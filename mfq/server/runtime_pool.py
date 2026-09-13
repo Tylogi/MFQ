@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import socket
 import subprocess
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -77,6 +77,34 @@ class _ManagedRuntime:
     monitor_task: asyncio.Task[None] | None = None
     realtime_gateway: Any | None = None
     realtime_error: str | None = None
+
+
+class _AutoReloadContext:
+    """Minimal JobContext stand-in for out-of-job model loads."""
+
+    def __init__(self) -> None:
+        self.cleanup_callbacks: list[Callable[[], Awaitable[None] | None]] = []
+        self.messages: list[str] = []
+
+    def raise_if_cancelled(self) -> None:
+        return None
+
+    def add_cleanup(self, callback: Callable[[], Awaitable[None] | None]) -> None:
+        self.cleanup_callbacks.append(callback)
+
+    async def progress(
+        self,
+        value: float,
+        *,
+        message: str | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        del value, data
+        if message:
+            self.messages.append(message)
+
+    async def log(self, message: str, **_: Any) -> None:
+        self.messages.append(message)
 
 
 class ManagedRuntimePool:
@@ -520,6 +548,51 @@ class ManagedRuntimePool:
             ]
         )
 
+    async def forget_failed_instances(self, model: str) -> None:
+        """Detach FAILED runtime slots so a reload can replace them."""
+
+        async with self._lock:
+            victims = [
+                item
+                for item in self._instances.values()
+                if item.state == RuntimeInstanceState.FAILED
+                and item.artifact.resource.name == model
+                and item.active_requests == 0
+            ]
+            for victim in victims:
+                self._detach_instance_locked(victim)
+
+    async def reload_model(self, model: str) -> str:
+        """Best-effort reload of an unloaded model for session continuity.
+
+        Reuses the managed load path (catalog resolution, LRU eviction,
+        startup wait) under a no-op job context. Returns ``"loaded"`` when
+        an instance is ready, ``"loading"`` when another caller is already
+        starting one, and ``"failed"`` when the model cannot be loaded.
+        """
+
+        context = _AutoReloadContext()
+        try:
+            await self.load(context, {"model": model})
+            return "loaded"
+        except JobExecutionError as error:
+            if error.detail.code in {"model_already_loading", "model_already_loaded"}:
+                return "loading"
+            return "failed"
+        except Exception:
+            return "failed"
+
+    async def wait_for_model(self, model: str, timeout: float = 180.0) -> bool:
+        """Wait for another in-flight load of ``model`` to finish."""
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            if await self._select(model, session_id=None) is not None:
+                return True
+            await asyncio.sleep(0.25)
+        return False
+
     async def stream(
         self,
         *,
@@ -532,6 +605,26 @@ class ManagedRuntimePool:
         response_format: ResponseFormat | None = None,
     ) -> AsyncIterator[BackendDelta]:
         instance = await self._select(model, session_id=session_id)
+        if instance is not None and instance.state == RuntimeInstanceState.FAILED:
+            # A dead runtime still occupies its pool slot and session route;
+            # drop it so the reload path can start a fresh process.
+            await self.forget_failed_instances(model)
+            instance = None
+        if instance is None:
+            # Sessions survive runtime eviction and server restarts: reload
+            # the model on demand instead of failing the turn. Concurrent
+            # callers coalesce through the pool's loading guard.
+            reload_state = await self.reload_model(model)
+            if reload_state == "loading":
+                await self.wait_for_model(model)
+            instance = await self._select(model, session_id=session_id)
+        if instance is not None and instance.state == RuntimeInstanceState.LOADING:
+            # A job-driven load is already starting this runtime; wait for
+            # readiness instead of failing the turn.
+            await self.wait_for_model(
+                model,
+                timeout=max(1.0, self.startup_timeout_seconds),
+            )
         if instance is None:
             if self.fallback is None:
                 raise BackendError("model_not_loaded", f"model is not loaded: {model}")

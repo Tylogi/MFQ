@@ -24,7 +24,13 @@ from mfq.server.catalog import (
     DuplicateModelNameError,
     ModelCatalog,
 )
-from mfq.server.models import JobStatus, RuntimeInstanceState, SamplingParams
+from mfq.server.models import (
+    ErrorDetail,
+    JobStatus,
+    RuntimeInstanceState,
+    SamplingParams,
+)
+from mfq.server.jobs import JobExecutionError
 from mfq.server.runtime_pool import ManagedRuntimePool, RuntimeConflictError, _ManagedRuntime
 from mfq.server.service import ServerService
 from mfq.server.storage import SessionStore
@@ -1073,5 +1079,101 @@ def test_minicpmo_voice_component_activates_in_the_managed_runtime(
         client = object()
         assert await pool.realtime_serve(client)
         assert instance.realtime_gateway.served == [client]
+
+    asyncio.run(run())
+
+
+def _streaming_instance(pool: ManagedRuntimePool, tmp_path: Path, name: str) -> _ManagedRuntime:
+    async def fake_stream(**kwargs):
+        yield BackendDelta(content_delta="reloaded")
+
+    backend = SimpleNamespace(
+        stream=lambda **kwargs: fake_stream(**kwargs),
+    )
+    instance = _ManagedRuntime(
+        id=uuid4(),
+        artifact=SimpleNamespace(
+            resource=SimpleNamespace(id=name, name=name, loadable=True),
+            path=tmp_path / f"{name}.mfq",
+        ),
+        process=None,
+        backend=backend,
+        port=0,
+        context_size=4096,
+        state=RuntimeInstanceState.READY,
+        request_slots=asyncio.Semaphore(1),
+    )
+    pool._instances[instance.id] = instance
+    return instance
+
+
+def test_stream_reloads_unloaded_model_instead_of_failing(tmp_path: Path) -> None:
+    async def run() -> None:
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        pool = ManagedRuntimePool(ModelCatalog([model_dir]), tmp_path / "runtime")
+        reload_calls: list[str] = []
+
+        async def fake_reload(model: str) -> str:
+            reload_calls.append(model)
+            _streaming_instance(pool, tmp_path, model)
+            return "loaded"
+
+        pool.reload_model = fake_reload  # type: ignore[method-assign]
+
+        deltas = [
+            delta
+            async for delta in pool.stream(
+                model="Qwen3.5-0.8B-MFQ-S6",
+                messages=[{"role": "user", "content": "hi"}],
+                sampling=SamplingParams(),
+            )
+        ]
+        assert reload_calls == ["Qwen3.5-0.8B-MFQ-S6"]
+        assert [delta.content_delta for delta in deltas] == ["reloaded"]
+
+    asyncio.run(run())
+
+
+def test_stream_reports_model_not_loaded_when_reload_fails(tmp_path: Path) -> None:
+    async def run() -> None:
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        pool = ManagedRuntimePool(ModelCatalog([model_dir]), tmp_path / "runtime")
+
+        async def fake_reload(model: str) -> str:
+            return "failed"
+
+        pool.reload_model = fake_reload  # type: ignore[method-assign]
+
+        with pytest.raises(Exception, match="model is not loaded"):
+            async for _ in pool.stream(
+                model="missing-model",
+                messages=[{"role": "user", "content": "hi"}],
+                sampling=SamplingParams(),
+            ):
+                pass
+
+    asyncio.run(run())
+
+
+def test_reload_model_reports_loading_and_failed_states(tmp_path: Path) -> None:
+    async def run() -> None:
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        catalog = ModelCatalog([model_dir], cache_seconds=0)
+        pool = ManagedRuntimePool(catalog, tmp_path / "runtime")
+
+        # Unknown artifact fails the managed load path.
+        assert await pool.reload_model("does-not-exist") == "failed"
+
+        # A concurrent in-flight load coalesces into the "loading" state.
+        async def already_loading(context, payload):
+            raise JobExecutionError(
+                ErrorDetail(code="model_already_loading", message="model is already loading")
+            )
+
+        pool.load = already_loading  # type: ignore[method-assign]
+        assert await pool.reload_model("anything") == "loading"
 
     asyncio.run(run())
