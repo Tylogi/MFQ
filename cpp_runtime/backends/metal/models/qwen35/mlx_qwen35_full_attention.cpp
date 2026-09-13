@@ -529,8 +529,21 @@ array MlxQwen35FullAttentionBlock::forward_impl(
     std::vector<array> projected;
     // As with the FFN gate/up pair, the single-row heterogeneous QKV kernel
     // is bandwidth-limited well below the individual packed GEMVs. Preserve
-    // it for multi-row prefill only.
-    if (detail::qwen35_use_grouped_projection_rows(
+    // it for multi-row prefill only. The speculative verification range
+    // (two through six rows) must instead use the per-tensor projections:
+    // the heterogeneous grouped dispatch returns numerically unfaithful
+    // rows there once a group mixes NINT bit widths (for example the S4-M
+    // preset's sensitivity-bumped NINT6 value projection beside NINT4
+    // query/key), which derails greedy MTP verification. The per-tensor
+    // small-M kernels are bit-exact with single-row decode for every
+    // verified NINT width, so MTP-on and MTP-off agree token for token.
+    const auto flattened_rows =
+        normalized.size() /
+        static_cast<std::size_t>(config_.hidden_size);
+    const bool speculative_verification_rows =
+        flattened_rows >= 2 && flattened_rows <= 6;
+    if (!speculative_verification_rows &&
+        detail::qwen35_use_grouped_projection_rows(
             normalized.size(),
             static_cast<int>(config_.hidden_size)) &&
         qkv_ &&

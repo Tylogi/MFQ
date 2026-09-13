@@ -304,6 +304,18 @@ class _MtpDecodeStats:
     rollback_ms: float = 0.0
 
 
+# The depth-one verifier runs the target through the multi-row kernel
+# regime, whose fp16 logits deviate from the single-row decode regime by
+# roughly 1.6e-2 on Qwen3.5-scale models. A greedy verify margin below that
+# noise floor cannot distinguish the top two tokens, and rerolling such
+# near-ties at every cycle compounds into degenerate continuations on
+# small low-bit-width models. After two consecutive sub-floor cycles the
+# request hands back to ordinary decoding, mirroring the acceptance-rate
+# fallback the native runtime uses for its depth schedule.
+_MTP_VERIFY_MARGIN_EPSILON = 0.05
+_MTP_LOW_MARGIN_HANDOFF_CYCLES = 2
+
+
 @dataclass(frozen=True)
 class _MultimodalInput:
     pixel_values: np.ndarray
@@ -1144,8 +1156,14 @@ class FlashNextTextWorker:
         cancellation: threading.Event,
         eos: set[int],
         emit_token: Callable[[int], None],
-    ) -> tuple[list[int], str, float | None, _MtpDecodeStats]:
-        """Run exact depth-one draft/verify with recurrent-state rollback."""
+    ) -> tuple[list[int], str, float | None, _MtpDecodeStats, mx.array | None]:
+        """Run exact depth-one draft/verify with recurrent-state rollback.
+
+        Returns the generated tokens, finish reason, first-token timestamp,
+        MTP statistics, and—when greedy verification hands the request back
+        to ordinary decoding—the verifier's last confirmed-row logits so the
+        plain decode loop can continue without recomputing the prefix.
+        """
 
         assert self.mtp is not None
         generated: list[int] = []
@@ -1153,6 +1171,7 @@ class FlashNextTextWorker:
         first_token_at: float | None = None
         stats = _MtpDecodeStats()
         greedy = prepared.temperature <= 0.0 or prepared.top_k == 1
+        low_margin_cycles = 0
         counts = self._initial_penalty_counts(
             prepared,
             int(initial_logits.shape[-1]),
@@ -1193,7 +1212,7 @@ class FlashNextTextWorker:
         main_token = draw(initial_logits[:, -1])
         first_token_at = time.perf_counter()
         if not append(main_token) or cancellation.is_set():
-            return generated, finish_reason, first_token_at, stats
+            return generated, finish_reason, first_token_at, stats, None
 
         target_started = time.perf_counter()
         next_logits, previous_hidden = self._forward_tokens_with_hidden(
@@ -1204,7 +1223,7 @@ class FlashNextTextWorker:
         stats.target_ms += (time.perf_counter() - target_started) * 1000.0
         next_main = draw(next_logits[:, -1])
         if not append(next_main) or cancellation.is_set():
-            return generated, finish_reason, first_token_at, stats
+            return generated, finish_reason, first_token_at, stats, None
 
         while not cancellation.is_set() and len(generated) < prepared.max_tokens:
             head_started = time.perf_counter()
@@ -1238,6 +1257,27 @@ class FlashNextTextWorker:
                 top_k=prepared.top_k,
                 top_p=prepared.top_p,
             )
+            if greedy:
+                top_two = mx.topk(target_logits[0], 2)
+                margin = abs(float(np.asarray(top_two[1] - top_two[0])))
+                if margin < _MTP_VERIFY_MARGIN_EPSILON:
+                    low_margin_cycles += 1
+                else:
+                    low_margin_cycles = 0
+                if low_margin_cycles >= _MTP_LOW_MARGIN_HANDOFF_CYCLES:
+                    # The verifier's kernel-regime noise dominates the greedy
+                    # decision, so every acceptance test on this request
+                    # rerolls near-ties instead of measuring the model. Roll
+                    # the speculative row back and let ordinary decoding take
+                    # over from the confirmed row's logits.
+                    self.model.rollback_speculative_cache()
+                    return (
+                        generated,
+                        finish_reason,
+                        first_token_at,
+                        stats,
+                        verify_logits[:, 0],
+                    )
             if greedy:
                 correction = draw_adjusted(target_logits)
                 accepted = correction == draft
@@ -1280,7 +1320,7 @@ class FlashNextTextWorker:
 
         if cancellation.is_set():
             finish_reason = "stop"
-        return generated, finish_reason, first_token_at, stats
+        return generated, finish_reason, first_token_at, stats, None
 
     def fork_session(self, source_session_id: str, target_session_id: str) -> int:
         if not source_session_id or not target_session_id:
@@ -1613,32 +1653,46 @@ class FlashNextTextWorker:
                             for kind, text in parser.feed(piece):
                                 emit({kind: text})
 
-                    if (
+                    handoff_logits: mx.array | None = None
+                    used_mtp = (
                         self.mtp is not None
                         and prepared.enable_mtp
                         and prepared.max_tokens >= 3
-                    ):
-                        generated, finish_reason, first_token_at, mtp_stats = (
-                            self._generate_with_mtp(
-                                prepared,
-                                logits,
-                                cancellation,
-                                eos,
-                                emit_token,
-                            )
+                    )
+                    if used_mtp:
+                        (
+                            generated,
+                            finish_reason,
+                            first_token_at,
+                            mtp_stats,
+                            handoff_logits,
+                        ) = self._generate_with_mtp(
+                            prepared,
+                            logits,
+                            cancellation,
+                            eos,
+                            emit_token,
                         )
-                    else:
+                    if not used_mtp or handoff_logits is not None:
                         counts = self._initial_penalty_counts(
                             prepared,
                             int(logits.shape[-1]),
                         )
-                        for step in range(prepared.max_tokens):
+                        if counts is not None and generated:
+                            counts = sample_token_counts_add(
+                                counts,
+                                np.asarray(generated, dtype=np.int32),
+                            )
+                        active_logits = (
+                            logits if handoff_logits is None else handoff_logits[:, None, :]
+                        )
+                        for step in range(prepared.max_tokens - len(generated)):
                             if cancellation.is_set():
                                 finish_reason = "stop"
                                 break
                             sampling_logits = self._penalized_logits(
                                 prepared,
-                                logits[:, -1],
+                                active_logits[:, -1],
                                 counts,
                             )
                             next_id = sample(
@@ -1657,11 +1711,11 @@ class FlashNextTextWorker:
                             generated.append(token)
                             counts = self._count_token(counts, token)
                             emit_token(token)
-                            if step + 1 >= prepared.max_tokens:
+                            if len(generated) >= prepared.max_tokens:
                                 finish_reason = "length"
                                 break
-                            logits = self._decode_token(prepared, token)
-                            self._remember_decoded_token(prepared, token, logits)
+                            active_logits = self._decode_token(prepared, token)
+                            self._remember_decoded_token(prepared, token, active_logits)
                     for kind, text in parser.finish():
                         emit({kind: text})
             ended = time.perf_counter()

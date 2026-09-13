@@ -533,7 +533,7 @@ def test_flash_next_depth_one_mtp_accepts_and_rolls_back_exactly() -> None:
 
     worker._penalized_logits = trace_penalties
 
-    generated, finish, first_at, stats = worker._generate_with_mtp(
+    generated, finish, first_at, stats, handoff = worker._generate_with_mtp(
         prepared,
         mx.array(initial),
         threading.Event(),
@@ -544,12 +544,111 @@ def test_flash_next_depth_one_mtp_accepts_and_rolls_back_exactly() -> None:
     assert generated == emitted == [1, 2, 3, 4, 5, 6]
     assert finish == "length"
     assert first_at is not None
+    assert handoff is None
     assert target.calls == [((1,), 0), ((2, 3), 1), ((4, 9), 1), ((5, 6), 1)]
     assert (target.commits, target.rollbacks, target.position) == (2, 1, 13)
     assert (stats.cycles, stats.drafted_tokens, stats.accepted_tokens) == (3, 3, 2)
     # The third draft sees the corrected token 5 but never the rejected draft 9.
     assert penalty_histories[7][5] == 1
     assert penalty_histories[7][9] == 0
+
+
+def test_flash_next_depth_one_mtp_hands_back_on_low_verify_margins() -> None:
+    vocab = 8
+
+    def near_tie_logits(tokens: np.ndarray) -> mx.array:
+        # The top two candidates sit inside the verifier's fp16 noise floor,
+        # so greedy verification cannot distinguish them.
+        transitions = {1: (2, 0), 2: (3, 7)}
+        result = np.full((*tokens.shape, vocab), -100.0, dtype=np.float32)
+        for row, token in enumerate(tokens.reshape(-1)):
+            top, second = transitions.get(int(token), (0, 6))
+            flat = result.reshape(-1, vocab)[row]
+            flat[top] = 0.02
+            flat[second] = 0.0
+        return mx.array(result)
+
+    class Target:
+        max_context = 64
+
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(eos_token_ids=(15,))
+            self.position = 7
+            self.calls: list[tuple[tuple[int, ...], int]] = []
+            self.checkpoint: int | None = None
+            self.commits = 0
+            self.rollbacks = 0
+
+        def forward_with_hidden(self, ids, *, use_cache, n_confirmed=0):
+            assert use_cache
+            values = np.asarray(ids, dtype=np.int32)
+            tokens = tuple(int(item) for item in values.reshape(-1))
+            self.calls.append((tokens, int(n_confirmed)))
+            start = self.position
+            self.position += len(tokens)
+            if n_confirmed:
+                self.checkpoint = start + int(n_confirmed)
+            hidden = mx.array(values[..., None].astype(np.float32))
+            return near_tie_logits(values), hidden
+
+        def commit_speculative_cache(self):
+            self.commits += 1
+            self.checkpoint = None
+
+        def rollback_speculative_cache(self):
+            assert self.checkpoint is not None
+            self.rollbacks += 1
+            self.position = self.checkpoint
+            self.checkpoint = None
+
+    class Mtp:
+        def reset_cache(self, _batch=1):
+            pass
+
+        def forward(self, ids, _hidden, *, use_cache):
+            assert use_cache
+            return mx.array([[[3.0]]], dtype=mx.float32)
+
+        @staticmethod
+        def compute_logits(hidden):
+            draft = int(np.asarray(hidden).reshape(-1)[0])
+            result = np.full((1, 1, vocab), -100.0, dtype=np.float32)
+            result[0, 0, draft] = 100.0
+            return mx.array(result)
+
+    target = Target()
+    worker = FlashNextTextWorker(
+        target,
+        SimpleNamespace(),
+        model_name="Flash",
+        model_type="glm5_next",
+        mtp=Mtp(),
+    )
+    prepared = replace(_prepared("mtp-low-margin", 11), max_tokens=5)
+    initial = np.full((1, 1, vocab), -100.0, dtype=np.float32)
+    initial[0, 0, 1] = 100.0
+
+    generated, finish, first_at, stats, handoff = worker._generate_with_mtp(
+        prepared,
+        mx.array(initial),
+        threading.Event(),
+        {15},
+        lambda _token: None,
+    )
+
+    # The first sub-floor cycle still commits through its own accept test,
+    # but the second consecutive one hands the request back: the speculative
+    # row is rolled back and the confirmed-row logits are returned for the
+    # plain decode loop instead of rerolling further near-ties.
+    assert generated == [1, 2, 3, 0]
+    assert finish == "stop"
+    assert handoff is not None
+    assert handoff.shape == (1, vocab)
+    mx.eval(handoff)
+    assert int(np.argmax(np.asarray(handoff)[0])) == 0
+    assert target.calls == [((1,), 0), ((2, 3), 1), ((0, 3), 1)]
+    assert (target.commits, target.rollbacks) == (1, 1)
+    assert (stats.cycles, stats.drafted_tokens, stats.accepted_tokens) == (2, 2, 1)
 
 
 def test_flash_next_multimodal_tensor_contract_rejects_wrong_family_and_nan() -> None:
