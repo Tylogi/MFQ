@@ -99,10 +99,9 @@ __global__ void rope_table_kernel(const float* __restrict__ x, const int64_t* __
     size_t base0 = ((size_t)m * T + t) * D;
     int tid = threadIdx.x;
 
-    for (int i = tid; i < D; i += ROPE_BD) {
+    for (int i = rotary_dim + tid; i < D; i += ROPE_BD) {
         out[base0 + i] = x[base0 + i];
     }
-    __syncthreads();
 
     for (int j = tid; j < half; j += ROPE_BD) {
         int64_t p;

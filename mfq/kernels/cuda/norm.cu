@@ -5,6 +5,7 @@
 #include "mfq_tensor_backend.h"
 #include <cuda_bf16.h>
 #include <algorithm>
+#include <cstdint>
 #include <vector>
 
 #include "reduce.cuh"
@@ -216,7 +217,7 @@ __global__ void rms_norm_kernel(const float* __restrict__ x, const float* __rest
         float xi = xr[i];
         ssq += xi * xi;
     }
-    ssq = block_sum<NORM_BD / 32>(ssq);
+    ssq = block_sum<BD / 32>(ssq);
 
     float rinv = rsqrtf(ssq / (float)D + eps);
     for (int i = tid; i < D; i += BD) {
@@ -243,11 +244,43 @@ __global__ void rms_norm_f16_kernel(const mfq_half* __restrict__ x,
         float xi = (float)xr[i];
         ssq += xi * xi;
     }
-    ssq = block_sum<NORM_BD / 32>(ssq);
+    ssq = block_sum<BD / 32>(ssq);
 
     float rinv = rsqrtf(ssq / (float)D + eps);
     for (int i = tid; i < D; i += BD) {
         or_[i] = (mfq_half)((float)xr[i] * rinv * (w[i] + weight_offset));
+    }
+}
+
+template <int BD>
+__global__ void rms_norm_f16x2_kernel(
+    const half2* __restrict__ x,
+    const float2* __restrict__ w,
+    half2* __restrict__ out,
+    int N, int pairs, float eps, float weight_offset)
+{
+    const int row = blockIdx.x;
+    if (row >= N) {
+        return;
+    }
+    const half2* input_row = x + (size_t)row * pairs;
+    half2* output_row = out + (size_t)row * pairs;
+    const int tid = threadIdx.x;
+
+    float square_sum = 0.0f;
+    for (int i = tid; i < pairs; i += BD) {
+        const float2 value = __half22float2(input_row[i]);
+        square_sum += value.x * value.x + value.y * value.y;
+    }
+    square_sum = block_sum<BD / 32>(square_sum);
+
+    const float inverse = rsqrtf(square_sum / (float)(pairs * 2) + eps);
+    for (int i = tid; i < pairs; i += BD) {
+        const float2 value = __half22float2(input_row[i]);
+        const float2 weight = w[i];
+        output_row[i] = __floats2half2_rn(
+            value.x * inverse * (weight.x + weight_offset),
+            value.y * inverse * (weight.y + weight_offset));
     }
 }
 
@@ -326,7 +359,8 @@ mfq_tensor_backend::Tensor rms_norm_cuda(mfq_tensor_backend::Tensor x, mfq_tenso
     int N = (int)(x.numel() / D);
     auto out = mfq_tensor_backend::empty_like(x);
     rms_norm_kernel<NORM_BD><<<N, NORM_BD, 0, mfq_current_cuda_stream()>>>(
-        x.data_ptr<float>(), weight.data_ptr<float>(), out.data_ptr<float>(), N, D, (float)eps, 0.0f);
+        x.data_ptr<float>(), weight.data_ptr<float>(), out.data_ptr<float>(),
+        N, D, (float)eps, 0.0f);
     return out;
 }
 
@@ -339,8 +373,8 @@ mfq_tensor_backend::Tensor rms_norm_offset_cuda(mfq_tensor_backend::Tensor x, mf
     int N = (int)(x.numel() / D);
     auto out = mfq_tensor_backend::empty_like(x);
     rms_norm_kernel<NORM_BD><<<N, NORM_BD, 0, mfq_current_cuda_stream()>>>(
-        x.data_ptr<float>(), weight.data_ptr<float>(), out.data_ptr<float>(), N, D,
-        (float)eps, (float)weight_offset);
+        x.data_ptr<float>(), weight.data_ptr<float>(), out.data_ptr<float>(),
+        N, D, (float)eps, (float)weight_offset);
     return out;
 }
 
@@ -356,9 +390,27 @@ mfq_tensor_backend::Tensor rms_norm_f16_cuda(mfq_tensor_backend::Tensor x, mfq_t
     int N = (int)(x.numel() / D);
     MFQ_RUNTIME_CHECK(weight.numel() == D, "rms_norm_f16: weight length mismatch");
     auto out = mfq_tensor_backend::empty_like(x);
-    rms_norm_f16_kernel<NORM_BD><<<N, NORM_BD, 0, mfq_current_cuda_stream()>>>(
-        x.data_ptr<mfq_half>(), weight.data_ptr<float>(), out.data_ptr<mfq_half>(),
-        N, D, (float)eps, (float)weight_offset);
+    const auto input_address = reinterpret_cast<std::uintptr_t>(x.data_ptr());
+    const auto weight_address =
+        reinterpret_cast<std::uintptr_t>(weight.data_ptr());
+    const auto output_address = reinterpret_cast<std::uintptr_t>(out.data_ptr());
+    const bool vector_aligned =
+        ((input_address | output_address) & (alignof(half2) - 1)) == 0 &&
+        (weight_address & (alignof(float2) - 1)) == 0;
+    if (D >= 4096 && (D & 1) == 0 && vector_aligned) {
+        rms_norm_f16x2_kernel<NORM_BD><<<
+            N, NORM_BD, 0, mfq_current_cuda_stream()>>>(
+            reinterpret_cast<const half2*>(x.data_ptr<mfq_half>()),
+            reinterpret_cast<const float2*>(weight.data_ptr<float>()),
+            reinterpret_cast<half2*>(out.data_ptr<mfq_half>()),
+            N, D / 2, (float)eps, (float)weight_offset);
+    } else {
+        rms_norm_f16_kernel<NORM_BD><<<
+            N, NORM_BD, 0, mfq_current_cuda_stream()>>>(
+            x.data_ptr<mfq_half>(), weight.data_ptr<float>(),
+            out.data_ptr<mfq_half>(), N, D, (float)eps,
+            (float)weight_offset);
+    }
     return out;
 }
 

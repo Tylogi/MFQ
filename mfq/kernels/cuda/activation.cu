@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
@@ -56,6 +57,32 @@ __global__ void silu_mul_f16_kernel(
         float g = __half2float(gate[i]);
         float u = __half2float(up[i]);
         out[i] = __float2half((g / (1.0f + expf(-g))) * u);
+    }
+}
+
+__global__ void silu_mul_f16x2_kernel(
+    const half2* __restrict__ gate,
+    const half2* __restrict__ up,
+    half2* __restrict__ out,
+    size_t n)
+{
+    const size_t pairs = n / 2;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         i < pairs;
+         i += (size_t)gridDim.x * blockDim.x) {
+        const float2 g = __half22float2(gate[i]);
+        const float2 u = __half22float2(up[i]);
+        const float x = (g.x / (1.0f + expf(-g.x))) * u.x;
+        const float y = (g.y / (1.0f + expf(-g.y))) * u.y;
+        out[i] = __floats2half2_rn(x, y);
+    }
+    if ((n & 1) != 0 && blockIdx.x == 0 && threadIdx.x == 0) {
+        const half* gate_tail = reinterpret_cast<const half*>(gate);
+        const half* up_tail = reinterpret_cast<const half*>(up);
+        half* out_tail = reinterpret_cast<half*>(out);
+        const float g = __half2float(gate_tail[n - 1]);
+        const float u = __half2float(up_tail[n - 1]);
+        out_tail[n - 1] = __float2half((g / (1.0f + expf(-g))) * u);
     }
 }
 
@@ -275,8 +302,27 @@ void silu_mul(
         silu_mul_f32_kernel<<<grid, block, 0, stream>>>(
             gate.data_as<float>(), up.data_as<float>(), output.data_as<float>(), elements);
     } else if (gate.scalar_type == ScalarType::float16) {
-        silu_mul_f16_kernel<<<grid, block, 0, stream>>>(
-            gate.data_as<half>(), up.data_as<half>(), output.data_as<half>(), elements);
+        // Half2 reduces work for large tensors, but scalar launch geometry is
+        // faster for the small decode-sized cases.
+        constexpr std::size_t vector_threshold = 1U << 18;
+        const auto gate_address = reinterpret_cast<std::uintptr_t>(gate.data);
+        const auto up_address = reinterpret_cast<std::uintptr_t>(up.data);
+        const auto output_address = reinterpret_cast<std::uintptr_t>(output.data);
+        const bool half2_aligned =
+            ((gate_address | up_address | output_address) & (alignof(half2) - 1)) == 0;
+        if (elements >= vector_threshold && half2_aligned) {
+            const auto pairs = elements / 2;
+            const int vector_grid = static_cast<int>(std::min<std::size_t>(
+                4096, (pairs + block - 1) / block));
+            silu_mul_f16x2_kernel<<<vector_grid, block, 0, stream>>>(
+                reinterpret_cast<const half2*>(gate.data_as<half>()),
+                reinterpret_cast<const half2*>(up.data_as<half>()),
+                reinterpret_cast<half2*>(output.data_as<half>()), elements);
+        } else {
+            silu_mul_f16_kernel<<<grid, block, 0, stream>>>(
+                gate.data_as<half>(), up.data_as<half>(),
+                output.data_as<half>(), elements);
+        }
     } else if (gate.scalar_type == ScalarType::bfloat16) {
         silu_mul_bf16_kernel<<<grid, block, 0, stream>>>(
             gate.data_as<__nv_bfloat16>(), up.data_as<__nv_bfloat16>(),

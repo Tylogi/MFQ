@@ -137,6 +137,8 @@ int main() {
             ++checked;
         }
     }
+    check_glu(262144, mfq::cuda::kFloat16, false);
+    ++checked;
     check_half_saturation();
     std::cout << "activation cases=" << checked + 1 << " passed (Release checks enabled)\n";
 }
