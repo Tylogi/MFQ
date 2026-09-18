@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include "mfq_tensor_backend.h"
+#include <type_traits>
 #include <vector>
 
 #include "reduce.cuh"
@@ -105,7 +106,7 @@ __global__ void acc_rms_norm_bf16_kernel(
     }
 }
 
-template <typename scalar_t, typename norm_t, int BD>
+template <typename scalar_t, typename norm_t, int BD, bool REUSE_STORED_SUM>
 __global__ void acc_rms_norm_kernel(const scalar_t* __restrict__ a,
                                     const scalar_t* __restrict__ b,
                                     const float* __restrict__ w,
@@ -136,9 +137,14 @@ __global__ void acc_rms_norm_kernel(const scalar_t* __restrict__ a,
 
     float rinv = rsqrtf(ssq / (float)D + eps);
     for (int i = tid; i < D; i += BD) {
-        float sf = (float)ar[i] + (float)br[i];
-        scalar_t stored = (scalar_t)sf;
-        float sn = (float)stored;
+        float sn;
+        if constexpr (REUSE_STORED_SUM) {
+            sn = (float)sr[i];
+        } else {
+            float sf = (float)ar[i] + (float)br[i];
+            scalar_t stored = (scalar_t)sf;
+            sn = (float)stored;
+        }
         nr[i] = (norm_t)(sn * rinv * (w[i] + weight_offset));
     }
 }
@@ -163,7 +169,8 @@ std::vector<mfq_tensor_backend::Tensor> acc_rms_norm_cuda(mfq_tensor_backend::Te
     auto sum = mfq_tensor_backend::empty_like(a);
     auto norm = mfq_tensor_backend::empty(a.sizes(), a.options().dtype(mfq_tensor_backend::kFloat32));
     MFQ_DISPATCH_FLOATING_TYPES_AND_HALF(a.scalar_type(), "acc_rms_norm_cuda", [&] {
-        acc_rms_norm_kernel<scalar_t, float, ACC_RMS_BD><<<N, ACC_RMS_BD, 0, mfq_current_cuda_stream()>>>(
+        constexpr bool reuse_stored_sum = std::is_same_v<scalar_t, float>;
+        acc_rms_norm_kernel<scalar_t, float, ACC_RMS_BD, reuse_stored_sum><<<N, ACC_RMS_BD, 0, mfq_current_cuda_stream()>>>(
             a.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), weight.data_ptr<float>(),
             sum.data_ptr<scalar_t>(), norm.data_ptr<float>(), N, D,
             (float)eps, (float)weight_offset);
@@ -189,7 +196,7 @@ std::vector<mfq_tensor_backend::Tensor> acc_rms_norm_f16_cuda(mfq_tensor_backend
 
     auto sum = mfq_tensor_backend::empty_like(a);
     auto norm = mfq_tensor_backend::empty_like(a);
-    acc_rms_norm_kernel<mfq_half, mfq_half, ACC_RMS_BD><<<N, ACC_RMS_BD, 0, mfq_current_cuda_stream()>>>(
+    acc_rms_norm_kernel<mfq_half, mfq_half, ACC_RMS_BD, false><<<N, ACC_RMS_BD, 0, mfq_current_cuda_stream()>>>(
         a.data_ptr<mfq_half>(), b.data_ptr<mfq_half>(), weight.data_ptr<float>(),
         sum.data_ptr<mfq_half>(), norm.data_ptr<mfq_half>(), N, D,
         (float)eps, (float)weight_offset);

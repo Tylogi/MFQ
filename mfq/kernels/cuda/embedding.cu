@@ -31,7 +31,7 @@ __device__ __forceinline__ uint8_t unpack_nint_code(
 
 
 template <typename Scalar>
-__global__ void dense_embedding_kernel(
+__global__ void dense_embedding_flat_kernel(
         const Scalar * __restrict__ weight,
         const int64_t * __restrict__ token_ids,
         Scalar * __restrict__ output,
@@ -49,6 +49,44 @@ __global__ void dense_embedding_kernel(
         output[index] = token >= 0 && token < vocabulary
             ? weight[static_cast<size_t>(token) * width + column]
             : Scalar(0);
+    }
+}
+
+
+template <typename Scalar>
+__global__ void dense_embedding_vector_kernel(
+        const Scalar * __restrict__ weight,
+        const int64_t * __restrict__ token_ids,
+        Scalar * __restrict__ output,
+        int token_count,
+        int width,
+        int vocabulary) {
+    constexpr int elements_per_vector = sizeof(uint4) / sizeof(Scalar);
+    const int vectors_per_token = width / elements_per_vector;
+    const int tiles_per_token =
+        (vectors_per_token + blockDim.x - 1) / blockDim.x;
+    const size_t total_tiles =
+        static_cast<size_t>(token_count) * tiles_per_token;
+    for (size_t tile_index = blockIdx.x;
+         tile_index < total_tiles;
+         tile_index += gridDim.x) {
+        const int token_index = static_cast<int>(
+            tile_index / tiles_per_token);
+        const int tile = static_cast<int>(tile_index % tiles_per_token);
+        const int vector_index = tile * blockDim.x + threadIdx.x;
+        if (vector_index >= vectors_per_token) {
+            continue;
+        }
+        const int64_t token = token_ids[token_index];
+        auto* output_vectors = reinterpret_cast<uint4 *>(output);
+        const auto* weight_vectors =
+            reinterpret_cast<const uint4 *>(weight);
+        const size_t output_index = static_cast<size_t>(token_index) *
+            vectors_per_token + vector_index;
+        output_vectors[output_index] = token >= 0 && token < vocabulary
+            ? weight_vectors[static_cast<size_t>(token) * vectors_per_token +
+                vector_index]
+            : make_uint4(0, 0, 0, 0);
     }
 }
 
@@ -162,18 +200,38 @@ mfq_tensor_backend::Tensor embedding_lookup_cuda(
         return output;
     }
     constexpr int threads = 256;
-    const int blocks = launch_blocks(
-        static_cast<size_t>(token_count) * width);
     MFQ_DISPATCH_FLOATING_TYPES_AND_HALF(
         weight.scalar_type(), "embedding_lookup_cuda", [&] {
-            dense_embedding_kernel<scalar_t><<<
-                blocks, threads, 0, mfq_current_cuda_stream()>>>(
-                    weight.data_ptr<scalar_t>(),
-                    token_ids.data_ptr<int64_t>(),
-                    output.data_ptr<scalar_t>(),
-                    token_count,
-                    width,
-                    vocabulary);
+            if (token_count >= 64 &&
+                (static_cast<size_t>(width) * sizeof(scalar_t)) %
+                    sizeof(uint4) == 0) {
+                constexpr int elements_per_vector =
+                    sizeof(uint4) / sizeof(scalar_t);
+                const size_t vectors =
+                    static_cast<size_t>(width) / elements_per_vector;
+                const size_t tiles = (vectors + threads - 1) / threads;
+                const int vector_blocks = launch_blocks(
+                    static_cast<size_t>(token_count) * tiles * threads);
+                dense_embedding_vector_kernel<scalar_t><<<
+                    vector_blocks, threads, 0, mfq_current_cuda_stream()>>>(
+                        weight.data_ptr<scalar_t>(),
+                        token_ids.data_ptr<int64_t>(),
+                        output.data_ptr<scalar_t>(),
+                        token_count,
+                        width,
+                        vocabulary);
+            } else {
+                const int flat_blocks = launch_blocks(
+                    static_cast<size_t>(token_count) * width);
+                dense_embedding_flat_kernel<scalar_t><<<
+                    flat_blocks, threads, 0, mfq_current_cuda_stream()>>>(
+                        weight.data_ptr<scalar_t>(),
+                        token_ids.data_ptr<int64_t>(),
+                        output.data_ptr<scalar_t>(),
+                        token_count,
+                        width,
+                        vocabulary);
+            }
         });
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;

@@ -7,8 +7,47 @@
 #include <cstdint>
 #include <vector>
 
+namespace {
+
+constexpr int KV_WARP_SIZE = 32;
+constexpr int KV_WARPS_PER_BLOCK = 4;
+constexpr int KV_BLOCK_SIZE = KV_WARP_SIZE * KV_WARPS_PER_BLOCK;
+constexpr size_t KV_ROW_KERNEL_MIN_ROWS = 4096;
+
+template <typename scalar_t, bool Vectorized>
+__device__ __forceinline__ void copy_kv_row(
+    const scalar_t* __restrict__ k,
+    const scalar_t* __restrict__ v,
+    scalar_t* __restrict__ k_cache,
+    scalar_t* __restrict__ v_cache,
+    size_t src,
+    size_t dst,
+    int D,
+    int lane)
+{
+    if constexpr (Vectorized) {
+        constexpr int elements_per_vector = sizeof(uint2) / sizeof(scalar_t);
+        const int vectors = D / elements_per_vector;
+        const auto* k_vector = reinterpret_cast<const uint2*>(k + src);
+        const auto* v_vector = reinterpret_cast<const uint2*>(v + src);
+        auto* k_cache_vector = reinterpret_cast<uint2*>(k_cache + dst);
+        auto* v_cache_vector = reinterpret_cast<uint2*>(v_cache + dst);
+        for (int index = lane; index < vectors; index += KV_WARP_SIZE) {
+            k_cache_vector[index] = k_vector[index];
+            v_cache_vector[index] = v_vector[index];
+        }
+    } else {
+        for (int d = lane; d < D; d += KV_WARP_SIZE) {
+            k_cache[dst + d] = k[src + d];
+            v_cache[dst + d] = v[src + d];
+        }
+    }
+}
+
+}  // namespace
+
 template <typename scalar_t>
-__global__ void kv_cache_write_kernel(
+__global__ void kv_cache_write_flat_kernel(
     const scalar_t* __restrict__ k,
     const scalar_t* __restrict__ v,
     scalar_t* __restrict__ k_cache,
@@ -40,6 +79,44 @@ __global__ void kv_cache_write_kernel(
         k_cache[dst] = k[src];
         v_cache[dst] = v[src];
     }
+}
+
+template <typename scalar_t, bool Vectorized>
+__global__ void kv_cache_write_rows_kernel(
+    const scalar_t* __restrict__ k,
+    const scalar_t* __restrict__ v,
+    scalar_t* __restrict__ k_cache,
+    scalar_t* __restrict__ v_cache,
+    const int64_t* __restrict__ positions,
+    int B,
+    int H,
+    int T,
+    int D,
+    int max_seq,
+    int pos_dim)
+{
+    const int warp = threadIdx.x / KV_WARP_SIZE;
+    const int lane = threadIdx.x % KV_WARP_SIZE;
+    const size_t row =
+        static_cast<size_t>(blockIdx.x) * KV_WARPS_PER_BLOCK + warp;
+    const size_t rows = static_cast<size_t>(B) * H * T;
+    if (row >= rows) return;
+
+    const int t = static_cast<int>(row % T);
+    const size_t head_row = row / T;
+    const int h = static_cast<int>(head_row % H);
+    const int b = static_cast<int>(head_row / H);
+    const int64_t p = pos_dim == 1
+        ? positions[t]
+        : positions[static_cast<size_t>(b) * T + t];
+    if (p < 0 || p >= max_seq) return;
+
+    const size_t src = row * D;
+    const size_t dst =
+        ((static_cast<size_t>(b) * H + h) * max_seq +
+         static_cast<size_t>(p)) * D;
+    copy_kv_row<scalar_t, Vectorized>(
+        k, v, k_cache, v_cache, src, dst, D, lane);
 }
 
 std::vector<mfq_tensor_backend::Tensor> kv_cache_write_cuda(
@@ -85,16 +162,43 @@ std::vector<mfq_tensor_backend::Tensor> kv_cache_write_cuda(
                     "kv_cache_write: positions [B,T] shape mismatch");
     }
 
-    constexpr int BD = 256;
-    size_t n = (size_t)B * H * T * D;
-    int grid = (int)((n + BD - 1) / BD);
-    grid = grid > 4096 ? 4096 : grid;
+    const size_t rows = (size_t)B * H * T;
     MFQ_DISPATCH_FLOATING_TYPES_AND2(
         mfq_dispatch_half, mfq_dispatch_bfloat16,
         k_cache.scalar_type(), "kv_cache_write_cuda", [&] {
-        kv_cache_write_kernel<scalar_t><<<grid, BD, 0, mfq_current_cuda_stream()>>>(
-            k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(), k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),
-            positions.data_ptr<int64_t>(), B, H, T, D, max_seq, pos_dim);
+        if (rows >= KV_ROW_KERNEL_MIN_ROWS &&
+            sizeof(scalar_t) < sizeof(float)) {
+            constexpr int elements_per_vector =
+                sizeof(uint2) / sizeof(scalar_t);
+            const int grid = static_cast<int>(
+                (rows + KV_WARPS_PER_BLOCK - 1) / KV_WARPS_PER_BLOCK);
+            if (D % elements_per_vector == 0) {
+                kv_cache_write_rows_kernel<scalar_t, true><<<
+                    grid, KV_BLOCK_SIZE, 0, mfq_current_cuda_stream()>>>(
+                    k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
+                    k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),
+                    positions.data_ptr<int64_t>(), B, H, T, D, max_seq,
+                    pos_dim);
+            } else {
+                kv_cache_write_rows_kernel<scalar_t, false><<<
+                    grid, KV_BLOCK_SIZE, 0, mfq_current_cuda_stream()>>>(
+                    k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
+                    k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),
+                    positions.data_ptr<int64_t>(), B, H, T, D, max_seq,
+                    pos_dim);
+            }
+        } else {
+            constexpr int block = 256;
+            const size_t elements = rows * D;
+            const int grid = static_cast<int>(std::min<size_t>(
+                4096, (elements + block - 1) / block));
+            kv_cache_write_flat_kernel<scalar_t><<<
+                grid, block, 0, mfq_current_cuda_stream()>>>(
+                    k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
+                    k_cache.data_ptr<scalar_t>(), v_cache.data_ptr<scalar_t>(),
+                    positions.data_ptr<int64_t>(), B, H, T, D, max_seq,
+                    pos_dim);
+        }
     });
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return {k_cache, v_cache};
