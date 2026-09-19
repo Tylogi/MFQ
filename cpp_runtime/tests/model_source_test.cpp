@@ -166,6 +166,8 @@ int main() {
             require(tensor->dtype == "BF16" && tensor->nbytes == 14,
                     "canonical tensor metadata differs by source format");
             require_bytes(source->read("model.token_embedding.weight"));
+            source->drop_file_cache();
+            require_bytes(source->read("model.token_embedding.weight"));
             std::byte ignored{};
             source->read_range_into(
                 "model.token_embedding.weight", 2, &ignored, 0);
