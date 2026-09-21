@@ -7,7 +7,7 @@
 #include "mlx_qwen35_causal_lm.h"
 
 #include "mfq_model_graph.h"
-#include "mfq/server.h"
+#include "mfq/runtime.h"
 
 #include <memory>
 #include <mutex>
@@ -17,9 +17,9 @@
 
 namespace mfq::metal {
 
-// Backend-specific payload translation lives behind this adapter. The HTTP
-// service consumes only these common callbacks and the capabilities recovered
-// from model_graph.json; it never selects a component by model name.
+// Backend-specific payload translation lives behind this adapter. A
+// communication service consumes only these common callbacks; it never
+// selects a component by model name.
 struct MlxServerComponentCallbacks {
     MfqMultimodalGenerateFn multimodal_generate;
     MfqDuplexBackend duplex;

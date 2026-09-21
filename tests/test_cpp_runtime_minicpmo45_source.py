@@ -9,7 +9,7 @@ DECODE = "\n".join(
 )
 CUDA_COMPONENTS = "\n".join(
     (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
-    for name in ("server_components.h", "server_components.cpp")
+    for name in ("runtime_components.h", "runtime_components.cpp")
 )
 ROPE = (ROOT / "mfq" / "kernels" / "cuda" / "rope.cu").read_text(
     encoding="utf-8"
@@ -39,10 +39,10 @@ METAL_COMPONENTS = (
 METAL_PLATFORM = (
     ROOT / "cpp_runtime" / "backends" / "metal" / "runtime" / "mlx_platform.h"
 ).read_text(encoding="utf-8")
-SERVER_HEADER = (ROOT / "cpp_runtime" / "server" / "include" / "mfq" / "server.h").read_text(
+SERVER_HEADER = (ROOT / "cpp_runtime" / "core" / "include" / "mfq" / "runtime.h").read_text(
     encoding="utf-8"
 )
-SERVER_SOURCE = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_text(
+SERVER_SOURCE = (ROOT / "cpp_runtime" / "transport" / "src" / "transport.cpp").read_text(
     encoding="utf-8"
 )
 REALTIME_GATEWAY = (
@@ -263,7 +263,7 @@ def test_minicpmo45_cli_exposes_native_duplex_tensor_contract():
 def test_minicpmo45_cuda_server_binds_the_realtime_backend():
     assert 'a == "--minicpmo-duplex"' not in DECODE
     assert "make_cuda_minicpmo45_duplex_backend(" in DECODE
-    assert "if (server_components.minicpmo)" in DECODE
+    assert "if (runtime_components.minicpmo)" in DECODE
     assert "load_runtime_components(" in DECODE
     assert 'backend.name = "cuda"' in DECODE
     assert "MiniCPMO45Runtime::load_with_language(" in CUDA_COMPONENTS
@@ -284,7 +284,7 @@ def test_minicpmo45_native_servers_share_mfqd_vision_tensors():
     assert "file_reader->read(" in SERVER_SOURCE
     assert 'single_special_token(tokenizer, "<image>")' in SERVER_SOURCE
     assert "MiniCPM-o image placeholder must contain 64 query tokens" in SERVER_SOURCE
-    assert "generate_server_multimodal_tokens(" in DECODE
+    assert "generate_multimodal_tokens(" in DECODE
     assert "runtime.forward(" in DECODE
     assert "mfq::cuda::sample_logits(" in DECODE
     assert "generate_multimodal(" in METAL_HEADER

@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from mfq.server.api import create_app
-from mfq.server.backend import BackendDelta, BackendError, BackendToolCallDelta
+from mfq.server.runtime.backend import BackendDelta, BackendError, BackendToolCallDelta
 from mfq.server.capabilities import capabilities_for_architecture
 from mfq.server.models import (
     CreateResponseRequest,

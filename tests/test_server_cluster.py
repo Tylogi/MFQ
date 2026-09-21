@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from mfq.server.api import create_app
-from mfq.server.backend import BackendDelta, BackendError
+from mfq.server.runtime.backend import BackendDelta, BackendError
 from mfq.server.cluster import ClusterBackend
 from mfq.server.models import (
     CreateRemoteNodeRequest,

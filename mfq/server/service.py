@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from mfq.server.backend import (
+from mfq.server.runtime.backend import (
     BackendDelta,
     BackendError,
     BackendToolCallDelta,

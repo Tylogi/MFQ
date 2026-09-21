@@ -3,7 +3,7 @@ import re
 
 
 CUDA_ROOT = Path(__file__).parents[1] / "cpp_runtime" / "backends" / "cuda"
-CUDA_RUNTIME = (CUDA_ROOT / "runtime" / "cuda_decode_runtime.cpp").read_text(
+CUDA_RUNTIME = (CUDA_ROOT / "runtime" / "cuda_runtime.cpp").read_text(
     encoding="utf-8"
 )
 BACKEND_CHECKS = (
@@ -48,12 +48,12 @@ ACC_SOURCE = (
 ).read_text(encoding="utf-8")
 
 
-def test_minicpmo_native_server_keeps_cuda_graph_enabled() -> None:
+def test_minicpmo_native_runtime_keeps_cuda_graph_enabled() -> None:
     assert "graph_architecture_supported" not in SOURCE
     graph_gate = SOURCE.split(
-        'const char * graph_env = std::getenv("MFQ_SERVER_CUDA_GRAPH");', 1
+        'const char * graph_env = std::getenv("MFQ_RUNTIME_CUDA_GRAPH");', 1
     )[1].split(
-        'const char * graph_min_env = std::getenv(', 1
+        "const char * graph_min_env =", 1
     )[0]
     assert "is_minicpmo45" not in graph_gate
 

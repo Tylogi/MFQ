@@ -3,7 +3,7 @@
 #include "causal_lm.h"
 #include "grid_vision.h"
 #include "mfq_cuda_ops.h"
-#include "mfq/server.h"
+#include "mfq/runtime.h"
 
 #include <algorithm>
 #include <cmath>

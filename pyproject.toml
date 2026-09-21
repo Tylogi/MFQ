@@ -129,7 +129,6 @@ include = ["mfq*"]
 [tool.setuptools.package-data]
 "mfq.server" = [
     "protocol/*.json",
-    "protocol/*.proto",
 ]
 "mfq._vendor.tpq" = [
     "README.md",

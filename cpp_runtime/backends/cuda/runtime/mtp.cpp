@@ -21,17 +21,17 @@
 namespace {
 
 template <typename Model>
-static mfq_tensor_backend::Tensor server_hidden_forward_chunked(
+static mfq_tensor_backend::Tensor hidden_forward_chunked(
     Model& model,
     const mfq_tensor_backend::Tensor & ids,
     int64_t chunk_size,
     mfq_tensor_backend::Tensor * raw_hidden = nullptr) {
     MFQ_RUNTIME_CHECK(
         chunk_size > 0,
-        "server prefill chunk size must be positive");
+        "runtime prefill chunk size must be positive");
     MFQ_RUNTIME_CHECK(
         ids.dim() == 2 && ids.size(0) == 1 && ids.size(1) > 0,
-        "server prefill IDs must have shape [1, tokens]");
+        "runtime prefill IDs must have shape [1, tokens]");
     std::vector<mfq_tensor_backend::Tensor> raw_chunks;
     if (raw_hidden != nullptr) {
         raw_chunks.reserve(static_cast<std::size_t>(
@@ -61,7 +61,7 @@ static mfq_tensor_backend::Tensor server_hidden_forward_chunked(
 }
 
 template <typename Model>
-static mfq_tensor_backend::Tensor server_hidden_forward_prepared_chunked(
+static mfq_tensor_backend::Tensor hidden_forward_prepared_chunked(
     Model& model,
     const mfq_tensor_backend::Tensor& ids,
     const CudaPreparedPrompt& prepared,
@@ -105,9 +105,9 @@ static mfq_tensor_backend::Tensor server_hidden_forward_prepared_chunked(
     return hidden;
 }
 
-class ServerPrefillCudaTimer {
+class PrefillCudaTimer {
 public:
-    ServerPrefillCudaTimer()
+    PrefillCudaTimer()
         : stream_(mfq_get_current_cuda_stream()) {
         MFQ_CUDA_CHECK(cudaEventCreate(&started_));
         try {
@@ -122,7 +122,7 @@ public:
         }
     }
 
-    ~ServerPrefillCudaTimer() {
+    ~PrefillCudaTimer() {
         if (finished_ != nullptr) cudaEventDestroy(finished_);
         if (started_ != nullptr) cudaEventDestroy(started_);
     }
@@ -543,12 +543,12 @@ int32_t run_mtp_generation(
     auto generate = [&]() {
         model.reset(1);
         mtp.reset(1);
-        ServerPrefillCudaTimer timer;
+        PrefillCudaTimer timer;
         Tensor raw;
         auto hidden = transformed_prompt
-            ? server_hidden_forward_prepared_chunked(
+            ? hidden_forward_prepared_chunked(
                   model, input_ids, *prepared, prefill_chunk_size, &raw)
-            : server_hidden_forward_chunked(
+            : hidden_forward_chunked(
                   model, input_ids, prefill_chunk_size, &raw);
         auto logits = logits_for(hidden.narrow(1, hidden.size(1) - 1, 1));
         MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));

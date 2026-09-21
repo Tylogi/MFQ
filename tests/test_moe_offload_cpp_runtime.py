@@ -33,8 +33,8 @@ from tests.test_formats.test_nepq_a import _a_tensor as make_nepq_a  # noqa: E40
 def _executable() -> Path:
     root = Path(__file__).resolve().parents[1]
     for path in (
-        root / "build" / "cpp_runtime" / "mfq-decode.exe",
-        root / "build" / "cuda-local" / "mfq-decode.exe",
+        root / "build" / "cpp_runtime" / "mfq-runtime.exe",
+        root / "build" / "cuda-local" / "mfq-runtime.exe",
     ):
         if path.exists():
             return path

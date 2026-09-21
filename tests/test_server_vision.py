@@ -18,8 +18,9 @@ import torch
 from PIL import Image
 
 from mfq.server import vision as vision_module
-from mfq.server.backend import OpenAIChatBackend
 from mfq.server.models import SamplingParams
+from mfq.server.runtime.backend import OpenAIChatBackend
+from mfq.server.runtime.client import HttpRuntimeClient
 from mfq.server.vision import (
     DeepseekV4VisionProcessor,
     DeepseekV41VisionProcessor,
@@ -788,7 +789,7 @@ def test_backend_sends_shared_vision_tensor_protocol_to_native_worker() -> None:
         maximum_image_slices = 1
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
+        if request.url.path == "/runtime/health":
             return httpx.Response(
                 200,
                 json={"model": "MiniCPM-o", "model_type": "minicpmo"},
@@ -807,7 +808,7 @@ def test_backend_sends_shared_vision_tensor_protocol_to_native_worker() -> None:
 
     async def run() -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        backend = OpenAIChatBackend("http://backend", client=client)
+        backend = OpenAIChatBackend(HttpRuntimeClient("http://backend", client=client))
         backend._vision_processor = TinyProcessor()
         image = Image.new("RGB", (28, 28), (20, 40, 60))
         deltas = [
@@ -834,8 +835,10 @@ def test_backend_sends_shared_vision_tensor_protocol_to_native_worker() -> None:
     asyncio.run(run())
     payload = captured["payload"]
     assert isinstance(payload, dict)
-    assert payload["messages"][0]["content"].startswith("<image_id>0</image_id>")
-    tensors = payload["mfq_multimodal"]
+    assert payload["input"]["messages"][0]["content"].startswith(
+        "<image_id>0</image_id>"
+    )
+    tensors = payload["media"]
     assert tensors["version"] == 1
     assert tensors["pixel_values"]["shape"] == [1, 3, 14, 56]
     assert tensors["patch_mask"]["shape"] == [1, 4]
@@ -851,13 +854,13 @@ def test_backend_cleans_local_binary_tensor_file_after_stream() -> None:
 
     async def handler(request: httpx.Request) -> httpx.Response:
         nonlocal captured_path
-        if request.url.path == "/health":
+        if request.url.path == "/runtime/health":
             return httpx.Response(
                 200,
                 json={"model": "MiniCPM-o", "model_type": "minicpmo"},
             )
         payload = json.loads(request.content)
-        captured_path = payload["mfq_multimodal"]["binary_file"]["path"]
+        captured_path = payload["media"]["binary_file"]["path"]
         assert Path(captured_path).is_file()
         body = (
             'data: {"choices":[{"delta":{"content":"ok"},'
@@ -873,8 +876,7 @@ def test_backend_cleans_local_binary_tensor_file_after_stream() -> None:
     async def run() -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         backend = OpenAIChatBackend(
-            "http://backend",
-            client=client,
+            HttpRuntimeClient("http://backend", client=client),
             local_tensor_files=True,
         )
         backend._vision_processor = TinyProcessor()
@@ -913,12 +915,12 @@ def test_backend_reports_product_level_multimodal_prefill() -> None:
         maximum_image_slices = 1
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
+        if request.url.path == "/runtime/health":
             return httpx.Response(
                 200,
                 json={"model": "MiniCPM-o", "model_type": "minicpmo"},
             )
-        if request.url.path == "/api/status":
+        if request.url.path == "/runtime/status":
             return httpx.Response(
                 200,
                 json={"model": "MiniCPM-o", "last_request": {"id": request_id}},
@@ -955,7 +957,7 @@ def test_backend_reports_product_level_multimodal_prefill() -> None:
 
     async def run() -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        backend = OpenAIChatBackend("http://backend", client=client)
+        backend = OpenAIChatBackend(HttpRuntimeClient("http://backend", client=client))
         backend._vision_processor = TinyProcessor()
         image = Image.new("RGB", (28, 28), (20, 40, 60))
         deltas = [

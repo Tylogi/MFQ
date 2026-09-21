@@ -14,7 +14,7 @@ from uuid import UUID
 
 from pydantic import TypeAdapter, ValidationError
 
-from mfq.server.backend import (
+from mfq.server.runtime.backend import (
     BackendDelta,
     BackendError,
     BackendToolCallDelta,

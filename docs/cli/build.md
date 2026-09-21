@@ -52,8 +52,8 @@ paths:
 | Backend | Executable |
 | --- | --- |
 | Metal | `<repo>/build/cpp_runtime/metal/mfq-decode-metal` |
-| CUDA | `<repo>/build/cpp_runtime/mfq-decode` |
-| CUDA on Windows | Usually `<repo>\build\cpp_runtime\mfq-decode.exe`; multi-configuration generators may add `Release\` |
+| CUDA | `<repo>/build/cpp_runtime/mfq-runtime` |
+| CUDA on Windows | Usually `<repo>\build\cpp_runtime\mfq-runtime.exe`; multi-configuration generators may add `Release\` |
 
 MFQ searches the build tree after compilation, so generators may place the
 executable in a configuration subdirectory.

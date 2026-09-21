@@ -29,7 +29,7 @@ from mfq.server.hf_tokenizer import (
     ensure_mfq_tokenizer_gguf,
     native_hf_asset_environment,
 )
-from mfq.server.native import native_runtime_environment, native_tokenizer_arguments
+from mfq.server.runtime.native import native_runtime_environment, native_tokenizer_arguments
 
 
 def _hf_fixture(

@@ -7,13 +7,14 @@ from uuid import UUID
 import httpx
 import pytest
 
-from mfq.server.backend import BackendError, BackendProtocolError, OpenAIChatBackend
 from mfq.server.models import (
     JsonSchemaResponseFormat,
     NamedToolChoice,
     SamplingParams,
     ToolDefinition,
 )
+from mfq.server.runtime.backend import BackendError, BackendProtocolError, OpenAIChatBackend
+from mfq.server.runtime.client import HttpRuntimeClient
 
 
 def test_backend_stream_parses_cpp_sse_and_preserves_request_fields() -> None:
@@ -21,42 +22,44 @@ def test_backend_stream_parses_cpp_sse_and_preserves_request_fields() -> None:
     backend_key = "unit-test-key"
 
     async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/runtime/generate"
         captured["authorization"] = request.headers.get("authorization")
         captured["payload"] = json.loads(request.content)
+        metadata = {
+            "request_id": "run-1",
+            "created": 1,
+            "model": "model-a",
+        }
         events = [
-            {"choices": [{"delta": {"role": "assistant"}, "finish_reason": None}]},
             {
-                "choices": [
-                    {
-                        "delta": {
-                            "reasoning_content": "think",
-                            "content": "answer",
-                            "tool_calls": [
-                                {
-                                    "index": 0,
-                                    "id": "call-1",
-                                    "function": {"name": "lookup", "arguments": '{"q":'},
-                                }
-                            ],
-                        },
-                        "finish_reason": None,
-                    }
-                ]
+                **metadata,
+                "event": "delta",
+                "delta": {
+                    "reasoning_content": "think",
+                    "content": "answer",
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call-1",
+                            "function": {"name": "lookup", "arguments": '{"q":'},
+                        }
+                    ],
+                },
             },
             {
-                "choices": [
-                    {
-                        "delta": {
-                            "tool_calls": [{"index": 0, "function": {"arguments": '"mfq"}'}}]
-                        },
-                        "finish_reason": "tool_calls",
-                    }
-                ]
+                **metadata,
+                "event": "delta",
+                "delta": {
+                    "tool_calls": [
+                        {"index": 0, "function": {"arguments": '"mfq"}'}}
+                    ]
+                },
             },
             {
-                "choices": [],
-                "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7},
-                "mfq_metrics": {
+                **metadata,
+                "event": "complete",
+                "finish_reason": "tool_calls",
+                "metrics": {
                     "prefill_tokens": 4,
                     "ttft_ms": 12.0,
                     "prefill_ms": 10.0,
@@ -84,6 +87,15 @@ def test_backend_stream_parses_cpp_sse_and_preserves_request_fields() -> None:
                     },
                 },
             },
+            {
+                **metadata,
+                "event": "usage",
+                "usage": {
+                    "prompt_tokens": 4,
+                    "completion_tokens": 3,
+                    "total_tokens": 7,
+                },
+            },
         ]
         body = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
         body += "data: [DONE]\n\n"
@@ -91,7 +103,9 @@ def test_backend_stream_parses_cpp_sse_and_preserves_request_fields() -> None:
 
     async def run() -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        backend = OpenAIChatBackend("http://backend", api_key=backend_key, client=client)
+        backend = OpenAIChatBackend(
+            HttpRuntimeClient("http://backend", api_key=backend_key, client=client)
+        )
         deltas = [
             delta
             async for delta in backend.stream(
@@ -140,20 +154,20 @@ def test_backend_stream_parses_cpp_sse_and_preserves_request_fields() -> None:
             )
         ]
         await client.aclose()
-        assert deltas[1].reasoning_delta == "think"
-        assert deltas[1].content_delta == "answer"
-        assert deltas[1].tool_calls[0].name == "lookup"
-        assert deltas[2].tool_calls[0].arguments_delta == '"mfq"}'
+        assert deltas[0].reasoning_delta == "think"
+        assert deltas[0].content_delta == "answer"
+        assert deltas[0].tool_calls[0].name == "lookup"
+        assert deltas[1].tool_calls[0].arguments_delta == '"mfq"}'
         assert deltas[2].finish_reason == "tool_calls"
         assert deltas[3].usage is not None and deltas[3].usage.total_tokens == 7
-        assert deltas[3].performance is not None
-        assert deltas[3].performance.multimodal_ms == 3.0
-        assert deltas[3].performance.model_prefill_ms == 7.0
-        assert deltas[3].performance.mtp_selected_depth == 5
-        assert deltas[3].performance.mtp_depth_5_cycles == 3
-        assert deltas[3].performance.mtp_position_5_acceptance_rate == 0.5
-        assert deltas[3].performance.mtp_depth_5_cycle_ms == 2.1
-        assert deltas[3].performance.model_dump()["future_runtime_metric"] == 123.0
+        assert deltas[2].performance is not None
+        assert deltas[2].performance.multimodal_ms == 3.0
+        assert deltas[2].performance.model_prefill_ms == 7.0
+        assert deltas[2].performance.mtp_selected_depth == 5
+        assert deltas[2].performance.mtp_depth_5_cycles == 3
+        assert deltas[2].performance.mtp_position_5_acceptance_rate == 0.5
+        assert deltas[2].performance.mtp_depth_5_cycle_ms == 2.1
+        assert deltas[2].performance.model_dump()["future_runtime_metric"] == 123.0
 
     asyncio.run(run())
     assert captured["authorization"] == f"Bearer {backend_key}"
@@ -161,14 +175,14 @@ def test_backend_stream_parses_cpp_sse_and_preserves_request_fields() -> None:
     assert isinstance(payload, dict)
     assert payload["model"] == "model-a"
     assert payload["stream"] is True
-    assert payload["stream_options"] == {"include_usage": True}
-    assert payload["max_tokens"] == 12
-    assert payload["seed"] == 7
-    assert payload["enable_vision"] is True
-    assert payload["enable_mtp"] is True
-    assert payload["mtp_max_draft_tokens"] == 3
-    assert payload["mfq_session_id"] == "11111111-1111-4111-8111-111111111111"
-    assert payload["chat_template_kwargs"] == {
+    assert payload["include_usage"] is True
+    assert payload["sampling"]["max_new_tokens"] == 12
+    assert payload["sampling"]["seed"] == 7
+    assert payload["sampling"]["enable_vision"] is True
+    assert payload["sampling"]["enable_mtp"] is True
+    assert payload["sampling"]["mtp_max_draft_tokens"] == 3
+    assert payload["session_id"] == "11111111-1111-4111-8111-111111111111"
+    assert payload["template"] == {
         "enable_thinking": True,
         "reasoning_effort": "high",
     }
@@ -201,7 +215,7 @@ def test_backend_splits_deepseek_v4_raw_reasoning_across_sse_chunks() -> None:
 
     async def run() -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        backend = OpenAIChatBackend("http://backend", client=client)
+        backend = OpenAIChatBackend(HttpRuntimeClient("http://backend", client=client))
         deltas = [
             delta
             async for delta in backend.stream(
@@ -219,8 +233,8 @@ def test_backend_splits_deepseek_v4_raw_reasoning_across_sse_chunks() -> None:
     asyncio.run(run())
     payload = captured["payload"]
     assert isinstance(payload, dict)
-    assert payload["reasoning_format"] == "none"
-    assert "mfq_preformatted_prompt" in payload
+    assert payload["output"]["reasoning_format"] == "none"
+    assert "preformatted_prompt" in payload["input"]
 
 
 def test_backend_converts_deepseek_v4_dsml_content_to_openai_tool_calls() -> None:
@@ -272,8 +286,7 @@ def test_backend_converts_deepseek_v4_dsml_content_to_openai_tool_calls() -> Non
     async def run() -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         backend = OpenAIChatBackend(
-            "http://backend",
-            client=client,
+            HttpRuntimeClient("http://backend", client=client),
             model_type="deepseek_v4_vision",
         )
         tool = ToolDefinition.model_validate(
@@ -317,9 +330,9 @@ def test_backend_converts_deepseek_v4_dsml_content_to_openai_tool_calls() -> Non
     asyncio.run(run())
     payload = captured["payload"]
     assert isinstance(payload, dict)
-    assert payload["reasoning_format"] == "none"
+    assert payload["output"]["reasoning_format"] == "none"
     assert payload["tool_choice"] == "required"
-    prompt = payload["mfq_preformatted_prompt"]
+    prompt = payload["input"]["preformatted_prompt"]
     assert isinstance(prompt, str)
     assert prompt.startswith("<｜begin▁of▁sentence｜>")
     assert '"name": "write"' in prompt
@@ -358,8 +371,7 @@ def test_backend_uses_v41_prompt_and_spaced_dsml_parser() -> None:
     async def run() -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         backend = OpenAIChatBackend(
-            "http://backend",
-            client=client,
+            HttpRuntimeClient("http://backend", client=client),
             model_type="deepseek_v41_vision",
         )
         tool = ToolDefinition.model_validate(
@@ -394,8 +406,8 @@ def test_backend_uses_v41_prompt_and_spaced_dsml_parser() -> None:
     asyncio.run(run())
     payload = captured["payload"]
     assert isinstance(payload, dict)
-    assert "<｜System｜>" in payload["mfq_preformatted_prompt"]
-    assert "<｜DSML｜ calls>" in payload["mfq_preformatted_prompt"]
+    assert "<｜System｜>" in payload["input"]["preformatted_prompt"]
+    assert "<｜DSML｜ calls>" in payload["input"]["preformatted_prompt"]
 
 
 @pytest.mark.parametrize(
@@ -446,7 +458,7 @@ def test_backend_normalizes_registered_qwen_and_glm_output_protocols(
 
     async def run() -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        backend = OpenAIChatBackend("http://backend", client=client)
+        backend = OpenAIChatBackend(HttpRuntimeClient("http://backend", client=client))
         backend._model_type = model_type
         tool = ToolDefinition.model_validate(
             {
@@ -485,7 +497,7 @@ def test_backend_normalizes_registered_qwen_and_glm_output_protocols(
     asyncio.run(run())
     payload = captured["payload"]
     assert isinstance(payload, dict)
-    assert payload["reasoning_format"] == "auto"
+    assert payload["output"]["reasoning_format"] == "auto"
 
 
 def test_backend_explicit_cancel_retries_the_native_activation_boundary() -> None:
@@ -495,14 +507,14 @@ def test_backend_explicit_cancel_retries_the_native_activation_boundary() -> Non
         nonlocal attempts
         assert request.method == "POST"
         assert request.url.path == (
-            "/api/runtime/sessions/11111111-1111-4111-8111-111111111111/cancel"
+            "/runtime/sessions/11111111-1111-4111-8111-111111111111/cancel"
         )
         attempts += 1
         return httpx.Response(200, json={"status": "ok", "cancelled": attempts >= 2})
 
     async def run() -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        backend = OpenAIChatBackend("http://backend", client=client)
+        backend = OpenAIChatBackend(HttpRuntimeClient("http://backend", client=client))
         assert await backend.cancel_response(
             UUID("11111111-1111-4111-8111-111111111111")
         )
@@ -518,15 +530,15 @@ def test_backend_proxies_runtime_console_resources() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content) if request.content else None
         requests.append((request.method, request.url.path, body))
-        if request.url.path == "/v1/models":
-            return httpx.Response(200, json={"data": [{"id": "model-a"}]})
-        if request.url.path == "/realtime/capabilities":
+        if request.url.path == "/runtime/models":
+            return httpx.Response(200, json={"models": [{"name": "model-a"}]})
+        if request.url.path == "/runtime/realtime/capabilities":
             return httpx.Response(200, json={"available": True})
         return httpx.Response(200, json={"model": "model-a", "max_context": 8192})
 
     async def run() -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        backend = OpenAIChatBackend("http://backend", client=client)
+        backend = OpenAIChatBackend(HttpRuntimeClient("http://backend", client=client))
         assert (await backend.runtime_status())["max_context"] == 8192
         assert (await backend.runtime_models())["data"][0]["id"] == "model-a"
         assert (await backend.realtime_capabilities())["available"] is True
@@ -537,12 +549,12 @@ def test_backend_proxies_runtime_console_resources() -> None:
 
     asyncio.run(run())
     assert requests == [
-        ("GET", "/api/status", None),
-        ("GET", "/v1/models", None),
-        ("GET", "/realtime/capabilities", None),
-        ("POST", "/api/reload", {"context_size": 16384}),
-        ("POST", "/api/runtime/cache/clear", None),
-        ("POST", "/api/runtime/cache/trim", {"target_bytes": 4096}),
+        ("GET", "/runtime/status", None),
+        ("GET", "/runtime/models", None),
+        ("GET", "/runtime/realtime/capabilities", None),
+        ("POST", "/runtime/reload", {"context_size": 16384}),
+        ("POST", "/runtime/cache/clear", None),
+        ("POST", "/runtime/cache/trim", {"target_bytes": 4096}),
     ]
 
 
@@ -552,7 +564,7 @@ def test_backend_bounds_local_control_requests_by_operation() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         timeout = request.extensions.get("timeout", {})
         observed[request.url.path] = float(timeout["read"])
-        if request.url.path == "/health":
+        if request.url.path == "/runtime/health":
             return httpx.Response(
                 200,
                 json={"model": "model-a", "model_type": "qwen3"},
@@ -565,10 +577,12 @@ def test_backend_bounds_local_control_requests_by_operation() -> None:
         session_id = UUID("11111111-1111-4111-8111-111111111111")
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         backend = OpenAIChatBackend(
-            "http://backend",
-            client=client,
-            control_timeout_seconds=7,
-            long_control_timeout_seconds=11,
+            HttpRuntimeClient(
+                "http://backend",
+                client=client,
+                control_timeout_seconds=7,
+                long_control_timeout_seconds=11,
+            )
         )
         await backend.capabilities()
         await backend.runtime_status()
@@ -581,13 +595,13 @@ def test_backend_bounds_local_control_requests_by_operation() -> None:
 
     asyncio.run(run())
     assert observed == {
-        "/health": 7,
-        "/api/status": 7,
-        "/api/reload": 11,
-        "/api/runtime/cache/clear": 11,
-        "/api/runtime/cache/trim": 7,
-        "/api/runtime/sessions/11111111-1111-4111-8111-111111111111": 7,
-        "/api/runtime/sessions/11111111-1111-4111-8111-111111111111/cancel": 1,
+        "/runtime/health": 7,
+        "/runtime/status": 7,
+        "/runtime/reload": 11,
+        "/runtime/cache/clear": 11,
+        "/runtime/cache/trim": 7,
+        "/runtime/sessions/11111111-1111-4111-8111-111111111111": 7,
+        "/runtime/sessions/11111111-1111-4111-8111-111111111111/cancel": 1,
     }
 
 
@@ -611,7 +625,9 @@ def test_backend_forwards_runtime_session_lifecycle() -> None:
         source = UUID("11111111-1111-4111-8111-111111111111")
         target = UUID("22222222-2222-4222-8222-222222222222")
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        backend = OpenAIChatBackend("http://backend", api_key=backend_key, client=client)
+        backend = OpenAIChatBackend(
+            HttpRuntimeClient("http://backend", api_key=backend_key, client=client)
+        )
         assert await backend.fork_session(source, target)
         assert await backend.close_session(target)
         await client.aclose()
@@ -620,7 +636,7 @@ def test_backend_forwards_runtime_session_lifecycle() -> None:
     assert requests == [
         (
             "POST",
-            "/api/runtime/sessions/fork",
+            "/runtime/sessions/fork",
             {
                 "source_session_id": "11111111-1111-4111-8111-111111111111",
                 "target_session_id": "22222222-2222-4222-8222-222222222222",
@@ -629,7 +645,7 @@ def test_backend_forwards_runtime_session_lifecycle() -> None:
         ),
         (
             "DELETE",
-            "/api/runtime/sessions/22222222-2222-4222-8222-222222222222",
+            "/runtime/sessions/22222222-2222-4222-8222-222222222222",
             None,
             f"Bearer {backend_key}",
         ),
@@ -654,9 +670,11 @@ def test_backend_reads_registered_model_capabilities_from_health() -> None:
     async def run() -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         backend = OpenAIChatBackend(
-            "http://backend",
-            api_key=test_credential,
-            client=client,
+            HttpRuntimeClient(
+                "http://backend",
+                api_key=test_credential,
+                client=client,
+            )
         )
         capabilities = await backend.capabilities()
         await client.aclose()
@@ -677,7 +695,7 @@ def test_backend_session_lifecycle_is_optional_for_older_runtimes() -> None:
     async def run() -> None:
         session_id = UUID("11111111-1111-4111-8111-111111111111")
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        backend = OpenAIChatBackend("http://backend", client=client)
+        backend = OpenAIChatBackend(HttpRuntimeClient("http://backend", client=client))
         assert not await backend.close_session(session_id)
         await client.aclose()
 
@@ -713,7 +731,7 @@ def test_backend_stream_rejects_incomplete_or_failed_responses(
 
     async def run() -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        backend = OpenAIChatBackend("http://backend", client=client)
+        backend = OpenAIChatBackend(HttpRuntimeClient("http://backend", client=client))
         with pytest.raises(BackendError) as caught:
             _ = [
                 delta

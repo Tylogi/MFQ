@@ -3,7 +3,7 @@
 #include "causal_lm.h"
 #include "mfq_cuda_mtp.h"
 #include "mfq_tensor_backend.h"
-#include "mfq/server.h"
+#include "mfq/runtime.h"
 
 #include <cstdint>
 #include <functional>
@@ -35,7 +35,7 @@ struct MtpBlockDraft {
 };
 
 // Generation sees one predictor contract. Architecture-specific modules own their
-// equations and cache layout; the server does not branch on architecture.
+// equations and cache layout; the runtime does not branch on architecture.
 struct MtpModule {
     virtual ~MtpModule() = default;
     virtual void reset(int64_t batch = 1) = 0;

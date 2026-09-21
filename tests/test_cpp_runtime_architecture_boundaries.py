@@ -55,11 +55,11 @@ CUDA_MTP_HEADER = (
     ROOT / "cpp_runtime" / "backends" / "cuda" / "include" / "mfq_cuda_mtp.h"
 ).read_text(encoding="utf-8")
 CUDA_APP = (
-    ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp"
+    ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "runtime_main.cpp"
 ).read_text(encoding="utf-8")
 CUDA_MODELS = ROOT / "cpp_runtime" / "backends" / "cuda" / "models"
 CUDA_RUNTIME = ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime"
-CUDA_RUNTIME_SOURCE = (CUDA_RUNTIME / "cuda_decode_runtime.cpp").read_text(
+CUDA_RUNTIME_SOURCE = (CUDA_RUNTIME / "cuda_runtime.cpp").read_text(
     encoding="utf-8"
 )
 CUDA_MTP_SOURCE = (CUDA_RUNTIME / "mtp.cpp").read_text(encoding="utf-8")
@@ -180,17 +180,22 @@ def test_native_cli_uses_backend_neutral_model_and_tokenizer_options() -> None:
 
 
 def test_cuda_cli_is_a_thin_client_of_the_runtime_library() -> None:
-    assert "mfq::cuda::run_decode(argc, argv)" in CUDA_APP
+    assert "mfq::cuda::run_runtime(argc, argv)" in CUDA_APP
     assert len(CUDA_APP.splitlines()) <= 10
     assert "struct Model" not in CUDA_APP
     assert "run_linear_check" not in CUDA_APP
 
-    cmake = (ROOT / "cpp_runtime" / "cmake" / "CudaRuntime.cmake").read_text(
+    cmake = (ROOT / "cpp_runtime" / "backends" / "cuda" / "CMakeLists.txt").read_text(
         encoding="utf-8"
     )
     assert "add_library(mfq-cuda-runtime STATIC" in cmake
-    assert "runtime/cuda_decode_runtime.cpp" in cmake
-    assert "target_link_libraries(mfq-decode PRIVATE mfq-cuda-runtime)" in cmake
+    assert "runtime/cuda_runtime.cpp" in cmake
+    assert "add_executable(mfq-runtime\n" in cmake
+    assert "target_link_libraries(mfq-runtime PRIVATE mfq-cuda-runtime)" in cmake
+    assert ("mfq-" + "decode") not in cmake
+    assert '"--server"' not in CUDA_RUNTIME_SOURCE
+    assert '"--stdio"' not in CUDA_RUNTIME_SOURCE
+    assert "MFQ_SERVER_" not in CUDA_RUNTIME_SOURCE
 
 
 def test_development_rules_forbid_architecture_bound_reuse() -> None:
@@ -314,10 +319,10 @@ def test_qwen4_qsa_caches_completed_index_blocks_incrementally() -> None:
     assert "trim_pooled_index_cache();" in QWEN4
 
 
-def test_native_server_prewarms_shared_ssd_arenas_on_load_and_reload() -> None:
+def test_native_runtime_prewarms_shared_ssd_arenas_on_load_and_reload() -> None:
     serving = DECODE_APP[
-        DECODE_APP.index("int serve_loaded_runtime(") :
-        DECODE_APP.index("int run_native_server(")
+        DECODE_APP.index("int run_loaded_runtime(") :
+        DECODE_APP.index("int run_native_runtime(")
     ]
     assert "runtime.prewarm_ssd_expert_arena();" in serving
     # Three capability checks and their matching calls cover initial load,
@@ -661,11 +666,12 @@ def test_model_config_parsing_is_backend_neutral() -> None:
 
 
 def test_cuda_model_runtime_uses_compiled_causal_lm_adapters() -> None:
-    cmake = (ROOT / "cpp_runtime" / "cmake" / "CudaRuntime.cmake").read_text(
+    cmake = (ROOT / "cpp_runtime" / "backends" / "cuda" / "CMakeLists.txt").read_text(
         encoding="utf-8"
     )
     adapters = {
-        "flash_next": "qwen4_causal_lm",
+        "qwen4_exp": "causal_lm",
+        "glm5_next": "causal_lm",
         "deepseek_v41": "deepseek_v41_causal_lm",
         "deepseek_v4": "deepseek_v4_causal_lm",
         "glm_dsa": "glm_dsa_causal_lm",
@@ -721,7 +727,7 @@ def test_cuda_model_runtime_uses_compiled_causal_lm_adapters() -> None:
 
 def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
     cuda = ROOT / "cpp_runtime" / "backends" / "cuda"
-    cmake = (ROOT / "cpp_runtime" / "cmake" / "CudaRuntime.cmake").read_text(
+    cmake = (ROOT / "cpp_runtime" / "backends" / "cuda" / "CMakeLists.txt").read_text(
         encoding="utf-8"
     )
     required = (
@@ -732,7 +738,7 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         "runtime/cuda_transformer.cpp",
         "runtime/cuda_transformer_loader.cpp",
         "runtime/mtp.cpp",
-        "runtime/server_components.cpp",
+        "runtime/runtime_components.cpp",
         "runtime/diagnostics/backend_checks.cpp",
         "runtime/diagnostics/model_checks.cpp",
     )

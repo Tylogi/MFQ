@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from mfq.server.backend import BackendDelta
+from mfq.server.runtime.backend import BackendDelta
 from mfq.server.documents import DocumentExtractionError, extract_document
 from mfq.server.models import CreateDocumentRequest, CreateSessionRequest
 from mfq.server.service import ServerService

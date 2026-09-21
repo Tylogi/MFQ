@@ -355,19 +355,20 @@ add_custom_command(
     COMMENT "Building the shared native Metal runtime bundle"
 )
 
-if(TARGET mfq-server)
+if(TARGET mfq-runtime-communication)
     target_sources(mfq-decode-metal PRIVATE
         runtime/mlx_server_components.cpp
     )
-    target_link_libraries(mfq-decode-metal PRIVATE mfq-server)
-    target_compile_definitions(mfq-decode-metal PRIVATE MFQ_METAL_SERVER=1)
+    target_link_libraries(mfq-decode-metal PRIVATE mfq-runtime-communication)
+    target_compile_definitions(
+        mfq-decode-metal PRIVATE MFQ_METAL_RUNTIME_COMMUNICATION=1)
 
     add_executable(mfq-perplexity
         apps/mfq_perplexity_mlx.cpp
     )
     target_link_libraries(mfq-perplexity PRIVATE
         mfq-metal-runtime
-        mfq-server
+        mfq-runtime-communication
     )
     target_compile_features(mfq-perplexity PRIVATE cxx_std_20)
     set_target_properties(mfq-perplexity PROPERTIES

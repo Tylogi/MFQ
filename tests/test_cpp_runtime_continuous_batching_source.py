@@ -38,8 +38,8 @@ def test_continuous_batching_is_an_explicit_server_mode():
 
 def test_cuda_server_prefill_is_bounded_for_serial_mtp_and_batched_paths():
     assert '"--prefill-chunk-size"' in DECODE
-    assert "server_prefill_tail(" in DECODE
-    assert "server_hidden_forward_chunked(" in DECODE
+    assert "prefill_tail(" in DECODE
+    assert "hidden_forward_chunked(" in DECODE
     assert "prefill_chunk_size_" in BATCHING
     assert "std::optional<QwenBatchState> prefill_state" in BATCHING
     assert "advance_prefills(incoming, contended)" in BATCHING

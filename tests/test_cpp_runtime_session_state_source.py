@@ -23,8 +23,8 @@ METAL_DSV41 = (
 METAL_MINICPM = (
     ROOT / "cpp_runtime" / "backends" / "metal" / "models/minicpmo45" / "mlx_minicpmo45.cpp"
 ).read_text(encoding="utf-8")
-SERVER = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_text(encoding="utf-8")
-HEADER = (ROOT / "cpp_runtime" / "server" / "include" / "mfq" / "server.h").read_text(encoding="utf-8")
+SERVER = (ROOT / "cpp_runtime" / "transport" / "src" / "transport.cpp").read_text(encoding="utf-8")
+HEADER = (ROOT / "cpp_runtime" / "core" / "include" / "mfq" / "runtime.h").read_text(encoding="utf-8")
 PAGED_HEADER = (ROOT / "cpp_runtime" / "core" / "mfq_paged_prefix_cache.h").read_text(
     encoding="utf-8"
 )
@@ -101,17 +101,18 @@ def test_session_cache_uses_exact_prefixes_and_reports_suffix_prefill() -> None:
     assert "tokens.begin(), tokens.end(), prompt.begin()))" in DECODE
     assert "tokens.size() >= prompt.size()" in DECODE
     assert "prompt.size() - reused_tokens" in DECODE
-    assert "MFQ_SERVER_MAX_KV_SESSIONS" in DECODE
-    assert "MFQ_SERVER_MAX_KV_SNAPSHOTS_PER_SESSION" in DECODE
-    assert "MFQ_SERVER_KV_SESSION_BYTES" in DECODE
+    assert "MFQ_RUNTIME_MAX_KV_SESSIONS" in DECODE
+    assert "MFQ_RUNTIME_MAX_KV_SNAPSHOTS_PER_SESSION" in DECODE
+    assert "MFQ_RUNTIME_KV_SESSION_BYTES" in DECODE
+    assert "MFQ_SERVER_" not in DECODE
 
 
 def test_session_cache_retains_history_and_exposes_lifecycle_controls() -> None:
     assert "std::vector<TextSessionState>> states_" in DECODE
     assert "fork_session(" in DECODE
     assert "close_session(" in DECODE
-    assert 'server.Post("/api/runtime/sessions/fork"' in SERVER
-    assert 'R"(/api/runtime/sessions/' in SERVER
+    assert 'server.Post("/runtime/sessions/fork"' in SERVER
+    assert 'R"(/runtime/sessions/' in SERVER
     assert "MfqSessionControl" in HEADER
 
 
@@ -207,7 +208,7 @@ def test_persistent_prefix_cache_is_content_addressed_and_restart_safe() -> None
 def test_tiered_prefix_cache_can_release_only_its_hot_payloads() -> None:
     assert "std::uint64_t trim_hot(" in PAGED_HEADER
     assert "pins_.count(iterator->first) != 0" in PAGED_SOURCE
-    assert 'server.Post("/api/runtime/cache/trim"' in SERVER
+    assert 'server.Post("/runtime/cache/trim"' in SERVER
     assert "session_control.trim_hot" in SERVER
     assert "session_control.trim_hot" in METAL_DECODE
     assert "text_session_cache.trim_hot(target_bytes)" in DECODE
@@ -239,6 +240,6 @@ def test_cuda_paged_cache_only_accepts_linear_full_attention_kv() -> None:
     assert "make_cuda_paged_prefix_cache(" in DECODE
     assert "backend=cuda action=paged_hit" in DECODE
     assert "prefix_cache_disk_blocks" in DECODE
-    assert "MFQ_SERVER_PREFIX_CACHE_PENDING_BYTES" in DECODE
+    assert "MFQ_RUNTIME_PREFIX_CACHE_PENDING_BYTES" in DECODE
     assert "prefix_cache_pending_max_bytes" in DECODE
     assert "paged_cache_->load_prefix(match.blocks)" in DECODE

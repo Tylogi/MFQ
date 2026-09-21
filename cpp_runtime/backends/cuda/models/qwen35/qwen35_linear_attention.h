@@ -387,7 +387,7 @@ struct LinearAttentionBlock final : ::Block {
             q = qkv_fast[0];
             k = qkv_fast[1];
             v = qkv_fast[2];
-            // Server CUDA graphs retain this state storage address across requests.
+            // Runtime CUDA graphs retain this state storage address across requests.
             conv_state.copy_(qkv_fast[3]);
         } else if (T == 1 && split_in_proj) {
             auto qkv_fast = g_profiler.measure("linear.conv_qkv_decode", [&]() {

@@ -2,13 +2,13 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SERVER = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_text(
+SERVER = (ROOT / "cpp_runtime" / "transport" / "src" / "transport.cpp").read_text(
     encoding="utf-8"
 )
 CUDA_RUNTIME = ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime"
 DECODE = "\n".join(
     (CUDA_RUNTIME / name).read_text(encoding="utf-8")
-    for name in ("cuda_decode_runtime.cpp", "cuda_sampling.h", "mtp.cpp")
+    for name in ("cuda_runtime.cpp", "cuda_sampling.h", "mtp.cpp")
 )
 CMAKE = (ROOT / "cpp_runtime" / "CMakeLists.txt").read_text(
     encoding="utf-8"
@@ -17,7 +17,7 @@ TOKENIZER_CMAKE = (
     ROOT / "cpp_runtime" / "components" / "tokenizer" / "CMakeLists.txt"
 ).read_text(encoding="utf-8")
 SERVER_CMAKE = (
-    ROOT / "cpp_runtime" / "server" / "CMakeLists.txt"
+    ROOT / "cpp_runtime" / "transport" / "CMakeLists.txt"
 ).read_text(encoding="utf-8")
 METAL_CMAKE = (
     ROOT / "cpp_runtime" / "backends" / "metal" / "CMakeLists.txt"
@@ -124,7 +124,7 @@ def test_server_enforces_complete_chat_template_tool_calls() -> None:
 
 
 def test_native_server_cancels_active_session_generation_per_token() -> None:
-    assert 'R"(/api/runtime/sessions/([A-Za-z0-9._:-]{1,128})/cancel)"' in SERVER
+    assert 'R"(/runtime/sessions/([A-Za-z0-9._:-]{1,128})/cancel)"' in SERVER
     assert "request_cancellations.cancel(session_id)" in SERVER
     assert "cancel_requested->load(std::memory_order_acquire)" in SERVER
     assert 'result.finish_reason = "cancelled"' in SERVER
@@ -141,10 +141,16 @@ def test_server_links_integrated_text_runtime() -> None:
     assert "BUILD_WITH_INSTALL_RPATH ON" in METAL_CMAKE
 
 
-def test_cuda_server_accepts_an_external_tokenizer_only() -> None:
-    assert "model server does not accept an external model config" in DECODE
-    assert "model server requires model config and tokenizer GGUF" in DECODE
-    assert "server_config.tokenizer_model = tokenizer_model" in DECODE
+def test_cpp_runtime_transport_has_no_public_openai_routes() -> None:
+    assert '"/v1/' not in SERVER
+    assert '"/api/' not in SERVER
+    assert 'server.Post("/runtime/generate"' in SERVER
+
+
+def test_cuda_runtime_accepts_an_external_tokenizer_only() -> None:
+    assert "model runtime does not accept an external model config" in DECODE
+    assert "model runtime requires model config and tokenizer GGUF" in DECODE
+    assert "transport_config.tokenizer_model = tokenizer_model" in DECODE
 
 
 def test_studio_keeps_reasoning_separate_and_template_controlled() -> None:
@@ -185,7 +191,7 @@ def test_studio_can_reload_model_with_a_new_context() -> None:
     assert "async function reloadRuntime()" in STUDIO_APP
     assert "api.reloadRuntime(contextSize, runtime?.instance_id)" in STUDIO_APP
     assert 'request("/api/v1/runtime/reload"' in STUDIO_API
-    assert 'server.Post("/api/reload"' in SERVER
+    assert 'server.Post("/runtime/reload"' in SERVER
     assert "context_size must be within the model context capacity" in SERVER
 
 

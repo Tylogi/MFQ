@@ -4,7 +4,7 @@
 #include "qwen_paged_kv.h"
 #include "../models/qwen35/qwen35_linear_attention.h"
 
-// Included by mfq_decode.cpp after the CUDA Qwen model and sampler are defined.
+// Included by cuda_runtime.cpp after the CUDA Qwen model and sampler are defined.
 // The scheduler owns request concurrency; the adapter below owns the hybrid
 // full-attention/recurrent state carried between decode iterations.
 
@@ -83,9 +83,10 @@ static bool qwen_continuous_batch_packed_metadata_enabled() {
 static bool qwen_continuous_batch_cuda_graph_enabled(const mfq::cuda::Qwen35CausalLm & model) {
     const char * environment = std::getenv(
         "MFQ_CONTINUOUS_BATCH_CUDA_GRAPH");
-    const char * server_environment = std::getenv("MFQ_SERVER_CUDA_GRAPH");
+    const char * runtime_environment =
+        std::getenv("MFQ_RUNTIME_CUDA_GRAPH");
     return (environment == nullptr || std::atoi(environment) != 0) &&
-        (server_environment == nullptr || server_environment[0] != '0') &&
+        (runtime_environment == nullptr || runtime_environment[0] != '0') &&
         mfq_cuda_graph_capture_supported() &&
         model_parallel_cuda_graph_enabled();
 }
@@ -592,7 +593,7 @@ private:
         Tensor counts;
         Tensor prefill_ids;
         std::optional<QwenBatchState> prefill_state;
-        std::vector<std::unique_ptr<ServerPrefillCudaTimer>> prefill_timers;
+        std::vector<std::unique_ptr<PrefillCudaTimer>> prefill_timers;
         int64_t prefill_offset = 0;
         int32_t generation_limit = 0;
         int32_t produced = 0;
@@ -783,14 +784,14 @@ private:
                     initialize_sampling(*request, request->prefill_ids);
                 }
                 Tensor hidden;
-                std::unique_ptr<ServerPrefillCudaTimer> final_timer;
+                std::unique_ptr<PrefillCudaTimer> final_timer;
                 do {
                     const int64_t count = std::min(
                         prefill_chunk_size_,
                         request->prefill_ids.size(1) -
                             request->prefill_offset);
                     auto chunk_timer =
-                        std::make_unique<ServerPrefillCudaTimer>();
+                        std::make_unique<PrefillCudaTimer>();
                     hidden = model_.hidden_forward(
                         request->prefill_ids.narrow(
                             1, request->prefill_offset, count).contiguous());
@@ -1019,7 +1020,7 @@ private:
             requested_len = std::max(
                 requested_len, request->cache_length + remaining);
         }
-        const int64_t planned_len = server_decode_graph_bucket(
+        const int64_t planned_len = decode_graph_bucket(
             requested_len, model_.max_position_embeddings());
         const char * graph_min_environment = std::getenv(
             "MFQ_CONTINUOUS_BATCH_CUDA_GRAPH_MIN_TOKENS");
@@ -1448,10 +1449,10 @@ static int run_qwen_continuous_batching_check(mfq::cuda::Qwen35CausalLm & model)
                       const MfqSamplingParams & params) {
         std::vector<int64_t> output;
         std::mutex mutex;
-        ServerDecodeGraphCache graph_cache(
+        DecodeGraphCache graph_cache(
             model.max_position_embeddings());
-        ServerTextSessionCache session_cache;
-        const int32_t produced = generate_server_tokens(
+        TextSessionCache session_cache;
+        const int32_t produced = generate_tokens(
             model, mutex, graph_cache, session_cache, prompt, params,
             [&](int64_t token) {
                 output.push_back(token);

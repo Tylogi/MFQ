@@ -1,7 +1,7 @@
 # MFQ tokenizer component
 
 This is MFQ's minimal native text-processing runtime. It contains only the
-components needed by `mfq-server`:
+components needed by `mfq-runtime-communication`:
 
 - GGUF metadata parsing;
 - tokenizer and detokenizer implementations;

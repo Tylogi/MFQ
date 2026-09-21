@@ -399,7 +399,7 @@ def write_glm_fixture(path,config,weights,predictor=False):
 def run_glm_fixture(path):
     bridge=os.environ.get("MFQ_FLASH_NEXT_NATIVE_TEST")
     if not bridge:pytest.skip("MFQ_FLASH_NEXT_NATIVE_TEST required")
-    binary=Path(bridge).with_name("mfq-decode")
+    binary=Path(bridge).with_name("mfq-runtime")
     return subprocess.run([str(binary),"--model",str(path),"--ctx-size","32","--check-flash-next"],
                           text=True,capture_output=True,timeout=90)
 
@@ -882,7 +882,7 @@ def mtp_fixture(family,layers=2):
 def run_mtp_fixture(path):
     bridge=os.environ.get("MFQ_FLASH_NEXT_NATIVE_TEST")
     if not bridge:pytest.skip("MFQ_FLASH_NEXT_NATIVE_TEST required")
-    return subprocess.run([str(Path(bridge).with_name("mfq-decode")),"--model",str(path),"--ctx-size","32","--check-flash-next-mtp"],
+    return subprocess.run([str(Path(bridge).with_name("mfq-runtime")),"--model",str(path),"--ctx-size","32","--check-flash-next-mtp"],
         text=True,capture_output=True,timeout=90)
 
 

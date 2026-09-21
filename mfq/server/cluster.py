@@ -17,15 +17,15 @@ from uuid import UUID, uuid4
 
 import httpx
 
-from mfq.server.backend import (
+from mfq.server.runtime.backend import (
     BackendDelta,
     BackendError,
     BackendToolCallDelta,
     ChatBackend,
     closing_backend_stream,
-    iter_sse_data,
     preflight_backend_request,
 )
+from mfq.server.runtime.client import iter_sse_data
 from mfq.server.models import (
     RemoteNodeResource,
     ResponseFormat,

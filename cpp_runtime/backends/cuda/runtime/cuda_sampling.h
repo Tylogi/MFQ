@@ -1,7 +1,7 @@
 #pragma once
 
 #include "mfq/sampling.h"
-#include "mfq/server.h"
+#include "mfq/runtime.h"
 #include "mfq_cuda_ops.h"
 
 #include <cstddef>

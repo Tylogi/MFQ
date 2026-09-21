@@ -3,8 +3,8 @@
 // Architecture-specific CLI diagnostics. Production generation uses the
 // common MtpModule path and does not depend on these concrete types.
 
-template <typename Model>
-static int run_flash_next_mtp_check(Model& model, FlashNextMtp& mtp) {
+template <typename Model, typename Predictor>
+static int run_flash_next_mtp_check(Model& model, Predictor& mtp) {
     namespace tb=mfq_tensor_backend;
     const MtpTarget target{
         [&model](tb::Tensor ids) {
@@ -61,7 +61,7 @@ static int run_flash_next_mtp_check(Model& model, FlashNextMtp& mtp) {
     model.reset(1);tb::Tensor raw;
     auto normalized=model.hidden_forward(ids,mfq_nullopt,mfq_nullopt,nullptr,mfq_nullopt,&raw);
     result["target_raw"]=json_tensor(raw);result["target_normalized"]=json_tensor(normalized);
-    // Exercise the production server generation path, target rollback and
+    // Exercise the production runtime generation path, target rollback and
     // callback early-stop. The two architectures retain distinct head equations.
     MfqSamplingParams sampling;sampling.max_tokens=12;sampling.temperature=0;sampling.top_k=1;
     std::vector<int64_t> prompt{1,2,3,4,5,6,7},expected,generated;

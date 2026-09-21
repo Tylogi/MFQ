@@ -1,0 +1,7 @@
+#pragma once
+
+namespace mfq::cuda {
+
+int run_runtime(int argc, char** argv);
+
+} // namespace mfq::cuda

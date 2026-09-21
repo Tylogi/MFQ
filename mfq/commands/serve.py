@@ -224,7 +224,7 @@ def _run(args: argparse.Namespace) -> int:
     from mfq.server.components import VoiceOutputComponent
     from mfq.server.jobs import JobManager
     from mfq.server.models import ModelLoadRequest
-    from mfq.server.runtime_pool import RuntimePool
+    from mfq.server.runtime.pool import RuntimePool
     from mfq.server.service import ServerService
     from mfq.server.storage import SessionStore
     from mfq.server.tool_jobs import ToolJobHandlers, ToolJobPaths
@@ -240,21 +240,21 @@ def _run(args: argparse.Namespace) -> int:
     executable = _resolve_runtime_executable(selected_backend, args.running_executable)
     runtime_environment: dict[str, str] = {}
     if args.no_prefix_cache:
-        runtime_environment["MFQ_SERVER_DISABLE_PREFIX_CACHE"] = "1"
+        runtime_environment["MFQ_RUNTIME_DISABLE_PREFIX_CACHE"] = "1"
     if args.prefix_cache_dir is not None:
-        runtime_environment["MFQ_SERVER_PREFIX_CACHE_DIR"] = str(
+        runtime_environment["MFQ_RUNTIME_PREFIX_CACHE_DIR"] = str(
             args.prefix_cache_dir.expanduser().resolve()
         )
     if args.prefix_cache_disk_size is not None:
-        runtime_environment["MFQ_SERVER_PREFIX_CACHE_DISK_BYTES"] = str(
+        runtime_environment["MFQ_RUNTIME_PREFIX_CACHE_DISK_BYTES"] = str(
             args.prefix_cache_disk_size
         )
     if args.prefix_cache_hot_size is not None:
-        runtime_environment["MFQ_SERVER_PREFIX_CACHE_HOT_BYTES"] = str(
+        runtime_environment["MFQ_RUNTIME_PREFIX_CACHE_HOT_BYTES"] = str(
             args.prefix_cache_hot_size
         )
     if args.prefix_cache_block_tokens is not None:
-        runtime_environment["MFQ_SERVER_PREFIX_CACHE_BLOCK_TOKENS"] = str(
+        runtime_environment["MFQ_RUNTIME_PREFIX_CACHE_BLOCK_TOKENS"] = str(
             args.prefix_cache_block_tokens
         )
     configured_roots = [path.expanduser().resolve() for path in args.model_dir]
@@ -307,6 +307,7 @@ def _run(args: argparse.Namespace) -> int:
         runtime_environment=runtime_environment,
         startup_loads=startup_loads,
         shared_cache_reclaimer=clear_image_decode_cache,
+        transport=args.transport,
     )
     database_path, media_root = _server_storage_paths(data_dir, args.db)
     store = SessionStore(database_path, media_root=media_root)
@@ -343,8 +344,6 @@ def _run(args: argparse.Namespace) -> int:
         voice_component=voice_component,
     )
     api_keys = ApiKeyManager(store, client_api_key) if client_api_key else None
-    public_url = f"http://{args.host}:{args.port}"
-    print(f"MFQ Server ready: {public_url}")
     if web_root is None:
         print("Web UI assets were not found; serving the API only")
     uvicorn.run(
@@ -479,4 +478,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="emit one HTTP access-log line per request (default: enabled)",
     )
     parser.add_argument("--backend", choices=("auto", "cuda", "metal"), default="auto")
+    parser.add_argument(
+        "--transport",
+        type=str.lower,
+        choices=("stdio", "http"),
+        default="stdio",
+        help="Python-to-native-runtime transport (default: stdio)",
+    )
     parser.set_defaults(_impl=_run)

@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from mfq.server.auth import ApiKeyManager, required_scope
-from mfq.server.backend import BackendError, preflight_backend_request
+from mfq.server.runtime.backend import BackendError, preflight_backend_request
 from mfq.server.models import (
     SHA256_PATTERN,
     ApiKeyList,

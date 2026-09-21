@@ -35,7 +35,8 @@ from mfq.runtime.flash_next_worker import (
     create_app,
     load_flash_next_tokenizer,
 )
-from mfq.server.backend import OpenAIChatBackend
+from mfq.server.runtime.backend import OpenAIChatBackend
+from mfq.server.runtime.client import HttpRuntimeClient
 from mfq.server.models import SamplingParams
 
 
@@ -912,7 +913,7 @@ def test_flash_next_worker_protocol_matches_common_backend() -> None:
             transport=httpx.ASGITransport(app=create_app(worker)),
             base_url="http://worker",
         )
-        backend = OpenAIChatBackend("http://worker", client=client)
+        backend = OpenAIChatBackend(HttpRuntimeClient("http://worker", client=client))
         try:
             capabilities = await backend.capabilities()
             assert capabilities.model == "Flash"

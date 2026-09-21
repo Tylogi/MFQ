@@ -10,7 +10,8 @@ import uvicorn
 import websockets
 
 from mfq.server.api import create_app
-from mfq.server.backend import OpenAIChatBackend
+from mfq.server.runtime.backend import OpenAIChatBackend
+from mfq.server.runtime.client import HttpRuntimeClient
 from mfq.server.service import ServerService
 from mfq.server.storage import SessionStore
 
@@ -22,7 +23,7 @@ def test_runtime_realtime_websocket_is_forwarded_without_protocol_translation(
         received: list[dict[str, Any]] = []
 
         async def upstream(socket: Any) -> None:
-            assert socket.request.path == "/v1/realtime?mode=audio"
+            assert socket.request.path == "/runtime/realtime?mode=audio"
             await socket.send(json.dumps({"type": "session.queue_done"}))
             received.append(json.loads(await socket.recv()))
             await socket.send(json.dumps({"type": "session.created", "session_id": "voice-1"}))
@@ -41,7 +42,9 @@ def test_runtime_realtime_websocket_is_forwarded_without_protocol_translation(
             upstream_port = upstream_server.sockets[0].getsockname()[1]
             service = ServerService(
                 SessionStore(tmp_path / "mfq.server.sqlite3"),
-                OpenAIChatBackend(f"http://127.0.0.1:{upstream_port}"),
+                OpenAIChatBackend(
+                    HttpRuntimeClient(f"http://127.0.0.1:{upstream_port}")
+                ),
             )
             listener = socket.socket()
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

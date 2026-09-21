@@ -3,7 +3,7 @@
 #include "mlx_qwen35_causal_lm.h"
 #include "qwen35_model.h"
 
-#include "mfq/server.h"
+#include "mfq/communication.h"
 #include "nlohmann/json.hpp"
 
 #include <algorithm>

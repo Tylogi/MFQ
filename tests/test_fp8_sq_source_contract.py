@@ -65,7 +65,7 @@ def test_python_cuda_mfe_registers_both_fp8_sq_families() -> None:
 
 
 def test_cuda_builds_include_fp8_sq_once() -> None:
-    cmake = (ROOT / "cpp_runtime/cmake/CudaRuntime.cmake").read_text()
+    cmake = (ROOT / "cpp_runtime/backends/cuda/CMakeLists.txt").read_text()
     extension = (ROOT / "mfq/kernels/cuda/_ext.py").read_text()
     assert cmake.count("${MFQ_CUDA_KERNEL_ROOT}/fp8_sq.cu") == 1
     assert extension.count('os.path.join(_DIR, "fp8_sq.cu")') == 1

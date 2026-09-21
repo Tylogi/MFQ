@@ -1,6 +1,6 @@
 #include "mfq_container.h"
 #include "mlx_deepseek_v4_causal_lm.h"
-#include "mfq/server.h"
+#include "mfq/communication.h"
 
 #include <algorithm>
 #include <cmath>

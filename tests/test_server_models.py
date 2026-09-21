@@ -21,7 +21,6 @@ import pytest
 from mfq.formats.header import FileHeader
 from mfq.formats.io import open_mmap, save
 from mfq.server.api import create_app
-from mfq.server.backend import BackendDelta, BackendError
 from mfq.server.capabilities import capabilities_for_architecture
 from mfq.server.catalog import (
     MODEL_FILE_INDEX,
@@ -40,9 +39,10 @@ from mfq.server.models import (
     RuntimeInstanceState,
     SamplingParams,
 )
-from mfq.server.runtime_pool import (
-    RuntimePool,
+from mfq.server.runtime.backend import BackendDelta, BackendError
+from mfq.server.runtime.pool import (
     RuntimeConflictError,
+    RuntimePool,
     _CachedLoadFailure,
     _Runtime,
 )
@@ -97,7 +97,7 @@ def test_metal_runtime_pool_derives_a_safe_default_memory_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "mfq.server.runtime_pool.total_physical_memory",
+        "mfq.server.runtime.pool.total_physical_memory",
         lambda: 128 << 30,
     )
 
@@ -131,11 +131,11 @@ def test_automatic_memory_budget_tracks_current_reclaimable_memory(
 ) -> None:
     gib = 1 << 30
     monkeypatch.setattr(
-        "mfq.server.runtime_pool.total_physical_memory",
+        "mfq.server.runtime.pool.total_physical_memory",
         lambda: 128 * gib,
     )
     monkeypatch.setattr(
-        "mfq.server.runtime_pool.host_memory_snapshot",
+        "mfq.server.runtime.pool.host_memory_snapshot",
         lambda: HostMemorySnapshot(
             total=128 * gib,
             free=4 * gib,
@@ -168,11 +168,11 @@ def test_automatic_memory_pressure_uses_soft_and_hard_watermarks(
     gib = 1 << 30
     reclaimable_gib = 4
     monkeypatch.setattr(
-        "mfq.server.runtime_pool.total_physical_memory",
+        "mfq.server.runtime.pool.total_physical_memory",
         lambda: 128 * gib,
     )
     monkeypatch.setattr(
-        "mfq.server.runtime_pool.host_memory_snapshot",
+        "mfq.server.runtime.pool.host_memory_snapshot",
         lambda: HostMemorySnapshot(
             total=128 * gib,
             free=reclaimable_gib * gib,
@@ -222,11 +222,11 @@ def test_load_pressure_reclaims_shared_host_cache_before_model_memory(
             return 512 << 20
 
         monkeypatch.setattr(
-            "mfq.server.runtime_pool.total_physical_memory",
+            "mfq.server.runtime.pool.total_physical_memory",
             lambda: 128 * gib,
         )
         monkeypatch.setattr(
-            "mfq.server.runtime_pool.host_memory_snapshot",
+            "mfq.server.runtime.pool.host_memory_snapshot",
             snapshot,
         )
         pool = RuntimePool(
@@ -285,6 +285,35 @@ def test_startup_models_use_the_managed_load_path(tmp_path: Path) -> None:
             assert remembered.prefill_chunk_size == 333
             assert remembered.prefix_cache_disk_bytes == 1234
             assert pool._startup_loads == []
+        finally:
+            await pool.aclose()
+
+    asyncio.run(run())
+
+
+def test_startup_model_can_use_stdio_runtime_transport(tmp_path: Path) -> None:
+    async def run() -> None:
+        model = tmp_path / "stdio.mfq"
+        executable = tmp_path / "fake-stdio-runtime"
+        _model(model, architecture="qwen35")
+        _fake_stdio_runtime(executable)
+        pool = RuntimePool(
+            ModelCatalog([tmp_path], cache_seconds=0),
+            executable,
+            startup_timeout_seconds=5,
+            startup_loads=[ModelLoadRequest(model="stdio", context_size=8192)],
+            transport="stdio",
+        )
+
+        try:
+            await pool.start()
+            instances = (await pool.instances()).data
+            assert len(instances) == 1
+            assert instances[0].model == "stdio"
+            assert instances[0].state == RuntimeInstanceState.READY
+            assert instances[0].context_size == 8192
+            assert instances[0].id in pool._instances
+            assert pool._instances[instances[0].id].port == 0
         finally:
             await pool.aclose()
 
@@ -376,6 +405,70 @@ def _model(path: Path, *, architecture: str = "test-model") -> None:
     )
 
 
+def _fake_stdio_runtime(path: Path) -> None:
+    path.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import argparse
+            import json
+            import sys
+
+            parser = argparse.ArgumentParser()
+            parser.add_argument('--model')
+            parser.add_argument('--transport', choices=('stdio', 'http'))
+            parser.add_argument('--ctx-size', type=int)
+            parser.add_argument('--model-name')
+            args, _ = parser.parse_known_args()
+
+            def send(frame):
+                print(json.dumps({'v': 1, **frame}, separators=(',', ':')), flush=True)
+
+            print('fake runtime log', file=sys.stderr, flush=True)
+            send({'type': 'ready'})
+            for line in sys.stdin:
+                request = json.loads(line)
+                request_id = request.get('id')
+                op = request['op']
+                if op == 'shutdown':
+                    break
+                if op == 'health':
+                    data = {
+                        'status': 'ok',
+                        'model': args.model_name,
+                        'model_type': 'qwen35',
+                        'model_capabilities': {
+                            'architecture_family': 'qwen3_5',
+                            'source': 'fake-runtime',
+                            'features': {'text': True, 'mtp': False},
+                        },
+                        'mtp_available': False,
+                        'max_context': args.ctx_size,
+                    }
+                elif op == 'status':
+                    data = {'status': 'ok', 'model': args.model_name}
+                elif op == 'models':
+                    data = {'models': [{'name': args.model_name, 'type': 'qwen35'}]}
+                else:
+                    send({
+                        'id': request_id,
+                        'type': 'error',
+                        'error': {
+                            'code': 'unsupported_operation',
+                            'message': op,
+                            'status_code': 501,
+                            'retryable': False,
+                        },
+                    })
+                    continue
+                send({'id': request_id, 'type': 'result', 'data': data})
+            """
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
 def _fake_runtime(path: Path) -> None:
     path.write_text(
         textwrap.dedent(
@@ -387,7 +480,7 @@ def _fake_runtime(path: Path) -> None:
 
             parser = argparse.ArgumentParser()
             parser.add_argument('--model')
-            parser.add_argument('--server', action='store_true')
+            parser.add_argument('--transport', choices=('stdio', 'http'))
             parser.add_argument('--host')
             parser.add_argument('--port', type=int)
             parser.add_argument('--ctx-size', type=int)
@@ -398,7 +491,7 @@ def _fake_runtime(path: Path) -> None:
 
             class Handler(BaseHTTPRequestHandler):
                 def do_GET(self):
-                    if self.path == '/health':
+                    if self.path == '/runtime/health':
                         has_mtp = args.model_name.endswith('-with-mtp')
                         payload = {
                             'status': 'ok',
@@ -412,10 +505,10 @@ def _fake_runtime(path: Path) -> None:
                             'mtp_available': has_mtp,
                             'max_context': args.ctx_size,
                         }
-                    elif self.path == '/api/status':
+                    elif self.path == '/runtime/status':
                         payload = {'status': 'ok', 'model': args.model_name}
-                    elif self.path == '/v1/models':
-                        payload = {'object': 'list', 'data': [{'id': args.model_name}]}
+                    elif self.path == '/runtime/models':
+                        payload = {'models': [{'name': args.model_name, 'type': 'qwen35'}]}
                     else:
                         self.send_response(404)
                         self.end_headers()
@@ -643,7 +736,7 @@ def test_native_hf_metal_auto_streaming_reserves_its_expert_cache(
         routed_expert_bytes=8 << 30,
     )
     monkeypatch.setattr(
-        "mfq.server.runtime_pool.total_physical_memory",
+        "mfq.server.runtime.pool.total_physical_memory",
         lambda: 6 << 30,
     )
     request = ModelLoadRequest(model="native-hf")
@@ -1310,18 +1403,59 @@ def test_managed_cuda_runtime_connects_explicit_request_concurrency(
         artifact = await catalog.resolve_path(model)
         pool = RuntimePool(
             catalog,
-            tmp_path / "mfq-decode",
+            tmp_path / "mfq-runtime",
             backend="cuda",
             max_requests_per_instance=6,
         )
 
-        command, _environment = pool._launch_configuration(
+        command, environment = pool._launch_configuration(
+            artifact,
+            ModelLoadRequest(model="tiny", prefix_cache_max_sessions=4),
+            port=43123,
+        )
+
+        assert command[command.index("--continuous-batching") + 1] == "6"
+        assert environment["MFQ_RUNTIME_MAX_KV_SESSIONS"] == "4"
+        assert "MFQ_SERVER_MAX_KV_SESSIONS" not in environment
+
+    asyncio.run(run())
+
+
+def test_managed_native_runtime_uses_selected_transport(tmp_path: Path) -> None:
+    async def run() -> None:
+        model = tmp_path / "tiny.mfq"
+        _model(model, architecture="qwen35")
+        catalog = ModelCatalog([tmp_path], cache_seconds=0)
+        artifact = await catalog.resolve_path(model)
+        stdio = RuntimePool(
+            catalog,
+            tmp_path / "mfq-runtime",
+            backend="cuda",
+            transport="stdio",
+        )
+        http = RuntimePool(
+            catalog,
+            tmp_path / "mfq-runtime",
+            backend="cuda",
+            transport="http",
+        )
+
+        stdio_command, _ = stdio._launch_configuration(
+            artifact,
+            ModelLoadRequest(model="tiny"),
+            port=0,
+        )
+        http_command, _ = http._launch_configuration(
             artifact,
             ModelLoadRequest(model="tiny"),
             port=43123,
         )
 
-        assert command[command.index("--continuous-batching") + 1] == "6"
+        assert stdio_command[stdio_command.index("--transport") + 1] == "stdio"
+        assert "--host" not in stdio_command
+        assert "--port" not in stdio_command
+        assert http_command[http_command.index("--transport") + 1] == "http"
+        assert http_command[http_command.index("--port") + 1] == "43123"
 
     asyncio.run(run())
 
@@ -1363,7 +1497,7 @@ def test_managed_cuda_runtime_leaves_continuous_batching_validation_to_worker(
         artifact = await catalog.resolve_path(model)
         pool = RuntimePool(
             catalog,
-            tmp_path / "mfq-decode",
+            tmp_path / "mfq-runtime",
             backend="cuda",
             max_requests_per_instance=6,
         )

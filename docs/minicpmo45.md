@@ -88,7 +88,7 @@ and arguments used by the official repository.
 
 ## Native C++ composite graph
 
-`mfq-decode` has a CUDA-native tensor interface for SigLIP, the Resampler,
+`mfq-runtime` has a CUDA-native tensor interface for SigLIP, the Resampler,
 Whisper, the audio projector, Qwen3, and the TTS code decoder. The same graph is
 available on Apple platforms through `MlxMiniCPMO45Runtime`; the Metal HTTP
 server loads the full visual graph for MiniCPM-o models.
@@ -126,11 +126,11 @@ The CUDA diagnostic interface reads files with a shared prefix:
 
 The `.pt` suffix is kept for CLI compatibility. The self-contained CUDA runtime
 uses MFQ's `MFQTNSR1` envelope, not Python pickle. Files written by `torch.save`
-work only with the optional `mfq-decode-torch` A/B runtime. Normal MFQd image,
+work only with the optional `mfq-runtime-torch` A/B runtime. Normal MFQd image,
 audio, and video requests do not use this diagnostic interface.
 
 ```bash
-mfq-decode \
+mfq-runtime \
   --model /models/MiniCPM-o-4_5-Q4KM-table.mfq \
   --minicpmo-input-prefix /data/request \
   --minicpmo-output-prefix /data/result \
@@ -169,7 +169,7 @@ official defaults. A `reset_session` scalar clears the Whisper, Qwen3, TTS,
 sampling, and turn state before processing that unit.
 
 ```bash
-mfq-decode \
+mfq-runtime \
   --model models/MiniCPM-o-4_5-Q4KM-table.mfq \
   --minicpmo-duplex-input-prefix fixtures/session \
   --minicpmo-duplex-output-prefix outputs/result \
@@ -194,9 +194,9 @@ Start the native CUDA or Apple worker. MiniCPM-o models expose their realtime
 duplex capability automatically; it is not a server launch option:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 mfq-decode \
+CUDA_VISIBLE_DEVICES=0 mfq-runtime \
   --model /models/MiniCPM-o-4_5.mfq \
-  --server \
+  --transport http \
   --host 127.0.0.1 \
   --port 8081
 ```

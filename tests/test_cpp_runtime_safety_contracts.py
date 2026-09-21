@@ -13,12 +13,16 @@ DECODE = "\n".join(
 MODEL_LOADER = (CUDA_ROOT / "runtime" / "causal_lm_loader.cpp").read_text(
     encoding="utf-8"
 )
-CUDA_RUNTIME = (CUDA_ROOT / "runtime" / "cuda_decode_runtime.cpp").read_text(
+CUDA_RUNTIME = (CUDA_ROOT / "runtime" / "cuda_runtime.cpp").read_text(
     encoding="utf-8"
 )
-SERVER = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_text(
+TRANSPORT = (ROOT / "cpp_runtime" / "transport" / "src" / "transport.cpp").read_text(
     encoding="utf-8"
 )
+SERVER = TRANSPORT
+METAL_RUNTIME = (
+    ROOT / "cpp_runtime" / "backends" / "metal" / "apps" / "mfq_decode_mlx.cpp"
+).read_text(encoding="utf-8")
 METAL_VQ = (ROOT / "cpp_runtime" / "backends" / "metal" / "ops" / "mlx_vq.cpp").read_text(
     encoding="utf-8"
 )
@@ -82,8 +86,40 @@ def test_optional_predictor_experts_join_the_shared_moe_cache() -> None:
 def test_reload_and_request_registration_share_one_gate() -> None:
     assert "std::mutex reload_gate;" in SERVER
     assert SERVER.count("std::lock_guard<std::mutex> gate(reload_gate);") >= 2
-    assert "std::make_shared<ActiveRequest>(server_metrics)" in SERVER
+    assert "std::make_shared<ActiveRequest>(request_metrics_store)" in SERVER
     assert "active_request->complete(" in SERVER
+
+
+def test_stdio_transport_owns_stdin_and_isolates_stdout() -> None:
+    assert "::dup2(STDERR_FILENO, STDOUT_FILENO)" in TRANSPORT
+    assert "FD_CLOEXEC" in TRANSPORT
+    assert "DuplicateHandle(" in TRANSPORT
+    assert "FALSE, DUPLICATE_SAME_ACCESS" in TRANSPORT
+    assert CUDA_RUNTIME.index("prepare_mfq_stdio_transport();") < CUDA_RUNTIME.index(
+        "Model model ="
+    )
+    assert METAL_RUNTIME.index("prepare_mfq_stdio_transport();") < METAL_RUNTIME.index(
+        "const mfq::metal::MfqContainer model(arguments.mfq);"
+    )
+
+    stdin_users: set[str] = set()
+    for path in (ROOT / "cpp_runtime").rglob("*"):
+        if path.suffix not in {".cpp", ".cc", ".cxx", ".cu", ".h", ".hpp"}:
+            continue
+        if "tests" in path.parts:
+            continue
+        source = path.read_text(encoding="utf-8", errors="ignore")
+        if any(
+            marker in source
+            for marker in ("std::cin", "STDIN_FILENO", "_fileno(stdin)")
+        ):
+            stdin_users.add(path.relative_to(ROOT / "cpp_runtime").as_posix())
+    assert stdin_users == {
+        "backends/cuda/models/minicpmo45/minicpmo45_runtime.cpp",
+        "transport/src/transport.cpp",
+    }
+    assert "if (!minicpmo_input_prefix.empty() || transport_mode ||" in CUDA_RUNTIME
+    assert "MiniCPM-o eval mode cannot be combined with" in CUDA_RUNTIME
 
 
 def test_metal_jsc_rejects_partial_code_vectors() -> None:

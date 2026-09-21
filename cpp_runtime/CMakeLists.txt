@@ -15,16 +15,16 @@ option(
 )
 
 if(APPLE)
-    set(_MFQ_BUILD_CPP_SERVER_DEFAULT OFF)
+    set(_MFQ_BUILD_RUNTIME_COMMUNICATION_DEFAULT OFF)
 else()
-    set(_MFQ_BUILD_CPP_SERVER_DEFAULT ON)
+    set(_MFQ_BUILD_RUNTIME_COMMUNICATION_DEFAULT ON)
 endif()
 option(
-    MFQ_BUILD_CPP_SERVER
-    "Build the backend-neutral C++ HTTP/tokenizer server library"
-    ${_MFQ_BUILD_CPP_SERVER_DEFAULT}
+    MFQ_BUILD_RUNTIME_COMMUNICATION
+    "Build private HTTP/stdio communication modules for native runtimes"
+    ${_MFQ_BUILD_RUNTIME_COMMUNICATION_DEFAULT}
 )
-unset(_MFQ_BUILD_CPP_SERVER_DEFAULT)
+unset(_MFQ_BUILD_RUNTIME_COMMUNICATION_DEFAULT)
 
 if(MFQ_BUILD_METAL_RUNTIME AND NOT APPLE)
     message(FATAL_ERROR "MFQ_BUILD_METAL_RUNTIME requires macOS")
@@ -34,12 +34,13 @@ endif()
 # canonical model graph and several public policy headers consume it.
 add_subdirectory(components/json)
 add_subdirectory(core)
+add_subdirectory(scheduler)
 
-if(MFQ_BUILD_CPP_SERVER)
+if(MFQ_BUILD_RUNTIME_COMMUNICATION)
     add_subdirectory(components/ggml)
     add_subdirectory(components/tokenizer)
     add_subdirectory(components/http)
-    add_subdirectory(server)
+    add_subdirectory(transport)
 endif()
 
 if(MFQ_BUILD_METAL_RUNTIME)
@@ -49,7 +50,7 @@ if(MFQ_BUILD_METAL_RUNTIME)
 endif()
 
 if(NOT APPLE)
-    include(cmake/CudaRuntime.cmake)
+    add_subdirectory(backends/cuda cuda)
 endif()
 
 if(BUILD_TESTING)

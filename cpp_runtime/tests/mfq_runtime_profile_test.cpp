@@ -1,4 +1,4 @@
-#include "mfq/server.h"
+#include "mfq/communication.h"
 
 #include <cmath>
 #include <filesystem>
@@ -81,7 +81,7 @@ int main() {
             "family sidecar field was lost");
     require(resolved.chat.top_k.value_or(-1) == 77,
             "embedded field was lost");
-    require(resolved.source.find("server-explicit:") == 0,
+    require(resolved.source.find("runtime-explicit:") == 0,
             "profile source mismatch");
 
     std::filesystem::remove_all(root);
