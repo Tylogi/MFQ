@@ -1,9 +1,10 @@
 #include "model_checks.h"
 
 #include "../../models/registry.h"
-#include "../../ops/cuda_quantized_ops.h"
+#include "quant_linear.h"
 #include "../cuda_execution.h"
 #include "../cuda_transformer.h"
+#include "../moe_expert_cache.h"
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"
 #include "mfq/kernels/cuda/deepseek_v41.h"

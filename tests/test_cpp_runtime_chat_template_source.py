@@ -2,8 +2,11 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SERVER = (ROOT / "cpp_runtime" / "transport" / "src" / "transport.cpp").read_text(
-    encoding="utf-8"
+TRANSPORT_SRC = ROOT / "cpp_runtime" / "transport"
+SERVER = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted(TRANSPORT_SRC.rglob("*"))
+    if path.suffix in {".cpp", ".h"}
 )
 CUDA_RUNTIME = ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime"
 DECODE = "\n".join(
@@ -89,7 +92,7 @@ def test_server_uses_native_gguf_jinja_template_and_common_parser() -> None:
 def test_processor_owned_prompts_bypass_cached_jinja_templates() -> None:
     parse_work = _section(
         SERVER,
-        "static RequestWork parse_work",
+        "RequestWork parse_work",
         "static size_t complete_utf8_prefix",
     )
 
@@ -125,7 +128,7 @@ def test_server_enforces_complete_chat_template_tool_calls() -> None:
 
 def test_native_server_cancels_active_session_generation_per_token() -> None:
     assert 'R"(/runtime/sessions/([A-Za-z0-9._:-]{1,128})/cancel)"' in SERVER
-    assert "request_cancellations.cancel(session_id)" in SERVER
+    assert "scheduler.cancel_request(session_id)" in SERVER
     assert "cancel_requested->load(std::memory_order_acquire)" in SERVER
     assert 'result.finish_reason = "cancelled"' in SERVER
     assert "!result.cancelled && !result.tool_calls.empty()" in SERVER

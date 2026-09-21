@@ -1,4 +1,5 @@
 #include "runtime_components.h"
+#include "moe_expert_cache.h"
 
 #include <iostream>
 #include <stdexcept>

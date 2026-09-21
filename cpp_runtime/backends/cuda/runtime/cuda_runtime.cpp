@@ -1,8 +1,9 @@
 #include "mfq_cuda_runtime.h"
+#include "moe_expert_cache.h"
 #include "cuda_execution.h"
 #include "cuda_sampling.h"
 #include "diagnostics/backend_checks.h"
-#include "../ops/cuda_quantized_ops.h"
+#include "quant_linear.h"
 #include "../models/qwen35/qwen35_linear_attention.h"
 #include "../models/registry.h"
 #include "mfq_tensor_backend.h"
@@ -26,7 +27,7 @@
 #include <nccl.h>
 #endif
 
-#include "mfq/communication.h"
+#include "transport.h"
 #include "mfq_format_compat.h"
 #include "grid_vision.h"
 #include "mfq_paged_prefix_cache.h"

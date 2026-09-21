@@ -1,13 +1,12 @@
-#include "mfq/communication.h"
+#include "common.h"
 
-#include "httplib.h"
 #include "nlohmann/json.hpp"
 #include "ggml.h"
 #include "mfq_text.h"
 #include "mfq_grammar.h"
 #include "chat.h"
 #include "json-schema-to-grammar.h"
-#include "common.h"
+#include "chat/common.h"
 
 #include <algorithm>
 #include <array>
@@ -16,10 +15,9 @@
 #include <cerrno>
 #include <cctype>
 #include <cmath>
-#include <csignal>
-#include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <iomanip>
@@ -33,84 +31,25 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <thread>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
-#ifdef _WIN32
-#include <fcntl.h>
-#include <io.h>
-#include <windows.h>
-#else
+#ifndef _WIN32
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
 
-namespace {
+namespace mfq::transport_detail {
 
-std::mutex stdio_protocol_mutex;
-int stdio_protocol_fd = -1;
 
-static bool write_stdio_protocol(const json & frame) {
-    const std::string line = frame.dump() + "\n";
-    std::lock_guard<std::mutex> lock(stdio_protocol_mutex);
-    if (stdio_protocol_fd < 0) return false;
-    size_t offset = 0;
-    while (offset < line.size()) {
-#ifdef _WIN32
-        const auto remaining = std::min<size_t>(
-            line.size() - offset,
-            static_cast<size_t>(std::numeric_limits<int>::max()));
-        const int written = _write(
-            stdio_protocol_fd, line.data() + offset,
-            static_cast<unsigned int>(remaining));
-#else
-        const ssize_t written = ::write(
-            stdio_protocol_fd, line.data() + offset,
-            line.size() - offset);
-#endif
-        if (written < 0 && errno == EINTR) continue;
-        if (written <= 0) return false;
-        offset += static_cast<size_t>(written);
-    }
-    return true;
-}
-
-class ApiError final : public std::runtime_error {
-public:
-    ApiError(int status, std::string type, std::string message, std::string param = {})
-        : std::runtime_error(std::move(message)), status(status), type(std::move(type)), param(std::move(param)) {}
-
-    int status;
-    std::string type;
-    std::string param;
-};
-
-static json error_body(const std::string & message, const std::string & type, const std::string & param = {}) {
-    return {
-        {"error", {
-            {"message", message},
-            {"type", type},
-            {"param", param.empty() ? json(nullptr) : json(param)},
-            {"code", json(nullptr)},
-        }},
-    };
-}
-
-static void set_json(httplib::Response & res, const json & body, int status = 200) {
-    res.status = status;
-    res.set_content(body.dump(), "application/json; charset=utf-8");
-}
-
-static int64_t unix_time_seconds() {
+int64_t unix_time_seconds() {
     return std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-static std::string request_id(const char * prefix) {
+std::string request_id(const char * prefix) {
     static std::atomic<uint64_t> sequence{0};
     const uint64_t n = sequence.fetch_add(1, std::memory_order_relaxed);
     return std::string(prefix) + std::to_string(unix_time_seconds()) + "-" + std::to_string(n);
@@ -122,143 +61,147 @@ static void mfq_text_log_quiet(ggml_log_level level, const char * text, void *) 
     }
 }
 
-class MfqTokenizer {
-public:
-    explicit MfqTokenizer(const std::string & path) {
-        load_from_file(path);
-        finish_init();
-    }
+MfqTokenizer::MfqTokenizer(const std::string & path) {
+    load_from_file(path);
+    finish_init();
+}
 
-    explicit MfqTokenizer(const std::vector<uint8_t> & gguf) {
-        if (gguf.empty()) {
-            throw std::runtime_error("embedded tokenizer GGUF is empty");
-        }
-        ggml_log_set(mfq_text_log_quiet, nullptr);
-        context_ = mfq_text_load_buffer(gguf.data(), gguf.size());
-        if (context_ == nullptr) {
-            throw std::runtime_error(
-                "cannot initialize tokenizer from embedded GGUF metadata");
-        }
-        finish_init();
+MfqTokenizer::MfqTokenizer(const std::vector<uint8_t> & gguf) {
+    if (gguf.empty()) {
+        throw std::runtime_error("embedded tokenizer GGUF is empty");
     }
+    ggml_log_set(mfq_text_log_quiet, nullptr);
+    context_ = mfq_text_load_buffer(gguf.data(), gguf.size());
+    if (context_ == nullptr) {
+        throw std::runtime_error(
+            "cannot initialize tokenizer from embedded GGUF metadata");
+    }
+    finish_init();
+}
 
-    ~MfqTokenizer() {
+MfqTokenizer::~MfqTokenizer() {
+    mfq_text_free(context_);
+}
+
+int32_t MfqTokenizer::vocab_size() const {
+    return mfq_text_vocab_n_tokens(vocab_);
+}
+
+std::string MfqTokenizer::chat_template() const {
+    const char * value = mfq_text_get_chat_template(context_, nullptr);
+    return value == nullptr ? std::string() : std::string(value);
+}
+
+const mfq_text_context * MfqTokenizer::context() const {
+    return context_;
+}
+
+int32_t MfqTokenizer::bos_token() const {
+    return mfq_text_vocab_bos(vocab_);
+}
+
+int32_t MfqTokenizer::eos_token() const {
+    return mfq_text_vocab_eos(vocab_);
+}
+
+int32_t MfqTokenizer::eot_token() const {
+    return mfq_text_vocab_eot(vocab_);
+}
+
+int32_t MfqTokenizer::pad_token() const {
+    return mfq_text_vocab_pad(vocab_);
+}
+
+bool MfqTokenizer::add_bos() const {
+    return mfq_text_vocab_get_add_bos(vocab_);
+}
+
+bool MfqTokenizer::add_eos() const {
+    return mfq_text_vocab_get_add_eos(vocab_);
+}
+
+std::vector<int64_t> MfqTokenizer::tokenize(
+        const std::string & text,
+        bool parse_special,
+        bool add_special) const {
+    int32_t n = mfq_text_tokenize(
+        vocab_, text.data(), static_cast<int32_t>(text.size()),
+        nullptr, 0, add_special, parse_special);
+    if (n == std::numeric_limits<int32_t>::min()) {
+        throw std::runtime_error("tokenized prompt exceeds the tokenizer limit");
+    }
+    if (n == 0) return {};
+    if (n > 0) {
+        throw std::runtime_error("tokenizer returned an invalid sizing result");
+    }
+    std::vector<mfq_text_token> tokens(static_cast<size_t>(-n));
+    n = mfq_text_tokenize(
+        vocab_, text.data(), static_cast<int32_t>(text.size()),
+        tokens.data(), static_cast<int32_t>(tokens.size()),
+        add_special, parse_special);
+    if (n < 0) {
+        throw std::runtime_error(
+            "tokenizer buffer sizing changed unexpectedly");
+    }
+    std::vector<int64_t> out;
+    out.reserve(static_cast<size_t>(n));
+    for (int32_t i = 0; i < n; ++i) {
+        out.push_back(tokens[static_cast<size_t>(i)]);
+    }
+    return out;
+}
+
+int64_t MfqTokenizer::special_token_id(const std::string & text) const {
+    const auto tokens = tokenize(text, true, false);
+    if (tokens.size() != 1) {
+        throw std::runtime_error(
+            "tokenizer does not map the required special token to one ID: " +
+            text);
+    }
+    return tokens.front();
+}
+
+bool MfqTokenizer::is_eog(int64_t token) const {
+    return mfq_text_vocab_is_eog(
+        vocab_, static_cast<mfq_text_token>(token));
+}
+
+std::string MfqTokenizer::piece(int64_t token, bool special) const {
+    char local[128];
+    int32_t n = mfq_text_token_to_piece(
+        vocab_, static_cast<mfq_text_token>(token), local,
+        static_cast<int32_t>(sizeof(local)), 0, special);
+    if (n >= 0) return std::string(local, local + n);
+    std::string out(static_cast<size_t>(-n), '\0');
+    n = mfq_text_token_to_piece(
+        vocab_, static_cast<mfq_text_token>(token), out.data(),
+        static_cast<int32_t>(out.size()), 0, special);
+    if (n < 0) {
+        throw std::runtime_error(
+            "token piece buffer sizing changed unexpectedly");
+    }
+    out.resize(static_cast<size_t>(n));
+    return out;
+}
+
+void MfqTokenizer::load_from_file(const std::string & path) {
+    ggml_log_set(mfq_text_log_quiet, nullptr);
+    context_ = mfq_text_load_file(path.c_str());
+    if (context_ == nullptr) {
+        throw std::runtime_error(
+            "cannot load tokenizer metadata from GGUF: " + path);
+    }
+}
+
+void MfqTokenizer::finish_init() {
+    vocab_ = mfq_text_get_vocab(context_);
+    if (vocab_ == nullptr) {
         mfq_text_free(context_);
+        context_ = nullptr;
+        throw std::runtime_error(
+            "GGUF does not contain a tokenizer vocabulary");
     }
-
-    MfqTokenizer(const MfqTokenizer &) = delete;
-    MfqTokenizer & operator=(const MfqTokenizer &) = delete;
-
-    int32_t vocab_size() const {
-        return mfq_text_vocab_n_tokens(vocab_);
-    }
-
-    std::string chat_template() const {
-        const char * value = mfq_text_get_chat_template(context_, nullptr);
-        return value == nullptr ? std::string() : std::string(value);
-    }
-
-    const mfq_text_context * context() const {
-        return context_;
-    }
-
-    int32_t bos_token() const {
-        return mfq_text_vocab_bos(vocab_);
-    }
-
-    int32_t eos_token() const {
-        return mfq_text_vocab_eos(vocab_);
-    }
-
-    int32_t eot_token() const {
-        return mfq_text_vocab_eot(vocab_);
-    }
-
-    int32_t pad_token() const {
-        return mfq_text_vocab_pad(vocab_);
-    }
-
-    bool add_bos() const {
-        return mfq_text_vocab_get_add_bos(vocab_);
-    }
-
-    bool add_eos() const {
-        return mfq_text_vocab_get_add_eos(vocab_);
-    }
-
-    std::vector<int64_t> tokenize(
-            const std::string & text,
-            bool parse_special,
-            bool add_special = false) const {
-        int32_t n = mfq_text_tokenize(vocab_, text.data(), static_cast<int32_t>(text.size()),
-                                   nullptr, 0, add_special, parse_special);
-        if (n == std::numeric_limits<int32_t>::min()) {
-            throw std::runtime_error("tokenized prompt exceeds the tokenizer limit");
-        }
-        if (n == 0) return {};
-        if (n > 0) {
-            throw std::runtime_error("tokenizer returned an invalid sizing result");
-        }
-        std::vector<mfq_text_token> tokens(static_cast<size_t>(-n));
-        n = mfq_text_tokenize(vocab_, text.data(), static_cast<int32_t>(text.size()),
-                           tokens.data(), static_cast<int32_t>(tokens.size()), add_special, parse_special);
-        if (n < 0) throw std::runtime_error("tokenizer buffer sizing changed unexpectedly");
-        std::vector<int64_t> out;
-        out.reserve(static_cast<size_t>(n));
-        for (int32_t i = 0; i < n; ++i) out.push_back(tokens[static_cast<size_t>(i)]);
-        return out;
-    }
-
-    int64_t special_token_id(const std::string & text) const {
-        const auto tokens = tokenize(text, true, false);
-        if (tokens.size() != 1) {
-            throw std::runtime_error(
-                "tokenizer does not map the required special token to one ID: " +
-                text);
-        }
-        return tokens.front();
-    }
-
-    bool is_eog(int64_t token) const {
-        return mfq_text_vocab_is_eog(vocab_, static_cast<mfq_text_token>(token));
-    }
-
-    std::string piece(int64_t token, bool special = false) const {
-        char local[128];
-        int32_t n = mfq_text_token_to_piece(vocab_, static_cast<mfq_text_token>(token),
-                                         local, static_cast<int32_t>(sizeof(local)), 0, special);
-        if (n >= 0) return std::string(local, local + n);
-        std::string out(static_cast<size_t>(-n), '\0');
-        n = mfq_text_token_to_piece(vocab_, static_cast<mfq_text_token>(token),
-                                 out.data(), static_cast<int32_t>(out.size()), 0, special);
-        if (n < 0) throw std::runtime_error("token piece buffer sizing changed unexpectedly");
-        out.resize(static_cast<size_t>(n));
-        return out;
-    }
-
-private:
-    void load_from_file(const std::string & path) {
-        ggml_log_set(mfq_text_log_quiet, nullptr);
-        context_ = mfq_text_load_file(path.c_str());
-        if (context_ == nullptr) {
-            throw std::runtime_error(
-                "cannot load tokenizer metadata from GGUF: " + path);
-        }
-    }
-
-    void finish_init() {
-        vocab_ = mfq_text_get_vocab(context_);
-        if (vocab_ == nullptr) {
-            mfq_text_free(context_);
-            context_ = nullptr;
-            throw std::runtime_error(
-                "GGUF does not contain a tokenizer vocabulary");
-        }
-    }
-
-    mfq_text_context * context_ = nullptr;
-    const mfq_text_vocab * vocab_ = nullptr;
-};
+}
 
 class MfqGrammarConstraint {
 public:
@@ -709,7 +652,7 @@ static std::optional<std::string> request_preformatted_prompt(
     return body["mfq_preformatted_prompt"].get<std::string>();
 }
 
-static int64_t integer_field(const json & body, const char * name, int64_t fallback) {
+int64_t integer_field(const json & body, const char * name, int64_t fallback) {
     if (!body.contains(name) || body[name].is_null()) return fallback;
     if (!body[name].is_number_integer()) {
         throw ApiError(400, "invalid_request_error", std::string(name) + " must be an integer", name);
@@ -717,7 +660,7 @@ static int64_t integer_field(const json & body, const char * name, int64_t fallb
     return body[name].get<int64_t>();
 }
 
-static double number_field(const json & body, const char * name, double fallback) {
+double number_field(const json & body, const char * name, double fallback) {
     if (!body.contains(name) || body[name].is_null()) return fallback;
     if (!body[name].is_number()) {
         throw ApiError(400, "invalid_request_error", std::string(name) + " must be a number", name);
@@ -725,7 +668,7 @@ static double number_field(const json & body, const char * name, double fallback
     return body[name].get<double>();
 }
 
-static MfqSamplingParams default_sampling_params(
+MfqSamplingParams default_sampling_params(
         const MfqRuntimeTransportConfig & config) {
     MfqSamplingParams defaults;
     const auto & profile = config.runtime_profile.chat;
@@ -753,7 +696,7 @@ static MfqSamplingParams default_sampling_params(
     return defaults;
 }
 
-static json sampling_params_json(const MfqSamplingParams & sampling) {
+json sampling_params_json(const MfqSamplingParams & sampling) {
     return {
         {"max_tokens", sampling.max_tokens},
         {"temperature", sampling.temperature},
@@ -862,8 +805,6 @@ static MfqRuntimeProfile architecture_runtime_profile(
     return result;
 }
 
-using MfqModelCapabilityProfile = MfqModelCapabilities;
-
 struct MfqModelCapabilityRegistration {
     std::array<const char *, 3> aliases{};
     MfqModelCapabilityProfile profile;
@@ -895,7 +836,7 @@ static const std::array<MfqModelCapabilityRegistration, 12>
          {"glm5_next", true, true, true, false, false, false, true}},
     }};
 
-static MfqModelCapabilityProfile architecture_capability_profile(
+MfqModelCapabilityProfile architecture_capability_profile(
         const std::string & model_type) {
     const std::string identity = normalized_identity(model_type);
     for (const auto & registration : kModelCapabilityRegistry) {
@@ -910,7 +851,7 @@ static MfqModelCapabilityProfile architecture_capability_profile(
     return result;
 }
 
-static json model_capability_profile_json(
+json model_capability_profile_json(
         const MfqModelCapabilityProfile & profile) {
     return {
         {"architecture_family", profile.family},
@@ -1138,7 +1079,7 @@ static std::vector<std::filesystem::path> profile_sidecar_paths(
     return result;
 }
 
-static json duplex_profile_json(const MfqDuplexSamplingProfile & value) {
+json duplex_profile_json(const MfqDuplexSamplingProfile & value) {
     json result = json::object();
 #define MFQ_SET(field) if (value.field) result[#field] = *value.field
     MFQ_SET(system_prompt);
@@ -1156,7 +1097,7 @@ static json duplex_profile_json(const MfqDuplexSamplingProfile & value) {
     return result;
 }
 
-static json tts_profile_json(const MfqTtsSamplingProfile & value) {
+json tts_profile_json(const MfqTtsSamplingProfile & value) {
     json result = json::object();
     if (value.temperature) result["temperature"] = *value.temperature;
     if (value.repetition_penalty) result["repetition_penalty"] = *value.repetition_penalty;
@@ -1164,7 +1105,7 @@ static json tts_profile_json(const MfqTtsSamplingProfile & value) {
     return result;
 }
 
-static json chat_template_capabilities_json(
+json chat_template_capabilities_json(
         const std::string & chat_template) {
     const bool supports_thinking =
         chat_template.find("enable_thinking") != std::string::npos;
@@ -1219,21 +1160,8 @@ static std::vector<std::string> parse_stops(const json & body) {
     return stops;
 }
 
-struct RequestWork {
-    bool chat = true;
-    bool stream = false;
-    bool include_usage = false;
-    common_chat_parser_params chat_parser;
-    std::unordered_set<int64_t> preserved_tokens;
-    std::vector<int64_t> prompt;
-    std::vector<std::string> stops;
-    MfqSamplingParams sampling;
-    MfqPromptCachePlan cache_plan;
-    MfqTokenConstraintPtr token_constraint;
-    std::optional<MfqVisionInput> vision;
-};
 
-static bool valid_mfq_session_id(const std::string & session_id) {
+bool valid_mfq_session_id(const std::string & session_id) {
     return !session_id.empty() && session_id.size() <= 128 &&
         std::all_of(
             session_id.begin(), session_id.end(),
@@ -1243,7 +1171,7 @@ static bool valid_mfq_session_id(const std::string & session_id) {
             });
 }
 
-static json runtime_generate_body(const json & params) {
+json runtime_generate_body(const json & params) {
     if (!params.is_object()) {
         throw ApiError(
             400, "invalid_request_error",
@@ -1313,7 +1241,7 @@ static json runtime_generate_body(const json & params) {
     return body;
 }
 
-static RequestWork parse_work(const json & body, bool chat, const MfqTokenizer & tokenizer,
+RequestWork parse_work(const json & body, bool chat, const MfqTokenizer & tokenizer,
                               const common_chat_templates * templates,
                               int64_t max_context,
                               const std::string & model_type,
@@ -1708,57 +1636,10 @@ private:
     std::vector<std::string> tool_call_ids_;
 };
 
-struct RequestMetrics {
-    using Clock = std::chrono::steady_clock;
 
-    Clock::time_point started = Clock::now();
-    Clock::time_point first_token;
-    size_t prefill_tokens = 0;
-    double prefill_ms = 0.0;
-    double multimodal_ms = 0.0;
-    double model_prefill_ms = 0.0;
-    bool saw_token = false;
-    bool saw_prefill = false;
 
-    void mark_prefill(const MfqPrefillTiming & timing) {
-        prefill_tokens = timing.prompt_tokens;
-        prefill_ms = timing.llm_ms;
-        multimodal_ms = timing.multimodal_ms;
-        model_prefill_ms = timing.model_ms;
-        saw_prefill = timing.llm_ms > 0.0 || timing.model_ms > 0.0;
-    }
 
-    void mark_token() {
-        if (saw_token) return;
-        first_token = Clock::now();
-        saw_token = true;
-    }
-};
-
-struct CompletionResult {
-    std::string text;
-    std::string reasoning_text;
-    std::vector<common_chat_tool_call> tool_calls;
-    std::string finish_reason = "length";
-    int32_t completion_tokens = 0;
-    bool client_connected = true;
-    bool cancelled = false;
-};
-
-struct RequestMetricValues {
-    size_t prefill_tokens = 0;
-    double generation_ms = 0.0;
-    double ttft_ms = 0.0;
-    double prefill_ms = 0.0;
-    double prefill_tps = 0.0;
-    double multimodal_ms = 0.0;
-    double model_prefill_ms = 0.0;
-    double decode_ms = 0.0;
-    double generation_tps = 0.0;
-    double decode_tps = 0.0;
-};
-
-static json request_metric_values_json(
+json request_metric_values_json(
         const RequestMetricValues & values,
         const MfqSamplingParams & sampling) {
     return {
@@ -1788,7 +1669,7 @@ static json request_metric_values_json(
     };
 }
 
-static RequestMetricValues request_metric_values(
+RequestMetricValues request_metric_values(
         const CompletionResult & result, const RequestMetrics & metrics) {
     const auto finished = RequestMetrics::Clock::now();
     RequestMetricValues values;
@@ -1825,7 +1706,7 @@ static RequestMetricValues request_metric_values(
     return values;
 }
 
-static void log_request_metrics(const std::string & id, bool chat, bool stream,
+void log_request_metrics(const std::string & id, bool chat, bool stream,
                                 size_t prompt_tokens, const MfqSamplingParams & sampling,
                                 const CompletionResult & result,
                                 const RequestMetricValues & values) {
@@ -1871,125 +1752,109 @@ static void log_request_metrics(const std::string & id, bool chat, bool stream,
     std::cout << line.str() << std::endl;
 }
 
-class RuntimeRequestMetrics {
-public:
-    RuntimeRequestMetrics()
-        : started_steady_(std::chrono::steady_clock::now()),
-          started_unix_(unix_time_seconds()) {}
+RuntimeRequestMetrics::RuntimeRequestMetrics()
+    : started_steady_(std::chrono::steady_clock::now()),
+      started_unix_(unix_time_seconds()) {}
 
-    void begin() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        ++total_requests_;
-        ++active_requests_;
-    }
+void RuntimeRequestMetrics::begin() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++total_requests_;
+    ++active_requests_;
+}
 
-    void complete(
-            const std::string & id, bool chat, bool stream,
-            size_t prompt_tokens, const CompletionResult & result,
-            const RequestMetricValues & values) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (active_requests_ > 0) --active_requests_;
-        total_prompt_tokens_ += prompt_tokens;
-        total_completion_tokens_ +=
-            static_cast<uint64_t>(std::max<int32_t>(result.completion_tokens, 0));
-        last_request_ = {
-            {"id", id},
-            {"endpoint", chat ? "chat" : "completion"},
-            {"stream", stream},
-            {"prompt_tokens", prompt_tokens},
-            {"prefill_tokens", values.prefill_tokens},
-            {"completion_tokens", result.completion_tokens},
-            {"ttft_ms", values.ttft_ms},
-            {"prefill_ms", values.prefill_ms},
-            {"prefill_tps", values.prefill_tps},
-            {"multimodal_ms", values.multimodal_ms},
-            {"model_prefill_ms", values.model_prefill_ms},
-            {"decode_ms", values.decode_ms},
-            {"decode_tps", values.decode_tps},
-            {"generation_ms", values.generation_ms},
-            {"generation_tps", values.generation_tps},
-            {"finish_reason", result.finish_reason},
-            {"client_connected", result.client_connected},
-            {"completed_at", unix_time_seconds()},
-        };
-    }
+void RuntimeRequestMetrics::complete(
+        const std::string & id,
+        bool chat,
+        bool stream,
+        size_t prompt_tokens,
+        const CompletionResult & result,
+        const RequestMetricValues & values) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_requests_ > 0) --active_requests_;
+    total_prompt_tokens_ += prompt_tokens;
+    total_completion_tokens_ +=
+        static_cast<uint64_t>(std::max<int32_t>(result.completion_tokens, 0));
+    last_request_ = {
+        {"id", id},
+        {"endpoint", chat ? "chat" : "completion"},
+        {"stream", stream},
+        {"prompt_tokens", prompt_tokens},
+        {"prefill_tokens", values.prefill_tokens},
+        {"completion_tokens", result.completion_tokens},
+        {"ttft_ms", values.ttft_ms},
+        {"prefill_ms", values.prefill_ms},
+        {"prefill_tps", values.prefill_tps},
+        {"multimodal_ms", values.multimodal_ms},
+        {"model_prefill_ms", values.model_prefill_ms},
+        {"decode_ms", values.decode_ms},
+        {"decode_tps", values.decode_tps},
+        {"generation_ms", values.generation_ms},
+        {"generation_tps", values.generation_tps},
+        {"finish_reason", result.finish_reason},
+        {"client_connected", result.client_connected},
+        {"completed_at", unix_time_seconds()},
+    };
+}
 
-    void fail() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (active_requests_ > 0) --active_requests_;
-        ++failed_requests_;
-    }
+void RuntimeRequestMetrics::fail() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_requests_ > 0) --active_requests_;
+    ++failed_requests_;
+}
 
-    uint64_t active_requests() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return active_requests_;
-    }
+uint64_t RuntimeRequestMetrics::active_requests() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return active_requests_;
+}
 
-    json snapshot(
-            const MfqRuntimeTransportConfig & config,
-            int64_t max_context,
-            bool reloading) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const double uptime_seconds =
-            std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - started_steady_).count();
-        return {
-            {"status", "ok"},
-            {"model", config.model_name},
-            {"model_type", config.model_type},
-            {"max_context", max_context},
-            {"context_capacity", config.context_capacity},
-            {"reloading", reloading},
-            {"vocab_size", config.vocab_size},
-            {"started_at", started_unix_},
-            {"uptime_seconds", uptime_seconds},
-            {"active_requests", active_requests_},
-            {"total_requests", total_requests_},
-            {"failed_requests", failed_requests_},
-            {"total_prompt_tokens", total_prompt_tokens_},
-            {"total_completion_tokens", total_completion_tokens_},
-            {"last_request", last_request_},
-        };
-    }
+json RuntimeRequestMetrics::snapshot(
+        const MfqRuntimeTransportConfig & config,
+        int64_t max_context,
+        bool reloading) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const double uptime_seconds =
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started_steady_).count();
+    return {
+        {"status", "ok"},
+        {"model", config.model_name},
+        {"model_type", config.model_type},
+        {"max_context", max_context},
+        {"context_capacity", config.context_capacity},
+        {"reloading", reloading},
+        {"vocab_size", config.vocab_size},
+        {"started_at", started_unix_},
+        {"uptime_seconds", uptime_seconds},
+        {"active_requests", active_requests_},
+        {"total_requests", total_requests_},
+        {"failed_requests", failed_requests_},
+        {"total_prompt_tokens", total_prompt_tokens_},
+        {"total_completion_tokens", total_completion_tokens_},
+        {"last_request", last_request_},
+    };
+}
 
-private:
-    mutable std::mutex mutex_;
-    std::chrono::steady_clock::time_point started_steady_;
-    int64_t started_unix_ = 0;
-    uint64_t active_requests_ = 0;
-    uint64_t total_requests_ = 0;
-    uint64_t failed_requests_ = 0;
-    uint64_t total_prompt_tokens_ = 0;
-    uint64_t total_completion_tokens_ = 0;
-    json last_request_ = nullptr;
-};
+ActiveRequest::ActiveRequest(RuntimeRequestMetrics & metrics)
+    : metrics_(metrics) {
+    metrics_.begin();
+}
 
-class ActiveRequest {
-public:
-    explicit ActiveRequest(RuntimeRequestMetrics & metrics)
-        : metrics_(metrics) {
-        metrics_.begin();
-    }
+ActiveRequest::~ActiveRequest() {
+    if (!completed_) metrics_.fail();
+}
 
-    ~ActiveRequest() {
-        if (!completed_) metrics_.fail();
-    }
+void ActiveRequest::complete(
+        const std::string & id,
+        bool chat,
+        bool stream,
+        size_t prompt_tokens,
+        const CompletionResult & result,
+        const RequestMetricValues & values) {
+    metrics_.complete(id, chat, stream, prompt_tokens, result, values);
+    completed_ = true;
+}
 
-    void complete(
-            const std::string & id, bool chat, bool stream,
-            size_t prompt_tokens, const CompletionResult & result,
-            const RequestMetricValues & values) {
-        metrics_.complete(
-            id, chat, stream, prompt_tokens, result, values);
-        completed_ = true;
-    }
-
-private:
-    RuntimeRequestMetrics & metrics_;
-    bool completed_ = false;
-};
-
-static CompletionResult generate_text(const RequestWork & work, const MfqTokenizer & tokenizer,
+CompletionResult generate_text(const RequestWork & work, const MfqTokenizer & tokenizer,
                                       const MfqScheduler & scheduler,
                                       const std::shared_ptr<std::atomic<bool>> & cancel_requested,
                                       const std::function<bool(const common_chat_msg_diff &)> & emit,
@@ -2089,7 +1954,7 @@ static CompletionResult generate_text(const RequestWork & work, const MfqTokeniz
     return result;
 }
 
-static json usage_json(size_t prompt_tokens, int32_t completion_tokens) {
+json usage_json(size_t prompt_tokens, int32_t completion_tokens) {
     return {
         {"prompt_tokens", prompt_tokens},
         {"completion_tokens", completion_tokens},
@@ -2100,7 +1965,7 @@ static json usage_json(size_t prompt_tokens, int32_t completion_tokens) {
 static json chat_tool_calls_json(
     const std::vector<common_chat_tool_call> & tool_calls);
 
-static json runtime_generation_event(
+json runtime_generation_event(
         const std::string & event,
         const std::string & request_id,
         int64_t created,
@@ -2113,7 +1978,7 @@ static json runtime_generation_event(
     };
 }
 
-static json runtime_generation_result(
+json runtime_generation_result(
         const std::string & request_id,
         int64_t created,
         const std::string & model,
@@ -2138,7 +2003,7 @@ static json runtime_generation_result(
     };
 }
 
-static json chat_diff_json(const common_chat_msg_diff & diff) {
+json chat_diff_json(const common_chat_msg_diff & diff) {
     json delta = json::object();
     if (!diff.reasoning_content_delta.empty()) {
         delta["reasoning_content"] = diff.reasoning_content_delta;
@@ -2186,19 +2051,6 @@ static json chat_tool_calls_json(
     return out;
 }
 
-static bool write_sse(httplib::DataSink & sink, const json & value) {
-    const std::string event = "data: " + value.dump() + "\n\n";
-    return sink.write(event.data(), event.size());
-}
-
-static bool authorized(const httplib::Request & req, httplib::Response & res, const std::string & api_key) {
-    if (api_key.empty()) return true;
-    const std::string expected = "Bearer " + api_key;
-    if (req.get_header_value("Authorization") == expected) return true;
-    res.set_header("WWW-Authenticate", "Bearer");
-    set_json(res, error_body("invalid API key", "authentication_error"), 401);
-    return false;
-}
 
 static int base64_digit(unsigned char value) {
     if (value >= 'A' && value <= 'Z') return value - 'A';
@@ -2924,7 +2776,7 @@ static MfqMultimodalInput parse_grid_vision_multimodal(
     return result;
 }
 
-static MfqMultimodalInput parse_mfq_vision(
+MfqMultimodalInput parse_mfq_vision(
         const json & value,
         std::vector<int64_t> & prompt,
         const MfqTokenizer & tokenizer,
@@ -3204,7 +3056,7 @@ static MfqMultimodalInput parse_mfq_vision(
     return result;
 }
 
-static std::vector<float> decode_audio_features(
+std::vector<float> decode_audio_features(
         const std::string & encoded,
         int32_t frames) {
     if (frames < 3 || frames > 4096) {
@@ -3233,19 +3085,7 @@ static std::vector<float> decode_audio_features(
     return features;
 }
 
-static json parse_body(const httplib::Request & req) {
-    try {
-        return json::parse(req.body);
-    } catch (const json::parse_error & error) {
-        throw ApiError(400, "invalid_request_error", std::string("invalid JSON: ") + error.what());
-    }
-}
-
-static void handle_api_error(httplib::Response & res, const ApiError & error) {
-    set_json(res, error_body(error.what(), error.type, error.param), error.status);
-}
-
-} // namespace
+} // namespace mfq::transport_detail
 
 MfqRuntimeProfile resolve_mfq_runtime_profile(
         const std::string & mfq_path,
@@ -3255,6 +3095,7 @@ MfqRuntimeProfile resolve_mfq_runtime_profile(
         const std::string & embedded_profile_json,
         const std::string & model_config_json,
         const std::string & explicit_profile_path) {
+    using namespace mfq::transport_detail;
     std::vector<std::string> identities{
         model_architecture, model_type, model_name,
     };
@@ -3304,6 +3145,7 @@ MfqTokenizerProbe probe_mfq_tokenizer(
         const std::string & text,
         bool add_special,
         bool parse_special) {
+    using namespace mfq::transport_detail;
     MfqTokenizer tokenizer(tokenizer_gguf);
     return {
         tokenizer.vocab_size(),
@@ -3323,6 +3165,7 @@ MfqTokenizerProbe probe_mfq_tokenizer(
         const std::string & text,
         bool add_special,
         bool parse_special) {
+    using namespace mfq::transport_detail;
     MfqTokenizer tokenizer(tokenizer_model);
     return {
         tokenizer.vocab_size(),
@@ -3335,2116 +3178,4 @@ MfqTokenizerProbe probe_mfq_tokenizer(
         tokenizer.chat_template(),
         tokenizer.tokenize(text, parse_special, add_special),
     };
-}
-
-namespace {
-
-int run_mfq_http_transport(
-        const MfqHttpRuntimeTransportConfig & config,
-        const MfqScheduler & scheduler) {
-    const auto & duplex = scheduler.duplex();
-    const auto & session_control = scheduler.session_control();
-    const auto & runtime_metrics = scheduler.runtime_metrics();
-    if (!scheduler.supports_generation()) {
-        throw std::runtime_error(
-            "MFQ runtime transport requires a generation engine");
-    }
-    if (config.tokenizer_gguf.empty() &&
-        config.tokenizer_model.empty()) {
-        throw std::runtime_error(
-            "MFQ runtime transport requires an embedded or external tokenizer GGUF");
-    }
-    if (!config.tokenizer_gguf.empty() &&
-        !config.tokenizer_model.empty()) {
-        throw std::runtime_error(
-            "MFQ runtime transport tokenizer source is ambiguous");
-    }
-    if (config.port < 1 || config.port > 65535) {
-        throw std::runtime_error("runtime transport port must be in [1, 65535]");
-    }
-
-    std::unique_ptr<MfqTokenizer> tokenizer =
-        config.tokenizer_gguf.empty()
-        ? std::make_unique<MfqTokenizer>(
-              config.tokenizer_model)
-        : std::make_unique<MfqTokenizer>(
-              config.tokenizer_gguf);
-    if (config.vocab_size > 0 && tokenizer->vocab_size() != config.vocab_size) {
-        throw std::runtime_error("tokenizer/model vocabulary mismatch: tokenizer=" +
-                                 std::to_string(tokenizer->vocab_size()) + " model=" +
-                                 std::to_string(config.vocab_size));
-    }
-    common_chat_templates_ptr chat_templates = nullptr;
-    if (!tokenizer->chat_template().empty()) {
-        chat_templates = common_chat_templates_init(
-            tokenizer->context(), "");
-        if (!chat_templates) {
-            throw std::runtime_error(
-                "cannot initialize tokenizer.chat_template");
-        }
-    }
-    const MfqSamplingParams sampling_defaults =
-        default_sampling_params(config);
-    const json duplex_sampling_defaults =
-        duplex_profile_json(config.runtime_profile.duplex);
-    const json tts_sampling_defaults =
-        tts_profile_json(config.runtime_profile.tts);
-    const std::string duplex_backend_name =
-        duplex.name.empty() ? "native" : duplex.name;
-    const json chat_template_capabilities =
-        chat_template_capabilities_json(
-            tokenizer->chat_template());
-    const auto model_capability_profile = config.model_capabilities
-        ? *config.model_capabilities
-        : architecture_capability_profile(config.model_type);
-    const json model_capabilities =
-        model_capability_profile_json(model_capability_profile);
-    const bool vision_supported =
-        model_capability_profile.image_input ||
-        model_capability_profile.video_input;
-    const bool vision_available =
-        scheduler.supports_multimodal_generation() &&
-        model_capability_profile.image_input;
-    const bool video_available =
-        scheduler.supports_multimodal_generation() &&
-        model_capability_profile.video_input;
-
-    httplib::Server server;
-    RuntimeRequestMetrics request_metrics_store;
-    std::atomic<int64_t> active_context{config.max_context};
-    std::atomic<bool> reloading{false};
-    std::mutex reload_gate;
-    std::mutex duplex_gate;
-    std::string duplex_session_id;
-    httplib::ws::WebSocket * duplex_socket = nullptr;
-    bool duplex_backend_started = false;
-
-    const auto duplex_is_active = [&]() {
-        std::lock_guard<std::mutex> lock(duplex_gate);
-        return !duplex_session_id.empty();
-    };
-    const auto stop_duplex_session = [&](const std::string & session_id,
-                                         bool close_socket) {
-        httplib::ws::WebSocket * socket = nullptr;
-        bool stop_backend = false;
-        {
-            std::lock_guard<std::mutex> lock(duplex_gate);
-            if (duplex_session_id.empty() ||
-                duplex_session_id != session_id) {
-                return false;
-            }
-            socket = duplex_socket;
-            stop_backend = duplex_backend_started;
-            duplex_session_id.clear();
-            duplex_socket = nullptr;
-            duplex_backend_started = false;
-        }
-        if (stop_backend) duplex.stop();
-        if (close_socket && socket != nullptr && socket->is_open()) {
-            socket->close(
-                httplib::ws::CloseStatus::Normal, "session closed");
-        }
-        return true;
-    };
-    server.set_payload_max_length(
-        (scheduler.supports_multimodal_generation() ? 512ULL : 16ULL) *
-        1024ULL * 1024ULL);
-    server.set_read_timeout(300, 0);
-    server.set_write_timeout(300, 0);
-    server.set_keep_alive_max_count(100);
-    server.set_default_headers({
-        {"Access-Control-Allow-Origin", "*"},
-        {"Access-Control-Allow-Headers", "Authorization, Content-Type"},
-        {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"},
-        {"X-Content-Type-Options", "nosniff"},
-    });
-
-    server.Options(R"(.*)", [](const httplib::Request &, httplib::Response & res) {
-        res.status = 204;
-    });
-
-    if (duplex) {
-        server.WebSocket("/runtime/realtime", [&](const httplib::Request & req,
-                                          httplib::ws::WebSocket & ws) {
-            const std::string expected = "Bearer " + config.api_key;
-            if (!config.api_key.empty() &&
-                req.get_header_value("Authorization") != expected) {
-                ws.close(
-                    httplib::ws::CloseStatus::PolicyViolation,
-                    "authentication failed");
-                return;
-            }
-
-            std::string owned_session;
-            std::unordered_set<int64_t> session_controls;
-            const auto send_event = [&](json event) {
-                event["server_send_ts"] =
-                    std::chrono::duration<double>(
-                        std::chrono::system_clock::now()
-                            .time_since_epoch()).count();
-                return ws.send(event.dump());
-            };
-            try {
-                std::string message;
-                while (ws.is_open()) {
-                    const auto read_result = ws.read(message);
-                    if (read_result == httplib::ws::ReadResult::Fail) break;
-                    if (read_result != httplib::ws::ReadResult::Text) {
-                        throw ApiError(
-                            400, "invalid_request_error",
-                            "duplex backend accepts JSON text frames only");
-                    }
-                    json body;
-                    try {
-                        body = json::parse(message);
-                    } catch (const json::parse_error & error) {
-                        throw ApiError(
-                            400, "invalid_request_error",
-                            std::string("invalid duplex JSON: ") +
-                                error.what());
-                    }
-                    if (!body.is_object() || !body.contains("type") ||
-                        !body["type"].is_string()) {
-                        throw ApiError(
-                            400, "invalid_request_error",
-                            "duplex message requires a string type");
-                    }
-                    const std::string type = body["type"].get<std::string>();
-
-                    if (type == "session.init") {
-                        if (!owned_session.empty()) {
-                            throw ApiError(
-                                409, "conflict",
-                                "duplex session is already initialized");
-                        }
-                        const json payload = body.value(
-                            "payload", json::object());
-                        if (!payload.is_object()) {
-                            throw ApiError(
-                                400, "invalid_request_error",
-                                "session.init payload must be an object");
-                        }
-                        const std::string mode = payload.value(
-                            "mode", std::string("full_duplex"));
-                        if (mode != "full_duplex") {
-                            throw ApiError(
-                                400, "unsupported_operation",
-                                duplex_backend_name +
-                                    " duplex backend supports full_duplex only");
-                        }
-
-                        owned_session = request_id("sess-");
-                        {
-                            std::lock_guard<std::mutex> lock(duplex_gate);
-                            if (!duplex_session_id.empty()) {
-                                owned_session.clear();
-                                throw ApiError(
-                                    409, "conflict",
-                                    "the " + duplex_backend_name +
-                                        " worker already owns a duplex session");
-                            }
-                            duplex_session_id = owned_session;
-                            duplex_socket = &ws;
-                        }
-
-                        MfqDuplexSessionParams parameters;
-                        const std::string system_prompt = payload.value(
-                            "system_prompt",
-                            config.runtime_profile.duplex.system_prompt.value_or(
-                                "Streaming Omni Conversation."));
-                        const std::string rendered_prefix =
-                            "<|im_start|>system\n" + system_prompt +
-                            "\n<|audio_start|>";
-                        parameters.system_prefix = tokenizer->tokenize(
-                            rendered_prefix, true, false);
-                        parameters.system_suffix = tokenizer->tokenize(
-                            "<|audio_end|><|im_end|>", true, false);
-                        if (payload.contains("reference_audio_features")) {
-                            if (!payload["reference_audio_features"].is_string()) {
-                                throw ApiError(
-                                    400, "invalid_request_error",
-                                    "reference_audio_features must be base64 float32 Mel data",
-                                    "reference_audio_features");
-                            }
-                            parameters.reference_audio_frames =
-                                static_cast<int32_t>(integer_field(
-                                    payload, "reference_audio_frames", 0));
-                            parameters.reference_audio_features =
-                                decode_audio_features(
-                                    payload["reference_audio_features"].get<std::string>(),
-                                    parameters.reference_audio_frames);
-                        }
-                        parameters.special_ids = {
-                            tokenizer->special_token_id("<unit>"),
-                            tokenizer->special_token_id("</unit>"),
-                            tokenizer->special_token_id("<image>"),
-                            tokenizer->special_token_id("</image>"),
-                            tokenizer->special_token_id("<slice>"),
-                            tokenizer->special_token_id("</slice>"),
-                            tokenizer->special_token_id("<|listen|>"),
-                            tokenizer->special_token_id("<|speak|>"),
-                            tokenizer->special_token_id("<|tts_bos|>"),
-                            tokenizer->special_token_id("<|tts_eos|>"),
-                            tokenizer->special_token_id("<|chunk_eos|>"),
-                            tokenizer->special_token_id("<|chunk_tts_eos|>"),
-                            tokenizer->special_token_id("<|turn_eos|>"),
-                            tokenizer->special_token_id("<|tts_pad|>"),
-                            151687,
-                        };
-                        parameters.forbidden_ids = {
-                            tokenizer->special_token_id("<|tts_pad|>"),
-                        };
-                        session_controls = std::unordered_set<int64_t>(
-                            parameters.special_ids.begin(),
-                            parameters.special_ids.end());
-                        const json generation = payload.value(
-                            "config", json::object());
-                        if (!generation.is_object()) {
-                            throw ApiError(
-                                400, "invalid_request_error",
-                                "session config must be an object", "config");
-                        }
-                        const auto & duplex_defaults = config.runtime_profile.duplex;
-                        parameters.greedy = generation.value(
-                            "decode_mode", duplex_defaults.decode_mode.value_or("sampling")) ==
-                            "greedy";
-                        parameters.temperature = number_field(
-                            generation, "temperature", duplex_defaults.temperature.value_or(0.7));
-                        parameters.top_k = static_cast<int32_t>(integer_field(
-                            generation, "top_k", duplex_defaults.top_k.value_or(100)));
-                        parameters.top_p = number_field(
-                            generation, "top_p", duplex_defaults.top_p.value_or(0.8));
-                        parameters.listen_probability_scale = number_field(
-                            generation, "listen_prob_scale", duplex_defaults.listen_prob_scale.value_or(1.0));
-                        parameters.repetition_penalty = number_field(
-                            generation, "text_repetition_penalty", duplex_defaults.text_repetition_penalty.value_or(1.05));
-                        parameters.repetition_window =
-                            static_cast<int32_t>(integer_field(
-                                generation,
-                                "text_repetition_window_size",
-                                duplex_defaults.text_repetition_window_size.value_or(512)));
-                        parameters.length_penalty = number_field(
-                            generation, "length_penalty", duplex_defaults.length_penalty.value_or(1.0));
-                        parameters.tts_temperature = number_field(
-                            generation, "tts_temperature",
-                            config.runtime_profile.tts.temperature.value_or(0.8));
-                        parameters.tts_repetition_penalty = number_field(
-                            generation, "tts_repetition_penalty",
-                            config.runtime_profile.tts.repetition_penalty.value_or(1.05));
-                        if (generation.contains("seed")) {
-                            parameters.seed = static_cast<uint64_t>(
-                                integer_field(generation, "seed", 0));
-                        } else {
-                            std::random_device random;
-                            parameters.seed =
-                                (static_cast<uint64_t>(random()) << 32) ^
-                                static_cast<uint64_t>(random());
-                        }
-
-                        try {
-                            duplex.start(parameters);
-                            std::lock_guard<std::mutex> lock(duplex_gate);
-                            if (duplex_session_id == owned_session) {
-                                duplex_backend_started = true;
-                            }
-                        } catch (...) {
-                            std::lock_guard<std::mutex> lock(duplex_gate);
-                            if (duplex_session_id == owned_session) {
-                                duplex_session_id.clear();
-                                duplex_socket = nullptr;
-                            }
-                            owned_session.clear();
-                            throw;
-                        }
-                        send_event({
-                            {"type", "session.created"},
-                            {"session_id", owned_session},
-                            {"mode", "full_duplex"},
-                            {"metrics", {{"backend", duplex_backend_name}}},
-                        });
-                        continue;
-                    }
-
-                    if (type != "input.append") {
-                        throw ApiError(
-                            400, "invalid_request_error",
-                            "unsupported duplex message type: " + type);
-                    }
-                    if (owned_session.empty()) {
-                        throw ApiError(
-                            409, "conflict",
-                            "session.init must precede input.append");
-                    }
-                    const json input = body.value("input", json::object());
-                    if (!input.is_object()) {
-                        throw ApiError(
-                            400, "invalid_request_error",
-                            "input must be an object", "input");
-                    }
-                    const bool has_audio = input.contains("audio_features");
-                    const bool has_text = input.contains("text");
-                    if (!has_audio && !has_text) {
-                        throw ApiError(
-                            400, "invalid_request_error",
-                            "input requires audio_features or text", "input");
-                    }
-                    MfqDuplexStepInput step;
-                    if (has_audio) {
-                        if (!input["audio_features"].is_string()) {
-                            throw ApiError(
-                                400, "invalid_request_error",
-                                "input.audio_features must be base64 float32 Mel data",
-                                "audio_features");
-                        }
-                        step.audio_frames = static_cast<int32_t>(integer_field(
-                            input, "audio_frames", 0));
-                        step.audio_features = decode_audio_features(
-                            input["audio_features"].get<std::string>(),
-                            step.audio_frames);
-                        step.audio_prefix_extra_frames = integer_field(
-                            input, "audio_prefix_extra_frames", 0);
-                        step.audio_suffix_extra_frames = integer_field(
-                            input, "audio_suffix_extra_frames", 0);
-                    }
-                    if (has_text) {
-                        if (!input["text"].is_string() ||
-                            input["text"].get_ref<const std::string&>().empty()) {
-                            throw ApiError(
-                                400, "invalid_request_error",
-                                "input.text must be a non-empty string", "text");
-                        }
-                        step.text_tokens = tokenizer->tokenize(
-                            input["text"].get<std::string>(), false, false);
-                        if (step.text_tokens.empty()) {
-                            throw ApiError(
-                                400, "invalid_request_error",
-                                "input.text produced no tokens", "text");
-                        }
-                    }
-                    step.max_new_speak_tokens = static_cast<int32_t>(
-                        integer_field(
-                            input,
-                            "max_new_speak_tokens",
-                            config.runtime_profile.duplex
-                                .max_new_speak_tokens_per_chunk
-                                .value_or(20)));
-                    if (input.contains("force_listen") &&
-                        !input["force_listen"].is_boolean()) {
-                        throw ApiError(
-                            400, "invalid_request_error",
-                            "force_listen must be boolean", "force_listen");
-                    }
-                    step.force_listen = input.value("force_listen", false);
-                    if (input.contains("force_speak") &&
-                        !input["force_speak"].is_boolean()) {
-                        throw ApiError(
-                            400, "invalid_request_error",
-                            "force_speak must be boolean", "force_speak");
-                    }
-                    step.force_speak = input.value("force_speak", false);
-                    if (step.force_listen && step.force_speak) {
-                        throw ApiError(
-                            400, "invalid_request_error",
-                            "force_listen and force_speak are mutually exclusive");
-                    }
-
-                    const auto result = duplex.step(step);
-                    const std::string response_id = request_id("resp-");
-                    json metrics = {
-                        {"backend", duplex_backend_name},
-                        {"wall_clock_ms", result.inference_ms},
-                        {"kv_cache_length", result.language_cache_position},
-                        {"audio_cache_length", result.audio_cache_position},
-                        {"tts_cache_length", result.tts_cache_position},
-                        {"audio_chunk_index", result.audio_chunk_index},
-                    };
-
-                    std::string text_delta;
-                    for (const int64_t token : result.generated_tokens) {
-                        if (session_controls.count(token) == 0) {
-                            text_delta += tokenizer->piece(token, false);
-                        }
-                    }
-                    if (!text_delta.empty()) {
-                        send_event({
-                            {"type", "response.output.delta"},
-                            {"kind", "text"},
-                            {"text", text_delta},
-                            {"session_id", owned_session},
-                            {"response_id", response_id},
-                            {"end_of_turn", result.end_of_turn},
-                            {"metrics", metrics},
-                        });
-                    }
-                    if (!result.audio_tokens.empty() ||
-                        (result.end_of_turn && !result.is_listen)) {
-                        send_event({
-                            {"type", "response.output.delta"},
-                            {"kind", "audio_tokens"},
-                            {"audio_tokens", result.audio_tokens},
-                            {"session_id", owned_session},
-                            {"response_id", response_id},
-                            {"end_of_turn", result.end_of_turn},
-                            {"force_flush", result.tts_force_flush},
-                            {"metrics", metrics},
-                        });
-                    }
-                    if (result.is_listen) {
-                        send_event({
-                            {"type", "response.output.delta"},
-                            {"kind", "listen"},
-                            {"session_id", owned_session},
-                            {"response_id", response_id},
-                            {"metrics", metrics},
-                        });
-                    }
-                    send_event({
-                        {"type", "response.step.done"},
-                        {"session_id", owned_session},
-                        {"response_id", response_id},
-                        {"end_of_turn", result.end_of_turn},
-                        {"metrics", metrics},
-                    });
-                }
-            } catch (const std::exception & error) {
-                send_event({
-                    {"type", "session.closed"},
-                    {"session_id", owned_session},
-                    {"reason", "backend_error"},
-                    {"diagnostic", {{"message", error.what()}}},
-                });
-                if (ws.is_open()) {
-                    ws.close(
-                        httplib::ws::CloseStatus::InternalError,
-                        "duplex backend error");
-                }
-            }
-            if (!owned_session.empty()) {
-                stop_duplex_session(owned_session, false);
-            }
-        });
-
-        server.Post(R"(/runtime/realtime/sessions/([A-Za-z0-9_-]+)/close)",
-            [&](const httplib::Request & req, httplib::Response & res) {
-                if (!authorized(req, res, config.api_key)) return;
-                const std::string session_id = req.matches[1].str();
-                if (!stop_duplex_session(session_id, true)) {
-                    set_json(res, error_body(
-                        "duplex session was not found", "not_found"), 404);
-                    return;
-                }
-                set_json(res, {
-                    {"ok", true},
-                    {"session_id", session_id},
-                    {"closed", true},
-                });
-            });
-    }
-
-    server.Get("/", [&](const httplib::Request & req, httplib::Response & res) {
-        if (!authorized(req, res, config.api_key)) return;
-        set_json(res, {
-            {"name", "MFQ C++ HTTP runtime transport"},
-            {"model", config.model_name},
-            {"endpoints", {
-                "/runtime/generate", "/runtime/models",
-                "/runtime/health", "/runtime/status", "/runtime/reload",
-                "/runtime/realtime", "/runtime/cache/clear",
-                "/runtime/cache/trim", "/runtime/sessions/fork",
-                "/runtime/sessions/{id}",
-                "/runtime/sessions/{id}/cancel",
-            }},
-        });
-    });
-
-    const auto add_runtime_metrics = [&](json & value) {
-        if (!runtime_metrics) return;
-        for (const auto & item : runtime_metrics()) {
-            value[item.first] = item.second;
-        }
-    };
-    const auto add_request_runtime_metrics = [&](json & value) {
-        if (!runtime_metrics) return;
-        static const std::unordered_set<std::string> request_metric_names{
-            "mtp_available",
-            "mtp_used",
-            "mtp_cycles",
-            "mtp_drafted_tokens",
-            "mtp_accepted_tokens",
-            "mtp_acceptance_rate",
-            "mtp_selected_depth",
-            "mtp_depth_0_cycles",
-            "mtp_depth_1_cycles",
-            "mtp_depth_2_cycles",
-            "mtp_depth_3_cycles",
-            "mtp_depth_4_cycles",
-            "mtp_depth_5_cycles",
-            "mtp_position_1_acceptance_rate",
-            "mtp_position_2_acceptance_rate",
-            "mtp_position_3_acceptance_rate",
-            "mtp_position_4_acceptance_rate",
-            "mtp_position_5_acceptance_rate",
-            "mtp_depth_0_cycle_ms",
-            "mtp_depth_1_cycle_ms",
-            "mtp_depth_2_cycle_ms",
-            "mtp_depth_3_cycle_ms",
-            "mtp_depth_4_cycle_ms",
-            "mtp_depth_5_cycle_ms",
-            "mtp_target_ms",
-            "mtp_head_ms",
-            "mtp_rollback_ms",
-        };
-        for (const auto & item : runtime_metrics()) {
-            if (request_metric_names.find(item.first) !=
-                request_metric_names.end()) {
-                value[item.first] = item.second;
-            }
-        }
-    };
-    const auto add_session_metrics = [&](json & value) {
-        if (!session_control.metrics) return;
-        for (const auto & item : session_control.metrics()) {
-            value[item.first] = item.second;
-        }
-    };
-
-    server.Get("/runtime/health", [&](const httplib::Request &, httplib::Response & res) {
-        json health = {
-            {"status", reloading.load() ? "loading" : "ok"},
-            {"model", config.model_name},
-            {"model_type", config.model_type},
-            {"model_capabilities", model_capabilities},
-            {"vision_supported", vision_supported},
-            {"vision_available", vision_available},
-            {"video_available", video_available},
-            {"mtp_supported", model_capability_profile.mtp},
-            {"mtp_available", false},
-            {"vision_enabled_default", sampling_defaults.enable_vision},
-            {"mtp_enabled_default", sampling_defaults.enable_mtp},
-            {"max_context", active_context.load()},
-            {"duplex_available", static_cast<bool>(duplex)},
-            {"duplex_active", duplex_is_active()},
-            {"sampling_defaults", sampling_params_json(sampling_defaults)},
-            {"duplex_sampling_defaults", duplex_sampling_defaults},
-            {"tts_sampling_defaults", tts_sampling_defaults},
-            {"runtime_profile_source", config.runtime_profile.source},
-            {"chat_template_capabilities", chat_template_capabilities},
-        };
-        add_runtime_metrics(health);
-        add_session_metrics(health);
-        set_json(res, health);
-    });
-
-    server.Get("/runtime/realtime/capabilities", [&] (
-            const httplib::Request & req, httplib::Response & res) {
-        if (!authorized(req, res, config.api_key)) return;
-        set_json(res, {
-            {"available", static_cast<bool>(duplex)},
-            {"modes", duplex ? json::array({"audio"}) : json::array()},
-        });
-    });
-
-    server.Get("/runtime/status", [&](const httplib::Request & req, httplib::Response & res) {
-        if (!authorized(req, res, config.api_key)) return;
-        json status = request_metrics_store.snapshot(
-            config, active_context.load(), reloading.load());
-        status["sampling_defaults"] = sampling_params_json(
-            sampling_defaults);
-        status["duplex_sampling_defaults"] = duplex_sampling_defaults;
-        status["tts_sampling_defaults"] = tts_sampling_defaults;
-        status["runtime_profile_source"] = config.runtime_profile.source;
-        status["chat_template_capabilities"] =
-            chat_template_capabilities;
-        status["model_capabilities"] = model_capabilities;
-        status["vision_supported"] = vision_supported;
-        status["vision_available"] = vision_available;
-        status["video_available"] = video_available;
-        status["mtp_supported"] = model_capability_profile.mtp;
-        status["mtp_available"] = false;
-        status["vision_enabled_default"] = sampling_defaults.enable_vision;
-        status["mtp_enabled_default"] = sampling_defaults.enable_mtp;
-        status["duplex_available"] = static_cast<bool>(duplex);
-        status["duplex_active"] = duplex_is_active();
-        add_runtime_metrics(status);
-        add_session_metrics(status);
-        set_json(res, status);
-    });
-
-    server.Post("/runtime/cache/clear", [&] (
-            const httplib::Request & req, httplib::Response & res) {
-        if (!authorized(req, res, config.api_key)) return;
-        if (!session_control.clear) {
-            set_json(res, error_body(
-                "this runtime does not expose a prefix cache",
-                "unsupported_operation"), 501);
-            return;
-        }
-        {
-            std::lock_guard<std::mutex> gate(reload_gate);
-            bool expected = false;
-            if (!reloading.compare_exchange_strong(expected, true)) {
-                set_json(res, error_body(
-                    "a runtime control operation is already in progress",
-                    "conflict"), 409);
-                return;
-            }
-            if (request_metrics_store.active_requests() != 0 ||
-                duplex_is_active()) {
-                reloading.store(false);
-                set_json(res, error_body(
-                    "cannot clear the prefix cache while a generation or "
-                    "duplex session is active",
-                    "conflict"), 409);
-                return;
-            }
-        }
-        try {
-            const size_t released = session_control.clear();
-            json result = {
-                {"status", "ok"},
-                {"released_snapshots", released},
-            };
-            add_session_metrics(result);
-            reloading.store(false);
-            set_json(res, result);
-        } catch (const std::exception & error) {
-            reloading.store(false);
-            set_json(res, error_body(error.what(), "server_error"), 500);
-        }
-    });
-
-    server.Post("/runtime/cache/trim", [&] (
-            const httplib::Request & req, httplib::Response & res) {
-        if (!authorized(req, res, config.api_key)) return;
-        if (!session_control.trim_hot) {
-            set_json(res, error_body(
-                "this runtime does not expose a tiered prefix cache",
-                "unsupported_operation"), 501);
-            return;
-        }
-        try {
-            const json body = parse_body(req);
-            if (!body.is_object()) {
-                throw ApiError(
-                    400, "invalid_request_error",
-                    "request body must be a JSON object");
-            }
-            std::uint64_t target_bytes = 0;
-            if (body.contains("target_bytes")) {
-                if (!body["target_bytes"].is_number_unsigned() &&
-                    !(body["target_bytes"].is_number_integer() &&
-                      body["target_bytes"].get<std::int64_t>() >= 0)) {
-                    throw ApiError(
-                        400, "invalid_request_error",
-                        "target_bytes must be a non-negative integer",
-                        "target_bytes");
-                }
-                target_bytes = body["target_bytes"].get<std::uint64_t>();
-            }
-            const auto released = session_control.trim_hot(target_bytes);
-            json result = {
-                {"status", "ok"},
-                {"released_bytes", released},
-                {"target_bytes", target_bytes},
-            };
-            add_session_metrics(result);
-            set_json(res, result);
-        } catch (const ApiError & error) {
-            handle_api_error(res, error);
-        } catch (const std::exception & error) {
-            set_json(res, error_body(error.what(), "server_error"), 500);
-        }
-    });
-
-    server.Post(
-        R"(/runtime/sessions/([A-Za-z0-9._:-]{1,128})/cancel)",
-        [&] (const httplib::Request & req, httplib::Response & res) {
-            if (!authorized(req, res, config.api_key)) return;
-            const std::string session_id = req.matches[1].str();
-            set_json(res, {
-                {"status", "ok"},
-                {"cancelled", scheduler.cancel_request(session_id)},
-            });
-        });
-
-    server.Post("/runtime/sessions/fork", [&] (
-            const httplib::Request & req, httplib::Response & res) {
-        if (!authorized(req, res, config.api_key)) return;
-        if (!session_control.fork) {
-            set_json(res, error_body(
-                "this runtime does not support session forks",
-                "unsupported_operation"), 501);
-            return;
-        }
-        try {
-            const json body = parse_body(req);
-            const auto read_session_id = [&](const char * field) {
-                if (!body.contains(field) || !body[field].is_string()) {
-                    throw ApiError(
-                        400, "invalid_request_error",
-                        std::string(field) + " must be a string", field);
-                }
-                auto session_id = body[field].get<std::string>();
-                if (!valid_mfq_session_id(session_id)) {
-                    throw ApiError(
-                        400, "invalid_request_error",
-                        std::string(field) +
-                            " must contain 1 to 128 safe identifier bytes",
-                        field);
-                }
-                return session_id;
-            };
-            const std::string source_session_id =
-                read_session_id("source_session_id");
-            const std::string target_session_id =
-                read_session_id("target_session_id");
-            if (source_session_id == target_session_id) {
-                throw ApiError(
-                    400, "invalid_request_error",
-                    "source and target sessions must differ",
-                    "target_session_id");
-            }
-            const size_t copied = session_control.fork(
-                source_session_id, target_session_id);
-            set_json(res, {
-                {"status", "ok"},
-                {"copied_snapshots", copied},
-            });
-        } catch (const ApiError & error) {
-            handle_api_error(res, error);
-        } catch (const std::exception & error) {
-            set_json(res, error_body(error.what(), "server_error"), 500);
-        }
-    });
-
-    server.Delete(
-        R"(/runtime/sessions/([A-Za-z0-9._:-]{1,128}))",
-        [&] (const httplib::Request & req, httplib::Response & res) {
-            if (!authorized(req, res, config.api_key)) return;
-            if (!session_control.close) {
-                set_json(res, error_body(
-                    "this runtime does not support session close",
-                    "unsupported_operation"), 501);
-                return;
-            }
-            try {
-                const std::string session_id = req.matches[1].str();
-                const size_t released = session_control.close(session_id);
-                set_json(res, {
-                    {"status", "ok"},
-                    {"released_snapshots", released},
-                });
-            } catch (const std::exception & error) {
-                set_json(res, error_body(error.what(), "server_error"), 500);
-            }
-        });
-
-    server.Post("/runtime/reload", [&](const httplib::Request & req, httplib::Response & res) {
-        if (!authorized(req, res, config.api_key)) return;
-        if (!scheduler.supports_reload()) {
-            set_json(res, error_body(
-                "this runtime does not support model reload",
-                "unsupported_operation"), 501);
-            return;
-        }
-        {
-            std::lock_guard<std::mutex> gate(reload_gate);
-            bool expected = false;
-            if (!reloading.compare_exchange_strong(expected, true)) {
-                set_json(res, error_body(
-                    "model reload is already in progress", "conflict"), 409);
-                return;
-            }
-            if (request_metrics_store.active_requests() != 0 ||
-                duplex_is_active()) {
-                reloading.store(false);
-                set_json(res, error_body(
-                    "cannot reload while a generation or duplex session is active",
-                    "conflict"), 409);
-                return;
-            }
-        }
-        const auto finish_reload = [&] {
-            reloading.store(false);
-        };
-        try {
-            const json body = parse_body(req);
-            const int64_t context_size = integer_field(
-                body, "context_size", active_context.load());
-            const int64_t capacity = config.context_capacity > 0
-                ? config.context_capacity
-                : config.max_context;
-            if (context_size < 1 ||
-                (capacity > 0 && context_size > capacity)) {
-                throw ApiError(
-                    400, "invalid_request_error",
-                    "context_size must be within the model context capacity",
-                    "context_size");
-            }
-            const int64_t loaded_context = scheduler.reload(context_size);
-            if (loaded_context < 1 ||
-                (capacity > 0 && loaded_context > capacity)) {
-                throw std::runtime_error(
-                    "runtime reload returned an invalid context size");
-            }
-            active_context.store(loaded_context);
-            finish_reload();
-            set_json(res, {
-                {"status", "ok"},
-                {"model", config.model_name},
-                {"max_context", loaded_context},
-                {"context_capacity", capacity},
-            });
-        } catch (const ApiError & error) {
-            finish_reload();
-            handle_api_error(res, error);
-        } catch (const std::exception & error) {
-            finish_reload();
-            set_json(res, error_body(error.what(), "server_error"), 500);
-        }
-    });
-
-    server.Get("/runtime/models", [&](const httplib::Request & req, httplib::Response & res) {
-        if (!authorized(req, res, config.api_key)) return;
-        set_json(res, {
-            {"models", json::array({{
-                {"name", config.model_name},
-                {"type", config.model_type},
-                {"capabilities", model_capabilities},
-            }})},
-        });
-    });
-
-    auto runtime_generate_handler = [&](const httplib::Request & req, httplib::Response & res) {
-        if (!authorized(req, res, config.api_key)) return;
-        if (duplex_is_active()) {
-            set_json(res, error_body(
-                "the model is reserved by an active duplex session",
-                "conflict"), 409);
-            return;
-        }
-        if (reloading.load()) {
-            set_json(res, error_body(
-                "model reload is in progress", "service_unavailable"), 503);
-            return;
-        }
-        try {
-            const json body = runtime_generate_body(parse_body(req));
-            RequestWork work = parse_work(
-                body, true, *tokenizer, chat_templates.get(),
-                active_context.load(), config.model_type,
-                sampling_defaults);
-            if (body.contains("mfq_multimodal")) {
-                if (!work.sampling.enable_vision) {
-                    throw ApiError(
-                        400, "invalid_request_error",
-                        "vision is disabled for this request; set enable_vision=true",
-                        "enable_vision");
-                }
-                if (!scheduler.supports_multimodal_generation()) {
-                    throw ApiError(
-                        501, "unsupported_parameter",
-                        "the loaded model has no native vision runtime",
-                        "mfq_multimodal");
-                }
-                work.vision = parse_mfq_vision(
-                    body["mfq_multimodal"], work.prompt, *tokenizer,
-                    config.vocab_size);
-                if (active_context.load() > 0 &&
-                    static_cast<int64_t>(work.prompt.size()) +
-                        work.sampling.max_tokens > active_context.load()) {
-                    throw ApiError(
-                        400, "context_length_exceeded",
-                        "expanded multimodal prompt plus max_tokens exceed "
-                        "the model context window",
-                        "max_tokens");
-                }
-                work.cache_plan.stable_prefix_tokens = 0;
-            }
-            const std::string id = request_id("run-");
-            const int64_t created = unix_time_seconds();
-            std::shared_ptr<ActiveRequest> active_request;
-            {
-                std::lock_guard<std::mutex> gate(reload_gate);
-                if (reloading.load()) {
-                    set_json(res, error_body(
-                        "model reload is in progress",
-                        "service_unavailable"), 503);
-                    return;
-                }
-                active_request =
-                    std::make_shared<ActiveRequest>(request_metrics_store);
-            }
-            auto cancellation = scheduler.activate_request(
-                work.cache_plan.session_id, true);
-
-            if (!work.stream) {
-                RequestMetrics metrics;
-                CompletionResult result = generate_text(
-                    work, *tokenizer, scheduler,
-                    cancellation->cancel_flag(),
-                    [](const common_chat_msg_diff &) {
-                        return true;
-                    },
-                    &metrics,
-                    true);
-                const RequestMetricValues metric_values =
-                    request_metric_values(result, metrics);
-                log_request_metrics(
-                    id, true, false, work.prompt.size(), work.sampling,
-                    result, metric_values);
-                active_request->complete(
-                    id, true, false, work.prompt.size(), result, metric_values);
-                auto performance =
-                    request_metric_values_json(metric_values, work.sampling);
-                add_request_runtime_metrics(performance);
-                set_json(res, runtime_generation_result(
-                    id, created, config.model_name, result,
-                    usage_json(work.prompt.size(), result.completion_tokens),
-                    std::move(performance)));
-                return;
-            }
-
-            res.set_header("Cache-Control", "no-cache");
-            res.set_header("X-Accel-Buffering", "no");
-            res.set_chunked_content_provider(
-                "text/event-stream; charset=utf-8",
-                [work = std::move(work), id, created, &tokenizer, &scheduler,
-                 &config, active_request, cancellation,
-                 &add_request_runtime_metrics]
-                (size_t offset, httplib::DataSink & sink) mutable -> bool {
-                    if (offset != 0) {
-                        sink.done();
-                        return false;
-                    }
-                    try {
-                        RequestMetrics metrics;
-                        CompletionResult result = generate_text(
-                            work, *tokenizer, scheduler,
-                            cancellation->cancel_flag(),
-                            [&](const common_chat_msg_diff & diff) {
-                                json delta = chat_diff_json(diff);
-                                if (delta.empty()) return true;
-                                auto event = runtime_generation_event(
-                                    "delta", id, created, config.model_name);
-                                event["delta"] = std::move(delta);
-                                return write_sse(sink, event);
-                        }, &metrics, false);
-                        const RequestMetricValues metric_values =
-                            request_metric_values(result, metrics);
-                        log_request_metrics(
-                            id, true, true, work.prompt.size(), work.sampling,
-                            result, metric_values);
-                        active_request->complete(
-                            id, true, true, work.prompt.size(), result,
-                            metric_values);
-                        if (!result.client_connected) return false;
-                        auto complete = runtime_generation_event(
-                            "complete", id, created, config.model_name);
-                        complete["finish_reason"] = result.finish_reason;
-                        auto performance = request_metric_values_json(
-                            metric_values, work.sampling);
-                        add_request_runtime_metrics(performance);
-                        complete["metrics"] = std::move(performance);
-                        if (!write_sse(sink, complete)) return false;
-                        if (work.include_usage) {
-                            auto usage = runtime_generation_event(
-                                "usage", id, created, config.model_name);
-                            usage["usage"] = usage_json(
-                                work.prompt.size(), result.completion_tokens);
-                            if (!write_sse(sink, usage)) return false;
-                        }
-                        static constexpr char done[] = "data: [DONE]\n\n";
-                        if (!sink.write(done, sizeof(done) - 1)) return false;
-                    } catch (const std::exception & error) {
-                        write_sse(sink, error_body(error.what(), "runtime_error"));
-                    }
-                    sink.done();
-                    return false;
-                });
-        } catch (const ApiError & error) {
-            handle_api_error(res, error);
-        } catch (const std::exception & error) {
-            set_json(res, error_body(error.what(), "server_error"), 500);
-        }
-    };
-
-    server.Post("/runtime/generate", runtime_generate_handler);
-
-    server.set_exception_handler([](const httplib::Request &, httplib::Response & res, std::exception_ptr ep) {
-        std::string message = "unhandled server exception";
-        try {
-            if (ep) std::rethrow_exception(ep);
-        } catch (const std::exception & error) {
-            message = error.what();
-        }
-        set_json(res, error_body(message, "server_error"), 500);
-    });
-
-    if (!server.bind_to_port(config.host, config.port)) {
-        throw std::runtime_error(
-            "failed to bind " + config.host + ":" +
-            std::to_string(config.port));
-    }
-    const std::string endpoint = "http://" + config.host + ":" +
-        std::to_string(config.port);
-    std::cout << "MFQ HTTP runtime transport ready: " << endpoint
-              << " model=" << config.model_name
-              << " context=" << config.max_context
-              << " vocab=" << tokenizer->vocab_size() << std::endl;
-    if (!server.listen_after_bind()) {
-        throw std::runtime_error(
-            "runtime transport stopped after binding " + config.host + ":" +
-            std::to_string(config.port));
-    }
-    return 0;
-}
-
-class MfqStdioTransport final : public MfqTransport {
-public:
-    explicit MfqStdioTransport(MfqRuntimeTransportConfig config)
-        : config_(std::move(config)) {}
-
-    int run(const MfqScheduler & scheduler) override {
-        const auto & duplex = scheduler.duplex();
-        const auto & session_control = scheduler.session_control();
-        const auto & runtime_metrics = scheduler.runtime_metrics();
-        if (stdio_protocol_fd < 0) {
-            throw std::runtime_error(
-                "prepare_mfq_stdio_transport must be called before model loading");
-        }
-        if (!scheduler.supports_generation()) {
-            throw std::runtime_error(
-                "MFQ runtime transport requires a generation engine");
-        }
-        if (config_.tokenizer_gguf.empty() && config_.tokenizer_model.empty()) {
-            throw std::runtime_error("MFQ stdio transport requires a tokenizer GGUF");
-        }
-        if (!config_.tokenizer_gguf.empty() && !config_.tokenizer_model.empty()) {
-            throw std::runtime_error("MFQ stdio tokenizer source is ambiguous");
-        }
-
-        std::unique_ptr<MfqTokenizer> tokenizer = config_.tokenizer_gguf.empty()
-            ? std::make_unique<MfqTokenizer>(config_.tokenizer_model)
-            : std::make_unique<MfqTokenizer>(config_.tokenizer_gguf);
-        if (config_.vocab_size > 0 &&
-            tokenizer->vocab_size() != config_.vocab_size) {
-            throw std::runtime_error("tokenizer/model vocabulary mismatch");
-        }
-        common_chat_templates_ptr chat_templates = nullptr;
-        if (!tokenizer->chat_template().empty()) {
-            chat_templates = common_chat_templates_init(
-                tokenizer->context(), "");
-            if (!chat_templates) {
-                throw std::runtime_error("cannot initialize tokenizer.chat_template");
-            }
-        }
-
-        const MfqSamplingParams sampling_defaults =
-            default_sampling_params(config_);
-        const json duplex_sampling_defaults =
-            duplex_profile_json(config_.runtime_profile.duplex);
-        const json tts_sampling_defaults =
-            tts_profile_json(config_.runtime_profile.tts);
-        const json chat_template_capabilities =
-            chat_template_capabilities_json(tokenizer->chat_template());
-        const auto capability_profile = config_.model_capabilities
-            ? *config_.model_capabilities
-            : architecture_capability_profile(config_.model_type);
-        const json model_capabilities =
-            model_capability_profile_json(capability_profile);
-        const bool vision_supported = capability_profile.image_input ||
-            capability_profile.video_input;
-        const bool vision_available =
-            scheduler.supports_multimodal_generation() &&
-            capability_profile.image_input;
-        const bool video_available =
-            scheduler.supports_multimodal_generation() &&
-            capability_profile.video_input;
-
-        RuntimeRequestMetrics request_metrics_store;
-        std::atomic<int64_t> active_context{config_.max_context};
-        std::atomic<bool> reloading{false};
-        std::mutex reload_gate;
-        struct RealtimeState {
-            std::string channel_id;
-            std::string session_id;
-            std::unordered_set<int64_t> control_tokens;
-            bool backend_started = false;
-        };
-        std::mutex realtime_gate;
-        RealtimeState realtime;
-        const auto duplex_active = [&] {
-            std::lock_guard<std::mutex> lock(realtime_gate);
-            return !realtime.session_id.empty();
-        };
-        struct Task {
-            std::thread thread;
-            std::shared_ptr<std::atomic<bool>> done;
-        };
-        std::vector<Task> tasks;
-
-        const auto send = [](json frame) {
-            frame["v"] = 1;
-            return write_stdio_protocol(frame);
-        };
-        const auto send_result = [&](const std::string & id, json data) {
-            return send({
-                {"id", id},
-                {"type", "result"},
-                {"data", std::move(data)},
-            });
-        };
-        const auto send_event = [&](const std::string & id, json data) {
-            return send({
-                {"id", id},
-                {"type", "event"},
-                {"data", std::move(data)},
-            });
-        };
-        const auto send_done = [&](const std::string & id) {
-            return send({{"id", id}, {"type", "done"}});
-        };
-        const auto send_error = [&](
-                const std::string & id, int status,
-                const std::string & code, const std::string & message) {
-            return send({
-                {"id", id},
-                {"type", "error"},
-                {"error", {
-                    {"code", code},
-                    {"message", message},
-                    {"status_code", status},
-                    {"retryable", status == 429 || status == 502 ||
-                        status == 503 || status == 504},
-                }},
-            });
-        };
-        const auto add_runtime_metrics = [&](json & value) {
-            if (!runtime_metrics) return;
-            for (const auto & item : runtime_metrics()) {
-                value[item.first] = item.second;
-            }
-        };
-        const auto add_session_metrics = [&](json & value) {
-            if (!session_control.metrics) return;
-            for (const auto & item : session_control.metrics()) {
-                value[item.first] = item.second;
-            }
-        };
-        const auto add_request_runtime_metrics = [&](json & value) {
-            if (!runtime_metrics) return;
-            static const std::unordered_set<std::string> names{
-                "mtp_available", "mtp_used", "mtp_cycles",
-                "mtp_drafted_tokens", "mtp_accepted_tokens",
-                "mtp_acceptance_rate", "mtp_selected_depth",
-                "mtp_depth_0_cycles", "mtp_depth_1_cycles",
-                "mtp_depth_2_cycles", "mtp_depth_3_cycles",
-                "mtp_depth_4_cycles", "mtp_depth_5_cycles",
-                "mtp_position_1_acceptance_rate",
-                "mtp_position_2_acceptance_rate",
-                "mtp_position_3_acceptance_rate",
-                "mtp_position_4_acceptance_rate",
-                "mtp_position_5_acceptance_rate",
-                "mtp_depth_0_cycle_ms", "mtp_depth_1_cycle_ms",
-                "mtp_depth_2_cycle_ms", "mtp_depth_3_cycle_ms",
-                "mtp_depth_4_cycle_ms", "mtp_depth_5_cycle_ms",
-                "mtp_target_ms", "mtp_head_ms", "mtp_rollback_ms",
-            };
-            for (const auto & item : runtime_metrics()) {
-                if (names.count(item.first) != 0) {
-                    value[item.first] = item.second;
-                }
-            }
-        };
-        const auto health = [&] {
-            json value = {
-                {"status", reloading.load() ? "loading" : "ok"},
-                {"model", config_.model_name},
-                {"model_type", config_.model_type},
-                {"model_capabilities", model_capabilities},
-                {"vision_supported", vision_supported},
-                {"vision_available", vision_available},
-                {"video_available", video_available},
-                {"mtp_supported", capability_profile.mtp},
-                {"mtp_available", false},
-                {"vision_enabled_default", sampling_defaults.enable_vision},
-                {"mtp_enabled_default", sampling_defaults.enable_mtp},
-                {"max_context", active_context.load()},
-                {"duplex_available", static_cast<bool>(duplex)},
-                {"duplex_active", duplex_active()},
-                {"sampling_defaults", sampling_params_json(sampling_defaults)},
-                {"duplex_sampling_defaults", duplex_sampling_defaults},
-                {"tts_sampling_defaults", tts_sampling_defaults},
-                {"runtime_profile_source", config_.runtime_profile.source},
-                {"chat_template_capabilities", chat_template_capabilities},
-            };
-            add_runtime_metrics(value);
-            add_session_metrics(value);
-            return value;
-        };
-        const auto status = [&] {
-            json value = request_metrics_store.snapshot(
-                config_, active_context.load(), reloading.load());
-            value["sampling_defaults"] =
-                sampling_params_json(sampling_defaults);
-            value["duplex_sampling_defaults"] = duplex_sampling_defaults;
-            value["tts_sampling_defaults"] = tts_sampling_defaults;
-            value["runtime_profile_source"] = config_.runtime_profile.source;
-            value["chat_template_capabilities"] =
-                chat_template_capabilities;
-            value["model_capabilities"] = model_capabilities;
-            value["vision_supported"] = vision_supported;
-            value["vision_available"] = vision_available;
-            value["video_available"] = video_available;
-            value["mtp_supported"] = capability_profile.mtp;
-            value["mtp_available"] = false;
-            value["vision_enabled_default"] =
-                sampling_defaults.enable_vision;
-            value["mtp_enabled_default"] = sampling_defaults.enable_mtp;
-            value["duplex_available"] = static_cast<bool>(duplex);
-            value["duplex_active"] = duplex_active();
-            add_runtime_metrics(value);
-            add_session_metrics(value);
-            return value;
-        };
-        const auto reap_tasks = [&](bool all) {
-            for (auto item = tasks.begin(); item != tasks.end();) {
-                if (all || item->done->load(std::memory_order_acquire)) {
-                    if (item->thread.joinable()) item->thread.join();
-                    item = tasks.erase(item);
-                } else {
-                    ++item;
-                }
-            }
-        };
-        const auto close_realtime = [&](const std::string & channel_id) {
-            bool stop_backend = false;
-            {
-                std::lock_guard<std::mutex> lock(realtime_gate);
-                if (realtime.channel_id.empty() ||
-                    (!channel_id.empty() &&
-                     realtime.channel_id != channel_id)) {
-                    return false;
-                }
-                stop_backend = realtime.backend_started;
-                realtime = {};
-            }
-            if (stop_backend) duplex.stop();
-            return true;
-        };
-        const auto emit_realtime = [&](json event) {
-            std::string channel_id;
-            {
-                std::lock_guard<std::mutex> lock(realtime_gate);
-                channel_id = realtime.channel_id;
-            }
-            if (channel_id.empty()) return false;
-            event["server_send_ts"] =
-                std::chrono::duration<double>(
-                    std::chrono::system_clock::now()
-                        .time_since_epoch()).count();
-            return send_event(channel_id, event.dump());
-        };
-
-        send({{"type", "ready"}});
-        bool running = true;
-        std::string line;
-        while (running && std::getline(std::cin, line)) {
-            reap_tasks(false);
-            std::string id;
-            try {
-                if (line.size() > 64ULL * 1024ULL * 1024ULL) {
-                    throw ApiError(
-                        413, "request_too_large",
-                        "stdio frame exceeds 64 MiB");
-                }
-                const json request = json::parse(line);
-                if (!request.is_object() || request.value("v", 0) != 1) {
-                    throw ApiError(
-                        400, "backend_protocol_error",
-                        "stdio request requires protocol version 1");
-                }
-                if (request.contains("id")) {
-                    if (!request["id"].is_string()) {
-                        throw ApiError(
-                            400, "backend_protocol_error",
-                            "stdio request id must be a string");
-                    }
-                    id = request["id"].get<std::string>();
-                }
-                if (!request.contains("op") || !request["op"].is_string()) {
-                    throw ApiError(
-                        400, "backend_protocol_error",
-                        "stdio request requires a string op");
-                }
-                const std::string op = request["op"].get<std::string>();
-                const json params = request.value("params", json::object());
-                if (!params.is_object()) {
-                    throw ApiError(
-                        400, "backend_protocol_error",
-                        "stdio params must be an object");
-                }
-
-                if (op == "shutdown") {
-                    if (!id.empty()) send_result(id, {{"status", "ok"}});
-                    running = false;
-                    continue;
-                }
-                if (op == "request.cancel") {
-                    const std::string target = params.value(
-                        "target_id", std::string());
-                    const bool cancelled = scheduler.cancel_request(target);
-                    if (!id.empty()) {
-                        send_result(id, {
-                            {"status", "ok"},
-                            {"cancelled", cancelled},
-                        });
-                    }
-                    continue;
-                }
-                if (id.empty()) {
-                    throw ApiError(
-                        400, "backend_protocol_error",
-                        "stdio operation requires an id");
-                }
-                if (op == "health") {
-                    send_result(id, health());
-                    continue;
-                }
-                if (op == "status") {
-                    send_result(id, status());
-                    continue;
-                }
-                if (op == "models") {
-                    send_result(id, {
-                        {"models", json::array({{
-                            {"name", config_.model_name},
-                            {"type", config_.model_type},
-                            {"capabilities", model_capabilities},
-                        }})},
-                    });
-                    continue;
-                }
-                if (op == "realtime.capabilities") {
-                    send_result(id, {
-                        {"available", static_cast<bool>(duplex)},
-                        {"modes", duplex ? json::array({"audio"}) : json::array()},
-                    });
-                    continue;
-                }
-                if (op == "session.cancel") {
-                    const std::string session_id = params.value(
-                        "session_id", std::string());
-                    const bool cancelled =
-                        scheduler.cancel_session(session_id);
-                    send_result(id, {
-                        {"status", "ok"},
-                        {"cancelled", cancelled},
-                    });
-                    continue;
-                }
-                if (op == "session.fork") {
-                    if (!session_control.fork) {
-                        throw ApiError(
-                            501, "unsupported_operation",
-                            "this runtime does not support session forks");
-                    }
-                    const std::string source = params.value(
-                        "source_session_id", std::string());
-                    const std::string target = params.value(
-                        "target_session_id", std::string());
-                    if (!valid_mfq_session_id(source) ||
-                        !valid_mfq_session_id(target) || source == target) {
-                        throw ApiError(
-                            400, "invalid_request_error",
-                            "source and target session IDs must be distinct safe identifiers");
-                    }
-                    send_result(id, {
-                        {"status", "ok"},
-                        {"copied_snapshots", session_control.fork(source, target)},
-                    });
-                    continue;
-                }
-                if (op == "session.close") {
-                    if (!session_control.close) {
-                        throw ApiError(
-                            501, "unsupported_operation",
-                            "this runtime does not support session close");
-                    }
-                    const std::string session_id = params.value(
-                        "session_id", std::string());
-                    if (!valid_mfq_session_id(session_id)) {
-                        throw ApiError(
-                            400, "invalid_request_error",
-                            "session_id must be a safe identifier");
-                    }
-                    send_result(id, {
-                        {"status", "ok"},
-                        {"released_snapshots", session_control.close(session_id)},
-                    });
-                    continue;
-                }
-                if (op == "cache.clear") {
-                    if (!session_control.clear) {
-                        throw ApiError(
-                            501, "unsupported_operation",
-                            "this runtime does not expose a prefix cache");
-                    }
-                    {
-                        std::lock_guard<std::mutex> lock(reload_gate);
-                        if (reloading.exchange(true)) {
-                            throw ApiError(
-                                409, "conflict",
-                                "a runtime control operation is already in progress");
-                        }
-                        if (request_metrics_store.active_requests() != 0) {
-                            reloading.store(false);
-                            throw ApiError(
-                                409, "conflict",
-                                "cannot clear the prefix cache during generation");
-                        }
-                    }
-                    try {
-                        json result = {
-                            {"status", "ok"},
-                            {"released_snapshots", session_control.clear()},
-                        };
-                        add_session_metrics(result);
-                        reloading.store(false);
-                        send_result(id, std::move(result));
-                    } catch (...) {
-                        reloading.store(false);
-                        throw;
-                    }
-                    continue;
-                }
-                if (op == "cache.trim") {
-                    if (!session_control.trim_hot) {
-                        throw ApiError(
-                            501, "unsupported_operation",
-                            "this runtime does not expose a tiered prefix cache");
-                    }
-                    const int64_t target = integer_field(
-                        params, "target_bytes", 0);
-                    if (target < 0) {
-                        throw ApiError(
-                            400, "invalid_request_error",
-                            "target_bytes must be non-negative");
-                    }
-                    json result = {
-                        {"status", "ok"},
-                        {"released_bytes", session_control.trim_hot(
-                            static_cast<uint64_t>(target))},
-                        {"target_bytes", target},
-                    };
-                    add_session_metrics(result);
-                    send_result(id, std::move(result));
-                    continue;
-                }
-                if (op == "reload") {
-                    if (!scheduler.supports_reload()) {
-                        throw ApiError(
-                            501, "unsupported_operation",
-                            "this runtime does not support model reload");
-                    }
-                    {
-                        std::lock_guard<std::mutex> lock(reload_gate);
-                        if (reloading.exchange(true)) {
-                            throw ApiError(
-                                409, "conflict",
-                                "model reload is already in progress");
-                        }
-                        if (request_metrics_store.active_requests() != 0) {
-                            reloading.store(false);
-                            throw ApiError(
-                                409, "conflict",
-                                "cannot reload during generation");
-                        }
-                    }
-                    try {
-                        const int64_t requested = integer_field(
-                            params, "context_size", active_context.load());
-                        const int64_t capacity = config_.context_capacity > 0
-                            ? config_.context_capacity
-                            : config_.max_context;
-                        if (requested < 1 ||
-                            (capacity > 0 && requested > capacity)) {
-                            throw ApiError(
-                                400, "invalid_request_error",
-                                "context_size exceeds model capacity");
-                        }
-                        const int64_t loaded = scheduler.reload(requested);
-                        if (loaded < 1 ||
-                            (capacity > 0 && loaded > capacity)) {
-                            throw std::runtime_error(
-                                "runtime reload returned an invalid context size");
-                        }
-                        active_context.store(loaded);
-                        reloading.store(false);
-                        send_result(id, {
-                            {"status", "ok"},
-                            {"model", config_.model_name},
-                            {"max_context", loaded},
-                            {"context_capacity", capacity},
-                        });
-                    } catch (...) {
-                        reloading.store(false);
-                        throw;
-                    }
-                    continue;
-                }
-                if (op == "realtime.open") {
-                    if (!duplex) {
-                        throw ApiError(
-                            501, "unsupported_operation",
-                            "this runtime has no realtime backend");
-                    }
-                    if (params.value("mode", std::string("audio")) != "audio") {
-                        throw ApiError(
-                            400, "unsupported_operation",
-                            "stdio realtime supports audio mode only");
-                    }
-                    {
-                        std::lock_guard<std::mutex> lock(realtime_gate);
-                        if (!realtime.channel_id.empty()) {
-                            throw ApiError(
-                                409, "conflict",
-                                "a realtime channel is already open");
-                        }
-                        realtime.channel_id = id;
-                    }
-                    send_result(id, {{"status", "ok"}});
-                    continue;
-                }
-                if (op == "realtime.close") {
-                    const std::string target = params.value(
-                        "target_id", std::string());
-                    if (!close_realtime(target)) {
-                        throw ApiError(
-                            404, "not_found",
-                            "realtime channel was not found");
-                    }
-                    send_done(target);
-                    send_result(id, {{"status", "ok"}});
-                    continue;
-                }
-                if (op == "realtime.send") {
-                    const std::string target = params.value(
-                        "target_id", std::string());
-                    const std::string encoded = params.value(
-                        "data", std::string());
-                    {
-                        std::lock_guard<std::mutex> lock(realtime_gate);
-                        if (target.empty() || target != realtime.channel_id) {
-                            throw ApiError(
-                                404, "not_found",
-                                "realtime channel was not found");
-                        }
-                    }
-                    json body;
-                    try {
-                        body = json::parse(encoded);
-                    } catch (const json::parse_error & error) {
-                        throw ApiError(
-                            400, "invalid_request_error",
-                            std::string("invalid realtime JSON: ") +
-                                error.what());
-                    }
-                    if (!body.is_object() || !body.contains("type") ||
-                        !body["type"].is_string()) {
-                        throw ApiError(
-                            400, "invalid_request_error",
-                            "realtime message requires a string type");
-                    }
-                    const std::string type = body["type"].get<std::string>();
-                    if (type == "session.init") {
-                        {
-                            std::lock_guard<std::mutex> lock(realtime_gate);
-                            if (!realtime.session_id.empty()) {
-                                throw ApiError(
-                                    409, "conflict",
-                                    "realtime session is already initialized");
-                            }
-                        }
-                        const json payload = body.value(
-                            "payload", json::object());
-                        if (!payload.is_object()) {
-                            throw ApiError(
-                                400, "invalid_request_error",
-                                "session.init payload must be an object");
-                        }
-                        const std::string mode = payload.value(
-                            "mode", std::string("full_duplex"));
-                        if (mode != "full_duplex") {
-                            throw ApiError(
-                                400, "unsupported_operation",
-                                "realtime backend supports full_duplex only");
-                        }
-                        MfqDuplexSessionParams parameters;
-                        const std::string system_prompt = payload.value(
-                            "system_prompt",
-                            config_.runtime_profile.duplex.system_prompt.value_or(
-                                "Streaming Omni Conversation."));
-                        parameters.system_prefix = tokenizer->tokenize(
-                            "<|im_start|>system\n" + system_prompt +
-                                "\n<|audio_start|>",
-                            true, false);
-                        parameters.system_suffix = tokenizer->tokenize(
-                            "<|audio_end|><|im_end|>", true, false);
-                        if (payload.contains("reference_audio_features")) {
-                            if (!payload["reference_audio_features"].is_string()) {
-                                throw ApiError(
-                                    400, "invalid_request_error",
-                                    "reference_audio_features must be base64 float32 data");
-                            }
-                            parameters.reference_audio_frames =
-                                static_cast<int32_t>(integer_field(
-                                    payload, "reference_audio_frames", 0));
-                            parameters.reference_audio_features =
-                                decode_audio_features(
-                                    payload["reference_audio_features"]
-                                        .get<std::string>(),
-                                    parameters.reference_audio_frames);
-                        }
-                        parameters.special_ids = {
-                            tokenizer->special_token_id("<unit>"),
-                            tokenizer->special_token_id("</unit>"),
-                            tokenizer->special_token_id("<image>"),
-                            tokenizer->special_token_id("</image>"),
-                            tokenizer->special_token_id("<slice>"),
-                            tokenizer->special_token_id("</slice>"),
-                            tokenizer->special_token_id("<|listen|>"),
-                            tokenizer->special_token_id("<|speak|>"),
-                            tokenizer->special_token_id("<|tts_bos|>"),
-                            tokenizer->special_token_id("<|tts_eos|>"),
-                            tokenizer->special_token_id("<|chunk_eos|>"),
-                            tokenizer->special_token_id("<|chunk_tts_eos|>"),
-                            tokenizer->special_token_id("<|turn_eos|>"),
-                            tokenizer->special_token_id("<|tts_pad|>"),
-                            151687,
-                        };
-                        parameters.forbidden_ids = {
-                            tokenizer->special_token_id("<|tts_pad|>"),
-                        };
-                        const json generation_config = payload.value(
-                            "config", json::object());
-                        if (!generation_config.is_object()) {
-                            throw ApiError(
-                                400, "invalid_request_error",
-                                "session config must be an object");
-                        }
-                        const auto & defaults = config_.runtime_profile.duplex;
-                        parameters.greedy = generation_config.value(
-                            "decode_mode",
-                            defaults.decode_mode.value_or("sampling")) ==
-                            "greedy";
-                        parameters.temperature = number_field(
-                            generation_config, "temperature",
-                            defaults.temperature.value_or(0.7));
-                        parameters.top_k = static_cast<int32_t>(integer_field(
-                            generation_config, "top_k",
-                            defaults.top_k.value_or(100)));
-                        parameters.top_p = number_field(
-                            generation_config, "top_p",
-                            defaults.top_p.value_or(0.8));
-                        parameters.listen_probability_scale = number_field(
-                            generation_config, "listen_prob_scale",
-                            defaults.listen_prob_scale.value_or(1.0));
-                        parameters.repetition_penalty = number_field(
-                            generation_config, "text_repetition_penalty",
-                            defaults.text_repetition_penalty.value_or(1.05));
-                        parameters.repetition_window =
-                            static_cast<int32_t>(integer_field(
-                                generation_config,
-                                "text_repetition_window_size",
-                                defaults.text_repetition_window_size.value_or(512)));
-                        parameters.length_penalty = number_field(
-                            generation_config, "length_penalty",
-                            defaults.length_penalty.value_or(1.0));
-                        parameters.tts_temperature = number_field(
-                            generation_config, "tts_temperature",
-                            config_.runtime_profile.tts.temperature.value_or(0.8));
-                        parameters.tts_repetition_penalty = number_field(
-                            generation_config, "tts_repetition_penalty",
-                            config_.runtime_profile.tts.repetition_penalty.value_or(1.05));
-                        if (generation_config.contains("seed")) {
-                            parameters.seed = static_cast<uint64_t>(
-                                integer_field(generation_config, "seed", 0));
-                        } else {
-                            std::random_device random;
-                            parameters.seed =
-                                (static_cast<uint64_t>(random()) << 32) ^
-                                static_cast<uint64_t>(random());
-                        }
-                        const std::string session_id = request_id("sess-");
-                        {
-                            std::lock_guard<std::mutex> lock(realtime_gate);
-                            realtime.session_id = session_id;
-                            realtime.control_tokens =
-                                std::unordered_set<int64_t>(
-                                    parameters.special_ids.begin(),
-                                    parameters.special_ids.end());
-                        }
-                        try {
-                            duplex.start(parameters);
-                            std::lock_guard<std::mutex> lock(realtime_gate);
-                            realtime.backend_started = true;
-                        } catch (...) {
-                            std::lock_guard<std::mutex> lock(realtime_gate);
-                            realtime.session_id.clear();
-                            realtime.control_tokens.clear();
-                            throw;
-                        }
-                        emit_realtime({
-                            {"type", "session.created"},
-                            {"session_id", session_id},
-                            {"mode", "full_duplex"},
-                            {"metrics", {{
-                                "backend",
-                                duplex.name.empty() ? "native" : duplex.name
-                            }}},
-                        });
-                        send_result(id, {{"status", "ok"}});
-                        continue;
-                    }
-                    if (type != "input.append") {
-                        throw ApiError(
-                            400, "invalid_request_error",
-                            "unsupported realtime message type: " + type);
-                    }
-                    std::string session_id;
-                    std::unordered_set<int64_t> controls;
-                    {
-                        std::lock_guard<std::mutex> lock(realtime_gate);
-                        session_id = realtime.session_id;
-                        controls = realtime.control_tokens;
-                    }
-                    if (session_id.empty()) {
-                        throw ApiError(
-                            409, "conflict",
-                            "session.init must precede input.append");
-                    }
-                    const json input = body.value("input", json::object());
-                    if (!input.is_object()) {
-                        throw ApiError(
-                            400, "invalid_request_error",
-                            "input must be an object");
-                    }
-                    const bool has_audio = input.contains("audio_features");
-                    const bool has_text = input.contains("text");
-                    if (!has_audio && !has_text) {
-                        throw ApiError(
-                            400, "invalid_request_error",
-                            "input requires audio_features or text");
-                    }
-                    MfqDuplexStepInput step;
-                    if (has_audio) {
-                        if (!input["audio_features"].is_string()) {
-                            throw ApiError(
-                                400, "invalid_request_error",
-                                "input.audio_features must be base64 float32 data");
-                        }
-                        step.audio_frames = static_cast<int32_t>(integer_field(
-                            input, "audio_frames", 0));
-                        step.audio_features = decode_audio_features(
-                            input["audio_features"].get<std::string>(),
-                            step.audio_frames);
-                        step.audio_prefix_extra_frames = integer_field(
-                            input, "audio_prefix_extra_frames", 0);
-                        step.audio_suffix_extra_frames = integer_field(
-                            input, "audio_suffix_extra_frames", 0);
-                    }
-                    if (has_text) {
-                        if (!input["text"].is_string() ||
-                            input["text"].get_ref<const std::string&>().empty()) {
-                            throw ApiError(
-                                400, "invalid_request_error",
-                                "input.text must be a non-empty string");
-                        }
-                        step.text_tokens = tokenizer->tokenize(
-                            input["text"].get<std::string>(), false, false);
-                    }
-                    step.max_new_speak_tokens = static_cast<int32_t>(
-                        integer_field(
-                            input, "max_new_speak_tokens",
-                            config_.runtime_profile.duplex
-                                .max_new_speak_tokens_per_chunk.value_or(20)));
-                    step.force_listen = input.value("force_listen", false);
-                    step.force_speak = input.value("force_speak", false);
-                    if (step.force_listen && step.force_speak) {
-                        throw ApiError(
-                            400, "invalid_request_error",
-                            "force_listen and force_speak are mutually exclusive");
-                    }
-                    const auto result = duplex.step(step);
-                    const std::string response_id = request_id("resp-");
-                    json metrics = {
-                        {"backend", duplex.name.empty() ? "native" : duplex.name},
-                        {"wall_clock_ms", result.inference_ms},
-                        {"kv_cache_length", result.language_cache_position},
-                        {"audio_cache_length", result.audio_cache_position},
-                        {"tts_cache_length", result.tts_cache_position},
-                        {"audio_chunk_index", result.audio_chunk_index},
-                    };
-                    std::string text_delta;
-                    for (const int64_t token : result.generated_tokens) {
-                        if (controls.count(token) == 0) {
-                            text_delta += tokenizer->piece(token, false);
-                        }
-                    }
-                    if (!text_delta.empty()) {
-                        emit_realtime({
-                            {"type", "response.output.delta"},
-                            {"kind", "text"},
-                            {"text", text_delta},
-                            {"session_id", session_id},
-                            {"response_id", response_id},
-                            {"end_of_turn", result.end_of_turn},
-                            {"metrics", metrics},
-                        });
-                    }
-                    if (!result.audio_tokens.empty() ||
-                        (result.end_of_turn && !result.is_listen)) {
-                        emit_realtime({
-                            {"type", "response.output.delta"},
-                            {"kind", "audio_tokens"},
-                            {"audio_tokens", result.audio_tokens},
-                            {"session_id", session_id},
-                            {"response_id", response_id},
-                            {"end_of_turn", result.end_of_turn},
-                            {"force_flush", result.tts_force_flush},
-                            {"metrics", metrics},
-                        });
-                    }
-                    if (result.is_listen) {
-                        emit_realtime({
-                            {"type", "response.output.delta"},
-                            {"kind", "listen"},
-                            {"session_id", session_id},
-                            {"response_id", response_id},
-                            {"metrics", metrics},
-                        });
-                    }
-                    emit_realtime({
-                        {"type", "response.step.done"},
-                        {"session_id", session_id},
-                        {"response_id", response_id},
-                        {"end_of_turn", result.end_of_turn},
-                        {"metrics", metrics},
-                    });
-                    send_result(id, {{"status", "ok"}});
-                    continue;
-                }
-                if (op != "generate") {
-                    throw ApiError(
-                        404, "unsupported_operation",
-                        "unsupported stdio operation: " + op);
-                }
-                if (duplex_active()) {
-                    throw ApiError(
-                        409, "conflict",
-                        "the model is reserved by an active realtime session");
-                }
-                if (reloading.load()) {
-                    throw ApiError(
-                        503, "service_unavailable",
-                        "model reload is in progress");
-                }
-                auto cancellation = scheduler.activate_request(id);
-                if (!cancellation) {
-                    throw ApiError(
-                        409, "conflict",
-                        "stdio request id is already active");
-                }
-                auto done = std::make_shared<std::atomic<bool>>(false);
-                tasks.push_back({
-                    std::thread([
-                        &, id, params, cancellation, done
-                    ]() mutable {
-                        try {
-                            const json body = runtime_generate_body(params);
-                            RequestWork work = parse_work(
-                                body, true, *tokenizer,
-                                chat_templates.get(), active_context.load(),
-                                config_.model_type, sampling_defaults);
-                            cancellation->set_session_id(
-                                work.cache_plan.session_id);
-                            if (body.contains("mfq_multimodal")) {
-                                if (!work.sampling.enable_vision) {
-                                    throw ApiError(
-                                        400, "invalid_request_error",
-                                        "vision is disabled for this request");
-                                }
-                                if (!scheduler.supports_multimodal_generation()) {
-                                    throw ApiError(
-                                        501, "unsupported_parameter",
-                                        "the loaded model has no native vision runtime");
-                                }
-                                work.vision = parse_mfq_vision(
-                                    body["mfq_multimodal"], work.prompt,
-                                    *tokenizer, config_.vocab_size);
-                                if (active_context.load() > 0 &&
-                                    static_cast<int64_t>(work.prompt.size()) +
-                                        work.sampling.max_tokens >
-                                        active_context.load()) {
-                                    throw ApiError(
-                                        400, "context_length_exceeded",
-                                        "expanded multimodal prompt exceeds context");
-                                }
-                                work.cache_plan.stable_prefix_tokens = 0;
-                            }
-                            const std::string response_id =
-                                request_id("run-");
-                            const int64_t created = unix_time_seconds();
-                            ActiveRequest active_request(request_metrics_store);
-                            RequestMetrics metrics;
-                            CompletionResult result = generate_text(
-                                work, *tokenizer, scheduler,
-                                cancellation->cancel_flag(),
-                                [&](const common_chat_msg_diff & diff) {
-                                    if (!work.stream) return true;
-                                    json delta = chat_diff_json(diff);
-                                    if (delta.empty()) return true;
-                                    auto event = runtime_generation_event(
-                                        "delta", response_id, created,
-                                        config_.model_name);
-                                    event["delta"] = std::move(delta);
-                                    return send_event(id, std::move(event));
-                                },
-                                &metrics,
-                                !work.stream);
-                            const RequestMetricValues metric_values =
-                                request_metric_values(result, metrics);
-                            log_request_metrics(
-                                response_id, true, work.stream,
-                                work.prompt.size(), work.sampling,
-                                result, metric_values);
-                            active_request.complete(
-                                response_id, true, work.stream,
-                                work.prompt.size(), result, metric_values);
-                            auto performance = request_metric_values_json(
-                                metric_values, work.sampling);
-                            add_request_runtime_metrics(performance);
-                            if (work.stream) {
-                                auto complete = runtime_generation_event(
-                                    "complete", response_id, created,
-                                    config_.model_name);
-                                complete["finish_reason"] = result.finish_reason;
-                                complete["metrics"] = std::move(performance);
-                                send_event(id, std::move(complete));
-                                if (work.include_usage) {
-                                    auto usage = runtime_generation_event(
-                                        "usage", response_id, created,
-                                        config_.model_name);
-                                    usage["usage"] = usage_json(
-                                        work.prompt.size(),
-                                        result.completion_tokens);
-                                    send_event(id, std::move(usage));
-                                }
-                            } else {
-                                send_event(id, runtime_generation_result(
-                                    response_id, created, config_.model_name,
-                                    result,
-                                    usage_json(
-                                        work.prompt.size(),
-                                        result.completion_tokens),
-                                    std::move(performance)));
-                            }
-                            send_done(id);
-                        } catch (const ApiError & error) {
-                            send_error(
-                                id, error.status, error.type, error.what());
-                        } catch (const std::exception & error) {
-                            send_error(
-                                id, 500, "server_error", error.what());
-                        }
-                        cancellation->finish();
-                        done->store(true, std::memory_order_release);
-                    }),
-                    done,
-                });
-            } catch (const ApiError & error) {
-                send_error(id, error.status, error.type, error.what());
-            } catch (const json::exception & error) {
-                send_error(id, 400, "backend_protocol_error", error.what());
-            } catch (const std::exception & error) {
-                send_error(id, 500, "server_error", error.what());
-            }
-        }
-
-        scheduler.cancel_all();
-        close_realtime("");
-        reap_tasks(true);
-        return 0;
-    }
-
-private:
-    MfqRuntimeTransportConfig config_;
-};
-
-class MfqHttpTransport final : public MfqTransport {
-public:
-    explicit MfqHttpTransport(MfqHttpRuntimeTransportConfig config)
-        : config_(std::move(config)) {}
-
-    int run(const MfqScheduler & scheduler) override {
-        return run_mfq_http_transport(config_, scheduler);
-    }
-
-private:
-    MfqHttpRuntimeTransportConfig config_;
-};
-
-} // namespace
-
-std::unique_ptr<MfqTransport> make_mfq_http_transport(
-        MfqHttpRuntimeTransportConfig config) {
-    return std::make_unique<MfqHttpTransport>(std::move(config));
-}
-
-void prepare_mfq_stdio_transport() {
-    std::lock_guard<std::mutex> lock(stdio_protocol_mutex);
-    if (stdio_protocol_fd >= 0) return;
-    std::cout.flush();
-    std::fflush(stdout);
-#ifdef _WIN32
-    const HANDLE stdout_handle = reinterpret_cast<HANDLE>(
-        _get_osfhandle(_fileno(stdout)));
-    HANDLE protocol_handle = nullptr;
-    if (stdout_handle == INVALID_HANDLE_VALUE ||
-        !DuplicateHandle(
-            GetCurrentProcess(), stdout_handle,
-            GetCurrentProcess(), &protocol_handle,
-            0, FALSE, DUPLICATE_SAME_ACCESS)) {
-        throw std::runtime_error("cannot reserve stdout for MFQ stdio protocol");
-    }
-    stdio_protocol_fd = _open_osfhandle(
-        reinterpret_cast<intptr_t>(protocol_handle), _O_WRONLY | _O_BINARY);
-    if (stdio_protocol_fd < 0) {
-        CloseHandle(protocol_handle);
-        throw std::runtime_error("cannot reserve stdout for MFQ stdio protocol");
-    }
-    if (_dup2(_fileno(stderr), _fileno(stdout)) != 0) {
-        _close(stdio_protocol_fd);
-        stdio_protocol_fd = -1;
-        throw std::runtime_error("cannot redirect runtime stdout to stderr");
-    }
-#else
-    stdio_protocol_fd = ::dup(STDOUT_FILENO);
-    if (stdio_protocol_fd < 0 ||
-        ::fcntl(stdio_protocol_fd, F_SETFD, FD_CLOEXEC) < 0 ||
-        ::dup2(STDERR_FILENO, STDOUT_FILENO) < 0) {
-        if (stdio_protocol_fd >= 0) ::close(stdio_protocol_fd);
-        stdio_protocol_fd = -1;
-        throw std::runtime_error("cannot reserve stdout for MFQ stdio protocol");
-    }
-    std::signal(SIGPIPE, SIG_IGN);
-#endif
-    std::cout.clear();
-}
-
-std::unique_ptr<MfqTransport> make_mfq_stdio_transport(
-        MfqRuntimeTransportConfig config) {
-    return std::make_unique<MfqStdioTransport>(std::move(config));
 }

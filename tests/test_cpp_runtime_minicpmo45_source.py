@@ -42,8 +42,11 @@ METAL_PLATFORM = (
 SERVER_HEADER = (ROOT / "cpp_runtime" / "core" / "include" / "mfq" / "runtime.h").read_text(
     encoding="utf-8"
 )
-SERVER_SOURCE = (ROOT / "cpp_runtime" / "transport" / "src" / "transport.cpp").read_text(
-    encoding="utf-8"
+TRANSPORT_SRC = ROOT / "cpp_runtime" / "transport"
+SERVER_SOURCE = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted(TRANSPORT_SRC.rglob("*"))
+    if path.suffix in {".cpp", ".h"}
 )
 REALTIME_GATEWAY = (
     ROOT / "mfq" / "runtime" / "minicpmo45_realtime.py"

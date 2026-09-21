@@ -16,10 +16,19 @@ MODEL_LOADER = (CUDA_ROOT / "runtime" / "causal_lm_loader.cpp").read_text(
 CUDA_RUNTIME = (CUDA_ROOT / "runtime" / "cuda_runtime.cpp").read_text(
     encoding="utf-8"
 )
-TRANSPORT = (ROOT / "cpp_runtime" / "transport" / "src" / "transport.cpp").read_text(
-    encoding="utf-8"
+CUDA_NINT = (CUDA_ROOT / "ops" / "nint.cpp").read_text(encoding="utf-8")
+TRANSPORT_SRC = ROOT / "cpp_runtime" / "transport"
+TRANSPORT = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted(TRANSPORT_SRC.rglob("*"))
+    if path.suffix in {".cpp", ".h"}
 )
 SERVER = TRANSPORT
+TRANSPORT_BASE = (
+    TRANSPORT_SRC / "include" / "transport.h"
+).read_text(encoding="utf-8")
+HTTP_TRANSPORT = (TRANSPORT_SRC / "src" / "http.cpp").read_text(encoding="utf-8")
+STDIO_TRANSPORT = (TRANSPORT_SRC / "src" / "stdio.cpp").read_text(encoding="utf-8")
 METAL_RUNTIME = (
     ROOT / "cpp_runtime" / "backends" / "metal" / "apps" / "mfq_decode_mlx.cpp"
 ).read_text(encoding="utf-8")
@@ -90,6 +99,14 @@ def test_reload_and_request_registration_share_one_gate() -> None:
     assert "active_request->complete(" in SERVER
 
 
+def test_http_and_stdio_are_separate_transport_implementations() -> None:
+    assert "class MfqTransport" in TRANSPORT_BASE
+    assert "class MfqHttpTransport final : public MfqTransport" in HTTP_TRANSPORT
+    assert "class MfqStdioTransport final : public MfqTransport" in STDIO_TRANSPORT
+    assert "std::cin" not in HTTP_TRANSPORT
+    assert "httplib::" not in STDIO_TRANSPORT
+
+
 def test_stdio_transport_owns_stdin_and_isolates_stdout() -> None:
     assert "::dup2(STDERR_FILENO, STDOUT_FILENO)" in TRANSPORT
     assert "FD_CLOEXEC" in TRANSPORT
@@ -116,7 +133,7 @@ def test_stdio_transport_owns_stdin_and_isolates_stdout() -> None:
             stdin_users.add(path.relative_to(ROOT / "cpp_runtime").as_posix())
     assert stdin_users == {
         "backends/cuda/models/minicpmo45/minicpmo45_runtime.cpp",
-        "transport/src/transport.cpp",
+        "transport/src/stdio.cpp",
     }
     assert "if (!minicpmo_input_prefix.empty() || transport_mode ||" in CUDA_RUNTIME
     assert "MiniCPM-o eval mode cannot be combined with" in CUDA_RUNTIME
@@ -136,9 +153,9 @@ def test_cuda_kl_rejects_context_larger_than_model_capacity() -> None:
 
 
 def test_cuda_nint_loader_expands_v2_metadata_before_kernel_dispatch() -> None:
-    start = DECODE.index("static NintCpu unpack_nint(")
-    stop = DECODE.index("struct Nint8ZeroCpu", start)
-    loader = DECODE[start:stop]
+    start = CUDA_NINT.index("NintCpu unpack_nint(")
+    stop = CUDA_NINT.index("Nint8ZeroCpu unpack_nint8_zero(", start)
+    loader = CUDA_NINT[start:stop]
     assert "const bool is_nint_v2 = (raw_bits & 0x80) != 0;" in loader
     assert "t.sub_bits = blob[off++];" in loader
     assert "if (is_nint_v2)" in loader

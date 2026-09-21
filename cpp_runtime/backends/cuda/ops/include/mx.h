@@ -1,0 +1,92 @@
+#pragma once
+
+#include "cuda_execution.h"
+#include "mfq_cuda_ops.h"
+
+#include <cstdint>
+#include <vector>
+
+struct Mxfp8Weight {
+    mfq_tensor_backend::Tensor values;
+    mfq_tensor_backend::Tensor scales;
+    int64_t out = 0;
+    int64_t neuron_len = 0;
+};
+
+struct Mxfp4Weight {
+    mfq_tensor_backend::Tensor values;
+    mfq_tensor_backend::Tensor scales;
+    int64_t out = 0;
+    int64_t neuron_len = 0;
+};
+
+mfq_tensor_backend::Tensor mxfp8_groupwise_matmul(
+    const Mxfp8Weight& weight,
+    mfq_tensor_backend::Tensor input,
+    std::int64_t groups);
+mfq_tensor_backend::Tensor mxfp8_groupwise_matmul_f32(
+    const Mxfp8Weight& weight,
+    mfq_tensor_backend::Tensor input,
+    std::int64_t groups);
+mfq_tensor_backend::Tensor mxfp8_matmul(
+    const Mxfp8Weight& weight, mfq_tensor_backend::Tensor input);
+mfq_tensor_backend::Tensor mxfp8_matmul_f32(
+    const Mxfp8Weight& weight, mfq_tensor_backend::Tensor input);
+mfq_tensor_backend::Tensor mxfp4_matmul(
+    const Mxfp4Weight& weight, mfq_tensor_backend::Tensor input);
+
+struct Mxfp4Linear {
+    Mxfp4Weight weight;
+
+    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x) const {
+        auto shape = x.sizes().vec();
+        auto y = mxfp4_matmul(
+            weight, x.reshape({-1, x.size(-1)}));
+        shape.back() = y.size(-1);
+        return y.reshape(shape);
+    }
+};
+
+struct Mxfp8Linear {
+    Mxfp8Weight weight;
+
+    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x) const {
+        auto shape = x.sizes().vec();
+        auto y = mxfp8_matmul(
+            weight, x.reshape({-1, x.size(-1)}));
+        shape.back() = y.size(-1);
+        return y.reshape(shape);
+    }
+};
+
+struct Mxfp8Cpu {
+    int64_t out = 0;
+    int64_t neuron_len = 0;
+    std::vector<uint8_t> values;
+    std::vector<uint8_t> scales;
+};
+
+struct Mxfp4Cpu {
+    int64_t out = 0;
+    int64_t neuron_len = 0;
+    std::vector<uint8_t> values;
+    std::vector<uint8_t> scales;
+};
+
+size_t checked_mxfp8_size(
+    uint64_t left, uint64_t right, const char* label);
+Mxfp8Cpu unpack_mxfp8(const std::vector<uint8_t>& blob);
+Mxfp4Cpu unpack_mxfp4(const std::vector<uint8_t>& blob);
+mfq_tensor_backend::Tensor dequant_mxfp4_cpu(const Mxfp4Cpu& source);
+Mxfp4Cpu select_mxfp4_cpu_rows(
+    const Mxfp4Cpu& source, const std::vector<int64_t>& rows);
+Mxfp4Cpu slice_mxfp4_cpu(
+    const Mxfp4Cpu& source, TensorParallelAxis axis, int64_t begin, int64_t end);
+Mxfp8Cpu slice_mxfp8_cpu(
+    const Mxfp8Cpu& source, TensorParallelAxis axis, int64_t begin, int64_t end);
+Mxfp8Weight to_device_mxfp8(
+    const Mxfp8Cpu& source, bool cuda, int device = -1);
+Mxfp8Weight to_cuda_device_mxfp8(const Mxfp8Cpu& source, int device);
+Mxfp4Weight to_device_mxfp4(
+    const Mxfp4Cpu& source, bool cuda, int device = -1);
+mfq_tensor_backend::Tensor mxfp8_cpu_reference(const Mxfp8Weight& weight);

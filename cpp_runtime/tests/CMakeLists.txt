@@ -36,8 +36,6 @@ mfq_add_core_test(mfq-grid-vision-test grid_vision_test.cpp)
 mfq_add_core_test(mfq-deepseek-v41-config-test deepseek_v41_config_test.cpp)
 mfq_add_core_test(mfq-model-config-test model_config_test.cpp)
 mfq_add_core_test(mfq-sampling-test mfq_sampling_test.cpp)
-mfq_add_core_test(mfq-runtime-transport-test mfq_runtime_transport_test.cpp)
-target_link_libraries(mfq-runtime-transport-test PRIVATE mfq-runtime-scheduler)
 mfq_add_core_test(mfq-moe-cache-policy-test moe_cache_policy_test.cpp)
 mfq_add_core_test(mfq-tensor-parallel-test tensor_parallel_test.cpp)
 
@@ -78,6 +76,9 @@ if(TARGET mfq-paged-prefix-cache)
 endif()
 
 if(TARGET mfq-runtime-communication)
+    mfq_add_core_test(mfq-runtime-transport-test mfq_runtime_transport_test.cpp)
+    target_link_libraries(mfq-runtime-transport-test PRIVATE mfq-runtime-communication)
+
     add_executable(mfq-runtime-profile-test mfq_runtime_profile_test.cpp)
     target_link_libraries(mfq-runtime-profile-test PRIVATE mfq-runtime-communication)
     target_compile_features(mfq-runtime-profile-test PRIVATE cxx_std_17)

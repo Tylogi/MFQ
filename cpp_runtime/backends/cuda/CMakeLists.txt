@@ -215,7 +215,7 @@ function(mfq_configure_cuda_runtime_target target)
         ${MFQ_REPOSITORY_ROOT}
         ${MFQ_CUDA_ROOT}/include
         ${MFQ_CUDA_ROOT}/models
-        ${MFQ_CUDA_ROOT}/ops
+        ${MFQ_CUDA_ROOT}/ops/include
         ${MFQ_CUDA_ROOT}/runtime
         ${MFQ_CUDA_KERNEL_ROOT}
         ${CUDAToolkit_INCLUDE_DIRS}
@@ -250,8 +250,20 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/registry.cpp
 )
 
+set(MFQ_CUDA_RUNTIME_OP_SOURCES
+    ${MFQ_CUDA_ROOT}/ops/format.cpp
+    ${MFQ_CUDA_ROOT}/ops/fp8_sq.cpp
+    ${MFQ_CUDA_ROOT}/ops/mx.cpp
+    ${MFQ_CUDA_ROOT}/ops/mxfp4_sq.cpp
+    ${MFQ_CUDA_ROOT}/ops/moe.cpp
+    ${MFQ_CUDA_ROOT}/ops/nint.cpp
+    ${MFQ_CUDA_ROOT}/ops/quant_linear.cpp
+    ${MFQ_CUDA_ROOT}/ops/vq.cpp
+    ${MFQ_CUDA_ROOT}/legacy/tpq/tpq.cpp
+)
+
 add_library(mfq-cuda-runtime STATIC
-    ${MFQ_CUDA_ROOT}/ops/cuda_quantized_ops.cpp
+    ${MFQ_CUDA_RUNTIME_OP_SOURCES}
     ${MFQ_CUDA_ROOT}/runtime/cuda_runtime.cpp
     ${MFQ_CUDA_ROOT}/runtime/cuda_execution.cpp
     ${MFQ_CUDA_ROOT}/runtime/causal_lm.cpp
@@ -259,6 +271,7 @@ add_library(mfq-cuda-runtime STATIC
     ${MFQ_CUDA_ROOT}/runtime/cuda_transformer.cpp
     ${MFQ_CUDA_ROOT}/runtime/cuda_transformer_loader.cpp
     ${MFQ_CUDA_ROOT}/runtime/mtp.cpp
+    ${MFQ_CUDA_ROOT}/runtime/moe_expert_cache.cpp
     ${MFQ_CUDA_ROOT}/runtime/runtime_components.cpp
     ${MFQ_CUDA_ROOT}/runtime/diagnostics/backend_checks.cpp
     ${MFQ_CUDA_ROOT}/runtime/diagnostics/model_checks.cpp
@@ -332,7 +345,7 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
     find_package(Torch REQUIRED)
     add_executable(mfq-runtime-torch
         ${MFQ_CUDA_ROOT}/apps/runtime_main.cpp
-        ${MFQ_CUDA_ROOT}/ops/cuda_quantized_ops.cpp
+        ${MFQ_CUDA_RUNTIME_OP_SOURCES}
         ${MFQ_CUDA_ROOT}/runtime/cuda_runtime.cpp
         ${MFQ_CUDA_ROOT}/runtime/cuda_execution.cpp
         ${MFQ_CUDA_ROOT}/runtime/causal_lm.cpp
@@ -340,6 +353,7 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         ${MFQ_CUDA_ROOT}/runtime/cuda_transformer.cpp
         ${MFQ_CUDA_ROOT}/runtime/cuda_transformer_loader.cpp
         ${MFQ_CUDA_ROOT}/runtime/mtp.cpp
+        ${MFQ_CUDA_ROOT}/runtime/moe_expert_cache.cpp
         ${MFQ_CUDA_ROOT}/runtime/runtime_components.cpp
         ${MFQ_CUDA_ROOT}/runtime/diagnostics/backend_checks.cpp
         ${MFQ_CUDA_ROOT}/runtime/diagnostics/model_checks.cpp

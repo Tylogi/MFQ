@@ -1,4 +1,4 @@
-#include "mfq/communication.h"
+#include "transport.h"
 
 #include <cmath>
 #include <filesystem>
@@ -21,6 +21,13 @@ void write_text(const std::filesystem::path & path, const std::string & value) {
 } // namespace
 
 int main() {
+    require(
+        static_cast<bool>(make_mfq_http_transport({})),
+        "HTTP transport factory failed");
+    require(
+        static_cast<bool>(make_mfq_stdio_transport({})),
+        "stdio transport factory failed");
+
     const auto registry = resolve_mfq_runtime_profile(
         "", "minicpmo-hf-mfq", "minicpmo", "test");
     require(registry.chat.temperature.has_value(), "registry temperature missing");

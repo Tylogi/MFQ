@@ -4,7 +4,12 @@ from mfq.server.capabilities import capabilities_for_architecture
 from mfq.server.output_protocols import output_protocol_for_architecture
 
 ROOT = Path(__file__).resolve().parents[1]
-SERVER = (ROOT / "cpp_runtime" / "transport" / "src" / "transport.cpp").read_text(encoding="utf-8")
+TRANSPORT_SRC = ROOT / "cpp_runtime" / "transport"
+SERVER = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted(TRANSPORT_SRC.rglob("*"))
+    if path.suffix in {".cpp", ".h"}
+)
 CUDA_PLAN = (
     ROOT / "cpp_runtime" / "backends" / "cuda" / "include" / "cuda_model_plan.h"
 ).read_text(encoding="utf-8")

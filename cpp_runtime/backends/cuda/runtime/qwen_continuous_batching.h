@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cuda_sampling.h"
+#include "moe_expert_cache.h"
 #include "qwen_paged_kv.h"
 #include "../models/qwen35/qwen35_linear_attention.h"
 

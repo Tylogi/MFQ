@@ -744,13 +744,22 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         encoding="utf-8"
     )
     required = (
-        "ops/cuda_quantized_ops.cpp",
+        "legacy/tpq/tpq.cpp",
+        "ops/format.cpp",
+        "ops/fp8_sq.cpp",
+        "ops/moe.cpp",
+        "ops/mx.cpp",
+        "ops/mxfp4_sq.cpp",
+        "ops/nint.cpp",
+        "ops/quant_linear.cpp",
+        "ops/vq.cpp",
         "runtime/cuda_execution.cpp",
         "runtime/causal_lm.cpp",
         "runtime/causal_lm_loader.cpp",
         "runtime/cuda_transformer.cpp",
         "runtime/cuda_transformer_loader.cpp",
         "runtime/mtp.cpp",
+        "runtime/moe_expert_cache.cpp",
         "runtime/runtime_components.cpp",
         "runtime/diagnostics/backend_checks.cpp",
         "runtime/diagnostics/model_checks.cpp",
@@ -758,11 +767,29 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
     for relative in required:
         assert (cuda / relative).is_file()
         assert relative in cmake
-    assert "struct QuantLinear" in (
-        cuda / "ops" / "cuda_quantized_ops.h"
-    ).read_text(encoding="utf-8")
+    ops = cuda / "ops"
+    assert "${MFQ_CUDA_ROOT}/ops/include" in cmake
+    assert not any(path.suffix == ".h" for path in ops.iterdir())
+    quant_header = (ops / "include" / "quant_linear.h").read_text(
+        encoding="utf-8"
+    )
+    assert "struct QuantLinear" in quant_header
+    owned_types = {
+        "ops/include/nint.h": ("NintWeight",),
+        "ops/include/vq.h": ("NvqWeight",),
+        "ops/include/mx.h": ("Mxfp4Weight", "Mxfp8Weight"),
+        "ops/include/fp8_sq.h": ("Fp8SqWeight",),
+        "ops/include/mxfp4_sq.h": ("Mxfp4SqWeight",),
+        "ops/include/moe.h": ("MfeWeight", "MoeRoutePlan"),
+        "legacy/tpq/tpq.h": ("TpqWeight",),
+    }
+    for relative, names in owned_types.items():
+        source = (cuda / relative).read_text(encoding="utf-8")
+        for name in names:
+            assert f"struct {name}" in source
+            assert f"struct {name} {{" not in quant_header
     assert "struct QuantLinear" not in CUDA_RUNTIME_SOURCE
-    assert '#include "cuda_quantized_ops.cpp"' not in CUDA_BACKEND_SOURCE
+    assert "cuda_quantized_ops" not in CUDA_BACKEND_SOURCE
     assert not re.search(r'#include\s+["<][^">]+\.inc[">]', CUDA_BACKEND_SOURCE)
 
 

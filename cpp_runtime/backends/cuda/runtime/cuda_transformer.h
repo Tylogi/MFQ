@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../ops/cuda_quantized_ops.h"
+#include "quant_linear.h"
 #include "models/model_config.h"
 #include "cuda_execution.h"
 #include "mfq_cuda_ops.h"

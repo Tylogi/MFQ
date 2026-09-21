@@ -14,7 +14,7 @@
 
 #ifdef MFQ_METAL_RUNTIME_COMMUNICATION
 #include "mfq_paged_prefix_cache.h"
-#include "mfq/communication.h"
+#include "transport.h"
 #include "mlx_paged_session_codec.h"
 #include "mlx_server_components.h"
 #endif

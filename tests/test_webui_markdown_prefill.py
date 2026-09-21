@@ -10,7 +10,12 @@ PACKAGE = (WEB / "package.json").read_text(encoding="utf-8")
 SERVER_HEADER = (ROOT / "cpp_runtime" / "core" / "include" / "mfq" / "runtime.h").read_text(
     encoding="utf-8"
 )
-SERVER = (ROOT / "cpp_runtime" / "transport" / "src" / "transport.cpp").read_text(encoding="utf-8")
+TRANSPORT_SRC = ROOT / "cpp_runtime" / "transport"
+SERVER = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted(TRANSPORT_SRC.rglob("*"))
+    if path.suffix in {".cpp", ".h"}
+)
 RUNTIME = (
     ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime" / "cuda_runtime.cpp"
 ).read_text(encoding="utf-8")

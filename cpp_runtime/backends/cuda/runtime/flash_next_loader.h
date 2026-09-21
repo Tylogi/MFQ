@@ -2,6 +2,7 @@
 
 #include "cuda_transformer.h"
 #include "flash_next_common.h"
+#include "moe_expert_cache.h"
 #include "models/flash_next.h"
 
 #include <functional>
