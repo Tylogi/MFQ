@@ -95,11 +95,11 @@ git clone https://github.com/Tylogi/TyloQuant.git MFQ
 cd MFQ
 
 # NVIDIA / CUDA
-uv sync --extra daemon
+uv sync
 uv run mfq build --backend cuda
 
 # Apple 芯片 / Metal
-uv sync --extra daemon --extra metal
+uv sync --extra metal
 uv run mfq build --backend metal
 ```
 
@@ -132,7 +132,7 @@ uv run mfq quantize \
 加载并启动量化后的模型：
 
 ```bash
-uv sync --extra daemon                 # Apple 芯片还需添加 --extra metal
+uv sync                                # Apple 芯片还需添加 --extra metal
 uv run mfq build --backend auto
 uv run mfq serve \
   --model /models/Qwen3.8-27B-MFQ-S4-M.mfq \

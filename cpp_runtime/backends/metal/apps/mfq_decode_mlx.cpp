@@ -42,6 +42,7 @@
 
 #include <mlx/mlx.h>
 
+#include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <malloc/malloc.h>
 #include <sys/sysctl.h>
@@ -54,6 +55,7 @@ constexpr std::size_t kMinimumServerCacheLimitBytes =
     std::size_t{1} << 30;
 constexpr std::size_t kMaximumServerCacheLimitBytes =
     std::size_t{8} << 30;
+constexpr std::size_t kGiB = std::size_t{1} << 30;
 
 void release_host_allocator_cache() {
     malloc_zone_pressure_relief(nullptr, 0);
@@ -333,6 +335,63 @@ std::size_t server_cache_limit_bytes() {
         kMaximumServerCacheLimitBytes);
 }
 
+std::size_t automatic_runtime_memory_budget_bytes() {
+    const auto total = physical_memory_bytes();
+    const auto reserve = total < 24 * kGiB ? 4 * kGiB : 6 * kGiB;
+    const auto physical_ceiling = total <= reserve
+        ? std::max<std::size_t>(1, total * 3 / 4)
+        : total - reserve;
+
+    std::size_t gpu_ceiling = physical_ceiling;
+    try {
+        const auto& info = mlx::core::device_info(
+            mlx::core::Device(mlx::core::Device::gpu, 0));
+        const auto found = info.find("max_recommended_working_set_size");
+        if (found != info.end()) {
+            if (const auto* value = std::get_if<std::size_t>(&found->second);
+                value != nullptr && *value > 0) {
+                gpu_ceiling = std::min(gpu_ceiling, *value);
+            }
+        }
+    } catch (...) {
+        // Older MLX builds may not expose this property. The physical-memory
+        // ceiling remains a safe portable fallback.
+    }
+
+    std::size_t available_ceiling = physical_ceiling;
+    vm_size_t page_size = 0;
+    vm_statistics64_data_t statistics{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    const auto host = mach_host_self();
+    const bool have_snapshot =
+        host_page_size(host, &page_size) == KERN_SUCCESS &&
+        host_statistics64(
+            host,
+            HOST_VM_INFO64,
+            reinterpret_cast<host_info64_t>(&statistics),
+            &count) == KERN_SUCCESS;
+    mach_port_deallocate(mach_task_self(), host);
+    if (have_snapshot && page_size > 0) {
+        const auto pages =
+            static_cast<std::uint64_t>(statistics.free_count) +
+            static_cast<std::uint64_t>(statistics.inactive_count);
+        const auto available = pages >
+                std::numeric_limits<std::size_t>::max() / page_size
+            ? std::numeric_limits<std::size_t>::max()
+            : static_cast<std::size_t>(pages) * page_size;
+        available_ceiling = available <= reserve
+            ? std::max<std::size_t>(1, available * 3 / 4)
+            : available - reserve;
+    }
+
+    // This is deliberately a live incremental budget. It excludes active
+    // memory owned by other services and leaves OS headroom, while also
+    // respecting Metal's per-process recommended working set.
+    return std::max<std::size_t>(
+        1,
+        std::min({physical_ceiling, gpu_ceiling, available_ceiling}));
+}
+
 bool prefill_autotune_enabled() noexcept {
     const char* value = std::getenv("MFQ_METAL_PREFILL_AUTOTUNE");
     if (value == nullptr) return true;
@@ -357,6 +416,34 @@ std::optional<std::size_t> native_hf_source_bytes(
         : std::nullopt;
 }
 
+bool is_independently_streamed_record(std::string_view name) noexcept {
+    return name.ends_with(".associative_memory.embedding.weight") ||
+        name.ends_with(".engram.embed.weight");
+}
+
+bool is_routed_expert_record(std::string_view name) noexcept {
+    return name.find(".mlp.experts.") != std::string_view::npos ||
+        name.find(".ffn_gate_exps.") != std::string_view::npos ||
+        name.find(".ffn_up_exps.") != std::string_view::npos ||
+        name.find(".ffn_gate_up_exps.") != std::string_view::npos ||
+        name.find(".ffn_down_exps.") != std::string_view::npos;
+}
+
+std::size_t record_payload_bytes(
+    const mfq::metal::MfqContainer& container,
+    bool (*selected)(std::string_view)) noexcept {
+    std::size_t total = 0;
+    for (const auto& [name, record] : container.records()) {
+        if (!selected(name)) continue;
+        if (record.nbytes >
+            std::numeric_limits<std::size_t>::max() - total) {
+            return std::numeric_limits<std::size_t>::max();
+        }
+        total += static_cast<std::size_t>(record.nbytes);
+    }
+    return total;
+}
+
 std::size_t requested_cache_bytes(
     const std::optional<double>& cache_gb,
     bool hf_streaming,
@@ -379,19 +466,43 @@ std::size_t requested_cache_bytes(
     if (!hf_streaming) {
         return 0;
     }
-    // Raw-HF is not synonymous with SSD streaming.  Keep a checkpoint fully
-    // resident when its complete source fits inside the same conservative
-    // two-thirds-of-UMA envelope used for the expert cache.  This matters for
-    // direct native-server launches, which do not pass through the Python
-    // model pool's more detailed admission controller.
-    const auto automatic_limit = std::max<std::size_t>(
-        std::uint64_t{1} << 30,
-        physical_memory_bytes() * 2 / 3);
+    // Raw-HF is not synonymous with SSD streaming. Direct native-server
+    // launches must make the same full-residency decision as the model pool;
+    // otherwise a checkpoint which already fits can allocate an unnecessary
+    // expert arena on top of its ordinary resident tensors.
     const auto source_bytes = native_hf_source_bytes(container);
-    if (source_bytes.has_value() && *source_bytes <= automatic_limit) {
+    const auto available_bytes = automatic_runtime_memory_budget_bytes();
+    const auto independently_streamed_bytes = record_payload_bytes(
+        container, is_independently_streamed_record);
+    const auto resident_source_bytes = source_bytes.has_value()
+        ? *source_bytes - std::min(*source_bytes, independently_streamed_bytes)
+        : std::numeric_limits<std::size_t>::max();
+    if (source_bytes.has_value() && resident_source_bytes <= available_bytes) {
         return 0;
     }
-    return automatic_limit;
+    const auto expert_bytes = record_payload_bytes(
+        container, is_routed_expert_record);
+    if (source_bytes.has_value() && expert_bytes > 0) {
+        const auto resident_expert_bytes = std::min(
+            expert_bytes, resident_source_bytes);
+        const auto dense_bytes = resident_source_bytes - resident_expert_bytes;
+        const auto runtime_headroom = std::clamp(
+            available_bytes / 20,
+            kGiB,
+            4 * kGiB);
+        const auto cache_bytes = available_bytes >
+                dense_bytes + runtime_headroom
+            ? std::min(
+                  resident_expert_bytes,
+                  available_bytes - dense_bytes - runtime_headroom)
+            : 0;
+        return std::max(
+            std::min(kGiB, resident_expert_bytes),
+            cache_bytes);
+    }
+    return std::max<std::size_t>(
+        kGiB,
+        std::min(available_bytes, physical_memory_bytes() * 2 / 3));
 }
 
 std::filesystem::path executable_path() {

@@ -1,7 +1,7 @@
 """Public, source-agnostic MFQ quantization command.
 
-The low-level converters remain importable for experiments.  This module is
-the stable user-facing surface: it normalizes common options and then calls
+The low-level converters remain importable for specialized workflows.  This
+module is the stable user-facing surface: it normalizes common options and then calls
 the same converter functions without adding another quantization path.
 """
 

@@ -13,14 +13,14 @@ checkout:
 uv sync --extra train
 ```
 
-A checkout that also serves models needs both sets of extras:
+Server dependencies are installed by default:
 
 ```shell
 # CUDA
-uv sync --extra daemon --extra train
+uv sync --extra train
 
 # Apple silicon
-uv sync --extra daemon --extra metal --extra train
+uv sync --extra metal --extra train
 ```
 
 ## Source modes

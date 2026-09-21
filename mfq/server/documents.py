@@ -126,7 +126,7 @@ def _extract_pdf(path: Path) -> ExtractedDocument:
         from pypdf import PdfReader
     except ImportError as error:
         raise DocumentExtractionError(
-            "PDF extraction requires the mfq daemon document dependency"
+            "PDF extraction requires pypdf"
         ) from error
     try:
         reader = PdfReader(path)

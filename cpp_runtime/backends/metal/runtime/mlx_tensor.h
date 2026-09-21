@@ -22,7 +22,7 @@
 
 namespace mfq::metal {
 
-// Experimental memory-for-bandwidth mode. When enabled before model loading,
+// Opt-in memory-for-bandwidth mode. When enabled before model loading,
 // ordinary packed linear and embedding tensors are materialized once as FP16
 // and their packed runtime objects are released. MFE expert containers keep
 // their dedicated representation.

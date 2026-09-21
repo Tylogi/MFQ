@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the self-contained Apple Silicon MFQ Studio DMG.
+# Build the self-contained Apple Silicon MFQ Studio DMG with a serve-only CLI.
 
 set -euo pipefail
 
@@ -20,7 +20,6 @@ mfq_dmg_dir="${mfq_studio_dir}/src-tauri/target/${mfq_tauri_target}/release/bund
 mfq_output_dir="${MFQ_RELEASE_OUTPUT_DIR:-${mfq_script_dir}/dist}"
 mfq_cli_name="mfq-cli"
 mfq_runtime_name="mfq-decode-metal-aarch64-apple-darwin"
-mfq_perplexity_name="mfq-perplexity-aarch64-apple-darwin"
 mfq_macos_deployment_target="${MFQ_RELEASE_MACOS_DEPLOYMENT_TARGET:-26.2}"
 mfq_release_rustflags="${RUSTFLAGS:-}"
 mfq_release_rustflags="${mfq_release_rustflags:+${mfq_release_rustflags} }--remap-path-prefix=${HOME}=/mfq-build/home --remap-path-prefix=${mfq_project_dir}=/mfq-src"
@@ -36,6 +35,13 @@ for mfq_command in uv cmake codesign hdiutil install_name_tool lipo npm cargo st
   command -v "${mfq_command}" >/dev/null 2>&1 || fail "${mfq_command} is required"
 done
 
+rm -rf \
+  "${mfq_script_dir}/build" \
+  "${mfq_script_dir}/sidecars" \
+  "${mfq_script_dir}/Frameworks" \
+  "${mfq_script_dir}/Resources" \
+  "${mfq_script_dir}/windows-runtime" \
+  "${mfq_script_dir}/dist"
 mkdir -p \
   "${mfq_native_build_dir}" \
   "${mfq_pyinstaller_build_dir}" \
@@ -60,11 +66,6 @@ if [[ "${MFQ_RELEASE_REUSE_VENV:-0}" != "1" ]]; then
     --no-default-groups \
     --no-editable \
     --group release \
-    --extra daemon \
-    --extra train \
-    --extra calibration \
-    --extra minicpmo45-realtime \
-    --extra tpq \
     --extra metal
 fi
 
@@ -86,18 +87,15 @@ cmake -S "${mfq_project_dir}/cpp_runtime" -B "${mfq_native_build_dir}" -G Ninja 
   -DMFQ_MLX_ROOT="${mfq_mlx_root}" \
   -DMFQ_MLX_METALLIB_DEFAULT:STRING=
 cmake --build "${mfq_native_build_dir}" \
-  --target mfq-decode-metal mfq-perplexity \
+  --target mfq-decode-metal \
   --parallel "${MFQ_RELEASE_JOBS:-$(sysctl -n hw.ncpu)}"
 
 mfq_runtime_source="${mfq_native_build_dir}/metal/mfq-decode-metal"
-mfq_perplexity_source="${mfq_native_build_dir}/metal/mfq-perplexity"
 mfq_video_source="${mfq_native_build_dir}/metal/libmfq_avfoundation_video.dylib"
 [[ -x "${mfq_runtime_source}" ]] || fail "native build did not create mfq-decode-metal"
-[[ -x "${mfq_perplexity_source}" ]] || fail "native build did not create mfq-perplexity"
 [[ -f "${mfq_video_source}" ]] || fail "native build did not create the AVFoundation video library"
 
 install -m 755 "${mfq_runtime_source}" "${mfq_sidecar_dir}/${mfq_runtime_name}"
-install -m 755 "${mfq_perplexity_source}" "${mfq_sidecar_dir}/${mfq_perplexity_name}"
 install -m 644 "${mfq_mlx_root}/lib/libmlx.dylib" "${mfq_framework_dir}/libmlx.dylib"
 install -m 644 "${mfq_mlx_root}/lib/libjaccl.dylib" "${mfq_framework_dir}/libjaccl.dylib"
 install -m 755 "${mfq_video_source}" "${mfq_framework_dir}/libmfq_avfoundation_video.dylib"
@@ -112,19 +110,15 @@ install -m 644 "${mfq_project_dir}/NOTICE" \
   "${mfq_license_dir}/NOTICE.txt"
 install -m 644 "${mfq_project_dir}"/LICENSES/*.txt "${mfq_license_dir}/"
 
-for mfq_native_binary in \
-  "${mfq_sidecar_dir}/${mfq_runtime_name}" \
-  "${mfq_sidecar_dir}/${mfq_perplexity_name}"; do
-  install_name_tool -add_rpath "@executable_path/../Frameworks" "${mfq_native_binary}"
-done
+install_name_tool -add_rpath "@executable_path/../Frameworks" \
+  "${mfq_sidecar_dir}/${mfq_runtime_name}"
 
 mfq_signing_identity="${MFQ_RELEASE_SIGNING_IDENTITY:-${APPLE_SIGNING_IDENTITY:--}}"
 for mfq_signed_file in \
   "${mfq_framework_dir}/libjaccl.dylib" \
   "${mfq_framework_dir}/libmlx.dylib" \
   "${mfq_framework_dir}/libmfq_avfoundation_video.dylib" \
-  "${mfq_sidecar_dir}/${mfq_runtime_name}" \
-  "${mfq_sidecar_dir}/${mfq_perplexity_name}"; do
+  "${mfq_sidecar_dir}/${mfq_runtime_name}"; do
   codesign --force --sign "${mfq_signing_identity}" "${mfq_signed_file}"
   codesign --verify --strict --verbose=2 "${mfq_signed_file}"
 done
@@ -141,33 +135,38 @@ mfq_pyinstaller_args=(
   --target-architecture arm64
   --paths "${mfq_project_dir}"
   --collect-data mfq
+  --collect-all av
   --collect-all fastapi
-  --collect-all uvicorn
+  --collect-all httpx
+  --collect-all PIL
   --collect-all pydantic
+  --collect-all pypdf
   --collect-all huggingface_hub
   --collect-all modelscope_hub
-  --collect-all torch
-  --collect-all transformers
-  --collect-all tokenizers
-  --collect-all safetensors
-  --collect-all mlx
-  --collect-all hyperpyyaml
-  --collect-all librosa
-  --collect-all onnxruntime
-  --collect-all s3tokenizer
-  --collect-all scipy
-  --collect-all soundfile
-  --collect-all stepaudio2
-  --collect-all torchaudio
+  --collect-all uvicorn
+  --collect-all websockets
   --copy-metadata requests
   --copy-metadata huggingface-hub
   --copy-metadata modelscope-hub
-  --hidden-import mfq.runtime.minicpmo45_realtime
-  --hidden-import mfq.runtime.flash_next_worker
-  --hidden-import mfq.runtime.mlx_qwen4_exp
-  --hidden-import mfq.runtime.mlx_glm5_next
-  --exclude-module mfq.runtime.minicpmo45
+  --exclude-module torch
+  --exclude-module transformers
+  --exclude-module mlx
+  --exclude-module safetensors
+  --exclude-module scipy
+  --exclude-module pyarrow
+  --exclude-module tiktoken
+  --exclude-module mfq.calibration
+  --exclude-module mfq.quantize
+  --exclude-module mfq.tools
+  --exclude-module mfq._vendor.tpq
+  --exclude-module mfq.runtime
   --exclude-module minicpmo_utils
+  --exclude-module stepaudio2_minicpmo
+  --exclude-module torchaudio
+  --exclude-module onnxruntime
+  --exclude-module s3tokenizer
+  --exclude-module hyperpyyaml
+  --exclude-module librosa
   --distpath "${mfq_resource_dir}"
   --workpath "${mfq_pyinstaller_build_dir}"
   --specpath "${mfq_spec_dir}"
@@ -185,37 +184,16 @@ mfq_pyinstaller_args+=("${mfq_project_dir}/mfq/cli.py")
 
 mfq_cli_path="${mfq_resource_dir}/${mfq_cli_name}/${mfq_cli_name}"
 [[ -x "${mfq_cli_path}" ]] || fail "PyInstaller did not create the unified mfq CLI"
-mfq_cli_internal_dir="${mfq_resource_dir}/${mfq_cli_name}/_internal"
-mfq_cli_mlx_metallib="${mfq_cli_internal_dir}/mlx/lib/mlx.metallib"
-mfq_cli_colocated_metallib="${mfq_cli_internal_dir}/mlx.metallib"
-[[ -f "${mfq_cli_mlx_metallib}" ]] \
-  || fail "PyInstaller did not collect the MLX Metal library"
-# MLX resolves its default library relative to the loaded libmlx.dylib.  Once
-# the frozen CLI lives inside a .app bundle that directory is _internal, not
-# mlx/lib, so preserve a relative alias at the lookup location.
-[[ ! -e "${mfq_cli_colocated_metallib}" && ! -L "${mfq_cli_colocated_metallib}" ]] \
-  || fail "unexpected pre-existing colocated MLX Metal library"
-ln -s "mlx/lib/mlx.metallib" "${mfq_cli_colocated_metallib}"
-[[ -r "${mfq_cli_colocated_metallib}" ]] \
-  || fail "colocated MLX Metal library alias is unreadable"
 for mfq_arm64_file in \
   "${mfq_cli_path}" \
-  "${mfq_sidecar_dir}/${mfq_runtime_name}" \
-  "${mfq_sidecar_dir}/${mfq_perplexity_name}"; do
+  "${mfq_sidecar_dir}/${mfq_runtime_name}"; do
   lipo -archs "${mfq_arm64_file}" | tr ' ' '\n' | grep -qx arm64 \
     || fail "${mfq_arm64_file} is not arm64"
 done
 codesign --verify --strict --verbose=2 "${mfq_cli_path}"
 
 "${mfq_cli_path}" --version
-"${mfq_cli_path}" _mlx-runtime-check >/dev/null
-"${mfq_cli_path}" _flash-next-worker --help >/dev/null
 "${mfq_cli_path}" serve --help >/dev/null
-"${mfq_cli_path}" quantize --help >/dev/null
-"${mfq_cli_path}" solve-ew --help >/dev/null
-"${mfq_cli_path}" calibrate --help >/dev/null
-"${mfq_cli_path}" tpq --help >/dev/null
-"${mfq_cli_path}" voice-runtime-check >/dev/null
 
 cd "${mfq_studio_dir}"
 npm ci
@@ -264,8 +242,7 @@ for mfq_private_prefix in "${HOME}/" "${mfq_project_dir}/"; do
 done
 MFQ_MLX_METALLIB="${mfq_packaged_app}/Contents/Resources/mlx.metallib" \
   "${mfq_packaged_app}/Contents/MacOS/mfq-decode-metal" --self-test-metal
-"${mfq_packaged_app}/Contents/Resources/mfq-cli/mfq-cli" \
-  _mlx-runtime-check >/dev/null
+"${mfq_packaged_app}/Contents/Resources/mfq-cli/mfq-cli" --version >/dev/null
 hdiutil detach "${mfq_mount_dir}" >/dev/null
 mfq_mounted=false
 rmdir "${mfq_mount_dir}"

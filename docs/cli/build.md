@@ -18,11 +18,10 @@ cd /path/to/MFQ
 uv sync --extra metal
 ```
 
-On a CUDA host, the native build itself needs no Python accelerator package.
-Install the daemon extra only when serving through the HTTP API:
+On a CUDA host, the native build itself needs no Python accelerator package:
 
 ```shell
-uv sync --extra daemon
+uv sync
 ```
 
 Build with automatic backend detection:

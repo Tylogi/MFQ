@@ -210,6 +210,21 @@ struct HfSafetensorsSource::Impl {
                         errno, std::generic_category(),
                         "open " + path.string());
                 }
+#if defined(__APPLE__) && defined(F_NOCACHE)
+                // Raw-HF tensors are copied into final runtime buffers or
+                // consumed through bounded row/expert stores. Retaining the
+                // same payload in the macOS file cache creates a transient
+                // second model copy and can compress live GPU allocations.
+                if (::fcntl(descriptor, F_NOCACHE, 1) != 0) {
+                    const auto error = errno;
+                    ::close(descriptor);
+                    descriptor = -1;
+                    throw std::system_error(
+                        error,
+                        std::generic_category(),
+                        "F_NOCACHE " + path.string());
+                }
+#endif
             }
             return descriptor;
         }
@@ -240,6 +255,7 @@ struct HfSafetensorsSource::Impl {
     std::unordered_map<std::string, std::size_t> tensor_indices;
     std::unordered_map<std::string, std::string> exposed_to_source;
     std::unordered_map<std::string, std::filesystem::path> asset_paths;
+    std::unordered_map<std::string, std::vector<std::byte>> inline_assets;
     std::vector<std::string> assets;
 };
 
@@ -408,16 +424,50 @@ HfSafetensorsSource::HfSafetensorsSource(
             throw std::runtime_error("invalid native HF runtime asset: " +
                                      path.string());
         }
-        impl_->assets.push_back(name);
-        if (!impl_->asset_paths.emplace(std::move(name), resolved).second) {
+        if (impl_->inline_assets.find(name) != impl_->inline_assets.end() ||
+            !impl_->asset_paths.emplace(name, resolved).second) {
             throw std::runtime_error("duplicate native HF runtime asset: " +
                                      path.string());
         }
+        impl_->assets.push_back(std::move(name));
+    };
+    const auto add_inline_asset = [&](std::string name, std::string payload) {
+        std::vector<std::byte> bytes(payload.size());
+        if (!payload.empty()) {
+            std::memcpy(bytes.data(), payload.data(), payload.size());
+        }
+        if (impl_->asset_paths.find(name) != impl_->asset_paths.end() ||
+            !impl_->inline_assets.emplace(name, std::move(bytes)).second) {
+            throw std::runtime_error("duplicate native HF inline asset: " + name);
+        }
+        impl_->assets.push_back(std::move(name));
     };
 
     const auto config = impl_->root / "config.json";
     if (std::filesystem::is_regular_file(config)) {
-        const auto parsed = parse_json(read_text(config), config);
+        auto parsed = parse_json(read_text(config), config);
+        const auto inference_config = impl_->root / "inference" / "config.json";
+        if (std::filesystem::is_regular_file(inference_config)) {
+            const auto supplemental = parse_json(
+                read_text(inference_config), inference_config);
+            if (!parsed.is_object() || !supplemental.is_object()) {
+                throw std::runtime_error(
+                    "HF model configuration files must contain JSON objects");
+            }
+            auto* target = &parsed;
+            if (const auto text = parsed.find("text_config");
+                text != parsed.end() && text->is_object()) {
+                target = &*text;
+            }
+            const auto* source = &supplemental;
+            if (const auto text = supplemental.find("text_config");
+                text != supplemental.end() && text->is_object()) {
+                source = &*text;
+            }
+            for (const auto& [key, value] : source->items()) {
+                if (!target->contains(key)) (*target)[key] = value;
+            }
+        }
         const auto model_type = parsed.find("model_type");
         if (model_type == parsed.end() || !model_type->is_string() ||
             model_type->get_ref<const std::string&>().empty()) {
@@ -426,7 +476,7 @@ HfSafetensorsSource::HfSafetensorsSource(
         impl_->architecture = model_type->get<std::string>() + "-hf-full-mfq";
         impl_->metadata.emplace("source.format", "hf-safetensors");
         impl_->metadata.emplace("source.precision", "native");
-        add_asset(std::string(kModelConfigAsset), config);
+        add_inline_asset(std::string(kModelConfigAsset), parsed.dump());
     }
     static constexpr std::array<std::pair<std::string_view, std::string_view>, 4>
         sidecars{{
@@ -605,12 +655,19 @@ const std::vector<std::string>& HfSafetensorsSource::assets() const noexcept {
 }
 
 bool HfSafetensorsSource::has_asset(std::string_view name) const noexcept {
-    return impl_->asset_paths.find(std::string(name)) != impl_->asset_paths.end();
+    const auto key = std::string(name);
+    return impl_->inline_assets.find(key) != impl_->inline_assets.end() ||
+        impl_->asset_paths.find(key) != impl_->asset_paths.end();
 }
 
 std::vector<std::byte> HfSafetensorsSource::read_asset(
     std::string_view name) const {
-    const auto found = impl_->asset_paths.find(std::string(name));
+    const auto key = std::string(name);
+    if (const auto inline_asset = impl_->inline_assets.find(key);
+        inline_asset != impl_->inline_assets.end()) {
+        return inline_asset->second;
+    }
+    const auto found = impl_->asset_paths.find(key);
     if (found == impl_->asset_paths.end()) {
         throw std::runtime_error("model asset not found: " + std::string(name));
     }

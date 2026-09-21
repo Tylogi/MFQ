@@ -14,7 +14,7 @@ MARKDOWN_TEXT = (STUDIO / "src" / "markdownText.ts").read_text(encoding="utf-8")
 STUDIO_BRIDGE = (STUDIO / "src" / "studio.ts").read_text(encoding="utf-8")
 STYLES = (STUDIO / "src" / "styles.css").read_text(encoding="utf-8")
 REALTIME_AUDIO = (STUDIO / "src" / "realtimeAudio.ts").read_text(encoding="utf-8")
-RELEASE_SCRIPT = (ROOT / "release" / "build_release_mac.sh").read_text(encoding="utf-8")
+RELEASE_SCRIPT = (ROOT / "packaging" / "build_release_mac.sh").read_text(encoding="utf-8")
 
 
 def test_studio_uses_one_package_for_web_and_desktop_clients():
@@ -43,8 +43,6 @@ def test_studio_uses_one_package_for_web_and_desktop_clients():
     assert 'RUSTFLAGS="${mfq_release_rustflags}"' in RELEASE_SCRIPT
     assert "packaged Studio contains a private build path" in RELEASE_SCRIPT
     assert 'mfq-decode-metal" --self-test-metal' in RELEASE_SCRIPT
-    assert 'ln -s "mlx/lib/mlx.metallib"' in RELEASE_SCRIPT
-    assert "_mlx-runtime-check" in RELEASE_SCRIPT
 
 
 def test_assistant_markdown_recovers_fully_escaped_structural_line_breaks():

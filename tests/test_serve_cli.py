@@ -122,6 +122,32 @@ def test_serve_accepts_an_explicit_expert_cache_budget() -> None:
     assert args.moe_gpu_cache_gb == 3.5
 
 
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--port", "0"),
+        ("--port", "65536"),
+        ("--context-size", "-1"),
+        ("--prefill-chunk-size", "0"),
+        ("--moe-gpu-cache-gb", "nan"),
+        ("--prefix-cache-disk-size", "invalid"),
+        ("--prefix-cache-hot-size", "-1M"),
+        ("--prefix-cache-block-tokens", "0"),
+        ("--runtime-startup-timeout", "0"),
+        ("--max-runtime-instances", "0"),
+        ("--max-requests-per-runtime", "0"),
+        ("--max-queued-requests-per-runtime", "-1"),
+        ("--max-runtime-memory", "1XB"),
+        ("--runtime-idle-timeout", "-1"),
+    ],
+)
+def test_serve_rejects_invalid_numeric_options(option: str, value: str) -> None:
+    with pytest.raises(SystemExit) as error:
+        _build_parser().parse_args(["serve", option, value])
+
+    assert error.value.code == 2
+
+
 def test_serve_accepts_an_empty_initial_model_catalog() -> None:
     args = _build_parser().parse_args(["serve"])
 

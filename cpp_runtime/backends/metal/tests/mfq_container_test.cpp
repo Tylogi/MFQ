@@ -709,13 +709,19 @@ void test_hf_virtual_mxfp8_geometries(
 void test_hf_virtual_mfe_experts(
     const std::filesystem::path& root) {
     const auto hf = root / "hf-native-experts";
-    std::filesystem::create_directories(hf);
+    const auto assets = hf / ".mfq-assets" / "hf";
+    std::filesystem::create_directories(assets);
     {
         std::ofstream stream(hf / "config.json", std::ios::binary);
-        stream << R"({"model_type":"deepseek_v41"})";
+        stream << R"({"model_type":"future_model"})";
     }
 
     json header = json::object();
+    json source_map = {
+        {"schema", "mfq.hf-source-map"},
+        {"version", 1},
+        {"canonical_to_source", json::object()},
+    };
     std::vector<std::uint8_t> payload;
     std::uint64_t offset = 0;
     for (int family = 0; family < 2; ++family) {
@@ -727,6 +733,16 @@ void test_hf_virtual_mfe_experts(
                 std::to_string(expert) + ".w" + std::to_string(projection);
             const auto values = prefix + ".weight";
             const auto scales = prefix + ".scale";
+            const auto canonical_root = family == 0
+                ? "model.block.0.mlp.experts."
+                : "predictor.stage.0.mlp.experts.";
+            const auto canonical_projection = projection == 1 ? "gate" :
+                projection == 2 ? "down" : "up";
+            const auto canonical = std::string(canonical_root) +
+                std::to_string(expert) + "." + canonical_projection;
+            source_map["canonical_to_source"][canonical + ".weight"] = values;
+            source_map["canonical_to_source"][canonical + ".weight_scale"] =
+                scales;
             header[values] = {
                 {"dtype", "I8"},
                 {"shape", {32, 16}},
@@ -747,6 +763,10 @@ void test_hf_virtual_mfe_experts(
             offset += 32;
             }
         }
+    }
+    {
+        std::ofstream stream(assets / "source_tensor_map.json");
+        stream << source_map.dump();
     }
     auto header_text = header.dump();
     while ((8 + header_text.size()) % 8 != 0) {
@@ -852,7 +872,7 @@ void test_hf_virtual_mfe_experts(
         resident_ids.eval();
         require(resident_ids.shape() == route_ids.shape() &&
                     resident_ids.data<std::int32_t>()[0] >= 0 &&
-                    prepared.weights().gate_up.weight().experts() == 8,
+                    prepared.weights().gate_up.weight().experts() == 6,
                 "shared SSD route preparation did not map the batch");
     }
     require(
@@ -895,8 +915,9 @@ void test_hf_virtual_mfe_experts(
         2,
         true);
     require(!bounded_overlap_cache.prefill_overlap_enabled() &&
-                bounded_overlap_cache.cache_slots() == 8,
-            "undersized SSD prefill buffers did not fall back to the LRU");
+                bounded_overlap_cache.cache_slots() == 6,
+            "SSD cache did not bound an oversized LRU request to useful "
+            "expert capacity");
 }
 
 } // namespace

@@ -2,12 +2,12 @@
   "bundle": {
     "targets": ["nsis"],
     "externalBin": [
-      "../../release/sidecars/mfq-runtime"
+      "../../packaging/sidecars/mfq-runtime"
     ],
     "resources": {
-      "../../release/windows-runtime/": "",
-      "../../release/Resources/mfq-cli": "mfq-cli",
-      "../../release/Resources/licenses": "licenses"
+      "../../packaging/windows-runtime/": "",
+      "../../packaging/Resources/mfq-cli": "mfq-cli",
+      "../../packaging/Resources/licenses": "licenses"
     }
   }
 }

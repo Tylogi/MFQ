@@ -102,11 +102,11 @@ git clone https://github.com/Tylogi/TyloQuant.git MFQ
 cd MFQ
 
 # NVIDIA / CUDA
-uv sync --extra daemon
+uv sync
 uv run mfq build --backend cuda
 
 # Apple silicon / Metal
-uv sync --extra daemon --extra metal
+uv sync --extra metal
 uv run mfq build --backend metal
 ```
 
@@ -140,7 +140,7 @@ uv run mfq quantize \
 Load and serve the result:
 
 ```bash
-uv sync --extra daemon                 # add --extra metal on Apple silicon
+uv sync                                # add --extra metal on Apple silicon
 uv run mfq build --backend auto
 uv run mfq serve \
   --model /models/Qwen3.8-27B-MFQ-S4-M.mfq \

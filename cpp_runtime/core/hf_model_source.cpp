@@ -293,6 +293,8 @@ struct HfModelSource::Impl {
 
 HfModelSource::HfModelSource(std::filesystem::path root)
     : impl_(std::make_unique<Impl>(std::move(root))) {
+    const bool has_explicit_source_map =
+        impl_->source.has_asset(kHfSourceMapAsset);
     auto canonical_to_source = source_map(impl_->source);
     if (canonical_to_source.empty()) {
         for (const auto& tensor : impl_->source.tensors()) {
@@ -328,7 +330,7 @@ HfModelSource::HfModelSource(std::filesystem::path root)
                 }
             }
         }
-        if (ends_with(source_name, ".weight")) {
+        if (!has_explicit_source_map && ends_with(source_name, ".weight")) {
             const auto base = source_name.substr(0, source_name.size() - 7);
             candidates.push_back(source_name + "_scale_inv");
             candidates.push_back(source_name + "_scale");

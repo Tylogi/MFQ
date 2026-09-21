@@ -35,6 +35,9 @@ _ROUTED_EXPERT_RE = re.compile(
     r"(?:gate|up|down|gate_up)(?:_proj)?\."
     r"(?:weight|weight_scale)$"
 )
+_ALWAYS_STREAMED_RE = re.compile(
+    r"(?:\.associative_memory\.embedding\.weight|\.engram\.embed\.weight)$"
+)
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -59,6 +62,7 @@ class DiscoveredModel:
     resource: ModelArtifactResource
     path: Path
     routed_expert_bytes: int = 0
+    always_streamed_bytes: int = 0
 
 
 def _is_routed_expert_tensor(name: str) -> bool:
@@ -73,6 +77,12 @@ def _is_routed_expert_tensor(name: str) -> bool:
             ".ffn_down_exps.",
         )
     )
+
+
+def _is_always_streamed_tensor(name: str) -> bool:
+    """Identify payloads whose runtime storage is independently bounded."""
+
+    return bool(_ALWAYS_STREAMED_RE.search(name))
 
 
 class ModelCatalog:
@@ -643,6 +653,12 @@ class ModelCatalog:
                     if not is_asset_record(record.name)
                     and _is_routed_expert_tensor(record.name)
                 )
+                always_streamed_bytes = sum(
+                    int(record.nbytes)
+                    for record in store.records.values()
+                    if not is_asset_record(record.name)
+                    and _is_always_streamed_tensor(record.name)
+                )
                 fingerprint = "\0".join(
                     [
                         store.header.model_arch,
@@ -690,6 +706,9 @@ class ModelCatalog:
             path=path,
             routed_expert_bytes=(
                 routed_expert_bytes if resource.complete else 0
+            ),
+            always_streamed_bytes=(
+                always_streamed_bytes if resource.complete else 0
             ),
         )
 
@@ -787,6 +806,7 @@ class ModelCatalog:
             identifier = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:32]
             loadable = graph_spec_for_source_names(config, sorted(tensors)) is not None
             routed_expert_bytes = 0
+            always_streamed_bytes = 0
             for tensor_name, tensor_bytes in tensor_sizes.items():
                 mapped = map_source_tensor_name(tensor_name, config)
                 canonical_name = (
@@ -794,6 +814,8 @@ class ModelCatalog:
                 )
                 if _is_routed_expert_tensor(canonical_name):
                     routed_expert_bytes += tensor_bytes
+                if _is_always_streamed_tensor(canonical_name):
+                    always_streamed_bytes += tensor_bytes
             resource = ModelArtifactResource(
                 id=identifier,
                 name=name,
@@ -839,5 +861,8 @@ class ModelCatalog:
             path=path,
             routed_expert_bytes=(
                 routed_expert_bytes if resource.complete else 0
+            ),
+            always_streamed_bytes=(
+                always_streamed_bytes if resource.complete else 0
             ),
         )

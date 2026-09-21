@@ -1457,13 +1457,26 @@ wheels = [
 name = "mfq"
 source = { editable = "." }
 dependencies = [
+    { name = "av", version = "17.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or (extra == 'extra-3-mfq-calibration' and extra == 'extra-3-mfq-minicpmo45')" },
+    { name = "av", version = "18.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11' or (extra == 'extra-3-mfq-calibration' and extra == 'extra-3-mfq-minicpmo45')" },
+    { name = "fastapi" },
     { name = "gguf" },
+    { name = "httpx" },
+    { name = "huggingface-hub", version = "0.36.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-3-mfq-minicpmo45'" },
+    { name = "huggingface-hub", version = "1.24.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-3-mfq-calibration' or extra != 'extra-3-mfq-minicpmo45'" },
+    { name = "modelscope-hub" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or (extra == 'extra-3-mfq-calibration' and extra == 'extra-3-mfq-minicpmo45')" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*' or (extra == 'extra-3-mfq-calibration' and extra == 'extra-3-mfq-minicpmo45')" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' or (extra == 'extra-3-mfq-calibration' and extra == 'extra-3-mfq-minicpmo45')" },
+    { name = "pillow" },
+    { name = "pydantic" },
+    { name = "pypdf" },
     { name = "tokenizers", version = "0.21.4", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-3-mfq-minicpmo45'" },
     { name = "tokenizers", version = "0.22.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-3-mfq-calibration' or extra != 'extra-3-mfq-minicpmo45'" },
     { name = "tqdm" },
+    { name = "uvicorn" },
+    { name = "websockets", version = "16.1.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or (extra == 'extra-3-mfq-calibration' and extra == 'extra-3-mfq-minicpmo45')" },
+    { name = "websockets", version = "17.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11' or (extra == 'extra-3-mfq-calibration' and extra == 'extra-3-mfq-minicpmo45')" },
 ]
 
 [package.optional-dependencies]
@@ -1477,27 +1490,9 @@ calibration = [
     { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" } },
     { name = "transformers", version = "5.14.1", source = { registry = "https://pypi.org/simple" } },
 ]
-daemon = [
-    { name = "av", version = "17.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or (extra == 'extra-3-mfq-calibration' and extra == 'extra-3-mfq-minicpmo45')" },
-    { name = "av", version = "18.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11' or (extra == 'extra-3-mfq-calibration' and extra == 'extra-3-mfq-minicpmo45')" },
-    { name = "fastapi" },
-    { name = "httpx" },
-    { name = "huggingface-hub", version = "0.36.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-3-mfq-minicpmo45'" },
-    { name = "huggingface-hub", version = "1.24.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-3-mfq-calibration' or extra != 'extra-3-mfq-minicpmo45'" },
-    { name = "modelscope-hub" },
-    { name = "pillow" },
-    { name = "pydantic" },
-    { name = "pypdf" },
-    { name = "uvicorn" },
-    { name = "websockets", version = "16.1.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or (extra == 'extra-3-mfq-calibration' and extra == 'extra-3-mfq-minicpmo45')" },
-    { name = "websockets", version = "17.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11' or (extra == 'extra-3-mfq-calibration' and extra == 'extra-3-mfq-minicpmo45')" },
-]
 dev = [
     { name = "black" },
-    { name = "fastapi" },
-    { name = "httpx" },
     { name = "mypy" },
-    { name = "pydantic" },
     { name = "pytest" },
     { name = "ruff" },
 ]
@@ -1567,33 +1562,30 @@ release = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", marker = "extra == 'minicpmo45'", specifier = ">=0.26.0" },
-    { name = "av", marker = "extra == 'daemon'", specifier = ">=12.0.0" },
+    { name = "av", specifier = ">=12.0.0" },
     { name = "black", marker = "extra == 'dev'", specifier = ">=23.0.0" },
-    { name = "fastapi", marker = "extra == 'daemon'", specifier = ">=0.115.0" },
-    { name = "fastapi", marker = "extra == 'dev'", specifier = ">=0.115.0" },
+    { name = "fastapi", specifier = ">=0.115.0" },
     { name = "fastapi", marker = "extra == 'minicpmo45-realtime'", specifier = ">=0.115.0" },
     { name = "fastapi", marker = "extra == 'tpq'", specifier = ">=0.115.0" },
     { name = "gguf", specifier = ">=0.19.0" },
-    { name = "httpx", marker = "extra == 'daemon'", specifier = ">=0.27.0" },
-    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27.0" },
+    { name = "httpx", specifier = ">=0.27.0" },
     { name = "httpx", marker = "extra == 'minicpmo45-realtime'", specifier = ">=0.27.0" },
+    { name = "huggingface-hub", specifier = ">=0.25.0" },
     { name = "huggingface-hub", marker = "extra == 'calibration'", specifier = ">=0.25.0" },
-    { name = "huggingface-hub", marker = "extra == 'daemon'", specifier = ">=0.25.0" },
     { name = "hyperpyyaml", marker = "extra == 'minicpmo45-realtime'", specifier = ">=1.2.2" },
     { name = "librosa", marker = "extra == 'minicpmo45'", specifier = ">=0.10.0" },
     { name = "minicpmo-utils", extras = ["all"], marker = "extra == 'minicpmo45'", specifier = ">=1.0.5" },
     { name = "mlx", marker = "extra == 'metal'", specifier = ">=0.32.0" },
-    { name = "modelscope-hub", marker = "extra == 'daemon'", specifier = ">=0.1.8" },
+    { name = "modelscope-hub", specifier = ">=0.1.8" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0.0" },
     { name = "ninja", marker = "extra == 'tpq'", specifier = ">=1.11.0" },
     { name = "numpy", specifier = ">=1.24.0" },
     { name = "onnxruntime", marker = "extra == 'minicpmo45-realtime'", specifier = ">=1.20.0" },
-    { name = "pillow", marker = "extra == 'daemon'", specifier = ">=10.0.0" },
+    { name = "pillow", specifier = ">=10.0.0" },
     { name = "psutil", marker = "extra == 'tpq'", specifier = ">=5.9.0" },
     { name = "pyarrow", marker = "extra == 'calibration'", specifier = ">=14.0.0" },
-    { name = "pydantic", marker = "extra == 'daemon'", specifier = ">=2.8.0" },
-    { name = "pydantic", marker = "extra == 'dev'", specifier = ">=2.8.0" },
-    { name = "pypdf", marker = "extra == 'daemon'", specifier = ">=5.0.0" },
+    { name = "pydantic", specifier = ">=2.8.0" },
+    { name = "pypdf", specifier = ">=5.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
     { name = "s3tokenizer", marker = "extra == 'minicpmo45-realtime'", specifier = ">=0.3.0" },
@@ -1622,13 +1614,13 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'calibration'", specifier = ">=5.7.0" },
     { name = "transformers", marker = "extra == 'minicpmo45'", specifier = "==4.51.0" },
     { name = "transformers", marker = "extra == 'minicpmo45-realtime'", specifier = ">=4.51.0" },
-    { name = "uvicorn", marker = "extra == 'daemon'", specifier = ">=0.30.0" },
+    { name = "uvicorn", specifier = ">=0.30.0" },
     { name = "uvicorn", marker = "extra == 'tpq'", specifier = ">=0.30.0" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'minicpmo45-realtime'", specifier = ">=0.30.0" },
-    { name = "websockets", marker = "extra == 'daemon'", specifier = ">=12.0" },
+    { name = "websockets", specifier = ">=12.0" },
     { name = "websockets", marker = "extra == 'minicpmo45-realtime'", specifier = ">=12.0" },
 ]
-provides-extras = ["dev", "daemon", "train", "calibration", "minicpmo45", "tpq", "metal", "minicpmo45-realtime"]
+provides-extras = ["dev", "train", "calibration", "minicpmo45", "tpq", "metal", "minicpmo45-realtime"]
 
 [package.metadata.requires-dev]
 release = [{ name = "pyinstaller", specifier = "==6.21.0" }]

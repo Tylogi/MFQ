@@ -16,7 +16,11 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field, SkipValidation
 
 from mfq.server.catalog import DiscoveredModel, ModelArtifactNotFoundError, ModelCatalog
-from mfq.server.host_memory import host_memory_snapshot, total_physical_memory
+from mfq.server.host_memory import (
+    host_memory_snapshot,
+    metal_recommended_working_set_size,
+    total_physical_memory,
+)
 from mfq.server.jobs import JobContext, JobExecutionError
 from mfq.server.models import (
     ErrorDetail,
@@ -307,7 +311,13 @@ class RuntimePool:
         reserve = 4 << 30 if total_bytes < 24 << 30 else 6 << 30
         if total_bytes <= reserve:
             return max(1, total_bytes * 3 // 4)
-        return total_bytes - reserve
+        physical_ceiling = total_bytes - reserve
+        metal_ceiling = metal_recommended_working_set_size()
+        return (
+            physical_ceiling
+            if metal_ceiling is None
+            else min(physical_ceiling, metal_ceiling)
+        )
 
     async def start(self) -> None:
         """Start lifecycle monitors and configured startup models."""
@@ -2198,9 +2208,14 @@ class RuntimePool:
         snapshot = host_memory_snapshot()
         if snapshot is None:
             return ceiling
+        reserve = 4 << 30 if snapshot.total < 24 << 30 else 6 << 30
+        currently_available = max(
+            0,
+            snapshot.reclaimable(active_ratio=0.0) - reserve,
+        )
         dynamic_ceiling = (
             self._committed_pool_bytes_locked()
-            + snapshot.reclaimable(active_ratio=0.5)
+            + currently_available
         )
         return max(1, min(ceiling, dynamic_ceiling))
 
@@ -2225,7 +2240,10 @@ class RuntimePool:
         artifact: DiscoveredModel,
         request: ModelLoadRequest,
     ) -> int:
-        total_bytes = artifact.resource.total_bytes
+        total_bytes = max(
+            0,
+            artifact.resource.total_bytes - artifact.always_streamed_bytes,
+        )
         cache_gb = request.moe_gpu_cache_gb
         streamed_bytes = artifact.routed_expert_bytes
         if streamed_bytes <= 0:
@@ -2268,15 +2286,21 @@ class RuntimePool:
             or artifact.routed_expert_bytes <= 0
         ):
             return request
-        if artifact.resource.total_bytes <= ceiling:
-            return (
-                request.model_copy(update={"moe_gpu_cache_gb": 0.0})
-                if artifact.resource.format == "hf"
-                else request
-            )
+        resident_total_bytes = max(
+            0,
+            artifact.resource.total_bytes - artifact.always_streamed_bytes,
+        )
+        if resident_total_bytes <= ceiling:
+            if artifact.resource.format == "hf":
+                # Native-HF workers interpret an omitted cache budget as
+                # "stream experts".  Make the opposite decision explicit
+                # when the complete checkpoint fits; otherwise a 512-GiB
+                # host needlessly starts a cold SSD LRU for a ~160-GiB MoE.
+                return request.model_copy(update={"moe_gpu_cache_gb": 0.0})
+            return request
         dense_bytes = max(
             0,
-            artifact.resource.total_bytes - artifact.routed_expert_bytes,
+            resident_total_bytes - artifact.routed_expert_bytes,
         )
         runtime_headroom = min(
             4 << 30,

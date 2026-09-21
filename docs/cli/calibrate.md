@@ -12,14 +12,14 @@ For a calibration-only checkout:
 uv sync --extra calibration
 ```
 
-A checkout that also serves models needs both sets of extras:
+Server dependencies are installed by default:
 
 ```shell
 # CUDA
-uv sync --extra daemon --extra calibration
+uv sync --extra calibration
 
 # Apple silicon
-uv sync --extra daemon --extra metal --extra calibration
+uv sync --extra metal --extra calibration
 ```
 
 ## Stages

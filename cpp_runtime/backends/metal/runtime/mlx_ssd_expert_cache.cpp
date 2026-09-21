@@ -172,7 +172,10 @@ struct MlxMoeSsdExpertCache::Impl {
               bytes,
               slot_bytes,
               store.max_num_experts())),
-          total_slots(bytes / slot_bytes),
+          total_slots(std::min(
+              bytes / slot_bytes,
+              prefill_slots + std::max<std::size_t>(
+                  6, store.total_num_experts()))),
           slot_count(total_slots > prefill_slots
               ? total_slots - prefill_slots
               : 0),

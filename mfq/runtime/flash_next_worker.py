@@ -28,11 +28,8 @@ from typing import Any
 
 import numpy as np
 
-try:
-    from fastapi import FastAPI, Request
-    from fastapi.responses import JSONResponse, StreamingResponse
-except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
-    raise ModuleNotFoundError("the Flash-Next worker requires MFQ's daemon extra") from exc
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
 try:
     import mlx.core as mx

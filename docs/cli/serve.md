@@ -9,10 +9,10 @@ Sync the server and backend dependencies once:
 
 ```shell
 cd /path/to/MFQ
-uv sync --extra daemon --extra metal
+uv sync --extra metal
 ```
 
-On a CUDA host, use `uv sync --extra daemon` instead. Native CUDA inference
+On a CUDA host, use `uv sync` instead. Native CUDA inference
 does not require PyTorch or LibTorch.
 
 Start an idle server:

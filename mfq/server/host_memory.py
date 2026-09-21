@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import functools
 import os
 import sys
 from dataclasses import dataclass
@@ -38,6 +39,31 @@ def total_physical_memory() -> int | None:
     except (AttributeError, OSError, OverflowError, TypeError, ValueError):
         return None
     return total if total > 0 else None
+
+
+@functools.lru_cache(maxsize=1)
+def metal_recommended_working_set_size() -> int | None:
+    """Return Metal's process working-set ceiling when MLX exposes it."""
+
+    if sys.platform != "darwin":
+        return None
+    try:
+        import mlx.core as mx
+
+        value = mx.device_info().get("max_recommended_working_set_size")
+        result = int(value)
+    except (
+        AttributeError,
+        ImportError,
+        KeyError,
+        OSError,
+        OverflowError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+    return result if result > 0 else None
 
 
 def _open_mach_host() -> tuple[ctypes.CDLL, int, int] | None:

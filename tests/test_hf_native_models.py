@@ -175,6 +175,23 @@ def test_catalog_tracks_native_hf_routed_expert_bytes(tmp_path: Path) -> None:
     assert artifact.routed_expert_bytes == 2
 
 
+def test_catalog_tracks_native_hf_independently_streamed_engram_bytes(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "DeepSeek-V4.1"
+    _hf_fixture(
+        model,
+        model_type="deepseek_v41",
+        tensor_name="layers.0.engram.embed.weight",
+    )
+
+    artifact = asyncio.run(
+        ModelCatalog([tmp_path], cache_seconds=0).resolve_path(model)
+    )
+
+    assert artifact.always_streamed_bytes == 2
+
+
 @pytest.mark.parametrize("model_type", ["qwen4_exp", "glm5_next"])
 def test_catalog_uses_registered_schema_for_native_hf(
     tmp_path: Path,

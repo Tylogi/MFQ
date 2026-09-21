@@ -100,6 +100,10 @@ def test_metal_runtime_pool_derives_a_safe_default_memory_budget(
         "mfq.server.runtime.pool.total_physical_memory",
         lambda: 128 << 30,
     )
+    monkeypatch.setattr(
+        "mfq.server.runtime.pool.metal_recommended_working_set_size",
+        lambda: 110 << 30,
+    )
 
     automatic = RuntimePool(ModelCatalog([]), "runtime", backend="metal")
     disabled = RuntimePool(
@@ -116,7 +120,7 @@ def test_metal_runtime_pool_derives_a_safe_default_memory_budget(
     )
     cuda = RuntimePool(ModelCatalog([]), "runtime", backend="cuda")
 
-    assert automatic.max_runtime_memory_bytes == 122 << 30
+    assert automatic.max_runtime_memory_bytes == 110 << 30
     assert automatic.automatic_memory_budget is True
     assert disabled.max_runtime_memory_bytes is None
     assert disabled.automatic_memory_budget is False
@@ -133,6 +137,10 @@ def test_automatic_memory_budget_tracks_current_reclaimable_memory(
     monkeypatch.setattr(
         "mfq.server.runtime.pool.total_physical_memory",
         lambda: 128 * gib,
+    )
+    monkeypatch.setattr(
+        "mfq.server.runtime.pool.metal_recommended_working_set_size",
+        lambda: 110 * gib,
     )
     monkeypatch.setattr(
         "mfq.server.runtime.pool.host_memory_snapshot",
@@ -155,7 +163,7 @@ def test_automatic_memory_budget_tracks_current_reclaimable_memory(
     )
     explicit._load_bytes["resident"] = 30 * gib
 
-    assert automatic._effective_runtime_memory_budget_locked() == 78 * gib
+    assert automatic._effective_runtime_memory_budget_locked() == 32 * gib
     assert explicit._effective_runtime_memory_budget_locked() == 100 * gib
     assert HostMemorySnapshot(0, -1, 10, -1, 0).reclaimable(
         active_ratio=2.0
@@ -166,7 +174,7 @@ def test_automatic_memory_pressure_uses_soft_and_hard_watermarks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gib = 1 << 30
-    reclaimable_gib = 4
+    reclaimable_gib = 10
     monkeypatch.setattr(
         "mfq.server.runtime.pool.total_physical_memory",
         lambda: 128 * gib,
@@ -190,7 +198,7 @@ def test_automatic_memory_pressure_uses_soft_and_hard_watermarks(
     assert ceiling == 44 * gib
     assert committed == 40 * gib
 
-    reclaimable_gib = 2
+    reclaimable_gib = 8
     level, ratio, ceiling, committed = pool._runtime_memory_pressure_locked()
     assert level == "hard"
     assert ratio == pytest.approx(40 / 42)
@@ -848,6 +856,49 @@ def test_native_hf_moe_uses_the_memory_budget(tmp_path: Path) -> None:
     assert roomy._estimated_load_bytes(artifact, full) == 160 << 30
     assert bounded.moe_gpu_cache_gb == 96
     assert constrained._estimated_load_bytes(artifact, bounded) == 116 << 30
+
+
+def test_native_hf_residency_excludes_independently_streamed_engram(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "native-v41"
+    model.mkdir()
+    artifact = DiscoveredModel(
+        resource=ModelArtifactResource(
+            id="5" * 32,
+            name="native-v41",
+            architecture="deepseek_v41-hf-full-mfq",
+            format="hf",
+            shard_count=16,
+            total_bytes=160 << 30,
+            tensor_count=1,
+            record_count=1,
+            complete=True,
+            loadable=True,
+            modified_at=datetime.now(timezone.utc),
+        ),
+        path=model,
+        routed_expert_bytes=100 << 30,
+        always_streamed_bytes=50 << 30,
+    )
+    pool = RuntimePool(
+        ModelCatalog([tmp_path]),
+        tmp_path / "runtime",
+        max_runtime_memory_bytes=100 << 30,
+    )
+
+    automatic = pool._apply_automatic_expert_residency(
+        artifact,
+        ModelLoadRequest(model="native-v41"),
+    )
+    full_resident = pool._apply_automatic_expert_residency(
+        artifact,
+        ModelLoadRequest(model="native-v41", moe_gpu_cache_gb=0),
+    )
+
+    assert automatic.moe_gpu_cache_gb == 86
+    assert pool._estimated_load_bytes(artifact, automatic) == 96 << 30
+    assert pool._estimated_load_bytes(artifact, full_resident) == 110 << 30
 
 
 def test_catalog_loads_registered_external_mfq_files(tmp_path: Path) -> None:

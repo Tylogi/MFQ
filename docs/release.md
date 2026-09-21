@@ -1,7 +1,7 @@
 # Self-contained releases
 
 MFQ desktop releases support macOS and Windows. Build scripts live in
-`release/` and write artifacts to `release/dist/`.
+`packaging/` and write artifacts to `packaging/dist/`.
 
 The packages include the server, Python environment, native runtime, and
 required runtime libraries. `mfq serve` or MFQ Studio manages the native
@@ -9,25 +9,24 @@ sidecars.
 
 ## macOS
 
-The macOS release packages the public `mfq` CLI and MFQ Studio into an Apple
-Silicon DMG. It includes:
+The macOS release packages the serve-only `mfq` CLI and MFQ Studio into an
+Apple Silicon DMG. It includes:
 
-- the unified `mfq` CLI with `serve`, `quantize`, `calibrate`, and related
-  subcommands;
-- private native sidecars such as `mfq-decode-metal` and `mfq-perplexity`;
+- the unified `mfq` CLI with the `serve` dependencies only;
+- the private native `mfq-decode-metal` sidecar;
 - `libmlx`, `libjaccl`, `mlx.metallib`, and the AVFoundation video bridge;
 - MFQ Studio and its production Web UI.
 
 Build from a clean checkout on Apple Silicon:
 
 ```shell
-cd release
+cd packaging
 ./build_release_mac.sh
 ```
 
 The script builds from the canonical `cpp_runtime` source tree, validates the
 native runtime, CLI subcommands, Rust desktop app, Web UI, architectures, and
-code signatures, then copies the DMG to `release/dist/`.
+code signatures, then copies the DMG to `packaging/dist/`.
 
 ## Windows
 
@@ -41,7 +40,7 @@ native build environment.
 Build from PowerShell 7 or newer on 64-bit Windows:
 
 ```powershell
-cd release
+cd packaging
 .\build_release_windows.ps1
 ```
 

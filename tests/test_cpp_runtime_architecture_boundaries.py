@@ -510,11 +510,24 @@ def test_deepseek_v41_route_transactions_keep_wide_global_expert_ids() -> None:
 
 def test_direct_native_hf_server_uses_size_aware_expert_residency() -> None:
     assert "native_hf_source_bytes(" in DECODE_APP
-    assert "*source_bytes <= automatic_limit" in DECODE_APP
+    assert "automatic_runtime_memory_budget_bytes()" in DECODE_APP
+    assert 'info.find("max_recommended_working_set_size")' in DECODE_APP
+    assert "statistics.free_count" in DECODE_APP
+    assert "statistics.inactive_count" in DECODE_APP
+    assert "is_independently_streamed_record" in DECODE_APP
+    assert "resident_source_bytes <= available_bytes" in DECODE_APP
     assert (
         "requested_cache_bytes(\n"
         "                arguments.expert_cache_gb, native_hf, container"
     ) in DECODE_APP
+
+    assert "F_NOCACHE" in HF_SOURCE
+
+    cache = (
+        ROOT
+        / "cpp_runtime/backends/metal/runtime/mlx_ssd_expert_cache.cpp"
+    ).read_text(encoding="utf-8")
+    assert "store.total_num_experts()" in cache
 
 
 def test_mixed_mfe_offload_uses_the_shared_pager() -> None:

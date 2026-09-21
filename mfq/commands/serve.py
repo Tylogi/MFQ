@@ -212,10 +212,7 @@ def _run(args: argparse.Namespace) -> int:
     if error := network_auth_error(args.host, client_api_key):
         raise ValueError(error)
     install_system_proxy_environment()
-    try:
-        import uvicorn
-    except ModuleNotFoundError as error:
-        raise ModuleNotFoundError("mfq serve requires the 'daemon' optional dependency") from error
+    import uvicorn
 
     from mfq.server.api import create_app
     from mfq.server.auth import ApiKeyManager

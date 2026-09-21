@@ -1,7 +1,7 @@
 # Build the Windows x64 MFQ Studio serve-only NSIS installer and CUDA sidecar.
 #
 # The release Python environment is isolated from development environments. It
-# contains only the daemon dependencies needed by `mfq serve`; training,
+# contains only the base dependencies needed by `mfq serve`; training,
 # calibration, quantization, TPQ, MiniCPM-o, and PyTorch are not packaged.
 # The script imports the Visual Studio environment and adds all required tools to
 # its own PATH, so it can be run from ordinary PowerShell.
@@ -322,7 +322,7 @@ function Initialize-PythonEnvironment {
 
     $syncArguments = @(
         "sync", "--locked", "--active", "--no-default-groups", "--no-editable",
-        "--group", "release", "--extra", "daemon"
+        "--group", "release"
     )
     Invoke-Checked $Context.Tools.Uv $syncArguments
 
@@ -486,6 +486,13 @@ function Build-NsisInstaller {
 
 if (-not [System.OperatingSystem]::IsWindows() -or -not [Environment]::Is64BitOperatingSystem) {
     Fail "this release target must be built on 64-bit Windows"
+}
+
+foreach ($name in @("build", "sidecars", "Frameworks", "Resources", "windows-runtime", "dist")) {
+    $path = Join-Path $PSScriptRoot $name
+    if (Test-Path -LiteralPath $path) {
+        Remove-Item -LiteralPath $path -Recurse -Force
+    }
 }
 
 $PythonVersion = if ([string]::IsNullOrWhiteSpace($PythonVersion)) { "3.12" } else { $PythonVersion }

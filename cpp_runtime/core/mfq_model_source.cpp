@@ -415,7 +415,7 @@ void MfqModelSource::read_range_into(
 }
 
 void MfqModelSource::drop_file_cache() const noexcept {
-#ifndef _WIN32
+#if !defined(_WIN32) && defined(POSIX_FADV_DONTNEED)
     for (const auto& path : impl_->source_paths) {
         const int fd = ::open(path.c_str(), O_RDONLY);
         if (fd < 0) continue;
