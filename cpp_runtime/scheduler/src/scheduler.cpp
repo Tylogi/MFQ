@@ -70,9 +70,11 @@ int32_t MfqScheduler::generate_multimodal(
         const MfqSamplingParams & sampling,
         const MfqTokenCallback & on_token,
         const MfqPrefillCallback & on_prefill,
+        const MfqPromptCachePlan & cache_plan,
         const MfqTokenConstraintPtr & token_constraint) const {
     return engine_.multimodal_generate(
-        prompt, media, sampling, on_token, on_prefill, token_constraint);
+        prompt, media, sampling, on_token, on_prefill, cache_plan,
+        token_constraint);
 }
 
 bool MfqScheduler::supports_reload() const noexcept {

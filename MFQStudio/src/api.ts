@@ -275,6 +275,8 @@ export interface RuntimeStatus {
   cuda_reserved_bytes?: number;
   device_free_bytes?: number;
   device_total_bytes?: number;
+  prefix_cache_supported?: number;
+  prefix_cache_disabled_reason?: number;
   prefix_cache_queries?: number;
   prefix_cache_hits?: number;
   prefix_cache_hit_tokens?: number;

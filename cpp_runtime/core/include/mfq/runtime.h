@@ -153,6 +153,7 @@ using MfqMultimodalGenerateFn = std::function<int32_t(
     const MfqSamplingParams & sampling,
     const MfqTokenCallback & on_token,
     const MfqPrefillCallback & on_prefill,
+    const MfqPromptCachePlan & cache_plan,
     const MfqTokenConstraintPtr & token_constraint)>;
 using MfqReloadFn = std::function<int64_t(int64_t context_size)>;
 using MfqRuntimeMetricsFn =

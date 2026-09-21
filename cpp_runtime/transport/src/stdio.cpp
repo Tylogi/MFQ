@@ -949,7 +949,6 @@ public:
                                         400, "context_length_exceeded",
                                         "expanded multimodal prompt exceeds context");
                                 }
-                                work.cache_plan.stable_prefix_tokens = 0;
                             }
                             const std::string response_id =
                                 request_id("run-");

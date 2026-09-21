@@ -1917,7 +1917,8 @@ CompletionResult generate_text(const RequestWork & work, const MfqTokenizer & to
     result.completion_tokens = work.vision
         ? scheduler.generate_multimodal(
               work.prompt, *work.vision, work.sampling,
-              on_token, on_prefill, work.token_constraint)
+              on_token, on_prefill, work.cache_plan,
+              work.token_constraint)
         : scheduler.generate(
               work.prompt, work.sampling, on_token, on_prefill,
               work.cache_plan, work.token_constraint);

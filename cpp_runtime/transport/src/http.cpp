@@ -980,7 +980,6 @@ int run_mfq_http_transport(
                         "the model context window",
                         "max_tokens");
                 }
-                work.cache_plan.stable_prefix_tokens = 0;
             }
             const std::string id = request_id("run-");
             const int64_t created = unix_time_seconds();

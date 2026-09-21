@@ -57,7 +57,7 @@ def test_prefill_speed_uses_cuda_events_around_only_the_first_model_eval() -> No
     assert "const int64_t token = next.template item<int64_t>();" in RUNTIME
     assert "const double prefill_ms = prefill_timer.elapsed_ms();" in RUNTIME
     assert "on_prefill(MfqPrefillTiming{" in RUNTIME
-    assert "prompt.size() - reused_tokens,\n                prefill_ms,\n                0.0,\n                prefill_ms" in RUNTIME
+    assert "prompt.size() - reused_tokens,\n                prefill_ms,\n                multimodal_ms,\n                prefill_ms + multimodal_ms" in RUNTIME
 
     sample = RUNTIME.split(
         "static mfq_tensor_backend::Tensor sample_token(", 1
@@ -83,15 +83,15 @@ def test_prefill_speed_uses_cuda_events_around_only_the_first_model_eval() -> No
     assert '{"prefill_ms", values.prefill_ms}' in SERVER
 
 
-def test_studio_displays_native_multimodal_prefill_without_media_preparation() -> None:
+def test_studio_prefers_runtime_prefill_metrics_over_ttft() -> None:
     assert "model_prefill_ms?: number;" in API
     assert "complete_prefill_ms?: number;" in API
     assert "complete_prefill_tps?: number;" in API
     assert "function displayPrefillMetric" in APP
-    assert "const nativeMilliseconds = Number(metrics.ttft_ms);" in APP
+    assert "const nativeMilliseconds = Number(metrics.ttft_ms);" not in APP
     assert "const modelMilliseconds = Number(metrics.model_prefill_ms);" in APP
-    assert "tokensPerSecond: (tokens * 1000) / milliseconds" in APP
-    assert "? (tokens * 1000) / nativeMilliseconds" in APP
+    assert "return { milliseconds, tokensPerSecond: reported };" in APP
+    assert "? (tokens * 1000) / milliseconds" in APP
     assert "preferPositiveMetric(last?.ttft_ms, last?.complete_prefill_ms)" in APP
     assert "displayPrefillMetric(response?.performance)" in APP
     assert "const lastPrefill = displayPrefillMetric(last);" in APP

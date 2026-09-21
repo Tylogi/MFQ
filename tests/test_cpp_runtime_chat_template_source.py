@@ -132,7 +132,8 @@ def test_native_server_cancels_active_session_generation_per_token() -> None:
     assert "cancel_requested->load(std::memory_order_acquire)" in SERVER
     assert 'result.finish_reason = "cancelled"' in SERVER
     assert "!result.cancelled && !result.tool_calls.empty()" in SERVER
-    assert "work.cache_plan.stable_prefix_tokens = 0;" in SERVER
+    assert "work.cache_plan.stable_prefix_tokens = 0;" not in SERVER
+    assert "on_token, on_prefill, work.cache_plan" in SERVER
     assert "work.cache_plan = {};" not in SERVER
 
 

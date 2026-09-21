@@ -49,6 +49,7 @@ public:
         const MfqSamplingParams & sampling,
         const MfqTokenCallback & on_token,
         const MfqPrefillCallback & on_prefill,
+        const MfqPromptCachePlan & cache_plan,
         const MfqTokenConstraintPtr & token_constraint) const;
 
     bool supports_reload() const noexcept;

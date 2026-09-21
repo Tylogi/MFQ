@@ -66,16 +66,17 @@ def test_prepared_prompt_separates_semantic_and_cache_positions() -> None:
     assert "cache_positions.has_value()" in CUDA_APP
 
 
-def test_prepared_prompt_supports_mtp_but_disables_remaining_fast_paths() -> None:
+def test_prepared_prompt_supports_mtp_and_safe_session_reuse() -> None:
     assert 'rope_parameters.value("mrope_interleaved", false)' in QWEN_CONFIG
     assert "interleaved_order" in CUDA_APP
     assert "hidden_forward_prepared_chunked" in CUDA_APP
-    assert "model, full_ids, *prepared, prefill_chunk_size" in CUDA_APP
+    assert "prepared_offset + offset" in CUDA_APP
     assert "model.last_logits_prepared(*prepared)" not in CUDA_APP
     assert "mtp.step_positioned(" in CUDA_APP
     assert "cache_pos, cache_pos + tokens, pos.options()" in CUDA_APP
     assert "!transformed_prompt && mtp != nullptr" not in CUDA_APP
-    assert "transformed_prompt ? 0" in CUDA_APP
+    assert "transformed_prompt ? 0" not in CUDA_APP
+    assert "state.input_key = input_key" in CUDA_APP
     assert "!transformed_prompt && graph_enabled" in CUDA_APP
     assert "runtime_components.grid_vision->prepare(" in CUDA_APP
     assert "runtime_components.mtp.get()" in CUDA_APP

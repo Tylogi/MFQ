@@ -71,8 +71,8 @@ def test_stateless_text_requests_use_the_content_addressed_prefix_cache() -> Non
 def test_full_attention_session_state_copies_only_visible_linear_kv() -> None:
     assert "struct TextSessionState" in DECODE
     assert "supports_text_session_state" in DECODE
-    assert "saved.ring" in DECODE
-    assert "std::min<int64_t>(cache_pos, saved.capacity)" in DECODE
+    assert "state.ring" in DECODE
+    assert "std::min<int64_t>(cache_pos, state.capacity)" in DECODE
     assert "restore_text_session_state" in DECODE
 
 
@@ -97,8 +97,25 @@ def test_glm_dsa_session_state_preserves_mla_and_index_caches() -> None:
 
 def test_partial_stable_prefix_is_saved_before_generation_suffix() -> None:
     assert "stable_prefix_tokens < prompt.size()" in DECODE
-    assert "store_session_snapshot(stable_prefix_tokens)" in DECODE
+    assert "store_session_snapshot(std::vector<int64_t>(" in DECODE
     assert "tokens.size() > maximum_prefix_tokens" in DECODE
+
+
+def test_qwen_hybrid_and_mtp_session_state_are_restored_together() -> None:
+    assert "TextSessionStateKind::HybridAttention" in DECODE
+    assert "saved.convolution_state = linear->conv_state.clone()" in DECODE
+    assert "saved.recurrent_state = linear->gdn_state.clone()" in DECODE
+    assert "std::optional<MtpSessionState> mtp" in DECODE
+    assert "mtp->restore_session_state(*selected.mtp)" in DECODE
+    assert "prompt.size() - reused_tokens" in DECODE
+
+
+def test_multimodal_cache_keys_include_media_and_reuse_vision_output() -> None:
+    assert "state.input_key != input_key" in DECODE
+    assert "media.pixel_values.data()" in DECODE
+    assert "cached_vision_key_ == cache_key" in DECODE
+    assert "stable_prefix_tokens = transformed_prompt ? 0" not in DECODE
+    assert "work.cache_plan.stable_prefix_tokens = 0;" not in SERVER
 
 
 def test_session_cache_uses_exact_prefixes_and_reports_suffix_prefill() -> None:

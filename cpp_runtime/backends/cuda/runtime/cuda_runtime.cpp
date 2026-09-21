@@ -1111,18 +1111,19 @@ static mfq_tensor_backend::Tensor hidden_forward_prepared_chunked(
     const mfq_tensor_backend::Tensor& ids,
     const CudaPreparedPrompt& prepared,
     int64_t chunk_size,
-    mfq_tensor_backend::Tensor* raw_hidden = nullptr) {
+    mfq_tensor_backend::Tensor* raw_hidden = nullptr,
+    int64_t prepared_offset = 0) {
     MFQ_RUNTIME_CHECK(
-        chunk_size > 0 && prepared.transformed() &&
+        chunk_size > 0 && prepared.transformed() && prepared_offset >= 0 &&
             ids.dim() == 2 && ids.size(0) == 1 && ids.size(1) > 0 &&
             prepared.embeddings.defined() && prepared.positions.defined() &&
             prepared.embeddings.dim() == 3 &&
             prepared.embeddings.size(0) == 1 &&
-            prepared.embeddings.size(1) == ids.size(1) &&
+            prepared_offset + ids.size(1) <= prepared.embeddings.size(1) &&
             prepared.embeddings.size(2) == model.hidden_size() &&
             (prepared.positions.dim() == 1 ||
              prepared.positions.dim() == 2) &&
-            prepared.positions.size(-1) == ids.size(1),
+            prepared_offset + ids.size(1) <= prepared.positions.size(-1),
         "prepared CUDA prefill tensors disagree with prompt geometry");
     std::vector<mfq_tensor_backend::Tensor> raw_chunks;
     if (raw_hidden != nullptr) {
@@ -1135,8 +1136,10 @@ static mfq_tensor_backend::Tensor hidden_forward_prepared_chunked(
         mfq_tensor_backend::Tensor raw_chunk;
         hidden = model.hidden_forward_inputs(
             ids.narrow(1, offset, count).contiguous(),
-            prepared.embeddings.narrow(1, offset, count).contiguous(),
-            prepared.positions.narrow(-1, offset, count).contiguous(),
+            prepared.embeddings.narrow(
+                1, prepared_offset + offset, count).contiguous(),
+            prepared.positions.narrow(
+                -1, prepared_offset + offset, count).contiguous(),
             mfq_nullopt, nullptr, mfq_nullopt, true, mfq_nullopt,
             raw_hidden != nullptr ? &raw_chunk : nullptr);
         if (raw_hidden != nullptr) raw_chunks.push_back(std::move(raw_chunk));
@@ -1308,6 +1311,11 @@ make_cuda_paged_prefix_cache(
         std::move(config));
 }
 
+struct TextSessionRestore {
+    size_t tokens = 0;
+    mfq_tensor_backend::Tensor mtp_last_target_hidden;
+};
+
 class TextSessionCache {
 private:
     struct PagedBinding {
@@ -1318,8 +1326,12 @@ private:
 
 public:
     explicit TextSessionCache(
-            std::shared_ptr<mfq::cache::PagedPrefixCache> paged_cache = {})
-        : paged_cache_(std::move(paged_cache)) {
+            std::shared_ptr<mfq::cache::PagedPrefixCache> paged_cache = {},
+            bool supported = true,
+            int disabled_reason = 0)
+        : paged_cache_(std::move(paged_cache)),
+          supported_(supported),
+          disabled_reason_(disabled_reason) {
         const char * entries =
             std::getenv("MFQ_RUNTIME_MAX_KV_SESSIONS");
         if (entries != nullptr) {
@@ -1356,22 +1368,25 @@ public:
     }
 
     template <typename Model>
-    size_t restore_best(
+    TextSessionRestore restore_best(
             Model& model,
+            MtpModule* mtp,
             const std::string & requested_session,
             const std::vector<int64_t> & prompt,
-            size_t maximum_prefix_tokens) {
-        if (paged_cache_) {
-            return restore_paged(
+            size_t maximum_prefix_tokens,
+            const std::string& input_key = {}) {
+        if (!supported_) return {};
+        if (paged_cache_ && mtp == nullptr && input_key.empty()) {
+            return {restore_paged(
                 model,
                 requested_session,
                 prompt,
-                maximum_prefix_tokens);
+                maximum_prefix_tokens), {}};
         }
         if (requested_session.empty() || max_sessions_ == 0 ||
                 max_snapshots_per_session_ == 0 ||
                 max_bytes_ == 0 || !model.supports_text_session_state()) {
-            return 0;
+            return {};
         }
         ++queries_;
         std::string selected_session;
@@ -1379,10 +1394,15 @@ public:
         size_t selected_tokens = 0;
         for (const auto & [session_id, history] : states_) {
             for (size_t index = 0; index < history.size(); ++index) {
-                const auto & tokens = history[index].tokens;
+                const auto & state = history[index];
+                const auto & tokens = state.tokens;
                 if (tokens.empty() || tokens.size() >= prompt.size() ||
                         tokens.size() > maximum_prefix_tokens ||
                         tokens.size() < selected_tokens ||
+                        state.input_key != input_key ||
+                        (mtp != nullptr &&
+                         (!mtp->supports_session_state() ||
+                          !state.mtp.has_value())) ||
                         !std::equal(
                             tokens.begin(), tokens.end(), prompt.begin())) {
                     continue;
@@ -1398,10 +1418,16 @@ public:
                 }
             }
         }
-        if (selected_session.empty()) return 0;
+        if (selected_session.empty()) return {};
         auto & selected = states_.at(selected_session)[selected_snapshot];
         try {
             model.restore_text_session_state(selected);
+            TextSessionRestore restored{selected_tokens, {}};
+            if (mtp != nullptr) {
+                mtp->restore_session_state(*selected.mtp);
+                restored.mtp_last_target_hidden =
+                    selected.mtp->last_target_hidden;
+            }
             selected.last_used = ++clock_;
             ++hits_;
             hit_tokens_ += selected_tokens;
@@ -1413,21 +1439,24 @@ public:
                           << " prefill_tokens="
                           << prompt.size() - selected_tokens << std::endl;
             }
-            return selected_tokens;
+            return restored;
         } catch (const std::exception & error) {
             erase_snapshot(selected_session, selected_snapshot, "invalidate");
             model.reset(1);
+            if (mtp != nullptr) mtp->reset(1);
             std::cerr << "runtime_session_cache action=invalidate session="
                       << selected_session << " error=" << error.what()
                       << std::endl;
-            return 0;
+            return {};
         }
     }
 
     void store(
             const std::string & session_id,
             TextSessionState state) {
-        if (paged_cache_) {
+        if (!supported_) return;
+        if (paged_cache_ && state.input_key.empty() &&
+                !state.mtp.has_value()) {
             store_paged(session_id, state);
             return;
         }
@@ -1449,7 +1478,8 @@ public:
         auto previous = std::find_if(
             history.begin(), history.end(),
             [&](const TextSessionState & saved) {
-                return saved.tokens == state.tokens;
+                return saved.tokens == state.tokens &&
+                    saved.input_key == state.input_key;
             });
         if (previous != history.end()) {
             bytes_ -= previous->bytes;
@@ -1561,6 +1591,9 @@ public:
         if (paged_cache_) {
             const auto value = paged_cache_->metrics();
             return {
+                {"prefix_cache_supported", supported_ ? 1.0 : 0.0},
+                {"prefix_cache_disabled_reason",
+                    static_cast<double>(disabled_reason_)},
                 {"prefix_cache_queries", static_cast<double>(value.queries)},
                 {"prefix_cache_hits", static_cast<double>(value.hits)},
                 {"prefix_cache_hit_tokens", static_cast<double>(value.hit_tokens)},
@@ -1588,6 +1621,9 @@ public:
             };
         }
         return {
+            {"prefix_cache_supported", supported_ ? 1.0 : 0.0},
+            {"prefix_cache_disabled_reason",
+                static_cast<double>(disabled_reason_)},
             {"prefix_cache_queries", static_cast<double>(queries_.load())},
             {"prefix_cache_hits", static_cast<double>(hits_.load())},
             {"prefix_cache_hit_tokens", static_cast<double>(hit_tokens_.load())},
@@ -1936,6 +1972,8 @@ private:
     std::atomic<size_t> metric_tokens_{0};
     std::atomic<size_t> metric_bytes_{0};
     bool trace_ = false;
+    bool supported_ = true;
+    int disabled_reason_ = 0;
 };
 
 
@@ -1961,51 +1999,96 @@ static int32_t generate_tokens(
     PreparedPromptFactory<Model> prepare_prompt = {})
 {
     std::lock_guard<std::mutex> lock(model_mutex);
-    const auto prepared = prepare_prompt
-        ? prepare_prompt(model)
-        : std::optional<CudaPreparedPrompt>{};
+    std::optional<CudaPreparedPrompt> prepared;
+    double multimodal_ms = 0.0;
+    if (prepare_prompt) {
+        PrefillCudaTimer multimodal_timer;
+        prepared = prepare_prompt(model);
+        MFQ_CUDA_CHECK(cudaEventRecord(
+            multimodal_timer.finished_event(),
+            mfq_get_current_cuda_stream()));
+        multimodal_ms = multimodal_timer.elapsed_ms();
+    }
     if (prepared && prepared->token_ids != prompt) {
         throw std::invalid_argument(
             "prepared prompt token IDs disagree with the rendered prompt");
     }
     const bool transformed_prompt = prepared && prepared->transformed();
+    const std::string input_key = prepared ? prepared->cache_key : std::string{};
     if (mtp != nullptr) {
         mtp->last_stats = {};
         mtp->last_stats.available = true;
     }
     const char* mtp_reprefill = std::getenv("MFQ_RUNTIME_REPREFILL");
     const char* mtp_trace = std::getenv("MFQ_RUNTIME_TRACE_INCREMENTAL");
-    if (mtp != nullptr && sampling.enable_mtp && sampling.max_tokens > 1 &&
+    const bool use_mtp =
+        mtp != nullptr && sampling.enable_mtp && sampling.max_tokens > 1 &&
         mfq_token_constraint_supports_speculation(token_constraint) &&
         !(mtp_reprefill != nullptr && mtp_reprefill[0] == '1') &&
-        !(mtp_trace != nullptr && mtp_trace[0] == '1')) {
-        // Predictor state is not in the persistent session snapshot contract.
+        !(mtp_trace != nullptr && mtp_trace[0] == '1');
+    const size_t stable_prefix_tokens = std::min(
+        cache_plan.stable_prefix_tokens, prompt.size());
+    const bool cache_enabled =
+        stable_prefix_tokens > 0 &&
+        (!transformed_prompt || !input_key.empty()) &&
+        (!cache_plan.session_id.empty() ||
+         session_cache.persistent_prefix_enabled()) &&
+        model.supports_text_session_state();
+    const bool can_restore_mtp = use_mtp && mtp->supports_session_state();
+    const auto restored = cache_enabled && (!use_mtp || can_restore_mtp)
+        ? session_cache.restore_best(
+            model, use_mtp ? mtp : nullptr,
+            cache_plan.session_id, prompt, stable_prefix_tokens, input_key)
+        : TextSessionRestore{};
+    const size_t reused_tokens = restored.tokens;
+    if (reused_tokens == 0) {
+        model.reset(1);
+        if (use_mtp) mtp->reset(1);
+    }
+    if (use_mtp) {
         if constexpr (
                 Model::backbone == mfq::cuda::CudaBackbone::generic_qwen ||
                 Model::backbone == mfq::cuda::CudaBackbone::qwen4_exp ||
                 Model::backbone == mfq::cuda::CudaBackbone::glm5_next ||
                 Model::backbone == mfq::cuda::CudaBackbone::deepseek_v41) {
-            return run_mtp_generation<Model::backbone>(
-                model, *mtp, prompt, sampling, on_token, on_prefill,
+            std::vector<int64_t> history = prompt;
+            const auto tracking_callback = [&](int32_t token) {
+                const bool keep_going = !on_token || on_token(token);
+                if (keep_going) history.push_back(token);
+                return keep_going;
+            };
+            mfq_tensor_backend::Tensor last_target_hidden;
+            const int32_t generated = run_mtp_generation<Model::backbone>(
+                model, *mtp, prompt, sampling, tracking_callback, on_prefill,
                 prefill_chunk_size, token_constraint,
-                transformed_prompt ? &*prepared : nullptr);
+                transformed_prompt ? &*prepared : nullptr,
+                reused_tokens, restored.mtp_last_target_hidden,
+                &last_target_hidden, multimodal_ms);
+            if (cache_enabled && last_target_hidden.defined() &&
+                    model.cache_pos > 1 &&
+                    model.cache_pos <= static_cast<int64_t>(history.size())) {
+                try {
+                    history.resize(static_cast<size_t>(model.cache_pos));
+                    auto state = model.capture_text_session_state(history);
+                    state.input_key = input_key;
+                    state.mtp = mtp->capture_session_state(
+                        model.cache_pos, last_target_hidden);
+                    state.bytes += state.mtp->bytes;
+                    session_cache.store(
+                        cache_plan.session_id, std::move(state));
+                } catch (const std::exception& error) {
+                    std::cerr
+                        << "runtime_session_cache action=skip session="
+                        << cache_plan.session_id
+                        << " error=" << error.what() << std::endl;
+                }
+            }
+            return generated;
         }
         throw std::runtime_error(
             "MTP is unavailable for this causal LM type");
     }
     auto options = mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA);
-    const size_t stable_prefix_tokens = transformed_prompt ? 0 : std::min(
-        cache_plan.stable_prefix_tokens, prompt.size());
-    const bool cache_enabled =
-        !transformed_prompt && stable_prefix_tokens > 0 &&
-        (!cache_plan.session_id.empty() ||
-         session_cache.persistent_prefix_enabled()) &&
-        model.supports_text_session_state();
-    const size_t reused_tokens = cache_enabled
-        ? session_cache.restore_best(
-            model, cache_plan.session_id, prompt, stable_prefix_tokens)
-        : 0;
-    if (reused_tokens == 0) model.reset(1);
     auto full_ids = mfq_tensor_backend::tensor(prompt, options)
         .reshape({1, -1}).contiguous();
     auto ids = full_ids.narrow(
@@ -2025,18 +2108,17 @@ static int32_t generate_tokens(
         counts.zero_();
         sample_token_counts_add_cuda(counts, full_ids);
     }
-    const auto store_session_snapshot = [&](size_t token_count) {
+    const auto store_session_snapshot = [&](
+            const std::vector<int64_t>& snapshot_tokens) {
         if (!cache_enabled || model.cache_pos !=
-                static_cast<int64_t>(token_count)) {
+                static_cast<int64_t>(snapshot_tokens.size())) {
             return;
         }
         try {
-            std::vector<int64_t> snapshot_tokens(
-                prompt.begin(), prompt.begin() +
-                    static_cast<std::ptrdiff_t>(token_count));
+            auto state = model.capture_text_session_state(snapshot_tokens);
+            state.input_key = input_key;
             session_cache.store(
-                cache_plan.session_id,
-                model.capture_text_session_state(snapshot_tokens));
+                cache_plan.session_id, std::move(state));
         } catch (const std::exception & error) {
             std::cerr << "runtime_session_cache action=skip session="
                       << cache_plan.session_id
@@ -2045,33 +2127,36 @@ static int32_t generate_tokens(
     };
     auto sample_first_token = [&]() {
         PrefillCudaTimer prefill_timer;
-        if (cache_enabled && stable_prefix_tokens < prompt.size()) {
-            if (reused_tokens < stable_prefix_tokens) {
-                auto stable_suffix = full_ids.narrow(
-                    1, static_cast<int64_t>(reused_tokens),
-                    static_cast<int64_t>(
-                        stable_prefix_tokens - reused_tokens)).contiguous();
-                stable_suffix = prefill_tail(
-                    model, std::move(stable_suffix), prefill_chunk_size);
-                MfqOptional<mfq_tensor_backend::Tensor> stable_seq_len = mfq_nullopt;
-                if (!Model::is_minicpmo45 && model.cache_pos > 0 &&
-                        stable_suffix.size(1) == 1) {
-                    stable_seq_len = mfq_tensor_backend::full(
-                        {1}, model.cache_pos + 1, options);
-                }
-                (void)model.hidden_forward(
-                    stable_suffix, mfq_nullopt, stable_seq_len);
-            }
-            store_session_snapshot(stable_prefix_tokens);
-            ids = full_ids.narrow(
-                1, static_cast<int64_t>(stable_prefix_tokens),
-                static_cast<int64_t>(
-                    prompt.size() - stable_prefix_tokens)).contiguous();
-        }
         mfq_tensor_backend::Tensor next;
         if (transformed_prompt) {
-            auto hidden = hidden_forward_prepared_chunked(
-                model, full_ids, *prepared, prefill_chunk_size);
+            size_t begin = reused_tokens;
+            mfq_tensor_backend::Tensor hidden;
+            if (cache_enabled && stable_prefix_tokens < prompt.size()) {
+                if (begin < stable_prefix_tokens) {
+                    auto stable_ids = full_ids.narrow(
+                        1, static_cast<int64_t>(begin),
+                        static_cast<int64_t>(stable_prefix_tokens - begin))
+                        .contiguous();
+                    hidden = hidden_forward_prepared_chunked(
+                        model, stable_ids, *prepared, prefill_chunk_size,
+                        nullptr, static_cast<int64_t>(begin));
+                }
+                store_session_snapshot(std::vector<int64_t>(
+                    prompt.begin(), prompt.begin() +
+                        static_cast<std::ptrdiff_t>(stable_prefix_tokens)));
+                begin = stable_prefix_tokens;
+            }
+            if (begin < prompt.size()) {
+                auto remaining_ids = full_ids.narrow(
+                    1, static_cast<int64_t>(begin),
+                    static_cast<int64_t>(prompt.size() - begin)).contiguous();
+                hidden = hidden_forward_prepared_chunked(
+                    model, remaining_ids, *prepared, prefill_chunk_size,
+                    nullptr, static_cast<int64_t>(begin));
+            }
+            MFQ_RUNTIME_CHECK(
+                hidden.defined(),
+                "prepared CUDA prefill produced no hidden state");
             auto logits = model.lm_head.forward(
                 hidden.index({Slice(), -1, Slice()})
                     .to(mfq_tensor_backend::kFloat16).contiguous())
@@ -2082,6 +2167,31 @@ static int32_t generate_tokens(
             next = mfq::cuda::sample_logits(
                 sampler, std::move(logits), counts, token_constraint);
         } else {
+            if (cache_enabled && stable_prefix_tokens < prompt.size()) {
+                if (reused_tokens < stable_prefix_tokens) {
+                    auto stable_suffix = full_ids.narrow(
+                        1, static_cast<int64_t>(reused_tokens),
+                        static_cast<int64_t>(
+                            stable_prefix_tokens - reused_tokens)).contiguous();
+                    stable_suffix = prefill_tail(
+                        model, std::move(stable_suffix), prefill_chunk_size);
+                    MfqOptional<mfq_tensor_backend::Tensor> stable_seq_len = mfq_nullopt;
+                    if (!Model::is_minicpmo45 && model.cache_pos > 0 &&
+                            stable_suffix.size(1) == 1) {
+                        stable_seq_len = mfq_tensor_backend::full(
+                            {1}, model.cache_pos + 1, options);
+                    }
+                    (void)model.hidden_forward(
+                        stable_suffix, mfq_nullopt, stable_seq_len);
+                }
+                store_session_snapshot(std::vector<int64_t>(
+                    prompt.begin(), prompt.begin() +
+                        static_cast<std::ptrdiff_t>(stable_prefix_tokens)));
+                ids = full_ids.narrow(
+                    1, static_cast<int64_t>(stable_prefix_tokens),
+                    static_cast<int64_t>(
+                        prompt.size() - stable_prefix_tokens)).contiguous();
+            }
             ids = prefill_tail(
                 model, std::move(ids), prefill_chunk_size);
             next = sample_token(
@@ -2091,14 +2201,14 @@ static int32_t generate_tokens(
         const int64_t token = next.template item<int64_t>();
         const double prefill_ms = prefill_timer.elapsed_ms();
         if (stable_prefix_tokens == prompt.size()) {
-            store_session_snapshot(stable_prefix_tokens);
+            store_session_snapshot(prompt);
         }
         if (on_prefill) {
             on_prefill(MfqPrefillTiming{
                 prompt.size() - reused_tokens,
                 prefill_ms,
-                0.0,
-                prefill_ms});
+                multimodal_ms,
+                prefill_ms + multimodal_ms});
         }
         return std::make_pair(std::move(next), token);
     };
@@ -2106,6 +2216,14 @@ static int32_t generate_tokens(
     const bool reprefill = !transformed_prompt &&
         reprefill_env != nullptr && reprefill_env[0] == '1';
     std::vector<int64_t> history = prompt;
+    const auto store_live_history = [&]() {
+        if (model.cache_pos <= 0 ||
+                model.cache_pos > static_cast<int64_t>(history.size())) {
+            return;
+        }
+        store_session_snapshot(std::vector<int64_t>(
+            history.begin(), history.begin() + model.cache_pos));
+    };
     const char * trace_incremental_env =
         std::getenv("MFQ_RUNTIME_TRACE_INCREMENTAL");
     const bool trace_incremental =
@@ -2212,7 +2330,15 @@ static int32_t generate_tokens(
         const bool greedy = sampler.greedy();
         auto [first, first_token] = sample_first_token();
         int32_t generated = 1;
-        if (!on_token(first_token) || generated >= sampling.max_tokens) return generated;
+        if (!on_token(first_token)) {
+            store_live_history();
+            return generated;
+        }
+        history.push_back(first_token);
+        if (generated >= sampling.max_tokens) {
+            store_live_history();
+            return generated;
+        }
 
         graph_cache.ensure_compute_streams();
         MfqCudaGuard graph_device_guard(
@@ -2330,8 +2456,10 @@ static int32_t generate_tokens(
             const int64_t token = graph_cache.static_next.template item<int64_t>();
             ++generated;
             if (!on_token(token)) break;
+            history.push_back(token);
         }
         model.cache_pos += generated - 1;
+        store_live_history();
         return generated;
     }
 
@@ -2358,6 +2486,7 @@ static int32_t generate_tokens(
         if (has_penalties) sample_token_counts_add_cuda(counts, next.contiguous());
         ids = next.reshape({1, 1});
     }
+    store_live_history();
     return generated;
 }
 
@@ -4253,9 +4382,16 @@ int mfq::cuda::run_runtime(int argc, char ** argv) {
             std::mutex model_mutex;
             DecodeGraphCache decode_graph_cache(
                 inference_model.max_position_embeddings());
+            const bool session_cache_supported =
+                inference_model.supports_text_session_state() &&
+                continuous_batching == 0;
             TextSessionCache text_session_cache(
                 make_cuda_paged_prefix_cache(
-                    runtime_assets, inference_model));
+                    runtime_assets, inference_model),
+                session_cache_supported,
+                inference_model.supports_text_session_state()
+                    ? (continuous_batching == 0 ? 0 : 2)
+                    : 1);
             std::unique_ptr<
                 mfq::cuda::continuous::CudaContinuousBatcher>
                 continuous_batcher;
@@ -4298,6 +4434,7 @@ int mfq::cuda::run_runtime(int argc, char ** argv) {
                         const MfqSamplingParams & sampling,
                         const MfqTokenCallback & on_token,
                         const MfqPrefillCallback & on_prefill,
+                        const MfqPromptCachePlan &,
                         const MfqTokenConstraintPtr & token_constraint) {
                         return generate_multimodal_tokens(
                             *runtime_components.minicpmo,
@@ -4316,11 +4453,12 @@ int mfq::cuda::run_runtime(int argc, char ** argv) {
                         const MfqSamplingParams& sampling,
                         const MfqTokenCallback& on_token,
                         const MfqPrefillCallback& on_prefill,
+                        const MfqPromptCachePlan& cache_plan,
                         const MfqTokenConstraintPtr& token_constraint) {
                         return generate_tokens<Model>(
                             inference_model, model_mutex, decode_graph_cache,
                             text_session_cache, prompt, sampling, on_token,
-                            on_prefill, {}, token_constraint,
+                            on_prefill, cache_plan, token_constraint,
                             continuous_batching == 0
                                 ? runtime_components.mtp.get()
                                 : nullptr,
