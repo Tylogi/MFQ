@@ -113,6 +113,47 @@ def test_real_weight_gate_exercises_join_and_compaction():
     assert '" prompt_lengths=193,17 split_k=1"' in BATCHING
 
 
+def test_contention_benchmark_uses_the_real_batcher_and_reports_latency():
+    assert '"--bench-continuous-batching"' in DECODE
+    assert '"--bench-continuous-batching-reps"' in DECODE
+    assert '"--bench-continuous-prefill-tokens"' in DECODE
+    assert '"--bench-continuous-baseline-tokens"' in DECODE
+    assert "const bool conflicting_execution_mode" in DECODE
+    assert "MFQ_RUNTIME_CHECK(!conflicting_execution_mode" in DECODE
+    assert "!check_linear.empty()" in DECODE
+    assert "check_backend_bf16_add || check_backend_argmax" in DECODE
+    assert "compare_mma_decode || compare_nvq_vec4" in DECODE
+    assert "prefill_repeat > 0 || compare_mma_attention" in DECODE
+    assert "--prefill-chunk-size N --gen N --ctx-size N" in DECODE
+    assert "run_qwen_continuous_batching_benchmark(" in DECODE
+    assert "CudaContinuousBatcher batcher(" in DECODE
+    assert "batcher.submit(" in DECODE
+    assert "a_timestamps.push_back(now)" in DECODE
+    assert "b_submit_started = Clock::now()" in DECODE
+    assert "last > b_submit_started && first < *b_prefill_callback" in DECODE
+    assert "metrics_after = qwen_continuous_benchmark_metrics(batcher)" in DECODE
+    b_thread = DECODE.index("std::thread b_thread")
+    metrics_before = DECODE.index("metrics_before =", b_thread)
+    submit_started = DECODE.index("b_submit_started =", metrics_before)
+    b_submit = DECODE.index("(void)batcher.submit(", submit_started)
+    metrics_after = DECODE.index("metrics_after =", b_submit)
+    assert b_thread < metrics_before < submit_started < b_submit < metrics_after
+    for window in ("baseline", "contended"):
+        for percentile in ("p50", "p95", "p99", "max"):
+            assert f"{window}_{percentile}_itl_ms=" in DECODE
+    assert "b_ttft_ms=" in DECODE
+    assert "metric_deltas" in DECODE
+    assert "continuous_batching_prefill_chunks" in DECODE
+    assert "continuous_batching_prefill_yields" in DECODE
+    assert "continuous_batching_interleaved_admissions" in DECODE
+    assert "continuous_batching_cuda_graph_captures" in DECODE
+    assert "continuous_batching_cuda_graph_replays" in DECODE
+    assert "paged_kv_table_updates" in DECODE
+    assert '" active_decode_batch=1"' in DECODE
+    assert "output differs from serial greedy oracle" in DECODE
+    assert '"--contended-prefill-chunk-size"' not in DECODE
+
+
 def test_linear_attention_uses_the_canonical_nint_operator():
     assert "nint_matmul_ws_cuda" in DECODE
     assert "MFQ_LINEAR_ATTN_SMALL_M_QX_REUSE" not in DECODE

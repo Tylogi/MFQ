@@ -2356,6 +2356,7 @@ static int32_t generate_server_tokens(
 }
 
 #include "qwen_continuous_batching.h"
+#include "qwen_continuous_batching_benchmark.h"
 
 // Real-weight correctness gate; does not require a tokenizer or start a server.
 // It calls the same MTP generator used by the server, with synthetic token IDs.
@@ -3140,6 +3141,9 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
         int gen = 16;
         std::string bench_qwen35_mtp;
         int bench_qwen35_mtp_reps = 3;
+        int bench_continuous_batching_reps = 5;
+        int64_t bench_continuous_prefill_tokens = 8192;
+        int bench_continuous_baseline_tokens = 8;
         int cpu_threads = 0;
         int server_port = 8080;
         int continuous_batching = 0;
@@ -3206,6 +3210,7 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
         bool check_text_session_state = false;
         bool check_qwen35_mtp = false;
         bool check_continuous_batching = false;
+        bool bench_continuous_batching = false;
         bool check_flash_next = false;
         bool check_flash_next_mtp = false;
         bool compare_dsv4_hc_ops = false;
@@ -3346,6 +3351,16 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
             else if (a == "--check-flash-next-mtp") check_flash_next_mtp = true;
             else if (a == "--bench-qwen35-mtp" && i + 1 < argc) bench_qwen35_mtp = argv[++i];
             else if (a == "--bench-qwen35-mtp-reps" && i + 1 < argc) bench_qwen35_mtp_reps = std::stoi(argv[++i]);
+            else if (a == "--bench-continuous-batching") bench_continuous_batching = true;
+            else if (a == "--bench-continuous-batching-reps" && i + 1 < argc) {
+                bench_continuous_batching_reps = std::stoi(argv[++i]);
+            }
+            else if (a == "--bench-continuous-prefill-tokens" && i + 1 < argc) {
+                bench_continuous_prefill_tokens = std::stoll(argv[++i]);
+            }
+            else if (a == "--bench-continuous-baseline-tokens" && i + 1 < argc) {
+                bench_continuous_baseline_tokens = std::stoi(argv[++i]);
+            }
             else if (a == "--compare-dsv4-hc-ops") compare_dsv4_hc_ops = true;
             else if (a == "--compare-dsv4-hc-model") compare_dsv4_hc_model = true;
             else parsed_option = false;
@@ -3478,7 +3493,8 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
             else if (a == "--compare-nvq-vec4" || a == "--compare-niq-vec4") compare_nvq_vec4 = true;
             else {
                 std::cerr << "usage: mfq-decode --model MODEL_PATH [--config config.json] "
-                             "(--ids 1,2,3 --gen 128 | --check-qwen35-mtp | --check-continuous-batching | --bench-qwen35-mtp ordinary|mtp | --server "
+                             "(--ids 1,2,3 --gen 128 | --check-qwen35-mtp | --check-continuous-batching | --bench-qwen35-mtp ordinary|mtp | "
+                             "--bench-continuous-batching [--bench-continuous-batching-reps N --bench-continuous-prefill-tokens N --bench-continuous-baseline-tokens N --prefill-chunk-size N --gen N --ctx-size N] | --server "
                              "[--host 127.0.0.1 --port 8080 --ctx-size 32768 --model-name name --tokenizer tokenizer.gguf "
                              "--continuous-batching 8 --prefill-chunk-size 2048 "
                              "--tensor-parallel 0,1 --tensor-split 1,1 "
@@ -3494,6 +3510,33 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
                              "[--kl-save-logits-f16 PATH])\n";
                 return 2;
             }
+        }
+        if (bench_continuous_batching) {
+            const bool conflicting_execution_mode =
+                check_backend_bf16_add || check_backend_argmax ||
+                !check_linear_cpu.empty() || !check_linear.empty() ||
+                !check_tp_linear.empty() || !check_ep_moe.empty() ||
+                !check_linear_group.empty() || !check_q8_embedding.empty() ||
+                !check_gdn_input.empty() || !check_linear_conv_input.empty() ||
+                check_gemma_geglu_layer >= 0 || check_mfq_container ||
+                check_runtime_assets || check_moe_layer >= 0 ||
+                !check_mfe_tensor.empty() || !check_dsv4_output_a.empty() ||
+                check_attention_decode > 0 || check_gemma4_swa ||
+                check_glm_dsa || check_dsv4_attention || check_dsv4_hc ||
+                check_deepseek_v41 || check_text_session_state ||
+                !minicpmo_duplex_input_prefix.empty() || minicpmo_eval_batch ||
+                !minicpmo_input_prefix.empty() || server_mode ||
+                check_qwen35_mtp || check_continuous_batching ||
+                check_flash_next || check_flash_next_mtp ||
+                !bench_qwen35_mtp.empty() || !ids_arg.empty() ||
+                !ids_file.empty() || !kl_base.empty() ||
+                !prefill_sweep_arg.empty() || compare_dsv4_hc_ops ||
+                compare_dsv4_hc_model || !block_trace_reference.empty() ||
+                !block_trace_output.empty() || compare_decode_splitk ||
+                compare_mma_decode || compare_nvq_vec4 ||
+                prefill_repeat > 0 || compare_mma_attention;
+            MFQ_RUNTIME_CHECK(!conflicting_execution_mode,
+                "continuous batching benchmark cannot combine execution modes");
         }
         if (cpu_threads_set && cpu_threads <= 0) {
             throw std::runtime_error("--threads must be positive");
@@ -3865,12 +3908,14 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
         }
         if (model_path.empty() ||
             (!server_mode && !check_qwen35_mtp &&
-                !check_continuous_batching && !check_flash_next &&
+                !check_continuous_batching && !bench_continuous_batching &&
+                !check_flash_next &&
                 !check_flash_next_mtp && bench_qwen35_mtp.empty() &&
                 ids_arg.empty() && ids_file.empty() &&
                 kl_base.empty() && prefill_sweep_arg.empty())) {
             std::cerr << "usage: mfq-decode --model MODEL_PATH [--config config.json] "
-                         "(--ids 1,2,3 --gen 128 | --check-qwen35-mtp | --check-continuous-batching | --bench-qwen35-mtp ordinary|mtp | --minicpmo-eval-batch "
+                         "(--ids 1,2,3 --gen 128 | --check-qwen35-mtp | --check-continuous-batching | --bench-continuous-batching "
+                         "[--bench-continuous-batching-reps N --bench-continuous-prefill-tokens N --bench-continuous-baseline-tokens N --prefill-chunk-size N --gen N --ctx-size N] | --bench-qwen35-mtp ordinary|mtp | --minicpmo-eval-batch "
                          "[--minicpmo-eval-vision-batch-size 16] | --server "
                          "[--host 127.0.0.1 --port 8080 --ctx-size 32768 --model-name name --tokenizer tokenizer.gguf "
                          "--api-key key] | --kl-base reference.bin "
@@ -3912,6 +3957,16 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
                 throw std::runtime_error(
                     "continuous batching check requires --ctx-size >= 32");
             }
+            std::cout << std::unitbuf;
+        }
+        if (bench_continuous_batching) {
+            if (context_size == 0) context_size = 16384;
+            MFQ_RUNTIME_CHECK(
+                bench_continuous_batching_reps > 0 &&
+                    bench_continuous_batching_reps <= 100 &&
+                    bench_continuous_prefill_tokens > prefill_chunk_size &&
+                    bench_continuous_baseline_tokens >= 2,
+                "continuous batching benchmark requires reps1-100, a split prefill, and baseline>=2");
             std::cout << std::unitbuf;
         }
         if (!cpu_offload_layers_arg.empty()) {
@@ -4116,6 +4171,19 @@ int mfq::cuda::run_decode(int argc, char ** argv) {
             }
             throw std::runtime_error(
                 "continuous batching requires Qwen35CausalLm");
+        }
+        if (bench_continuous_batching) {
+            if constexpr (
+                    Backbone == mfq::cuda::CudaBackbone::generic_qwen) {
+                return mfq::cuda::continuous::
+                    run_qwen_continuous_batching_benchmark(
+                        model, prefill_chunk_size, gen,
+                        bench_continuous_prefill_tokens,
+                        bench_continuous_baseline_tokens,
+                        bench_continuous_batching_reps);
+            }
+            throw std::runtime_error(
+                "continuous batching benchmark requires Qwen35CausalLm");
         }
         if (check_flash_next) {
             if constexpr (
