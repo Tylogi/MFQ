@@ -20,6 +20,12 @@ target_include_directories(mfq-native-tensor-test PRIVATE
 target_compile_features(mfq-native-tensor-test PRIVATE cxx_std_20)
 add_test(NAME mfq-native-tensor-test COMMAND mfq-native-tensor-test)
 
+add_executable(mfq-paged-kv-allocator-test
+    mfq_paged_kv_allocator_test.cpp
+)
+target_compile_features(mfq-paged-kv-allocator-test PRIVATE cxx_std_17)
+add_test(NAME mfq-paged-kv-allocator-test COMMAND mfq-paged-kv-allocator-test)
+
 function(mfq_add_core_test target source)
     add_executable(${target} ${source})
     target_link_libraries(${target} PRIVATE mfq-core)

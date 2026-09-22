@@ -10,6 +10,7 @@ import pytest
 from gguf import GGUFReader
 
 from mfq.architectures.hf_config import load_hf_model_config
+from mfq.architectures.tensor_schema import canonical_source_tensor_map
 from mfq.formats.assets import (
     HF_GENERATION_CONFIG_ASSET,
     HF_SOURCE_MAP_ASSET,
@@ -259,6 +260,80 @@ def test_native_hf_source_view_comes_from_registered_schema(
         )
     }
     assert graph["canonical_naming"]["namespace"] == "mfq.tensor"
+
+
+@pytest.mark.parametrize(
+    ("source_suffix", "canonical_suffix"),
+    [
+        (".weight_scale_inv", ".weight_scale"),
+        (".weight_scale", ".weight_scale"),
+        (".weight_scale_2", ".weight_scale_2"),
+        (".scale", ".weight_scale"),
+    ],
+)
+def test_native_hf_source_map_completes_scale_companions(
+    source_suffix: str,
+    canonical_suffix: str,
+) -> None:
+    source_base = "model.language_model.layers.0.linear_attn.in_proj_z"
+    canonical_base = "model.block.0.linear_attention.gate"
+
+    assert canonical_source_tensor_map(
+        {"model_type": "qwen3_5", "num_hidden_layers": 1},
+        [source_base + ".weight", source_base + source_suffix],
+    ) == {
+        canonical_base + ".weight": source_base + ".weight",
+        canonical_base + canonical_suffix: source_base + source_suffix,
+    }
+
+
+def test_native_hf_source_map_does_not_claim_orphan_scale() -> None:
+    source = (
+        "model.language_model.layers.0.linear_attn.in_proj_z.weight_scale_inv"
+    )
+
+    assert canonical_source_tensor_map(
+        {"model_type": "qwen3_5", "num_hidden_layers": 1},
+        [source],
+    ) == {}
+
+
+def test_native_hf_asset_maps_qwen_fp8_scale_companion(tmp_path: Path) -> None:
+    model = tmp_path / "Qwen3.8-27B-FP8"
+    source_base = "model.language_model.layers.0.linear_attn.in_proj_z"
+    _hf_fixture(model, tensor_name=source_base + ".weight")
+    header = json.dumps(
+        {
+            source_base + ".weight": {
+                "dtype": "F8_E4M3",
+                "shape": [128, 128],
+                "data_offsets": [0, 16384],
+            },
+            source_base + ".weight_scale_inv": {
+                "dtype": "BF16",
+                "shape": [1, 1],
+                "data_offsets": [16384, 16386],
+            },
+        },
+        separators=(",", ":"),
+    ).encode()
+    with (model / "model.safetensors").open("wb") as stream:
+        stream.write(struct.pack("<Q", len(header)))
+        stream.write(header)
+        stream.write(bytes(16386))
+
+    environment = native_hf_asset_environment(model, tmp_path / "assets")
+    asset_root = Path(environment["MFQ_RUNTIME_ASSET_DIRECTORY"])
+    source_map = json.loads(
+        (asset_root / HF_SOURCE_MAP_ASSET.removeprefix("__mfq_asset__/")).read_text()
+    )
+
+    assert source_map["canonical_to_source"] == {
+        "model.block.0.linear_attention.gate.weight": source_base + ".weight",
+        "model.block.0.linear_attention.gate.weight_scale": (
+            source_base + ".weight_scale_inv"
+        ),
+    }
 
 
 @pytest.mark.parametrize(

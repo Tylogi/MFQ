@@ -1,6 +1,5 @@
 #include "mfq_cuda_paged_kv.h"
 #include "mfq_native_tensor.h"
-#include "../runtime/paged_kv_allocator.h"
 
 #include <cuda_runtime_api.h>
 
@@ -28,31 +27,6 @@ std::vector<float> float_values(const Tensor & tensor) {
         .contiguous();
     return std::vector<float>(
         host.data_ptr<float>(), host.data_ptr<float>() + host.numel());
-}
-
-void check_allocator() {
-    using mfq::cuda::continuous::PagedKvPageAllocator;
-    PagedKvPageAllocator allocator(8);
-    auto first = allocator.allocate(3);
-    require(first == std::vector<std::int32_t>({0, 1, 2}),
-        "Paged KV allocator did not issue monotonic pages");
-    allocator.release({1});
-    auto reused = allocator.allocate(1);
-    require(reused == std::vector<std::int32_t>({1}) &&
-        allocator.reuse_count() == 1 && allocator.live_pages() == 3,
-        "Paged KV allocator did not reuse a retired page");
-    bool rejected = false;
-    try {
-        allocator.release({7});
-    } catch (const std::logic_error &) {
-        rejected = true;
-    }
-    require(rejected && allocator.live_pages() == 3,
-        "Paged KV allocator accepted an invalid release");
-    allocator.release({0, 2, 1});
-    require(allocator.live_pages() == 0 &&
-        allocator.peak_live_pages() == 3,
-        "Paged KV allocator accounting mismatch");
 }
 
 void check_kernels() {
@@ -208,7 +182,6 @@ int main() {
         (void)cudaGetLastError();
         return 77;
     }
-    check_allocator();
     check_kernels();
     std::cout << "paged_kv_test PASS page_size=4 chunks=2 gqa=4 split=1\n";
     return 0;

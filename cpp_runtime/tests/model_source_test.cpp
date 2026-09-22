@@ -110,9 +110,16 @@ void write_hf_mxfp8(const std::filesystem::path& root) {
     stream.write(payload.data(), static_cast<std::streamsize>(payload.size()));
 }
 
-void write_hf_fp8_128(const std::filesystem::path& root) {
+void write_hf_fp8_128(
+    const std::filesystem::path& root,
+    bool explicit_source_map = false) {
     std::filesystem::create_directories(root);
     std::ofstream(root / "config.json") << R"({"model_type":"qwen3_5"})";
+    if (explicit_source_map) {
+        std::filesystem::create_directories(root / ".mfq-assets" / "hf");
+        std::ofstream(root / ".mfq-assets" / "hf" / "source_tensor_map.json")
+            << R"({"schema":"mfq.hf-source-map","version":1,"canonical_to_source":{"model.block.0.linear_attention.gate.weight":"block.weight","model.block.0.linear_attention.gate.weight_scale":"block.weight_scale_inv"}})";
+    }
     const std::string header =
         R"({"block.weight":{"dtype":"F8_E4M3","shape":[128,128],"data_offsets":[0,16384]},"block.weight_scale_inv":{"dtype":"BF16","shape":[1,1],"data_offsets":[16384,16386]}})";
     std::ofstream stream(root / "model.safetensors", std::ios::binary);
@@ -148,6 +155,7 @@ int main() {
         write_hf(hf_path);
         write_hf_mxfp8(root / "hf-mxfp8");
         write_hf_fp8_128(root / "hf-fp8-128");
+        write_hf_fp8_128(root / "hf-fp8-128-explicit", true);
 
         mfq::MfqModelSource mfq_source(mfq_path);
         mfq::HfModelSource hf_source(hf_path);
@@ -250,6 +258,19 @@ int main() {
                     std::to_integer<unsigned char>(
                         fp8_128_bytes[fp8_128_layout.scales + 1]) == 0x3f,
                 "lossless FP8-128SQ payload differs from HF source bytes");
+
+        mfq::HfModelSource fp8_128_explicit_source(
+            root / "hf-fp8-128-explicit");
+        const auto* fp8_128_explicit = fp8_128_explicit_source.find_tensor(
+            "model.block.0.linear_attention.gate.weight");
+        require(fp8_128_explicit != nullptr &&
+                    fp8_128_explicit->dtype == "FP8-128SQ" &&
+                    fp8_128_explicit->stored_dtype == "FP8-128SQ" &&
+                    fp8_128_explicit->nbytes == 16734,
+                "explicit HF source map did not bind block FP8 scale");
+        require(fp8_128_explicit_source.find_tensor(
+                    "model.block.0.linear_attention.gate.weight_scale") == nullptr,
+                "explicit block FP8 scale leaked into tensor enumeration");
 
         mfq::HfModelSource mxfp8_source(root / "hf-mxfp8");
         for (const auto& [name, nbytes] :

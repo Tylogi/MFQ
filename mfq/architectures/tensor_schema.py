@@ -361,6 +361,31 @@ def source_runtime_assets(
     return tuple(registration.source_asset_builder(Path(root), config))
 
 
+_SCALE_COMPANION_SUFFIXES = (
+    (".weight_scale_inv", ".weight_scale"),
+    (".weight_scale_2", ".weight_scale_2"),
+    (".weight_scale", ".weight_scale"),
+    (".scale", ".weight_scale"),
+)
+
+
+def _canonical_scale_companion(
+    source_name: str,
+    resolved_sources: Mapping[str, TensorNameMapping | None],
+) -> str | None:
+    """Bind source scale metadata to an already mapped sibling weight."""
+
+    for source_suffix, canonical_suffix in _SCALE_COMPANION_SUFFIXES:
+        if not source_name.endswith(source_suffix):
+            continue
+        weight_source = source_name.removesuffix(source_suffix) + ".weight"
+        weight = resolved_sources.get(weight_source)
+        if weight is None or not weight.canonical_name.endswith(".weight"):
+            return None
+        return weight.canonical_name.removesuffix(".weight") + canonical_suffix
+    return None
+
+
 def canonical_source_tensor_map(
     config: Mapping[str, object],
     source_names: Sequence[str],
@@ -371,14 +396,24 @@ def canonical_source_tensor_map(
     supplies tensor semantics once; every storage backend receives the same
     canonical-to-source map without adding an architecture-specific loader.
     A source tensor that is already canonical wins over any compatibility
-    spelling for the same tensor.
+    spelling for the same tensor. Scale companions inherit the canonical name
+    of a mapped sibling weight, so explicit maps remain complete and closed.
     """
 
+    ordered_sources = sorted(set(source_names))
+    resolved_sources = {
+        source_name: map_source_tensor_name(source_name, config)
+        for source_name in ordered_sources
+    }
     mapped: list[tuple[str, str]] = []
-    for source_name in sorted(set(source_names)):
-        resolved = map_source_tensor_name(source_name, config)
+    for source_name in ordered_sources:
+        resolved = resolved_sources[source_name]
         if resolved is not None:
             mapped.append((resolved.canonical_name, source_name))
+            continue
+        companion = _canonical_scale_companion(source_name, resolved_sources)
+        if companion is not None:
+            mapped.append((companion, source_name))
 
     identities = {
         canonical: source
