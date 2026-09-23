@@ -396,10 +396,15 @@ def write_glm_fixture(path,config,weights,predictor=False):
          {**weights,MODEL_CONFIG_ASSET:json.dumps(config).encode(),MODEL_GRAPH_ASSET:json.dumps(graph).encode()})
 
 
+def diagnostics_binary(bridge):
+    path=Path(bridge).with_name("mfq-diagnostics")
+    return path if path.is_file() else path.parent.parent/path.name
+
+
 def run_glm_fixture(path):
     bridge=os.environ.get("MFQ_FLASH_NEXT_NATIVE_TEST")
     if not bridge:pytest.skip("MFQ_FLASH_NEXT_NATIVE_TEST required")
-    binary=Path(bridge).with_name("mfq-runtime")
+    binary=diagnostics_binary(bridge)
     return subprocess.run([str(binary),"--model",str(path),"--ctx-size","32","--check-flash-next"],
                           text=True,capture_output=True,timeout=90)
 
@@ -882,7 +887,7 @@ def mtp_fixture(family,layers=2):
 def run_mtp_fixture(path):
     bridge=os.environ.get("MFQ_FLASH_NEXT_NATIVE_TEST")
     if not bridge:pytest.skip("MFQ_FLASH_NEXT_NATIVE_TEST required")
-    return subprocess.run([str(Path(bridge).with_name("mfq-runtime")),"--model",str(path),"--ctx-size","32","--check-flash-next-mtp"],
+    return subprocess.run([str(diagnostics_binary(bridge)),"--model",str(path),"--ctx-size","32","--check-flash-next-mtp"],
         text=True,capture_output=True,timeout=90)
 
 

@@ -304,7 +304,7 @@ set_target_properties(mfq-cuda-runtime PROPERTIES
 )
 
 add_executable(mfq-runtime
-    ${MFQ_CUDA_ROOT}/apps/runtime_main.cpp
+    ${MFQ_CUDA_ROOT}/apps/runtime.cpp
 )
 target_link_libraries(mfq-runtime PRIVATE mfq-cuda-runtime)
 target_include_directories(mfq-runtime PRIVATE
@@ -315,10 +315,39 @@ set_target_properties(mfq-runtime PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
 )
 
+add_executable(mfq-diagnostics ${MFQ_CUDA_ROOT}/apps/diagnostics.cpp)
+target_link_libraries(mfq-diagnostics PRIVATE mfq-cuda-runtime)
+target_include_directories(mfq-diagnostics PRIVATE ${MFQ_CUDA_ROOT}/runtime)
+target_compile_features(mfq-diagnostics PRIVATE cxx_std_20)
+set_target_properties(mfq-diagnostics PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
+)
+
+add_executable(mfq-eval ${MFQ_CUDA_ROOT}/apps/eval.cpp)
+target_link_libraries(mfq-eval PRIVATE mfq-cuda-runtime)
+target_include_directories(mfq-eval PRIVATE ${MFQ_CUDA_ROOT}/runtime)
+target_compile_features(mfq-eval PRIVATE cxx_std_20)
+set_target_properties(mfq-eval PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
+)
+
 if(BUILD_TESTING)
     add_test(
         NAME mfq-deepseek-v41-runtime-check
-        COMMAND mfq-runtime --check-deepseek-v41)
+        COMMAND mfq-diagnostics --check-deepseek-v41)
+    add_test(NAME mfq-diagnostics-help COMMAND mfq-diagnostics --help)
+    add_test(NAME mfq-eval-help COMMAND mfq-eval kl --help)
+    add_test(NAME mfq-runtime-rejects-check
+        COMMAND mfq-runtime --check-mfq-container)
+    add_test(NAME mfq-runtime-rejects-kl
+        COMMAND mfq-runtime --kl-base reference.bin)
+    add_test(NAME mfq-diagnostics-rejects-kl
+        COMMAND mfq-diagnostics --kl-base reference.bin)
+    add_test(NAME mfq-eval-rejects-check
+        COMMAND mfq-eval kl --check-mfq-container)
+    set_tests_properties(mfq-runtime-rejects-check mfq-runtime-rejects-kl
+        mfq-diagnostics-rejects-kl mfq-eval-rejects-check
+        PROPERTIES WILL_FAIL TRUE)
 endif()
 
 option(MFQ_BUILD_TORCH_REFERENCE_RUNTIME
@@ -341,7 +370,7 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
     endif()
     find_package(Torch REQUIRED)
     add_executable(mfq-runtime-torch
-        ${MFQ_CUDA_ROOT}/apps/runtime_main.cpp
+        ${MFQ_CUDA_ROOT}/apps/runtime.cpp
         ${MFQ_CUDA_RUNTIME_OP_SOURCES}
         ${MFQ_CUDA_ROOT}/runtime/cuda_runtime.cpp
         ${MFQ_CUDA_ROOT}/runtime/cuda_execution.cpp

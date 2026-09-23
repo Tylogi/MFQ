@@ -360,7 +360,7 @@ function Build-NativeSidecar {
     )
     Invoke-Checked $Context.Tools.CMake @(
         "--build", $Context.NativeBuildDirectory,
-        "--target", "mfq-runtime",
+        "--target", "mfq-runtime", "mfq-diagnostics",
         "--config", "Release",
         "--parallel", $ParallelJobs
     )
@@ -373,6 +373,15 @@ function Build-NativeSidecar {
         Fail "native build did not create mfq-runtime.exe"
     }
     Copy-Item -LiteralPath $Context.NativeOutput.FullName -Destination $Context.NativeArtifact -Force
+    $diagnostics = Get-ChildItem -LiteralPath $Context.NativeBuildDirectory `
+        -Recurse -File -Filter "mfq-diagnostics.exe" |
+        Sort-Object -Property LastWriteTimeUtc -Descending |
+        Select-Object -First 1
+    if ($null -eq $diagnostics) {
+        Fail "native build did not create mfq-diagnostics.exe"
+    }
+    Copy-Item -LiteralPath $diagnostics.FullName -Destination `
+        (Join-Path $Context.SidecarDirectory "mfq-diagnostics-$($Context.TargetTriple).exe") -Force
 }
 
 function Stage-WindowsRuntime {

@@ -3233,7 +3233,11 @@ static int run_flash_next_check(Model& model) {
     return 0;
 }
 
-int mfq::cuda::run_runtime(int argc, char ** argv) {
+namespace {
+
+enum class CliMode { Runtime, Diagnostics, Eval };
+
+int run_cli(CliMode mode, int argc, char ** argv) {
     struct ModelParallelCollectiveCleanup {
         ~ModelParallelCollectiveCleanup() {
             g_model_parallel_collectives.reset();
@@ -3359,6 +3363,37 @@ int mfq::cuda::run_runtime(int argc, char ** argv) {
         bool cpu_threads_set = false;
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
+            if (a == "--help" || a == "-h") {
+                std::cout << (mode == CliMode::Runtime
+                    ? "usage: mfq-runtime --model MODEL_PATH (--transport stdio|http | --ids IDS --gen N)\n"
+                    : mode == CliMode::Diagnostics
+                    ? "usage: mfq-diagnostics [--model MODEL_PATH] --check-* | --bench-* | --compare-*\n"
+                    : "usage: mfq-eval kl --model MODEL_PATH --kl-base REFERENCE [--kl-* options]\n");
+                return 0;
+            }
+            const bool check_option = a.starts_with("--check-") ||
+                a.starts_with("--compare-") ||
+                a.starts_with("--dump-block-trace") ||
+                a == "--prefill-sweep" || a == "--prefill-sweep-reps" ||
+                a == "--prefill-repeat" || a.starts_with("--bench-") ||
+                a.starts_with("--minicpmo-eval-") || a == "--profile";
+            const bool kl_option = a.starts_with("--kl-");
+            const bool runtime_only = a == "--transport" || a == "--host" ||
+                a == "--port" || a == "--continuous-batching" ||
+                a == "--prefill-chunk-size" || a == "--model-name" ||
+                a == "--api-key" || a == "--sampling-profile" ||
+                (a.starts_with("--minicpmo-") && !a.starts_with("--minicpmo-eval-"));
+            if ((mode == CliMode::Runtime && (check_option || kl_option)) ||
+                (mode == CliMode::Diagnostics &&
+                    (runtime_only || (kl_option && a != "--kl-mmq"))) ||
+                (mode == CliMode::Eval &&
+                    (check_option || runtime_only || a == "--ids" ||
+                     a == "--ids-file" || a == "--gen"))) {
+                throw std::runtime_error(
+                    "option " + a + " belongs to a different command: " +
+                    (check_option ? "mfq-diagnostics" :
+                     kl_option ? "mfq-eval kl" : "mfq-runtime"));
+            }
             bool parsed_option = true;
             if (a == "--model" && i + 1 < argc) model_path = argv[++i];
             else if (a == "--config" && i + 1 < argc) config_path = argv[++i];
@@ -3623,23 +3658,36 @@ int mfq::cuda::run_runtime(int argc, char ** argv) {
             else if (a == "--compare-mma-decode-planned-len" && i + 1 < argc) compare_mma_decode_planned_len = std::stoi(argv[++i]);
             else if (a == "--compare-nvq-vec4" || a == "--compare-niq-vec4") compare_nvq_vec4 = true;
             else {
-                std::cerr << "usage: mfq-runtime --model MODEL_PATH [--config config.json] "
-                             "(--ids 1,2,3 --gen 128 | --check-qwen35-mtp | --check-continuous-batching | --bench-qwen35-mtp ordinary|mtp | --transport stdio|http "
-                             "[--host 127.0.0.1 --port 8080 --ctx-size 32768 --model-name name --tokenizer tokenizer.gguf "
-                             "--continuous-batching 8 --prefill-chunk-size 2048 "
-                             "--tensor-parallel 0,1 --tensor-split 1,1 "
-                             "--expert-parallel 0,1 --expert-split 1,1 "
-                             "--layer-parallel 0,1 --layer-split 1,1 "
-                             "--n-gpu-layers 60 --threads 32 --cpu-offload-layers 0-7,12 --moe-gpu-cache-gb 8 "
-                             "--moe-cache-profile profile.json "
-                             "--api-key key --sampling-profile profile.json] | --kl-base reference.bin "
-                             "[--kl-evaluator optimized|legacy --kl-chunks -1 "
-                             "--kl-score-count N --kl-n-batch N "
-                             "--kl-reference-n-batch N "
-                             "--kl-reference-n-ubatch N --kl-mmq default|fp16|nint8_1] "
-                             "[--kl-save-logits-f16 PATH])\n";
+                std::cerr << "unknown option: " << a << " (see --help)\n";
                 return 2;
             }
+        }
+        if (mode == CliMode::Eval && kl_base.empty()) {
+            std::cerr << "mfq-eval kl requires --kl-base (see --help)\n";
+            return 2;
+        }
+        if (mode == CliMode::Diagnostics &&
+                check_linear.empty() && check_linear_cpu.empty() &&
+                check_tp_linear.empty() && check_ep_moe.empty() &&
+                check_linear_group.empty() && check_q8_embedding.empty() &&
+                check_gdn_input.empty() && check_linear_conv_input.empty() &&
+                check_mfe_tensor.empty() && check_dsv4_output_a.empty() &&
+                check_moe_layer < 0 && check_gemma_geglu_layer < 0 &&
+                check_attention_decode <= 0 && !check_backend_bf16_add &&
+                !check_backend_argmax && !check_gemma4_swa && !check_glm_dsa &&
+                !check_dsv4_attention && !check_dsv4_hc &&
+                !check_deepseek_v41 && !check_text_session_state &&
+                !check_qwen35_mtp && !check_continuous_batching &&
+                !check_flash_next && !check_flash_next_mtp &&
+                !check_runtime_assets && !check_mfq_container &&
+                !compare_dsv4_hc_ops && !compare_dsv4_hc_model &&
+                !compare_mma_attention && !compare_decode_splitk &&
+                !compare_mma_decode && !compare_nvq_vec4 &&
+                block_trace_reference.empty() && block_trace_output.empty() &&
+                bench_qwen35_mtp.empty() && prefill_sweep_arg.empty() &&
+                prefill_repeat <= 0 && !profile && !minicpmo_eval_batch) {
+            std::cerr << "mfq-diagnostics requires a check or benchmark (see --help)\n";
+            return 2;
         }
         if (stdio_mode) {
             prepare_mfq_stdio_transport();
@@ -4013,21 +4061,10 @@ int mfq::cuda::run_runtime(int argc, char ** argv) {
                 context_size, minicpmo_tts_steps);
         }
         if (model_path.empty() ||
-            (!transport_mode && !check_qwen35_mtp &&
-                !check_continuous_batching && !check_flash_next &&
-                !check_flash_next_mtp && bench_qwen35_mtp.empty() &&
-                ids_arg.empty() && ids_file.empty() &&
-                kl_base.empty() && prefill_sweep_arg.empty())) {
-            std::cerr << "usage: mfq-runtime --model MODEL_PATH [--config config.json] "
-                         "(--ids 1,2,3 --gen 128 | --check-qwen35-mtp | --check-continuous-batching | --bench-qwen35-mtp ordinary|mtp | --minicpmo-eval-batch "
-                         "[--minicpmo-eval-vision-batch-size 16] | --transport stdio|http "
-                         "[--host 127.0.0.1 --port 8080 --ctx-size 32768 --model-name name --tokenizer tokenizer.gguf "
-                         "--api-key key] | --kl-base reference.bin "
-                         "[--kl-evaluator optimized|legacy --kl-chunks -1 "
-                         "--kl-score-count N --kl-n-batch N "
-                         "--kl-reference-n-batch N "
-                         "--kl-reference-n-ubatch N --kl-mmq default|fp16|nint8_1] "
-                         ")\n";
+            (mode == CliMode::Runtime && !transport_mode &&
+                ids_arg.empty() && ids_file.empty()) ||
+            (mode == CliMode::Eval && kl_base.empty())) {
+            std::cerr << "missing model or execution mode (see --help)\n";
             return 2;
         }
         if (context_size < 0) throw std::runtime_error("--ctx-size must be positive");
@@ -5111,4 +5148,18 @@ int mfq::cuda::run_runtime(int argc, char ** argv) {
         std::cerr << "error: " << e.what() << "\n";
         return 1;
     }
+}
+
+} // namespace
+
+int mfq::cuda::run_runtime(int argc, char ** argv) {
+    return run_cli(CliMode::Runtime, argc, argv);
+}
+
+int mfq::cuda::run_diagnostics(int argc, char ** argv) {
+    return run_cli(CliMode::Diagnostics, argc, argv);
+}
+
+int mfq::cuda::run_eval(int argc, char ** argv) {
+    return run_cli(CliMode::Eval, argc, argv);
 }

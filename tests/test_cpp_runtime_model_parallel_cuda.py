@@ -21,9 +21,11 @@ def model_parallel_fixture(
     binary_value = os.environ.get("MFQ_DECODE_NATIVE_TEST")
     if not binary_value:
         pytest.skip("MFQ_DECODE_NATIVE_TEST is required")
-    binary = Path(binary_value)
+    binary = Path(binary_value).with_name(
+        "mfq-diagnostics" + Path(binary_value).suffix
+    )
     if not binary.is_file():
-        pytest.skip(f"native CUDA runtime does not exist: {binary}")
+        pytest.skip(f"native CUDA diagnostics does not exist: {binary}")
 
     rng = np.random.default_rng(20260908)
     spec = NintSpec(4, 24, 6)

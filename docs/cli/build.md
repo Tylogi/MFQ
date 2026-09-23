@@ -51,8 +51,16 @@ paths:
 | Backend | Executable |
 | --- | --- |
 | Metal | `<repo>/build/cpp_runtime/metal/mfq-decode-metal` |
-| CUDA | `<repo>/build/cpp_runtime/mfq-runtime` |
-| CUDA on Windows | Usually `<repo>\build\cpp_runtime\mfq-runtime.exe`; multi-configuration generators may add `Release\` |
+| CUDA | `<repo>/build/cpp_runtime/mfq-runtime`, `mfq-diagnostics`, `mfq-eval` |
+| CUDA on Windows | Usually `<repo>\build\cpp_runtime\mfq-runtime.exe` (plus `mfq-diagnostics.exe`, `mfq-eval.exe`); multi-configuration generators may add `Release\` |
+
+`mfq-runtime` runs inference and service mode; CUDA checks and benchmarks use
+`mfq-diagnostics`, and KL evaluation uses `mfq-eval kl`:
+
+```shell
+mfq-diagnostics --check-deepseek-v41
+mfq-eval kl --model model.mfq --kl-base reference.bin
+```
 
 MFQ searches the build tree after compilation, so generators may place the
 executable in a configuration subdirectory.

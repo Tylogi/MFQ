@@ -122,6 +122,9 @@ def test_cuda_build_plan_is_native_and_does_not_import_or_configure_torch(
 
     command = " ".join(plan.configure_command)
     assert plan.target == "mfq-runtime"
+    assert plan.build_command[plan.build_command.index("--target") + 1 : -2] == (
+        "mfq-runtime", "mfq-diagnostics", "mfq-eval"
+    )
     assert "MFQ_BUILD_TORCH_REFERENCE_RUNTIME=OFF" in command
     assert "CMAKE_PREFIX_PATH" not in command
     assert "Python_EXECUTABLE" not in command
@@ -157,7 +160,7 @@ def test_native_cuda_runtime_compilation_units_do_not_include_torch() -> None:
     )
     source_block = cmake.split("set(MFQ_CUDA_KERNEL_SOURCES", 1)[1].split(")", 1)[0]
     sources = [
-        ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "runtime_main.cpp",
+        ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "runtime.cpp",
         ROOT / "cpp_runtime" / "backends" / "cuda" / "models" / "minicpmo45" / "minicpmo45_runtime.h",
         ROOT / "cpp_runtime" / "backends" / "cuda" / "models" / "minicpmo45" / "minicpmo45_runtime.cpp",
         *(

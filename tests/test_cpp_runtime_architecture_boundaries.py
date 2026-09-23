@@ -55,7 +55,7 @@ CUDA_MTP_HEADER = (
     ROOT / "cpp_runtime" / "backends" / "cuda" / "include" / "mfq_cuda_mtp.h"
 ).read_text(encoding="utf-8")
 CUDA_APP = (
-    ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "runtime_main.cpp"
+    ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "runtime.cpp"
 ).read_text(encoding="utf-8")
 CUDA_MODELS = ROOT / "cpp_runtime" / "backends" / "cuda" / "models"
 CUDA_RUNTIME = ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime"
