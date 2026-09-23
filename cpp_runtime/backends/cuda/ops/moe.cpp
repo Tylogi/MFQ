@@ -138,15 +138,6 @@ static MfeCpu unpack_mfe_impl(
                 throw std::runtime_error(
                     "MFE MXFP4 pool weight shape mismatch");
             }
-        } else if (!version1 && is_tpq_pq_dtype(pool.dtype)) {
-            pool.tpq = unpack_tpq_pq(pool.payload, pool.dtype);
-            const int expected_rows =
-                static_cast<int>(expert_count) * result.out_per_expert;
-            if (pool.tpq.out != expected_rows ||
-                    pool.tpq.neuron_len != result.neuron_len) {
-                throw std::runtime_error(
-                    "MFE TPQ-PQ pool weight shape mismatch");
-            }
         } else if (!version1 && pool.dtype == "NINT8-0") {
             pool.q8_zero = unpack_nint8_zero(pool.payload);
             const int expected_rows =
@@ -672,9 +663,6 @@ int64_t mixed_moe_storage_bytes(const MixedMoeRuntime & runtime) {
             bytes += tensor_storage_bytes(pool.fp8_sq.row_q);
             bytes += tensor_storage_bytes(
                 pool.fp8_sq.row_symbol_byte_offsets);
-        } else if (pool.family == MixedMoeFamily::Tpq) {
-            bytes += tensor_storage_bytes(pool.tpq.packed);
-            bytes += tensor_storage_bytes(pool.tpq.codebook);
         } else if (pool.family == MixedMoeFamily::Nvq) {
             bytes += tensor_storage_bytes(pool.nvq.indices_packed);
             bytes += tensor_storage_bytes(pool.nvq.aux_packed);
@@ -759,14 +747,6 @@ std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
                     pool.fp8_sq.neuron_len != cpu.neuron_len) {
                 throw std::runtime_error(
                     "mixed FP8-SQ cohort shape mismatch");
-            }
-        } else if (is_tpq_pq_dtype(source.dtype)) {
-            pool.family = MixedMoeFamily::Tpq;
-            pool.tpq = to_device_tpq(source.tpq, cuda);
-            if (pool.tpq.int4 || pool.tpq.out != expected_rows ||
-                    pool.tpq.neuron_len != cpu.neuron_len) {
-                throw std::runtime_error(
-                    "mixed TPQ-PQ cohort shape mismatch");
             }
         } else if (source.dtype == "NINT") {
             pool.family = MixedMoeFamily::Nint;
@@ -952,10 +932,6 @@ MfeWeight to_cuda_device_moe_expert_slice(
             pool.family = MixedMoeFamily::Fp8Sq;
             pool.fp8_sq = to_device_fp8_sq(
                 source.dtype, source.payload, true);
-        } else if (is_tpq_pq_dtype(source.dtype)) {
-            pool.family = MixedMoeFamily::Tpq;
-            pool.tpq = to_device_tpq(
-                select_tpq_cpu_rows(source.tpq, rows), true);
         } else if (source.dtype == "NEPQ") {
             pool.family = MixedMoeFamily::Nepq;
             auto parsed = unpack_nepq(
@@ -1048,14 +1024,6 @@ static Fp8SqWeight copy_cpu_fp8_sq_to_cuda(
     return result;
 }
 
-static TpqWeight copy_cpu_tpq_to_cuda(const TpqWeight & source) {
-    TpqWeight result = source;
-    result.packed = copy_cpu_weight_to_cuda(source.packed);
-    result.scales = copy_cpu_weight_to_cuda(source.scales);
-    result.codebook = copy_cpu_weight_to_cuda(source.codebook);
-    return result;
-}
-
 static NepqWeight copy_cpu_nepq_to_cuda(const NepqWeight & source) {
     NepqWeight result = source;
     result.indices_packed =
@@ -1107,8 +1075,6 @@ MfeWeight stage_cpu_mixed_moe(
                 source.mxfp4_sq);
         } else if (pool.family == MixedMoeFamily::Fp8Sq) {
             pool.fp8_sq = copy_cpu_fp8_sq_to_cuda(source.fp8_sq);
-        } else if (pool.family == MixedMoeFamily::Tpq) {
-            pool.tpq = copy_cpu_tpq_to_cuda(source.tpq);
         } else if (pool.family == MixedMoeFamily::Nvq) {
             pool.nvq = copy_cpu_nvq_to_cuda(source.nvq);
         } else {
@@ -1194,12 +1160,6 @@ mfq_tensor_backend::Tensor mfe_dense_reference(
         } else if (pool.dtype == "MXFP4") {
             dense_flat = dequant_mxfp4_cpu(pool.mxfp4)
                 .to(mfq_tensor_backend::kCUDA).contiguous();
-        } else if (is_tpq_pq_dtype(pool.dtype)) {
-            auto packed = to_device_tpq(pool.tpq, true);
-            dense_flat = tpq_pq_dequant_cuda(
-                packed.packed, packed.codebook,
-                packed.out, packed.neuron_len,
-                packed.vector_size, packed.index_bits);
         } else if (pool.dtype == "NEPQ") {
             auto packed = to_gpu_nepq(unpack_nepq(
                 pool.payload, pool.dtype, pool.runtime_payload));

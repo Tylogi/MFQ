@@ -7,7 +7,6 @@
 #include "moe.h"
 #include "nint.h"
 #include "vq.h"
-#include "../../legacy/tpq/tpq.h"
 
 #include "cuda_execution.h"
 #include "mfq_cuda_ops.h"
@@ -238,7 +237,6 @@ enum class QuantLinearKind {
     Mxfp4Sq,
     Fp8Sq,
     Mxfp8,
-    Tpq,
     Dense,
 };
 
@@ -253,7 +251,6 @@ struct QuantLinearShard {
     NvqWeight nvq;
     Mxfp4Weight mxfp4;
     Mxfp8Weight mxfp8;
-    TpqWeight tpq;
     mfq_tensor_backend::Tensor dense;
 };
 
@@ -265,7 +262,6 @@ struct QuantLinear {
     Mxfp4SqLinear mxfp4_sq;
     Fp8SqLinear fp8_sq;
     Mxfp8Linear mxfp8;
-    TpqLinear tpq;
     mfq_tensor_backend::Tensor dense;
     bool dense_small_m_rowwise = false;
     TensorParallelAxis tensor_parallel_axis =
@@ -284,7 +280,6 @@ struct QuantLinear {
     bool is_mxfp4_sq() const { return kind == QuantLinearKind::Mxfp4Sq; }
     bool is_fp8_sq() const { return kind == QuantLinearKind::Fp8Sq; }
     bool is_mxfp8() const { return kind == QuantLinearKind::Mxfp8; }
-    bool is_tpq() const { return kind == QuantLinearKind::Tpq; }
     bool is_dense() const { return kind == QuantLinearKind::Dense; }
 
     mfq_tensor_backend::Tensor forward_tensor_parallel_flat(
@@ -392,7 +387,6 @@ struct QuantLinear {
         if (is_mxfp4()) return mxfp4.forward(x);
         if (is_mxfp4_sq()) return mxfp4_sq.forward(x);
         if (is_fp8_sq()) return fp8_sq.forward(x);
-        if (is_tpq()) return tpq.forward(x);
         if (is_dense()) return forward_dense(x);
         return mxfp8.forward(x);
     }
@@ -482,7 +476,6 @@ struct QuantLinear {
         if (is_mxfp4()) return mxfp4.weight.out;
         if (is_mxfp4_sq()) return mxfp4_sq.weight.out;
         if (is_fp8_sq()) return fp8_sq.weight.out;
-        if (is_tpq()) return tpq.weight.out;
         if (is_dense()) return dense.size(0);
         return mxfp8.weight.out;
     }
@@ -493,7 +486,6 @@ struct QuantLinear {
         if (is_mxfp4()) return mxfp4.weight.neuron_len;
         if (is_mxfp4_sq()) return mxfp4_sq.weight.neuron_len;
         if (is_fp8_sq()) return fp8_sq.weight.neuron_len;
-        if (is_tpq()) return tpq.weight.neuron_len;
         if (is_dense()) return dense.size(1);
         return mxfp8.weight.neuron_len;
     }

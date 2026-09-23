@@ -123,7 +123,7 @@ Within one tensor, candidates sharing a `pool_key` must have identical
 precision descriptors and `pool_storage_bits`. Pool charges are scoped to
 that tensor.
 
-## Budget and TPQ-shape constraints
+## Budget and shape constraints
 
 Format: `mfq.ew-budget.v1`.
 
@@ -147,7 +147,7 @@ removing too much precision from Down.
   },
   "shape_constraints": [
     {
-      "name": "down-tpq-spikes",
+      "name": "down-spikes",
       "projection": "down",
       "peak_reference_min_bpw": 3.0,
       "peak_selected_min_bpw": 3.0,

@@ -1220,8 +1220,6 @@ int run_linear_check(
         ? &linear.fp8_sq.weight : nullptr;
     const Mxfp8Weight * mxfp8 = linear.is_mxfp8()
         ? &linear.mxfp8.weight : nullptr;
-    const TpqWeight * tpq = linear.is_tpq()
-        ? &linear.tpq.weight : nullptr;
     auto ww = quant_linear_reference_weight(linear);
     mfq_tensor_backend::Tensor ref_input = xh;
     if (gate_mode == 1) ref_input = xh * mfq_tensor_backend::sigmoid(gateh);
@@ -1248,10 +1246,6 @@ int run_linear_check(
         ? (double)mxfp4_sq->blob.numel()
         : fp8_sq != nullptr
         ? (double)fp8_sq->blob.numel()
-        : tpq != nullptr
-        ? (double)tpq->packed.numel() +
-          (double)tpq->scales.numel() * sizeof(mfq_half) +
-          (double)tpq->codebook.numel() * sizeof(float)
         : (double)mxfp8->values.numel() + (double)mxfp8->scales.numel();
     std::cout << "shape=" << y_ref.sizes() << "\n";
     if (nint != nullptr) {
@@ -1289,9 +1283,6 @@ int run_linear_check(
                   << fp8_sq->distribution_entropy
                   << " block=" << fp8_sq->block_rows
                   << "x" << fp8_sq->block_columns
-                  << " m=" << M << "\n";
-    } else if (tpq != nullptr) {
-        std::cout << "dtype=" << (tpq->int4 ? "TPQ-I4G64" : "TPQ-PQ")
                   << " m=" << M << "\n";
     } else {
         std::cout << "dtype=MXFP8 block=128x128 m=" << M << "\n";

@@ -894,21 +894,6 @@ MlxDeepseekV4Moe::MlxDeepseekV4Moe(
                 "DeepSeek-V4 streamed routed component "
                 "dimensions mismatch");
         }
-        legacy_tpq_stream_ =
-            expert_offload_->is_legacy_tpq(streamed_down_name_);
-        const auto same_stream_family = [&](const std::string& name) {
-            return expert_offload_->is_legacy_tpq(name)
-                == legacy_tpq_stream_;
-        };
-        const bool stream_family_matches = split_streamed
-            ? same_stream_family(streamed_gate_name_)
-                && same_stream_family(streamed_up_name_)
-            : same_stream_family(streamed_gate_up_name_);
-        if (!stream_family_matches) {
-            throw std::invalid_argument(
-                "DeepSeek-V4 cannot mix legacy TPQ and native MFE "
-                "within one routed projection set");
-        }
     } else {
         if (layer_ >= static_cast<std::size_t>(
                 config_.n_layers + config_.n_mtp_layers)) {
@@ -2235,36 +2220,6 @@ MlxDeepseekV4Moe::forward_branches(
                     Shape{start, 0},
                     Shape{end, routes});
             auto chunk_output = [&]() -> array {
-                if (legacy_tpq_stream_) {
-                    array routed_hidden = [&]() {
-                        if (!streamed_gate_name_.empty()) {
-                            auto gate_weight = expert_offload_->grouped(
-                                streamed_gate_name_, selected);
-                            auto up_weight = expert_offload_->grouped(
-                                streamed_up_name_, selected);
-                            return limited_swiglu_pair(
-                                gate_weight.routed_matmul(
-                                    chunk_source, chunk_ids),
-                                up_weight.routed_matmul(
-                                    chunk_source, chunk_ids),
-                                static_cast<float>(config_.swiglu_limit));
-                        }
-                        auto gate_weight = expert_offload_->grouped(
-                            streamed_gate_up_name_, selected);
-                        return moe_limited_swiglu_split(
-                            gate_weight.routed_matmul(
-                                chunk_source, chunk_ids),
-                            static_cast<float>(config_.swiglu_limit));
-                    }();
-                    auto down_weight = expert_offload_->grouped(
-                        streamed_down_name_, selected);
-                    auto down = down_weight.routed_matmul(
-                        routed_hidden, chunk_ids);
-                    return moe_weighted_reduce(
-                        down,
-                        chunk_weights);
-                }
-
                 std::vector<std::int32_t> global_to_local(
                     static_cast<std::size_t>(config_.n_experts) + 1,
                     -1);

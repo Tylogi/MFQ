@@ -2,7 +2,6 @@
 
 #include "mlx_fp8_sq.h"
 #include "mlx_mxfp4_sq.h"
-#include "mlx_tpq.h"
 #include "mlx_mx.h"
 #include "mlx_nint.h"
 #include "mlx_nint8_zero.h"
@@ -24,8 +23,6 @@ using MlxGroupedLinearWeightRef = std::variant<
     const MlxNintWeight*,
     const MlxNint8ZeroWeight*,
     const MlxVqWeight*,
-    const MlxTpqInt4Weight*,
-    const MlxTpqPqWeight*,
     const MlxFp8SqWeight*,
     const MlxMxfp4SqWeight*,
     const MlxMxWeight*,
@@ -89,7 +86,7 @@ public:
     // NINT projection groups bind the retained metadata streams directly.
     // Other production groups may bind each source array to a format-level
     // Metal dispatch; groups which exceed the direct buffer limit and contain
-    // VQ, TPQ, or MX are unsupported.
+    // VQ or MX are unsupported.
     bool uses_zero_copy_storage() const noexcept;
     std::size_t copied_packed_nbytes() const noexcept;
 

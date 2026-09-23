@@ -83,8 +83,6 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/rope.cu
     ${MFQ_CUDA_KERNEL_ROOT}/sampling.cu
     ${MFQ_CUDA_KERNEL_ROOT}/ssm_conv.cu
-    # Temporary old-artifact compatibility only; TPQ is not a forward format.
-    ${MFQ_CUDA_KERNEL_ROOT}/tpq_matmul.cu
 )
 
 add_library(mfq-cuda-native-kernels STATIC ${MFQ_CUDA_KERNEL_SOURCES})
@@ -259,7 +257,6 @@ set(MFQ_CUDA_RUNTIME_OP_SOURCES
     ${MFQ_CUDA_ROOT}/ops/nint.cpp
     ${MFQ_CUDA_ROOT}/ops/quant_linear.cpp
     ${MFQ_CUDA_ROOT}/ops/vq.cpp
-    ${MFQ_CUDA_ROOT}/legacy/tpq/tpq.cpp
 )
 
 add_library(mfq-cuda-runtime STATIC

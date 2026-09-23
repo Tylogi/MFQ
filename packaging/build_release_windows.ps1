@@ -2,7 +2,7 @@
 #
 # The release Python environment is isolated from development environments. It
 # contains only the base dependencies needed by `mfq serve`; training,
-# calibration, quantization, TPQ, MiniCPM-o, and PyTorch are not packaged.
+# Calibration, quantization, MiniCPM-o, and PyTorch are not packaged.
 # The script imports the Visual Studio environment and adds all required tools to
 # its own PATH, so it can be run from ordinary PowerShell.
 

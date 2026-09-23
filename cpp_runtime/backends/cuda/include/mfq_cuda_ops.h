@@ -352,35 +352,6 @@ mfq_tensor_backend::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
     mfq_tensor_backend::Tensor output, mfq_tensor_backend::Tensor ids_dst,
     mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
     mfq_tensor_backend::Tensor tile_experts);
-mfq_tensor_backend::Tensor tpq_int4_matmul_f16_cuda(
-    mfq_tensor_backend::Tensor packed, mfq_tensor_backend::Tensor scales,
-    mfq_tensor_backend::Tensor input, int64_t group_size);
-mfq_tensor_backend::Tensor tpq_int4_dequant_cuda(
-    mfq_tensor_backend::Tensor packed, mfq_tensor_backend::Tensor scales, int64_t group_size);
-mfq_tensor_backend::Tensor tpq_int4_embedding_lookup_cuda(
-    mfq_tensor_backend::Tensor packed, mfq_tensor_backend::Tensor scales,
-    mfq_tensor_backend::Tensor token_ids, int64_t group_size);
-mfq_tensor_backend::Tensor tpq_pq_matmul_f16_cuda(
-    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor codebook, mfq_tensor_backend::Tensor input,
-    int64_t outputs, int64_t width,
-    int64_t vector_size, int64_t index_bits);
-mfq_tensor_backend::Tensor tpq_pq_dequant_cuda(
-    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor codebook,
-    int64_t outputs, int64_t width,
-    int64_t vector_size, int64_t index_bits);
-mfq_tensor_backend::Tensor tpq_pq_embedding_lookup_cuda(
-    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor codebook, mfq_tensor_backend::Tensor token_ids,
-    int64_t outputs, int64_t width,
-    int64_t vector_size, int64_t index_bits);
-mfq_tensor_backend::Tensor tpq_pq_moe_grouped_matmul_pool_f16_cuda(
-    mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor codebook,
-    mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor ids,
-    mfq_tensor_backend::Tensor expert_local, int64_t global_experts,
-    int64_t pool_experts, int64_t out_per_expert,
-    int64_t width, int64_t vector_size, int64_t index_bits,
-    mfq_tensor_backend::Tensor output, mfq_tensor_backend::Tensor ids_dst,
-    mfq_tensor_backend::Tensor expert_bounds, mfq_tensor_backend::Tensor tile_bounds,
-    mfq_tensor_backend::Tensor tile_experts);
 mfq_tensor_backend::Tensor nvq_dequant_cuda(
     mfq_tensor_backend::Tensor indices, mfq_tensor_backend::Tensor aux, mfq_tensor_backend::Tensor sub_scale,
     mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor codebook,

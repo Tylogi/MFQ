@@ -443,8 +443,7 @@ def test_deepseek_v4_mfe_streaming_uses_fused_down_reduce() -> None:
     streamed = source[source.index("} else if (!expert_offload_) {") :]
     streamed = streamed[: streamed.index("if (!shared.has_value())")]
     assert "down_weight.routed_matmul_reduce(" in streamed
-    # Legacy TPQ has no matching fused primitive and retains its fallback.
-    assert "return moe_weighted_reduce(" in streamed
+    assert "return moe_weighted_reduce(" not in streamed
 
 
 def test_deepseek_v4_only_tracks_token_counts_for_active_penalties() -> None:
@@ -744,7 +743,6 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         encoding="utf-8"
     )
     required = (
-        "legacy/tpq/tpq.cpp",
         "ops/format.cpp",
         "ops/fp8_sq.cpp",
         "ops/moe.cpp",
@@ -781,7 +779,6 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         "ops/include/fp8_sq.h": ("Fp8SqWeight",),
         "ops/include/mxfp4_sq.h": ("Mxfp4SqWeight",),
         "ops/include/moe.h": ("MfeWeight", "MoeRoutePlan"),
-        "legacy/tpq/tpq.h": ("TpqWeight",),
     }
     for relative, names in owned_types.items():
         source = (cuda / relative).read_text(encoding="utf-8")

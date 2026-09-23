@@ -7,7 +7,6 @@
 #include "mxfp4_sq.h"
 #include "nint.h"
 #include "vq.h"
-#include "../legacy/tpq/tpq.h"
 #include "mfq_format_compat.h"
 #include "mfe_expert_store.h"
 #include "moe_cache_policy.h"
@@ -388,12 +387,6 @@ mfq_tensor_backend::Tensor run_quant_linear_shard(
             "MXFP4 tensor-parallel linear does not support input gating");
         return mxfp4_matmul(shard.mxfp4, x);
     }
-    if (shard.kind == QuantLinearKind::Tpq) {
-        MFQ_RUNTIME_CHECK(
-            !gate.has_value(),
-            "TPQ tensor-parallel linear does not support input gating");
-        return tpq_matmul(shard.tpq, x);
-    }
     if (shard.kind == QuantLinearKind::Dense) {
         auto local = x.to(shard.dense.scalar_type());
         if (gate.has_value()) {
@@ -723,20 +716,7 @@ mfq_tensor_backend::Tensor quant_embedding_lookup(
     MFQ_RUNTIME_CHECK(
         !embedding.is_mxfp4_sq() && !embedding.is_fp8_sq(),
         "SQ tensors do not support embedding lookup");
-    MFQ_RUNTIME_CHECK(embedding.is_tpq(), "unsupported quantized embedding kind");
-    if (embedding.tpq.weight.int4) {
-        return tpq_int4_embedding_lookup_cuda(
-            embedding.tpq.weight.packed,
-            embedding.tpq.weight.scales, token_ids,
-            embedding.tpq.weight.group_size);
-    }
-    return tpq_pq_embedding_lookup_cuda(
-        embedding.tpq.weight.packed,
-        embedding.tpq.weight.codebook, token_ids,
-        embedding.tpq.weight.out,
-        embedding.tpq.weight.neuron_len,
-        embedding.tpq.weight.vector_size,
-        embedding.tpq.weight.index_bits);
+    throw std::runtime_error("unsupported quantized embedding kind");
 }
 
 bool tensor_parallel_output_projections_compatible(
@@ -1266,43 +1246,6 @@ QuantLinear load_quant_linear(
             result.mxfp8.weight = to_cuda_device_mxfp8(
                 cpu, active_weight_load_device());
         }
-    } else if (dtype == "TPQ-I4G64" || is_tpq_pq_dtype(dtype)) {
-        result.kind = QuantLinearKind::Tpq;
-        const auto cpu = dtype == "TPQ-I4G64"
-            ? unpack_tpq_int4(read_tensor(mfq, name))
-            : unpack_tpq_pq(read_tensor(mfq, name), dtype);
-        result.logical_out = cpu.out;
-        result.logical_neuron_len = cpu.neuron_len;
-        if (g_tensor_parallel.enabled() &&
-                axis != TensorParallelAxis::Mirrored) {
-            const int64_t extent = axis == TensorParallelAxis::Output
-                ? cpu.out : cpu.neuron_len;
-            const int64_t preferred = axis == TensorParallelAxis::Output
-                ? 8 : (cpu.int4 ? cpu.group_size : cpu.vector_size);
-            for (const auto & slice : select_slices(extent, preferred)) {
-                auto shard_cpu = slice_tpq_cpu(
-                    cpu, axis, slice.begin, slice.end);
-                QuantLinearShard shard;
-                shard.device = slice.device;
-                shard.kind = QuantLinearKind::Tpq;
-                shard.output_begin = axis == TensorParallelAxis::Output
-                    ? slice.begin : 0;
-                shard.output_end = axis == TensorParallelAxis::Output
-                    ? slice.end : cpu.out;
-                shard.input_begin = axis == TensorParallelAxis::Input
-                    ? slice.begin : 0;
-                shard.input_end = axis == TensorParallelAxis::Input
-                    ? slice.end : cpu.neuron_len;
-                shard.tpq = to_device_tpq(
-                    shard_cpu, true, slice.device);
-                result.tensor_parallel_shards.push_back(
-                    std::move(shard));
-            }
-        } else {
-            result.tpq.weight = to_device_tpq(
-                cpu, !g_loading_cpu_layer,
-                g_loading_cpu_layer ? -1 : active_weight_load_device());
-        }
     } else if (dtype == "BF16" || dtype == "F16" || dtype == "F32") {
         result.kind = QuantLinearKind::Dense;
         result.dense_small_m_rowwise = name.rfind("predictor.", 0) == 0;
@@ -1354,7 +1297,7 @@ QuantLinear load_quant_linear(
         }
     } else {
         throw std::runtime_error(
-            "linear tensor must be NINT/NVQ/MXFP4-SQ/MXFP8-SQ/FP8-128SQ/MXFP4/MXFP8/TPQ/BF16/F16/F32: " +
+            "linear tensor must be NINT/NVQ/MXFP4-SQ/MXFP8-SQ/FP8-128SQ/MXFP4/MXFP8/BF16/F16/F32: " +
             name + " dtype=" + dtype);
     }
     return result;
@@ -1364,8 +1307,7 @@ bool is_quant_dtype(const std::string & dtype) {
     return is_nint_linear_dtype(dtype) ||
         is_nvq_linear_dtype(dtype) || dtype == "MXFP4-SQ" ||
         mfq::fp8sq::is_dtype(dtype) ||
-        dtype == "MXFP4" || dtype == "MXFP8" ||
-        dtype == "TPQ-I4G64" || is_tpq_pq_dtype(dtype);
+        dtype == "MXFP4" || dtype == "MXFP8";
 }
 
 QuantLinearGroup make_quant_group(
@@ -1435,13 +1377,6 @@ static bool quant_linear_pair_compatible(const QuantLinear & a, const QuantLinea
             a.fp8_sq.weight.block_rows == b.fp8_sq.weight.block_rows &&
             a.fp8_sq.weight.block_columns == b.fp8_sq.weight.block_columns &&
             a.fp8_sq.weight.scale_kind == b.fp8_sq.weight.scale_kind;
-    }
-    if (a.is_tpq()) {
-        return a.tpq.weight.int4 == b.tpq.weight.int4 &&
-            a.tpq.weight.neuron_len == b.tpq.weight.neuron_len &&
-            a.tpq.weight.group_size == b.tpq.weight.group_size &&
-            a.tpq.weight.vector_size == b.tpq.weight.vector_size &&
-            a.tpq.weight.index_bits == b.tpq.weight.index_bits;
     }
     if (a.is_dense()) {
         return a.dense.size(1) == b.dense.size(1);
@@ -1598,17 +1533,6 @@ static mfq_tensor_backend::Tensor dequant_quant_linear_f32(const QuantLinear & l
         if (linear.is_fp8_sq()) {
             return dequant_fp8_sq(linear.fp8_sq.weight, true).contiguous();
         }
-        if (linear.is_tpq()) {
-            const auto & weight = linear.tpq.weight;
-            auto dense = weight.int4
-                ? tpq_int4_dequant_cuda(
-                    weight.packed, weight.scales, weight.group_size)
-                : tpq_pq_dequant_cuda(
-                    weight.packed, weight.codebook,
-                    weight.out, weight.neuron_len,
-                    weight.vector_size, weight.index_bits);
-            return dense.to(mfq_tensor_backend::kFloat32).contiguous();
-        }
         if (linear.is_dense()) {
             return linear.dense.to(mfq_tensor_backend::kFloat32).contiguous();
         }
@@ -1640,16 +1564,6 @@ static mfq_tensor_backend::Tensor dequant_quant_linear_f32(const QuantLinear & l
             part = mxfp4_dequant_cuda(
                 shard.mxfp4.values, shard.mxfp4.scales)
                 .to(mfq_tensor_backend::kFloat32).contiguous();
-        } else if (shard.kind == QuantLinearKind::Tpq) {
-            part = shard.tpq.int4
-                ? tpq_int4_dequant_cuda(
-                    shard.tpq.packed, shard.tpq.scales,
-                    shard.tpq.group_size)
-                : tpq_pq_dequant_cuda(
-                    shard.tpq.packed, shard.tpq.codebook,
-                    shard.tpq.out, shard.tpq.neuron_len,
-                    shard.tpq.vector_size, shard.tpq.index_bits);
-            part = part.to(mfq_tensor_backend::kFloat32).contiguous();
         } else if (shard.kind == QuantLinearKind::Dense) {
             part = shard.dense.to(mfq_tensor_backend::kFloat32).contiguous();
         } else {
@@ -1733,16 +1647,6 @@ mfq_tensor_backend::Tensor quant_linear_reference_weight(
     }
     if (linear.is_fp8_sq()) {
         return dequant_fp8_sq(linear.fp8_sq.weight, false);
-    }
-    if (linear.is_tpq()) {
-        const auto& weight = linear.tpq.weight;
-        return weight.int4
-            ? tpq_int4_dequant_cuda(
-                  weight.packed, weight.scales, weight.group_size)
-            : tpq_pq_dequant_cuda(
-                  weight.packed, weight.codebook, weight.out,
-                  weight.neuron_len, weight.vector_size,
-                  weight.index_bits);
     }
     if (linear.is_mxfp8()) {
         return mxfp8_cpu_reference(linear.mxfp8.weight);

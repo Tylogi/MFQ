@@ -126,7 +126,6 @@ def test_processor_prompt_registry_covers_source_and_container_identities() -> N
         "deepseek_v4_text",
         "deepseek_v4_vision",
         "DeepseekV4ForCausalLM",
-        "deepseek-v4-tpq-mfq",
     ):
         protocol = processor_prompt_protocol_for_architecture(identity)
         assert protocol is not None

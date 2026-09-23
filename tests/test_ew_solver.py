@@ -119,7 +119,7 @@ def test_rank_only_joint_solver_preserves_peak_and_exact_storage() -> None:
     budget = load_budget_document(
         {
             "format": "mfq.ew-budget.v1",
-            "target_profile": "TPQ-S-SHAPE",
+            "target_profile": "EW-S-SHAPE",
             "model_weight_count": 400,
             "total": {"target_bits": 830},
             "shape_constraints": [

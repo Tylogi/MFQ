@@ -61,7 +61,7 @@ parameters. Start each executable in a fresh process.
 | Area | Required coverage |
 | --- | --- |
 | Architectures | dense causal LM, GQA, multimodal MiniCPM-o, and routed MoE |
-| Formats | dense BF16/F16, NINT, NVQ/NPQ/NEPQ, TPQ, MXFP8, and MXFP4 where the architecture permits them |
+| Formats | dense BF16/F16, NINT, NVQ/NPQ/NEPQ, MXFP8, and MXFP4 where the architecture permits them |
 | Shapes | single-token decode, short and long prefill, odd sizes, batched inputs, and GQA head broadcasting |
 | State | empty cache, reused prefix cache, context rollover, session reset, and interrupted generation |
 | Sampling | greedy, temperature, top-k, top-p, min-p, repetition/presence penalties, and fixed random seed |

@@ -79,9 +79,6 @@ static std::vector<mfq_tensor_backend::Tensor> moe_cache_fields(
     if (pool.family == MixedMoeFamily::Mxfp4) {
         return {pool.mxfp4.values, pool.mxfp4.scales};
     }
-    if (pool.family == MixedMoeFamily::Tpq) {
-        return {pool.tpq.packed};
-    }
     if (pool.family == MixedMoeFamily::Nvq) {
         return {
             pool.nvq.indices_packed,
@@ -191,38 +188,6 @@ static void validate_nepq_expert_boundaries(
     }
 }
 
-static void validate_tpq_expert_boundaries(
-        const MixedMoePool & pool,
-        int out_per_expert,
-        int neuron_len) {
-    if (pool.family != MixedMoeFamily::Tpq) return;
-    if (pool.tpq.vector_size <= 0) {
-        throw std::runtime_error("TPQ-PQ cache vector size must be positive");
-    }
-    const int64_t vectors = neuron_len / pool.tpq.vector_size;
-    const int64_t bits_per_expert =
-        static_cast<int64_t>(out_per_expert) * vectors *
-        pool.tpq.index_bits;
-    if (pool.tpq.int4 ||
-            neuron_len % pool.tpq.vector_size != 0 ||
-            pool.tpq.index_bits < 8 || pool.tpq.index_bits > 16 ||
-            bits_per_expert % 8 != 0 ||
-            !pool.tpq.packed.defined() || !pool.tpq.packed.is_cpu() ||
-            !pool.tpq.packed.is_contiguous() ||
-            pool.tpq.packed.scalar_type() != mfq_tensor_backend::kUInt8 ||
-            pool.tpq.packed.numel() !=
-                pool.local_experts * bits_per_expert / 8 ||
-            !pool.tpq.codebook.defined() || !pool.tpq.codebook.is_cpu() ||
-            !pool.tpq.codebook.is_contiguous() ||
-            pool.tpq.codebook.scalar_type() != mfq_tensor_backend::kFloat32 ||
-            pool.tpq.codebook.dim() != 2 ||
-            pool.tpq.codebook.size(0) <= 1 ||
-            pool.tpq.codebook.size(1) != pool.tpq.vector_size) {
-        throw std::runtime_error(
-            "TPQ-PQ expert fields are incompatible with GPU caching");
-    }
-}
-
 static std::string moe_cache_signature(
         const MixedMoePool & pool,
         int out_per_expert,
@@ -242,9 +207,6 @@ static std::string moe_cache_signature(
         stream << ":g32:n" << pool.q8_zero.ng;
     } else if (pool.family == MixedMoeFamily::Mxfp4) {
         stream << ":mx4";
-    } else if (pool.family == MixedMoeFamily::Tpq) {
-        stream << ":tpq:v" << pool.tpq.vector_size
-               << ":b" << pool.tpq.index_bits;
     } else if (pool.family == MixedMoeFamily::Nvq) {
         stream << ":f" << pool.nvq.format
                << ":kf" << pool.nvq.kernel_format
@@ -422,8 +384,6 @@ public:
                 "cannot register a MoE source after cache finalization");
         }
         validate_nepq_expert_boundaries(
-            pool, out_per_expert, neuron_len);
-        validate_tpq_expert_boundaries(
             pool, out_per_expert, neuron_len);
         return register_cohort_layout(
             pool,
@@ -1374,13 +1334,6 @@ public:
                 pool.mxfp4.values = arena.fields.at(field++);
                 pool.mxfp4.scales = arena.fields.at(field++);
                 pool.mxfp4.out =
-                    static_cast<int64_t>(arena.slots) *
-                    cpu_->out_per_expert;
-            } else if (pool.family == MixedMoeFamily::Tpq) {
-                pool.tpq.packed = arena.fields.at(field++);
-                pool.tpq.codebook =
-                    copy_cpu_weight_to_cuda(source.tpq.codebook);
-                pool.tpq.out =
                     static_cast<int64_t>(arena.slots) *
                     cpu_->out_per_expert;
             } else if (pool.family == MixedMoeFamily::Nvq) {

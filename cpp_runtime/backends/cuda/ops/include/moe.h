@@ -6,7 +6,6 @@
 #include "mxfp4_sq.h"
 #include "nint.h"
 #include "vq.h"
-#include "../legacy/tpq/tpq.h"
 
 #include <algorithm>
 #include <array>
@@ -471,7 +470,6 @@ struct MfeCpuPool {
     NintCpu weight;
     Nint8ZeroCpu q8_zero;
     Mxfp4Cpu mxfp4;
-    TpqCpu tpq;
 };
 
 struct MfeCpu {
@@ -487,7 +485,6 @@ enum class MixedMoeFamily {
     Mxfp4,
     Mxfp4Sq,
     Fp8Sq,
-    Tpq,
     Nvq,
     Nepq,
 };
@@ -499,7 +496,6 @@ struct MixedMoePool {
     Mxfp4Weight mxfp4;
     Mxfp4SqWeight mxfp4_sq;
     Fp8SqWeight fp8_sq;
-    TpqWeight tpq;
     NvqWeight nvq;
     NepqWeight nepq;
     mfq_tensor_backend::Tensor expert_local;
@@ -630,8 +626,7 @@ struct MixedMoeRuntime {
                 gs = static_cast<int>(pool.nvq.gs);
             } else if (pool.family == MixedMoeFamily::Mxfp4 ||
                     pool.family == MixedMoeFamily::Mxfp4Sq ||
-                    pool.family == MixedMoeFamily::Fp8Sq ||
-                    pool.family == MixedMoeFamily::Tpq) {
+                    pool.family == MixedMoeFamily::Fp8Sq) {
                 continue;
             } else {
                 groups = pool.nepq.ng;
@@ -804,8 +799,7 @@ struct MixedMoeRuntime {
                 groups = (int)pool.nvq.ng;
             } else if (pool.family == MixedMoeFamily::Mxfp4 ||
                     pool.family == MixedMoeFamily::Mxfp4Sq ||
-                    pool.family == MixedMoeFamily::Fp8Sq ||
-                    pool.family == MixedMoeFamily::Tpq) {
+                    pool.family == MixedMoeFamily::Fp8Sq) {
                 groups = 0;
             } else {
                 groups = pool.nepq.ng;
@@ -860,16 +854,6 @@ struct MixedMoeRuntime {
                         pool.fp8_sq, value, route.ids, pool.expert_local,
                         n_experts, pool.local_experts, out_per_expert,
                         neuron_len, output);
-                    continue;
-                }
-                if (pool.family == MixedMoeFamily::Tpq) {
-                    tpq_pq_moe_grouped_matmul_pool_f16_cuda(
-                        pool.tpq.packed, pool.tpq.codebook, value,
-                        route.ids, pool.expert_local, n_experts,
-                        pool.local_experts, out_per_expert, neuron_len,
-                        pool.tpq.vector_size, pool.tpq.index_bits, output,
-                        route.ids_dst, route.expert_bounds,
-                        route.tile_bounds, route.tile_experts);
                     continue;
                 }
                 if (pool.family == MixedMoeFamily::Nvq) {
@@ -940,16 +924,6 @@ struct MixedMoeRuntime {
                     pool.fp8_sq, value, route.ids, pool.expert_local,
                     n_experts, pool.local_experts, out_per_expert,
                     neuron_len, output);
-                continue;
-            }
-            if (pool.family == MixedMoeFamily::Tpq) {
-                tpq_pq_moe_grouped_matmul_pool_f16_cuda(
-                    pool.tpq.packed, pool.tpq.codebook, value,
-                    route.ids, pool.expert_local, n_experts,
-                    pool.local_experts, out_per_expert, neuron_len,
-                    pool.tpq.vector_size, pool.tpq.index_bits, output,
-                    route.ids_dst, route.expert_bounds,
-                    route.tile_bounds, route.tile_experts);
                 continue;
             }
             if (pool.family == MixedMoeFamily::Nvq && use_f16_mma) {

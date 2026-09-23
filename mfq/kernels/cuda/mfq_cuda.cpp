@@ -210,36 +210,6 @@ torch::Tensor mxfp4_moe_grouped_matmul_pool_f16_cuda(
     torch::Tensor output, torch::Tensor ids_dst,
     torch::Tensor expert_bounds, torch::Tensor tile_bounds,
     torch::Tensor tile_experts);
-// tpq_matmul.cu
-torch::Tensor tpq_int4_matmul_f16_cuda(
-    torch::Tensor packed, torch::Tensor scales,
-    torch::Tensor input, int64_t group_size);
-torch::Tensor tpq_int4_dequant_cuda(
-    torch::Tensor packed, torch::Tensor scales, int64_t group_size);
-torch::Tensor tpq_int4_embedding_lookup_cuda(
-    torch::Tensor packed, torch::Tensor scales,
-    torch::Tensor token_ids, int64_t group_size);
-torch::Tensor tpq_pq_matmul_f16_cuda(
-    torch::Tensor indices, torch::Tensor codebook, torch::Tensor input,
-    int64_t outputs, int64_t width,
-    int64_t vector_size, int64_t index_bits);
-torch::Tensor tpq_pq_dequant_cuda(
-    torch::Tensor indices, torch::Tensor codebook,
-    int64_t outputs, int64_t width,
-    int64_t vector_size, int64_t index_bits);
-torch::Tensor tpq_pq_embedding_lookup_cuda(
-    torch::Tensor indices, torch::Tensor codebook, torch::Tensor token_ids,
-    int64_t outputs, int64_t width,
-    int64_t vector_size, int64_t index_bits);
-torch::Tensor tpq_pq_moe_grouped_matmul_pool_f16_cuda(
-    torch::Tensor indices, torch::Tensor codebook,
-    torch::Tensor input, torch::Tensor ids,
-    torch::Tensor expert_local, int64_t global_experts,
-    int64_t pool_experts, int64_t out_per_expert,
-    int64_t width, int64_t vector_size, int64_t index_bits,
-    torch::Tensor output, torch::Tensor ids_dst,
-    torch::Tensor expert_bounds, torch::Tensor tile_bounds,
-    torch::Tensor tile_experts);
 // nvq_matmul.cu
 // nepq.cu
 torch::Tensor nepq_hadamard_input_cuda(
@@ -581,21 +551,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mxfp4_moe_grouped_matmul_pool_f16_cuda",
           &mxfp4_moe_grouped_matmul_pool_f16_cuda,
           "MXFP4 routed cohort matmul (CUDA)");
-    m.def("tpq_int4_matmul_f16_cuda", &tpq_int4_matmul_f16_cuda,
-          "TPQ symmetric int4 packed matmul (CUDA)");
-    m.def("tpq_int4_dequant_cuda", &tpq_int4_dequant_cuda,
-          "TPQ symmetric int4 dequantization (CUDA)");
-    m.def("tpq_int4_embedding_lookup_cuda", &tpq_int4_embedding_lookup_cuda,
-          "TPQ symmetric int4 selected-row embedding decode (CUDA)");
-    m.def("tpq_pq_matmul_f16_cuda", &tpq_pq_matmul_f16_cuda,
-          "TPQ learned product-VQ packed matmul (CUDA)");
-    m.def("tpq_pq_dequant_cuda", &tpq_pq_dequant_cuda,
-          "TPQ learned product-VQ dequantization (CUDA)");
-    m.def("tpq_pq_embedding_lookup_cuda", &tpq_pq_embedding_lookup_cuda,
-          "TPQ learned product-VQ selected-row embedding decode (CUDA)");
-    m.def("tpq_pq_moe_grouped_matmul_pool_f16_cuda",
-          &tpq_pq_moe_grouped_matmul_pool_f16_cuda,
-          "TPQ-PQ routed cohort matmul (CUDA)");
     m.def("nepq_hadamard_input_cuda", &nepq_hadamard_input_cuda, "NEPQ signed block-Hadamard activation transform (CUDA)");
     m.def("nepq_hadamard_adjoint_cuda", &nepq_hadamard_adjoint_cuda, "NEPQ signed block-Hadamard adjoint (CUDA)");
     m.def("nepq_sparse_residual_matmul_cuda", &nepq_sparse_residual_matmul_cuda, "NEPQ-A sparse residual matmul (CUDA)");

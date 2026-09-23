@@ -37,9 +37,7 @@ constexpr int kQ8QOffset = 3;
 constexpr int kQ8ScaleOffset = 4;
 
 constexpr int kFamilyVq = 2;
-constexpr int kFamilyTpqInt4 = 3;
-constexpr int kFamilyTpqPq = 4;
-constexpr int kFamilyMx = 5;
+constexpr int kFamilyMx = 3;
 
 struct DirectProjectionLayout {
     int family = kFamilyNint8Zero;
@@ -70,8 +68,6 @@ using RetainedProjection = std::variant<
     MlxNintWeight,
     MlxNint8ZeroWeight,
     MlxVqWeight,
-    MlxTpqInt4Weight,
-    MlxTpqPqWeight,
     MlxFp8SqWeight,
     MlxMxfp4SqWeight,
     MlxMxWeight>;
@@ -1027,14 +1023,6 @@ std::string direct_kernel_key(
             key += "q8";
         } else if (layout.family == kFamilyVq) {
             key += layout.execution_layout == 1 ? "vqg64" : "vq";
-        } else if (
-            layout.family == kFamilyTpqInt4
-        ) {
-            key += "ci4";
-        } else if (
-            layout.family == kFamilyTpqPq
-        ) {
-            key += "cpq";
         } else if (layout.family == kFamilyMx) {
             key += "mx" + std::to_string(layout.bits);
         } else {
@@ -1112,23 +1100,10 @@ std::vector<std::string> direct_input_names(
             names.push_back("vq_bank_ids_" + suffix);
             names.push_back("vq_parameters_" + suffix);
         } else if (
-            layouts[projection].family
-                == kFamilyTpqInt4
-        ) {
-            names.push_back(
-                "tpq_i4_packed_" + suffix);
-            names.push_back(
-                "tpq_i4_scales_" + suffix);
-        } else if (
             layouts[projection].family == kFamilyMx
         ) {
             names.push_back("mx_values_" + suffix);
             names.push_back("mx_scales_" + suffix);
-        } else {
-            names.push_back(
-                "tpq_pq_indices_" + suffix);
-            names.push_back(
-                "tpq_pq_codebook_" + suffix);
         }
     }
     names.emplace_back("x");
@@ -1524,27 +1499,6 @@ std::string make_direct_source(
                 "                    uint(P" + suffix + "_NSUPER),\n"
                 "                    (uint(K) + 7u) / 8u);\n";
         } else if (
-            layouts[projection].family
-                == kFamilyTpqInt4
-        ) {
-            source +=
-                "                uint packed_value = uint(\n"
-                "                    tpq_i4_packed_" + suffix + "[\n"
-                "                        output * uint(K / 2)\n"
-                "                        + (column >> 1)]);\n"
-                "                uint quantized ="
-                " (column & 1u) == 0u\n"
-                "                    ? packed_value & 15u\n"
-                "                    : packed_value >> 4u;\n"
-                "                float scale = float(\n"
-                "                    tpq_i4_scales_" + suffix + "[\n"
-                "                        output * uint(P" + suffix
-                + "_NG)\n"
-                "                        + column / uint(P" + suffix
-                + "_GS)]);\n"
-                "                weight ="
-                " float(int(quantized) - 8) * scale;\n";
-        } else if (
             layouts[projection].family == kFamilyMx
         ) {
             source +=
@@ -1554,25 +1508,6 @@ std::string make_direct_source(
                 "                    output, column,\n"
                 "                    uint(P" + suffix + "_BITS),\n"
                 "                    uint(K));\n";
-        } else {
-            source +=
-                "                uint block ="
-                " column / uint(P" + suffix
-                + "_VECTOR_SIZE);\n"
-                "                uint component ="
-                " column - block * uint(P" + suffix
-                + "_VECTOR_SIZE);\n"
-                "                uint code ="
-                " mfq_grouped_vq_read_bits(\n"
-                "                    tpq_pq_indices_" + suffix + ",\n"
-                "                    output * uint(P" + suffix
-                + "_BLOCKS) + block,\n"
-                "                    uint(P" + suffix
-                + "_INDEX_BITS));\n"
-                "                weight = float(\n"
-                "                    tpq_pq_codebook_" + suffix + "[\n"
-                "                        code * uint(P" + suffix
-                + "_VECTOR_SIZE) + component]);\n";
         }
         source += "            }";
     }
@@ -3881,29 +3816,6 @@ MlxGroupedLinear::MlxGroupedLinear(
                         direct_inputs.push_back(
                             weight->parameters());
                     } else if constexpr (
-                        std::is_same_v<
-                            Weight,
-                            MlxTpqInt4Weight>
-                    ) {
-                        layout.family =
-                            kFamilyTpqInt4;
-                        layout.group_size =
-                            weight->group_size();
-                        layout.groups =
-                            weight->groups();
-                        validate_direct_array(
-                            weight->packed_values(),
-                            mlx::core::uint8,
-                            "TPQ-I4G64 packed values");
-                        validate_direct_array(
-                            weight->scales(),
-                            mlx::core::float16,
-                            "TPQ-I4G64 scales");
-                        direct_inputs.push_back(
-                            weight->packed_values());
-                        direct_inputs.push_back(
-                            weight->scales());
-                    } else if constexpr (
                         std::is_same_v<Weight, MlxMxWeight>
                     ) {
                         layout.family = kFamilyMx;
@@ -3925,29 +3837,6 @@ MlxGroupedLinear::MlxGroupedLinear(
                     ) {
                         throw MlxGroupedLinearUnsupported(
                             "dense projections require the dense grouped kernel");
-                    } else {
-                        layout.family =
-                            kFamilyTpqPq;
-                        layout.vector_size =
-                            weight->vector_size();
-                        layout.blocks =
-                            weight->blocks();
-                        layout.index_bits =
-                            weight->index_bits();
-                        layout.entries =
-                            weight->entries();
-                        validate_direct_array(
-                            weight->packed_indices(),
-                            mlx::core::uint8,
-                            "TPQ-PQ packed indices");
-                        validate_direct_array(
-                            weight->codebook(),
-                            mlx::core::float16,
-                            "TPQ-PQ codebook");
-                        direct_inputs.push_back(
-                            weight->packed_indices());
-                        direct_inputs.push_back(
-                            weight->codebook());
                     }
                     if constexpr (std::is_same_v<Weight, array>) {
                         weight_bytes = weight->nbytes();
@@ -3994,14 +3883,10 @@ MlxGroupedLinear::MlxGroupedLinear(
                 return std::holds_alternative<
                            const MlxVqWeight*>(weight) ||
                     std::holds_alternative<
-                        const MlxTpqInt4Weight*>(weight) ||
-                    std::holds_alternative<
-                        const MlxTpqPqWeight*>(weight) ||
-                    std::holds_alternative<
                         const MlxMxWeight*>(weight);
             })) {
         throw MlxGroupedLinearUnsupported(
-            "VQ/TPQ/MX grouped linear requires the direct-binding "
+            "VQ/MX grouped linear requires the direct-binding "
             "zero-copy path");
     }
 
@@ -4879,24 +4764,6 @@ std::vector<array> MlxGroupedLinear::matmul(
                     templates.emplace_back(
                         prefix + "NSUPER",
                         layout.supergroups);
-                } else if (
-                    layout.family == kFamilyTpqInt4
-                ) {
-                    templates.emplace_back(
-                        prefix + "GS",
-                        layout.group_size);
-                } else if (
-                    layout.family == kFamilyTpqPq
-                ) {
-                    templates.emplace_back(
-                        prefix + "VECTOR_SIZE",
-                        layout.vector_size);
-                    templates.emplace_back(
-                        prefix + "BLOCKS",
-                        layout.blocks);
-                    templates.emplace_back(
-                        prefix + "INDEX_BITS",
-                        layout.index_bits);
                 } else if (layout.family == kFamilyMx) {
                     templates.emplace_back(
                         prefix + "BITS",
