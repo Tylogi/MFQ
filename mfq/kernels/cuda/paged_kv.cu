@@ -120,6 +120,33 @@ __global__ void paged_kv_cache_write_kernel(
     }
 }
 
+template <typename scalar_t>
+__global__ void paged_kv_cache_gather_kernel(
+    const int64_t * k_ptrs, const int64_t * v_ptrs,
+    const int32_t * table, scalar_t * k, scalar_t * v,
+    int B, int H, int T, int D, int logical_pages,
+    int page_size, int pages_per_chunk) {
+    const size_t count = static_cast<size_t>(B) * H * T * D;
+    const size_t page_elements = static_cast<size_t>(H) * page_size * D;
+    for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < count; index += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const int d = index % D;
+        const size_t td = index / D;
+        const int t = td % T;
+        const int h = (td / T) % H;
+        const int b = td / (static_cast<size_t>(T) * H);
+        const int physical = table[static_cast<size_t>(b) * logical_pages + t / page_size];
+        if (physical < 0) {
+            k[index] = scalar_t(0.0f);
+            v[index] = scalar_t(0.0f);
+            continue;
+        }
+        const size_t element = (static_cast<size_t>(h) * page_size + t % page_size) * D + d;
+        k[index] = page_address<scalar_t>(k_ptrs, physical, pages_per_chunk, page_elements)[element];
+        v[index] = page_address<scalar_t>(v_ptrs, physical, pages_per_chunk, page_elements)[element];
+    }
+}
+
 template <int Warps>
 __device__ __forceinline__ float paged_block_sum(float value) {
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -891,6 +918,39 @@ void paged_kv_cache_write_cuda(
             B, H, T, D, static_cast<int>(page_table.size(1)),
             static_cast<int>(page_size), static_cast<int>(pages_per_chunk),
             static_cast<int>(k_chunk_ptrs.numel()), positions.dim());
+    });
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void paged_kv_cache_gather_cuda(
+    mfq_tensor_backend::Tensor k_chunk_ptrs,
+    mfq_tensor_backend::Tensor v_chunk_ptrs,
+    mfq_tensor_backend::Tensor page_table,
+    mfq_tensor_backend::Tensor k,
+    mfq_tensor_backend::Tensor v,
+    int64_t page_size,
+    int64_t pages_per_chunk) {
+    validate_pointer_table(k_chunk_ptrs, "paged gather key pointers");
+    validate_pointer_table(v_chunk_ptrs, "paged gather value pointers");
+    MFQ_RUNTIME_CHECK(k.is_cuda() && v.is_cuda() && k.is_contiguous() && v.is_contiguous() &&
+        k.dim() == 4 && k.sizes() == v.sizes() && k.scalar_type() == v.scalar_type(),
+        "paged gather requires matching contiguous CUDA rank-4 outputs");
+    MFQ_RUNTIME_CHECK(page_table.is_cuda() && page_table.is_contiguous() &&
+        page_table.scalar_type() == mfq_tensor_backend::kInt32 && page_table.dim() == 2 &&
+        page_table.size(0) >= k.size(0) && page_size > 0 && pages_per_chunk > 0 &&
+        k.size(2) <= page_table.size(1) * page_size,
+        "paged gather has invalid page geometry");
+    const int B = k.size(0), H = k.size(1), T = k.size(2), D = k.size(3);
+    if (!k.numel()) return;
+    constexpr int threads = 256;
+    const int blocks = static_cast<int>((k.numel() + threads - 1) / threads);
+    MFQ_DISPATCH_FLOATING_TYPES_AND2(
+        mfq_dispatch_half, mfq_dispatch_bfloat16,
+        k.scalar_type(), "paged_kv_cache_gather_cuda", [&] {
+        paged_kv_cache_gather_kernel<scalar_t><<<blocks, threads, 0, mfq_current_cuda_stream()>>>(
+            k_chunk_ptrs.data_ptr<int64_t>(), v_chunk_ptrs.data_ptr<int64_t>(),
+            page_table.data_ptr<int32_t>(), k.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
+            B, H, T, D, static_cast<int>(page_table.size(1)), page_size, pages_per_chunk);
     });
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }

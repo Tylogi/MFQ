@@ -488,7 +488,9 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
     }
 
     double norm_weight_offset() const noexcept {
-        if constexpr (
+        if constexpr (Backbone == CudaBackbone::generic_qwen) {
+            return this->config.legacy_tensor_layout.norm_weight_offset;
+        } else if constexpr (
                 is_flash_next || is_dsv4 || is_gemma4 || is_minicpmo45) {
             return 0.0;
         } else {
@@ -509,6 +511,8 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
     int64_t num_experts() const noexcept {
         if constexpr (is_qwen4 || is_glm5) {
             return this->config.experts;
+        } else if constexpr (Backbone == CudaBackbone::generic_qwen) {
+            return this->config.num_experts;
         } else if constexpr (is_deepseek_v41) {
             return this->config.n_experts;
         } else if constexpr (Backbone == CudaBackbone::deepseek_v4 ||

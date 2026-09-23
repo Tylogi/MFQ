@@ -75,9 +75,9 @@ def test_prefill_speed_uses_cuda_events_around_only_the_first_model_eval() -> No
     assert first.index("PrefillCudaTimer prefill_timer") < first.index(
         "mfq_tensor_backend::Tensor next;"
     )
-    assert first.index("const int64_t token = next.template item<int64_t>();") < first.index(
-        "prefill_timer.elapsed_ms()"
-    )
+    assert first.index(
+        "const int64_t token = next.template item<int64_t>();"
+    ) < first.index("prefill_timer.elapsed_ms()")
     assert "1000.0 * metrics.prefill_tokens / metrics.prefill_ms" in SERVER
     assert '{"prefill_tps", values.prefill_tps}' in SERVER
     assert '{"prefill_ms", values.prefill_ms}' in SERVER

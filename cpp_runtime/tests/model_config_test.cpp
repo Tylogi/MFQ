@@ -109,6 +109,24 @@ int main() {
                 qwen.linear_v_size() == 512 && !qwen.grid_vision,
             "Qwen3.5 config was not normalized");
 
+        const auto qwen_moe = mfq::models::qwen35::Config::from_json(R"({
+            "model_type":"qwen3_5_moe","text_config":{
+            "model_type":"qwen3_5_moe_text","vocab_size":128,
+            "hidden_size":64,"num_hidden_layers":2,
+            "num_attention_heads":4,"num_key_value_heads":2,
+            "max_position_embeddings":4096,"head_dim":16,
+            "num_experts":8,"num_experts_per_tok":2,
+            "moe_intermediate_size":48,
+            "shared_expert_intermediate_size":96,
+            "layer_types":["full_attention","linear_attention"]}})", graph);
+        require(
+            qwen_moe.intermediate_size == 0 &&
+                qwen_moe.num_experts == 8 &&
+                qwen_moe.num_experts_per_tok == 2 &&
+                qwen_moe.moe_intermediate_size == 48 &&
+                qwen_moe.shared_expert_intermediate_size == 96,
+            "Qwen3.5 MoE config was not normalized without intermediate_size");
+
         const auto minicpm = mfq::models::minicpmo45::Config::from_json(R"({
             "version":"4.5","model_type":"minicpmo45","vocab_size":128,
             "hidden_size":4096,"intermediate_size":12288,

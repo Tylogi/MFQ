@@ -25,9 +25,39 @@ Config Config::from_json(
 
     Config config;
     static_cast<ModelConfig&>(config) = ModelConfig::from_json(payload);
-    if (config.intermediate_size <= 0) {
+    config.num_experts = text.value(
+        "num_experts",
+        text.value("n_routed_experts", std::int64_t{0}));
+    config.num_experts_per_tok = text.value(
+        "num_experts_per_tok",
+        text.value("top_k_experts", std::int64_t{0}));
+    config.moe_intermediate_size =
+        text.value("moe_intermediate_size", std::int64_t{0});
+    config.shared_expert_intermediate_size =
+        text.value("shared_expert_intermediate_size", std::int64_t{0});
+    const auto shared_experts =
+        text.value("n_shared_experts", std::int64_t{0});
+    if (config.shared_expert_intermediate_size == 0 &&
+            shared_experts > 0 && config.moe_intermediate_size > 0) {
+        config.shared_expert_intermediate_size =
+            shared_experts * config.moe_intermediate_size;
+    }
+    config.routed_scaling_factor =
+        text.value("routed_scaling_factor", 1.0);
+    config.norm_topk_prob = text.value("norm_topk_prob", false);
+    config.expert_gating_func =
+        text.value("scoring_func", std::string("softmax"));
+    if (config.num_experts > 0) {
+        if (config.num_experts_per_tok <= 0 ||
+                config.num_experts_per_tok > config.num_experts ||
+                config.moe_intermediate_size <= 0 ||
+                config.shared_expert_intermediate_size <= 0) {
+            throw std::runtime_error(
+                "invalid Qwen MoE configuration");
+        }
+    } else if (config.intermediate_size <= 0) {
         throw std::runtime_error(
-            "Qwen model config intermediate_size must be positive");
+            "dense Qwen model config intermediate_size must be positive");
     }
     config.attention_output_gate = text.value("attn_output_gate", false);
     config.mtp_num_hidden_layers =

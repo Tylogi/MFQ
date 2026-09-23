@@ -304,7 +304,7 @@ def test_native_cuda_worker_forwards_explicit_continuous_batching(
     assert command[command.index("--continuous-batching") + 1] == "8"
 
 
-def test_native_request_capacity_is_backend_and_storage_based() -> None:
+def test_native_request_capacity_is_backend_based() -> None:
     assert native_request_capacity(
         backend="cuda",
         routed_expert_bytes=0,
@@ -319,7 +319,7 @@ def test_native_request_capacity_is_backend_and_storage_based() -> None:
         backend="cuda",
         routed_expert_bytes=1,
         requested=8,
-    ) == 1
+    ) == 8
 
 
 def test_native_metal_worker_rejects_cuda_continuous_batching(

@@ -88,8 +88,30 @@ void check_kernels() {
         0, 1, 2, 3, 4, 5, 6,
     }).reshape({B, T}).to(gpu).contiguous();
     paged_kv_cache_write_cuda(
-        k_chunks, v_chunks, page_table, k, v, positions,
+        k_chunks, v_chunks, page_table,
+        k.narrow(2, 0, 3).contiguous(), v.narrow(2, 0, 3).contiguous(),
+        positions.narrow(1, 0, 3).contiguous(),
         Page, PagesPerChunk);
+    auto first_k = mfq::cuda::empty({B, Hk, 3, D},
+        TensorOptions().device(gpu).dtype(mfq::cuda::kFloat16));
+    auto first_v = mfq::cuda::empty_like(first_k);
+    paged_kv_cache_gather_cuda(k_chunks, v_chunks, page_table,
+        first_k, first_v, Page, PagesPerChunk);
+    require(float_values(first_k) == float_values(k.narrow(2, 0, 3)),
+        "Paged first-chunk key gather differs from source");
+    require(float_values(first_v) == float_values(v.narrow(2, 0, 3)),
+        "Paged first-chunk value gather differs from source");
+    paged_kv_cache_write_cuda(k_chunks, v_chunks, page_table,
+        k.narrow(2, 3, 4).contiguous(), v.narrow(2, 3, 4).contiguous(),
+        positions.narrow(1, 3, 4).contiguous(), Page, PagesPerChunk);
+    auto gathered_k = mfq::cuda::empty_like(k);
+    auto gathered_v = mfq::cuda::empty_like(v);
+    paged_kv_cache_gather_cuda(k_chunks, v_chunks, page_table,
+        gathered_k, gathered_v, Page, PagesPerChunk);
+    require(float_values(gathered_k) == float_values(k),
+        "Paged complete-prefix key gather differs from source");
+    require(float_values(gathered_v) == float_values(v),
+        "Paged complete-prefix value gather differs from source");
 
     auto lengths = mfq::cuda::tensor<std::int64_t>({7, 5}).to(gpu);
     auto partial_o = mfq::cuda::empty(

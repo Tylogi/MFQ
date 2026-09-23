@@ -87,7 +87,8 @@ struct LinearAttentionBlock final : ::Block {
         auto residual = x;
         auto xn = qwen_rms_norm(
             x.reshape({B * T, H}).to(mfq_tensor_backend::kFloat32),
-            attn_norm, qwen_config.rms_norm_eps, 1.0)
+            attn_norm, qwen_config.rms_norm_eps,
+            qwen_config.legacy_tensor_layout.norm_weight_offset)
             .reshape({B, T, H});
         mfq_tensor_backend::Tensor qkv, qk_part, v_part, z, alpha_raw, beta_raw;
         if (dense_ab_tail) {
@@ -231,7 +232,8 @@ struct LinearAttentionBlock final : ::Block {
         residual = x;
         xn = qwen_rms_norm(
             x.reshape({B * T, H}).to(mfq_tensor_backend::kFloat32),
-            ffn_norm, qwen_config.rms_norm_eps, 1.0)
+            ffn_norm, qwen_config.rms_norm_eps,
+            qwen_config.legacy_tensor_layout.norm_weight_offset)
             .reshape({B, T, H});
         auto ff = ffn.forward(xn.reshape({B * T, H})).reshape({B, T, H});
         return (residual.to(mfq_tensor_backend::kFloat32) + ff.to(mfq_tensor_backend::kFloat32))
@@ -254,7 +256,8 @@ struct LinearAttentionBlock final : ::Block {
         auto xn = g_profiler.measure("linear.attn_norm", [&]() {
             return qwen_rms_norm(
                 x.reshape({B * T, H}).to(mfq_tensor_backend::kFloat32),
-                attn_norm, qwen_config.rms_norm_eps, 1.0)
+                attn_norm, qwen_config.rms_norm_eps,
+                qwen_config.legacy_tensor_layout.norm_weight_offset)
                 .reshape({B, T, H});
         });
         mfq_tensor_backend::Tensor qkv, qk_part, v_part, z, alpha_raw, beta_raw;
@@ -477,16 +480,19 @@ struct LinearAttentionBlock final : ::Block {
                 return acc_rms_norm_cuda(
                     rr.to(mfq_tensor_backend::kFloat32),
                     oo2.to(mfq_tensor_backend::kFloat32),
-                    ffn_norm, qwen_config.rms_norm_eps, 1.0);
+                    ffn_norm, qwen_config.rms_norm_eps,
+                    qwen_config.legacy_tensor_layout.norm_weight_offset);
             }
             if (rr.scalar_type() == mfq_tensor_backend::kFloat16 && oo2.scalar_type() == mfq_tensor_backend::kFloat16) {
                 return acc_rms_norm_f16_cuda(
                     rr, oo2, ffn_norm,
-                    qwen_config.rms_norm_eps, 1.0);
+                    qwen_config.rms_norm_eps,
+                    qwen_config.legacy_tensor_layout.norm_weight_offset);
             }
             return acc_rms_norm_cuda(
                 rr, oo2, ffn_norm,
-                qwen_config.rms_norm_eps, 1.0);
+                qwen_config.rms_norm_eps,
+                qwen_config.legacy_tensor_layout.norm_weight_offset);
         });
         return {attn_pair[0].reshape({B, T, H}),
                 attn_pair[1].reshape({B, T, H})};

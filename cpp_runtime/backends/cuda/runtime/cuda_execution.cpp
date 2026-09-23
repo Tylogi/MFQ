@@ -52,6 +52,7 @@ bool g_force_moe_pool_path = false;
 bool g_force_moe_unfused_reduce = false;
 bool g_force_moe_materialized_swiglu = false;
 bool g_force_moe_prefill_mma_off = false;
+thread_local bool g_moe_continuous_batch_cache_serial = false;
 
 KlMmqMode g_kl_mmq_mode = KlMmqMode::Default;
 int64_t g_kl_mmq_activation_quantize_calls = 0;
@@ -370,4 +371,3 @@ bool moe_small_glu_path_enabled(int tokens) {
     }();
     return tokens == 1 || (tokens <= 4 && !disabled);
 }
-

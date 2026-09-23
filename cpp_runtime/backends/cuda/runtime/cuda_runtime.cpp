@@ -4408,6 +4408,13 @@ int mfq::cuda::run_runtime(int argc, char ** argv) {
                         << continuous_batching
                         << " prefill_chunk_size=" << prefill_chunk_size
                         << " decode=target_only mtp=disabled"
+                        << " moe="
+                        << (mfq::cuda::continuous::
+                            qwen_continuous_batch_has_moe(server_model) ? 1 : 0)
+                        << " moe_expert_cache="
+                        << (mfq::cuda::continuous::
+                            qwen_continuous_batch_has_cached_moe(server_model)
+                                ? 1 : 0)
                         << " paged_kv="
                         << (continuous_batcher->paged_kv_enabled() ? 1 : 0)
                         << " page_size="

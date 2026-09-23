@@ -1570,7 +1570,18 @@ def test_managed_cuda_runtime_leaves_continuous_batching_validation_to_worker(
         )
 
         assert dense[dense.index("--continuous-batching") + 1] == "6"
-        assert "--continuous-batching" not in moe
+        assert moe[moe.index("--continuous-batching") + 1] == "6"
+
+        cached, _environment = pool._launch_configuration(
+            DiscoveredModel(
+                resource=artifact.resource,
+                path=artifact.path,
+                routed_expert_bytes=1,
+            ),
+            request.model_copy(update={"moe_gpu_cache_gb": 1.0}),
+            port=43125,
+        )
+        assert cached[cached.index("--continuous-batching") + 1] == "6"
 
     asyncio.run(run())
 

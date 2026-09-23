@@ -1,19 +1,29 @@
 #pragma once
 
 #include "grid_vision.h"
+#include "mfq_legacy_tensor_names.h"
 #include "mfq_model_graph.h"
 #include "models/model_config.h"
 
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
 namespace mfq::models::qwen35 {
 
 struct Config : ModelConfig {
+    MfqLegacyTensorLayout legacy_tensor_layout;
     bool attention_output_gate = false;
+    std::int64_t num_experts = 0;
+    std::int64_t num_experts_per_tok = 0;
+    std::int64_t moe_intermediate_size = 0;
+    std::int64_t shared_expert_intermediate_size = 0;
+    double routed_scaling_factor = 1.0;
+    bool norm_topk_prob = false;
+    std::string expert_gating_func = "softmax";
     std::int64_t mtp_num_hidden_layers = 0;
     bool mtp_use_dedicated_embeddings = false;
     std::int64_t linear_conv_kernel_dim = 4;

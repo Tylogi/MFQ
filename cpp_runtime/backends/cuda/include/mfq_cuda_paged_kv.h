@@ -29,3 +29,12 @@ mfq_tensor_backend::Tensor attention_paged_cache_decode_cuda(
     mfq_tensor_backend::Tensor partial_l,
     int64_t parts,
     bool dynamic_parts);
+
+void paged_kv_cache_gather_cuda(
+    mfq_tensor_backend::Tensor k_chunk_ptrs,
+    mfq_tensor_backend::Tensor v_chunk_ptrs,
+    mfq_tensor_backend::Tensor page_table,
+    mfq_tensor_backend::Tensor k,
+    mfq_tensor_backend::Tensor v,
+    int64_t page_size,
+    int64_t pages_per_chunk);

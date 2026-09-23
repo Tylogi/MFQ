@@ -1,6 +1,7 @@
 #include "mfq/mfq_model_source.h"
 
 #include "mfq_format_compat.h"
+#include "mfq_legacy_tensor_names.h"
 
 #include <algorithm>
 #include <cctype>
@@ -271,6 +272,7 @@ struct MfqModelSource::Impl {
     std::vector<MfqStoredRecord> records;
     std::vector<TensorMetadata> tensors;
     std::vector<std::string> assets;
+    MfqLegacyTensorAliases legacy_tensor_compatibility;
     std::unordered_map<std::string, std::size_t> records_by_name;
     std::unordered_map<std::string, std::size_t> tensors_by_name;
 };
@@ -352,15 +354,59 @@ MfqModelSource::MfqModelSource(std::filesystem::path requested)
         impl_->source_paths = paths;
     }
 
+    std::vector<std::string> stored_names;
     for (const auto& record : impl_->records) {
         if (record.asset) {
             impl_->assets.push_back(record.tensor.name);
-            continue;
+        } else {
+            stored_names.push_back(record.tensor.name);
         }
-        impl_->tensors_by_name.emplace(record.tensor.name, impl_->tensors.size());
-        impl_->tensors.push_back(record.tensor);
     }
     std::sort(impl_->assets.begin(), impl_->assets.end());
+
+    std::unordered_map<std::string, std::string> stored_to_canonical;
+    if (!has_asset(kModelGraphAsset) && has_asset(kModelConfigAsset)) {
+        const auto config = read_asset(kModelConfigAsset);
+        impl_->legacy_tensor_compatibility = make_legacy_tensor_aliases(
+            architecture(),
+            std::string_view(
+                reinterpret_cast<const char*>(config.data()), config.size()),
+            stored_names);
+        for (const auto& [canonical, stored] :
+             impl_->legacy_tensor_compatibility.canonical_to_stored) {
+            const auto record = impl_->records_by_name.find(stored);
+            if (record == impl_->records_by_name.end() ||
+                    impl_->records[record->second].asset ||
+                    impl_->records_by_name.find(canonical) !=
+                        impl_->records_by_name.end()) {
+                throw std::runtime_error(
+                    "invalid legacy MFQ tensor alias: " + canonical);
+            }
+            const auto [found, inserted] =
+                stored_to_canonical.emplace(stored, canonical);
+            if (!inserted && found->second != canonical) {
+                throw std::runtime_error(
+                    "legacy MFQ tensor has multiple canonical names: " +
+                    stored);
+            }
+        }
+    }
+
+    for (const auto& record : impl_->records) {
+        if (record.asset) continue;
+        auto tensor = record.tensor;
+        if (const auto found = stored_to_canonical.find(tensor.name);
+            found != stored_to_canonical.end()) {
+            tensor.name = found->second;
+        }
+        if (!impl_->tensors_by_name.emplace(
+                tensor.name, impl_->tensors.size()).second) {
+            throw std::runtime_error(
+                "legacy MFQ tensor aliases collide at canonical name: " +
+                tensor.name);
+        }
+        impl_->tensors.push_back(std::move(tensor));
+    }
 }
 
 MfqModelSource::~MfqModelSource() = default;
@@ -392,14 +438,27 @@ const TensorMetadata* MfqModelSource::find_tensor(std::string_view name) const n
         : &impl_->tensors[found->second];
 }
 
+const MfqLegacyTensorAliases&
+MfqModelSource::legacy_tensor_compatibility() const noexcept {
+    return impl_->legacy_tensor_compatibility;
+}
+
 void MfqModelSource::read_range_into(
     std::string_view name,
     std::uint64_t relative_offset,
     std::byte* destination,
     std::size_t size) const {
-    const auto found = impl_->records_by_name.find(std::string(name));
+    auto found = impl_->records_by_name.find(std::string(name));
+    if (found == impl_->records_by_name.end()) {
+        const auto alias = impl_->legacy_tensor_compatibility
+            .canonical_to_stored.find(std::string(name));
+        if (alias != impl_->legacy_tensor_compatibility
+                .canonical_to_stored.end()) {
+            found = impl_->records_by_name.find(alias->second);
+        }
+    }
     if (found == impl_->records_by_name.end() ||
-        impl_->records[found->second].asset) {
+            impl_->records[found->second].asset) {
         throw std::runtime_error("model tensor not found: " + std::string(name));
     }
     const auto& record = impl_->records[found->second];

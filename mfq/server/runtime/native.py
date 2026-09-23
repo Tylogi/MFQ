@@ -55,7 +55,11 @@ def native_request_capacity(
 
     if requested < 1:
         raise ValueError("requested runtime concurrency must be positive")
-    return requested if backend == "cuda" and routed_expert_bytes == 0 else 1
+    # Routed expert storage does not determine whether the CUDA scheduler can
+    # batch requests.  The native worker owns model/state compatibility and
+    # its MoE implementation handles both resident and cached experts.
+    _ = routed_expert_bytes
+    return requested if backend == "cuda" else 1
 
 
 def find_native_runtime_resource(executable: str | Path, name: str) -> Path | None:

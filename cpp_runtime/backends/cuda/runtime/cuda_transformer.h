@@ -330,6 +330,16 @@ struct FFN {
     double swiglu_limit = 0.0;
     int moe_layer = -1;
 
+    bool uses_moe_expert_cache() const {
+        if (!is_moe) return false;
+        if (moe_split_gate_up) {
+            return moe_gate.cached_source ||
+                moe_up.cached_source ||
+                moe_down.cached_source;
+        }
+        return moe_gate_up.cached_source || moe_down.cached_source;
+    }
+
     bool tensor_parallel_dense_compatible() const {
         if (is_moe ||
             gate_up.layers.size() != 2 ||
@@ -654,6 +664,36 @@ struct FFN {
                 });
         }
         if (is_moe) {
+            const int64_t rows = xh.numel() / xh.size(-1);
+            if (g_moe_continuous_batch_cache_serial &&
+                    uses_moe_expert_cache() && rows > 1) {
+                // A bounded expert cache cannot safely admit the union of an
+                // arbitrary request batch: a miss in that union otherwise
+                // falls back to staging the complete projection. Keep the
+                // outer request/KV/attention batch intact and execute only
+                // each routed FFN row independently, so cache admission is
+                // bounded by one token's top-k experts.
+                auto flat = xh.reshape({rows, xh.size(-1)}).contiguous();
+                std::vector<mfq_tensor_backend::Tensor> outputs;
+                outputs.reserve(static_cast<size_t>(rows));
+                for (int64_t row = 0; row < rows; ++row) {
+                    auto row_input = flat.narrow(0, row, 1).contiguous();
+                    if (input_ids.has_value()) {
+                        MFQ_RUNTIME_CHECK(
+                            input_ids.value().numel() == rows,
+                            "continuous-batch MoE token ids do not match rows");
+                        auto row_ids = input_ids.value().reshape({rows})
+                            .narrow(0, row, 1).contiguous();
+                        outputs.push_back(forward_impl(
+                            row_input, row_ids, false));
+                    } else {
+                        outputs.push_back(forward_impl(
+                            row_input, mfq_nullopt, false));
+                    }
+                }
+                return mfq_tensor_backend::cat(outputs, 0)
+                    .reshape(xh.sizes());
+            }
             if (!shared || moe_top_k <= 0 || !moe_router.defined() ||
                 (!moe_shared_ungated && !moe_shared_gate.defined())) {
                 throw std::runtime_error("incomplete MoE FFN state");
@@ -745,7 +785,8 @@ struct FFN {
                 return value != nullptr && std::atoi(value) != 0;
             }();
             auto prefetch_projection_bundle = [&]() {
-                if (disable_projection_bundle || cpu_moe_down) {
+                if (disable_projection_bundle || cpu_moe_down ||
+                        g_moe_continuous_batch_cache_serial) {
                     return false;
                 }
                 if (moe_split_gate_up) {
@@ -1173,7 +1214,8 @@ struct KVCache {
 
     std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> append(
             mfq_tensor_backend::Tensor kk, mfq_tensor_backend::Tensor vv, mfq_tensor_backend::Tensor pos,
-            int64_t start_pos, int64_t end_pos) {
+            int64_t start_pos, int64_t end_pos,
+            bool contiguous_prefill_prefix = false) {
         (void)start_pos;
         auto kh = kk.to(scalar_type()).contiguous();
         auto vh = vv.to(scalar_type()).contiguous();
@@ -1186,10 +1228,20 @@ struct KVCache {
             paged_kv_cache_write_cuda(
                 k_chunk_ptrs, v_chunk_ptrs, page_table,
                 kh, vh, pos, page_size, pages_per_chunk);
-            // Continuous-batching prefill starts from an empty sequence, so
-            // the projected K/V tensors are already the logical contiguous
-            // view needed by causal prefill attention. Decode consumes the
-            // physical pages directly below.
+            // Later prefill chunks must attend to the complete previous
+            // prefix, including a final one-token chunk. Decode reads pages
+            // directly and does not materialize a contiguous prefix.
+            if (contiguous_prefill_prefix && start_pos > 0) {
+                auto options = mfq_tensor_backend::TensorOptions()
+                    .device(kh.device()).dtype(kh.scalar_type());
+                auto prefix_k = mfq_tensor_backend::empty(
+                    {paged_batch, paged_heads, end_pos, paged_head_dim}, options);
+                auto prefix_v = mfq_tensor_backend::empty(
+                    {paged_batch, paged_heads, end_pos, paged_head_dim}, options);
+                paged_kv_cache_gather_cuda(k_chunk_ptrs, v_chunk_ptrs,
+                    page_table, prefix_k, prefix_v, page_size, pages_per_chunk);
+                return {prefix_k, prefix_v};
+            }
             return {kh, vh};
         }
         MFQ_RUNTIME_CHECK(
@@ -1573,7 +1625,8 @@ struct FullBlock : Block {
             });
             kv = g_profiler.measure("full.kv_write", [&]() {
                 return cache.append(
-                    k, v, write_positions, cache_pos, cache_pos + T);
+                    k, v, write_positions, cache_pos, cache_pos + T,
+                    !seq_len.has_value());
             });
         }
         }

@@ -96,15 +96,17 @@ struct Qwen35Mtp final : MtpModule {
             cache_pos + tokens <= config.max_position_embeddings,
             "Qwen MTP history exceeds context capacity");
         auto embedded = target.embed(next_ids).to(hidden.scalar_type());
+        const auto norm_weight_offset =
+            config.legacy_tensor_layout.norm_weight_offset;
         auto e = qwen_rms_norm(
             embedded.reshape({batch * tokens, config.hidden_size})
                 .to(mfq_tensor_backend::kFloat32),
-            embedding_norm, config.rms_norm_eps, 1.0)
+            embedding_norm, config.rms_norm_eps, norm_weight_offset)
             .reshape_as(hidden);
         auto h = qwen_rms_norm(
             hidden.reshape({batch * tokens, config.hidden_size})
                 .to(mfq_tensor_backend::kFloat32),
-            hidden_norm, config.rms_norm_eps, 1.0)
+            hidden_norm, config.rms_norm_eps, norm_weight_offset)
             .reshape_as(hidden);
         trace_gemma_stage(0, "mtp.embedding_norm", e);
         trace_gemma_stage(0, "mtp.hidden_norm", h);
@@ -145,7 +147,7 @@ struct Qwen35Mtp final : MtpModule {
         auto output = qwen_rms_norm(
             x.reshape({batch * tokens, config.hidden_size})
                 .to(mfq_tensor_backend::kFloat32),
-            output_norm, config.rms_norm_eps, 1.0)
+            output_norm, config.rms_norm_eps, norm_weight_offset)
             .reshape({batch, tokens, config.hidden_size});
         trace_gemma_stage(0, "mtp.output_norm", output);
         return output;

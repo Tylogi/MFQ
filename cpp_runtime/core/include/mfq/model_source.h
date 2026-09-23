@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mfq/model_graph.h"
+#include "mfq_legacy_tensor_names.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -42,6 +43,11 @@ public:
     virtual const std::vector<TensorMetadata>& tensors() const noexcept = 0;
     virtual const TensorMetadata* find_tensor(
         std::string_view name) const noexcept = 0;
+    virtual const MfqLegacyTensorAliases& legacy_tensor_compatibility()
+        const noexcept {
+        static const MfqLegacyTensorAliases compatibility;
+        return compatibility;
+    }
     virtual void read_range_into(
         std::string_view name,
         std::uint64_t relative_offset,

@@ -6,6 +6,116 @@
 #include "../../runtime/cuda_transformer_loader.h"
 
 namespace mfq::cuda::qwen35 {
+namespace {
+
+FFN load_qwen_ffn(
+        const mfq::ModelSource& source,
+        const Config& config,
+        int layer,
+        std::string_view tensor_root) {
+    const std::string prefix =
+        std::string(tensor_root) + ".block." +
+        std::to_string(layer) + ".mlp.";
+    const std::string expert_gate_up =
+        prefix + "experts.gate_up.weight";
+    const std::string expert_gate = prefix + "experts.gate.weight";
+    const std::string expert_up = prefix + "experts.up.weight";
+    const std::string expert_down = prefix + "experts.down.weight";
+    const bool has_expert_gate_up = has_tensor(source, expert_gate_up);
+    const bool has_expert_gate = has_tensor(source, expert_gate);
+    const bool has_expert_up = has_tensor(source, expert_up);
+    const bool has_expert_down = has_tensor(source, expert_down);
+
+    if (!has_expert_gate_up && !has_expert_gate &&
+            !has_expert_up && !has_expert_down) {
+        return load_ffn(source, config, layer, false, tensor_root);
+    }
+    if (has_expert_gate != has_expert_up) {
+        throw std::runtime_error(
+            "Qwen MoE split Gate/Up records are incomplete at layer " +
+            std::to_string(layer));
+    }
+    if (has_expert_gate_up == has_expert_gate || !has_expert_down) {
+        throw std::runtime_error(
+            "Qwen MoE layer requires exactly one fused or split Gate/Up representation at layer " +
+            std::to_string(layer));
+    }
+    if (config.num_experts <= 0 || config.num_experts_per_tok <= 0 ||
+            config.moe_intermediate_size <= 0 ||
+            config.shared_expert_intermediate_size <= 0) {
+        throw std::runtime_error("Qwen MoE config fields are missing");
+    }
+
+    FFN ffn;
+    ffn.is_moe = true;
+    ffn.moe_split_gate_up = has_expert_gate;
+    if (ffn.moe_split_gate_up) {
+        ffn.moe_gate = load_mfe_gpu(
+            source, expert_gate, true, layer, "gate");
+        ffn.moe_up = load_mfe_gpu(
+            source, expert_up, true, layer, "up");
+    } else {
+        ffn.moe_gate_up = load_mfe_gpu(
+            source, expert_gate_up, true, layer, "gate_up");
+    }
+    ffn.moe_down = load_mfe_gpu(
+        source, expert_down, true, layer, "down");
+    ffn.moe_router = load_dense_gpu(source, prefix + "router.weight")
+        .to(mfq_tensor_backend::kFloat32).contiguous();
+    ffn.moe_shared_gate = load_dense_gpu(
+        source, prefix + "shared_expert.router.weight")
+        .to(mfq_tensor_backend::kFloat32).contiguous();
+    ffn.moe_top_k = static_cast<int>(config.num_experts_per_tok);
+    ffn.moe_use_sqrt_softplus =
+        config.expert_gating_func == "sqrtsoftplus";
+    if (ffn.moe_use_sqrt_softplus) {
+        ffn.moe_normalize = config.norm_topk_prob;
+        ffn.moe_delayed_softmax = false;
+        ffn.moe_router_scale = config.routed_scaling_factor;
+    } else {
+        // Qwen's full-softmax -> top-k -> renormalize is exactly a
+        // softmax over the selected logits; keep that fused delayed form.
+        ffn.moe_delayed_softmax = true;
+    }
+    ffn.moe_layer = layer;
+    ffn.shared = std::make_unique<FFN>();
+    ffn.shared->down = load_quant_linear(
+        source, prefix + "shared_expert.down.weight");
+    ffn.shared->gate_up = load_paired_gate_up(source, {
+        prefix + "shared_expert.gate.weight",
+        prefix + "shared_expert.up.weight"},
+        ffn.shared->down);
+    prepare_ffn_workspaces(*ffn.shared);
+
+    const bool routed_gate_shapes = ffn.moe_split_gate_up
+        ? ffn.moe_gate.n_experts == config.num_experts &&
+            ffn.moe_up.n_experts == config.num_experts &&
+            ffn.moe_gate.neuron_len == config.hidden_size &&
+            ffn.moe_up.neuron_len == config.hidden_size &&
+            ffn.moe_gate.out_per_expert == config.moe_intermediate_size &&
+            ffn.moe_up.out_per_expert == config.moe_intermediate_size
+        : ffn.moe_gate_up.n_experts == config.num_experts &&
+            ffn.moe_gate_up.neuron_len == config.hidden_size &&
+            ffn.moe_gate_up.out_per_expert ==
+                2 * config.moe_intermediate_size;
+    if (!routed_gate_shapes ||
+            ffn.moe_down.n_experts != config.num_experts ||
+            ffn.moe_down.neuron_len != config.moe_intermediate_size ||
+            ffn.moe_down.out_per_expert != config.hidden_size ||
+            ffn.moe_router.dim() != 2 ||
+            ffn.moe_router.size(0) != config.num_experts ||
+            ffn.moe_router.size(1) != config.hidden_size ||
+            ffn.moe_shared_gate.dim() != 2 ||
+            ffn.moe_shared_gate.size(0) != 1 ||
+            ffn.moe_shared_gate.size(1) != config.hidden_size) {
+        throw std::runtime_error(
+            "Qwen MoE tensor shapes disagree with config at layer " +
+            std::to_string(layer));
+    }
+    return ffn;
+}
+
+} // namespace
 
 std::unique_ptr<::Block> load_block(
         const mfq::ModelSource& source,
@@ -25,7 +135,8 @@ std::unique_ptr<::Block> load_block(
         b->attention_head_dim = config.head_dim;
         b->max_position_embeddings = config.max_position_embeddings;
         b->rms_norm_eps = config.rms_norm_eps;
-        b->norm_weight_offset = 1.0;
+        b->norm_weight_offset =
+            config.legacy_tensor_layout.norm_weight_offset;
         b->attention_output_gate = config.attention_output_gate;
         b->attn_norm = load_dense_gpu(
             source, lp + "attention.norm.weight");
@@ -61,13 +172,15 @@ std::unique_ptr<::Block> load_block(
             b->k_norm = load_dense_gpu(
                 source, ap + "key_norm.weight");
         }
-        b->ffn = load_ffn(
-            source, config, layer, false, tensor_root);
+        b->ffn = load_qwen_ffn(
+            source, config, layer, tensor_root);
         return b;
     }
     if (type == "linear_attention") {
         auto b = std::make_unique<LinearAttentionBlock>();
         b->qwen_config = config;
+        b->tiled_v_heads =
+            config.legacy_tensor_layout.qwen_gdn_gguf_layout;
         b->attn_norm = load_dense_gpu(source, lp + "attention.norm.weight");
         b->ffn_norm = load_dense_gpu(source, lp + "mlp.norm.weight");
         const std::string sp = lp + "linear_attention.";
@@ -136,7 +249,10 @@ std::unique_ptr<::Block> load_block(
             b->conv_bias = load_dense_gpu(source, sp + "conv.bias");
         }
         b->dt_bias = load_dense_gpu(source, sp + "dt_bias");
-        b->a_log = load_dense_gpu(source, sp + "a");
+        const auto a_parameter = load_dense_gpu(source, sp + "a");
+        b->a_log = config.legacy_tensor_layout.linear_attention_a_is_log
+            ? a_parameter
+            : mfq_tensor_backend::log(-a_parameter);
         b->linear_norm = load_dense_gpu(source, sp + "norm.weight");
         const std::string out_name = sp + "output.weight";
         if (is_quant_dtype(require_tensor(source, out_name).dtype)) {
@@ -153,8 +269,8 @@ std::unique_ptr<::Block> load_block(
                     "dense linear_attention output projection must be 2D");
             }
         }
-        b->ffn = load_ffn(
-            source, config, layer, false, tensor_root);
+        b->ffn = load_qwen_ffn(
+            source, config, layer, tensor_root);
         return b;
     }
     return load_transformer_block(

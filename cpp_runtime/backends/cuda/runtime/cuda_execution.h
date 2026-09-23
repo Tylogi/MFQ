@@ -345,6 +345,7 @@ extern bool g_force_moe_pool_path;
 extern bool g_force_moe_unfused_reduce;
 extern bool g_force_moe_materialized_swiglu;
 extern bool g_force_moe_prefill_mma_off;
+extern thread_local bool g_moe_continuous_batch_cache_serial;
 extern KlMmqMode g_kl_mmq_mode;
 extern int64_t g_kl_mmq_activation_quantize_calls;
 extern int64_t g_kl_mmq_dense_calls;

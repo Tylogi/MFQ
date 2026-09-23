@@ -37,6 +37,52 @@ static void clear_full_attention_decode_workspaces(FullBlock & block) {
     block.decode_mma_meta = Tensor();
 }
 
+static bool qwen_continuous_batch_has_moe(
+        const mfq::cuda::Qwen35CausalLm & model) {
+    for (const auto & block : model.blocks) {
+        if (const auto * full = dynamic_cast<const FullBlock *>(block.get())) {
+            if (full->ffn.is_moe) return true;
+        } else if (const auto * linear =
+                dynamic_cast<const LinearBlock *>(block.get())) {
+            if (linear->ffn.is_moe) return true;
+        }
+    }
+    return false;
+}
+
+static bool qwen_continuous_batch_has_cached_moe(
+        const mfq::cuda::Qwen35CausalLm & model) {
+    for (const auto & block : model.blocks) {
+        if (const auto * full = dynamic_cast<const FullBlock *>(block.get())) {
+            if (full->ffn.uses_moe_expert_cache()) return true;
+        } else if (const auto * linear =
+                dynamic_cast<const LinearBlock *>(block.get())) {
+            if (linear->ffn.uses_moe_expert_cache()) return true;
+        }
+    }
+    return false;
+}
+
+class MoeContinuousBatchCacheScope {
+public:
+    explicit MoeContinuousBatchCacheScope(bool enabled)
+        : previous_(g_moe_continuous_batch_cache_serial) {
+        g_moe_continuous_batch_cache_serial = enabled;
+    }
+
+    ~MoeContinuousBatchCacheScope() {
+        g_moe_continuous_batch_cache_serial = previous_;
+    }
+
+    MoeContinuousBatchCacheScope(
+        const MoeContinuousBatchCacheScope &) = delete;
+    MoeContinuousBatchCacheScope & operator=(
+        const MoeContinuousBatchCacheScope &) = delete;
+
+private:
+    bool previous_ = false;
+};
+
 static std::string qwen_continuous_batching_incompatibility(
         const mfq::cuda::Qwen35CausalLm & model) {
     if (model.blocks.empty()) {
@@ -45,22 +91,26 @@ static std::string qwen_continuous_batching_incompatibility(
     if (g_dense_cpu_layer_count != 0 || !g_dsv4_cpu_offload_layers.empty()) {
         return "continuous batching requires GPU-resident model blocks";
     }
-    if (g_moe_expert_cache) {
-        return "continuous batching cannot use the expert cache";
-    }
     for (const auto & block : model.blocks) {
         if (block->cpu_offloaded) {
             return "continuous batching cannot use CPU-offloaded blocks";
         }
         if (const auto * full = dynamic_cast<const FullBlock *>(block.get())) {
-            if (full->sliding || full->ffn.is_moe) {
-                return "continuous batching requires dense non-sliding Qwen blocks";
+            if (full->sliding) {
+                return "continuous batching requires non-sliding Qwen attention";
+            }
+            if (full->ffn.uses_moe_expert_cache() &&
+                    full->ffn.moe_top_k >
+                        g_moe_cache_registration_min_slots) {
+                return "continuous batching requires one cached slot per routed expert";
             }
             continue;
         }
         if (const auto * linear = dynamic_cast<const LinearBlock *>(block.get())) {
-            if (linear->ffn.is_moe) {
-                return "continuous batching requires dense Qwen blocks";
+            if (linear->ffn.uses_moe_expert_cache() &&
+                    linear->ffn.moe_top_k >
+                        g_moe_cache_registration_min_slots) {
+                return "continuous batching requires one cached slot per routed expert";
             }
             continue;
         }
@@ -88,6 +138,7 @@ static bool qwen_continuous_batch_cuda_graph_enabled(const mfq::cuda::Qwen35Caus
         std::getenv("MFQ_RUNTIME_CUDA_GRAPH");
     return (environment == nullptr || std::atoi(environment) != 0) &&
         (runtime_environment == nullptr || runtime_environment[0] != '0') &&
+        !qwen_continuous_batch_has_cached_moe(model) &&
         mfq_cuda_graph_capture_supported() &&
         model_parallel_cuda_graph_enabled();
 }
@@ -371,6 +422,9 @@ public:
         : model_(model), model_mutex_(model_mutex),
           max_sequences_(max_sequences),
           prefill_chunk_size_(prefill_chunk_size),
+          moe_enabled_(qwen_continuous_batch_has_moe(model)),
+          cached_moe_enabled_(
+              qwen_continuous_batch_has_cached_moe(model)),
           initial_batch_wait_(initial_batch_wait) {
         if (max_sequences_ < 1) {
             throw std::invalid_argument(
@@ -544,6 +598,10 @@ public:
                 static_cast<double>(cuda_graph_replays_.load())},
             {"continuous_batching_mtp_target_only_requests",
                 static_cast<double>(mtp_bypasses_.load())},
+            {"continuous_batching_moe",
+                moe_enabled_ ? 1.0 : 0.0},
+            {"continuous_batching_moe_cached_row_serial",
+                cached_moe_enabled_ ? 1.0 : 0.0},
             {"continuous_batching_prefix_cache_bypasses",
                 static_cast<double>(prefix_cache_bypasses_.load())},
             {"continuous_batching_paged_kv",
@@ -1114,6 +1172,8 @@ private:
         }
         Tensor logits;
         Tensor graph_tokens;
+        MoeContinuousBatchCacheScope moe_cache_scope(
+            cached_moe_enabled_ && batch > 1);
         try {
             model_.cache_pos = max_position;
             if (graph_decode) {
@@ -1384,6 +1444,8 @@ private:
     std::mutex & model_mutex_;
     int32_t max_sequences_ = 0;
     int64_t prefill_chunk_size_ = 2048;
+    bool moe_enabled_ = false;
+    bool cached_moe_enabled_ = false;
     std::chrono::microseconds initial_batch_wait_;
     std::thread worker_;
     mutable std::mutex queue_mutex_;
@@ -1553,6 +1615,18 @@ static int run_qwen_continuous_batching_check(mfq::cuda::Qwen35CausalLm & model)
     MFQ_RUNTIME_CHECK(first_produced == first_params.max_tokens &&
         second_produced == second_params.max_tokens,
         "continuous batching generated token count mismatch");
+    const auto print_mismatch = [](const char * name,
+            const std::vector<int64_t> & reference,
+            const std::vector<int64_t> & actual) {
+        if (reference == actual) return;
+        std::cerr << "continuous_batching_check mismatch " << name << " reference=";
+        for (auto token : reference) std::cerr << token << ',';
+        std::cerr << " actual=";
+        for (auto token : actual) std::cerr << token << ',';
+        std::cerr << '\n';
+    };
+    print_mismatch("first", first_reference, first_output);
+    print_mismatch("second", second_reference, second_output);
     MFQ_RUNTIME_CHECK(first_output == first_reference,
         "continuous batching first request differs from serial greedy oracle");
     MFQ_RUNTIME_CHECK(second_output == second_reference,

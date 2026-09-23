@@ -72,6 +72,8 @@ mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
     const auto payload = load_model_config_json(source, config_path);
     if constexpr (Kind == CudaBackbone::generic_qwen) {
         model.config = qwen35::Config::from_json(payload, model.graph);
+        model.config.legacy_tensor_layout =
+            source.legacy_tensor_compatibility().layout;
         if (model.graph.component("vision") != nullptr &&
                 model.plan.vision != CudaVisionAdapter::grid_vit) {
             throw std::runtime_error(
