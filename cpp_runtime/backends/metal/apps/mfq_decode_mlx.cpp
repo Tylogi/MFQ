@@ -1582,7 +1582,7 @@ template <typename Runtime, typename Loader>
 int run_loaded_runtime(
     const Arguments& arguments,
     const mfq::metal::MfqContainer& container,
-    Runtime runtime,
+    Runtime model,
     Loader load_runtime,
     std::string model_type,
     std::int64_t maximum_context,
@@ -1593,7 +1593,7 @@ int run_loaded_runtime(
     if constexpr (requires(Runtime& value) {
             value.prewarm_ssd_expert_arena();
         }) {
-        runtime.prewarm_ssd_expert_arena();
+        model.prewarm_ssd_expert_arena();
         release_model_load_staging_memory(runtime_stream);
     }
     int prefill_chunk_size = arguments.prefill_chunk_size;
@@ -1602,7 +1602,7 @@ int run_loaded_runtime(
         if constexpr (requires(const Runtime& value) {
                 value.preferred_prefill_chunk_size(prefill_chunk_size);
             }) {
-            const int preferred = runtime.preferred_prefill_chunk_size(
+            const int preferred = model.preferred_prefill_chunk_size(
                 prefill_chunk_size);
             if (preferred > 0 && preferred != prefill_chunk_size) {
                 prefill_chunk_size = preferred;
@@ -1659,7 +1659,7 @@ int run_loaded_runtime(
     auto runtime_mutex = std::make_shared<std::mutex>();
     auto runtime_holder =
         std::make_shared<std::optional<Runtime>>(
-            std::move(runtime));
+            std::move(model));
     const auto paged_cache_factory =
         [&container](std::int64_t context_size)
             -> std::shared_ptr<mfq::cache::PagedPrefixCache> {

@@ -578,8 +578,9 @@ class RuntimePool:
                     raise _job_error(
                         "runtime_memory_limit" if memory_limited else "runtime_instance_limit",
                         (
-                            "runtime memory budget reached; all remaining instances "
-                            "are pinned or busy"
+                            f"runtime memory budget reached: model needs {incoming_bytes:,} B; "
+                            f"remaining capacity under the runtime budget: "
+                            f"{max(0, memory_ceiling - committed_bytes):,} B"
                             if memory_limited
                             else "managed runtime instance limit reached; all instances "
                             "are pinned or busy"

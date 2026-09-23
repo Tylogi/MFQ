@@ -170,6 +170,7 @@ def test_automatic_memory_budget_tracks_current_reclaimable_memory(
     ) == 10
 
 
+
 def test_automatic_memory_pressure_uses_soft_and_hard_watermarks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2602,6 +2603,35 @@ def test_runtime_memory_budget_evicts_idle_models_and_respects_pins(
     async def run() -> None:
         await scenario(tmp_path / "evictable", pinned=False)
         await scenario(tmp_path / "pinned", pinned=True)
+
+    asyncio.run(run())
+
+
+def test_runtime_memory_limit_without_instances_reports_available_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        _model(tmp_path / "small.mfq", architecture="qwen35")
+        catalog = ModelCatalog([tmp_path])
+        artifact = await catalog.resolve("small")
+        size = artifact.resource.total_bytes
+        pool = RuntimePool(
+            catalog,
+            tmp_path / "runtime",
+            max_runtime_memory_bytes=size * 2,
+        )
+        monkeypatch.setattr(pool, "_effective_runtime_memory_budget_locked", lambda: size // 2)
+
+        with pytest.raises(JobExecutionError) as blocked:
+            await pool.load(
+                _TestJobContext(),  # type: ignore[arg-type]
+                {"model": "small"},
+            )
+
+        assert blocked.value.detail.code == "runtime_memory_limit"
+        assert f"model needs {size:,} B" in blocked.value.detail.message
+        assert f"remaining capacity under the runtime budget: {size // 2:,} B" in blocked.value.detail.message
+        assert "pinned or busy" not in blocked.value.detail.message
 
     asyncio.run(run())
 
