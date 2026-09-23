@@ -7,7 +7,7 @@ from uuid import UUID
 import httpx
 import pytest
 
-from mfq.server.models import (
+from mfq.server.protocol.models import (
     JsonSchemaResponseFormat,
     NamedToolChoice,
     SamplingParams,

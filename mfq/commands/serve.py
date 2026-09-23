@@ -207,7 +207,7 @@ def _server_storage_paths(
 
 
 def _run(args: argparse.Namespace) -> int:
-    from mfq.server.network import install_system_proxy_environment, network_auth_error
+    from mfq.server.api.network import install_system_proxy_environment, network_auth_error
 
     client_api_key = os.environ.get(args.api_key_env, "")
     if error := network_auth_error(args.host, client_api_key):
@@ -216,16 +216,16 @@ def _run(args: argparse.Namespace) -> int:
     import uvicorn
 
     from mfq.server.api import create_app
-    from mfq.server.auth import ApiKeyManager
-    from mfq.server.catalog import ModelCatalog
-    from mfq.server.cluster import ClusterBackend
-    from mfq.server.components import VoiceOutputComponent
-    from mfq.server.jobs import JobManager
-    from mfq.server.models import ModelLoadRequest
-    from mfq.server.runtime.pool import RuntimePool
-    from mfq.server.service import ServerService
-    from mfq.server.storage import SessionStore
-    from mfq.server.tool_jobs import ToolJobHandlers, ToolJobPaths
+    from mfq.server.api.auth import ApiKeyManager
+    from mfq.server.state.catalog import ModelCatalog
+    from mfq.server.runtime.cluster import ClusterBackend
+    from mfq.server.services.components import VoiceOutputComponent
+    from mfq.server.services.jobs import JobManager
+    from mfq.server.protocol.models import ModelLoadRequest
+    from mfq.server.runtime.runtime_pool import RuntimePool
+    from mfq.server.services.service import ServerService
+    from mfq.server.state.storage import SessionStore
+    from mfq.server.services.tool_jobs import ToolJobHandlers, ToolJobPaths
     from mfq.server.vision import clear_image_decode_cache
 
     data_dir = args.data_dir.expanduser().resolve()

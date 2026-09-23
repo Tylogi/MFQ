@@ -18,7 +18,7 @@ import torch
 from PIL import Image
 
 from mfq.server import vision as vision_module
-from mfq.server.models import SamplingParams
+from mfq.server.protocol.models import SamplingParams
 from mfq.server.runtime.backend import OpenAIChatBackend
 from mfq.server.runtime.client import HttpRuntimeClient
 from mfq.server.vision import (

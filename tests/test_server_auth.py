@@ -6,8 +6,8 @@ from pathlib import Path
 import httpx
 
 from mfq.server.api import create_app
-from mfq.server.auth import ApiKeyManager, hash_api_key
-from mfq.server.storage import SCHEMA_VERSION, SessionStore
+from mfq.server.api.auth import ApiKeyManager, hash_api_key
+from mfq.server.state.storage import SCHEMA_VERSION, SessionStore
 
 
 def test_scoped_keys_rotate_revoke_and_never_persist_plaintext(tmp_path: Path) -> None:

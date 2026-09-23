@@ -10,15 +10,15 @@ import httpx
 import pytest
 
 from mfq.server.api import create_app
-from mfq.server.jobs import JobManager
-from mfq.server.models import (
+from mfq.server.protocol.models import (
     CreateJobRequest,
     ErrorDetail,
     JobEventType,
     JobStatus,
 )
-from mfq.server.service import ServerService
-from mfq.server.storage import InvalidJobStateError, JobNotFoundError, SessionStore
+from mfq.server.services.jobs import JobManager
+from mfq.server.services.service import ServerService
+from mfq.server.state.storage import InvalidJobStateError, JobNotFoundError, SessionStore
 
 JOB_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 NOW = datetime(2026, 8, 11, tzinfo=timezone.utc)

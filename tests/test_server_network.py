@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from mfq.commands import serve
-from mfq.server import network
+from mfq.server.api import network
 
 
 @pytest.mark.parametrize(

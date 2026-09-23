@@ -7527,7 +7527,7 @@ def convert(args: argparse.Namespace) -> None:
             and (root / "tokenizer_config.json").is_file()
         ):
             try:
-                from mfq.server.hf_tokenizer import ensure_hf_tokenizer_gguf
+                from mfq.server.runtime.hf_tokenizer import ensure_hf_tokenizer_gguf
 
                 tokenizer_gguf = ensure_hf_tokenizer_gguf(root)
             except Exception as error:

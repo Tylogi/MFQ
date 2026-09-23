@@ -12,14 +12,14 @@ import pytest
 
 from mfq.server.api import create_app
 from mfq.server.runtime.backend import BackendDelta, BackendError
-from mfq.server.cluster import ClusterBackend
-from mfq.server.models import (
+from mfq.server.runtime.cluster import ClusterBackend
+from mfq.server.protocol.models import (
     CreateRemoteNodeRequest,
     SamplingParams,
     UpdateRemoteNodeRequest,
 )
-from mfq.server.service import ServerService
-from mfq.server.storage import SessionStore
+from mfq.server.services.service import ServerService
+from mfq.server.state.storage import SessionStore
 from tests.test_server_service import FakeBackend
 
 
@@ -196,7 +196,7 @@ def test_cluster_registers_probes_and_routes_matching_model(tmp_path: Path) -> N
                     }
                 ],
                 sampling=__import__(
-                    "mfq.server.models", fromlist=["SamplingParams"]
+                    "mfq.server.protocol.models", fromlist=["SamplingParams"]
                 ).SamplingParams(),
                 session_id=UUID("33333333-3333-4333-8333-333333333333"),
             ):
@@ -210,7 +210,7 @@ def test_cluster_registers_probes_and_routes_matching_model(tmp_path: Path) -> N
                     model="remote-model",
                     messages=[{"role": "user", "content": "edited"}],
                     sampling=__import__(
-                        "mfq.server.models", fromlist=["SamplingParams"]
+                        "mfq.server.protocol.models", fromlist=["SamplingParams"]
                     ).SamplingParams(),
                     session_id=UUID("33333333-3333-4333-8333-333333333333"),
                 )
@@ -286,7 +286,7 @@ def test_remote_node_configuration_never_persists_secret(tmp_path: Path, monkeyp
     store = SessionStore(tmp_path / "mfq.server.sqlite3")
     node = store.create_remote_node(
         __import__(
-            "mfq.server.models", fromlist=["CreateRemoteNodeRequest"]
+            "mfq.server.protocol.models", fromlist=["CreateRemoteNodeRequest"]
         ).CreateRemoteNodeRequest(
             name="secure", url="https://worker.example", api_key_env="REMOTE_NODE_TOKEN"
         )
@@ -346,7 +346,7 @@ def test_stateless_remote_stream_releases_ephemeral_session(tmp_path: Path) -> N
                     model="remote-model",
                     messages=[{"role": "user", "content": "hello"}],
                     sampling=__import__(
-                        "mfq.server.models", fromlist=["SamplingParams"]
+                        "mfq.server.protocol.models", fromlist=["SamplingParams"]
                     ).SamplingParams(),
                 )
             ]
@@ -361,7 +361,7 @@ def test_stateless_remote_stream_releases_ephemeral_session(tmp_path: Path) -> N
                 model="remote-model",
                 messages=[{"role": "user", "content": "stop early"}],
                 sampling=__import__(
-                    "mfq.server.models", fromlist=["SamplingParams"]
+                    "mfq.server.protocol.models", fromlist=["SamplingParams"]
                 ).SamplingParams(),
             )
             assert (await anext(interrupted)).content_delta == "remote"
@@ -783,7 +783,7 @@ def test_cluster_fails_over_before_the_first_remote_delta(tmp_path: Path) -> Non
                 model="remote-model",
                 messages=[{"role": "user", "content": "hello"}],
                 sampling=__import__(
-                    "mfq.server.models", fromlist=["SamplingParams"]
+                    "mfq.server.protocol.models", fromlist=["SamplingParams"]
                 ).SamplingParams(),
                 session_id=UUID("33333333-3333-4333-8333-333333333333"),
             )
@@ -841,7 +841,7 @@ def test_cluster_never_replays_after_a_remote_delta(tmp_path: Path) -> None:
                 model="remote-model",
                 messages=[{"role": "user", "content": "hello"}],
                 sampling=__import__(
-                    "mfq.server.models", fromlist=["SamplingParams"]
+                    "mfq.server.protocol.models", fromlist=["SamplingParams"]
                 ).SamplingParams(),
             ):
                 received.append(delta)

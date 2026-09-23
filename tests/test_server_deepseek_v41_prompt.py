@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from mfq.server.deepseek_v41_prompt import render_deepseek_v41_prompt
-from mfq.server.input_protocols import render_preformatted_prompt
-from mfq.server.models import ToolDefinition
-from mfq.server.processor_prompt_protocols import (
+from mfq.server.protocol.deepseek_v41_prompt import render_deepseek_v41_prompt
+from mfq.server.protocol.input_protocols import render_preformatted_prompt
+from mfq.server.protocol.models import ToolDefinition
+from mfq.server.protocol.processor_prompt_protocols import (
     DEEPSEEK_V4_CHAT_TEMPLATE,
     DEEPSEEK_V41_CHAT_TEMPLATE,
     processor_prompt_protocol_for_architecture,

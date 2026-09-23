@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mfq.server.storage import SCHEMA_VERSION, SessionStore
+from mfq.server.state.storage import SCHEMA_VERSION, SessionStore
 
 
 def test_artifact_lineage_tracks_validation_and_schema_migration(tmp_path: Path) -> None:

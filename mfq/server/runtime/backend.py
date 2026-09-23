@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
-from mfq.server.capabilities import capabilities_for_architecture
-from mfq.server.input_protocols import render_preformatted_prompt
-from mfq.server.models import (
+from mfq.server.runtime.capabilities import capabilities_for_architecture
+from mfq.server.protocol.input_protocols import render_preformatted_prompt
+from mfq.server.protocol.models import (
     ModelCapabilities,
     ResponseFormat,
     ResponsePerformance,
@@ -24,7 +24,7 @@ from mfq.server.models import (
     ToolChoice,
     ToolDefinition,
 )
-from mfq.server.output_protocols import (
+from mfq.server.protocol.output_protocols import (
     ParsedToolCall,
     output_protocol_for_architecture,
 )

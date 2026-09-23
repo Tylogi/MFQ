@@ -7,11 +7,11 @@ from uuid import UUID
 
 import httpx
 
-import mfq.server.storage as storage_module
+import mfq.server.state.storage as storage_module
 from mfq.server.api import create_app
-from mfq.server.models import RuntimeLogLevel
-from mfq.server.service import ServerService
-from mfq.server.storage import SessionStore
+from mfq.server.protocol.models import RuntimeLogLevel
+from mfq.server.services.service import ServerService
+from mfq.server.state.storage import SessionStore
 
 INSTANCE_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 NOW = datetime(2026, 8, 11, tzinfo=timezone.utc)

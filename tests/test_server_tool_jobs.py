@@ -11,16 +11,16 @@ import numpy as np
 from mfq.formats.header import FileHeader
 from mfq.formats.io import save
 from mfq.quantize.imatrix import ImportanceEntry, save_importance_matrix
-from mfq.server.catalog import ModelCatalog
-from mfq.server.jobs import JobManager
-from mfq.server.models import CreateJobRequest, JobStatus
-from mfq.server.storage import SessionStore
-from mfq.server.tool_jobs import (
+from mfq.server.protocol.models import CreateJobRequest, JobStatus
+from mfq.server.services.jobs import JobManager
+from mfq.server.services.tool_jobs import (
     ImatrixCalibrationPayload,
     QuantizePayload,
     ToolJobHandlers,
     ToolJobPaths,
 )
+from mfq.server.state.catalog import ModelCatalog
+from mfq.server.state.storage import SessionStore
 
 
 def test_imatrix_jobs_default_to_compact_activation_aware_objective() -> None:
@@ -72,7 +72,7 @@ def _model(path: Path) -> None:
 def test_tool_process_retains_only_a_bounded_output_tail(
     tmp_path: Path, monkeypatch
 ) -> None:
-    import mfq.server.tool_jobs as tool_jobs
+    import mfq.server.services.tool_jobs as tool_jobs
 
     class Context:
         def __init__(self) -> None:

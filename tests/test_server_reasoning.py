@@ -1,4 +1,4 @@
-from mfq.server.reasoning import TaggedReasoningParser, split_tagged_reasoning
+from mfq.server.protocol.reasoning import TaggedReasoningParser, split_tagged_reasoning
 
 
 def test_reasoning_parser_hides_tags_split_across_transport_chunks() -> None:

@@ -7,14 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from mfq.server.mcp import McpClient
-from mfq.server.models import (
+from mfq.server.protocol.models import (
     CreateMcpServerRequest,
     McpToolCallRequest,
     McpTransport,
 )
-from mfq.server.service import ServerService, ServiceError
-from mfq.server.storage import SessionStore
+from mfq.server.services.mcp import McpClient
+from mfq.server.services.service import ServerService, ServiceError
+from mfq.server.state.storage import SessionStore
 from tests.test_server_service import FakeBackend
 
 

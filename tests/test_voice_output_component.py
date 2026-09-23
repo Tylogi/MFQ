@@ -7,12 +7,12 @@ from pathlib import Path
 
 import httpx
 
-import mfq.server.components as components
+import mfq.server.services.components as components
 from mfq.server.api import create_app
-from mfq.server.components import ComponentFile, VoiceOutputComponent
-from mfq.server.jobs import JobManager
-from mfq.server.service import ServerService
-from mfq.server.storage import SessionStore
+from mfq.server.services.components import ComponentFile, VoiceOutputComponent
+from mfq.server.services.jobs import JobManager
+from mfq.server.services.service import ServerService
+from mfq.server.state.storage import SessionStore
 
 
 class IdleBackend:

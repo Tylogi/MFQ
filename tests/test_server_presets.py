@@ -6,15 +6,15 @@ from pathlib import Path
 
 import pytest
 
-from mfq.server.models import (
+from mfq.server.protocol.models import (
     CreateGenerationPresetRequest,
     ResponseRequestSettings,
     SamplingParams,
     SessionMode,
     UpdateGenerationPresetRequest,
 )
-from mfq.server.service import ServerService, ServiceError
-from mfq.server.storage import SessionStore
+from mfq.server.services.service import ServerService, ServiceError
+from mfq.server.state.storage import SessionStore
 from tests.test_server_service import FakeBackend
 
 

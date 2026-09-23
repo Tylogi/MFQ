@@ -9,7 +9,8 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 
 from mfq.server.api import create_app, create_contract_app
-from mfq.server.models import (
+from mfq.server.api.openapi import REALTIME_EVENTS, build_openapi_schema, render_openapi
+from mfq.server.protocol.models import (
     PROTOCOL_VERSION,
     ContentPart,
     CreateResponseRequest,
@@ -19,7 +20,6 @@ from mfq.server.models import (
     SessionState,
     SessionStateChanged,
 )
-from mfq.server.openapi import REALTIME_EVENTS, build_openapi_schema, render_openapi
 
 SESSION_ID = UUID("11111111-1111-4111-8111-111111111111")
 RESPONSE_ID = UUID("22222222-2222-4222-8222-222222222222")
@@ -186,8 +186,9 @@ def test_openapi_contract_has_all_native_routes_and_realtime_extension() -> None
     assert set(schema["paths"]) == expected_paths
     assert schema["x-mfq-protocol-version"] == PROTOCOL_VERSION
     assert schema["x-mfq-websocket"]["events"] == REALTIME_EVENTS
-    assert any(route.path == "/api/v1/realtime" for route in create_contract_app().routes)
-    assert any(route.path == "/api/v1/runtime/realtime" for route in create_contract_app().routes)
+    app = create_contract_app()
+    assert app.url_path_for("realtime") == "/api/v1/realtime"
+    assert app.url_path_for("runtime_realtime") == "/api/v1/runtime/realtime"
 
 
 def test_checked_in_openapi_is_current() -> None:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from mfq.server.deepseek_v4_prompt import render_deepseek_v4_prompt
-from mfq.server.models import ToolDefinition
+from mfq.server.protocol.deepseek_v4_prompt import render_deepseek_v4_prompt
+from mfq.server.protocol.models import ToolDefinition
 
 
 def _weather_tool() -> ToolDefinition:

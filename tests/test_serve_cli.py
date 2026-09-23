@@ -27,7 +27,10 @@ def test_server_runtime_control_plane_has_no_architecture_dispatch() -> None:
     root = Path(__file__).resolve().parents[1]
     source = "\n".join(
         (root / path).read_text(encoding="utf-8")
-        for path in ("mfq/server/runtime/native.py", "mfq/server/runtime/pool.py")
+        for path in (
+            "mfq/server/runtime/native.py",
+            "mfq/server/runtime/runtime_pool.py",
+        )
     )
 
     for forbidden in (
@@ -48,11 +51,11 @@ import sys
 
 for name in (
     'mfq.server.api',
-    'mfq.server.catalog',
+    'mfq.server.state.catalog',
     'mfq.commands.serve',
     'mfq.server.runtime.native',
-    'mfq.server.runtime.pool',
-    'mfq.server.service',
+    'mfq.server.runtime.runtime_pool',
+    'mfq.server.services.service',
 ):
     importlib.import_module(name)
 

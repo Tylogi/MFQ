@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from mfq.server.xml_tool_calls import (
+from mfq.server.protocol.xml_tool_calls import (
     XMLToolCallParseError,
     XMLToolCallStreamParser,
 )

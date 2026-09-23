@@ -7,7 +7,7 @@ from uuid import UUID
 
 import pytest
 
-from mfq.server.models import (
+from mfq.server.protocol.models import (
     CreateSessionRequest,
     ErrorDetail,
     ForkSessionRequest,
@@ -19,7 +19,7 @@ from mfq.server.models import (
     TokenUsage,
     UpdateSessionRequest,
 )
-from mfq.server.storage import (
+from mfq.server.state.storage import (
     IdempotencyConflictError,
     MediaIntegrityError,
     MessageNotFoundError,

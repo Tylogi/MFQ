@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from mfq.server.capabilities import capabilities_for_architecture
-from mfq.server.output_protocols import output_protocol_for_architecture
+from mfq.server.protocol.output_protocols import output_protocol_for_architecture
+from mfq.server.runtime.capabilities import capabilities_for_architecture
 
 ROOT = Path(__file__).resolve().parents[1]
 TRANSPORT_SRC = ROOT / "cpp_runtime" / "transport"

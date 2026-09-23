@@ -8,8 +8,8 @@ from pathlib import Path
 import httpx
 
 from mfq.server.api import create_app
-from mfq.server.service import ServerService
-from mfq.server.storage import SessionStore
+from mfq.server.services.service import ServerService
+from mfq.server.state.storage import SessionStore
 from tests.test_server_service import FakeBackend
 
 

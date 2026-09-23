@@ -9,10 +9,10 @@ from pathlib import Path
 import pytest
 
 from mfq.server.runtime.backend import BackendDelta
-from mfq.server.documents import DocumentExtractionError, extract_document
-from mfq.server.models import CreateDocumentRequest, CreateSessionRequest
-from mfq.server.service import ServerService
-from mfq.server.storage import SessionStore
+from mfq.server.services.documents import DocumentExtractionError, extract_document
+from mfq.server.protocol.models import CreateDocumentRequest, CreateSessionRequest
+from mfq.server.services.service import ServerService
+from mfq.server.state.storage import SessionStore
 from tests.test_server_service import FakeBackend
 
 
@@ -67,7 +67,7 @@ def test_document_is_persisted_and_expanded_for_backend(tmp_path: Path) -> None:
         session = await service.create_session(CreateSessionRequest(model="model-a"))
         from uuid import uuid4
 
-        from mfq.server.models import CreateResponseRequest
+        from mfq.server.protocol.models import CreateResponseRequest
 
         prepared = await service.prepare_response(
             session.id,

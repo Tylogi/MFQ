@@ -21,16 +21,16 @@ import pytest
 from mfq.formats.header import FileHeader
 from mfq.formats.io import open_mmap, save
 from mfq.server.api import create_app
-from mfq.server.capabilities import capabilities_for_architecture
-from mfq.server.catalog import (
+from mfq.server.runtime.capabilities import capabilities_for_architecture
+from mfq.server.state.catalog import (
     MODEL_FILE_INDEX,
     DiscoveredModel,
     DuplicateModelNameError,
     ModelCatalog,
 )
-from mfq.server.host_memory import HostMemorySnapshot
-from mfq.server.jobs import JobExecutionError
-from mfq.server.models import (
+from mfq.server.runtime.host_memory import HostMemorySnapshot
+from mfq.server.services.jobs import JobExecutionError
+from mfq.server.protocol.models import (
     ErrorDetail,
     JobStatus,
     ModelArtifactResource,
@@ -40,14 +40,14 @@ from mfq.server.models import (
     SamplingParams,
 )
 from mfq.server.runtime.backend import BackendDelta, BackendError
-from mfq.server.runtime.pool import (
+from mfq.server.runtime.runtime_pool import (
     RuntimeConflictError,
     RuntimePool,
     _CachedLoadFailure,
     _Runtime,
 )
-from mfq.server.service import ServerService
-from mfq.server.storage import SessionStore
+from mfq.server.services.service import ServerService
+from mfq.server.state.storage import SessionStore
 from mfq.tools.split_mfq import split_mfq
 
 
@@ -97,11 +97,11 @@ def test_metal_runtime_pool_derives_a_safe_default_memory_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "mfq.server.runtime.pool.total_physical_memory",
+        "mfq.server.runtime.runtime_pool.total_physical_memory",
         lambda: 128 << 30,
     )
     monkeypatch.setattr(
-        "mfq.server.runtime.pool.metal_recommended_working_set_size",
+        "mfq.server.runtime.runtime_pool.metal_recommended_working_set_size",
         lambda: 110 << 30,
     )
 
@@ -135,15 +135,15 @@ def test_automatic_memory_budget_tracks_current_reclaimable_memory(
 ) -> None:
     gib = 1 << 30
     monkeypatch.setattr(
-        "mfq.server.runtime.pool.total_physical_memory",
+        "mfq.server.runtime.runtime_pool.total_physical_memory",
         lambda: 128 * gib,
     )
     monkeypatch.setattr(
-        "mfq.server.runtime.pool.metal_recommended_working_set_size",
+        "mfq.server.runtime.runtime_pool.metal_recommended_working_set_size",
         lambda: 110 * gib,
     )
     monkeypatch.setattr(
-        "mfq.server.runtime.pool.host_memory_snapshot",
+        "mfq.server.runtime.runtime_pool.host_memory_snapshot",
         lambda: HostMemorySnapshot(
             total=128 * gib,
             free=4 * gib,
@@ -176,11 +176,11 @@ def test_automatic_memory_pressure_uses_soft_and_hard_watermarks(
     gib = 1 << 30
     reclaimable_gib = 10
     monkeypatch.setattr(
-        "mfq.server.runtime.pool.total_physical_memory",
+        "mfq.server.runtime.runtime_pool.total_physical_memory",
         lambda: 128 * gib,
     )
     monkeypatch.setattr(
-        "mfq.server.runtime.pool.host_memory_snapshot",
+        "mfq.server.runtime.runtime_pool.host_memory_snapshot",
         lambda: HostMemorySnapshot(
             total=128 * gib,
             free=reclaimable_gib * gib,
@@ -230,11 +230,11 @@ def test_load_pressure_reclaims_shared_host_cache_before_model_memory(
             return 512 << 20
 
         monkeypatch.setattr(
-            "mfq.server.runtime.pool.total_physical_memory",
+            "mfq.server.runtime.runtime_pool.total_physical_memory",
             lambda: 128 * gib,
         )
         monkeypatch.setattr(
-            "mfq.server.runtime.pool.host_memory_snapshot",
+            "mfq.server.runtime.runtime_pool.host_memory_snapshot",
             snapshot,
         )
         pool = RuntimePool(
@@ -744,7 +744,7 @@ def test_native_hf_metal_auto_streaming_reserves_its_expert_cache(
         routed_expert_bytes=8 << 30,
     )
     monkeypatch.setattr(
-        "mfq.server.runtime.pool.total_physical_memory",
+        "mfq.server.runtime.runtime_pool.total_physical_memory",
         lambda: 6 << 30,
     )
     request = ModelLoadRequest(model="native-hf")

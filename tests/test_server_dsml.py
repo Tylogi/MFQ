@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from mfq.server.dsml import DSMLParseError, DSMLStreamParser
+from mfq.server.protocol.dsml import DSMLParseError, DSMLStreamParser
 
 TOOLS = {
     "write": {

@@ -21,7 +21,7 @@ from mfq.formats.assets import (
     TOKENIZER_GGUF_ASSET,
 )
 from mfq.formats.io import open_mmap
-from mfq.server.hf_tokenizer import (
+from mfq.server.runtime.hf_tokenizer import (
     ensure_hf_tokenizer_gguf,
     ensure_mfq_tokenizer_gguf,
     native_hf_asset_environment,

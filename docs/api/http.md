@@ -568,8 +568,8 @@ The stream sends comment keep-alives while idle and ends after the job reaches
 Regenerate and verify OpenAPI after changing routes or protocol models:
 
 ```shell
-uv run -m mfq.server.openapi mfq/server/protocol/openapi.json
-uv run -m mfq.server.openapi --check mfq/server/protocol/openapi.json
+uv run -m mfq.server.api.openapi mfq/server/protocol/openapi.json
+uv run -m mfq.server.api.openapi --check mfq/server/protocol/openapi.json
 ```
 
 WebSockets are not represented as OpenAPI path operations. The
