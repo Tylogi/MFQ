@@ -107,6 +107,18 @@ std::vector<std::int64_t> broadcast_shape(const Tensor& left, const Tensor& righ
     return result;
 }
 
+bool same_shape(const Tensor& left, const Tensor& right) {
+    if (left.dim() != right.dim()) {
+        return false;
+    }
+    for (std::int64_t dimension = 0; dimension < left.dim(); ++dimension) {
+        if (left.size(dimension) != right.size(dimension)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 __device__ std::int64_t tensor_offset(const TensorView& view, std::int64_t linear) {
     std::int64_t offset = 0;
     for (std::size_t reverse = view.rank; reverse > 0; --reverse) {
@@ -296,6 +308,113 @@ __global__ void scalar_binary_kernel(
             static_cast<std::int64_t>(x) | static_cast<std::int64_t>(y));
         if (operation == 12) result = ::pow(x, y);
         destination[tensor_offset(output, linear)] = store_number<Value>(result);
+    }
+}
+
+// Shared arithmetic for contiguous elementwise kernels.  Direct linear
+// indexing removes TensorView coordinate reconstruction while keeping one
+// logical element per CUDA thread.  That preserves parallel coverage across
+// devices instead of reducing the grid by a dtype-dependent packing factor.
+__device__ float apply_arithmetic(float x, float y, int operation) {
+    if (operation == 0) return x + y;
+    if (operation == 1) return x - y;
+    if (operation == 2) return x * y;
+    return x / y;
+}
+
+template <typename Value>
+__device__ float to_float_value(Value value) {
+    if constexpr (std::is_same_v<Value, __half>) {
+        return __half2float(value);
+    } else if constexpr (std::is_same_v<Value, __nv_bfloat16>) {
+        return __bfloat162float(value);
+    } else {
+        return value;
+    }
+}
+
+template <typename Value>
+__global__ void contiguous_binary_kernel(
+    Value* destination,
+    const Value* left,
+    const Value* right,
+    std::int64_t elements,
+    int operation) {
+    const std::int64_t stride =
+        static_cast<std::int64_t>(blockDim.x) * gridDim.x;
+    for (std::int64_t index =
+             static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < elements;
+         index += stride) {
+        destination[index] = store_number<Value>(static_cast<double>(
+            apply_arithmetic(
+                to_float_value(left[index]),
+                to_float_value(right[index]), operation)));
+    }
+}
+
+template <typename Value>
+__global__ void contiguous_scalar_kernel(
+    Value* destination,
+    const Value* source,
+    std::int64_t elements,
+    double scalar,
+    int operation,
+    bool scalar_first) {
+    const float scalar_value = static_cast<float>(scalar);
+    const std::int64_t stride =
+        static_cast<std::int64_t>(blockDim.x) * gridDim.x;
+    for (std::int64_t index =
+             static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < elements;
+         index += stride) {
+        const float value = to_float_value(source[index]);
+        destination[index] = store_number<Value>(static_cast<double>(
+            scalar_first
+                ? apply_arithmetic(scalar_value, value, operation)
+                : apply_arithmetic(value, scalar_value, operation)));
+    }
+}
+
+// Unary operations eligible for the contiguous fast path: exp(2), sqrt(3),
+// sigmoid(11), tanh(12), relu(13), rsqrt(14), log(18), silu(22). All are
+// parameter-free and produce numeric (non-boolean) output. relu is exact;
+// the transcendentals carry the usual one-ulp float-to-reduced-precision
+// difference covered by the benchmark tolerances.
+bool contiguous_unary_operation(int operation) {
+    return operation == 2 || operation == 3 || operation == 11 ||
+        operation == 12 || operation == 13 || operation == 14 ||
+        operation == 18 || operation == 22;
+}
+
+__device__ float apply_unary(float value, int operation) {
+    switch (operation) {
+        case 2: return ::expf(value);
+        case 3: return ::sqrtf(value);
+        case 11: return 1.0f / (1.0f + ::expf(-value));
+        case 12: return ::tanhf(value);
+        case 13: return ::fmaxf(value, 0.0f);
+        case 14: return 1.0f / ::sqrtf(value);
+        case 18: return ::logf(value);
+        case 22: return value / (1.0f + ::expf(-value));
+        default: return value;
+    }
+}
+
+template <typename Value>
+__global__ void contiguous_unary_kernel(
+    Value* destination,
+    const Value* source,
+    std::int64_t elements,
+    int operation) {
+    const std::int64_t stride =
+        static_cast<std::int64_t>(blockDim.x) * gridDim.x;
+    for (std::int64_t index =
+             static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < elements;
+         index += stride) {
+        destination[index] = store_number<Value>(static_cast<double>(
+            apply_unary(to_float_value(source[index]), operation)));
     }
 }
 
@@ -501,6 +620,135 @@ __global__ void exact_bf16_softmax_normalize_element_kernel(
             static_cast<double>(numerator[linear]) /
             static_cast<double>(denominator[linear / columns]));
     }
+}
+
+template <int Threads>
+__device__ float block_reduce_max(float value, float* shared) {
+    shared[threadIdx.x] = value;
+    __syncthreads();
+    for (int offset = Threads / 2; offset > 0; offset /= 2) {
+        if (threadIdx.x < offset) {
+            shared[threadIdx.x] = ::fmaxf(
+                shared[threadIdx.x], shared[threadIdx.x + offset]);
+        }
+        __syncthreads();
+    }
+    const float result = shared[0];
+    __syncthreads();
+    return result;
+}
+
+template <int Threads>
+__device__ float block_reduce_sum(float value, float* shared) {
+    shared[threadIdx.x] = value;
+    __syncthreads();
+    for (int offset = Threads / 2; offset > 0; offset /= 2) {
+        if (threadIdx.x < offset) {
+            shared[threadIdx.x] += shared[threadIdx.x + offset];
+        }
+        __syncthreads();
+    }
+    const float result = shared[0];
+    __syncthreads();
+    return result;
+}
+
+template <typename Value, int Threads>
+__global__ void row_softmax_last_contiguous_kernel(
+    const Value* __restrict__ input,
+    Value* __restrict__ output,
+    std::int64_t rows,
+    std::int64_t columns) {
+    const auto row = static_cast<std::int64_t>(blockIdx.x);
+    if (row >= rows) return;
+    const auto* row_input = input + row * columns;
+    auto* row_output = output + row * columns;
+    float maximum = -std::numeric_limits<float>::infinity();
+    for (std::int64_t column = threadIdx.x;
+         column < columns;
+         column += Threads) {
+        maximum = ::fmaxf(maximum, static_cast<float>(
+            load_number(row_input, column)));
+    }
+    __shared__ float partial[Threads];
+    maximum = block_reduce_max<Threads>(maximum, partial);
+    float sum = 0.0f;
+    for (std::int64_t column = threadIdx.x;
+         column < columns;
+         column += Threads) {
+        sum += ::expf(static_cast<float>(
+            load_number(row_input, column)) - maximum);
+    }
+    sum = block_reduce_sum<Threads>(sum, partial);
+    const float inverse = 1.0f / sum;
+    for (std::int64_t column = threadIdx.x;
+         column < columns;
+         column += Threads) {
+        row_output[column] = store_number<Value>(::expf(
+            static_cast<float>(load_number(row_input, column)) - maximum) *
+            inverse);
+    }
+}
+
+template <typename Value, int Threads>
+__global__ void row_log_softmax_last_contiguous_kernel(
+    const Value* __restrict__ input,
+    Value* __restrict__ output,
+    std::int64_t rows,
+    std::int64_t columns) {
+    const auto row = static_cast<std::int64_t>(blockIdx.x);
+    if (row >= rows) return;
+    const auto* row_input = input + row * columns;
+    auto* row_output = output + row * columns;
+    float maximum = -std::numeric_limits<float>::infinity();
+    for (std::int64_t column = threadIdx.x;
+         column < columns;
+         column += Threads) {
+        maximum = ::fmaxf(maximum, static_cast<float>(
+            load_number(row_input, column)));
+    }
+    __shared__ float partial[Threads];
+    maximum = block_reduce_max<Threads>(maximum, partial);
+    float sum = 0.0f;
+    for (std::int64_t column = threadIdx.x;
+         column < columns;
+         column += Threads) {
+        sum += ::expf(static_cast<float>(
+            load_number(row_input, column)) - maximum);
+    }
+    sum = block_reduce_sum<Threads>(sum, partial);
+    const float shift = maximum + ::logf(sum);
+    for (std::int64_t column = threadIdx.x;
+         column < columns;
+         column += Threads) {
+        row_output[column] = store_number<Value>(
+            static_cast<float>(load_number(row_input, column)) - shift);
+    }
+}
+
+template <typename Value>
+void launch_row_softmax(
+    const Value* input,
+    Value* output,
+    std::int64_t rows,
+    std::int64_t columns,
+    bool logarithmic,
+    cudaStream_t stream) {
+    const auto launch = [&]<int Threads>() {
+        if (logarithmic) {
+            row_log_softmax_last_contiguous_kernel<Value, Threads>
+                <<<static_cast<unsigned int>(rows), Threads, 0, stream>>>(
+                    input, output, rows, columns);
+        } else {
+            row_softmax_last_contiguous_kernel<Value, Threads>
+                <<<static_cast<unsigned int>(rows), Threads, 0, stream>>>(
+                    input, output, rows, columns);
+        }
+    };
+    if (columns <= 32) launch.template operator()<32>();
+    else if (columns <= 64) launch.template operator()<64>();
+    else if (columns <= 128) launch.template operator()<128>();
+    else launch.template operator()<256>();
 }
 
 bool matrix_layout_supported(const Tensor& tensor) {
@@ -836,10 +1084,10 @@ __global__ void reduce_kernel(
     }
 }
 
-template <int Threads>
-__global__ void row_mean_last_contiguous_f32_kernel(
-    const float* __restrict__ input,
-    float* __restrict__ output,
+template <typename Value, int Threads>
+__global__ void row_mean_last_contiguous_kernel(
+    const Value* __restrict__ input,
+    Value* __restrict__ output,
     std::int64_t rows,
     std::int64_t columns) {
     const auto row = static_cast<std::int64_t>(blockIdx.x);
@@ -848,7 +1096,8 @@ __global__ void row_mean_last_contiguous_f32_kernel(
     for (std::int64_t column = threadIdx.x;
          column < columns;
          column += Threads) {
-        accumulator += input[row * columns + column];
+        accumulator += static_cast<float>(
+            load_number(input, row * columns + column));
     }
     __shared__ float partial[Threads];
     partial[threadIdx.x] = accumulator;
@@ -860,8 +1109,27 @@ __global__ void row_mean_last_contiguous_f32_kernel(
         __syncthreads();
     }
     if (threadIdx.x == 0) {
-        output[row] = partial[0] / static_cast<float>(columns);
+        output[row] = store_number<Value>(
+            partial[0] / static_cast<float>(columns));
     }
+}
+
+template <typename Value>
+void launch_row_mean(
+    const Value* input,
+    Value* output,
+    std::int64_t rows,
+    std::int64_t columns,
+    cudaStream_t stream) {
+    const auto launch = [&]<int Threads>() {
+        row_mean_last_contiguous_kernel<Value, Threads>
+            <<<static_cast<unsigned int>(rows), Threads, 0, stream>>>(
+                input, output, rows, columns);
+    };
+    if (columns <= 32) launch.template operator()<32>();
+    else if (columns <= 64) launch.template operator()<64>();
+    else if (columns <= 128) launch.template operator()<128>();
+    else launch.template operator()<256>();
 }
 
 template <int Threads>
@@ -955,8 +1223,18 @@ Tensor unary_cuda(
     auto output = empty(source.sizes(), options);
     const auto [blocks, threads] = launch_geometry(source.numel());
     const auto stream = current_stream(source.get_device()).stream();
+    const bool contiguous_unary = contiguous_unary_operation(operation) &&
+        (source.scalar_type() == kFloat32 ||
+         source.scalar_type() == kFloat16 ||
+         source.scalar_type() == kBFloat16) &&
+        source.is_contiguous() && output.is_contiguous();
     auto launch = [&]<typename Value>() {
-        if (boolean_output) {
+        if (contiguous_unary) {
+            contiguous_unary_kernel<Value><<<blocks, threads, 0, stream>>>(
+                static_cast<Value*>(output.data_ptr()),
+                static_cast<const Value*>(source.data_ptr()),
+                source.numel(), operation);
+        } else if (boolean_output) {
             unary_bool_kernel<Value><<<blocks, threads, 0, stream>>>(
                 output.view_descriptor(), source.view_descriptor(), source.numel(), operation);
         } else {
@@ -985,8 +1263,19 @@ Tensor binary_cuda(const Tensor& left_source, const Tensor& right_source, int op
     const auto right_view = align_for_broadcast(right, shape);
     const auto [blocks, threads] = launch_geometry(output.numel());
     const auto stream = current_stream(left.get_device()).stream();
+    const bool contiguous_binary = operation >= 0 && operation <= 3 &&
+        (type == kFloat32 || type == kFloat16 || type == kBFloat16) &&
+        same_shape(left, right) &&
+        left.is_contiguous() && right.is_contiguous() &&
+        output.is_contiguous();
     auto launch = [&]<typename Value>() {
-        if (comparison) {
+        if (contiguous_binary) {
+            contiguous_binary_kernel<Value><<<blocks, threads, 0, stream>>>(
+                static_cast<Value*>(output.data_ptr()),
+                static_cast<const Value*>(left.data_ptr()),
+                static_cast<const Value*>(right.data_ptr()),
+                output.numel(), operation);
+        } else if (comparison) {
             comparison_kernel<Value><<<blocks, threads, 0, stream>>>(
                 output.view_descriptor(), left_view, right_view, output.numel(), operation);
         } else {
@@ -1013,8 +1302,19 @@ Tensor scalar_binary_cuda(
         left.sizes(), left.options().dtype(comparison ? kBool : left.scalar_type()));
     const auto [blocks, threads] = launch_geometry(left.numel());
     const auto stream = current_stream(left.get_device()).stream();
+    const bool contiguous_scalar = operation >= 0 && operation <= 3 &&
+        (left.scalar_type() == kFloat32 ||
+         left.scalar_type() == kFloat16 ||
+         left.scalar_type() == kBFloat16) &&
+        left.is_contiguous() && output.is_contiguous() &&
+        static_cast<double>(static_cast<float>(right)) == right;
     auto launch = [&]<typename Value>() {
-        if (comparison) {
+        if (contiguous_scalar) {
+            contiguous_scalar_kernel<Value><<<blocks, threads, 0, stream>>>(
+                static_cast<Value*>(output.data_ptr()),
+                static_cast<const Value*>(left.data_ptr()),
+                left.numel(), right, operation, scalar_first);
+        } else if (comparison) {
             scalar_comparison_kernel<Value><<<blocks, threads, 0, stream>>>(
                 output.view_descriptor(), left.view_descriptor(), left.numel(),
                 right, operation, scalar_first);
@@ -1050,19 +1350,36 @@ Tensor reduce_cuda(
         reduction_type(source.scalar_type(), operation)));
     const auto outer = output.numel();
     const auto stream = current_stream(source.get_device()).stream();
-    const char* disable_parallel_f32_mean =
-        std::getenv("MFQ_DISABLE_NATIVE_PARALLEL_F32_MEAN");
+    bool row_mean_enabled = true;
+    if (source.scalar_type() == kFloat32) {
+        const char* value =
+            std::getenv("MFQ_DISABLE_NATIVE_PARALLEL_F32_MEAN");
+        row_mean_enabled = value == nullptr || value[0] != '1';
+    }
     if (operation == 1 &&
-        source.scalar_type() == kFloat32 &&
+        (source.scalar_type() == kFloat32 ||
+         source.scalar_type() == kFloat16 ||
+         source.scalar_type() == kBFloat16) &&
         source.is_contiguous() &&
         selected + 1 == static_cast<std::size_t>(source.dim()) &&
+        outer > 0 &&
         outer <= std::numeric_limits<unsigned int>::max() &&
-        (disable_parallel_f32_mean == nullptr ||
-         disable_parallel_f32_mean[0] != '1')) {
-        constexpr int threads = 256;
-        row_mean_last_contiguous_f32_kernel<threads>
-            <<<static_cast<unsigned int>(outer), threads, 0, stream>>>(
-                source.data_ptr<float>(), output.data_ptr<float>(), outer, reduced);
+        row_mean_enabled) {
+        if (source.scalar_type() == kFloat32) {
+            launch_row_mean(
+                source.data_ptr<float>(), output.data_ptr<float>(),
+                outer, reduced, stream);
+        } else if (source.scalar_type() == kFloat16) {
+            launch_row_mean(
+                    static_cast<const __half*>(source.data_ptr()),
+                    static_cast<__half*>(output.data_ptr()),
+                    outer, reduced, stream);
+        } else {
+            launch_row_mean(
+                    static_cast<const __nv_bfloat16*>(source.data_ptr()),
+                    static_cast<__nv_bfloat16*>(output.data_ptr()),
+                    outer, reduced, stream);
+        }
         MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
         return output;
     }
@@ -1158,6 +1475,24 @@ namespace {
 template <typename Index>
 __device__ std::int64_t load_index(const Index* indices, std::int64_t offset) {
     return static_cast<std::int64_t>(indices[offset]);
+}
+
+template <typename Index>
+__global__ void index_select_dim0_contiguous_vec16_kernel(
+    uint4* __restrict__ output,
+    const uint4* __restrict__ source,
+    const Index* __restrict__ indices,
+    std::int64_t packs_per_row,
+    std::int64_t total_packs) {
+    for (std::int64_t linear =
+             static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         linear < total_packs;
+         linear += static_cast<std::int64_t>(blockDim.x) * gridDim.x) {
+        const auto output_row = linear / packs_per_row;
+        const auto pack = linear - output_row * packs_per_row;
+        const auto source_row = load_index(indices, output_row);
+        output[linear] = source[source_row * packs_per_row + pack];
+    }
 }
 
 template <typename Value, typename Index>
@@ -1461,8 +1796,33 @@ Tensor index_select_cuda(
     auto shape = source.sizes().vec();
     shape[selected] = indices.numel();
     auto output = empty(shape, source.options());
-    const auto [blocks, threads] = launch_geometry(output.numel());
     const auto stream = current_stream(source.get_device()).stream();
+    if (selected == 0 && source.is_contiguous() && source.size(0) > 0) {
+        const auto row_bytes = static_cast<std::size_t>(
+            source.numel() / source.size(0)) * source.element_size();
+        const auto addresses = reinterpret_cast<std::uintptr_t>(source.data_ptr()) |
+            reinterpret_cast<std::uintptr_t>(output.data_ptr());
+        if (row_bytes >= sizeof(uint4) &&
+            row_bytes % sizeof(uint4) == 0 &&
+            (addresses & (alignof(uint4) - 1)) == 0) {
+            const auto packs_per_row = static_cast<std::int64_t>(
+                row_bytes / sizeof(uint4));
+            const auto total_packs = indices.numel() * packs_per_row;
+            const auto [blocks, threads] = launch_geometry(total_packs);
+            auto launch_index = [&]<typename Index>() {
+                index_select_dim0_contiguous_vec16_kernel<Index>
+                    <<<blocks, threads, 0, stream>>>(
+                        static_cast<uint4*>(output.data_ptr()),
+                        static_cast<const uint4*>(source.data_ptr()),
+                        indices.data_ptr<Index>(), packs_per_row,
+                        total_packs);
+            };
+            dispatch_index_type(indices.scalar_type(), launch_index);
+            MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
+            return output;
+        }
+    }
+    const auto [blocks, threads] = launch_geometry(output.numel());
     auto launch_value = [&]<typename Value>() {
         auto launch_index = [&]<typename Index>() {
             index_select_kernel<Value, Index><<<blocks, threads, 0, stream>>>(
@@ -2419,16 +2779,50 @@ Tensor logsumexp(const Tensor& input, std::int64_t dimension, bool keep_dimensio
 
 Tensor softmax(const Tensor& input, std::int64_t dimension) {
     const auto selected = normalize_dimension(dimension, input.dim());
-    const char* exact_bf16_disabled =
-        std::getenv("MFQ_DISABLE_NATIVE_EXACT_BF16_SOFTMAX");
+    const auto columns = input.size(-1);
+    const auto rows = columns == 0 ? 0 : input.numel() / columns;
+    bool exact_bf16_disabled = false;
+    if (input.scalar_type() == kBFloat16) {
+        const char* value =
+            std::getenv("MFQ_DISABLE_NATIVE_EXACT_BF16_SOFTMAX");
+        exact_bf16_disabled = value != nullptr && value[0] == '1';
+    }
+    const bool row_softmax = input.is_cuda() && input.is_contiguous() &&
+        selected + 1 == static_cast<std::size_t>(input.dim()) &&
+        (input.scalar_type() == kFloat32 ||
+         input.scalar_type() == kFloat16 ||
+         input.scalar_type() == kBFloat16) &&
+        (input.scalar_type() != kBFloat16 || exact_bf16_disabled) &&
+        columns > 0 &&
+        rows > 0 &&
+        rows <= std::numeric_limits<unsigned int>::max();
+    if (row_softmax) {
+        auto output = empty(input.sizes(), input.options());
+        const auto stream = current_stream(input.get_device()).stream();
+        if (input.scalar_type() == kFloat32) {
+            launch_row_softmax(
+                input.data_ptr<float>(), output.data_ptr<float>(),
+                rows, columns, false, stream);
+        } else if (input.scalar_type() == kFloat16) {
+            launch_row_softmax(
+                    static_cast<const __half*>(input.data_ptr()),
+                    static_cast<__half*>(output.data_ptr()),
+                    rows, columns, false, stream);
+        } else {
+            launch_row_softmax(
+                    static_cast<const __nv_bfloat16*>(input.data_ptr()),
+                    static_cast<__nv_bfloat16*>(output.data_ptr()),
+                    rows, columns, false, stream);
+        }
+        MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
+        return output;
+    }
     const bool exact_bf16 = input.is_cuda() &&
         input.scalar_type() == kBFloat16 && input.is_contiguous() &&
         selected + 1 == static_cast<std::size_t>(input.dim()) &&
         input.size(-1) >= 32 &&
-        (exact_bf16_disabled == nullptr || exact_bf16_disabled[0] != '1');
+        !exact_bf16_disabled;
     if (exact_bf16) {
-        const auto columns = input.size(-1);
-        const auto rows = input.numel() / columns;
         auto maximum = empty(
             {rows}, input.options().dtype(kFloat32));
         auto numerator = empty(
@@ -2471,6 +2865,38 @@ Tensor softmax(const Tensor& input, std::int64_t dimension) {
 }
 
 Tensor log_softmax(const Tensor& input, std::int64_t dimension) {
+    const auto selected = normalize_dimension(dimension, input.dim());
+    const auto columns = input.size(-1);
+    const auto rows = columns == 0 ? 0 : input.numel() / columns;
+    const bool row_log_softmax = input.is_cuda() && input.is_contiguous() &&
+        selected + 1 == static_cast<std::size_t>(input.dim()) &&
+        (input.scalar_type() == kFloat32 ||
+         input.scalar_type() == kFloat16 ||
+         input.scalar_type() == kBFloat16) &&
+        columns > 0 &&
+        rows > 0 &&
+        rows <= std::numeric_limits<unsigned int>::max();
+    if (row_log_softmax) {
+        auto output = empty(input.sizes(), input.options());
+        const auto stream = current_stream(input.get_device()).stream();
+        if (input.scalar_type() == kFloat32) {
+            launch_row_softmax(
+                input.data_ptr<float>(), output.data_ptr<float>(),
+                rows, columns, true, stream);
+        } else if (input.scalar_type() == kFloat16) {
+            launch_row_softmax(
+                    static_cast<const __half*>(input.data_ptr()),
+                    static_cast<__half*>(output.data_ptr()),
+                    rows, columns, true, stream);
+        } else {
+            launch_row_softmax(
+                    static_cast<const __nv_bfloat16*>(input.data_ptr()),
+                    static_cast<__nv_bfloat16*>(output.data_ptr()),
+                    rows, columns, true, stream);
+        }
+        MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
+        return output;
+    }
     auto working = input.scalar_type() == kFloat64
         ? input
         : input.to(kFloat32);
