@@ -258,9 +258,13 @@ static int run_qwen_continuous_batching_benchmark(
             baseline_tokens >= 2 && repetitions > 0 && repetitions <= 100,
         "continuous batching benchmark requires a split prefill, baseline>=2, and reps1-100");
     const int64_t contended_chunks =
-        (long_prefill_tokens + prefill_chunk_size - 1) / prefill_chunk_size;
+        long_prefill_tokens / prefill_chunk_size +
+        (long_prefill_tokens % prefill_chunk_size != 0);
     MFQ_BENCH_CHECK(
-        generated_tokens >= baseline_tokens + contended_chunks + 4 &&
+        static_cast<int64_t>(generated_tokens) >=
+            static_cast<int64_t>(baseline_tokens) + 4 &&
+            contended_chunks <=
+                static_cast<int64_t>(generated_tokens) - baseline_tokens - 4 &&
             model.vocab_size() > 1024 &&
             model.max_position_embeddings() >= long_prefill_tokens + 1 &&
             model.max_position_embeddings() >= generated_tokens + 17,

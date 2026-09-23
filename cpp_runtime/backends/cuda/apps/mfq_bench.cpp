@@ -65,7 +65,8 @@ int main(int argc, char** argv) {
             usage();
             return 2;
         }
-        if (context_size < prefill_tokens + 1 || context_size < generated_tokens + 17 ||
+        if (prefill_tokens >= context_size || context_size <= 17 ||
+                generated_tokens > context_size - 17 ||
                 prefill_tokens <= chunk_size || baseline_tokens < 2 ||
                 repetitions > 100 || generated_tokens > INT32_MAX ||
                 baseline_tokens > INT32_MAX || repetitions > INT32_MAX) {
