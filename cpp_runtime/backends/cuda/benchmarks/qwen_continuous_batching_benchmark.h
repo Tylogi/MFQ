@@ -1,5 +1,7 @@
 #pragma once
 
+#include "qwen_continuous_workload.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -7,6 +9,7 @@
 #include <cstdint>
 #include <exception>
 #include <iomanip>
+#include <iostream>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -15,6 +18,10 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#define MFQ_BENCH_CHECK(condition, message) do { \
+    if (!(condition)) throw std::runtime_error(message); \
+} while (false)
 
 namespace mfq::cuda::continuous {
 
@@ -37,7 +44,7 @@ static double qwen_continuous_benchmark_ms(
 
 static double qwen_continuous_benchmark_percentile(
         std::vector<double> values, double percentile) {
-    MFQ_RUNTIME_CHECK(!values.empty(),
+    MFQ_BENCH_CHECK(!values.empty(),
         "continuous batching benchmark has no percentile samples");
     std::sort(values.begin(), values.end());
     const auto rank = static_cast<size_t>(std::ceil(
@@ -46,7 +53,7 @@ static double qwen_continuous_benchmark_percentile(
 }
 
 static std::map<std::string, double> qwen_continuous_benchmark_metrics(
-        const CudaContinuousBatcher & batcher) {
+        const mfq::cuda::QwenContinuousWorkload & batcher) {
     std::map<std::string, double> result;
     for (const auto & [name, value] : batcher.metrics()) {
         result.emplace(name, value);
@@ -63,7 +70,7 @@ static double qwen_continuous_benchmark_metric(
 
 static QwenContinuousBatchingBenchmarkResult
 run_qwen_continuous_batching_benchmark_once(
-        CudaContinuousBatcher & batcher,
+        mfq::cuda::QwenContinuousWorkload & batcher,
         const std::vector<int64_t> & a_prompt,
         const std::vector<int64_t> & b_prompt,
         const MfqSamplingParams & a_params,
@@ -102,7 +109,7 @@ run_qwen_continuous_batching_benchmark_once(
                     }
                     state_ready.notify_one();
                     return true;
-                }, {}, {}, {});
+                }, {});
         } catch (...) {
             a_error = std::current_exception();
         }
@@ -150,7 +157,7 @@ run_qwen_continuous_batching_benchmark_once(
                     std::lock_guard<std::mutex> lock(state_mutex);
                     b_prefill_timing = timing;
                     b_prefill_callback = Clock::now();
-                }, {}, {});
+                });
             metrics_after = qwen_continuous_benchmark_metrics(batcher);
         } catch (...) {
             b_error = std::current_exception();
@@ -162,9 +169,9 @@ run_qwen_continuous_batching_benchmark_once(
     if (a_error) std::rethrow_exception(a_error);
     if (b_error) std::rethrow_exception(b_error);
     const auto metrics_final = qwen_continuous_benchmark_metrics(batcher);
-    MFQ_RUNTIME_CHECK(a_output == a_reference && b_output == b_reference,
+    MFQ_BENCH_CHECK(a_output == a_reference && b_output == b_reference,
         "continuous batching benchmark output differs from serial greedy oracle");
-    MFQ_RUNTIME_CHECK(
+    MFQ_BENCH_CHECK(
         b_prefill_callback.has_value() && b_first_token.has_value() &&
             b_prefill_timing.has_value() && b_submit_started < a_finished,
         "continuous batching benchmark did not overlap prefill with active decode");
@@ -188,7 +195,7 @@ run_qwen_continuous_batching_benchmark_once(
         result.baseline_itl_ms.end(),
         available_baseline.end() - baseline_count,
         available_baseline.end());
-    MFQ_RUNTIME_CHECK(
+    MFQ_BENCH_CHECK(
         result.baseline_itl_ms.size() == static_cast<size_t>(baseline_tokens) &&
             !result.contended_itl_ms.empty(),
         "continuous batching benchmark did not collect both ITL windows");
@@ -201,7 +208,7 @@ run_qwen_continuous_batching_benchmark_once(
     result.decode_tokens = static_cast<double>(a_timestamps.size() - 1);
     result.decode_ms = qwen_continuous_benchmark_ms(
         a_timestamps.front(), a_timestamps.back());
-    MFQ_RUNTIME_CHECK(
+    MFQ_BENCH_CHECK(
         std::isfinite(result.b_ttft_ms) && result.b_ttft_ms > 0.0 &&
             std::isfinite(result.prefill_gpu_ms) &&
             result.prefill_gpu_ms > 0.0 &&
@@ -214,7 +221,7 @@ run_qwen_continuous_batching_benchmark_once(
         result.metric_deltas[name] = value -
             qwen_continuous_benchmark_metric(metrics_before, name);
     }
-    MFQ_RUNTIME_CHECK(
+    MFQ_BENCH_CHECK(
         qwen_continuous_benchmark_metric(
             result.metric_deltas,
             "continuous_batching_interleaved_admissions") >= 1.0 &&
@@ -222,7 +229,7 @@ run_qwen_continuous_batching_benchmark_once(
             result.metric_deltas,
             "continuous_batching_prefill_yields") >= 1.0,
         "continuous batching benchmark did not exercise contended prefill");
-    MFQ_RUNTIME_CHECK(
+    MFQ_BENCH_CHECK(
         qwen_continuous_benchmark_metric(
             metrics_final, "continuous_batching_active") == 0.0 &&
         qwen_continuous_benchmark_metric(
@@ -232,7 +239,7 @@ run_qwen_continuous_batching_benchmark_once(
         "continuous batching benchmark left scheduler work pending");
     if (qwen_continuous_benchmark_metric(
             metrics_final, "continuous_batching_paged_kv") != 0.0) {
-        MFQ_RUNTIME_CHECK(qwen_continuous_benchmark_metric(
+        MFQ_BENCH_CHECK(qwen_continuous_benchmark_metric(
             metrics_final, "paged_kv_live_pages") == 0.0,
             "continuous batching benchmark leaked Paged KV pages");
     }
@@ -240,19 +247,19 @@ run_qwen_continuous_batching_benchmark_once(
 }
 
 static int run_qwen_continuous_batching_benchmark(
-        mfq::cuda::Qwen35CausalLm & model,
+        mfq::cuda::QwenContinuousWorkload & model,
         int64_t prefill_chunk_size,
         int generated_tokens,
         int64_t long_prefill_tokens,
         int baseline_tokens,
         int repetitions) {
-    MFQ_RUNTIME_CHECK(
+    MFQ_BENCH_CHECK(
         prefill_chunk_size > 0 && long_prefill_tokens > prefill_chunk_size &&
             baseline_tokens >= 2 && repetitions > 0 && repetitions <= 100,
         "continuous batching benchmark requires a split prefill, baseline>=2, and reps1-100");
     const int64_t contended_chunks =
         (long_prefill_tokens + prefill_chunk_size - 1) / prefill_chunk_size;
-    MFQ_RUNTIME_CHECK(
+    MFQ_BENCH_CHECK(
         generated_tokens >= baseline_tokens + contended_chunks + 4 &&
             model.vocab_size() > 1024 &&
             model.max_position_embeddings() >= long_prefill_tokens + 1 &&
@@ -281,30 +288,12 @@ static int run_qwen_continuous_batching_benchmark(
 
     auto serial = [&](const std::vector<int64_t> & prompt,
                       const MfqSamplingParams & params) {
-        std::vector<int64_t> output;
-        std::mutex mutex;
-        ServerDecodeGraphCache graph_cache(
-            model.max_position_embeddings());
-        ServerTextSessionCache session_cache;
-        const int32_t produced = generate_server_tokens(
-            model, mutex, graph_cache, session_cache, prompt, params,
-            [&](int64_t token) {
-                output.push_back(token);
-                return true;
-            }, {}, {}, {}, nullptr, prefill_chunk_size);
-        MFQ_RUNTIME_CHECK(
-            produced == params.max_tokens &&
-                output.size() == static_cast<size_t>(produced),
-            "continuous batching benchmark serial oracle length mismatch");
-        return output;
+        return model.serial_generate(prompt, params);
     };
     const auto a_reference = serial(a_prompt, a_params);
     const auto b_reference = serial(b_prompt, b_params);
-    model.reset(1);
-
-    std::mutex model_mutex;
-    CudaContinuousBatcher batcher(
-        model, model_mutex, 2, prefill_chunk_size);
+    model.start_batcher();
+    auto & batcher = model;
     (void)run_qwen_continuous_batching_benchmark_once(
         batcher, a_prompt, b_prompt, a_params, b_params,
         a_reference, b_reference, baseline_tokens);
@@ -390,3 +379,5 @@ static int run_qwen_continuous_batching_benchmark(
 }
 
 } // namespace mfq::cuda::continuous
+
+#undef MFQ_BENCH_CHECK
