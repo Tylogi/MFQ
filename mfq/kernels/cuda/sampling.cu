@@ -3,6 +3,8 @@
 // random uniforms are passed as a small GPU tensor.
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include "mfq_tensor_backend.h"
 #include <cub/block/block_radix_sort.cuh>
 #include <float.h>
@@ -176,6 +178,71 @@ __device__ inline float sample_load(const scalar_t* p, size_t i)
     return (float)p[i];
 }
 
+__device__ __forceinline__ void sample_argmax_update(
+    float other_value,
+    int other_index,
+    float& best_value,
+    int& best_index)
+{
+    if (other_index != INT_MAX &&
+        (other_value > best_value ||
+         (other_value == best_value && other_index < best_index))) {
+        best_value = other_value;
+        best_index = other_index;
+    }
+}
+
+__device__ __forceinline__ void sample_argmax_warp_reduce(
+    float& best_value,
+    int& best_index)
+{
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float other_value = __shfl_down_sync(
+            0xffffffffU, best_value, offset);
+        const int other_index = __shfl_down_sync(
+            0xffffffffU, best_index, offset);
+        sample_argmax_update(
+            other_value, other_index, best_value, best_index);
+    }
+}
+
+__device__ __forceinline__ float2 sample_pair_to_float2(half2 value)
+{
+    return __half22float2(value);
+}
+
+__device__ __forceinline__ float2 sample_pair_to_float2(
+    __nv_bfloat162 value)
+{
+    return __bfloat1622float2(value);
+}
+
+__device__ __forceinline__ void sample_argmax_block_finish(
+    float best_value,
+    int best_index,
+    int64_t* out,
+    int row)
+{
+    constexpr int warps = SAMPLE_BD / 32;
+    __shared__ float warp_values[warps];
+    __shared__ int warp_indices[warps];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    sample_argmax_warp_reduce(best_value, best_index);
+    if (lane == 0) {
+        warp_values[warp] = best_value;
+        warp_indices[warp] = best_index;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        best_value = lane < warps ? warp_values[lane] : -FLT_MAX;
+        best_index = lane < warps ? warp_indices[lane] : INT_MAX;
+        sample_argmax_warp_reduce(best_value, best_index);
+        if (lane == 0) out[row] = best_index == INT_MAX ? 0 : best_index;
+    }
+}
+
 template <typename scalar_t>
 __global__ void sample_greedy_kernel(
     const scalar_t* __restrict__ logits,
@@ -184,8 +251,6 @@ __global__ void sample_greedy_kernel(
     int V)
 {
     int row = blockIdx.x;
-    __shared__ float vals[SAMPLE_BD];
-    __shared__ int idxs[SAMPLE_BD];
     float best = -FLT_MAX;
     int best_i = 0;
     for (int i = threadIdx.x; i < V; i += SAMPLE_BD) {
@@ -195,23 +260,28 @@ __global__ void sample_greedy_kernel(
             best_i = i;
         }
     }
-    vals[threadIdx.x] = best;
-    idxs[threadIdx.x] = best_i;
-    __syncthreads();
-    for (int stride = SAMPLE_BD / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            float ov = vals[threadIdx.x + stride];
-            int oi = idxs[threadIdx.x + stride];
-            if (ov > vals[threadIdx.x] || (ov == vals[threadIdx.x] && oi < idxs[threadIdx.x])) {
-                vals[threadIdx.x] = ov;
-                idxs[threadIdx.x] = oi;
-            }
-        }
-        __syncthreads();
+    sample_argmax_block_finish(best, best_i, out, row);
+}
+
+template <typename pair_t>
+__global__ void sample_greedy_pair_kernel(
+    const pair_t* __restrict__ logits,
+    int64_t* __restrict__ out,
+    int V)
+{
+    const int row = blockIdx.x;
+    const int pairs = V / 2;
+    const auto* row_logits = logits + (size_t)row * pairs;
+    float best = -FLT_MAX;
+    // Match the scalar kernel's fallback for rows that contain no value
+    // greater than -FLT_MAX (for example, NaN followed by only -inf).
+    int best_i = 0;
+    for (int pair = threadIdx.x; pair < pairs; pair += SAMPLE_BD) {
+        const float2 values = sample_pair_to_float2(row_logits[pair]);
+        sample_argmax_update(values.x, pair * 2, best, best_i);
+        sample_argmax_update(values.y, pair * 2 + 1, best, best_i);
     }
-    if (threadIdx.x == 0) {
-        out[row] = idxs[0];
-    }
+    sample_argmax_block_finish(best, best_i, out, row);
 }
 
 template <typename scalar_t>
@@ -401,12 +471,33 @@ mfq_tensor_backend::Tensor sample_greedy_cuda(mfq_tensor_backend::Tensor logits)
     int B = (int)logits.size(0);
     int V = (int)logits.size(1);
     auto out = mfq_tensor_backend::empty({B}, logits.options().dtype(mfq_tensor_backend::kInt64));
-    MFQ_DISPATCH_FLOATING_TYPES_AND2(
-        mfq_dispatch_half, mfq_dispatch_bfloat16,
-        logits.scalar_type(), "sample_greedy_cuda", [&] {
+    const auto stream = mfq_current_cuda_stream();
+    const auto logits_address = reinterpret_cast<std::uintptr_t>(
+        logits.data_ptr());
+    const bool pair_aligned =
+        (logits_address & (alignof(half2) - 1)) == 0;
+    if ((V & 1) == 0 &&
+        pair_aligned &&
+        logits.scalar_type() == mfq_tensor_backend::kFloat16) {
+        sample_greedy_pair_kernel<half2><<<B, SAMPLE_BD, 0, stream>>>(
+            reinterpret_cast<const half2*>(logits.data_ptr<mfq_half>()),
+            out.data_ptr<int64_t>(), V);
+    } else if ((V & 1) == 0 &&
+               pair_aligned &&
+               logits.scalar_type() == mfq_tensor_backend::kBFloat16) {
+        sample_greedy_pair_kernel<__nv_bfloat162>
+            <<<B, SAMPLE_BD, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat162*>(
+                    logits.data_ptr<mfq_bfloat16>()),
+                out.data_ptr<int64_t>(), V);
+    } else {
+        MFQ_DISPATCH_FLOATING_TYPES_AND2(
+            mfq_dispatch_half, mfq_dispatch_bfloat16,
+            logits.scalar_type(), "sample_greedy_cuda", [&] {
         sample_greedy_kernel<scalar_t><<<B, SAMPLE_BD, 0, mfq_current_cuda_stream()>>>(
             logits.data_ptr<scalar_t>(), out.data_ptr<int64_t>(), B, V);
-    });
+        });
+    }
     return out;
 }
 
