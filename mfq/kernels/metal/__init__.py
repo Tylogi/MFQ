@@ -50,15 +50,6 @@ from mfq.kernels.metal.grouped_linear import (
     MetalLinearGroupWeight,
     grouped_linear_matmul,
 )
-from mfq.kernels.metal.kimi_k3 import (
-    kimi_attention_residual,
-    kimi_gated_rmsnorm,
-    kimi_kda_recurrent,
-    kimi_route_experts,
-    kimi_short_conv3,
-    situ_mul,
-    situ_split,
-)
 from mfq.kernels.metal.linear_attention import (
     MetalLinearConvQkvParameters,
     gated_delta_net,
@@ -134,19 +125,6 @@ from mfq.kernels.metal.sampling import (
     sample_token_counts_add,
     sample_top_k_top_p,
 )
-from mfq.kernels.metal.tpq import (
-    MetalTpqInt4Weight,
-    MetalTpqMoeWeight,
-    MetalTpqPqWeight,
-    tpq_grouped_moe_matmul,
-    tpq_int4_dequantize,
-    tpq_int4_embedding,
-    tpq_int4_grouped_row_matmul,
-    tpq_int4_matmul,
-    tpq_pq_dequantize,
-    tpq_pq_matmul,
-    tpq_pq_routed_matmul,
-)
 from mfq.kernels.metal.vq import (
     MetalVqWeight,
     inverse_signed_hadamard,
@@ -164,9 +142,6 @@ from mfq.kernels.metal.vq import (
 )
 
 __all__ = [
-    "MetalTpqInt4Weight",
-    "MetalTpqMoeWeight",
-    "MetalTpqPqWeight",
     "MetalLinearGroupWeight",
     "MetalLinearConvQkvParameters",
     "MetalMoeWeight",
@@ -183,14 +158,6 @@ __all__ = [
     "attention_glm_mla_dense",
     "attention_glm_mla_sparse",
     "apply_expert_scale",
-    "tpq_grouped_moe_matmul",
-    "tpq_int4_dequantize",
-    "tpq_int4_embedding",
-    "tpq_int4_grouped_row_matmul",
-    "tpq_int4_matmul",
-    "tpq_pq_dequantize",
-    "tpq_pq_matmul",
-    "tpq_pq_routed_matmul",
     "dsv4_build_decode_plan",
     "dsv4_build_prefill_plan",
     "dsv4_compress",
@@ -224,11 +191,6 @@ __all__ = [
     "hadamard_mul",
     "l2_norm",
     "linear_conv_qkv",
-    "kimi_attention_residual",
-    "kimi_gated_rmsnorm",
-    "kimi_kda_recurrent",
-    "kimi_route_experts",
-    "kimi_short_conv3",
     "moe_topk",
     "mx_backward_input",
     "mx_dequantize",
@@ -276,8 +238,6 @@ __all__ = [
     "signed_hadamard",
     "sqrtsoftplus_weights",
     "ssm_conv_silu",
-    "situ_mul",
-    "situ_split",
     "swiglu_split",
     "vq_backward_input",
     "vq_dequantize",

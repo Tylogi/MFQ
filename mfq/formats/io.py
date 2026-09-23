@@ -64,7 +64,6 @@ from mfq.formats.compat import (
     NPQ_DTYPE,
     NVQ_DTYPE,
     canonical_dtype,
-    is_nint_dtype,
 )
 from mfq.formats.fp8_sq import (
     Fp8_128SqTensor,
@@ -101,16 +100,6 @@ from mfq.formats.npq0_s import Npq0STensor, pack_npq0_s, unpack_npq0_s
 from mfq.formats.nvq import NvqJscTensor, NvqTensor, pack_nvq, unpack_nvq
 from mfq.formats.nvq1_l import Nvq1LTensor, pack_nvq1_l, unpack_nvq1_l
 from mfq.formats.nvq1_s import Nvq1STensor, pack_nvq1_s, unpack_nvq1_s
-from mfq.formats.tpq import (
-    TPQ_PQ_SPECS,
-    TpqInt4Tensor,
-    TpqPqTensor,
-    normalize_tpq_dtype,
-    pack_tpq_int4,
-    pack_tpq_pq,
-    unpack_tpq_int4,
-    unpack_tpq_pq,
-)
 
 MfqTensor: TypeAlias = (
     NintTensor
@@ -123,8 +112,6 @@ MfqTensor: TypeAlias = (
     | Nvq1LTensor
     | Nvq1STensor
     | NepqTensor
-    | TpqPqTensor
-    | TpqInt4Tensor
     | MxTensor
     | Mxfp4SqTensor
     | Mxfp8SqTensor
@@ -941,25 +928,10 @@ def _unpack_tensor(dtype: str, blob: bytes | memoryview) -> MfqTensor:
     if dtype in MX_DTYPES:
         return unpack_mx(dtype, blob)
     dtype = canonical_dtype(dtype)
-    dtype = normalize_tpq_dtype(dtype)
     if dtype == MFE_DTYPE:
         return unpack_mfe(blob)
     if dtype == "NINT8-0":
         return unpack_nint8_zero(blob)
-    if dtype == "TPQ-I4G64":
-        tensor = unpack_tpq_int4(blob)
-        if tensor.group_size != 64:
-            raise ValueError(
-                f"MFQ dtype/blob mismatch: TPQ-I4G64 contains g{tensor.group_size}"
-            )
-        return tensor
-    if dtype in TPQ_PQ_SPECS or dtype == "TPQ-P":
-        tensor = unpack_tpq_pq(blob)
-        if tensor.spec.label != dtype:
-            raise ValueError(
-                f"MFQ dtype/blob mismatch: {dtype} contains {tensor.spec.label}"
-            )
-        return tensor
     if dtype == NEPQ_DTYPE:
         return unpack_nepq(blob)
     if dtype == MXFP4_SQ_DTYPE:
@@ -1011,14 +983,6 @@ def _pack_tensor(tensor: MfqTensor, *, allow_moe: bool = True) -> tuple[str, byt
         return tensor.dtype, pack_fp8_sq(tensor)
     if isinstance(tensor, Nint8ZeroTensor):
         return "NINT8-0", pack_nint8_zero(tensor)
-    if isinstance(tensor, TpqInt4Tensor):
-        if tensor.group_size != 64:
-            raise ValueError(
-                f"MFQ only names the production TPQ int4-g64 profile, got g{tensor.group_size}"
-            )
-        return "TPQ-I4G64", pack_tpq_int4(tensor)
-    if isinstance(tensor, TpqPqTensor):
-        return tensor.spec.label, pack_tpq_pq(tensor)
     if isinstance(tensor, NintTensor):
         return NINT_DTYPE, pack_nint(tensor)
     if isinstance(tensor, MfeTensor):

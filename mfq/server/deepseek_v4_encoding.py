@@ -4,8 +4,8 @@ Ported from the official DeepSeek-V4 Flash message encoder.
 Source SHA-256:
   bdbd57c132a1b3725042323d02b98b9d1df28e5f388f134399555d041f5055e0
 
-TPQ keeps this module transport-independent. OpenAI request validation and
-HTTP serialization belong outside this file.
+This module stays transport-independent. OpenAI request validation and HTTP
+serialization belong outside this file.
 """
 
 from typing import Any, Dict, List, Union, Optional, Tuple
@@ -154,7 +154,7 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
 
     try:
         arguments = json.loads(tool_call["arguments"])
-    except Exception as err:
+    except Exception:
         arguments = {"arguments": tool_call["arguments"]}
 
     for k, v in arguments.items():

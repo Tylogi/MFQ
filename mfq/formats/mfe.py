@@ -28,7 +28,6 @@ from mfq.formats.npq0_s import Npq0STensor
 from mfq.formats.nvq import NvqJscTensor, NvqTensor
 from mfq.formats.nvq1_l import Nvq1LTensor
 from mfq.formats.nvq1_s import Nvq1STensor
-from mfq.formats.tpq import TpqPqTensor
 
 ExpertPoolTensor: TypeAlias = (
     NintTensor
@@ -40,7 +39,6 @@ ExpertPoolTensor: TypeAlias = (
     | Nvq1LTensor
     | Nvq1STensor
     | NepqTensor
-    | TpqPqTensor
     | MxTensor
     | Mxfp4SqTensor
     | Mxfp8SqTensor
@@ -76,8 +74,6 @@ def expert_tensor_family(tensor: ExpertPoolTensor) -> str:
     if isinstance(tensor, NintTensor):
         return NINT_DTYPE
     if isinstance(tensor, NepqTensor):
-        return tensor.spec.label
-    if isinstance(tensor, TpqPqTensor):
         return tensor.spec.label
     if isinstance(tensor, Nvq1LTensor):
         return "NVQ1-L"

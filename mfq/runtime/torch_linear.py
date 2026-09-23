@@ -28,7 +28,6 @@ from mfq.formats.npq0_s import Npq0STensor
 from mfq.formats.nvq import NvqJscTensor, NvqTensor
 from mfq.formats.nvq1_l import Nvq1LTensor
 from mfq.formats.nvq1_s import Nvq1STensor
-from mfq.formats.tpq import TpqInt4Tensor, TpqPqTensor
 from mfq.kernels import torch_backend
 from mfq.kernels.cuda.embedding import nint_embedding
 from mfq.kernels.cuda.mx_matmul import mx_dequantize, mx_embedding, mx_matmul, to_gpu_mx
@@ -49,17 +48,9 @@ from mfq.kernels.cuda.nvq_matmul import (
     nvq_matmul_swiglu,
     to_gpu_nvq,
 )
-from mfq.kernels.cuda.tpq_matmul import (
-    to_gpu_tpq,
-    tpq_dequantize,
-    tpq_embedding,
-    tpq_matmul,
-)
-
 TensorMapping = Mapping[str, MfqTensor]
 NvqAnyTensor = NvqTensor | NvqJscTensor | Npq0LTensor | Npq0STensor | Nvq1LTensor | Nvq1STensor
-TpqTensor = TpqInt4Tensor | TpqPqTensor
-QuantizedTensor = NintTensor | Nint8ZeroTensor | NvqAnyTensor | MxTensor | TpqTensor
+QuantizedTensor = NintTensor | Nint8ZeroTensor | NvqAnyTensor | MxTensor
 
 
 def _device_guard(device: str | torch.device):
@@ -77,7 +68,7 @@ def is_nvq_tensor(tensor: object) -> bool:
 def is_quantized_tensor(tensor: object) -> bool:
     return isinstance(
         tensor,
-        (NintTensor, Nint8ZeroTensor, MxTensor, TpqInt4Tensor, TpqPqTensor),
+        (NintTensor, Nint8ZeroTensor, MxTensor),
     ) or is_nvq_tensor(tensor)
 
 
@@ -299,28 +290,6 @@ class TorchMxLinear:
         return self.forward(x)
 
 
-class TorchTpqLinear:
-    """Packed TPQ-I4/TPQ-PQ GPU linear layer."""
-
-    def __init__(
-        self,
-        tensor: TpqTensor,
-        device: str | torch.device = "cuda",
-    ) -> None:
-        self.g = to_gpu_tpq(tensor, device)
-        self.device = device
-
-    @property
-    def weight(self) -> torch.Tensor:
-        return tpq_dequantize(self.g)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return tpq_matmul(self.g, x)
-
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward(x)
-
-
 class TorchNint8ZeroLinear:
     """Packed symmetric NINT8-0 GPU linear layer."""
 
@@ -517,8 +486,6 @@ class TorchLinearGroup:
             if is_nvq_tensor(t)
             else TorchMxLinear(t, device)
             if isinstance(t, MxTensor)
-            else TorchTpqLinear(t, device)
-            if isinstance(t, (TpqInt4Tensor, TpqPqTensor))
             else TorchDenseLinear(t, device)
             for t in tensors
         ]
@@ -619,20 +586,6 @@ class TorchMxEmbedding:
         return self.forward(token_ids)
 
 
-class TorchTpqEmbedding:
-    """Packed TPQ-I4/TPQ-PQ embedding that decodes selected rows."""
-
-    def __init__(self, tensor: TpqTensor, device: str | torch.device = "cuda") -> None:
-        self.g = to_gpu_tpq(tensor, device)
-        self.device = device
-
-    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        return tpq_embedding(self.g, token_ids)
-
-    def __call__(self, token_ids: torch.Tensor) -> torch.Tensor:
-        return self.forward(token_ids)
-
-
 class TorchSwiGLUFFN:
     """SwiGLU FFN whose gate, up, and down projections are all :class:`TorchNintLinear`."""
 
@@ -642,20 +595,17 @@ class TorchSwiGLUFFN:
         | TorchNint8ZeroLinear
         | TorchNvqLinear
         | TorchMxLinear
-        | TorchTpqLinear
         | TorchNintLinearGroup
         | TorchLinearGroup,
         up: TorchNintLinear
         | TorchNint8ZeroLinear
         | TorchNvqLinear
         | TorchMxLinear
-        | TorchTpqLinear
         | None,
         down: TorchNintLinear
         | TorchNint8ZeroLinear
         | TorchNvqLinear
-        | TorchMxLinear
-        | TorchTpqLinear,
+        | TorchMxLinear,
     ) -> None:
         self.gate = gate
         self.up = up
@@ -682,8 +632,6 @@ class TorchSwiGLUFFN:
             if isinstance(down, Nint8ZeroTensor)
             else TorchMxLinear(down, device)
             if isinstance(down, MxTensor)
-            else TorchTpqLinear(down, device)
-            if isinstance(down, (TpqInt4Tensor, TpqPqTensor))
             else TorchNvqLinear(down, device)
         )
         return cls(gate_up, None, down_layer)
@@ -710,7 +658,7 @@ class TorchSwiGLUFFN:
             if self.up is None:
                 raise RuntimeError("SwiGLU up projection is missing")
             gate, up = self.gate(x), self.up(x)
-        if isinstance(self.down, (TorchMxLinear, TorchTpqLinear)):
+        if isinstance(self.down, TorchMxLinear):
             return self.down(torch.nn.functional.silu(gate) * up)
         return self.down.forward_swiglu(gate, up)
 
@@ -737,7 +685,7 @@ class TorchNintModel:
 
     def linear(
         self, name: str
-    ) -> TorchNintLinear | TorchNint8ZeroLinear | TorchNvqLinear | TorchMxLinear | TorchTpqLinear:
+    ) -> TorchNintLinear | TorchNint8ZeroLinear | TorchNvqLinear | TorchMxLinear:
         if name not in self.tensors:
             raise KeyError(f"tensor {name!r} 不在模型中；已有: {list(self.tensors)}")
         tensor = self.tensors[name]
@@ -749,9 +697,7 @@ class TorchNintModel:
             return TorchNvqLinear(tensor, self.device)
         if isinstance(tensor, MxTensor):
             return TorchMxLinear(tensor, self.device)
-        if isinstance(tensor, (TpqInt4Tensor, TpqPqTensor)):
-            return TorchTpqLinear(tensor, self.device)
-        raise TypeError(f"tensor {name!r} 不是 NINT/NVQ/MX/TPQ 权重")
+        raise TypeError(f"tensor {name!r} 不是 NINT/NVQ/MX 权重")
 
     def embedding(
         self, name: str
@@ -760,7 +706,6 @@ class TorchNintModel:
         | TorchNint8ZeroEmbedding
         | TorchNvqEmbedding
         | TorchMxEmbedding
-        | TorchTpqEmbedding
     ):
         if name not in self.tensors:
             raise KeyError(f"tensor {name!r} 不在模型中；已有: {list(self.tensors)}")
@@ -773,9 +718,7 @@ class TorchNintModel:
             return TorchNvqEmbedding(tensor, self.device)
         if isinstance(tensor, MxTensor):
             return TorchMxEmbedding(tensor, self.device)
-        if isinstance(tensor, (TpqInt4Tensor, TpqPqTensor)):
-            return TorchTpqEmbedding(tensor, self.device)
-        raise TypeError(f"tensor {name!r} 不是 NINT/NVQ/MX/TPQ 权重")
+        raise TypeError(f"tensor {name!r} 不是 NINT/NVQ/MX 权重")
 
     def dense(self, name: str, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         if name not in self.tensors:

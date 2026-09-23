@@ -11,7 +11,6 @@ from typing import Any
 
 from mfq.formats.compat import NINT_DTYPE, is_nint_dtype
 from mfq.formats.nint import NintSpec
-from mfq.formats.tpq import normalize_tpq_dtype
 
 _FORMAT_V1 = "mfq.calibration-scheme.v1"
 _FORMAT_V2 = "mfq.calibration-scheme.v2"
@@ -44,10 +43,6 @@ EXPERT_PRECISION_FAMILIES = frozenset(
         "NEPQ1-S",
         "NEPQ1-L",
         "NEPQ1-A",
-        "TPQ-X",
-        "TPQ-W",
-        "TPQ-V",
-        "TPQ-VV",
     }
 )
 _OPTION_SCALARS = (str, int, float, bool)
@@ -63,7 +58,7 @@ class ExpertPrecision:
     options: tuple[tuple[str, str | int | float | bool], ...] = ()
 
     def __post_init__(self) -> None:
-        family = normalize_tpq_dtype(str(self.family))
+        family = str(self.family)
         if is_nint_dtype(family):
             family = NINT_DTYPE
         family = {

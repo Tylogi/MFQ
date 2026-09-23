@@ -413,7 +413,6 @@ function Build-PythonCli {
             "torch", "transformers", "tokenizers", "safetensors",
             "scipy", "pyarrow", "tiktoken",
             "mfq.calibration", "mfq.quantize", "mfq.runtime", "mfq.tools",
-            "mfq._vendor.tpq",
             "mfq.runtime.minicpmo45", "mfq.runtime.minicpmo45_realtime",
             "minicpmo_utils", "stepaudio2_minicpmo", "torchaudio", "onnxruntime",
             "s3tokenizer", "hyperpyyaml", "librosa")) {

@@ -47,11 +47,6 @@ from mfq.formats.nvq1_s import (
     Nvq1STensor,
     pack_nvq1_s_banked_codebook,
 )
-from mfq.formats.tpq import (
-    TPQ_PQ_SPECS_BY_LABEL,
-    TpqPqTensor,
-    normalize_tpq_dtype,
-)
 from mfq.quantize.nepq import NepqQuantConfig, quantize_nepq_fixed
 from mfq.quantize.nepq_a import (
     NepqAArtifact,
@@ -89,13 +84,6 @@ from mfq.quantize.nvq_jsc import (
 )
 from mfq.quantize.nvq_quant import dequantize as dequantize_nvq
 from mfq.quantize.nvq_quant import quantize as quantize_nvq
-from mfq.quantize.tpq import (
-    TpqKmeansConfig,
-    dequantize_tpq_pq,
-    quantize_tpq_pq_fixed,
-    train_tpq_pq,
-)
-
 ExpertProfile = NintSpec | ExpertPrecision
 ArtifactMap = Mapping[ExpertPrecision | str, object]
 
@@ -244,18 +232,6 @@ def _load_precision_artifact(
     family = precision.family
     if path.suffix.lower() == ".npz":
         arrays = _npz_arrays(path)
-        if family in TPQ_PQ_SPECS_BY_LABEL:
-            if "codebook" not in arrays:
-                raise ValueError(f"{family} artifact lacks a codebook: {path}")
-            stored_family = arrays.get("family")
-            if (
-                stored_family is not None
-                and normalize_tpq_dtype(str(stored_family.item())) != family
-            ):
-                raise ValueError(
-                    f"{family} artifact declares {stored_family.item()!r}: {path}"
-                )
-            return np.ascontiguousarray(arrays["codebook"], dtype=np.float32)
         if family == "NPQ0-L":
             return Npq0LTables(
                 arrays["scale_lut"],
@@ -429,33 +405,6 @@ def _quantize_flat_cohort(
             search_steps=_option_int(precision, "search_steps", 19),
             group_chunk=_option_int(precision, "group_chunk", 1024),
             codebook=codebook,
-        )
-    if family in TPQ_PQ_SPECS_BY_LABEL:
-        spec = TPQ_PQ_SPECS_BY_LABEL[family]
-        config = TpqKmeansConfig(
-            iterations=_option_int(precision, "iterations", 12),
-            restarts=_option_int(precision, "restarts", 2),
-            sample_points=_option_int(precision, "sample_points", 100_000),
-            seed=_option_int(precision, "seed", 0),
-            distance_bytes=_option_int(
-                precision, "distance_bytes", 1 << 30
-            ),
-        )
-        weight = torch.as_tensor(rows, dtype=torch.float32)
-        if artifact is None:
-            tensor, _ = train_tpq_pq(
-                weight,
-                spec,
-                config=config,
-                device=device,
-            )
-            return tensor
-        return quantize_tpq_pq_fixed(
-            weight,
-            spec,
-            np.asarray(artifact, dtype=np.float32),
-            device=device,
-            distance_bytes=config.distance_bytes,
         )
     if family == "NVQ1-L":
         codebook = None if artifact is None else np.asarray(artifact)
@@ -757,8 +706,6 @@ def _dequantize_pool(tensor: object) -> np.ndarray:
         from mfq.formats.nepq import dequantize_nepq
 
         return dequantize_nepq(tensor)
-    if isinstance(tensor, TpqPqTensor):
-        return dequantize_tpq_pq(tensor)
     if isinstance(tensor, NvqJscTensor):
         return dequantize_nvq_jsc(tensor)
     if isinstance(tensor, NvqTensor):

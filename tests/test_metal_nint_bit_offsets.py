@@ -23,7 +23,6 @@ _PYTHON_MOE = _ROOT / "mfq/kernels/metal/moe.py"
 _CPP_MOE = _ROOT / "cpp_runtime/backends/metal/ops/mlx_moe.cpp"
 _PYTHON_VQ = _ROOT / "mfq/kernels/metal/vq.py"
 _CPP_VQ = _ROOT / "cpp_runtime/backends/metal/ops/mlx_vq.cpp"
-_PYTHON_TPQ = _ROOT / "mfq/kernels/metal/tpq.py"
 _CPP_TPQ = _ROOT / "cpp_runtime/backends/metal/legacy/tpq/mlx_tpq.cpp"
 
 _PACKED_METAL_SOURCES = (
@@ -34,7 +33,6 @@ _PACKED_METAL_SOURCES = (
     _CPP_MOE,
     _PYTHON_VQ,
     _CPP_VQ,
-    _PYTHON_TPQ,
     _CPP_TPQ,
 )
 
@@ -135,7 +133,7 @@ def test_specialized_nint3_nint6_addresses_do_not_multiply_before_shift(
 
 @pytest.mark.parametrize("path", _PACKED_METAL_SOURCES)
 def test_no_metal_packed_index_multiplies_bits_before_reducing(path: Path):
-    """Audit all current NINT/VQ/TPQ embedded Metal address helpers."""
+    """Audit all current NINT/VQ and native TPQ Metal address helpers."""
 
     source = path.read_text()
     match = _UNSAFE_ADDRESS_PATTERN.search(source)
@@ -167,7 +165,6 @@ def test_generic_packed_helpers_keep_quotient_remainder_formula(
 @pytest.mark.parametrize(
     ("path", "safe_addresses"),
     [
-        (_PYTHON_TPQ, 3),
         (_CPP_TPQ, 1),
         (_CPP_MOE, 1),
     ],
@@ -176,7 +173,7 @@ def test_tpq_packed_helpers_keep_quotient_remainder_formula(
     path: Path,
     safe_addresses: int,
 ):
-    """Lock both standalone and MoE TPQ packed-index helpers."""
+    """Lock the native TPQ packed-index helper."""
 
     assert len(_BASED_ADDRESS_PATTERN.findall(path.read_text())) >= safe_addresses
 

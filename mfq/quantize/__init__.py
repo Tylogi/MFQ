@@ -18,7 +18,6 @@ This subpackage converts a full-precision tensor to an MFQ-specified precision:
 - ``nvq1_s_codebook`` -- weighted NVQ1-S codebook training and unique ternary projection.
 - ``npq0_l`` -- NPQ0-L state-conditioned PQ3+4 codebook training and fixed-table quantization.
 - ``nepq`` -- cross-expert shared codebook pools, 96-weight bank selection, and four fixed-pool NEPQ quantizers.
-- ``tpq`` -- native Metal/CPU TPQ product-codebook training, assignment, and TPQ-I4 encoding.
 - ``ternary_quant`` -- joint search over scalar ternary values and neuron/sub-group scales.
 - ``nvq_codebook`` -- NVQ2 E8 codebook trainer for a model, tensor family, or individual tensor.
 - ``sensitivity`` -- per-tensor sensitivity analysis used for precision allocation.

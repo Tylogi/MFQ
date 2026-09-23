@@ -169,7 +169,6 @@ class ExpertWiseMixedWeight:
                 "mxfp4_sq",
                 "mxfp8_sq",
                 "fp8_128_sq",
-                "tpq",
             }:
                 raise ValueError(f"unsupported expert cohort family: {pool.family}")
             if not pool.expert_ids:
@@ -520,26 +519,6 @@ def _grouped_matmul_mixed(
                 len(pool.expert_ids),
                 weight.out_per_expert,
                 weight.neuron_len,
-                out,
-                route.ids_dst,
-                route.expert_bounds,
-                route.tile_bounds,
-                route.tile_experts,
-            )
-            continue
-        if pool.family == "tpq":
-            ext().tpq_pq_moe_grouped_matmul_pool_f16_cuda(
-                g["packed"],
-                g["codebook"],
-                x,
-                route.ids,
-                expert_local,
-                weight.n_experts,
-                len(pool.expert_ids),
-                weight.out_per_expert,
-                weight.neuron_len,
-                int(g["vector_size"]),
-                int(g["index_bits"]),
                 out,
                 route.ids_dst,
                 route.expert_bounds,
@@ -919,12 +898,10 @@ def to_gpu(
     from mfq.formats.nepq import NepqTensor
     from mfq.formats.nint import NintTensor
     from mfq.formats.nint8_zero import Nint8ZeroTensor
-    from mfq.formats.tpq import TpqPqTensor
     from mfq.kernels.cuda.mx_matmul import to_gpu_mx
     from mfq.kernels.cuda.nepq_matmul import to_gpu_nepq
     from mfq.kernels.cuda.nint8_zero_matmul import to_gpu_nint8_zero
     from mfq.kernels.cuda.nvq_matmul import to_gpu_nvq
-    from mfq.kernels.cuda.tpq_matmul import to_gpu_tpq
     from mfq.kernels.torch_backend import to_gpu as nint_to_gpu
 
     if not isinstance(tensor, MfeTensor):
@@ -970,9 +947,6 @@ def to_gpu(
         elif isinstance(pool.tensor, Fp8_128SqTensor):
             family = "fp8_128_sq"
             packed = _to_gpu_fp8_sq(pool.tensor, device)
-        elif isinstance(pool.tensor, TpqPqTensor):
-            family = "tpq"
-            packed = to_gpu_tpq(pool.tensor, device=device)
         else:
             family = "nvq"
             packed = to_gpu_nvq(pool.tensor, device=device)

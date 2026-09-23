@@ -1112,33 +1112,14 @@ def convert(args) -> None:
     ).resolve()
     recipe, _ = load_recipe(recipe_path)
     scheme = load_scheme(scheme_path)
-    routed_families = {
-        item.descriptor.family
-        for selection in scheme.expert_selections.values()
-        for item in selection.selections
-    }
-    tpq_mode = bool(routed_families) and routed_families <= {
-        "TPQ-X",
-        "TPQ-W",
-        "TPQ-V",
-        "TPQ-VV",
-    }
-    allocation = None
-    allocation_document = None
-    imatrix = None
-    imatrix_sha256 = None
-    if tpq_mode:
-        if scheme.metadata.get("codebook_objective") != "euclidean_sse":
-            raise ValueError("TPQ scheme is not an original Euclidean scheme")
-    else:
-        allocation = _load_allocation(run_dir / "allocation.json")
-        allocation_document = json.loads(
-            (run_dir / "allocation.json").read_text(encoding="utf-8")
-        )
-        imatrix_sha256 = _sha256(args.imatrix)
-        if allocation_document.get("imatrix_sha256") != imatrix_sha256:
-            raise ValueError("V4F conversion imatrix differs from the prepared run")
-        imatrix = V4FImportanceMatrix.load(args.imatrix)
+    allocation = _load_allocation(run_dir / "allocation.json")
+    allocation_document = json.loads(
+        (run_dir / "allocation.json").read_text(encoding="utf-8")
+    )
+    imatrix_sha256 = _sha256(args.imatrix)
+    if allocation_document.get("imatrix_sha256") != imatrix_sha256:
+        raise ValueError("V4F conversion imatrix differs from the prepared run")
+    imatrix = V4FImportanceMatrix.load(args.imatrix)
     checkpoint = V4FCheckpoint(args.input)
     plans = _plans(args, checkpoint, recipe, scheme)
     artifact_root = scheme.path.parent
@@ -1146,7 +1127,7 @@ def convert(args) -> None:
         _plan_blob_nbytes(item, _DEFAULT_NINT, artifact_root)
         for item in plans
     )
-    if allocation is not None and estimated != allocation.estimated_blob_bytes:
+    if estimated != allocation.estimated_blob_bytes:
         raise ValueError(
             f"V4F plan size changed: {estimated} != "
             f"{allocation.estimated_blob_bytes}"
@@ -1250,20 +1231,7 @@ def convert(args) -> None:
             handle.write(json.dumps(event) + "\n")
         print(json.dumps(event), flush=True)
 
-    if tpq_mode:
-        expert_metadata = {
-            "expert_families": sorted(routed_families),
-            "expert_allocation_objective": scheme.metadata.get(
-                "allocator",
-                "tpq-per-layer-routing-energy",
-            ),
-            "expert_codebook_objective": "euclidean_sse",
-            "expert_audit_metric": scheme.metadata.get("audit_metric"),
-            "expert_audit_upgrade_factor": scheme.metadata.get(
-                "audit_upgrade_factor"
-            ),
-        }
-    elif isinstance(allocation, V4FTieredAllocation):
+    if isinstance(allocation, V4FTieredAllocation):
         expert_metadata = {
             "expert_base_family": "NVQ2J",
             "expert_upgrade_family": "NINT4",
@@ -1285,42 +1253,28 @@ def convert(args) -> None:
         ),
         "recipe_sha256": _sha256(recipe_path),
         "scheme_sha256": _sha256(scheme_path),
-        "target_bytes": (
-            estimated if allocation is None else allocation.target_bytes
-        ),
+        "target_bytes": allocation.target_bytes,
         "estimated_blob_bytes": estimated,
         "mtp_included": False,
-        "expert_objective": (
-            "euclidean_sse"
-            if tpq_mode
-            else "count_weighted_diagonal_imatrix"
-        ),
+        "expert_objective": "count_weighted_diagonal_imatrix",
         **expert_metadata,
     }
-    if not tpq_mode:
-        assert allocation is not None
-        assert imatrix is not None
-        assert imatrix_sha256 is not None
-        extra.update(
-            {
-                "allocation_sha256": _sha256(run_dir / "allocation.json"),
-                "imatrix": str(Path(args.imatrix).resolve()),
-                "imatrix_sha256": imatrix_sha256,
-                "imatrix_datasets": list(imatrix.matrix.datasets),
-                "imatrix_chunk_count": imatrix.matrix.chunk_count,
-                "imatrix_chunk_size": imatrix.matrix.chunk_size,
-            }
-        )
+    extra.update(
+        {
+            "allocation_sha256": _sha256(run_dir / "allocation.json"),
+            "imatrix": str(Path(args.imatrix).resolve()),
+            "imatrix_sha256": imatrix_sha256,
+            "imatrix_datasets": list(imatrix.matrix.datasets),
+            "imatrix_chunk_count": imatrix.matrix.chunk_count,
+            "imatrix_chunk_size": imatrix.matrix.chunk_size,
+        }
+    )
     runtime_profile = architecture_profile("deepseek_v4")
     if runtime_profile is not None:
         extra[RUNTIME_SAMPLING_METADATA_KEY] = runtime_profile
     header = FileHeader(
         version=2,
-        model_arch=(
-            "deepseek_v4-tpq-mfq"
-            if tpq_mode
-            else "deepseek_v4-ew-mfq"
-        ),
+        model_arch="deepseek_v4-ew-mfq",
         num_tensors=len(records),
         extra=extra,
     )

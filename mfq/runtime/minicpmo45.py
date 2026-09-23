@@ -23,7 +23,6 @@ from mfq.formats.assets import is_asset_record
 from mfq.formats.io import MfqTensor
 from mfq.formats.mx import MxTensor
 from mfq.formats.nint8_zero import Nint8ZeroTensor
-from mfq.formats.tpq import TpqInt4Tensor, TpqPqTensor
 from mfq.quantize.nint_quant import NintTensor
 from mfq.runtime.torch_linear import (
     TorchMxEmbedding,
@@ -34,8 +33,6 @@ from mfq.runtime.torch_linear import (
     TorchNintLinear,
     TorchNvqEmbedding,
     TorchNvqLinear,
-    TorchTpqEmbedding,
-    TorchTpqLinear,
     is_nvq_tensor,
     is_quantized_tensor,
 )
@@ -77,10 +74,8 @@ class _MfqLinearModule(nn.Module):
             self._operator = TorchNvqLinear(tensor, device)
         elif isinstance(tensor, MxTensor):
             self._operator = TorchMxLinear(tensor, device)
-        elif isinstance(tensor, (TpqInt4Tensor, TpqPqTensor)):
-            self._operator = TorchTpqLinear(tensor, device)
         else:
-            raise TypeError("MiniCPM-o linear weight must be NINT/NVQ/MX/TPQ")
+            raise TypeError("MiniCPM-o linear weight must be NINT/NVQ/MX")
         self.in_features = int(source.in_features)
         self.out_features = int(source.out_features)
         self.device = torch.device(device)
@@ -141,10 +136,8 @@ class _MfqEmbeddingModule(nn.Module):
             self._operator = TorchNvqEmbedding(tensor, device)
         elif isinstance(tensor, MxTensor):
             self._operator = TorchMxEmbedding(tensor, device)
-        elif isinstance(tensor, (TpqInt4Tensor, TpqPqTensor)):
-            self._operator = TorchTpqEmbedding(tensor, device)
         else:
-            raise TypeError("MiniCPM-o embedding weight must be NINT/NVQ/MX/TPQ")
+            raise TypeError("MiniCPM-o embedding weight must be NINT/NVQ/MX")
         self.num_embeddings = int(source.num_embeddings)
         self.embedding_dim = int(source.embedding_dim)
         self.padding_idx = source.padding_idx

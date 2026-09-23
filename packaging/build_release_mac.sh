@@ -158,7 +158,6 @@ mfq_pyinstaller_args=(
   --exclude-module mfq.calibration
   --exclude-module mfq.quantize
   --exclude-module mfq.tools
-  --exclude-module mfq._vendor.tpq
   --exclude-module mfq.runtime
   --exclude-module minicpmo_utils
   --exclude-module stepaudio2_minicpmo

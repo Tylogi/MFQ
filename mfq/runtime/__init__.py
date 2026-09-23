@@ -1,7 +1,7 @@
 """MFQ inference runtimes.
 
-The NumPy reference runtime is always available. Torch/CUDA, TPQ, and
-MLX/Metal objects are imported lazily so installing one optional backend does
+The NumPy reference runtime is always available. Torch/CUDA and MLX/Metal
+objects are imported lazily so installing one optional backend does
 not require the dependencies of another backend.
 """
 
@@ -13,14 +13,6 @@ from mfq.runtime.dequantize import clear_backends, dequantize, register_backend
 from mfq.runtime.ffn import SwiGLUFFN, silu
 from mfq.runtime.linear import NintLinear
 from mfq.runtime.model import NintModel
-from mfq.runtime.tpq import (
-    TPQArtifact,
-    configure_tpq_memory,
-    load_tpq_model,
-    open_tpq_artifact,
-    run_tpq_chat,
-)
-
 if TYPE_CHECKING:
     from mfq.runtime.causal_lm import (
         TorchNintCausalLM,
@@ -40,14 +32,6 @@ if TYPE_CHECKING:
         MlxFullAttentionBlock,
         MlxQwen35LinearAttentionBlock,
         MlxQwen35Mtp,
-    )
-    from mfq.runtime.mlx_deepseek_v4 import (
-        MlxDeepseekV4,
-        MlxDeepseekV4Attention,
-        MlxDeepseekV4Config,
-        MlxDeepseekV4MoE,
-        MlxDeepseekV4Names,
-        MlxDeepseekV4PoolState,
     )
     from mfq.runtime.mlx_flash_next_vision import (
         MlxGlm5NextVision,
@@ -84,15 +68,6 @@ if TYPE_CHECKING:
         MlxGlmDsaMoE,
         MlxGlmDsaNames,
     )
-    from mfq.runtime.mlx_kimi_k3 import (
-        MlxKimiK3,
-        MlxKimiK3Config,
-        MlxKimiK3Names,
-        MlxKimiKDA,
-        MlxKimiMLA,
-        MlxKimiMoE,
-        MlxKimiSiTUFFN,
-    )
     from mfq.runtime.mlx_linear import (
         MlxDenseEmbedding,
         MlxDenseLinear,
@@ -108,11 +83,7 @@ if TYPE_CHECKING:
         MlxShardedEmbedding,
         MlxSwiGLUFFN,
     )
-    from mfq.runtime.mlx_moe import (
-        MlxRoutedLinear,
-        MlxRoutedSiTUFFN,
-        MlxRoutedSwiGLUFFN,
-    )
+    from mfq.runtime.mlx_moe import MlxRoutedLinear, MlxRoutedSwiGLUFFN
     from mfq.runtime.mlx_ops import MlxRMSNorm, MlxRoPE
     from mfq.runtime.mlx_qwen4_exp import (
         MlxQwen4Exp,
@@ -128,17 +99,7 @@ if TYPE_CHECKING:
         MlxQwen4ExpPle,
         MlxQwen4ExpQsa,
     )
-    from mfq.runtime.mlx_tpq import (
-        MlxTpqInt4Embedding,
-        MlxTpqInt4Linear,
-        MlxTpqPqLinear,
-    )
     from mfq.runtime.mlx_vq import MlxVqEmbedding, MlxVqLinear
-    from mfq.runtime.tpq_mfq import (
-        MfqTpqStore,
-        NativeTPQArtifact,
-    )
-
 
 _TORCH_EXPORTS = {
     "TorchNintCausalLM",
@@ -150,15 +111,7 @@ _MINICPMO45_EXPORTS = {
     "TorchMfqMiniCPMO45",
     "load_minicpmo45",
 }
-_TPQ_MFQ_EXPORTS = {
-    "MfqTpqStore",
-    "NativeTPQArtifact",
-    "install_mfq_tpq_store",
-}
 _MLX_EXPORTS = {
-    "MlxTpqInt4Embedding",
-    "MlxTpqInt4Linear",
-    "MlxTpqPqLinear",
     "MlxDenseEmbedding",
     "MlxDenseLinear",
     "MlxLinearGroup",
@@ -186,19 +139,6 @@ _MLX_CAUSAL_LM_EXPORTS = {
     "MlxFullAttentionBlock",
     "MlxQwen35Mtp",
     "MlxQwen35LinearAttentionBlock",
-}
-_MLX_TPQ_EXPORTS = {
-    "MlxTpqInt4Embedding",
-    "MlxTpqInt4Linear",
-    "MlxTpqPqLinear",
-}
-_MLX_DEEPSEEK_V4_EXPORTS = {
-    "MlxDeepseekV4",
-    "MlxDeepseekV4Attention",
-    "MlxDeepseekV4Config",
-    "MlxDeepseekV4MoE",
-    "MlxDeepseekV4Names",
-    "MlxDeepseekV4PoolState",
 }
 _MLX_GEMMA4_EXPORTS = {
     "MlxGemma4",
@@ -235,15 +175,6 @@ _MLX_GLM5_NEXT_EXPORTS = {
     "MlxGlm5NextNames",
     "MlxGlm5NextSparseAttention",
 }
-_MLX_KIMI_EXPORTS = {
-    "MlxKimiK3",
-    "MlxKimiK3Config",
-    "MlxKimiK3Names",
-    "MlxKimiKDA",
-    "MlxKimiMLA",
-    "MlxKimiMoE",
-    "MlxKimiSiTUFFN",
-}
 _MLX_QWEN4_EXP_EXPORTS = {
     "MlxQwen4Exp",
     "MlxQwen4ExpDenseFFN",
@@ -258,19 +189,11 @@ _MLX_QWEN4_EXP_EXPORTS = {
     "MlxQwen4ExpPle",
     "MlxQwen4ExpQsa",
 }
-_MLX_MOE_EXPORTS = {
-    "MlxRoutedLinear",
-    "MlxRoutedSiTUFFN",
-    "MlxRoutedSwiGLUFFN",
-}
+_MLX_MOE_EXPORTS = {"MlxRoutedLinear", "MlxRoutedSwiGLUFFN"}
 
 
 def __getattr__(name: str):
-    if name in _TPQ_MFQ_EXPORTS:
-        from mfq.runtime import tpq_mfq
-
-        value = getattr(tpq_mfq, name)
-    elif name in _TORCH_EXPORTS:
+    if name in _TORCH_EXPORTS:
         from mfq.runtime import causal_lm
 
         value = getattr(causal_lm, name)
@@ -290,14 +213,6 @@ def __getattr__(name: str):
         from mfq.runtime import mlx_causal_lm
 
         value = getattr(mlx_causal_lm, name)
-    elif name in _MLX_TPQ_EXPORTS:
-        from mfq.runtime import mlx_tpq
-
-        value = getattr(mlx_tpq, name)
-    elif name in _MLX_DEEPSEEK_V4_EXPORTS:
-        from mfq.runtime import mlx_deepseek_v4
-
-        value = getattr(mlx_deepseek_v4, name)
     elif name in _MLX_FLASH_NEXT_VISION_EXPORTS:
         from mfq.runtime import mlx_flash_next_vision
 
@@ -314,10 +229,6 @@ def __getattr__(name: str):
         from mfq.runtime import mlx_glm5_next
 
         value = getattr(mlx_glm5_next, name)
-    elif name in _MLX_KIMI_EXPORTS:
-        from mfq.runtime import mlx_kimi_k3
-
-        value = getattr(mlx_kimi_k3, name)
     elif name in _MLX_QWEN4_EXP_EXPORTS:
         from mfq.runtime import mlx_qwen4_exp
 
@@ -337,14 +248,6 @@ def __getattr__(name: str):
 
 
 __all__ = [
-    "TPQArtifact",
-    "NativeTPQArtifact",
-    "MfqTpqStore",
-    "configure_tpq_memory",
-    "install_mfq_tpq_store",
-    "load_tpq_model",
-    "open_tpq_artifact",
-    "run_tpq_chat",
     "NintModel",
     "NintLinear",
     "SwiGLUFFN",
@@ -358,17 +261,8 @@ __all__ = [
     "MiniCPMO45LoadReport",
     "TorchMfqMiniCPMO45",
     "load_minicpmo45",
-    "MlxTpqInt4Embedding",
-    "MlxTpqInt4Linear",
-    "MlxTpqPqLinear",
     "MlxDenseEmbedding",
     "MlxDenseLinear",
-    "MlxDeepseekV4",
-    "MlxDeepseekV4Attention",
-    "MlxDeepseekV4Config",
-    "MlxDeepseekV4MoE",
-    "MlxDeepseekV4Names",
-    "MlxDeepseekV4PoolState",
     "MlxGlm5NextVision",
     "MlxCausalLM",
     "MlxCausalLMConfig",
@@ -413,13 +307,6 @@ __all__ = [
     "MlxQwen4ExpVision",
     "qwen4_multimodal_positions",
     "MlxKVCache",
-    "MlxKimiK3",
-    "MlxKimiK3Config",
-    "MlxKimiK3Names",
-    "MlxKimiKDA",
-    "MlxKimiMLA",
-    "MlxKimiMoE",
-    "MlxKimiSiTUFFN",
     "MlxLinearGroup",
     "MlxMMapEmbedding",
     "MlxMxEmbedding",
@@ -433,7 +320,6 @@ __all__ = [
     "MlxRMSNorm",
     "MlxRoPE",
     "MlxRoutedLinear",
-    "MlxRoutedSiTUFFN",
     "MlxRoutedSwiGLUFFN",
     "MlxSwiGLUFFN",
     "MlxSlidingWindowKVCache",

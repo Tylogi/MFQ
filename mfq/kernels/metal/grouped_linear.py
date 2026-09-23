@@ -1,6 +1,6 @@
 """Single-dispatch packed linear projections for Apple silicon.
 
-The decode path concatenates packed NINT8-0, VQ-family, and TPQ streams once.
+The decode path concatenates packed NINT8-0 and VQ-family streams once.
 NINT pair/triple groups use a separate zero-copy metadata-driven operator;
 they never enter the older heterogeneous decoder below.
 """
@@ -59,35 +59,10 @@ from mfq.kernels.metal.moe import (
 )
 from mfq.kernels.metal.nint import MetalNintWeight, _NINT_HEADER_SOURCE
 from mfq.kernels.metal.nint8_zero import MetalNint8ZeroWeight
-from mfq.kernels.metal.tpq import (
-    _PQ_INDEX_HEADER,
-    MetalTpqInt4Weight,
-    MetalTpqPqWeight,
-)
 from mfq.kernels.metal.vq import _BITSTREAM_HEADER, MetalVqWeight, signed_hadamard
 
-_FAMILY_TPQ_INT4 = 3
-_FAMILY_TPQ_PQ = 4
-
-# TPQ int4 descriptor fields.
-_TPQ_I4_GROUP_SIZE = 4
-_TPQ_I4_GROUPS = 5
-_TPQ_I4_PACKED_OFFSET = 6
-_TPQ_I4_SCALE_OFFSET = 7
-
-# TPQ product-VQ descriptor fields.
-_TPQ_PQ_BITS = 4
-_TPQ_PQ_VECTOR_SIZE = 5
-_TPQ_PQ_BLOCKS = 6
-_TPQ_PQ_INDEX_OFFSET = 7
-_TPQ_PQ_CODEBOOK_OFFSET = 8
-
-PackedLinearWeight: TypeAlias = (
-    MetalNintWeight | MetalNint8ZeroWeight | MetalVqWeight | MetalTpqInt4Weight | MetalTpqPqWeight
-)
-HeterogeneousLinearWeight: TypeAlias = (
-    MetalNint8ZeroWeight | MetalVqWeight | MetalTpqInt4Weight | MetalTpqPqWeight
-)
+PackedLinearWeight: TypeAlias = MetalNintWeight | MetalNint8ZeroWeight | MetalVqWeight
+HeterogeneousLinearWeight: TypeAlias = MetalNint8ZeroWeight | MetalVqWeight
 
 
 def _nint_group_input_names(projections: int) -> list[str]:
@@ -482,79 +457,24 @@ _GROUPED_LINEAR_SOURCE = r"""
             if (output >= output_width) {
                 continue;
             }
-            float weight;
-            if (family == 3u) {
-                uint group_size =
-                    uint(descriptors[descriptor_base + 4u]);
-                uint groups = uint(descriptors[descriptor_base + 5u]);
-                uint packed_offset =
-                    uint(descriptors[descriptor_base + 6u]);
-                uint scale_offset =
-                    uint(descriptors[descriptor_base + 7u]);
-                uint packed_value = uint(tpq_i4_packed[
-                    packed_offset + output * uint(K / 2u) + (column >> 1)
-                ]);
-                uint quantized = (column & 1u) == 0u
-                    ? packed_value & 15u
-                    : packed_value >> 4u;
-                float scale = float(tpq_i4_scales[
-                    scale_offset
-                    + output * groups
-                    + column / group_size
-                ]);
-                weight = float(int(quantized) - 8) * scale;
-            } else if (family == 4u) {
-                uint bits = uint(descriptors[descriptor_base + 4u]);
-                uint vector_size =
-                    uint(descriptors[descriptor_base + 5u]);
-                uint blocks = uint(descriptors[descriptor_base + 6u]);
-                uint index_offset =
-                    uint(descriptors[descriptor_base + 7u]);
-                uint codebook_offset =
-                    uint(descriptors[descriptor_base + 8u]);
-                uint block = column / vector_size;
-                uint component = column - block * vector_size;
-                uint linear_index = output * blocks + block;
-                uint code;
-                if (bits == 8u) {
-                    code = uint(
-                        tpq_pq_indices8[index_offset + linear_index]
-                    );
-                } else if (bits == 16u) {
-                    code = uint(
-                        tpq_pq_indices16[index_offset + linear_index]
-                    );
-                } else {
-                    code = mfq_tpq_read_packed_index(
-                        tpq_pq_indices_packed,
-                        index_offset,
-                        linear_index,
-                        bits
-                    );
-                }
-                weight = float(tpq_pq_codebooks[
-                    codebook_offset + code * vector_size + component
-                ]);
-            } else {
-                weight = mfq_grouped_linear_decode_weight(
-                    descriptors,
-                    q8_q,
-                    q8_scales,
-                    vq_indices,
-                    vq_state,
-                    vq_aux,
-                    vq_anchors,
-                    vq_codebooks,
-                    vq_scales,
-                    vq_state_to_codebank,
-                    vq_banks,
-                    vq_parameters,
-                    descriptor_base,
-                    output,
-                    column,
-                    uint(K)
-                );
-            }
+            float weight = mfq_grouped_linear_decode_weight(
+                descriptors,
+                q8_q,
+                q8_scales,
+                vq_indices,
+                vq_state,
+                vq_aux,
+                vq_anchors,
+                vq_codebooks,
+                vq_scales,
+                vq_state_to_codebank,
+                vq_banks,
+                vq_parameters,
+                descriptor_base,
+                output,
+                column,
+                uint(K)
+            );
             accumulators[local_row] = fma(
                 activation,
                 weight,
@@ -593,16 +513,10 @@ _GROUPED_LINEAR_KERNEL = mx.fast.metal_kernel(
         "vq_state_to_codebank",
         "vq_banks",
         "vq_parameters",
-        "tpq_i4_packed",
-        "tpq_i4_scales",
-        "tpq_pq_indices8",
-        "tpq_pq_indices16",
-        "tpq_pq_indices_packed",
-        "tpq_pq_codebooks",
         "x",
     ],
     output_names=["y"],
-    header=_GROUPED_LINEAR_HEADER + _PQ_INDEX_HEADER,
+    header=_GROUPED_LINEAR_HEADER,
     source=_GROUPED_LINEAR_SOURCE,
     compile_options={"math_mode": "fast"},
 )
@@ -672,12 +586,6 @@ class MetalLinearGroupWeight:
     vq_state_to_codebank: mx.array
     vq_banks: mx.array
     vq_parameters: mx.array
-    tpq_i4_packed: mx.array
-    tpq_i4_scales: mx.array
-    tpq_pq_indices8: mx.array
-    tpq_pq_indices16: mx.array
-    tpq_pq_indices_packed: mx.array
-    tpq_pq_codebooks: mx.array
     descriptor_values: np.ndarray
     rotation_specs: tuple[tuple[mx.array, int, int], ...]
     output_widths: tuple[int, ...]
@@ -713,12 +621,6 @@ class MetalLinearGroupWeight:
             "vq_state_to_codebank": [],
             "vq_banks": [],
             "vq_parameters": [],
-            "tpq_i4_packed": [],
-            "tpq_i4_scales": [],
-            "tpq_pq_indices8": [],
-            "tpq_pq_indices16": [],
-            "tpq_pq_indices_packed": [],
-            "tpq_pq_codebooks": [],
         }
         offsets = {name: 0 for name in streams}
         rotation_variants: dict[tuple[int, int], int] = {}
@@ -808,37 +710,7 @@ class MetalLinearGroupWeight:
                 offsets["vq_parameters"] += _size(weight.parameters)
                 continue
 
-            if isinstance(weight, MetalTpqInt4Weight):
-                descriptor[_FAMILY] = _FAMILY_TPQ_INT4
-                descriptor[_TPQ_I4_GROUP_SIZE] = weight.group_size
-                descriptor[_TPQ_I4_GROUPS] = weight.groups
-                descriptor[_TPQ_I4_PACKED_OFFSET] = offsets["tpq_i4_packed"]
-                descriptor[_TPQ_I4_SCALE_OFFSET] = offsets["tpq_i4_scales"]
-                streams["tpq_i4_packed"].append(weight.packed)
-                streams["tpq_i4_scales"].append(weight.scales)
-                offsets["tpq_i4_packed"] += _size(weight.packed)
-                offsets["tpq_i4_scales"] += _size(weight.scales)
-                continue
-
-            if not isinstance(weight, MetalTpqPqWeight):
-                raise TypeError(f"unsupported grouped linear weight {type(weight).__name__}")
-            descriptor[_FAMILY] = _FAMILY_TPQ_PQ
-            descriptor[_TPQ_PQ_BITS] = weight.index_bits
-            descriptor[_TPQ_PQ_VECTOR_SIZE] = weight.vector_size
-            descriptor[_TPQ_PQ_BLOCKS] = weight.blocks
-            descriptor[_TPQ_PQ_CODEBOOK_OFFSET] = offsets["tpq_pq_codebooks"]
-            bits = int(weight.index_bits)
-            if bits == 8:
-                index_stream = "tpq_pq_indices8"
-            elif bits == 16:
-                index_stream = "tpq_pq_indices16"
-            else:
-                index_stream = "tpq_pq_indices_packed"
-            descriptor[_TPQ_PQ_INDEX_OFFSET] = offsets[index_stream]
-            streams[index_stream].append(weight.indices)
-            streams["tpq_pq_codebooks"].append(weight.codebook)
-            offsets[index_stream] += _size(weight.indices)
-            offsets["tpq_pq_codebooks"] += _size(weight.codebook)
+            raise TypeError(f"unsupported grouped linear weight {type(weight).__name__}")
 
         widths = tuple(output_widths)
         output_offsets = np.zeros((len(widths) + 1,), dtype=np.int32)
@@ -883,30 +755,6 @@ class MetalLinearGroupWeight:
                 streams["vq_parameters"],
                 dtype=mx.float32,
             ),
-            tpq_i4_packed=_join(
-                streams["tpq_i4_packed"],
-                dtype=mx.uint8,
-            ),
-            tpq_i4_scales=_join(
-                streams["tpq_i4_scales"],
-                dtype=mx.float16,
-            ),
-            tpq_pq_indices8=_join(
-                streams["tpq_pq_indices8"],
-                dtype=mx.uint8,
-            ),
-            tpq_pq_indices16=_join(
-                streams["tpq_pq_indices16"],
-                dtype=mx.uint16,
-            ),
-            tpq_pq_indices_packed=_join(
-                streams["tpq_pq_indices_packed"],
-                dtype=mx.uint8,
-            ),
-            tpq_pq_codebooks=_join(
-                streams["tpq_pq_codebooks"],
-                dtype=mx.float16,
-            ),
             descriptor_values=descriptors,
             rotation_specs=tuple(rotation_specs),
             output_widths=widths,
@@ -937,12 +785,6 @@ class MetalLinearGroupWeight:
             self.vq_state_to_codebank,
             self.vq_banks,
             self.vq_parameters,
-            self.tpq_i4_packed,
-            self.tpq_i4_scales,
-            self.tpq_pq_indices8,
-            self.tpq_pq_indices16,
-            self.tpq_pq_indices_packed,
-            self.tpq_pq_codebooks,
         )
         return sum(int(array.nbytes) for array in arrays)
 
@@ -1075,12 +917,6 @@ def grouped_linear_matmul(
             weight.vq_state_to_codebank,
             weight.vq_banks,
             weight.vq_parameters,
-            weight.tpq_i4_packed,
-            weight.tpq_i4_scales,
-            weight.tpq_pq_indices8,
-            weight.tpq_pq_indices16,
-            weight.tpq_pq_indices_packed,
-            weight.tpq_pq_codebooks,
             execution_input,
         ],
         template=[

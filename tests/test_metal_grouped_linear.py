@@ -31,11 +31,6 @@ from mfq.formats.nvq import (  # noqa: E402
     NVQ3_D4_1024,
     NvqTensor,
 )
-from mfq.formats.tpq import (  # noqa: E402
-    TpqInt4Tensor,
-    TpqPqSpec,
-    TpqPqTensor,
-)
 from mfq.quantize.nint_quant import dequantize, quantize  # noqa: E402
 from mfq.quantize.nvq_quant import dequantize as dequantize_nvq  # noqa: E402
 from mfq.runtime.mlx_linear import MlxLinearGroup  # noqa: E402
@@ -126,62 +121,6 @@ def test_grouped_linear_mixes_nint_q8_and_vq_with_variable_outputs(rows: int):
             rtol=4e-3,
             atol=4e-3,
         )
-
-
-def test_grouped_linear_mixes_tpq_int4_and_p12():
-    rng = np.random.default_rng(20260820)
-    width = 64
-    quantized = rng.integers(-8, 8, size=(9, width), dtype=np.int16)
-    packed = ((quantized[:, 0::2] + 8) | ((quantized[:, 1::2] + 8) << 4)).astype(np.uint8)
-    scales = rng.uniform(0.01, 0.1, size=(9, 1)).astype(np.float16)
-    int4 = TpqInt4Tensor(
-        shape=(9, width),
-        axis=0,
-        neuron_len=width,
-        group_size=64,
-        packed=packed,
-        scales=scales,
-    )
-    int4_dense = quantized.astype(np.float32) * scales.astype(np.float32)
-
-    spec = TpqPqSpec("w", 8, 300, storage_bits=12)
-    indices = rng.integers(
-        0,
-        spec.codebook_entries,
-        size=(7, width // spec.vector_size),
-        dtype=np.uint16,
-    )
-    codebook = rng.normal(
-        0,
-        0.1,
-        size=(spec.codebook_entries, spec.vector_size),
-    ).astype(np.float32)
-    pq = TpqPqTensor(
-        spec=spec,
-        shape=(7, width),
-        axis=0,
-        neuron_len=width,
-        indices=indices,
-        codebook=codebook,
-    )
-    pq_dense = codebook[indices].reshape(7, width)
-    group = MlxLinearGroup((int4, pq))
-    assert group.uses_grouped_kernel
-
-    source = rng.normal(0, 0.1, size=(3, width)).astype(np.float16)
-    actual_int4, actual_pq = (_array(item) for item in group(source))
-    np.testing.assert_allclose(
-        actual_int4,
-        (source.astype(np.float32) @ int4_dense.T).astype(np.float16),
-        rtol=4e-3,
-        atol=4e-3,
-    )
-    np.testing.assert_allclose(
-        actual_pq,
-        (source.astype(np.float32) @ pq_dense.T).astype(np.float16),
-        rtol=4e-3,
-        atol=4e-3,
-    )
 
 
 def test_grouped_linear_mixes_every_nint_width():

@@ -220,12 +220,6 @@ from mfq.formats.shards import (
     validate_split_limits,
     write_blob_record_shards,
 )
-from mfq.formats.tpq import (
-    TPQ_PQ_SPECS_BY_LABEL,
-    pack_tpq_indices,
-    pack_tpq_pq_prefix,
-    tpq_pq_payload_nbytes,
-)
 from mfq.quantize.backend import (
     ACCELERATOR_BACKENDS,
     QUANT_BACKENDS,
@@ -270,7 +264,6 @@ from mfq.quantize.standard_presets import (
 from mfq.quantize.standard_presets import (
     normalize_preset as _normalize_standard_preset,
 )
-from mfq.quantize.tpq import quantize_tpq_pq_fixed
 
 
 @dataclass(frozen=True)
@@ -1211,10 +1204,6 @@ _COMPACT_FAMILY_BITS = {
     "NEPQ1-S": 2.0,
     "NEPQ1-L": 2.0,
     "NEPQ1-A": 1.5625,
-    "TPQ-X": 1.0,
-    "TPQ-W": 1.5,
-    "TPQ-V": 2.0,
-    "TPQ-VV": 3.0,
 }
 
 
@@ -5193,16 +5182,6 @@ def _quantize_flat_stream_chunk(
             group_chunk=int(precision.option("group_chunk", 1024)),
             device=device,
         )
-    if quant_backend in ACCELERATOR_BACKENDS and family in TPQ_PQ_SPECS_BY_LABEL:
-        if artifact is None:
-            raise ValueError(f"streaming {family} requires a frozen codebook")
-        return quantize_tpq_pq_fixed(
-            weight_tensor,
-            TPQ_PQ_SPECS_BY_LABEL[family],
-            np.asarray(artifact, dtype=np.float32),
-            device=device,
-            distance_bytes=int(precision.option("distance_bytes", 1 << 30)),
-        )
     if quant_backend in ACCELERATOR_BACKENDS and family in {"NPQ0-L", "NPQ0-S"}:
         if family == "NPQ0-L":
             if not isinstance(artifact, Npq0LTables):
@@ -5286,7 +5265,6 @@ def _write_flat_family_axis0_blob(
             "NVQ3J-L",
             "NPQ0-L",
             "NPQ0-S",
-            *TPQ_PQ_SPECS_BY_LABEL,
         }
         and artifact is None
     ):
@@ -5302,16 +5280,7 @@ def _write_flat_family_axis0_blob(
         )
 
     anchor_bytes_per_row = 2
-    if family in TPQ_PQ_SPECS_BY_LABEL:
-        spec = TPQ_PQ_SPECS_BY_LABEL[family]
-        codebook = np.ascontiguousarray(artifact, dtype=np.float32)
-        header = pack_tpq_pq_prefix(spec, shape, codebook)
-        table_payload = b""
-        stream_bits = ((neuron_len // spec.vector_size) * spec.index_bits,)
-        packer = pack_tpq_indices
-        fields = ("indices",)
-        anchor_bytes_per_row = 0
-    elif family == "NVQ1-L":
+    if family == "NVQ1-L":
         spec = NVQ1_L_T8_S3
         ng = (neuron_len + spec.groupsize - 1) // spec.groupsize
         nvec = (neuron_len + spec.vector_size - 1) // spec.vector_size
@@ -5462,13 +5431,10 @@ def _write_flat_family_axis0_blob(
             importance, device=device, dtype=torch.float32
         ).contiguous()
     with blob_path.open("wb+") as output:
-        if family in TPQ_PQ_SPECS_BY_LABEL:
-            output.write(header)
-        else:
-            output.write(header)
-            output.write(struct.pack(f"<{len(shape)}q", *shape))
-            output.write(struct.pack("<I", out))
-            output.write(table_payload)
+        output.write(header)
+        output.write(struct.pack(f"<{len(shape)}q", *shape))
+        output.write(struct.pack("<I", out))
+        output.write(table_payload)
         anchor_offset = output.tell()
         stream_offsets: list[int] = []
         offset = anchor_offset + out * anchor_bytes_per_row
@@ -6267,15 +6233,6 @@ def _mixed_moe_blob_nbytes(
                 raise ValueError("NPQ0-S size estimation requires its table artifact")
             payload_nbytes = (
                 _NPQ0_S_HEADER.size + flat_shape_header + NPQ0_S.payload_nbytes(rows, columns)
-            )
-        elif precision.family in TPQ_PQ_SPECS_BY_LABEL:
-            if artifact is None:
-                raise ValueError(
-                    f"{precision.family} size estimation requires its codebook artifact"
-                )
-            payload_nbytes = tpq_pq_payload_nbytes(
-                (rows, columns),
-                TPQ_PQ_SPECS_BY_LABEL[precision.family],
             )
         elif precision.family in _NVQ_SPECS:
             spec = _NVQ_SPECS[precision.family]
@@ -7893,7 +7850,7 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument(
         "--input-mfq",
         default="",
-        help="full-precision MFQ containing no NINT/NVQ/NPQ/NEPQ/TPQ tensors",
+        help="full-precision MFQ containing no compact tensors",
     )
     parser.add_argument("--output", required=True, help="output .mfq path")
     parser.add_argument(

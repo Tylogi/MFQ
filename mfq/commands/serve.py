@@ -14,7 +14,6 @@ import sys
 from pathlib import Path
 
 from mfq.commands.build import BuildError, build_runtime, detect_backend, load_managed_build
-from mfq.server.network import install_system_proxy_environment, network_auth_error
 
 
 def _positive_int(value: str) -> int:
@@ -208,6 +207,8 @@ def _server_storage_paths(
 
 
 def _run(args: argparse.Namespace) -> int:
+    from mfq.server.network import install_system_proxy_environment, network_auth_error
+
     client_api_key = os.environ.get(args.api_key_env, "")
     if error := network_auth_error(args.host, client_api_key):
         raise ValueError(error)

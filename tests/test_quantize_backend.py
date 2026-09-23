@@ -40,16 +40,6 @@ def test_explicit_unavailable_metal_is_rejected(
         resolve_quant_backend("metal", "mps")
 
 
-def test_tpq_default_device_prefers_metal_without_cuda(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from mfq.quantize.tpq import _device
-
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
-    assert _device(None) == torch.device("mps")
-
-
 def test_gguf_converter_enables_native_assignment_for_metal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -84,81 +74,6 @@ def test_gguf_converter_enables_native_assignment_for_metal(
     assert result is sentinel
     assert captured["nvq_native_assignment"] is True
     assert captured["nvq1_l_native_assignment"] is True
-
-
-@pytest.mark.skipif(
-    not torch.backends.mps.is_available(),
-    reason="Metal/MPS is unavailable",
-)
-@pytest.mark.parametrize("entries,vector_size", [(256, 8), (4096, 4)])
-def test_metal_tpq_assignment_matches_torch_reference(
-    entries: int,
-    vector_size: int,
-) -> None:
-    from mfq.quantize.tpq import _assign_device, _assign_device_torch
-
-    generator = torch.Generator().manual_seed(entries + vector_size)
-    points = torch.randn((19, vector_size), generator=generator).to("mps")
-    codebook = torch.randn(
-        (entries, vector_size), generator=generator
-    ).to("mps")
-    labels, errors = _assign_device(
-        points, codebook, distance_bytes=1 << 20
-    )
-    reference_labels, reference_errors = _assign_device_torch(
-        points, codebook, distance_bytes=1 << 20
-    )
-    assert torch.equal(labels, reference_labels)
-    torch.testing.assert_close(errors, reference_errors, rtol=2e-5, atol=2e-5)
-
-
-@pytest.mark.skipif(
-    not torch.backends.mps.is_available(),
-    reason="Metal/MPS is unavailable",
-)
-def test_metal_tpq_training_uses_native_assignment_end_to_end() -> None:
-    from mfq.formats.tpq import TPQ_X
-    from mfq.quantize.tpq import TpqKmeansConfig, train_tpq_codebook
-
-    points = torch.randn(
-        (264, TPQ_X.vector_size),
-        generator=torch.Generator().manual_seed(20260814),
-    )
-    result = train_tpq_codebook(
-        points,
-        TPQ_X,
-        config=TpqKmeansConfig(
-            iterations=2,
-            restarts=1,
-            sample_points=264,
-            distance_bytes=1 << 20,
-        ),
-        device="mps",
-    )
-    assert result.codebook.shape == (
-        TPQ_X.codebook_entries,
-        TPQ_X.vector_size,
-    )
-    assert result.sse >= 0.0
-    assert len(result.history) == 2
-
-
-@pytest.mark.skipif(
-    not torch.backends.mps.is_available(),
-    reason="Metal/MPS is unavailable",
-)
-def test_metal_tpq_int4_matches_cpu_encoding() -> None:
-    import numpy as np
-
-    from mfq.quantize.tpq import quantize_tpq_int4
-
-    weight = np.random.default_rng(20260814).normal(
-        0.0, 0.2, (7, 128)
-    ).astype(np.float32)
-    cpu = quantize_tpq_int4(weight)
-    metal = quantize_tpq_int4(torch.from_numpy(weight).to("mps"))
-    np.testing.assert_array_equal(metal.packed, cpu.packed)
-    np.testing.assert_array_equal(metal.scales, cpu.scales)
 
 
 @pytest.mark.skipif(

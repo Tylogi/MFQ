@@ -24,8 +24,6 @@ from mfq.formats.npq0_s import Npq0STensor
 from mfq.formats.nvq import NvqJscTensor, NvqTensor
 from mfq.formats.nvq1_l import Nvq1LTensor
 from mfq.formats.nvq1_s import Nvq1STensor
-from mfq.formats.tpq import TpqPqTensor
-from mfq.kernels.metal.kimi_k3 import situ_split
 from mfq.kernels.metal.moe import (
     MetalMoeWeight,
     UnsupportedGroupedMoeError,
@@ -41,12 +39,6 @@ from mfq.kernels.metal.nint import MetalNintWeight, nint_matmul
 from mfq.kernels.metal.nint8_zero import (
     MetalNint8ZeroWeight,
     nint8_zero_matmul,
-)
-from mfq.kernels.metal.tpq import (
-    MetalTpqMoeWeight,
-    MetalTpqPqWeight,
-    tpq_grouped_moe_matmul,
-    tpq_pq_routed_matmul,
 )
 from mfq.kernels.metal.vq import MetalVqWeight, vq_matmul
 
@@ -64,13 +56,7 @@ _VQ_TYPES = (
 @dataclass(frozen=True)
 class _MlxMoePool:
     expert_ids: mx.array
-    weight: (
-        MetalNintWeight
-        | MetalNint8ZeroWeight
-        | MetalVqWeight
-        | MetalTpqPqWeight
-        | MetalMxWeight
-    )
+    weight: MetalNintWeight | MetalNint8ZeroWeight | MetalVqWeight | MetalMxWeight
     experts: int
     out_per_expert: int
 
@@ -79,14 +65,6 @@ class _MlxMoePool:
         x: mx.array,
         selected_ids: mx.array,
     ) -> mx.array:
-        if isinstance(self.weight, MetalTpqPqWeight):
-            return tpq_pq_routed_matmul(
-                self.weight,
-                x,
-                selected_ids,
-                self.expert_ids,
-                out_per_expert=self.out_per_expert,
-            )
         if isinstance(self.weight, MetalNintWeight):
             value = nint_matmul(self.weight, x)
         elif isinstance(self.weight, MetalNint8ZeroWeight):
@@ -158,15 +136,10 @@ class MlxRoutedLinear:
         self.out_per_expert = tensor.out_per_expert
         self.neuron_len = tensor.neuron_len
         self.grouped_projection: int | None = None
-        self.grouped_weight: MetalMoeWeight | MetalTpqMoeWeight | None = None
-        has_tpq = any(isinstance(pool.tensor, TpqPqTensor) for pool in tensor.pools)
-        all_tpq = all(isinstance(pool.tensor, TpqPqTensor) for pool in tensor.pools)
+        self.grouped_weight: MetalMoeWeight | None = None
         if use_grouped:
-            if all_tpq:
-                self.grouped_weight = MetalTpqMoeWeight.from_tensor(tensor)
-            elif not has_tpq:
-                with suppress(UnsupportedGroupedMoeError, TypeError):
-                    self.grouped_weight = MetalMoeWeight.from_tensor(tensor)
+            with suppress(UnsupportedGroupedMoeError, TypeError):
+                self.grouped_weight = MetalMoeWeight.from_tensor(tensor)
         if self.grouped_weight is not None:
             self.pools = ()
             return
@@ -175,21 +148,17 @@ class MlxRoutedLinear:
         for pool in tensor.pools:
             source = pool.tensor
             if isinstance(source, NintTensor):
-                weight: (
-                    MetalNintWeight | MetalNint8ZeroWeight | MetalVqWeight | MetalTpqPqWeight
-                    | MetalMxWeight
-                ) = MetalNintWeight.from_tensor(source)
+                weight: MetalNintWeight | MetalNint8ZeroWeight | MetalVqWeight | MetalMxWeight
+                weight = MetalNintWeight.from_tensor(source)
             elif isinstance(source, Nint8ZeroTensor):
                 weight = MetalNint8ZeroWeight.from_tensor(source)
             elif isinstance(source, _VQ_TYPES):
                 weight = MetalVqWeight.from_tensor(source)
-            elif isinstance(source, TpqPqTensor):
-                weight = MetalTpqPqWeight.from_tensor(source)
             elif isinstance(source, MxTensor) and source.dtype in MX_DTYPES:
                 weight = MetalMxWeight.from_tensor(source)
             else:
                 raise TypeError(
-                    "Metal MFE supports NINT/NVQ/NPQ/NEPQ/TPQ/MX cohorts; "
+                    "Metal MFE supports NINT/NVQ/NPQ/NEPQ/MX cohorts; "
                     f"received {type(source).__name__}"
                 )
             expert_ids = np.ascontiguousarray(pool.expert_ids, dtype=np.int32)
@@ -239,15 +208,7 @@ class MlxRoutedLinear:
         expert_ids: mx.array | np.ndarray,
     ) -> mx.array:
         if self.grouped_weight is not None:
-            result = (
-                tpq_grouped_moe_matmul(
-                    self.grouped_weight,
-                    x,
-                    expert_ids,
-                )
-                if isinstance(self.grouped_weight, MetalTpqMoeWeight)
-                else grouped_moe_matmul(self.grouped_weight, x, expert_ids)
-            )
+            result = grouped_moe_matmul(self.grouped_weight, x, expert_ids)
             if self.grouped_projection is not None:
                 start = self.grouped_projection * self.out_per_expert
                 result = result[..., start : start + self.out_per_expert]
@@ -281,13 +242,10 @@ class MlxRoutedLinear:
         )
         for pool in self.pools:
             candidates = pool.forward(source, ids)
-            if isinstance(pool.weight, MetalTpqPqWeight):
-                selected = candidates
-            else:
-                membership = ids[:, :, None] == pool.expert_ids[None, None, :]
-                selected = (candidates * membership[:, :, :, None].astype(candidates.dtype)).sum(
-                    axis=2
-                )
+            membership = ids[:, :, None] == pool.expert_ids[None, None, :]
+            selected = (candidates * membership[:, :, :, None].astype(candidates.dtype)).sum(
+                axis=2
+            )
             result = result + selected
         return result
 
@@ -466,54 +424,4 @@ class MlxRoutedSwiGLUFFN:
         return self.forward(x, expert_ids, route_weights)
 
 
-class MlxRoutedSiTUFFN:
-    """TPQ2 combined gate/up and down expert FFN with SiTU activation."""
-
-    def __init__(
-        self,
-        gate_up: MfeTensor,
-        down: MfeTensor,
-        *,
-        beta: float,
-        linear_beta: float | None,
-    ) -> None:
-        self.gate_up = MlxRoutedLinear(gate_up)
-        self.down = MlxRoutedLinear(down)
-        if (
-            self.gate_up.n_experts != self.down.n_experts
-            or self.gate_up.out_per_expert % 2
-            or self.gate_up.out_per_expert // 2 != self.down.neuron_len
-            or self.gate_up.neuron_len != self.down.out_per_expert
-        ):
-            raise ValueError("routed SiTU gate_up/down shapes are incompatible")
-        self.beta = float(beta)
-        self.linear_beta = None if linear_beta is None else float(linear_beta)
-
-    def forward(
-        self,
-        x: mx.array | np.ndarray,
-        expert_ids: mx.array | np.ndarray,
-        route_weights: mx.array | np.ndarray,
-    ) -> mx.array:
-        gate_up = self.gate_up(x, expert_ids)
-        hidden = situ_split(
-            gate_up,
-            beta=self.beta,
-            linear_beta=self.linear_beta,
-        )
-        return self.down.combine(hidden, expert_ids, route_weights)
-
-    def __call__(
-        self,
-        x: mx.array | np.ndarray,
-        expert_ids: mx.array | np.ndarray,
-        route_weights: mx.array | np.ndarray,
-    ) -> mx.array:
-        return self.forward(x, expert_ids, route_weights)
-
-
-__all__ = [
-    "MlxRoutedLinear",
-    "MlxRoutedSiTUFFN",
-    "MlxRoutedSwiGLUFFN",
-]
+__all__ = ["MlxRoutedLinear", "MlxRoutedSwiGLUFFN"]

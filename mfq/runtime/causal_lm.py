@@ -16,7 +16,6 @@ from mfq.formats.io import MfqTensor
 from mfq.formats.mx import MxTensor
 from mfq.formats.nint import NintTensor
 from mfq.formats.nint8_zero import Nint8ZeroTensor
-from mfq.formats.tpq import TpqInt4Tensor, TpqPqTensor
 from mfq.kernels.cuda.acc import acc
 from mfq.kernels.cuda.attention import attention
 from mfq.kernels.cuda.gated_delta_net import gated_delta_net
@@ -38,8 +37,6 @@ from mfq.runtime.torch_linear import (
     TorchNvqEmbedding,
     TorchNvqLinear,
     TorchSwiGLUFFN,
-    TorchTpqEmbedding,
-    TorchTpqLinear,
     is_nvq_tensor,
     is_quantized_tensor,
 )
@@ -590,10 +587,8 @@ class TorchNintCausalLM:
             self.embed = TorchNvqEmbedding(embed_tensor, device)
         elif isinstance(embed_tensor, MxTensor):
             self.embed = TorchMxEmbedding(embed_tensor, device)
-        elif isinstance(embed_tensor, (TpqInt4Tensor, TpqPqTensor)):
-            self.embed = TorchTpqEmbedding(embed_tensor, device)
         else:
-            raise TypeError("token embedding must be NINT/NVQ/MX/TPQ")
+            raise TypeError("token embedding must be NINT/NVQ/MX")
         layer_types = config.layer_types or ("full_attention",) * config.num_hidden_layers
         if len(layer_types) != config.num_hidden_layers:
             raise ValueError("layer_types length must match num_hidden_layers")
@@ -740,7 +735,7 @@ def _require_quantized(tensors: TensorMapping, name: str) -> QuantizedTensor:
         raise KeyError(f"missing tensor {name!r}")
     tensor = tensors[name]
     if not is_quantized_tensor(tensor):
-        raise TypeError(f"tensor {name!r} must be NINT/NVQ/MX/TPQ")
+        raise TypeError(f"tensor {name!r} must be NINT/NVQ/MX")
     return tensor
 
 
@@ -748,7 +743,7 @@ def _linear(
     tensors: TensorMapping,
     name: str,
     device: str | torch.device,
-) -> TorchNintLinear | TorchNint8ZeroLinear | TorchNvqLinear | TorchMxLinear | TorchTpqLinear:
+) -> TorchNintLinear | TorchNint8ZeroLinear | TorchNvqLinear | TorchMxLinear:
     tensor = _require_quantized(tensors, name)
     if isinstance(tensor, NintTensor):
         return TorchNintLinear(tensor, device)
@@ -758,9 +753,7 @@ def _linear(
         return TorchNvqLinear(tensor, device)
     if isinstance(tensor, MxTensor):
         return TorchMxLinear(tensor, device)
-    if isinstance(tensor, (TpqInt4Tensor, TpqPqTensor)):
-        return TorchTpqLinear(tensor, device)
-    raise TypeError(f"tensor {name!r} must be NINT/NVQ/MX/TPQ")
+    raise TypeError(f"tensor {name!r} must be NINT/NVQ/MX")
 
 
 def _linear_group(
