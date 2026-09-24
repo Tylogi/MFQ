@@ -165,6 +165,62 @@ struct Qwen35Mtp final : MtpModule {
         cache_pos = position;
     }
 
+    bool supports_session_state() const noexcept override { return true; }
+
+    MtpSessionState capture_session_state(
+            int64_t target_cache_position,
+            const mfq_tensor_backend::Tensor& last_target_hidden) const override {
+        const int64_t predictor_position = target_cache_position - 1;
+        if (predictor_position <= 0 || predictor_position > cache_pos ||
+                !last_target_hidden.defined() ||
+                last_target_hidden.dim() != 3 ||
+                last_target_hidden.size(0) != 1 ||
+                last_target_hidden.size(1) != 1 ||
+                last_target_hidden.size(2) != config.hidden_size) {
+            throw std::runtime_error(
+                "Qwen MTP session boundary is unavailable");
+        }
+        MtpSessionState state;
+        state.cache_pos = predictor_position;
+        state.blocks.reserve(blocks.size());
+        for (const auto& block : blocks) {
+            MfqCudaGuard guard(block->cuda_device);
+            const auto* full = dynamic_cast<const FullBlock*>(block.get());
+            if (full == nullptr) {
+                throw std::runtime_error(
+                    "Qwen MTP session layer type changed");
+            }
+            state.blocks.push_back(capture_full_attention_session_state(
+                *full, predictor_position, state.bytes));
+        }
+        state.last_target_hidden = last_target_hidden.clone();
+        state.bytes += session_tensor_bytes(state.last_target_hidden);
+        return state;
+    }
+
+    void restore_session_state(const MtpSessionState& state) override {
+        if (state.cache_pos <= 0 || state.blocks.size() != blocks.size() ||
+                !state.last_target_hidden.defined() ||
+                state.last_target_hidden.dim() != 3 ||
+                state.last_target_hidden.size(0) != 1 ||
+                state.last_target_hidden.size(1) != 1 ||
+                state.last_target_hidden.size(2) != config.hidden_size) {
+            throw std::runtime_error("Qwen MTP session state is incompatible");
+        }
+        for (std::size_t index = 0; index < blocks.size(); ++index) {
+            auto& block = blocks[index];
+            MfqCudaGuard guard(block->cuda_device);
+            auto* full = dynamic_cast<FullBlock*>(block.get());
+            if (full == nullptr) {
+                throw std::runtime_error(
+                    "Qwen MTP session layer type changed");
+            }
+            restore_full_attention_session_state(
+                *full, state.blocks[index]);
+        }
+        cache_pos = state.cache_pos;
+    }
+
     bool teacher_forced_prompt_prime() const noexcept override { return true; }
     bool target_bootstrap_decode() const noexcept override { return false; }
     bool preserve_output_dtype() const noexcept override { return false; }

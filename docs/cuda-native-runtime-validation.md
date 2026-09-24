@@ -1,11 +1,11 @@
 # Native CUDA runtime validation
 
-MFQ's production CUDA inference executable is `mfq-decode`. It owns tensor
+MFQ's production CUDA inference executable is `mfq-runtime`. It owns tensor
 storage, CUDA streams and events, CUDA Graphs, and generic graph operations
 without Python, PyTorch, ATen, or LibTorch. The packed MFQ CUDA kernels are the
 same kernels used by the optional reference executable.
 
-`mfq-decode-torch` is an opt-in migration target. It exists only for A/B
+`mfq-runtime-torch` is an opt-in migration target. It exists only for A/B
 validation and is excluded from normal builds and packages.
 
 ## Build and dependency checks
@@ -26,8 +26,8 @@ LibTorch. Check the final dependency table with `ldd` on Linux and
 runtime, and optional NCCL are expected.
 
 For an A/B build, configure a separate tree with LibTorch discoverable and
-`-DMFQ_BUILD_TORCH_REFERENCE_RUNTIME=ON`. This adds `mfq-decode-torch`; it does
-not alter `mfq-decode`.
+`-DMFQ_BUILD_TORCH_REFERENCE_RUNTIME=ON`. This adds `mfq-runtime-torch`; it does
+not alter `mfq-runtime`.
 
 ## Tensor and expert parallel execution
 
@@ -35,10 +35,10 @@ The native runtime accepts either a rank count or an ordered CUDA device list.
 Split weights stay attached to that device order:
 
 ```shell
-mfq-decode --model model.mfq --tensor-parallel 4
-mfq-decode --model moe.mfq \
+mfq-runtime --model model.mfq --tensor-parallel 4
+mfq-runtime --model moe.mfq \
   --expert-parallel 0,1,2,3 --expert-split 1,1,1,1
-mfq-decode --model moe.mfq \
+mfq-runtime --model moe.mfq \
   --tensor-parallel 0,1,2,3 --tensor-split 1,1,1,1 \
   --expert-parallel 0,1,2,3 --expert-split 1,1,2,4
 ```
@@ -61,7 +61,7 @@ parameters. Start each executable in a fresh process.
 | Area | Required coverage |
 | --- | --- |
 | Architectures | dense causal LM, GQA, multimodal MiniCPM-o, and routed MoE |
-| Formats | dense BF16/F16, NINT, NVQ/NPQ/NEPQ, TPQ, MXFP8, and MXFP4 where the architecture permits them |
+| Formats | dense BF16/F16, NINT, NVQ/NPQ/NEPQ, MXFP8, and MXFP4 where the architecture permits them |
 | Shapes | single-token decode, short and long prefill, odd sizes, batched inputs, and GQA head broadcasting |
 | State | empty cache, reused prefix cache, context rollover, session reset, and interrupted generation |
 | Sampling | greedy, temperature, top-k, top-p, min-p, repetition/presence penalties, and fixed random seed |
@@ -92,5 +92,5 @@ an environment that has no `torch` package and no LibTorch files, then verify:
 
 The legacy MiniCPM-o diagnostic `.pt` filenames use MFQ's `MFQTNSR1` tensor
 envelope in the native executable. Python pickle files created by `torch.save`
-are intentionally handled only by `mfq-decode-torch`; production HTTP media
+are intentionally handled only by `mfq-runtime-torch`; production HTTP media
 requests do not cross this file boundary.

@@ -1,10 +1,11 @@
 #pragma once
 
 #include "cuda_sampling.h"
+#include "moe_expert_cache.h"
 #include "qwen_paged_kv.h"
 #include "../models/qwen35/qwen35_linear_attention.h"
 
-// Included by mfq_decode.cpp after the CUDA Qwen model and sampler are defined.
+// Included by cuda_runtime.cpp after the CUDA Qwen model and sampler are defined.
 // The scheduler owns request concurrency; the adapter below owns the hybrid
 // full-attention/recurrent state carried between decode iterations.
 
@@ -133,9 +134,10 @@ static bool qwen_continuous_batch_packed_metadata_enabled() {
 static bool qwen_continuous_batch_cuda_graph_enabled(const mfq::cuda::Qwen35CausalLm & model) {
     const char * environment = std::getenv(
         "MFQ_CONTINUOUS_BATCH_CUDA_GRAPH");
-    const char * server_environment = std::getenv("MFQ_SERVER_CUDA_GRAPH");
+    const char * runtime_environment =
+        std::getenv("MFQ_RUNTIME_CUDA_GRAPH");
     return (environment == nullptr || std::atoi(environment) != 0) &&
-        (server_environment == nullptr || server_environment[0] != '0') &&
+        (runtime_environment == nullptr || runtime_environment[0] != '0') &&
         !qwen_continuous_batch_has_cached_moe(model) &&
         mfq_cuda_graph_capture_supported() &&
         model_parallel_cuda_graph_enabled();
@@ -650,7 +652,7 @@ private:
         Tensor counts;
         Tensor prefill_ids;
         std::optional<QwenBatchState> prefill_state;
-        std::vector<std::unique_ptr<ServerPrefillCudaTimer>> prefill_timers;
+        std::vector<std::unique_ptr<PrefillCudaTimer>> prefill_timers;
         int64_t prefill_offset = 0;
         int32_t generation_limit = 0;
         int32_t produced = 0;
@@ -841,14 +843,14 @@ private:
                     initialize_sampling(*request, request->prefill_ids);
                 }
                 Tensor hidden;
-                std::unique_ptr<ServerPrefillCudaTimer> final_timer;
+                std::unique_ptr<PrefillCudaTimer> final_timer;
                 do {
                     const int64_t count = std::min(
                         prefill_chunk_size_,
                         request->prefill_ids.size(1) -
                             request->prefill_offset);
                     auto chunk_timer =
-                        std::make_unique<ServerPrefillCudaTimer>();
+                        std::make_unique<PrefillCudaTimer>();
                     hidden = model_.hidden_forward(
                         request->prefill_ids.narrow(
                             1, request->prefill_offset, count).contiguous());
@@ -1077,8 +1079,10 @@ private:
             requested_len = std::max(
                 requested_len, request->cache_length + remaining);
         }
-        const int64_t planned_len = server_decode_graph_bucket(
+        const int64_t planned_len = decode_graph_bucket(
             requested_len, model_.max_position_embeddings());
+        const int64_t graph_attention_parts = decode_graph_attention_parts(
+            planned_len, FullBlock::kDecodeAttentionMaxParts);
         const char * graph_min_environment = std::getenv(
             "MFQ_CONTINUOUS_BATCH_CUDA_GRAPH_MIN_TOKENS");
         const int64_t graph_min_tokens = graph_min_environment != nullptr
@@ -1176,8 +1180,9 @@ private:
             model_.cache_pos = max_position;
             if (graph_decode) {
                 const auto invoke = [&]() {
-                    auto hidden = model_.hidden_forward(
-                        ids, pos, lengths, nullptr, pos);
+                    auto hidden = model_.hidden_forward_static(
+                        ids, pos, lengths, planned_len,
+                        graph_attention_parts);
                     auto current_logits = qwen_logits_from_last_hidden(
                         model_, std::move(hidden));
                     return sample_greedy_cuda(
@@ -1186,12 +1191,6 @@ private:
                 if (!graph_cache_hit) {
                     decode_graph_->invalidate();
                     mfq_cuda_empty_cache();
-                    g_decode_graph_attention_kv_len = planned_len;
-                    g_decode_graph_attention_parts = planned_len >= 192
-                        ? (planned_len + 127) / 128 : 1;
-                    g_decode_graph_attention_parts = std::min<int64_t>(
-                        g_decode_graph_attention_parts,
-                        FullBlock::kDecodeAttentionMaxParts);
                     try {
                         DecodeGraphBranchScope branch_scope;
                         DecodeGraphTpProjectionScope tp_projection_scope;
@@ -1210,12 +1209,8 @@ private:
                         ++cuda_graph_captures_;
                     } catch (...) {
                         decode_graph_->invalidate();
-                        g_decode_graph_attention_kv_len = 0;
-                        g_decode_graph_attention_parts = 0;
                         throw;
                     }
-                    g_decode_graph_attention_kv_len = 0;
-                    g_decode_graph_attention_parts = 0;
                 }
                 decode_graph_->graph->replay();
                 graph_tokens = decode_graph_->static_next;
@@ -1230,8 +1225,6 @@ private:
         } catch (...) {
             auto error = std::current_exception();
             invalidate_decode_graph();
-            g_decode_graph_attention_kv_len = 0;
-            g_decode_graph_attention_parts = 0;
             try { model_.reset(1); } catch (...) {}
             fail_requests(active_, error);
             release_paged_requests(active_);
@@ -1510,10 +1503,10 @@ static int run_qwen_continuous_batching_check(mfq::cuda::Qwen35CausalLm & model)
                       const MfqSamplingParams & params) {
         std::vector<int64_t> output;
         std::mutex mutex;
-        ServerDecodeGraphCache graph_cache(
+        DecodeGraphCache graph_cache(
             model.max_position_embeddings());
-        ServerTextSessionCache session_cache;
-        const int32_t produced = generate_server_tokens(
+        TextSessionCache session_cache;
+        const int32_t produced = generate_tokens(
             model, mutex, graph_cache, session_cache, prompt, params,
             [&](int64_t token) {
                 output.push_back(token);

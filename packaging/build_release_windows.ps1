@@ -2,7 +2,7 @@
 #
 # The release Python environment is isolated from development environments. It
 # contains only the base dependencies needed by `mfq serve`; training,
-# calibration, quantization, TPQ, MiniCPM-o, and PyTorch are not packaged.
+# Calibration, quantization, MiniCPM-o, and PyTorch are not packaged.
 # The script imports the Visual Studio environment and adds all required tools to
 # its own PATH, so it can be run from ordinary PowerShell.
 
@@ -185,7 +185,7 @@ function Copy-VisualCppRuntimeDlls {
     }
     Copy-RuntimeDlls $crtDirectory.FullName $DestinationDirectory
 
-    # CMake may enable OpenMP for mfq-decode when the VS workload provides it.
+    # CMake may enable OpenMP for mfq-runtime when the VS workload provides it.
     # Staging the runtime when present is harmless if OpenMP was not selected.
     Get-ChildItem -LiteralPath $x64Directory -Directory |
         Where-Object { $_.Name -match '^Microsoft\.VC\d+\.OpenMP$' } |
@@ -245,7 +245,7 @@ function New-BuildContext {
         TargetTriple = $targetTriple
         CliName = $cliName
         CliArtifact = Join-Path (Join-Path $resourceDirectory $cliName) "$cliName.exe"
-        NativeArtifact = Join-Path $sidecarDirectory "mfq-decode-$targetTriple.exe"
+        NativeArtifact = Join-Path $sidecarDirectory "mfq-runtime-$targetTriple.exe"
         VenvDirectory = $Venv
         OutputDirectory = $Output
         CudaRoot = $null
@@ -343,7 +343,7 @@ function Build-NativeSidecar {
         [Parameter(Mandatory)][int] $ParallelJobs
     )
 
-    # mfq-decode uses the native tensor backend and must remain independent of
+    # mfq-runtime uses the native tensor backend and must remain independent of
     # Python and LibTorch. Explicitly disable the optional A/B reference target
     # so a reused CMake cache cannot pull those dependencies back into a release.
     Invoke-Checked $Context.Tools.CMake @(
@@ -354,25 +354,34 @@ function Build-NativeSidecar {
         "-DCMAKE_CUDA_COMPILER=$([System.IO.Path]::Combine($Context.CudaRoot, 'bin', 'nvcc.exe'))",
         "-DCMAKE_CUDA_ARCHITECTURES=$Architectures",
         "-DMFQ_CUDA_ARCHITECTURES=$Architectures",
-        "-DMFQ_BUILD_CPP_SERVER=ON",
+        "-DMFQ_BUILD_RUNTIME_COMMUNICATION=ON",
         "-DMFQ_BUILD_METAL_RUNTIME=OFF",
         "-DMFQ_BUILD_TORCH_REFERENCE_RUNTIME=OFF"
     )
     Invoke-Checked $Context.Tools.CMake @(
         "--build", $Context.NativeBuildDirectory,
-        "--target", "mfq-decode",
+        "--target", "mfq-runtime", "mfq-diagnostics",
         "--config", "Release",
         "--parallel", $ParallelJobs
     )
 
     $Context.NativeOutput = Get-ChildItem -LiteralPath $Context.NativeBuildDirectory `
-        -Recurse -File -Filter "mfq-decode.exe" |
+        -Recurse -File -Filter "mfq-runtime.exe" |
         Sort-Object -Property LastWriteTimeUtc -Descending |
         Select-Object -First 1
     if ($null -eq $Context.NativeOutput) {
-        Fail "native build did not create mfq-decode.exe"
+        Fail "native build did not create mfq-runtime.exe"
     }
     Copy-Item -LiteralPath $Context.NativeOutput.FullName -Destination $Context.NativeArtifact -Force
+    $diagnostics = Get-ChildItem -LiteralPath $Context.NativeBuildDirectory `
+        -Recurse -File -Filter "mfq-diagnostics.exe" |
+        Sort-Object -Property LastWriteTimeUtc -Descending |
+        Select-Object -First 1
+    if ($null -eq $diagnostics) {
+        Fail "native build did not create mfq-diagnostics.exe"
+    }
+    Copy-Item -LiteralPath $diagnostics.FullName -Destination `
+        (Join-Path $Context.SidecarDirectory "mfq-diagnostics-$($Context.TargetTriple).exe") -Force
 }
 
 function Stage-WindowsRuntime {

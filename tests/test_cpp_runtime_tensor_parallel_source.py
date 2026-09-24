@@ -15,7 +15,7 @@ CMAKE = (ROOT / "cpp_runtime" / "tests" / "CMakeLists.txt").read_text(
 )
 COMPONENTS = "\n".join(
     (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
-    for name in ("server_components.h", "server_components.cpp")
+    for name in ("runtime_components.h", "runtime_components.cpp")
 )
 
 

@@ -94,7 +94,7 @@ def test_build_plan_selects_only_the_metal_server_target_and_forwards_cmake_args
 
     assert plan.backend == "metal"
     assert plan.target == "mfq-decode-metal"
-    assert "-DMFQ_BUILD_CPP_SERVER=ON" in plan.configure_command
+    assert "-DMFQ_BUILD_RUNTIME_COMMUNICATION=ON" in plan.configure_command
     assert "-DMFQ_BUILD_METAL_RUNTIME=ON" in plan.configure_command
     assert "-DMFQ_EXPERIMENTAL_KERNEL=ON" in plan.configure_command
     assert plan.build_command[-2:] == ("-j", "3")
@@ -121,7 +121,10 @@ def test_cuda_build_plan_is_native_and_does_not_import_or_configure_torch(
     )
 
     command = " ".join(plan.configure_command)
-    assert plan.target == "mfq-decode"
+    assert plan.target == "mfq-runtime"
+    assert plan.build_command[plan.build_command.index("--target") + 1 : -2] == (
+        "mfq-runtime", "mfq-diagnostics", "mfq-eval"
+    )
     assert "MFQ_BUILD_TORCH_REFERENCE_RUNTIME=OFF" in command
     assert "CMAKE_PREFIX_PATH" not in command
     assert "Python_EXECUTABLE" not in command
@@ -131,7 +134,7 @@ def test_cuda_build_plan_is_native_and_does_not_import_or_configure_torch(
 
 
 def test_default_cuda_cmake_target_has_no_python_or_libtorch_dependency() -> None:
-    cmake = (ROOT / "cpp_runtime" / "cmake" / "CudaRuntime.cmake").read_text(
+    cmake = (ROOT / "cpp_runtime" / "backends" / "cuda" / "CMakeLists.txt").read_text(
         encoding="utf-8"
     )
     native_start = cmake.index("add_library(mfq-cuda-runtime STATIC\n")
@@ -148,16 +151,17 @@ def test_default_cuda_cmake_target_has_no_python_or_libtorch_dependency() -> Non
 
     assert "MFQ_BUILD_TORCH_REFERENCE_RUNTIME" in cmake
     assert "find_package(Torch REQUIRED)" in cmake[reference_start:]
-    assert "add_executable(mfq-decode-torch" in cmake[reference_start:]
+    assert "add_executable(mfq-runtime-torch" in cmake[reference_start:]
 
 
 def test_native_cuda_runtime_compilation_units_do_not_include_torch() -> None:
-    cmake = (ROOT / "cpp_runtime" / "cmake" / "CudaRuntime.cmake").read_text(
+    cmake = (ROOT / "cpp_runtime" / "backends" / "cuda" / "CMakeLists.txt").read_text(
         encoding="utf-8"
     )
     source_block = cmake.split("set(MFQ_CUDA_KERNEL_SOURCES", 1)[1].split(")", 1)[0]
     sources = [
-        ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp",
+        ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "runtime_main.cpp",
+        ROOT / "cpp_runtime" / "backends" / "cuda" / "commands" / "runtime.cpp",
         ROOT / "cpp_runtime" / "backends" / "cuda" / "models" / "minicpmo45" / "minicpmo45_runtime.h",
         ROOT / "cpp_runtime" / "backends" / "cuda" / "models" / "minicpmo45" / "minicpmo45_runtime.cpp",
         *(
@@ -172,13 +176,13 @@ def test_native_cuda_runtime_compilation_units_do_not_include_torch() -> None:
         source = source_path.read_text(encoding="utf-8")
         assert not any(token in source for token in forbidden), source_path
 
-    native_start = cmake.index("add_executable(mfq-decode\n")
+    native_start = cmake.index("add_executable(mfq-runtime\n")
     reference_start = cmake.index("option(MFQ_BUILD_TORCH_REFERENCE_RUNTIME")
     assert "mfq_cuda.cpp" not in cmake[native_start:reference_start]
 
 
 def test_native_cuda_cmake_uses_consistent_windows_cuda_settings() -> None:
-    cmake = (ROOT / "cpp_runtime" / "cmake" / "CudaRuntime.cmake").read_text(
+    cmake = (ROOT / "cpp_runtime" / "backends" / "cuda" / "CMakeLists.txt").read_text(
         encoding="utf-8"
     )
 

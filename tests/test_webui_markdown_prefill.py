@@ -7,12 +7,17 @@ API = (WEB / "src" / "api.ts").read_text(encoding="utf-8")
 MARKDOWN = (WEB / "src" / "Markdown.tsx").read_text(encoding="utf-8")
 CSS = (WEB / "src" / "styles.css").read_text(encoding="utf-8")
 PACKAGE = (WEB / "package.json").read_text(encoding="utf-8")
-SERVER_HEADER = (ROOT / "cpp_runtime" / "server" / "include" / "mfq" / "server.h").read_text(
+SERVER_HEADER = (ROOT / "cpp_runtime" / "core" / "include" / "mfq" / "runtime.h").read_text(
     encoding="utf-8"
 )
-SERVER = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_text(encoding="utf-8")
+TRANSPORT_SRC = ROOT / "cpp_runtime" / "transport"
+SERVER = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted(TRANSPORT_SRC.rglob("*"))
+    if path.suffix in {".cpp", ".h"}
+)
 RUNTIME = (
-    ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime" / "cuda_decode_runtime.cpp"
+    ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime" / "cuda_runtime.cpp"
 ).read_text(encoding="utf-8")
 SAMPLING = (
     ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime" / "cuda_sampling.h"
@@ -42,7 +47,7 @@ def test_rich_text_uses_sanitized_gfm_and_katex() -> None:
 def test_prefill_speed_uses_cuda_events_around_only_the_first_model_eval() -> None:
     assert "using MfqPrefillCallback" in SERVER_HEADER
     assert "const MfqPrefillCallback & on_prefill" in RUNTIME
-    assert "class ServerPrefillCudaTimer" in RUNTIME
+    assert "class PrefillCudaTimer" in RUNTIME
     assert "cudaEventRecord(started_, stream_)" in RUNTIME
     assert "cudaEvent_t prefill_finished = nullptr" in RUNTIME
     assert RUNTIME.count(
@@ -52,21 +57,22 @@ def test_prefill_speed_uses_cuda_events_around_only_the_first_model_eval() -> No
     assert "const int64_t token = next.template item<int64_t>();" in RUNTIME
     assert "const double prefill_ms = prefill_timer.elapsed_ms();" in RUNTIME
     assert "on_prefill(MfqPrefillTiming{" in RUNTIME
-    assert "prompt.size() - reused_tokens,\n                prefill_ms,\n                0.0,\n                prefill_ms" in RUNTIME
+    assert "prompt.size() - reused_tokens,\n                prefill_ms,\n                multimodal_ms,\n                prefill_ms + multimodal_ms" in RUNTIME
 
     sample = RUNTIME.split(
-        "static mfq_tensor_backend::Tensor sample_server_token(", 1
+        "static mfq_tensor_backend::Tensor sample_token(", 1
     )[1]
-    sample = sample.split("class ServerPrefillCudaTimer", 1)[0]
+    sample = sample.split("class PrefillCudaTimer", 1)[0]
     logits = sample.index("auto logits = model.last_logits(ids)")
     finished = sample.index("cudaEventRecord(", logits)
     sampling = sample.index("mfq::cuda::sample_logits(", logits)
     assert logits < finished < sampling
+    assert "inline SamplingOps::Tensor sample_logits(" in SAMPLING
     assert "sample_apply_penalties_cuda(" in SAMPLING
 
     first = RUNTIME.split("auto sample_first_token = [&]()", 1)[1]
     first = first.split("const char * reprefill_env", 1)[0]
-    assert first.index("ServerPrefillCudaTimer prefill_timer") < first.index(
+    assert first.index("PrefillCudaTimer prefill_timer") < first.index(
         "mfq_tensor_backend::Tensor next;"
     )
     assert first.index(
@@ -77,15 +83,15 @@ def test_prefill_speed_uses_cuda_events_around_only_the_first_model_eval() -> No
     assert '{"prefill_ms", values.prefill_ms}' in SERVER
 
 
-def test_studio_displays_native_multimodal_prefill_without_media_preparation() -> None:
+def test_studio_prefers_runtime_prefill_metrics_over_ttft() -> None:
     assert "model_prefill_ms?: number;" in API
     assert "complete_prefill_ms?: number;" in API
     assert "complete_prefill_tps?: number;" in API
     assert "function displayPrefillMetric" in APP
-    assert "const nativeMilliseconds = Number(metrics.ttft_ms);" in APP
+    assert "const nativeMilliseconds = Number(metrics.ttft_ms);" not in APP
     assert "const modelMilliseconds = Number(metrics.model_prefill_ms);" in APP
-    assert "tokensPerSecond: (tokens * 1000) / milliseconds" in APP
-    assert "? (tokens * 1000) / nativeMilliseconds" in APP
+    assert "return { milliseconds, tokensPerSecond: reported };" in APP
+    assert "? (tokens * 1000) / milliseconds" in APP
     assert "preferPositiveMetric(last?.ttft_ms, last?.complete_prefill_ms)" in APP
     assert "displayPrefillMetric(response?.performance)" in APP
     assert "const lastPrefill = displayPrefillMetric(last);" in APP

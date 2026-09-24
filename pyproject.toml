@@ -114,7 +114,6 @@ include = ["mfq*"]
 [tool.setuptools.package-data]
 "mfq.server" = [
     "protocol/*.json",
-    "protocol/*.proto",
 ]
 
 [tool.uv]

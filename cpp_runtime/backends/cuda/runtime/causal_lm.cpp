@@ -225,6 +225,48 @@ void restore_session_prefix_tensor(
     }
 }
 
+FullBlockSessionState capture_full_attention_session_state(
+        const FullBlock & block,
+        int64_t cache_pos,
+        size_t & bytes) {
+    if (!block.cache.k.defined() || !block.cache.v.defined() ||
+            block.cache.k.dim() != 4 ||
+            block.cache.v.sizes() != block.cache.k.sizes() ||
+            block.cache.k.size(0) != 1) {
+        throw std::runtime_error(
+            "full-attention KV cache is unavailable");
+    }
+    FullBlockSessionState state;
+    state.capacity = block.cache.k.size(2);
+    state.ring = block.cache.ring;
+    const int64_t saved_tokens = state.ring
+        ? state.capacity
+        : std::min<int64_t>(cache_pos, state.capacity);
+    state.k = block.cache.k.narrow(2, 0, saved_tokens).clone();
+    state.v = block.cache.v.narrow(2, 0, saved_tokens).clone();
+    bytes += session_tensor_bytes(state.k);
+    bytes += session_tensor_bytes(state.v);
+    return state;
+}
+
+void restore_full_attention_session_state(
+        FullBlock & block,
+        const FullBlockSessionState & state) {
+    if (!state.k.defined() || !state.v.defined() ||
+            state.capacity <= 0 || state.k.dim() != 4 ||
+            state.v.sizes() != state.k.sizes() ||
+            state.k.size(0) != 1 ||
+            state.k.size(2) > state.capacity) {
+        throw std::runtime_error(
+            "full-attention session KV layout is invalid");
+    }
+    restore_session_prefix_tensor(
+        block.cache.k, state.k, 2, state.capacity);
+    restore_session_prefix_tensor(
+        block.cache.v, state.v, 2, state.capacity);
+    block.cache.ring = state.ring;
+}
+
 Dsv4PoolSessionState capture_dsv4_pool_session_state(
         const Dsv4PoolState & source,
         int64_t cache_pos,

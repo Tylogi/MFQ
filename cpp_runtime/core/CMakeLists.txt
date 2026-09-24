@@ -76,7 +76,7 @@ target_link_libraries(mfq-core INTERFACE
     mfq-json
 )
 
-if(MFQ_BUILD_CPP_SERVER)
+if(MFQ_BUILD_RUNTIME_COMMUNICATION)
     find_package(Threads REQUIRED)
 
     add_library(mfq-paged-prefix-cache STATIC

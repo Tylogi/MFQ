@@ -817,33 +817,25 @@ function displayPrefillMetric(metrics?: PrefillMetricLike | null): {
   tokensPerSecond: number | undefined;
 } {
   if (!metrics) return { milliseconds: undefined, tokensPerSecond: undefined };
-  const nativeMilliseconds = Number(metrics.ttft_ms);
-  if (Number.isFinite(nativeMilliseconds) && nativeMilliseconds > 0) {
-    const tokens = Number(metrics.prefill_tokens ?? metrics.prompt_tokens);
-    return {
-      milliseconds: nativeMilliseconds,
-      tokensPerSecond:
-        Number.isFinite(tokens) && tokens > 0
-          ? (tokens * 1000) / nativeMilliseconds
-          : undefined,
-    };
-  }
-  const modelMilliseconds = Number(metrics.model_prefill_ms);
   const languageMilliseconds = Number(metrics.prefill_ms);
+  const modelMilliseconds = Number(metrics.model_prefill_ms);
   const milliseconds =
-    Number.isFinite(modelMilliseconds) && modelMilliseconds > 0
-      ? modelMilliseconds
-      : Number.isFinite(languageMilliseconds) && languageMilliseconds > 0
-        ? languageMilliseconds
+    Number.isFinite(languageMilliseconds) && languageMilliseconds > 0
+      ? languageMilliseconds
+      : Number.isFinite(modelMilliseconds) && modelMilliseconds > 0
+        ? modelMilliseconds
         : undefined;
-  const tokens = Number(metrics.prefill_tokens ?? metrics.prompt_tokens);
-  if (milliseconds !== undefined && Number.isFinite(tokens) && tokens > 0) {
-    return { milliseconds, tokensPerSecond: (tokens * 1000) / milliseconds };
-  }
   const reported = Number(metrics.prefill_tps);
+  if (Number.isFinite(reported) && reported > 0) {
+    return { milliseconds, tokensPerSecond: reported };
+  }
+  const tokens = Number(metrics.prefill_tokens ?? metrics.prompt_tokens);
   return {
     milliseconds,
-    tokensPerSecond: Number.isFinite(reported) ? reported : undefined,
+    tokensPerSecond:
+      milliseconds !== undefined && Number.isFinite(tokens) && tokens > 0
+        ? (tokens * 1000) / milliseconds
+        : undefined,
   };
 }
 
@@ -3791,7 +3783,12 @@ export default function App() {
     : 0;
   const prefixCacheHotOnly = runtime?.prefix_cache_mode === "single_device_hot_prefix";
   const prefixCachePersistent = typeof runtime?.prefix_cache_max_bytes === "number";
-  const prefixCacheSupported = prefixCachePersistent || prefixCacheHotOnly;
+  const prefixCacheSupported = runtime?.prefix_cache_supported !== undefined
+    ? Number(runtime.prefix_cache_supported) > 0
+    : prefixCachePersistent || prefixCacheHotOnly;
+  const prefixCacheUnavailableReason = Number(runtime?.prefix_cache_disabled_reason) === 2
+    ? tr("连续批处理模式暂不支持 Session KV 缓存", "Session KV cache is unavailable with continuous batching")
+    : tr("当前模型不支持 Session KV 缓存", "The current model does not support Session KV cache");
   const genericJobKinds = jobKinds;
   const selectedKind = genericJobKinds.find((item) => item.kind === selectedJobKind);
   const imatrixArtifacts = lineage.filter((item) =>
@@ -4295,7 +4292,7 @@ export default function App() {
                 <MetricTile label={tr("预填充", "Prefill")} value={`${formatNumber(lastPrefill.tokensPerSecond, 1)} tok/s`} detail={`${formatNumber(lastPrefill.milliseconds, 1)} ms · ${tr("输入处理", "Prompt processing")}`} icon="text-forward" />
                 <MetricTile label={tr("解码", "Decode")} value={`${formatNumber(last?.decode_tps, 1)} tok/s`} detail={tr("输出生成", "Token generation")} icon="waveform" />
                 <MetricTile label={tr("首字延迟", "TTFT")} value={`${formatNumber(lastTtftMs, 1)} ms`} detail={tr("首次输出耗时", "Time to first token")} icon="clock" />
-                <MetricTile label={tr("前缀复用", "Prefix reuse")} value={prefixCacheQueries > 0 ? `${formatNumber(prefixCacheHitRate, 1)}%` : "--"} detail={tr(`已恢复 ${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens`, `${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens restored`)} icon="reuse" />
+                <MetricTile label={tr("前缀复用", "Prefix reuse")} value={!prefixCacheSupported ? tr("不支持", "Unavailable") : prefixCacheQueries > 0 ? `${formatNumber(prefixCacheHitRate, 1)}%` : "--"} detail={!prefixCacheSupported ? prefixCacheUnavailableReason : tr(`已恢复 ${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens`, `${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens restored`)} icon="reuse" />
                 <MetricTile label={tr("内存", "Memory")} value={formatBytes(runtimeMemory)} detail={runtimeCache ? tr(`分配器缓存 ${formatBytes(runtimeCache)}`, `${formatBytes(runtimeCache)} allocator cache`) : tr("模型驻留", "Runtime residency")} icon="memory" />
               </div>
               <SectionLabel title={tr("内存层级", "Memory hierarchy")} />
@@ -4378,7 +4375,7 @@ export default function App() {
                   )}
                   {prefixCacheSnapshots > 0 && <button className="panel-action danger" disabled={busy || Number(runtime?.active_requests || 0) > 0} onClick={() => void clearRuntimeCache()} type="button">{tr("清除 Session KV 缓存", "Clear Session KV cache")}</button>}
                 </TMPanel>
-              ) : <EmptyPanel icon="settings" title={tr("Runtime 诊断未启用", "Runtime diagnostics are offline")} message={tr("加载模型后可查看内存与前缀缓存状态。", "Load a model to inspect memory and prefix-cache state.")} />}
+              ) : <EmptyPanel icon="settings" title={runtime ? tr("Session KV 缓存不可用", "Session KV cache unavailable") : tr("Runtime 诊断未启用", "Runtime diagnostics are offline")} message={runtime ? prefixCacheUnavailableReason : tr("加载模型后可查看内存与前缀缓存状态。", "Load a model to inspect memory and prefix-cache state.")} />}
               <SectionLabel title={tr("运行配置", "Runtime profiles")} />
               <TMPanel className="profile-panel"><div className="panel-heading"><div><h2>{tr("已保存配置", "Saved profiles")}</h2><p>{tr("将加载参数和采样默认值绑定到模型产物", "Bind load and sampling defaults to a model artifact")}</p></div><b>{runtimeProfiles.length}</b></div><div className="profile-create"><input maxLength={64} onChange={(event) => setProfileName(event.target.value)} placeholder={tr("当前配置名称", "Current configuration name")} value={profileName} /><button disabled={busy || !profileName.trim() || !artifacts.some((item) => item.name === runtime?.model)} onClick={() => void saveRuntimeProfile()} type="button">{tr("保存当前配置", "Save current")}</button></div>{runtimeProfiles.length > 0 ? <div className="profile-list">{runtimeProfiles.map((profile) => <div className={`profile-row ${profile.drifted ? "drifted" : ""}`} key={profile.id}><div><strong>{profile.name}</strong><small>{profile.load.context_size.toLocaleString()} ctx · {profile.load.prefill_chunk_size.toLocaleString()} chunk{profile.drifted ? ` · ${tr("模型已变化", "artifact changed")}` : ""}</small></div><button disabled={busy} onClick={() => void loadRuntimeProfile(profile)} type="button">{tr("加载", "Load")}</button><button aria-label={tr("删除配置档案", "Delete profile")} disabled={busy} onClick={() => void deleteRuntimeProfile(profile.id)} type="button"><Icon name="trash" size={14} /></button></div>)}</div> : <div className="inline-empty">{tr("尚未保存运行配置。", "No runtime profiles saved yet.")}</div>}</TMPanel>
               {toolsRoutingPanel}

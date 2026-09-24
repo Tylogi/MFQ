@@ -21,17 +21,17 @@
 namespace {
 
 template <typename Model>
-static mfq_tensor_backend::Tensor server_hidden_forward_chunked(
+static mfq_tensor_backend::Tensor hidden_forward_chunked(
     Model& model,
     const mfq_tensor_backend::Tensor & ids,
     int64_t chunk_size,
     mfq_tensor_backend::Tensor * raw_hidden = nullptr) {
     MFQ_RUNTIME_CHECK(
         chunk_size > 0,
-        "server prefill chunk size must be positive");
+        "runtime prefill chunk size must be positive");
     MFQ_RUNTIME_CHECK(
         ids.dim() == 2 && ids.size(0) == 1 && ids.size(1) > 0,
-        "server prefill IDs must have shape [1, tokens]");
+        "runtime prefill IDs must have shape [1, tokens]");
     std::vector<mfq_tensor_backend::Tensor> raw_chunks;
     if (raw_hidden != nullptr) {
         raw_chunks.reserve(static_cast<std::size_t>(
@@ -61,23 +61,24 @@ static mfq_tensor_backend::Tensor server_hidden_forward_chunked(
 }
 
 template <typename Model>
-static mfq_tensor_backend::Tensor server_hidden_forward_prepared_chunked(
+static mfq_tensor_backend::Tensor hidden_forward_prepared_chunked(
     Model& model,
     const mfq_tensor_backend::Tensor& ids,
     const CudaPreparedPrompt& prepared,
     int64_t chunk_size,
-    mfq_tensor_backend::Tensor* raw_hidden = nullptr) {
+    mfq_tensor_backend::Tensor* raw_hidden = nullptr,
+    int64_t prepared_offset = 0) {
     MFQ_RUNTIME_CHECK(
-        chunk_size > 0 && prepared.transformed() &&
+        chunk_size > 0 && prepared.transformed() && prepared_offset >= 0 &&
             ids.dim() == 2 && ids.size(0) == 1 && ids.size(1) > 0 &&
             prepared.embeddings.defined() && prepared.positions.defined() &&
             prepared.embeddings.dim() == 3 &&
             prepared.embeddings.size(0) == 1 &&
-            prepared.embeddings.size(1) == ids.size(1) &&
+            prepared_offset + ids.size(1) <= prepared.embeddings.size(1) &&
             prepared.embeddings.size(2) == model.hidden_size() &&
             (prepared.positions.dim() == 1 ||
              prepared.positions.dim() == 2) &&
-            prepared.positions.size(-1) == ids.size(1),
+            prepared_offset + ids.size(1) <= prepared.positions.size(-1),
         "prepared CUDA prefill tensors disagree with prompt geometry");
     std::vector<mfq_tensor_backend::Tensor> raw_chunks;
     if (raw_hidden != nullptr) {
@@ -90,8 +91,10 @@ static mfq_tensor_backend::Tensor server_hidden_forward_prepared_chunked(
         mfq_tensor_backend::Tensor raw_chunk;
         hidden = model.hidden_forward_inputs(
             ids.narrow(1, offset, count).contiguous(),
-            prepared.embeddings.narrow(1, offset, count).contiguous(),
-            prepared.positions.narrow(-1, offset, count).contiguous(),
+            prepared.embeddings.narrow(
+                1, prepared_offset + offset, count).contiguous(),
+            prepared.positions.narrow(
+                -1, prepared_offset + offset, count).contiguous(),
             mfq_nullopt, nullptr, mfq_nullopt, true, mfq_nullopt,
             raw_hidden != nullptr ? &raw_chunk : nullptr);
         if (raw_hidden != nullptr) raw_chunks.push_back(std::move(raw_chunk));
@@ -105,9 +108,9 @@ static mfq_tensor_backend::Tensor server_hidden_forward_prepared_chunked(
     return hidden;
 }
 
-class ServerPrefillCudaTimer {
+class PrefillCudaTimer {
 public:
-    ServerPrefillCudaTimer()
+    PrefillCudaTimer()
         : stream_(mfq_get_current_cuda_stream()) {
         MFQ_CUDA_CHECK(cudaEventCreate(&started_));
         try {
@@ -122,7 +125,7 @@ public:
         }
     }
 
-    ~ServerPrefillCudaTimer() {
+    ~PrefillCudaTimer() {
         if (finished_ != nullptr) cudaEventDestroy(finished_);
         if (started_ != nullptr) cudaEventDestroy(started_);
     }
@@ -326,7 +329,11 @@ int32_t run_mtp_generation(
         const MfqTokenCallback& on_token, const MfqPrefillCallback& on_prefill,
         int64_t prefill_chunk_size,
         const MfqTokenConstraintPtr& token_constraint,
-        const CudaPreparedPrompt* prepared) {
+        const CudaPreparedPrompt* prepared,
+        std::size_t reused_tokens,
+        const mfq_tensor_backend::Tensor& restored_last_hidden,
+        mfq_tensor_backend::Tensor* session_last_hidden,
+        double multimodal_ms) {
     using Tensor = mfq_tensor_backend::Tensor;
     using Clock = std::chrono::steady_clock;
     namespace policy = mfq::cuda::mtp;
@@ -339,9 +346,11 @@ int32_t run_mtp_generation(
         },
         &model.rope,
     };
+    if (session_last_hidden != nullptr) *session_last_hidden = {};
     MFQ_RUNTIME_CHECK(
-        !prompt.empty() && prompt.size() <=
-            static_cast<size_t>(model.max_position_embeddings()),
+        !prompt.empty() && reused_tokens < prompt.size() &&
+            prompt.size() <=
+                static_cast<size_t>(model.max_position_embeddings()),
         "invalid MTP prompt length");
     for (auto token : prompt) {
         MFQ_RUNTIME_CHECK(
@@ -356,6 +365,12 @@ int32_t run_mtp_generation(
         !transformed_prompt ||
             (prepared->embeddings.defined() && prepared->positions.defined()),
         "prepared CUDA MTP prompt is missing embeddings or positions");
+    MFQ_RUNTIME_CHECK(
+        reused_tokens == 0 ||
+            (mtp.supports_session_state() && restored_last_hidden.defined() &&
+             model.cache_pos == static_cast<int64_t>(reused_tokens) &&
+             mtp.cache_position() == static_cast<int64_t>(reused_tokens) - 1),
+        "restored CUDA MTP session boundary is incompatible");
     MFQ_RUNTIME_CHECK(
         mfq_token_constraint_supports_speculation(token_constraint),
         "CUDA MTP token constraint must support allows/apply/accept/clone");
@@ -541,15 +556,29 @@ int32_t run_mtp_generation(
     policy::DepthController depth_controller(maximum_depth);
 
     auto generate = [&]() {
-        model.reset(1);
-        mtp.reset(1);
-        ServerPrefillCudaTimer timer;
+        if (reused_tokens == 0) {
+            model.reset(1);
+            mtp.reset(1);
+        }
+        PrefillCudaTimer timer;
         Tensor raw;
+        auto prefill_ids = input_ids.narrow(
+            1, static_cast<int64_t>(reused_tokens),
+            static_cast<int64_t>(prompt.size() - reused_tokens)).contiguous();
         auto hidden = transformed_prompt
-            ? server_hidden_forward_prepared_chunked(
-                  model, input_ids, *prepared, prefill_chunk_size, &raw)
-            : server_hidden_forward_chunked(
-                  model, input_ids, prefill_chunk_size, &raw);
+            ? hidden_forward_prepared_chunked(
+                  model, prefill_ids, *prepared, prefill_chunk_size, &raw,
+                  static_cast<int64_t>(reused_tokens))
+            : hidden_forward_chunked(
+                  model, prefill_ids, prefill_chunk_size, &raw);
+        auto committed_last_hidden = raw.narrow(
+            1, raw.size(1) - 1, 1);
+        auto finish = [&]() {
+            if (session_last_hidden != nullptr) {
+                *session_last_hidden = committed_last_hidden;
+            }
+            return generated;
+        };
         auto logits = logits_for(hidden.narrow(1, hidden.size(1) - 1, 1));
         MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
         auto initial_constraint = token_constraint
@@ -564,8 +593,51 @@ int32_t run_mtp_generation(
         int32_t pending = sample_constrained(
             logits, counts, initial_constraint);
         const double prefill_ms = timer.elapsed_ms();
-        if (on_prefill) on_prefill(MfqPrefillTiming{prompt.size(), prefill_ms, 0., prefill_ms});
-        if (!emit(pending) || generated == limit) return generated;
+        if (on_prefill) on_prefill(MfqPrefillTiming{
+            prompt.size() - reused_tokens,
+            prefill_ms,
+            multimodal_ms,
+            prefill_ms + multimodal_ms});
+
+        MFQ_RUNTIME_CHECK(
+            reused_tokens == 0 || !mtp.blockwise_drafting(),
+            "blockwise CUDA MTP session restore is unsupported");
+        if (mtp.blockwise_drafting()) {
+            mtp.append_target_context(raw, 0);
+        }
+
+        if (mtp.teacher_forced_prompt_prime()) {
+            constexpr int64_t chunk_size = 512;
+            Tensor prime_hidden;
+            int64_t prime_ids_offset = 1;
+            int64_t pairs = raw.size(1) - 1;
+            if (reused_tokens > 0) {
+                prime_hidden = raw.size(1) == 1
+                    ? restored_last_hidden
+                    : mfq_tensor_backend::cat(
+                          {restored_last_hidden,
+                           raw.narrow(1, 0, raw.size(1) - 1)},
+                          1).contiguous();
+                prime_ids_offset = static_cast<int64_t>(reused_tokens);
+                pairs = raw.size(1);
+            } else if (pairs > 0) {
+                prime_hidden = raw.narrow(1, 0, pairs);
+            }
+            for (int64_t offset = 0; offset < pairs; offset += chunk_size) {
+                const int64_t count = std::min(chunk_size, pairs - offset);
+                (void)predictor_step(
+                    prime_hidden.narrow(1, offset, count),
+                    input_ids.narrow(
+                        1, prime_ids_offset + offset, count),
+                    transformed_prompt
+                        ? prepared->positions.narrow(
+                              -1, prime_ids_offset + offset,
+                              count).contiguous()
+                        : Tensor{});
+            }
+        }
+
+        if (!emit(pending) || generated == limit) return finish();
         auto constraint_cursor = token_constraint
             ? token_constraint->clone()
             : MfqTokenConstraintPtr{};
@@ -576,26 +648,7 @@ int32_t run_mtp_generation(
                      constraint_cursor)),
             "CUDA MTP token constraint cursor is incomplete");
 
-        if (mtp.blockwise_drafting()) {
-            mtp.append_target_context(raw, 0);
-        }
-
-        if (mtp.teacher_forced_prompt_prime() && prompt.size() > 1) {
-            constexpr int64_t chunk_size = 512;
-            const int64_t pairs = raw.size(1) - 1;
-            for (int64_t offset = 0; offset < pairs; offset += chunk_size) {
-                const int64_t count = std::min(chunk_size, pairs - offset);
-                (void)predictor_step(
-                    raw.narrow(1, offset, count),
-                    input_ids.narrow(1, offset + 1, count),
-                    transformed_prompt
-                        ? prepared->positions.narrow(
-                              -1, offset + 1, count).contiguous()
-                        : Tensor{});
-            }
-        }
-
-        auto initial_hidden = raw.narrow(1, raw.size(1) - 1, 1);
+        auto initial_hidden = committed_last_hidden;
         if (mtp.target_bootstrap_decode()) {
             if (mtp.teacher_forced_prompt_prime()) {
                 // Some recurrent predictors consume the prompt/first-token
@@ -610,11 +663,13 @@ int32_t run_mtp_generation(
             auto next_hidden = model.hidden_forward(
                 ids_for({pending}), mfq_nullopt, mfq_nullopt,
                 nullptr, mfq_nullopt, &raw);
+            committed_last_hidden = raw.narrow(
+                1, raw.size(1) - 1, 1);
             pending = sample_constrained(
                 logits_for(next_hidden), counts, constraint_cursor);
             if (constraint_cursor) constraint_cursor->accept(pending);
-            if (!emit(pending) || generated == limit) return generated;
-            initial_hidden = raw.narrow(1, raw.size(1) - 1, 1);
+            if (!emit(pending) || generated == limit) return finish();
+            initial_hidden = committed_last_hidden;
         }
 
         int64_t predictor_history_position = mtp.cache_position();
@@ -917,8 +972,32 @@ int32_t run_mtp_generation(
                     }
                 }
             }
-            if (!continue_generation) return generated;
-            if (!emit(result.next_token)) return generated;
+            committed_last_hidden = verified_raw.narrow(
+                1, emitted_accepted, 1);
+            if (!continue_generation) {
+                if (emitted_accepted > 0 &&
+                        mtp.teacher_forced_prompt_prime()) {
+                    std::vector<int32_t> committed_ids(
+                        draft.tokens.begin(),
+                        draft.tokens.begin() + emitted_accepted);
+                    (void)prepare_draft(
+                        verified_raw.narrow(1, 0, emitted_accepted),
+                        committed_ids, 0, false);
+                }
+                return finish();
+            }
+            if (!emit(result.next_token)) {
+                if (mtp.teacher_forced_prompt_prime()) {
+                    std::vector<int32_t> committed_ids(
+                        draft.tokens.begin(),
+                        draft.tokens.begin() + accepted);
+                    committed_ids.push_back(result.next_token);
+                    (void)prepare_draft(
+                        verified_raw.narrow(1, 0, accepted + 1),
+                        committed_ids, 0, false);
+                }
+                return finish();
+            }
 
             const double cycle_ms = std::chrono::duration<double, std::milli>(
                 Clock::now() - cycle_started).count();
@@ -953,7 +1032,7 @@ int32_t run_mtp_generation(
                 bounded_depth(depth_controller.depth()),
                 false);
         }
-        return generated;
+        return finish();
     };
     try {
         const auto result = generate();
@@ -966,6 +1045,7 @@ int32_t run_mtp_generation(
     } catch (...) {
         // A failed partial pass must never become the next request's history.
         try { model.reset(1); mtp.reset(1); } catch (...) {}
+        if (session_last_hidden != nullptr) *session_last_hidden = {};
         throw;
     }
 }
@@ -975,7 +1055,9 @@ int32_t run_mtp_generation(
         mfq::cuda::CausalLmFor<BACKBONE>&, MtpModule&,                         \
         const std::vector<int64_t>&, const MfqSamplingParams&,              \
         const MfqTokenCallback&, const MfqPrefillCallback&, int64_t,         \
-        const MfqTokenConstraintPtr&, const CudaPreparedPrompt*)
+        const MfqTokenConstraintPtr&, const CudaPreparedPrompt*,             \
+        std::size_t, const mfq_tensor_backend::Tensor&,                      \
+        mfq_tensor_backend::Tensor*, double)
 
 MFQ_INSTANTIATE_MTP(mfq::cuda::CudaBackbone::generic_qwen);
 MFQ_INSTANTIATE_MTP(mfq::cuda::CudaBackbone::glm5_next);

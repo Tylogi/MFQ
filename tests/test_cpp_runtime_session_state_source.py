@@ -23,8 +23,13 @@ METAL_DSV41 = (
 METAL_MINICPM = (
     ROOT / "cpp_runtime" / "backends" / "metal" / "models/minicpmo45" / "mlx_minicpmo45.cpp"
 ).read_text(encoding="utf-8")
-SERVER = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_text(encoding="utf-8")
-HEADER = (ROOT / "cpp_runtime" / "server" / "include" / "mfq" / "server.h").read_text(encoding="utf-8")
+TRANSPORT_SRC = ROOT / "cpp_runtime" / "transport"
+SERVER = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted(TRANSPORT_SRC.rglob("*"))
+    if path.suffix in {".cpp", ".h"}
+)
+HEADER = (ROOT / "cpp_runtime" / "core" / "include" / "mfq" / "runtime.h").read_text(encoding="utf-8")
 PAGED_HEADER = (ROOT / "cpp_runtime" / "core" / "mfq_paged_prefix_cache.h").read_text(
     encoding="utf-8"
 )
@@ -66,8 +71,8 @@ def test_stateless_text_requests_use_the_content_addressed_prefix_cache() -> Non
 def test_full_attention_session_state_copies_only_visible_linear_kv() -> None:
     assert "struct TextSessionState" in DECODE
     assert "supports_text_session_state" in DECODE
-    assert "saved.ring" in DECODE
-    assert "std::min<int64_t>(cache_pos, saved.capacity)" in DECODE
+    assert "state.ring" in DECODE
+    assert "std::min<int64_t>(cache_pos, state.capacity)" in DECODE
     assert "restore_text_session_state" in DECODE
 
 
@@ -86,14 +91,31 @@ def test_glm_dsa_session_state_preserves_mla_and_index_caches() -> None:
     assert "saved.kv_cache = glm->kv_cache.narrow(" in DECODE
     assert "saved.index_cache = glm->index_cache.narrow(" in DECODE
     assert "glm->shared_state->reset()" in DECODE
-    assert 'a == "--check-text-session-state"' in DECODE
+    assert 'option == "--check-text-session-state"' in DECODE
     assert '"text_session_state_check dsv4=1 glm_dsa=1\\n"' in DECODE
 
 
 def test_partial_stable_prefix_is_saved_before_generation_suffix() -> None:
     assert "stable_prefix_tokens < prompt.size()" in DECODE
-    assert "store_session_snapshot(stable_prefix_tokens)" in DECODE
+    assert "store_session_snapshot(std::vector<int64_t>(" in DECODE
     assert "tokens.size() > maximum_prefix_tokens" in DECODE
+
+
+def test_qwen_hybrid_and_mtp_session_state_are_restored_together() -> None:
+    assert "TextSessionStateKind::HybridAttention" in DECODE
+    assert "saved.convolution_state = linear->conv_state.clone()" in DECODE
+    assert "saved.recurrent_state = linear->gdn_state.clone()" in DECODE
+    assert "std::optional<MtpSessionState> mtp" in DECODE
+    assert "mtp->restore_session_state(*selected.mtp)" in DECODE
+    assert "prompt.size() - reused_tokens" in DECODE
+
+
+def test_multimodal_cache_keys_include_media_and_reuse_vision_output() -> None:
+    assert "state.input_key != input_key" in DECODE
+    assert "media.pixel_values.data()" in DECODE
+    assert "cached_vision_key_ == cache_key" in DECODE
+    assert "stable_prefix_tokens = transformed_prompt ? 0" not in DECODE
+    assert "work.cache_plan.stable_prefix_tokens = 0;" not in SERVER
 
 
 def test_session_cache_uses_exact_prefixes_and_reports_suffix_prefill() -> None:
@@ -101,17 +123,18 @@ def test_session_cache_uses_exact_prefixes_and_reports_suffix_prefill() -> None:
     assert "tokens.begin(), tokens.end(), prompt.begin()))" in DECODE
     assert "tokens.size() >= prompt.size()" in DECODE
     assert "prompt.size() - reused_tokens" in DECODE
-    assert "MFQ_SERVER_MAX_KV_SESSIONS" in DECODE
-    assert "MFQ_SERVER_MAX_KV_SNAPSHOTS_PER_SESSION" in DECODE
-    assert "MFQ_SERVER_KV_SESSION_BYTES" in DECODE
+    assert "MFQ_RUNTIME_MAX_KV_SESSIONS" in DECODE
+    assert "MFQ_RUNTIME_MAX_KV_SNAPSHOTS_PER_SESSION" in DECODE
+    assert "MFQ_RUNTIME_KV_SESSION_BYTES" in DECODE
+    assert "MFQ_SERVER_" not in DECODE
 
 
 def test_session_cache_retains_history_and_exposes_lifecycle_controls() -> None:
     assert "std::vector<TextSessionState>> states_" in DECODE
     assert "fork_session(" in DECODE
     assert "close_session(" in DECODE
-    assert 'server.Post("/api/runtime/sessions/fork"' in SERVER
-    assert 'R"(/api/runtime/sessions/' in SERVER
+    assert 'server.Post("/runtime/sessions/fork"' in SERVER
+    assert 'R"(/runtime/sessions/' in SERVER
     assert "MfqSessionControl" in HEADER
 
 
@@ -207,7 +230,7 @@ def test_persistent_prefix_cache_is_content_addressed_and_restart_safe() -> None
 def test_tiered_prefix_cache_can_release_only_its_hot_payloads() -> None:
     assert "std::uint64_t trim_hot(" in PAGED_HEADER
     assert "pins_.count(iterator->first) != 0" in PAGED_SOURCE
-    assert 'server.Post("/api/runtime/cache/trim"' in SERVER
+    assert 'server.Post("/runtime/cache/trim"' in SERVER
     assert "session_control.trim_hot" in SERVER
     assert "session_control.trim_hot" in METAL_DECODE
     assert "text_session_cache.trim_hot(target_bytes)" in DECODE
@@ -239,6 +262,6 @@ def test_cuda_paged_cache_only_accepts_linear_full_attention_kv() -> None:
     assert "make_cuda_paged_prefix_cache(" in DECODE
     assert "backend=cuda action=paged_hit" in DECODE
     assert "prefix_cache_disk_blocks" in DECODE
-    assert "MFQ_SERVER_PREFIX_CACHE_PENDING_BYTES" in DECODE
+    assert "MFQ_RUNTIME_PREFIX_CACHE_PENDING_BYTES" in DECODE
     assert "prefix_cache_pending_max_bytes" in DECODE
     assert "paged_cache_->load_prefix(match.blocks)" in DECODE

@@ -218,6 +218,7 @@ class ToolJobPaths:
     huggingface: Path | None
     runtime: Path | None
     perplexity: Path | None
+    diagnostics: Path | None = None
     standalone_cli: bool = False
     internal_modelscope: bool = False
     internal_huggingface: bool = False
@@ -706,10 +707,12 @@ class ToolJobHandlers:
     ) -> dict[str, Any]:
         request = ContainerValidationPayload.model_validate(payload)
         artifact = await self._model(request.model)
-        runtime = self._required_executable(self.paths.runtime, "MFQ runtime")
+        diagnostics = self._required_executable(
+            self.paths.diagnostics or self.paths.runtime, "MFQ diagnostics"
+        )
         output = await self._run(
             context,
-            [str(runtime), "--model", str(artifact.path), "--check-mfq-container"],
+            [str(diagnostics), "--model", str(artifact.path), "--check-mfq-container"],
         )
         with suppress(ValueError, StorageError):
             await context.validate_artifact(self._artifact_uri(artifact.path))

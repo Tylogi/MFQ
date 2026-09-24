@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import dataclasses
 import io
 import json
 import os
@@ -21,19 +20,18 @@ from PIL import Image
 from mfq.server import vision as vision_module
 from mfq.server.protocol.models import SamplingParams
 from mfq.server.runtime.backend import OpenAIChatBackend
+from mfq.server.runtime.client import HttpRuntimeClient
 from mfq.server.vision import (
     DeepseekV4VisionProcessor,
     DeepseekV41VisionProcessor,
     Glm5NextVisionProcessor,
     MiniCPMO45VisionProcessor,
-    ProcessedVisionRequest,
     Qwen4ExpVisionProcessor,
     Qwen35VisionProcessor,
     _DecodedVideo,
     _PreparedVideoFrame,
     multimodal_processor_for_architecture,
 )
-from mfq.server.vision import decode as decode_module
 
 
 def _data_url(image: Image.Image) -> str:
@@ -43,22 +41,10 @@ def _data_url(image: Image.Image) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
-def test_pydantic_value_objects_preserve_dataclass_api() -> None:
-    frame = _PreparedVideoFrame(Image.new("RGB", (1, 1)), (1, 1), 0.5)
-    video = _DecodedVideo((frame,), (0,), 1.0, 1.0)
-    request = ProcessedVisionRequest([], {}, 1, 1)
-
-    assert all(dataclasses.is_dataclass(value) for value in (frame, video, request))
-    assert dataclasses.replace(request, frame_count=2).frame_count == 2
-    assert hasattr(ProcessedVisionRequest, "__pydantic_validator__")
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        request.frame_count = 2
-
-
 def test_decoded_images_are_cached_by_content(monkeypatch: pytest.MonkeyPatch) -> None:
     vision_module.clear_image_decode_cache()
     source = _data_url(Image.new("RGB", (24, 24), "red"))
-    data = decode_module._decode_data_url(source, "image/")
+    data = MiniCPMO45VisionProcessor._decode_data_url(source, "image/")
     real_open = Image.open
     open_count = 0
 
@@ -69,12 +55,12 @@ def test_decoded_images_are_cached_by_content(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(Image, "open", tracked_open)
     try:
-        first = decode_module._decode_image(data)
-        second = decode_module._decode_image(data)
+        first = MiniCPMO45VisionProcessor._decode_image(data)
+        second = MiniCPMO45VisionProcessor._decode_image(data)
         assert first is second
         assert open_count == 1
         assert vision_module.clear_image_decode_cache() > 0
-        decode_module._decode_image(data)
+        MiniCPMO45VisionProcessor._decode_image(data)
         assert open_count == 2
     finally:
         vision_module.clear_image_decode_cache()
@@ -85,7 +71,7 @@ def test_clear_during_image_decode_does_not_repopulate_cache(
 ) -> None:
     vision_module.clear_image_decode_cache()
     source = _data_url(Image.new("RGB", (24, 24), "blue"))
-    data = decode_module._decode_data_url(source, "image/")
+    data = MiniCPMO45VisionProcessor._decode_data_url(source, "image/")
     entered = ThreadEvent()
     resume = ThreadEvent()
     real_open = Image.open
@@ -98,14 +84,14 @@ def test_clear_during_image_decode_does_not_repopulate_cache(
     monkeypatch.setattr(Image, "open", blocked_open)
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(decode_module._decode_image, data)
+            future = pool.submit(MiniCPMO45VisionProcessor._decode_image, data)
             assert entered.wait(5)
             vision_module.clear_image_decode_cache()
             resume.set()
             decoded = future.result(timeout=5)
         assert decoded.getpixel((0, 0)) == (0, 0, 255)
-        assert not decode_module._image_decode_cache
-        assert decode_module._image_decode_cache_bytes == 0
+        assert not vision_module._image_decode_cache
+        assert vision_module._image_decode_cache_bytes == 0
     finally:
         resume.set()
         vision_module.clear_image_decode_cache()
@@ -115,19 +101,19 @@ def test_decoded_image_cache_is_byte_bounded_lru(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     vision_module.clear_image_decode_cache()
-    red = decode_module._decode_data_url(
+    red = MiniCPMO45VisionProcessor._decode_data_url(
         _data_url(Image.new("RGB", (24, 24), "red")),
         "image/",
     )
-    green = decode_module._decode_data_url(
+    green = MiniCPMO45VisionProcessor._decode_data_url(
         _data_url(Image.new("RGB", (24, 24), "green")),
         "image/",
     )
-    cache_bytes = decode_module._decoded_pixel_bytes(
+    cache_bytes = vision_module._decoded_pixel_bytes(
         Image.new("RGB", (24, 24))
     )
     monkeypatch.setattr(
-        decode_module,
+        vision_module,
         "_IMAGE_DECODE_CACHE_MAX_BYTES",
         cache_bytes,
     )
@@ -141,12 +127,12 @@ def test_decoded_image_cache_is_byte_bounded_lru(
 
     monkeypatch.setattr(Image, "open", tracked_open)
     try:
-        decode_module._decode_image(red)
-        decode_module._decode_image(green)
-        decode_module._decode_image(red)
+        MiniCPMO45VisionProcessor._decode_image(red)
+        MiniCPMO45VisionProcessor._decode_image(green)
+        MiniCPMO45VisionProcessor._decode_image(red)
         assert open_count == 3
-        assert len(decode_module._image_decode_cache) == 1
-        assert decode_module._image_decode_cache_bytes == cache_bytes
+        assert len(vision_module._image_decode_cache) == 1
+        assert vision_module._image_decode_cache_bytes == cache_bytes
     finally:
         vision_module.clear_image_decode_cache()
 
@@ -803,7 +789,7 @@ def test_backend_sends_shared_vision_tensor_protocol_to_native_worker() -> None:
         maximum_image_slices = 1
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
+        if request.url.path == "/runtime/health":
             return httpx.Response(
                 200,
                 json={"model": "MiniCPM-o", "model_type": "minicpmo"},
@@ -822,7 +808,7 @@ def test_backend_sends_shared_vision_tensor_protocol_to_native_worker() -> None:
 
     async def run() -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        backend = OpenAIChatBackend("http://backend", client=client)
+        backend = OpenAIChatBackend(HttpRuntimeClient("http://backend", client=client))
         backend._vision_processor = TinyProcessor()
         image = Image.new("RGB", (28, 28), (20, 40, 60))
         deltas = [
@@ -849,8 +835,10 @@ def test_backend_sends_shared_vision_tensor_protocol_to_native_worker() -> None:
     asyncio.run(run())
     payload = captured["payload"]
     assert isinstance(payload, dict)
-    assert payload["messages"][0]["content"].startswith("<image_id>0</image_id>")
-    tensors = payload["mfq_multimodal"]
+    assert payload["input"]["messages"][0]["content"].startswith(
+        "<image_id>0</image_id>"
+    )
+    tensors = payload["media"]
     assert tensors["version"] == 1
     assert tensors["pixel_values"]["shape"] == [1, 3, 14, 56]
     assert tensors["patch_mask"]["shape"] == [1, 4]
@@ -866,13 +854,13 @@ def test_backend_cleans_local_binary_tensor_file_after_stream() -> None:
 
     async def handler(request: httpx.Request) -> httpx.Response:
         nonlocal captured_path
-        if request.url.path == "/health":
+        if request.url.path == "/runtime/health":
             return httpx.Response(
                 200,
                 json={"model": "MiniCPM-o", "model_type": "minicpmo"},
             )
         payload = json.loads(request.content)
-        captured_path = payload["mfq_multimodal"]["binary_file"]["path"]
+        captured_path = payload["media"]["binary_file"]["path"]
         assert Path(captured_path).is_file()
         body = (
             'data: {"choices":[{"delta":{"content":"ok"},'
@@ -888,8 +876,7 @@ def test_backend_cleans_local_binary_tensor_file_after_stream() -> None:
     async def run() -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         backend = OpenAIChatBackend(
-            "http://backend",
-            client=client,
+            HttpRuntimeClient("http://backend", client=client),
             local_tensor_files=True,
         )
         backend._vision_processor = TinyProcessor()
@@ -928,12 +915,12 @@ def test_backend_reports_product_level_multimodal_prefill() -> None:
         maximum_image_slices = 1
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
+        if request.url.path == "/runtime/health":
             return httpx.Response(
                 200,
                 json={"model": "MiniCPM-o", "model_type": "minicpmo"},
             )
-        if request.url.path == "/api/status":
+        if request.url.path == "/runtime/status":
             return httpx.Response(
                 200,
                 json={"model": "MiniCPM-o", "last_request": {"id": request_id}},
@@ -970,7 +957,7 @@ def test_backend_reports_product_level_multimodal_prefill() -> None:
 
     async def run() -> None:
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        backend = OpenAIChatBackend("http://backend", client=client)
+        backend = OpenAIChatBackend(HttpRuntimeClient("http://backend", client=client))
         backend._vision_processor = TinyProcessor()
         image = Image.new("RGB", (28, 28), (20, 40, 60))
         deltas = [

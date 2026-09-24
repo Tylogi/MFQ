@@ -234,106 +234,6 @@ std::vector<std::uint8_t> zero_mfe_blob(
     return blob;
 }
 
-std::vector<std::uint8_t> zero_tpq_mfe_blob(
-    int output_per_expert,
-    int input) {
-    constexpr int vector_size = 8;
-    constexpr int entries = 256;
-    constexpr int index_bits = 8;
-    require(
-        output_per_expert > 0 &&
-            input > 0 &&
-            input % vector_size == 0,
-        "invalid synthetic TPQ MFE shape");
-    const std::string dtype = "TPQ-X";
-    std::vector<std::uint8_t> blob{
-        'N', 'I', 'M', '2',
-    };
-    append<std::uint32_t>(
-        blob,
-        kExperts);
-    append<std::uint32_t>(
-        blob,
-        output_per_expert);
-    append<std::uint32_t>(
-        blob,
-        input);
-    append<std::uint32_t>(
-        blob,
-        kExperts);
-    for (int expert = 0;
-         expert < kExperts;
-         ++expert) {
-        std::vector<std::uint8_t> payload{
-            'C', 'P', 'Q', '1',
-        };
-        append<std::uint8_t>(payload, 1);
-        append<std::uint8_t>(payload, 1);
-        append<std::uint8_t>(
-            payload,
-            vector_size);
-        append<std::uint8_t>(
-            payload,
-            index_bits);
-        append<std::int32_t>(
-            payload,
-            0);
-        append<std::int32_t>(
-            payload,
-            input);
-        append<std::uint32_t>(
-            payload,
-            2);
-        append<std::uint32_t>(
-            payload,
-            entries);
-        append<std::int64_t>(
-            payload,
-            output_per_expert);
-        append<std::int64_t>(
-            payload,
-            input);
-        append<std::uint32_t>(
-            payload,
-            output_per_expert);
-        payload.resize(
-            payload.size() +
-                static_cast<std::size_t>(
-                    entries * vector_size) *
-                    sizeof(float) +
-                static_cast<std::size_t>(
-                    output_per_expert) *
-                    (input / vector_size),
-            0);
-
-        append<std::uint32_t>(
-            blob,
-            1);
-        append<std::uint32_t>(
-            blob,
-            static_cast<std::uint32_t>(
-                dtype.size()));
-        append<std::uint64_t>(
-            blob,
-            payload.size());
-        append<std::uint64_t>(
-            blob,
-            0);
-        append<std::int32_t>(
-            blob,
-            expert);
-        blob.insert(
-            blob.end(),
-            dtype.begin(),
-            dtype.end());
-        blob.insert(
-            blob.end(),
-            payload.begin(),
-            payload.end());
-    }
-    return blob;
-}
-
 std::vector<std::uint8_t> zero_dense_payload(
     const std::vector<std::int64_t>& shape) {
     std::vector<std::uint8_t> payload;
@@ -430,8 +330,7 @@ struct ContainerRecord {
 };
 
 void write_causal_lm_container(
-    const std::filesystem::path& path,
-    bool streamed_experts = false) {
+    const std::filesystem::path& path) {
     const auto config_json =
         load_test_manifest_config();
     const auto config =
@@ -448,17 +347,11 @@ void write_causal_lm_container(
                 {
                     binding.name,
                     "MFE",
-                    streamed_experts
-                    ? zero_tpq_mfe_blob(
-                          static_cast<int>(
-                              binding.shape.at(1)),
-                          static_cast<int>(
-                              binding.shape.at(2)))
-                    : zero_mfe_blob(
-                          static_cast<int>(
-                              binding.shape.at(1)),
-                          static_cast<int>(
-                              binding.shape.at(2))),
+                    zero_mfe_blob(
+                        static_cast<int>(
+                            binding.shape.at(1)),
+                        static_cast<int>(
+                            binding.shape.at(2))),
                 });
         } else {
             records.push_back(
@@ -470,14 +363,13 @@ void write_causal_lm_container(
                 });
         }
     }
-    const json manifest{
-        {"format", "tpq-1"},
-        {"config", config_json},
-        {
-            "tiers_per_layer",
-            {{"0", "xw"}},
-        },
-    };
+    const auto config_text = config_json.dump();
+    records.push_back({
+        "__mfq_asset__/model_config.json",
+        "ASSET",
+        std::vector<std::uint8_t>(
+            config_text.begin(), config_text.end()),
+    });
     std::ofstream stream(
         path,
         std::ios::binary);
@@ -490,22 +382,10 @@ void write_causal_lm_container(
         2);
     write_string(
         stream,
-        "deepseek_v4-tpq-mfq");
+        "deepseek_v4-hf-mfq-nint-recipe");
     write_scalar<std::uint32_t>(
         stream,
-        2);
-    write_string(
-        stream,
-        "source_format");
-    write_string(
-        stream,
-        json("tpq-1").dump());
-    write_string(
-        stream,
-        "tpq_manifest");
-    write_string(
-        stream,
-        manifest.dump());
+        0);
     write_scalar<std::uint32_t>(
         stream,
         static_cast<std::uint32_t>(
@@ -2142,9 +2022,7 @@ void test_streamed_mfq_container_lifetime() {
     const auto path =
         std::filesystem::temp_directory_path() /
         "mfq-dsv4-causal-lm-lifetime-test.mfq";
-    write_causal_lm_container(
-        path,
-        true);
+    write_causal_lm_container(path);
     try {
         std::optional<MlxDeepseekV4CausalLm> runtime;
         {

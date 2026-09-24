@@ -3,11 +3,12 @@ import re
 
 
 CUDA_ROOT = Path(__file__).parents[1] / "cpp_runtime" / "backends" / "cuda"
-CUDA_RUNTIME = (CUDA_ROOT / "runtime" / "cuda_decode_runtime.cpp").read_text(
-    encoding="utf-8"
+CUDA_RUNTIME = "\n".join(
+    (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
+    for name in ("cuda_runtime.cpp", "generation.h")
 )
 BACKEND_CHECKS = (
-    CUDA_ROOT / "runtime" / "diagnostics" / "backend_checks.cpp"
+    CUDA_ROOT / "diagnostics" / "backend_checks.cpp"
 ).read_text(encoding="utf-8")
 SOURCE = "\n".join(
     (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
@@ -16,8 +17,11 @@ SOURCE = "\n".join(
         "cuda_transformer.h",
         "cuda_execution.h",
         "cuda_execution.cpp",
+        "decode_graph.h",
     )
-) + "\n" + BACKEND_CHECKS + "\n" + CUDA_RUNTIME
+) + "\n" + BACKEND_CHECKS + "\n" + CUDA_RUNTIME + "\n" + (
+    CUDA_ROOT / "commands" / "diagnostics.cpp"
+).read_text(encoding="utf-8")
 ATTENTION_SOURCE = (
     Path(__file__).parents[1] / "mfq" / "kernels" / "cuda" / "attention.cu"
 ).read_text(encoding="utf-8")
@@ -48,18 +52,21 @@ ACC_SOURCE = (
 ).read_text(encoding="utf-8")
 
 
-def test_minicpmo_native_server_keeps_cuda_graph_enabled() -> None:
+def test_minicpmo_native_runtime_keeps_cuda_graph_enabled() -> None:
     assert "graph_architecture_supported" not in SOURCE
     graph_gate = SOURCE.split(
-        'const char * graph_env = std::getenv("MFQ_SERVER_CUDA_GRAPH");', 1
+        'const char * graph_env = std::getenv("MFQ_RUNTIME_CUDA_GRAPH");', 1
     )[1].split(
-        'const char * graph_min_env = std::getenv(', 1
+        "const char * graph_min_env =", 1
     )[0]
     assert "is_minicpmo45" not in graph_gate
 
 
 def test_static_decode_uses_dynamic_position_for_kv_writes() -> None:
-    assert SOURCE.count("hidden_forward(ids, pos, seq_len, nullptr, pos)") == 2
+    static_forward = SOURCE.split(
+        "mfq_tensor_backend::Tensor hidden_forward_static", 1
+    )[1].split("mfq_tensor_backend::Tensor last_logits_static", 1)[0]
+    assert "nullptr, pos, nullptr, 0" in static_forward
     assert "cache_positions_override.value(), primary" in SOURCE
     assert (
         '"cache_positions must have shape [tokens] or [batch,tokens]"'
@@ -74,7 +81,8 @@ def test_minicpmo_persistent_decode_workspaces_are_warmed_before_capture() -> No
         SOURCE,
     )
     assert len(warmup_gates) == 1
-    assert SOURCE.count("prepare_decode_graph_memory(model,") == 2
+    assert "graph_cache.ensure_captured(" in CUDA_RUNTIME
+    assert CUDA_RUNTIME.count("prepare_decode_graph_memory(model,") == 1
 
 
 def test_graph_stage_events_start_after_decode_workspace_warmup() -> None:
@@ -83,7 +91,7 @@ def test_graph_stage_events_start_after_decode_workspace_warmup() -> None:
     )[1].split(
         "graph.capture_end();", 1
     )[0]
-    warmup = graph_path.index("model.next_token_static(static_input, static_pos, static_len)")
+    warmup = graph_path.index("model.next_token_static(")
     profiler_reset = graph_path.index("g_profiler.reset();")
     external_events = graph_path.index(
         "g_profiler.graph_events = profile_cuda_graph;"
@@ -114,7 +122,7 @@ def test_torch_reference_graph_can_emit_a_debug_dump() -> None:
 
 def test_backend_bf16_add_check_covers_eager_and_graph_paths() -> None:
     assert "run_backend_bf16_add_check" in SOURCE
-    assert 'a == "--check-backend-bf16-add"' in SOURCE
+    assert 'option == "--check-backend-bf16-add"' in SOURCE
     check = BACKEND_CHECKS.split("int run_backend_bf16_add_check", 1)[1].split(
         "int run_backend_argmax_check", 1
     )[0]
@@ -288,7 +296,9 @@ def test_native_bf16_kv_cache_uses_the_fused_writer() -> None:
 
 def test_graph_attention_tracks_eager_split_count_from_device_length() -> None:
     assert "attention_cache_decode_dynamic_cuda" in SOURCE
-    assert "g_decode_graph_attention_parts > 1" in SOURCE
+    assert "decode_attention_parts > 1" in SOURCE
+    assert "context.decode_attention_parts" in SOURCE
+    assert "g_decode_graph_attention_parts" not in SOURCE
     active_parts = ATTENTION_SOURCE.split(
         "__device__ __forceinline__ int attention_decode_active_parts", 1
     )[1].split("template <int BD, typename scalar_t>", 1)[0]

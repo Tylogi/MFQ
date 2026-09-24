@@ -12,9 +12,9 @@
 
 #include "nlohmann/json.hpp"
 
-#ifdef MFQ_METAL_SERVER
+#ifdef MFQ_METAL_RUNTIME_COMMUNICATION
 #include "mfq_paged_prefix_cache.h"
-#include "mfq/server.h"
+#include "transport.h"
 #include "mlx_paged_session_codec.h"
 #include "mlx_server_components.h"
 #endif
@@ -88,6 +88,7 @@ struct Arguments {
     bool list_tensors = false;
     bool self_test_metal = false;
     bool server = false;
+    bool stdio = false;
     bool predequantize_fp16 = false;
     std::string host = "127.0.0.1";
     int port = 8080;
@@ -186,8 +187,27 @@ Arguments parse_arguments(int argc, char** argv) {
             result.list_tensors = true;
         } else if (value == "--self-test-metal") {
             result.self_test_metal = true;
-        } else if (value == "--server") {
+        } else if (value == "--transport") {
+            const std::string transport = require_value("--transport");
+            if (result.server) {
+                usage_error("runtime transport was specified more than once");
+            }
+            if (transport != "stdio" && transport != "http") {
+                usage_error("--transport must be stdio or http");
+            }
             result.server = true;
+            result.stdio = transport == "stdio";
+        } else if (value == "--server") {
+            if (result.server) {
+                usage_error("runtime transport was specified more than once");
+            }
+            result.server = true;
+        } else if (value == "--stdio") {
+            if (result.server) {
+                usage_error("runtime transport was specified more than once");
+            }
+            result.server = true;
+            result.stdio = true;
         } else if (value == "--metal-predequantize-f16") {
             result.predequantize_fp16 = true;
         } else if (value == "--host") {
@@ -258,6 +278,7 @@ void print_help() {
         << "  mfq-decode-metal --model MODEL.mfq --tensor NAME\n"
         << "  mfq-decode-metal --model MODEL.mfq --server "
            "[--host 127.0.0.1 --port 8080]\n"
+        << "  mfq-decode-metal --model MODEL.mfq --transport stdio\n"
         << "  mfq-decode-metal --model HF_MODEL_DIR --server "
            "--tokenizer TOKENIZER.gguf\n"
         << "  mfq-decode-metal --self-test-metal\n\n"
@@ -273,7 +294,9 @@ void print_help() {
         << "                          vary N routed experts across benchmark tokens\n"
         << "  --benchmark-swiglu     fuse an even-width MFE gate/up record\n"
         << "  --self-test-metal      execute an MLX C++ graph on Metal\n"
-        << "  --server               run the native C++ OpenAI-compatible server\n"
+        << "  --transport TYPE       runtime communication: stdio or http\n"
+        << "  --server               deprecated alias for --transport http\n"
+        << "  --stdio                deprecated alias for --transport stdio\n"
         << "  --metal-predequantize-f16\n"
         << "                          expand regular weights to FP16 at load time\n"
         << "  --host ADDRESS         server bind address (default 127.0.0.1)\n"
@@ -536,7 +559,7 @@ void self_test_metal() {
     std::cout << "MLX C++ Metal self-test passed\n";
 }
 
-#ifdef MFQ_METAL_SERVER
+#ifdef MFQ_METAL_RUNTIME_COMMUNICATION
 std::uint64_t cache_bytes_from_environment(
     const char* name,
     std::uint64_t fallback) {
@@ -1556,10 +1579,10 @@ std::int32_t generate_with_prefill_metrics(
 }
 
 template <typename Runtime, typename Loader>
-int serve_loaded_runtime(
+int run_loaded_runtime(
     const Arguments& arguments,
     const mfq::metal::MfqContainer& container,
-    Runtime runtime,
+    Runtime model,
     Loader load_runtime,
     std::string model_type,
     std::int64_t maximum_context,
@@ -1570,7 +1593,7 @@ int serve_loaded_runtime(
     if constexpr (requires(Runtime& value) {
             value.prewarm_ssd_expert_arena();
         }) {
-        runtime.prewarm_ssd_expert_arena();
+        model.prewarm_ssd_expert_arena();
         release_model_load_staging_memory(runtime_stream);
     }
     int prefill_chunk_size = arguments.prefill_chunk_size;
@@ -1579,7 +1602,7 @@ int serve_loaded_runtime(
         if constexpr (requires(const Runtime& value) {
                 value.preferred_prefill_chunk_size(prefill_chunk_size);
             }) {
-            const int preferred = runtime.preferred_prefill_chunk_size(
+            const int preferred = model.preferred_prefill_chunk_size(
                 prefill_chunk_size);
             if (preferred > 0 && preferred != prefill_chunk_size) {
                 prefill_chunk_size = preferred;
@@ -1591,27 +1614,27 @@ int serve_loaded_runtime(
     }
     const auto allocator_cache_limit = server_cache_limit_bytes();
     mlx::core::set_cache_limit(allocator_cache_limit);
-    MfqServerConfig server;
-    server.host = arguments.host;
-    server.port = arguments.port;
-    server.model_name = arguments.model_name.empty()
+    MfqHttpRuntimeTransportConfig transport_config;
+    transport_config.host = arguments.host;
+    transport_config.port = arguments.port;
+    transport_config.model_name = arguments.model_name.empty()
         ? arguments.mfq.stem().string()
         : arguments.model_name;
-    server.model_type = std::move(model_type);
+    transport_config.model_type = std::move(model_type);
     const auto model_graph = mfq::metal::effective_model_graph(container);
     if (container.contains(tokenizer_asset)) {
-        server.tokenizer_gguf =
+        transport_config.tokenizer_gguf =
             container.read(tokenizer_asset);
     } else {
-        server.tokenizer_model =
+        transport_config.tokenizer_model =
             arguments.tokenizer_gguf.string();
     }
-    server.api_key = arguments.api_key;
-    server.max_context = std::min<std::int64_t>(
+    transport_config.api_key = arguments.api_key;
+    transport_config.max_context = std::min<std::int64_t>(
         arguments.context_size,
         maximum_context);
-    server.context_capacity = maximum_context;
-    server.vocab_size = vocabulary_size;
+    transport_config.context_capacity = maximum_context;
+    transport_config.vocab_size = vocabulary_size;
     constexpr const char* model_config_asset =
         "__mfq_asset__/model_config.json";
     const auto embedded = [&] {
@@ -1624,11 +1647,11 @@ int serve_loaded_runtime(
     const auto model_config = container.contains(model_config_asset)
         ? container.read_text(model_config_asset)
         : std::string();
-    server.runtime_profile = resolve_mfq_runtime_profile(
+    transport_config.runtime_profile = resolve_mfq_runtime_profile(
         arguments.mfq.string(),
         model_graph.architecture,
-        server.model_type,
-        server.model_name,
+        transport_config.model_type,
+        transport_config.model_name,
         embedded,
         model_config,
         arguments.sampling_profile.string());
@@ -1636,7 +1659,7 @@ int serve_loaded_runtime(
     auto runtime_mutex = std::make_shared<std::mutex>();
     auto runtime_holder =
         std::make_shared<std::optional<Runtime>>(
-            std::move(runtime));
+            std::move(model));
     const auto paged_cache_factory =
         [&container](std::int64_t context_size)
             -> std::shared_ptr<mfq::cache::PagedPrefixCache> {
@@ -1645,9 +1668,9 @@ int serve_loaded_runtime(
         };
     auto session_cache =
         std::make_shared<MlxServerTextSessionCache<Runtime>>(
-            paged_cache_factory(server.max_context));
+            paged_cache_factory(transport_config.max_context));
     auto loaded_context =
-        std::make_shared<std::int64_t>(server.max_context);
+        std::make_shared<std::int64_t>(transport_config.max_context);
     auto runtime_components = mfq::metal::make_mlx_server_components(
         &model_graph,
         runtime_mutex,
@@ -1673,7 +1696,7 @@ int serve_loaded_runtime(
             model_graph.has_component("audio_output");
         capabilities.full_duplex =
             static_cast<bool>(runtime_components.duplex);
-        server.model_capabilities = std::move(capabilities);
+        transport_config.model_capabilities = std::move(capabilities);
     }
     const MfqGenerateFn generate =
         [runtime_mutex, runtime_holder, session_cache, runtime_stream,
@@ -1880,9 +1903,13 @@ int serve_loaded_runtime(
     session_control.trim_hot = [session_cache](std::uint64_t target_bytes) {
         return session_cache->trim_hot(target_bytes);
     };
-    return run_mfq_server(
-        server, generate, reload, duplex, session_control,
-        multimodal_generate,
+    MfqInferenceEngine inference_engine;
+    inference_engine.generate = generate;
+    inference_engine.reload = reload;
+    inference_engine.duplex = std::move(duplex);
+    inference_engine.session_control = std::move(session_control);
+    inference_engine.multimodal_generate = multimodal_generate;
+    inference_engine.runtime_metrics =
         [runtime_mutex, runtime_holder, allocator_cache_limit] {
             std::vector<std::pair<std::string, double>> metrics{
                 {"mlx_active_bytes", static_cast<double>(mlx::core::get_active_memory())},
@@ -2071,10 +2098,15 @@ int serve_loaded_runtime(
                 }
             }
             return metrics;
-        });
+        };
+    auto transport = arguments.stdio
+        ? make_mfq_stdio_transport(transport_config)
+        : make_mfq_http_transport(std::move(transport_config));
+    MfqRuntime runtime(std::move(inference_engine), std::move(transport));
+    return runtime.run();
 }
 
-int run_native_server(
+int run_native_runtime(
     const Arguments& arguments,
     const mfq::metal::MfqContainer& container) {
     constexpr const char* tokenizer_asset =
@@ -2144,7 +2176,7 @@ int run_native_server(
                     static_cast<int>(requested_context),
                     expert_cache_bytes);
             };
-        return serve_loaded_runtime(
+        return run_loaded_runtime(
             arguments,
             container,
             std::move(runtime),
@@ -2212,7 +2244,7 @@ int run_native_server(
                         static_cast<int>(requested_context),
                         expert_cache_bytes);
             };
-        return serve_loaded_runtime(
+        return run_loaded_runtime(
             arguments,
             container,
             std::move(runtime),
@@ -2255,7 +2287,7 @@ int run_native_server(
                     requested_context,
                     load_modalities);
             };
-        return serve_loaded_runtime(
+        return run_loaded_runtime(
             arguments,
             container,
             std::move(runtime),
@@ -2311,7 +2343,7 @@ int run_native_server(
                     static_cast<int>(requested_context),
                     expert_cache_bytes);
             };
-        return serve_loaded_runtime(
+        return run_loaded_runtime(
             arguments,
             container,
             std::move(runtime),
@@ -2351,7 +2383,7 @@ int run_native_server(
             return mfq::metal::
                 MlxQwen35CausalLm::load(container);
         };
-    return serve_loaded_runtime(
+    return run_loaded_runtime(
         arguments,
         container,
         std::move(runtime),
@@ -2370,6 +2402,9 @@ int run_native_server(
 int main(int argc, char** argv) {
     try {
         const auto arguments = parse_arguments(argc, argv);
+        if (arguments.stdio) {
+            prepare_mfq_stdio_transport();
+        }
         mfq::metal::set_mlx_predequantize_fp16(
             arguments.predequantize_fp16);
         if (arguments.help) {
@@ -2624,12 +2659,12 @@ int main(int argc, char** argv) {
         }
         if (arguments.server) {
             configure_mlx_metal();
-#ifdef MFQ_METAL_SERVER
-            return run_native_server(arguments, model);
+#ifdef MFQ_METAL_RUNTIME_COMMUNICATION
+            return run_native_runtime(arguments, model);
 #else
             throw std::runtime_error(
-                "this build has no C++ server support; configure with "
-                "-DMFQ_BUILD_CPP_SERVER=ON");
+                "this build has no runtime communication support; configure with "
+                "-DMFQ_BUILD_RUNTIME_COMMUNICATION=ON");
 #endif
         }
         if (!arguments.check_container &&
@@ -2639,7 +2674,7 @@ int main(int argc, char** argv) {
             !arguments.server) {
             usage_error(
                 "select --check-mfq-container, --list-tensors, --tensor, "
-                "--server, or --self-test-metal");
+                "--transport, or --self-test-metal");
         }
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {

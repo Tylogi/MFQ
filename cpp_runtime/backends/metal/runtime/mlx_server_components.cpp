@@ -103,6 +103,7 @@ MlxServerComponentCallbacks make_mlx_server_components(
             const MfqSamplingParams& sampling,
             const MfqTokenCallback& callback,
             const MfqPrefillCallback& on_prefill,
+            const MfqPromptCachePlan&,
             const MfqTokenConstraintPtr& token_constraint) {
             std::lock_guard<std::mutex> lock(*runtime_mutex);
             if (!runtime_holder->has_value()) {
@@ -185,6 +186,7 @@ MlxServerComponentCallbacks make_mlx_server_components(
                 const MfqSamplingParams& sampling,
                 const MfqTokenCallback& callback,
                 const MfqPrefillCallback& on_prefill,
+                const MfqPromptCachePlan&,
                 const MfqTokenConstraintPtr& token_constraint) {
                 std::lock_guard<std::mutex> lock(*runtime_mutex);
                 if (!runtime_holder->has_value()) {
@@ -514,6 +516,7 @@ MlxServerComponentCallbacks make_mlx_server_components(
             const MfqSamplingParams& sampling,
             const MfqTokenCallback& callback,
             const MfqPrefillCallback& on_prefill,
+            const MfqPromptCachePlan&,
             const MfqTokenConstraintPtr& token_constraint) {
             std::lock_guard<std::mutex> lock(*runtime_mutex);
             if (!runtime_holder->has_value()) {
@@ -663,6 +666,7 @@ MlxServerComponentCallbacks make_mlx_server_components(
             const MfqSamplingParams& sampling,
             const MfqTokenCallback& callback,
             const MfqPrefillCallback& on_prefill,
+            const MfqPromptCachePlan&,
             const MfqTokenConstraintPtr& token_constraint) {
             std::lock_guard<std::mutex> lock(*runtime_mutex);
             if (!runtime_holder->has_value()) {

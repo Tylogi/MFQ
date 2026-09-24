@@ -2,7 +2,8 @@
   "bundle": {
     "targets": ["nsis"],
     "externalBin": [
-      "../../packaging/sidecars/mfq-decode"
+      "../../packaging/sidecars/mfq-runtime",
+      "../../packaging/sidecars/mfq-diagnostics"
     ],
     "resources": {
       "../../packaging/windows-runtime/": "",

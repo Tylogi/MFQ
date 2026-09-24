@@ -19,8 +19,7 @@ struct DeepseekV4RopeScaling {
     std::int64_t original_max_position_embeddings = 0;
 };
 
-// Normalized configuration shared by manifest-form TPQ archives and raw
-// Hugging Face DeepSeek-V4 config.json files.
+// Normalized DeepSeek-V4 configuration.
 struct DeepseekV4Config {
     std::string model_type = "deepseek_v4";
     std::int64_t n_layers = 0;
@@ -79,13 +78,10 @@ struct DeepseekV4Config {
     std::int64_t vision_min_pixels = 147'456;
     std::int64_t vision_max_wh_ratio = 8;
 
-    // Accepts a normalized manifest config, a complete TPQ manifest, or a
-    // Hugging Face config. Alias fields are normalized to the members above.
+    // Accepts a native or Hugging Face config. Alias fields are normalized.
     static DeepseekV4Config from_json(std::string_view payload);
 
-    // Requires a native DeepSeek-V4 TPQ MFQ header and reads the normalized
-    // Canonical artifacts load the shared model_config.json asset. The
-    // header TPQ manifest is accepted only as pre-schema compatibility.
+    // Loads the shared model_config.json asset from a native artifact.
     static DeepseekV4Config from_mfq(const MfqContainer& model);
 
     void validate() const;

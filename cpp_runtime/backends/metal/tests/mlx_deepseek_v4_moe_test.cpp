@@ -600,225 +600,6 @@ MoeFixture make_streamable_nint_moe(
     };
 }
 
-MoeFixture make_tpq_moe(
-    int output,
-    int input,
-    int salt,
-    std::array<bool, kExperts> included = {
-        true,
-        true,
-        true,
-        true,
-    }) {
-    struct Profile {
-        const char* dtype;
-        int tier;
-        int vector_size;
-        int entries;
-        int bits;
-    };
-    const std::array<Profile, kExperts> profiles{{
-        {"TPQ-X", 1, 8, 256, 8},
-        {"TPQ-W", 2, 8, 4096, 12},
-        {"TPQ-V", 3, 4, 256, 14},
-        {"TPQ-VV", 4, 4, 4096, 16},
-    }};
-    std::vector<std::uint8_t> blob{
-        'N', 'I', 'M', '2',
-    };
-    append<std::uint32_t>(blob, kExperts);
-    append<std::uint32_t>(blob, output);
-    append<std::uint32_t>(blob, input);
-    const auto pool_count = std::count(
-        included.begin(),
-        included.end(),
-        true);
-    require(
-        pool_count > 0,
-        "TPQ MoE fixture requires an expert");
-    append<std::uint32_t>(
-        blob,
-        static_cast<std::uint32_t>(
-            pool_count));
-    std::vector<float> dense(
-        static_cast<std::size_t>(kExperts)
-            * output * input);
-    for (
-        int expert = kExperts - 1;
-        expert >= 0;
-        --expert
-    ) {
-        if (!included[
-                static_cast<std::size_t>(
-                    expert)]) {
-            continue;
-        }
-        const auto& profile =
-            profiles[
-                static_cast<std::size_t>(
-                    expert)];
-        require(
-            input % profile.vector_size == 0,
-            "TPQ MoE fixture vector mismatch");
-        const int blocks =
-            input / profile.vector_size;
-        std::vector<float> codebook(
-            static_cast<std::size_t>(
-                profile.entries)
-                * profile.vector_size);
-        for (
-            int entry = 0;
-            entry < profile.entries;
-            ++entry
-        ) {
-            for (
-                int component = 0;
-                component < profile.vector_size;
-                ++component
-            ) {
-                codebook[
-                    static_cast<std::size_t>(
-                        entry)
-                        * profile.vector_size
-                    + component
-                ] =
-                    static_cast<float>(
-                        (
-                            entry * 3
-                            + component * 5
-                            + salt
-                            + expert * 7
-                        ) % 31
-                        - 15)
-                    / 64.0f;
-            }
-        }
-        std::vector<std::uint16_t> indices(
-            static_cast<std::size_t>(
-                output)
-                * blocks);
-        for (
-            std::size_t index = 0;
-            index < indices.size();
-            ++index
-        ) {
-            indices[index] =
-                static_cast<std::uint16_t>(
-                    (
-                        index * 97
-                        + static_cast<std::size_t>(
-                            salt * 11
-                            + expert * 13)
-                        + profile.entries - 1
-                    ) % profile.entries);
-        }
-        if (!indices.empty()) {
-            indices.front() =
-                static_cast<std::uint16_t>(
-                    profile.entries - 1);
-        }
-        std::vector<std::uint8_t> payload;
-        append_magic(payload, "CPQ1");
-        append<std::uint8_t>(payload, 1);
-        append<std::uint8_t>(
-            payload,
-            static_cast<std::uint8_t>(
-                profile.tier));
-        append<std::uint8_t>(
-            payload,
-            static_cast<std::uint8_t>(
-                profile.vector_size));
-        append<std::uint8_t>(
-            payload,
-            static_cast<std::uint8_t>(
-                profile.bits));
-        append<std::int32_t>(payload, 0);
-        append<std::int32_t>(payload, input);
-        append<std::uint32_t>(payload, 2);
-        append<std::uint32_t>(
-            payload,
-            static_cast<std::uint32_t>(
-                profile.entries));
-        append<std::int64_t>(payload, output);
-        append<std::int64_t>(payload, input);
-        append<std::uint32_t>(payload, output);
-        for (const auto value : codebook) {
-            append<float>(payload, value);
-        }
-        append_bytes(
-            payload,
-            pack_bits(indices, profile.bits));
-
-        const std::string dtype(profile.dtype);
-        append<std::uint32_t>(blob, 1);
-        append<std::uint32_t>(
-            blob,
-            static_cast<std::uint32_t>(
-                dtype.size()));
-        append<std::uint64_t>(
-            blob,
-            payload.size());
-        append<std::uint64_t>(blob, 0);
-        append<std::int32_t>(blob, expert);
-        blob.insert(
-            blob.end(),
-            dtype.begin(),
-            dtype.end());
-        append_bytes(blob, payload);
-
-        for (
-            int row = 0;
-            row < output;
-            ++row
-        ) {
-            for (
-                int block = 0;
-                block < blocks;
-                ++block
-            ) {
-                const auto code =
-                    indices[
-                        static_cast<std::size_t>(
-                            row)
-                            * blocks
-                        + block];
-                for (
-                    int component = 0;
-                    component
-                        < profile.vector_size;
-                    ++component
-                ) {
-                    dense[
-                        (
-                            static_cast<std::size_t>(
-                                expert)
-                                * output
-                            + row
-                        ) * input
-                        + block
-                            * profile.vector_size
-                        + component
-                    ] =
-                        codebook[
-                            static_cast<std::size_t>(
-                                code)
-                                * profile.vector_size
-                            + component
-                        ];
-                }
-            }
-        }
-    }
-    return {
-        std::move(blob),
-        std::move(dense),
-        std::vector<RotationFixture>(
-            kExperts),
-        output,
-        input,
-    };
-}
-
 std::vector<float> patterned(
     std::size_t count,
     int multiplier,
@@ -919,20 +700,12 @@ MoeFixture concatenate_gate_up_reference(
     return result;
 }
 
-SplitModelFixture make_split_model_fixture(bool tpq) {
+SplitModelFixture make_split_model_fixture() {
     auto reference = make_model_fixture();
-    auto gate = tpq
-        ? make_tpq_moe(kIntermediate, kHidden, 31)
-        : make_mixed_moe(kIntermediate, kHidden, 5);
-    auto up = tpq
-        ? make_tpq_moe(kIntermediate, kHidden, 37)
-        : make_mixed_moe(kIntermediate, kHidden, 8);
+    auto gate = make_mixed_moe(kIntermediate, kHidden, 5);
+    auto up = make_mixed_moe(kIntermediate, kHidden, 8);
     reference.routed_gate_up =
         concatenate_gate_up_reference(gate, up);
-    if (tpq) {
-        reference.routed_down =
-            make_tpq_moe(kHidden, kIntermediate, 43);
-    }
     return {
         std::move(reference),
         std::move(gate),
@@ -1957,7 +1730,7 @@ void test_visual_tokens_use_visual_router_bias(
 }
 
 void test_split_gate_up_eager_load_and_forward() {
-    const auto fixture = make_split_model_fixture(false);
+    const auto fixture = make_split_model_fixture();
     const TemporaryDeepseekMfq file(
         split_model_records(
             fixture,
@@ -2064,60 +1837,8 @@ void test_split_gate_up_mfe_offload_load_and_forward() {
     run(5, 32);
 }
 
-void test_split_gate_up_streamed_load_and_forward() {
-    const auto fixture = make_split_model_fixture(true);
-    const TemporaryDeepseekMfq file(
-        split_model_records(
-            fixture,
-            kTokenExperts,
-            true),
-        "deepseek_v4-ew-mfq");
-    const mfq::metal::MfqContainer model(file.path());
-    auto residency =
-        std::make_shared<mfq::metal::MlxTpqExpertResidency>(
-            model,
-            0,
-            kExperts);
-    const auto config = test_config(true);
-    auto moe = MlxDeepseekV4Moe::load(
-        model,
-        config,
-        0,
-        availability_array(kAvailable),
-        residency);
-    require(
-        moe.uses_streamed_experts(),
-        "split TPQ Gate/Up did not select streamed residency");
-
-    const auto run = [&](int rows, int salt) {
-        const auto input = input_values(rows, salt);
-        std::vector<std::int32_t> tokens(
-            static_cast<std::size_t>(rows));
-        for (int row = 0; row < rows; ++row) {
-            tokens[static_cast<std::size_t>(row)] = row % kVocab;
-        }
-        const auto expected = reference(
-            fixture.reference,
-            config,
-            input,
-            rows,
-            tokens,
-            std::nullopt,
-            kTokenExperts,
-            kAvailable);
-        compare(
-            moe.forward_with_routing(
-                array(input.begin(), Shape{rows, kHidden}),
-                array(tokens.begin(), Shape{rows})),
-            expected,
-            3e-2f);
-    };
-    run(1, 31);
-    run(35, 33);
-}
-
 void test_split_gate_up_requires_pair() {
-    const auto fixture = make_split_model_fixture(false);
+    const auto fixture = make_split_model_fixture();
     auto records = split_model_records(
         fixture,
         kTokenExperts,
@@ -2148,15 +1869,15 @@ void test_split_gate_up_requires_pair() {
         "DeepSeek-V4 accepted an incomplete split Gate/Up pair");
 }
 
-void test_streamed_tpq_load_and_forward() {
+void test_streamed_mfe_load_and_forward() {
     auto fixture = make_model_fixture();
     fixture.routed_gate_up =
-        make_tpq_moe(
+        make_streamable_nint_moe(
             2 * kIntermediate,
             kHidden,
             31);
     fixture.routed_down =
-        make_tpq_moe(
+        make_streamable_nint_moe(
             kHidden,
             kIntermediate,
             43);
@@ -2169,7 +1890,7 @@ void test_streamed_tpq_load_and_forward() {
     auto residency =
         std::make_shared<
             mfq::metal::
-                MlxTpqExpertResidency>(
+                MlxMfeOffloadCache>(
             model,
             0,
             kExperts);
@@ -2183,7 +1904,7 @@ void test_streamed_tpq_load_and_forward() {
     require(
         moe.uses_streamed_experts(),
         "DeepSeek-V4 MoE did not select streamed "
-        "TPQ residency");
+        "MFE residency");
     require(
         moe.uses_grouped_shared_projection(),
         "streamed DeepSeek-V4 shared projections "
@@ -2320,28 +2041,28 @@ void test_streamed_tpq_load_and_forward() {
         Shape{16, kHidden},
         Shape{16},
         8,
-        "16-row streamed TPQ");
+        "16-row streamed MFE");
     run_rows(
         35,
         Shape{35, kHidden},
         Shape{35},
         9,
-        "35-row streamed TPQ");
+        "35-row streamed MFE");
     run_rows(
         34,
         Shape{2, 17, kHidden},
         Shape{2, 17},
         10,
-        "batched streamed TPQ");
+        "batched streamed MFE");
 }
 
-void test_named_dspark_moe_reuses_streamed_tpq_cache() {
+void test_named_dspark_moe_reuses_streamed_cache() {
     auto fixture = make_model_fixture();
-    fixture.routed_gate_up = make_tpq_moe(
+    fixture.routed_gate_up = make_streamable_nint_moe(
         2 * kIntermediate,
         kHidden,
         71);
-    fixture.routed_down = make_tpq_moe(
+    fixture.routed_down = make_streamable_nint_moe(
         kHidden,
         kIntermediate,
         73);
@@ -2353,7 +2074,7 @@ void test_named_dspark_moe_reuses_streamed_tpq_cache() {
     }
     const TemporaryDeepseekMfq file(
         records,
-        "deepseek_v4-tpq-mfq");
+        "deepseek_v4-ew-mfq");
     const mfq::metal::MfqContainer model(file.path());
     auto residency = std::make_shared<
         mfq::metal::MlxMfeOffloadCache>(
@@ -2396,122 +2117,6 @@ void test_named_dspark_moe_reuses_streamed_tpq_cache() {
         3e-2f);
 }
 
-void test_streamed_router_availability_intersection() {
-    constexpr std::array<bool, kExperts> gate_available{
-        true,
-        true,
-        true,
-        false,
-    };
-    constexpr std::array<bool, kExperts> down_available{
-        false,
-        true,
-        true,
-        true,
-    };
-    constexpr std::array<bool, kExperts> intersection{
-        false,
-        true,
-        true,
-        false,
-    };
-    constexpr std::array<bool, kExperts> requested{
-        true,
-        true,
-        true,
-        true,
-    };
-
-    auto fixture = make_model_fixture();
-    fixture.routed_gate_up =
-        make_tpq_moe(
-            2 * kIntermediate,
-            kHidden,
-            53,
-            gate_available);
-    fixture.routed_down =
-        make_tpq_moe(
-            kHidden,
-            kIntermediate,
-            61,
-            down_available);
-    const TemporaryDeepseekMfq file(
-        streamed_router_model_records(
-            fixture,
-            kBias));
-    const mfq::metal::MfqContainer model(
-        file.path());
-    auto residency =
-        std::make_shared<
-            mfq::metal::
-                MlxTpqExpertResidency>(
-            model,
-            0,
-            kExperts);
-    auto config = test_config(true);
-    config.n_hash_layers = 0;
-    config.validate();
-    auto moe = MlxDeepseekV4Moe::load(
-        model,
-        config,
-        0,
-        availability_array(requested),
-        residency);
-    require(
-        moe.uses_streamed_experts(),
-        "ordinary router did not retain streamed "
-        "TPQ experts");
-
-    constexpr int rows = 7;
-    const auto input = input_values(rows, 17);
-    std::vector<std::int32_t> tokens(rows);
-    for (int row = 0; row < rows; ++row) {
-        tokens[
-            static_cast<std::size_t>(
-                row)] =
-            row % kVocab;
-    }
-    const auto expected = reference(
-        fixture,
-        config,
-        input,
-        rows,
-        tokens,
-        kBias,
-        std::nullopt,
-        intersection);
-    auto actual = moe.forward_with_routing(
-        array(
-            input.begin(),
-            Shape{rows, kHidden}),
-        array(
-            tokens.begin(),
-            Shape{rows}));
-    const auto ids =
-        evaluated_ids(actual.expert_ids);
-    bool selected_one = false;
-    bool selected_two = false;
-    for (const auto expert : ids) {
-        require(
-            expert == 1 || expert == 2,
-            "ordinary router selected an expert "
-            "outside the gate/down availability "
-            "intersection");
-        selected_one = selected_one ||
-            expert == 1;
-        selected_two = selected_two ||
-            expert == 2;
-    }
-    require(
-        selected_one && selected_two,
-        "ordinary router did not exercise both "
-        "experts in the gate/down intersection");
-    compare(
-        std::move(actual),
-        expected,
-        3e-2f);
-}
-
 void test_availability_validation(
     const ModelFixture& fixture) {
     bool rejected = false;
@@ -2542,15 +2147,13 @@ int main() {
         test_visual_tokens_use_visual_router_bias(fixture);
         test_split_gate_up_eager_load_and_forward();
         test_split_gate_up_mfe_offload_load_and_forward();
-        test_split_gate_up_streamed_load_and_forward();
         test_split_gate_up_requires_pair();
-        test_streamed_tpq_load_and_forward();
-        test_named_dspark_moe_reuses_streamed_tpq_cache();
-        test_streamed_router_availability_intersection();
+        test_streamed_mfe_load_and_forward();
+        test_named_dspark_moe_reuses_streamed_cache();
         test_availability_validation(fixture);
         std::cout
             << "MFQ native DeepSeek-V4 heterogeneous/"
-               "streamed TPQ MoE Metal tests passed\n";
+               "streamed MFE MoE Metal tests passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr

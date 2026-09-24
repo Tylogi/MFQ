@@ -1852,7 +1852,7 @@ __device__ __forceinline__ int aligned_group_dot_preloaded_e8_stage3(
         x0, x1, x2, state);
 }
 
-// TPQ5-style decode geometry: every warp owns several output rows and reuses
+// Decode geometry: every warp owns several output rows and reuses
 // the same quantized activation values across those rows.  The compact D4
 // tables fit in shared memory and are staged once per CTA; the 128 KiB E8
 // tables remain in the read-only cache path.

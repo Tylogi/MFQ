@@ -173,7 +173,6 @@ private:
     std::string streamed_gate_name_;
     std::string streamed_up_name_;
     std::string streamed_down_name_;
-    bool legacy_tpq_stream_ = false;
     std::optional<MlxProjectionBatch> projection_batch_;
     std::optional<MlxProjectionBatch> shared_gate_up_batch_;
     bool fused_shared_swiglu_ = true;

@@ -2076,113 +2076,6 @@ constexpr const char* kMoeSource = R"METAL(
     }
 )METAL";
 
-constexpr int kTpqDescriptorSize = 5;
-constexpr int kTpqBits = 0;
-constexpr int kTpqIndexOffset = 1;
-constexpr int kTpqCodebookOffset = 2;
-constexpr int kTpqVectorSize = 3;
-constexpr int kTpqBlocks = 4;
-
-constexpr const char* kTpqMoeHeader = R"METAL(
-inline uint mfq_tpq_moe_read_index(
-    device const uchar* indices,
-    uint byte_base,
-    uint value_index,
-    uint bits
-) {
-    uint residual_bits = (value_index & 7u) * bits;
-    uint byte_offset = byte_base
-        + (value_index >> 3) * bits
-        + (residual_bits >> 3);
-    uint shift = residual_bits & 7u;
-    uint packed =
-        uint(indices[byte_offset])
-        | (uint(indices[byte_offset + 1u]) << 8u)
-        | (uint(indices[byte_offset + 2u]) << 16u);
-    return (packed >> shift)
-        & ((1u << bits) - 1u);
-}
-)METAL";
-
-constexpr const char* kTpqMoeSource = R"METAL(
-    uint lane = thread_index_in_simdgroup;
-    uint task = threadgroup_position_in_grid.x;
-    uint output = task % uint(OUT);
-    uint pair = task / uint(OUT);
-    uint route = pair % uint(ROUTES);
-    uint token = pair / uint(ROUTES);
-    if (token >= uint(TOKENS)) {
-        return;
-    }
-
-    int expert =
-        int(expert_ids[token * uint(ROUTES) + route]);
-    uint destination = pair * uint(OUT) + output;
-    if (expert < 0 || expert >= int(EXPERTS)) {
-        if (lane == 0u) {
-            y[destination] = T(0.0f);
-        }
-        return;
-    }
-    uint descriptor_base =
-        uint(expert) * uint(DESCRIPTOR_SIZE);
-    uint bits =
-        uint(descriptors[descriptor_base]);
-    if (bits == 0u) {
-        if (lane == 0u) {
-            y[destination] = T(0.0f);
-        }
-        return;
-    }
-    uint index_offset =
-        uint(descriptors[descriptor_base + 1u]);
-    uint codebook_offset =
-        uint(descriptors[descriptor_base + 2u]);
-    uint vector_size =
-        uint(descriptors[descriptor_base + 3u]);
-    uint blocks =
-        uint(descriptors[descriptor_base + 4u]);
-    uint input_base = (
-        uint(SHARED_INPUT) != 0u
-            ? token
-            : token * uint(ROUTES) + route
-    ) * uint(K);
-    uint row_base = output * blocks;
-    float accumulator = 0.0f;
-    for (
-        uint block = lane;
-        block < blocks;
-        block += 32u
-    ) {
-        uint code = mfq_tpq_moe_read_index(
-            indices,
-            index_offset,
-            row_base + block,
-            bits);
-        uint code_base =
-            codebook_offset + code * vector_size;
-        uint column_base = block * vector_size;
-        for (
-            uint component = 0u;
-            component < vector_size;
-            ++component
-        ) {
-            accumulator = fma(
-                float(x[
-                    input_base
-                    + column_base
-                    + component]),
-                float(codebooks[
-                    code_base + component]),
-                accumulator);
-        }
-    }
-    accumulator = simd_sum(accumulator);
-    if (lane == 0u) {
-        y[destination] = T(accumulator);
-    }
-)METAL";
-
 constexpr const char* kMoeHadamardSource = R"METAL(
     uint row = thread_position_in_grid.x / 256u;
     uint lane = thread_index_in_threadgroup;
@@ -4103,30 +3996,6 @@ moe_kernel() {
     return kernel;
 }
 
-const mlx::core::fast::CustomKernelFunction&
-tpq_moe_kernel() {
-    static const auto kernel = [] {
-        CompileOptions options;
-        options.math_mode = MathMode::Fast;
-        return mlx::core::fast::metal_kernel(
-            "mfq_cpp_streamed_tpq_moe",
-            {
-                "descriptors",
-                "indices",
-                "codebooks",
-                "x",
-                "expert_ids",
-            },
-            {"y"},
-            kTpqMoeSource,
-            kTpqMoeHeader,
-            true,
-            false,
-            options);
-    }();
-    return kernel;
-}
-
 mlx::core::fast::CustomKernelFunction
 make_moe_hadamard_kernel() {
     CompileOptions options;
@@ -5473,57 +5342,6 @@ std::int32_t descriptor_u32_with_offset(
         name);
 }
 
-class TpqStreamUnsupported final
-    : public std::runtime_error {
-public:
-    using std::runtime_error::runtime_error;
-};
-
-struct TpqTierLayout {
-    int tier = 0;
-    int vector_size = 0;
-    int entries = 0;
-};
-
-TpqTierLayout tpq_tier_layout(
-    std::string_view dtype) {
-    if (dtype == "TPQ-X") {
-        return {1, 8, 256};
-    }
-    if (dtype == "TPQ-W") {
-        return {2, 8, 4096};
-    }
-    if (dtype == "TPQ-V") {
-        return {3, 4, 256};
-    }
-    if (dtype == "TPQ-VV") {
-        return {4, 4, 4096};
-    }
-    if (dtype.rfind("TPQ-", 0) == 0) {
-        throw std::runtime_error(
-            "unsupported streamed TPQ cohort "
-            "dtype: " + std::string(dtype));
-    }
-    throw TpqStreamUnsupported(
-        "MFE contains a non-TPQ cohort");
-}
-
-bool tpq_index_layout_allowed(
-    int entries,
-    int bits) {
-    if (entries == 256) {
-        return bits == 8
-            || bits == 12
-            || bits == 14;
-    }
-    if (entries == 4096) {
-        return bits == 12
-            || bits == 14
-            || bits == 16;
-    }
-    return false;
-}
-
 std::uint64_t checked_range_add(
     std::uint64_t left,
     std::uint64_t right,
@@ -5534,7 +5352,7 @@ std::uint64_t checked_range_add(
             - right
     ) {
         throw std::runtime_error(
-            std::string("TPQ ") + name
+            std::string("streamed MFE ") + name
             + " overflows");
     }
     return left + right;
@@ -5551,14 +5369,14 @@ std::uint64_t checked_range_product(
                 / left
     ) {
         throw std::runtime_error(
-            std::string("TPQ ") + name
+            std::string("streamed MFE ") + name
             + " overflows");
     }
     return left * right;
 }
 
 template <typename T>
-T tpq_scalar(
+T read_scalar(
     const std::vector<std::uint8_t>& bytes,
     std::size_t offset,
     const char* name) {
@@ -5567,7 +5385,7 @@ T tpq_scalar(
         || sizeof(T) > bytes.size() - offset
     ) {
         throw std::runtime_error(
-            std::string("truncated TPQ ") + name);
+            std::string("truncated streamed MFE ") + name);
     }
     T value{};
     std::memcpy(
@@ -5577,7 +5395,7 @@ T tpq_scalar(
     return value;
 }
 
-std::string tpq_ascii(
+std::string read_ascii(
     const std::vector<std::uint8_t>& bytes,
     std::size_t offset,
     std::size_t count,
@@ -5587,7 +5405,7 @@ std::string tpq_ascii(
         || count > bytes.size() - offset
     ) {
         throw std::runtime_error(
-            std::string("truncated TPQ ") + name);
+            std::string("truncated streamed MFE ") + name);
     }
     const auto begin =
         bytes.begin()
@@ -5603,7 +5421,7 @@ std::string tpq_ascii(
             })
     ) {
         throw std::runtime_error(
-            std::string("TPQ ") + name
+            std::string("streamed MFE ") + name
             + " is not ASCII");
     }
     return {
@@ -5613,103 +5431,7 @@ std::string tpq_ascii(
     };
 }
 
-array make_tpq_codebook(
-    const std::vector<std::uint8_t>& bytes,
-    int entries,
-    int vector_size,
-    const std::string& name) {
-    const auto elements = checked_product(
-        static_cast<std::size_t>(entries),
-        static_cast<std::size_t>(vector_size),
-        "TPQ codebook elements");
-    if (
-        bytes.size()
-        != checked_product(
-            elements,
-            sizeof(float),
-            "TPQ codebook bytes")
-    ) {
-        throw std::runtime_error(
-            "TPQ codebook byte count mismatch: "
-            + name);
-    }
-    std::vector<float> values(elements);
-    if (!values.empty()) {
-        std::memcpy(
-            values.data(),
-            bytes.data(),
-            bytes.size());
-    }
-    if (
-        std::any_of(
-            values.begin(),
-            values.end(),
-            [](float value) {
-                return !std::isfinite(value);
-            })
-    ) {
-        throw std::runtime_error(
-            "TPQ codebook contains non-finite values: "
-            + name);
-    }
-    const array source(
-        values.begin(),
-        Shape{checked_int(
-            elements,
-            "TPQ codebook elements")});
-    return mlx::core::contiguous(
-        mlx::core::astype(
-            source,
-            mlx::core::float16));
-}
-
-struct TpqStreamPool {
-    std::string dtype;
-    int vector_size = 0;
-    int entries = 0;
-    int index_bits = 0;
-    int rows_per_expert = 0;
-    int columns = 0;
-    int blocks = 0;
-    int expert_count = 0;
-    int codebook_offset = 0;
-    std::uint64_t indices_offset = 0;
-    std::size_t indices_per_expert = 0;
-};
-
-struct TpqExpertLocation {
-    std::shared_ptr<const TpqStreamPool> pool;
-    int local_expert = 0;
-};
-
-struct TpqStreamProjection {
-    TpqStreamProjection(
-        int expert_count,
-        int output_width,
-        int input_width,
-        array tables,
-        std::size_t table_bytes,
-        std::vector<
-            std::optional<TpqExpertLocation>>
-            locations)
-        : experts(expert_count),
-          out_per_expert(output_width),
-          neuron_len(input_width),
-          codebooks(std::move(tables)),
-          codebook_nbytes(table_bytes),
-          experts_by_id(std::move(locations)) {}
-
-    int experts = 0;
-    int out_per_expert = 0;
-    int neuron_len = 0;
-    array codebooks;
-    std::size_t codebook_nbytes = 0;
-    std::vector<
-        std::optional<TpqExpertLocation>>
-        experts_by_id;
-};
-
-std::uint32_t tpq_read_packed(
+std::uint32_t read_packed(
     const std::vector<std::uint8_t>& bytes,
     std::size_t bit_offset,
     int bits) {
@@ -5731,7 +5453,7 @@ std::uint32_t tpq_read_packed(
     ) & ((std::uint32_t{1} << bits) - 1u);
 }
 
-void tpq_write_packed(
+void write_packed(
     std::vector<std::uint8_t>& bytes,
     std::size_t value_index,
     int bits,
@@ -5750,23 +5472,6 @@ void tpq_write_packed(
                 1u << (target & 7));
     }
 }
-
-struct TpqCachedExpert {
-    TpqCachedExpert(
-        std::int32_t global,
-        std::shared_ptr<const TpqStreamPool> source,
-        array packed,
-        std::size_t bytes)
-        : expert(global),
-          pool(std::move(source)),
-          indices(std::move(packed)),
-          packed_nbytes(bytes) {}
-
-    std::int32_t expert = 0;
-    std::shared_ptr<const TpqStreamPool> pool;
-    array indices;
-    std::size_t packed_nbytes = 0;
-};
 
 class MfeStreamUnsupported final
     : public std::runtime_error {
@@ -5803,7 +5508,7 @@ std::vector<std::uint8_t> unpack_small_selectors(
     const char* name) {
     std::vector<std::uint8_t> result(count);
     for (std::size_t index = 0; index < count; ++index) {
-        const auto value = tpq_read_packed(
+        const auto value = read_packed(
             packed,
             index * static_cast<std::size_t>(bits),
             bits);
@@ -5823,7 +5528,7 @@ std::vector<std::uint8_t> pack_small_selectors(
         checked_packed_size(values.size(), bits, "selector bytes"),
         0);
     for (std::size_t index = 0; index < values.size(); ++index) {
-        tpq_write_packed(result, index, bits, values[index]);
+        write_packed(result, index, bits, values[index]);
     }
     return result;
 }
@@ -5872,11 +5577,11 @@ std::vector<std::uint8_t> read_packed_value_slice(
         checked_packed_size(value_count, bits, "streamed packed slice"),
         0);
     for (std::size_t index = 0; index < value_count; ++index) {
-        tpq_write_packed(
+        write_packed(
             result,
             index,
             bits,
-            tpq_read_packed(
+            read_packed(
                 raw,
                 shift + index * static_cast<std::size_t>(bits),
                 bits));
@@ -5984,21 +5689,21 @@ MfeNintStreamLayout parse_streamed_nint_layout(
         name, payload_offset, kHeaderBytes);
     const int raw_bits = header[0];
     const int nominal_sub_bits = header[1];
-    const auto group_size = tpq_scalar<std::int32_t>(
+    const auto group_size = read_scalar<std::int32_t>(
         header, 2, "NINT group size");
-    const auto axis = tpq_scalar<std::int32_t>(
+    const auto axis = read_scalar<std::int32_t>(
         header, 6, "NINT axis");
-    const auto columns = tpq_scalar<std::int32_t>(
+    const auto columns = read_scalar<std::int32_t>(
         header, 10, "NINT width");
-    const auto dimensions = tpq_scalar<std::uint32_t>(
+    const auto dimensions = read_scalar<std::uint32_t>(
         header, 14, "NINT dimensions");
-    const auto shape_rows = tpq_scalar<std::int64_t>(
+    const auto shape_rows = read_scalar<std::int64_t>(
         header, 18, "NINT rows");
-    const auto shape_columns = tpq_scalar<std::int64_t>(
+    const auto shape_columns = read_scalar<std::int64_t>(
         header, 26, "NINT columns");
-    const auto rows = tpq_scalar<std::uint32_t>(
+    const auto rows = read_scalar<std::uint32_t>(
         header, 34, "NINT output size");
-    const auto groups = tpq_scalar<std::uint32_t>(
+    const auto groups = read_scalar<std::uint32_t>(
         header, 38, "NINT group count");
     const bool adaptive_storage = (raw_bits & 0x80) != 0;
     const int q_bits = raw_bits & 0x7f;
@@ -6162,19 +5867,19 @@ MfeNvqJscStreamLayout parse_streamed_nvq_jsc_layout(
     const int profile_flags = header[4];
     const int profile = profile_flags & ~(0x80 | 0x40 | 0x20);
     const int state_bits = header[5];
-    const auto group_size = tpq_scalar<std::uint16_t>(
+    const auto group_size = read_scalar<std::uint16_t>(
         header, 6, "NVQ group size");
-    const auto axis = tpq_scalar<std::int32_t>(
+    const auto axis = read_scalar<std::int32_t>(
         header, 8, "NVQ axis");
-    const auto columns = tpq_scalar<std::int32_t>(
+    const auto columns = read_scalar<std::int32_t>(
         header, 12, "NVQ width");
-    const auto dimensions = tpq_scalar<std::uint32_t>(
+    const auto dimensions = read_scalar<std::uint32_t>(
         header, 16, "NVQ dimensions");
-    const auto shape_rows = tpq_scalar<std::int64_t>(
+    const auto shape_rows = read_scalar<std::int64_t>(
         header, 20, "NVQ rows");
-    const auto shape_columns = tpq_scalar<std::int64_t>(
+    const auto shape_columns = read_scalar<std::int64_t>(
         header, 28, "NVQ columns");
-    const auto rows = tpq_scalar<std::uint32_t>(
+    const auto rows = read_scalar<std::uint32_t>(
         header, 36, "NVQ output size");
     const int vector_size = profile == 1 || profile == 4 || profile == 5
         ? 8 : profile == 2 || profile == 3 || profile == 6 ? 4 : 0;
@@ -6283,17 +5988,17 @@ MfeMxStreamLayout parse_streamed_mx_layout(
         reinterpret_cast<const char*>(header.data()), 4);
     const int version = header[4];
     const int bits = header[5];
-    const auto reserved = tpq_scalar<std::uint16_t>(
+    const auto reserved = read_scalar<std::uint16_t>(
         header, 6, "MX reserved");
-    const auto rows = tpq_scalar<std::uint64_t>(header, 8, "MX rows");
-    const auto columns = tpq_scalar<std::uint64_t>(header, 16, "MX columns");
-    const auto storage_rows = tpq_scalar<std::uint64_t>(
+    const auto rows = read_scalar<std::uint64_t>(header, 8, "MX rows");
+    const auto columns = read_scalar<std::uint64_t>(header, 16, "MX columns");
+    const auto storage_rows = read_scalar<std::uint64_t>(
         header, 24, "MX storage rows");
-    const auto storage_columns = tpq_scalar<std::uint64_t>(
+    const auto storage_columns = read_scalar<std::uint64_t>(
         header, 32, "MX storage columns");
-    const auto scale_rows = tpq_scalar<std::uint64_t>(
+    const auto scale_rows = read_scalar<std::uint64_t>(
         header, 40, "MX scale rows");
-    const auto scale_columns = tpq_scalar<std::uint64_t>(
+    const auto scale_columns = read_scalar<std::uint64_t>(
         header, 48, "MX scale columns");
     const auto expected_storage_columns = expected_bits == 4
         ? static_cast<std::uint64_t>(expected_columns / 2)
@@ -6608,35 +6313,6 @@ std::vector<std::uint8_t> slice_streamed_mfe_expert_payload(
 
 } // namespace
 
-struct MlxTpqRoutedWeight::Impl {
-    Impl(
-        array descriptor_array,
-        array index_array,
-        array codebook_array,
-        int expert_count,
-        int output_width,
-        int input_width,
-        std::size_t active_bytes,
-        std::size_t table_bytes)
-        : descriptors(std::move(descriptor_array)),
-          indices(std::move(index_array)),
-          codebooks(std::move(codebook_array)),
-          experts(expert_count),
-          out_per_expert(output_width),
-          neuron_len(input_width),
-          packed_bytes(active_bytes),
-          codebook_bytes(table_bytes) {}
-
-    array descriptors;
-    array indices;
-    array codebooks;
-    int experts = 0;
-    int out_per_expert = 0;
-    int neuron_len = 0;
-    std::size_t packed_bytes = 0;
-    std::size_t codebook_bytes = 0;
-};
-
 struct MlxMfeOffloadCache::Impl {
     struct Key {
         std::string name;
@@ -6667,12 +6343,6 @@ struct MlxMfeOffloadCache::Impl {
         }
     };
 
-    struct CacheValue {
-        Key key;
-        std::shared_ptr<const TpqCachedExpert>
-            weight;
-    };
-
     struct MfeCachedExpert {
         MfeCachedExpert(
             std::int32_t global,
@@ -6691,15 +6361,6 @@ struct MlxMfeOffloadCache::Impl {
         std::shared_ptr<const MfeCachedExpert> weight;
     };
 
-    using Lru = std::list<CacheValue>;
-    using ProjectionCache = std::unordered_map<
-        std::string,
-        std::shared_ptr<
-            const TpqStreamProjection>>;
-    using ExpertCache = std::unordered_map<
-        Key,
-        Lru::iterator,
-        KeyHash>;
     using MfeProjectionCache = std::unordered_map<
         std::string,
         std::shared_ptr<const MfeStreamProjection>>;
@@ -6747,13 +6408,13 @@ struct MlxMfeOffloadCache::Impl {
             throw std::runtime_error(
                 "invalid streamed MFE magic: " + name);
         }
-        const auto record_experts = tpq_scalar<std::uint32_t>(
+        const auto record_experts = read_scalar<std::uint32_t>(
             header, 4, "MFE expert count");
-        const auto rows_per_expert = tpq_scalar<std::uint32_t>(
+        const auto rows_per_expert = read_scalar<std::uint32_t>(
             header, 8, "MFE output width");
-        const auto columns = tpq_scalar<std::uint32_t>(
+        const auto columns = read_scalar<std::uint32_t>(
             header, 12, "MFE input width");
-        const auto pool_count = tpq_scalar<std::uint32_t>(
+        const auto pool_count = read_scalar<std::uint32_t>(
             header, 16, "MFE pool count");
         if (record_experts == 0
             || record_experts > static_cast<std::uint32_t>(
@@ -6784,13 +6445,13 @@ struct MlxMfeOffloadCache::Impl {
             }
             const auto pool_header = model.read_range(
                 name, offset, pool_header_size);
-            const auto pool_experts = tpq_scalar<std::uint32_t>(
+            const auto pool_experts = read_scalar<std::uint32_t>(
                 pool_header, 0, "MFE pool expert count");
-            const auto dtype_bytes = tpq_scalar<std::uint32_t>(
+            const auto dtype_bytes = read_scalar<std::uint32_t>(
                 pool_header, 4, "MFE pool dtype length");
-            const auto payload_bytes = tpq_scalar<std::uint64_t>(
+            const auto payload_bytes = read_scalar<std::uint64_t>(
                 pool_header, 8, "MFE pool payload length");
-            const auto runtime_bytes = tpq_scalar<std::uint64_t>(
+            const auto runtime_bytes = read_scalar<std::uint64_t>(
                 pool_header, 16, "MFE pool runtime length");
             if (pool_experts == 0 || pool_experts > record_experts
                 || dtype_bytes == 0 || dtype_bytes > 32) {
@@ -6815,7 +6476,7 @@ struct MlxMfeOffloadCache::Impl {
             }
             const auto metadata = model.read_range(
                 name, offset, metadata_bytes);
-            const auto dtype = tpq_ascii(
+            const auto dtype = read_ascii(
                 metadata,
                 static_cast<std::size_t>(ids_bytes),
                 dtype_bytes,
@@ -6871,7 +6532,7 @@ struct MlxMfeOffloadCache::Impl {
             pool->payload_bytes = payload_bytes;
             pool->layout = std::move(layout);
             for (std::uint32_t local = 0; local < pool_experts; ++local) {
-                const auto expert = tpq_scalar<std::int32_t>(
+                const auto expert = read_scalar<std::int32_t>(
                     metadata,
                     static_cast<std::size_t>(local) * sizeof(std::int32_t),
                     "MFE global expert ID");
@@ -6964,609 +6625,12 @@ struct MlxMfeOffloadCache::Impl {
         return blob;
     }
 
-    std::shared_ptr<const TpqStreamProjection>
-    parse_projection(
-        const std::string& name) {
-        const auto& record = model.record(name);
-        if (record.dtype != "MFE") {
-            throw TpqStreamUnsupported(
-                "expert record is not MFE: "
-                + name);
-        }
-        constexpr std::uint64_t header_size = 20;
-        constexpr std::uint64_t pool_header_size = 24;
-        constexpr std::uint64_t pq_prefix_size = 44;
-        if (record.nbytes < header_size) {
-            throw std::runtime_error(
-                "truncated streamed MFE header: "
-                + name);
-        }
-        const auto header =
-            model.read_range(
-                name,
-                0,
-                header_size);
-        const std::string_view magic(
-            reinterpret_cast<const char*>(
-                header.data()),
-            4);
-        if (magic == "NIM1") {
-            throw TpqStreamUnsupported(
-                "NIM1 expert records are not "
-                "streamable");
-        }
-        if (magic != "MFE1" && magic != "NIM2") {
-            throw std::runtime_error(
-                "invalid streamed MFE magic: "
-                + name);
-        }
-        const auto record_experts =
-            tpq_scalar<std::uint32_t>(
-                header,
-                4,
-                "MFE expert count");
-        const auto rows_per_expert =
-            tpq_scalar<std::uint32_t>(
-                header,
-                8,
-                "MFE output width");
-        const auto columns =
-            tpq_scalar<std::uint32_t>(
-                header,
-                12,
-                "MFE input width");
-        const auto pool_count =
-            tpq_scalar<std::uint32_t>(
-                header,
-                16,
-                "MFE pool count");
-        if (
-            record_experts == 0
-            || record_experts
-                > static_cast<std::uint32_t>(
-                    std::numeric_limits<int>::max())
-            || (experts > 0
-                && record_experts
-                    != static_cast<std::uint32_t>(experts))
-            || rows_per_expert == 0
-            || columns == 0
-            || rows_per_expert
-                > static_cast<std::uint32_t>(
-                    std::numeric_limits<int>::max())
-            || columns
-                > static_cast<std::uint32_t>(
-                    std::numeric_limits<int>::max())
-            || pool_count == 0
-            || pool_count > record_experts
-        ) {
-            throw std::runtime_error(
-                "invalid streamed MFE dimensions: "
-                + name);
-        }
-        const int projection_experts =
-            static_cast<int>(record_experts);
-
-        std::vector<
-            std::optional<TpqExpertLocation>>
-            locations(
-                static_cast<std::size_t>(projection_experts));
-        std::vector<array> codebooks;
-        codebooks.reserve(pool_count);
-        std::size_t codebook_elements = 0;
-        std::uint64_t offset = header_size;
-
-        for (
-            std::uint32_t pool_index = 0;
-            pool_index < pool_count;
-            ++pool_index
-        ) {
-            if (
-                offset > record.nbytes
-                || pool_header_size
-                    > record.nbytes - offset
-            ) {
-                throw std::runtime_error(
-                    "truncated streamed MFE pool "
-                    "header: " + name);
-            }
-            const auto pool_header =
-                model.read_range(
-                    name,
-                    offset,
-                    pool_header_size);
-            const auto pool_experts =
-                tpq_scalar<std::uint32_t>(
-                    pool_header,
-                    0,
-                    "pool expert count");
-            const auto dtype_bytes =
-                tpq_scalar<std::uint32_t>(
-                    pool_header,
-                    4,
-                    "pool dtype length");
-            const auto payload_bytes =
-                tpq_scalar<std::uint64_t>(
-                    pool_header,
-                    8,
-                    "pool payload length");
-            const auto runtime_bytes =
-                tpq_scalar<std::uint64_t>(
-                    pool_header,
-                    16,
-                    "pool runtime length");
-            if (
-                pool_experts == 0
-                || pool_experts > record_experts
-                || dtype_bytes == 0
-                || dtype_bytes > 32
-            ) {
-                throw std::runtime_error(
-                    "invalid streamed MFE pool "
-                    "metadata: " + name);
-            }
-            offset = checked_range_add(
-                offset,
-                pool_header_size,
-                "pool offset");
-            const auto ids_bytes =
-                checked_range_product(
-                    pool_experts,
-                    sizeof(std::int32_t),
-                    "expert ID bytes");
-            const auto metadata_bytes =
-                checked_range_add(
-                    ids_bytes,
-                    dtype_bytes,
-                    "pool metadata bytes");
-            const auto metadata_end =
-                checked_range_add(
-                    offset,
-                    metadata_bytes,
-                    "pool metadata end");
-            const auto payload_start =
-                checked_range_add(
-                    metadata_end,
-                    runtime_bytes,
-                    "pool payload offset");
-            const auto payload_end =
-                checked_range_add(
-                    payload_start,
-                    payload_bytes,
-                    "pool payload end");
-            if (payload_end > record.nbytes) {
-                throw std::runtime_error(
-                    "truncated streamed MFE pool: "
-                    + name);
-            }
-            const auto metadata =
-                model.read_range(
-                    name,
-                    offset,
-                    metadata_bytes);
-            const auto dtype = tpq_ascii(
-                metadata,
-                static_cast<std::size_t>(
-                    ids_bytes),
-                dtype_bytes,
-                "pool dtype");
-            const auto layout =
-                tpq_tier_layout(dtype);
-            if (
-                runtime_bytes != 0
-                || payload_bytes < pq_prefix_size
-            ) {
-                throw std::runtime_error(
-                    "TPQ pool has invalid runtime/"
-                    "payload metadata: " + name);
-            }
-
-            const auto prefix =
-                model.read_range(
-                    name,
-                    payload_start,
-                    pq_prefix_size);
-            const std::string_view pq_magic(
-                reinterpret_cast<const char*>(
-                    prefix.data()),
-                4);
-            const int version =
-                prefix.at(4);
-            const int tier =
-                prefix.at(5);
-            const int vector_size =
-                prefix.at(6);
-            const int index_bits =
-                prefix.at(7);
-            const auto axis =
-                tpq_scalar<std::int32_t>(
-                    prefix,
-                    8,
-                    "PQ axis");
-            const auto neuron_len =
-                tpq_scalar<std::int32_t>(
-                    prefix,
-                    12,
-                    "PQ neuron length");
-            const auto dimensions =
-                tpq_scalar<std::uint32_t>(
-                    prefix,
-                    16,
-                    "PQ dimension count");
-            const auto entries =
-                tpq_scalar<std::uint32_t>(
-                    prefix,
-                    20,
-                    "PQ codebook entries");
-            const auto shape_rows =
-                tpq_scalar<std::int64_t>(
-                    prefix,
-                    24,
-                    "PQ row shape");
-            const auto shape_columns =
-                tpq_scalar<std::int64_t>(
-                    prefix,
-                    32,
-                    "PQ column shape");
-            const auto row_tail =
-                tpq_scalar<std::uint32_t>(
-                    prefix,
-                    40,
-                    "PQ row count");
-            const auto expected_rows =
-                checked_range_product(
-                    pool_experts,
-                    rows_per_expert,
-                    "PQ rows");
-            if (
-                pq_magic != "CPQ1"
-                || version != 1
-                || tier != layout.tier
-                || vector_size
-                    != layout.vector_size
-                || entries
-                    != static_cast<std::uint32_t>(
-                        layout.entries)
-                || !tpq_index_layout_allowed(
-                    layout.entries,
-                    index_bits)
-                || axis != 0
-                || neuron_len
-                    != static_cast<std::int32_t>(
-                        columns)
-                || dimensions != 2
-                || shape_rows
-                    != static_cast<std::int64_t>(
-                        expected_rows)
-                || shape_columns
-                    != static_cast<std::int64_t>(
-                        columns)
-                || row_tail != expected_rows
-                || columns
-                    % static_cast<std::uint32_t>(
-                        vector_size)
-                    != 0
-            ) {
-                throw std::runtime_error(
-                    "inconsistent streamed TPQ pool "
-                    "header: " + name);
-            }
-            const int blocks =
-                static_cast<int>(columns)
-                / vector_size;
-            const auto table_elements =
-                checked_range_product(
-                    entries,
-                    vector_size,
-                    "codebook elements");
-            const auto table_bytes =
-                checked_range_product(
-                    table_elements,
-                    sizeof(float),
-                    "codebook bytes");
-            const auto index_count =
-                checked_range_product(
-                    expected_rows,
-                    static_cast<std::uint64_t>(
-                        blocks),
-                    "index count");
-            const auto index_bits_total =
-                checked_range_product(
-                    index_count,
-                    static_cast<std::uint64_t>(
-                        index_bits),
-                    "index bits");
-            const auto index_bytes =
-                checked_range_add(
-                    index_bits_total,
-                    7,
-                    "index rounding")
-                / 8;
-            const auto expected_payload =
-                checked_range_add(
-                    checked_range_add(
-                        pq_prefix_size,
-                        table_bytes,
-                        "payload table end"),
-                    index_bytes,
-                    "payload index end");
-            if (payload_bytes != expected_payload) {
-                throw std::runtime_error(
-                    "streamed TPQ pool payload length "
-                    "mismatch: " + name);
-            }
-            const auto table_start =
-                checked_range_add(
-                    payload_start,
-                    pq_prefix_size,
-                    "codebook offset");
-            const auto index_start =
-                checked_range_add(
-                    table_start,
-                    table_bytes,
-                    "index offset");
-            const auto raw_table =
-                model.read_range(
-                    name,
-                    table_start,
-                    table_bytes);
-            codebooks.push_back(
-                make_tpq_codebook(
-                    raw_table,
-                    layout.entries,
-                    vector_size,
-                    name));
-            const auto table_offset =
-                checked_int(
-                    codebook_elements,
-                    "TPQ codebook offset");
-            codebook_elements = checked_add(
-                codebook_elements,
-                static_cast<std::size_t>(
-                    table_elements),
-                "TPQ codebook elements");
-
-            if (
-                index_bits_total % 8 != 0
-                && index_bytes != 0
-            ) {
-                const auto last =
-                    model.read_range(
-                        name,
-                        index_start
-                            + index_bytes - 1,
-                        1);
-                const unsigned used =
-                    static_cast<unsigned>(
-                        index_bits_total & 7u);
-                const auto padding_mask =
-                    static_cast<std::uint8_t>(
-                        0xffu << used);
-                if ((last.front() & padding_mask) != 0) {
-                    throw std::runtime_error(
-                        "streamed TPQ index padding is "
-                        "non-zero: " + name);
-                }
-            }
-
-            auto pool =
-                std::make_shared<TpqStreamPool>();
-            pool->dtype = dtype;
-            pool->vector_size = vector_size;
-            pool->entries = layout.entries;
-            pool->index_bits = index_bits;
-            pool->rows_per_expert =
-                static_cast<int>(
-                    rows_per_expert);
-            pool->columns =
-                static_cast<int>(columns);
-            pool->blocks = blocks;
-            pool->expert_count =
-                static_cast<int>(pool_experts);
-            pool->codebook_offset =
-                table_offset;
-            pool->indices_offset =
-                index_start;
-            pool->indices_per_expert =
-                checked_product(
-                    static_cast<std::size_t>(
-                        rows_per_expert),
-                    static_cast<std::size_t>(
-                        blocks),
-                    "TPQ expert index count");
-
-            for (
-                std::uint32_t local = 0;
-                local < pool_experts;
-                ++local
-            ) {
-                const auto expert =
-                    tpq_scalar<std::int32_t>(
-                        metadata,
-                        static_cast<std::size_t>(
-                            local)
-                            * sizeof(std::int32_t),
-                        "global expert ID");
-                if (
-                    expert < 0
-                    || expert >= projection_experts
-                    || locations[
-                        static_cast<std::size_t>(
-                            expert)].has_value()
-                ) {
-                    throw std::runtime_error(
-                        "invalid or duplicate streamed "
-                        "TPQ global expert ID: "
-                        + name);
-                }
-                locations[
-                    static_cast<std::size_t>(
-                        expert)] =
-                    TpqExpertLocation{
-                        pool,
-                        static_cast<int>(local),
-                    };
-            }
-            offset = payload_end;
-        }
-        if (offset != record.nbytes) {
-            throw std::runtime_error(
-                "invalid streamed MFE tail: "
-                + name);
-        }
-        array combined = codebooks.size() == 1
-            ? codebooks.front()
-            : mlx::core::contiguous(
-                mlx::core::concatenate(
-                    std::move(codebooks),
-                    0));
-        return std::make_shared<
-            TpqStreamProjection>(
-                projection_experts,
-                static_cast<int>(
-                    rows_per_expert),
-                static_cast<int>(columns),
-                std::move(combined),
-                checked_product(
-                    codebook_elements,
-                    sizeof(std::uint16_t),
-                    "resident TPQ codebook bytes"),
-                std::move(locations));
-    }
-
-    std::shared_ptr<const TpqStreamProjection>
-    projection_locked(
-        const std::string& name) {
-        const auto found =
-            projections.find(name);
-        if (found != projections.end()) {
-            return found->second;
-        }
-        auto result = parse_projection(name);
-        projections.emplace(name, result);
-        return result;
-    }
-
-    std::shared_ptr<const TpqCachedExpert>
-    load_expert(
-        const std::string& name,
-        std::int32_t expert,
-        const TpqExpertLocation& location) {
-        const auto& pool = *location.pool;
-        if (
-            location.local_expert < 0
-            || location.local_expert
-                >= pool.expert_count
-        ) {
-            throw std::runtime_error(
-                "streamed TPQ local expert is "
-                "out of range: " + name);
-        }
-        const auto expert_bits =
-            checked_range_product(
-                pool.indices_per_expert,
-                static_cast<std::uint64_t>(
-                    pool.index_bits),
-                "expert index bits");
-        const auto source_bit =
-            checked_range_product(
-                static_cast<std::uint64_t>(
-                    location.local_expert),
-                expert_bits,
-                "expert index offset");
-        const auto source_byte =
-            source_bit / 8;
-        const auto source_shift =
-            static_cast<std::size_t>(
-                source_bit & 7u);
-        const auto source_span_bits =
-            checked_range_add(
-                source_shift,
-                expert_bits,
-                "expert source bits");
-        const auto source_bytes =
-            checked_range_add(
-                source_span_bits,
-                7,
-                "expert source bytes")
-            / 8;
-        const auto raw = model.read_range(
-            name,
-            checked_range_add(
-                pool.indices_offset,
-                source_byte,
-                "expert file offset"),
-            source_bytes);
-        const auto packed_nbytes =
-            checked_range_add(
-                expert_bits,
-                7,
-                "expert packed bytes")
-            / 8;
-        if (
-            packed_nbytes
-            > static_cast<std::uint64_t>(
-                std::numeric_limits<
-                    std::size_t>::max())
-        ) {
-            throw std::runtime_error(
-                "streamed TPQ expert index stream "
-                "is too large: " + name);
-        }
-        std::vector<std::uint8_t> packed(
-            static_cast<std::size_t>(
-                packed_nbytes),
-            0);
-        for (
-            std::size_t index = 0;
-            index < pool.indices_per_expert;
-            ++index
-        ) {
-            const auto value =
-                tpq_read_packed(
-                    raw,
-                    source_shift
-                        + index
-                            * static_cast<
-                                std::size_t>(
-                                pool.index_bits),
-                    pool.index_bits);
-            if (
-                value
-                >= static_cast<std::uint32_t>(
-                    pool.entries)
-            ) {
-                throw std::runtime_error(
-                    "streamed TPQ expert references "
-                    "a missing codeword: " + name);
-            }
-            tpq_write_packed(
-                packed,
-                index,
-                pool.index_bits,
-                value);
-        }
-        auto indices =
-            make_raw_array(
-                std::move(packed),
-                mlx::core::uint8);
-        return std::make_shared<
-            TpqCachedExpert>(
-                expert,
-                location.pool,
-                std::move(indices),
-                static_cast<std::size_t>(
-                    packed_nbytes));
-    }
-
     // Own the record table and source paths.  Streamed layers frequently
     // outlive the MfqContainer object used by their load call.
     MfqContainer model;
     const std::size_t cache_limit = 0;
     const int experts = 0;
     mutable std::mutex mutex;
-    ProjectionCache projections;
-    Lru lru;
-    ExpertCache cache;
     std::unordered_map<
         std::string,
         std::shared_ptr<const MfeStreamProjection>> mfe_projections;
@@ -7574,150 +6638,6 @@ struct MlxMfeOffloadCache::Impl {
     MfeExpertCache mfe_cache;
     std::size_t resident_bytes = 0;
 };
-
-MlxTpqRoutedWeight::MlxTpqRoutedWeight(
-    std::shared_ptr<const Impl> impl)
-    : impl_(std::move(impl)) {
-    if (!impl_) {
-        throw std::invalid_argument(
-            "streamed TPQ implementation cannot "
-            "be null");
-    }
-}
-
-array MlxTpqRoutedWeight::routed_matmul(
-    const array& input,
-    const array& expert_ids) const {
-    auto ids = mlx::core::contiguous(
-        mlx::core::astype(
-            expert_ids,
-            mlx::core::int32));
-    if (ids.ndim() != 2) {
-        throw std::invalid_argument(
-            "streamed TPQ expert IDs must have "
-            "[tokens,routes] shape");
-    }
-    const int tokens = ids.shape(0);
-    const int routes = ids.shape(1);
-    const bool shared_input =
-        input.ndim() == 2
-        && input.shape(0) == tokens
-        && input.shape(1) == impl_->neuron_len;
-    if (
-        !shared_input
-        && (
-            input.ndim() != 3
-            || input.shape(0) != tokens
-            || input.shape(1) != routes
-            || input.shape(2)
-                != impl_->neuron_len
-        )
-    ) {
-        throw std::invalid_argument(
-            "streamed TPQ input must have "
-            "[tokens,K] or [tokens,routes,K] shape");
-    }
-    auto source = input;
-    if (
-        source.dtype() != mlx::core::float16
-        && source.dtype() != mlx::core::float32
-    ) {
-        source = mlx::core::astype(
-            source,
-            mlx::core::float16);
-    }
-    source = mlx::core::contiguous(source);
-    const Shape output_shape{
-        tokens,
-        routes,
-        impl_->out_per_expert,
-    };
-    if (tokens == 0 || routes == 0) {
-        return mlx::core::zeros(
-            output_shape,
-            source.dtype());
-    }
-    auto tasks = checked_product(
-        checked_product(
-            static_cast<std::size_t>(tokens),
-            static_cast<std::size_t>(routes),
-            "streamed TPQ route count"),
-        static_cast<std::size_t>(
-            impl_->out_per_expert),
-        "streamed TPQ task count");
-    const auto grid = checked_product(
-        tasks,
-        32,
-        "streamed TPQ Metal grid");
-    if (
-        grid
-        > static_cast<std::size_t>(
-            std::numeric_limits<int>::max())
-    ) {
-        throw std::runtime_error(
-            "streamed TPQ Metal grid exceeds "
-            "MLX limits");
-    }
-    auto outputs = tpq_moe_kernel()(
-        {
-            impl_->descriptors,
-            impl_->indices,
-            impl_->codebooks,
-            source,
-            ids,
-        },
-        {output_shape},
-        {source.dtype()},
-        {
-            static_cast<int>(grid),
-            1,
-            1,
-        },
-        {32, 1, 1},
-        {
-            {"T", source.dtype()},
-            {"TOKENS", tokens},
-            {"ROUTES", routes},
-            {"EXPERTS", impl_->experts},
-            {"OUT", impl_->out_per_expert},
-            {"K", impl_->neuron_len},
-            {
-                "DESCRIPTOR_SIZE",
-                kTpqDescriptorSize,
-            },
-            {
-                "SHARED_INPUT",
-                static_cast<int>(
-                    shared_input),
-            },
-        },
-        std::nullopt,
-        false,
-        {});
-    return std::move(outputs.front());
-}
-
-int MlxTpqRoutedWeight::experts() const noexcept {
-    return impl_->experts;
-}
-
-int MlxTpqRoutedWeight::out_per_expert() const noexcept {
-    return impl_->out_per_expert;
-}
-
-int MlxTpqRoutedWeight::neuron_len() const noexcept {
-    return impl_->neuron_len;
-}
-
-std::size_t
-MlxTpqRoutedWeight::packed_nbytes() const noexcept {
-    return impl_->packed_bytes;
-}
-
-std::size_t
-MlxTpqRoutedWeight::shared_codebook_nbytes() const noexcept {
-    return impl_->codebook_bytes;
-}
 
 MlxMfeOffloadCache::MlxMfeOffloadCache(
     const MfqContainer& model,
@@ -7735,15 +6655,10 @@ bool MlxMfeOffloadCache::can_offload(
     const std::string& name) {
     std::lock_guard lock(impl_->mutex);
     try {
-        (void)impl_->projection_locked(name);
+        (void)impl_->mfe_projection_locked(name);
         return true;
-    } catch (const TpqStreamUnsupported&) {
-        try {
-            (void)impl_->mfe_projection_locked(name);
-            return true;
-        } catch (const MfeStreamUnsupported&) {
-            return false;
-        }
+    } catch (const MfeStreamUnsupported&) {
+        return false;
     }
 }
 
@@ -7758,44 +6673,19 @@ bool MlxMfeOffloadCache::can_group_mfe(
     }
 }
 
-bool MlxMfeOffloadCache::is_legacy_tpq(
-    const std::string& name) {
-    std::lock_guard lock(impl_->mutex);
-    try {
-        (void)impl_->projection_locked(name);
-        return true;
-    } catch (const TpqStreamUnsupported&) {
-        return false;
-    }
-}
-
 MlxMfeProjectionInfo
 MlxMfeOffloadCache::projection_info(
     const std::string& name) {
     std::lock_guard lock(impl_->mutex);
+    const auto projection = impl_->mfe_projection_locked(name);
     MlxMfeProjectionInfo result;
-    try {
-        const auto projection = impl_->projection_locked(name);
-        result.experts = projection->experts;
-        result.out_per_expert = projection->out_per_expert;
-        result.neuron_len = projection->neuron_len;
-        result.shared_codebook_nbytes = projection->codebook_nbytes;
-        for (int expert = 0; expert < projection->experts; ++expert) {
-            if (projection->experts_by_id[
-                    static_cast<std::size_t>(expert)].has_value()) {
-                result.available_experts.push_back(expert);
-            }
-        }
-    } catch (const TpqStreamUnsupported&) {
-        const auto projection = impl_->mfe_projection_locked(name);
-        result.experts = projection->experts;
-        result.out_per_expert = projection->out_per_expert;
-        result.neuron_len = projection->neuron_len;
-        for (int expert = 0; expert < projection->experts; ++expert) {
-            if (projection->experts_by_id[
-                    static_cast<std::size_t>(expert)].has_value()) {
-                result.available_experts.push_back(expert);
-            }
+    result.experts = projection->experts;
+    result.out_per_expert = projection->out_per_expert;
+    result.neuron_len = projection->neuron_len;
+    for (int expert = 0; expert < projection->experts; ++expert) {
+        if (projection->experts_by_id[
+                static_cast<std::size_t>(expert)].has_value()) {
+            result.available_experts.push_back(expert);
         }
     }
     return result;
@@ -7805,315 +6695,14 @@ std::vector<std::uint8_t>
 MlxMfeOffloadCache::availability(
     const std::string& name) {
     std::lock_guard lock(impl_->mutex);
-    try {
-        const auto projection = impl_->projection_locked(name);
-        std::vector<std::uint8_t> result(
-            static_cast<std::size_t>(projection->experts), 0);
-        for (int expert = 0; expert < projection->experts; ++expert) {
-            result[static_cast<std::size_t>(expert)] =
-                static_cast<std::uint8_t>(projection->experts_by_id[
-                    static_cast<std::size_t>(expert)].has_value());
-        }
-        return result;
-    } catch (const TpqStreamUnsupported&) {
-        const auto projection = impl_->mfe_projection_locked(name);
-        std::vector<std::uint8_t> result(
-            static_cast<std::size_t>(projection->experts), 0);
-        for (int expert = 0; expert < projection->experts; ++expert) {
-            result[static_cast<std::size_t>(expert)] =
-                static_cast<std::uint8_t>(projection->experts_by_id[
-                    static_cast<std::size_t>(expert)].has_value());
-        }
-        return result;
+    const auto projection = impl_->mfe_projection_locked(name);
+    std::vector<std::uint8_t> result(
+        static_cast<std::size_t>(projection->experts), 0);
+    for (int expert = 0; expert < projection->experts; ++expert) {
+        result[static_cast<std::size_t>(expert)] =
+            static_cast<std::uint8_t>(projection->experts_by_id[
+                static_cast<std::size_t>(expert)].has_value());
     }
-}
-
-MlxTpqRoutedWeight
-MlxMfeOffloadCache::grouped(
-    const std::string& name,
-    const std::vector<std::int32_t>&
-        active_experts) {
-    std::lock_guard lock(impl_->mutex);
-    const auto parsed =
-        impl_->projections.find(name);
-    const bool projection_is_new =
-        parsed == impl_->projections.end();
-    const auto projection =
-        projection_is_new
-        ? impl_->parse_projection(name)
-        : parsed->second;
-
-    // Validate the entire active set before reading or staging a single
-    // expert.  In particular, a late invalid/unavailable ID must not touch
-    // the LRU position of an earlier cached ID.
-    std::vector<Impl::Key> ordered_keys;
-    ordered_keys.reserve(active_experts.size());
-    std::vector<std::shared_ptr<
-        const TpqCachedExpert>> active;
-    active.reserve(active_experts.size());
-    std::unordered_set<
-        Impl::Key,
-        Impl::KeyHash>
-        active_keys;
-    active_keys.reserve(active_experts.size());
-    for (const auto expert : active_experts) {
-        if (
-            expert < 0
-            || expert >= projection->experts
-        ) {
-            throw std::out_of_range(
-                "streamed TPQ global expert ID "
-                "is out of range");
-        }
-        const auto& location =
-            projection->experts_by_id[
-                static_cast<std::size_t>(
-                    expert)];
-        if (!location.has_value()) {
-            throw std::runtime_error(
-                "streamed TPQ global expert "
-                + std::to_string(expert)
-                + " is unavailable in " + name);
-        }
-        Impl::Key key{name, expert};
-        if (!active_keys.emplace(key).second) {
-            continue;
-        }
-        ordered_keys.push_back(std::move(key));
-    }
-
-    // New expert arrays and their map/list nodes live outside the residency
-    // until every fallible operation, including the returned MLX graph
-    // construction, has succeeded.
-    Impl::Lru staged_lru;
-    Impl::ExpertCache staged_cache;
-    staged_cache.reserve(ordered_keys.size());
-    std::size_t staged_bytes = 0;
-    for (const auto& key : ordered_keys) {
-        const auto cached =
-            impl_->cache.find(key);
-        if (cached != impl_->cache.end()) {
-            active.push_back(
-                cached->second->weight);
-            continue;
-        }
-        const auto& location =
-            projection->experts_by_id[
-                static_cast<std::size_t>(
-                    key.expert)];
-        auto weight = impl_->load_expert(
-            name,
-            key.expert,
-            *location);
-        staged_bytes = checked_add(
-            staged_bytes,
-            weight->packed_nbytes,
-            "staged TPQ packed bytes");
-        staged_lru.push_back({
-            key,
-            weight,
-        });
-        const auto inserted =
-            std::prev(staged_lru.end());
-        const auto cached_insert =
-            staged_cache.emplace(
-                inserted->key,
-                inserted);
-        if (!cached_insert.second) {
-            throw std::logic_error(
-                "duplicate staged TPQ expert");
-        }
-        active.push_back(std::move(weight));
-    }
-
-    std::vector<std::int32_t> descriptors(
-        checked_product(
-            static_cast<std::size_t>(
-                projection->experts),
-            static_cast<std::size_t>(
-                kTpqDescriptorSize),
-            "TPQ descriptor count"),
-        0);
-    std::vector<array> index_arrays;
-    index_arrays.reserve(active.size() + 1);
-    std::size_t index_offset = 0;
-    for (const auto& weight : active) {
-        const auto base = checked_product(
-            static_cast<std::size_t>(
-                weight->expert),
-            static_cast<std::size_t>(
-                kTpqDescriptorSize),
-            "TPQ descriptor offset");
-        descriptors[
-            base + kTpqBits] =
-            weight->pool->index_bits;
-        descriptors[
-            base + kTpqIndexOffset] =
-            checked_int(
-                index_offset,
-                "TPQ active index offset");
-        descriptors[
-            base + kTpqCodebookOffset] =
-            weight->pool->codebook_offset;
-        descriptors[
-            base + kTpqVectorSize] =
-            weight->pool->vector_size;
-        descriptors[
-            base + kTpqBlocks] =
-            weight->pool->blocks;
-        index_arrays.push_back(
-            weight->indices);
-        index_offset = checked_add(
-            index_offset,
-            weight->packed_nbytes,
-            "TPQ active index bytes");
-    }
-    // The bit reader may issue a three-byte load for the final value.
-    index_arrays.push_back(
-        mlx::core::zeros(
-            Shape{2},
-            mlx::core::uint8));
-    auto combined_indices =
-        mlx::core::contiguous(
-            mlx::core::concatenate(
-                std::move(index_arrays),
-                0));
-    auto descriptor_array =
-        make_int32_array(
-            descriptors,
-            Shape{
-                projection->experts,
-                kTpqDescriptorSize,
-            });
-    const auto packed_bytes = checked_add(
-        combined_indices.nbytes(),
-        descriptor_array.nbytes(),
-        "TPQ active packed bytes");
-    MlxTpqRoutedWeight result(
-        std::make_shared<
-            MlxTpqRoutedWeight::Impl>(
-                std::move(descriptor_array),
-                std::move(combined_indices),
-                projection->codebooks,
-                projection->experts,
-                projection->out_per_expert,
-                projection->neuron_len,
-                packed_bytes,
-                projection->codebook_nbytes));
-    auto committed_bytes = checked_add(
-        impl_->resident_bytes,
-        staged_bytes,
-        "resident TPQ packed bytes");
-
-    // Preallocate both destination hash tables before publishing any staged
-    // node.  reserve() may throw, but it cannot change the logical
-    // cache/LRU/resident-byte state.
-    impl_->cache.reserve(
-        checked_add(
-            impl_->cache.size(),
-            staged_cache.size(),
-            "resident TPQ cache entries"));
-    Impl::ProjectionCache staged_projections;
-    if (projection_is_new) {
-        staged_projections.emplace(
-            name,
-            projection);
-        impl_->projections.reserve(
-            checked_add(
-                impl_->projections.size(),
-                std::size_t{1},
-                "resident TPQ projections"));
-    }
-
-    // Transferring an unordered_map node does not allocate after reserve.
-    // Keep exact published-node addresses so an implementation-level
-    // exception from insertion can still roll the transaction back before
-    // the LRU is touched.
-    std::vector<const Impl::Key*> published_keys;
-    published_keys.reserve(staged_cache.size());
-    bool projection_published = false;
-    try {
-        while (!staged_cache.empty()) {
-            auto node =
-                staged_cache.extract(
-                    staged_cache.begin());
-            auto published =
-                impl_->cache.insert(
-                    std::move(node));
-            if (!published.inserted) {
-                throw std::logic_error(
-                    "TPQ staged cache key already "
-                    "exists");
-            }
-            published_keys.push_back(
-                &published.position->first);
-        }
-        if (projection_is_new) {
-            auto node =
-                staged_projections.extract(
-                    staged_projections.begin());
-            auto published =
-                impl_->projections.insert(
-                    std::move(node));
-            if (!published.inserted) {
-                throw std::logic_error(
-                    "TPQ staged projection already "
-                    "exists");
-            }
-            projection_published = true;
-        }
-    } catch (...) {
-        if (projection_published) {
-            impl_->projections.erase(name);
-        }
-        for (const auto* key : published_keys) {
-            const auto found =
-                impl_->cache.find(*key);
-            if (found != impl_->cache.end()) {
-                impl_->cache.erase(found);
-            }
-        }
-        throw;
-    }
-
-    // From this point onward all operations are non-allocating.  Publish the
-    // staged list nodes, reproduce the request-order LRU touches, evict only
-    // inactive entries, and expose resident_bytes once at the final value.
-    impl_->lru.splice(
-        impl_->lru.end(),
-        staged_lru);
-    for (const auto& key : ordered_keys) {
-        const auto cached =
-            impl_->cache.find(key);
-        impl_->lru.splice(
-            impl_->lru.end(),
-            impl_->lru,
-            cached->second);
-    }
-    while (
-        committed_bytes > impl_->cache_limit
-        && !impl_->lru.empty()
-    ) {
-        const auto candidate =
-            std::find_if(
-                impl_->lru.begin(),
-                impl_->lru.end(),
-                [&](const auto& item) {
-                    return active_keys.find(
-                        item.key)
-                        == active_keys.end();
-                });
-        if (candidate == impl_->lru.end()) {
-            break;
-        }
-        committed_bytes -=
-            candidate->weight->packed_nbytes;
-        const auto cached =
-            impl_->cache.find(candidate->key);
-        impl_->cache.erase(cached);
-        impl_->lru.erase(candidate);
-    }
-    impl_->resident_bytes = committed_bytes;
     return result;
 }
 
@@ -8265,29 +6854,12 @@ MlxMfeOffloadCache::resident_packed_bytes() const {
 std::size_t
 MlxMfeOffloadCache::cached_expert_count() const {
     std::lock_guard lock(impl_->mutex);
-    return impl_->cache.size() + impl_->mfe_cache.size();
+    return impl_->mfe_cache.size();
 }
 
 void MlxMfeOffloadCache::discard_record(
     const std::string& name) noexcept {
     std::lock_guard lock(impl_->mutex);
-    for (
-        auto item = impl_->lru.begin();
-        item != impl_->lru.end();
-    ) {
-        if (item->key.name != name) {
-            ++item;
-            continue;
-        }
-        impl_->resident_bytes -=
-            item->weight->packed_nbytes;
-        const auto cached =
-            impl_->cache.find(item->key);
-        if (cached != impl_->cache.end()) {
-            impl_->cache.erase(cached);
-        }
-        item = impl_->lru.erase(item);
-    }
     for (auto item = impl_->mfe_lru.begin();
          item != impl_->mfe_lru.end();) {
         if (item->key.name != name) {
@@ -8298,15 +6870,11 @@ void MlxMfeOffloadCache::discard_record(
         impl_->mfe_cache.erase(item->key);
         item = impl_->mfe_lru.erase(item);
     }
-    impl_->projections.erase(name);
     impl_->mfe_projections.erase(name);
 }
 
 void MlxMfeOffloadCache::clear() {
     std::lock_guard lock(impl_->mutex);
-    impl_->cache.clear();
-    impl_->lru.clear();
-    impl_->projections.clear();
     impl_->mfe_cache.clear();
     impl_->mfe_lru.clear();
     impl_->mfe_projections.clear();

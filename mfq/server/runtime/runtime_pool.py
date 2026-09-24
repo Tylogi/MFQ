@@ -15,6 +15,13 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, SkipValidation
 
+from mfq.server.state.catalog import DiscoveredModel, ModelArtifactNotFoundError, ModelCatalog
+from mfq.server.runtime.host_memory import (
+    host_memory_snapshot,
+    metal_recommended_working_set_size,
+    total_physical_memory,
+)
+from mfq.server.services.jobs import JobContext, JobExecutionError
 from mfq.server.protocol.models import (
     ErrorDetail,
     ModelLoadRequest,
@@ -38,11 +45,7 @@ from mfq.server.runtime.backend import (
     closing_backend_stream,
     preflight_backend_request,
 )
-from mfq.server.runtime.host_memory import (
-    host_memory_snapshot,
-    metal_recommended_working_set_size,
-    total_physical_memory,
-)
+from mfq.server.runtime.client import HttpRuntimeClient, StdioRuntimeClient
 from mfq.server.runtime.native import (
     append_native_prefill_chunk_override,
     find_native_runtime_resource,
@@ -50,8 +53,6 @@ from mfq.server.runtime.native import (
     native_runtime_environment,
     native_tokenizer_arguments,
 )
-from mfq.server.services.jobs import JobContext, JobExecutionError
-from mfq.server.state.catalog import DiscoveredModel, ModelArtifactNotFoundError, ModelCatalog
 
 
 class RuntimeManagementError(RuntimeError):
@@ -222,6 +223,7 @@ class RuntimePool:
         startup_loads: Sequence[ModelLoadRequest] = (),
         automatic_memory_budget: bool = True,
         shared_cache_reclaimer: Callable[[], int] | None = None,
+        transport: str = "http",
     ) -> None:
         if max_instances < 1:
             raise ValueError("max_instances must be positive")
@@ -261,7 +263,10 @@ class RuntimePool:
         self.metric_interval_seconds = max(0.25, metric_interval_seconds)
         if backend not in {"cuda", "metal"}:
             raise ValueError(f"unsupported native backend: {backend}")
+        if transport not in {"stdio", "http"}:
+            raise ValueError(f"unsupported native runtime transport: {transport}")
         self.backend = backend
+        self.transport = transport
         self.voice_component = voice_component
         self.runtime_environment = dict(runtime_environment or {})
         self._startup_loads = [request.model_copy(deep=True) for request in startup_loads]
@@ -573,8 +578,9 @@ class RuntimePool:
                     raise _job_error(
                         "runtime_memory_limit" if memory_limited else "runtime_instance_limit",
                         (
-                            "runtime memory budget reached; all remaining instances "
-                            "are pinned or busy"
+                            f"runtime memory budget reached: model needs {incoming_bytes:,} B; "
+                            f"remaining capacity under the runtime budget: "
+                            f"{max(0, memory_ceiling - committed_bytes):,} B"
                             if memory_limited
                             else "managed runtime instance limit reached; all instances "
                             "are pinned or busy"
@@ -588,7 +594,7 @@ class RuntimePool:
                     0,
                     committed_bytes - self._committed_runtime_bytes(victim),
                 )
-            port = self._reserve_free_port_locked()
+            port = self._reserve_free_port_locked() if self.transport == "http" else 0
             for victim in evicted:
                 self._mark_instance_unloading_locked(victim)
             load_event = asyncio.Event()
@@ -597,7 +603,8 @@ class RuntimePool:
             self._load_errors.pop(model_name, None)
             self._load_failures.pop(model_name, None)
             self._loading_artifact_ids[model_name] = artifact.resource.id
-            self._load_ports[model_name] = port
+            if port:
+                self._load_ports[model_name] = port
             self._load_bytes[model_name] = incoming_bytes
 
         if evicted:
@@ -629,11 +636,20 @@ class RuntimePool:
             await context.progress(0.02, message="Starting runtime process")
             process = await asyncio.create_subprocess_exec(
                 *command,
-                stdin=asyncio.subprocess.DEVNULL,
+                stdin=(
+                    asyncio.subprocess.PIPE
+                    if self.transport == "stdio"
+                    else asyncio.subprocess.DEVNULL
+                ),
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+                stderr=(
+                    asyncio.subprocess.PIPE
+                    if self.transport == "stdio"
+                    else asyncio.subprocess.STDOUT
+                ),
                 start_new_session=True,
                 env=process_environment,
+                limit=64 * 1024 * 1024,
             )
         except BaseException as error:
             async with self._lock:
@@ -652,8 +668,13 @@ class RuntimePool:
                 "libmfq_avfoundation_video.dylib",
             )
         )
+        runtime_client = (
+            StdioRuntimeClient(process)
+            if self.transport == "stdio"
+            else HttpRuntimeClient(f"http://127.0.0.1:{port}")
+        )
         backend = OpenAIChatBackend(
-            f"http://127.0.0.1:{port}",
+            runtime_client,
             local_tensor_files=True,
             model_type=artifact.resource.architecture,
             avfoundation_video_library=(
@@ -2552,7 +2573,7 @@ class RuntimePool:
         process = instance.process
         if isinstance(process, subprocess.Popen):
             return
-        stream = process.stdout
+        stream = process.stderr if self.transport == "stdio" else process.stdout
         if stream is None:
             return
         while True:
@@ -2572,7 +2593,13 @@ class RuntimePool:
                     ),
                     message[:4096],
                     instance_id=instance.id,
-                    fields={"source": "runtime.stdout"},
+                    fields={
+                        "source": (
+                            "runtime.stderr"
+                            if self.transport == "stdio"
+                            else "runtime.stdout"
+                        )
+                    },
                 )
 
     async def _monitor(self, instance: _Runtime) -> None:
@@ -2814,16 +2841,17 @@ class RuntimePool:
             str(self.executable),
             "--model",
             str(artifact.path),
-            "--server",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
+            "--transport",
+            self.transport,
+        ]
+        if self.transport == "http":
+            command.extend(["--host", "127.0.0.1", "--port", str(port)])
+        command.extend([
             "--ctx-size",
             str(request.context_size),
             "--model-name",
             artifact.resource.name,
-        ]
+        ])
         append_native_prefill_chunk_override(command, request.prefill_chunk_size)
         if self.backend == "cuda" and request_capacity > 1:
             command.extend(
@@ -2841,22 +2869,22 @@ class RuntimePool:
         )
         process_environment.update(self.runtime_environment)
         cache_environment = {
-            "MFQ_SERVER_MAX_KV_SESSIONS": request.prefix_cache_max_sessions,
-            "MFQ_SERVER_MAX_KV_SNAPSHOTS_PER_SESSION": (
+            "MFQ_RUNTIME_MAX_KV_SESSIONS": request.prefix_cache_max_sessions,
+            "MFQ_RUNTIME_MAX_KV_SNAPSHOTS_PER_SESSION": (
                 request.prefix_cache_max_snapshots_per_session
             ),
-            "MFQ_SERVER_KV_SESSION_BYTES": request.prefix_cache_max_bytes,
-            "MFQ_SERVER_DISABLE_PREFIX_CACHE": (
+            "MFQ_RUNTIME_KV_SESSION_BYTES": request.prefix_cache_max_bytes,
+            "MFQ_RUNTIME_DISABLE_PREFIX_CACHE": (
                 None if request.prefix_cache_enabled else 1
             ),
-            "MFQ_SERVER_PREFIX_CACHE_DISK_BYTES": request.prefix_cache_disk_bytes,
-            "MFQ_SERVER_PREFIX_CACHE_HOT_BYTES": (
+            "MFQ_RUNTIME_PREFIX_CACHE_DISK_BYTES": request.prefix_cache_disk_bytes,
+            "MFQ_RUNTIME_PREFIX_CACHE_HOT_BYTES": (
                 request.prefix_cache_hot_bytes
                 if request.prefix_cache_hot_bytes is not None
                 else request.prefix_cache_max_bytes
             ),
-            "MFQ_SERVER_PREFIX_CACHE_BLOCK_TOKENS": request.prefix_cache_block_tokens,
-            "MFQ_SERVER_PREFIX_CACHE_PENDING_BYTES": request.prefix_cache_pending_bytes,
+            "MFQ_RUNTIME_PREFIX_CACHE_BLOCK_TOKENS": request.prefix_cache_block_tokens,
+            "MFQ_RUNTIME_PREFIX_CACHE_PENDING_BYTES": request.prefix_cache_pending_bytes,
         }
         for name, value in cache_environment.items():
             if value is not None:

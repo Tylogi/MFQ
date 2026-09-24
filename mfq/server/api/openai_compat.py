@@ -14,6 +14,12 @@ from uuid import UUID
 
 from pydantic import TypeAdapter, ValidationError
 
+from mfq.server.runtime.backend import (
+    BackendDelta,
+    BackendError,
+    BackendToolCallDelta,
+    ChatBackend,
+)
 from mfq.server.protocol.models import (
     NamedToolChoice,
     ResponseFormat,
@@ -22,12 +28,6 @@ from mfq.server.protocol.models import (
     TokenUsage,
     ToolChoice,
     ToolDefinition,
-)
-from mfq.server.runtime.backend import (
-    BackendDelta,
-    BackendError,
-    BackendToolCallDelta,
-    ChatBackend,
 )
 
 

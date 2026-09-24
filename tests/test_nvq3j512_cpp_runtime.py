@@ -32,7 +32,7 @@ def _executable() -> Path:
         Path(__file__).resolve().parents[1]
         / "build"
         / "cpp_runtime"
-        / "mfq-decode.exe"
+        / "mfq-diagnostics.exe"
     )
     if not path.exists():
         pytest.skip("C++ runtime is not built")

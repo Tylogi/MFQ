@@ -241,19 +241,3 @@ def test_openapi_references_resolve() -> None:
         assert reference.startswith("#/components/schemas/")
         name = reference.rsplit("/", 1)[-1]
         assert name in schema["components"]["schemas"]
-
-
-def test_runtime_proto_contains_versioned_envelope_and_shared_memory() -> None:
-    source = files("mfq.server").joinpath("protocol", "runtime.proto").read_text(encoding="utf-8")
-    assert "package mfq.server.v1;" in source
-    assert "message RuntimeEnvelope" in source
-    assert "message RuntimeIdentity" in source
-    assert "message SharedMemoryRef" in source
-    assert "message PushAudioRequest" in source
-    assert "message CommitAudioRequest" in source
-    assert "message ResponseReasoningDelta" in source
-    assert "message ResponseToolCallDelta" in source
-    assert "message ResponseCompleted" in source
-    assert "message TokenUsage" in source
-    assert "oneof frame" in source
-    assert "oneof payload" in source

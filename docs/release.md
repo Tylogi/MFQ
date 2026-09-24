@@ -31,8 +31,8 @@ code signatures, then copies the DMG to `packaging/dist/`.
 ## Windows
 
 The Windows release packages `mfq serve`, MFQ Studio, and the native CUDA
-`mfq-decode` sidecar into a single x64 NSIS installer. This serve-only package
-excludes PyTorch and the training, calibration, quantization, TPQ, and MiniCPM-o
+`mfq-runtime` sidecar into a single x64 NSIS installer. This serve-only package
+excludes PyTorch and the training, calibration, quantization, and MiniCPM-o
 dependency groups. The CUDA, cuBLAS, MSVC, and optional OpenMP runtime DLLs are
 bundled with the sidecar, so end users do not need Python, the CUDA Toolkit, or a
 native build environment.

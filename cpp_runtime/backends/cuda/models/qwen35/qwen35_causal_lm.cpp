@@ -1,6 +1,7 @@
 #include "qwen35_causal_lm.h"
 #include "qwen35_linear_attention.h"
 
+#include "../../runtime/causal_lm.h"
 #include "../../runtime/cuda_transformer.h"
 #include "../../runtime/cuda_transformer_loader.h"
 
@@ -354,6 +355,124 @@ void LinearAttentionBlock::rollback_speculative(int64_t keep_position) {
     } catch (...) {
         clear_speculative();
         throw;
+    }
+}
+
+bool supports_text_session_state(
+        const std::vector<std::unique_ptr<::Block>>& blocks) {
+    return !blocks.empty() && std::all_of(
+        blocks.begin(), blocks.end(),
+        [](const std::unique_ptr<::Block>& block) {
+            return dynamic_cast<const FullBlock*>(block.get()) != nullptr ||
+                dynamic_cast<const LinearAttentionBlock*>(block.get()) !=
+                    nullptr;
+        });
+}
+
+TextSessionState capture_text_session_state(
+        const std::vector<std::unique_ptr<::Block>>& blocks,
+        const std::vector<std::int64_t>& tokens,
+        std::int64_t cache_position) {
+    if (!supports_text_session_state(blocks) || cache_position <= 0 ||
+            static_cast<std::size_t>(cache_position) != tokens.size()) {
+        throw std::runtime_error(
+            "Qwen hybrid session token count does not match the cache");
+    }
+    TextSessionState state;
+    state.tokens = tokens;
+    state.kind = TextSessionStateKind::HybridAttention;
+    state.cache_pos = cache_position;
+    state.hybrid_blocks.reserve(blocks.size());
+    for (const auto& block : blocks) {
+        MfqCudaGuard guard(block->cuda_device);
+        HybridBlockSessionState saved;
+        if (const auto* full = dynamic_cast<const FullBlock*>(block.get())) {
+            saved.kind = HybridBlockSessionStateKind::FullAttention;
+            saved.full_attention = capture_full_attention_session_state(
+                *full, cache_position, state.bytes);
+        } else if (const auto* linear =
+                       dynamic_cast<const LinearAttentionBlock*>(block.get())) {
+            if (linear->speculative_pending ||
+                    !linear->conv_state.defined() ||
+                    !linear->gdn_state.defined()) {
+                throw std::runtime_error(
+                    "Qwen recurrent session state is unavailable");
+            }
+            saved.kind = HybridBlockSessionStateKind::Recurrent;
+            saved.convolution_state = linear->conv_state.clone();
+            saved.recurrent_state = linear->gdn_state.clone();
+            state.bytes += session_tensor_bytes(saved.convolution_state);
+            state.bytes += session_tensor_bytes(saved.recurrent_state);
+        } else {
+            throw std::runtime_error(
+                "Qwen hybrid session layer type changed");
+        }
+        state.hybrid_blocks.push_back(std::move(saved));
+    }
+    return state;
+}
+
+void restore_text_session_state(
+        std::vector<std::unique_ptr<::Block>>& blocks,
+        const TextSessionState& state) {
+    if (state.kind != TextSessionStateKind::HybridAttention ||
+            state.cache_pos <= 0 ||
+            state.tokens.size() != static_cast<std::size_t>(state.cache_pos) ||
+            state.hybrid_blocks.size() != blocks.size()) {
+        throw std::runtime_error("Qwen hybrid session state is incompatible");
+    }
+    for (std::size_t index = 0; index < blocks.size(); ++index) {
+        auto& block = blocks[index];
+        const auto& saved = state.hybrid_blocks[index];
+        MfqCudaGuard guard(block->cuda_device);
+        if (saved.kind == HybridBlockSessionStateKind::FullAttention) {
+            auto* full = dynamic_cast<FullBlock*>(block.get());
+            if (full == nullptr) {
+                throw std::runtime_error(
+                    "Qwen hybrid full-attention layer changed");
+            }
+            restore_full_attention_session_state(
+                *full, saved.full_attention);
+            continue;
+        }
+        auto* linear = dynamic_cast<LinearAttentionBlock*>(block.get());
+        const auto convolution_width = linear != nullptr
+            ? 2 * linear->qwen_config.linear_k_size() +
+                  linear->qwen_config.linear_v_size()
+            : 0;
+        if (linear == nullptr || !saved.convolution_state.defined() ||
+                !saved.recurrent_state.defined() ||
+                saved.convolution_state.scalar_type() !=
+                    mfq_tensor_backend::kFloat32 ||
+                saved.recurrent_state.scalar_type() !=
+                    mfq_tensor_backend::kFloat32 ||
+                saved.convolution_state.dim() != 3 ||
+                saved.convolution_state.size(0) != 1 ||
+                saved.convolution_state.size(1) !=
+                    linear->qwen_config.linear_conv_kernel_dim - 1 ||
+                saved.convolution_state.size(2) != convolution_width ||
+                saved.recurrent_state.dim() != 4 ||
+                saved.recurrent_state.size(0) != 1 ||
+                saved.recurrent_state.size(1) !=
+                    linear->qwen_config.linear_num_value_heads ||
+                saved.recurrent_state.size(2) !=
+                    linear->qwen_config.linear_value_head_dim ||
+                saved.recurrent_state.size(3) !=
+                    linear->qwen_config.linear_value_head_dim ||
+                !saved.convolution_state.is_cuda() ||
+                !saved.recurrent_state.is_cuda() ||
+                saved.convolution_state.get_device() != block->cuda_device ||
+                saved.recurrent_state.get_device() != block->cuda_device) {
+            throw std::runtime_error(
+                "Qwen recurrent session topology changed");
+        }
+        restore_session_tensor(
+            linear->conv_state, saved.convolution_state);
+        restore_session_tensor(
+            linear->gdn_state, saved.recurrent_state);
+        linear->speculative_conv = {};
+        linear->speculative_gdn = {};
+        linear->clear_speculative();
     }
 }
 

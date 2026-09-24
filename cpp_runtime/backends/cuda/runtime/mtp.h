@@ -3,7 +3,7 @@
 #include "causal_lm.h"
 #include "mfq_cuda_mtp.h"
 #include "mfq_tensor_backend.h"
-#include "mfq/server.h"
+#include "mfq/runtime.h"
 
 #include <cstdint>
 #include <functional>
@@ -35,7 +35,7 @@ struct MtpBlockDraft {
 };
 
 // Generation sees one predictor contract. Architecture-specific modules own their
-// equations and cache layout; the server does not branch on architecture.
+// equations and cache layout; the runtime does not branch on architecture.
 struct MtpModule {
     virtual ~MtpModule() = default;
     virtual void reset(int64_t batch = 1) = 0;
@@ -72,6 +72,17 @@ struct MtpModule {
     virtual bool retains_partial_target_prefix() const noexcept {
         return false;
     }
+    virtual bool supports_session_state() const noexcept { return false; }
+    virtual MtpSessionState capture_session_state(
+        std::int64_t,
+        const mfq_tensor_backend::Tensor&) const {
+        throw std::runtime_error(
+            "this CUDA MTP predictor has no session state");
+    }
+    virtual void restore_session_state(const MtpSessionState&) {
+        throw std::runtime_error(
+            "this CUDA MTP predictor has no session state");
+    }
     virtual void append_target_context(
         mfq_tensor_backend::Tensor,
         std::int64_t) {
@@ -103,4 +114,8 @@ int32_t run_mtp_generation(
     const MfqPrefillCallback& on_prefill,
     int64_t prefill_chunk_size = 2048,
     const MfqTokenConstraintPtr& token_constraint = {},
-    const CudaPreparedPrompt* prepared = nullptr);
+    const CudaPreparedPrompt* prepared = nullptr,
+    std::size_t reused_tokens = 0,
+    const mfq_tensor_backend::Tensor& restored_last_hidden = {},
+    mfq_tensor_backend::Tensor* session_last_hidden = nullptr,
+    double multimodal_ms = 0.0);

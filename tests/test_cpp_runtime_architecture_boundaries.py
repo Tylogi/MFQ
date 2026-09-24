@@ -55,11 +55,17 @@ CUDA_MTP_HEADER = (
     ROOT / "cpp_runtime" / "backends" / "cuda" / "include" / "mfq_cuda_mtp.h"
 ).read_text(encoding="utf-8")
 CUDA_APP = (
-    ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "mfq_decode.cpp"
+    ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "runtime_main.cpp"
+).read_text(encoding="utf-8")
+CUDA_RUNTIME_COMMAND = (
+    ROOT / "cpp_runtime" / "backends" / "cuda" / "commands" / "runtime.cpp"
+).read_text(encoding="utf-8")
+CUDA_CLI = (
+    ROOT / "cpp_runtime" / "backends" / "cuda" / "commands" / "cli.h"
 ).read_text(encoding="utf-8")
 CUDA_MODELS = ROOT / "cpp_runtime" / "backends" / "cuda" / "models"
 CUDA_RUNTIME = ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime"
-CUDA_RUNTIME_SOURCE = (CUDA_RUNTIME / "cuda_decode_runtime.cpp").read_text(
+CUDA_RUNTIME_SOURCE = (CUDA_RUNTIME / "cuda_runtime.cpp").read_text(
     encoding="utf-8"
 )
 CUDA_MTP_SOURCE = (CUDA_RUNTIME / "mtp.cpp").read_text(encoding="utf-8")
@@ -167,7 +173,7 @@ def test_model_sources_are_backend_neutral_and_shared() -> None:
 
 def test_native_cli_uses_backend_neutral_model_and_tokenizer_options() -> None:
     sources = (
-        CUDA_DECODE,
+        CUDA_APP + "\n" + CUDA_RUNTIME_COMMAND + "\n" + CUDA_CLI,
         DECODE_APP,
         (METAL / "apps" / "mfq_perplexity_mlx.cpp").read_text(encoding="utf-8"),
     )
@@ -180,17 +186,30 @@ def test_native_cli_uses_backend_neutral_model_and_tokenizer_options() -> None:
 
 
 def test_cuda_cli_is_a_thin_client_of_the_runtime_library() -> None:
-    assert "mfq::cuda::run_decode(argc, argv)" in CUDA_APP
-    assert len(CUDA_APP.splitlines()) <= 10
-    assert "struct Model" not in CUDA_APP
-    assert "run_linear_check" not in CUDA_APP
+    apps = ROOT / "cpp_runtime" / "backends" / "cuda" / "apps"
+    for name in ("runtime", "diagnostics", "eval"):
+        source = (apps / f"{name}_main.cpp").read_text(encoding="utf-8")
+        assert f"mfq::cuda::commands::run_{name}(argc, argv)" in source
+        assert "argv[" not in source
+        assert "struct Model" not in source
 
-    cmake = (ROOT / "cpp_runtime" / "cmake" / "CudaRuntime.cmake").read_text(
+    cmake = (ROOT / "cpp_runtime" / "backends" / "cuda" / "CMakeLists.txt").read_text(
         encoding="utf-8"
     )
     assert "add_library(mfq-cuda-runtime STATIC" in cmake
-    assert "runtime/cuda_decode_runtime.cpp" in cmake
-    assert "target_link_libraries(mfq-decode PRIVATE mfq-cuda-runtime)" in cmake
+    assert "runtime/cuda_runtime.cpp" in cmake
+    assert "add_executable(mfq-runtime\n" in cmake
+    assert "mfq-cuda-runtime mfq-runtime-communication" in cmake
+    assert "${MFQ_CUDA_ROOT}/commands/runtime.cpp" in cmake
+    assert "${MFQ_CUDA_ROOT}/commands/diagnostics.cpp" in cmake
+    assert "${MFQ_CUDA_ROOT}/commands/eval.cpp" in cmake
+    assert ("mfq-" + "decode") not in cmake
+    assert "execute_runtime" in CUDA_RUNTIME_COMMAND
+    assert "RuntimeExecution" not in CUDA_RUNTIME_SOURCE
+    assert "run_runtime(RuntimeOptions" not in CUDA_RUNTIME_SOURCE
+    assert '"--server"' not in CUDA_RUNTIME_SOURCE
+    assert '"--stdio"' not in CUDA_RUNTIME_SOURCE
+    assert "MFQ_SERVER_" not in CUDA_RUNTIME_SOURCE
 
 
 def test_development_rules_forbid_architecture_bound_reuse() -> None:
@@ -314,10 +333,10 @@ def test_qwen4_qsa_caches_completed_index_blocks_incrementally() -> None:
     assert "trim_pooled_index_cache();" in QWEN4
 
 
-def test_native_server_prewarms_shared_ssd_arenas_on_load_and_reload() -> None:
+def test_native_runtime_prewarms_shared_ssd_arenas_on_load_and_reload() -> None:
     serving = DECODE_APP[
-        DECODE_APP.index("int serve_loaded_runtime(") :
-        DECODE_APP.index("int run_native_server(")
+        DECODE_APP.index("int run_loaded_runtime(") :
+        DECODE_APP.index("int run_native_runtime(")
     ]
     assert "runtime.prewarm_ssd_expert_arena();" in serving
     # Three capability checks and their matching calls cover initial load,
@@ -438,8 +457,7 @@ def test_deepseek_v4_mfe_streaming_uses_fused_down_reduce() -> None:
     streamed = source[source.index("} else if (!expert_offload_) {") :]
     streamed = streamed[: streamed.index("if (!shared.has_value())")]
     assert "down_weight.routed_matmul_reduce(" in streamed
-    # Legacy TPQ has no matching fused primitive and retains its fallback.
-    assert "return moe_weighted_reduce(" in streamed
+    assert "return moe_weighted_reduce(" not in streamed
 
 
 def test_deepseek_v4_only_tracks_token_counts_for_active_penalties() -> None:
@@ -674,11 +692,12 @@ def test_model_config_parsing_is_backend_neutral() -> None:
 
 
 def test_cuda_model_runtime_uses_compiled_causal_lm_adapters() -> None:
-    cmake = (ROOT / "cpp_runtime" / "cmake" / "CudaRuntime.cmake").read_text(
+    cmake = (ROOT / "cpp_runtime" / "backends" / "cuda" / "CMakeLists.txt").read_text(
         encoding="utf-8"
     )
     adapters = {
-        "flash_next": "qwen4_causal_lm",
+        "qwen4_exp": "causal_lm",
+        "glm5_next": "causal_lm",
         "deepseek_v41": "deepseek_v41_causal_lm",
         "deepseek_v4": "deepseek_v4_causal_lm",
         "glm_dsa": "glm_dsa_causal_lm",
@@ -734,29 +753,57 @@ def test_cuda_model_runtime_uses_compiled_causal_lm_adapters() -> None:
 
 def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
     cuda = ROOT / "cpp_runtime" / "backends" / "cuda"
-    cmake = (ROOT / "cpp_runtime" / "cmake" / "CudaRuntime.cmake").read_text(
+    cmake = (ROOT / "cpp_runtime" / "backends" / "cuda" / "CMakeLists.txt").read_text(
         encoding="utf-8"
     )
     required = (
-        "ops/cuda_quantized_ops.cpp",
+        "ops/format.cpp",
+        "ops/fp8_sq.cpp",
+        "ops/moe.cpp",
+        "ops/mx.cpp",
+        "ops/mxfp4_sq.cpp",
+        "ops/nint.cpp",
+        "ops/quant_linear.cpp",
+        "ops/vq.cpp",
         "runtime/cuda_execution.cpp",
+        "runtime/decode_graph.cpp",
+        "runtime/runner.cpp",
         "runtime/causal_lm.cpp",
         "runtime/causal_lm_loader.cpp",
         "runtime/cuda_transformer.cpp",
         "runtime/cuda_transformer_loader.cpp",
         "runtime/mtp.cpp",
-        "runtime/server_components.cpp",
-        "runtime/diagnostics/backend_checks.cpp",
-        "runtime/diagnostics/model_checks.cpp",
+        "runtime/moe_expert_cache.cpp",
+        "runtime/runtime_components.cpp",
+        "diagnostics/backend_checks.cpp",
+        "diagnostics/model_checks.cpp",
+        "eval/kl.cpp",
     )
     for relative in required:
         assert (cuda / relative).is_file()
         assert relative in cmake
-    assert "struct QuantLinear" in (
-        cuda / "ops" / "cuda_quantized_ops.h"
-    ).read_text(encoding="utf-8")
+    ops = cuda / "ops"
+    assert "${MFQ_CUDA_ROOT}/ops/include" in cmake
+    assert not any(path.suffix == ".h" for path in ops.iterdir())
+    quant_header = (ops / "include" / "quant_linear.h").read_text(
+        encoding="utf-8"
+    )
+    assert "struct QuantLinear" in quant_header
+    owned_types = {
+        "ops/include/nint.h": ("NintWeight",),
+        "ops/include/vq.h": ("NvqWeight",),
+        "ops/include/mx.h": ("Mxfp4Weight", "Mxfp8Weight"),
+        "ops/include/fp8_sq.h": ("Fp8SqWeight",),
+        "ops/include/mxfp4_sq.h": ("Mxfp4SqWeight",),
+        "ops/include/moe.h": ("MfeWeight", "MoeRoutePlan"),
+    }
+    for relative, names in owned_types.items():
+        source = (cuda / relative).read_text(encoding="utf-8")
+        for name in names:
+            assert f"struct {name}" in source
+            assert f"struct {name} {{" not in quant_header
     assert "struct QuantLinear" not in CUDA_RUNTIME_SOURCE
-    assert '#include "cuda_quantized_ops.cpp"' not in CUDA_BACKEND_SOURCE
+    assert "cuda_quantized_ops" not in CUDA_BACKEND_SOURCE
     assert not re.search(r'#include\s+["<][^">]+\.inc[">]', CUDA_BACKEND_SOURCE)
 
 
@@ -767,7 +814,7 @@ def test_cuda_qwen_speculation_is_model_owned() -> None:
     assert "forward_speculative(" not in CUDA_TRANSFORMER_HEADER
     assert "struct LinearBlock" not in CUDA_TRANSFORMER_HEADER
     assert "MFQ_QWEN_MTP_BATCH" not in CUDA_TRANSFORMER_HEADER
-    assert "for (int accepted_drafts : {0, 1, 2})" in CUDA_RUNTIME_SOURCE
+    assert "for (int accepted_drafts : {0, 1, 2})" in CUDA_BACKEND_SOURCE
 
 
 def test_cuda_qwen_linear_ffn_matches_residual_dtype() -> None:

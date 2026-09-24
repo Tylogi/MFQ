@@ -5,8 +5,6 @@
 #include "mlx_mtp.h"
 #include "mlx_transformer.h"
 
-#include "nlohmann/json.hpp"
-
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -28,7 +26,6 @@
 namespace mfq::metal {
 namespace {
 
-using json = nlohmann::json;
 using mlx::core::Dtype;
 using mlx::core::Shape;
 using mlx::core::array;
@@ -327,101 +324,13 @@ array all_experts_available(int experts) {
 }
 
 std::vector<array> expert_availability(
-    const MfqContainer& model,
     const DeepseekV4Config& config) {
-    const int layers =
-        checked_int(config.n_layers, "layer count");
-    const int experts =
-        checked_int(config.n_experts, "expert count");
+    const int layers = checked_int(config.n_layers, "layer count");
+    const int experts = checked_int(config.n_experts, "expert count");
     std::vector<array> result;
     result.reserve(layers);
     for (int layer = 0; layer < layers; ++layer) {
-        result.push_back(
-            all_experts_available(experts));
-    }
-
-    const auto found =
-        model.header().extra_json.find(
-            "tpq_manifest");
-    if (found ==
-        model.header().extra_json.end()) {
-        return result;
-    }
-
-    json manifest;
-    try {
-        manifest = json::parse(found->second);
-    } catch (const json::exception& error) {
-        throw std::runtime_error(
-            std::string(
-                "invalid DeepSeek-V4 TPQ manifest: ") +
-            error.what());
-    }
-    const auto assignments =
-        manifest.find("tiers_per_layer");
-    if (assignments == manifest.end() ||
-        assignments->is_null()) {
-        return result;
-    }
-    if (!assignments->is_object()) {
-        throw std::runtime_error(
-            "DeepSeek-V4 tiers_per_layer must be an object");
-    }
-    for (int layer = 0; layer < layers; ++layer) {
-        const auto assigned =
-            assignments->find(std::to_string(layer));
-        if (assigned == assignments->end()) {
-            continue;
-        }
-        if (!assigned->is_string()) {
-            throw std::runtime_error(
-                "DeepSeek-V4 tier assignment must be a string");
-        }
-        const auto tiers =
-            assigned->get<std::string>();
-        if (tiers.size() !=
-            static_cast<std::size_t>(experts)) {
-            throw std::runtime_error(
-                "DeepSeek-V4 layer " +
-                std::to_string(layer) +
-                " tier assignment length does not match "
-                "n_experts");
-        }
-        std::vector<std::uint8_t> available(
-            static_cast<std::size_t>(experts));
-        int count = 0;
-        for (int expert = 0;
-             expert < experts;
-             ++expert) {
-            const char tier =
-                tiers[static_cast<std::size_t>(expert)];
-            if (tier != 'x' &&
-                tier != 'w' &&
-                tier != 'v' &&
-                tier != 'V' &&
-                tier != 'd') {
-                throw std::runtime_error(
-                    "DeepSeek-V4 layer " +
-                    std::to_string(layer) +
-                    " contains an invalid expert tier");
-            }
-            available[static_cast<std::size_t>(expert)] =
-                static_cast<std::uint8_t>(
-                    tier != 'd');
-            count += tier != 'd' ? 1 : 0;
-        }
-        if (count < config.top_k) {
-            throw std::runtime_error(
-                "DeepSeek-V4 layer " +
-                std::to_string(layer) +
-                " has fewer than top_k available experts");
-        }
-        result[static_cast<std::size_t>(layer)] =
-            mlx::core::astype(
-                array(
-                    available.begin(),
-                    Shape{experts}),
-                mlx::core::bool_);
+        result.push_back(all_experts_available(experts));
     }
     return result;
 }
@@ -854,7 +763,7 @@ MlxDeepseekV4CausalLm::load(
                 config.compress_rope_theta),
             yarn_scaling(config.rope_scaling));
     auto availability =
-        expert_availability(model, config);
+        expert_availability(config);
     std::shared_ptr<MlxMfeOffloadCache>
         expert_offload;
     std::shared_ptr<MlxMoeSsdExpertCache>

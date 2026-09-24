@@ -4,11 +4,13 @@
 #include "cuda_model_plan.h"
 #include "../models/deepseek_v4/deepseek_v4_causal_lm.h"
 #include "../models/deepseek_v41/deepseek_v41_causal_lm.h"
-#include "../models/flash_next/qwen4_causal_lm.h"
+#include "../models/glm5_next/causal_lm.h"
+#include "../models/qwen4_exp/causal_lm.h"
 #include "../models/glm_dsa/glm_dsa_causal_lm.h"
 #include "models/gemma4.h"
 #include "models/minicpmo45.h"
 #include "models/qwen35.h"
+#include "../models/qwen35/qwen35_causal_lm.h"
 #include "mfq_cuda_paged_kv.h"
 #include "prepared_prompt.h"
 
@@ -35,6 +37,7 @@ struct FullBlockSessionState {
 enum class TextSessionStateKind {
     Unsupported,
     FullAttention,
+    HybridAttention,
     DeepseekV4,
     GlmDsa,
 };
@@ -66,12 +69,35 @@ struct GlmDsaBlockSessionState {
     bool full_indexer = false;
 };
 
+enum class HybridBlockSessionStateKind {
+    FullAttention,
+    Recurrent,
+};
+
+struct HybridBlockSessionState {
+    HybridBlockSessionStateKind kind =
+        HybridBlockSessionStateKind::FullAttention;
+    FullBlockSessionState full_attention;
+    mfq_tensor_backend::Tensor convolution_state;
+    mfq_tensor_backend::Tensor recurrent_state;
+};
+
+struct MtpSessionState {
+    std::vector<FullBlockSessionState> blocks;
+    mfq_tensor_backend::Tensor last_target_hidden;
+    int64_t cache_pos = 0;
+    size_t bytes = 0;
+};
+
 struct TextSessionState {
     std::vector<int64_t> tokens;
+    std::string input_key;
     TextSessionStateKind kind = TextSessionStateKind::Unsupported;
     std::vector<FullBlockSessionState> blocks;
+    std::vector<HybridBlockSessionState> hybrid_blocks;
     std::vector<Dsv4BlockSessionState> dsv4_blocks;
     std::vector<GlmDsaBlockSessionState> glm_dsa_blocks;
+    std::optional<MtpSessionState> mtp;
     int64_t cache_pos = 0;
     size_t bytes = 0;
     uint64_t last_used = 0;
@@ -265,6 +291,15 @@ void restore_session_prefix_tensor(
         const mfq_tensor_backend::Tensor & source,
         int64_t dimension,
         int64_t capacity);
+
+FullBlockSessionState capture_full_attention_session_state(
+        const FullBlock & block,
+        int64_t cache_pos,
+        size_t & bytes);
+
+void restore_full_attention_session_state(
+        FullBlock & block,
+        const FullBlockSessionState & state);
 
 Dsv4PoolSessionState capture_dsv4_pool_session_state(
         const Dsv4PoolState & source,
@@ -674,14 +709,19 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
                 Backbone == CudaBackbone::generic_qwen ||
                 Backbone == CudaBackbone::minicpmo45 ||
                 Backbone == CudaBackbone::minicpmo_tts) {
-            return std::all_of(
+            const bool full_attention = std::all_of(
                 blocks.begin(), blocks.end(),
                 [](const std::unique_ptr<Block>& block) {
                     return dynamic_cast<const FullBlock*>(block.get()) !=
                         nullptr;
-                })
-                ? TextSessionStateKind::FullAttention
-                : TextSessionStateKind::Unsupported;
+                });
+            if (full_attention) return TextSessionStateKind::FullAttention;
+            if constexpr (Backbone == CudaBackbone::generic_qwen) {
+                return mfq::cuda::qwen35::supports_text_session_state(blocks)
+                    ? TextSessionStateKind::HybridAttention
+                    : TextSessionStateKind::Unsupported;
+            }
+            return TextSessionStateKind::Unsupported;
         } else if constexpr (Backbone == CudaBackbone::deepseek_v4) {
             return std::all_of(
                 blocks.begin(), blocks.end(),
@@ -741,29 +781,23 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
                 Backbone == CudaBackbone::generic_qwen ||
                 Backbone == CudaBackbone::minicpmo45 ||
                 Backbone == CudaBackbone::minicpmo_tts) {
+            if constexpr (Backbone == CudaBackbone::generic_qwen) {
+                if (state.kind == TextSessionStateKind::HybridAttention) {
+                    return mfq::cuda::qwen35::capture_text_session_state(
+                        blocks, tokens, cache_pos);
+                }
+            }
             state.blocks.reserve(blocks.size());
             for (const auto & block : blocks) {
                 MfqCudaGuard guard(block->cuda_device);
                 const auto * full =
                     dynamic_cast<const FullBlock *>(block.get());
-                if (full == nullptr || !full->cache.k.defined() ||
-                        !full->cache.v.defined()) {
+                if (full == nullptr) {
                     throw std::runtime_error(
-                        "full-attention KV cache is unavailable");
+                        "full-attention session layer changed");
                 }
-                FullBlockSessionState saved;
-                saved.capacity = full->cache.k.size(2);
-                saved.ring = full->cache.ring;
-                const int64_t saved_tokens = saved.ring
-                    ? saved.capacity
-                    : std::min<int64_t>(cache_pos, saved.capacity);
-                saved.k = full->cache.k.narrow(
-                    2, 0, saved_tokens).clone();
-                saved.v = full->cache.v.narrow(
-                    2, 0, saved_tokens).clone();
-                state.bytes += session_tensor_bytes(saved.k);
-                state.bytes += session_tensor_bytes(saved.v);
-                state.blocks.push_back(std::move(saved));
+                state.blocks.push_back(capture_full_attention_session_state(
+                    *full, cache_pos, state.bytes));
             }
         } else if constexpr (Backbone == CudaBackbone::deepseek_v4) {
             state.dsv4_blocks.reserve(blocks.size());
@@ -835,6 +869,14 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
                 Backbone == CudaBackbone::generic_qwen ||
                 Backbone == CudaBackbone::minicpmo45 ||
                 Backbone == CudaBackbone::minicpmo_tts) {
+            if constexpr (Backbone == CudaBackbone::generic_qwen) {
+                if (state.kind == TextSessionStateKind::HybridAttention) {
+                    mfq::cuda::qwen35::restore_text_session_state(
+                        blocks, state);
+                    cache_pos = state.cache_pos;
+                    return;
+                }
+            }
             if (state.blocks.size() != blocks.size()) {
                 throw std::runtime_error(
                     "full-attention session layer count changed");
@@ -843,21 +885,12 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
                 auto & block = blocks[index];
                 MfqCudaGuard guard(block->cuda_device);
                 auto * full = dynamic_cast<FullBlock *>(block.get());
-                const auto & saved = state.blocks[index];
-                if (full == nullptr || !saved.k.defined() ||
-                        !saved.v.defined() || saved.capacity <= 0 ||
-                        saved.k.dim() != 4 ||
-                        saved.v.sizes() != saved.k.sizes() ||
-                        saved.k.size(0) != 1 ||
-                        saved.k.size(2) > saved.capacity) {
+                if (full == nullptr) {
                     throw std::runtime_error(
-                        "full-attention session KV layout is invalid");
+                        "full-attention session layer changed");
                 }
-                restore_session_prefix_tensor(
-                    full->cache.k, saved.k, 2, saved.capacity);
-                restore_session_prefix_tensor(
-                    full->cache.v, saved.v, 2, saved.capacity);
-                full->cache.ring = saved.ring;
+                restore_full_attention_session_state(
+                    *full, state.blocks[index]);
             }
         } else if constexpr (Backbone == CudaBackbone::deepseek_v4) {
             if (state.dsv4_blocks.size() != blocks.size()) {
@@ -980,7 +1013,9 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
                                  std::vector<mfq_tensor_backend::Tensor> * block_trace = nullptr,
                                  MfqOptional<mfq_tensor_backend::Tensor> cache_positions_override = mfq_nullopt,
                                  mfq_tensor_backend::Tensor* raw_hidden = nullptr,
-                                 int64_t confirmed_prefix = 0) {
+                                 int64_t confirmed_prefix = 0,
+                                 int64_t planned_kv_length = 0,
+                                 int64_t decode_attention_parts = 0) {
         const int primary = g_layer_placement.primary_device();
         MfqCudaGuard primary_guard(primary);
         ids = tensor_to_cuda_device(
@@ -989,7 +1024,8 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
         auto x = g_profiler.measure("model.embed", [&]() { return embed_forward(ids); });
         return hidden_forward_inputs(
             ids, x, pos_override, seq_len, block_trace,
-            mfq_nullopt, false, cache_positions_override, raw_hidden, confirmed_prefix);
+            mfq_nullopt, false, cache_positions_override, raw_hidden,
+            confirmed_prefix, planned_kv_length, decode_attention_parts);
     }
 
     mfq_tensor_backend::Tensor hidden_forward_speculative_suffix(
@@ -1022,7 +1058,9 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
             bool advance_cache_with_position_ids = false,
             MfqOptional<mfq_tensor_backend::Tensor> cache_positions_override = mfq_nullopt,
             mfq_tensor_backend::Tensor* raw_hidden = nullptr,
-            int64_t confirmed_prefix = 0) {
+            int64_t confirmed_prefix = 0,
+            int64_t planned_kv_length = 0,
+            int64_t decode_attention_parts = 0) {
         const int primary = g_layer_placement.primary_device();
         MfqCudaGuard primary_guard(primary);
         ids = tensor_to_cuda_device(
@@ -1225,6 +1263,8 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
             }
             context.cache_position=cache_pos;
             context.confirmed_prefix=confirmed_prefix;
+            context.planned_kv_length=planned_kv_length;
+            context.decode_attention_parts=decode_attention_parts;
             context.sequence_lengths=local_seq_len;
             context.cache_positions=local_cache_positions;
             if constexpr (is_minicpmo45) {
@@ -1339,8 +1379,26 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
         return apply_final_logit_softcap(lm_head.forward(last));
     }
 
-    mfq_tensor_backend::Tensor last_logits_static(mfq_tensor_backend::Tensor ids, mfq_tensor_backend::Tensor pos, mfq_tensor_backend::Tensor seq_len) {
-        auto y = hidden_forward(ids, pos, seq_len, nullptr, pos);
+    mfq_tensor_backend::Tensor hidden_forward_static(
+            mfq_tensor_backend::Tensor ids,
+            mfq_tensor_backend::Tensor pos,
+            mfq_tensor_backend::Tensor seq_len,
+            int64_t planned_kv_length,
+            int64_t decode_attention_parts) {
+        return hidden_forward(
+            std::move(ids), pos, seq_len, nullptr, pos, nullptr, 0,
+            planned_kv_length, decode_attention_parts);
+    }
+
+    mfq_tensor_backend::Tensor last_logits_static(
+            mfq_tensor_backend::Tensor ids,
+            mfq_tensor_backend::Tensor pos,
+            mfq_tensor_backend::Tensor seq_len,
+            int64_t planned_kv_length = 0,
+            int64_t decode_attention_parts = 0) {
+        auto y = hidden_forward_static(
+            std::move(ids), std::move(pos), std::move(seq_len),
+            planned_kv_length, decode_attention_parts);
         auto last = y.index({Slice(), -1, Slice()});
         if constexpr (is_minicpmo45) {
             return logits_from_hidden(
@@ -1363,8 +1421,15 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
         return next_token_from_hidden(y);
     }
 
-    mfq_tensor_backend::Tensor next_token_static(mfq_tensor_backend::Tensor ids, mfq_tensor_backend::Tensor pos, mfq_tensor_backend::Tensor seq_len) {
-        auto y = hidden_forward(ids, pos, seq_len, nullptr, pos);
+    mfq_tensor_backend::Tensor next_token_static(
+            mfq_tensor_backend::Tensor ids,
+            mfq_tensor_backend::Tensor pos,
+            mfq_tensor_backend::Tensor seq_len,
+            int64_t planned_kv_length = 0,
+            int64_t decode_attention_parts = 0) {
+        auto y = hidden_forward_static(
+            std::move(ids), std::move(pos), std::move(seq_len),
+            planned_kv_length, decode_attention_parts);
         return next_token_from_hidden(y);
     }
 

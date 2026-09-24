@@ -247,6 +247,7 @@ uv run mfq serve \
 | `--max-requests-per-runtime N` | Concurrent requests per worker. | `1` |
 | `--log-level LEVEL` | Uvicorn log level. | `info` |
 | `--backend {auto,cuda,metal}` | Select or detect the native backend. | `auto` |
+| `--transport {stdio,http}` | Python-to-native-runtime communication transport. | `stdio` |
 
 When the current database does not yet exist, an existing legacy Studio
 database named `mfq-server.sqlite3` and its matching media directory are reused

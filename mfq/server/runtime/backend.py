@@ -1,10 +1,8 @@
-"""Streaming adapter for the existing MFQ OpenAI-compatible text server."""
+"""Python API adapter for MFQ native runtime transports."""
 
 from __future__ import annotations
 
 import asyncio
-import inspect
-import json
 import os
 import time
 from collections.abc import AsyncIterator, Sequence
@@ -12,11 +10,9 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
-import httpx
-
+from mfq.server.runtime.capabilities import capabilities_for_architecture
 from mfq.server.protocol.input_protocols import render_preformatted_prompt
 from mfq.server.protocol.models import (
     ModelCapabilities,
@@ -32,32 +28,16 @@ from mfq.server.protocol.output_protocols import (
     ParsedToolCall,
     output_protocol_for_architecture,
 )
-from mfq.server.runtime.capabilities import capabilities_for_architecture
+from mfq.server.runtime.client import (
+    BackendError,
+    BackendProtocolError,
+    RuntimeClient,
+)
 from mfq.server.vision import (
     MiniCPMO45VisionProcessor,
     VisionProcessingError,
     multimodal_processor_for_architecture,
 )
-
-
-class BackendError(RuntimeError):
-    def __init__(
-        self,
-        code: str,
-        message: str,
-        *,
-        retryable: bool = False,
-        status_code: int | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.code = code
-        self.retryable = retryable
-        self.status_code = status_code
-
-
-class BackendProtocolError(BackendError):
-    def __init__(self, message: str) -> None:
-        super().__init__("backend_protocol_error", message)
 
 
 @dataclass(frozen=True)
@@ -170,56 +150,18 @@ async def closing_backend_stream(
             await close()
 
 
-async def iter_sse_data(response: httpx.Response) -> AsyncIterator[str]:
-    """Yield complete SSE data fields while ignoring comments and metadata."""
-
-    data_lines: list[str] = []
-    async for line in response.aiter_lines():
-        if line == "":
-            if data_lines:
-                yield "\n".join(data_lines)
-                data_lines.clear()
-            continue
-        if line.startswith(":"):
-            continue
-        if line.startswith("data:"):
-            value = line[5:]
-            data_lines.append(value[1:] if value.startswith(" ") else value)
-    if data_lines:
-        yield "\n".join(data_lines)
-
-
 class OpenAIChatBackend:
-    """Forward text generation to MFQ's existing C++ streaming endpoint."""
+    """Translate Python-owned chat semantics to native runtime operations."""
 
     def __init__(
         self,
-        base_url: str,
+        runtime: RuntimeClient,
         *,
-        api_key: str = "",
-        client: httpx.AsyncClient | None = None,
         avfoundation_video_library: str | Path | None = None,
         local_tensor_files: bool = False,
         model_type: str | None = None,
-        control_timeout_seconds: float = 30.0,
-        long_control_timeout_seconds: float = 1800.0,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
-        self._owns_client = client is None
-        self.control_timeout_seconds = max(0.25, control_timeout_seconds)
-        self.long_control_timeout_seconds = max(
-            self.control_timeout_seconds,
-            long_control_timeout_seconds,
-        )
-        hostname = urlsplit(self.base_url).hostname
-        self._client = client or httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5.0, read=None, write=30.0, pool=5.0),
-            # Native runtimes are private loopback workers.  Routing those
-            # requests through a desktop/system HTTP proxy makes readiness
-            # checks hang and could expose local inference traffic.
-            trust_env=hostname not in {"127.0.0.1", "localhost", "::1"},
-        )
+        self._runtime = runtime
         # Managed local workers already have a canonical architecture from the
         # model catalog.  Seed it here so the first text-only request selects
         # the correct prompt/output protocol without depending on a prior
@@ -392,28 +334,11 @@ class OpenAIChatBackend:
             # Processor-owned prompt protocols are selected by the registry;
             # messages and tools remain present for native output constraints.
             payload["mfq_preformatted_prompt"] = preformatted_prompt
-        headers = {"Accept": "text/event-stream"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
         try:
-            async with self._client.stream(
-                "POST",
-                f"{self.base_url}/v1/chat/completions",
-                json=payload,
-                headers=headers,
-            ) as response:
-                if response.status_code >= 400:
-                    body = await response.aread()
-                    raise self._http_error(response.status_code, body)
-                content_type = response.headers.get("content-type", "").lower()
-                if "text/event-stream" not in content_type:
-                    raise BackendProtocolError(
-                        f"backend returned unexpected content type {content_type!r}"
-                    )
+            async with self._runtime.generate(payload) as events:
                 saw_done = False
-                async for data in iter_sse_data(response):
-                    if data == "[DONE]":
+                async for data in events:
+                    if data is None:
                         trailing_reasoning = ""
                         trailing_content = ""
                         if reasoning_parser is not None:
@@ -526,19 +451,12 @@ class OpenAIChatBackend:
                     yield delta
                 if not saw_done:
                     raise BackendProtocolError("backend stream ended without [DONE]")
-        except BackendError:
-            raise
-        except httpx.TimeoutException as error:
-            raise BackendError("backend_timeout", str(error), retryable=True) from error
-        except httpx.HTTPError as error:
-            raise BackendError("backend_connection_error", str(error), retryable=True) from error
         finally:
             for path in cleanup_paths:
                 path.unlink(missing_ok=True)
 
     async def aclose(self) -> None:
-        if self._owns_client:
-            await self._client.aclose()
+        await self._runtime.aclose()
 
     @staticmethod
     def _parsed_tool_call_deltas(
@@ -557,20 +475,13 @@ class OpenAIChatBackend:
         )
 
     async def fork_session(self, source_session_id: UUID, target_session_id: UUID) -> bool:
-        return await self._session_control_request(
-            "POST",
-            "/api/runtime/sessions/fork",
-            json_body={
-                "source_session_id": str(source_session_id),
-                "target_session_id": str(target_session_id),
-            },
+        return await self._runtime.fork_session(
+            str(source_session_id),
+            str(target_session_id),
         )
 
     async def close_session(self, session_id: UUID) -> bool:
-        return await self._session_control_request(
-            "DELETE",
-            f"/api/runtime/sessions/{session_id}",
-        )
+        return await self._runtime.close_session(str(session_id))
 
     async def cancel_response(self, session_id: UUID) -> bool:
         # A stop can race the native request becoming visible after Python-side
@@ -578,44 +489,18 @@ class OpenAIChatBackend:
         # at that boundary without delaying an already-active decode.
         for attempt in range(20):
             try:
-                payload = await self._json_request(
-                    "POST",
-                    f"/api/runtime/sessions/{session_id}/cancel",
-                    timeout_seconds=min(1.0, self.control_timeout_seconds),
-                )
+                if await self._runtime.cancel_response(str(session_id)):
+                    return True
             except BackendError as error:
                 if error.retryable:
                     return False
                 raise
-            if payload.get("cancelled") is True:
-                return True
             if attempt < 19:
                 await asyncio.sleep(0.025)
         return False
 
     async def capabilities(self) -> RuntimeCapabilitiesResource:
-        headers = {}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        try:
-            response = await self._client.get(
-                f"{self.base_url}/health",
-                headers=headers,
-                timeout=self._control_timeout(self.control_timeout_seconds),
-            )
-            if response.status_code >= 400:
-                raise self._http_error(response.status_code, response.content)
-            payload = response.json()
-        except BackendError:
-            raise
-        except (httpx.HTTPError, ValueError) as error:
-            raise BackendError(
-                "backend_capabilities_unavailable",
-                str(error),
-                retryable=True,
-            ) from error
-        if not isinstance(payload, dict):
-            raise BackendProtocolError("backend health must be a JSON object")
+        payload = await self._runtime.health()
         model = str(payload.get("model") or "mfq-model")
         model_type = str(payload.get("model_type") or "unknown")
         self._model_type = model_type
@@ -672,12 +557,11 @@ class OpenAIChatBackend:
 
     async def runtime_status(self) -> dict[str, Any]:
         try:
-            status = await self._json_request("GET", "/api/status")
+            status = await self._runtime.status()
         except BackendError as error:
             if error.code not in {"backend_http_404", "not_found"}:
                 raise
-            health = await self._json_request("GET", "/health")
-            return {**health, "limited": True}
+            return {**(await self._runtime.health()), "limited": True}
         last_request = status.get("last_request")
         if isinstance(last_request, dict):
             request_id = last_request.get("id")
@@ -729,134 +613,27 @@ class OpenAIChatBackend:
             self._runtime_metric_overrides.pop(next(iter(self._runtime_metric_overrides)))
 
     async def runtime_models(self) -> dict[str, Any]:
-        return await self._json_request("GET", "/v1/models")
+        return await self._runtime.models()
 
     async def realtime_capabilities(self) -> dict[str, Any]:
-        return await self._json_request("GET", "/realtime/capabilities")
+        return await self._runtime.realtime_capabilities()
 
     async def reload_runtime(self, context_size: int) -> dict[str, Any]:
-        return await self._json_request(
-            "POST",
-            "/api/reload",
-            json_body={"context_size": context_size},
-            timeout_seconds=self.long_control_timeout_seconds,
-        )
+        return await self._runtime.reload(context_size)
 
     async def clear_runtime_cache(self) -> dict[str, Any]:
-        return await self._json_request(
-            "POST",
-            "/api/runtime/cache/clear",
-            timeout_seconds=self.long_control_timeout_seconds,
-        )
+        return await self._runtime.clear_cache()
 
     async def trim_runtime_cache(self, target_bytes: int = 0) -> dict[str, Any]:
         if target_bytes < 0:
             raise ValueError("target_bytes must be non-negative")
-        return await self._json_request(
-            "POST",
-            "/api/runtime/cache/trim",
-            json_body={"target_bytes": target_bytes},
-        )
+        return await self._runtime.trim_cache(target_bytes)
 
     def realtime_connect(self, *, mode: str = "audio") -> Any:
-        import websockets
-
-        parsed = urlsplit(self.base_url)
-        scheme = "wss" if parsed.scheme == "https" else "ws"
-        url = urlunsplit((scheme, parsed.netloc, "/v1/realtime", f"mode={mode}", ""))
-        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else None
-        parameters = inspect.signature(websockets.connect).parameters
-        options: dict[str, Any] = {"max_size": 128 * 1024 * 1024}
-        if "proxy" in parameters:
-            options["proxy"] = None
-        if headers:
-            header_name = (
-                "additional_headers" if "additional_headers" in parameters else "extra_headers"
-            )
-            options[header_name] = headers
-        return websockets.connect(url, **options)
-
-    async def _json_request(
-        self,
-        method: str,
-        path: str,
-        *,
-        json_body: dict[str, Any] | None = None,
-        timeout_seconds: float | None = None,
-    ) -> dict[str, Any]:
-        headers = {}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        try:
-            response = await self._client.request(
-                method,
-                f"{self.base_url}{path}",
-                json=json_body,
-                headers=headers,
-                timeout=self._control_timeout(
-                    self.control_timeout_seconds
-                    if timeout_seconds is None
-                    else timeout_seconds
-                ),
-            )
-            if response.status_code >= 400:
-                raise self._http_error(response.status_code, response.content)
-            payload = response.json()
-        except BackendError:
-            raise
-        except httpx.TimeoutException as error:
-            raise BackendError("backend_timeout", str(error), retryable=True) from error
-        except httpx.HTTPError as error:
-            raise BackendError(
-                "backend_connection_error",
-                str(error),
-                retryable=True,
-            ) from error
-        except ValueError as error:
-            raise BackendError("backend_protocol_error", str(error)) from error
-        if not isinstance(payload, dict):
-            raise BackendProtocolError(f"backend {path} response must be a JSON object")
-        return payload
-
-    async def _session_control_request(
-        self,
-        method: str,
-        path: str,
-        *,
-        json_body: dict[str, str] | None = None,
-    ) -> bool:
-        headers = {}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        try:
-            response = await self._client.request(
-                method,
-                f"{self.base_url}{path}",
-                json=json_body,
-                headers=headers,
-                timeout=self._control_timeout(self.control_timeout_seconds),
-            )
-        except httpx.HTTPError:
-            return False
-        return bool(200 <= response.status_code < 300)
+        return self._runtime.realtime_connect(mode=mode)
 
     @staticmethod
-    def _control_timeout(seconds: float) -> httpx.Timeout:
-        return httpx.Timeout(
-            seconds,
-            connect=min(5.0, seconds),
-            write=min(30.0, seconds),
-            pool=min(5.0, seconds),
-        )
-
-    @staticmethod
-    def _parse_event(data: str) -> BackendDelta:
-        try:
-            event = json.loads(data)
-        except json.JSONDecodeError as error:
-            raise BackendProtocolError(f"backend returned invalid SSE JSON: {error}") from error
-        if not isinstance(event, dict):
-            raise BackendProtocolError("backend SSE data must be a JSON object")
+    def _parse_event(event: dict[str, Any]) -> BackendDelta:
         raw_request_id = event.get("id")
         backend_request_id = raw_request_id if isinstance(raw_request_id, str) else None
         if "error" in event:
@@ -948,21 +725,3 @@ class OpenAIChatBackend:
             )
         return tuple(parsed)
 
-    @staticmethod
-    def _http_error(status_code: int, body: bytes) -> BackendError:
-        code = f"backend_http_{status_code}"
-        message = body.decode("utf-8", errors="replace") or f"backend returned HTTP {status_code}"
-        try:
-            parsed = json.loads(body)
-            detail = parsed.get("error") if isinstance(parsed, dict) else None
-            if isinstance(detail, dict):
-                code = str(detail.get("code") or detail.get("type") or code)
-                message = str(detail.get("message") or message)
-        except json.JSONDecodeError:
-            pass
-        return BackendError(
-            code,
-            message,
-            retryable=status_code in {429, 502, 503, 504},
-            status_code=status_code,
-        )

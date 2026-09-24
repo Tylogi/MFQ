@@ -357,7 +357,8 @@ def test_studio_adapts_prefix_cache_panel_to_flash_next_hot_cache():
     assert 'prefix_cache_pending_max_bytes?: number;' in API
     assert 'runtime?.prefix_cache_mode === "single_device_hot_prefix"' in APP
     assert "const prefixCachePersistent" in APP
-    assert "const prefixCacheSupported = prefixCachePersistent || prefixCacheHotOnly" in APP
+    assert "runtime?.prefix_cache_supported !== undefined" in APP
+    assert "prefixCachePersistent || prefixCacheHotOnly" in APP
     assert 'tr("设备热前缀", "Device-hot prefix")' in APP
     assert 'tr("进程生命周期", "Process lifetime")' in APP
     assert "device-hot prefix? Chat history will be kept." in APP

@@ -1,0 +1,203 @@
+#pragma once
+
+#include "cuda_execution.h"
+#include "mfq_cuda_ops.h"
+#include "mfq/model_source.h"
+
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+struct Workspace {
+    int M = 0;
+    int K_pad = 0;
+    mfq_tensor_backend::Tensor qx;
+    mfq_tensor_backend::Tensor xscale;
+};
+
+struct NintWeight {
+    mfq_tensor_backend::Tensor q_packed;
+    mfq_tensor_backend::Tensor row_q_bits;
+    mfq_tensor_backend::Tensor row_q_bit_offsets;
+    mfq_tensor_backend::Tensor q8_zero_scale;
+    mfq_tensor_backend::Tensor sub_scale;
+    mfq_tensor_backend::Tensor sub_min;
+    mfq_tensor_backend::Tensor neuron_scale;
+    mfq_tensor_backend::Tensor neuron_min;
+    int64_t out = 0;
+    int64_t ng = 0;
+    int64_t gs = 0;
+    int64_t bits = 0;
+    int64_t neuron_len = 0;
+    int64_t q_expert_stride = 0;
+    int format_version = 2;
+    double aggregate_bpw = 0.0;
+    double distribution_entropy = 0.0;
+    bool q8_zero = false;
+    std::vector<int64_t> shape;
+    mutable std::unordered_map<int, Workspace> workspaces;
+
+    Workspace & workspace(int M) const {
+        int K_pad = (int)(ng * gs);
+        auto it = workspaces.find(M);
+        if (it != workspaces.end() && it->second.K_pad == K_pad) return it->second;
+        Workspace ws;
+        ws.M = M;
+        ws.K_pad = K_pad;
+        const auto workspace_options = q_packed.options();
+        ws.qx = mfq_tensor_backend::empty(
+            {M, K_pad}, workspace_options.dtype(mfq_tensor_backend::kInt8));
+        ws.xscale = mfq_tensor_backend::empty(
+            {M, ng}, workspace_options.dtype(mfq_tensor_backend::kFloat32));
+        auto res = workspaces.emplace(M, std::move(ws));
+        return res.first->second;
+    }
+
+};
+
+mfq_tensor_backend::Tensor nint_matmul(
+    const NintWeight& weight, mfq_tensor_backend::Tensor input);
+mfq_tensor_backend::Tensor nint_matmul_bf16_output(
+    const NintWeight& weight, mfq_tensor_backend::Tensor input);
+mfq_tensor_backend::Tensor nint_matmul_input_mul(
+    const NintWeight& weight,
+    mfq_tensor_backend::Tensor input,
+    mfq_tensor_backend::Tensor gate,
+    int mode);
+mfq_tensor_backend::Tensor nint_matmul_input_mul_f32_kld(
+    const NintWeight& weight,
+    mfq_tensor_backend::Tensor input,
+    mfq_tensor_backend::Tensor gate,
+    int mode);
+mfq_tensor_backend::Tensor nint_matmul_swiglu(
+    const NintWeight& weight, mfq_tensor_backend::Tensor input);
+mfq_tensor_backend::Tensor nint_matmul_geglu(
+    const NintWeight& weight, mfq_tensor_backend::Tensor input);
+
+struct NintLinear {
+    NintWeight w;
+    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x) const {
+        auto shape = x.sizes().vec();
+        int64_t last = shape.back();
+        (void)last;
+        auto y = nint_matmul(w, x.reshape({-1, x.size(-1)}));
+        shape.back() = y.size(-1);
+        return y.reshape(shape);
+    }
+    mfq_tensor_backend::Tensor forward_bf16_output(mfq_tensor_backend::Tensor x) const {
+        return nint_matmul_bf16_output(w, x);
+    }
+    mfq_tensor_backend::Tensor forward_input_mul(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate, int mode) const {
+        auto shape = x.sizes().vec();
+        auto y = nint_matmul_input_mul(w, x.reshape({-1, x.size(-1)}), gate.reshape({-1, gate.size(-1)}), mode);
+        shape.back() = y.size(-1);
+        return y.reshape(shape);
+    }
+    mfq_tensor_backend::Tensor forward_input_mul_f32_kld(
+            mfq_tensor_backend::Tensor x,
+            mfq_tensor_backend::Tensor gate,
+            int mode) const {
+        auto shape = x.sizes().vec();
+        auto y = nint_matmul_input_mul_f32_kld(
+            w,
+            x.reshape({-1, x.size(-1)}),
+            gate.reshape({-1, gate.size(-1)}),
+            mode);
+        shape.back() = y.size(-1);
+        return y.reshape(shape);
+    }
+};
+
+struct NintCpu {
+    int format_version = 2;
+    int bits = 0;
+    int sub_bits = 0;
+    int gs = 0;
+    int axis = 0;
+    int neuron_len = 0;
+    std::vector<int64_t> shape;
+    int out = 0;
+    int ng = 0;
+    std::vector<uint8_t> q_packed;
+    std::vector<uint8_t> row_q_bits;
+    std::vector<int64_t> row_q_bit_offsets;
+    std::vector<uint8_t> row_sub_bits;
+    std::vector<uint8_t> sub_scale;
+    std::vector<uint8_t> sub_min;
+    std::vector<uint16_t> neuron_scale_h;
+    std::vector<uint16_t> neuron_min_h;
+    double aggregate_bpw = 0.0;
+    double distribution_entropy = 0.0;
+};
+
+struct Nint8ZeroCpu {
+    int axis = 0;
+    int neuron_len = 0;
+    std::vector<int64_t> shape;
+    int out = 0;
+    int ng = 0;
+    std::vector<uint8_t> q;
+    std::vector<uint16_t> scale_h;
+};
+
+struct CpuQuantizedActivation {
+    int64_t rows = 0;
+    int64_t groups = 0;
+    int64_t group_size = 0;
+    std::vector<int8_t> values;
+    std::vector<float> scales;
+    std::vector<int32_t> sums;
+};
+
+void require_tp_row_major_weight(
+    const std::vector<int64_t>& shape,
+    int axis,
+    int out,
+    int neuron_len,
+    const char* format);
+NintCpu unpack_nint(const std::vector<uint8_t>& blob);
+Nint8ZeroCpu unpack_nint8_zero(const std::vector<uint8_t>& blob);
+NintCpu slice_nint_cpu_output(
+    const NintCpu& source, int64_t begin, int64_t end);
+NintCpu slice_nint_cpu_input_groups(
+    const NintCpu& source, int64_t begin, int64_t end);
+NintCpu select_nint_cpu_rows(
+    const NintCpu& source, const std::vector<int64_t>& rows);
+Nint8ZeroCpu slice_nint8_zero_cpu_output(
+    const Nint8ZeroCpu& source, int64_t begin, int64_t end);
+Nint8ZeroCpu slice_nint8_zero_cpu_input_groups(
+    const Nint8ZeroCpu& source, int64_t begin, int64_t end);
+Nint8ZeroCpu select_nint8_zero_cpu_rows(
+    const Nint8ZeroCpu& source, const std::vector<int64_t>& rows);
+NintWeight to_device_nint(const NintCpu& source, bool cuda);
+NintWeight to_gpu_nint(const NintCpu& source);
+NintWeight to_cuda_device_nint(const NintCpu& source, int device);
+NintWeight to_cpu_nint(const NintCpu& source);
+NintWeight to_device_mfe_nint(
+    const NintCpu& source, int local_experts, int out_per_expert, bool cuda);
+NintWeight to_device_nint8_zero(const Nint8ZeroCpu& source, bool cuda);
+NintWeight to_gpu_nint8_zero(const Nint8ZeroCpu& source);
+NintWeight to_cuda_device_nint8_zero(
+    const Nint8ZeroCpu& source, int device);
+NintWeight to_cpu_nint8_zero(const Nint8ZeroCpu& source);
+NintWeight load_nint_gpu(
+    const mfq::ModelSource& source, const std::string& name);
+mfq_tensor_backend::Tensor dequant_nint8_zero_cpu(
+    const Nint8ZeroCpu& source);
+
+mfq_tensor_backend::Tensor pad_last(
+    mfq_tensor_backend::Tensor input, int64_t target);
+uint32_t cpu_load_packed_bits(
+    const uint8_t* data, int64_t nbytes, int64_t bit, int bits);
+int32_t cpu_dot_s8_s8_64(
+    const int8_t* left, const int8_t* right, int32_t right_sum);
+int32_t cpu_dot_u8_s8_64(
+    const uint8_t* left, const int8_t* right);
+void cpu_unpack_nint_group(
+    const uint8_t* packed, int bits, int valid, uint8_t* values);
+void cpu_unpack_nint_group_at_bit_offset(
+    const uint8_t* packed, uint64_t bit_offset, int bits, int valid, uint8_t* values);
+CpuQuantizedActivation cpu_quantize_activation(
+    mfq_tensor_backend::Tensor input, int64_t width, int64_t group_size, bool with_sums);
+float cpu_half_from_bytes(const int8_t* bytes, int64_t offset);

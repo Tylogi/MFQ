@@ -93,6 +93,8 @@ def test_serve_exposes_public_host_and_port_options(tmp_path: Path) -> None:
             "12G",
             "--runtime-idle-timeout",
             "300",
+            "--transport",
+            "HTTP",
         ]
     )
 
@@ -108,11 +110,13 @@ def test_serve_exposes_public_host_and_port_options(tmp_path: Path) -> None:
     assert defaults.no_memory_guard is False
     assert defaults.moe_gpu_cache_gb is None
     assert defaults.runtime_idle_timeout is None
+    assert defaults.transport == "stdio"
     assert args.host == "0.0.0.0"
     assert args.port == 9001
     assert args.max_queued_requests_per_runtime == 7
     assert args.max_runtime_memory == 12 * 1024**3
     assert args.runtime_idle_timeout == 300
+    assert args.transport == "http"
 
 
 def test_serve_accepts_an_explicit_expert_cache_budget() -> None:
@@ -237,7 +241,7 @@ def test_prebuilt_cuda_runtime_does_not_require_a_local_compiler(monkeypatch) ->
         lambda _: (_ for _ in ()).throw(AssertionError("must not require nvcc")),
     )
 
-    assert _select_backend("auto", Path("mfq-decode")) == "cuda"
+    assert _select_backend("auto", Path("mfq-runtime")) == "cuda"
 
 
 def test_serve_rebuilds_a_missing_runtime_from_its_recorded_recipe(
@@ -270,7 +274,7 @@ def test_serve_rebuilds_a_missing_runtime_from_its_recorded_recipe(
 
 def test_native_cuda_worker_is_private_and_uses_a_loopback_port(tmp_path: Path) -> None:
     runtime = NativeRuntime(
-        executable=tmp_path / "mfq-decode",
+        executable=tmp_path / "mfq-runtime",
         model=tmp_path / "model.mfq",
         model_name="model",
         backend="cuda",
@@ -280,6 +284,7 @@ def test_native_cuda_worker_is_private_and_uses_a_loopback_port(tmp_path: Path) 
     command = runtime.command(43123)
 
     assert command[:3] == [str(runtime.executable), "--model", str(runtime.model)]
+    assert command[command.index("--transport") + 1] == "http"
     assert command[command.index("--host") + 1] == "127.0.0.1"
     assert command[command.index("--port") + 1] == "43123"
     assert command[command.index("--ctx-size") + 1] == "32768"
@@ -290,7 +295,7 @@ def test_native_cuda_worker_forwards_explicit_continuous_batching(
     tmp_path: Path,
 ) -> None:
     runtime = NativeRuntime(
-        executable=tmp_path / "mfq-decode",
+        executable=tmp_path / "mfq-runtime",
         model=tmp_path / "model.mfq",
         model_name="model",
         backend="cuda",
@@ -351,7 +356,7 @@ def test_native_metal_worker_receives_prefill_chunk_size(tmp_path: Path) -> None
 
 def test_native_cuda_worker_receives_prefill_chunk_size(tmp_path: Path) -> None:
     runtime = NativeRuntime(
-        executable=tmp_path / "mfq-decode-cuda",
+        executable=tmp_path / "mfq-runtime",
         model=tmp_path / "model.mfq",
         model_name="model",
         backend="cuda",
@@ -485,7 +490,11 @@ def test_serve_can_disable_web_ui_build() -> None:
     assert _prepare_web_root(None, disabled=True) is None
 
 
-def test_serve_starts_without_loading_an_initial_model(tmp_path: Path, monkeypatch) -> None:
+def test_serve_starts_without_loading_an_initial_model(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
     executable = tmp_path / "mfq-decode-metal"
     executable.write_bytes(b"runtime")
     data_dir = tmp_path / ".mfq"
@@ -519,6 +528,7 @@ def test_serve_starts_without_loading_an_initial_model(tmp_path: Path, monkeypat
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 8090
     assert captured["access_log"] is True
+    assert "MFQ Server ready" not in capsys.readouterr().out
     assert (data_dir / "server.sqlite3").is_file()
     assert (data_dir / "media").is_dir()
     assert (data_dir / "models").is_dir()

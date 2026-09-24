@@ -3,7 +3,8 @@
 #include "causal_lm.h"
 #include "grid_vision.h"
 #include "mfq_cuda_ops.h"
-#include "mfq/server.h"
+#include "mfq_paged_prefix_cache.h"
+#include "mfq/runtime.h"
 
 #include <algorithm>
 #include <cmath>
@@ -435,23 +436,46 @@ public:
             throw std::invalid_argument(
                 "CUDA grid-Vision image geometry is invalid");
         }
-        auto pixels = mfq_tensor_backend::from_blob(
-            const_cast<float*>(media.pixel_values.data()), media.pixel_shape,
-            mfq_tensor_backend::TensorOptions()
-                .dtype(mfq_tensor_backend::kFloat32)
-                .device(mfq_tensor_backend::kCPU)).clone()
-            .to(mfq_tensor_backend::kCUDA);
-        auto patches = encoder_.encode(std::move(pixels), {grid});
-        const int64_t unit = encoder_.config().spatial_merge_size *
-            encoder_.config().spatial_merge_size;
-        if (patches.size(0) % unit != 0) {
-            throw std::runtime_error(
-                "grid-Vision patch count is not divisible by merge unit");
+        std::string cache_key = input_contract_ + '|' + position_policy_ +
+            '|' + mfq::cache::block_hash_hex(mfq::cache::sha256(
+                media.pixel_values.data(),
+                media.pixel_values.size() * sizeof(float)));
+        for (const auto value : media.pixel_shape) {
+            cache_key.push_back('|');
+            cache_key += std::to_string(value);
         }
-        auto merged = merger_down_(mfq_tensor_backend::gelu(
-            merger_up_(merger_norm_(patches).reshape(
-                {patches.size(0) / unit,
-                 unit * encoder_.config().hidden_size})), "none"));
+        for (const auto value : media.vision_grid) {
+            cache_key.push_back('|');
+            cache_key += std::to_string(value);
+        }
+
+        Tensor merged;
+        if (cached_vision_key_ == cache_key && cached_vision_.defined()) {
+            merged = cached_vision_;
+        } else {
+            auto pixels = mfq_tensor_backend::from_blob(
+                const_cast<float*>(media.pixel_values.data()),
+                media.pixel_shape,
+                mfq_tensor_backend::TensorOptions()
+                    .dtype(mfq_tensor_backend::kFloat32)
+                    .device(mfq_tensor_backend::kCPU)).clone()
+                .to(mfq_tensor_backend::kCUDA);
+            auto patches = encoder_.encode(std::move(pixels), {grid});
+            const int64_t unit = encoder_.config().spatial_merge_size *
+                encoder_.config().spatial_merge_size;
+            if (patches.size(0) % unit != 0) {
+                throw std::runtime_error(
+                    "grid-Vision patch count is not divisible by merge unit");
+            }
+            merged = merger_down_(mfq_tensor_backend::gelu(
+                merger_up_(merger_norm_(patches).reshape(
+                    {patches.size(0) / unit,
+                     unit * encoder_.config().hidden_size})), "none"));
+            // ponytail: one image is the current native contract; use an LRU
+            // only when alternating concurrent images becomes measurable.
+            cached_vision_key_ = cache_key;
+            cached_vision_ = merged;
+        }
 
         auto ids = mfq_tensor_backend::tensor(
             token_ids,
@@ -495,7 +519,7 @@ public:
             .to(mfq_tensor_backend::kInt64);
         return {
             token_ids, std::move(embeddings), std::move(position_tensor),
-            positions.decode_delta};
+            positions.decode_delta, std::move(cache_key)};
     }
 
     const std::string& input_contract() const noexcept {
@@ -532,6 +556,8 @@ private:
     int64_t video_token_id_ = -1;
     std::string input_contract_;
     std::string position_policy_;
+    mutable std::string cached_vision_key_;
+    mutable Tensor cached_vision_;
 };
 
 } // namespace mfq::cuda::grid_vision_runtime

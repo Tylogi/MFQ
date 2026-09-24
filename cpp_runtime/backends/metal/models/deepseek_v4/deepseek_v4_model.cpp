@@ -38,27 +38,6 @@ json parse_json(
 
 json config_object(const json& root) {
     json value = root;
-    auto embedded = value.find("tpq_manifest");
-    if (embedded != value.end()) {
-        if (embedded->is_string()) {
-            value = parse_json(
-                embedded->get<std::string>(),
-                "DeepSeek-V4 TPQ manifest");
-        } else if (embedded->is_object()) {
-            value = *embedded;
-        } else {
-            throw std::runtime_error(
-                "DeepSeek-V4 tpq_manifest must be an object");
-        }
-    }
-    const auto manifest_config = value.find("config");
-    if (manifest_config != value.end()) {
-        if (!manifest_config->is_object()) {
-            throw std::runtime_error(
-                "DeepSeek-V4 manifest config must be an object");
-        }
-        value = *manifest_config;
-    }
     const auto text_config = value.find("text_config");
     if (text_config != value.end() &&
         !value.contains("n_layers") &&
@@ -501,38 +480,18 @@ bool is_nint_dtype(std::string_view dtype) {
     return dtype == "NINT";
 }
 
-bool is_tpq_pq_dtype(std::string_view dtype) {
-    return dtype == "TPQ-X" ||
-        dtype == "TPQ-W" ||
-        dtype == "TPQ-V" ||
-        dtype == "TPQ-VV";
-}
-
-bool is_tpq_int4_dtype(std::string_view dtype) {
-    return dtype == "TPQ-I4G64";
-}
-
-bool is_tpq_tier(
-    std::string_view dtype,
-    std::string_view tier) {
-    return dtype == "TPQ-" + std::string(tier);
-}
-
 bool is_linear_dtype(std::string_view dtype) {
     return is_dense_float_dtype(dtype) ||
         is_mx_dtype(dtype) ||
         is_nint_dtype(dtype) ||
-        dtype == "NINT8-0" ||
-        is_tpq_int4_dtype(dtype) ||
-        is_tpq_pq_dtype(dtype);
+        dtype == "NINT8-0";
 }
 
 bool is_embedding_dtype(std::string_view dtype) {
     return is_dense_float_dtype(dtype) ||
         is_mx_dtype(dtype) ||
         is_nint_dtype(dtype) ||
-        dtype == "NINT8-0" ||
-        is_tpq_int4_dtype(dtype);
+        dtype == "NINT8-0";
 }
 
 void add_binding(
@@ -759,54 +718,8 @@ DeepseekV4Config DeepseekV4Config::from_mfq(
     if (model.contains(model_config_asset)) {
         return from_json(model.read_text(model_config_asset));
     }
-    // Temporary pre-schema TPQ compatibility. New artifacts always carry the
-    // common model-config asset; remove this branch with the TPQ runtime.
-    if (model.header().architecture !=
-            "deepseek_v4-tpq-mfq") {
-        throw std::runtime_error(
-            "DeepSeek-V4 MFQ has no embedded model_config.json asset");
-    }
-    const auto source =
-        model.header().extra_json.find("source_format");
-    auto manifest =
-        model.header().extra_json.find("tpq_manifest");
-    if (source == model.header().extra_json.end() ||
-        manifest == model.header().extra_json.end()) {
-        throw std::runtime_error(
-            "DeepSeek-V4 C++ loading requires native TPQ metadata");
-    }
-
-    json source_value;
-    try {
-        source_value = json::parse(source->second);
-    } catch (const json::exception& error) {
-        throw std::runtime_error(
-            std::string("invalid DeepSeek-V4 source_format metadata: ") +
-            error.what());
-    }
-    if (!source_value.is_string() ||
-        source_value.get<std::string>() != "tpq-1") {
-        throw std::runtime_error(
-            "DeepSeek-V4 C++ loading requires source_format=tpq-1");
-    }
-
-    const auto manifest_value = parse_json(
-        manifest->second,
-        "DeepSeek-V4 TPQ manifest");
-    const auto format = manifest_value.find("format");
-    if (format != manifest_value.end() &&
-        (!format->is_string() ||
-         format->get<std::string>() != "tpq-1")) {
-        throw std::runtime_error(
-            "unsupported DeepSeek-V4 TPQ manifest format");
-    }
-    const auto config = manifest_value.find("config");
-    if (config == manifest_value.end() ||
-        !config->is_object()) {
-        throw std::runtime_error(
-            "DeepSeek-V4 TPQ manifest lacks config");
-    }
-    return from_json(config->dump());
+    throw std::runtime_error(
+        "DeepSeek-V4 MFQ has no embedded model_config.json asset");
 }
 
 void DeepseekV4Config::validate() const {
@@ -1503,160 +1416,6 @@ inspect_deepseek_v4_tensor_metadata(
                     neuron_len / 32)) {
             throw std::runtime_error(
                 "inconsistent DeepSeek-V4 NINT8-0 header: " +
-                name);
-        }
-        return result;
-    }
-
-    if (is_tpq_int4_dtype(record.dtype)) {
-        result.packed = true;
-        if (cursor.bytes(4, "TPQ-I4 magic") != "CI41" ||
-            cursor.scalar<std::uint8_t>(
-                "TPQ-I4 version") != 1) {
-            throw std::runtime_error(
-                "invalid DeepSeek-V4 TPQ-I4 header: " +
-                name);
-        }
-        cursor.skip(3, "TPQ-I4 padding");
-        const auto group_size =
-            cursor.scalar<std::uint32_t>(
-                "TPQ-I4 group size");
-        const auto axis =
-            cursor.scalar<std::int32_t>("TPQ-I4 axis");
-        const auto neuron_len =
-            cursor.scalar<std::int32_t>(
-                "TPQ-I4 neuron length");
-        result.shape = read_shape(
-            cursor,
-            cursor.scalar<std::uint32_t>(
-                "TPQ-I4 dimension count"),
-            name);
-        const auto rows =
-            cursor.scalar<std::uint32_t>("TPQ-I4 rows");
-        const auto groups =
-            cursor.scalar<std::uint32_t>("TPQ-I4 groups");
-        if (group_size != 64 || axis != 0 ||
-            result.shape.size() != 2 ||
-            result.shape[0] != rows ||
-            result.shape[1] != neuron_len ||
-            neuron_len % 64 != 0 ||
-            groups !=
-                static_cast<std::uint32_t>(
-                    neuron_len / 64)) {
-            throw std::runtime_error(
-                "inconsistent DeepSeek-V4 TPQ-I4 dimensions: " +
-                name);
-        }
-        const auto values = checked_multiply(
-            rows,
-            static_cast<std::uint64_t>(neuron_len / 2),
-            name);
-        const auto scales = checked_multiply(
-            checked_multiply(rows, groups, name),
-            2,
-            name);
-        const auto expected = checked_add(
-            checked_add(
-                static_cast<std::uint64_t>(cursor.offset()),
-                values,
-                name),
-            scales,
-            name);
-        if (expected != record.nbytes) {
-            throw std::runtime_error(
-                "invalid DeepSeek-V4 TPQ-I4 tensor length: " +
-                name);
-        }
-        return result;
-    }
-
-    if (is_tpq_pq_dtype(record.dtype)) {
-        result.packed = true;
-        if (cursor.bytes(4, "TPQ-PQ magic") != "CPQ1" ||
-            cursor.scalar<std::uint8_t>(
-                "TPQ-PQ version") != 1) {
-            throw std::runtime_error(
-                "invalid DeepSeek-V4 TPQ-PQ header: " +
-                name);
-        }
-        const auto tier =
-            cursor.scalar<std::uint8_t>("TPQ-PQ tier");
-        const auto vector_size =
-            cursor.scalar<std::uint8_t>(
-                "TPQ-PQ vector size");
-        const auto index_bits =
-            cursor.scalar<std::uint8_t>(
-                "TPQ-PQ index bits");
-        const auto axis =
-            cursor.scalar<std::int32_t>("TPQ-PQ axis");
-        const auto neuron_len =
-            cursor.scalar<std::int32_t>(
-                "TPQ-PQ neuron length");
-        result.shape = read_shape(
-            cursor,
-            cursor.scalar<std::uint32_t>(
-                "TPQ-PQ dimension count"),
-            name);
-        const auto entries =
-            cursor.scalar<std::uint32_t>(
-                "TPQ-PQ codebook entries");
-        const auto rows =
-            cursor.scalar<std::uint32_t>("TPQ-PQ rows");
-        const bool storage_matches =
-            (entries == 256 &&
-             (index_bits == 8 ||
-              index_bits == 12 ||
-              index_bits == 14)) ||
-            (entries == 4096 &&
-             (index_bits == 12 ||
-              index_bits == 14 ||
-              index_bits == 16));
-        const bool tier_matches =
-            (is_tpq_tier(record.dtype, "X") &&
-             tier == 1 && vector_size == 8 &&
-             entries == 256) ||
-            (is_tpq_tier(record.dtype, "W") &&
-             tier == 2 && vector_size == 8 &&
-             entries == 4096) ||
-            (is_tpq_tier(record.dtype, "V") &&
-             tier == 3 && vector_size == 4 &&
-             entries == 256) ||
-            (is_tpq_tier(record.dtype, "VV") &&
-             tier == 4 && vector_size == 4 &&
-             entries == 4096);
-        if (!tier_matches || !storage_matches || axis != 0 ||
-            result.shape.size() != 2 ||
-            result.shape[0] != rows ||
-            result.shape[1] != neuron_len ||
-            neuron_len % vector_size != 0) {
-            throw std::runtime_error(
-                "inconsistent DeepSeek-V4 TPQ-PQ dimensions: " +
-                name);
-        }
-        const auto codebook = checked_multiply(
-            checked_multiply(entries, vector_size, name),
-            4,
-            name);
-        const auto indices =
-            checked_multiply(
-                rows,
-                static_cast<std::uint64_t>(
-                    neuron_len / vector_size),
-                name);
-        const auto index_bytes = checked_add(
-            checked_multiply(indices, index_bits, name),
-            7,
-            name) / 8;
-        const auto expected = checked_add(
-            checked_add(
-                static_cast<std::uint64_t>(cursor.offset()),
-                codebook,
-                name),
-            index_bytes,
-            name);
-        if (expected != record.nbytes) {
-            throw std::runtime_error(
-                "invalid DeepSeek-V4 TPQ-PQ tensor length: " +
                 name);
         }
         return result;

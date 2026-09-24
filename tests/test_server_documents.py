@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from mfq.server.protocol.models import CreateDocumentRequest, CreateSessionRequest
 from mfq.server.runtime.backend import BackendDelta
 from mfq.server.services.documents import DocumentExtractionError, extract_document
+from mfq.server.protocol.models import CreateDocumentRequest, CreateSessionRequest
 from mfq.server.services.service import ServerService
 from mfq.server.state.storage import SessionStore
 from tests.test_server_service import FakeBackend
