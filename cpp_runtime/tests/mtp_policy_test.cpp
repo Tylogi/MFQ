@@ -1,4 +1,4 @@
-#include "mfq_cuda_mtp.h"
+#include "mtp_policy.h"
 #include <array>
 #include <iostream>
 
@@ -12,7 +12,7 @@ template<class F> void rejects(F&& fn) {
 }
 
 int main() {
-    using namespace mfq::cuda::mtp;
+    using namespace mfq::engine::mtp;
     {
         DepthController controller(3);
         require(controller.depth() == 3);

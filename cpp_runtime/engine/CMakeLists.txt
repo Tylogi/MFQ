@@ -1,0 +1,10 @@
+add_library(mfq-engine STATIC src/text_emitter.cpp)
+add_library(mfq::engine ALIAS mfq-engine)
+target_include_directories(mfq-engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(mfq-engine PUBLIC cxx_std_20)
+set_target_properties(mfq-engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+if(TARGET mfq-tokenizer)
+    target_sources(mfq-engine PRIVATE src/tokenizer.cpp)
+    target_link_libraries(mfq-engine PUBLIC mfq-tokenizer)
+endif()

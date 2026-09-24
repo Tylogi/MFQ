@@ -36,6 +36,11 @@ function(mfq_add_core_test target source)
     add_test(NAME ${target} COMMAND ${target})
 endfunction()
 
+add_executable(mfq-text-emitter-test mfq_text_emitter_test.cpp)
+target_link_libraries(mfq-text-emitter-test PRIVATE mfq-engine)
+target_compile_features(mfq-text-emitter-test PRIVATE cxx_std_17)
+add_test(NAME mfq-text-emitter-test COMMAND mfq-text-emitter-test)
+
 mfq_add_core_test(mfq-model-graph-test mfq_model_graph_test.cpp)
 mfq_add_core_test(mfq-model-source-test model_source_test.cpp)
 mfq_add_core_test(mfq-grid-vision-test grid_vision_test.cpp)
@@ -55,12 +60,10 @@ target_link_libraries(mfq-cuda-model-plan-test PRIVATE mfq-core)
 target_compile_features(mfq-cuda-model-plan-test PRIVATE cxx_std_20)
 add_test(NAME mfq-cuda-model-plan-test COMMAND mfq-cuda-model-plan-test)
 
-add_executable(mfq-cuda-mtp-test
-    ${PROJECT_SOURCE_DIR}/backends/cuda/tests/mfq_cuda_mtp_test.cpp)
-target_include_directories(mfq-cuda-mtp-test PRIVATE
-    ${PROJECT_SOURCE_DIR}/backends/cuda/include)
-target_compile_features(mfq-cuda-mtp-test PRIVATE cxx_std_20)
-add_test(NAME mfq-cuda-mtp-test COMMAND mfq-cuda-mtp-test)
+add_executable(mfq-mtp-policy-test mtp_policy_test.cpp)
+target_link_libraries(mfq-mtp-policy-test PRIVATE mfq-engine)
+target_compile_features(mfq-mtp-policy-test PRIVATE cxx_std_20)
+add_test(NAME mfq-mtp-policy-test COMMAND mfq-mtp-policy-test)
 
 add_executable(mfq-moe-cache-profile-test moe_cache_profile_test.cpp)
 target_link_libraries(mfq-moe-cache-profile-test PRIVATE mfq-core mfq-json)

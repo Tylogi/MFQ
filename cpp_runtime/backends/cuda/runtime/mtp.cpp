@@ -286,7 +286,7 @@ static CompactDistribution positive_residual(
     return residual;
 }
 
-static mfq::cuda::mtp::ChainVerification verify_compact_chain(
+static mfq::engine::mtp::ChainVerification verify_compact_chain(
         std::span<const int32_t> drafts,
         const std::vector<CompactDistribution>& proposals,
         const std::vector<CompactDistribution>& targets,
@@ -336,7 +336,7 @@ int32_t run_mtp_generation(
         double multimodal_ms) {
     using Tensor = mfq_tensor_backend::Tensor;
     using Clock = std::chrono::steady_clock;
-    namespace policy = mfq::cuda::mtp;
+    namespace policy = mfq::engine::mtp;
     const MtpTarget target{
         [&model](Tensor ids) {
             return model.embed_forward(std::move(ids));

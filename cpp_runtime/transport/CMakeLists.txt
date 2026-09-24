@@ -21,6 +21,7 @@ target_link_libraries(mfq-runtime-communication
     PUBLIC
         mfq-runtime-scheduler
     PRIVATE
+        mfq-engine
         mfq-http
         mfq-tokenizer
         mfq-json

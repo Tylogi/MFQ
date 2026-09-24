@@ -52,7 +52,7 @@ SERVER_COMPONENTS = (
 ).read_text(encoding="utf-8")
 CONTRIBUTING = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
 CUDA_MTP_HEADER = (
-    ROOT / "cpp_runtime" / "backends" / "cuda" / "include" / "mfq_cuda_mtp.h"
+    ROOT / "cpp_runtime" / "engine" / "include" / "mtp_policy.h"
 ).read_text(encoding="utf-8")
 CUDA_APP = (
     ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "runtime_main.cpp"

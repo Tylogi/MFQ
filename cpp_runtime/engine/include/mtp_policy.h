@@ -1,8 +1,7 @@
 #pragma once
 
-// Host reference policy for the native CUDA MTP chain. The acceptance and
-// positive-residual correction match Metal runtime/mlx_mtp.cpp at e27c987.
-// Inputs to distribution() have already received the ordinary CUDA penalties.
+// Host-side MTP depth selection and chain verification shared by engines.
+// Inputs to distribution() have already received the sampler's penalties.
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -14,7 +13,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace mfq::cuda::mtp {
+namespace mfq::engine::mtp {
 
 inline constexpr int kMaximumDraftDepth = 5;
 
@@ -319,10 +318,9 @@ inline std::vector<float> distribution(std::span<const float> logits,
     if (logits.empty() || !std::isfinite(temperature) || temperature <= 0. ||
         top_k < 0 || top_k > 1024 || top_k > static_cast<int>(logits.size()) ||
         !std::isfinite(top_p) || top_p <= 0. || top_p > 1.) {
-        throw std::invalid_argument("invalid CUDA MTP sampling geometry");
+        throw std::invalid_argument("invalid MTP sampling geometry");
     }
-    // Preserve the existing CUDA sampler: top_k=0 selects full softmax,
-    // whose current implementation does not apply a nucleus cutoff.
+    // top_k=0 selects full softmax, without a nucleus cutoff.
     if (top_k == 0) top_p = 1.;
     const int vocab = static_cast<int>(logits.size());
     std::vector<int> order(vocab);
@@ -471,4 +469,4 @@ inline ChainVerification verify_stochastic_chain(
     return {drafts.size(), sample(targets.back(), sample_uniform), true};
 }
 
-}  // namespace mfq::cuda::mtp
+}  // namespace mfq::engine::mtp

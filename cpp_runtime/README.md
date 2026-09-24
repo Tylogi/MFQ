@@ -8,6 +8,8 @@ family or source origin:
   `core/compat/`;
 - `transport/` — private stdio/HTTP protocol adapters;
 - `scheduler/` — backend-neutral request dispatch and lifecycle boundary;
+- `engine/` — backend-neutral tokenizer, output processing, and MTP policies;
+  CUDA tensors and device execution stay in `backends/cuda/`;
 - `components/` — focused integrated components (`ggml`, `tokenizer`, `http`,
   and `json`);
 - `backends/cuda/` — the CUDA runtime, scheduler-facing inference engine,

@@ -40,6 +40,11 @@ if(MFQ_BUILD_RUNTIME_COMMUNICATION)
     add_subdirectory(components/ggml)
     add_subdirectory(components/tokenizer)
     add_subdirectory(components/http)
+endif()
+
+add_subdirectory(engine)
+
+if(MFQ_BUILD_RUNTIME_COMMUNICATION)
     add_subdirectory(transport)
 endif()
 

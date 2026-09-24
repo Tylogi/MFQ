@@ -91,7 +91,7 @@ struct CudaEngineState {
 
 void append_mtp_metrics(
         std::vector<std::pair<std::string, double>>& result,
-        const mtp::GenerationStats& stats) {
+        const mfq::engine::mtp::GenerationStats& stats) {
     result.emplace_back("mtp_used", stats.used ? 1.0 : 0.0);
     result.emplace_back(
         "mtp_cycles", static_cast<double>(stats.cycles));

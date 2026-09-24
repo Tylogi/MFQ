@@ -1,7 +1,7 @@
 #include "common.h"
 
+#include "text_emitter.h"
 #include "nlohmann/json.hpp"
-#include "ggml.h"
 #include "mfq_text.h"
 #include "mfq_grammar.h"
 #include "chat.h"
@@ -53,154 +53,6 @@ std::string request_id(const char * prefix) {
     static std::atomic<uint64_t> sequence{0};
     const uint64_t n = sequence.fetch_add(1, std::memory_order_relaxed);
     return std::string(prefix) + std::to_string(unix_time_seconds()) + "-" + std::to_string(n);
-}
-
-static void mfq_text_log_quiet(ggml_log_level level, const char * text, void *) {
-    if (level == GGML_LOG_LEVEL_WARN || level == GGML_LOG_LEVEL_ERROR) {
-        std::cerr << "mfq-text: " << text;
-    }
-}
-
-MfqTokenizer::MfqTokenizer(const std::string & path) {
-    load_from_file(path);
-    finish_init();
-}
-
-MfqTokenizer::MfqTokenizer(const std::vector<uint8_t> & gguf) {
-    if (gguf.empty()) {
-        throw std::runtime_error("embedded tokenizer GGUF is empty");
-    }
-    ggml_log_set(mfq_text_log_quiet, nullptr);
-    context_ = mfq_text_load_buffer(gguf.data(), gguf.size());
-    if (context_ == nullptr) {
-        throw std::runtime_error(
-            "cannot initialize tokenizer from embedded GGUF metadata");
-    }
-    finish_init();
-}
-
-MfqTokenizer::~MfqTokenizer() {
-    mfq_text_free(context_);
-}
-
-int32_t MfqTokenizer::vocab_size() const {
-    return mfq_text_vocab_n_tokens(vocab_);
-}
-
-std::string MfqTokenizer::chat_template() const {
-    const char * value = mfq_text_get_chat_template(context_, nullptr);
-    return value == nullptr ? std::string() : std::string(value);
-}
-
-const mfq_text_context * MfqTokenizer::context() const {
-    return context_;
-}
-
-int32_t MfqTokenizer::bos_token() const {
-    return mfq_text_vocab_bos(vocab_);
-}
-
-int32_t MfqTokenizer::eos_token() const {
-    return mfq_text_vocab_eos(vocab_);
-}
-
-int32_t MfqTokenizer::eot_token() const {
-    return mfq_text_vocab_eot(vocab_);
-}
-
-int32_t MfqTokenizer::pad_token() const {
-    return mfq_text_vocab_pad(vocab_);
-}
-
-bool MfqTokenizer::add_bos() const {
-    return mfq_text_vocab_get_add_bos(vocab_);
-}
-
-bool MfqTokenizer::add_eos() const {
-    return mfq_text_vocab_get_add_eos(vocab_);
-}
-
-std::vector<int64_t> MfqTokenizer::tokenize(
-        const std::string & text,
-        bool parse_special,
-        bool add_special) const {
-    int32_t n = mfq_text_tokenize(
-        vocab_, text.data(), static_cast<int32_t>(text.size()),
-        nullptr, 0, add_special, parse_special);
-    if (n == std::numeric_limits<int32_t>::min()) {
-        throw std::runtime_error("tokenized prompt exceeds the tokenizer limit");
-    }
-    if (n == 0) return {};
-    if (n > 0) {
-        throw std::runtime_error("tokenizer returned an invalid sizing result");
-    }
-    std::vector<mfq_text_token> tokens(static_cast<size_t>(-n));
-    n = mfq_text_tokenize(
-        vocab_, text.data(), static_cast<int32_t>(text.size()),
-        tokens.data(), static_cast<int32_t>(tokens.size()),
-        add_special, parse_special);
-    if (n < 0) {
-        throw std::runtime_error(
-            "tokenizer buffer sizing changed unexpectedly");
-    }
-    std::vector<int64_t> out;
-    out.reserve(static_cast<size_t>(n));
-    for (int32_t i = 0; i < n; ++i) {
-        out.push_back(tokens[static_cast<size_t>(i)]);
-    }
-    return out;
-}
-
-int64_t MfqTokenizer::special_token_id(const std::string & text) const {
-    const auto tokens = tokenize(text, true, false);
-    if (tokens.size() != 1) {
-        throw std::runtime_error(
-            "tokenizer does not map the required special token to one ID: " +
-            text);
-    }
-    return tokens.front();
-}
-
-bool MfqTokenizer::is_eog(int64_t token) const {
-    return mfq_text_vocab_is_eog(
-        vocab_, static_cast<mfq_text_token>(token));
-}
-
-std::string MfqTokenizer::piece(int64_t token, bool special) const {
-    char local[128];
-    int32_t n = mfq_text_token_to_piece(
-        vocab_, static_cast<mfq_text_token>(token), local,
-        static_cast<int32_t>(sizeof(local)), 0, special);
-    if (n >= 0) return std::string(local, local + n);
-    std::string out(static_cast<size_t>(-n), '\0');
-    n = mfq_text_token_to_piece(
-        vocab_, static_cast<mfq_text_token>(token), out.data(),
-        static_cast<int32_t>(out.size()), 0, special);
-    if (n < 0) {
-        throw std::runtime_error(
-            "token piece buffer sizing changed unexpectedly");
-    }
-    out.resize(static_cast<size_t>(n));
-    return out;
-}
-
-void MfqTokenizer::load_from_file(const std::string & path) {
-    ggml_log_set(mfq_text_log_quiet, nullptr);
-    context_ = mfq_text_load_file(path.c_str());
-    if (context_ == nullptr) {
-        throw std::runtime_error(
-            "cannot load tokenizer metadata from GGUF: " + path);
-    }
-}
-
-void MfqTokenizer::finish_init() {
-    vocab_ = mfq_text_get_vocab(context_);
-    if (vocab_ == nullptr) {
-        mfq_text_free(context_);
-        context_ = nullptr;
-        throw std::runtime_error(
-            "GGUF does not contain a tokenizer vocabulary");
-    }
 }
 
 class MfqGrammarConstraint {
@@ -1495,94 +1347,6 @@ RequestWork parse_work(const json & body, bool chat, const MfqTokenizer & tokeni
     return work;
 }
 
-static size_t complete_utf8_prefix(const std::string & value, size_t limit) {
-    size_t i = 0;
-    size_t complete = 0;
-    limit = std::min(limit, value.size());
-    while (i < limit) {
-        const unsigned char lead = static_cast<unsigned char>(value[i]);
-        size_t width = 1;
-        if ((lead & 0x80u) == 0) width = 1;
-        else if ((lead & 0xE0u) == 0xC0u) width = 2;
-        else if ((lead & 0xF0u) == 0xE0u) width = 3;
-        else if ((lead & 0xF8u) == 0xF0u) width = 4;
-        else break;
-        if (i + width > limit) break;
-        bool valid = true;
-        for (size_t j = 1; j < width; ++j) {
-            if ((static_cast<unsigned char>(value[i + j]) & 0xC0u) != 0x80u) {
-                valid = false;
-                break;
-            }
-        }
-        if (!valid) break;
-        i += width;
-        complete = i;
-    }
-    return complete;
-}
-
-class TextEmitter {
-public:
-    using Emit = std::function<bool(const std::string &)>;
-
-    TextEmitter(std::vector<std::string> stops, Emit emit)
-        : stops_(std::move(stops)), emit_(std::move(emit)) {}
-
-    bool append(const std::string & piece) {
-        pending_ += piece;
-        size_t stop_pos = std::string::npos;
-        for (const auto & stop : stops_) {
-            const size_t pos = pending_.find(stop);
-            if (pos != std::string::npos && (stop_pos == std::string::npos || pos < stop_pos)) stop_pos = pos;
-        }
-        if (stop_pos != std::string::npos) {
-            if (!emit_prefix(stop_pos)) return false;
-            pending_.clear();
-            stopped_ = true;
-            return false;
-        }
-
-        size_t retain = 0;
-        for (const auto & stop : stops_) {
-            const size_t max_prefix = std::min(stop.size() - 1, pending_.size());
-            for (size_t n = 1; n <= max_prefix; ++n) {
-                if (pending_.compare(pending_.size() - n, n, stop, 0, n) == 0) retain = std::max(retain, n);
-            }
-        }
-        return emit_prefix(pending_.size() - retain);
-    }
-
-    bool flush() {
-        const size_t complete = complete_utf8_prefix(pending_, pending_.size());
-        if (complete > 0 && !emit_bytes(complete)) return false;
-        if (!pending_.empty()) {
-            pending_.clear();
-            return emit_("\xEF\xBF\xBD");
-        }
-        return true;
-    }
-
-    bool stopped() const { return stopped_; }
-
-private:
-    bool emit_prefix(size_t limit) {
-        const size_t complete = complete_utf8_prefix(pending_, limit);
-        return complete == 0 || emit_bytes(complete);
-    }
-
-    bool emit_bytes(size_t count) {
-        std::string text = pending_.substr(0, count);
-        pending_.erase(0, count);
-        return text.empty() || emit_(text);
-    }
-
-    std::vector<std::string> stops_;
-    Emit emit_;
-    std::string pending_;
-    bool stopped_ = false;
-};
-
 class ChatOutputParser {
 public:
     using Emit = std::function<bool(const common_chat_msg_diff &)>;
@@ -1870,7 +1634,7 @@ CompletionResult generate_text(const RequestWork & work, const MfqTokenizer & to
         chat_parser = std::make_unique<ChatOutputParser>(
             work.chat_parser, emit_parsed);
     }
-    TextEmitter emitter(work.stops, [&](const std::string & text) {
+    mfq::engine::TextEmitter emitter(work.stops, [&](const std::string & text) {
         if (chat_parser) {
             return chat_parser->append(text);
         }

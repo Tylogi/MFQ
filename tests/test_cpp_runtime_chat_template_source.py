@@ -98,7 +98,7 @@ def test_processor_owned_prompts_bypass_cached_jinja_templates() -> None:
     parse_work = _section(
         SERVER,
         "RequestWork parse_work",
-        "static size_t complete_utf8_prefix",
+        "class ChatOutputParser",
     )
 
     assert "request_preformatted_prompt(body)" in parse_work

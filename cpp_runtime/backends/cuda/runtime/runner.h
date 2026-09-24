@@ -3,7 +3,6 @@
 #include "causal_lm.h"
 #include "runtime_components.h"
 #include "cuda_execution.h"
-#include "mfq_cuda_mtp.h"
 #include "tensor_parallel.h"
 #include "moe_expert_cache.h"
 #include <chrono>

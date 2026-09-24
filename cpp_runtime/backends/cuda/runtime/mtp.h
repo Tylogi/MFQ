@@ -1,7 +1,7 @@
 #pragma once
 
 #include "causal_lm.h"
-#include "mfq_cuda_mtp.h"
+#include "mtp_policy.h"
 #include "mfq_tensor_backend.h"
 #include "mfq/runtime.h"
 
@@ -65,7 +65,7 @@ struct MtpModule {
     virtual bool target_bootstrap_decode() const noexcept = 0;
     virtual bool preserve_output_dtype() const noexcept = 0;
     virtual int maximum_draft_depth() const noexcept {
-        return mfq::cuda::mtp::kMaximumDraftDepth;
+        return mfq::engine::mtp::kMaximumDraftDepth;
     }
     virtual bool blockwise_drafting() const noexcept { return false; }
     virtual bool split_target_verification() const noexcept { return false; }
@@ -98,7 +98,7 @@ struct MtpModule {
             "this CUDA MTP predictor has no block-draft adapter");
     }
 
-    mfq::cuda::mtp::GenerationStats last_stats;
+    mfq::engine::mtp::GenerationStats last_stats;
     uint64_t last_cycles = 0;
     uint64_t last_accepted = 0;
     uint64_t last_rejected = 0;
