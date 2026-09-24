@@ -266,7 +266,7 @@ def test_minicpmo45_cli_exposes_native_duplex_tensor_contract():
 def test_minicpmo45_cuda_server_binds_the_realtime_backend():
     assert 'option == "--minicpmo-duplex"' not in DECODE
     assert "make_cuda_minicpmo45_duplex_backend(" in DECODE
-    assert "if (runtime_components.minicpmo)" in DECODE
+    assert "if (state->components.minicpmo)" in DECODE
     assert "load_runtime_components(" in DECODE
     assert 'backend.name = "cuda"' in DECODE
     assert "MiniCPMO45Runtime::load_with_language(" in CUDA_COMPONENTS

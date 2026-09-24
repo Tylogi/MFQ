@@ -16,9 +16,11 @@ SERVER = "\n".join(
     for path in sorted(TRANSPORT_SRC.rglob("*"))
     if path.suffix in {".cpp", ".h"}
 )
-RUNTIME = (
-    ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime" / "cuda_runtime.cpp"
-).read_text(encoding="utf-8")
+RUNTIME_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime"
+RUNTIME = "\n".join(
+    (RUNTIME_ROOT / name).read_text(encoding="utf-8")
+    for name in ("generation.h", "generation.cpp")
+)
 SAMPLING = (
     ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime" / "cuda_sampling.h"
 ).read_text(encoding="utf-8")
@@ -62,7 +64,10 @@ def test_prefill_speed_uses_cuda_events_around_only_the_first_model_eval() -> No
     sample = RUNTIME.split(
         "static mfq_tensor_backend::Tensor sample_token(", 1
     )[1]
-    sample = sample.split("class PrefillCudaTimer", 1)[0]
+    sample = sample.split(
+        "template <typename Model>\nstatic mfq_tensor_backend::Tensor prefill_tail(",
+        1,
+    )[0]
     logits = sample.index("auto logits = model.last_logits(ids)")
     finished = sample.index("cudaEventRecord(", logits)
     sampling = sample.index("mfq::cuda::sample_logits(", logits)

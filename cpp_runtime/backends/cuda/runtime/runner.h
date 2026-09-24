@@ -21,10 +21,10 @@ std::vector<int64_t> load_ids_file(const std::string& path);
 std::unordered_set<int> parse_layer_ranges(const std::string& value);
 
 template <typename F>
-int with_loaded_cuda_model(mfq::cuda::CudaLoadOptions& options,
+auto with_loaded_cuda_model(mfq::cuda::CudaLoadOptions& options,
         bool load_optional_components, F&& run) {
     auto dispatch_source = mfq::open_model_source(options.model_path);
-    auto run_loaded = [&]<mfq::cuda::CudaBackbone Backbone>() -> int {
+    auto run_loaded = [&]<mfq::cuda::CudaBackbone Backbone>() {
         using Model = mfq::cuda::CausalLmFor<Backbone>;
         auto t0 = std::chrono::steady_clock::now();
         Model model = mfq::cuda::load_causal_lm<Backbone>(
@@ -82,6 +82,3 @@ int with_loaded_cuda_model(mfq::cuda::CudaLoadOptions& options,
  }
 
 } // namespace mfq::cuda::internal
-int run_qwen35_mtp_bench(mfq::cuda::Qwen35CausalLm& model, Qwen35Mtp& mtp,
-    bool enable_mtp, int generated_tokens, int repetitions);
-int run_cuda_continuous_batching_check(mfq::cuda::Qwen35CausalLm& model);

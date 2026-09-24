@@ -246,6 +246,7 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/gemma4/gemma4_causal_lm.cpp
     ${MFQ_CUDA_ROOT}/models/glm_dsa/glm_dsa_causal_lm.cpp
     ${MFQ_CUDA_ROOT}/models/minicpmo45/minicpmo45_runtime.cpp
+    ${MFQ_CUDA_ROOT}/models/minicpmo45/minicpmo45_engine.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/qwen35_causal_lm.cpp
     ${MFQ_CUDA_ROOT}/models/registry.cpp
 )
@@ -263,7 +264,9 @@ set(MFQ_CUDA_RUNTIME_OP_SOURCES
 
 add_library(mfq-cuda-runtime STATIC
     ${MFQ_CUDA_RUNTIME_OP_SOURCES}
-    ${MFQ_CUDA_ROOT}/runtime/cuda_runtime.cpp
+    ${MFQ_CUDA_ROOT}/runtime/cuda_engine.cpp
+    ${MFQ_CUDA_ROOT}/runtime/generation.cpp
+    ${MFQ_CUDA_ROOT}/runtime/text_session_cache.cpp
     ${MFQ_CUDA_ROOT}/runtime/runner.cpp
     ${MFQ_CUDA_ROOT}/runtime/decode_graph.cpp
     ${MFQ_CUDA_ROOT}/runtime/cuda_execution.cpp
@@ -314,6 +317,7 @@ target_link_libraries(mfq-cuda-eval PUBLIC mfq-cuda-runtime)
 add_library(mfq-cuda-diagnostics STATIC
     ${MFQ_CUDA_ROOT}/diagnostics/backend_checks.cpp
     ${MFQ_CUDA_ROOT}/diagnostics/model_checks.cpp
+    ${MFQ_CUDA_ROOT}/diagnostics/runtime_checks.cpp
 )
 mfq_configure_cuda_runtime_target(mfq-cuda-diagnostics)
 target_include_directories(mfq-cuda-diagnostics PRIVATE ${MFQ_CUDA_ROOT}/storage)
@@ -432,7 +436,9 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         ${MFQ_CUDA_ROOT}/apps/runtime_main.cpp
         ${MFQ_CUDA_ROOT}/commands/runtime.cpp
         ${MFQ_CUDA_RUNTIME_OP_SOURCES}
-        ${MFQ_CUDA_ROOT}/runtime/cuda_runtime.cpp
+        ${MFQ_CUDA_ROOT}/runtime/cuda_engine.cpp
+        ${MFQ_CUDA_ROOT}/runtime/generation.cpp
+        ${MFQ_CUDA_ROOT}/runtime/text_session_cache.cpp
         ${MFQ_CUDA_ROOT}/runtime/runner.cpp
         ${MFQ_CUDA_ROOT}/runtime/decode_graph.cpp
         ${MFQ_CUDA_ROOT}/runtime/cuda_execution.cpp

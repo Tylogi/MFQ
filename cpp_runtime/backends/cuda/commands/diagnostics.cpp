@@ -398,20 +398,6 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             }
             std::cout << std::unitbuf;
         }
-        if (!cpu_offload_layers_arg.empty()) {
-            g_dsv4_cpu_offload_layers =
-                parse_layer_ranges(cpu_offload_layers_arg);
-            std::vector<int> ordered(
-                g_dsv4_cpu_offload_layers.begin(),
-                g_dsv4_cpu_offload_layers.end());
-            std::sort(ordered.begin(), ordered.end());
-            std::cerr << "cpu_offload_layers=";
-            for (size_t index = 0; index < ordered.size(); ++index) {
-                if (index) std::cerr << ',';
-                std::cerr << ordered[index];
-            }
-            std::cerr << std::endl;
-        }
         std::vector<int64_t> prefill_sweep_sizes;
         if (!prefill_sweep_arg.empty()) {
             prefill_sweep_sizes = parse_ids(prefill_sweep_arg);

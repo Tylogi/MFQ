@@ -13,8 +13,13 @@ DECODE = "\n".join(
 MODEL_LOADER = (CUDA_ROOT / "runtime" / "causal_lm_loader.cpp").read_text(
     encoding="utf-8"
 )
-CUDA_RUNTIME = (CUDA_ROOT / "runtime" / "cuda_runtime.cpp").read_text(
-    encoding="utf-8"
+CUDA_RUNTIME = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in (
+        CUDA_ROOT / "commands" / "runtime.cpp",
+        CUDA_ROOT / "runtime" / "runner.h",
+        CUDA_ROOT / "commands" / "diagnostics.cpp",
+    )
 )
 CUDA_NINT = (CUDA_ROOT / "ops" / "nint.cpp").read_text(encoding="utf-8")
 TRANSPORT_SRC = ROOT / "cpp_runtime" / "transport"
@@ -86,7 +91,7 @@ def test_moe_cache_capacity_failure_uses_full_projection_path() -> None:
 def test_optional_predictor_experts_join_the_shared_moe_cache() -> None:
     assert "bool defer_moe_cache_finalize = false" in DECODE
     assert "!defer_moe_cache_finalize" in MODEL_LOADER
-    assert "const bool load_optional_components" in CUDA_RUNTIME
+    assert "bool load_optional_components" in CUDA_RUNTIME
     assert CUDA_RUNTIME.index("load_runtime_components(") < CUDA_RUNTIME.index(
         "finalize_moe_expert_cache();"
     )
@@ -135,7 +140,7 @@ def test_stdio_transport_owns_stdin_and_isolates_stdout() -> None:
         "backends/cuda/models/minicpmo45/minicpmo45_runtime.cpp",
         "transport/src/stdio.cpp",
     }
-    assert "if (!minicpmo_input_prefix.empty() || transport_mode ||" in CUDA_RUNTIME
+    assert "if (minicpmo_eval_batch)" in CUDA_RUNTIME
     assert "MiniCPM-o eval mode cannot be combined with" in CUDA_RUNTIME
 
 

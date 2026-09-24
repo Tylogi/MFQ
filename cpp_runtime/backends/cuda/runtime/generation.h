@@ -1,15 +1,64 @@
 #pragma once
 #include "cuda_execution.h"
 #include "decode_graph.h"
+#include "moe_expert_cache.h"
 #include "mfq_tensor_backend.h"
+#include "mfq/runtime.h"
+#include "prepared_prompt.h"
 #include <cuda_profiler_api.h>
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <iomanip>
+#include <mutex>
+#include <optional>
+#include <vector>
+
+struct MtpModule;
 
 namespace mfq::cuda::internal {
+
+class TextSessionCache;
+
+class PrefillCudaTimer {
+public:
+    PrefillCudaTimer();
+    ~PrefillCudaTimer();
+
+    PrefillCudaTimer(const PrefillCudaTimer&) = delete;
+    PrefillCudaTimer& operator=(const PrefillCudaTimer&) = delete;
+
+    cudaEvent_t finished_event() const;
+    double elapsed_ms() const;
+
+private:
+    cudaStream_t stream_ = nullptr;
+    cudaEvent_t started_ = nullptr;
+    cudaEvent_t finished_ = nullptr;
+};
+
+template <typename Model>
+using PreparedPromptFactory =
+    std::function<std::optional<CudaPreparedPrompt>(Model&)>;
+
+template <typename Model>
+int32_t generate_tokens(
+    Model& model,
+    std::mutex& model_mutex,
+    DecodeGraphCache& graph_cache,
+    TextSessionCache& session_cache,
+    const std::vector<int64_t>& prompt,
+    const MfqSamplingParams& sampling,
+    const MfqTokenCallback& on_token,
+    const MfqPrefillCallback& on_prefill,
+    const MfqPromptCachePlan& cache_plan,
+    const MfqTokenConstraintPtr& token_constraint,
+    MtpModule* mtp = nullptr,
+    int64_t prefill_chunk_size = 2048,
+    PreparedPromptFactory<Model> prepare_prompt = {});
+
 template <typename Model>
 int generate_cli_tokens(Model& model, mfq_tensor_backend::Tensor ids,
         int gen, bool profile,

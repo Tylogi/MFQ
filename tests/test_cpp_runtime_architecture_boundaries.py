@@ -65,8 +65,17 @@ CUDA_CLI = (
 ).read_text(encoding="utf-8")
 CUDA_MODELS = ROOT / "cpp_runtime" / "backends" / "cuda" / "models"
 CUDA_RUNTIME = ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime"
-CUDA_RUNTIME_SOURCE = (CUDA_RUNTIME / "cuda_runtime.cpp").read_text(
+CUDA_ENGINE_SOURCE = (CUDA_RUNTIME / "cuda_engine.cpp").read_text(
     encoding="utf-8"
+)
+CUDA_RUNTIME_SOURCE = "\n".join(
+    (CUDA_RUNTIME / name).read_text(encoding="utf-8")
+    for name in (
+        "cuda_engine.cpp",
+        "generation.cpp",
+        "text_session_cache.cpp",
+        "runner.cpp",
+    )
 )
 CUDA_MTP_SOURCE = (CUDA_RUNTIME / "mtp.cpp").read_text(encoding="utf-8")
 CUDA_DECODE = CUDA_APP + "\n" + CUDA_RUNTIME_SOURCE
@@ -197,7 +206,11 @@ def test_cuda_cli_is_a_thin_client_of_the_runtime_library() -> None:
         encoding="utf-8"
     )
     assert "add_library(mfq-cuda-runtime STATIC" in cmake
-    assert "runtime/cuda_runtime.cpp" in cmake
+    assert not (CUDA_RUNTIME / "cuda_runtime.cpp").exists()
+    assert "runtime/cuda_runtime.cpp" not in cmake
+    assert "runtime/cuda_engine.cpp" in cmake
+    assert "runtime/generation.cpp" in cmake
+    assert "runtime/text_session_cache.cpp" in cmake
     assert "add_executable(mfq-runtime\n" in cmake
     assert "mfq-cuda-runtime mfq-runtime-communication" in cmake
     assert "${MFQ_CUDA_ROOT}/commands/runtime.cpp" in cmake
@@ -210,6 +223,18 @@ def test_cuda_cli_is_a_thin_client_of_the_runtime_library() -> None:
     assert '"--server"' not in CUDA_RUNTIME_SOURCE
     assert '"--stdio"' not in CUDA_RUNTIME_SOURCE
     assert "MFQ_SERVER_" not in CUDA_RUNTIME_SOURCE
+
+
+def test_cuda_runtime_composes_transport_scheduler_and_engine() -> None:
+    assert "MfqInferenceEngine inference;" in CUDA_ENGINE_SOURCE
+    assert '"device_free_bytes"' in CUDA_ENGINE_SOURCE
+    assert "MfqRuntime" not in CUDA_ENGINE_SOURCE
+    assert "make_mfq_http_transport" not in CUDA_ENGINE_SOURCE
+    assert "make_mfq_stdio_transport" not in CUDA_ENGINE_SOURCE
+    assert "load_cuda_engine" in CUDA_RUNTIME_COMMAND
+    assert "MfqRuntime runtime(" in CUDA_RUNTIME_COMMAND
+    assert "make_mfq_http_transport" in CUDA_RUNTIME_COMMAND
+    assert "make_mfq_stdio_transport" in CUDA_RUNTIME_COMMAND
 
 
 def test_development_rules_forbid_architecture_bound_reuse() -> None:

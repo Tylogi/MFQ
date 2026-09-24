@@ -1,16 +1,37 @@
 #pragma once
 
 #include "cuda_sampling.h"
+#include "generation.h"
+#include "text_session_cache.h"
 #include "moe_expert_cache.h"
 #include "qwen_paged_kv.h"
 #include "../models/qwen35/qwen35_linear_attention.h"
 
-// Included by cuda_runtime.cpp after the CUDA Qwen model and sampler are defined.
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+#include <deque>
+#include <exception>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
 // The scheduler owns request concurrency; the adapter below owns the hybrid
 // full-attention/recurrent state carried between decode iterations.
 
 namespace mfq::cuda::continuous {
 
+using internal::generate_tokens;
+using internal::PrefillCudaTimer;
+using internal::TextSessionCache;
 using Tensor = mfq_tensor_backend::Tensor;
 using LinearBlock = mfq::cuda::qwen35::LinearAttentionBlock;
 

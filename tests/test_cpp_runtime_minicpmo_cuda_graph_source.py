@@ -5,7 +5,7 @@ import re
 CUDA_ROOT = Path(__file__).parents[1] / "cpp_runtime" / "backends" / "cuda"
 CUDA_RUNTIME = "\n".join(
     (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
-    for name in ("cuda_runtime.cpp", "generation.h")
+    for name in ("generation.cpp", "generation.h")
 )
 BACKEND_CHECKS = (
     CUDA_ROOT / "diagnostics" / "backend_checks.cpp"

@@ -233,7 +233,7 @@ def test_tiered_prefix_cache_can_release_only_its_hot_payloads() -> None:
     assert 'server.Post("/runtime/cache/trim"' in SERVER
     assert "session_control.trim_hot" in SERVER
     assert "session_control.trim_hot" in METAL_DECODE
-    assert "text_session_cache.trim_hot(target_bytes)" in DECODE
+    assert "state->session_cache.trim_hot(target_bytes)" in DECODE
     assert "release_host_allocator_cache()" in METAL_DECODE
     assert "mfq_release_host_allocator_cache()" in DECODE
 

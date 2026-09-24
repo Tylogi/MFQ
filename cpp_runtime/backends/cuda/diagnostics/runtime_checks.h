@@ -1,7 +1,10 @@
 #pragma once
 
+#include "runtime/causal_lm.h"
 #include "runtime/generation.h"
+#include "runtime/mtp.h"
 #include "diagnostics/flash_next_mtp.h"
+#include "qwen35/mtp.h"
 #include "quant_linear.h"
 #include "registry.h"
 #include "cuda_execution.h"
@@ -25,6 +28,15 @@
 namespace mfq::cuda::diagnostics {
 
 using namespace mfq::cuda::internal;
+
+int run_qwen35_mtp_bench(
+    mfq::cuda::Qwen35CausalLm& model,
+    Qwen35Mtp& mtp,
+    bool enable_mtp,
+    int generated_tokens,
+    int repetitions);
+int run_cuda_continuous_batching_check(
+    mfq::cuda::Qwen35CausalLm& model);
 
 template <typename Model>
 static int run_prefill_sweep(

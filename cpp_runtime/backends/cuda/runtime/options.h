@@ -20,20 +20,23 @@ struct CudaLoadOptions {
     int n_gpu_layers = -1;
 };
 
+struct CudaEngineOptions : CudaLoadOptions {
+    int continuous_batching = 0;
+    int64_t prefill_chunk_size = 2048;
+};
+
 struct TokenInputOptions {
     std::string ids_arg, ids_file;
     int gen = 16;
 };
 
-struct RuntimeOptions : CudaLoadOptions, TokenInputOptions {
+struct RuntimeOptions : CudaEngineOptions, TokenInputOptions {
     std::string minicpmo_input_prefix, minicpmo_output_prefix;
     std::string minicpmo_duplex_input_prefix, minicpmo_duplex_output_prefix;
     std::string transport_host = "127.0.0.1";
     std::string runtime_model_name = "mfq-model", transport_api_key;
     std::string runtime_sampling_profile;
     int transport_port = 8080;
-    int continuous_batching = 0;
-    int64_t prefill_chunk_size = 2048;
     int64_t minicpmo_tts_steps = 0;
     int64_t minicpmo_duplex_steps = 0;
     int64_t minicpmo_duplex_max_speak_tokens = 20;

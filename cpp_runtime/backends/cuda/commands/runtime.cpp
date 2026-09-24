@@ -1,13 +1,22 @@
 #include "cli.h"
-#include "runtime/cuda_runtime.h"
+#include "runtime/cuda_engine.h"
+#include "runtime/moe_expert_cache.h"
 #include "runtime/setup.h"
+#include "runtime/token_generation.h"
+#include "models/registry.h"
+#include "mfq/model_source.h"
 #include "transport.h"
 
+#include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace mfq::cuda::commands {
 namespace {
@@ -195,6 +204,97 @@ RuntimeOptions parse_runtime(ArgCursor& args) {
     return result;
 }
 
+std::vector<uint8_t> read_runtime_asset(
+        const mfq::ModelSource& source,
+        std::string_view name) {
+    const auto bytes = source.read_asset(name);
+    std::vector<uint8_t> result(bytes.size());
+    if (!bytes.empty()) {
+        std::memcpy(result.data(), bytes.data(), bytes.size());
+    }
+    return result;
+}
+
+std::string read_runtime_asset_text(
+        const mfq::ModelSource& source,
+        std::string_view name) {
+    const auto bytes = source.read_asset(name);
+    if (bytes.empty()) return {};
+    return std::string(
+        reinterpret_cast<const char*>(bytes.data()), bytes.size());
+}
+
+int run_transport_runtime(RuntimeOptions& options) {
+    auto source = mfq::open_model_source(options.model_path);
+    if (!options.config_path.empty()) {
+        throw std::runtime_error(
+            "model runtime does not accept an external model config");
+    }
+    if (!source->has_asset(mfq::kModelConfigAsset) ||
+            (!source->has_asset(mfq::cuda::kTokenizerGgufAsset) &&
+             options.tokenizer_model.empty())) {
+        throw std::runtime_error(
+            "model runtime requires model config and tokenizer GGUF");
+    }
+
+    CudaEngineOptions engine_options = options;
+    auto loaded = load_cuda_engine(std::move(engine_options));
+    if (options.transport_api_key.empty()) {
+        const char* env_key = std::getenv("MFQ_API_KEY");
+        if (env_key != nullptr) options.transport_api_key = env_key;
+    }
+
+    MfqHttpRuntimeTransportConfig transport_config;
+    transport_config.host = options.transport_host;
+    transport_config.port = options.transport_port;
+    transport_config.model_name = options.runtime_model_name;
+    transport_config.model_type = loaded.metadata.model_type;
+    transport_config.api_key = options.transport_api_key;
+    transport_config.max_context = loaded.metadata.max_context;
+    transport_config.vocab_size = loaded.metadata.vocab_size;
+    transport_config.model_capabilities = MfqModelCapabilities{
+        loaded.metadata.architecture,
+        loaded.metadata.capabilities.text,
+        loaded.metadata.capabilities.image_input,
+        loaded.metadata.capabilities.video_input,
+        loaded.metadata.capabilities.audio_input,
+        loaded.metadata.capabilities.audio_output,
+        loaded.metadata.capabilities.full_duplex,
+        loaded.metadata.capabilities.mtp,
+        "model-graph+cuda-adapters",
+    };
+    const auto& runtime_assets = *loaded.metadata.source;
+    if (runtime_assets.has_asset(mfq::cuda::kTokenizerGgufAsset)) {
+        transport_config.tokenizer_gguf = read_runtime_asset(
+            runtime_assets, mfq::cuda::kTokenizerGgufAsset);
+    } else {
+        transport_config.tokenizer_model = options.tokenizer_model;
+    }
+    const auto embedded_profile = runtime_assets.metadata().find(
+        "runtime.sampling.v1");
+    transport_config.runtime_profile = resolve_mfq_runtime_profile(
+        options.model_path,
+        loaded.metadata.architecture,
+        transport_config.model_type,
+        transport_config.model_name,
+        embedded_profile == runtime_assets.metadata().end()
+            ? std::string()
+            : embedded_profile->second,
+        read_runtime_asset_text(runtime_assets, mfq::kModelConfigAsset),
+        options.runtime_sampling_profile);
+
+    auto transport = options.stdio_mode
+        ? make_mfq_stdio_transport(transport_config)
+        : make_mfq_http_transport(transport_config);
+    MfqRuntime runtime(
+        std::move(loaded.inference), std::move(transport));
+    const int status = runtime.run();
+    if (g_moe_expert_cache) {
+        print_moe_expert_cache_stats(std::cout);
+    }
+    return status;
+}
+
 int execute_runtime(RuntimeOptions options) {
     return mfq::cuda::internal::with_command_errors([&]() -> int {
         if (options.stdio_mode) prepare_mfq_stdio_transport();
@@ -205,7 +305,11 @@ int execute_runtime(RuntimeOptions options) {
         if (!options.minicpmo_input_prefix.empty()) {
             return run_cuda_minicpmo_composite(options);
         }
-        return run_cuda_inference(std::move(options));
+        if (options.transport_mode) {
+            return run_transport_runtime(options);
+        }
+        return mfq::cuda::internal::run_cuda_token_generation(
+            options, options);
     });
 }
 

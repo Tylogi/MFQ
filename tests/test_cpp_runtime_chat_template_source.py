@@ -10,8 +10,13 @@ SERVER = "\n".join(
 )
 CUDA_RUNTIME = ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime"
 DECODE = "\n".join(
-    (CUDA_RUNTIME / name).read_text(encoding="utf-8")
-    for name in ("cuda_runtime.cpp", "cuda_sampling.h", "mtp.cpp")
+    path.read_text(encoding="utf-8")
+    for path in (
+        CUDA_RUNTIME / "generation.cpp",
+        CUDA_RUNTIME / "cuda_sampling.h",
+        CUDA_RUNTIME / "mtp.cpp",
+        ROOT / "cpp_runtime" / "backends" / "cuda" / "commands" / "runtime.cpp",
+    )
 )
 CMAKE = (ROOT / "cpp_runtime" / "CMakeLists.txt").read_text(
     encoding="utf-8"
@@ -154,7 +159,7 @@ def test_cpp_runtime_transport_has_no_public_openai_routes() -> None:
 def test_cuda_runtime_accepts_an_external_tokenizer_only() -> None:
     assert "model runtime does not accept an external model config" in DECODE
     assert "model runtime requires model config and tokenizer GGUF" in DECODE
-    assert "transport_config.tokenizer_model = tokenizer_model" in DECODE
+    assert "transport_config.tokenizer_model = options.tokenizer_model" in DECODE
 
 
 def test_studio_keeps_reasoning_separate_and_template_controlled() -> None:
