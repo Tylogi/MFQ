@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../../runtime/cuda_transformer.h"
-#include "models/flash_next.h"
+#include "models/include/flash_next.h"
 #include "layers.h"
 
 #include <memory>

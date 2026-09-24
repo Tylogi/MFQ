@@ -2,7 +2,7 @@
 
 #include "../../runtime/causal_lm.h"
 #include "../../runtime/cuda_transformer_loader.h"
-#include "models/minicpmo45.h"
+#include "models/include/minicpmo45.h"
 #include "mfq_cuda_ops.h"
 
 #include <nlohmann/json.hpp>

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "models/qwen35.h"
+#include "models/include/qwen35.h"
 
 #include <cstdint>
 #include <memory>

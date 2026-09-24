@@ -1,7 +1,7 @@
 #pragma once
 
 #include "quant_linear.h"
-#include "models/model_config.h"
+#include "models/include/model_config.h"
 #include "cuda_execution.h"
 #include "mfq_cuda_ops.h"
 #include "mfq_cuda_paged_kv.h"

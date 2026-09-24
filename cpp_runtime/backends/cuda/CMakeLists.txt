@@ -222,6 +222,7 @@ function(mfq_configure_cuda_runtime_target target)
     )
     target_link_libraries(${target} PRIVATE
         mfq-core
+        mfq-models
         mfq-engine
         mfq-json
         mfq-runtime-communication

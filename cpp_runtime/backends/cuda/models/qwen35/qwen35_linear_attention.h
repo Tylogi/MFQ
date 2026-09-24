@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../../runtime/cuda_transformer.h"
-#include "models/qwen35.h"
+#include "models/include/qwen35.h"
 
 namespace mfq::cuda::qwen35 {
 

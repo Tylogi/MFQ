@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../../runtime/cuda_transformer.h"
-#include "models/deepseek_v4.h"
+#include "models/include/deepseek_v4.h"
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"
 

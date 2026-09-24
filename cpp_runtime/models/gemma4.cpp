@@ -1,4 +1,4 @@
-#include "models/gemma4.h"
+#include "models/include/gemma4.h"
 
 #include "nlohmann/json.hpp"
 

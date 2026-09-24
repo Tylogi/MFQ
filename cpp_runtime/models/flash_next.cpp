@@ -1,4 +1,4 @@
-#include "models/flash_next.h"
+#include "models/include/flash_next.h"
 
 namespace mfq::models::flash_next {
 

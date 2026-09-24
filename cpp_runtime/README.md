@@ -6,6 +6,7 @@ family or source origin:
 - `core/` — canonical model graph, backend-neutral policies, interfaces, and
   generated tables; temporary old-artifact name adapters live in
   `core/compat/`;
+- `models/` — shared model configuration and architecture geometry; public headers in `models/include/`;
 - `transport/` — private stdio/HTTP protocol adapters;
 - `scheduler/` — backend-neutral request dispatch and lifecycle boundary;
 - `engine/` — backend-neutral tokenizer, output processing, and MTP policies;

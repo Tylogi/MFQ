@@ -273,6 +273,7 @@ target_include_directories(mfq-metal-runtime PRIVATE
 )
 target_link_libraries(mfq-metal-runtime PUBLIC
     mfq-core
+    mfq-models
     mfq-mlx
     mfq-jaccl
     Threads::Threads

@@ -1,22 +1,17 @@
 #pragma once
 
-#include "models/model_config.h"
+#include "model_config.h"
 
 #include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
 
-namespace mfq::models::deepseek_v4 {
+namespace mfq::models::glm_dsa {
 
 struct Config : ModelConfig {
-    std::vector<std::int64_t> compress_ratios;
-    std::int64_t hash_layer_count = 0;
-    double compress_rope_base = 0.0;
-    std::int64_t rope_original_positions = 0;
-    double rope_factor = 1.0;
-    double rope_beta_fast = 32.0;
-    double rope_beta_slow = 1.0;
+    std::vector<std::string> indexer_types;
+    std::vector<std::string> mlp_layer_types;
     std::int64_t num_experts = 0;
     std::int64_t num_experts_per_tok = 0;
     std::int64_t moe_intermediate_size = 0;
@@ -24,21 +19,24 @@ struct Config : ModelConfig {
     std::int64_t shared_expert_intermediate_size = 0;
     std::int64_t q_lora_rank = 0;
     std::int64_t kv_lora_rank = 0;
+    std::int64_t qk_head_dim = 0;
     std::int64_t qk_nope_head_dim = 0;
     std::int64_t qk_rope_head_dim = 0;
     std::int64_t v_head_dim = 0;
     std::int64_t index_head_dim = 0;
     std::int64_t index_n_heads = 0;
     std::int64_t index_topk = 0;
-    std::int64_t hc_mult = 1;
-    std::int64_t hc_sinkhorn_iters = 0;
-    double hc_eps = 1e-6;
-    std::int64_t o_groups = 1;
-    std::int64_t o_lora_rank = 0;
-    double swiglu_limit = 0.0;
+    std::int64_t expert_group_count = 1;
+    std::int64_t selected_group_count = 1;
     double routed_scaling_factor = 1.0;
     bool norm_topk_prob = false;
+    double swiglu_limit = 0.0;
     std::string scoring_func = "softmax";
+    std::string hidden_act;
+    std::string topk_method;
+    bool attention_bias = false;
+    bool rope_interleave = true;
+    bool indexer_rope_interleave = true;
 
     static Config from_json(std::string_view payload);
 
@@ -48,4 +46,4 @@ struct Config : ModelConfig {
     }
 };
 
-} // namespace mfq::models::deepseek_v4
+} // namespace mfq::models::glm_dsa

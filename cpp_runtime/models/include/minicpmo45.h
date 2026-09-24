@@ -1,6 +1,6 @@
 #pragma once
 
-#include "models/model_config.h"
+#include "model_config.h"
 
 #include <string>
 #include <string_view>

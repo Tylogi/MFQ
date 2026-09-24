@@ -659,13 +659,17 @@ def test_model_config_parsing_is_backend_neutral() -> None:
         "deepseek_v41",
     )
 
+    assert "../models/" not in (CORE / "CMakeLists.txt").read_text(encoding="utf-8")
+    assert "target_link_libraries(mfq-models PUBLIC mfq-core)" in (
+        CORE.parent / "models" / "CMakeLists.txt"
+    ).read_text(encoding="utf-8")
     assert not (CUDA_MODELS / "config.h").exists()
     assert not (CUDA_RUNTIME / "model_config.h").exists()
     assert not (CUDA_MODELS / "cuda_model_config.h").exists()
     assert not (CUDA_MODELS / "cuda_model_config.cpp").exists()
     for stem in shared_configs:
-        assert (CORE / "models" / f"{stem}.h").is_file()
-        assert (CORE / "models" / f"{stem}.cpp").is_file()
+        assert (CORE.parent / "models" / "include" / f"{stem}.h").is_file()
+        assert (CORE.parent / "models" / f"{stem}.cpp").is_file()
 
     for config in (
         "mfq::models::qwen35::Config",
@@ -683,7 +687,7 @@ def test_model_config_parsing_is_backend_neutral() -> None:
     assert "nlohmann::json" not in CUDA_REGISTRY + CUDA_CAUSAL_LM_LOADER
     assert "Config::from_json" not in CUDA_REGISTRY
 
-    qwen_config = (CORE / "models" / "qwen35.h").read_text(
+    qwen_config = (CORE.parent / "models" / "include" / "qwen35.h").read_text(
         encoding="utf-8"
     )
     for field in (

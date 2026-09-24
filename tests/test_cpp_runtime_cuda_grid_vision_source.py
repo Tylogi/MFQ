@@ -4,10 +4,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CORE = (ROOT / "cpp_runtime/core/grid_vision.cpp").read_text()
 QWEN_CONFIG = (
-    ROOT / "cpp_runtime/core/models/qwen35.cpp"
+    ROOT / "cpp_runtime/models/qwen35.cpp"
 ).read_text()
 COMMON_CONFIG = (
-    ROOT / "cpp_runtime/core/models/model_config.cpp"
+    ROOT / "cpp_runtime/models/model_config.cpp"
 ).read_text()
 CUDA_ROOT = ROOT / "cpp_runtime/backends/cuda"
 CUDA = (CUDA_ROOT / "runtime/grid_vision_runtime.h").read_text()
