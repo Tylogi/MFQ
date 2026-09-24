@@ -1,27 +1,42 @@
 #pragma once
 
-#include "minicpmo45_runtime.h"
-#include "mfq/runtime.h"
+#include <cstdint>
+#include <string>
+#include <string_view>
 
-#include <mutex>
-#include <optional>
-#include <vector>
+namespace mfq::cuda {
+struct CudaLoadOptions;
+namespace commands { class ArgCursor; }
 
-namespace mfq::cuda::minicpmo45 {
+namespace minicpmo45 {
 
-int32_t generate_multimodal_tokens(
-    MiniCPMO45Runtime& runtime,
-    std::mutex& model_mutex,
-    const std::vector<int64_t>& prompt,
-    const MfqVisionInput& vision,
-    const MfqSamplingParams& sampling,
-    const MfqTokenCallback& on_token,
-    const MfqPrefillCallback& on_prefill,
-    const MfqTokenConstraintPtr& token_constraint);
+struct CommandOptions {
+    std::string input_prefix, output_prefix;
+    std::string duplex_input_prefix, duplex_output_prefix;
+    std::int64_t tts_steps = 0;
+    std::int64_t duplex_steps = 0;
+    std::int64_t duplex_max_speak_tokens = 20;
+    std::int64_t duplex_seed = 0;
+    bool duplex_greedy = false;
+};
 
-MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
-    MiniCPMO45Runtime& runtime,
-    std::mutex& model_mutex,
-    std::optional<MiniCPMO45DuplexSession>& session);
+bool parse_command_option(
+    std::string_view option,
+    commands::ArgCursor& args,
+    CommandOptions& result);
+void validate_command_options(const CommandOptions& options);
 
-} // namespace mfq::cuda::minicpmo45
+int run_composite(
+    const CudaLoadOptions& load,
+    const CommandOptions& options);
+int run_duplex(
+    const CudaLoadOptions& load,
+    const CommandOptions& options);
+int run_eval_batch(
+    const std::string& model_path,
+    const std::string& config_path,
+    std::int64_t context_size,
+    std::int64_t vision_batch_size);
+
+} // namespace minicpmo45
+} // namespace mfq::cuda

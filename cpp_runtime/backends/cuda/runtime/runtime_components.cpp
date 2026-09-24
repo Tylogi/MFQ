@@ -38,18 +38,9 @@ RuntimeComponents<Model> load_runtime_components(
             }
             break;
         }
-        case mfq::cuda::CudaVisionAdapter::minicpmo45:
-            if constexpr (std::is_same_v<
-                              Model, mfq::cuda::MiniCPMO45CausalLm>) {
-                result.minicpmo.emplace(
-                    MiniCPMO45Runtime::load_with_language(
-                        std::move(model)));
-                result.vision_available = true;
-            } else {
-                throw std::runtime_error(
-                    "MiniCPM-o components require MiniCPMO45CausalLm");
-            }
-            break;
+        default:
+            throw std::runtime_error(
+                "CUDA vision adapter is unsupported for this backbone");
     }
     if constexpr (
             Model::backbone == mfq::cuda::CudaBackbone::generic_qwen) {
@@ -109,8 +100,6 @@ RuntimeComponents<Model> load_runtime_components(
         TYPE&, bool)
 
 MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::Qwen35CausalLm);
-MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::MiniCPMO45CausalLm);
-MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::MiniCPMOTtsCausalLm);
 MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::Gemma4CausalLm);
 MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::GlmDsaCausalLm);
 MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::Glm5CausalLm);

@@ -9,7 +9,6 @@
 #include "runner.h"
 #include "runtime_components.h"
 #include "text_session_cache.h"
-#include "../models/minicpmo45/minicpmo45_engine.h"
 
 #include <cuda_runtime_api.h>
 
@@ -87,7 +86,6 @@ struct CudaEngineState {
     DecodeGraphCache decode_graph;
     TextSessionCache session_cache;
     std::unique_ptr<continuous::CudaContinuousBatcher> continuous_batcher;
-    std::optional<MiniCPMO45DuplexSession> minicpmo_duplex_session;
     int64_t prefill_chunk_size = 2048;
 };
 
@@ -230,30 +228,9 @@ LoadedCudaEngine make_loaded_engine(
             return state->session_cache.trim_hot(target_bytes);
         },
     };
-    if (state->components.minicpmo) {
-        inference.multimodal_generate = [state](
-                const std::vector<int64_t>& prompt,
-                const MfqVisionInput& vision,
-                const MfqSamplingParams& sampling,
-                const MfqTokenCallback& on_token,
-                const MfqPrefillCallback& on_prefill,
-                const MfqPromptCachePlan&,
-                const MfqTokenConstraintPtr& token_constraint) {
-            return minicpmo45::generate_multimodal_tokens(
-                *state->components.minicpmo,
-                state->model_mutex,
-                prompt,
-                vision,
-                sampling,
-                on_token,
-                on_prefill,
-                token_constraint);
-        };
-        inference.duplex =
-            minicpmo45::make_cuda_minicpmo45_duplex_backend(
-                *state->components.minicpmo,
-                state->model_mutex,
-                state->minicpmo_duplex_session);
+    if (state->components.engine_binder) {
+        state->components.engine_binder(
+            inference, state->model_mutex);
     } else if (state->components.grid_vision) {
         inference.multimodal_generate = [state](
                 const std::vector<int64_t>& prompt,
@@ -292,7 +269,8 @@ LoadedCudaEngine make_loaded_engine(
     };
 
     const auto component_state = state->components.state();
-    const bool composite_loaded = state->components.minicpmo.has_value();
+    const bool model_adapter_loaded =
+        static_cast<bool>(state->components.engine_binder);
     CudaEngineMetadata metadata;
     metadata.source = state->language->source;
     metadata.architecture = state->components.graph.architecture;
@@ -306,11 +284,11 @@ LoadedCudaEngine make_loaded_engine(
     metadata.capabilities.video_input =
         component_state.vision_available &&
         !state->components.grid_vision.has_value();
-    metadata.capabilities.audio_input = composite_loaded &&
+    metadata.capabilities.audio_input = model_adapter_loaded &&
         state->components.graph.has_component("audio_input");
-    metadata.capabilities.audio_output = composite_loaded &&
+    metadata.capabilities.audio_output = model_adapter_loaded &&
         state->components.graph.has_component("audio_output");
-    metadata.capabilities.full_duplex = composite_loaded &&
+    metadata.capabilities.full_duplex = model_adapter_loaded &&
         state->components.graph.has_component("duplex");
     metadata.capabilities.mtp =
         component_state.mtp_available && !state->continuous_batcher;
@@ -330,24 +308,6 @@ LoadedCudaEngine load_cuda_engine(CudaEngineOptions options) {
             return make_loaded_engine<Backbone>(
                 std::move(model), std::move(components), options);
         });
-}
-
-int run_cuda_minicpmo_composite(const RuntimeOptions& options) {
-    return run_minicpmo45_composite(
-        options.model_path, options.config_path,
-        options.minicpmo_input_prefix, options.minicpmo_output_prefix,
-        options.context_size, options.minicpmo_tts_steps);
-}
-
-int run_cuda_minicpmo_duplex(const RuntimeOptions& options) {
-    return run_minicpmo45_duplex(
-        options.model_path, options.config_path,
-        options.minicpmo_duplex_input_prefix,
-        options.minicpmo_duplex_output_prefix,
-        options.context_size, options.minicpmo_duplex_steps,
-        options.minicpmo_duplex_max_speak_tokens,
-        options.minicpmo_duplex_greedy,
-        options.minicpmo_duplex_seed);
 }
 
 } // namespace mfq::cuda

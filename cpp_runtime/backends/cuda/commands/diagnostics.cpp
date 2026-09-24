@@ -5,6 +5,7 @@
 #include "diagnostics/model_checks.h"
 #include "diagnostics/runtime_checks.h"
 #include "diagnostics/flash_next_mtp.h"
+#include "models/minicpmo45/minicpmo45_engine.h"
 #include "registry.h"
 #include "transport.h"
 #include "cuda_execution.h"
@@ -358,7 +359,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 throw std::runtime_error(
                     "--minicpmo-eval-vision-batch-size must be positive");
             }
-            return run_minicpmo45_eval_batch(
+            return mfq::cuda::minicpmo45::run_eval_batch(
                 model_path, config_path, context_size,
                 minicpmo_eval_vision_batch_size);
         }

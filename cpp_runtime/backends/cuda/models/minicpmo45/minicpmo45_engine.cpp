@@ -1,17 +1,24 @@
 #include "minicpmo45_engine.h"
+#include "minicpmo45_runtime.h"
 
+#include "commands/cli.h"
 #include "runtime/cuda_execution.h"
 #include "runtime/cuda_sampling.h"
 #include "runtime/generation.h"
+#include "runtime/options.h"
+#include "runtime/runtime_components.h"
 #include "mfq_tensor_backend.h"
 #include "tensor_parallel.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace mfq::cuda::minicpmo45 {
 
@@ -47,7 +54,7 @@ static mfq_tensor_backend::Tensor sample_token(
 
 } // namespace
 
-int32_t generate_multimodal_tokens(
+static int32_t generate_multimodal_tokens(
     MiniCPMO45Runtime & runtime,
     std::mutex & model_mutex,
     const std::vector<int64_t> & prompt,
@@ -192,7 +199,7 @@ int32_t generate_multimodal_tokens(
     return generated;
 }
 
-MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
+static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
         MiniCPMO45Runtime & runtime,
         std::mutex & model_mutex,
         std::optional<MiniCPMO45DuplexSession> & session) {
@@ -386,5 +393,166 @@ MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
     return backend;
 }
 
+
+struct EngineComponents {
+    explicit EngineComponents(mfq::cuda::MiniCPMO45CausalLm language)
+        : runtime(MiniCPMO45Runtime::load_with_language(
+              std::move(language))) {}
+
+    MiniCPMO45Runtime runtime;
+    std::optional<MiniCPMO45DuplexSession> duplex_session;
+};
+
+} // namespace mfq::cuda::minicpmo45
+
+template <>
+RuntimeComponents<mfq::cuda::MiniCPMO45CausalLm>
+load_runtime_components(
+        mfq::cuda::MiniCPMO45CausalLm& model,
+        bool load_optional_components) {
+    RuntimeComponents<mfq::cuda::MiniCPMO45CausalLm> result;
+    result.graph = model.graph;
+    result.plan = model.plan;
+    if (!load_optional_components ||
+            result.plan.vision == mfq::cuda::CudaVisionAdapter::none) {
+        return result;
+    }
+    if (result.plan.vision !=
+            mfq::cuda::CudaVisionAdapter::minicpmo45) {
+        throw std::runtime_error(
+            "unsupported MiniCPM-o CUDA vision adapter");
+    }
+
+    auto state = std::make_shared<
+        mfq::cuda::minicpmo45::EngineComponents>(std::move(model));
+    result.language_override = &state->runtime.language;
+    result.engine_binder = [state](
+            MfqInferenceEngine& engine,
+            std::mutex& model_mutex) {
+        engine.multimodal_generate = [state, &model_mutex](
+                const std::vector<int64_t>& prompt,
+                const MfqVisionInput& vision,
+                const MfqSamplingParams& sampling,
+                const MfqTokenCallback& on_token,
+                const MfqPrefillCallback& on_prefill,
+                const MfqPromptCachePlan&,
+                const MfqTokenConstraintPtr& token_constraint) {
+            return mfq::cuda::minicpmo45::generate_multimodal_tokens(
+                state->runtime,
+                model_mutex,
+                prompt,
+                vision,
+                sampling,
+                on_token,
+                on_prefill,
+                token_constraint);
+        };
+        engine.duplex =
+            mfq::cuda::minicpmo45::make_cuda_minicpmo45_duplex_backend(
+                state->runtime,
+                model_mutex,
+                state->duplex_session);
+    };
+    result.vision_available = true;
+    return result;
+}
+
+template <>
+RuntimeComponents<mfq::cuda::MiniCPMOTtsCausalLm>
+load_runtime_components(
+        mfq::cuda::MiniCPMOTtsCausalLm& model,
+        bool) {
+    RuntimeComponents<mfq::cuda::MiniCPMOTtsCausalLm> result;
+    result.graph = model.graph;
+    result.plan = model.plan;
+    return result;
+}
+
+namespace mfq::cuda::minicpmo45 {
+
+bool parse_command_option(
+        std::string_view option,
+        commands::ArgCursor& args,
+        CommandOptions& result) {
+    using commands::integer;
+    using commands::usage_error;
+    if (option == "--minicpmo-input-prefix") {
+        result.input_prefix = args.value(option);
+    } else if (option == "--minicpmo-output-prefix") {
+        result.output_prefix = args.value(option);
+    } else if (option == "--minicpmo-tts-steps") {
+        result.tts_steps = integer<int64_t>(args.value(option), option);
+        if (result.tts_steps < 0) {
+            usage_error("--minicpmo-tts-steps must be non-negative");
+        }
+    } else if (option == "--minicpmo-duplex-input-prefix") {
+        result.duplex_input_prefix = args.value(option);
+    } else if (option == "--minicpmo-duplex-output-prefix") {
+        result.duplex_output_prefix = args.value(option);
+    } else if (option == "--minicpmo-duplex-steps") {
+        result.duplex_steps = integer<int64_t>(args.value(option), option);
+        if (result.duplex_steps < 0) {
+            usage_error("--minicpmo-duplex-steps must be non-negative");
+        }
+    } else if (option == "--minicpmo-duplex-max-speak-tokens") {
+        result.duplex_max_speak_tokens =
+            integer<int64_t>(args.value(option), option);
+        if (result.duplex_max_speak_tokens <= 0) {
+            usage_error(
+                "--minicpmo-duplex-max-speak-tokens must be positive");
+        }
+    } else if (option == "--minicpmo-duplex-seed") {
+        result.duplex_seed = integer<int64_t>(args.value(option), option);
+    } else if (option == "--minicpmo-duplex-greedy") {
+        result.duplex_greedy = true;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+void validate_command_options(const CommandOptions& options) {
+    if (!options.output_prefix.empty() && options.input_prefix.empty()) {
+        commands::usage_error(
+            "--minicpmo-output-prefix requires --minicpmo-input-prefix");
+    }
+    if (!options.duplex_output_prefix.empty() &&
+            options.duplex_input_prefix.empty()) {
+        commands::usage_error(
+            "--minicpmo-duplex-output-prefix requires "
+            "--minicpmo-duplex-input-prefix");
+    }
+}
+
+int run_composite(
+        const CudaLoadOptions& load,
+        const CommandOptions& options) {
+    return run_minicpmo45_composite(
+        load.model_path, load.config_path,
+        options.input_prefix, options.output_prefix,
+        load.context_size, options.tts_steps);
+}
+
+int run_duplex(
+        const CudaLoadOptions& load,
+        const CommandOptions& options) {
+    return run_minicpmo45_duplex(
+        load.model_path, load.config_path,
+        options.duplex_input_prefix,
+        options.duplex_output_prefix,
+        load.context_size, options.duplex_steps,
+        options.duplex_max_speak_tokens,
+        options.duplex_greedy,
+        options.duplex_seed);
+}
+
+int run_eval_batch(
+        const std::string& model_path,
+        const std::string& config_path,
+        int64_t context_size,
+        int64_t vision_batch_size) {
+    return run_minicpmo45_eval_batch(
+        model_path, config_path, context_size, vision_batch_size);
+}
 
 } // namespace mfq::cuda::minicpmo45

@@ -39,7 +39,4 @@ struct LoadedCudaEngine {
 
 LoadedCudaEngine load_cuda_engine(CudaEngineOptions options);
 
-int run_cuda_minicpmo_composite(const RuntimeOptions& options);
-int run_cuda_minicpmo_duplex(const RuntimeOptions& options);
-
 } // namespace mfq::cuda

@@ -31,19 +31,12 @@ struct TokenInputOptions {
 };
 
 struct RuntimeOptions : CudaEngineOptions, TokenInputOptions {
-    std::string minicpmo_input_prefix, minicpmo_output_prefix;
-    std::string minicpmo_duplex_input_prefix, minicpmo_duplex_output_prefix;
     std::string transport_host = "127.0.0.1";
     std::string runtime_model_name = "mfq-model", transport_api_key;
     std::string runtime_sampling_profile;
     int transport_port = 8080;
-    int64_t minicpmo_tts_steps = 0;
-    int64_t minicpmo_duplex_steps = 0;
-    int64_t minicpmo_duplex_max_speak_tokens = 20;
-    int64_t minicpmo_duplex_seed = 0;
     bool transport_mode = false;
     bool stdio_mode = false;
-    bool minicpmo_duplex_greedy = false;
 };
 
 } // namespace mfq::cuda

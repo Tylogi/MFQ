@@ -11,6 +11,15 @@ CUDA_COMPONENTS = "\n".join(
     (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
     for name in ("runtime_components.h", "runtime_components.cpp")
 )
+CUDA_ENGINE = (CUDA_ROOT / "runtime" / "cuda_engine.cpp").read_text(
+    encoding="utf-8"
+)
+CUDA_OPTIONS = (CUDA_ROOT / "runtime" / "options.h").read_text(
+    encoding="utf-8"
+)
+MINICPM_ENGINE = (
+    CUDA_ROOT / "models" / "minicpmo45" / "minicpmo45_engine.cpp"
+).read_text(encoding="utf-8")
 ROPE = (ROOT / "mfq" / "kernels" / "cuda" / "rope.cu").read_text(
     encoding="utf-8"
 )
@@ -265,11 +274,15 @@ def test_minicpmo45_cli_exposes_native_duplex_tensor_contract():
 
 def test_minicpmo45_cuda_server_binds_the_realtime_backend():
     assert 'option == "--minicpmo-duplex"' not in DECODE
-    assert "make_cuda_minicpmo45_duplex_backend(" in DECODE
-    assert "if (state->components.minicpmo)" in DECODE
-    assert "load_runtime_components(" in DECODE
-    assert 'backend.name = "cuda"' in DECODE
-    assert "MiniCPMO45Runtime::load_with_language(" in CUDA_COMPONENTS
+    assert "make_cuda_minicpmo45_duplex_backend(" in MINICPM_ENGINE
+    assert "engine_binder" in MINICPM_ENGINE
+    assert "load_runtime_components(" in MINICPM_ENGINE
+    assert 'backend.name = "cuda"' in MINICPM_ENGINE
+    assert "MiniCPMO45Runtime::load_with_language(" in MINICPM_ENGINE
+    assert "MiniCPM" not in CUDA_ENGINE
+    assert "minicpmo" not in CUDA_OPTIONS.lower()
+    assert "MiniCPMO45Runtime" not in CUDA_COMPONENTS
+    assert "components.minicpmo" not in CUDA_COMPONENTS
     assert "session->prepare(" in DECODE
     assert "parameters.reference_audio_features" in DECODE
     assert "input.force_speak" in DECODE

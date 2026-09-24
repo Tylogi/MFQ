@@ -3,6 +3,7 @@
 #include "runtime/moe_expert_cache.h"
 #include "runtime/setup.h"
 #include "runtime/token_generation.h"
+#include "models/minicpmo45/minicpmo45_engine.h"
 #include "models/registry.h"
 #include "mfq/model_source.h"
 #include "transport.h"
@@ -62,8 +63,12 @@ void print_help() {
         << "  -h, --help                      show this help\n";
 }
 
-RuntimeOptions parse_runtime(ArgCursor& args) {
-    RuntimeOptions result;
+struct RuntimeCommandOptions
+    : RuntimeOptions,
+      mfq::cuda::minicpmo45::CommandOptions {};
+
+RuntimeCommandOptions parse_runtime(ArgCursor& args) {
+    RuntimeCommandOptions result;
     bool transport_option = false;
     bool gen_option = false;
     while (!args.empty()) {
@@ -73,6 +78,10 @@ RuntimeOptions parse_runtime(ArgCursor& args) {
             throw HelpRequested{};
         }
         if (parse_cuda_load_option(option, args, result)) continue;
+        if (mfq::cuda::minicpmo45::parse_command_option(
+                option, args, result)) {
+            continue;
+        }
         if (option == "--ids") {
             result.ids_arg = args.value(option);
             validate_integer_list(result.ids_arg, option);
@@ -82,43 +91,6 @@ RuntimeOptions parse_runtime(ArgCursor& args) {
             result.gen = integer<int>(args.value(option), option);
             if (result.gen < 0) usage_error("--gen must be non-negative");
             gen_option = true;
-        }
-        else if (option == "--minicpmo-input-prefix") {
-            result.minicpmo_input_prefix = args.value(option);
-        }
-        else if (option == "--minicpmo-output-prefix") {
-            result.minicpmo_output_prefix = args.value(option);
-        }
-        else if (option == "--minicpmo-tts-steps") {
-            result.minicpmo_tts_steps = integer<int64_t>(args.value(option), option);
-            if (result.minicpmo_tts_steps < 0) {
-                usage_error("--minicpmo-tts-steps must be non-negative");
-            }
-        }
-        else if (option == "--minicpmo-duplex-input-prefix") {
-            result.minicpmo_duplex_input_prefix = args.value(option);
-        }
-        else if (option == "--minicpmo-duplex-output-prefix") {
-            result.minicpmo_duplex_output_prefix = args.value(option);
-        }
-        else if (option == "--minicpmo-duplex-steps") {
-            result.minicpmo_duplex_steps = integer<int64_t>(args.value(option), option);
-            if (result.minicpmo_duplex_steps < 0) {
-                usage_error("--minicpmo-duplex-steps must be non-negative");
-            }
-        }
-        else if (option == "--minicpmo-duplex-max-speak-tokens") {
-            result.minicpmo_duplex_max_speak_tokens =
-                integer<int64_t>(args.value(option), option);
-            if (result.minicpmo_duplex_max_speak_tokens <= 0) {
-                usage_error("--minicpmo-duplex-max-speak-tokens must be positive");
-            }
-        }
-        else if (option == "--minicpmo-duplex-seed") {
-            result.minicpmo_duplex_seed = integer<int64_t>(args.value(option), option);
-        }
-        else if (option == "--minicpmo-duplex-greedy") {
-            result.minicpmo_duplex_greedy = true;
         }
         else if (option == "--transport") {
             if (result.transport_mode) {
@@ -175,21 +147,12 @@ RuntimeOptions parse_runtime(ArgCursor& args) {
     if (!result.ids_arg.empty() && !result.ids_file.empty()) {
         usage_error("--ids and --ids-file are mutually exclusive");
     }
-    if (!result.minicpmo_output_prefix.empty() &&
-            result.minicpmo_input_prefix.empty()) {
-        usage_error("--minicpmo-output-prefix requires --minicpmo-input-prefix");
-    }
-    if (!result.minicpmo_duplex_output_prefix.empty() &&
-            result.minicpmo_duplex_input_prefix.empty()) {
-        usage_error(
-            "--minicpmo-duplex-output-prefix requires "
-            "--minicpmo-duplex-input-prefix");
-    }
+    mfq::cuda::minicpmo45::validate_command_options(result);
     const bool token_mode = !result.ids_arg.empty() || !result.ids_file.empty();
     const int modes = static_cast<int>(result.transport_mode) +
         static_cast<int>(token_mode) +
-        static_cast<int>(!result.minicpmo_input_prefix.empty()) +
-        static_cast<int>(!result.minicpmo_duplex_input_prefix.empty());
+        static_cast<int>(!result.input_prefix.empty()) +
+        static_cast<int>(!result.duplex_input_prefix.empty());
     if (modes != 1) {
         usage_error("select exactly one execution mode: --transport, token input, "
                     "MiniCPM-o composite, or MiniCPM-o duplex");
@@ -295,15 +258,15 @@ int run_transport_runtime(RuntimeOptions& options) {
     return status;
 }
 
-int execute_runtime(RuntimeOptions options) {
+int execute_runtime(RuntimeCommandOptions options) {
     return mfq::cuda::internal::with_command_errors([&]() -> int {
         if (options.stdio_mode) prepare_mfq_stdio_transport();
         mfq::cuda::internal::setup_cuda_load(options);
-        if (!options.minicpmo_duplex_input_prefix.empty()) {
-            return run_cuda_minicpmo_duplex(options);
+        if (!options.duplex_input_prefix.empty()) {
+            return mfq::cuda::minicpmo45::run_duplex(options, options);
         }
-        if (!options.minicpmo_input_prefix.empty()) {
-            return run_cuda_minicpmo_composite(options);
+        if (!options.input_prefix.empty()) {
+            return mfq::cuda::minicpmo45::run_composite(options, options);
         }
         if (options.transport_mode) {
             return run_transport_runtime(options);
