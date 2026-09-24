@@ -192,9 +192,9 @@ def test_minicpmo45_serializes_independent_decode_projection_branches():
 
 
 def test_minicpmo45_cli_exposes_tensor_fixture_contract():
-    assert 'a == "--minicpmo-input-prefix"' in DECODE
-    assert 'a == "--minicpmo-output-prefix"' in DECODE
-    assert 'a == "--minicpmo-tts-steps"' in DECODE
+    assert 'option == "--minicpmo-input-prefix"' in DECODE
+    assert 'option == "--minicpmo-output-prefix"' in DECODE
+    assert 'option == "--minicpmo-tts-steps"' in DECODE
     assert 'input_prefix + ".input_ids.pt"' in GRAPH
     assert 'input_prefix + ".position_ids.pt"' in GRAPH
     assert 'input_prefix + ".attention_mask.pt"' in GRAPH
@@ -248,12 +248,12 @@ def test_minicpmo45_native_duplex_uses_official_sampling_contracts():
 
 
 def test_minicpmo45_cli_exposes_native_duplex_tensor_contract():
-    assert 'a == "--minicpmo-duplex-input-prefix"' in DECODE
-    assert 'a == "--minicpmo-duplex-output-prefix"' in DECODE
-    assert 'a == "--minicpmo-duplex-steps"' in DECODE
-    assert 'a == "--minicpmo-duplex-max-speak-tokens"' in DECODE
-    assert 'a == "--minicpmo-duplex-seed"' in DECODE
-    assert 'a == "--minicpmo-duplex-greedy"' in DECODE
+    assert 'option == "--minicpmo-duplex-input-prefix"' in DECODE
+    assert 'option == "--minicpmo-duplex-output-prefix"' in DECODE
+    assert 'option == "--minicpmo-duplex-steps"' in DECODE
+    assert 'option == "--minicpmo-duplex-max-speak-tokens"' in DECODE
+    assert 'option == "--minicpmo-duplex-seed"' in DECODE
+    assert 'option == "--minicpmo-duplex-greedy"' in DECODE
     assert 'input_prefix + ".special_ids.pt"' in GRAPH
     assert 'input + ".audio_features.pt"' in GRAPH
     assert 'input + ".force_listen.pt"' in GRAPH
@@ -264,7 +264,7 @@ def test_minicpmo45_cli_exposes_native_duplex_tensor_contract():
 
 
 def test_minicpmo45_cuda_server_binds_the_realtime_backend():
-    assert 'a == "--minicpmo-duplex"' not in DECODE
+    assert 'option == "--minicpmo-duplex"' not in DECODE
     assert "make_cuda_minicpmo45_duplex_backend(" in DECODE
     assert "if (runtime_components.minicpmo)" in DECODE
     assert "load_runtime_components(" in DECODE

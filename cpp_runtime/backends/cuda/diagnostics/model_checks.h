@@ -1,30 +1,10 @@
 #pragma once
 
-#include "../causal_lm.h"
+#include "../runtime/causal_lm.h"
 
 #include <cstdint>
 #include <string>
 #include <vector>
-
-struct KlReferenceContract {
-    std::int64_t n_batch = 0;
-    std::int64_t n_ubatch = 0;
-};
-
-enum class KlEvaluator {
-    Legacy,
-    Optimized,
-};
-
-KlEvaluator parse_kl_evaluator(const std::string& value);
-KlMmqMode parse_kl_mmq_mode(const std::string& value);
-std::vector<KlMmqMode> parse_kl_mmq_sequence(const std::string& value);
-const char* kl_evaluator_name(KlEvaluator evaluator);
-template <typename Model>
-int run_kl_eval_batched(Model& model, const std::string& reference_path, int max_chunks, std::int64_t requested_n_batch, int score_override, const KlReferenceContract& reference_contract);
-template <typename Model>
-int run_selected_kl_eval(Model& model, const std::string& reference_path, int max_chunks, KlEvaluator evaluator, std::int64_t requested_n_batch, int score_override, const KlReferenceContract& reference_contract);
-int run_kl_eval_streamed(const std::string& model_path, const std::string& config_path, const std::string& reference_path, const std::string& logits_output_path, int max_chunks, int layer_group, int chunk_batch, int score_override, const KlReferenceContract& reference_contract);
 int run_linear_check(const std::string& model_path, const std::string& name, int rows, int gate_mode, int repetitions);
 int run_cpu_linear_check(const std::string& model_path, const std::string& name, int rows, int gate_mode, int repetitions);
 int run_tensor_parallel_linear_check(const std::string& model_path, const std::string& name, TensorParallelAxis axis, int rows);

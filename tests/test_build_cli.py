@@ -160,7 +160,8 @@ def test_native_cuda_runtime_compilation_units_do_not_include_torch() -> None:
     )
     source_block = cmake.split("set(MFQ_CUDA_KERNEL_SOURCES", 1)[1].split(")", 1)[0]
     sources = [
-        ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "runtime.cpp",
+        ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "runtime_main.cpp",
+        ROOT / "cpp_runtime" / "backends" / "cuda" / "commands" / "runtime.cpp",
         ROOT / "cpp_runtime" / "backends" / "cuda" / "models" / "minicpmo45" / "minicpmo45_runtime.h",
         ROOT / "cpp_runtime" / "backends" / "cuda" / "models" / "minicpmo45" / "minicpmo45_runtime.cpp",
         *(

@@ -1013,7 +1013,9 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
                                  std::vector<mfq_tensor_backend::Tensor> * block_trace = nullptr,
                                  MfqOptional<mfq_tensor_backend::Tensor> cache_positions_override = mfq_nullopt,
                                  mfq_tensor_backend::Tensor* raw_hidden = nullptr,
-                                 int64_t confirmed_prefix = 0) {
+                                 int64_t confirmed_prefix = 0,
+                                 int64_t planned_kv_length = 0,
+                                 int64_t decode_attention_parts = 0) {
         const int primary = g_layer_placement.primary_device();
         MfqCudaGuard primary_guard(primary);
         ids = tensor_to_cuda_device(
@@ -1022,7 +1024,8 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
         auto x = g_profiler.measure("model.embed", [&]() { return embed_forward(ids); });
         return hidden_forward_inputs(
             ids, x, pos_override, seq_len, block_trace,
-            mfq_nullopt, false, cache_positions_override, raw_hidden, confirmed_prefix);
+            mfq_nullopt, false, cache_positions_override, raw_hidden,
+            confirmed_prefix, planned_kv_length, decode_attention_parts);
     }
 
     mfq_tensor_backend::Tensor hidden_forward_speculative_suffix(
@@ -1055,7 +1058,9 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
             bool advance_cache_with_position_ids = false,
             MfqOptional<mfq_tensor_backend::Tensor> cache_positions_override = mfq_nullopt,
             mfq_tensor_backend::Tensor* raw_hidden = nullptr,
-            int64_t confirmed_prefix = 0) {
+            int64_t confirmed_prefix = 0,
+            int64_t planned_kv_length = 0,
+            int64_t decode_attention_parts = 0) {
         const int primary = g_layer_placement.primary_device();
         MfqCudaGuard primary_guard(primary);
         ids = tensor_to_cuda_device(
@@ -1258,6 +1263,8 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
             }
             context.cache_position=cache_pos;
             context.confirmed_prefix=confirmed_prefix;
+            context.planned_kv_length=planned_kv_length;
+            context.decode_attention_parts=decode_attention_parts;
             context.sequence_lengths=local_seq_len;
             context.cache_positions=local_cache_positions;
             if constexpr (is_minicpmo45) {
@@ -1372,8 +1379,26 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
         return apply_final_logit_softcap(lm_head.forward(last));
     }
 
-    mfq_tensor_backend::Tensor last_logits_static(mfq_tensor_backend::Tensor ids, mfq_tensor_backend::Tensor pos, mfq_tensor_backend::Tensor seq_len) {
-        auto y = hidden_forward(ids, pos, seq_len, nullptr, pos);
+    mfq_tensor_backend::Tensor hidden_forward_static(
+            mfq_tensor_backend::Tensor ids,
+            mfq_tensor_backend::Tensor pos,
+            mfq_tensor_backend::Tensor seq_len,
+            int64_t planned_kv_length,
+            int64_t decode_attention_parts) {
+        return hidden_forward(
+            std::move(ids), pos, seq_len, nullptr, pos, nullptr, 0,
+            planned_kv_length, decode_attention_parts);
+    }
+
+    mfq_tensor_backend::Tensor last_logits_static(
+            mfq_tensor_backend::Tensor ids,
+            mfq_tensor_backend::Tensor pos,
+            mfq_tensor_backend::Tensor seq_len,
+            int64_t planned_kv_length = 0,
+            int64_t decode_attention_parts = 0) {
+        auto y = hidden_forward_static(
+            std::move(ids), std::move(pos), std::move(seq_len),
+            planned_kv_length, decode_attention_parts);
         auto last = y.index({Slice(), -1, Slice()});
         if constexpr (is_minicpmo45) {
             return logits_from_hidden(
@@ -1396,8 +1421,15 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
         return next_token_from_hidden(y);
     }
 
-    mfq_tensor_backend::Tensor next_token_static(mfq_tensor_backend::Tensor ids, mfq_tensor_backend::Tensor pos, mfq_tensor_backend::Tensor seq_len) {
-        auto y = hidden_forward(ids, pos, seq_len, nullptr, pos);
+    mfq_tensor_backend::Tensor next_token_static(
+            mfq_tensor_backend::Tensor ids,
+            mfq_tensor_backend::Tensor pos,
+            mfq_tensor_backend::Tensor seq_len,
+            int64_t planned_kv_length = 0,
+            int64_t decode_attention_parts = 0) {
+        auto y = hidden_forward_static(
+            std::move(ids), std::move(pos), std::move(seq_len),
+            planned_kv_length, decode_attention_parts);
         return next_token_from_hidden(y);
     }
 

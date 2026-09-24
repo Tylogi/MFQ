@@ -91,7 +91,7 @@ def test_glm_dsa_session_state_preserves_mla_and_index_caches() -> None:
     assert "saved.kv_cache = glm->kv_cache.narrow(" in DECODE
     assert "saved.index_cache = glm->index_cache.narrow(" in DECODE
     assert "glm->shared_state->reset()" in DECODE
-    assert 'a == "--check-text-session-state"' in DECODE
+    assert 'option == "--check-text-session-state"' in DECODE
     assert '"text_session_state_check dsv4=1 glm_dsa=1\\n"' in DECODE
 
 

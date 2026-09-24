@@ -211,9 +211,11 @@ find_package(OpenMP QUIET)
 function(mfq_configure_cuda_runtime_target target)
     target_include_directories(${target} PRIVATE
         ${MFQ_REPOSITORY_ROOT}
+        ${MFQ_CUDA_ROOT}
         ${MFQ_CUDA_ROOT}/include
         ${MFQ_CUDA_ROOT}/models
         ${MFQ_CUDA_ROOT}/ops/include
+        ${MFQ_CUDA_ROOT}/commands
         ${MFQ_CUDA_ROOT}/runtime
         ${MFQ_CUDA_KERNEL_ROOT}
         ${CUDAToolkit_INCLUDE_DIRS}
@@ -262,6 +264,8 @@ set(MFQ_CUDA_RUNTIME_OP_SOURCES
 add_library(mfq-cuda-runtime STATIC
     ${MFQ_CUDA_RUNTIME_OP_SOURCES}
     ${MFQ_CUDA_ROOT}/runtime/cuda_runtime.cpp
+    ${MFQ_CUDA_ROOT}/runtime/runner.cpp
+    ${MFQ_CUDA_ROOT}/runtime/decode_graph.cpp
     ${MFQ_CUDA_ROOT}/runtime/cuda_execution.cpp
     ${MFQ_CUDA_ROOT}/runtime/causal_lm.cpp
     ${MFQ_CUDA_ROOT}/runtime/causal_lm_loader.cpp
@@ -270,8 +274,6 @@ add_library(mfq-cuda-runtime STATIC
     ${MFQ_CUDA_ROOT}/runtime/mtp.cpp
     ${MFQ_CUDA_ROOT}/runtime/moe_expert_cache.cpp
     ${MFQ_CUDA_ROOT}/runtime/runtime_components.cpp
-    ${MFQ_CUDA_ROOT}/runtime/diagnostics/backend_checks.cpp
-    ${MFQ_CUDA_ROOT}/runtime/diagnostics/model_checks.cpp
     ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
     ${MFQ_CUDA_MODEL_SOURCES}
 )
@@ -303,11 +305,34 @@ set_target_properties(mfq-cuda-runtime PROPERTIES
     CUDA_RUNTIME_LIBRARY Shared
 )
 
-add_executable(mfq-runtime
-    ${MFQ_CUDA_ROOT}/apps/runtime.cpp
+add_library(mfq-cuda-eval STATIC ${MFQ_CUDA_ROOT}/eval/kl.cpp)
+mfq_configure_cuda_runtime_target(mfq-cuda-eval)
+target_include_directories(mfq-cuda-eval PRIVATE ${MFQ_CUDA_ROOT}/storage)
+target_compile_definitions(mfq-cuda-eval PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+target_link_libraries(mfq-cuda-eval PUBLIC mfq-cuda-runtime)
+
+add_library(mfq-cuda-diagnostics STATIC
+    ${MFQ_CUDA_ROOT}/diagnostics/backend_checks.cpp
+    ${MFQ_CUDA_ROOT}/diagnostics/model_checks.cpp
 )
-target_link_libraries(mfq-runtime PRIVATE mfq-cuda-runtime)
+mfq_configure_cuda_runtime_target(mfq-cuda-diagnostics)
+target_include_directories(mfq-cuda-diagnostics PRIVATE ${MFQ_CUDA_ROOT}/storage)
+target_compile_definitions(mfq-cuda-diagnostics PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+target_link_libraries(mfq-cuda-diagnostics PUBLIC mfq-cuda-runtime)
+if(MSVC)
+    foreach(target mfq-cuda-diagnostics mfq-cuda-eval)
+        target_compile_options(${target} PRIVATE /utf-8 /EHsc /bigobj)
+    endforeach()
+endif()
+
+add_executable(mfq-runtime
+    ${MFQ_CUDA_ROOT}/apps/runtime_main.cpp
+    ${MFQ_CUDA_ROOT}/commands/runtime.cpp
+)
+target_link_libraries(mfq-runtime PRIVATE
+    mfq-cuda-runtime mfq-runtime-communication)
 target_include_directories(mfq-runtime PRIVATE
+    ${MFQ_CUDA_ROOT}
     ${MFQ_CUDA_ROOT}/runtime
 )
 target_compile_features(mfq-runtime PRIVATE cxx_std_20)
@@ -315,18 +340,35 @@ set_target_properties(mfq-runtime PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
 )
 
-add_executable(mfq-diagnostics ${MFQ_CUDA_ROOT}/apps/diagnostics.cpp)
-target_link_libraries(mfq-diagnostics PRIVATE mfq-cuda-runtime)
-target_include_directories(mfq-diagnostics PRIVATE ${MFQ_CUDA_ROOT}/runtime)
+add_executable(mfq-diagnostics
+    ${MFQ_CUDA_ROOT}/apps/diagnostics_main.cpp
+    ${MFQ_CUDA_ROOT}/commands/diagnostics.cpp
+)
+mfq_configure_cuda_runtime_target(mfq-diagnostics)
+target_include_directories(mfq-diagnostics PRIVATE ${MFQ_CUDA_ROOT}/storage)
+target_compile_definitions(mfq-diagnostics PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+target_link_libraries(mfq-diagnostics PRIVATE mfq-cuda-diagnostics)
 target_compile_features(mfq-diagnostics PRIVATE cxx_std_20)
+if(MSVC)
+    target_compile_options(mfq-diagnostics PRIVATE /utf-8 /EHsc /bigobj)
+endif()
 set_target_properties(mfq-diagnostics PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
 )
 
-add_executable(mfq-eval ${MFQ_CUDA_ROOT}/apps/eval.cpp)
-target_link_libraries(mfq-eval PRIVATE mfq-cuda-runtime)
-target_include_directories(mfq-eval PRIVATE ${MFQ_CUDA_ROOT}/runtime)
+add_executable(mfq-eval
+    ${MFQ_CUDA_ROOT}/apps/eval_main.cpp
+    ${MFQ_CUDA_ROOT}/commands/eval.cpp
+)
+mfq_configure_cuda_runtime_target(mfq-eval)
+target_include_directories(mfq-eval PRIVATE ${MFQ_CUDA_ROOT}/storage)
+target_compile_definitions(mfq-eval PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+target_link_libraries(mfq-eval PRIVATE
+    mfq-cuda-eval mfq-cuda-runtime mfq-cuda-native-kernels mfq-ggml)
 target_compile_features(mfq-eval PRIVATE cxx_std_20)
+if(MSVC)
+    target_compile_options(mfq-eval PRIVATE /utf-8 /EHsc /bigobj)
+endif()
 set_target_properties(mfq-eval PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
 )
@@ -336,17 +378,34 @@ if(BUILD_TESTING)
         NAME mfq-deepseek-v41-runtime-check
         COMMAND mfq-diagnostics --check-deepseek-v41)
     add_test(NAME mfq-diagnostics-help COMMAND mfq-diagnostics --help)
-    add_test(NAME mfq-eval-help COMMAND mfq-eval kl --help)
+    add_test(NAME mfq-eval-help COMMAND mfq-eval --help)
+    add_test(NAME mfq-eval-kl-help COMMAND mfq-eval kl --help)
+    add_test(NAME mfq-runtime-cli-options COMMAND mfq-runtime --ids 1,2 --gen 3 --help)
+    add_test(NAME mfq-diagnostics-cli-options COMMAND mfq-diagnostics --check-linear x --kl-mmq default --help)
+    add_test(NAME mfq-eval-cli-options COMMAND mfq-eval kl --kl-base x --kl-evaluator optimized --help)
     add_test(NAME mfq-runtime-rejects-check
         COMMAND mfq-runtime --check-mfq-container)
     add_test(NAME mfq-runtime-rejects-kl
         COMMAND mfq-runtime --kl-base reference.bin)
+    add_test(NAME mfq-runtime-rejects-bad-number
+        COMMAND mfq-runtime --gen 3x --help)
+    add_test(NAME mfq-runtime-rejects-missing-value
+        COMMAND mfq-runtime --model --help)
+    add_test(NAME mfq-runtime-rejects-bad-ids
+        COMMAND mfq-runtime --ids 1,x --help)
     add_test(NAME mfq-diagnostics-rejects-kl
         COMMAND mfq-diagnostics --kl-base reference.bin)
+    add_test(NAME mfq-diagnostics-rejects-missing-value
+        COMMAND mfq-diagnostics --check-linear --check-backend-argmax)
     add_test(NAME mfq-eval-rejects-check
         COMMAND mfq-eval kl --check-mfq-container)
-    set_tests_properties(mfq-runtime-rejects-check mfq-runtime-rejects-kl
-        mfq-diagnostics-rejects-kl mfq-eval-rejects-check
+    add_test(NAME mfq-eval-rejects-bad-number
+        COMMAND mfq-eval kl --kl-chunks 1x --help)
+    set_tests_properties(
+        mfq-runtime-rejects-check mfq-runtime-rejects-kl
+        mfq-runtime-rejects-bad-number mfq-runtime-rejects-missing-value
+        mfq-runtime-rejects-bad-ids mfq-diagnostics-rejects-kl mfq-diagnostics-rejects-missing-value
+        mfq-eval-rejects-check mfq-eval-rejects-bad-number
         PROPERTIES WILL_FAIL TRUE)
 endif()
 
@@ -370,9 +429,12 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
     endif()
     find_package(Torch REQUIRED)
     add_executable(mfq-runtime-torch
-        ${MFQ_CUDA_ROOT}/apps/runtime.cpp
+        ${MFQ_CUDA_ROOT}/apps/runtime_main.cpp
+        ${MFQ_CUDA_ROOT}/commands/runtime.cpp
         ${MFQ_CUDA_RUNTIME_OP_SOURCES}
         ${MFQ_CUDA_ROOT}/runtime/cuda_runtime.cpp
+        ${MFQ_CUDA_ROOT}/runtime/runner.cpp
+        ${MFQ_CUDA_ROOT}/runtime/decode_graph.cpp
         ${MFQ_CUDA_ROOT}/runtime/cuda_execution.cpp
         ${MFQ_CUDA_ROOT}/runtime/causal_lm.cpp
         ${MFQ_CUDA_ROOT}/runtime/causal_lm_loader.cpp
@@ -381,8 +443,6 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         ${MFQ_CUDA_ROOT}/runtime/mtp.cpp
         ${MFQ_CUDA_ROOT}/runtime/moe_expert_cache.cpp
         ${MFQ_CUDA_ROOT}/runtime/runtime_components.cpp
-        ${MFQ_CUDA_ROOT}/runtime/diagnostics/backend_checks.cpp
-        ${MFQ_CUDA_ROOT}/runtime/diagnostics/model_checks.cpp
         ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
         ${MFQ_CUDA_MODEL_SOURCES}
         ${MFQ_CUDA_KERNEL_SOURCES}

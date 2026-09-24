@@ -339,8 +339,6 @@ struct LayerPlacementConfig {
 };
 
 extern CudaProfiler g_profiler;
-extern int64_t g_decode_graph_attention_parts;
-extern int64_t g_decode_graph_attention_kv_len;
 extern bool g_force_moe_pool_path;
 extern bool g_force_moe_unfused_reduce;
 extern bool g_force_moe_materialized_swiglu;

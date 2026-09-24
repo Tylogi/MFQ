@@ -1302,6 +1302,8 @@ struct Block {
         mfq_tensor_backend::Tensor full_positions;
         int64_t cache_position = 0;
         int64_t confirmed_prefix = 0;
+        int64_t planned_kv_length = 0;
+        int64_t decode_attention_parts = 0;
         MfqOptional<mfq_tensor_backend::Tensor> sequence_lengths = mfq_nullopt;
         MfqOptional<mfq_tensor_backend::Tensor> cache_positions = mfq_nullopt;
         MfqOptional<mfq_tensor_backend::Tensor> attention_mask = mfq_nullopt;
@@ -1399,6 +1401,35 @@ struct FullBlock : Block {
             const RopeCache & rope,
             const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
             const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) override {
+        return forward_impl(
+            std::move(x), std::move(pos), cache_pos, seq_len, rope,
+            cache_positions, attention_mask, 0, 0);
+    }
+
+    mfq_tensor_backend::Tensor forward_context(
+            mfq_tensor_backend::Tensor x,
+            const Context& context,
+            const RopeCache& rope) override {
+        MFQ_RUNTIME_CHECK(
+            context.confirmed_prefix == 0 || supports_speculation(),
+            "block does not support speculative verification");
+        return forward_impl(
+            std::move(x), context.positions, context.cache_position,
+            context.sequence_lengths, rope, context.cache_positions,
+            context.attention_mask, context.planned_kv_length,
+            context.decode_attention_parts);
+    }
+
+    mfq_tensor_backend::Tensor forward_impl(
+            mfq_tensor_backend::Tensor x,
+            mfq_tensor_backend::Tensor pos,
+            int64_t cache_pos,
+            const MfqOptional<mfq_tensor_backend::Tensor>& seq_len,
+            const RopeCache& rope,
+            const MfqOptional<mfq_tensor_backend::Tensor>& cache_positions,
+            const MfqOptional<mfq_tensor_backend::Tensor>& attention_mask,
+            int64_t planned_kv_length,
+            int64_t decode_attention_parts) {
         int64_t B = x.size(0), T = x.size(1), H = x.size(2);
         auto trace_qwen_stage = [&](const char* name, const mfq_tensor_backend::Tensor& value,
                                     int token_axis = 1) {
@@ -1829,8 +1860,8 @@ struct FullBlock : Block {
                 }
                 }
             } else if (seq_len.has_value()) {
-                const int64_t planned_len = g_decode_graph_attention_kv_len > 0
-                    ? g_decode_graph_attention_kv_len : cache_pos + T;
+                const int64_t planned_len = planned_kv_length > 0
+                    ? planned_kv_length : cache_pos + T;
                 const char * aten_decode_env = std::getenv("MFQ_ATTENTION_DECODE_ATEN");
                 const char * bf16_gqa_env = std::getenv("MFQ_MINICPM_BF16_GQA_DECODE");
                 const bool bf16_gqa_decode = official_bf16 && T == 1 &&
@@ -1867,8 +1898,8 @@ struct FullBlock : Block {
                     int64_t parts = split_enabled && cache_pos >= 192
                         ? (cache_pos + 127) / 128 : 1;
                     const bool dynamic_parts =
-                        split_enabled && g_decode_graph_attention_parts > 1;
-                    if (dynamic_parts) parts = g_decode_graph_attention_parts;
+                        split_enabled && decode_attention_parts > 1;
+                    if (dynamic_parts) parts = decode_attention_parts;
                     parts = std::min<int64_t>(
                         parts, kDecodeAttentionMaxParts);
                     a = attention_paged_cache_decode_cuda(
@@ -1931,11 +1962,11 @@ struct FullBlock : Block {
                             split_env == nullptr || split_env[0] != '0';
                         int64_t parts = split_enabled && cache_pos >= 192
                             ? (cache_pos + 127) / 128 : 1;
-                        if (split_enabled && g_decode_graph_attention_parts > 0) {
-                            parts = g_decode_graph_attention_parts;
+                        if (split_enabled && decode_attention_parts > 0) {
+                            parts = decode_attention_parts;
                         }
                         parts = std::min<int64_t>(parts, kDecodeAttentionMaxParts);
-                        a = g_decode_graph_attention_parts > 1
+                        a = decode_attention_parts > 1
                             ? attention_cache_decode_dynamic_cuda(
                                 qh, cache.k, cache.v, seq_len.value(), attn_scale,
                                 decode_partial_o, decode_partial_m, decode_partial_l,

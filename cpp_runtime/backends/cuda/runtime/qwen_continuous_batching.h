@@ -1081,6 +1081,8 @@ private:
         }
         const int64_t planned_len = decode_graph_bucket(
             requested_len, model_.max_position_embeddings());
+        const int64_t graph_attention_parts = decode_graph_attention_parts(
+            planned_len, FullBlock::kDecodeAttentionMaxParts);
         const char * graph_min_environment = std::getenv(
             "MFQ_CONTINUOUS_BATCH_CUDA_GRAPH_MIN_TOKENS");
         const int64_t graph_min_tokens = graph_min_environment != nullptr
@@ -1178,8 +1180,9 @@ private:
             model_.cache_pos = max_position;
             if (graph_decode) {
                 const auto invoke = [&]() {
-                    auto hidden = model_.hidden_forward(
-                        ids, pos, lengths, nullptr, pos);
+                    auto hidden = model_.hidden_forward_static(
+                        ids, pos, lengths, planned_len,
+                        graph_attention_parts);
                     auto current_logits = qwen_logits_from_last_hidden(
                         model_, std::move(hidden));
                     return sample_greedy_cuda(
@@ -1188,12 +1191,6 @@ private:
                 if (!graph_cache_hit) {
                     decode_graph_->invalidate();
                     mfq_cuda_empty_cache();
-                    g_decode_graph_attention_kv_len = planned_len;
-                    g_decode_graph_attention_parts = planned_len >= 192
-                        ? (planned_len + 127) / 128 : 1;
-                    g_decode_graph_attention_parts = std::min<int64_t>(
-                        g_decode_graph_attention_parts,
-                        FullBlock::kDecodeAttentionMaxParts);
                     try {
                         DecodeGraphBranchScope branch_scope;
                         DecodeGraphTpProjectionScope tp_projection_scope;
@@ -1212,12 +1209,8 @@ private:
                         ++cuda_graph_captures_;
                     } catch (...) {
                         decode_graph_->invalidate();
-                        g_decode_graph_attention_kv_len = 0;
-                        g_decode_graph_attention_parts = 0;
                         throw;
                     }
-                    g_decode_graph_attention_kv_len = 0;
-                    g_decode_graph_attention_parts = 0;
                 }
                 decode_graph_->graph->replay();
                 graph_tokens = decode_graph_->static_next;
@@ -1232,8 +1225,6 @@ private:
         } catch (...) {
             auto error = std::current_exception();
             invalidate_decode_graph();
-            g_decode_graph_attention_kv_len = 0;
-            g_decode_graph_attention_parts = 0;
             try { model_.reset(1); } catch (...) {}
             fail_requests(active_, error);
             release_paged_requests(active_);

@@ -127,10 +127,10 @@ struct GlmDsaBlock : Block {
     mfq_tensor_backend::Tensor dense_attention(
         mfq_tensor_backend::Tensor q, int64_t logical_len, int64_t B,
         const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
-        double scale) const {
+        double scale, int64_t planned_kv_length) const {
         if (seq_len.has_value() && q.size(2) == 1 && B == 1) {
-            const int64_t planned_len = g_decode_graph_attention_kv_len > 0
-                ? g_decode_graph_attention_kv_len : logical_len;
+            const int64_t planned_len = planned_kv_length > 0
+                ? planned_kv_length : logical_len;
             shared_state->ensure_decode_workspace(B, planned_len);
             return attention_glm_mla576_decode_cuda(
                 q, kv_cache, seq_len.value(), scale, planned_len,
@@ -146,7 +146,8 @@ struct GlmDsaBlock : Block {
     void update_indexer(
         mfq_tensor_backend::Tensor index_q, mfq_tensor_backend::Tensor index_weights,
         int64_t B, int64_t T, int64_t cache_pos,
-        const MfqOptional<mfq_tensor_backend::Tensor> & seq_len) const {
+        const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
+        int64_t planned_kv_length) const {
         const auto& c = config;
         const int64_t logical_len = cache_pos + T;
         if (logical_len <= c.index_topk) {
@@ -156,8 +157,8 @@ struct GlmDsaBlock : Block {
         }
 
         if (seq_len.has_value() && T == 1 && B == 1) {
-            const int64_t planned_len = g_decode_graph_attention_kv_len > 0
-                ? g_decode_graph_attention_kv_len : logical_len;
+            const int64_t planned_len = planned_kv_length > 0
+                ? planned_kv_length : logical_len;
             auto scores = g_profiler.measure("glm.indexer_scores", [&]() {
                 return glm_dsa_indexer_scores_decode_cuda(
                     index_q, index_cache, index_weights,
@@ -213,6 +214,32 @@ struct GlmDsaBlock : Block {
         const RopeCache & rope,
         const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
         const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) override {
+        return forward_impl(
+            std::move(x), std::move(pos), cache_pos, seq_len, rope,
+            cache_positions, attention_mask, 0);
+    }
+
+    mfq_tensor_backend::Tensor forward_context(
+            mfq_tensor_backend::Tensor x,
+            const Context& context,
+            const RopeCache& rope) override {
+        MFQ_RUNTIME_CHECK(
+            context.confirmed_prefix == 0,
+            "GLM DSA does not support speculative verification");
+        return forward_impl(
+            std::move(x), context.positions, context.cache_position,
+            context.sequence_lengths, rope, context.cache_positions,
+            context.attention_mask, context.planned_kv_length);
+    }
+
+    mfq_tensor_backend::Tensor forward_impl(
+        mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos,
+        int64_t cache_pos,
+        const MfqOptional<mfq_tensor_backend::Tensor>& seq_len,
+        const RopeCache& rope,
+        const MfqOptional<mfq_tensor_backend::Tensor>& cache_positions,
+        const MfqOptional<mfq_tensor_backend::Tensor>& attention_mask,
+        int64_t planned_kv_length) {
         const auto& c = config;
         (void)cache_positions;
         (void)attention_mask;
@@ -324,7 +351,8 @@ struct GlmDsaBlock : Block {
             auto index_weights = first[3].reshape({B, T, c.index_n_heads})
                 .to(mfq_tensor_backend::kFloat32).contiguous();
             update_indexer(
-                index_q, index_weights, B, T, cache_pos, seq_len);
+                index_q, index_weights, B, T, cache_pos, seq_len,
+                planned_kv_length);
         }
 
         auto q_absorbed = g_profiler.measure("glm.embed_q", [&]() {
@@ -337,7 +365,9 @@ struct GlmDsaBlock : Block {
         mfq_tensor_backend::Tensor attended;
         if (!shared_state->topk_indices.defined()) {
             attended = g_profiler.measure("glm.attention_dense", [&]() {
-                return dense_attention(q_mla, logical_len, B, seq_len, scale);
+                return dense_attention(
+                    q_mla, logical_len, B, seq_len, scale,
+                    planned_kv_length);
             });
         } else {
             const int64_t prefix = shared_state->dense_prefix_rows;
@@ -350,7 +380,8 @@ struct GlmDsaBlock : Block {
                 dense_out = g_profiler.measure("glm.attention_dense_prefix", [&]() {
                     return dense_attention(
                         q_mla.narrow(2, 0, prefix).contiguous(),
-                        cache_pos + prefix, B, mfq_nullopt, scale);
+                        cache_pos + prefix, B, mfq_nullopt, scale,
+                        planned_kv_length);
                 });
             }
             shared_state->ensure_meta();

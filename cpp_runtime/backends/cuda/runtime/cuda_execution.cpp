@@ -46,8 +46,6 @@ using mfq_tensor_backend::indexing::Slice;
 
 CudaProfiler g_profiler;
 
-int64_t g_decode_graph_attention_parts = 0;
-int64_t g_decode_graph_attention_kv_len = 0;
 bool g_force_moe_pool_path = false;
 bool g_force_moe_unfused_reduce = false;
 bool g_force_moe_materialized_swiglu = false;

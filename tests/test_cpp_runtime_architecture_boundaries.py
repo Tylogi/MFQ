@@ -55,7 +55,13 @@ CUDA_MTP_HEADER = (
     ROOT / "cpp_runtime" / "backends" / "cuda" / "include" / "mfq_cuda_mtp.h"
 ).read_text(encoding="utf-8")
 CUDA_APP = (
-    ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "runtime.cpp"
+    ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "runtime_main.cpp"
+).read_text(encoding="utf-8")
+CUDA_RUNTIME_COMMAND = (
+    ROOT / "cpp_runtime" / "backends" / "cuda" / "commands" / "runtime.cpp"
+).read_text(encoding="utf-8")
+CUDA_CLI = (
+    ROOT / "cpp_runtime" / "backends" / "cuda" / "commands" / "cli.h"
 ).read_text(encoding="utf-8")
 CUDA_MODELS = ROOT / "cpp_runtime" / "backends" / "cuda" / "models"
 CUDA_RUNTIME = ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime"
@@ -167,7 +173,7 @@ def test_model_sources_are_backend_neutral_and_shared() -> None:
 
 def test_native_cli_uses_backend_neutral_model_and_tokenizer_options() -> None:
     sources = (
-        CUDA_DECODE,
+        CUDA_APP + "\n" + CUDA_RUNTIME_COMMAND + "\n" + CUDA_CLI,
         DECODE_APP,
         (METAL / "apps" / "mfq_perplexity_mlx.cpp").read_text(encoding="utf-8"),
     )
@@ -180,10 +186,12 @@ def test_native_cli_uses_backend_neutral_model_and_tokenizer_options() -> None:
 
 
 def test_cuda_cli_is_a_thin_client_of_the_runtime_library() -> None:
-    assert "mfq::cuda::run_runtime(argc, argv)" in CUDA_APP
-    assert len(CUDA_APP.splitlines()) <= 10
-    assert "struct Model" not in CUDA_APP
-    assert "run_linear_check" not in CUDA_APP
+    apps = ROOT / "cpp_runtime" / "backends" / "cuda" / "apps"
+    for name in ("runtime", "diagnostics", "eval"):
+        source = (apps / f"{name}_main.cpp").read_text(encoding="utf-8")
+        assert f"mfq::cuda::commands::run_{name}(argc, argv)" in source
+        assert "argv[" not in source
+        assert "struct Model" not in source
 
     cmake = (ROOT / "cpp_runtime" / "backends" / "cuda" / "CMakeLists.txt").read_text(
         encoding="utf-8"
@@ -191,8 +199,14 @@ def test_cuda_cli_is_a_thin_client_of_the_runtime_library() -> None:
     assert "add_library(mfq-cuda-runtime STATIC" in cmake
     assert "runtime/cuda_runtime.cpp" in cmake
     assert "add_executable(mfq-runtime\n" in cmake
-    assert "target_link_libraries(mfq-runtime PRIVATE mfq-cuda-runtime)" in cmake
+    assert "mfq-cuda-runtime mfq-runtime-communication" in cmake
+    assert "${MFQ_CUDA_ROOT}/commands/runtime.cpp" in cmake
+    assert "${MFQ_CUDA_ROOT}/commands/diagnostics.cpp" in cmake
+    assert "${MFQ_CUDA_ROOT}/commands/eval.cpp" in cmake
     assert ("mfq-" + "decode") not in cmake
+    assert "execute_runtime" in CUDA_RUNTIME_COMMAND
+    assert "RuntimeExecution" not in CUDA_RUNTIME_SOURCE
+    assert "run_runtime(RuntimeOptions" not in CUDA_RUNTIME_SOURCE
     assert '"--server"' not in CUDA_RUNTIME_SOURCE
     assert '"--stdio"' not in CUDA_RUNTIME_SOURCE
     assert "MFQ_SERVER_" not in CUDA_RUNTIME_SOURCE
@@ -752,6 +766,8 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         "ops/quant_linear.cpp",
         "ops/vq.cpp",
         "runtime/cuda_execution.cpp",
+        "runtime/decode_graph.cpp",
+        "runtime/runner.cpp",
         "runtime/causal_lm.cpp",
         "runtime/causal_lm_loader.cpp",
         "runtime/cuda_transformer.cpp",
@@ -759,8 +775,9 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         "runtime/mtp.cpp",
         "runtime/moe_expert_cache.cpp",
         "runtime/runtime_components.cpp",
-        "runtime/diagnostics/backend_checks.cpp",
-        "runtime/diagnostics/model_checks.cpp",
+        "diagnostics/backend_checks.cpp",
+        "diagnostics/model_checks.cpp",
+        "eval/kl.cpp",
     )
     for relative in required:
         assert (cuda / relative).is_file()
@@ -797,7 +814,7 @@ def test_cuda_qwen_speculation_is_model_owned() -> None:
     assert "forward_speculative(" not in CUDA_TRANSFORMER_HEADER
     assert "struct LinearBlock" not in CUDA_TRANSFORMER_HEADER
     assert "MFQ_QWEN_MTP_BATCH" not in CUDA_TRANSFORMER_HEADER
-    assert "for (int accepted_drafts : {0, 1, 2})" in CUDA_RUNTIME_SOURCE
+    assert "for (int accepted_drafts : {0, 1, 2})" in CUDA_BACKEND_SOURCE
 
 
 def test_cuda_qwen_linear_ffn_matches_residual_dtype() -> None:
