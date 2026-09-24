@@ -12,6 +12,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -180,31 +181,70 @@ LoadedCudaEngine make_loaded_engine(
         std::move(model), std::move(components), options);
 
     MfqInferenceEngine inference;
-    inference.generate = [state](
+    // Both CUDA entry points use one internal generate request. Keep the
+    // external callbacks while Metal and the legacy CUDA path remain intact.
+    const auto generate_request = [state](
+            const std::vector<int64_t>& prompt,
+            const MfqMultimodalInput* media,
+            const MfqSamplingParams& sampling,
+            const MfqTokenCallback& on_token,
+            const MfqPrefillCallback& on_prefill,
+            const MfqPromptCachePlan& cache_plan,
+            const MfqTokenConstraintPtr& token_constraint) {
+        PreparedPromptFactory<typename State::Model> prepare;
+        if (media) {
+            if constexpr (Backbone == CudaBackbone::generic_qwen) {
+                if (!state->components.grid_vision) {
+                    throw std::invalid_argument("CUDA vision component is unavailable");
+                }
+                prepare = [state, &prompt, media](auto& language) {
+                    return std::optional<CudaPreparedPrompt>{
+                        state->components.grid_vision->prepare(
+                            language, prompt, *media)};
+                };
+            } else {
+                throw std::invalid_argument("CUDA backbone has no prepared vision component");
+            }
+        } else if (state->continuous_batcher) {
+            return state->continuous_batcher->submit(
+                prompt, sampling, on_token, on_prefill,
+                cache_plan, token_constraint);
+        }
+        const char* flow = std::getenv("MFQ_RUNTIME_QWEN38_TEXT_FLOW");
+        const char* reprefill = std::getenv("MFQ_RUNTIME_REPREFILL");
+        const char* trace = std::getenv("MFQ_RUNTIME_TRACE_INCREMENTAL");
+        if constexpr (Backbone != CudaBackbone::minicpmo45 &&
+                      Backbone != CudaBackbone::minicpmo_tts) {
+            if (flow && flow[0] == '1' &&
+                    !(reprefill && reprefill[0] == '1') &&
+                    !(trace && trace[0] == '1') &&
+                    (!media || !state->continuous_batcher)) {
+                return mfq::cuda::internal::generate(
+                    *state->language, state->model_mutex,
+                    state->decode_graph, state->session_cache,
+                    prompt, sampling, on_token, on_prefill,
+                    cache_plan, token_constraint, state->components.mtp.get(),
+                    state->prefill_chunk_size, std::move(prepare));
+            }
+        }
+        return generate_tokens(
+            *state->language, state->model_mutex,
+            state->decode_graph, state->session_cache,
+            prompt, sampling, on_token, on_prefill,
+            cache_plan, token_constraint,
+            state->continuous_batcher && media
+                ? nullptr : state->components.mtp.get(),
+            state->prefill_chunk_size, std::move(prepare));
+    };
+    inference.generate = [generate_request](
             const std::vector<int64_t>& prompt,
             const MfqSamplingParams& sampling,
             const MfqTokenCallback& on_token,
             const MfqPrefillCallback& on_prefill,
             const MfqPromptCachePlan& cache_plan,
             const MfqTokenConstraintPtr& token_constraint) {
-        if (state->continuous_batcher) {
-            return state->continuous_batcher->submit(
-                prompt, sampling, on_token, on_prefill,
-                cache_plan, token_constraint);
-        }
-        return generate_tokens(
-            *state->language,
-            state->model_mutex,
-            state->decode_graph,
-            state->session_cache,
-            prompt,
-            sampling,
-            on_token,
-            on_prefill,
-            cache_plan,
-            token_constraint,
-            state->components.mtp.get(),
-            state->prefill_chunk_size);
+        return generate_request(prompt, nullptr, sampling, on_token,
+                                on_prefill, cache_plan, token_constraint);
     };
     inference.session_control = {
         [state](const std::string& source_session_id,
@@ -232,36 +272,16 @@ LoadedCudaEngine make_loaded_engine(
         state->components.engine_binder(
             inference, state->model_mutex);
     } else if (state->components.grid_vision) {
-        inference.multimodal_generate = [state](
+        inference.multimodal_generate = [generate_request](
                 const std::vector<int64_t>& prompt,
-                const MfqVisionInput& vision,
+                const MfqMultimodalInput& media,
                 const MfqSamplingParams& sampling,
                 const MfqTokenCallback& on_token,
                 const MfqPrefillCallback& on_prefill,
                 const MfqPromptCachePlan& cache_plan,
                 const MfqTokenConstraintPtr& token_constraint) {
-            PreparedPromptFactory<typename State::Model> prepare =
-                [state, &prompt, &vision](auto& language) {
-                    return std::optional<CudaPreparedPrompt>{
-                        state->components.grid_vision->prepare(
-                            language, prompt, vision)};
-                };
-            return generate_tokens(
-                *state->language,
-                state->model_mutex,
-                state->decode_graph,
-                state->session_cache,
-                prompt,
-                sampling,
-                on_token,
-                on_prefill,
-                cache_plan,
-                token_constraint,
-                state->continuous_batcher
-                    ? nullptr
-                    : state->components.mtp.get(),
-                state->prefill_chunk_size,
-                std::move(prepare));
+            return generate_request(prompt, &media, sampling, on_token,
+                                    on_prefill, cache_plan, token_constraint);
         };
     }
     inference.runtime_metrics = [state] {

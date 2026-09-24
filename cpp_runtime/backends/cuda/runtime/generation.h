@@ -59,6 +59,24 @@ int32_t generate_tokens(
     int64_t prefill_chunk_size = 2048,
     PreparedPromptFactory<Model> prepare_prompt = {});
 
+// Opt-in whole-model flow for text and prepared inputs. The legacy
+// generate_tokens path remains the default; device work stays CUDA-local.
+template <typename Model>
+int32_t generate(
+    Model& model,
+    std::mutex& model_mutex,
+    DecodeGraphCache& graph_cache,
+    TextSessionCache& session_cache,
+    const std::vector<int64_t>& prompt,
+    const MfqSamplingParams& sampling,
+    const MfqTokenCallback& on_token,
+    const MfqPrefillCallback& on_prefill,
+    const MfqPromptCachePlan& cache_plan,
+    const MfqTokenConstraintPtr& token_constraint,
+    MtpModule* mtp,
+    int64_t prefill_chunk_size,
+    PreparedPromptFactory<Model> prepare_prompt = {});
+
 template <typename Model>
 int generate_cli_tokens(Model& model, mfq_tensor_backend::Tensor ids,
         int gen, bool profile,
