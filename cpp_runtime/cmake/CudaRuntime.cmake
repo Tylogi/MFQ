@@ -300,6 +300,15 @@ target_include_directories(mfq-decode PRIVATE
 )
 target_compile_features(mfq-decode PRIVATE cxx_std_20)
 
+add_executable(mfq-bench
+    ${MFQ_CUDA_ROOT}/apps/mfq_bench.cpp
+)
+target_link_libraries(mfq-bench PRIVATE mfq-cuda-runtime mfq-server)
+target_include_directories(mfq-bench PRIVATE
+    ${MFQ_CUDA_ROOT}/runtime
+)
+target_compile_features(mfq-bench PRIVATE cxx_std_20)
+
 if(BUILD_TESTING)
     add_test(
         NAME mfq-deepseek-v41-runtime-check
