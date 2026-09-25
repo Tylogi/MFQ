@@ -77,7 +77,7 @@ int run_qwen35_mtp_bench(
                 MFQ_CUDA_CHECK(cudaProfilerStart());
             }
             const auto started = Clock::now();
-            const int produced = generate_tokens(model, model_mutex, graph_cache,
+            const int produced = generate(model, model_mutex, graph_cache,
                 session_cache, prompt, params, [&](int64_t token) {
                     if (output.empty()) first_token = Clock::now();
                     output.push_back(token);

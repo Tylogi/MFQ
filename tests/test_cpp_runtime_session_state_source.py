@@ -36,6 +36,9 @@ PAGED_HEADER = (ROOT / "cpp_runtime" / "core" / "mfq_paged_prefix_cache.h").read
 PAGED_SOURCE = (ROOT / "cpp_runtime" / "core" / "mfq_paged_prefix_cache.cpp").read_text(
     encoding="utf-8"
 )
+ENGINE_FLOW = (
+    ROOT / "cpp_runtime" / "engine" / "include" / "inference.h"
+).read_text(encoding="utf-8")
 METAL_PAGED_CODEC = (
     ROOT / "cpp_runtime" / "backends" / "metal" / "runtime" / "mlx_paged_session_codec.cpp"
 ).read_text(encoding="utf-8")
@@ -96,8 +99,9 @@ def test_glm_dsa_session_state_preserves_mla_and_index_caches() -> None:
 
 
 def test_partial_stable_prefix_is_saved_before_generation_suffix() -> None:
-    assert "stable_prefix_tokens < prompt.size()" in DECODE
-    assert "store_session_snapshot(std::vector<int64_t>(" in DECODE
+    assert "stable > 0 && stable < prompt.size()" in DECODE
+    assert "checkpoint(stable);" in DECODE
+    assert "model.snapshot(std::vector<std::int64_t>(" in ENGINE_FLOW
     assert "tokens.size() > maximum_prefix_tokens" in DECODE
 
 

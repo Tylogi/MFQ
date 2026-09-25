@@ -29,7 +29,7 @@
 
 namespace mfq::cuda::continuous {
 
-using internal::generate_tokens;
+using internal::generate;
 using internal::PrefillCudaTimer;
 using internal::TextSessionCache;
 using Tensor = mfq_tensor_backend::Tensor;
@@ -1527,7 +1527,7 @@ static int run_qwen_continuous_batching_check(mfq::cuda::Qwen35CausalLm & model)
         DecodeGraphCache graph_cache(
             model.max_position_embeddings());
         TextSessionCache session_cache;
-        const int32_t produced = generate_tokens(
+        const int32_t produced = generate(
             model, mutex, graph_cache, session_cache, prompt, params,
             [&](int64_t token) {
                 output.push_back(token);

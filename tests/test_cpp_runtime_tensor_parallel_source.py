@@ -74,9 +74,9 @@ def test_tensor_parallel_graph_capture_registers_all_participant_streams():
     assert "environment == nullptr || environment[0] != '0'" in SOURCE
     assert "graph_participant_streams" in SOURCE
     assert "g_model_parallel_collectives.streams.begin()" in SOURCE
-    assert "graph_cache.compute_streams" in SOURCE
+    assert "graph.compute_streams" in SOURCE
     assert "participant_streams" in SOURCE
-    assert "const bool graph_enabled" in SOURCE
+    assert "const bool graph_eligible" in SOURCE
     assert "bool use_cuda_graph" in SOURCE
 
 

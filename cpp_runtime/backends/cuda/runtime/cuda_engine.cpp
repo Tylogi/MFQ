@@ -12,6 +12,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -181,6 +182,8 @@ LoadedCudaEngine make_loaded_engine(
         std::move(model), std::move(components), options);
 
     MfqInferenceEngine inference;
+    inference.max_concurrent_requests = static_cast<std::size_t>(
+        std::max(1, options.continuous_batching));
     // Both CUDA entry points use one internal generate request. Keep the
     // external callbacks while Metal and the legacy CUDA path remain intact.
     const auto generate_request = [state](
@@ -210,24 +213,7 @@ LoadedCudaEngine make_loaded_engine(
                 prompt, sampling, on_token, on_prefill,
                 cache_plan, token_constraint);
         }
-        const char* flow = std::getenv("MFQ_RUNTIME_QWEN38_TEXT_FLOW");
-        const char* reprefill = std::getenv("MFQ_RUNTIME_REPREFILL");
-        const char* trace = std::getenv("MFQ_RUNTIME_TRACE_INCREMENTAL");
-        if constexpr (Backbone != CudaBackbone::minicpmo45 &&
-                      Backbone != CudaBackbone::minicpmo_tts) {
-            if (flow && flow[0] == '1' &&
-                    !(reprefill && reprefill[0] == '1') &&
-                    !(trace && trace[0] == '1') &&
-                    (!media || !state->continuous_batcher)) {
-                return mfq::cuda::internal::generate(
-                    *state->language, state->model_mutex,
-                    state->decode_graph, state->session_cache,
-                    prompt, sampling, on_token, on_prefill,
-                    cache_plan, token_constraint, state->components.mtp.get(),
-                    state->prefill_chunk_size, std::move(prepare));
-            }
-        }
-        return generate_tokens(
+        return mfq::cuda::internal::generate(
             *state->language, state->model_mutex,
             state->decode_graph, state->session_cache,
             prompt, sampling, on_token, on_prefill,

@@ -8,6 +8,17 @@ SERVER = "\n".join(
     for path in sorted(TRANSPORT_SRC.rglob("*"))
     if path.suffix in {".cpp", ".h"}
 )
+ENGINE_SRC = ROOT / "cpp_runtime" / "engine"
+ENGINE = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted(ENGINE_SRC.rglob("*"))
+    if path.suffix in {".cpp", ".h"}
+)
+SCHEDULER = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted((ROOT / "cpp_runtime" / "scheduler").rglob("*"))
+    if path.suffix in {".cpp", ".h"}
+)
 CUDA_RUNTIME = ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime"
 DECODE = "\n".join(
     path.read_text(encoding="utf-8")
@@ -85,8 +96,9 @@ def test_cpp_runtime_dependencies_are_integrated() -> None:
 def test_server_uses_native_gguf_jinja_template_and_common_parser() -> None:
     assert "common_chat_templates_apply" in SERVER
     assert "common_chat_msgs_parse_oaicompat" in SERVER
-    assert "common_chat_parse" in SERVER
-    assert "common_chat_msg_diff::compute_diffs" in SERVER
+    assert "common_chat_parse" in ENGINE
+    assert "common_chat_msg_diff::compute_diffs" in ENGINE
+    assert "common_chat_parse" not in SERVER
     assert "config.tokenizer_gguf.empty()" in SERVER
     assert "config.tokenizer_model.empty()" in SERVER
     assert "requires an embedded or external tokenizer GGUF" in SERVER
@@ -98,7 +110,7 @@ def test_processor_owned_prompts_bypass_cached_jinja_templates() -> None:
     parse_work = _section(
         SERVER,
         "RequestWork parse_work",
-        "class ChatOutputParser",
+        "json request_metric_values_json",
     )
 
     assert "request_preformatted_prompt(body)" in parse_work
@@ -116,8 +128,9 @@ def test_server_enforces_complete_chat_template_tool_calls() -> None:
     assert "MfqGrammarConstraint" in SERVER
     assert "make_token_constraint(tokenizer, chat_params)" in SERVER
     assert "work.token_constraint" in SERVER
-    assert "if (partial)" in SERVER
-    assert "parsed.tool_calls.clear()" in SERVER
+    assert "if (partial)" in ENGINE
+    assert "parsed.tool_calls.clear()" in ENGINE
+    assert "parsed.tool_calls.clear()" not in SERVER
     assert 'uses_tool_calls ? "tool_calls" : "function_calls"' in TEXT_CHAT
     assert 'src.find("tool_calls") != std::string::npos' in TEXT_CHAT
     assert "token_constraint->apply" in METAL_DSV4
@@ -126,17 +139,18 @@ def test_server_enforces_complete_chat_template_tool_calls() -> None:
     assert "CUDA constrained sampler returned an invalid token" in DECODE
     assert "masked.to(logits.device())" in DECODE
     assert "mfq_token_constraint_supports_speculation(token_constraint)" in DECODE
-    assert "prefill_chunk_size, token_constraint" in DECODE
+    assert "chunk_size, constraint, prepared, reused" in DECODE
     assert "if (constraint_cursor) constraint_cursor->accept(pending);" in DECODE
     assert "constraint_cursor->accept(result.next_token);" in DECODE
 
 
 def test_native_server_cancels_active_session_generation_per_token() -> None:
     assert 'R"(/runtime/sessions/([A-Za-z0-9._:-]{1,128})/cancel)"' in SERVER
-    assert "scheduler.cancel_request(session_id)" in SERVER
-    assert "cancel_requested->load(std::memory_order_acquire)" in SERVER
-    assert 'result.finish_reason = "cancelled"' in SERVER
-    assert "!result.cancelled && !result.tool_calls.empty()" in SERVER
+    assert "scheduler.cancel_session(session_id)" in SERVER
+    assert "cancel_flag->load(std::memory_order_acquire)" in SCHEDULER
+    assert 'result.finish_reason = "cancelled"' in ENGINE
+    assert "!result.cancelled && !result.tool_calls.empty()" in ENGINE
+    assert "cancel_requested" not in SERVER
     assert "work.cache_plan.stable_prefix_tokens = 0;" not in SERVER
     assert "on_token, on_prefill, work.cache_plan" in SERVER
     assert "work.cache_plan = {};" not in SERVER
@@ -189,7 +203,7 @@ def test_native_server_does_not_bundle_or_mount_a_webui() -> None:
 
 
 def test_dsv4_server_uses_exact_stable_prefix_kv_reuse() -> None:
-    assert "MfqPromptCachePlan" in SERVER
+    assert "MfqPromptCachePlan" in ENGINE
     assert 'normalized_identity(model_type).rfind("deepseek_v4", 0) == 0' in SERVER
     assert 'work.sampling.enable_thinking ? "<think>" : "</think>"' in SERVER
     assert "stable_prefix_tokens" in SERVER

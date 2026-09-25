@@ -784,7 +784,7 @@ int run_mfq_http_transport(
             const std::string session_id = req.matches[1].str();
             set_json(res, {
                 {"status", "ok"},
-                {"cancelled", scheduler.cancel_request(session_id)},
+                {"cancelled", scheduler.cancel_session(session_id)},
             });
         });
 
@@ -996,13 +996,16 @@ int run_mfq_http_transport(
                     std::make_shared<ActiveRequest>(request_metrics_store);
             }
             auto cancellation = scheduler.activate_request(
-                work.cache_plan.session_id, true);
+                id, work.cache_plan.session_id, true);
+            if (!cancellation) {
+                throw ApiError(
+                    409, "conflict", "request id is already active");
+            }
 
             if (!work.stream) {
                 RequestMetrics metrics;
-                CompletionResult result = generate_text(
-                    work, *tokenizer, scheduler,
-                    cancellation->cancel_flag(),
+                CompletionResult result = run_inference(
+                    work, *tokenizer, scheduler, *cancellation,
                     [](const common_chat_msg_diff &) {
                         return true;
                     },
@@ -1039,9 +1042,8 @@ int run_mfq_http_transport(
                     }
                     try {
                         RequestMetrics metrics;
-                        CompletionResult result = generate_text(
-                            work, *tokenizer, scheduler,
-                            cancellation->cancel_flag(),
+                        CompletionResult result = run_inference(
+                            work, *tokenizer, scheduler, *cancellation,
                             [&](const common_chat_msg_diff & diff) {
                                 json delta = chat_diff_json(diff);
                                 if (delta.empty()) return true;

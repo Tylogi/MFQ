@@ -10,7 +10,7 @@
 
 namespace {
 void require(bool ok) {
-    if (!ok) throw std::runtime_error("whole-model text flow test failed");
+    if (!ok) throw std::runtime_error("inference test failed");
 }
 
 struct FakeModel {
@@ -38,6 +38,7 @@ struct FakeModel {
         position = 0;
     }
     std::int64_t cache_position() const { return position; }
+    std::size_t prompt_size() const { return 4; }
     void snapshot(std::vector<std::int64_t> tokens) {
         calls.push_back("snapshot");
         snapshots.push_back(std::move(tokens));
@@ -71,19 +72,8 @@ struct FakeModel {
             const std::function<void(std::size_t)>& checkpoint,
             const MfqTokenCallback& emit,
             const MfqPrefillCallback& on_prefill, std::int32_t limit) {
-        const auto first = prefill(reused, stable, checkpoint);
-        if (stable == 4) checkpoint(stable);
-        if (on_prefill) on_prefill(first.timing);
-        std::int32_t count = 0;
-        std::int64_t token = first.token;
-        while (count < limit) {
-            ++count;
-            if (!emit(token)) break;
-            accept(token);
-            if (count == limit) break;
-            token = advance();
-        }
-        return count;
+        return mfq::engine::generate_target(
+            *this, reused, stable, checkpoint, emit, on_prefill, limit);
     }
 };
 

@@ -1,6 +1,5 @@
 #include "common.h"
 
-#include "text_emitter.h"
 #include "nlohmann/json.hpp"
 #include "mfq_text.h"
 #include "mfq_grammar.h"
@@ -1347,61 +1346,6 @@ RequestWork parse_work(const json & body, bool chat, const MfqTokenizer & tokeni
     return work;
 }
 
-class ChatOutputParser {
-public:
-    using Emit = std::function<bool(const common_chat_msg_diff &)>;
-
-    ChatOutputParser(
-            const common_chat_parser_params & params, Emit emit)
-        : params_(params), emit_(std::move(emit)) {
-        if (params_.is_continuation && !params_.echo) {
-            message_ = common_chat_parse("", true, params_);
-        }
-    }
-
-    bool append(const std::string & piece) {
-        generated_ += piece;
-        return update(true);
-    }
-
-    bool flush() { return update(false); }
-
-    const common_chat_msg & message() const {
-        return message_;
-    }
-
-private:
-    bool update(bool partial) {
-        common_chat_msg parsed =
-            common_chat_parse(generated_, partial, params_);
-        if (parsed.empty()) return true;
-        // A partial PEG parse may already know the tool name while its JSON
-        // arguments are still incomplete. Do not expose that half-call to an
-        // transport client; emit the complete call on flush instead.
-        if (partial) {
-            parsed.tool_calls.clear();
-        }
-        parsed.set_tool_call_ids(
-            tool_call_ids_,
-            []() { return request_id("call_"); });
-        const auto diffs =
-            common_chat_msg_diff::compute_diffs(message_, parsed);
-        message_ = std::move(parsed);
-        for (const auto & diff : diffs) {
-            if (!emit_(diff)) return false;
-        }
-        return true;
-    }
-
-    common_chat_parser_params params_;
-    Emit emit_;
-    std::string generated_;
-    common_chat_msg message_;
-    std::vector<std::string> tool_call_ids_;
-};
-
-
-
 
 json request_metric_values_json(
         const RequestMetricValues & values,
@@ -1618,105 +1562,27 @@ void ActiveRequest::complete(
     completed_ = true;
 }
 
-CompletionResult generate_text(const RequestWork & work, const MfqTokenizer & tokenizer,
+CompletionResult run_inference(const RequestWork & work, const MfqTokenizer & tokenizer,
                                       const MfqScheduler & scheduler,
-                                      const std::shared_ptr<std::atomic<bool>> & cancel_requested,
+                                      const MfqScheduledRequest & request,
                                       const std::function<bool(const common_chat_msg_diff &)> & emit,
                                       RequestMetrics * metrics,
                                       bool defer_token_parsing) {
-    CompletionResult result;
-    auto emit_parsed = [&](const common_chat_msg_diff & diff) {
-        result.client_connected = emit(diff);
-        return result.client_connected;
+    const auto execute = [&](const MfqTokenCallback& on_token,
+                             const MfqPrefillCallback& on_prefill) {
+        return work.vision
+            ? scheduler.generate_multimodal(
+                  request, work.prompt, *work.vision, work.sampling,
+                  on_token, on_prefill, work.cache_plan,
+                  work.token_constraint)
+            : scheduler.generate(
+                  request, work.prompt, work.sampling, on_token, on_prefill,
+                  work.cache_plan, work.token_constraint);
     };
-    std::unique_ptr<ChatOutputParser> chat_parser;
-    if (work.chat) {
-        chat_parser = std::make_unique<ChatOutputParser>(
-            work.chat_parser, emit_parsed);
-    }
-    mfq::engine::TextEmitter emitter(work.stops, [&](const std::string & text) {
-        if (chat_parser) {
-            return chat_parser->append(text);
-        }
-        result.text += text;
-        common_chat_msg_diff diff;
-        diff.content_delta = text;
-        return emit_parsed(diff);
-    });
-
-    const bool defer_tokens = defer_token_parsing && work.stops.empty();
-    std::vector<int64_t> deferred_tokens;
-    if (defer_tokens) {
-        deferred_tokens.reserve(
-            static_cast<std::size_t>(std::max(work.sampling.max_tokens, 0)));
-    }
-    const auto on_token = [&](int64_t token) {
-            if (cancel_requested &&
-                cancel_requested->load(std::memory_order_acquire)) {
-                result.cancelled = true;
-                result.finish_reason = "cancelled";
-                return false;
-            }
-            if (metrics != nullptr) metrics->mark_token();
-            if (tokenizer.is_eog(token)) {
-                result.finish_reason = "stop";
-                return false;
-            }
-            if (defer_tokens) {
-                deferred_tokens.push_back(token);
-                return true;
-            }
-            const bool preserve =
-                work.preserved_tokens.find(token) !=
-                work.preserved_tokens.end();
-            if (!emitter.append(tokenizer.piece(token, preserve))) {
-                if (emitter.stopped()) result.finish_reason = "stop";
-                return false;
-            }
-            return true;
-        };
-    const auto on_prefill = [&](const MfqPrefillTiming & timing) {
-            if (metrics != nullptr) metrics->mark_prefill(timing);
-        };
-    result.completion_tokens = work.vision
-        ? scheduler.generate_multimodal(
-              work.prompt, *work.vision, work.sampling,
-              on_token, on_prefill, work.cache_plan,
-              work.token_constraint)
-        : scheduler.generate(
-              work.prompt, work.sampling, on_token, on_prefill,
-              work.cache_plan, work.token_constraint);
-    if (cancel_requested &&
-        cancel_requested->load(std::memory_order_acquire)) {
-        result.cancelled = true;
-        result.finish_reason = "cancelled";
-    }
-    if (defer_tokens) {
-        std::string deferred_text;
-        deferred_text.reserve(deferred_tokens.size() * 8);
-        for (const auto token : deferred_tokens) {
-            const bool preserve =
-                work.preserved_tokens.find(token) !=
-                work.preserved_tokens.end();
-            deferred_text += tokenizer.piece(token, preserve);
-        }
-        if (!deferred_text.empty() && !emitter.append(deferred_text)) {
-            if (emitter.stopped()) result.finish_reason = "stop";
-        }
-    }
-    if (result.client_connected && !emitter.stopped()) emitter.flush();
-    if (result.client_connected && chat_parser) {
-        chat_parser->flush();
-        const auto & message = chat_parser->message();
-        result.text = message.content;
-        result.reasoning_text = message.reasoning_content;
-        result.tool_calls = message.tool_calls;
-    }
-    if (emitter.stopped() && !result.cancelled) result.finish_reason = "stop";
-    if (!result.cancelled && !result.tool_calls.empty()) {
-        result.finish_reason = "tool_calls";
-    }
-    return result;
+    return mfq::engine::run_inference(
+        work, tokenizer, execute,
+        [&] { return request.cancelled(); }, emit, metrics,
+        defer_token_parsing, [] { return request_id("call_"); });
 }
 
 json usage_json(size_t prompt_tokens, int32_t completion_tokens) {

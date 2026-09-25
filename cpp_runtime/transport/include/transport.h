@@ -1,7 +1,7 @@
 #pragma once
 
 #include "mfq/runtime.h"
-#include "mfq/scheduler.h"
+#include "scheduler.h"
 
 #include <cstdint>
 #include <memory>

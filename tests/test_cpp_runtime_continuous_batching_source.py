@@ -31,7 +31,7 @@ QWEN_LOADER = (
     CUDA_ROOT / "models" / "qwen35" / "qwen35_causal_lm.cpp"
 ).read_text(encoding="utf-8")
 QWEN_CONFIG = (
-    ROOT / "cpp_runtime" / "core" / "models" / "qwen35.cpp"
+    ROOT / "cpp_runtime" / "models" / "qwen35.cpp"
 ).read_text(encoding="utf-8")
 CAUSAL_LM = (CUDA_ROOT / "runtime" / "causal_lm.h").read_text(
     encoding="utf-8"

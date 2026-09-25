@@ -77,7 +77,7 @@ def test_prepared_prompt_supports_mtp_and_safe_session_reuse() -> None:
     assert "!transformed_prompt && mtp != nullptr" not in CUDA_APP
     assert "transformed_prompt ? 0" not in CUDA_APP
     assert "state.input_key = input_key" in CUDA_APP
-    assert "!transformed_prompt && graph_enabled" in CUDA_APP
+    assert "(!prepared || !prepared->transformed()) && !constraint" in CUDA_APP
     assert "state->components.grid_vision->prepare(" in CUDA_APP
     assert "state->components.mtp.get()" in CUDA_APP
     assert "continuous_batcher->submit(" in CUDA_APP

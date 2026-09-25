@@ -955,9 +955,8 @@ public:
                             const int64_t created = unix_time_seconds();
                             ActiveRequest active_request(request_metrics_store);
                             RequestMetrics metrics;
-                            CompletionResult result = generate_text(
-                                work, *tokenizer, scheduler,
-                                cancellation->cancel_flag(),
+                            CompletionResult result = run_inference(
+                                work, *tokenizer, scheduler, *cancellation,
                                 [&](const common_chat_msg_diff & diff) {
                                     if (!work.stream) return true;
                                     json delta = chat_diff_json(diff);

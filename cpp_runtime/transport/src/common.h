@@ -2,7 +2,7 @@
 
 #include "transport.h"
 
-#include "tokenizer.h"
+#include "inference.h"
 #include "chat.h"
 #include "mfq_text.h"
 #include "nlohmann/json.hpp"
@@ -40,59 +40,11 @@ public:
 };
 
 using mfq::engine::MfqTokenizer;
+using RequestWork = mfq::engine::InferenceRequest;
+using RequestMetrics = mfq::engine::InferenceMetrics;
+using CompletionResult = mfq::engine::InferenceResult;
 
 using MfqModelCapabilityProfile = MfqModelCapabilities;
-
-struct RequestWork {
-    bool chat = true;
-    bool stream = false;
-    bool include_usage = false;
-    common_chat_parser_params chat_parser;
-    std::unordered_set<int64_t> preserved_tokens;
-    std::vector<int64_t> prompt;
-    std::vector<std::string> stops;
-    MfqSamplingParams sampling;
-    MfqPromptCachePlan cache_plan;
-    MfqTokenConstraintPtr token_constraint;
-    std::optional<MfqVisionInput> vision;
-};
-
-struct RequestMetrics {
-    using Clock = std::chrono::steady_clock;
-
-    Clock::time_point started = Clock::now();
-    Clock::time_point first_token;
-    size_t prefill_tokens = 0;
-    double prefill_ms = 0.0;
-    double multimodal_ms = 0.0;
-    double model_prefill_ms = 0.0;
-    bool saw_token = false;
-    bool saw_prefill = false;
-
-    void mark_prefill(const MfqPrefillTiming & timing) {
-        prefill_tokens = timing.prompt_tokens;
-        prefill_ms = timing.llm_ms;
-        multimodal_ms = timing.multimodal_ms;
-        model_prefill_ms = timing.model_ms;
-        saw_prefill = timing.llm_ms > 0.0 || timing.model_ms > 0.0;
-    }
-
-    void mark_token() {
-        if (saw_token) return;
-        first_token = Clock::now();
-        saw_token = true;
-    }
-};
-
-struct CompletionResult {
-    std::string text;
-    std::string reasoning_text;
-    std::vector<common_chat_tool_call> tool_calls;
-    std::string finish_reason = "length";
-    int32_t completion_tokens = 0;
-    bool client_connected = true;
-    bool cancelled = false;
-};
 
 struct RequestMetricValues {
     size_t prefill_tokens = 0;
@@ -198,11 +150,11 @@ void log_request_metrics(
     const MfqSamplingParams & sampling,
     const CompletionResult & result,
     const RequestMetricValues & values);
-CompletionResult generate_text(
+CompletionResult run_inference(
     const RequestWork & work,
     const MfqTokenizer & tokenizer,
     const MfqScheduler & scheduler,
-    const std::shared_ptr<std::atomic<bool>> & cancel_requested,
+    const MfqScheduledRequest & request,
     const std::function<bool(const common_chat_msg_diff &)> & emit,
     RequestMetrics * metrics,
     bool defer_token_parsing);

@@ -172,6 +172,9 @@ struct MfqSessionControl {
 // Backend-neutral inference engine consumed by the runtime scheduler.
 // Transport and process lifecycle stay outside the engine.
 struct MfqInferenceEngine {
+    // Logical requests admitted by the scheduler may execute concurrently.
+    // Backends still own physical batching and model-state synchronization.
+    size_t max_concurrent_requests = 1;
     MfqGenerateFn generate;
     MfqReloadFn reload;
     MfqDuplexBackend duplex;

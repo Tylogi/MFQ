@@ -6,6 +6,9 @@ target_link_libraries(mfq-engine PUBLIC mfq-core)
 set_target_properties(mfq-engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(TARGET mfq-tokenizer)
-    target_sources(mfq-engine PRIVATE src/tokenizer.cpp)
+    target_sources(mfq-engine PRIVATE
+        src/inference.cpp
+        src/tokenizer.cpp
+    )
     target_link_libraries(mfq-engine PUBLIC mfq-tokenizer)
 endif()

@@ -12,6 +12,7 @@ public:
     ~MfqScheduledRequest();
 
     const std::shared_ptr<std::atomic<bool>> & cancel_flag() const noexcept;
+    bool cancelled() const noexcept;
     void set_session_id(std::string session_id);
     void finish();
 
@@ -33,6 +34,7 @@ private:
 class MfqScheduler {
 public:
     explicit MfqScheduler(const MfqInferenceEngine & engine);
+    ~MfqScheduler();
 
     bool supports_generation() const noexcept;
     int32_t generate(
@@ -42,8 +44,25 @@ public:
         const MfqPrefillCallback & on_prefill,
         const MfqPromptCachePlan & cache_plan,
         const MfqTokenConstraintPtr & token_constraint) const;
+    int32_t generate(
+        const MfqScheduledRequest & request,
+        const std::vector<int64_t> & prompt,
+        const MfqSamplingParams & sampling,
+        const MfqTokenCallback & on_token,
+        const MfqPrefillCallback & on_prefill,
+        const MfqPromptCachePlan & cache_plan,
+        const MfqTokenConstraintPtr & token_constraint) const;
     bool supports_multimodal_generation() const noexcept;
     int32_t generate_multimodal(
+        const std::vector<int64_t> & prompt,
+        const MfqMultimodalInput & media,
+        const MfqSamplingParams & sampling,
+        const MfqTokenCallback & on_token,
+        const MfqPrefillCallback & on_prefill,
+        const MfqPromptCachePlan & cache_plan,
+        const MfqTokenConstraintPtr & token_constraint) const;
+    int32_t generate_multimodal(
+        const MfqScheduledRequest & request,
         const std::vector<int64_t> & prompt,
         const MfqMultimodalInput & media,
         const MfqSamplingParams & sampling,
@@ -61,12 +80,41 @@ public:
     std::shared_ptr<MfqScheduledRequest> activate_request(
         const std::string & request_id,
         bool replace = false) const;
+    std::shared_ptr<MfqScheduledRequest> activate_request(
+        const std::string & request_id,
+        const std::string & session_id,
+        bool replace_session) const;
     bool cancel_request(const std::string & request_id) const;
     bool cancel_session(const std::string & session_id) const;
     void cancel_all() const;
 
 private:
     struct State;
+
+    std::shared_ptr<MfqScheduledRequest> activate_request_impl(
+        const std::string & request_id,
+        const std::string & session_id,
+        bool replace_request,
+        bool replace_session) const;
+    bool admit(const std::shared_ptr<std::atomic<bool>> & cancel_flag) const;
+    void release_admission() const;
+    int32_t generate_with_cancel(
+        const std::shared_ptr<std::atomic<bool>> & cancel_flag,
+        const std::vector<int64_t> & prompt,
+        const MfqSamplingParams & sampling,
+        const MfqTokenCallback & on_token,
+        const MfqPrefillCallback & on_prefill,
+        const MfqPromptCachePlan & cache_plan,
+        const MfqTokenConstraintPtr & token_constraint) const;
+    int32_t generate_multimodal_with_cancel(
+        const std::shared_ptr<std::atomic<bool>> & cancel_flag,
+        const std::vector<int64_t> & prompt,
+        const MfqMultimodalInput & media,
+        const MfqSamplingParams & sampling,
+        const MfqTokenCallback & on_token,
+        const MfqPrefillCallback & on_prefill,
+        const MfqPromptCachePlan & cache_plan,
+        const MfqTokenConstraintPtr & token_constraint) const;
 
     const MfqInferenceEngine & engine_;
     std::shared_ptr<State> state_;

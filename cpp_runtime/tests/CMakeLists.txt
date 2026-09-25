@@ -62,9 +62,9 @@ target_link_libraries(mfq-cuda-model-plan-test PRIVATE mfq-core)
 target_compile_features(mfq-cuda-model-plan-test PRIVATE cxx_std_20)
 add_test(NAME mfq-cuda-model-plan-test COMMAND mfq-cuda-model-plan-test)
 
-add_executable(mfq-text-inference-test text_inference_test.cpp)
-target_link_libraries(mfq-text-inference-test PRIVATE mfq-engine)
-add_test(NAME mfq-text-inference-test COMMAND mfq-text-inference-test)
+add_executable(mfq-inference-test inference_test.cpp)
+target_link_libraries(mfq-inference-test PRIVATE mfq-engine)
+add_test(NAME mfq-inference-test COMMAND mfq-inference-test)
 
 add_executable(mfq-mtp-policy-test mtp_policy_test.cpp)
 target_link_libraries(mfq-mtp-policy-test PRIVATE mfq-engine)

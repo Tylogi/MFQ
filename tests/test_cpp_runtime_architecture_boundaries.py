@@ -225,6 +225,30 @@ def test_cuda_cli_is_a_thin_client_of_the_runtime_library() -> None:
     assert "MFQ_SERVER_" not in CUDA_RUNTIME_SOURCE
 
 
+def test_cuda_runtime_has_one_shared_generation_path() -> None:
+    generation = (CUDA_RUNTIME / "generation.cpp").read_text(encoding="utf-8")
+    header = (CUDA_RUNTIME / "generation.h").read_text(encoding="utf-8")
+    shared = (
+        ROOT / "cpp_runtime" / "engine" / "include" / "inference.h"
+    ).read_text(encoding="utf-8")
+
+    assert "generate_tokens" not in generation + header
+    assert "MFQ_RUNTIME_QWEN38_TEXT_FLOW" not in CUDA_ENGINE_SOURCE
+    assert "mfq::cuda::internal::generate(" in CUDA_ENGINE_SOURCE
+    assert "mfq::engine::generate(" in generation
+    assert "mfq::engine::generate_target(" in generation
+    assert "generate_target(" in shared
+    assert "InferenceRequest" in shared
+    assert "TextGeneration" not in shared
+    assert not (
+        ROOT / "cpp_runtime" / "engine" / "include" / "text_generation.h"
+    ).exists()
+    assert not (
+        ROOT / "cpp_runtime" / "engine" / "src" / "text_generation.cpp"
+    ).exists()
+    assert "ensure_captured(" in generation
+
+
 def test_cuda_runtime_composes_transport_scheduler_and_engine() -> None:
     assert "MfqInferenceEngine inference;" in CUDA_ENGINE_SOURCE
     assert '"device_free_bytes"' in CUDA_ENGINE_SOURCE

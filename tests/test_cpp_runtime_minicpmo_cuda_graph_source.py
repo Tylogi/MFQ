@@ -54,10 +54,10 @@ ACC_SOURCE = (
 
 def test_minicpmo_native_runtime_keeps_cuda_graph_enabled() -> None:
     assert "graph_architecture_supported" not in SOURCE
-    graph_gate = SOURCE.split(
-        'const char * graph_env = std::getenv("MFQ_RUNTIME_CUDA_GRAPH");', 1
+    graph_gate = CUDA_RUNTIME.split(
+        'const char* enabled = std::getenv("MFQ_RUNTIME_CUDA_GRAPH");', 1
     )[1].split(
-        "const char * graph_min_env =", 1
+        "const bool graph_eligible =", 1
     )[0]
     assert "is_minicpmo45" not in graph_gate
 
@@ -81,7 +81,7 @@ def test_minicpmo_persistent_decode_workspaces_are_warmed_before_capture() -> No
         SOURCE,
     )
     assert len(warmup_gates) == 1
-    assert "graph_cache.ensure_captured(" in CUDA_RUNTIME
+    assert "graph.ensure_captured(" in CUDA_RUNTIME
     assert CUDA_RUNTIME.count("prepare_decode_graph_memory(model,") == 1
 
 
