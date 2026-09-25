@@ -1706,7 +1706,8 @@ int run_loaded_runtime(
             const MfqTokenCallback& callback,
             const MfqPrefillCallback& on_prefill,
             const MfqPromptCachePlan& cache_plan,
-            const MfqTokenConstraintPtr& token_constraint) {
+            const MfqTokenConstraintPtr& token_constraint,
+            const MfqCancellationCheck&) {
             std::lock_guard<std::mutex> lock(*runtime_mutex);
             if (!runtime_holder->has_value()) {
                 throw std::runtime_error(

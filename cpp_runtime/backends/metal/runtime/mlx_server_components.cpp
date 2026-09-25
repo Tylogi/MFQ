@@ -104,7 +104,8 @@ MlxServerComponentCallbacks make_mlx_server_components(
             const MfqTokenCallback& callback,
             const MfqPrefillCallback& on_prefill,
             const MfqPromptCachePlan&,
-            const MfqTokenConstraintPtr& token_constraint) {
+            const MfqTokenConstraintPtr& token_constraint,
+            const MfqCancellationCheck&) {
             std::lock_guard<std::mutex> lock(*runtime_mutex);
             if (!runtime_holder->has_value()) {
                 throw std::runtime_error(
@@ -187,7 +188,8 @@ MlxServerComponentCallbacks make_mlx_server_components(
                 const MfqTokenCallback& callback,
                 const MfqPrefillCallback& on_prefill,
                 const MfqPromptCachePlan&,
-                const MfqTokenConstraintPtr& token_constraint) {
+                const MfqTokenConstraintPtr& token_constraint,
+                const MfqCancellationCheck&) {
                 std::lock_guard<std::mutex> lock(*runtime_mutex);
                 if (!runtime_holder->has_value()) {
                     throw std::runtime_error(
@@ -517,7 +519,8 @@ MlxServerComponentCallbacks make_mlx_server_components(
             const MfqTokenCallback& callback,
             const MfqPrefillCallback& on_prefill,
             const MfqPromptCachePlan&,
-            const MfqTokenConstraintPtr& token_constraint) {
+            const MfqTokenConstraintPtr& token_constraint,
+            const MfqCancellationCheck&) {
             std::lock_guard<std::mutex> lock(*runtime_mutex);
             if (!runtime_holder->has_value()) {
                 throw std::runtime_error(
@@ -667,7 +670,8 @@ MlxServerComponentCallbacks make_mlx_server_components(
             const MfqTokenCallback& callback,
             const MfqPrefillCallback& on_prefill,
             const MfqPromptCachePlan&,
-            const MfqTokenConstraintPtr& token_constraint) {
+            const MfqTokenConstraintPtr& token_constraint,
+            const MfqCancellationCheck&) {
             std::lock_guard<std::mutex> lock(*runtime_mutex);
             if (!runtime_holder->has_value()) {
                 throw std::runtime_error(

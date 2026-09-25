@@ -237,6 +237,7 @@ def test_cuda_runtime_has_one_shared_generation_path() -> None:
     assert "mfq::cuda::internal::generate(" in CUDA_ENGINE_SOURCE
     assert "mfq::engine::generate(" in generation
     assert "mfq::engine::generate_target(" in generation
+    assert "while (generated < max_tokens)" not in generation
     assert "generate_target(" in shared
     assert "InferenceRequest" in shared
     assert "TextGeneration" not in shared

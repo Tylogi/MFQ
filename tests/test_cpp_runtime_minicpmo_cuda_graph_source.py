@@ -55,9 +55,9 @@ ACC_SOURCE = (
 def test_minicpmo_native_runtime_keeps_cuda_graph_enabled() -> None:
     assert "graph_architecture_supported" not in SOURCE
     graph_gate = CUDA_RUNTIME.split(
-        'const char* enabled = std::getenv("MFQ_RUNTIME_CUDA_GRAPH");', 1
+        "bool graph_eligible() const {", 1
     )[1].split(
-        "const bool graph_eligible =", 1
+        "void prepare_graph()", 1
     )[0]
     assert "is_minicpmo45" not in graph_gate
 

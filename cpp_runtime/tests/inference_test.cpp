@@ -1,3 +1,4 @@
+#include "continuous_batching.h"
 #include "inference.h"
 
 #include <algorithm>
@@ -5,6 +6,7 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -97,6 +99,21 @@ struct FakeMtp : FakeModel {
 }
 
 int main() {
+    mfq::engine::ContinuousBatchRequest batch_request({1, 2}, {}, {}, {});
+    std::thread producer([&] {
+        batch_request.publish_prefill({2, 1.0, 0.0, 1.0});
+        batch_request.publish_token(3);
+        batch_request.complete();
+    });
+    bool batch_prefilled = false;
+    const auto batch_tokens = batch_request.consume(
+        [](int64_t token) { return token == 3; },
+        [&](const MfqPrefillTiming& timing) {
+            batch_prefilled = timing.prompt_tokens == 2;
+        });
+    producer.join();
+    require(batch_tokens == 1 && batch_prefilled);
+
     const std::vector<std::int64_t> prompt{1, 2, 3, 4};
     MfqSamplingParams sampling;
     sampling.max_tokens = 2;

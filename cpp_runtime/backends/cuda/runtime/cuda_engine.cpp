@@ -5,7 +5,7 @@
 #include "decode_graph.h"
 #include "generation.h"
 #include "moe_expert_cache.h"
-#include "qwen_continuous_batching.h"
+#include "models/qwen35/qwen35_batch_executor.h"
 #include "runner.h"
 #include "runtime_components.h"
 #include "text_session_cache.h"
@@ -53,8 +53,8 @@ struct CudaEngineState {
           prefill_chunk_size(options.prefill_chunk_size) {
         if (options.continuous_batching <= 0) return;
         if constexpr (Backbone == CudaBackbone::generic_qwen) {
-            continuous_batcher = std::make_unique<
-                continuous::CudaContinuousBatcher>(
+            auto qwen_executor = std::make_unique<
+                qwen35::QwenBatchExecutor>(
                     *language, model_mutex,
                     options.continuous_batching,
                     options.prefill_chunk_size);
@@ -64,16 +64,17 @@ struct CudaEngineState {
                 << " prefill_chunk_size=" << options.prefill_chunk_size
                 << " decode=target_only mtp=disabled"
                 << " moe="
-                << (continuous::qwen_continuous_batch_has_moe(
+                << (qwen35::qwen_continuous_batch_has_moe(
                         *language) ? 1 : 0)
                 << " moe_expert_cache="
-                << (continuous::qwen_continuous_batch_has_cached_moe(
+                << (qwen35::qwen_continuous_batch_has_cached_moe(
                         *language) ? 1 : 0)
                 << " paged_kv="
-                << (continuous_batcher->paged_kv_enabled() ? 1 : 0)
+                << (qwen_executor->paged_kv_enabled() ? 1 : 0)
                 << " page_size="
-                << continuous_batcher->paged_kv_page_size()
+                << qwen_executor->paged_kv_page_size()
                 << " prefix_cache=fresh_prefill\n";
+            batch_executor = std::move(qwen_executor);
         } else {
             throw std::runtime_error(
                 "continuous batching requires Qwen35CausalLm");
@@ -87,7 +88,7 @@ struct CudaEngineState {
     std::mutex model_mutex;
     DecodeGraphCache decode_graph;
     TextSessionCache session_cache;
-    std::unique_ptr<continuous::CudaContinuousBatcher> continuous_batcher;
+    std::unique_ptr<mfq::engine::ContinuousBatchExecutor> batch_executor;
     int64_t prefill_chunk_size = 2048;
 };
 
@@ -146,7 +147,7 @@ std::vector<std::pair<std::string, double>> engine_metrics(
     const auto memory = mfq_cuda_memory_stats(mfq_current_cuda_device());
     const auto components = state->components.state();
     const bool mtp_available =
-        components.mtp_available && !state->continuous_batcher;
+        components.mtp_available && !state->batch_executor;
     std::vector<std::pair<std::string, double>> result{
         {"device_free_bytes", static_cast<double>(free_bytes)},
         {"device_total_bytes", static_cast<double>(total_bytes)},
@@ -165,8 +166,8 @@ std::vector<std::pair<std::string, double>> engine_metrics(
     if (mtp_available && lock.owns_lock() && state->components.mtp) {
         append_mtp_metrics(result, state->components.mtp->last_stats);
     }
-    if (state->continuous_batcher) {
-        auto batching = state->continuous_batcher->metrics();
+    if (state->batch_executor) {
+        auto batching = state->batch_executor->metrics();
         result.insert(result.end(), batching.begin(), batching.end());
     }
     return result;
@@ -193,7 +194,8 @@ LoadedCudaEngine make_loaded_engine(
             const MfqTokenCallback& on_token,
             const MfqPrefillCallback& on_prefill,
             const MfqPromptCachePlan& cache_plan,
-            const MfqTokenConstraintPtr& token_constraint) {
+            const MfqTokenConstraintPtr& token_constraint,
+            const MfqCancellationCheck& cancelled) {
         PreparedPromptFactory<typename State::Model> prepare;
         if (media) {
             if constexpr (Backbone == CudaBackbone::generic_qwen) {
@@ -208,17 +210,17 @@ LoadedCudaEngine make_loaded_engine(
             } else {
                 throw std::invalid_argument("CUDA backbone has no prepared vision component");
             }
-        } else if (state->continuous_batcher) {
-            return state->continuous_batcher->submit(
+        } else if (state->batch_executor) {
+            return state->batch_executor->submit(
                 prompt, sampling, on_token, on_prefill,
-                cache_plan, token_constraint);
+                cache_plan, token_constraint, cancelled);
         }
         return mfq::cuda::internal::generate(
             *state->language, state->model_mutex,
             state->decode_graph, state->session_cache,
             prompt, sampling, on_token, on_prefill,
             cache_plan, token_constraint,
-            state->continuous_batcher && media
+            state->batch_executor && media
                 ? nullptr : state->components.mtp.get(),
             state->prefill_chunk_size, std::move(prepare));
     };
@@ -228,9 +230,11 @@ LoadedCudaEngine make_loaded_engine(
             const MfqTokenCallback& on_token,
             const MfqPrefillCallback& on_prefill,
             const MfqPromptCachePlan& cache_plan,
-            const MfqTokenConstraintPtr& token_constraint) {
+            const MfqTokenConstraintPtr& token_constraint,
+            const MfqCancellationCheck& cancelled) {
         return generate_request(prompt, nullptr, sampling, on_token,
-                                on_prefill, cache_plan, token_constraint);
+                                on_prefill, cache_plan, token_constraint,
+                                cancelled);
     };
     inference.session_control = {
         [state](const std::string& source_session_id,
@@ -265,9 +269,11 @@ LoadedCudaEngine make_loaded_engine(
                 const MfqTokenCallback& on_token,
                 const MfqPrefillCallback& on_prefill,
                 const MfqPromptCachePlan& cache_plan,
-                const MfqTokenConstraintPtr& token_constraint) {
+                const MfqTokenConstraintPtr& token_constraint,
+                const MfqCancellationCheck& cancelled) {
             return generate_request(prompt, &media, sampling, on_token,
-                                    on_prefill, cache_plan, token_constraint);
+                                    on_prefill, cache_plan, token_constraint,
+                                    cancelled);
         };
     }
     inference.runtime_metrics = [state] {
@@ -297,7 +303,7 @@ LoadedCudaEngine make_loaded_engine(
     metadata.capabilities.full_duplex = model_adapter_loaded &&
         state->components.graph.has_component("duplex");
     metadata.capabilities.mtp =
-        component_state.mtp_available && !state->continuous_batcher;
+        component_state.mtp_available && !state->batch_executor;
     return {std::move(inference), std::move(metadata)};
 }
 

@@ -2,7 +2,7 @@
 
 #include "runtime/generation.h"
 #include "runtime/text_session_cache.h"
-#include "runtime/qwen_continuous_batching.h"
+#include "models/qwen35/qwen35_batch_executor.h"
 
 #include <cuda_profiler_api.h>
 
@@ -120,7 +120,7 @@ int run_qwen35_mtp_bench(
 
 int run_cuda_continuous_batching_check(
         mfq::cuda::Qwen35CausalLm& model) {
-    return mfq::cuda::continuous::
+    return mfq::cuda::qwen35::
         run_qwen_continuous_batching_check(model);
 }
 

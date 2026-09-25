@@ -186,6 +186,320 @@ double PrefillCudaTimer::elapsed_ms() const {
     return static_cast<double>(elapsed);
 }
 
+namespace {
+
+template <typename Model>
+struct CudaGenerationOps {
+    Model& model;
+    TextSessionCache& cache;
+    DecodeGraphCache& graph;
+    const std::vector<int64_t>& prompt;
+    const MfqPromptCachePlan& plan;
+    const MfqTokenConstraintPtr& constraint;
+    int64_t chunk_size;
+    mfq_tensor_backend::Tensor& full_ids;
+    mfq_tensor_backend::Tensor& pending;
+    mfq_tensor_backend::Tensor& counts;
+    mfq_tensor_backend::Tensor& random_host;
+    mfq::cuda::Sampler& sampler;
+    bool has_penalties;
+    mfq_tensor_backend::TensorOptions options;
+    const CudaPreparedPrompt* prepared;
+    const std::string& input_key;
+    double multimodal_ms;
+    std::int32_t generation_limit = 0;
+    bool graph_active = false;
+    bool graph_prepared = false;
+
+    bool supports_cache() const {
+        return model.supports_text_session_state() &&
+            (!prepared || !prepared->transformed() || !input_key.empty());
+    }
+    bool persistent_prefix_enabled() const {
+        return cache.persistent_prefix_enabled();
+    }
+    std::size_t prompt_size() const { return prompt.size(); }
+    std::size_t restore(std::size_t stable) {
+        return cache.restore_best(
+            model, nullptr, plan.session_id, prompt, stable, input_key).tokens;
+    }
+    void reset() { model.reset(1); }
+    std::int64_t cache_position() const { return model.cache_pos; }
+    void snapshot(std::vector<int64_t> tokens) {
+        try {
+            auto state = model.capture_text_session_state(tokens);
+            state.input_key = input_key;
+            cache.store(plan.session_id, std::move(state));
+        } catch (const std::exception& error) {
+            std::cerr << "runtime_session_cache action=skip session="
+                      << plan.session_id << " error=" << error.what()
+                      << std::endl;
+        }
+    }
+    mfq::engine::PrefillResult prefill(
+            std::size_t reused, std::size_t stable,
+            const std::function<void(std::size_t)>& checkpoint) {
+        PrefillCudaTimer timer;
+        auto ids = full_ids.narrow(
+            1, static_cast<int64_t>(reused),
+            static_cast<int64_t>(prompt.size() - reused)).contiguous();
+        if (stable > 0 && stable < prompt.size()) {
+            if (reused < stable) {
+                auto prefix = full_ids.narrow(
+                    1, static_cast<int64_t>(reused),
+                    static_cast<int64_t>(stable - reused)).contiguous();
+                if (prepared && prepared->transformed()) {
+                    (void)hidden_forward_prepared_chunked(
+                        model, prefix, *prepared, chunk_size, nullptr,
+                        static_cast<int64_t>(reused));
+                } else {
+                    prefix = prefill_tail(model, std::move(prefix), chunk_size);
+                    MfqOptional<mfq_tensor_backend::Tensor> seq_len = mfq_nullopt;
+                    if (!Model::is_minicpmo45 && model.cache_pos > 0 &&
+                            prefix.size(1) == 1) {
+                        seq_len = mfq_tensor_backend::full(
+                            {1}, model.cache_pos + 1, options);
+                    }
+                    (void)model.hidden_forward(prefix, mfq_nullopt, seq_len);
+                }
+            }
+            checkpoint(stable);
+            ids = full_ids.narrow(
+                1, static_cast<int64_t>(stable),
+                static_cast<int64_t>(prompt.size() - stable)).contiguous();
+        }
+        if (prepared && prepared->transformed()) {
+            const auto offset = stable > 0 && stable < prompt.size()
+                ? stable : reused;
+            auto hidden = hidden_forward_prepared_chunked(
+                model, ids, *prepared, chunk_size, nullptr,
+                static_cast<int64_t>(offset));
+            auto logits = model.lm_head.forward(
+                hidden.index({Slice(), -1, Slice()})
+                    .to(mfq_tensor_backend::kFloat16).contiguous())
+                .contiguous().view({1, -1});
+            MFQ_CUDA_CHECK(cudaEventRecord(
+                timer.finished_event(), mfq_get_current_cuda_stream()));
+            pending = mfq::cuda::sample_logits(
+                sampler, std::move(logits), counts, constraint);
+        } else {
+            ids = prefill_tail(model, std::move(ids), chunk_size);
+            pending = sample_token(model, ids, sampler, counts, constraint,
+                                   timer.finished_event());
+        }
+        const auto token = pending.template item<int64_t>();
+        const double prefill_ms = timer.elapsed_ms();
+        return {token, {prompt.size() - reused, prefill_ms, multimodal_ms,
+                        prefill_ms + multimodal_ms}};
+    }
+    bool graph_eligible() const {
+        const char* enabled = std::getenv("MFQ_RUNTIME_CUDA_GRAPH");
+        const char* minimum =
+            std::getenv("MFQ_RUNTIME_CUDA_GRAPH_MIN_TOKENS");
+        const std::int32_t minimum_tokens = minimum
+            ? std::max<std::int32_t>(2, std::atoi(minimum))
+            : 16;
+        return (!prepared || !prepared->transformed()) && !constraint &&
+            (enabled == nullptr || enabled[0] != '0') &&
+            !Model::is_flash_next && mfq_cuda_graph_capture_supported() &&
+            g_dsv4_cpu_offload_layers.empty() &&
+            g_dense_cpu_layer_count == 0 && !g_moe_expert_cache &&
+            model_parallel_cuda_graph_enabled() &&
+            generation_limit >= minimum_tokens &&
+            generation_limit <= graph.generated_capacity;
+    }
+    void prepare_graph() {
+        graph.ensure_compute_streams();
+        MfqCudaGuard graph_device_guard(graph.stream.device_index());
+        auto graph_stream_guards =
+            activate_cuda_graph_compute_streams(graph.compute_streams);
+        cudaStream_t graph_stream = graph.stream.stream();
+        if (has_penalties) {
+            sample_token_counts_add_cuda(counts, pending.contiguous());
+        }
+
+        std::int64_t position = model.cache_pos;
+        std::int64_t length = position + 1;
+        std::int64_t step = 1;
+        MFQ_CUDA_CHECK(cudaMemcpyAsync(
+            graph.static_input.template data_ptr<int64_t>(),
+            pending.template data_ptr<int64_t>(), sizeof(int64_t),
+            cudaMemcpyDeviceToDevice, graph_stream));
+        MFQ_CUDA_CHECK(cudaMemcpyAsync(
+            graph.generated.template data_ptr<int64_t>(),
+            pending.template data_ptr<int64_t>(), sizeof(int64_t),
+            cudaMemcpyDeviceToDevice, graph_stream));
+        MFQ_CUDA_CHECK(cudaMemcpyAsync(
+            graph.static_pos.template data_ptr<int64_t>(), &position,
+            sizeof(int64_t), cudaMemcpyHostToDevice, graph_stream));
+        MFQ_CUDA_CHECK(cudaMemcpyAsync(
+            graph.static_len.template data_ptr<int64_t>(), &length,
+            sizeof(int64_t), cudaMemcpyHostToDevice, graph_stream));
+        MFQ_CUDA_CHECK(cudaMemcpyAsync(
+            graph.static_step.template data_ptr<int64_t>(), &step,
+            sizeof(int64_t), cudaMemcpyHostToDevice, graph_stream));
+        *random_host.template data_ptr<float>() = 0.5f;
+        MFQ_CUDA_CHECK(cudaMemcpyAsync(
+            graph.random.template data_ptr<float>(),
+            random_host.template data_ptr<float>(), sizeof(float),
+            cudaMemcpyHostToDevice, graph_stream));
+        MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_stream));
+
+        const std::int64_t requested = model.cache_pos + generation_limit;
+        const std::int64_t planned = decode_graph_bucket(
+            requested, model.max_position_embeddings());
+        const std::int64_t parts = decode_graph_attention_parts(
+            planned, FullBlock::kDecodeAttentionMaxParts);
+        const bool greedy = sampler.greedy();
+        const auto sample_static = [&]() {
+            if (greedy && !has_penalties) {
+                return model.next_token_static(
+                    graph.static_input, graph.static_pos,
+                    graph.static_len, planned, parts);
+            }
+            auto logits = model.last_logits_static(
+                    graph.static_input, graph.static_pos,
+                    graph.static_len, planned, parts)
+                .contiguous().view({1, -1});
+            if (has_penalties) {
+                logits = sampler.apply_penalties(std::move(logits), counts);
+            }
+            if (greedy) {
+                return sampler.ops().sample_greedy(std::move(logits));
+            }
+            return sampler.ops().sample_stochastic(
+                std::move(logits), graph.random, sampler.params());
+        };
+        const bool hit = graph.ensure_captured(
+            model, planned, sampler.params(), greedy,
+            [&]() { return sample_static(); },
+            [&](const mfq_tensor_backend::Tensor& next) {
+                if (has_penalties) {
+                    sample_token_counts_add_cuda(counts, next.contiguous());
+                }
+                decode_graph_commit_cuda(
+                    next, graph.generated, graph.static_step,
+                    graph.static_input, graph.static_pos,
+                    graph.static_len);
+            });
+        if (!hit) report_cuda_memory("runtime_graph_capture");
+        if (trace_cuda_graph()) {
+            std::cerr << "runtime_cuda_graph action="
+                      << (hit ? "reuse" : "capture")
+                      << " requested_len=" << requested
+                      << " planned_len=" << planned
+                      << " captures=" << graph.captures
+                      << " reuses=" << graph.reuses << std::endl;
+        }
+    }
+    std::int64_t advance() {
+        if (!graph_active) {
+            pending = sample_token(
+                model, pending.reshape({1, 1}), sampler, counts, constraint);
+            return pending.template item<int64_t>();
+        }
+
+        if (!graph_prepared) {
+            prepare_graph();
+            graph_prepared = true;
+        }
+        MfqCudaGuard graph_device_guard(graph.stream.device_index());
+        auto graph_stream_guards =
+            activate_cuda_graph_compute_streams(graph.compute_streams);
+        cudaStream_t graph_stream = graph.stream.stream();
+        if (!sampler.greedy()) {
+            *random_host.template data_ptr<float>() =
+                sampler.next_uniform_float();
+            MFQ_CUDA_CHECK(cudaMemcpyAsync(
+                graph.random.template data_ptr<float>(),
+                random_host.template data_ptr<float>(), sizeof(float),
+                cudaMemcpyHostToDevice, graph_stream));
+        }
+        graph.graph->replay();
+        const auto token = graph.static_next.template item<int64_t>();
+        ++model.cache_pos;
+        return token;
+    }
+    void accept(std::int64_t) {
+        if (has_penalties && !graph_active) {
+            sample_token_counts_add_cuda(counts, pending.contiguous());
+        }
+    }
+    std::int32_t generate(
+            std::size_t reused, std::size_t stable,
+            const std::function<void(std::size_t)>& checkpoint,
+            const MfqTokenCallback& emit,
+            const MfqPrefillCallback& on_prefill,
+            std::int32_t max_tokens) {
+        generation_limit = max_tokens;
+        graph_active = graph_eligible();
+        return mfq::engine::generate_target(
+            *this, reused, stable, checkpoint, emit,
+            on_prefill, max_tokens);
+    }
+};
+
+template <typename Model>
+struct CudaMtpGenerationOps {
+    Model& model;
+    MtpModule& mtp;
+    TextSessionCache& cache;
+    const std::vector<int64_t>& prompt;
+    const MfqSamplingParams& sampling;
+    const MfqPromptCachePlan& plan;
+    const MfqTokenConstraintPtr& constraint;
+    int64_t chunk_size;
+    const CudaPreparedPrompt* prepared;
+    const std::string& input_key;
+    double multimodal_ms;
+    TextSessionRestore restored;
+    mfq_tensor_backend::Tensor last_target_hidden;
+
+    bool supports_cache() const {
+        return model.supports_text_session_state() &&
+            (!prepared || !prepared->transformed() || !input_key.empty());
+    }
+    bool persistent_prefix_enabled() const {
+        return cache.persistent_prefix_enabled();
+    }
+    std::size_t restore(std::size_t stable) {
+        if (!mtp.supports_session_state()) return 0;
+        restored = cache.restore_best(
+            model, &mtp, plan.session_id, prompt, stable, input_key);
+        return restored.tokens;
+    }
+    void reset() { model.reset(1); mtp.reset(1); }
+    std::int64_t cache_position() const { return model.cache_pos; }
+    void snapshot(std::vector<int64_t> tokens) {
+        if (!last_target_hidden.defined() || model.cache_pos <= 1) return;
+        try {
+            auto state = model.capture_text_session_state(tokens);
+            state.input_key = input_key;
+            state.mtp = mtp.capture_session_state(
+                model.cache_pos, last_target_hidden);
+            state.bytes += state.mtp->bytes;
+            cache.store(plan.session_id, std::move(state));
+        } catch (const std::exception& error) {
+            std::cerr << "runtime_session_cache action=skip session="
+                      << plan.session_id << " error=" << error.what()
+                      << std::endl;
+        }
+    }
+    std::int32_t generate(
+            std::size_t reused, std::size_t,
+            const std::function<void(std::size_t)>&,
+            const MfqTokenCallback& emit,
+            const MfqPrefillCallback& on_prefill, std::int32_t) {
+        return run_mtp_generation<Model::backbone>(
+            model, mtp, prompt, sampling, emit, on_prefill,
+            chunk_size, constraint, prepared, reused,
+            restored.mtp_last_target_hidden, &last_target_hidden,
+            multimodal_ms);
+    }
+};
+
+} // namespace
+
 template <typename Model>
 int32_t generate(
     Model& model,
@@ -218,7 +532,6 @@ int32_t generate(
         throw std::invalid_argument(
             "prepared prompt token IDs disagree with the rendered prompt");
     }
-    const bool transformed = prepared && prepared->transformed();
     const std::string input_key = prepared ? prepared->cache_key : std::string{};
     if (mtp != nullptr) {
         mtp->last_stats = {};
@@ -233,63 +546,10 @@ int32_t generate(
                 Model::backbone == mfq::cuda::CudaBackbone::qwen4_exp ||
                 Model::backbone == mfq::cuda::CudaBackbone::glm5_next ||
                 Model::backbone == mfq::cuda::CudaBackbone::deepseek_v41) {
-        struct MtpOps {
-            Model& model;
-            MtpModule& mtp;
-            TextSessionCache& cache;
-            const std::vector<int64_t>& prompt;
-            const MfqSamplingParams& sampling;
-            const MfqPromptCachePlan& plan;
-            const MfqTokenConstraintPtr& constraint;
-            int64_t chunk_size;
-            const CudaPreparedPrompt* prepared;
-            const std::string& input_key;
-            double multimodal_ms;
-            TextSessionRestore restored;
-            mfq_tensor_backend::Tensor last_target_hidden;
-
-            bool supports_cache() const {
-                return model.supports_text_session_state() &&
-                    (!prepared || !prepared->transformed() || !input_key.empty());
-            }
-            bool persistent_prefix_enabled() const { return cache.persistent_prefix_enabled(); }
-            std::size_t restore(std::size_t stable) {
-                if (!mtp.supports_session_state()) return 0;
-                restored = cache.restore_best(
-                    model, &mtp, plan.session_id, prompt, stable, input_key);
-                return restored.tokens;
-            }
-            void reset() { model.reset(1); mtp.reset(1); }
-            std::int64_t cache_position() const { return model.cache_pos; }
-            void snapshot(std::vector<int64_t> tokens) {
-                if (!last_target_hidden.defined() || model.cache_pos <= 1) return;
-                try {
-                    auto state = model.capture_text_session_state(tokens);
-                    state.input_key = input_key;
-                    state.mtp = mtp.capture_session_state(
-                        model.cache_pos, last_target_hidden);
-                    state.bytes += state.mtp->bytes;
-                    cache.store(plan.session_id, std::move(state));
-                } catch (const std::exception& error) {
-                    std::cerr << "runtime_session_cache action=skip session="
-                              << plan.session_id << " error=" << error.what()
-                              << std::endl;
-                }
-            }
-            std::int32_t generate(
-                    std::size_t reused, std::size_t,
-                    const std::function<void(std::size_t)>&,
-                    const MfqTokenCallback& emit,
-                    const MfqPrefillCallback& on_prefill, std::int32_t) {
-                return run_mtp_generation<Model::backbone>(
-                    model, mtp, prompt, sampling, emit, on_prefill,
-                    chunk_size, constraint, prepared, reused,
-                    restored.mtp_last_target_hidden, &last_target_hidden,
-                    multimodal_ms);
-            }
-        } ops{model, *mtp, session_cache, prompt, sampling, cache_plan,
-              token_constraint, prefill_chunk_size,
-              prepared ? &*prepared : nullptr, input_key, multimodal_ms, {}, {}};
+        CudaMtpGenerationOps<Model> ops{
+            model, *mtp, session_cache, prompt, sampling, cache_plan,
+            token_constraint, prefill_chunk_size,
+            prepared ? &*prepared : nullptr, input_key, multimodal_ms, {}, {}};
         return mfq::engine::generate(
             ops, prompt, sampling, on_token, on_prefill, cache_plan);
         }
@@ -318,256 +578,11 @@ int32_t generate(
     }
     mfq_tensor_backend::Tensor pending;
 
-    struct Ops {
-        Model& model;
-        TextSessionCache& cache;
-        DecodeGraphCache& graph;
-        const std::vector<int64_t>& prompt;
-        const MfqPromptCachePlan& plan;
-        const MfqTokenConstraintPtr& constraint;
-        int64_t chunk_size;
-        mfq_tensor_backend::Tensor& full_ids;
-        mfq_tensor_backend::Tensor& pending;
-        mfq_tensor_backend::Tensor& counts;
-        mfq_tensor_backend::Tensor& random_host;
-        mfq::cuda::Sampler& sampler;
-        bool has_penalties;
-        mfq_tensor_backend::TensorOptions options;
-        const CudaPreparedPrompt* prepared;
-        const std::string& input_key;
-        double multimodal_ms;
-
-        bool supports_cache() const {
-            return model.supports_text_session_state() &&
-                (!prepared || !prepared->transformed() || !input_key.empty());
-        }
-        bool persistent_prefix_enabled() const { return cache.persistent_prefix_enabled(); }
-        std::size_t prompt_size() const { return prompt.size(); }
-        std::size_t restore(std::size_t stable) {
-            return cache.restore_best(
-                model, nullptr, plan.session_id, prompt, stable, input_key).tokens;
-        }
-        void reset() { model.reset(1); }
-        std::int64_t cache_position() const { return model.cache_pos; }
-        void snapshot(std::vector<int64_t> tokens) {
-            try {
-                auto state = model.capture_text_session_state(tokens);
-                state.input_key = input_key;
-                cache.store(plan.session_id, std::move(state));
-            } catch (const std::exception& error) {
-                std::cerr << "runtime_session_cache action=skip session="
-                          << plan.session_id << " error=" << error.what()
-                          << std::endl;
-            }
-        }
-        mfq::engine::PrefillResult prefill(
-                std::size_t reused, std::size_t stable,
-                const std::function<void(std::size_t)>& checkpoint) {
-            PrefillCudaTimer timer;
-            auto ids = full_ids.narrow(
-                1, static_cast<int64_t>(reused),
-                static_cast<int64_t>(prompt.size() - reused)).contiguous();
-            if (stable > 0 && stable < prompt.size()) {
-                if (reused < stable) {
-                    auto prefix = full_ids.narrow(
-                        1, static_cast<int64_t>(reused),
-                        static_cast<int64_t>(stable - reused)).contiguous();
-                    if (prepared && prepared->transformed()) {
-                        (void)hidden_forward_prepared_chunked(
-                            model, prefix, *prepared, chunk_size, nullptr,
-                            static_cast<int64_t>(reused));
-                    } else {
-                        prefix = prefill_tail(model, std::move(prefix), chunk_size);
-                        MfqOptional<mfq_tensor_backend::Tensor> seq_len = mfq_nullopt;
-                        if (!Model::is_minicpmo45 && model.cache_pos > 0 &&
-                                prefix.size(1) == 1) {
-                            seq_len = mfq_tensor_backend::full(
-                                {1}, model.cache_pos + 1, options);
-                        }
-                        (void)model.hidden_forward(prefix, mfq_nullopt, seq_len);
-                    }
-                }
-                checkpoint(stable);
-                ids = full_ids.narrow(
-                    1, static_cast<int64_t>(stable),
-                    static_cast<int64_t>(prompt.size() - stable)).contiguous();
-            }
-            if (prepared && prepared->transformed()) {
-                const auto offset = stable > 0 && stable < prompt.size()
-                    ? stable : reused;
-                auto hidden = hidden_forward_prepared_chunked(
-                    model, ids, *prepared, chunk_size, nullptr,
-                    static_cast<int64_t>(offset));
-                auto logits = model.lm_head.forward(
-                    hidden.index({Slice(), -1, Slice()})
-                        .to(mfq_tensor_backend::kFloat16).contiguous())
-                    .contiguous().view({1, -1});
-                MFQ_CUDA_CHECK(cudaEventRecord(
-                    timer.finished_event(), mfq_get_current_cuda_stream()));
-                pending = mfq::cuda::sample_logits(
-                    sampler, std::move(logits), counts, constraint);
-            } else {
-                ids = prefill_tail(model, std::move(ids), chunk_size);
-                pending = sample_token(model, ids, sampler, counts, constraint,
-                                       timer.finished_event());
-            }
-            const auto token = pending.template item<int64_t>();
-            const double prefill_ms = timer.elapsed_ms();
-            return {token, {prompt.size() - reused, prefill_ms, multimodal_ms,
-                            prefill_ms + multimodal_ms}};
-        }
-        std::int64_t advance() {
-            pending = sample_token(
-                model, pending.reshape({1, 1}), sampler, counts, constraint);
-            return pending.template item<int64_t>();
-        }
-        void accept(std::int64_t) {
-            if (has_penalties) {
-                sample_token_counts_add_cuda(counts, pending.contiguous());
-            }
-        }
-        std::int32_t generate(
-                std::size_t reused, std::size_t stable,
-                const std::function<void(std::size_t)>& checkpoint,
-                const MfqTokenCallback& emit,
-                const MfqPrefillCallback& on_prefill,
-                std::int32_t max_tokens) {
-            const char* enabled = std::getenv("MFQ_RUNTIME_CUDA_GRAPH");
-            const char* minimum =
-                std::getenv("MFQ_RUNTIME_CUDA_GRAPH_MIN_TOKENS");
-            const std::int32_t minimum_tokens = minimum
-                ? std::max<std::int32_t>(2, std::atoi(minimum))
-                : 16;
-            const bool graph_eligible =
-                (!prepared || !prepared->transformed()) && !constraint &&
-                (enabled == nullptr || enabled[0] != '0') &&
-                !Model::is_flash_next && mfq_cuda_graph_capture_supported() &&
-                g_dsv4_cpu_offload_layers.empty() &&
-                g_dense_cpu_layer_count == 0 && !g_moe_expert_cache &&
-                model_parallel_cuda_graph_enabled() &&
-                max_tokens >= minimum_tokens &&
-                max_tokens <= graph.generated_capacity;
-            if (!graph_eligible) {
-                return mfq::engine::generate_target(
-                    *this, reused, stable, checkpoint, emit,
-                    on_prefill, max_tokens);
-            }
-
-            const auto first = prefill(reused, stable, checkpoint);
-            if (stable == prompt.size()) checkpoint(stable);
-            if (on_prefill) on_prefill(first.timing);
-            std::int32_t generated = 1;
-            if (!emit(first.token)) return generated;
-            if (generated >= max_tokens) return generated;
-
-            graph.ensure_compute_streams();
-            MfqCudaGuard graph_device_guard(graph.stream.device_index());
-            auto graph_stream_guards =
-                activate_cuda_graph_compute_streams(graph.compute_streams);
-            cudaStream_t graph_stream = graph.stream.stream();
-            if (has_penalties) {
-                sample_token_counts_add_cuda(
-                    counts, pending.contiguous());
-            }
-
-            std::int64_t position = model.cache_pos;
-            std::int64_t length = position + 1;
-            std::int64_t step = 1;
-            MFQ_CUDA_CHECK(cudaMemcpyAsync(
-                graph.static_input.template data_ptr<int64_t>(),
-                pending.template data_ptr<int64_t>(), sizeof(int64_t),
-                cudaMemcpyDeviceToDevice, graph_stream));
-            MFQ_CUDA_CHECK(cudaMemcpyAsync(
-                graph.generated.template data_ptr<int64_t>(),
-                pending.template data_ptr<int64_t>(), sizeof(int64_t),
-                cudaMemcpyDeviceToDevice, graph_stream));
-            MFQ_CUDA_CHECK(cudaMemcpyAsync(
-                graph.static_pos.template data_ptr<int64_t>(), &position,
-                sizeof(int64_t), cudaMemcpyHostToDevice, graph_stream));
-            MFQ_CUDA_CHECK(cudaMemcpyAsync(
-                graph.static_len.template data_ptr<int64_t>(), &length,
-                sizeof(int64_t), cudaMemcpyHostToDevice, graph_stream));
-            MFQ_CUDA_CHECK(cudaMemcpyAsync(
-                graph.static_step.template data_ptr<int64_t>(), &step,
-                sizeof(int64_t), cudaMemcpyHostToDevice, graph_stream));
-            *random_host.template data_ptr<float>() = 0.5f;
-            MFQ_CUDA_CHECK(cudaMemcpyAsync(
-                graph.random.template data_ptr<float>(),
-                random_host.template data_ptr<float>(), sizeof(float),
-                cudaMemcpyHostToDevice, graph_stream));
-            MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_stream));
-
-            const std::int64_t requested = model.cache_pos + max_tokens;
-            const std::int64_t planned = decode_graph_bucket(
-                requested, model.max_position_embeddings());
-            const std::int64_t parts = decode_graph_attention_parts(
-                planned, FullBlock::kDecodeAttentionMaxParts);
-            const bool greedy = sampler.greedy();
-            const auto sample_static = [&]() {
-                if (greedy && !has_penalties) {
-                    return model.next_token_static(
-                        graph.static_input, graph.static_pos,
-                        graph.static_len, planned, parts);
-                }
-                auto logits = model.last_logits_static(
-                        graph.static_input, graph.static_pos,
-                        graph.static_len, planned, parts)
-                    .contiguous().view({1, -1});
-                if (has_penalties) {
-                    logits = sampler.apply_penalties(
-                        std::move(logits), counts);
-                }
-                if (greedy) {
-                    return sampler.ops().sample_greedy(std::move(logits));
-                }
-                return sampler.ops().sample_stochastic(
-                    std::move(logits), graph.random, sampler.params());
-            };
-            const bool hit = graph.ensure_captured(
-                model, planned, sampler.params(), greedy,
-                [&]() { return sample_static(); },
-                [&](const mfq_tensor_backend::Tensor& next) {
-                    if (has_penalties) {
-                        sample_token_counts_add_cuda(
-                            counts, next.contiguous());
-                    }
-                    decode_graph_commit_cuda(
-                        next, graph.generated, graph.static_step,
-                        graph.static_input, graph.static_pos,
-                        graph.static_len);
-                });
-            if (!hit) report_cuda_memory("runtime_graph_capture");
-            if (trace_cuda_graph()) {
-                std::cerr << "runtime_cuda_graph action="
-                          << (hit ? "reuse" : "capture")
-                          << " requested_len=" << requested
-                          << " planned_len=" << planned
-                          << " captures=" << graph.captures
-                          << " reuses=" << graph.reuses << std::endl;
-            }
-
-            while (generated < max_tokens) {
-                if (!greedy) {
-                    *random_host.template data_ptr<float>() =
-                        sampler.next_uniform_float();
-                    MFQ_CUDA_CHECK(cudaMemcpyAsync(
-                        graph.random.template data_ptr<float>(),
-                        random_host.template data_ptr<float>(), sizeof(float),
-                        cudaMemcpyHostToDevice, graph_stream));
-                }
-                graph.graph->replay();
-                const auto token =
-                    graph.static_next.template item<int64_t>();
-                ++generated;
-                if (!emit(token)) break;
-            }
-            model.cache_pos += generated - 1;
-            return generated;
-        }
-    } ops{model, session_cache, graph_cache, prompt, cache_plan,
-          token_constraint, prefill_chunk_size, full_ids, pending, counts,
-          random_host, sampler, has_penalties, options,
-          prepared ? &*prepared : nullptr, input_key, multimodal_ms};
+    CudaGenerationOps<Model> ops{
+        model, session_cache, graph_cache, prompt, cache_plan,
+        token_constraint, prefill_chunk_size, full_ids, pending, counts,
+        random_host, sampler, has_penalties, options,
+        prepared ? &*prepared : nullptr, input_key, multimodal_ms};
     return mfq::engine::generate(
         ops, prompt, sampling, on_token, on_prefill, cache_plan);
 }

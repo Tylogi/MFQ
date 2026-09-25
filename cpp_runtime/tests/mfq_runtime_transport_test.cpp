@@ -50,7 +50,9 @@ int main() {
             const MfqTokenCallback& on_token,
             const MfqPrefillCallback& on_prefill,
             const MfqPromptCachePlan&,
-            const MfqTokenConstraintPtr&) {
+            const MfqTokenConstraintPtr&,
+            const MfqCancellationCheck& cancelled) {
+        assert(!cancelled());
         on_prefill({prompt.size(), 0.0, 0.0, 0.0});
         on_token(3);
         return 1;
@@ -65,6 +67,7 @@ int main() {
     std::condition_variable changed;
     bool first_running = false;
     bool release_first = false;
+    bool backend_saw_cancel = false;
     int engine_calls = 0;
     queued_engine.generate = [&](
             const std::vector<int64_t>&,
@@ -72,12 +75,14 @@ int main() {
             const MfqTokenCallback& on_token,
             const MfqPrefillCallback&,
             const MfqPromptCachePlan&,
-            const MfqTokenConstraintPtr&) {
+            const MfqTokenConstraintPtr&,
+            const MfqCancellationCheck& cancelled) {
         std::unique_lock<std::mutex> lock(gate);
         ++engine_calls;
         first_running = true;
         changed.notify_all();
         changed.wait(lock, [&] { return release_first; });
+        backend_saw_cancel = cancelled();
         lock.unlock();
         on_token(3);
         return 1;
@@ -111,11 +116,12 @@ int main() {
     assert(cancelled);
     second_thread.join();
     assert(second_result == 0 && engine_calls == 1);
+    assert(scheduler.cancel_request("first"));
     {
         std::lock_guard<std::mutex> lock(gate);
         release_first = true;
     }
     changed.notify_all();
     first_thread.join();
-    assert(first_result == 1);
+    assert(first_result == 1 && backend_saw_cancel);
 }

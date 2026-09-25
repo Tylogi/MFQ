@@ -111,12 +111,15 @@ int32_t MfqScheduler::generate_with_cancel(
         const MfqTokenConstraintPtr & token_constraint) const {
     if (!admit(cancel_flag)) return 0;
     try {
-        const auto emit = [cancel_flag, &on_token](int64_t token) {
-            return !cancel_flag->load(std::memory_order_acquire) &&
-                (!on_token || on_token(token));
+        const auto cancelled = [cancel_flag] {
+            return cancel_flag->load(std::memory_order_acquire);
+        };
+        const auto emit = [cancelled, &on_token](int64_t token) {
+            return !cancelled() && (!on_token || on_token(token));
         };
         const auto result = engine_.generate(
-            prompt, sampling, emit, on_prefill, cache_plan, token_constraint);
+            prompt, sampling, emit, on_prefill, cache_plan, token_constraint,
+            cancelled);
         release_admission();
         return result;
     } catch (...) {
@@ -167,13 +170,15 @@ int32_t MfqScheduler::generate_multimodal_with_cancel(
         const MfqTokenConstraintPtr & token_constraint) const {
     if (!admit(cancel_flag)) return 0;
     try {
-        const auto emit = [cancel_flag, &on_token](int64_t token) {
-            return !cancel_flag->load(std::memory_order_acquire) &&
-                (!on_token || on_token(token));
+        const auto cancelled = [cancel_flag] {
+            return cancel_flag->load(std::memory_order_acquire);
+        };
+        const auto emit = [cancelled, &on_token](int64_t token) {
+            return !cancelled() && (!on_token || on_token(token));
         };
         const auto result = engine_.multimodal_generate(
             prompt, media, sampling, emit, on_prefill, cache_plan,
-            token_constraint);
+            token_constraint, cancelled);
         release_admission();
         return result;
     } catch (...) {

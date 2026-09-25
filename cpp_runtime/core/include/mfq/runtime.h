@@ -127,6 +127,7 @@ struct MfqDuplexBackend {
 };
 
 using MfqTokenCallback = std::function<bool(int64_t token)>;
+using MfqCancellationCheck = std::function<bool()>;
 
 struct MfqPrefillTiming {
     size_t prompt_tokens = 0;
@@ -146,7 +147,8 @@ using MfqGenerateFn = std::function<int32_t(
     const MfqTokenCallback & on_token,
     const MfqPrefillCallback & on_prefill,
     const MfqPromptCachePlan & cache_plan,
-    const MfqTokenConstraintPtr & token_constraint)>;
+    const MfqTokenConstraintPtr & token_constraint,
+    const MfqCancellationCheck & cancelled)>;
 using MfqMultimodalGenerateFn = std::function<int32_t(
     const std::vector<int64_t> & prompt,
     const MfqMultimodalInput & media,
@@ -154,7 +156,8 @@ using MfqMultimodalGenerateFn = std::function<int32_t(
     const MfqTokenCallback & on_token,
     const MfqPrefillCallback & on_prefill,
     const MfqPromptCachePlan & cache_plan,
-    const MfqTokenConstraintPtr & token_constraint)>;
+    const MfqTokenConstraintPtr & token_constraint,
+    const MfqCancellationCheck & cancelled)>;
 using MfqReloadFn = std::function<int64_t(int64_t context_size)>;
 using MfqRuntimeMetricsFn =
     std::function<std::vector<std::pair<std::string, double>>() >;

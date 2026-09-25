@@ -12,8 +12,12 @@ BATCHING = (
     / "cpp_runtime"
     / "backends"
     / "cuda"
-    / "runtime"
-    / "qwen_continuous_batching.h"
+    / "models"
+    / "qwen35"
+    / "qwen35_batch_executor.h"
+).read_text(encoding="utf-8")
+COMMON_BATCHING = (
+    ROOT / "cpp_runtime" / "engine" / "include" / "continuous_batching.h"
 ).read_text(encoding="utf-8")
 ROPE = (ROOT / "mfq" / "kernels" / "cuda" / "rope.cu").read_text(
     encoding="utf-8"
@@ -41,7 +45,8 @@ CAUSAL_LM = (CUDA_ROOT / "runtime" / "causal_lm.h").read_text(
 def test_continuous_batching_is_an_explicit_server_mode():
     assert '"--continuous-batching"' in DECODE
     assert '"--check-continuous-batching"' in DECODE
-    assert "CudaContinuousBatcher" in DECODE
+    assert "ContinuousBatchExecutor" in COMMON_BATCHING
+    assert "QwenBatchExecutor final" in BATCHING
     assert "decode=target_only mtp=disabled" in DECODE
 
 
@@ -67,9 +72,9 @@ def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
     assert "request->token_constraint" in BATCHING
     assert "pending_" in BATCHING
     assert "active_" in BATCHING
-    assert "output_tokens" in BATCHING
-    assert "publish_token" in BATCHING
-    assert "cancel_requested" in BATCHING
+    assert "output_tokens_" in COMMON_BATCHING
+    assert "publish_token" in COMMON_BATCHING
+    assert "cancel_requested" in COMMON_BATCHING
     assert "retire_cancelled_requests" in BATCHING
     assert "MFQ_CONTINUOUS_BATCH_GREEDY" in BATCHING
     assert "environment == nullptr || std::atoi(environment) != 0" in BATCHING

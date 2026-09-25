@@ -436,7 +436,8 @@ load_runtime_components(
                 const MfqTokenCallback& on_token,
                 const MfqPrefillCallback& on_prefill,
                 const MfqPromptCachePlan&,
-                const MfqTokenConstraintPtr& token_constraint) {
+                const MfqTokenConstraintPtr& token_constraint,
+                const MfqCancellationCheck&) {
             return mfq::cuda::minicpmo45::generate_multimodal_tokens(
                 state->runtime,
                 model_mutex,

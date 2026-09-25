@@ -1,4 +1,7 @@
-add_library(mfq-engine STATIC src/text_emitter.cpp)
+add_library(mfq-engine STATIC
+    src/continuous_batching.cpp
+    src/text_emitter.cpp
+)
 add_library(mfq::engine ALIAS mfq-engine)
 target_include_directories(mfq-engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(mfq-engine PUBLIC cxx_std_20)
