@@ -1,3 +1,4 @@
+"""检查 MiniCPM C++ 原生执行与 Python 实时网关契约。"""
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
@@ -47,12 +48,6 @@ SERVER_SOURCE = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_te
 )
 REALTIME_GATEWAY = (
     ROOT / "mfq" / "runtime" / "minicpmo45_realtime.py"
-).read_text(encoding="utf-8")
-STUDIO_APP = (ROOT / "MFQStudio" / "src" / "App.tsx").read_text(
-    encoding="utf-8"
-)
-STUDIO_REALTIME = (
-    ROOT / "MFQStudio" / "src" / "realtimeAudio.ts"
 ).read_text(encoding="utf-8")
 
 
@@ -453,10 +448,6 @@ def test_minicpmo45_realtime_uses_official_demo_defaults():
     assert "await self.backend_runtime_defaults()" in REALTIME_GATEWAY
     assert "token2wav_steps: int = 10" in REALTIME_GATEWAY
     assert "DEFAULT_DUPLEX_SYSTEM_PROMPT" in REALTIME_GATEWAY
-    assert "const SPEAK_TOKENS = 20" in STUDIO_REALTIME
-    assert "const PLAYBACK_DELAY_SECONDS = 0.2" in STUDIO_REALTIME
-    assert "REALTIME_SYSTEM_PROMPTS" not in STUDIO_APP
-    assert "systemPrompt: effectiveSystemPrompt" in STUDIO_APP
 
 
 def test_minicpmo45_realtime_preserves_official_first_tts_flush():

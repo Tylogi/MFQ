@@ -1,4 +1,4 @@
-"""FastAPI application for the public ``mfq serve`` API."""
+"""组装 MFQ 公共 API、鉴权中间件与前端静态服务。"""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 from mfq.server.api.auth import ApiKeyManager, required_scope
 from mfq.server.api.routes import ERROR_RESPONSES as ERROR_RESPONSES
@@ -29,6 +28,7 @@ from mfq.server.api.routes.runtime import profile_router
 from mfq.server.api.routes.runtime import router as runtime_router
 from mfq.server.api.routes.sessions import initial_router as initial_session_router
 from mfq.server.api.routes.sessions import router as session_router
+from mfq.server.api.static import SPAStaticFiles
 from mfq.server.protocol.models import ErrorDetail, ErrorResponse
 from mfq.server.services.service import ServerService, ServiceError
 
@@ -152,7 +152,7 @@ def create_app(
         root = Path(web_root)
         if not root.is_dir():
             raise ValueError(f"web root is not a directory: {root}")
-        app.mount("/", StaticFiles(directory=root, html=True), name="web")
+        app.mount("/", SPAStaticFiles(directory=root, html=True), name="web")
 
     return app
 

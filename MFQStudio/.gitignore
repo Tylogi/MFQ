@@ -1,8 +1,16 @@
 node_modules/
+.npm-cache/
 dist/
+artifacts/
+playwright-report/
+test-results/
 *.tsbuildinfo
 vite.config.js
 vite.config.d.ts
 src-tauri/gen/
 src-tauri/icons/
 src-tauri/target/
+
+# 前端模型管理源码不属于根目录忽略的模型权重目录。
+!src/features/models/
+!src/features/models/**

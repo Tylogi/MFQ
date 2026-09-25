@@ -1,0 +1,92 @@
+/* 设置草稿、采样参数和预设编辑样式。 */
+/* ---------- Settings page ---------- */
+
+.settings-page { display: grid; }
+.settings-page > .section-label:first-child { margin-top: 2px; }
+.settings-page-inherited { min-width: 0; border: 0; margin: 0; padding: 0; }
+.settings-page-inherited:disabled { opacity: 0.65; }
+.settings-page-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.settings-page-section { display: grid; min-width: 0; align-content: start; }
+.settings-page-panel { min-width: 0; }
+.settings-defaults-panel { padding-block: 15px; }
+.settings-defaults-panel input[type="checkbox"],
+.settings-form-panel input[type="checkbox"] { accent-color: var(--accent); }
+.settings-form-panel { display: grid; align-content: start; gap: 15px; }
+.settings-control-block { display: grid; gap: 8px; }
+.settings-control-block > label,
+.settings-range > span,
+.settings-inline-fields label > span,
+.settings-page .saved-presets label > span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 610;
+  line-height: 1.45;
+}
+.settings-page .segmented { gap: 4px; }
+.settings-page .segmented button,
+.settings-page button,
+.settings-page .portable-actions label {
+  min-height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 11px;
+  color: var(--ink-soft);
+  background: var(--panel-control);
+  font-size: 11px;
+  font-weight: 610;
+}
+.settings-page button:hover,
+.settings-page .portable-actions label:hover { border-color: var(--line-strong); background: var(--surface-hover); }
+.settings-page button.primary { border-color: var(--accent); color: var(--on-accent); background: var(--accent); font-weight: 700; }
+.settings-page textarea,
+.settings-page input:not([type="checkbox"]):not([type="range"]),
+.settings-page select {
+  width: 100%;
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  outline: 0;
+  padding: 7px 9px;
+  color: var(--ink-soft);
+  background: var(--panel-control);
+  font-size: 11px;
+}
+.settings-page textarea { resize: vertical; line-height: 1.5; }
+.settings-page textarea:focus,
+.settings-page input:not([type="checkbox"]):not([type="range"]):focus,
+.settings-page select:focus { border-color: var(--line-strong); box-shadow: 0 0 0 3px var(--accent-soft); }
+.settings-page .saved-presets { gap: 9px; border-top: 1px solid var(--line-soft); margin-top: 0; padding-top: 15px; }
+.settings-page .saved-presets label { display: grid; gap: 6px; margin: 0; }
+.settings-page .saved-presets > small { color: var(--muted-light); font-size: 11px; line-height: 1.5; }
+.settings-page .preset-status { margin: 0; font-size: 11px; }
+.settings-range { display: grid; gap: 8px; }
+.settings-range + .settings-range { border-top: 1px solid var(--line-soft); padding-top: 14px; }
+.settings-range > span { display: flex; justify-content: space-between; gap: 14px; }
+.settings-range output { color: var(--ink-soft); font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.settings-range input { width: 100%; accent-color: var(--accent); }
+.settings-inline-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; border-top: 1px solid var(--line-soft); padding-top: 14px; }
+.settings-inline-fields label { display: grid; gap: 6px; }
+.settings-number-input { width: 112px !important; text-align: right; }
+.settings-context-input { width: 146px !important; }
+.settings-panel-actions { display: flex; justify-content: flex-end; border-top: 1px solid var(--line-soft); margin-top: 2px; padding-top: 14px; }
+.settings-data-panel { padding-block: 15px; }
+.settings-page .portable-actions { flex-wrap: nowrap; }
+.settings-page .portable-actions label { display: grid; place-items: center; margin: 0; cursor: pointer; }
+.settings-page-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+
+.segmented { display: grid; grid-template-columns: repeat(3, 1fr); gap: 3px; }
+.segmented button { border: 1px solid transparent; border-radius: 7px; padding: 6px 2px; color: var(--muted); background: transparent; font-size: 10.5px; }
+.segmented button[aria-pressed="true"] { border-color: var(--accent-border); color: var(--accent-ink); background: var(--accent-soft); }
+
+.saved-presets { display: grid; gap: 7px; border-top: 1px solid var(--line-soft); margin-top: 11px; padding-top: 11px; }
+.saved-presets label { margin: 0; }
+.saved-presets > small { color: var(--muted-light); font-size: 10px; line-height: 1.45; }
+.preset-save-row { display: grid; grid-template-columns: minmax(0, 1fr) auto 30px; gap: 5px; }
+.preset-save-row input { min-width: 0; }
+.preset-save-row button { padding-inline: 10px; white-space: nowrap; }
+.preset-save-row .preset-delete { display: grid; width: 30px; place-items: center; padding: 0; color: var(--danger); }
+.preset-status { margin: 0; color: var(--success); font-size: 10px; }
+.preset-status.error { color: var(--danger); }
+.portable-actions { display: flex; gap: 6px; }
+.portable-actions button, .portable-actions label { display: grid; place-items: center; border: 1px solid var(--line); border-radius: 7px; margin: 0; padding: 6px 10px; color: var(--muted); background: var(--surface-subtle); font-size: 10.5px; cursor: pointer; }
+.portable-actions input { display: none; }

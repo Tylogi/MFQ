@@ -1,3 +1,4 @@
+"""校验原生对话模板、推理能力发布及上下文重载契约。"""
 import re
 from pathlib import Path
 
@@ -28,12 +29,6 @@ METAL_DECODE = (
 METAL_DSV4 = (
     ROOT / "cpp_runtime" / "backends" / "metal" / "models/deepseek_v4" / "mlx_deepseek_v4_causal_lm.cpp"
 ).read_text(encoding="utf-8")
-STUDIO_APP = (ROOT / "MFQStudio" / "src" / "App.tsx").read_text(
-    encoding="utf-8"
-)
-STUDIO_API = (ROOT / "MFQStudio" / "src" / "api.ts").read_text(
-    encoding="utf-8"
-)
 TEXT_CHAT = (
     ROOT / "cpp_runtime" / "components" / "tokenizer" / "chat" / "chat.cpp"
 ).read_text(encoding="utf-8")
@@ -147,21 +142,10 @@ def test_cuda_server_accepts_an_external_tokenizer_only() -> None:
     assert "server_config.tokenizer_model = tokenizer_model" in DECODE
 
 
-def test_studio_keeps_reasoning_separate_and_template_controlled() -> None:
-    assert "reasoning: string;" in STUDIO_APP
-    assert "include_reasoning_history: !effectiveSettings.excludeReasoning" in STUDIO_APP
-    assert "effectiveSettings.enableThinking" in STUDIO_APP
-    assert "effectiveSettings.excludeReasoning" in STUDIO_APP
-
-
-def test_studio_exposes_template_gated_reasoning_effort() -> None:
+def test_server_publishes_template_gated_reasoning_effort() -> None:
     assert "chat_template_capabilities_json" in SERVER
     assert '{"chat_template_capabilities", chat_template_capabilities}' in SERVER
     assert 'chat_template.find("enable_thinking")' in SERVER
-    assert 'runtime?.chat_template_capabilities?.thinking?.supported' in STUDIO_APP
-    assert "runtime?.chat_template_capabilities?.reasoning_effort?.values" in STUDIO_APP
-    assert "effectiveSettings.enableThinking && reasoningValues.length > 0" in STUDIO_APP
-    assert "reasoning_effort: effectiveSettings.reasoningEffort || null" in STUDIO_APP
 
 
 def test_native_server_does_not_bundle_or_mount_a_webui() -> None:
@@ -181,10 +165,7 @@ def test_dsv4_server_uses_exact_stable_prefix_kv_reuse() -> None:
     assert '{"prefill_tokens", values.prefill_tokens}' in SERVER
 
 
-def test_studio_can_reload_model_with_a_new_context() -> None:
-    assert "async function reloadRuntime()" in STUDIO_APP
-    assert "api.reloadRuntime(contextSize, runtime?.instance_id)" in STUDIO_APP
-    assert 'request("/api/v1/runtime/reload"' in STUDIO_API
+def test_server_validates_context_on_model_reload() -> None:
     assert 'server.Post("/api/reload"' in SERVER
     assert "context_size must be within the model context capacity" in SERVER
 

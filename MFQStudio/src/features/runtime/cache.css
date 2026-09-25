@@ -1,0 +1,21 @@
+/* 资源缓存与运行配置页面样式。 */
+/* ---------- Cache and profiles page ---------- */
+
+.cache-usage-bars { margin: 17px 0 20px; }
+.cache-stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-top: 17px; }
+.cache-stats > div { display: grid; gap: 2px; border-left: 2px solid var(--line-strong); padding-left: 11px; }
+.cache-stats span { color: var(--muted-light); font-size: 11px; }
+.cache-stats strong { color: var(--ink-soft); font-size: 14px; font-weight: 620; }
+.cache-stats strong small { margin-left: 5px; color: var(--muted-light); font-size: 10.5px; font-weight: 500; }
+
+.profile-panel { margin-top: 0; }
+.profile-create { display: grid; grid-template-columns: minmax(180px, 1fr) auto; gap: 7px; margin-top: 12px; }
+.profile-create input { min-width: 0; border: 1px solid var(--panel-line); border-radius: 7px; padding: 7px 9px; color: var(--ink-soft); background: var(--panel-control); font-size: 11px; }
+.profile-create button, .profile-row button { border: 1px solid var(--panel-line); border-radius: 7px; padding: 6px 9px; color: var(--ink-soft); background: var(--panel-control); font-size: 10.5px; }
+.profile-create button:hover, .profile-row button:hover { border-color: var(--line-strong); color: var(--ink); background: var(--surface-hover); }
+.profile-list { display: grid; gap: 2px; margin-top: 10px; }
+.profile-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 7px; border-top: 1px solid var(--panel-line); padding: 8px 0; }
+.profile-row > div { display: grid; min-width: 0; gap: 2px; }
+.profile-row strong { color: var(--ink-soft); font-size: 11px; }
+.profile-row small { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.profile-row.drifted strong { color: var(--warning); }

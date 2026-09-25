@@ -1,0 +1,67 @@
+# 分别验证 Studio 行为、生产产物浏览器交互及原生跨语言契约。
+name: Studio frontend
+
+on:
+  push:
+    branches: [master]
+    paths: ['MFQStudio/**', 'tests/**', 'mfq/**', 'cpp_runtime/**', 'packaging/**', 'third_party/**', 'pyproject.toml', 'NOTICE', '.github/workflows/frontend.yaml']
+  pull_request:
+    paths: ['MFQStudio/**', 'tests/**', 'mfq/**', 'cpp_runtime/**', 'packaging/**', 'third_party/**', 'pyproject.toml', 'NOTICE', '.github/workflows/frontend.yaml']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: MFQStudio
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: MFQStudio/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Test behavior
+        run: npm test
+      - name: Check types
+        run: npm run typecheck
+      - name: Build production assets
+        run: npm run build
+      - name: Install browser test runtime
+        run: npx playwright install --with-deps chromium --only-shell
+      - name: Check production assets in desktop and mobile browsers
+        run: npm run test:e2e
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: studio-browser-failures
+          path: MFQStudio/artifacts/playwright
+          retention-days: 7
+
+  source-contracts:
+    name: Native and cross-language contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install source-contract test runner
+        run: python -m pip install pytest 'pydantic>=2.8.0'
+      - name: Check native packaging and runtime contracts
+        working-directory: .
+        run: >-
+          python -m pytest tests/test_mfq_studio_source.py
+          tests/test_webui_markdown_prefill.py tests/test_cpp_runtime_chat_template_source.py
+          tests/test_cpp_runtime_minicpmo45_source.py tests/test_model_capabilities.py -q

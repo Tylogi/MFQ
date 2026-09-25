@@ -1,3 +1,4 @@
+"""检查 Python 能力注册与 C++ 架构声明；前端能力交互由 Vitest 覆盖。"""
 from pathlib import Path
 
 from mfq.server.protocol.output_protocols import output_protocol_for_architecture
@@ -17,12 +18,6 @@ CUDA_DECODE = "\n".join(
 CUDA_COMPONENTS = "\n".join(
     (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
     for name in ("server_components.h", "server_components.cpp")
-)
-STUDIO_APP = (ROOT / "MFQStudio" / "src" / "App.tsx").read_text(
-    encoding="utf-8"
-)
-STUDIO_AUDIO = (ROOT / "MFQStudio" / "src" / "realtimeAudio.ts").read_text(
-    encoding="utf-8"
 )
 
 
@@ -220,16 +215,3 @@ def test_cuda_uses_one_architecture_and_optional_component_registry() -> None:
     assert "auto server_components" in CUDA_DECODE
     assert "switch (result.plan.vision)" in CUDA_COMPONENTS
     assert "server_minicpmo_runtime" not in CUDA_DECODE
-
-
-def test_studio_displays_capabilities_and_gates_voice_modes() -> None:
-    assert '(["text", "voice", "full_duplex"] as SessionMode[])' in STUDIO_APP
-    assert "!feature.audio_input" in STUDIO_APP
-    assert "!feature.full_duplex" in STUDIO_APP
-    assert "features.mtp === true" in STUDIO_APP
-    assert "enableVision: !effectiveSettings.enableVision" in STUDIO_APP
-    assert "enableMtp: !effectiveSettings.enableMtp" in STUDIO_APP
-    assert "heldHalfDuplexChunk" in STUDIO_AUDIO
-    assert "forceListen: true" in STUDIO_AUDIO
-    assert "forceSpeak: true" in STUDIO_AUDIO
-    assert 'event.type === "response.step.done"' in STUDIO_AUDIO

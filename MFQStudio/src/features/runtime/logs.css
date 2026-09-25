@@ -1,0 +1,59 @@
+/* 运行日志列表、筛选和级别标签样式。 */
+/* ---------- Logs page ---------- */
+
+.runtime-log-list { display: grid; margin-top: 12px; }
+.runtime-log { display: grid; grid-template-columns: 66px minmax(0, 1fr); gap: 8px; border-top: 1px solid var(--panel-line); padding: 7px 1px; }
+.runtime-log span { color: var(--muted-light); font-size: 10px; }
+.runtime-log p { min-width: 0; overflow-wrap: anywhere; margin: 0; color: var(--ink-soft); font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
+.runtime-log.error p { color: var(--danger); }
+
+.job-list { display: grid; max-height: 500px; margin-top: 10px; overflow-y: auto; }
+.job-list > button { display: grid; grid-template-columns: 8px minmax(0, 1fr) 38px; gap: 9px; align-items: center; border: 0; border-top: 1px solid var(--panel-line); padding: 9px 4px; color: inherit; background: transparent; text-align: left; }
+.job-list > button:hover, .job-list > button.active { background: var(--surface-active); }
+.job-list div { display: grid; min-width: 0; gap: 2px; }
+.job-list strong { overflow: hidden; font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.job-list small { color: var(--muted-light); font-size: 10px; }
+.job-list b { color: var(--muted); font-size: 10px; text-align: right; }
+.job-status { width: 7px; height: 7px; border-radius: 50%; background: var(--muted-light); }
+.job-status.running { background: var(--warning); box-shadow: 0 0 0 3px var(--warning-soft); }
+.job-status.succeeded { background: var(--success); }
+.job-status.failed, .job-status.interrupted { background: var(--danger); }
+.job-status.cancelling, .job-status.cancelled { background: var(--muted-light); }
+.job-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(70px, 110px) 38px; gap: 10px; align-items: center; border-top: 1px solid var(--panel-line); padding: 9px 1px; }
+.job-row div { display: grid; min-width: 0; gap: 2px; }
+.job-row strong { overflow: hidden; color: var(--ink-soft); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+.job-row small { color: var(--muted-light); font-size: 10px; }
+.job-row progress { width: 100%; height: 5px; accent-color: var(--accent); }
+.job-row > b { color: var(--muted); font-size: 10px; text-align: right; }
+.job-row.completed { grid-template-columns: minmax(0, 1fr) minmax(70px, 110px) 38px 24px; }
+.job-row.completed > button { display: grid; width: 24px; height: 24px; place-content: center; border: 0; border-radius: 6px; padding: 0; color: var(--muted); background: transparent; }
+.job-row.completed > button:hover { color: var(--danger); background: var(--danger-soft); }
+.completed-jobs { border-top: 1px solid var(--panel-line); margin-top: 10px; }
+.completed-jobs > summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 1px 5px; color: var(--muted); cursor: pointer; font-size: 10.5px; list-style: none; }
+.completed-jobs > summary::-webkit-details-marker { display: none; }
+.completed-jobs > summary > span { display: inline-flex; align-items: center; gap: 5px; font-weight: 600; }
+.completed-jobs > summary > span::before { content: "›"; display: inline-block; color: var(--muted-light); transition: transform 140ms ease; }
+.completed-jobs[open] > summary > span::before { transform: rotate(90deg); }
+.completed-jobs > summary b { color: var(--muted-light); font-size: 10px; }
+.completed-jobs > summary button { border: 1px solid var(--panel-line); border-radius: 6px; padding: 4px 7px; color: var(--muted); background: var(--panel-control); font-size: 10px; }
+.completed-jobs > summary button:hover { border-color: var(--line-strong); color: var(--danger); background: var(--danger-soft); }
+.completed-jobs .request-table, .completed-jobs .job-list { margin-top: 3px; }
+
+.job-detail { margin-top: 10px; }
+.job-detail > progress { width: 100%; height: 6px; margin: 15px 0 8px; accent-color: var(--accent); }
+.job-result-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 8px 0; }
+.job-result-grid > div { display: grid; border-left: 2px solid var(--line-strong); padding-left: 9px; }
+.job-result-grid span { color: var(--muted-light); font-size: 10px; }
+.job-result-grid strong { margin-top: 2px; color: var(--ink-soft); font-size: 11px; }
+.job-detail > pre { max-height: 240px; overflow: auto; border-radius: 7px; padding: 10px; color: var(--ink-soft); background: var(--surface-inset); font: 10px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.job-error { overflow-wrap: anywhere; border-radius: 7px; margin-top: 10px; padding: 9px; color: var(--danger); background: var(--danger-soft); font-size: 10.5px; white-space: pre-wrap; }
+.job-actions { display: flex; gap: 7px; flex-wrap: wrap; }
+.job-actions .secondary { border: 1px solid var(--panel-line); border-radius: 7px; padding: 6px 9px; color: var(--ink-soft); background: var(--panel-control); font-size: 10.5px; }
+.job-actions .secondary:hover { border-color: var(--line-strong); color: var(--ink); background: var(--surface-hover); }
+.job-actions .danger { color: var(--danger); }
+.job-log { max-height: 320px; margin-top: 12px; overflow: auto; border: 1px solid var(--panel-line); border-radius: 8px; background: var(--panel-control); }
+.job-log header { position: sticky; top: 0; padding: 7px 9px; color: var(--muted); background: var(--surface-subtle); font-size: 10px; text-transform: uppercase; }
+.job-log > div { display: grid; grid-template-columns: 70px minmax(0, 1fr); gap: 8px; border-top: 1px solid var(--line-soft); padding: 6px 9px; }
+.job-log time { color: var(--muted-light); font-size: 10px; }
+.job-log code { overflow-wrap: anywhere; color: var(--ink-soft); font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.job-log .error code { color: var(--danger); }
