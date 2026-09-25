@@ -1,0 +1,33 @@
+/* 全局弹窗和不可恢复错误页面样式。 */
+/* ---------- Dialogs ---------- */
+
+.dialog-backdrop { position: fixed; inset: 0; z-index: 30; display: grid; place-items: center; padding: 20px; background: rgb(21 23 23 / 34%); backdrop-filter: blur(3px); }
+.studio-dialog { display: grid; width: min(500px, 100%); max-height: 90vh; overflow-y: auto; border: 1px solid var(--line); border-radius: 14px; color: var(--ink); background: var(--canvas); box-shadow: var(--shadow-md); }
+.studio-dialog header { display: flex; align-items: flex-start; justify-content: space-between; padding: 22px 22px 14px; }
+.studio-dialog h2 { margin: 3px 0 0; font-size: 21px; font-weight: 650; letter-spacing: -0.015em; }
+.studio-dialog header > button { width: 28px; height: 28px; border: 0; padding: 0; color: var(--muted); background: transparent; font-size: 20px; }
+.studio-dialog header p { margin: 4px 0 0; color: var(--muted); font-size: 10.5px; }
+.studio-dialog label { display: grid; gap: 5px; margin: 9px 0; color: var(--muted); font-size: 11px; }
+.studio-dialog label > span { display: flex; justify-content: space-between; }
+.studio-dialog input { width: 100%; min-height: 36px; border: 1px solid var(--line); border-radius: 9px; outline: 0; padding: 8px 10px; color: var(--ink); background: var(--surface-control); }
+.studio-dialog input:focus { border-color: var(--line-strong); box-shadow: 0 0 0 3px var(--accent-soft); }
+.studio-dialog > .segmented, .studio-dialog > label, .dialog-status { margin-inline: 18px; }
+.studio-dialog > .segmented { border-radius: 8px; padding: 3px; background: var(--surface-subtle); }
+.dialog-status { display: flex; align-items: center; gap: 7px; border: 1px solid var(--line); border-radius: 8px; margin-block: 10px; padding: 8px 9px; color: var(--muted); background: var(--surface); font-size: 10.5px; }
+.dialog-status span { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; }
+.dialog-status span.online { background: var(--success); }
+.dialog-status span.offline { background: var(--danger); }
+.studio-dialog footer { display: flex; justify-content: flex-end; gap: 7px; border-top: 1px solid var(--line); padding: 11px 17px; background: var(--surface-overlay); }
+.studio-dialog footer .primary { border-color: var(--accent); background: var(--accent); }
+
+.model-browser-dialog { width: min(620px, 100%); grid-template-rows: auto auto minmax(220px, 52vh) auto; overflow: hidden; }
+.model-browser-location { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 7px; border-block: 1px solid var(--line-soft); padding: 9px 18px; color: var(--muted); background: var(--surface-overlay); font-size: 10.5px; }
+.model-browser-location input { min-width: 0; height: 30px; border-color: var(--line-soft); border-radius: 7px; padding-inline: 10px; color: var(--ink); background: var(--surface); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10.5px; }
+.model-browser-location button { min-height: 30px; padding: 6px 10px; }
+.model-browser-location span { color: var(--accent-ink); }
+.model-browser-list { min-height: 0; overflow-y: auto; padding: 7px 10px; }
+.model-browser-list > button { display: grid; width: 100%; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: center; gap: 8px; border: 0; padding: 9px 10px; color: var(--ink-soft); background: transparent; text-align: left; }
+.model-browser-list > button:hover { border-color: transparent; background: var(--surface-subtle); }
+.model-browser-list > button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-browser-list > button b { color: var(--muted); font-size: 10px; font-weight: 600; }
+.model-browser-list > p { margin: 28px 12px; color: var(--muted); text-align: center; font-size: 10.5px; }

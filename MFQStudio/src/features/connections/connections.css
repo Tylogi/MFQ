@@ -1,0 +1,73 @@
+/* 服务器配置、工具服务和远程节点样式。 */
+/* ---------- Server page ---------- */
+
+.server-page { display: grid; }
+.server-page > .section-label:first-child { margin-top: 2px; }
+.server-active-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 1px 1px 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.server-active-notice .ui-icon { flex: 0 0 auto; color: var(--accent); }
+.server-active-notice + .section-label { margin-top: 20px; }
+.server-settings-panel { padding-block: 15px; }
+.server-page .setting-row-trailing { max-width: 55%; }
+.server-page .setting-row-trailing select,
+.server-page .setting-row-trailing input:not([type="checkbox"]):not([type="range"]),
+.server-page .setting-row-trailing textarea {
+  min-height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  outline: 0;
+  padding: 6px 9px;
+  color: var(--ink-soft);
+  background: var(--panel-control);
+  font-size: 11px;
+}
+.server-page .setting-row-trailing select:focus,
+.server-page .setting-row-trailing input:not([type="checkbox"]):not([type="range"]):focus,
+.server-page .setting-row-trailing textarea:focus { border-color: var(--line-strong); box-shadow: 0 0 0 3px var(--accent-soft); }
+.server-page .setting-row-trailing select { width: 220px; }
+.server-page .setting-row-trailing input[type="checkbox"] { accent-color: var(--accent); }
+.server-row-actions { display: flex; min-width: 0; align-items: center; justify-content: flex-end; gap: 9px; }
+.server-row-actions > button,
+.server-page-footer > button {
+  min-height: 32px;
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 11px;
+  color: var(--ink-soft);
+  background: var(--panel-control);
+  font-size: 11px;
+  font-weight: 610;
+}
+.server-row-actions > button:hover { border-color: var(--line-strong); background: var(--surface-hover); }
+.server-model-control > strong {
+  overflow: hidden;
+  max-width: min(28vw, 300px);
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 610;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.server-wide-input { width: min(32vw, 360px); }
+.server-number-input { width: 96px; text-align: right; }
+.server-managed-value { color: var(--muted); font-size: 11px; }
+.server-unit-value,
+.server-input-unit { display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
+.server-unit-value strong { color: var(--ink-soft); font: 610 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.server-unit-value span,
+.server-input-unit span { color: var(--muted); font-size: 11px; }
+.server-prompt-input { width: min(36vw, 410px); resize: vertical; line-height: 1.45; }
+.server-temperature-control { display: flex; align-items: center; gap: 12px; }
+.server-temperature-control input { width: min(20vw, 190px); accent-color: var(--accent); }
+.server-temperature-control strong { width: 42px; color: var(--ink-soft); font: 610 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; }
+.server-page-footer { display: flex; align-items: center; justify-content: flex-end; gap: 14px; margin-top: 18px; }
+.server-page-footer > span { color: var(--muted-light); font-size: 11px; }
+.server-page-footer > button.primary { border-color: var(--accent); color: var(--on-accent); background: var(--accent); font-weight: 700; }

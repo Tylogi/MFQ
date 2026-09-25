@@ -1,0 +1,39 @@
+/* 基础元素重置、字体和交互默认样式。 */
+/* ---------- Base ---------- */
+
+* { box-sizing: border-box; }
+html, body, #root { min-width: 320px; min-height: 100%; margin: 0; }
+body { overflow: hidden; }
+button, input, textarea, select { font: inherit; }
+button { cursor: pointer; }
+button:not(:disabled):active { opacity: 0.8; }
+button:disabled { cursor: not-allowed; opacity: 0.45; }
+button, input, textarea, select {
+  transition: border-color 130ms ease, background-color 130ms ease, color 130ms ease,
+    box-shadow 130ms ease;
+}
+button:focus-visible, input:focus-visible, textarea:focus-visible,
+select:focus-visible, summary:focus-visible {
+  outline: 2px solid rgb(10 132 255 / 42%);
+  outline-offset: 2px;
+}
+::selection { color: #fff; background: #0a84ff; }
+* { scrollbar-width: thin; scrollbar-color: var(--scrollbar) transparent; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+
+.ui-icon {
+  display: block;
+  flex: 0 0 auto;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}

@@ -1,9 +1,15 @@
-import { Component, StrictMode, type ErrorInfo, type ReactNode } from "react";
-import { createRoot } from "react-dom/client";
-import "katex/dist/katex.min.css";
+/**
+ * MFQ Studio Web 与 Tauri 共用的 React 启动入口，负责路由和顶层错误隔离。
+ */
 
-import App from "./App";
-import "./styles.css";
+import { Component, StrictMode, type ErrorInfo, type ReactNode } from 'react';
+import { createRoot } from 'react-dom/client';
+import { createBrowserRouter, createHashRouter, RouterProvider } from 'react-router';
+
+import App from './App';
+import { FailureView } from './app/FailurePage';
+import { isStudio } from './studio';
+import './styles.css';
 
 interface AppErrorBoundaryState {
   error: Error | null;
@@ -24,29 +30,43 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, AppErrorBounda
     if (!this.state.error) return this.props.children;
     const chinese = navigator.language.toLowerCase().startsWith("zh");
     return (
-      <main className="fatal-error" role="alert">
-        <section>
-          <p className="eyebrow">MFQ STUDIO</p>
-          <h1>{chinese ? "界面遇到错误" : "The interface hit an error"}</h1>
-          <p>
-            {chinese
-              ? "模型服务仍在运行。重新载入界面通常可以恢复；下面的信息可用于定位问题。"
-              : "The model service is still running. Reloading the interface usually recovers it; the detail below helps diagnose the problem."}
-          </p>
-          <pre>{this.state.error.message || this.state.error.name}</pre>
-          <button onClick={() => window.location.reload()} type="button">
-            {chinese ? "重新载入" : "Reload"}
-          </button>
-        </section>
+      <main className="fatal-workspace">
+        <FailureView
+          code="APP / 03"
+          description={chinese
+            ? '应用界面遇到了意外问题。服务可能仍在运行，可以重新载入界面后继续。'
+            : 'The interface encountered an unexpected problem. The service may still be running; reload to continue.'}
+          detail={this.state.error.message || this.state.error.name}
+          detailLabel={chinese ? '查看错误详情' : 'View error details'}
+          kind="render"
+          leaveLabel={chinese ? '返回概览' : 'Back to overview'}
+          onLeave={() => window.location.assign(isStudio() ? '#/' : '/')}
+          onRetry={() => window.location.reload()}
+          retryLabel={chinese ? '重新载入' : 'Reload'}
+          title={chinese ? '界面暂时无法显示' : 'Interface unavailable'}
+        />
       </main>
     );
   }
 }
 
-createRoot(document.getElementById("root")!).render(
+// 浏览器清理旧版根路径哈希链接；桌面打包资源仍使用哈希路由。
+if (!isStudio() && window.location.pathname === '/' && window.location.hash.startsWith('#/')) {
+  window.history.replaceState(window.history.state, '', window.location.hash.slice(1));
+}
+
+const createRouter = isStudio() ? createHashRouter : createBrowserRouter;
+const router = createRouter([
+  {
+    path: '*',
+    element: <App />,
+  },
+]);
+
+createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <AppErrorBoundary>
-      <App />
+      <RouterProvider router={router} />
     </AppErrorBoundary>
   </StrictMode>,
 );

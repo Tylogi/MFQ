@@ -1,3 +1,5 @@
+"""提供 MiniCPM-o 实时音频网关、后端代理与前端页面服务。"""
+
 from __future__ import annotations
 
 import argparse
@@ -819,8 +821,9 @@ class RealtimeGateway:
 def build_app(gateway: RealtimeGateway, web_root: Path | None = None) -> Any:
     import httpx
     from fastapi import FastAPI
-    from fastapi.staticfiles import StaticFiles
     from starlette.background import BackgroundTask
+
+    from mfq.server.api.static import SPAStaticFiles
 
     root = (web_root or DEFAULT_WEB_ROOT).resolve()
     if not (root / "index.html").is_file():
@@ -908,7 +911,7 @@ def build_app(gateway: RealtimeGateway, web_root: Path | None = None) -> Any:
             except Exception:
                 pass
 
-    app.mount("/", StaticFiles(directory=root, html=True), name="web")
+    app.mount("/", SPAStaticFiles(directory=root, html=True), name="web")
     return app
 
 

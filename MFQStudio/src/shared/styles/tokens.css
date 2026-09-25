@@ -1,0 +1,141 @@
+/* 全局明暗主题设计变量与色彩令牌。 */
+/* ---------- Design tokens ---------- */
+
+:root {
+  color: var(--ink);
+  background: var(--canvas);
+  color-scheme: light;
+  font-family: "SF Pro Text", "SF Pro Display", -apple-system, BlinkMacSystemFont,
+    "PingFang SC", "Noto Sans SC", "Segoe UI", sans-serif;
+  font-size: 14px;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+
+  --ink: #202122;
+  --ink-strong: #111213;
+  --ink-soft: #454748;
+  --muted: #5f6264;
+  --muted-light: #6c6f71;
+  --line: rgb(32 34 35 / 12%);
+  --line-strong: rgb(32 34 35 / 18%);
+  --line-soft: rgb(32 34 35 / 8%);
+  --canvas: #f4f4f5;
+  --surface: #ffffff;
+  --surface-control: #fbfbfc;
+  --surface-subtle: #f0f0f1;
+  --surface-hover: #e9e9eb;
+  --surface-active: #e4e4e6;
+  --surface-inset: #eeeeef;
+  --surface-overlay: rgb(247 247 248 / 92%);
+  --surface-user: rgb(32 34 35 / 9%);
+  --panel-surface: #ffffff;
+  --panel-control: rgb(32 34 35 / 3.5%);
+  --panel-line: rgb(32 34 35 / 8%);
+  --sidebar: rgb(238 238 240 / 94%);
+  --sidebar-surface: rgb(255 255 255 / 58%);
+  --sidebar-hover: rgb(32 34 35 / 7%);
+  --sidebar-line: rgb(32 34 35 / 10%);
+  --accent: #087cff;
+  --accent-hover: #0068df;
+  --accent-soft: rgb(8 124 255 / 11%);
+  --accent-border: rgb(8 124 255 / 28%);
+  --accent-ink: #0067d8;
+  --on-accent: #ffffff;
+  --warning: #9e6900;
+  --warning-soft: rgb(158 105 0 / 11%);
+  --success: #147a43;
+  --success-soft: rgb(20 122 67 / 11%);
+  --danger: #b5322d;
+  --danger-soft: rgb(181 50 45 / 9%);
+  --scrollbar: rgb(32 34 35 / 24%);
+  --shadow-sm: 0 1px 1px rgb(0 0 0 / 2%), 0 5px 15px rgb(0 0 0 / 3%);
+  --shadow-md: 0 28px 80px rgb(0 0 0 / 18%);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --ink: #f0f1f1;
+  --ink-strong: #ffffff;
+  --ink-soft: #ced0d0;
+  --muted: #999d9e;
+  --muted-light: #8d9293;
+  --line: rgb(240 243 243 / 12%);
+  --line-strong: rgb(240 243 243 / 18%);
+  --line-soft: rgb(240 243 243 / 7%);
+  --canvas: #181a1a;
+  --surface: #232525;
+  --surface-control: #292b2b;
+  --surface-subtle: #272929;
+  --surface-hover: #303333;
+  --surface-active: #343737;
+  --surface-inset: #141616;
+  --surface-overlay: rgb(24 26 26 / 92%);
+  --surface-user: rgb(240 243 243 / 9%);
+  --panel-surface: #232525;
+  --panel-control: rgb(240 243 243 / 3.5%);
+  --panel-line: rgb(240 243 243 / 8%);
+  --sidebar: rgb(20 22 22 / 96%);
+  --sidebar-surface: rgb(240 243 243 / 5%);
+  --sidebar-hover: rgb(240 243 243 / 8%);
+  --sidebar-line: rgb(240 243 243 / 10%);
+  --accent: #0a84ff;
+  --accent-hover: #409cff;
+  --accent-soft: rgb(10 132 255 / 18%);
+  --accent-border: rgb(10 132 255 / 40%);
+  --accent-ink: #65adff;
+  --on-accent: #ffffff;
+  --warning: #ffc747;
+  --warning-soft: rgb(255 199 71 / 12%);
+  --success: #57d184;
+  --success-soft: rgb(87 209 132 / 12%);
+  --danger: #ff7169;
+  --danger-soft: rgb(255 113 105 / 11%);
+  --scrollbar: rgb(240 243 243 / 22%);
+  --shadow-sm: 0 1px 0 rgb(255 255 255 / 3%), 0 10px 28px rgb(0 0 0 / 16%);
+  --shadow-md: 0 28px 80px rgb(0 0 0 / 40%);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"] {
+    color-scheme: dark;
+    --ink: #f0f1f1;
+    --ink-strong: #ffffff;
+    --ink-soft: #ced0d0;
+    --muted: #999d9e;
+    --muted-light: #8d9293;
+    --line: rgb(240 243 243 / 12%);
+    --line-strong: rgb(240 243 243 / 18%);
+    --line-soft: rgb(240 243 243 / 7%);
+    --canvas: #181a1a;
+    --surface: #232525;
+    --surface-control: #292b2b;
+    --surface-subtle: #272929;
+    --surface-hover: #303333;
+    --surface-active: #343737;
+    --surface-inset: #141616;
+    --surface-overlay: rgb(24 26 26 / 92%);
+    --surface-user: rgb(240 243 243 / 9%);
+    --panel-surface: #232525;
+    --panel-control: rgb(240 243 243 / 3.5%);
+    --panel-line: rgb(240 243 243 / 8%);
+      --sidebar: rgb(20 22 22 / 96%);
+    --sidebar-surface: rgb(240 243 243 / 5%);
+    --sidebar-hover: rgb(240 243 243 / 8%);
+    --sidebar-line: rgb(240 243 243 / 10%);
+    --accent: #0a84ff;
+    --accent-hover: #409cff;
+    --accent-soft: rgb(10 132 255 / 18%);
+    --accent-border: rgb(10 132 255 / 40%);
+    --accent-ink: #65adff;
+    --on-accent: #ffffff;
+    --warning: #ffc747;
+    --warning-soft: rgb(255 199 71 / 12%);
+    --success: #57d184;
+    --success-soft: rgb(87 209 132 / 12%);
+    --danger: #ff7169;
+    --danger-soft: rgb(255 113 105 / 11%);
+    --scrollbar: rgb(240 243 243 / 22%);
+    --shadow-sm: 0 1px 0 rgb(255 255 255 / 3%), 0 10px 28px rgb(0 0 0 / 16%);
+    --shadow-md: 0 28px 80px rgb(0 0 0 / 40%);
+  }
+}

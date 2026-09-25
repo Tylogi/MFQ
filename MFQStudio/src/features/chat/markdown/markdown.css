@@ -1,0 +1,150 @@
+/* 聊天消息中的代码块与 Prism 语法高亮。 */
+.rich-text pre.code-block,
+.rich-text pre[class*="language-"] {
+  position: relative;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 34px 14px 14px;
+  color: var(--ink);
+  background: var(--surface-inset);
+  font-family: "SFMono-Regular", "Cascadia Code", Menlo, Monaco, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.6;
+  tab-size: 2;
+}
+
+.rich-text pre.code-block code,
+.rich-text pre[class*="language-"] code {
+  border: 0;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  font-family: inherit;
+  font-size: inherit;
+}
+
+.rich-text pre .code-header {
+  position: absolute;
+  top: 6px;
+  left: 12px;
+  right: 7px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.rich-text pre .code-lang {
+  font-family: "SFMono-Regular", "Cascadia Code", Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  user-select: none;
+}
+
+.rich-text pre .code-copy {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 22px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  padding: 2px 8px;
+  color: var(--muted);
+  background: var(--surface-subtle);
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: color 120ms ease, background 120ms ease, border-color 120ms ease;
+}
+
+.rich-text pre .code-copy:hover {
+  border-color: var(--line-strong);
+  color: var(--ink);
+  background: var(--surface-hover);
+}
+
+.rich-text pre .code-copy.copied {
+  border-color: var(--success);
+  color: var(--success);
+  background: var(--success-soft);
+}
+
+/* Prism syntax highlighting tokens */
+.rich-text .token.comment,
+.rich-text .token.prolog,
+.rich-text .token.doctype,
+.rich-text .token.cdata {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.rich-text .token.punctuation {
+  color: var(--muted-light);
+}
+
+.rich-text .token.namespace {
+  opacity: 0.7;
+}
+
+.rich-text .token.property,
+.rich-text .token.tag,
+.rich-text .token.boolean,
+.rich-text .token.number,
+.rich-text .token.constant,
+.rich-text .token.symbol,
+.rich-text .token.deleted {
+  color: var(--warning);
+}
+
+.rich-text .token.selector,
+.rich-text .token.attr-name,
+.rich-text .token.string,
+.rich-text .token.char,
+.rich-text .token.builtin,
+.rich-text .token.inserted {
+  color: var(--success);
+}
+
+.rich-text .token.operator,
+.rich-text .token.entity,
+.rich-text .token.url {
+  color: var(--ink-soft);
+}
+
+.rich-text .token.atrule,
+.rich-text .token.attr-value,
+.rich-text .token.keyword {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.rich-text .token.function,
+.rich-text .token.class-name {
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+
+.rich-text .token.regex,
+.rich-text .token.important,
+.rich-text .token.variable {
+  color: var(--accent-hover);
+}
+
+.rich-text .token.important,
+.rich-text .token.bold {
+  font-weight: 700;
+}
+
+.rich-text .token.italic {
+  font-style: italic;
+}
+
+.rich-text .token.entity {
+  cursor: help;
+}

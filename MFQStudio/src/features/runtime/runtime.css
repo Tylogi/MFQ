@@ -1,0 +1,114 @@
+/* 运行时概览、指标与模型状态展示。 */
+/* ---------- Overview page ---------- */
+
+.tm-panel.runtime-hero {
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 18px;
+  padding: 20px;
+}
+.runtime-hero-copy { display: grid; min-width: 0; gap: 5px; }
+.runtime-hero-copy > div { display: flex; min-width: 0; align-items: center; gap: 9px; }
+.runtime-hero h2 { overflow: hidden; margin: 0; color: var(--ink-strong); font-size: 18px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.runtime-hero-copy > p.runtime-endpoint {
+  margin: 0;
+  color: var(--muted);
+  font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.runtime-hero-copy > small { color: var(--muted-light); font-size: 11px; line-height: 1.5; }
+.runtime-hero-actions { display: flex; gap: 8px; }
+.runtime-hero-actions button {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 7px 12px;
+  color: var(--ink-soft);
+  background: var(--surface);
+  font-size: 11px;
+  font-weight: 590;
+  box-shadow: none;
+}
+.runtime-hero-actions button:hover { border-color: var(--line-strong); background: var(--surface-hover); }
+.runtime-hero-actions button.primary { border-color: var(--accent); color: var(--on-accent); background: var(--accent); font-weight: 700; }
+.runtime-hero-actions button.primary:hover { border-color: var(--accent-hover); background: var(--accent-hover); }
+
+.overview-models-panel { padding: 11px; }
+.overview-model-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 8px; }
+.overview-model-card {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 11px;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  padding: 10px;
+  color: var(--ink-soft);
+  background: var(--panel-control);
+  text-align: left;
+}
+.overview-model-card:hover { border-color: var(--line-strong); background: var(--surface-hover); }
+.overview-model-card.selected { border-color: var(--accent-border); background: var(--accent-soft); }
+.overview-model-card:disabled { cursor: default; opacity: 1; }
+.overview-model-card > .model-monogram { width: 42px; height: 42px; border-radius: 11px; font-size: 20px; }
+.overview-model-copy { display: grid; min-width: 0; gap: 3px; }
+.overview-model-card strong { overflow: hidden; color: var(--ink-strong); font-size: 12px; font-weight: 640; text-overflow: ellipsis; white-space: nowrap; }
+.overview-model-card small { overflow: hidden; color: var(--muted); font-size: 10.5px; text-overflow: ellipsis; white-space: nowrap; }
+
+.overview-memory-panel { padding: 19px; }
+.overview-memory-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
+.overview-memory-heading h2,
+.overview-panel-title h2 { margin: 0; color: var(--ink-soft); font-size: 15px; font-weight: 640; line-height: 1.35; }
+.overview-memory-heading p { margin: 5px 0 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
+.overview-memory-heading > strong { color: var(--ink-soft); font: 600 14px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+.overview-memory-bars { margin-top: 19px; }
+.overview-memory-bars .usage-bar:nth-child(2) .usage-bar-track i { background: var(--muted); }
+.overview-memory-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 24px;
+  border-top: 1px solid var(--line-soft);
+  margin-top: 19px;
+  padding-top: 14px;
+}
+.overview-memory-facts span { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+.overview-memory-facts .ui-icon { color: var(--muted-light); }
+
+.overview-footer-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 14px; }
+.overview-endpoint-panel,
+.overview-session-panel { display: grid; align-content: start; gap: 15px; min-height: 158px; }
+.overview-panel-title { display: flex; min-width: 0; align-items: center; gap: 8px; }
+.overview-panel-title > .ui-icon { flex: 0 0 auto; color: var(--accent); }
+.overview-panel-title > button {
+  display: grid;
+  width: 27px;
+  height: 27px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  margin-left: auto;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+}
+.overview-panel-title > button:hover { color: var(--ink); background: var(--surface-hover); }
+.overview-panel-title > button.copied { color: var(--success); }
+.overview-panel-title > span { margin-left: auto; color: var(--muted); font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.overview-endpoint-panel > code {
+  overflow: hidden;
+  color: var(--ink-soft);
+  font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+}
+.overview-endpoint-panel > p,
+.overview-session-panel > p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
+.overview-session-stats { display: flex; gap: 32px; }
+.overview-session-stats > div { display: grid; gap: 3px; }
+.overview-session-stats strong { color: var(--ink-soft); font: 600 15px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.overview-session-stats small { color: var(--muted-light); font-size: 11px; line-height: 1.4; }
