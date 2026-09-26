@@ -903,6 +903,148 @@ __global__ void __launch_bounds__(256) fp8_128_sq_q8_m5_kernel(
     }
 }
 
+__device__ __forceinline__ void accumulate_pair(
+        const float4& gate_weight,
+        const float4& up_weight,
+        const float4& activation,
+        float& gate,
+        float& up) {
+    gate = fmaf(gate_weight.x, activation.x, gate);
+    up = fmaf(up_weight.x, activation.x, up);
+    gate = fmaf(gate_weight.y, activation.y, gate);
+    up = fmaf(up_weight.y, activation.y, up);
+    gate = fmaf(gate_weight.z, activation.z, gate);
+    up = fmaf(up_weight.z, activation.z, up);
+    gate = fmaf(gate_weight.w, activation.w, gate);
+    up = fmaf(up_weight.w, activation.w, up);
+}
+
+template <bool BF16_SCALE>
+__global__ void __launch_bounds__(128) fp8_128_sq_swiglu_m5_kernel(
+        const std::uint8_t* __restrict__ gate_blob,
+        const std::uint8_t* __restrict__ gate_row_q,
+        const std::int32_t* __restrict__ gate_row_symbol_byte_offsets,
+        const std::uint8_t* __restrict__ up_blob,
+        const std::uint8_t* __restrict__ up_row_q,
+        const std::int32_t* __restrict__ up_row_symbol_byte_offsets,
+        const __half* __restrict__ input,
+        __half* __restrict__ output,
+        Layout gate_layout,
+        Layout up_layout) {
+    constexpr int group_size = 16;
+    constexpr int values_per_lane = 8;
+    constexpr int outputs_per_block = 8;
+    const int warp_lane = static_cast<int>(threadIdx.x) & 31;
+    const int lane = warp_lane & (group_size - 1);
+    const unsigned group_mask =
+        0xffffu << (warp_lane / group_size) * group_size;
+    const int output_row = static_cast<int>(blockIdx.x) * outputs_per_block +
+        static_cast<int>(threadIdx.x) / group_size;
+    if (output_row >= gate_layout.outputs) return;
+
+    float gate_accumulators[5] = {};
+    float up_accumulators[5] = {};
+    if (gate_row_q[output_row] == 8 && up_row_q[output_row] == 8) {
+        const auto* gate_symbols = gate_blob + gate_layout.symbols +
+            static_cast<std::size_t>(
+                gate_row_symbol_byte_offsets[output_row]);
+        const auto* up_symbols = up_blob + up_layout.symbols +
+            static_cast<std::size_t>(
+                up_row_symbol_byte_offsets[output_row]);
+#pragma unroll 4
+        for (int block_column = 0;
+             block_column < gate_layout.width;
+             block_column += 128) {
+            float gate_scale = lane == 0
+                ? (BF16_SCALE
+                    ? decode_bf16_block_scale(
+                        gate_blob, gate_layout, output_row, block_column)
+                    : decode_scale<false>(
+                        gate_blob, gate_layout, output_row, block_column))
+                : 0.0f;
+            float up_scale = lane == 0
+                ? (BF16_SCALE
+                    ? decode_bf16_block_scale(
+                        up_blob, up_layout, output_row, block_column)
+                    : decode_scale<false>(
+                        up_blob, up_layout, output_row, block_column))
+                : 0.0f;
+            gate_scale = __shfl_sync(
+                group_mask, gate_scale, 0, group_size);
+            up_scale = __shfl_sync(group_mask, up_scale, 0, group_size);
+            const int column = block_column + lane * values_per_lane;
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int current = column + half * 4;
+                const float4 gate_decoded = decode_e4m3fn4(
+                    load_u32(gate_symbols + current));
+                const float4 up_decoded = decode_e4m3fn4(
+                    load_u32(up_symbols + current));
+                const float4 gate_weight = make_float4(
+                    gate_decoded.x * gate_scale,
+                    gate_decoded.y * gate_scale,
+                    gate_decoded.z * gate_scale,
+                    gate_decoded.w * gate_scale);
+                const float4 up_weight = make_float4(
+                    up_decoded.x * up_scale,
+                    up_decoded.y * up_scale,
+                    up_decoded.z * up_scale,
+                    up_decoded.w * up_scale);
+#pragma unroll
+                for (int item = 0; item < 5; ++item) {
+                    const float4 activation = load_activation4(
+                        input + static_cast<std::size_t>(item) *
+                            gate_layout.width + current);
+                    accumulate_pair(
+                        gate_weight, up_weight, activation,
+                        gate_accumulators[item], up_accumulators[item]);
+                }
+            }
+        }
+    } else {
+        for (int column = lane;
+             column < gate_layout.width;
+             column += group_size) {
+            const float gate_weight = decode_weight<false>(
+                gate_blob, gate_row_q, gate_row_symbol_byte_offsets,
+                gate_layout, output_row, column);
+            const float up_weight = decode_weight<false>(
+                up_blob, up_row_q, up_row_symbol_byte_offsets,
+                up_layout, output_row, column);
+#pragma unroll
+            for (int item = 0; item < 5; ++item) {
+                const float activation = __half2float(input[
+                    static_cast<std::size_t>(item) * gate_layout.width +
+                    column]);
+                gate_accumulators[item] = fmaf(
+                    gate_weight, activation, gate_accumulators[item]);
+                up_accumulators[item] = fmaf(
+                    up_weight, activation, up_accumulators[item]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int item = 0; item < 5; ++item) {
+#pragma unroll
+        for (int delta = group_size / 2; delta > 0; delta >>= 1) {
+            gate_accumulators[item] += __shfl_down_sync(
+                group_mask, gate_accumulators[item], delta, group_size);
+            up_accumulators[item] += __shfl_down_sync(
+                group_mask, up_accumulators[item], delta, group_size);
+        }
+        if (lane == 0) {
+            const float gate = __half2float(
+                __float2half_rn(gate_accumulators[item]));
+            const float up = __half2float(
+                __float2half_rn(up_accumulators[item]));
+            output[static_cast<std::size_t>(item) * gate_layout.outputs +
+                output_row] = __float2half_rn(
+                    (gate / (1.0f + expf(-gate))) * up);
+        }
+    }
+}
+
 void validate_metadata(
         const mfq_tensor_backend::Tensor& blob,
         const mfq_tensor_backend::Tensor& row_q,
@@ -1400,6 +1542,64 @@ mfq_tensor_backend::Tensor matmul(
     return output;
 }
 
+mfq_tensor_backend::Tensor swiglu_m5(
+        mfq_tensor_backend::Tensor gate_blob,
+        mfq_tensor_backend::Tensor gate_row_q,
+        mfq_tensor_backend::Tensor gate_row_symbol_byte_offsets,
+        mfq_tensor_backend::Tensor up_blob,
+        mfq_tensor_backend::Tensor up_row_q,
+        mfq_tensor_backend::Tensor up_row_symbol_byte_offsets,
+        mfq_tensor_backend::Tensor input,
+        Layout gate_layout,
+        Layout up_layout) {
+    validate_metadata(
+        gate_blob, gate_row_q, gate_row_symbol_byte_offsets,
+        gate_layout, false);
+    validate_metadata(
+        up_blob, up_row_q, up_row_symbol_byte_offsets,
+        up_layout, false);
+    MFQ_RUNTIME_CHECK(
+        gate_layout.outputs == up_layout.outputs &&
+        gate_layout.width == up_layout.width &&
+        gate_layout.scale_kind == up_layout.scale_kind &&
+        input.is_cuda() && input.get_device() == gate_blob.get_device() &&
+        up_blob.get_device() == gate_blob.get_device() &&
+        input.dim() == 2 && input.is_contiguous() && input.size(0) == 5 &&
+        input.size(1) == gate_layout.width &&
+        input.scalar_type() == mfq_tensor_backend::kFloat16,
+        "FP8-128SQ SwiGLU M=5 requires compatible weights and FP16 input");
+    const MfqCudaGuard guard(gate_blob.device());
+    auto output = mfq_tensor_backend::empty(
+        {5, gate_layout.outputs}, input.options());
+    const int blocks = (gate_layout.outputs + 7) / 8;
+    const auto stream = mfq_current_cuda_stream();
+    if (gate_layout.scale_kind == 2) {
+        fp8_128_sq_swiglu_m5_kernel<true><<<blocks, 128, 0, stream>>>(
+            gate_blob.data_ptr<std::uint8_t>(),
+            gate_row_q.data_ptr<std::uint8_t>(),
+            gate_row_symbol_byte_offsets.data_ptr<std::int32_t>(),
+            up_blob.data_ptr<std::uint8_t>(),
+            up_row_q.data_ptr<std::uint8_t>(),
+            up_row_symbol_byte_offsets.data_ptr<std::int32_t>(),
+            reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),
+            reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
+            gate_layout, up_layout);
+    } else {
+        fp8_128_sq_swiglu_m5_kernel<false><<<blocks, 128, 0, stream>>>(
+            gate_blob.data_ptr<std::uint8_t>(),
+            gate_row_q.data_ptr<std::uint8_t>(),
+            gate_row_symbol_byte_offsets.data_ptr<std::int32_t>(),
+            up_blob.data_ptr<std::uint8_t>(),
+            up_row_q.data_ptr<std::uint8_t>(),
+            up_row_symbol_byte_offsets.data_ptr<std::int32_t>(),
+            reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),
+            reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
+            gate_layout, up_layout);
+    }
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
 template <bool MXFP8>
 void routed_matmul(
         mfq_tensor_backend::Tensor blob,
@@ -1562,6 +1762,37 @@ mfq_tensor_backend::Tensor fp8_128_sq_matmul_cuda(
         make_layout(outputs, width, 128, 128,
                     (outputs + 127) / 128, (width + 127) / 128,
                     scale_kind, palettes_offset, symbols_offset, scales_offset));
+}
+
+mfq_tensor_backend::Tensor fp8_128_sq_swiglu_m5_cuda(
+        mfq_tensor_backend::Tensor gate_blob,
+        mfq_tensor_backend::Tensor gate_row_q,
+        mfq_tensor_backend::Tensor gate_row_symbol_byte_offsets,
+        mfq_tensor_backend::Tensor up_blob,
+        mfq_tensor_backend::Tensor up_row_q,
+        mfq_tensor_backend::Tensor up_row_symbol_byte_offsets,
+        mfq_tensor_backend::Tensor input,
+        std::int64_t outputs, std::int64_t width,
+        std::int64_t scale_kind,
+        std::int64_t gate_palettes_offset,
+        std::int64_t gate_symbols_offset,
+        std::int64_t gate_scales_offset,
+        std::int64_t up_palettes_offset,
+        std::int64_t up_symbols_offset,
+        std::int64_t up_scales_offset) {
+    return swiglu_m5(
+        std::move(gate_blob), std::move(gate_row_q),
+        std::move(gate_row_symbol_byte_offsets),
+        std::move(up_blob), std::move(up_row_q),
+        std::move(up_row_symbol_byte_offsets), std::move(input),
+        make_layout(outputs, width, 128, 128,
+                    (outputs + 127) / 128, (width + 127) / 128,
+                    scale_kind, gate_palettes_offset,
+                    gate_symbols_offset, gate_scales_offset),
+        make_layout(outputs, width, 128, 128,
+                    (outputs + 127) / 128, (width + 127) / 128,
+                    scale_kind, up_palettes_offset,
+                    up_symbols_offset, up_scales_offset));
 }
 
 mfq_tensor_backend::Tensor mxfp8_sq_backward_input_cuda(
