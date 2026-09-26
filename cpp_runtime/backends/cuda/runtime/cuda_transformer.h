@@ -1071,7 +1071,6 @@ struct FFN {
         const char* disable_swiglu = std::getenv("MFQ_DISABLE_FFN_SWIGLU_FUSION");
         if ((disable_swiglu == nullptr || disable_swiglu[0] != '1') &&
             xh.numel() / xh.size(-1) >= 1 && xh.numel() / xh.size(-1) <= 6 &&
-            gate_up.nint_grouped && gate_up.nint.split_w.empty() &&
             gate_up.outs.size() == 2 && gate_up.outs[0] == gate_up.outs[1]) {
             auto act = g_profiler.measure("ffn.gate_up_swiglu", [&]() { return gate_up.forward_swiglu(xh); });
             return g_profiler.measure("ffn.down", [&]() { return down.forward(act); });

@@ -113,6 +113,16 @@ __device__ __forceinline__ uint64_t unpack_nint_codes8_packed(
 }
 
 
+__device__ __forceinline__ int unpack_nint4_codes4(
+        uint32_t packed) {
+    return static_cast<int>(
+        (packed & 0x000fu) |
+        ((packed & 0x00f0u) << 4) |
+        ((packed & 0x0f00u) << 8) |
+        ((packed & 0xf000u) << 12));
+}
+
+
 __device__ __forceinline__ int load_i8x4(const int8_t * source) {
     const uint8_t * bytes = reinterpret_cast<const uint8_t *>(source);
     const uint32_t packed = static_cast<uint32_t>(bytes[0]) |
@@ -913,10 +923,147 @@ __device__ __forceinline__ void nint_matmul_routed_pair(
 }
 
 
-// One NINT compute kernel covers every q, k, group size, M<=8, and routed MFE
-// projection. q is row metadata; k has already been baked into the subgroup
-// metadata values. Routed execution changes only the indexing contract, not
-// the packed-weight compute kernel.
+// Decode M=1 one GS24 group per lane.  NINTv2 stores q rows in bit-width
+// cohorts, so row_q_bit_offsets remains the source of truth instead of a
+// presumed row stride.  Q4 gets fixed-width vector loads; adaptive rows keep
+// the canonical metadata-driven unpack.
+__global__ void __launch_bounds__(128) nint_matmul_m1_gs24_kernel(
+        const uint8_t * __restrict__ bitstream,
+        const uint8_t * __restrict__ row_q_bits,
+        const int64_t * __restrict__ row_q_bit_offsets,
+        const uint8_t * __restrict__ subgroup_scale,
+        const uint8_t * __restrict__ subgroup_minimum,
+        const float * __restrict__ neuron_scale,
+        const float * __restrict__ neuron_minimum,
+        const int8_t * __restrict__ activation,
+        const float * __restrict__ activation_scale,
+        __half * __restrict__ output,
+        int output_rows,
+        int groups) {
+    constexpr int group_size = 24;
+    constexpr int chunks = group_size / 4;
+    constexpr int warps_per_block = 4;
+    const int output_row = static_cast<int>(blockIdx.x);
+    const int lane = static_cast<int>(threadIdx.x);
+    const int warp = static_cast<int>(threadIdx.y);
+    if (output_row >= output_rows) {
+        return;
+    }
+
+    const int bits = static_cast<int>(row_q_bits[output_row]);
+    const uint64_t row_bit_offset = static_cast<uint64_t>(
+        row_q_bit_offsets[output_row]);
+    const bool q4 = bits == 4 && (row_bit_offset & 7u) == 0;
+    const bool vector_q4 = q4 && (row_bit_offset & 31u) == 0;
+    const uint8_t * scale_row = subgroup_scale +
+        static_cast<size_t>(output_row) * groups;
+    const uint8_t * minimum_row = subgroup_minimum +
+        static_cast<size_t>(output_row) * groups;
+    float dot_accumulator = 0.0f;
+    float minimum_accumulator = 0.0f;
+
+    for (int group = warp * 32 + lane;
+         group < groups;
+         group += warps_per_block * 32) {
+        int dot = 0;
+        int activation_sum = 0;
+        uint32_t qwords[3] = {};
+        const uint8_t * qgroup = nullptr;
+        if (q4) {
+            qgroup = bitstream + (row_bit_offset >> 3) +
+                static_cast<size_t>(group) * (group_size / 2);
+            if (vector_q4) {
+                const uint32_t * words =
+                    reinterpret_cast<const uint32_t *>(qgroup);
+                qwords[0] = words[0];
+                qwords[1] = words[1];
+                qwords[2] = words[2];
+            }
+        }
+#pragma unroll
+        for (int chunk = 0; chunk < chunks; ++chunk) {
+            const int column = group * group_size + chunk * 4;
+            const int activation_codes = load_i8x4(activation + column);
+            const int chunk_sum = __dp4a(
+                0x01010101, activation_codes, 0);
+            int weight_codes;
+            if (q4) {
+                uint32_t packed;
+                if (vector_q4) {
+                    packed = qwords[chunk >> 1] >> ((chunk & 1) * 16);
+                } else {
+                    const uint8_t * pair = qgroup + chunk * 2;
+                    packed = static_cast<uint32_t>(pair[0]) |
+                        (static_cast<uint32_t>(pair[1]) << 8);
+                }
+                weight_codes = unpack_nint4_codes4(packed);
+            } else {
+                const uint64_t bit_offset = row_bit_offset +
+                    static_cast<uint64_t>(column) *
+                        static_cast<uint64_t>(bits);
+                weight_codes = unpack_nint_codes4(
+                    bitstream, bit_offset, bits);
+            }
+            dot += bits == 8
+                ? __dp4a(
+                      weight_codes ^ static_cast<int>(0x80808080u),
+                      activation_codes,
+                      0) + 128 * chunk_sum
+                : __dp4a(weight_codes, activation_codes, 0);
+            activation_sum += chunk_sum;
+        }
+        const float input_scale = activation_scale[group];
+        dot_accumulator = fmaf(
+            input_scale * static_cast<float>(scale_row[group]),
+            static_cast<float>(dot),
+            dot_accumulator);
+        minimum_accumulator = fmaf(
+            input_scale * static_cast<float>(minimum_row[group]),
+            static_cast<float>(activation_sum),
+            minimum_accumulator);
+    }
+
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        dot_accumulator += __shfl_xor_sync(
+            0xffffffffu, dot_accumulator, offset);
+        minimum_accumulator += __shfl_xor_sync(
+            0xffffffffu, minimum_accumulator, offset);
+    }
+    __shared__ float partial_dot[warps_per_block];
+    __shared__ float partial_minimum[warps_per_block];
+    if (lane == 0) {
+        partial_dot[warp] = dot_accumulator;
+        partial_minimum[warp] = minimum_accumulator;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        dot_accumulator = lane < warps_per_block
+            ? partial_dot[lane]
+            : 0.0f;
+        minimum_accumulator = lane < warps_per_block
+            ? partial_minimum[lane]
+            : 0.0f;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            dot_accumulator += __shfl_xor_sync(
+                0xffffffffu, dot_accumulator, offset);
+            minimum_accumulator += __shfl_xor_sync(
+                0xffffffffu, minimum_accumulator, offset);
+        }
+        if (lane == 0) {
+            output[output_row] = __float2half_rn(
+                neuron_scale[output_row] * dot_accumulator -
+                neuron_minimum[output_row] * minimum_accumulator);
+        }
+    }
+}
+
+
+// One generic NINT compute kernel covers every q, k, group size, M<=8, and
+// routed MFE projection. q is row metadata; k has already been baked into the
+// subgroup metadata values. Routed execution changes only the indexing
+// contract, not the packed-weight compute kernel.
 __global__ void __launch_bounds__(128) nint_matmul_kernel(
         const uint8_t * __restrict__ bitstream,
         const uint8_t * __restrict__ row_q_bits,
@@ -1894,35 +2041,52 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
             groups,
             static_cast<int>(group_size),
             static_cast<int>(activation_mode));
-    nint_matmul_kernel<<<
-        dim3((output_rows + 3) / 4), dim3(32, 4), 0, stream>>>(
-            bitstream.data_ptr<uint8_t>(),
-            row_q_bits.data_ptr<uint8_t>(),
-            row_q_bit_offsets.data_ptr<int64_t>(),
-            subgroup_scale.data_ptr<uint8_t>(),
-            subgroup_minimum.data_ptr<uint8_t>(),
-            neuron_scale.data_ptr<float>(),
-            neuron_minimum.data_ptr<float>(),
-            quantized_input.data_ptr<int8_t>(),
-            input_scale.data_ptr<float>(),
-            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
-            activation_rows,
-            output_rows,
-            groups,
-            padded_width,
-            static_cast<int>(group_size),
-            nullptr,
-            nullptr,
-            nullptr,
-            nullptr,
-            nullptr,
-            nullptr,
-            0,
-            0,
-            0,
-            0,
-            0,
-            false);
+    if (activation_rows == 1 && group_size == 24) {
+        nint_matmul_m1_gs24_kernel<<<
+            output_rows, dim3(32, 4), 0, stream>>>(
+                bitstream.data_ptr<uint8_t>(),
+                row_q_bits.data_ptr<uint8_t>(),
+                row_q_bit_offsets.data_ptr<int64_t>(),
+                subgroup_scale.data_ptr<uint8_t>(),
+                subgroup_minimum.data_ptr<uint8_t>(),
+                neuron_scale.data_ptr<float>(),
+                neuron_minimum.data_ptr<float>(),
+                quantized_input.data_ptr<int8_t>(),
+                input_scale.data_ptr<float>(),
+                reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
+                output_rows,
+                groups);
+    } else {
+        nint_matmul_kernel<<<
+            dim3((output_rows + 3) / 4), dim3(32, 4), 0, stream>>>(
+                bitstream.data_ptr<uint8_t>(),
+                row_q_bits.data_ptr<uint8_t>(),
+                row_q_bit_offsets.data_ptr<int64_t>(),
+                subgroup_scale.data_ptr<uint8_t>(),
+                subgroup_minimum.data_ptr<uint8_t>(),
+                neuron_scale.data_ptr<float>(),
+                neuron_minimum.data_ptr<float>(),
+                quantized_input.data_ptr<int8_t>(),
+                input_scale.data_ptr<float>(),
+                reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
+                activation_rows,
+                output_rows,
+                groups,
+                padded_width,
+                static_cast<int>(group_size),
+                nullptr,
+                nullptr,
+                nullptr,
+                nullptr,
+                nullptr,
+                nullptr,
+                0,
+                0,
+                0,
+                0,
+                0,
+                false);
+    }
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }

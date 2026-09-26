@@ -61,13 +61,21 @@ class DepthController {
 public:
     explicit DepthController(int maximum_depth = 3)
         : maximum_depth_(std::clamp(maximum_depth, 1, kMaximumDraftDepth)),
-          current_depth_(maximum_depth_),
-          acceptance_(static_cast<std::size_t>(maximum_depth_), 0.6),
+          current_depth_(std::min(maximum_depth_, 4)),
+          acceptance_(
+              static_cast<std::size_t>(maximum_depth_), kInitialAcceptance),
           warmup_accepts_(static_cast<std::size_t>(maximum_depth_), 0),
           warmup_trials_(static_cast<std::size_t>(maximum_depth_), 0),
           cycle_ms_(static_cast<std::size_t>(maximum_depth_ + 1)),
           cycle_age_ms_(static_cast<std::size_t>(maximum_depth_ + 1)) {
-        warmup_.insert(warmup_.end(), {maximum_depth_, maximum_depth_});
+        warmup_.insert(
+            warmup_.end(), maximum_depth_ > current_depth_ ? 6 : 2,
+            current_depth_);
+        if (maximum_depth_ > 3) {
+            for (int depth = current_depth_ - 1; depth > 0; --depth) {
+                warmup_.push_back(depth);
+            }
+        }
         warmup_.insert(warmup_.end(), {0, 0, 0});
     }
 
@@ -89,8 +97,11 @@ public:
             if (!warmup_.empty()) {
                 warmup_accepts_[index] += hit > 0.0 ? 1 : 0;
                 ++warmup_trials_[index];
-                estimate = static_cast<double>(warmup_accepts_[index]) /
-                    static_cast<double>(warmup_trials_[index]);
+                estimate =
+                    (kInitialAcceptance * kAcceptancePriorTrials +
+                     static_cast<double>(warmup_accepts_[index])) /
+                    (kAcceptancePriorTrials +
+                     static_cast<double>(warmup_trials_[index]));
             } else {
                 estimate = (1.0 - kAcceptanceAlpha) * estimate +
                     kAcceptanceAlpha * hit;
@@ -158,10 +169,12 @@ public:
     }
 
 private:
+    static constexpr double kInitialAcceptance = 0.6;
+    static constexpr double kAcceptancePriorTrials = 4.0;
     static constexpr double kAcceptanceAlpha = 0.08;
     static constexpr double kTimeTauMs = 400.0;
-    static constexpr double kProbePeriodMs = 1000.0;
-    static constexpr double kExplorePeriodMs = 5000.0;
+    static constexpr double kProbePeriodMs = 5000.0;
+    static constexpr double kExplorePeriodMs = 15000.0;
     static constexpr int kProbeLength = 4;
     static constexpr double kProbeDuty = 0.15;
     static constexpr double kProbeMargin = 1.15;

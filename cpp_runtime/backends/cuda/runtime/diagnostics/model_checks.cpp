@@ -1225,6 +1225,7 @@ int run_linear_check(
     mfq_tensor_backend::Tensor ref_input = xh;
     if (gate_mode == 1) ref_input = xh * mfq_tensor_backend::sigmoid(gateh);
     else if (gate_mode == 2) ref_input = xh * mfq_tensor_backend::silu(gateh);
+    ref_input = ref_input.to(ww.scalar_type()).contiguous();
     auto y_ref = mfq_tensor_backend::matmul(ref_input, ww.transpose(0, 1)).to(mfq_tensor_backend::kFloat32);
     mfq_cuda_synchronize();
     auto diff = (y_test - y_ref).abs();

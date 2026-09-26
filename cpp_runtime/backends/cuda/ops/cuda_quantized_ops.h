@@ -1461,7 +1461,8 @@ struct QuantLinearGroup {
             throw std::runtime_error("SwiGLU requires equal gate/up output widths");
         }
         auto parts = forward(x);
-        return mfq_tensor_backend::silu(parts[0]) * parts[1];
+        return silu_mul_cuda(
+            parts[0].contiguous(), parts[1].contiguous());
     }
     mfq_tensor_backend::Tensor forward_geglu(mfq_tensor_backend::Tensor x) const {
         if (g_kl_mmq_mode == KlMmqMode::Default &&
