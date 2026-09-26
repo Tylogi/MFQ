@@ -8,6 +8,7 @@
 #include "models/qwen35/batch_executor.h"
 #include "causal_lm_loader.h"
 #include "models/components.h"
+#include "mtp_metrics.h"
 #include "text_session_cache.h"
 
 #include <cuda_runtime_api.h>
@@ -36,7 +37,8 @@ struct CudaEngineState {
             Model loaded_model,
             RuntimeComponents<Model> loaded_components,
             const CudaEngineOptions& options)
-        : model(std::move(loaded_model)),
+        : execution(cuda_execution_context()),
+          model(std::move(loaded_model)),
           components(std::move(loaded_components)),
           language(&components.language(model)),
           decode_graph(language->max_position_embeddings()),
@@ -81,6 +83,7 @@ struct CudaEngineState {
         }
     }
 
+    CudaExecutionContext& execution;
     mfq_tensor_backend::NoGradGuard no_grad;
     Model model;
     RuntimeComponents<Model> components;
@@ -91,52 +94,6 @@ struct CudaEngineState {
     std::unique_ptr<mfq::engine::ContinuousBatchExecutor> batch_executor;
     int64_t prefill_chunk_size = 2048;
 };
-
-void append_mtp_metrics(
-        std::vector<std::pair<std::string, double>>& result,
-        const mfq::engine::mtp::GenerationStats& stats) {
-    result.emplace_back("mtp_used", stats.used ? 1.0 : 0.0);
-    result.emplace_back(
-        "mtp_cycles", static_cast<double>(stats.cycles));
-    result.emplace_back(
-        "mtp_drafted_tokens",
-        static_cast<double>(stats.drafted_tokens));
-    result.emplace_back(
-        "mtp_accepted_tokens",
-        static_cast<double>(stats.accepted_tokens));
-    result.emplace_back(
-        "mtp_acceptance_rate",
-        stats.drafted_tokens == 0
-            ? 0.0
-            : static_cast<double>(stats.accepted_tokens) /
-                stats.drafted_tokens);
-    result.emplace_back(
-        "mtp_selected_depth",
-        static_cast<double>(stats.selected_depth));
-    for (std::size_t depth = 0;
-            depth < stats.depth_cycles.size(); ++depth) {
-        result.emplace_back(
-            "mtp_depth_" + std::to_string(depth) + "_cycles",
-            static_cast<double>(stats.depth_cycles[depth]));
-    }
-    for (std::size_t position = 0;
-            position < stats.position_drafted.size(); ++position) {
-        result.emplace_back(
-            "mtp_position_" + std::to_string(position + 1) +
-                "_acceptance_rate",
-            stats.position_drafted[position] == 0
-                ? 0.0
-                : static_cast<double>(
-                      stats.position_accepted[position]) /
-                      stats.position_drafted[position]);
-    }
-    for (std::size_t depth = 0;
-            depth < stats.measured_depth_ms.size(); ++depth) {
-        result.emplace_back(
-            "mtp_depth_" + std::to_string(depth) + "_cycle_ms",
-            stats.measured_depth_ms[depth]);
-    }
-}
 
 template <CudaBackbone Backbone>
 std::vector<std::pair<std::string, double>> engine_metrics(
@@ -164,7 +121,8 @@ std::vector<std::pair<std::string, double>> engine_metrics(
     };
     std::unique_lock lock(state->model_mutex, std::try_to_lock);
     if (mtp_available && lock.owns_lock() && state->components.mtp) {
-        append_mtp_metrics(result, state->components.mtp->last_stats);
+        mfq::engine::mtp::append_generation_metrics(
+            result, state->components.mtp->last_stats);
     }
     if (state->batch_executor) {
         auto batching = state->batch_executor->metrics();
@@ -222,7 +180,7 @@ CudaInferenceEngine make_cuda_inference_engine(
             cache_plan, token_constraint,
             state->batch_executor && media
                 ? nullptr : state->components.mtp.get(),
-            state->prefill_chunk_size, std::move(prepare));
+            state->prefill_chunk_size, std::move(prepare), cancelled);
     };
     engine.generate = [generate_request](
             const std::vector<int64_t>& prompt,

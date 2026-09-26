@@ -15,7 +15,6 @@ target_include_directories(mfq-runtime-communication
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
         ${PROJECT_SOURCE_DIR}/components/tokenizer
-        ${PROJECT_SOURCE_DIR}/components/tokenizer/src
 )
 target_link_libraries(mfq-runtime-communication
     PUBLIC

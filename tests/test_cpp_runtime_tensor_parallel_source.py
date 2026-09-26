@@ -76,7 +76,7 @@ def test_tensor_parallel_graph_capture_registers_all_participant_streams():
     assert "g_model_parallel_collectives.streams.begin()" in SOURCE
     assert "graph.compute_streams" in SOURCE
     assert "participant_streams" in SOURCE
-    assert "const bool graph_eligible" in SOURCE
+    assert "bool graph_eligible() const" in SOURCE
     assert "bool use_cuda_graph" in SOURCE
 
 

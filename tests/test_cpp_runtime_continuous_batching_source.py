@@ -7,15 +7,10 @@ DECODE = "\n".join(
     for path in sorted(CUDA_ROOT.rglob("*"))
     if path.suffix in {".h", ".cpp"}
 )
-BATCHING = (
-    ROOT
-    / "cpp_runtime"
-    / "backends"
-    / "cuda"
-    / "models"
-    / "qwen35"
-    / "batch_executor.h"
-).read_text(encoding="utf-8")
+BATCHING = "\n".join(
+    (CUDA_ROOT / "models" / "qwen35" / name).read_text(encoding="utf-8")
+    for name in ("batch_executor.h", "batch_executor.cpp")
+)
 COMMON_BATCHING = (
     ROOT / "cpp_runtime" / "engine" / "include" / "continuous_batching.h"
 ).read_text(encoding="utf-8")

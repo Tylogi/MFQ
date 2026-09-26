@@ -11,6 +11,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace mfq::engine::mtp {
@@ -358,6 +359,192 @@ inline std::vector<float> distribution(std::span<const float> logits,
     std::vector<float> probabilities(vocab, 0.f);
     for (int i = 0; i < keep; ++i) probabilities[order[i]] = static_cast<float>(masses[i] / kept_mass);
     return probabilities;
+}
+
+struct CompactDistribution {
+    std::vector<int32_t> tokens;
+    std::vector<float> probabilities;
+
+    float probability(int32_t token) const {
+        const auto found = std::lower_bound(tokens.begin(), tokens.end(), token);
+        return found == tokens.end() || *found != token
+            ? 0.0f
+            : probabilities[static_cast<std::size_t>(found - tokens.begin())];
+    }
+};
+
+inline void validate_compact_distribution(
+        const CompactDistribution& distribution) {
+    if (distribution.tokens.empty() ||
+            distribution.tokens.size() != distribution.probabilities.size() ||
+            !std::is_sorted(
+                distribution.tokens.begin(), distribution.tokens.end())) {
+        throw std::invalid_argument("invalid compact MTP distribution");
+    }
+    double total = 0.0;
+    for (const float probability : distribution.probabilities) {
+        if (!std::isfinite(probability) || probability < 0.0f) {
+            throw std::invalid_argument("invalid compact MTP probability");
+        }
+        total += probability;
+    }
+    if (std::abs(total - 1.0) > 1.0e-5) {
+        throw std::invalid_argument(
+            "compact MTP distribution is not normalized");
+    }
+}
+
+inline CompactDistribution compact_distribution_from_topk(
+        const float* values,
+        const int64_t* indices,
+        int count,
+        double temperature,
+        double top_p) {
+    if (count <= 0 || !std::isfinite(values[0]) ||
+            !std::isfinite(temperature) || temperature <= 0.0 ||
+            !std::isfinite(top_p) || top_p <= 0.0 || top_p > 1.0) {
+        throw std::invalid_argument("invalid compact MTP logits or sampling");
+    }
+    std::vector<double> masses(static_cast<std::size_t>(count));
+    double total = 0.0;
+    for (int index = 0; index < count; ++index) {
+        masses[static_cast<std::size_t>(index)] = std::exp(
+            (static_cast<double>(values[index]) - values[0]) / temperature);
+        total += masses[static_cast<std::size_t>(index)];
+    }
+    if (!(total > 0.0) || !std::isfinite(total)) {
+        throw std::invalid_argument("invalid compact MTP softmax mass");
+    }
+    int keep = count;
+    double kept_mass = total;
+    if (top_p < 1.0) {
+        kept_mass = 0.0;
+        for (int index = 0; index < count; ++index) {
+            kept_mass += masses[static_cast<std::size_t>(index)];
+            if (kept_mass >= top_p * total) {
+                keep = index + 1;
+                break;
+            }
+        }
+    }
+    std::vector<std::pair<int32_t, float>> entries;
+    entries.reserve(static_cast<std::size_t>(keep));
+    for (int index = 0; index < keep; ++index) {
+        entries.emplace_back(
+            static_cast<int32_t>(indices[index]),
+            static_cast<float>(
+                masses[static_cast<std::size_t>(index)] / kept_mass));
+    }
+    std::sort(entries.begin(), entries.end());
+    CompactDistribution result;
+    result.tokens.reserve(entries.size());
+    result.probabilities.reserve(entries.size());
+    for (const auto& [token, probability] : entries) {
+        result.tokens.push_back(token);
+        result.probabilities.push_back(probability);
+    }
+    validate_compact_distribution(result);
+    return result;
+}
+
+inline int32_t sample_compact(
+        const CompactDistribution& distribution, double uniform) {
+    validate_compact_distribution(distribution);
+    if (!std::isfinite(uniform)) {
+        throw std::invalid_argument("invalid compact MTP sampling uniform");
+    }
+    uniform = std::clamp(uniform, 0.0, std::nextafter(1.0, 0.0));
+    double cumulative = 0.0;
+    int32_t fallback = distribution.tokens.back();
+    for (std::size_t index = 0; index < distribution.tokens.size(); ++index) {
+        if (distribution.probabilities[index] <= 0.0f) continue;
+        fallback = distribution.tokens[index];
+        cumulative += distribution.probabilities[index];
+        if (uniform < cumulative) return fallback;
+    }
+    return fallback;
+}
+
+inline CompactDistribution positive_residual(
+        const CompactDistribution& target,
+        const CompactDistribution& proposal) {
+    validate_compact_distribution(target);
+    validate_compact_distribution(proposal);
+    CompactDistribution residual;
+    residual.tokens.reserve(target.tokens.size() + proposal.tokens.size());
+    residual.probabilities.reserve(residual.tokens.capacity());
+    std::size_t target_index = 0;
+    std::size_t proposal_index = 0;
+    double total = 0.0;
+    while (target_index < target.tokens.size() ||
+            proposal_index < proposal.tokens.size()) {
+        const int32_t token = proposal_index == proposal.tokens.size() ||
+                (target_index < target.tokens.size() &&
+                 target.tokens[target_index] < proposal.tokens[proposal_index])
+            ? target.tokens[target_index]
+            : proposal_index < proposal.tokens.size() &&
+                    (target_index == target.tokens.size() ||
+                     proposal.tokens[proposal_index] < target.tokens[target_index])
+                ? proposal.tokens[proposal_index]
+                : target.tokens[target_index];
+        const float probability = std::max(
+            0.0f, target.probability(token) - proposal.probability(token));
+        if (probability > 0.0f) {
+            residual.tokens.push_back(token);
+            residual.probabilities.push_back(probability);
+            total += probability;
+        }
+        if (target_index < target.tokens.size() &&
+                target.tokens[target_index] == token) {
+            ++target_index;
+        }
+        if (proposal_index < proposal.tokens.size() &&
+                proposal.tokens[proposal_index] == token) {
+            ++proposal_index;
+        }
+    }
+    if (!(total > 0.0) || !std::isfinite(total)) return target;
+    for (float& probability : residual.probabilities) {
+        probability = static_cast<float>(probability / total);
+    }
+    return residual;
+}
+
+inline ChainVerification verify_compact_chain(
+        std::span<const int32_t> drafts,
+        const std::vector<CompactDistribution>& proposals,
+        const std::vector<CompactDistribution>& targets,
+        std::span<const double> acceptance_uniforms,
+        double sample_uniform) {
+    if (drafts.empty() || proposals.size() != drafts.size() ||
+            targets.size() != drafts.size() + 1 ||
+            acceptance_uniforms.size() != drafts.size()) {
+        throw std::invalid_argument("compact MTP chain shapes are incompatible");
+    }
+    for (std::size_t position = 0; position < drafts.size(); ++position) {
+        validate_compact_distribution(proposals[position]);
+        validate_compact_distribution(targets[position]);
+        const double q = proposals[position].probability(drafts[position]);
+        const double p = targets[position].probability(drafts[position]);
+        if (!(q > 0.0) || !std::isfinite(acceptance_uniforms[position])) {
+            throw std::invalid_argument(
+                "compact MTP chain probability is invalid");
+        }
+        const double acceptance = std::min(1.0, p / q);
+        if (std::clamp(
+                acceptance_uniforms[position], 0.0,
+                std::nextafter(1.0, 0.0)) < acceptance) {
+            continue;
+        }
+        return {
+            position,
+            sample_compact(
+                positive_residual(targets[position], proposals[position]),
+                sample_uniform),
+            false};
+    }
+    return {
+        drafts.size(), sample_compact(targets.back(), sample_uniform), true};
 }
 
 inline void validate_distribution(std::span<const float> probabilities) {

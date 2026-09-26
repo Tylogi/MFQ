@@ -8,7 +8,7 @@
 
 class MoeExpertCache;
 
-extern std::shared_ptr<MoeExpertCache> g_moe_expert_cache;
+extern std::shared_ptr<MoeExpertCache>& g_moe_expert_cache;
 
 std::shared_ptr<MoeExpertCache> make_moe_expert_cache(std::int64_t bytes);
 bool moe_expert_cache_has_sources();

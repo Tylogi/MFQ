@@ -3,17 +3,16 @@
 #include "causal_lm.h"
 #include "mtp.h"
 #include "mfq_paged_prefix_cache.h"
+#include "paged_session_bindings.h"
 #include "session_snapshot_cache.h"
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
-#include <unordered_map>
 
 namespace mfq::cuda::internal {
 
@@ -158,13 +157,6 @@ make_cuda_paged_prefix_cache(
 }
 
 struct TextSessionCache::Impl {
-private:
-    struct PagedBinding {
-        std::vector<mfq::cache::BlockHash> blocks;
-        size_t tokens = 0;
-        uint64_t last_used = 0;
-    };
-
 public:
     explicit Impl(
             std::shared_ptr<mfq::cache::PagedPrefixCache> paged_cache = {},
@@ -172,6 +164,7 @@ public:
             int disabled_reason = 0)
         : snapshots_(cuda_session_snapshot_config()),
           paged_cache_(std::move(paged_cache)),
+          paged_bindings_(paged_cache_, snapshots_.max_sessions()),
           supported_(supported),
           disabled_reason_(disabled_reason) {
         const char * trace =
@@ -284,17 +277,7 @@ public:
             const std::string & source_session,
             const std::string & target_session) {
         if (paged_cache_) {
-            const auto source = paged_bindings_.find(source_session);
-            if (source == paged_bindings_.end() ||
-                    source_session.empty() || target_session.empty() ||
-                    source_session == target_session) {
-                return 0;
-            }
-            bind_paged_session(
-                target_session,
-                source->second.blocks,
-                source->second.tokens);
-            return source->second.blocks.size();
+            return paged_bindings_.fork(source_session, target_session);
         }
         const auto copied_snapshots =
             snapshots_.fork(source_session, target_session);
@@ -309,7 +292,7 @@ public:
     }
 
     size_t close_session(const std::string & session_id) {
-        if (paged_cache_) return close_paged_session(session_id);
+        if (paged_cache_) return paged_bindings_.close(session_id);
         const auto released = snapshots_.close(session_id);
         if (trace_ && released.snapshots > 0) {
             std::cerr << "runtime_session_cache action=close session="
@@ -331,9 +314,9 @@ public:
                 {"prefix_cache_queries", static_cast<double>(value.queries)},
                 {"prefix_cache_hits", static_cast<double>(value.hits)},
                 {"prefix_cache_hit_tokens", static_cast<double>(value.hit_tokens)},
-                {"prefix_cache_sessions", static_cast<double>(paged_metric_sessions_.load())},
+                {"prefix_cache_sessions", static_cast<double>(paged_bindings_.sessions())},
                 {"prefix_cache_snapshots", static_cast<double>(value.disk_blocks)},
-                {"prefix_cache_tokens", static_cast<double>(paged_metric_tokens_.load())},
+                {"prefix_cache_tokens", static_cast<double>(paged_bindings_.tokens())},
                 {"prefix_cache_bytes", static_cast<double>(value.hot_bytes)},
                 {"prefix_cache_max_sessions", static_cast<double>(snapshots_.max_sessions())},
                 {"prefix_cache_max_snapshots_per_session", 1.0},
@@ -376,16 +359,7 @@ public:
     }
 
     size_t clear_live_sessions() noexcept {
-        if (paged_cache_) {
-            const auto sessions = paged_bindings_.size();
-            for (const auto & [session, binding] : paged_bindings_) {
-                (void)session;
-                paged_cache_->unpin(binding.blocks);
-            }
-            paged_bindings_.clear();
-            sync_paged_telemetry();
-            return sessions;
-        }
+        if (paged_cache_) return paged_bindings_.clear();
         return snapshots_.clear();
     }
 
@@ -463,7 +437,7 @@ private:
         try {
             model.restore_text_session_state(*state);
             if (!requested_session.empty()) {
-                bind_paged_session(
+                paged_bindings_.bind(
                     requested_session, match.blocks, match.matched_tokens);
             }
             paged_cache_->record_match(match.matched_tokens);
@@ -518,7 +492,7 @@ private:
             blocks.push_back(parent);
         }
         if (!session_id.empty()) {
-            bind_paged_session(
+            paged_bindings_.bind(
                 session_id,
                 std::move(blocks),
                 full_blocks * block_size);
@@ -532,59 +506,11 @@ private:
         }
     }
 
-    void bind_paged_session(
-            const std::string & session_id,
-            std::vector<mfq::cache::BlockHash> blocks,
-            size_t tokens) {
-        close_paged_session(session_id);
-        paged_cache_->pin(blocks);
-        paged_bindings_[session_id] = PagedBinding{
-            std::move(blocks), tokens, ++clock_};
-        while (paged_bindings_.size() > snapshots_.max_sessions()) {
-            auto victim = paged_bindings_.end();
-            for (auto iterator = paged_bindings_.begin();
-                    iterator != paged_bindings_.end(); ++iterator) {
-                if (iterator->first == session_id) continue;
-                if (victim == paged_bindings_.end() ||
-                        iterator->second.last_used <
-                            victim->second.last_used) {
-                    victim = iterator;
-                }
-            }
-            if (victim == paged_bindings_.end()) break;
-            close_paged_session(victim->first);
-        }
-        sync_paged_telemetry();
-    }
-
-    size_t close_paged_session(const std::string & session_id) {
-        auto found = paged_bindings_.find(session_id);
-        if (found == paged_bindings_.end()) return 0;
-        const auto blocks = found->second.blocks.size();
-        paged_cache_->unpin(found->second.blocks);
-        paged_bindings_.erase(found);
-        sync_paged_telemetry();
-        return blocks;
-    }
-
-    void sync_paged_telemetry() noexcept {
-        size_t tokens = 0;
-        for (const auto & [session, binding] : paged_bindings_) {
-            (void)session;
-            tokens += binding.tokens;
-        }
-        paged_metric_sessions_.store(paged_bindings_.size());
-        paged_metric_tokens_.store(tokens);
-    }
-
     mfq::engine::SessionSnapshotCache<TextSessionState> snapshots_;
-    std::unordered_map<std::string, PagedBinding> paged_bindings_;
     std::shared_ptr<mfq::cache::PagedPrefixCache> paged_cache_;
+    mfq::engine::PagedSessionBindings paged_bindings_;
     uint64_t paged_disk_budget_ = 0;
     uint64_t paged_hot_budget_ = 0;
-    uint64_t clock_ = 0;
-    std::atomic<size_t> paged_metric_sessions_{0};
-    std::atomic<size_t> paged_metric_tokens_{0};
     bool trace_ = false;
     bool supported_ = true;
     int disabled_reason_ = 0;

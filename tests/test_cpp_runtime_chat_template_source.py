@@ -113,15 +113,16 @@ def test_processor_owned_prompts_bypass_cached_jinja_templates() -> None:
     assert "prompt = *preformatted_prompt;" in parse_work
     assert "work.chat_parser.parse_tool_calls = false;" in parse_work
     assert "json_schema_to_grammar(json::parse(json_schema))" in parse_work
-    assert "make_token_constraint(tokenizer, constraint_params)" in parse_work
+    assert "make_chat_token_constraint(" in parse_work
     assert parse_work.index("if (preformatted_prompt)") < parse_work.index(
         "apply_chat_template("
     )
 
 
 def test_server_enforces_complete_chat_template_tool_calls() -> None:
-    assert "MfqGrammarConstraint" in SERVER
-    assert "make_token_constraint(tokenizer, chat_params)" in SERVER
+    assert "class GrammarConstraint" in ENGINE
+    assert "class GrammarConstraint" not in SERVER
+    assert "make_chat_token_constraint(" in SERVER
     assert "work.token_constraint" in SERVER
     assert "if (partial)" in ENGINE
     assert "parsed.tool_calls.clear()" in ENGINE

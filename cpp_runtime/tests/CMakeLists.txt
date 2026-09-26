@@ -99,6 +99,7 @@ if(TARGET mfq-paged-prefix-cache)
         mfq_paged_prefix_cache_test.cpp
     )
     target_link_libraries(mfq-paged-prefix-cache-test PRIVATE
+        mfq-engine
         mfq-paged-prefix-cache
     )
     target_compile_features(mfq-paged-prefix-cache-test PRIVATE cxx_std_17)

@@ -3,6 +3,7 @@
 #include "cuda_execution.h"
 #include "causal_lm.h"
 #include "cuda_sampling.h"
+#include "inference.h"
 #include "mfq_cuda_ops.h"
 
 #include <cuda_runtime_api.h>
@@ -17,6 +18,8 @@
 #include <utility>
 #include <vector>
 
+using mfq::cuda::internal::PrefillCudaTimer;
+
 namespace {
 
 template <typename Model>
@@ -24,6 +27,7 @@ static mfq_tensor_backend::Tensor hidden_forward_chunked(
     Model& model,
     const mfq_tensor_backend::Tensor & ids,
     int64_t chunk_size,
+    const MfqCancellationCheck& cancelled,
     mfq_tensor_backend::Tensor * raw_hidden = nullptr) {
     MFQ_RUNTIME_CHECK(
         chunk_size > 0,
@@ -38,6 +42,9 @@ static mfq_tensor_backend::Tensor hidden_forward_chunked(
     }
     mfq_tensor_backend::Tensor hidden;
     for (int64_t offset = 0; offset < ids.size(1); offset += chunk_size) {
+        if (cancelled && cancelled()) {
+            throw mfq::engine::InferenceCancelled{};
+        }
         const int64_t count = std::min(chunk_size, ids.size(1) - offset);
         mfq_tensor_backend::Tensor raw_chunk;
         hidden = model.hidden_forward(
@@ -49,6 +56,9 @@ static mfq_tensor_backend::Tensor hidden_forward_chunked(
             raw_hidden != nullptr ? &raw_chunk : nullptr);
         if (raw_hidden != nullptr) {
             raw_chunks.push_back(std::move(raw_chunk));
+        }
+        if (cancelled && cancelled()) {
+            throw mfq::engine::InferenceCancelled{};
         }
     }
     if (raw_hidden != nullptr) {
@@ -65,6 +75,7 @@ static mfq_tensor_backend::Tensor hidden_forward_prepared_chunked(
     const mfq_tensor_backend::Tensor& ids,
     const CudaPreparedPrompt& prepared,
     int64_t chunk_size,
+    const MfqCancellationCheck& cancelled,
     mfq_tensor_backend::Tensor* raw_hidden = nullptr,
     int64_t prepared_offset = 0) {
     MFQ_RUNTIME_CHECK(
@@ -86,6 +97,9 @@ static mfq_tensor_backend::Tensor hidden_forward_prepared_chunked(
     }
     mfq_tensor_backend::Tensor hidden;
     for (int64_t offset = 0; offset < ids.size(1); offset += chunk_size) {
+        if (cancelled && cancelled()) {
+            throw mfq::engine::InferenceCancelled{};
+        }
         const int64_t count = std::min(chunk_size, ids.size(1) - offset);
         mfq_tensor_backend::Tensor raw_chunk;
         hidden = model.hidden_forward_inputs(
@@ -97,6 +111,9 @@ static mfq_tensor_backend::Tensor hidden_forward_prepared_chunked(
             mfq_nullopt, nullptr, mfq_nullopt, true, mfq_nullopt,
             raw_hidden != nullptr ? &raw_chunk : nullptr);
         if (raw_hidden != nullptr) raw_chunks.push_back(std::move(raw_chunk));
+        if (cancelled && cancelled()) {
+            throw mfq::engine::InferenceCancelled{};
+        }
     }
     model.decode_position_delta = prepared.decode_position_delta;
     if (raw_hidden != nullptr) {
@@ -105,218 +122,6 @@ static mfq_tensor_backend::Tensor hidden_forward_prepared_chunked(
             : mfq_tensor_backend::cat(raw_chunks, 1).contiguous();
     }
     return hidden;
-}
-
-class PrefillCudaTimer {
-public:
-    PrefillCudaTimer()
-        : stream_(mfq_get_current_cuda_stream()) {
-        MFQ_CUDA_CHECK(cudaEventCreate(&started_));
-        try {
-            MFQ_CUDA_CHECK(cudaEventCreate(&finished_));
-            MFQ_CUDA_CHECK(cudaEventRecord(started_, stream_));
-        } catch (...) {
-            if (finished_ != nullptr) cudaEventDestroy(finished_);
-            cudaEventDestroy(started_);
-            finished_ = nullptr;
-            started_ = nullptr;
-            throw;
-        }
-    }
-
-    ~PrefillCudaTimer() {
-        if (finished_ != nullptr) cudaEventDestroy(finished_);
-        if (started_ != nullptr) cudaEventDestroy(started_);
-    }
-
-    cudaEvent_t finished_event() const {
-        return finished_;
-    }
-
-    double elapsed_ms() const {
-        MFQ_CUDA_CHECK(cudaEventSynchronize(finished_));
-        float elapsed = 0.0f;
-        MFQ_CUDA_CHECK(cudaEventElapsedTime(&elapsed, started_, finished_));
-        return static_cast<double>(elapsed);
-    }
-
-private:
-    cudaStream_t stream_ = nullptr;
-    cudaEvent_t started_ = nullptr;
-    cudaEvent_t finished_ = nullptr;
-};
-
-struct CompactDistribution {
-    std::vector<int32_t> tokens;
-    std::vector<float> probabilities;
-
-    float probability(int32_t token) const {
-        const auto found = std::lower_bound(tokens.begin(), tokens.end(), token);
-        return found == tokens.end() || *found != token
-            ? 0.0f
-            : probabilities[static_cast<size_t>(found - tokens.begin())];
-    }
-};
-
-static void validate_compact_distribution(const CompactDistribution& distribution) {
-    MFQ_RUNTIME_CHECK(
-        !distribution.tokens.empty() &&
-            distribution.tokens.size() == distribution.probabilities.size() &&
-            std::is_sorted(distribution.tokens.begin(), distribution.tokens.end()),
-        "invalid compact MTP distribution");
-    double total = 0.0;
-    for (const float probability : distribution.probabilities) {
-        MFQ_RUNTIME_CHECK(
-            std::isfinite(probability) && probability >= 0.0f,
-            "invalid compact MTP probability");
-        total += probability;
-    }
-    MFQ_RUNTIME_CHECK(
-        std::abs(total - 1.0) <= 1.0e-5,
-        "compact MTP distribution is not normalized");
-}
-
-static CompactDistribution compact_distribution_from_topk(
-        const float* values,
-        const int64_t* indices,
-        int count,
-        const MfqSamplingParams& sampling) {
-    MFQ_RUNTIME_CHECK(
-        count > 0 && std::isfinite(values[0]),
-        "compact CUDA MTP logits have no finite maximum");
-    std::vector<double> masses(static_cast<size_t>(count));
-    double total = 0.0;
-    for (int index = 0; index < count; ++index) {
-        masses[static_cast<size_t>(index)] = std::exp(
-            (static_cast<double>(values[index]) - values[0]) /
-            sampling.temperature);
-        total += masses[static_cast<size_t>(index)];
-    }
-    MFQ_RUNTIME_CHECK(
-        total > 0.0 && std::isfinite(total),
-        "invalid compact CUDA MTP softmax mass");
-    int keep = count;
-    double kept_mass = total;
-    if (sampling.top_p < 1.0) {
-        kept_mass = 0.0;
-        for (int index = 0; index < count; ++index) {
-            kept_mass += masses[static_cast<size_t>(index)];
-            if (kept_mass >= sampling.top_p * total) {
-                keep = index + 1;
-                break;
-            }
-        }
-    }
-    std::vector<std::pair<int32_t, float>> entries;
-    entries.reserve(static_cast<size_t>(keep));
-    for (int index = 0; index < keep; ++index) {
-        entries.emplace_back(
-            static_cast<int32_t>(indices[index]),
-            static_cast<float>(
-                masses[static_cast<size_t>(index)] / kept_mass));
-    }
-    std::sort(entries.begin(), entries.end());
-    CompactDistribution result;
-    result.tokens.reserve(entries.size());
-    result.probabilities.reserve(entries.size());
-    for (const auto& [token, probability] : entries) {
-        result.tokens.push_back(token);
-        result.probabilities.push_back(probability);
-    }
-    validate_compact_distribution(result);
-    return result;
-}
-
-static int32_t sample_compact(
-        const CompactDistribution& distribution, double uniform) {
-    validate_compact_distribution(distribution);
-    uniform = std::clamp(uniform, 0.0, std::nextafter(1.0, 0.0));
-    double cumulative = 0.0;
-    int32_t fallback = distribution.tokens.back();
-    for (size_t index = 0; index < distribution.tokens.size(); ++index) {
-        if (distribution.probabilities[index] <= 0.0f) continue;
-        fallback = distribution.tokens[index];
-        cumulative += distribution.probabilities[index];
-        if (uniform < cumulative) return fallback;
-    }
-    return fallback;
-}
-
-static CompactDistribution positive_residual(
-        const CompactDistribution& target,
-        const CompactDistribution& proposal) {
-    CompactDistribution residual;
-    residual.tokens.reserve(target.tokens.size() + proposal.tokens.size());
-    residual.probabilities.reserve(residual.tokens.capacity());
-    size_t target_index = 0;
-    size_t proposal_index = 0;
-    double total = 0.0;
-    while (target_index < target.tokens.size() ||
-            proposal_index < proposal.tokens.size()) {
-        const int32_t token = proposal_index == proposal.tokens.size() ||
-                (target_index < target.tokens.size() &&
-                 target.tokens[target_index] < proposal.tokens[proposal_index])
-            ? target.tokens[target_index]
-            : proposal_index < proposal.tokens.size() &&
-                    (target_index == target.tokens.size() ||
-                     proposal.tokens[proposal_index] < target.tokens[target_index])
-                ? proposal.tokens[proposal_index]
-                : target.tokens[target_index];
-        const float probability = std::max(
-            0.0f, target.probability(token) - proposal.probability(token));
-        if (probability > 0.0f) {
-            residual.tokens.push_back(token);
-            residual.probabilities.push_back(probability);
-            total += probability;
-        }
-        if (target_index < target.tokens.size() &&
-                target.tokens[target_index] == token) {
-            ++target_index;
-        }
-        if (proposal_index < proposal.tokens.size() &&
-                proposal.tokens[proposal_index] == token) {
-            ++proposal_index;
-        }
-    }
-    if (!(total > 0.0) || !std::isfinite(total)) return target;
-    for (float& probability : residual.probabilities) {
-        probability = static_cast<float>(probability / total);
-    }
-    return residual;
-}
-
-static mfq::engine::mtp::ChainVerification verify_compact_chain(
-        std::span<const int32_t> drafts,
-        const std::vector<CompactDistribution>& proposals,
-        const std::vector<CompactDistribution>& targets,
-        std::span<const double> acceptance_uniforms,
-        double sample_uniform) {
-    MFQ_RUNTIME_CHECK(
-        !drafts.empty() && proposals.size() == drafts.size() &&
-            targets.size() == drafts.size() + 1 &&
-            acceptance_uniforms.size() == drafts.size(),
-        "compact MTP chain shapes are incompatible");
-    for (size_t position = 0; position < drafts.size(); ++position) {
-        validate_compact_distribution(proposals[position]);
-        validate_compact_distribution(targets[position]);
-        const double q = proposals[position].probability(drafts[position]);
-        const double p = targets[position].probability(drafts[position]);
-        MFQ_RUNTIME_CHECK(q > 0.0, "compact MTP draft has zero probability");
-        const double acceptance = std::min(1.0, p / q);
-        if (std::clamp(
-                acceptance_uniforms[position], 0.0,
-                std::nextafter(1.0, 0.0)) < acceptance) {
-            continue;
-        }
-        return {
-            position,
-            sample_compact(
-                positive_residual(targets[position], proposals[position]),
-                sample_uniform),
-            false};
-    }
-    return {
-        drafts.size(), sample_compact(targets.back(), sample_uniform), true};
 }
 
 } // namespace
@@ -332,10 +137,12 @@ int32_t run_mtp_generation(
         std::size_t reused_tokens,
         const mfq_tensor_backend::Tensor& restored_last_hidden,
         mfq_tensor_backend::Tensor* session_last_hidden,
-        double multimodal_ms) {
+        double multimodal_ms,
+        const MfqCancellationCheck& cancelled) {
     using Tensor = mfq_tensor_backend::Tensor;
     using Clock = std::chrono::steady_clock;
     namespace policy = mfq::engine::mtp;
+    using policy::CompactDistribution;
     const MtpTarget target{
         [&model](Tensor ids) {
             return model.embed_forward(std::move(ids));
@@ -346,6 +153,9 @@ int32_t run_mtp_generation(
         &model.rope,
     };
     if (session_last_hidden != nullptr) *session_last_hidden = {};
+    if (cancelled && cancelled()) {
+        throw mfq::engine::InferenceCancelled{};
+    }
     MFQ_RUNTIME_CHECK(
         !prompt.empty() && reused_tokens < prompt.size() &&
             prompt.size() <=
@@ -486,9 +296,11 @@ int32_t run_mtp_generation(
         auto indices = std::get<1>(selected)
             .to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64)
             .contiguous().reshape({-1});
-        return compact_distribution_from_topk(
-            values.template data_ptr<float>(), indices.template data_ptr<int64_t>(),
-            static_cast<int>(values.numel()), parameters);
+        return policy::compact_distribution_from_topk(
+            values.template data_ptr<float>(),
+            indices.template data_ptr<int64_t>(),
+            static_cast<int>(values.numel()),
+            parameters.temperature, parameters.top_p);
     };
     auto compact_probability_rows = [&](Tensor logits,
                                         const MfqSamplingParams& parameters) {
@@ -513,10 +325,11 @@ int32_t run_mtp_generation(
         std::vector<CompactDistribution> result;
         result.reserve(static_cast<size_t>(rows));
         for (int64_t row = 0; row < rows; ++row) {
-            result.push_back(compact_distribution_from_topk(
+            result.push_back(policy::compact_distribution_from_topk(
                 value_data + row * columns,
                 index_data + row * columns,
-                static_cast<int>(columns), parameters));
+                static_cast<int>(columns),
+                parameters.temperature, parameters.top_p));
         }
         return result;
     };
@@ -566,10 +379,10 @@ int32_t run_mtp_generation(
             static_cast<int64_t>(prompt.size() - reused_tokens)).contiguous();
         auto hidden = transformed_prompt
             ? hidden_forward_prepared_chunked(
-                  model, prefill_ids, *prepared, prefill_chunk_size, &raw,
-                  static_cast<int64_t>(reused_tokens))
+                  model, prefill_ids, *prepared, prefill_chunk_size,
+                  cancelled, &raw, static_cast<int64_t>(reused_tokens))
             : hidden_forward_chunked(
-                  model, prefill_ids, prefill_chunk_size, &raw);
+                  model, prefill_ids, prefill_chunk_size, cancelled, &raw);
         auto committed_last_hidden = raw.narrow(
             1, raw.size(1) - 1, 1);
         auto finish = [&]() {
@@ -623,6 +436,9 @@ int32_t run_mtp_generation(
                 prime_hidden = raw.narrow(1, 0, pairs);
             }
             for (int64_t offset = 0; offset < pairs; offset += chunk_size) {
+                if (cancelled && cancelled()) {
+                    throw mfq::engine::InferenceCancelled{};
+                }
                 const int64_t count = std::min(chunk_size, pairs - offset);
                 (void)predictor_step(
                     prime_hidden.narrow(1, offset, count),
@@ -633,10 +449,14 @@ int32_t run_mtp_generation(
                               -1, prime_ids_offset + offset,
                               count).contiguous()
                         : Tensor{});
+                if (cancelled && cancelled()) {
+                    throw mfq::engine::InferenceCancelled{};
+                }
             }
         }
 
         if (!emit(pending) || generated == limit) return finish();
+        if (cancelled && cancelled()) return finish();
         auto constraint_cursor = token_constraint
             ? token_constraint->clone()
             : MfqTokenConstraintPtr{};
@@ -705,7 +525,8 @@ int32_t run_mtp_generation(
                 } else if (compact_stochastic) {
                     auto proposal = compact_probabilities(
                         draft_logits, prospective_counts, draft_sampling);
-                    token = sample_compact(proposal, sampler.next_uniform());
+                    token = policy::sample_compact(
+                        proposal, sampler.next_uniform());
                     result.compact_probabilities.push_back(
                         std::move(proposal));
                 } else {
@@ -787,6 +608,7 @@ int32_t run_mtp_generation(
             initial_hidden, {pending},
             bounded_depth(depth_controller.depth()), true);
         while (generated < limit) {
+            if (cancelled && cancelled()) return finish();
             const auto cycle_started = Clock::now();
             const int draft_count = static_cast<int>(draft.tokens.size());
             Tensor verified_raw;
@@ -876,7 +698,7 @@ int32_t run_mtp_generation(
                 std::generate(
                     acceptance_uniforms.begin(), acceptance_uniforms.end(),
                     [&] { return sampler.next_uniform(); });
-                result = verify_compact_chain(
+                result = policy::verify_compact_chain(
                     draft.tokens, draft.compact_probabilities,
                     target_probabilities, acceptance_uniforms,
                     sampler.next_uniform());
@@ -1056,7 +878,7 @@ int32_t run_mtp_generation(
         const MfqTokenCallback&, const MfqPrefillCallback&, int64_t,         \
         const MfqTokenConstraintPtr&, const CudaPreparedPrompt*,             \
         std::size_t, const mfq_tensor_backend::Tensor&,                      \
-        mfq_tensor_backend::Tensor*, double)
+        mfq_tensor_backend::Tensor*, double, const MfqCancellationCheck&)
 
 MFQ_INSTANTIATE_MTP(mfq::cuda::CudaBackbone::generic_qwen);
 MFQ_INSTANTIATE_MTP(mfq::cuda::CudaBackbone::glm5_next);

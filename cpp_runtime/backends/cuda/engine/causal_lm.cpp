@@ -339,3 +339,269 @@ void restore_dsv4_pool_session_state(
     restore_session_prefix_tensor(
         target.pool, state.pool, 1, state.capacity);
 }
+
+namespace mfq::cuda {
+
+template <CudaBackbone Backbone>
+TextSessionStateKind CudaSessionCodec<Backbone>::kind(
+        const CausalLm<Backbone>& model) {
+    const auto& blocks = model.blocks;
+    if (blocks.empty()) return TextSessionStateKind::Unsupported;
+    if constexpr (
+            Backbone == CudaBackbone::generic_qwen ||
+            Backbone == CudaBackbone::minicpmo45 ||
+            Backbone == CudaBackbone::minicpmo_tts) {
+        const bool full_attention = std::all_of(
+            blocks.begin(), blocks.end(),
+            [](const std::unique_ptr<Block>& block) {
+                return dynamic_cast<const FullBlock*>(block.get()) != nullptr;
+            });
+        if (full_attention) return TextSessionStateKind::FullAttention;
+        if constexpr (Backbone == CudaBackbone::generic_qwen) {
+            return mfq::cuda::qwen35::supports_text_session_state(blocks)
+                ? TextSessionStateKind::HybridAttention
+                : TextSessionStateKind::Unsupported;
+        }
+    } else if constexpr (Backbone == CudaBackbone::deepseek_v4) {
+        return std::all_of(
+            blocks.begin(), blocks.end(),
+            [](const std::unique_ptr<Block>& block) {
+                return dynamic_cast<const Dsv4Block*>(block.get()) != nullptr;
+            })
+            ? TextSessionStateKind::DeepseekV4
+            : TextSessionStateKind::Unsupported;
+    } else if constexpr (Backbone == CudaBackbone::glm_dsa) {
+        return std::all_of(
+            blocks.begin(), blocks.end(),
+            [](const std::unique_ptr<Block>& block) {
+                return dynamic_cast<const GlmDsaBlock*>(block.get()) != nullptr;
+            })
+            ? TextSessionStateKind::GlmDsa
+            : TextSessionStateKind::Unsupported;
+    }
+    return TextSessionStateKind::Unsupported;
+}
+
+template <CudaBackbone Backbone>
+bool CudaSessionCodec<Backbone>::supports_paged(
+        const CausalLm<Backbone>& model) {
+    if (kind(model) != TextSessionStateKind::FullAttention) return false;
+    return std::all_of(
+        model.blocks.begin(), model.blocks.end(),
+        [](const std::unique_ptr<Block>& block) {
+            const auto* full = dynamic_cast<const FullBlock*>(block.get());
+            return full != nullptr && !full->sliding;
+        });
+}
+
+template <CudaBackbone Backbone>
+TextSessionState CudaSessionCodec<Backbone>::capture(
+        const CausalLm<Backbone>& model,
+        const std::vector<int64_t>& tokens) {
+    const auto& blocks = model.blocks;
+    const auto cache_pos = model.cache_pos;
+    const auto state_kind = kind(model);
+    if (state_kind == TextSessionStateKind::Unsupported) {
+        throw std::runtime_error(
+            "text session state is unsupported by this block layout");
+    }
+    if (cache_pos <= 0 || static_cast<size_t>(cache_pos) != tokens.size()) {
+        throw std::runtime_error(
+            "text session token count does not match the model cache");
+    }
+    TextSessionState state;
+    state.tokens = tokens;
+    state.kind = state_kind;
+    state.cache_pos = cache_pos;
+    if constexpr (
+            Backbone == CudaBackbone::generic_qwen ||
+            Backbone == CudaBackbone::minicpmo45 ||
+            Backbone == CudaBackbone::minicpmo_tts) {
+        if constexpr (Backbone == CudaBackbone::generic_qwen) {
+            if (state.kind == TextSessionStateKind::HybridAttention) {
+                return mfq::cuda::qwen35::capture_text_session_state(
+                    blocks, tokens, cache_pos);
+            }
+        }
+        state.blocks.reserve(blocks.size());
+        for (const auto& block : blocks) {
+            MfqCudaGuard guard(block->cuda_device);
+            const auto* full = dynamic_cast<const FullBlock*>(block.get());
+            if (full == nullptr) {
+                throw std::runtime_error(
+                    "full-attention session layer changed");
+            }
+            state.blocks.push_back(capture_full_attention_session_state(
+                *full, cache_pos, state.bytes));
+        }
+    } else if constexpr (Backbone == CudaBackbone::deepseek_v4) {
+        state.dsv4_blocks.reserve(blocks.size());
+        for (const auto& block : blocks) {
+            MfqCudaGuard guard(block->cuda_device);
+            const auto* dsv4 = dynamic_cast<const Dsv4Block*>(block.get());
+            if (dsv4 == nullptr || !dsv4->local_cache.defined()) {
+                throw std::runtime_error(
+                    "DeepSeek V4 local session cache is unavailable");
+            }
+            Dsv4BlockSessionState saved;
+            saved.local_cache = dsv4->local_cache.clone();
+            state.bytes += session_tensor_bytes(saved.local_cache);
+            saved.compressor = capture_dsv4_pool_session_state(
+                dsv4->compressor, cache_pos, state.bytes);
+            saved.indexer_compressor = capture_dsv4_pool_session_state(
+                dsv4->indexer_compressor, cache_pos, state.bytes);
+            state.dsv4_blocks.push_back(std::move(saved));
+        }
+    } else if constexpr (Backbone == CudaBackbone::glm_dsa) {
+        state.glm_dsa_blocks.reserve(blocks.size());
+        for (const auto& block : blocks) {
+            MfqCudaGuard guard(block->cuda_device);
+            const auto* glm = dynamic_cast<const GlmDsaBlock*>(block.get());
+            if (glm == nullptr || !glm->kv_cache.defined() ||
+                    glm->kv_cache.dim() != 4 ||
+                    glm->kv_cache.size(0) != 1 ||
+                    cache_pos > glm->kv_cache.size(2)) {
+                throw std::runtime_error(
+                    "GLM DSA session MLA cache is unavailable");
+            }
+            GlmDsaBlockSessionState saved;
+            saved.full_indexer = glm->full_indexer;
+            saved.kv_capacity = glm->kv_cache.size(2);
+            saved.kv_cache = glm->kv_cache.narrow(2, 0, cache_pos).clone();
+            state.bytes += session_tensor_bytes(saved.kv_cache);
+            if (glm->full_indexer) {
+                if (!glm->index_cache.defined() ||
+                        glm->index_cache.dim() != 3 ||
+                        glm->index_cache.size(0) != 1 ||
+                        cache_pos > glm->index_cache.size(1)) {
+                    throw std::runtime_error(
+                        "GLM DSA session index cache is unavailable");
+                }
+                saved.index_capacity = glm->index_cache.size(1);
+                saved.index_cache = glm->index_cache.narrow(
+                    1, 0, cache_pos).clone();
+                state.bytes += session_tensor_bytes(saved.index_cache);
+            }
+            state.glm_dsa_blocks.push_back(std::move(saved));
+        }
+    }
+    return state;
+}
+
+template <CudaBackbone Backbone>
+void CudaSessionCodec<Backbone>::restore(
+        CausalLm<Backbone>& model,
+        const TextSessionState& state) {
+    auto& blocks = model.blocks;
+    const auto model_kind = kind(model);
+    if (model_kind == TextSessionStateKind::Unsupported ||
+            state.kind != model_kind || state.cache_pos <= 0 ||
+            static_cast<size_t>(state.cache_pos) != state.tokens.size()) {
+        throw std::runtime_error("text session state is incompatible");
+    }
+    if constexpr (
+            Backbone == CudaBackbone::generic_qwen ||
+            Backbone == CudaBackbone::minicpmo45 ||
+            Backbone == CudaBackbone::minicpmo_tts) {
+        if constexpr (Backbone == CudaBackbone::generic_qwen) {
+            if (state.kind == TextSessionStateKind::HybridAttention) {
+                mfq::cuda::qwen35::restore_text_session_state(blocks, state);
+                model.cache_pos = state.cache_pos;
+                return;
+            }
+        }
+        if (state.blocks.size() != blocks.size()) {
+            throw std::runtime_error(
+                "full-attention session layer count changed");
+        }
+        for (size_t index = 0; index < blocks.size(); ++index) {
+            auto& block = blocks[index];
+            MfqCudaGuard guard(block->cuda_device);
+            auto* full = dynamic_cast<FullBlock*>(block.get());
+            if (full == nullptr) {
+                throw std::runtime_error(
+                    "full-attention session layer changed");
+            }
+            restore_full_attention_session_state(
+                *full, state.blocks[index]);
+        }
+    } else if constexpr (Backbone == CudaBackbone::deepseek_v4) {
+        if (state.dsv4_blocks.size() != blocks.size()) {
+            throw std::runtime_error(
+                "DeepSeek V4 session layer count changed");
+        }
+        for (size_t index = 0; index < blocks.size(); ++index) {
+            auto& block = blocks[index];
+            MfqCudaGuard guard(block->cuda_device);
+            auto* dsv4 = dynamic_cast<Dsv4Block*>(block.get());
+            const auto& saved = state.dsv4_blocks[index];
+            if (dsv4 == nullptr || !saved.local_cache.defined() ||
+                    saved.local_cache.dim() != 3 ||
+                    saved.local_cache.size(0) != 1 ||
+                    saved.local_cache.size(1) != 128) {
+                throw std::runtime_error(
+                    "DeepSeek V4 saved local cache is invalid");
+            }
+            restore_session_tensor(dsv4->local_cache, saved.local_cache);
+            restore_dsv4_pool_session_state(
+                dsv4->compressor, saved.compressor);
+            restore_dsv4_pool_session_state(
+                dsv4->indexer_compressor, saved.indexer_compressor);
+            dsv4->shared_state->ensure();
+        }
+    } else if constexpr (Backbone == CudaBackbone::glm_dsa) {
+        if (state.glm_dsa_blocks.size() != blocks.size()) {
+            throw std::runtime_error(
+                "GLM DSA session layer count changed");
+        }
+        for (size_t index = 0; index < blocks.size(); ++index) {
+            auto& block = blocks[index];
+            MfqCudaGuard guard(block->cuda_device);
+            auto* glm = dynamic_cast<GlmDsaBlock*>(block.get());
+            const auto& saved = state.glm_dsa_blocks[index];
+            if (glm == nullptr || glm->full_indexer != saved.full_indexer ||
+                    !saved.kv_cache.defined() ||
+                    saved.kv_cache.dim() != 4 ||
+                    saved.kv_cache.size(0) != 1 ||
+                    saved.kv_cache.size(2) != state.cache_pos) {
+                throw std::runtime_error(
+                    "GLM DSA saved MLA cache is invalid");
+            }
+            restore_session_prefix_tensor(
+                glm->kv_cache, saved.kv_cache, 2, saved.kv_capacity);
+            if (saved.full_indexer) {
+                if (!saved.index_cache.defined() ||
+                        saved.index_cache.dim() != 3 ||
+                        saved.index_cache.size(0) != 1 ||
+                        saved.index_cache.size(1) != state.cache_pos) {
+                    throw std::runtime_error(
+                        "GLM DSA saved index cache is invalid");
+                }
+                restore_session_prefix_tensor(
+                    glm->index_cache, saved.index_cache,
+                    1, saved.index_capacity);
+            } else {
+                glm->index_cache = mfq_tensor_backend::Tensor();
+            }
+            glm->shared_state->reset();
+        }
+    }
+    model.cache_pos = state.cache_pos;
+}
+
+#define MFQ_INSTANTIATE_SESSION_CODEC(BACKBONE) \
+    template struct CudaSessionCodec<BACKBONE>;
+
+MFQ_INSTANTIATE_SESSION_CODEC(CudaBackbone::generic_qwen)
+MFQ_INSTANTIATE_SESSION_CODEC(CudaBackbone::minicpmo45)
+MFQ_INSTANTIATE_SESSION_CODEC(CudaBackbone::minicpmo_tts)
+MFQ_INSTANTIATE_SESSION_CODEC(CudaBackbone::gemma4)
+MFQ_INSTANTIATE_SESSION_CODEC(CudaBackbone::glm_dsa)
+MFQ_INSTANTIATE_SESSION_CODEC(CudaBackbone::glm5_next)
+MFQ_INSTANTIATE_SESSION_CODEC(CudaBackbone::qwen4_exp)
+MFQ_INSTANTIATE_SESSION_CODEC(CudaBackbone::deepseek_v4)
+MFQ_INSTANTIATE_SESSION_CODEC(CudaBackbone::deepseek_v41)
+
+#undef MFQ_INSTANTIATE_SESSION_CODEC
+
+} // namespace mfq::cuda

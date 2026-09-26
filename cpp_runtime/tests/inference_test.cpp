@@ -22,6 +22,7 @@ struct FakeModel {
     bool cache = true;
     bool transformed = false;
     bool fail_decode = false;
+    std::function<void()> after_prefill;
     std::string input_key;
     std::vector<std::string> snapshot_keys;
 
@@ -56,6 +57,7 @@ struct FakeModel {
             checkpoint(stable);
         }
         position = 4;
+        if (after_prefill) after_prefill();
         return {41, {4 - reused, 1.0, transformed ? 2.0 : 0.0,
                      transformed ? 3.0 : 1.0}};
     }
@@ -73,9 +75,11 @@ struct FakeModel {
             std::size_t reused, std::size_t stable,
             const std::function<void(std::size_t)>& checkpoint,
             const MfqTokenCallback& emit,
-            const MfqPrefillCallback& on_prefill, std::int32_t limit) {
+            const MfqPrefillCallback& on_prefill, std::int32_t limit,
+            const MfqCancellationCheck& cancelled) {
         return mfq::engine::generate_target(
-            *this, reused, stable, checkpoint, emit, on_prefill, limit);
+            *this, reused, stable, checkpoint, emit, on_prefill, limit,
+            cancelled);
     }
 };
 
@@ -84,7 +88,8 @@ struct FakeMtp : FakeModel {
             std::size_t reused, std::size_t,
             const std::function<void(std::size_t)>&,
             const MfqTokenCallback& emit,
-            const MfqPrefillCallback& on_prefill, std::int32_t) {
+            const MfqPrefillCallback& on_prefill, std::int32_t,
+            const MfqCancellationCheck&) {
         calls.push_back("mtp");
         require(reused == (supports_cache() ? 2u : 0u));
         position = 4; // The prompt is evaluated; the first sample is pending.
@@ -222,6 +227,33 @@ int main() {
     require(mfq::engine::generate(
         uncached, prompt, sampling, {}, {}, plan) == 2);
     require(uncached.snapshots.empty() && uncached.calls.front() == "reset");
+
+    FakeModel cancelled_before;
+    require(mfq::engine::generate(
+        cancelled_before, prompt, sampling, {}, {}, plan,
+        [] { return true; }) == 0);
+    require(cancelled_before.calls.empty());
+
+    FakeModel cancelled_during_prefill;
+    cancelled_during_prefill.after_prefill = [] {
+        throw mfq::engine::InferenceCancelled{};
+    };
+    require(mfq::engine::generate(
+        cancelled_during_prefill, prompt, sampling, {}, {}, plan) == 0);
+    require(cancelled_during_prefill.calls.back() == "reset");
+
+    FakeModel cancelled_after_prefill;
+    bool cancel_requested = false;
+    cancelled_after_prefill.after_prefill = [&] { cancel_requested = true; };
+    require(mfq::engine::generate(
+        cancelled_after_prefill, prompt, sampling, {}, {}, plan,
+        [&] { return cancel_requested; }) == 0);
+    require(!cancelled_after_prefill.snapshots.empty());
+    require(cancelled_after_prefill.snapshots.back() == prompt);
+    require(std::find(
+        cancelled_after_prefill.calls.begin(),
+        cancelled_after_prefill.calls.end(), "advance") ==
+        cancelled_after_prefill.calls.end());
 
     FakeModel failed;
     failed.fail_decode = true;

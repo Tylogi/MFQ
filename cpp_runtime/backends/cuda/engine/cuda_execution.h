@@ -44,6 +44,29 @@
 #endif
 #endif
 
+class MoeExpertCache;
+
+namespace mfq::cuda::internal {
+
+class PrefillCudaTimer {
+public:
+    PrefillCudaTimer();
+    ~PrefillCudaTimer();
+
+    PrefillCudaTimer(const PrefillCudaTimer&) = delete;
+    PrefillCudaTimer& operator=(const PrefillCudaTimer&) = delete;
+
+    cudaEvent_t finished_event() const;
+    double elapsed_ms() const;
+
+private:
+    cudaStream_t stream_ = nullptr;
+    cudaEvent_t started_ = nullptr;
+    cudaEvent_t finished_ = nullptr;
+};
+
+} // namespace mfq::cuda::internal
+
 struct CudaPreparedPrompt {
     std::vector<std::int64_t> token_ids;
     mfq_tensor_backend::Tensor embeddings;
@@ -351,30 +374,65 @@ struct LayerPlacementConfig {
     }
 };
 
-extern CudaProfiler g_profiler;
-extern bool g_force_moe_pool_path;
-extern bool g_force_moe_unfused_reduce;
-extern bool g_force_moe_materialized_swiglu;
-extern bool g_force_moe_prefill_mma_off;
+struct CudaExecutionContext {
+    CudaProfiler profiler;
+    bool force_moe_pool_path = false;
+    bool force_moe_unfused_reduce = false;
+    bool force_moe_materialized_swiglu = false;
+    bool force_moe_prefill_mma_off = false;
+    KlMmqMode kl_mmq_mode = KlMmqMode::Default;
+    int64_t kl_mmq_activation_quantize_calls = 0;
+    int64_t kl_mmq_dense_calls = 0;
+    int64_t kl_mmq_moe_calls = 0;
+    int64_t kl_mmq_fallback_calls = 0;
+    int64_t kl_kv_cache_capacity = 0;
+    std::unordered_set<int> dsv4_cpu_offload_layers;
+    int64_t dsv4_cpu_offload_host_bytes = 0;
+    int n_gpu_layers = -1;
+    int dense_cpu_layer_count = 0;
+    bool loading_cpu_layer = false;
+    int moe_cache_registration_min_slots = 8;
+    int gemma_trace_layer = -1;
+    std::vector<std::pair<std::string, mfq_tensor_backend::Tensor>>*
+        gemma_stage_trace = nullptr;
+    ParallelConfig tensor_parallel;
+    ParallelConfig expert_parallel;
+    ModelParallelCollectiveRuntime model_parallel_collectives;
+    LayerPlacementConfig layer_placement;
+    std::shared_ptr<MoeExpertCache> moe_expert_cache;
+
+    void reset() noexcept;
+};
+
+CudaExecutionContext& cuda_execution_context();
+
+// Transitional aliases keep kernels unchanged while ownership moves into the
+// concrete context above. New state belongs on CudaExecutionContext.
+extern CudaProfiler& g_profiler;
+extern bool& g_force_moe_pool_path;
+extern bool& g_force_moe_unfused_reduce;
+extern bool& g_force_moe_materialized_swiglu;
+extern bool& g_force_moe_prefill_mma_off;
 extern thread_local bool g_moe_continuous_batch_cache_serial;
-extern KlMmqMode g_kl_mmq_mode;
-extern int64_t g_kl_mmq_activation_quantize_calls;
-extern int64_t g_kl_mmq_dense_calls;
-extern int64_t g_kl_mmq_moe_calls;
-extern int64_t g_kl_mmq_fallback_calls;
-extern int64_t g_kl_kv_cache_capacity;
-extern std::unordered_set<int> g_dsv4_cpu_offload_layers;
-extern int64_t g_dsv4_cpu_offload_host_bytes;
-extern int g_n_gpu_layers;
-extern int g_dense_cpu_layer_count;
-extern bool g_loading_cpu_layer;
-extern int g_moe_cache_registration_min_slots;
-extern int g_gemma_trace_layer;
-extern std::vector<std::pair<std::string, mfq_tensor_backend::Tensor>>* g_gemma_stage_trace;
-extern ParallelConfig g_tensor_parallel;
-extern ParallelConfig g_expert_parallel;
-extern ModelParallelCollectiveRuntime g_model_parallel_collectives;
-extern LayerPlacementConfig g_layer_placement;
+extern KlMmqMode& g_kl_mmq_mode;
+extern int64_t& g_kl_mmq_activation_quantize_calls;
+extern int64_t& g_kl_mmq_dense_calls;
+extern int64_t& g_kl_mmq_moe_calls;
+extern int64_t& g_kl_mmq_fallback_calls;
+extern int64_t& g_kl_kv_cache_capacity;
+extern std::unordered_set<int>& g_dsv4_cpu_offload_layers;
+extern int64_t& g_dsv4_cpu_offload_host_bytes;
+extern int& g_n_gpu_layers;
+extern int& g_dense_cpu_layer_count;
+extern bool& g_loading_cpu_layer;
+extern int& g_moe_cache_registration_min_slots;
+extern int& g_gemma_trace_layer;
+extern std::vector<std::pair<std::string, mfq_tensor_backend::Tensor>>*&
+    g_gemma_stage_trace;
+extern ParallelConfig& g_tensor_parallel;
+extern ParallelConfig& g_expert_parallel;
+extern ModelParallelCollectiveRuntime& g_model_parallel_collectives;
+extern LayerPlacementConfig& g_layer_placement;
 
 void mfq_set_env(const char* name, const char* value);
 void mfq_release_host_allocator_cache() noexcept;

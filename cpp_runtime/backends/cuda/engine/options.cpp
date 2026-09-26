@@ -377,6 +377,8 @@ static std::unordered_set<int> parse_layer_ranges(
 }
 
 void setup_cuda_load(const mfq::cuda::CudaLoadOptions& options) {
+    cuda_execution_context().reset();
+    g_mfq_drop_file_cache = false;
     const auto& tensor_parallel_arg = options.tensor_parallel_arg;
     const auto& tensor_split_arg = options.tensor_split_arg;
     const auto& expert_parallel_arg = options.expert_parallel_arg;
@@ -471,7 +473,8 @@ void setup_cuda_load(const mfq::cuda::CudaLoadOptions& options) {
 }
 
 void reset_cuda_load() noexcept {
-    g_model_parallel_collectives.reset();
+    cuda_execution_context().reset();
+    g_mfq_drop_file_cache = false;
 }
 
 } // namespace mfq::cuda::internal

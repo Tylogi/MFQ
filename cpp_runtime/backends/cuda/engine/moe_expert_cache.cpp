@@ -1,5 +1,6 @@
 #include "moe_expert_cache.h"
 
+#include "cuda_execution.h"
 #include "moe.h"
 #include "quant_linear.h"
 #include "mfe_expert_store.h"
@@ -22,7 +23,8 @@
 
 using mfq_tensor_backend::indexing::Slice;
 
-std::shared_ptr<MoeExpertCache> g_moe_expert_cache;
+std::shared_ptr<MoeExpertCache>& g_moe_expert_cache =
+    cuda_execution_context().moe_expert_cache;
 struct MoeCacheTransfer {
     const uint8_t * source = nullptr;
     uint8_t * destination = nullptr;

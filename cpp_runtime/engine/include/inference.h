@@ -75,6 +75,11 @@ struct PrefillResult {
     MfqPrefillTiming timing;
 };
 
+// Backends throw this only at safe interruption points where no token has been
+// published. The shared lifecycle resets partial model state and reports a
+// normal cancelled completion through the scheduler.
+struct InferenceCancelled {};
+
 // A whole-model request: adapters own device tensors, sampling and physical
 // cache state. cache_position counts evaluated tokens, not emitted tokens.
 namespace detail {
@@ -84,7 +89,9 @@ std::int32_t run_request(
         const std::vector<std::int64_t>& prompt,
         const MfqTokenCallback& on_token,
         const MfqPromptCachePlan& cache_plan,
+        const MfqCancellationCheck& cancelled,
         Generate&& generate) {
+    if (cancelled && cancelled()) return 0;
     const auto stable = std::min(cache_plan.stable_prefix_tokens, prompt.size());
     const bool cache_enabled = stable > 0 && model.supports_cache() &&
         (!cache_plan.session_id.empty() || model.persistent_prefix_enabled());
@@ -116,6 +123,9 @@ std::int32_t run_request(
             snapshot(static_cast<std::size_t>(position));
         }
         return generated;
+    } catch (const InferenceCancelled&) {
+        model.reset();
+        return 0;
     } catch (...) {
         model.reset();
         throw;
@@ -133,18 +143,19 @@ std::int32_t generate_target(
         const std::function<void(std::size_t)>& checkpoint,
         const MfqTokenCallback& emit,
         const MfqPrefillCallback& on_prefill,
-        std::int32_t max_tokens) {
-    if (max_tokens <= 0) return 0;
+        std::int32_t max_tokens,
+        const MfqCancellationCheck& cancelled = {}) {
+    if (max_tokens <= 0 || (cancelled && cancelled())) return 0;
     const auto first = model.prefill(reused, stable, checkpoint);
     if (stable == model.prompt_size()) checkpoint(stable);
     if (on_prefill) on_prefill(first.timing);
     std::int32_t generated = 0;
     std::int64_t token = first.token;
-    while (generated < max_tokens) {
+    while (generated < max_tokens && (!cancelled || !cancelled())) {
         ++generated;
         if (!emit(token)) break;
         model.accept(token);
-        if (generated == max_tokens) break;
+        if (generated == max_tokens || (cancelled && cancelled())) break;
         token = model.advance();
     }
     return generated;
@@ -159,14 +170,15 @@ std::int32_t generate(
         const MfqSamplingParams& sampling,
         const MfqTokenCallback& on_token,
         const MfqPrefillCallback& on_prefill,
-        const MfqPromptCachePlan& cache_plan) {
+        const MfqPromptCachePlan& cache_plan,
+        const MfqCancellationCheck& cancelled = {}) {
     return detail::run_request(
-        model, prompt, on_token, cache_plan,
+        model, prompt, on_token, cache_plan, cancelled,
         [&](std::size_t reused, std::size_t stable,
             const auto& snapshot, const auto& emit) {
             if (sampling.max_tokens <= 0) return std::int32_t{0};
             return model.generate(reused, stable, snapshot, emit,
-                                  on_prefill, sampling.max_tokens);
+                                  on_prefill, sampling.max_tokens, cancelled);
         });
 }
 

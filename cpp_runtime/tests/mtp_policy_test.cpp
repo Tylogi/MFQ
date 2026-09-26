@@ -1,4 +1,4 @@
-#include "mtp_policy.h"
+#include "mtp_metrics.h"
 #include <array>
 #include <iostream>
 
@@ -83,6 +83,36 @@ int main() {
             drafts, proposal, target, reject_second, .5);
         require(rejected.accepted_drafts == 1 && rejected.next_token == 0 && !rejected.bonus);
     }
+    {
+        const std::array<int32_t, 2> drafts{10, 20};
+        const std::vector<CompactDistribution> proposal{
+            {{10, 20}, {.5f, .5f}}, {{10, 20}, {.25f, .75f}}};
+        const std::vector<CompactDistribution> target{
+            {{10, 20}, {.75f, .25f}},
+            {{10, 20}, {.5f, .5f}},
+            {{10, 20}, {0.f, 1.f}}};
+        const std::array<double, 2> accept_all{.5, .5};
+        const auto accepted = verify_compact_chain(
+            drafts, proposal, target, accept_all, .5);
+        require(accepted.accepted_drafts == 2 &&
+                accepted.next_token == 20 && accepted.bonus);
+        const std::array<double, 2> reject_second{.5, .95};
+        const auto rejected = verify_compact_chain(
+            drafts, proposal, target, reject_second, .5);
+        require(rejected.accepted_drafts == 1 &&
+                rejected.next_token == 10 && !rejected.bonus);
+
+        const std::array<float, 2> logits{2.f, 1.f};
+        const std::array<int64_t, 2> indices{9, 3};
+        const auto compact = compact_distribution_from_topk(
+            logits.data(), indices.data(), 2, 1.0, 1.0);
+        require(compact.tokens == std::vector<int32_t>({3, 9}));
+        require(sample_compact(compact, 0.0) == 3);
+        rejects([&] {
+            compact_distribution_from_topk(
+                logits.data(), indices.data(), 2, 0.0, 1.0);
+        });
+    }
     const std::array<float, 3> q{.5f, .25f, .25f}, p{.25f, .5f, .25f}, bonus{0.f, 0.f, 1.f};
     require(verify(0, q, p, bonus, .49, .2).accepted);
     require(verify(0, q, p, bonus, .49, .2).next_token == 2);
@@ -116,5 +146,18 @@ int main() {
         }
     }
     require(histogram[0] == 10000 && histogram[1] == 20000 && histogram[2] == 10000);
+
+    GenerationStats stats;
+    stats.used = true;
+    stats.cycles = 3;
+    stats.drafted_tokens = 4;
+    stats.accepted_tokens = 2;
+    std::vector<std::pair<std::string, double>> metrics;
+    append_generation_metrics(metrics, stats);
+    const auto acceptance = std::find_if(
+        metrics.begin(), metrics.end(), [](const auto& metric) {
+            return metric.first == "mtp_acceptance_rate";
+        });
+    require(acceptance != metrics.end() && acceptance->second == .5);
     std::cout << "MTP sampling/acceptance/correction tests passed; 40000 exact grid checks\n";
 }

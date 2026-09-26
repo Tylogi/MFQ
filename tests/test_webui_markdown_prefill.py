@@ -14,7 +14,12 @@ SERVER = "\n".join(
 RUNTIME_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda" / "engine"
 RUNTIME = "\n".join(
     (RUNTIME_ROOT / name).read_text(encoding="utf-8")
-    for name in ("generation.h", "generation.cpp")
+    for name in (
+        "cuda_execution.h",
+        "cuda_execution.cpp",
+        "generation.h",
+        "generation.cpp",
+    )
 )
 SAMPLING = (
     ROOT / "cpp_runtime" / "backends" / "cuda" / "engine" / "cuda_sampling.h"

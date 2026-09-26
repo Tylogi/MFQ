@@ -47,7 +47,8 @@ template <typename Model>
 static mfq_tensor_backend::Tensor prefill_tail(
     Model& model,
     mfq_tensor_backend::Tensor ids,
-    int64_t chunk_size) {
+    int64_t chunk_size,
+    const MfqCancellationCheck& cancelled) {
     MFQ_RUNTIME_CHECK(
         chunk_size > 0,
         "runtime prefill chunk size must be positive");
@@ -56,53 +57,19 @@ static mfq_tensor_backend::Tensor prefill_tail(
         "runtime prefill IDs must have shape [1, tokens]");
     int64_t offset = 0;
     while (ids.size(1) - offset > chunk_size) {
+        if (cancelled && cancelled()) {
+            throw mfq::engine::InferenceCancelled{};
+        }
         (void)model.hidden_forward(
             ids.narrow(1, offset, chunk_size).contiguous());
         offset += chunk_size;
     }
+    if (cancelled && cancelled()) {
+        throw mfq::engine::InferenceCancelled{};
+    }
     return offset == 0
         ? ids
         : ids.narrow(1, offset, ids.size(1) - offset).contiguous();
-}
-
-template <typename Model>
-static mfq_tensor_backend::Tensor hidden_forward_chunked(
-    Model& model,
-    const mfq_tensor_backend::Tensor & ids,
-    int64_t chunk_size,
-    mfq_tensor_backend::Tensor * raw_hidden = nullptr) {
-    MFQ_RUNTIME_CHECK(
-        chunk_size > 0,
-        "runtime prefill chunk size must be positive");
-    MFQ_RUNTIME_CHECK(
-        ids.dim() == 2 && ids.size(0) == 1 && ids.size(1) > 0,
-        "runtime prefill IDs must have shape [1, tokens]");
-    std::vector<mfq_tensor_backend::Tensor> raw_chunks;
-    if (raw_hidden != nullptr) {
-        raw_chunks.reserve(static_cast<std::size_t>(
-            (ids.size(1) + chunk_size - 1) / chunk_size));
-    }
-    mfq_tensor_backend::Tensor hidden;
-    for (int64_t offset = 0; offset < ids.size(1); offset += chunk_size) {
-        const int64_t count = std::min(chunk_size, ids.size(1) - offset);
-        mfq_tensor_backend::Tensor raw_chunk;
-        hidden = model.hidden_forward(
-            ids.narrow(1, offset, count).contiguous(),
-            mfq_nullopt,
-            mfq_nullopt,
-            nullptr,
-            mfq_nullopt,
-            raw_hidden != nullptr ? &raw_chunk : nullptr);
-        if (raw_hidden != nullptr) {
-            raw_chunks.push_back(std::move(raw_chunk));
-        }
-    }
-    if (raw_hidden != nullptr) {
-        *raw_hidden = raw_chunks.size() == 1
-            ? std::move(raw_chunks.front())
-            : mfq_tensor_backend::cat(raw_chunks, 1).contiguous();
-    }
-    return hidden;
 }
 
 template <typename Model>
@@ -111,6 +78,7 @@ static mfq_tensor_backend::Tensor hidden_forward_prepared_chunked(
     const mfq_tensor_backend::Tensor& ids,
     const CudaPreparedPrompt& prepared,
     int64_t chunk_size,
+    const MfqCancellationCheck& cancelled,
     mfq_tensor_backend::Tensor* raw_hidden = nullptr,
     int64_t prepared_offset = 0) {
     MFQ_RUNTIME_CHECK(
@@ -132,6 +100,9 @@ static mfq_tensor_backend::Tensor hidden_forward_prepared_chunked(
     }
     mfq_tensor_backend::Tensor hidden;
     for (int64_t offset = 0; offset < ids.size(1); offset += chunk_size) {
+        if (cancelled && cancelled()) {
+            throw mfq::engine::InferenceCancelled{};
+        }
         const int64_t count = std::min(chunk_size, ids.size(1) - offset);
         mfq_tensor_backend::Tensor raw_chunk;
         hidden = model.hidden_forward_inputs(
@@ -143,6 +114,9 @@ static mfq_tensor_backend::Tensor hidden_forward_prepared_chunked(
             mfq_nullopt, nullptr, mfq_nullopt, true, mfq_nullopt,
             raw_hidden != nullptr ? &raw_chunk : nullptr);
         if (raw_hidden != nullptr) raw_chunks.push_back(std::move(raw_chunk));
+        if (cancelled && cancelled()) {
+            throw mfq::engine::InferenceCancelled{};
+        }
     }
     model.decode_position_delta = prepared.decode_position_delta;
     if (raw_hidden != nullptr) {
@@ -154,37 +128,6 @@ static mfq_tensor_backend::Tensor hidden_forward_prepared_chunked(
 }
 
 } // namespace
-
-PrefillCudaTimer::PrefillCudaTimer()
-    : stream_(mfq_get_current_cuda_stream()) {
-    MFQ_CUDA_CHECK(cudaEventCreate(&started_));
-    try {
-        MFQ_CUDA_CHECK(cudaEventCreate(&finished_));
-        MFQ_CUDA_CHECK(cudaEventRecord(started_, stream_));
-    } catch (...) {
-        if (finished_ != nullptr) cudaEventDestroy(finished_);
-        cudaEventDestroy(started_);
-        finished_ = nullptr;
-        started_ = nullptr;
-        throw;
-    }
-}
-
-PrefillCudaTimer::~PrefillCudaTimer() {
-    if (finished_ != nullptr) cudaEventDestroy(finished_);
-    if (started_ != nullptr) cudaEventDestroy(started_);
-}
-
-cudaEvent_t PrefillCudaTimer::finished_event() const {
-    return finished_;
-}
-
-double PrefillCudaTimer::elapsed_ms() const {
-    MFQ_CUDA_CHECK(cudaEventSynchronize(finished_));
-    float elapsed = 0.0f;
-    MFQ_CUDA_CHECK(cudaEventElapsedTime(&elapsed, started_, finished_));
-    return static_cast<double>(elapsed);
-}
 
 namespace {
 
@@ -206,6 +149,7 @@ struct CudaGenerationOps {
     mfq_tensor_backend::TensorOptions options;
     const CudaPreparedPrompt* prepared;
     const std::string& input_key;
+    const MfqCancellationCheck& cancelled;
     double multimodal_ms;
     std::int32_t generation_limit = 0;
     bool graph_active = false;
@@ -250,10 +194,11 @@ struct CudaGenerationOps {
                     static_cast<int64_t>(stable - reused)).contiguous();
                 if (prepared && prepared->transformed()) {
                     (void)hidden_forward_prepared_chunked(
-                        model, prefix, *prepared, chunk_size, nullptr,
-                        static_cast<int64_t>(reused));
+                        model, prefix, *prepared, chunk_size, cancelled,
+                        nullptr, static_cast<int64_t>(reused));
                 } else {
-                    prefix = prefill_tail(model, std::move(prefix), chunk_size);
+                    prefix = prefill_tail(
+                        model, std::move(prefix), chunk_size, cancelled);
                     MfqOptional<mfq_tensor_backend::Tensor> seq_len = mfq_nullopt;
                     if (!Model::is_minicpmo45 && model.cache_pos > 0 &&
                             prefix.size(1) == 1) {
@@ -272,7 +217,7 @@ struct CudaGenerationOps {
             const auto offset = stable > 0 && stable < prompt.size()
                 ? stable : reused;
             auto hidden = hidden_forward_prepared_chunked(
-                model, ids, *prepared, chunk_size, nullptr,
+                model, ids, *prepared, chunk_size, cancelled, nullptr,
                 static_cast<int64_t>(offset));
             auto logits = model.lm_head.forward(
                 hidden.index({Slice(), -1, Slice()})
@@ -283,7 +228,8 @@ struct CudaGenerationOps {
             pending = mfq::cuda::sample_logits(
                 sampler, std::move(logits), counts, constraint);
         } else {
-            ids = prefill_tail(model, std::move(ids), chunk_size);
+            ids = prefill_tail(
+                model, std::move(ids), chunk_size, cancelled);
             pending = sample_token(model, ids, sampler, counts, constraint,
                                    timer.finished_event());
         }
@@ -430,12 +376,13 @@ struct CudaGenerationOps {
             const std::function<void(std::size_t)>& checkpoint,
             const MfqTokenCallback& emit,
             const MfqPrefillCallback& on_prefill,
-            std::int32_t max_tokens) {
+            std::int32_t max_tokens,
+            const MfqCancellationCheck& cancellation) {
         generation_limit = max_tokens;
         graph_active = graph_eligible();
         return mfq::engine::generate_target(
             *this, reused, stable, checkpoint, emit,
-            on_prefill, max_tokens);
+            on_prefill, max_tokens, cancellation);
     }
 };
 
@@ -489,12 +436,13 @@ struct CudaMtpGenerationOps {
             std::size_t reused, std::size_t,
             const std::function<void(std::size_t)>&,
             const MfqTokenCallback& emit,
-            const MfqPrefillCallback& on_prefill, std::int32_t) {
+            const MfqPrefillCallback& on_prefill, std::int32_t,
+            const MfqCancellationCheck& cancelled) {
         return run_mtp_generation<Model::backbone>(
             model, mtp, prompt, sampling, emit, on_prefill,
             chunk_size, constraint, prepared, reused,
             restored.mtp_last_target_hidden, &last_target_hidden,
-            multimodal_ms);
+            multimodal_ms, cancelled);
     }
 };
 
@@ -514,13 +462,15 @@ int32_t generate(
     const MfqTokenConstraintPtr& token_constraint,
     MtpModule* mtp,
     int64_t prefill_chunk_size,
-    PreparedPromptFactory<Model> prepare_prompt) {
+    PreparedPromptFactory<Model> prepare_prompt,
+    MfqCancellationCheck cancelled) {
     std::lock_guard<std::mutex> lock(model_mutex);
     if (prompt.empty() || prefill_chunk_size <= 0) {
         throw std::invalid_argument("CUDA generate needs a prompt and positive prefill chunk size");
     }
     std::optional<CudaPreparedPrompt> prepared;
     double multimodal_ms = 0.0;
+    if (cancelled && cancelled()) return 0;
     if (prepare_prompt) {
         PrefillCudaTimer timer;
         prepared = prepare_prompt(model);
@@ -551,7 +501,8 @@ int32_t generate(
             token_constraint, prefill_chunk_size,
             prepared ? &*prepared : nullptr, input_key, multimodal_ms, {}, {}};
         return mfq::engine::generate(
-            ops, prompt, sampling, on_token, on_prefill, cache_plan);
+            ops, prompt, sampling, on_token, on_prefill, cache_plan,
+            cancelled);
         }
         throw std::runtime_error("MTP is unavailable for this causal LM type");
     }
@@ -582,9 +533,9 @@ int32_t generate(
         model, session_cache, graph_cache, prompt, cache_plan,
         token_constraint, prefill_chunk_size, full_ids, pending, counts,
         random_host, sampler, has_penalties, options,
-        prepared ? &*prepared : nullptr, input_key, multimodal_ms};
+        prepared ? &*prepared : nullptr, input_key, cancelled, multimodal_ms};
     return mfq::engine::generate(
-        ops, prompt, sampling, on_token, on_prefill, cache_plan);
+        ops, prompt, sampling, on_token, on_prefill, cache_plan, cancelled);
 }
 
 #define MFQ_INSTANTIATE_FLOW(BACKBONE)                                    \
@@ -594,7 +545,8 @@ int32_t generate(
         const MfqSamplingParams&, const MfqTokenCallback&,                  \
         const MfqPrefillCallback&, const MfqPromptCachePlan&,               \
         const MfqTokenConstraintPtr&, MtpModule*, int64_t,                  \
-        PreparedPromptFactory<mfq::cuda::CausalLmFor<BACKBONE>>);
+        PreparedPromptFactory<mfq::cuda::CausalLmFor<BACKBONE>>,            \
+        MfqCancellationCheck);
 
 MFQ_INSTANTIATE_FLOW(mfq::cuda::CudaBackbone::generic_qwen)
 MFQ_INSTANTIATE_FLOW(mfq::cuda::CudaBackbone::minicpmo45)

@@ -39,6 +39,10 @@ PAGED_SOURCE = (ROOT / "cpp_runtime" / "core" / "mfq_paged_prefix_cache.cpp").re
 ENGINE_FLOW = (
     ROOT / "cpp_runtime" / "engine" / "include" / "inference.h"
 ).read_text(encoding="utf-8")
+SESSION_CACHE = (
+    ROOT / "cpp_runtime" / "engine" / "include" /
+    "session_snapshot_cache.h"
+).read_text(encoding="utf-8")
 METAL_PAGED_CODEC = (
     ROOT / "cpp_runtime" / "backends" / "metal" / "runtime" / "mlx_paged_session_codec.cpp"
 ).read_text(encoding="utf-8")
@@ -102,7 +106,7 @@ def test_partial_stable_prefix_is_saved_before_generation_suffix() -> None:
     assert "stable > 0 && stable < prompt.size()" in DECODE
     assert "checkpoint(stable);" in DECODE
     assert "model.snapshot(std::vector<std::int64_t>(" in ENGINE_FLOW
-    assert "tokens.size() > maximum_prefix_tokens" in DECODE
+    assert "tokens.size() > maximum_prefix_tokens" in SESSION_CACHE
 
 
 def test_qwen_hybrid_and_mtp_session_state_are_restored_together() -> None:
@@ -110,12 +114,12 @@ def test_qwen_hybrid_and_mtp_session_state_are_restored_together() -> None:
     assert "saved.convolution_state = linear->conv_state.clone()" in DECODE
     assert "saved.recurrent_state = linear->gdn_state.clone()" in DECODE
     assert "std::optional<MtpSessionState> mtp" in DECODE
-    assert "mtp->restore_session_state(*selected.mtp)" in DECODE
+    assert "mtp->restore_session_state(*match->state->mtp)" in DECODE
     assert "prompt.size() - reused_tokens" in DECODE
 
 
 def test_multimodal_cache_keys_include_media_and_reuse_vision_output() -> None:
-    assert "state.input_key != input_key" in DECODE
+    assert "state.input_key == input_key" in DECODE
     assert "media.pixel_values.data()" in DECODE
     assert "cached_vision_key_ == cache_key" in DECODE
     assert "stable_prefix_tokens = transformed_prompt ? 0" not in DECODE
@@ -124,8 +128,8 @@ def test_multimodal_cache_keys_include_media_and_reuse_vision_output() -> None:
 
 def test_session_cache_uses_exact_prefixes_and_reports_suffix_prefill() -> None:
     assert "!std::equal(" in DECODE
-    assert "tokens.begin(), tokens.end(), prompt.begin()))" in DECODE
-    assert "tokens.size() >= prompt.size()" in DECODE
+    assert "tokens.begin(), tokens.end(), prompt.begin()))" in SESSION_CACHE
+    assert "tokens.size() >= prompt.size()" in SESSION_CACHE
     assert "prompt.size() - reused_tokens" in DECODE
     assert "MFQ_RUNTIME_MAX_KV_SESSIONS" in DECODE
     assert "MFQ_RUNTIME_MAX_KV_SNAPSHOTS_PER_SESSION" in DECODE
@@ -134,7 +138,7 @@ def test_session_cache_uses_exact_prefixes_and_reports_suffix_prefill() -> None:
 
 
 def test_session_cache_retains_history_and_exposes_lifecycle_controls() -> None:
-    assert "std::vector<TextSessionState>> states_" in DECODE
+    assert "SessionSnapshotCache<TextSessionState> snapshots_" in DECODE
     assert "fork_session(" in DECODE
     assert "close_session(" in DECODE
     assert 'server.Post("/runtime/sessions/fork"' in SERVER

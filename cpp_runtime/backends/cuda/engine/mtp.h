@@ -118,4 +118,5 @@ int32_t run_mtp_generation(
     std::size_t reused_tokens = 0,
     const mfq_tensor_backend::Tensor& restored_last_hidden = {},
     mfq_tensor_backend::Tensor* session_last_hidden = nullptr,
-    double multimodal_ms = 0.0);
+    double multimodal_ms = 0.0,
+    const MfqCancellationCheck& cancelled = {});

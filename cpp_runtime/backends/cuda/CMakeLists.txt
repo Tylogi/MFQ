@@ -251,6 +251,7 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/glm_dsa/causal_lm.cpp
     ${MFQ_CUDA_ROOT}/models/minicpmo45/causal_lm.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/causal_lm.cpp
+    ${MFQ_CUDA_ROOT}/models/qwen35/batch_executor.cpp
     ${MFQ_CUDA_ROOT}/models/registry.cpp
 )
 

@@ -99,6 +99,15 @@ CUDA_QWEN_LINEAR = (
 CUDA_CAUSAL_LM = (CUDA_RUNTIME / "causal_lm.h").read_text(
     encoding="utf-8"
 )
+CUDA_CAUSAL_LM_SOURCE = (CUDA_RUNTIME / "causal_lm.cpp").read_text(
+    encoding="utf-8"
+)
+CUDA_QWEN_BATCH_HEADER = (
+    CUDA_MODELS / "qwen35" / "batch_executor.h"
+).read_text(encoding="utf-8")
+CUDA_QWEN_BATCH_SOURCE = (
+    CUDA_MODELS / "qwen35" / "batch_executor.cpp"
+).read_text(encoding="utf-8")
 CUDA_CAUSAL_LM_LOADER = (CUDA_RUNTIME / "causal_lm_loader.cpp").read_text(
     encoding="utf-8"
 )
@@ -238,6 +247,10 @@ def test_cuda_runtime_has_one_shared_generation_path() -> None:
     assert "mfq::engine::generate(" in generation
     assert "mfq::engine::generate_target(" in generation
     assert "while (generated < max_tokens)" not in generation
+    assert "generate_cli_tokens" not in header
+    assert "generate_cli_tokens" in (
+        CUDA_RUNTIME.parent / "commands" / "token_generation.h"
+    ).read_text(encoding="utf-8")
     assert "generate_target(" in shared
     assert "InferenceRequest" in shared
     assert "TextGeneration" not in shared
@@ -248,6 +261,35 @@ def test_cuda_runtime_has_one_shared_generation_path() -> None:
         ROOT / "cpp_runtime" / "engine" / "src" / "text_generation.cpp"
     ).exists()
     assert "ensure_captured(" in generation
+
+
+def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
+    execution = (CUDA_RUNTIME / "cuda_execution.h").read_text(encoding="utf-8")
+    options = (CUDA_RUNTIME / "options.cpp").read_text(encoding="utf-8")
+
+    assert "struct CudaExecutionContext" in execution
+    assert "CudaExecutionContext& execution;" in CUDA_ENGINE_SOURCE
+    assert "class PagedSessionBindings" in (
+        ROOT / "cpp_runtime" / "engine" / "include" /
+        "paged_session_bindings.h"
+    ).read_text(encoding="utf-8")
+    assert "struct CompactDistribution" in CUDA_MTP_HEADER
+    assert "struct CompactDistribution" not in CUDA_MTP_SOURCE
+    constraint = (
+        ROOT / "cpp_runtime" / "engine" / "src" / "token_constraint.cpp"
+    ).read_text(encoding="utf-8")
+    transport = (
+        ROOT / "cpp_runtime" / "transport" / "src" / "common.cpp"
+    ).read_text(encoding="utf-8")
+    assert "class GrammarConstraint" in constraint
+    assert "class MfqGrammarConstraint" not in transport
+    assert "cuda_execution_context().reset();" in options
+    assert "struct CudaSessionCodec" in CUDA_CAUSAL_LM
+    assert "return CudaSessionCodec<Backbone>::capture" in CUDA_CAUSAL_LM
+    assert "CudaSessionCodec<Backbone>::capture" in CUDA_CAUSAL_LM_SOURCE
+    assert "struct Request" not in CUDA_QWEN_BATCH_HEADER
+    assert "struct QwenBatchExecutor::Impl" in CUDA_QWEN_BATCH_SOURCE
+    assert len(CUDA_QWEN_BATCH_HEADER.splitlines()) < 80
 
 
 def test_cuda_runtime_composes_transport_scheduler_and_engine() -> None:

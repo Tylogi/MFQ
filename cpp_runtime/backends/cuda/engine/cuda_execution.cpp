@@ -40,43 +40,116 @@ void mfq_release_host_allocator_cache() noexcept {
 
 using mfq_tensor_backend::indexing::Slice;
 
+namespace mfq::cuda::internal {
 
+PrefillCudaTimer::PrefillCudaTimer()
+    : stream_(mfq_get_current_cuda_stream()) {
+    MFQ_CUDA_CHECK(cudaEventCreate(&started_));
+    try {
+        MFQ_CUDA_CHECK(cudaEventCreate(&finished_));
+        MFQ_CUDA_CHECK(cudaEventRecord(started_, stream_));
+    } catch (...) {
+        if (finished_ != nullptr) cudaEventDestroy(finished_);
+        cudaEventDestroy(started_);
+        finished_ = nullptr;
+        started_ = nullptr;
+        throw;
+    }
+}
 
+PrefillCudaTimer::~PrefillCudaTimer() {
+    if (finished_ != nullptr) cudaEventDestroy(finished_);
+    if (started_ != nullptr) cudaEventDestroy(started_);
+}
 
+cudaEvent_t PrefillCudaTimer::finished_event() const {
+    return finished_;
+}
 
-CudaProfiler g_profiler;
+double PrefillCudaTimer::elapsed_ms() const {
+    MFQ_CUDA_CHECK(cudaEventSynchronize(finished_));
+    float elapsed = 0.0f;
+    MFQ_CUDA_CHECK(cudaEventElapsedTime(&elapsed, started_, finished_));
+    return static_cast<double>(elapsed);
+}
 
-bool g_force_moe_pool_path = false;
-bool g_force_moe_unfused_reduce = false;
-bool g_force_moe_materialized_swiglu = false;
-bool g_force_moe_prefill_mma_off = false;
+} // namespace mfq::cuda::internal
+
+CudaExecutionContext& cuda_execution_context() {
+    // ponytail: one process-wide CUDA load; pass contexts explicitly if
+    // independently configured engines must coexist in one process.
+    static CudaExecutionContext context;
+    return context;
+}
+
+CudaProfiler& g_profiler = cuda_execution_context().profiler;
+bool& g_force_moe_pool_path =
+    cuda_execution_context().force_moe_pool_path;
+bool& g_force_moe_unfused_reduce =
+    cuda_execution_context().force_moe_unfused_reduce;
+bool& g_force_moe_materialized_swiglu =
+    cuda_execution_context().force_moe_materialized_swiglu;
+bool& g_force_moe_prefill_mma_off =
+    cuda_execution_context().force_moe_prefill_mma_off;
 thread_local bool g_moe_continuous_batch_cache_serial = false;
+KlMmqMode& g_kl_mmq_mode = cuda_execution_context().kl_mmq_mode;
+int64_t& g_kl_mmq_activation_quantize_calls =
+    cuda_execution_context().kl_mmq_activation_quantize_calls;
+int64_t& g_kl_mmq_dense_calls =
+    cuda_execution_context().kl_mmq_dense_calls;
+int64_t& g_kl_mmq_moe_calls = cuda_execution_context().kl_mmq_moe_calls;
+int64_t& g_kl_mmq_fallback_calls =
+    cuda_execution_context().kl_mmq_fallback_calls;
+int64_t& g_kl_kv_cache_capacity =
+    cuda_execution_context().kl_kv_cache_capacity;
+std::unordered_set<int>& g_dsv4_cpu_offload_layers =
+    cuda_execution_context().dsv4_cpu_offload_layers;
+int64_t& g_dsv4_cpu_offload_host_bytes =
+    cuda_execution_context().dsv4_cpu_offload_host_bytes;
+int& g_n_gpu_layers = cuda_execution_context().n_gpu_layers;
+int& g_dense_cpu_layer_count =
+    cuda_execution_context().dense_cpu_layer_count;
+bool& g_loading_cpu_layer = cuda_execution_context().loading_cpu_layer;
+int& g_moe_cache_registration_min_slots =
+    cuda_execution_context().moe_cache_registration_min_slots;
+int& g_gemma_trace_layer = cuda_execution_context().gemma_trace_layer;
+std::vector<std::pair<std::string, mfq_tensor_backend::Tensor>>*&
+    g_gemma_stage_trace = cuda_execution_context().gemma_stage_trace;
+ParallelConfig& g_tensor_parallel =
+    cuda_execution_context().tensor_parallel;
+ParallelConfig& g_expert_parallel =
+    cuda_execution_context().expert_parallel;
+ModelParallelCollectiveRuntime& g_model_parallel_collectives =
+    cuda_execution_context().model_parallel_collectives;
+LayerPlacementConfig& g_layer_placement =
+    cuda_execution_context().layer_placement;
 
-KlMmqMode g_kl_mmq_mode = KlMmqMode::Default;
-int64_t g_kl_mmq_activation_quantize_calls = 0;
-int64_t g_kl_mmq_dense_calls = 0;
-int64_t g_kl_mmq_moe_calls = 0;
-int64_t g_kl_mmq_fallback_calls = 0;
-int64_t g_kl_kv_cache_capacity = 0;
-std::unordered_set<int> g_dsv4_cpu_offload_layers;
-int64_t g_dsv4_cpu_offload_host_bytes = 0;
-// Repeating-layer placement: the first layers stay on CPU and
-// the last n_gpu_layers stay on CUDA.  -1 keeps the historical all-CUDA path.
-int g_n_gpu_layers = -1;
-int g_dense_cpu_layer_count = 0;
-bool g_loading_cpu_layer = false;
-class MoeExpertCache;
-class MoeCachedSource;
-int g_moe_cache_registration_min_slots = 8;
-int g_gemma_trace_layer = -1;
-std::vector<std::pair<std::string, mfq_tensor_backend::Tensor>> * g_gemma_stage_trace = nullptr;
-
-
-
-
-
-ParallelConfig g_tensor_parallel;
-ParallelConfig g_expert_parallel;
+void CudaExecutionContext::reset() noexcept {
+    profiler.reset();
+    moe_expert_cache.reset();
+    model_parallel_collectives.reset();
+    tensor_parallel = {};
+    expert_parallel = {};
+    layer_placement = {};
+    dsv4_cpu_offload_layers.clear();
+    dsv4_cpu_offload_host_bytes = 0;
+    n_gpu_layers = -1;
+    dense_cpu_layer_count = 0;
+    loading_cpu_layer = false;
+    kl_mmq_mode = KlMmqMode::Default;
+    kl_mmq_activation_quantize_calls = 0;
+    kl_mmq_dense_calls = 0;
+    kl_mmq_moe_calls = 0;
+    kl_mmq_fallback_calls = 0;
+    kl_kv_cache_capacity = 0;
+    force_moe_pool_path = false;
+    force_moe_unfused_reduce = false;
+    force_moe_materialized_swiglu = false;
+    force_moe_prefill_mma_off = false;
+    moe_cache_registration_min_slots = 8;
+    gemma_trace_layer = -1;
+    gemma_stage_trace = nullptr;
+}
 
 bool model_parallel_enabled() {
     return g_tensor_parallel.enabled() ||
@@ -106,8 +179,6 @@ int model_parallel_primary_device() {
 }
 
 
-
-ModelParallelCollectiveRuntime g_model_parallel_collectives;
 
 bool model_parallel_cuda_graph_enabled() {
     if (!model_parallel_enabled()) {
@@ -189,8 +260,6 @@ size_t model_parallel_launch_index(
 }
 
 
-
-LayerPlacementConfig g_layer_placement;
 
 int active_weight_load_device() {
     return g_layer_placement.load_device >= 0
