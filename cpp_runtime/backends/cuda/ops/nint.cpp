@@ -299,6 +299,7 @@ static mfq_tensor_backend::Tensor nint_matmul_cpu(
     return result;
 }
 mfq_tensor_backend::Tensor nint_matmul(const NintWeight & w, mfq_tensor_backend::Tensor x) {
+    auto& execution = cuda_execution_context();
     if (!x.is_cuda()) return nint_matmul_cpu(w, std::move(x));
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
@@ -323,7 +324,7 @@ mfq_tensor_backend::Tensor nint_matmul(const NintWeight & w, mfq_tensor_backend:
             return mfq_tensor_backend::matmul(x, dense.transpose(0, 1));
         });
     }
-    if (g_kl_mmq_mode != KlMmqMode::Default) {
+    if (execution.kl_mmq_mode != KlMmqMode::Default) {
         const int original_m = M;
         MFQ_RUNTIME_CHECK(original_m > 0, "KLD NINT8-0 MMQ requires activation rows");
         if (M < 16) {
@@ -333,7 +334,7 @@ mfq_tensor_backend::Tensor nint_matmul(const NintWeight & w, mfq_tensor_backend:
             M = 16;
         }
         x = kl_mmq_prepare_activation(x);
-        ++g_kl_mmq_dense_calls;
+        ++execution.kl_mmq_dense_calls;
         auto result = g_profiler.measure("kld_mmq.nint8_zero.fp16", [&]() {
             return nint8_zero_mmq_f16_packed_cuda(
                 w.q_packed, w.q8_zero_scale, x, w.neuron_len);
@@ -367,8 +368,9 @@ mfq_tensor_backend::Tensor nint_matmul_bf16_output(
 
 static mfq_tensor_backend::Tensor nint_matmul_f32_kld(
         const NintWeight & w, mfq_tensor_backend::Tensor x) {
+    auto& execution = cuda_execution_context();
     MFQ_RUNTIME_CHECK(
-        g_kl_mmq_mode == KlMmqMode::Fp16,
+        execution.kl_mmq_mode == KlMmqMode::Fp16,
         "FP32-output NINT MMQ is restricted to the FP16 KLD path");
     x = pad_last(
         x.contiguous().to(mfq_tensor_backend::kFloat16),
@@ -379,7 +381,7 @@ static mfq_tensor_backend::Tensor nint_matmul_f32_kld(
     MFQ_RUNTIME_CHECK(
         x.size(0) >= 16,
         "FP32-output NINT MMQ requires at least 16 activation rows");
-    ++g_kl_mmq_dense_calls;
+    ++execution.kl_mmq_dense_calls;
     return g_profiler.measure(
         "kld_mmq.nint8_zero.fp32_output", [&]() {
             return nint8_zero_mmq_f32_packed_cuda(

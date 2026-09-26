@@ -792,13 +792,14 @@ int run_kl_eval_batched(
                << " reference_n_batch=" << reference_contract.n_batch
                << " reference_n_ubatch=" << reference_contract.n_ubatch
                << "\n";
+    const auto& execution = cuda_execution_context();
     std::cout << "cpp_kl_mmq"
-              << " mmq=" << kl_mmq_mode_name(g_kl_mmq_mode)
+              << " mmq=" << kl_mmq_mode_name(execution.kl_mmq_mode)
               << " activation_quantize_calls="
-              << g_kl_mmq_activation_quantize_calls
-              << " dense_calls=" << g_kl_mmq_dense_calls
-              << " moe_calls=" << g_kl_mmq_moe_calls
-              << " fallback_calls=" << g_kl_mmq_fallback_calls
+              << execution.kl_mmq_activation_quantize_calls
+              << " dense_calls=" << execution.kl_mmq_dense_calls
+              << " moe_calls=" << execution.kl_mmq_moe_calls
+              << " fallback_calls=" << execution.kl_mmq_fallback_calls
               << "\n";
     return 0;
 }

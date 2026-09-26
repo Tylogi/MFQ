@@ -321,16 +321,17 @@ static mfq_tensor_backend::Tensor nvq_matmul_cpu(
     return result;
 }
 mfq_tensor_backend::Tensor nvq_matmul(const NvqWeight & w, mfq_tensor_backend::Tensor x) {
+    auto& execution = cuda_execution_context();
     if (!x.is_cuda()) return nvq_matmul_cpu(w, std::move(x));
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
     int M = (int)x.size(0);
-    if (g_kl_mmq_mode != KlMmqMode::Default) {
+    if (execution.kl_mmq_mode != KlMmqMode::Default) {
         MFQ_RUNTIME_CHECK(
             M >= 16,
             "KLD common NVQ MMQ requires at least 16 activation rows");
         x = kl_mmq_prepare_activation(x);
-        ++g_kl_mmq_dense_calls;
+        ++execution.kl_mmq_dense_calls;
         return g_profiler.measure("kld_mmq.nvq.fp16", [&]() {
             return nvq_gemm_f16_cuda(
                 w.indices_packed, w.aux_packed, w.sub_scale_packed,

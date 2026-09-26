@@ -47,9 +47,10 @@ def test_routed_moe_all_compact_families_are_expert_sharded():
 def test_expert_parallel_cli_and_hybrid_device_contract_are_wired():
     assert '"--expert-parallel"' in SOURCE
     assert '"--expert-split"' in SOURCE
-    assert "g_expert_parallel" in SOURCE
+    assert "execution.expert_parallel" in SOURCE
     assert "plan_moe_expert_parallel_slices" in SOURCE
-    assert "g_tensor_parallel.devices != g_expert_parallel.devices" in SOURCE
+    assert "execution.tensor_parallel.devices !=" in SOURCE
+    assert "execution.expert_parallel.devices" in SOURCE
 
 
 def test_tensor_parallel_has_a_native_partition_test_target():
@@ -73,7 +74,7 @@ def test_tensor_parallel_graph_capture_registers_all_participant_streams():
     assert "model_parallel_cuda_graph_enabled()" in SOURCE
     assert "environment == nullptr || environment[0] != '0'" in SOURCE
     assert "graph_participant_streams" in SOURCE
-    assert "g_model_parallel_collectives.streams.begin()" in SOURCE
+    assert "collectives.streams.begin()" in SOURCE
     assert "graph.compute_streams" in SOURCE
     assert "participant_streams" in SOURCE
     assert "bool graph_eligible() const" in SOURCE
@@ -140,8 +141,8 @@ def test_tensor_parallel_peer_first_launch_preserves_rank_indexing():
 
 def test_qwen35_mtp_accepts_dense_tensor_parallel_placement():
     assert "const bool supported_placement" in COMPONENTS
-    assert "!g_layer_placement.enabled()" in COMPONENTS
-    assert "!g_tensor_parallel.enabled()" not in COMPONENTS
+    assert "!execution.layer_placement.enabled()" in COMPONENTS
+    assert "!execution.tensor_parallel.enabled()" not in COMPONENTS
     assert "dense GPU-resident Qwen blocks" in COMPONENTS
 
 

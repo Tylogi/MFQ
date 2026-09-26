@@ -20,6 +20,7 @@ int generate_cli_tokens(Model& model, mfq_tensor_backend::Tensor ids,
         int gen, bool profile,
         std::chrono::steady_clock::time_point t0,
         std::chrono::steady_clock::time_point t1) {
+        const auto& execution = cuda_execution_context();
         g_profiler.reset();
         auto next = model.next_token(ids);
         mfq_cuda_synchronize();
@@ -45,9 +46,9 @@ int generate_cli_tokens(Model& model, mfq_tensor_backend::Tensor ids,
             (graph_env == nullptr || graph_env[0] != '0') &&
             !Model::is_flash_next &&
             mfq_cuda_graph_capture_supported() &&
-            g_dsv4_cpu_offload_layers.empty() &&
-            g_dense_cpu_layer_count == 0 &&
-            !g_moe_expert_cache &&
+            execution.dsv4_cpu_offload_layers.empty() &&
+            execution.dense_cpu_layer_count == 0 &&
+            !moe_expert_cache() &&
             model_parallel_cuda_graph_enabled() &&
             (!profile || profile_cuda_graph) && gen > 1;
         const char * cuda_profiler_env = std::getenv("MFQ_CUDA_PROFILER_RANGE");
@@ -158,7 +159,7 @@ int generate_cli_tokens(Model& model, mfq_tensor_backend::Tensor ids,
             std::cout << generated_ptr[i];
         }
         std::cout << "\n";
-        if (g_moe_expert_cache) {
+        if (moe_expert_cache()) {
             print_moe_expert_cache_stats(std::cout);
         }
         return 0;

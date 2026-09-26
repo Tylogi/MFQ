@@ -647,6 +647,7 @@ struct MixedMoeRuntime {
             const MoeRoutePlan & route,
             bool input_prequantized = false,
             int epilogue_mode = 0) const {
+        auto& execution = cuda_execution_context();
         if (epilogue_mode < 0 || epilogue_mode > 2 ||
                 (epilogue_mode != 0 &&
                  (!nint_only() || (out_per_expert % 2) != 0))) {
@@ -707,10 +708,12 @@ struct MixedMoeRuntime {
                 rows != nullptr || warps != nullptr || shared != nullptr;
         }();
         const bool use_f16_mma =
-            !disable_prefill_mma && !g_force_moe_prefill_mma_off &&
+            !disable_prefill_mma &&
+            !execution.force_moe_prefill_mma_off &&
             tokens >= prefill_mma_min_tokens && route.map_ready &&
             route.ids_dst.numel() == route.ids.numel();
-        const bool use_kl_mmq = g_kl_mmq_mode != KlMmqMode::Default;
+        const bool use_kl_mmq =
+            execution.kl_mmq_mode != KlMmqMode::Default;
         const bool nvq_hetero_prefill_ready = nvq_dispatch &&
             (nvq_dispatch->pool_count > 1 ||
              (out_per_expert >= 128 &&
@@ -721,7 +724,7 @@ struct MixedMoeRuntime {
         const bool use_nvq_decode =
             !use_f16_mma && !use_kl_mmq && nvq_dispatch &&
             nvq_dispatch->pool_count > 1 &&
-            tokens <= 8 && !g_force_moe_pool_path &&
+            tokens <= 8 && !execution.force_moe_pool_path &&
             !disable_nvq_hetero_decode;
         int nint_pool_phase = 0;
         if (input_prequantized && use_kl_mmq) {
@@ -824,7 +827,7 @@ struct MixedMoeRuntime {
             }
             if (use_kl_mmq) {
                 value = kl_mmq_prepare_activation(value);
-                ++g_kl_mmq_moe_calls;
+                ++execution.kl_mmq_moe_calls;
                 if (pool.family == MixedMoeFamily::Mxfp4) {
                     mxfp4_moe_grouped_matmul_pool_f16_cuda(
                         pool.mxfp4.values, pool.mxfp4.scales, value,
@@ -891,7 +894,7 @@ struct MixedMoeRuntime {
                     }
                     continue;
                 }
-                ++g_kl_mmq_fallback_calls;
+                ++execution.kl_mmq_fallback_calls;
                 throw std::runtime_error(
                     "KLD mixed routed FP16 encountered a non-VQ pool");
             }
@@ -1030,7 +1033,8 @@ struct MixedMoeRuntime {
             mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route,
             bool gelu) const {
-        if (nint_only() && g_kl_mmq_mode == KlMmqMode::Default) {
+        if (nint_only() &&
+                cuda_execution_context().kl_mmq_mode == KlMmqMode::Default) {
             return forward(x, route, false, gelu ? 2 : 1);
         }
         auto gate_up = forward(x, route);

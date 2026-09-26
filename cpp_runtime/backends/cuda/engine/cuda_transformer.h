@@ -3,6 +3,7 @@
 #include "quant_linear.h"
 #include "models/include/model_config.h"
 #include "cuda_execution.h"
+#include "moe_expert_cache.h"
 #include "mfq_cuda_ops.h"
 #include "mfq_cuda_paged_kv.h"
 
@@ -512,7 +513,7 @@ struct FFN {
             mfq_tensor_backend::Tensor gate_up_pair;
             mfq_tensor_backend::Tensor projected_hidden;
             if (swiglu_limit <= 0.0 &&
-                    !g_force_moe_materialized_swiglu &&
+                    !cuda_execution_context().force_moe_materialized_swiglu &&
                     gate_shard.weight
                         ->supports_projection_glu_epilogue()) {
                 projected_hidden = gate_shard.weight->forward_glu_output(
@@ -524,7 +525,7 @@ struct FFN {
             mfq_tensor_backend::Tensor down_pair;
             const bool allow_fusion =
                 gate_up_pair.defined() &&
-                !g_force_moe_materialized_swiglu &&
+                !cuda_execution_context().force_moe_materialized_swiglu &&
                 !disable_swiglu_quant_fusion &&
                 moe_small_glu_path_enabled(
                     static_cast<int>(gate_up_pair.size(0)));
@@ -617,7 +618,7 @@ struct FFN {
                     "MFQ_DIAGNOSTIC_IN_F32_DOWN");
             const bool use_f32_down =
                 rows >= 16 &&
-                g_kl_mmq_mode == KlMmqMode::Fp16 &&
+                cuda_execution_context().kl_mmq_mode == KlMmqMode::Fp16 &&
                 f32_down != nullptr &&
                 f32_down[0] == '1';
             if (use_f32_down) {
@@ -665,7 +666,7 @@ struct FFN {
         }
         if (is_moe) {
             const int64_t rows = xh.numel() / xh.size(-1);
-            if (g_moe_continuous_batch_cache_serial &&
+            if (moe_continuous_batch_cache_serial() &&
                     uses_moe_expert_cache() && rows > 1) {
                 // A bounded expert cache cannot safely admit the union of an
                 // arbitrary request batch: a miss in that union otherwise
@@ -786,7 +787,7 @@ struct FFN {
             }();
             auto prefetch_projection_bundle = [&]() {
                 if (disable_projection_bundle || cpu_moe_down ||
-                        g_moe_continuous_batch_cache_serial) {
+                        moe_continuous_batch_cache_serial()) {
                     return false;
                 }
                 if (moe_split_gate_up) {
@@ -875,7 +876,8 @@ struct FFN {
                     }();
                     const bool reuse_gate_activation =
                         !disable_activation_reuse &&
-                        g_kl_mmq_mode == KlMmqMode::Default &&
+                        cuda_execution_context().kl_mmq_mode ==
+                            KlMmqMode::Default &&
                         xf.size(0) <= 8 &&
                         active_gate->can_reuse_activation_for(*active_up);
                     auto gate = active_gate->forward(xf, route);
@@ -907,7 +909,7 @@ struct FFN {
                 }
                 const bool fuse_projection_glu =
                     swiglu_limit <= 0.0 &&
-                    !g_force_moe_materialized_swiglu &&
+                    !cuda_execution_context().force_moe_materialized_swiglu &&
                     active_gate_up->supports_projection_glu_epilogue();
                 if (fuse_projection_glu) {
                     projected_hidden = g_profiler.measure(
@@ -943,7 +945,7 @@ struct FFN {
             mfq_tensor_backend::Tensor down_pair;
             const bool allow_swiglu_quant_fusion =
                 gate_up_pair.defined() &&
-                !g_force_moe_materialized_swiglu &&
+                !cuda_execution_context().force_moe_materialized_swiglu &&
                 !disable_swiglu_quant_fusion &&
                 moe_small_glu_path_enabled(
                     static_cast<int>(gate_up_pair.size(0)));
@@ -989,7 +991,8 @@ struct FFN {
                 const char * value = std::getenv("MFQ_DISABLE_MOE_REDUCE_GATE_FUSION");
                 return value != nullptr && std::atoi(value) != 0;
             }();
-            const bool fuse_reduce_gate = !g_force_moe_unfused_reduce &&
+            const bool fuse_reduce_gate =
+                !cuda_execution_context().force_moe_unfused_reduce &&
                 !disable_reduce_gate_fusion && !moe_shared_ungated &&
                 down_pair.size(0) <= 8;
             mfq_tensor_backend::Tensor routed;
@@ -1430,11 +1433,13 @@ struct FullBlock : Block {
             const MfqOptional<mfq_tensor_backend::Tensor>& attention_mask,
             int64_t planned_kv_length,
             int64_t decode_attention_parts) {
+        auto& execution = cuda_execution_context();
         int64_t B = x.size(0), T = x.size(1), H = x.size(2);
         auto trace_qwen_stage = [&](const char* name, const mfq_tensor_backend::Tensor& value,
                                     int token_axis = 1) {
-            if (!attention_output_gate || g_gemma_stage_trace == nullptr ||
-                    layer != g_gemma_trace_layer) return;
+            if (!attention_output_gate ||
+                    execution.gemma_stage_trace == nullptr ||
+                    layer != execution.gemma_trace_layer) return;
             auto ordered = token_axis == 1 ? value : value.transpose(1, token_axis).contiguous();
             trace_gemma_stage(layer, name, ordered.reshape({B, T, -1}));
         };
@@ -1446,11 +1451,11 @@ struct FullBlock : Block {
         const int64_t nkh = kv_heads;
         const int64_t hd = attention_head_dim;
         const int64_t attn_width = nh * hd;
+        const auto kl_capacity = execution.kl_kv_cache_capacity;
         const int64_t cache_capacity = sliding
             ? attention_window
-            : (g_kl_kv_cache_capacity > 0
-                   ? std::max<int64_t>(
-                         cache_pos + T, g_kl_kv_cache_capacity)
+            : (kl_capacity > 0
+                   ? std::max<int64_t>(cache_pos + T, kl_capacity)
                    : max_position_embeddings);
         const RopeCache & active_rope = attention_rope.cos.defined() ? attention_rope : rope;
         if (!cache.defined()) {
@@ -2036,7 +2041,8 @@ struct FullBlock : Block {
             trace_gemma_stage(layer, "attention_output", oo);
             const bool fused_norms = gemma4_moe &&
                 gemma4_fused_norms_enabled() &&
-                g_gemma_stage_trace == nullptr && layer_scale.defined();
+                execution.gemma_stage_trace == nullptr &&
+                layer_scale.defined();
             mfq_tensor_backend::Tensor dense_input;
             mfq_tensor_backend::Tensor router_input;
             mfq_tensor_backend::Tensor moe_input;
@@ -2143,7 +2149,8 @@ struct FullBlock : Block {
                     gemma_moe_gate_up, gemma_moe_down, route);
             mfq_tensor_backend::Tensor down_pair;
             const bool tracing_layer =
-                g_gemma_stage_trace != nullptr && layer == g_gemma_trace_layer;
+                execution.gemma_stage_trace != nullptr &&
+                layer == execution.gemma_trace_layer;
             if (!tracing_layer &&
                     gemma_moe_gate_up
                         .supports_projection_glu_epilogue()) {

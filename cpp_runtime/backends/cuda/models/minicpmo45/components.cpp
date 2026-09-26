@@ -263,7 +263,7 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
 
         std::lock_guard<std::mutex> lock(model_mutex);
         MfqCudaGuard guard(
-            g_layer_placement.primary_device());
+            runtime.language.execution->layer_placement.primary_device());
         mfq_tensor_backend::manual_seed(static_cast<int64_t>(parameters.seed));
         mfq_cuda_manual_seed_all(parameters.seed);
         auto special_ids = MiniCPMO45DuplexSpecialIds::from_tensor(
@@ -325,7 +325,7 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
 
         std::lock_guard<std::mutex> lock(model_mutex);
         MfqCudaGuard guard(
-            g_layer_placement.primary_device());
+            runtime.language.execution->layer_placement.primary_device());
         if (!session) {
             throw std::runtime_error(
                 "MiniCPM-o duplex session is not prepared");
@@ -380,7 +380,7 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
     backend.stop = [&]() {
         std::lock_guard<std::mutex> lock(model_mutex);
         MfqCudaGuard guard(
-            g_layer_placement.primary_device());
+            runtime.language.execution->layer_placement.primary_device());
         session.reset();
         runtime.language.reset(1);
         runtime.audio.reset();

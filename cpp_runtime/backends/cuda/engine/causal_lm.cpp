@@ -343,6 +343,156 @@ void restore_dsv4_pool_session_state(
 namespace mfq::cuda {
 
 template <CudaBackbone Backbone>
+bool CausalLm<Backbone>::supports_qwen_speculation() const {
+    if constexpr (
+            Backbone != CudaBackbone::generic_qwen && !is_flash_next) {
+        return false;
+    }
+    return !blocks.empty() && std::all_of(
+        blocks.begin(), blocks.end(),
+        [](const auto& block) { return block->supports_speculation(); });
+}
+
+template <CudaBackbone Backbone>
+bool CausalLm<Backbone>::supports_deepseek_v41_speculation() const {
+    if constexpr (!is_deepseek_v41) return false;
+    return !blocks.empty() && std::all_of(
+        blocks.begin(), blocks.end(),
+        [](const auto& block) { return block->supports_speculation(); });
+}
+
+template <CudaBackbone Backbone>
+void CausalLm<Backbone>::begin_speculative_suffix(int64_t draft_tokens) {
+    if constexpr (!is_deepseek_v41) {
+        throw std::runtime_error(
+            "speculative suffix requires DeepseekV41CausalLm");
+    } else {
+        MFQ_RUNTIME_CHECK(
+            supports_deepseek_v41_speculation() &&
+                speculative_start < 0 && draft_tokens > 0 &&
+                cache_pos + draft_tokens <= max_position_embeddings() &&
+                this->shared,
+            "invalid DeepSeek-V4.1 speculative suffix");
+        speculative_start = cache_pos;
+        speculative_confirmed = 0;
+        this->shared->begin_speculative();
+        std::size_t begun = 0;
+        try {
+            for (auto& block : blocks) {
+                MfqCudaGuard guard(block->cuda_device);
+                block->begin_speculative(draft_tokens);
+                ++begun;
+            }
+        } catch (...) {
+            for (std::size_t index = 0; index < begun; ++index) {
+                try {
+                    MfqCudaGuard guard(blocks[index]->cuda_device);
+                    blocks[index]->commit_speculative();
+                } catch (...) {}
+            }
+            try { this->shared->rollback_speculative(); } catch (...) {}
+            speculative_start = -1;
+            speculative_confirmed = 0;
+            throw;
+        }
+    }
+}
+
+template <CudaBackbone Backbone>
+void CausalLm<Backbone>::commit_speculative() {
+    MFQ_RUNTIME_CHECK(
+        speculative_start >= 0,
+        "no speculative transaction to commit");
+    for (auto& block : blocks) {
+        MfqCudaGuard guard(block->cuda_device);
+        block->commit_speculative();
+    }
+    if constexpr (is_deepseek_v41) {
+        MFQ_RUNTIME_CHECK(
+            this->shared,
+            "DeepSeek-V4.1 speculative state is unavailable");
+        this->shared->commit_speculative();
+    }
+    speculative_start = -1;
+    speculative_confirmed = 0;
+}
+
+template <CudaBackbone Backbone>
+void CausalLm<Backbone>::rollback_speculative(int64_t accepted_suffix) {
+    MFQ_RUNTIME_CHECK(
+        speculative_start >= 0 && accepted_suffix >= 0,
+        "no speculative transaction to roll back");
+    const int64_t keep =
+        speculative_start + speculative_confirmed + accepted_suffix;
+    for (auto& block : blocks) {
+        MfqCudaGuard guard(block->cuda_device);
+        block->rollback_speculative(keep);
+    }
+    if constexpr (is_deepseek_v41) {
+        MFQ_RUNTIME_CHECK(
+            this->shared,
+            "DeepSeek-V4.1 speculative state is unavailable");
+        this->shared->rollback_speculative();
+    }
+    cache_pos = keep;
+    if constexpr (is_qwen4) {
+        if (this->positions.defined()) {
+            this->positions = this->positions.narrow(-1, 0, cache_pos);
+        }
+    }
+    speculative_start = -1;
+    speculative_confirmed = 0;
+}
+
+template <CudaBackbone Backbone>
+mfq_tensor_backend::Tensor CausalLm<Backbone>::finalize_hidden(
+        mfq_tensor_backend::Tensor x, int64_t batch, int64_t tokens) {
+    if constexpr (is_qwen4) return this->final_mixer->pre(x)[0];
+    if constexpr (is_glm5) {
+        return glm5_next::rms_norm(
+            x.mean(2), output_norm, rms_norm_eps());
+    }
+    if constexpr (Backbone == CudaBackbone::deepseek_v4) {
+        x = g_profiler.measure("model.dsv4_hc_head", [&]() {
+            auto flat = x.flatten(2).to(mfq_tensor_backend::kFloat32);
+            auto inverse_rms = mfq_tensor_backend::rsqrt(
+                flat.square().mean(-1, true) + rms_norm_eps());
+            auto mixes = mfq_tensor_backend::matmul(
+                flat, this->hc_head_fn.transpose(0, 1)) * inverse_rms;
+            auto pre = mfq_tensor_backend::sigmoid(
+                mixes * this->hc_head_scale + this->hc_head_base) + hc_eps();
+            return (
+                pre.unsqueeze(-1) *
+                flat.reshape({batch, tokens, hc_mult(), hidden_size()}))
+                .sum(2).to(mfq_tensor_backend::kFloat16).contiguous();
+        });
+    }
+    if constexpr (is_deepseek_v41) {
+        MFQ_RUNTIME_CHECK(
+            this->shared,
+            "DeepSeek-V4.1 final state is unavailable");
+        x = g_profiler.measure(
+            "model.deepseek_v41.final_collapse", [&]() {
+                return this->shared->final_collapse(
+                    x, this->shared->config.n_layers);
+            });
+    }
+    return g_profiler.measure("model.output_norm", [&]() {
+        if constexpr (is_minicpmo45) {
+            return qwen_rms_norm_bf16(
+                x.reshape({batch * tokens, hidden_size()}), output_norm,
+                rms_norm_eps(), norm_weight_offset())
+                .reshape({batch, tokens, hidden_size()});
+        }
+        return qwen_rms_norm(
+            x.reshape({batch * tokens, hidden_size()})
+                .to(mfq_tensor_backend::kFloat32),
+            output_norm, rms_norm_eps(), norm_weight_offset())
+            .reshape({batch, tokens, hidden_size()});
+    });
+}
+
+template <CudaBackbone Backbone>
 TextSessionStateKind CudaSessionCodec<Backbone>::kind(
         const CausalLm<Backbone>& model) {
     const auto& blocks = model.blocks;
@@ -589,8 +739,16 @@ void CudaSessionCodec<Backbone>::restore(
     model.cache_pos = state.cache_pos;
 }
 
-#define MFQ_INSTANTIATE_SESSION_CODEC(BACKBONE) \
-    template struct CudaSessionCodec<BACKBONE>;
+#define MFQ_INSTANTIATE_SESSION_CODEC(BACKBONE)                           \
+    template struct CudaSessionCodec<BACKBONE>;                           \
+    template bool CausalLm<BACKBONE>::supports_qwen_speculation() const; \
+    template bool CausalLm<BACKBONE>::                                   \
+        supports_deepseek_v41_speculation() const;                       \
+    template void CausalLm<BACKBONE>::begin_speculative_suffix(int64_t); \
+    template void CausalLm<BACKBONE>::commit_speculative();              \
+    template void CausalLm<BACKBONE>::rollback_speculative(int64_t);     \
+    template mfq_tensor_backend::Tensor CausalLm<BACKBONE>::             \
+        finalize_hidden(mfq_tensor_backend::Tensor, int64_t, int64_t);
 
 MFQ_INSTANTIATE_SESSION_CODEC(CudaBackbone::generic_qwen)
 MFQ_INSTANTIATE_SESSION_CODEC(CudaBackbone::minicpmo45)

@@ -11,6 +11,7 @@ std::unique_ptr<::Block> load_block(
         const std::string& type,
         const std::shared_ptr<::Dsv4SharedState>& state) {
         const auto& config = c;
+        auto& execution = cuda_execution_context();
         if (type != "deepseek_v4" || !state) {
             throw std::runtime_error(
                 "invalid DeepSeek V4 block loader state");
@@ -132,7 +133,7 @@ std::unique_ptr<::Block> load_block(
         }
         b->ffn.moe_split_gate_up = has_split_gate;
         const bool cpu_offload =
-            g_dsv4_cpu_offload_layers.count(i) != 0;
+            execution.dsv4_cpu_offload_layers.count(i) != 0;
         if (cpu_offload) {
             if (b->ffn.moe_split_gate_up) {
                 b->ffn.cpu_moe_gate = load_mfe_cpu_offloaded(
@@ -159,14 +160,14 @@ std::unique_ptr<::Block> load_block(
                 : b->ffn.moe_gate_up.mixed_weight_bytes;
             const int64_t down_bytes =
                 b->ffn.moe_down.mixed_weight_bytes;
-            g_dsv4_cpu_offload_host_bytes +=
+            execution.dsv4_cpu_offload_host_bytes +=
                 gate_up_bytes + down_bytes;
             std::cerr
                 << "cpu_offload layer=" << i
                 << " gate_up_bytes=" << gate_up_bytes
                 << " down_bytes=" << down_bytes
                 << " total_host_bytes="
-                << g_dsv4_cpu_offload_host_bytes
+                << execution.dsv4_cpu_offload_host_bytes
                 << std::endl;
         } else {
             if (b->ffn.moe_split_gate_up) {
@@ -275,15 +276,16 @@ void validate_load_options(const Config& config) {
         throw std::runtime_error(
             "unsupported DeepSeek V4 CUDA configuration");
     }
-    if (g_dsv4_cpu_offload_layers.empty()) return;
-    for (int layer : g_dsv4_cpu_offload_layers) {
+    auto& execution = cuda_execution_context();
+    if (execution.dsv4_cpu_offload_layers.empty()) return;
+    for (int layer : execution.dsv4_cpu_offload_layers) {
         if (layer < 0 || layer >= config.num_hidden_layers) {
             throw std::runtime_error(
                 "CPU-offload layer is outside the model: " +
                 std::to_string(layer));
         }
     }
-    g_dsv4_cpu_offload_host_bytes = 0;
+    execution.dsv4_cpu_offload_host_bytes = 0;
     g_mfq_drop_file_cache = true;
 }
 

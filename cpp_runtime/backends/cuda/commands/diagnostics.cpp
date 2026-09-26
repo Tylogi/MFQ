@@ -297,7 +297,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 parse_kl_mmq_mode(kl_mmq_arg));
             const auto tensor_names =
                 parse_tensor_names(check_mfe_tensor);
-            if (g_moe_expert_cache &&
+            if (moe_expert_cache() &&
                     tensor_names.size() != 1) {
                 throw std::runtime_error(
                     "cached --check-mfe-tensor accepts one tensor "
@@ -483,7 +483,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
         if (!prefill_sweep_sizes.empty()) {
             const int status = run_prefill_sweep(
                 model, prefill_sweep_sizes, prefill_sweep_reps);
-            if (g_moe_expert_cache) {
+            if (moe_expert_cache()) {
                 print_moe_expert_cache_stats(std::cout);
             }
             return status;
@@ -668,12 +668,12 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 std::vector<std::pair<std::string, mfq_tensor_backend::Tensor>> gemma_trace;
                 mfq_tensor_backend::Tensor logits;
                 if (trace_repeat) {
-                    g_gemma_trace_layer = 0;
-                    g_gemma_stage_trace = &gemma_trace;
+                    model.execution->gemma_trace_layer = 0;
+                    model.execution->gemma_stage_trace = &gemma_trace;
                     auto hidden = model.hidden_forward(
                         ids, mfq_nullopt, mfq_nullopt, &trace);
-                    g_gemma_stage_trace = nullptr;
-                    g_gemma_trace_layer = -1;
+                    model.execution->gemma_stage_trace = nullptr;
+                    model.execution->gemma_trace_layer = -1;
                     auto last = hidden.index({Slice(), -1, Slice()})
                         .to(mfq_tensor_backend::kFloat16).contiguous();
                     logits = model.lm_head.forward(last);

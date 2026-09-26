@@ -2,8 +2,10 @@
 #include "inference.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -118,6 +120,31 @@ int main() {
         });
     producer.join();
     require(batch_tokens == 1 && batch_prefilled);
+
+    using BatchRequest = mfq::engine::ContinuousBatchRequest;
+    mfq::engine::ContinuousBatchQueue<BatchRequest> queue(2);
+    auto first = std::make_shared<BatchRequest>(
+        std::vector<int64_t>{1}, MfqSamplingParams{}, nullptr);
+    auto second = std::make_shared<BatchRequest>(
+        std::vector<int64_t>{2}, MfqSamplingParams{}, nullptr);
+    auto third = std::make_shared<BatchRequest>(
+        std::vector<int64_t>{3}, MfqSamplingParams{}, nullptr);
+    queue.submit(first);
+    queue.submit(second);
+    queue.submit(third);
+    require(queue.wait_for_work(false, std::chrono::microseconds(0)));
+    const auto admitted = queue.take(1, 2);
+    require(admitted.size() == 1 && admitted.front() == first);
+    require(queue.size() == 2);
+    const auto drained = queue.stop_and_drain();
+    require(drained.size() == 2 && queue.stopping());
+    bool rejected_submit = false;
+    try {
+        queue.submit(first);
+    } catch (const std::runtime_error&) {
+        rejected_submit = true;
+    }
+    require(rejected_submit);
 
     const std::vector<std::int64_t> prompt{1, 2, 3, 4};
     MfqSamplingParams sampling;

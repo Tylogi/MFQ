@@ -166,7 +166,7 @@ struct EvalCommand : mfq::cuda::EvalCommandOptions {
                 throw std::runtime_error(
                     "--kl-chunks-sequence is unavailable for streamed KL");
             }
-            if (g_moe_expert_cache) {
+            if (moe_expert_cache()) {
                 throw std::runtime_error(
                     "--moe-gpu-cache-gb is unavailable for streamed KL");
             }
@@ -211,7 +211,7 @@ struct EvalCommand : mfq::cuda::EvalCommandOptions {
                     kl_evaluator,
                     kl_n_batch, kl_score_count,
                     kl_reference_contract);
-                if (g_moe_expert_cache) {
+                if (moe_expert_cache()) {
                     print_moe_expert_cache_stats(std::cout);
                 }
                 return status;
@@ -230,7 +230,7 @@ struct EvalCommand : mfq::cuda::EvalCommandOptions {
                 std::cout << "cpp_kl_sequence_end index=" << index
                           << " chunks=" << chunks << "\n";
             }
-            if (g_moe_expert_cache) {
+            if (moe_expert_cache()) {
                 print_moe_expert_cache_stats(std::cout);
             }
             return 0;

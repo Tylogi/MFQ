@@ -160,8 +160,10 @@ std::unique_ptr<::Block> load_block(
 }
 
 void validate_load_options() {
-    if (g_tensor_parallel.enabled() || g_layer_placement.enabled() ||
-            g_n_gpu_layers >= 0) {
+    const auto& execution = cuda_execution_context();
+    if (execution.tensor_parallel.enabled() ||
+            execution.layer_placement.enabled() ||
+            execution.n_gpu_layers >= 0) {
         throw std::runtime_error(
             "DeepSeek-V4.1 native CUDA currently supports single-device dense "
             "placement or expert parallelism");

@@ -258,7 +258,7 @@ int run_transport_runtime(RuntimeOptions& options) {
         : make_mfq_http_transport(transport_config);
     MfqRuntime runtime(std::move(engine), std::move(transport));
     const int status = runtime.run();
-    if (g_moe_expert_cache) {
+    if (moe_expert_cache()) {
         print_moe_expert_cache_stats(std::cout);
     }
     return status;

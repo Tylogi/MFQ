@@ -197,9 +197,16 @@ int run_cpu_linear_check(
     MFQ_RUNTIME_CHECK(reps >= 1, "--check-linear-reps must be positive");
     auto model_source = mfq::open_model_source(model_path);
     const auto& mfq = *model_source;
-    g_loading_cpu_layer = true;
-    auto cpu_linear = load_quant_linear(mfq, name);
-    g_loading_cpu_layer = false;
+    auto& execution = cuda_execution_context();
+    execution.loading_cpu_layer = true;
+    QuantLinear cpu_linear;
+    try {
+        cpu_linear = load_quant_linear(mfq, name);
+    } catch (...) {
+        execution.loading_cpu_layer = false;
+        throw;
+    }
+    execution.loading_cpu_layer = false;
     auto cuda_linear = load_quant_linear(mfq, name);
     const int64_t width = cpu_linear.neuron_len();
     auto x = mfq_tensor_backend::arange(
@@ -256,8 +263,9 @@ int run_tensor_parallel_linear_check(
         const std::string & name,
         TensorParallelAxis axis,
         int M) {
+    auto& execution = cuda_execution_context();
     MFQ_RUNTIME_CHECK(
-        g_tensor_parallel.enabled(),
+        execution.tensor_parallel.enabled(),
         "--check-tp-linear requires --tensor-parallel");
     MFQ_RUNTIME_CHECK(
         axis == TensorParallelAxis::Output ||
@@ -268,14 +276,18 @@ int run_tensor_parallel_linear_check(
         "--check-tp-m must be in [1, 4096]");
     auto model_source = mfq::open_model_source(model_path);
     const auto& mfq = *model_source;
-    const ParallelConfig saved =
-        g_tensor_parallel;
-    g_tensor_parallel = {};
-    g_tensor_parallel.devices = {
-        saved.primary_device()};
-    auto full = load_quant_linear(
-        mfq, name, TensorParallelAxis::Mirrored);
-    g_tensor_parallel = saved;
+    const ParallelConfig saved = execution.tensor_parallel;
+    execution.tensor_parallel = {};
+    execution.tensor_parallel.devices = {saved.primary_device()};
+    QuantLinear full;
+    try {
+        full = load_quant_linear(
+            mfq, name, TensorParallelAxis::Mirrored);
+    } catch (...) {
+        execution.tensor_parallel = saved;
+        throw;
+    }
+    execution.tensor_parallel = saved;
     auto sharded = load_quant_linear(
         mfq, name, axis);
     MFQ_RUNTIME_CHECK(
@@ -1018,16 +1030,24 @@ int run_expert_parallel_moe_check(
     const std::string role =
         tensor_name.find("gate_up") != std::string::npos
         ? "gate_up" : "diagnostic";
-    const ParallelConfig saved_tensor = g_tensor_parallel;
-    const ParallelConfig saved_expert = g_expert_parallel;
+    auto& execution = cuda_execution_context();
+    const ParallelConfig saved_tensor = execution.tensor_parallel;
+    const ParallelConfig saved_expert = execution.expert_parallel;
     const ParallelConfig saved = moe_parallel_config();
-    g_tensor_parallel = {};
-    g_expert_parallel = {};
-    g_expert_parallel.devices = {saved.primary_device()};
-    auto full = load_mfe_gpu(
-        mfq, tensor_name, false, 0, role);
-    g_tensor_parallel = saved_tensor;
-    g_expert_parallel = saved_expert;
+    execution.tensor_parallel = {};
+    execution.expert_parallel = {};
+    execution.expert_parallel.devices = {saved.primary_device()};
+    MfeWeight full;
+    try {
+        full = load_mfe_gpu(
+            mfq, tensor_name, false, 0, role);
+    } catch (...) {
+        execution.tensor_parallel = saved_tensor;
+        execution.expert_parallel = saved_expert;
+        throw;
+    }
+    execution.tensor_parallel = saved_tensor;
+    execution.expert_parallel = saved_expert;
     auto sharded = load_mfe_gpu(
         mfq, tensor_name, false, 0, role);
     MFQ_RUNTIME_CHECK(
@@ -1150,7 +1170,7 @@ int run_mfe_tensor_check(
     const auto& mfq = *model_source;
     auto weight = load_mfe_gpu(
         mfq, tensor_name, true, 0, "diagnostic");
-    if (g_moe_expert_cache &&
+    if (moe_expert_cache() &&
             !moe_expert_cache_finalized()) {
         finalize_moe_expert_cache();
     }
@@ -1476,7 +1496,7 @@ int run_mfe_tensor_check(
                   << " max_abs=" << diff.abs().max().item<double>()
                   << "\n";
     }
-    if (g_moe_expert_cache) {
+    if (moe_expert_cache()) {
         print_moe_expert_cache_stats(std::cout);
     }
     return 0;
@@ -1488,6 +1508,7 @@ static int run_gemma_moe_check(
         int layer,
         const std::vector<int64_t> & token_sizes,
     int reps) {
+    auto& execution = cuda_execution_context();
     const std::string prefix =
         "model.block." + std::to_string(layer) + ".mlp.experts.";
     auto gate_up = load_mfe_gpu(
@@ -1496,7 +1517,7 @@ static int run_gemma_moe_check(
     auto down = load_mfe_gpu(
         mfq, prefix + "down.weight",
         true, layer, "down");
-    if (g_moe_expert_cache &&
+    if (moe_expert_cache() &&
             !moe_expert_cache_finalized()) {
         finalize_moe_expert_cache();
     }
@@ -1656,15 +1677,15 @@ static int run_gemma_moe_check(
         }
 
         if (tokens != 1) {
-            g_force_moe_prefill_mma_off = false;
+            execution.force_moe_prefill_mma_off = false;
             auto mma = time_ms(forward, reps);
             auto mma_first = mma.second.clone();
             auto mma_repeat = forward().clone();
             mfq_cuda_synchronize();
-            g_force_moe_prefill_mma_off = true;
+            execution.force_moe_prefill_mma_off = true;
             auto baseline = time_ms(forward, reps);
             mfq_cuda_synchronize();
-            g_force_moe_prefill_mma_off = false;
+            execution.force_moe_prefill_mma_off = false;
             auto repeat_diff = (mma_repeat - mma_first).abs().to(mfq_tensor_backend::kFloat32);
             auto baseline_diff = (mma_first - baseline.second).abs().to(mfq_tensor_backend::kFloat32);
             std::cout << std::setprecision(6)
@@ -1723,7 +1744,7 @@ static int run_gemma_moe_check(
             }
         }
     }
-    if (g_moe_expert_cache) {
+    if (moe_expert_cache()) {
         print_moe_expert_cache_stats(std::cout);
     }
     return 0;
@@ -1735,6 +1756,7 @@ int run_moe_check(
         int layer,
         const std::vector<int64_t> & token_sizes,
         int reps) {
+    auto& execution = cuda_execution_context();
     if (layer < 0) throw std::runtime_error("--check-moe-layer must be nonnegative");
     if (reps < 1) throw std::runtime_error("--check-moe-reps must be positive");
     if (token_sizes.empty() || std::any_of(token_sizes.begin(), token_sizes.end(),
@@ -1807,7 +1829,7 @@ int run_moe_check(
         throw std::runtime_error(
             "selected layer does not contain MFE MoE weights");
     }
-    if (g_moe_expert_cache &&
+    if (moe_expert_cache() &&
             !moe_expert_cache_finalized()) {
         finalize_moe_expert_cache();
     }
@@ -1865,10 +1887,16 @@ int run_moe_check(
         const char * prefill_ab_env = std::getenv("MFQ_CHECK_MOE_PREFILL_MMA_AB");
         if (prefill_ab_env != nullptr && std::atoi(prefill_ab_env) != 0 && tokens >= 9) {
             auto candidate = output.clone();
-            g_force_moe_prefill_mma_off = true;
-            auto baseline = ffn.forward(x);
-            mfq_cuda_synchronize();
-            g_force_moe_prefill_mma_off = false;
+            execution.force_moe_prefill_mma_off = true;
+            mfq_tensor_backend::Tensor baseline;
+            try {
+                baseline = ffn.forward(x);
+                mfq_cuda_synchronize();
+            } catch (...) {
+                execution.force_moe_prefill_mma_off = false;
+                throw;
+            }
+            execution.force_moe_prefill_mma_off = false;
             auto diff = (candidate - baseline).to(mfq_tensor_backend::kFloat32);
             const double baseline_norm = baseline.to(mfq_tensor_backend::kFloat32).norm().item<double>();
             std::cout << "moe_prefill_mma_ab"
@@ -1884,14 +1912,22 @@ int run_moe_check(
         const char * exact_env = std::getenv("MFQ_CHECK_MOE_POOL_EXACT");
         if (exact_env != nullptr && std::atoi(exact_env) != 0 && tokens <= 8) {
             auto candidate = output;
-            g_force_moe_pool_path = true;
-            g_force_moe_unfused_reduce = true;
-            g_force_moe_materialized_swiglu = true;
-            auto baseline = ffn.forward(x);
-            mfq_cuda_synchronize();
-            g_force_moe_pool_path = false;
-            g_force_moe_unfused_reduce = false;
-            g_force_moe_materialized_swiglu = false;
+            execution.force_moe_pool_path = true;
+            execution.force_moe_unfused_reduce = true;
+            execution.force_moe_materialized_swiglu = true;
+            mfq_tensor_backend::Tensor baseline;
+            try {
+                baseline = ffn.forward(x);
+                mfq_cuda_synchronize();
+            } catch (...) {
+                execution.force_moe_pool_path = false;
+                execution.force_moe_unfused_reduce = false;
+                execution.force_moe_materialized_swiglu = false;
+                throw;
+            }
+            execution.force_moe_pool_path = false;
+            execution.force_moe_unfused_reduce = false;
+            execution.force_moe_materialized_swiglu = false;
             auto diff = (candidate - baseline).abs().to(mfq_tensor_backend::kFloat32);
             std::cout << "moe_exact_result"
                       << " equal=" << (candidate.equal(baseline) ? 1 : 0)
@@ -1909,7 +1945,7 @@ int run_moe_check(
         g_profiler.enabled = false;
         g_profiler.reset();
     }
-    if (g_moe_expert_cache) {
+    if (moe_expert_cache()) {
         print_moe_expert_cache_stats(std::cout);
     }
     return 0;

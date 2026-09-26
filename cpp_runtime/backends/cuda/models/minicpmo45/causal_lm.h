@@ -1000,7 +1000,8 @@ struct MiniCPMO45TtsDecoder {
             auto block = load_transformer_block(
                 mfq, result.config, index, "full_attention", false, "tts");
             static_cast<FullBlock&>(*block).norm_weight_offset = 0.0;
-            block->cuda_device = g_layer_placement.primary_device();
+            block->cuda_device =
+                cuda_execution_context().layer_placement.primary_device();
             result.blocks.push_back(std::move(block));
         }
         return result;
@@ -1474,10 +1475,9 @@ struct MiniCPMO45Runtime {
             mfq::cuda::MiniCPMO45CausalLm language) {
         MiniCPMO45Runtime result;
         result.language = std::move(language);
-        g_layer_placement.load_device =
-            g_layer_placement.primary_device();
-        MfqCudaGuard guard(
-            g_layer_placement.primary_device());
+        auto& placement = result.language.execution->layer_placement;
+        placement.load_device = placement.primary_device();
+        MfqCudaGuard guard(placement.primary_device());
         const auto& mfq = *result.language.source;
         result.vision = MiniCPMO45VisionEncoder::load(mfq);
         result.resampler = MiniCPMO45Resampler::load(mfq);

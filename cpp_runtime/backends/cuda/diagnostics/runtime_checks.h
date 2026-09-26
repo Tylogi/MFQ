@@ -96,23 +96,24 @@ static int run_block_trace_compare(
     int64_t context_size,
     mfq_tensor_backend::Tensor ids)
 {
+    auto& execution = cuda_execution_context();
     Model reference = [&]() {
-        if (g_n_gpu_layers < 0) {
+        if (execution.n_gpu_layers < 0) {
             return mfq::cuda::load_causal_lm<Model::backbone>(
                 reference_model_path, config_path, context_size);
         }
-        const int saved_n_gpu_layers = g_n_gpu_layers;
-        const int saved_cpu_layers = g_dense_cpu_layer_count;
-        g_n_gpu_layers = -1;
+        const int saved_n_gpu_layers = execution.n_gpu_layers;
+        const int saved_cpu_layers = execution.dense_cpu_layer_count;
+        execution.n_gpu_layers = -1;
         try {
             auto loaded = mfq::cuda::load_causal_lm<Model::backbone>(
                 reference_model_path, config_path, context_size);
-            g_n_gpu_layers = saved_n_gpu_layers;
-            g_dense_cpu_layer_count = saved_cpu_layers;
+            execution.n_gpu_layers = saved_n_gpu_layers;
+            execution.dense_cpu_layer_count = saved_cpu_layers;
             return loaded;
         } catch (...) {
-            g_n_gpu_layers = saved_n_gpu_layers;
-            g_dense_cpu_layer_count = saved_cpu_layers;
+            execution.n_gpu_layers = saved_n_gpu_layers;
+            execution.dense_cpu_layer_count = saved_cpu_layers;
             throw;
         }
     }();
@@ -402,6 +403,7 @@ static int run_dsv4_hc_model_compare(
 static int run_qwen35_mtp_check(
         mfq::cuda::Qwen35CausalLm& model, Qwen35Mtp& mtp) {
     using Tensor = mfq_tensor_backend::Tensor;
+    auto& execution = *model.execution;
     const MtpTarget target{
         [&model](Tensor ids) {
             return model.embed_forward(std::move(ids));
@@ -478,11 +480,11 @@ static int run_qwen35_mtp_check(
         (void)model.hidden_forward(ids(prompt));
         std::vector<Tensor> verify_trace;
         std::vector<std::pair<std::string, Tensor>> verify_stages;
-        g_gemma_trace_layer = 3;
-        g_gemma_stage_trace = &verify_stages;
+        execution.gemma_trace_layer = 3;
+        execution.gemma_stage_trace = &verify_stages;
         (void)model.hidden_forward(ids({37, 41, 43}), mfq_nullopt, mfq_nullopt,
             &verify_trace, mfq_nullopt, nullptr, 1);
-        g_gemma_stage_trace = nullptr;
+        execution.gemma_stage_trace = nullptr;
         if (accepted_drafts == 2) model.commit_speculative();
         else model.rollback_speculative(accepted_drafts);
         MFQ_RUNTIME_CHECK(
@@ -500,10 +502,10 @@ static int run_qwen35_mtp_check(
         (void)model.hidden_forward(ids(prompt));
         std::vector<Tensor> serial_trace;
         std::vector<std::pair<std::string, Tensor>> serial_stages;
-        g_gemma_stage_trace = &serial_stages;
+        execution.gemma_stage_trace = &serial_stages;
         (void)model.hidden_forward(ids({37}), mfq_nullopt, mfq_nullopt,
             &serial_trace);
-        g_gemma_stage_trace = nullptr;
+        execution.gemma_stage_trace = nullptr;
         MFQ_RUNTIME_CHECK(verify_stages.size() == serial_stages.size() && !verify_stages.empty(),
             "MTP full-attention stage trace mismatch");
         for (size_t stage = 0; stage < verify_stages.size(); ++stage) {
@@ -544,18 +546,18 @@ static int run_qwen35_mtp_check(
     for (int tokens = 2; tokens <= 6; ++tokens) {
         auto next = ids(prompt).narrow(1, 1, tokens);
         std::vector<std::pair<std::string, Tensor>> batch_stages, row_stages;
-        g_gemma_trace_layer = 0;
-        if (tokens == 2) g_gemma_stage_trace = &batch_stages;
+        execution.gemma_trace_layer = 0;
+        if (tokens == 2) execution.gemma_stage_trace = &batch_stages;
         mtp.reset();
         auto batched = mtp.forward(
             target, raw.narrow(1, 0, tokens), next).clone();
         mtp.reset();
-        if (tokens == 2) g_gemma_stage_trace = &row_stages;
+        if (tokens == 2) execution.gemma_stage_trace = &row_stages;
         std::vector<Tensor> serial;
         for (int t = 0; t < tokens; ++t)
             serial.push_back(mtp.forward(
                 target, raw.narrow(1, t, 1), next.narrow(1, t, 1)));
-        g_gemma_stage_trace = nullptr;
+        execution.gemma_stage_trace = nullptr;
         if (tokens == 2) {
             MFQ_RUNTIME_CHECK(row_stages.size() == 2 * batch_stages.size(),
                 "MTP predictor diagnostic stage count mismatch");

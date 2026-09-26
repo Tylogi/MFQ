@@ -245,11 +245,12 @@ struct CudaGenerationOps {
         const std::int32_t minimum_tokens = minimum
             ? std::max<std::int32_t>(2, std::atoi(minimum))
             : 16;
+        const auto& execution = cuda_execution_context();
         return (!prepared || !prepared->transformed()) && !constraint &&
             (enabled == nullptr || enabled[0] != '0') &&
             !Model::is_flash_next && mfq_cuda_graph_capture_supported() &&
-            g_dsv4_cpu_offload_layers.empty() &&
-            g_dense_cpu_layer_count == 0 && !g_moe_expert_cache &&
+            execution.dsv4_cpu_offload_layers.empty() &&
+            execution.dense_cpu_layer_count == 0 && !moe_expert_cache() &&
             model_parallel_cuda_graph_enabled() &&
             generation_limit >= minimum_tokens &&
             generation_limit <= graph.generated_capacity;

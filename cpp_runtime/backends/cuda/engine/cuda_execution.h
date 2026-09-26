@@ -406,33 +406,46 @@ struct CudaExecutionContext {
 
 CudaExecutionContext& cuda_execution_context();
 
-// Transitional aliases keep kernels unchanged while ownership moves into the
-// concrete context above. New state belongs on CudaExecutionContext.
-extern CudaProfiler& g_profiler;
-extern bool& g_force_moe_pool_path;
-extern bool& g_force_moe_unfused_reduce;
-extern bool& g_force_moe_materialized_swiglu;
-extern bool& g_force_moe_prefill_mma_off;
-extern thread_local bool g_moe_continuous_batch_cache_serial;
-extern KlMmqMode& g_kl_mmq_mode;
-extern int64_t& g_kl_mmq_activation_quantize_calls;
-extern int64_t& g_kl_mmq_dense_calls;
-extern int64_t& g_kl_mmq_moe_calls;
-extern int64_t& g_kl_mmq_fallback_calls;
-extern int64_t& g_kl_kv_cache_capacity;
-extern std::unordered_set<int>& g_dsv4_cpu_offload_layers;
-extern int64_t& g_dsv4_cpu_offload_host_bytes;
-extern int& g_n_gpu_layers;
-extern int& g_dense_cpu_layer_count;
-extern bool& g_loading_cpu_layer;
-extern int& g_moe_cache_registration_min_slots;
-extern int& g_gemma_trace_layer;
-extern std::vector<std::pair<std::string, mfq_tensor_backend::Tensor>>*&
-    g_gemma_stage_trace;
-extern ParallelConfig& g_tensor_parallel;
-extern ParallelConfig& g_expert_parallel;
-extern ModelParallelCollectiveRuntime& g_model_parallel_collectives;
-extern LayerPlacementConfig& g_layer_placement;
+// ponytail: stateless compatibility facade; delete when operator signatures
+// carry CudaExecutionContext. Profiler state remains owned by the context.
+class CudaProfilerAccess {
+public:
+    class Flag {
+    public:
+        explicit constexpr Flag(bool CudaProfiler::*member)
+            : member_(member) {}
+
+        const Flag& operator=(bool value) const {
+            cuda_execution_context().profiler.*member_ = value;
+            return *this;
+        }
+
+        operator bool() const {
+            return cuda_execution_context().profiler.*member_;
+        }
+
+    private:
+        bool CudaProfiler::*member_;
+    };
+
+    template <typename Fn>
+    auto measure(const std::string& name, Fn&& fn) const
+            -> decltype(cuda_execution_context().profiler.measure(
+                name, std::forward<Fn>(fn))) {
+        return cuda_execution_context().profiler.measure(
+            name, std::forward<Fn>(fn));
+    }
+
+    void reset() const { cuda_execution_context().profiler.reset(); }
+    void report(const std::string& title) const {
+        cuda_execution_context().profiler.report(title);
+    }
+
+    const Flag enabled{&CudaProfiler::enabled};
+    const Flag graph_events{&CudaProfiler::graph_events};
+};
+
+inline const CudaProfilerAccess g_profiler;
 
 void mfq_set_env(const char* name, const char* value);
 void mfq_release_host_allocator_cache() noexcept;
@@ -468,46 +481,54 @@ void report_cuda_memory(const char* stage);
 bool moe_small_glu_path_enabled(int tokens);
 
 struct KlMmqScope {
+    CudaExecutionContext& execution;
     KlMmqMode previous_mode;
     int64_t previous_activation_quantize_calls;
     int64_t previous_dense_calls;
     int64_t previous_moe_calls;
     int64_t previous_fallback_calls;
 
-    explicit KlMmqScope(KlMmqMode mode)
-        : previous_mode(g_kl_mmq_mode),
+    explicit KlMmqScope(
+            KlMmqMode mode,
+            CudaExecutionContext& context = cuda_execution_context())
+        : execution(context),
+          previous_mode(context.kl_mmq_mode),
           previous_activation_quantize_calls(
-              g_kl_mmq_activation_quantize_calls),
-          previous_dense_calls(g_kl_mmq_dense_calls),
-          previous_moe_calls(g_kl_mmq_moe_calls),
-          previous_fallback_calls(g_kl_mmq_fallback_calls) {
-        g_kl_mmq_mode = mode;
-        g_kl_mmq_activation_quantize_calls = 0;
-        g_kl_mmq_dense_calls = 0;
-        g_kl_mmq_moe_calls = 0;
-        g_kl_mmq_fallback_calls = 0;
+              context.kl_mmq_activation_quantize_calls),
+          previous_dense_calls(context.kl_mmq_dense_calls),
+          previous_moe_calls(context.kl_mmq_moe_calls),
+          previous_fallback_calls(context.kl_mmq_fallback_calls) {
+        execution.kl_mmq_mode = mode;
+        execution.kl_mmq_activation_quantize_calls = 0;
+        execution.kl_mmq_dense_calls = 0;
+        execution.kl_mmq_moe_calls = 0;
+        execution.kl_mmq_fallback_calls = 0;
     }
 
     ~KlMmqScope() {
-        g_kl_mmq_mode = previous_mode;
-        g_kl_mmq_activation_quantize_calls =
+        execution.kl_mmq_mode = previous_mode;
+        execution.kl_mmq_activation_quantize_calls =
             previous_activation_quantize_calls;
-        g_kl_mmq_dense_calls = previous_dense_calls;
-        g_kl_mmq_moe_calls = previous_moe_calls;
-        g_kl_mmq_fallback_calls = previous_fallback_calls;
+        execution.kl_mmq_dense_calls = previous_dense_calls;
+        execution.kl_mmq_moe_calls = previous_moe_calls;
+        execution.kl_mmq_fallback_calls = previous_fallback_calls;
     }
 };
 
 struct KlKvCacheCapacityScope {
+    CudaExecutionContext& execution;
     int64_t previous_capacity;
 
-    explicit KlKvCacheCapacityScope(int64_t capacity)
-        : previous_capacity(g_kl_kv_cache_capacity) {
-        g_kl_kv_cache_capacity = capacity;
+    explicit KlKvCacheCapacityScope(
+            int64_t capacity,
+            CudaExecutionContext& context = cuda_execution_context())
+        : execution(context),
+          previous_capacity(context.kl_kv_cache_capacity) {
+        execution.kl_kv_cache_capacity = capacity;
     }
 
     ~KlKvCacheCapacityScope() {
-        g_kl_kv_cache_capacity = previous_capacity;
+        execution.kl_kv_cache_capacity = previous_capacity;
     }
 };
 

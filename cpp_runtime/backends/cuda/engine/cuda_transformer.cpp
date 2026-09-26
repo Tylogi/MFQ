@@ -57,7 +57,7 @@ mfq_tensor_backend::Tensor gemma_rms_norm_f16(
 }
 
 void prepare_ffn_workspaces(FFN & f) {
-    if (g_loading_cpu_layer) return;
+    if (cuda_execution_context().loading_cpu_layer) return;
     if (f.down.tensor_parallel()) return;
     if (f.gate_up.nvq_prefix2 && f.gate_up.layers.size() == 2 && f.down.is_nvq() &&
         f.gate_up.outs.size() == 2 && f.gate_up.outs[0] == f.gate_up.outs[1] &&

@@ -69,8 +69,10 @@ inline Routed routed_gate_up(const mfq::ModelSource& file, const std::string& ml
 }
 
 inline void validate_load_options() {
-    if (g_tensor_parallel.enabled() || g_layer_placement.enabled() ||
-            g_n_gpu_layers >= 0 || g_moe_expert_cache) {
+    const auto& execution = cuda_execution_context();
+    if (execution.tensor_parallel.enabled() ||
+            execution.layer_placement.enabled() ||
+            execution.n_gpu_layers >= 0 || moe_expert_cache()) {
         throw std::runtime_error(
             "Qwen native adapter supports expert parallelism, but "
             "tensor/layer parallelism and offload require a different placement path");

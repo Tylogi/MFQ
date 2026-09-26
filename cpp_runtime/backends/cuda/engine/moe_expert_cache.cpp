@@ -23,8 +23,14 @@
 
 using mfq_tensor_backend::indexing::Slice;
 
-std::shared_ptr<MoeExpertCache>& g_moe_expert_cache =
-    cuda_execution_context().moe_expert_cache;
+std::shared_ptr<MoeExpertCache>& moe_expert_cache() {
+    return cuda_execution_context().moe_expert_cache;
+}
+
+bool& moe_continuous_batch_cache_serial() {
+    static thread_local bool enabled = false;
+    return enabled;
+}
 struct MoeCacheTransfer {
     const uint8_t * source = nullptr;
     uint8_t * destination = nullptr;
@@ -2497,9 +2503,11 @@ MfeWeight load_mfe_gpu(
         bool cacheable,
         int layer_id,
         const std::string & projection_role) {
+    auto& cache = moe_expert_cache();
+    const auto& execution = cuda_execution_context();
     const char * disable_ranges =
         std::getenv("MFQ_DISABLE_MOE_SSD_RANGES");
-    if (g_moe_expert_cache && cacheable &&
+    if (cache && cacheable &&
             !moe_parallel_config().enabled() &&
             (disable_ranges == nullptr || std::atoi(disable_ranges) == 0)) {
         const auto & record = require_tensor(mfq, name);
@@ -2523,12 +2531,12 @@ MfeWeight load_mfe_gpu(
                         },
                     });
             auto runtime = make_mxfp4_range_runtime(*store);
-            auto source = g_moe_expert_cache->register_range_source(
+            auto source = cache->register_range_source(
                 name,
                 runtime,
                 std::move(store),
                 std::min(
-                    g_moe_cache_registration_min_slots,
+                    execution.moe_cache_registration_min_slots,
                     runtime->n_experts),
                 layer_id,
                 projection_role);
@@ -2567,13 +2575,13 @@ MfeWeight load_mfe_gpu(
         }
         return result;
     }
-    if (g_moe_expert_cache && cacheable && !has_matrix_local_sq) {
+    if (cache && cacheable && !has_matrix_local_sq) {
         auto runtime =
             make_mixed_moe_runtime(cpu, false);
-        auto source = g_moe_expert_cache->register_source(
+        auto source = cache->register_source(
             name, runtime,
             std::min(
-                g_moe_cache_registration_min_slots,
+                execution.moe_cache_registration_min_slots,
                 runtime->n_experts),
             layer_id,
             projection_role);
@@ -2595,28 +2603,29 @@ std::shared_ptr<MoeExpertCache> make_moe_expert_cache(std::int64_t bytes) {
 }
 
 bool moe_expert_cache_has_sources() {
-    return g_moe_expert_cache && g_moe_expert_cache->has_sources();
+    const auto& cache = moe_expert_cache();
+    return cache && cache->has_sources();
 }
 
 bool moe_expert_cache_finalized() {
-    return g_moe_expert_cache && g_moe_expert_cache->finalized();
+    const auto& cache = moe_expert_cache();
+    return cache && cache->finalized();
 }
 
 void finalize_moe_expert_cache() {
-    if (g_moe_expert_cache && !g_moe_expert_cache->finalized()) {
-        g_moe_expert_cache->finalize();
-    }
+    const auto& cache = moe_expert_cache();
+    if (cache && !cache->finalized()) cache->finalize();
 }
 
 void print_moe_expert_cache_stats(std::ostream& output) {
-    if (g_moe_expert_cache) {
-        g_moe_expert_cache->print_stats(output);
-    }
+    const auto& cache = moe_expert_cache();
+    if (cache) cache->print_stats(output);
 }
 
 void set_moe_expert_cache_profile(mfq::MoeCacheProfile profile) {
-    if (!g_moe_expert_cache) {
+    const auto& cache = moe_expert_cache();
+    if (!cache) {
         throw std::runtime_error("MoE expert cache is not configured");
     }
-    g_moe_expert_cache->set_profile(std::move(profile));
+    cache->set_profile(std::move(profile));
 }

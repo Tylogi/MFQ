@@ -37,7 +37,7 @@ struct CudaEngineState {
             Model loaded_model,
             RuntimeComponents<Model> loaded_components,
             const CudaEngineOptions& options)
-        : execution(cuda_execution_context()),
+        : execution(*loaded_model.execution),
           model(std::move(loaded_model)),
           components(std::move(loaded_components)),
           language(&components.language(model)),
@@ -57,7 +57,7 @@ struct CudaEngineState {
         if constexpr (Backbone == CudaBackbone::generic_qwen) {
             auto qwen_executor = std::make_unique<
                 qwen35::QwenBatchExecutor>(
-                    *language, model_mutex,
+                    *language, execution, model_mutex,
                     options.continuous_batching,
                     options.prefill_chunk_size);
             std::cerr

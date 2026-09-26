@@ -268,7 +268,20 @@ def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
     options = (CUDA_RUNTIME / "options.cpp").read_text(encoding="utf-8")
 
     assert "struct CudaExecutionContext" in execution
+    assert "class CudaProfilerAccess" in execution
+    assert "extern CudaProfiler&" not in execution
     assert "CudaExecutionContext& execution;" in CUDA_ENGINE_SOURCE
+    for alias in (
+        "g_tensor_parallel",
+        "g_expert_parallel",
+        "g_model_parallel_collectives",
+        "g_layer_placement",
+        "g_moe_expert_cache",
+        "g_dsv4_cpu_offload_layers",
+        "g_dense_cpu_layer_count",
+        "g_loading_cpu_layer",
+    ):
+        assert alias not in execution
     assert "class PagedSessionBindings" in (
         ROOT / "cpp_runtime" / "engine" / "include" /
         "paged_session_bindings.h"
@@ -283,10 +296,20 @@ def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
     ).read_text(encoding="utf-8")
     assert "class GrammarConstraint" in constraint
     assert "class MfqGrammarConstraint" not in transport
-    assert "cuda_execution_context().reset();" in options
+    assert "execution.reset();" in options
+    assert "CudaExecutionContext& execution" in CUDA_CAUSAL_LM
+    assert "model.execution = &execution;" in (
+        CUDA_RUNTIME / "causal_lm_loader.cpp"
+    ).read_text(encoding="utf-8")
     assert "struct CudaSessionCodec" in CUDA_CAUSAL_LM
     assert "return CudaSessionCodec<Backbone>::capture" in CUDA_CAUSAL_LM
     assert "CudaSessionCodec<Backbone>::capture" in CUDA_CAUSAL_LM_SOURCE
+    assert "void begin_speculative_suffix(int64_t draft_tokens);" in CUDA_CAUSAL_LM
+    causal_lm_source = (
+        CUDA_RUNTIME / "causal_lm.cpp"
+    ).read_text(encoding="utf-8")
+    assert "CausalLm<Backbone>::begin_speculative_suffix" in causal_lm_source
+    assert "CausalLm<Backbone>::finalize_hidden" in causal_lm_source
     assert "struct Request" not in CUDA_QWEN_BATCH_HEADER
     assert "struct QwenBatchExecutor::Impl" in CUDA_QWEN_BATCH_SOURCE
     assert len(CUDA_QWEN_BATCH_HEADER.splitlines()) < 80

@@ -128,7 +128,8 @@ struct DeepseekV41Dspark final : MtpModule {
             true);
         result->rope = Dsv4RopeTable(
             config.max_position_embeddings, config.rope_theta, 0);
-        result->cuda_device = g_layer_placement.primary_device();
+        result->cuda_device =
+            cuda_execution_context().layer_placement.primary_device();
 
         const auto function_width = config.hc_mult * config.hidden;
         const auto valid_mhc = [&](const Tensor& function,

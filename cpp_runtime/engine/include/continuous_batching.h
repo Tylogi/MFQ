@@ -2,14 +2,18 @@
 
 #include "mfq/runtime.h"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <exception>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -57,6 +61,99 @@ private:
     std::deque<int64_t> output_tokens_;
     bool done_ = false;
     std::exception_ptr error_;
+};
+
+template <typename Request>
+class ContinuousBatchQueue {
+public:
+    explicit ContinuousBatchQueue(std::size_t capacity)
+        : capacity_(capacity) {
+        if (capacity_ == 0) {
+            throw std::invalid_argument(
+                "continuous batching capacity must be positive");
+        }
+    }
+
+    void submit(std::shared_ptr<Request> request) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stopping_) {
+            throw std::runtime_error(
+                "continuous batching scheduler is stopping");
+        }
+        pending_.push_back(std::move(request));
+        ready_.notify_one();
+    }
+
+    bool wait_for_work(
+            bool backend_has_work,
+            std::chrono::microseconds initial_batch_wait) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ready_.wait(lock, [&] {
+            return stopping_ || !pending_.empty() || backend_has_work;
+        });
+        if (!stopping_ && !backend_has_work &&
+                pending_.size() < capacity_) {
+            ready_.wait_for(lock, initial_batch_wait, [&] {
+                return stopping_ || pending_.size() >= capacity_;
+            });
+        }
+        return !stopping_;
+    }
+
+    std::vector<std::shared_ptr<Request>> take(
+            std::size_t occupied,
+            std::size_t admission_limit) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const std::size_t available = capacity_ > occupied
+            ? capacity_ - occupied : 0;
+        const std::size_t count = std::min(
+            {available, pending_.size(), admission_limit});
+        std::vector<std::shared_ptr<Request>> requests;
+        requests.reserve(count);
+        for (std::size_t index = 0; index < count; ++index) {
+            requests.push_back(std::move(pending_.front()));
+            pending_.pop_front();
+        }
+        return requests;
+    }
+
+    std::vector<std::shared_ptr<Request>> stop_and_drain() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopping_ = true;
+        std::vector<std::shared_ptr<Request>> requests;
+        requests.reserve(pending_.size());
+        while (!pending_.empty()) {
+            requests.push_back(std::move(pending_.front()));
+            pending_.pop_front();
+        }
+        ready_.notify_all();
+        return requests;
+    }
+
+    void stop() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopping_ = true;
+        ready_.notify_all();
+    }
+
+    void notify() { ready_.notify_one(); }
+
+    std::size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return pending_.size();
+    }
+
+    bool stopping() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return stopping_;
+    }
+
+private:
+    const std::size_t capacity_;
+    mutable std::mutex mutex_;
+    std::condition_variable ready_;
+    std::deque<std::shared_ptr<Request>> pending_;
+    bool stopping_ = false;
 };
 
 class ContinuousBatchExecutor {

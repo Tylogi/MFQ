@@ -398,6 +398,7 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
     std::shared_ptr<const mfq::ModelSource> source;
     mfq::ModelGraph graph;
     CudaModelPlan plan;
+    CudaExecutionContext* execution = &cuda_execution_context();
     RopeCache rope;
     RopeCache cpu_rope;
     std::unordered_map<int, RopeCache> device_ropes;
@@ -591,102 +592,11 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
         }
     }
 
-    bool supports_qwen_speculation() const {
-        if constexpr (
-                Backbone != CudaBackbone::generic_qwen && !is_flash_next) {
-            return false;
-        }
-        return !blocks.empty() && std::all_of(
-            blocks.begin(), blocks.end(),
-            [](const auto& block) { return block->supports_speculation(); });
-    }
-
-    bool supports_deepseek_v41_speculation() const {
-        if constexpr (!is_deepseek_v41) return false;
-        return !blocks.empty() && std::all_of(
-            blocks.begin(), blocks.end(),
-            [](const auto& block) { return block->supports_speculation(); });
-    }
-
-    void begin_speculative_suffix(int64_t draft_tokens) {
-        if constexpr (!is_deepseek_v41) {
-            throw std::runtime_error(
-                "speculative suffix requires DeepseekV41CausalLm");
-        } else {
-            MFQ_RUNTIME_CHECK(
-                supports_deepseek_v41_speculation() &&
-                    speculative_start < 0 && draft_tokens > 0 &&
-                    cache_pos + draft_tokens <= max_position_embeddings() &&
-                    this->shared,
-                "invalid DeepSeek-V4.1 speculative suffix");
-            speculative_start = cache_pos;
-            speculative_confirmed = 0;
-            this->shared->begin_speculative();
-            std::size_t begun = 0;
-            try {
-                for (auto& block : blocks) {
-                    MfqCudaGuard guard(block->cuda_device);
-                    block->begin_speculative(draft_tokens);
-                    ++begun;
-                }
-            } catch (...) {
-                for (std::size_t index = 0; index < begun; ++index) {
-                    try {
-                        MfqCudaGuard guard(blocks[index]->cuda_device);
-                        blocks[index]->commit_speculative();
-                    } catch (...) {}
-                }
-                try { this->shared->rollback_speculative(); } catch (...) {}
-                speculative_start = -1;
-                speculative_confirmed = 0;
-                throw;
-            }
-        }
-    }
-
-    void commit_speculative() {
-        MFQ_RUNTIME_CHECK(speculative_start >= 0, "no speculative transaction to commit");
-        for (auto& block : blocks) {
-            MfqCudaGuard guard(block->cuda_device);
-            block->commit_speculative();
-        }
-        if constexpr (is_deepseek_v41) {
-            MFQ_RUNTIME_CHECK(
-                this->shared,
-                "DeepSeek-V4.1 speculative state is unavailable");
-            this->shared->commit_speculative();
-        }
-        speculative_start = -1;
-        speculative_confirmed = 0;
-    }
-
-    void rollback_speculative(int64_t accepted_suffix = 0) {
-        MFQ_RUNTIME_CHECK(
-            speculative_start >= 0 && accepted_suffix >= 0,
-            "no speculative transaction to roll back");
-        const int64_t keep =
-            speculative_start + speculative_confirmed + accepted_suffix;
-        for (auto& block : blocks) {
-            MfqCudaGuard guard(block->cuda_device);
-            block->rollback_speculative(keep);
-        }
-        if constexpr (is_deepseek_v41) {
-            MFQ_RUNTIME_CHECK(
-                this->shared,
-                "DeepSeek-V4.1 speculative state is unavailable");
-            this->shared->rollback_speculative();
-        }
-        // Full-attention KV slots beyond this logical length are overwritten
-        // by the next pass; no history-sized cache copy is needed.
-        cache_pos = keep;
-        if constexpr (is_qwen4) {
-            if (this->positions.defined()) {
-                this->positions = this->positions.narrow(-1, 0, cache_pos);
-            }
-        }
-        speculative_start = -1;
-        speculative_confirmed = 0;
-    }
+    bool supports_qwen_speculation() const;
+    bool supports_deepseek_v41_speculation() const;
+    void begin_speculative_suffix(int64_t draft_tokens);
+    void commit_speculative();
+    void rollback_speculative(int64_t accepted_suffix = 0);
 
     mfq_tensor_backend::Tensor embed_forward(mfq_tensor_backend::Tensor ids) const {
         auto token_ids = ids.contiguous().to(mfq_tensor_backend::kCUDA, mfq_tensor_backend::kInt64);
@@ -737,52 +647,8 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
         CudaSessionCodec<Backbone>::restore(*this, state);
     }
 
-    mfq_tensor_backend::Tensor finalize_hidden(mfq_tensor_backend::Tensor x, int64_t B, int64_t T) {
-        if constexpr (is_qwen4) return this->final_mixer->pre(x)[0];
-        if constexpr (is_glm5) {
-            return glm5_next::rms_norm(
-                x.mean(2), output_norm, rms_norm_eps());
-        }
-        if constexpr (Backbone == CudaBackbone::deepseek_v4) {
-            x = g_profiler.measure("model.dsv4_hc_head", [&]() {
-                auto flat = x.flatten(2).to(mfq_tensor_backend::kFloat32);
-                auto inverse_rms = mfq_tensor_backend::rsqrt(
-                    flat.square().mean(-1, true) + rms_norm_eps());
-                auto mixes = mfq_tensor_backend::matmul(
-                    flat, this->hc_head_fn.transpose(0, 1)) *
-                    inverse_rms;
-                auto pre = mfq_tensor_backend::sigmoid(
-                    mixes * this->hc_head_scale +
-                    this->hc_head_base) + hc_eps();
-                return (
-                    pre.unsqueeze(-1) *
-                    flat.reshape({B, T, hc_mult(), hidden_size()}))
-                    .sum(2).to(mfq_tensor_backend::kFloat16).contiguous();
-            });
-        }
-        if constexpr (is_deepseek_v41) {
-            MFQ_RUNTIME_CHECK(
-                this->shared,
-                "DeepSeek-V4.1 final state is unavailable");
-            x = g_profiler.measure("model.deepseek_v41.final_collapse", [&]() {
-                return this->shared->final_collapse(
-                    x, this->shared->config.n_layers);
-            });
-        }
-        return g_profiler.measure("model.output_norm", [&]() {
-            if constexpr (is_minicpmo45) {
-                return qwen_rms_norm_bf16(
-                    x.reshape({B * T, hidden_size()}), output_norm,
-                    rms_norm_eps(), norm_weight_offset())
-                    .reshape({B, T, hidden_size()});
-            }
-            return qwen_rms_norm(
-                x.reshape({B * T, hidden_size()})
-                    .to(mfq_tensor_backend::kFloat32),
-                output_norm, rms_norm_eps(), norm_weight_offset())
-                .reshape({B, T, hidden_size()});
-        });
-    }
+    mfq_tensor_backend::Tensor finalize_hidden(
+        mfq_tensor_backend::Tensor x, int64_t batch, int64_t tokens);
 
     mfq_tensor_backend::Tensor hidden_forward(mfq_tensor_backend::Tensor ids,
                                  MfqOptional<mfq_tensor_backend::Tensor> pos_override = mfq_nullopt,
@@ -793,7 +659,7 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
                                  int64_t confirmed_prefix = 0,
                                  int64_t planned_kv_length = 0,
                                  int64_t decode_attention_parts = 0) {
-        const int primary = g_layer_placement.primary_device();
+        const int primary = execution->layer_placement.primary_device();
         MfqCudaGuard primary_guard(primary);
         ids = tensor_to_cuda_device(
             ids.to(mfq_tensor_backend::kInt64), primary);
@@ -838,7 +704,7 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
             int64_t confirmed_prefix = 0,
             int64_t planned_kv_length = 0,
             int64_t decode_attention_parts = 0) {
-        const int primary = g_layer_placement.primary_device();
+        const int primary = execution->layer_placement.primary_device();
         MfqCudaGuard primary_guard(primary);
         ids = tensor_to_cuda_device(
             ids.to(mfq_tensor_backend::kInt64), primary);
@@ -941,7 +807,7 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
         mfq_tensor_backend::Tensor cpu_ids, cpu_pos, cpu_cache_positions;
         MfqOptional<mfq_tensor_backend::Tensor> cpu_attention_mask = mfq_nullopt;
         MfqOptional<mfq_tensor_backend::Tensor> cpu_seq_len = mfq_nullopt;
-        if (g_dense_cpu_layer_count > 0) {
+        if (execution->dense_cpu_layer_count > 0) {
             cpu_ids = ids.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
             cpu_pos = pos.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
             cpu_cache_positions = cache_positions
@@ -1261,11 +1127,26 @@ using CausalLmFor = typename CausalLmType<Backbone>::type;
 
 template <CudaBackbone Backbone>
 CausalLmFor<Backbone> load_causal_lm(
+    CudaExecutionContext& execution,
     const std::string& model_path,
     const std::string& config_path,
     std::int64_t context_size_override = 0,
     bool load_blocks = true,
     bool defer_moe_cache_finalize = false,
     std::shared_ptr<const mfq::ModelSource> source = {});
+
+template <CudaBackbone Backbone>
+CausalLmFor<Backbone> load_causal_lm(
+        const std::string& model_path,
+        const std::string& config_path,
+        std::int64_t context_size_override = 0,
+        bool load_blocks = true,
+        bool defer_moe_cache_finalize = false,
+        std::shared_ptr<const mfq::ModelSource> source = {}) {
+    return load_causal_lm<Backbone>(
+        cuda_execution_context(), model_path, config_path,
+        context_size_override, load_blocks,
+        defer_moe_cache_finalize, std::move(source));
+}
 
 } // namespace mfq::cuda

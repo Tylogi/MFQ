@@ -41,7 +41,10 @@ def test_continuous_batching_is_an_explicit_server_mode():
     assert '"--continuous-batching"' in DECODE
     assert '"--check-continuous-batching"' in DECODE
     assert "ContinuousBatchExecutor" in COMMON_BATCHING
+    assert "class ContinuousBatchQueue" in COMMON_BATCHING
     assert "QwenBatchExecutor final" in BATCHING
+    assert "ContinuousBatchQueue<Request> queue_" in BATCHING
+    assert "queue_mutex_" not in BATCHING
     assert "decode=target_only mtp=disabled" in DECODE
 
 
@@ -97,11 +100,11 @@ def test_scheduler_supports_resident_and_cached_qwen_moe():
     assert "qwen_continuous_batch_has_cached_moe" in BATCHING
     assert "uses_moe_expert_cache()" in DECODE
     assert "MoeContinuousBatchCacheScope moe_cache_scope" in BATCHING
-    assert "g_moe_continuous_batch_cache_serial" in DECODE
+    assert "moe_continuous_batch_cache_serial()" in DECODE
     assert "each routed FFN row independently" in DECODE
     assert (
         "cpu_moe_down ||\n"
-        "                        g_moe_continuous_batch_cache_serial"
+        "                        moe_continuous_batch_cache_serial()"
         in DECODE
     )
 

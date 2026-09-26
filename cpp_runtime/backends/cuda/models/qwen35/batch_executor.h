@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+struct CudaExecutionContext;
+
 namespace mfq::cuda {
 struct Qwen35CausalLm;
 }
@@ -25,6 +27,7 @@ class QwenBatchExecutor final : public mfq::engine::ContinuousBatchExecutor {
 public:
     QwenBatchExecutor(
         Qwen35CausalLm& model,
+        CudaExecutionContext& execution,
         std::mutex& model_mutex,
         std::int32_t max_sequences,
         std::int64_t prefill_chunk_size = 2048,

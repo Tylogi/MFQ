@@ -534,6 +534,8 @@ struct QuantLinearGroup {
     }
 
     std::vector<mfq_tensor_backend::Tensor> forward(mfq_tensor_backend::Tensor x) const {
+        const bool default_mmq =
+            cuda_execution_context().kl_mmq_mode == KlMmqMode::Default;
         if (!x.is_cuda()) {
             MFQ_RUNTIME_CHECK(
                 !nint_grouped,
@@ -550,8 +552,7 @@ struct QuantLinearGroup {
             return forward_tensor_parallel_output_group(x);
         }
         if (nint_grouped) return nint.forward(x);
-        if (g_kl_mmq_mode == KlMmqMode::Default &&
-                nvq_prefix2 && nvq_fusion_enabled()) {
+        if (default_mmq && nvq_prefix2 && nvq_fusion_enabled()) {
             auto shape = x.sizes().vec();
             const auto flat =
                 x.reshape({-1, x.size(-1)});
@@ -594,8 +595,7 @@ struct QuantLinearGroup {
             return result;
         }
         std::vector<mfq_tensor_backend::Tensor> result;
-        if (g_kl_mmq_mode == KlMmqMode::Default &&
-                decode_branch_parallel &&
+        if (default_mmq && decode_branch_parallel &&
                 decode_branch_parallel_enabled(
                     x.numel() / x.size(-1)) &&
                 branch_executor->run(
@@ -613,13 +613,13 @@ struct QuantLinearGroup {
         return result;
     }
     mfq_tensor_backend::Tensor forward_swiglu(mfq_tensor_backend::Tensor x) const {
-        if (g_kl_mmq_mode == KlMmqMode::Default &&
-                nint_grouped && nint.split_w.empty() &&
+        const bool default_mmq =
+            cuda_execution_context().kl_mmq_mode == KlMmqMode::Default;
+        if (default_mmq && nint_grouped && nint.split_w.empty() &&
                 x.numel() / x.size(-1) >= 1 && x.numel() / x.size(-1) <= 6) {
             return nint.forward_swiglu(x);
         }
-        if (g_kl_mmq_mode == KlMmqMode::Default &&
-                nvq_prefix2 && layers.size() == 2 &&
+        if (default_mmq && nvq_prefix2 && layers.size() == 2 &&
                 nvq_fusion_enabled()) {
             auto shape = x.sizes().vec();
             auto y = nvq_matmul_swiglu(
@@ -635,7 +635,7 @@ struct QuantLinearGroup {
         return mfq_tensor_backend::silu(parts[0]) * parts[1];
     }
     mfq_tensor_backend::Tensor forward_geglu(mfq_tensor_backend::Tensor x) const {
-        if (g_kl_mmq_mode == KlMmqMode::Default &&
+        if (cuda_execution_context().kl_mmq_mode == KlMmqMode::Default &&
                 nint_grouped && nint.split_w.empty() &&
                 x.numel() / x.size(-1) == 1) {
             return nint.forward_geglu(x);

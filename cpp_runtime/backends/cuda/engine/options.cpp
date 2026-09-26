@@ -176,24 +176,26 @@ static void configure_model_parallel(
         const std::string & expert_devices_arg,
         const std::string & expert_split_arg,
         bool allow_duplicate_devices = false) {
-    g_model_parallel_collectives.reset();
-    g_tensor_parallel = {};
-    g_expert_parallel = {};
+    auto& execution = cuda_execution_context();
+    execution.model_parallel_collectives.reset();
+    execution.tensor_parallel = {};
+    execution.expert_parallel = {};
 
     int available = 0;
     MFQ_CUDA_CHECK(cudaGetDeviceCount(&available));
-    g_tensor_parallel = parse_parallel_config(
+    execution.tensor_parallel = parse_parallel_config(
         tensor_devices_arg, tensor_split_arg,
         "--tensor-parallel", "--tensor-split",
         available, allow_duplicate_devices);
-    g_expert_parallel = parse_parallel_config(
+    execution.expert_parallel = parse_parallel_config(
         expert_devices_arg, expert_split_arg,
         "--expert-parallel", "--expert-split",
         available, allow_duplicate_devices);
 
-    if (g_tensor_parallel.enabled() &&
-            g_expert_parallel.enabled() &&
-            g_tensor_parallel.devices != g_expert_parallel.devices) {
+    if (execution.tensor_parallel.enabled() &&
+            execution.expert_parallel.enabled() &&
+            execution.tensor_parallel.devices !=
+                execution.expert_parallel.devices) {
         throw std::runtime_error(
             "combined tensor and expert parallelism requires the same "
             "ordered CUDA device group");
@@ -229,14 +231,16 @@ static void configure_model_parallel(
             }
         }
     }
-    g_model_parallel_collectives.configure(
+    execution.model_parallel_collectives.configure(
         config.devices, allow_duplicate_devices);
     MFQ_CUDA_CHECK(cudaSetDevice(model_parallel_primary_device()));
-    print_parallel_config("tensor_parallel", g_tensor_parallel);
-    print_parallel_config("expert_parallel", g_expert_parallel);
+    print_parallel_config(
+        "tensor_parallel", execution.tensor_parallel);
+    print_parallel_config(
+        "expert_parallel", execution.expert_parallel);
     std::cerr << "model_parallel ranks=" << config.devices.size()
               << " collective_backend="
-              << (g_model_parallel_collectives.collectives_enabled
+              << (execution.model_parallel_collectives.collectives_enabled
                   ? "nccl" : "serial")
               << '\n';
 }
@@ -244,7 +248,8 @@ static void configure_model_parallel(
 static void configure_layer_placement(
         const std::string & devices_arg,
         const std::string & split_arg) {
-    g_layer_placement = {};
+    auto& placement = cuda_execution_context().layer_placement;
+    placement = {};
     if (devices_arg.empty()) {
         if (!split_arg.empty()) {
             throw std::runtime_error(
@@ -267,16 +272,15 @@ static void configure_layer_placement(
             throw std::runtime_error(
                 "--layer-parallel device count must be at least 2");
         }
-        g_layer_placement.devices.resize(static_cast<size_t>(count));
+        placement.devices.resize(static_cast<size_t>(count));
         std::iota(
-            g_layer_placement.devices.begin(),
-            g_layer_placement.devices.end(), 0);
+            placement.devices.begin(), placement.devices.end(), 0);
     } else {
         for (const auto & item : device_values) {
-            g_layer_placement.devices.push_back(
+            placement.devices.push_back(
                 strict_int(item, "--layer-parallel"));
         }
-        if (g_layer_placement.devices.size() < 2) {
+        if (placement.devices.size() < 2) {
             throw std::runtime_error(
                 "--layer-parallel requires at least two devices");
         }
@@ -285,7 +289,7 @@ static void configure_layer_placement(
     int available = 0;
     MFQ_CUDA_CHECK(cudaGetDeviceCount(&available));
     std::unordered_set<int> unique_devices;
-    for (int device : g_layer_placement.devices) {
+    for (int device : placement.devices) {
         if (device < 0 || device >= available) {
             throw std::runtime_error(
                 "layer-placement CUDA device is unavailable: " +
@@ -304,27 +308,24 @@ static void configure_layer_placement(
                 throw std::runtime_error(
                     "--layer-split values must be positive");
             }
-            g_layer_placement.split.push_back(weight);
+            placement.split.push_back(weight);
         }
-        if (g_layer_placement.split.size() !=
-                g_layer_placement.devices.size()) {
+        if (placement.split.size() != placement.devices.size()) {
             throw std::runtime_error(
                 "--layer-split count must match --layer-parallel devices");
         }
     }
-    MFQ_CUDA_CHECK(cudaSetDevice(g_layer_placement.primary_device()));
+    MFQ_CUDA_CHECK(cudaSetDevice(placement.primary_device()));
     std::cerr << "layer_parallel devices=";
-    for (size_t index = 0;
-         index < g_layer_placement.devices.size(); ++index) {
+    for (size_t index = 0; index < placement.devices.size(); ++index) {
         if (index) std::cerr << ',';
-        std::cerr << g_layer_placement.devices[index];
+        std::cerr << placement.devices[index];
     }
-    if (!g_layer_placement.split.empty()) {
+    if (!placement.split.empty()) {
         std::cerr << " split=";
-        for (size_t index = 0;
-             index < g_layer_placement.split.size(); ++index) {
+        for (size_t index = 0; index < placement.split.size(); ++index) {
             if (index) std::cerr << ',';
-            std::cerr << g_layer_placement.split[index];
+            std::cerr << placement.split[index];
         }
     }
     std::cerr << '\n';
@@ -377,7 +378,8 @@ static std::unordered_set<int> parse_layer_ranges(
 }
 
 void setup_cuda_load(const mfq::cuda::CudaLoadOptions& options) {
-    cuda_execution_context().reset();
+    auto& execution = cuda_execution_context();
+    execution.reset();
     g_mfq_drop_file_cache = false;
     const auto& tensor_parallel_arg = options.tensor_parallel_arg;
     const auto& tensor_split_arg = options.tensor_split_arg;
@@ -393,7 +395,7 @@ void setup_cuda_load(const mfq::cuda::CudaLoadOptions& options) {
     const auto& n_gpu_layers = options.n_gpu_layers;
     const auto& cpu_threads_set = options.cpu_threads_set;
     const auto& cpu_threads = options.cpu_threads;
-        if (n_gpu_layers_set) g_n_gpu_layers = n_gpu_layers;
+        if (n_gpu_layers_set) execution.n_gpu_layers = n_gpu_layers;
         if (cpu_threads_set && cpu_threads <= 0) {
             throw std::runtime_error("--threads must be positive");
         }
@@ -407,11 +409,11 @@ void setup_cuda_load(const mfq::cuda::CudaLoadOptions& options) {
         configure_layer_placement(
             layer_parallel_arg, layer_split_arg);
         if (!cpu_offload_layers_arg.empty()) {
-            g_dsv4_cpu_offload_layers =
+            execution.dsv4_cpu_offload_layers =
                 parse_layer_ranges(cpu_offload_layers_arg);
             std::vector<int> ordered(
-                g_dsv4_cpu_offload_layers.begin(),
-                g_dsv4_cpu_offload_layers.end());
+                execution.dsv4_cpu_offload_layers.begin(),
+                execution.dsv4_cpu_offload_layers.end());
             std::sort(ordered.begin(), ordered.end());
             std::cerr << "cpu_offload_layers=";
             for (size_t index = 0; index < ordered.size(); ++index) {
@@ -420,7 +422,7 @@ void setup_cuda_load(const mfq::cuda::CudaLoadOptions& options) {
             }
             std::cerr << std::endl;
         }
-        if (n_gpu_layers_set && g_n_gpu_layers < 0) {
+        if (n_gpu_layers_set && execution.n_gpu_layers < 0) {
             throw std::runtime_error("--n-gpu-layers must be non-negative");
         }
         if (n_gpu_layers_set && !cpu_offload_layers_arg.empty()) {
@@ -460,7 +462,7 @@ void setup_cuda_load(const mfq::cuda::CudaLoadOptions& options) {
                 throw std::runtime_error(
                     "--moe-gpu-cache-gb is outside the supported range");
             }
-            g_moe_expert_cache =
+            moe_expert_cache() =
                 make_moe_expert_cache(
                     static_cast<int64_t>(bytes));
             if (!moe_cache_profile_path.empty()) {

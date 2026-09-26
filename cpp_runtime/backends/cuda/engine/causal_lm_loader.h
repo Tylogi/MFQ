@@ -15,11 +15,13 @@ namespace mfq::cuda::internal {
 template <typename F>
 auto with_loaded_cuda_model(const CudaLoadOptions& options,
         bool load_optional_components, F&& run) {
+    auto& execution = cuda_execution_context();
     auto source = mfq::open_model_source(options.model_path);
     auto load = [&]<CudaBackbone Backbone>() {
         using Model = CausalLmFor<Backbone>;
         auto started = std::chrono::steady_clock::now();
         Model model = load_causal_lm<Backbone>(
+            execution,
             options.model_path,
             options.config_path,
             options.context_size,

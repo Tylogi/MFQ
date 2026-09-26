@@ -29,13 +29,14 @@ float round_to_bfloat16(float value) {
 
 template <typename Model, typename Loader>
 void load_model_blocks(Model& model, Loader&& load) {
+    auto& execution = cuda_execution_context();
     const auto layer_count = model.num_hidden_layers();
     model.blocks.reserve(static_cast<std::size_t>(layer_count));
     for (int layer = 0; layer < layer_count; ++layer) {
-        const int device = g_layer_placement.device_for_layer(layer);
-        const bool cpu_offloaded = layer < g_dense_cpu_layer_count;
-        g_loading_cpu_layer = cpu_offloaded;
-        g_layer_placement.load_device = device;
+        const int device = execution.layer_placement.device_for_layer(layer);
+        const bool cpu_offloaded = layer < execution.dense_cpu_layer_count;
+        execution.loading_cpu_layer = cpu_offloaded;
+        execution.layer_placement.load_device = device;
         MfqCudaGuard layer_guard(device);
         const std::string type(model.layer_type(layer));
         std::cerr << "loading layer " << layer << ' ' << type << ' '
@@ -51,6 +52,7 @@ void load_model_blocks(Model& model, Loader&& load) {
 
 template <mfq::cuda::CudaBackbone Kind>
 mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
+        CudaExecutionContext& execution,
         const std::string& model_path,
         const std::string& config_path,
         int64_t context_size_override,
@@ -58,6 +60,7 @@ mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
         bool defer_moe_cache_finalize,
         std::shared_ptr<const mfq::ModelSource> model_source) {
     CausalLmFor<Kind> model;
+    model.execution = &execution;
     model.source = model_source
         ? std::move(model_source)
         : mfq::open_model_source(model_path);
@@ -172,18 +175,20 @@ mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
     if constexpr (Kind == CudaBackbone::deepseek_v4) {
         deepseek_v4::validate_load_options(model.config);
     }
-    if (g_expert_parallel.enabled() && model.num_experts() <= 0) {
+    if (execution.expert_parallel.enabled() && model.num_experts() <= 0) {
         throw std::runtime_error(
             "--expert-parallel requires a model with routed experts");
     }
 
-    g_layer_placement.prepare(model.num_hidden_layers());
-    g_dense_cpu_layer_count = 0;
-    if (g_n_gpu_layers >= 0) {
-        g_dense_cpu_layer_count = static_cast<int>(std::max<int64_t>(
-            model.num_hidden_layers() - g_n_gpu_layers, 0));
-        if (g_dense_cpu_layer_count > 0) {
-            if (model_parallel_enabled() || g_layer_placement.enabled()) {
+    execution.layer_placement.prepare(model.num_hidden_layers());
+    execution.dense_cpu_layer_count = 0;
+    if (execution.n_gpu_layers >= 0) {
+        execution.dense_cpu_layer_count = static_cast<int>(
+            std::max<int64_t>(
+                model.num_hidden_layers() - execution.n_gpu_layers, 0));
+        if (execution.dense_cpu_layer_count > 0) {
+            if (model_parallel_enabled() ||
+                    execution.layer_placement.enabled()) {
                 throw std::runtime_error(
                     "--n-gpu-layers cannot be combined with tensor/expert/layer parallelism");
             }
@@ -203,17 +208,18 @@ mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
                     "--n-gpu-layers currently supports dense Qwen-style blocks only");
             }
             std::cerr << "dense_layer_placement cpu=0-"
-                      << (g_dense_cpu_layer_count - 1)
-                      << " gpu=" << g_dense_cpu_layer_count << '-'
+                      << (execution.dense_cpu_layer_count - 1)
+                      << " gpu=" << execution.dense_cpu_layer_count << '-'
                       << (model.num_hidden_layers() - 1)
                       << " cpu_threads=" << mfq_get_num_threads()
                       << std::endl;
         }
     }
-    g_layer_placement.load_device = g_layer_placement.primary_device();
-    MfqCudaGuard model_guard(g_layer_placement.primary_device());
+    execution.layer_placement.load_device =
+        execution.layer_placement.primary_device();
+    MfqCudaGuard model_guard(execution.layer_placement.primary_device());
     if (model.plan.vision == CudaVisionAdapter::grid_vit &&
-            g_dense_cpu_layer_count > 0) {
+            execution.dense_cpu_layer_count > 0) {
         throw std::runtime_error(
             "CUDA grid-Vision currently requires GPU-resident text layers");
     }
@@ -246,14 +252,14 @@ mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
         };
         const auto primary = mfq_tensor_backend::Device(
             mfq_tensor_backend::kCUDA,
-            g_layer_placement.primary_device());
+            execution.layer_placement.primary_device());
         model.rope = make_rope(primary);
-        if (g_dense_cpu_layer_count > 0) {
+        if (execution.dense_cpu_layer_count > 0) {
             model.cpu_rope = make_rope(
                 mfq_tensor_backend::Device(mfq_tensor_backend::kCPU));
         }
-        if (g_layer_placement.enabled()) {
-            for (int device : g_layer_placement.devices) {
+        if (execution.layer_placement.enabled()) {
+            for (int device : execution.layer_placement.devices) {
                 MfqCudaGuard rope_guard(device);
                 model.device_ropes.emplace(
                     device,
@@ -280,7 +286,7 @@ mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
         model.hc_head_base = std::move(head.base);
     }
     if (model.tie_word_embeddings() || !has_tensor(source, output_name)) {
-        model.lm_head = g_tensor_parallel.enabled()
+        model.lm_head = execution.tensor_parallel.enabled()
             ? load_quant_linear(
                 source, embed_name, TensorParallelAxis::Output)
             : model.embed;
@@ -350,8 +356,9 @@ mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
         }
     }
 
-    g_loading_cpu_layer = false;
-    g_layer_placement.load_device = g_layer_placement.primary_device();
+    execution.loading_cpu_layer = false;
+    execution.layer_placement.load_device =
+        execution.layer_placement.primary_device();
     if (moe_expert_cache_has_sources() &&
             !moe_expert_cache_finalized() &&
             !defer_moe_cache_finalize) {
@@ -362,8 +369,8 @@ mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
 
 #define MFQ_INSTANTIATE_CAUSAL_LM(BACKBONE, TYPE)                         \
     template TYPE mfq::cuda::load_causal_lm<BACKBONE>(                   \
-        const std::string&, const std::string&, int64_t, bool, bool,     \
-        std::shared_ptr<const mfq::ModelSource>)
+        CudaExecutionContext&, const std::string&, const std::string&,   \
+        int64_t, bool, bool, std::shared_ptr<const mfq::ModelSource>)
 
 MFQ_INSTANTIATE_CAUSAL_LM(
     mfq::cuda::CudaBackbone::generic_qwen, mfq::cuda::Qwen35CausalLm);

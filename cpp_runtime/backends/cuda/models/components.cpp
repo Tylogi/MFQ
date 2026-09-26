@@ -46,13 +46,16 @@ RuntimeComponents<Model> load_runtime_components(
             Model::backbone == mfq::cuda::CudaBackbone::generic_qwen) {
         if (result.plan.predictor ==
                 mfq::cuda::CudaPredictorAdapter::qwen35) {
-            const bool supported_placement = !g_layer_placement.enabled() &&
-                g_dense_cpu_layer_count == 0 &&
-                g_dsv4_cpu_offload_layers.empty() && !g_moe_expert_cache;
+            const auto& execution = cuda_execution_context();
+            const bool supported_placement =
+                !execution.layer_placement.enabled() &&
+                execution.dense_cpu_layer_count == 0 &&
+                execution.dsv4_cpu_offload_layers.empty() &&
+                !moe_expert_cache();
             if (supported_placement && model.num_experts() == 0 &&
                     model.supports_qwen_speculation()) {
                 auto predictor = Qwen35Mtp::load_if_present(
-                    *model.source, model.config);
+                    *model.source, model.config, *model.execution);
                 if (predictor) {
                     result.mtp = std::make_unique<Qwen35Mtp>(
                         std::move(*predictor));

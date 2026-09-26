@@ -24,10 +24,11 @@ std::vector<MfqCudaStream> make_cuda_graph_compute_streams(
 std::vector<MfqCudaStream> cuda_graph_participant_streams(
         const std::vector<MfqCudaStream>& compute_streams) {
     auto participants = compute_streams;
+    const auto& collectives =
+        cuda_execution_context().model_parallel_collectives;
     participants.insert(
         participants.end(),
-        g_model_parallel_collectives.streams.begin(),
-        g_model_parallel_collectives.streams.end());
+        collectives.streams.begin(), collectives.streams.end());
     return participants;
 }
 

@@ -82,48 +82,6 @@ CudaExecutionContext& cuda_execution_context() {
     return context;
 }
 
-CudaProfiler& g_profiler = cuda_execution_context().profiler;
-bool& g_force_moe_pool_path =
-    cuda_execution_context().force_moe_pool_path;
-bool& g_force_moe_unfused_reduce =
-    cuda_execution_context().force_moe_unfused_reduce;
-bool& g_force_moe_materialized_swiglu =
-    cuda_execution_context().force_moe_materialized_swiglu;
-bool& g_force_moe_prefill_mma_off =
-    cuda_execution_context().force_moe_prefill_mma_off;
-thread_local bool g_moe_continuous_batch_cache_serial = false;
-KlMmqMode& g_kl_mmq_mode = cuda_execution_context().kl_mmq_mode;
-int64_t& g_kl_mmq_activation_quantize_calls =
-    cuda_execution_context().kl_mmq_activation_quantize_calls;
-int64_t& g_kl_mmq_dense_calls =
-    cuda_execution_context().kl_mmq_dense_calls;
-int64_t& g_kl_mmq_moe_calls = cuda_execution_context().kl_mmq_moe_calls;
-int64_t& g_kl_mmq_fallback_calls =
-    cuda_execution_context().kl_mmq_fallback_calls;
-int64_t& g_kl_kv_cache_capacity =
-    cuda_execution_context().kl_kv_cache_capacity;
-std::unordered_set<int>& g_dsv4_cpu_offload_layers =
-    cuda_execution_context().dsv4_cpu_offload_layers;
-int64_t& g_dsv4_cpu_offload_host_bytes =
-    cuda_execution_context().dsv4_cpu_offload_host_bytes;
-int& g_n_gpu_layers = cuda_execution_context().n_gpu_layers;
-int& g_dense_cpu_layer_count =
-    cuda_execution_context().dense_cpu_layer_count;
-bool& g_loading_cpu_layer = cuda_execution_context().loading_cpu_layer;
-int& g_moe_cache_registration_min_slots =
-    cuda_execution_context().moe_cache_registration_min_slots;
-int& g_gemma_trace_layer = cuda_execution_context().gemma_trace_layer;
-std::vector<std::pair<std::string, mfq_tensor_backend::Tensor>>*&
-    g_gemma_stage_trace = cuda_execution_context().gemma_stage_trace;
-ParallelConfig& g_tensor_parallel =
-    cuda_execution_context().tensor_parallel;
-ParallelConfig& g_expert_parallel =
-    cuda_execution_context().expert_parallel;
-ModelParallelCollectiveRuntime& g_model_parallel_collectives =
-    cuda_execution_context().model_parallel_collectives;
-LayerPlacementConfig& g_layer_placement =
-    cuda_execution_context().layer_placement;
-
 void CudaExecutionContext::reset() noexcept {
     profiler.reset();
     moe_expert_cache.reset();
@@ -152,28 +110,32 @@ void CudaExecutionContext::reset() noexcept {
 }
 
 bool model_parallel_enabled() {
-    return g_tensor_parallel.enabled() ||
-        g_expert_parallel.enabled();
+    const auto& execution = cuda_execution_context();
+    return execution.tensor_parallel.enabled() ||
+        execution.expert_parallel.enabled();
 }
 
 const ParallelConfig & model_parallel_config() {
-    return g_tensor_parallel.enabled()
-        ? g_tensor_parallel
-        : g_expert_parallel;
+    const auto& execution = cuda_execution_context();
+    return execution.tensor_parallel.enabled()
+        ? execution.tensor_parallel
+        : execution.expert_parallel;
 }
 
 const ParallelConfig & moe_parallel_config() {
-    return g_expert_parallel.enabled()
-        ? g_expert_parallel
-        : g_tensor_parallel;
+    const auto& execution = cuda_execution_context();
+    return execution.expert_parallel.enabled()
+        ? execution.expert_parallel
+        : execution.tensor_parallel;
 }
 
 int model_parallel_primary_device() {
-    if (!g_tensor_parallel.devices.empty()) {
-        return g_tensor_parallel.primary_device();
+    const auto& execution = cuda_execution_context();
+    if (!execution.tensor_parallel.devices.empty()) {
+        return execution.tensor_parallel.primary_device();
     }
-    if (!g_expert_parallel.devices.empty()) {
-        return g_expert_parallel.primary_device();
+    if (!execution.expert_parallel.devices.empty()) {
+        return execution.expert_parallel.primary_device();
     }
     return 0;
 }
@@ -186,13 +148,15 @@ bool model_parallel_cuda_graph_enabled() {
     }
     const char * environment = std::getenv(
         "MFQ_MODEL_PARALLEL_CUDA_GRAPH");
+    const auto& execution = cuda_execution_context();
     if (environment == nullptr) {
         environment = std::getenv(
-            g_expert_parallel.enabled() && !g_tensor_parallel.enabled()
+            execution.expert_parallel.enabled() &&
+                    !execution.tensor_parallel.enabled()
                 ? "MFQ_EP_CUDA_GRAPH"
                 : "MFQ_TP_CUDA_GRAPH");
     }
-    return g_model_parallel_collectives.collectives_enabled &&
+    return execution.model_parallel_collectives.collectives_enabled &&
            (environment == nullptr || environment[0] != '0');
 }
 
@@ -262,8 +226,9 @@ size_t model_parallel_launch_index(
 
 
 int active_weight_load_device() {
-    return g_layer_placement.load_device >= 0
-        ? g_layer_placement.load_device
+    const auto& placement = cuda_execution_context().layer_placement;
+    return placement.load_device >= 0
+        ? placement.load_device
         : model_parallel_primary_device();
 }
 
@@ -281,13 +246,12 @@ const char * kl_mmq_mode_name(KlMmqMode mode) {
 
 
 mfq_tensor_backend::Tensor kl_mmq_prepare_activation(mfq_tensor_backend::Tensor x) {
-    if (g_kl_mmq_mode != KlMmqMode::Nint8One) {
-        return x;
-    }
+    auto& execution = cuda_execution_context();
+    if (execution.kl_mmq_mode != KlMmqMode::Nint8One) return x;
     const auto original_shape = x.sizes().vec();
     auto flat = x.reshape({-1, x.size(-1)}).contiguous();
     auto quantized = nint8_one_quantize_reconstruct_cuda(flat);
-    ++g_kl_mmq_activation_quantize_calls;
+    ++execution.kl_mmq_activation_quantize_calls;
     return quantized.at(3).reshape(original_shape).contiguous();
 }
 
@@ -396,8 +360,10 @@ void write_moe_route_stats() {
 }
 
 void trace_gemma_stage(int layer, const char * name, const mfq_tensor_backend::Tensor & value) {
-    if (g_gemma_stage_trace != nullptr && layer == g_gemma_trace_layer) {
-        g_gemma_stage_trace->emplace_back(
+    auto& execution = cuda_execution_context();
+    if (execution.gemma_stage_trace != nullptr &&
+            layer == execution.gemma_trace_layer) {
+        execution.gemma_stage_trace->emplace_back(
             name, value.to(mfq_tensor_backend::kFloat32).contiguous().clone());
     }
 }

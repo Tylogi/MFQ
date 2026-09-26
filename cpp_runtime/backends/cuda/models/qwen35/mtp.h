@@ -9,11 +9,13 @@ struct Qwen35Mtp final : MtpModule {
     QuantLinear fusion;
     mfq_tensor_backend::Tensor hidden_norm, embedding_norm, output_norm;
     std::vector<std::unique_ptr<Block>> blocks;
+    CudaExecutionContext* execution = nullptr;
     int64_t cache_pos = 0;
 
     static std::optional<Qwen35Mtp> load_if_present(
             const mfq::ModelSource& file,
-            const mfq::cuda::qwen35::Config& main) {
+            const mfq::cuda::qwen35::Config& main,
+            CudaExecutionContext& execution) {
         const bool fusion_present = has_tensor(file, "predictor.fusion.weight");
         const bool any = fusion_present ||
             has_tensor(file, "predictor.hidden_norm.weight") ||
@@ -30,6 +32,7 @@ struct Qwen35Mtp final : MtpModule {
             "Qwen MTP requires declared predictor layers and shared embeddings");
         Qwen35Mtp result;
         result.config = main;
+        result.execution = &execution;
         result.hidden_norm = load_dense_gpu(
             file, "predictor.hidden_norm.weight");
         result.embedding_norm = load_dense_gpu(
@@ -47,7 +50,8 @@ struct Qwen35Mtp final : MtpModule {
         for (int layer = 0; layer < main.mtp_num_hidden_layers; ++layer) {
             auto block = mfq::cuda::qwen35::load_block(
                 file, result.config, layer, "full_attention", "predictor");
-            block->cuda_device = g_layer_placement.primary_device();
+            block->cuda_device =
+                execution.layer_placement.primary_device();
             result.blocks.push_back(std::move(block));
         }
         return result;
@@ -114,7 +118,7 @@ struct Qwen35Mtp final : MtpModule {
         trace_gemma_stage(0, "mtp.fusion", x);
         auto pos = positions.defined()
             ? tensor_to_cuda_device(
-                  positions, g_layer_placement.primary_device())
+                  positions, execution->layer_placement.primary_device())
                   .to(mfq_tensor_backend::kInt64).contiguous()
             : mfq_tensor_backend::arange(
                   cache_pos, cache_pos + tokens,
