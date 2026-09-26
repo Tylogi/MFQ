@@ -4288,6 +4288,72 @@ void test_minicpmo45_gqa_attention() {
     }
 }
 
+static MiniQwen3Language make_minicpmo45_generation_test_language() {
+    MiniQwen3Config config;
+    config.model_type = "minicpmo-generation-test";
+    config.vocab = 32;
+    config.hidden = 8;
+    config.intermediate = 16;
+    config.layers = 1;
+    config.query_heads = 2;
+    config.kv_heads = 1;
+    config.head_dim = 4;
+    config.maximum_context = 32;
+    config.rope_base = 10000.0f;
+    config.norm_eps = 1e-5f;
+    config.tie_embeddings = true;
+
+    const auto linear = [](int output, int input, int phase) {
+        std::vector<float> values(
+            static_cast<std::size_t>(output * input));
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            values[index] = 0.075f * std::sin(
+                static_cast<float>(index + 1 + phase * 17) * 0.37f);
+        }
+        auto weight = mlx::core::astype(
+            array(values.begin(), Shape{output, input}),
+            mlx::core::bfloat16);
+        return MiniLinear(MlxLinear(std::move(weight)), std::nullopt);
+    };
+    const auto norm = [](int width) {
+        return MlxRmsNorm(
+            mlx::core::ones(Shape{width}, mlx::core::float32),
+            1e-5f,
+            0.0f);
+    };
+    std::vector<float> embedding_values(
+        static_cast<std::size_t>(config.vocab * config.hidden));
+    for (std::size_t index = 0; index < embedding_values.size(); ++index) {
+        embedding_values[index] = 0.11f * std::sin(
+            static_cast<float>(index + 5) * 0.19f);
+    }
+    std::vector<MiniQwen3Block> blocks;
+    blocks.emplace_back(
+        config,
+        norm(8),
+        linear(8, 8, 1),
+        linear(4, 8, 2),
+        linear(4, 8, 3),
+        linear(8, 8, 4),
+        norm(4),
+        norm(4),
+        norm(8),
+        MiniQwen3Ffn(
+            linear(16, 8, 5),
+            linear(16, 8, 6),
+            linear(8, 16, 7)));
+    return MiniQwen3Language(
+        config,
+        MlxEmbedding(mlx::core::astype(
+            array(
+                embedding_values.begin(),
+                Shape{config.vocab, config.hidden}),
+            mlx::core::bfloat16)),
+        std::move(blocks),
+        norm(config.hidden),
+        std::nullopt);
+}
+
 void test_minicpmo45_qwen3_cache_equivalence() {
     MiniQwen3Config config;
     config.model_type = "minicpmo-test";
@@ -4412,27 +4478,8 @@ void test_minicpmo45_qwen3_cache_equivalence() {
             " cache=" + std::to_string(maximum_cache_delta));
     }
 
-    config.tie_embeddings = true;
-    const auto make_language = [&]() {
-        std::vector<float> embedding_values(
-            static_cast<std::size_t>(config.vocab * config.hidden));
-        for (std::size_t index = 0;
-             index < embedding_values.size(); ++index) {
-            embedding_values[index] = 0.11f * std::sin(
-                static_cast<float>(index + 5) * 0.19f);
-        }
-        std::vector<MiniQwen3Block> blocks;
-        blocks.emplace_back(make_block());
-        return MiniQwen3Language(
-            config,
-            MlxEmbedding(mlx::core::astype(
-                array(
-                    embedding_values.begin(),
-                    Shape{config.vocab, config.hidden}),
-                mlx::core::bfloat16)),
-            std::move(blocks),
-            norm(config.hidden),
-            std::nullopt);
+    const auto make_language = []() {
+        return make_minicpmo45_generation_test_language();
     };
     const auto ids = [](std::initializer_list<std::int32_t> values) {
         return array(
@@ -5247,9 +5294,11 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
     const std::function<bool(std::int64_t)>& callback,
     const std::function<void(std::size_t, double)>& prefill_callback,
     const MfqTokenConstraintPtr& token_constraint,
-    std::optional<std::size_t> stable_prefix_tokens) {
+    std::optional<std::size_t> stable_prefix_tokens,
+    int prefill_chunk_size) {
+    last_prefill_chunk_sizes_.clear();
     const auto& config = implementation_->language.config();
-    if (prompt.empty() || max_tokens < 0 ||
+    if (prompt.empty() || max_tokens < 0 || prefill_chunk_size <= 0 ||
         prompt.size() > static_cast<std::size_t>(config.maximum_context)) {
         throw std::invalid_argument(
             "MiniCPM-o generation prompt or token limit is invalid");
@@ -5328,6 +5377,7 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
                 prompt_ids,
                 Shape{0, static_cast<int>(begin)},
                 Shape{1, static_cast<int>(end)});
+            last_prefill_chunk_sizes_.push_back(end - begin);
             if (fused_greedy) {
                 return implementation_->language.forward_greedy(ids, true);
             }
@@ -5335,13 +5385,34 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
                 implementation_->language.forward(ids, true),
                 config.vocab);
         };
+        const auto materialize_text_cache = [&]() {
+            detail::measure_evaluation([&]() {
+                implementation_->language.materialize_cache();
+            });
+        };
+        const auto prefill_range = [&](std::size_t begin, std::size_t end) {
+            std::optional<array> result;
+            const auto chunk_size =
+                static_cast<std::size_t>(prefill_chunk_size);
+            for (auto offset = begin; offset < end;) {
+                const auto stop = std::min(end, offset + chunk_size);
+                result = forward_range(offset, stop);
+                offset = stop;
+                if (offset < end) materialize_text_cache();
+            }
+            if (!result) {
+                throw std::runtime_error(
+                    "MiniCPM-o session prefill range is empty");
+            }
+            return std::move(*result);
+        };
         std::optional<array> stable_logits;
         array result = [&]() {
             if (stable_count == 0) {
-                return forward_range(0, prompt.size());
+                return prefill_range(0, prompt.size());
             }
             if (reused_tokens < stable_count) {
-                stable_logits = forward_range(
+                stable_logits = prefill_range(
                     reused_tokens, stable_count);
             }
             if (implementation_->language.cache_position() !=
@@ -5349,6 +5420,7 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
                 throw std::runtime_error(
                     "MiniCPM-o stable session cache position mismatch");
             }
+            if (reused_tokens < stable_count) materialize_text_cache();
             std::vector<std::int64_t> prefix(
                 prompt.begin(),
                 prompt.begin() +
@@ -5356,7 +5428,8 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
             stable_snapshot = implementation_->language
                 .capture_text_session_state(prefix);
             if (stable_count < prompt.size()) {
-                return forward_range(stable_count, prompt.size());
+                stable_logits.reset();
+                return prefill_range(stable_count, prompt.size());
             }
             if (!stable_logits) {
                 throw std::runtime_error(
@@ -5457,6 +5530,76 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
     }
     return generated;
 }
+
+namespace detail {
+
+void test_minicpmo45_chunked_prefill_generation() {
+    const auto make_runtime = []() {
+        return MlxMiniCPMO45Runtime(
+            std::make_unique<MlxMiniCPMO45Runtime::Impl>(
+                make_minicpmo45_generation_test_language(),
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt));
+    };
+    struct Result {
+        std::vector<std::int64_t> tokens;
+        std::int32_t count = 0;
+        int cache_position = 0;
+        int prefill_calls = 0;
+        std::size_t prefill_tokens = 0;
+        std::vector<std::size_t> extents;
+    };
+    const std::vector<std::int64_t> prompt{1, 2, 3, 4, 5};
+    MlxSamplingParams sampling;
+    sampling.temperature = 0.0;
+    const auto run = [&](int chunk_size) {
+        auto runtime = make_runtime();
+        Result result;
+        result.count = runtime.generate(
+            prompt,
+            sampling,
+            3,
+            [&](std::int64_t token) {
+                result.tokens.push_back(token);
+                return true;
+            },
+            [&](std::size_t tokens, double) {
+                ++result.prefill_calls;
+                result.prefill_tokens = tokens;
+            },
+            {},
+            std::nullopt,
+            chunk_size);
+        result.cache_position = runtime.cache_position();
+        result.extents = runtime.last_prefill_chunk_sizes();
+        return result;
+    };
+
+    const auto baseline = run(5);
+    const auto chunked = run(2);
+    if (baseline.extents != std::vector<std::size_t>({5}) ||
+        chunked.extents != std::vector<std::size_t>({2, 2, 1}) ||
+        chunked.extents.back() != 1) {
+        throw std::runtime_error(
+            "MiniCPM-o chunked prefill forward extents mismatch");
+    }
+    if (baseline.tokens != chunked.tokens ||
+        baseline.count != chunked.count ||
+        baseline.cache_position != chunked.cache_position) {
+        throw std::runtime_error(
+            "MiniCPM-o chunked prefill changed greedy generation");
+    }
+    if (baseline.prefill_calls != 1 || chunked.prefill_calls != 1 ||
+        baseline.prefill_tokens != prompt.size() ||
+        chunked.prefill_tokens != prompt.size()) {
+        throw std::runtime_error(
+            "MiniCPM-o chunked prefill callback accounting mismatch");
+    }
+}
+
+} // namespace detail
 
 std::int32_t MlxMiniCPMO45Runtime::generate_multimodal(
     const MlxMiniCPMO45Inputs& inputs,
