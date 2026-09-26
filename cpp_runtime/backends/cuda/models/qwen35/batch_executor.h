@@ -6,7 +6,7 @@
 #include "text_session_cache.h"
 #include "moe_expert_cache.h"
 #include "qwen_paged_kv.h"
-#include "qwen35_linear_attention.h"
+#include "linear_attention.h"
 
 #include <algorithm>
 #include <atomic>

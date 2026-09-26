@@ -1,4 +1,4 @@
-#include "deepseek_v41_causal_lm.h"
+#include "causal_lm.h"
 
 namespace mfq::cuda::deepseek_v41_runtime {
 

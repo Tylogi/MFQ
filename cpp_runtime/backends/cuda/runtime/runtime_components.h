@@ -4,7 +4,7 @@
 #include "grid_vision_runtime.h"
 #include "mtp.h"
 #include "mfq/runtime.h"
-#include "../models/deepseek_v41/deepseek_v41_dspark.h"
+#include "../models/deepseek_v41/dspark.h"
 #include "../models/glm5_next/mtp.h"
 #include "../models/qwen4_exp/mtp.h"
 #include "../models/qwen35/mtp.h"
@@ -42,4 +42,4 @@ RuntimeComponents<Model> load_runtime_components(
     Model& model,
     bool load_optional_components);
 
-#include "../models/minicpmo45/minicpmo45_components.h"
+#include "minicpmo45.h"

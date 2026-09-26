@@ -1,5 +1,5 @@
-#include "qwen35_causal_lm.h"
-#include "qwen35_linear_attention.h"
+#include "causal_lm.h"
+#include "linear_attention.h"
 
 #include "../../runtime/causal_lm.h"
 #include "../../runtime/cuda_transformer.h"

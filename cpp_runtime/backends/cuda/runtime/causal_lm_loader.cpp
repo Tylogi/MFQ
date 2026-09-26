@@ -3,13 +3,13 @@
 #include "cuda_transformer_loader.h"
 #include "moe_expert_cache.h"
 #include "../models/registry.h"
-#include "../models/deepseek_v4/deepseek_v4_causal_lm.h"
-#include "../models/deepseek_v41/deepseek_v41_causal_lm.h"
+#include "../models/deepseek_v4/causal_lm.h"
+#include "../models/deepseek_v41/causal_lm.h"
 #include "../models/glm5_next/causal_lm.h"
 #include "../models/qwen4_exp/causal_lm.h"
-#include "../models/gemma4/gemma4_causal_lm.h"
-#include "../models/glm_dsa/glm_dsa_causal_lm.h"
-#include "../models/qwen35/qwen35_causal_lm.h"
+#include "../models/gemma4/causal_lm.h"
+#include "../models/glm_dsa/causal_lm.h"
+#include "../models/qwen35/causal_lm.h"
 
 #include <algorithm>
 #include <bit>

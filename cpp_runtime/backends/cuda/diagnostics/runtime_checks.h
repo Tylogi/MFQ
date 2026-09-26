@@ -8,7 +8,7 @@
 #include "quant_linear.h"
 #include "registry.h"
 #include "cuda_execution.h"
-#include "qwen35/qwen35_linear_attention.h"
+#include "qwen35/linear_attention.h"
 #include "mfq/kernels/cuda/deepseek_v41.h"
 #include "nlohmann/json.hpp"
 

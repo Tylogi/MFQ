@@ -5,7 +5,7 @@
 #include "decode_graph.h"
 #include "generation.h"
 #include "moe_expert_cache.h"
-#include "models/qwen35/qwen35_batch_executor.h"
+#include "models/qwen35/batch_executor.h"
 #include "runner.h"
 #include "runtime_components.h"
 #include "text_session_cache.h"

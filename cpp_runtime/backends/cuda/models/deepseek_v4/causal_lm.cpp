@@ -1,4 +1,4 @@
-#include "deepseek_v4_causal_lm.h"
+#include "causal_lm.h"
 
 #include "../../runtime/cuda_transformer.h"
 

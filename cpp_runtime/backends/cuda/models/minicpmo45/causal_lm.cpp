@@ -1,4 +1,4 @@
-#include "minicpmo45_runtime.h"
+#include "causal_lm.h"
 
 int run_minicpmo45_duplex(
         const std::string & model_path,

@@ -1,9 +1,9 @@
 #pragma once
 
 #include "../../runtime/cuda_transformer.h"
-#include "../deepseek_v4/deepseek_v4_causal_lm.h"
-#include "deepseek_v41_engram.h"
-#include "deepseek_v41_dspark.h"
+#include "../deepseek_v4/causal_lm.h"
+#include "engram.h"
+#include "dspark.h"
 #include "models/include/deepseek_v41.h"
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"

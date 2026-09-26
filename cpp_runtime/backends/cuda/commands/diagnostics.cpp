@@ -5,7 +5,7 @@
 #include "diagnostics/model_checks.h"
 #include "diagnostics/runtime_checks.h"
 #include "diagnostics/flash_next_mtp.h"
-#include "models/minicpmo45/minicpmo45_engine.h"
+#include "minicpmo45.h"
 #include "registry.h"
 #include "transport.h"
 #include "cuda_execution.h"

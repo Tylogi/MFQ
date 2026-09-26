@@ -2,7 +2,7 @@
 
 #include "runtime/generation.h"
 #include "runtime/text_session_cache.h"
-#include "models/qwen35/qwen35_batch_executor.h"
+#include "models/qwen35/batch_executor.h"
 
 #include <cuda_profiler_api.h>
 

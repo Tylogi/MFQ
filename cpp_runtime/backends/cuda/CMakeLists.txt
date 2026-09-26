@@ -240,16 +240,15 @@ function(mfq_configure_cuda_runtime_target target)
 endfunction()
 
 set(MFQ_CUDA_MODEL_SOURCES
-    ${MFQ_CUDA_ROOT}/models/deepseek_v4/deepseek_v4_causal_lm.cpp
-    ${MFQ_CUDA_ROOT}/models/deepseek_v41/deepseek_v41_causal_lm.cpp
-    ${MFQ_CUDA_ROOT}/models/deepseek_v41/deepseek_v41_dspark.cpp
+    ${MFQ_CUDA_ROOT}/models/deepseek_v4/causal_lm.cpp
+    ${MFQ_CUDA_ROOT}/models/deepseek_v41/causal_lm.cpp
+    ${MFQ_CUDA_ROOT}/models/deepseek_v41/dspark.cpp
     ${MFQ_CUDA_ROOT}/models/qwen4_exp/causal_lm.cpp
     ${MFQ_CUDA_ROOT}/models/glm5_next/causal_lm.cpp
-    ${MFQ_CUDA_ROOT}/models/gemma4/gemma4_causal_lm.cpp
-    ${MFQ_CUDA_ROOT}/models/glm_dsa/glm_dsa_causal_lm.cpp
-    ${MFQ_CUDA_ROOT}/models/minicpmo45/minicpmo45_runtime.cpp
-    ${MFQ_CUDA_ROOT}/models/minicpmo45/minicpmo45_engine.cpp
-    ${MFQ_CUDA_ROOT}/models/qwen35/qwen35_causal_lm.cpp
+    ${MFQ_CUDA_ROOT}/models/gemma4/causal_lm.cpp
+    ${MFQ_CUDA_ROOT}/models/glm_dsa/causal_lm.cpp
+    ${MFQ_CUDA_ROOT}/models/minicpmo45/causal_lm.cpp
+    ${MFQ_CUDA_ROOT}/models/qwen35/causal_lm.cpp
     ${MFQ_CUDA_ROOT}/models/registry.cpp
 )
 
@@ -279,6 +278,8 @@ add_library(mfq-cuda-runtime STATIC
     ${MFQ_CUDA_ROOT}/runtime/mtp.cpp
     ${MFQ_CUDA_ROOT}/runtime/moe_expert_cache.cpp
     ${MFQ_CUDA_ROOT}/runtime/runtime_components.cpp
+    ${MFQ_CUDA_ROOT}/runtime/minicpmo45.cpp
+    ${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp
     ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
     ${MFQ_CUDA_MODEL_SOURCES}
 )

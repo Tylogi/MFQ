@@ -3,7 +3,7 @@
 #include "runtime/moe_expert_cache.h"
 #include "runtime/setup.h"
 #include "runtime/token_generation.h"
-#include "models/minicpmo45/minicpmo45_engine.h"
+#include "minicpmo45.h"
 #include "models/registry.h"
 #include "mfq/model_source.h"
 #include "transport.h"

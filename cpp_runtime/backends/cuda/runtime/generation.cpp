@@ -5,7 +5,7 @@
 #include "cuda_sampling.h"
 #include "text_session_cache.h"
 #include "mtp.h"
-#include "../models/qwen35/qwen35_linear_attention.h"
+#include "../models/qwen35/linear_attention.h"
 #include "mfq_cuda_ops.h"
 
 #include <algorithm>

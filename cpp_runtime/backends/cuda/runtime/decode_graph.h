@@ -3,7 +3,7 @@
 #include "mfq_tensor_backend.h"
 #include "cuda_model_plan.h"
 #include "mfq/runtime.h"
-#include "../models/qwen35/qwen35_linear_attention.h"
+#include "../models/qwen35/linear_attention.h"
 
 #include <cstdint>
 #include <functional>

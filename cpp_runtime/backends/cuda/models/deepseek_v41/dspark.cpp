@@ -1,8 +1,8 @@
-#include "deepseek_v41_dspark.h"
+#include "dspark.h"
 
 #include "../../runtime/causal_lm.h"
 #include "../../runtime/mtp.h"
-#include "deepseek_v41_causal_lm.h"
+#include "causal_lm.h"
 
 #include <algorithm>
 #include <cmath>
