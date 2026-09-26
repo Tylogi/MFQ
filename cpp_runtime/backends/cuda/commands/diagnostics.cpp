@@ -1,6 +1,6 @@
 #include "cli.h"
-#include "runtime/runner.h"
-#include "runtime/generation.h"
+#include "engine/runner.h"
+#include "engine/generation.h"
 #include "diagnostics/backend_checks.h"
 #include "diagnostics/model_checks.h"
 #include "diagnostics/runtime_checks.h"
@@ -444,7 +444,8 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                     Backbone == mfq::cuda::CudaBackbone::glm5_next) {
                 using Predictor=std::conditional_t<
                     Backbone==mfq::cuda::CudaBackbone::qwen4_exp,
-                    Qwen4ExpMtp,Glm5NextMtp>;
+                    mfq::cuda::qwen4_exp::Qwen4ExpMtp,
+                    mfq::cuda::glm5_next::Glm5NextMtp>;
                 auto* predictor=dynamic_cast<Predictor*>(runtime_components.mtp.get());
                 MFQ_RUNTIME_CHECK(predictor != nullptr,
                     "Flash-Next MTP diagnostic requires a loaded predictor component");

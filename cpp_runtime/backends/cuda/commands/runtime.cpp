@@ -1,8 +1,6 @@
 #include "cli.h"
-#include "runtime/cuda_engine.h"
-#include "runtime/moe_expert_cache.h"
-#include "runtime/setup.h"
-#include "runtime/token_generation.h"
+#include "engine/cuda_engine.h"
+#include "engine/moe_expert_cache.h"
 #include "minicpmo45.h"
 #include "models/registry.h"
 #include "mfq/model_source.h"
@@ -62,6 +60,15 @@ void print_help() {
         << "  --layer-split WEIGHTS           layer-placement weights\n"
         << "  -h, --help                      show this help\n";
 }
+
+struct RuntimeOptions : CudaEngineOptions, TokenInputOptions {
+    std::string transport_host = "127.0.0.1";
+    std::string runtime_model_name = "mfq-model", transport_api_key;
+    std::string runtime_sampling_profile;
+    int transport_port = 8080;
+    bool transport_mode = false;
+    bool stdio_mode = false;
+};
 
 struct RuntimeCommandOptions
     : RuntimeOptions,
@@ -201,7 +208,7 @@ int run_transport_runtime(RuntimeOptions& options) {
     }
 
     CudaEngineOptions engine_options = options;
-    auto loaded = load_cuda_engine(std::move(engine_options));
+    auto engine = load_cuda_engine(std::move(engine_options));
     if (options.transport_api_key.empty()) {
         const char* env_key = std::getenv("MFQ_API_KEY");
         if (env_key != nullptr) options.transport_api_key = env_key;
@@ -211,22 +218,22 @@ int run_transport_runtime(RuntimeOptions& options) {
     transport_config.host = options.transport_host;
     transport_config.port = options.transport_port;
     transport_config.model_name = options.runtime_model_name;
-    transport_config.model_type = loaded.metadata.model_type;
+    transport_config.model_type = engine.metadata.model_type;
     transport_config.api_key = options.transport_api_key;
-    transport_config.max_context = loaded.metadata.max_context;
-    transport_config.vocab_size = loaded.metadata.vocab_size;
+    transport_config.max_context = engine.metadata.max_context;
+    transport_config.vocab_size = engine.metadata.vocab_size;
     transport_config.model_capabilities = MfqModelCapabilities{
-        loaded.metadata.architecture,
-        loaded.metadata.capabilities.text,
-        loaded.metadata.capabilities.image_input,
-        loaded.metadata.capabilities.video_input,
-        loaded.metadata.capabilities.audio_input,
-        loaded.metadata.capabilities.audio_output,
-        loaded.metadata.capabilities.full_duplex,
-        loaded.metadata.capabilities.mtp,
+        engine.metadata.architecture,
+        engine.metadata.capabilities.text,
+        engine.metadata.capabilities.image_input,
+        engine.metadata.capabilities.video_input,
+        engine.metadata.capabilities.audio_input,
+        engine.metadata.capabilities.audio_output,
+        engine.metadata.capabilities.full_duplex,
+        engine.metadata.capabilities.mtp,
         "model-graph+cuda-adapters",
     };
-    const auto& runtime_assets = *loaded.metadata.source;
+    const auto& runtime_assets = *engine.metadata.source;
     if (runtime_assets.has_asset(mfq::cuda::kTokenizerGgufAsset)) {
         transport_config.tokenizer_gguf = read_runtime_asset(
             runtime_assets, mfq::cuda::kTokenizerGgufAsset);
@@ -237,7 +244,7 @@ int run_transport_runtime(RuntimeOptions& options) {
         "runtime.sampling.v1");
     transport_config.runtime_profile = resolve_mfq_runtime_profile(
         options.model_path,
-        loaded.metadata.architecture,
+        engine.metadata.architecture,
         transport_config.model_type,
         transport_config.model_name,
         embedded_profile == runtime_assets.metadata().end()
@@ -249,8 +256,7 @@ int run_transport_runtime(RuntimeOptions& options) {
     auto transport = options.stdio_mode
         ? make_mfq_stdio_transport(transport_config)
         : make_mfq_http_transport(transport_config);
-    MfqRuntime runtime(
-        std::move(loaded.inference), std::move(transport));
+    MfqRuntime runtime(std::move(engine), std::move(transport));
     const int status = runtime.run();
     if (g_moe_expert_cache) {
         print_moe_expert_cache_stats(std::cout);

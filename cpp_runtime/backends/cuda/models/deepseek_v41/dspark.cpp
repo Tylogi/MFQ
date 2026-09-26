@@ -1,7 +1,7 @@
 #include "dspark.h"
 
-#include "../../runtime/causal_lm.h"
-#include "../../runtime/mtp.h"
+#include "../../engine/causal_lm.h"
+#include "../../engine/mtp.h"
 #include "causal_lm.h"
 
 #include <algorithm>

@@ -20,7 +20,7 @@ SCHEDULER = "\n".join(
     for path in sorted((ROOT / "cpp_runtime" / "scheduler").rglob("*"))
     if path.suffix in {".cpp", ".h"}
 )
-CUDA_RUNTIME = ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime"
+CUDA_RUNTIME = ROOT / "cpp_runtime" / "backends" / "cuda" / "engine"
 DECODE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in (

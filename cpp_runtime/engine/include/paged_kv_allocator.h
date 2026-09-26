@@ -8,7 +8,7 @@
 #include <unordered_set>
 #include <vector>
 
-namespace mfq::cuda::continuous {
+namespace mfq::engine {
 
 class PagedKvPageAllocator {
 public:
@@ -110,4 +110,4 @@ private:
     std::vector<std::int32_t> free_pages_;
 };
 
-} // namespace mfq::cuda::continuous
+} // namespace mfq::engine

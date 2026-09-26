@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../runtime/mtp.h"
+#include "../../engine/mtp.h"
 #include "layers.h"
 
 #include <algorithm>
@@ -8,17 +8,18 @@
 #include <utility>
 #include <vector>
 
+namespace mfq::cuda::glm5_next {
+
 // GLM5-Next predictor shares the target embedding and output projection.
 struct Glm5NextMtp final : MtpModule {
     using Tensor=mfq_tensor_backend::Tensor;
-    using Linear=mfq::flash_next::Linear;
     struct Layer {
         Tensor attention_norm,ffn_norm;
-        std::unique_ptr<mfq::flash_next::SparseMla> attention;
+        std::unique_ptr<SparseMla> attention;
         Linear ffn;
     };
 
-    mfq::models::flash_next::GlmConfig config;
+    mfq::models::glm5_next::Config config;
     Tensor embedding_norm,hidden_norm,output_norm;
     Linear fusion;
     std::vector<Layer> layers;
@@ -27,8 +28,7 @@ struct Glm5NextMtp final : MtpModule {
 
     static std::optional<Glm5NextMtp> load_if_present(
             const mfq::ModelSource& file,
-            const mfq::models::flash_next::GlmConfig& main) {
-        using namespace flash_runtime;
+            const mfq::models::glm5_next::Config& main) {
         const bool any=std::any_of(file.tensors().begin(),file.tensors().end(),
             [](const mfq::TensorMetadata& tensor) {return tensor.name.rfind("predictor.",0)==0;});
         const auto count=main.predictor_layers;
@@ -46,7 +46,7 @@ struct Glm5NextMtp final : MtpModule {
             const auto p="predictor.block."+std::to_string(i),a=p+".attention";
             Layer layer;layer.attention_norm=dense(file,a+".norm.weight");layer.ffn_norm=dense(file,p+".mlp.norm.weight");
             layer.ffn=glm_ffn(file,main,int(i),"predictor");
-            mfq::flash_next::MlaWeights w{linear(file,a+".query_a.weight"),linear(file,a+".key_value_a.weight"),
+            MlaWeights w{linear(file,a+".query_a.weight"),linear(file,a+".key_value_a.weight"),
                 linear(file,a+".query_b.weight"),linear(file,a+".output.weight"),linear(file,a+".indexer.query.weight"),
                 linear(file,a+".indexer.key.weight"),linear(file,a+".indexer.score.weight"),
                 headwise(routed(file,a+".latent.query_embedding.weight",int(i),main.heads,main.latent,main.nope),main.heads,main.latent),
@@ -54,9 +54,9 @@ struct Glm5NextMtp final : MtpModule {
                 dense(file,a+".query_a_norm.weight"),dense(file,a+".key_value_a_norm.weight"),
                 dense(file,a+".indexer.key_norm.weight"),dense(file,a+".indexer.key_norm.bias"),
                 dense(file,a+".indexer.pool.gate"),dense(file,a+".indexer.pool.position")};
-            mfq::flash_next::MlaConfig mc{main.heads,main.nope,main.latent,main.value_width,main.index_heads,
+            MlaConfig mc{main.heads,main.nope,main.latent,main.value_width,main.index_heads,
                 main.index_width,main.pool,main.budget,main.maximum,main.tail,main.eps};
-            layer.attention=std::make_unique<mfq::flash_next::SparseMla>(std::move(w),mc);
+            layer.attention=std::make_unique<SparseMla>(std::move(w),mc);
             result.layers.push_back(std::move(layer));
         }
         MFQ_RUNTIME_CHECK(result.embedding_norm.dim()==1 && result.embedding_norm.numel()==main.hidden &&
@@ -92,15 +92,15 @@ struct Glm5NextMtp final : MtpModule {
         current=current.to(tb::kInt32);
         auto mask=(current==0).reshape({current.dim()==1?1:b,t,1});
         auto e=tb::where(mask,tb::zeros_like(embeds),embeds);
-        auto x=fusion(tb::cat({mfq::flash_next::rms_norm(e,embedding_norm,config.eps),
-            mfq::flash_next::rms_norm(hidden,hidden_norm,config.eps)},-1));
+        auto x=fusion(tb::cat({rms_norm(e,embedding_norm,config.eps),
+            rms_norm(hidden,hidden_norm,config.eps)},-1));
         auto& block=layers[layer];
-        auto attention=block.attention->forward(mfq::flash_next::rms_norm(x,block.attention_norm,config.eps),cache);
+        auto attention=block.attention->forward(rms_norm(x,block.attention_norm,config.eps),cache);
         auto residual=x.to(tb::kFloat32)+attention.to(tb::kFloat32);
         const auto dtype=x.scalar_type()==tb::kFloat32?tb::kFloat32:tb::kFloat16;
-        auto branch=mfq::flash_next::rms_norm(residual,block.ffn_norm,config.eps).to(dtype);
+        auto branch=rms_norm(residual,block.ffn_norm,config.eps).to(dtype);
         auto multi=residual+block.ffn(branch).to(tb::kFloat32);
-        auto output=mfq::flash_next::rms_norm(multi,output_norm,config.eps).to(dtype);
+        auto output=rms_norm(multi,output_norm,config.eps).to(dtype);
         if (cache) {batch=b;lengths[layer]=start+t;}
         return {output,multi};
     }
@@ -120,3 +120,5 @@ struct Glm5NextMtp final : MtpModule {
     bool target_bootstrap_decode() const noexcept override {return true;}
     bool preserve_output_dtype() const noexcept override {return true;}
 };
+
+} // namespace mfq::cuda::glm5_next

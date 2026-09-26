@@ -2,7 +2,8 @@ add_library(mfq-models STATIC
     model_config.cpp
     deepseek_v4.cpp
     deepseek_v41.cpp
-    flash_next.cpp
+    glm5_next.cpp
+    qwen4_exp.cpp
     gemma4.cpp
     glm_dsa.cpp
     minicpmo45.cpp

@@ -1,7 +1,7 @@
 #include "runtime_checks.h"
 
-#include "runtime/generation.h"
-#include "runtime/text_session_cache.h"
+#include "engine/generation.h"
+#include "engine/text_session_cache.h"
 #include "models/qwen35/batch_executor.h"
 
 #include <cuda_profiler_api.h>

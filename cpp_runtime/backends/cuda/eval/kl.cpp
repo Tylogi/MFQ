@@ -2,9 +2,9 @@
 
 #include "../models/registry.h"
 #include "quant_linear.h"
-#include "../runtime/cuda_execution.h"
-#include "../runtime/cuda_transformer.h"
-#include "../runtime/moe_expert_cache.h"
+#include "../engine/cuda_execution.h"
+#include "../engine/cuda_transformer.h"
+#include "../engine/moe_expert_cache.h"
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"
 #include "mfq/kernels/cuda/deepseek_v41.h"

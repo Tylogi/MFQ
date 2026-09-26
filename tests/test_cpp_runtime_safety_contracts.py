@@ -10,14 +10,14 @@ DECODE = "\n".join(
     for path in sorted(CUDA_ROOT.rglob("*"))
     if path.suffix in {".h", ".cpp"}
 )
-MODEL_LOADER = (CUDA_ROOT / "runtime" / "causal_lm_loader.cpp").read_text(
+MODEL_LOADER = (CUDA_ROOT / "engine" / "causal_lm_loader.cpp").read_text(
     encoding="utf-8"
 )
 CUDA_RUNTIME = "\n".join(
     path.read_text(encoding="utf-8")
     for path in (
         CUDA_ROOT / "commands" / "runtime.cpp",
-        CUDA_ROOT / "runtime" / "runner.h",
+        CUDA_ROOT / "engine" / "runner.h",
         CUDA_ROOT / "commands" / "diagnostics.cpp",
     )
 )
@@ -137,7 +137,7 @@ def test_stdio_transport_owns_stdin_and_isolates_stdout() -> None:
         ):
             stdin_users.add(path.relative_to(ROOT / "cpp_runtime").as_posix())
     assert stdin_users == {
-        "backends/cuda/models/minicpmo45/minicpmo45_runtime.cpp",
+        "backends/cuda/models/minicpmo45/causal_lm.cpp",
         "transport/src/stdio.cpp",
     }
     assert "if (minicpmo_eval_batch)" in CUDA_RUNTIME

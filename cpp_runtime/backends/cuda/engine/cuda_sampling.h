@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq/sampling.h"
+#include "sampling.h"
 #include "mfq/runtime.h"
 #include "mfq_cuda_ops.h"
 
@@ -55,7 +55,7 @@ private:
     Tensor random_cuda_;
 };
 
-using Sampler = mfq::Sampler<SamplingOps>;
+using Sampler = mfq::engine::Sampler<SamplingOps>;
 
 inline SamplingOps::Tensor sample_logits(
         Sampler& sampler,

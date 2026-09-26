@@ -14,8 +14,8 @@ CMAKE = (ROOT / "cpp_runtime" / "tests" / "CMakeLists.txt").read_text(
     encoding="utf-8"
 )
 COMPONENTS = "\n".join(
-    (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
-    for name in ("runtime_components.h", "runtime_components.cpp")
+    (CUDA_ROOT / "models" / name).read_text(encoding="utf-8")
+    for name in ("components.h", "components.cpp")
 )
 
 
@@ -164,7 +164,7 @@ def test_deepseek_v4_split_gate_up_uses_existing_moe_runtime_and_cache():
 
 def test_generic_ffn_loader_stays_dense_and_model_moe_loaders_are_typed():
     loader = (
-        CUDA_ROOT / "runtime" / "cuda_transformer_loader.cpp"
+        CUDA_ROOT / "engine" / "cuda_transformer_loader.cpp"
     ).read_text(encoding="utf-8")
     assert "experts.gate.weight" not in loader
     assert "const mfq::models::ModelConfig& config" in loader

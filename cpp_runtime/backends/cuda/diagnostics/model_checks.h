@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../runtime/causal_lm.h"
+#include "../engine/causal_lm.h"
 
 #include <cstdint>
 #include <string>

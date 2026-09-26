@@ -64,7 +64,7 @@ CUDA_CLI = (
     ROOT / "cpp_runtime" / "backends" / "cuda" / "commands" / "cli.h"
 ).read_text(encoding="utf-8")
 CUDA_MODELS = ROOT / "cpp_runtime" / "backends" / "cuda" / "models"
-CUDA_RUNTIME = ROOT / "cpp_runtime" / "backends" / "cuda" / "runtime"
+CUDA_RUNTIME = ROOT / "cpp_runtime" / "backends" / "cuda" / "engine"
 CUDA_ENGINE_SOURCE = (CUDA_RUNTIME / "cuda_engine.cpp").read_text(
     encoding="utf-8"
 )
@@ -92,9 +92,9 @@ CUDA_TRANSFORMER_HEADER = (
     CUDA_RUNTIME / "cuda_transformer.h"
 ).read_text(encoding="utf-8")
 CUDA_QWEN_LINEAR = (
-    CUDA_MODELS / "qwen35" / "qwen35_linear_attention.h"
+    CUDA_MODELS / "qwen35" / "linear_attention.h"
 ).read_text(encoding="utf-8") + (\
-    CUDA_MODELS / "qwen35" / "qwen35_causal_lm.cpp"
+    CUDA_MODELS / "qwen35" / "causal_lm.cpp"
 ).read_text(encoding="utf-8")
 CUDA_CAUSAL_LM = (CUDA_RUNTIME / "causal_lm.h").read_text(
     encoding="utf-8"
@@ -207,10 +207,10 @@ def test_cuda_cli_is_a_thin_client_of_the_runtime_library() -> None:
     )
     assert "add_library(mfq-cuda-runtime STATIC" in cmake
     assert not (CUDA_RUNTIME / "cuda_runtime.cpp").exists()
-    assert "runtime/cuda_runtime.cpp" not in cmake
-    assert "runtime/cuda_engine.cpp" in cmake
-    assert "runtime/generation.cpp" in cmake
-    assert "runtime/text_session_cache.cpp" in cmake
+    assert "engine/cuda_runtime.cpp" not in cmake
+    assert "engine/cuda_engine.cpp" in cmake
+    assert "engine/generation.cpp" in cmake
+    assert "engine/text_session_cache.cpp" in cmake
     assert "add_executable(mfq-runtime\n" in cmake
     assert "mfq-cuda-runtime mfq-runtime-communication" in cmake
     assert "${MFQ_CUDA_ROOT}/commands/runtime.cpp" in cmake
@@ -251,7 +251,9 @@ def test_cuda_runtime_has_one_shared_generation_path() -> None:
 
 
 def test_cuda_runtime_composes_transport_scheduler_and_engine() -> None:
-    assert "MfqInferenceEngine inference;" in CUDA_ENGINE_SOURCE
+    assert "CudaInferenceEngine engine;" in CUDA_ENGINE_SOURCE
+    assert "LoadedCudaEngine" not in CUDA_BACKEND_SOURCE
+    assert "LoadedEngine" not in CUDA_BACKEND_SOURCE
     assert '"device_free_bytes"' in CUDA_ENGINE_SOURCE
     assert "MfqRuntime" not in CUDA_ENGINE_SOURCE
     assert "make_mfq_http_transport" not in CUDA_ENGINE_SOURCE
@@ -676,7 +678,8 @@ def test_model_config_parsing_is_backend_neutral() -> None:
     shared_configs = (
         "model_config",
         "minicpmo45",
-        "flash_next",
+        "glm5_next",
+        "qwen4_exp",
         "qwen35",
         "glm_dsa",
         "gemma4",
@@ -701,6 +704,8 @@ def test_model_config_parsing_is_backend_neutral() -> None:
         "mfq::models::minicpmo45::Config",
         "mfq::models::ModelConfig",
         "mfq::models::gemma4::Config",
+        "mfq::models::glm5_next::Config",
+        "mfq::models::qwen4_exp::Config",
         "mfq::models::glm_dsa::Config",
         "mfq::models::deepseek_v4::Config",
         "mfq::models::deepseek_v41::Config",
@@ -734,7 +739,8 @@ def test_model_config_parsing_is_backend_neutral() -> None:
     assert CUDA_CAUSAL_LM_LOADER.count("Config::from_json(payload)") == 8
     for namespace in (
         "minicpmo45",
-        "flash_next",
+        "glm5_next",
+        "qwen4_exp",
         "deepseek_v41",
         "qwen35",
         "glm_dsa",
@@ -745,32 +751,49 @@ def test_model_config_parsing_is_backend_neutral() -> None:
         assert not (CUDA_MODELS / namespace / f"{namespace}_model.cpp").exists()
 
 
+def test_cuda_qwen4_and_glm5_own_their_model_implementations() -> None:
+    assert not (CUDA_MODELS / "flash_next").exists()
+    qwen = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (CUDA_MODELS / "qwen4_exp").glob("*")
+        if path.is_file()
+    )
+    glm = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (CUDA_MODELS / "glm5_next").glob("*")
+        if path.is_file()
+    )
+    assert "namespace mfq::cuda::qwen4_exp" in qwen
+    assert "namespace mfq::cuda::glm5_next" in glm
+    assert "glm5_next" not in qwen
+    assert "qwen4_exp" not in glm
+
+
 def test_cuda_model_runtime_uses_compiled_causal_lm_adapters() -> None:
     cmake = (ROOT / "cpp_runtime" / "backends" / "cuda" / "CMakeLists.txt").read_text(
         encoding="utf-8"
     )
-    adapters = {
-        "qwen4_exp": "causal_lm",
-        "glm5_next": "causal_lm",
-        "deepseek_v41": "deepseek_v41_causal_lm",
-        "deepseek_v4": "deepseek_v4_causal_lm",
-        "glm_dsa": "glm_dsa_causal_lm",
-        "gemma4": "gemma4_causal_lm",
-        "qwen35": "qwen35_causal_lm",
-    }
+    adapters = (
+        "qwen4_exp",
+        "glm5_next",
+        "deepseek_v41",
+        "deepseek_v4",
+        "glm_dsa",
+        "gemma4",
+        "qwen35",
+    )
 
     assert not list(CUDA_MODELS.rglob("construction.h"))
     assert not list(CUDA_MODELS.rglob("model_loader.h"))
     assert not list((ROOT / "cpp_runtime" / "backends" / "cuda").rglob("*.inc"))
-    for namespace, stem in adapters.items():
+    for namespace in adapters:
         model_dir = CUDA_MODELS / namespace
-        header = model_dir / f"{stem}.h"
-        source = model_dir / f"{stem}.cpp"
+        header = model_dir / "causal_lm.h"
+        source = model_dir / "causal_lm.cpp"
         assert header.is_file()
         assert source.is_file()
-        assert f'models/{namespace}/{stem}.cpp' in cmake
-        assert f'#include "{stem}.h"' in source.read_text(encoding="utf-8")
-        assert not stem.startswith("cuda_")
+        assert f"models/{namespace}/causal_lm.cpp" in cmake
+        assert '#include "causal_lm.h"' in source.read_text(encoding="utf-8")
 
     for concrete_definition in (
         "struct Glm5NextBlock",
@@ -819,16 +842,16 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         "ops/nint.cpp",
         "ops/quant_linear.cpp",
         "ops/vq.cpp",
-        "runtime/cuda_execution.cpp",
-        "runtime/decode_graph.cpp",
-        "runtime/runner.cpp",
-        "runtime/causal_lm.cpp",
-        "runtime/causal_lm_loader.cpp",
-        "runtime/cuda_transformer.cpp",
-        "runtime/cuda_transformer_loader.cpp",
-        "runtime/mtp.cpp",
-        "runtime/moe_expert_cache.cpp",
-        "runtime/runtime_components.cpp",
+        "engine/cuda_execution.cpp",
+        "engine/decode_graph.cpp",
+        "engine/runner.cpp",
+        "engine/causal_lm.cpp",
+        "engine/causal_lm_loader.cpp",
+        "engine/cuda_transformer.cpp",
+        "engine/cuda_transformer_loader.cpp",
+        "engine/mtp.cpp",
+        "engine/moe_expert_cache.cpp",
+        "models/components.cpp",
         "diagnostics/backend_checks.cpp",
         "diagnostics/model_checks.cpp",
         "eval/kl.cpp",

@@ -2,7 +2,7 @@
 
 #include "models/minicpmo45/causal_lm.h"
 #include "cli.h"
-#include "runtime/options.h"
+#include "engine/options.h"
 
 namespace mfq::cuda::minicpmo45 {
 

@@ -142,10 +142,10 @@ mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
         }
     } else if constexpr (Kind == CudaBackbone::glm5_next) {
         model.config =
-            mfq::models::flash_next::GlmConfig::from_json(payload);
+            mfq::models::glm5_next::Config::from_json(payload);
     } else if constexpr (Kind == CudaBackbone::qwen4_exp) {
         model.config =
-            mfq::models::flash_next::QwenConfig::from_json(payload);
+            mfq::models::qwen4_exp::Config::from_json(payload);
     } else if constexpr (Kind == CudaBackbone::deepseek_v4) {
         model.config = deepseek_v4::Config::from_json(payload);
         model.config.layer_types.assign(
@@ -160,9 +160,11 @@ mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
         throw std::runtime_error(
             "model graph/config text-layer topology mismatch");
     }
-    if constexpr (Kind == CudaBackbone::qwen4_exp ||
-                  Kind == CudaBackbone::glm5_next) {
-        flash_next::validate_load_options();
+    if constexpr (Kind == CudaBackbone::qwen4_exp) {
+        qwen4_exp::validate_load_options();
+    }
+    if constexpr (Kind == CudaBackbone::glm5_next) {
+        glm5_next::validate_load_options();
     }
     if constexpr (Kind == CudaBackbone::deepseek_v41) {
         deepseek_v41_runtime::validate_load_options();
@@ -267,7 +269,7 @@ mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
     model.embed = load_quant_linear(source, embed_name);
     if constexpr (Kind == CudaBackbone::qwen4_exp) {
         model.final_mixer =
-            flash_next::load_final_mixer(source, model.config);
+            qwen4_exp::load_final_mixer(source, model.config);
     } else {
         model.output_norm = load_dense_gpu(source, norm_name);
     }
@@ -288,11 +290,13 @@ mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
     }
 
     if (load_blocks) {
-        if constexpr (Kind == CudaBackbone::qwen4_exp ||
-                      Kind == CudaBackbone::glm5_next) {
+        if constexpr (Kind == CudaBackbone::qwen4_exp) {
             load_model_blocks(model, [&](int layer, int, const std::string&) {
-                return flash_next::load_block(
-                    source, model.config, layer);
+                return qwen4_exp::load_block(source, model.config, layer);
+            });
+        } else if constexpr (Kind == CudaBackbone::glm5_next) {
+            load_model_blocks(model, [&](int layer, int, const std::string&) {
+                return glm5_next::load_block(source, model.config, layer);
             });
         } else if constexpr (Kind == CudaBackbone::deepseek_v41) {
             model.shared = deepseek_v41_runtime::load_shared_state(

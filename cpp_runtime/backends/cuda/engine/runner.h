@@ -1,7 +1,7 @@
 #pragma once
-#include "setup.h"
+#include "options.h"
 #include "causal_lm.h"
-#include "runtime_components.h"
+#include "models/components.h"
 #include "cuda_execution.h"
 #include "tensor_parallel.h"
 #include "moe_expert_cache.h"
@@ -13,6 +13,9 @@
 #include <vector>
 
 namespace mfq::cuda::internal {
+void setup_cuda_load(const CudaLoadOptions& options);
+void reset_cuda_load() noexcept;
+
 std::vector<int64_t> parse_ids(const std::string& value);
 KlMmqMode parse_kl_mmq_mode(const std::string& value);
 std::vector<KlMmqMode> parse_kl_mmq_sequence(const std::string& value);

@@ -293,7 +293,7 @@ private:
     int32_t maximum_sequences_ = 0;
     int64_t logical_pages_per_sequence_ = 0;
     size_t maximum_physical_pages_ = 0;
-    PagedKvPageAllocator allocator_;
+    mfq::engine::PagedKvPageAllocator allocator_;
     std::vector<std::int32_t> host_page_table_;
     std::map<int, mfq_tensor_backend::Tensor> device_page_tables_;
     std::vector<LayerPool> layers_;

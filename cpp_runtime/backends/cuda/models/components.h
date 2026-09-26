@@ -1,13 +1,13 @@
 #pragma once
 
-#include "causal_lm.h"
-#include "grid_vision_runtime.h"
-#include "mtp.h"
+#include "../engine/causal_lm.h"
+#include "../engine/mtp.h"
+#include "grid_vision_component.h"
 #include "mfq/runtime.h"
-#include "../models/deepseek_v41/dspark.h"
-#include "../models/glm5_next/mtp.h"
-#include "../models/qwen4_exp/mtp.h"
-#include "../models/qwen35/mtp.h"
+#include "deepseek_v41/dspark.h"
+#include "glm5_next/mtp.h"
+#include "qwen4_exp/mtp.h"
+#include "qwen35/mtp.h"
 
 #include <functional>
 #include <memory>
@@ -42,4 +42,14 @@ RuntimeComponents<Model> load_runtime_components(
     Model& model,
     bool load_optional_components);
 
-#include "minicpmo45.h"
+template <>
+RuntimeComponents<mfq::cuda::MiniCPMO45CausalLm>
+load_runtime_components(
+    mfq::cuda::MiniCPMO45CausalLm& model,
+    bool load_optional_components);
+
+template <>
+RuntimeComponents<mfq::cuda::MiniCPMOTtsCausalLm>
+load_runtime_components(
+    mfq::cuda::MiniCPMOTtsCausalLm& model,
+    bool load_optional_components);

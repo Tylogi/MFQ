@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../runtime/mtp.h"
+#include "../../engine/mtp.h"
 #include "layers.h"
 
 #include <algorithm>
@@ -9,15 +9,16 @@
 #include <utility>
 #include <vector>
 
+namespace mfq::cuda::qwen4_exp {
+
 // Qwen4-Exp predictor shares the target embedding and output projection.
 struct Qwen4ExpMtp final : MtpModule {
     using Tensor=mfq_tensor_backend::Tensor;
-    using Linear=mfq::flash_next::Linear;
 
-    mfq::models::flash_next::QwenConfig config;
+    mfq::models::qwen4_exp::Config config;
     Tensor embedding_norm,hidden_norm;
     Linear embedding_fusion,hidden_fusion;
-    std::unique_ptr<flash_runtime::Gr> final_mixer;
+    std::unique_ptr<Gr> final_mixer;
     std::vector<std::unique_ptr<Qwen4Block>> layers;
     std::vector<Tensor> positions;
     std::vector<int64_t> lengths;
@@ -25,8 +26,7 @@ struct Qwen4ExpMtp final : MtpModule {
 
     static std::optional<Qwen4ExpMtp> load_if_present(
             const mfq::ModelSource& file,
-            const mfq::models::flash_next::QwenConfig& main) {
-        using namespace flash_runtime;
+            const mfq::models::qwen4_exp::Config& main) {
         const bool any=std::any_of(file.tensors().begin(),file.tensors().end(),
             [](const mfq::TensorMetadata& tensor) {return tensor.name.rfind("predictor.",0)==0;});
         const auto count=main.predictor_layers;
@@ -79,8 +79,8 @@ struct Qwen4ExpMtp final : MtpModule {
             (current.size(1)==1 || current.size(1)==b),"Qwen4 MTP positions require [T]/[3,T]/[3,B,T]");
         current=current.to(tb::kInt32).expand({3,b,t}).contiguous();
         auto full=cache && positions[layer].defined()?tb::cat({positions[layer],current},-1):current;
-        auto e=embedding_fusion(mfq::flash_next::rms_norm(embeds,embedding_norm+1,config.eps));
-        auto streams=hidden_fusion(mfq::flash_next::rms_norm(hidden,hidden_norm+1,config.eps)
+        auto e=embedding_fusion(rms_norm(embeds,embedding_norm+1,config.eps));
+        auto streams=hidden_fusion(rms_norm(hidden,hidden_norm+1,config.eps)
             .reshape({b,t,config.streams,config.hidden}));
         auto x=(streams+e.unsqueeze(-2)).reshape({b,t,config.streams*config.hidden});
         auto& block=*layers[layer];
@@ -110,3 +110,5 @@ struct Qwen4ExpMtp final : MtpModule {
     bool target_bootstrap_decode() const noexcept override {return true;}
     bool preserve_output_dtype() const noexcept override {return true;}
 };
+
+} // namespace mfq::cuda::qwen4_exp

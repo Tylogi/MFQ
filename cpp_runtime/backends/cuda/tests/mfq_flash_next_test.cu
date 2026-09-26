@@ -1,6 +1,7 @@
 // Native ABI numerical-test bridge: tests/test_cuda_flash_next.py supplies the
 // same NumPy oracle cases to this executable and the production Torch module.
-#include "mfq/kernels/cuda/flash_next.h"
+#include "mfq/kernels/cuda/glm5_next.h"
+#include "mfq/kernels/cuda/qwen4_exp.h"
 #include "glm5_next/model.h"
 #include "qwen4_exp/model.h"
 #include "mfq_cuda_context.h"
@@ -82,7 +83,7 @@ void check_shared_sparse_attention() {
         .reshape({1, 2, 256, 1}).expand({1, 2, 256, 256})
         .contiguous().to(kFloat16);
     require_qsa_gqa_means(
-        mfq_flash_next::qwen4_sparse_gqa_attention(
+        mfq_qwen4_exp::sparse_gqa_attention(
             qsa_q, qsa_k, qsa_v, indices),
         glm_expected, glm_expected + 256.0f, 6.0e-2f);
 
@@ -152,18 +153,17 @@ Tensor input(const Json& j) {
 }
 
 std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, const Json& p) {
-    using namespace mfq_flash_next;
     const auto optional = [&](size_t i) -> std::optional<Tensor> {
         return a.at(i).defined() ? std::optional<Tensor>(a.at(i)) : std::nullopt;
     };
     std::optional<double> scale;
     if (p.contains("scale") && !p.at("scale").is_null()) scale = p.at("scale").get<double>();
     if (op == "runtime_gdn") {
-        const auto linear = [&](int index) -> mfq::flash_next::Linear {
+        const auto linear = [&](int index) -> mfq::cuda::qwen4_exp::Linear {
             auto w=a.at(index);return [w](const Tensor& x) {return matmul(x.to(w.scalar_type()),w.transpose(-1,-2));};
         };
-        mfq::flash_next::GdnWeights w{linear(1),linear(2),linear(3),linear(4),linear(5),a.at(6),a.at(7),a.at(8),a.at(9)};
-        mfq::flash_next::Gdn block(std::move(w),p.at("key_heads"),p.at("value_heads"),p.at("width"),
+        mfq::cuda::qwen4_exp::GdnWeights w{linear(1),linear(2),linear(3),linear(4),linear(5),a.at(6),a.at(7),a.at(8),a.at(9)};
+        mfq::cuda::qwen4_exp::Gdn block(std::move(w),p.at("key_heads"),p.at("value_heads"),p.at("width"),
             p.at("kernel"),p.value("eps",1e-6),p.value("silu_gate",false));
         std::vector<Tensor> out;
         for (const auto& step:p.at("steps")) {
@@ -179,7 +179,7 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
     }
     if (op == "runtime_ngram" || op == "runtime_ple") {
         const auto weights=a.at(op=="runtime_ngram"?1:2);
-        std::vector<mfq::flash_next::Linear> shards;
+        std::vector<mfq::cuda::qwen4_exp::Linear> shards;
         for (int64_t i=0;i<weights.size(0);++i) {
             auto w=weights.select(0,i);
             shards.push_back([w](const Tensor& ids) {
@@ -187,7 +187,7 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
                 return w.index_select(0,ids.reshape({-1}).to(kInt64)).reshape(shape);
             });
         }
-        mfq::flash_next::NgramEmbedding embedding(std::move(shards),weights.size(1),weights.size(2),p.at("ngram"),
+        mfq::cuda::qwen4_exp::NgramEmbedding embedding(std::move(shards),weights.size(1),weights.size(2),p.at("ngram"),
             p.at("heads_per_ngram"),p.at("eos"),p.at("multipliers").get<std::vector<int64_t>>(),
             p.at("offsets").get<std::vector<int64_t>>(),p.at("vocab").get<std::vector<int64_t>>());
         std::vector<Tensor> out;
@@ -201,11 +201,11 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
                 }
             }
         } else {
-            const auto linear=[&](int i)->mfq::flash_next::Linear {
+            const auto linear=[&](int i)->mfq::cuda::qwen4_exp::Linear {
                 auto w=a.at(i);return [w](const Tensor& x) {return matmul(x.to(w.scalar_type()),w.transpose(-1,-2));};
             };
-            mfq::flash_next::PleWeights w{linear(3),linear(4),a.at(5),a.at(6),a.at(7),a.at(8)};
-            mfq::flash_next::Ple block(std::move(embedding),std::move(w),p.at("hidden"),p.at("streams"),p.at("ngram"),p.value("eps",1e-6));
+            mfq::cuda::qwen4_exp::PleWeights w{linear(3),linear(4),a.at(5),a.at(6),a.at(7),a.at(8)};
+            mfq::cuda::qwen4_exp::Ple block(std::move(embedding),std::move(w),p.at("hidden"),p.at("streams"),p.at("ngram"),p.value("eps",1e-6));
             for (const auto& step:p.at("steps")) {
                 if (step.value("reset",false)) block.reset();
                 else if (step.value("commit",false)) block.commit();
@@ -220,21 +220,21 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
         return out;
     }
     if (op == "runtime_rotary") {
-        mfq::flash_next::Rotary rotary(p.at("rotary"),p.at("maximum"),p.value("base",1e7),
+        mfq::cuda::qwen4_exp::Rotary rotary(p.at("rotary"),p.at("maximum"),p.value("base",1e7),
             p.value("sections",std::vector<int64_t>{}),p.value("interleaved",false));
         return {rotary.forward(a.at(0),a.at(1))};
     }
     if (op == "runtime_qsa") {
-        const auto linear = [&](int index) -> mfq::flash_next::Linear {
+        const auto linear = [&](int index) -> mfq::cuda::qwen4_exp::Linear {
             auto weight=a.at(index);
             return [weight](const Tensor& x) {return matmul(x.to(weight.scalar_type()),weight.transpose(-1,-2));};
         };
-        auto rotary=std::make_shared<mfq::flash_next::Rotary>(p.at("rotary"),p.at("maximum"),p.value("base",1e7),
+        auto rotary=std::make_shared<mfq::cuda::qwen4_exp::Rotary>(p.at("rotary"),p.at("maximum"),p.value("base",1e7),
             p.value("sections",std::vector<int64_t>{}),p.value("interleaved",false));
-        mfq::flash_next::QsaWeights weights{linear(1),linear(2),linear(3),linear(4),linear(5),a.at(6),a.at(7),a.at(8),a.at(9)};
-        mfq::flash_next::QsaConfig config{p.at("heads"),p.at("kv_heads"),p.at("width"),p.at("index_heads"),
+        mfq::cuda::qwen4_exp::QsaWeights weights{linear(1),linear(2),linear(3),linear(4),linear(5),a.at(6),a.at(7),a.at(8),a.at(9)};
+        mfq::cuda::qwen4_exp::QsaConfig config{p.at("heads"),p.at("kv_heads"),p.at("width"),p.at("index_heads"),
             p.at("index_width"),p.at("pool"),p.at("budget"),p.at("maximum"),p.value("eps",1e-6)};
-        mfq::flash_next::Qsa block(std::move(weights),config,rotary);
+        mfq::cuda::qwen4_exp::Qsa block(std::move(weights),config,rotary);
         Tensor history;
         std::vector<Tensor> out;
         for (const auto& step:p.at("steps")) {
@@ -255,10 +255,10 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
         }
         return out;
     }
-    if (op == "runtime_select_pooled_blocks") return {mfq::flash_next::select_pooled_blocks(
+    if (op == "runtime_select_pooled_blocks") return {mfq::cuda::qwen4_exp::select_pooled_blocks(
         a.at(0), p.at("query_offset"), p.at("logical_length"), p.at("pool"), p.at("budget"), p.at("tail"))};
     if (op == "runtime_sequence_cache") {
-        mfq::flash_next::SequenceCache cache(p.at("maximum"), a.at(0).size(-1));
+        mfq::cuda::qwen4_exp::SequenceCache cache(p.at("maximum"), a.at(0).size(-1));
         std::vector<Tensor> out;
         for (const auto& step : p.at("steps")) {
             if (step.contains("truncate")) cache.truncate(step.at("truncate"));
@@ -268,13 +268,13 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
         return out;
     }
     if (op == "runtime_kda") {
-        const auto linear = [&](int index) -> mfq::flash_next::Linear {
+        const auto linear = [&](int index) -> mfq::cuda::glm5_next::Linear {
             auto weight = a.at(index);
             return [weight](const Tensor& x) { return matmul(x.to(weight.scalar_type()), weight.transpose(-1,-2)); };
         };
-        mfq::flash_next::KdaWeights weights{linear(1),linear(2),linear(3),linear(4),linear(5),linear(6),linear(7),
+        mfq::cuda::glm5_next::KdaWeights weights{linear(1),linear(2),linear(3),linear(4),linear(5),linear(6),linear(7),
             a.at(8),a.at(9),a.at(10),a.at(11),a.at(12),a.at(13)};
-        mfq::flash_next::Kda block(std::move(weights), p.at("heads"), p.at("width"), p.at("kernel"),
+        mfq::cuda::glm5_next::Kda block(std::move(weights), p.at("heads"), p.at("width"), p.at("kernel"),
             p.value("lower_bound", -5.0), p.value("eps", 1e-5));
         std::vector<Tensor> out;
         for (const auto& step : p.at("steps")) {
@@ -290,20 +290,20 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
         }
         return out;
     }
-    if (op == "qwen4_grouped_rms_norm") return {qwen4_grouped_rms_norm(a.at(0), a.at(1), p.at("group_size"), p.value("eps", 1e-6))};
-    if (op == "qwen4_gated_residual_pre") return qwen4_gated_residual_pre(a.at(0), a.at(1), a.at(2), a.at(3), optional(4), p.at("hidden_size"), p.value("hc_count", 4), p.value("eps", 1e-6));
-    if (op == "qwen4_gated_residual_post") return {qwen4_gated_residual_post(a.at(0), a.at(1), a.at(2), p.value("hc_count", 4))};
-    if (op == "glm5_mhc_pre") return glm5_mhc_pre(a.at(0), a.at(1), a.at(2), a.at(3), p.value("sinkhorn_iterations", 20), p.value("hc_eps", 1e-6), p.value("rms_eps", 1e-5));
-    if (op == "glm5_mhc_post") return {glm5_mhc_post(a.at(0), a.at(1), a.at(2), a.at(3))};
-    if (op == "glm5_kda_forget_gate") return {glm5_kda_forget_gate(a.at(0), a.at(1), a.at(2), a.at(3), a.at(4), p.at("num_heads"), p.at("head_dim"), p.value("lower_bound", -5.0))};
-    if (op == "qsa_block_scores") return {qsa_block_scores(a.at(0), a.at(1))};
-    if (op == "glm5_kpool_scores") return {glm5_kpool_scores(a.at(0), a.at(1), a.at(2))};
-    if (op == "glm5_kpool_states") return {glm5_kpool_states(a.at(0), a.at(1), a.at(2), p.value("pool_size", 4))};
-    if (op == "qwen4_ple_dilated_conv_silu") return qwen4_ple_dilated_conv_silu(a.at(0), a.at(1), optional(2), p.at("dilation"));
-    if (op == "qwen4_dense_gqa_attention") return {qwen4_dense_gqa_attention(a.at(0), a.at(1), a.at(2), p.at("query_offset"))};
-    if (op == "qwen4_sparse_gqa_attention") return {qwen4_sparse_gqa_attention(a.at(0), a.at(1), a.at(2), a.at(3))};
-    if (op == "glm5_dense_mla_attention") return {glm5_dense_mla_attention(a.at(0), a.at(1), p.at("query_offset"), scale)};
-    if (op == "glm5_sparse_mla_attention") return {glm5_sparse_mla_attention(a.at(0), a.at(1), a.at(2), scale)};
+    if (op == "qwen4_grouped_rms_norm") return {mfq_qwen4_exp::grouped_rms_norm(a.at(0), a.at(1), p.at("group_size"), p.value("eps", 1e-6))};
+    if (op == "qwen4_gated_residual_pre") return mfq_qwen4_exp::gated_residual_pre(a.at(0), a.at(1), a.at(2), a.at(3), optional(4), p.at("hidden_size"), p.value("hc_count", 4), p.value("eps", 1e-6));
+    if (op == "qwen4_gated_residual_post") return {mfq_qwen4_exp::gated_residual_post(a.at(0), a.at(1), a.at(2), p.value("hc_count", 4))};
+    if (op == "glm5_mhc_pre") return mfq_glm5_next::mhc_pre(a.at(0), a.at(1), a.at(2), a.at(3), p.value("sinkhorn_iterations", 20), p.value("hc_eps", 1e-6), p.value("rms_eps", 1e-5));
+    if (op == "glm5_mhc_post") return {mfq_glm5_next::mhc_post(a.at(0), a.at(1), a.at(2), a.at(3))};
+    if (op == "glm5_kda_forget_gate") return {mfq_glm5_next::kda_forget_gate(a.at(0), a.at(1), a.at(2), a.at(3), a.at(4), p.at("num_heads"), p.at("head_dim"), p.value("lower_bound", -5.0))};
+    if (op == "qsa_block_scores") return {mfq_qwen4_exp::block_scores(a.at(0), a.at(1))};
+    if (op == "glm5_kpool_scores") return {mfq_glm5_next::kpool_scores(a.at(0), a.at(1), a.at(2))};
+    if (op == "glm5_kpool_states") return {mfq_glm5_next::kpool_states(a.at(0), a.at(1), a.at(2), p.value("pool_size", 4))};
+    if (op == "qwen4_ple_dilated_conv_silu") return mfq_qwen4_exp::ple_dilated_conv_silu(a.at(0), a.at(1), optional(2), p.at("dilation"));
+    if (op == "qwen4_dense_gqa_attention") return {mfq_qwen4_exp::dense_gqa_attention(a.at(0), a.at(1), a.at(2), p.at("query_offset"))};
+    if (op == "qwen4_sparse_gqa_attention") return {mfq_qwen4_exp::sparse_gqa_attention(a.at(0), a.at(1), a.at(2), a.at(3))};
+    if (op == "glm5_dense_mla_attention") return {mfq_glm5_next::dense_mla_attention(a.at(0), a.at(1), p.at("query_offset"), scale)};
+    if (op == "glm5_sparse_mla_attention") return {mfq_glm5_next::sparse_mla_attention(a.at(0), a.at(1), a.at(2), scale)};
     throw std::runtime_error("unknown Flash-Next operation");
 }
 
@@ -332,7 +332,7 @@ int main(int argc, char** argv) {
         if (argc == 1) {
             auto q = mfq::cuda::ones({1,1,2,4}, mfq::cuda::TensorOptions{}.device(mfq::cuda::kCUDA));
             auto k = mfq::cuda::ones({1,3,4}, q.options());
-            auto got = mfq_flash_next::qsa_block_scores(q,k).cpu();
+            auto got = mfq_qwen4_exp::block_scores(q,k).cpu();
             for (int i = 0; i < 3; ++i)
                 if (got.data_ptr<float>()[i] != 4.f) throw std::runtime_error("QSA smoke mismatch");
             check_shared_sparse_attention();

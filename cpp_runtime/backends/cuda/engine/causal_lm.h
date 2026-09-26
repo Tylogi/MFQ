@@ -100,7 +100,6 @@ struct TextSessionState {
     std::optional<MtpSessionState> mtp;
     int64_t cache_pos = 0;
     size_t bytes = 0;
-    uint64_t last_used = 0;
 };
 
 using CudaPagedPayload =
@@ -343,13 +342,13 @@ struct CausalLmArchitectureState<CudaBackbone::glm_dsa> {
 
 template <>
 struct CausalLmArchitectureState<CudaBackbone::glm5_next> {
-    mfq::models::flash_next::GlmConfig config{};
+    mfq::models::glm5_next::Config config;
 };
 
 template <>
 struct CausalLmArchitectureState<CudaBackbone::qwen4_exp> {
-    mfq::models::flash_next::QwenConfig config{};
-    std::unique_ptr<flash_runtime::Gr> final_mixer;
+    mfq::models::qwen4_exp::Config config;
+    std::unique_ptr<qwen4_exp::Gr> final_mixer;
     mfq_tensor_backend::Tensor positions;
     int64_t batch = 0;
 };
@@ -963,7 +962,7 @@ struct CausalLm : CausalLmArchitectureState<Backbone> {
     mfq_tensor_backend::Tensor finalize_hidden(mfq_tensor_backend::Tensor x, int64_t B, int64_t T) {
         if constexpr (is_qwen4) return this->final_mixer->pre(x)[0];
         if constexpr (is_glm5) {
-            return mfq::flash_next::rms_norm(
+            return glm5_next::rms_norm(
                 x.mean(2), output_norm, rms_norm_eps());
         }
         if constexpr (Backbone == CudaBackbone::deepseek_v4) {

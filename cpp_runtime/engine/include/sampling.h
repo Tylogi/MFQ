@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace mfq {
+namespace mfq::engine {
 
 // Ops supplies:
 //   using Tensor;
@@ -96,4 +96,4 @@ private:
     std::mt19937_64 rng_;
 };
 
-} // namespace mfq
+} // namespace mfq::engine

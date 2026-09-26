@@ -1,28 +1,29 @@
 #pragma once
 
-#include "../../runtime/flash_next_loader.h"
+#include "loader.h"
 #include "model.h"
 
-namespace flash_runtime {
+namespace mfq::cuda::qwen4_exp {
+
 struct Gr {
     Tensor norm,down,up,injection;
     int64_t hidden,streams;
     double eps;
-    Gr(const mfq::ModelSource& file,const mfq::models::flash_next::QwenConfig& c,const std::string& p,bool combine=true)
+    Gr(const mfq::ModelSource& file,const mfq::models::qwen4_exp::Config& c,const std::string& p,bool combine=true)
         : norm(dense(file,p+".norm.weight").to(tb::kFloat32)),down(dense(file,p+".down.weight")),
           up(dense(file,p+".up.weight")),hidden(c.hidden),streams(c.streams),eps(c.eps) {
         if (combine) injection=dense(file,p.substr(0,p.size()-4)+".post.inject.weight");
     }
     std::vector<Tensor> pre(const Tensor& x) const {
-        return mfq_flash_next::qwen4_gated_residual_pre(x,norm,down,up,
+        return mfq_qwen4_exp::gated_residual_pre(x,norm,down,up,
             injection.defined()?std::optional<Tensor>(injection):std::nullopt,hidden,streams,eps);
     }
     Tensor post(const Tensor& branch,const std::vector<Tensor>& inputs) const {
-        return mfq_flash_next::qwen4_gated_residual_post(branch,inputs[1],inputs[2],streams);
+        return mfq_qwen4_exp::gated_residual_post(branch,inputs[1],inputs[2],streams);
     }
 };
 
-inline Linear qwen_ffn(const mfq::ModelSource& file,const mfq::models::flash_next::QwenConfig& c,int i,const std::string& root="model") {
+inline Linear qwen_ffn(const mfq::ModelSource& file,const mfq::models::qwen4_exp::Config& c,int i,const std::string& root="model") {
     const auto p=root+".block."+std::to_string(i)+".mlp";
     auto gate_up=routed_gate_up(file,p,i,c.experts,c.moe_width,c.hidden);
     auto down=routed(file,p+".experts.down.weight",i,c.experts,c.hidden,c.moe_width);
@@ -52,54 +53,51 @@ inline std::vector<int64_t> integers(const mfq::ModelSource& file,const std::str
     return {host.data_ptr<int64_t>(),host.data_ptr<int64_t>()+host.numel()};
 }
 
-inline std::unique_ptr<mfq::flash_next::Ple> qwen_ple(const mfq::ModelSource& file,const mfq::models::flash_next::QwenConfig& c,const std::string& p) {
+inline std::unique_ptr<Ple> qwen_ple(const mfq::ModelSource& file,const mfq::models::qwen4_exp::Config& c,const std::string& p) {
     std::vector<Linear> shards;
     int64_t rows=0,width=c.hidden/((c.ngram-1)*c.ngram_heads);
     for (int64_t i=0;i<c.shards;++i) {
         const auto name=p+".ngram.shard."+std::to_string(i)+".weight";
         auto weight=std::make_shared<QuantLinear>(load_quant_linear(file,name));
-        // QuantLinear reports logical dimensions regardless of storage format.
         std::vector<int64_t> shape{weight->out(),weight->neuron_len()};
         MFQ_RUNTIME_CHECK(shape.size()==2 && shape[1]==width && shape[0]>0 && (!rows || shape[0]==rows),
             "Qwen4 PLE embedding shard dimensions disagree");
         rows=shape[0];
         shards.push_back([weight](const Tensor& ids) {return quant_embedding_lookup(*weight,ids);});
     }
-    mfq::flash_next::NgramEmbedding embedding(std::move(shards),rows,width,c.ngram,c.ngram_heads,c.eos,
+    NgramEmbedding embedding(std::move(shards),rows,width,c.ngram,c.ngram_heads,c.eos,
         integers(file,p+".ngram.layer_multipliers"),integers(file,p+".ngram.head_offsets"),integers(file,p+".ngram.head_vocab_sizes"));
-    mfq::flash_next::PleWeights w{linear(file,p+".key.weight"),linear(file,p+".value.weight"),
+    PleWeights w{linear(file,p+".key.weight"),linear(file,p+".value.weight"),
         dense(file,p+".key_norm.weight"),dense(file,p+".query_norm.weight"),dense(file,p+".conv_norm.weight"),dense(file,p+".conv.weight")};
-    return std::make_unique<mfq::flash_next::Ple>(std::move(embedding),std::move(w),c.hidden,c.streams,c.ngram,c.eps);
+    return std::make_unique<Ple>(std::move(embedding),std::move(w),c.hidden,c.streams,c.ngram,c.eps);
 }
-} // namespace flash_runtime
 
 struct Qwen4Block final : Block {
     using Tensor=mfq_tensor_backend::Tensor;
-    mfq::models::flash_next::QwenConfig config;
-    flash_runtime::Gr attention_gr,ffn_gr;
-    mfq::flash_next::Linear ffn;
-    std::unique_ptr<mfq::flash_next::Gdn> gdn;
-    std::unique_ptr<mfq::flash_next::Qsa> qsa;
-    std::unique_ptr<mfq::flash_next::Ple> ple;
-    Qwen4Block(const mfq::ModelSource& file,const mfq::models::flash_next::QwenConfig& c,int i,const std::string& root="model")
+    mfq::models::qwen4_exp::Config config;
+    Gr attention_gr,ffn_gr;
+    Linear ffn;
+    std::unique_ptr<Gdn> gdn;
+    std::unique_ptr<Qsa> qsa;
+    std::unique_ptr<Ple> ple;
+    Qwen4Block(const mfq::ModelSource& file,const mfq::models::qwen4_exp::Config& c,int i,const std::string& root="model")
         : config(c),attention_gr(file,c,root+".block."+std::to_string(i)+".attention.mhc.pre"),
-          ffn_gr(file,c,root+".block."+std::to_string(i)+".mlp.mhc.pre"),ffn(flash_runtime::qwen_ffn(file,c,i,root)) {
-        using namespace flash_runtime;
+          ffn_gr(file,c,root+".block."+std::to_string(i)+".mlp.mhc.pre"),ffn(qwen_ffn(file,c,i,root)) {
         const auto p=root+".block."+std::to_string(i);
         if (root=="model" && c.layer_types.at(i)=="linear_attention") {
             const auto a=p+".linear_attention";
-            mfq::flash_next::GdnWeights w{linear(file,a+".qkv.weight"),linear(file,a+".gate.weight"),
+            GdnWeights w{linear(file,a+".qkv.weight"),linear(file,a+".gate.weight"),
                 linear(file,a+".alpha.weight"),linear(file,a+".beta.weight"),linear(file,a+".output.weight"),
                 dense(file,a+".conv.weight"),dense(file,a+".dt_bias"),dense(file,a+".a"),dense(file,a+".norm.weight")};
-            gdn=std::make_unique<mfq::flash_next::Gdn>(std::move(w),c.key_heads,c.value_heads,c.linear_width,c.kernel,c.eps,c.silu_gate);
+            gdn=std::make_unique<Gdn>(std::move(w),c.key_heads,c.value_heads,c.linear_width,c.kernel,c.eps,c.silu_gate);
         } else {
             const auto a=p+".attention";
-            mfq::flash_next::QsaWeights w{linear(file,a+".query.weight"),linear(file,a+".key.weight"),linear(file,a+".value.weight"),
+            QsaWeights w{linear(file,a+".query.weight"),linear(file,a+".key.weight"),linear(file,a+".value.weight"),
                 linear(file,a+".output.weight"),linear(file,a+".indexer.query_key.weight"),
                 dense(file,a+".query_norm.weight"),dense(file,a+".key_norm.weight"),dense(file,a+".indexer.query_norm.weight"),dense(file,a+".indexer.key_norm.weight")};
-            mfq::flash_next::QsaConfig qc{c.heads,c.kv_heads,c.width,c.index_heads,c.index_width,c.pool,c.budget,c.maximum,c.eps};
-            auto rotary=std::make_shared<mfq::flash_next::Rotary>(c.rotary,c.maximum,c.rope_base,c.sections,c.interleaved);
-            qsa=std::make_unique<mfq::flash_next::Qsa>(std::move(w),qc,std::move(rotary));
+            QsaConfig qc{c.heads,c.kv_heads,c.width,c.index_heads,c.index_width,c.pool,c.budget,c.maximum,c.eps};
+            auto rotary=std::make_shared<Rotary>(c.rotary,c.maximum,c.rope_base,c.sections,c.interleaved);
+            qsa=std::make_unique<Qsa>(std::move(w),qc,std::move(rotary));
         }
         if (root=="model" && std::find(c.ple_layers.begin(),c.ple_layers.end(),i+1)!=c.ple_layers.end()) ple=qwen_ple(file,c,p+".position_embedding");
     }
@@ -126,3 +124,5 @@ struct Qwen4Block final : Block {
             context.full_positions,context.confirmed_prefix);
     }
 };
+
+} // namespace mfq::cuda::qwen4_exp

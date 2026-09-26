@@ -14,7 +14,7 @@ BATCHING = (
     / "cuda"
     / "models"
     / "qwen35"
-    / "qwen35_batch_executor.h"
+    / "batch_executor.h"
 ).read_text(encoding="utf-8")
 COMMON_BATCHING = (
     ROOT / "cpp_runtime" / "engine" / "include" / "continuous_batching.h"
@@ -32,12 +32,12 @@ KV_CACHE = (ROOT / "mfq" / "kernels" / "cuda" / "kv_cache.cu").read_text(
     encoding="utf-8"
 )
 QWEN_LOADER = (
-    CUDA_ROOT / "models" / "qwen35" / "qwen35_causal_lm.cpp"
+    CUDA_ROOT / "models" / "qwen35" / "causal_lm.cpp"
 ).read_text(encoding="utf-8")
 QWEN_CONFIG = (
     ROOT / "cpp_runtime" / "models" / "qwen35.cpp"
 ).read_text(encoding="utf-8")
-CAUSAL_LM = (CUDA_ROOT / "runtime" / "causal_lm.h").read_text(
+CAUSAL_LM = (CUDA_ROOT / "engine" / "causal_lm.h").read_text(
     encoding="utf-8"
 )
 

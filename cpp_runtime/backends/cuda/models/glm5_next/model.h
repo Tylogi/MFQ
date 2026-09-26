@@ -1,7 +1,7 @@
 #pragma once
-#include "../../runtime/flash_next_common.h"
+#include "runtime.h"
 
-namespace mfq::flash_next {
+namespace mfq::cuda::glm5_next {
 struct KdaWeights {
     Linear query, key, value, beta, gate_a, gate_b, output;
     Tensor conv, forget_a, forget_b, dt_bias, a_log, output_norm;
@@ -63,7 +63,7 @@ public:
             return (x / tb::clamp_min((x * x).sum(-1, true).sqrt(), 1e-6)).contiguous();
         };
         auto q = normalize(heads(0)), k = normalize(heads(channels)), v = heads(2 * channels).contiguous();
-        auto forget = mfq_flash_next::glm5_kda_forget_gate(hidden, w_.forget_a, w_.forget_b,
+        auto forget = mfq_glm5_next::kda_forget_gate(hidden, w_.forget_a, w_.forget_b,
             w_.dt_bias, w_.a_log, heads_, width_, lower_bound_).permute({0,2,1,3}).contiguous();
         auto beta = tb::sigmoid(w_.beta(hidden).to(tb::kFloat32)).transpose(1,2).contiguous();
         Tensor attended, next_recurrent;
@@ -153,14 +153,14 @@ public:
             Tensor attended;
             const double scale = 1.0 / std::sqrt(double(c_.nope));
             if (latent.size(1) <= c_.budget) {
-                attended = mfq_flash_next::glm5_dense_mla_attention(absorbed, latent, offset, scale);
+                attended = mfq_glm5_next::dense_mla_attention(absorbed, latent, offset, scale);
             } else {
-                auto pooled = mfq_flash_next::glm5_kpool_states(packed.narrow(-1,0,c_.index_width),
+                auto pooled = mfq_glm5_next::kpool_states(packed.narrow(-1,0,c_.index_width),
                     packed.narrow(-1,c_.index_width,c_.index_width), w_.index_position, c_.pool);
                 auto iq = w_.index_query(qr).reshape({b,t,c_.index_heads,c_.index_width});
-                auto scores = mfq_flash_next::glm5_kpool_scores(iq, pooled, w_.index_score(hidden));
+                auto scores = mfq_glm5_next::kpool_scores(iq, pooled, w_.index_score(hidden));
                 auto selected = select_pooled_blocks(scores, offset, latent.size(1), c_.pool, c_.budget, c_.tail);
-                attended = mfq_flash_next::glm5_sparse_mla_attention(absorbed, latent, selected, scale);
+                attended = mfq_glm5_next::sparse_mla_attention(absorbed, latent, selected, scale);
             }
             auto value = w_.unembed_output(attended.to(tb::kFloat16));
             return w_.output(value.reshape({b,t,c_.heads*c_.value_width}));
@@ -174,4 +174,4 @@ private:
     MlaConfig c_;
     SequenceCache latent_, index_;
 };
-} // namespace mfq::flash_next
+} // namespace mfq::cuda::glm5_next

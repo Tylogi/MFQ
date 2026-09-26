@@ -4,14 +4,14 @@ import re
 
 CUDA_ROOT = Path(__file__).parents[1] / "cpp_runtime" / "backends" / "cuda"
 CUDA_RUNTIME = "\n".join(
-    (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
+    (CUDA_ROOT / "engine" / name).read_text(encoding="utf-8")
     for name in ("generation.cpp", "generation.h")
 )
 BACKEND_CHECKS = (
     CUDA_ROOT / "diagnostics" / "backend_checks.cpp"
 ).read_text(encoding="utf-8")
 SOURCE = "\n".join(
-    (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
+    (CUDA_ROOT / "engine" / name).read_text(encoding="utf-8")
     for name in (
         "causal_lm.h",
         "cuda_transformer.h",

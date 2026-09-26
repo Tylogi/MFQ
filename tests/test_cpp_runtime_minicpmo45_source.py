@@ -9,17 +9,17 @@ DECODE = "\n".join(
     if path.suffix in {".h", ".cpp"}
 )
 CUDA_COMPONENTS = "\n".join(
-    (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
-    for name in ("runtime_components.h", "runtime_components.cpp")
+    (CUDA_ROOT / "models" / name).read_text(encoding="utf-8")
+    for name in ("components.h", "components.cpp")
 )
-CUDA_ENGINE = (CUDA_ROOT / "runtime" / "cuda_engine.cpp").read_text(
+CUDA_ENGINE = (CUDA_ROOT / "engine" / "cuda_engine.cpp").read_text(
     encoding="utf-8"
 )
-CUDA_OPTIONS = (CUDA_ROOT / "runtime" / "options.h").read_text(
+CUDA_OPTIONS = (CUDA_ROOT / "engine" / "options.h").read_text(
     encoding="utf-8"
 )
 MINICPM_ENGINE = (
-    CUDA_ROOT / "models" / "minicpmo45" / "minicpmo45_engine.cpp"
+    CUDA_ROOT / "models" / "minicpmo45" / "components.cpp"
 ).read_text(encoding="utf-8")
 ROPE = (ROOT / "mfq" / "kernels" / "cuda" / "rope.cu").read_text(
     encoding="utf-8"
@@ -32,7 +32,7 @@ NORM = (ROOT / "mfq" / "kernels" / "cuda" / "norm.cu").read_text(
 )
 GRAPH = "\n".join(
     (CUDA_ROOT / "models" / "minicpmo45" / name).read_text(encoding="utf-8")
-    for name in ("minicpmo45_runtime.h", "minicpmo45_runtime.cpp")
+    for name in ("causal_lm.h", "causal_lm.cpp")
 )
 METAL_GRAPH = (ROOT / "cpp_runtime" / "backends" / "metal" / "models/minicpmo45" / "mlx_minicpmo45.cpp").read_text(
     encoding="utf-8"
@@ -64,7 +64,7 @@ REALTIME_GATEWAY = (
 
 
 def test_minicpmo45_uses_native_composite_graph_and_canonical_names():
-    assert "minicpmo45_runtime.h" in DECODE
+    assert "models/minicpmo45/causal_lm.h" in DECODE
     assert 'const std::string embed_name = "model.token_embedding.weight"' in DECODE
     assert 'const std::string norm_name = "model.output_norm.weight"' in DECODE
     assert 'const std::string output_name = "model.output.weight"' in DECODE

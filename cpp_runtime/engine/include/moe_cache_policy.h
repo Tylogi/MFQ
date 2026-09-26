@@ -301,4 +301,4 @@ inline std::unordered_map<std::string, int> plan_moe_arena_slots(
     return result;
 }
 
-}  // namespace mfq
+} // namespace mfq

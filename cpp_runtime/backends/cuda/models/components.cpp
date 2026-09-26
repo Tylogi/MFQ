@@ -1,5 +1,5 @@
-#include "runtime_components.h"
-#include "moe_expert_cache.h"
+#include "components.h"
+#include "../engine/moe_expert_cache.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -73,7 +73,8 @@ RuntimeComponents<Model> load_runtime_components(
                 "invalid Flash-Next predictor backbone");
             using Predictor=std::conditional_t<
                 Model::backbone==mfq::cuda::CudaBackbone::qwen4_exp,
-                Qwen4ExpMtp,Glm5NextMtp>;
+                mfq::cuda::qwen4_exp::Qwen4ExpMtp,
+                mfq::cuda::glm5_next::Glm5NextMtp>;
             auto predictor=Predictor::load_if_present(*model.source,model.config);
             if (predictor) result.mtp=std::make_unique<Predictor>(std::move(*predictor));
             result.mtp_available = static_cast<bool>(result.mtp);

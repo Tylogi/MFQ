@@ -1,8 +1,8 @@
 #pragma once
 
-#include "runtime/causal_lm.h"
-#include "runtime/generation.h"
-#include "runtime/mtp.h"
+#include "engine/causal_lm.h"
+#include "engine/generation.h"
+#include "engine/mtp.h"
 #include "diagnostics/flash_next_mtp.h"
 #include "qwen35/mtp.h"
 #include "quant_linear.h"

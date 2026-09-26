@@ -10,7 +10,7 @@ COMMON_CONFIG = (
     ROOT / "cpp_runtime/models/model_config.cpp"
 ).read_text()
 CUDA_ROOT = ROOT / "cpp_runtime/backends/cuda"
-CUDA = (CUDA_ROOT / "runtime/grid_vision_runtime.h").read_text()
+CUDA = (CUDA_ROOT / "models/grid_vision_component.h").read_text()
 CUDA_APP = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(CUDA_ROOT.rglob("*"))
@@ -20,10 +20,10 @@ CUDA_PLAN_TEST = (ROOT / "cpp_runtime/backends/cuda/tests/cuda_model_plan_test.c
 METAL = (ROOT / "cpp_runtime/backends/metal/runtime/mlx_grid_vision.cpp").read_text()
 METAL_MM = (ROOT / "cpp_runtime/backends/metal/runtime/mlx_multimodal.cpp").read_text()
 PLAN = (ROOT / "cpp_runtime/backends/cuda/include/cuda_model_plan.h").read_text()
-PREPARED = (ROOT / "cpp_runtime/backends/cuda/runtime/prepared_prompt.h").read_text()
+PREPARED = (ROOT / "cpp_runtime/backends/cuda/engine/prepared_prompt.h").read_text()
 CUDA_COMPONENTS = "\n".join(
-    (CUDA_ROOT / "runtime" / name).read_text()
-    for name in ("runtime_components.h", "runtime_components.cpp")
+    (CUDA_ROOT / "models" / name).read_text()
+    for name in ("components.h", "components.cpp")
 )
 
 

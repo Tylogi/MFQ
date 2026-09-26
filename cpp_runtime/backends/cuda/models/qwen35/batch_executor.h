@@ -5,7 +5,7 @@
 #include "generation.h"
 #include "text_session_cache.h"
 #include "moe_expert_cache.h"
-#include "qwen_paged_kv.h"
+#include "paged_kv.h"
 #include "linear_attention.h"
 
 #include <algorithm>

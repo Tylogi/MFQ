@@ -1,9 +1,9 @@
 #pragma once
 
-#include "cuda_transformer.h"
-#include "flash_next_common.h"
-#include "moe_expert_cache.h"
-#include "models/include/flash_next.h"
+#include "../../engine/cuda_transformer.h"
+#include "../../engine/moe_expert_cache.h"
+#include "models/include/qwen4_exp.h"
+#include "runtime.h"
 
 #include <functional>
 #include <memory>
@@ -12,12 +12,8 @@
 #include <utility>
 #include <vector>
 
-// Flash-Next layers use the shared CUDA model loader and the common Block
-// context. Architecture-specific execution stays out of the CLI/model loop.
-namespace flash_runtime {
-namespace tb = mfq_tensor_backend;
-using Tensor = tb::Tensor;
-using Linear = mfq::flash_next::Linear;
+namespace mfq::cuda::qwen4_exp {
+
 using Routed = std::function<Tensor(const Tensor&, const Tensor&)>;
 
 inline Linear linear(const mfq::ModelSource& file, const std::string& name) {
@@ -28,7 +24,7 @@ inline Linear linear(const mfq::ModelSource& file, const std::string& name) {
 inline Tensor dense(const mfq::ModelSource& file, const std::string& name) {
     const auto& dtype=require_tensor(file, name).dtype;
     MFQ_RUNTIME_CHECK(dtype=="F32" || dtype=="F16" || dtype=="BF16",
-        "Flash-Next requires a dense parameter: ",name);
+        "Qwen requires a dense parameter: ",name);
     auto value=load_dense_gpu(file,name);
     return value.to(dtype=="F16" ? tb::kFloat16 : dtype=="BF16" ? tb::kBFloat16 : tb::kFloat32);
 }
@@ -41,7 +37,7 @@ inline Routed routed(const mfq::ModelSource& file, const std::string& name, int 
             "expert parallelism requires packed routed tensors: ",name);
         auto w=dense(file,name);
         MFQ_RUNTIME_CHECK(w.sizes().vec()==std::vector<int64_t>({experts,output,input}),
-            "Flash-Next dense expert tensor shape mismatch: ",name);
+            "Qwen dense expert tensor shape mismatch: ",name);
         return [w,output,input](const Tensor& x,const Tensor& ids) {
             const auto rows=ids.size(0), routes=ids.size(1);
             auto selected=w.index_select(0,ids.reshape({-1}).to(tb::kInt64)).reshape({rows,routes,output,input});
@@ -49,9 +45,9 @@ inline Routed routed(const mfq::ModelSource& file, const std::string& name, int 
             return tb::matmul(selected,source.to(w.scalar_type()).unsqueeze(-1)).squeeze(-1);
         };
     }
-    auto w=std::make_shared<MfeWeight>(load_mfe_gpu(file,name,true,layer,"flash_next"));
+    auto w=std::make_shared<MfeWeight>(load_mfe_gpu(file,name,true,layer,"qwen4_exp"));
     MFQ_RUNTIME_CHECK(w->n_experts==experts && w->out_per_expert==output && w->neuron_len==input,
-        "Flash-Next routed tensor shape mismatch: ",name);
+        "Qwen routed tensor shape mismatch: ",name);
     return [w,experts](const Tensor& x,const Tensor& ids) {
         auto route=build_moe_route_plan(ids.to(tb::kInt32).contiguous(),int(experts));
         return w->forward(x.contiguous(),route);
@@ -72,31 +68,13 @@ inline Routed routed_gate_up(const mfq::ModelSource& file, const std::string& ml
     };
 }
 
-inline Linear headwise(Routed projection,int64_t heads,int64_t output) {
-    return [projection=std::move(projection),heads,output](const Tensor& x) {
-        MFQ_RUNTIME_CHECK(x.dim()==4 && x.size(2)==heads,"Flash-Next head-wise projection shape mismatch");
-        const auto b=x.size(0),t=x.size(1),rows=b*t*heads;
-        auto ids=tb::arange(rows,x.options().dtype(tb::kInt32)).remainder(heads).reshape({rows,1});
-        return projection(x.reshape({rows,x.size(-1)}),ids).reshape({b,t,heads,output});
-    };
-}
-
-inline Linear dense_ffn(const mfq::ModelSource& file,const std::string& p,double limit) {
-    auto gate=linear(file,p+".gate.weight"),up=linear(file,p+".up.weight"),down=linear(file,p+".down.weight");
-    return [gate,up,down,limit](const Tensor& x) {
-        auto g=tb::clamp_max(gate(x),limit),u=tb::clamp(up(x),-limit,limit);
-        return down((g*tb::sigmoid(g))*u);
-    };
-}
-} // namespace flash_runtime
-
-namespace mfq::cuda::flash_next {
 inline void validate_load_options() {
     if (g_tensor_parallel.enabled() || g_layer_placement.enabled() ||
             g_n_gpu_layers >= 0 || g_moe_expert_cache) {
         throw std::runtime_error(
-            "Flash-Next native adapter supports expert parallelism, but "
-            "tensor/layer parallelism and offload still require a different placement path");
+            "Qwen native adapter supports expert parallelism, but "
+            "tensor/layer parallelism and offload require a different placement path");
     }
 }
-} // namespace mfq::cuda::flash_next
+
+} // namespace mfq::cuda::qwen4_exp

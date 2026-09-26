@@ -7,7 +7,7 @@
 #include "moe_expert_cache.h"
 #include "models/qwen35/batch_executor.h"
 #include "runner.h"
-#include "runtime_components.h"
+#include "models/components.h"
 #include "text_session_cache.h"
 
 #include <cuda_runtime_api.h>
@@ -174,7 +174,7 @@ std::vector<std::pair<std::string, double>> engine_metrics(
 }
 
 template <CudaBackbone Backbone>
-LoadedCudaEngine make_loaded_engine(
+CudaInferenceEngine make_cuda_inference_engine(
         CausalLmFor<Backbone> model,
         RuntimeComponents<CausalLmFor<Backbone>> components,
         const CudaEngineOptions& options) {
@@ -182,8 +182,8 @@ LoadedCudaEngine make_loaded_engine(
     auto state = std::make_shared<State>(
         std::move(model), std::move(components), options);
 
-    MfqInferenceEngine inference;
-    inference.max_concurrent_requests = static_cast<std::size_t>(
+    CudaInferenceEngine engine;
+    engine.max_concurrent_requests = static_cast<std::size_t>(
         std::max(1, options.continuous_batching));
     // Both CUDA entry points use one internal generate request. Keep the
     // external callbacks while Metal and the legacy CUDA path remain intact.
@@ -224,7 +224,7 @@ LoadedCudaEngine make_loaded_engine(
                 ? nullptr : state->components.mtp.get(),
             state->prefill_chunk_size, std::move(prepare));
     };
-    inference.generate = [generate_request](
+    engine.generate = [generate_request](
             const std::vector<int64_t>& prompt,
             const MfqSamplingParams& sampling,
             const MfqTokenCallback& on_token,
@@ -236,7 +236,7 @@ LoadedCudaEngine make_loaded_engine(
                                 on_prefill, cache_plan, token_constraint,
                                 cancelled);
     };
-    inference.session_control = {
+    engine.session_control = {
         [state](const std::string& source_session_id,
                 const std::string& target_session_id) {
             std::lock_guard<std::mutex> lock(state->model_mutex);
@@ -260,9 +260,9 @@ LoadedCudaEngine make_loaded_engine(
     };
     if (state->components.engine_binder) {
         state->components.engine_binder(
-            inference, state->model_mutex);
+            engine, state->model_mutex);
     } else if (state->components.grid_vision) {
-        inference.multimodal_generate = [generate_request](
+        engine.multimodal_generate = [generate_request](
                 const std::vector<int64_t>& prompt,
                 const MfqMultimodalInput& media,
                 const MfqSamplingParams& sampling,
@@ -276,40 +276,39 @@ LoadedCudaEngine make_loaded_engine(
                                     cancelled);
         };
     }
-    inference.runtime_metrics = [state] {
+    engine.runtime_metrics = [state] {
         return engine_metrics(state);
     };
 
     const auto component_state = state->components.state();
     const bool model_adapter_loaded =
         static_cast<bool>(state->components.engine_binder);
-    CudaEngineMetadata metadata;
-    metadata.source = state->language->source;
-    metadata.architecture = state->components.graph.architecture;
-    metadata.model_type = state->language->model_type();
-    metadata.max_context = state->language->max_position_embeddings();
-    metadata.vocab_size = state->language->vocab_size();
-    metadata.capabilities.text =
+    engine.metadata.source = state->language->source;
+    engine.metadata.architecture = state->components.graph.architecture;
+    engine.metadata.model_type = state->language->model_type();
+    engine.metadata.max_context = state->language->max_position_embeddings();
+    engine.metadata.vocab_size = state->language->vocab_size();
+    engine.metadata.capabilities.text =
         state->components.graph.has_component("text") &&
         state->components.plan.backbone != CudaBackbone::unsupported;
-    metadata.capabilities.image_input = component_state.vision_available;
-    metadata.capabilities.video_input =
+    engine.metadata.capabilities.image_input = component_state.vision_available;
+    engine.metadata.capabilities.video_input =
         component_state.vision_available &&
         !state->components.grid_vision.has_value();
-    metadata.capabilities.audio_input = model_adapter_loaded &&
+    engine.metadata.capabilities.audio_input = model_adapter_loaded &&
         state->components.graph.has_component("audio_input");
-    metadata.capabilities.audio_output = model_adapter_loaded &&
+    engine.metadata.capabilities.audio_output = model_adapter_loaded &&
         state->components.graph.has_component("audio_output");
-    metadata.capabilities.full_duplex = model_adapter_loaded &&
+    engine.metadata.capabilities.full_duplex = model_adapter_loaded &&
         state->components.graph.has_component("duplex");
-    metadata.capabilities.mtp =
+    engine.metadata.capabilities.mtp =
         component_state.mtp_available && !state->batch_executor;
-    return {std::move(inference), std::move(metadata)};
+    return engine;
 }
 
 } // namespace
 
-LoadedCudaEngine load_cuda_engine(CudaEngineOptions options) {
+CudaInferenceEngine load_cuda_engine(CudaEngineOptions options) {
     if (options.context_size == 0) options.context_size = 32768;
     g_profiler.enabled = false;
     mfq_tensor_backend::NoGradGuard no_grad;
@@ -317,7 +316,7 @@ LoadedCudaEngine load_cuda_engine(CudaEngineOptions options) {
         options, true,
         [&]<CudaBackbone Backbone>(auto& model,
                 auto& components, auto, auto) {
-            return make_loaded_engine<Backbone>(
+            return make_cuda_inference_engine<Backbone>(
                 std::move(model), std::move(components), options);
         });
 }

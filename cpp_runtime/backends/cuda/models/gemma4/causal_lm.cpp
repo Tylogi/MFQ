@@ -1,6 +1,6 @@
 #include "causal_lm.h"
 
-#include "../../runtime/cuda_transformer.h"
+#include "../../engine/cuda_transformer.h"
 
 namespace mfq::cuda::gemma4 {
 

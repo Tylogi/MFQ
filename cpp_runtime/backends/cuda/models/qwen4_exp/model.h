@@ -1,12 +1,12 @@
 #pragma once
-#include "../../runtime/flash_next_common.h"
+#include "runtime.h"
 #include <array>
 #include <memory>
 #include <numeric>
 #include <cstring>
 #include <set>
 
-namespace mfq::flash_next {
+namespace mfq::cuda::qwen4_exp {
 
 struct GdnWeights {
     Linear qkv,gate,alpha,beta,output;
@@ -193,14 +193,14 @@ public:
         try {
             auto embeddings=embedding_.forward(ids,cache);
             const auto b=x.size(0),t=x.size(1);
-            auto key=mfq_flash_next::qwen4_grouped_rms_norm(w_.key(embeddings),w_.key_norm,hidden_,eps_).reshape({b,t,streams_,hidden_});
-            auto query=mfq_flash_next::qwen4_grouped_rms_norm(x,w_.query_norm,hidden_,eps_).reshape({b,t,streams_,hidden_});
+            auto key=mfq_qwen4_exp::grouped_rms_norm(w_.key(embeddings),w_.key_norm,hidden_,eps_).reshape({b,t,streams_,hidden_});
+            auto query=mfq_qwen4_exp::grouped_rms_norm(x,w_.query_norm,hidden_,eps_).reshape({b,t,streams_,hidden_});
             auto score=(key.to(tb::kFloat32)*query.to(tb::kFloat32)).sum(-1)/std::sqrt(double(hidden_));
             auto sign=(score>0).to(tb::kFloat32)-(score<0).to(tb::kFloat32);
             auto root=sign*tb::clamp_min(score.abs(),1e-6).sqrt();
             auto gated=(tb::sigmoid(root).unsqueeze(-1)*w_.value(embeddings).to(tb::kFloat32).unsqueeze(-2)).reshape({b,t,streams_*hidden_});
-            auto normalized=mfq_flash_next::qwen4_grouped_rms_norm(gated,w_.conv_norm,hidden_,eps_);
-            auto result=mfq_flash_next::qwen4_ple_dilated_conv_silu(normalized,w_.conv,
+            auto normalized=mfq_qwen4_exp::grouped_rms_norm(gated,w_.conv_norm,hidden_,eps_);
+            auto result=mfq_qwen4_exp::ple_dilated_conv_silu(normalized,w_.conv,
                 cache && conv_.defined()?std::optional<Tensor>(conv_):std::nullopt,dilation_);
             auto output=(gated+result[0]).to(x.scalar_type());
             if (cache) conv_=result[1];
@@ -331,7 +331,7 @@ public:
             }
             key=key.permute({0,2,1,3});value=value.permute({0,2,1,3});
             Tensor attended;
-            if (offset+t<=c_.budget) attended=mfq_flash_next::qwen4_dense_gqa_attention(query,key,value,offset);
+            if (offset+t<=c_.budget) attended=mfq_qwen4_exp::dense_gqa_attention(query,key,value,offset);
             else {
                 const auto pools=(offset+t)/c_.pool;
                 auto pooled=raw.narrow(1,0,pools*c_.pool).reshape({b,pools,c_.pool,c_.index_width})
@@ -340,10 +340,10 @@ public:
                 auto starts=tb::arange(pools,raw.options().dtype(tb::kInt64))*c_.pool;
                 auto positions=full_positions.index_select(-1,starts);
                 pooled=rotary_->forward(pooled.unsqueeze(1),positions).squeeze(1);
-                auto scores=mfq_flash_next::qsa_block_scores(iq,pooled);
+                auto scores=mfq_qwen4_exp::block_scores(iq,pooled);
                 auto ids=select_pooled_blocks(scores,offset,offset+t,c_.pool,c_.budget,true);
                 if (selection_trace) *selection_trace={scores,ids,iq,pooled};
-                attended=mfq_flash_next::qwen4_sparse_gqa_attention(query,key,value,ids);
+                attended=mfq_qwen4_exp::sparse_gqa_attention(query,key,value,ids);
             }
             auto gated=attended.to(tb::kFloat32)*tb::sigmoid(gate.to(tb::kFloat32));
             return w_.output(gated.reshape({b,t,c_.heads*c_.width}).to(hidden.scalar_type()));
@@ -355,4 +355,4 @@ private:
     std::shared_ptr<Rotary> rotary_;
     SequenceCache keys_,values_,index_;
 };
-} // namespace mfq::flash_next
+} // namespace mfq::cuda::qwen4_exp

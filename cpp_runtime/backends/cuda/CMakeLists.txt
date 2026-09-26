@@ -66,7 +66,9 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/deepseek_v4_hc.cu
     ${MFQ_CUDA_KERNEL_ROOT}/deepseek_v41.cu
     ${MFQ_CUDA_KERNEL_ROOT}/embedding.cu
-    ${MFQ_CUDA_KERNEL_ROOT}/flash_next.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/selected_attention.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/qwen4_exp.cu
+    ${MFQ_CUDA_KERNEL_ROOT}/glm5_next.cu
     ${MFQ_CUDA_KERNEL_ROOT}/gated_delta_net.cu
     ${MFQ_CUDA_KERNEL_ROOT}/glm_dsa.cu
     ${MFQ_CUDA_KERNEL_ROOT}/kv_cache.cu
@@ -216,7 +218,7 @@ function(mfq_configure_cuda_runtime_target target)
         ${MFQ_CUDA_ROOT}/models
         ${MFQ_CUDA_ROOT}/ops/include
         ${MFQ_CUDA_ROOT}/commands
-        ${MFQ_CUDA_ROOT}/runtime
+        ${MFQ_CUDA_ROOT}/engine
         ${MFQ_CUDA_KERNEL_ROOT}
         ${CUDAToolkit_INCLUDE_DIRS}
     )
@@ -265,21 +267,22 @@ set(MFQ_CUDA_RUNTIME_OP_SOURCES
 
 add_library(mfq-cuda-runtime STATIC
     ${MFQ_CUDA_RUNTIME_OP_SOURCES}
-    ${MFQ_CUDA_ROOT}/runtime/cuda_engine.cpp
-    ${MFQ_CUDA_ROOT}/runtime/generation.cpp
-    ${MFQ_CUDA_ROOT}/runtime/text_session_cache.cpp
-    ${MFQ_CUDA_ROOT}/runtime/runner.cpp
-    ${MFQ_CUDA_ROOT}/runtime/decode_graph.cpp
-    ${MFQ_CUDA_ROOT}/runtime/cuda_execution.cpp
-    ${MFQ_CUDA_ROOT}/runtime/causal_lm.cpp
-    ${MFQ_CUDA_ROOT}/runtime/causal_lm_loader.cpp
-    ${MFQ_CUDA_ROOT}/runtime/cuda_transformer.cpp
-    ${MFQ_CUDA_ROOT}/runtime/cuda_transformer_loader.cpp
-    ${MFQ_CUDA_ROOT}/runtime/mtp.cpp
-    ${MFQ_CUDA_ROOT}/runtime/moe_expert_cache.cpp
-    ${MFQ_CUDA_ROOT}/runtime/runtime_components.cpp
-    ${MFQ_CUDA_ROOT}/runtime/minicpmo45.cpp
+    ${MFQ_CUDA_ROOT}/engine/cuda_engine.cpp
+    ${MFQ_CUDA_ROOT}/engine/generation.cpp
+    ${MFQ_CUDA_ROOT}/engine/text_session_cache.cpp
+    ${MFQ_CUDA_ROOT}/engine/runner.cpp
+    ${MFQ_CUDA_ROOT}/engine/decode_graph.cpp
+    ${MFQ_CUDA_ROOT}/engine/cuda_execution.cpp
+    ${MFQ_CUDA_ROOT}/engine/causal_lm.cpp
+    ${MFQ_CUDA_ROOT}/engine/causal_lm_loader.cpp
+    ${MFQ_CUDA_ROOT}/engine/cuda_transformer.cpp
+    ${MFQ_CUDA_ROOT}/engine/cuda_transformer_loader.cpp
+    ${MFQ_CUDA_ROOT}/engine/mtp.cpp
+    ${MFQ_CUDA_ROOT}/engine/moe_expert_cache.cpp
+    ${MFQ_CUDA_ROOT}/models/components.cpp
+    ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
     ${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp
+    ${MFQ_CUDA_ROOT}/commands/token_generation.cpp
     ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
     ${MFQ_CUDA_MODEL_SOURCES}
 )
@@ -340,7 +343,7 @@ target_link_libraries(mfq-runtime PRIVATE
     mfq-cuda-runtime mfq-runtime-communication)
 target_include_directories(mfq-runtime PRIVATE
     ${MFQ_CUDA_ROOT}
-    ${MFQ_CUDA_ROOT}/runtime
+    ${MFQ_CUDA_ROOT}/engine
 )
 target_compile_features(mfq-runtime PRIVATE cxx_std_20)
 set_target_properties(mfq-runtime PROPERTIES
@@ -438,20 +441,21 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
     add_executable(mfq-runtime-torch
         ${MFQ_CUDA_ROOT}/apps/runtime_main.cpp
         ${MFQ_CUDA_ROOT}/commands/runtime.cpp
+        ${MFQ_CUDA_ROOT}/commands/token_generation.cpp
         ${MFQ_CUDA_RUNTIME_OP_SOURCES}
-        ${MFQ_CUDA_ROOT}/runtime/cuda_engine.cpp
-        ${MFQ_CUDA_ROOT}/runtime/generation.cpp
-        ${MFQ_CUDA_ROOT}/runtime/text_session_cache.cpp
-        ${MFQ_CUDA_ROOT}/runtime/runner.cpp
-        ${MFQ_CUDA_ROOT}/runtime/decode_graph.cpp
-        ${MFQ_CUDA_ROOT}/runtime/cuda_execution.cpp
-        ${MFQ_CUDA_ROOT}/runtime/causal_lm.cpp
-        ${MFQ_CUDA_ROOT}/runtime/causal_lm_loader.cpp
-        ${MFQ_CUDA_ROOT}/runtime/cuda_transformer.cpp
-        ${MFQ_CUDA_ROOT}/runtime/cuda_transformer_loader.cpp
-        ${MFQ_CUDA_ROOT}/runtime/mtp.cpp
-        ${MFQ_CUDA_ROOT}/runtime/moe_expert_cache.cpp
-        ${MFQ_CUDA_ROOT}/runtime/runtime_components.cpp
+        ${MFQ_CUDA_ROOT}/engine/cuda_engine.cpp
+        ${MFQ_CUDA_ROOT}/engine/generation.cpp
+        ${MFQ_CUDA_ROOT}/engine/text_session_cache.cpp
+        ${MFQ_CUDA_ROOT}/engine/runner.cpp
+        ${MFQ_CUDA_ROOT}/engine/decode_graph.cpp
+        ${MFQ_CUDA_ROOT}/engine/cuda_execution.cpp
+        ${MFQ_CUDA_ROOT}/engine/causal_lm.cpp
+        ${MFQ_CUDA_ROOT}/engine/causal_lm_loader.cpp
+        ${MFQ_CUDA_ROOT}/engine/cuda_transformer.cpp
+        ${MFQ_CUDA_ROOT}/engine/cuda_transformer_loader.cpp
+        ${MFQ_CUDA_ROOT}/engine/mtp.cpp
+        ${MFQ_CUDA_ROOT}/engine/moe_expert_cache.cpp
+        ${MFQ_CUDA_ROOT}/models/components.cpp
         ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
         ${MFQ_CUDA_MODEL_SOURCES}
         ${MFQ_CUDA_KERNEL_SOURCES}

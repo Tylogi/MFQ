@@ -1,4 +1,4 @@
-#include "runtime_components.h"
+#include "../components.h"
 
 #include "models/minicpmo45/causal_lm.h"
 #include "cuda_execution.h"

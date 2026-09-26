@@ -32,11 +32,10 @@ struct CudaEngineMetadata {
     CudaEngineCapabilities capabilities;
 };
 
-struct LoadedCudaEngine {
-    MfqInferenceEngine inference;
+struct CudaInferenceEngine final : MfqInferenceEngine {
     CudaEngineMetadata metadata;
 };
 
-LoadedCudaEngine load_cuda_engine(CudaEngineOptions options);
+CudaInferenceEngine load_cuda_engine(CudaEngineOptions options);
 
 } // namespace mfq::cuda

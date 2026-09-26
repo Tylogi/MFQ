@@ -1,5 +1,6 @@
 #include "models/include/deepseek_v4.h"
-#include "models/include/flash_next.h"
+#include "models/include/glm5_next.h"
+#include "models/include/qwen4_exp.h"
 #include "models/include/gemma4.h"
 #include "models/include/glm_dsa.h"
 #include "models/include/minicpmo45.h"

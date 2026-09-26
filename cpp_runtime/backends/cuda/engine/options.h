@@ -25,18 +25,4 @@ struct CudaEngineOptions : CudaLoadOptions {
     int64_t prefill_chunk_size = 2048;
 };
 
-struct TokenInputOptions {
-    std::string ids_arg, ids_file;
-    int gen = 16;
-};
-
-struct RuntimeOptions : CudaEngineOptions, TokenInputOptions {
-    std::string transport_host = "127.0.0.1";
-    std::string runtime_model_name = "mfq-model", transport_api_key;
-    std::string runtime_sampling_profile;
-    int transport_port = 8080;
-    bool transport_mode = false;
-    bool stdio_mode = false;
-};
-
 } // namespace mfq::cuda
