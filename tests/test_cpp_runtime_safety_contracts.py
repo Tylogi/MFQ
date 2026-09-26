@@ -17,7 +17,9 @@ CUDA_RUNTIME = "\n".join(
     path.read_text(encoding="utf-8")
     for path in (
         CUDA_ROOT / "commands" / "runtime.cpp",
-        CUDA_ROOT / "engine" / "runner.h",
+        CUDA_ROOT / "engine" / "causal_lm_loader.h",
+        CUDA_ROOT / "commands" / "cli.cpp",
+        CUDA_ROOT / "engine" / "options.cpp",
         CUDA_ROOT / "commands" / "diagnostics.cpp",
     )
 )

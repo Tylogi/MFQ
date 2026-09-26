@@ -2354,6 +2354,14 @@ FFN load_ffn(
     bool minicpmo45 = false,
     std::string_view tensor_root = "model");
 
+std::unique_ptr<Block> load_transformer_block(
+    const mfq::ModelSource& source,
+    const mfq::models::ModelConfig& config,
+    int layer,
+    const std::string& type,
+    bool minicpmo45 = false,
+    std::string_view tensor_root = "model");
+
 void load_important_neuron_branch(
         const mfq::ModelSource & mfq,
         int64_t hidden_size,

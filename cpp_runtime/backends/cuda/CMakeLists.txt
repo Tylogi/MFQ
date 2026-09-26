@@ -270,7 +270,7 @@ add_library(mfq-cuda-runtime STATIC
     ${MFQ_CUDA_ROOT}/engine/cuda_engine.cpp
     ${MFQ_CUDA_ROOT}/engine/generation.cpp
     ${MFQ_CUDA_ROOT}/engine/text_session_cache.cpp
-    ${MFQ_CUDA_ROOT}/engine/runner.cpp
+    ${MFQ_CUDA_ROOT}/engine/options.cpp
     ${MFQ_CUDA_ROOT}/engine/decode_graph.cpp
     ${MFQ_CUDA_ROOT}/engine/cuda_execution.cpp
     ${MFQ_CUDA_ROOT}/engine/causal_lm.cpp
@@ -281,6 +281,7 @@ add_library(mfq-cuda-runtime STATIC
     ${MFQ_CUDA_ROOT}/engine/moe_expert_cache.cpp
     ${MFQ_CUDA_ROOT}/models/components.cpp
     ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
+    ${MFQ_CUDA_ROOT}/commands/cli.cpp
     ${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp
     ${MFQ_CUDA_ROOT}/commands/token_generation.cpp
     ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
@@ -441,12 +442,13 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
     add_executable(mfq-runtime-torch
         ${MFQ_CUDA_ROOT}/apps/runtime_main.cpp
         ${MFQ_CUDA_ROOT}/commands/runtime.cpp
+        ${MFQ_CUDA_ROOT}/commands/cli.cpp
         ${MFQ_CUDA_ROOT}/commands/token_generation.cpp
         ${MFQ_CUDA_RUNTIME_OP_SOURCES}
         ${MFQ_CUDA_ROOT}/engine/cuda_engine.cpp
         ${MFQ_CUDA_ROOT}/engine/generation.cpp
         ${MFQ_CUDA_ROOT}/engine/text_session_cache.cpp
-        ${MFQ_CUDA_ROOT}/engine/runner.cpp
+        ${MFQ_CUDA_ROOT}/engine/options.cpp
         ${MFQ_CUDA_ROOT}/engine/decode_graph.cpp
         ${MFQ_CUDA_ROOT}/engine/cuda_execution.cpp
         ${MFQ_CUDA_ROOT}/engine/causal_lm.cpp

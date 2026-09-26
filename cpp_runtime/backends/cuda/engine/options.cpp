@@ -1,9 +1,9 @@
-#include "runner.h"
+#include "options.h"
 #include "cuda_execution.h"
-#include "generation.h"
 #include "moe_expert_cache.h"
 #include "moe_cache_profile.h"
 #include "mfq_tensor_backend.h"
+#include "quant_linear.h"
 #include "tensor_parallel.h"
 
 #include <cuda_runtime_api.h>
@@ -11,7 +11,6 @@
 #include <charconv>
 #include <cctype>
 #include <cmath>
-#include <fstream>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -49,32 +48,6 @@ double strict_double(const std::string& text, const char* option) {
 
 } // namespace
 
-std::vector<int64_t> parse_ids(const std::string & value) {
-    std::vector<int64_t> ids;
-    std::stringstream stream(value);
-    std::string item;
-    while (std::getline(stream, item, ',')) {
-        const auto first = item.find_first_not_of(" \t\r\n");
-        const auto last = item.find_last_not_of(" \t\r\n");
-        if (first == std::string::npos) {
-            throw std::runtime_error("token ID lists cannot contain empty items");
-        }
-        item = item.substr(first, last - first + 1);
-        int64_t id = 0;
-        const auto [end, error] = std::from_chars(
-            item.data(), item.data() + item.size(), id);
-        if (error != std::errc{} || end != item.data() + item.size()) {
-            throw std::runtime_error(
-                "token ID lists must contain comma-separated integers");
-        }
-        ids.push_back(id);
-    }
-    if (ids.empty() || value.ends_with(',')) {
-        throw std::runtime_error("token ID lists require at least one integer");
-    }
-    return ids;
-}
-
 static std::vector<std::string> split_csv_values(
         const std::string & value,
         const char * option) {
@@ -100,33 +73,6 @@ static std::vector<std::string> split_csv_values(
             std::string(option) + " contains an empty item");
     }
     return result;
-}
-
-KlMmqMode parse_kl_mmq_mode(const std::string & value) {
-    if (value == "default") return KlMmqMode::Default;
-    if (value == "nint8_1") return KlMmqMode::Nint8One;
-    if (value == "fp16") return KlMmqMode::Fp16;
-    throw std::runtime_error(
-        "--kl-mmq must be default, nint8_1, or fp16");
-}
-
-std::vector<KlMmqMode> parse_kl_mmq_sequence(
-        const std::string & value) {
-    std::vector<KlMmqMode> modes;
-    for (const auto & item :
-         split_csv_values(value, "--kl-mmq-sequence")) {
-        const KlMmqMode mode = parse_kl_mmq_mode(item);
-        if (mode == KlMmqMode::Default) {
-            throw std::runtime_error(
-                "--kl-mmq-sequence accepts only nint8_1 and fp16");
-        }
-        if (std::find(modes.begin(), modes.end(), mode) != modes.end()) {
-            throw std::runtime_error(
-                "--kl-mmq-sequence contains a duplicate mode");
-        }
-        modes.push_back(mode);
-    }
-    return modes;
 }
 
 static ParallelConfig parse_parallel_config(
@@ -384,22 +330,7 @@ static void configure_layer_placement(
     std::cerr << '\n';
 }
 
-std::vector<int64_t> load_ids_file(const std::string & path) {
-    std::ifstream input(path, std::ios::binary | std::ios::ate);
-    if (!input) throw std::runtime_error("cannot open --ids-file: " + path);
-    const std::streamsize bytes = input.tellg();
-    if (bytes <= 0 || bytes % static_cast<std::streamsize>(sizeof(int32_t)) != 0) {
-        throw std::runtime_error("--ids-file must contain raw int32 token ids");
-    }
-    input.seekg(0);
-    std::vector<int32_t> stored(
-        static_cast<size_t>(bytes / static_cast<std::streamsize>(sizeof(int32_t))));
-    input.read(reinterpret_cast<char *>(stored.data()), bytes);
-    if (!input) throw std::runtime_error("truncated --ids-file: " + path);
-    return std::vector<int64_t>(stored.begin(), stored.end());
-}
-
-std::unordered_set<int> parse_layer_ranges(
+static std::unordered_set<int> parse_layer_ranges(
         const std::string & value) {
     std::unordered_set<int> result;
     std::stringstream stream(value);

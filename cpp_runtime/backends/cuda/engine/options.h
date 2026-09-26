@@ -26,3 +26,10 @@ struct CudaEngineOptions : CudaLoadOptions {
 };
 
 } // namespace mfq::cuda
+
+namespace mfq::cuda::internal {
+
+void setup_cuda_load(const CudaLoadOptions& options);
+void reset_cuda_load() noexcept;
+
+} // namespace mfq::cuda::internal

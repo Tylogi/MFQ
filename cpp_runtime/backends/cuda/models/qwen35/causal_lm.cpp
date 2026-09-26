@@ -3,7 +3,7 @@
 
 #include "../../engine/causal_lm.h"
 #include "../../engine/cuda_transformer.h"
-#include "../../engine/cuda_transformer_loader.h"
+#include "../../engine/cuda_transformer.h"
 
 namespace mfq::cuda::qwen35 {
 namespace {

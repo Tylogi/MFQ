@@ -1,5 +1,3 @@
-#include "cuda_transformer_loader.h"
-
 #include "cuda_transformer.h"
 
 std::unique_ptr<Block> load_transformer_block(

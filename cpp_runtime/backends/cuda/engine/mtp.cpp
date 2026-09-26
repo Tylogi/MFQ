@@ -3,7 +3,6 @@
 #include "cuda_execution.h"
 #include "causal_lm.h"
 #include "cuda_sampling.h"
-#include "prepared_prompt.h"
 #include "mfq_cuda_ops.h"
 
 #include <cuda_runtime_api.h>

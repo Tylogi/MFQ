@@ -74,7 +74,7 @@ CUDA_RUNTIME_SOURCE = "\n".join(
         "cuda_engine.cpp",
         "generation.cpp",
         "text_session_cache.cpp",
-        "runner.cpp",
+        "options.cpp",
     )
 )
 CUDA_MTP_SOURCE = (CUDA_RUNTIME / "mtp.cpp").read_text(encoding="utf-8")
@@ -844,7 +844,8 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         "ops/vq.cpp",
         "engine/cuda_execution.cpp",
         "engine/decode_graph.cpp",
-        "engine/runner.cpp",
+        "engine/options.cpp",
+        "commands/cli.cpp",
         "engine/causal_lm.cpp",
         "engine/causal_lm_loader.cpp",
         "engine/cuda_transformer.cpp",
@@ -859,6 +860,8 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
     for relative in required:
         assert (cuda / relative).is_file()
         assert relative in cmake
+    assert not (cuda / "engine" / "runner.h").exists()
+    assert not (cuda / "engine" / "runner.cpp").exists()
     ops = cuda / "ops"
     assert "${MFQ_CUDA_ROOT}/ops/include" in cmake
     assert not any(path.suffix == ".h" for path in ops.iterdir())

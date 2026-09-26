@@ -1,5 +1,5 @@
 #include "cli.h"
-#include "engine/runner.h"
+#include "engine/causal_lm_loader.h"
 #include "engine/generation.h"
 #include "diagnostics/backend_checks.h"
 #include "diagnostics/model_checks.h"

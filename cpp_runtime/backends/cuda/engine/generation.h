@@ -4,7 +4,6 @@
 #include "moe_expert_cache.h"
 #include "mfq_tensor_backend.h"
 #include "mfq/runtime.h"
-#include "prepared_prompt.h"
 #include <cuda_profiler_api.h>
 #include <cuda_runtime_api.h>
 #include <algorithm>

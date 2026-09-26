@@ -5,13 +5,16 @@
 #include <charconv>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <type_traits>
-#include <utility>
+#include <vector>
+
+enum class KlMmqMode;
 
 namespace mfq::cuda {
 
@@ -24,24 +27,15 @@ struct TokenInputOptions {
 
 namespace mfq::cuda::internal {
 
-void setup_cuda_load(const CudaLoadOptions& options);
-void reset_cuda_load() noexcept;
+std::vector<int64_t> parse_ids(const std::string& value);
+KlMmqMode parse_kl_mmq_mode(const std::string& value);
+std::vector<KlMmqMode> parse_kl_mmq_sequence(const std::string& value);
+std::vector<int64_t> load_ids_file(const std::string& path);
+
 int run_cuda_token_generation(
     CudaLoadOptions& load_options,
     const TokenInputOptions& token_options);
-
-template <typename F>
-int with_command_errors(F&& fn) {
-    struct Cleanup {
-        ~Cleanup() { reset_cuda_load(); }
-    } cleanup;
-    try {
-        return std::forward<F>(fn)();
-    } catch (const std::exception& error) {
-        std::cerr << "error: " << error.what() << '\n';
-        return 1;
-    }
-}
+int with_command_errors(const std::function<int()>& fn);
 
 } // namespace mfq::cuda::internal
 

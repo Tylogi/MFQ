@@ -1,7 +1,7 @@
 #include "cli.h"
 
 #include "engine/generation.h"
-#include "engine/runner.h"
+#include "engine/causal_lm_loader.h"
 #include "mfq_tensor_backend.h"
 
 #include <utility>

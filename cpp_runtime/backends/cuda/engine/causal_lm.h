@@ -12,7 +12,6 @@
 #include "models/include/qwen35.h"
 #include "../models/qwen35/causal_lm.h"
 #include "mfq_cuda_paged_kv.h"
-#include "prepared_prompt.h"
 
 #include <algorithm>
 #include <cstddef>

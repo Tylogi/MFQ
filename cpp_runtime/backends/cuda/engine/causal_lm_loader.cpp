@@ -1,6 +1,6 @@
 #include "causal_lm.h"
 
-#include "cuda_transformer_loader.h"
+#include "cuda_transformer.h"
 #include "moe_expert_cache.h"
 #include "../models/registry.h"
 #include "../models/deepseek_v4/causal_lm.h"
