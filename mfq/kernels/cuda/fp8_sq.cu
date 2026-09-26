@@ -660,116 +660,15 @@ __global__ void __launch_bounds__(128) fp8_128_sq_q8_m2_kernel(
     }
 }
 
-template <bool BF16_SCALE, typename T>
-__global__ void __launch_bounds__(256) fp8_128_sq_q8_m4_kernel(
+template <int ROWS, int GROUP_SIZE, bool BF16_SCALE, typename T>
+__global__ void __launch_bounds__(256) fp8_128_sq_q8_small_m_kernel(
         const std::uint8_t* __restrict__ blob,
         const std::uint8_t* __restrict__ row_q,
         const std::int32_t* __restrict__ row_symbol_byte_offsets,
         const T* __restrict__ input,
         T* __restrict__ output,
         Layout layout) {
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int output_row = static_cast<int>(blockIdx.x) * 8 +
-        (static_cast<int>(threadIdx.x) >> 5);
-    if (output_row >= layout.outputs) return;
-
-    float accumulators[4] = {};
-    if (row_q[output_row] == 8) {
-        const auto* row_symbols = blob + layout.symbols +
-            static_cast<std::size_t>(row_symbol_byte_offsets[output_row]);
-        const bool aligned =
-            (reinterpret_cast<std::uintptr_t>(row_symbols) & 3u) == 0;
-#pragma unroll 4
-        for (int block_column = 0;
-             block_column < layout.width;
-             block_column += 128) {
-            float scale = lane == 0
-                ? (BF16_SCALE
-                    ? decode_bf16_block_scale(
-                          blob, layout, output_row, block_column)
-                    : decode_scale<false>(
-                          blob, layout, output_row, block_column))
-                : 0.0f;
-            scale = __shfl_sync(0xffffffffu, scale, 0);
-            const int column = block_column + lane * 4;
-            if (column + 4 <= layout.width) {
-                const std::uint32_t codes = aligned
-                    ? *reinterpret_cast<const std::uint32_t*>(
-                          row_symbols + column)
-                    : load_u32(row_symbols + column);
-                const float4 decoded = decode_e4m3fn4(codes);
-                const float4 weights = make_float4(
-                    decoded.x * scale, decoded.y * scale,
-                    decoded.z * scale, decoded.w * scale);
-#pragma unroll
-                for (int item = 0; item < 4; ++item) {
-                    const float4 activation = load_activation4(
-                        input + static_cast<std::size_t>(item) *
-                            layout.width + column);
-                    accumulators[item] = fmaf(
-                        weights.x, activation.x, accumulators[item]);
-                    accumulators[item] = fmaf(
-                        weights.y, activation.y, accumulators[item]);
-                    accumulators[item] = fmaf(
-                        weights.z, activation.z, accumulators[item]);
-                    accumulators[item] = fmaf(
-                        weights.w, activation.w, accumulators[item]);
-                }
-            } else {
-#pragma unroll
-                for (int component = 0; component < 4; ++component) {
-                    if (column + component >= layout.width) continue;
-                    const float weight =
-                        decode_e4m3fn(row_symbols[column + component]) *
-                        scale;
-#pragma unroll
-                    for (int item = 0; item < 4; ++item) {
-                        accumulators[item] = fmaf(
-                            weight,
-                            as_float(input[
-                                static_cast<std::size_t>(item) *
-                                    layout.width + column + component]),
-                            accumulators[item]);
-                    }
-                }
-            }
-        }
-    } else {
-        for (int column = lane; column < layout.width; column += 32) {
-            const float weight = decode_weight<false>(
-                blob, row_q, row_symbol_byte_offsets,
-                layout, output_row, column);
-#pragma unroll
-            for (int item = 0; item < 4; ++item) {
-                accumulators[item] = fmaf(
-                    weight,
-                    as_float(input[
-                        static_cast<std::size_t>(item) * layout.width +
-                        column]),
-                    accumulators[item]);
-            }
-        }
-    }
-
-#pragma unroll
-    for (int item = 0; item < 4; ++item) {
-        const float value = warp_sum(accumulators[item]);
-        if (lane == 0) {
-            output[
-                static_cast<std::size_t>(item) * layout.outputs +
-                output_row] = from_float<T>(value);
-        }
-    }
-}
-
-template <int GROUP_SIZE, bool BF16_SCALE, typename T>
-__global__ void __launch_bounds__(256) fp8_128_sq_q8_m5_kernel(
-        const std::uint8_t* __restrict__ blob,
-        const std::uint8_t* __restrict__ row_q,
-        const std::int32_t* __restrict__ row_symbol_byte_offsets,
-        const T* __restrict__ input,
-        T* __restrict__ output,
-        Layout layout) {
+    static_assert(ROWS >= 3 && ROWS <= 5);
     static_assert(GROUP_SIZE == 16 || GROUP_SIZE == 32);
     constexpr int values_per_lane = 128 / GROUP_SIZE;
     const int outputs_per_block = static_cast<int>(blockDim.x) / GROUP_SIZE;
@@ -782,7 +681,7 @@ __global__ void __launch_bounds__(256) fp8_128_sq_q8_m5_kernel(
         ? 0xffffffffu
         : 0xffffu << (warp_lane / GROUP_SIZE) * GROUP_SIZE;
 
-    float accumulators[5] = {};
+    float accumulators[ROWS] = {};
     if (row_q[output_row] == 8) {
         const auto* row_symbols = blob + layout.symbols +
             static_cast<std::size_t>(row_symbol_byte_offsets[output_row]);
@@ -811,7 +710,7 @@ __global__ void __launch_bounds__(256) fp8_128_sq_q8_m5_kernel(
                     decoded0.x * scale, decoded0.y * scale,
                     decoded0.z * scale, decoded0.w * scale);
 #pragma unroll
-                for (int item = 0; item < 5; ++item) {
+                for (int item = 0; item < ROWS; ++item) {
                     const float4 activation = load_activation4(
                         input + static_cast<std::size_t>(item) *
                             layout.width + column);
@@ -834,7 +733,7 @@ __global__ void __launch_bounds__(256) fp8_128_sq_q8_m5_kernel(
                         decoded1.x * scale, decoded1.y * scale,
                         decoded1.z * scale, decoded1.w * scale);
 #pragma unroll
-                    for (int item = 0; item < 5; ++item) {
+                    for (int item = 0; item < ROWS; ++item) {
                         const float4 activation = load_activation4(
                             input + static_cast<std::size_t>(item) *
                                 layout.width + column + 4);
@@ -858,7 +757,7 @@ __global__ void __launch_bounds__(256) fp8_128_sq_q8_m5_kernel(
                         decode_e4m3fn(row_symbols[column + component]) *
                         scale;
 #pragma unroll
-                    for (int item = 0; item < 5; ++item) {
+                    for (int item = 0; item < ROWS; ++item) {
                         accumulators[item] = fmaf(
                             weight,
                             as_float(input[
@@ -877,7 +776,7 @@ __global__ void __launch_bounds__(256) fp8_128_sq_q8_m5_kernel(
                 blob, row_q, row_symbol_byte_offsets,
                 layout, output_row, column);
 #pragma unroll
-            for (int item = 0; item < 5; ++item) {
+            for (int item = 0; item < ROWS; ++item) {
                 accumulators[item] = fmaf(
                     weight,
                     as_float(input[
@@ -889,7 +788,7 @@ __global__ void __launch_bounds__(256) fp8_128_sq_q8_m5_kernel(
     }
 
 #pragma unroll
-    for (int item = 0; item < 5; ++item) {
+    for (int item = 0; item < ROWS; ++item) {
 #pragma unroll
         for (int delta = GROUP_SIZE / 2; delta > 0; delta >>= 1) {
             accumulators[item] += __shfl_down_sync(
@@ -1256,8 +1155,8 @@ void launch_fp8_128_sq_q8_m2(
     }
 }
 
-template <typename T>
-void launch_fp8_128_sq_q8_m4(
+template <int ROWS, typename T>
+void launch_fp8_128_sq_q8_small_m(
         const std::uint8_t* blob,
         const std::uint8_t* row_q,
         const std::int32_t* row_symbol_byte_offsets,
@@ -1265,29 +1164,9 @@ void launch_fp8_128_sq_q8_m4(
         T* output,
         Layout layout,
         cudaStream_t stream) {
-    const int blocks = static_cast<int>(std::min<std::int64_t>(
-        (static_cast<std::int64_t>(layout.outputs) + 7) / 8, 65535));
-    if (layout.scale_kind == 2) {
-        fp8_128_sq_q8_m4_kernel<true><<<blocks, 256, 0, stream>>>(
-            blob, row_q, row_symbol_byte_offsets,
-            input, output, layout);
-    } else {
-        fp8_128_sq_q8_m4_kernel<false><<<blocks, 256, 0, stream>>>(
-            blob, row_q, row_symbol_byte_offsets,
-            input, output, layout);
-    }
-}
-
-template <typename T>
-void launch_fp8_128_sq_q8_m5(
-        const std::uint8_t* blob,
-        const std::uint8_t* row_q,
-        const std::int32_t* row_symbol_byte_offsets,
-        const T* input,
-        T* output,
-        Layout layout,
-        cudaStream_t stream) {
-    const bool half_warp = layout.outputs >= layout.width;
+    // M=5 feeds speculative recurrent state, so keep its reduction identical
+    // to serial M=1; half-warp rounding can otherwise change greedy tokens.
+    const bool half_warp = ROWS < 5 && layout.outputs >= layout.width;
     constexpr int outputs_per_block = 8;
     const int blocks = static_cast<int>(std::min<std::int64_t>(
         (static_cast<std::int64_t>(layout.outputs) + outputs_per_block - 1) /
@@ -1295,22 +1174,26 @@ void launch_fp8_128_sq_q8_m5(
         65535));
     if (layout.scale_kind == 2) {
         if (half_warp) {
-            fp8_128_sq_q8_m5_kernel<16, true><<<blocks, 128, 0, stream>>>(
-                blob, row_q, row_symbol_byte_offsets,
-                input, output, layout);
+            fp8_128_sq_q8_small_m_kernel<ROWS, 16, true>
+                <<<blocks, 128, 0, stream>>>(
+                    blob, row_q, row_symbol_byte_offsets,
+                    input, output, layout);
         } else {
-            fp8_128_sq_q8_m5_kernel<32, true><<<blocks, 256, 0, stream>>>(
-                blob, row_q, row_symbol_byte_offsets,
-                input, output, layout);
+            fp8_128_sq_q8_small_m_kernel<ROWS, 32, true>
+                <<<blocks, 256, 0, stream>>>(
+                    blob, row_q, row_symbol_byte_offsets,
+                    input, output, layout);
         }
     } else if (half_warp) {
-        fp8_128_sq_q8_m5_kernel<16, false><<<blocks, 128, 0, stream>>>(
-            blob, row_q, row_symbol_byte_offsets,
-            input, output, layout);
+        fp8_128_sq_q8_small_m_kernel<ROWS, 16, false>
+            <<<blocks, 128, 0, stream>>>(
+                blob, row_q, row_symbol_byte_offsets,
+                input, output, layout);
     } else {
-        fp8_128_sq_q8_m5_kernel<32, false><<<blocks, 256, 0, stream>>>(
-            blob, row_q, row_symbol_byte_offsets,
-            input, output, layout);
+        fp8_128_sq_q8_small_m_kernel<ROWS, 32, false>
+            <<<blocks, 256, 0, stream>>>(
+                blob, row_q, row_symbol_byte_offsets,
+                input, output, layout);
     }
 }
 
@@ -1349,29 +1232,21 @@ void dispatch_mmq(
                     layout, stream);
             }
             break;
-        MFQ_FP8_SQ_M_CASE(3);
-        case 4:
-            if constexpr (MXFP8) {
-                launch_mmq<true, 4>(
-                    blob, row_q, row_symbol_byte_offsets, input, output,
-                    layout, rows, stream);
-            } else {
-                launch_fp8_128_sq_q8_m4(
-                    blob, row_q, row_symbol_byte_offsets, input, output,
-                    layout, stream);
-            }
-            break;
-        case 5:
-            if constexpr (MXFP8) {
-                launch_mmq<true, 5>(
-                    blob, row_q, row_symbol_byte_offsets, input, output,
-                    layout, rows, stream);
-            } else {
-                launch_fp8_128_sq_q8_m5(
-                    blob, row_q, row_symbol_byte_offsets, input, output,
-                    layout, stream);
-            }
-            break;
+#define MFQ_FP8_128_SQ_SMALL_M_CASE(M) \
+    case M: \
+        if constexpr (MXFP8) { \
+            launch_mmq<true, M>( \
+                blob, row_q, row_symbol_byte_offsets, input, output, \
+                layout, rows, stream); \
+        } else { \
+            launch_fp8_128_sq_q8_small_m<M>( \
+                blob, row_q, row_symbol_byte_offsets, input, output, \
+                layout, stream); \
+        } \
+        break
+        MFQ_FP8_128_SQ_SMALL_M_CASE(3);
+        MFQ_FP8_128_SQ_SMALL_M_CASE(4);
+        MFQ_FP8_128_SQ_SMALL_M_CASE(5);
         MFQ_FP8_SQ_M_CASE(6);
         default:
             launch_mmq<MXFP8, 8>(
@@ -1379,6 +1254,7 @@ void dispatch_mmq(
                 input, output, layout, rows, stream);
             break;
     }
+#undef MFQ_FP8_128_SQ_SMALL_M_CASE
 #undef MFQ_FP8_SQ_M_CASE
 }
 

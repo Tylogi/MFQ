@@ -185,6 +185,20 @@ def test_cuda_dense_dispatch_covers_decode_and_prefill(
         )
 
 
+@pytest.mark.parametrize("activation_dtype", (torch.float16, torch.float32))
+def test_cuda_fp8_128sq_m5_matches_serial_reduction(extension, activation_dtype):
+    fixture = _fixture("FP8-128SQ")
+    x = torch.linspace(
+        -1.0, 1.0, 5 * 128, dtype=activation_dtype, device="cuda"
+    ).reshape(5, 128)
+    batched = _matmul(extension, "FP8-128SQ", fixture, x)
+    serial = torch.cat([
+        _matmul(extension, "FP8-128SQ", fixture, row.reshape(1, 128))
+        for row in x
+    ])
+    assert torch.equal(batched, serial)
+
+
 @pytest.mark.parametrize("dtype", ("MXFP8-SQ", "FP8-128SQ"))
 @pytest.mark.parametrize("activation_dtype", (torch.float16, torch.float32))
 def test_cuda_backward_input(extension, dtype: str, activation_dtype):

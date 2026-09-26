@@ -26,6 +26,14 @@ def test_public_formats_keep_distinct_scale_kernels() -> None:
     assert "row_symbol_byte_offsets[output]" in metal
 
 
+def test_cuda_fp8_128sq_specializes_m3_m4_with_stable_m5_reduction() -> None:
+    source = (ROOT / "mfq/kernels/cuda/fp8_sq.cu").read_text()
+    for rows in (3, 4, 5):
+        assert f"MFQ_FP8_128_SQ_SMALL_M_CASE({rows});" in source
+    assert "fp8_128_sq_q8_small_m_kernel" in source
+    assert "ROWS < 5 && layout.outputs >= layout.width" in source
+
+
 def test_cuda_dense_dispatch_keeps_packed_decode_and_transient_gemm() -> None:
     source = (ROOT / "mfq/kernels/cuda/fp8_sq.cu").read_text()
     assert "constexpr int kDirectPackedMaxRows = 48;" in source
