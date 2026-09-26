@@ -77,6 +77,7 @@ export function useChatInference(mode: SessionMode) {
       enable_thinking: thinkingSupported && effectiveSettings.enableThinking,
       enable_vision: effectiveSettings.enableVision,
       enable_mtp: mtpSupported && mtpAvailable && effectiveSettings.enableMtp,
+      mtp_max_draft_tokens: 5,
       reasoning_effort: effectiveSettings.reasoningEffort || null,
     }),
     [effectiveSettings, thinkingSupported, mtpSupported, mtpAvailable],

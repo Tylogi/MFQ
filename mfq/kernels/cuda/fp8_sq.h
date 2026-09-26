@@ -49,6 +49,23 @@ mfq_tensor_backend::Tensor fp8_128_sq_matmul_cuda(
     std::int64_t palettes_offset, std::int64_t symbols_offset,
     std::int64_t scales_offset);
 
+mfq_tensor_backend::Tensor fp8_128_sq_swiglu_m5_cuda(
+    mfq_tensor_backend::Tensor gate_blob,
+    mfq_tensor_backend::Tensor gate_row_q,
+    mfq_tensor_backend::Tensor gate_row_symbol_byte_offsets,
+    mfq_tensor_backend::Tensor up_blob,
+    mfq_tensor_backend::Tensor up_row_q,
+    mfq_tensor_backend::Tensor up_row_symbol_byte_offsets,
+    mfq_tensor_backend::Tensor input,
+    std::int64_t outputs, std::int64_t width,
+    std::int64_t scale_kind,
+    std::int64_t gate_palettes_offset,
+    std::int64_t gate_symbols_offset,
+    std::int64_t gate_scales_offset,
+    std::int64_t up_palettes_offset,
+    std::int64_t up_symbols_offset,
+    std::int64_t up_scales_offset);
+
 mfq_tensor_backend::Tensor mxfp8_sq_backward_input_cuda(
     mfq_tensor_backend::Tensor blob,
     mfq_tensor_backend::Tensor row_q,

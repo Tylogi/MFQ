@@ -1038,6 +1038,29 @@ struct Fp8SqLinear {
         shape.back() = output.size(-1);
         return output.reshape(shape);
     }
+
+    mfq_tensor_backend::Tensor forward_swiglu_m5(
+            const Fp8SqLinear & up,
+            mfq_tensor_backend::Tensor x) const {
+        auto shape = x.sizes().vec();
+        auto source = x.reshape({-1, x.size(-1)});
+        if (source.scalar_type() != mfq_tensor_backend::kFloat16) {
+            source = source.to(mfq_tensor_backend::kFloat16).contiguous();
+        } else {
+            source = source.contiguous();
+        }
+        auto output = fp8_128_sq_swiglu_m5_cuda(
+            weight.blob, weight.row_q,
+            weight.row_symbol_byte_offsets,
+            up.weight.blob, up.weight.row_q,
+            up.weight.row_symbol_byte_offsets,
+            source, weight.out, weight.neuron_len, weight.scale_kind,
+            weight.palettes_offset, weight.symbols_offset,
+            weight.scales_offset, up.weight.palettes_offset,
+            up.weight.symbols_offset, up.weight.scales_offset);
+        shape.back() = output.size(-1);
+        return output.reshape(shape);
+    }
 };
 
 struct Mxfp8Linear {
@@ -1443,6 +1466,20 @@ struct QuantLinearGroup {
     }
     mfq_tensor_backend::Tensor forward_swiglu(mfq_tensor_backend::Tensor x) const {
         if (g_kl_mmq_mode == KlMmqMode::Default &&
+                layers.size() == 2 &&
+                x.numel() / x.size(-1) == 5 &&
+                layers[0].is_fp8_sq() && layers[1].is_fp8_sq() &&
+                layers[0].fp8_sq.weight.dtype == "FP8-128SQ" &&
+                layers[1].fp8_sq.weight.dtype == "FP8-128SQ" &&
+                layers[0].fp8_sq.weight.out == layers[1].fp8_sq.weight.out &&
+                layers[0].fp8_sq.weight.neuron_len ==
+                    layers[1].fp8_sq.weight.neuron_len &&
+                layers[0].fp8_sq.weight.scale_kind ==
+                    layers[1].fp8_sq.weight.scale_kind) {
+            return layers[0].fp8_sq.forward_swiglu_m5(
+                layers[1].fp8_sq, x);
+        }
+        if (g_kl_mmq_mode == KlMmqMode::Default &&
                 nint_grouped && nint.split_w.empty() &&
                 x.numel() / x.size(-1) >= 1 && x.numel() / x.size(-1) <= 6) {
             return nint.forward_swiglu(x);
@@ -1461,7 +1498,8 @@ struct QuantLinearGroup {
             throw std::runtime_error("SwiGLU requires equal gate/up output widths");
         }
         auto parts = forward(x);
-        return mfq_tensor_backend::silu(parts[0]) * parts[1];
+        return silu_mul_cuda(
+            parts[0].contiguous(), parts[1].contiguous());
     }
     mfq_tensor_backend::Tensor forward_geglu(mfq_tensor_backend::Tensor x) const {
         if (g_kl_mmq_mode == KlMmqMode::Default &&

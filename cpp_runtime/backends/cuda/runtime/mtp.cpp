@@ -522,6 +522,7 @@ int32_t run_mtp_generation(
     };
     struct DraftChain {
         std::vector<int32_t> tokens;
+        Tensor device_tokens;
         std::vector<std::vector<float>> probabilities;
         std::vector<CompactDistribution> compact_probabilities;
     };
@@ -710,13 +711,26 @@ int32_t run_mtp_generation(
                 1, head.sample_hidden.size(1) - 1, 1);
             auto chain_hidden = head.chain_hidden.narrow(
                 1, head.chain_hidden.size(1) - 1, 1);
+            const bool device_greedy =
+                greedy && !penalties && !mtp.split_target_verification();
+            std::vector<Tensor> device_tokens;
+            device_tokens.reserve(static_cast<size_t>(requested_depth));
             for (int position = 0; position < requested_depth; ++position) {
                 auto draft_logits = logits_for(sample_hidden).reshape({1, -1});
-                const int32_t token = select_draft(draft_logits);
+                Tensor device_token;
+                int32_t token = -1;
+                if (device_greedy) {
+                    device_token = draft_logits.argmax(-1).contiguous();
+                    device_tokens.push_back(device_token);
+                } else {
+                    token = select_draft(draft_logits);
+                }
                 if (position + 1 < requested_depth) {
                     auto next = predictor_step(
                         chain_hidden,
-                        ids_for({token}),
+                        device_greedy
+                            ? device_token.reshape({1, 1})
+                            : ids_for({token}),
                         transformed_prompt
                             ? decode_positions(
                                   predictor_history_position + position + 1,
@@ -726,19 +740,39 @@ int32_t run_mtp_generation(
                     chain_hidden = std::move(next.chain_hidden);
                 }
             }
+            if (device_greedy && !device_tokens.empty()) {
+                result.device_tokens =
+                    mfq_tensor_backend::cat(device_tokens, 0).contiguous();
+                result.tokens.resize(
+                    static_cast<size_t>(result.device_tokens.numel()), -1);
+            }
             return result;
         };
 
-        auto draft = prepare_draft(
-            initial_hidden, {pending},
-            bounded_depth(depth_controller.depth()), true);
+        Tensor draft_hidden_rows = initial_hidden;
+        std::vector<int32_t> draft_next_ids{pending};
+        bool initial_draft = true;
         while (generated < limit) {
             const auto cycle_started = Clock::now();
+            auto draft = prepare_draft(
+                draft_hidden_rows, draft_next_ids,
+                bounded_depth(depth_controller.depth()), initial_draft);
+            initial_draft = false;
             const int draft_count = static_cast<int>(draft.tokens.size());
             Tensor verified_raw;
-            std::vector<int64_t> verify_ids{pending};
-            verify_ids.insert(
-                verify_ids.end(), draft.tokens.begin(), draft.tokens.end());
+            Tensor verify_tensor;
+            if (draft.device_tokens.defined()) {
+                verify_tensor = mfq_tensor_backend::cat(
+                    {ids_for({pending}),
+                     draft.device_tokens.reshape({1, -1})},
+                    1).contiguous();
+            } else {
+                std::vector<int64_t> verify_ids{pending};
+                verify_ids.insert(
+                    verify_ids.end(),
+                    draft.tokens.begin(), draft.tokens.end());
+                verify_tensor = ids_for(std::move(verify_ids));
+            }
             Tensor verified;
             if (mtp.split_target_verification()) {
                 Tensor pending_raw;
@@ -762,7 +796,7 @@ int32_t run_mtp_generation(
                 }
             } else {
                 verified = model.hidden_forward(
-                    ids_for(std::move(verify_ids)), mfq_nullopt, mfq_nullopt,
+                    std::move(verify_tensor), mfq_nullopt, mfq_nullopt,
                     nullptr, mfq_nullopt, &verified_raw,
                     draft_count > 0 ? 1 : 0);
             }
@@ -788,12 +822,40 @@ int32_t run_mtp_generation(
             } else if (greedy) {
                 std::vector<int32_t> target_tokens;
                 target_tokens.reserve(static_cast<size_t>(draft_count + 1));
-                for (int row = 0; row <= draft_count; ++row) {
-                    target_tokens.push_back(sample_normal(
-                        targets.narrow(0, row, 1), row_counts));
-                    if (row < draft_count && penalties) {
-                        sample_token_counts_add_cuda(
-                            row_counts, ids_for({draft.tokens[static_cast<size_t>(row)]}));
+                if (!penalties) {
+                    auto device_targets = targets.argmax(-1).contiguous();
+                    Tensor host_tokens;
+                    if (draft.device_tokens.defined()) {
+                        host_tokens = mfq_tensor_backend::cat(
+                            {draft.device_tokens.reshape({-1}),
+                             device_targets.reshape({-1})},
+                            0).to(
+                                mfq_tensor_backend::kCPU,
+                                mfq_tensor_backend::kInt64)
+                            .contiguous();
+                    } else {
+                        host_tokens = device_targets.to(
+                            mfq_tensor_backend::kCPU,
+                            mfq_tensor_backend::kInt64).contiguous();
+                    }
+                    const auto* data =
+                        host_tokens.template data_ptr<int64_t>();
+                    if (draft.device_tokens.defined()) {
+                        draft.tokens.assign(data, data + draft_count);
+                        data += draft_count;
+                    }
+                    target_tokens.assign(
+                        data, data + draft_count + 1);
+                } else {
+                    for (int row = 0; row <= draft_count; ++row) {
+                        target_tokens.push_back(sample_normal(
+                            targets.narrow(0, row, 1), row_counts));
+                        if (row < draft_count) {
+                            sample_token_counts_add_cuda(
+                                row_counts,
+                                ids_for({draft.tokens[
+                                    static_cast<size_t>(row)]}));
+                        }
                     }
                 }
                 result = policy::verify_greedy(draft.tokens, target_tokens);
@@ -941,17 +1003,13 @@ int32_t run_mtp_generation(
             }
             ++mtp.last_cycles;
             pending = result.next_token;
-            std::vector<int32_t> next_ids;
-            next_ids.reserve(static_cast<size_t>(accepted + 1));
-            next_ids.insert(
-                next_ids.end(), draft.tokens.begin(),
+            draft_hidden_rows = verified_raw.narrow(1, 0, accepted + 1);
+            draft_next_ids.clear();
+            draft_next_ids.reserve(static_cast<size_t>(accepted + 1));
+            draft_next_ids.insert(
+                draft_next_ids.end(), draft.tokens.begin(),
                 draft.tokens.begin() + accepted);
-            next_ids.push_back(pending);
-            draft = prepare_draft(
-                verified_raw.narrow(1, 0, accepted + 1),
-                next_ids,
-                bounded_depth(depth_controller.depth()),
-                false);
+            draft_next_ids.push_back(pending);
         }
         return generated;
     };

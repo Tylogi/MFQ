@@ -1,6 +1,7 @@
 #include "fp8_sq.h"
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -48,6 +49,27 @@ __device__ __forceinline__ float decode_e4m3fn(std::uint8_t raw) {
         ? static_cast<float>(mantissa) * 0.001953125f
         : __uint_as_float(((exponent + 120u) << 23u) | (mantissa << 20u));
     return (raw & 0x80u) == 0u ? value : -value;
+}
+
+
+__device__ __forceinline__ float4 decode_e4m3fn4(std::uint32_t raw) {
+#if __CUDA_ARCH__ >= 890
+    const __half2_raw low_raw = __nv_cvt_fp8x2_to_halfraw2(
+        static_cast<__nv_fp8x2_storage_t>(raw), __NV_E4M3);
+    const __half2_raw high_raw = __nv_cvt_fp8x2_to_halfraw2(
+        static_cast<__nv_fp8x2_storage_t>(raw >> 16), __NV_E4M3);
+    const float2 low = __half22float2(__halves2half2(
+        __ushort_as_half(low_raw.x), __ushort_as_half(low_raw.y)));
+    const float2 high = __half22float2(__halves2half2(
+        __ushort_as_half(high_raw.x), __ushort_as_half(high_raw.y)));
+    return make_float4(low.x, low.y, high.x, high.y);
+#else
+    return make_float4(
+        decode_e4m3fn(static_cast<std::uint8_t>(raw)),
+        decode_e4m3fn(static_cast<std::uint8_t>(raw >> 8)),
+        decode_e4m3fn(static_cast<std::uint8_t>(raw >> 16)),
+        decode_e4m3fn(static_cast<std::uint8_t>(raw >> 24)));
+#endif
 }
 
 __device__ __forceinline__ float decode_e8m0(std::uint8_t raw) {
@@ -124,6 +146,20 @@ __device__ __forceinline__ float decode_scale(
             blob + layout.scales + scale_index * itemsize,
             layout.scale_kind);
     }
+}
+
+__device__ __forceinline__ float decode_bf16_block_scale(
+        const std::uint8_t* blob,
+        const Layout& layout,
+        int output,
+        int column) {
+    const auto scale_index =
+        static_cast<std::size_t>(output / layout.block_rows) *
+            layout.scale_columns +
+        column / layout.block_columns;
+    return __uint_as_float(
+        static_cast<unsigned>(load_u16(
+            blob + layout.scales + scale_index * 2)) << 16);
 }
 
 template <bool MXFP8>
@@ -321,6 +357,593 @@ __global__ void fp8_128_sq_mmq_kernel(
         out_per_expert, routes, shared_input);
 }
 
+template <typename T>
+__device__ __forceinline__ float4 load_activation4(const T* values) {
+    if constexpr (std::is_same_v<T, __half>) {
+        if ((reinterpret_cast<std::uintptr_t>(values) & 3u) == 0) {
+            const auto* pairs = reinterpret_cast<const __half2*>(values);
+            const float2 low = __half22float2(pairs[0]);
+            const float2 high = __half22float2(pairs[1]);
+            return make_float4(low.x, low.y, high.x, high.y);
+        }
+    } else if ((reinterpret_cast<std::uintptr_t>(values) & 15u) == 0) {
+        return *reinterpret_cast<const float4*>(values);
+    }
+    return make_float4(
+        as_float(values[0]), as_float(values[1]),
+        as_float(values[2]), as_float(values[3]));
+}
+
+__device__ __forceinline__ void accumulate_m2(
+        const float4& weights,
+        const float4& activation0,
+        const float4& activation1,
+        float& accumulator0,
+        float& accumulator1) {
+    accumulator0 = fmaf(weights.x, activation0.x, accumulator0);
+    accumulator1 = fmaf(weights.x, activation1.x, accumulator1);
+    accumulator0 = fmaf(weights.y, activation0.y, accumulator0);
+    accumulator1 = fmaf(weights.y, activation1.y, accumulator1);
+    accumulator0 = fmaf(weights.z, activation0.z, accumulator0);
+    accumulator1 = fmaf(weights.z, activation1.z, accumulator1);
+    accumulator0 = fmaf(weights.w, activation0.w, accumulator0);
+    accumulator1 = fmaf(weights.w, activation1.w, accumulator1);
+}
+
+template <int TILE_M, bool BF16_SCALE, typename T>
+__global__ void __launch_bounds__(128) fp8_128_sq_q8_kernel(
+        const std::uint8_t* __restrict__ blob,
+        const std::uint8_t* __restrict__ row_q,
+        const std::int32_t* __restrict__ row_symbol_byte_offsets,
+        const T* __restrict__ input,
+        T* __restrict__ output,
+        Layout layout,
+        int rows) {
+    constexpr int outputs_per_block = 4;
+    constexpr int values_per_lane = 4;
+    constexpr int columns_per_warp = 128;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int output_tiles = (layout.outputs + outputs_per_block - 1) /
+        outputs_per_block;
+    const int task = static_cast<int>(blockIdx.x);
+    const int output_row = (task % output_tiles) * outputs_per_block + warp;
+    const int first_row = (task / output_tiles) * TILE_M;
+    if (output_row >= layout.outputs || first_row >= rows) {
+        return;
+    }
+
+    float accumulators[TILE_M] = {};
+    const int bits = static_cast<int>(row_q[output_row]);
+    if (bits == 8) {
+        const auto* row_symbols = blob + layout.symbols +
+            static_cast<std::size_t>(row_symbol_byte_offsets[output_row]);
+        const bool aligned =
+            (reinterpret_cast<std::uintptr_t>(row_symbols) & 3u) == 0;
+#pragma unroll 4
+        for (int block_column = 0;
+             block_column < layout.width;
+             block_column += columns_per_warp) {
+            float scale = lane == 0
+                ? (BF16_SCALE
+                    ? decode_bf16_block_scale(
+                          blob, layout, output_row, block_column)
+                    : decode_scale<false>(
+                          blob, layout, output_row, block_column))
+                : 0.0f;
+            scale = __shfl_sync(0xffffffffu, scale, 0);
+            const int column = block_column + lane * values_per_lane;
+            if (column + values_per_lane <= layout.width) {
+                const std::uint32_t codes = aligned
+                    ? *reinterpret_cast<const std::uint32_t*>(
+                          row_symbols + column)
+                    : load_u32(row_symbols + column);
+                const float4 weights = decode_e4m3fn4(codes);
+#pragma unroll
+                for (int item = 0; item < TILE_M; ++item) {
+                    if (first_row + item >= rows) continue;
+                    const T* input_row = input +
+                        static_cast<std::size_t>(first_row + item) *
+                            layout.width;
+                    float4 activations;
+                    if constexpr (std::is_same_v<T, __half>) {
+                        const T* values = input_row + column;
+                        if ((reinterpret_cast<std::uintptr_t>(values) & 3u) ==
+                                0) {
+                            const auto* pairs =
+                                reinterpret_cast<const __half2*>(values);
+                            const float2 low = __half22float2(pairs[0]);
+                            const float2 high = __half22float2(pairs[1]);
+                            activations = make_float4(
+                                low.x, low.y, high.x, high.y);
+                        } else {
+                            activations = make_float4(
+                                as_float(values[0]), as_float(values[1]),
+                                as_float(values[2]), as_float(values[3]));
+                        }
+                    } else {
+                        const T* values = input_row + column;
+                        activations =
+                            (reinterpret_cast<std::uintptr_t>(values) & 15u) ==
+                                0
+                            ? *reinterpret_cast<const float4*>(values)
+                            : make_float4(
+                                  as_float(values[0]), as_float(values[1]),
+                                  as_float(values[2]), as_float(values[3]));
+                    }
+                    accumulators[item] = fmaf(
+                        weights.x * scale,
+                        activations.x,
+                        accumulators[item]);
+                    accumulators[item] = fmaf(
+                        weights.y * scale,
+                        activations.y,
+                        accumulators[item]);
+                    accumulators[item] = fmaf(
+                        weights.z * scale,
+                        activations.z,
+                        accumulators[item]);
+                    accumulators[item] = fmaf(
+                        weights.w * scale,
+                        activations.w,
+                        accumulators[item]);
+                }
+            } else {
+#pragma unroll
+                for (int component = 0;
+                     component < values_per_lane;
+                     ++component) {
+                    if (column + component >= layout.width) continue;
+                    const float weight =
+                        decode_e4m3fn(row_symbols[column + component]) *
+                        scale;
+#pragma unroll
+                    for (int item = 0; item < TILE_M; ++item) {
+                        if (first_row + item < rows) {
+                            accumulators[item] = fmaf(
+                                weight,
+                                as_float(input[
+                                    static_cast<std::size_t>(
+                                        first_row + item) * layout.width +
+                                    column + component]),
+                                accumulators[item]);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        for (int column = lane; column < layout.width; column += 32) {
+            const float weight = decode_weight<false>(
+                blob, row_q, row_symbol_byte_offsets,
+                layout, output_row, column);
+#pragma unroll
+            for (int item = 0; item < TILE_M; ++item) {
+                if (first_row + item < rows) {
+                    accumulators[item] = fmaf(
+                        weight,
+                        as_float(input[
+                            static_cast<std::size_t>(first_row + item) *
+                                layout.width + column]),
+                        accumulators[item]);
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int item = 0; item < TILE_M; ++item) {
+        const float value = warp_sum(accumulators[item]);
+        if (lane == 0 && first_row + item < rows) {
+            output[
+                static_cast<std::size_t>(first_row + item) * layout.outputs +
+                output_row] = from_float<T>(value);
+        }
+    }
+}
+
+template <int GROUP_SIZE, bool BF16_SCALE, typename T>
+__global__ void __launch_bounds__(128) fp8_128_sq_q8_m2_kernel(
+        const std::uint8_t* __restrict__ blob,
+        const std::uint8_t* __restrict__ row_q,
+        const std::int32_t* __restrict__ row_symbol_byte_offsets,
+        const T* __restrict__ input,
+        T* __restrict__ output,
+        Layout layout) {
+    static_assert(GROUP_SIZE == 16 || GROUP_SIZE == 32);
+    constexpr int values_per_lane = 128 / GROUP_SIZE;
+    constexpr int outputs_per_block = 128 / GROUP_SIZE;
+    const int lane = static_cast<int>(threadIdx.x) & (GROUP_SIZE - 1);
+    const int output_row = static_cast<int>(blockIdx.x) * outputs_per_block +
+        static_cast<int>(threadIdx.x) / GROUP_SIZE;
+    if (output_row >= layout.outputs) return;
+    const int warp_lane = static_cast<int>(threadIdx.x) & 31;
+    const unsigned group_mask = GROUP_SIZE == 32
+        ? 0xffffffffu
+        : 0xffffu << (warp_lane / GROUP_SIZE) * GROUP_SIZE;
+
+    const T* input0 = input;
+    const T* input1 = input + layout.width;
+    float accumulator0 = 0.0f;
+    float accumulator1 = 0.0f;
+    if (row_q[output_row] == 8) {
+        const auto* row_symbols = blob + layout.symbols +
+            static_cast<std::size_t>(row_symbol_byte_offsets[output_row]);
+        const bool aligned =
+            (reinterpret_cast<std::uintptr_t>(row_symbols) & 3u) == 0;
+#pragma unroll 4
+        for (int block_column = 0;
+             block_column < layout.width;
+             block_column += 128) {
+            float scale = lane == 0
+                ? (BF16_SCALE
+                    ? decode_bf16_block_scale(
+                          blob, layout, output_row, block_column)
+                    : decode_scale<false>(
+                          blob, layout, output_row, block_column))
+                : 0.0f;
+            scale = __shfl_sync(group_mask, scale, 0, GROUP_SIZE);
+            const int column = block_column + lane * values_per_lane;
+            if (column + values_per_lane <= layout.width) {
+                const std::uint32_t codes0 = aligned
+                    ? *reinterpret_cast<const std::uint32_t*>(
+                          row_symbols + column)
+                    : load_u32(row_symbols + column);
+                const float4 decoded0 = decode_e4m3fn4(codes0);
+                const float4 weights0 = make_float4(
+                    decoded0.x * scale, decoded0.y * scale,
+                    decoded0.z * scale, decoded0.w * scale);
+                const float4 activation00 = load_activation4(input0 + column);
+                const float4 activation10 = load_activation4(input1 + column);
+                accumulate_m2(
+                    weights0, activation00, activation10,
+                    accumulator0, accumulator1);
+                if constexpr (values_per_lane == 8) {
+                    const std::uint32_t codes1 = aligned
+                        ? *reinterpret_cast<const std::uint32_t*>(
+                              row_symbols + column + 4)
+                        : load_u32(row_symbols + column + 4);
+                    const float4 decoded1 = decode_e4m3fn4(codes1);
+                    const float4 weights1 = make_float4(
+                        decoded1.x * scale, decoded1.y * scale,
+                        decoded1.z * scale, decoded1.w * scale);
+                    const float4 activation01 =
+                        load_activation4(input0 + column + 4);
+                    const float4 activation11 =
+                        load_activation4(input1 + column + 4);
+                    accumulate_m2(
+                        weights1, activation01, activation11,
+                        accumulator0, accumulator1);
+                }
+            } else {
+#pragma unroll
+                for (int component = 0;
+                     component < values_per_lane;
+                     ++component) {
+                    if (column + component >= layout.width) continue;
+                    const float weight =
+                        decode_e4m3fn(row_symbols[column + component]) *
+                        scale;
+                    accumulator0 = fmaf(
+                        weight, as_float(input0[column + component]),
+                        accumulator0);
+                    accumulator1 = fmaf(
+                        weight, as_float(input1[column + component]),
+                        accumulator1);
+                }
+            }
+        }
+    } else {
+        for (int column = lane;
+             column < layout.width;
+             column += GROUP_SIZE) {
+            const float weight = decode_weight<false>(
+                blob, row_q, row_symbol_byte_offsets,
+                layout, output_row, column);
+            accumulator0 = fmaf(
+                weight, as_float(input0[column]), accumulator0);
+            accumulator1 = fmaf(
+                weight, as_float(input1[column]), accumulator1);
+        }
+    }
+
+#pragma unroll
+    for (int delta = GROUP_SIZE / 2; delta > 0; delta >>= 1) {
+        accumulator0 += __shfl_down_sync(
+            group_mask, accumulator0, delta, GROUP_SIZE);
+        accumulator1 += __shfl_down_sync(
+            group_mask, accumulator1, delta, GROUP_SIZE);
+    }
+    if (lane == 0) {
+        output[output_row] = from_float<T>(accumulator0);
+        output[layout.outputs + output_row] = from_float<T>(accumulator1);
+    }
+}
+
+template <int ROWS, int GROUP_SIZE, bool BF16_SCALE, typename T>
+__global__ void __launch_bounds__(256) fp8_128_sq_q8_small_m_kernel(
+        const std::uint8_t* __restrict__ blob,
+        const std::uint8_t* __restrict__ row_q,
+        const std::int32_t* __restrict__ row_symbol_byte_offsets,
+        const T* __restrict__ input,
+        T* __restrict__ output,
+        Layout layout) {
+    static_assert(ROWS >= 3 && ROWS <= 5);
+    static_assert(GROUP_SIZE == 16 || GROUP_SIZE == 32);
+    constexpr int values_per_lane = 128 / GROUP_SIZE;
+    const int outputs_per_block = static_cast<int>(blockDim.x) / GROUP_SIZE;
+    const int lane = static_cast<int>(threadIdx.x) & (GROUP_SIZE - 1);
+    const int output_row = static_cast<int>(blockIdx.x) * outputs_per_block +
+        static_cast<int>(threadIdx.x) / GROUP_SIZE;
+    if (output_row >= layout.outputs) return;
+    const int warp_lane = static_cast<int>(threadIdx.x) & 31;
+    const unsigned group_mask = GROUP_SIZE == 32
+        ? 0xffffffffu
+        : 0xffffu << (warp_lane / GROUP_SIZE) * GROUP_SIZE;
+
+    float accumulators[ROWS] = {};
+    if (row_q[output_row] == 8) {
+        const auto* row_symbols = blob + layout.symbols +
+            static_cast<std::size_t>(row_symbol_byte_offsets[output_row]);
+        const bool aligned =
+            (reinterpret_cast<std::uintptr_t>(row_symbols) & 3u) == 0;
+#pragma unroll 4
+        for (int block_column = 0;
+             block_column < layout.width;
+             block_column += 128) {
+            float scale = lane == 0
+                ? (BF16_SCALE
+                    ? decode_bf16_block_scale(
+                          blob, layout, output_row, block_column)
+                    : decode_scale<false>(
+                          blob, layout, output_row, block_column))
+                : 0.0f;
+            scale = __shfl_sync(group_mask, scale, 0, GROUP_SIZE);
+            const int column = block_column + lane * values_per_lane;
+            if (column + values_per_lane <= layout.width) {
+                const std::uint32_t codes0 = aligned
+                    ? *reinterpret_cast<const std::uint32_t*>(
+                          row_symbols + column)
+                    : load_u32(row_symbols + column);
+                const float4 decoded0 = decode_e4m3fn4(codes0);
+                const float4 weights0 = make_float4(
+                    decoded0.x * scale, decoded0.y * scale,
+                    decoded0.z * scale, decoded0.w * scale);
+#pragma unroll
+                for (int item = 0; item < ROWS; ++item) {
+                    const float4 activation = load_activation4(
+                        input + static_cast<std::size_t>(item) *
+                            layout.width + column);
+                    accumulators[item] = fmaf(
+                        weights0.x, activation.x, accumulators[item]);
+                    accumulators[item] = fmaf(
+                        weights0.y, activation.y, accumulators[item]);
+                    accumulators[item] = fmaf(
+                        weights0.z, activation.z, accumulators[item]);
+                    accumulators[item] = fmaf(
+                        weights0.w, activation.w, accumulators[item]);
+                }
+                if constexpr (values_per_lane == 8) {
+                    const std::uint32_t codes1 = aligned
+                        ? *reinterpret_cast<const std::uint32_t*>(
+                              row_symbols + column + 4)
+                        : load_u32(row_symbols + column + 4);
+                    const float4 decoded1 = decode_e4m3fn4(codes1);
+                    const float4 weights1 = make_float4(
+                        decoded1.x * scale, decoded1.y * scale,
+                        decoded1.z * scale, decoded1.w * scale);
+#pragma unroll
+                    for (int item = 0; item < ROWS; ++item) {
+                        const float4 activation = load_activation4(
+                            input + static_cast<std::size_t>(item) *
+                                layout.width + column + 4);
+                        accumulators[item] = fmaf(
+                            weights1.x, activation.x, accumulators[item]);
+                        accumulators[item] = fmaf(
+                            weights1.y, activation.y, accumulators[item]);
+                        accumulators[item] = fmaf(
+                            weights1.z, activation.z, accumulators[item]);
+                        accumulators[item] = fmaf(
+                            weights1.w, activation.w, accumulators[item]);
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int component = 0;
+                     component < values_per_lane;
+                     ++component) {
+                    if (column + component >= layout.width) continue;
+                    const float weight =
+                        decode_e4m3fn(row_symbols[column + component]) *
+                        scale;
+#pragma unroll
+                    for (int item = 0; item < ROWS; ++item) {
+                        accumulators[item] = fmaf(
+                            weight,
+                            as_float(input[
+                                static_cast<std::size_t>(item) *
+                                    layout.width + column + component]),
+                            accumulators[item]);
+                    }
+                }
+            }
+        }
+    } else {
+        for (int column = lane;
+             column < layout.width;
+             column += GROUP_SIZE) {
+            const float weight = decode_weight<false>(
+                blob, row_q, row_symbol_byte_offsets,
+                layout, output_row, column);
+#pragma unroll
+            for (int item = 0; item < ROWS; ++item) {
+                accumulators[item] = fmaf(
+                    weight,
+                    as_float(input[
+                        static_cast<std::size_t>(item) * layout.width +
+                        column]),
+                    accumulators[item]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int item = 0; item < ROWS; ++item) {
+#pragma unroll
+        for (int delta = GROUP_SIZE / 2; delta > 0; delta >>= 1) {
+            accumulators[item] += __shfl_down_sync(
+                group_mask, accumulators[item], delta, GROUP_SIZE);
+        }
+        if (lane == 0) {
+            output[
+                static_cast<std::size_t>(item) * layout.outputs +
+                output_row] = from_float<T>(accumulators[item]);
+        }
+    }
+}
+
+__device__ __forceinline__ void accumulate_pair(
+        const float4& gate_weight,
+        const float4& up_weight,
+        const float4& activation,
+        float& gate,
+        float& up) {
+    gate = fmaf(gate_weight.x, activation.x, gate);
+    up = fmaf(up_weight.x, activation.x, up);
+    gate = fmaf(gate_weight.y, activation.y, gate);
+    up = fmaf(up_weight.y, activation.y, up);
+    gate = fmaf(gate_weight.z, activation.z, gate);
+    up = fmaf(up_weight.z, activation.z, up);
+    gate = fmaf(gate_weight.w, activation.w, gate);
+    up = fmaf(up_weight.w, activation.w, up);
+}
+
+template <bool BF16_SCALE>
+__global__ void __launch_bounds__(128) fp8_128_sq_swiglu_m5_kernel(
+        const std::uint8_t* __restrict__ gate_blob,
+        const std::uint8_t* __restrict__ gate_row_q,
+        const std::int32_t* __restrict__ gate_row_symbol_byte_offsets,
+        const std::uint8_t* __restrict__ up_blob,
+        const std::uint8_t* __restrict__ up_row_q,
+        const std::int32_t* __restrict__ up_row_symbol_byte_offsets,
+        const __half* __restrict__ input,
+        __half* __restrict__ output,
+        Layout gate_layout,
+        Layout up_layout) {
+    constexpr int group_size = 16;
+    constexpr int values_per_lane = 8;
+    constexpr int outputs_per_block = 8;
+    const int warp_lane = static_cast<int>(threadIdx.x) & 31;
+    const int lane = warp_lane & (group_size - 1);
+    const unsigned group_mask =
+        0xffffu << (warp_lane / group_size) * group_size;
+    const int output_row = static_cast<int>(blockIdx.x) * outputs_per_block +
+        static_cast<int>(threadIdx.x) / group_size;
+    if (output_row >= gate_layout.outputs) return;
+
+    float gate_accumulators[5] = {};
+    float up_accumulators[5] = {};
+    if (gate_row_q[output_row] == 8 && up_row_q[output_row] == 8) {
+        const auto* gate_symbols = gate_blob + gate_layout.symbols +
+            static_cast<std::size_t>(
+                gate_row_symbol_byte_offsets[output_row]);
+        const auto* up_symbols = up_blob + up_layout.symbols +
+            static_cast<std::size_t>(
+                up_row_symbol_byte_offsets[output_row]);
+#pragma unroll 4
+        for (int block_column = 0;
+             block_column < gate_layout.width;
+             block_column += 128) {
+            float gate_scale = lane == 0
+                ? (BF16_SCALE
+                    ? decode_bf16_block_scale(
+                        gate_blob, gate_layout, output_row, block_column)
+                    : decode_scale<false>(
+                        gate_blob, gate_layout, output_row, block_column))
+                : 0.0f;
+            float up_scale = lane == 0
+                ? (BF16_SCALE
+                    ? decode_bf16_block_scale(
+                        up_blob, up_layout, output_row, block_column)
+                    : decode_scale<false>(
+                        up_blob, up_layout, output_row, block_column))
+                : 0.0f;
+            gate_scale = __shfl_sync(
+                group_mask, gate_scale, 0, group_size);
+            up_scale = __shfl_sync(group_mask, up_scale, 0, group_size);
+            const int column = block_column + lane * values_per_lane;
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int current = column + half * 4;
+                const float4 gate_decoded = decode_e4m3fn4(
+                    load_u32(gate_symbols + current));
+                const float4 up_decoded = decode_e4m3fn4(
+                    load_u32(up_symbols + current));
+                const float4 gate_weight = make_float4(
+                    gate_decoded.x * gate_scale,
+                    gate_decoded.y * gate_scale,
+                    gate_decoded.z * gate_scale,
+                    gate_decoded.w * gate_scale);
+                const float4 up_weight = make_float4(
+                    up_decoded.x * up_scale,
+                    up_decoded.y * up_scale,
+                    up_decoded.z * up_scale,
+                    up_decoded.w * up_scale);
+#pragma unroll
+                for (int item = 0; item < 5; ++item) {
+                    const float4 activation = load_activation4(
+                        input + static_cast<std::size_t>(item) *
+                            gate_layout.width + current);
+                    accumulate_pair(
+                        gate_weight, up_weight, activation,
+                        gate_accumulators[item], up_accumulators[item]);
+                }
+            }
+        }
+    } else {
+        for (int column = lane;
+             column < gate_layout.width;
+             column += group_size) {
+            const float gate_weight = decode_weight<false>(
+                gate_blob, gate_row_q, gate_row_symbol_byte_offsets,
+                gate_layout, output_row, column);
+            const float up_weight = decode_weight<false>(
+                up_blob, up_row_q, up_row_symbol_byte_offsets,
+                up_layout, output_row, column);
+#pragma unroll
+            for (int item = 0; item < 5; ++item) {
+                const float activation = __half2float(input[
+                    static_cast<std::size_t>(item) * gate_layout.width +
+                    column]);
+                gate_accumulators[item] = fmaf(
+                    gate_weight, activation, gate_accumulators[item]);
+                up_accumulators[item] = fmaf(
+                    up_weight, activation, up_accumulators[item]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int item = 0; item < 5; ++item) {
+#pragma unroll
+        for (int delta = group_size / 2; delta > 0; delta >>= 1) {
+            gate_accumulators[item] += __shfl_down_sync(
+                group_mask, gate_accumulators[item], delta, group_size);
+            up_accumulators[item] += __shfl_down_sync(
+                group_mask, up_accumulators[item], delta, group_size);
+        }
+        if (lane == 0) {
+            const float gate = __half2float(
+                __float2half_rn(gate_accumulators[item]));
+            const float up = __half2float(
+                __float2half_rn(up_accumulators[item]));
+            output[static_cast<std::size_t>(item) * gate_layout.outputs +
+                output_row] = __float2half_rn(
+                    (gate / (1.0f + expf(-gate))) * up);
+        }
+    }
+}
+
 void validate_metadata(
         const mfq_tensor_backend::Tensor& blob,
         const mfq_tensor_backend::Tensor& row_q,
@@ -466,6 +1089,114 @@ void launch_mmq(
     }
 }
 
+template <int TILE_M, typename T>
+void launch_fp8_128_sq_q8(
+        const std::uint8_t* blob,
+        const std::uint8_t* row_q,
+        const std::int32_t* row_symbol_byte_offsets,
+        const T* input,
+        T* output,
+        Layout layout,
+        int rows,
+        cudaStream_t stream) {
+    const auto output_tiles =
+        (static_cast<std::int64_t>(layout.outputs) + 3) / 4;
+    const auto row_tiles =
+        (static_cast<std::int64_t>(rows) + TILE_M - 1) / TILE_M;
+    const int blocks = static_cast<int>(std::min<std::int64_t>(
+        output_tiles * row_tiles, 65535));
+    if (layout.scale_kind == 2) {
+        fp8_128_sq_q8_kernel<TILE_M, true><<<blocks, 128, 0, stream>>>(
+            blob, row_q, row_symbol_byte_offsets,
+            input, output, layout, rows);
+    } else {
+        fp8_128_sq_q8_kernel<TILE_M, false><<<blocks, 128, 0, stream>>>(
+            blob, row_q, row_symbol_byte_offsets,
+            input, output, layout, rows);
+    }
+}
+
+template <typename T>
+void launch_fp8_128_sq_q8_m2(
+        const std::uint8_t* blob,
+        const std::uint8_t* row_q,
+        const std::int32_t* row_symbol_byte_offsets,
+        const T* input,
+        T* output,
+        Layout layout,
+        cudaStream_t stream) {
+    // M=2 half-warps win for balanced/tall matrices; very wide output
+    // projections need full warps to hide HBM latency.
+    const bool half_warp = static_cast<std::int64_t>(layout.outputs) <=
+        2 * static_cast<std::int64_t>(layout.width);
+    const int outputs_per_block = half_warp ? 8 : 4;
+    const int blocks = static_cast<int>(std::min<std::int64_t>(
+        (static_cast<std::int64_t>(layout.outputs) + outputs_per_block - 1) /
+            outputs_per_block,
+        65535));
+    if (layout.scale_kind == 2) {
+        if (half_warp) {
+            fp8_128_sq_q8_m2_kernel<16, true><<<blocks, 128, 0, stream>>>(
+                blob, row_q, row_symbol_byte_offsets,
+                input, output, layout);
+        } else {
+            fp8_128_sq_q8_m2_kernel<32, true><<<blocks, 128, 0, stream>>>(
+                blob, row_q, row_symbol_byte_offsets,
+                input, output, layout);
+        }
+    } else if (half_warp) {
+        fp8_128_sq_q8_m2_kernel<16, false><<<blocks, 128, 0, stream>>>(
+            blob, row_q, row_symbol_byte_offsets,
+            input, output, layout);
+    } else {
+        fp8_128_sq_q8_m2_kernel<32, false><<<blocks, 128, 0, stream>>>(
+            blob, row_q, row_symbol_byte_offsets,
+            input, output, layout);
+    }
+}
+
+template <int ROWS, typename T>
+void launch_fp8_128_sq_q8_small_m(
+        const std::uint8_t* blob,
+        const std::uint8_t* row_q,
+        const std::int32_t* row_symbol_byte_offsets,
+        const T* input,
+        T* output,
+        Layout layout,
+        cudaStream_t stream) {
+    // M=5 feeds speculative recurrent state, so keep its reduction identical
+    // to serial M=1; half-warp rounding can otherwise change greedy tokens.
+    const bool half_warp = ROWS < 5 && layout.outputs >= layout.width;
+    constexpr int outputs_per_block = 8;
+    const int blocks = static_cast<int>(std::min<std::int64_t>(
+        (static_cast<std::int64_t>(layout.outputs) + outputs_per_block - 1) /
+            outputs_per_block,
+        65535));
+    if (layout.scale_kind == 2) {
+        if (half_warp) {
+            fp8_128_sq_q8_small_m_kernel<ROWS, 16, true>
+                <<<blocks, 128, 0, stream>>>(
+                    blob, row_q, row_symbol_byte_offsets,
+                    input, output, layout);
+        } else {
+            fp8_128_sq_q8_small_m_kernel<ROWS, 32, true>
+                <<<blocks, 256, 0, stream>>>(
+                    blob, row_q, row_symbol_byte_offsets,
+                    input, output, layout);
+        }
+    } else if (half_warp) {
+        fp8_128_sq_q8_small_m_kernel<ROWS, 16, false>
+            <<<blocks, 128, 0, stream>>>(
+                blob, row_q, row_symbol_byte_offsets,
+                input, output, layout);
+    } else {
+        fp8_128_sq_q8_small_m_kernel<ROWS, 32, false>
+            <<<blocks, 256, 0, stream>>>(
+                blob, row_q, row_symbol_byte_offsets,
+                input, output, layout);
+    }
+}
+
 template <bool MXFP8, typename T>
 void dispatch_mmq(
         const std::uint8_t* blob,
@@ -477,14 +1208,45 @@ void dispatch_mmq(
         int rows,
         cudaStream_t stream) {
 #define MFQ_FP8_SQ_M_CASE(M) \
-    case M: launch_mmq<MXFP8, M>( \
-        blob, row_q, row_symbol_byte_offsets, input, output, layout, rows, stream); break
+    case M: \
+        if constexpr (MXFP8) { \
+            launch_mmq<true, M>( \
+                blob, row_q, row_symbol_byte_offsets, input, output, \
+                layout, rows, stream); \
+        } else { \
+            launch_fp8_128_sq_q8<M>( \
+                blob, row_q, row_symbol_byte_offsets, input, output, \
+                layout, rows, stream); \
+        } \
+        break
     switch (rows) {
         MFQ_FP8_SQ_M_CASE(1);
-        MFQ_FP8_SQ_M_CASE(2);
-        MFQ_FP8_SQ_M_CASE(3);
-        MFQ_FP8_SQ_M_CASE(4);
-        MFQ_FP8_SQ_M_CASE(5);
+        case 2:
+            if constexpr (MXFP8) {
+                launch_mmq<true, 2>(
+                    blob, row_q, row_symbol_byte_offsets, input, output,
+                    layout, rows, stream);
+            } else {
+                launch_fp8_128_sq_q8_m2(
+                    blob, row_q, row_symbol_byte_offsets, input, output,
+                    layout, stream);
+            }
+            break;
+#define MFQ_FP8_128_SQ_SMALL_M_CASE(M) \
+    case M: \
+        if constexpr (MXFP8) { \
+            launch_mmq<true, M>( \
+                blob, row_q, row_symbol_byte_offsets, input, output, \
+                layout, rows, stream); \
+        } else { \
+            launch_fp8_128_sq_q8_small_m<M>( \
+                blob, row_q, row_symbol_byte_offsets, input, output, \
+                layout, stream); \
+        } \
+        break
+        MFQ_FP8_128_SQ_SMALL_M_CASE(3);
+        MFQ_FP8_128_SQ_SMALL_M_CASE(4);
+        MFQ_FP8_128_SQ_SMALL_M_CASE(5);
         MFQ_FP8_SQ_M_CASE(6);
         default:
             launch_mmq<MXFP8, 8>(
@@ -492,6 +1254,7 @@ void dispatch_mmq(
                 input, output, layout, rows, stream);
             break;
     }
+#undef MFQ_FP8_128_SQ_SMALL_M_CASE
 #undef MFQ_FP8_SQ_M_CASE
 }
 
@@ -650,6 +1413,64 @@ mfq_tensor_backend::Tensor matmul(
             reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),
             reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
             layout, rows, stream);
+    }
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+mfq_tensor_backend::Tensor swiglu_m5(
+        mfq_tensor_backend::Tensor gate_blob,
+        mfq_tensor_backend::Tensor gate_row_q,
+        mfq_tensor_backend::Tensor gate_row_symbol_byte_offsets,
+        mfq_tensor_backend::Tensor up_blob,
+        mfq_tensor_backend::Tensor up_row_q,
+        mfq_tensor_backend::Tensor up_row_symbol_byte_offsets,
+        mfq_tensor_backend::Tensor input,
+        Layout gate_layout,
+        Layout up_layout) {
+    validate_metadata(
+        gate_blob, gate_row_q, gate_row_symbol_byte_offsets,
+        gate_layout, false);
+    validate_metadata(
+        up_blob, up_row_q, up_row_symbol_byte_offsets,
+        up_layout, false);
+    MFQ_RUNTIME_CHECK(
+        gate_layout.outputs == up_layout.outputs &&
+        gate_layout.width == up_layout.width &&
+        gate_layout.scale_kind == up_layout.scale_kind &&
+        input.is_cuda() && input.get_device() == gate_blob.get_device() &&
+        up_blob.get_device() == gate_blob.get_device() &&
+        input.dim() == 2 && input.is_contiguous() && input.size(0) == 5 &&
+        input.size(1) == gate_layout.width &&
+        input.scalar_type() == mfq_tensor_backend::kFloat16,
+        "FP8-128SQ SwiGLU M=5 requires compatible weights and FP16 input");
+    const MfqCudaGuard guard(gate_blob.device());
+    auto output = mfq_tensor_backend::empty(
+        {5, gate_layout.outputs}, input.options());
+    const int blocks = (gate_layout.outputs + 7) / 8;
+    const auto stream = mfq_current_cuda_stream();
+    if (gate_layout.scale_kind == 2) {
+        fp8_128_sq_swiglu_m5_kernel<true><<<blocks, 128, 0, stream>>>(
+            gate_blob.data_ptr<std::uint8_t>(),
+            gate_row_q.data_ptr<std::uint8_t>(),
+            gate_row_symbol_byte_offsets.data_ptr<std::int32_t>(),
+            up_blob.data_ptr<std::uint8_t>(),
+            up_row_q.data_ptr<std::uint8_t>(),
+            up_row_symbol_byte_offsets.data_ptr<std::int32_t>(),
+            reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),
+            reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
+            gate_layout, up_layout);
+    } else {
+        fp8_128_sq_swiglu_m5_kernel<false><<<blocks, 128, 0, stream>>>(
+            gate_blob.data_ptr<std::uint8_t>(),
+            gate_row_q.data_ptr<std::uint8_t>(),
+            gate_row_symbol_byte_offsets.data_ptr<std::int32_t>(),
+            up_blob.data_ptr<std::uint8_t>(),
+            up_row_q.data_ptr<std::uint8_t>(),
+            up_row_symbol_byte_offsets.data_ptr<std::int32_t>(),
+            reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),
+            reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
+            gate_layout, up_layout);
     }
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
@@ -817,6 +1638,37 @@ mfq_tensor_backend::Tensor fp8_128_sq_matmul_cuda(
         make_layout(outputs, width, 128, 128,
                     (outputs + 127) / 128, (width + 127) / 128,
                     scale_kind, palettes_offset, symbols_offset, scales_offset));
+}
+
+mfq_tensor_backend::Tensor fp8_128_sq_swiglu_m5_cuda(
+        mfq_tensor_backend::Tensor gate_blob,
+        mfq_tensor_backend::Tensor gate_row_q,
+        mfq_tensor_backend::Tensor gate_row_symbol_byte_offsets,
+        mfq_tensor_backend::Tensor up_blob,
+        mfq_tensor_backend::Tensor up_row_q,
+        mfq_tensor_backend::Tensor up_row_symbol_byte_offsets,
+        mfq_tensor_backend::Tensor input,
+        std::int64_t outputs, std::int64_t width,
+        std::int64_t scale_kind,
+        std::int64_t gate_palettes_offset,
+        std::int64_t gate_symbols_offset,
+        std::int64_t gate_scales_offset,
+        std::int64_t up_palettes_offset,
+        std::int64_t up_symbols_offset,
+        std::int64_t up_scales_offset) {
+    return swiglu_m5(
+        std::move(gate_blob), std::move(gate_row_q),
+        std::move(gate_row_symbol_byte_offsets),
+        std::move(up_blob), std::move(up_row_q),
+        std::move(up_row_symbol_byte_offsets), std::move(input),
+        make_layout(outputs, width, 128, 128,
+                    (outputs + 127) / 128, (width + 127) / 128,
+                    scale_kind, gate_palettes_offset,
+                    gate_symbols_offset, gate_scales_offset),
+        make_layout(outputs, width, 128, 128,
+                    (outputs + 127) / 128, (width + 127) / 128,
+                    scale_kind, up_palettes_offset,
+                    up_symbols_offset, up_scales_offset));
 }
 
 mfq_tensor_backend::Tensor mxfp8_sq_backward_input_cuda(

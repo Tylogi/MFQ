@@ -2617,6 +2617,7 @@ static int run_qwen35_mtp_bench(
     params.top_k = 1;
     params.top_p = 1.;
     params.enable_mtp = enable_mtp;
+    params.mtp_max_draft_tokens = mtp.maximum_draft_depth();
     params.seed = 20260907;
     const auto options = mfq_tensor_backend::TensorOptions()
         .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt64);
