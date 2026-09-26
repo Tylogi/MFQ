@@ -1417,7 +1417,7 @@ std::int32_t generate_with_prefill_metrics(
     const MfqPrefillCallback& on_prefill,
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
-    int) {
+    int prefill_chunk_size) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
@@ -1434,7 +1434,8 @@ std::int32_t generate_with_prefill_metrics(
         cache_plan.stable_prefix_tokens > 0
             ? std::optional<std::size_t>(
                   cache_plan.stable_prefix_tokens)
-            : std::nullopt);
+            : std::nullopt,
+        prefill_chunk_size);
 }
 
 std::int32_t generate_with_prefill_metrics(
