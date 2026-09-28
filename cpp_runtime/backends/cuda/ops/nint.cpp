@@ -308,6 +308,12 @@ mfq_tensor_backend::Tensor nint_matmul(const NintWeight & w, mfq_tensor_backend:
         if (M <= 8) {
             Workspace & ws = w.workspace(M);
             return g_profiler.measure("nint.matmul", [&]() {
+                if (w.aligned_q8) {
+                    return nint_matmul_q8_ws_cuda(
+                        w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
+                        w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
+                        x, w.gs, ws.qx, ws.xscale);
+                }
                 return nint_matmul_ws_cuda(
                     w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
                     w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
@@ -467,6 +473,12 @@ mfq_tensor_backend::Tensor nint_matmul_input_mul(const NintWeight & w, mfq_tenso
     if (!w.q8_zero && x.size(0) <= 8) {
         Workspace & ws = w.workspace(static_cast<int>(x.size(0)));
         return g_profiler.measure("nint.matmul.input_mul", [&]() {
+            if (w.aligned_q8) {
+                return nint_matmul_input_mul_q8_ws_cuda(
+                    w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
+                    w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
+                    x, gate, mode, w.gs, ws.qx, ws.xscale);
+            }
             return nint_matmul_input_mul_ws_cuda(
                 w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
                 w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
@@ -1123,6 +1135,11 @@ NintWeight to_device_nint(const NintCpu & c, bool cuda) {
     w.aggregate_bpw = c.aggregate_bpw;
     w.distribution_entropy = c.distribution_entropy;
     w.shape = c.shape;
+    w.aligned_q8 = c.gs % 4 == 0;
+    for (size_t row = 0; row < c.row_q_bits.size(); ++row) {
+        w.aligned_q8 = w.aligned_q8 && c.row_q_bits[row] == 8 &&
+            (c.row_q_bit_offsets[row] & 31) == 0;
+    }
     w.q_packed = cpu_u8_tensor(
         c.q_packed, {static_cast<int64_t>(c.q_packed.size())});
     w.row_q_bits = cpu_u8_tensor(c.row_q_bits, {c.out});
@@ -1215,6 +1232,7 @@ NintWeight to_device_mfe_nint(
         }
     }
     NintWeight result = to_device_nint(source, false);
+    result.aligned_q8 = false;
     result.q_expert_stride = static_cast<int64_t>(stride);
     result.q_packed = cpu_u8_tensor(
         expert_stream, {local_experts, static_cast<int64_t>(stride)});

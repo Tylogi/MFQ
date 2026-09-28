@@ -35,6 +35,8 @@ struct NintWeight {
     double aggregate_bpw = 0.0;
     double distribution_entropy = 0.0;
     bool q8_zero = false;
+    // Proven once from CPU row metadata; false for unclassified/grouped weights.
+    bool aligned_q8 = false;
     std::vector<int64_t> shape;
     mutable std::unordered_map<int, Workspace> workspaces;
 

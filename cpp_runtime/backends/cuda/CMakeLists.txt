@@ -168,6 +168,11 @@ if(BUILD_TESTING)
     mfq_add_cuda_test(mfq-cuda-activation-test
         ${MFQ_CUDA_ROOT}/tests/mfq_cuda_activation_test.cu
         mfq-cuda-native-kernels)
+    mfq_add_cuda_test(mfq-nint-q8-test
+        ${MFQ_CUDA_ROOT}/tests/mfq_nint_q8_test.cu
+        mfq-cuda-native-kernels)
+    target_compile_definitions(mfq-nint-q8-test PRIVATE
+        MFQ_NATIVE_CUDA_RUNTIME=1)
     mfq_add_cuda_test(mfq-paged-kv-test
         ${MFQ_CUDA_ROOT}/tests/mfq_paged_kv_test.cu
         mfq-cuda-native-kernels)

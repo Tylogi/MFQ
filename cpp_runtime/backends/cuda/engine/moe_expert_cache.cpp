@@ -1314,6 +1314,7 @@ public:
                     .dtype(mfq_tensor_backend::kInt32));
             size_t field = 0;
             if (pool.family == MixedMoeFamily::Nint) {
+                pool.nint.aligned_q8 = false;
                 pool.nint.workspaces.clear();
                 pool.nint.q_packed = arena.fields.at(field++);
                 pool.nint.row_q_bits = arena.fields.at(field++);

@@ -260,6 +260,7 @@ static NintWeight cat_weights(const std::vector<NintWeight> & ws) {
     std::vector<mfq_tensor_backend::Tensor> qp, rqb, rqoff, q8s, ss, sm, ns, nm;
     int64_t out = 0;
     int64_t q_bit_base = 0;
+    bool aligned_q8 = !a.q8_zero;
     for (const auto & w : ws) {
         if (w.ng != a.ng || w.gs != a.gs ||
             w.neuron_len != a.neuron_len || w.q8_zero != a.q8_zero) {
@@ -267,6 +268,7 @@ static NintWeight cat_weights(const std::vector<NintWeight> & ws) {
         }
         qp.push_back(w.q_packed);
         if (!w.q8_zero) {
+            aligned_q8 = aligned_q8 && w.aligned_q8 && (q_bit_base & 31) == 0;
             rqb.push_back(w.row_q_bits);
             rqoff.push_back(w.row_q_bit_offsets + q_bit_base);
             q_bit_base += w.q_packed.numel() * 8;
@@ -289,6 +291,7 @@ static NintWeight cat_weights(const std::vector<NintWeight> & ws) {
     g.bits = a.bits;
     g.neuron_len = a.neuron_len;
     g.q8_zero = a.q8_zero;
+    g.aligned_q8 = aligned_q8;
     g.shape = a.shape;
     g.shape[0] = out;
     g.q_packed = mfq_tensor_backend::cat(qp, 0).contiguous();
