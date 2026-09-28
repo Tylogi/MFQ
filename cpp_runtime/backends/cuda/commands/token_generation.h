@@ -2,7 +2,7 @@
 
 #include "engine/cuda_execution.h"
 #include "engine/decode_graph.h"
-#include "engine/moe_expert_cache.h"
+#include "storage/moe_expert_cache.h"
 #include "mfq_tensor_backend.h"
 
 #include <cuda_profiler_api.h>

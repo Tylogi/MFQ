@@ -1,6 +1,7 @@
 #include "options.h"
+#include "runtime_config.h"
 #include "cuda_execution.h"
-#include "moe_expert_cache.h"
+#include "storage/moe_expert_cache.h"
 #include "moe_cache_profile.h"
 #include "mfq_tensor_backend.h"
 #include "quant_linear.h"
@@ -11,6 +12,8 @@
 #include <charconv>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -46,7 +49,143 @@ double strict_double(const std::string& text, const char* option) {
     return result;
 }
 
+std::uint64_t environment_uint64(
+        const char* name, std::uint64_t fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') return fallback;
+    std::uint64_t result = 0;
+    const auto length = std::char_traits<char>::length(value);
+    const auto [end, error] = std::from_chars(value, value + length, result);
+    if (error != std::errc{} || end != value + length) {
+        throw std::runtime_error(std::string("invalid ") + name);
+    }
+    return result;
+}
+
+bool environment_enabled(const char* name, bool fallback = true) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') return fallback;
+    return strict_int(value, name) != 0;
+}
+
+std::filesystem::path default_prefix_cache_directory() {
+    if (const char* configured =
+            std::getenv("MFQ_RUNTIME_PREFIX_CACHE_DIR")) {
+        if (configured[0] != '\0') return configured;
+    }
+#ifdef _WIN32
+    if (const char* local = std::getenv("LOCALAPPDATA")) {
+        if (local[0] != '\0') {
+            return std::filesystem::path(local) /
+                "TyloQuant" / "MFQ" / "prefix-cache";
+        }
+    }
+#else
+    if (const char* xdg = std::getenv("XDG_CACHE_HOME")) {
+        if (xdg[0] != '\0') {
+            return std::filesystem::path(xdg) /
+                "tyloquant" / "mfq" / "prefix-cache";
+        }
+    }
+    if (const char* home = std::getenv("HOME")) {
+        if (home[0] != '\0') {
+            return std::filesystem::path(home) / ".cache" /
+                "tyloquant" / "mfq" / "prefix-cache";
+        }
+    }
+#endif
+    return std::filesystem::temp_directory_path() /
+        "tyloquant-mfq-prefix-cache";
+}
+
+std::size_t checked_size(std::uint64_t value, const char* name) {
+    if (value > std::numeric_limits<std::size_t>::max()) {
+        throw std::runtime_error(std::string(name) + " exceeds size_t");
+    }
+    return static_cast<std::size_t>(value);
+}
+
+std::int32_t graph_minimum(const char* name) {
+    const auto value = std::max<std::uint64_t>(
+        2, environment_uint64(name, 16));
+    if (value > static_cast<std::uint64_t>(
+            std::numeric_limits<std::int32_t>::max())) {
+        throw std::runtime_error(std::string(name) + " exceeds int32");
+    }
+    return static_cast<std::int32_t>(value);
+}
+
 } // namespace
+
+CudaRuntimeConfig resolve_cuda_runtime_config(
+        const CudaEngineOptions& options) {
+    if (options.prefill_chunk_size <= 0) {
+        throw std::invalid_argument("prefill chunk size must be positive");
+    }
+    if (options.continuous_batching < 0) {
+        throw std::invalid_argument(
+            "continuous batching capacity must be non-negative");
+    }
+
+    CudaRuntimeConfig config;
+    config.generation.prefill_chunk_size = options.prefill_chunk_size;
+    config.decode_graph.enabled = environment_enabled(
+        "MFQ_RUNTIME_CUDA_GRAPH", true);
+    config.decode_graph.trace = environment_enabled(
+        "MFQ_RUNTIME_TRACE_CUDA_GRAPH", false);
+    config.decode_graph.minimum_generation_tokens = graph_minimum(
+        "MFQ_RUNTIME_CUDA_GRAPH_MIN_TOKENS");
+
+    config.continuous_batch.scheduling.max_sequences =
+        static_cast<std::size_t>(options.continuous_batching);
+    config.continuous_batch.greedy = environment_enabled(
+        "MFQ_CONTINUOUS_BATCH_GREEDY", true);
+    config.continuous_batch.packed_metadata = environment_enabled(
+        "MFQ_CONTINUOUS_BATCH_PACKED_METADATA", true);
+    config.continuous_batch.cuda_graph =
+        config.decode_graph.enabled && environment_enabled(
+            "MFQ_CONTINUOUS_BATCH_CUDA_GRAPH", true);
+    config.continuous_batch.paged_kv = environment_enabled(
+        "MFQ_CONTINUOUS_PAGED_KV", true);
+    config.continuous_batch.cuda_graph_minimum_tokens = graph_minimum(
+        "MFQ_CONTINUOUS_BATCH_CUDA_GRAPH_MIN_TOKENS");
+
+    auto& sessions = config.session_cache;
+    sessions.snapshots.max_sessions = checked_size(environment_uint64(
+        "MFQ_RUNTIME_MAX_KV_SESSIONS", sessions.snapshots.max_sessions),
+        "MFQ_RUNTIME_MAX_KV_SESSIONS");
+    sessions.snapshots.max_snapshots_per_session = checked_size(
+        environment_uint64(
+            "MFQ_RUNTIME_MAX_KV_SNAPSHOTS_PER_SESSION",
+            sessions.snapshots.max_snapshots_per_session),
+        "MFQ_RUNTIME_MAX_KV_SNAPSHOTS_PER_SESSION");
+    sessions.snapshots.max_bytes = checked_size(environment_uint64(
+        "MFQ_RUNTIME_KV_SESSION_BYTES", sessions.snapshots.max_bytes),
+        "MFQ_RUNTIME_KV_SESSION_BYTES");
+    sessions.trace = environment_enabled(
+        "MFQ_RUNTIME_TRACE_SESSION_CACHE", false);
+
+    auto& prefix = config.prefix_cache;
+    prefix.directory = default_prefix_cache_directory();
+    prefix.enabled = !environment_enabled(
+        "MFQ_RUNTIME_DISABLE_PREFIX_CACHE", false);
+    prefix.block_tokens = environment_uint64(
+        "MFQ_RUNTIME_PREFIX_CACHE_BLOCK_TOKENS", prefix.block_tokens);
+    if (prefix.block_tokens == 0 || prefix.block_tokens > 65536) {
+        throw std::runtime_error(
+            "MFQ_RUNTIME_PREFIX_CACHE_BLOCK_TOKENS must be in [1, 65536]");
+    }
+    prefix.disk_bytes = environment_uint64(
+        "MFQ_RUNTIME_PREFIX_CACHE_DISK_BYTES", prefix.disk_bytes);
+    prefix.hot_bytes = environment_uint64(
+        "MFQ_RUNTIME_PREFIX_CACHE_HOT_BYTES", prefix.hot_bytes);
+    prefix.pending_writes = checked_size(environment_uint64(
+        "MFQ_RUNTIME_PREFIX_CACHE_PENDING_WRITES", prefix.pending_writes),
+        "MFQ_RUNTIME_PREFIX_CACHE_PENDING_WRITES");
+    prefix.pending_bytes = environment_uint64(
+        "MFQ_RUNTIME_PREFIX_CACHE_PENDING_BYTES", prefix.pending_bytes);
+    return config;
+}
 
 static std::vector<std::string> split_csv_values(
         const std::string & value,

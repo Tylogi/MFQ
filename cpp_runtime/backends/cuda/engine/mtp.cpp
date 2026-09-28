@@ -1,8 +1,9 @@
 #include "mtp.h"
 
 #include "cuda_execution.h"
-#include "causal_lm.h"
+#include "models/causal_lm.h"
 #include "cuda_sampling.h"
+#include "generation_policy.h"
 #include "inference.h"
 #include "mfq_cuda_ops.h"
 
@@ -41,14 +42,15 @@ static mfq_tensor_backend::Tensor hidden_forward_chunked(
             (ids.size(1) + chunk_size - 1) / chunk_size));
     }
     mfq_tensor_backend::Tensor hidden;
-    for (int64_t offset = 0; offset < ids.size(1); offset += chunk_size) {
+    for (int64_t offset = 0; offset < ids.size(1);) {
         if (cancelled && cancelled()) {
             throw mfq::engine::InferenceCancelled{};
         }
-        const int64_t count = std::min(chunk_size, ids.size(1) - offset);
+        const auto chunk = mfq::engine::next_prefill_chunk(
+            ids.size(1), offset, chunk_size);
         mfq_tensor_backend::Tensor raw_chunk;
         hidden = model.hidden_forward(
-            ids.narrow(1, offset, count).contiguous(),
+            ids.narrow(1, chunk.offset, chunk.count).contiguous(),
             mfq_nullopt,
             mfq_nullopt,
             nullptr,
@@ -60,6 +62,7 @@ static mfq_tensor_backend::Tensor hidden_forward_chunked(
         if (cancelled && cancelled()) {
             throw mfq::engine::InferenceCancelled{};
         }
+        offset += chunk.count;
     }
     if (raw_hidden != nullptr) {
         *raw_hidden = raw_chunks.size() == 1
@@ -96,24 +99,26 @@ static mfq_tensor_backend::Tensor hidden_forward_prepared_chunked(
             (ids.size(1) + chunk_size - 1) / chunk_size));
     }
     mfq_tensor_backend::Tensor hidden;
-    for (int64_t offset = 0; offset < ids.size(1); offset += chunk_size) {
+    for (int64_t offset = 0; offset < ids.size(1);) {
         if (cancelled && cancelled()) {
             throw mfq::engine::InferenceCancelled{};
         }
-        const int64_t count = std::min(chunk_size, ids.size(1) - offset);
+        const auto chunk = mfq::engine::next_prefill_chunk(
+            ids.size(1), offset, chunk_size);
         mfq_tensor_backend::Tensor raw_chunk;
         hidden = model.hidden_forward_inputs(
-            ids.narrow(1, offset, count).contiguous(),
+            ids.narrow(1, chunk.offset, chunk.count).contiguous(),
             prepared.embeddings.narrow(
-                1, prepared_offset + offset, count).contiguous(),
+                1, prepared_offset + chunk.offset, chunk.count).contiguous(),
             prepared.positions.narrow(
-                -1, prepared_offset + offset, count).contiguous(),
+                -1, prepared_offset + chunk.offset, chunk.count).contiguous(),
             mfq_nullopt, nullptr, mfq_nullopt, true, mfq_nullopt,
             raw_hidden != nullptr ? &raw_chunk : nullptr);
         if (raw_hidden != nullptr) raw_chunks.push_back(std::move(raw_chunk));
         if (cancelled && cancelled()) {
             throw mfq::engine::InferenceCancelled{};
         }
+        offset += chunk.count;
     }
     model.decode_position_delta = prepared.decode_position_delta;
     if (raw_hidden != nullptr) {
@@ -157,15 +162,8 @@ int32_t run_mtp_generation(
         throw mfq::engine::InferenceCancelled{};
     }
     MFQ_RUNTIME_CHECK(
-        !prompt.empty() && reused_tokens < prompt.size() &&
-            prompt.size() <=
-                static_cast<size_t>(model.max_position_embeddings()),
-        "invalid MTP prompt length");
-    for (auto token : prompt) {
-        MFQ_RUNTIME_CHECK(
-            token >= 0 && token < model.vocab_size(),
-            "MTP prompt token outside vocabulary");
-    }
+        reused_tokens < prompt.size(),
+        "restored MTP prefix must be shorter than the prompt");
     const bool transformed_prompt = prepared != nullptr && prepared->transformed();
     MFQ_RUNTIME_CHECK(
         prepared == nullptr || prepared->token_ids == prompt,
@@ -196,9 +194,10 @@ int32_t run_mtp_generation(
         "prepared CUDA MTP decode position is outside context capacity");
     const int64_t occupied_context = std::max<int64_t>(
         static_cast<int64_t>(prompt.size()), next_logical_position);
-    const int32_t limit = static_cast<int32_t>(std::min<int64_t>(
-        sampling.max_tokens,
-        model.max_position_embeddings() - occupied_context));
+    const auto generation_plan = mfq::engine::plan_generation(
+        prompt, model.vocab_size(), model.max_position_embeddings(),
+        sampling.max_tokens, 0, occupied_context);
+    const int32_t limit = generation_plan.generation_tokens;
     if (limit <= 0) return 0;
     const auto options = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA)
         .dtype(mfq_tensor_backend::kInt64);
@@ -435,23 +434,25 @@ int32_t run_mtp_generation(
             } else if (pairs > 0) {
                 prime_hidden = raw.narrow(1, 0, pairs);
             }
-            for (int64_t offset = 0; offset < pairs; offset += chunk_size) {
+            for (int64_t offset = 0; offset < pairs;) {
                 if (cancelled && cancelled()) {
                     throw mfq::engine::InferenceCancelled{};
                 }
-                const int64_t count = std::min(chunk_size, pairs - offset);
+                const auto chunk = mfq::engine::next_prefill_chunk(
+                    pairs, offset, chunk_size);
                 (void)predictor_step(
-                    prime_hidden.narrow(1, offset, count),
+                    prime_hidden.narrow(1, chunk.offset, chunk.count),
                     input_ids.narrow(
-                        1, prime_ids_offset + offset, count),
+                        1, prime_ids_offset + chunk.offset, chunk.count),
                     transformed_prompt
                         ? prepared->positions.narrow(
-                              -1, prime_ids_offset + offset,
-                              count).contiguous()
+                              -1, prime_ids_offset + chunk.offset,
+                              chunk.count).contiguous()
                         : Tensor{});
                 if (cancelled && cancelled()) {
                     throw mfq::engine::InferenceCancelled{};
                 }
+                offset += chunk.count;
             }
         }
 

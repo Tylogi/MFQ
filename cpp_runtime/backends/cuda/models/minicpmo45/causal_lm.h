@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../../engine/causal_lm.h"
-#include "../../engine/cuda_transformer.h"
+#include "../causal_lm.h"
+#include "models/transformer.h"
 #include "models/include/minicpmo45.h"
 #include "mfq_cuda_ops.h"
 

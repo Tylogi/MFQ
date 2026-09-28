@@ -1,7 +1,7 @@
 #pragma once
 
 #include "kl_reference_contract.h"
-#include "engine/causal_lm.h"
+#include "models/causal_lm.h"
 
 #include <cstdint>
 #include <string>

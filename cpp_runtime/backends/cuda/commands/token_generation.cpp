@@ -1,7 +1,7 @@
 #include "cli.h"
 #include "token_generation.h"
 
-#include "engine/causal_lm_loader.h"
+#include "models/loader.h"
 #include "mfq_tensor_backend.h"
 
 #include <utility>

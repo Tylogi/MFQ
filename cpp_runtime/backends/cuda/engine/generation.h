@@ -2,6 +2,7 @@
 
 #include "cuda_execution.h"
 #include "decode_graph.h"
+#include "runtime_config.h"
 #include "mfq/runtime.h"
 
 #include <cstdint>
@@ -26,6 +27,7 @@ std::int32_t generate(
     std::mutex& model_mutex,
     DecodeGraphCache& graph_cache,
     TextSessionCache& session_cache,
+    const CudaRuntimeConfig& config,
     const std::vector<std::int64_t>& prompt,
     const MfqSamplingParams& sampling,
     const MfqTokenCallback& on_token,
@@ -33,7 +35,6 @@ std::int32_t generate(
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     MtpModule* mtp = nullptr,
-    std::int64_t prefill_chunk_size = 2048,
     PreparedPromptFactory<Model> prepare_prompt = {},
     MfqCancellationCheck cancelled = {});
 

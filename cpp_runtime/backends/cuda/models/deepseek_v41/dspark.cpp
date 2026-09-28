@@ -1,6 +1,6 @@
 #include "dspark.h"
 
-#include "../../engine/causal_lm.h"
+#include "../causal_lm.h"
 #include "../../engine/mtp.h"
 #include "causal_lm.h"
 

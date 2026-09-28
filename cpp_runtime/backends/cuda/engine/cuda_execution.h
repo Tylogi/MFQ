@@ -8,17 +8,11 @@
 #include <nccl.h>
 #endif
 
-#include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <cstdlib>
-#include <functional>
-#include <iomanip>
-#include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -99,39 +93,8 @@ struct CudaProfiler {
     std::vector<std::string> order;
     std::vector<PendingEvent> pending;
 
-    bool selected(const std::string & name) const {
-        const char * filter_value =
-            std::getenv("MFQ_PROFILE_CUDA_FILTER");
-        if (filter_value == nullptr || filter_value[0] == '\0') {
-            return true;
-        }
-        const std::string_view filter(filter_value);
-        size_t begin = 0;
-        while (begin <= filter.size()) {
-            const size_t end = filter.find(',', begin);
-            const size_t count = end == std::string_view::npos
-                ? filter.size() - begin
-                : end - begin;
-            if (filter.substr(begin, count) == name) {
-                return true;
-            }
-            if (end == std::string_view::npos) {
-                break;
-            }
-            begin = end + 1;
-        }
-        return false;
-    }
-
-    void reset() {
-        for (auto & p : pending) {
-            cudaEventDestroy(p.start);
-            cudaEventDestroy(p.stop);
-        }
-        pending.clear();
-        stats.clear();
-        order.clear();
-    }
+    bool selected(const std::string& name) const;
+    void reset();
 
     template <typename Fn>
     auto measure(const std::string & name, Fn && fn) -> decltype(fn()) {
@@ -164,30 +127,7 @@ struct CudaProfiler {
         return out;
     }
 
-    void report(const std::string & title) {
-        if (!enabled) return;
-        if (!pending.empty()) cudaEventSynchronize(pending.back().stop);
-        for (auto & p : pending) {
-            float ms = 0.0f;
-            cudaEventElapsedTime(&ms, p.start, p.stop);
-            stats.at(p.name).ms += (double)ms;
-            cudaEventDestroy(p.start);
-            cudaEventDestroy(p.stop);
-        }
-        pending.clear();
-        std::cerr << "profile " << title << "\n";
-        for (const auto & name : order) {
-            const auto & s = stats.at(name);
-            std::cerr << "profile_item"
-                      << " name=" << name
-                      << " calls=" << s.calls
-                      << " cuda_ms=" << s.ms
-                      << " cuda_avg_ms=" << (s.calls ? s.ms / (double)s.calls : 0.0)
-                      << " wall_ms=" << s.wall_ms
-                      << " wall_avg_ms=" << (s.calls ? s.wall_ms / (double)s.calls : 0.0)
-                      << "\n";
-        }
-    }
+    void report(const std::string& title);
 };
 
 enum class KlMmqMode {
@@ -229,110 +169,11 @@ struct ModelParallelCollectiveRuntime {
 #endif
     bool collectives_enabled = false;
 
-    ~ModelParallelCollectiveRuntime() {
-        reset();
-    }
-
-    void reset() noexcept {
-        // Release CUDA-owned state while every device context is still alive.
-        // Static destruction is too late: the CUDA allocator may already be
-        // shutting down when tensors on secondary model-parallel devices are
-        // destroyed.
-        for (int device : devices) {
-            (void)cudaSetDevice(device);
-            (void)cudaDeviceSynchronize();
-        }
-        reduction_buffers.clear();
-#ifdef MFQ_HAVE_NCCL
-        for (auto communicator : communicators) {
-            if (communicator != nullptr) {
-                (void)ncclCommDestroy(communicator);
-            }
-        }
-        communicators.clear();
-#endif
-        for (size_t index = 0; index < devices.size(); ++index) {
-            (void)cudaSetDevice(devices[index]);
-            if (index < ready.size() && ready[index] != nullptr) {
-                (void)cudaEventDestroy(ready[index]);
-            }
-            if (index < completed.size() && completed[index] != nullptr) {
-                (void)cudaEventDestroy(completed[index]);
-            }
-        }
-        devices.clear();
-        streams.clear();
-        ready.clear();
-        completed.clear();
-        collectives_enabled = false;
-    }
-
+    ~ModelParallelCollectiveRuntime();
+    void reset() noexcept;
     void configure(
-            const std::vector<int> & requested_devices,
-            bool allow_duplicate_devices) {
-        reset();
-        if (requested_devices.size() < 2 || allow_duplicate_devices) {
-            return;
-        }
-        devices = requested_devices;
-        streams.reserve(devices.size());
-        ready.resize(devices.size(), nullptr);
-        completed.resize(devices.size(), nullptr);
-        reduction_buffers.resize(devices.size());
-        for (size_t index = 0; index < devices.size(); ++index) {
-            MfqCudaGuard guard(devices[index]);
-            streams.push_back(
-                mfq_get_stream_from_pool(false, devices[index]));
-            MFQ_CUDA_CHECK(cudaEventCreateWithFlags(
-                &ready[index], cudaEventDisableTiming));
-            MFQ_CUDA_CHECK(cudaEventCreateWithFlags(
-                &completed[index], cudaEventDisableTiming));
-        }
-#ifdef MFQ_HAVE_NCCL
-        communicators.resize(devices.size(), nullptr);
-        MFQ_NCCL_CHECK(ncclCommInitAll(
-            communicators.data(),
-            static_cast<int>(devices.size()),
-            devices.data()));
-        // NCCL initializes peer transports lazily.  That initialization can
-        // allocate shared-memory control state, which CUDA forbids once graph
-        // capture has started.  Exercise both directions between the primary
-        // rank and every peer while ordinary stream execution is still active.
-        std::vector<mfq_tensor_backend::Tensor> p2p_warmup_buffers;
-        p2p_warmup_buffers.reserve(devices.size());
-        for (const int device : devices) {
-            MfqCudaGuard guard(device);
-            p2p_warmup_buffers.push_back(mfq_tensor_backend::empty(
-                {1}, mfq_tensor_backend::TensorOptions()
-                    .device(mfq_tensor_backend::Device(
-                        mfq_tensor_backend::kCUDA, device))
-                    .dtype(mfq_tensor_backend::kUInt8)));
-        }
-        for (size_t peer = 1; peer < devices.size(); ++peer) {
-            MFQ_NCCL_CHECK(ncclGroupStart());
-            MFQ_NCCL_CHECK(ncclSend(
-                p2p_warmup_buffers[0].data_ptr(), 1, ncclUint8,
-                static_cast<int>(peer), communicators[0],
-                streams[0].stream()));
-            MFQ_NCCL_CHECK(ncclRecv(
-                p2p_warmup_buffers[peer].data_ptr(), 1, ncclUint8,
-                0, communicators[peer], streams[peer].stream()));
-            MFQ_NCCL_CHECK(ncclSend(
-                p2p_warmup_buffers[peer].data_ptr(), 1, ncclUint8,
-                0, communicators[peer], streams[peer].stream()));
-            MFQ_NCCL_CHECK(ncclRecv(
-                p2p_warmup_buffers[0].data_ptr(), 1, ncclUint8,
-                static_cast<int>(peer), communicators[0],
-                streams[0].stream()));
-            MFQ_NCCL_CHECK(ncclGroupEnd());
-        }
-        for (size_t index = 0; index < devices.size(); ++index) {
-            MfqCudaGuard guard(devices[index]);
-            MFQ_CUDA_CHECK(cudaStreamSynchronize(streams[index].stream()));
-        }
-        collectives_enabled = true;
-#endif
-    }
+        const std::vector<int>& requested_devices,
+        bool allow_duplicate_devices);
 };
 
 int model_parallel_primary_device();
@@ -353,25 +194,8 @@ struct LayerPlacementConfig {
             : devices.front();
     }
 
-    void prepare(int64_t layers) {
-        layer_devices.assign(
-            static_cast<size_t>(layers), primary_device());
-        if (!enabled()) return;
-        const auto slices = mfq::plan_tensor_parallel_slices(
-            layers, 1, devices, split);
-        for (const auto & slice : slices) {
-            for (int64_t layer = slice.begin; layer < slice.end; ++layer) {
-                layer_devices.at(static_cast<size_t>(layer)) = slice.device;
-            }
-        }
-    }
-
-    int device_for_layer(int64_t layer) const {
-        if (layer < 0 || layer >= static_cast<int64_t>(layer_devices.size())) {
-            throw std::runtime_error("layer-placement index is outside the model");
-        }
-        return layer_devices.at(static_cast<size_t>(layer));
-    }
+    void prepare(int64_t layers);
+    int device_for_layer(int64_t layer) const;
 };
 
 struct CudaExecutionContext {
@@ -489,30 +313,9 @@ struct KlMmqScope {
     int64_t previous_fallback_calls;
 
     explicit KlMmqScope(
-            KlMmqMode mode,
-            CudaExecutionContext& context = cuda_execution_context())
-        : execution(context),
-          previous_mode(context.kl_mmq_mode),
-          previous_activation_quantize_calls(
-              context.kl_mmq_activation_quantize_calls),
-          previous_dense_calls(context.kl_mmq_dense_calls),
-          previous_moe_calls(context.kl_mmq_moe_calls),
-          previous_fallback_calls(context.kl_mmq_fallback_calls) {
-        execution.kl_mmq_mode = mode;
-        execution.kl_mmq_activation_quantize_calls = 0;
-        execution.kl_mmq_dense_calls = 0;
-        execution.kl_mmq_moe_calls = 0;
-        execution.kl_mmq_fallback_calls = 0;
-    }
-
-    ~KlMmqScope() {
-        execution.kl_mmq_mode = previous_mode;
-        execution.kl_mmq_activation_quantize_calls =
-            previous_activation_quantize_calls;
-        execution.kl_mmq_dense_calls = previous_dense_calls;
-        execution.kl_mmq_moe_calls = previous_moe_calls;
-        execution.kl_mmq_fallback_calls = previous_fallback_calls;
-    }
+        KlMmqMode mode,
+        CudaExecutionContext& context = cuda_execution_context());
+    ~KlMmqScope();
 };
 
 struct KlKvCacheCapacityScope {
@@ -520,16 +323,9 @@ struct KlKvCacheCapacityScope {
     int64_t previous_capacity;
 
     explicit KlKvCacheCapacityScope(
-            int64_t capacity,
-            CudaExecutionContext& context = cuda_execution_context())
-        : execution(context),
-          previous_capacity(context.kl_kv_cache_capacity) {
-        execution.kl_kv_cache_capacity = capacity;
-    }
-
-    ~KlKvCacheCapacityScope() {
-        execution.kl_kv_cache_capacity = previous_capacity;
-    }
+        int64_t capacity,
+        CudaExecutionContext& context = cuda_execution_context());
+    ~KlKvCacheCapacityScope();
 };
 
 struct MoeRouteLayerStats {

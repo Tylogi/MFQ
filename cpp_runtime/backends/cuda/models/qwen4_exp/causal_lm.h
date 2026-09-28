@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../engine/cuda_transformer.h"
+#include "models/transformer.h"
 #include "models/include/qwen4_exp.h"
 #include "layers.h"
 

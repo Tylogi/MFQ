@@ -1,10 +1,10 @@
 #include "batch_executor.h"
 
-#include "engine/causal_lm.h"
+#include "models/causal_lm.h"
 #include "cuda_sampling.h"
 #include "generation.h"
 #include "text_session_cache.h"
-#include "moe_expert_cache.h"
+#include "storage/moe_expert_cache.h"
 #include "paged_kv.h"
 #include "linear_attention.h"
 
@@ -12,10 +12,10 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cstdlib>
 #include <deque>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -145,33 +145,13 @@ static std::string qwen_continuous_batching_incompatibility(
     return {};
 }
 
-static bool qwen_continuous_batch_greedy_enabled() {
-    const char * environment = std::getenv(
-        "MFQ_CONTINUOUS_BATCH_GREEDY");
-    return environment == nullptr || std::atoi(environment) != 0;
-}
-
-static bool qwen_continuous_batch_packed_metadata_enabled() {
-    const char * environment = std::getenv(
-        "MFQ_CONTINUOUS_BATCH_PACKED_METADATA");
-    return environment == nullptr || std::atoi(environment) != 0;
-}
-
-static bool qwen_continuous_batch_cuda_graph_enabled(const mfq::cuda::Qwen35CausalLm & model) {
-    const char * environment = std::getenv(
-        "MFQ_CONTINUOUS_BATCH_CUDA_GRAPH");
-    const char * runtime_environment =
-        std::getenv("MFQ_RUNTIME_CUDA_GRAPH");
-    return (environment == nullptr || std::atoi(environment) != 0) &&
-        (runtime_environment == nullptr || runtime_environment[0] != '0') &&
+static bool qwen_continuous_batch_cuda_graph_enabled(
+        const mfq::cuda::Qwen35CausalLm& model,
+        const CudaContinuousBatchConfig& config) {
+    return config.cuda_graph &&
         !qwen_continuous_batch_has_cached_moe(model) &&
         mfq_cuda_graph_capture_supported() &&
         model_parallel_cuda_graph_enabled();
-}
-
-static bool qwen_continuous_paged_kv_enabled() {
-    const char * environment = std::getenv("MFQ_CONTINUOUS_PAGED_KV");
-    return environment == nullptr || std::atoi(environment) != 0;
 }
 
 static QwenBatchState take_qwen_batch_state(
@@ -442,19 +422,21 @@ struct QwenBatchExecutor::Impl final : mfq::engine::ContinuousBatchExecutor {
             mfq::cuda::Qwen35CausalLm & model,
             CudaExecutionContext& execution,
             std::mutex & model_mutex,
-            int32_t max_sequences,
-            int64_t prefill_chunk_size = 2048,
-            std::chrono::microseconds initial_batch_wait =
-                std::chrono::microseconds(1000))
+            CudaContinuousBatchConfig config,
+            mfq::engine::GenerationConfig generation)
         : model_(model), execution_(execution), model_mutex_(model_mutex),
-          max_sequences_(max_sequences),
-          prefill_chunk_size_(prefill_chunk_size),
+          config_(std::move(config)),
+          max_sequences_(static_cast<int32_t>(
+              config_.scheduling.max_sequences)),
+          prefill_chunk_size_(generation.prefill_chunk_size),
           moe_enabled_(qwen_continuous_batch_has_moe(model)),
           cached_moe_enabled_(
               qwen_continuous_batch_has_cached_moe(model)),
-          initial_batch_wait_(initial_batch_wait),
-          queue_(static_cast<std::size_t>(max_sequences)) {
-        if (max_sequences_ < 1) {
+          queue_(config_.scheduling.max_sequences) {
+        if (config_.scheduling.max_sequences >
+                static_cast<std::size_t>(
+                    std::numeric_limits<int32_t>::max()) ||
+                max_sequences_ < 1) {
             throw std::invalid_argument(
                 "continuous batching max sequences must be positive");
         }
@@ -467,7 +449,7 @@ struct QwenBatchExecutor::Impl final : mfq::engine::ContinuousBatchExecutor {
         if (!incompatibility.empty()) {
             throw std::runtime_error(incompatibility);
         }
-        if (qwen_continuous_paged_kv_enabled()) {
+        if (config_.paged_kv) {
             paged_kv_ = std::make_unique<QwenPagedKvArena>(
                 model_, max_sequences_);
         }
@@ -490,33 +472,13 @@ struct QwenBatchExecutor::Impl final : mfq::engine::ContinuousBatchExecutor {
             const MfqPromptCachePlan & cache_plan,
             const MfqTokenConstraintPtr & token_constraint,
             const MfqCancellationCheck & cancelled) override {
-        if (prompt.empty() ||
-                prompt.size() > static_cast<size_t>(
-                    model_.max_position_embeddings())) {
-            throw std::invalid_argument(
-                "continuous batching prompt length is invalid");
-        }
-        if (sampling.max_tokens < 0) {
-            throw std::invalid_argument(
-                "continuous batching max_tokens cannot be negative");
-        }
-        for (const auto token : prompt) {
-            if (token < 0 || token >= model_.vocab_size()) {
-                throw std::invalid_argument(
-                    "continuous batching prompt token is outside the vocabulary");
-            }
-        }
-        if (sampling.max_tokens == 0 ||
-                prompt.size() == static_cast<size_t>(
-                    model_.max_position_embeddings())) {
-            return 0;
-        }
+        const auto plan = mfq::engine::plan_generation(
+            prompt, model_.vocab_size(), model_.max_position_embeddings(),
+            sampling.max_tokens, cache_plan.stable_prefix_tokens);
+        if (plan.generation_tokens == 0) return 0;
         auto request = std::make_shared<Request>(
             prompt, sampling, token_constraint, cancelled);
-        request->generation_limit = static_cast<int32_t>(
-            std::min<int64_t>(sampling.max_tokens,
-                model_.max_position_embeddings() -
-                    static_cast<int64_t>(prompt.size())));
+        request->generation_limit = plan.generation_tokens;
         if (!cache_plan.session_id.empty() ||
                 cache_plan.stable_prefix_tokens != 0) {
             ++prefix_cache_bypasses_;
@@ -759,16 +721,16 @@ private:
                 Tensor hidden;
                 std::unique_ptr<PrefillCudaTimer> final_timer;
                 do {
-                    const int64_t count = std::min(
-                        prefill_chunk_size_,
-                        request->prefill_ids.size(1) -
-                            request->prefill_offset);
+                    const auto chunk = mfq::engine::next_prefill_chunk(
+                        request->prefill_ids.size(1),
+                        request->prefill_offset,
+                        prefill_chunk_size_);
                     auto chunk_timer =
                         std::make_unique<PrefillCudaTimer>();
                     hidden = model_.hidden_forward(
                         request->prefill_ids.narrow(
-                            1, request->prefill_offset, count).contiguous());
-                    request->prefill_offset += count;
+                            1, chunk.offset, chunk.count).contiguous());
+                    request->prefill_offset += chunk.count;
                     if (request->prefill_offset <
                             request->prefill_ids.size(1)) {
                         MFQ_CUDA_CHECK(cudaEventRecord(
@@ -997,21 +959,17 @@ private:
             requested_len, model_.max_position_embeddings());
         const int64_t graph_attention_parts = decode_graph_attention_parts(
             planned_len, FullBlock::kDecodeAttentionMaxParts);
-        const char * graph_min_environment = std::getenv(
-            "MFQ_CONTINUOUS_BATCH_CUDA_GRAPH_MIN_TOKENS");
-        const int64_t graph_min_tokens = graph_min_environment != nullptr
-            ? std::max<int64_t>(2, std::atoi(graph_min_environment)) : 16;
         std::vector<const void *> graph_state_addresses;
         bool graph_cache_hit = false;
         bool graph_decode = false;
-        if (batch >= 2 && batch_greedy &&
-                qwen_continuous_batch_greedy_enabled() &&
-                qwen_continuous_batch_cuda_graph_enabled(model_)) {
+        if (batch >= 2 && batch_greedy && config_.greedy &&
+                qwen_continuous_batch_cuda_graph_enabled(
+                    model_, config_)) {
             graph_state_addresses = qwen_decode_state_addresses(model_);
             graph_cache_hit = decode_graph_ && decode_graph_->matches(
                 batch, planned_len, graph_state_addresses);
-            graph_decode = graph_cache_hit ||
-                minimum_remaining >= graph_min_tokens;
+            graph_decode = graph_cache_hit || minimum_remaining >=
+                config_.cuda_graph_minimum_tokens;
             if (graph_decode && !decode_graph_) {
                 decode_graph_ =
                     std::make_unique<QwenContinuousDecodeGraph>();
@@ -1031,8 +989,8 @@ private:
         std::vector<int64_t> input_tokens;
         std::vector<int64_t> positions;
         std::vector<int64_t> sequence_lengths;
-        const bool packed_metadata = graph_decode ||
-            qwen_continuous_batch_packed_metadata_enabled();
+        const bool packed_metadata =
+            graph_decode || config_.packed_metadata;
         int64_t * packed_metadata_data = nullptr;
         if (packed_metadata) {
             ensure_decode_metadata_buffers(primary);
@@ -1162,7 +1120,7 @@ private:
             batched_greedy_data =
                 batched_greedy_tokens.data_ptr<int64_t>();
             ++batched_greedy_batches_;
-        } else if (qwen_continuous_batch_greedy_enabled() && batch_greedy) {
+        } else if (config_.greedy && batch_greedy) {
             batched_greedy_tokens = sample_greedy_cuda(
                     logits.contiguous().view({batch, -1}))
                 .to(mfq_tensor_backend::kCPU).contiguous();
@@ -1262,7 +1220,7 @@ private:
             try {
                 if (!queue_.wait_for_work(
                         !active_.empty() || !prefilling_.empty(),
-                        initial_batch_wait_)) {
+                        config_.scheduling.initial_batch_wait)) {
                     auto error = std::make_exception_ptr(
                         std::runtime_error(
                             "continuous batching scheduler stopped"));
@@ -1326,11 +1284,11 @@ private:
     mfq::cuda::Qwen35CausalLm & model_;
     CudaExecutionContext& execution_;
     std::mutex & model_mutex_;
+    const CudaContinuousBatchConfig config_;
     int32_t max_sequences_ = 0;
     int64_t prefill_chunk_size_ = 2048;
     bool moe_enabled_ = false;
     bool cached_moe_enabled_ = false;
-    std::chrono::microseconds initial_batch_wait_;
     mfq::engine::ContinuousBatchQueue<Request> queue_;
     std::thread worker_;
     std::deque<std::shared_ptr<Request>> prefilling_;
@@ -1360,12 +1318,10 @@ private:
 
 QwenBatchExecutor::QwenBatchExecutor(
         Qwen35CausalLm& model, CudaExecutionContext& execution,
-        std::mutex& model_mutex,
-        std::int32_t max_sequences, std::int64_t prefill_chunk_size,
-        std::chrono::microseconds initial_batch_wait)
+        std::mutex& model_mutex, CudaContinuousBatchConfig config,
+        mfq::engine::GenerationConfig generation)
     : impl_(std::make_unique<Impl>(
-          model, execution, model_mutex, max_sequences, prefill_chunk_size,
-          initial_batch_wait)) {}
+          model, execution, model_mutex, std::move(config), generation)) {}
 
 QwenBatchExecutor::~QwenBatchExecutor() = default;
 
@@ -1399,7 +1355,14 @@ std::int64_t QwenBatchExecutor::paged_kv_page_size() const noexcept {
     return impl_->paged_kv_page_size();
 }
 
-int run_qwen_continuous_batching_check(Qwen35CausalLm& model) {
+int run_qwen_continuous_batching_check(
+        Qwen35CausalLm& model,
+        const CudaRuntimeConfig& runtime_config) {
+    auto check_config = runtime_config;
+    check_config.generation.prefill_chunk_size = 64;
+    check_config.continuous_batch.scheduling.max_sequences = 4;
+    check_config.continuous_batch.scheduling.initial_batch_wait =
+        std::chrono::milliseconds(100);
     auto& execution = *model.execution;
     const auto incompatibility =
         qwen_continuous_batching_incompatibility(model, execution);
@@ -1428,21 +1391,21 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model) {
         second_prompt[index] = 113 +
             static_cast<int64_t>((index * 53) % 880);
     }
-    constexpr int64_t check_prefill_chunk_size = 64;
-
     auto serial = [&](const std::vector<int64_t> & prompt,
                       const MfqSamplingParams & params) {
         std::vector<int64_t> output;
         std::mutex mutex;
         DecodeGraphCache graph_cache(
             model.max_position_embeddings());
-        TextSessionCache session_cache;
+        TextSessionCache session_cache(
+            check_config.session_cache, check_config.prefix_cache);
         const int32_t produced = generate(
-            model, mutex, graph_cache, session_cache, prompt, params,
+            model, mutex, graph_cache, session_cache, check_config,
+            prompt, params,
             [&](int64_t token) {
                 output.push_back(token);
                 return true;
-            }, {}, {}, {}, nullptr, check_prefill_chunk_size);
+            }, {}, {}, {}, nullptr);
         MFQ_RUNTIME_CHECK(
             produced == params.max_tokens &&
                 output.size() == static_cast<size_t>(produced),
@@ -1455,8 +1418,8 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model) {
 
     std::mutex model_mutex;
     QwenBatchExecutor batcher(
-        model, execution, model_mutex, 4, check_prefill_chunk_size,
-        std::chrono::milliseconds(100));
+        model, execution, model_mutex, check_config.continuous_batch,
+        check_config.generation);
     std::mutex gate_mutex;
     std::condition_variable gate_ready;
     bool first_prefilled = false;
@@ -1613,14 +1576,15 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model) {
               << metric("continuous_batching_queued") << '\n';
     MFQ_RUNTIME_CHECK(metric("continuous_batching_max_batch") >= 2.0 &&
         metric("continuous_batching_compactions") >= 1.0 &&
-        (!qwen_continuous_batch_greedy_enabled() ||
+        (!check_config.continuous_batch.greedy ||
             metric("continuous_batching_batched_greedy_batches") >= 1.0) &&
-        (!qwen_continuous_batch_packed_metadata_enabled() ||
+        (!check_config.continuous_batch.packed_metadata ||
             metric("continuous_batching_packed_metadata_batches") >= 1.0) &&
-        (!qwen_continuous_batch_cuda_graph_enabled(model) ||
+        (!qwen_continuous_batch_cuda_graph_enabled(
+                model, check_config.continuous_batch) ||
              (metric("continuous_batching_cuda_graph_captures") >= 1.0 &&
              metric("continuous_batching_cuda_graph_replays") >= 2.0)) &&
-        (!qwen_continuous_paged_kv_enabled() ||
+        (!check_config.continuous_batch.paged_kv ||
             (metric("continuous_batching_paged_kv") == 1.0 &&
              metric("paged_kv_page_size") ==
                 static_cast<double>(QwenPagedKvArena::kPageSize) &&

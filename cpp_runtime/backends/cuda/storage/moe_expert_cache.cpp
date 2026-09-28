@@ -1,4 +1,4 @@
-#include "moe_expert_cache.h"
+#include "storage/moe_expert_cache.h"
 
 #include "cuda_execution.h"
 #include "moe.h"
@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <iostream>
 #include <list>
 #include <memory>
 #include <mutex>

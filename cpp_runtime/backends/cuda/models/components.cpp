@@ -1,5 +1,5 @@
 #include "components.h"
-#include "../engine/moe_expert_cache.h"
+#include "storage/moe_expert_cache.h"
 
 #include <iostream>
 #include <stdexcept>

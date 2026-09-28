@@ -1,6 +1,6 @@
 #include "cli.h"
 #include "token_generation.h"
-#include "engine/causal_lm_loader.h"
+#include "models/loader.h"
 #include "diagnostics/backend_checks.h"
 #include "diagnostics/model_checks.h"
 #include "diagnostics/runtime_checks.h"
@@ -9,7 +9,7 @@
 #include "registry.h"
 #include "transport.h"
 #include "cuda_execution.h"
-#include "moe_expert_cache.h"
+#include "storage/moe_expert_cache.h"
 #include "mfq/kernels/cuda/deepseek_v41.h"
 
 #include <algorithm>

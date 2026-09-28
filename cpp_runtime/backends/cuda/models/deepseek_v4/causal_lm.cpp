@@ -1,6 +1,6 @@
 #include "causal_lm.h"
 
-#include "../../engine/cuda_transformer.h"
+#include "models/transformer.h"
 
 namespace mfq::cuda::deepseek_v4 {
 

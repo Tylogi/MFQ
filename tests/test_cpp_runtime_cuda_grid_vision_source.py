@@ -70,7 +70,7 @@ def test_prepared_prompt_supports_mtp_and_safe_session_reuse() -> None:
     assert 'rope_parameters.value("mrope_interleaved", false)' in QWEN_CONFIG
     assert "interleaved_order" in CUDA_APP
     assert "hidden_forward_prepared_chunked" in CUDA_APP
-    assert "prepared_offset + offset" in CUDA_APP
+    assert "prepared_offset + chunk.offset" in CUDA_APP
     assert "model.last_logits_prepared(*prepared)" not in CUDA_APP
     assert "mtp.step_positioned(" in CUDA_APP
     assert "cache_pos, cache_pos + tokens, pos.options()" in CUDA_APP

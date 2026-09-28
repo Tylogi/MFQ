@@ -160,4 +160,3 @@ bool DecodeGraphCache::ensure_captured(
 
 int64_t decode_graph_bucket(int64_t planned_len, int64_t context_capacity);
 int64_t decode_graph_attention_parts(int64_t planned_len, int64_t max_parts);
-bool trace_cuda_graph();

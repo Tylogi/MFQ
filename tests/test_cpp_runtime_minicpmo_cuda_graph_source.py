@@ -15,13 +15,15 @@ BACKEND_CHECKS = (
     CUDA_ROOT / "diagnostics" / "backend_checks.cpp"
 ).read_text(encoding="utf-8")
 SOURCE = "\n".join(
-    (CUDA_ROOT / "engine" / name).read_text(encoding="utf-8")
-    for name in (
-        "causal_lm.h",
-        "cuda_transformer.h",
-        "cuda_execution.h",
-        "cuda_execution.cpp",
-        "decode_graph.h",
+    path.read_text(encoding="utf-8")
+    for path in (
+        CUDA_ROOT / "models" / "causal_lm.h",
+        CUDA_ROOT / "models" / "causal_lm.cpp",
+        CUDA_ROOT / "models" / "transformer.h",
+        CUDA_ROOT / "models" / "transformer.cpp",
+        CUDA_ROOT / "engine" / "cuda_execution.h",
+        CUDA_ROOT / "engine" / "cuda_execution.cpp",
+        CUDA_ROOT / "engine" / "decode_graph.h",
     )
 ) + "\n" + BACKEND_CHECKS + "\n" + CUDA_RUNTIME + "\n" + (
     CUDA_ROOT / "commands" / "diagnostics.cpp"
@@ -67,9 +69,12 @@ def test_minicpmo_native_runtime_keeps_cuda_graph_enabled() -> None:
 
 
 def test_static_decode_uses_dynamic_position_for_kv_writes() -> None:
-    static_forward = SOURCE.split(
-        "mfq_tensor_backend::Tensor hidden_forward_static", 1
-    )[1].split("mfq_tensor_backend::Tensor last_logits_static", 1)[0]
+    causal_lm = (CUDA_ROOT / "models" / "causal_lm.cpp").read_text(
+        encoding="utf-8"
+    )
+    static_forward = causal_lm.split(
+        "CausalLm<Backbone>::hidden_forward_static", 1
+    )[1].split("CausalLm<Backbone>::last_logits_static", 1)[0]
     assert "nullptr, pos, nullptr, 0" in static_forward
     assert "cache_positions_override.value(), primary" in SOURCE
     assert (

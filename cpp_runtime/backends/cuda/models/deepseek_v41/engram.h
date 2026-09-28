@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../engine/cuda_transformer.h"
+#include "models/transformer.h"
 #include "models/include/deepseek_v41.h"
 #include "mfe_expert_store.h"
 

@@ -1,8 +1,8 @@
 #include "cli.h"
-#include "engine/causal_lm_loader.h"
+#include "models/loader.h"
 #include "eval/kl.h"
 #include "cuda_execution.h"
-#include "moe_expert_cache.h"
+#include "storage/moe_expert_cache.h"
 
 #include <algorithm>
 #include <cstdlib>

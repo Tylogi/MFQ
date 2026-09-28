@@ -1,8 +1,9 @@
 #pragma once
 
 #include "continuous_batching.h"
+#include "cuda_model_plan.h"
+#include "engine/runtime_config.h"
 
-#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -13,7 +14,9 @@
 struct CudaExecutionContext;
 
 namespace mfq::cuda {
-struct Qwen35CausalLm;
+template <CudaBackbone Backbone>
+struct CausalLm;
+using Qwen35CausalLm = CausalLm<CudaBackbone::generic_qwen>;
 }
 
 namespace mfq::cuda::qwen35 {
@@ -29,10 +32,8 @@ public:
         Qwen35CausalLm& model,
         CudaExecutionContext& execution,
         std::mutex& model_mutex,
-        std::int32_t max_sequences,
-        std::int64_t prefill_chunk_size = 2048,
-        std::chrono::microseconds initial_batch_wait =
-            std::chrono::microseconds(1000));
+        CudaContinuousBatchConfig config,
+        mfq::engine::GenerationConfig generation);
     ~QwenBatchExecutor() override;
 
     QwenBatchExecutor(const QwenBatchExecutor&) = delete;
@@ -57,6 +58,8 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-int run_qwen_continuous_batching_check(Qwen35CausalLm& model);
+int run_qwen_continuous_batching_check(
+    Qwen35CausalLm& model,
+    const CudaRuntimeConfig& config);
 
 } // namespace mfq::cuda::qwen35

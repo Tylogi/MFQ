@@ -32,9 +32,13 @@ QWEN_LOADER = (
 QWEN_CONFIG = (
     ROOT / "cpp_runtime" / "models" / "qwen35.cpp"
 ).read_text(encoding="utf-8")
-CAUSAL_LM = (CUDA_ROOT / "engine" / "causal_lm.h").read_text(
-    encoding="utf-8"
+CAUSAL_LM = "\n".join(
+    (CUDA_ROOT / "models" / name).read_text(encoding="utf-8")
+    for name in ("causal_lm.h", "causal_lm.cpp")
 )
+RUNTIME_OPTIONS = (
+    CUDA_ROOT / "engine" / "options.cpp"
+).read_text(encoding="utf-8")
 
 
 def test_continuous_batching_is_an_explicit_server_mode():
@@ -55,7 +59,8 @@ def test_cuda_server_prefill_is_bounded_for_serial_mtp_and_batched_paths():
     assert "prefill_chunk_size_" in BATCHING
     assert "std::optional<QwenBatchState> prefill_state" in BATCHING
     assert "advance_prefills(incoming, contended)" in BATCHING
-    assert "request->prefill_offset += count" in BATCHING
+    assert "request->prefill_offset += chunk.count" in BATCHING
+    assert "next_prefill_chunk(" in BATCHING
     assert "active_.size() + prefilling_.size()" in BATCHING
     assert "continuous_batching_prefill_chunks" in BATCHING
     assert "continuous_batching_prefill_yields" in BATCHING
@@ -74,17 +79,16 @@ def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
     assert "publish_token" in COMMON_BATCHING
     assert "cancel_requested" in COMMON_BATCHING
     assert "retire_cancelled_requests" in BATCHING
-    assert "MFQ_CONTINUOUS_BATCH_GREEDY" in BATCHING
-    assert "environment == nullptr || std::atoi(environment) != 0" in BATCHING
+    assert "MFQ_CONTINUOUS_BATCH_GREEDY" in RUNTIME_OPTIONS
+    assert "std::getenv(" not in BATCHING
+    assert "config_.greedy" in BATCHING
     assert "continuous_batching_batched_greedy_batches" in BATCHING
     assert "sample_greedy_cuda(" in BATCHING
-    assert "MFQ_CONTINUOUS_BATCH_PACKED_METADATA" in BATCHING
-    assert BATCHING.count(
-        "environment == nullptr || std::atoi(environment) != 0"
-    ) >= 3
+    assert "MFQ_CONTINUOUS_BATCH_PACKED_METADATA" in RUNTIME_OPTIONS
+    assert "config_.packed_metadata" in BATCHING
     assert "continuous_batching_packed_metadata_batches" in BATCHING
     assert "ensure_decode_metadata_buffers" in BATCHING
-    assert "MFQ_CONTINUOUS_BATCH_CUDA_GRAPH" in BATCHING
+    assert "MFQ_CONTINUOUS_BATCH_CUDA_GRAPH" in RUNTIME_OPTIONS
     assert "QwenContinuousDecodeGraph" in BATCHING
     assert "continuous_batching_cuda_graph_captures" in BATCHING
     assert "continuous_batching_cuda_graph_replays" in BATCHING

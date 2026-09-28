@@ -1,12 +1,13 @@
 #include "cuda_engine.h"
 
-#include "causal_lm.h"
+#include "models/causal_lm.h"
 #include "cuda_execution.h"
 #include "decode_graph.h"
 #include "generation.h"
-#include "moe_expert_cache.h"
+#include "runtime_config.h"
+#include "storage/moe_expert_cache.h"
 #include "models/qwen35/batch_executor.h"
-#include "causal_lm_loader.h"
+#include "models/loader.h"
 #include "models/components.h"
 #include "mtp_metrics.h"
 #include "text_session_cache.h"
@@ -14,7 +15,6 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
-#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -36,34 +36,41 @@ struct CudaEngineState {
     CudaEngineState(
             Model loaded_model,
             RuntimeComponents<Model> loaded_components,
-            const CudaEngineOptions& options)
+            CudaRuntimeConfig config)
         : execution(*loaded_model.execution),
+          runtime_config(std::move(config)),
           model(std::move(loaded_model)),
           components(std::move(loaded_components)),
           language(&components.language(model)),
           decode_graph(language->max_position_embeddings()),
           session_cache(
+              runtime_config.session_cache,
+              runtime_config.prefix_cache,
               make_cuda_paged_prefix_cache(
                   *language->source,
                   language->max_position_embeddings(),
-                  language->supports_paged_text_session_state()),
+                  language->supports_paged_text_session_state(),
+                  runtime_config.prefix_cache),
               language->supports_text_session_state() &&
-                  options.continuous_batching == 0,
+                  runtime_config.continuous_batch.scheduling.max_sequences == 0,
               language->supports_text_session_state()
-                  ? (options.continuous_batching == 0 ? 0 : 2)
-                  : 1),
-          prefill_chunk_size(options.prefill_chunk_size) {
-        if (options.continuous_batching <= 0) return;
+                  ? (runtime_config.continuous_batch.scheduling.max_sequences == 0
+                        ? 0 : 2)
+                  : 1) {
+        if (runtime_config.continuous_batch.scheduling.max_sequences == 0) {
+            return;
+        }
         if constexpr (Backbone == CudaBackbone::generic_qwen) {
             auto qwen_executor = std::make_unique<
                 qwen35::QwenBatchExecutor>(
                     *language, execution, model_mutex,
-                    options.continuous_batching,
-                    options.prefill_chunk_size);
+                    runtime_config.continuous_batch,
+                    runtime_config.generation);
             std::cerr
                 << "continuous_batching enabled=1 max_sequences="
-                << options.continuous_batching
-                << " prefill_chunk_size=" << options.prefill_chunk_size
+                << runtime_config.continuous_batch.scheduling.max_sequences
+                << " prefill_chunk_size="
+                << runtime_config.generation.prefill_chunk_size
                 << " decode=target_only mtp=disabled"
                 << " moe="
                 << (qwen35::qwen_continuous_batch_has_moe(
@@ -84,6 +91,7 @@ struct CudaEngineState {
     }
 
     CudaExecutionContext& execution;
+    const CudaRuntimeConfig runtime_config;
     mfq_tensor_backend::NoGradGuard no_grad;
     Model model;
     RuntimeComponents<Model> components;
@@ -92,7 +100,6 @@ struct CudaEngineState {
     DecodeGraphCache decode_graph;
     TextSessionCache session_cache;
     std::unique_ptr<mfq::engine::ContinuousBatchExecutor> batch_executor;
-    int64_t prefill_chunk_size = 2048;
 };
 
 template <CudaBackbone Backbone>
@@ -135,14 +142,14 @@ template <CudaBackbone Backbone>
 CudaInferenceEngine make_cuda_inference_engine(
         CausalLmFor<Backbone> model,
         RuntimeComponents<CausalLmFor<Backbone>> components,
-        const CudaEngineOptions& options) {
+        CudaRuntimeConfig config) {
     using State = CudaEngineState<Backbone>;
     auto state = std::make_shared<State>(
-        std::move(model), std::move(components), options);
+        std::move(model), std::move(components), std::move(config));
 
     CudaInferenceEngine engine;
-    engine.max_concurrent_requests = static_cast<std::size_t>(
-        std::max(1, options.continuous_batching));
+    engine.max_concurrent_requests = std::max<std::size_t>(
+        1, state->runtime_config.continuous_batch.scheduling.max_sequences);
     // Both CUDA entry points use one internal generate request. Keep the
     // external callbacks while Metal and the legacy CUDA path remain intact.
     const auto generate_request = [state](
@@ -176,11 +183,11 @@ CudaInferenceEngine make_cuda_inference_engine(
         return mfq::cuda::internal::generate(
             *state->language, state->model_mutex,
             state->decode_graph, state->session_cache,
-            prompt, sampling, on_token, on_prefill,
+            state->runtime_config, prompt, sampling, on_token, on_prefill,
             cache_plan, token_constraint,
             state->batch_executor && media
                 ? nullptr : state->components.mtp.get(),
-            state->prefill_chunk_size, std::move(prepare), cancelled);
+            std::move(prepare), cancelled);
     };
     engine.generate = [generate_request](
             const std::vector<int64_t>& prompt,
@@ -268,6 +275,7 @@ CudaInferenceEngine make_cuda_inference_engine(
 
 CudaInferenceEngine load_cuda_engine(CudaEngineOptions options) {
     if (options.context_size == 0) options.context_size = 32768;
+    auto runtime_config = resolve_cuda_runtime_config(options);
     g_profiler.enabled = false;
     mfq_tensor_backend::NoGradGuard no_grad;
     return with_loaded_cuda_model(
@@ -275,7 +283,8 @@ CudaInferenceEngine load_cuda_engine(CudaEngineOptions options) {
         [&]<CudaBackbone Backbone>(auto& model,
                 auto& components, auto, auto) {
             return make_cuda_inference_engine<Backbone>(
-                std::move(model), std::move(components), options);
+                std::move(model), std::move(components),
+                std::move(runtime_config));
         });
 }
 

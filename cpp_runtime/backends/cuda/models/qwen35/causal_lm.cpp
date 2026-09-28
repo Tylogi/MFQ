@@ -1,9 +1,8 @@
 #include "causal_lm.h"
 #include "linear_attention.h"
 
-#include "../../engine/causal_lm.h"
-#include "../../engine/cuda_transformer.h"
-#include "../../engine/cuda_transformer.h"
+#include "../causal_lm.h"
+#include "models/transformer.h"
 
 namespace mfq::cuda::qwen35 {
 namespace {

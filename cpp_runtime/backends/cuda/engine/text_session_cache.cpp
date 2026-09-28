@@ -1,6 +1,7 @@
 #include "text_session_cache.h"
 
-#include "causal_lm.h"
+#include "runtime_config.h"
+#include "models/causal_lm.h"
 #include "mtp.h"
 #include "mfq_paged_prefix_cache.h"
 #include "paged_session_bindings.h"
@@ -8,74 +9,12 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
 
 namespace mfq::cuda::internal {
-
-static uint64_t cuda_cache_environment_bytes(
-        const char * name, uint64_t fallback) {
-    const char * value = std::getenv(name);
-    if (value == nullptr || value[0] == '\0') return fallback;
-    char * end = nullptr;
-    const auto parsed = std::strtoull(value, &end, 10);
-    if (end == value || *end != '\0') {
-        throw std::runtime_error(std::string("invalid ") + name);
-    }
-    return parsed;
-}
-
-static mfq::engine::SessionSnapshotCacheConfig
-cuda_session_snapshot_config() {
-    mfq::engine::SessionSnapshotCacheConfig config;
-    if (const char* value = std::getenv("MFQ_RUNTIME_MAX_KV_SESSIONS")) {
-        config.max_sessions = static_cast<std::size_t>(
-            std::strtoull(value, nullptr, 10));
-    }
-    if (const char* value = std::getenv(
-            "MFQ_RUNTIME_MAX_KV_SNAPSHOTS_PER_SESSION")) {
-        config.max_snapshots_per_session = static_cast<std::size_t>(
-            std::strtoull(value, nullptr, 10));
-    }
-    if (const char* value = std::getenv("MFQ_RUNTIME_KV_SESSION_BYTES")) {
-        config.max_bytes = static_cast<std::size_t>(
-            std::strtoull(value, nullptr, 10));
-    }
-    return config;
-}
-
-static std::filesystem::path default_cuda_prefix_cache_directory() {
-    if (const char * configured =
-            std::getenv("MFQ_RUNTIME_PREFIX_CACHE_DIR")) {
-        if (configured[0] != '\0') return configured;
-    }
-#ifdef _WIN32
-    if (const char * local = std::getenv("LOCALAPPDATA")) {
-        if (local[0] != '\0') {
-            return std::filesystem::path(local) /
-                "TyloQuant" / "MFQ" / "prefix-cache";
-        }
-    }
-#else
-    if (const char * xdg = std::getenv("XDG_CACHE_HOME")) {
-        if (xdg[0] != '\0') {
-            return std::filesystem::path(xdg) /
-                "tyloquant" / "mfq" / "prefix-cache";
-        }
-    }
-    if (const char * home = std::getenv("HOME")) {
-        if (home[0] != '\0') {
-            return std::filesystem::path(home) / ".cache" /
-                "tyloquant" / "mfq" / "prefix-cache";
-        }
-    }
-#endif
-    return std::filesystem::temp_directory_path() /
-        "tyloquant-mfq-prefix-cache";
-}
 
 static std::string cuda_prefix_cache_compatibility_key(
         const mfq::ModelSource& source,
@@ -116,69 +55,46 @@ std::shared_ptr<mfq::cache::PagedPrefixCache>
 make_cuda_paged_prefix_cache(
         const mfq::ModelSource& source,
         int64_t max_position_embeddings,
-        bool supports_paged_text_session_state) {
+        bool supports_paged_text_session_state,
+        const CudaPrefixCacheConfig& config) {
     const auto format = source.metadata().find("source.format");
     // ponytail: HF source fingerprints exclude config sidecars for now.
-    if ((format != source.metadata().end() &&
-         format->second == "hf-safetensors") ||
-        !supports_paged_text_session_state) {
+    if (!config.enabled ||
+            (format != source.metadata().end() &&
+             format->second == "hf-safetensors") ||
+            !supports_paged_text_session_state) {
         return {};
     }
-    if (const char * disabled =
-            std::getenv("MFQ_RUNTIME_DISABLE_PREFIX_CACHE")) {
-        if (disabled[0] == '1') return {};
-    }
-    const auto block_size = cuda_cache_environment_bytes(
-        "MFQ_RUNTIME_PREFIX_CACHE_BLOCK_TOKENS", 256);
-    if (block_size == 0 || block_size > 65536) {
-        throw std::runtime_error(
-            "MFQ_RUNTIME_PREFIX_CACHE_BLOCK_TOKENS must be in [1, 65536]");
-    }
-    mfq::cache::PagedPrefixCacheConfig config;
-    config.cache_dir = default_cuda_prefix_cache_directory();
-    config.compatibility_key =
-        cuda_prefix_cache_compatibility_key(
-            source, max_position_embeddings);
-    config.block_size_tokens = static_cast<size_t>(block_size);
-    config.max_disk_bytes = cuda_cache_environment_bytes(
-        "MFQ_RUNTIME_PREFIX_CACHE_DISK_BYTES",
-        100ULL * 1024ULL * 1024ULL * 1024ULL);
-    config.max_hot_bytes = cuda_cache_environment_bytes(
-        "MFQ_RUNTIME_PREFIX_CACHE_HOT_BYTES",
-        2ULL * 1024ULL * 1024ULL * 1024ULL);
-    config.max_pending_writes = static_cast<size_t>(
-        cuda_cache_environment_bytes(
-            "MFQ_RUNTIME_PREFIX_CACHE_PENDING_WRITES", 64));
-    config.max_pending_bytes = cuda_cache_environment_bytes(
-        "MFQ_RUNTIME_PREFIX_CACHE_PENDING_BYTES",
-        512ULL * 1024ULL * 1024ULL);
+    mfq::cache::PagedPrefixCacheConfig cache;
+    cache.cache_dir = config.directory;
+    cache.compatibility_key = cuda_prefix_cache_compatibility_key(
+        source, max_position_embeddings);
+    cache.block_size_tokens = static_cast<size_t>(
+        config.block_tokens);
+    cache.max_disk_bytes = config.disk_bytes;
+    cache.max_hot_bytes = config.hot_bytes;
+    cache.max_pending_writes = config.pending_writes;
+    cache.max_pending_bytes = config.pending_bytes;
     return std::make_shared<mfq::cache::PagedPrefixCache>(
-        std::move(config));
+        std::move(cache));
 }
 
 struct TextSessionCache::Impl {
 public:
     explicit Impl(
+            const CudaSessionCacheConfig& session_config,
+            const CudaPrefixCacheConfig& prefix_config,
             std::shared_ptr<mfq::cache::PagedPrefixCache> paged_cache = {},
             bool supported = true,
             int disabled_reason = 0)
-        : snapshots_(cuda_session_snapshot_config()),
+        : snapshots_(session_config.snapshots),
           paged_cache_(std::move(paged_cache)),
           paged_bindings_(paged_cache_, snapshots_.max_sessions()),
+          paged_disk_budget_(paged_cache_ ? prefix_config.disk_bytes : 0),
+          paged_hot_budget_(paged_cache_ ? prefix_config.hot_bytes : 0),
+          trace_(session_config.trace),
           supported_(supported),
-          disabled_reason_(disabled_reason) {
-        const char * trace =
-            std::getenv("MFQ_RUNTIME_TRACE_SESSION_CACHE");
-        trace_ = trace != nullptr && trace[0] == '1';
-        if (paged_cache_) {
-            paged_disk_budget_ = cuda_cache_environment_bytes(
-                "MFQ_RUNTIME_PREFIX_CACHE_DISK_BYTES",
-                100ULL * 1024ULL * 1024ULL * 1024ULL);
-            paged_hot_budget_ = cuda_cache_environment_bytes(
-                "MFQ_RUNTIME_PREFIX_CACHE_HOT_BYTES",
-                2ULL * 1024ULL * 1024ULL * 1024ULL);
-        }
-    }
+          disabled_reason_(disabled_reason) {}
 
     bool persistent_prefix_enabled() const noexcept {
         return static_cast<bool>(paged_cache_);
@@ -521,11 +437,14 @@ private:
 
 
 TextSessionCache::TextSessionCache(
+        const CudaSessionCacheConfig& session_config,
+        const CudaPrefixCacheConfig& prefix_config,
         std::shared_ptr<mfq::cache::PagedPrefixCache> paged_cache,
         bool supported,
         int disabled_reason)
     : impl_(std::make_unique<Impl>(
-          std::move(paged_cache), supported, disabled_reason)) {}
+          session_config, prefix_config, std::move(paged_cache),
+          supported, disabled_reason)) {}
 
 TextSessionCache::~TextSessionCache() = default;
 

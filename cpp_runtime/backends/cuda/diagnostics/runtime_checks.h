@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/causal_lm.h"
+#include "models/causal_lm.h"
 #include "engine/generation.h"
 #include "engine/mtp.h"
 #include "diagnostics/flash_next_mtp.h"

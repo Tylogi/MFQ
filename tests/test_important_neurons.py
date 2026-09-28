@@ -158,7 +158,7 @@ def test_important_neuron_asset_is_deterministic() -> None:
 def test_runtime_parallelizes_in_branches_only_for_decode() -> None:
     source = (
         Path(__file__).parents[1]
-        / "cpp_runtime" / "backends" / "cuda" / "engine" / "cuda_transformer.h"
+        / "cpp_runtime" / "backends" / "cuda" / "models" / "transformer.cpp"
     ).read_text(encoding="utf-8")
     branch = source[
         source.index(

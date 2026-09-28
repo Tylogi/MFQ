@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../../engine/cuda_transformer.h"
-#include "../../engine/moe_expert_cache.h"
+#include "models/transformer.h"
+#include "storage/moe_expert_cache.h"
 #include "models/include/glm5_next.h"
 #include "runtime.h"
 

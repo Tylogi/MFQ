@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../engine/causal_lm.h"
+#include "causal_lm.h"
 #include "../engine/mtp.h"
 #include "grid_vision_component.h"
 #include "mfq/runtime.h"

@@ -2,7 +2,6 @@
 #include "cuda_execution.h"
 
 #include <algorithm>
-#include <cstdlib>
 
 std::vector<MfqCudaStream> make_cuda_graph_compute_streams(
         const MfqCudaStream& primary_stream) {
@@ -119,9 +118,4 @@ int64_t decode_graph_attention_parts(
     const int64_t parts = planned_len >= 192
         ? (planned_len + 127) / 128 : 1;
     return std::min(parts, max_parts);
-}
-
-bool trace_cuda_graph() {
-    const char * value = std::getenv("MFQ_RUNTIME_TRACE_CUDA_GRAPH");
-    return value != nullptr && std::atoi(value) != 0;
 }

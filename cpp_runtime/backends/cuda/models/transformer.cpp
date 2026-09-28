@@ -1,119 +1,10 @@
-#pragma once
+#include "models/transformer.h"
 
-#include "quant_linear.h"
-#include "models/include/model_config.h"
-#include "cuda_execution.h"
-#include "moe_expert_cache.h"
-#include "mfq_cuda_ops.h"
-#include "mfq_cuda_paged_kv.h"
-
-#include <cuda_runtime_api.h>
-
-#include <algorithm>
-#include <array>
-#include <cmath>
-#include <cstdint>
-#include <cstdlib>
-#include <functional>
-#include <iostream>
-#include <memory>
-#include <optional>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
-
-using mfq_tensor_backend::indexing::Slice;
-
-std::string layer_name(const std::string & templ, int i);
-
-mfq_tensor_backend::Tensor qwen_rms_norm(
-    mfq_tensor_backend::Tensor x,
-    mfq_tensor_backend::Tensor weight,
-    double eps,
-    double weight_offset);
-
-mfq_tensor_backend::Tensor qwen_rms_norm_bf16(
-    mfq_tensor_backend::Tensor x,
-    mfq_tensor_backend::Tensor weight,
-    double eps,
-    double weight_offset);
-
-mfq_tensor_backend::Tensor gemma_rms_norm_f16(
-    mfq_tensor_backend::Tensor x,
-    mfq_tensor_backend::Tensor weight,
-    double eps,
-    double weight_offset);
-
-struct RopeCache {
-    mfq_tensor_backend::Tensor cos;
-    mfq_tensor_backend::Tensor sin;
-    mfq_tensor_backend::Tensor sections;
-    mfq_tensor_backend::Tensor empty_sections;
-    mfq_tensor_backend::Tensor interleaved_order;
-    mfq_tensor_backend::Tensor interleaved_inverse;
-    int64_t rotary_dim = 0;
-
-    RopeCache() = default;
-    RopeCache(
-        int64_t max_positions,
-        int64_t dim,
-        double base,
-        int64_t frequency_dim = 0,
-        int64_t active_pairs = -1,
-        mfq_tensor_backend::Device device = mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA),
-        bool official_reciprocal_frequencies = false) : rotary_dim(dim) {
-        int64_t half = rotary_dim / 2;
-        const int64_t denominator = frequency_dim > 0 ? frequency_dim : rotary_dim;
-        if (active_pairs < 0) active_pairs = half;
-        if (active_pairs > half) {
-            throw std::runtime_error("RoPE active pair count exceeds rotary dimension");
-        }
-        auto opts = mfq_tensor_backend::TensorOptions().device(device).dtype(mfq_tensor_backend::kFloat32);
-        auto pos = mfq_tensor_backend::arange(max_positions, opts);
-        auto ar = mfq_tensor_backend::arange(0, rotary_dim, 2, opts);
-        auto freq = mfq_tensor_backend::pow(
-            mfq_tensor_backend::full({half}, base, opts),
-            -ar / (double)denominator);
-        if (official_reciprocal_frequencies) {
-            auto cpu_opts = mfq_tensor_backend::TensorOptions()
-                .device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kFloat32);
-#ifdef MFQ_NATIVE_CUDA_RUNTIME
-            std::vector<float> official_values(static_cast<size_t>(half));
-            const float official_base = static_cast<float>(base);
-            const float official_denominator = static_cast<float>(denominator);
-            for (int64_t index = 0; index < half; ++index) {
-                const float exponent =
-                    static_cast<float>(index * 2) / official_denominator;
-                official_values[static_cast<size_t>(index)] =
-                    1.0f / std::pow(official_base, exponent);
-            }
-            auto official_freq = mfq_tensor_backend::tensor(
-                official_values, cpu_opts);
-#else
-            auto exponent = mfq_tensor_backend::arange(0, rotary_dim, 2, cpu_opts) /
-                (double)denominator;
-            auto official_freq = mfq_tensor_backend::reciprocal(
-                mfq_tensor_backend::pow(mfq_tensor_backend::full({half}, base, cpu_opts), exponent));
-#endif
-            freq.copy_(official_freq);
-        }
-        if (active_pairs < half) {
-            auto pair = mfq_tensor_backend::arange(half, opts);
-            freq = mfq_tensor_backend::where(pair < active_pairs, freq, mfq_tensor_backend::zeros_like(freq));
-        }
-        auto ang = pos.unsqueeze(1) * freq.unsqueeze(0);
-        cos = mfq_tensor_backend::cos(ang).contiguous();
-        sin = mfq_tensor_backend::sin(ang).contiguous();
-        sections = mfq_tensor_backend::empty({0}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCPU));
-        empty_sections = sections;
-    }
-    void configure_mrope(
-            const std::vector<int64_t>& configured_sections,
-            bool interleaved,
-            int64_t configured_rotary_dim,
-            mfq_tensor_backend::Device device) {
+void RopeCache::configure_mrope(
+        const std::vector<int64_t>& configured_sections,
+        bool interleaved,
+        int64_t configured_rotary_dim,
+        mfq_tensor_backend::Device device) {
         if (configured_sections.empty()) return;
         auto execution_sections = configured_sections;
         if (interleaved) {
@@ -155,10 +46,11 @@ struct RopeCache {
                 .dtype(mfq_tensor_backend::kInt64)
                 .device(mfq_tensor_backend::kCPU));
     }
-    mfq_tensor_backend::Tensor apply(
-            mfq_tensor_backend::Tensor x,
-            mfq_tensor_backend::Tensor pos,
-            bool grid_mrope_positions = false) const {
+
+mfq_tensor_backend::Tensor RopeCache::apply(
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor pos,
+        bool grid_mrope_positions) const {
         if (!x.is_cuda()) {
             MFQ_RUNTIME_CHECK(
                 !cos.is_cuda() && !sin.is_cuda(),
@@ -250,7 +142,7 @@ struct RopeCache {
         return output;
     }
 
-    mfq_tensor_backend::Tensor apply_bf16(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos) const {
+mfq_tensor_backend::Tensor RopeCache::apply_bf16(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos) const {
         MFQ_RUNTIME_CHECK(
             sections.numel() == 0,
             "Qwen3 BF16 RoPE does not support multi-axis sections");
@@ -296,42 +188,8 @@ struct RopeCache {
             second * selected_cos + first * selected_sin);
         return output.contiguous();
     }
-};
 
-struct FFN {
-    QuantLinearGroup gate_up;
-    QuantLinear down;
-    std::unique_ptr<FFN> important_neurons;
-    mutable std::shared_ptr<CudaIndependentBranchExecutor>
-        important_neuron_executor =
-            std::make_shared<CudaIndependentBranchExecutor>();
-    bool geglu = false;
-    bool is_moe = false;
-    bool moe_split_gate_up = false;
-    MfeWeight moe_gate_up;
-    MfeWeight moe_gate;
-    MfeWeight moe_up;
-    MfeWeight moe_down;
-    std::shared_ptr<MixedMoeRuntime> cpu_moe_gate_up;
-    std::shared_ptr<MixedMoeRuntime> cpu_moe_gate;
-    std::shared_ptr<MixedMoeRuntime> cpu_moe_up;
-    std::shared_ptr<MixedMoeRuntime> cpu_moe_down;
-    mfq_tensor_backend::Tensor moe_router;
-    mfq_tensor_backend::Tensor moe_shared_gate;
-    mfq_tensor_backend::Tensor moe_router_bias;
-    mfq_tensor_backend::Tensor moe_hash_ids;
-    std::unique_ptr<FFN> shared;
-    int moe_top_k = 0;
-    bool moe_use_sigmoid = false;
-    bool moe_use_sqrt_softplus = false;
-    bool moe_normalize = false;
-    bool moe_delayed_softmax = true;
-    bool moe_shared_ungated = false;
-    double moe_router_scale = 1.0;
-    double swiglu_limit = 0.0;
-    int moe_layer = -1;
-
-    bool uses_moe_expert_cache() const {
+bool FFN::uses_moe_expert_cache() const {
         if (!is_moe) return false;
         if (moe_split_gate_up) {
             return moe_gate.cached_source ||
@@ -341,7 +199,7 @@ struct FFN {
         return moe_gate_up.cached_source || moe_down.cached_source;
     }
 
-    bool tensor_parallel_dense_compatible() const {
+bool FFN::tensor_parallel_dense_compatible() const {
         if (is_moe ||
             gate_up.layers.size() != 2 ||
             !down.tensor_parallel() ||
@@ -388,8 +246,8 @@ struct FFN {
         return true;
     }
 
-    mfq_tensor_backend::Tensor forward_tensor_parallel_dense(
-            mfq_tensor_backend::Tensor xh) const {
+mfq_tensor_backend::Tensor FFN::forward_tensor_parallel_dense(
+        mfq_tensor_backend::Tensor xh) const {
         auto shape = xh.sizes().vec();
         auto flat = xh.reshape(
             {-1, xh.size(-1)});
@@ -455,7 +313,7 @@ struct FFN {
         return output.reshape(shape);
     }
 
-    bool expert_parallel_moe_compatible() const {
+bool FFN::expert_parallel_moe_compatible() const {
         if (!is_moe || moe_split_gate_up ||
                 moe_gate_up.expert_parallel_shards.size() !=
                     moe_down.expert_parallel_shards.size() ||
@@ -476,10 +334,10 @@ struct FFN {
         return true;
     }
 
-    mfq_tensor_backend::Tensor forward_expert_parallel_moe(
-            mfq_tensor_backend::Tensor x,
-            const MoeRoutePlan & route,
-            mfq_tensor_backend::Tensor route_weights) const {
+mfq_tensor_backend::Tensor FFN::forward_expert_parallel_moe(
+        mfq_tensor_backend::Tensor x,
+        const MoeRoutePlan & route,
+        mfq_tensor_backend::Tensor route_weights) const {
         const size_t shard_count =
             moe_gate_up.expert_parallel_shards.size();
         std::vector<mfq_tensor_backend::Tensor> routed_partials(
@@ -579,8 +437,8 @@ struct FFN {
             std::move(routed_partials));
     }
 
-    mfq_tensor_backend::Tensor forward_dense_f32_down_kld(
-            mfq_tensor_backend::Tensor xh) const {
+mfq_tensor_backend::Tensor FFN::forward_dense_f32_down_kld(
+        mfq_tensor_backend::Tensor xh) const {
         MFQ_RUNTIME_CHECK(
             !is_moe && !tensor_parallel_dense_compatible() &&
             !geglu && swiglu_limit <= 0.0,
@@ -596,10 +454,10 @@ struct FFN {
             });
     }
 
-    mfq_tensor_backend::Tensor forward_impl(
-        mfq_tensor_backend::Tensor x,
-        MfqOptional<mfq_tensor_backend::Tensor> input_ids,
-        bool allow_important_neurons) const {
+mfq_tensor_backend::Tensor FFN::forward_impl(
+    mfq_tensor_backend::Tensor x,
+    MfqOptional<mfq_tensor_backend::Tensor> input_ids,
+    bool allow_important_neurons) const {
         mfq_tensor_backend::Tensor xh;
         if (x.scalar_type() == mfq_tensor_backend::kFloat16) {
             xh = x;
@@ -1091,9 +949,9 @@ struct FFN {
         return g_profiler.measure("ffn.down", [&]() { return down.forward_input_mul(parts[1], parts[0], 2); });
     }
 
-    bool can_forward_fused_residual(
-        const mfq_tensor_backend::Tensor & x,
-        const mfq_tensor_backend::Tensor & residual) const {
+bool FFN::can_forward_fused_residual(
+    const mfq_tensor_backend::Tensor & x,
+    const mfq_tensor_backend::Tensor & residual) const {
         const char * fp32_residual_env =
             std::getenv("MFQ_DIAGNOSTIC_FP32_RESIDUAL");
         if (fp32_residual_env != nullptr && fp32_residual_env[0] == '1') {
@@ -1125,9 +983,9 @@ struct FFN {
             down.nvq.w.kernel_format);
     }
 
-    mfq_tensor_backend::Tensor forward_fused_residual(
-        mfq_tensor_backend::Tensor x,
-        mfq_tensor_backend::Tensor residual) const {
+mfq_tensor_backend::Tensor FFN::forward_fused_residual(
+    mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor residual) const {
         MFQ_RUNTIME_CHECK(
             can_forward_fused_residual(x, residual),
             "FFN fused residual requires a compatible single-token NVQ FFN");
@@ -1140,85 +998,17 @@ struct FFN {
         return output.reshape(shape);
     }
 
-    mfq_tensor_backend::Tensor forward(
-        mfq_tensor_backend::Tensor x,
-        MfqOptional<mfq_tensor_backend::Tensor> input_ids =
-            mfq_nullopt) const {
+mfq_tensor_backend::Tensor FFN::forward(
+    mfq_tensor_backend::Tensor x,
+    MfqOptional<mfq_tensor_backend::Tensor> input_ids) const {
         return forward_impl(
             std::move(x), input_ids, true);
     }
-};
 
-struct KVCache {
-    mfq_tensor_backend::Tensor k;
-    mfq_tensor_backend::Tensor v;
-    mfq_tensor_backend::Tensor k_chunk_ptrs;
-    mfq_tensor_backend::Tensor v_chunk_ptrs;
-    mfq_tensor_backend::Tensor page_table;
-    bool ring = false;
-    int64_t paged_batch = 0;
-    int64_t paged_heads = 0;
-    int64_t paged_head_dim = 0;
-    int64_t page_size = 0;
-    int64_t pages_per_chunk = 0;
-    mfq_tensor_backend::ScalarType paged_dtype =
-        mfq_tensor_backend::kFloat16;
-    KVCache() = default;
-    KVCache(
-            int64_t B,
-            int64_t H,
-            int64_t max_seq,
-            int64_t D,
-            bool use_ring = false,
-            mfq_tensor_backend::Device device = mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA),
-            mfq_tensor_backend::ScalarType dtype = mfq_tensor_backend::kFloat16)
-        : ring(use_ring) {
-        auto opts = mfq_tensor_backend::TensorOptions().device(device).dtype(dtype);
-        k = mfq_tensor_backend::zeros({B, H, max_seq, D}, opts);
-        v = mfq_tensor_backend::zeros({B, H, max_seq, D}, opts);
-    }
-
-    static KVCache paged_view(
-            mfq_tensor_backend::Tensor key_chunks,
-            mfq_tensor_backend::Tensor value_chunks,
-            mfq_tensor_backend::Tensor pages,
-            int64_t batch, int64_t heads, int64_t head_dim,
-            int64_t tokens_per_page, int64_t chunk_pages,
-            mfq_tensor_backend::ScalarType dtype) {
-        KVCache result;
-        result.k_chunk_ptrs = std::move(key_chunks);
-        result.v_chunk_ptrs = std::move(value_chunks);
-        result.page_table = std::move(pages);
-        result.paged_batch = batch;
-        result.paged_heads = heads;
-        result.paged_head_dim = head_dim;
-        result.page_size = tokens_per_page;
-        result.pages_per_chunk = chunk_pages;
-        result.paged_dtype = dtype;
-        return result;
-    }
-
-    bool is_paged() const noexcept { return page_size > 0; }
-
-    bool defined() const noexcept {
-        return is_paged()
-            ? k_chunk_ptrs.defined() && v_chunk_ptrs.defined() &&
-                page_table.defined()
-            : k.defined() && v.defined();
-    }
-
-    int64_t batch_size() const noexcept {
-        return is_paged() ? paged_batch : (k.defined() ? k.size(0) : 0);
-    }
-
-    mfq_tensor_backend::ScalarType scalar_type() const {
-        return is_paged() ? paged_dtype : k.scalar_type();
-    }
-
-    std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> append(
-            mfq_tensor_backend::Tensor kk, mfq_tensor_backend::Tensor vv, mfq_tensor_backend::Tensor pos,
-            int64_t start_pos, int64_t end_pos,
-            bool contiguous_prefill_prefix = false) {
+std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> KVCache::append(
+        mfq_tensor_backend::Tensor kk, mfq_tensor_backend::Tensor vv, mfq_tensor_backend::Tensor pos,
+        int64_t start_pos, int64_t end_pos,
+        bool contiguous_prefill_prefix) {
         (void)start_pos;
         auto kh = kk.to(scalar_type()).contiguous();
         auto vh = vv.to(scalar_type()).contiguous();
@@ -1296,96 +1086,8 @@ struct KVCache {
         return {k.index({Slice(), Slice(), Slice(0, end_pos), Slice()}),
                 v.index({Slice(), Slice(), Slice(0, end_pos), Slice()})};
     }
-};
 
-struct Block {
-    struct Context {
-        mfq_tensor_backend::Tensor token_ids;
-        mfq_tensor_backend::Tensor positions;
-        mfq_tensor_backend::Tensor full_positions;
-        int64_t cache_position = 0;
-        int64_t confirmed_prefix = 0;
-        int64_t planned_kv_length = 0;
-        int64_t decode_attention_parts = 0;
-        MfqOptional<mfq_tensor_backend::Tensor> sequence_lengths = mfq_nullopt;
-        MfqOptional<mfq_tensor_backend::Tensor> cache_positions = mfq_nullopt;
-        MfqOptional<mfq_tensor_backend::Tensor> attention_mask = mfq_nullopt;
-    };
-    int cuda_device = 0;
-    bool cpu_offloaded = false;
-    virtual ~Block() = default;
-    virtual void reset(int64_t B) = 0;
-    virtual void set_token_ids(const mfq_tensor_backend::Tensor &) {}
-    virtual bool supports_speculation() const noexcept { return false; }
-    virtual void begin_speculative(int64_t) {}
-    virtual void commit_speculative() {}
-    virtual void rollback_speculative(int64_t) {}
-    virtual mfq_tensor_backend::Tensor forward(
-            mfq_tensor_backend::Tensor x,
-            mfq_tensor_backend::Tensor pos,
-            int64_t cache_pos,
-            const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
-            const RopeCache & rope,
-            const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
-            const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) = 0;
-    virtual mfq_tensor_backend::Tensor forward_context(
-            mfq_tensor_backend::Tensor x,
-            const Context & context,
-            const RopeCache & rope) {
-        MFQ_RUNTIME_CHECK(
-            context.confirmed_prefix == 0 || supports_speculation(),
-            "block does not support speculative verification");
-        return forward(
-            std::move(x), context.positions, context.cache_position,
-            context.sequence_lengths, rope, context.cache_positions,
-            context.attention_mask);
-    }
-};
-
-struct FullBlock : Block {
-    int layer = -1;
-    bool gemma4 = false;
-    bool gemma4_moe = false;
-    bool sliding = false;
-    bool value_equals_key = false;
-    int64_t attention_heads = 0;
-    int64_t kv_heads = 0;
-    int64_t attention_head_dim = 0;
-    int64_t attention_rotary_dim = 0;
-    int64_t attention_window = 0;
-    int64_t max_position_embeddings = 0;
-    double attention_scale = 0.0;
-    double rms_norm_eps = 1e-6;
-    double norm_weight_offset = 1.0;
-    bool official_bf16 = false;
-    RopeCache attention_rope;
-
-    bool supports_speculation() const noexcept override { return !sliding; }
-    mfq_tensor_backend::Tensor attn_norm, ffn_norm, q_norm, k_norm;
-    mfq_tensor_backend::Tensor v_norm, attn_post_norm;
-    mfq_tensor_backend::Tensor ffn_post_norm, ffn_post_norm_1, ffn_pre_norm_2, ffn_post_norm_2;
-    mfq_tensor_backend::Tensor layer_scale;
-    QuantLinearGroup qkv;
-    bool attention_output_gate = false;
-    bool split_q_kv_projections = false;
-    QuantLinear q_projection;
-    QuantLinear k_projection;
-    QuantLinear v_projection;
-    QuantLinear o;
-    FFN ffn;
-    MfeWeight gemma_moe_gate_up;
-    MfeWeight gemma_moe_down;
-    mfq_tensor_backend::Tensor gemma_router;
-    mfq_tensor_backend::Tensor gemma_router_norm_scale;
-    mfq_tensor_backend::Tensor gemma_expert_scale;
-    int gemma_top_k = 0;
-    KVCache cache;
-    mfq_tensor_backend::Tensor decode_partial_o, decode_partial_m, decode_partial_l;
-    mfq_tensor_backend::Tensor decode_mma_mask, decode_mma_kv_max, decode_mma_meta;
-
-    static constexpr int64_t kDecodeAttentionMaxParts = 16;
-
-    void reset(int64_t B) override {
+void FullBlock::reset(int64_t B) {
         if (cache.defined() && cache.batch_size() == B) return;
         cache = KVCache();
         decode_partial_o = mfq_tensor_backend::Tensor();
@@ -1396,23 +1098,23 @@ struct FullBlock : Block {
         decode_mma_meta = mfq_tensor_backend::Tensor();
     }
 
-    mfq_tensor_backend::Tensor forward(
-            mfq_tensor_backend::Tensor x,
-            mfq_tensor_backend::Tensor pos,
-            int64_t cache_pos,
-            const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
-            const RopeCache & rope,
-            const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
-            const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) override {
+mfq_tensor_backend::Tensor FullBlock::forward(
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor pos,
+        int64_t cache_pos,
+        const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
+        const RopeCache & rope,
+        const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions,
+        const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask) {
         return forward_impl(
             std::move(x), std::move(pos), cache_pos, seq_len, rope,
             cache_positions, attention_mask, 0, 0);
     }
 
-    mfq_tensor_backend::Tensor forward_context(
-            mfq_tensor_backend::Tensor x,
-            const Context& context,
-            const RopeCache& rope) override {
+mfq_tensor_backend::Tensor FullBlock::forward_context(
+        mfq_tensor_backend::Tensor x,
+        const Context& context,
+        const RopeCache& rope) {
         MFQ_RUNTIME_CHECK(
             context.confirmed_prefix == 0 || supports_speculation(),
             "block does not support speculative verification");
@@ -1423,16 +1125,16 @@ struct FullBlock : Block {
             context.decode_attention_parts);
     }
 
-    mfq_tensor_backend::Tensor forward_impl(
-            mfq_tensor_backend::Tensor x,
-            mfq_tensor_backend::Tensor pos,
-            int64_t cache_pos,
-            const MfqOptional<mfq_tensor_backend::Tensor>& seq_len,
-            const RopeCache& rope,
-            const MfqOptional<mfq_tensor_backend::Tensor>& cache_positions,
-            const MfqOptional<mfq_tensor_backend::Tensor>& attention_mask,
-            int64_t planned_kv_length,
-            int64_t decode_attention_parts) {
+mfq_tensor_backend::Tensor FullBlock::forward_impl(
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor pos,
+        int64_t cache_pos,
+        const MfqOptional<mfq_tensor_backend::Tensor>& seq_len,
+        const RopeCache& rope,
+        const MfqOptional<mfq_tensor_backend::Tensor>& cache_positions,
+        const MfqOptional<mfq_tensor_backend::Tensor>& attention_mask,
+        int64_t planned_kv_length,
+        int64_t decode_attention_parts) {
         auto& execution = cuda_execution_context();
         int64_t B = x.size(0), T = x.size(1), H = x.size(2);
         auto trace_qwen_stage = [&](const char* name, const mfq_tensor_backend::Tensor& value,
@@ -2350,24 +2052,78 @@ struct FullBlock : Block {
         });
         return output;
     }
-};
 
-void prepare_ffn_workspaces(FFN & f);
+std::string layer_name(const std::string & templ, int i) {
+    std::string s = templ;
+    auto p = s.find("{i}");
+    if (p != std::string::npos) s.replace(p, 3, std::to_string(i));
+    return s;
+}
 
-FFN load_ffn(
-    const mfq::ModelSource& source,
-    const mfq::models::ModelConfig& config,
-    int layer,
-    bool minicpmo45 = false,
-    std::string_view tensor_root = "model");
+mfq_tensor_backend::Tensor qwen_rms_norm(
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor weight,
+        double eps,
+        double weight_offset) {
+    if (!x.is_cuda()) {
+        auto xf = x.contiguous().to(mfq_tensor_backend::kFloat32);
+        auto wf = weight.contiguous().to(mfq_tensor_backend::kFloat32);
+        if (weight_offset != 0.0) wf = wf + weight_offset;
+        auto inverse = mfq_tensor_backend::rsqrt(
+            xf.square().mean(-1, true) + eps);
+        return (xf * inverse * wf).contiguous();
+    }
+    return rms_norm_offset_cuda(x, weight, eps, weight_offset);
+}
 
-std::unique_ptr<Block> load_transformer_block(
-    const mfq::ModelSource& source,
-    const mfq::models::ModelConfig& config,
-    int layer,
-    const std::string& type,
-    bool minicpmo45 = false,
-    std::string_view tensor_root = "model");
+mfq_tensor_backend::Tensor qwen_rms_norm_bf16(
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor weight,
+        double eps,
+        double weight_offset) {
+    auto input = x.contiguous().to(mfq_tensor_backend::kBFloat16);
+    const char * fused_env = std::getenv("MFQ_MINICPM_FUSED_BF16_RMSNORM");
+    if (input.is_cuda() &&
+            (fused_env == nullptr || fused_env[0] != '0')) {
+        return qwen_rms_norm_bf16_cuda(
+            input, weight.contiguous(), eps, weight_offset);
+    }
+    auto xf = input.to(mfq_tensor_backend::kFloat32);
+    auto inverse = mfq_tensor_backend::rsqrt(
+        xf.square().mean(-1, true) + eps);
+    auto normalized = (xf * inverse).to(mfq_tensor_backend::kBFloat16);
+    auto scale = weight.contiguous().to(mfq_tensor_backend::kBFloat16);
+    if (weight_offset != 0.0) scale = scale + weight_offset;
+    return (scale * normalized).contiguous();
+}
+
+mfq_tensor_backend::Tensor gemma_rms_norm_f16(
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor weight,
+        double eps,
+        double weight_offset) {
+    MFQ_RUNTIME_CHECK(
+        x.scalar_type() == mfq_tensor_backend::kFloat16,
+        "gemma_rms_norm_f16: activation must remain f16");
+    return rms_norm_f16_cuda(
+        x.contiguous(), weight, eps, weight_offset);
+}
+
+void prepare_ffn_workspaces(FFN & f) {
+    if (cuda_execution_context().loading_cpu_layer) return;
+    if (f.down.tensor_parallel()) return;
+    if (f.gate_up.nvq_prefix2 && f.gate_up.layers.size() == 2 && f.down.is_nvq() &&
+        f.gate_up.outs.size() == 2 && f.gate_up.outs[0] == f.gate_up.outs[1] &&
+        f.gate_up.outs[0] == f.down.nvq.w.neuron_len) {
+        NvqWorkspace & ws = f.gate_up.layers[0].nvq.w.workspace(1);
+        ws.swiglu_scratch = mfq_tensor_backend::empty(
+            {f.gate_up.outs[0]}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
+        (void)f.down.nvq.w.workspace(1);
+    }
+    if (f.important_neurons) {
+        prepare_ffn_workspaces(*f.important_neurons);
+    }
+}
 
 void load_important_neuron_branch(
         const mfq::ModelSource & mfq,
@@ -2376,4 +2132,114 @@ void load_important_neuron_branch(
         FFN & f,
         const std::string & down_name,
         const std::string & gate_name,
-        const std::string & up_name);
+        const std::string & up_name) {
+    const std::string down_high = down_name + ".in_high";
+    const std::string gate_high = gate_name + ".in_high";
+    const std::string up_high = up_name + ".in_high";
+    const bool has_down = has_tensor(mfq, down_high);
+    const bool has_gate = has_tensor(mfq, gate_high);
+    const bool has_up = has_tensor(mfq, up_high);
+    if (!has_down && !has_gate && !has_up) {
+        return;
+    }
+    if (!has_down || !has_gate || !has_up) {
+        throw std::runtime_error(
+            "important-neuron FFN requires matching gate/up/down .in_high records");
+    }
+    if (f.is_moe) {
+        throw std::runtime_error(
+            "important-neuron records are unsupported on routed MoE FFNs");
+    }
+
+    auto high = std::make_unique<FFN>();
+    high->down = load_quant_linear(
+        mfq, down_high, TensorParallelAxis::Input);
+    high->gate_up = load_paired_gate_up(
+        mfq, {gate_high, up_high}, high->down);
+    high->geglu = f.geglu;
+    high->swiglu_limit = f.swiglu_limit;
+
+    if (f.gate_up.outs.size() != 2 ||
+        high->gate_up.outs.size() != 2 ||
+        f.gate_up.outs[0] != f.gate_up.outs[1] ||
+        high->gate_up.outs[0] != high->gate_up.outs[1] ||
+        f.down.out() != hidden_size ||
+        high->down.out() != hidden_size ||
+        f.down.neuron_len() != f.gate_up.outs[0] ||
+        high->down.neuron_len() != high->gate_up.outs[0] ||
+        f.down.neuron_len() + high->down.neuron_len() !=
+            intermediate_size) {
+        throw std::runtime_error(
+            "important-neuron FFN tensor shapes disagree with model config");
+    }
+    f.important_neurons = std::move(high);
+}
+
+std::unique_ptr<Block> load_transformer_block(
+        const mfq::ModelSource& source,
+        const mfq::models::ModelConfig& config,
+        int layer,
+        const std::string& type,
+        bool minicpmo45,
+        std::string_view tensor_root) {
+    if (type != "full_attention") {
+        throw std::runtime_error("unsupported layer type: " + type);
+    }
+
+    const std::string prefix =
+        std::string(tensor_root) + ".block." +
+        std::to_string(layer) + ".";
+    auto block = std::make_unique<FullBlock>();
+    block->layer = layer;
+    block->attention_heads = config.num_attention_heads;
+    block->kv_heads = config.num_key_value_heads;
+    block->attention_head_dim = config.head_dim;
+    block->max_position_embeddings = config.max_position_embeddings;
+    block->rms_norm_eps = config.rms_norm_eps;
+    block->norm_weight_offset = minicpmo45 ? 0.0 : 1.0;
+    block->official_bf16 = minicpmo45;
+    block->attn_norm = load_dense_gpu(
+        source, prefix + "attention.norm.weight");
+    block->ffn_norm = load_dense_gpu(
+        source, prefix + "mlp.norm.weight");
+    const std::string attention = prefix + "attention.";
+    block->qkv = load_quant_group(source, {
+        attention + "query.weight",
+        attention + "key.weight",
+        attention + "value.weight"}, 2, nullptr, minicpmo45);
+    block->o = load_quant_linear(source, attention + "output.weight");
+    if (has_tensor(source, attention + "query_norm.weight")) {
+        block->q_norm = load_dense_gpu(
+            source, attention + "query_norm.weight");
+    }
+    if (has_tensor(source, attention + "key_norm.weight")) {
+        block->k_norm = load_dense_gpu(
+            source, attention + "key_norm.weight");
+    }
+    block->ffn = load_ffn(
+        source, config, layer, minicpmo45, tensor_root);
+    return block;
+}
+
+FFN load_ffn(
+        const mfq::ModelSource& source,
+        const mfq::models::ModelConfig& config,
+        int layer,
+        bool minicpmo45,
+        std::string_view tensor_root) {
+    FFN ffn;
+    const std::string prefix =
+        std::string(tensor_root) + ".block." +
+        std::to_string(layer) + ".mlp.";
+    const std::string down = prefix + "down.weight";
+    const std::string gate = prefix + "gate.weight";
+    const std::string up = prefix + "up.weight";
+    ffn.down = load_quant_linear(source, down);
+    ffn.gate_up = load_paired_gate_up(
+        source, {gate, up}, ffn.down, 2, minicpmo45);
+    load_important_neuron_branch(
+        source, config.hidden_size, config.intermediate_size,
+        ffn, down, gate, up);
+    prepare_ffn_workspaces(ffn);
+    return ffn;
+}

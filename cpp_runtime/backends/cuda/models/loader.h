@@ -2,7 +2,7 @@
 
 #include "causal_lm.h"
 #include "cuda_execution.h"
-#include "moe_expert_cache.h"
+#include "storage/moe_expert_cache.h"
 #include "options.h"
 #include "models/components.h"
 

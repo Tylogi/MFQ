@@ -86,20 +86,20 @@ CUDA_BACKEND_SOURCE = "\n".join(
 )
 CUDA_REGISTRY = (CUDA_MODELS / "registry.cpp").read_text(encoding="utf-8")
 CUDA_TRANSFORMER_LOADER = (
-    CUDA_RUNTIME / "cuda_transformer_loader.cpp"
+    CUDA_MODELS / "transformer.cpp"
 ).read_text(encoding="utf-8")
 CUDA_TRANSFORMER_HEADER = (
-    CUDA_RUNTIME / "cuda_transformer.h"
+    CUDA_MODELS / "transformer.h"
 ).read_text(encoding="utf-8")
 CUDA_QWEN_LINEAR = (
     CUDA_MODELS / "qwen35" / "linear_attention.h"
 ).read_text(encoding="utf-8") + (\
     CUDA_MODELS / "qwen35" / "causal_lm.cpp"
 ).read_text(encoding="utf-8")
-CUDA_CAUSAL_LM = (CUDA_RUNTIME / "causal_lm.h").read_text(
+CUDA_CAUSAL_LM = (CUDA_MODELS / "causal_lm.h").read_text(
     encoding="utf-8"
 )
-CUDA_CAUSAL_LM_SOURCE = (CUDA_RUNTIME / "causal_lm.cpp").read_text(
+CUDA_CAUSAL_LM_SOURCE = (CUDA_MODELS / "causal_lm.cpp").read_text(
     encoding="utf-8"
 )
 CUDA_QWEN_BATCH_HEADER = (
@@ -108,7 +108,7 @@ CUDA_QWEN_BATCH_HEADER = (
 CUDA_QWEN_BATCH_SOURCE = (
     CUDA_MODELS / "qwen35" / "batch_executor.cpp"
 ).read_text(encoding="utf-8")
-CUDA_CAUSAL_LM_LOADER = (CUDA_RUNTIME / "causal_lm_loader.cpp").read_text(
+CUDA_CAUSAL_LM_LOADER = (CUDA_MODELS / "loader.cpp").read_text(
     encoding="utf-8"
 )
 SPARSE_OPERATOR = (METAL / "ops" / "mlx_sparse_attention.cpp").read_text(
@@ -299,14 +299,14 @@ def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
     assert "execution.reset();" in options
     assert "CudaExecutionContext& execution" in CUDA_CAUSAL_LM
     assert "model.execution = &execution;" in (
-        CUDA_RUNTIME / "causal_lm_loader.cpp"
+        CUDA_MODELS / "loader.cpp"
     ).read_text(encoding="utf-8")
     assert "struct CudaSessionCodec" in CUDA_CAUSAL_LM
     assert "return CudaSessionCodec<Backbone>::capture" in CUDA_CAUSAL_LM
     assert "CudaSessionCodec<Backbone>::capture" in CUDA_CAUSAL_LM_SOURCE
     assert "void begin_speculative_suffix(int64_t draft_tokens);" in CUDA_CAUSAL_LM
     causal_lm_source = (
-        CUDA_RUNTIME / "causal_lm.cpp"
+        CUDA_MODELS / "causal_lm.cpp"
     ).read_text(encoding="utf-8")
     assert "CausalLm<Backbone>::begin_speculative_suffix" in causal_lm_source
     assert "CausalLm<Backbone>::finalize_hidden" in causal_lm_source
@@ -869,8 +869,8 @@ def test_cuda_model_runtime_uses_compiled_causal_lm_adapters() -> None:
         "class MoeExpertCache",
     ):
         assert concrete_definition not in CUDA_RUNTIME_SOURCE
-    causal_lm = (CUDA_RUNTIME / "causal_lm.h").read_text(encoding="utf-8")
-    causal_lm_loader = (CUDA_RUNTIME / "causal_lm_loader.cpp").read_text(
+    causal_lm = (CUDA_MODELS / "causal_lm.h").read_text(encoding="utf-8")
+    causal_lm_loader = (CUDA_MODELS / "loader.cpp").read_text(
         encoding="utf-8"
     )
     assert re.search(r"\bCudaModel\b", CUDA_BACKEND_SOURCE) is None
@@ -885,7 +885,7 @@ def test_cuda_model_runtime_uses_compiled_causal_lm_adapters() -> None:
         "DeepseekV4CausalLm",
         "DeepseekV41CausalLm",
     ):
-        assert f"struct {runtime} final : CausalLm<" in causal_lm
+        assert f"using {runtime} = CausalLm<" in causal_lm
 
     assert "std::make_unique<FullBlock>" in CUDA_TRANSFORMER_LOADER
     assert "std::make_unique<LinearAttentionBlock>" in CUDA_QWEN_LINEAR
@@ -911,12 +911,11 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         "engine/decode_graph.cpp",
         "engine/options.cpp",
         "commands/cli.cpp",
-        "engine/causal_lm.cpp",
-        "engine/causal_lm_loader.cpp",
-        "engine/cuda_transformer.cpp",
-        "engine/cuda_transformer_loader.cpp",
+        "models/causal_lm.cpp",
+        "models/loader.cpp",
+        "models/transformer.cpp",
         "engine/mtp.cpp",
-        "engine/moe_expert_cache.cpp",
+        "storage/moe_expert_cache.cpp",
         "models/components.cpp",
         "diagnostics/backend_checks.cpp",
         "diagnostics/model_checks.cpp",

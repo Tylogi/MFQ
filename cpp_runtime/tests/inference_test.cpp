@@ -1,4 +1,5 @@
 #include "continuous_batching.h"
+#include "generation_policy.h"
 #include "inference.h"
 
 #include <algorithm>
@@ -6,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -106,6 +108,27 @@ struct FakeMtp : FakeModel {
 }
 
 int main() {
+    const std::vector<std::int64_t> planned_prompt{1, 2};
+    const auto generation_plan = mfq::engine::plan_generation(
+        planned_prompt, 4, 3, 5, 9);
+    require(generation_plan.prompt_tokens == 2 &&
+        generation_plan.stable_prefix_tokens == 2 &&
+        generation_plan.generation_tokens == 1);
+    const auto first_chunk = mfq::engine::next_prefill_chunk(5, 0, 2);
+    const auto last_chunk = mfq::engine::next_prefill_chunk(5, 4, 2);
+    require(first_chunk.offset == 0 && first_chunk.count == 2 &&
+        !first_chunk.last && last_chunk.offset == 4 &&
+        last_chunk.count == 1 && last_chunk.last);
+    bool invalid_plan = false;
+    try {
+        (void)mfq::engine::plan_generation(
+            std::span<const std::int64_t>{planned_prompt.data(), 1},
+            1, 3, 1);
+    } catch (const std::invalid_argument&) {
+        invalid_plan = true;
+    }
+    require(invalid_plan);
+
     mfq::engine::ContinuousBatchRequest batch_request({1, 2}, {}, {}, {});
     std::thread producer([&] {
         batch_request.publish_prefill({2, 1.0, 0.0, 1.0});

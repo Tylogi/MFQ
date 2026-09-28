@@ -1,6 +1,8 @@
 #include "runtime_checks.h"
 
 #include "engine/generation.h"
+#include "engine/options.h"
+#include "engine/runtime_config.h"
 #include "engine/text_session_cache.h"
 #include "models/qwen35/batch_executor.h"
 
@@ -28,7 +30,9 @@ int run_qwen35_mtp_bench(
             model.max_position_embeddings() >= generated_tokens + 17,
         "MTP benchmark requires gen>=2, reps1-100 and context>=gen+17");
     DecodeGraphCache graph_cache(model.max_position_embeddings());
-    TextSessionCache session_cache;
+    const auto runtime_config = resolve_cuda_runtime_config({});
+    TextSessionCache session_cache(
+        runtime_config.session_cache, runtime_config.prefix_cache);
     std::mutex model_mutex;
     MfqSamplingParams params;
     params.max_tokens = generated_tokens;
@@ -39,12 +43,11 @@ int run_qwen35_mtp_bench(
     params.seed = 20260907;
     const auto options = mfq_tensor_backend::TensorOptions()
         .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt64);
-    const char* graph_env = std::getenv("MFQ_RUNTIME_CUDA_GRAPH");
     const char* profiler_env = std::getenv("MFQ_CUDA_PROFILER_RANGE");
     const bool profiler_range = profiler_env != nullptr && std::atoi(profiler_env) != 0;
     std::cout << "mtp_bench config mode=" << (enable_mtp ? "mtp" : "ordinary")
         << " full_window_batching=1"
-        << " runtime_graph=" << (graph_env == nullptr ? "default" : graph_env)
+        << " runtime_graph=" << (runtime_config.decode_graph.enabled ? 1 : 0)
         << " gen=" << generated_tokens << " reps=" << repetitions
         << " warmup=1 seed=20260907 synthetic_ids=1 eos_stop=0 session_cache=0\n";
     const auto ms_between = [](Clock::time_point first, Clock::time_point last) {
@@ -78,7 +81,7 @@ int run_qwen35_mtp_bench(
             }
             const auto started = Clock::now();
             const int produced = generate(model, model_mutex, graph_cache,
-                session_cache, prompt, params, [&](int64_t token) {
+                session_cache, runtime_config, prompt, params, [&](int64_t token) {
                     if (output.empty()) first_token = Clock::now();
                     output.push_back(token);
                     return true;
@@ -120,8 +123,8 @@ int run_qwen35_mtp_bench(
 
 int run_cuda_continuous_batching_check(
         mfq::cuda::Qwen35CausalLm& model) {
-    return mfq::cuda::qwen35::
-        run_qwen_continuous_batching_check(model);
+    return mfq::cuda::qwen35::run_qwen_continuous_batching_check(
+        model, resolve_cuda_runtime_config({}));
 }
 
 } // namespace mfq::cuda::diagnostics

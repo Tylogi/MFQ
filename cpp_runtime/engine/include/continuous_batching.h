@@ -20,6 +20,11 @@
 
 namespace mfq::engine {
 
+struct ContinuousBatchConfig {
+    std::size_t max_sequences = 0;
+    std::chrono::microseconds initial_batch_wait{1000};
+};
+
 struct ContinuousBatchRequest {
     struct CancellationState {
         explicit CancellationState(MfqCancellationCheck external_check = {});

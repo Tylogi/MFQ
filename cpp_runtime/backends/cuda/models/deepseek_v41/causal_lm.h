@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../engine/cuda_transformer.h"
+#include "models/transformer.h"
 #include "../deepseek_v4/causal_lm.h"
 #include "engram.h"
 #include "dspark.h"

@@ -1,6 +1,6 @@
 #include "cli.h"
 #include "engine/cuda_engine.h"
-#include "engine/moe_expert_cache.h"
+#include "storage/moe_expert_cache.h"
 #include "minicpmo45.h"
 #include "models/registry.h"
 #include "mfq/model_source.h"
