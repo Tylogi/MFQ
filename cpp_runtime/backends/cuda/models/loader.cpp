@@ -1,4 +1,4 @@
-#include "causal_lm.h"
+#include "loader.h"
 
 #include "storage/moe_expert_cache.h"
 #include "../models/registry.h"
@@ -11,7 +11,7 @@ namespace {
 
 template <typename Model, typename Loader>
 void load_model_blocks(Model& model, Loader&& load) {
-    auto& execution = cuda_execution_context();
+    auto& execution = *model.execution;
     const auto layer_count = model.num_hidden_layers();
     model.blocks.reserve(static_cast<std::size_t>(layer_count));
     for (int layer = 0; layer < layer_count; ++layer) {
@@ -78,6 +78,7 @@ Model mfq::cuda::load_causal_lm(
         bool load_blocks,
         bool defer_moe_cache_finalize,
         std::shared_ptr<const mfq::ModelSource> model_source) {
+    CudaExecutionContextScope context_scope(execution);
     Model model;
     model.execution = &execution;
     model.source = model_source

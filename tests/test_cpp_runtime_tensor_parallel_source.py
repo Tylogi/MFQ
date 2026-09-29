@@ -14,8 +14,12 @@ CMAKE = (ROOT / "cpp_runtime" / "tests" / "CMakeLists.txt").read_text(
     encoding="utf-8"
 )
 COMPONENTS = "\n".join(
-    (CUDA_ROOT / "models" / name).read_text(encoding="utf-8")
-    for name in ("components.h", "components.cpp")
+    path.read_text(encoding="utf-8")
+    for path in (
+        CUDA_ROOT / "models" / "components.h",
+        CUDA_ROOT / "models" / "components.cpp",
+        CUDA_ROOT / "models" / "qwen35" / "causal_lm.cpp",
+    )
 )
 
 
@@ -122,7 +126,8 @@ def test_tensor_parallel_projection_groups_share_each_rank_input_transfer():
 
 
 def test_batched_decode_graph_orders_tp_groups_by_projection():
-    assert "g_decode_graph_tp_projection_major" in SOURCE
+    assert "decode_graph_tp_projection_major" in SOURCE
+    assert "thread_local bool g_decode_graph_tp_projection_major" not in SOURCE
     assert "DecodeGraphTpProjectionScope" in SOURCE
     assert "std::vector<mfq_tensor_backend::Tensor> local_inputs" in SOURCE
     assert "local_inputs[shard] = tensor_to_cuda_device(flat, device)" in SOURCE
@@ -141,7 +146,7 @@ def test_tensor_parallel_peer_first_launch_preserves_rank_indexing():
 
 def test_qwen35_mtp_accepts_dense_tensor_parallel_placement():
     assert "const bool supported_placement" in COMPONENTS
-    assert "!execution.layer_placement.enabled()" in COMPONENTS
+    assert "!model_execution.layer_placement.enabled()" in COMPONENTS
     assert "!execution.tensor_parallel.enabled()" not in COMPONENTS
     assert "dense GPU-resident Qwen blocks" in COMPONENTS
 

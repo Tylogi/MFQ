@@ -1,18 +1,18 @@
 #include "causal_lm.h"
+#include "../causal_lm_impl.h"
 
-#include "../causal_lm.h"
 #include "models/transformer.h"
 
 namespace mfq::cuda::deepseek_v4 {
 
 std::unique_ptr<::Block> load_block(
+        CudaExecutionContext& execution,
         const mfq::ModelSource& mfq,
         const Config& c,
         int i,
         const std::string& type,
         const std::shared_ptr<::Dsv4SharedState>& state) {
         const auto& config = c;
-        auto& execution = cuda_execution_context();
         if (type != "deepseek_v4" || !state) {
             throw std::runtime_error(
                 "invalid DeepSeek V4 block loader state");
@@ -263,7 +263,9 @@ std::unique_ptr<::Block> load_block(
         return b;
 }
 
-void validate_load_options(const Config& config) {
+void validate_load_options(
+        const Config& config,
+        CudaExecutionContext& execution) {
     if (config.hidden_size != 4096 || config.num_attention_heads != 64 ||
             config.head_dim != 512 || config.q_lora_rank != 1024 ||
             config.qk_rope_head_dim != 64 || config.index_head_dim != 128 ||
@@ -277,7 +279,6 @@ void validate_load_options(const Config& config) {
         throw std::runtime_error(
             "unsupported DeepSeek V4 CUDA configuration");
     }
-    auto& execution = cuda_execution_context();
     if (execution.dsv4_cpu_offload_layers.empty()) return;
     for (int layer : execution.dsv4_cpu_offload_layers) {
         if (layer < 0 || layer >= config.num_hidden_layers) {
@@ -287,7 +288,7 @@ void validate_load_options(const Config& config) {
         }
     }
     execution.dsv4_cpu_offload_host_bytes = 0;
-    g_mfq_drop_file_cache = true;
+    execution.drop_file_cache = true;
 }
 
 OutputHeadWeights load_output_head(
@@ -306,9 +307,10 @@ mfq_tensor_backend::Tensor finalize_hidden(
         mfq_tensor_backend::Tensor hidden,
         const OutputHeadWeights& output_head,
         const Config& config,
+        CudaProfiler& profiler,
         int64_t batch,
         int64_t tokens) {
-    return g_profiler.measure("model.dsv4_hc_head", [&]() {
+    return profiler.measure("model.dsv4_hc_head", [&]() {
         auto flat = hidden.flatten(2).to(mfq_tensor_backend::kFloat32);
         auto inverse_rms = mfq_tensor_backend::rsqrt(
             flat.square().mean(-1, true) + config.rms_norm_eps);
@@ -354,7 +356,7 @@ void DeepseekV4Model::adapter_load_config(
 }
 
 void DeepseekV4Model::adapter_validate_load_options() const {
-    deepseek_v4::validate_load_options(config);
+    deepseek_v4::validate_load_options(config, *execution);
 }
 
 void DeepseekV4Model::adapter_load_final_state(
@@ -373,7 +375,7 @@ DeepseekV4Model::adapter_load_block(
     auto& state = block_states[device];
     if (!state) state = std::make_shared<Dsv4SharedState>();
     return deepseek_v4::load_block(
-        source, config, layer, type, state);
+        *execution, source, config, layer, type, state);
 }
 
 TextSessionStateKind
@@ -479,8 +481,9 @@ DeepseekV4Model::adapter_finalize_hidden(
         int64_t batch,
         int64_t tokens) const {
     hidden = deepseek_v4::finalize_hidden(
-        std::move(hidden), output_head, config, batch, tokens);
-    return g_profiler.measure("model.output_norm", [&]() {
+        std::move(hidden), output_head, config, execution->profiler,
+        batch, tokens);
+    return execution->profiler.measure("model.output_norm", [&]() {
         return qwen_rms_norm(
             hidden.reshape({batch * tokens, metadata.hidden_size})
                 .to(mfq_tensor_backend::kFloat32),
@@ -489,5 +492,84 @@ DeepseekV4Model::adapter_finalize_hidden(
             .reshape({batch, tokens, metadata.hidden_size});
     });
 }
+
+} // namespace mfq::cuda
+
+Dsv4PoolSessionState capture_dsv4_pool_session_state(
+        const Dsv4PoolState& source,
+        int64_t cache_pos,
+        size_t& bytes) {
+    Dsv4PoolSessionState state;
+    state.ratio = source.ratio;
+    state.head_dim = source.head_dim;
+    state.cache_quant_mode = source.cache_quant_mode;
+    state.capacity = source.capacity;
+    state.overlap = source.overlap;
+    if (source.ratio <= 0) return state;
+    if (source.capacity <= 0 || !source.state_kv.defined() ||
+            !source.state_gate.defined() || !source.pool.defined() ||
+            source.pool.dim() != 3 || source.pool.size(0) != 1 ||
+            source.pool.size(1) != source.capacity ||
+            (source.overlap &&
+             (!source.previous_kv.defined() ||
+              !source.previous_gate.defined()))) {
+        throw std::runtime_error(
+            "DeepSeek V4 session compressor state is unavailable");
+    }
+    const int64_t visible = std::min<int64_t>(
+        cache_pos / source.ratio, source.capacity);
+    state.state_kv = source.state_kv.clone();
+    state.state_gate = source.state_gate.clone();
+    if (source.overlap) {
+        state.previous_kv = source.previous_kv.clone();
+        state.previous_gate = source.previous_gate.clone();
+    }
+    state.pool = source.pool.narrow(1, 0, visible).clone();
+    bytes += session_tensor_bytes(state.state_kv);
+    bytes += session_tensor_bytes(state.state_gate);
+    bytes += session_tensor_bytes(state.previous_kv);
+    bytes += session_tensor_bytes(state.previous_gate);
+    bytes += session_tensor_bytes(state.pool);
+    return state;
+}
+
+void restore_dsv4_pool_session_state(
+        Dsv4PoolState& target,
+        const Dsv4PoolSessionState& state) {
+    if (target.ratio != state.ratio ||
+            target.head_dim != state.head_dim ||
+            target.cache_quant_mode != state.cache_quant_mode ||
+            target.overlap != state.overlap) {
+        throw CudaSessionStateError(
+            "DeepSeek V4 session compressor configuration changed");
+    }
+    if (state.ratio <= 0) return;
+    if (state.capacity <= 0 || !state.state_kv.defined() ||
+            !state.state_gate.defined() || !state.pool.defined() ||
+            state.pool.dim() != 3 || state.pool.size(0) != 1 ||
+            state.pool.size(1) > state.capacity ||
+            (state.overlap &&
+             (!state.previous_kv.defined() ||
+              !state.previous_gate.defined()))) {
+        throw CudaSessionStateError(
+            "DeepSeek V4 saved compressor state is invalid");
+    }
+    target.capacity = state.capacity;
+    restore_session_tensor(target.state_kv, state.state_kv);
+    restore_session_tensor(target.state_gate, state.state_gate);
+    if (state.overlap) {
+        restore_session_tensor(target.previous_kv, state.previous_kv);
+        restore_session_tensor(target.previous_gate, state.previous_gate);
+    } else {
+        target.previous_kv = mfq_tensor_backend::Tensor();
+        target.previous_gate = mfq_tensor_backend::Tensor();
+    }
+    restore_session_prefix_tensor(
+        target.pool, state.pool, 1, state.capacity);
+}
+
+namespace mfq::cuda {
+
+template struct CausalLm<DeepseekV4Model>;
 
 } // namespace mfq::cuda

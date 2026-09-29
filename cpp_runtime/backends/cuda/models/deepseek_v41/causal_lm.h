@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../causal_lm.h"
 #include "models/transformer.h"
 #include "../deepseek_v4/causal_lm.h"
 #include "engram.h"
@@ -533,6 +534,7 @@ struct Block final : ::Block {
     }
 
     MhcResult collapse(
+        CudaProfiler& profiler,
         const Tensor& residual,
         const Tensor& previous_pre,
         const Tensor& function,
@@ -540,7 +542,7 @@ struct Block final : ::Block {
         const Tensor& base,
         const Tensor& norm,
         const char* profile) const {
-        return g_profiler.measure(profile, [&]() {
+        return profiler.measure(profile, [&]() {
             auto flat = residual.flatten(2).to(mfq_tensor_backend::kFloat32);
             auto inverse = mfq_tensor_backend::rsqrt(
                 flat.square().mean(-1, true) + config.rms_eps);
@@ -570,11 +572,12 @@ struct Block final : ::Block {
     }
 
     Tensor expand(
+        CudaProfiler& profiler,
         const Tensor& branch,
         const Tensor& residual,
         const MhcResult& mix,
         const char* profile) const {
-        return g_profiler.measure(profile, [&]() {
+        return profiler.measure(profile, [&]() {
             return dsv4_hc_post_cuda(
                 branch.contiguous(),
                 residual.contiguous(),
@@ -583,7 +586,9 @@ struct Block final : ::Block {
         });
     }
 
-    Tensor output_projection(Tensor attention) const {
+    Tensor output_projection(
+        CudaExecutionContext& execution,
+        Tensor attention) const {
         const auto batch = attention.size(0);
         const auto tokens = attention.size(1);
         const auto rows = batch * tokens;
@@ -597,19 +602,19 @@ struct Block final : ::Block {
             output_a.nint.w.gs == 48 &&
             output_a.nint.w.out == groups * config.o_lora_rank) {
             auto low_rank = nint_matmul_groupwise_u8(
-                output_a.nint.w, grouped, groups);
-            return output_b.forward(low_rank)
+                execution.profiler, output_a.nint.w, grouped, groups);
+            return output_b.forward(execution, low_rank)
                 .reshape({batch, tokens, config.hidden});
         }
         if (output_a.is_mxfp8() &&
             output_a.out() == groups * config.o_lora_rank) {
             auto low_rank = output_a.forward_mxfp8_groupwise(
-                grouped, groups);
-            return output_b.forward(low_rank)
+                execution, grouped, groups);
+            return output_b.forward(execution, low_rank)
                 .reshape({batch, tokens, config.hidden});
         }
         auto expanded = output_a.forward(
-            grouped.reshape({rows * groups, group_width}))
+            execution, grouped.reshape({rows * groups, group_width}))
             .reshape({rows, groups, groups, config.o_lora_rank});
         std::vector<Tensor> diagonal;
         diagonal.reserve(static_cast<std::size_t>(groups));
@@ -621,25 +626,26 @@ struct Block final : ::Block {
             .reshape({rows, groups * config.o_lora_rank})
             .to(mfq_tensor_backend::kFloat16)
             .contiguous();
-        return output_b.forward(low_rank)
+        return output_b.forward(execution, low_rank)
             .reshape({batch, tokens, config.hidden});
     }
 
     std::optional<Tensor> update_compressed_source(
+        CudaExecutionContext& execution,
         const Tensor& input,
         std::int64_t position) {
         const auto batch = input.size(0);
         const auto tokens = input.size(1);
         if (ratio == 1) {
             return weighted_rms(
-                compressor_key_value.forward(input),
+                compressor_key_value.forward(execution, input),
                 compressor_norm,
                 config.rms_eps);
         }
-        auto projected_kv = compressor_key_value.forward(input)
+        auto projected_kv = compressor_key_value.forward(execution, input)
             .to(mfq_tensor_backend::kFloat32)
             .contiguous();
-        auto projected_score = compressor_gate.forward(input)
+        auto projected_score = compressor_gate.forward(execution, input)
             .to(mfq_tensor_backend::kFloat32)
             .contiguous();
         std::vector<Tensor> emitted;
@@ -695,9 +701,11 @@ struct Block final : ::Block {
     }
 
     void publish_compressed_source(
+        CudaExecutionContext& execution,
         const Tensor& input,
         std::int64_t position) {
-        auto latent = update_compressed_source(input, position);
+        auto latent = update_compressed_source(
+            execution, input, position);
         if (latent) {
             const auto count = latent->size(1);
             const auto begin = state.compressed_length;
@@ -710,7 +718,7 @@ struct Block final : ::Block {
                 ratio,
                 latent->options().dtype(mfq_tensor_backend::kInt64));
             auto index_values = weighted_rms(
-                index_key.forward(*latent),
+                index_key.forward(execution, *latent),
                 index_key_norm,
                 config.rms_eps);
             index_values = rotate_token_major_tail(
@@ -735,6 +743,7 @@ struct Block final : ::Block {
     }
 
     Tensor compute_topk(
+        CudaExecutionContext& execution,
         const Tensor& input,
         const Tensor& q_rank,
         const Tensor& positions,
@@ -753,7 +762,7 @@ struct Block final : ::Block {
         auto topk = empty_topk(batch, tokens, input.device());
         const auto pool_length = shared->compressed_length;
         if (pool_length > 0) {
-            auto query = index_query.forward(q_rank)
+            auto query = index_query.forward(execution, q_rank)
                 .reshape({batch, tokens,
                           config.index_n_heads,
                           config.index_head_dim})
@@ -765,7 +774,7 @@ struct Block final : ::Block {
                 .contiguous();
             query = dsv4_fp4_sim_cuda(
                 query.to(mfq_tensor_backend::kFloat16).contiguous());
-            auto weights = index_score.forward(input)
+            auto weights = index_score.forward(execution, input)
                 .reshape({batch, tokens, config.index_n_heads})
                 .to(mfq_tensor_backend::kFloat16)
                 .contiguous();
@@ -815,6 +824,7 @@ struct Block final : ::Block {
     }
 
     Tensor attention_forward(
+        CudaExecutionContext& execution,
         const Tensor& input,
         const Tensor& positions,
         std::int64_t position,
@@ -822,8 +832,8 @@ struct Block final : ::Block {
         const auto batch = input.size(0);
         const auto tokens = input.size(1);
         auto q_rank = weighted_rms(
-            query_a.forward(input), query_a_norm, config.rms_eps);
-        auto query = query_b.forward(q_rank)
+            query_a.forward(execution, input), query_a_norm, config.rms_eps);
+        auto query = query_b.forward(execution, q_rank)
             .reshape({batch, tokens, config.n_heads, config.head_dim})
             .transpose(1, 2)
             .contiguous()
@@ -831,13 +841,13 @@ struct Block final : ::Block {
         query = dsv4_rotate_rope_tail(query, positions, rope, false);
 
         auto local = weighted_rms(
-            key_value.forward(input), key_value_norm, config.rms_eps)
+            key_value.forward(execution, input), key_value_norm, config.rms_eps)
             .reshape({batch, tokens, config.head_dim});
         local = rotate_token_major_tail(local, positions, rope);
         local = deepseek_v41_mxfp8_e4m3_sim_cuda(local.contiguous());
 
         if (kv_source()) {
-            publish_compressed_source(input, position);
+            publish_compressed_source(execution, input, position);
         } else if (ratio > 0) {
             MFQ_RUNTIME_CHECK(
                 shared->compressed_kv.defined() &&
@@ -845,7 +855,8 @@ struct Block final : ::Block {
                     shared->ratio == ratio,
                 "DeepSeek-V4.1 CSA2 consumer ran before its source layer");
         }
-        auto topk = compute_topk(input, q_rank, positions, position);
+        auto topk = compute_topk(
+            execution, input, q_rank, positions, position);
 
         Tensor local_for_attention;
         if (tokens == 1) {
@@ -950,10 +961,11 @@ struct Block final : ::Block {
                        .transpose(1, 2)
                        .contiguous();
         state.position += tokens;
-        return output_projection(attended);
+        return output_projection(execution, attended);
     }
 
     Tensor forward(
+        CudaExecutionContext& execution,
         Tensor hidden,
         Tensor positions,
         std::int64_t cache_position,
@@ -961,6 +973,7 @@ struct Block final : ::Block {
         const RopeCache&,
         const MfqOptional<Tensor>& cache_positions = mfq_nullopt,
         const MfqOptional<Tensor>& attention_mask = mfq_nullopt) override {
+        auto& profiler = execution.profiler;
         MFQ_RUNTIME_CHECK(
             current_ids.defined() && hidden.dim() == 4 &&
                 hidden.size(2) == config.hc_mult &&
@@ -981,8 +994,9 @@ struct Block final : ::Block {
             current_ids);
 
         if (engram) {
-            hidden = g_profiler.measure("deepseek_v41.engram", [&]() {
-                return engram->forward(hidden, shared->engram_hashes);
+            hidden = profiler.measure("deepseek_v41.engram", [&]() {
+                return engram->forward(
+                    execution, hidden, shared->engram_hashes);
             });
         }
 
@@ -990,7 +1004,7 @@ struct Block final : ::Block {
 
         auto attention_residual = hidden;
         auto attention_mix = collapse(
-            attention_residual,
+            profiler, attention_residual,
             shared->previous_pre,
             attention_mhc_function,
             attention_mhc_scale,
@@ -998,19 +1012,19 @@ struct Block final : ::Block {
             attention_norm,
             "deepseek_v41.mhc.attention.collapse");
         auto attention = attention_forward(
-            attention_mix.branch,
+            execution, attention_mix.branch,
             positions,
             cache_position,
             sequence_lengths);
         hidden = expand(
-            attention,
+            profiler, attention,
             attention_residual,
             attention_mix,
             "deepseek_v41.mhc.attention.expand");
 
         auto mlp_residual = hidden;
         auto mlp_mix = collapse(
-            mlp_residual,
+            profiler, mlp_residual,
             attention_mix.next_pre,
             mlp_mhc_function,
             mlp_mhc_scale,
@@ -1018,7 +1032,7 @@ struct Block final : ::Block {
             mlp_norm,
             "deepseek_v41.mhc.mlp.collapse");
         auto feed_forward = mlp.forward(
-            mlp_mix.branch.reshape(
+            execution, mlp_mix.branch.reshape(
                 {-1, config.hidden}),
             current_ids)
                                 .reshape(
@@ -1026,7 +1040,7 @@ struct Block final : ::Block {
                                      hidden.size(1),
                                      config.hidden});
         hidden = expand(
-            feed_forward,
+            profiler, feed_forward,
             mlp_residual,
             mlp_mix,
             "deepseek_v41.mhc.mlp.expand");
@@ -1112,13 +1126,14 @@ std::unique_ptr<::Block> load_block(
     const mfq::ModelSource& model,
     std::int64_t layer,
     const std::shared_ptr<SharedState>& shared);
-void validate_load_options();
+void validate_load_options(const CudaExecutionContext& execution);
 std::shared_ptr<SharedState> load_shared_state(
     const mfq::ModelSource& source,
     const CommonConfig& config);
 Tensor finalize_hidden(
     const std::shared_ptr<SharedState>& state,
-    const Tensor& hidden);
+    const Tensor& hidden,
+    CudaProfiler& profiler);
 
 inline int run_self_check() {
     EngramHashState::self_check();
@@ -1144,3 +1159,58 @@ inline int run_self_check() {
 }
 
 } // namespace mfq::cuda::deepseek_v41_runtime
+
+namespace mfq::cuda {
+
+struct DeepseekV41Model : CausalLmArchitecture {
+    mfq::models::deepseek_v41::Config config;
+    std::shared_ptr<deepseek_v41_runtime::SharedState> shared;
+
+    void adapter_load_config(
+        std::string_view payload,
+        const mfq::ModelGraph& graph,
+        const mfq::ModelSource& source);
+    void adapter_validate_load_options() const;
+    void adapter_load_final_state(
+        const mfq::ModelSource& source,
+        mfq_tensor_backend::Tensor& output_norm);
+    void adapter_prepare_blocks(const mfq::ModelSource& source);
+    std::unique_ptr<Block> adapter_load_block(
+        const mfq::ModelSource& source,
+        int layer,
+        int device,
+        const std::string& type);
+    void adapter_set_max_position_embeddings(int64_t value) {
+        config.max_position_embeddings = value;
+    }
+    void adapter_validate_forward(
+        int64_t batch,
+        int64_t tokens,
+        int64_t cache_position,
+        bool has_position_override,
+        bool has_cache_position_override,
+        bool has_attention_mask) const;
+    mfq_tensor_backend::Tensor adapter_prepare_hidden(
+        mfq_tensor_backend::Tensor hidden,
+        int64_t batch,
+        int64_t tokens) const;
+    void adapter_begin_forward(bool capture_raw_hidden);
+    mfq_tensor_backend::Tensor adapter_finalize_hidden(
+        mfq_tensor_backend::Tensor hidden,
+        const mfq_tensor_backend::Tensor& output_norm,
+        int64_t batch,
+        int64_t tokens) const;
+    mfq_tensor_backend::Tensor adapter_raw_hidden(
+        const mfq_tensor_backend::Tensor& hidden,
+        const mfq_tensor_backend::Tensor& finalized) const;
+    bool adapter_supports_suffix_speculation() const noexcept;
+    void adapter_begin_speculative();
+    void adapter_commit_speculative();
+    void adapter_rollback_speculative(int64_t keep);
+};
+
+extern template struct CudaSessionCodec<DeepseekV41Model>;
+
+extern template struct CausalLm<DeepseekV41Model>;
+
+} // namespace mfq::cuda

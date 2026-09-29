@@ -1,6 +1,5 @@
 #include "cuda_engine.h"
 
-#include "models/causal_lm.h"
 #include "cuda_execution.h"
 #include "decode_graph.h"
 #include "generation.h"
@@ -33,10 +32,12 @@ struct CudaEngineState {
     using Model = ModelType;
 
     CudaEngineState(
+            std::shared_ptr<CudaExecutionContext> loaded_execution,
             Model loaded_model,
             RuntimeComponents<Model> loaded_components,
             CudaRuntimeConfig config)
-        : execution(*loaded_model.execution),
+        : execution_owner(std::move(loaded_execution)),
+          execution(*execution_owner),
           runtime_config(std::move(config)),
           model(std::move(loaded_model)),
           components(std::move(loaded_components)),
@@ -76,6 +77,7 @@ struct CudaEngineState {
             << " prefix_cache=fresh_prefill\n";
     }
 
+    std::shared_ptr<CudaExecutionContext> execution_owner;
     CudaExecutionContext& execution;
     const CudaRuntimeConfig runtime_config;
     mfq_tensor_backend::NoGradGuard no_grad;
@@ -91,6 +93,7 @@ struct CudaEngineState {
 template <typename Model>
 std::vector<std::pair<std::string, double>> engine_metrics(
         const std::shared_ptr<CudaEngineState<Model>>& state) {
+    CudaExecutionContextScope context_scope(state->execution);
     size_t free_bytes = 0;
     size_t total_bytes = 0;
     MFQ_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
@@ -126,12 +129,14 @@ std::vector<std::pair<std::string, double>> engine_metrics(
 
 template <typename Model>
 CudaEngine make_cuda_engine(
+        std::shared_ptr<CudaExecutionContext> execution,
         Model model,
         RuntimeComponents<Model> components,
         CudaRuntimeConfig config) {
     using State = CudaEngineState<Model>;
     auto state = std::make_shared<State>(
-        std::move(model), std::move(components), std::move(config));
+        std::move(execution), std::move(model), std::move(components),
+        std::move(config));
 
     CudaEngine engine;
     engine.max_concurrent_requests = std::max<std::size_t>(
@@ -147,6 +152,7 @@ CudaEngine make_cuda_engine(
             const MfqPromptCachePlan& cache_plan,
             const MfqTokenConstraintPtr& token_constraint,
             const MfqCancellationCheck& cancelled) {
+        CudaExecutionContextScope context_scope(state->execution);
         PreparedPromptFactory<typename State::Model> prepare;
         if (media) {
             if (!state->components.grid_vision) {
@@ -187,28 +193,69 @@ CudaEngine make_cuda_engine(
     engine.session_control = {
         [state](const std::string& source_session_id,
                 const std::string& target_session_id) {
+            CudaExecutionContextScope context_scope(state->execution);
             std::lock_guard<std::mutex> lock(state->model_mutex);
             return state->session_cache.fork_session(
                 source_session_id, target_session_id);
         },
         [state](const std::string& session_id) {
+            CudaExecutionContextScope context_scope(state->execution);
             std::lock_guard<std::mutex> lock(state->model_mutex);
             return state->session_cache.close_session(session_id);
         },
         [state] {
+            CudaExecutionContextScope context_scope(state->execution);
             return state->session_cache.metrics();
         },
         [state] {
+            CudaExecutionContextScope context_scope(state->execution);
             std::lock_guard<std::mutex> lock(state->model_mutex);
             return state->session_cache.clear();
         },
         [state](uint64_t target_bytes) {
+            CudaExecutionContextScope context_scope(state->execution);
             return state->session_cache.trim_hot(target_bytes);
         },
     };
     if (state->components.engine_binder) {
         state->components.engine_binder(
             engine, state->model_mutex);
+        if (engine.multimodal_generate) {
+            auto generate = std::move(engine.multimodal_generate);
+            engine.multimodal_generate = [state, generate = std::move(generate)](
+                    const std::vector<int64_t>& prompt,
+                    const MfqMultimodalInput& media,
+                    const MfqSamplingParams& sampling,
+                    const MfqTokenCallback& on_token,
+                    const MfqPrefillCallback& on_prefill,
+                    const MfqPromptCachePlan& cache_plan,
+                    const MfqTokenConstraintPtr& token_constraint,
+                    const MfqCancellationCheck& cancelled) {
+                CudaExecutionContextScope context_scope(state->execution);
+                return generate(
+                    prompt, media, sampling, on_token, on_prefill,
+                    cache_plan, token_constraint, cancelled);
+            };
+        }
+        if (engine.duplex) {
+            auto start = std::move(engine.duplex.start);
+            auto step = std::move(engine.duplex.step);
+            auto stop = std::move(engine.duplex.stop);
+            engine.duplex.start = [state, start = std::move(start)](
+                    const MfqDuplexSessionParams& params) {
+                CudaExecutionContextScope context_scope(state->execution);
+                start(params);
+            };
+            engine.duplex.step = [state, step = std::move(step)](
+                    const MfqDuplexStepInput& input) {
+                CudaExecutionContextScope context_scope(state->execution);
+                return step(input);
+            };
+            engine.duplex.stop = [state, stop = std::move(stop)] {
+                CudaExecutionContextScope context_scope(state->execution);
+                stop();
+            };
+        }
     } else if (state->components.grid_vision) {
         engine.multimodal_generate = [generate_request](
                 const std::vector<int64_t>& prompt,
@@ -258,13 +305,16 @@ CudaEngine make_cuda_engine(
 CudaEngine load_cuda_engine(CudaEngineOptions options) {
     if (options.context_size == 0) options.context_size = 32768;
     auto runtime_config = resolve_cuda_runtime_config(options);
-    g_profiler.enabled = false;
+    auto execution = std::make_shared<CudaExecutionContext>();
+    setup_cuda_load(options, *execution);
+    CudaExecutionContextScope context_scope(*execution);
+    execution->profiler.enabled = false;
     mfq_tensor_backend::NoGradGuard no_grad;
     return with_loaded_cuda_model(
-        options, true,
+        *execution, options, true,
         [&](auto& model, auto& components, auto, auto) {
             return make_cuda_engine(
-                std::move(model), std::move(components),
+                execution, std::move(model), std::move(components),
                 std::move(runtime_config));
         });
 }

@@ -4,6 +4,8 @@
 #include <string>
 #include <string_view>
 
+struct CudaExecutionContext;
+
 namespace mfq::cuda {
 struct CudaLoadOptions;
 namespace commands { class ArgCursor; }
@@ -27,12 +29,15 @@ bool parse_command_option(
 void validate_command_options(const CommandOptions& options);
 
 int run_composite(
+    CudaExecutionContext& execution,
     const CudaLoadOptions& load,
     const CommandOptions& options);
 int run_duplex(
+    CudaExecutionContext& execution,
     const CudaLoadOptions& load,
     const CommandOptions& options);
 int run_eval_batch(
+    CudaExecutionContext& execution,
     const std::string& model_path,
     const std::string& config_path,
     std::int64_t context_size,

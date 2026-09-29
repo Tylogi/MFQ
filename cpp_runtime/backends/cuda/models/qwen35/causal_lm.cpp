@@ -1,7 +1,7 @@
 #include "causal_lm.h"
+#include "../causal_lm_impl.h"
 #include "linear_attention.h"
 
-#include "../causal_lm.h"
 #include "../components.h"
 #include "models/transformer.h"
 #include "storage/moe_expert_cache.h"
@@ -289,12 +289,13 @@ void LinearAttentionBlock::clear_speculative() noexcept {
 }
 
 mfq_tensor_backend::Tensor LinearAttentionBlock::forward_context(
+        CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor input,
         const Block::Context& context,
         const RopeCache& rope) {
     if (context.confirmed_prefix == 0) {
         return Block::forward_context(
-            std::move(input), context, rope);
+            execution, std::move(input), context, rope);
     }
     MFQ_RUNTIME_CHECK(
         input.is_cuda() && !speculative_pending &&
@@ -323,9 +324,10 @@ mfq_tensor_backend::Tensor LinearAttentionBlock::forward_context(
         // once so projections and FFN stay batched. Rollback replays only the
         // recurrent state prefix from this layer's retained projections.
         auto attention = forward_attention_cuda(
-            std::move(input), &speculative_recurrent);
+            execution, std::move(input), &speculative_recurrent);
         auto result = forward_ffn_cuda(
-            std::move(attention[0]), std::move(attention[1]));
+            execution, std::move(attention[0]),
+            std::move(attention[1]));
         ++speculative_projection_batches;
         ++speculative_ffn_batches;
         return result;
@@ -648,12 +650,12 @@ RuntimeComponents<mfq::cuda::Qwen35CausalLm> load_runtime_components(
     }
 
     if (result.plan.predictor == mfq::cuda::CudaPredictorAdapter::qwen35) {
-        const auto& execution = cuda_execution_context();
+        const auto& model_execution = *model.execution;
         const bool supported_placement =
-            !execution.layer_placement.enabled() &&
-            execution.dense_cpu_layer_count == 0 &&
-            execution.dsv4_cpu_offload_layers.empty() &&
-            !moe_expert_cache();
+            !model_execution.layer_placement.enabled() &&
+            model_execution.dense_cpu_layer_count == 0 &&
+            model_execution.dsv4_cpu_offload_layers.empty() &&
+            !model_execution.moe_expert_cache;
         if (supported_placement && model.num_experts() == 0 &&
                 model.supports_speculation()) {
             auto predictor = Qwen35Mtp::load_if_present(
@@ -673,3 +675,10 @@ RuntimeComponents<mfq::cuda::Qwen35CausalLm> load_runtime_components(
     }
     return result;
 }
+
+namespace mfq::cuda {
+
+template struct FullAttentionSessionCodec<Qwen35Model>;
+template struct CausalLm<Qwen35Model>;
+
+} // namespace mfq::cuda

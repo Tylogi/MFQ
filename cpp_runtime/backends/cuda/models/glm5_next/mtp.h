@@ -24,9 +24,11 @@ struct Glm5NextMtp final : MtpModule {
     Linear fusion;
     std::vector<Layer> layers;
     std::vector<int64_t> lengths;
+    CudaExecutionContext* execution=nullptr;
     int64_t batch=0;
 
     static std::optional<Glm5NextMtp> load_if_present(
+            CudaExecutionContext& execution,
             const mfq::ModelSource& file,
             const mfq::models::glm5_next::Config& main) {
         const bool any=std::any_of(file.tensors().begin(),file.tensors().end(),
@@ -37,6 +39,7 @@ struct Glm5NextMtp final : MtpModule {
             return std::nullopt;
         }
         Glm5NextMtp result;
+        result.execution=&execution;
         result.config=main;
         result.embedding_norm=dense(file,"predictor.embedding_norm.weight").to(tb::kFloat32);
         result.hidden_norm=dense(file,"predictor.hidden_norm.weight").to(tb::kFloat32);
@@ -92,14 +95,16 @@ struct Glm5NextMtp final : MtpModule {
         current=current.to(tb::kInt32);
         auto mask=(current==0).reshape({current.dim()==1?1:b,t,1});
         auto e=tb::where(mask,tb::zeros_like(embeds),embeds);
-        auto x=fusion(tb::cat({rms_norm(e,embedding_norm,config.eps),
+        auto x=fusion(*execution,tb::cat({rms_norm(e,embedding_norm,config.eps),
             rms_norm(hidden,hidden_norm,config.eps)},-1));
         auto& block=layers[layer];
-        auto attention=block.attention->forward(rms_norm(x,block.attention_norm,config.eps),cache);
+        auto attention=block.attention->forward(
+            *execution,rms_norm(x,block.attention_norm,config.eps),cache);
         auto residual=x.to(tb::kFloat32)+attention.to(tb::kFloat32);
         const auto dtype=x.scalar_type()==tb::kFloat32?tb::kFloat32:tb::kFloat16;
         auto branch=rms_norm(residual,block.ffn_norm,config.eps).to(dtype);
-        auto multi=residual+block.ffn(branch).to(tb::kFloat32);
+        auto multi=residual+block.ffn(
+            *execution,branch).to(tb::kFloat32);
         auto output=rms_norm(multi,output_norm,config.eps).to(dtype);
         if (cache) {batch=b;lengths[layer]=start+t;}
         return {output,multi};

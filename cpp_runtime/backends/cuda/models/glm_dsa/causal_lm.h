@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../causal_lm.h"
 #include "models/transformer.h"
 #include "models/include/glm_dsa.h"
 
@@ -144,6 +145,7 @@ struct GlmDsaBlock : Block {
     }
 
     void update_indexer(
+        CudaProfiler& profiler,
         mfq_tensor_backend::Tensor index_q, mfq_tensor_backend::Tensor index_weights,
         int64_t B, int64_t T, int64_t cache_pos,
         const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
@@ -159,12 +161,12 @@ struct GlmDsaBlock : Block {
         if (seq_len.has_value() && T == 1 && B == 1) {
             const int64_t planned_len = planned_kv_length > 0
                 ? planned_kv_length : logical_len;
-            auto scores = g_profiler.measure("glm.indexer_scores", [&]() {
+            auto scores = profiler.measure("glm.indexer_scores", [&]() {
                 return glm_dsa_indexer_scores_decode_cuda(
                     index_q, index_cache, index_weights,
                     seq_len.value(), planned_len);
             });
-            auto selected = g_profiler.measure("glm.indexer_topk", [&]() {
+            auto selected = profiler.measure("glm.indexer_topk", [&]() {
                 return mfq_tensor_backend::topk(scores, c.index_topk, -1, true, false);
             });
             shared_state->topk_indices =
@@ -193,12 +195,12 @@ struct GlmDsaBlock : Block {
             const int64_t count = std::min<int64_t>(rows_per_chunk, sparse_rows - start);
             auto q_chunk = index_q.narrow(1, prefix_rows + start, count).contiguous();
             auto w_chunk = index_weights.narrow(1, prefix_rows + start, count).contiguous();
-            auto scores = g_profiler.measure("glm.indexer_scores", [&]() {
+            auto scores = profiler.measure("glm.indexer_scores", [&]() {
                 return glm_dsa_indexer_scores_cuda(
                     q_chunk, index_cache, w_chunk,
                     cache_pos + prefix_rows + start, logical_len);
             });
-            auto selected = g_profiler.measure("glm.indexer_topk", [&]() {
+            auto selected = profiler.measure("glm.indexer_topk", [&]() {
                 return mfq_tensor_backend::topk(scores, c.index_topk, -1, true, false);
             });
             indices.narrow(1, start, count).copy_(
@@ -209,17 +211,20 @@ struct GlmDsaBlock : Block {
     }
 
     mfq_tensor_backend::Tensor forward(
-        mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, int64_t cache_pos,
+        CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos,
+        int64_t cache_pos,
         const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
         const RopeCache & rope,
         const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
         const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) override {
         return forward_impl(
-            std::move(x), std::move(pos), cache_pos, seq_len, rope,
+            execution, std::move(x), std::move(pos), cache_pos, seq_len, rope,
             cache_positions, attention_mask, 0);
     }
 
     mfq_tensor_backend::Tensor forward_context(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x,
             const Context& context,
             const RopeCache& rope) override {
@@ -227,12 +232,14 @@ struct GlmDsaBlock : Block {
             context.confirmed_prefix == 0,
             "GLM DSA does not support speculative verification");
         return forward_impl(
-            std::move(x), context.positions, context.cache_position,
+            execution, std::move(x), context.positions,
+            context.cache_position,
             context.sequence_lengths, rope, context.cache_positions,
             context.attention_mask, context.planned_kv_length);
     }
 
     mfq_tensor_backend::Tensor forward_impl(
+        CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos,
         int64_t cache_pos,
         const MfqOptional<mfq_tensor_backend::Tensor>& seq_len,
@@ -240,6 +247,7 @@ struct GlmDsaBlock : Block {
         const MfqOptional<mfq_tensor_backend::Tensor>& cache_positions,
         const MfqOptional<mfq_tensor_backend::Tensor>& attention_mask,
         int64_t planned_kv_length) {
+        auto& profiler = execution.profiler;
         const auto& c = config;
         (void)cache_positions;
         (void)attention_mask;
@@ -266,25 +274,25 @@ struct GlmDsaBlock : Block {
 
         auto residual = x.scalar_type() == mfq_tensor_backend::kFloat16
             ? x.contiguous() : x.to(mfq_tensor_backend::kFloat16).contiguous();
-        auto xn = g_profiler.measure("glm.attn_norm", [&]() {
+        auto xn = profiler.measure("glm.attn_norm", [&]() {
             return rms_norm_f16_cuda(
                 residual.reshape({B * T, H}), attn_norm,
                 c.rms_norm_eps, 0.0).reshape({B, T, H});
         });
-        auto first = g_profiler.measure("glm.input_proj", [&]() {
-            return input_proj.forward(xn);
+        auto first = profiler.measure("glm.input_proj", [&]() {
+            return input_proj.forward(execution, xn);
         });
         const size_t expected_first = full_indexer ? 4u : 2u;
         if (first.size() != expected_first) {
             throw std::runtime_error("GLM DSA input projection count mismatch");
         }
-        auto qr = g_profiler.measure("glm.q_a_norm", [&]() {
+        auto qr = profiler.measure("glm.q_a_norm", [&]() {
             return rms_norm_f16_cuda(
                 first[0].reshape({B * T, c.q_lora_rank}).to(mfq_tensor_backend::kFloat16).contiguous(),
                 q_a_norm, 1e-6, 0.0).reshape({B, T, c.q_lora_rank});
         });
-        auto second = g_profiler.measure("glm.q_proj", [&]() {
-            return q_proj.forward(qr);
+        auto second = profiler.measure("glm.q_proj", [&]() {
+            return q_proj.forward(execution, qr);
         });
         const size_t expected_second = full_indexer ? 2u : 1u;
         if (second.size() != expected_second) {
@@ -297,14 +305,14 @@ struct GlmDsaBlock : Block {
             .contiguous();
         auto q_pe = q_main.index({Slice(), Slice(), Slice(), Slice(kNope, kNope + kRope)})
             .permute({0, 2, 1, 3}).contiguous();
-        q_pe = g_profiler.measure("glm.q_rope", [&]() {
+        q_pe = profiler.measure("glm.q_rope", [&]() {
             return glm_interleaved_rope_cuda(
                 q_pe, pos.contiguous(), rope.cos, rope.sin, kRope);
         });
 
         auto compressed = first[1].to(mfq_tensor_backend::kFloat16)
             .reshape({B, T, kLatent + kRope});
-        auto kv_latent = g_profiler.measure("glm.kv_a_norm", [&]() {
+        auto kv_latent = profiler.measure("glm.kv_a_norm", [&]() {
             auto raw = compressed.index({Slice(), Slice(), Slice(0, kLatent)})
                 .contiguous();
             return rms_norm_f16_cuda(
@@ -313,7 +321,7 @@ struct GlmDsaBlock : Block {
         });
         auto k_pe = compressed.index({Slice(), Slice(), Slice(kLatent, kLatent + kRope)})
             .reshape({B, T, 1, kRope}).permute({0, 2, 1, 3}).contiguous();
-        k_pe = g_profiler.measure("glm.k_rope", [&]() {
+        k_pe = profiler.measure("glm.k_rope", [&]() {
             return glm_interleaved_rope_cuda(
                 k_pe, pos.contiguous(), rope.cos, rope.sin, kRope);
         });
@@ -321,14 +329,14 @@ struct GlmDsaBlock : Block {
             kv_latent,
             k_pe.permute({0, 2, 1, 3}).reshape({B, T, kRope})}, -1)
             .contiguous();
-        g_profiler.measure("glm.kv_write", [&]() {
+        profiler.measure("glm.kv_write", [&]() {
             return glm_dsa_cache_write_cuda(
                 kv_cache.view({B, c.max_position_embeddings, kMlaWidth}),
                 kv_rows, pos.contiguous());
         });
 
         if (full_indexer) {
-            auto index_k = g_profiler.measure("glm.indexer_k_norm", [&]() {
+            auto index_k = profiler.measure("glm.indexer_k_norm", [&]() {
                 return glm_dsa_indexer_layer_norm_cuda(
                     first[2].to(mfq_tensor_backend::kFloat16).reshape({B, T, c.index_head_dim}).contiguous(),
                     index_k_norm, index_k_bias, 1e-5);
@@ -338,7 +346,7 @@ struct GlmDsaBlock : Block {
                     .permute({0, 2, 1, 3}).contiguous(),
                 pos.contiguous(), rope.cos, rope.sin, kRope)
                 .permute({0, 2, 1, 3}).reshape({B, T, c.index_head_dim}).contiguous();
-            g_profiler.measure("glm.indexer_k_write", [&]() {
+            profiler.measure("glm.indexer_k_write", [&]() {
                 return glm_dsa_cache_write_cuda(
                     index_cache, index_k, pos.contiguous());
             });
@@ -351,11 +359,11 @@ struct GlmDsaBlock : Block {
             auto index_weights = first[3].reshape({B, T, c.index_n_heads})
                 .to(mfq_tensor_backend::kFloat32).contiguous();
             update_indexer(
-                index_q, index_weights, B, T, cache_pos, seq_len,
+                profiler, index_q, index_weights, B, T, cache_pos, seq_len,
                 planned_kv_length);
         }
 
-        auto q_absorbed = g_profiler.measure("glm.embed_q", [&]() {
+        auto q_absorbed = profiler.measure("glm.embed_q", [&]() {
             return headwise_project(embed_q, q_nope, B, T, kHeads);
         }).permute({0, 2, 1, 3}).contiguous();
         auto q_mla = mfq_tensor_backend::cat({q_absorbed, q_pe}, -1)
@@ -364,7 +372,7 @@ struct GlmDsaBlock : Block {
             static_cast<double>(kNope + kRope));
         mfq_tensor_backend::Tensor attended;
         if (!shared_state->topk_indices.defined()) {
-            attended = g_profiler.measure("glm.attention_dense", [&]() {
+            attended = profiler.measure("glm.attention_dense", [&]() {
                 return dense_attention(
                     q_mla, logical_len, B, seq_len, scale,
                     planned_kv_length);
@@ -377,7 +385,7 @@ struct GlmDsaBlock : Block {
             }
             mfq_tensor_backend::Tensor dense_out;
             if (prefix > 0) {
-                dense_out = g_profiler.measure("glm.attention_dense_prefix", [&]() {
+                dense_out = profiler.measure("glm.attention_dense_prefix", [&]() {
                     return dense_attention(
                         q_mla.narrow(2, 0, prefix).contiguous(),
                         cache_pos + prefix, B, mfq_nullopt, scale,
@@ -385,7 +393,7 @@ struct GlmDsaBlock : Block {
                 });
             }
             shared_state->ensure_meta();
-            auto sparse_out = g_profiler.measure("glm.attention_sparse", [&]() {
+            auto sparse_out = profiler.measure("glm.attention_sparse", [&]() {
                 return attention_glm_mla_sparse_cuda(
                     q_mla.narrow(2, prefix, sparse_rows).contiguous(),
                     kv_cache.view({B, c.max_position_embeddings, kMlaWidth}),
@@ -395,16 +403,17 @@ struct GlmDsaBlock : Block {
             attended = prefix > 0
                 ? mfq_tensor_backend::cat({dense_out, sparse_out}, 1) : sparse_out;
         }
-        auto value_heads = g_profiler.measure("glm.unembed_out", [&]() {
+        auto value_heads = profiler.measure("glm.unembed_out", [&]() {
             return headwise_project(
                 unembed_out, attended.to(mfq_tensor_backend::kFloat16).contiguous(),
                 B, T, kHeads);
         });
-        auto attn_out = g_profiler.measure("glm.o_proj", [&]() {
+        auto attn_out = profiler.measure("glm.o_proj", [&]() {
             return o_proj.forward(
+                execution,
                 value_heads.reshape({B, T, kHeads * kValue}).contiguous());
         });
-        auto attn_pair = g_profiler.measure("glm.attn_residual_ffn_norm", [&]() {
+        auto attn_pair = profiler.measure("glm.attn_residual_ffn_norm", [&]() {
             return acc_rms_norm_f16_cuda(
                 residual.reshape({B * T, H}),
                 attn_out.reshape({B * T, H}).to(mfq_tensor_backend::kFloat16).contiguous(),
@@ -412,8 +421,9 @@ struct GlmDsaBlock : Block {
         });
         auto hidden = attn_pair[0].reshape({B, T, H});
         auto ffn_input = attn_pair[1].reshape({B * T, H});
-        auto ffn_out = ffn.forward(ffn_input).reshape({B * T, H});
-        return g_profiler.measure("glm.ffn_residual", [&]() {
+        auto ffn_out = ffn.forward(execution, ffn_input)
+            .reshape({B * T, H});
+        return profiler.measure("glm.ffn_residual", [&]() {
             return acc_cuda(hidden.reshape({B * T, H}), ffn_out)
                 .reshape({B, T, H});
         });
@@ -434,3 +444,41 @@ std::unique_ptr<::Block> load_block(
     const std::shared_ptr<::GlmDsaSharedState>& state);
 
 } // namespace mfq::cuda::glm_dsa
+
+namespace mfq::cuda {
+
+struct GlmDsaModel : CausalLmArchitecture {
+    mfq::models::glm_dsa::Config config;
+    std::unordered_map<int, std::shared_ptr<GlmDsaSharedState>> block_states;
+
+    void adapter_load_config(
+        std::string_view payload,
+        const mfq::ModelGraph& graph,
+        const mfq::ModelSource& source);
+    bool adapter_uses_common_rope() const noexcept;
+    std::unique_ptr<Block> adapter_load_block(
+        const mfq::ModelSource& source,
+        int layer,
+        int device,
+        const std::string& type);
+    void adapter_set_max_position_embeddings(int64_t value) {
+        config.max_position_embeddings = value;
+    }
+};
+
+template <>
+struct CudaSessionCodec<GlmDsaModel> {
+    using Model = CausalLm<GlmDsaModel>;
+    static TextSessionStateKind kind(const Model& model);
+    static bool supports_paged(const Model& model);
+    static TextSessionState capture(
+        const Model& model,
+        const std::vector<int64_t>& tokens);
+    static void restore(
+        Model& model,
+        const TextSessionState& state);
+};
+
+extern template struct CausalLm<GlmDsaModel>;
+
+} // namespace mfq::cuda

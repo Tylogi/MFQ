@@ -4,6 +4,7 @@
 #include "mfq/kernels/cuda/qwen4_exp.h"
 #include "glm5_next/model.h"
 #include "qwen4_exp/model.h"
+#include "cuda_execution.h"
 #include "mfq_cuda_context.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -153,6 +154,7 @@ Tensor input(const Json& j) {
 }
 
 std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, const Json& p) {
+    CudaExecutionContext execution;
     const auto optional = [&](size_t i) -> std::optional<Tensor> {
         return a.at(i).defined() ? std::optional<Tensor>(a.at(i)) : std::nullopt;
     };
@@ -160,7 +162,7 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
     if (p.contains("scale") && !p.at("scale").is_null()) scale = p.at("scale").get<double>();
     if (op == "runtime_gdn") {
         const auto linear = [&](int index) -> mfq::cuda::qwen4_exp::Linear {
-            auto w=a.at(index);return [w](const Tensor& x) {return matmul(x.to(w.scalar_type()),w.transpose(-1,-2));};
+            auto w=a.at(index);return [w](CudaExecutionContext&, const Tensor& x) {return matmul(x.to(w.scalar_type()),w.transpose(-1,-2));};
         };
         mfq::cuda::qwen4_exp::GdnWeights w{linear(1),linear(2),linear(3),linear(4),linear(5),a.at(6),a.at(7),a.at(8),a.at(9)};
         mfq::cuda::qwen4_exp::Gdn block(std::move(w),p.at("key_heads"),p.at("value_heads"),p.at("width"),
@@ -171,7 +173,7 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
             else if (step.value("commit",false)) block.commit();
             else if (step.value("rollback",false)) block.rollback();
             else {
-                out.push_back(block.forward(a.at(0).narrow(1,step.at("begin"),step.at("count")),step.value("cache",true),step.value("confirmed",0)));
+                out.push_back(block.forward(execution,a.at(0).narrow(1,step.at("begin"),step.at("count")),step.value("cache",true),step.value("confirmed",0)));
                 out.push_back(block.conv_state());out.push_back(block.recurrent_state());
             }
         }
@@ -179,7 +181,7 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
     }
     if (op == "runtime_ngram" || op == "runtime_ple") {
         const auto weights=a.at(op=="runtime_ngram"?1:2);
-        std::vector<mfq::cuda::qwen4_exp::Linear> shards;
+        std::vector<mfq::cuda::qwen4_exp::Embedding> shards;
         for (int64_t i=0;i<weights.size(0);++i) {
             auto w=weights.select(0,i);
             shards.push_back([w](const Tensor& ids) {
@@ -202,7 +204,7 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
             }
         } else {
             const auto linear=[&](int i)->mfq::cuda::qwen4_exp::Linear {
-                auto w=a.at(i);return [w](const Tensor& x) {return matmul(x.to(w.scalar_type()),w.transpose(-1,-2));};
+                auto w=a.at(i);return [w](CudaExecutionContext&, const Tensor& x) {return matmul(x.to(w.scalar_type()),w.transpose(-1,-2));};
             };
             mfq::cuda::qwen4_exp::PleWeights w{linear(3),linear(4),a.at(5),a.at(6),a.at(7),a.at(8)};
             mfq::cuda::qwen4_exp::Ple block(std::move(embedding),std::move(w),p.at("hidden"),p.at("streams"),p.at("ngram"),p.value("eps",1e-6));
@@ -212,7 +214,7 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
                 else if (step.value("rollback",false)) block.rollback();
                 else {
                     const int64_t begin=step.at("begin"),count=step.at("count");
-                    out.push_back(block.forward(a.at(0).narrow(1,begin,count),a.at(1).narrow(1,begin,count),step.value("cache",true),step.value("confirmed",0)));
+                    out.push_back(block.forward(execution,a.at(0).narrow(1,begin,count),a.at(1).narrow(1,begin,count),step.value("cache",true),step.value("confirmed",0)));
                     out.push_back(block.conv_state());
                 }
             }
@@ -227,7 +229,7 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
     if (op == "runtime_qsa") {
         const auto linear = [&](int index) -> mfq::cuda::qwen4_exp::Linear {
             auto weight=a.at(index);
-            return [weight](const Tensor& x) {return matmul(x.to(weight.scalar_type()),weight.transpose(-1,-2));};
+            return [weight](CudaExecutionContext&, const Tensor& x) {return matmul(x.to(weight.scalar_type()),weight.transpose(-1,-2));};
         };
         auto rotary=std::make_shared<mfq::cuda::qwen4_exp::Rotary>(p.at("rotary"),p.at("maximum"),p.value("base",1e7),
             p.value("sections",std::vector<int64_t>{}),p.value("interleaved",false));
@@ -247,7 +249,7 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
                 const bool cache=step.value("cache",true);
                 auto full=cache && history.defined()?cat({history,pos},-1):pos;
                 std::vector<Tensor> trace;
-                out.push_back(block.forward(a.at(0).narrow(1,step.at("begin"),step.at("count")),pos,full,cache,
+                out.push_back(block.forward(execution,a.at(0).narrow(1,step.at("begin"),step.at("count")),pos,full,cache,
                     p.value("trace",false)?&trace:nullptr));
                 out.insert(out.end(),trace.begin(),trace.end());
                 if (cache) history=full;
@@ -270,7 +272,7 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
     if (op == "runtime_kda") {
         const auto linear = [&](int index) -> mfq::cuda::glm5_next::Linear {
             auto weight = a.at(index);
-            return [weight](const Tensor& x) { return matmul(x.to(weight.scalar_type()), weight.transpose(-1,-2)); };
+            return [weight](CudaExecutionContext&, const Tensor& x) { return matmul(x.to(weight.scalar_type()), weight.transpose(-1,-2)); };
         };
         mfq::cuda::glm5_next::KdaWeights weights{linear(1),linear(2),linear(3),linear(4),linear(5),linear(6),linear(7),
             a.at(8),a.at(9),a.at(10),a.at(11),a.at(12),a.at(13)};
@@ -282,7 +284,7 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
             else if (step.value("commit", false)) block.commit();
             else if (step.value("reset", false)) block.reset();
             else {
-                out.push_back(block.forward(a.at(0).narrow(1, step.at("begin"), step.at("count")),
+                out.push_back(block.forward(execution,a.at(0).narrow(1, step.at("begin"), step.at("count")),
                     step.value("cache", true), step.value("confirmed", 0)));
                 out.push_back(block.conv_state());
                 out.push_back(block.recurrent_state());

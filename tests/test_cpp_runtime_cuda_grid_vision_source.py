@@ -22,8 +22,12 @@ METAL_MM = (ROOT / "cpp_runtime/backends/metal/runtime/mlx_multimodal.cpp").read
 PLAN = (ROOT / "cpp_runtime/backends/cuda/include/cuda_model_plan.h").read_text()
 PREPARED = (ROOT / "cpp_runtime/backends/cuda/engine/cuda_execution.h").read_text()
 CUDA_COMPONENTS = "\n".join(
-    (CUDA_ROOT / "models" / name).read_text()
-    for name in ("components.h", "components.cpp")
+    path.read_text()
+    for path in (
+        CUDA_ROOT / "models" / "components.h",
+        CUDA_ROOT / "models" / "components.cpp",
+        CUDA_ROOT / "models" / "qwen35" / "causal_lm.cpp",
+    )
 )
 
 

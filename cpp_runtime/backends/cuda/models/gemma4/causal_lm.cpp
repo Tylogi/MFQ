@@ -1,6 +1,6 @@
 #include "causal_lm.h"
+#include "../causal_lm_impl.h"
 
-#include "../causal_lm.h"
 #include "models/transformer.h"
 
 #include <bit>
@@ -165,9 +165,16 @@ Gemma4Model::adapter_prepare_hidden(
         mfq_tensor_backend::Tensor hidden,
         int64_t,
         int64_t) const {
-    return g_profiler.measure("model.embed_scale", [&]() {
+    return execution->profiler.measure("model.embed_scale", [&]() {
         return hidden * embed_scale;
     });
 }
+
+} // namespace mfq::cuda
+
+namespace mfq::cuda {
+
+template struct CudaSessionCodec<Gemma4Model>;
+template struct CausalLm<Gemma4Model>;
 
 } // namespace mfq::cuda

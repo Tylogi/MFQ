@@ -160,19 +160,23 @@ struct FFN {
     bool tensor_parallel_dense_compatible() const;
 
     mfq_tensor_backend::Tensor forward_tensor_parallel_dense(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor xh) const;
 
     bool expert_parallel_moe_compatible() const;
 
     mfq_tensor_backend::Tensor forward_expert_parallel_moe(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route,
             mfq_tensor_backend::Tensor route_weights) const;
 
     mfq_tensor_backend::Tensor forward_dense_f32_down_kld(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor xh) const;
 
     mfq_tensor_backend::Tensor forward_impl(
+        CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x,
         MfqOptional<mfq_tensor_backend::Tensor> input_ids,
         bool allow_important_neurons) const;
@@ -182,10 +186,12 @@ struct FFN {
         const mfq_tensor_backend::Tensor & residual) const;
 
     mfq_tensor_backend::Tensor forward_fused_residual(
+        CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x,
         mfq_tensor_backend::Tensor residual) const;
 
     mfq_tensor_backend::Tensor forward(
+        CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x,
         MfqOptional<mfq_tensor_backend::Tensor> input_ids =
             mfq_nullopt) const;
@@ -286,6 +292,7 @@ struct Block {
     virtual void commit_speculative() {}
     virtual void rollback_speculative(int64_t) {}
     virtual mfq_tensor_backend::Tensor forward(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x,
             mfq_tensor_backend::Tensor pos,
             int64_t cache_pos,
@@ -294,6 +301,7 @@ struct Block {
             const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
             const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) = 0;
     virtual mfq_tensor_backend::Tensor forward_context(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x,
             const Context & context,
             const RopeCache & rope) {
@@ -301,7 +309,7 @@ struct Block {
             context.confirmed_prefix == 0 || supports_speculation(),
             "block does not support speculative verification");
         return forward(
-            std::move(x), context.positions, context.cache_position,
+            execution, std::move(x), context.positions, context.cache_position,
             context.sequence_lengths, rope, context.cache_positions,
             context.attention_mask);
     }
@@ -353,6 +361,7 @@ struct FullBlock : Block {
     void reset(int64_t B) override;
 
     mfq_tensor_backend::Tensor forward(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x,
             mfq_tensor_backend::Tensor pos,
             int64_t cache_pos,
@@ -362,11 +371,13 @@ struct FullBlock : Block {
             const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) override;
 
     mfq_tensor_backend::Tensor forward_context(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x,
             const Context& context,
             const RopeCache& rope) override;
 
     mfq_tensor_backend::Tensor forward_impl(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x,
             mfq_tensor_backend::Tensor pos,
             int64_t cache_pos,

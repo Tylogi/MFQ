@@ -48,6 +48,7 @@ static std::pair<Tensor, Tensor> dspark_full_attention_plan(
 }
 
 struct DeepseekV41Dspark final : MtpModule {
+    CudaExecutionContext* execution = nullptr;
     CommonConfig config;
     QuantLinear main_projection;
     Tensor main_norm;
@@ -63,6 +64,7 @@ struct DeepseekV41Dspark final : MtpModule {
     std::int64_t position = 0;
 
     static std::unique_ptr<Block> load_stage(
+        CudaExecutionContext& execution,
         const mfq::ModelSource& model,
         const CommonConfig& config,
         std::int64_t stage) {
@@ -129,7 +131,7 @@ struct DeepseekV41Dspark final : MtpModule {
         result->rope = Dsv4RopeTable(
             config.max_position_embeddings, config.rope_theta, 0);
         result->cuda_device =
-            cuda_execution_context().layer_placement.primary_device();
+            execution.layer_placement.primary_device();
 
         const auto function_width = config.hc_mult * config.hidden;
         const auto valid_mhc = [&](const Tensor& function,
@@ -179,6 +181,7 @@ struct DeepseekV41Dspark final : MtpModule {
     }
 
     static std::optional<DeepseekV41Dspark> load_if_present(
+        CudaExecutionContext& execution,
         const mfq::ModelSource& model,
         const CommonConfig& config) {
         const bool root = has_tensor(model,
@@ -197,6 +200,7 @@ struct DeepseekV41Dspark final : MtpModule {
             config.has_dspark(),
             "DeepSeek-V4.1 model source has DSpark tensors without configuration");
         DeepseekV41Dspark result;
+        result.execution = &execution;
         result.config = config;
         result.maximum_context = config.max_position_embeddings;
         const auto first = std::string("predictor.stage.0.");
@@ -220,7 +224,7 @@ struct DeepseekV41Dspark final : MtpModule {
              stage < result.config.n_mtp_layers;
              ++stage) {
             result.stages.push_back(load_stage(
-                model, result.config, stage));
+                execution, model, result.config, stage));
         }
         const auto target_width = result.config.hidden *
             static_cast<std::int64_t>(
@@ -315,7 +319,7 @@ struct DeepseekV41Dspark final : MtpModule {
             .clamp_min(1.0);
         auto main_x = weighted_rms(
             main_projection.forward(
-                (floating / scale)
+                *execution, (floating / scale)
                     .to(mfq_tensor_backend::kFloat16)
                     .contiguous()),
             main_norm,
@@ -334,7 +338,7 @@ struct DeepseekV41Dspark final : MtpModule {
             .contiguous();
         for (std::size_t index = 0; index < stages.size(); ++index) {
             auto key_value = weighted_rms(
-                stages[index]->key_value.forward(main_x),
+                stages[index]->key_value.forward(*execution, main_x),
                 stages[index]->key_value_norm,
                 config.rms_eps);
             key_value = rotate_token_major_tail(
@@ -360,10 +364,10 @@ struct DeepseekV41Dspark final : MtpModule {
         const Tensor& ring) {
         const auto tokens = input.size(1);
         auto q_rank = weighted_rms(
-            stage.query_a.forward(input),
+            stage.query_a.forward(*execution, input),
             stage.query_a_norm,
             config.rms_eps);
-        auto query = stage.query_b.forward(q_rank)
+        auto query = stage.query_b.forward(*execution, q_rank)
             .reshape({batch, tokens, config.n_heads, config.head_dim})
             .transpose(1, 2)
             .contiguous()
@@ -377,7 +381,7 @@ struct DeepseekV41Dspark final : MtpModule {
         query = dsv4_rotate_rope_tail(
             query, positions, stage.rope, false);
         auto current_keys = weighted_rms(
-            stage.key_value.forward(input),
+            stage.key_value.forward(*execution, input),
             stage.key_value_norm,
             config.rms_eps);
         current_keys = rotate_token_major_tail(
@@ -408,7 +412,7 @@ struct DeepseekV41Dspark final : MtpModule {
                        true)
                        .transpose(1, 2)
                        .contiguous();
-        return stage.output_projection(attended);
+        return stage.output_projection(*execution, attended);
     }
 
     MtpBlockDraft draft_block(
@@ -452,7 +456,7 @@ struct DeepseekV41Dspark final : MtpModule {
             auto& stage = *stages[index];
             auto attention_residual = hidden;
             auto attention_mix = stage.collapse(
-                attention_residual,
+                execution->profiler, attention_residual,
                 previous_pre,
                 stage.attention_mhc_function,
                 stage.attention_mhc_scale,
@@ -460,13 +464,14 @@ struct DeepseekV41Dspark final : MtpModule {
                 stage.attention_norm,
                 "deepseek_v41.dspark.mhc.attention.collapse");
             hidden = stage.expand(
+                execution->profiler,
                 attention(attention_mix.branch, stage, rings[index]),
                 attention_residual,
                 attention_mix,
                 "deepseek_v41.dspark.mhc.attention.expand");
             auto mlp_residual = hidden;
             auto mlp_mix = stage.collapse(
-                mlp_residual,
+                execution->profiler, mlp_residual,
                 attention_mix.next_pre,
                 stage.mlp_mhc_function,
                 stage.mlp_mhc_scale,
@@ -474,11 +479,11 @@ struct DeepseekV41Dspark final : MtpModule {
                 stage.mlp_norm,
                 "deepseek_v41.dspark.mhc.mlp.collapse");
             auto feed_forward = stage.mlp.forward(
-                mlp_mix.branch.reshape({-1, config.hidden}),
+                *execution, mlp_mix.branch.reshape({-1, config.hidden}),
                 draft_ids).reshape(
                     {batch, physical_width, config.hidden});
             hidden = stage.expand(
-                feed_forward,
+                execution->profiler, feed_forward,
                 mlp_residual,
                 mlp_mix,
                 "deepseek_v41.dspark.mhc.mlp.expand");
@@ -506,7 +511,7 @@ struct DeepseekV41Dspark final : MtpModule {
                 markov_embedding, previous)
                               .to(head_hidden.scalar_type())
                               .contiguous();
-            auto bias = markov_output.forward(markov)
+            auto bias = markov_output.forward(*execution, markov)
                             .to(mfq_tensor_backend::kFloat32);
             auto logits = base_logits.narrow(1, index, 1) + bias;
             const auto token = select_token(logits);
@@ -521,7 +526,7 @@ struct DeepseekV41Dspark final : MtpModule {
         }
         auto returned_hidden = head_hidden.narrow(1, 0, requested);
         auto confidence = confidence_projection.forward(
-            mfq_tensor_backend::cat(
+            *execution, mfq_tensor_backend::cat(
                 {returned_hidden,
                  mfq_tensor_backend::cat(markov_rows, 1)},
                 -1).contiguous())
@@ -535,10 +540,11 @@ struct DeepseekV41Dspark final : MtpModule {
 };
 
 std::unique_ptr<::MtpModule> load_dspark_if_present(
+        CudaExecutionContext& execution,
         const mfq::ModelSource& source,
         const CommonConfig& config) {
     auto predictor = DeepseekV41Dspark::load_if_present(
-        source, config);
+        execution, source, config);
     return predictor
         ? std::make_unique<DeepseekV41Dspark>(
               std::move(*predictor))

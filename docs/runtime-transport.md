@@ -5,7 +5,7 @@ its private runtime control surface through one selected communication module:
 
 ```text
 Python Server -> RuntimeClient -> stdio or private HTTP -> C++ Runtime
-                                              Transport -> Scheduler -> InferenceEngine
+                                              Transport -> Scheduler -> Engine
 ```
 
 The transport only speaks the private protocol; scheduling owns request

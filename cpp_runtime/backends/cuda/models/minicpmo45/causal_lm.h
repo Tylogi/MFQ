@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../causal_lm.h"
+#include "../full_attention_session_codec.h"
 #include "models/transformer.h"
 #include "models/include/minicpmo45.h"
 #include "mfq_cuda_ops.h"
@@ -26,6 +27,91 @@
 #include <utility>
 #include <vector>
 
+namespace mfq::cuda {
+
+struct MiniCPMO45Model : CausalLmArchitecture {
+    mfq::models::minicpmo45::Config config;
+
+    void adapter_load_config(
+        std::string_view payload,
+        const mfq::ModelGraph& graph,
+        const mfq::ModelSource& source);
+    bool adapter_uses_common_rope() const noexcept;
+    bool adapter_supports_dense_cpu_offload() const noexcept;
+    std::unique_ptr<Block> adapter_load_block(
+        const mfq::ModelSource& source,
+        int layer,
+        int device,
+        const std::string& type);
+    void adapter_set_max_position_embeddings(int64_t value) {
+        config.max_position_embeddings = value;
+    }
+    mfq_tensor_backend::Tensor adapter_embed(
+        mfq_tensor_backend::Tensor output) const;
+    MfqOptional<mfq_tensor_backend::Tensor> adapter_attention_mask(
+        MfqOptional<mfq_tensor_backend::Tensor> mask,
+        int64_t tokens,
+        int64_t cache_position) const;
+    mfq_tensor_backend::Tensor adapter_prepare_hidden(
+        mfq_tensor_backend::Tensor hidden,
+        int64_t batch,
+        int64_t tokens) const;
+    bool adapter_pass_cache_positions(bool, bool) const noexcept;
+    bool adapter_pass_attention_mask() const noexcept;
+    mfq_tensor_backend::Tensor adapter_finalize_hidden(
+        mfq_tensor_backend::Tensor hidden,
+        const mfq_tensor_backend::Tensor& output_norm,
+        int64_t batch,
+        int64_t tokens) const;
+    mfq_tensor_backend::Tensor adapter_logits(
+        const QuantLinear& lm_head,
+        mfq_tensor_backend::Tensor hidden) const;
+    mfq_tensor_backend::Tensor adapter_last_logits(
+        const QuantLinear& lm_head,
+        mfq_tensor_backend::Tensor hidden) const;
+    mfq_tensor_backend::Tensor adapter_next_token(
+        const QuantLinear& lm_head,
+        mfq_tensor_backend::Tensor hidden) const;
+    bool adapter_uses_decode_sequence_length() const noexcept;
+};
+
+template <>
+struct CudaSessionCodec<MiniCPMO45Model>
+    : FullAttentionSessionCodec<MiniCPMO45Model> {};
+
+extern template struct FullAttentionSessionCodec<MiniCPMO45Model>;
+
+extern template struct CausalLm<MiniCPMO45Model>;
+
+struct MiniCPMOTtsModel : CausalLmArchitecture {
+    mfq::models::ModelConfig config;
+
+    void adapter_load_config(
+        std::string_view payload,
+        const mfq::ModelGraph& graph,
+        const mfq::ModelSource& source);
+    bool adapter_uses_common_rope() const noexcept;
+    bool adapter_supports_dense_cpu_offload() const noexcept;
+    std::unique_ptr<Block> adapter_load_block(
+        const mfq::ModelSource& source,
+        int layer,
+        int device,
+        const std::string& type);
+    void adapter_set_max_position_embeddings(int64_t value) {
+        config.max_position_embeddings = value;
+    }
+};
+
+template <>
+struct CudaSessionCodec<MiniCPMOTtsModel>
+    : FullAttentionSessionCodec<MiniCPMOTtsModel> {};
+
+extern template struct FullAttentionSessionCodec<MiniCPMOTtsModel>;
+
+extern template struct CausalLm<MiniCPMOTtsModel>;
+
+} // namespace mfq::cuda
+
 inline constexpr const char * MINICPMO45_RESAMPLER_POS_EMBED_ASSET =
     "__mfq_asset__/minicpmo45-resampler-pos-embed-v1.bf16";
 
@@ -46,7 +132,9 @@ struct MiniCPMO45Linear {
         return result;
     }
 
-    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor input) const {
+    mfq_tensor_backend::Tensor forward(
+            CudaExecutionContext& execution,
+            mfq_tensor_backend::Tensor input) const {
         const auto output_dtype = input.scalar_type();
         if (weight.is_dense()) {
             const auto dense_dtype = weight.dense.scalar_type();
@@ -59,7 +147,7 @@ struct MiniCPMO45Linear {
                 .to(output_dtype)
                 .contiguous();
         }
-        auto output = weight.forward(input);
+        auto output = weight.forward(execution, input);
         if (bias.defined()) {
             output = output + bias.to(output.scalar_type());
         }
@@ -184,6 +272,7 @@ struct MiniCPMO45VisionAttention {
     }
 
     mfq_tensor_backend::Tensor forward(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor input,
             MfqOptional<mfq_tensor_backend::Tensor> mask) const {
         const int64_t batch = input.size(0);
@@ -193,13 +282,13 @@ struct MiniCPMO45VisionAttention {
                 .transpose(1, 2).contiguous();
         };
         auto attended = minicpmo45_attention(
-            reshape(q.forward(input)),
-            reshape(k.forward(input)),
-            reshape(v.forward(input)),
+            reshape(q.forward(execution, input)),
+            reshape(k.forward(execution, input)),
+            reshape(v.forward(execution, input)),
             mask, 1.0 / std::sqrt(static_cast<double>(head_dim)));
         attended = attended.transpose(1, 2).reshape(
             {batch, tokens, heads * head_dim});
-        return output.forward(attended);
+        return output.forward(execution, attended);
     }
 };
 
@@ -234,14 +323,19 @@ struct MiniCPMO45VisionLayer {
     }
 
     mfq_tensor_backend::Tensor forward(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor input,
             MfqOptional<mfq_tensor_backend::Tensor> mask) const {
         auto normalized = minicpmo45_layer_norm(
             input, norm1_weight, norm1_bias, 1e-6);
-        auto hidden = input + attention.forward(normalized, mask);
+        auto hidden = input + attention.forward(
+            execution, normalized, mask);
         normalized = minicpmo45_layer_norm(
             hidden, norm2_weight, norm2_bias, 1e-6);
-        auto mlp = fc2.forward(mfq_tensor_backend::gelu(fc1.forward(normalized), "tanh"));
+        auto mlp = fc2.forward(
+            execution,
+            mfq_tensor_backend::gelu(
+                fc1.forward(execution, normalized), "tanh"));
         return (hidden + mlp).contiguous();
     }
 };
@@ -284,6 +378,7 @@ struct MiniCPMO45VisionEncoder {
     }
 
     mfq_tensor_backend::Tensor forward(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor pixels,
             mfq_tensor_backend::Tensor patch_mask,
             mfq_tensor_backend::Tensor target_sizes) const {
@@ -367,7 +462,8 @@ struct MiniCPMO45VisionEncoder {
                 .masked_fill(invalid, -std::numeric_limits<float>::infinity());
         }
         for (const auto & layer : layers) {
-            embedded = layer.forward(embedded, attention_mask);
+            embedded = layer.forward(
+                execution, embedded, attention_mask);
         }
         embedded = minicpmo45_layer_norm(
             embedded, post_norm_weight, post_norm_bias, 1e-6);
@@ -468,6 +564,7 @@ struct MiniCPMO45Resampler {
     }
 
     mfq_tensor_backend::Tensor forward(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor input,
             mfq_tensor_backend::Tensor target_sizes) const {
         if (input.dim() != 3 || input.size(2) != 1152 ||
@@ -517,7 +614,7 @@ struct MiniCPMO45Resampler {
             key_padding.data(), std::vector<int64_t>{batch, length},
             mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kUInt8)).clone()
             .to(mfq_tensor_backend::kCUDA, mfq_tensor_backend::kBool);
-        auto kv = kv_projection.forward(input);
+        auto kv = kv_projection.forward(execution, input);
         kv = minicpmo45_layer_norm(
             kv, kv_norm_weight, kv_norm_bias, 1e-6);
         auto normalized_query = minicpmo45_layer_norm(
@@ -596,6 +693,7 @@ struct MiniCPMO45WhisperAttention {
     }
 
     mfq_tensor_backend::Tensor forward(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor input,
             MfqOptional<mfq_tensor_backend::Tensor> mask,
             mfq_tensor_backend::Tensor * key_cache = nullptr,
@@ -606,9 +704,9 @@ struct MiniCPMO45WhisperAttention {
             return value.reshape({batch, tokens, heads, head_dim})
                 .transpose(1, 2).contiguous();
         };
-        auto query_projection = q.forward(input);
-        auto key_projection = k.forward(input);
-        auto value_projection = v.forward(input);
+        auto query_projection = q.forward(execution, input);
+        auto key_projection = k.forward(execution, input);
+        auto value_projection = v.forward(execution, input);
         auto query = reshape(query_projection);
         auto key = reshape(key_projection);
         auto value = reshape(value_projection);
@@ -629,7 +727,7 @@ struct MiniCPMO45WhisperAttention {
             0.0, false, std::nullopt, false).contiguous();
         attended = attended.transpose(1, 2).reshape(
             {batch, tokens, heads * head_dim});
-        return output.forward(attended);
+        return output.forward(execution, attended);
     }
 };
 
@@ -671,6 +769,7 @@ struct MiniCPMO45WhisperLayer {
     }
 
     mfq_tensor_backend::Tensor forward(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor input,
             MfqOptional<mfq_tensor_backend::Tensor> mask,
             bool use_cache) {
@@ -678,14 +777,14 @@ struct MiniCPMO45WhisperLayer {
             input, attention_norm_weight, attention_norm_bias, 1e-5);
         auto attended = use_cache
             ? attention.forward(
-                normalized, mask, &key_cache, &value_cache)
-            : attention.forward(normalized, mask);
+                execution, normalized, mask, &key_cache, &value_cache)
+            : attention.forward(execution, normalized, mask);
         auto hidden = (input + attended).contiguous();
         normalized = minicpmo45_layer_norm(
             hidden, final_norm_weight, final_norm_bias, 1e-5);
-        auto fc1_output = fc1.forward(normalized);
+        auto fc1_output = fc1.forward(execution, normalized);
         auto activation = mfq_tensor_backend::gelu(fc1_output);
-        auto feed_forward = fc2.forward(activation);
+        auto feed_forward = fc2.forward(execution, activation);
         return (hidden + feed_forward).contiguous();
     }
 };
@@ -749,6 +848,7 @@ struct MiniCPMO45AudioEncoder {
     }
 
     mfq_tensor_backend::Tensor forward_streaming(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor features,
             int64_t prefix_extra_frames,
             int64_t suffix_extra_frames) {
@@ -809,13 +909,14 @@ struct MiniCPMO45AudioEncoder {
             {1, 1, tokens, past + tokens},
             hidden.options());
         for (auto & layer : layers) {
-            hidden = layer.forward(hidden, attention_mask, true);
+            hidden = layer.forward(
+                execution, hidden, attention_mask, true);
         }
         hidden = minicpmo45_layer_norm(
             hidden, final_norm_weight, final_norm_bias, 1e-5);
-        hidden = projector1.forward(hidden);
+        hidden = projector1.forward(execution, hidden);
         hidden = mfq_tensor_backend::relu(hidden);
-        hidden = projector2.forward(hidden);
+        hidden = projector2.forward(execution, hidden);
         if (hidden.size(1) < 5) {
             throw std::runtime_error(
                 "MiniCPM-o streaming audio chunk is too short for stride-5 pooling");
@@ -845,6 +946,7 @@ struct MiniCPMO45AudioEncoder {
     }
 
     mfq_tensor_backend::Tensor forward(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor features,
             mfq_tensor_backend::Tensor raw_lengths,
             bool use_cache = false) {
@@ -907,13 +1009,14 @@ struct MiniCPMO45AudioEncoder {
                 visible.logical_not().unsqueeze(1),
                 -std::numeric_limits<float>::infinity());
         for (auto & layer : layers) {
-            hidden = layer.forward(hidden, attention_mask, use_cache);
+            hidden = layer.forward(
+                execution, hidden, attention_mask, use_cache);
         }
         hidden = minicpmo45_layer_norm(
             hidden, final_norm_weight, final_norm_bias, 1e-5);
-        hidden = projector1.forward(hidden);
+        hidden = projector1.forward(execution, hidden);
         hidden = mfq_tensor_backend::relu(hidden);
-        hidden = projector2.forward(hidden);
+        hidden = projector2.forward(execution, hidden);
         hidden = mfq_tensor_backend::avg_pool1d(
             hidden.transpose(1, 2),
             std::vector<int64_t>{5},
@@ -924,6 +1027,7 @@ struct MiniCPMO45AudioEncoder {
 };
 
 struct MiniCPMO45TtsDecoder {
+    CudaExecutionContext* execution = nullptr;
     mfq::models::ModelConfig config;
     RopeCache rope;
     QuantLinear text_embedding;
@@ -954,8 +1058,11 @@ struct MiniCPMO45TtsDecoder {
         return result;
     }
 
-    static MiniCPMO45TtsDecoder load(const mfq::ModelSource & mfq) {
+    static MiniCPMO45TtsDecoder load(
+            CudaExecutionContext& execution,
+            const mfq::ModelSource& mfq) {
         MiniCPMO45TtsDecoder result;
+        result.execution = &execution;
         result.config = make_config();
         result.rope = RopeCache(
             result.config.max_position_embeddings,
@@ -1001,7 +1108,7 @@ struct MiniCPMO45TtsDecoder {
                 mfq, result.config, index, "full_attention", false, "tts");
             static_cast<FullBlock&>(*block).norm_weight_offset = 0.0;
             block->cuda_device =
-                cuda_execution_context().layer_placement.primary_device();
+                execution.layer_placement.primary_device();
             result.blocks.push_back(std::move(block));
         }
         return result;
@@ -1013,9 +1120,11 @@ struct MiniCPMO45TtsDecoder {
     }
 
     mfq_tensor_backend::Tensor semantic_projection(mfq_tensor_backend::Tensor hidden) const {
-        auto projected = semantic_projector1.forward(hidden);
+        auto projected = semantic_projector1.forward(
+            *execution, hidden);
         projected = mfq_tensor_backend::relu(projected);
-        projected = semantic_projector2.forward(projected);
+        projected = semantic_projector2.forward(
+            *execution, projected);
         auto norm = mfq_tensor_backend::sqrt(
             mfq_tensor_backend::sum(projected.to(mfq_tensor_backend::kFloat32).square(), -1, true))
             .clamp_min(1e-12);
@@ -1024,7 +1133,9 @@ struct MiniCPMO45TtsDecoder {
 
     mfq_tensor_backend::Tensor speaker_projection(mfq_tensor_backend::Tensor hidden) const {
         return speaker_projector2.forward(
-            mfq_tensor_backend::relu(speaker_projector1.forward(hidden)));
+            *execution,
+            mfq_tensor_backend::relu(
+                speaker_projector1.forward(*execution, hidden)));
     }
 
     mfq_tensor_backend::Tensor condition(
@@ -1115,7 +1226,7 @@ struct MiniCPMO45TtsDecoder {
         auto hidden = input_embeddings.to(mfq_tensor_backend::kBFloat16).contiguous();
         for (auto & block : blocks) {
             hidden = block->forward(
-                hidden, positions, cache_position,
+                *execution, hidden, positions, cache_position,
                 sequence_length, rope);
         }
         cache_position += tokens;
@@ -1462,13 +1573,14 @@ struct MiniCPMO45Runtime {
     MiniCPMO45TtsDecoder tts;
 
     static MiniCPMO45Runtime load(
+            CudaExecutionContext& execution,
             const std::string & model_path,
             const std::string & config_path,
             int64_t context_size) {
         return load_with_language(
             mfq::cuda::load_causal_lm<
                 mfq::cuda::MiniCPMO45CausalLm>(
-                    model_path, config_path, context_size));
+                    execution, model_path, config_path, context_size));
     }
 
     static MiniCPMO45Runtime load_with_language(
@@ -1482,7 +1594,8 @@ struct MiniCPMO45Runtime {
         result.vision = MiniCPMO45VisionEncoder::load(mfq);
         result.resampler = MiniCPMO45Resampler::load(mfq);
         result.audio = MiniCPMO45AudioEncoder::load(mfq);
-        result.tts = MiniCPMO45TtsDecoder::load(mfq);
+        result.tts = MiniCPMO45TtsDecoder::load(
+            *result.language.execution, mfq);
         return result;
     }
 
@@ -1514,9 +1627,10 @@ struct MiniCPMO45Runtime {
                     "MiniCPM-o image bounds require image tensors");
             }
             result.vision_states = vision.forward(
+                *language.execution,
                 pixels.to(mfq_tensor_backend::kCUDA), patch_mask, target_sizes);
             result.image_embeddings = resampler.forward(
-                result.vision_states, target_sizes);
+                *language.execution, result.vision_states, target_sizes);
             for (const auto & bound : images) {
                 if (bound.batch >= input_ids.size(0) ||
                         bound.source >= result.image_embeddings.size(0) ||
@@ -1541,7 +1655,9 @@ struct MiniCPMO45Runtime {
             }
             audio.reset();
             result.audio_embeddings = audio.forward(
-                audio_features.to(mfq_tensor_backend::kCUDA), audio_lengths, false);
+                *language.execution,
+                audio_features.to(mfq_tensor_backend::kCUDA),
+                audio_lengths, false);
             const auto valid_lengths =
                 MiniCPMO45AudioEncoder::pooled_lengths(audio_lengths);
             for (const auto & bound : audios) {
@@ -1713,6 +1829,7 @@ struct MiniCPMO45DuplexSession {
                 std::vector<int64_t>{reference_audio_features.size(2)},
                 mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64));
             auto embeddings = runtime.audio.forward(
+                *runtime.language.execution,
                 reference_audio_features.to(mfq_tensor_backend::kCUDA),
                 raw_lengths, false);
             feed_embeddings(embeddings);
@@ -1889,9 +2006,10 @@ struct MiniCPMO45DuplexSession {
                     "MiniCPM-o duplex image pixels require patch mask and target sizes");
             }
             auto vision_states = runtime.vision.forward(
+                *runtime.language.execution,
                 pixels.to(mfq_tensor_backend::kCUDA), patch_mask, target_sizes);
             auto image_embeddings = runtime.resampler.forward(
-                vision_states, target_sizes);
+                *runtime.language.execution, vision_states, target_sizes);
             std::vector<int64_t> counts;
             if (image_slice_counts.defined()) {
                 auto count_tensor = image_slice_counts
@@ -1929,6 +2047,7 @@ struct MiniCPMO45DuplexSession {
 
         if (audio_features.defined()) {
             audio_embeddings = runtime.audio.forward_streaming(
+                *runtime.language.execution,
                 audio_features.to(mfq_tensor_backend::kCUDA),
                 audio_prefix_extra_frames,
                 audio_suffix_extra_frames);
@@ -2126,6 +2245,7 @@ inline std::string minicpmo45_duplex_step_prefix(
 }
 
 int run_minicpmo45_duplex(
+    CudaExecutionContext& execution,
     const std::string& model_path,
     const std::string& config_path,
     const std::string& input_prefix,
@@ -2136,11 +2256,13 @@ int run_minicpmo45_duplex(
     bool greedy,
     std::int64_t seed);
 int run_minicpmo45_eval_batch(
+    CudaExecutionContext& execution,
     const std::string& model_path,
     const std::string& config_path,
     std::int64_t context_size,
     std::int64_t vision_batch_size);
 int run_minicpmo45_composite(
+    CudaExecutionContext& execution,
     const std::string& model_path,
     const std::string& config_path,
     const std::string& input_prefix,

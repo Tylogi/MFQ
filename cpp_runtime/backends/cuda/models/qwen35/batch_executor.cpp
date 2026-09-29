@@ -1,6 +1,6 @@
 #include "batch_executor.h"
 
-#include "models/causal_lm.h"
+#include "models/qwen35/causal_lm.h"
 #include "models/components.h"
 #include "cuda_sampling.h"
 #include "generation.h"
@@ -345,7 +345,7 @@ static Tensor qwen_logits_from_last_hidden(mfq::cuda::Qwen35CausalLm & model, Te
     auto last = hidden.index({Slice(), -1, Slice()})
         .to(mfq_tensor_backend::kFloat16).contiguous();
     return model.apply_final_logit_softcap(
-        model.lm_head.forward(last));
+        model.lm_head.forward(*model.execution, last));
 }
 
 static std::vector<const void *> qwen_decode_state_addresses(mfq::cuda::Qwen35CausalLm & model) {
@@ -604,6 +604,7 @@ struct QwenBatchOperations {
             bool yield_after_chunk,
             State& state,
             const Queue& queue) {
+        CudaExecutionContextScope context_scope(execution_);
         for (const auto& request : incoming) {
             state.prefilling.push_back(request);
         }
@@ -854,6 +855,7 @@ struct QwenBatchOperations {
     }
 
     void decode_active(State& state) {
+        CudaExecutionContextScope context_scope(execution_);
         if (state.active.empty()) return;
         std::lock_guard<std::mutex> model_lock(model_mutex_);
         const int primary = execution_.layer_placement.primary_device();
@@ -1148,6 +1150,7 @@ struct QwenBatchOperations {
             const std::vector<std::shared_ptr<Request>>& pending,
             State& state,
             std::exception_ptr error) {
+        CudaExecutionContextScope context_scope(execution_);
         std::vector<std::shared_ptr<Request>> prefilling(
             state.prefilling.begin(), state.prefilling.end());
         fail_requests(pending, error);

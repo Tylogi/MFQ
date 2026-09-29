@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../causal_lm.h"
 #include "models/transformer.h"
 #include "models/include/deepseek_v4.h"
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
@@ -415,7 +416,10 @@ struct Dsv4Block : Block {
         return g_dsv4_fused_hc ? candidate : reference;
     }
 
-    mfq_tensor_backend::Tensor output_projection(mfq_tensor_backend::Tensor attention) const {
+    mfq_tensor_backend::Tensor output_projection(
+            CudaExecutionContext& execution,
+            mfq_tensor_backend::Tensor attention) const {
+        auto& profiler = execution.profiler;
         const int64_t batch = attention.size(0);
         const int64_t tokens = attention.size(1);
         const int64_t rows = batch * tokens;
@@ -429,30 +433,30 @@ struct Dsv4Block : Block {
         if (groupwise_enabled && output_a.is_nint() &&
                 output_a.nint.w.bits == 8 && output_a.nint.w.gs == 48 &&
                 output_a.nint.w.out == groups * o_rank) {
-            auto low_rank = g_profiler.measure("dsv4.output_a", [&]() {
+            auto low_rank = profiler.measure("dsv4.output_a", [&]() {
                 return nint_matmul_groupwise_u8(
-                    output_a.nint.w, grouped, groups);
+                    profiler, output_a.nint.w, grouped, groups);
             });
-            return g_profiler.measure("dsv4.output_b", [&]() {
-                return output_b.forward(low_rank)
+            return profiler.measure("dsv4.output_b", [&]() {
+                return output_b.forward(execution, low_rank)
                     .reshape({batch, tokens, hidden_size});
             });
         }
         if (groupwise_enabled && output_a.is_mxfp8() &&
                 output_a.out() == groups * o_rank) {
-            auto low_rank = g_profiler.measure(
+            auto low_rank = profiler.measure(
                 "dsv4.output_a", [&]() {
                     return output_a.forward_mxfp8_groupwise(
-                        grouped, groups);
+                        execution, grouped, groups);
                 });
-            return g_profiler.measure("dsv4.output_b", [&]() {
-                return output_b.forward(low_rank)
+            return profiler.measure("dsv4.output_b", [&]() {
+                return output_b.forward(execution, low_rank)
                     .reshape({batch, tokens, hidden_size});
             });
         }
-        auto expanded = g_profiler.measure("dsv4.output_a", [&]() {
+        auto expanded = profiler.measure("dsv4.output_a", [&]() {
             return output_a.forward(
-                grouped.reshape({rows * groups, grouped.size(-1)}))
+                execution, grouped.reshape({rows * groups, grouped.size(-1)}))
                 .reshape({rows, groups, groups, o_rank});
         });
         std::vector<mfq_tensor_backend::Tensor> diagonal;
@@ -464,48 +468,50 @@ struct Dsv4Block : Block {
         auto low_rank = mfq_tensor_backend::stack(diagonal, 1)
             .reshape({rows, groups * o_rank})
             .to(mfq_tensor_backend::kFloat16).contiguous();
-        return g_profiler.measure("dsv4.output_b", [&]() {
-            return output_b.forward(low_rank)
+        return profiler.measure("dsv4.output_b", [&]() {
+            return output_b.forward(execution, low_rank)
                 .reshape({batch, tokens, hidden_size});
         });
     }
 
     mfq_tensor_backend::Tensor attention_forward(
+        CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x,
         mfq_tensor_backend::Tensor positions,
         int64_t cache_pos,
         const MfqOptional<mfq_tensor_backend::Tensor> & seq_len) {
+        auto& profiler = execution.profiler;
         const int64_t batch = x.size(0);
         const int64_t tokens = x.size(1);
         auto flat = x.reshape({batch * tokens, hidden_size})
             .to(mfq_tensor_backend::kFloat16).contiguous();
 
-        auto qr = g_profiler.measure("dsv4.q_a", [&]() {
-            return q_a.forward(flat);
+        auto qr = profiler.measure("dsv4.q_a", [&]() {
+            return q_a.forward(execution, flat);
         });
-        qr = g_profiler.measure("dsv4.q_a_norm", [&]() {
+        qr = profiler.measure("dsv4.q_a_norm", [&]() {
             return rms_norm_cuda(
                 qr.reshape({-1, qr.size(-1)}).to(mfq_tensor_backend::kFloat32),
                 q_a_norm, eps).to(mfq_tensor_backend::kFloat16).contiguous();
         });
-        auto queries = g_profiler.measure("dsv4.q_b", [&]() {
-            return q_b.forward(qr)
+        auto queries = profiler.measure("dsv4.q_b", [&]() {
+            return q_b.forward(execution, qr)
                 .reshape({batch, tokens, heads, head_dim})
                 .transpose(1, 2).contiguous()
                 .to(mfq_tensor_backend::kFloat32);
         });
-        queries = g_profiler.measure("dsv4.q_norm_rope", [&]() {
+        queries = profiler.measure("dsv4.q_norm_rope", [&]() {
             auto normalized = queries * mfq_tensor_backend::rsqrt(
                 queries.square().mean(-1, true) + eps);
             return dsv4_rotate_rope_tail(
                 normalized, positions, attention_rope, false);
         });
 
-        auto values = g_profiler.measure("dsv4.kv", [&]() {
-            return kv.forward(flat)
+        auto values = profiler.measure("dsv4.kv", [&]() {
+            return kv.forward(execution, flat)
                 .reshape({batch, tokens, head_dim});
         });
-        values = g_profiler.measure("dsv4.kv_norm_rope", [&]() {
+        values = profiler.measure("dsv4.kv_norm_rope", [&]() {
             auto normalized = rms_norm_cuda(
                 values.reshape({-1, head_dim}).to(mfq_tensor_backend::kFloat32),
                 kv_norm, eps).reshape({batch, tokens, head_dim})
@@ -518,14 +524,14 @@ struct Dsv4Block : Block {
 
         std::vector<mfq_tensor_backend::Tensor> compressor_parts;
         if (compress_ratio > 0) {
-            compressor_parts = g_profiler.measure(
+            compressor_parts = profiler.measure(
                 "dsv4.compressor_proj", [&]() {
                     return compressor.project(flat, batch, tokens);
                 });
         }
         std::vector<mfq_tensor_backend::Tensor> indexer_parts;
         if (compress_ratio == 4) {
-            indexer_parts = g_profiler.measure(
+            indexer_parts = profiler.measure(
                 "dsv4.indexer_compressor_proj", [&]() {
                     return indexer_compressor.project(flat, batch, tokens);
                 });
@@ -536,7 +542,7 @@ struct Dsv4Block : Block {
             auto local_positions = positions.narrow(
                 0, tokens - local_tokens, local_tokens)
                 .remainder(128).to(mfq_tensor_backend::kInt64).contiguous();
-            g_profiler.measure("dsv4.local_cache_prefill", [&]() {
+            profiler.measure("dsv4.local_cache_prefill", [&]() {
                 local_cache.index_copy_(
                     1, local_positions,
                     values.narrow(1, tokens - local_tokens, local_tokens));
@@ -545,7 +551,7 @@ struct Dsv4Block : Block {
 
             int64_t visible = 0;
             if (compress_ratio > 0) {
-                visible = g_profiler.measure(
+                visible = profiler.measure(
                     "dsv4.compressor_prefill", [&]() {
                         return compressor.prefill(
                             compressor_parts.at(0), compressor_parts.at(1),
@@ -553,7 +559,7 @@ struct Dsv4Block : Block {
                     });
             }
             if (compress_ratio == 4) {
-                const int64_t index_visible = g_profiler.measure(
+                const int64_t index_visible = profiler.measure(
                     "dsv4.indexer_compressor_prefill", [&]() {
                         return indexer_compressor.prefill(
                             indexer_parts.at(0), indexer_parts.at(1),
@@ -569,9 +575,9 @@ struct Dsv4Block : Block {
             auto int_options = mfq_tensor_backend::TensorOptions()
                 .device(x.device()).dtype(mfq_tensor_backend::kInt32);
             if (compress_ratio == 4 && visible > 512) {
-                auto index_query = g_profiler.measure(
+                auto index_query = profiler.measure(
                     "dsv4.indexer_q_prefill", [&]() {
-                        return indexer_q.forward(qr)
+                        return indexer_q.forward(execution, qr)
                             .reshape({batch, tokens, heads, 128})
                             .transpose(1, 2).contiguous();
                     });
@@ -584,7 +590,7 @@ struct Dsv4Block : Block {
                     shared_state->hadamard_signs, 128)
                     .reshape({batch, tokens, heads, 128});
                 index_query = dsv4_fp4_sim_cuda(index_query.contiguous());
-                auto weights = g_profiler.measure(
+                auto weights = profiler.measure(
                     "dsv4.indexer_weight_prefill", [&]() {
                         return mfq_tensor_backend::matmul(
                             x.reshape({batch * tokens, hidden_size})
@@ -593,7 +599,7 @@ struct Dsv4Block : Block {
                             .reshape({batch, tokens, heads})
                             .to(mfq_tensor_backend::kFloat16).contiguous();
                     });
-                auto scores = g_profiler.measure(
+                auto scores = profiler.measure(
                     "dsv4.indexer_scores_prefill", [&]() {
                         return dsv4_indexer_scores_cuda(
                             index_query,
@@ -601,7 +607,7 @@ struct Dsv4Block : Block {
                                 .narrow(1, 0, visible).contiguous(),
                             weights, 0, 4);
                     });
-                selected = g_profiler.measure(
+                selected = profiler.measure(
                     "dsv4.indexer_topk_prefill", [&]() {
                         return dsv4_topk512_cuda(scores);
                     });
@@ -615,12 +621,12 @@ struct Dsv4Block : Block {
 
             const int64_t plan_ratio =
                 compress_ratio > 0 ? compress_ratio : 1;
-            auto plan = g_profiler.measure(
+            auto plan = profiler.measure(
                 "dsv4.attention_plan_prefill", [&]() {
                     return dsv4_build_prefill_plan_cuda(
                         selected, 0, 0, visible, plan_ratio, 128);
                 });
-            auto cache = g_profiler.measure(
+            auto cache = profiler.measure(
                 "dsv4.attention_cache_prefill", [&]() {
                     return visible > 0
                         ? mfq_tensor_backend::cat({
@@ -629,21 +635,21 @@ struct Dsv4Block : Block {
                             .contiguous()
                         : values.contiguous();
                 });
-            auto attention = g_profiler.measure(
+            auto attention = profiler.measure(
                 "dsv4.sparse_attention_prefill", [&]() {
                     return attention_dsv4_sparse_cuda(
                         queries, cache, plan.at(0), plan.at(1),
                         sinks, shared_state->attention_meta,
                         1.0 / std::sqrt(static_cast<double>(head_dim)));
                 });
-            attention = g_profiler.measure(
+            attention = profiler.measure(
                 "dsv4.attention_inverse_rope_prefill", [&]() {
                     auto transposed = attention.transpose(1, 2).contiguous();
                     transposed = dsv4_rotate_rope_tail(
                         transposed, positions, attention_rope, true);
                     return transposed.transpose(1, 2).contiguous();
                 });
-            return output_projection(attention);
+            return output_projection(execution, attention);
         }
 
         std::vector<mfq_tensor_backend::Tensor> outputs;
@@ -653,7 +659,7 @@ struct Dsv4Block : Block {
             auto position = positions.narrow(0, token, 1);
             auto slot = mfq_tensor_backend::remainder(position, 128)
                 .to(mfq_tensor_backend::kInt64).contiguous();
-            g_profiler.measure("dsv4.local_cache_write", [&]() {
+            profiler.measure("dsv4.local_cache_write", [&]() {
                 glm_dsa_cache_write_cuda(
                     local_cache,
                     values.narrow(1, token, 1).contiguous(),
@@ -671,7 +677,7 @@ struct Dsv4Block : Block {
                         .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kInt64));
             }
             if (compress_ratio > 0) {
-                g_profiler.measure("dsv4.compressor_update", [&]() {
+                profiler.measure("dsv4.compressor_update", [&]() {
                     compressor.update(
                         compressor_parts.at(0).narrow(1, token, 1)
                             .contiguous(),
@@ -682,7 +688,7 @@ struct Dsv4Block : Block {
                 });
             }
             if (compress_ratio == 4) {
-                g_profiler.measure(
+                profiler.measure(
                     "dsv4.indexer_compressor_update", [&]() {
                         indexer_compressor.update(
                             indexer_parts.at(0).narrow(1, token, 1)
@@ -705,9 +711,9 @@ struct Dsv4Block : Block {
                     .narrow(1, token, 1)
                     .reshape({batch, qr.size(-1)})
                     .contiguous();
-                auto index_query = g_profiler.measure(
+                auto index_query = profiler.measure(
                     "dsv4.indexer_q", [&]() {
-                        return indexer_q.forward(qr_token)
+                        return indexer_q.forward(execution, qr_token)
                             .reshape({batch, 1, heads, 128})
                             .transpose(1, 2).contiguous();
                     });
@@ -721,7 +727,7 @@ struct Dsv4Block : Block {
                     .reshape({batch, 1, heads, 128});
                 index_query = dsv4_fp4_sim_cuda(
                     index_query.contiguous());
-                auto weights = g_profiler.measure(
+                auto weights = profiler.measure(
                     "dsv4.indexer_weight", [&]() {
                         return mfq_tensor_backend::matmul(
                             x.narrow(1, token, 1)
@@ -731,7 +737,7 @@ struct Dsv4Block : Block {
                             .reshape({batch, 1, heads})
                             .to(mfq_tensor_backend::kFloat16).contiguous();
                     });
-                auto scores = g_profiler.measure(
+                auto scores = profiler.measure(
                     "dsv4.indexer_scores", [&]() {
                         return dsv4_indexer_scores_cuda(
                             index_query,
@@ -739,7 +745,7 @@ struct Dsv4Block : Block {
                                 .narrow(1, 0, visible).contiguous(),
                             weights, cache_pos + token, 4);
                     });
-                selected = g_profiler.measure(
+                selected = profiler.measure(
                     "dsv4.indexer_topk", [&]() {
                         return dsv4_topk512_cuda(scores);
                     });
@@ -751,11 +757,11 @@ struct Dsv4Block : Block {
 
             const int64_t plan_ratio =
                 compress_ratio > 0 ? compress_ratio : 1;
-            auto plan = g_profiler.measure("dsv4.attention_plan", [&]() {
+            auto plan = profiler.measure("dsv4.attention_plan", [&]() {
                 return dsv4_build_decode_plan_cuda(
                     selected, length, visible, plan_ratio, 128);
             });
-            auto cache = g_profiler.measure("dsv4.attention_cache", [&]() {
+            auto cache = profiler.measure("dsv4.attention_cache", [&]() {
                 return visible > 0
                     ? mfq_tensor_backend::cat({
                         local_cache,
@@ -764,26 +770,27 @@ struct Dsv4Block : Block {
                     : local_cache;
             });
             auto query = queries.narrow(2, token, 1).contiguous();
-            auto attention = g_profiler.measure(
+            auto attention = profiler.measure(
                 "dsv4.sparse_attention", [&]() {
                     return attention_dsv4_sparse_cuda(
                         query, cache, plan.at(0), plan.at(1),
                         sinks, shared_state->attention_meta,
                         1.0 / std::sqrt(static_cast<double>(head_dim)));
                 });
-            attention = g_profiler.measure(
+            attention = profiler.measure(
                 "dsv4.attention_inverse_rope", [&]() {
                     auto transposed = attention.transpose(1, 2).contiguous();
                     transposed = dsv4_rotate_rope_tail(
                         transposed, position, attention_rope, true);
                     return transposed.transpose(1, 2).contiguous();
                 });
-            outputs.push_back(output_projection(attention));
+            outputs.push_back(output_projection(execution, attention));
         }
         return mfq_tensor_backend::cat(outputs, 1);
     }
 
     mfq_tensor_backend::Tensor forward(
+        CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x,
         mfq_tensor_backend::Tensor pos,
         int64_t cache_pos,
@@ -793,6 +800,7 @@ struct Dsv4Block : Block {
         const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) override {
         (void)cache_positions;
         (void)attention_mask;
+        auto& profiler = execution.profiler;
         if (!current_ids.defined()) {
             throw std::runtime_error(
                 "DeepSeek V4 block did not receive token ids");
@@ -800,11 +808,11 @@ struct Dsv4Block : Block {
         const int64_t batch = x.size(0);
         const int64_t tokens = x.size(1);
         auto residual = x;
-        auto pre = g_profiler.measure("dsv4.hc_attn_pre", [&]() {
+        auto pre = profiler.measure("dsv4.hc_attn_pre", [&]() {
             return hc_pre(
                 x, hc_attn_fn, hc_attn_scale, hc_attn_base, "attn_pre");
         });
-        auto normalized = g_profiler.measure("dsv4.attn_norm", [&]() {
+        auto normalized = profiler.measure("dsv4.attn_norm", [&]() {
             return rms_norm_cuda(
                 pre.at(0).reshape({batch * tokens, hidden_size})
                     .to(mfq_tensor_backend::kFloat32),
@@ -813,18 +821,18 @@ struct Dsv4Block : Block {
                 .to(mfq_tensor_backend::kFloat16);
         });
         auto attention = attention_forward(
-            normalized, pos, cache_pos, seq_len);
-        x = g_profiler.measure("dsv4.hc_attn_post", [&]() {
+            execution, normalized, pos, cache_pos, seq_len);
+        x = profiler.measure("dsv4.hc_attn_post", [&]() {
             return hc_post(
                 attention, residual, pre.at(1), pre.at(2), "attn_post");
         });
 
         residual = x;
-        pre = g_profiler.measure("dsv4.hc_ffn_pre", [&]() {
+        pre = profiler.measure("dsv4.hc_ffn_pre", [&]() {
             return hc_pre(
                 x, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, "ffn_pre");
         });
-        normalized = g_profiler.measure("dsv4.ffn_norm", [&]() {
+        normalized = profiler.measure("dsv4.ffn_norm", [&]() {
             return rms_norm_cuda(
                 pre.at(0).reshape({batch * tokens, hidden_size})
                     .to(mfq_tensor_backend::kFloat32),
@@ -833,11 +841,12 @@ struct Dsv4Block : Block {
                 .to(mfq_tensor_backend::kFloat16);
         });
         auto feed_forward = ffn.forward(
+            execution,
             normalized.reshape({batch * tokens, hidden_size}),
             current_ids);
         feed_forward = feed_forward.reshape(
             {batch, tokens, hidden_size});
-        return g_profiler.measure("dsv4.hc_ffn_post", [&]() {
+        return profiler.measure("dsv4.hc_ffn_post", [&]() {
             return hc_post(
                 feed_forward, residual, pre.at(1), pre.at(2), "ffn_post");
         });
@@ -852,18 +861,73 @@ struct OutputHeadWeights {
 };
 
 std::unique_ptr<::Block> load_block(
+    CudaExecutionContext& execution,
     const mfq::ModelSource& source,
     const Config& config,
     int layer,
     const std::string& type,
     const std::shared_ptr<::Dsv4SharedState>& state);
-void validate_load_options(const Config& config);
+void validate_load_options(
+    const Config& config,
+    CudaExecutionContext& execution);
 OutputHeadWeights load_output_head(const mfq::ModelSource& source);
 mfq_tensor_backend::Tensor finalize_hidden(
     mfq_tensor_backend::Tensor hidden,
     const OutputHeadWeights& output_head,
     const Config& config,
+    CudaProfiler& profiler,
     int64_t batch,
     int64_t tokens);
 
 } // namespace mfq::cuda::deepseek_v4
+
+namespace mfq::cuda {
+
+struct DeepseekV4Model : CausalLmArchitecture {
+    mfq::models::deepseek_v4::Config config;
+    deepseek_v4::OutputHeadWeights output_head;
+    std::unordered_map<int, std::shared_ptr<Dsv4SharedState>> block_states;
+
+    void adapter_load_config(
+        std::string_view payload,
+        const mfq::ModelGraph& graph,
+        const mfq::ModelSource& source);
+    void adapter_validate_load_options() const;
+    void adapter_load_final_state(
+        const mfq::ModelSource& source,
+        mfq_tensor_backend::Tensor& output_norm);
+    std::unique_ptr<Block> adapter_load_block(
+        const mfq::ModelSource& source,
+        int layer,
+        int device,
+        const std::string& type);
+    void adapter_set_max_position_embeddings(int64_t value) {
+        config.max_position_embeddings = value;
+    }
+    mfq_tensor_backend::Tensor adapter_prepare_hidden(
+        mfq_tensor_backend::Tensor hidden,
+        int64_t batch,
+        int64_t tokens) const;
+    mfq_tensor_backend::Tensor adapter_finalize_hidden(
+        mfq_tensor_backend::Tensor hidden,
+        const mfq_tensor_backend::Tensor& output_norm,
+        int64_t batch,
+        int64_t tokens) const;
+};
+
+template <>
+struct CudaSessionCodec<DeepseekV4Model> {
+    using Model = CausalLm<DeepseekV4Model>;
+    static TextSessionStateKind kind(const Model& model);
+    static bool supports_paged(const Model& model);
+    static TextSessionState capture(
+        const Model& model,
+        const std::vector<int64_t>& tokens);
+    static void restore(
+        Model& model,
+        const TextSessionState& state);
+};
+
+extern template struct CausalLm<DeepseekV4Model>;
+
+} // namespace mfq::cuda

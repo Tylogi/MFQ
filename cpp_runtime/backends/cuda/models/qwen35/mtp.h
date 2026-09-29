@@ -114,7 +114,8 @@ struct Qwen35Mtp final : MtpModule {
             .reshape_as(hidden);
         trace_gemma_stage(0, "mtp.embedding_norm", e);
         trace_gemma_stage(0, "mtp.hidden_norm", h);
-        auto x = fusion.forward(mfq_tensor_backend::cat({e, h}, -1));
+        auto x = fusion.forward(
+            *execution, mfq_tensor_backend::cat({e, h}, -1));
         trace_gemma_stage(0, "mtp.fusion", x);
         auto pos = positions.defined()
             ? tensor_to_cuda_device(
@@ -144,7 +145,7 @@ struct Qwen35Mtp final : MtpModule {
         }
         for (auto& block : blocks) {
             x = block->forward(
-                x, pos, cache_pos, length, *target.rope,
+                *execution, x, pos, cache_pos, length, *target.rope,
                 cache_positions);
         }
         cache_pos += tokens;

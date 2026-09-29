@@ -1,7 +1,8 @@
 #include "text_session_cache.h"
 
 #include "runtime_config.h"
-#include "models/causal_lm.h"
+#include "models/causal_models.h"
+#include "models/session_state.h"
 #include "mtp.h"
 #include "mfq_paged_prefix_cache.h"
 #include "paged_session_bindings.h"

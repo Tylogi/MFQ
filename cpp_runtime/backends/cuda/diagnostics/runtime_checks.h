@@ -1,8 +1,8 @@
 #pragma once
 
-#include "models/causal_lm.h"
 #include "engine/generation.h"
 #include "engine/mtp.h"
+#include "models/deepseek_v4/causal_lm.h"
 #include "diagnostics/flash_next_mtp.h"
 #include "qwen35/mtp.h"
 #include "quant_linear.h"
@@ -96,18 +96,18 @@ static int run_block_trace_compare(
     int64_t context_size,
     mfq_tensor_backend::Tensor ids)
 {
-    auto& execution = cuda_execution_context();
+    auto& execution = *test.execution;
     Model reference = [&]() {
         if (execution.n_gpu_layers < 0) {
             return mfq::cuda::load_causal_lm<Model>(
-                reference_model_path, config_path, context_size);
+                execution, reference_model_path, config_path, context_size);
         }
         const int saved_n_gpu_layers = execution.n_gpu_layers;
         const int saved_cpu_layers = execution.dense_cpu_layer_count;
         execution.n_gpu_layers = -1;
         try {
             auto loaded = mfq::cuda::load_causal_lm<Model>(
-                reference_model_path, config_path, context_size);
+                execution, reference_model_path, config_path, context_size);
             execution.n_gpu_layers = saved_n_gpu_layers;
             execution.dense_cpu_layer_count = saved_cpu_layers;
             return loaded;
@@ -157,8 +157,10 @@ static int run_block_trace_compare(
                   << " test_rms=" << test_rms << "\n";
     }
 
-    auto reference_logits = reference.lm_head.forward(reference_hidden).to(mfq_tensor_backend::kFloat32);
-    auto test_logits = test.lm_head.forward(test_hidden).to(mfq_tensor_backend::kFloat32);
+    auto reference_logits = reference.lm_head.forward(
+        execution, reference_hidden).to(mfq_tensor_backend::kFloat32);
+    auto test_logits = test.lm_head.forward(
+        execution, test_hidden).to(mfq_tensor_backend::kFloat32);
     double kl_sum = 0.0;
     int64_t same_top = 0;
     int64_t rows = 0;
@@ -286,7 +288,7 @@ static int run_block_trace_dump(
     final_hidden = token_slice(final_hidden);
     dump_terminal("final_norm", final_hidden);
     auto logits = model.apply_final_logit_softcap(
-        model.lm_head.forward(final_hidden));
+        model.lm_head.forward(*model.execution, final_hidden));
     dump_terminal("logits", logits);
     metadata.flush();
     if (!metadata) throw std::runtime_error("failed to write block trace metadata");
@@ -306,22 +308,25 @@ static int run_dsv4_hc_model_compare(
     model.reset(ids.size(0));
     auto reference_hidden = model.hidden_forward(
         ids, mfq_nullopt, mfq_nullopt, &reference_trace);
-    auto reference_logits =
-        model.lm_head.forward(reference_hidden).to(mfq_tensor_backend::kFloat32);
+    auto reference_logits = model.lm_head.forward(
+        *model.execution, reference_hidden)
+        .to(mfq_tensor_backend::kFloat32);
 
     g_dsv4_fused_hc = true;
     model.reset(ids.size(0));
     auto candidate_hidden = model.hidden_forward(
         ids, mfq_nullopt, mfq_nullopt, &candidate_trace);
-    auto candidate_logits =
-        model.lm_head.forward(candidate_hidden).to(mfq_tensor_backend::kFloat32);
+    auto candidate_logits = model.lm_head.forward(
+        *model.execution, candidate_hidden)
+        .to(mfq_tensor_backend::kFloat32);
 
     g_dsv4_fused_hc = false;
     model.reset(ids.size(0));
     auto repeat_hidden = model.hidden_forward(
         ids, mfq_nullopt, mfq_nullopt, &repeat_trace);
-    auto repeat_logits =
-        model.lm_head.forward(repeat_hidden).to(mfq_tensor_backend::kFloat32);
+    auto repeat_logits = model.lm_head.forward(
+        *model.execution, repeat_hidden)
+        .to(mfq_tensor_backend::kFloat32);
     g_dsv4_fused_hc = true;
     mfq_cuda_synchronize();
 
@@ -434,7 +439,8 @@ static int run_qwen35_mtp_check(
         const double tolerance = dtype == mfq_tensor_backend::kBFloat16 ? .008
             : dtype == mfq_tensor_backend::kFloat16 ? .001 : 2.e-6;
         for (int m = 1; m <= 6; ++m) for (int mode : {1, 2}) {
-            auto actual = linear.forward_input_mul(test_input.narrow(1, 0, m),
+            auto actual = linear.forward_input_mul(
+                execution, test_input.narrow(1, 0, m),
                 test_gate.narrow(1, 0, m), mode);
             MFQ_RUNTIME_CHECK(actual.scalar_type() == dtype && actual.size(1) == m,
                 "dense gate output dtype or shape mismatch");

@@ -29,14 +29,18 @@ public:
     }
     const Tensor& conv_state() const {return conv_;}
     const Tensor& recurrent_state() const {return state_;}
-    Tensor forward(const Tensor& x,bool cache,int64_t confirmed=0) {
+    Tensor forward(
+            CudaExecutionContext& execution,
+            const Tensor& x,bool cache,int64_t confirmed=0) {
         MFQ_RUNTIME_CHECK(x.is_cuda() && x.dim()==3 && x.size(0)>0 && x.size(1)>0 &&
             confirmed>=0 && confirmed<=x.size(1) && (!confirmed || cache),"invalid Qwen4 GDN input");
         if (confirmed>0 && confirmed<x.size(1)) {
             MFQ_RUNTIME_CHECK(!saved_conv_.defined(),"resolve previous Qwen4 GDN checkpoint");
-            auto first=forward(x.narrow(1,0,confirmed),true);
+            auto first=forward(
+                execution,x.narrow(1,0,confirmed),true);
             saved_conv_=conv_;saved_state_=state_;
-            try {return tb::cat({first,forward(x.narrow(1,confirmed,x.size(1)-confirmed),true)},1);}
+            try {return tb::cat({first,forward(
+                execution,x.narrow(1,confirmed,x.size(1)-confirmed),true)},1);}
             catch (...) {rollback();throw;}
         }
         const auto b=x.size(0),t=x.size(1),kw=nk_*d_,vw=nv_*d_,channels=2*kw+vw;
@@ -44,7 +48,7 @@ public:
         MFQ_RUNTIME_CHECK(!cache || !conv_.defined() || (conv_.size(0)==b && conv_.device()==x.device()),
             "reset Qwen4 GDN before changing batch/device");
         auto previous=cache && conv_.defined()?conv_:tb::zeros({b,kernel_-1,channels},options);
-        auto projected=w_.qkv(x).to(tb::kFloat32);
+        auto projected=w_.qkv(execution,x).to(tb::kFloat32);
         MFQ_RUNTIME_CHECK(projected.sizes().vec()==std::vector<int64_t>({b,t,channels}),"Qwen4 GDN projection width mismatch");
         auto joined=tb::cat({previous,projected},1).contiguous();
         auto convolved=ssm_conv_silu_cuda(joined,w_.conv.to(tb::kFloat32).contiguous(),tb::empty({0},options),t);
@@ -53,10 +57,10 @@ public:
         auto q=normalize(convolved.narrow(-1,0,kw).reshape({b,t,nk_,d_}).permute({0,2,1,3}));
         auto k=normalize(convolved.narrow(-1,kw,kw).reshape({b,t,nk_,d_}).permute({0,2,1,3}));
         auto v=convolved.narrow(-1,2*kw,vw).reshape({b,t,nv_,d_}).permute({0,2,1,3}).contiguous();
-        auto gate_input=w_.alpha(x).to(tb::kFloat32).reshape({b,t,nv_})+w_.dt_bias.to(tb::kFloat32).reshape({1,1,nv_});
+        auto gate_input=w_.alpha(execution,x).to(tb::kFloat32).reshape({b,t,nv_})+w_.dt_bias.to(tb::kFloat32).reshape({1,1,nv_});
         auto softplus=tb::clamp_min(gate_input,0)+tb::log1p(tb::exp(-gate_input.abs()));
         auto decay=(-w_.a_log.to(tb::kFloat32).exp().reshape({1,1,nv_})*softplus).transpose(1,2).contiguous();
-        auto beta=tb::sigmoid(w_.beta(x).to(tb::kFloat32).reshape({b,t,nv_})).transpose(1,2).contiguous();
+        auto beta=tb::sigmoid(w_.beta(execution,x).to(tb::kFloat32).reshape({b,t,nv_})).transpose(1,2).contiguous();
         auto initial=cache && state_.defined()?state_:Tensor{};
         Tensor attended,next_state;
         if (d_==32 || d_==64 || d_==128) {
@@ -76,11 +80,11 @@ public:
             }
             attended=tb::cat(out,2);
         }
-        auto z=w_.gate(x).reshape({b,t,nv_,d_}).permute({0,2,1,3}).to(tb::kFloat32);
+        auto z=w_.gate(execution,x).reshape({b,t,nv_,d_}).permute({0,2,1,3}).to(tb::kFloat32);
         auto gate=tb::sigmoid(z);
         if (silu_gate_) gate=z*gate;
         auto normalized=rms_norm(attended,w_.norm,eps_)*gate;
-        auto result=w_.output(normalized.permute({0,2,1,3}).reshape({b,t,vw}).to(x.scalar_type()));
+        auto result=w_.output(execution,normalized.permute({0,2,1,3}).reshape({b,t,vw}).to(x.scalar_type()));
         if (cache) {conv_=next_conv;state_=next_state;}
         return result;
     }
@@ -97,7 +101,7 @@ private:
 class NgramEmbedding {
 public:
     struct Context {int64_t batch=0;std::vector<int64_t> tokens;};
-    NgramEmbedding(std::vector<Linear> shards,int64_t rows,int64_t dimension,int64_t ngram,int64_t heads_per_ngram,
+    NgramEmbedding(std::vector<Embedding> shards,int64_t rows,int64_t dimension,int64_t ngram,int64_t heads_per_ngram,
         int64_t eos,std::vector<int64_t> multipliers,std::vector<int64_t> offsets,std::vector<int64_t> vocab)
         : shards_(std::move(shards)),rows_(rows),dimension_(dimension),ngram_(ngram),heads_(heads_per_ngram),eos_(eos),
           multipliers_(std::move(multipliers)),offsets_(std::move(offsets)),vocab_(std::move(vocab)) {
@@ -161,7 +165,7 @@ public:
         return result.reshape({b,t,nh*dimension_});
     }
 private:
-    std::vector<Linear> shards_;
+    std::vector<Embedding> shards_;
     int64_t rows_,dimension_,ngram_,heads_,eos_;
     std::vector<int64_t> multipliers_,offsets_,vocab_;
     Context context_;
@@ -179,26 +183,33 @@ public:
         conv_=saved_conv_;embedding_.restore(saved_context_);commit();
     }
     const Tensor& conv_state() const {return conv_;}
-    Tensor forward(const Tensor& x,const Tensor& ids,bool cache,int64_t confirmed=0) {
+    Tensor forward(
+            CudaExecutionContext& execution,
+            const Tensor& x,const Tensor& ids,bool cache,
+            int64_t confirmed=0) {
         MFQ_RUNTIME_CHECK(x.dim()==3 && ids.dim()==2 && x.size(0)==ids.size(0) && x.size(1)==ids.size(1) &&
             x.size(2)==hidden_*streams_ && confirmed>=0 && confirmed<=x.size(1) && (!confirmed || cache),"invalid Qwen4 PLE input");
         if (confirmed>0 && confirmed<x.size(1)) {
             MFQ_RUNTIME_CHECK(!saved_,"resolve previous Qwen4 PLE checkpoint");
-            auto first=forward(x.narrow(1,0,confirmed),ids.narrow(1,0,confirmed),true);
+            auto first=forward(
+                execution,x.narrow(1,0,confirmed),
+                ids.narrow(1,0,confirmed),true);
             saved_=true;saved_conv_=conv_;saved_context_=embedding_.context();
-            try {return tb::cat({first,forward(x.narrow(1,confirmed,x.size(1)-confirmed),ids.narrow(1,confirmed,x.size(1)-confirmed),true)},1);}
+            try {return tb::cat({first,forward(
+                execution,x.narrow(1,confirmed,x.size(1)-confirmed),
+                ids.narrow(1,confirmed,x.size(1)-confirmed),true)},1);}
             catch (...) {rollback();throw;}
         }
         auto context=embedding_.context();
         try {
             auto embeddings=embedding_.forward(ids,cache);
             const auto b=x.size(0),t=x.size(1);
-            auto key=mfq_qwen4_exp::grouped_rms_norm(w_.key(embeddings),w_.key_norm,hidden_,eps_).reshape({b,t,streams_,hidden_});
+            auto key=mfq_qwen4_exp::grouped_rms_norm(w_.key(execution,embeddings),w_.key_norm,hidden_,eps_).reshape({b,t,streams_,hidden_});
             auto query=mfq_qwen4_exp::grouped_rms_norm(x,w_.query_norm,hidden_,eps_).reshape({b,t,streams_,hidden_});
             auto score=(key.to(tb::kFloat32)*query.to(tb::kFloat32)).sum(-1)/std::sqrt(double(hidden_));
             auto sign=(score>0).to(tb::kFloat32)-(score<0).to(tb::kFloat32);
             auto root=sign*tb::clamp_min(score.abs(),1e-6).sqrt();
-            auto gated=(tb::sigmoid(root).unsqueeze(-1)*w_.value(embeddings).to(tb::kFloat32).unsqueeze(-2)).reshape({b,t,streams_*hidden_});
+            auto gated=(tb::sigmoid(root).unsqueeze(-1)*w_.value(execution,embeddings).to(tb::kFloat32).unsqueeze(-2)).reshape({b,t,streams_*hidden_});
             auto normalized=mfq_qwen4_exp::grouped_rms_norm(gated,w_.conv_norm,hidden_,eps_);
             auto result=mfq_qwen4_exp::ple_dilated_conv_silu(normalized,w_.conv,
                 cache && conv_.defined()?std::optional<Tensor>(conv_):std::nullopt,dilation_);
@@ -302,7 +313,10 @@ public:
             "invalid Qwen4 QSA cache truncation");
         keys_.truncate(keep);values_.truncate(keep);index_.truncate(keep);
     }
-    Tensor forward(const Tensor& hidden,const Tensor& current_positions,const Tensor& full_positions,bool use_cache,
+    Tensor forward(
+        CudaExecutionContext& execution,
+        const Tensor& hidden,const Tensor& current_positions,
+        const Tensor& full_positions,bool use_cache,
         std::vector<Tensor>* selection_trace=nullptr) {
         MFQ_RUNTIME_CHECK(hidden.is_cuda() && hidden.dim()==3 && hidden.size(0)>0 && hidden.size(1)>0,
             "Qwen4 QSA requires nonempty [B,T,H] input");
@@ -310,15 +324,15 @@ public:
         MFQ_RUNTIME_CHECK(t<=c_.maximum-offset && full_positions.size(-1)==offset+t &&
             (!use_cache || (offset==values_.position() && offset==index_.position())),
             "Qwen4 QSA cache/position geometry mismatch");
-        auto pair=w_.query(hidden).reshape({b,t,c_.heads,2*c_.width});
+        auto pair=w_.query(execution,hidden).reshape({b,t,c_.heads,2*c_.width});
         auto gate=pair.narrow(-1,c_.width,c_.width);
         auto query=rms_norm(pair.narrow(-1,0,c_.width),w_.query_norm.to(tb::kFloat32)+1,c_.eps).permute({0,2,1,3});
-        auto key=rms_norm(w_.key(hidden).reshape({b,t,c_.kv_heads,c_.width}),
+        auto key=rms_norm(w_.key(execution,hidden).reshape({b,t,c_.kv_heads,c_.width}),
             w_.key_norm.to(tb::kFloat32)+1,c_.eps).permute({0,2,1,3});
-        auto value=w_.value(hidden).reshape({b,t,c_.kv_heads,c_.width});
+        auto value=w_.value(execution,hidden).reshape({b,t,c_.kv_heads,c_.width});
         query=rotary_->forward(query,current_positions);
         key=rotary_->forward(key,current_positions).permute({0,2,1,3});
-        auto iqk=w_.index_query_key(hidden);
+        auto iqk=w_.index_query_key(execution,hidden);
         auto iq=rms_norm(iqk.narrow(-1,0,c_.index_heads*c_.index_width).reshape({b,t,c_.index_heads,c_.index_width}),
             w_.index_query_norm.to(tb::kFloat32)+1,c_.eps).permute({0,2,1,3});
         iq=rotary_->forward(iq,current_positions).permute({0,2,1,3});
@@ -346,7 +360,7 @@ public:
                 attended=mfq_qwen4_exp::sparse_gqa_attention(query,key,value,ids);
             }
             auto gated=attended.to(tb::kFloat32)*tb::sigmoid(gate.to(tb::kFloat32));
-            return w_.output(gated.reshape({b,t,c_.heads*c_.width}).to(hidden.scalar_type()));
+            return w_.output(execution,gated.reshape({b,t,c_.heads*c_.width}).to(hidden.scalar_type()));
         } catch (...) { if (use_cache) truncate(offset); throw; }
     }
 private:

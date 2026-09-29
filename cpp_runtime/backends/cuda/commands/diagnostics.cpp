@@ -117,10 +117,12 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
     explicit DiagnosticsCommand(mfq::cuda::DiagnosticsCommandOptions options)
         : mfq::cuda::DiagnosticsCommandOptions(std::move(options)) {}
     int run() { return with_command_errors([&]() -> int {
+        CudaExecutionContext execution;
+        CudaExecutionContextScope context_scope(execution);
         // Operator-only checks do not require loading a model.
         if (check_backend_bf16_add) return run_backend_bf16_add_check(4096, 10000);
         if (check_backend_argmax) return run_backend_argmax_check(151748, 2000);
-        setup_cuda_load(*this);
+        setup_cuda_load(*this, execution);
         if (!check_linear_cpu.empty()) {
             if (model_path.empty()) {
                 throw std::runtime_error("--check-linear-cpu requires --model");
@@ -132,7 +134,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 throw std::runtime_error("--check-linear-gate must be sigmoid or silu");
             }
             return run_cpu_linear_check(
-                model_path, check_linear_cpu, check_linear_m,
+                execution, model_path, check_linear_cpu, check_linear_m,
                 gate_mode, check_linear_reps);
         }
         if (!check_linear.empty()) {
@@ -144,7 +146,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 throw std::runtime_error("--check-linear-gate must be sigmoid or silu");
             }
             return run_linear_check(
-                model_path, check_linear, check_linear_m, gate_mode,
+                execution, model_path, check_linear, check_linear_m, gate_mode,
                 check_linear_reps);
         }
         if (!check_tp_linear.empty()) {
@@ -160,7 +162,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 : throw std::runtime_error(
                     "--check-tp-axis must be output or input");
             return run_tensor_parallel_linear_check(
-                model_path, check_tp_linear,
+                execution, model_path, check_tp_linear,
                 axis, check_tp_m);
         }
         if (!check_ep_moe.empty()) {
@@ -169,7 +171,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                     "--check-ep-moe requires --model");
             }
             return run_expert_parallel_moe_check(
-                model_path, check_ep_moe,
+                execution, model_path, check_ep_moe,
                 check_ep_moe_tokens,
                 check_ep_moe_routes);
         }
@@ -178,7 +180,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 throw std::runtime_error("--check-linear-group requires --model");
             }
             return run_linear_group_check(
-                model_path, check_linear_group, check_linear_m,
+                execution, model_path, check_linear_group, check_linear_m,
                 check_linear_reps);
         }
         if (!check_q8_embedding.empty()) {
@@ -214,7 +216,8 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 throw std::runtime_error("--check-gemma-geglu-layer requires --model");
             }
             return run_gemma_geglu_check(
-                model_path, check_gemma_geglu_layer, check_gemma_geglu_reps);
+                execution, model_path, check_gemma_geglu_layer,
+                check_gemma_geglu_reps);
         }
         if (check_mfq_container) {
             if (model_path.empty()) {
@@ -287,7 +290,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 throw std::runtime_error("--check-moe-layer requires --model");
             }
             return run_moe_check(
-                model_path, config_path, check_moe_layer, parse_ids(check_moe_tokens), check_moe_reps);
+                execution, model_path, config_path, check_moe_layer, parse_ids(check_moe_tokens), check_moe_reps);
         }
         if (!check_mfe_tensor.empty()) {
             if (model_path.empty()) {
@@ -318,7 +321,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 throw std::runtime_error("--check-dsv4-output-a requires --model");
             }
             return run_dsv4_output_a_check(
-                model_path, check_dsv4_output_a,
+                execution, model_path, check_dsv4_output_a,
                 check_dsv4_output_a_batch, check_dsv4_output_a_reps);
         }
         if (check_attention_decode > 0) {
@@ -360,7 +363,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                     "--minicpmo-eval-vision-batch-size must be positive");
             }
             return mfq::cuda::minicpmo45::run_eval_batch(
-                model_path, config_path, context_size,
+                execution, model_path, config_path, context_size,
                 minicpmo_eval_vision_batch_size);
         }
         if (model_path.empty()) {
@@ -415,9 +418,9 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             context_size = (int64_t)(
                 ids_file.empty() ? parse_ids(ids_arg) : load_ids_file(ids_file)).size();
         }
-        g_profiler.enabled = false;
+        execution.profiler.enabled = false;
         mfq_tensor_backend::NoGradGuard no_grad;
-        return with_loaded_cuda_model(*this,
+        return with_loaded_cuda_model(execution, *this,
             check_qwen35_mtp || check_flash_next_mtp || !bench_qwen35_mtp.empty(),
             [&](auto& model, auto& runtime_components,
                     auto t0, auto t1) -> int {
@@ -513,8 +516,8 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             (void)model.next_token(ids);
             mfq_cuda_synchronize();
             model.reset(1);
-            g_profiler.reset();
-            g_profiler.enabled = true;
+            execution.profiler.reset();
+            execution.profiler.enabled = true;
         }
         if (compare_decode_splitk) {
             auto run = [&](const char * split) {
@@ -526,7 +529,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 auto decode_id = ids.index({Slice(), -1}).reshape({1, 1});
                 auto hidden = model.hidden_forward(decode_id, mfq_nullopt, seq_len);
                 auto last = hidden.index({Slice(), -1, Slice()}).to(mfq_tensor_backend::kFloat16).contiguous();
-                auto logits = model.lm_head.forward(last).to(mfq_tensor_backend::kFloat32);
+                auto logits = model.lm_head.forward(execution, last).to(mfq_tensor_backend::kFloat32);
                 mfq_cuda_synchronize();
                 return logits;
             };
@@ -562,7 +565,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 auto seq_len = mfq_tensor_backend::tensor({decode_len}, cuda_i64);
                 auto hidden = model.hidden_forward(input, mfq_nullopt, seq_len);
                 auto last = hidden.index({Slice(), -1, Slice()}).to(mfq_tensor_backend::kFloat16).contiguous();
-                auto logits = model.lm_head.forward(last).to(mfq_tensor_backend::kFloat32);
+                auto logits = model.lm_head.forward(execution, last).to(mfq_tensor_backend::kFloat32);
                 reference_logits.push_back(logits.clone());
                 const int64_t next = logits.argmax(-1).template item<int64_t>();
                 teacher_tokens.push_back(next);
@@ -595,7 +598,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                     input, mfq_nullopt, seq_len, nullptr, mfq_nullopt,
                     nullptr, 0, planned_kv_length, 0);
                 auto last = hidden.index({Slice(), -1, Slice()}).to(mfq_tensor_backend::kFloat16).contiguous();
-                auto test = model.lm_head.forward(last).to(mfq_tensor_backend::kFloat32);
+                auto test = model.lm_head.forward(execution, last).to(mfq_tensor_backend::kFloat32);
                 const auto & ref = reference_logits[(size_t)step];
                 auto ref_logp = mfq_tensor_backend::log_softmax(ref, -1);
                 auto test_logp = mfq_tensor_backend::log_softmax(test, -1);
@@ -674,7 +677,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                     model.execution->gemma_trace_layer = -1;
                     auto last = hidden.index({Slice(), -1, Slice()})
                         .to(mfq_tensor_backend::kFloat16).contiguous();
-                    logits = model.lm_head.forward(last);
+                    logits = model.lm_head.forward(execution, last);
                 } else {
                     logits = model.last_logits(ids);
                 }
@@ -738,7 +741,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             return 0;
         }
         return generate_diagnostic_tokens(
-            model, ids, gen, profile, t0, t1);
+            execution, model, ids, gen, profile, t0, t1);
             });
     }); }
 };

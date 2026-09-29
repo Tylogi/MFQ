@@ -198,6 +198,14 @@ struct LayerPlacementConfig {
     int device_for_layer(int64_t layer) const;
 };
 
+struct MoeRouteLayerStats {
+    mfq_tensor_backend::Tensor counts;
+    mfq_tensor_backend::Tensor weight_sum;
+    mfq_tensor_backend::Tensor weight_sq_sum;
+    mfq_tensor_backend::Tensor output_energy;
+    mfq_tensor_backend::Tensor weighted_output_energy;
+};
+
 struct CudaExecutionContext {
     CudaProfiler profiler;
     bool force_moe_pool_path = false;
@@ -215,6 +223,9 @@ struct CudaExecutionContext {
     int n_gpu_layers = -1;
     int dense_cpu_layer_count = 0;
     bool loading_cpu_layer = false;
+    bool drop_file_cache = false;
+    bool decode_graph_serial_branches = false;
+    bool decode_graph_tp_projection_major = false;
     int moe_cache_registration_min_slots = 8;
     int gemma_trace_layer = -1;
     std::vector<std::pair<std::string, mfq_tensor_backend::Tensor>>*
@@ -224,52 +235,26 @@ struct CudaExecutionContext {
     ModelParallelCollectiveRuntime model_parallel_collectives;
     LayerPlacementConfig layer_placement;
     std::shared_ptr<MoeExpertCache> moe_expert_cache;
+    std::unordered_map<int, MoeRouteLayerStats> moe_route_stats;
 
     void reset() noexcept;
 };
 
+CudaExecutionContext* current_cuda_execution_context() noexcept;
 CudaExecutionContext& cuda_execution_context();
 
-// ponytail: stateless compatibility facade; delete when operator signatures
-// carry CudaExecutionContext. Profiler state remains owned by the context.
-class CudaProfilerAccess {
+class CudaExecutionContextScope {
 public:
-    class Flag {
-    public:
-        explicit constexpr Flag(bool CudaProfiler::*member)
-            : member_(member) {}
+    explicit CudaExecutionContextScope(CudaExecutionContext& context) noexcept;
+    ~CudaExecutionContextScope();
 
-        const Flag& operator=(bool value) const {
-            cuda_execution_context().profiler.*member_ = value;
-            return *this;
-        }
+    CudaExecutionContextScope(const CudaExecutionContextScope&) = delete;
+    CudaExecutionContextScope& operator=(
+        const CudaExecutionContextScope&) = delete;
 
-        operator bool() const {
-            return cuda_execution_context().profiler.*member_;
-        }
-
-    private:
-        bool CudaProfiler::*member_;
-    };
-
-    template <typename Fn>
-    auto measure(const std::string& name, Fn&& fn) const
-            -> decltype(cuda_execution_context().profiler.measure(
-                name, std::forward<Fn>(fn))) {
-        return cuda_execution_context().profiler.measure(
-            name, std::forward<Fn>(fn));
-    }
-
-    void reset() const { cuda_execution_context().profiler.reset(); }
-    void report(const std::string& title) const {
-        cuda_execution_context().profiler.report(title);
-    }
-
-    const Flag enabled{&CudaProfiler::enabled};
-    const Flag graph_events{&CudaProfiler::graph_events};
+private:
+    CudaExecutionContext* previous_;
 };
-
-inline const CudaProfilerAccess g_profiler;
 
 void mfq_set_env(const char* name, const char* value);
 void mfq_release_host_allocator_cache() noexcept;
@@ -326,12 +311,4 @@ struct KlKvCacheCapacityScope {
         int64_t capacity,
         CudaExecutionContext& context = cuda_execution_context());
     ~KlKvCacheCapacityScope();
-};
-
-struct MoeRouteLayerStats {
-    mfq_tensor_backend::Tensor counts;
-    mfq_tensor_backend::Tensor weight_sum;
-    mfq_tensor_backend::Tensor weight_sq_sum;
-    mfq_tensor_backend::Tensor output_energy;
-    mfq_tensor_backend::Tensor weighted_output_energy;
 };

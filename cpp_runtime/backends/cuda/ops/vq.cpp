@@ -320,8 +320,11 @@ static mfq_tensor_backend::Tensor nvq_matmul_cpu(
     });
     return result;
 }
-mfq_tensor_backend::Tensor nvq_matmul(const NvqWeight & w, mfq_tensor_backend::Tensor x) {
-    auto& execution = cuda_execution_context();
+mfq_tensor_backend::Tensor nvq_matmul(
+        CudaExecutionContext& execution,
+        const NvqWeight& w,
+        mfq_tensor_backend::Tensor x) {
+    auto& profiler = execution.profiler;
     if (!x.is_cuda()) return nvq_matmul_cpu(w, std::move(x));
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
@@ -332,7 +335,7 @@ mfq_tensor_backend::Tensor nvq_matmul(const NvqWeight & w, mfq_tensor_backend::T
             "KLD common NVQ MMQ requires at least 16 activation rows");
         x = kl_mmq_prepare_activation(x);
         ++execution.kl_mmq_dense_calls;
-        return g_profiler.measure("kld_mmq.nvq.fp16", [&]() {
+        return profiler.measure("kld_mmq.nvq.fp16", [&]() {
             return nvq_gemm_f16_cuda(
                 w.indices_packed, w.aux_packed, w.sub_scale_packed,
                 w.neuron_scale, w.codebook, x, w.neuron_len, w.gs,
@@ -342,7 +345,7 @@ mfq_tensor_backend::Tensor nvq_matmul(const NvqWeight & w, mfq_tensor_backend::T
     const NvqMatmulPath path = select_nvq_matmul_path(w, M);
     if (path == NvqMatmulPath::Gemv) {
         NvqWorkspace & ws = w.workspace(M);
-        return g_profiler.measure("nvq.gemv", [&]() {
+        return profiler.measure("nvq.gemv", [&]() {
             return nvq_gemv_ws_cuda(
                 w.indices_packed, w.aux_packed, w.sub_scale_packed,
                 w.neuron_scale, w.codebook, x, w.neuron_len, w.gs,
@@ -351,7 +354,7 @@ mfq_tensor_backend::Tensor nvq_matmul(const NvqWeight & w, mfq_tensor_backend::T
     }
     if (path == NvqMatmulPath::Mmq) {
         NvqWorkspace & ws = w.workspace(M);
-        return g_profiler.measure("nvq.mma24", [&]() {
+        return profiler.measure("nvq.mma24", [&]() {
             return nvq_mmq_ws_cuda(
                 w.indices_packed, w.aux_packed, w.sub_scale_packed,
                 w.neuron_scale, w.codebook, x, w.neuron_len, w.gs,
@@ -359,24 +362,26 @@ mfq_tensor_backend::Tensor nvq_matmul(const NvqWeight & w, mfq_tensor_backend::T
         });
     }
     if (path == NvqMatmulPath::OnlineF16) {
-        return g_profiler.measure("nvq.gemm_online_f16", [&]() {
+        return profiler.measure("nvq.gemm_online_f16", [&]() {
             return nvq_gemm_f16_cuda(
                 w.indices_packed, w.aux_packed, w.sub_scale_packed,
                 w.neuron_scale, w.codebook, x, w.neuron_len, w.gs,
                 w.sub_bits, w.kernel_format, w.sign_mode);
         });
     }
-    auto weight = g_profiler.measure("nvq.dequant", [&]() { return nvq_dequant(w); });
-    return g_profiler.measure("nvq.gemm", [&]() {
+    auto weight = profiler.measure("nvq.dequant", [&]() { return nvq_dequant(w); });
+    return profiler.measure("nvq.gemm", [&]() {
         return nint_cublas_gemm_nt_f32acc_cuda(x, weight);
     });
 }
 
 mfq_tensor_backend::Tensor nvq_matmul_input_mul(
+    CudaExecutionContext& execution,
     const NvqWeight & w,
     mfq_tensor_backend::Tensor x,
     mfq_tensor_backend::Tensor gate,
     int mode) {
+    auto& profiler = execution.profiler;
     MFQ_RUNTIME_CHECK(mode == 1 || mode == 2, "NVQ input gate mode must be 1(sigmoid) or 2(silu)");
     if (!x.is_cuda()) {
         x = x.contiguous().to(mfq_tensor_backend::kFloat16);
@@ -396,7 +401,7 @@ mfq_tensor_backend::Tensor nvq_matmul_input_mul(
     const NvqMatmulPath path = select_nvq_matmul_path(w, M);
     if (path == NvqMatmulPath::Gemv) {
         NvqWorkspace & ws = w.workspace(M);
-        return g_profiler.measure("nvq.gemv_gate", [&]() {
+        return profiler.measure("nvq.gemv_gate", [&]() {
             return nvq_gemv_gate_ws_cuda(
                 w.indices_packed, w.aux_packed, w.sub_scale_packed,
                 w.neuron_scale, w.codebook, x, gate, w.neuron_len, w.gs,
@@ -405,7 +410,7 @@ mfq_tensor_backend::Tensor nvq_matmul_input_mul(
     }
     if (path == NvqMatmulPath::Mmq) {
         NvqWorkspace & ws = w.workspace(M);
-        return g_profiler.measure("nvq.mma24_gate", [&]() {
+        return profiler.measure("nvq.mma24_gate", [&]() {
             return nvq_mmq_gate_ws_cuda(
                 w.indices_packed, w.aux_packed, w.sub_scale_packed,
                 w.neuron_scale, w.codebook, x, gate, w.neuron_len, w.gs,
@@ -413,7 +418,7 @@ mfq_tensor_backend::Tensor nvq_matmul_input_mul(
         });
     }
     mfq_tensor_backend::Tensor value = mode == 1 ? x * mfq_tensor_backend::sigmoid(gate) : x * mfq_tensor_backend::silu(gate);
-    return nvq_matmul(w, value);
+    return nvq_matmul(execution, w, value);
 }
 
 bool nvq_pair_compatible(const NvqWeight & first, const NvqWeight & second) {
@@ -429,17 +434,23 @@ bool nvq_fusion_enabled() {
 }
 
 mfq_tensor_backend::Tensor nvq_matmul_multi2(
+    CudaExecutionContext& execution,
     const NvqWeight & first,
     const NvqWeight & second,
     mfq_tensor_backend::Tensor x) {
+    auto& profiler = execution.profiler;
     if (!nvq_pair_compatible(first, second)) {
         throw std::runtime_error("NVQ multi-projection requires compatible formats and input layouts");
     }
     x = pad_last(x.contiguous().to(mfq_tensor_backend::kFloat16), first.neuron_len);
     const int M = (int)x.size(0);
-    if (M > 8) return mfq_tensor_backend::cat({nvq_matmul(first, x), nvq_matmul(second, x)}, -1);
+    if (M > 8) {
+        return mfq_tensor_backend::cat(
+            {nvq_matmul(execution, first, x),
+             nvq_matmul(execution, second, x)}, -1);
+    }
     NvqWorkspace & ws = first.workspace(M);
-    return g_profiler.measure("nvq.gemv_multi2", [&]() {
+    return profiler.measure("nvq.gemv_multi2", [&]() {
         return nvq_gemv_multi2_ws_cuda(
             first.indices_packed, first.aux_packed, first.sub_scale_packed,
             first.neuron_scale, first.codebook,
@@ -453,20 +464,22 @@ mfq_tensor_backend::Tensor nvq_matmul_multi2(
 }
 
 mfq_tensor_backend::Tensor nvq_matmul_swiglu(
+    CudaExecutionContext& execution,
     const NvqWeight & gate,
     const NvqWeight & up,
     mfq_tensor_backend::Tensor x) {
+    auto& profiler = execution.profiler;
     if (!nvq_pair_compatible(gate, up) || gate.out != up.out) {
         throw std::runtime_error("NVQ SwiGLU requires compatible equal-width gate/up weights");
     }
     x = pad_last(x.contiguous().to(mfq_tensor_backend::kFloat16), gate.neuron_len);
     if (x.size(0) != 1) {
-        auto pair = nvq_matmul_multi2(gate, up, x);
+        auto pair = nvq_matmul_multi2(execution, gate, up, x);
         auto parts = pair.split_with_sizes({gate.out, up.out}, -1);
         return mfq_tensor_backend::silu(parts[0]) * parts[1];
     }
     NvqWorkspace & ws = gate.workspace(1);
-    return g_profiler.measure("nvq.gemv_swiglu", [&]() {
+    return profiler.measure("nvq.gemv_swiglu", [&]() {
         return nvq_gemv_swiglu_ws_cuda(
             gate.indices_packed, gate.aux_packed, gate.sub_scale_packed,
             gate.neuron_scale, gate.codebook,
@@ -480,17 +493,21 @@ mfq_tensor_backend::Tensor nvq_matmul_swiglu(
 }
 
 mfq_tensor_backend::Tensor nvq_ffn_swiglu_down(
+    CudaExecutionContext& execution,
     const NvqWeight & gate,
     const NvqWeight & up,
     const NvqWeight & down,
     mfq_tensor_backend::Tensor x,
     MfqOptional<mfq_tensor_backend::Tensor> residual) {
+    auto& profiler = execution.profiler;
     if (!nvq_pair_compatible(gate, up) || gate.out != up.out || gate.out != down.neuron_len) {
         throw std::runtime_error("NVQ fused FFN weight layouts are incompatible");
     }
     x = pad_last(x.contiguous().to(mfq_tensor_backend::kFloat16), gate.neuron_len);
     if (x.size(0) != 1 || (down.gs != 24 && down.gs != 28 && down.gs != 32)) {
-        auto output = nvq_matmul(down, nvq_matmul_swiglu(gate, up, x));
+        auto output = nvq_matmul(
+            execution, down,
+            nvq_matmul_swiglu(execution, gate, up, x));
         return residual.has_value()
             ? acc_cuda(residual.value(), output)
             : output;
@@ -502,7 +519,7 @@ mfq_tensor_backend::Tensor nvq_ffn_swiglu_down(
             {gate.out}, gate.indices_packed.options().dtype(
                 mfq_tensor_backend::kFloat32));
     }
-    g_profiler.measure("nvq.ffn_swiglu_quant", [&]() {
+    profiler.measure("nvq.ffn_swiglu_quant", [&]() {
         nvq_ffn_swiglu_quant_ws_cuda(
             gate.indices_packed, gate.aux_packed, gate.sub_scale_packed,
             gate.neuron_scale, gate.codebook,
@@ -515,7 +532,7 @@ mfq_tensor_backend::Tensor nvq_ffn_swiglu_down(
             output_ws.qx, output_ws.xscale, input_ws.swiglu_scratch);
         return 0;
     });
-    return g_profiler.measure(
+    return profiler.measure(
         residual.has_value() ? "nvq.gemv_qx_residual" : "nvq.gemv_qx",
         [&]() {
         if (residual.has_value()) {

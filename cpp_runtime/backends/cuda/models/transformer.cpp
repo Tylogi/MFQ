@@ -247,6 +247,7 @@ bool FFN::tensor_parallel_dense_compatible() const {
     }
 
 mfq_tensor_backend::Tensor FFN::forward_tensor_parallel_dense(
+        CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor xh) const {
         auto shape = xh.sizes().vec();
         auto flat = xh.reshape(
@@ -273,10 +274,10 @@ mfq_tensor_backend::Tensor FFN::forward_tensor_parallel_dense(
                     flat, gate_shard.device);
             auto gate_output =
                 run_quant_linear_shard(
-                    gate_shard, local_x);
+                    execution, gate_shard, local_x);
             auto up_output =
                 run_quant_linear_shard(
-                    up_shard, local_x);
+                    execution, up_shard, local_x);
             mfq_tensor_backend::Tensor activation;
             if (geglu) {
                 activation = gelu_mul_cuda(
@@ -304,7 +305,7 @@ mfq_tensor_backend::Tensor FFN::forward_tensor_parallel_dense(
                      up_output).contiguous();
             }
             partials[index] = run_quant_linear_shard(
-                down_shard, activation);
+                execution, down_shard, activation);
         }
         auto output =
             reduce_model_parallel_outputs(
@@ -335,6 +336,7 @@ bool FFN::expert_parallel_moe_compatible() const {
     }
 
 mfq_tensor_backend::Tensor FFN::forward_expert_parallel_moe(
+        CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x,
         const MoeRoutePlan & route,
         mfq_tensor_backend::Tensor route_weights) const {
@@ -371,7 +373,7 @@ mfq_tensor_backend::Tensor FFN::forward_expert_parallel_moe(
             mfq_tensor_backend::Tensor gate_up_pair;
             mfq_tensor_backend::Tensor projected_hidden;
             if (swiglu_limit <= 0.0 &&
-                    !cuda_execution_context().force_moe_materialized_swiglu &&
+                    !execution.force_moe_materialized_swiglu &&
                     gate_shard.weight
                         ->supports_projection_glu_epilogue()) {
                 projected_hidden = gate_shard.weight->forward_glu_output(
@@ -383,7 +385,7 @@ mfq_tensor_backend::Tensor FFN::forward_expert_parallel_moe(
             mfq_tensor_backend::Tensor down_pair;
             const bool allow_fusion =
                 gate_up_pair.defined() &&
-                !cuda_execution_context().force_moe_materialized_swiglu &&
+                !execution.force_moe_materialized_swiglu &&
                 !disable_swiglu_quant_fusion &&
                 moe_small_glu_path_enabled(
                     static_cast<int>(gate_up_pair.size(0)));
@@ -438,31 +440,35 @@ mfq_tensor_backend::Tensor FFN::forward_expert_parallel_moe(
     }
 
 mfq_tensor_backend::Tensor FFN::forward_dense_f32_down_kld(
+        CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor xh) const {
+        auto& profiler = execution.profiler;
         MFQ_RUNTIME_CHECK(
             !is_moe && !tensor_parallel_dense_compatible() &&
             !geglu && swiglu_limit <= 0.0,
             "FP32-output IN diagnostic requires a local dense SiLU FFN");
-        auto parts = g_profiler.measure(
+        auto parts = profiler.measure(
             "ffn.gate_up", [&]() {
-                return gate_up.forward(xh);
+                return gate_up.forward(execution, xh);
             });
-        return g_profiler.measure(
+        return profiler.measure(
             "ffn.down.fp32_output", [&]() {
                 return down.forward_input_mul_f32_kld(
-                    parts[1], parts[0], 2);
+                    execution, parts[1], parts[0], 2);
             });
     }
 
 mfq_tensor_backend::Tensor FFN::forward_impl(
+    CudaExecutionContext& execution,
     mfq_tensor_backend::Tensor x,
     MfqOptional<mfq_tensor_backend::Tensor> input_ids,
     bool allow_important_neurons) const {
+        auto& profiler = execution.profiler;
         mfq_tensor_backend::Tensor xh;
         if (x.scalar_type() == mfq_tensor_backend::kFloat16) {
             xh = x;
         } else {
-            xh = g_profiler.measure("ffn.input_cast", [&]() { return x.to(mfq_tensor_backend::kFloat16); });
+            xh = profiler.measure("ffn.input_cast", [&]() { return x.to(mfq_tensor_backend::kFloat16); });
         }
         if (allow_important_neurons && important_neurons) {
             if (is_moe) {
@@ -476,16 +482,16 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                     "MFQ_DIAGNOSTIC_IN_F32_DOWN");
             const bool use_f32_down =
                 rows >= 16 &&
-                cuda_execution_context().kl_mmq_mode == KlMmqMode::Fp16 &&
+                execution.kl_mmq_mode == KlMmqMode::Fp16 &&
                 f32_down != nullptr &&
                 f32_down[0] == '1';
             if (use_f32_down) {
                 auto low =
-                    forward_dense_f32_down_kld(xh);
+                    forward_dense_f32_down_kld(execution, xh);
                 auto high =
                     important_neurons
-                        ->forward_dense_f32_down_kld(xh);
-                return g_profiler.measure(
+                        ->forward_dense_f32_down_kld(execution, xh);
+                return profiler.measure(
                     "ffn.in.combine.fp32", [&]() {
                         return (low + high)
                             .to(mfq_tensor_backend::kFloat16)
@@ -494,32 +500,31 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
             }
             auto run_branch = [&](size_t index) {
                 return index == 0
-                    ? forward_impl(xh, input_ids, false)
+                    ? forward_impl(execution, xh, input_ids, false)
                     : important_neurons->forward_impl(
-                        xh, input_ids, false);
+                        execution, xh, input_ids, false);
             };
             std::vector<mfq_tensor_backend::Tensor> outputs;
             const char * disable_parallel =
                 std::getenv("MFQ_DISABLE_IN_BRANCH_PARALLEL");
             const bool parallel =
-                decode_branch_parallel_enabled(rows) &&
+                decode_branch_parallel_enabled(execution, rows) &&
                 (disable_parallel == nullptr ||
                  disable_parallel[0] != '1') &&
                 important_neuron_executor->run(
                     2, run_branch, outputs);
             auto low = parallel ? outputs[0] : run_branch(0);
             auto high = parallel ? outputs[1] : run_branch(1);
-            return g_profiler.measure(
+            return profiler.measure(
                 "ffn.in.combine", [&]() {
                     return acc_cuda(
                         low.contiguous(), high.contiguous());
                 });
         }
         if (tensor_parallel_dense_compatible()) {
-            return g_profiler.measure(
+            return profiler.measure(
                 "ffn.tensor_parallel", [&]() {
-                    return forward_tensor_parallel_dense(
-                        xh);
+                    return forward_tensor_parallel_dense(execution, xh);
                 });
         }
         if (is_moe) {
@@ -544,10 +549,10 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                         auto row_ids = input_ids.value().reshape({rows})
                             .narrow(0, row, 1).contiguous();
                         outputs.push_back(forward_impl(
-                            row_input, row_ids, false));
+                            execution, row_input, row_ids, false));
                     } else {
                         outputs.push_back(forward_impl(
-                            row_input, mfq_nullopt, false));
+                            execution, row_input, mfq_nullopt, false));
                     }
                 }
                 return mfq_tensor_backend::cat(outputs, 0)
@@ -558,10 +563,10 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                 throw std::runtime_error("incomplete MoE FFN state");
             }
             auto xf = xh.reshape({-1, xh.size(-1)}).contiguous();
-            auto xf32 = g_profiler.measure("moe.input_f32", [&]() {
+            auto xf32 = profiler.measure("moe.input_f32", [&]() {
                 return xf.to(mfq_tensor_backend::kFloat32);
             });
-            auto router_logits = g_profiler.measure("moe.router", [&]() {
+            auto router_logits = profiler.measure("moe.router", [&]() {
                 return mfq_tensor_backend::matmul(xf32, moe_router.transpose(0, 1));
             });
             mfq_tensor_backend::Tensor shared_gate_logits;
@@ -571,7 +576,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                     throw std::runtime_error(
                         "hash-routed MoE requires the current token ids");
                 }
-                selected = g_profiler.measure("moe.hash_route", [&]() {
+                selected = profiler.measure("moe.hash_route", [&]() {
                     auto ids = moe_hash_ids.index_select(
                         0, input_ids.value().reshape({-1})
                                .to(mfq_tensor_backend::kCUDA, mfq_tensor_backend::kInt64))
@@ -582,7 +587,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                     return std::vector<mfq_tensor_backend::Tensor>{ids, weights};
                 });
             } else {
-                selected = g_profiler.measure("moe.topk", [&]() {
+                selected = profiler.measure("moe.topk", [&]() {
                     return moe_topk_cuda(
                         router_logits.contiguous(), moe_top_k,
                         moe_use_sigmoid, moe_use_sqrt_softplus,
@@ -593,35 +598,35 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                         1e-20, moe_router_scale);
                 });
             }
-            auto route = g_profiler.measure("moe.route_map", [&]() {
+            auto route = profiler.measure("moe.route_map", [&]() {
                 return build_moe_route_plan(
                     selected.at(0),
                     moe_split_gate_up ? moe_gate.n_experts : moe_gate_up.n_experts);
             });
             if (expert_parallel_moe_compatible()) {
-                auto routed = g_profiler.measure(
+                auto routed = profiler.measure(
                     "moe.expert_parallel", [&]() {
                         return forward_expert_parallel_moe(
-                            xf, route, selected.at(1));
+                            execution, xf, route, selected.at(1));
                     });
-                auto shared_output = shared->forward(xf);
+                auto shared_output = shared->forward(execution, xf);
                 auto shared_half = shared_output
                     .reshape({xf.size(0), xf.size(1)})
                     .contiguous().to(mfq_tensor_backend::kFloat16);
                 if (moe_shared_ungated) {
-                    return g_profiler.measure("moe.combine", [&]() {
+                    return profiler.measure("moe.combine", [&]() {
                         return acc_cuda(
                             routed.contiguous(), shared_half);
                     });
                 }
-                shared_gate_logits = g_profiler.measure(
+                shared_gate_logits = profiler.measure(
                     "moe.shared_gate", [&]() {
                         return mfq_tensor_backend::matmul(
                             xf32,
                             moe_shared_gate.transpose(0, 1))
                             .contiguous();
                     });
-                return g_profiler.measure("moe.combine", [&]() {
+                return profiler.measure("moe.combine", [&]() {
                     return moe_add_shared_gate_cuda(
                         routed.contiguous(), shared_half,
                         shared_gate_logits);
@@ -679,12 +684,12 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                     }
                 }
             }
-            auto shared_output = g_profiler.measure(
+            auto shared_output = profiler.measure(
                 "moe.shared", [&]() {
-                    return shared->forward(xf);
+                    return shared->forward(execution, xf);
                 });
             if (!moe_split_gate_up && !moe_shared_ungated) {
-                shared_gate_logits = g_profiler.measure(
+                shared_gate_logits = profiler.measure(
                     "moe.shared_gate", [&]() {
                     return mfq_tensor_backend::matmul(
                         xf32,
@@ -713,20 +718,20 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
             mfq_tensor_backend::Tensor projected_hidden;
             if (moe_split_gate_up) {
                 if (cpu_moe_gate) {
-                    staged_gate.emplace(g_profiler.measure(
+                    staged_gate.emplace(profiler.measure(
                         "moe.cpu_offload_gate_h2d", [&]() {
                             return stage_cpu_mixed_moe(cpu_moe_gate);
                         }));
                     active_gate = &staged_gate.value();
                 }
                 if (cpu_moe_up) {
-                    staged_up.emplace(g_profiler.measure(
+                    staged_up.emplace(profiler.measure(
                         "moe.cpu_offload_up_h2d", [&]() {
                             return stage_cpu_mixed_moe(cpu_moe_up);
                         }));
                     active_up = &staged_up.value();
                 }
-                gate_up_pair = g_profiler.measure("moe.gate_up_split", [&]() {
+                gate_up_pair = profiler.measure("moe.gate_up_split", [&]() {
                     static const bool disable_activation_reuse = [] {
                         const char * value = std::getenv(
                             "MFQ_DISABLE_SPLIT_MOE_ACTIVATION_REUSE");
@@ -734,7 +739,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                     }();
                     const bool reuse_gate_activation =
                         !disable_activation_reuse &&
-                        cuda_execution_context().kl_mmq_mode ==
+                        execution.kl_mmq_mode ==
                             KlMmqMode::Default &&
                         xf.size(0) <= 8 &&
                         active_gate->can_reuse_activation_for(*active_up);
@@ -744,7 +749,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                     }
                     if (!moe_shared_ungated &&
                             !shared_gate_logits.defined()) {
-                        shared_gate_logits = g_profiler.measure(
+                        shared_gate_logits = profiler.measure(
                             "moe.shared_gate", [&]() {
                                 return mfq_tensor_backend::matmul(
                                     xf32,
@@ -759,7 +764,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                 });
             } else {
                 if (cpu_moe_gate_up) {
-                    staged_gate_up.emplace(g_profiler.measure(
+                    staged_gate_up.emplace(profiler.measure(
                         "moe.cpu_offload_gate_up_h2d", [&]() {
                             return stage_cpu_mixed_moe(cpu_moe_gate_up);
                         }));
@@ -767,16 +772,16 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                 }
                 const bool fuse_projection_glu =
                     swiglu_limit <= 0.0 &&
-                    !cuda_execution_context().force_moe_materialized_swiglu &&
+                    !execution.force_moe_materialized_swiglu &&
                     active_gate_up->supports_projection_glu_epilogue();
                 if (fuse_projection_glu) {
-                    projected_hidden = g_profiler.measure(
+                    projected_hidden = profiler.measure(
                         "moe.gate_up_swiglu", [&]() {
                             return active_gate_up->forward_glu_output(
                                 xf, route, false);
                         });
                 } else {
-                    gate_up_pair = g_profiler.measure("moe.gate_up", [&]() {
+                    gate_up_pair = profiler.measure("moe.gate_up", [&]() {
                         return active_gate_up->forward(xf, route);
                     });
                 }
@@ -790,7 +795,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
             std::optional<MfeWeight> staged_down;
             const MfeWeight * active_down = &moe_down;
             if (cpu_moe_down) {
-                staged_down.emplace(g_profiler.measure(
+                staged_down.emplace(profiler.measure(
                     "moe.cpu_offload_down_h2d", [&]() {
                         return stage_cpu_mixed_moe(cpu_moe_down);
                     }));
@@ -803,26 +808,26 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
             mfq_tensor_backend::Tensor down_pair;
             const bool allow_swiglu_quant_fusion =
                 gate_up_pair.defined() &&
-                !cuda_execution_context().force_moe_materialized_swiglu &&
+                !execution.force_moe_materialized_swiglu &&
                 !disable_swiglu_quant_fusion &&
                 moe_small_glu_path_enabled(
                     static_cast<int>(gate_up_pair.size(0)));
             if (projected_hidden.defined()) {
-                down_pair = g_profiler.measure("moe.down", [&]() {
+                down_pair = profiler.measure("moe.down", [&]() {
                     return active_down->forward(projected_hidden, route);
                 });
             } else if (swiglu_limit <= 0.0 && allow_swiglu_quant_fusion) {
-                down_pair = g_profiler.measure("moe.swiglu_down", [&]() {
+                down_pair = profiler.measure("moe.swiglu_down", [&]() {
                     return active_down->forward_swiglu(gate_up_pair, route);
                 });
             } else if (swiglu_limit > 0.0 && allow_swiglu_quant_fusion &&
                     active_down->supports_clamped_swiglu()) {
-                down_pair = g_profiler.measure("moe.swiglu_down", [&]() {
+                down_pair = profiler.measure("moe.swiglu_down", [&]() {
                     return active_down->forward_clamped_swiglu(
                         gate_up_pair, route, swiglu_limit);
                 });
             } else {
-                auto hidden = g_profiler.measure("moe.swiglu", [&]() {
+                auto hidden = profiler.measure("moe.swiglu", [&]() {
                     if (swiglu_limit <= 0.0) {
                         return moe_swiglu_split_cuda(gate_up_pair);
                     }
@@ -837,7 +842,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                     return (mfq_tensor_backend::silu(gate) * up)
                         .to(mfq_tensor_backend::kFloat16).contiguous();
                 });
-                down_pair = g_profiler.measure("moe.down", [&]() {
+                down_pair = profiler.measure("moe.down", [&]() {
                     return active_down->forward(hidden, route);
                 });
             }
@@ -850,33 +855,33 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                 return value != nullptr && std::atoi(value) != 0;
             }();
             const bool fuse_reduce_gate =
-                !cuda_execution_context().force_moe_unfused_reduce &&
+                !execution.force_moe_unfused_reduce &&
                 !disable_reduce_gate_fusion && !moe_shared_ungated &&
                 down_pair.size(0) <= 8;
             mfq_tensor_backend::Tensor routed;
             if (!fuse_reduce_gate) {
-                routed = g_profiler.measure("moe.reduce", [&]() {
+                routed = profiler.measure("moe.reduce", [&]() {
                     return moe_weighted_reduce_cuda(down_pair, selected.at(1));
                 });
             }
             if (!moe_shared_ungated && !shared_gate_logits.defined()) {
-                shared_gate_logits = g_profiler.measure("moe.shared_gate", [&]() {
+                shared_gate_logits = profiler.measure("moe.shared_gate", [&]() {
                     return mfq_tensor_backend::matmul(xf32, moe_shared_gate.transpose(0, 1)).contiguous();
                 });
             }
             auto shared_half = shared_output.reshape({xf.size(0), xf.size(1)}).contiguous().to(mfq_tensor_backend::kFloat16);
             if (moe_shared_ungated) {
-                return g_profiler.measure("moe.combine", [&]() {
+                return profiler.measure("moe.combine", [&]() {
                     return acc_cuda(routed.contiguous(), shared_half);
                 });
             }
             if (fuse_reduce_gate) {
-                return g_profiler.measure("moe.reduce_combine", [&]() {
+                return profiler.measure("moe.reduce_combine", [&]() {
                     return moe_weighted_reduce_shared_gate_cuda(
                         down_pair, selected.at(1), shared_half, shared_gate_logits);
                 });
             }
-            return g_profiler.measure("moe.combine", [&]() {
+            return profiler.measure("moe.combine", [&]() {
                 return moe_add_shared_gate_cuda(
                     routed.contiguous(), shared_half,
                     shared_gate_logits);
@@ -888,22 +893,22 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                 disable_geglu == nullptr || disable_geglu[0] != '1';
             if (geglu_fusion_enabled && xh.numel() / xh.size(-1) == 1 && gate_up.nint_grouped &&
                 gate_up.nint.split_w.empty()) {
-                auto act = g_profiler.measure("ffn.gate_up_geglu", [&]() {
-                    return gate_up.forward_geglu(xh);
+                auto act = profiler.measure("ffn.gate_up_geglu", [&]() {
+                    return gate_up.forward_geglu(execution, xh);
                 });
-                return g_profiler.measure("ffn.down", [&]() { return down.forward(act); });
+                return profiler.measure("ffn.down", [&]() { return down.forward(execution, act); });
             }
-            auto parts = g_profiler.measure("ffn.gate_up", [&]() { return gate_up.forward(xh); });
-            auto act = g_profiler.measure("ffn.geglu", [&]() {
+            auto parts = profiler.measure("ffn.gate_up", [&]() { return gate_up.forward(execution, xh); });
+            auto act = profiler.measure("ffn.geglu", [&]() {
                 return gelu_mul_cuda(parts[0].contiguous(), parts[1].contiguous());
             });
-            return g_profiler.measure("ffn.down", [&]() { return down.forward(act); });
+            return profiler.measure("ffn.down", [&]() { return down.forward(execution, act); });
         }
         if (swiglu_limit > 0.0) {
-            auto parts = g_profiler.measure("ffn.gate_up", [&]() {
-                return gate_up.forward(xh);
+            auto parts = profiler.measure("ffn.gate_up", [&]() {
+                return gate_up.forward(execution, xh);
             });
-            auto act = g_profiler.measure("ffn.swiglu_clamped", [&]() {
+            auto act = profiler.measure("ffn.swiglu_clamped", [&]() {
                 auto gate = mfq_tensor_backend::clamp_max(
                     parts[0].to(mfq_tensor_backend::kFloat32), swiglu_limit);
                 auto up = mfq_tensor_backend::clamp(
@@ -912,8 +917,8 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                 return (mfq_tensor_backend::silu(gate) * up)
                     .to(mfq_tensor_backend::kFloat16).contiguous();
             });
-            return g_profiler.measure("ffn.down", [&]() {
-                return down.forward(act);
+            return profiler.measure("ffn.down", [&]() {
+                return down.forward(execution, act);
             });
         }
         if (nvq_fusion_enabled() && xh.numel() / xh.size(-1) == 1 &&
@@ -925,7 +930,8 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
             auto shape = xh.sizes().vec();
             shape.back() = down.nvq.w.out;
             auto y = nvq_ffn_swiglu_down(
-                gate_up.layers[0].nvq.w, gate_up.layers[1].nvq.w, down.nvq.w,
+                execution, gate_up.layers[0].nvq.w,
+                gate_up.layers[1].nvq.w, down.nvq.w,
                 xh.reshape({-1, xh.size(-1)}));
             return y.reshape(shape);
         }
@@ -934,19 +940,19 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
             xh.numel() / xh.size(-1) >= 1 && xh.numel() / xh.size(-1) <= 6 &&
             gate_up.nint_grouped && gate_up.nint.split_w.empty() &&
             gate_up.outs.size() == 2 && gate_up.outs[0] == gate_up.outs[1]) {
-            auto act = g_profiler.measure("ffn.gate_up_swiglu", [&]() { return gate_up.forward_swiglu(xh); });
-            return g_profiler.measure("ffn.down", [&]() { return down.forward(act); });
+            auto act = profiler.measure("ffn.gate_up_swiglu", [&]() { return gate_up.forward_swiglu(execution, xh); });
+            return profiler.measure("ffn.down", [&]() { return down.forward(execution, act); });
         }
-        auto parts = g_profiler.measure("ffn.gate_up", [&]() { return gate_up.forward(xh); });
+        auto parts = profiler.measure("ffn.gate_up", [&]() { return gate_up.forward(execution, xh); });
         if (down.is_dense() || down.is_mxfp8()) {
-            auto activation = g_profiler.measure("ffn.swiglu", [&]() {
+            auto activation = profiler.measure("ffn.swiglu", [&]() {
                 return (parts[1] * mfq_tensor_backend::silu(parts[0])).contiguous();
             });
-            return g_profiler.measure("ffn.down", [&]() {
-                return down.forward(activation);
+            return profiler.measure("ffn.down", [&]() {
+                return down.forward(execution, activation);
             });
         }
-        return g_profiler.measure("ffn.down", [&]() { return down.forward_input_mul(parts[1], parts[0], 2); });
+        return profiler.measure("ffn.down", [&]() { return down.forward_input_mul(execution, parts[1], parts[0], 2); });
     }
 
 bool FFN::can_forward_fused_residual(
@@ -984,6 +990,7 @@ bool FFN::can_forward_fused_residual(
     }
 
 mfq_tensor_backend::Tensor FFN::forward_fused_residual(
+    CudaExecutionContext& execution,
     mfq_tensor_backend::Tensor x,
     mfq_tensor_backend::Tensor residual) const {
         MFQ_RUNTIME_CHECK(
@@ -992,17 +999,19 @@ mfq_tensor_backend::Tensor FFN::forward_fused_residual(
         auto shape = x.sizes().vec();
         shape.back() = down.nvq.w.out;
         auto output = nvq_ffn_swiglu_down(
-            gate_up.layers[0].nvq.w, gate_up.layers[1].nvq.w,
-            down.nvq.w, x.reshape({1, x.size(-1)}),
+            execution, gate_up.layers[0].nvq.w,
+            gate_up.layers[1].nvq.w, down.nvq.w,
+            x.reshape({1, x.size(-1)}),
             residual.reshape({1, residual.size(-1)}));
         return output.reshape(shape);
     }
 
 mfq_tensor_backend::Tensor FFN::forward(
+    CudaExecutionContext& execution,
     mfq_tensor_backend::Tensor x,
     MfqOptional<mfq_tensor_backend::Tensor> input_ids) const {
         return forward_impl(
-            std::move(x), input_ids, true);
+            execution, std::move(x), input_ids, true);
     }
 
 std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> KVCache::append(
@@ -1099,6 +1108,7 @@ void FullBlock::reset(int64_t B) {
     }
 
 mfq_tensor_backend::Tensor FullBlock::forward(
+        CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x,
         mfq_tensor_backend::Tensor pos,
         int64_t cache_pos,
@@ -1107,11 +1117,12 @@ mfq_tensor_backend::Tensor FullBlock::forward(
         const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions,
         const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask) {
         return forward_impl(
-            std::move(x), std::move(pos), cache_pos, seq_len, rope,
+            execution, std::move(x), std::move(pos), cache_pos, seq_len, rope,
             cache_positions, attention_mask, 0, 0);
     }
 
 mfq_tensor_backend::Tensor FullBlock::forward_context(
+        CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x,
         const Context& context,
         const RopeCache& rope) {
@@ -1119,13 +1130,15 @@ mfq_tensor_backend::Tensor FullBlock::forward_context(
             context.confirmed_prefix == 0 || supports_speculation(),
             "block does not support speculative verification");
         return forward_impl(
-            std::move(x), context.positions, context.cache_position,
-            context.sequence_lengths, rope, context.cache_positions,
+            execution, std::move(x), context.positions,
+            context.cache_position, context.sequence_lengths,
+            rope, context.cache_positions,
             context.attention_mask, context.planned_kv_length,
             context.decode_attention_parts);
     }
 
 mfq_tensor_backend::Tensor FullBlock::forward_impl(
+        CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor x,
         mfq_tensor_backend::Tensor pos,
         int64_t cache_pos,
@@ -1135,7 +1148,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
         const MfqOptional<mfq_tensor_backend::Tensor>& attention_mask,
         int64_t planned_kv_length,
         int64_t decode_attention_parts) {
-        auto& execution = cuda_execution_context();
+        auto& profiler = execution.profiler;
         int64_t B = x.size(0), T = x.size(1), H = x.size(2);
         auto trace_qwen_stage = [&](const char* name, const mfq_tensor_backend::Tensor& value,
                                     int token_axis = 1) {
@@ -1182,7 +1195,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             }
         }
         auto residual = x;
-        auto xn = g_profiler.measure("full.attn_norm", [&]() {
+        auto xn = profiler.measure("full.attn_norm", [&]() {
             return official_bf16
                 ? qwen_rms_norm_bf16(
                     x.reshape({B * T, H}), attn_norm,
@@ -1195,13 +1208,15 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                     .reshape({B, T, H});
         });
         trace_qwen_stage("qwen.attn_norm", xn);
-        auto parts = g_profiler.measure("full.qkv", [&]() {
-            if (!split_q_kv_projections) return qkv.forward(xn);
+        auto parts = profiler.measure("full.qkv", [&]() {
+            if (!split_q_kv_projections) {
+                return qkv.forward(execution, xn);
+            }
             std::vector<mfq_tensor_backend::Tensor> result;
             result.reserve(3);
-            result.push_back(q_projection.forward(xn));
-            result.push_back(k_projection.forward(xn));
-            result.push_back(v_projection.forward(xn));
+            result.push_back(q_projection.forward(execution, xn));
+            result.push_back(k_projection.forward(execution, xn));
+            result.push_back(v_projection.forward(execution, xn));
             return result;
         });
         if (parts.size() != (value_equals_key ? 2u : 3u)) {
@@ -1218,7 +1233,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             v_full = v_full.to(mfq_tensor_backend::kBFloat16).contiguous();
         }
         mfq_tensor_backend::Tensor q_raw, q_gate;
-        g_profiler.measure("full.qkv_view", [&]() {
+        profiler.measure("full.qkv_view", [&]() {
             if (attention_output_gate) {
             auto qp = q_full.reshape({B, T, nh, hd * 2});
             auto chunks = qp.chunk(2, -1);
@@ -1229,9 +1244,9 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             }
             return q_raw;
         });
-        auto q = g_profiler.measure("full.q_view", [&]() { return q_raw.transpose(1, 2).contiguous(); });
-        auto k = g_profiler.measure("full.k_view", [&]() { return k_full.reshape({B, T, nkh, hd}).transpose(1, 2).contiguous(); });
-        auto v = g_profiler.measure("full.v_view", [&]() { return v_full.reshape({B, T, nkh, hd}).transpose(1, 2).contiguous(); });
+        auto q = profiler.measure("full.q_view", [&]() { return q_raw.transpose(1, 2).contiguous(); });
+        auto k = profiler.measure("full.k_view", [&]() { return k_full.reshape({B, T, nkh, hd}).transpose(1, 2).contiguous(); });
+        auto v = profiler.measure("full.v_view", [&]() { return v_full.reshape({B, T, nkh, hd}).transpose(1, 2).contiguous(); });
         auto write_positions = cache_positions.has_value()
             ? cache_positions.value().to(x.device(), mfq_tensor_backend::kInt64).contiguous()
             : pos.to(x.device(), mfq_tensor_backend::kInt64).contiguous();
@@ -1259,7 +1274,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
              fused_qk_rope_kv_env[0] != '0');
         std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> kv;
         if (fused_qk_rope_kv) {
-            q = g_profiler.measure("full.qk_norm_rope_kv_write", [&]() {
+            q = profiler.measure("full.qk_norm_rope_kv_write", [&]() {
                 return minicpm_qk_norm_rope_cache_write_bf16_cuda(
                     q.contiguous(), k.contiguous(), v.contiguous(),
                     q_norm, k_norm,
@@ -1280,7 +1295,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
         if (fused_bf16_norm && q_norm.defined() && k_norm.defined() &&
                 q.scalar_type() == mfq_tensor_backend::kBFloat16 &&
                 k.scalar_type() == mfq_tensor_backend::kBFloat16) {
-            auto normalized = g_profiler.measure("full.qk_norm", [&]() {
+            auto normalized = profiler.measure("full.qk_norm", [&]() {
                 return qwen_rms_norm_pair_bf16_cuda(
                     q, k, q_norm, k_norm,
                     rms_norm_eps, norm_weight_offset);
@@ -1290,7 +1305,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
         } else if (!official_bf16 && q_norm.defined() && k_norm.defined() &&
             q.scalar_type() == mfq_tensor_backend::kFloat16 &&
             k.scalar_type() == mfq_tensor_backend::kFloat16) {
-            auto normalized = g_profiler.measure("full.qk_norm", [&]() {
+            auto normalized = profiler.measure("full.qk_norm", [&]() {
                 return rms_norm_pair_f16_f32_offset_cuda(
                     q, k, q_norm, k_norm,
                     rms_norm_eps, norm_weight_offset);
@@ -1298,7 +1313,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             q = normalized[0].reshape_as(q);
             k = normalized[1].reshape_as(k);
         } else {
-            if (q_norm.defined()) q = g_profiler.measure("full.q_norm", [&]() {
+            if (q_norm.defined()) q = profiler.measure("full.q_norm", [&]() {
                 return official_bf16
                     ? qwen_rms_norm_bf16(
                         q.reshape({-1, hd}), q_norm,
@@ -1309,7 +1324,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                         q_norm, rms_norm_eps, norm_weight_offset)
                         .reshape_as(q);
             });
-            if (k_norm.defined()) k = g_profiler.measure("full.k_norm", [&]() {
+            if (k_norm.defined()) k = profiler.measure("full.k_norm", [&]() {
                 return official_bf16
                     ? qwen_rms_norm_bf16(
                         k.reshape({-1, hd}), k_norm,
@@ -1321,7 +1336,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                         .reshape_as(k);
             });
         }
-        if (v_norm.defined()) v = g_profiler.measure("full.v_norm", [&]() {
+        if (v_norm.defined()) v = profiler.measure("full.v_norm", [&]() {
             return official_bf16
                 ? qwen_rms_norm_bf16(
                     v.reshape({-1, hd}), v_norm,
@@ -1340,7 +1355,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             hd == 128 && cache.scalar_type() == mfq_tensor_backend::kBFloat16 &&
             (fused_rope_kv_env == nullptr || fused_rope_kv_env[0] != '0');
         if (fused_rope_kv) {
-            q = g_profiler.measure("full.rope_kv_write", [&]() {
+            q = profiler.measure("full.rope_kv_write", [&]() {
                 return minicpm_bf16_rope_cache_write_cuda(
                     q.contiguous(), k.contiguous(), v.contiguous(),
                     pos.contiguous().to(x.device(), mfq_tensor_backend::kInt64),
@@ -1351,17 +1366,17 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                 cache.k.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()}),
                 cache.v.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()})};
         } else {
-            q = g_profiler.measure("full.q_rope", [&]() {
+            q = profiler.measure("full.q_rope", [&]() {
                 return official_bf16
                     ? active_rope.apply_bf16(q, pos)
                     : active_rope.apply(q, pos, grid_mrope_positions);
             });
-            k = g_profiler.measure("full.k_rope", [&]() {
+            k = profiler.measure("full.k_rope", [&]() {
                 return official_bf16
                     ? active_rope.apply_bf16(k, pos)
                     : active_rope.apply(k, pos, grid_mrope_positions);
             });
-            kv = g_profiler.measure("full.kv_write", [&]() {
+            kv = profiler.measure("full.kv_write", [&]() {
                 return cache.append(
                     k, v, write_positions, cache_pos, cache_pos + T,
                     !seq_len.has_value());
@@ -1425,7 +1440,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
         double attn_scale = attention_scale > 0.0 ? attention_scale : 1.0 / std::sqrt((double)hd);
         mfq_tensor_backend::Tensor a;
         bool attention_token_major = false;
-        a = g_profiler.measure("full.attention", [&]() {
+        a = profiler.measure("full.attention", [&]() {
             if (!x.is_cuda()) {
                 MFQ_RUNTIME_CHECK(!sliding, "CPU dense offload does not support sliding attention");
                 const auto cpu_attention_dtype = official_bf16
@@ -1490,14 +1505,14 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                         const bool specialized_casts =
                             specialized_casts_disabled == nullptr ||
                             specialized_casts_disabled[0] != '1';
-                        auto flash_q = g_profiler.measure(
+                        auto flash_q = profiler.measure(
                             "full.flash128_q_cast", [&]() {
                                 return specialized_casts
                                     ? minicpm_flash128_q_cast_cuda(qh)
                                     : qh.to(mfq_tensor_backend::kFloat32)
                                         .contiguous();
                             });
-                        auto flash_kv = g_profiler.measure(
+                        auto flash_kv = profiler.measure(
                             "full.flash128_kv_cast", [&]() {
                                 if (specialized_casts) {
                                     return minicpm_flash128_kv_cast_cuda(kh, vh);
@@ -1508,13 +1523,13 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                                     vh.to(mfq_tensor_backend::kFloat16)
                                         .contiguous()};
                             });
-                        a = g_profiler.measure(
+                        a = profiler.measure(
                             "full.flash128_kernel", [&]() {
                                 return mfq_attention_mma128_cuda(
                                     flash_q, flash_kv[0], flash_kv[1],
                                     attn_scale);
                             });
-                        a = g_profiler.measure(
+                        a = profiler.measure(
                             "full.flash128_output_cast", [&]() {
                                 return specialized_casts
                                     ? minicpm_flash128_output_cast_cuda(a)
@@ -1718,21 +1733,23 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
         mfq_tensor_backend::Tensor oo;
         if (q_gate.defined()) {
             trace_qwen_stage("qwen.attention", a, attention_token_major ? 1 : 2);
-            auto af = g_profiler.measure("full.attn_out_view", [&]() {
+            auto af = profiler.measure("full.attn_out_view", [&]() {
                 return attention_token_major ? a.reshape({B, T, attn_width}) :
                     a.transpose(1, 2).contiguous().reshape({B, T, attn_width});
             });
-            auto gf = g_profiler.measure("full.q_gate_view", [&]() { return q_gate.contiguous().reshape({B, T, attn_width}); });
-            oo = g_profiler.measure("full.o_proj_gate", [&]() { return o.forward_input_mul(af, gf, 1); });
+            auto gf = profiler.measure("full.q_gate_view", [&]() { return q_gate.contiguous().reshape({B, T, attn_width}); });
+            oo = profiler.measure("full.o_proj_gate", [&]() {
+                return o.forward_input_mul(execution, af, gf, 1);
+            });
         } else {
-            auto af = g_profiler.measure("full.attn_out_view", [&]() {
+            auto af = profiler.measure("full.attn_out_view", [&]() {
                 return attention_token_major ? a.reshape({B, T, attn_width}) :
                     a.transpose(1, 2).contiguous().reshape({B, T, attn_width});
             });
-            oo = g_profiler.measure("full.o_proj", [&]() {
+            oo = profiler.measure("full.o_proj", [&]() {
                 return official_bf16
-                    ? o.forward_bf16_output(af)
-                    : o.forward(af);
+                    ? o.forward_bf16_output(execution, af)
+                    : o.forward(execution, af);
             });
         }
         trace_qwen_stage("qwen.o_projection", oo);
@@ -1749,7 +1766,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             mfq_tensor_backend::Tensor router_input;
             mfq_tensor_backend::Tensor moe_input;
             if (fused_norms) {
-                auto prepared = g_profiler.measure("gemma.attn_residual_pre_norms", [&]() {
+                auto prepared = profiler.measure("gemma.attn_residual_pre_norms", [&]() {
                     return gemma4_attn_residual_pre_norms_f16_cuda(
                         residual.reshape({B * T, H}), oo.reshape({B * T, H}),
                         attn_post_norm, ffn_norm, gemma_router_norm_scale,
@@ -1761,41 +1778,42 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                 router_input = prepared[2];
                 moe_input = prepared[3];
             } else {
-                auto attn_post = g_profiler.measure("gemma.attn_post_norm", [&]() {
+                auto attn_post = profiler.measure("gemma.attn_post_norm", [&]() {
                     return gemma_rms_norm_f16(
                         oo.reshape({B * T, H}), attn_post_norm,
                         rms_norm_eps, norm_weight_offset);
                 });
-                x = g_profiler.measure("gemma.attn_residual", [&]() {
+                x = profiler.measure("gemma.attn_residual", [&]() {
                     return acc_cuda(residual.reshape({B * T, H}), attn_post).reshape({B, T, H});
                 });
                 trace_gemma_stage(layer, "attention_residual", x);
                 residual = x;
-                dense_input = g_profiler.measure("gemma.ffn_pre_norm", [&]() {
+                dense_input = profiler.measure("gemma.ffn_pre_norm", [&]() {
                     return gemma_rms_norm_f16(
                         x.reshape({B * T, H}), ffn_norm,
                         rms_norm_eps, norm_weight_offset);
                 });
                 if (gemma4_moe) {
-                    router_input = g_profiler.measure("gemma.router_norm", [&]() {
+                    router_input = profiler.measure("gemma.router_norm", [&]() {
                         return qwen_rms_norm(
                             x.reshape({B * T, H})
                                 .to(mfq_tensor_backend::kFloat32),
                             gemma_router_norm_scale,
                             rms_norm_eps, norm_weight_offset);
                     });
-                    moe_input = g_profiler.measure("gemma.ffn_pre_norm_2", [&]() {
+                    moe_input = profiler.measure("gemma.ffn_pre_norm_2", [&]() {
                         return gemma_rms_norm_f16(
                             x.reshape({B * T, H}), ffn_pre_norm_2,
                             rms_norm_eps, norm_weight_offset);
                     });
                 }
             }
-            auto dense_output = g_profiler.measure("gemma.ffn_dense", [&]() {
-                return ffn.forward(dense_input).reshape({B * T, H});
+            auto dense_output = profiler.measure("gemma.ffn_dense", [&]() {
+                return ffn.forward(execution, dense_input)
+                    .reshape({B * T, H});
             });
             if (!gemma4_moe) {
-                auto dense_post = g_profiler.measure("gemma.ffn_post_norm", [&]() {
+                auto dense_post = profiler.measure("gemma.ffn_post_norm", [&]() {
                     return dense_output.scalar_type() == mfq_tensor_backend::kFloat16
                         ? gemma_rms_norm_f16(
                             dense_output, ffn_post_norm,
@@ -1807,13 +1825,13 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                             .to(mfq_tensor_backend::kFloat16)
                             .contiguous();
                 });
-                auto result = g_profiler.measure("gemma.ffn_residual", [&]() {
+                auto result = profiler.measure("gemma.ffn_residual", [&]() {
                     return acc_cuda(
                         residual.reshape({B * T, H}), dense_post)
                         .reshape({B, T, H});
                 });
                 if (layer_scale.defined()) {
-                    result = g_profiler.measure("gemma.layer_scale", [&]() {
+                    result = profiler.measure("gemma.layer_scale", [&]() {
                         return result * layer_scale;
                     });
                 }
@@ -1821,29 +1839,29 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                 return result;
             }
             if (!fused_norms) {
-                dense_output = g_profiler.measure("gemma.ffn_post_norm_1", [&]() {
+                dense_output = profiler.measure("gemma.ffn_post_norm_1", [&]() {
                     return gemma_rms_norm_f16(
                         dense_output, ffn_post_norm_1,
                         rms_norm_eps, norm_weight_offset);
                 });
                 trace_gemma_stage(layer, "dense_output", dense_output);
             }
-            auto router_logits = g_profiler.measure("gemma.router", [&]() {
+            auto router_logits = profiler.measure("gemma.router", [&]() {
                 return mfq_tensor_backend::matmul(router_input, gemma_router.transpose(0, 1));
             });
-            auto selected = g_profiler.measure("gemma.topk", [&]() {
+            auto selected = profiler.measure("gemma.topk", [&]() {
                 return moe_topk_cuda(
                     router_logits.contiguous(), gemma_top_k,
                     false, false, false, true, mfq_nullopt, 1e-20, 1.0);
             });
             trace_gemma_stage(layer, "route_ids", selected.at(0));
             trace_gemma_stage(layer, "route_weights_before_scale", selected.at(1));
-            g_profiler.measure("gemma.route_scale", [&]() {
+            profiler.measure("gemma.route_scale", [&]() {
                 return moe_apply_expert_scale_cuda(
                     selected.at(1), selected.at(0), gemma_expert_scale);
             });
             trace_gemma_stage(layer, "route_weights", selected.at(1));
-            auto route = g_profiler.measure("gemma.route_map", [&]() {
+            auto route = profiler.measure("gemma.route_map", [&]() {
                 return build_moe_route_plan(selected.at(0), gemma_moe_gate_up.n_experts);
             });
             const bool projection_bundle_prefetched =
@@ -1856,17 +1874,17 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             if (!tracing_layer &&
                     gemma_moe_gate_up
                         .supports_projection_glu_epilogue()) {
-                auto moe_hidden = g_profiler.measure("gemma.moe_gate_up_geglu", [&]() {
+                auto moe_hidden = profiler.measure("gemma.moe_gate_up_geglu", [&]() {
                     return gemma_moe_gate_up.forward_glu_output(moe_input, route, true);
                 });
                 if (!projection_bundle_prefetched) {
                     gemma_moe_down.prefetch(route);
                 }
-                down_pair = g_profiler.measure("gemma.moe_down", [&]() {
+                down_pair = profiler.measure("gemma.moe_down", [&]() {
                     return gemma_moe_down.forward(moe_hidden, route);
                 });
             } else {
-                auto gate_up_pair = g_profiler.measure("gemma.moe_gate_up", [&]() {
+                auto gate_up_pair = profiler.measure("gemma.moe_gate_up", [&]() {
                     return gemma_moe_gate_up.forward(moe_input, route);
                 });
                 if (!projection_bundle_prefetched) {
@@ -1874,26 +1892,26 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                 }
                 trace_gemma_stage(layer, "moe_gate_up", gate_up_pair);
                 if (tracing_layer || gate_up_pair.size(0) > 4) {
-                    auto moe_hidden = g_profiler.measure("gemma.moe_geglu", [&]() {
+                    auto moe_hidden = profiler.measure("gemma.moe_geglu", [&]() {
                         return moe_geglu_split_cuda(gate_up_pair);
                     });
                     if (tracing_layer) trace_gemma_stage(layer, "moe_hidden", moe_hidden);
-                    down_pair = g_profiler.measure("gemma.moe_down", [&]() {
+                    down_pair = profiler.measure("gemma.moe_down", [&]() {
                         return gemma_moe_down.forward(moe_hidden, route);
                     });
                 } else {
-                    down_pair = g_profiler.measure("gemma.moe_geglu_down", [&]() {
+                    down_pair = profiler.measure("gemma.moe_geglu_down", [&]() {
                         return gemma_moe_down.forward_geglu(gate_up_pair, route);
                     });
                 }
             }
             trace_gemma_stage(layer, "moe_down", down_pair);
-            auto moe_output = g_profiler.measure("gemma.moe_reduce", [&]() {
+            auto moe_output = profiler.measure("gemma.moe_reduce", [&]() {
                 return moe_weighted_reduce_cuda(down_pair, selected.at(1));
             });
             trace_gemma_stage(layer, "moe_reduce", moe_output);
             if (fused_norms) {
-                auto result = g_profiler.measure("gemma.ffn_merge", [&]() {
+                auto result = profiler.measure("gemma.ffn_merge", [&]() {
                     return gemma4_ffn_merge_f16_cuda(
                         dense_output, moe_output, residual.reshape({B * T, H}),
                         ffn_post_norm_1, ffn_post_norm_2, ffn_post_norm,
@@ -1901,31 +1919,31 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                 });
                 return result;
             }
-            moe_output = g_profiler.measure("gemma.ffn_post_norm_2", [&]() {
+            moe_output = profiler.measure("gemma.ffn_post_norm_2", [&]() {
                 return gemma_rms_norm_f16(
                     moe_output, ffn_post_norm_2,
                     rms_norm_eps, norm_weight_offset);
             });
-            auto combined = g_profiler.measure("gemma.ffn_combine", [&]() {
+            auto combined = profiler.measure("gemma.ffn_combine", [&]() {
                 return dense_output + moe_output;
             });
-            auto post = g_profiler.measure("gemma.ffn_post_norm", [&]() {
+            auto post = profiler.measure("gemma.ffn_post_norm", [&]() {
                 return gemma_rms_norm_f16(
                     combined, ffn_post_norm,
                     rms_norm_eps, norm_weight_offset);
             });
-            auto result = g_profiler.measure("gemma.ffn_residual", [&]() {
+            auto result = profiler.measure("gemma.ffn_residual", [&]() {
                 return acc_cuda(residual.reshape({B * T, H}), post).reshape({B, T, H});
             });
             if (layer_scale.defined()) {
-                result = g_profiler.measure("gemma.layer_scale", [&]() {
+                result = profiler.measure("gemma.layer_scale", [&]() {
                     return result * layer_scale;
                 });
             }
             trace_gemma_stage(layer, "layer_output", result);
             return result;
         }
-        auto attn_pair = g_profiler.measure("full.attn_residual_ffn_norm", [&]() {
+        auto attn_pair = profiler.measure("full.attn_residual_ffn_norm", [&]() {
             auto rr = residual.reshape({-1, H});
             auto oo2 = oo.reshape({-1, H});
             if (!rr.is_cuda()) {
@@ -1982,24 +2000,27 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             auto ffn_input = xn.reshape({B * T, H});
             auto residual_flat = residual.reshape({B * T, H});
             if (ffn.can_forward_fused_residual(ffn_input, residual_flat)) {
-                return g_profiler.measure("full.ffn_down_residual", [&]() {
+                return profiler.measure("full.ffn_down_residual", [&]() {
                     return ffn.forward_fused_residual(
-                        ffn_input, residual_flat).reshape({B, T, H});
+                        execution, ffn_input, residual_flat)
+                        .reshape({B, T, H});
                 });
             }
         }
         mfq_tensor_backend::Tensor ff;
         if (official_bf16) {
             auto ffn_input = xn.reshape({B * T, H});
-            auto gate_up = g_profiler.measure(
+            auto gate_up = profiler.measure(
                 "full.minicpmo45_ffn_gate_up",
-                [&]() { return ffn.gate_up.forward(ffn_input); });
+                [&]() {
+                    return ffn.gate_up.forward(execution, ffn_input);
+                });
             MFQ_RUNTIME_CHECK(
                 gate_up.size() == 2,
                 "MiniCPM-o Qwen3 FFN requires separate Gate and Up outputs");
             auto gate = gate_up[0].to(mfq_tensor_backend::kBFloat16).contiguous();
             auto up = gate_up[1].to(mfq_tensor_backend::kBFloat16).contiguous();
-            auto activation = g_profiler.measure(
+            auto activation = profiler.measure(
                 "full.minicpmo45_ffn_swiglu",
                 [&]() {
                     const char * disabled = std::getenv(
@@ -2009,20 +2030,21 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                     }
                     return (mfq_tensor_backend::silu(gate) * up).contiguous();
                 });
-            ff = g_profiler.measure(
+            ff = profiler.measure(
                 "full.minicpmo45_ffn_down",
                 [&]() {
                     return ffn.down.forward_bf16_output(
-                        activation);
+                        execution, activation);
                 })
                 .reshape({B, T, H})
                 .to(mfq_tensor_backend::kBFloat16)
                 .contiguous();
         } else {
-            ff = ffn.forward(xn.reshape({B * T, H})).reshape({B, T, H});
+            ff = ffn.forward(execution, xn.reshape({B * T, H}))
+                .reshape({B, T, H});
         }
         trace_qwen_stage("qwen.ffn_output", ff);
-        auto output = g_profiler.measure("full.ffn_residual", [&]() {
+        auto output = profiler.measure("full.ffn_residual", [&]() {
             auto rr = residual.reshape({-1, H});
             auto ff2 = ff.reshape({-1, H});
             if (!rr.is_cuda()) {

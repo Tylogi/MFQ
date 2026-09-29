@@ -34,7 +34,7 @@ QWEN_CONFIG = (
 ).read_text(encoding="utf-8")
 CAUSAL_LM = "\n".join(
     (CUDA_ROOT / "models" / name).read_text(encoding="utf-8")
-    for name in ("causal_lm.h", "causal_lm.cpp")
+    for name in ("causal_lm.h", "causal_lm.cpp", "causal_lm_impl.h")
 )
 RUNTIME_OPTIONS = (
     CUDA_ROOT / "engine" / "options.cpp"
@@ -129,8 +129,8 @@ def test_generic_qwen_loader_constructs_moe_ffns():
     assert "load_mfe_gpu(" in QWEN_LOADER
     assert "ffn.is_moe = true" in QWEN_LOADER
     assert "load_qwen_ffn(" in QWEN_LOADER
-    assert "config.num_experts" in QWEN_LOADER
-    assert "return this->config.num_experts" in CAUSAL_LM
+    assert "metadata.num_experts = config.num_experts" in QWEN_LOADER
+    assert "return this->metadata.num_experts" in CAUSAL_LM
     assert "dense Qwen model config intermediate_size must be positive" in QWEN_CONFIG
     assert '"Qwen model config intermediate_size must be positive"' not in QWEN_CONFIG
 

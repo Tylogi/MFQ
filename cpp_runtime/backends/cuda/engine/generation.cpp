@@ -1,7 +1,7 @@
 #include "generation.h"
 
 #include "inference.h"
-#include "models/causal_lm.h"
+#include "models/causal_models.h"
 #include "cuda_sampling.h"
 #include "text_session_cache.h"
 #include "mtp.h"
@@ -224,6 +224,7 @@ struct CudaGenerationOps {
                 model, ids, *prepared, chunk_size, cancelled, nullptr,
                 static_cast<int64_t>(offset));
             auto logits = model.lm_head.forward(
+                *model.execution,
                 hidden.index({Slice(), -1, Slice()})
                     .to(mfq_tensor_backend::kFloat16).contiguous())
                 .contiguous().view({1, -1});

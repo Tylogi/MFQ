@@ -59,50 +59,72 @@ struct NintWeight {
 };
 
 mfq_tensor_backend::Tensor nint_matmul(
-    const NintWeight& weight, mfq_tensor_backend::Tensor input);
+    CudaExecutionContext& execution,
+    const NintWeight& weight,
+    mfq_tensor_backend::Tensor input);
 mfq_tensor_backend::Tensor nint_matmul_bf16_output(
-    const NintWeight& weight, mfq_tensor_backend::Tensor input);
+    CudaExecutionContext& execution,
+    const NintWeight& weight,
+    mfq_tensor_backend::Tensor input);
 mfq_tensor_backend::Tensor nint_matmul_input_mul(
+    CudaExecutionContext& execution,
     const NintWeight& weight,
     mfq_tensor_backend::Tensor input,
     mfq_tensor_backend::Tensor gate,
     int mode);
 mfq_tensor_backend::Tensor nint_matmul_input_mul_f32_kld(
+    CudaExecutionContext& execution,
     const NintWeight& weight,
     mfq_tensor_backend::Tensor input,
     mfq_tensor_backend::Tensor gate,
     int mode);
 mfq_tensor_backend::Tensor nint_matmul_swiglu(
-    const NintWeight& weight, mfq_tensor_backend::Tensor input);
+    CudaExecutionContext& execution,
+    const NintWeight& weight,
+    mfq_tensor_backend::Tensor input);
 mfq_tensor_backend::Tensor nint_matmul_geglu(
-    const NintWeight& weight, mfq_tensor_backend::Tensor input);
+    CudaExecutionContext& execution,
+    const NintWeight& weight,
+    mfq_tensor_backend::Tensor input);
 
 struct NintLinear {
     NintWeight w;
-    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x) const {
+    mfq_tensor_backend::Tensor forward(
+            CudaExecutionContext& execution,
+            mfq_tensor_backend::Tensor x) const {
         auto shape = x.sizes().vec();
         int64_t last = shape.back();
         (void)last;
-        auto y = nint_matmul(w, x.reshape({-1, x.size(-1)}));
+        auto y = nint_matmul(
+            execution, w, x.reshape({-1, x.size(-1)}));
         shape.back() = y.size(-1);
         return y.reshape(shape);
     }
-    mfq_tensor_backend::Tensor forward_bf16_output(mfq_tensor_backend::Tensor x) const {
-        return nint_matmul_bf16_output(w, x);
+    mfq_tensor_backend::Tensor forward_bf16_output(
+            CudaExecutionContext& execution,
+            mfq_tensor_backend::Tensor x) const {
+        return nint_matmul_bf16_output(execution, w, x);
     }
-    mfq_tensor_backend::Tensor forward_input_mul(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate, int mode) const {
+    mfq_tensor_backend::Tensor forward_input_mul(
+            CudaExecutionContext& execution,
+            mfq_tensor_backend::Tensor x,
+            mfq_tensor_backend::Tensor gate,
+            int mode) const {
         auto shape = x.sizes().vec();
-        auto y = nint_matmul_input_mul(w, x.reshape({-1, x.size(-1)}), gate.reshape({-1, gate.size(-1)}), mode);
+        auto y = nint_matmul_input_mul(
+            execution, w, x.reshape({-1, x.size(-1)}),
+            gate.reshape({-1, gate.size(-1)}), mode);
         shape.back() = y.size(-1);
         return y.reshape(shape);
     }
     mfq_tensor_backend::Tensor forward_input_mul_f32_kld(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x,
             mfq_tensor_backend::Tensor gate,
             int mode) const {
         auto shape = x.sizes().vec();
         auto y = nint_matmul_input_mul_f32_kld(
-            w,
+            execution, w,
             x.reshape({-1, x.size(-1)}),
             gate.reshape({-1, gate.size(-1)}),
             mode);

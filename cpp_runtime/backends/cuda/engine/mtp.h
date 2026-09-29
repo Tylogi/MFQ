@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/causal_lm.h"
+#include "models/session_state.h"
 #include "mtp_policy.h"
 #include "mfq_tensor_backend.h"
 #include "mfq/runtime.h"

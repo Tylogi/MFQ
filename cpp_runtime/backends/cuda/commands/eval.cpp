@@ -42,7 +42,9 @@ struct EvalCommand : mfq::cuda::EvalCommandOptions {
     explicit EvalCommand(mfq::cuda::EvalCommandOptions options)
         : mfq::cuda::EvalCommandOptions(std::move(options)) {}
     int run() { return with_command_errors([&]() -> int {
-        setup_cuda_load(*this);
+        CudaExecutionContext execution;
+        CudaExecutionContextScope context_scope(execution);
+        setup_cuda_load(*this, execution);
         if (model_path.empty()) {
             std::cerr << "missing model or execution mode (see --help)\n";
             return 2;
@@ -141,7 +143,7 @@ struct EvalCommand : mfq::cuda::EvalCommandOptions {
                     "positive comma-separated chunk counts");
             }
         }
-        g_profiler.enabled = false;
+        execution.profiler.enabled = false;
         mfq_tensor_backend::NoGradGuard no_grad;
         if (!kl_base.empty()) std::cout << std::unitbuf;
         if (!kl_base.empty()) {
@@ -176,7 +178,7 @@ struct EvalCommand : mfq::cuda::EvalCommandOptions {
                 kl_stream_layers, kl_stream_batch,
                 kl_score_count, kl_reference_contract);
         }
-        return with_loaded_cuda_model(*this, false,
+        return with_loaded_cuda_model(execution, *this, false,
             [&](auto& model, auto& runtime_components,
                     auto t0, auto t1) -> int {
         if (!kl_base.empty()) {

@@ -1,7 +1,7 @@
 #include "mtp.h"
 
 #include "cuda_execution.h"
-#include "models/causal_lm.h"
+#include "models/causal_models.h"
 #include "cuda_sampling.h"
 #include "generation_policy.h"
 #include "inference.h"

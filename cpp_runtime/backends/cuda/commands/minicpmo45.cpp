@@ -61,19 +61,21 @@ void validate_command_options(const CommandOptions& options) {
 }
 
 int run_composite(
+        CudaExecutionContext& execution,
         const CudaLoadOptions& load,
         const CommandOptions& options) {
     return run_minicpmo45_composite(
-        load.model_path, load.config_path,
+        execution, load.model_path, load.config_path,
         options.input_prefix, options.output_prefix,
         load.context_size, options.tts_steps);
 }
 
 int run_duplex(
+        CudaExecutionContext& execution,
         const CudaLoadOptions& load,
         const CommandOptions& options) {
     return run_minicpmo45_duplex(
-        load.model_path, load.config_path,
+        execution, load.model_path, load.config_path,
         options.duplex_input_prefix,
         options.duplex_output_prefix,
         load.context_size, options.duplex_steps,
@@ -83,12 +85,14 @@ int run_duplex(
 }
 
 int run_eval_batch(
+        CudaExecutionContext& execution,
         const std::string& model_path,
         const std::string& config_path,
         int64_t context_size,
         int64_t vision_batch_size) {
     return run_minicpmo45_eval_batch(
-        model_path, config_path, context_size, vision_batch_size);
+        execution, model_path, config_path, context_size,
+        vision_batch_size);
 }
 
 } // namespace mfq::cuda::minicpmo45

@@ -12,9 +12,12 @@ inline Linear glm_ffn(const mfq::ModelSource& file,const mfq::models::glm5_next:
     auto down=routed(file,p+".experts.down.weight",i,c.experts,c.hidden,c.moe_intermediate);
     auto router=linear(file,p+".router.weight"),shared=dense_ffn(file,p+".shared_expert",c.swiglu_limit);
     auto bias=dense(file,p+".router.bias").to(tb::kFloat32).contiguous();
-    return [gate_up,down,router,shared,bias,c](const Tensor& x) {
+    return [gate_up,down,router,shared,bias,c](
+            CudaExecutionContext& execution, const Tensor& x) {
         auto source=x.reshape({-1,c.hidden}).to(tb::kFloat16);
-        auto selected=moe_topk_cuda(router(source.to(tb::kFloat32)).to(tb::kFloat32).contiguous(),
+        auto selected=moe_topk_cuda(
+            router(execution,source.to(tb::kFloat32))
+                .to(tb::kFloat32).contiguous(),
             c.topk,true,false,c.normalize_routes,false,bias,1e-20,c.router_scale);
         auto gu=gate_up(source,selected[0]);
         auto gate=tb::clamp_max(gu.narrow(-1,0,c.moe_intermediate),c.swiglu_limit);
@@ -23,7 +26,8 @@ inline Linear glm_ffn(const mfq::ModelSource& file,const mfq::models::glm5_next:
         auto reduced=tb::zeros({source.size(0),c.hidden},source.options().dtype(tb::kFloat32));
         for (int64_t r=0;r<c.topk;++r)
             reduced=reduced+pairs.select(1,r).to(tb::kFloat32)*selected[1].select(1,r).unsqueeze(-1);
-        return (reduced.to(pairs.scalar_type())+shared(source)).reshape(x.sizes());
+        return (reduced.to(pairs.scalar_type())+
+            shared(execution,source)).reshape(x.sizes());
     };
 }
 
@@ -78,25 +82,36 @@ struct Glm5NextBlock final : Block {
     bool supports_speculation() const noexcept override {return true;}
     void commit_speculative() override { if (kda) kda->commit(); }
     void rollback_speculative(int64_t keep) override { if (kda) kda->rollback(); if (mla) mla->truncate(keep); }
-    Tensor execute(const Tensor& x,int64_t position,int64_t confirmed=0) {
+    Tensor execute(
+            CudaExecutionContext& execution,
+            const Tensor& x,
+            int64_t position,
+            int64_t confirmed=0) {
         if (mla) MFQ_RUNTIME_CHECK(mla->position()==position,"GLM MLA/model cache positions diverged");
         auto first=attention_hc.pre(x,config);
         auto branch=rms_norm(first[2],attention_norm,config.eps);
-        branch=kda ? kda->forward(branch,true,confirmed) : mla->forward(branch,true);
+        branch=kda
+            ? kda->forward(execution,branch,true,confirmed)
+            : mla->forward(execution,branch,true);
         auto hidden=mfq_glm5_next::mhc_post(branch,x,first[0],first[1]);
         auto second=ffn_hc.pre(hidden,config);
-        branch=ffn(rms_norm(second[2],ffn_norm,config.eps));
+        branch=ffn(
+            execution,rms_norm(second[2],ffn_norm,config.eps));
         return mfq_glm5_next::mhc_post(branch,hidden,second[0],second[1]);
     }
-    Tensor forward(Tensor x,Tensor,int64_t position,const MfqOptional<Tensor>&,
+    Tensor forward(
+        CudaExecutionContext& execution,
+        Tensor x,Tensor,int64_t position,const MfqOptional<Tensor>&,
         const RopeCache&,const MfqOptional<Tensor>& = mfq_nullopt,
         const MfqOptional<Tensor>& mask = mfq_nullopt) override {
         MFQ_RUNTIME_CHECK(!mask.has_value(),"GLM requires its causal unpadded attention geometry");
-        return execute(x,position);
+        return execute(execution,x,position);
     }
     Tensor forward_context(
+        CudaExecutionContext& execution,
         Tensor x,const Context& context,const RopeCache&) override {
-        return execute(x,context.cache_position,context.confirmed_prefix);
+        return execute(
+            execution,x,context.cache_position,context.confirmed_prefix);
     }
 };
 

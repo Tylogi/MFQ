@@ -18,7 +18,9 @@ using Routed = std::function<Tensor(const Tensor&, const Tensor&)>;
 
 inline Linear linear(const mfq::ModelSource& file, const std::string& name) {
     auto weight=std::make_shared<QuantLinear>(load_quant_linear(file,name));
-    return [weight](const Tensor& x) { return weight->forward(x); };
+    return [weight](CudaExecutionContext& execution, const Tensor& x) {
+        return weight->forward(execution, x);
+    };
 }
 
 inline Tensor dense(const mfq::ModelSource& file, const std::string& name) {
@@ -68,11 +70,11 @@ inline Routed routed_gate_up(const mfq::ModelSource& file, const std::string& ml
     };
 }
 
-inline void validate_load_options() {
-    const auto& execution = cuda_execution_context();
+inline void validate_load_options(
+        const CudaExecutionContext& execution) {
     if (execution.tensor_parallel.enabled() ||
             execution.layer_placement.enabled() ||
-            execution.n_gpu_layers >= 0 || moe_expert_cache()) {
+            execution.n_gpu_layers >= 0 || execution.moe_expert_cache) {
         throw std::runtime_error(
             "Qwen native adapter supports expert parallelism, but "
             "tensor/layer parallelism and offload require a different placement path");

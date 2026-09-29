@@ -57,8 +57,10 @@ struct Affine {
         return result;
     }
 
-    Tensor operator()(Tensor input) const {
-        auto output = linear.forward(std::move(input));
+    Tensor operator()(
+            CudaExecutionContext& execution,
+            Tensor input) const {
+        auto output = linear.forward(execution, std::move(input));
         return bias.defined()
             ? output + bias.to(output.scalar_type())
             : output;
@@ -183,9 +185,13 @@ struct VisionAttention {
     int64_t head_dim = 0;
     double theta = 10'000.0;
 
-    Tensor operator()(const Tensor& input, const GridVisionLayout& layout) const {
+    Tensor operator()(
+            CudaExecutionContext& execution,
+            const Tensor& input,
+            const GridVisionLayout& layout) const {
         const int64_t tokens = input.size(0);
-        auto projected = qkv(input).reshape({tokens, 3, heads, head_dim});
+        auto projected = qkv(execution, input)
+            .reshape({tokens, 3, heads, head_dim});
         auto query = projected.select(1, 0);
         auto key = projected.select(1, 1);
         auto value = projected.select(1, 2);
@@ -193,7 +199,8 @@ struct VisionAttention {
         key = apply_axial_rope(key, layout.positions, theta);
         auto attended = segmented_attention(
             query, key, value, layout.segment_lengths);
-        return output(attended.reshape({tokens, hidden}));
+        return output(
+            execution, attended.reshape({tokens, hidden}));
     }
 };
 
@@ -214,10 +221,16 @@ struct VisionBlock {
     Affine mlp_up;
     Affine mlp_down;
 
-    Tensor operator()(const Tensor& input, const GridVisionLayout& layout) const {
-        auto attention_output = attention(norm1(input), layout);
+    Tensor operator()(
+            CudaExecutionContext& execution,
+            const Tensor& input,
+            const GridVisionLayout& layout) const {
+        auto attention_output = attention(
+            execution, norm1(input), layout);
         auto hidden = input + attention_output.to(input.scalar_type());
-        auto mlp_output = mlp_down(gelu_tanh(mlp_up(norm2(hidden))));
+        auto mlp_output = mlp_down(
+            execution,
+            gelu_tanh(mlp_up(execution, norm2(hidden))));
         return hidden + mlp_output.to(hidden.scalar_type());
     }
 };
@@ -297,7 +310,10 @@ public:
             std::move(position_weight), std::move(blocks));
     }
 
-    Tensor encode(Tensor pixels, const std::vector<GridShape>& grids) const {
+    Tensor encode(
+            CudaExecutionContext& execution,
+            Tensor pixels,
+            const std::vector<GridShape>& grids) const {
         const auto layout = make_grid_vision_layout(
             grids, static_cast<int32_t>(config_.spatial_merge_size));
         if (pixels.dim() == 5) {
@@ -335,7 +351,9 @@ public:
                 .reshape({layout.patch_count, 4, config_.hidden_size}) * weights,
             1);
         hidden = hidden + learned.to(hidden.scalar_type());
-        for (const auto& block : blocks_) hidden = block(hidden, layout);
+        for (const auto& block : blocks_) {
+            hidden = block(execution, hidden, layout);
+        }
         return hidden;
     }
 
@@ -460,17 +478,23 @@ public:
                     .dtype(mfq_tensor_backend::kFloat32)
                     .device(mfq_tensor_backend::kCPU)).clone()
                 .to(mfq_tensor_backend::kCUDA);
-            auto patches = encoder_.encode(std::move(pixels), {grid});
+            auto patches = encoder_.encode(
+                *language.execution, std::move(pixels), {grid});
             const int64_t unit = encoder_.config().spatial_merge_size *
                 encoder_.config().spatial_merge_size;
             if (patches.size(0) % unit != 0) {
                 throw std::runtime_error(
                     "grid-Vision patch count is not divisible by merge unit");
             }
-            merged = merger_down_(mfq_tensor_backend::gelu(
-                merger_up_(merger_norm_(patches).reshape(
-                    {patches.size(0) / unit,
-                     unit * encoder_.config().hidden_size})), "none"));
+            merged = merger_down_(
+                *language.execution,
+                mfq_tensor_backend::gelu(
+                    merger_up_(
+                        *language.execution,
+                        merger_norm_(patches).reshape(
+                            {patches.size(0) / unit,
+                             unit * encoder_.config().hidden_size})),
+                    "none"));
             // ponytail: one image is the current native contract; use an LRU
             // only when alternating concurrent images becomes measurable.
             cached_vision_key_ = cache_key;

@@ -1,6 +1,6 @@
 #include "causal_lm.h"
+#include "../causal_lm_impl.h"
 
-#include "../causal_lm.h"
 #include "../components.h"
 
 namespace mfq::cuda::deepseek_v41_runtime {
@@ -162,8 +162,7 @@ std::unique_ptr<::Block> load_block(
     return result;
 }
 
-void validate_load_options() {
-    const auto& execution = cuda_execution_context();
+void validate_load_options(const CudaExecutionContext& execution) {
     if (execution.tensor_parallel.enabled() ||
             execution.layer_placement.enabled() ||
             execution.n_gpu_layers >= 0) {
@@ -184,11 +183,12 @@ std::shared_ptr<SharedState> load_shared_state(
 
 Tensor finalize_hidden(
         const std::shared_ptr<SharedState>& state,
-        const Tensor& hidden) {
+        const Tensor& hidden,
+        CudaProfiler& profiler) {
     MFQ_RUNTIME_CHECK(
         state,
         "DeepSeek-V4.1 final state is unavailable");
-    return g_profiler.measure(
+    return profiler.measure(
         "model.deepseek_v41.final_collapse", [&]() {
             return state->final_collapse(
                 hidden, state->config.n_layers);
@@ -224,7 +224,7 @@ void DeepseekV41Model::adapter_load_config(
 }
 
 void DeepseekV41Model::adapter_validate_load_options() const {
-    deepseek_v41_runtime::validate_load_options();
+    deepseek_v41_runtime::validate_load_options(*execution);
 }
 
 void DeepseekV41Model::adapter_load_final_state(
@@ -291,8 +291,9 @@ DeepseekV41Model::adapter_finalize_hidden(
         const mfq_tensor_backend::Tensor& output_norm,
         int64_t batch,
         int64_t tokens) const {
-    hidden = deepseek_v41_runtime::finalize_hidden(shared, hidden);
-    return g_profiler.measure("model.output_norm", [&]() {
+    hidden = deepseek_v41_runtime::finalize_hidden(
+        shared, hidden, execution->profiler);
+    return execution->profiler.measure("model.output_norm", [&]() {
         return qwen_rms_norm(
             hidden.reshape({batch * tokens, metadata.hidden_size})
                 .to(mfq_tensor_backend::kFloat32),
@@ -358,7 +359,14 @@ RuntimeComponents<mfq::cuda::DeepseekV41CausalLm> load_runtime_components(
         "invalid DeepSeek-V4.1 DSpark model");
     result.mtp =
         mfq::cuda::deepseek_v41_runtime::load_dspark_if_present(
-            *model.source, model.shared->config);
+            *model.execution, *model.source, model.shared->config);
     result.mtp_available = static_cast<bool>(result.mtp);
     return result;
 }
+
+namespace mfq::cuda {
+
+template struct CudaSessionCodec<DeepseekV41Model>;
+template struct CausalLm<DeepseekV41Model>;
+
+} // namespace mfq::cuda

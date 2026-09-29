@@ -5,6 +5,7 @@ using mfq_tensor_backend::indexing::Slice;
 using namespace mfq::cuda::quant_format;
 
 mfq_tensor_backend::Tensor mxfp8_matmul(
+        CudaProfiler& profiler,
         const Mxfp8Weight & weight,
         mfq_tensor_backend::Tensor x) {
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
@@ -61,18 +62,19 @@ mfq_tensor_backend::Tensor mxfp8_matmul(
         return result;
     }
     if (x.size(0) <= 8) {
-        return g_profiler.measure("mxfp8.small_m", [&]() {
+        return profiler.measure("mxfp8.small_m", [&]() {
             return mxfp8_small_m_cuda(
                 weight.values, weight.scales, x);
         });
     }
-    return g_profiler.measure("mxfp8.packed_matmul", [&]() {
+    return profiler.measure("mxfp8.packed_matmul", [&]() {
         return mxfp8_matmul_f16_cuda(
             weight.values, weight.scales, x);
     });
 }
 
 mfq_tensor_backend::Tensor mxfp8_matmul_f32(
+        CudaProfiler& profiler,
         const Mxfp8Weight & weight,
         mfq_tensor_backend::Tensor x) {
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
@@ -80,12 +82,12 @@ mfq_tensor_backend::Tensor mxfp8_matmul_f32(
         x.dim() == 2 && x.size(1) == weight.neuron_len,
         "MXFP8 FP32-output activation width mismatch");
     if (x.size(0) <= 8) {
-        return g_profiler.measure("mxfp8.small_m_f32", [&]() {
+        return profiler.measure("mxfp8.small_m_f32", [&]() {
             return mxfp8_small_m_f32_cuda(
                 weight.values, weight.scales, x);
         });
     }
-    return g_profiler.measure("mxfp8.gemm_f32", [&]() {
+    return profiler.measure("mxfp8.gemm_f32", [&]() {
         return mxfp8_gemm_f32_cuda(
             weight.values, weight.scales, x);
     });
@@ -138,6 +140,7 @@ mfq_tensor_backend::Tensor mxfp8_cpu_reference(
 }
 
 mfq_tensor_backend::Tensor mxfp8_groupwise_matmul(
+        CudaProfiler& profiler,
         const Mxfp8Weight & weight,
         mfq_tensor_backend::Tensor grouped,
         int64_t groups) {
@@ -152,7 +155,7 @@ mfq_tensor_backend::Tensor mxfp8_groupwise_matmul(
         outputs_per_group % 128 == 0,
         "MXFP8 groupwise output width must preserve scale blocks");
     if (grouped.size(0) <= 8) {
-        return g_profiler.measure("mxfp8.groupwise_small_m", [&]() {
+        return profiler.measure("mxfp8.groupwise_small_m", [&]() {
             return mxfp8_groupwise_small_m_cuda(
                 weight.values, weight.scales, grouped, groups);
         });
@@ -171,12 +174,14 @@ mfq_tensor_backend::Tensor mxfp8_groupwise_matmul(
             0, group * scale_rows_per_group,
             scale_rows_per_group).contiguous();
         outputs.push_back(mxfp8_matmul(
-            shard, grouped.select(1, group).contiguous()));
+            profiler, shard,
+            grouped.select(1, group).contiguous()));
     }
     return mfq_tensor_backend::cat(outputs, -1).contiguous();
 }
 
 mfq_tensor_backend::Tensor mxfp8_groupwise_matmul_f32(
+        CudaProfiler& profiler,
         const Mxfp8Weight & weight,
         mfq_tensor_backend::Tensor grouped,
         int64_t groups) {
@@ -191,7 +196,7 @@ mfq_tensor_backend::Tensor mxfp8_groupwise_matmul_f32(
         outputs_per_group % 128 == 0,
         "MXFP8 groupwise output width must preserve scale blocks");
     if (grouped.size(0) <= 8) {
-        return g_profiler.measure(
+        return profiler.measure(
             "mxfp8.groupwise_small_m_f32", [&]() {
                 return mxfp8_groupwise_small_m_f32_cuda(
                     weight.values, weight.scales, grouped, groups);
@@ -211,7 +216,8 @@ mfq_tensor_backend::Tensor mxfp8_groupwise_matmul_f32(
             0, group * scale_rows_per_group,
             scale_rows_per_group).contiguous();
         outputs.push_back(mxfp8_matmul_f32(
-            shard, grouped.select(1, group).contiguous()));
+            profiler, shard,
+            grouped.select(1, group).contiguous()));
     }
     return mfq_tensor_backend::cat(outputs, -1).contiguous();
 }

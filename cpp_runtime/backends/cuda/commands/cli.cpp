@@ -113,9 +113,6 @@ std::vector<int64_t> load_ids_file(const std::string& path) {
 }
 
 int with_command_errors(const std::function<int()>& fn) {
-    struct Cleanup {
-        ~Cleanup() { reset_cuda_load(); }
-    } cleanup;
     try {
         return fn();
     } catch (const std::exception& error) {

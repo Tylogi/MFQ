@@ -1,4 +1,5 @@
 #include "causal_lm.h"
+#include "../causal_lm_impl.h"
 
 namespace mfq::cuda {
 
@@ -132,7 +133,7 @@ MiniCPMO45Model::adapter_finalize_hidden(
         const mfq_tensor_backend::Tensor& output_norm,
         int64_t batch,
         int64_t tokens) const {
-    return g_profiler.measure("model.output_norm", [&]() {
+    return execution->profiler.measure("model.output_norm", [&]() {
         return qwen_rms_norm_bf16(
             hidden.reshape({batch * tokens, metadata.hidden_size}),
             output_norm, metadata.rms_norm_eps,
@@ -145,8 +146,8 @@ mfq_tensor_backend::Tensor
 MiniCPMO45Model::adapter_logits(
         const QuantLinear& lm_head,
         mfq_tensor_backend::Tensor hidden) const {
-    return g_profiler.measure("model.lm_head", [&]() {
-        return lm_head.forward(hidden)
+    return execution->profiler.measure("model.lm_head", [&]() {
+        return lm_head.forward(*execution, hidden)
             .to(mfq_tensor_backend::kBFloat16).contiguous();
     });
 }
@@ -176,6 +177,7 @@ bool MiniCPMO45Model::adapter_uses_decode_sequence_length() const noexcept {
 } // namespace mfq::cuda
 
 int run_minicpmo45_duplex(
+        CudaExecutionContext& execution,
         const std::string & model_path,
         const std::string & config_path,
         const std::string & input_prefix,
@@ -186,7 +188,7 @@ int run_minicpmo45_duplex(
         bool greedy,
         int64_t seed) {
     mfq_tensor_backend::NoGradGuard no_grad;
-    g_profiler.enabled = false;
+    execution.profiler.enabled = false;
     if (input_prefix.empty() || output_prefix.empty() || steps <= 0 ||
             max_speak_tokens < 2 || seed < 0) {
         throw std::runtime_error(
@@ -196,7 +198,7 @@ int run_minicpmo45_duplex(
     mfq_tensor_backend::manual_seed(seed);
     mfq_cuda_manual_seed_all(seed);
     auto runtime = MiniCPMO45Runtime::load(
-        model_path, config_path, context_size);
+        execution, model_path, config_path, context_size);
     auto special_ids = MiniCPMO45DuplexSpecialIds::from_tensor(
         minicpmo45_load_tensor(input_prefix + ".special_ids.pt", true));
     std::vector<int64_t> forbidden_ids;
@@ -465,16 +467,17 @@ minicpmo45_teacher_prefill_segments(
 }
 
 int run_minicpmo45_eval_batch(
+        CudaExecutionContext& execution,
         const std::string & model_path,
         const std::string & config_path,
         int64_t context_size,
         int64_t vision_batch_size) {
     mfq_tensor_backend::NoGradGuard no_grad;
-    g_profiler.enabled = false;
+    execution.profiler.enabled = false;
     if (context_size <= 0) context_size = 8192;
     if (vision_batch_size <= 0) vision_batch_size = 16;
     auto runtime = MiniCPMO45Runtime::load(
-        model_path, config_path, context_size);
+        execution, model_path, config_path, context_size);
     std::cout << "minicpmo45_eval_batch=ready"
               << " context_size=" << context_size
               << " vision_batch_size=" << vision_batch_size << std::endl;
@@ -607,12 +610,14 @@ int run_minicpmo45_eval_batch(
                 const int64_t count = std::min<int64_t>(
                     vision_batch_size, pixels.size(0) - begin);
                 auto vision_part = runtime.vision.forward(
+                    execution,
                     pixels.narrow(0, begin, count).to(mfq_tensor_backend::kCUDA),
                     patch_mask.narrow(0, begin, count),
                     target_sizes.narrow(0, begin, count));
                 vision_parts.push_back(vision_part);
                 image_embedding_parts.push_back(runtime.resampler.forward(
-                    vision_part, target_sizes.narrow(0, begin, count)));
+                    execution, vision_part,
+                    target_sizes.narrow(0, begin, count)));
             }
             image_embeddings = mfq_tensor_backend::cat(
                 image_embedding_parts, 0).contiguous();
@@ -644,7 +649,7 @@ int run_minicpmo45_eval_batch(
                     std::vector<int64_t>{raw_lengths[index]},
                     mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64));
                 auto part = runtime.audio.forward(
-                    part_features, part_length, false);
+                    execution, part_features, part_length, false);
                 if (part.size(1) != valid_length_values[
                         static_cast<size_t>(index)]) {
                     throw std::runtime_error(
@@ -1032,6 +1037,7 @@ int run_minicpmo45_eval_batch(
 }
 
 int run_minicpmo45_composite(
+        CudaExecutionContext& execution,
         const std::string & model_path,
         const std::string & config_path,
         const std::string & input_prefix,
@@ -1039,13 +1045,13 @@ int run_minicpmo45_composite(
         int64_t context_size,
         int64_t tts_steps) {
     mfq_tensor_backend::NoGradGuard no_grad;
-    g_profiler.enabled = false;
+    execution.profiler.enabled = false;
     if (input_prefix.empty() || output_prefix.empty()) {
         throw std::runtime_error(
             "MiniCPM-o composite graph requires input and output prefixes");
     }
     auto runtime = MiniCPMO45Runtime::load(
-        model_path, config_path, context_size);
+        execution, model_path, config_path, context_size);
     const auto input_ids = minicpmo45_load_tensor(
         input_prefix + ".input_ids.pt", true);
     const auto position_ids = minicpmo45_load_tensor(
@@ -1129,3 +1135,12 @@ int run_minicpmo45_composite(
               << " tts_steps=" << tts_steps << "\n";
     return 0;
 }
+
+namespace mfq::cuda {
+
+template struct FullAttentionSessionCodec<MiniCPMO45Model>;
+template struct FullAttentionSessionCodec<MiniCPMOTtsModel>;
+template struct CausalLm<MiniCPMO45Model>;
+template struct CausalLm<MiniCPMOTtsModel>;
+
+} // namespace mfq::cuda

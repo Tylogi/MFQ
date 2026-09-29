@@ -29,9 +29,11 @@ inline Linear qwen_ffn(const mfq::ModelSource& file,const mfq::models::qwen4_exp
     auto down=routed(file,p+".experts.down.weight",i,c.experts,c.hidden,c.moe_width);
     auto router=linear(file,p+".router.weight"),shared_gate=linear(file,p+".shared_expert.router.weight");
     auto sg=linear(file,p+".shared_expert.gate.weight"),su=linear(file,p+".shared_expert.up.weight"),sd=linear(file,p+".shared_expert.down.weight");
-    return [gate_up,down,router,shared_gate,sg,su,sd,c](const Tensor& x) {
+    return [gate_up,down,router,shared_gate,sg,su,sd,c](
+            CudaExecutionContext& execution, const Tensor& x) {
         auto source=x.reshape({-1,c.hidden}).to(tb::kFloat16);
-        auto selected=moe_topk_cuda(router(source).to(tb::kFloat32).contiguous(),c.topk,
+        auto selected=moe_topk_cuda(
+            router(execution,source).to(tb::kFloat32).contiguous(),c.topk,
             false,false,c.normalize_routes,false,mfq_nullopt,1e-20,1.0);
         auto gu=gate_up(source,selected[0]);
         auto gate=gu.narrow(-1,0,c.moe_width),up=gu.narrow(-1,c.moe_width,c.moe_width);
@@ -39,8 +41,9 @@ inline Linear qwen_ffn(const mfq::ModelSource& file,const mfq::models::qwen4_exp
         auto reduced=tb::zeros({source.size(0),c.hidden},source.options().dtype(tb::kFloat32));
         for (int64_t r=0;r<c.topk;++r)
             reduced=reduced+pairs.select(1,r).to(tb::kFloat32)*selected[1].select(1,r).unsqueeze(-1);
-        auto g=sg(source),u=su(source);
-        auto shared=tb::sigmoid(shared_gate(source))*sd((g*tb::sigmoid(g))*u);
+        auto g=sg(execution,source),u=su(execution,source);
+        auto shared=tb::sigmoid(shared_gate(execution,source))*
+            sd(execution,(g*tb::sigmoid(g))*u);
         return (reduced.to(pairs.scalar_type())+shared).reshape(x.sizes());
     };
 }
@@ -54,7 +57,7 @@ inline std::vector<int64_t> integers(const mfq::ModelSource& file,const std::str
 }
 
 inline std::unique_ptr<Ple> qwen_ple(const mfq::ModelSource& file,const mfq::models::qwen4_exp::Config& c,const std::string& p) {
-    std::vector<Linear> shards;
+    std::vector<Embedding> shards;
     int64_t rows=0,width=c.hidden/((c.ngram-1)*c.ngram_heads);
     for (int64_t i=0;i<c.shards;++i) {
         const auto name=p+".ngram.shard."+std::to_string(i)+".weight";
@@ -105,22 +108,34 @@ struct Qwen4Block final : Block {
     bool supports_speculation() const noexcept override {return true;}
     void commit_speculative() override {if (gdn) gdn->commit();if (ple) ple->commit();}
     void rollback_speculative(int64_t keep) override {if (gdn) gdn->rollback();if (qsa) qsa->truncate(keep);if (ple) ple->rollback();}
-    Tensor execute(Tensor x,const Tensor& ids,const Tensor& positions,const Tensor& full_positions,int64_t confirmed=0) {
-        if (ple) x=x+ple->forward(x,ids,true,confirmed);
+    Tensor execute(
+            CudaExecutionContext& execution,
+            Tensor x,
+            const Tensor& ids,
+            const Tensor& positions,
+            const Tensor& full_positions,
+            int64_t confirmed=0) {
+        if (ple) x=x+ple->forward(execution,x,ids,true,confirmed);
         auto first=attention_gr.pre(x);
-        auto branch=gdn?gdn->forward(first[0],true,confirmed):qsa->forward(first[0],positions,full_positions,true);
+        auto branch=gdn
+            ? gdn->forward(execution,first[0],true,confirmed)
+            : qsa->forward(
+                execution,first[0],positions,full_positions,true);
         x=attention_gr.post(branch,first);
         auto second=ffn_gr.pre(x);
-        return ffn_gr.post(ffn(second[0]),second);
+        return ffn_gr.post(ffn(execution,second[0]),second);
     }
-    Tensor forward(Tensor,Tensor,int64_t,const MfqOptional<Tensor>&,
+    Tensor forward(
+        CudaExecutionContext&,
+        Tensor,Tensor,int64_t,const MfqOptional<Tensor>&,
         const RopeCache&,const MfqOptional<Tensor>& = mfq_nullopt,
         const MfqOptional<Tensor>& = mfq_nullopt) override {
         throw std::runtime_error("Qwen4 block requires the unified model position/PLE input lifecycle");
     }
     Tensor forward_context(
+        CudaExecutionContext& execution,
         Tensor x,const Context& context,const RopeCache&) override {
-        return execute(std::move(x),context.token_ids,context.positions,
+        return execute(execution,std::move(x),context.token_ids,context.positions,
             context.full_positions,context.confirmed_prefix);
     }
 };

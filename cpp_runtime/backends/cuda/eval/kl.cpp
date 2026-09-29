@@ -1,5 +1,6 @@
 #include "kl.h"
 
+#include "models/causal_models.h"
 #include "../models/registry.h"
 #include "quant_linear.h"
 #include "../engine/cuda_execution.h"
@@ -906,7 +907,7 @@ int run_kl_eval_streamed(
     auto started = std::chrono::steady_clock::now();
     auto model = mfq::cuda::load_causal_lm<
         mfq::cuda::DeepseekV4CausalLm>(
-            model_path, config_path, n_ctx, false);
+            cuda_execution_context(), model_path, config_path, n_ctx, false);
     if (chunk_batch > 16) {
         throw std::runtime_error(
             "DeepSeek V4 streamed KL chunk batch must not exceed 16");
@@ -966,7 +967,7 @@ int run_kl_eval_streamed(
             std::cerr << "stream loading layer " << layer << " "
                       << model.layer_type(layer) << std::endl;
             blocks.push_back(mfq::cuda::deepseek_v4::load_block(
-                mfq, model.config, layer,
+                *model.execution, mfq, model.config, layer,
                 std::string(model.layer_type(layer)), dsv4_state));
         }
         for (int begin = 0; begin < chunks; begin += chunk_batch) {
@@ -981,7 +982,7 @@ int run_kl_eval_streamed(
                 block->reset(count);
                 block->set_token_ids(ids);
                 x = block->forward(
-                    x, pos, 0, mfq_nullopt, model.rope);
+                    *model.execution, x, pos, 0, mfq_nullopt, model.rope);
             }
             hidden_cpu.narrow(0, begin, count).copy_(x, true);
             mfq_cuda_synchronize();
@@ -1011,7 +1012,7 @@ int run_kl_eval_streamed(
         auto selected =
             y.index({Slice(), Slice(first, first + score_count), Slice()});
         auto logits = model.apply_final_logit_softcap(
-            model.lm_head.forward(selected));
+            model.lm_head.forward(*model.execution, selected));
         if (logits_output.is_open()) {
             auto saved = logits.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kFloat16)
                              .contiguous();

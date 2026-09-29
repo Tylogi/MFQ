@@ -1,6 +1,6 @@
 #include "causal_lm.h"
+#include "../causal_lm_impl.h"
 
-#include "../causal_lm.h"
 #include "../components.h"
 
 namespace mfq::cuda::qwen4_exp {
@@ -52,7 +52,7 @@ void Qwen4Model::adapter_load_config(
 }
 
 void Qwen4Model::adapter_validate_load_options() const {
-    qwen4_exp::validate_load_options();
+    qwen4_exp::validate_load_options(*execution);
 }
 
 void Qwen4Model::adapter_load_final_state(
@@ -214,7 +214,7 @@ RuntimeComponents<mfq::cuda::Qwen4CausalLm> load_runtime_components(
         model.supports_speculation(),
         "invalid Flash-Next predictor model");
     auto predictor = mfq::cuda::qwen4_exp::Qwen4ExpMtp::load_if_present(
-        *model.source, model.config);
+        *model.execution, *model.source, model.config);
     if (predictor) {
         result.mtp =
             std::make_unique<mfq::cuda::qwen4_exp::Qwen4ExpMtp>(
@@ -223,3 +223,10 @@ RuntimeComponents<mfq::cuda::Qwen4CausalLm> load_runtime_components(
     result.mtp_available = static_cast<bool>(result.mtp);
     return result;
 }
+
+namespace mfq::cuda {
+
+template struct CudaSessionCodec<Qwen4Model>;
+template struct CausalLm<Qwen4Model>;
+
+} // namespace mfq::cuda

@@ -1,6 +1,6 @@
 #include "causal_lm.h"
+#include "../causal_lm_impl.h"
 
-#include "../causal_lm.h"
 #include "../components.h"
 
 namespace mfq::cuda::glm5_next {
@@ -47,7 +47,7 @@ void Glm5Model::adapter_load_config(
 }
 
 void Glm5Model::adapter_validate_load_options() const {
-    glm5_next::validate_load_options();
+    glm5_next::validate_load_options(*execution);
 }
 
 std::unique_ptr<Block>
@@ -145,7 +145,7 @@ RuntimeComponents<mfq::cuda::Glm5CausalLm> load_runtime_components(
         model.supports_speculation(),
         "invalid Flash-Next predictor model");
     auto predictor = mfq::cuda::glm5_next::Glm5NextMtp::load_if_present(
-        *model.source, model.config);
+        *model.execution, *model.source, model.config);
     if (predictor) {
         result.mtp =
             std::make_unique<mfq::cuda::glm5_next::Glm5NextMtp>(
@@ -154,3 +154,10 @@ RuntimeComponents<mfq::cuda::Glm5CausalLm> load_runtime_components(
     result.mtp_available = static_cast<bool>(result.mtp);
     return result;
 }
+
+namespace mfq::cuda {
+
+template struct CudaSessionCodec<Glm5Model>;
+template struct CausalLm<Glm5Model>;
+
+} // namespace mfq::cuda

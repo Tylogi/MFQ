@@ -310,12 +310,12 @@ static void print_parallel_config(
 }
 
 static void configure_model_parallel(
+        CudaExecutionContext& execution,
         const std::string & tensor_devices_arg,
         const std::string & tensor_split_arg,
         const std::string & expert_devices_arg,
         const std::string & expert_split_arg,
         bool allow_duplicate_devices = false) {
-    auto& execution = cuda_execution_context();
     execution.model_parallel_collectives.reset();
     execution.tensor_parallel = {};
     execution.expert_parallel = {};
@@ -339,12 +339,14 @@ static void configure_model_parallel(
             "combined tensor and expert parallelism requires the same "
             "ordered CUDA device group");
     }
-    if (!model_parallel_enabled()) {
+    if (!execution.tensor_parallel.enabled() &&
+            !execution.expert_parallel.enabled()) {
         MFQ_CUDA_CHECK(cudaSetDevice(0));
         return;
     }
 
-    const auto & config = model_parallel_config();
+    const auto& config = execution.tensor_parallel.enabled()
+        ? execution.tensor_parallel : execution.expert_parallel;
     std::unordered_set<int> unique_devices(
         config.devices.begin(), config.devices.end());
     for (const int source : unique_devices) {
@@ -372,7 +374,7 @@ static void configure_model_parallel(
     }
     execution.model_parallel_collectives.configure(
         config.devices, allow_duplicate_devices);
-    MFQ_CUDA_CHECK(cudaSetDevice(model_parallel_primary_device()));
+    MFQ_CUDA_CHECK(cudaSetDevice(config.primary_device()));
     print_parallel_config(
         "tensor_parallel", execution.tensor_parallel);
     print_parallel_config(
@@ -385,9 +387,10 @@ static void configure_model_parallel(
 }
 
 static void configure_layer_placement(
+        CudaExecutionContext& execution,
         const std::string & devices_arg,
         const std::string & split_arg) {
-    auto& placement = cuda_execution_context().layer_placement;
+    auto& placement = execution.layer_placement;
     placement = {};
     if (devices_arg.empty()) {
         if (!split_arg.empty()) {
@@ -396,7 +399,8 @@ static void configure_layer_placement(
         }
         return;
     }
-    if (model_parallel_enabled()) {
+    if (execution.tensor_parallel.enabled() ||
+            execution.expert_parallel.enabled()) {
         throw std::runtime_error(
             "--layer-parallel cannot be combined with tensor/expert parallelism");
     }
@@ -516,10 +520,11 @@ static std::unordered_set<int> parse_layer_ranges(
     return result;
 }
 
-void setup_cuda_load(const mfq::cuda::CudaLoadOptions& options) {
-    auto& execution = cuda_execution_context();
+void setup_cuda_load(
+        const mfq::cuda::CudaLoadOptions& options,
+        CudaExecutionContext& execution) {
+    CudaExecutionContextScope context_scope(execution);
     execution.reset();
-    g_mfq_drop_file_cache = false;
     const auto& tensor_parallel_arg = options.tensor_parallel_arg;
     const auto& tensor_split_arg = options.tensor_split_arg;
     const auto& expert_parallel_arg = options.expert_parallel_arg;
@@ -542,11 +547,11 @@ void setup_cuda_load(const mfq::cuda::CudaLoadOptions& options) {
             mfq_set_num_threads(cpu_threads);
         }
         configure_model_parallel(
-            tensor_parallel_arg, tensor_split_arg,
+            execution, tensor_parallel_arg, tensor_split_arg,
             expert_parallel_arg, expert_split_arg,
             parallel_test_duplicates);
         configure_layer_placement(
-            layer_parallel_arg, layer_split_arg);
+            execution, layer_parallel_arg, layer_split_arg);
         if (!cpu_offload_layers_arg.empty()) {
             execution.dsv4_cpu_offload_layers =
                 parse_layer_ranges(cpu_offload_layers_arg);
@@ -580,7 +585,8 @@ void setup_cuda_load(const mfq::cuda::CudaLoadOptions& options) {
                 "--cpu-offload-layers");
         }
         if (moe_gpu_cache_gb > 0.0 &&
-                model_parallel_enabled()) {
+                (execution.tensor_parallel.enabled() ||
+                 execution.expert_parallel.enabled())) {
             throw std::runtime_error(
                 "--moe-gpu-cache-gb cannot be combined with "
                 "tensor/expert parallelism");
@@ -601,7 +607,7 @@ void setup_cuda_load(const mfq::cuda::CudaLoadOptions& options) {
                 throw std::runtime_error(
                     "--moe-gpu-cache-gb is outside the supported range");
             }
-            moe_expert_cache() =
+            execution.moe_expert_cache =
                 make_moe_expert_cache(
                     static_cast<int64_t>(bytes));
             if (!moe_cache_profile_path.empty()) {
@@ -609,13 +615,17 @@ void setup_cuda_load(const mfq::cuda::CudaLoadOptions& options) {
                     mfq::load_moe_cache_profile(
                         moe_cache_profile_path));
             }
-            g_mfq_drop_file_cache = true;
+            execution.drop_file_cache = true;
         }
 }
 
-void reset_cuda_load() noexcept {
-    cuda_execution_context().reset();
-    g_mfq_drop_file_cache = false;
+int with_cuda_load(
+        const CudaLoadOptions& options,
+        const std::function<int(CudaExecutionContext&)>& run) {
+    CudaExecutionContext execution;
+    CudaExecutionContextScope context_scope(execution);
+    setup_cuda_load(options, execution);
+    return run(execution);
 }
 
 } // namespace mfq::cuda::internal

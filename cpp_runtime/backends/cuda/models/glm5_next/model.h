@@ -28,17 +28,25 @@ public:
         MFQ_RUNTIME_CHECK(pending(), "GLM KDA has no speculative checkpoint");
         conv_ = rollback_conv_; recurrent_ = rollback_recurrent_; commit();
     }
-    Tensor forward(const Tensor& hidden, bool use_cache, int64_t confirmed = 0) {
+    Tensor forward(
+            CudaExecutionContext& execution,
+            const Tensor& hidden,
+            bool use_cache,
+            int64_t confirmed = 0) {
         MFQ_RUNTIME_CHECK(hidden.is_cuda() && hidden.dim() == 3 && hidden.size(0) > 0 &&
             hidden.size(1) > 0 && confirmed >= 0 && confirmed <= hidden.size(1) &&
             (!confirmed || use_cache), "invalid GLM KDA input/verification geometry");
         if (confirmed > 0 && confirmed < hidden.size(1)) {
             MFQ_RUNTIME_CHECK(!pending(), "resolve previous GLM KDA speculative checkpoint");
-            auto prefix = forward(hidden.narrow(1, 0, confirmed), true);
+            auto prefix = forward(
+                execution, hidden.narrow(1, 0, confirmed), true);
             // Kernels produce fresh state: retaining these references is enough.
             rollback_conv_ = conv_; rollback_recurrent_ = recurrent_;
             try {
-                auto suffix = forward(hidden.narrow(1, confirmed, hidden.size(1) - confirmed), true);
+                auto suffix = forward(
+                    execution,
+                    hidden.narrow(1, confirmed, hidden.size(1) - confirmed),
+                    true);
                 return tb::cat({prefix, suffix}, 1);
             } catch (...) { rollback(); throw; }
         }
@@ -49,7 +57,7 @@ public:
             "reset GLM KDA before changing batch/device");
         auto previous = use_cache && conv_.defined() ? conv_ :
             tb::zeros({b,kernel_ - 1,3 * channels}, options);
-        auto raw = tb::cat({w_.query(hidden), w_.key(hidden), w_.value(hidden)}, -1).to(tb::kFloat32);
+        auto raw = tb::cat({w_.query(execution,hidden), w_.key(execution,hidden), w_.value(execution,hidden)}, -1).to(tb::kFloat32);
         MFQ_RUNTIME_CHECK(raw.sizes().vec() == std::vector<int64_t>({b,t,3 * channels}),
             "GLM KDA projection shape mismatch");
         auto joined = tb::cat({previous, raw}, 1).contiguous();
@@ -65,7 +73,7 @@ public:
         auto q = normalize(heads(0)), k = normalize(heads(channels)), v = heads(2 * channels).contiguous();
         auto forget = mfq_glm5_next::kda_forget_gate(hidden, w_.forget_a, w_.forget_b,
             w_.dt_bias, w_.a_log, heads_, width_, lower_bound_).permute({0,2,1,3}).contiguous();
-        auto beta = tb::sigmoid(w_.beta(hidden).to(tb::kFloat32)).transpose(1,2).contiguous();
+        auto beta = tb::sigmoid(w_.beta(execution,hidden).to(tb::kFloat32)).transpose(1,2).contiguous();
         Tensor attended, next_recurrent;
         auto initial = use_cache && recurrent_.defined() ? recurrent_ : Tensor{};
         if (width_ == 32 || width_ == 64 || width_ == 128) {
@@ -87,9 +95,9 @@ public:
             }
             attended = tb::cat(steps, 2);
         }
-        auto gate = w_.gate_b(w_.gate_a(hidden)).reshape({b,t,heads_,width_}).permute({0,2,1,3});
+        auto gate = w_.gate_b(execution,w_.gate_a(execution,hidden)).reshape({b,t,heads_,width_}).permute({0,2,1,3});
         auto normalized = rms_norm(attended, w_.output_norm, eps_) * tb::sigmoid(gate.to(tb::kFloat32));
-        auto result = w_.output(normalized.permute({0,2,1,3}).reshape({b,t,channels}).to(hidden.scalar_type()));
+        auto result = w_.output(execution,normalized.permute({0,2,1,3}).reshape({b,t,channels}).to(hidden.scalar_type()));
         // Publish state only after the whole branch succeeds.
         if (use_cache) { conv_ = std::move(next_conv); recurrent_ = std::move(next_recurrent); }
         return result;
@@ -130,17 +138,20 @@ public:
             "invalid Flash-Next MLA cache truncation");
         latent_.truncate(keep); index_.truncate(keep);
     }
-    Tensor forward(const Tensor& hidden, bool use_cache) {
+    Tensor forward(
+            CudaExecutionContext& execution,
+            const Tensor& hidden,
+            bool use_cache) {
         MFQ_RUNTIME_CHECK(hidden.is_cuda() && hidden.dim() == 3 && hidden.size(0) > 0 && hidden.size(1) > 0,
             "GLM MLA requires nonempty [B,T,H] input");
         const auto b = hidden.size(0), t = hidden.size(1), offset = use_cache ? position() : 0;
         MFQ_RUNTIME_CHECK(offset == (use_cache ? index_.position() : 0) && t <= c_.maximum - offset,
             "GLM MLA cache position/capacity mismatch");
-        auto qr = rms_norm(w_.query_a(hidden), w_.query_norm, c_.eps);
-        auto query = w_.query_b(qr).reshape({b,t,c_.heads,c_.nope});
-        auto latent = rms_norm(w_.key_value_a(hidden).narrow(-1, 0, c_.latent), w_.latent_norm, c_.eps);
+        auto qr = rms_norm(w_.query_a(execution,hidden), w_.query_norm, c_.eps);
+        auto query = w_.query_b(execution,qr).reshape({b,t,c_.heads,c_.nope});
+        auto latent = rms_norm(w_.key_value_a(execution,hidden).narrow(-1, 0, c_.latent), w_.latent_norm, c_.eps);
         // Metal's indexer LayerNorm explicitly casts the source/output to F16.
-        auto ik = w_.index_key(hidden).to(tb::kFloat16).to(tb::kFloat32);
+        auto ik = w_.index_key(execution,hidden).to(tb::kFloat16).to(tb::kFloat32);
         auto centered = ik - ik.mean(-1, true);
         ik = (centered * tb::rsqrt((centered * centered).mean(-1, true) + 1e-6) *
             w_.index_norm.to(tb::kFloat32) + w_.index_bias.to(tb::kFloat32)).to(tb::kFloat16);
@@ -149,7 +160,7 @@ public:
         auto packed = tb::cat({ik.to(gates.scalar_type()), gates}, -1);
         try {
             if (use_cache) { latent = latent_.append(latent); packed = index_.append(packed); }
-            auto absorbed = w_.embed_query(query).permute({0,2,1,3}).to(tb::kFloat32);
+            auto absorbed = w_.embed_query(execution,query).permute({0,2,1,3}).to(tb::kFloat32);
             Tensor attended;
             const double scale = 1.0 / std::sqrt(double(c_.nope));
             if (latent.size(1) <= c_.budget) {
@@ -157,13 +168,13 @@ public:
             } else {
                 auto pooled = mfq_glm5_next::kpool_states(packed.narrow(-1,0,c_.index_width),
                     packed.narrow(-1,c_.index_width,c_.index_width), w_.index_position, c_.pool);
-                auto iq = w_.index_query(qr).reshape({b,t,c_.index_heads,c_.index_width});
-                auto scores = mfq_glm5_next::kpool_scores(iq, pooled, w_.index_score(hidden));
+                auto iq = w_.index_query(execution,qr).reshape({b,t,c_.index_heads,c_.index_width});
+                auto scores = mfq_glm5_next::kpool_scores(iq, pooled, w_.index_score(execution,hidden));
                 auto selected = select_pooled_blocks(scores, offset, latent.size(1), c_.pool, c_.budget, c_.tail);
                 attended = mfq_glm5_next::sparse_mla_attention(absorbed, latent, selected, scale);
             }
-            auto value = w_.unembed_output(attended.to(tb::kFloat16));
-            return w_.output(value.reshape({b,t,c_.heads*c_.value_width}));
+            auto value = w_.unembed_output(execution,attended.to(tb::kFloat16));
+            return w_.output(execution,value.reshape({b,t,c_.heads*c_.value_width}));
         } catch (...) {
             if (use_cache) { latent_.truncate(offset); index_.truncate(offset); }
             throw;

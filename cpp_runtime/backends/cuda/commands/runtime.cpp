@@ -240,14 +240,18 @@ int run_transport_runtime(RuntimeOptions& options) {
 int execute_runtime(RuntimeCommandOptions options) {
     return mfq::cuda::internal::with_command_errors([&]() -> int {
         if (options.stdio_mode) prepare_mfq_stdio_transport();
-        mfq::cuda::internal::setup_cuda_load(options);
-        if (!options.duplex_input_prefix.empty()) {
-            return mfq::cuda::minicpmo45::run_duplex(options, options);
+        if (options.duplex_input_prefix.empty() &&
+                options.input_prefix.empty()) {
+            return run_transport_runtime(options);
         }
-        if (!options.input_prefix.empty()) {
-            return mfq::cuda::minicpmo45::run_composite(options, options);
-        }
-        return run_transport_runtime(options);
+        return mfq::cuda::internal::with_cuda_load(
+            options, [&](CudaExecutionContext& execution) {
+                return !options.duplex_input_prefix.empty()
+                    ? mfq::cuda::minicpmo45::run_duplex(
+                        execution, options, options)
+                    : mfq::cuda::minicpmo45::run_composite(
+                        execution, options, options);
+        });
     });
 }
 

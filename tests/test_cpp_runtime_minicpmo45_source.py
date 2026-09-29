@@ -66,9 +66,9 @@ REALTIME_GATEWAY = (
 def test_minicpmo45_uses_native_composite_graph_and_canonical_names():
     assert "models/minicpmo45/causal_lm.h" in DECODE
     assert 'const std::string embed_name = "model.token_embedding.weight"' in DECODE
-    assert 'const std::string norm_name = "model.output_norm.weight"' in DECODE
+    assert 'output_norm = load_dense_gpu(source, "model.output_norm.weight")' in DECODE
     assert 'const std::string output_name = "model.output.weight"' in DECODE
-    assert "CudaBackbone::minicpmo45" in DECODE
+    assert "using MiniCPMO45CausalLm = CausalLm<MiniCPMO45Model>" in DECODE
     assert "llm.model." not in DECODE
     assert "llm.lm_head.weight" not in DECODE
 
@@ -155,17 +155,28 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
     assert 'std::getenv("MFQ_MINICPM_BF16_GQA_DECODE")' in DECODE
     assert "const bool bf16_gqa_decode = official_bf16 && T == 1" in DECODE
     assert "official_bf16 && !bf16_gqa_decode" in DECODE
-    assert "logits = logits.to(mfq_tensor_backend::kBFloat16)" in DECODE
+    assert "MiniCPMO45Model::adapter_logits(" in GRAPH
+    assert (
+        "return lm_head.forward(hidden)\n"
+        "            .to(mfq_tensor_backend::kBFloat16).contiguous();"
+        in GRAPH
+    )
     assert "repeated_k = kh.repeat_interleave(repeat, 1)" in DECODE
     assert '"full.minicpmo45_ffn_swiglu"' in DECODE
     assert "mfq_tensor_backend::silu(gate) * up" in DECODE
     assert "return logits_from_hidden(" in DECODE
-    assert "last.to(mfq_tensor_backend::kBFloat16)" in DECODE
+    assert "hidden.to(mfq_tensor_backend::kBFloat16)" in GRAPH
     assert "cache_pos > 0 && T > 1" in DECODE
     assert "minicpmo45_attention_mask" in DECODE
     assert "std::numeric_limits<mfq_bfloat16>::lowest()" in DECODE
-    assert "!Model::is_minicpmo45 && model.cache_pos > 0" in DECODE
-    assert "attention_mask.value().eq(1).all().item<bool>()" in DECODE
+    assert (
+        "bool MiniCPMO45Model::adapter_uses_decode_sequence_length() const noexcept {\n"
+        "    return false;\n"
+        "}"
+        in GRAPH
+    )
+    assert "this->adapter_uses_decode_sequence_length() &&" in DECODE
+    assert "mask.value().eq(1).all().item<bool>()" in GRAPH
 
 
 def test_minicpmo45_preserves_qkv_projection_boundaries():
@@ -184,7 +195,8 @@ def test_minicpmo45_matches_official_rope_frequency_construction():
     assert "bool official_reciprocal_frequencies = false" in DECODE
     assert "mfq_tensor_backend::reciprocal(" in DECODE
     assert "freq.copy_(official_freq)" in DECODE
-    assert "Kind == CudaBackbone::minicpmo45" in DECODE
+    assert "metadata.rope_interleaved = true" in GRAPH
+    assert "model.metadata.rope_interleaved" in DECODE
     assert "rope_table_bf16_cuda" in DECODE
     assert "rope_table_bf16_kernel" in ROPE
 

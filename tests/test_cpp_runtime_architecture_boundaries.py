@@ -102,6 +102,22 @@ CUDA_CAUSAL_LM = (CUDA_MODELS / "causal_lm.h").read_text(
 CUDA_CAUSAL_LM_SOURCE = (CUDA_MODELS / "causal_lm.cpp").read_text(
     encoding="utf-8"
 )
+CUDA_CAUSAL_LM_IMPL = (CUDA_MODELS / "causal_lm_impl.h").read_text(
+    encoding="utf-8"
+)
+CUDA_MODEL_HEADERS = "\n".join(
+    (CUDA_MODELS / path / "causal_lm.h").read_text(encoding="utf-8")
+    for path in (
+        "qwen35",
+        "minicpmo45",
+        "gemma4",
+        "glm_dsa",
+        "glm5_next",
+        "qwen4_exp",
+        "deepseek_v4",
+        "deepseek_v41",
+    )
+)
 CUDA_MODEL_FINALIZERS = {
     name: (CUDA_MODELS / name / "causal_lm.cpp").read_text(encoding="utf-8")
     for name in ("qwen4_exp", "glm5_next", "deepseek_v4", "deepseek_v41")
@@ -282,9 +298,25 @@ def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
     options = (CUDA_RUNTIME / "options.cpp").read_text(encoding="utf-8")
 
     assert "struct CudaExecutionContext" in execution
-    assert "class CudaProfilerAccess" in execution
+    assert "class CudaProfilerAccess" not in execution
+    assert "inline const CudaProfilerAccess g_profiler" not in execution
     assert "extern CudaProfiler&" not in execution
     assert "CudaExecutionContext& execution;" in CUDA_ENGINE_SOURCE
+    assert "std::make_shared<CudaExecutionContext>()" in CUDA_ENGINE_SOURCE
+    execution_source = (CUDA_RUNTIME / "cuda_execution.cpp").read_text(
+        encoding="utf-8"
+    )
+    assert "static CudaExecutionContext context" not in execution_source
+    assert "thread_local bool g_decode_graph" not in CUDA_BACKEND_SOURCE
+    command_and_diagnostic_sources = "\n".join(
+        path.read_text(encoding="utf-8")
+        for directory in (
+            CUDA_RUNTIME.parent / "commands",
+            CUDA_RUNTIME.parent / "diagnostics",
+        )
+        for path in directory.glob("*.cpp")
+    )
+    assert "cuda_execution_context()" not in command_and_diagnostic_sources
     for alias in (
         "g_tensor_parallel",
         "g_expert_parallel",
@@ -316,16 +348,30 @@ def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
         CUDA_MODELS / "loader.cpp"
     ).read_text(encoding="utf-8")
     assert "struct CudaSessionCodec" in CUDA_CAUSAL_LM
-    assert "return CudaSessionCodec<Model>::capture" in CUDA_CAUSAL_LM
-    assert "CudaSessionCodec<Model>::capture" in CUDA_CAUSAL_LM_SOURCE
+    assert "return CudaSessionCodec<Model>::capture" in CUDA_CAUSAL_LM_IMPL
+    assert "CudaSessionCodec<Model>::capture" in CUDA_CAUSAL_LM_IMPL
     assert "void begin_speculative_suffix(int64_t draft_tokens);" in CUDA_CAUSAL_LM
-    causal_lm_source = (
-        CUDA_MODELS / "causal_lm.cpp"
-    ).read_text(encoding="utf-8")
-    assert "CausalLm<Model>::begin_speculative_suffix" in causal_lm_source
-    assert "CausalLm<Model>::finalize_hidden" in causal_lm_source
-    assert "if constexpr" not in causal_lm_source
-    assert "CudaBackbone" not in CUDA_CAUSAL_LM + causal_lm_source
+    assert "CausalLm<Model>::begin_speculative_suffix" in CUDA_CAUSAL_LM_IMPL
+    assert "CausalLm<Model>::finalize_hidden" in CUDA_CAUSAL_LM_IMPL
+    assert "if constexpr" not in CUDA_CAUSAL_LM_IMPL
+    assert "struct Qwen35Model :" not in CUDA_CAUSAL_LM
+    assert "template struct CausalLm<" not in CUDA_CAUSAL_LM_SOURCE
+    for model, path in (
+        ("Qwen35Model", "qwen35"),
+        ("MiniCPMO45Model", "minicpmo45"),
+        ("MiniCPMOTtsModel", "minicpmo45"),
+        ("Gemma4Model", "gemma4"),
+        ("GlmDsaModel", "glm_dsa"),
+        ("Glm5Model", "glm5_next"),
+        ("Qwen4Model", "qwen4_exp"),
+        ("DeepseekV4Model", "deepseek_v4"),
+        ("DeepseekV41Model", "deepseek_v41"),
+    ):
+        source = (CUDA_MODELS / path / "causal_lm.cpp").read_text(
+            encoding="utf-8"
+        )
+        assert f"template struct CausalLm<{model}>;" in source
+    assert "CudaBackbone" not in CUDA_CAUSAL_LM + CUDA_CAUSAL_LM_IMPL
     assert "struct Request" not in CUDA_QWEN_BATCH_HEADER
     assert "struct QwenBatchExecutor::Impl" in CUDA_QWEN_BATCH_SOURCE
     assert len(CUDA_QWEN_BATCH_HEADER.splitlines()) < 80
@@ -827,7 +873,8 @@ def test_model_config_parsing_is_backend_neutral() -> None:
         "mfq::models::deepseek_v4::Config",
         "mfq::models::deepseek_v41::Config",
     ):
-        assert f"{config} config;" in CUDA_CAUSAL_LM
+        assert f"{config} config;" in CUDA_MODEL_HEADERS
+        assert f"{config} config;" not in CUDA_CAUSAL_LM
     assert "CudaRuntimeParameters" not in CUDA_BACKEND_SOURCE
     assert "load_runtime_parameters" not in CUDA_BACKEND_SOURCE
     assert "resolved_config_json" not in CUDA_BACKEND_SOURCE

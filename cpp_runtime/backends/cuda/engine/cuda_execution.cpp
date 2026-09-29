@@ -43,6 +43,10 @@ void mfq_release_host_allocator_cache() noexcept {
 
 using mfq_tensor_backend::indexing::Slice;
 
+namespace {
+thread_local CudaExecutionContext* active_execution_context = nullptr;
+}
+
 namespace mfq::cuda::internal {
 
 PrefillCudaTimer::PrefillCudaTimer()
@@ -282,11 +286,25 @@ KlKvCacheCapacityScope::~KlKvCacheCapacityScope() {
     execution.kl_kv_cache_capacity = previous_capacity;
 }
 
+CudaExecutionContext* current_cuda_execution_context() noexcept {
+    return active_execution_context;
+}
+
 CudaExecutionContext& cuda_execution_context() {
-    // ponytail: one process-wide CUDA load; pass contexts explicitly if
-    // independently configured engines must coexist in one process.
-    static CudaExecutionContext context;
-    return context;
+    if (active_execution_context == nullptr) {
+        throw std::logic_error("CUDA execution context is not active");
+    }
+    return *active_execution_context;
+}
+
+CudaExecutionContextScope::CudaExecutionContextScope(
+        CudaExecutionContext& context) noexcept
+    : previous_(active_execution_context) {
+    active_execution_context = &context;
+}
+
+CudaExecutionContextScope::~CudaExecutionContextScope() {
+    active_execution_context = previous_;
 }
 
 void CudaExecutionContext::reset() noexcept {
@@ -301,6 +319,10 @@ void CudaExecutionContext::reset() noexcept {
     n_gpu_layers = -1;
     dense_cpu_layer_count = 0;
     loading_cpu_layer = false;
+    drop_file_cache = false;
+    decode_graph_serial_branches = false;
+    decode_graph_tp_projection_major = false;
+    moe_route_stats.clear();
     kl_mmq_mode = KlMmqMode::Default;
     kl_mmq_activation_quantize_calls = 0;
     kl_mmq_dense_calls = 0;
@@ -464,8 +486,6 @@ mfq_tensor_backend::Tensor kl_mmq_prepare_activation(mfq_tensor_backend::Tensor 
 
 
 
-static std::unordered_map<int, MoeRouteLayerStats> g_moe_route_stats;
-
 const char * moe_route_stats_path() {
     const char * value = std::getenv("MFQ_MOE_ROUTE_STATS");
     return value != nullptr && value[0] != '\0' ? value : nullptr;
@@ -483,8 +503,9 @@ void record_moe_route_stats(
         const mfq_tensor_backend::Tensor & output,
         int n_experts) {
     if (layer < 0 || moe_route_stats_path() == nullptr) return;
-    auto found = g_moe_route_stats.find(layer);
-    if (found == g_moe_route_stats.end()) {
+    auto& stats = cuda_execution_context().moe_route_stats;
+    auto found = stats.find(layer);
+    if (found == stats.end()) {
         auto options = mfq_tensor_backend::TensorOptions()
             .device(ids.device()).dtype(mfq_tensor_backend::kFloat64);
         MoeRouteLayerStats value{
@@ -494,7 +515,7 @@ void record_moe_route_stats(
             mfq_tensor_backend::zeros({n_experts}, options),
             mfq_tensor_backend::zeros({n_experts}, options),
         };
-        found = g_moe_route_stats.emplace(layer, std::move(value)).first;
+        found = stats.emplace(layer, std::move(value)).first;
     }
     auto flat_ids = ids.reshape({-1}).to(mfq_tensor_backend::kInt64);
     auto flat_weights = weights.reshape({-1}).to(mfq_tensor_backend::kFloat64);
@@ -513,12 +534,13 @@ void record_moe_route_stats(
 }
 
 void clear_moe_route_stats() {
-    g_moe_route_stats.clear();
+    cuda_execution_context().moe_route_stats.clear();
 }
 
 void write_moe_route_stats() {
     const char * path_value = moe_route_stats_path();
-    if (path_value == nullptr || g_moe_route_stats.empty()) return;
+    const auto& stats = cuda_execution_context().moe_route_stats;
+    if (path_value == nullptr || stats.empty()) return;
     mfq_cuda_synchronize();
     std::filesystem::path path(path_value);
     if (path.has_parent_path()) {
@@ -532,12 +554,12 @@ void write_moe_route_stats() {
     out << "layer,expert,count,weight_sum,weight_sq_sum,"
            "output_energy,weighted_output_energy\n";
     std::vector<int> layers;
-    layers.reserve(g_moe_route_stats.size());
-    for (const auto & item : g_moe_route_stats) layers.push_back(item.first);
+    layers.reserve(stats.size());
+    for (const auto & item : stats) layers.push_back(item.first);
     std::sort(layers.begin(), layers.end());
     out << std::setprecision(17);
     for (int layer : layers) {
-        const auto & value = g_moe_route_stats.at(layer);
+        const auto & value = stats.at(layer);
         auto counts = value.counts.to(mfq_tensor_backend::kCPU).contiguous();
         auto weight_sum = value.weight_sum.to(mfq_tensor_backend::kCPU).contiguous();
         auto weight_sq_sum = value.weight_sq_sum.to(mfq_tensor_backend::kCPU).contiguous();

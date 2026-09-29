@@ -298,8 +298,11 @@ static mfq_tensor_backend::Tensor nint_matmul_cpu(
     });
     return result;
 }
-mfq_tensor_backend::Tensor nint_matmul(const NintWeight & w, mfq_tensor_backend::Tensor x) {
-    auto& execution = cuda_execution_context();
+mfq_tensor_backend::Tensor nint_matmul(
+        CudaExecutionContext& execution,
+        const NintWeight& w,
+        mfq_tensor_backend::Tensor x) {
+    auto& profiler = execution.profiler;
     if (!x.is_cuda()) return nint_matmul_cpu(w, std::move(x));
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
@@ -307,7 +310,7 @@ mfq_tensor_backend::Tensor nint_matmul(const NintWeight & w, mfq_tensor_backend:
     if (!w.q8_zero) {
         if (M <= 8) {
             Workspace & ws = w.workspace(M);
-            return g_profiler.measure("nint.matmul", [&]() {
+            return profiler.measure("nint.matmul", [&]() {
                 if (w.aligned_q8) {
                     return nint_matmul_q8_ws_cuda(
                         w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
@@ -320,13 +323,13 @@ mfq_tensor_backend::Tensor nint_matmul(const NintWeight & w, mfq_tensor_backend:
                     x, w.gs, ws.qx, ws.xscale);
             });
         }
-        auto dense = g_profiler.measure("nint.dequant", [&]() {
+        auto dense = profiler.measure("nint.dequant", [&]() {
             return nint_decode_cuda(
                 w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
                 w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
                 w.neuron_len, w.gs);
         });
-        return g_profiler.measure("nint.gemm", [&]() {
+        return profiler.measure("nint.gemm", [&]() {
             return mfq_tensor_backend::matmul(x, dense.transpose(0, 1));
         });
     }
@@ -341,7 +344,7 @@ mfq_tensor_backend::Tensor nint_matmul(const NintWeight & w, mfq_tensor_backend:
         }
         x = kl_mmq_prepare_activation(x);
         ++execution.kl_mmq_dense_calls;
-        auto result = g_profiler.measure("kld_mmq.nint8_zero.fp16", [&]() {
+        auto result = profiler.measure("kld_mmq.nint8_zero.fp16", [&]() {
             return nint8_zero_mmq_f16_packed_cuda(
                 w.q_packed, w.q8_zero_scale, x, w.neuron_len);
         });
@@ -351,30 +354,34 @@ mfq_tensor_backend::Tensor nint_matmul(const NintWeight & w, mfq_tensor_backend:
     }
     if (M <= 8) {
         Workspace & ws = w.workspace(M);
-        return g_profiler.measure("nint8_zero.gemv", [&]() {
+        return profiler.measure("nint8_zero.gemv", [&]() {
             return nint8_zero_gemv_ws_cuda(
                 w.q_packed, w.q8_zero_scale, x, ws.qx, ws.xscale);
         });
     }
-    return g_profiler.measure("nint8_zero.packed_mmq", [&]() {
+    return profiler.measure("nint8_zero.packed_mmq", [&]() {
         return nint8_zero_mmq_f16_packed_cuda(
             w.q_packed, w.q8_zero_scale, x, w.neuron_len);
     });
 }
 
 mfq_tensor_backend::Tensor nint_matmul_bf16_output(
-        const NintWeight & w, mfq_tensor_backend::Tensor x) {
+        CudaExecutionContext& execution,
+        const NintWeight & w,
+        mfq_tensor_backend::Tensor x) {
     auto shape = x.sizes().vec();
     auto flat = x.reshape({-1, x.size(-1)});
-    auto output = nint_matmul(w, flat)
+    auto output = nint_matmul(execution, w, flat)
         .to(mfq_tensor_backend::kBFloat16).contiguous();
     shape.back() = output.size(-1);
     return output.reshape(shape);
 }
 
 static mfq_tensor_backend::Tensor nint_matmul_f32_kld(
-        const NintWeight & w, mfq_tensor_backend::Tensor x) {
-    auto& execution = cuda_execution_context();
+        CudaExecutionContext& execution,
+        const NintWeight & w,
+        mfq_tensor_backend::Tensor x) {
+    auto& profiler = execution.profiler;
     MFQ_RUNTIME_CHECK(
         execution.kl_mmq_mode == KlMmqMode::Fp16,
         "FP32-output NINT MMQ is restricted to the FP16 KLD path");
@@ -382,13 +389,14 @@ static mfq_tensor_backend::Tensor nint_matmul_f32_kld(
         x.contiguous().to(mfq_tensor_backend::kFloat16),
         w.neuron_len);
     if (!w.q8_zero) {
-        return nint_matmul(w, x).to(mfq_tensor_backend::kFloat32);
+        return nint_matmul(
+            execution, w, x).to(mfq_tensor_backend::kFloat32);
     }
     MFQ_RUNTIME_CHECK(
         x.size(0) >= 16,
         "FP32-output NINT MMQ requires at least 16 activation rows");
     ++execution.kl_mmq_dense_calls;
-    return g_profiler.measure(
+    return profiler.measure(
         "kld_mmq.nint8_zero.fp32_output", [&]() {
             return nint8_zero_mmq_f32_packed_cuda(
                 w.q_packed, w.q8_zero_scale,
@@ -397,6 +405,7 @@ static mfq_tensor_backend::Tensor nint_matmul_f32_kld(
 }
 
 mfq_tensor_backend::Tensor nint_matmul_input_mul_f32_kld(
+        CudaExecutionContext& execution,
         const NintWeight & w,
         mfq_tensor_backend::Tensor x,
         mfq_tensor_backend::Tensor gate,
@@ -417,11 +426,14 @@ mfq_tensor_backend::Tensor nint_matmul_input_mul_f32_kld(
         ? x * mfq_tensor_backend::sigmoid(gate)
         : x * mfq_tensor_backend::silu(gate);
     return nint_matmul_f32_kld(
-        w, activation.contiguous());
+        execution, w, activation.contiguous());
 }
 
 mfq_tensor_backend::Tensor nint_matmul_groupwise_u8(
-        const NintWeight & w, mfq_tensor_backend::Tensor x, int64_t groups) {
+        CudaProfiler& profiler,
+        const NintWeight & w,
+        mfq_tensor_backend::Tensor x,
+        int64_t groups) {
     MFQ_RUNTIME_CHECK(
         w.bits == 8 && w.gs == 48,
         "groupwise NINT projection requires NINT8 gs48");
@@ -432,14 +444,14 @@ mfq_tensor_backend::Tensor nint_matmul_groupwise_u8(
         w.out % groups == 0,
         "groupwise NINT projection output rows must divide groups");
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
-    auto dense = g_profiler.measure("nint.groupwise_dequant", [&]() {
+    auto dense = profiler.measure("nint.groupwise_dequant", [&]() {
         return nint_decode_cuda(
             w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
             w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
             w.neuron_len, w.gs);
     });
     const int64_t rows_per_group = w.out / groups;
-    return g_profiler.measure("nint.groupwise_gemm", [&]() {
+    return profiler.measure("nint.groupwise_gemm", [&]() {
         return mfq_tensor_backend::bmm(
             x.transpose(0, 1),
             dense.reshape({groups, rows_per_group, w.neuron_len})
@@ -450,7 +462,13 @@ mfq_tensor_backend::Tensor nint_matmul_groupwise_u8(
     });
 }
 
-mfq_tensor_backend::Tensor nint_matmul_input_mul(const NintWeight & w, mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate, int mode) {
+mfq_tensor_backend::Tensor nint_matmul_input_mul(
+        CudaExecutionContext& execution,
+        const NintWeight& w,
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor gate,
+        int mode) {
+    auto& profiler = execution.profiler;
     MFQ_RUNTIME_CHECK(
         mode == 1 || mode == 2,
         "NINT input gate mode must be sigmoid or SiLU");
@@ -472,7 +490,7 @@ mfq_tensor_backend::Tensor nint_matmul_input_mul(const NintWeight & w, mfq_tenso
     gate = pad_last(gate, w.neuron_len);
     if (!w.q8_zero && x.size(0) <= 8) {
         Workspace & ws = w.workspace(static_cast<int>(x.size(0)));
-        return g_profiler.measure("nint.matmul.input_mul", [&]() {
+        return profiler.measure("nint.matmul.input_mul", [&]() {
             if (w.aligned_q8) {
                 return nint_matmul_input_mul_q8_ws_cuda(
                     w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
@@ -485,34 +503,44 @@ mfq_tensor_backend::Tensor nint_matmul_input_mul(const NintWeight & w, mfq_tenso
                 x, gate, mode, w.gs, ws.qx, ws.xscale);
         });
     }
-    if (mode == 1) return nint_matmul(w, x * mfq_tensor_backend::sigmoid(gate));
-    return nint_matmul(w, x * mfq_tensor_backend::silu(gate));
+    if (mode == 1) {
+        return nint_matmul(
+            execution, w, x * mfq_tensor_backend::sigmoid(gate));
+    }
+    return nint_matmul(
+        execution, w, x * mfq_tensor_backend::silu(gate));
 }
 
-mfq_tensor_backend::Tensor nint_matmul_swiglu(const NintWeight & w, mfq_tensor_backend::Tensor x) {
+mfq_tensor_backend::Tensor nint_matmul_swiglu(
+        CudaExecutionContext& execution,
+        const NintWeight& w,
+        mfq_tensor_backend::Tensor x) {
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
-    auto parts = nint_matmul(w, x).chunk(2, -1);
+    auto parts = nint_matmul(execution, w, x).chunk(2, -1);
     return mfq_tensor_backend::silu(parts[0]) * parts[1];
 }
 
-mfq_tensor_backend::Tensor nint_matmul_geglu(const NintWeight & w, mfq_tensor_backend::Tensor x) {
+mfq_tensor_backend::Tensor nint_matmul_geglu(
+        CudaExecutionContext& execution,
+        const NintWeight& w,
+        mfq_tensor_backend::Tensor x) {
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
-    auto parts = nint_matmul(w, x).chunk(2, -1);
+    auto parts = nint_matmul(execution, w, x).chunk(2, -1);
     return gelu_mul_cuda(parts[0].contiguous(), parts[1].contiguous());
 }
 
-thread_local bool g_decode_graph_serial_branches = false;
-thread_local bool g_decode_graph_tp_projection_major = false;
-
-bool decode_branch_parallel_enabled(int64_t rows) {
+bool decode_branch_parallel_enabled(
+        const CudaExecutionContext& execution,
+        int64_t rows) {
     const char * disabled =
         std::getenv("MFQ_DISABLE_DECODE_BRANCH_PARALLEL");
     // Branch output storage belongs to its allocating stream. Keep graph
     // warmup/capture on the graph pool's stream until cross-stream allocation
     // lifetime tracking supports a fully rejoined capture. Eager is unchanged.
-    return rows == 1 && !g_decode_graph_serial_branches &&
+    return rows == 1 &&
+        !execution.decode_graph_serial_branches &&
         (disabled == nullptr || disabled[0] != '1');
 }
 static void refresh_nint_descriptor(NintCpu & t) {

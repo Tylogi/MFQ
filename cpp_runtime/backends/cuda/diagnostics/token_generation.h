@@ -16,12 +16,16 @@
 namespace mfq::cuda::internal {
 
 template <typename Model>
-int generate_diagnostic_tokens(Model& model, mfq_tensor_backend::Tensor ids,
-        int gen, bool profile,
+int generate_diagnostic_tokens(
+        CudaExecutionContext& execution,
+        Model& model,
+        mfq_tensor_backend::Tensor ids,
+        int gen,
+        bool profile,
         std::chrono::steady_clock::time_point t0,
         std::chrono::steady_clock::time_point t1) {
-        const auto& execution = cuda_execution_context();
-        g_profiler.reset();
+        auto& profiler = execution.profiler;
+        profiler.reset();
         auto next = model.next_token(ids);
         mfq_cuda_synchronize();
         auto t2 = std::chrono::steady_clock::now();
@@ -31,8 +35,8 @@ int generate_diagnostic_tokens(Model& model, mfq_tensor_backend::Tensor ids,
             mfq_cuda_empty_cache();
             report_cuda_memory("prefill_empty_cache");
         }
-        g_profiler.report("prefill");
-        g_profiler.reset();
+        profiler.report("prefill");
+        profiler.reset();
         if (gen == 0) return 0;
         auto generated_cuda = mfq_tensor_backend::empty({gen}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
         cudaStream_t stream = mfq_get_current_cuda_stream().stream();
@@ -97,15 +101,15 @@ int generate_diagnostic_tokens(Model& model, mfq_tensor_backend::Tensor ids,
                         planned_len, attention_parts);
                 }, cuda_graph_participant_streams(
                     graph_compute_streams));
-                g_profiler.reset();
-                g_profiler.graph_events = profile_cuda_graph;
+                profiler.reset();
+                profiler.graph_events = profile_cuda_graph;
                 graph.capture_begin();
-                static_next = g_profiler.measure("decode.model_total", [&]() {
+                static_next = profiler.measure("decode.model_total", [&]() {
                     return model.next_token_static(
                         static_input, static_pos, static_len,
                         planned_len, attention_parts);
                 });
-                g_profiler.measure("decode.commit", [&]() {
+                profiler.measure("decode.commit", [&]() {
                     decode_graph_commit_cuda(
                         static_next, generated_cuda, static_step,
                         static_input, static_pos, static_len);
@@ -123,10 +127,10 @@ int generate_diagnostic_tokens(Model& model, mfq_tensor_backend::Tensor ids,
             MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
         } else {
             for (int i = 1; i < gen; ++i) {
-                next = g_profiler.measure("decode.eager_model", [&]() {
+                next = profiler.measure("decode.eager_model", [&]() {
                     return model.next_token(next.view({1, 1}));
                 });
-                g_profiler.measure("decode.eager_commit", [&]() {
+                profiler.measure("decode.eager_commit", [&]() {
                     MFQ_CUDA_CHECK(cudaMemcpyAsync(
                         generated_cuda.template data_ptr<int64_t>() + i,
                         next.template data_ptr<int64_t>(), sizeof(int64_t),
@@ -138,7 +142,7 @@ int generate_diagnostic_tokens(Model& model, mfq_tensor_backend::Tensor ids,
         mfq_cuda_synchronize();
         if (cuda_profiler_range) MFQ_CUDA_CHECK(cudaProfilerStop());
         auto t3 = std::chrono::steady_clock::now();
-        g_profiler.report("decode");
+        profiler.report("decode");
         auto generated_tensor = generated_cuda.to(mfq_tensor_backend::kCPU).contiguous();
         auto generated_ptr = generated_tensor.template data_ptr<int64_t>();
         double load_s = std::chrono::duration<double>(t1 - t0).count();

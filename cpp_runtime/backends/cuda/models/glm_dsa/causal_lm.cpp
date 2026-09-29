@@ -1,6 +1,6 @@
 #include "causal_lm.h"
+#include "../causal_lm_impl.h"
 
-#include "../causal_lm.h"
 #include "models/transformer.h"
 
 namespace mfq::cuda::glm_dsa {
@@ -347,5 +347,11 @@ void CudaSessionCodec<GlmDsaModel>::restore(
     }
     model.cache_pos = state.cache_pos;
 }
+
+} // namespace mfq::cuda
+
+namespace mfq::cuda {
+
+template struct CausalLm<GlmDsaModel>;
 
 } // namespace mfq::cuda

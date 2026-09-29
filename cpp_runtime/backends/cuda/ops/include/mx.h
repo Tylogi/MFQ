@@ -21,17 +21,23 @@ struct Mxfp4Weight {
 };
 
 mfq_tensor_backend::Tensor mxfp8_groupwise_matmul(
+    CudaProfiler& profiler,
     const Mxfp8Weight& weight,
     mfq_tensor_backend::Tensor input,
     std::int64_t groups);
 mfq_tensor_backend::Tensor mxfp8_groupwise_matmul_f32(
+    CudaProfiler& profiler,
     const Mxfp8Weight& weight,
     mfq_tensor_backend::Tensor input,
     std::int64_t groups);
 mfq_tensor_backend::Tensor mxfp8_matmul(
-    const Mxfp8Weight& weight, mfq_tensor_backend::Tensor input);
+    CudaProfiler& profiler,
+    const Mxfp8Weight& weight,
+    mfq_tensor_backend::Tensor input);
 mfq_tensor_backend::Tensor mxfp8_matmul_f32(
-    const Mxfp8Weight& weight, mfq_tensor_backend::Tensor input);
+    CudaProfiler& profiler,
+    const Mxfp8Weight& weight,
+    mfq_tensor_backend::Tensor input);
 mfq_tensor_backend::Tensor mxfp4_matmul(
     const Mxfp4Weight& weight, mfq_tensor_backend::Tensor input);
 
@@ -50,10 +56,12 @@ struct Mxfp4Linear {
 struct Mxfp8Linear {
     Mxfp8Weight weight;
 
-    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x) const {
+    mfq_tensor_backend::Tensor forward(
+            CudaProfiler& profiler,
+            mfq_tensor_backend::Tensor x) const {
         auto shape = x.sizes().vec();
         auto y = mxfp8_matmul(
-            weight, x.reshape({-1, x.size(-1)}));
+            profiler, weight, x.reshape({-1, x.size(-1)}));
         shape.back() = y.size(-1);
         return y.reshape(shape);
     }

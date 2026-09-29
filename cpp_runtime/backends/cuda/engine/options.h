@@ -1,7 +1,10 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
+
+struct CudaExecutionContext;
 
 namespace mfq::cuda {
 
@@ -32,7 +35,11 @@ struct CudaRuntimeConfig;
 namespace mfq::cuda::internal {
 
 CudaRuntimeConfig resolve_cuda_runtime_config(const CudaEngineOptions& options);
-void setup_cuda_load(const CudaLoadOptions& options);
-void reset_cuda_load() noexcept;
+void setup_cuda_load(
+    const CudaLoadOptions& options,
+    CudaExecutionContext& execution);
+int with_cuda_load(
+    const CudaLoadOptions& options,
+    const std::function<int(CudaExecutionContext&)>& run);
 
 } // namespace mfq::cuda::internal

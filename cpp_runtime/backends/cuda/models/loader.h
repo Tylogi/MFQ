@@ -1,6 +1,6 @@
 #pragma once
 
-#include "causal_lm.h"
+#include "causal_models.h"
 #include "cuda_execution.h"
 #include "storage/moe_expert_cache.h"
 #include "options.h"
@@ -13,9 +13,12 @@
 namespace mfq::cuda::internal {
 
 template <typename F>
-auto with_loaded_cuda_model(const CudaLoadOptions& options,
-        bool load_optional_components, F&& run) {
-    auto& execution = cuda_execution_context();
+auto with_loaded_cuda_model(
+        CudaExecutionContext& execution,
+        const CudaLoadOptions& options,
+        bool load_optional_components,
+        F&& run) {
+    CudaExecutionContextScope context_scope(execution);
     auto source = mfq::open_model_source(options.model_path);
     auto load = [&]<typename Model>() {
         auto started = std::chrono::steady_clock::now();

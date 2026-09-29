@@ -22,9 +22,11 @@ struct Qwen4ExpMtp final : MtpModule {
     std::vector<std::unique_ptr<Qwen4Block>> layers;
     std::vector<Tensor> positions;
     std::vector<int64_t> lengths;
+    CudaExecutionContext* execution=nullptr;
     int64_t batch=0;
 
     static std::optional<Qwen4ExpMtp> load_if_present(
+            CudaExecutionContext& execution,
             const mfq::ModelSource& file,
             const mfq::models::qwen4_exp::Config& main) {
         const bool any=std::any_of(file.tensors().begin(),file.tensors().end(),
@@ -35,6 +37,7 @@ struct Qwen4ExpMtp final : MtpModule {
             return std::nullopt;
         }
         Qwen4ExpMtp result;
+        result.execution=&execution;
         result.config=main;
         result.embedding_norm=dense(file,"predictor.embedding_norm.weight").to(tb::kFloat32);
         result.hidden_norm=dense(file,"predictor.hidden_norm.weight").to(tb::kFloat32);
@@ -79,16 +82,20 @@ struct Qwen4ExpMtp final : MtpModule {
             (current.size(1)==1 || current.size(1)==b),"Qwen4 MTP positions require [T]/[3,T]/[3,B,T]");
         current=current.to(tb::kInt32).expand({3,b,t}).contiguous();
         auto full=cache && positions[layer].defined()?tb::cat({positions[layer],current},-1):current;
-        auto e=embedding_fusion(rms_norm(embeds,embedding_norm+1,config.eps));
-        auto streams=hidden_fusion(rms_norm(hidden,hidden_norm+1,config.eps)
+        auto e=embedding_fusion(
+            *execution,rms_norm(embeds,embedding_norm+1,config.eps));
+        auto streams=hidden_fusion(
+            *execution,rms_norm(hidden,hidden_norm+1,config.eps)
             .reshape({b,t,config.streams,config.hidden}));
         auto x=(streams+e.unsqueeze(-2)).reshape({b,t,config.streams*config.hidden});
         auto& block=*layers[layer];
         auto first=block.attention_gr.pre(x);
-        auto branch=block.qsa->forward(first[0],current,full,cache);
+        auto branch=block.qsa->forward(
+            *execution,first[0],current,full,cache);
         x=block.attention_gr.post(branch,first);
         auto second=block.ffn_gr.pre(x);
-        auto multi=block.ffn_gr.post(block.ffn(second[0]),second);
+        auto multi=block.ffn_gr.post(
+            block.ffn(*execution,second[0]),second);
         auto output=final_mixer->pre(multi)[0];
         if (cache) {positions[layer]=full;batch=b;lengths[layer]=start+t;}
         return {output,multi};

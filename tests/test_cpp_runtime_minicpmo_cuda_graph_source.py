@@ -1,5 +1,4 @@
 from pathlib import Path
-import re
 
 
 CUDA_ROOT = Path(__file__).parents[1] / "cpp_runtime" / "backends" / "cuda"
@@ -14,11 +13,18 @@ CUDA_RUNTIME = "\n".join(
 BACKEND_CHECKS = (
     CUDA_ROOT / "diagnostics" / "backend_checks.cpp"
 ).read_text(encoding="utf-8")
+MODEL_METADATA_SOURCE = "\n".join(
+    (CUDA_ROOT / "models" / model / "causal_lm.cpp").read_text(
+        encoding="utf-8"
+    )
+    for model in ("glm_dsa", "minicpmo45")
+)
 SOURCE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in (
         CUDA_ROOT / "models" / "causal_lm.h",
         CUDA_ROOT / "models" / "causal_lm.cpp",
+        CUDA_ROOT / "models" / "causal_lm_impl.h",
         CUDA_ROOT / "models" / "transformer.h",
         CUDA_ROOT / "models" / "transformer.cpp",
         CUDA_ROOT / "engine" / "cuda_execution.h",
@@ -69,12 +75,12 @@ def test_minicpmo_native_runtime_keeps_cuda_graph_enabled() -> None:
 
 
 def test_static_decode_uses_dynamic_position_for_kv_writes() -> None:
-    causal_lm = (CUDA_ROOT / "models" / "causal_lm.cpp").read_text(
+    causal_lm = (CUDA_ROOT / "models" / "causal_lm_impl.h").read_text(
         encoding="utf-8"
     )
     static_forward = causal_lm.split(
-        "CausalLm<Backbone>::hidden_forward_static", 1
-    )[1].split("CausalLm<Backbone>::last_logits_static", 1)[0]
+        "CausalLm<Model>::hidden_forward_static", 1
+    )[1].split("CausalLm<Model>::last_logits_static", 1)[0]
     assert "nullptr, pos, nullptr, 0" in static_forward
     assert "cache_positions_override.value(), primary" in SOURCE
     assert (
@@ -84,12 +90,10 @@ def test_static_decode_uses_dynamic_position_for_kv_writes() -> None:
 
 
 def test_minicpmo_persistent_decode_workspaces_are_warmed_before_capture() -> None:
-    warmup_gates = re.findall(
-        r"Model::backbone == mfq::cuda::CudaBackbone::glm_dsa\) \|\|\s+"
-        r"Model::is_minicpmo45\) \{",
-        SOURCE,
-    )
-    assert len(warmup_gates) == 1
+    assert MODEL_METADATA_SOURCE.count(
+        "metadata.decode_graph_double_warmup = true;"
+    ) == 2
+    assert "model.metadata.decode_graph_double_warmup" in SOURCE
     assert "graph.ensure_captured(" in CUDA_RUNTIME
     assert CUDA_RUNTIME.count("prepare_decode_graph_memory(model,") == 1
 
@@ -101,9 +105,9 @@ def test_graph_stage_events_start_after_decode_workspace_warmup() -> None:
         "graph.capture_end();", 1
     )[0]
     warmup = graph_path.index("model.next_token_static(")
-    profiler_reset = graph_path.index("g_profiler.reset();")
+    profiler_reset = graph_path.index("profiler.reset();")
     external_events = graph_path.index(
-        "g_profiler.graph_events = profile_cuda_graph;"
+        "profiler.graph_events = profile_cuda_graph;"
     )
     capture = graph_path.index("graph.capture_begin();")
     assert warmup < profiler_reset < external_events < capture
@@ -115,10 +119,10 @@ def test_graph_profile_covers_model_and_commit_boundaries() -> None:
     )[1].split(
         "graph.capture_end();", 1
     )[0]
-    assert 'g_profiler.measure("decode.model_total"' in graph_path
-    assert 'g_profiler.measure("decode.commit"' in graph_path
-    assert graph_path.index('g_profiler.measure("decode.model_total"') < graph_path.index(
-        'g_profiler.measure("decode.commit"'
+    assert 'profiler.measure("decode.model_total"' in graph_path
+    assert 'profiler.measure("decode.commit"' in graph_path
+    assert graph_path.index('profiler.measure("decode.model_total"') < graph_path.index(
+        'profiler.measure("decode.commit"'
     )
 
 
@@ -261,8 +265,8 @@ def test_cuda_profiler_filter_supports_low_perturbation_eager_attribution() -> N
     eager_path = CUDA_RUNTIME.rsplit("} else {", 1)[1].split(
         "mfq_cuda_synchronize();", 1
     )[0]
-    assert 'g_profiler.measure("decode.eager_model"' in eager_path
-    assert 'g_profiler.measure("decode.eager_commit"' in eager_path
+    assert 'profiler.measure("decode.eager_model"' in eager_path
+    assert 'profiler.measure("decode.eager_commit"' in eager_path
 
 
 def test_bf16_head_to_token_candidate_is_exactly_stride_bounded() -> None:

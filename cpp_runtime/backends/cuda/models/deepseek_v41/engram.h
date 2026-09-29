@@ -905,6 +905,7 @@ public:
     }
 
     EngramTensor forward(
+        CudaExecutionContext& execution,
         const EngramTensor& hidden,
         const EngramHashBatch& hashes) const {
         const auto batch = hashes.batch;
@@ -926,7 +927,7 @@ public:
             tokens,
             hashes.columns,
             hidden.device());
-        auto key_value = projection_.forward(embeddings);
+        auto key_value = projection_.forward(execution, embeddings);
         const auto key_width = config_.hc_mult * config_.hidden;
         auto key = key_value.narrow(-1, 0, key_width)
             .reshape({batch, tokens, config_.hc_mult, config_.hidden})

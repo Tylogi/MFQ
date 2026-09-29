@@ -193,7 +193,9 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-flash-next-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     target_include_directories(mfq-flash-next-test PRIVATE
         ${MFQ_REPOSITORY_ROOT}
-        ${MFQ_CUDA_ROOT}/models)
+        ${MFQ_CUDA_ROOT}/models
+        ${MFQ_CUDA_ROOT}/engine
+        ${MFQ_CUDA_ROOT}/../../core)
 endif()
 
 set(MFQ_NCCL_ROOT "" CACHE PATH
@@ -318,6 +320,20 @@ set_target_properties(mfq-cuda-runtime PROPERTIES
     CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
     CUDA_RUNTIME_LIBRARY Shared
 )
+
+if(BUILD_TESTING)
+    add_executable(mfq-cuda-execution-scope-test
+        ${MFQ_CUDA_ROOT}/tests/cuda_execution_scope_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-execution-scope-test)
+    target_compile_definitions(mfq-cuda-execution-scope-test PRIVATE
+        MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-execution-scope-test PRIVATE
+        mfq-cuda-runtime)
+    target_link_libraries(mfq-flash-next-test PRIVATE
+        mfq-cuda-runtime)
+    add_test(NAME mfq-cuda-execution-scope-test
+        COMMAND mfq-cuda-execution-scope-test)
+endif()
 
 add_library(mfq-cuda-eval STATIC ${MFQ_CUDA_ROOT}/eval/kl.cpp)
 mfq_configure_cuda_runtime_target(mfq-cuda-eval)

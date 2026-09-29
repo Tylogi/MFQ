@@ -25,48 +25,64 @@ struct QuantLinear;
 struct QuantLinearGroup;
 struct DenseLinearGroup;
 
-extern thread_local bool g_decode_graph_serial_branches;
-extern thread_local bool g_decode_graph_tp_projection_major;
-extern bool g_mfq_drop_file_cache;
-
 struct MfqDropFileCacheGuard {
+    CudaExecutionContext& execution;
     bool previous;
 
-    explicit MfqDropFileCacheGuard(bool enabled)
-        : previous(g_mfq_drop_file_cache) {
-        g_mfq_drop_file_cache = enabled;
+    MfqDropFileCacheGuard(
+            bool enabled,
+            CudaExecutionContext& context = cuda_execution_context())
+        : execution(context), previous(context.drop_file_cache) {
+        execution.drop_file_cache = enabled;
     }
 
     ~MfqDropFileCacheGuard() {
-        g_mfq_drop_file_cache = previous;
+        execution.drop_file_cache = previous;
     }
 };
 
-bool decode_branch_parallel_enabled(std::int64_t rows);
+bool decode_branch_parallel_enabled(
+    const CudaExecutionContext& execution,
+    std::int64_t rows);
 
 mfq_tensor_backend::Tensor tensor_to_cuda_device(
     mfq_tensor_backend::Tensor value,
     int device,
     mfq_tensor_backend::Tensor reusable = {});
 mfq_tensor_backend::Tensor run_quant_linear_shard(
+    CudaExecutionContext& execution,
     const struct QuantLinearShard& shard,
     mfq_tensor_backend::Tensor input,
     MfqOptional<mfq_tensor_backend::Tensor> gate = mfq_nullopt,
     int gate_mode = 0);
 
 struct DecodeGraphBranchScope {
-    bool previous = g_decode_graph_serial_branches;
-    DecodeGraphBranchScope() { g_decode_graph_serial_branches = true; }
-    ~DecodeGraphBranchScope() { g_decode_graph_serial_branches = previous; }
+    CudaExecutionContext& execution;
+    bool previous;
+
+    explicit DecodeGraphBranchScope(
+            CudaExecutionContext& context = cuda_execution_context())
+        : execution(context),
+          previous(context.decode_graph_serial_branches) {
+        execution.decode_graph_serial_branches = true;
+    }
+    ~DecodeGraphBranchScope() {
+        execution.decode_graph_serial_branches = previous;
+    }
 };
 
 struct DecodeGraphTpProjectionScope {
-    bool previous = g_decode_graph_tp_projection_major;
-    DecodeGraphTpProjectionScope() {
-        g_decode_graph_tp_projection_major = true;
+    CudaExecutionContext& execution;
+    bool previous;
+
+    explicit DecodeGraphTpProjectionScope(
+            CudaExecutionContext& context = cuda_execution_context())
+        : execution(context),
+          previous(context.decode_graph_tp_projection_major) {
+        execution.decode_graph_tp_projection_major = true;
     }
     ~DecodeGraphTpProjectionScope() {
-        g_decode_graph_tp_projection_major = previous;
+        execution.decode_graph_tp_projection_major = previous;
     }
 };
 
@@ -170,7 +186,9 @@ struct NintLinearGroup {
     mutable std::shared_ptr<CudaIndependentBranchExecutor>
         branch_executor =
             std::make_shared<CudaIndependentBranchExecutor>();
-    std::vector<mfq_tensor_backend::Tensor> forward(mfq_tensor_backend::Tensor x) const {
+    std::vector<mfq_tensor_backend::Tensor> forward(
+            CudaExecutionContext& execution,
+            mfq_tensor_backend::Tensor x) const {
         auto shape = x.sizes().vec();
         std::vector<mfq_tensor_backend::Tensor> parts;
         auto xf = x.reshape({-1, x.size(-1)});
@@ -178,29 +196,31 @@ struct NintLinearGroup {
                 projection_w.size() == outs.size()) {
             parts.reserve(projection_w.size());
             for (const auto & projection : projection_w) {
-                parts.push_back(nint_matmul(projection, xf));
+                parts.push_back(nint_matmul(
+                    execution, projection, xf));
             }
         } else if (!split_w.empty()) {
             parts.reserve(outs.size());
             std::vector<mfq_tensor_backend::Tensor> grouped_outputs;
             const bool parallel =
-                decode_branch_parallel_enabled(xf.size(0)) &&
+                decode_branch_parallel_enabled(execution, xf.size(0)) &&
                 branch_executor->run(
                     split_w.size(),
                     [&](size_t index) {
                         return nint_matmul(
-                            split_w[index], xf);
+                            execution, split_w[index], xf);
                     },
                     grouped_outputs);
             for (size_t i = 0; i < split_w.size(); ++i) {
                 auto y = parallel
                     ? grouped_outputs[i]
-                    : nint_matmul(split_w[i], xf);
+                    : nint_matmul(execution, split_w[i], xf);
                 auto ys = y.split_with_sizes(split_outs[i], -1);
                 for (auto & p : ys) parts.push_back(p);
             }
         } else {
-            auto y = nint_matmul(w, x.reshape({-1, x.size(-1)}));
+            auto y = nint_matmul(
+                execution, w, x.reshape({-1, x.size(-1)}));
             parts = y.split_with_sizes(outs, -1);
         }
         for (auto & p : parts) {
@@ -210,21 +230,27 @@ struct NintLinearGroup {
         }
         return parts;
     }
-    mfq_tensor_backend::Tensor forward_swiglu(mfq_tensor_backend::Tensor x) const {
+    mfq_tensor_backend::Tensor forward_swiglu(
+            CudaExecutionContext& execution,
+            mfq_tensor_backend::Tensor x) const {
         if (!split_w.empty() || outs.size() != 2 || outs[0] != outs[1]) {
             throw std::runtime_error("NINT SwiGLU fusion requires one packed [gate, up] group");
         }
         auto shape = x.sizes().vec();
-        auto y = nint_matmul_swiglu(w, x.reshape({-1, x.size(-1)}));
+        auto y = nint_matmul_swiglu(
+            execution, w, x.reshape({-1, x.size(-1)}));
         shape.back() = y.size(-1);
         return y.reshape(shape);
     }
-    mfq_tensor_backend::Tensor forward_geglu(mfq_tensor_backend::Tensor x) const {
+    mfq_tensor_backend::Tensor forward_geglu(
+            CudaExecutionContext& execution,
+            mfq_tensor_backend::Tensor x) const {
         if (!split_w.empty() || outs.size() != 2 || outs[0] != outs[1]) {
             throw std::runtime_error("NINT GeGLU fusion requires one packed [gate, up] group");
         }
         auto shape = x.sizes().vec();
-        auto y = nint_matmul_geglu(w, x.reshape({-1, x.size(-1)}));
+        auto y = nint_matmul_geglu(
+            execution, w, x.reshape({-1, x.size(-1)}));
         shape.back() = y.size(-1);
         return y.reshape(shape);
     }
@@ -283,6 +309,7 @@ struct QuantLinear {
     bool is_dense() const { return kind == QuantLinearKind::Dense; }
 
     mfq_tensor_backend::Tensor forward_tensor_parallel_flat(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x,
             MfqOptional<mfq_tensor_backend::Tensor> gate,
             int gate_mode) const {
@@ -327,11 +354,12 @@ struct QuantLinear {
                     !gate.has_value(),
                     "MXFP8 input-axis tensor parallelism does not support gating");
                 local_outputs[index] =
-                    mxfp8_matmul_f32(shard.mxfp8, local_x);
+                    mxfp8_matmul_f32(
+                        execution.profiler, shard.mxfp8, local_x);
             } else {
                 local_outputs[index] =
                     run_quant_linear_shard(
-                        shard, local_x,
+                        execution, shard, local_x,
                         gate.has_value()
                             ? MfqOptional<mfq_tensor_backend::Tensor>(
                                 local_gate)
@@ -373,30 +401,36 @@ struct QuantLinear {
         return mfq_tensor_backend::matmul(input, dense.transpose(0, 1));
     }
 
-    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x) const {
+    mfq_tensor_backend::Tensor forward(
+            CudaExecutionContext& execution,
+            mfq_tensor_backend::Tensor x) const {
         if (tensor_parallel()) {
             auto shape = x.sizes().vec();
             auto y = forward_tensor_parallel_flat(
-                x.reshape({-1, x.size(-1)}),
+                execution, x.reshape({-1, x.size(-1)}),
                 mfq_nullopt, 0);
             shape.back() = y.size(-1);
             return y.reshape(shape);
         }
-        if (is_nint()) return nint.forward(x);
-        if (is_nvq()) return nvq.forward(x);
+        if (is_nint()) return nint.forward(execution, x);
+        if (is_nvq()) return nvq.forward(execution, x);
         if (is_mxfp4()) return mxfp4.forward(x);
         if (is_mxfp4_sq()) return mxfp4_sq.forward(x);
         if (is_fp8_sq()) return fp8_sq.forward(x);
         if (is_dense()) return forward_dense(x);
-        return mxfp8.forward(x);
+        return mxfp8.forward(execution.profiler, x);
     }
-    mfq_tensor_backend::Tensor forward_bf16_output(mfq_tensor_backend::Tensor x) const {
+    mfq_tensor_backend::Tensor forward_bf16_output(
+            CudaExecutionContext& execution,
+            mfq_tensor_backend::Tensor x) const {
         if (!tensor_parallel() && is_nint()) {
-            return nint.forward_bf16_output(x);
+            return nint.forward_bf16_output(execution, x);
         }
-        return forward(x).to(mfq_tensor_backend::kBFloat16).contiguous();
+        return forward(execution, x)
+            .to(mfq_tensor_backend::kBFloat16).contiguous();
     }
     mfq_tensor_backend::Tensor forward_mxfp8_groupwise(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor grouped,
             int64_t groups) const {
         MFQ_RUNTIME_CHECK(
@@ -404,7 +438,7 @@ struct QuantLinear {
             "groupwise MXFP8 projection requires an MXFP8 tensor");
         if (!tensor_parallel()) {
             return mxfp8_groupwise_matmul(
-                mxfp8.weight, grouped, groups);
+                execution.profiler, mxfp8.weight, grouped, groups);
         }
         MFQ_RUNTIME_CHECK(
             tensor_parallel_axis == TensorParallelAxis::Input,
@@ -419,27 +453,32 @@ struct QuantLinear {
             auto local = grouped.narrow(
                 -1, shard.input_begin,
                 shard.input_end - shard.input_begin);
-            local = tensor_to_cuda_device(
-                local, shard.device);
+            local = tensor_to_cuda_device(local, shard.device);
             partials.push_back(mxfp8_groupwise_matmul_f32(
-                shard.mxfp8, local, groups));
+                execution.profiler, shard.mxfp8, local, groups));
         }
-        return reduce_model_parallel_outputs(
-            std::move(partials))
+        return reduce_model_parallel_outputs(std::move(partials))
             .to(grouped.scalar_type()).contiguous();
     }
-    mfq_tensor_backend::Tensor forward_input_mul(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate, int mode) const {
+    mfq_tensor_backend::Tensor forward_input_mul(
+            CudaExecutionContext& execution,
+            mfq_tensor_backend::Tensor x,
+            mfq_tensor_backend::Tensor gate,
+            int mode) const {
         if (tensor_parallel()) {
             auto shape = x.sizes().vec();
             auto y = forward_tensor_parallel_flat(
-                x.reshape({-1, x.size(-1)}),
-                gate.reshape({-1, gate.size(-1)}),
-                mode);
+                execution, x.reshape({-1, x.size(-1)}),
+                gate.reshape({-1, gate.size(-1)}), mode);
             shape.back() = y.size(-1);
             return y.reshape(shape);
         }
-        if (is_nint()) return nint.forward_input_mul(x, gate, mode);
-        if (is_nvq()) return nvq.forward_input_mul(x, gate, mode);
+        if (is_nint()) {
+            return nint.forward_input_mul(execution, x, gate, mode);
+        }
+        if (is_nvq()) {
+            return nvq.forward_input_mul(execution, x, gate, mode);
+        }
         if (is_dense()) {
             MFQ_RUNTIME_CHECK(mode == 1 || mode == 2,
                 "dense input gate mode must be sigmoid or SiLU");
@@ -457,9 +496,10 @@ struct QuantLinear {
         auto gated = mode == 1
             ? x * mfq_tensor_backend::sigmoid(local_gate)
             : x * mfq_tensor_backend::silu(local_gate);
-        return forward(gated);
+        return forward(execution, gated);
     }
     mfq_tensor_backend::Tensor forward_input_mul_f32_kld(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x,
             mfq_tensor_backend::Tensor gate,
             int mode) const {
@@ -467,7 +507,7 @@ struct QuantLinear {
             !tensor_parallel() && is_nint(),
             "FP32-output KLD down projection requires a local NINT tensor");
         return nint.forward_input_mul_f32_kld(
-            x, gate, mode);
+            execution, x, gate, mode);
     }
     int64_t out() const {
         if (tensor_parallel()) return logical_out;
@@ -498,6 +538,7 @@ bool tensor_parallel_output_projections_compatible(
     const QuantLinearProjectionRefs& projections);
 std::vector<mfq_tensor_backend::Tensor>
 forward_tensor_parallel_output_projections(
+    CudaExecutionContext& execution,
     mfq_tensor_backend::Tensor input,
     const QuantLinearProjectionRefs& projections);
 
@@ -528,14 +569,17 @@ struct QuantLinearGroup {
 
     std::vector<mfq_tensor_backend::Tensor>
     forward_tensor_parallel_output_group(
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x) const {
         return forward_tensor_parallel_output_projections(
-            x, tensor_parallel_output_projections());
+            execution, x, tensor_parallel_output_projections());
     }
 
-    std::vector<mfq_tensor_backend::Tensor> forward(mfq_tensor_backend::Tensor x) const {
+    std::vector<mfq_tensor_backend::Tensor> forward(
+            CudaExecutionContext& execution,
+            mfq_tensor_backend::Tensor x) const {
         const bool default_mmq =
-            cuda_execution_context().kl_mmq_mode == KlMmqMode::Default;
+            execution.kl_mmq_mode == KlMmqMode::Default;
         if (!x.is_cuda()) {
             MFQ_RUNTIME_CHECK(
                 !nint_grouped,
@@ -543,15 +587,15 @@ struct QuantLinearGroup {
             std::vector<mfq_tensor_backend::Tensor> result;
             result.reserve(layers.size());
             for (const auto & layer : layers) {
-                result.push_back(layer.forward(x));
+                result.push_back(layer.forward(execution, x));
             }
             return result;
         }
         if (tensor_parallel_grouped_projections_enabled() &&
                 tensor_parallel_output_compatible()) {
-            return forward_tensor_parallel_output_group(x);
+            return forward_tensor_parallel_output_group(execution, x);
         }
-        if (nint_grouped) return nint.forward(x);
+        if (nint_grouped) return nint.forward(execution, x);
         if (default_mmq && nvq_prefix2 && nvq_fusion_enabled()) {
             auto shape = x.sizes().vec();
             const auto flat =
@@ -559,25 +603,25 @@ struct QuantLinearGroup {
             std::vector<mfq_tensor_backend::Tensor> branch_outputs;
             const bool parallel =
                 decode_branch_parallel &&
-                decode_branch_parallel_enabled(flat.size(0)) &&
+                decode_branch_parallel_enabled(
+                    execution, flat.size(0)) &&
                 layers.size() > 2 &&
                 branch_executor->run(
                     layers.size() - 1,
                     [&](size_t branch) {
                         if (branch == 0) {
                             return nvq_matmul_multi2(
-                                layers[0].nvq.w,
-                                layers[1].nvq.w,
-                                flat);
+                                execution, layers[0].nvq.w,
+                                layers[1].nvq.w, flat);
                         }
-                        return layers[branch + 1].forward(x);
+                        return layers[branch + 1].forward(execution, x);
                     },
                     branch_outputs);
             auto combined = parallel
                 ? branch_outputs[0]
                 : nvq_matmul_multi2(
-                    layers[0].nvq.w, layers[1].nvq.w,
-                    flat);
+                    execution, layers[0].nvq.w,
+                    layers[1].nvq.w, flat);
             auto pair = combined.split_with_sizes({outs[0], outs[1]}, -1);
             std::vector<mfq_tensor_backend::Tensor> result;
             result.reserve(layers.size());
@@ -590,40 +634,42 @@ struct QuantLinearGroup {
                 result.push_back(
                     parallel
                         ? branch_outputs[i - 1]
-                        : layers[i].forward(x));
+                        : layers[i].forward(execution, x));
             }
             return result;
         }
         std::vector<mfq_tensor_backend::Tensor> result;
         if (default_mmq && decode_branch_parallel &&
                 decode_branch_parallel_enabled(
-                    x.numel() / x.size(-1)) &&
+                    execution, x.numel() / x.size(-1)) &&
                 branch_executor->run(
                     layers.size(),
                     [&](size_t index) {
-                        return layers[index].forward(x);
+                        return layers[index].forward(execution, x);
                     },
                     result)) {
             return result;
         }
         result.reserve(layers.size());
         for (const auto & layer : layers) {
-            result.push_back(layer.forward(x));
+            result.push_back(layer.forward(execution, x));
         }
         return result;
     }
-    mfq_tensor_backend::Tensor forward_swiglu(mfq_tensor_backend::Tensor x) const {
+    mfq_tensor_backend::Tensor forward_swiglu(
+            CudaExecutionContext& execution,
+            mfq_tensor_backend::Tensor x) const {
         const bool default_mmq =
-            cuda_execution_context().kl_mmq_mode == KlMmqMode::Default;
+            execution.kl_mmq_mode == KlMmqMode::Default;
         if (default_mmq && nint_grouped && nint.split_w.empty() &&
                 x.numel() / x.size(-1) >= 1 && x.numel() / x.size(-1) <= 6) {
-            return nint.forward_swiglu(x);
+            return nint.forward_swiglu(execution, x);
         }
         if (default_mmq && nvq_prefix2 && layers.size() == 2 &&
                 nvq_fusion_enabled()) {
             auto shape = x.sizes().vec();
             auto y = nvq_matmul_swiglu(
-                layers[0].nvq.w, layers[1].nvq.w,
+                execution, layers[0].nvq.w, layers[1].nvq.w,
                 x.reshape({-1, x.size(-1)}));
             shape.back() = y.size(-1);
             return y.reshape(shape);
@@ -631,19 +677,21 @@ struct QuantLinearGroup {
         if (outs.size() != 2 || outs[0] != outs[1]) {
             throw std::runtime_error("SwiGLU requires equal gate/up output widths");
         }
-        auto parts = forward(x);
+        auto parts = forward(execution, x);
         return mfq_tensor_backend::silu(parts[0]) * parts[1];
     }
-    mfq_tensor_backend::Tensor forward_geglu(mfq_tensor_backend::Tensor x) const {
-        if (cuda_execution_context().kl_mmq_mode == KlMmqMode::Default &&
+    mfq_tensor_backend::Tensor forward_geglu(
+            CudaExecutionContext& execution,
+            mfq_tensor_backend::Tensor x) const {
+        if (execution.kl_mmq_mode == KlMmqMode::Default &&
                 nint_grouped && nint.split_w.empty() &&
                 x.numel() / x.size(-1) == 1) {
-            return nint.forward_geglu(x);
+            return nint.forward_geglu(execution, x);
         }
         if (outs.size() != 2 || outs[0] != outs[1]) {
             throw std::runtime_error("GeGLU requires equal gate/up output widths");
         }
-        auto parts = forward(x);
+        auto parts = forward(execution, x);
         return gelu_mul_cuda(parts[0].contiguous(), parts[1].contiguous());
     }
 };
@@ -681,11 +729,13 @@ MfeWeight load_mfe_gpu(
     int layer_id = -1,
     const std::string& projection_role = {});
 std::shared_ptr<MixedMoeRuntime> load_mfe_cpu_offloaded(
-    const mfq::ModelSource& source, const std::string& name);
+    const mfq::ModelSource& source,
+    const std::string& name);
 MfeWeight cpu_mixed_moe_metadata(
     const std::shared_ptr<MixedMoeRuntime>& runtime);
 mfq_tensor_backend::Tensor load_dense_gpu(
-    const mfq::ModelSource& source, const std::string& name);
+    const mfq::ModelSource& source,
+    const std::string& name);
 QuantLinear load_quant_linear(
     const mfq::ModelSource& source,
     const std::string& name,
@@ -719,6 +769,7 @@ bool prefetch_cached_moe_projection_bundle(
     const MfeWeight& down,
     const MoeRoutePlan& route);
 mfq_tensor_backend::Tensor nvq_ffn_swiglu_down(
+    CudaExecutionContext& execution,
     const NvqWeight& gate,
     const NvqWeight& up,
     const NvqWeight& down,
@@ -726,6 +777,7 @@ mfq_tensor_backend::Tensor nvq_ffn_swiglu_down(
     MfqOptional<mfq_tensor_backend::Tensor> residual = mfq_nullopt);
 bool nvq_fused_residual_format(std::int64_t kernel_format);
 mfq_tensor_backend::Tensor nint_matmul_groupwise_u8(
+    CudaProfiler& profiler,
     const NintWeight& weight,
     mfq_tensor_backend::Tensor input,
     std::int64_t groups);
@@ -746,4 +798,5 @@ mfq_tensor_backend::Tensor mfe_dense_reference(
     int routes,
     bool routed_input);
 mfq_tensor_backend::Tensor materialize_mfe_dense(
-    const mfq::ModelSource& source, const std::string& name);
+    const mfq::ModelSource& source,
+    const std::string& name);

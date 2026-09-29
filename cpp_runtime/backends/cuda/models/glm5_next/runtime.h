@@ -16,11 +16,13 @@ std::vector<mfq_tensor_backend::Tensor> gdn_cuda(
 mfq_tensor_backend::Tensor ssm_conv_silu_cuda(
     mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor,
     mfq_tensor_backend::Tensor, int64_t);
+struct CudaExecutionContext;
 
 namespace mfq::cuda::glm5_next {
 namespace tb = mfq_tensor_backend;
 using Tensor = tb::Tensor;
-using Linear = std::function<Tensor(const Tensor&)>;
+using Linear =
+    std::function<Tensor(CudaExecutionContext&, const Tensor&)>;
 
 inline Tensor rms_norm(const Tensor& value, const Tensor& weight, double eps) {
     auto f = value.to(tb::kFloat32);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../causal_lm.h"
+#include "../full_attention_session_codec.h"
 #include "models/include/qwen35.h"
 
 #include <cstdint>
@@ -10,7 +12,6 @@
 
 namespace mfq { class ModelSource; }
 struct Block;
-struct TextSessionState;
 
 namespace mfq::cuda::qwen35 {
 
@@ -36,3 +37,55 @@ void restore_text_session_state(
     const TextSessionState& state);
 
 } // namespace mfq::cuda::qwen35
+
+namespace mfq::cuda {
+
+struct Qwen35Model : CausalLmArchitecture {
+    mfq::models::qwen35::Config config;
+
+    void adapter_load_config(
+        std::string_view payload,
+        const mfq::ModelGraph& graph,
+        const mfq::ModelSource& source);
+    void adapter_configure_rope(
+        RopeCache& rope,
+        mfq_tensor_backend::Device device) const;
+    bool adapter_uses_common_rope() const noexcept;
+    bool adapter_supports_dense_cpu_offload() const noexcept;
+    std::unique_ptr<Block> adapter_load_block(
+        const mfq::ModelSource& source,
+        int layer,
+        int device,
+        const std::string& type);
+    void adapter_set_max_position_embeddings(int64_t value) {
+        config.max_position_embeddings = value;
+    }
+    mfq_tensor_backend::Tensor adapter_embed(
+        mfq_tensor_backend::Tensor output) const;
+    void adapter_validate_positions(
+        const mfq_tensor_backend::Tensor& positions,
+        int64_t batch,
+        int64_t tokens,
+        bool has_mrope) const;
+    bool adapter_supports_prepared_prompt() const noexcept;
+    bool adapter_supports_speculation() const noexcept;
+};
+
+template <>
+struct CudaSessionCodec<Qwen35Model> {
+    using Model = CausalLm<Qwen35Model>;
+    static TextSessionStateKind kind(const Model& model);
+    static bool supports_paged(const Model& model);
+    static TextSessionState capture(
+        const Model& model,
+        const std::vector<int64_t>& tokens);
+    static void restore(
+        Model& model,
+        const TextSessionState& state);
+};
+
+extern template struct FullAttentionSessionCodec<Qwen35Model>;
+
+extern template struct CausalLm<Qwen35Model>;
+
+} // namespace mfq::cuda

@@ -45,16 +45,21 @@ struct NvqWeight {
 
 bool nvq_fusion_enabled();
 mfq_tensor_backend::Tensor nvq_matmul_multi2(
+    CudaExecutionContext& execution,
     const NvqWeight& first,
     const NvqWeight& second,
     mfq_tensor_backend::Tensor input);
 mfq_tensor_backend::Tensor nvq_matmul_swiglu(
+    CudaExecutionContext& execution,
     const NvqWeight& gate,
     const NvqWeight& up,
     mfq_tensor_backend::Tensor input);
 mfq_tensor_backend::Tensor nvq_matmul(
-    const NvqWeight& weight, mfq_tensor_backend::Tensor input);
+    CudaExecutionContext& execution,
+    const NvqWeight& weight,
+    mfq_tensor_backend::Tensor input);
 mfq_tensor_backend::Tensor nvq_matmul_input_mul(
+    CudaExecutionContext& execution,
     const NvqWeight& weight,
     mfq_tensor_backend::Tensor input,
     mfq_tensor_backend::Tensor gate,
@@ -62,16 +67,24 @@ mfq_tensor_backend::Tensor nvq_matmul_input_mul(
 
 struct NvqLinear {
     NvqWeight w;
-    mfq_tensor_backend::Tensor forward(mfq_tensor_backend::Tensor x) const {
+    mfq_tensor_backend::Tensor forward(
+            CudaExecutionContext& execution,
+            mfq_tensor_backend::Tensor x) const {
         auto shape = x.sizes().vec();
-        auto y = nvq_matmul(w, x.reshape({-1, x.size(-1)}));
+        auto y = nvq_matmul(
+            execution, w, x.reshape({-1, x.size(-1)}));
         shape.back() = y.size(-1);
         return y.reshape(shape);
     }
-    mfq_tensor_backend::Tensor forward_input_mul(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate, int mode) const {
+    mfq_tensor_backend::Tensor forward_input_mul(
+            CudaExecutionContext& execution,
+            mfq_tensor_backend::Tensor x,
+            mfq_tensor_backend::Tensor gate,
+            int mode) const {
         auto shape = x.sizes().vec();
         auto y = nvq_matmul_input_mul(
-            w, x.reshape({-1, x.size(-1)}), gate.reshape({-1, gate.size(-1)}), mode);
+            execution, w, x.reshape({-1, x.size(-1)}),
+            gate.reshape({-1, gate.size(-1)}), mode);
         shape.back() = y.size(-1);
         return y.reshape(shape);
     }

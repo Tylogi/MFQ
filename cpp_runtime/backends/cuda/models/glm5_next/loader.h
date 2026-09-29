@@ -18,7 +18,9 @@ using Routed = std::function<Tensor(const Tensor&, const Tensor&)>;
 
 inline Linear linear(const mfq::ModelSource& file, const std::string& name) {
     auto weight=std::make_shared<QuantLinear>(load_quant_linear(file,name));
-    return [weight](const Tensor& x) { return weight->forward(x); };
+    return [weight](CudaExecutionContext& execution, const Tensor& x) {
+        return weight->forward(execution, x);
+    };
 }
 
 inline Tensor dense(const mfq::ModelSource& file, const std::string& name) {
@@ -69,7 +71,8 @@ inline Routed routed_gate_up(const mfq::ModelSource& file, const std::string& ml
 }
 
 inline Linear headwise(Routed projection,int64_t heads,int64_t output) {
-    return [projection=std::move(projection),heads,output](const Tensor& x) {
+    return [projection=std::move(projection),heads,output](
+            CudaExecutionContext&, const Tensor& x) {
         MFQ_RUNTIME_CHECK(x.dim()==4 && x.size(2)==heads,"GLM head-wise projection shape mismatch");
         const auto b=x.size(0),t=x.size(1),rows=b*t*heads;
         auto ids=tb::arange(rows,x.options().dtype(tb::kInt32)).remainder(heads).reshape({rows,1});
@@ -79,17 +82,19 @@ inline Linear headwise(Routed projection,int64_t heads,int64_t output) {
 
 inline Linear dense_ffn(const mfq::ModelSource& file,const std::string& p,double limit) {
     auto gate=linear(file,p+".gate.weight"),up=linear(file,p+".up.weight"),down=linear(file,p+".down.weight");
-    return [gate,up,down,limit](const Tensor& x) {
-        auto g=tb::clamp_max(gate(x),limit),u=tb::clamp(up(x),-limit,limit);
-        return down((g*tb::sigmoid(g))*u);
+    return [gate,up,down,limit](
+            CudaExecutionContext& execution, const Tensor& x) {
+        auto g=tb::clamp_max(gate(execution,x),limit);
+        auto u=tb::clamp(up(execution,x),-limit,limit);
+        return down(execution,(g*tb::sigmoid(g))*u);
     };
 }
 
-inline void validate_load_options() {
-    const auto& execution = cuda_execution_context();
+inline void validate_load_options(
+        const CudaExecutionContext& execution) {
     if (execution.tensor_parallel.enabled() ||
             execution.layer_placement.enabled() ||
-            execution.n_gpu_layers >= 0 || moe_expert_cache()) {
+            execution.n_gpu_layers >= 0 || execution.moe_expert_cache) {
         throw std::runtime_error(
             "GLM native adapter supports expert parallelism, but "
             "tensor/layer parallelism and offload require a different placement path");
