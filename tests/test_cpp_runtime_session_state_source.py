@@ -61,7 +61,7 @@ def test_native_session_identifier_reaches_the_cuda_runtime() -> None:
     assert "std::string session_id;" in HEADER
     assert 'body.contains("mfq_session_id")' in SERVER
     assert "valid_mfq_session_id" in SERVER
-    assert "const MfqPromptCachePlan & cache_plan" in DECODE
+    assert "const MfqPromptCachePlan& cache_plan" in DECODE
     assert "cache_plan.session_id" in DECODE
 
 

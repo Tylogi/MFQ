@@ -424,7 +424,7 @@ load_runtime_components(
         mfq::cuda::minicpmo45::EngineComponents>(std::move(model));
     result.language_override = &state->runtime.language;
     result.engine_binder = [state](
-            MfqInferenceEngine& engine,
+            mfq::engine::Engine& engine,
             std::mutex& model_mutex) {
         engine.multimodal_generate = [state, &model_mutex](
                 const std::vector<int64_t>& prompt,

@@ -1,6 +1,5 @@
 #include "cli.h"
 #include "engine/cuda_engine.h"
-#include "storage/moe_expert_cache.h"
 #include "minicpmo45.h"
 #include "models/registry.h"
 #include "mfq/model_source.h"
@@ -25,8 +24,6 @@ void print_help() {
         << "MFQ native CUDA runtime\n\n"
         << "Usage:\n"
         << "  mfq-runtime --model MODEL --transport stdio|http [OPTIONS]\n"
-        << "  mfq-runtime --model MODEL --ids IDS [--gen N] [OPTIONS]\n"
-        << "  mfq-runtime --model MODEL --ids-file FILE [--gen N] [OPTIONS]\n"
         << "  mfq-runtime --model MODEL --minicpmo-input-prefix PREFIX "
            "--minicpmo-output-prefix PREFIX [OPTIONS]\n"
         << "  mfq-runtime --model MODEL --minicpmo-duplex-input-prefix PREFIX "
@@ -34,9 +31,6 @@ void print_help() {
         << "Runtime options:\n"
         << "  --model PATH                    model or split-model shard\n"
         << "  --config PATH                   external model config\n"
-        << "  --ids LIST                      token IDs\n"
-        << "  --ids-file PATH                 raw int32 token IDs\n"
-        << "  --gen N                         generated tokens (default 16)\n"
         << "  --transport TYPE                stdio or http\n"
         << "  --host HOST                     HTTP bind host (default 127.0.0.1)\n"
         << "  --port N                        HTTP port (default 8080)\n"
@@ -61,7 +55,7 @@ void print_help() {
         << "  -h, --help                      show this help\n";
 }
 
-struct RuntimeOptions : CudaEngineOptions, TokenInputOptions {
+struct RuntimeOptions : CudaEngineOptions {
     std::string transport_host = "127.0.0.1";
     std::string runtime_model_name = "mfq-model", transport_api_key;
     std::string runtime_sampling_profile;
@@ -77,7 +71,6 @@ struct RuntimeCommandOptions
 RuntimeCommandOptions parse_runtime(ArgCursor& args) {
     RuntimeCommandOptions result;
     bool transport_option = false;
-    bool gen_option = false;
     while (!args.empty()) {
         const std::string_view option = args.next();
         if (option == "--help" || option == "-h") {
@@ -89,17 +82,7 @@ RuntimeCommandOptions parse_runtime(ArgCursor& args) {
                 option, args, result)) {
             continue;
         }
-        if (option == "--ids") {
-            result.ids_arg = args.value(option);
-            validate_integer_list(result.ids_arg, option);
-        }
-        else if (option == "--ids-file") result.ids_file = args.value(option);
-        else if (option == "--gen") {
-            result.gen = integer<int>(args.value(option), option);
-            if (result.gen < 0) usage_error("--gen must be non-negative");
-            gen_option = true;
-        }
-        else if (option == "--transport") {
+        if (option == "--transport") {
             if (result.transport_mode) {
                 usage_error("runtime transport was specified more than once");
             }
@@ -151,20 +134,14 @@ RuntimeCommandOptions parse_runtime(ArgCursor& args) {
     }
 
     if (result.model_path.empty()) usage_error("--model is required");
-    if (!result.ids_arg.empty() && !result.ids_file.empty()) {
-        usage_error("--ids and --ids-file are mutually exclusive");
-    }
     mfq::cuda::minicpmo45::validate_command_options(result);
-    const bool token_mode = !result.ids_arg.empty() || !result.ids_file.empty();
     const int modes = static_cast<int>(result.transport_mode) +
-        static_cast<int>(token_mode) +
         static_cast<int>(!result.input_prefix.empty()) +
         static_cast<int>(!result.duplex_input_prefix.empty());
     if (modes != 1) {
-        usage_error("select exactly one execution mode: --transport, token input, "
+        usage_error("select exactly one execution mode: --transport, "
                     "MiniCPM-o composite, or MiniCPM-o duplex");
     }
-    if (gen_option && !token_mode) usage_error("--gen requires token input");
     if (transport_option && !result.transport_mode) {
         usage_error("transport options require --transport");
     }
@@ -257,11 +234,7 @@ int run_transport_runtime(RuntimeOptions& options) {
         ? make_mfq_stdio_transport(transport_config)
         : make_mfq_http_transport(transport_config);
     MfqRuntime runtime(std::move(engine), std::move(transport));
-    const int status = runtime.run();
-    if (moe_expert_cache()) {
-        print_moe_expert_cache_stats(std::cout);
-    }
-    return status;
+    return runtime.run();
 }
 
 int execute_runtime(RuntimeCommandOptions options) {
@@ -274,11 +247,7 @@ int execute_runtime(RuntimeCommandOptions options) {
         if (!options.input_prefix.empty()) {
             return mfq::cuda::minicpmo45::run_composite(options, options);
         }
-        if (options.transport_mode) {
-            return run_transport_runtime(options);
-        }
-        return mfq::cuda::internal::run_cuda_token_generation(
-            options, options);
+        return run_transport_runtime(options);
     });
 }
 

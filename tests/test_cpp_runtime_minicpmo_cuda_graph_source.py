@@ -8,7 +8,7 @@ CUDA_RUNTIME = "\n".join(
     for path in (
         CUDA_ROOT / "engine" / "generation.cpp",
         CUDA_ROOT / "engine" / "generation.h",
-        CUDA_ROOT / "commands" / "token_generation.h",
+        CUDA_ROOT / "diagnostics" / "token_generation.h",
     )
 )
 BACKEND_CHECKS = (

@@ -248,9 +248,19 @@ def test_cuda_runtime_has_one_shared_generation_path() -> None:
     assert "mfq::engine::generate_target(" in generation
     assert "while (generated < max_tokens)" not in generation
     assert "generate_cli_tokens" not in header
-    assert "generate_cli_tokens" in (
+    assert not (
         CUDA_RUNTIME.parent / "commands" / "token_generation.h"
+    ).exists()
+    assert not (
+        CUDA_RUNTIME.parent / "commands" / "token_generation.cpp"
+    ).exists()
+    assert "generate_diagnostic_tokens" in (
+        CUDA_RUNTIME.parent / "diagnostics" / "token_generation.h"
     ).read_text(encoding="utf-8")
+    assert '"--ids"' not in CUDA_RUNTIME_COMMAND
+    assert '"--ids-file"' not in CUDA_RUNTIME_COMMAND
+    assert '"--gen"' not in CUDA_RUNTIME_COMMAND
+    assert "run_token_mode" not in CUDA_RUNTIME_COMMAND
     assert "generate_target(" in shared
     assert "InferenceRequest" in shared
     assert "TextGeneration" not in shared
@@ -316,7 +326,26 @@ def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
 
 
 def test_cuda_runtime_composes_transport_scheduler_and_engine() -> None:
-    assert "CudaInferenceEngine engine;" in CUDA_ENGINE_SOURCE
+    engine_contract = (
+        ROOT / "cpp_runtime" / "engine" / "include" / "engine.h"
+    ).read_text(encoding="utf-8")
+    scheduler = (
+        ROOT / "cpp_runtime" / "scheduler" / "include" / "scheduler.h"
+    ).read_text(encoding="utf-8")
+    cuda_engine_header = (
+        CUDA_RUNTIME / "cuda_engine.h"
+    ).read_text(encoding="utf-8")
+    assert "class Engine" in engine_contract
+    assert "virtual ~Engine() = 0" in engine_contract
+    assert "struct CudaEngine final : mfq::engine::Engine" in cuda_engine_header
+    assert "CudaEngine engine;" in CUDA_ENGINE_SOURCE
+    assert "std::unique_ptr<mfq::engine::ContinuousBatching>" in CUDA_ENGINE_SOURCE
+    assert "make_cuda_continuous_batching(" in CUDA_ENGINE_SOURCE
+    assert "qwen35::QwenBatchExecutor" not in CUDA_ENGINE_SOURCE
+    assert "const mfq::engine::Engine& engine_" in scheduler
+    assert "MfqInferenceEngine" not in (
+        ROOT / "cpp_runtime" / "core" / "include" / "mfq" / "runtime.h"
+    ).read_text(encoding="utf-8")
     assert "LoadedCudaEngine" not in CUDA_BACKEND_SOURCE
     assert "LoadedEngine" not in CUDA_BACKEND_SOURCE
     assert '"device_free_bytes"' in CUDA_ENGINE_SOURCE

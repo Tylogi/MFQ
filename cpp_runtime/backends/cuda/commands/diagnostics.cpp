@@ -1,5 +1,5 @@
 #include "cli.h"
-#include "token_generation.h"
+#include "diagnostics/token_generation.h"
 #include "models/loader.h"
 #include "diagnostics/backend_checks.h"
 #include "diagnostics/model_checks.h"
@@ -739,7 +739,8 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             std::cout << "attention_compare_same_top=" << (same_top.template item<bool>() ? 1 : 0) << "\n";
             return 0;
         }
-        return generate_cli_tokens(model, ids, gen, profile, t0, t1);
+        return generate_diagnostic_tokens(
+            model, ids, gen, profile, t0, t1);
             });
     }); }
 };
@@ -835,6 +836,7 @@ bool has_diagnostic_action(const DiagnosticsCommandOptions& value) {
         value.compare_mma_decode || value.compare_nvq_vec4 ||
         !value.block_trace_reference.empty() || !value.block_trace_output.empty() ||
         !value.bench_qwen35_mtp.empty() || !value.prefill_sweep_arg.empty() ||
+        !value.ids_arg.empty() || !value.ids_file.empty() ||
         value.prefill_repeat > 0 || value.profile || value.minicpmo_eval_batch;
 }
 

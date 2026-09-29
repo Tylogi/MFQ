@@ -6,7 +6,6 @@
 #include "generation.h"
 #include "runtime_config.h"
 #include "storage/moe_expert_cache.h"
-#include "models/qwen35/batch_executor.h"
 #include "models/loader.h"
 #include "models/components.h"
 #include "mtp_metrics.h"
@@ -60,34 +59,21 @@ struct CudaEngineState {
         if (runtime_config.continuous_batch.scheduling.max_sequences == 0) {
             return;
         }
-        if constexpr (Backbone == CudaBackbone::generic_qwen) {
-            auto qwen_executor = std::make_unique<
-                qwen35::QwenBatchExecutor>(
-                    *language, execution, model_mutex,
-                    runtime_config.continuous_batch,
-                    runtime_config.generation);
-            std::cerr
-                << "continuous_batching enabled=1 max_sequences="
-                << runtime_config.continuous_batch.scheduling.max_sequences
-                << " prefill_chunk_size="
-                << runtime_config.generation.prefill_chunk_size
-                << " decode=target_only mtp=disabled"
-                << " moe="
-                << (qwen35::qwen_continuous_batch_has_moe(
-                        *language) ? 1 : 0)
-                << " moe_expert_cache="
-                << (qwen35::qwen_continuous_batch_has_cached_moe(
-                        *language) ? 1 : 0)
-                << " paged_kv="
-                << (qwen_executor->paged_kv_enabled() ? 1 : 0)
-                << " page_size="
-                << qwen_executor->paged_kv_page_size()
-                << " prefix_cache=fresh_prefill\n";
-            batch_executor = std::move(qwen_executor);
-        } else {
+        continuous_batching = make_cuda_continuous_batching(
+            *language, execution, model_mutex,
+            runtime_config.continuous_batch,
+            runtime_config.generation);
+        if (!continuous_batching) {
             throw std::runtime_error(
-                "continuous batching requires Qwen35CausalLm");
+                "continuous batching is unavailable for this model adapter");
         }
+        std::cerr
+            << "continuous_batching enabled=1 max_sequences="
+            << runtime_config.continuous_batch.scheduling.max_sequences
+            << " prefill_chunk_size="
+            << runtime_config.generation.prefill_chunk_size
+            << " decode=target_only mtp=disabled"
+            << " prefix_cache=fresh_prefill\n";
     }
 
     CudaExecutionContext& execution;
@@ -99,7 +85,7 @@ struct CudaEngineState {
     std::mutex model_mutex;
     DecodeGraphCache decode_graph;
     TextSessionCache session_cache;
-    std::unique_ptr<mfq::engine::ContinuousBatchExecutor> batch_executor;
+    std::unique_ptr<mfq::engine::ContinuousBatching> continuous_batching;
 };
 
 template <CudaBackbone Backbone>
@@ -111,7 +97,7 @@ std::vector<std::pair<std::string, double>> engine_metrics(
     const auto memory = mfq_cuda_memory_stats(mfq_current_cuda_device());
     const auto components = state->components.state();
     const bool mtp_available =
-        components.mtp_available && !state->batch_executor;
+        components.mtp_available && !state->continuous_batching;
     std::vector<std::pair<std::string, double>> result{
         {"device_free_bytes", static_cast<double>(free_bytes)},
         {"device_total_bytes", static_cast<double>(total_bytes)},
@@ -131,15 +117,15 @@ std::vector<std::pair<std::string, double>> engine_metrics(
         mfq::engine::mtp::append_generation_metrics(
             result, state->components.mtp->last_stats);
     }
-    if (state->batch_executor) {
-        auto batching = state->batch_executor->metrics();
+    if (state->continuous_batching) {
+        auto batching = state->continuous_batching->metrics();
         result.insert(result.end(), batching.begin(), batching.end());
     }
     return result;
 }
 
 template <CudaBackbone Backbone>
-CudaInferenceEngine make_cuda_inference_engine(
+CudaEngine make_cuda_engine(
         CausalLmFor<Backbone> model,
         RuntimeComponents<CausalLmFor<Backbone>> components,
         CudaRuntimeConfig config) {
@@ -147,7 +133,7 @@ CudaInferenceEngine make_cuda_inference_engine(
     auto state = std::make_shared<State>(
         std::move(model), std::move(components), std::move(config));
 
-    CudaInferenceEngine engine;
+    CudaEngine engine;
     engine.max_concurrent_requests = std::max<std::size_t>(
         1, state->runtime_config.continuous_batch.scheduling.max_sequences);
     // Both CUDA entry points use one internal generate request. Keep the
@@ -175,8 +161,8 @@ CudaInferenceEngine make_cuda_inference_engine(
             } else {
                 throw std::invalid_argument("CUDA backbone has no prepared vision component");
             }
-        } else if (state->batch_executor) {
-            return state->batch_executor->submit(
+        } else if (state->continuous_batching) {
+            return state->continuous_batching->submit(
                 prompt, sampling, on_token, on_prefill,
                 cache_plan, token_constraint, cancelled);
         }
@@ -185,7 +171,7 @@ CudaInferenceEngine make_cuda_inference_engine(
             state->decode_graph, state->session_cache,
             state->runtime_config, prompt, sampling, on_token, on_prefill,
             cache_plan, token_constraint,
-            state->batch_executor && media
+            state->continuous_batching && media
                 ? nullptr : state->components.mtp.get(),
             std::move(prepare), cancelled);
     };
@@ -267,13 +253,13 @@ CudaInferenceEngine make_cuda_inference_engine(
     engine.metadata.capabilities.full_duplex = model_adapter_loaded &&
         state->components.graph.has_component("duplex");
     engine.metadata.capabilities.mtp =
-        component_state.mtp_available && !state->batch_executor;
+        component_state.mtp_available && !state->continuous_batching;
     return engine;
 }
 
 } // namespace
 
-CudaInferenceEngine load_cuda_engine(CudaEngineOptions options) {
+CudaEngine load_cuda_engine(CudaEngineOptions options) {
     if (options.context_size == 0) options.context_size = 32768;
     auto runtime_config = resolve_cuda_runtime_config(options);
     g_profiler.enabled = false;
@@ -282,7 +268,7 @@ CudaInferenceEngine load_cuda_engine(CudaEngineOptions options) {
         options, true,
         [&]<CudaBackbone Backbone>(auto& model,
                 auto& components, auto, auto) {
-            return make_cuda_inference_engine<Backbone>(
+            return make_cuda_engine<Backbone>(
                 std::move(model), std::move(components),
                 std::move(runtime_config));
         });

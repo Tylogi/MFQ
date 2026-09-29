@@ -15,6 +15,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -161,9 +162,167 @@ private:
     bool stopping_ = false;
 };
 
-class ContinuousBatchExecutor {
+template <typename Request>
+struct ContinuousBatchState {
+    std::deque<std::shared_ptr<Request>> prefilling;
+    std::vector<std::shared_ptr<Request>> active;
+};
+
+// Owns queue, worker, and request-state transitions. Operations supplies only
+// backend prefill/decode and device-state cleanup.
+template <typename Request, typename Operations>
+class ContinuousBatchingController {
 public:
-    virtual ~ContinuousBatchExecutor() = default;
+    using State = ContinuousBatchState<Request>;
+    using Queue = ContinuousBatchQueue<Request>;
+    using RequestPtr = std::shared_ptr<Request>;
+
+    ContinuousBatchingController(
+            ContinuousBatchConfig config,
+            std::unique_ptr<Operations> operations)
+        : config_(config),
+          operations_(std::move(operations)),
+          queue_(config.max_sequences) {
+        if (!operations_) {
+            throw std::invalid_argument(
+                "continuous batching requires backend operations");
+        }
+        worker_ = std::thread([this] { worker_main(); });
+    }
+
+    ~ContinuousBatchingController() {
+        queue_.stop();
+        if (worker_.joinable()) worker_.join();
+    }
+
+    ContinuousBatchingController(const ContinuousBatchingController&) = delete;
+    ContinuousBatchingController& operator=(
+        const ContinuousBatchingController&) = delete;
+
+    void submit(RequestPtr request) { queue_.submit(std::move(request)); }
+
+    std::int32_t submit(
+            RequestPtr request,
+            const MfqTokenCallback& on_token,
+            const MfqPrefillCallback& on_prefill) {
+        queue_.submit(request);
+        return request->consume(on_token, on_prefill, [this] {
+            queue_.notify();
+        });
+    }
+
+    std::vector<std::pair<std::string, double>> metrics() const {
+        return {
+            {"continuous_batching_max_sequences",
+                static_cast<double>(config_.max_sequences)},
+            {"continuous_batching_active", static_cast<double>(active())},
+            {"continuous_batching_prefilling",
+                static_cast<double>(prefilling())},
+            {"continuous_batching_queued", static_cast<double>(queued())},
+            {"continuous_batching_max_batch",
+                static_cast<double>(max_batch())},
+            {"continuous_batching_interleaved_admissions",
+                static_cast<double>(interleaved_admissions())},
+        };
+    }
+
+    Operations& operations() noexcept { return *operations_; }
+    const Operations& operations() const noexcept { return *operations_; }
+    std::size_t queued() const { return queue_.size(); }
+    std::int64_t active() const noexcept {
+        return active_count_.load(std::memory_order_relaxed);
+    }
+    std::int64_t prefilling() const noexcept {
+        return prefilling_count_.load(std::memory_order_relaxed);
+    }
+    std::int64_t max_batch() const noexcept {
+        return max_batch_.load(std::memory_order_relaxed);
+    }
+    std::int64_t interleaved_admissions() const noexcept {
+        return interleaved_admissions_.load(std::memory_order_relaxed);
+    }
+
+private:
+    void publish_state() {
+        active_count_.store(
+            static_cast<std::int64_t>(state_.active.size()),
+            std::memory_order_relaxed);
+        prefilling_count_.store(
+            static_cast<std::int64_t>(state_.prefilling.size()),
+            std::memory_order_relaxed);
+        auto previous = max_batch_.load(std::memory_order_relaxed);
+        const auto current = static_cast<std::int64_t>(state_.active.size());
+        while (previous < current && !max_batch_.compare_exchange_weak(
+                previous, current, std::memory_order_relaxed)) {}
+    }
+
+    void clear_state() {
+        state_.active.clear();
+        state_.prefilling.clear();
+        publish_state();
+    }
+
+    void worker_main() noexcept {
+        for (;;) {
+            try {
+                if (!queue_.wait_for_work(
+                        !state_.active.empty() || !state_.prefilling.empty(),
+                        config_.initial_batch_wait)) {
+                    auto error = std::make_exception_ptr(
+                        std::runtime_error(
+                            "continuous batching scheduler stopped"));
+                    auto pending = queue_.stop_and_drain();
+                    try {
+                        operations_->shutdown(pending, state_, error);
+                    } catch (...) {}
+                    clear_state();
+                    return;
+                }
+                // Service one decode step, then at most one prompt chunk
+                // while decode remains active.
+                const bool decode_was_active = !state_.active.empty();
+                if (decode_was_active) {
+                    operations_->decode_active(state_);
+                    publish_state();
+                }
+                const bool contended = !state_.active.empty();
+                auto incoming = queue_.take(
+                    state_.active.size() + state_.prefilling.size(),
+                    contended ? std::size_t{1} : config_.max_sequences);
+                if (contended && !incoming.empty()) {
+                    interleaved_admissions_.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                operations_->advance_prefills(
+                    incoming, contended, state_, queue_);
+                publish_state();
+                if (!decode_was_active) {
+                    operations_->decode_active(state_);
+                    publish_state();
+                }
+            } catch (...) {
+                try {
+                    operations_->recover(state_, std::current_exception());
+                } catch (...) {}
+                clear_state();
+            }
+        }
+    }
+
+    const ContinuousBatchConfig config_;
+    std::unique_ptr<Operations> operations_;
+    Queue queue_;
+    std::thread worker_;
+    State state_;
+    std::atomic<std::int64_t> active_count_{0};
+    std::atomic<std::int64_t> prefilling_count_{0};
+    std::atomic<std::int64_t> max_batch_{0};
+    std::atomic<std::int64_t> interleaved_admissions_{0};
+};
+
+class ContinuousBatching {
+public:
+    virtual ~ContinuousBatching() = default;
 
     virtual int32_t submit(
         const std::vector<int64_t>& prompt,

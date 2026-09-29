@@ -3,7 +3,8 @@
 #include "causal_lm.h"
 #include "../engine/mtp.h"
 #include "grid_vision_component.h"
-#include "mfq/runtime.h"
+#include "engine.h"
+#include "engine/runtime_config.h"
 #include "deepseek_v41/dspark.h"
 #include "glm5_next/mtp.h"
 #include "qwen4_exp/mtp.h"
@@ -14,6 +15,8 @@
 #include <mutex>
 #include <optional>
 
+struct CudaExecutionContext;
+
 template <typename Model>
 struct RuntimeComponents {
     mfq::ModelGraph graph;
@@ -23,7 +26,7 @@ struct RuntimeComponents {
         grid_vision;
     std::unique_ptr<MtpModule> mtp;
     Model* language_override = nullptr;
-    std::function<void(MfqInferenceEngine&, std::mutex&)> engine_binder;
+    std::function<void(mfq::engine::Engine&, std::mutex&)> engine_binder;
     bool vision_available = false;
     bool mtp_available = false;
 
@@ -41,6 +44,15 @@ template <typename Model>
 RuntimeComponents<Model> load_runtime_components(
     Model& model,
     bool load_optional_components);
+
+template <typename Model>
+std::unique_ptr<mfq::engine::ContinuousBatching>
+make_cuda_continuous_batching(
+    Model& model,
+    CudaExecutionContext& execution,
+    std::mutex& model_mutex,
+    const mfq::cuda::CudaContinuousBatchConfig& config,
+    mfq::engine::GenerationConfig generation);
 
 template <>
 RuntimeComponents<mfq::cuda::MiniCPMO45CausalLm>

@@ -25,8 +25,8 @@
 #include <utility>
 #include <vector>
 
-// The scheduler owns logical request admission and cancellation. This executor
-// owns CUDA batch assembly and the physical state carried between steps.
+// Shared engine code owns queueing, worker lifetime, and request transitions.
+// This adapter owns Qwen CUDA batch assembly and device state.
 
 namespace mfq::cuda::qwen35 {
 
@@ -417,11 +417,35 @@ struct QwenContinuousDecodeGraph {
     }
 };
 
-struct QwenBatchExecutor::Impl final : mfq::engine::ContinuousBatchExecutor {
-    Impl(
-            mfq::cuda::Qwen35CausalLm & model,
+struct QwenBatchRequest : mfq::engine::ContinuousBatchRequest {
+    QwenBatchRequest(
+            const std::vector<int64_t>& input_prompt,
+            const MfqSamplingParams& input_sampling,
+            const MfqTokenConstraintPtr& input_constraint,
+            const MfqCancellationCheck& input_cancelled)
+        : ContinuousBatchRequest(
+              input_prompt, input_sampling, input_constraint,
+              input_cancelled) {}
+
+    std::optional<mfq::cuda::Sampler> sampler;
+    Tensor counts;
+    Tensor prefill_ids;
+    std::optional<QwenBatchState> prefill_state;
+    std::vector<std::unique_ptr<PrefillCudaTimer>> prefill_timers;
+    int64_t prefill_offset = 0;
+    int64_t cache_length = 0;
+    QwenPagedKvSequence paged_kv;
+};
+
+struct QwenBatchOperations {
+    using Request = QwenBatchRequest;
+    using State = mfq::engine::ContinuousBatchState<Request>;
+    using Queue = mfq::engine::ContinuousBatchQueue<Request>;
+
+    QwenBatchOperations(
+            mfq::cuda::Qwen35CausalLm& model,
             CudaExecutionContext& execution,
-            std::mutex & model_mutex,
+            std::mutex& model_mutex,
             CudaContinuousBatchConfig config,
             mfq::engine::GenerationConfig generation)
         : model_(model), execution_(execution), model_mutex_(model_mutex),
@@ -431,8 +455,7 @@ struct QwenBatchExecutor::Impl final : mfq::engine::ContinuousBatchExecutor {
           prefill_chunk_size_(generation.prefill_chunk_size),
           moe_enabled_(qwen_continuous_batch_has_moe(model)),
           cached_moe_enabled_(
-              qwen_continuous_batch_has_cached_moe(model)),
-          queue_(config_.scheduling.max_sequences) {
+              qwen_continuous_batch_has_cached_moe(model)) {
         if (config_.scheduling.max_sequences >
                 static_cast<std::size_t>(
                     std::numeric_limits<int32_t>::max()) ||
@@ -453,69 +476,27 @@ struct QwenBatchExecutor::Impl final : mfq::engine::ContinuousBatchExecutor {
             paged_kv_ = std::make_unique<QwenPagedKvArena>(
                 model_, max_sequences_);
         }
-        worker_ = std::thread([this] { worker_main(); });
     }
 
-    ~Impl() override {
-        queue_.stop();
-        if (worker_.joinable()) worker_.join();
-    }
+    QwenBatchOperations(const QwenBatchOperations&) = delete;
+    QwenBatchOperations& operator=(const QwenBatchOperations&) = delete;
 
-    Impl(const Impl&) = delete;
-    Impl& operator=(const Impl&) = delete;
-
-    int32_t submit(
-            const std::vector<int64_t> & prompt,
-            const MfqSamplingParams & sampling,
-            const MfqTokenCallback & on_token,
-            const MfqPrefillCallback & on_prefill,
-            const MfqPromptCachePlan & cache_plan,
-            const MfqTokenConstraintPtr & token_constraint,
-            const MfqCancellationCheck & cancelled) override {
-        const auto plan = mfq::engine::plan_generation(
-            prompt, model_.vocab_size(), model_.max_position_embeddings(),
-            sampling.max_tokens, cache_plan.stable_prefix_tokens);
-        if (plan.generation_tokens == 0) return 0;
-        auto request = std::make_shared<Request>(
-            prompt, sampling, token_constraint, cancelled);
-        request->generation_limit = plan.generation_tokens;
-        if (!cache_plan.session_id.empty() ||
-                cache_plan.stable_prefix_tokens != 0) {
-            ++prefix_cache_bypasses_;
-        }
-        if (sampling.enable_mtp) ++mtp_bypasses_;
-        queue_.submit(request);
-        return request->consume(on_token, on_prefill, [this] {
-            queue_.notify();
-        });
-    }
-
-    std::vector<std::pair<std::string, double>> metrics() const override {
+    std::vector<std::pair<std::string, double>> metrics() const {
         return {
-            {"continuous_batching_max_sequences",
-                static_cast<double>(max_sequences_)},
-            {"continuous_batching_active",
-                static_cast<double>(active_count_.load())},
-            {"continuous_batching_prefilling",
-                static_cast<double>(prefilling_count_.load())},
-            {"continuous_batching_queued",
-                static_cast<double>(queue_.size())},
             {"continuous_batching_requests",
                 static_cast<double>(requests_.load())},
             {"continuous_batching_decode_batches",
                 static_cast<double>(decode_batches_.load())},
             {"continuous_batching_decode_tokens",
                 static_cast<double>(decode_tokens_.load())},
-            {"continuous_batching_max_batch",
-                static_cast<double>(max_batch_seen_.load())},
+
             {"continuous_batching_admissions",
                 static_cast<double>(admissions_.load())},
             {"continuous_batching_prefill_chunks",
                 static_cast<double>(prefill_chunks_.load())},
             {"continuous_batching_prefill_yields",
                 static_cast<double>(prefill_yields_.load())},
-            {"continuous_batching_interleaved_admissions",
-                static_cast<double>(interleaved_admissions_.load())},
+
             {"continuous_batching_compactions",
                 static_cast<double>(compactions_.load())},
             {"continuous_batching_batched_greedy_batches",
@@ -557,35 +538,10 @@ struct QwenBatchExecutor::Impl final : mfq::engine::ContinuousBatchExecutor {
         };
     }
 
-    int64_t queued_requests() const {
-        return static_cast<int64_t>(queue_.size());
-    }
-
     bool paged_kv_enabled() const noexcept { return paged_kv_ != nullptr; }
     int64_t paged_kv_page_size() const noexcept {
         return paged_kv_ ? paged_kv_->page_size() : 0;
     }
-
-private:
-    struct Request : mfq::engine::ContinuousBatchRequest {
-        Request(
-                const std::vector<int64_t> & input_prompt,
-                const MfqSamplingParams & input_sampling,
-                const MfqTokenConstraintPtr & input_constraint,
-                const MfqCancellationCheck & input_cancelled)
-            : ContinuousBatchRequest(
-                  input_prompt, input_sampling, input_constraint,
-                  input_cancelled) {}
-
-        std::optional<mfq::cuda::Sampler> sampler;
-        Tensor counts;
-        Tensor prefill_ids;
-        std::optional<QwenBatchState> prefill_state;
-        std::vector<std::unique_ptr<PrefillCudaTimer>> prefill_timers;
-        int64_t prefill_offset = 0;
-        int64_t cache_length = 0;
-        QwenPagedKvSequence paged_kv;
-    };
 
     void bind_paged_requests(
             const std::vector<std::shared_ptr<Request>> & requests) {
@@ -618,12 +574,6 @@ private:
         }
     }
 
-    std::vector<std::shared_ptr<Request>> take_pending(
-            size_t admission_limit) {
-        return queue_.take(
-            active_.size() + prefilling_.size(), admission_limit);
-    }
-
     void initialize_sampling(Request & request, const Tensor & prompt_ids) {
         const int primary = execution_.layer_placement.primary_device();
         const auto cuda_options = mfq_tensor_backend::TensorOptions()
@@ -649,37 +599,33 @@ private:
     }
 
     void advance_prefills(
-            const std::vector<std::shared_ptr<Request>> & incoming,
-            bool yield_after_chunk) {
-        for (const auto & request : incoming) {
-            prefilling_.push_back(request);
+            const std::vector<std::shared_ptr<Request>>& incoming,
+            bool yield_after_chunk,
+            State& state,
+            const Queue& queue) {
+        for (const auto& request : incoming) {
+            state.prefilling.push_back(request);
         }
-        prefilling_count_.store(
-            static_cast<int64_t>(prefilling_.size()),
-            std::memory_order_relaxed);
-        if (prefilling_.empty()) return;
+        if (state.prefilling.empty()) return;
         std::lock_guard<std::mutex> model_lock(model_mutex_);
         invalidate_decode_graph();
         const int primary = execution_.layer_placement.primary_device();
         MfqCudaGuard primary_guard(primary);
         std::vector<QwenBatchState> states;
-        states.reserve(1 + prefilling_.size());
-        if (!active_.empty()) {
+        states.reserve(1 + state.prefilling.size());
+        if (!state.active.empty()) {
             states.push_back(take_qwen_batch_state(
-                model_, static_cast<int64_t>(active_.size()),
+                model_, static_cast<int64_t>(state.active.size()),
                 paged_kv_.get()));
         }
         std::vector<std::shared_ptr<Request>> admitted;
-        admitted.reserve(prefilling_.size());
+        admitted.reserve(state.prefilling.size());
         int64_t chunks_advanced = 0;
-        while (!prefilling_.empty() &&
-                !queue_.stopping() &&
+        while (!state.prefilling.empty() &&
+                !queue.stopping() &&
                 (!yield_after_chunk || chunks_advanced == 0)) {
-            auto request = std::move(prefilling_.front());
-            prefilling_.pop_front();
-            prefilling_count_.store(
-                static_cast<int64_t>(prefilling_.size()),
-                std::memory_order_relaxed);
+            auto request = std::move(state.prefilling.front());
+            state.prefilling.pop_front();
             if (request->cancel_requested.load(std::memory_order_acquire)) {
                 try { mfq_cuda_synchronize(); } catch (...) {}
                 if (paged_kv_) {
@@ -747,7 +693,7 @@ private:
                     request->prefill_offset < request->prefill_ids.size(1) &&
                     !request->cancel_requested.load(
                         std::memory_order_acquire) &&
-                    !queue_.stopping());
+                    !queue.stopping());
                 if (request->cancel_requested.load(
                         std::memory_order_acquire)) {
                     try { mfq_cuda_synchronize(); } catch (...) {}
@@ -761,7 +707,7 @@ private:
                     request->complete();
                     continue;
                 }
-                if (queue_.stopping()) {
+                if (queue.stopping()) {
                     throw std::runtime_error(
                         "continuous batching scheduler stopped during prefill");
                 }
@@ -769,11 +715,8 @@ private:
                     request->prefill_state = take_qwen_batch_state(
                         model_, 1, paged_kv_.get());
                     detach_paged_kv();
-                    prefilling_.push_back(std::move(request));
+                    state.prefilling.push_back(std::move(request));
                     ++prefill_yields_;
-                    prefilling_count_.store(
-                        static_cast<int64_t>(prefilling_.size()),
-                        std::memory_order_relaxed);
                     continue;
                 }
                 auto logits = qwen_logits_from_last_hidden(
@@ -834,41 +777,32 @@ private:
                 request->complete(error);
             }
         }
-        active_.insert(active_.end(), admitted.begin(), admitted.end());
+        state.active.insert(
+            state.active.end(), admitted.begin(), admitted.end());
         if (!states.empty()) {
             int64_t max_cache_position = 0;
-            for (const auto & request : active_) {
+            for (const auto& request : state.active) {
                 max_cache_position = std::max(
                     max_cache_position, request->cache_length);
             }
             restore_qwen_batch_states(
                 model_, states, max_cache_position, paged_kv_.get());
-            bind_paged_requests(active_);
+            bind_paged_requests(state.active);
         } else {
             model_.reset(1);
             detach_paged_kv();
         }
-        active_count_.store(
-            static_cast<int64_t>(active_.size()),
-            std::memory_order_relaxed);
-        prefilling_count_.store(
-            static_cast<int64_t>(prefilling_.size()),
-            std::memory_order_relaxed);
-        int64_t previous = max_batch_seen_.load();
-        while (previous < static_cast<int64_t>(active_.size()) &&
-                !max_batch_seen_.compare_exchange_weak(
-                    previous, static_cast<int64_t>(active_.size()))) {}
     }
 
-    void retire_cancelled_requests() {
+    void retire_cancelled_requests(State& state) {
         std::vector<std::shared_ptr<Request>> survivors;
         std::vector<std::shared_ptr<Request>> cancelled;
         std::vector<int64_t> survivor_rows;
         int64_t survivor_max_position = 0;
-        survivors.reserve(active_.size());
-        survivor_rows.reserve(active_.size());
-        for (size_t row = 0; row < active_.size(); ++row) {
-            const auto & request = active_[row];
+        survivors.reserve(state.active.size());
+        survivor_rows.reserve(state.active.size());
+        for (size_t row = 0; row < state.active.size(); ++row) {
+            const auto& request = state.active[row];
             if (request->cancel_requested.load(
                     std::memory_order_acquire)) {
                 cancelled.push_back(request);
@@ -879,7 +813,7 @@ private:
             survivor_max_position = std::max(
                 survivor_max_position, request->cache_length);
         }
-        if (survivors.size() == active_.size()) return;
+        if (survivors.size() == state.active.size()) return;
         invalidate_decode_graph();
         if (survivors.empty()) {
             model_.reset(1);
@@ -893,11 +827,8 @@ private:
             bind_paged_requests(survivors);
             ++compactions_;
         }
-        active_ = std::move(survivors);
-        active_count_.store(
-            static_cast<int64_t>(active_.size()),
-            std::memory_order_relaxed);
-        for (const auto & request : cancelled) {
+        state.active = std::move(survivors);
+        for (const auto& request : cancelled) {
             request->complete();
         }
     }
@@ -921,34 +852,35 @@ private:
         if (decode_graph_) decode_graph_->invalidate();
     }
 
-    void decode_active() {
-        if (active_.empty()) return;
+    void decode_active(State& state) {
+        if (state.active.empty()) return;
         std::lock_guard<std::mutex> model_lock(model_mutex_);
         const int primary = execution_.layer_placement.primary_device();
         MfqCudaGuard primary_guard(primary);
-        retire_cancelled_requests();
-        if (active_.empty()) return;
+        retire_cancelled_requests(state);
+        if (state.active.empty()) return;
         if (paged_kv_) {
             bool page_table_changed = false;
-            for (const auto & request : active_) {
+            for (const auto& request : state.active) {
                 page_table_changed = paged_kv_->ensure_tokens(
                     request->paged_kv, request->cache_length + 1) ||
                     page_table_changed;
             }
-            if (page_table_changed) bind_paged_requests(active_);
+            if (page_table_changed) bind_paged_requests(state.active);
         }
-        const int64_t batch = static_cast<int64_t>(active_.size());
+        const int64_t batch = static_cast<int64_t>(state.active.size());
         const bool batch_greedy = std::all_of(
-            active_.begin(), active_.end(),
-            [](const std::shared_ptr<Request> & request) {
+            state.active.begin(), state.active.end(),
+            [](const std::shared_ptr<Request>& request) {
                 return request->sampler->greedy() &&
                     !request->sampler->has_penalties() &&
                     !request->token_constraint;
             });
         int64_t requested_len = 0;
         int64_t minimum_remaining =
-            active_.front()->generation_limit - active_.front()->produced;
-        for (const auto & request : active_) {
+            state.active.front()->generation_limit -
+            state.active.front()->produced;
+        for (const auto& request : state.active) {
             const int64_t remaining =
                 request->generation_limit - request->produced;
             minimum_remaining = std::min(minimum_remaining, remaining);
@@ -997,14 +929,14 @@ private:
             packed_metadata_data =
                 decode_metadata_host_.data_ptr<int64_t>();
         } else {
-            input_tokens.reserve(active_.size());
-            positions.reserve(active_.size());
-            sequence_lengths.reserve(active_.size());
+            input_tokens.reserve(state.active.size());
+            positions.reserve(state.active.size());
+            sequence_lengths.reserve(state.active.size());
         }
         int64_t max_position = 0;
         int64_t max_sequence_length = 0;
-        for (size_t row = 0; row < active_.size(); ++row) {
-            const auto & request = active_[row];
+        for (size_t row = 0; row < state.active.size(); ++row) {
+            const auto& request = state.active[row];
             if (packed_metadata_data != nullptr) {
                 packed_metadata_data[row] = request->pending_token;
                 packed_metadata_data[batch + row] = request->cache_length;
@@ -1098,11 +1030,10 @@ private:
             auto error = std::current_exception();
             invalidate_decode_graph();
             try { model_.reset(1); } catch (...) {}
-            fail_requests(active_, error);
-            release_paged_requests(active_);
+            fail_requests(state.active, error);
+            release_paged_requests(state.active);
             detach_paged_kv();
-            active_.clear();
-            active_count_.store(0);
+            state.active.clear();
             return;
         }
         ++decode_batches_;
@@ -1137,11 +1068,11 @@ private:
         std::vector<std::pair<std::shared_ptr<Request>,
             std::exception_ptr>> completions;
         std::vector<int64_t> survivor_rows;
-        survivors.reserve(active_.size());
-        survivor_rows.reserve(active_.size());
+        survivors.reserve(state.active.size());
+        survivor_rows.reserve(state.active.size());
         int64_t survivor_max_position = 0;
-        for (size_t row = 0; row < active_.size(); ++row) {
-            const auto & request = active_[row];
+        for (size_t row = 0; row < state.active.size(); ++row) {
+            const auto& request = state.active[row];
             request->cache_length += 1;
             if (request->cancel_requested.load(
                     std::memory_order_acquire)) {
@@ -1188,9 +1119,9 @@ private:
         if (survivors.empty()) {
             invalidate_decode_graph();
             model_.reset(1);
-            release_paged_requests(active_);
+            release_paged_requests(state.active);
             detach_paged_kv();
-        } else if (survivors.size() != active_.size()) {
+        } else if (survivors.size() != state.active.size()) {
             invalidate_decode_graph();
             compact_qwen_batch_state(
                 model_, survivor_rows, survivor_max_position,
@@ -1206,79 +1137,31 @@ private:
         } else {
             model_.cache_pos = survivor_max_position;
         }
-        active_ = std::move(survivors);
-        active_count_.store(
-            static_cast<int64_t>(active_.size()),
-            std::memory_order_relaxed);
-        for (const auto & completion : completions) {
+        state.active = std::move(survivors);
+        for (const auto& completion : completions) {
             completion.first->complete(completion.second);
         }
     }
 
-    void worker_main() noexcept {
-        for (;;) {
-            try {
-                if (!queue_.wait_for_work(
-                        !active_.empty() || !prefilling_.empty(),
-                        config_.scheduling.initial_batch_wait)) {
-                    auto error = std::make_exception_ptr(
-                        std::runtime_error(
-                            "continuous batching scheduler stopped"));
-                    auto pending = queue_.stop_and_drain();
-                    std::vector<std::shared_ptr<Request>> prefilling(
-                        prefilling_.begin(), prefilling_.end());
-                    prefilling_.clear();
-                    prefilling_count_.store(0);
-                    fail_requests(pending, error);
-                    fail_requests(prefilling, error);
-                    fail_requests(active_, error);
-                    try {
-                        std::lock_guard<std::mutex> model_lock(model_mutex_);
-                        try { mfq_cuda_synchronize(); } catch (...) {}
-                        release_paged_requests(prefilling);
-                        release_paged_requests(active_);
-                        model_.reset(1);
-                        detach_paged_kv();
-                    } catch (...) {}
-                    active_.clear();
-                    active_count_.store(0);
-                    return;
-                }
-                // CUDA kernels cannot be preempted. Service one decode step,
-                // then advance at most one prompt chunk while decode remains
-                // active. The partial Qwen state is detached until the next
-                // scheduler turn, bounding each decode stall to one chunk.
-                const bool decode_was_active = !active_.empty();
-                if (decode_was_active) decode_active();
-                const bool contended = !active_.empty();
-                auto incoming = take_pending(contended
-                    ? size_t{1}
-                    : static_cast<size_t>(max_sequences_));
-                if (contended && !incoming.empty()) {
-                    ++interleaved_admissions_;
-                }
-                advance_prefills(incoming, contended);
-                if (!decode_was_active) decode_active();
-            } catch (...) {
-                auto error = std::current_exception();
-                std::vector<std::shared_ptr<Request>> prefilling(
-                    prefilling_.begin(), prefilling_.end());
-                fail_requests(active_, error);
-                fail_requests(prefilling, error);
-                try {
-                    std::lock_guard<std::mutex> model_lock(model_mutex_);
-                    try { mfq_cuda_synchronize(); } catch (...) {}
-                    release_paged_requests(active_);
-                    release_paged_requests(prefilling);
-                    model_.reset(1);
-                    detach_paged_kv();
-                } catch (...) {}
-                active_.clear();
-                prefilling_.clear();
-                active_count_.store(0);
-                prefilling_count_.store(0);
-            }
-        }
+    void shutdown(
+            const std::vector<std::shared_ptr<Request>>& pending,
+            State& state,
+            std::exception_ptr error) {
+        std::vector<std::shared_ptr<Request>> prefilling(
+            state.prefilling.begin(), state.prefilling.end());
+        fail_requests(pending, error);
+        fail_requests(prefilling, error);
+        fail_requests(state.active, error);
+        std::lock_guard<std::mutex> model_lock(model_mutex_);
+        try { mfq_cuda_synchronize(); } catch (...) {}
+        release_paged_requests(prefilling);
+        release_paged_requests(state.active);
+        model_.reset(1);
+        detach_paged_kv();
+    }
+
+    void recover(State& state, std::exception_ptr error) {
+        shutdown({}, state, error);
     }
 
     mfq::cuda::Qwen35CausalLm & model_;
@@ -1289,20 +1172,12 @@ private:
     int64_t prefill_chunk_size_ = 2048;
     bool moe_enabled_ = false;
     bool cached_moe_enabled_ = false;
-    mfq::engine::ContinuousBatchQueue<Request> queue_;
-    std::thread worker_;
-    std::deque<std::shared_ptr<Request>> prefilling_;
-    std::vector<std::shared_ptr<Request>> active_;
-    std::atomic<int64_t> active_count_{0};
-    std::atomic<int64_t> prefilling_count_{0};
     std::atomic<int64_t> requests_{0};
     std::atomic<int64_t> decode_batches_{0};
     std::atomic<int64_t> decode_tokens_{0};
-    std::atomic<int64_t> max_batch_seen_{0};
     std::atomic<int64_t> admissions_{0};
     std::atomic<int64_t> prefill_chunks_{0};
     std::atomic<int64_t> prefill_yields_{0};
-    std::atomic<int64_t> interleaved_admissions_{0};
     std::atomic<int64_t> compactions_{0};
     std::atomic<int64_t> batched_greedy_batches_{0};
     std::atomic<int64_t> packed_metadata_batches_{0};
@@ -1314,6 +1189,69 @@ private:
     Tensor decode_metadata_cuda_;
     std::unique_ptr<QwenPagedKvArena> paged_kv_;
     std::unique_ptr<QwenContinuousDecodeGraph> decode_graph_;
+};
+
+struct QwenBatchExecutor::Impl {
+    using Controller = mfq::engine::ContinuousBatchingController<
+        QwenBatchRequest, QwenBatchOperations>;
+
+    Impl(
+            Qwen35CausalLm& model,
+            CudaExecutionContext& execution,
+            std::mutex& model_mutex,
+            const CudaContinuousBatchConfig& config,
+            mfq::engine::GenerationConfig generation)
+        : controller_(
+              config.scheduling,
+              std::make_unique<QwenBatchOperations>(
+                  model, execution, model_mutex, config, generation)) {}
+
+    int32_t submit(
+            const std::vector<int64_t>& prompt,
+            const MfqSamplingParams& sampling,
+            const MfqTokenCallback& on_token,
+            const MfqPrefillCallback& on_prefill,
+            const MfqPromptCachePlan& cache_plan,
+            const MfqTokenConstraintPtr& token_constraint,
+            const MfqCancellationCheck& cancelled) {
+        auto& operations = controller_.operations();
+        const auto plan = mfq::engine::plan_generation(
+            prompt, operations.model_.vocab_size(),
+            operations.model_.max_position_embeddings(),
+            sampling.max_tokens, cache_plan.stable_prefix_tokens);
+        if (plan.generation_tokens == 0) return 0;
+        auto request = std::make_shared<QwenBatchRequest>(
+            prompt, sampling, token_constraint, cancelled);
+        request->generation_limit = plan.generation_tokens;
+        if (!cache_plan.session_id.empty() ||
+                cache_plan.stable_prefix_tokens != 0) {
+            ++operations.prefix_cache_bypasses_;
+        }
+        if (sampling.enable_mtp) ++operations.mtp_bypasses_;
+        return controller_.submit(request, on_token, on_prefill);
+    }
+
+    std::vector<std::pair<std::string, double>> metrics() const {
+        const auto& operations = controller_.operations();
+        auto result = controller_.metrics();
+        auto backend = operations.metrics();
+        result.insert(result.end(), backend.begin(), backend.end());
+        return result;
+    }
+
+    int64_t queued_requests() const {
+        return static_cast<int64_t>(controller_.queued());
+    }
+
+    bool paged_kv_enabled() const noexcept {
+        return controller_.operations().paged_kv_enabled();
+    }
+
+    int64_t paged_kv_page_size() const noexcept {
+        return controller_.operations().paged_kv_page_size();
+    }
+
+    Controller controller_;
 };
 
 QwenBatchExecutor::QwenBatchExecutor(

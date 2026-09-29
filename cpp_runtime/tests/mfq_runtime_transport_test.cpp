@@ -43,7 +43,8 @@ public:
 
 int main() {
     static_assert(std::is_abstract_v<MfqTransport>);
-    MfqInferenceEngine engine;
+    static_assert(std::is_abstract_v<mfq::engine::Engine>);
+    mfq::engine::CallbackEngine engine;
     engine.generate = [](
             const std::vector<int64_t>& prompt,
             const MfqSamplingParams&,
@@ -61,7 +62,7 @@ int main() {
         std::move(engine), std::make_unique<TestTransport>());
     assert(runtime.run() == 1);
 
-    MfqInferenceEngine queued_engine;
+    mfq::engine::CallbackEngine queued_engine;
     queued_engine.max_concurrent_requests = 1;
     std::mutex gate;
     std::condition_variable changed;

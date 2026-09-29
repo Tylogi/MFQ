@@ -32,9 +32,6 @@ KlMmqMode parse_kl_mmq_mode(const std::string& value);
 std::vector<KlMmqMode> parse_kl_mmq_sequence(const std::string& value);
 std::vector<int64_t> load_ids_file(const std::string& path);
 
-int run_cuda_token_generation(
-    CudaLoadOptions& load_options,
-    const TokenInputOptions& token_options);
 int with_command_errors(const std::function<int()>& fn);
 
 } // namespace mfq::cuda::internal

@@ -44,10 +44,15 @@ RUNTIME_OPTIONS = (
 def test_continuous_batching_is_an_explicit_server_mode():
     assert '"--continuous-batching"' in DECODE
     assert '"--check-continuous-batching"' in DECODE
-    assert "ContinuousBatchExecutor" in COMMON_BATCHING
+    assert "class ContinuousBatching" in COMMON_BATCHING
     assert "class ContinuousBatchQueue" in COMMON_BATCHING
+    assert "class ContinuousBatchingController" in COMMON_BATCHING
+    assert "std::thread worker_" in COMMON_BATCHING
+    assert "State state_" in COMMON_BATCHING
     assert "QwenBatchExecutor final" in BATCHING
-    assert "ContinuousBatchQueue<Request> queue_" in BATCHING
+    assert "ContinuousBatchingController<" in BATCHING
+    assert "worker_" not in BATCHING
+    assert "queue_" not in BATCHING
     assert "queue_mutex_" not in BATCHING
     assert "decode=target_only mtp=disabled" in DECODE
 
@@ -58,10 +63,11 @@ def test_cuda_server_prefill_is_bounded_for_serial_mtp_and_batched_paths():
     assert "hidden_forward_chunked(" in DECODE
     assert "prefill_chunk_size_" in BATCHING
     assert "std::optional<QwenBatchState> prefill_state" in BATCHING
-    assert "advance_prefills(incoming, contended)" in BATCHING
+    assert "operations_->advance_prefills(" in COMMON_BATCHING
+    assert "void advance_prefills(" in BATCHING
     assert "request->prefill_offset += chunk.count" in BATCHING
     assert "next_prefill_chunk(" in BATCHING
-    assert "active_.size() + prefilling_.size()" in BATCHING
+    assert "state_.active.size() + state_.prefilling.size()" in COMMON_BATCHING
     assert "continuous_batching_prefill_chunks" in BATCHING
     assert "continuous_batching_prefill_yields" in BATCHING
 
@@ -73,8 +79,9 @@ def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
     assert "mfq::cuda::sample_logits" in BATCHING
     assert "request->sampler" in BATCHING
     assert "request->token_constraint" in BATCHING
-    assert "pending_" in BATCHING
-    assert "active_" in BATCHING
+    assert "pending_" in COMMON_BATCHING
+    assert "state_.active" in COMMON_BATCHING
+    assert "state.active" in BATCHING
     assert "output_tokens_" in COMMON_BATCHING
     assert "publish_token" in COMMON_BATCHING
     assert "cancel_requested" in COMMON_BATCHING
@@ -129,13 +136,13 @@ def test_generic_qwen_loader_constructs_moe_ffns():
 
 
 def test_scheduler_services_decode_before_contended_prefill_admission():
-    decode_first = "if (decode_was_active) decode_active();"
-    limited_join = "? size_t{1}"
-    admission = "advance_prefills(incoming, contended);"
-    assert decode_first in BATCHING
-    assert limited_join in BATCHING
-    assert BATCHING.index(decode_first) < BATCHING.index(admission)
-    assert "continuous_batching_interleaved_admissions" in BATCHING
+    decode_first = "operations_->decode_active(state_);"
+    limited_join = "contended ? std::size_t{1}"
+    admission = "operations_->advance_prefills("
+    assert decode_first in COMMON_BATCHING
+    assert limited_join in COMMON_BATCHING
+    assert COMMON_BATCHING.index(decode_first) < COMMON_BATCHING.index(admission)
+    assert "interleaved_admissions_" in COMMON_BATCHING
 
 
 def test_qwen_decode_accepts_independent_batch_positions():

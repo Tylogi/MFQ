@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq/runtime.h"
+#include "engine.h"
 
 #include <atomic>
 #include <functional>
@@ -33,7 +33,7 @@ private:
 // engine. Backend-specific batch execution remains inside the engine callback.
 class MfqScheduler {
 public:
-    explicit MfqScheduler(const MfqInferenceEngine & engine);
+    explicit MfqScheduler(const mfq::engine::Engine& engine);
     ~MfqScheduler();
 
     bool supports_generation() const noexcept;
@@ -116,6 +116,6 @@ private:
         const MfqPromptCachePlan & cache_plan,
         const MfqTokenConstraintPtr & token_constraint) const;
 
-    const MfqInferenceEngine & engine_;
+    const mfq::engine::Engine& engine_;
     std::shared_ptr<State> state_;
 };

@@ -171,17 +171,3 @@ struct MfqSessionControl {
     std::function<size_t()> clear;
     std::function<uint64_t(uint64_t target_bytes)> trim_hot;
 };
-
-// Backend-neutral inference engine consumed by the runtime scheduler.
-// Transport and process lifecycle stay outside the engine.
-struct MfqInferenceEngine {
-    // Logical requests admitted by the scheduler may execute concurrently.
-    // Backends still own physical batching and model-state synchronization.
-    size_t max_concurrent_requests = 1;
-    MfqGenerateFn generate;
-    MfqReloadFn reload;
-    MfqDuplexBackend duplex;
-    MfqSessionControl session_control;
-    MfqMultimodalGenerateFn multimodal_generate;
-    MfqRuntimeMetricsFn runtime_metrics;
-};

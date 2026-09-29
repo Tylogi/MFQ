@@ -105,6 +105,47 @@ struct FakeMtp : FakeModel {
         return 2;
     }
 };
+
+struct FakeContinuousOperations {
+    template <typename State, typename Queue>
+    void advance_prefills(
+            const std::vector<std::shared_ptr<
+                mfq::engine::ContinuousBatchRequest>>& incoming,
+            bool,
+            State& state,
+            const Queue&) {
+        for (const auto& request : incoming) {
+            request->publish_prefill(
+                {request->prompt.size(), 1.0, 0.0, 1.0});
+            state.active.push_back(request);
+        }
+    }
+
+    template <typename State>
+    void decode_active(State& state) {
+        for (const auto& request : state.active) {
+            request->publish_token(7);
+            request->complete();
+        }
+        state.active.clear();
+    }
+
+    template <typename State>
+    void shutdown(
+            const std::vector<std::shared_ptr<
+                mfq::engine::ContinuousBatchRequest>>& pending,
+            State& state,
+            std::exception_ptr error) {
+        for (const auto& request : pending) request->complete(error);
+        for (const auto& request : state.prefilling) request->complete(error);
+        for (const auto& request : state.active) request->complete(error);
+    }
+
+    template <typename State>
+    void recover(State& state, std::exception_ptr error) {
+        shutdown({}, state, error);
+    }
+};
 }
 
 int main() {
@@ -143,6 +184,25 @@ int main() {
         });
     producer.join();
     require(batch_tokens == 1 && batch_prefilled);
+
+    mfq::engine::ContinuousBatchConfig batch_config;
+    batch_config.max_sequences = 2;
+    batch_config.initial_batch_wait = std::chrono::microseconds(0);
+    mfq::engine::ContinuousBatchingController<
+        mfq::engine::ContinuousBatchRequest,
+        FakeContinuousOperations> batch_controller(
+            batch_config, std::make_unique<FakeContinuousOperations>());
+    auto controlled_request = std::make_shared<
+        mfq::engine::ContinuousBatchRequest>(
+            std::vector<int64_t>{1, 2}, MfqSamplingParams{}, nullptr);
+    batch_controller.submit(controlled_request);
+    bool controlled_prefill = false;
+    require(controlled_request->consume(
+        [](int64_t token) { return token == 7; },
+        [&](const MfqPrefillTiming& timing) {
+            controlled_prefill = timing.prompt_tokens == 2;
+        }) == 1);
+    require(controlled_prefill && batch_controller.max_batch() == 1);
 
     using BatchRequest = mfq::engine::ContinuousBatchRequest;
     mfq::engine::ContinuousBatchQueue<BatchRequest> queue(2);

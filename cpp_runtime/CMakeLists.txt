@@ -35,7 +35,6 @@ endif()
 add_subdirectory(components/json)
 add_subdirectory(core)
 add_subdirectory(models)
-add_subdirectory(scheduler)
 
 if(MFQ_BUILD_RUNTIME_COMMUNICATION)
     add_subdirectory(components/ggml)
@@ -44,6 +43,7 @@ if(MFQ_BUILD_RUNTIME_COMMUNICATION)
 endif()
 
 add_subdirectory(engine)
+add_subdirectory(scheduler)
 
 if(MFQ_BUILD_RUNTIME_COMMUNICATION)
     add_subdirectory(transport)

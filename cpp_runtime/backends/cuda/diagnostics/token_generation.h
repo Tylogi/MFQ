@@ -16,7 +16,7 @@
 namespace mfq::cuda::internal {
 
 template <typename Model>
-int generate_cli_tokens(Model& model, mfq_tensor_backend::Tensor ids,
+int generate_diagnostic_tokens(Model& model, mfq_tensor_backend::Tensor ids,
         int gen, bool profile,
         std::chrono::steady_clock::time_point t0,
         std::chrono::steady_clock::time_point t1) {

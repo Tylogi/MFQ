@@ -80,7 +80,7 @@ def test_prepared_prompt_supports_mtp_and_safe_session_reuse() -> None:
     assert "(!prepared || !prepared->transformed()) && !constraint" in CUDA_APP
     assert "state->components.grid_vision->prepare(" in CUDA_APP
     assert "state->components.mtp.get()" in CUDA_APP
-    assert "batch_executor->submit(" in CUDA_APP
+    assert "continuous_batching->submit(" in CUDA_APP
 
 
 def test_batched_text_positions_do_not_select_grid_mrope_sections() -> None:

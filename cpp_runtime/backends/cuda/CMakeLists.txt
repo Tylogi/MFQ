@@ -288,7 +288,6 @@ add_library(mfq-cuda-runtime STATIC
     ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
     ${MFQ_CUDA_ROOT}/commands/cli.cpp
     ${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp
-    ${MFQ_CUDA_ROOT}/commands/token_generation.cpp
     ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
     ${MFQ_CUDA_MODEL_SOURCES}
 )
@@ -396,19 +395,21 @@ if(BUILD_TESTING)
     add_test(NAME mfq-diagnostics-help COMMAND mfq-diagnostics --help)
     add_test(NAME mfq-eval-help COMMAND mfq-eval --help)
     add_test(NAME mfq-eval-kl-help COMMAND mfq-eval kl --help)
-    add_test(NAME mfq-runtime-cli-options COMMAND mfq-runtime --ids 1,2 --gen 3 --help)
-    add_test(NAME mfq-diagnostics-cli-options COMMAND mfq-diagnostics --check-linear x --kl-mmq default --help)
+    add_test(NAME mfq-runtime-cli-options COMMAND mfq-runtime --transport stdio --continuous-batching 2 --help)
+    add_test(NAME mfq-diagnostics-cli-options COMMAND mfq-diagnostics --ids 1,2 --gen 3 --help)
     add_test(NAME mfq-eval-cli-options COMMAND mfq-eval kl --kl-base x --kl-evaluator optimized --help)
     add_test(NAME mfq-runtime-rejects-check
         COMMAND mfq-runtime --check-mfq-container)
     add_test(NAME mfq-runtime-rejects-kl
         COMMAND mfq-runtime --kl-base reference.bin)
     add_test(NAME mfq-runtime-rejects-bad-number
-        COMMAND mfq-runtime --gen 3x --help)
+        COMMAND mfq-runtime --port 3x --help)
     add_test(NAME mfq-runtime-rejects-missing-value
         COMMAND mfq-runtime --model --help)
-    add_test(NAME mfq-runtime-rejects-bad-ids
-        COMMAND mfq-runtime --ids 1,x --help)
+    add_test(NAME mfq-runtime-rejects-token-input
+        COMMAND mfq-runtime --ids 1,2 --help)
+    add_test(NAME mfq-diagnostics-rejects-bad-ids
+        COMMAND mfq-diagnostics --ids 1,x --help)
     add_test(NAME mfq-diagnostics-rejects-kl
         COMMAND mfq-diagnostics --kl-base reference.bin)
     add_test(NAME mfq-diagnostics-rejects-missing-value
@@ -420,7 +421,8 @@ if(BUILD_TESTING)
     set_tests_properties(
         mfq-runtime-rejects-check mfq-runtime-rejects-kl
         mfq-runtime-rejects-bad-number mfq-runtime-rejects-missing-value
-        mfq-runtime-rejects-bad-ids mfq-diagnostics-rejects-kl mfq-diagnostics-rejects-missing-value
+        mfq-runtime-rejects-token-input mfq-diagnostics-rejects-bad-ids
+        mfq-diagnostics-rejects-kl mfq-diagnostics-rejects-missing-value
         mfq-eval-rejects-check mfq-eval-rejects-bad-number
         PROPERTIES WILL_FAIL TRUE)
 endif()
@@ -448,7 +450,6 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         ${MFQ_CUDA_ROOT}/apps/runtime_main.cpp
         ${MFQ_CUDA_ROOT}/commands/runtime.cpp
         ${MFQ_CUDA_ROOT}/commands/cli.cpp
-        ${MFQ_CUDA_ROOT}/commands/token_generation.cpp
         ${MFQ_CUDA_RUNTIME_OP_SOURCES}
         ${MFQ_CUDA_ROOT}/engine/cuda_engine.cpp
         ${MFQ_CUDA_ROOT}/engine/generation.cpp

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "options.h"
-#include "mfq/runtime.h"
+#include "engine.h"
 
 #include <cstdint>
 #include <memory>
@@ -32,10 +32,10 @@ struct CudaEngineMetadata {
     CudaEngineCapabilities capabilities;
 };
 
-struct CudaInferenceEngine final : MfqInferenceEngine {
+struct CudaEngine final : mfq::engine::Engine {
     CudaEngineMetadata metadata;
 };
 
-CudaInferenceEngine load_cuda_engine(CudaEngineOptions options);
+CudaEngine load_cuda_engine(CudaEngineOptions options);
 
 } // namespace mfq::cuda

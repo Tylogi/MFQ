@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq/runtime.h"
+#include "engine.h"
 #include "scheduler.h"
 
 #include <cstdint>
@@ -8,6 +8,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -91,22 +92,40 @@ public:
 class MfqRuntime {
 public:
     MfqRuntime(
-            MfqInferenceEngine engine,
+            std::unique_ptr<mfq::engine::Engine> engine,
             std::unique_ptr<MfqTransport> transport)
-        : engine_(std::move(engine)),
-          scheduler_(engine_),
+        : engine_(require_engine(std::move(engine))),
+          scheduler_(*engine_),
           transport_(std::move(transport)) {
         if (!transport_) {
             throw std::invalid_argument("MFQ runtime requires a transport");
         }
     }
 
+    template <typename ConcreteEngine,
+              std::enable_if_t<std::is_base_of_v<
+                  mfq::engine::Engine, ConcreteEngine>, int> = 0>
+    MfqRuntime(
+            ConcreteEngine engine,
+            std::unique_ptr<MfqTransport> transport)
+        : MfqRuntime(
+              std::make_unique<ConcreteEngine>(std::move(engine)),
+              std::move(transport)) {}
+
     int run() {
         return transport_->run(scheduler_);
     }
 
 private:
-    MfqInferenceEngine engine_;
+    static std::unique_ptr<mfq::engine::Engine> require_engine(
+            std::unique_ptr<mfq::engine::Engine> engine) {
+        if (!engine) {
+            throw std::invalid_argument("MFQ runtime requires an engine");
+        }
+        return engine;
+    }
+
+    std::unique_ptr<mfq::engine::Engine> engine_;
     MfqScheduler scheduler_;
     std::unique_ptr<MfqTransport> transport_;
 };

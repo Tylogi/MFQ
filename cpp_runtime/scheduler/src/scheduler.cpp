@@ -58,7 +58,7 @@ void MfqScheduledRequest::finish() {
     release();
 }
 
-MfqScheduler::MfqScheduler(const MfqInferenceEngine & engine)
+MfqScheduler::MfqScheduler(const mfq::engine::Engine& engine)
     : engine_(engine),
       state_(std::make_shared<State>(engine.max_concurrent_requests)) {}
 

@@ -1,4 +1,5 @@
 #include "components.h"
+#include "qwen35/batch_executor.h"
 #include "storage/moe_expert_cache.h"
 
 #include <iostream>
@@ -99,9 +100,30 @@ RuntimeComponents<Model> load_runtime_components(
     return result;
 }
 
+template <typename Model>
+std::unique_ptr<mfq::engine::ContinuousBatching>
+make_cuda_continuous_batching(
+        Model& model,
+        CudaExecutionContext& execution,
+        std::mutex& model_mutex,
+        const mfq::cuda::CudaContinuousBatchConfig& config,
+        mfq::engine::GenerationConfig generation) {
+    if constexpr (
+            Model::backbone == mfq::cuda::CudaBackbone::generic_qwen) {
+        return std::make_unique<mfq::cuda::qwen35::QwenBatchExecutor>(
+            model, execution, model_mutex, config, generation);
+    }
+    return {};
+}
+
 #define MFQ_INSTANTIATE_COMPONENTS(TYPE)                                    \
     template RuntimeComponents<TYPE> load_runtime_components(               \
-        TYPE&, bool)
+        TYPE&, bool);                                                       \
+    template std::unique_ptr<mfq::engine::ContinuousBatching>               \
+    make_cuda_continuous_batching(                                          \
+        TYPE&, CudaExecutionContext&, std::mutex&,                          \
+        const mfq::cuda::CudaContinuousBatchConfig&,                        \
+        mfq::engine::GenerationConfig)
 
 MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::Qwen35CausalLm);
 MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::Gemma4CausalLm);
@@ -111,4 +133,15 @@ MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::Qwen4CausalLm);
 MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::DeepseekV4CausalLm);
 MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::DeepseekV41CausalLm);
 
+#define MFQ_INSTANTIATE_BATCHING(TYPE)                                      \
+    template std::unique_ptr<mfq::engine::ContinuousBatching>               \
+    make_cuda_continuous_batching(                                          \
+        TYPE&, CudaExecutionContext&, std::mutex&,                          \
+        const mfq::cuda::CudaContinuousBatchConfig&,                        \
+        mfq::engine::GenerationConfig)
+
+MFQ_INSTANTIATE_BATCHING(mfq::cuda::MiniCPMO45CausalLm);
+MFQ_INSTANTIATE_BATCHING(mfq::cuda::MiniCPMOTtsCausalLm);
+
+#undef MFQ_INSTANTIATE_BATCHING
 #undef MFQ_INSTANTIATE_COMPONENTS

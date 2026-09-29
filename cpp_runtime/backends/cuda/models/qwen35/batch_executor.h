@@ -24,9 +24,9 @@ namespace mfq::cuda::qwen35 {
 bool qwen_continuous_batch_has_moe(const Qwen35CausalLm& model);
 bool qwen_continuous_batch_has_cached_moe(const Qwen35CausalLm& model);
 
-// Scheduler admission is backend-neutral. This executor owns only physical
-// CUDA batch packing and per-sequence device state.
-class QwenBatchExecutor final : public mfq::engine::ContinuousBatchExecutor {
+// The shared controller owns queueing and request lifecycle. This adapter
+// supplies Qwen CUDA batch operations and per-sequence device state.
+class QwenBatchExecutor final : public mfq::engine::ContinuousBatching {
 public:
     QwenBatchExecutor(
         Qwen35CausalLm& model,
