@@ -17,10 +17,9 @@ auto with_loaded_cuda_model(const CudaLoadOptions& options,
         bool load_optional_components, F&& run) {
     auto& execution = cuda_execution_context();
     auto source = mfq::open_model_source(options.model_path);
-    auto load = [&]<CudaBackbone Backbone>() {
-        using Model = CausalLmFor<Backbone>;
+    auto load = [&]<typename Model>() {
         auto started = std::chrono::steady_clock::now();
-        Model model = load_causal_lm<Backbone>(
+        Model model = load_causal_lm<Model>(
             execution,
             options.model_path,
             options.config_path,
@@ -37,29 +36,28 @@ auto with_loaded_cuda_model(const CudaLoadOptions& options,
         mfq_cuda_synchronize();
         auto loaded = std::chrono::steady_clock::now();
         report_cuda_memory("loaded");
-        return run.template operator()<Backbone>(
-            model, runtime_components, started, loaded);
+        return run(model, runtime_components, started, loaded);
     };
 
-    switch (cuda_model_plan(source->resolved_model_graph()).backbone) {
+    switch (cuda_backbone(source->resolved_model_graph().backbone)) {
         case CudaBackbone::generic_qwen:
-            return load.template operator()<CudaBackbone::generic_qwen>();
+            return load.template operator()<Qwen35CausalLm>();
         case CudaBackbone::minicpmo45:
-            return load.template operator()<CudaBackbone::minicpmo45>();
+            return load.template operator()<MiniCPMO45CausalLm>();
         case CudaBackbone::minicpmo_tts:
-            return load.template operator()<CudaBackbone::minicpmo_tts>();
+            return load.template operator()<MiniCPMOTtsCausalLm>();
         case CudaBackbone::gemma4:
-            return load.template operator()<CudaBackbone::gemma4>();
+            return load.template operator()<Gemma4CausalLm>();
         case CudaBackbone::glm_dsa:
-            return load.template operator()<CudaBackbone::glm_dsa>();
+            return load.template operator()<GlmDsaCausalLm>();
         case CudaBackbone::glm5_next:
-            return load.template operator()<CudaBackbone::glm5_next>();
+            return load.template operator()<Glm5CausalLm>();
         case CudaBackbone::qwen4_exp:
-            return load.template operator()<CudaBackbone::qwen4_exp>();
+            return load.template operator()<Qwen4CausalLm>();
         case CudaBackbone::deepseek_v4:
-            return load.template operator()<CudaBackbone::deepseek_v4>();
+            return load.template operator()<DeepseekV4CausalLm>();
         case CudaBackbone::deepseek_v41:
-            return load.template operator()<CudaBackbone::deepseek_v41>();
+            return load.template operator()<DeepseekV41CausalLm>();
         case CudaBackbone::unsupported:
             throw std::runtime_error("unsupported CUDA model backbone");
     }

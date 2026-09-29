@@ -2,7 +2,11 @@
 #include "linear_attention.h"
 
 #include "../causal_lm.h"
+#include "../components.h"
 #include "models/transformer.h"
+#include "storage/moe_expert_cache.h"
+
+#include <iostream>
 
 namespace mfq::cuda::qwen35 {
 namespace {
@@ -379,9 +383,11 @@ TextSessionState capture_text_session_state(
     }
     TextSessionState state;
     state.tokens = tokens;
-    state.kind = TextSessionStateKind::HybridAttention;
     state.cache_pos = cache_position;
-    state.hybrid_blocks.reserve(blocks.size());
+    state.payload = std::vector<HybridBlockSessionState>{};
+    auto& layers = std::get<std::vector<HybridBlockSessionState>>(
+        state.payload);
+    layers.reserve(blocks.size());
     for (const auto& block : blocks) {
         MfqCudaGuard guard(block->cuda_device);
         HybridBlockSessionState saved;
@@ -406,7 +412,7 @@ TextSessionState capture_text_session_state(
             throw std::runtime_error(
                 "Qwen hybrid session layer type changed");
         }
-        state.hybrid_blocks.push_back(std::move(saved));
+        layers.push_back(std::move(saved));
     }
     return state;
 }
@@ -414,20 +420,23 @@ TextSessionState capture_text_session_state(
 void restore_text_session_state(
         std::vector<std::unique_ptr<::Block>>& blocks,
         const TextSessionState& state) {
-    if (state.kind != TextSessionStateKind::HybridAttention ||
+    const auto* layers = std::get_if<
+        std::vector<HybridBlockSessionState>>(&state.payload);
+    if (state.kind() != TextSessionStateKind::HybridAttention ||
             state.cache_pos <= 0 ||
             state.tokens.size() != static_cast<std::size_t>(state.cache_pos) ||
-            state.hybrid_blocks.size() != blocks.size()) {
-        throw std::runtime_error("Qwen hybrid session state is incompatible");
+            layers == nullptr || layers->size() != blocks.size()) {
+        throw CudaSessionStateError(
+            "Qwen hybrid session state is incompatible");
     }
     for (std::size_t index = 0; index < blocks.size(); ++index) {
         auto& block = blocks[index];
-        const auto& saved = state.hybrid_blocks[index];
+        const auto& saved = (*layers)[index];
         MfqCudaGuard guard(block->cuda_device);
         if (saved.kind == HybridBlockSessionStateKind::FullAttention) {
             auto* full = dynamic_cast<FullBlock*>(block.get());
             if (full == nullptr) {
-                throw std::runtime_error(
+                throw CudaSessionStateError(
                     "Qwen hybrid full-attention layer changed");
             }
             restore_full_attention_session_state(
@@ -462,7 +471,7 @@ void restore_text_session_state(
                 !saved.recurrent_state.is_cuda() ||
                 saved.convolution_state.get_device() != block->cuda_device ||
                 saved.recurrent_state.get_device() != block->cuda_device) {
-            throw std::runtime_error(
+            throw CudaSessionStateError(
                 "Qwen recurrent session topology changed");
         }
         restore_session_tensor(
@@ -476,3 +485,191 @@ void restore_text_session_state(
 }
 
 } // namespace mfq::cuda::qwen35
+
+namespace mfq::cuda {
+
+void Qwen35Model::adapter_load_config(
+        std::string_view payload,
+        const mfq::ModelGraph& graph,
+        const mfq::ModelSource& source) {
+    config = qwen35::Config::from_json(payload, graph);
+    config.legacy_tensor_layout =
+        source.legacy_tensor_compatibility().layout;
+    metadata.vocab_size = config.vocab_size;
+    metadata.hidden_size = config.hidden_size;
+    metadata.num_hidden_layers = config.num_hidden_layers;
+    metadata.num_attention_heads = config.num_attention_heads;
+    metadata.num_key_value_heads = config.num_key_value_heads;
+    metadata.head_dim = config.head_dim;
+    metadata.max_position_embeddings = config.max_position_embeddings;
+    metadata.rotary_dim = config.rotary_dim;
+    metadata.num_experts = config.num_experts;
+    metadata.rope_base = config.rope_base;
+    metadata.rms_norm_eps = config.rms_norm_eps;
+    metadata.norm_weight_offset =
+        config.legacy_tensor_layout.norm_weight_offset;
+    metadata.tie_word_embeddings = config.tie_word_embeddings;
+    metadata.model_type = config.model_type;
+    metadata.layer_types = config.layer_types;
+    if (graph.component("vision") != nullptr &&
+            cuda_model_plan(graph).vision != CudaVisionAdapter::grid_vit) {
+        throw std::runtime_error(
+            "Qwen CUDA vision requires grid_vit/grid_vision.v1/grid_mrope");
+    }
+}
+
+void Qwen35Model::adapter_configure_rope(
+        RopeCache& rope,
+        mfq_tensor_backend::Device device) const {
+    rope.configure_mrope(
+        config.mrope_sections,
+        config.mrope_interleaved,
+        config.rotary_dim,
+        device);
+}
+
+bool Qwen35Model::adapter_uses_common_rope() const noexcept {
+    return true;
+}
+
+bool Qwen35Model::adapter_supports_dense_cpu_offload() const noexcept {
+    return true;
+}
+
+std::unique_ptr<Block>
+Qwen35Model::adapter_load_block(
+        const mfq::ModelSource& source,
+        int layer,
+        int,
+        const std::string& type) {
+    return qwen35::load_block(source, config, layer, type);
+}
+
+TextSessionStateKind
+CudaSessionCodec<Qwen35Model>::kind(const Model& model) {
+    const auto full =
+        FullAttentionSessionCodec<Qwen35Model>::kind(model);
+    if (full != TextSessionStateKind::Unsupported) return full;
+    return qwen35::supports_text_session_state(model.blocks)
+        ? TextSessionStateKind::HybridAttention
+        : TextSessionStateKind::Unsupported;
+}
+
+bool CudaSessionCodec<Qwen35Model>::supports_paged(
+        const Model& model) {
+    return FullAttentionSessionCodec<Qwen35Model>::supports_paged(model);
+}
+
+TextSessionState CudaSessionCodec<Qwen35Model>::capture(
+        const Model& model,
+        const std::vector<int64_t>& tokens) {
+    if (kind(model) == TextSessionStateKind::HybridAttention) {
+        if (model.cache_pos <= 0 ||
+                static_cast<size_t>(model.cache_pos) != tokens.size()) {
+            throw std::runtime_error(
+                "text session token count does not match the model cache");
+        }
+        return qwen35::capture_text_session_state(
+            model.blocks, tokens, model.cache_pos);
+    }
+    return FullAttentionSessionCodec<Qwen35Model>::capture(model, tokens);
+}
+
+void CudaSessionCodec<Qwen35Model>::restore(
+        Model& model,
+        const TextSessionState& state) {
+    if (kind(model) == TextSessionStateKind::HybridAttention &&
+            state.kind() == TextSessionStateKind::HybridAttention) {
+        qwen35::restore_text_session_state(model.blocks, state);
+        model.cache_pos = state.cache_pos;
+        return;
+    }
+    FullAttentionSessionCodec<Qwen35Model>::restore(model, state);
+}
+
+mfq_tensor_backend::Tensor
+Qwen35Model::adapter_embed(
+        mfq_tensor_backend::Tensor output) const {
+    return output.to(mfq_tensor_backend::kFloat16).contiguous();
+}
+
+void Qwen35Model::adapter_validate_positions(
+        const mfq_tensor_backend::Tensor& positions,
+        int64_t batch,
+        int64_t tokens,
+        bool has_mrope) const {
+    if (!((positions.dim() == 1 && positions.numel() == tokens) ||
+          (positions.dim() == 2 && positions.size(0) == batch &&
+           positions.size(1) == tokens) ||
+          (has_mrope && positions.dim() == 2 &&
+           positions.size(0) == 3 && positions.size(1) == tokens))) {
+        throw std::runtime_error(
+            "position_ids must have shape [tokens], [batch,tokens], or "
+            "configured grid-MRoPE [3,tokens]");
+    }
+}
+
+bool Qwen35Model::adapter_supports_prepared_prompt() const noexcept {
+    return true;
+}
+
+bool Qwen35Model::adapter_supports_speculation() const noexcept {
+    return true;
+}
+
+} // namespace mfq::cuda
+
+template <>
+RuntimeComponents<mfq::cuda::Qwen35CausalLm> load_runtime_components(
+        mfq::cuda::Qwen35CausalLm& model,
+        bool load_optional_components) {
+    RuntimeComponents<mfq::cuda::Qwen35CausalLm> result;
+    result.graph = model.graph;
+    result.plan = model.plan;
+    if (!load_optional_components) return result;
+
+    if (result.plan.vision == mfq::cuda::CudaVisionAdapter::grid_vit) {
+        const auto* component = result.graph.component("vision");
+        const auto& config = model.config;
+        if (component == nullptr || !config.grid_vision ||
+                !config.image_token_id || !config.video_token_id) {
+            throw std::runtime_error(
+                "CUDA grid-Vision configuration is incomplete");
+        }
+        result.grid_vision.emplace(
+            mfq::cuda::grid_vision_runtime::CudaGridVisionPromptComponent::load(
+                *model.source, *config.grid_vision,
+                *config.image_token_id, *config.video_token_id,
+                component->input_contract, component->position_policy));
+        result.vision_available = true;
+    } else if (result.plan.vision != mfq::cuda::CudaVisionAdapter::none) {
+        throw std::runtime_error(
+            "CUDA vision adapter is unsupported for Qwen");
+    }
+
+    if (result.plan.predictor == mfq::cuda::CudaPredictorAdapter::qwen35) {
+        const auto& execution = cuda_execution_context();
+        const bool supported_placement =
+            !execution.layer_placement.enabled() &&
+            execution.dense_cpu_layer_count == 0 &&
+            execution.dsv4_cpu_offload_layers.empty() &&
+            !moe_expert_cache();
+        if (supported_placement && model.num_experts() == 0 &&
+                model.supports_speculation()) {
+            auto predictor = Qwen35Mtp::load_if_present(
+                *model.source, model.config, *model.execution);
+            if (predictor) {
+                result.mtp = std::make_unique<Qwen35Mtp>(
+                    std::move(*predictor));
+            }
+            result.mtp_available = static_cast<bool>(result.mtp);
+        } else {
+            std::cerr << "qwen_mtp unavailable: CUDA adapter requires dense GPU-resident Qwen blocks\n";
+        }
+    } else if (result.plan.predictor !=
+            mfq::cuda::CudaPredictorAdapter::none) {
+        throw std::runtime_error(
+            "CUDA predictor adapter is unsupported for Qwen");
+    }
+    return result;
+}

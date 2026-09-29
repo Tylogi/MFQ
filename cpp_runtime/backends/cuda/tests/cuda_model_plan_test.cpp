@@ -43,7 +43,7 @@ int main() {
             mfq::kMfqGridMropePositionPolicy;
         const auto qwen_plan = cuda_model_plan(qwen);
         require(
-            qwen_plan.backbone == CudaBackbone::generic_qwen,
+            cuda_backbone(qwen.backbone) == CudaBackbone::generic_qwen,
             "Qwen semantic backbone did not resolve");
         const auto qwen_state = cuda_component_state(
             qwen, qwen_plan, true, true);
@@ -114,18 +114,18 @@ int main() {
 
         const auto unsupported = graph_with("unknown_experimental", "grid_vit");
         require(
-            cuda_model_plan(unsupported).backbone ==
+            cuda_backbone(unsupported.backbone) ==
                 CudaBackbone::unsupported,
             "unimplemented CUDA backbone was accepted");
         const auto qwen4 = graph_with("qwen4_exp", "grid_vit", "next_token_prediction");
         const auto qwen4_plan = cuda_model_plan(qwen4);
-        require(qwen4_plan.backbone == CudaBackbone::qwen4_exp &&
+        require(cuda_backbone(qwen4.backbone) == CudaBackbone::qwen4_exp &&
             qwen4_plan.vision == CudaVisionAdapter::none && qwen4_plan.predictor == CudaPredictorAdapter::flash_next,
             "Qwen4 text/optional-component selection mismatch");
 
         const auto glm_next = graph_with("glm5_next", "grid_vit", "next_token_prediction");
         const auto glm_plan = cuda_model_plan(glm_next);
-        require(glm_plan.backbone == CudaBackbone::glm5_next,
+        require(cuda_backbone(glm_next.backbone) == CudaBackbone::glm5_next,
             "GLM Flash-Next text adapter was not selected");
         require(glm_plan.vision == CudaVisionAdapter::none &&
             glm_plan.predictor == CudaPredictorAdapter::flash_next,
@@ -142,7 +142,8 @@ int main() {
             "deepseek_v41", "deepseek_v41_vision", "deepseek_v41_dspark");
         const auto deepseek_v41_plan = cuda_model_plan(deepseek_v41);
         require(
-            deepseek_v41_plan.backbone == CudaBackbone::deepseek_v41,
+            cuda_backbone(deepseek_v41.backbone) ==
+                CudaBackbone::deepseek_v41,
             "DeepSeek-V4.1 text adapter was not selected");
         require(
             deepseek_v41_plan.vision == CudaVisionAdapter::none &&

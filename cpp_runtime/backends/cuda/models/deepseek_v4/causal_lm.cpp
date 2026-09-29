@@ -1,5 +1,6 @@
 #include "causal_lm.h"
 
+#include "../causal_lm.h"
 #include "models/transformer.h"
 
 namespace mfq::cuda::deepseek_v4 {
@@ -301,4 +302,192 @@ OutputHeadWeights load_output_head(
     };
 }
 
+mfq_tensor_backend::Tensor finalize_hidden(
+        mfq_tensor_backend::Tensor hidden,
+        const OutputHeadWeights& output_head,
+        const Config& config,
+        int64_t batch,
+        int64_t tokens) {
+    return g_profiler.measure("model.dsv4_hc_head", [&]() {
+        auto flat = hidden.flatten(2).to(mfq_tensor_backend::kFloat32);
+        auto inverse_rms = mfq_tensor_backend::rsqrt(
+            flat.square().mean(-1, true) + config.rms_norm_eps);
+        auto mixes = mfq_tensor_backend::matmul(
+            flat, output_head.function.transpose(0, 1)) * inverse_rms;
+        auto pre = mfq_tensor_backend::sigmoid(
+            mixes * output_head.scale + output_head.base) + config.hc_eps;
+        return (
+            pre.unsqueeze(-1) *
+            flat.reshape({batch, tokens, config.hc_mult, config.hidden_size}))
+            .sum(2).to(mfq_tensor_backend::kFloat16).contiguous();
+    });
+}
+
 } // namespace mfq::cuda::deepseek_v4
+
+namespace mfq::cuda {
+
+void DeepseekV4Model::adapter_load_config(
+        std::string_view payload,
+        const mfq::ModelGraph&,
+        const mfq::ModelSource&) {
+    config = deepseek_v4::Config::from_json(payload);
+    config.layer_types.assign(
+        static_cast<std::size_t>(config.num_hidden_layers),
+        "deepseek_v4");
+    metadata.vocab_size = config.vocab_size;
+    metadata.hidden_size = config.hidden_size;
+    metadata.num_hidden_layers = config.num_hidden_layers;
+    metadata.num_attention_heads = config.num_attention_heads;
+    metadata.num_key_value_heads = config.num_key_value_heads;
+    metadata.head_dim = config.head_dim;
+    metadata.max_position_embeddings = config.max_position_embeddings;
+    metadata.rotary_dim = config.rotary_dim;
+    metadata.num_experts = config.num_experts;
+    metadata.hc_mult = config.hc_mult;
+    metadata.rope_base = config.rope_base;
+    metadata.rms_norm_eps = config.rms_norm_eps;
+    metadata.hc_eps = config.hc_eps;
+    metadata.tie_word_embeddings = config.tie_word_embeddings;
+    metadata.model_type = config.model_type;
+    metadata.layer_types = config.layer_types;
+}
+
+void DeepseekV4Model::adapter_validate_load_options() const {
+    deepseek_v4::validate_load_options(config);
+}
+
+void DeepseekV4Model::adapter_load_final_state(
+        const mfq::ModelSource& source,
+        mfq_tensor_backend::Tensor& output_norm) {
+    CausalLmArchitecture::adapter_load_final_state(source, output_norm);
+    output_head = deepseek_v4::load_output_head(source);
+}
+
+std::unique_ptr<Block>
+DeepseekV4Model::adapter_load_block(
+        const mfq::ModelSource& source,
+        int layer,
+        int device,
+        const std::string& type) {
+    auto& state = block_states[device];
+    if (!state) state = std::make_shared<Dsv4SharedState>();
+    return deepseek_v4::load_block(
+        source, config, layer, type, state);
+}
+
+TextSessionStateKind
+CudaSessionCodec<DeepseekV4Model>::kind(const Model& model) {
+    return !model.blocks.empty() && std::all_of(
+        model.blocks.begin(), model.blocks.end(),
+        [](const std::unique_ptr<::Block>& block) {
+            return dynamic_cast<const Dsv4Block*>(block.get()) != nullptr;
+        })
+        ? TextSessionStateKind::DeepseekV4
+        : TextSessionStateKind::Unsupported;
+}
+
+bool CudaSessionCodec<DeepseekV4Model>::supports_paged(
+        const Model&) {
+    return false;
+}
+
+TextSessionState CudaSessionCodec<DeepseekV4Model>::capture(
+        const Model& model,
+        const std::vector<int64_t>& tokens) {
+    if (kind(model) != TextSessionStateKind::DeepseekV4 ||
+            model.cache_pos <= 0 ||
+            static_cast<size_t>(model.cache_pos) != tokens.size()) {
+        throw std::runtime_error(
+            "DeepSeek-V4 text session state is unavailable");
+    }
+    TextSessionState state;
+    state.tokens = tokens;
+    state.cache_pos = model.cache_pos;
+    state.payload = std::vector<Dsv4BlockSessionState>{};
+    auto& layers = std::get<std::vector<Dsv4BlockSessionState>>(state.payload);
+    layers.reserve(model.blocks.size());
+    for (const auto& block : model.blocks) {
+        MfqCudaGuard guard(block->cuda_device);
+        const auto* dsv4 = dynamic_cast<const Dsv4Block*>(block.get());
+        if (dsv4 == nullptr || !dsv4->local_cache.defined()) {
+            throw std::runtime_error(
+                "DeepSeek V4 local session cache is unavailable");
+        }
+        Dsv4BlockSessionState saved;
+        saved.local_cache = dsv4->local_cache.clone();
+        state.bytes += session_tensor_bytes(saved.local_cache);
+        saved.compressor = capture_dsv4_pool_session_state(
+            dsv4->compressor, model.cache_pos, state.bytes);
+        saved.indexer_compressor = capture_dsv4_pool_session_state(
+            dsv4->indexer_compressor, model.cache_pos, state.bytes);
+        layers.push_back(std::move(saved));
+    }
+    return state;
+}
+
+void CudaSessionCodec<DeepseekV4Model>::restore(
+        Model& model,
+        const TextSessionState& state) {
+    const auto* layers = std::get_if<
+        std::vector<Dsv4BlockSessionState>>(&state.payload);
+    if (kind(model) != TextSessionStateKind::DeepseekV4 ||
+            state.kind() != TextSessionStateKind::DeepseekV4 ||
+            state.cache_pos <= 0 ||
+            static_cast<size_t>(state.cache_pos) != state.tokens.size() ||
+            layers == nullptr || layers->size() != model.blocks.size()) {
+        throw CudaSessionStateError(
+            "DeepSeek V4 text session state is incompatible");
+    }
+    for (size_t index = 0; index < model.blocks.size(); ++index) {
+        auto& block = model.blocks[index];
+        MfqCudaGuard guard(block->cuda_device);
+        auto* dsv4 = dynamic_cast<Dsv4Block*>(block.get());
+        const auto& saved = (*layers)[index];
+        if (dsv4 == nullptr || !saved.local_cache.defined() ||
+                saved.local_cache.dim() != 3 ||
+                saved.local_cache.size(0) != 1 ||
+                saved.local_cache.size(1) != 128) {
+            throw CudaSessionStateError(
+                "DeepSeek V4 saved local cache is invalid");
+        }
+        restore_session_tensor(dsv4->local_cache, saved.local_cache);
+        restore_dsv4_pool_session_state(
+            dsv4->compressor, saved.compressor);
+        restore_dsv4_pool_session_state(
+            dsv4->indexer_compressor, saved.indexer_compressor);
+        dsv4->shared_state->ensure();
+    }
+    model.cache_pos = state.cache_pos;
+}
+
+mfq_tensor_backend::Tensor
+DeepseekV4Model::adapter_prepare_hidden(
+        mfq_tensor_backend::Tensor hidden,
+        int64_t batch,
+        int64_t tokens) const {
+    return hidden.to(mfq_tensor_backend::kFloat16)
+        .unsqueeze(2)
+        .expand({batch, tokens, metadata.hc_mult, metadata.hidden_size})
+        .contiguous();
+}
+
+mfq_tensor_backend::Tensor
+DeepseekV4Model::adapter_finalize_hidden(
+        mfq_tensor_backend::Tensor hidden,
+        const mfq_tensor_backend::Tensor& output_norm,
+        int64_t batch,
+        int64_t tokens) const {
+    hidden = deepseek_v4::finalize_hidden(
+        std::move(hidden), output_head, config, batch, tokens);
+    return g_profiler.measure("model.output_norm", [&]() {
+        return qwen_rms_norm(
+            hidden.reshape({batch * tokens, metadata.hidden_size})
+                .to(mfq_tensor_backend::kFloat32),
+            output_norm, metadata.rms_norm_eps,
+            metadata.norm_weight_offset)
+            .reshape({batch, tokens, metadata.hidden_size});
+    });
+}
+
+} // namespace mfq::cuda

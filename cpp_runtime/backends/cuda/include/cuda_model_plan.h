@@ -37,7 +37,6 @@ enum class CudaPredictorAdapter {
 };
 
 struct CudaModelPlan {
-    CudaBackbone backbone = CudaBackbone::unsupported;
     CudaVisionAdapter vision = CudaVisionAdapter::none;
     CudaPredictorAdapter predictor = CudaPredictorAdapter::none;
 };
@@ -81,7 +80,6 @@ inline constexpr CudaBackbone cuda_backbone(
 inline CudaModelPlan cuda_model_plan(
         const ModelGraph& graph) noexcept {
     CudaModelPlan result;
-    result.backbone = cuda_backbone(graph.backbone);
     const auto* vision = graph.component("vision");
     if (graph.backbone == "qwen3_5" && vision != nullptr &&
         vision->tensor_root == "vision" &&

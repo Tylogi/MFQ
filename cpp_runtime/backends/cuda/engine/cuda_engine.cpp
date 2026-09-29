@@ -28,9 +28,9 @@ namespace {
 
 using namespace mfq::cuda::internal;
 
-template <CudaBackbone Backbone>
+template <typename ModelType>
 struct CudaEngineState {
-    using Model = CausalLmFor<Backbone>;
+    using Model = ModelType;
 
     CudaEngineState(
             Model loaded_model,
@@ -88,9 +88,9 @@ struct CudaEngineState {
     std::unique_ptr<mfq::engine::ContinuousBatching> continuous_batching;
 };
 
-template <CudaBackbone Backbone>
+template <typename Model>
 std::vector<std::pair<std::string, double>> engine_metrics(
-        const std::shared_ptr<CudaEngineState<Backbone>>& state) {
+        const std::shared_ptr<CudaEngineState<Model>>& state) {
     size_t free_bytes = 0;
     size_t total_bytes = 0;
     MFQ_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
@@ -124,12 +124,12 @@ std::vector<std::pair<std::string, double>> engine_metrics(
     return result;
 }
 
-template <CudaBackbone Backbone>
+template <typename Model>
 CudaEngine make_cuda_engine(
-        CausalLmFor<Backbone> model,
-        RuntimeComponents<CausalLmFor<Backbone>> components,
+        Model model,
+        RuntimeComponents<Model> components,
         CudaRuntimeConfig config) {
-    using State = CudaEngineState<Backbone>;
+    using State = CudaEngineState<Model>;
     auto state = std::make_shared<State>(
         std::move(model), std::move(components), std::move(config));
 
@@ -149,18 +149,15 @@ CudaEngine make_cuda_engine(
             const MfqCancellationCheck& cancelled) {
         PreparedPromptFactory<typename State::Model> prepare;
         if (media) {
-            if constexpr (Backbone == CudaBackbone::generic_qwen) {
-                if (!state->components.grid_vision) {
-                    throw std::invalid_argument("CUDA vision component is unavailable");
-                }
-                prepare = [state, &prompt, media](auto& language) {
-                    return std::optional<CudaPreparedPrompt>{
-                        state->components.grid_vision->prepare(
-                            language, prompt, *media)};
-                };
-            } else {
-                throw std::invalid_argument("CUDA backbone has no prepared vision component");
+            if (!state->components.grid_vision) {
+                throw std::invalid_argument(
+                    "CUDA vision component is unavailable");
             }
+            prepare = [state, &prompt, media](auto& language) {
+                return std::optional<CudaPreparedPrompt>{
+                    state->components.grid_vision->prepare(
+                        language, prompt, *media)};
+            };
         } else if (state->continuous_batching) {
             return state->continuous_batching->submit(
                 prompt, sampling, on_token, on_prefill,
@@ -240,8 +237,7 @@ CudaEngine make_cuda_engine(
     engine.metadata.max_context = state->language->max_position_embeddings();
     engine.metadata.vocab_size = state->language->vocab_size();
     engine.metadata.capabilities.text =
-        state->components.graph.has_component("text") &&
-        state->components.plan.backbone != CudaBackbone::unsupported;
+        state->components.graph.has_component("text");
     engine.metadata.capabilities.image_input = component_state.vision_available;
     engine.metadata.capabilities.video_input =
         component_state.vision_available &&
@@ -266,9 +262,8 @@ CudaEngine load_cuda_engine(CudaEngineOptions options) {
     mfq_tensor_backend::NoGradGuard no_grad;
     return with_loaded_cuda_model(
         options, true,
-        [&]<CudaBackbone Backbone>(auto& model,
-                auto& components, auto, auto) {
-            return make_cuda_engine<Backbone>(
+        [&](auto& model, auto& components, auto, auto) {
+            return make_cuda_engine(
                 std::move(model), std::move(components),
                 std::move(runtime_config));
         });

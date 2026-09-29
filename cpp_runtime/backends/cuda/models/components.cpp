@@ -1,8 +1,4 @@
 #include "components.h"
-#include "qwen35/batch_executor.h"
-#include "storage/moe_expert_cache.h"
-
-#include <iostream>
 #include <stdexcept>
 
 template <typename Model>
@@ -12,90 +8,11 @@ RuntimeComponents<Model> load_runtime_components(
     RuntimeComponents<Model> result;
     result.graph = model.graph;
     result.plan = model.plan;
-    if (!load_optional_components) return result;
-
-    switch (result.plan.vision) {
-        case mfq::cuda::CudaVisionAdapter::none:
-            break;
-        case mfq::cuda::CudaVisionAdapter::grid_vit: {
-            if constexpr (Model::backbone ==
-                    mfq::cuda::CudaBackbone::generic_qwen) {
-                const auto* component = result.graph.component("vision");
-                const auto& config = model.config;
-                if (component == nullptr || !config.grid_vision ||
-                        !config.image_token_id || !config.video_token_id) {
-                    throw std::runtime_error(
-                        "CUDA grid-Vision configuration is incomplete");
-                }
-                result.grid_vision.emplace(
-                    mfq::cuda::grid_vision_runtime::CudaGridVisionPromptComponent::load(
-                        *model.source, *config.grid_vision,
-                        *config.image_token_id, *config.video_token_id,
-                        component->input_contract, component->position_policy));
-                result.vision_available = true;
-            } else {
-                throw std::runtime_error(
-                    "grid-Vision requires the Qwen CUDA backbone");
-            }
-            break;
-        }
-        default:
-            throw std::runtime_error(
-                "CUDA vision adapter is unsupported for this backbone");
-    }
-    if constexpr (
-            Model::backbone == mfq::cuda::CudaBackbone::generic_qwen) {
-        if (result.plan.predictor ==
-                mfq::cuda::CudaPredictorAdapter::qwen35) {
-            const auto& execution = cuda_execution_context();
-            const bool supported_placement =
-                !execution.layer_placement.enabled() &&
-                execution.dense_cpu_layer_count == 0 &&
-                execution.dsv4_cpu_offload_layers.empty() &&
-                !moe_expert_cache();
-            if (supported_placement && model.num_experts() == 0 &&
-                    model.supports_qwen_speculation()) {
-                auto predictor = Qwen35Mtp::load_if_present(
-                    *model.source, model.config, *model.execution);
-                if (predictor) {
-                    result.mtp = std::make_unique<Qwen35Mtp>(
-                        std::move(*predictor));
-                }
-                result.mtp_available = static_cast<bool>(result.mtp);
-            } else {
-                std::cerr << "qwen_mtp unavailable: CUDA adapter requires dense GPU-resident Qwen blocks\n";
-            }
-        }
-    }
-    if constexpr (
-            Model::backbone == mfq::cuda::CudaBackbone::qwen4_exp ||
-            Model::backbone == mfq::cuda::CudaBackbone::glm5_next) {
-        if (result.plan.predictor ==
-                mfq::cuda::CudaPredictorAdapter::flash_next) {
-            MFQ_RUNTIME_CHECK(
-                model.supports_qwen_speculation(),
-                "invalid Flash-Next predictor backbone");
-            using Predictor=std::conditional_t<
-                Model::backbone==mfq::cuda::CudaBackbone::qwen4_exp,
-                mfq::cuda::qwen4_exp::Qwen4ExpMtp,
-                mfq::cuda::glm5_next::Glm5NextMtp>;
-            auto predictor=Predictor::load_if_present(*model.source,model.config);
-            if (predictor) result.mtp=std::make_unique<Predictor>(std::move(*predictor));
-            result.mtp_available = static_cast<bool>(result.mtp);
-        }
-    }
-    if constexpr (
-            Model::backbone == mfq::cuda::CudaBackbone::deepseek_v41) {
-        if (result.plan.predictor ==
-                mfq::cuda::CudaPredictorAdapter::deepseek_v41_dspark) {
-            MFQ_RUNTIME_CHECK(
-                model.supports_deepseek_v41_speculation() && model.shared,
-                "invalid DeepSeek-V4.1 DSpark backbone");
-            result.mtp =
-                mfq::cuda::deepseek_v41_runtime::load_dspark_if_present(
-                    *model.source, model.shared->config);
-            result.mtp_available = static_cast<bool>(result.mtp);
-        }
+    if (load_optional_components &&
+            (result.plan.vision != mfq::cuda::CudaVisionAdapter::none ||
+             result.plan.predictor != mfq::cuda::CudaPredictorAdapter::none)) {
+        throw std::runtime_error(
+            "CUDA component adapter is unsupported for this model");
     }
     return result;
 }
@@ -103,35 +20,20 @@ RuntimeComponents<Model> load_runtime_components(
 template <typename Model>
 std::unique_ptr<mfq::engine::ContinuousBatching>
 make_cuda_continuous_batching(
-        Model& model,
-        CudaExecutionContext& execution,
-        std::mutex& model_mutex,
-        const mfq::cuda::CudaContinuousBatchConfig& config,
-        mfq::engine::GenerationConfig generation) {
-    if constexpr (
-            Model::backbone == mfq::cuda::CudaBackbone::generic_qwen) {
-        return std::make_unique<mfq::cuda::qwen35::QwenBatchExecutor>(
-            model, execution, model_mutex, config, generation);
-    }
+        Model&,
+        CudaExecutionContext&,
+        std::mutex&,
+        const mfq::cuda::CudaContinuousBatchConfig&,
+        mfq::engine::GenerationConfig) {
     return {};
 }
 
-#define MFQ_INSTANTIATE_COMPONENTS(TYPE)                                    \
-    template RuntimeComponents<TYPE> load_runtime_components(               \
-        TYPE&, bool);                                                       \
-    template std::unique_ptr<mfq::engine::ContinuousBatching>               \
-    make_cuda_continuous_batching(                                          \
-        TYPE&, CudaExecutionContext&, std::mutex&,                          \
-        const mfq::cuda::CudaContinuousBatchConfig&,                        \
-        mfq::engine::GenerationConfig)
+#define MFQ_INSTANTIATE_COMPONENTS(TYPE)                                  \
+    template RuntimeComponents<TYPE> load_runtime_components(TYPE&, bool)
 
-MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::Qwen35CausalLm);
 MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::Gemma4CausalLm);
 MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::GlmDsaCausalLm);
-MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::Glm5CausalLm);
-MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::Qwen4CausalLm);
 MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::DeepseekV4CausalLm);
-MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::DeepseekV41CausalLm);
 
 #define MFQ_INSTANTIATE_BATCHING(TYPE)                                      \
     template std::unique_ptr<mfq::engine::ContinuousBatching>               \
@@ -142,6 +44,12 @@ MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::DeepseekV41CausalLm);
 
 MFQ_INSTANTIATE_BATCHING(mfq::cuda::MiniCPMO45CausalLm);
 MFQ_INSTANTIATE_BATCHING(mfq::cuda::MiniCPMOTtsCausalLm);
+MFQ_INSTANTIATE_BATCHING(mfq::cuda::Gemma4CausalLm);
+MFQ_INSTANTIATE_BATCHING(mfq::cuda::GlmDsaCausalLm);
+MFQ_INSTANTIATE_BATCHING(mfq::cuda::Glm5CausalLm);
+MFQ_INSTANTIATE_BATCHING(mfq::cuda::Qwen4CausalLm);
+MFQ_INSTANTIATE_BATCHING(mfq::cuda::DeepseekV4CausalLm);
+MFQ_INSTANTIATE_BATCHING(mfq::cuda::DeepseekV41CausalLm);
 
 #undef MFQ_INSTANTIATE_BATCHING
 #undef MFQ_INSTANTIATE_COMPONENTS

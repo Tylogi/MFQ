@@ -99,14 +99,14 @@ static int run_block_trace_compare(
     auto& execution = cuda_execution_context();
     Model reference = [&]() {
         if (execution.n_gpu_layers < 0) {
-            return mfq::cuda::load_causal_lm<Model::backbone>(
+            return mfq::cuda::load_causal_lm<Model>(
                 reference_model_path, config_path, context_size);
         }
         const int saved_n_gpu_layers = execution.n_gpu_layers;
         const int saved_cpu_layers = execution.dense_cpu_layer_count;
         execution.n_gpu_layers = -1;
         try {
-            auto loaded = mfq::cuda::load_causal_lm<Model::backbone>(
+            auto loaded = mfq::cuda::load_causal_lm<Model>(
                 reference_model_path, config_path, context_size);
             execution.n_gpu_layers = saved_n_gpu_layers;
             execution.dense_cpu_layer_count = saved_cpu_layers;
@@ -588,7 +588,7 @@ static int run_qwen35_mtp_check(
             current = next.reshape({1, 1});
         }
         std::vector<int64_t> got;
-        const int produced = run_mtp_generation<mfq::cuda::CudaBackbone::generic_qwen>(model, mtp, input, params,
+        const int produced = run_mtp_generation(model, mtp, input, params,
             [&](int64_t token) { got.push_back(token); return true; }, {});
         total_cycles += mtp.last_cycles;
         std::cout << "mtp_check greedy_prompt_tokens=" << input.size() << " produced=" << produced
@@ -599,7 +599,7 @@ static int run_qwen35_mtp_check(
         // Callback stop then a fresh request exercises state reset after an
         // early return, including stopping before a computed bonus is emitted.
         got.clear();
-        const int stopped = run_mtp_generation<mfq::cuda::CudaBackbone::generic_qwen>(model, mtp, input, params,
+        const int stopped = run_mtp_generation(model, mtp, input, params,
             [&](int64_t token) { got.push_back(token); return got.size() < 3; }, {});
         MFQ_RUNTIME_CHECK(stopped == 3 && got == std::vector<int64_t>(expected.begin(), expected.begin() + 3),
             "MTP callback emitted extra or incorrect tokens");
@@ -613,7 +613,7 @@ static int run_qwen35_mtp_check(
     stochastic.frequency_penalty = .1;
     stochastic.repetition_penalty = 1.05;
     stochastic.seed = 20260907;
-    const int produced = run_mtp_generation<mfq::cuda::CudaBackbone::generic_qwen>(model, mtp, prompt, stochastic,
+    const int produced = run_mtp_generation(model, mtp, prompt, stochastic,
         [](int64_t) { return true; }, {});
     MFQ_RUNTIME_CHECK(produced == 8 && mtp.last_cycles > 0 && total_cycles > 0,
         "MTP runtime gate did not execute speculative cycles");
@@ -643,7 +643,7 @@ template <typename Model>
 static int run_flash_next_check(Model& model) {
     namespace tb=mfq_tensor_backend;
     MFQ_RUNTIME_CHECK(
-        Model::is_flash_next && model.vocab_size() >= 8 &&
+        model.metadata.flash_next && model.vocab_size() >= 8 &&
             model.max_position_embeddings() >= 16,
         "Flash-Next diagnostic requires a Flash-Next text graph, vocab>=8 and context>=16");
     auto ids=tb::tensor(std::vector<int64_t>{1,2,3,4,5,6,7},
@@ -677,7 +677,7 @@ static int run_flash_next_check(Model& model) {
     }
     model.reset(1);
     result["reset"]=json_tensor(model.forward(ids));
-    if constexpr (Model::is_qwen4) {
+    if (model.metadata.multi_axis_positions) {
         auto positions=tb::stack({ids.reshape({7})-1,ids.reshape({7})+1,ids.reshape({7})+3},0);
         model.reset(1);
         result["axis_full"]=json_tensor(model.logits_from_hidden(model.hidden_forward(ids,positions)));

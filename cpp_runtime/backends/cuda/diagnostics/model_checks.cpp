@@ -1767,63 +1767,52 @@ int run_moe_check(
     const auto& mfq = *model_source;
     mfq::cuda::validate_model_source(mfq);
     const auto graph = mfq.resolved_model_graph();
-    const auto plan = mfq::cuda::cuda_model_plan(graph);
     const auto payload = mfq::cuda::load_model_config_json(
         mfq, config_path);
     FFN ffn;
     int64_t hidden_size = 0;
-    switch (plan.backbone) {
-        case mfq::cuda::CudaBackbone::gemma4: {
-            const auto config =
-                mfq::models::gemma4::Config::from_json(payload);
-            if (layer >= config.num_hidden_layers) {
-                throw std::runtime_error(
-                    "MoE benchmark layer is out of range");
-            }
-            return run_gemma_moe_check(
-                mfq, config, layer, token_sizes, reps);
-        }
-        case mfq::cuda::CudaBackbone::glm_dsa: {
-            const auto config =
-                mfq::models::glm_dsa::Config::from_json(payload);
-            if (layer >= config.num_hidden_layers) {
-                throw std::runtime_error(
-                    "MoE benchmark layer is out of range");
-            }
-            mfq::cuda::glm_dsa::load_ffn(
-                mfq, config, layer, ffn);
-            hidden_size = config.hidden_size;
-            break;
-        }
-        case mfq::cuda::CudaBackbone::deepseek_v4: {
-            const auto config =
-                mfq::models::deepseek_v4::Config::from_json(payload);
-            if (layer >= config.num_hidden_layers) {
-                throw std::runtime_error(
-                    "MoE benchmark layer is out of range");
-            }
-            auto block = mfq::cuda::deepseek_v4::load_block(
-                mfq, config, layer, "deepseek_v4",
-                std::make_shared<Dsv4SharedState>());
-            ffn = std::move(static_cast<Dsv4Block&>(*block).ffn);
-            hidden_size = config.hidden_size;
-            break;
-        }
-        case mfq::cuda::CudaBackbone::deepseek_v41: {
-            const auto config =
-                mfq::models::deepseek_v41::Config::from_json(payload);
-            if (layer >= config.n_layers) {
-                throw std::runtime_error(
-                    "MoE benchmark layer is out of range");
-            }
-            ffn = mfq::cuda::deepseek_v41_runtime::load_moe(
-                mfq, config, layer);
-            hidden_size = config.hidden;
-            break;
-        }
-        default:
+    if (graph.backbone == "gemma4") {
+        const auto config = mfq::models::gemma4::Config::from_json(payload);
+        if (layer >= config.num_hidden_layers) {
             throw std::runtime_error(
-                "selected CUDA backbone has no FFN MoE benchmark adapter");
+                "MoE benchmark layer is out of range");
+        }
+        return run_gemma_moe_check(
+            mfq, config, layer, token_sizes, reps);
+    }
+    if (graph.backbone == "glm_dsa") {
+        const auto config = mfq::models::glm_dsa::Config::from_json(payload);
+        if (layer >= config.num_hidden_layers) {
+            throw std::runtime_error(
+                "MoE benchmark layer is out of range");
+        }
+        mfq::cuda::glm_dsa::load_ffn(mfq, config, layer, ffn);
+        hidden_size = config.hidden_size;
+    } else if (graph.backbone == "deepseek_v4") {
+        const auto config =
+            mfq::models::deepseek_v4::Config::from_json(payload);
+        if (layer >= config.num_hidden_layers) {
+            throw std::runtime_error(
+                "MoE benchmark layer is out of range");
+        }
+        auto block = mfq::cuda::deepseek_v4::load_block(
+            mfq, config, layer, "deepseek_v4",
+            std::make_shared<Dsv4SharedState>());
+        ffn = std::move(static_cast<Dsv4Block&>(*block).ffn);
+        hidden_size = config.hidden_size;
+    } else if (graph.backbone == "deepseek_v41") {
+        const auto config =
+            mfq::models::deepseek_v41::Config::from_json(payload);
+        if (layer >= config.n_layers) {
+            throw std::runtime_error(
+                "MoE benchmark layer is out of range");
+        }
+        ffn = mfq::cuda::deepseek_v41_runtime::load_moe(
+            mfq, config, layer);
+        hidden_size = config.hidden;
+    } else {
+        throw std::runtime_error(
+            "selected CUDA backbone has no FFN MoE benchmark adapter");
     }
     if (!ffn.is_moe) {
         throw std::runtime_error(
@@ -3212,7 +3201,8 @@ int run_text_session_state_check() {
     dsv4_block->indexer_compressor.pool.zero_();
     dsv4_model.cache_pos = 0;
     dsv4_model.restore_text_session_state(dsv4_state);
-    const auto & saved_dsv4 = dsv4_state.dsv4_blocks.at(0);
+    const auto & saved_dsv4 = std::get<
+        std::vector<Dsv4BlockSessionState>>(dsv4_state.payload).at(0);
     require_equal(
         mfq_tensor_backend::equal(dsv4_block->local_cache, saved_dsv4.local_cache),
         "DeepSeek V4 local session cache restore failed");
@@ -3273,8 +3263,10 @@ int run_text_session_state_check() {
         {1, 1, 1}, cuda_float.dtype(mfq_tensor_backend::kInt32));
     glm_model.cache_pos = 0;
     glm_model.restore_text_session_state(glm_state);
+    const auto& saved_glm = std::get<
+        std::vector<GlmDsaBlockSessionState>>(glm_state.payload);
     for (size_t index = 0; index < glm_blocks.size(); ++index) {
-        const auto & saved = glm_state.glm_dsa_blocks.at(index);
+        const auto & saved = saved_glm.at(index);
         require_equal(
             glm_blocks[index]->kv_cache.size(2) == saved.kv_capacity &&
             mfq_tensor_backend::equal(

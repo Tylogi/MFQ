@@ -106,7 +106,7 @@ static int run_kl_eval(
             // chunk's first corpus token with BOS before evaluating it, then
             // serializes the original corpus tokens in this legacy header.
             // Qwen legacy references use the serialized token directly.
-            if (Model::is_gemma4 &&
+            if (model.metadata.gemma4 &&
                     eval_chunks[(size_t)ci].tokens[0] != legacy_bos) {
                 eval_chunks[(size_t)ci].tokens[0] = legacy_bos;
                 ++legacy_bos_replacements;
@@ -115,7 +115,7 @@ static int run_kl_eval(
             eval_chunks[(size_t)ci].score_count = score_count;
         }
         std::cout << "cpp_kl_legacy_chunk_bos="
-                  << (Model::is_gemma4 ? legacy_bos : -1)
+                  << (model.metadata.gemma4 ? legacy_bos : -1)
                   << " replacements=" << legacy_bos_replacements
                   << " model_type=" << model.model_type() << "\n";
     } else if (reference_format == "_logit2_" || reference_format == "_logit3_") {
@@ -687,7 +687,7 @@ int run_kl_eval_batched(
     int bos_replacements = 0;
     int32_t legacy_bos = -1;
     if (input.reference_format == "_logits_" &&
-        Model::is_gemma4) {
+        model.metadata.gemma4) {
         legacy_bos = input.chunks[0].tokens[0];
         for (auto & chunk : input.chunks) {
             if (chunk.tokens[0] != legacy_bos) {
@@ -905,7 +905,7 @@ int run_kl_eval_streamed(
 
     auto started = std::chrono::steady_clock::now();
     auto model = mfq::cuda::load_causal_lm<
-        mfq::cuda::CudaBackbone::deepseek_v4>(
+        mfq::cuda::DeepseekV4CausalLm>(
             model_path, config_path, n_ctx, false);
     if (chunk_batch > 16) {
         throw std::runtime_error(

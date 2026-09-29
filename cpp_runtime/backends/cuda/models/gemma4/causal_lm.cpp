@@ -1,6 +1,10 @@
 #include "causal_lm.h"
 
+#include "../causal_lm.h"
 #include "models/transformer.h"
+
+#include <bit>
+#include <cmath>
 
 namespace mfq::cuda::gemma4 {
 
@@ -115,3 +119,55 @@ std::unique_ptr<::Block> load_block(
 
 
 } // namespace mfq::cuda::gemma4
+
+namespace mfq::cuda {
+
+void Gemma4Model::adapter_load_config(
+        std::string_view payload,
+        const mfq::ModelGraph&,
+        const mfq::ModelSource&) {
+    config = gemma4::Config::from_json(payload);
+    auto bits = std::bit_cast<std::uint32_t>(static_cast<float>(
+        std::sqrt(static_cast<double>(config.hidden_size))));
+    bits += 0x7fffU + ((bits >> 16U) & 1U);
+    embed_scale = std::bit_cast<float>(bits & 0xffff0000U);
+    metadata.vocab_size = config.vocab_size;
+    metadata.hidden_size = config.hidden_size;
+    metadata.num_hidden_layers = config.num_hidden_layers;
+    metadata.num_attention_heads = config.num_attention_heads;
+    metadata.num_key_value_heads = config.num_key_value_heads;
+    metadata.head_dim = config.head_dim;
+    metadata.max_position_embeddings = config.max_position_embeddings;
+    metadata.rotary_dim = config.rotary_dim;
+    metadata.num_experts = config.num_experts;
+    metadata.rope_base = config.rope_base;
+    metadata.rms_norm_eps = config.rms_norm_eps;
+    metadata.final_logit_softcapping = config.final_logit_softcapping;
+    metadata.embedding_scale = embed_scale;
+    metadata.tie_word_embeddings = config.tie_word_embeddings;
+    metadata.gemma4 = true;
+    metadata.decode_graph_double_warmup = true;
+    metadata.model_type = config.model_type;
+    metadata.layer_types = config.layer_types;
+}
+
+std::unique_ptr<Block>
+Gemma4Model::adapter_load_block(
+        const mfq::ModelSource& source,
+        int layer,
+        int,
+        const std::string& type) {
+    return gemma4::load_block(source, config, layer, type);
+}
+
+mfq_tensor_backend::Tensor
+Gemma4Model::adapter_prepare_hidden(
+        mfq_tensor_backend::Tensor hidden,
+        int64_t,
+        int64_t) const {
+    return g_profiler.measure("model.embed_scale", [&]() {
+        return hidden * embed_scale;
+    });
+}
+
+} // namespace mfq::cuda

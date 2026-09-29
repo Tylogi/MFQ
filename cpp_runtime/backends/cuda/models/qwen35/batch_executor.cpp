@@ -1,6 +1,7 @@
 #include "batch_executor.h"
 
 #include "models/causal_lm.h"
+#include "models/components.h"
 #include "cuda_sampling.h"
 #include "generation.h"
 #include "text_session_cache.h"
@@ -1550,3 +1551,15 @@ int run_qwen_continuous_batching_check(
 }
 
 } // namespace mfq::cuda::qwen35
+
+template <>
+std::unique_ptr<mfq::engine::ContinuousBatching>
+make_cuda_continuous_batching(
+        mfq::cuda::Qwen35CausalLm& model,
+        CudaExecutionContext& execution,
+        std::mutex& model_mutex,
+        const mfq::cuda::CudaContinuousBatchConfig& config,
+        mfq::engine::GenerationConfig generation) {
+    return std::make_unique<mfq::cuda::qwen35::QwenBatchExecutor>(
+        model, execution, model_mutex, config, generation);
+}

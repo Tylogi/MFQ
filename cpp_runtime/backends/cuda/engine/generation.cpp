@@ -203,7 +203,8 @@ struct CudaGenerationOps {
                     prefix = prefill_tail(
                         model, std::move(prefix), chunk_size, cancelled);
                     MfqOptional<mfq_tensor_backend::Tensor> seq_len = mfq_nullopt;
-                    if (!Model::is_minicpmo45 && model.cache_pos > 0 &&
+                    if (model.adapter_uses_decode_sequence_length() &&
+                            model.cache_pos > 0 &&
                             prefix.size(1) == 1) {
                         seq_len = mfq_tensor_backend::full(
                             {1}, model.cache_pos + 1, options);
@@ -245,7 +246,7 @@ struct CudaGenerationOps {
         const auto& execution = cuda_execution_context();
         return graph_config.enabled &&
             (!prepared || !prepared->transformed()) && !constraint &&
-            !Model::is_flash_next && mfq_cuda_graph_capture_supported() &&
+            !model.metadata.flash_next && mfq_cuda_graph_capture_supported() &&
             execution.dsv4_cpu_offload_layers.empty() &&
             execution.dense_cpu_layer_count == 0 && !moe_expert_cache() &&
             model_parallel_cuda_graph_enabled() &&
@@ -436,7 +437,7 @@ struct CudaMtpGenerationOps {
             const MfqTokenCallback& emit,
             const MfqPrefillCallback& on_prefill, std::int32_t,
             const MfqCancellationCheck& cancelled) {
-        return run_mtp_generation<Model::backbone>(
+        return run_mtp_generation(
             model, mtp, prompt, sampling, emit, on_prefill,
             chunk_size, constraint, prepared, reused,
             restored.mtp_last_target_hidden, &last_target_hidden,
@@ -506,11 +507,6 @@ int32_t generate(
         effective_sampling.max_tokens > 1 &&
         mfq_token_constraint_supports_speculation(token_constraint);
     if (use_mtp) {
-        if constexpr (
-                Model::backbone == mfq::cuda::CudaBackbone::generic_qwen ||
-                Model::backbone == mfq::cuda::CudaBackbone::qwen4_exp ||
-                Model::backbone == mfq::cuda::CudaBackbone::glm5_next ||
-                Model::backbone == mfq::cuda::CudaBackbone::deepseek_v41) {
         CudaMtpGenerationOps<Model> ops{
             model, *mtp, session_cache, prompt, effective_sampling,
             effective_cache_plan, token_constraint,
@@ -519,8 +515,6 @@ int32_t generate(
         return mfq::engine::generate(
             ops, prompt, effective_sampling, on_token, on_prefill,
             effective_cache_plan, cancelled);
-        }
-        throw std::runtime_error("MTP is unavailable for this causal LM type");
     }
     auto options = mfq_tensor_backend::TensorOptions()
         .dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA);
@@ -557,26 +551,24 @@ int32_t generate(
         effective_cache_plan, cancelled);
 }
 
-#define MFQ_INSTANTIATE_FLOW(BACKBONE)                                    \
-    template int32_t generate(                                              \
-        mfq::cuda::CausalLmFor<BACKBONE>&, std::mutex&, DecodeGraphCache&,  \
-        TextSessionCache&, const CudaRuntimeConfig&,                        \
-        const std::vector<int64_t>&, const MfqSamplingParams&,              \
-        const MfqTokenCallback&, const MfqPrefillCallback&,                 \
-        const MfqPromptCachePlan&, const MfqTokenConstraintPtr&,            \
-        MtpModule*, PreparedPromptFactory<                                  \
-            mfq::cuda::CausalLmFor<BACKBONE>>,                              \
-        MfqCancellationCheck);
+#define MFQ_INSTANTIATE_FLOW(MODEL)                                       \
+    template int32_t generate(                                             \
+        MODEL&, std::mutex&, DecodeGraphCache&, TextSessionCache&,          \
+        const CudaRuntimeConfig&, const std::vector<int64_t>&,              \
+        const MfqSamplingParams&, const MfqTokenCallback&,                  \
+        const MfqPrefillCallback&, const MfqPromptCachePlan&,               \
+        const MfqTokenConstraintPtr&, MtpModule*,                           \
+        PreparedPromptFactory<MODEL>, MfqCancellationCheck);
 
-MFQ_INSTANTIATE_FLOW(mfq::cuda::CudaBackbone::generic_qwen)
-MFQ_INSTANTIATE_FLOW(mfq::cuda::CudaBackbone::minicpmo45)
-MFQ_INSTANTIATE_FLOW(mfq::cuda::CudaBackbone::minicpmo_tts)
-MFQ_INSTANTIATE_FLOW(mfq::cuda::CudaBackbone::gemma4)
-MFQ_INSTANTIATE_FLOW(mfq::cuda::CudaBackbone::glm_dsa)
-MFQ_INSTANTIATE_FLOW(mfq::cuda::CudaBackbone::glm5_next)
-MFQ_INSTANTIATE_FLOW(mfq::cuda::CudaBackbone::qwen4_exp)
-MFQ_INSTANTIATE_FLOW(mfq::cuda::CudaBackbone::deepseek_v4)
-MFQ_INSTANTIATE_FLOW(mfq::cuda::CudaBackbone::deepseek_v41)
+MFQ_INSTANTIATE_FLOW(mfq::cuda::Qwen35CausalLm)
+MFQ_INSTANTIATE_FLOW(mfq::cuda::MiniCPMO45CausalLm)
+MFQ_INSTANTIATE_FLOW(mfq::cuda::MiniCPMOTtsCausalLm)
+MFQ_INSTANTIATE_FLOW(mfq::cuda::Gemma4CausalLm)
+MFQ_INSTANTIATE_FLOW(mfq::cuda::GlmDsaCausalLm)
+MFQ_INSTANTIATE_FLOW(mfq::cuda::Glm5CausalLm)
+MFQ_INSTANTIATE_FLOW(mfq::cuda::Qwen4CausalLm)
+MFQ_INSTANTIATE_FLOW(mfq::cuda::DeepseekV4CausalLm)
+MFQ_INSTANTIATE_FLOW(mfq::cuda::DeepseekV41CausalLm)
 
 #undef MFQ_INSTANTIATE_FLOW
 

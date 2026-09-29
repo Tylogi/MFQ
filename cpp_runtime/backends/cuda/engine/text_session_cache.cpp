@@ -331,27 +331,30 @@ private:
             prompt.begin(),
             prompt.begin() + static_cast<std::ptrdiff_t>(
                 match.matched_tokens));
-        std::optional<TextSessionState> state;
-        try {
-            state.emplace(decode_cuda_paged_session(
-                payloads,
-                matched_tokens,
-                paged_cache_->block_size_tokens()));
-        } catch (const std::exception & error) {
-            if (!match.blocks.empty()) {
+        const auto fail = [&](const char* action,
+                              const std::exception& error,
+                              bool invalidate) {
+            if (invalidate && !match.blocks.empty()) {
                 paged_cache_->invalidate(match.blocks.back());
             }
             paged_cache_->record_match(0);
             model.reset(1);
             std::cerr
-                << "runtime_session_cache backend=cuda "
-                << "action=paged_codec_invalidate "
-                << "session=" << requested_session
+                << "runtime_session_cache backend=cuda action=" << action
+                << " session=" << requested_session
                 << " error=" << error.what() << std::endl;
-            return 0;
-        }
+            return size_t{0};
+        };
+        const char* invalid_action = "paged_codec_invalidate";
+        const char* failure_action = "paged_codec_failed";
         try {
-            model.restore_text_session_state(*state);
+            auto state = decode_cuda_paged_session(
+                payloads,
+                matched_tokens,
+                paged_cache_->block_size_tokens());
+            invalid_action = "paged_restore_invalidate";
+            failure_action = "paged_restore_failed";
+            model.restore_text_session_state(state);
             if (!requested_session.empty()) {
                 paged_bindings_.bind(
                     requested_session, match.blocks, match.matched_tokens);
@@ -366,15 +369,10 @@ private:
                     << prompt.size() - match.matched_tokens << std::endl;
             }
             return match.matched_tokens;
-        } catch (const std::exception & error) {
-            paged_cache_->record_match(0);
-            model.reset(1);
-            std::cerr
-                << "runtime_session_cache backend=cuda "
-                << "action=paged_restore_failed "
-                << "session=" << requested_session
-                << " error=" << error.what() << std::endl;
-            return 0;
+        } catch (const CudaSessionStateError& error) {
+            return fail(invalid_action, error, true);
+        } catch (const std::exception& error) {
+            return fail(failure_action, error, false);
         }
     }
 
@@ -498,21 +496,20 @@ uint64_t TextSessionCache::trim_hot(uint64_t target_bytes) {
     return impl_->trim_hot(target_bytes);
 }
 
-#define MFQ_INSTANTIATE_SESSION_CACHE(BACKBONE)                           \
-    template TextSessionRestore TextSessionCache::restore_best(          \
-        mfq::cuda::CausalLmFor<BACKBONE>&, MtpModule*,                   \
-        const std::string&, const std::vector<int64_t>&,                 \
-        size_t, const std::string&);
+#define MFQ_INSTANTIATE_SESSION_CACHE(MODEL)                              \
+    template TextSessionRestore TextSessionCache::restore_best(           \
+        MODEL&, MtpModule*, const std::string&,                            \
+        const std::vector<int64_t>&, size_t, const std::string&);
 
-MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::CudaBackbone::generic_qwen)
-MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::CudaBackbone::minicpmo45)
-MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::CudaBackbone::minicpmo_tts)
-MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::CudaBackbone::gemma4)
-MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::CudaBackbone::glm_dsa)
-MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::CudaBackbone::glm5_next)
-MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::CudaBackbone::qwen4_exp)
-MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::CudaBackbone::deepseek_v4)
-MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::CudaBackbone::deepseek_v41)
+MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::Qwen35CausalLm)
+MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::MiniCPMO45CausalLm)
+MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::MiniCPMOTtsCausalLm)
+MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::Gemma4CausalLm)
+MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::GlmDsaCausalLm)
+MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::Glm5CausalLm)
+MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::Qwen4CausalLm)
+MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::DeepseekV4CausalLm)
+MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::DeepseekV41CausalLm)
 
 #undef MFQ_INSTANTIATE_SESSION_CACHE
 

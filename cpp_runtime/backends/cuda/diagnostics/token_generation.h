@@ -44,7 +44,7 @@ int generate_diagnostic_tokens(Model& model, mfq_tensor_backend::Tensor ids,
             std::atoi(profile_graph_env) != 0;
         bool use_cuda_graph =
             (graph_env == nullptr || graph_env[0] != '0') &&
-            !Model::is_flash_next &&
+            !model.metadata.flash_next &&
             mfq_cuda_graph_capture_supported() &&
             execution.dsv4_cpu_offload_layers.empty() &&
             execution.dense_cpu_layer_count == 0 &&

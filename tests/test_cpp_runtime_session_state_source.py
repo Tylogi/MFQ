@@ -2,6 +2,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
+CUDA_SESSION_CACHE = (CUDA_ROOT / "engine" / "text_session_cache.cpp").read_text(
+    encoding="utf-8"
+)
+CUDA_CAUSAL_LM_HEADER = (CUDA_ROOT / "models" / "causal_lm.h").read_text(
+    encoding="utf-8"
+)
+CUDA_CAUSAL_LM_SOURCE = (CUDA_ROOT / "models" / "causal_lm.cpp").read_text(
+    encoding="utf-8"
+)
 DECODE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(CUDA_ROOT.rglob("*"))
@@ -110,6 +119,16 @@ def test_partial_stable_prefix_is_saved_before_generation_suffix() -> None:
 
 
 def test_qwen_hybrid_and_mtp_session_state_are_restored_together() -> None:
+    assert "using TextSessionPayload = std::variant<" in CUDA_CAUSAL_LM_HEADER
+    assert "TextSessionPayload payload;" in CUDA_CAUSAL_LM_HEADER
+    assert "TextSessionStateKind kind =" not in CUDA_CAUSAL_LM_HEADER
+    assert "payload.index()" in CUDA_CAUSAL_LM_HEADER
+    for obsolete in (
+        "hybrid_blocks;",
+        "dsv4_blocks;",
+        "glm_dsa_blocks;",
+    ):
+        assert obsolete not in CUDA_CAUSAL_LM_HEADER
     assert "TextSessionStateKind::HybridAttention" in DECODE
     assert "saved.convolution_state = linear->conv_state.clone()" in DECODE
     assert "saved.recurrent_state = linear->gdn_state.clone()" in DECODE
@@ -258,6 +277,19 @@ def test_metal_paged_codec_preserves_raw_kv_tensor_storage() -> None:
     assert "MFQ_SERVER_PREFIX_CACHE_PENDING_BYTES" in METAL_DECODE
     assert "prefix_cache_pending_max_bytes" in METAL_DECODE
     assert "paged_cache_->load_prefix(match.blocks)" in METAL_DECODE
+
+
+def test_cuda_paged_restore_invalidates_only_deterministic_state_errors() -> None:
+    assert "class CudaSessionStateError" in CUDA_CAUSAL_LM_HEADER
+    assert "throw CudaSessionStateError(" in CUDA_CAUSAL_LM_SOURCE
+    restore = CUDA_SESSION_CACHE.split("size_t restore_paged(", 1)[1].split(
+        "void store_paged(", 1
+    )[0]
+    corrupt, transient = restore.split(
+        "catch (const CudaSessionStateError& error)", 1
+    )[1].split("catch (const std::exception& error)", 1)
+    assert "return fail(invalid_action, error, true);" in corrupt
+    assert "return fail(failure_action, error, false);" in transient
 
 
 def test_cuda_paged_cache_only_accepts_linear_full_attention_kv() -> None:

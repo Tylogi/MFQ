@@ -55,6 +55,39 @@ make_cuda_continuous_batching(
     mfq::engine::GenerationConfig generation);
 
 template <>
+RuntimeComponents<mfq::cuda::Qwen35CausalLm>
+load_runtime_components(
+    mfq::cuda::Qwen35CausalLm& model,
+    bool load_optional_components);
+
+template <>
+RuntimeComponents<mfq::cuda::Qwen4CausalLm>
+load_runtime_components(
+    mfq::cuda::Qwen4CausalLm& model,
+    bool load_optional_components);
+
+template <>
+RuntimeComponents<mfq::cuda::Glm5CausalLm>
+load_runtime_components(
+    mfq::cuda::Glm5CausalLm& model,
+    bool load_optional_components);
+
+template <>
+RuntimeComponents<mfq::cuda::DeepseekV41CausalLm>
+load_runtime_components(
+    mfq::cuda::DeepseekV41CausalLm& model,
+    bool load_optional_components);
+
+template <>
+std::unique_ptr<mfq::engine::ContinuousBatching>
+make_cuda_continuous_batching(
+    mfq::cuda::Qwen35CausalLm& model,
+    CudaExecutionContext& execution,
+    std::mutex& model_mutex,
+    const mfq::cuda::CudaContinuousBatchConfig& config,
+    mfq::engine::GenerationConfig generation);
+
+template <>
 RuntimeComponents<mfq::cuda::MiniCPMO45CausalLm>
 load_runtime_components(
     mfq::cuda::MiniCPMO45CausalLm& model,

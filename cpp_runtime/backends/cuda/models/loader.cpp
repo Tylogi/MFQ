@@ -1,31 +1,13 @@
 #include "causal_lm.h"
 
-#include "models/transformer.h"
 #include "storage/moe_expert_cache.h"
 #include "../models/registry.h"
-#include "../models/deepseek_v4/causal_lm.h"
-#include "../models/deepseek_v41/causal_lm.h"
-#include "../models/glm5_next/causal_lm.h"
-#include "../models/qwen4_exp/causal_lm.h"
-#include "../models/gemma4/causal_lm.h"
-#include "../models/glm_dsa/causal_lm.h"
-#include "../models/qwen35/causal_lm.h"
 
 #include <algorithm>
-#include <bit>
-#include <cmath>
-#include <cstdint>
 #include <iostream>
-#include <unordered_map>
 #include <utility>
 
 namespace {
-
-float round_to_bfloat16(float value) {
-    auto bits = std::bit_cast<std::uint32_t>(value);
-    bits += 0x7fffU + ((bits >> 16U) & 1U);
-    return std::bit_cast<float>(bits & 0xffff0000U);
-}
 
 template <typename Model, typename Loader>
 void load_model_blocks(Model& model, Loader&& load) {
@@ -48,10 +30,47 @@ void load_model_blocks(Model& model, Loader&& load) {
     }
 }
 
+mfq::cuda::CudaBackbone expected_backbone(
+        const mfq::cuda::Qwen35CausalLm&) {
+    return mfq::cuda::CudaBackbone::generic_qwen;
+}
+mfq::cuda::CudaBackbone expected_backbone(
+        const mfq::cuda::MiniCPMO45CausalLm&) {
+    return mfq::cuda::CudaBackbone::minicpmo45;
+}
+mfq::cuda::CudaBackbone expected_backbone(
+        const mfq::cuda::MiniCPMOTtsCausalLm&) {
+    return mfq::cuda::CudaBackbone::minicpmo_tts;
+}
+mfq::cuda::CudaBackbone expected_backbone(
+        const mfq::cuda::Gemma4CausalLm&) {
+    return mfq::cuda::CudaBackbone::gemma4;
+}
+mfq::cuda::CudaBackbone expected_backbone(
+        const mfq::cuda::GlmDsaCausalLm&) {
+    return mfq::cuda::CudaBackbone::glm_dsa;
+}
+mfq::cuda::CudaBackbone expected_backbone(
+        const mfq::cuda::Glm5CausalLm&) {
+    return mfq::cuda::CudaBackbone::glm5_next;
+}
+mfq::cuda::CudaBackbone expected_backbone(
+        const mfq::cuda::Qwen4CausalLm&) {
+    return mfq::cuda::CudaBackbone::qwen4_exp;
+}
+mfq::cuda::CudaBackbone expected_backbone(
+        const mfq::cuda::DeepseekV4CausalLm&) {
+    return mfq::cuda::CudaBackbone::deepseek_v4;
+}
+mfq::cuda::CudaBackbone expected_backbone(
+        const mfq::cuda::DeepseekV41CausalLm&) {
+    return mfq::cuda::CudaBackbone::deepseek_v41;
+}
+
 } // namespace
 
-template <mfq::cuda::CudaBackbone Kind>
-mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
+template <typename Model>
+Model mfq::cuda::load_causal_lm(
         CudaExecutionContext& execution,
         const std::string& model_path,
         const std::string& config_path,
@@ -59,7 +78,7 @@ mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
         bool load_blocks,
         bool defer_moe_cache_finalize,
         std::shared_ptr<const mfq::ModelSource> model_source) {
-    CausalLmFor<Kind> model;
+    Model model;
     model.execution = &execution;
     model.source = model_source
         ? std::move(model_source)
@@ -69,112 +88,17 @@ mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
     model.graph = source.resolved_model_graph();
     model.plan = cuda_model_plan(model.graph);
     MFQ_RUNTIME_CHECK(
-        model.plan.backbone == Kind,
+        cuda_backbone(model.graph.backbone) == expected_backbone(model),
         "loaded CUDA backbone does not match the requested causal LM type");
 
-    const auto payload = load_model_config_json(source, config_path);
-    if constexpr (Kind == CudaBackbone::generic_qwen) {
-        model.config = qwen35::Config::from_json(payload, model.graph);
-        model.config.legacy_tensor_layout =
-            source.legacy_tensor_compatibility().layout;
-        if (model.graph.component("vision") != nullptr &&
-                model.plan.vision != CudaVisionAdapter::grid_vit) {
-            throw std::runtime_error(
-                "Qwen CUDA vision requires grid_vit/grid_vision.v1/grid_mrope");
-        }
-    } else if constexpr (Kind == CudaBackbone::minicpmo45) {
-        model.config =
-            mfq::models::minicpmo45::Config::from_json(payload);
-        if (model.config.model_type.empty()) {
-            model.config.model_type = model.graph.architecture;
-        }
-        model.config.rotary_dim = model.config.head_dim;
-        model.config.layer_types.assign(
-            static_cast<std::size_t>(model.config.num_hidden_layers),
-            "full_attention");
-        if (model.config.hidden_size != 4096 ||
-                model.config.intermediate_size != 12288 ||
-                model.config.num_hidden_layers != 36 ||
-                model.config.num_attention_heads != 32 ||
-                model.config.num_key_value_heads != 8 ||
-                model.config.head_dim != 128 ||
-                model.config.hidden_act != "silu" ||
-                model.config.attention_bias ||
-                model.config.use_sliding_window) {
-            throw std::runtime_error(
-                "unsupported MiniCPM-o 4.5 Qwen3 CUDA configuration");
-        }
-    } else if constexpr (Kind == CudaBackbone::minicpmo_tts) {
-        model.config = mfq::models::ModelConfig::from_json(payload);
-    } else if constexpr (Kind == CudaBackbone::gemma4) {
-        model.config = gemma4::Config::from_json(payload);
-        model.embed_scale = round_to_bfloat16(static_cast<float>(
-            std::sqrt(static_cast<double>(model.config.hidden_size))));
-    } else if constexpr (Kind == CudaBackbone::glm_dsa) {
-        model.config = glm_dsa::Config::from_json(payload);
-        model.config.layer_types.assign(
-            static_cast<std::size_t>(model.config.num_hidden_layers),
-            "glm_dsa");
-        model.config.rotary_dim = model.config.qk_rope_head_dim;
-        const auto& config = model.config;
-        if (config.q_lora_rank <= 0 || config.kv_lora_rank <= 0 ||
-                config.qk_nope_head_dim <= 0 ||
-                config.qk_rope_head_dim <= 0 || config.v_head_dim <= 0 ||
-                config.index_head_dim <= 0 || config.index_n_heads <= 0 ||
-                config.index_topk <= 0 || config.num_experts <= 0 ||
-                config.num_experts_per_tok <= 0 ||
-                config.num_attention_heads != 64 ||
-                config.num_key_value_heads != 64 ||
-                config.kv_lora_rank != 512 ||
-                config.qk_nope_head_dim != 192 ||
-                config.qk_rope_head_dim != 64 || config.v_head_dim != 256 ||
-                config.index_head_dim != 128 || config.index_n_heads != 32 ||
-                config.index_topk != 2048 ||
-                config.qk_head_dim !=
-                    config.qk_nope_head_dim + config.qk_rope_head_dim ||
-                config.attention_bias || !config.rope_interleave ||
-                !config.indexer_rope_interleave ||
-                config.hidden_act != "silu" ||
-                config.expert_group_count != 1 ||
-                config.selected_group_count != 1 ||
-                config.shared_expert_count != 1 ||
-                config.scoring_func != "sigmoid" ||
-                config.topk_method != "noaux_tc") {
-            throw std::runtime_error(
-                "unsupported GLM DSA CUDA configuration");
-        }
-    } else if constexpr (Kind == CudaBackbone::glm5_next) {
-        model.config =
-            mfq::models::glm5_next::Config::from_json(payload);
-    } else if constexpr (Kind == CudaBackbone::qwen4_exp) {
-        model.config =
-            mfq::models::qwen4_exp::Config::from_json(payload);
-    } else if constexpr (Kind == CudaBackbone::deepseek_v4) {
-        model.config = deepseek_v4::Config::from_json(payload);
-        model.config.layer_types.assign(
-            static_cast<std::size_t>(model.config.num_hidden_layers),
-            "deepseek_v4");
-    } else if constexpr (Kind == CudaBackbone::deepseek_v41) {
-        model.config =
-            mfq::models::deepseek_v41::Config::from_json(payload);
-    }
+    model.adapter_load_config(
+        load_model_config_json(source, config_path), model.graph, source);
 
     if (model.num_hidden_layers() != model.graph.topology.text_layers) {
         throw std::runtime_error(
             "model graph/config text-layer topology mismatch");
     }
-    if constexpr (Kind == CudaBackbone::qwen4_exp) {
-        qwen4_exp::validate_load_options();
-    }
-    if constexpr (Kind == CudaBackbone::glm5_next) {
-        glm5_next::validate_load_options();
-    }
-    if constexpr (Kind == CudaBackbone::deepseek_v41) {
-        deepseek_v41_runtime::validate_load_options();
-    }
-    if constexpr (Kind == CudaBackbone::deepseek_v4) {
-        deepseek_v4::validate_load_options(model.config);
-    }
+    model.adapter_validate_load_options();
     if (execution.expert_parallel.enabled() && model.num_experts() <= 0) {
         throw std::runtime_error(
             "--expert-parallel requires a model with routed experts");
@@ -192,11 +116,9 @@ mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
                 throw std::runtime_error(
                     "--n-gpu-layers cannot be combined with tensor/expert/layer parallelism");
             }
-            constexpr bool dense_qwen_style =
-                Kind == CudaBackbone::generic_qwen ||
-                Kind == CudaBackbone::minicpmo45 ||
-                Kind == CudaBackbone::minicpmo_tts;
-            bool supported = dense_qwen_style && model.num_experts() <= 0;
+            bool supported =
+                model.adapter_supports_dense_cpu_offload() &&
+                model.num_experts() <= 0;
             for (int layer = 0; supported &&
                     layer < model.num_hidden_layers(); ++layer) {
                 const auto type = model.layer_type(layer);
@@ -232,22 +154,13 @@ mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
         model.set_max_position_embeddings(context_size_override);
     }
 
-    if constexpr (Kind == CudaBackbone::generic_qwen ||
-                  Kind == CudaBackbone::minicpmo45 ||
-                  Kind == CudaBackbone::minicpmo_tts ||
-                  Kind == CudaBackbone::glm_dsa) {
+    if (model.adapter_uses_common_rope()) {
         auto make_rope = [&](mfq_tensor_backend::Device device) {
             RopeCache rope(
                 model.max_position_embeddings(), model.rotary_dim(),
                 model.rope_base(), 0, -1, device,
-                Kind == CudaBackbone::minicpmo45);
-            if constexpr (Kind == CudaBackbone::generic_qwen) {
-                rope.configure_mrope(
-                    model.config.mrope_sections,
-                    model.config.mrope_interleaved,
-                    model.config.rotary_dim,
-                    device);
-            }
+                model.metadata.rope_interleaved);
+            model.adapter_configure_rope(rope, device);
             return rope;
         };
         const auto primary = mfq_tensor_backend::Device(
@@ -270,21 +183,9 @@ mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
     }
 
     const std::string embed_name = "model.token_embedding.weight";
-    const std::string norm_name = "model.output_norm.weight";
     const std::string output_name = "model.output.weight";
     model.embed = load_quant_linear(source, embed_name);
-    if constexpr (Kind == CudaBackbone::qwen4_exp) {
-        model.final_mixer =
-            qwen4_exp::load_final_mixer(source, model.config);
-    } else {
-        model.output_norm = load_dense_gpu(source, norm_name);
-    }
-    if constexpr (Kind == CudaBackbone::deepseek_v4) {
-        auto head = deepseek_v4::load_output_head(source);
-        model.hc_head_fn = std::move(head.function);
-        model.hc_head_scale = std::move(head.scale);
-        model.hc_head_base = std::move(head.base);
-    }
+    model.adapter_load_final_state(source, model.output_norm);
     if (model.tie_word_embeddings() || !has_tensor(source, output_name)) {
         model.lm_head = execution.tensor_parallel.enabled()
             ? load_quant_linear(
@@ -296,64 +197,12 @@ mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
     }
 
     if (load_blocks) {
-        if constexpr (Kind == CudaBackbone::qwen4_exp) {
-            load_model_blocks(model, [&](int layer, int, const std::string&) {
-                return qwen4_exp::load_block(source, model.config, layer);
-            });
-        } else if constexpr (Kind == CudaBackbone::glm5_next) {
-            load_model_blocks(model, [&](int layer, int, const std::string&) {
-                return glm5_next::load_block(source, model.config, layer);
-            });
-        } else if constexpr (Kind == CudaBackbone::deepseek_v41) {
-            model.shared = deepseek_v41_runtime::load_shared_state(
-                source, model.config);
-            load_model_blocks(model, [&](int layer, int,
-                                         const std::string& type) {
-                MFQ_RUNTIME_CHECK(
-                    type == "deepseek_v41" && model.shared,
-                    "invalid DeepSeek-V4.1 block loader state");
-                return deepseek_v41_runtime::load_block(
-                    source, layer, model.shared);
-            });
-        } else if constexpr (Kind == CudaBackbone::deepseek_v4) {
-            std::unordered_map<int, std::shared_ptr<Dsv4SharedState>> states;
-            load_model_blocks(model, [&](int layer, int device,
-                                         const std::string& type) {
-                auto& state = states[device];
-                if (!state) state = std::make_shared<Dsv4SharedState>();
-                return deepseek_v4::load_block(
-                    source, model.config, layer, type, state);
-            });
-        } else if constexpr (Kind == CudaBackbone::glm_dsa) {
-            std::unordered_map<int, std::shared_ptr<GlmDsaSharedState>> states;
-            load_model_blocks(model, [&](int layer, int device,
-                                         const std::string& type) {
-                auto& state = states[device];
-                if (!state) state = std::make_shared<GlmDsaSharedState>();
-                return glm_dsa::load_block(
-                    source, model.config, layer, type, state);
-            });
-        } else if constexpr (Kind == CudaBackbone::gemma4) {
-            load_model_blocks(model, [&](int layer, int,
-                                         const std::string& type) {
-                return gemma4::load_block(
-                    source, model.config, layer, type);
-            });
-        } else if constexpr (Kind == CudaBackbone::generic_qwen) {
-            load_model_blocks(model, [&](int layer, int,
-                                         const std::string& type) {
-                return qwen35::load_block(
-                    source, model.config, layer, type);
-            });
-        } else if constexpr (Kind == CudaBackbone::minicpmo45 ||
-                             Kind == CudaBackbone::minicpmo_tts) {
-            load_model_blocks(model, [&](int layer, int,
-                                         const std::string& type) {
-                return load_transformer_block(
-                    source, model.config, layer, type,
-                    Kind == CudaBackbone::minicpmo45);
-            });
-        }
+        model.adapter_prepare_blocks(source);
+        load_model_blocks(model, [&](int layer, int device,
+                                     const std::string& type) {
+            return model.adapter_load_block(
+                source, layer, device, type);
+        });
     }
 
     execution.loading_cpu_layer = false;
@@ -367,28 +216,19 @@ mfq::cuda::CausalLmFor<Kind> mfq::cuda::load_causal_lm(
     return model;
 }
 
-#define MFQ_INSTANTIATE_CAUSAL_LM(BACKBONE, TYPE)                         \
-    template TYPE mfq::cuda::load_causal_lm<BACKBONE>(                   \
-        CudaExecutionContext&, const std::string&, const std::string&,   \
+#define MFQ_INSTANTIATE_CAUSAL_LM(TYPE)                                   \
+    template TYPE mfq::cuda::load_causal_lm<TYPE>(                        \
+        CudaExecutionContext&, const std::string&, const std::string&,     \
         int64_t, bool, bool, std::shared_ptr<const mfq::ModelSource>)
 
-MFQ_INSTANTIATE_CAUSAL_LM(
-    mfq::cuda::CudaBackbone::generic_qwen, mfq::cuda::Qwen35CausalLm);
-MFQ_INSTANTIATE_CAUSAL_LM(
-    mfq::cuda::CudaBackbone::minicpmo45, mfq::cuda::MiniCPMO45CausalLm);
-MFQ_INSTANTIATE_CAUSAL_LM(
-    mfq::cuda::CudaBackbone::minicpmo_tts, mfq::cuda::MiniCPMOTtsCausalLm);
-MFQ_INSTANTIATE_CAUSAL_LM(
-    mfq::cuda::CudaBackbone::gemma4, mfq::cuda::Gemma4CausalLm);
-MFQ_INSTANTIATE_CAUSAL_LM(
-    mfq::cuda::CudaBackbone::glm_dsa, mfq::cuda::GlmDsaCausalLm);
-MFQ_INSTANTIATE_CAUSAL_LM(
-    mfq::cuda::CudaBackbone::glm5_next, mfq::cuda::Glm5CausalLm);
-MFQ_INSTANTIATE_CAUSAL_LM(
-    mfq::cuda::CudaBackbone::qwen4_exp, mfq::cuda::Qwen4CausalLm);
-MFQ_INSTANTIATE_CAUSAL_LM(
-    mfq::cuda::CudaBackbone::deepseek_v4, mfq::cuda::DeepseekV4CausalLm);
-MFQ_INSTANTIATE_CAUSAL_LM(
-    mfq::cuda::CudaBackbone::deepseek_v41, mfq::cuda::DeepseekV41CausalLm);
+MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::Qwen35CausalLm);
+MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::MiniCPMO45CausalLm);
+MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::MiniCPMOTtsCausalLm);
+MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::Gemma4CausalLm);
+MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::GlmDsaCausalLm);
+MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::Glm5CausalLm);
+MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::Qwen4CausalLm);
+MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::DeepseekV4CausalLm);
+MFQ_INSTANTIATE_CAUSAL_LM(mfq::cuda::DeepseekV41CausalLm);
 
 #undef MFQ_INSTANTIATE_CAUSAL_LM

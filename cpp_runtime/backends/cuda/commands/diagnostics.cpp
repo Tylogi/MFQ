@@ -419,11 +419,11 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
         mfq_tensor_backend::NoGradGuard no_grad;
         return with_loaded_cuda_model(*this,
             check_qwen35_mtp || check_flash_next_mtp || !bench_qwen35_mtp.empty(),
-            [&]<mfq::cuda::CudaBackbone Backbone>(auto& model,
-                    auto& runtime_components, auto t0, auto t1) -> int {
+            [&](auto& model, auto& runtime_components,
+                    auto t0, auto t1) -> int {
+        using Model = std::remove_cvref_t<decltype(model)>;
         if (check_continuous_batching) {
-            if constexpr (
-                    Backbone == mfq::cuda::CudaBackbone::generic_qwen) {
+            if constexpr (std::is_same_v<Model, mfq::cuda::Qwen35CausalLm>) {
                 return run_cuda_continuous_batching_check(model);
             }
             throw std::runtime_error(
@@ -431,8 +431,8 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
         }
         if (check_flash_next) {
             if constexpr (
-                    Backbone == mfq::cuda::CudaBackbone::qwen4_exp ||
-                    Backbone == mfq::cuda::CudaBackbone::glm5_next) {
+                    std::is_same_v<Model, mfq::cuda::Qwen4CausalLm> ||
+                    std::is_same_v<Model, mfq::cuda::Glm5CausalLm>) {
                 return run_flash_next_check(model);
             }
             throw std::runtime_error(
@@ -440,10 +440,10 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
         }
         if (check_flash_next_mtp) {
             if constexpr (
-                    Backbone == mfq::cuda::CudaBackbone::qwen4_exp ||
-                    Backbone == mfq::cuda::CudaBackbone::glm5_next) {
+                    std::is_same_v<Model, mfq::cuda::Qwen4CausalLm> ||
+                    std::is_same_v<Model, mfq::cuda::Glm5CausalLm>) {
                 using Predictor=std::conditional_t<
-                    Backbone==mfq::cuda::CudaBackbone::qwen4_exp,
+                    std::is_same_v<Model, mfq::cuda::Qwen4CausalLm>,
                     mfq::cuda::qwen4_exp::Qwen4ExpMtp,
                     mfq::cuda::glm5_next::Glm5NextMtp>;
                 auto* predictor=dynamic_cast<Predictor*>(runtime_components.mtp.get());
@@ -455,8 +455,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 "Flash-Next MTP diagnostic requires a Flash-Next causal LM");
         }
         if (check_qwen35_mtp) {
-            if constexpr (
-                    Backbone == mfq::cuda::CudaBackbone::generic_qwen) {
+            if constexpr (std::is_same_v<Model, mfq::cuda::Qwen35CausalLm>) {
                 auto* predictor = dynamic_cast<Qwen35Mtp*>(
                     runtime_components.mtp.get());
                 MFQ_RUNTIME_CHECK(predictor != nullptr,
@@ -467,8 +466,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 "--check-qwen35-mtp requires Qwen35CausalLm");
         }
         if (!bench_qwen35_mtp.empty()) {
-            if constexpr (
-                    Backbone == mfq::cuda::CudaBackbone::generic_qwen) {
+            if constexpr (std::is_same_v<Model, mfq::cuda::Qwen35CausalLm>) {
                 auto* predictor = dynamic_cast<Qwen35Mtp*>(
                     runtime_components.mtp.get());
                 MFQ_RUNTIME_CHECK(predictor != nullptr,

@@ -1467,7 +1467,7 @@ struct MiniCPMO45Runtime {
             int64_t context_size) {
         return load_with_language(
             mfq::cuda::load_causal_lm<
-                mfq::cuda::CudaBackbone::minicpmo45>(
+                mfq::cuda::MiniCPMO45CausalLm>(
                     model_path, config_path, context_size));
     }
 

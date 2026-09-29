@@ -859,5 +859,11 @@ std::unique_ptr<::Block> load_block(
     const std::shared_ptr<::Dsv4SharedState>& state);
 void validate_load_options(const Config& config);
 OutputHeadWeights load_output_head(const mfq::ModelSource& source);
+mfq_tensor_backend::Tensor finalize_hidden(
+    mfq_tensor_backend::Tensor hidden,
+    const OutputHeadWeights& output_head,
+    const Config& config,
+    int64_t batch,
+    int64_t tokens);
 
 } // namespace mfq::cuda::deepseek_v4

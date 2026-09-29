@@ -15,5 +15,6 @@ std::unique_ptr<::Block> load_block(
 std::unique_ptr<Gr> load_final_mixer(
     const mfq::ModelSource& source,
     const mfq::models::qwen4_exp::Config& config);
+Tensor finalize_hidden(const Gr& mixer, const Tensor& hidden);
 
 } // namespace mfq::cuda::qwen4_exp

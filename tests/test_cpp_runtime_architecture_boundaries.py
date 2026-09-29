@@ -102,6 +102,10 @@ CUDA_CAUSAL_LM = (CUDA_MODELS / "causal_lm.h").read_text(
 CUDA_CAUSAL_LM_SOURCE = (CUDA_MODELS / "causal_lm.cpp").read_text(
     encoding="utf-8"
 )
+CUDA_MODEL_FINALIZERS = {
+    name: (CUDA_MODELS / name / "causal_lm.cpp").read_text(encoding="utf-8")
+    for name in ("qwen4_exp", "glm5_next", "deepseek_v4", "deepseek_v41")
+}
 CUDA_QWEN_BATCH_HEADER = (
     CUDA_MODELS / "qwen35" / "batch_executor.h"
 ).read_text(encoding="utf-8")
@@ -312,17 +316,36 @@ def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
         CUDA_MODELS / "loader.cpp"
     ).read_text(encoding="utf-8")
     assert "struct CudaSessionCodec" in CUDA_CAUSAL_LM
-    assert "return CudaSessionCodec<Backbone>::capture" in CUDA_CAUSAL_LM
-    assert "CudaSessionCodec<Backbone>::capture" in CUDA_CAUSAL_LM_SOURCE
+    assert "return CudaSessionCodec<Model>::capture" in CUDA_CAUSAL_LM
+    assert "CudaSessionCodec<Model>::capture" in CUDA_CAUSAL_LM_SOURCE
     assert "void begin_speculative_suffix(int64_t draft_tokens);" in CUDA_CAUSAL_LM
     causal_lm_source = (
         CUDA_MODELS / "causal_lm.cpp"
     ).read_text(encoding="utf-8")
-    assert "CausalLm<Backbone>::begin_speculative_suffix" in causal_lm_source
-    assert "CausalLm<Backbone>::finalize_hidden" in causal_lm_source
+    assert "CausalLm<Model>::begin_speculative_suffix" in causal_lm_source
+    assert "CausalLm<Model>::finalize_hidden" in causal_lm_source
+    assert "if constexpr" not in causal_lm_source
+    assert "CudaBackbone" not in CUDA_CAUSAL_LM + causal_lm_source
     assert "struct Request" not in CUDA_QWEN_BATCH_HEADER
     assert "struct QwenBatchExecutor::Impl" in CUDA_QWEN_BATCH_SOURCE
     assert len(CUDA_QWEN_BATCH_HEADER.splitlines()) < 80
+
+
+def test_cuda_model_finalizers_live_with_their_models() -> None:
+    for name, source in CUDA_MODEL_FINALIZERS.items():
+        namespace = "deepseek_v41_runtime" if name == "deepseek_v41" else name
+        assert f"{namespace}::finalize_hidden" not in CUDA_CAUSAL_LM_SOURCE
+        assert f"{namespace}::finalize_hidden" in source
+    for implementation in (
+        '"model.dsv4_hc_head"',
+        '"model.deepseek_v41.final_collapse"',
+        "final_mixer->pre(",
+        "x.mean(2)",
+    ):
+        assert implementation not in CUDA_CAUSAL_LM_SOURCE
+    assert "output_head = deepseek_v4::load_output_head(source);" in (
+        CUDA_MODEL_FINALIZERS["deepseek_v4"]
+    )
 
 
 def test_cuda_runtime_composes_transport_scheduler_and_engine() -> None:
@@ -484,7 +507,7 @@ def test_native_runtime_prewarms_shared_ssd_arenas_on_load_and_reload() -> None:
         DECODE_APP.index("int run_loaded_runtime(") :
         DECODE_APP.index("int run_native_runtime(")
     ]
-    assert "runtime.prewarm_ssd_expert_arena();" in serving
+    assert "model.prewarm_ssd_expert_arena();" in serving
     # Three capability checks and their matching calls cover initial load,
     # successful context reload, and restoration after a failed reload.
     assert serving.count(".prewarm_ssd_expert_arena();") == 6
@@ -830,8 +853,12 @@ def test_model_config_parsing_is_backend_neutral() -> None:
     ):
         assert field in qwen_config
 
-    assert CUDA_CAUSAL_LM_LOADER.count("Config::from_json(payload)") == 8
-    for namespace in (
+    assert "Config::from_json" not in CUDA_CAUSAL_LM_LOADER
+    assert "if constexpr" not in CUDA_CAUSAL_LM_LOADER
+    assert "if constexpr" not in (
+        CUDA_MODELS / "components.cpp"
+    ).read_text(encoding="utf-8")
+    model_names = (
         "minicpmo45",
         "glm5_next",
         "qwen4_exp",
@@ -840,7 +867,13 @@ def test_model_config_parsing_is_backend_neutral() -> None:
         "glm_dsa",
         "gemma4",
         "deepseek_v4",
-    ):
+    )
+    model_loaders = "\n".join(
+        (CUDA_MODELS / name / "causal_lm.cpp").read_text(encoding="utf-8")
+        for name in model_names
+    )
+    assert model_loaders.count("Config::from_json") == 9
+    for namespace in model_names:
         assert not (CUDA_MODELS / namespace / f"{namespace}_model.h").exists()
         assert not (CUDA_MODELS / namespace / f"{namespace}_model.cpp").exists()
 
@@ -999,7 +1032,8 @@ def test_cuda_qwen_linear_ffn_matches_residual_dtype() -> None:
 
 def test_cuda_mtp_generation_loop_is_architecture_independent_and_reversible() -> None:
     generation = CUDA_MTP_SOURCE
-    assert "run_mtp_generation(" in generation
+    implementation = generation[: generation.index("#define MFQ_INSTANTIATE_MTP")]
+    assert "run_mtp_generation(" in implementation
     assert "int32_t run_mtp_generation(" not in CUDA_RUNTIME_SOURCE
     for architecture_name in (
         "Qwen",
@@ -1008,7 +1042,7 @@ def test_cuda_mtp_generation_loop_is_architecture_independent_and_reversible() -
         "Flash",
         "MiniCPM",
     ):
-        assert architecture_name not in generation
+        assert architecture_name not in implementation
     assert "should_exit" not in generation
     assert "should_exit" not in CUDA_MTP_HEADER
     assert "exit_streak" not in CUDA_MTP_HEADER

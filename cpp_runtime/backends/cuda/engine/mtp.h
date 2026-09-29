@@ -104,9 +104,9 @@ struct MtpModule {
     uint64_t last_rejected = 0;
 };
 
-template <mfq::cuda::CudaBackbone Backbone>
+template <typename Model>
 int32_t run_mtp_generation(
-    mfq::cuda::CausalLmFor<Backbone>& model,
+    Model& model,
     MtpModule& mtp,
     const std::vector<int64_t>& prompt,
     const MfqSamplingParams& sampling,

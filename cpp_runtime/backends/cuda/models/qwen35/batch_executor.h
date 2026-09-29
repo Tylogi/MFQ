@@ -14,9 +14,10 @@
 struct CudaExecutionContext;
 
 namespace mfq::cuda {
-template <CudaBackbone Backbone>
+struct Qwen35Model;
+template <typename Model>
 struct CausalLm;
-using Qwen35CausalLm = CausalLm<CudaBackbone::generic_qwen>;
+using Qwen35CausalLm = CausalLm<Qwen35Model>;
 }
 
 namespace mfq::cuda::qwen35 {

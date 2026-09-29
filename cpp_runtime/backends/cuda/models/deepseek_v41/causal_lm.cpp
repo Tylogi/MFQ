@@ -1,5 +1,8 @@
 #include "causal_lm.h"
 
+#include "../causal_lm.h"
+#include "../components.h"
+
 namespace mfq::cuda::deepseek_v41_runtime {
 
 std::unique_ptr<::Block> load_block(
@@ -179,4 +182,183 @@ std::shared_ptr<SharedState> load_shared_state(
     return state;
 }
 
+Tensor finalize_hidden(
+        const std::shared_ptr<SharedState>& state,
+        const Tensor& hidden) {
+    MFQ_RUNTIME_CHECK(
+        state,
+        "DeepSeek-V4.1 final state is unavailable");
+    return g_profiler.measure(
+        "model.deepseek_v41.final_collapse", [&]() {
+            return state->final_collapse(
+                hidden, state->config.n_layers);
+        });
+}
+
 } // namespace mfq::cuda::deepseek_v41_runtime
+
+namespace mfq::cuda {
+
+void DeepseekV41Model::adapter_load_config(
+        std::string_view payload,
+        const mfq::ModelGraph&,
+        const mfq::ModelSource&) {
+    config = mfq::models::deepseek_v41::Config::from_json(payload);
+    metadata.vocab_size = config.vocab;
+    metadata.hidden_size = config.hidden;
+    metadata.num_hidden_layers = config.n_layers;
+    metadata.num_attention_heads = config.n_heads;
+    metadata.num_key_value_heads = config.n_kv_heads;
+    metadata.head_dim = config.head_dim;
+    metadata.max_position_embeddings = config.max_position_embeddings;
+    metadata.rotary_dim = config.rope_head_dim;
+    metadata.num_experts = config.n_experts;
+    metadata.hc_mult = config.hc_mult;
+    metadata.rope_base = config.rope_theta;
+    metadata.rms_norm_eps = config.rms_eps;
+    metadata.hc_eps = config.hc_eps;
+    metadata.model_type = config.text_model_type;
+    metadata.layer_types.assign(
+        static_cast<std::size_t>(config.n_layers),
+        "deepseek_v41");
+}
+
+void DeepseekV41Model::adapter_validate_load_options() const {
+    deepseek_v41_runtime::validate_load_options();
+}
+
+void DeepseekV41Model::adapter_load_final_state(
+        const mfq::ModelSource& source,
+        mfq_tensor_backend::Tensor& output_norm) {
+    CausalLmArchitecture::adapter_load_final_state(source, output_norm);
+}
+
+void DeepseekV41Model::adapter_prepare_blocks(
+        const mfq::ModelSource& source) {
+    shared = deepseek_v41_runtime::load_shared_state(source, config);
+}
+
+std::unique_ptr<Block>
+DeepseekV41Model::adapter_load_block(
+        const mfq::ModelSource& source,
+        int layer,
+        int,
+        const std::string& type) {
+    MFQ_RUNTIME_CHECK(
+        type == "deepseek_v41" && shared,
+        "invalid DeepSeek-V4.1 block loader state");
+    return deepseek_v41_runtime::load_block(source, layer, shared);
+}
+
+void DeepseekV41Model::adapter_validate_forward(
+        int64_t,
+        int64_t tokens,
+        int64_t cache_position,
+        bool has_position_override,
+        bool has_cache_position_override,
+        bool has_attention_mask) const {
+    MFQ_RUNTIME_CHECK(
+        tokens > 0 && cache_position + tokens <= metadata.max_position_embeddings &&
+            !has_position_override && !has_cache_position_override &&
+            !has_attention_mask,
+        "DeepSeek-V4.1 currently requires contiguous causal cache positions "
+        "without an external mask");
+}
+
+mfq_tensor_backend::Tensor
+DeepseekV41Model::adapter_prepare_hidden(
+        mfq_tensor_backend::Tensor hidden,
+        int64_t batch,
+        int64_t tokens) const {
+    return hidden.to(mfq_tensor_backend::kFloat16)
+        .unsqueeze(2)
+        .expand({batch, tokens, metadata.hc_mult, metadata.hidden_size})
+        .contiguous();
+}
+
+void DeepseekV41Model::adapter_begin_forward(bool capture_raw_hidden) {
+    MFQ_RUNTIME_CHECK(
+        shared,
+        "DeepSeek-V4.1 target capture state is unavailable");
+    shared->begin_forward(
+        capture_raw_hidden,
+        shared->config.dspark_target_layer_ids.size());
+}
+
+mfq_tensor_backend::Tensor
+DeepseekV41Model::adapter_finalize_hidden(
+        mfq_tensor_backend::Tensor hidden,
+        const mfq_tensor_backend::Tensor& output_norm,
+        int64_t batch,
+        int64_t tokens) const {
+    hidden = deepseek_v41_runtime::finalize_hidden(shared, hidden);
+    return g_profiler.measure("model.output_norm", [&]() {
+        return qwen_rms_norm(
+            hidden.reshape({batch * tokens, metadata.hidden_size})
+                .to(mfq_tensor_backend::kFloat32),
+            output_norm, metadata.rms_norm_eps,
+            metadata.norm_weight_offset)
+            .reshape({batch, tokens, metadata.hidden_size});
+    });
+}
+
+mfq_tensor_backend::Tensor
+DeepseekV41Model::adapter_raw_hidden(
+        const mfq_tensor_backend::Tensor&,
+        const mfq_tensor_backend::Tensor&) const {
+    return shared->dspark_target_hidden();
+}
+
+bool DeepseekV41Model::adapter_supports_suffix_speculation() const noexcept {
+    return true;
+}
+
+void DeepseekV41Model::adapter_begin_speculative() {
+    MFQ_RUNTIME_CHECK(
+        shared,
+        "DeepSeek-V4.1 speculative state is unavailable");
+    shared->begin_speculative();
+}
+
+void DeepseekV41Model::adapter_commit_speculative() {
+    MFQ_RUNTIME_CHECK(
+        shared,
+        "DeepSeek-V4.1 speculative state is unavailable");
+    shared->commit_speculative();
+}
+
+void DeepseekV41Model::adapter_rollback_speculative(int64_t) {
+    MFQ_RUNTIME_CHECK(
+        shared,
+        "DeepSeek-V4.1 speculative state is unavailable");
+    shared->rollback_speculative();
+}
+
+} // namespace mfq::cuda
+
+template <>
+RuntimeComponents<mfq::cuda::DeepseekV41CausalLm> load_runtime_components(
+        mfq::cuda::DeepseekV41CausalLm& model,
+        bool load_optional_components) {
+    RuntimeComponents<mfq::cuda::DeepseekV41CausalLm> result;
+    result.graph = model.graph;
+    result.plan = model.plan;
+    if (!load_optional_components) return result;
+    if (result.plan.vision != mfq::cuda::CudaVisionAdapter::none ||
+            (result.plan.predictor != mfq::cuda::CudaPredictorAdapter::none &&
+             result.plan.predictor !=
+                 mfq::cuda::CudaPredictorAdapter::deepseek_v41_dspark)) {
+        throw std::runtime_error(
+            "unsupported DeepSeek-V4.1 CUDA component adapter");
+    }
+    if (result.plan.predictor ==
+            mfq::cuda::CudaPredictorAdapter::none) return result;
+    MFQ_RUNTIME_CHECK(
+        model.supports_suffix_speculation() && model.shared,
+        "invalid DeepSeek-V4.1 DSpark model");
+    result.mtp =
+        mfq::cuda::deepseek_v41_runtime::load_dspark_if_present(
+            *model.source, model.shared->config);
+    result.mtp_available = static_cast<bool>(result.mtp);
+    return result;
+}

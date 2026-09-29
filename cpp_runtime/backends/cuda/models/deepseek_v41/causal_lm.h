@@ -1116,8 +1116,9 @@ void validate_load_options();
 std::shared_ptr<SharedState> load_shared_state(
     const mfq::ModelSource& source,
     const CommonConfig& config);
-
-
+Tensor finalize_hidden(
+    const std::shared_ptr<SharedState>& state,
+    const Tensor& hidden);
 
 inline int run_self_check() {
     EngramHashState::self_check();

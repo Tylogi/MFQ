@@ -108,7 +108,7 @@ void prepare_decode_graph_memory(Model& model, MfqCudaGraph& graph,
         }
     };
     mfq_prepare_cuda_graph_memory(graph, participant_streams);
-    if (!saved.empty() || Model::is_gemma4 || (Model::backbone == mfq::cuda::CudaBackbone::glm_dsa) || Model::is_minicpmo45) {
+    if (!saved.empty() || model.metadata.decode_graph_double_warmup) {
         // The first pass may initialize persistent CUDA/NCCL workspace state.
         // A second pass then records the complete set of reusable temporaries
         // needed by capture after those persistent allocations exist.

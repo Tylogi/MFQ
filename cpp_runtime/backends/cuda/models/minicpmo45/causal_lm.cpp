@@ -1,5 +1,180 @@
 #include "causal_lm.h"
 
+namespace mfq::cuda {
+
+namespace {
+
+void set_standard_metadata(
+        CausalLmMetadata& metadata,
+        const mfq::models::ModelConfig& config) {
+    metadata.vocab_size = config.vocab_size;
+    metadata.hidden_size = config.hidden_size;
+    metadata.num_hidden_layers = config.num_hidden_layers;
+    metadata.num_attention_heads = config.num_attention_heads;
+    metadata.num_key_value_heads = config.num_key_value_heads;
+    metadata.head_dim = config.head_dim;
+    metadata.max_position_embeddings = config.max_position_embeddings;
+    metadata.rotary_dim = config.rotary_dim;
+    metadata.rope_base = config.rope_base;
+    metadata.rms_norm_eps = config.rms_norm_eps;
+    metadata.tie_word_embeddings = config.tie_word_embeddings;
+    metadata.model_type = config.model_type;
+    metadata.layer_types = config.layer_types;
+}
+
+} // namespace
+
+void MiniCPMO45Model::adapter_load_config(
+        std::string_view payload,
+        const mfq::ModelGraph& graph,
+        const mfq::ModelSource&) {
+    config = mfq::models::minicpmo45::Config::from_json(payload);
+    if (config.model_type.empty()) config.model_type = graph.architecture;
+    config.rotary_dim = config.head_dim;
+    config.layer_types.assign(
+        static_cast<std::size_t>(config.num_hidden_layers),
+        "full_attention");
+    if (config.hidden_size != 4096 ||
+            config.intermediate_size != 12288 ||
+            config.num_hidden_layers != 36 ||
+            config.num_attention_heads != 32 ||
+            config.num_key_value_heads != 8 ||
+            config.head_dim != 128 || config.hidden_act != "silu" ||
+            config.attention_bias || config.use_sliding_window) {
+        throw std::runtime_error(
+            "unsupported MiniCPM-o 4.5 Qwen3 CUDA configuration");
+    }
+    set_standard_metadata(metadata, config);
+    metadata.rope_interleaved = true;
+    metadata.decode_graph_double_warmup = true;
+}
+
+bool MiniCPMO45Model::adapter_uses_common_rope() const noexcept {
+    return true;
+}
+
+bool MiniCPMO45Model::adapter_supports_dense_cpu_offload() const noexcept {
+    return true;
+}
+
+std::unique_ptr<Block>
+MiniCPMO45Model::adapter_load_block(
+        const mfq::ModelSource& source,
+        int layer,
+        int,
+        const std::string& type) {
+    return load_transformer_block(source, config, layer, type, true);
+}
+
+void MiniCPMOTtsModel::adapter_load_config(
+        std::string_view payload,
+        const mfq::ModelGraph&,
+        const mfq::ModelSource&) {
+    config = mfq::models::ModelConfig::from_json(payload);
+    set_standard_metadata(metadata, config);
+    metadata.norm_weight_offset = 1.0;
+}
+
+bool MiniCPMOTtsModel::adapter_uses_common_rope() const noexcept {
+    return true;
+}
+
+bool MiniCPMOTtsModel::adapter_supports_dense_cpu_offload() const noexcept {
+    return true;
+}
+
+std::unique_ptr<Block>
+MiniCPMOTtsModel::adapter_load_block(
+        const mfq::ModelSource& source,
+        int layer,
+        int,
+        const std::string& type) {
+    return load_transformer_block(source, config, layer, type, false);
+}
+
+mfq_tensor_backend::Tensor
+MiniCPMO45Model::adapter_embed(
+        mfq_tensor_backend::Tensor output) const {
+    return output.to(mfq_tensor_backend::kBFloat16).contiguous();
+}
+
+MfqOptional<mfq_tensor_backend::Tensor>
+MiniCPMO45Model::adapter_attention_mask(
+        MfqOptional<mfq_tensor_backend::Tensor> mask,
+        int64_t tokens,
+        int64_t cache_position) const {
+    if (mask.has_value() && (tokens == 1 || cache_position == 0) &&
+            mask.value().eq(1).all().item<bool>()) {
+        return mfq_nullopt;
+    }
+    return mask;
+}
+
+mfq_tensor_backend::Tensor
+MiniCPMO45Model::adapter_prepare_hidden(
+        mfq_tensor_backend::Tensor hidden,
+        int64_t,
+        int64_t) const {
+    return hidden.to(mfq_tensor_backend::kBFloat16).contiguous();
+}
+
+bool MiniCPMO45Model::adapter_pass_cache_positions(bool, bool) const noexcept {
+    return true;
+}
+
+bool MiniCPMO45Model::adapter_pass_attention_mask() const noexcept {
+    return true;
+}
+
+mfq_tensor_backend::Tensor
+MiniCPMO45Model::adapter_finalize_hidden(
+        mfq_tensor_backend::Tensor hidden,
+        const mfq_tensor_backend::Tensor& output_norm,
+        int64_t batch,
+        int64_t tokens) const {
+    return g_profiler.measure("model.output_norm", [&]() {
+        return qwen_rms_norm_bf16(
+            hidden.reshape({batch * tokens, metadata.hidden_size}),
+            output_norm, metadata.rms_norm_eps,
+            metadata.norm_weight_offset)
+            .reshape({batch, tokens, metadata.hidden_size});
+    });
+}
+
+mfq_tensor_backend::Tensor
+MiniCPMO45Model::adapter_logits(
+        const QuantLinear& lm_head,
+        mfq_tensor_backend::Tensor hidden) const {
+    return g_profiler.measure("model.lm_head", [&]() {
+        return lm_head.forward(hidden)
+            .to(mfq_tensor_backend::kBFloat16).contiguous();
+    });
+}
+
+mfq_tensor_backend::Tensor
+MiniCPMO45Model::adapter_last_logits(
+        const QuantLinear& lm_head,
+        mfq_tensor_backend::Tensor hidden) const {
+    return adapter_logits(
+        lm_head,
+        hidden.to(mfq_tensor_backend::kBFloat16).contiguous());
+}
+
+mfq_tensor_backend::Tensor
+MiniCPMO45Model::adapter_next_token(
+        const QuantLinear& lm_head,
+        mfq_tensor_backend::Tensor hidden) const {
+    return mfq_tensor_backend::argmax(
+        adapter_last_logits(lm_head, std::move(hidden)), -1)
+        .to(mfq_tensor_backend::kInt64);
+}
+
+bool MiniCPMO45Model::adapter_uses_decode_sequence_length() const noexcept {
+    return false;
+}
+
+} // namespace mfq::cuda
+
 int run_minicpmo45_duplex(
         const std::string & model_path,
         const std::string & config_path,

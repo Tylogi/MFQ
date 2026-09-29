@@ -131,9 +131,9 @@ static mfq_tensor_backend::Tensor hidden_forward_prepared_chunked(
 
 } // namespace
 
-template <mfq::cuda::CudaBackbone Backbone>
+template <typename Model>
 int32_t run_mtp_generation(
-        mfq::cuda::CausalLmFor<Backbone>& model, MtpModule& mtp,
+        Model& model, MtpModule& mtp,
         const std::vector<int64_t>& prompt, const MfqSamplingParams& sampling,
         const MfqTokenCallback& on_token, const MfqPrefillCallback& on_prefill,
         int64_t prefill_chunk_size,
@@ -872,18 +872,23 @@ int32_t run_mtp_generation(
     }
 }
 
-#define MFQ_INSTANTIATE_MTP(BACKBONE)                                      \
-    template int32_t run_mtp_generation<BACKBONE>(                         \
-        mfq::cuda::CausalLmFor<BACKBONE>&, MtpModule&,                         \
-        const std::vector<int64_t>&, const MfqSamplingParams&,              \
-        const MfqTokenCallback&, const MfqPrefillCallback&, int64_t,         \
-        const MfqTokenConstraintPtr&, const CudaPreparedPrompt*,             \
-        std::size_t, const mfq_tensor_backend::Tensor&,                      \
+#define MFQ_INSTANTIATE_MTP(MODEL)                                         \
+    template int32_t run_mtp_generation<MODEL>(                            \
+        MODEL&, MtpModule&, const std::vector<int64_t>&,                    \
+        const MfqSamplingParams&, const MfqTokenCallback&,                  \
+        const MfqPrefillCallback&, int64_t,                                 \
+        const MfqTokenConstraintPtr&, const CudaPreparedPrompt*,            \
+        std::size_t, const mfq_tensor_backend::Tensor&,                     \
         mfq_tensor_backend::Tensor*, double, const MfqCancellationCheck&)
 
-MFQ_INSTANTIATE_MTP(mfq::cuda::CudaBackbone::generic_qwen);
-MFQ_INSTANTIATE_MTP(mfq::cuda::CudaBackbone::glm5_next);
-MFQ_INSTANTIATE_MTP(mfq::cuda::CudaBackbone::qwen4_exp);
-MFQ_INSTANTIATE_MTP(mfq::cuda::CudaBackbone::deepseek_v41);
+MFQ_INSTANTIATE_MTP(mfq::cuda::Qwen35CausalLm);
+MFQ_INSTANTIATE_MTP(mfq::cuda::MiniCPMO45CausalLm);
+MFQ_INSTANTIATE_MTP(mfq::cuda::MiniCPMOTtsCausalLm);
+MFQ_INSTANTIATE_MTP(mfq::cuda::Gemma4CausalLm);
+MFQ_INSTANTIATE_MTP(mfq::cuda::GlmDsaCausalLm);
+MFQ_INSTANTIATE_MTP(mfq::cuda::Glm5CausalLm);
+MFQ_INSTANTIATE_MTP(mfq::cuda::Qwen4CausalLm);
+MFQ_INSTANTIATE_MTP(mfq::cuda::DeepseekV4CausalLm);
+MFQ_INSTANTIATE_MTP(mfq::cuda::DeepseekV41CausalLm);
 
 #undef MFQ_INSTANTIATE_MTP

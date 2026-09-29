@@ -177,8 +177,8 @@ struct EvalCommand : mfq::cuda::EvalCommandOptions {
                 kl_score_count, kl_reference_contract);
         }
         return with_loaded_cuda_model(*this, false,
-            [&]<mfq::cuda::CudaBackbone Backbone>(auto& model,
-                    auto& runtime_components, auto t0, auto t1) -> int {
+            [&](auto& model, auto& runtime_components,
+                    auto t0, auto t1) -> int {
         if (!kl_base.empty()) {
             if (!kl_mmq_sequence.empty()) {
                 if (!kl_chunks_sequence.empty()) {
