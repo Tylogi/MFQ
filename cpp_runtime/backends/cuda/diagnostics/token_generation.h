@@ -52,8 +52,11 @@ int generate_diagnostic_tokens(
             mfq_cuda_graph_capture_supported() &&
             execution.dsv4_cpu_offload_layers.empty() &&
             execution.dense_cpu_layer_count == 0 &&
-            !moe_expert_cache() &&
-            model_parallel_cuda_graph_enabled() &&
+            !execution.moe_expert_cache &&
+            model_parallel_cuda_graph_enabled(
+                execution.tensor_parallel,
+                execution.expert_parallel,
+                execution.model_parallel_collectives) &&
             (!profile || profile_cuda_graph) && gen > 1;
         const char * cuda_profiler_env = std::getenv("MFQ_CUDA_PROFILER_RANGE");
         const bool cuda_profiler_range = cuda_profiler_env != nullptr &&
@@ -68,8 +71,11 @@ int generate_diagnostic_tokens(
             auto graph_stream = mfq_get_stream_from_pool(false);
             MfqCudaGuard graph_device_guard(
                 graph_stream.device_index());
+            const auto& parallel = execution.tensor_parallel.enabled()
+                ? execution.tensor_parallel
+                : execution.expert_parallel;
             auto graph_compute_streams =
-                make_cuda_graph_compute_streams(graph_stream);
+                make_cuda_graph_compute_streams(graph_stream, parallel);
             auto graph_stream_guards =
                 activate_cuda_graph_compute_streams(
                     graph_compute_streams);
@@ -94,13 +100,14 @@ int generate_diagnostic_tokens(
             const int64_t attention_parts = decode_graph_attention_parts(
                 planned_len, FullBlock::kDecodeAttentionMaxParts);
             {
-                DecodeGraphBranchScope branch_scope;
+                DecodeGraphBranchScope branch_scope(execution);
                 prepare_decode_graph_memory(model, graph, [&]() {
                     (void)model.next_token_static(
                         static_input, static_pos, static_len,
                         planned_len, attention_parts);
                 }, cuda_graph_participant_streams(
-                    graph_compute_streams));
+                    graph_compute_streams,
+                    execution.model_parallel_collectives));
                 profiler.reset();
                 profiler.graph_events = profile_cuda_graph;
                 graph.capture_begin();
@@ -163,7 +170,7 @@ int generate_diagnostic_tokens(
             std::cout << generated_ptr[i];
         }
         std::cout << "\n";
-        if (moe_expert_cache()) {
+        if (execution.moe_expert_cache) {
             print_moe_expert_cache_stats(std::cout);
         }
         return 0;

@@ -130,7 +130,7 @@ struct EvalCommand : mfq::cuda::EvalCommandOptions {
             ? kl_mmq_mode : kl_mmq_sequence.front();
         if (load_mmq_mode != KlMmqMode::Default) {
             kl_mmq_scope =
-                std::make_unique<KlMmqScope>(load_mmq_mode);
+                std::make_unique<KlMmqScope>(load_mmq_mode, execution);
         }
         if (!kl_chunks_sequence_arg.empty()) {
             kl_chunks_sequence = parse_ids(kl_chunks_sequence_arg);
@@ -173,7 +173,7 @@ struct EvalCommand : mfq::cuda::EvalCommandOptions {
                     "--moe-gpu-cache-gb is unavailable for streamed KL");
             }
             return run_kl_eval_streamed(
-                model_path, config_path, kl_base,
+                execution, model_path, config_path, kl_base,
                 kl_save_logits_f16, kl_chunks,
                 kl_stream_layers, kl_stream_batch,
                 kl_score_count, kl_reference_contract);
@@ -194,7 +194,8 @@ struct EvalCommand : mfq::cuda::EvalCommandOptions {
                               << " mmq="
                               << kl_mmq_mode_name(kl_mmq_sequence[index])
                               << " chunks=" << kl_chunks << "\n";
-                    KlMmqScope run_scope(kl_mmq_sequence[index]);
+                    KlMmqScope run_scope(
+                        kl_mmq_sequence[index], execution);
                     const int status = run_kl_eval_batched(
                         model, kl_base, kl_chunks,
                         kl_n_batch, kl_score_count,

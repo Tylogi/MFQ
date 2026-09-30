@@ -244,18 +244,26 @@ struct CudaGenerationOps {
                         prefill_ms + multimodal_ms}};
     }
     bool graph_eligible() const {
-        const auto& execution = cuda_execution_context();
+        const auto& execution = *model.execution;
         return graph_config.enabled &&
             (!prepared || !prepared->transformed()) && !constraint &&
             !model.metadata.flash_next && mfq_cuda_graph_capture_supported() &&
             execution.dsv4_cpu_offload_layers.empty() &&
-            execution.dense_cpu_layer_count == 0 && !moe_expert_cache() &&
-            model_parallel_cuda_graph_enabled() &&
+            execution.dense_cpu_layer_count == 0 &&
+            !execution.moe_expert_cache &&
+            model_parallel_cuda_graph_enabled(
+                execution.tensor_parallel,
+                execution.expert_parallel,
+                execution.model_parallel_collectives) &&
             generation_limit >= graph_config.minimum_generation_tokens &&
             generation_limit <= graph.generated_capacity;
     }
     void prepare_graph() {
-        graph.ensure_compute_streams();
+        const auto& execution = *model.execution;
+        graph.ensure_compute_streams(
+            execution.tensor_parallel.enabled()
+                ? execution.tensor_parallel
+                : execution.expert_parallel);
         MfqCudaGuard graph_device_guard(graph.stream.device_index());
         auto graph_stream_guards =
             activate_cuda_graph_compute_streams(graph.compute_streams);

@@ -371,21 +371,22 @@ int model_parallel_primary_device() {
 
 
 
-bool model_parallel_cuda_graph_enabled() {
-    if (!model_parallel_enabled()) {
+bool model_parallel_cuda_graph_enabled(
+        const ParallelConfig& tensor_parallel,
+        const ParallelConfig& expert_parallel,
+        const ModelParallelCollectiveRuntime& collectives) {
+    if (!tensor_parallel.enabled() && !expert_parallel.enabled()) {
         return true;
     }
     const char * environment = std::getenv(
         "MFQ_MODEL_PARALLEL_CUDA_GRAPH");
-    const auto& execution = cuda_execution_context();
     if (environment == nullptr) {
         environment = std::getenv(
-            execution.expert_parallel.enabled() &&
-                    !execution.tensor_parallel.enabled()
+            expert_parallel.enabled() && !tensor_parallel.enabled()
                 ? "MFQ_EP_CUDA_GRAPH"
                 : "MFQ_TP_CUDA_GRAPH");
     }
-    return execution.model_parallel_collectives.collectives_enabled &&
+    return collectives.collectives_enabled &&
            (environment == nullptr || environment[0] != '0');
 }
 
@@ -533,13 +534,9 @@ void record_moe_route_stats(
     }
 }
 
-void clear_moe_route_stats() {
-    cuda_execution_context().moe_route_stats.clear();
-}
-
-void write_moe_route_stats() {
+void write_moe_route_stats(
+        const std::unordered_map<int, MoeRouteLayerStats>& stats) {
     const char * path_value = moe_route_stats_path();
-    const auto& stats = cuda_execution_context().moe_route_stats;
     if (path_value == nullptr || stats.empty()) return;
     mfq_cuda_synchronize();
     std::filesystem::path path(path_value);

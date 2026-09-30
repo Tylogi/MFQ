@@ -30,8 +30,7 @@ struct MfqDropFileCacheGuard {
     bool previous;
 
     MfqDropFileCacheGuard(
-            bool enabled,
-            CudaExecutionContext& context = cuda_execution_context())
+            bool enabled, CudaExecutionContext& context)
         : execution(context), previous(context.drop_file_cache) {
         execution.drop_file_cache = enabled;
     }
@@ -60,8 +59,7 @@ struct DecodeGraphBranchScope {
     CudaExecutionContext& execution;
     bool previous;
 
-    explicit DecodeGraphBranchScope(
-            CudaExecutionContext& context = cuda_execution_context())
+    explicit DecodeGraphBranchScope(CudaExecutionContext& context)
         : execution(context),
           previous(context.decode_graph_serial_branches) {
         execution.decode_graph_serial_branches = true;
@@ -75,8 +73,7 @@ struct DecodeGraphTpProjectionScope {
     CudaExecutionContext& execution;
     bool previous;
 
-    explicit DecodeGraphTpProjectionScope(
-            CudaExecutionContext& context = cuda_execution_context())
+    explicit DecodeGraphTpProjectionScope(CudaExecutionContext& context)
         : execution(context),
           previous(context.decode_graph_tp_projection_major) {
         execution.decode_graph_tp_projection_major = true;

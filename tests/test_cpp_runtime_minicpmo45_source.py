@@ -157,7 +157,7 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
     assert "official_bf16 && !bf16_gqa_decode" in DECODE
     assert "MiniCPMO45Model::adapter_logits(" in GRAPH
     assert (
-        "return lm_head.forward(hidden)\n"
+        "return lm_head.forward(*execution, hidden)\n"
         "            .to(mfq_tensor_backend::kBFloat16).contiguous();"
         in GRAPH
     )

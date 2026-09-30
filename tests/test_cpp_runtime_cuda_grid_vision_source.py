@@ -47,8 +47,9 @@ def test_cuda_grid_vision_uses_existing_primitives_and_canonical_names() -> None
     assert "attention_cuda(" in CUDA
     assert "Tensor gelu_tanh(" in CUDA
     assert "mfq_tensor_backend::tanh(" in CUDA
-    assert 'merger_up_(merger_norm_(patches)' in CUDA
-    assert '})), "none"))' in CUDA
+    assert "merger_up_(\n                        *language.execution," in CUDA
+    assert "merger_norm_(patches).reshape(" in CUDA
+    assert '"none"));' in CUDA
     assert "grid_vision_canonical_name(" in CUDA
     assert "index_select(0, index.reshape({-1}))" in CUDA
     assert "model.visual" not in CUDA

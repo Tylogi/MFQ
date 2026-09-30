@@ -75,7 +75,8 @@ def test_tensor_parallel_graph_capture_registers_all_participant_streams():
     assert '"MFQ_MODEL_PARALLEL_CUDA_GRAPH"' in SOURCE
     assert '"MFQ_TP_CUDA_GRAPH"' in SOURCE
     assert '"MFQ_EP_CUDA_GRAPH"' in SOURCE
-    assert "model_parallel_cuda_graph_enabled()" in SOURCE
+    assert "model_parallel_cuda_graph_enabled(" in SOURCE
+    assert "execution.model_parallel_collectives" in SOURCE
     assert "environment == nullptr || environment[0] != '0'" in SOURCE
     assert "graph_participant_streams" in SOURCE
     assert "collectives.streams.begin()" in SOURCE
@@ -121,7 +122,7 @@ def test_tensor_parallel_projection_groups_share_each_rank_input_transfer():
     assert 'std::getenv(\n        "MFQ_TP_GROUPED_PROJECTIONS")' in SOURCE
     assert "environment == nullptr || std::atoi(environment) != 0" in SOURCE
     assert "tensor_parallel_output_compatible()" in SOURCE
-    assert "forward_tensor_parallel_output_group(x)" in SOURCE
+    assert "forward_tensor_parallel_output_group(execution, x)" in SOURCE
     assert "auto local_x = tensor_to_cuda_device(flat, device);" in SOURCE
 
 

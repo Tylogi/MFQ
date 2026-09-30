@@ -262,7 +262,10 @@ bool model_parallel_enabled();
 const ParallelConfig& model_parallel_config();
 const ParallelConfig& moe_parallel_config();
 int model_parallel_primary_device();
-bool model_parallel_cuda_graph_enabled();
+bool model_parallel_cuda_graph_enabled(
+    const ParallelConfig& tensor_parallel,
+    const ParallelConfig& expert_parallel,
+    const ModelParallelCollectiveRuntime& collectives);
 bool tensor_parallel_grouped_projections_enabled();
 bool tensor_parallel_shared_linear_attention_input_enabled();
 bool tensor_parallel_mirror_linear_attention_scalars_enabled();
@@ -282,8 +285,8 @@ void record_moe_route_stats(
     const mfq_tensor_backend::Tensor& weights,
     const mfq_tensor_backend::Tensor& output,
     int n_experts);
-void clear_moe_route_stats();
-void write_moe_route_stats();
+void write_moe_route_stats(
+    const std::unordered_map<int, MoeRouteLayerStats>& stats);
 void trace_gemma_stage(int layer, const char* name, const mfq_tensor_backend::Tensor& value);
 bool gemma4_fused_norms_enabled();
 void report_cuda_memory(const char* stage);
@@ -297,9 +300,7 @@ struct KlMmqScope {
     int64_t previous_moe_calls;
     int64_t previous_fallback_calls;
 
-    explicit KlMmqScope(
-        KlMmqMode mode,
-        CudaExecutionContext& context = cuda_execution_context());
+    KlMmqScope(KlMmqMode mode, CudaExecutionContext& context);
     ~KlMmqScope();
 };
 
@@ -307,8 +308,7 @@ struct KlKvCacheCapacityScope {
     CudaExecutionContext& execution;
     int64_t previous_capacity;
 
-    explicit KlKvCacheCapacityScope(
-        int64_t capacity,
-        CudaExecutionContext& context = cuda_execution_context());
+    KlKvCacheCapacityScope(
+        int64_t capacity, CudaExecutionContext& context);
     ~KlKvCacheCapacityScope();
 };

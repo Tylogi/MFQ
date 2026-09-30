@@ -4,14 +4,12 @@
 #include <algorithm>
 
 std::vector<MfqCudaStream> make_cuda_graph_compute_streams(
-        const MfqCudaStream& primary_stream) {
-    if (!model_parallel_enabled()) {
-        return {primary_stream};
-    }
-    const auto & config = model_parallel_config();
+        const MfqCudaStream& primary_stream,
+        const ParallelConfig& parallel) {
+    if (!parallel.enabled()) return {primary_stream};
     std::vector<MfqCudaStream> streams;
-    streams.reserve(config.devices.size());
-    for (const int device : config.devices) {
+    streams.reserve(parallel.devices.size());
+    for (const int device : parallel.devices) {
         streams.push_back(
             device == primary_stream.device_index()
                 ? primary_stream
@@ -21,10 +19,9 @@ std::vector<MfqCudaStream> make_cuda_graph_compute_streams(
 }
 
 std::vector<MfqCudaStream> cuda_graph_participant_streams(
-        const std::vector<MfqCudaStream>& compute_streams) {
+        const std::vector<MfqCudaStream>& compute_streams,
+        const ModelParallelCollectiveRuntime& collectives) {
     auto participants = compute_streams;
-    const auto& collectives =
-        cuda_execution_context().model_parallel_collectives;
     participants.insert(
         participants.end(),
         collectives.streams.begin(), collectives.streams.end());
@@ -47,13 +44,15 @@ DecodeGraphCache::DecodeGraphCache(int64_t context_capacity)
     : stream(mfq_get_stream_from_pool(false)),
       generated_capacity(std::max<int64_t>(context_capacity, 2048)) {}
 
-void DecodeGraphCache::ensure_compute_streams() {
+void DecodeGraphCache::ensure_compute_streams(
+        const ParallelConfig& parallel) {
     if (!compute_streams.empty()) return;
-    compute_streams = make_cuda_graph_compute_streams(stream);
+    compute_streams = make_cuda_graph_compute_streams(stream, parallel);
 }
 
-std::vector<MfqCudaStream> DecodeGraphCache::graph_participant_streams() const {
-    return cuda_graph_participant_streams(compute_streams);
+std::vector<MfqCudaStream> DecodeGraphCache::graph_participant_streams(
+        const ModelParallelCollectiveRuntime& collectives) const {
+    return cuda_graph_participant_streams(compute_streams, collectives);
 }
 
 bool DecodeGraphCache::matches(

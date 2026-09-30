@@ -149,10 +149,14 @@ static std::string qwen_continuous_batching_incompatibility(
 static bool qwen_continuous_batch_cuda_graph_enabled(
         const mfq::cuda::Qwen35CausalLm& model,
         const CudaContinuousBatchConfig& config) {
+    const auto& execution = *model.execution;
     return config.cuda_graph &&
         !qwen_continuous_batch_has_cached_moe(model) &&
         mfq_cuda_graph_capture_supported() &&
-        model_parallel_cuda_graph_enabled();
+        model_parallel_cuda_graph_enabled(
+            execution.tensor_parallel,
+            execution.expert_parallel,
+            execution.model_parallel_collectives);
 }
 
 static QwenBatchState take_qwen_batch_state(
@@ -382,14 +386,17 @@ struct QwenContinuousDecodeGraph {
     QwenContinuousDecodeGraph()
         : stream(mfq_get_stream_from_pool(false)) {}
 
-    void ensure_compute_streams() {
+    void ensure_compute_streams(const ParallelConfig& parallel) {
         if (compute_streams.empty()) {
-            compute_streams = make_cuda_graph_compute_streams(stream);
+            compute_streams = make_cuda_graph_compute_streams(
+                stream, parallel);
         }
     }
 
-    std::vector<MfqCudaStream> participant_streams() const {
-        return cuda_graph_participant_streams(compute_streams);
+    std::vector<MfqCudaStream> participant_streams(
+            const ModelParallelCollectiveRuntime& collectives) const {
+        return cuda_graph_participant_streams(
+            compute_streams, collectives);
     }
 
     bool matches(
@@ -914,7 +921,10 @@ struct QwenBatchOperations {
         std::vector<std::unique_ptr<MfqCudaStreamGuard>>
             graph_compute_stream_guards;
         if (graph_decode) {
-            decode_graph_->ensure_compute_streams();
+            const auto& parallel = execution_.tensor_parallel.enabled()
+                ? execution_.tensor_parallel
+                : execution_.expert_parallel;
+            decode_graph_->ensure_compute_streams(parallel);
             graph_stream_guard = std::make_unique<MfqCudaStreamGuard>(
                 decode_graph_->stream);
             graph_compute_stream_guards =
@@ -999,14 +1009,16 @@ struct QwenBatchOperations {
                     decode_graph_->invalidate();
                     mfq_cuda_empty_cache();
                     try {
-                        DecodeGraphBranchScope branch_scope;
-                        DecodeGraphTpProjectionScope tp_projection_scope;
+                        DecodeGraphBranchScope branch_scope(execution_);
+                        DecodeGraphTpProjectionScope tp_projection_scope(
+                            execution_);
                         decode_graph_->graph =
                             std::make_unique<MfqCudaGraph>();
                         prepare_decode_graph_memory(
                             model_, *decode_graph_->graph,
                             [&]() { (void)invoke(); },
-                            decode_graph_->participant_streams());
+                            decode_graph_->participant_streams(
+                                execution_.model_parallel_collectives));
                         decode_graph_->graph->capture_begin();
                         decode_graph_->static_next = invoke();
                         decode_graph_->graph->capture_end();

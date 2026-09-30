@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <string>
 
+struct CudaExecutionContext;
+
 enum class KlEvaluator {
     Legacy,
     Optimized,
@@ -32,6 +34,7 @@ int run_selected_kl_eval(
     const KlReferenceContract& reference_contract);
 
 int run_kl_eval_streamed(
+    CudaExecutionContext& execution,
     const std::string& model_path,
     const std::string& config_path,
     const std::string& reference_path,

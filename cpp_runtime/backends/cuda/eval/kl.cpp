@@ -663,7 +663,8 @@ int run_kl_eval_batched(
         1, n_batch / n_ctx);
     validate_kl_execution_geometry(
         n_batch, n_batch, reference_contract, "optimized");
-    KlKvCacheCapacityScope kv_cache_capacity_scope(n_ctx);
+    KlKvCacheCapacityScope kv_cache_capacity_scope(
+        n_ctx, *model.execution);
     const int target_start = input.chunks[0].target_start;
     int score_count = input.chunks[0].score_count;
     for (const auto & chunk : input.chunks) {
@@ -793,7 +794,7 @@ int run_kl_eval_batched(
                << " reference_n_batch=" << reference_contract.n_batch
                << " reference_n_ubatch=" << reference_contract.n_ubatch
                << "\n";
-    const auto& execution = cuda_execution_context();
+    const auto& execution = *model.execution;
     std::cout << "cpp_kl_mmq"
               << " mmq=" << kl_mmq_mode_name(execution.kl_mmq_mode)
               << " activation_quantize_calls="
@@ -825,6 +826,7 @@ int run_selected_kl_eval(
 }
 
 int run_kl_eval_streamed(
+    CudaExecutionContext& execution,
     const std::string & model_path,
     const std::string & config_path,
     const std::string & reference_path,
@@ -838,8 +840,8 @@ int run_kl_eval_streamed(
         throw std::runtime_error(
             "streamed KL layer group and chunk batch must be positive");
     }
-    clear_moe_route_stats();
-    MfqDropFileCacheGuard drop_cache_guard(true);
+    execution.moe_route_stats.clear();
+    MfqDropFileCacheGuard drop_cache_guard(true, execution);
     auto input = load_streamed_kl_input(reference_path, max_chunks);
     const int chunks = (int)input.chunks.size();
     const int64_t n_ctx = (int64_t)input.chunks[0].tokens.size();
@@ -907,7 +909,7 @@ int run_kl_eval_streamed(
     auto started = std::chrono::steady_clock::now();
     auto model = mfq::cuda::load_causal_lm<
         mfq::cuda::DeepseekV4CausalLm>(
-            cuda_execution_context(), model_path, config_path, n_ctx, false);
+            execution, model_path, config_path, n_ctx, false);
     if (chunk_batch > 16) {
         throw std::runtime_error(
             "DeepSeek V4 streamed KL chunk batch must not exceed 16");
@@ -1091,7 +1093,7 @@ int run_kl_eval_streamed(
               << " reference_n_batch=" << reference_contract.n_batch
               << " reference_n_ubatch=" << reference_contract.n_ubatch
               << "\n";
-    write_moe_route_stats();
+    write_moe_route_stats(execution.moe_route_stats);
     return 0;
 }
 
