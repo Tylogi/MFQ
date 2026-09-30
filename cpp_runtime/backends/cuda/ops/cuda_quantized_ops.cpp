@@ -1,4 +1,5 @@
 #include "cuda_quantized_ops.h"
+#include "mfq/mxfp4_sq_decode.h"
 
 #include "mfq_format_compat.h"
 #include "mfe_expert_store.h"
@@ -9352,14 +9353,11 @@ mfq_tensor_backend::Tensor nint_matmul(const NintWeight & w, mfq_tensor_backend:
                     x, w.gs, ws.qx, ws.xscale);
             });
         }
-        auto dense = g_profiler.measure("nint.dequant", [&]() {
-            return nint_decode_cuda(
+        return g_profiler.measure("nint.prefill", [&]() {
+            return nint_matmul_ws_cuda(
                 w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
                 w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-                w.neuron_len, w.gs);
-        });
-        return g_profiler.measure("nint.gemm", [&]() {
-            return mfq_tensor_backend::matmul(x, dense.transpose(0, 1));
+                x, w.gs, {}, {});
         });
     }
     if (g_kl_mmq_mode != KlMmqMode::Default) {
@@ -10002,12 +10000,67 @@ mfq_tensor_backend::Tensor tpq_matmul(
 
 
 
+template <typename Decode>
+static mfq_tensor_backend::Tensor sq_matmul_cpu_impl(
+        mfq_tensor_backend::Tensor x, int64_t outputs, int64_t width, Decode decode) {
+    MFQ_RUNTIME_CHECK(!x.is_cuda() && x.size(-1) == width, "SQ CPU activation device or width mismatch");
+    const auto dtype = x.scalar_type();
+    auto shape = x.sizes().vec();
+    x = x.to(mfq_tensor_backend::kFloat32).reshape({-1, width}).contiguous();
+    const auto rows = x.size(0);
+    auto result = mfq_tensor_backend::empty({rows, outputs}, x.options());
+    const auto* input = x.data_ptr<float>();
+    auto* output = result.data_ptr<float>();
+    mfq_parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
+        std::vector<float> weights(width);
+        for (auto n = begin; n < end; ++n) {
+            decode(n, weights.data());
+            for (int64_t m = 0; m < rows; ++m) {
+                float sum = 0;
+                for (int64_t k = 0; k < width; ++k) sum = std::fma(input[m * width + k], weights[k], sum);
+                output[m * outputs + n] = sum;
+            }
+        }
+    });
+    shape.back() = outputs;
+    return result.to(dtype).reshape(shape);
+}
+
+mfq_tensor_backend::Tensor sq_matmul_cpu(const Mxfp4SqWeight& weight, mfq_tensor_backend::Tensor x) {
+    MFQ_RUNTIME_CHECK(!weight.blob.is_cuda(), "SQ CPU weights must be on CPU");
+    const auto* blob = weight.blob.data_ptr<uint8_t>();
+    const auto layout = mfq::sq::parse(blob, weight.blob.numel());
+    return sq_matmul_cpu_impl(x, weight.out, weight.neuron_len, [&](int64_t n, float* row) {
+        mfq::sq::decode_cpu_row(blob, layout, weight.row_q.data_ptr<uint8_t>()[n],
+            weight.row_symbol_byte_offsets.data_ptr<int32_t>()[n], weight.row_auxiliary.data_ptr<int32_t>()[n], row);
+    });
+}
+
+mfq_tensor_backend::Tensor sq_matmul_cpu(const Fp8SqWeight& weight, mfq_tensor_backend::Tensor x) {
+    MFQ_RUNTIME_CHECK(!weight.blob.is_cuda(), "SQ CPU weights must be on CPU");
+    const auto* blob = weight.blob.data_ptr<uint8_t>();
+    const auto layout = mfq::fp8sq::parse(weight.dtype, blob, weight.blob.numel());
+    return sq_matmul_cpu_impl(x, weight.out, weight.neuron_len, [&](int64_t n, float* row) {
+        for (int64_t k = 0; k < weight.neuron_len; ++k) row[k] = mfq::fp8sq::decode_cpu(
+            blob, layout, weight.row_q.data_ptr<uint8_t>()[n],
+            weight.row_symbol_byte_offsets.data_ptr<int32_t>()[n], n, k);
+    });
+}
+
 mfq_tensor_backend::Tensor run_quant_linear_shard(
         const QuantLinearShard & shard,
         mfq_tensor_backend::Tensor x,
         MfqOptional<mfq_tensor_backend::Tensor> gate,
         int gate_mode) {
     MfqCudaGuard guard(shard.device);
+    if (shard.kind == QuantLinearKind::Mxfp4Sq || shard.kind == QuantLinearKind::Fp8Sq) {
+        if (gate.has_value()) {
+            MFQ_RUNTIME_CHECK(gate_mode == 1 || gate_mode == 2, "SQ input gate mode must be sigmoid or SiLU");
+            x = x * (gate_mode == 1 ? mfq_tensor_backend::sigmoid(*gate) : mfq_tensor_backend::silu(*gate));
+        }
+        return shard.kind == QuantLinearKind::Mxfp4Sq
+            ? shard.mxfp4_sq.forward(x) : shard.fp8_sq.forward(x);
+    }
     if (shard.kind == QuantLinearKind::Nint) {
         return gate.has_value()
             ? nint_matmul_input_mul(
@@ -10807,39 +10860,54 @@ QuantLinear load_quant_linear(
         }
     } else if (dtype == "MXFP4-SQ") {
         result.kind = QuantLinearKind::Mxfp4Sq;
-        if (g_tensor_parallel.enabled() &&
-                axis != TensorParallelAxis::Mirrored) {
-            throw std::runtime_error(
-                "MXFP4-SQ tensor parallelism is not implemented: " + name);
+        const auto payload = read_tensor(mfq, name);
+        const auto layout = mfq::sq::parse(payload.data(), payload.size());
+        result.logical_out = layout.outputs;
+        result.logical_neuron_len = layout.width;
+        if (!g_loading_cpu_layer && g_tensor_parallel.enabled() && axis != TensorParallelAxis::Mirrored) {
+            const bool output_axis = axis == TensorParallelAxis::Output;
+            for (const auto& slice : select_slices(output_axis ? layout.outputs : layout.width, output_axis ? 128 : 32)) {
+                QuantLinearShard shard;
+                shard.kind = result.kind;
+                shard.device = slice.device;
+                shard.output_begin = output_axis ? slice.begin : 0;
+                shard.output_end = output_axis ? slice.end : layout.outputs;
+                shard.input_begin = output_axis ? 0 : slice.begin;
+                shard.input_end = output_axis ? layout.width : slice.end;
+                std::vector<int64_t> rows(shard.output_end - shard.output_begin);
+                std::iota(rows.begin(), rows.end(), shard.output_begin);
+                shard.mxfp4_sq.weight = to_device_mxfp4_sq(
+                    mfq::sq::select_rows(payload, rows, shard.input_begin, shard.input_end), true, slice.device);
+                result.tensor_parallel_shards.push_back(std::move(shard));
+            }
+        } else {
+            result.mxfp4_sq.weight = to_device_mxfp4_sq(payload, !g_loading_cpu_layer, active_weight_load_device());
         }
-        if (g_loading_cpu_layer) {
-            throw std::runtime_error(
-                "MXFP4-SQ does not support dense CPU-layer offload: " + name);
-        }
-        result.mxfp4_sq.weight = to_device_mxfp4_sq(
-            read_tensor(mfq, name),
-            true,
-            active_weight_load_device());
-        result.logical_out = result.mxfp4_sq.weight.out;
-        result.logical_neuron_len =
-            result.mxfp4_sq.weight.neuron_len;
     } else if (mfq::fp8sq::is_dtype(dtype)) {
         result.kind = QuantLinearKind::Fp8Sq;
-        if (g_tensor_parallel.enabled() &&
-                axis != TensorParallelAxis::Mirrored) {
-            throw std::runtime_error(
-                "FP8-SQ tensor parallelism is not implemented: " + name);
+        const auto payload = read_tensor(mfq, name);
+        const auto layout = mfq::fp8sq::parse(dtype, payload.data(), payload.size());
+        result.logical_out = layout.outputs;
+        result.logical_neuron_len = layout.width;
+        if (!g_loading_cpu_layer && g_tensor_parallel.enabled() && axis != TensorParallelAxis::Mirrored) {
+            const bool output_axis = axis == TensorParallelAxis::Output;
+            const auto alignment = output_axis ? layout.block_rows : layout.block_columns;
+            for (const auto& slice : select_slices(output_axis ? layout.outputs : layout.width, alignment)) {
+                QuantLinearShard shard;
+                shard.kind = result.kind;
+                shard.device = slice.device;
+                shard.output_begin = output_axis ? slice.begin : 0;
+                shard.output_end = output_axis ? slice.end : layout.outputs;
+                shard.input_begin = output_axis ? 0 : slice.begin;
+                shard.input_end = output_axis ? layout.width : slice.end;
+                shard.fp8_sq.weight = to_device_fp8_sq(dtype,
+                    mfq::fp8sq::slice(dtype, payload, shard.output_begin, shard.output_end,
+                        shard.input_begin, shard.input_end), true, slice.device);
+                result.tensor_parallel_shards.push_back(std::move(shard));
+            }
+        } else {
+            result.fp8_sq.weight = to_device_fp8_sq(dtype, payload, !g_loading_cpu_layer, active_weight_load_device());
         }
-        if (g_loading_cpu_layer) {
-            throw std::runtime_error(
-                "FP8-SQ does not support dense CPU-layer offload: " + name);
-        }
-        result.fp8_sq.weight = to_device_fp8_sq(
-            dtype, read_tensor(mfq, name), true,
-            active_weight_load_device());
-        result.logical_out = result.fp8_sq.weight.out;
-        result.logical_neuron_len =
-            result.fp8_sq.weight.neuron_len;
     } else if (dtype == "MXFP4") {
         result.kind = QuantLinearKind::Mxfp4;
         const auto cpu = unpack_mxfp4(read_tensor(mfq, name));
@@ -11189,9 +11257,37 @@ DenseLinearGroup make_dense_group(const std::vector<mfq_tensor_backend::Tensor> 
     return g;
 }
 
+static mfq_tensor_backend::Tensor dequant_sq_cpu(const Mxfp4SqWeight& weight) {
+    auto output = mfq_tensor_backend::empty({weight.out, weight.neuron_len},
+        weight.blob.options().dtype(mfq_tensor_backend::kFloat32));
+    const auto* blob = weight.blob.data_ptr<uint8_t>();
+    const auto layout = mfq::sq::parse(blob, weight.blob.numel());
+    mfq_parallel_for(0, weight.out, 1, [&](int64_t begin, int64_t end) {
+        for (auto n = begin; n < end; ++n) mfq::sq::decode_cpu_row(blob, layout,
+            weight.row_q.data_ptr<uint8_t>()[n], weight.row_symbol_byte_offsets.data_ptr<int32_t>()[n],
+            weight.row_auxiliary.data_ptr<int32_t>()[n], output.data_ptr<float>() + n * weight.neuron_len);
+    });
+    return output;
+}
+
+static mfq_tensor_backend::Tensor dequant_sq_cpu(const Fp8SqWeight& weight) {
+    auto output = mfq_tensor_backend::empty({weight.out, weight.neuron_len},
+        weight.blob.options().dtype(mfq_tensor_backend::kFloat32));
+    const auto* blob = weight.blob.data_ptr<uint8_t>();
+    const auto layout = mfq::fp8sq::parse(weight.dtype, blob, weight.blob.numel());
+    mfq_parallel_for(0, weight.out, 1, [&](int64_t begin, int64_t end) {
+        for (auto n = begin; n < end; ++n) for (int64_t k = 0; k < weight.neuron_len; ++k)
+            output.data_ptr<float>()[n * weight.neuron_len + k] = mfq::fp8sq::decode_cpu(blob, layout,
+                weight.row_q.data_ptr<uint8_t>()[n], weight.row_symbol_byte_offsets.data_ptr<int32_t>()[n], n, k);
+    });
+    return output;
+}
+
 static mfq_tensor_backend::Tensor dequant_fp8_sq(
         const Fp8SqWeight & weight,
         bool fp32) {
+    if (!weight.blob.is_cuda()) return dequant_sq_cpu(weight).to(
+        fp32 ? mfq_tensor_backend::kFloat32 : mfq_tensor_backend::kFloat16);
     if (weight.dtype == "MXFP8-SQ") {
         return mxfp8_sq_dequant_cuda(
             weight.blob, weight.row_q, weight.row_symbol_byte_offsets,
@@ -11248,6 +11344,7 @@ static mfq_tensor_backend::Tensor dequant_quant_linear_f32(const QuantLinear & l
         }
         if (linear.is_mxfp4_sq()) {
             const auto & weight = linear.mxfp4_sq.weight;
+            if (!weight.blob.is_cuda()) return dequant_sq_cpu(weight);
             return mxfp4_sq_dequant_cuda(
                 weight.blob,
                 weight.row_q,
@@ -11306,6 +11403,12 @@ static mfq_tensor_backend::Tensor dequant_quant_linear_f32(const QuantLinear & l
             part = mxfp4_dequant_cuda(
                 shard.mxfp4.values, shard.mxfp4.scales)
                 .to(mfq_tensor_backend::kFloat32).contiguous();
+        } else if (shard.kind == QuantLinearKind::Mxfp4Sq || shard.kind == QuantLinearKind::Fp8Sq) {
+            QuantLinear local;
+            local.kind = shard.kind;
+            local.mxfp4_sq = shard.mxfp4_sq;
+            local.fp8_sq = shard.fp8_sq;
+            part = dequant_quant_linear_f32(local);
         } else if (shard.kind == QuantLinearKind::Tpq) {
             part = shard.tpq.int4
                 ? tpq_int4_dequant_cuda(
@@ -11396,6 +11499,7 @@ mfq_tensor_backend::Tensor quant_linear_reference_weight(
     }
     if (linear.is_mxfp4_sq()) {
         const auto& weight = linear.mxfp4_sq.weight;
+        if (!weight.blob.is_cuda()) return dequant_sq_cpu(weight).to(mfq_tensor_backend::kFloat16);
         return mxfp4_sq_dequant_cuda(
             weight.blob, weight.row_q, weight.row_symbol_byte_offsets,
             weight.row_auxiliary, weight.bits, weight.out,

@@ -2,8 +2,10 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <cstdlib>
 
 #include "packed_backward.cuh"
+#include "packed_gemm.cuh"
 
 namespace {
 
@@ -95,6 +97,37 @@ __device__ __forceinline__ float decode_value(
         : kSq3Palette[palette * 8 + symbol];
     return decode_native(nibble, exponent);
 }
+
+struct SqPackedDecoder {
+    const std::uint8_t *blob, *row_q;
+    const std::int32_t *offsets, *auxiliary;
+    mfq::sq::Layout q;
+    __device__ void load8(int row, int column, float* destination, int outputs, int width) const {
+        if (row >= outputs || column >= width) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) destination[i] = 0;
+            return;
+        }
+        const int bits = row_q[row];
+        const auto aux = static_cast<std::size_t>(auxiliary[row]);
+        const auto* symbols = blob + q.symbols + offsets[row];
+        const auto block = column / 32;
+        unsigned exponent, palette = 0;
+        if (bits == 4) exponent = blob[q.native_scales + aux * (q.width / 32) + block];
+        else {
+            const auto selector = aux * (q.width / 32) + block;
+            const auto state = aux * 8 + block_tag(symbols, blob + q.selectors, block, selector, bits);
+            exponent = q.base + read_bits(blob + q.scales, state, 2);
+            palette = read_bits(blob + q.palettes, state, 5);
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const auto symbol = read_bits(symbols, column + i, bits);
+            destination[i] = bits == 4 ? decode_native(symbol, exponent) : decode_value(palette, symbol, exponent, bits);
+        }
+    }
+
+};
 
 template<typename T> __device__ __forceinline__ float as_float(T x) { return float(x); }
 template<> __device__ __forceinline__ float as_float(__half x) { return __half2float(x); }
@@ -530,9 +563,19 @@ mfq_tensor_backend::Tensor mxfp4_sq_matmul_cuda(
     } else {
         const auto* x = reinterpret_cast<const __half*>(input.data_ptr<mfq_half>());
         auto* y = reinterpret_cast<__half*>(out.data_ptr<mfq_half>());
-        dispatch_mmq(
-            data, q_data, symbol_offsets, auxiliary,
-            x, y, q, rows, stream);
+        const char* disable_tensor_core = std::getenv("MFQ_DISABLE_SQ_TENSOR_CORE");
+        const char* force_tensor_core = std::getenv("MFQ_FORCE_SQ_TENSOR_CORE");
+        // Retained 3090 Ti comparisons show a crossover at M*N=131072 for
+        // M>=32; smaller projections lose to the direct packed kernel.
+        const bool profitable = rows >= 32 && std::int64_t(rows) * outputs >= 131072;
+        if (rows > 8 && (profitable || (force_tensor_core != nullptr && force_tensor_core[0] == '1')) &&
+            (disable_tensor_core == nullptr || disable_tensor_core[0] != '1')) {
+            mfq::packed::gemm_nt<SqPackedDecoder, true, 32, 64, true>
+                <<<dim3((q.outputs + 63) / 64, (rows + 31) / 32), 256, 0, stream>>>(
+                    {data, q_data, symbol_offsets, auxiliary, q}, x, y, rows, q.outputs, q.width);
+        } else {
+            dispatch_mmq(data, q_data, symbol_offsets, auxiliary, x, y, q, rows, stream);
+        }
     }
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;

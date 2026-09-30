@@ -264,6 +264,9 @@ struct Fp8SqWeight {
     double distribution_entropy = 0.0;
 };
 
+mfq_tensor_backend::Tensor sq_matmul_cpu(const Mxfp4SqWeight&, mfq_tensor_backend::Tensor);
+mfq_tensor_backend::Tensor sq_matmul_cpu(const Fp8SqWeight&, mfq_tensor_backend::Tensor);
+
 struct MoeActivationGeometry {
     int groups = 0;
     int gs = 0;
@@ -965,9 +968,7 @@ struct Mxfp4SqLinear {
 
     mfq_tensor_backend::Tensor forward(
             mfq_tensor_backend::Tensor x) const {
-        MFQ_RUNTIME_CHECK(
-            weight.blob.is_cuda(),
-            "MXFP4-SQ does not support dense CPU-layer offload");
+        if (!weight.blob.is_cuda()) return sq_matmul_cpu(weight, x);
         auto shape = x.sizes().vec();
         const auto original_dtype = x.scalar_type();
         auto source = x.reshape({-1, x.size(-1)});
@@ -1002,9 +1003,7 @@ struct Fp8SqLinear {
 
     mfq_tensor_backend::Tensor forward(
             mfq_tensor_backend::Tensor x) const {
-        MFQ_RUNTIME_CHECK(
-            weight.blob.is_cuda(),
-            "FP8-SQ does not support dense CPU-layer offload");
+        if (!weight.blob.is_cuda()) return sq_matmul_cpu(weight, x);
         auto shape = x.sizes().vec();
         const auto original_dtype = x.scalar_type();
         auto source = x.reshape({-1, x.size(-1)});
@@ -1078,6 +1077,8 @@ struct QuantLinearShard {
     Mxfp8Weight mxfp8;
     TpqWeight tpq;
     mfq_tensor_backend::Tensor dense;
+    Mxfp4SqLinear mxfp4_sq;
+    Fp8SqLinear fp8_sq;
 };
 
 struct QuantLinear {

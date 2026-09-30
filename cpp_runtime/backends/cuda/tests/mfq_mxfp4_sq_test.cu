@@ -1,6 +1,8 @@
 #include "mfq/kernels/cuda/mxfp4_sq.h"
+#include "mfq/mxfp4_sq_decode.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -161,6 +163,20 @@ void check_fixture(const std::filesystem::path& path, int& matmuls,
             }
         }
     }
+    if (q.width >= 64) {
+        std::vector<std::int64_t> selected;
+        for (int row = 0; row < q.outputs; row += 2) selected.push_back(row);
+        const auto sliced = mfq::sq::select_rows(raw, selected, 32, q.width);
+        const auto layout = mfq::sq::parse(sliced.data(), sliced.size());
+        const auto rows = mfq::sq::row_metadata(sliced.data(), layout);
+        for (int row = 0; row < layout.outputs; ++row) for (int col = 0; col < layout.width; ++col) {
+            const float actual = mfq::sq::decode_cpu(sliced.data(), layout, rows.q[row],
+                rows.symbol_byte_offsets[row], rows.auxiliary_rows[row], col);
+            const float expected_value = expected[selected[row] * q.width + 32 + col];
+            require(std::memcmp(&actual, &expected_value, sizeof(float)) == 0,
+                    "SQ packed row/column slice or CPU decode differs");
+        }
+    }
     // Extreme exponents test decode only; bounded base120 is the matmul gate.
     if (q.base != 120) return;
     for (const auto dtype : {kFloat16, kFloat32}) {
@@ -269,6 +285,11 @@ void check_fixture(const std::filesystem::path& path, int& matmuls,
 } // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    _putenv_s("MFQ_FORCE_SQ_TENSOR_CORE", "1");
+#else
+    setenv("MFQ_FORCE_SQ_TENSOR_CORE", "1", 1);
+#endif
     if (argc != 2) { std::cerr << "usage: mfq-mxfp4-sq-test FIXTURE_DIRECTORY\n"; return 2; }
     int devices = 0;
     const auto status = cudaGetDeviceCount(&devices);

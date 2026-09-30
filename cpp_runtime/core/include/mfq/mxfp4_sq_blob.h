@@ -322,8 +322,15 @@ inline void write_packed_bits(
 
 inline std::vector<std::uint8_t> select_rows(
     std::span<const std::uint8_t> source,
-    std::span<const std::int64_t> selected_rows) {
+    std::span<const std::int64_t> selected_rows,
+    int column_begin = 0,
+    int column_end = -1) {
     const auto src = parse(source.data(), source.size());
+    if (column_end == -1) column_end = src.width;
+    if (column_begin < 0 || column_end > src.width || column_begin >= column_end ||
+        column_begin % 32 != 0 || column_end % 32 != 0) {
+        throw std::runtime_error("MXFP4-SQ column selection must align to block32");
+    }
     if (selected_rows.empty() ||
         selected_rows.size() > static_cast<std::size_t>(
             std::numeric_limits<int>::max())) {
@@ -344,7 +351,7 @@ inline std::vector<std::uint8_t> select_rows(
     }
     const auto dst = adaptive_layout(
         static_cast<std::int64_t>(selected_rows.size()),
-        src.width,
+        column_end - column_begin,
         src.base,
         q_sum,
         sq4_rows);
@@ -362,9 +369,10 @@ inline std::vector<std::uint8_t> select_rows(
         }
     };
     write_u64(8, selected_rows.size());
-    write_u64(16, static_cast<std::uint64_t>(src.width));
+    write_u64(16, static_cast<std::uint64_t>(dst.width));
 
-    const auto blocks = static_cast<std::size_t>(src.width / 32);
+    const auto blocks = static_cast<std::size_t>(dst.width / 32);
+    const auto source_blocks = static_cast<std::size_t>(src.width / 32);
     std::size_t destination_symbol = dst.symbols;
     std::size_t destination_sq_row = 0;
     std::size_t destination_native_row = 0;
@@ -376,11 +384,12 @@ inline std::vector<std::uint8_t> select_rows(
         const unsigned q = source_rows.q[source_row];
         write_packed_bits(result, dst.q_selectors, destination_row, 2,
                           static_cast<std::uint8_t>(q - 1));
-        const auto row_bytes = static_cast<std::size_t>(src.width) * q / 8;
+        const auto row_bytes = static_cast<std::size_t>(dst.width) * q / 8;
         std::memcpy(
             result.data() + destination_symbol,
             source.data() + src.symbols +
-                source_rows.symbol_byte_offsets[source_row],
+                source_rows.symbol_byte_offsets[source_row] +
+                static_cast<std::size_t>(column_begin) * q / 8,
             row_bytes);
         destination_symbol += row_bytes;
 
@@ -391,7 +400,7 @@ inline std::vector<std::uint8_t> select_rows(
                 result.data() + dst.native_scales +
                     destination_native_row * blocks,
                 source.data() + src.native_scales +
-                    static_cast<std::size_t>(source_auxiliary) * blocks,
+                    static_cast<std::size_t>(source_auxiliary) * source_blocks + column_begin / 32,
                 blocks);
             ++destination_native_row;
             continue;
@@ -405,7 +414,7 @@ inline std::vector<std::uint8_t> select_rows(
                 read_packed_bits(
                     source,
                     src.selectors,
-                    static_cast<std::size_t>(source_auxiliary) * blocks + block,
+                    static_cast<std::size_t>(source_auxiliary) * source_blocks + column_begin / 32 + block,
                     1));
         }
         for (std::size_t state = 0; state < 8; ++state) {

@@ -24,6 +24,7 @@
 #include "glu.cuh"
 #include "mfq_tensor_backend.h"
 #include "packed_backward.cuh"
+#include "packed_gemm.cuh"
 
 
 #define MFQ_CUBLAS_CHECK(expression) \
@@ -175,6 +176,46 @@ __global__ void nint8_one_quantize_reconstruct_kernel(
     }
 }
 
+
+struct NintPackedDecoder {
+    const uint8_t *bits, *row_q, *sub_scale, *sub_min;
+    const int64_t* offsets;
+    const float *scale, *minimum;
+    int groups, group_size;
+    __device__ void load8(int row, int column, __half* destination, int outputs, int width) const {
+        if (row >= outputs || column + 8 > width) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) destination[i] = __float2half_rn(
+                row < outputs && column + i < width ? (*this)(row, column + i) : 0.0f);
+            return;
+        }
+        const int q = row_q[row];
+        const auto codes = unpack_nint_codes8_packed(bits,
+            static_cast<uint64_t>(offsets[row]) + static_cast<uint64_t>(column) * q, q);
+        const float ns = scale[row], nm = minimum[row];
+        const auto group = static_cast<size_t>(row) * groups + column / group_size;
+        if (group_size % 8 == 0) {
+            const float s = ns * static_cast<float>(sub_scale[group]);
+            const float m = nm * static_cast<float>(sub_min[group]);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) destination[i] = __float2half_rn(
+                s * static_cast<float>((codes >> (i * q)) & ((1u << q) - 1)) - m);
+        } else {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const auto g = static_cast<size_t>(row) * groups + (column + i) / group_size;
+                destination[i] = __float2half_rn((ns * static_cast<float>(sub_scale[g])) *
+                    static_cast<float>((codes >> (i * q)) & ((1u << q) - 1)) - nm * static_cast<float>(sub_min[g]));
+            }
+        }
+    }
+    __device__ float operator()(int row, int column) const {
+        const auto metadata = static_cast<size_t>(row) * groups + column / group_size;
+        const auto code = unpack_nint_code(bits, offsets[row], column, row_q[row]);
+        return (scale[row] * static_cast<float>(sub_scale[metadata])) * static_cast<float>(code) -
+            minimum[row] * static_cast<float>(sub_min[metadata]);
+    }
+};
 
 __global__ void nint_decode_rows_kernel(
         const uint8_t * __restrict__ bitstream,
@@ -1931,8 +1972,8 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
     const int real_width = static_cast<int>(input.size(1));
     const int padded_width = groups * static_cast<int>(group_size);
     MFQ_RUNTIME_CHECK(
-        activation_rows >= 1 && activation_rows <= 8,
-        "NINT packed matmul supports M in [1,8]");
+        activation_rows >= 1,
+        "NINT packed matmul requires at least one activation row");
     MFQ_RUNTIME_CHECK(
         group_size >= 4 && group_size <= 64 && real_width <= padded_width,
         "NINT packed matmul dimensions are invalid");
@@ -1942,6 +1983,67 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
         neuron_scale.numel() == output_rows &&
         neuron_minimum.numel() == output_rows,
         "NINT row metadata shape mismatch");
+    if (activation_rows > 8) {
+        MFQ_RUNTIME_CHECK(gate == nullptr,
+            "NINT tiled prefill expects an already prepared activation");
+        MFQ_RUNTIME_CHECK(
+            bitstream.device() == input.device() && row_q_bits.device() == input.device() &&
+            row_q_bit_offsets.device() == input.device() && subgroup_scale.device() == input.device() &&
+            subgroup_minimum.device() == input.device() && neuron_scale.device() == input.device() &&
+            neuron_minimum.device() == input.device(), "NINT weights must share the activation device");
+        const MfqCudaGuard guard(input.device());
+        const char* fused_prefill = std::getenv("MFQ_NINT_FUSED_PREFILL");
+        const char* panel_prefill = std::getenv("MFQ_NINT_PANEL_PREFILL");
+        if ((fused_prefill == nullptr || fused_prefill[0] != '1') &&
+            (panel_prefill == nullptr || panel_prefill[0] != '1')) {
+            auto decoded = nint_decode_cuda(bitstream, row_q_bits, row_q_bit_offsets,
+                subgroup_scale, subgroup_minimum, neuron_scale, neuron_minimum, real_width, group_size);
+            return mfq_tensor_backend::matmul(input, decoded.transpose(0, 1));
+        }
+        auto output = mfq_tensor_backend::empty({activation_rows, output_rows}, input.options());
+        if (fused_prefill == nullptr || fused_prefill[0] != '1') {
+            // Keep each decoded panel in cache for GEMM and reuse its workspace.
+            // This bounds scratch storage independently of the projection's N.
+            constexpr int panel_rows = 2048;
+            auto decoded = mfq_tensor_backend::empty({std::min(output_rows, panel_rows), real_width}, input.options());
+            const auto stream = mfq_current_cuda_stream();
+            const auto handle = mfq_current_cublas_handle();
+            MFQ_CUBLAS_CHECK(cublasSetStream(handle, stream));
+            const float alpha = 1.0f, beta = 0.0f;
+            for (int begin = 0; begin < output_rows; begin += panel_rows) {
+                const int count = std::min(panel_rows, output_rows - begin);
+                const int blocks = static_cast<int>(std::min<size_t>((static_cast<size_t>(count) * real_width + 255) / 256, 65535));
+                nint_decode_rows_kernel<<<blocks, 256, 0, stream>>>(
+                    bitstream.data_ptr<uint8_t>(), row_q_bits.data_ptr<uint8_t>() + begin,
+                    row_q_bit_offsets.data_ptr<int64_t>() + begin,
+                    subgroup_scale.data_ptr<uint8_t>() + static_cast<size_t>(begin) * groups,
+                    subgroup_minimum.data_ptr<uint8_t>() + static_cast<size_t>(begin) * groups,
+                    neuron_scale.data_ptr<float>() + begin, neuron_minimum.data_ptr<float>() + begin,
+                    reinterpret_cast<__half*>(decoded.data_ptr<mfq_half>()), count, groups, group_size, real_width);
+                MFQ_CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                    count, activation_rows, real_width, &alpha,
+                    decoded.data_ptr<mfq_half>(), CUDA_R_16F, real_width,
+                    input.data_ptr<mfq_half>(), CUDA_R_16F, real_width, &beta,
+                    output.data_ptr<mfq_half>() + begin, CUDA_R_16F, output_rows,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            }
+            MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+            return output;
+        }
+        const NintPackedDecoder decoder{
+            bitstream.data_ptr<uint8_t>(), row_q_bits.data_ptr<uint8_t>(),
+            subgroup_scale.data_ptr<uint8_t>(), subgroup_minimum.data_ptr<uint8_t>(),
+            row_q_bit_offsets.data_ptr<int64_t>(), neuron_scale.data_ptr<float>(),
+            neuron_minimum.data_ptr<float>(), groups, static_cast<int>(group_size)};
+        mfq::packed::gemm_nt<NintPackedDecoder, false, 32, 64, true>
+            <<<dim3((output_rows + 63) / 64, (activation_rows + 31) / 32),
+            256, 0, mfq_current_cuda_stream()>>>(decoder,
+                reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),
+                reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
+                activation_rows, output_rows, real_width);
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return output;
+    }
     MFQ_RUNTIME_CHECK(
         quantized_input.is_cuda() && quantized_input.is_contiguous() &&
         quantized_input.scalar_type() == mfq_tensor_backend::kInt8 &&

@@ -172,6 +172,11 @@ if(BUILD_TESTING)
         mfq-cuda-native-kernels)
     target_compile_definitions(mfq-nint-q8-test PRIVATE
         MFQ_NATIVE_CUDA_RUNTIME=1)
+    mfq_add_cuda_test(mfq-packed-prefill-test
+        ${MFQ_CUDA_ROOT}/tests/mfq_packed_prefill_test.cu
+        mfq-cuda-native-kernels mfq-core)
+    target_compile_definitions(mfq-packed-prefill-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
+    target_include_directories(mfq-packed-prefill-test PRIVATE ${MFQ_REPOSITORY_ROOT})
     mfq_add_cuda_test(mfq-paged-kv-test
         ${MFQ_CUDA_ROOT}/tests/mfq_paged_kv_test.cu
         mfq-cuda-native-kernels)
@@ -270,6 +275,13 @@ add_library(mfq-cuda-runtime STATIC
 )
 add_library(mfq::cuda-runtime ALIAS mfq-cuda-runtime)
 mfq_configure_cuda_decode_target(mfq-cuda-runtime)
+
+if(BUILD_TESTING)
+    add_executable(mfq-sq-linear-test ${MFQ_CUDA_ROOT}/tests/mfq_sq_linear_test.cpp)
+    mfq_configure_cuda_decode_target(mfq-sq-linear-test)
+    target_compile_definitions(mfq-sq-linear-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-sq-linear-test PRIVATE mfq-cuda-runtime)
+endif()
 target_link_libraries(mfq-cuda-runtime PRIVATE
     CUDA::cuda_driver
     CUDA::cudart
