@@ -5,6 +5,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 
 namespace mfq::engine {
@@ -155,3 +156,45 @@ void MfqTokenizer::finish_init() {
 }
 
 } // namespace mfq::engine
+
+namespace {
+
+MfqTokenizerProbe probe(
+        std::unique_ptr<mfq::engine::MfqTokenizer> tokenizer,
+        const std::string & text,
+        bool add_special,
+        bool parse_special) {
+    return {
+        tokenizer->vocab_size(),
+        tokenizer->bos_token(),
+        tokenizer->eos_token(),
+        tokenizer->eot_token(),
+        tokenizer->pad_token(),
+        tokenizer->add_bos(),
+        tokenizer->add_eos(),
+        tokenizer->chat_template(),
+        tokenizer->tokenize(text, parse_special, add_special),
+    };
+}
+
+} // namespace
+
+MfqTokenizerProbe probe_mfq_tokenizer(
+        const std::vector<uint8_t> & tokenizer_gguf,
+        const std::string & text,
+        bool add_special,
+        bool parse_special) {
+    return probe(
+        std::make_unique<mfq::engine::MfqTokenizer>(tokenizer_gguf),
+        text, add_special, parse_special);
+}
+
+MfqTokenizerProbe probe_mfq_tokenizer(
+        const std::string & tokenizer_model,
+        const std::string & text,
+        bool add_special,
+        bool parse_special) {
+    return probe(
+        std::make_unique<mfq::engine::MfqTokenizer>(tokenizer_model),
+        text, add_special, parse_special);
+}

@@ -187,6 +187,80 @@ int32_t MfqScheduler::generate_multimodal_with_cancel(
     }
 }
 
+#ifdef MFQ_ENGINE_TEXT
+mfq::engine::InferenceRequest MfqScheduler::prepare_inference(
+        mfq::engine::InferenceInput input,
+        int64_t max_context) const {
+    if (!engine_.text) {
+        throw std::runtime_error("engine has no text processor");
+    }
+    return engine_.text->prepare(std::move(input), max_context);
+}
+
+mfq::engine::InferenceResult MfqScheduler::run_inference(
+        const mfq::engine::InferenceRequest & request,
+        const MfqScheduledRequest & scheduled,
+        const mfq::engine::InferenceEmit & emit,
+        mfq::engine::InferenceMetrics * metrics,
+        bool defer_token_parsing,
+        const std::function<std::string()> & make_tool_call_id) const {
+    if (!engine_.text) {
+        throw std::runtime_error("engine has no text processor");
+    }
+    const auto execute = [&](const MfqTokenCallback & on_token,
+                             const MfqPrefillCallback & on_prefill) {
+        return request.vision
+            ? generate_multimodal(
+                  scheduled, request.prompt, *request.vision, request.sampling,
+                  on_token, on_prefill, request.cache_plan,
+                  request.token_constraint)
+            : generate(
+                  scheduled, request.prompt, request.sampling, on_token,
+                  on_prefill, request.cache_plan, request.token_constraint);
+    };
+    return engine_.text->run(
+        request, execute, [&] { return scheduled.cancelled(); }, emit,
+        metrics, defer_token_parsing, make_tool_call_id);
+}
+
+mfq::engine::ChatTemplateCapabilities
+MfqScheduler::chat_template_capabilities() const {
+    if (!engine_.text) return {};
+    return engine_.text->chat_template_capabilities();
+}
+
+int32_t MfqScheduler::vocab_size() const {
+    return engine_.text ? engine_.text->vocab_size() : 0;
+}
+
+void MfqScheduler::prepare_duplex_session(
+        const std::string & system_prompt,
+        MfqDuplexSessionParams & parameters) const {
+    if (!engine_.text) {
+        throw std::runtime_error("engine has no text processor");
+    }
+    engine_.text->prepare_duplex_session(system_prompt, parameters);
+}
+
+void MfqScheduler::prepare_duplex_step(
+        const std::string & text,
+        MfqDuplexStepInput & step) const {
+    if (!engine_.text) {
+        throw std::runtime_error("engine has no text processor");
+    }
+    engine_.text->prepare_duplex_step(text, step);
+}
+
+std::string MfqScheduler::decode_tokens(
+        const std::vector<int64_t> & tokens,
+        const std::unordered_set<int64_t> & excluded) const {
+    if (!engine_.text) {
+        throw std::runtime_error("engine has no text processor");
+    }
+    return engine_.text->decode_tokens(tokens, excluded);
+}
+#endif
+
 bool MfqScheduler::supports_reload() const noexcept {
     return static_cast<bool>(engine_.reload);
 }

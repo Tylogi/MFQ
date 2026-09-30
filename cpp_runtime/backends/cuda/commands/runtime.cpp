@@ -8,7 +8,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -151,17 +150,6 @@ RuntimeCommandOptions parse_runtime(ArgCursor& args) {
     return result;
 }
 
-std::vector<uint8_t> read_runtime_asset(
-        const mfq::ModelSource& source,
-        std::string_view name) {
-    const auto bytes = source.read_asset(name);
-    std::vector<uint8_t> result(bytes.size());
-    if (!bytes.empty()) {
-        std::memcpy(result.data(), bytes.data(), bytes.size());
-    }
-    return result;
-}
-
 std::string read_runtime_asset_text(
         const mfq::ModelSource& source,
         std::string_view name) {
@@ -211,12 +199,6 @@ int run_transport_runtime(RuntimeOptions& options) {
         "model-graph+cuda-adapters",
     };
     const auto& runtime_assets = *engine.metadata.source;
-    if (runtime_assets.has_asset(mfq::cuda::kTokenizerGgufAsset)) {
-        transport_config.tokenizer_gguf = read_runtime_asset(
-            runtime_assets, mfq::cuda::kTokenizerGgufAsset);
-    } else {
-        transport_config.tokenizer_model = options.tokenizer_model;
-    }
     const auto embedded_profile = runtime_assets.metadata().find(
         "runtime.sampling.v1");
     transport_config.runtime_profile = resolve_mfq_runtime_profile(

@@ -48,9 +48,10 @@ PAGED_HEADER = (ROOT / "cpp_runtime" / "core" / "mfq_paged_prefix_cache.h").read
 PAGED_SOURCE = (ROOT / "cpp_runtime" / "core" / "mfq_paged_prefix_cache.cpp").read_text(
     encoding="utf-8"
 )
-ENGINE_FLOW = (
-    ROOT / "cpp_runtime" / "engine" / "include" / "inference.h"
-).read_text(encoding="utf-8")
+ENGINE_FLOW = "\n".join(
+    (ROOT / "cpp_runtime" / "engine" / part).read_text(encoding="utf-8")
+    for part in ("include/inference.h", "src/text_processor.cpp")
+)
 SESSION_CACHE = (
     ROOT / "cpp_runtime" / "engine" / "include" /
     "session_snapshot_cache.h"
@@ -78,7 +79,8 @@ def test_native_session_identifier_reaches_the_cuda_runtime() -> None:
 
 
 def test_stateless_text_requests_use_the_content_addressed_prefix_cache() -> None:
-    assert "work.cache_plan.stable_prefix_tokens = work.prompt.size();" in SERVER
+    assert "work.cache_plan.stable_prefix_tokens = work.prompt.size();" in ENGINE_FLOW
+    assert "stable_prefix_tokens" not in SERVER
     assert "persistent_prefix_enabled()" in DECODE
     assert "persistent_prefix_enabled()" in METAL_DECODE
     assert "!cache_plan.session_id.empty() ||" in DECODE

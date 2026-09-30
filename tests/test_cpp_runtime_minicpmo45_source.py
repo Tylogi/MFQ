@@ -58,6 +58,9 @@ SERVER_SOURCE = "\n".join(
     for path in sorted(TRANSPORT_SRC.rglob("*"))
     if path.suffix in {".cpp", ".h"}
 )
+TEXT_PROCESSOR = (
+    ROOT / "cpp_runtime" / "engine" / "src" / "text_processor.cpp"
+).read_text(encoding="utf-8")
 REALTIME_GATEWAY = (
     ROOT / "mfq" / "runtime" / "minicpmo45_realtime.py"
 ).read_text(encoding="utf-8")
@@ -305,8 +308,9 @@ def test_minicpmo45_native_servers_share_mfqd_vision_tensors():
     assert "class TensorFileReader final" in SERVER_SOURCE
     assert 'value.contains("binary_file")' in SERVER_SOURCE
     assert "file_reader->read(" in SERVER_SOURCE
-    assert 'single_special_token(tokenizer, "<image>")' in SERVER_SOURCE
-    assert "MiniCPM-o image placeholder must contain 64 query tokens" in SERVER_SOURCE
+    assert 'special_token(tokenizer, "<image>")' in TEXT_PROCESSOR
+    assert "MiniCPM-o image placeholder must contain 64 query tokens" in TEXT_PROCESSOR
+    assert "special_token(" not in SERVER_SOURCE
     assert "generate_multimodal_tokens(" in DECODE
     assert "runtime.forward(" in DECODE
     assert "mfq::cuda::sample_logits(" in DECODE

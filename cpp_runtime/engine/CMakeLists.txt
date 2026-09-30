@@ -20,10 +20,12 @@ if(TARGET mfq-tokenizer)
         src/inference.cpp
         src/token_constraint.cpp
         src/tokenizer.cpp
+        src/text_processor.cpp
     )
     target_include_directories(mfq-engine PRIVATE
         ${PROJECT_SOURCE_DIR}/components/tokenizer
         ${PROJECT_SOURCE_DIR}/components/tokenizer/src
     )
     target_link_libraries(mfq-engine PUBLIC mfq-tokenizer)
+    target_compile_definitions(mfq-engine PUBLIC MFQ_ENGINE_TEXT=1)
 endif()

@@ -7,6 +7,8 @@
 #include "storage/moe_expert_cache.h"
 #include "models/loader.h"
 #include "models/components.h"
+#include "models/registry.h"
+#include "text_processor.h"
 #include "mtp_metrics.h"
 #include "text_session_cache.h"
 
@@ -310,13 +312,29 @@ CudaEngine load_cuda_engine(CudaEngineOptions options) {
     CudaExecutionContextScope context_scope(*execution);
     execution->profiler.enabled = false;
     mfq_tensor_backend::NoGradGuard no_grad;
-    return with_loaded_cuda_model(
+    auto engine = with_loaded_cuda_model(
         *execution, options, true,
         [&](auto& model, auto& components, auto, auto) {
             return make_cuda_engine(
                 execution, std::move(model), std::move(components),
                 std::move(runtime_config));
         });
+    if (engine.metadata.source->has_asset(kTokenizerGgufAsset)) {
+        const auto bytes = engine.metadata.source->read_asset(
+            kTokenizerGgufAsset);
+        engine.text = std::make_shared<mfq::engine::TextProcessor>(
+            std::vector<uint8_t>(
+                reinterpret_cast<const uint8_t*>(bytes.data()),
+                reinterpret_cast<const uint8_t*>(bytes.data()) + bytes.size()),
+            static_cast<int32_t>(engine.metadata.vocab_size),
+            engine.metadata.model_type);
+    } else {
+        engine.text = std::make_shared<mfq::engine::TextProcessor>(
+            options.tokenizer_model,
+            static_cast<int32_t>(engine.metadata.vocab_size),
+            engine.metadata.model_type);
+    }
+    return engine;
 }
 
 } // namespace mfq::cuda

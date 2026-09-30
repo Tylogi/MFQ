@@ -2,6 +2,7 @@
 
 #include "engine.h"
 #include "scheduler.h"
+#include "tokenizer.h"
 
 #include <cstdint>
 #include <memory>
@@ -86,6 +87,7 @@ struct MfqHttpRuntimeTransportConfig : MfqRuntimeTransportConfig {
 class MfqTransport {
 public:
     virtual ~MfqTransport() = default;
+    virtual void configure_engine(mfq::engine::Engine &) {}
     virtual int run(const MfqScheduler & scheduler) = 0;
 };
 
@@ -95,12 +97,8 @@ public:
             std::unique_ptr<mfq::engine::Engine> engine,
             std::unique_ptr<MfqTransport> transport)
         : engine_(require_engine(std::move(engine))),
-          scheduler_(*engine_),
-          transport_(std::move(transport)) {
-        if (!transport_) {
-            throw std::invalid_argument("MFQ runtime requires a transport");
-        }
-    }
+          transport_(require_transport(std::move(transport))),
+          scheduler_(configure_engine(*engine_, *transport_)) {}
 
     template <typename ConcreteEngine,
               std::enable_if_t<std::is_base_of_v<
@@ -124,22 +122,23 @@ private:
         }
         return engine;
     }
+    static std::unique_ptr<MfqTransport> require_transport(
+            std::unique_ptr<MfqTransport> transport) {
+        if (!transport) {
+            throw std::invalid_argument("MFQ runtime requires a transport");
+        }
+        return transport;
+    }
+    static const mfq::engine::Engine & configure_engine(
+            mfq::engine::Engine & engine,
+            MfqTransport & transport) {
+        transport.configure_engine(engine);
+        return engine;
+    }
 
     std::unique_ptr<mfq::engine::Engine> engine_;
-    MfqScheduler scheduler_;
     std::unique_ptr<MfqTransport> transport_;
-};
-
-struct MfqTokenizerProbe {
-    int32_t vocab_size = 0;
-    int32_t bos_token = -1;
-    int32_t eos_token = -1;
-    int32_t eot_token = -1;
-    int32_t pad_token = -1;
-    bool add_bos = false;
-    bool add_eos = false;
-    std::string chat_template;
-    std::vector<int64_t> tokens;
+    MfqScheduler scheduler_;
 };
 
 std::unique_ptr<MfqTransport> make_mfq_http_transport(
@@ -152,11 +151,6 @@ void prepare_mfq_stdio_transport();
 std::unique_ptr<MfqTransport> make_mfq_stdio_transport(
     MfqRuntimeTransportConfig config);
 
-MfqTokenizerProbe probe_mfq_tokenizer(
-    const std::vector<uint8_t> & tokenizer_gguf,
-    const std::string & text,
-    bool add_special = false,
-    bool parse_special = true);
 MfqRuntimeProfile resolve_mfq_runtime_profile(
     const std::string & mfq_path,
     const std::string & model_architecture,
@@ -165,8 +159,3 @@ MfqRuntimeProfile resolve_mfq_runtime_profile(
     const std::string & embedded_profile_json = {},
     const std::string & model_config_json = {},
     const std::string & explicit_profile_path = {});
-MfqTokenizerProbe probe_mfq_tokenizer(
-    const std::string & tokenizer_model,
-    const std::string & text,
-    bool add_special = false,
-    bool parse_special = true);

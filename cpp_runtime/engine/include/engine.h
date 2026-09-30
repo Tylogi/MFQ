@@ -3,8 +3,11 @@
 #include "mfq/runtime.h"
 
 #include <cstddef>
+#include <memory>
 
 namespace mfq::engine {
+
+class TextProcessor;
 
 // The runtime's only backend-polymorphic boundary.
 class Engine {
@@ -17,6 +20,7 @@ public:
     virtual ~Engine() = 0;
 
     std::size_t max_concurrent_requests = 1;
+    std::shared_ptr<TextProcessor> text;
     MfqGenerateFn generate;
     MfqReloadFn reload;
     MfqDuplexBackend duplex;

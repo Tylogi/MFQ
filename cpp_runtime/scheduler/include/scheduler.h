@@ -1,11 +1,15 @@
 #pragma once
 
 #include "engine.h"
+#ifdef MFQ_ENGINE_TEXT
+#include "text_processor.h"
+#endif
 
 #include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_set>
 
 class MfqScheduledRequest {
 public:
@@ -70,6 +74,30 @@ public:
         const MfqPrefillCallback & on_prefill,
         const MfqPromptCachePlan & cache_plan,
         const MfqTokenConstraintPtr & token_constraint) const;
+
+#ifdef MFQ_ENGINE_TEXT
+    mfq::engine::InferenceRequest prepare_inference(
+        mfq::engine::InferenceInput input,
+        int64_t max_context) const;
+    mfq::engine::InferenceResult run_inference(
+        const mfq::engine::InferenceRequest & request,
+        const MfqScheduledRequest & scheduled,
+        const mfq::engine::InferenceEmit & emit,
+        mfq::engine::InferenceMetrics * metrics = nullptr,
+        bool defer_token_parsing = false,
+        const std::function<std::string()> & make_tool_call_id = {}) const;
+    mfq::engine::ChatTemplateCapabilities chat_template_capabilities() const;
+    int32_t vocab_size() const;
+    void prepare_duplex_session(
+        const std::string & system_prompt,
+        MfqDuplexSessionParams & parameters) const;
+    void prepare_duplex_step(
+        const std::string & text,
+        MfqDuplexStepInput & step) const;
+    std::string decode_tokens(
+        const std::vector<int64_t> & tokens,
+        const std::unordered_set<int64_t> & excluded = {}) const;
+#endif
 
     bool supports_reload() const noexcept;
     int64_t reload(int64_t context_size) const;

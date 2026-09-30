@@ -3,8 +3,8 @@
 #include "transport.h"
 
 #include "inference.h"
+#include "text_processor.h"
 #include "chat.h"
-#include "mfq_text.h"
 #include "nlohmann/json.hpp"
 
 #include <atomic>
@@ -39,8 +39,8 @@ public:
     std::string param;
 };
 
-using mfq::engine::MfqTokenizer;
 using RequestWork = mfq::engine::InferenceRequest;
+using RequestInput = mfq::engine::InferenceInput;
 using RequestMetrics = mfq::engine::InferenceMetrics;
 using CompletionResult = mfq::engine::InferenceResult;
 
@@ -125,16 +125,16 @@ json model_capability_profile_json(
     const MfqModelCapabilityProfile & profile);
 json duplex_profile_json(const MfqDuplexSamplingProfile & value);
 json tts_profile_json(const MfqTtsSamplingProfile & value);
-json chat_template_capabilities_json(const std::string & chat_template);
+json chat_template_capabilities_json(
+    const mfq::engine::ChatTemplateCapabilities & capabilities);
+void configure_text_processor(
+    mfq::engine::Engine & engine,
+    const MfqRuntimeTransportConfig & config);
 bool valid_mfq_session_id(const std::string & session_id);
 json runtime_generate_body(const json & params);
-RequestWork parse_work(
+RequestInput parse_input(
     const json & body,
     bool chat,
-    const MfqTokenizer & tokenizer,
-    const common_chat_templates * templates,
-    int64_t max_context,
-    const std::string & model_type,
     const MfqSamplingParams & defaults);
 RequestMetricValues request_metric_values(
     const CompletionResult & result,
@@ -150,14 +150,6 @@ void log_request_metrics(
     const MfqSamplingParams & sampling,
     const CompletionResult & result,
     const RequestMetricValues & values);
-CompletionResult run_inference(
-    const RequestWork & work,
-    const MfqTokenizer & tokenizer,
-    const MfqScheduler & scheduler,
-    const MfqScheduledRequest & request,
-    const std::function<bool(const common_chat_msg_diff &)> & emit,
-    RequestMetrics * metrics,
-    bool defer_token_parsing);
 json usage_json(size_t prompt_tokens, int32_t completion_tokens);
 json runtime_generation_event(
     const std::string & event,
@@ -172,11 +164,7 @@ json runtime_generation_result(
     json usage,
     json metrics);
 json chat_diff_json(const common_chat_msg_diff & diff);
-MfqMultimodalInput parse_mfq_vision(
-    const json & value,
-    std::vector<int64_t> & prompt,
-    const MfqTokenizer & tokenizer,
-    int64_t vocab_size);
+MfqMultimodalInput parse_mfq_vision(const json & value);
 std::vector<float> decode_audio_features(
     const std::string & encoded,
     int32_t frames);

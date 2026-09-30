@@ -39,6 +39,10 @@ TOKENIZER_CMAKE = (
 SERVER_CMAKE = (
     ROOT / "cpp_runtime" / "transport" / "CMakeLists.txt"
 ).read_text(encoding="utf-8")
+ENGINE_CMAKE = (
+    ROOT / "cpp_runtime" / "engine" / "CMakeLists.txt"
+).read_text(encoding="utf-8")
+CUDA_ENGINE = (CUDA_RUNTIME / "cuda_engine.cpp").read_text(encoding="utf-8")
 METAL_CMAKE = (
     ROOT / "cpp_runtime" / "backends" / "metal" / "CMakeLists.txt"
 ).read_text(encoding="utf-8")
@@ -88,42 +92,43 @@ def test_cpp_runtime_dependencies_are_integrated() -> None:
     assert "third_party" not in CMAKE
 
 
-def test_server_uses_native_gguf_jinja_template_and_common_parser() -> None:
-    assert "common_chat_templates_apply" in SERVER
+def test_engine_owns_native_gguf_jinja_template_and_common_parser() -> None:
+    assert "common_chat_templates_apply" in ENGINE
+    assert "common_chat_templates_apply" not in SERVER
     assert "common_chat_msgs_parse_oaicompat" in SERVER
     assert "common_chat_parse" in ENGINE
     assert "common_chat_msg_diff::compute_diffs" in ENGINE
     assert "common_chat_parse" not in SERVER
-    assert "config.tokenizer_gguf.empty()" in SERVER
-    assert "config.tokenizer_model.empty()" in SERVER
-    assert "requires an embedded or external tokenizer GGUF" in SERVER
+    assert "MfqTokenizer" not in SERVER
+    assert ".tokenize(" not in SERVER
+    assert "std::make_shared<mfq::engine::TextProcessor>" in CUDA_ENGINE
     assert "format_gemma4_chat_prompt" not in SERVER
     assert "format_dsv4_chat_prompt" not in SERVER
 
 
 def test_processor_owned_prompts_bypass_cached_jinja_templates() -> None:
-    parse_work = _section(
-        SERVER,
-        "RequestWork parse_work",
-        "json request_metric_values_json",
+    prepare = _section(
+        ENGINE,
+        "InferenceRequest TextProcessor::prepare",
+        "InferenceResult TextProcessor::run",
     )
 
-    assert "request_preformatted_prompt(body)" in parse_work
-    assert "if (preformatted_prompt)" in parse_work
-    assert "prompt = *preformatted_prompt;" in parse_work
-    assert "work.chat_parser.parse_tool_calls = false;" in parse_work
-    assert "json_schema_to_grammar(json::parse(json_schema))" in parse_work
-    assert "make_chat_token_constraint(" in parse_work
-    assert parse_work.index("if (preformatted_prompt)") < parse_work.index(
-        "apply_chat_template("
+    assert "if (chat.preformatted_prompt)" in prepare
+    assert "prompt = *chat.preformatted_prompt;" in prepare
+    assert "work.chat_parser.parse_tool_calls = false;" in prepare
+    assert "json_schema_to_grammar(" in prepare
+    assert "make_chat_token_constraint(" in prepare
+    assert prepare.index("if (chat.preformatted_prompt)") < prepare.index(
+        "common_chat_templates_apply("
     )
 
 
 def test_server_enforces_complete_chat_template_tool_calls() -> None:
     assert "class GrammarConstraint" in ENGINE
     assert "class GrammarConstraint" not in SERVER
-    assert "make_chat_token_constraint(" in SERVER
-    assert "work.token_constraint" in SERVER
+    assert "make_chat_token_constraint(" in ENGINE
+    assert "make_chat_token_constraint(" not in SERVER
+    assert "work.token_constraint" in ENGINE
     assert "if (partial)" in ENGINE
     assert "parsed.tool_calls.clear()" in ENGINE
     assert "parsed.tool_calls.clear()" not in SERVER
@@ -148,15 +153,16 @@ def test_native_server_cancels_active_session_generation_per_token() -> None:
     assert "!result.cancelled && !result.tool_calls.empty()" in ENGINE
     assert "cancel_requested" not in SERVER
     assert "work.cache_plan.stable_prefix_tokens = 0;" not in SERVER
-    assert "on_token, on_prefill, work.cache_plan" in SERVER
-    assert "work.cache_plan = {};" not in SERVER
+    assert "on_token, on_prefill, request.cache_plan" in SCHEDULER
+    assert "request.cache_plan = {};" not in SCHEDULER
 
 
 def test_server_links_integrated_text_runtime() -> None:
     assert "add_subdirectory(components/tokenizer)" in CMAKE
     assert "add_library(mfq-tokenizer STATIC" in TOKENIZER_CMAKE
     assert "add_library(mfq-text-runtime ALIAS mfq-tokenizer)" in TOKENIZER_CMAKE
-    assert "mfq-tokenizer" in SERVER_CMAKE
+    assert "mfq-tokenizer" in ENGINE_CMAKE
+    assert "mfq-tokenizer" not in SERVER_CMAKE
     assert "BUILD_WITH_INSTALL_RPATH ON" in METAL_CMAKE
 
 
@@ -169,13 +175,15 @@ def test_cpp_runtime_transport_has_no_public_openai_routes() -> None:
 def test_cuda_runtime_accepts_an_external_tokenizer_only() -> None:
     assert "model runtime does not accept an external model config" in DECODE
     assert "model runtime requires model config and tokenizer GGUF" in DECODE
-    assert "transport_config.tokenizer_model = options.tokenizer_model" in DECODE
+    assert "options.tokenizer_model" in CUDA_ENGINE
+    assert "transport_config.tokenizer_model" not in DECODE
 
 
 def test_server_publishes_template_gated_reasoning_effort() -> None:
     assert "chat_template_capabilities_json" in SERVER
     assert '{"chat_template_capabilities", chat_template_capabilities}' in SERVER
-    assert 'chat_template.find("enable_thinking")' in SERVER
+    assert 'source.find("enable_thinking")' in ENGINE
+    assert 'chat_template.find("enable_thinking")' not in SERVER
 
 
 def test_native_server_does_not_bundle_or_mount_a_webui() -> None:
@@ -189,9 +197,9 @@ def test_native_server_does_not_bundle_or_mount_a_webui() -> None:
 
 def test_dsv4_server_uses_exact_stable_prefix_kv_reuse() -> None:
     assert "MfqPromptCachePlan" in ENGINE
-    assert 'normalized_identity(model_type).rfind("deepseek_v4", 0) == 0' in SERVER
-    assert 'work.sampling.enable_thinking ? "<think>" : "</think>"' in SERVER
-    assert "stable_prefix_tokens" in SERVER
+    assert 'normalized_identity(impl_->model_type).rfind(' in ENGINE
+    assert 'work.sampling.enable_thinking\n            ? "<think>" : "</think>"' in ENGINE
+    assert "stable_prefix_tokens" in ENGINE
     assert '{"prefill_tokens", values.prefill_tokens}' in SERVER
 
 

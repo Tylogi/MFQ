@@ -10,18 +10,14 @@ add_library(mfq-runtime-communication STATIC
     src/stdio.cpp
 )
 add_library(mfq::runtime-communication ALIAS mfq-runtime-communication)
-target_include_directories(mfq-runtime-communication
-    PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    PRIVATE
-        ${PROJECT_SOURCE_DIR}/components/tokenizer
+target_include_directories(mfq-runtime-communication PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 target_link_libraries(mfq-runtime-communication
     PUBLIC
         mfq-runtime-scheduler
     PRIVATE
         mfq-http
-        mfq-tokenizer
         mfq-json
         mfq-paged-prefix-cache
         Threads::Threads

@@ -60,6 +60,17 @@ static void handle_api_error(httplib::Response & res, const ApiError & error) {
     set_json(res, error_body(error.what(), error.type, error.param), error.status);
 }
 
+static ApiError api_error(const mfq::engine::InferenceInputError & error) {
+    const char * type = "invalid_request_error";
+    if (error.code == mfq::engine::InferenceInputErrorCode::Unsupported) {
+        type = "unsupported_parameter";
+    } else if (error.code ==
+            mfq::engine::InferenceInputErrorCode::ContextLength) {
+        type = "context_length_exceeded";
+    }
+    return ApiError(400, type, error.what(), error.field);
+}
+
 int run_mfq_http_transport(
         const MfqHttpRuntimeTransportConfig & config,
         const MfqScheduler & scheduler) {
@@ -70,40 +81,10 @@ int run_mfq_http_transport(
         throw std::runtime_error(
             "MFQ runtime transport requires a generation engine");
     }
-    if (config.tokenizer_gguf.empty() &&
-        config.tokenizer_model.empty()) {
-        throw std::runtime_error(
-            "MFQ runtime transport requires an embedded or external tokenizer GGUF");
-    }
-    if (!config.tokenizer_gguf.empty() &&
-        !config.tokenizer_model.empty()) {
-        throw std::runtime_error(
-            "MFQ runtime transport tokenizer source is ambiguous");
-    }
     if (config.port < 1 || config.port > 65535) {
         throw std::runtime_error("runtime transport port must be in [1, 65535]");
     }
 
-    std::unique_ptr<MfqTokenizer> tokenizer =
-        config.tokenizer_gguf.empty()
-        ? std::make_unique<MfqTokenizer>(
-              config.tokenizer_model)
-        : std::make_unique<MfqTokenizer>(
-              config.tokenizer_gguf);
-    if (config.vocab_size > 0 && tokenizer->vocab_size() != config.vocab_size) {
-        throw std::runtime_error("tokenizer/model vocabulary mismatch: tokenizer=" +
-                                 std::to_string(tokenizer->vocab_size()) + " model=" +
-                                 std::to_string(config.vocab_size));
-    }
-    common_chat_templates_ptr chat_templates = nullptr;
-    if (!tokenizer->chat_template().empty()) {
-        chat_templates = common_chat_templates_init(
-            tokenizer->context(), "");
-        if (!chat_templates) {
-            throw std::runtime_error(
-                "cannot initialize tokenizer.chat_template");
-        }
-    }
     const MfqSamplingParams sampling_defaults =
         default_sampling_params(config);
     const json duplex_sampling_defaults =
@@ -114,7 +95,7 @@ int run_mfq_http_transport(
         duplex.name.empty() ? "native" : duplex.name;
     const json chat_template_capabilities =
         chat_template_capabilities_json(
-            tokenizer->chat_template());
+            scheduler.chat_template_capabilities());
     const auto model_capability_profile = config.model_capabilities
         ? *config.model_capabilities
         : architecture_capability_profile(config.model_type);
@@ -273,13 +254,8 @@ int run_mfq_http_transport(
                             "system_prompt",
                             config.runtime_profile.duplex.system_prompt.value_or(
                                 "Streaming Omni Conversation."));
-                        const std::string rendered_prefix =
-                            "<|im_start|>system\n" + system_prompt +
-                            "\n<|audio_start|>";
-                        parameters.system_prefix = tokenizer->tokenize(
-                            rendered_prefix, true, false);
-                        parameters.system_suffix = tokenizer->tokenize(
-                            "<|audio_end|><|im_end|>", true, false);
+                        scheduler.prepare_duplex_session(
+                            system_prompt, parameters);
                         if (payload.contains("reference_audio_features")) {
                             if (!payload["reference_audio_features"].is_string()) {
                                 throw ApiError(
@@ -295,26 +271,6 @@ int run_mfq_http_transport(
                                     payload["reference_audio_features"].get<std::string>(),
                                     parameters.reference_audio_frames);
                         }
-                        parameters.special_ids = {
-                            tokenizer->special_token_id("<unit>"),
-                            tokenizer->special_token_id("</unit>"),
-                            tokenizer->special_token_id("<image>"),
-                            tokenizer->special_token_id("</image>"),
-                            tokenizer->special_token_id("<slice>"),
-                            tokenizer->special_token_id("</slice>"),
-                            tokenizer->special_token_id("<|listen|>"),
-                            tokenizer->special_token_id("<|speak|>"),
-                            tokenizer->special_token_id("<|tts_bos|>"),
-                            tokenizer->special_token_id("<|tts_eos|>"),
-                            tokenizer->special_token_id("<|chunk_eos|>"),
-                            tokenizer->special_token_id("<|chunk_tts_eos|>"),
-                            tokenizer->special_token_id("<|turn_eos|>"),
-                            tokenizer->special_token_id("<|tts_pad|>"),
-                            151687,
-                        };
-                        parameters.forbidden_ids = {
-                            tokenizer->special_token_id("<|tts_pad|>"),
-                        };
                         session_controls = std::unordered_set<int64_t>(
                             parameters.special_ids.begin(),
                             parameters.special_ids.end());
@@ -434,13 +390,8 @@ int run_mfq_http_transport(
                                 400, "invalid_request_error",
                                 "input.text must be a non-empty string", "text");
                         }
-                        step.text_tokens = tokenizer->tokenize(
-                            input["text"].get<std::string>(), false, false);
-                        if (step.text_tokens.empty()) {
-                            throw ApiError(
-                                400, "invalid_request_error",
-                                "input.text produced no tokens", "text");
-                        }
+                        scheduler.prepare_duplex_step(
+                            input["text"].get<std::string>(), step);
                     }
                     step.max_new_speak_tokens = static_cast<int32_t>(
                         integer_field(
@@ -480,12 +431,8 @@ int run_mfq_http_transport(
                         {"audio_chunk_index", result.audio_chunk_index},
                     };
 
-                    std::string text_delta;
-                    for (const int64_t token : result.generated_tokens) {
-                        if (session_controls.count(token) == 0) {
-                            text_delta += tokenizer->piece(token, false);
-                        }
-                    }
+                    const std::string text_delta = scheduler.decode_tokens(
+                        result.generated_tokens, session_controls);
                     if (!text_delta.empty()) {
                         send_event({
                             {"type", "response.output.delta"},
@@ -526,6 +473,18 @@ int run_mfq_http_transport(
                         {"end_of_turn", result.end_of_turn},
                         {"metrics", metrics},
                     });
+                }
+            } catch (const mfq::engine::InferenceInputError & error) {
+                send_event({
+                    {"type", "session.closed"},
+                    {"session_id", owned_session},
+                    {"reason", "invalid_request"},
+                    {"diagnostic", {{"message", error.what()}}},
+                });
+                if (ws.is_open()) {
+                    ws.close(
+                        httplib::ws::CloseStatus::PolicyViolation,
+                        "invalid duplex input");
                 }
             } catch (const std::exception & error) {
                 send_event({
@@ -951,12 +910,9 @@ int run_mfq_http_transport(
         }
         try {
             const json body = runtime_generate_body(parse_body(req));
-            RequestWork work = parse_work(
-                body, true, *tokenizer, chat_templates.get(),
-                active_context.load(), config.model_type,
-                sampling_defaults);
+            auto input = parse_input(body, true, sampling_defaults);
             if (body.contains("mfq_multimodal")) {
-                if (!work.sampling.enable_vision) {
+                if (!input.sampling.enable_vision) {
                     throw ApiError(
                         400, "invalid_request_error",
                         "vision is disabled for this request; set enable_vision=true",
@@ -968,19 +924,10 @@ int run_mfq_http_transport(
                         "the loaded model has no native vision runtime",
                         "mfq_multimodal");
                 }
-                work.vision = parse_mfq_vision(
-                    body["mfq_multimodal"], work.prompt, *tokenizer,
-                    config.vocab_size);
-                if (active_context.load() > 0 &&
-                    static_cast<int64_t>(work.prompt.size()) +
-                        work.sampling.max_tokens > active_context.load()) {
-                    throw ApiError(
-                        400, "context_length_exceeded",
-                        "expanded multimodal prompt plus max_tokens exceed "
-                        "the model context window",
-                        "max_tokens");
-                }
+                input.media = parse_mfq_vision(body["mfq_multimodal"]);
             }
+            RequestWork work = scheduler.prepare_inference(
+                std::move(input), active_context.load());
             const std::string id = request_id("run-");
             const int64_t created = unix_time_seconds();
             std::shared_ptr<ActiveRequest> active_request;
@@ -1004,13 +951,10 @@ int run_mfq_http_transport(
 
             if (!work.stream) {
                 RequestMetrics metrics;
-                CompletionResult result = run_inference(
-                    work, *tokenizer, scheduler, *cancellation,
-                    [](const common_chat_msg_diff &) {
-                        return true;
-                    },
-                    &metrics,
-                    true);
+                CompletionResult result = scheduler.run_inference(
+                    work, *cancellation,
+                    [](const common_chat_msg_diff &) { return true; },
+                    &metrics, true, [] { return request_id("call_"); });
                 const RequestMetricValues metric_values =
                     request_metric_values(result, metrics);
                 log_request_metrics(
@@ -1032,7 +976,7 @@ int run_mfq_http_transport(
             res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider(
                 "text/event-stream; charset=utf-8",
-                [work = std::move(work), id, created, &tokenizer, &scheduler,
+                [work = std::move(work), id, created, &scheduler,
                  &config, active_request, cancellation,
                  &add_request_runtime_metrics]
                 (size_t offset, httplib::DataSink & sink) mutable -> bool {
@@ -1042,8 +986,8 @@ int run_mfq_http_transport(
                     }
                     try {
                         RequestMetrics metrics;
-                        CompletionResult result = run_inference(
-                            work, *tokenizer, scheduler, *cancellation,
+                        CompletionResult result = scheduler.run_inference(
+                            work, *cancellation,
                             [&](const common_chat_msg_diff & diff) {
                                 json delta = chat_diff_json(diff);
                                 if (delta.empty()) return true;
@@ -1051,7 +995,8 @@ int run_mfq_http_transport(
                                     "delta", id, created, config.model_name);
                                 event["delta"] = std::move(delta);
                                 return write_sse(sink, event);
-                        }, &metrics, false);
+                            }, &metrics, false,
+                            [] { return request_id("call_"); });
                         const RequestMetricValues metric_values =
                             request_metric_values(result, metrics);
                         log_request_metrics(
@@ -1086,6 +1031,8 @@ int run_mfq_http_transport(
                 });
         } catch (const ApiError & error) {
             handle_api_error(res, error);
+        } catch (const mfq::engine::InferenceInputError & error) {
+            handle_api_error(res, api_error(error));
         } catch (const std::exception & error) {
             set_json(res, error_body(error.what(), "server_error"), 500);
         }
@@ -1113,7 +1060,7 @@ int run_mfq_http_transport(
     std::cout << "MFQ HTTP runtime transport ready: " << endpoint
               << " model=" << config.model_name
               << " context=" << config.max_context
-              << " vocab=" << tokenizer->vocab_size() << std::endl;
+              << " vocab=" << scheduler.vocab_size() << std::endl;
     if (!server.listen_after_bind()) {
         throw std::runtime_error(
             "runtime transport stopped after binding " + config.host + ":" +
@@ -1126,6 +1073,10 @@ class MfqHttpTransport final : public MfqTransport {
 public:
     explicit MfqHttpTransport(MfqHttpRuntimeTransportConfig config)
         : config_(std::move(config)) {}
+
+    void configure_engine(mfq::engine::Engine & engine) override {
+        configure_text_processor(engine, config_);
+    }
 
     int run(const MfqScheduler & scheduler) override {
         return run_mfq_http_transport(config_, scheduler);

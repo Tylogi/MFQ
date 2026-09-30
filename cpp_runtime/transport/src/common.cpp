@@ -1,11 +1,7 @@
 #include "common.h"
 
-#include "token_constraint.h"
-
 #include "nlohmann/json.hpp"
 #include "chat.h"
-#include "json-schema-to-grammar.h"
-#include "chat/common.h"
 
 #include <algorithm>
 #include <array>
@@ -177,8 +173,11 @@ static std::string request_json_schema(const json & body) {
     return schema.dump();
 }
 
-static common_chat_params apply_chat_template(
-        const json & body, const common_chat_templates * templates,
+static std::optional<std::string> request_preformatted_prompt(
+    const json & body);
+
+static mfq::engine::ChatInput parse_chat_input(
+        const json & body,
         bool enable_thinking_default) {
     if (!body.contains("messages") || !body["messages"].is_array() ||
         body["messages"].empty()) {
@@ -187,26 +186,27 @@ static common_chat_params apply_chat_template(
             "messages must be a non-empty array", "messages");
     }
 
-    try {
-        common_chat_templates_inputs inputs;
-        inputs.messages =
-            common_chat_msgs_parse_oaicompat(body["messages"]);
-        inputs.json_schema = request_json_schema(body);
-        inputs.reasoning_format = request_reasoning_format(body);
-        inputs.enable_thinking = request_enable_thinking(
-            body, enable_thinking_default);
-        inputs.use_jinja = true;
-        inputs.add_generation_prompt =
-            boolean_field(body, "add_generation_prompt", true);
+    mfq::engine::ChatInput result;
+    auto & inputs = result.template_inputs;
+    result.preformatted_prompt = request_preformatted_prompt(body);
+    result.reasoning_format = request_reasoning_format(body);
+    inputs.json_schema = request_json_schema(body);
+    inputs.reasoning_format = result.reasoning_format;
+    inputs.enable_thinking = request_enable_thinking(
+        body, enable_thinking_default);
+    inputs.use_jinja = true;
+    inputs.add_generation_prompt =
+        boolean_field(body, "add_generation_prompt", true);
+    if (result.preformatted_prompt) return result;
 
+    try {
+        inputs.messages = common_chat_msgs_parse_oaicompat(body["messages"]);
         if (body.contains("continue_final_message") &&
             !body["continue_final_message"].is_null()) {
-            inputs.continue_final_message =
-                common_chat_continuation_parse(
-                    body["continue_final_message"]);
+            inputs.continue_final_message = common_chat_continuation_parse(
+                body["continue_final_message"]);
         }
-        if (inputs.continue_final_message !=
-                COMMON_CHAT_CONTINUATION_NONE &&
+        if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE &&
             inputs.add_generation_prompt) {
             throw ApiError(
                 400, "invalid_request_error",
@@ -214,26 +214,20 @@ static common_chat_params apply_chat_template(
                 "cannot both be enabled",
                 "continue_final_message");
         }
-
-        const auto caps =
-            common_chat_templates_get_caps(templates);
-        inputs.parallel_tool_calls = boolean_field(
-            body, "parallel_tool_calls",
-            caps.at("supports_parallel_tool_calls"));
-
+        if (body.contains("parallel_tool_calls") &&
+            !body["parallel_tool_calls"].is_null()) {
+            result.parallel_tool_calls = boolean_field(
+                body, "parallel_tool_calls", false);
+        }
         if (body.contains("tools") && !body["tools"].is_null()) {
-            inputs.tools =
-                common_chat_tools_parse_oaicompat(body["tools"]);
+            inputs.tools = common_chat_tools_parse_oaicompat(body["tools"]);
         }
         const json tool_choice =
-            body.contains("tool_choice") &&
-                    !body["tool_choice"].is_null()
-                ? body["tool_choice"]
-                : json("auto");
+            body.contains("tool_choice") && !body["tool_choice"].is_null()
+                ? body["tool_choice"] : json("auto");
         if (tool_choice.is_string()) {
-            inputs.tool_choice =
-                common_chat_tool_choice_parse_oaicompat(
-                    tool_choice.get<std::string>());
+            inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(
+                tool_choice.get<std::string>());
         } else if (tool_choice.is_object()) {
             if (!tool_choice.contains("type") ||
                 tool_choice["type"] != "function" ||
@@ -274,7 +268,6 @@ static common_chat_params apply_chat_template(
                 "tool_choice required needs at least one tool",
                 "tool_choice");
         }
-
         if (body.contains("chat_template_kwargs") &&
             !body["chat_template_kwargs"].is_null()) {
             if (!body["chat_template_kwargs"].is_object()) {
@@ -283,22 +276,17 @@ static common_chat_params apply_chat_template(
                     "chat_template_kwargs must be an object",
                     "chat_template_kwargs");
             }
-            for (const auto & item :
-                 body["chat_template_kwargs"].items()) {
-                inputs.chat_template_kwargs[item.key()] =
-                    item.value().dump();
+            for (const auto & item : body["chat_template_kwargs"].items()) {
+                inputs.chat_template_kwargs[item.key()] = item.value().dump();
             }
         }
-        return common_chat_templates_apply(templates, inputs);
     } catch (const ApiError &) {
         throw;
     } catch (const std::exception & error) {
         throw ApiError(
-            400, "invalid_request_error",
-            std::string("chat template application failed: ") +
-                error.what(),
-            "messages");
+            400, "invalid_request_error", error.what(), "messages");
     }
+    return result;
 }
 
 static std::optional<std::string> request_preformatted_prompt(
@@ -773,34 +761,37 @@ json tts_profile_json(const MfqTtsSamplingProfile & value) {
 }
 
 json chat_template_capabilities_json(
-        const std::string & chat_template) {
-    const bool supports_thinking =
-        chat_template.find("enable_thinking") != std::string::npos;
-    json reasoning_effort_values = json::array();
-    if (chat_template.find("reasoning_effort") != std::string::npos) {
-        const auto supports_value = [&](const char * value) {
-            return chat_template.find(
-                       std::string("'") + value + "'") !=
-                       std::string::npos ||
-                   chat_template.find(
-                       std::string("\"") + value + "\"") !=
-                       std::string::npos;
-        };
-        for (const char * value : {"high", "max"}) {
-            if (supports_value(value)) {
-                reasoning_effort_values.push_back(value);
-            }
-        }
-    }
+        const mfq::engine::ChatTemplateCapabilities & capabilities) {
     return {
         {"thinking", {
-            {"supported", supports_thinking},
+            {"supported", capabilities.thinking},
         }},
         {"reasoning_effort", {
-            {"supported", !reasoning_effort_values.empty()},
-            {"values", std::move(reasoning_effort_values)},
+            {"supported", !capabilities.reasoning_effort_values.empty()},
+            {"values", capabilities.reasoning_effort_values},
         }},
     };
+}
+
+void configure_text_processor(
+        mfq::engine::Engine & engine,
+        const MfqRuntimeTransportConfig & config) {
+    if (engine.text) return;
+    if (!config.tokenizer_gguf.empty() && !config.tokenizer_model.empty()) {
+        throw std::runtime_error("runtime tokenizer source is ambiguous");
+    }
+    if (!config.tokenizer_gguf.empty()) {
+        engine.text = std::make_shared<mfq::engine::TextProcessor>(
+            config.tokenizer_gguf, static_cast<int32_t>(config.vocab_size),
+            config.model_type);
+    } else if (!config.tokenizer_model.empty()) {
+        engine.text = std::make_shared<mfq::engine::TextProcessor>(
+            config.tokenizer_model, static_cast<int32_t>(config.vocab_size),
+            config.model_type);
+    } else {
+        throw std::runtime_error(
+            "runtime requires an embedded or external tokenizer GGUF");
+    }
 }
 
 static std::vector<std::string> parse_stops(const json & body) {
@@ -908,11 +899,10 @@ json runtime_generate_body(const json & params) {
     return body;
 }
 
-RequestWork parse_work(const json & body, bool chat, const MfqTokenizer & tokenizer,
-                              const common_chat_templates * templates,
-                              int64_t max_context,
-                              const std::string & model_type,
-                              const MfqSamplingParams & defaults) {
+RequestInput parse_input(
+        const json & body,
+        bool chat,
+        const MfqSamplingParams & defaults) {
     if (!body.is_object()) throw ApiError(400, "invalid_request_error", "request body must be a JSON object");
     if (integer_field(body, "n", 1) != 1) {
         throw ApiError(400, "unsupported_parameter", "only n=1 is supported", "n");
@@ -929,7 +919,7 @@ RequestWork parse_work(const json & body, bool chat, const MfqTokenizer & tokeni
         throw ApiError(400, "unsupported_parameter", "min_p is not implemented", "min_p");
     }
 
-    RequestWork work;
+    RequestInput work;
     work.chat = chat;
     if (body.contains("stream") && !body["stream"].is_null() && !body["stream"].is_boolean()) {
         throw ApiError(400, "invalid_request_error", "stream must be boolean", "stream");
@@ -1017,100 +1007,17 @@ RequestWork parse_work(const json & body, bool chat, const MfqTokenizer & tokeni
         work.sampling.seed = (static_cast<uint64_t>(device()) << 32) ^ device();
     }
 
-    std::string prompt;
-    bool parse_special = false;
     if (chat) {
-        const auto preformatted_prompt =
-            request_preformatted_prompt(body);
-        if (preformatted_prompt) {
-            if (!body.contains("messages") ||
-                !body["messages"].is_array() ||
-                body["messages"].empty()) {
-                throw ApiError(
-                    400,
-                    "invalid_request_error",
-                    "messages must be a non-empty array",
-                    "messages");
-            }
-            // The managed API has already applied the architecture-registered
-            // processor protocol.  Treat that prompt as authoritative: an old
-            // or deliberately minimal cached Jinja template must not reject or
-            // reinterpret its tool, media, or extended message fields.
-            prompt = *preformatted_prompt;
-            work.chat_parser.reasoning_format =
-                request_reasoning_format(body);
-            work.chat_parser.reasoning_in_content =
-                work.stream &&
-                work.chat_parser.reasoning_format ==
-                    COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY;
-            work.chat_parser.parse_tool_calls = false;
-            const std::string json_schema = request_json_schema(body);
-            if (!json_schema.empty()) {
-                common_chat_params constraint_params;
-                constraint_params.grammar =
-                    json_schema_to_grammar(json::parse(json_schema));
-                work.token_constraint =
-                    mfq::engine::make_chat_token_constraint(
-                        tokenizer, constraint_params);
-            }
-        } else {
-            if (templates == nullptr) {
-                throw ApiError(
-                    400,
-                    "unsupported_parameter",
-                    "the tokenizer has no chat template; provide "
-                    "input.preformatted_prompt",
-                    "messages");
-            }
-            const common_chat_params chat_params =
-                apply_chat_template(
-                    body, templates, work.sampling.enable_thinking);
-            work.token_constraint =
-                mfq::engine::make_chat_token_constraint(
-                    tokenizer, chat_params);
-            prompt = chat_params.prompt;
-            work.chat_parser.format = chat_params.format;
-            work.chat_parser.reasoning_format =
-                request_reasoning_format(body);
-            work.chat_parser.reasoning_in_content =
-                work.stream &&
-                work.chat_parser.reasoning_format ==
-                    COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY;
-            work.chat_parser.generation_prompt =
-                chat_params.generation_prompt;
-            work.chat_parser.parse_tool_calls = true;
-            if (!chat_params.parser.empty()) {
-                work.chat_parser.parser.load(chat_params.parser);
-            }
-            if (body.contains("continue_final_message") &&
-                !body["continue_final_message"].is_null()) {
-                work.chat_parser.is_continuation =
-                    common_chat_continuation_parse(
-                        body["continue_final_message"]) !=
-                    COMMON_CHAT_CONTINUATION_NONE;
-            }
-            for (const auto & text : chat_params.preserved_tokens) {
-                const auto tokens = tokenizer.tokenize(text, true);
-                work.preserved_tokens.insert(tokens.begin(), tokens.end());
-            }
-            work.stops.insert(
-                work.stops.end(), chat_params.additional_stops.begin(),
-                chat_params.additional_stops.end());
-        }
-        parse_special = true;
+        work.chat_input = parse_chat_input(
+            body, work.sampling.enable_thinking);
     } else {
         if (!body.contains("prompt") || !body["prompt"].is_string()) {
-            throw ApiError(400, "invalid_request_error", "prompt must be a string", "prompt");
+            throw ApiError(
+                400, "invalid_request_error",
+                "prompt must be a string", "prompt");
         }
-        prompt = body["prompt"].get<std::string>();
+        work.prompt = body["prompt"].get<std::string>();
     }
-    work.prompt = tokenizer.tokenize(prompt, parse_special);
-    if (work.prompt.empty()) throw ApiError(400, "invalid_request_error", "prompt tokenized to an empty sequence", "prompt");
-    // Exact token prefixes are reusable independently of MFQ's optional
-    // session routing extension.  A session ID only pins the matched chain
-    // for fast continuation; content-addressed SSD/RAM blocks also serve
-    // ordinary stateless runtime requests.
-    work.cache_plan.stable_prefix_tokens = work.prompt.size();
     if (body.contains("mfq_session_id") && !body["mfq_session_id"].is_null()) {
         if (!body["mfq_session_id"].is_string()) {
             throw ApiError(
@@ -1126,41 +1033,7 @@ RequestWork parse_work(const json & body, bool chat, const MfqTokenizer & tokeni
                 "mfq_session_id");
         }
     }
-    if (chat && normalized_identity(model_type).rfind("deepseek_v4", 0) == 0 &&
-        boolean_field(body, "add_generation_prompt", true)) {
-        const std::string stable_marker =
-            work.sampling.enable_thinking ? "<think>" : "</think>";
-        const auto marker_tokens =
-            tokenizer.tokenize(stable_marker, true);
-        if (!marker_tokens.empty() &&
-            marker_tokens.size() < work.prompt.size() &&
-            std::equal(
-                marker_tokens.rbegin(),
-                marker_tokens.rend(),
-                work.prompt.rbegin())) {
-            work.cache_plan.stable_prefix_tokens =
-                work.prompt.size() - marker_tokens.size();
-        }
-    }
-    if (max_context > 0 &&
-        static_cast<int64_t>(work.prompt.size()) + max_tokens > max_context) {
-        throw ApiError(400, "context_length_exceeded",
-                       "prompt tokens plus max_tokens exceed the model context window", "max_tokens");
-    }
-    const auto requested_stops = parse_stops(body);
-    work.stops.insert(
-        work.stops.end(), requested_stops.begin(),
-        requested_stops.end());
-    std::vector<std::string> unique_stops;
-    unique_stops.reserve(work.stops.size());
-    for (const auto & stop : work.stops) {
-        if (std::find(
-                unique_stops.begin(), unique_stops.end(), stop) ==
-            unique_stops.end()) {
-            unique_stops.push_back(stop);
-        }
-    }
-    work.stops = std::move(unique_stops);
+    work.stops = parse_stops(body);
     return work;
 }
 
@@ -1378,29 +1251,6 @@ void ActiveRequest::complete(
         const RequestMetricValues & values) {
     metrics_.complete(id, chat, stream, prompt_tokens, result, values);
     completed_ = true;
-}
-
-CompletionResult run_inference(const RequestWork & work, const MfqTokenizer & tokenizer,
-                                      const MfqScheduler & scheduler,
-                                      const MfqScheduledRequest & request,
-                                      const std::function<bool(const common_chat_msg_diff &)> & emit,
-                                      RequestMetrics * metrics,
-                                      bool defer_token_parsing) {
-    const auto execute = [&](const MfqTokenCallback& on_token,
-                             const MfqPrefillCallback& on_prefill) {
-        return work.vision
-            ? scheduler.generate_multimodal(
-                  request, work.prompt, *work.vision, work.sampling,
-                  on_token, on_prefill, work.cache_plan,
-                  work.token_constraint)
-            : scheduler.generate(
-                  request, work.prompt, work.sampling, on_token, on_prefill,
-                  work.cache_plan, work.token_constraint);
-    };
-    return mfq::engine::run_inference(
-        work, tokenizer, execute,
-        [&] { return request.cancelled(); }, emit, metrics,
-        defer_token_parsing, [] { return request_id("call_"); });
 }
 
 json usage_json(size_t prompt_tokens, int32_t completion_tokens) {
@@ -1848,122 +1698,11 @@ static std::pair<std::vector<Value>, std::vector<int64_t>> decode_tensor(
     return {std::move(values), std::move(shape)};
 }
 
-static int64_t single_special_token(
-        const MfqTokenizer & tokenizer,
-        const std::string & marker) {
-    const auto tokens = tokenizer.tokenize(marker, true, false);
-    if (tokens.size() != 1) {
-        throw ApiError(
-            500, "runtime_error",
-            "model tokenizer does not encode " + marker +
-                " as one special token");
-    }
-    return tokens.front();
-}
-
-struct DeepseekV4ImageBlock {
-    std::vector<int64_t> types;
-    std::vector<int64_t> permutation;
-};
-
-static DeepseekV4ImageBlock deepseek_v4_image_block(
-        int64_t height,
-        int64_t width,
-        size_t start_position) {
-    constexpr int64_t kImageStart = 0;
-    constexpr int64_t kImagePad = 1;
-    constexpr int64_t kImage = 2;
-    constexpr int64_t kImageNewLine = 3;
-    constexpr int64_t kImageEnd = 4;
-    if (height <= 0 || width <= 0) {
-        throw ApiError(
-            400, "invalid_request_error",
-            "DeepSeek-V4 image grid must be positive",
-            "mfq_multimodal.vision_grid");
-    }
-    const int64_t padded_height = height + height % 2;
-    const int64_t row_length = width + 1;
-    const int64_t compress_pad =
-        3 - static_cast<int64_t>(start_position % 4);
-    const int64_t trailing_pad =
-        ((padded_height / 2 * row_length) % 2) * 2;
-    DeepseekV4ImageBlock result;
-    result.types.reserve(static_cast<size_t>(
-        compress_pad + 1 + padded_height * row_length +
-        trailing_pad + 1));
-    result.permutation.reserve(
-        static_cast<size_t>(height * width));
-    result.types.insert(
-        result.types.end(),
-        static_cast<size_t>(compress_pad),
-        kImagePad);
-    result.types.push_back(kImageStart);
-    // Official N-layout order: pairs of rows, then columns, then the two
-    // rows in each pair.  Newline/padded slots participate in the order but
-    // only real image slots contribute to the aligner permutation.
-    for (int64_t pair = 0; pair < padded_height / 2; ++pair) {
-        for (int64_t column = 0; column < row_length; ++column) {
-            for (int64_t within = 0; within < 2; ++within) {
-                const int64_t row = pair * 2 + within;
-                const bool real_row = row < height;
-                const bool real_column = column < width;
-                if (real_row && real_column) {
-                    result.types.push_back(kImage);
-                    result.permutation.push_back(row * width + column);
-                } else if (real_row) {
-                    result.types.push_back(kImageNewLine);
-                } else {
-                    result.types.push_back(kImagePad);
-                }
-            }
-        }
-    }
-    result.types.insert(
-        result.types.end(),
-        static_cast<size_t>(trailing_pad),
-        kImagePad);
-    result.types.push_back(kImageEnd);
-    return result;
-}
-
-static DeepseekV4ImageBlock deepseek_v41_image_block(
-        int64_t height,
-        int64_t width) {
-    constexpr int64_t kImageStart = 0;
-    constexpr int64_t kImage = 1;
-    constexpr int64_t kImageNewLine = 2;
-    constexpr int64_t kImageEnd = 3;
-    if (height <= 0 || width <= 0) {
-        throw ApiError(
-            400, "invalid_request_error",
-            "DeepSeek-V4.1 image grid must be positive",
-            "mfq_multimodal.vision_grid");
-    }
-    DeepseekV4ImageBlock result;
-    result.types.reserve(static_cast<size_t>(height * (width + 1) + 2));
-    result.types.push_back(kImageStart);
-    for (int64_t row = 0; row < height; ++row) {
-        result.types.insert(
-            result.types.end(), static_cast<size_t>(width), kImage);
-        result.types.push_back(kImageNewLine);
-    }
-    result.types.push_back(kImageEnd);
-    return result;
-}
-
 static MfqMultimodalInput parse_deepseek_multimodal(
         const json & value,
-        std::vector<int64_t> & prompt,
-        const MfqTokenizer & tokenizer,
-        int64_t vocab_size,
         TensorFileReader * file_reader,
         bool v41) {
     const std::string label = v41 ? "DeepSeek-V4.1" : "DeepSeek-V4";
-    if (vocab_size <= 0) {
-        throw ApiError(
-            500, "runtime_error",
-            label + " multimodal runtime has no vocabulary size");
-    }
     for (const char * name : {"pixel_values", "patch_mask", "vision_grid"}) {
         if (!value.contains(name)) {
             throw ApiError(
@@ -2042,50 +1781,6 @@ static MfqMultimodalInput parse_deepseek_multimodal(
         }
     }
 
-    const int64_t placeholder = single_special_token(
-        tokenizer, "<｜deepseek_image｜>");
-    std::vector<int64_t> expanded;
-    expanded.reserve(
-        prompt.size() + static_cast<size_t>(images) * (v41 ? 1024 : 384));
-    result.image_permutation_offsets.push_back(0);
-    int64_t source = 0;
-    for (const int64_t token : prompt) {
-        if (token != placeholder) {
-            expanded.push_back(token);
-            continue;
-        }
-        if (source >= images) {
-            throw ApiError(
-                400, "invalid_request_error",
-                label + " image placeholders exceed processed images",
-                "messages");
-        }
-        const int64_t llm_h = result.vision_grid[4 * source + 2];
-        const int64_t llm_w = result.vision_grid[4 * source + 3];
-        auto block = v41
-            ? deepseek_v41_image_block(llm_h, llm_w)
-            : deepseek_v4_image_block(llm_h, llm_w, expanded.size());
-        const int64_t begin = static_cast<int64_t>(expanded.size());
-        for (const int64_t type : block.types) {
-            expanded.push_back(v41 ? placeholder : vocab_size + type);
-        }
-        result.image_bounds.insert(
-            result.image_bounds.end(),
-            {0, source, begin, static_cast<int64_t>(expanded.size())});
-        result.image_permutation.insert(
-            result.image_permutation.end(),
-            block.permutation.begin(), block.permutation.end());
-        result.image_permutation_offsets.push_back(
-            static_cast<int64_t>(result.image_permutation.size()));
-        ++source;
-    }
-    if (source != images) {
-        throw ApiError(
-            400, "invalid_request_error",
-            label + " image placeholders do not match processed images",
-            "messages");
-    }
-    prompt = std::move(expanded);
     return result;
 }
 
@@ -2225,11 +1920,7 @@ static MfqMultimodalInput parse_grid_vision_multimodal(
     return result;
 }
 
-MfqMultimodalInput parse_mfq_vision(
-        const json & value,
-        std::vector<int64_t> & prompt,
-        const MfqTokenizer & tokenizer,
-        int64_t vocab_size) {
+MfqMultimodalInput parse_mfq_vision(const json & value) {
     if (!value.is_object()) {
         throw ApiError(
             400, "invalid_request_error",
@@ -2265,12 +1956,7 @@ MfqMultimodalInput parse_mfq_vision(
                 "mfq_multimodal.processor");
         }
         return parse_deepseek_multimodal(
-            value,
-            prompt,
-            tokenizer,
-            vocab_size,
-            file_reader.get(),
-            processor == "deepseek_v41");
+            value, file_reader.get(), processor == "deepseek_v41");
     }
     if (version != 1) {
         throw ApiError(
@@ -2373,46 +2059,6 @@ MfqMultimodalInput parse_mfq_vision(
                 "mfq_multimodal pixel_values contains a non-finite value",
                 "mfq_multimodal.pixel_values");
         }
-
-        const int64_t image_start = single_special_token(tokenizer, "<image>");
-        const int64_t image_end = single_special_token(tokenizer, "</image>");
-        const int64_t slice_start = single_special_token(tokenizer, "<slice>");
-        const int64_t slice_end = single_special_token(tokenizer, "</slice>");
-        for (size_t index = 0; index < prompt.size(); ++index) {
-            const int64_t token = prompt[index];
-            if (token != image_start && token != slice_start) continue;
-            const int64_t end_token = token == image_start ? image_end : slice_end;
-            const auto found = std::find(
-                prompt.begin() + static_cast<std::ptrdiff_t>(index + 1),
-                prompt.end(), end_token);
-            if (found == prompt.end()) {
-                throw ApiError(
-                    400, "invalid_request_error",
-                    "MiniCPM-o image placeholder is missing its end token",
-                    "messages");
-            }
-            const size_t end = static_cast<size_t>(found - prompt.begin());
-            if (end - index - 1 != 64) {
-                throw ApiError(
-                    400, "invalid_request_error",
-                    "MiniCPM-o image placeholder must contain 64 query tokens",
-                    "messages");
-            }
-            const int64_t source =
-                static_cast<int64_t>(result.image_bounds.size() / 4);
-            result.image_bounds.insert(
-                result.image_bounds.end(),
-                {0, source, static_cast<int64_t>(index + 1),
-                 static_cast<int64_t>(end)});
-            index = end;
-        }
-        if (result.image_bounds.size() / 4 !=
-            static_cast<size_t>(source_count)) {
-            throw ApiError(
-                400, "invalid_request_error",
-                "MiniCPM-o image placeholders do not match processed image slices",
-                "messages");
-        }
     }
 
     if (has_all_audio_tensors) {
@@ -2445,8 +2091,6 @@ MfqMultimodalInput parse_mfq_vision(
                 "mfq_multimodal audio_features contains a non-finite value",
                 "mfq_multimodal.audio_features");
         }
-        std::vector<int64_t> pooled_lengths;
-        pooled_lengths.reserve(result.audio_lengths.size());
         for (const int64_t length : result.audio_lengths) {
             if (length < 9 || length > result.audio_features_shape[2]) {
                 throw ApiError(
@@ -2454,52 +2098,6 @@ MfqMultimodalInput parse_mfq_vision(
                     "mfq_multimodal audio length is out of range",
                     "mfq_multimodal.audio_lengths");
             }
-            const int64_t after_convolution = (length - 1) / 2 + 1;
-            const int64_t pooled = (after_convolution - 5) / 5 + 1;
-            if (pooled <= 0) {
-                throw ApiError(
-                    400, "invalid_request_error",
-                    "mfq_multimodal audio input is too short",
-                    "mfq_multimodal.audio_lengths");
-            }
-            pooled_lengths.push_back(pooled);
-        }
-
-        const int64_t audio_start =
-            single_special_token(tokenizer, "<|audio_start|>");
-        const int64_t audio_end =
-            single_special_token(tokenizer, "<|audio_end|>");
-        for (size_t index = 0; index < prompt.size(); ++index) {
-            if (prompt[index] != audio_start) continue;
-            const auto found = std::find(
-                prompt.begin() + static_cast<std::ptrdiff_t>(index + 1),
-                prompt.end(), audio_end);
-            if (found == prompt.end()) {
-                throw ApiError(
-                    400, "invalid_request_error",
-                    "MiniCPM-o audio placeholder is missing its end token",
-                    "messages");
-            }
-            const size_t end = static_cast<size_t>(found - prompt.begin());
-            const size_t source = result.audio_bounds.size() / 4;
-            if (source >= pooled_lengths.size() ||
-                static_cast<int64_t>(end - index - 1) != pooled_lengths[source]) {
-                throw ApiError(
-                    400, "invalid_request_error",
-                    "MiniCPM-o audio placeholder does not match pooled audio length",
-                    "messages");
-            }
-            result.audio_bounds.insert(
-                result.audio_bounds.end(),
-                {0, static_cast<int64_t>(source),
-                 static_cast<int64_t>(index + 1), static_cast<int64_t>(end)});
-            index = end;
-        }
-        if (result.audio_bounds.size() / 4 != pooled_lengths.size()) {
-            throw ApiError(
-                400, "invalid_request_error",
-                "MiniCPM-o audio placeholders do not match processed audio chunks",
-                "messages");
         }
     }
     return result;
@@ -2587,44 +2185,4 @@ MfqRuntimeProfile resolve_mfq_runtime_profile(
             read_profile_file(path), "runtime-explicit:" + path.filename().string()));
     }
     return result;
-}
-
-MfqTokenizerProbe probe_mfq_tokenizer(
-        const std::vector<uint8_t> & tokenizer_gguf,
-        const std::string & text,
-        bool add_special,
-        bool parse_special) {
-    using namespace mfq::transport_detail;
-    MfqTokenizer tokenizer(tokenizer_gguf);
-    return {
-        tokenizer.vocab_size(),
-        tokenizer.bos_token(),
-        tokenizer.eos_token(),
-        tokenizer.eot_token(),
-        tokenizer.pad_token(),
-        tokenizer.add_bos(),
-        tokenizer.add_eos(),
-        tokenizer.chat_template(),
-        tokenizer.tokenize(text, parse_special, add_special),
-    };
-}
-
-MfqTokenizerProbe probe_mfq_tokenizer(
-        const std::string & tokenizer_model,
-        const std::string & text,
-        bool add_special,
-        bool parse_special) {
-    using namespace mfq::transport_detail;
-    MfqTokenizer tokenizer(tokenizer_model);
-    return {
-        tokenizer.vocab_size(),
-        tokenizer.bos_token(),
-        tokenizer.eos_token(),
-        tokenizer.eot_token(),
-        tokenizer.pad_token(),
-        tokenizer.add_bos(),
-        tokenizer.add_eos(),
-        tokenizer.chat_template(),
-        tokenizer.tokenize(text, parse_special, add_special),
-    };
 }
