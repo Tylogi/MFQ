@@ -1538,6 +1538,18 @@
             "minLength": 1,
             "title": "Name",
             "type": "string"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256"
           }
         },
         "required": [
@@ -1549,6 +1561,37 @@
       "HubModelInfo": {
         "additionalProperties": false,
         "properties": {
+          "architectures": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Architectures",
+            "type": "array"
+          },
+          "author": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Author"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
           "downloads": {
             "default": 0,
             "minimum": 0.0,
@@ -1562,11 +1605,71 @@
             "title": "Files",
             "type": "array"
           },
+          "gated": {
+            "default": false,
+            "title": "Gated",
+            "type": "boolean"
+          },
+          "library": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Library"
+          },
+          "license": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "License"
+          },
           "likes": {
             "default": 0,
             "minimum": 0.0,
             "title": "Likes",
             "type": "integer"
+          },
+          "modalities": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Modalities",
+            "type": "array"
+          },
+          "parameter_count": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Count"
+          },
+          "pipeline_tag": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pipeline Tag"
           },
           "provider": {
             "enum": [
@@ -1585,6 +1688,29 @@
           "revision": {
             "title": "Revision",
             "type": "string"
+          },
+          "runtime_compatible": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Compatible"
+          },
+          "source_url": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Url"
           },
           "tags": {
             "items": {
@@ -1610,6 +1736,13 @@
               }
             ],
             "title": "Updated At"
+          },
+          "variants": {
+            "items": {
+              "$ref": "#/components/schemas/HubModelVariant"
+            },
+            "title": "Variants",
+            "type": "array"
           }
         },
         "required": [
@@ -1641,6 +1774,30 @@
       "HubModelSummary": {
         "additionalProperties": false,
         "properties": {
+          "author": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Author"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
           "downloads": {
             "default": 0,
             "minimum": 0.0,
@@ -1667,6 +1824,18 @@
             "title": "Repo Id",
             "type": "string"
           },
+          "source_url": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Url"
+          },
           "total_bytes": {
             "default": 0,
             "minimum": 0.0,
@@ -1691,6 +1860,165 @@
           "repo_id"
         ],
         "title": "HubModelSummary",
+        "type": "object"
+      },
+      "HubModelVariant": {
+        "additionalProperties": false,
+        "properties": {
+          "byte_size": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Byte Size",
+            "type": "integer"
+          },
+          "configuration": {
+            "$ref": "#/components/schemas/ModelConfigurationStatus"
+          },
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 256,
+            "title": "Files",
+            "type": "array"
+          },
+          "format": {
+            "enum": [
+              "mfq",
+              "hf",
+              "gguf",
+              "unknown"
+            ],
+            "title": "Format",
+            "type": "string"
+          },
+          "id": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          },
+          "precision": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Precision"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "format",
+          "configuration"
+        ],
+        "title": "HubModelVariant",
+        "type": "object"
+      },
+      "HubReferenceRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "fallback_provider": {
+            "default": "huggingface",
+            "enum": [
+              "huggingface",
+              "modelscope"
+            ],
+            "title": "Fallback Provider",
+            "type": "string"
+          },
+          "reference": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Reference",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reference"
+        ],
+        "title": "HubReferenceRequest",
+        "type": "object"
+      },
+      "HubSystemProfile": {
+        "additionalProperties": false,
+        "properties": {
+          "available_memory_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Available Memory Bytes"
+          },
+          "backend": {
+            "enum": [
+              "metal",
+              "cuda",
+              "cpu",
+              "unknown"
+            ],
+            "title": "Backend",
+            "type": "string"
+          },
+          "machine": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Machine",
+            "type": "string"
+          },
+          "physical_memory_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Physical Memory Bytes"
+          },
+          "platform": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Platform",
+            "type": "string"
+          },
+          "runtime_memory_budget_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Memory Budget Bytes"
+          }
+        },
+        "required": [
+          "platform",
+          "machine",
+          "backend"
+        ],
+        "title": "HubSystemProfile",
         "type": "object"
       },
       "ImagePart": {
@@ -2706,6 +3034,68 @@
         "title": "ModelCapabilities",
         "type": "object"
       },
+      "ModelConfigurationStatus": {
+        "additionalProperties": false,
+        "properties": {
+          "available_memory_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Available Memory Bytes"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Reasons",
+            "type": "array"
+          },
+          "recommended_memory_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recommended Memory Bytes"
+          },
+          "required_memory_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Required Memory Bytes"
+          },
+          "status": {
+            "enum": [
+              "recommended",
+              "warning",
+              "unknown"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "ModelConfigurationStatus",
+        "type": "object"
+      },
       "ModelDirectoryEntry": {
         "additionalProperties": false,
         "properties": {
@@ -3076,6 +3466,241 @@
           "name"
         ],
         "title": "NamedToolChoiceFunction",
+        "type": "object"
+      },
+      "OfficialModelInfo": {
+        "additionalProperties": false,
+        "properties": {
+          "active_parameter_label": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Parameter Label"
+          },
+          "architecture": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Architecture",
+            "type": "string"
+          },
+          "capabilities": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Capabilities",
+            "type": "array"
+          },
+          "configuration": {
+            "$ref": "#/components/schemas/ModelConfigurationStatus"
+          },
+          "description": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Description",
+            "type": "string"
+          },
+          "description_zh": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Description Zh",
+            "type": "string"
+          },
+          "downloads": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Downloads",
+            "type": "integer"
+          },
+          "family": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Family",
+            "type": "string"
+          },
+          "id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "license": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "License"
+          },
+          "likes": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Likes",
+            "type": "integer"
+          },
+          "modalities": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Modalities",
+            "type": "array"
+          },
+          "name": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "parameter_label": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter Label"
+          },
+          "precision_options": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Precision Options",
+            "type": "array"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "selected_source": {
+            "$ref": "#/components/schemas/OfficialModelSource"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/OfficialModelSource"
+            },
+            "title": "Sources",
+            "type": "array"
+          },
+          "supports_ssd_streaming": {
+            "default": false,
+            "title": "Supports Ssd Streaming",
+            "type": "boolean"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "variants": {
+            "items": {
+              "$ref": "#/components/schemas/HubModelVariant"
+            },
+            "title": "Variants",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "family",
+          "architecture",
+          "description",
+          "description_zh",
+          "sources",
+          "selected_source",
+          "revision",
+          "configuration"
+        ],
+        "title": "OfficialModelInfo",
+        "type": "object"
+      },
+      "OfficialModelList": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/OfficialModelInfo"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "system": {
+            "$ref": "#/components/schemas/HubSystemProfile"
+          }
+        },
+        "required": [
+          "system",
+          "data"
+        ],
+        "title": "OfficialModelList",
+        "type": "object"
+      },
+      "OfficialModelSource": {
+        "additionalProperties": false,
+        "properties": {
+          "available": {
+            "default": true,
+            "title": "Available",
+            "type": "boolean"
+          },
+          "provider": {
+            "enum": [
+              "huggingface",
+              "modelscope"
+            ],
+            "title": "Provider",
+            "type": "string"
+          },
+          "repo_id": {
+            "maxLength": 255,
+            "minLength": 3,
+            "title": "Repo Id",
+            "type": "string"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision"
+          },
+          "url": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "repo_id",
+          "url"
+        ],
+        "title": "OfficialModelSource",
         "type": "object"
       },
       "OperationAccepted": {
@@ -8919,6 +9544,290 @@
           }
         },
         "summary": "Hub Model Info",
+        "tags": [
+          "models"
+        ]
+      }
+    },
+    "/api/v1/hub/official": {
+      "get": {
+        "operationId": "official_hub_models_api_v1_hub_official_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Refresh",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfficialModelList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Official Hub Models",
+        "tags": [
+          "models"
+        ]
+      }
+    },
+    "/api/v1/hub/resolve": {
+      "post": {
+        "operationId": "resolve_hub_model_api_v1_hub_resolve_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HubReferenceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HubModelInfo"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Resolve Hub Model",
         "tags": [
           "models"
         ]

@@ -16,11 +16,13 @@ import { presetResourceBody, storedPresetFromResource, type StoredPreset } from 
 import { SettingsPage } from './SettingsPage';
 import { useSettings } from './SettingsProvider';
 import { useGenerationPresets } from './useGenerationPresets';
+import { UpdateManager, useStudioUpdateContext } from './UpdateManager';
 import { toast } from '../../stores/toastStore';
 
 /** 在访问设置路由时创建草稿并加载本领域数据，应用后才更新共享偏好。 */
 export function SettingsRoute() {
   const { settings, replaceSettings, tr, contextSize, setContextSize } = useSettings();
+  const studioUpdates = useStudioUpdateContext();
   const {
     runtime,
     realtime,
@@ -206,6 +208,9 @@ export function SettingsRoute() {
         setContextSize={setContextSize}
         busy={busy}
         hasStudio={Boolean(studio)}
+        updateManager={
+          studio ? <UpdateManager {...studioUpdates} tr={tr} /> : undefined
+        }
         actions={{
           setModelDefaultInheritance,
           applyPreset,

@@ -18,6 +18,7 @@ vi.mock('../src/features/settings/SettingsProvider', () => ({
 }));
 
 beforeEach(() => {
+  vi.restoreAllMocks();
   addJob.mockReset();
 });
 
@@ -64,25 +65,53 @@ describe('test_model_hub_accepts_repository_links_and_downloads_into_the_model_c
 
   it.each(['huggingface', 'modelscope'] as const)('%s 链接经页面提交下载至模型目录并登记任务', async (provider) => {
     const host = provider === 'huggingface' ? 'huggingface.co' : 'modelscope.cn/models';
+    const configuration = {
+      status: 'recommended' as const,
+      required_memory_bytes: 4096,
+      recommended_memory_bytes: 8192,
+      available_memory_bytes: 16384,
+      reasons: ['fits'],
+    };
     const info = {
       provider, repo_id: 'team/model', revision: 'main', files: [], tags: [], downloads: 10, likes: 1, total_bytes: 4096,
+      source_url: `https://${host}/team/model`, architectures: [], modalities: ['text'],
+      gated: false, runtime_compatible: true,
+      variants: [{
+        id: 'mfq:model', label: 'model', format: 'mfq' as const,
+        files: ['model.mfq'], byte_size: 4096, configuration,
+      }],
     };
     const job = {
       id: 'download-job', kind: `download.${provider}`, status: 'queued' as const,
       payload: {}, progress: 0, cancel_requested: false, created_at: '', updated_at: '',
     };
+    vi.spyOn(modelsApi, 'officialHubModels').mockResolvedValue({
+      system: { platform: 'test', machine: 'test', backend: 'unknown' },
+      data: [],
+    });
     vi.spyOn(jobsApi, 'jobKinds').mockResolvedValue([{ kind: `download.${provider}`, payload_schema: {} }]);
-    const inspect = vi.spyOn(modelsApi, 'hubModelInfo').mockResolvedValue(info);
+    const inspect = vi.spyOn(modelsApi, 'resolveHubModel').mockResolvedValue(info);
     const createJob = vi.spyOn(jobsApi, 'createJob').mockResolvedValue(job);
     render(<MemoryRouter><ModelHubPage /></MemoryRouter>);
-    fireEvent.change(screen.getByPlaceholderText('Model, repository, or URL'), { target: { value: `https://${host}/team/model/tree/main` } });
-    fireEvent.click(screen.getByRole('button', { name: 'Find' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Community' }));
+    fireEvent.change(screen.getByPlaceholderText('Model name, owner/repo, or repository URL'), { target: { value: `https://${host}/team/model/tree/main` } });
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }));
     const download = await screen.findByRole('button', { name: 'Download' });
     await waitFor(() => expect(download).toBeEnabled());
-    expect(inspect).toHaveBeenCalledExactlyOnceWith(provider, 'team/model', 'main');
+    expect(inspect).toHaveBeenCalledExactlyOnceWith(
+      `https://${host}/team/model/tree/main`,
+      'huggingface',
+    );
     fireEvent.click(download);
     await waitFor(() => expect(createJob).toHaveBeenCalledExactlyOnceWith(`download.${provider}`, {
-      repo_id: 'team/model', destination: `models/${provider}/team/model`, revision: 'main', expected_bytes: 4096,
+      repo_id: 'team/model',
+      destination: `models/${provider}/team/model/model`,
+      revision: 'main',
+      include: [
+        'model.mfq', '*.json', '*.txt', '*.model', '*.tiktoken', '*.jinja',
+        'tokenizer*', 'processor*', 'preprocessor*',
+      ],
+      expected_bytes: 4096,
     }));
     expect(addJob).toHaveBeenCalledWith(job);
   });

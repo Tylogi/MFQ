@@ -853,6 +853,9 @@ class RegisterModelDirectoryRequest(ProtocolModel):
 class HubModelSummary(ProtocolModel):
     provider: Literal["huggingface", "modelscope"]
     repo_id: str = Field(min_length=3, max_length=255)
+    source_url: str | None = Field(default=None, max_length=2048)
+    author: str | None = Field(default=None, max_length=255)
+    description: str | None = Field(default=None, max_length=2048)
     downloads: int = Field(default=0, ge=0)
     likes: int = Field(default=0, ge=0)
     total_bytes: int = Field(default=0, ge=0)
@@ -866,12 +869,91 @@ class HubModelSearchResult(ProtocolModel):
 class HubModelFile(ProtocolModel):
     name: str = Field(min_length=1, max_length=1024)
     byte_size: int = Field(default=0, ge=0)
+    sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+
+
+class ModelConfigurationStatus(ProtocolModel):
+    status: Literal["recommended", "warning", "unknown"]
+    required_memory_bytes: int | None = Field(default=None, ge=0)
+    recommended_memory_bytes: int | None = Field(default=None, ge=0)
+    available_memory_bytes: int | None = Field(default=None, ge=0)
+    reasons: list[str] = Field(default_factory=list)
+
+
+class HubModelVariant(ProtocolModel):
+    id: str = Field(min_length=1, max_length=1024)
+    label: str = Field(min_length=1, max_length=255)
+    format: Literal["mfq", "hf", "gguf", "unknown"]
+    precision: str | None = Field(default=None, max_length=128)
+    files: list[str] = Field(default_factory=list, max_length=256)
+    byte_size: int = Field(default=0, ge=0)
+    configuration: ModelConfigurationStatus
+
+
+class HubSystemProfile(ProtocolModel):
+    platform: str = Field(min_length=1, max_length=64)
+    machine: str = Field(min_length=1, max_length=64)
+    backend: Literal["metal", "cuda", "cpu", "unknown"]
+    physical_memory_bytes: int | None = Field(default=None, ge=0)
+    available_memory_bytes: int | None = Field(default=None, ge=0)
+    runtime_memory_budget_bytes: int | None = Field(default=None, ge=0)
 
 
 class HubModelInfo(HubModelSummary):
     revision: str
     files: list[HubModelFile]
     tags: list[str] = Field(default_factory=list)
+    license: str | None = Field(default=None, max_length=255)
+    library: str | None = Field(default=None, max_length=255)
+    pipeline_tag: str | None = Field(default=None, max_length=255)
+    architectures: list[str] = Field(default_factory=list)
+    modalities: list[str] = Field(default_factory=list)
+    parameter_count: int | None = Field(default=None, ge=0)
+    gated: bool = False
+    runtime_compatible: bool | None = None
+    variants: list[HubModelVariant] = Field(default_factory=list)
+
+
+class HubReferenceRequest(ProtocolModel):
+    reference: str = Field(min_length=1, max_length=2048)
+    fallback_provider: Literal["huggingface", "modelscope"] = "huggingface"
+
+
+class OfficialModelSource(ProtocolModel):
+    provider: Literal["huggingface", "modelscope"]
+    repo_id: str = Field(min_length=3, max_length=255)
+    revision: str | None = Field(default=None, max_length=255)
+    url: str = Field(min_length=1, max_length=2048)
+    available: bool = True
+
+
+class OfficialModelInfo(ProtocolModel):
+    id: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=255)
+    family: str = Field(min_length=1, max_length=255)
+    architecture: str = Field(min_length=1, max_length=128)
+    description: str = Field(min_length=1, max_length=2048)
+    description_zh: str = Field(min_length=1, max_length=2048)
+    parameter_label: str | None = Field(default=None, max_length=128)
+    active_parameter_label: str | None = Field(default=None, max_length=128)
+    modalities: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list)
+    precision_options: list[str] = Field(default_factory=list)
+    license: str | None = Field(default=None, max_length=255)
+    supports_ssd_streaming: bool = False
+    sources: list[OfficialModelSource]
+    selected_source: OfficialModelSource
+    revision: str
+    downloads: int = Field(default=0, ge=0)
+    likes: int = Field(default=0, ge=0)
+    updated_at: AwareDatetime | None = None
+    variants: list[HubModelVariant] = Field(default_factory=list)
+    configuration: ModelConfigurationStatus
+
+
+class OfficialModelList(ProtocolModel):
+    system: HubSystemProfile
+    data: list[OfficialModelInfo]
 
 
 class ArtifactLineageResource(ProtocolModel):

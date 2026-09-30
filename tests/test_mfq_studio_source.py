@@ -17,6 +17,13 @@ STUDIO_BRIDGE = (STUDIO / "src" / "studio.ts").read_text(encoding="utf-8")
 PLATFORM_BRIDGE = STUDIO / "src" / "shared" / "platform" / "studio.ts"
 if PLATFORM_BRIDGE.exists():
     STUDIO_BRIDGE += "\n" + PLATFORM_BRIDGE.read_text(encoding="utf-8")
+MODEL_BROWSER = (
+    STUDIO / "src" / "features" / "models" / "ModelBrowser.tsx"
+).read_text(encoding="utf-8")
+UPDATE_MANAGER = (
+    STUDIO / "src" / "features" / "settings" / "UpdateManager.tsx"
+).read_text(encoding="utf-8")
+UPDATER = (TAURI / "src" / "updater.rs").read_text(encoding="utf-8")
 RELEASE_SCRIPT = (ROOT / "packaging" / "build_release_mac.sh").read_text(encoding="utf-8")
 
 
@@ -76,3 +83,32 @@ def test_studio_uses_native_confirmation_dialogs_for_destructive_actions():
     assert "rfd::MessageButtons::YesNo" in RUST
     assert "studio_confirm," in RUST
     assert "tauri.invoke<boolean>('studio_confirm', { message })" in STUDIO_BRIDGE
+
+
+def test_model_hub_resolves_links_and_downloads_selected_variants():
+    assert "modelsApi.resolveHubModel(reference, provider)" in MODEL_BROWSER
+    assert (
+        "destination: `models/${source.provider}/${repositoryPath}/${variantPath}`"
+        in MODEL_BROWSER
+    )
+    assert "downloadPatterns(variant)" in MODEL_BROWSER
+    assert "jobsApi.createJob" in MODEL_BROWSER
+    assert 'tr("官方模型", "Official")' in MODEL_BROWSER
+    assert 'tr("第三方模型", "Community")' in MODEL_BROWSER
+    assert 'recommended ? "★"' in MODEL_BROWSER
+    assert 'warning ? "⚠"' in MODEL_BROWSER
+
+
+def test_studio_checks_releases_and_keeps_verified_versions_for_rollback():
+    assert "studio_update_status" in RUST
+    assert "studio_update_download" in RUST
+    assert "studio_update_install" in RUST
+    assert "studio_update_delete" in RUST
+    assert "studio_update_progress" in RUST
+    assert "api.github.com/repos/Tylogi/TyloQuant/releases" in UPDATER
+    assert "release SHA-256 verification failed" in UPDATER
+    assert "snapshot_current_bundle" in UPDATER
+    assert "replace_macos_bundle" in UPDATER
+    assert "com.tylogi.mfq-studio" in UPDATER
+    assert "studioUpdateStatus(false)" in UPDATE_MANAGER
+    assert 'tr("自动检查并提醒", "Automatically check and notify")' in UPDATE_MANAGER
