@@ -431,11 +431,11 @@ struct Dsv4Block : Block {
             return value == nullptr || value[0] != '0';
         }();
         if (groupwise_enabled && output_a.is_nint() &&
-                output_a.nint.w.bits == 8 && output_a.nint.w.gs == 48 &&
-                output_a.nint.w.out == groups * o_rank) {
+                output_a.nint.bits == 8 && output_a.nint.gs == 48 &&
+                output_a.nint.out == groups * o_rank) {
             auto low_rank = profiler.measure("dsv4.output_a", [&]() {
                 return nint_matmul_groupwise_u8(
-                    profiler, output_a.nint.w, grouped, groups);
+                    profiler, output_a.nint, grouped, groups);
             });
             return profiler.measure("dsv4.output_b", [&]() {
                 return output_b.forward(execution, low_rank)
@@ -447,7 +447,7 @@ struct Dsv4Block : Block {
             auto low_rank = profiler.measure(
                 "dsv4.output_a", [&]() {
                     return output_a.forward_mxfp8_groupwise(
-                        execution, grouped, groups);
+                        profiler, grouped, groups);
                 });
             return profiler.measure("dsv4.output_b", [&]() {
                 return output_b.forward(execution, low_rank)

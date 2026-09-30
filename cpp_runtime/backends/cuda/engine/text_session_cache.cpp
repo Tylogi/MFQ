@@ -193,9 +193,8 @@ public:
     size_t fork_session(
             const std::string & source_session,
             const std::string & target_session) {
-        if (paged_cache_) {
-            return paged_bindings_.fork(source_session, target_session);
-        }
+        const auto copied_paged = paged_bindings_.fork(
+            source_session, target_session);
         const auto copied_snapshots =
             snapshots_.fork(source_session, target_session);
         if (trace_ && copied_snapshots > 0) {
@@ -205,11 +204,11 @@ public:
                       << " total_bytes=" << snapshots_.metrics().bytes
                       << std::endl;
         }
-        return copied_snapshots;
+        return copied_snapshots + copied_paged;
     }
 
     size_t close_session(const std::string & session_id) {
-        if (paged_cache_) return paged_bindings_.close(session_id);
+        const auto released_paged = paged_bindings_.close(session_id);
         const auto released = snapshots_.close(session_id);
         if (trace_ && released.snapshots > 0) {
             std::cerr << "runtime_session_cache action=close session="
@@ -218,7 +217,7 @@ public:
                       << " total_bytes=" << snapshots_.metrics().bytes
                       << std::endl;
         }
-        return released.snapshots;
+        return released.snapshots + released_paged;
     }
 
     std::vector<std::pair<std::string, double>> metrics() const {
@@ -276,16 +275,13 @@ public:
     }
 
     size_t clear_live_sessions() noexcept {
-        if (paged_cache_) return paged_bindings_.clear();
-        return snapshots_.clear();
+        return snapshots_.clear() + paged_bindings_.clear();
     }
 
     size_t clear() {
-        if (paged_cache_) {
-            clear_live_sessions();
-            return paged_cache_->clear();
-        }
-        return clear_live_sessions();
+        const auto snapshots = snapshots_.clear();
+        paged_bindings_.clear();
+        return snapshots + (paged_cache_ ? paged_cache_->clear() : 0);
     }
 
     uint64_t trim_hot(uint64_t target_bytes) {

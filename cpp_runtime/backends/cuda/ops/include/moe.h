@@ -826,7 +826,7 @@ struct MixedMoeRuntime {
                 }
             }
             if (use_kl_mmq) {
-                value = kl_mmq_prepare_activation(value);
+                value = execution.kl_mmq_prepare_activation(value);
                 ++execution.kl_mmq_moe_calls;
                 if (pool.family == MixedMoeFamily::Mxfp4) {
                     mxfp4_moe_grouped_matmul_pool_f16_cuda(

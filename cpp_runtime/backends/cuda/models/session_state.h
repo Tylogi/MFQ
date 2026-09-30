@@ -97,6 +97,7 @@ struct TextSessionState {
     TextSessionPayload payload;
     std::optional<MtpSessionState> mtp;
     int64_t cache_pos = 0;
+    int64_t decode_position_delta = 0;
     size_t bytes = 0;
 
     TextSessionStateKind kind() const noexcept {

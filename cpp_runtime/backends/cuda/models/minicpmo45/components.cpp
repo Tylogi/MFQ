@@ -59,9 +59,11 @@ static int32_t generate_multimodal_tokens(
     const MfqSamplingParams & sampling,
     const MfqTokenCallback & on_token,
     const MfqPrefillCallback & on_prefill,
-    const MfqTokenConstraintPtr & token_constraint)
+    const MfqTokenConstraintPtr & token_constraint,
+    const MfqCancellationCheck & cancelled)
 {
     std::lock_guard<std::mutex> lock(model_mutex);
+    if (cancelled && cancelled()) return 0;
     if (prompt.empty() || sampling.max_tokens < 0) {
         throw std::invalid_argument(
             "MiniCPM-o multimodal generation input is invalid");
@@ -151,17 +153,25 @@ static int32_t generate_multimodal_tokens(
     }
 
     PrefillCudaTimer prefill_timer;
-    auto result = runtime.forward(
-        input_ids,
-        mfq_tensor_backend::Tensor(),
-        mfq_tensor_backend::Tensor(),
-        pixels,
-        patch_mask,
-        target_sizes,
-        image_bounds,
-        audio_features,
-        audio_lengths,
-        audio_bounds);
+    MiniCPMO45ForwardResult result;
+    try {
+        result = runtime.forward(
+            input_ids,
+            mfq_tensor_backend::Tensor(),
+            mfq_tensor_backend::Tensor(),
+            pixels,
+            patch_mask,
+            target_sizes,
+            image_bounds,
+            audio_features,
+            audio_lengths,
+            audio_bounds,
+            cancelled);
+    } catch (const mfq::engine::InferenceCancelled&) {
+        runtime.language.reset(1);
+        runtime.audio.reset();
+        return 0;
+    }
     auto logits = result.logits.index({Slice(), -1, Slice()})
         .contiguous().view({1, -1});
     MFQ_CUDA_CHECK(cudaEventRecord(
@@ -182,10 +192,11 @@ static int32_t generate_multimodal_tokens(
     }
 
     int32_t generated = 0;
-    while (generated < generation_limit) {
+    while (generated < generation_limit && (!cancelled || !cancelled())) {
         const int64_t token = next.template item<int64_t>();
         ++generated;
-        if (!on_token(token) || generated >= generation_limit) break;
+        if (!on_token(token) || generated >= generation_limit ||
+                (cancelled && cancelled())) break;
         if (has_penalties) {
             sample_token_counts_add_cuda(counts, next.contiguous());
         }
@@ -434,7 +445,7 @@ load_runtime_components(
                 const MfqPrefillCallback& on_prefill,
                 const MfqPromptCachePlan&,
                 const MfqTokenConstraintPtr& token_constraint,
-                const MfqCancellationCheck&) {
+                const MfqCancellationCheck& cancelled) {
             return mfq::cuda::minicpmo45::generate_multimodal_tokens(
                 state->runtime,
                 model_mutex,
@@ -443,7 +454,8 @@ load_runtime_components(
                 sampling,
                 on_token,
                 on_prefill,
-                token_constraint);
+                token_constraint,
+                cancelled);
         };
         engine.duplex =
             mfq::cuda::minicpmo45::make_cuda_minicpmo45_duplex_backend(

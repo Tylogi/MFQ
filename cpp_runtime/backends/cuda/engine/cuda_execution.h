@@ -237,6 +237,7 @@ struct CudaExecutionContext {
     std::shared_ptr<MoeExpertCache> moe_expert_cache;
     std::unordered_map<int, MoeRouteLayerStats> moe_route_stats;
 
+    mfq_tensor_backend::Tensor kl_mmq_prepare_activation(mfq_tensor_backend::Tensor x);
     void reset() noexcept;
 };
 
@@ -276,7 +277,6 @@ bool model_parallel_peer_first_launch_enabled();
 size_t model_parallel_launch_index(size_t launch_position, size_t shard_count);
 int active_weight_load_device();
 const char* kl_mmq_mode_name(KlMmqMode mode);
-mfq_tensor_backend::Tensor kl_mmq_prepare_activation(mfq_tensor_backend::Tensor x);
 const char* moe_route_stats_path();
 bool moe_route_output_energy_enabled();
 void record_moe_route_stats(

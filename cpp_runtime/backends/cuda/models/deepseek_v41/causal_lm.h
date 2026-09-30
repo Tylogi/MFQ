@@ -598,18 +598,18 @@ struct Block final : ::Block {
         auto grouped = attention.contiguous()
             .reshape({rows, groups, group_width})
             .to(mfq_tensor_backend::kFloat16);
-        if (output_a.is_nint() && output_a.nint.w.bits == 8 &&
-            output_a.nint.w.gs == 48 &&
-            output_a.nint.w.out == groups * config.o_lora_rank) {
+        if (output_a.is_nint() && output_a.nint.bits == 8 &&
+            output_a.nint.gs == 48 &&
+            output_a.nint.out == groups * config.o_lora_rank) {
             auto low_rank = nint_matmul_groupwise_u8(
-                execution.profiler, output_a.nint.w, grouped, groups);
+                execution.profiler, output_a.nint, grouped, groups);
             return output_b.forward(execution, low_rank)
                 .reshape({batch, tokens, config.hidden});
         }
         if (output_a.is_mxfp8() &&
             output_a.out() == groups * config.o_lora_rank) {
             auto low_rank = output_a.forward_mxfp8_groupwise(
-                execution, grouped, groups);
+                execution.profiler, grouped, groups);
             return output_b.forward(execution, low_rank)
                 .reshape({batch, tokens, config.hidden});
         }

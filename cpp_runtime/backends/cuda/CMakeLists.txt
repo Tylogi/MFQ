@@ -132,6 +132,9 @@ if(BUILD_TESTING)
             CUDA_STANDARD 20
             CUDA_STANDARD_REQUIRED ON
         )
+        target_compile_options(${target} PRIVATE
+            "$<$<COMPILE_LANGUAGE:CUDA>:-UNDEBUG>"
+            "$<$<COMPILE_LANGUAGE:CXX>:$<IF:$<CXX_COMPILER_ID:MSVC>,/UNDEBUG,-UNDEBUG>>")
         add_test(NAME ${target} COMMAND ${target})
         set_tests_properties(${target} PROPERTIES SKIP_RETURN_CODE 77)
     endfunction()
@@ -333,6 +336,15 @@ if(BUILD_TESTING)
         mfq-cuda-runtime)
     add_test(NAME mfq-cuda-execution-scope-test
         COMMAND mfq-cuda-execution-scope-test)
+
+    add_executable(mfq-cuda-runtime-state-test
+        ${MFQ_CUDA_ROOT}/tests/cuda_runtime_state_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-runtime-state-test)
+    target_compile_definitions(mfq-cuda-runtime-state-test PRIVATE
+        MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-runtime-state-test PRIVATE mfq-cuda-runtime)
+    add_test(NAME mfq-cuda-runtime-state-test COMMAND mfq-cuda-runtime-state-test)
+    set_tests_properties(mfq-cuda-runtime-state-test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 add_library(mfq-cuda-eval STATIC ${MFQ_CUDA_ROOT}/eval/kl.cpp)
@@ -466,6 +478,7 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         ${MFQ_CUDA_ROOT}/apps/runtime_main.cpp
         ${MFQ_CUDA_ROOT}/commands/runtime.cpp
         ${MFQ_CUDA_ROOT}/commands/cli.cpp
+        ${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp
         ${MFQ_CUDA_RUNTIME_OP_SOURCES}
         ${MFQ_CUDA_ROOT}/engine/cuda_engine.cpp
         ${MFQ_CUDA_ROOT}/engine/generation.cpp
@@ -477,6 +490,7 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         ${MFQ_CUDA_ROOT}/engine/mtp.cpp
         ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp
         ${MFQ_CUDA_ROOT}/models/components.cpp
+        ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
         ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
         ${MFQ_CUDA_MODEL_SOURCES}
         ${MFQ_CUDA_KERNEL_SOURCES}

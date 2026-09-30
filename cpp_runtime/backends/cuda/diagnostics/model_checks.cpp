@@ -107,8 +107,8 @@ int run_linear_check(
     cudaEventDestroy(stop);
     y_test = y_test.to(mfq_tensor_backend::kFloat32);
 
-    const NintWeight * nint = linear.is_nint() ? &linear.nint.w : nullptr;
-    const NvqWeight * nvq = linear.is_nvq() ? &linear.nvq.w : nullptr;
+    const NintWeight * nint = linear.is_nint() ? &linear.nint : nullptr;
+    const NvqWeight * nvq = linear.is_nvq() ? &linear.nvq : nullptr;
     const Mxfp4Weight * mxfp4 = linear.is_mxfp4()
         ? &linear.mxfp4.weight : nullptr;
     const Mxfp4SqWeight * mxfp4_sq = linear.is_mxfp4_sq()
@@ -455,7 +455,7 @@ int run_linear_group_check(
               << " mean_ms=" << elapsed_ms / reps << '\n';
     MFQ_RUNTIME_CHECK(actual.size() == names.size(), "linear group output count mismatch");
     std::vector<mfq_tensor_backend::Tensor> graph_actual;
-    if (M == 1 && decode_branch_parallel_enabled(execution, M)) {
+    if (M == 1 && decode_branch_parallel_enabled(execution.decode_graph_serial_branches, M)) {
         mfq_cuda_synchronize();
         const auto graph_stream =
             mfq_get_stream_from_pool(false);
@@ -505,7 +505,7 @@ int run_linear_group_check(
         MFQ_RUNTIME_CHECK(
             linear.is_nint(),
             "--check-linear-group currently requires NINT tensors");
-        const auto & weight = linear.nint.w;
+        const auto & weight = linear.nint;
         auto dense = weight.q8_zero
             ? nint8_zero_dequant_cuda(
                   weight.q_packed, weight.q8_zero_scale, weight.neuron_len)
@@ -751,9 +751,9 @@ int run_q8_embedding_check(
     const auto& mfq = *model_source;
     auto linear = load_quant_linear(mfq, name);
     MFQ_RUNTIME_CHECK(
-        linear.is_nint() && linear.nint.w.q8_zero,
+        linear.is_nint() && linear.nint.q8_zero,
         "--check-q8-embedding requires an NINT8-0 tensor");
-    const int64_t vocab = linear.nint.w.out;
+    const int64_t vocab = linear.nint.out;
     std::vector<int64_t> host_ids = {
         0,
         std::min<int64_t>(1, vocab - 1),
@@ -769,11 +769,11 @@ int run_q8_embedding_check(
                    .to(mfq_tensor_backend::kCUDA)
                    .contiguous();
     auto candidate = nint8_zero_embedding_lookup_cuda(
-        linear.nint.w.q_packed, linear.nint.w.q8_zero_scale,
-        ids, linear.nint.w.neuron_len);
+        linear.nint.q_packed, linear.nint.q8_zero_scale,
+        ids, linear.nint.neuron_len);
     auto dense = nint8_zero_dequant_cuda(
-        linear.nint.w.q_packed, linear.nint.w.q8_zero_scale,
-        linear.nint.w.neuron_len);
+        linear.nint.q_packed, linear.nint.q8_zero_scale,
+        linear.nint.neuron_len);
     auto reference = dense.index_select(0, ids);
     auto difference =
         candidate.to(mfq_tensor_backend::kFloat32) - reference.to(mfq_tensor_backend::kFloat32);
@@ -782,7 +782,7 @@ int run_q8_embedding_check(
               << " tensor=" << name
               << " ids=" << host_ids.size()
               << " vocab=" << vocab
-              << " width=" << linear.nint.w.neuron_len
+              << " width=" << linear.nint.neuron_len
               << " equal=" << (candidate.equal(reference) ? 1 : 0)
               << " rel="
               << (difference.norm() /
@@ -807,8 +807,8 @@ int run_dsv4_output_a_check(
         mfq, name, TensorParallelAxis::Input);
     const bool supported_nint =
         linear.is_nint() &&
-        linear.nint.w.bits == 8 &&
-        linear.nint.w.gs == 48;
+        linear.nint.bits == 8 &&
+        linear.nint.gs == 48;
     MFQ_RUNTIME_CHECK(
         supported_nint || linear.is_mxfp8(),
         "DSV4 output_a check requires NINT8 gs48 or MXFP8");
@@ -843,9 +843,9 @@ int run_dsv4_output_a_check(
     auto groupwise = [&]() {
         return linear.is_mxfp8()
             ? linear.forward_mxfp8_groupwise(
-                execution, grouped, kGroups)
+                execution.profiler, grouped, kGroups)
             : nint_matmul_groupwise_u8(
-                execution.profiler, linear.nint.w, grouped, kGroups);
+                execution.profiler, linear.nint, grouped, kGroups);
     };
     auto time_ms = [&](auto && fn) {
         mfq_tensor_backend::Tensor output;
@@ -953,8 +953,8 @@ int run_gemma_geglu_check(
               << " gate_up_gs=" << gate_up.nint.w.gs
               << " gate_out=" << gate_up.outs[0]
               << " up_out=" << gate_up.outs[1]
-              << " down_bits=" << down.nint.w.bits
-              << " down_gs=" << down.nint.w.gs << "\n";
+              << " down_bits=" << down.nint.bits
+              << " down_gs=" << down.nint.gs << "\n";
     auto report = [&](const char * name, mfq_tensor_backend::Tensor value, mfq_tensor_backend::Tensor reference) {
         auto got = value.to(mfq_tensor_backend::kFloat64);
         auto ref = reference.to(mfq_tensor_backend::kFloat64);
@@ -1001,8 +1001,8 @@ int run_gemma_geglu_check(
     std::cout << "gemma_geglu_check layer=" << layer
               << " gate_bits=" << gate_up.nint.w.bits
               << " gate_gs=" << gate_up.nint.w.gs
-              << " down_bits=" << down.nint.w.bits
-              << " down_gs=" << down.nint.w.gs
+              << " down_bits=" << down.nint.bits
+              << " down_gs=" << down.nint.gs
               << " materialized_ms=" << materialized_ms
               << " combined_ms=" << combined_ms
               << " pair_ms=" << pair_ms << "\n";

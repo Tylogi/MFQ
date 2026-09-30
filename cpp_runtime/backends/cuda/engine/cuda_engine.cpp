@@ -101,6 +101,8 @@ std::vector<std::pair<std::string, double>> engine_metrics(
     MFQ_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
     const auto memory = mfq_cuda_memory_stats(mfq_current_cuda_device());
     const auto components = state->components.state();
+    const bool vision_available =
+        components.vision_available && !state->continuous_batching;
     const bool mtp_available =
         components.mtp_available && !state->continuous_batching;
     std::vector<std::pair<std::string, double>> result{
@@ -112,7 +114,7 @@ std::vector<std::pair<std::string, double>> engine_metrics(
             memory.reserved_bytes)},
         {"vision_declared", components.vision_declared ? 1.0 : 0.0},
         {"vision_supported", components.vision_supported ? 1.0 : 0.0},
-        {"vision_available", components.vision_available ? 1.0 : 0.0},
+        {"vision_available", vision_available ? 1.0 : 0.0},
         {"mtp_declared", components.mtp_declared ? 1.0 : 0.0},
         {"mtp_supported", components.mtp_supported ? 1.0 : 0.0},
         {"mtp_available", mtp_available ? 1.0 : 0.0},
@@ -176,8 +178,7 @@ CudaEngine make_cuda_engine(
             state->decode_graph, state->session_cache,
             state->runtime_config, prompt, sampling, on_token, on_prefill,
             cache_plan, token_constraint,
-            state->continuous_batching && media
-                ? nullptr : state->components.mtp.get(),
+            state->components.mtp.get(),
             std::move(prepare), cancelled);
     };
     engine.generate = [generate_request](
@@ -219,7 +220,9 @@ CudaEngine make_cuda_engine(
             return state->session_cache.trim_hot(target_bytes);
         },
     };
-    if (state->components.engine_binder) {
+    // ponytail: batching owns shared model state; enable media only after
+    // per-request KV/recurrent state isolation is implemented.
+    if (!state->continuous_batching && state->components.engine_binder) {
         state->components.engine_binder(
             engine, state->model_mutex);
         if (engine.multimodal_generate) {
@@ -258,7 +261,7 @@ CudaEngine make_cuda_engine(
                 stop();
             };
         }
-    } else if (state->components.grid_vision) {
+    } else if (!state->continuous_batching && state->components.grid_vision) {
         engine.multimodal_generate = [generate_request](
                 const std::vector<int64_t>& prompt,
                 const MfqMultimodalInput& media,
@@ -279,7 +282,7 @@ CudaEngine make_cuda_engine(
 
     const auto component_state = state->components.state();
     const bool model_adapter_loaded =
-        static_cast<bool>(state->components.engine_binder);
+        state->components.engine_binder && !state->continuous_batching;
     engine.metadata.source = state->language->source;
     engine.metadata.architecture = state->components.graph.architecture;
     engine.metadata.model_type = state->language->model_type();
@@ -287,9 +290,10 @@ CudaEngine make_cuda_engine(
     engine.metadata.vocab_size = state->language->vocab_size();
     engine.metadata.capabilities.text =
         state->components.graph.has_component("text");
-    engine.metadata.capabilities.image_input = component_state.vision_available;
+    engine.metadata.capabilities.image_input =
+        component_state.vision_available && !state->continuous_batching;
     engine.metadata.capabilities.video_input =
-        component_state.vision_available &&
+        engine.metadata.capabilities.image_input &&
         !state->components.grid_vision.has_value();
     engine.metadata.capabilities.audio_input = model_adapter_loaded &&
         state->components.graph.has_component("audio_input");

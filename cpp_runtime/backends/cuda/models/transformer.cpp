@@ -508,7 +508,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
             const char * disable_parallel =
                 std::getenv("MFQ_DISABLE_IN_BRANCH_PARALLEL");
             const bool parallel =
-                decode_branch_parallel_enabled(execution, rows) &&
+                decode_branch_parallel_enabled(execution.decode_graph_serial_branches, rows) &&
                 (disable_parallel == nullptr ||
                  disable_parallel[0] != '1') &&
                 important_neuron_executor->run(
@@ -925,13 +925,13 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
             gate_up.nvq_prefix2 && gate_up.layers.size() == 2 &&
             gate_up.layers[0].is_nvq() && gate_up.layers[1].is_nvq() && down.is_nvq() &&
             gate_up.outs.size() == 2 && gate_up.outs[0] == gate_up.outs[1] &&
-            gate_up.outs[0] == down.nvq.w.neuron_len &&
-            (down.nvq.w.gs == 24 || down.nvq.w.gs == 28 || down.nvq.w.gs == 32)) {
+            gate_up.outs[0] == down.nvq.neuron_len &&
+            (down.nvq.gs == 24 || down.nvq.gs == 28 || down.nvq.gs == 32)) {
             auto shape = xh.sizes().vec();
-            shape.back() = down.nvq.w.out;
+            shape.back() = down.nvq.out;
             auto y = nvq_ffn_swiglu_down(
-                execution, gate_up.layers[0].nvq.w,
-                gate_up.layers[1].nvq.w, down.nvq.w,
+                profiler, gate_up.layers[0].nvq,
+                gate_up.layers[1].nvq, down.nvq,
                 xh.reshape({-1, xh.size(-1)}));
             return y.reshape(shape);
         }
@@ -980,27 +980,27 @@ bool FFN::can_forward_fused_residual(
             gate_up.layers[1].tensor_parallel() || down.tensor_parallel() ||
             gate_up.outs.size() != 2 ||
             gate_up.outs[0] != gate_up.outs[1] ||
-            gate_up.outs[0] != down.nvq.w.neuron_len ||
-            x.size(-1) != gate_up.layers[0].nvq.w.neuron_len ||
-            residual.size(-1) != down.nvq.w.out) {
+            gate_up.outs[0] != down.nvq.neuron_len ||
+            x.size(-1) != gate_up.layers[0].nvq.neuron_len ||
+            residual.size(-1) != down.nvq.out) {
             return false;
         }
         return nvq_fused_residual_format(
-            down.nvq.w.kernel_format);
+            down.nvq.kernel_format);
     }
 
 mfq_tensor_backend::Tensor FFN::forward_fused_residual(
-    CudaExecutionContext& execution,
+    CudaProfiler& profiler,
     mfq_tensor_backend::Tensor x,
     mfq_tensor_backend::Tensor residual) const {
         MFQ_RUNTIME_CHECK(
             can_forward_fused_residual(x, residual),
             "FFN fused residual requires a compatible single-token NVQ FFN");
         auto shape = x.sizes().vec();
-        shape.back() = down.nvq.w.out;
+        shape.back() = down.nvq.out;
         auto output = nvq_ffn_swiglu_down(
-            execution, gate_up.layers[0].nvq.w,
-            gate_up.layers[1].nvq.w, down.nvq.w,
+            profiler, gate_up.layers[0].nvq,
+            gate_up.layers[1].nvq, down.nvq,
             x.reshape({1, x.size(-1)}),
             residual.reshape({1, residual.size(-1)}));
         return output.reshape(shape);
@@ -2002,7 +2002,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             if (ffn.can_forward_fused_residual(ffn_input, residual_flat)) {
                 return profiler.measure("full.ffn_down_residual", [&]() {
                     return ffn.forward_fused_residual(
-                        execution, ffn_input, residual_flat)
+                        profiler, ffn_input, residual_flat)
                         .reshape({B, T, H});
                 });
             }
@@ -2136,11 +2136,11 @@ void prepare_ffn_workspaces(FFN & f) {
     if (f.down.tensor_parallel()) return;
     if (f.gate_up.nvq_prefix2 && f.gate_up.layers.size() == 2 && f.down.is_nvq() &&
         f.gate_up.outs.size() == 2 && f.gate_up.outs[0] == f.gate_up.outs[1] &&
-        f.gate_up.outs[0] == f.down.nvq.w.neuron_len) {
-        NvqWorkspace & ws = f.gate_up.layers[0].nvq.w.workspace(1);
+        f.gate_up.outs[0] == f.down.nvq.neuron_len) {
+        NvqWorkspace & ws = f.gate_up.layers[0].nvq.workspace(1);
         ws.swiglu_scratch = mfq_tensor_backend::empty(
             {f.gate_up.outs[0]}, mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
-        (void)f.down.nvq.w.workspace(1);
+        (void)f.down.nvq.workspace(1);
     }
     if (f.important_neurons) {
         prepare_ffn_workspaces(*f.important_neurons);

@@ -587,7 +587,7 @@ struct LinearAttentionBlock final : ::Block {
         if (ffn.can_forward_fused_residual(ffn_input, residual_flat)) {
             return profiler.measure("linear.ffn_down_residual", [&]() {
                 return ffn.forward_fused_residual(
-                    execution, ffn_input, residual_flat).reshape({B, T, H});
+                    profiler, ffn_input, residual_flat).reshape({B, T, H});
             });
         }
         auto ff = ffn.forward(execution, ffn_input).reshape({B, T, H});

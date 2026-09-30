@@ -593,13 +593,16 @@ bool CausalLm<Model>::supports_paged_text_session_state() const {
 template <typename Model>
 TextSessionState CausalLm<Model>::capture_text_session_state(
         const std::vector<int64_t>& tokens) const {
-    return CudaSessionCodec<Model>::capture(*this, tokens);
+    auto state = CudaSessionCodec<Model>::capture(*this, tokens);
+    state.decode_position_delta = decode_position_delta;
+    return state;
 }
 
 template <typename Model>
 void CausalLm<Model>::restore_text_session_state(
         const TextSessionState& state) {
     CudaSessionCodec<Model>::restore(*this, state);
+    decode_position_delta = state.decode_position_delta;
 }
 
 template <typename Model>

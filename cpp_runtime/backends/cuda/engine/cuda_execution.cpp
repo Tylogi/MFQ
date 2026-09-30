@@ -475,13 +475,13 @@ const char * kl_mmq_mode_name(KlMmqMode mode) {
 
 
 
-mfq_tensor_backend::Tensor kl_mmq_prepare_activation(mfq_tensor_backend::Tensor x) {
-    auto& execution = cuda_execution_context();
-    if (execution.kl_mmq_mode != KlMmqMode::Nint8One) return x;
+mfq_tensor_backend::Tensor CudaExecutionContext::kl_mmq_prepare_activation(
+        mfq_tensor_backend::Tensor x) {
+    if (kl_mmq_mode != KlMmqMode::Nint8One) return x;
     const auto original_shape = x.sizes().vec();
     auto flat = x.reshape({-1, x.size(-1)}).contiguous();
     auto quantized = nint8_one_quantize_reconstruct_cuda(flat);
-    ++execution.kl_mmq_activation_quantize_calls;
+    ++kl_mmq_activation_quantize_calls;
     return quantized.at(3).reshape(original_shape).contiguous();
 }
 

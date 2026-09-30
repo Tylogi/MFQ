@@ -327,7 +327,9 @@ std::vector<CudaPagedPayload> encode_cuda_paged_session(
         'M', 'F', 'Q', 'C', 'U', 'D', '1', 0};
     const auto* layers = std::get_if<
         std::vector<FullBlockSessionState>>(&state.payload);
+    // Paged prefixes are text-only; media positions are not block-sliceable.
     if (state.kind() != TextSessionStateKind::FullAttention ||
+            state.decode_position_delta != 0 || !state.input_key.empty() ||
             state.cache_pos <= 0 || layers == nullptr || layers->empty() ||
             state.tokens.size() != static_cast<size_t>(state.cache_pos)) {
         throw std::runtime_error(

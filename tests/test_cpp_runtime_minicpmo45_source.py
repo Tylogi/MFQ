@@ -144,7 +144,7 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
         ROOT / "cpp_runtime" / "backends" / "cuda" / "src" / "mfq_native_tensor_ops.cu"
     ).read_text(encoding="utf-8")
     assert 'rec.dtype == "NINT"' in DECODE
-    assert "dequant_nint_dense_f32(load_nint_gpu(mfq, name))" in DECODE
+    assert "dequant_nint_dense_f32(to_gpu_nint(unpack_nint(blob)))" in DECODE
     assert "attention_cache_decode_split_gqa4_d128_part_kernel" in ATTENTION
     assert "mfq_dispatch_bfloat16" in ATTENTION
     assert "minicpm_bf16_rope_cache_write_cuda" in DECODE
@@ -312,6 +312,11 @@ def test_minicpmo45_native_servers_share_mfqd_vision_tensors():
     assert "MiniCPM-o image placeholder must contain 64 query tokens" in TEXT_PROCESSOR
     assert "special_token(" not in SERVER_SOURCE
     assert "generate_multimodal_tokens(" in DECODE
+    assert "const MfqCancellationCheck& cancelled" in MINICPM_ENGINE
+    assert "token_constraint,\n                cancelled);" in MINICPM_ENGINE
+    assert "audio_bounds,\n            cancelled);" in MINICPM_ENGINE
+    assert "catch (const mfq::engine::InferenceCancelled&)" in MINICPM_ENGINE
+    assert "check_cancelled();" in GRAPH
     assert "runtime.forward(" in DECODE
     assert "mfq::cuda::sample_logits(" in DECODE
     assert "generate_multimodal(" in METAL_HEADER

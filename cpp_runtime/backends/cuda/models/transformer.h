@@ -186,7 +186,7 @@ struct FFN {
         const mfq_tensor_backend::Tensor & residual) const;
 
     mfq_tensor_backend::Tensor forward_fused_residual(
-        CudaExecutionContext& execution,
+        CudaProfiler& profiler,
         mfq_tensor_backend::Tensor x,
         mfq_tensor_backend::Tensor residual) const;
 

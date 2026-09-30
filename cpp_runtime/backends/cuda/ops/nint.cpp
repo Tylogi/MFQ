@@ -1,4 +1,5 @@
 #include "nint.h"
+#include "cuda_execution.h"
 #include "format.h"
 
 #if defined(__x86_64__) && defined(__GNUC__)
@@ -299,10 +300,9 @@ static mfq_tensor_backend::Tensor nint_matmul_cpu(
     return result;
 }
 mfq_tensor_backend::Tensor nint_matmul(
-        CudaExecutionContext& execution,
+        CudaProfiler& profiler,
         const NintWeight& w,
         mfq_tensor_backend::Tensor x) {
-    auto& profiler = execution.profiler;
     if (!x.is_cuda()) return nint_matmul_cpu(w, std::move(x));
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
@@ -333,25 +333,6 @@ mfq_tensor_backend::Tensor nint_matmul(
             return mfq_tensor_backend::matmul(x, dense.transpose(0, 1));
         });
     }
-    if (execution.kl_mmq_mode != KlMmqMode::Default) {
-        const int original_m = M;
-        MFQ_RUNTIME_CHECK(original_m > 0, "KLD NINT8-0 MMQ requires activation rows");
-        if (M < 16) {
-            auto padding = mfq_tensor_backend::zeros(
-                {16 - M, x.size(1)}, x.options());
-            x = mfq_tensor_backend::cat({x, padding}, 0).contiguous();
-            M = 16;
-        }
-        x = kl_mmq_prepare_activation(x);
-        ++execution.kl_mmq_dense_calls;
-        auto result = profiler.measure("kld_mmq.nint8_zero.fp16", [&]() {
-            return nint8_zero_mmq_f16_packed_cuda(
-                w.q_packed, w.q8_zero_scale, x, w.neuron_len);
-        });
-        return original_m < 16
-            ? result.index({Slice(0, original_m)}).contiguous()
-            : result;
-    }
     if (M <= 8) {
         Workspace & ws = w.workspace(M);
         return profiler.measure("nint8_zero.gemv", [&]() {
@@ -365,37 +346,20 @@ mfq_tensor_backend::Tensor nint_matmul(
     });
 }
 
-mfq_tensor_backend::Tensor nint_matmul_bf16_output(
-        CudaExecutionContext& execution,
+static mfq_tensor_backend::Tensor nint_matmul_f32(
+        CudaProfiler& profiler,
         const NintWeight & w,
         mfq_tensor_backend::Tensor x) {
-    auto shape = x.sizes().vec();
-    auto flat = x.reshape({-1, x.size(-1)});
-    auto output = nint_matmul(execution, w, flat)
-        .to(mfq_tensor_backend::kBFloat16).contiguous();
-    shape.back() = output.size(-1);
-    return output.reshape(shape);
-}
-
-static mfq_tensor_backend::Tensor nint_matmul_f32_kld(
-        CudaExecutionContext& execution,
-        const NintWeight & w,
-        mfq_tensor_backend::Tensor x) {
-    auto& profiler = execution.profiler;
-    MFQ_RUNTIME_CHECK(
-        execution.kl_mmq_mode == KlMmqMode::Fp16,
-        "FP32-output NINT MMQ is restricted to the FP16 KLD path");
     x = pad_last(
         x.contiguous().to(mfq_tensor_backend::kFloat16),
         w.neuron_len);
     if (!w.q8_zero) {
         return nint_matmul(
-            execution, w, x).to(mfq_tensor_backend::kFloat32);
+            profiler, w, x).to(mfq_tensor_backend::kFloat32);
     }
     MFQ_RUNTIME_CHECK(
         x.size(0) >= 16,
         "FP32-output NINT MMQ requires at least 16 activation rows");
-    ++execution.kl_mmq_dense_calls;
     return profiler.measure(
         "kld_mmq.nint8_zero.fp32_output", [&]() {
             return nint8_zero_mmq_f32_packed_cuda(
@@ -404,8 +368,8 @@ static mfq_tensor_backend::Tensor nint_matmul_f32_kld(
         });
 }
 
-mfq_tensor_backend::Tensor nint_matmul_input_mul_f32_kld(
-        CudaExecutionContext& execution,
+mfq_tensor_backend::Tensor nint_matmul_input_mul_f32(
+        CudaProfiler& profiler,
         const NintWeight & w,
         mfq_tensor_backend::Tensor x,
         mfq_tensor_backend::Tensor gate,
@@ -425,8 +389,8 @@ mfq_tensor_backend::Tensor nint_matmul_input_mul_f32_kld(
     auto activation = mode == 1
         ? x * mfq_tensor_backend::sigmoid(gate)
         : x * mfq_tensor_backend::silu(gate);
-    return nint_matmul_f32_kld(
-        execution, w, activation.contiguous());
+    return nint_matmul_f32(
+        profiler, w, activation.contiguous());
 }
 
 mfq_tensor_backend::Tensor nint_matmul_groupwise_u8(
@@ -463,12 +427,11 @@ mfq_tensor_backend::Tensor nint_matmul_groupwise_u8(
 }
 
 mfq_tensor_backend::Tensor nint_matmul_input_mul(
-        CudaExecutionContext& execution,
+        CudaProfiler& profiler,
         const NintWeight& w,
         mfq_tensor_backend::Tensor x,
         mfq_tensor_backend::Tensor gate,
         int mode) {
-    auto& profiler = execution.profiler;
     MFQ_RUNTIME_CHECK(
         mode == 1 || mode == 2,
         "NINT input gate mode must be sigmoid or SiLU");
@@ -505,34 +468,34 @@ mfq_tensor_backend::Tensor nint_matmul_input_mul(
     }
     if (mode == 1) {
         return nint_matmul(
-            execution, w, x * mfq_tensor_backend::sigmoid(gate));
+            profiler, w, x * mfq_tensor_backend::sigmoid(gate));
     }
     return nint_matmul(
-        execution, w, x * mfq_tensor_backend::silu(gate));
+        profiler, w, x * mfq_tensor_backend::silu(gate));
 }
 
 mfq_tensor_backend::Tensor nint_matmul_swiglu(
-        CudaExecutionContext& execution,
+        CudaProfiler& profiler,
         const NintWeight& w,
         mfq_tensor_backend::Tensor x) {
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
-    auto parts = nint_matmul(execution, w, x).chunk(2, -1);
+    auto parts = nint_matmul(profiler, w, x).chunk(2, -1);
     return mfq_tensor_backend::silu(parts[0]) * parts[1];
 }
 
 mfq_tensor_backend::Tensor nint_matmul_geglu(
-        CudaExecutionContext& execution,
+        CudaProfiler& profiler,
         const NintWeight& w,
         mfq_tensor_backend::Tensor x) {
     x = x.contiguous().to(mfq_tensor_backend::kFloat16);
     x = pad_last(x, w.neuron_len);
-    auto parts = nint_matmul(execution, w, x).chunk(2, -1);
+    auto parts = nint_matmul(profiler, w, x).chunk(2, -1);
     return gelu_mul_cuda(parts[0].contiguous(), parts[1].contiguous());
 }
 
 bool decode_branch_parallel_enabled(
-        const CudaExecutionContext& execution,
+        bool serial_branches,
         int64_t rows) {
     const char * disabled =
         std::getenv("MFQ_DISABLE_DECODE_BRANCH_PARALLEL");
@@ -540,7 +503,7 @@ bool decode_branch_parallel_enabled(
     // warmup/capture on the graph pool's stream until cross-stream allocation
     // lifetime tracking supports a fully rejoined capture. Eager is unchanged.
     return rows == 1 &&
-        !execution.decode_graph_serial_branches &&
+        !serial_branches &&
         (disabled == nullptr || disabled[0] != '1');
 }
 static void refresh_nint_descriptor(NintCpu & t) {
@@ -1316,12 +1279,6 @@ NintWeight to_cpu_nint8_zero(const Nint8ZeroCpu & c) {
     return to_device_nint8_zero(c, false);
 }
 
-NintWeight load_nint_gpu(const mfq::ModelSource & mfq, const std::string & name) {
-    if (require_tensor(mfq, name).dtype == "NINT8-0") {
-        return to_gpu_nint8_zero(unpack_nint8_zero(read_tensor(mfq, name)));
-    }
-    return to_gpu_nint(unpack_nint(read_tensor(mfq, name)));
-}
 NintCpu select_nint_cpu_rows(
         const NintCpu & source,
         const std::vector<int64_t> & rows) {

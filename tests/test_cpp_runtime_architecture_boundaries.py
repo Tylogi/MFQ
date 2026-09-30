@@ -170,6 +170,16 @@ def model_sources() -> str:
     )
 
 
+def test_cuda_format_operators_only_receive_the_profiler() -> None:
+    ops = CUDA_RUNTIME.parent / "ops"
+    for name in ("nint.cpp", "vq.cpp", "include/nint.h", "include/vq.h"):
+        source = (ops / name).read_text(encoding="utf-8")
+        assert "CudaProfiler&" in source
+        assert "CudaExecutionContext" not in source
+        assert "cuda_execution_context(" not in source
+        assert "KlMmqMode" not in source
+
+
 def test_model_sources_are_backend_neutral_and_shared() -> None:
     assert "class ModelSource" in MODEL_SOURCE_HEADER
     assert "class MfqModelSource final : public ModelSource" in (
@@ -241,6 +251,9 @@ def test_cuda_cli_is_a_thin_client_of_the_runtime_library() -> None:
     assert "engine/generation.cpp" in cmake
     assert "engine/text_session_cache.cpp" in cmake
     assert "add_executable(mfq-runtime\n" in cmake
+    torch_sources = cmake.split("add_executable(mfq-runtime-torch", 1)[1].split(")", 1)[0]
+    assert "${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp" in torch_sources
+    assert "${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp" in torch_sources
     assert "mfq-cuda-runtime mfq-runtime-communication" in cmake
     assert "${MFQ_CUDA_ROOT}/commands/runtime.cpp" in cmake
     assert "${MFQ_CUDA_ROOT}/commands/diagnostics.cpp" in cmake
@@ -348,8 +361,9 @@ def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
         CUDA_MODELS / "loader.cpp"
     ).read_text(encoding="utf-8")
     assert "struct CudaSessionCodec" in CUDA_CAUSAL_LM
-    assert "return CudaSessionCodec<Model>::capture" in CUDA_CAUSAL_LM_IMPL
     assert "CudaSessionCodec<Model>::capture" in CUDA_CAUSAL_LM_IMPL
+    assert "state.decode_position_delta = decode_position_delta" in CUDA_CAUSAL_LM_IMPL
+    assert "decode_position_delta = state.decode_position_delta" in CUDA_CAUSAL_LM_IMPL
     assert "void begin_speculative_suffix(int64_t draft_tokens);" in CUDA_CAUSAL_LM
     assert "CausalLm<Model>::begin_speculative_suffix" in CUDA_CAUSAL_LM_IMPL
     assert "CausalLm<Model>::finalize_hidden" in CUDA_CAUSAL_LM_IMPL

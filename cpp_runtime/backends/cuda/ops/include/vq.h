@@ -2,6 +2,8 @@
 
 #include "nint.h"
 
+enum class TensorParallelAxis;
+
 struct NvqWorkspace {
     int M = 0;
     int K_pad = 0;
@@ -45,50 +47,25 @@ struct NvqWeight {
 
 bool nvq_fusion_enabled();
 mfq_tensor_backend::Tensor nvq_matmul_multi2(
-    CudaExecutionContext& execution,
+    CudaProfiler& profiler,
     const NvqWeight& first,
     const NvqWeight& second,
     mfq_tensor_backend::Tensor input);
 mfq_tensor_backend::Tensor nvq_matmul_swiglu(
-    CudaExecutionContext& execution,
+    CudaProfiler& profiler,
     const NvqWeight& gate,
     const NvqWeight& up,
     mfq_tensor_backend::Tensor input);
 mfq_tensor_backend::Tensor nvq_matmul(
-    CudaExecutionContext& execution,
+    CudaProfiler& profiler,
     const NvqWeight& weight,
     mfq_tensor_backend::Tensor input);
 mfq_tensor_backend::Tensor nvq_matmul_input_mul(
-    CudaExecutionContext& execution,
+    CudaProfiler& profiler,
     const NvqWeight& weight,
     mfq_tensor_backend::Tensor input,
     mfq_tensor_backend::Tensor gate,
     int mode);
-
-struct NvqLinear {
-    NvqWeight w;
-    mfq_tensor_backend::Tensor forward(
-            CudaExecutionContext& execution,
-            mfq_tensor_backend::Tensor x) const {
-        auto shape = x.sizes().vec();
-        auto y = nvq_matmul(
-            execution, w, x.reshape({-1, x.size(-1)}));
-        shape.back() = y.size(-1);
-        return y.reshape(shape);
-    }
-    mfq_tensor_backend::Tensor forward_input_mul(
-            CudaExecutionContext& execution,
-            mfq_tensor_backend::Tensor x,
-            mfq_tensor_backend::Tensor gate,
-            int mode) const {
-        auto shape = x.sizes().vec();
-        auto y = nvq_matmul_input_mul(
-            execution, w, x.reshape({-1, x.size(-1)}),
-            gate.reshape({-1, gate.size(-1)}), mode);
-        shape.back() = y.size(-1);
-        return y.reshape(shape);
-    }
-};
 
 struct NvqCpu {
     int format = 0;
@@ -191,8 +168,6 @@ NepqCpu select_nepq_cpu_rows(
 NepqWeight to_device_nepq(const NepqCpu& source, bool cuda);
 NepqWeight to_gpu_nepq(const NepqCpu& source);
 NepqWeight to_cpu_nepq(const NepqCpu& source);
-NvqWeight load_nvq_gpu(
-    const mfq::ModelSource& source, const std::string& name);
 
 bool nvq_pair_compatible(const NvqWeight& first, const NvqWeight& second);
 mfq_tensor_backend::Tensor nvq_dequant(const NvqWeight& weight);
