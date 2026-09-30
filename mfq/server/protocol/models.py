@@ -874,8 +874,15 @@ class HubModelFile(ProtocolModel):
 
 class ModelConfigurationStatus(ProtocolModel):
     status: Literal["recommended", "warning", "unknown"]
+    recommendation: Literal[
+        "three_stars",
+        "two_stars",
+        "one_star",
+        "caution",
+        "not_recommended",
+        "unknown",
+    ]
     required_memory_bytes: int | None = Field(default=None, ge=0)
-    recommended_memory_bytes: int | None = Field(default=None, ge=0)
     available_memory_bytes: int | None = Field(default=None, ge=0)
     reasons: list[str] = Field(default_factory=list)
 

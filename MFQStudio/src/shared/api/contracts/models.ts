@@ -45,8 +45,8 @@ export interface HubModelSummary {
 
 export interface ModelConfigurationStatus {
   status: 'recommended' | 'warning' | 'unknown';
+  recommendation: 'three_stars' | 'two_stars' | 'one_star' | 'caution' | 'not_recommended' | 'unknown';
   required_memory_bytes?: number | null;
-  recommended_memory_bytes?: number | null;
   available_memory_bytes?: number | null;
   reasons: string[];
 }

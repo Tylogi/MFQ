@@ -57,13 +57,36 @@ function formatDate(value?: string | null): string {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString();
 }
 
+function memoryBudgetPercentage(status: ModelConfigurationStatus): number | null {
+  const required = status.required_memory_bytes;
+  const budget = status.available_memory_bytes;
+  if (required == null || budget == null || budget <= 0) return null;
+  return (required / budget) * 100;
+}
+
+function memoryPressureColor(percentage: number): string {
+  const hue = 120 - Math.min(Math.max(percentage, 0), 100) * 1.2;
+  return `hsl(${hue.toFixed(1)} 68% 42%)`;
+}
+
 function configurationReasons(status: ModelConfigurationStatus, tr: Translate): string[] {
   return status.reasons.map((reason) => {
     if (reason === "Configuration requirements could not be determined.") return tr("无法确定此配置的资源需求。", reason);
     if (reason === "Estimated memory requirement exceeds the detected runtime budget.") return tr("预计内存需求超出检测到的推理预算。", reason);
+    if (reason === "Estimated memory requirement exceeds the detected runtime budget, but at least 70% is available.") return tr("预计内存需求超出检测到的推理预算，但当前预算已达到需求的 70%。", reason);
+    if (reason === "The detected runtime budget is below 70% of the estimated memory requirement.") return tr("检测到的推理预算不足预计内存需求的 70%。", reason);
     if (reason === "Fits within the detected runtime memory budget.") return tr("符合检测到的推理内存预算。", reason);
     if (reason === "Close other memory-heavy applications before loading.") return tr("加载前建议关闭其他占用大量内存的应用。", reason);
-    if (reason === "At least one published precision tier fits this configuration.") return tr("至少有一个已发布精度档适合当前配置。", reason);
+    if (reason === "All published precision tiers fit within the detected runtime memory budget.") return tr("所有已发布精度档都符合检测到的推理内存预算。", reason);
+    if (reason === "More than half of the published precision tiers fit within the detected runtime memory budget.") return tr("超过一半的已发布精度档符合检测到的推理内存预算。", reason);
+    if (reason === "At most half of the published precision tiers fit within the detected runtime memory budget.") return tr("不超过一半的已发布精度档符合检测到的推理内存预算。", reason);
+    if (reason === "The detected runtime memory budget covers at least 70% of the smallest published precision tier.") return tr("检测到的推理预算已达到最小精度档内存需求的 70%，请谨慎加载。", reason);
+    if (reason === "The detected runtime memory budget is below 70% of the smallest published precision tier.") return tr("检测到的推理预算不足最小精度档内存需求的 70%。", reason);
+    if (reason === "All published precision tiers fit fully within the detected runtime memory budget.") return tr("所有已发布精度档都可完整常驻于当前推理内存预算。", reason);
+    if (reason === "More than half of the published precision tiers fit fully within the detected runtime memory budget.") return tr("超过一半的已发布精度档可完整常驻于当前推理内存预算。", reason);
+    if (reason === "At most half of the published precision tiers fit fully within the detected runtime memory budget.") return tr("不超过一半的已发布精度档可完整常驻于当前推理内存预算。", reason);
+    if (reason === "The detected runtime memory budget covers at least 70% of the full-residency requirement for the smallest published precision tier.") return tr("当前推理预算已达到最小精度档完整常驻需求的 70%，处于临界区间。", reason);
+    if (reason === "The detected runtime memory budget is below 70% of the full-residency requirement for the smallest published precision tier.") return tr("当前推理预算不足最小精度档完整常驻需求的 70%。", reason);
     if (reason === "The catalog is available offline; repository metadata could not be refreshed.") return tr("官方目录仍可离线浏览，但仓库元数据暂未刷新。", reason);
     if (reason === "GGUF must be converted before the MFQ runtime can load it.") return tr("MFQ Runtime 加载前需要先转换 GGUF。", reason);
     if (reason === "The repository can be downloaded, but direct runtime compatibility has not been verified.") return tr("可以下载此仓库，但尚未验证能否由 MFQ Runtime 直接加载。", reason);
@@ -94,34 +117,32 @@ function downloadPatterns(variant: HubModelVariant | null): string[] {
 }
 
 function ConfigurationBadge({ status, tr }: { status: ModelConfigurationStatus; tr: Translate }) {
-  const recommended = status.status === "recommended";
-  const warning = status.status === "warning";
-  const title = configurationReasons(status, tr).join(" ");
+  const reason = configurationReasons(status, tr).join(" ");
+  const presentation = {
+    three_stars: ["★★★", tr("内存压力低：全部精度档均可完整常驻", "Low memory pressure: all precision tiers fit fully in memory")],
+    two_stars: ["★★", tr("内存压力中等：多数精度档可完整常驻", "Moderate memory pressure: most precision tiers fit fully in memory")],
+    one_star: ["★", tr("内存压力较高：仅部分精度档可完整常驻", "High memory pressure: only some precision tiers fit fully in memory")],
+    caution: ["▲", tr("内存临界：最低档接近完整常驻门槛", "Memory near limit: the smallest tier is close to fitting fully")],
+    not_recommended: ["✕", tr("内存不足：最低档无法完整常驻", "Insufficient memory: the smallest tier does not fit fully")],
+    unknown: ["?", tr("内存压力未知", "Memory pressure unknown")],
+  }[status.recommendation];
   return (
     <span
-      className={`configuration-badge ${status.status}`}
-      title={title}
+      aria-label={presentation[1]}
+      className={`configuration-badge ${status.status} ${status.recommendation.replaceAll("_", "-")}`}
+      title={[presentation[1], reason].filter(Boolean).join(" · ")}
     >
-      <b aria-hidden="true">{recommended ? "★" : warning ? "⚠" : "?"}</b>
-      {recommended
-        ? tr("适合此设备", "Recommended")
-        : warning
-          ? tr("超出建议配置", "Check requirements")
-          : tr("配置未知", "Unknown")}
+      <b aria-hidden="true">{presentation[0]}</b>
     </span>
   );
 }
 
 function ConfigurationDetails({ status, tr }: { status: ModelConfigurationStatus; tr: Translate }) {
   return (
-    <div className={`configuration-details ${status.status}`}>
+    <div className={`configuration-details ${status.status} ${status.recommendation.replaceAll("_", "-")}`}>
       <div>
-        <span>{tr("预计最低内存", "Estimated minimum")}</span>
+        <span>{tr("预计最低内存", "Estimated minimum memory")}</span>
         <strong>{formatBytes(status.required_memory_bytes)}</strong>
-      </div>
-      <div>
-        <span>{tr("建议内存", "Recommended memory")}</span>
-        <strong>{formatBytes(status.recommended_memory_bytes)}</strong>
       </div>
       <div>
         <span>{tr("当前推理预算", "Detected runtime budget")}</span>
@@ -148,18 +169,36 @@ function VariantList({
   }
   return (
     <div className="model-variant-list">
-      {variants.map((variant) => (
-        <div className="model-variant" key={variant.id}>
-          <div>
-            <strong>{variant.label}</strong>
-            <small>{variant.precision || variant.format.toUpperCase()} · {formatBytes(variant.byte_size)} · {tr("预计", "est.")} {formatBytes(variant.configuration.required_memory_bytes)} RAM</small>
+      {variants.map((variant) => {
+        const percentage = memoryBudgetPercentage(variant.configuration);
+        const percentageLabel = percentage == null ? "—" : `${percentage.toFixed(1)}%`;
+        const color = percentage == null ? "var(--muted)" : memoryPressureColor(percentage);
+        return (
+          <div className="model-variant" key={variant.id}>
+            <div>
+              <strong>{variant.label}</strong>
+              <small>{variant.precision || variant.format.toUpperCase()} · {tr("文件", "file")} {formatBytes(variant.byte_size)} · {tr("完整常驻约", "est. full residency")} {formatBytes(variant.configuration.required_memory_bytes)}</small>
+            </div>
+            <div className="variant-memory-pressure">
+              <div
+                aria-label={`${tr("预计占当前推理预算", "Estimated share of runtime budget")}: ${percentageLabel}`}
+                aria-valuemax={100}
+                aria-valuemin={0}
+                aria-valuenow={percentage == null ? undefined : Math.min(percentage, 100)}
+                aria-valuetext={percentageLabel}
+                className="variant-memory-track"
+                role="progressbar"
+              >
+                <span style={{ backgroundColor: color, width: `${Math.min(percentage ?? 0, 100)}%` }} />
+              </div>
+              <strong style={{ color }}>{percentageLabel}</strong>
+            </div>
+            <button disabled={disabled} onClick={() => onDownload(variant)} type="button">
+              {tr("下载", "Download")}
+            </button>
           </div>
-          <ConfigurationBadge status={variant.configuration} tr={tr} />
-          <button disabled={disabled} onClick={() => onDownload(variant)} type="button">
-            {tr("下载", "Download")}
-          </button>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -331,6 +370,15 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tr }: ModelBrows
             <div><span>{tr("推理预算", "Runtime budget")}</span><strong>{formatBytes(system?.runtime_memory_budget_bytes)}</strong></div>
             <button disabled={officialLoading} onClick={() => void loadOfficial(true)} type="button">{officialLoading ? tr("刷新中", "Refreshing") : tr("刷新目录", "Refresh")}</button>
           </div>
+          <div className="memory-pressure-guide">
+            <strong>{tr("内存压力", "Memory pressure")}</strong>
+            <span><b>★★★</b>{tr("低", "Low")}</span>
+            <span><b>★★</b>{tr("中", "Moderate")}</span>
+            <span><b>★</b>{tr("高", "High")}</span>
+            <span><b>▲</b>{tr("临界", "Near limit")}</span>
+            <span><b>✕</b>{tr("不足", "Insufficient")}</span>
+            <small>{tr("只反映当前设备可完整常驻的精度档比例，不代表模型能力或质量。", "Reflects only how many precision tiers fit fully in this device's memory, not model capability or quality.")}</small>
+          </div>
           <div className="model-browser-layout">
             <div className="official-model-grid">
               {official?.data.map((item) => (
@@ -361,7 +409,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tr }: ModelBrows
                 </dl>
                 <label className="model-source-picker"><span>{tr("下载来源", "Download source")}</span><select onChange={(event) => { const source = selectedOfficial.sources[Number(event.target.value)]; if (source) void chooseOfficialSource(source); }} value={String(Math.max(0, selectedOfficial.sources.findIndex((item) => item.provider === selectedSource.provider && item.repo_id === selectedSource.repo_id)))}>{selectedOfficial.sources.map((source, index) => <option disabled={!source.available} key={`${source.provider}:${source.repo_id}`} value={index}>{source.provider === "huggingface" ? "Hugging Face" : "ModelScope"}{source.available ? "" : ` · ${tr("离线", "unavailable")}`}</option>)}</select></label>
                 <div className="repository-line"><button onClick={() => void openStudioExternal(selectedSource.url).catch((cause) => onError(cause instanceof Error ? cause.message : String(cause)))} type="button">{selectedSource.repo_id}</button><span>{officialVariants.length} {tr("个精度版本", "variants")}</span></div>
-                {selectedOfficial.supports_ssd_streaming && <div className="streaming-note">{tr("支持 SSD 专家流式读取；星级按建议常驻预算评估，不要求整个模型进入内存。", "SSD expert streaming is supported; the rating uses the recommended resident budget rather than requiring the full model in memory.")}</div>}
+                {selectedOfficial.supports_ssd_streaming && <div className="streaming-note">{tr("支持 SSD 专家流式读取；即使无法完整常驻仍可流式运行。上方图标只表示完整常驻时的内存压力。", "SSD expert streaming remains available when the model cannot fit fully in memory. The icon above reflects full-residency memory pressure only.")}</div>}
                 <VariantList disabled={officialLoading || !selectedSource.available || !canDownload(selectedSource.provider) || downloading !== null} onDownload={(variant) => void download({ provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision || selectedOfficial.revision }, variant)} tr={tr} variants={officialVariants} />
               </aside>
             )}

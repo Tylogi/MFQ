@@ -6,6 +6,7 @@ import { MemoryRouter } from 'react-router';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { renderMarkdown } from '../src/features/chat/MessageMarkdown';
 import { parseHubReference } from '../src/features/models/hubReference';
+import { ModelBrowser } from '../src/features/models/ModelBrowser';
 import { ModelHubPage } from '../src/features/models/ModelHubPage';
 import { modelsApi } from '../src/shared/api/resources/models';
 import { jobsApi } from '../src/shared/api/resources/jobs';
@@ -67,8 +68,8 @@ describe('test_model_hub_accepts_repository_links_and_downloads_into_the_model_c
     const host = provider === 'huggingface' ? 'huggingface.co' : 'modelscope.cn/models';
     const configuration = {
       status: 'recommended' as const,
+      recommendation: 'three_stars' as const,
       required_memory_bytes: 4096,
-      recommended_memory_bytes: 8192,
       available_memory_bytes: 16384,
       reasons: ['fits'],
     };
@@ -114,6 +115,93 @@ describe('test_model_hub_accepts_repository_links_and_downloads_into_the_model_c
       expected_bytes: 4096,
     }));
     expect(addJob).toHaveBeenCalledWith(job);
+  });
+});
+
+describe('test_model_hub_renders_device_recommendation_grades（行为）', () => {
+  it('只用图标显示内存压力档位，并明确不代表模型能力或质量', async () => {
+    const grades = [
+      ['three_stars', 'recommended', '★★★', 'Low memory pressure: all precision tiers fit fully in memory', 'three-stars'],
+      ['two_stars', 'recommended', '★★', 'Moderate memory pressure: most precision tiers fit fully in memory', 'two-stars'],
+      ['one_star', 'recommended', '★', 'High memory pressure: only some precision tiers fit fully in memory', 'one-star'],
+      ['caution', 'warning', '▲', 'Memory near limit: the smallest tier is close to fitting fully', 'caution'],
+      ['not_recommended', 'warning', '✕', 'Insufficient memory: the smallest tier does not fit fully', 'not-recommended'],
+      ['unknown', 'unknown', '?', 'Memory pressure unknown', 'unknown'],
+    ] as const;
+    const source = {
+      provider: 'huggingface' as const,
+      repo_id: 'team/model',
+      revision: 'main',
+      url: 'https://huggingface.co/team/model',
+      available: true,
+    };
+    vi.spyOn(modelsApi, 'officialHubModels').mockResolvedValue({
+      system: { platform: 'test', machine: 'test', backend: 'unknown' },
+      data: grades.map(([recommendation, status], index) => ({
+        id: `model-${index}`,
+        name: `Model ${index}`,
+        family: 'MFQ',
+        architecture: 'test',
+        description: 'test model',
+        description_zh: '测试模型',
+        modalities: ['text'],
+        capabilities: [],
+        precision_options: [],
+        supports_ssd_streaming: false,
+        sources: [source],
+        selected_source: source,
+        revision: 'main',
+        downloads: 0,
+        likes: 0,
+        variants: index === 0 ? [{
+          id: 'mfq:tier',
+          label: 'tier',
+          format: 'mfq' as const,
+          precision: 'S4',
+          files: ['tier.mfq'],
+          byte_size: 70,
+          configuration: {
+            status: 'recommended' as const,
+            recommendation: 'three_stars' as const,
+            required_memory_bytes: 75,
+            available_memory_bytes: 100,
+            reasons: [],
+          },
+        }] : [],
+        configuration: {
+          status,
+          recommendation,
+          required_memory_bytes: 100,
+          available_memory_bytes: 100,
+          reasons: [],
+        },
+      })),
+    });
+    const view = render(
+      <MemoryRouter>
+        <ModelBrowser
+          jobKinds={[]}
+          onError={vi.fn()}
+          onJobCreated={vi.fn()}
+          tr={(_zh, en) => en}
+        />
+      </MemoryRouter>,
+    );
+
+    await screen.findAllByLabelText('Low memory pressure: all precision tiers fit fully in memory');
+    expect(screen.getByText('Memory pressure')).toBeInTheDocument();
+    expect(screen.getByText("Reflects only how many precision tiers fit fully in this device's memory, not model capability or quality.")).toBeInTheDocument();
+    expect(screen.queryByText('3-star recommendation')).not.toBeInTheDocument();
+    expect(screen.queryByText('2-star recommendation')).not.toBeInTheDocument();
+    const tierPressure = screen.getByRole('progressbar', { name: 'Estimated share of runtime budget: 75.0%' });
+    expect(tierPressure).toHaveAttribute('aria-valuetext', '75.0%');
+    expect(tierPressure.querySelector('span')).toHaveStyle({ width: '75%' });
+    expect(screen.getByText('75.0%')).toBeInTheDocument();
+    expect(view.container.querySelector('.model-variant .configuration-badge')).toBeNull();
+    for (const [, , symbol, label, className] of grades) {
+      expect(screen.getAllByLabelText(label).length).toBeGreaterThan(0);
+      expect(view.container.querySelector(`.configuration-badge.${className} b`)).toHaveTextContent(symbol);
+    }
   });
 });
 

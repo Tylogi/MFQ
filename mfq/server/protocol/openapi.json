@@ -3056,17 +3056,17 @@
             "title": "Reasons",
             "type": "array"
           },
-          "recommended_memory_bytes": {
-            "anyOf": [
-              {
-                "minimum": 0.0,
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
+          "recommendation": {
+            "enum": [
+              "three_stars",
+              "two_stars",
+              "one_star",
+              "caution",
+              "not_recommended",
+              "unknown"
             ],
-            "title": "Recommended Memory Bytes"
+            "title": "Recommendation",
+            "type": "string"
           },
           "required_memory_bytes": {
             "anyOf": [
@@ -3091,7 +3091,8 @@
           }
         },
         "required": [
-          "status"
+          "status",
+          "recommendation"
         ],
         "title": "ModelConfigurationStatus",
         "type": "object"

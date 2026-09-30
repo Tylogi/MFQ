@@ -95,8 +95,12 @@ def test_model_hub_resolves_links_and_downloads_selected_variants():
     assert "jobsApi.createJob" in MODEL_BROWSER
     assert 'tr("官方模型", "Official")' in MODEL_BROWSER
     assert 'tr("第三方模型", "Community")' in MODEL_BROWSER
-    assert 'recommended ? "★"' in MODEL_BROWSER
-    assert 'warning ? "⚠"' in MODEL_BROWSER
+    assert 'tr("内存压力", "Memory pressure")' in MODEL_BROWSER
+    assert "not model capability or quality" in MODEL_BROWSER
+    assert "三星推荐" not in MODEL_BROWSER
+    assert "3-star recommendation" not in MODEL_BROWSER
+    for symbol in ('"★★★"', '"★★"', '"★"', '"▲"', '"✕"'):
+        assert symbol in MODEL_BROWSER
 
 
 def test_studio_checks_releases_and_keeps_verified_versions_for_rollback():

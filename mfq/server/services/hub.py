@@ -76,8 +76,6 @@ class _OfficialModelSpec:
     precision_options: tuple[str, ...]
     license: str | None
     sources: tuple[_OfficialSourceSpec, ...]
-    minimum_memory_gib: int
-    recommended_memory_gib: int
     supports_ssd_streaming: bool = False
 
 
@@ -109,8 +107,6 @@ _OFFICIAL_MODELS = (
                 "modelscope", "Tylogi/DeepSeek-V4-Flash-0731-EW-MFQ"
             ),
         ),
-        minimum_memory_gib=48,
-        recommended_memory_gib=96,
         supports_ssd_streaming=True,
     ),
     _OfficialModelSpec(
@@ -132,8 +128,6 @@ _OFFICIAL_MODELS = (
         precision_options=("V1–V4", "S4–S6"),
         license=None,
         sources=(_OfficialSourceSpec("modelscope", "Tylogi/Qwen3.8-27B-MFQ"),),
-        minimum_memory_gib=24,
-        recommended_memory_gib=32,
     ),
     _OfficialModelSpec(
         id="qwen3-6-27b",
@@ -154,8 +148,6 @@ _OFFICIAL_MODELS = (
         precision_options=("V2–V3", "S2–S6"),
         license=None,
         sources=(_OfficialSourceSpec("huggingface", "Tylogi/Qwen3.6-27B-MFQ"),),
-        minimum_memory_gib=16,
-        recommended_memory_gib=32,
     ),
     _OfficialModelSpec(
         id="minicpm-o-4-5",
@@ -176,8 +168,6 @@ _OFFICIAL_MODELS = (
         precision_options=("S4–S8",),
         license=None,
         sources=(_OfficialSourceSpec("modelscope", "Tylogi/MiniCPM-o-4_5-MFQ"),),
-        minimum_memory_gib=16,
-        recommended_memory_gib=32,
     ),
 )
 
@@ -247,42 +237,128 @@ def _configuration_status(
     byte_size: int,
     profile: HubSystemProfile,
     *,
-    minimum_memory_bytes: int | None = None,
-    recommended_memory_bytes: int | None = None,
     supported: bool | None = True,
     unsupported_reason: str | None = None,
 ) -> ModelConfigurationStatus:
-    required = minimum_memory_bytes
-    if required is None and byte_size > 0:
-        required = max(byte_size + 2 * _GIB, int(byte_size * 1.08))
-    recommended = recommended_memory_bytes
-    if recommended is None and required is not None:
-        recommended = max(required + 2 * _GIB, int(required * 1.12))
+    required = max(byte_size + 2 * _GIB, int(byte_size * 1.08)) if byte_size > 0 else None
     capacity = profile.runtime_memory_budget_bytes or profile.physical_memory_bytes
     reasons: list[str] = []
     if supported is False:
         reasons.append(unsupported_reason or "This format is not directly loadable by MFQ.")
         status: Literal["recommended", "warning", "unknown"] = "warning"
+        recommendation = "not_recommended"
     elif supported is None:
         reasons.append("Runtime compatibility could not be verified from repository metadata.")
         status = "unknown"
+        recommendation = "unknown"
     elif required is None or capacity is None:
         reasons.append("Configuration requirements could not be determined.")
         status = "unknown"
+        recommendation = "unknown"
     elif required > capacity:
-        reasons.append("Estimated memory requirement exceeds the detected runtime budget.")
         status = "warning"
+        if capacity * 10 >= required * 7:
+            recommendation = "caution"
+            reasons.append(
+                "Estimated memory requirement exceeds the detected runtime budget, "
+                "but at least 70% is available."
+            )
+        else:
+            recommendation = "not_recommended"
+            reasons.append(
+                "The detected runtime budget is below 70% of the estimated memory requirement."
+            )
     else:
         reasons.append("Fits within the detected runtime memory budget.")
         status = "recommended"
-        if recommended is not None and recommended > capacity:
-            reasons.append("Close other memory-heavy applications before loading.")
+        recommendation = "three_stars"
     return ModelConfigurationStatus(
         status=status,
+        recommendation=recommendation,
         required_memory_bytes=required,
-        recommended_memory_bytes=recommended,
         available_memory_bytes=capacity,
         reasons=reasons,
+    )
+
+
+def _model_configuration_status(
+    variants: list[HubModelVariant],
+    profile: HubSystemProfile,
+) -> ModelConfigurationStatus:
+    """Rate full residency from the share of loadable precision tiers that fit."""
+
+    candidates = [
+        variant
+        for variant in variants
+        if variant.format in {"mfq", "hf"}
+        and variant.configuration.status != "unknown"
+        and variant.configuration.required_memory_bytes is not None
+    ]
+    capacity = profile.runtime_memory_budget_bytes or profile.physical_memory_bytes
+    if not candidates:
+        return ModelConfigurationStatus(
+            status="unknown",
+            recommendation="unknown",
+            available_memory_bytes=capacity,
+            reasons=["Configuration requirements could not be determined."],
+        )
+
+    requirements = [
+        variant.configuration.required_memory_bytes
+        for variant in candidates
+        if variant.configuration.required_memory_bytes is not None
+    ]
+    smallest = min(requirements)
+    if capacity is None:
+        return ModelConfigurationStatus(
+            status="unknown",
+            recommendation="unknown",
+            required_memory_bytes=smallest,
+            reasons=["Configuration requirements could not be determined."],
+        )
+    fit_count = sum(requirement <= capacity for requirement in requirements)
+    total = len(requirements)
+    if fit_count == total:
+        status: Literal["recommended", "warning", "unknown"] = "recommended"
+        recommendation = "three_stars"
+        reason = (
+            "All published precision tiers fit fully within the detected runtime memory "
+            "budget."
+        )
+    elif fit_count * 2 > total:
+        status = "recommended"
+        recommendation = "two_stars"
+        reason = (
+            "More than half of the published precision tiers fit fully within the "
+            "detected runtime memory budget."
+        )
+    elif fit_count > 0:
+        status = "recommended"
+        recommendation = "one_star"
+        reason = (
+            "At most half of the published precision tiers fit fully within the detected "
+            "runtime memory budget."
+        )
+    elif capacity * 10 >= smallest * 7:
+        status = "warning"
+        recommendation = "caution"
+        reason = (
+            "The detected runtime memory budget covers at least 70% of the full-residency "
+            "requirement for the smallest published precision tier."
+        )
+    else:
+        status = "warning"
+        recommendation = "not_recommended"
+        reason = (
+            "The detected runtime memory budget is below 70% of the full-residency "
+            "requirement for the smallest published precision tier."
+        )
+    return ModelConfigurationStatus(
+        status=status,
+        recommendation=recommendation,
+        required_memory_bytes=smallest,
+        available_memory_bytes=capacity,
+        reasons=[reason],
     )
 
 
@@ -516,38 +592,12 @@ class HubCatalog:
             for index, source in enumerate(spec.sources)
         ]
         selected_source = sources[selected_index]
-        minimum = spec.minimum_memory_gib * _GIB
-        recommended = spec.recommended_memory_gib * _GIB
         variants = []
         if source_info is not None:
-            for variant in _model_variants(
+            variants = _model_variants(
                 source_info.files, profile, runtime_compatible=True
-            ):
-                if spec.supports_ssd_streaming:
-                    variant = variant.model_copy(
-                        update={
-                            "configuration": _configuration_status(
-                                variant.byte_size,
-                                profile,
-                                minimum_memory_bytes=minimum,
-                                recommended_memory_bytes=recommended,
-                            )
-                        }
-                    )
-                variants.append(variant)
-        if variants and not spec.supports_ssd_streaming:
-            smallest = min(variants, key=lambda item: (item.byte_size <= 0, item.byte_size))
-            configuration = smallest.configuration.model_copy(deep=True)
-            configuration.reasons.insert(
-                0, "At least one published precision tier fits this configuration."
             )
-        else:
-            configuration = _configuration_status(
-                min((item.byte_size for item in variants if item.byte_size > 0), default=0),
-                profile,
-                minimum_memory_bytes=minimum,
-                recommended_memory_bytes=recommended,
-            )
+        configuration = _model_configuration_status(variants, profile)
         if source_info is None:
             configuration.reasons.append(
                 "The catalog is available offline; repository metadata could not be refreshed."
