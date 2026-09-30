@@ -15,8 +15,9 @@ matrix products (including zero contraction and CUDA Graph capture), small-K
 selection with stable ties, and tiled grouped-query attention. The attention
 path bounds score storage to 128 query rows and shares the K/V head storage.
 
-`mfq-packed-prefill-test` compares heterogeneous NINT, FP8-SQ and chunked GDN
-against the existing implementations, and prints timings for retained shapes.
+`mfq-packed-prefill-test` checks FP8-SQ CPU decoding and packed slicing,
+compares MXFP4-SQ Tensor Core execution with the direct packed kernel, and
+checks native TopK/graph behavior while printing timings for retained shapes.
 `mfq-mxfp4-sq-test` consumes independently decoded wire fixtures, including
 packed column/row slicing and CPU decoding. Generate them and check SQ linear
 CPU execution and shard composition with:
@@ -37,17 +38,6 @@ The CUDA workflow is manual and requires a dedicated `mfq-cuda` runner and the
 source-contract tests alone do not establish CUDA correctness. The macOS
 workflow also runs Qwen3.5 and MiniCPM-o text-prefill chunking tests.
 
-Experimental prefill alternatives remain explicitly selected:
-
-- `MFQ_NINT_FUSED_PREFILL=1`: packed tile decoding directly into Tensor Core operands.
-- `MFQ_NINT_PANEL_PREFILL=1`: cuBLAS with a reused 2048-row decode panel, bounding
-  temporary weight storage independently of output width.
-- `MFQ_FP8_SQ_FUSED_PREFILL=1`: FP8-SQ packed Tensor Core tiles without a dense weight buffer.
-- `MFQ_GDN_CHUNKED=1`: scalar-gate chunked delta rule with FP32 state and compensated
-  TF32 products. Per-channel KDA retains the recurrent path.
-
-These alternatives passed operator numerical tests but were slower than the
-original paths on the tested RTX 3090 Ti shapes, so they are **off by default**.
 MXFP4-SQ uses Tensor Core tiles by default for `M >= 32` and `M*N >= 131072`,
 where the retained RTX 3090 Ti comparisons showed gains; smaller projections
 keep direct packed execution. `MFQ_FORCE_SQ_TENSOR_CORE=1` tests that kernel on

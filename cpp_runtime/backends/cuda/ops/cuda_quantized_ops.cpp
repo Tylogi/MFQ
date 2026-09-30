@@ -9353,11 +9353,14 @@ mfq_tensor_backend::Tensor nint_matmul(const NintWeight & w, mfq_tensor_backend:
                     x, w.gs, ws.qx, ws.xscale);
             });
         }
-        return g_profiler.measure("nint.prefill", [&]() {
-            return nint_matmul_ws_cuda(
+        auto dense = g_profiler.measure("nint.dequant", [&]() {
+            return nint_decode_cuda(
                 w.q_packed, w.row_q_bits, w.row_q_bit_offsets,
                 w.sub_scale, w.sub_min, w.neuron_scale, w.neuron_min,
-                x, w.gs, {}, {});
+                w.neuron_len, w.gs);
+        });
+        return g_profiler.measure("nint.gemm", [&]() {
+            return mfq_tensor_backend::matmul(x, dense.transpose(0, 1));
         });
     }
     if (g_kl_mmq_mode != KlMmqMode::Default) {

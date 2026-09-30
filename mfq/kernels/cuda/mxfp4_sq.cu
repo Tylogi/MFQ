@@ -5,7 +5,7 @@
 #include <cstdlib>
 
 #include "packed_backward.cuh"
-#include "packed_gemm.cuh"
+#include <mma.h>
 
 namespace {
 
@@ -128,6 +128,60 @@ struct SqPackedDecoder {
     }
 
 };
+
+// Decode each weight tile once for 32 activation rows. No dense weight buffer
+// is allocated. TF32 keeps MXFP4's E8M0 exponent range (including weights
+// outside FP16) using exact TF32 representations of its E2M1 mantissas.
+__global__ void sq_packed_gemm(
+    SqPackedDecoder decode, const __half* input, __half* output,
+    int rows, int outputs, int width) {
+    constexpr int tile_m = 32, tile_n = 64, tile_k = 32, stride = 40;
+    constexpr int warps_n = tile_n / 16, warps = tile_m * tile_n / 256;
+    constexpr int mma_k = 8;
+    using Operand = nvcuda::wmma::precision::tf32;
+    __shared__ __align__(32) float a[tile_m * stride];
+    __shared__ __align__(32) float b[tile_n * stride];
+    __shared__ __align__(32) float result[warps * 256];
+    const int warp = threadIdx.x / 32;
+    const int row_begin = blockIdx.y * tile_m;
+    const int output_begin = blockIdx.x * tile_n;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, mma_k, float> acc;
+    nvcuda::wmma::fill_fragment(acc, 0.0f);
+    for (int begin = 0; begin < width; begin += tile_k) {
+        for (int i = threadIdx.x; i < tile_m * tile_k; i += blockDim.x) {
+            const int m = i / tile_k, k = i % tile_k;
+            const float value = row_begin + m < rows && begin + k < width
+                ? __half2float(input[static_cast<std::size_t>(row_begin + m) * width + begin + k]) : 0.0f;
+            a[m * stride + k] = value;
+        }
+        for (int i = threadIdx.x; i < tile_n * tile_k / 8; i += blockDim.x) {
+            const int n = i / (tile_k / 8), k = (i % (tile_k / 8)) * 8;
+            decode.load8(output_begin + n, begin + k, b + n * stride + k, outputs, width);
+        }
+        __syncthreads();
+        for (int k = 0; k < tile_k; k += mma_k) {
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, mma_k, Operand,
+                nvcuda::wmma::row_major> fa;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, mma_k, Operand,
+                nvcuda::wmma::col_major> fb;
+            nvcuda::wmma::load_matrix_sync(fa, a + (warp / warps_n) * 16 * stride + k, stride);
+            nvcuda::wmma::load_matrix_sync(fb, b + (warp % warps_n) * 16 * stride + k, stride);
+            nvcuda::wmma::mma_sync(acc, fa, fb, acc);
+        }
+        __syncthreads();
+    }
+    nvcuda::wmma::store_matrix_sync(result + warp * 256, acc, 16, nvcuda::wmma::mem_row_major);
+    __syncthreads();
+    for (int i = threadIdx.x; i < tile_m * tile_n; i += blockDim.x) {
+        const int m = i / tile_n, n = i % tile_n;
+        if (row_begin + m < rows && output_begin + n < outputs) {
+            const int owner = (m / 16) * warps_n + n / 16;
+            output[static_cast<std::size_t>(row_begin + m) * outputs + output_begin + n] =
+                __float2half_rn(result[owner * 256 + (m % 16) * 16 + n % 16]);
+        }
+    }
+}
+
 
 template<typename T> __device__ __forceinline__ float as_float(T x) { return float(x); }
 template<> __device__ __forceinline__ float as_float(__half x) { return __half2float(x); }
@@ -570,7 +624,7 @@ mfq_tensor_backend::Tensor mxfp4_sq_matmul_cuda(
         const bool profitable = rows >= 32 && std::int64_t(rows) * outputs >= 131072;
         if (rows > 8 && (profitable || (force_tensor_core != nullptr && force_tensor_core[0] == '1')) &&
             (disable_tensor_core == nullptr || disable_tensor_core[0] != '1')) {
-            mfq::packed::gemm_nt<SqPackedDecoder, true, 32, 64, true>
+            sq_packed_gemm
                 <<<dim3((q.outputs + 63) / 64, (rows + 31) / 32), 256, 0, stream>>>(
                     {data, q_data, symbol_offsets, auxiliary, q}, x, y, rows, q.outputs, q.width);
         } else {

@@ -52,85 +52,9 @@ template <typename F> float milliseconds(F run) {
     cudaEventDestroy(start); cudaEventDestroy(stop);
     return ms / 10;
 }
-void nint(int m, int n, int gs, int groups) {
-    const int width = gs * groups - 1;
-    std::vector<std::uint8_t> bits(n), bytes((std::size_t(n) * gs * groups * 8 + 7) / 8 + 8, 0);
-    std::vector<std::int64_t> offsets(n);
-    std::uint64_t position = 0;
-    for (int row = 0; row < n; ++row) {
-        const int q = bits[row] = 1 + row % 8;
-        offsets[row] = position;
-        for (int k = 0; k < gs * groups; ++k) {
-            const unsigned code = (k * 31 + row * 17) & ((1 << q) - 1);
-            for (int j = 0; j < q; ++j, ++position) bytes[position / 8] |= ((code >> j) & 1) << (position % 8);
-        }
-    }
-    auto packed = tensor(bytes).to(gpu), q = tensor(bits).to(gpu), off = tensor(offsets).to(gpu);
-    auto sub = ones({n, groups}, TensorOptions{}.device(gpu).dtype(kUInt8));
-    auto ns = full({n}, 0.001, TensorOptions{}.device(gpu).dtype(kFloat32));
-    auto nm = ns * 7.0;
-    auto x = pattern({m, width}, 0.5f).to(kFloat16);
-    auto run = [&] { return nint_matmul_ws_cuda(packed, q, off, sub, sub, ns, nm, x, gs, {}, {}); };
-    auto reference = [&] { return matmul(x, nint_decode_cuda(packed, q, off, sub, sub, ns, nm, width, gs).transpose(0, 1)); };
-    close(run(), reference(), 0.002f, 0.002f);
-    environment("MFQ_NINT_PANEL_PREFILL", "1");
-    close(run(), reference(), 0.002f, 0.002f);
-    const float panel_ms = n >= 512 ? milliseconds(run) : 0;
-    environment("MFQ_NINT_FUSED_PREFILL", "1");
-    close(run(), reference(), 0.002f, 0.002f);
-    if (n >= 512) std::cout << "NINT M=" << m << " N=" << n << " K=" << width
-        << " packed_ms=" << milliseconds(run) << " panel_ms=" << panel_ms
-        << " decode_gemm_ms=" << milliseconds(reference) << '\n';
-    environment("MFQ_NINT_FUSED_PREFILL", "0");
-    environment("MFQ_NINT_PANEL_PREFILL", "0");
-}
-void gdn(int d, int t, bool transpose, bool tiled, bool initial, bool benchmark = false) {
-    const int hq = benchmark ? 8 : 2, hv = benchmark ? 16 : 4;
-    auto q = pattern({1, hq, t, d}, 0.07f);
-    auto k = pattern({1, hq, t, d}, 0.09f, 13);
-    auto v = pattern({1, hv, t, d}, 0.25f, 7);
-    auto g = pattern({1, hv, t}, 0.025f) - 0.05;
-    auto beta = pattern({1, hv, t}, 0.2f) + 0.5;
-    auto state = initial ? pattern({1, hv, d, d}, 0.025f) : zeros({1, hv, d, d}, q.options());
-    if (transpose) state = state.transpose(-2, -1).contiguous();
-    auto run = [&] {
-        auto local = state.clone();
-        if (transpose) return tiled ? gdn_inplace_transposed_tiled_cuda(q,k,v,g,beta,local)
-            : gdn_inplace_transposed_cuda(q,k,v,g,beta,local);
-        return tiled ? gdn_inplace_tiled_cuda(q,k,v,g,beta,local) : gdn_inplace_cuda(q,k,v,g,beta,local);
-    };
-    environment("MFQ_GDN_CHUNKED", "0");
-    const auto reference = run();
-    const float baseline_ms = benchmark ? milliseconds(run) : 0;
-    environment("MFQ_GDN_CHUNKED", "1");
-    const auto result = run();
-    close(result[0], reference[0], 2e-5f, 2e-4f);
-    close(result[1], reference[1], 2e-5f, 2e-4f);
-    if (d == 128 && !benchmark && initial && transpose && !tiled && default_context(0)->supports_async_allocations()) {
-        auto stream = stream_from_pool(false, 0);
-        StreamGuard guard(stream);
-        Graph graph;
-        std::vector<Tensor> captured;
-        graph.prepare_memory();
-        captured = run();
-        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
-        captured.clear();
-        graph.capture_begin();
-        captured = run();
-        graph.capture_end();
-        graph.replay(); graph.replay();
-        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
-        close(captured[0], reference[0], 2e-5f, 2e-4f);
-        close(captured[1], reference[1], 2e-5f, 2e-4f);
-    }
-    if (benchmark) std::cout << "GDN T=" << t << " D=" << d << " chunk_ms=" << milliseconds(run)
-        << " recurrent_ms=" << baseline_ms << '\n';
-}
-
-void fp8(bool mx, bool benchmark = false) {
-    environment("MFQ_FP8_SQ_FUSED_PREFILL", "1");
+void fp8(bool mx) {
     const std::string dtype = mx ? "MXFP8-SQ" : "FP8-128SQ";
-    const int n = benchmark ? 4096 : mx ? 17 : 257, k = benchmark ? 4096 : mx ? 96 : 257;
+    const int n = mx ? 17 : 257, k = mx ? 96 : 257;
     const int br = mx ? 1 : 128, bc = mx ? 32 : 128;
     const auto q_bytes = (mfq::fp8sq::packed_nbytes(n, 3) + 3) & ~std::size_t{3};
     const auto palettes = 44 + q_bytes, symbols = palettes + 256;
@@ -167,7 +91,7 @@ void fp8(bool mx, bool benchmark = false) {
         if (mx) raw[scales + i] = 120 + i % 3;
         else { raw[scales + 2 * i] = 128; raw[scales + 2 * i + 1] = 60; }
     }
-    const auto decode = [&](const std::vector<std::uint8_t>& bytes, bool run_matmul) {
+    const auto decode = [&](const std::vector<std::uint8_t>& bytes) {
         const auto layout = mfq::fp8sq::parse(dtype, bytes.data(), bytes.size());
         const auto metadata = mfq::fp8sq::row_metadata(bytes.data(), layout);
         auto blob = tensor(bytes).to(gpu), q = tensor(metadata.q).to(gpu);
@@ -177,29 +101,15 @@ void fp8(bool mx, bool benchmark = false) {
             layout.scale_rows,layout.scale_columns,layout.palettes,layout.symbols,layout.scales,true)
             : fp8_128_sq_dequant_cuda(blob,q,off,layout.outputs,layout.width,2,layout.palettes,layout.symbols,layout.scales,true);
         auto host = dense.to(kCPU);
-        if (!benchmark) for (int row = 0; row < layout.outputs; ++row) for (int col = 0; col < layout.width; ++col)
+        for (int row = 0; row < layout.outputs; ++row) for (int col = 0; col < layout.width; ++col)
             require(host.data_ptr<float>()[row * layout.width + col] == mfq::fp8sq::decode_cpu(
                 bytes.data(), layout, metadata.q[row], offsets[row], row, col), "FP8 CPU decode differs");
-        if (run_matmul) {
-            auto x = pattern({benchmark ? 128 : 65, layout.width}, 0.5f).to(kFloat16);
-            auto run = [&] { return mx ? mxfp8_sq_matmul_cuda(blob,q,off,x,layout.outputs,layout.width,br,bc,
-                layout.scale_rows,layout.scale_columns,layout.palettes,layout.symbols,layout.scales)
-                : fp8_128_sq_matmul_cuda(blob,q,off,x,layout.outputs,layout.width,2,layout.palettes,layout.symbols,layout.scales); };
-            close(run(), matmul(x, dense.to(kFloat16).transpose(0,1)), 0.02f, 0.002f);
-            if (benchmark) {
-                const float packed=milliseconds(run);
-                environment("MFQ_FP8_SQ_FUSED_PREFILL","0");
-                std::cout << dtype << " M=128 N="<<layout.outputs<<" K="<<layout.width<<" tensor_core_ms="<<packed<<" decode_gemm_ms="<<milliseconds(run)<<'\n';
-                environment("MFQ_FP8_SQ_FUSED_PREFILL","1");
-            }
-        }
         return dense;
     };
-    const auto original = decode(raw, true);
-    if (benchmark) return;
+    const auto original = decode(raw);
     const int row_begin = mx ? 8 : 128, col_begin = mx ? 32 : 128;
     const auto sliced = mfq::fp8sq::slice(dtype, raw, row_begin, n, col_begin, k);
-    close(decode(sliced, true), original.narrow(0, row_begin, n-row_begin).narrow(1,col_begin,k-col_begin), 0, 0);
+    close(decode(sliced), original.narrow(0, row_begin, n-row_begin).narrow(1,col_begin,k-col_begin), 0, 0);
 }
 
 void mxfp4_benchmark(int n, int m = 128) {
@@ -270,19 +180,10 @@ void native_benchmark() {
 int main() try {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
-    for (int gs : {5, 28, 64}) for (int m : {9, 33, 65}) nint(m, 9, gs, 3);
-    nint(128, 512, 32, 32);
-    nint(128, 4096, 32, 128);
-    nint(9, 4096, 32, 128);
-    nint(32, 4096, 32, 128);
-    for (int d : {32, 64, 128}) for (bool transpose : {false, true})
-        for (bool tiled : {false, true}) for (bool initial : {false, true}) gdn(d, 137, transpose, tiled, initial);
-    gdn(128, 2048, true, false, true, true);
     fp8(true); fp8(false);
-    fp8(true,true); fp8(false,true);
     for (int m : {9, 32, 128}) for (int n : {512,1024,2048,4096}) mxfp4_benchmark(n,m);
     native_benchmark();
-    std::cout << "PASS packed prefill and chunked GDN\n";
+    std::cout << "PASS SQ operators and native benchmarks\n";
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

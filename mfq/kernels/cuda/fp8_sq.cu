@@ -7,12 +7,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
-#include <cstdlib>
 #include <type_traits>
 #include <utility>
 
 #include "packed_backward.cuh"
-#include "packed_gemm.cuh"
 
 namespace {
 
@@ -140,25 +138,6 @@ __device__ __forceinline__ float decode_weight(
         blob, row_q, row_symbol_byte_offsets, layout, output, column)) *
         decode_scale<MXFP8>(blob, layout, output, column);
 }
-
-template <bool MXFP8>
-struct Fp8PackedDecoder {
-    const std::uint8_t *blob, *row_q;
-    const std::int32_t* offsets;
-    Layout layout;
-    __device__ void load8(int row, int column, __half* destination, int outputs, int width) const {
-        const float scale = row < outputs && column < width ? decode_scale<MXFP8>(blob, layout, row, column) : 0.0f;
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const float value = row < outputs && column + i < width
-                ? decode_e4m3fn(decode_code(blob, row_q, offsets, layout, row, column + i)) * scale : 0.0f;
-            destination[i] = __float2half_rn(value);
-        }
-    }
-    __device__ float operator()(int row, int column) const {
-        return decode_weight<MXFP8>(blob, row_q, offsets, layout, row, column);
-    }
-};
 
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
@@ -645,18 +624,6 @@ mfq_tensor_backend::Tensor matmul(
     const int rows = static_cast<int>(input.size(0));
     if (rows == 0) return output;
     const auto stream = mfq_current_cuda_stream();
-    const char* fused_prefill = std::getenv("MFQ_FP8_SQ_FUSED_PREFILL");
-    if (rows > kDirectPackedMaxRows && input.scalar_type() == mfq_tensor_backend::kFloat16 &&
-        (fused_prefill != nullptr && fused_prefill[0] == '1')) {
-        mfq::packed::gemm_nt<Fp8PackedDecoder<MXFP8>, false, 32, 64, true>
-            <<<dim3((layout.outputs + 63) / 64, (rows + 31) / 32), 256, 0, stream>>>(
-                {blob.data_ptr<std::uint8_t>(), row_q.data_ptr<std::uint8_t>(),
-                 row_symbol_byte_offsets.data_ptr<std::int32_t>(), layout},
-                reinterpret_cast<const __half*>(input.data_ptr<mfq_half>()),
-                reinterpret_cast<__half*>(output.data_ptr<mfq_half>()), rows, layout.outputs, layout.width);
-        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
-        return output;
-    }
     if (rows > kDirectPackedMaxRows) {
         // The decoded matrix is a transient workspace owned by this call.  It
         // is never cached or attached to the packed weight.

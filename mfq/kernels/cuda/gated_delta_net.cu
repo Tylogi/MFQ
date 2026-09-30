@@ -12,7 +12,6 @@
 #include <cstdlib>
 
 #include "reduce.cuh"
-#include "gdn_chunked.cuh"
 
 template <int D>
 __global__ void gdn_kernel(
@@ -363,14 +362,6 @@ static std::vector<mfq_tensor_backend::Tensor> gdn_cuda_impl(
     float* sod = s_out.data_ptr<float>();
     cudaStream_t stream = mfq_current_cuda_stream();
     int shmem = D * D * (int)sizeof(float);
-
-    const char* chunk_enabled = std::getenv("MFQ_GDN_CHUNKED");
-    if (!kda && T >= 128 && (D == 32 || D == 64 || D == 128) &&
-        chunk_enabled != nullptr && chunk_enabled[0] == '1') {
-        mfq::gdn_chunked::run(qd, kd, vd, gd, bd, sd, od, sod,
-            B, Hq, Hv, T, D, transposed_state, tiled_heads, opts, stream);
-        return {out, s_out};
-    }
 
     const char* col_env = std::getenv("MFQ_GDN_COLUMN");
     const char* warp_env = std::getenv("MFQ_GDN_WARP");
