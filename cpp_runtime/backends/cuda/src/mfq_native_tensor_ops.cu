@@ -752,7 +752,78 @@ void launch_row_softmax(
 }
 
 bool matrix_layout_supported(const Tensor& tensor) {
-    return tensor.stride(-1) == 1 || tensor.stride(-2) == 1;
+    return (tensor.stride(-1) == 1 &&
+            (tensor.size(-2) <= 1 || tensor.stride(-2) >= tensor.size(-1))) ||
+        (tensor.stride(-2) == 1 &&
+            (tensor.size(-1) <= 1 || tensor.stride(-1) >= tensor.size(-2)));
+}
+
+template <bool Descending, int Items>
+__global__ void topk_tile_kernel(
+    const float* source, const std::int64_t* source_indices,
+    float* output, std::int64_t* output_indices,
+    std::int64_t rows, std::int64_t columns, int count) {
+    constexpr int threads = 256, items = Items, tile = threads * items;
+    using Sort = cub::BlockRadixSort<float, threads, items, std::int64_t>;
+    extern __shared__ __align__(16) unsigned char temporary[];
+    auto& storage = *reinterpret_cast<typename Sort::TempStorage*>(temporary);
+    const auto tiles = (columns + tile - 1) / tile;
+    for (std::int64_t task = blockIdx.x; task < rows * tiles; task += gridDim.x) {
+        const auto row = task / tiles;
+        const auto begin = (task % tiles) * tile;
+        float keys[items];
+        std::int64_t indices[items];
+#pragma unroll
+        for (int i = 0; i < items; ++i) {
+            const auto column = begin + threadIdx.x * items + i;
+            // Extremal radix keys include signed NaNs, unlike +/- infinity.
+            keys[i] = column < columns ? source[row * columns + column]
+                : __uint_as_float(Descending ? 0xffffffffu : 0x7fffffffu);
+            indices[i] = column < columns
+                ? (source_indices ? source_indices[row * columns + column] : column)
+                : std::numeric_limits<std::int64_t>::max();
+        }
+        if constexpr (Descending) Sort(storage).SortDescending(keys, indices);
+        else Sort(storage).Sort(keys, indices);
+#pragma unroll
+        for (int i = 0; i < items; ++i) {
+            const int rank = threadIdx.x * items + i;
+            if (rank < count) {
+                output[task * count + rank] = keys[i];
+                output_indices[task * count + rank] = indices[i];
+            }
+        }
+        __syncthreads();
+    }
+}
+
+int matrix_leading_dimension(const Tensor& tensor, bool row_major) {
+    const auto minimum = std::max<std::int64_t>(1, tensor.size(row_major ? -1 : -2));
+    const auto leading = tensor.size(row_major ? -2 : -1) <= 1
+        ? minimum : tensor.stride(row_major ? -2 : -1);
+    if (leading > std::numeric_limits<int>::max()) {
+        throw std::overflow_error("matmul stride exceeds cuBLAS integer ABI");
+    }
+    return static_cast<int>(leading);
+}
+
+// Flatten only batches whose addresses form an arithmetic progression. Mixed
+// broadcasting (e.g. [B,1] by [1,H]) keeps the general per-batch path.
+std::optional<std::int64_t> regular_batch_stride(
+    const Tensor& tensor, const std::vector<std::int64_t>& batch_shape) {
+    std::optional<std::int64_t> step;
+    std::int64_t extent = 1;
+    const auto padding = static_cast<std::int64_t>(batch_shape.size()) - tensor.dim() + 2;
+    for (auto axis = static_cast<std::int64_t>(batch_shape.size()); axis-- > 0;) {
+        if (batch_shape[axis] <= 1) continue;
+        const auto source_axis = axis - padding;
+        const auto stride = source_axis < 0 || tensor.size(source_axis) == 1
+            ? 0 : tensor.stride(source_axis);
+        if (!step) step = stride;
+        if (stride != *step * extent) return std::nullopt;
+        extent *= batch_shape[axis];
+    }
+    return step.value_or(0);
 }
 
 struct ParallelBatchMatmulContext {
@@ -2345,8 +2416,38 @@ Tensor matmul(const Tensor& left_source, const Tensor& right_source) {
         contraction > std::numeric_limits<int>::max()) {
         throw std::overflow_error("matmul dimension exceeds cuBLAS integer ABI");
     }
-    const int left_leading = static_cast<int>(left_row_major ? contraction : rows);
-    const int right_leading = static_cast<int>(right_row_major ? columns : contraction);
+    const int left_leading = matrix_leading_dimension(left, left_row_major);
+    const int right_leading = matrix_leading_dimension(right, right_row_major);
+
+    if (contraction == 0) {
+        output.zero_();
+        if (left_vector) output = output.squeeze(-2);
+        if (right_vector) output = output.squeeze(-1);
+        return output;
+    }
+    const auto left_batch_stride = regular_batch_stride(left, batch_shape);
+    const auto right_batch_stride = regular_batch_stride(right, batch_shape);
+    const char* strided_disabled = std::getenv("MFQ_DISABLE_NATIVE_STRIDED_BATCH_MATMUL");
+    if (batches > 1 && batches <= std::numeric_limits<int>::max() &&
+        left_batch_stride && right_batch_stride &&
+        (strided_disabled == nullptr || strided_disabled[0] != '1')) {
+        const float alpha = 1.0f, beta = 0.0f;
+        const double alpha64 = 1.0, beta64 = 0.0;
+        const bool fp64 = left.scalar_type() == kFloat64;
+        MFQ_NATIVE_CUDA_CHECK(cublasGemmStridedBatchedEx(
+            handle, right_operation, left_operation,
+            static_cast<int>(columns), static_cast<int>(rows), static_cast<int>(contraction),
+            fp64 ? static_cast<const void*>(&alpha64) : &alpha,
+            right.data_ptr(), data_type, right_leading, *right_batch_stride,
+            left.data_ptr(), data_type, left_leading, *left_batch_stride,
+            fp64 ? static_cast<const void*>(&beta64) : &beta,
+            output.data_ptr(), data_type, static_cast<int>(columns), rows * columns,
+            static_cast<int>(batches),
+            fp64 ? CUBLAS_COMPUTE_64F : CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        if (left_vector) output = output.squeeze(-2);
+        if (right_vector) output = output.squeeze(-1);
+        return output;
+    }
 
     const char* parallel_batch_disabled =
         std::getenv("MFQ_DISABLE_NATIVE_PARALLEL_BATCH_MATMUL");
@@ -2510,8 +2611,39 @@ Tensor scaled_dot_product_attention(
         value_source.dim() != query_source.dim()) {
         throw std::invalid_argument("attention tensors have incompatible ranks");
     }
+    if (causal && mask.has_value()) {
+        throw std::invalid_argument("attention cannot combine explicit and causal masks");
+    }
+    // Bound score storage to one query tile. Each tile still uses GEMM and the
+    // existing dtype-specific softmax, preserving reduced-precision semantics.
+    const char* tiled_disabled = std::getenv("MFQ_DISABLE_NATIVE_TILED_SDPA");
+    if (query_source.dim() == 4 && query_source.size(-2) > 128 &&
+        key_source.size(0) == query_source.size(0) &&
+        value_source.size(0) == query_source.size(0) &&
+        (tiled_disabled == nullptr || tiled_disabled[0] != '1')) {
+        auto shape = query_source.sizes().vec();
+        shape.back() = value_source.size(-1);
+        auto output = empty(shape, query_source.options());
+        for (std::int64_t begin = 0; begin < query_source.size(-2); begin += 128) {
+            const auto length = std::min<std::int64_t>(128, query_source.size(-2) - begin);
+            std::optional<Tensor> local_mask = mask;
+            if (causal) {
+                const auto indices = TensorOptions{}.dtype(kInt64).device(query_source.device());
+                local_mask = arange(key_source.size(-2), indices).unsqueeze(0) <=
+                    (arange(length, indices) + begin).unsqueeze(-1);
+            } else if (mask && mask->dim() >= 2 && mask->size(-2) > 1) {
+                local_mask = mask->narrow(-2, begin, length);
+            }
+            output.narrow(-2, begin, length).copy_(scaled_dot_product_attention(
+                query_source.narrow(-2, begin, length), key_source, value_source,
+                local_mask, dropout, false, scale, enable_grouped_query_attention));
+        }
+        return output;
+    }
+    auto query = query_source;
     auto key = key_source;
     auto value = value_source;
+    bool grouped_view = false;
     const auto head_dimension = query_source.dim() - 3;
     if (query_source.size(head_dimension) != key.size(head_dimension)) {
         if (!enable_grouped_query_attention ||
@@ -2519,12 +2651,22 @@ Tensor scaled_dot_product_attention(
             throw std::invalid_argument("attention head counts are incompatible");
         }
         const auto repeat = query_source.size(head_dimension) / key.size(head_dimension);
-        key = key.repeat_interleave(repeat, head_dimension).contiguous();
-        value = value.repeat_interleave(repeat, head_dimension).contiguous();
+        if (query_source.dim() == 4 && key.size(1) == value.size(1)) {
+            query = query_source.reshape({query_source.size(0), key.size(1), repeat,
+                query_source.size(2), query_source.size(3)});
+            key = key.unsqueeze(2);
+            value = value.unsqueeze(2);
+            grouped_view = true;
+        } else {
+            key = key.repeat_interleave(repeat, head_dimension).contiguous();
+            value = value.repeat_interleave(repeat, head_dimension).contiguous();
+        }
     }
     const auto factor = scale.value_or(
         1.0 / std::sqrt(static_cast<double>(query_source.size(-1))));
-    auto scores = matmul(query_source, key.transpose(-2, -1));
+    auto scores = matmul(query, key.transpose(-2, -1));
+    if (grouped_view) scores = scores.reshape({scores.size(0), query_source.size(1),
+        query_source.size(-2), key_source.size(-2)});
     const char* fused_causal_scale_disabled =
         std::getenv("MFQ_DISABLE_NATIVE_FUSED_CAUSAL_SCALE");
     const bool fused_causal_scale = causal && !mask.has_value() &&
@@ -2571,6 +2713,12 @@ Tensor scaled_dot_product_attention(
         }
     }
     auto probabilities = softmax(scores, -1).to(value.scalar_type());
+    if (grouped_view) {
+        probabilities = probabilities.reshape({scores.size(0), key.size(1),
+            query.size(2), query_source.size(-2), key_source.size(-2)});
+        return matmul(probabilities, value).reshape({scores.size(0), query_source.size(1),
+            query_source.size(-2), value_source.size(-1)});
+    }
     return matmul(probabilities, value);
 }
 
@@ -2936,6 +3084,9 @@ std::tuple<Tensor, Tensor> sort(
     }
     auto input = input_source.contiguous();
     const auto columns = input.size(-1);
+    if (input.numel() == 0) {
+        return {input.clone(), empty(input.sizes(), input.options().dtype(kInt64))};
+    }
     const auto rows = input.numel() / columns;
     auto keys = floating(input.scalar_type()) && input.scalar_type() != kFloat64
         ? input.to(kFloat32)
@@ -2995,10 +3146,61 @@ std::tuple<Tensor, Tensor> topk(
     std::int64_t dimension,
     bool largest,
     bool) {
-    auto [values, indices] = sort(input, dimension, largest);
-    if (count < 0 || count > values.size(dimension)) {
+    const auto selected = normalize_dimension(dimension, input.dim());
+    if (count < 0 || count > input.size(selected)) {
         throw std::invalid_argument("topk count is out of range");
     }
+    auto shape = input.sizes().vec();
+    shape[selected] = count;
+    if (count == 0 || input.numel() == 0) {
+        return {empty(shape, input.options()), empty(shape, input.options().dtype(kInt64))};
+    }
+    if (input.is_cuda() && selected + 1 == input.dim() &&
+        (count <= 256 || (count <= 2048 && count * 4 <= input.size(-1))) &&
+        (input.scalar_type() == kFloat32 || input.scalar_type() == kFloat16 ||
+         input.scalar_type() == kBFloat16)) {
+        DeviceGuard guard(input.get_device());
+        auto keys = input.to(kFloat32).contiguous();
+        Tensor indices;
+        const auto rows = input.numel() / input.size(-1);
+        auto columns = input.size(-1);
+        const auto stream = current_stream(input.get_device()).stream();
+        do {
+            const int items = count <= 256 ? 4 : count <= 1024 ? 16 : 32;
+            const int tile = 256 * items;
+            const auto tiles = (columns + tile - 1) / tile;
+            auto next_keys = empty({rows, tiles * count}, keys.options());
+            auto next_indices = empty(next_keys.sizes(), keys.options().dtype(kInt64));
+            const int blocks = static_cast<int>(std::min<std::int64_t>(rows * tiles, 65535));
+            const auto launch = [&]<bool Descending, int Items>() {
+                constexpr auto bytes = sizeof(typename cub::BlockRadixSort<float, 256, Items, std::int64_t>::TempStorage);
+                if constexpr (bytes > 49152) {
+                    MFQ_NATIVE_CUDA_CHECK(cudaFuncSetAttribute(topk_tile_kernel<Descending, Items>,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes)));
+                }
+                topk_tile_kernel<Descending, Items><<<blocks, 256, bytes, stream>>>(
+                    keys.data_ptr<float>(), indices.defined() ? indices.data_ptr<std::int64_t>() : nullptr,
+                    next_keys.data_ptr<float>(), next_indices.data_ptr<std::int64_t>(),
+                    rows, columns, static_cast<int>(count));
+            };
+            if (items == 4) {
+                if (largest) launch.template operator()<true, 4>();
+                else launch.template operator()<false, 4>();
+            } else if (items == 16) {
+                if (largest) launch.template operator()<true, 16>();
+                else launch.template operator()<false, 16>();
+            } else {
+                if (largest) launch.template operator()<true, 32>();
+                else launch.template operator()<false, 32>();
+            }
+            MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
+            keys = std::move(next_keys);
+            indices = std::move(next_indices);
+            columns = tiles * count;
+        } while (columns > count);
+        return {keys.to(input.scalar_type()).reshape(shape), indices.reshape(shape)};
+    }
+    auto [values, indices] = sort(input, dimension, largest);
     return {
         values.narrow(dimension, 0, count).contiguous(),
         indices.narrow(dimension, 0, count).contiguous()};
