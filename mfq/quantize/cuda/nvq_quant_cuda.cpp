@@ -1,6 +1,10 @@
 #include <torch/extension.h>
 #include <vector>
 
+torch::Tensor nvq_pack_bits_cuda(torch::Tensor values, int64_t bits);
+torch::Tensor nvq_pack_group64_cuda(torch::Tensor state, torch::Tensor indices,
+                                   torch::Tensor signs, int64_t neuron_len);
+
 std::vector<torch::Tensor> nvq1_l_assign_cuda(
     torch::Tensor xgroup,
     torch::Tensor wgroup,
@@ -18,7 +22,8 @@ std::vector<torch::Tensor> nvq_search_cuda(
     int64_t valid_last,
     int64_t vector_size,
     int64_t search_steps,
-    double qmax);
+    double qmax,
+    int64_t group_chunk);
 torch::Tensor nvq_reassign_cuda(
     torch::Tensor xgroup,
     torch::Tensor wgroup,
@@ -26,7 +31,8 @@ torch::Tensor nvq_reassign_cuda(
     torch::Tensor codebook,
     int64_t groups_per_row,
     int64_t valid_last,
-    int64_t vector_size);
+    int64_t vector_size,
+    int64_t group_chunk);
 std::vector<torch::Tensor> nepq0_s_assign_cuda(
     torch::Tensor value,
     torch::Tensor initial_anchor,
@@ -59,7 +65,8 @@ std::vector<torch::Tensor> nvq2j_assign_cuda(
     torch::Tensor bank_for_state,
     torch::Tensor codebooks,
     int64_t valid_width,
-    int64_t refine_steps);
+    int64_t refine_steps,
+    int64_t group_chunk);
 std::vector<torch::Tensor> nvq3j_assign_cuda(
     torch::Tensor value,
     torch::Tensor objective_weight,
@@ -68,7 +75,8 @@ std::vector<torch::Tensor> nvq3j_assign_cuda(
     torch::Tensor bank_for_state,
     torch::Tensor codebooks,
     int64_t valid_width,
-    int64_t refine_steps);
+    int64_t refine_steps,
+    int64_t group_chunk);
 std::vector<torch::Tensor> nvq2j_search_banks_cuda(
     torch::Tensor xgroup,
     torch::Tensor wgroup,
@@ -76,7 +84,8 @@ std::vector<torch::Tensor> nvq2j_search_banks_cuda(
     torch::Tensor bank_qmax,
     int64_t groups_per_row,
     int64_t valid_last,
-    int64_t search_steps);
+    int64_t search_steps,
+    int64_t group_chunk);
 std::vector<torch::Tensor> nint_make_qkx3_cuda(
     torch::Tensor x,
     torch::Tensor weight,
@@ -90,12 +99,21 @@ std::vector<torch::Tensor> nint_make_qp_cuda(
     int64_t nmax);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    namespace py = pybind11;
+    m.def("nvq_pack_bits", &nvq_pack_bits_cuda, "Pack validated NVQ streams (CUDA)");
+    m.def("nvq_pack_group64", &nvq_pack_group64_cuda, "Pack validated NVQ2J-XL (CUDA)");
     m.def(
         "nvq1_l_assign",
         &nvq1_l_assign_cuda,
         "Exact NVQ1-L fixed-anchor group assignment (CUDA)");
-    m.def("nvq_search", &nvq_search_cuda, "NVQ floating group-scale search (CUDA)");
-    m.def("nvq_reassign", &nvq_reassign_cuda, "NVQ fixed-scale code assignment (CUDA)");
+    m.def("nvq_search", &nvq_search_cuda, "NVQ floating group-scale search (CUDA)",
+          py::arg("xgroup"), py::arg("wgroup"), py::arg("codebook"),
+          py::arg("groups_per_row"), py::arg("valid_last"), py::arg("vector_size"),
+          py::arg("search_steps"), py::arg("qmax"), py::arg("group_chunk") = 4096);
+    m.def("nvq_reassign", &nvq_reassign_cuda, "NVQ fixed-scale code assignment (CUDA)",
+          py::arg("xgroup"), py::arg("wgroup"), py::arg("scale"), py::arg("codebook"),
+          py::arg("groups_per_row"), py::arg("valid_last"), py::arg("vector_size"),
+          py::arg("group_chunk") = 4096);
     m.def(
         "nepq0_s_assign",
         &nepq0_s_assign_cuda,
@@ -111,15 +129,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
         "nvq2j_assign",
         &nvq2j_assign_cuda,
-        "NVQ2J fixed-table assignment and anchor refit (CUDA)");
+        "NVQ2J fixed-table assignment and anchor refit (CUDA)",
+        py::arg("value"), py::arg("objective_weight"), py::arg("initial_anchor"),
+        py::arg("scale_lut"), py::arg("bank_for_state"), py::arg("codebooks"),
+        py::arg("valid_width"), py::arg("refine_steps"), py::arg("group_chunk") = 4096);
     m.def(
         "nvq3j_assign",
         &nvq3j_assign_cuda,
-        "NVQ3J fixed-table assignment and anchor refit (CUDA)");
+        "NVQ3J fixed-table assignment and anchor refit (CUDA)",
+        py::arg("value"), py::arg("objective_weight"), py::arg("initial_anchor"),
+        py::arg("scale_lut"), py::arg("bank_for_state"), py::arg("codebooks"),
+        py::arg("valid_width"), py::arg("refine_steps"), py::arg("group_chunk") = 4096);
     m.def(
         "nvq2j_search_banks",
         &nvq2j_search_banks_cuda,
-        "NVQ2J fused four-bank floating-scale search (CUDA)");
+        "NVQ2J fused four-bank floating-scale search (CUDA)",
+        py::arg("xgroup"), py::arg("wgroup"), py::arg("codebooks"),
+        py::arg("bank_qmax"), py::arg("groups_per_row"), py::arg("valid_last"),
+        py::arg("search_steps"), py::arg("group_chunk") = 4096);
     m.def(
         "nint_make_qkx3",
         &nint_make_qkx3_cuda,

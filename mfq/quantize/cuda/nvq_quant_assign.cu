@@ -2,6 +2,7 @@
 #include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
+#include "nvq_chunk.h"
 
 #include <cfloat>
 #include <cstdint>
@@ -516,7 +517,7 @@ void check_nvq_inputs(
 
 }  // namespace
 
-std::vector<torch::Tensor> nvq_search_cuda(
+static std::vector<torch::Tensor> nvq_search_part(
     torch::Tensor xgroup,
     torch::Tensor wgroup,
     torch::Tensor codebook,
@@ -605,7 +606,7 @@ std::vector<torch::Tensor> nvq_search_cuda(
     return {scales, indices};
 }
 
-torch::Tensor nvq_reassign_cuda(
+static torch::Tensor nvq_reassign_part(
     torch::Tensor xgroup,
     torch::Tensor wgroup,
     torch::Tensor scale,
@@ -683,4 +684,29 @@ torch::Tensor nvq_reassign_cuda(
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return indices;
+}
+
+std::vector<torch::Tensor> nvq_search_cuda(
+    torch::Tensor xgroup, torch::Tensor wgroup, torch::Tensor codebook,
+    int64_t groups_per_row, int64_t valid_last, int64_t vector_size,
+    int64_t search_steps, double qmax, int64_t group_chunk) {
+    const auto step = nvq_group_step(groups_per_row, group_chunk);
+    return nvq_chunked(xgroup.size(0), step, [&](int64_t begin, int64_t length) {
+        return nvq_search_part(xgroup.narrow(0, begin, length),
+            wgroup.narrow(0, begin, length), codebook, groups_per_row,
+            valid_last, vector_size, search_steps, qmax);
+    });
+}
+
+torch::Tensor nvq_reassign_cuda(
+    torch::Tensor xgroup, torch::Tensor wgroup, torch::Tensor scale,
+    torch::Tensor codebook, int64_t groups_per_row, int64_t valid_last,
+    int64_t vector_size, int64_t group_chunk) {
+    const auto step = nvq_group_step(groups_per_row, group_chunk);
+    return nvq_chunked(xgroup.size(0), step, [&](int64_t begin, int64_t length) {
+        return std::vector<torch::Tensor>{nvq_reassign_part(
+            xgroup.narrow(0, begin, length), wgroup.narrow(0, begin, length),
+            scale.narrow(0, begin, length), codebook, groups_per_row,
+            valid_last, vector_size)};
+    })[0];
 }

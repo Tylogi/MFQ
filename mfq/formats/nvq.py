@@ -662,6 +662,7 @@ def pack_jsc_group64(
     signs: np.ndarray,
     *,
     neuron_len: int,
+    device: str | None = None,
 ) -> bytes:
     """Pack NVQ2J-XL state, index, and sign rows as aligned 64-bit groups."""
 
@@ -688,6 +689,10 @@ def pack_jsc_group64(
             or np.any(values > maximum)
         ):
             raise ValueError(f"group64 {label} values must be integers in [0,{maximum}]")
+    if device is not None and str(device).startswith("cuda"):
+        from mfq.quantize.cuda.nvq_pack import pack_group64
+
+        return pack_group64(state_values, index_values, sign_values, neuron_len, device)
     states = state_values.astype(np.uint64, copy=False)
     indices = index_values.astype(np.uint64, copy=False)
     signs = sign_values.astype(np.uint8, copy=False)
@@ -709,12 +714,13 @@ def pack_jsc_group64(
     return np.ascontiguousarray(records, dtype="<u8").tobytes()
 
 
-def _pack_jsc_group64(tensor: NvqJscTensor) -> bytes:
+def _pack_jsc_group64(tensor: NvqJscTensor, *, device: str | None = None) -> bytes:
     return pack_jsc_group64(
         tensor.state,
         tensor.indices,
         tensor.signs,
         neuron_len=tensor.neuron_len,
+        device=device,
     )
 
 
@@ -751,7 +757,7 @@ def _unpack_jsc_group64(
     return state, indices[:, :vectors], signs[:, :vectors], off + nbytes
 
 
-def _pack_bits(values: np.ndarray, bits: int) -> bytes:
+def _pack_bits(values: np.ndarray, bits: int, *, device: str | None = None) -> bytes:
     arr = np.ascontiguousarray(values).reshape(-1)
     if bits == 8:
         return arr.astype(np.uint8, copy=False).tobytes()
@@ -760,6 +766,10 @@ def _pack_bits(values: np.ndarray, bits: int) -> bytes:
     u = arr.astype(np.uint16, copy=False)
     if np.any(u > (1 << bits) - 1):
         raise ValueError(f"value exceeds {bits}-bit packed width")
+    if device is not None and str(device).startswith("cuda"):
+        from mfq.quantize.cuda.nvq_pack import pack_bits
+
+        return pack_bits(u, bits, device)
     shifts = np.arange(bits, dtype=np.uint16)
     stream = ((u[:, None] >> shifts[None, :]) & 1).astype(np.uint8)
     return np.packbits(stream.reshape(-1), bitorder="little").tobytes()
@@ -803,11 +813,11 @@ def _nonnegative_f16_anchors(value: np.ndarray, label: str) -> np.ndarray:
     return anchors
 
 
-def pack_nvq(tensor: NvqTensor | NvqJscTensor) -> bytes:
-    """Serialize NVQ metadata and all bit-packed streams."""
+def pack_nvq(tensor: NvqTensor | NvqJscTensor, *, device: str | None = None) -> bytes:
+    """Serialize NVQ streams, optionally packing on an explicitly selected CUDA device."""
 
     if isinstance(tensor, NvqJscTensor):
-        return pack_nvq_jsc(tensor)
+        return pack_nvq_jsc(tensor, device=device)
 
     spec = tensor.spec
     out = tensor.neuron_scale.size
@@ -841,14 +851,14 @@ def pack_nvq(tensor: NvqTensor | NvqJscTensor) -> bytes:
         struct.pack("<I", out),
         custom_codebook,
         anchors.tobytes(),
-        _pack_bits(tensor.sub_scale, spec.sub_bits),
-        _pack_bits(tensor.indices, spec.index_bits),
-        _pack_bits(tensor.signs, 7),
+        _pack_bits(tensor.sub_scale, spec.sub_bits, device=device),
+        _pack_bits(tensor.indices, spec.index_bits, device=device),
+        _pack_bits(tensor.signs, 7, device=device),
     ]
     return b"".join(parts)
 
 
-def pack_nvq_jsc(tensor: NvqJscTensor) -> bytes:
+def pack_nvq_jsc(tensor: NvqJscTensor, *, device: str | None = None) -> bytes:
     """Serialize the production NVQ-JSC profile."""
 
     out = int(np.asarray(tensor.neuron_scale).size)
@@ -891,12 +901,12 @@ def pack_nvq_jsc(tensor: NvqJscTensor) -> bytes:
     anchors = _nonnegative_f16_anchors(tensor.neuron_scale, "NVQ-JSC")
     storage_layout = _resolve_jsc_storage_layout(tensor)
     if storage_layout == _JSC_GROUP64_LAYOUT_NAME:
-        packed_streams = [_pack_jsc_group64(tensor)]
+        packed_streams = [_pack_jsc_group64(tensor, device=device)]
     else:
         packed_streams = [
-            _pack_bits(state, 4),
-            _pack_bits(indices, spec.index_bits),
-            _pack_bits(signs, 7),
+            _pack_bits(state, 4, device=device),
+            _pack_bits(indices, spec.index_bits, device=device),
+            _pack_bits(signs, 7, device=device),
         ]
 
     return b"".join(
