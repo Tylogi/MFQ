@@ -1074,8 +1074,11 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         "engine/mtp.cpp",
         "storage/moe_expert_cache.cpp",
         "models/components.cpp",
+        "diagnostics/attention_checks.cpp",
         "diagnostics/backend_checks.cpp",
-        "diagnostics/model_checks.cpp",
+        "diagnostics/linear_checks.cpp",
+        "diagnostics/moe_checks.cpp",
+        "diagnostics/session_checks.cpp",
         "eval/kl.cpp",
     )
     for relative in required:

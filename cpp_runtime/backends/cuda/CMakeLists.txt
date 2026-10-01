@@ -391,9 +391,12 @@ target_compile_definitions(mfq-cuda-eval PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMIN
 target_link_libraries(mfq-cuda-eval PUBLIC mfq-cuda-runtime)
 
 add_library(mfq-cuda-diagnostics STATIC
+    ${MFQ_CUDA_ROOT}/diagnostics/attention_checks.cpp
     ${MFQ_CUDA_ROOT}/diagnostics/backend_checks.cpp
-    ${MFQ_CUDA_ROOT}/diagnostics/model_checks.cpp
+    ${MFQ_CUDA_ROOT}/diagnostics/linear_checks.cpp
+    ${MFQ_CUDA_ROOT}/diagnostics/moe_checks.cpp
     ${MFQ_CUDA_ROOT}/diagnostics/runtime_checks.cpp
+    ${MFQ_CUDA_ROOT}/diagnostics/session_checks.cpp
 )
 mfq_configure_cuda_runtime_target(mfq-cuda-diagnostics)
 target_include_directories(mfq-cuda-diagnostics PRIVATE ${MFQ_CUDA_ROOT}/storage)
