@@ -7,8 +7,11 @@
 #include <ostream>
 
 class MoeExpertCache;
+struct CudaExecutionConfig;
 
-std::shared_ptr<MoeExpertCache> make_moe_expert_cache(std::int64_t bytes);
+std::shared_ptr<MoeExpertCache> make_moe_expert_cache(
+    std::int64_t bytes,
+    const CudaExecutionConfig& config);
 bool moe_expert_cache_has_sources(
     const std::shared_ptr<MoeExpertCache>& cache);
 bool moe_expert_cache_finalized(

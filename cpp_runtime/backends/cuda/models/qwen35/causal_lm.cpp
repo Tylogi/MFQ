@@ -153,7 +153,7 @@ std::unique_ptr<::Block> load_block(
         const std::string value_name = ap + "value.weight";
         const bool mirror_kv =
             config.attention_output_gate &&
-            tensor_parallel_mirror_qwen35_attention_kv_enabled() &&
+            execution.config.tensor_parallel_mirror_qwen35_attention_kv &&
             is_quant_dtype(require_tensor(source, key_name).dtype) &&
             is_quant_dtype(require_tensor(source, value_name).dtype);
         if (mirror_kv) {
@@ -205,7 +205,7 @@ std::unique_ptr<::Block> load_block(
                 b->ab_is_nint = a_nint;
                 if (b->ab_is_nint) {
                     const auto scalar_axis =
-                        tensor_parallel_mirror_linear_attention_scalars_enabled()
+                        execution.config.tensor_parallel_mirror_linear_attention_scalars
                             ? std::optional<TensorParallelAxis>(
                                 TensorParallelAxis::Mirrored)
                             : std::nullopt;

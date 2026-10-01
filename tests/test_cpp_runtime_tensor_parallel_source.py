@@ -77,7 +77,8 @@ def test_tensor_parallel_graph_capture_registers_all_participant_streams():
     assert '"MFQ_EP_CUDA_GRAPH"' in SOURCE
     assert "model_parallel_cuda_graph_enabled(" in SOURCE
     assert "execution.model_parallel_collectives" in SOURCE
-    assert "environment == nullptr || environment[0] != '0'" in SOURCE
+    assert "execution.config.tensor_parallel_cuda_graph" in SOURCE
+    assert "execution.config.expert_parallel_cuda_graph" in SOURCE
     assert "graph_participant_streams" in SOURCE
     assert "collectives.streams.begin()" in SOURCE
     assert "graph.compute_streams" in SOURCE
@@ -110,8 +111,7 @@ def test_expert_parallel_graph_uses_capture_safe_peer_transfers():
 def test_two_rank_fp16_reduce_avoids_round_trip_casts():
     assert '"MFQ_MODEL_PARALLEL_FP16_REDUCE"' in SOURCE
     assert '"MFQ_TP_FP16_REDUCE"' in SOURCE
-    assert "model_parallel_fp16_reduce_enabled()" in SOURCE
-    assert "environment == nullptr || std::atoi(environment) != 0" in SOURCE
+    assert "execution.config.model_parallel_fp16_reduce" in SOURCE
     assert "outputs.size() == 2" in SOURCE
     assert "output_dtype == mfq_tensor_backend::kFloat16" in SOURCE
     assert "fp16_reduce ? ncclFloat16 : ncclFloat32" in SOURCE
@@ -119,8 +119,8 @@ def test_two_rank_fp16_reduce_avoids_round_trip_casts():
 
 
 def test_tensor_parallel_projection_groups_share_each_rank_input_transfer():
-    assert 'std::getenv(\n        "MFQ_TP_GROUPED_PROJECTIONS")' in SOURCE
-    assert "environment == nullptr || std::atoi(environment) != 0" in SOURCE
+    assert '"MFQ_TP_GROUPED_PROJECTIONS"' in SOURCE
+    assert "execution.config.tensor_parallel_grouped_projections" in SOURCE
     assert "tensor_parallel_output_compatible()" in SOURCE
     assert "forward_tensor_parallel_output_group(execution, x)" in SOURCE
     assert "auto local_x = tensor_to_cuda_device(execution, flat, device);" in SOURCE
@@ -138,7 +138,7 @@ def test_tensor_parallel_peer_first_launch_preserves_rank_indexing():
     assert '"MFQ_MODEL_PARALLEL_PEER_FIRST_LAUNCH"' in SOURCE
     assert '"MFQ_TP_PEER_FIRST_LAUNCH"' in SOURCE
     assert "model_parallel_launch_index(" in SOURCE
-    assert "environment == nullptr || std::atoi(environment) != 0" in SOURCE
+    assert "config.model_parallel_peer_first_launch" in SOURCE
     assert "peer_first_parallel_launch_index" in SOURCE
     assert "launch_position < primary_rank" in CORE
     assert "local_outputs[index] =" in SOURCE
@@ -183,7 +183,8 @@ def test_generic_ffn_loader_stays_dense_and_model_moe_loaders_are_typed():
 def test_native_float_linears_are_supported_without_forcing_tp_shards():
     assert "QuantLinearKind::Dense" in SOURCE
     assert 'dtype == "BF16" || dtype == "F16" || dtype == "F32"' in SOURCE
-    assert 'std::getenv("MFQ_TP_SHARD_NATIVE_FLOAT")' in SOURCE
+    assert '"MFQ_TP_SHARD_NATIVE_FLOAT"' in SOURCE
+    assert "execution.config.tensor_parallel_shard_native_float" in SOURCE
     assert (
         "result.dense = cpu.to(mfq_tensor_backend::kCUDA).contiguous()" in SOURCE
     )

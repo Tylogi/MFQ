@@ -117,17 +117,10 @@ mfq_tensor_backend::Tensor normalize_hidden(
         const CausalLmMetadata& metadata,
         int64_t batch,
         int64_t tokens,
-        bool bfloat16,
         CudaProfiler& profiler) {
     return profiler.measure("model.output_norm", [&]() {
         auto flat = hidden.reshape(
             {batch * tokens, metadata.hidden_size});
-        if (bfloat16) {
-            return qwen_rms_norm_bf16(
-                flat, output_norm, metadata.rms_norm_eps,
-                metadata.norm_weight_offset)
-                .reshape({batch, tokens, metadata.hidden_size});
-        }
         return qwen_rms_norm(
             flat.to(mfq_tensor_backend::kFloat32), output_norm,
             metadata.rms_norm_eps, metadata.norm_weight_offset)
@@ -249,7 +242,7 @@ mfq_tensor_backend::Tensor CausalLmArchitecture::adapter_finalize_hidden(
         int64_t batch,
         int64_t tokens) const {
     return normalize_hidden(
-        std::move(hidden), output_norm, metadata, batch, tokens, false,
+        std::move(hidden), output_norm, metadata, batch, tokens,
         execution->profiler);
 }
 

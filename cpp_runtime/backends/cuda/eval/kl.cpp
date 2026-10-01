@@ -3,7 +3,7 @@
 #include "models/causal_models.h"
 #include "../models/registry.h"
 #include "quant_linear.h"
-#include "../engine/cuda_execution.h"
+#include "cuda_execution.h"
 #include "models/transformer.h"
 #include "storage/moe_expert_cache.h"
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
@@ -1093,7 +1093,7 @@ int run_kl_eval_streamed(
               << " reference_n_batch=" << reference_contract.n_batch
               << " reference_n_ubatch=" << reference_contract.n_ubatch
               << "\n";
-    write_moe_route_stats(execution.moe_route_stats);
+    write_moe_route_stats(execution.config, execution.moe_route_stats);
     return 0;
 }
 

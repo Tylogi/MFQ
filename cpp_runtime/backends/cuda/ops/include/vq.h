@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cuda_execution.h"
 #include "nint.h"
 
 enum class TensorParallelAxis;
@@ -45,7 +46,7 @@ struct NvqWeight {
     }
 };
 
-bool nvq_fusion_enabled();
+bool nvq_fusion_enabled(const CudaExecutionConfig& config);
 mfq_tensor_backend::Tensor nvq_matmul_multi2(
     CudaProfiler& profiler,
     const NvqWeight& first,
@@ -152,9 +153,17 @@ NvqCpu slice_nvq_cpu(
     const NvqCpu& source, TensorParallelAxis axis, int64_t begin, int64_t end);
 NvqCpu select_nvq_cpu_rows(
     const NvqCpu& source, const std::vector<int64_t>& rows);
-NvqWeight to_device_nvq(const NvqCpu& source, bool cuda);
-NvqWeight to_gpu_nvq(const NvqCpu& source);
-NvqWeight to_cuda_device_nvq(const NvqCpu& source, int device);
+NvqWeight to_device_nvq(
+    const NvqCpu& source,
+    bool cuda,
+    const CudaExecutionConfig& config = {});
+NvqWeight to_gpu_nvq(
+    const NvqCpu& source,
+    const CudaExecutionConfig& config = {});
+NvqWeight to_cuda_device_nvq(
+    const NvqCpu& source,
+    int device,
+    const CudaExecutionConfig& config = {});
 NvqWeight to_cpu_nvq(const NvqCpu& source);
 NepqCpu unpack_nepq(
     const std::vector<uint8_t>& blob,

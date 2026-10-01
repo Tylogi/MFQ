@@ -3,7 +3,7 @@
 #include "models/causal_models.h"
 #include "../models/registry.h"
 #include "quant_linear.h"
-#include "../engine/cuda_execution.h"
+#include "cuda_execution.h"
 #include "models/transformer.h"
 #include "storage/moe_expert_cache.h"
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
@@ -455,7 +455,8 @@ int run_linear_group_check(
               << " mean_ms=" << elapsed_ms / reps << '\n';
     MFQ_RUNTIME_CHECK(actual.size() == names.size(), "linear group output count mismatch");
     std::vector<mfq_tensor_backend::Tensor> graph_actual;
-    if (M == 1 && decode_branch_parallel_enabled(execution.decode_graph_serial_branches, M)) {
+    if (M == 1 && decode_branch_parallel_enabled(
+                    execution.config, execution.decode_graph_serial_branches, M)) {
         mfq_cuda_synchronize();
         const auto graph_stream =
             mfq_get_stream_from_pool(false);
@@ -968,13 +969,10 @@ int run_gemma_geglu_check(
                   << " max_abs=" << (got - ref).abs().max().item<double>() << "\n";
     };
 
-    mfq_set_env("MFQ_NINT_GLU_COMBINED", "1");
     report("activation_combined", fused_activation(), reference_activation);
     report("output_combined", fused(), reference_output);
-    mfq_set_env("MFQ_NINT_GLU_COMBINED", "0");
     report("activation_pair", fused_activation(), reference_activation);
     report("output_pair", fused(), reference_output);
-    mfq_set_env("MFQ_NINT_GLU_COMBINED", "");
 
     auto time_ms = [&](auto && fn) {
         for (int i = 0; i < 10; ++i) (void)fn();
@@ -994,11 +992,8 @@ int run_gemma_geglu_check(
         return elapsed / reps;
     };
     const float materialized_ms = time_ms(materialized);
-    mfq_set_env("MFQ_NINT_GLU_COMBINED", "1");
     const float combined_ms = time_ms(fused);
-    mfq_set_env("MFQ_NINT_GLU_COMBINED", "0");
     const float pair_ms = time_ms(fused);
-    mfq_set_env("MFQ_NINT_GLU_COMBINED", "");
     std::cout << "gemma_geglu_check layer=" << layer
               << " gate_bits=" << gate_up.nint.w.bits
               << " gate_gs=" << gate_up.nint.w.gs

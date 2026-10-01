@@ -2,16 +2,32 @@
 #include "cuda_execution.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <thread>
 #include <utility>
 #include <vector>
 
 int main() {
+#ifdef _WIN32
+    _putenv_s("MFQ_DISABLE_NVQ_FUSION", "1");
+#else
+    setenv("MFQ_DISABLE_NVQ_FUSION", "1", 1);
+#endif
+    const auto disabled_config = load_cuda_execution_config();
+#ifdef _WIN32
+    _putenv_s("MFQ_DISABLE_NVQ_FUSION", "");
+#else
+    unsetenv("MFQ_DISABLE_NVQ_FUSION");
+#endif
+    const auto enabled_config = load_cuda_execution_config();
+    if (disabled_config.nvq_fusion || !enabled_config.nvq_fusion) return 1;
+
     CudaExecutionContext first;
     CudaExecutionContext second;
     first.tensor_parallel.devices = {0, 1};
     second.expert_parallel.devices = {2, 3};
     first.drop_file_cache = true;
+    first.config.nvq_fusion = false;
     second.decode_graph_serial_branches = true;
 
     mfq::cuda::CudaEngine first_engine;
@@ -44,12 +60,14 @@ int main() {
                 context.tensor_parallel.primary_device() == 0 &&
                 !context.expert_parallel.enabled() &&
                 context.kl_mmq_dense_calls == 11 &&
-                context.profiler.stats.at("engine").calls == 3
+                context.profiler.stats.at("engine").calls == 3 &&
+                !context.config.nvq_fusion
             : model_parallel_enabled(context) &&
                 !context.tensor_parallel.enabled() &&
                 moe_parallel_config(context).primary_device() == 2 &&
                 context.kl_mmq_dense_calls == 29 &&
-                context.profiler.stats.at("engine").calls == 7;
+                context.profiler.stats.at("engine").calls == 7 &&
+                context.config.nvq_fusion;
         const auto metrics = engine.runtime_metrics();
         const auto expected = first_context ? 11.0 : 29.0;
         if (!valid || metrics.size() != 1 ||

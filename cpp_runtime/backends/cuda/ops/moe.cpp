@@ -462,11 +462,10 @@ MixedNvqF16FormatGroup mixed_nvq_f16_format_group(int format) {
 }
 
 static void initialize_mixed_nvq_dispatch(
-        MixedMoeRuntime & runtime) {
+        MixedMoeRuntime & runtime,
+        const CudaExecutionConfig& config) {
     runtime.nvq_dispatch.reset();
-    const char * disabled =
-        std::getenv("MFQ_DISABLE_MOE_NVQ_HETERO");
-    if (disabled != nullptr && std::atoi(disabled) != 0) return;
+    if (!config.moe_nvq_heterogeneous) return;
 
     int nvq_pools = 0;
     for (const auto & pool : runtime.pools) {
@@ -661,7 +660,9 @@ int64_t mixed_moe_storage_bytes(const MixedMoeRuntime & runtime) {
 }
 
 std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
-        const MfeCpu & cpu, bool cuda) {
+        const MfeCpu & cpu,
+        bool cuda,
+        const CudaExecutionConfig& config) {
     auto runtime = std::make_shared<MixedMoeRuntime>();
     runtime->n_experts = cpu.n_experts;
     runtime->out_per_expert = cpu.out_per_expert;
@@ -750,13 +751,13 @@ std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
                 throw std::runtime_error("mixed NVQ/NPQ cohort shape mismatch");
             }
             pool.nvq = cuda
-                ? to_gpu_nvq(parsed)
+                ? to_gpu_nvq(parsed, config)
                 : to_cpu_nvq(parsed);
         }
         runtime->pools.push_back(std::move(pool));
     }
     if (cuda) {
-        initialize_mixed_nvq_dispatch(*runtime);
+        initialize_mixed_nvq_dispatch(*runtime, config);
     }
     return runtime;
 }
@@ -802,15 +803,19 @@ static MfeWeight wrap_mixed_moe_runtime(
     return result;
 }
 
-MfeWeight to_gpu_mixed_moe(const MfeCpu & cpu) {
-    return wrap_mixed_moe_runtime(make_mixed_moe_runtime(cpu, true));
+MfeWeight to_gpu_mixed_moe(
+        const MfeCpu & cpu,
+        const CudaExecutionConfig& config) {
+    return wrap_mixed_moe_runtime(
+        make_mixed_moe_runtime(cpu, true, config));
 }
 
 MfeWeight to_cuda_device_moe_expert_slice(
         const MfeCpu & cpu,
         int64_t expert_begin,
         int64_t expert_end,
-        int device) {
+        int device,
+        const CudaExecutionConfig& config) {
     if (expert_begin < 0 || expert_begin >= expert_end ||
             expert_end > cpu.n_experts) {
         throw std::runtime_error(
@@ -922,7 +927,7 @@ MfeWeight to_cuda_device_moe_expert_slice(
             pool.family = MixedMoeFamily::Nvq;
             auto parsed = unpack_nvq(source.payload, source.dtype);
             pool.nvq = to_gpu_nvq(
-                select_nvq_cpu_rows(parsed, rows));
+                select_nvq_cpu_rows(parsed, rows), config);
         }
         runtime->pools.push_back(std::move(pool));
     }
@@ -930,7 +935,7 @@ MfeWeight to_cuda_device_moe_expert_slice(
         throw std::runtime_error(
             "expert-parallel MoE shard has no owned experts");
     }
-    initialize_mixed_nvq_dispatch(*runtime);
+    initialize_mixed_nvq_dispatch(*runtime, config);
     return wrap_mixed_moe_runtime(runtime);
 }
 
@@ -1030,7 +1035,8 @@ static NepqWeight copy_cpu_nepq_to_cuda(const NepqWeight & source) {
 }
 
 MfeWeight stage_cpu_mixed_moe(
-        const std::shared_ptr<MixedMoeRuntime> & cpu) {
+        const std::shared_ptr<MixedMoeRuntime> & cpu,
+        const CudaExecutionConfig& config) {
     if (!cpu) throw std::runtime_error("missing CPU-offloaded MoE state");
     auto runtime = std::make_shared<MixedMoeRuntime>();
     runtime->n_experts = cpu->n_experts;
@@ -1061,7 +1067,7 @@ MfeWeight stage_cpu_mixed_moe(
         }
         runtime->pools.push_back(std::move(pool));
     }
-    initialize_mixed_nvq_dispatch(*runtime);
+    initialize_mixed_nvq_dispatch(*runtime, config);
     return wrap_mixed_moe_runtime(runtime);
 }
 

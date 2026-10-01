@@ -27,8 +27,8 @@ SOURCE = "\n".join(
         CUDA_ROOT / "models" / "causal_lm_impl.h",
         CUDA_ROOT / "models" / "transformer.h",
         CUDA_ROOT / "models" / "transformer.cpp",
-        CUDA_ROOT / "engine" / "cuda_execution.h",
-        CUDA_ROOT / "engine" / "cuda_execution.cpp",
+        CUDA_ROOT / "ops" / "include" / "cuda_execution.h",
+        CUDA_ROOT / "ops" / "cuda_execution.cpp",
         CUDA_ROOT / "engine" / "decode_graph.h",
     )
 ) + "\n" + BACKEND_CHECKS + "\n" + CUDA_RUNTIME + "\n" + (
@@ -202,7 +202,7 @@ def test_native_bf16_softmax_preserves_serial_reduction_order() -> None:
 
 def test_minicpmo_bf16_prefill_flash128_is_strictly_bounded() -> None:
     selection = SOURCE.split(
-        'std::getenv("MFQ_DISABLE_MINICPM_BF16_FLASH128")', 1
+        "const bool bf16_flash128 =", 1
     )[1].split("if (bf16_flash128)", 1)[0]
     assert "!sliding && hd == 128" in selection
     assert "nh == 4 * nkh" in selection
@@ -220,7 +220,7 @@ def test_minicpmo_bf16_prefill_flash128_is_strictly_bounded() -> None:
     assert "mfq_attention_mma_launch<128, 128, 16, 4>" in implementation
     assert "mfq_attention_mma_launch<128, 128, 8, 8>" in implementation
     casts = SOURCE.split(
-        '"MFQ_DISABLE_MINICPM_FLASH128_SPECIALIZED_CASTS"', 1
+        "const bool specialized_casts =", 1
     )[1].split("attention_token_major = true", 1)[0]
     assert "minicpm_flash128_q_cast_cuda" in casts
     assert "minicpm_flash128_kv_cast_cuda" in casts
@@ -242,17 +242,17 @@ def test_full_flash_attention_accepts_gqa8_with_matching_tiles() -> None:
     assert "mfq_attention_mma_launch<256, 256, 16, 4>" in implementation
     assert "mfq_attention_mma_launch<256, 256, 8, 8>" in implementation
     selection = SOURCE.split(
-        'const char * mma_attention_env = std::getenv("MFQ_MMA_ATTENTION")', 1
+        "const bool mma_attention_enabled =", 1
     )[1].split("else if (sliding)", 1)[0]
     assert "nh == 4 * nkh || nh == 8 * nkh" in selection
 
 
 def test_minicpmo_bf16_residual_uses_contiguous_specialized_add() -> None:
     selection = SOURCE.split(
-        'std::getenv("MFQ_DISABLE_MINICPM_BF16_RESIDUAL_ACC")', 1
-    )[1].split("return acc_cuda(rr, ff2)", 1)[0]
+        "if (execution.config.minicpm_bf16_residual_acc)", 1
+    )[1].split("return (rr + ff2)", 1)[0]
     assert "rr.scalar_type() == mfq_tensor_backend::kBFloat16" in SOURCE
-    assert "specialized_acc_disabled == nullptr" in selection
+    assert "return acc_cuda(rr, ff2)" in selection
     assert "acc_bf16_kernel" in ACC_SOURCE
     assert "a.is_cuda() && a.is_contiguous()" in ACC_SOURCE
     assert "a.sizes() == b.sizes()" in ACC_SOURCE
@@ -260,7 +260,8 @@ def test_minicpmo_bf16_residual_uses_contiguous_specialized_add() -> None:
 
 
 def test_cuda_profiler_filter_supports_low_perturbation_eager_attribution() -> None:
-    assert 'std::getenv("MFQ_PROFILE_CUDA_FILTER")' in SOURCE
+    assert '"MFQ_PROFILE_CUDA_FILTER"' in SOURCE
+    assert "profiler.filter = config.profile_filter" in SOURCE
     assert "if (!enabled || !selected(name)) return fn();" in SOURCE
     eager_path = CUDA_RUNTIME.rsplit("} else {", 1)[1].split(
         "mfq_cuda_synchronize();", 1

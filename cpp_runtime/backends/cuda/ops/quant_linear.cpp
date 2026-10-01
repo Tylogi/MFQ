@@ -606,11 +606,11 @@ mfq_tensor_backend::Tensor reduce_model_parallel_outputs(
         const auto output_dtype = outputs.front().scalar_type();
         const int64_t elements = outputs.front().numel();
         const bool reduce_to_primary =
-            model_parallel_reduce_to_primary_enabled();
+            execution.config.model_parallel_reduce_to_primary;
         // A two-input FP16 sum has the same final FP16 rounding as the former
         // FP32 reduction, while avoiding both conversion passes.
         const bool fp16_reduce =
-            model_parallel_fp16_reduce_enabled() &&
+            execution.config.model_parallel_fp16_reduce &&
             reduce_to_primary &&
             outputs.size() == 2 &&
             output_dtype == mfq_tensor_backend::kFloat16;
@@ -832,7 +832,7 @@ forward_tensor_parallel_output_projections(
         for (size_t launch_position = 0;
              launch_position < shard_count; ++launch_position) {
             const size_t shard = model_parallel_launch_index(
-                launch_position, shard_count);
+                execution.config, launch_position, shard_count);
             const int device =
                 projections.front()->tensor_parallel_shards[shard].device;
             MfqCudaGuard guard(device);
@@ -848,7 +848,7 @@ forward_tensor_parallel_output_projections(
             for (size_t launch_position = 0;
                  launch_position < shard_count; ++launch_position) {
                 const size_t shard = model_parallel_launch_index(
-                    launch_position, shard_count);
+                execution.config, launch_position, shard_count);
                 const auto & weight =
                     projection->tensor_parallel_shards[shard];
                 MfqCudaGuard guard(weight.device);
@@ -878,7 +878,7 @@ forward_tensor_parallel_output_projections(
     for (size_t launch_position = 0;
          launch_position < shard_count; ++launch_position) {
         const size_t shard = model_parallel_launch_index(
-            launch_position, shard_count);
+                execution.config, launch_position, shard_count);
         const int device =
             projections.front()->tensor_parallel_shards[shard].device;
         MfqCudaGuard guard(device);
@@ -1190,10 +1190,10 @@ QuantLinear load_quant_linear(
             }
         } else {
             if (cpu_layer) {
-                result.nvq = to_device_nvq(cpu, false);
+                result.nvq = to_device_nvq(cpu, false, execution.config);
             } else {
                 MfqCudaGuard guard(active_weight_load_device(execution));
-                result.nvq = to_device_nvq(cpu, true);
+                result.nvq = to_device_nvq(cpu, true, execution.config);
             }
         }
     } else if (dtype == "MXFP4-SQ") {
@@ -1311,11 +1311,8 @@ QuantLinear load_quant_linear(
         // materially larger drift than the weight formats under test. They
         // are a small fraction of the model; routed experts and MXFP8/NINT/NVQ
         // weights remain sharded.
-        const char * shard_native_float_env =
-            std::getenv("MFQ_TP_SHARD_NATIVE_FLOAT");
         const bool shard_native_float =
-            shard_native_float_env != nullptr &&
-            std::atoi(shard_native_float_env) != 0;
+            execution.config.tensor_parallel_shard_native_float;
         if (shard_native_float && execution.tensor_parallel.enabled() &&
                 axis != TensorParallelAxis::Mirrored) {
             const int64_t extent = axis == TensorParallelAxis::Output
@@ -1382,10 +1379,8 @@ QuantLinearGroup make_quant_group(
             nint_weights.push_back(layer.nint);
         }
     }
-    const char * disable_nint_group =
-        std::getenv("MFQ_DIAGNOSTIC_DISABLE_NINT_GROUP");
     const bool diagnostic_keep_nint_separate =
-        disable_nint_group != nullptr && disable_nint_group[0] == '1';
+        !execution.config.diagnostic_nint_group;
     const bool cpu_layer = execution.loading_cpu_layer;
     const bool any_tensor_parallel = std::any_of(
         layers.begin(), layers.end(),

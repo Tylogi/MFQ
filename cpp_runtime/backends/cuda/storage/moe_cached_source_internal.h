@@ -355,13 +355,13 @@ public:
             const MoeRoutePlan & route) {
         if (use_full_projection(route)) {
             cache_->count_full_projection_fallback();
-            auto staged = stage_fallback_runtime();
+            auto staged = stage_fallback_runtime(execution.config);
             return staged.forward(execution, x, route);
         }
         if (!cache_->prepare(
                 *this, route_experts(route), false)) {
             cache_->count_full_projection_fallback();
-            auto staged = stage_fallback_runtime();
+            auto staged = stage_fallback_runtime(execution.config);
             return staged.forward(execution, x, route);
         }
         auto output = active_->forward(execution, x, route);
@@ -380,7 +380,7 @@ public:
         if (!cache_->prepare(
                 *this, route_experts(route), false)) {
             cache_->count_full_projection_fallback();
-            auto staged = stage_fallback_runtime();
+            auto staged = stage_fallback_runtime(execution.config);
             return staged.forward(execution, x, route);
         }
         auto output = active_->forward(execution, x, route, true);
@@ -401,13 +401,13 @@ public:
             bool gelu) {
         if (use_full_projection(route)) {
             cache_->count_full_projection_fallback();
-            auto staged = stage_fallback_runtime();
+            auto staged = stage_fallback_runtime(execution.config);
             return staged.forward_glu_output(execution, x, route, gelu);
         }
         if (!cache_->prepare(
                 *this, route_experts(route), false)) {
             cache_->count_full_projection_fallback();
-            auto staged = stage_fallback_runtime();
+            auto staged = stage_fallback_runtime(execution.config);
             return staged.forward_glu_output(execution, x, route, gelu);
         }
         auto output = active_->forward_glu_output(
@@ -434,14 +434,14 @@ public:
             double limit) {
         if (use_full_projection(route)) {
             cache_->count_full_projection_fallback();
-            auto staged = stage_cpu_mixed_moe(cpu_);
+            auto staged = stage_cpu_mixed_moe(cpu_, execution.config);
             return staged.forward_clamped_swiglu(
                 execution, gate_up, route, limit);
         }
         if (!cache_->prepare(
                 *this, route_experts(route), false)) {
             cache_->count_full_projection_fallback();
-            auto staged = stage_cpu_mixed_moe(cpu_);
+            auto staged = stage_cpu_mixed_moe(cpu_, execution.config);
             return staged.forward_clamped_swiglu(
                 execution, gate_up, route, limit);
         }
@@ -509,9 +509,10 @@ private:
         return fallback_cpu_;
     }
 
-    MfeWeight stage_fallback_runtime() {
+    MfeWeight stage_fallback_runtime(
+            const CudaExecutionConfig& config) {
         auto runtime = fallback_runtime();
-        return stage_cpu_mixed_moe(runtime);
+        return stage_cpu_mixed_moe(runtime, config);
     }
 
     MoeExpertCache * cache_ = nullptr;

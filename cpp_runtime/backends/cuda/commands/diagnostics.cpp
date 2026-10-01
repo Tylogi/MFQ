@@ -528,8 +528,8 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             execution.profiler.enabled = true;
         }
         if (compare_decode_splitk) {
-            auto run = [&](const char * split) {
-                mfq_set_env("MFQ_ATTENTION_DECODE_SPLITK", split);
+            auto run = [&](bool split) {
+                execution.config.attention_decode_split_k = split;
                 model.reset(1);
                 (void)model.hidden_forward(ids);
                 const int64_t decode_len = model.cache_pos + 1;
@@ -541,8 +541,8 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 mfq_cuda_synchronize();
                 return logits;
             };
-            auto ref = run("0");
-            auto test = run("1");
+            auto ref = run(false);
+            auto test = run(true);
             auto ref_logp = mfq_tensor_backend::log_softmax(ref, -1);
             auto test_logp = mfq_tensor_backend::log_softmax(test, -1);
             auto kl = (ref_logp.exp() * (ref_logp - test_logp)).sum(-1);
@@ -564,7 +564,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             std::vector<int64_t> teacher_tokens;
             reference_logits.reserve(compare_mma_decode_steps);
             teacher_tokens.reserve(compare_mma_decode_steps);
-            mfq_set_env("MFQ_MMA_ATTENTION_DECODE", "0");
+            execution.config.mma_attention_decode = false;
             model.reset(1);
             auto input = model.next_token(ids).reshape({1, 1});
             const int64_t initial_teacher_token = input.template item<int64_t>();
@@ -579,7 +579,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 teacher_tokens.push_back(next);
                 input = mfq_tensor_backend::tensor({next}, cuda_i64).reshape({1, 1});
             }
-            mfq_set_env("MFQ_MMA_ATTENTION_DECODE", "1");
+            execution.config.mma_attention_decode = true;
             const int64_t planned_kv_length =
                 compare_mma_decode_planned_len > 0
                 ? compare_mma_decode_planned_len
@@ -637,16 +637,15 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             return 0;
         }
         if (compare_nvq_vec4) {
-            auto run = [&](const char * enabled) {
-                mfq_set_env("MFQ_NVQ_SWIGLU_VEC4", enabled);
+            auto run = [&](bool) {
                 model.reset(1);
                 auto logits = model.last_logits(ids).to(mfq_tensor_backend::kFloat32);
                 mfq_cuda_synchronize();
                 return logits;
             };
-            auto ref = run("0");
-            auto repeat = run("0");
-            auto test = run("1");
+            auto ref = run(false);
+            auto repeat = run(false);
+            auto test = run(true);
             auto ref_logp = mfq_tensor_backend::log_softmax(ref, -1);
             auto repeat_logp = mfq_tensor_backend::log_softmax(repeat, -1);
             auto test_logp = mfq_tensor_backend::log_softmax(test, -1);
@@ -728,13 +727,13 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             return 0;
         }
         if (compare_mma_attention) {
-            mfq_set_env("MFQ_MMA_ATTENTION", "0");
-            mfq_set_env("MFQ_DISABLE_MINICPM_BF16_FLASH128", "1");
+            execution.config.mma_attention = false;
+            execution.config.minicpm_bf16_flash128 = false;
             auto ref = model.last_logits(ids).to(mfq_tensor_backend::kFloat32);
             mfq_cuda_synchronize();
             model.reset(1);
-            mfq_set_env("MFQ_MMA_ATTENTION", "1");
-            mfq_set_env("MFQ_DISABLE_MINICPM_BF16_FLASH128", "0");
+            execution.config.mma_attention = true;
+            execution.config.minicpm_bf16_flash128 = true;
             auto test = model.last_logits(ids).to(mfq_tensor_backend::kFloat32);
             mfq_cuda_synchronize();
             auto ref_logp = mfq_tensor_backend::log_softmax(ref, -1);

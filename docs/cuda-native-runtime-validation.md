@@ -29,6 +29,12 @@ For an A/B build, configure a separate tree with LibTorch discoverable and
 `-DMFQ_BUILD_TORCH_REFERENCE_RUNTIME=ON`. This adds `mfq-runtime-torch`; it does
 not alter `mfq-runtime`.
 
+Execution policy environment variables are parsed when a
+`CudaExecutionContext` is constructed. Each Engine keeps its own typed
+`CudaExecutionConfig`; changing the process environment afterwards does not
+reconfigure an existing Engine. Diagnostic A/B paths must override the target
+Engine's config directly or construct a fresh Engine.
+
 Run the model-backed scheduler and execution-isolation gates on a machine with
 enough device memory. The second command loads and generates with two complete
 engines concurrently and compares each result with its serial oracle:

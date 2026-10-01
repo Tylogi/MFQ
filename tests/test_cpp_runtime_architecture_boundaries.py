@@ -64,6 +64,7 @@ CUDA_CLI = (
     ROOT / "cpp_runtime" / "backends" / "cuda" / "commands" / "cli.h"
 ).read_text(encoding="utf-8")
 CUDA_MODELS = ROOT / "cpp_runtime" / "backends" / "cuda" / "models"
+CUDA_OPS = ROOT / "cpp_runtime" / "backends" / "cuda" / "ops"
 CUDA_RUNTIME = ROOT / "cpp_runtime" / "backends" / "cuda" / "engine"
 CUDA_ENGINE_SOURCE = (CUDA_RUNTIME / "cuda_engine.cpp").read_text(
     encoding="utf-8"
@@ -159,6 +160,23 @@ def model_sources() -> str:
         for path in MODELS.rglob("*")
         if path.suffix in {".h", ".cpp"}
     )
+
+
+def test_cuda_ops_do_not_depend_on_engine_or_parse_environment() -> None:
+    for path in CUDA_OPS.rglob("*"):
+        if path.suffix not in {".h", ".cpp", ".cu"}:
+            continue
+        source = path.read_text(encoding="utf-8")
+        assert not re.search(r'#include\s*[<"](?:\.\./)*engine/', source)
+        if path.name != "cuda_execution.cpp":
+            assert "getenv(" not in source
+
+
+def test_cuda_models_and_storage_do_not_parse_execution_environment() -> None:
+    for directory in (CUDA_MODELS, CUDA_RUNTIME.parent / "storage"):
+        for path in directory.rglob("*"):
+            if path.suffix in {".h", ".cpp", ".cu"}:
+                assert "getenv(" not in path.read_text(encoding="utf-8")
 
 
 def test_cuda_format_operators_only_receive_the_profiler() -> None:
@@ -298,7 +316,7 @@ def test_cuda_runtime_has_one_shared_generation_path() -> None:
 
 
 def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
-    execution = (CUDA_RUNTIME / "cuda_execution.h").read_text(encoding="utf-8")
+    execution = (CUDA_OPS / "include" / "cuda_execution.h").read_text(encoding="utf-8")
     options = (CUDA_RUNTIME / "options.cpp").read_text(encoding="utf-8")
 
     assert "struct CudaExecutionContext" in execution
@@ -307,7 +325,7 @@ def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
     assert "extern CudaProfiler&" not in execution
     assert "CudaExecutionContext& execution;" in CUDA_ENGINE_SOURCE
     assert "std::make_shared<CudaExecutionContext>()" in CUDA_ENGINE_SOURCE
-    execution_source = (CUDA_RUNTIME / "cuda_execution.cpp").read_text(
+    execution_source = (CUDA_OPS / "cuda_execution.cpp").read_text(
         encoding="utf-8"
     )
     assert "static CudaExecutionContext context" not in execution_source
@@ -1021,7 +1039,7 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         "ops/nint.cpp",
         "ops/quant_linear.cpp",
         "ops/vq.cpp",
-        "engine/cuda_execution.cpp",
+        "ops/cuda_execution.cpp",
         "engine/decode_graph.cpp",
         "engine/options.cpp",
         "commands/cli.cpp",

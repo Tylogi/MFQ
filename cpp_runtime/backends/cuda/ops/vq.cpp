@@ -413,10 +413,8 @@ bool nvq_pair_compatible(const NvqWeight & first, const NvqWeight & second) {
            first.neuron_len == second.neuron_len && first.ng == second.ng;
 }
 
-bool nvq_fusion_enabled() {
-    const char * disable = std::getenv("MFQ_DISABLE_NVQ_FUSION");
-    if (disable == nullptr) disable = std::getenv("MFQ_DISABLE_NIQ_FUSION");
-    return disable == nullptr || disable[0] != '1';
+bool nvq_fusion_enabled(const CudaExecutionConfig& config) {
+    return config.nvq_fusion;
 }
 
 mfq_tensor_backend::Tensor nvq_matmul_multi2(
@@ -1364,15 +1362,13 @@ static std::vector<uint8_t> repack_extended_jsc_group_metadata(
     return metadata;
 }
 
-static bool nvq2_exec_layout_enabled() {
-    const char * disable = std::getenv("MFQ_DISABLE_NVQ2_EXEC");
-    if (disable == nullptr) disable = std::getenv("MFQ_DISABLE_NIQ2_EXEC");
-    return disable == nullptr || disable[0] != '1';
+static bool nvq2_exec_layout_enabled(const CudaExecutionConfig& config) {
+    return config.nvq2_exec;
 }
 
-static bool extended_jsc_group_layout_enabled() {
-    const char * enable = std::getenv("MFQ_NVQ_EXTENDED_GROUP_EXEC");
-    return enable != nullptr && enable[0] == '1';
+static bool extended_jsc_group_layout_enabled(
+        const CudaExecutionConfig& config) {
+    return config.nvq_extended_group_exec;
 }
 
 static std::vector<int8_t> reorder_extended_e8_codebook_for_stage3(
@@ -1496,7 +1492,10 @@ static std::vector<uint8_t> remap_extended_e8_sub_scale_states(
     return remapped;
 }
 
-NvqWeight to_device_nvq(const NvqCpu & c, bool cuda) {
+NvqWeight to_device_nvq(
+        const NvqCpu & c,
+        bool cuda,
+        const CudaExecutionConfig& config) {
     NvqWeight w;
     std::array<uint8_t, 16> e8_state_remap = {};
     auto e8_index_remap =
@@ -1504,7 +1503,8 @@ NvqWeight to_device_nvq(const NvqCpu & c, bool cuda) {
     std::vector<int8_t> e8_runtime_codebook;
     std::vector<uint8_t> e8_runtime_sub_scale;
     const bool use_extended_e8 =
-        cuda && c.format == 14 && extended_jsc_group_layout_enabled();
+        cuda && c.format == 14 &&
+        extended_jsc_group_layout_enabled(config);
     if (use_extended_e8) {
         e8_runtime_codebook = reorder_extended_e8_codebook_for_stage3(
             c, e8_state_remap, *e8_index_remap);
@@ -1521,7 +1521,7 @@ NvqWeight to_device_nvq(const NvqCpu & c, bool cuda) {
     w.neuron_len = c.neuron_len;
     w.shape = c.shape;
     if (cuda && (c.format == 14 || c.format == 15) &&
-        extended_jsc_group_layout_enabled()) {
+        extended_jsc_group_layout_enabled(config)) {
         auto metadata = repack_extended_jsc_group_metadata(
             c,
             use_extended_e8 ? &e8_state_remap : nullptr,
@@ -1534,7 +1534,7 @@ NvqWeight to_device_nvq(const NvqCpu & c, bool cuda) {
             ? kNvq2JscXlGroupExecKernelFormat
             : kNvq3JscLGroupExecKernelFormat;
     } else if (cuda && (c.format == 2 || c.format == 5) &&
-               nvq2_exec_layout_enabled()) {
+               nvq2_exec_layout_enabled(config)) {
         auto metadata = repack_nvq2_exec_metadata(c);
         w.indices_packed = cpu_u8_tensor(
             metadata, {(int64_t)metadata.size()});
@@ -1591,14 +1591,18 @@ NvqWeight to_device_nvq(const NvqCpu & c, bool cuda) {
     return w;
 }
 
-NvqWeight to_gpu_nvq(const NvqCpu & c) {
-    return to_device_nvq(c, true);
+NvqWeight to_gpu_nvq(
+        const NvqCpu & c,
+        const CudaExecutionConfig& config) {
+    return to_device_nvq(c, true, config);
 }
 
 NvqWeight to_cuda_device_nvq(
-        const NvqCpu & c, int device) {
+        const NvqCpu & c,
+        int device,
+        const CudaExecutionConfig& config) {
     MfqCudaGuard guard(device);
-    return to_device_nvq(c, true);
+    return to_device_nvq(c, true, config);
 }
 
 NvqWeight to_cpu_nvq(const NvqCpu & c) {

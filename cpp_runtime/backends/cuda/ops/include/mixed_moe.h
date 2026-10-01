@@ -224,33 +224,11 @@ struct MixedMoeRuntime {
         prepared_inputs.emplace(identity, x);
         std::unordered_set<
             MixedMoeActivationKey, MixedMoeActivationKeyHash> quantized;
-        static const bool disable_prefill_mma = [] {
-            const char * value = std::getenv("MFQ_DISABLE_MOE_PREFILL_MMA");
-            return value != nullptr && std::atoi(value) != 0;
-        }();
-        static const int prefill_mma_min_tokens = [] {
-            const char * value = std::getenv("MFQ_MOE_PREFILL_MMA_MIN_TOKENS");
-            return value == nullptr ? 9 : std::max(9, std::atoi(value));
-        }();
-        static const bool disable_nvq_hetero_decode = [] {
-            const char * disabled =
-                std::getenv("MFQ_DISABLE_MOE_NVQ_HETERO_DECODE");
-            const char * exact =
-                std::getenv("MFQ_NVQ_MOE_EXACT_REDUCTION");
-            const char * rows =
-                std::getenv("MFQ_NVQ_MOE_ROWS_PER_BLOCK");
-            const char * warps =
-                std::getenv("MFQ_NVQ_MOE_WARPS");
-            const char * shared =
-                std::getenv("MFQ_NVQ_MOE_SHARE_GROUP_STATE");
-            return (disabled != nullptr && std::atoi(disabled) != 0) ||
-                (exact != nullptr && std::atoi(exact) != 0) ||
-                rows != nullptr || warps != nullptr || shared != nullptr;
-        }();
         const bool use_f16_mma =
-            !disable_prefill_mma &&
+            execution.config.moe_prefill_mma &&
             !execution.force_moe_prefill_mma_off &&
-            tokens >= prefill_mma_min_tokens && route.map_ready &&
+            tokens >= execution.config.moe_prefill_mma_min_tokens &&
+            route.map_ready &&
             route.ids_dst.numel() == route.ids.numel();
         const bool use_kl_mmq =
             execution.kl_mmq_mode != KlMmqMode::Default;
@@ -265,7 +243,7 @@ struct MixedMoeRuntime {
             !use_f16_mma && !use_kl_mmq && nvq_dispatch &&
             nvq_dispatch->pool_count > 1 &&
             tokens <= 8 && !execution.force_moe_pool_path &&
-            !disable_nvq_hetero_decode;
+            execution.config.moe_nvq_heterogeneous_decode;
         int nint_pool_phase = 0;
         if (input_prequantized && use_kl_mmq) {
             throw std::runtime_error(
@@ -622,16 +600,21 @@ MfeCpu load_mfe_cpu(
     const mfq::ModelSource& source, const std::string& name);
 MfeWeight to_gpu_mfe(const MfeCpu& source);
 std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
-    const MfeCpu& source, bool cuda);
+    const MfeCpu& source,
+    bool cuda,
+    const CudaExecutionConfig& config = {});
 int64_t mixed_moe_storage_bytes(const MixedMoeRuntime& runtime);
 mfq_tensor_backend::Tensor copy_cpu_weight_to_cuda(
     const mfq_tensor_backend::Tensor& source);
-MfeWeight to_gpu_mixed_moe(const MfeCpu& source);
+MfeWeight to_gpu_mixed_moe(
+    const MfeCpu& source,
+    const CudaExecutionConfig& config = {});
 MfeWeight to_cuda_device_moe_expert_slice(
     const MfeCpu& source,
     int64_t expert_begin,
     int64_t expert_end,
-    int device);
+    int device,
+    const CudaExecutionConfig& config = {});
 std::shared_ptr<MixedMoeRuntime> make_mxfp4_range_runtime(
     const mfq::cuda::MfeMxfp4ExpertStore& store);
 std::vector<mfq::TensorParallelSlice> plan_moe_expert_parallel_slices(

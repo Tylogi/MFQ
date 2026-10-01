@@ -495,16 +495,14 @@ mfq_tensor_backend::Tensor nint_matmul_geglu(
 }
 
 bool decode_branch_parallel_enabled(
+        const CudaExecutionConfig& config,
         bool serial_branches,
         int64_t rows) {
-    const char * disabled =
-        std::getenv("MFQ_DISABLE_DECODE_BRANCH_PARALLEL");
     // Branch output storage belongs to its allocating stream. Keep graph
     // warmup/capture on the graph pool's stream until cross-stream allocation
     // lifetime tracking supports a fully rejoined capture. Eager is unchanged.
     return rows == 1 &&
-        !serial_branches &&
-        (disabled == nullptr || disabled[0] != '1');
+        !serial_branches && config.decode_branch_parallel;
 }
 static void refresh_nint_descriptor(NintCpu & t) {
     if (t.out <= 0 || t.neuron_len <= 0 || t.ng <= 0 || t.gs <= 0 ||

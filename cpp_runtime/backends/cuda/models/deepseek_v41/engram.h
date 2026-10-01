@@ -154,20 +154,6 @@ inline float decode_e4m3(std::uint8_t raw) {
               exponent - 7));
 }
 
-inline std::size_t cache_capacity_rows() {
-    constexpr std::size_t fallback = 16'384;
-    const char* raw = std::getenv("MFQ_DEEPSEEK_V41_ENGRAM_CACHE_ROWS");
-    if (raw == nullptr || *raw == '\0') return fallback;
-    char* end = nullptr;
-    const auto parsed = std::strtoull(raw, &end, 10);
-    if (end == raw || *end != '\0' ||
-        parsed > std::numeric_limits<std::size_t>::max()) {
-        throw std::runtime_error(
-            "invalid MFQ_DEEPSEEK_V41_ENGRAM_CACHE_ROWS");
-    }
-    return static_cast<std::size_t>(parsed);
-}
-
 } // namespace engram_detail
 
 struct EngramHashBatch {
@@ -599,7 +585,8 @@ public:
         const mfq::ModelSource& model,
         const std::string& name,
         std::int64_t expected_rows,
-        int expected_width) {
+        int expected_width,
+        std::size_t cache_capacity_rows) {
         const auto record = require_tensor(model, name);
         if (record.dtype != "MXFP8") {
             throw std::runtime_error(
@@ -649,7 +636,7 @@ public:
             static_cast<std::int64_t>(rows),
             static_cast<int>(columns),
             value_bytes,
-            engram_detail::cache_capacity_rows()));
+            cache_capacity_rows));
     }
 
     EngramTensor gather(
@@ -900,7 +887,8 @@ public:
                 prefix + "embedding.weight",
                 config.engram_num_embeddings[
                     static_cast<std::size_t>(hash_layer)],
-                static_cast<int>(config.engram_head_dim)),
+                static_cast<int>(config.engram_head_dim),
+                execution.config.deepseek_v41_engram_cache_rows),
             std::move(projection),
             (query * key).contiguous()));
     }

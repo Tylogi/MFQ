@@ -38,6 +38,7 @@ struct LinearAttentionBlock final : ::Block {
     mfq_tensor_backend::Tensor conv_state, gdn_state;
     mfq_tensor_backend::Tensor speculative_conv, speculative_gdn;
     bool speculative_pending = false;
+    bool transposed_gdn_state = true;
     int64_t speculative_ffn_batches = 0;
     int64_t speculative_projection_batches = 0;
     LinearRecurrentInputs speculative_recurrent;
@@ -247,6 +248,7 @@ struct LinearAttentionBlock final : ::Block {
             mfq_tensor_backend::Tensor x,
             LinearRecurrentInputs* captured = nullptr) {
         auto& profiler = execution.profiler;
+        transposed_gdn_state = execution.config.gdn_transposed_state;
         int64_t B = x.size(0), T = x.size(1), H = x.size(2);
         int64_t nk = qwen_config.linear_num_key_heads, nv = qwen_config.linear_num_value_heads;
         int64_t dk = qwen_config.linear_key_head_dim, dv = qwen_config.linear_value_head_dim;
@@ -276,8 +278,8 @@ struct LinearAttentionBlock final : ::Block {
             bool shared_projection_input = false;
             if (!shared_projection_input &&
                     !split_dense_zab && ab_is_nint &&
-                    tensor_parallel_grouped_projections_enabled() &&
-                    tensor_parallel_shared_linear_attention_input_enabled() &&
+                    execution.config.tensor_parallel_grouped_projections &&
+                    execution.config.tensor_parallel_shared_linear_attention_input &&
                     qkv_proj.layers.size() == 2) {
                 QuantLinearProjectionRefs projections = {
                     &qkv_proj.layers[0], &qkv_proj.layers[1],
@@ -362,8 +364,7 @@ struct LinearAttentionBlock final : ::Block {
         auto recurrent_step = [&](mfq_tensor_backend::Tensor rq, mfq_tensor_backend::Tensor rk,
                 mfq_tensor_backend::Tensor rv, mfq_tensor_backend::Tensor rg,
                 mfq_tensor_backend::Tensor rb) {
-            const char* transposed_env = std::getenv("MFQ_GDN_TRANSPOSED_STATE");
-            const bool transposed = transposed_env == nullptr || transposed_env[0] != '0';
+            const bool transposed = transposed_gdn_state;
             if (transposed) {
                 if (tiled_v_heads) return gdn_inplace_transposed_tiled_cuda(
                     rq.contiguous(), rk.contiguous(), rv.contiguous(), rg, rb, gdn_state);
@@ -375,8 +376,8 @@ struct LinearAttentionBlock final : ::Block {
             return gdn_inplace_cuda(rq.contiguous(), rk.contiguous(), rv.contiguous(), rg, rb, gdn_state);
         };
         mfq_tensor_backend::Tensor q, k, v;
-        const char * fused_prefill_env = std::getenv("MFQ_LINEAR_CONV_PREFILL_FUSED");
-        bool fused_prefill = T >= 256 && (fused_prefill_env == nullptr || fused_prefill_env[0] != '0');
+        bool fused_prefill = T >= 256 &&
+            execution.config.linear_conv_prefill_fused;
         if (T > 1 && split_in_proj && fused_prefill) {
             auto qkv_fast = profiler.measure("linear.conv_qkv_prefill", [&]() {
                 return linear_conv_qkv_prefill_cuda(
@@ -477,10 +478,7 @@ struct LinearAttentionBlock final : ::Block {
             if (oo2.scalar_type() != rr.scalar_type()) {
                 oo2 = oo2.to(rr.scalar_type()).contiguous();
             }
-            const char * fp32_residual_env =
-                std::getenv("MFQ_DIAGNOSTIC_FP32_RESIDUAL");
-            if (fp32_residual_env != nullptr &&
-                    fp32_residual_env[0] == '1') {
+            if (execution.config.diagnostic_fp32_residual) {
                 return acc_rms_norm_cuda(
                     rr.to(mfq_tensor_backend::kFloat32),
                     oo2.to(mfq_tensor_backend::kFloat32),
@@ -550,9 +548,7 @@ struct LinearAttentionBlock final : ::Block {
         k = l2_norm_cuda(
             k.contiguous().reshape({-1, dk}), qwen_config.rms_norm_eps)
                 .reshape_as(k);
-        const char* transposed_env = std::getenv("MFQ_GDN_TRANSPOSED_STATE");
-        const bool transposed =
-            transposed_env == nullptr || transposed_env[0] != '0';
+        const bool transposed = transposed_gdn_state;
         const auto gate = inputs.gate.narrow(2, 0, T).contiguous();
         const auto beta = inputs.beta.narrow(2, 0, T).contiguous();
         std::vector<mfq_tensor_backend::Tensor> output;
@@ -584,20 +580,19 @@ struct LinearAttentionBlock final : ::Block {
         const int64_t B = residual.size(0), T = residual.size(1), H = residual.size(2);
         auto ffn_input = xn.reshape({B * T, H});
         auto residual_flat = residual.reshape({B * T, H});
-        if (ffn.can_forward_fused_residual(ffn_input, residual_flat)) {
+        if (ffn.can_forward_fused_residual(
+                execution.config, ffn_input, residual_flat)) {
             return profiler.measure("linear.ffn_down_residual", [&]() {
                 return ffn.forward_fused_residual(
-                    profiler, ffn_input, residual_flat).reshape({B, T, H});
+                    profiler, execution.config,
+                    ffn_input, residual_flat).reshape({B, T, H});
             });
         }
         auto ff = ffn.forward(execution, ffn_input).reshape({B, T, H});
         return profiler.measure("linear.ffn_residual", [&]() {
             auto rr = residual.reshape({-1, H});
             auto ff2 = ff.reshape({-1, H});
-            const char * fp32_residual_env =
-                std::getenv("MFQ_DIAGNOSTIC_FP32_RESIDUAL");
-            if (fp32_residual_env != nullptr &&
-                    fp32_residual_env[0] == '1') {
+            if (execution.config.diagnostic_fp32_residual) {
                 rr = rr.to(mfq_tensor_backend::kFloat32);
                 ff2 = ff2.to(mfq_tensor_backend::kFloat32);
             } else if (ff2.scalar_type() != rr.scalar_type()) {

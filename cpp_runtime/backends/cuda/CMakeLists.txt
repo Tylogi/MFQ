@@ -197,7 +197,7 @@ if(BUILD_TESTING)
     target_include_directories(mfq-flash-next-test PRIVATE
         ${MFQ_REPOSITORY_ROOT}
         ${MFQ_CUDA_ROOT}/models
-        ${MFQ_CUDA_ROOT}/engine
+        ${MFQ_CUDA_ROOT}/ops/include
         ${MFQ_CUDA_ROOT}/../../core)
 endif()
 
@@ -269,6 +269,7 @@ set(MFQ_CUDA_MODEL_SOURCES
 )
 
 set(MFQ_CUDA_RUNTIME_OP_SOURCES
+    ${MFQ_CUDA_ROOT}/ops/cuda_execution.cpp
     ${MFQ_CUDA_ROOT}/ops/format.cpp
     ${MFQ_CUDA_ROOT}/ops/fp8_sq.cpp
     ${MFQ_CUDA_ROOT}/ops/mx.cpp
@@ -305,7 +306,6 @@ add_library(mfq-cuda-runtime STATIC
     ${MFQ_CUDA_ROOT}/engine/generation.cpp
     ${MFQ_CUDA_ROOT}/engine/text_session_cache.cpp
     ${MFQ_CUDA_ROOT}/engine/decode_graph.cpp
-    ${MFQ_CUDA_ROOT}/engine/cuda_execution.cpp
     ${MFQ_CUDA_ROOT}/models/causal_lm.cpp
     ${MFQ_CUDA_ROOT}/engine/mtp.cpp
     ${MFQ_CUDA_ROOT}/models/components.cpp
@@ -506,7 +506,6 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         ${MFQ_CUDA_ROOT}/engine/text_session_cache.cpp
         ${MFQ_CUDA_ROOT}/engine/options.cpp
         ${MFQ_CUDA_ROOT}/engine/decode_graph.cpp
-        ${MFQ_CUDA_ROOT}/engine/cuda_execution.cpp
         ${MFQ_CUDA_ROOT}/models/causal_lm.cpp
         ${MFQ_CUDA_ROOT}/models/loader.cpp
         ${MFQ_CUDA_ROOT}/engine/mtp.cpp

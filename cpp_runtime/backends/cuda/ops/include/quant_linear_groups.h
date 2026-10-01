@@ -53,12 +53,12 @@ struct QuantLinearGroup {
             }
             return result;
         }
-        if (tensor_parallel_grouped_projections_enabled() &&
+        if (execution.config.tensor_parallel_grouped_projections &&
                 tensor_parallel_output_compatible()) {
             return forward_tensor_parallel_output_group(execution, x);
         }
         if (nint_grouped) return nint.forward(execution, x);
-        if (default_mmq && nvq_prefix2 && nvq_fusion_enabled()) {
+        if (default_mmq && nvq_prefix2 && nvq_fusion_enabled(execution.config)) {
             auto shape = x.sizes().vec();
             const auto flat =
                 x.reshape({-1, x.size(-1)});
@@ -66,7 +66,7 @@ struct QuantLinearGroup {
             const bool parallel =
                 decode_branch_parallel &&
                 decode_branch_parallel_enabled(
-                    execution.decode_graph_serial_branches, flat.size(0)) &&
+                    execution.config, execution.decode_graph_serial_branches, flat.size(0)) &&
                 layers.size() > 2 &&
                 branch_executor->run(
                     layers.size() - 1,
@@ -103,7 +103,7 @@ struct QuantLinearGroup {
         std::vector<mfq_tensor_backend::Tensor> result;
         if (default_mmq && decode_branch_parallel &&
                 decode_branch_parallel_enabled(
-                    execution.decode_graph_serial_branches, x.numel() / x.size(-1)) &&
+                    execution.config, execution.decode_graph_serial_branches, x.numel() / x.size(-1)) &&
                 branch_executor->run(
                     layers.size(),
                     [&](size_t index) {
@@ -128,7 +128,7 @@ struct QuantLinearGroup {
             return nint.forward_swiglu(execution.profiler, x);
         }
         if (default_mmq && nvq_prefix2 && layers.size() == 2 &&
-                nvq_fusion_enabled()) {
+                nvq_fusion_enabled(execution.config)) {
             auto shape = x.sizes().vec();
             auto y = nvq_matmul_swiglu(
                 execution.profiler, layers[0].nvq, layers[1].nvq,
@@ -227,7 +227,8 @@ DenseLinearGroup make_fp32_quant_group(
     QuantLinearGroup group);
 
 MfeWeight stage_cpu_mixed_moe(
-    const std::shared_ptr<MixedMoeRuntime>& runtime);
+    const std::shared_ptr<MixedMoeRuntime>& runtime,
+    const CudaExecutionConfig& config = {});
 bool prefetch_cached_moe_projection_bundle(
     const MfeWeight& gate,
     const MfeWeight& up,

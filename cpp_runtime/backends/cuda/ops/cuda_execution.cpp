@@ -3,13 +3,14 @@
 #include "mfq_cuda_ops.h"
 
 #include <algorithm>
-#include <cerrno>
+#include <charconv>
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -18,21 +19,196 @@
 #include <malloc.h>
 #endif
 
-void mfq_set_env(const char * name, const char * value) {
-#ifdef _WIN32
-    if (_putenv_s(name, value ? value : "") != 0) {
-        throw std::runtime_error(std::string("failed to update environment variable ") + name);
+namespace {
+
+std::optional<std::string> environment(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') return std::nullopt;
+    return value;
+}
+
+bool environment_flag(const char* name, bool fallback) {
+    const auto value = environment(name);
+    if (!value) return fallback;
+    int parsed = 0;
+    const auto [end, error] = std::from_chars(
+        value->data(), value->data() + value->size(), parsed);
+    if (error != std::errc{} || end != value->data() + value->size()) {
+        throw std::runtime_error(std::string("invalid ") + name);
     }
-#else
-    const int status = value && value[0] != '\0'
-        ? setenv(name, value, 1)
-        : unsetenv(name);
-    if (status != 0) {
-        throw std::runtime_error(
-            std::string("failed to update environment variable ") + name +
-            ": " + std::strerror(errno));
+    return parsed != 0;
+}
+
+int environment_int(
+        const char* name, int fallback, int minimum, int maximum) {
+    const auto value = environment(name);
+    if (!value) return fallback;
+    int parsed = 0;
+    const auto [end, error] = std::from_chars(
+        value->data(), value->data() + value->size(), parsed);
+    if (error != std::errc{} || end != value->data() + value->size() ||
+            parsed < minimum || parsed > maximum) {
+        throw std::runtime_error(std::string("invalid ") + name);
     }
-#endif
+    return parsed;
+}
+
+std::size_t environment_size(
+        const char* name, std::size_t fallback) {
+    const auto value = environment(name);
+    if (!value) return fallback;
+    std::size_t parsed = 0;
+    const auto [end, error] = std::from_chars(
+        value->data(), value->data() + value->size(), parsed);
+    if (error != std::errc{} || end != value->data() + value->size()) {
+        throw std::runtime_error(std::string("invalid ") + name);
+    }
+    return parsed;
+}
+
+bool enabled_unless_disabled(const char* name) {
+    return !environment_flag(name, false);
+}
+
+} // namespace
+
+CudaExecutionConfig load_cuda_execution_config() {
+    CudaExecutionConfig result;
+    result.profile_filter = environment("MFQ_PROFILE_CUDA_FILTER").value_or("");
+    result.moe_route_stats_path = environment("MFQ_MOE_ROUTE_STATS").value_or("");
+    result.moe_route_output_energy = environment_flag(
+        "MFQ_MOE_ROUTE_OUTPUT_ENERGY", false);
+    result.report_cuda_memory = environment_flag("MFQ_REPORT_CUDA_MEMORY", false);
+
+    const auto parallel_graph = environment("MFQ_MODEL_PARALLEL_CUDA_GRAPH");
+    if (parallel_graph) {
+        result.model_parallel_cuda_graph = environment_flag(
+            "MFQ_MODEL_PARALLEL_CUDA_GRAPH", true);
+        result.tensor_parallel_cuda_graph = result.model_parallel_cuda_graph;
+        result.expert_parallel_cuda_graph = result.model_parallel_cuda_graph;
+    } else {
+        result.tensor_parallel_cuda_graph = environment_flag(
+            "MFQ_TP_CUDA_GRAPH", true);
+        result.expert_parallel_cuda_graph = environment_flag(
+            "MFQ_EP_CUDA_GRAPH", true);
+    }
+    result.tensor_parallel_grouped_projections = environment_flag(
+        "MFQ_TP_GROUPED_PROJECTIONS", true);
+    result.tensor_parallel_shared_linear_attention_input = environment_flag(
+        "MFQ_TP_SHARED_LINEAR_ATTENTION_INPUT", true);
+    result.tensor_parallel_mirror_linear_attention_scalars = environment_flag(
+        "MFQ_TP_MIRROR_LINEAR_ATTENTION_SCALARS", true);
+    result.tensor_parallel_mirror_qwen35_attention_kv = environment_flag(
+        "MFQ_TP_MIRROR_QWEN35_ATTENTION_KV", true);
+    result.model_parallel_reduce_to_primary = environment(
+        "MFQ_MODEL_PARALLEL_REDUCE_TO_PRIMARY")
+        ? environment_flag("MFQ_MODEL_PARALLEL_REDUCE_TO_PRIMARY", true)
+        : environment_flag("MFQ_TP_REDUCE_TO_PRIMARY", true);
+    result.model_parallel_fp16_reduce = environment(
+        "MFQ_MODEL_PARALLEL_FP16_REDUCE")
+        ? environment_flag("MFQ_MODEL_PARALLEL_FP16_REDUCE", true)
+        : environment_flag("MFQ_TP_FP16_REDUCE", true);
+    result.model_parallel_peer_first_launch = environment(
+        "MFQ_MODEL_PARALLEL_PEER_FIRST_LAUNCH")
+        ? environment_flag("MFQ_MODEL_PARALLEL_PEER_FIRST_LAUNCH", true)
+        : environment_flag("MFQ_TP_PEER_FIRST_LAUNCH", true);
+
+    result.decode_branch_parallel = enabled_unless_disabled(
+        "MFQ_DISABLE_DECODE_BRANCH_PARALLEL");
+    result.tensor_parallel_shard_native_float = environment_flag(
+        "MFQ_TP_SHARD_NATIVE_FLOAT", false);
+    result.nvq_fusion = environment("MFQ_DISABLE_NVQ_FUSION")
+        ? enabled_unless_disabled("MFQ_DISABLE_NVQ_FUSION")
+        : enabled_unless_disabled("MFQ_DISABLE_NIQ_FUSION");
+    result.nvq2_exec = environment("MFQ_DISABLE_NVQ2_EXEC")
+        ? enabled_unless_disabled("MFQ_DISABLE_NVQ2_EXEC")
+        : enabled_unless_disabled("MFQ_DISABLE_NIQ2_EXEC");
+    result.nvq_extended_group_exec = environment_flag(
+        "MFQ_NVQ_EXTENDED_GROUP_EXEC", false);
+    result.moe_nvq_heterogeneous = enabled_unless_disabled(
+        "MFQ_DISABLE_MOE_NVQ_HETERO");
+    result.moe_nvq_heterogeneous_decode =
+        enabled_unless_disabled("MFQ_DISABLE_MOE_NVQ_HETERO_DECODE") &&
+        !environment_flag("MFQ_NVQ_MOE_EXACT_REDUCTION", false) &&
+        !environment("MFQ_NVQ_MOE_ROWS_PER_BLOCK") &&
+        !environment("MFQ_NVQ_MOE_WARPS") &&
+        !environment("MFQ_NVQ_MOE_SHARE_GROUP_STATE");
+    result.moe_prefill_mma = enabled_unless_disabled(
+        "MFQ_DISABLE_MOE_PREFILL_MMA");
+    result.moe_prefill_mma_min_tokens = environment_int(
+        "MFQ_MOE_PREFILL_MMA_MIN_TOKENS", 9, 9,
+        std::numeric_limits<int>::max());
+    result.moe_small_heterogeneous = enabled_unless_disabled(
+        "MFQ_DISABLE_MOE_SMALL_HETERO");
+    result.moe_delayed_route_readback = environment_flag(
+        "MFQ_MOE_DELAYED_ROUTE_READBACK", true);
+    result.moe_projection_bundle_prefetch = enabled_unless_disabled(
+        "MFQ_DISABLE_MOE_PROJECTION_BUNDLE_PREFETCH");
+    result.split_moe_activation_reuse = enabled_unless_disabled(
+        "MFQ_DISABLE_SPLIT_MOE_ACTIVATION_REUSE");
+    result.moe_swiglu_quant_fusion = enabled_unless_disabled(
+        "MFQ_DISABLE_MOE_SWIGLU_QUANT_FUSION");
+    result.moe_reduce_gate_fusion = enabled_unless_disabled(
+        "MFQ_DISABLE_MOE_REDUCE_GATE_FUSION");
+    result.ffn_geglu_fusion = enabled_unless_disabled(
+        "MFQ_DISABLE_FFN_GEGLU_FUSION");
+    result.ffn_swiglu_fusion = enabled_unless_disabled(
+        "MFQ_DISABLE_FFN_SWIGLU_FUSION");
+    result.important_neuron_branch_parallel = enabled_unless_disabled(
+        "MFQ_DISABLE_IN_BRANCH_PARALLEL");
+    result.gemma4_fused_norms = environment_flag(
+        "MFQ_GEMMA4_FUSED_NORMS", true);
+    result.dsv4_groupwise_output_a = environment_flag(
+        "MFQ_DSV4_GROUPWISE_OUTPUT_A", true);
+    result.diagnostic_nint_group = enabled_unless_disabled(
+        "MFQ_DIAGNOSTIC_DISABLE_NINT_GROUP");
+    result.diagnostic_fp32_residual = environment_flag(
+        "MFQ_DIAGNOSTIC_FP32_RESIDUAL", false);
+    result.diagnostic_in_f32_down = environment_flag(
+        "MFQ_DIAGNOSTIC_IN_F32_DOWN", false);
+    result.kv_cache_write_aten = environment_flag(
+        "MFQ_KV_CACHE_WRITE_ATEN", false);
+    result.gdn_transposed_state = environment_flag(
+        "MFQ_GDN_TRANSPOSED_STATE", true);
+    result.linear_conv_prefill_fused = environment_flag(
+        "MFQ_LINEAR_CONV_PREFILL_FUSED", true);
+    result.minicpm_fused_bf16_rope = environment_flag(
+        "MFQ_MINICPM_FUSED_BF16_ROPE", true);
+    result.minicpm_fused_qk_norm_rope_kv = environment_flag(
+        "MFQ_MINICPM_FUSED_QK_NORM_ROPE_KV", true);
+    result.minicpm_fused_bf16_rmsnorm = environment_flag(
+        "MFQ_MINICPM_FUSED_BF16_RMSNORM", true);
+    result.minicpm_fused_rope_kv = environment_flag(
+        "MFQ_MINICPM_FUSED_ROPE_KV", true);
+    result.minicpm_bf16_flash128 = enabled_unless_disabled(
+        "MFQ_DISABLE_MINICPM_BF16_FLASH128");
+    result.minicpm_flash128_specialized_casts = enabled_unless_disabled(
+        "MFQ_DISABLE_MINICPM_FLASH128_SPECIALIZED_CASTS");
+    result.minicpm_bf16_gqa_decode = environment_flag(
+        "MFQ_MINICPM_BF16_GQA_DECODE", true);
+    result.minicpm_bf16_swiglu_fusion = enabled_unless_disabled(
+        "MFQ_DISABLE_MINICPM_BF16_SWIGLU_FUSION");
+    result.minicpm_bf16_residual_acc = enabled_unless_disabled(
+        "MFQ_DISABLE_MINICPM_BF16_RESIDUAL_ACC");
+    result.mma_attention = environment_flag("MFQ_MMA_ATTENTION", true);
+    result.mma_attention_decode = environment_flag(
+        "MFQ_MMA_ATTENTION_DECODE", true);
+    result.attention_decode_aten = environment_flag(
+        "MFQ_ATTENTION_DECODE_ATEN", false);
+    result.attention_decode_split_k = environment_flag(
+        "MFQ_ATTENTION_DECODE_SPLITK", true);
+    result.deepseek_v41_engram_cache_rows = environment_size(
+        "MFQ_DEEPSEEK_V41_ENGRAM_CACHE_ROWS", 16'384);
+    result.moe_mapped_gather = environment_flag("MFQ_MOE_MAPPED_GATHER", false);
+    result.moe_mapped_copy_blocks = environment_int(
+        "MFQ_MOE_MAPPED_COPY_BLOCKS", 64, 4, 128);
+    result.moe_ssd_io_workers = environment_int(
+        "MFQ_MOE_SSD_IO_WORKERS", 8, 1, 64);
+    result.moe_ssd_overlap = enabled_unless_disabled(
+        "MFQ_DISABLE_MOE_SSD_OVERLAP");
+    result.moe_ssd_ranges = enabled_unless_disabled(
+        "MFQ_DISABLE_MOE_SSD_RANGES");
+    return result;
 }
 
 void mfq_release_host_allocator_cache() noexcept {
@@ -79,17 +255,16 @@ double PrefillCudaTimer::elapsed_ms() const {
 } // namespace mfq::cuda::internal
 
 bool CudaProfiler::selected(const std::string& name) const {
-    const char* filter_value = std::getenv("MFQ_PROFILE_CUDA_FILTER");
-    if (filter_value == nullptr || filter_value[0] == '\0') return true;
+    if (filter.empty()) return true;
 
-    const std::string_view filter(filter_value);
+    const std::string_view filter_value(filter);
     size_t begin = 0;
-    while (begin <= filter.size()) {
-        const size_t end = filter.find(',', begin);
+    while (begin <= filter_value.size()) {
+        const size_t end = filter_value.find(',', begin);
         const size_t count = end == std::string_view::npos
-            ? filter.size() - begin
+            ? filter_value.size() - begin
             : end - begin;
-        if (filter.substr(begin, count) == name) return true;
+        if (filter_value.substr(begin, count) == name) return true;
         if (end == std::string_view::npos) break;
         begin = end + 1;
     }
@@ -282,6 +457,11 @@ KlKvCacheCapacityScope::~KlKvCacheCapacityScope() {
     execution.kl_kv_cache_capacity = previous_capacity;
 }
 
+CudaExecutionContext::CudaExecutionContext()
+    : config(load_cuda_execution_config()) {
+    profiler.filter = config.profile_filter;
+}
+
 void CudaExecutionContext::reset() noexcept {
     profiler.reset();
     moe_expert_cache.reset();
@@ -346,82 +526,23 @@ int model_parallel_primary_device(const CudaExecutionContext& execution) {
 
 
 bool model_parallel_cuda_graph_enabled(
-        const ParallelConfig& tensor_parallel,
-        const ParallelConfig& expert_parallel,
-        const ModelParallelCollectiveRuntime& collectives) {
-    if (!tensor_parallel.enabled() && !expert_parallel.enabled()) {
+        const CudaExecutionContext& execution) {
+    if (!execution.tensor_parallel.enabled() &&
+            !execution.expert_parallel.enabled()) {
         return true;
     }
-    const char * environment = std::getenv(
-        "MFQ_MODEL_PARALLEL_CUDA_GRAPH");
-    if (environment == nullptr) {
-        environment = std::getenv(
-            expert_parallel.enabled() && !tensor_parallel.enabled()
-                ? "MFQ_EP_CUDA_GRAPH"
-                : "MFQ_TP_CUDA_GRAPH");
-    }
-    return collectives.collectives_enabled &&
-           (environment == nullptr || environment[0] != '0');
-}
-
-bool tensor_parallel_grouped_projections_enabled() {
-    const char * environment = std::getenv(
-        "MFQ_TP_GROUPED_PROJECTIONS");
-    return environment == nullptr || std::atoi(environment) != 0;
-}
-
-bool tensor_parallel_shared_linear_attention_input_enabled() {
-    const char * environment = std::getenv(
-        "MFQ_TP_SHARED_LINEAR_ATTENTION_INPUT");
-    return environment == nullptr || std::atoi(environment) != 0;
-}
-
-bool tensor_parallel_mirror_linear_attention_scalars_enabled() {
-    const char * environment = std::getenv(
-        "MFQ_TP_MIRROR_LINEAR_ATTENTION_SCALARS");
-    return environment == nullptr || std::atoi(environment) != 0;
-}
-
-bool tensor_parallel_mirror_qwen35_attention_kv_enabled() {
-    const char * environment = std::getenv(
-        "MFQ_TP_MIRROR_QWEN35_ATTENTION_KV");
-    return environment == nullptr || std::atoi(environment) != 0;
-}
-
-bool model_parallel_reduce_to_primary_enabled() {
-    const char * environment = std::getenv(
-        "MFQ_MODEL_PARALLEL_REDUCE_TO_PRIMARY");
-    if (environment == nullptr) {
-        environment = std::getenv("MFQ_TP_REDUCE_TO_PRIMARY");
-    }
-    return environment == nullptr || std::atoi(environment) != 0;
-}
-
-bool model_parallel_fp16_reduce_enabled() {
-    const char * environment = std::getenv(
-        "MFQ_MODEL_PARALLEL_FP16_REDUCE");
-    if (environment == nullptr) {
-        environment = std::getenv("MFQ_TP_FP16_REDUCE");
-    }
-    return environment == nullptr || std::atoi(environment) != 0;
-}
-
-bool model_parallel_peer_first_launch_enabled() {
-    static const bool enabled = [] {
-        const char * environment = std::getenv(
-            "MFQ_MODEL_PARALLEL_PEER_FIRST_LAUNCH");
-        if (environment == nullptr) {
-            environment = std::getenv(
-                "MFQ_TP_PEER_FIRST_LAUNCH");
-        }
-        return environment == nullptr || std::atoi(environment) != 0;
-    }();
-    return enabled;
+    const bool enabled = execution.expert_parallel.enabled() &&
+            !execution.tensor_parallel.enabled()
+        ? execution.config.expert_parallel_cuda_graph
+        : execution.config.tensor_parallel_cuda_graph;
+    return execution.model_parallel_collectives.collectives_enabled && enabled;
 }
 
 size_t model_parallel_launch_index(
-        size_t launch_position, size_t shard_count) {
-    return model_parallel_peer_first_launch_enabled()
+        const CudaExecutionConfig& config,
+        size_t launch_position,
+        size_t shard_count) {
+    return config.model_parallel_peer_first_launch
         ? mfq::peer_first_parallel_launch_index(
             launch_position, shard_count)
         : launch_position;
@@ -461,16 +582,6 @@ mfq_tensor_backend::Tensor CudaExecutionContext::kl_mmq_prepare_activation(
 
 
 
-const char * moe_route_stats_path() {
-    const char * value = std::getenv("MFQ_MOE_ROUTE_STATS");
-    return value != nullptr && value[0] != '\0' ? value : nullptr;
-}
-
-bool moe_route_output_energy_enabled() {
-    const char * value = std::getenv("MFQ_MOE_ROUTE_OUTPUT_ENERGY");
-    return value != nullptr && std::atoi(value) != 0;
-}
-
 void record_moe_route_stats(
         CudaExecutionContext& execution,
         int layer,
@@ -478,7 +589,7 @@ void record_moe_route_stats(
         const mfq_tensor_backend::Tensor & weights,
         const mfq_tensor_backend::Tensor & output,
         int n_experts) {
-    if (layer < 0 || moe_route_stats_path() == nullptr) return;
+    if (layer < 0 || execution.config.moe_route_stats_path.empty()) return;
     auto& stats = execution.moe_route_stats;
     auto found = stats.find(layer);
     if (found == stats.end()) {
@@ -500,7 +611,7 @@ void record_moe_route_stats(
     found->second.weight_sum.scatter_add_(0, flat_ids, flat_weights);
     found->second.weight_sq_sum.scatter_add_(
         0, flat_ids, flat_weights.square());
-    if (moe_route_output_energy_enabled()) {
+    if (execution.config.moe_route_output_energy) {
         auto energy = output.reshape({flat_ids.numel(), output.size(-1)})
             .to(mfq_tensor_backend::kFloat32).square().sum(1).to(mfq_tensor_backend::kFloat64);
         found->second.output_energy.scatter_add_(0, flat_ids, energy);
@@ -510,11 +621,11 @@ void record_moe_route_stats(
 }
 
 void write_moe_route_stats(
+        const CudaExecutionConfig& config,
         const std::unordered_map<int, MoeRouteLayerStats>& stats) {
-    const char * path_value = moe_route_stats_path();
-    if (path_value == nullptr || stats.empty()) return;
+    if (config.moe_route_stats_path.empty() || stats.empty()) return;
     mfq_cuda_synchronize();
-    std::filesystem::path path(path_value);
+    std::filesystem::path path(config.moe_route_stats_path);
     if (path.has_parent_path()) {
         std::filesystem::create_directories(path.parent_path());
     }
@@ -557,7 +668,7 @@ void write_moe_route_stats(
     std::cout << "moe_route_stats_path=" << path.string()
               << " layers=" << layers.size()
               << " output_energy="
-              << (moe_route_output_energy_enabled() ? 1 : 0) << "\n";
+              << (config.moe_route_output_energy ? 1 : 0) << "\n";
 }
 
 void trace_gemma_stage(
@@ -572,14 +683,10 @@ void trace_gemma_stage(
     }
 }
 
-bool gemma4_fused_norms_enabled() {
-    const char * value = std::getenv("MFQ_GEMMA4_FUSED_NORMS");
-    return value == nullptr || std::atoi(value) != 0;
-}
-
-void report_cuda_memory(const char * stage) {
-    const char * enabled = std::getenv("MFQ_REPORT_CUDA_MEMORY");
-    if (enabled == nullptr || std::atoi(enabled) == 0) return;
+void report_cuda_memory(
+        const CudaExecutionConfig& config,
+        const char * stage) {
+    if (!config.report_cuda_memory) return;
     size_t free_bytes = 0;
     size_t total_bytes = 0;
     MFQ_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
@@ -599,12 +706,4 @@ void report_cuda_memory(const char * stage) {
               << " segments=" << stats.segments
               << " retries=" << stats.retries
               << " ooms=" << stats.ooms << "\n";
-}
-
-bool moe_small_glu_path_enabled(int tokens) {
-    static const bool disabled = [] {
-        const char * value = std::getenv("MFQ_DISABLE_MOE_SMALL_HETERO");
-        return value != nullptr && std::atoi(value) != 0;
-    }();
-    return tokens == 1 || (tokens <= 4 && !disabled);
 }

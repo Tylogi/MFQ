@@ -28,7 +28,8 @@ struct NintLinearGroup {
             parts.reserve(outs.size());
             std::vector<mfq_tensor_backend::Tensor> grouped_outputs;
             const bool parallel =
-                decode_branch_parallel_enabled(execution.decode_graph_serial_branches, xf.size(0)) &&
+                decode_branch_parallel_enabled(
+                    execution.config, execution.decode_graph_serial_branches, xf.size(0)) &&
                 branch_executor->run(
                     split_w.size(),
                     [&](size_t index) {

@@ -137,6 +137,7 @@ MiniCPMO45Model::adapter_finalize_hidden(
         int64_t tokens) const {
     return execution->profiler.measure("model.output_norm", [&]() {
         return qwen_rms_norm_bf16(
+            execution->config,
             hidden.reshape({batch * tokens, metadata.hidden_size}),
             output_norm, metadata.rms_norm_eps,
             metadata.norm_weight_offset)

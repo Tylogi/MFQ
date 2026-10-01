@@ -426,11 +426,8 @@ struct Dsv4Block : Block {
         auto grouped = attention.contiguous()
             .reshape({rows, groups, heads / groups * head_dim})
             .to(mfq_tensor_backend::kFloat16);
-        static const bool groupwise_enabled = [] {
-            const char * value = std::getenv("MFQ_DSV4_GROUPWISE_OUTPUT_A");
-            return value == nullptr || value[0] != '0';
-        }();
-        if (groupwise_enabled && output_a.is_nint() &&
+        if (execution.config.dsv4_groupwise_output_a &&
+                output_a.is_nint() &&
                 output_a.nint.bits == 8 && output_a.nint.gs == 48 &&
                 output_a.nint.out == groups * o_rank) {
             auto low_rank = profiler.measure("dsv4.output_a", [&]() {
@@ -442,7 +439,7 @@ struct Dsv4Block : Block {
                     .reshape({batch, tokens, hidden_size});
             });
         }
-        if (groupwise_enabled && output_a.is_mxfp8() &&
+        if (execution.config.dsv4_groupwise_output_a && output_a.is_mxfp8() &&
                 output_a.out() == groups * o_rank) {
             auto low_rank = profiler.measure(
                 "dsv4.output_a", [&]() {

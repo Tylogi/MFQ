@@ -87,7 +87,7 @@ def test_single_source_moe_cache_holds_full_demand_set() -> None:
 def test_moe_cache_capacity_failure_uses_full_projection_path() -> None:
     assert "if (!cache_->prepare(" in DECODE
     assert "count_full_projection_fallback" in DECODE
-    assert "stage_cpu_mixed_moe(cpu_)" in DECODE
+    assert "stage_cpu_mixed_moe(cpu_, execution.config)" in DECODE
 
 
 def test_optional_predictor_experts_join_the_shared_moe_cache() -> None:

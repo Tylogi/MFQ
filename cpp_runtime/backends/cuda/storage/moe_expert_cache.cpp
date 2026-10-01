@@ -909,11 +909,9 @@ MfeWeight load_mfe_gpu(
         int layer_id,
         const std::string & projection_role) {
     auto& cache = execution.moe_expert_cache;
-    const char * disable_ranges =
-        std::getenv("MFQ_DISABLE_MOE_SSD_RANGES");
     if (cache && cacheable &&
             !moe_parallel_config(execution).enabled() &&
-            (disable_ranges == nullptr || std::atoi(disable_ranges) == 0)) {
+            execution.config.moe_ssd_ranges) {
         const auto & record = require_tensor(mfq, name);
         try {
             auto store =
@@ -969,7 +967,8 @@ MfeWeight load_mfe_gpu(
                     to_cuda_device_moe_expert_slice(
                         cpu, slice.begin,
                         slice.end,
-                        slice.device));
+                        slice.device,
+                        execution.config));
             result.expert_parallel_shards.push_back({
                 slice.device,
                 slice.begin,
@@ -995,15 +994,19 @@ MfeWeight load_mfe_gpu(
         cpu.pools.begin(), cpu.pools.end(), [](const MfeCpuPool & pool) {
             return pool.dtype == "NINT";
         });
-    return all_nint ? to_gpu_mfe(cpu) : to_gpu_mixed_moe(cpu);
+    return all_nint
+        ? to_gpu_mfe(cpu)
+        : to_gpu_mixed_moe(cpu, execution.config);
 }
 
 std::shared_ptr<MixedMoeRuntime> load_mfe_cpu_offloaded(
         const mfq::ModelSource & mfq, const std::string & name) {
     return make_mixed_moe_runtime(load_mfe_cpu(mfq, name), false);
 }
-std::shared_ptr<MoeExpertCache> make_moe_expert_cache(std::int64_t bytes) {
-    return std::make_shared<MoeExpertCache>(bytes);
+std::shared_ptr<MoeExpertCache> make_moe_expert_cache(
+        std::int64_t bytes,
+        const CudaExecutionConfig& config) {
+    return std::make_shared<MoeExpertCache>(bytes, config);
 }
 
 bool moe_expert_cache_has_sources(

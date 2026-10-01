@@ -142,14 +142,15 @@ mfq_tensor_backend::Tensor RopeCache::apply(
         return output;
     }
 
-mfq_tensor_backend::Tensor RopeCache::apply_bf16(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos) const {
+mfq_tensor_backend::Tensor RopeCache::apply_bf16(
+        const CudaExecutionConfig& config,
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor pos) const {
         MFQ_RUNTIME_CHECK(
             sections.numel() == 0,
             "Qwen3 BF16 RoPE does not support multi-axis sections");
-        const char * fused_env =
-            std::getenv("MFQ_MINICPM_FUSED_BF16_ROPE");
         if (x.is_cuda() && pos.dim() == 1 &&
-                (fused_env == nullptr || fused_env[0] != '0')) {
+                config.minicpm_fused_bf16_rope) {
             return rope_table_bf16_cuda(
                 x.contiguous().to(mfq_tensor_backend::kBFloat16),
                 pos.contiguous().to(cos.device(), mfq_tensor_backend::kInt64),
@@ -258,7 +259,7 @@ mfq_tensor_backend::Tensor FFN::forward_tensor_parallel_dense(
              launch_position < shard_count;
              ++launch_position) {
             const size_t index = model_parallel_launch_index(
-                launch_position, shard_count);
+                execution.config, launch_position, shard_count);
             const auto & gate_shard =
                 gate_up.layers[0]
                     .tensor_parallel_shards[index];
@@ -346,20 +347,15 @@ mfq_tensor_backend::Tensor FFN::forward_expert_parallel_moe(
             shard_count);
         std::vector<mfq_tensor_backend::Tensor> down_partials;
         const bool collect_output_energy =
-            moe_route_stats_path() != nullptr &&
-            moe_route_output_energy_enabled();
+            !execution.config.moe_route_stats_path.empty() &&
+            execution.config.moe_route_output_energy;
         if (collect_output_energy) {
             down_partials.resize(shard_count);
         }
-        static const bool disable_swiglu_quant_fusion = [] {
-            const char * value = std::getenv(
-                "MFQ_DISABLE_MOE_SWIGLU_QUANT_FUSION");
-            return value != nullptr && std::atoi(value) != 0;
-        }();
         for (size_t launch_position = 0;
              launch_position < shard_count; ++launch_position) {
             const size_t index = model_parallel_launch_index(
-                launch_position, shard_count);
+                execution.config, launch_position, shard_count);
             const auto & gate_shard =
                 moe_gate_up.expert_parallel_shards[index];
             const auto & down_shard =
@@ -387,9 +383,10 @@ mfq_tensor_backend::Tensor FFN::forward_expert_parallel_moe(
             const bool allow_fusion =
                 gate_up_pair.defined() &&
                 !execution.force_moe_materialized_swiglu &&
-                !disable_swiglu_quant_fusion &&
-                moe_small_glu_path_enabled(
-                    static_cast<int>(gate_up_pair.size(0)));
+                execution.config.moe_swiglu_quant_fusion &&
+                (gate_up_pair.size(0) == 1 ||
+                 (gate_up_pair.size(0) <= 4 &&
+                  execution.config.moe_small_heterogeneous));
             if (projected_hidden.defined()) {
                 down_pair = down_shard.weight->forward(
                     execution, projected_hidden, local_route);
@@ -426,7 +423,7 @@ mfq_tensor_backend::Tensor FFN::forward_expert_parallel_moe(
             routed_partials[index] = moe_weighted_reduce_cuda(
                 down_pair, local_weights);
         }
-        if (moe_route_stats_path() != nullptr) {
+        if (!execution.config.moe_route_stats_path.empty()) {
             mfq_tensor_backend::Tensor complete_down;
             if (collect_output_energy) {
                 complete_down = reduce_model_parallel_outputs(
@@ -478,14 +475,10 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
             }
             const int64_t rows =
                 xh.numel() / xh.size(-1);
-            const char * f32_down =
-                std::getenv(
-                    "MFQ_DIAGNOSTIC_IN_F32_DOWN");
             const bool use_f32_down =
                 rows >= 16 &&
                 execution.kl_mmq_mode == KlMmqMode::Fp16 &&
-                f32_down != nullptr &&
-                f32_down[0] == '1';
+                execution.config.diagnostic_in_f32_down;
             if (use_f32_down) {
                 auto low =
                     forward_dense_f32_down_kld(execution, xh);
@@ -506,12 +499,10 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                         execution, xh, input_ids, false);
             };
             std::vector<mfq_tensor_backend::Tensor> outputs;
-            const char * disable_parallel =
-                std::getenv("MFQ_DISABLE_IN_BRANCH_PARALLEL");
             const bool parallel =
-                decode_branch_parallel_enabled(execution.decode_graph_serial_branches, rows) &&
-                (disable_parallel == nullptr ||
-                 disable_parallel[0] != '1') &&
+                decode_branch_parallel_enabled(
+                    execution.config, execution.decode_graph_serial_branches, rows) &&
+                execution.config.important_neuron_branch_parallel &&
                 important_neuron_executor->run(
                     2, run_branch, outputs);
             auto low = parallel ? outputs[0] : run_branch(0);
@@ -639,18 +630,9 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
             // then launches H2D on its separate stream.  The projection
             // forward below still performs the normal cache check and stream
             // wait, preserving the existing execution semantics.
-            static const bool delayed_route_readback = [] {
-                const char * value =
-                    std::getenv("MFQ_MOE_DELAYED_ROUTE_READBACK");
-                return value == nullptr || std::atoi(value) != 0;
-            }();
-            static const bool disable_projection_bundle = [] {
-                const char * value = std::getenv(
-                    "MFQ_DISABLE_MOE_PROJECTION_BUNDLE_PREFETCH");
-                return value != nullptr && std::atoi(value) != 0;
-            }();
             auto prefetch_projection_bundle = [&]() {
-                if (disable_projection_bundle || cpu_moe_down ||
+                if (!execution.config.moe_projection_bundle_prefetch ||
+                        cpu_moe_down ||
                         execution.continuous_batch_cache_serial) {
                     return false;
                 }
@@ -665,7 +647,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
             };
             bool projection_bundle_prefetched = false;
             if (moe_split_gate_up) {
-                if (delayed_route_readback) {
+                if (execution.config.moe_delayed_route_readback) {
                     moe_gate.prefetch_begin(route);
                 } else {
                     projection_bundle_prefetched =
@@ -675,7 +657,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                     }
                 }
             } else {
-                if (delayed_route_readback) {
+                if (execution.config.moe_delayed_route_readback) {
                     moe_gate_up.prefetch_begin(route);
                 } else {
                     projection_bundle_prefetched =
@@ -698,7 +680,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                         .contiguous();
                 });
             }
-            if (delayed_route_readback) {
+            if (execution.config.moe_delayed_route_readback) {
                 projection_bundle_prefetched =
                     prefetch_projection_bundle();
                 if (!projection_bundle_prefetched) {
@@ -721,25 +703,20 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                 if (cpu_moe_gate) {
                     staged_gate.emplace(profiler.measure(
                         "moe.cpu_offload_gate_h2d", [&]() {
-                            return stage_cpu_mixed_moe(cpu_moe_gate);
+                            return stage_cpu_mixed_moe(cpu_moe_gate, execution.config);
                         }));
                     active_gate = &staged_gate.value();
                 }
                 if (cpu_moe_up) {
                     staged_up.emplace(profiler.measure(
                         "moe.cpu_offload_up_h2d", [&]() {
-                            return stage_cpu_mixed_moe(cpu_moe_up);
+                            return stage_cpu_mixed_moe(cpu_moe_up, execution.config);
                         }));
                     active_up = &staged_up.value();
                 }
                 gate_up_pair = profiler.measure("moe.gate_up_split", [&]() {
-                    static const bool disable_activation_reuse = [] {
-                        const char * value = std::getenv(
-                            "MFQ_DISABLE_SPLIT_MOE_ACTIVATION_REUSE");
-                        return value != nullptr && std::atoi(value) != 0;
-                    }();
                     const bool reuse_gate_activation =
-                        !disable_activation_reuse &&
+                        execution.config.split_moe_activation_reuse &&
                         execution.kl_mmq_mode ==
                             KlMmqMode::Default &&
                         xf.size(0) <= 8 &&
@@ -767,7 +744,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                 if (cpu_moe_gate_up) {
                     staged_gate_up.emplace(profiler.measure(
                         "moe.cpu_offload_gate_up_h2d", [&]() {
-                            return stage_cpu_mixed_moe(cpu_moe_gate_up);
+                            return stage_cpu_mixed_moe(cpu_moe_gate_up, execution.config);
                         }));
                     active_gate_up = &staged_gate_up.value();
                 }
@@ -799,21 +776,18 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
             if (cpu_moe_down) {
                 staged_down.emplace(profiler.measure(
                     "moe.cpu_offload_down_h2d", [&]() {
-                        return stage_cpu_mixed_moe(cpu_moe_down);
+                        return stage_cpu_mixed_moe(cpu_moe_down, execution.config);
                     }));
                 active_down = &staged_down.value();
             }
-            static const bool disable_swiglu_quant_fusion = [] {
-                const char * value = std::getenv("MFQ_DISABLE_MOE_SWIGLU_QUANT_FUSION");
-                return value != nullptr && std::atoi(value) != 0;
-            }();
             mfq_tensor_backend::Tensor down_pair;
             const bool allow_swiglu_quant_fusion =
                 gate_up_pair.defined() &&
                 !execution.force_moe_materialized_swiglu &&
-                !disable_swiglu_quant_fusion &&
-                moe_small_glu_path_enabled(
-                    static_cast<int>(gate_up_pair.size(0)));
+                execution.config.moe_swiglu_quant_fusion &&
+                (gate_up_pair.size(0) == 1 ||
+                 (gate_up_pair.size(0) <= 4 &&
+                  execution.config.moe_small_heterogeneous));
             if (projected_hidden.defined()) {
                 down_pair = profiler.measure("moe.down", [&]() {
                     return active_down->forward(
@@ -854,13 +828,9 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                 execution, moe_layer, selected.at(0), selected.at(1), down_pair,
                 moe_split_gate_up ? moe_gate.n_experts : moe_gate_up.n_experts);
             staged_down.reset();
-            static const bool disable_reduce_gate_fusion = [] {
-                const char * value = std::getenv("MFQ_DISABLE_MOE_REDUCE_GATE_FUSION");
-                return value != nullptr && std::atoi(value) != 0;
-            }();
             const bool fuse_reduce_gate =
                 !execution.force_moe_unfused_reduce &&
-                !disable_reduce_gate_fusion && !moe_shared_ungated &&
+                execution.config.moe_reduce_gate_fusion && !moe_shared_ungated &&
                 down_pair.size(0) <= 8;
             mfq_tensor_backend::Tensor routed;
             if (!fuse_reduce_gate) {
@@ -892,9 +862,8 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
             });
         }
         if (geglu) {
-            const char * disable_geglu = std::getenv("MFQ_DISABLE_FFN_GEGLU_FUSION");
             const bool geglu_fusion_enabled =
-                disable_geglu == nullptr || disable_geglu[0] != '1';
+                execution.config.ffn_geglu_fusion;
             if (geglu_fusion_enabled && xh.numel() / xh.size(-1) == 1 && gate_up.nint_grouped &&
                 gate_up.nint.split_w.empty()) {
                 auto act = profiler.measure("ffn.gate_up_geglu", [&]() {
@@ -925,7 +894,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                 return down.forward(execution, act);
             });
         }
-        if (nvq_fusion_enabled() && xh.numel() / xh.size(-1) == 1 &&
+        if (nvq_fusion_enabled(execution.config) && xh.numel() / xh.size(-1) == 1 &&
             gate_up.nvq_prefix2 && gate_up.layers.size() == 2 &&
             gate_up.layers[0].is_nvq() && gate_up.layers[1].is_nvq() && down.is_nvq() &&
             gate_up.outs.size() == 2 && gate_up.outs[0] == gate_up.outs[1] &&
@@ -939,8 +908,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                 xh.reshape({-1, xh.size(-1)}));
             return y.reshape(shape);
         }
-        const char* disable_swiglu = std::getenv("MFQ_DISABLE_FFN_SWIGLU_FUSION");
-        if ((disable_swiglu == nullptr || disable_swiglu[0] != '1') &&
+        if (execution.config.ffn_swiglu_fusion &&
             xh.numel() / xh.size(-1) >= 1 && xh.numel() / xh.size(-1) <= 6 &&
             gate_up.nint_grouped && gate_up.nint.split_w.empty() &&
             gate_up.outs.size() == 2 && gate_up.outs[0] == gate_up.outs[1]) {
@@ -960,14 +928,11 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
     }
 
 bool FFN::can_forward_fused_residual(
+    const CudaExecutionConfig& config,
     const mfq_tensor_backend::Tensor & x,
     const mfq_tensor_backend::Tensor & residual) const {
-        const char * fp32_residual_env =
-            std::getenv("MFQ_DIAGNOSTIC_FP32_RESIDUAL");
-        if (fp32_residual_env != nullptr && fp32_residual_env[0] == '1') {
-            return false;
-        }
-        if (!nvq_fusion_enabled() || is_moe || geglu ||
+        if (config.diagnostic_fp32_residual) return false;
+        if (!nvq_fusion_enabled(config) || is_moe || geglu ||
             swiglu_limit > 0.0 || important_neurons ||
             tensor_parallel_dense_compatible() ||
             !x.is_cuda() || !residual.is_cuda() ||
@@ -995,10 +960,11 @@ bool FFN::can_forward_fused_residual(
 
 mfq_tensor_backend::Tensor FFN::forward_fused_residual(
     CudaProfiler& profiler,
+    const CudaExecutionConfig& config,
     mfq_tensor_backend::Tensor x,
     mfq_tensor_backend::Tensor residual) const {
         MFQ_RUNTIME_CHECK(
-            can_forward_fused_residual(x, residual),
+            can_forward_fused_residual(config, x, residual),
             "FFN fused residual requires a compatible single-token NVQ FFN");
         auto shape = x.sizes().vec();
         shape.back() = down.nvq.out;
@@ -1019,6 +985,7 @@ mfq_tensor_backend::Tensor FFN::forward(
     }
 
 std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> KVCache::append(
+        const CudaExecutionConfig& config,
         mfq_tensor_backend::Tensor kk, mfq_tensor_backend::Tensor vv, mfq_tensor_backend::Tensor pos,
         int64_t start_pos, int64_t end_pos,
         bool contiguous_prefill_prefix) {
@@ -1058,13 +1025,11 @@ std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> KVCache::appen
              (pos.dim() == 2 && pos.size(0) == kh.size(0) &&
               pos.size(1) == kh.size(2))),
             "KV cache write requires positions [T] or [B,T]");
-        const char * aten_write_env = std::getenv("MFQ_KV_CACHE_WRITE_ATEN");
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
-        const bool aten_write =
-            aten_write_env != nullptr && aten_write_env[0] == '1';
+        const bool aten_write = config.kv_cache_write_aten;
 #else
         const bool aten_write = k.scalar_type() != mfq_tensor_backend::kFloat16 ||
-            (aten_write_env != nullptr && aten_write_env[0] == '1');
+            config.kv_cache_write_aten;
 #endif
         if (k.is_cuda() && !aten_write && !ring) {
             auto out = kv_cache_write_cuda(k, v, kh, vh, pos);
@@ -1203,6 +1168,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
         auto xn = profiler.measure("full.attn_norm", [&]() {
             return official_bf16
                 ? qwen_rms_norm_bf16(
+                    execution.config,
                     x.reshape({B * T, H}), attn_norm,
                     rms_norm_eps, norm_weight_offset)
                     .reshape({B, T, H})
@@ -1266,8 +1232,6 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
         const bool grid_mrope_positions = B == 1 &&
             cache_positions.has_value() && pos.dim() == 2 &&
             pos.size(0) == 3;
-        const char * fused_qk_rope_kv_env =
-            std::getenv("MFQ_MINICPM_FUSED_QK_NORM_ROPE_KV");
         const bool fused_qk_rope_kv = official_bf16 && x.is_cuda() &&
             write_positions.dim() == 1 && pos.dim() == 1 && T == 1 &&
             !cache.is_paged() && !cache.ring && !v_norm.defined() &&
@@ -1275,8 +1239,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             active_rope.rotary_dim == 128 &&
             active_rope.sections.numel() == 0 && nh == 32 && nkh == 8 &&
             hd == 128 && cache.scalar_type() == mfq_tensor_backend::kBFloat16 &&
-            (fused_qk_rope_kv_env == nullptr ||
-             fused_qk_rope_kv_env[0] != '0');
+            execution.config.minicpm_fused_qk_norm_rope_kv;
         std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> kv;
         if (fused_qk_rope_kv) {
             q = profiler.measure("full.qk_norm_rope_kv_write", [&]() {
@@ -1292,11 +1255,8 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                 cache.k.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()}),
                 cache.v.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()})};
         } else {
-        const char * fused_bf16_norm_env =
-            std::getenv("MFQ_MINICPM_FUSED_BF16_RMSNORM");
         const bool fused_bf16_norm = official_bf16 &&
-            (fused_bf16_norm_env == nullptr ||
-             fused_bf16_norm_env[0] != '0');
+            execution.config.minicpm_fused_bf16_rmsnorm;
         if (fused_bf16_norm && q_norm.defined() && k_norm.defined() &&
                 q.scalar_type() == mfq_tensor_backend::kBFloat16 &&
                 k.scalar_type() == mfq_tensor_backend::kBFloat16) {
@@ -1321,6 +1281,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             if (q_norm.defined()) q = profiler.measure("full.q_norm", [&]() {
                 return official_bf16
                     ? qwen_rms_norm_bf16(
+                    execution.config,
                         q.reshape({-1, hd}), q_norm,
                         rms_norm_eps, norm_weight_offset).reshape_as(q)
                     : qwen_rms_norm(
@@ -1332,6 +1293,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             if (k_norm.defined()) k = profiler.measure("full.k_norm", [&]() {
                 return official_bf16
                     ? qwen_rms_norm_bf16(
+                    execution.config,
                         k.reshape({-1, hd}), k_norm,
                         rms_norm_eps, norm_weight_offset).reshape_as(k)
                     : qwen_rms_norm(
@@ -1344,6 +1306,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
         if (v_norm.defined()) v = profiler.measure("full.v_norm", [&]() {
             return official_bf16
                 ? qwen_rms_norm_bf16(
+                    execution.config,
                     v.reshape({-1, hd}), v_norm,
                     rms_norm_eps, norm_weight_offset).reshape_as(v)
                 : qwen_rms_norm(
@@ -1351,14 +1314,12 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                     v_norm, rms_norm_eps, norm_weight_offset)
                     .reshape_as(v);
         });
-        const char * fused_rope_kv_env =
-            std::getenv("MFQ_MINICPM_FUSED_ROPE_KV");
         const bool fused_rope_kv = official_bf16 && x.is_cuda() &&
             write_positions.dim() == 1 && pos.dim() == 1 && T == 1 &&
             !cache.is_paged() && !cache.ring && active_rope.rotary_dim == 128 &&
             active_rope.sections.numel() == 0 && nh == 32 && nkh == 8 &&
             hd == 128 && cache.scalar_type() == mfq_tensor_backend::kBFloat16 &&
-            (fused_rope_kv_env == nullptr || fused_rope_kv_env[0] != '0');
+            execution.config.minicpm_fused_rope_kv;
         if (fused_rope_kv) {
             q = profiler.measure("full.rope_kv_write", [&]() {
                 return minicpm_bf16_rope_cache_write_cuda(
@@ -1373,17 +1334,17 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
         } else {
             q = profiler.measure("full.q_rope", [&]() {
                 return official_bf16
-                    ? active_rope.apply_bf16(q, pos)
+                    ? active_rope.apply_bf16(execution.config, q, pos)
                     : active_rope.apply(q, pos, grid_mrope_positions);
             });
             k = profiler.measure("full.k_rope", [&]() {
                 return official_bf16
-                    ? active_rope.apply_bf16(k, pos)
+                    ? active_rope.apply_bf16(execution.config, k, pos)
                     : active_rope.apply(k, pos, grid_mrope_positions);
             });
             kv = profiler.measure("full.kv_write", [&]() {
                 return cache.append(
-                    k, v, write_positions, cache_pos, cache_pos + T,
+                    execution.config, k, v, write_positions, cache_pos, cache_pos + T,
                     !seq_len.has_value());
             });
         }
@@ -1497,19 +1458,13 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             auto vh = v.to(attention_dtype).contiguous();
             if (cache_pos == 0 && T > 1) {
                 if (official_bf16) {
-                    const char* bf16_flash128_disabled =
-                        std::getenv("MFQ_DISABLE_MINICPM_BF16_FLASH128");
                     const bool bf16_flash128 = !sliding && hd == 128 &&
                         nh == 4 * nkh && !seq_len.has_value() &&
                         !attention_mask.has_value() &&
-                        (bf16_flash128_disabled == nullptr ||
-                         bf16_flash128_disabled[0] != '1');
+                        execution.config.minicpm_bf16_flash128;
                     if (bf16_flash128) {
-                        const char* specialized_casts_disabled = std::getenv(
-                            "MFQ_DISABLE_MINICPM_FLASH128_SPECIALIZED_CASTS");
                         const bool specialized_casts =
-                            specialized_casts_disabled == nullptr ||
-                            specialized_casts_disabled[0] != '1';
+                            execution.config.minicpm_flash128_specialized_casts;
                         auto flash_q = profiler.measure(
                             "full.flash128_q_cast", [&]() {
                                 return specialized_casts
@@ -1559,9 +1514,8 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                             0.0, !mask.has_value(), attn_scale, false);
                     }
                 } else {
-                const char * mma_attention_env = std::getenv("MFQ_MMA_ATTENTION");
                 const bool mma_attention_enabled =
-                    mma_attention_env == nullptr || mma_attention_env[0] != '0';
+                    execution.config.mma_attention;
                 if (!sliding && T % 256 == 0 && hd == 512 && nh == 8 * nkh &&
                     mma_attention_enabled) {
                     a = mfq_attention_mma512_cuda(
@@ -1589,15 +1543,13 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             } else if (seq_len.has_value()) {
                 const int64_t planned_len = planned_kv_length > 0
                     ? planned_kv_length : cache_pos + T;
-                const char * aten_decode_env = std::getenv("MFQ_ATTENTION_DECODE_ATEN");
-                const char * bf16_gqa_env = std::getenv("MFQ_MINICPM_BF16_GQA_DECODE");
                 const bool bf16_gqa_decode = official_bf16 && T == 1 &&
-                    (bf16_gqa_env == nullptr || bf16_gqa_env[0] != '0');
-                const bool aten_decode_enabled = (official_bf16 && !bf16_gqa_decode) ||
-                    (aten_decode_env != nullptr && aten_decode_env[0] == '1');
-                const char * mma_decode_env = std::getenv("MFQ_MMA_ATTENTION_DECODE");
+                    execution.config.minicpm_bf16_gqa_decode;
+                const bool aten_decode_enabled =
+                    (official_bf16 && !bf16_gqa_decode) ||
+                    execution.config.attention_decode_aten;
                 const bool mma_decode_enabled =
-                    mma_decode_env == nullptr || mma_decode_env[0] != '0';
+                    execution.config.mma_attention_decode;
                 auto prepare_mma_decode_workspace = [&](int64_t visible_len, int64_t kv_tile) {
                     const int64_t mask_stride = (visible_len + kv_tile - 1) / kv_tile * kv_tile;
                     const int64_t ntiles_kv = (visible_len + kv_tile - 1) / kv_tile;
@@ -1618,10 +1570,8 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                     }
                 };
                 if (cache.is_paged()) {
-                    const char * split_env =
-                        std::getenv("MFQ_ATTENTION_DECODE_SPLITK");
                     const bool split_enabled =
-                        split_env == nullptr || split_env[0] != '0';
+                        execution.config.attention_decode_split_k;
                     int64_t parts = split_enabled && cache_pos >= 192
                         ? (cache_pos + 127) / 128 : 1;
                     const bool dynamic_parts =
@@ -1684,9 +1634,8 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                         qh, cache.k, cache.v, seq_len.value(),
                         attn_scale, attention_window, planned_len);
                 } else {
-                        const char * split_env = std::getenv("MFQ_ATTENTION_DECODE_SPLITK");
                         const bool split_enabled =
-                            split_env == nullptr || split_env[0] != '0';
+                            execution.config.attention_decode_split_k;
                         int64_t parts = split_enabled && cache_pos >= 192
                             ? (cache_pos + 127) / 128 : 1;
                         if (split_enabled && decode_attention_parts > 0) {
@@ -1764,7 +1713,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
         if (gemma4) {
             trace_gemma_stage(execution, layer, "attention_output", oo);
             const bool fused_norms = gemma4_moe &&
-                gemma4_fused_norms_enabled() &&
+                execution.config.gemma4_fused_norms &&
                 execution.gemma_stage_trace == nullptr &&
                 layer_scale.defined();
             mfq_tensor_backend::Tensor dense_input;
@@ -1972,6 +1921,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                     .to(rr.scalar_type()).contiguous();
                 auto normalized = official_bf16
                     ? qwen_rms_norm_bf16(
+                    execution.config,
                         summed, ffn_norm, rms_norm_eps, norm_weight_offset)
                     : qwen_rms_norm(
                         summed.to(mfq_tensor_backend::kFloat32), ffn_norm,
@@ -1981,10 +1931,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             if (oo2.scalar_type() != rr.scalar_type()) {
                 oo2 = oo2.to(rr.scalar_type()).contiguous();
             }
-            const char * fp32_residual_env =
-                std::getenv("MFQ_DIAGNOSTIC_FP32_RESIDUAL");
-            if (fp32_residual_env != nullptr &&
-                    fp32_residual_env[0] == '1') {
+            if (execution.config.diagnostic_fp32_residual) {
                 return acc_rms_norm_cuda(
                     rr.to(mfq_tensor_backend::kFloat32),
                     oo2.to(mfq_tensor_backend::kFloat32),
@@ -2020,10 +1967,12 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
         if (!official_bf16) {
             auto ffn_input = xn.reshape({B * T, H});
             auto residual_flat = residual.reshape({B * T, H});
-            if (ffn.can_forward_fused_residual(ffn_input, residual_flat)) {
+            if (ffn.can_forward_fused_residual(
+                    execution.config, ffn_input, residual_flat)) {
                 return profiler.measure("full.ffn_down_residual", [&]() {
                     return ffn.forward_fused_residual(
-                        profiler, ffn_input, residual_flat)
+                        profiler, execution.config,
+                        ffn_input, residual_flat)
                         .reshape({B, T, H});
                 });
             }
@@ -2044,9 +1993,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             auto activation = profiler.measure(
                 "full.minicpmo45_ffn_swiglu",
                 [&]() {
-                    const char * disabled = std::getenv(
-                        "MFQ_DISABLE_MINICPM_BF16_SWIGLU_FUSION");
-                    if (disabled == nullptr || disabled[0] != '1') {
+                    if (execution.config.minicpm_bf16_swiglu_fusion) {
                         return silu_mul_cuda(gate, up);
                     }
                     return (mfq_tensor_backend::silu(gate) * up).contiguous();
@@ -2072,10 +2019,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                 return (rr.to(mfq_tensor_backend::kFloat32) + ff2.to(mfq_tensor_backend::kFloat32))
                     .to(rr.scalar_type()).reshape({B, T, H}).contiguous();
             }
-            const char * fp32_residual_env =
-                std::getenv("MFQ_DIAGNOSTIC_FP32_RESIDUAL");
-            if (fp32_residual_env != nullptr &&
-                    fp32_residual_env[0] == '1') {
+            if (execution.config.diagnostic_fp32_residual) {
                 rr = rr.to(mfq_tensor_backend::kFloat32);
                 ff2 = ff2.to(mfq_tensor_backend::kFloat32);
             } else if (ff2.scalar_type() != rr.scalar_type()) {
@@ -2083,10 +2027,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             }
             if (rr.scalar_type() == mfq_tensor_backend::kBFloat16 &&
                     ff2.scalar_type() == mfq_tensor_backend::kBFloat16) {
-                const char* specialized_acc_disabled =
-                    std::getenv("MFQ_DISABLE_MINICPM_BF16_RESIDUAL_ACC");
-                if (specialized_acc_disabled == nullptr ||
-                        specialized_acc_disabled[0] != '1') {
+                if (execution.config.minicpm_bf16_residual_acc) {
                     return acc_cuda(rr, ff2).reshape({B, T, H});
                 }
                 return (rr + ff2).contiguous().reshape({B, T, H});
@@ -2120,14 +2061,13 @@ mfq_tensor_backend::Tensor qwen_rms_norm(
 }
 
 mfq_tensor_backend::Tensor qwen_rms_norm_bf16(
+        const CudaExecutionConfig& config,
         mfq_tensor_backend::Tensor x,
         mfq_tensor_backend::Tensor weight,
         double eps,
         double weight_offset) {
     auto input = x.contiguous().to(mfq_tensor_backend::kBFloat16);
-    const char * fused_env = std::getenv("MFQ_MINICPM_FUSED_BF16_RMSNORM");
-    if (input.is_cuda() &&
-            (fused_env == nullptr || fused_env[0] != '0')) {
+    if (input.is_cuda() && config.minicpm_fused_bf16_rmsnorm) {
         return qwen_rms_norm_bf16_cuda(
             input, weight.contiguous(), eps, weight_offset);
     }

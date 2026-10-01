@@ -41,6 +41,7 @@ struct MfqDropFileCacheGuard {
 };
 
 bool decode_branch_parallel_enabled(
+    const CudaExecutionConfig& config,
     bool serial_branches,
     std::int64_t rows);
 

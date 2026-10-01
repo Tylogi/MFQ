@@ -11,14 +11,14 @@ SERVER = "\n".join(
     for path in sorted(TRANSPORT_SRC.rglob("*"))
     if path.suffix in {".cpp", ".h"}
 )
-RUNTIME_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda" / "engine"
+CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
 RUNTIME = "\n".join(
-    (RUNTIME_ROOT / name).read_text(encoding="utf-8")
+    (CUDA_ROOT / name).read_text(encoding="utf-8")
     for name in (
-        "cuda_execution.h",
-        "cuda_execution.cpp",
-        "generation.h",
-        "generation.cpp",
+        "ops/include/cuda_execution.h",
+        "ops/cuda_execution.cpp",
+        "engine/generation.h",
+        "engine/generation.cpp",
     )
 )
 SAMPLING = (

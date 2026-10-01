@@ -619,7 +619,7 @@ void setup_cuda_load(
             }
             execution.moe_expert_cache =
                 make_moe_expert_cache(
-                    static_cast<int64_t>(bytes));
+                    static_cast<int64_t>(bytes), execution.config);
             if (!moe_cache_profile_path.empty()) {
                 set_moe_expert_cache_profile(
                     *execution.moe_expert_cache,

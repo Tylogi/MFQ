@@ -251,10 +251,7 @@ struct CudaGenerationOps {
             execution.dsv4_cpu_offload_layers.empty() &&
             execution.dense_cpu_layer_count == 0 &&
             !execution.moe_expert_cache &&
-            model_parallel_cuda_graph_enabled(
-                execution.tensor_parallel,
-                execution.expert_parallel,
-                execution.model_parallel_collectives) &&
+            model_parallel_cuda_graph_enabled(execution) &&
             generation_limit >= graph_config.minimum_generation_tokens &&
             generation_limit <= graph.generated_capacity;
     }
@@ -336,7 +333,7 @@ struct CudaGenerationOps {
                     graph.static_input, graph.static_pos,
                     graph.static_len);
             });
-        if (!hit) report_cuda_memory("runtime_graph_capture");
+        if (!hit) report_cuda_memory(execution.config, "runtime_graph_capture");
         if (graph_config.trace) {
             std::cerr << "runtime_cuda_graph action="
                       << (hit ? "reuse" : "capture")

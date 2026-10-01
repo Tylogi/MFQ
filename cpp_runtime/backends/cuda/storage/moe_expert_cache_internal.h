@@ -4,7 +4,9 @@
 
 class MoeExpertCache : public std::enable_shared_from_this<MoeExpertCache> {
 public:
-    explicit MoeExpertCache(int64_t budget_bytes)
+    MoeExpertCache(
+            int64_t budget_bytes,
+            const CudaExecutionConfig& config)
         : budget_bytes_(budget_bytes) {
         if (budget_bytes_ <= 0) {
             throw std::invalid_argument(
@@ -27,28 +29,12 @@ public:
             MFQ_CUDA_CHECK(cudaEventCreateWithFlags(
                 &stage.done, cudaEventDisableTiming));
         }
-        const char * mapped = std::getenv("MFQ_MOE_MAPPED_GATHER");
-        mapped_gather_enabled_ =
-            mapped != nullptr && std::atoi(mapped) != 0;
-        const char * blocks =
-            std::getenv("MFQ_MOE_MAPPED_COPY_BLOCKS");
-        if (blocks != nullptr) {
-            mapped_copy_blocks_ = std::max(
-                4, std::min(128, std::atoi(blocks)));
-        }
-        int range_workers = 8;
-        const char * workers =
-            std::getenv("MFQ_MOE_SSD_IO_WORKERS");
-        if (workers != nullptr) {
-            range_workers = std::max(
-                1, std::min(64, std::atoi(workers)));
-        }
+        mapped_gather_enabled_ = config.moe_mapped_gather;
+        mapped_copy_blocks_ = config.moe_mapped_copy_blocks;
         range_read_pool_ =
-            std::make_unique<mfq::cuda::MfeMxfp4ReadPool>(range_workers);
-        const char * disable_overlap =
-            std::getenv("MFQ_DISABLE_MOE_SSD_OVERLAP");
-        range_overlap_enabled_ =
-            disable_overlap == nullptr || std::atoi(disable_overlap) == 0;
+            std::make_unique<mfq::cuda::MfeMxfp4ReadPool>(
+                config.moe_ssd_io_workers);
+        range_overlap_enabled_ = config.moe_ssd_overlap;
     }
 
     ~MoeExpertCache() {

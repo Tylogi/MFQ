@@ -157,10 +157,7 @@ static bool qwen_continuous_batch_cuda_graph_enabled(
     return config.cuda_graph &&
         !qwen_continuous_batch_has_cached_moe(model) &&
         mfq_cuda_graph_capture_supported() &&
-        model_parallel_cuda_graph_enabled(
-            execution.tensor_parallel,
-            execution.expert_parallel,
-            execution.model_parallel_collectives);
+        model_parallel_cuda_graph_enabled(execution);
 }
 
 static QwenBatchState take_qwen_batch_state(

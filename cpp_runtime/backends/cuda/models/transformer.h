@@ -36,6 +36,7 @@ mfq_tensor_backend::Tensor qwen_rms_norm(
     double weight_offset);
 
 mfq_tensor_backend::Tensor qwen_rms_norm_bf16(
+    const CudaExecutionConfig& config,
     mfq_tensor_backend::Tensor x,
     mfq_tensor_backend::Tensor weight,
     double eps,
@@ -120,7 +121,10 @@ struct RopeCache {
             mfq_tensor_backend::Tensor pos,
             bool grid_mrope_positions = false) const;
 
-    mfq_tensor_backend::Tensor apply_bf16(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos) const;
+    mfq_tensor_backend::Tensor apply_bf16(
+        const CudaExecutionConfig& config,
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor pos) const;
 };
 
 struct FFN {
@@ -183,11 +187,13 @@ struct FFN {
         bool allow_important_neurons) const;
 
     bool can_forward_fused_residual(
+        const CudaExecutionConfig& config,
         const mfq_tensor_backend::Tensor & x,
         const mfq_tensor_backend::Tensor & residual) const;
 
     mfq_tensor_backend::Tensor forward_fused_residual(
         CudaProfiler& profiler,
+        const CudaExecutionConfig& config,
         mfq_tensor_backend::Tensor x,
         mfq_tensor_backend::Tensor residual) const;
 
@@ -265,6 +271,7 @@ struct KVCache {
     }
 
     std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> append(
+            const CudaExecutionConfig& config,
             mfq_tensor_backend::Tensor kk, mfq_tensor_backend::Tensor vv, mfq_tensor_backend::Tensor pos,
             int64_t start_pos, int64_t end_pos,
             bool contiguous_prefill_prefix = false);

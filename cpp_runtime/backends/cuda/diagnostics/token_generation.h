@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/cuda_execution.h"
+#include "cuda_execution.h"
 #include "engine/decode_graph.h"
 #include "storage/moe_expert_cache.h"
 #include "mfq_tensor_backend.h"
@@ -29,11 +29,11 @@ int generate_diagnostic_tokens(
         auto next = model.next_token(ids);
         mfq_cuda_synchronize();
         auto t2 = std::chrono::steady_clock::now();
-        report_cuda_memory("prefill");
+        report_cuda_memory(execution.config, "prefill");
         const char * empty_cache_env = std::getenv("MFQ_EMPTY_CACHE_BEFORE_GRAPH");
         if (empty_cache_env != nullptr && std::atoi(empty_cache_env) != 0) {
             mfq_cuda_empty_cache();
-            report_cuda_memory("prefill_empty_cache");
+            report_cuda_memory(execution.config, "prefill_empty_cache");
         }
         profiler.report("prefill");
         profiler.reset();
@@ -53,10 +53,7 @@ int generate_diagnostic_tokens(
             execution.dsv4_cpu_offload_layers.empty() &&
             execution.dense_cpu_layer_count == 0 &&
             !execution.moe_expert_cache &&
-            model_parallel_cuda_graph_enabled(
-                execution.tensor_parallel,
-                execution.expert_parallel,
-                execution.model_parallel_collectives) &&
+            model_parallel_cuda_graph_enabled(execution) &&
             (!profile || profile_cuda_graph) && gen > 1;
         const char * cuda_profiler_env = std::getenv("MFQ_CUDA_PROFILER_RANGE");
         const bool cuda_profiler_range = cuda_profiler_env != nullptr &&
@@ -125,7 +122,7 @@ int generate_diagnostic_tokens(
                 graph.capture_end();
             }
             mfq_debug_dump_cuda_graph(graph);
-            report_cuda_memory("graph_captured");
+            report_cuda_memory(execution.config, "graph_captured");
 
             decode_replay_t0 = std::chrono::steady_clock::now();
             for (int i = 1; i < gen; ++i) {

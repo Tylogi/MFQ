@@ -62,7 +62,7 @@ struct QuantLinear {
              launch_position < tensor_parallel_shards.size();
              ++launch_position) {
             const size_t index = model_parallel_launch_index(
-                launch_position, tensor_parallel_shards.size());
+                execution.config, launch_position, tensor_parallel_shards.size());
             const auto & shard = tensor_parallel_shards[index];
             MfqCudaGuard guard(shard.device);
             mfq_tensor_backend::Tensor local_x = x;

@@ -89,6 +89,7 @@ struct CudaProfiler {
 
     bool enabled = false;
     bool graph_events = false;
+    std::string filter;
     std::unordered_map<std::string, ProfileStat> stats;
     std::vector<std::string> order;
     std::vector<PendingEvent> pending;
@@ -194,6 +195,70 @@ struct LayerPlacementConfig {
     int device_for_layer(int64_t layer) const;
 };
 
+struct CudaExecutionConfig {
+    std::string profile_filter;
+    std::string moe_route_stats_path;
+    bool moe_route_output_energy = false;
+    bool report_cuda_memory = false;
+    bool model_parallel_cuda_graph = true;
+    bool tensor_parallel_cuda_graph = true;
+    bool expert_parallel_cuda_graph = true;
+    bool tensor_parallel_grouped_projections = true;
+    bool tensor_parallel_shared_linear_attention_input = true;
+    bool tensor_parallel_mirror_linear_attention_scalars = true;
+    bool tensor_parallel_mirror_qwen35_attention_kv = true;
+    bool model_parallel_reduce_to_primary = true;
+    bool model_parallel_fp16_reduce = true;
+    bool model_parallel_peer_first_launch = true;
+    bool decode_branch_parallel = true;
+    bool tensor_parallel_shard_native_float = false;
+    bool nvq_fusion = true;
+    bool nvq2_exec = true;
+    bool nvq_extended_group_exec = false;
+    bool moe_nvq_heterogeneous = true;
+    bool moe_nvq_heterogeneous_decode = true;
+    bool moe_prefill_mma = true;
+    int moe_prefill_mma_min_tokens = 9;
+    bool moe_small_heterogeneous = true;
+    bool moe_delayed_route_readback = true;
+    bool moe_projection_bundle_prefetch = true;
+    bool split_moe_activation_reuse = true;
+    bool moe_swiglu_quant_fusion = true;
+    bool moe_reduce_gate_fusion = true;
+    bool ffn_geglu_fusion = true;
+    bool ffn_swiglu_fusion = true;
+    bool important_neuron_branch_parallel = true;
+    bool gemma4_fused_norms = true;
+    bool dsv4_groupwise_output_a = true;
+    bool diagnostic_nint_group = true;
+    bool diagnostic_fp32_residual = false;
+    bool diagnostic_in_f32_down = false;
+    bool kv_cache_write_aten = false;
+    bool gdn_transposed_state = true;
+    bool linear_conv_prefill_fused = true;
+    bool minicpm_fused_bf16_rope = true;
+    bool minicpm_fused_qk_norm_rope_kv = true;
+    bool minicpm_fused_bf16_rmsnorm = true;
+    bool minicpm_fused_rope_kv = true;
+    bool minicpm_bf16_flash128 = true;
+    bool minicpm_flash128_specialized_casts = true;
+    bool minicpm_bf16_gqa_decode = true;
+    bool minicpm_bf16_swiglu_fusion = true;
+    bool minicpm_bf16_residual_acc = true;
+    bool mma_attention = true;
+    bool mma_attention_decode = true;
+    bool attention_decode_aten = false;
+    bool attention_decode_split_k = true;
+    std::size_t deepseek_v41_engram_cache_rows = 16'384;
+    bool moe_mapped_gather = false;
+    int moe_mapped_copy_blocks = 64;
+    int moe_ssd_io_workers = 8;
+    bool moe_ssd_overlap = true;
+    bool moe_ssd_ranges = true;
+};
+
+CudaExecutionConfig load_cuda_execution_config();
+
 struct MoeRouteLayerStats {
     mfq_tensor_backend::Tensor counts;
     mfq_tensor_backend::Tensor weight_sum;
@@ -203,7 +268,10 @@ struct MoeRouteLayerStats {
 };
 
 struct CudaExecutionContext {
+    CudaExecutionContext();
+
     CudaProfiler profiler;
+    CudaExecutionConfig config;
     bool force_moe_pool_path = false;
     bool force_moe_unfused_reduce = false;
     bool force_moe_materialized_swiglu = false;
@@ -238,7 +306,6 @@ struct CudaExecutionContext {
     void reset() noexcept;
 };
 
-void mfq_set_env(const char* name, const char* value);
 void mfq_release_host_allocator_cache() noexcept;
 bool model_parallel_enabled(const CudaExecutionContext& execution);
 const ParallelConfig& model_parallel_config(
@@ -246,22 +313,13 @@ const ParallelConfig& model_parallel_config(
 const ParallelConfig& moe_parallel_config(
     const CudaExecutionContext& execution);
 int model_parallel_primary_device(const CudaExecutionContext& execution);
-bool model_parallel_cuda_graph_enabled(
-    const ParallelConfig& tensor_parallel,
-    const ParallelConfig& expert_parallel,
-    const ModelParallelCollectiveRuntime& collectives);
-bool tensor_parallel_grouped_projections_enabled();
-bool tensor_parallel_shared_linear_attention_input_enabled();
-bool tensor_parallel_mirror_linear_attention_scalars_enabled();
-bool tensor_parallel_mirror_qwen35_attention_kv_enabled();
-bool model_parallel_reduce_to_primary_enabled();
-bool model_parallel_fp16_reduce_enabled();
-bool model_parallel_peer_first_launch_enabled();
-size_t model_parallel_launch_index(size_t launch_position, size_t shard_count);
+bool model_parallel_cuda_graph_enabled(const CudaExecutionContext& execution);
+size_t model_parallel_launch_index(
+    const CudaExecutionConfig& config,
+    size_t launch_position,
+    size_t shard_count);
 int active_weight_load_device(const CudaExecutionContext& execution);
 const char* kl_mmq_mode_name(KlMmqMode mode);
-const char* moe_route_stats_path();
-bool moe_route_output_energy_enabled();
 void record_moe_route_stats(
     CudaExecutionContext& execution,
     int layer,
@@ -270,15 +328,16 @@ void record_moe_route_stats(
     const mfq_tensor_backend::Tensor& output,
     int n_experts);
 void write_moe_route_stats(
+    const CudaExecutionConfig& config,
     const std::unordered_map<int, MoeRouteLayerStats>& stats);
 void trace_gemma_stage(
     CudaExecutionContext& execution,
     int layer,
     const char* name,
     const mfq_tensor_backend::Tensor& value);
-bool gemma4_fused_norms_enabled();
-void report_cuda_memory(const char* stage);
-bool moe_small_glu_path_enabled(int tokens);
+void report_cuda_memory(
+    const CudaExecutionConfig& config,
+    const char* stage);
 
 struct KlMmqScope {
     CudaExecutionContext& execution;

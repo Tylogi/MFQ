@@ -136,7 +136,8 @@ def test_minicpmo45_supports_native_tensor_files_and_bfloat16_tts():
 
 def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
     assert "qwen_rms_norm_bf16" in DECODE
-    assert 'std::getenv("MFQ_MINICPM_FUSED_BF16_RMSNORM")' in DECODE
+    assert '"MFQ_MINICPM_FUSED_BF16_RMSNORM"' in DECODE
+    assert "config.minicpm_fused_bf16_rmsnorm" in DECODE
     assert "qwen_rms_norm_bf16_cuda(" in DECODE
     assert "qwen_rms_norm_pair_bf16_cuda(" in DECODE
     assert "qwen_rms_norm_bf16_kernel" in NORM
@@ -149,14 +150,17 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
     assert "attention_cache_decode_split_gqa4_d128_part_kernel" in ATTENTION
     assert "mfq_dispatch_bfloat16" in ATTENTION
     assert "minicpm_bf16_rope_cache_write_cuda" in DECODE
-    assert 'std::getenv("MFQ_MINICPM_FUSED_ROPE_KV")' in DECODE
+    assert '"MFQ_MINICPM_FUSED_ROPE_KV"' in DECODE
+    assert "config.minicpm_fused_rope_kv" in DECODE
     assert "minicpm_bf16_rope_cache_write_kernel" in ROPE
     assert "minicpm_qk_norm_rope_cache_write_bf16_kernel" in NORM
-    assert 'std::getenv("MFQ_MINICPM_FUSED_QK_NORM_ROPE_KV")' in DECODE
+    assert '"MFQ_MINICPM_FUSED_QK_NORM_ROPE_KV"' in DECODE
+    assert "config.minicpm_fused_qk_norm_rope_kv" in DECODE
     assert "active_rope.apply_bf16" in DECODE
     assert "official_bf16 ? mfq_tensor_backend::kBFloat16" in DECODE
     assert "k.scalar_type() != mfq_tensor_backend::kFloat16" in DECODE
-    assert 'std::getenv("MFQ_MINICPM_BF16_GQA_DECODE")' in DECODE
+    assert '"MFQ_MINICPM_BF16_GQA_DECODE"' in DECODE
+    assert "execution.config.minicpm_bf16_gqa_decode" in DECODE
     assert "const bool bf16_gqa_decode = official_bf16 && T == 1" in DECODE
     assert "official_bf16 && !bf16_gqa_decode" in DECODE
     assert "MiniCPMO45Model::adapter_logits(" in GRAPH
