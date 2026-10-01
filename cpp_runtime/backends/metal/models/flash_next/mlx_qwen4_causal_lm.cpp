@@ -6,6 +6,7 @@
 #include "mlx_linear_attention.h"
 #include "mlx_moe.h"
 #include "mlx_moe_ops.h"
+#include "mlx_nint_rows.h"
 #include "mfe_expert_store.h"
 #include "mlx_sparse_attention.h"
 #include "mlx_tensor.h"
@@ -837,6 +838,7 @@ private:
         const std::uint8_t* values = nullptr;
         std::int64_t rows = 0;
         std::int64_t width = 0;
+        std::optional<MlxMappedNintRows> nint;
     };
 
 public:
@@ -848,17 +850,33 @@ public:
         shards.reserve(static_cast<std::size_t>(config.split_ngram_parts));
         std::int64_t rows = 0;
         std::int64_t width = 0;
+        std::optional<bool> quantized;
         for (std::int64_t index = 0;
              index < config.split_ngram_parts; ++index) {
             const auto name = prefix + ".ngram.shard." +
                 std::to_string(index) + ".weight";
             const auto& record = model.record(name);
-            if (record.dtype != "F8_E4M3") {
+            const bool nint = is_nint_dtype(record.dtype);
+            if (!nint && record.dtype != "F8_E4M3") {
                 throw std::runtime_error(
-                    "Qwen4 PLE row streaming currently requires F8_E4M3: " + name);
+                    "Qwen4 PLE row streaming requires F8_E4M3 or NINT: " + name);
             }
+            if (quantized && *quantized != nint) {
+                throw std::runtime_error("Qwen4 PLE cannot mix FP8 and NINT shards");
+            }
+            quantized = nint;
             auto mapping = model.map_record(name);
             const auto bytes = mapping.view();
+            if (nint) {
+                MlxMappedNintRows table(bytes);
+                if (!shards.empty() && (table.rows() != rows || table.width() != width)) {
+                    throw std::runtime_error("Qwen4 PLE shards have different shapes");
+                }
+                rows = table.rows();
+                width = table.width();
+                shards.push_back({std::move(mapping), nullptr, rows, width, std::move(table)});
+                continue;
+            }
             if (bytes.size() < 20) {
                 throw std::runtime_error("truncated Qwen4 PLE shard: " + name);
             }
@@ -882,7 +900,7 @@ public:
             rows = shard_rows;
             width = shard_width;
             const auto* values = mapping.data() + 20;
-            shards.push_back({std::move(mapping), values, rows, width});
+            shards.push_back({std::move(mapping), values, rows, width, std::nullopt});
         }
         const auto metadata = prefix + ".ngram";
         return Qwen4NgramEmbedding(
@@ -890,7 +908,7 @@ public:
             std::move(shards),
             rows,
             width,
-            scalar_float(model, metadata + ".weight_scale"),
+            quantized.value_or(false) ? 1.0f : scalar_float(model, metadata + ".weight_scale"),
             integer_vector(model, metadata + ".layer_multipliers"),
             integer_vector(model, metadata + ".head_offsets"),
             integer_vector(model, metadata + ".head_vocab_sizes"));
@@ -1031,6 +1049,18 @@ public:
                     prefix,
                     context_.data() + static_cast<std::size_t>(bi * prefix));
             }
+        }
+        if (shards_.front().nint) {
+            MlxNintRowBatch selected;
+            for (const auto row : global) {
+                if (row < 0 || row >= rows_ * static_cast<std::int64_t>(shards_.size())) {
+                    throw std::runtime_error("Qwen4 PLE hash is outside embedding table");
+                }
+                const auto shard = static_cast<std::size_t>(row / rows_);
+                shards_[shard].nint->append_row(row % rows_, selected);
+            }
+            return mlx::core::reshape(
+                selected.decode(), Shape{batch, tokens, heads * static_cast<int>(width_)});
         }
         std::vector<mlx::core::float16_t> result(
             static_cast<std::size_t>(batch * tokens * heads * width_));

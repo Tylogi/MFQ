@@ -274,6 +274,10 @@ mfq_tensor_backend::Tensor nint_embedding_cuda(
     mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
     mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
     mfq_tensor_backend::Tensor token_ids, int64_t neuron_len, int64_t gs);
+// Selected packed rows; descriptors use the common NintRowBatch protocol.
+mfq_tensor_backend::Tensor nint_selected_rows_cuda(
+    mfq_tensor_backend::Tensor packed, mfq_tensor_backend::Tensor descriptors,
+    int64_t width);
 mfq_tensor_backend::Tensor nint8_zero_embedding_lookup_cuda(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor scale, mfq_tensor_backend::Tensor token_ids,
     int64_t neuron_len);

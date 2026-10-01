@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -33,6 +34,8 @@ struct TensorMetadata {
 // canonical names exposed here.
 class ModelSource {
 public:
+    using TensorReader = std::function<void(
+        std::uint64_t, std::byte*, std::size_t)>;
     virtual ~ModelSource() = default;
 
     virtual const std::vector<std::filesystem::path>& source_paths()
@@ -54,6 +57,12 @@ public:
         std::byte* destination,
         std::size_t size) const = 0;
     virtual void drop_file_cache() const noexcept {}
+
+    // An independently owned, bounded range reader that survives this source.
+    // Packed row consumers must not fall back to reading the complete tensor.
+    virtual TensorReader tensor_reader(std::string_view) const {
+        throw std::runtime_error("model source has no retained tensor range reader");
+    }
 
     virtual const std::vector<std::string>& assets() const noexcept = 0;
     virtual bool has_asset(std::string_view name) const noexcept = 0;
