@@ -5505,6 +5505,7 @@ def _write_flat_family_axis0_blob(
                             tensor.indices,
                             tensor.signs,
                             neuron_len=neuron_len,
+                            device=device if quant_backend == "cuda" else None,
                         )
                     )
                     continue
@@ -5520,7 +5521,16 @@ def _write_flat_family_axis0_blob(
                     packed_bits = spec.sub_bits
                 if packer is None:
                     raise AssertionError("missing compact stream packer")
-                output.write(packer(np.asarray(getattr(tensor, field)), packed_bits))
+                values = np.asarray(getattr(tensor, field))
+                if packer is _pack_nvq_bits:
+                    output.write(
+                        packer(
+                            values, packed_bits,
+                            device=device if quant_backend == "cuda" else None,
+                        )
+                    )
+                else:
+                    output.write(packer(values, packed_bits))
             del tensor
     return blob_path.stat().st_size
 

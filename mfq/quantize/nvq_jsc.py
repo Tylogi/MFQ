@@ -161,6 +161,7 @@ def _native_search(
     ng: int,
     valid_last: int,
     search_steps: int,
+    group_chunk: int = 4096,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from mfq.quantize.cuda._ext import ext
 
@@ -174,6 +175,7 @@ def _native_search(
             int(codebook.shape[1]),
             search_steps,
             float(codebook.max().item()),
+            group_chunk,
         )
     )
 
@@ -206,6 +208,7 @@ def _native_reassign(
     codebook: torch.Tensor,
     ng: int,
     valid_last: int,
+    group_chunk: int = 4096,
 ) -> torch.Tensor:
     from mfq.quantize.cuda._ext import ext
 
@@ -217,6 +220,7 @@ def _native_reassign(
         ng,
         valid_last,
         int(codebook.shape[1]),
+        group_chunk,
     )
 
 
@@ -256,6 +260,7 @@ def _search(
             ng,
             valid_last,
             config.search_steps,
+            config.group_chunk,
         )
     if codebook.dtype == torch.int8 and codebook.device.type == "mps":
         return _metal_search(
@@ -293,6 +298,7 @@ def _reassign(
             codebook,
             ng,
             valid_last,
+            config.group_chunk,
         )
     if codebook.dtype == torch.int8 and codebook.device.type == "mps":
         return _metal_reassign(
@@ -386,6 +392,7 @@ def _native_e8_search_banks(
     ng: int,
     valid_last: int,
     search_steps: int,
+    group_chunk: int = 4096,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from mfq.quantize.cuda._ext import ext
 
@@ -398,6 +405,7 @@ def _native_e8_search_banks(
         ng,
         valid_last,
         search_steps,
+        group_chunk,
     )
     return scales, indices.to(torch.int64)
 
@@ -414,6 +422,7 @@ def _assign_groups(
     ng: int,
     valid_last: int,
     config: NvqJscConfig,
+    raw_scales: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if _metal_e8_jsc_assignment_supported(codebooks, config):
         from mfq.quantize.metal.nvq_jsc import nvq2j_assign
@@ -449,6 +458,7 @@ def _assign_groups(
             ng=ng,
             valid_last=valid_last,
             search_steps=config.search_steps,
+            group_chunk=config.group_chunk,
         )
         group_anchor = neuron_scale.repeat_interleave(ng)
         safe_anchor = torch.where(
@@ -480,6 +490,7 @@ def _assign_groups(
                     codebooks[bank_id],
                     ng,
                     valid_last,
+                    config.group_chunk,
                 )
                 for bank_id in range(config.banks)
             ],
@@ -537,14 +548,14 @@ def _assign_groups(
     )
 
     for bank in range(codebooks.shape[0]):
-        raw_scale, _ = _search(
-            xgroup,
-            wgroup,
-            codebooks[bank],
-            ng,
-            valid_last,
-            config,
-        )
+        if raw_scales is None:
+            raw_scale, _ = _search(
+                xgroup, wgroup, codebooks[bank], ng, valid_last, config
+            )
+        else:
+            # Only fixed-table quantization supplies these. The floating scale
+            # search depends on x, importance and the bank, not the row anchor.
+            raw_scale = raw_scales[bank]
         state = _nearest_state(raw_scale / safe_anchor, alpha, bank_for_state, bank)
         effective_scale = group_anchor * alpha[state]
         indices = _reassign(
@@ -827,6 +838,7 @@ def quantize_nvq_jsc_fixed(
             native_codebooks,
             neuron_len,
             assignment_refine_steps,
+            group_chunk,
         )
         nvec = math.ceil(neuron_len / spec.vector_size)
         nsign = math.ceil(neuron_len / 8)
@@ -1032,6 +1044,7 @@ def quantize_nvq_jsc_fixed(
         ng=ng,
         valid_last=valid_last,
         config=config,
+        raw_scales=raw_scales,
     )
     for _ in range(assignment_refine_steps):
         neuron_scale, _ = _refit_scale_tables(
@@ -1058,6 +1071,7 @@ def quantize_nvq_jsc_fixed(
             ng=ng,
             valid_last=valid_last,
             config=config,
+            raw_scales=raw_scales,
         )
     if not torch.equal(bank, bank_for_state[state]):
         raise RuntimeError("NVQ-JSC fixed state/bank assignment is inconsistent")
