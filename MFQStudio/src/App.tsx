@@ -2,6 +2,7 @@
 import { lazy, Suspense } from 'react';
 import { Route, Routes } from 'react-router';
 import { SettingsProvider } from './features/settings/SettingsProvider';
+import { StudioUpdateProvider } from './features/settings/UpdateManager';
 import { RuntimeProvider } from './app/RuntimeProvider';
 import { ChatProvider } from './features/chat/ChatProvider';
 import { StudioShell } from './app/StudioShell';
@@ -51,29 +52,31 @@ const QuantizationPage = lazy(() =>
 export default function App() {
   return (
     <SettingsProvider>
-      <RuntimeProvider>
-        <ChatProvider>
-          <Suspense fallback={<main className="fatal-workspace"><LoadingPage /></main>}>
-            <Routes>
-              <Route element={<StudioShell />}>
-                <Route index element={<OverviewPage />} />
-                <Route path="chat" element={<ChatPage />} />
-                <Route path="models" element={<ModelsPage />} />
-                <Route path="runtime" element={<ConnectionsPage />} />
-                <Route path="resources" element={<CachePage />} />
-                <Route path="logs" element={<LogsPage />} />
-                <Route path="settings" element={<SettingsRoute />} />
-                <Route element={<LabLayout />}>
-                  <Route path="model-hub" element={<ModelHubPage />} />
-                  <Route path="evaluations" element={<EvaluationsPage />} />
-                  <Route path="quantization" element={<QuantizationPage />} />
+      <StudioUpdateProvider>
+        <RuntimeProvider>
+          <ChatProvider>
+            <Suspense fallback={<main className="fatal-workspace"><LoadingPage /></main>}>
+              <Routes>
+                <Route element={<StudioShell />}>
+                  <Route index element={<OverviewPage />} />
+                  <Route path="chat" element={<ChatPage />} />
+                  <Route path="models" element={<ModelsPage />} />
+                  <Route path="runtime" element={<ConnectionsPage />} />
+                  <Route path="resources" element={<CachePage />} />
+                  <Route path="logs" element={<LogsPage />} />
+                  <Route path="settings" element={<SettingsRoute />} />
+                  <Route element={<LabLayout />}>
+                    <Route path="model-hub" element={<ModelHubPage />} />
+                    <Route path="evaluations" element={<EvaluationsPage />} />
+                    <Route path="quantization" element={<QuantizationPage />} />
+                  </Route>
+                  <Route path="*" element={<NotFoundPage />} />
                 </Route>
-                <Route path="*" element={<NotFoundPage />} />
-              </Route>
-            </Routes>
-          </Suspense>
-        </ChatProvider>
-      </RuntimeProvider>
+              </Routes>
+            </Suspense>
+          </ChatProvider>
+        </RuntimeProvider>
+      </StudioUpdateProvider>
     </SettingsProvider>
   );
 }

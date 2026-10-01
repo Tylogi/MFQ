@@ -29,7 +29,13 @@ from mfq.server.state.catalog import (
     ModelRegistrationError,
 )
 from mfq.server.services.documents import DocumentExtractionError, extract_document
-from mfq.server.services.hub import HubCatalog, HubError, HubProvider
+from mfq.server.services.hub import (
+    HubCatalog,
+    HubError,
+    HubProvider,
+    resolve_hub_reference,
+    system_profile,
+)
 from mfq.server.services.jobs import (
     JobExecutionError,
     JobKindNotRegisteredError,
@@ -70,6 +76,7 @@ from mfq.server.protocol.models import (
     GenerationPresetResource,
     HubModelInfo,
     HubModelSearchResult,
+    HubReferenceRequest,
     ImagePart,
     JobEventList,
     JobKindList,
@@ -90,6 +97,7 @@ from mfq.server.protocol.models import (
     ModelDirectoryList,
     ModelLoadRequest,
     ModelUnloadRequest,
+    OfficialModelList,
     OperationAccepted,
     PortableMedia,
     PortableMessage,
@@ -418,7 +426,52 @@ class ServerService:
         self, provider: HubProvider, repo_id: str, revision: str | None
     ) -> HubModelInfo:
         try:
+            if isinstance(self.hub_catalog, HubCatalog):
+                return await self.hub_catalog.info(
+                    provider,
+                    repo_id,
+                    revision,
+                    profile=self._hub_system_profile(),
+                )
             return await self.hub_catalog.info(provider, repo_id, revision)
+        except HubError as error:
+            raise ServiceError(502, "model_hub_error", str(error), retryable=True) from error
+
+    def _hub_system_profile(self):
+        manager = self.runtime_manager
+        return system_profile(
+            backend=getattr(manager, "backend", "unknown"),
+            runtime_memory_budget_bytes=getattr(
+                manager, "max_runtime_memory_bytes", None
+            ),
+        )
+
+    async def resolve_hub_model(self, request: HubReferenceRequest) -> HubModelInfo:
+        try:
+            provider, repo_id, revision = resolve_hub_reference(
+                request.reference, request.fallback_provider
+            )
+        except HubError as error:
+            raise ServiceError(422, "invalid_model_hub_reference", str(error)) from error
+        try:
+            if isinstance(self.hub_catalog, HubCatalog):
+                return await self.hub_catalog.info(
+                    provider,
+                    repo_id,
+                    revision,
+                    profile=self._hub_system_profile(),
+                )
+            return await self.hub_catalog.info(provider, repo_id, revision)
+        except HubError as error:
+            raise ServiceError(
+                502, "model_hub_error", str(error), retryable=True
+            ) from error
+
+    async def official_hub_models(self, *, refresh: bool = False) -> OfficialModelList:
+        try:
+            return await self.hub_catalog.official(
+                profile=self._hub_system_profile(), refresh=refresh
+            )
         except HubError as error:
             raise ServiceError(502, "model_hub_error", str(error), retryable=True) from error
 

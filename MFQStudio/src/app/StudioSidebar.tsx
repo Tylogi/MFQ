@@ -3,6 +3,10 @@ import { useEffect, type ComponentProps } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { useRuntime } from './RuntimeProvider';
 import { useSettings } from '../features/settings/SettingsProvider';
+import {
+  UpdateAvailableBanner,
+  useStudioUpdateContext,
+} from '../features/settings/UpdateManager';
 import { useUiStore } from '../stores/uiStore';
 import { Icon } from './display';
 import { formatNumber } from './formatters';
@@ -24,6 +28,7 @@ export function StudioSidebar() {
   const location = useLocation();
   const navigate = useNavigate();
   const { tr } = useSettings();
+  const studioUpdates = useStudioUpdateContext();
   const { runtime, selectedModel: model, models, instances, loading: selectedModelLoading } = useRuntime();
   const sidebarOpen = useUiStore((state) => state.sidebarOpen);
   const closeSidebar = useUiStore((state) => state.closeSidebar);
@@ -116,6 +121,11 @@ export function StudioSidebar() {
             ))}
           </nav>
         </div>
+        <UpdateAvailableBanner
+          onOpen={() => open('/settings')}
+          status={studioUpdates.status}
+          tr={tr}
+        />
         <button className="sidebar-runtime-card" onClick={() => open(dashboard('overview'))} type="button">
           <span className={`runtime-dot ${activeRequests > 0 ? 'busy' : selectedModelAvailable
             ? 'ready' : selectedModelLoading ? 'busy' : 'idle'}`} />

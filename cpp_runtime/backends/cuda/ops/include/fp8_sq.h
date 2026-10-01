@@ -28,14 +28,16 @@ struct Fp8SqWeight {
     double distribution_entropy = 0.0;
 };
 
+mfq_tensor_backend::Tensor sq_matmul_cpu(
+    const Fp8SqWeight& weight,
+    mfq_tensor_backend::Tensor input);
+
 struct Fp8SqLinear {
     Fp8SqWeight weight;
 
     mfq_tensor_backend::Tensor forward(
             mfq_tensor_backend::Tensor x) const {
-        MFQ_RUNTIME_CHECK(
-            weight.blob.is_cuda(),
-            "FP8-SQ does not support dense CPU-layer offload");
+        if (!weight.blob.is_cuda()) return sq_matmul_cpu(weight, x);
         auto shape = x.sizes().vec();
         const auto original_dtype = x.scalar_type();
         auto source = x.reshape({-1, x.size(-1)});

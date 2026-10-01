@@ -8,6 +8,44 @@ same kernels used by the optional reference executable.
 `mfq-runtime-torch` is an opt-in migration target. It exists only for A/B
 validation and is excluded from normal builds and packages.
 
+## Operator regression targets
+
+`mfq-native-tensor-cuda-test` covers padded, sliced, transposed and broadcast
+matrix products (including zero contraction and CUDA Graph capture), small-K
+selection with stable ties, and tiled grouped-query attention. The attention
+path bounds score storage to 128 query rows and shares the K/V head storage.
+
+`mfq-packed-prefill-test` checks FP8-SQ CPU decoding and packed slicing,
+compares MXFP4-SQ Tensor Core execution with the direct packed kernel, and
+checks native TopK/graph behavior while printing timings for retained shapes.
+`mfq-mxfp4-sq-test` consumes independently decoded wire fixtures, including
+packed column/row slicing and CPU decoding. Generate them and check SQ linear
+CPU execution and shard composition with:
+
+```shell
+python bench/cuda_mxfp4_sq_fixtures.py build/sq-fixtures
+build/cuda-native/mfq-mxfp4-sq-test build/sq-fixtures
+build/cuda-native/mfq-sq-linear-test build/sq-fixtures
+```
+
+SQ tensor-parallel partitions preserve the native scale blocks: MXFP4-SQ input
+partitions align to 32 columns; FP8-SQ partitions align to the format's row and
+column scale block boundaries. The single-GPU shard test exercises both output
+gather and input reduction; it does not certify inter-device transport.
+
+The CUDA workflow is manual and requires a dedicated `mfq-cuda` runner and the
+`MFQ_CI_GPU_UUID` repository variable. It executes GPU numerical and graph tests;
+source-contract tests alone do not establish CUDA correctness. The macOS
+workflow also runs Qwen3.5 and MiniCPM-o text-prefill chunking tests.
+
+MXFP4-SQ uses Tensor Core tiles by default for `M >= 32` and `M*N >= 131072`,
+where the retained RTX 3090 Ti comparisons showed gains; smaller projections
+keep direct packed execution. `MFQ_FORCE_SQ_TENSOR_CORE=1` tests that kernel on
+smaller shapes. `MFQ_DISABLE_SQ_TENSOR_CORE=1`, `MFQ_DISABLE_NATIVE_STRIDED_BATCH_MATMUL=1`, and
+`MFQ_DISABLE_NATIVE_TILED_SDPA=1` retain comparison paths for their corresponding
+optimizations. These operator checks do not establish model-level token parity
+or replace full-model quality evaluation.
+
 ## Build and dependency checks
 
 Configure the production runtime on both Linux and Windows:

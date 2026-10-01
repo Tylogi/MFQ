@@ -4,6 +4,7 @@ import type {
   ModelDirectoryList,
   HubModelSummary,
   HubModelInfo,
+  OfficialModelList,
   ArtifactLineage,
 } from '../types';
 import { request } from '../client';
@@ -72,6 +73,25 @@ export const modelsApi = {
   ): Promise<HubModelSummary[]> {
     const params = new URLSearchParams({ provider, query, limit: '20' });
     return (await request<{ data: HubModelSummary[] }>(`/api/v1/hub/models?${params}`)).data;
+  },
+
+  /** 读取内置官方目录以及服务端评估的设备适配建议。 */
+  officialHubModels(refresh = false): Promise<OfficialModelList> {
+    return request(`/api/v1/hub/official${refresh ? '?refresh=true' : ''}`);
+  },
+
+  /** 解析 owner/repo 或受信任的 Hugging Face、ModelScope 仓库链接。 */
+  resolveHubModel(
+    reference: string,
+    fallbackProvider: HubModelSummary['provider'],
+  ): Promise<HubModelInfo> {
+    return request('/api/v1/hub/resolve', {
+      method: 'POST',
+      body: JSON.stringify({
+        reference,
+        fallback_provider: fallbackProvider,
+      }),
+    });
   },
 
   /** 读取远程模型的版本、文件列表与容量信息。 */

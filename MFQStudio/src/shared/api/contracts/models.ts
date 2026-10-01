@@ -34,16 +34,92 @@ export interface ModelDirectoryList {
 export interface HubModelSummary {
   provider: 'huggingface' | 'modelscope';
   repo_id: string;
+  source_url?: string | null;
+  author?: string | null;
+  description?: string | null;
   downloads: number;
   likes: number;
   total_bytes: number;
   updated_at?: string | null;
 }
 
+export interface ModelConfigurationStatus {
+  status: 'recommended' | 'warning' | 'unknown';
+  recommendation: 'three_stars' | 'two_stars' | 'one_star' | 'caution' | 'not_recommended' | 'unknown';
+  required_memory_bytes?: number | null;
+  available_memory_bytes?: number | null;
+  reasons: string[];
+}
+
+export interface HubModelVariant {
+  id: string;
+  label: string;
+  format: 'mfq' | 'hf' | 'gguf' | 'unknown';
+  precision?: string | null;
+  files: string[];
+  byte_size: number;
+  configuration: ModelConfigurationStatus;
+}
+
+export interface HubSystemProfile {
+  platform: string;
+  machine: string;
+  backend: 'metal' | 'cuda' | 'cpu' | 'unknown';
+  physical_memory_bytes?: number | null;
+  available_memory_bytes?: number | null;
+  runtime_memory_budget_bytes?: number | null;
+}
+
 export interface HubModelInfo extends HubModelSummary {
   revision: string;
-  files: Array<{ name: string; byte_size: number }>;
+  files: Array<{ name: string; byte_size: number; sha256?: string | null }>;
   tags: string[];
+  license?: string | null;
+  library?: string | null;
+  pipeline_tag?: string | null;
+  architectures: string[];
+  modalities: string[];
+  parameter_count?: number | null;
+  gated: boolean;
+  runtime_compatible?: boolean | null;
+  variants: HubModelVariant[];
+}
+
+export interface OfficialModelSource {
+  provider: HubModelSummary['provider'];
+  repo_id: string;
+  revision?: string | null;
+  url: string;
+  available: boolean;
+}
+
+export interface OfficialModelInfo {
+  id: string;
+  name: string;
+  family: string;
+  architecture: string;
+  description: string;
+  description_zh: string;
+  parameter_label?: string | null;
+  active_parameter_label?: string | null;
+  modalities: string[];
+  capabilities: string[];
+  precision_options: string[];
+  license?: string | null;
+  supports_ssd_streaming: boolean;
+  sources: OfficialModelSource[];
+  selected_source: OfficialModelSource;
+  revision: string;
+  downloads: number;
+  likes: number;
+  updated_at?: string | null;
+  variants: HubModelVariant[];
+  configuration: ModelConfigurationStatus;
+}
+
+export interface OfficialModelList {
+  system: HubSystemProfile;
+  data: OfficialModelInfo[];
 }
 
 export interface ArtifactLineage {

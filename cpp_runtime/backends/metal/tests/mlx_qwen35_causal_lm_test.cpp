@@ -1038,6 +1038,72 @@ void test_mtp_greedy_identity() {
         "MTP stochastic generation is invalid or non-deterministic");
 }
 
+void test_chunked_prefill_generation() {
+    mfq::metal::MlxSamplingParams sampling;
+    sampling.temperature = 0.0;
+    const std::vector<std::int64_t> prompt{1, 4, 2, 5, 3};
+
+    auto baseline = make_model();
+    auto chunked = make_model();
+    std::vector<std::int64_t> baseline_tokens;
+    std::vector<std::int64_t> chunked_tokens;
+    int baseline_prefill_calls = 0;
+    int chunked_prefill_calls = 0;
+    std::size_t baseline_prefill_tokens = 0;
+    std::size_t chunked_prefill_tokens = 0;
+
+    const auto baseline_count = baseline.generate(
+        prompt,
+        sampling,
+        3,
+        [&](std::int64_t token) {
+            baseline_tokens.push_back(token);
+            return true;
+        },
+        [&](std::size_t tokens, double) {
+            ++baseline_prefill_calls;
+            baseline_prefill_tokens = tokens;
+        },
+        {},
+        std::nullopt,
+        static_cast<int>(prompt.size()));
+    const auto chunked_count = chunked.generate(
+        prompt,
+        sampling,
+        3,
+        [&](std::int64_t token) {
+            chunked_tokens.push_back(token);
+            return true;
+        },
+        [&](std::size_t tokens, double) {
+            ++chunked_prefill_calls;
+            chunked_prefill_tokens = tokens;
+        },
+        {},
+        std::nullopt,
+        2);
+
+    require(
+        baseline.last_prefill_chunk_sizes() ==
+            std::vector<std::size_t>({5}) &&
+            chunked.last_prefill_chunk_sizes() ==
+                std::vector<std::size_t>({2, 2, 1}),
+        "Qwen3.5 generation did not use the requested prefill chunks");
+    require(
+        chunked.last_prefill_chunk_sizes().back() == 1,
+        "Qwen3.5 chunked prefill did not preserve the one-token tail");
+    require(
+        baseline_count == chunked_count &&
+            baseline_tokens == chunked_tokens &&
+            baseline.cache_position() == chunked.cache_position(),
+        "Qwen3.5 chunked prefill changed greedy generation");
+    require(
+        baseline_prefill_calls == 1 && chunked_prefill_calls == 1 &&
+            baseline_prefill_tokens == prompt.size() &&
+            chunked_prefill_tokens == prompt.size(),
+        "Qwen3.5 chunked prefill callback accounting mismatch");
+}
+
 void test_mtp_constrained_identity() {
     mfq::metal::MlxSamplingParams sampling;
     sampling.temperature = 0.0;
@@ -1622,6 +1688,7 @@ int main(int argc, char** argv) {
         test_embedding_cache_continuity();
         test_embedding_validation();
         test_prefill_decode_and_reset();
+        test_chunked_prefill_generation();
         test_mtp_greedy_identity();
         test_mtp_constrained_identity();
         test_mtp_prepared_mrope_generation();

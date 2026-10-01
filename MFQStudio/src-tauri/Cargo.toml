@@ -1,6 +1,6 @@
 [package]
 name = "mfq-studio"
-version = "0.1.0"
+version = "0.3.2"
 description = "Desktop client for MFQ Server"
 edition = "2021"
 publish = false
@@ -11,11 +11,12 @@ ico = "0.5.0"
 tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls", "system-proxy"] }
 keyring = "3.6.3"
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.10.9"
 tauri = { version = "2.11.5", features = [] }
-tokio = { version = "1", features = ["sync", "time"] }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
 url = "2.5.8"

@@ -6,6 +6,7 @@
 #include <array>
 #include <cmath>
 #include <cstdlib>
+#include <iostream>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -19,7 +20,7 @@ void require(bool condition, const char* message) {
 }
 
 void require_close(float actual, float expected, float tolerance, const char* message) {
-    if (std::abs(actual - expected) > tolerance) {
+    if (!std::isfinite(actual) || std::abs(actual - expected) > tolerance) {
         throw std::runtime_error(
             std::string(message) + ": expected " + std::to_string(expected) +
             ", got " + std::to_string(actual));
@@ -27,13 +28,13 @@ void require_close(float actual, float expected, float tolerance, const char* me
 }
 
 std::vector<float> host_values(const mfq::cuda::Tensor& value) {
-    auto host = value.to(mfq::cuda::kCPU, mfq::cuda::kFloat32).contiguous();
+    auto host = value.contiguous().to(mfq::cuda::kCPU, mfq::cuda::kFloat32);
     return std::vector<float>(
         host.data_ptr<float>(), host.data_ptr<float>() + host.numel());
 }
 
 std::vector<std::int64_t> host_int64_values(const mfq::cuda::Tensor& value) {
-    auto host = value.to(mfq::cuda::kCPU, mfq::cuda::kInt64).contiguous();
+    auto host = value.contiguous().to(mfq::cuda::kCPU, mfq::cuda::kInt64);
     return std::vector<std::int64_t>(
         host.data_ptr<std::int64_t>(),
         host.data_ptr<std::int64_t>() + host.numel());
@@ -53,7 +54,7 @@ void set_test_environment(const char* name, const char* value) {
 
 }  // namespace
 
-int main() {
+int main() try {
     int devices = 0;
     const auto device_status = cudaGetDeviceCount(&devices);
     if (device_status != cudaSuccess || devices == 0) {
@@ -166,6 +167,33 @@ int main() {
     const std::vector<float> expected_product{58, 64, 139, 154};
     require(product == expected_product, "cuBLAS row-major matmul");
 
+    for (const auto dtype : {kFloat32, kFloat16, kBFloat16, kFloat64}) {
+        auto padded = tensor<float>({1, 2, 3, 99, 4, 5, 6, 99})
+            .reshape({2, 4}).to(cuda_device).to(dtype);
+        auto sliced = padded.narrow(1, 0, 3);
+        auto ones_column = ones({3, 1}, sliced.options());
+        require(host_values(matmul(sliced, ones_column)) == std::vector<float>({6, 15}),
+                "matmul narrowed left leading dimension");
+        require(host_values(matmul(ones_column.transpose(0, 1), sliced.transpose(0, 1))) ==
+                    std::vector<float>({6, 15}), "matmul transposed narrowed right");
+        require(host_values(matmul(sliced, sliced.transpose(0, 1))) ==
+                    std::vector<float>({14, 32, 32, 77}), "matmul both padded operands");
+        auto stepped = padded.slice(1, 0, 4, 2);
+        require(host_values(matmul(stepped, stepped.transpose(0, 1))) ==
+                    std::vector<float>({10, 22, 22, 52}), "matmul strided inner materialization");
+        require(host_values(matmul(sliced.select(0, 1), ones_column.squeeze(-1))) ==
+                    std::vector<float>({15}), "matmul vector promotion");
+        auto expanded = sliced.narrow(0, 0, 1).expand({2, 3});
+        require(host_values(matmul(expanded, ones_column)) == std::vector<float>({6, 6}),
+                "matmul overlapping broadcast matrix");
+        require(host_values(matmul(empty({2, 0}, sliced.options()), empty({0, 3}, sliced.options()))) ==
+                    std::vector<float>(6, 0), "matmul empty contraction");
+        auto batched = padded.unsqueeze(0).expand({4, 2, 4}).narrow(-1, 0, 3);
+        require(host_values(matmul(batched, ones_column)) ==
+                    std::vector<float>({6, 15, 6, 15, 6, 15, 6, 15}),
+                "matmul strided batched broadcast with padding");
+    }
+
     auto batched_left = tensor<float>({1, 2, 3, 4, 5, 6, 7, 8})
         .reshape({2, 2, 2})
         .to(cuda_device);
@@ -193,6 +221,7 @@ int main() {
         .reshape({1, 4, 64, 128}).to(cuda_device).to(kBFloat16)
         .transpose(-2, -1);
     set_test_environment("MFQ_DISABLE_NATIVE_PARALLEL_BATCH_MATMUL", "1");
+    set_test_environment("MFQ_DISABLE_NATIVE_STRIDED_BATCH_MATMUL", "1");
     const auto loop_batched_product = host_values(
         matmul(attention_left, attention_right));
     set_test_environment("MFQ_DISABLE_NATIVE_PARALLEL_BATCH_MATMUL", "0");
@@ -202,6 +231,58 @@ int main() {
     require(
         parallel_batched_product == loop_batched_product,
         "parallel batched matmul exactness");
+    set_test_environment("MFQ_DISABLE_NATIVE_STRIDED_BATCH_MATMUL", "0");
+    const auto strided_batched_product = host_values(
+        matmul(attention_left, attention_right));
+    for (std::size_t index = 0; index < strided_batched_product.size(); ++index) {
+        const auto reference = loop_batched_product[index];
+        require_close(
+            strided_batched_product[index], reference,
+            0.01f + 0.01f * std::abs(reference),
+            "strided batched matmul parity");
+    }
+
+    std::vector<float> selection_values(3 * 2051);
+    for (std::size_t i = 0; i < selection_values.size(); ++i) {
+        selection_values[i] = static_cast<float>((i * 17) % 127) - 63;
+    }
+    for (const auto dtype : {kFloat32, kFloat16, kBFloat16}) {
+        auto selection = tensor<float>(selection_values).reshape({3, 2051})
+            .to(cuda_device).to(dtype);
+        for (const bool largest : {false, true}) {
+            auto [sorted_values, sorted_indices] = sort(selection, -1, largest);
+            for (const int k : {0, 1, 7, 256}) {
+                auto [values, indices] = topk(selection, k, -1, largest, true);
+                require(host_values(values) == host_values(sorted_values.narrow(-1, 0, k)),
+                        "tiled topk values");
+                require(host_int64_values(indices) == host_int64_values(sorted_indices.narrow(-1, 0, k)),
+                        "tiled topk stable indices");
+            }
+        }
+    }
+    require(std::get<0>(sort(empty({2, 0}, input.options()), -1, false)).numel() == 0,
+            "sort empty last dimension");
+
+    auto mixed_left = tensor<float>({1, 2, 3, 4}).reshape({2, 1, 1, 2}).to(cuda_device);
+    auto mixed_right = tensor<float>({5, 6, 7, 8, 9, 10}).reshape({1, 3, 2, 1}).to(cuda_device);
+    require(host_values(matmul(mixed_left, mixed_right)) ==
+                std::vector<float>({17, 23, 29, 39, 53, 67}), "mixed batch broadcasting");
+    if (default_context(0)->supports_async_allocations()) {
+        Graph matrix_graph;
+        Tensor captured;
+        matrix_graph.prepare_memory();
+        captured = matmul(attention_left, attention_right);
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream(0).stream()));
+        captured = {};
+        matrix_graph.capture_begin();
+        captured = matmul(attention_left, attention_right);
+        matrix_graph.capture_end();
+        matrix_graph.replay();
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream(0).stream()));
+        require(
+            host_values(captured) == strided_batched_product,
+            "strided batched CUDA graph");
+    }
 
     const auto probabilities = host_values(softmax(input, -1));
     require_close(probabilities[0], 0.09003057f, 1.0e-6f, "softmax first value");
@@ -219,6 +300,33 @@ int main() {
         .to(cuda_device);
     const auto attended = host_values(scaled_dot_product_attention(
         query, key, value, std::nullopt, 0.0, false, 1.0, false));
+    for (const auto dtype : {kFloat32, kFloat16, kBFloat16}) {
+        auto q = (arange(4 * 259 * 16, input.options()).remainder(17) / 32.0)
+            .reshape({1, 4, 259, 16}).to(dtype);
+        auto k = (arange(2 * 263 * 16, input.options()).remainder(13) / 32.0)
+            .reshape({1, 2, 263, 16}).to(dtype);
+        auto v = (arange(2 * 263 * 16, input.options()).remainder(19) / 32.0)
+            .reshape({1, 2, 263, 16}).to(dtype);
+        for (int mask_mode = 0; mask_mode < 4; ++mask_mode) {
+            const bool causal = mask_mode == 1;
+            std::optional<Tensor> mask;
+            if (mask_mode == 2) mask = arange(259 * 263, input.options()).remainder(7)
+                .reshape({259, 263}).ne(0);
+            if (mask_mode == 3) mask = (arange(263, input.options()).remainder(7) / -4.0)
+                .reshape({1, 263}).to(dtype);
+            set_test_environment("MFQ_DISABLE_NATIVE_TILED_SDPA", "1");
+            auto reference = host_values(scaled_dot_product_attention(q,
+                k.repeat_interleave(2, 1), v.repeat_interleave(2, 1),
+                mask, 0.0, causal, std::nullopt, false));
+            set_test_environment("MFQ_DISABLE_NATIVE_TILED_SDPA", "0");
+            auto actual = host_values(scaled_dot_product_attention(q, k, v,
+                mask, 0.0, causal, std::nullopt, true));
+            const float tolerance = dtype == kFloat32 ? 2e-5f : dtype == kFloat16 ? 0.001f : 0.004f;
+            for (std::size_t i = 0; i < actual.size(); ++i) {
+                require_close(actual[i], reference[i], tolerance, "tiled grouped-query attention");
+            }
+        }
+    }
     const float high = std::exp(1.0f) / (std::exp(1.0f) + 1.0f);
     require_close(attended[0], high * 10.0f + (1.0f - high) * 30.0f,
                   2.0e-5f, "attention query zero");
@@ -406,4 +514,8 @@ int main() {
             host_values(graph_output)[5], 36.0f, 0.0f,
             "back-to-back graph replay value");
     }
+    return 0;
+} catch (const std::exception& error) {
+    std::cerr << error.what() << '\n';
+    return 1;
 }

@@ -12,6 +12,8 @@ struct QuantLinearShard {
     NintWeight nint;
     NvqWeight nvq;
     Mxfp4Weight mxfp4;
+    Mxfp4SqLinear mxfp4_sq;
+    Fp8SqLinear fp8_sq;
     Mxfp8Weight mxfp8;
     mfq_tensor_backend::Tensor dense;
 };

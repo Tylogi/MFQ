@@ -32,11 +32,12 @@ interface SettingsPageProps {
   setContextSize: Dispatch<SetStateAction<number>>;
   busy: boolean;
   hasStudio: boolean;
+  updateManager?: ReactNode;
   actions: SettingsActions;
 }
 
 /** 渲染可编辑设置草稿；保存、模型重载及数据操作由明确的业务回调执行。 */
-export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable, presetManager, contextCapacity, contextSize, setContextSize, busy, hasStudio, actions }: SettingsPageProps) {
+export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable, presetManager, contextCapacity, contextSize, setContextSize, busy, hasStudio, updateManager, actions }: SettingsPageProps) {
   const { setModelDefaultInheritance, applyPreset, reloadRuntime, exportStudioData, importStudioData, openServerPage, resetSettingsDraft, saveSettings } = actions;
   return (
     <div className="settings-page">
@@ -160,6 +161,15 @@ export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable
         />
         {hasStudio && <SettingRow title={tr("服务器连接", "Server connection")} detail={tr("配置本地或远程 MFQ Server。", "Configure a local or remote MFQ Server.")} trailing={<button className="secondary" onClick={openServerPage} type="button">{tr("打开服务器设置", "Open server settings")}</button>} />}
       </TMPanel>
+
+      {updateManager && (
+        <>
+          <SectionLabel title={tr('版本', 'Version')} />
+          <TMPanel className="settings-page-panel settings-update-panel">
+            {updateManager}
+          </TMPanel>
+        </>
+      )}
 
       <div className="settings-page-actions">
         <button onClick={resetSettingsDraft} type="button">{tr("恢复默认", "Reset")}</button>

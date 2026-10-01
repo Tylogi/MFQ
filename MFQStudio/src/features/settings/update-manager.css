@@ -1,0 +1,37 @@
+/* Studio Release 检查、下载、切换与回退界面。 */
+.settings-update-panel { padding-block: 15px; }
+.update-manager { display: grid; gap: 14px; }
+.update-manager-heading { display: flex; align-items: start; justify-content: space-between; gap: 16px; }
+.update-manager-heading h3 { margin: 0; font-size: 13px; }
+.update-manager-heading p { max-width: 680px; margin: 4px 0 0; color: var(--muted); font-size: 10.5px; line-height: 1.45; }
+.update-current-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; border-block: 1px solid var(--line-soft); padding-block: 12px; }
+.update-current-row > div { display: grid; gap: 2px; }
+.update-current-row > div span, .update-current-row small { color: var(--muted); font-size: 9.5px; }
+.update-current-row > div strong { font-size: 12px; }
+.update-current-row label { display: flex; align-items: center; gap: 9px; color: var(--ink-soft); font-size: 10.5px; }
+.update-current-row input { accent-color: var(--accent); }
+.update-manager-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.update-manager-grid > div { min-width: 0; }
+.update-manager h4 { margin: 0 0 7px; color: var(--muted); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.05em; }
+.release-version-list, .installed-version-list { display: grid; gap: 4px; }
+.release-version-list > div, .installed-version-list > div { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 6px; border: 1px solid var(--panel-line); border-radius: 8px; padding: 8px; background: var(--panel-control); }
+.release-version-list > div.latest { border-color: var(--accent-border); background: var(--accent-soft); }
+.release-version-list > div > div, .installed-version-list > div > div { display: grid; min-width: 0; gap: 2px; }
+.release-version-list strong, .installed-version-list strong { font-size: 10.5px; }
+.release-version-list small, .installed-version-list small { overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.release-version-list progress { width: min(180px, 100%); height: 3px; border: 0; accent-color: var(--accent); }
+.release-version-list span, .installed-version-list span { color: var(--muted); font-size: 9.5px; }
+.release-version-list button, .installed-version-list button { padding: 6px 8px; font-size: 9.5px; }
+.installed-version-list button.version-remove { width: 27px; padding-inline: 0; color: var(--muted); }
+.update-empty { border: 1px dashed var(--panel-line) !important; padding: 18px !important; color: var(--muted); background: transparent !important; font-size: 10px; text-align: center; }
+.update-error { margin: -5px 0 0; border-left: 2px solid var(--danger); padding: 6px 8px; color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent); font-size: 9.5px; }
+.settings-page button.release-page-link { width: max-content; border: 0; padding: 0; color: var(--accent); background: transparent; font-size: 10px; }
+.update-available-banner { display: grid; grid-template-columns: 28px minmax(0, 1fr); align-items: center; gap: 8px; border: 1px solid var(--sidebar-line); border-radius: 9px; margin: 7px 10px 0; padding: 8px; color: var(--ink-soft); background: var(--accent-soft); text-align: left; }
+.update-available-banner > span { display: grid; width: 28px; height: 28px; place-items: center; border-radius: 7px; color: var(--on-accent); background: var(--accent); font-size: 14px; font-weight: 800; }
+.update-available-banner > div { display: grid; min-width: 0; gap: 2px; }
+.update-available-banner strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.update-available-banner small { color: var(--muted); font-size: 8.5px; }
+
+@media (max-width: 760px) {
+  .update-manager-grid { grid-template-columns: 1fr; }
+}
