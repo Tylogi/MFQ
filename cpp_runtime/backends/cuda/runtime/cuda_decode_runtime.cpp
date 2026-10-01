@@ -1,4 +1,5 @@
 #include "cuda_decode_runtime.h"
+#include "qwen_continuous_workload.h"
 #include "cuda_execution.h"
 #include "cuda_sampling.h"
 #include "diagnostics/backend_checks.h"
@@ -2356,6 +2357,81 @@ static int32_t generate_server_tokens(
 }
 
 #include "qwen_continuous_batching.h"
+
+int mfq::cuda::run_qwen_continuous_workload(
+        const std::string& model_path,
+        const std::string& config_path,
+        int64_t context_size,
+        int64_t prefill_chunk_size,
+        const QwenWorkloadFn& run) {
+    MFQ_RUNTIME_CHECK(!model_path.empty() && context_size > 0 &&
+        prefill_chunk_size > 0 && static_cast<bool>(run),
+        "continuous workload requires a model, context, chunk size and callback");
+    mfq_tensor_backend::NoGradGuard no_grad;
+    auto source = mfq::open_model_source(model_path);
+    auto plan = mfq::cuda::cuda_model_plan(source->resolved_model_graph());
+    MFQ_RUNTIME_CHECK(plan.backbone == mfq::cuda::CudaBackbone::generic_qwen,
+        "continuous workload requires Qwen35CausalLm");
+    auto model = mfq::cuda::load_causal_lm<mfq::cuda::CudaBackbone::generic_qwen>(
+        model_path, config_path, context_size, true, false, source);
+    (void)load_runtime_components(model, false);
+    mfq_cuda_synchronize();
+
+    class Session final : public QwenContinuousWorkload {
+    public:
+        Session(mfq::cuda::Qwen35CausalLm& model, int64_t chunk)
+            : model_(model), chunk_(chunk) {}
+
+        int64_t vocab_size() const override { return model_.vocab_size(); }
+        int64_t max_position_embeddings() const override {
+            return model_.max_position_embeddings();
+        }
+        std::vector<int64_t> serial_generate(
+                const std::vector<int64_t>& prompt,
+                const MfqSamplingParams& sampling) override {
+            MFQ_RUNTIME_CHECK(!batcher_,
+                "serial reference must run before the continuous batcher starts");
+            std::vector<int64_t> output;
+            ServerDecodeGraphCache graph_cache(model_.max_position_embeddings());
+            ServerTextSessionCache session_cache;
+            const int32_t produced = generate_server_tokens(
+                model_, model_mutex_, graph_cache, session_cache, prompt, sampling,
+                [&](int64_t token) { output.push_back(token); return true; },
+                {}, {}, {}, nullptr, chunk_);
+            MFQ_RUNTIME_CHECK(produced == sampling.max_tokens &&
+                output.size() == static_cast<size_t>(produced),
+                "continuous workload serial reference length mismatch");
+            return output;
+        }
+        void start_batcher() override {
+            MFQ_RUNTIME_CHECK(!batcher_, "continuous batcher already started");
+            model_.reset(1);
+            batcher_ = std::make_unique<mfq::cuda::continuous::CudaContinuousBatcher>(
+                model_, model_mutex_, 2, chunk_);
+        }
+        int32_t submit(
+                const std::vector<int64_t>& prompt,
+                const MfqSamplingParams& sampling,
+                const MfqTokenCallback& on_token,
+                const MfqPrefillCallback& on_prefill) override {
+            MFQ_RUNTIME_CHECK(batcher_, "continuous batcher has not started");
+            return batcher_->submit(prompt, sampling, on_token, on_prefill, {}, {});
+        }
+        std::vector<std::pair<std::string, double>> metrics() const override {
+            MFQ_RUNTIME_CHECK(batcher_, "continuous batcher has not started");
+            return batcher_->metrics();
+        }
+
+    private:
+        mfq::cuda::Qwen35CausalLm& model_;
+        int64_t chunk_;
+        std::mutex model_mutex_;
+        std::unique_ptr<mfq::cuda::continuous::CudaContinuousBatcher> batcher_;
+    };
+
+    Session session(model, prefill_chunk_size);
+    return run(session);
+}
 
 // Real-weight correctness gate; does not require a tokenizer or start a server.
 // It calls the same MTP generator used by the server, with synthetic token IDs.

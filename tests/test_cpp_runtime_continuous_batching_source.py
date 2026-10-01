@@ -15,6 +15,16 @@ BATCHING = (
     / "runtime"
     / "qwen_continuous_batching.h"
 ).read_text(encoding="utf-8")
+BENCH = (CUDA_ROOT / "benchmarks" / "qwen_continuous_batching_benchmark.h").read_text(
+    encoding="utf-8"
+)
+BENCH_APP = (CUDA_ROOT / "apps" / "mfq_bench.cpp").read_text(encoding="utf-8")
+DECODE_RUNTIME = (CUDA_ROOT / "runtime" / "cuda_decode_runtime.cpp").read_text(
+    encoding="utf-8"
+)
+CUDA_CMAKE = (ROOT / "cpp_runtime" / "cmake" / "CudaRuntime.cmake").read_text(
+    encoding="utf-8"
+)
 ROPE = (ROOT / "mfq" / "kernels" / "cuda" / "rope.cu").read_text(
     encoding="utf-8"
 )
@@ -153,6 +163,31 @@ def test_real_weight_gate_exercises_join_and_compaction():
     assert 'metric("continuous_batching_compactions") >= 1.0' in BATCHING
     assert "std::vector<int64_t> first_prompt(193)" in BATCHING
     assert '" prompt_lengths=193,17 split_k=1"' in BATCHING
+
+
+def test_contention_benchmark_uses_the_real_batcher_and_reports_latency():
+    assert "add_executable(mfq-bench" in CUDA_CMAKE
+    assert "target_link_libraries(mfq-bench PRIVATE mfq-cuda-runtime mfq-server)" in CUDA_CMAKE
+    assert '"continuous-batching"' in BENCH_APP
+    assert "run_qwen_continuous_workload(" in BENCH_APP
+    assert "run_qwen_continuous_batching_benchmark(" in BENCH_APP
+    assert "bench-continuous-batching" not in DECODE_RUNTIME
+    assert "qwen_continuous_batching_benchmark.h" not in DECODE_RUNTIME
+    assert "CudaContinuousBatcher" in DECODE_RUNTIME
+    assert "generate_server_tokens(" in DECODE_RUNTIME
+    assert "serial_generate(" in BENCH
+    assert "start_batcher()" in BENCH
+    assert "batcher.submit(" in BENCH
+    assert "a_timestamps.push_back(now)" in BENCH
+    assert "last > b_submit_started && first < *b_prefill_callback" in BENCH
+    assert BENCH.index("metrics_before =") < BENCH.index("(void)batcher.submit(", BENCH.index("std::thread b_thread"))
+    for window in ("baseline", "contended"):
+        for percentile in ("p50", "p95", "p99", "max"):
+            assert f"{window}_{percentile}_itl_ms=" in BENCH
+    assert "b_ttft_ms=" in BENCH
+    assert "continuous_batching_interleaved_admissions" in BENCH
+    assert "continuous_batching_prefill_yields" in BENCH
+    assert "output differs from serial greedy oracle" in BENCH
 
 
 def test_linear_attention_uses_the_canonical_nint_operator():
