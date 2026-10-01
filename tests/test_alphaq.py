@@ -357,6 +357,147 @@ def test_mfq_source_and_cache_identity(tmp_path):
         collect_alphaq(path, stats, device="cpu")
 
 
+@pytest.fixture(params=["tensor", "block"])
+def scaled_expert_sources(tmp_path, request):
+    from safetensors.torch import save_file
+
+    from mfq.formats.header import FileHeader
+    from mfq.formats.io import Float8E4M3Array, save
+
+    hf = tmp_path / "scaled-hf"
+    hf.mkdir()
+    config = {
+        "model_type": "glm5_next",
+        "text_config": {"model_type": "glm5_next", "num_hidden_layers": 1},
+    }
+    (hf / "config.json").write_text(json.dumps(config))
+    generator = torch.Generator().manual_seed(74)
+    tensors, records, expected = {}, {}, {}
+    for projection, shape in (("gate", (256, 128)), ("up", (256, 128)), ("down", (128, 256))):
+        weight = torch.randn(shape, generator=generator).to(torch.float8_e4m3fn)
+        decoded = []
+        for expert, multiplier in enumerate((0.1, 2.0)):
+            name = f"model.language_model.layers.0.mlp.experts.{expert}.{projection}_proj.weight"
+            if request.param == "tensor":
+                scale = torch.tensor([multiplier])
+                expanded = scale
+            else:
+                scale = torch.tensor([[multiplier], [3 * multiplier]]).reshape(
+                    shape[0] // 128, shape[1] // 128
+                )
+                expanded = scale.repeat_interleave(128, 0).repeat_interleave(128, 1)
+            tensors[name] = weight.clone()
+            tensors[name + "_scale_inv"] = scale
+            records[name] = weight.view(torch.uint8).numpy().view(Float8E4M3Array)
+            records[name + "_scale_inv"] = scale.numpy()
+            decoded.append(weight.float() * expanded)
+        expected[f"model.block.0.mlp.experts.{projection}.weight"] = torch.stack(decoded)
+    save_file(tensors, hf / "model.safetensors")
+    mfq = tmp_path / "scaled.mfq"
+    save(
+        mfq,
+        FileHeader(model_arch="glm5_next", num_tensors=len(records), extra={"hf_config": config}),
+        records,
+    )
+    return hf, mfq, expected
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda:0",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable"),
+        ),
+    ],
+)
+def test_scaled_mfq_statistics_and_allocation_match_hf(tmp_path, scaled_expert_sources, device):
+    hf, mfq, expected = scaled_expert_sources
+    hf_stats = collect_alphaq(hf, tmp_path / "hf-stats.json", device=device)
+    mfq_stats = collect_alphaq(mfq, tmp_path / "mfq-stats.json", device=device)
+    alpha_rtol = 1e-4 if device.startswith("cuda") else 2e-5
+    for actual, reference in zip(mfq_stats, hf_stats, strict=True):
+        assert actual.name == reference.name
+        oracle = alphaq_weight_statistics(expected[actual.name])
+        np.testing.assert_allclose(actual.alpha, oracle[0], rtol=alpha_rtol)
+        np.testing.assert_allclose(actual.variance, oracle[1], rtol=2e-6)
+        np.testing.assert_allclose(actual.alpha, reference.alpha, rtol=2e-5)
+        np.testing.assert_allclose(actual.variance, reference.variance, rtol=2e-6)
+    table = alphaq_nint_candidates(hf_stats, ("NINT2", "NINT4"))
+    budget = _budget(table, table.routed_weight_count * 4)
+    hf_result = allocate_alphaq(hf_stats, table, budget)
+    mfq_result = allocate_alphaq(mfq_stats, table, budget)
+    assert mfq_result.selected == hf_result.selected
+    assert mfq_result.scheme.storage_bits == hf_result.scheme.storage_bits
+
+
+def test_scaled_mfq_quantization_matches_hf(tmp_path, scaled_expert_sources):
+    from mfq.calibration.artifact import save_scheme
+    from mfq.formats.io import open_mmap
+
+    hf, mfq, expected = scaled_expert_sources
+    stats = collect_alphaq(hf, tmp_path / "stats.json", device="cpu")
+    table = alphaq_nint_candidates(stats, ("NINT2", "NINT4"))
+    result = allocate_alphaq(stats, table, _budget(table, table.routed_weight_count * 4))
+    scheme = tmp_path / "scheme.json"
+    save_scheme(scheme, result.scheme)
+    payloads = []
+    for index, source in enumerate((hf, mfq)):
+        output = tmp_path / f"quantized-{index}.mfq"
+        # Cross both 128-row scale blocks and expert boundaries.
+        assert (
+            cli.main(
+                [
+                    "quantize",
+                    str(source),
+                    str(output),
+                    "--scheme",
+                    str(scheme),
+                    "--backend",
+                    "cpu",
+                    "--device",
+                    "cpu",
+                    "--row-chunk",
+                    "129",
+                ]
+            )
+            == 0
+        )
+        with open_mmap(output) as store:
+            payloads.append({name: store.read_blob(name) for name in expected})
+    assert payloads[0] == payloads[1]
+
+
+def test_scaled_mfq_recomputes_only_stale_bank_cache(tmp_path, scaled_expert_sources, monkeypatch):
+    from mfq.calibration import alphaq_source
+
+    _, mfq, _ = scaled_expert_sources
+    path = tmp_path / "stats.json"
+    expected = collect_alphaq(mfq, path, device="cpu")
+    saved = json.loads(path.read_text())
+    stale = saved["tensors"][expected[0].name]
+    stale.pop("mfq_expert_scales_applied", None)
+    stale["alpha"] = [1.0, 1.0]
+    stale["variance"] = [999.0, 999.0]
+    path.write_text(json.dumps(saved))
+    original = alphaq_source._collect_batch
+    calls = []
+
+    def counted(*args):
+        calls.append(args[1:3])
+        return original(*args)
+
+    monkeypatch.setattr(alphaq_source, "_collect_batch", counted)
+    actual = collect_alphaq(mfq, path, device="cpu")
+    assert actual == expected
+    assert calls == [(0, 2)]
+    assert json.loads(path.read_text())["tensors"][expected[0].name]["mfq_expert_scales_applied"]
+    calls.clear()
+    assert collect_alphaq(mfq, path, device="cpu") == expected
+    assert calls == []
+
+
 def test_optional_progress_io_does_not_fail_collection(monkeypatch):
     from mfq.calibration.alphaq_source import _progress
 

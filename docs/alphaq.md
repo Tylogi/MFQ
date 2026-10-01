@@ -61,6 +61,11 @@ saved after each bank and reused by name, shape, method and source file
 path/size/mtime identity. This is a local restart check, not a cryptographic
 model-revision guarantee. Keep immutable checkpoints for reproducibility.
 
+Separate FP8 experts apply their tensor or block scale multipliers for both HF
+and MFQ inputs, in statistics collection and subsequent quantization. Older
+cached MFQ expert statistics without the scale-decoding marker are recomputed
+per affected bank; all unaffected cached banks remain reusable.
+
 The default scheme sidecars are `<stem>.alphaq-statistics.json` and
 `<stem>.report.json`. `--statistics` and `--report` override these paths.
 Optional console-output failures do not interrupt computation. A failed

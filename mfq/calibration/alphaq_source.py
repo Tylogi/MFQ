@@ -121,8 +121,21 @@ def collect_alphaq(
             shape = tuple(item.expert_shape or item.shape)
             if len(shape) != 3:
                 raise ValueError(f"AlphaQ requires an expert bank [E,O,I]: {name} {shape}")
-            if name in saved["tensors"]:
-                raw = saved["tensors"][name]
+            scaled_mfq_experts = (
+                checkpoint is not None
+                and item.expert_source_names is not None
+                and any(
+                    scheme is not None
+                    for row in (item.expert_source_quantizations or ())
+                    for scheme in row
+                )
+            )
+            raw = saved["tensors"].get(name)
+            # Older collectors read separate MFQ experts without their FP8
+            # scales. Recompute only those banks, preserving unaffected work.
+            if raw is not None and (
+                not scaled_mfq_experts or raw.get("mfq_expert_scales_applied") is True
+            ):
                 value = AlphaQTensorStatistics(
                     raw["name"],
                     raw["layer"],
@@ -141,7 +154,13 @@ def collect_alphaq(
             else:
                 if item.expert_source_names is not None:
                     source = (
-                        _MfqGlmExpertRowSource(checkpoint, shape, item.expert_source_names)
+                        _MfqGlmExpertRowSource(
+                            checkpoint,
+                            shape,
+                            item.expert_source_names,
+                            item.expert_source_quantizations,
+                            item.expert_source_scale_names,
+                        )
                         if checkpoint is not None
                         else _SeparateExpertRowSource(
                             root,
@@ -186,6 +205,9 @@ def collect_alphaq(
                     if hasattr(source, "close"):
                         source.close()
                 saved["tensors"][name] = asdict(value)
+                if scaled_mfq_experts:
+                    saved["tensors"][name]["mfq_expert_scales_applied"] = True
+                saved["complete"] = False
                 _atomic_json(output, saved)
             results.append(value)
             _progress(

@@ -1,0 +1,37 @@
+name: Calibration
+
+on:
+  push:
+    branches: [master]
+    paths: ['mfq/**', 'tests/**', 'pyproject.toml', '.github/workflows/calibration.yaml']
+  pull_request:
+    branches: [master]
+    paths: ['mfq/**', 'tests/**', 'pyproject.toml', '.github/workflows/calibration.yaml']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  calibration:
+    name: AlphaQ and source decoding
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install pytest scipy safetensors gguf 'pydantic>=2.8.0'
+      - name: Check allocation, source decoding and quantization
+        run: >-
+          python -m pytest tests/test_alphaq.py tests/test_ew_solver.py
+          tests/test_hf_source_store.py tests/test_quantize_cli.py tests/test_calibration.py
+          tests/test_build_reap_expert_scheme.py tests/test_quantize/test_hf_to_mfq.py
+          tests/test_quantize/test_full_precision_mfq.py -q

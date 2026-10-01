@@ -4730,15 +4730,44 @@ class _MfqGlmExpertRowSource:
         checkpoint,
         expert_shape: tuple[int, int, int],
         source_names: tuple[tuple[str, ...], ...],
+        source_quantizations: tuple[tuple[str | None, ...], ...] | None = None,
+        source_scale_names: tuple[tuple[str | None, ...], ...] | None = None,
     ) -> None:
         self.checkpoint = checkpoint
         self.n_experts, self.rows_per_expert, self.columns = expert_shape
         self.source_names = source_names
         if len(source_names) != self.n_experts:
             raise ValueError("GLM expert source count does not match expert shape")
+        empty = tuple(tuple(None for _ in names) for names in source_names)
+        self.source_quantizations = empty if source_quantizations is None else source_quantizations
+        self.source_scale_names = empty if source_scale_names is None else source_scale_names
+        for values in (self.source_quantizations, self.source_scale_names):
+            if len(values) != self.n_experts or any(
+                len(row) != len(names) for row, names in zip(values, source_names, strict=True)
+            ):
+                raise ValueError("invalid MFQ expert source quantization metadata")
+        self._reader_key: tuple[int, int] | None = None
+        self._reader = None
 
     def close(self) -> None:
-        return None
+        self._reader_key = None
+        self._reader = None
+
+    def _source(self, expert: int, index: int):
+        key = (expert, index)
+        if self._reader_key == key and self._reader is not None:
+            return self._reader
+        name = self.source_names[expert][index]
+        reader = self.checkpoint.tensor_source(name)
+        scheme = self.source_quantizations[expert][index]
+        if scheme is not None:
+            scale_name = self.source_scale_names[expert][index]
+            if scale_name is None:
+                raise ValueError(f"scaled MFQ expert source lacks scale metadata: {name}")
+            reader = _ScaledFp8TensorSlice(reader, self.checkpoint.tensor_source(scale_name), scheme)
+        self._reader_key = key
+        self._reader = reader
+        return reader
 
     def _read(
         self,
@@ -4759,7 +4788,7 @@ class _MfqGlmExpertRowSource:
             local_row = cursor % rows_per_source
             take = min(end - cursor, rows_per_source - local_row)
             pieces.append(
-                self.checkpoint.tensor_source(names[source_index]).read_rows(
+                self._source(expert, source_index).read_rows(
                     local_row,
                     local_row + take,
                     device=device,
@@ -7045,6 +7074,8 @@ def convert(args: argparse.Namespace) -> None:
                             mfq_checkpoint,
                             item.shape,
                             item.expert_source_names,
+                            item.expert_source_quantizations,
+                            item.expert_source_scale_names,
                         )
                         if mfq_checkpoint is not None
                         else _SeparateExpertRowSource(
