@@ -33,8 +33,36 @@ uv sync --extra metal --extra calibration
 | `allocate` | Score candidates and allocate tensor precision |
 | `candidates` | Materialize packed dense candidates without allocating a scheme |
 | `inint` | Select per-neuron NINT4/NINT8 rows |
+| `alphaq` | Allocate routed-expert precision from weights alone, without a calibration corpus |
 
 Run `uv run mfq calibrate STAGE --help` for stage-specific options.
+
+## Calibration-free AlphaQ
+
+```shell
+uv run mfq calibrate alphaq \
+  --model model-hf --target-bpw 3.0 \
+  --statistics alphaq-stats.json --output alphaq-3bpw.json
+
+uv run mfq quantize model-hf model-alphaq.mfq --scheme alphaq-3bpw.json
+```
+
+No tokenizer, dataset, forward pass, gradient collection or candidate weight
+fitting is required for allocation. `--device auto` uses CUDA when available,
+otherwise CPU. The spectral statistics are saved after each expert bank; repeat
+the command with the same `--statistics` to resume or select another budget.
+Completed output schemes are never overwritten.
+
+The built-in candidates are MFQ's standard NINT2/3/4/5/6/8 specifications.
+Use repeated `--profile NINT2 --profile NINT3` to select a subset, or supply an
+existing EW candidate table with `--candidates` for NVQ/native/mixed formats.
+The command emits the normal scheme consumed by `mfq quantize --scheme`.
+Its scope is **routed expert tensors only**; non-routed tensors follow the normal
+quantizer/recipe policy, not the AlphaQ budget. The default 3.0 BPW is an example
+chosen by the caller, not an AlphaQ method hyperparameter.
+
+See [AlphaQ's formula, storage accounting and API](../alphaq.md) before comparing
+budgets or using shared-codebook candidate tables.
 
 ## Activation imatrix
 

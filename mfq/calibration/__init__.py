@@ -9,6 +9,15 @@ from typing import Any
 # artifact types, so importing every calibration pipeline here would create a
 # cycle between ``mfq.quantize`` and ``mfq.calibration``.
 _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
+    "alphaq": (
+        "AlphaQTensorStatistics",
+        "alphaq_weight_statistics",
+        "alphaq_importance",
+        "alphaq_candidates",
+        "alphaq_nint_candidates",
+        "allocate_alphaq",
+    ),
+    "alphaq_source": ("collect_alphaq",),
     "allocator": ("AllocationResult", "GroupCandidate", "allocate"),
     "artifact": (
         "CalibrationScheme",
@@ -82,6 +91,13 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
 }
 
 __all__ = [
+    "AlphaQTensorStatistics",
+    "alphaq_weight_statistics",
+    "alphaq_importance",
+    "alphaq_candidates",
+    "alphaq_nint_candidates",
+    "allocate_alphaq",
+    "collect_alphaq",
     "ActivationImatrixCollector",
     "AllocationResult",
     "CalibrationBatch",
