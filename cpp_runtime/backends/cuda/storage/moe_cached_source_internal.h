@@ -364,7 +364,10 @@ public:
             auto staged = stage_fallback_runtime(execution.config);
             return staged.forward(execution, x, route);
         }
-        auto output = active_->forward(execution, x, route);
+        auto output = active_->forward(
+            execution.config, execution.kl_mmq,
+            execution.force_moe_prefill_mma_off,
+            execution.force_moe_pool_path, x, route);
         cache_->record_compute_use();
         return output;
     }
@@ -383,7 +386,10 @@ public:
             auto staged = stage_fallback_runtime(execution.config);
             return staged.forward(execution, x, route);
         }
-        auto output = active_->forward(execution, x, route, true);
+        auto output = active_->forward(
+            execution.config, execution.kl_mmq,
+            execution.force_moe_prefill_mma_off,
+            execution.force_moe_pool_path, x, route, true);
         cache_->record_compute_use();
         return output;
     }
@@ -411,7 +417,9 @@ public:
             return staged.forward_glu_output(execution, x, route, gelu);
         }
         auto output = active_->forward_glu_output(
-            execution, x, route, gelu);
+            execution.config, execution.kl_mmq,
+            execution.force_moe_prefill_mma_off,
+            execution.force_moe_pool_path, x, route, gelu);
         cache_->record_compute_use();
         return output;
     }
@@ -445,9 +453,11 @@ public:
             return staged.forward_clamped_swiglu(
                 execution, gate_up, route, limit);
         }
-        auto output =
-            active_->forward_clamped_swiglu(
-                execution, gate_up, route, limit);
+        auto output = active_->forward_clamped_swiglu(
+            execution.config, execution.kl_mmq,
+            execution.force_moe_prefill_mma_off,
+            execution.force_moe_pool_path,
+            gate_up, route, limit);
         cache_->record_compute_use();
         return output;
     }

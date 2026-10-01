@@ -58,24 +58,24 @@ static void check_linear_execution() {
                 .dtype(mfq_tensor_backend::kFloat32)) * 0.013)
             .to(mfq_tensor_backend::kFloat16).reshape({2, 8, linear->neuron_len()});
         for (auto mode : {KlMmqMode::Default, KlMmqMode::Fp16, KlMmqMode::Nint8One}) {
-            owner.kl_mmq_mode = mode;
-            other.kl_mmq_mode = mode == KlMmqMode::Nint8One
+            owner.kl_mmq.mode = mode;
+            other.kl_mmq.mode = mode == KlMmqMode::Nint8One
                 ? KlMmqMode::Fp16 : KlMmqMode::Nint8One;
             auto verify = [&](auto run) {
                 auto expected = run(input.reshape({16, linear->neuron_len()}))
                     .reshape({2, 8, 2});
-                const auto calls = owner.kl_mmq_activation_quantize_calls;
-                const auto dense_calls = owner.kl_mmq_dense_calls;
+                const auto calls = owner.kl_mmq.activation_quantize_calls;
+                const auto dense_calls = owner.kl_mmq.dense_calls;
                 const auto actual = run(input);
                 check(actual.scalar_type() == expected.scalar_type() &&
                           actual.equal(expected),
                       "linear output lost its shape/dtype");
-                check(owner.kl_mmq_activation_quantize_calls == calls +
+                check(owner.kl_mmq.activation_quantize_calls == calls +
                           (mode == KlMmqMode::Nint8One ? 1 : 0) &&
-                      owner.kl_mmq_dense_calls == dense_calls +
+                      owner.kl_mmq.dense_calls == dense_calls +
                           (mode != KlMmqMode::Default ? 1 : 0) &&
-                      other.kl_mmq_activation_quantize_calls == 0 &&
-                      other.kl_mmq_dense_calls == 0,
+                      other.kl_mmq.activation_quantize_calls == 0 &&
+                      other.kl_mmq.dense_calls == 0,
                       "linear diagnostics escaped the explicit execution");
                 check(run(input).equal(expected),
                       "linear execution changed without hidden state");

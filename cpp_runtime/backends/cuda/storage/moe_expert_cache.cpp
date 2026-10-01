@@ -954,7 +954,7 @@ MfeWeight load_mfe_gpu(
         });
     if (moe_parallel_config(execution).enabled()) {
         auto slices = plan_moe_expert_parallel_slices(
-            execution, cpu.n_experts, name);
+            moe_parallel_config(execution), cpu.n_experts, name);
         MfeWeight result;
         result.n_experts = cpu.n_experts;
         result.out_per_expert =

@@ -97,7 +97,8 @@ int generate_diagnostic_tokens(
             const int64_t attention_parts = decode_graph_attention_parts(
                 planned_len, FullBlock::kDecodeAttentionMaxParts);
             {
-                DecodeGraphBranchScope branch_scope(execution);
+                DecodeGraphBranchScope branch_scope(
+                    execution.decode_graph_serial_branches);
                 prepare_decode_graph_memory(model, graph, [&]() {
                     (void)model.next_token_static(
                         static_input, static_pos, static_len,

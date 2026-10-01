@@ -41,7 +41,7 @@ struct QuantLinearGroup {
             CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x) const {
         const bool default_mmq =
-            execution.kl_mmq_mode == KlMmqMode::Default;
+            execution.kl_mmq.mode == KlMmqMode::Default;
         if (!x.is_cuda()) {
             MFQ_RUNTIME_CHECK(
                 !nint_grouped,
@@ -57,7 +57,11 @@ struct QuantLinearGroup {
                 tensor_parallel_output_compatible()) {
             return forward_tensor_parallel_output_group(execution, x);
         }
-        if (nint_grouped) return nint.forward(execution, x);
+        if (nint_grouped) {
+            return nint.forward(
+                execution.profiler, execution.kl_mmq,
+                execution.config, execution.decode_graph_serial_branches, x);
+        }
         if (default_mmq && nvq_prefix2 && nvq_fusion_enabled(execution.config)) {
             auto shape = x.sizes().vec();
             const auto flat =
@@ -122,7 +126,7 @@ struct QuantLinearGroup {
             CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x) const {
         const bool default_mmq =
-            execution.kl_mmq_mode == KlMmqMode::Default;
+            execution.kl_mmq.mode == KlMmqMode::Default;
         if (default_mmq && nint_grouped && nint.split_w.empty() &&
                 x.numel() / x.size(-1) >= 1 && x.numel() / x.size(-1) <= 6) {
             return nint.forward_swiglu(execution.profiler, x);
@@ -145,7 +149,7 @@ struct QuantLinearGroup {
     mfq_tensor_backend::Tensor forward_geglu(
             CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x) const {
-        if (execution.kl_mmq_mode == KlMmqMode::Default &&
+        if (execution.kl_mmq.mode == KlMmqMode::Default &&
                 nint_grouped && nint.split_w.empty() &&
                 x.numel() / x.size(-1) == 1) {
             return nint.forward_geglu(execution.profiler, x);

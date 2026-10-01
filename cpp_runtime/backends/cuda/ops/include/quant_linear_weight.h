@@ -80,11 +80,13 @@ struct QuantLinear {
                 local_gate = gate.value();
             }
             local_x = tensor_to_cuda_device(
-                execution, local_x, shard.device);
+                execution.model_parallel_collectives,
+                local_x, shard.device);
             if (gate.has_value()) {
                 local_gate =
                     tensor_to_cuda_device(
-                        execution, local_gate, shard.device);
+                        execution.model_parallel_collectives,
+                        local_gate, shard.device);
             }
             if (is_mxfp8() &&
                     tensor_parallel_axis == TensorParallelAxis::Input) {
@@ -97,7 +99,8 @@ struct QuantLinear {
             } else {
                 local_outputs[index] =
                     run_quant_linear_shard(
-                        execution, shard, local_x,
+                        execution.profiler, execution.kl_mmq,
+                        shard, local_x,
                         gate.has_value()
                             ? MfqOptional<mfq_tensor_backend::Tensor>(
                                 local_gate)
@@ -113,7 +116,9 @@ struct QuantLinear {
             gathered.reserve(local_outputs.size());
             for (auto & output : local_outputs) {
                 gathered.push_back(
-                    tensor_to_cuda_device(execution, output, primary));
+                    tensor_to_cuda_device(
+                        execution.model_parallel_collectives,
+                        output, primary));
             }
             return mfq_tensor_backend::cat(gathered, -1).contiguous();
         }
@@ -147,8 +152,10 @@ struct QuantLinear {
             auto flat = x.reshape({-1, x.size(-1)});
             auto y = tensor_parallel()
                 ? forward_tensor_parallel_flat(execution, flat, mfq_nullopt, 0)
-                : is_nint() ? run_nint_linear(execution, nint, flat)
-                            : run_nvq_linear(execution, nvq, flat);
+                : is_nint() ? run_nint_linear(
+                      execution.profiler, execution.kl_mmq, nint, flat)
+                            : run_nvq_linear(
+                      execution.profiler, execution.kl_mmq, nvq, flat);
             shape.back() = y.size(-1);
             return y.reshape(shape);
         }
@@ -189,7 +196,8 @@ struct QuantLinear {
                 -1, shard.input_begin,
                 shard.input_end - shard.input_begin);
             local = tensor_to_cuda_device(
-                execution, local, shard.device);
+                execution.model_parallel_collectives,
+                local, shard.device);
             partials.push_back(mxfp8_groupwise_matmul_f32(
                 execution.profiler, shard.mxfp8, local, groups));
         }
@@ -207,8 +215,12 @@ struct QuantLinear {
             auto flat_gate = gate.reshape({-1, gate.size(-1)});
             auto y = tensor_parallel()
                 ? forward_tensor_parallel_flat(execution, flat, flat_gate, mode)
-                : is_nint() ? run_nint_linear(execution, nint, flat, flat_gate, mode)
-                            : run_nvq_linear(execution, nvq, flat, flat_gate, mode);
+                : is_nint() ? run_nint_linear(
+                      execution.profiler, execution.kl_mmq,
+                      nint, flat, flat_gate, mode)
+                            : run_nvq_linear(
+                      execution.profiler, execution.kl_mmq,
+                      nvq, flat, flat_gate, mode);
             shape.back() = y.size(-1);
             return y.reshape(shape);
         }
@@ -240,13 +252,13 @@ struct QuantLinear {
             !tensor_parallel() && is_nint(),
             "FP32-output KLD down projection requires a local NINT tensor");
         MFQ_RUNTIME_CHECK(
-            execution.kl_mmq_mode == KlMmqMode::Fp16,
+            execution.kl_mmq.mode == KlMmqMode::Fp16,
             "FP32-output NINT MMQ is restricted to the FP16 KLD path");
         auto shape = x.sizes().vec();
         auto y = nint_matmul_input_mul_f32(
             execution.profiler, nint, x.reshape({-1, x.size(-1)}),
             gate.reshape({-1, gate.size(-1)}), mode);
-        if (nint.q8_zero) ++execution.kl_mmq_dense_calls;
+        if (nint.q8_zero) ++execution.kl_mmq.dense_calls;
         shape.back() = y.size(-1);
         return y.reshape(shape);
     }

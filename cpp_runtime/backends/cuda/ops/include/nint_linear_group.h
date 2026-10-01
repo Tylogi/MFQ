@@ -12,7 +12,10 @@ struct NintLinearGroup {
         branch_executor =
             std::make_shared<CudaIndependentBranchExecutor>();
     std::vector<mfq_tensor_backend::Tensor> forward(
-            CudaExecutionContext& execution,
+            CudaProfiler& profiler,
+            KlMmqState& kl_mmq,
+            const CudaExecutionConfig& config,
+            bool serial_branches,
             mfq_tensor_backend::Tensor x) const {
         auto shape = x.sizes().vec();
         std::vector<mfq_tensor_backend::Tensor> parts;
@@ -22,31 +25,33 @@ struct NintLinearGroup {
             parts.reserve(projection_w.size());
             for (const auto & projection : projection_w) {
                 parts.push_back(run_nint_linear(
-                    execution, projection, xf));
+                    profiler, kl_mmq, projection, xf));
             }
         } else if (!split_w.empty()) {
             parts.reserve(outs.size());
             std::vector<mfq_tensor_backend::Tensor> grouped_outputs;
             const bool parallel =
                 decode_branch_parallel_enabled(
-                    execution.config, execution.decode_graph_serial_branches, xf.size(0)) &&
+                    config, serial_branches, xf.size(0)) &&
                 branch_executor->run(
                     split_w.size(),
                     [&](size_t index) {
                         return run_nint_linear(
-                            execution, split_w[index], xf);
+                            profiler, kl_mmq, split_w[index], xf);
                     },
                     grouped_outputs);
             for (size_t i = 0; i < split_w.size(); ++i) {
                 auto y = parallel
                     ? grouped_outputs[i]
-                    : run_nint_linear(execution, split_w[i], xf);
+                    : run_nint_linear(
+                          profiler, kl_mmq, split_w[i], xf);
                 auto ys = y.split_with_sizes(split_outs[i], -1);
                 for (auto & p : ys) parts.push_back(p);
             }
         } else {
             auto y = run_nint_linear(
-                execution, w, x.reshape({-1, x.size(-1)}));
+                profiler, kl_mmq,
+                w, x.reshape({-1, x.size(-1)}));
             parts = y.split_with_sizes(outs, -1);
         }
         for (auto & p : parts) {

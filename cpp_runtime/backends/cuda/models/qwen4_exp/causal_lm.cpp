@@ -147,7 +147,8 @@ Qwen4Model::adapter_block_positions(
         const mfq_tensor_backend::Tensor& full_positions,
         const mfq_tensor_backend::Tensor&,
         int device) const {
-    return tensor_to_cuda_device(*execution, full_positions, device);
+    return tensor_to_cuda_device(
+        execution->model_parallel_collectives, full_positions, device);
 }
 
 void Qwen4Model::adapter_finish_forward(

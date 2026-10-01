@@ -183,7 +183,10 @@ struct MixedMoeRuntime {
     }
 
     mfq_tensor_backend::Tensor forward(
-            CudaExecutionContext& execution,
+            const CudaExecutionConfig& config,
+            KlMmqState& kl_mmq,
+            bool force_prefill_mma_off,
+            bool force_pool_path,
             mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route,
             bool input_prequantized = false,
@@ -225,13 +228,13 @@ struct MixedMoeRuntime {
         std::unordered_set<
             MixedMoeActivationKey, MixedMoeActivationKeyHash> quantized;
         const bool use_f16_mma =
-            execution.config.moe_prefill_mma &&
-            !execution.force_moe_prefill_mma_off &&
-            tokens >= execution.config.moe_prefill_mma_min_tokens &&
+            config.moe_prefill_mma &&
+            !force_prefill_mma_off &&
+            tokens >= config.moe_prefill_mma_min_tokens &&
             route.map_ready &&
             route.ids_dst.numel() == route.ids.numel();
         const bool use_kl_mmq =
-            execution.kl_mmq_mode != KlMmqMode::Default;
+            kl_mmq.mode != KlMmqMode::Default;
         const bool nvq_hetero_prefill_ready = nvq_dispatch &&
             (nvq_dispatch->pool_count > 1 ||
              (out_per_expert >= 128 &&
@@ -242,8 +245,8 @@ struct MixedMoeRuntime {
         const bool use_nvq_decode =
             !use_f16_mma && !use_kl_mmq && nvq_dispatch &&
             nvq_dispatch->pool_count > 1 &&
-            tokens <= 8 && !execution.force_moe_pool_path &&
-            execution.config.moe_nvq_heterogeneous_decode;
+            tokens <= 8 && !force_pool_path &&
+            config.moe_nvq_heterogeneous_decode;
         int nint_pool_phase = 0;
         if (input_prequantized && use_kl_mmq) {
             throw std::runtime_error(
@@ -344,8 +347,8 @@ struct MixedMoeRuntime {
                 }
             }
             if (use_kl_mmq) {
-                value = execution.kl_mmq_prepare_activation(value);
-                ++execution.kl_mmq_moe_calls;
+                value = kl_mmq.prepare_activation(value);
+                ++kl_mmq.moe_calls;
                 if (pool.family == MixedMoeFamily::Mxfp4) {
                     mxfp4_moe_grouped_matmul_pool_f16_cuda(
                         pool.mxfp4.values, pool.mxfp4.scales, value,
@@ -412,7 +415,7 @@ struct MixedMoeRuntime {
                     }
                     continue;
                 }
-                ++execution.kl_mmq_fallback_calls;
+                ++kl_mmq.fallback_calls;
                 throw std::runtime_error(
                     "KLD mixed routed FP16 encountered a non-VQ pool");
             }
@@ -548,15 +551,21 @@ struct MixedMoeRuntime {
     }
 
     mfq_tensor_backend::Tensor forward_glu_output(
-            CudaExecutionContext& execution,
+            const CudaExecutionConfig& config,
+            KlMmqState& kl_mmq,
+            bool force_prefill_mma_off,
+            bool force_pool_path,
             mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route,
             bool gelu) const {
-        if (nint_only() &&
-                execution.kl_mmq_mode == KlMmqMode::Default) {
-            return forward(execution, x, route, false, gelu ? 2 : 1);
+        if (nint_only() && kl_mmq.mode == KlMmqMode::Default) {
+            return forward(
+                config, kl_mmq, force_prefill_mma_off, force_pool_path,
+                x, route, false, gelu ? 2 : 1);
         }
-        auto gate_up = forward(execution, x, route);
+        auto gate_up = forward(
+            config, kl_mmq, force_prefill_mma_off, force_pool_path,
+            x, route);
         return gelu
             ? moe_geglu_split_cuda(gate_up)
             : moe_swiglu_split_cuda(gate_up);
@@ -567,7 +576,10 @@ struct MixedMoeRuntime {
     }
 
     mfq_tensor_backend::Tensor forward_clamped_swiglu(
-            CudaExecutionContext& execution,
+            const CudaExecutionConfig& config,
+            KlMmqState& kl_mmq,
+            bool force_prefill_mma_off,
+            bool force_pool_path,
             mfq_tensor_backend::Tensor gate_up,
             const MoeRoutePlan & route,
             double limit) const {
@@ -591,7 +603,9 @@ struct MixedMoeRuntime {
         auto up = mfq_tensor_backend::clamp(parts[1], -limit, limit);
         auto activation =
             (mfq_tensor_backend::silu(gate) * up).contiguous();
-        return forward(execution, activation, route);
+        return forward(
+            config, kl_mmq, force_prefill_mma_off, force_pool_path,
+            activation, route);
     }
 };
 
@@ -618,6 +632,6 @@ MfeWeight to_cuda_device_moe_expert_slice(
 std::shared_ptr<MixedMoeRuntime> make_mxfp4_range_runtime(
     const mfq::cuda::MfeMxfp4ExpertStore& store);
 std::vector<mfq::TensorParallelSlice> plan_moe_expert_parallel_slices(
-    const CudaExecutionContext& execution,
+    const ParallelConfig& parallel,
     int64_t extent,
     const std::string& name);

@@ -36,11 +36,11 @@ int main() {
     second_engine.metadata.architecture = "second";
     first_engine.runtime_metrics = [&first] {
         return std::vector<std::pair<std::string, double>>{
-            {"calls", static_cast<double>(first.kl_mmq_dense_calls)}};
+            {"calls", static_cast<double>(first.kl_mmq.dense_calls)}};
     };
     second_engine.runtime_metrics = [&second] {
         return std::vector<std::pair<std::string, double>>{
-            {"calls", static_cast<double>(second.kl_mmq_dense_calls)}};
+            {"calls", static_cast<double>(second.kl_mmq.dense_calls)}};
     };
 
     std::atomic<int> ready{0};
@@ -48,7 +48,7 @@ int main() {
     auto run = [&](CudaExecutionContext& context,
                    mfq::cuda::CudaEngine& engine,
                    bool first_context) {
-        context.kl_mmq_dense_calls = first_context ? 11 : 29;
+        context.kl_mmq.dense_calls = first_context ? 11 : 29;
         context.continuous_batch_cache_serial = first_context;
         context.profiler.stats["engine"].calls = first_context ? 3 : 7;
         ready.fetch_add(1, std::memory_order_release);
@@ -59,13 +59,13 @@ int main() {
             ? model_parallel_enabled(context) &&
                 context.tensor_parallel.primary_device() == 0 &&
                 !context.expert_parallel.enabled() &&
-                context.kl_mmq_dense_calls == 11 &&
+                context.kl_mmq.dense_calls == 11 &&
                 context.profiler.stats.at("engine").calls == 3 &&
                 !context.config.nvq_fusion
             : model_parallel_enabled(context) &&
                 !context.tensor_parallel.enabled() &&
                 moe_parallel_config(context).primary_device() == 2 &&
-                context.kl_mmq_dense_calls == 29 &&
+                context.kl_mmq.dense_calls == 29 &&
                 context.profiler.stats.at("engine").calls == 7 &&
                 context.config.nvq_fusion;
         const auto metrics = engine.runtime_metrics();

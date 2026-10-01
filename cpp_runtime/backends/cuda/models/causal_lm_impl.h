@@ -141,7 +141,8 @@ mfq_tensor_backend::Tensor CausalLm<Model>::hidden_forward(mfq_tensor_backend::T
                              int64_t decode_attention_parts) {
         const int primary = this->execution->layer_placement.primary_device();
         MfqCudaGuard primary_guard(primary);
-        ids = tensor_to_cuda_device(*this->execution,
+        ids = tensor_to_cuda_device(
+            this->execution->model_parallel_collectives,
             ids.to(mfq_tensor_backend::kInt64), primary);
         if (ids.dim() == 1) ids = ids.unsqueeze(0);
         auto x = this->execution->profiler.measure(
@@ -189,7 +190,8 @@ mfq_tensor_backend::Tensor CausalLm<Model>::hidden_forward_inputs(
         int64_t decode_attention_parts) {
         const int primary = this->execution->layer_placement.primary_device();
         MfqCudaGuard primary_guard(primary);
-        ids = tensor_to_cuda_device(*this->execution,
+        ids = tensor_to_cuda_device(
+            this->execution->model_parallel_collectives,
             ids.to(mfq_tensor_backend::kInt64), primary);
         if (ids.dim() == 1) ids = ids.unsqueeze(0);
         if (input_embeddings.dim() != 3 ||
@@ -223,7 +225,8 @@ mfq_tensor_backend::Tensor CausalLm<Model>::hidden_forward_inputs(
         }
         if (cache_pos == 0) reset(B);
         auto cache_positions = cache_positions_override.has_value()
-            ? tensor_to_cuda_device(*this->execution,
+            ? tensor_to_cuda_device(
+                this->execution->model_parallel_collectives,
                 cache_positions_override.value(), primary)
                 .to(mfq_tensor_backend::kInt64).contiguous()
             : mfq_tensor_backend::arange(
@@ -237,7 +240,8 @@ mfq_tensor_backend::Tensor CausalLm<Model>::hidden_forward_inputs(
                 "cache_positions must have shape [tokens] or [batch,tokens]");
         }
         auto pos = pos_override.has_value()
-            ? tensor_to_cuda_device(*this->execution,
+            ? tensor_to_cuda_device(
+                this->execution->model_parallel_collectives,
                 pos_override.value(), primary).to(mfq_tensor_backend::kInt64).contiguous()
             : (decode_position_delta == 0
                 ? cache_positions
@@ -276,7 +280,9 @@ mfq_tensor_backend::Tensor CausalLm<Model>::hidden_forward_inputs(
             }
         }
         auto x = this->adapter_prepare_hidden(
-            tensor_to_cuda_device(*this->execution, input_embeddings, primary).contiguous(),
+            tensor_to_cuda_device(
+                this->execution->model_parallel_collectives,
+                input_embeddings, primary).contiguous(),
             B, T);
         this->adapter_begin_forward(raw_hidden != nullptr);
         if (block_trace != nullptr) block_trace->push_back(x.to(mfq_tensor_backend::kFloat32).clone());
@@ -284,10 +290,14 @@ mfq_tensor_backend::Tensor CausalLm<Model>::hidden_forward_inputs(
             MfqCudaGuard block_guard(b->cuda_device);
             auto local_ids = b->cpu_offloaded
                 ? cpu_ids
-                : tensor_to_cuda_device(*this->execution, ids, b->cuda_device);
+                : tensor_to_cuda_device(
+                    this->execution->model_parallel_collectives,
+                    ids, b->cuda_device);
             auto local_pos = b->cpu_offloaded
                 ? cpu_pos
-                : tensor_to_cuda_device(*this->execution, pos, b->cuda_device);
+                : tensor_to_cuda_device(
+                    this->execution->model_parallel_collectives,
+                    pos, b->cuda_device);
             MfqOptional<mfq_tensor_backend::Tensor> local_cache_positions = mfq_nullopt;
             // Grid-MRoPE semantic coordinates never double as physical KV
             // slots, during either prepared prefill or delta-adjusted decode.
@@ -296,26 +306,31 @@ mfq_tensor_backend::Tensor CausalLm<Model>::hidden_forward_inputs(
                     cache_positions_override.has_value())) {
                 local_cache_positions = b->cpu_offloaded
                     ? cpu_cache_positions
-                    : tensor_to_cuda_device(*this->execution,
+                    : tensor_to_cuda_device(
+                        this->execution->model_parallel_collectives,
                         cache_positions, b->cuda_device);
             }
             MfqOptional<mfq_tensor_backend::Tensor> local_seq_len = mfq_nullopt;
             if (seq_len.has_value()) {
                 local_seq_len = b->cpu_offloaded
                     ? cpu_seq_len.value()
-                    : tensor_to_cuda_device(*this->execution,
+                    : tensor_to_cuda_device(
+                        this->execution->model_parallel_collectives,
                         seq_len.value(), b->cuda_device);
             }
             MfqOptional<mfq_tensor_backend::Tensor> local_attention_mask = mfq_nullopt;
             if (effective_attention_mask.has_value()) {
                 local_attention_mask = b->cpu_offloaded
                     ? cpu_attention_mask.value()
-                    : tensor_to_cuda_device(*this->execution,
+                    : tensor_to_cuda_device(
+                        this->execution->model_parallel_collectives,
                         effective_attention_mask.value(), b->cuda_device);
             }
             x = b->cpu_offloaded
                 ? x.to(mfq_tensor_backend::kCPU).contiguous()
-                : tensor_to_cuda_device(*this->execution, x, b->cuda_device);
+                : tensor_to_cuda_device(
+                    this->execution->model_parallel_collectives,
+                    x, b->cuda_device);
             b->set_token_ids(local_ids);
             const RopeCache & active_rope = b->cpu_offloaded
                 ? cpu_rope
@@ -339,7 +354,9 @@ mfq_tensor_backend::Tensor CausalLm<Model>::hidden_forward_inputs(
                 *this->execution, std::move(x), context, active_rope);
             if (block_trace != nullptr) {
                 block_trace->push_back(
-                    tensor_to_cuda_device(*this->execution, x, primary)
+                    tensor_to_cuda_device(
+                        this->execution->model_parallel_collectives,
+                        x, primary)
                         .to(mfq_tensor_backend::kFloat32).clone());
             }
         }
@@ -349,7 +366,8 @@ mfq_tensor_backend::Tensor CausalLm<Model>::hidden_forward_inputs(
                 advance_cache_with_position_ids) {
             cache_pos += T;
         }
-        x = tensor_to_cuda_device(*this->execution, x, primary);
+        x = tensor_to_cuda_device(
+            this->execution->model_parallel_collectives, x, primary);
         auto finalized=finalize_hidden(x, B, T);
         if (raw_hidden != nullptr) {
             *raw_hidden = this->adapter_raw_hidden(x, finalized);

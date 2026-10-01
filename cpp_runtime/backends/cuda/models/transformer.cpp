@@ -272,13 +272,16 @@ mfq_tensor_backend::Tensor FFN::forward_tensor_parallel_dense(
                 gate_shard.device);
             auto local_x =
                 tensor_to_cuda_device(
-                    execution, flat, gate_shard.device);
+                    execution.model_parallel_collectives,
+                    flat, gate_shard.device);
             auto gate_output =
                 run_quant_linear_shard(
-                    execution, gate_shard, local_x);
+                    execution.profiler, execution.kl_mmq,
+                    gate_shard, local_x);
             auto up_output =
                 run_quant_linear_shard(
-                    execution, up_shard, local_x);
+                    execution.profiler, execution.kl_mmq,
+                    up_shard, local_x);
             mfq_tensor_backend::Tensor activation;
             if (geglu) {
                 activation = gelu_mul_cuda(
@@ -306,7 +309,8 @@ mfq_tensor_backend::Tensor FFN::forward_tensor_parallel_dense(
                      up_output).contiguous();
             }
             partials[index] = run_quant_linear_shard(
-                execution, down_shard, activation);
+                execution.profiler, execution.kl_mmq,
+                down_shard, activation);
         }
         auto output =
             reduce_model_parallel_outputs(
@@ -362,11 +366,14 @@ mfq_tensor_backend::Tensor FFN::forward_expert_parallel_moe(
                 moe_down.expert_parallel_shards[index];
             MfqCudaGuard guard(gate_shard.device);
             auto local_x = tensor_to_cuda_device(
-                execution, x, gate_shard.device);
+                execution.model_parallel_collectives,
+                x, gate_shard.device);
             auto local_weights = tensor_to_cuda_device(
-                execution, route_weights, gate_shard.device);
+                execution.model_parallel_collectives,
+                route_weights, gate_shard.device);
             const auto& local_route = moe_route_to_device(
-                execution, route, gate_shard.device);
+                execution.model_parallel_collectives,
+                route, gate_shard.device);
             mfq_tensor_backend::Tensor gate_up_pair;
             mfq_tensor_backend::Tensor projected_hidden;
             if (swiglu_limit <= 0.0 &&
@@ -477,7 +484,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                 xh.numel() / xh.size(-1);
             const bool use_f32_down =
                 rows >= 16 &&
-                execution.kl_mmq_mode == KlMmqMode::Fp16 &&
+                execution.kl_mmq.mode == KlMmqMode::Fp16 &&
                 execution.config.diagnostic_in_f32_down;
             if (use_f32_down) {
                 auto low =
@@ -717,7 +724,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                 gate_up_pair = profiler.measure("moe.gate_up_split", [&]() {
                     const bool reuse_gate_activation =
                         execution.config.split_moe_activation_reuse &&
-                        execution.kl_mmq_mode ==
+                        execution.kl_mmq.mode ==
                             KlMmqMode::Default &&
                         xf.size(0) <= 8 &&
                         active_gate->can_reuse_activation_for(*active_up);
@@ -1136,7 +1143,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
         const int64_t nkh = kv_heads;
         const int64_t hd = attention_head_dim;
         const int64_t attn_width = nh * hd;
-        const auto kl_capacity = execution.kl_kv_cache_capacity;
+        const auto kl_capacity = execution.kl_mmq.kv_cache_capacity;
         const int64_t cache_capacity = sliding
             ? attention_window
             : (kl_capacity > 0

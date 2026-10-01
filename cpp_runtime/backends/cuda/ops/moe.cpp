@@ -184,15 +184,15 @@ static MfeCpu unpack_mfe_delta(
 static std::atomic<uint64_t> g_moe_route_generation{1};
 
 mfq_tensor_backend::Tensor moe_tensor_to_device(
-        CudaExecutionContext& execution,
+        ModelParallelCollectiveRuntime& collectives,
         mfq_tensor_backend::Tensor value, int device) {
     return value.defined()
-        ? tensor_to_cuda_device(execution, std::move(value), device)
+        ? tensor_to_cuda_device(collectives, std::move(value), device)
         : value;
 }
 
 static void copy_route_tensor(
-        CudaExecutionContext& execution,
+        ModelParallelCollectiveRuntime& collectives,
         mfq_tensor_backend::Tensor& destination,
         const mfq_tensor_backend::Tensor& source,
         int device) {
@@ -202,28 +202,28 @@ static void copy_route_tensor(
         destination = source.contiguous();
     } else {
         destination = tensor_to_cuda_device(
-            execution, source, device, std::move(destination));
+            collectives, source, device, std::move(destination));
     }
 }
 
 const MoeRoutePlan& moe_route_to_device(
-        CudaExecutionContext& execution,
+        ModelParallelCollectiveRuntime& collectives,
         const MoeRoutePlan& source,
         int device) {
     auto& replica = (*source.device_replicas)[device];
     if (!replica) replica = std::make_shared<MoeRoutePlan>();
     if (replica->generation == source.generation) return *replica;
-    copy_route_tensor(execution, replica->ids, source.ids, device);
-    copy_route_tensor(execution, replica->ids_dst, source.ids_dst, device);
-    copy_route_tensor(execution, replica->expert_bounds, source.expert_bounds, device);
-    copy_route_tensor(execution, replica->tile_bounds, source.tile_bounds, device);
-    copy_route_tensor(execution, replica->tile_experts, source.tile_experts, device);
+    copy_route_tensor(collectives, replica->ids, source.ids, device);
+    copy_route_tensor(collectives, replica->ids_dst, source.ids_dst, device);
+    copy_route_tensor(collectives, replica->expert_bounds, source.expert_bounds, device);
+    copy_route_tensor(collectives, replica->tile_bounds, source.tile_bounds, device);
+    copy_route_tensor(collectives, replica->tile_experts, source.tile_experts, device);
     if (source.mma_tile_m == 8) {
         replica->mma_tile_bounds = replica->tile_bounds;
         replica->mma_tile_experts = replica->tile_experts;
     } else {
-        copy_route_tensor(execution, replica->mma_tile_bounds, source.mma_tile_bounds, device);
-        copy_route_tensor(execution, replica->mma_tile_experts, source.mma_tile_experts, device);
+        copy_route_tensor(collectives, replica->mma_tile_bounds, source.mma_tile_bounds, device);
+        copy_route_tensor(collectives, replica->mma_tile_experts, source.mma_tile_experts, device);
     }
     if (source.wide_tile_m == 8) {
         replica->wide_tile_bounds = replica->tile_bounds;
@@ -232,11 +232,11 @@ const MoeRoutePlan& moe_route_to_device(
         replica->wide_tile_bounds = replica->mma_tile_bounds;
         replica->wide_tile_experts = replica->mma_tile_experts;
     } else {
-        copy_route_tensor(execution, replica->wide_tile_bounds, source.wide_tile_bounds, device);
-        copy_route_tensor(execution, replica->wide_tile_experts, source.wide_tile_experts, device);
+        copy_route_tensor(collectives, replica->wide_tile_bounds, source.wide_tile_bounds, device);
+        copy_route_tensor(collectives, replica->wide_tile_experts, source.wide_tile_experts, device);
     }
-    copy_route_tensor(execution, replica->counts, source.counts, device);
-    copy_route_tensor(execution, replica->cursors, source.cursors, device);
+    copy_route_tensor(collectives, replica->counts, source.counts, device);
+    copy_route_tensor(collectives, replica->cursors, source.cursors, device);
     replica->n_experts = source.n_experts;
     replica->mma_tile_m = source.mma_tile_m;
     replica->wide_tile_m = source.wide_tile_m;
@@ -776,19 +776,28 @@ static MfeWeight wrap_mixed_moe_runtime(
     result.mixed_forward = [runtime](
             CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x, const MoeRoutePlan & route) {
-        return runtime->forward(execution, x, route);
+        return runtime->forward(
+            execution.config, execution.kl_mmq,
+            execution.force_moe_prefill_mma_off,
+            execution.force_moe_pool_path, x, route);
     };
     result.mixed_prequantized_forward = [runtime](
             CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x, const MoeRoutePlan & route) {
-        return runtime->forward(execution, x, route, true);
+        return runtime->forward(
+            execution.config, execution.kl_mmq,
+            execution.force_moe_prefill_mma_off,
+            execution.force_moe_pool_path, x, route, true);
     };
     result.mixed_glu_output_forward = [runtime](
             CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route,
             bool gelu) {
-        return runtime->forward_glu_output(execution, x, route, gelu);
+        return runtime->forward_glu_output(
+            execution.config, execution.kl_mmq,
+            execution.force_moe_prefill_mma_off,
+            execution.force_moe_pool_path, x, route, gelu);
     };
     if (runtime->supports_clamped_swiglu()) {
         result.mixed_clamped_swiglu_forward = [runtime](
@@ -797,7 +806,10 @@ static MfeWeight wrap_mixed_moe_runtime(
                 const MoeRoutePlan & route,
                 double limit) {
             return runtime->forward_clamped_swiglu(
-                execution, gate_up, route, limit);
+                execution.config, execution.kl_mmq,
+                execution.force_moe_prefill_mma_off,
+                execution.force_moe_pool_path,
+                gate_up, route, limit);
         };
     }
     return result;

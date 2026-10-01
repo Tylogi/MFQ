@@ -137,6 +137,19 @@ enum class KlMmqMode {
     Fp16,
 };
 
+struct KlMmqState {
+    KlMmqMode mode = KlMmqMode::Default;
+    int64_t activation_quantize_calls = 0;
+    int64_t dense_calls = 0;
+    int64_t moe_calls = 0;
+    int64_t fallback_calls = 0;
+    int64_t kv_cache_capacity = 0;
+
+    mfq_tensor_backend::Tensor prepare_activation(
+        mfq_tensor_backend::Tensor input);
+    void reset() noexcept;
+};
+
 enum class TensorParallelAxis {
     Mirrored,
     Output,
@@ -276,12 +289,7 @@ struct CudaExecutionContext {
     bool force_moe_unfused_reduce = false;
     bool force_moe_materialized_swiglu = false;
     bool force_moe_prefill_mma_off = false;
-    KlMmqMode kl_mmq_mode = KlMmqMode::Default;
-    int64_t kl_mmq_activation_quantize_calls = 0;
-    int64_t kl_mmq_dense_calls = 0;
-    int64_t kl_mmq_moe_calls = 0;
-    int64_t kl_mmq_fallback_calls = 0;
-    int64_t kl_kv_cache_capacity = 0;
+    KlMmqState kl_mmq;
     std::unordered_set<int> dsv4_cpu_offload_layers;
     int64_t dsv4_cpu_offload_host_bytes = 0;
     int n_gpu_layers = -1;
@@ -302,7 +310,6 @@ struct CudaExecutionContext {
     std::shared_ptr<MoeExpertCache> moe_expert_cache;
     std::unordered_map<int, MoeRouteLayerStats> moe_route_stats;
 
-    mfq_tensor_backend::Tensor kl_mmq_prepare_activation(mfq_tensor_backend::Tensor x);
     void reset() noexcept;
 };
 
@@ -340,22 +347,18 @@ void report_cuda_memory(
     const char* stage);
 
 struct KlMmqScope {
-    CudaExecutionContext& execution;
-    KlMmqMode previous_mode;
-    int64_t previous_activation_quantize_calls;
-    int64_t previous_dense_calls;
-    int64_t previous_moe_calls;
-    int64_t previous_fallback_calls;
+    KlMmqState& state;
+    KlMmqState previous;
 
-    KlMmqScope(KlMmqMode mode, CudaExecutionContext& context);
+    KlMmqScope(KlMmqMode mode, KlMmqState& state);
     ~KlMmqScope();
 };
 
 struct KlKvCacheCapacityScope {
-    CudaExecutionContext& execution;
+    KlMmqState& state;
     int64_t previous_capacity;
 
     KlKvCacheCapacityScope(
-        int64_t capacity, CudaExecutionContext& context);
+        int64_t capacity, KlMmqState& state);
     ~KlKvCacheCapacityScope();
 };

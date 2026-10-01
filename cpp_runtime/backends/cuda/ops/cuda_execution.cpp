@@ -423,38 +423,29 @@ int LayerPlacementConfig::device_for_layer(int64_t layer) const {
     return layer_devices.at(static_cast<size_t>(layer));
 }
 
-KlMmqScope::KlMmqScope(KlMmqMode mode, CudaExecutionContext& context)
-    : execution(context),
-      previous_mode(context.kl_mmq_mode),
-      previous_activation_quantize_calls(
-          context.kl_mmq_activation_quantize_calls),
-      previous_dense_calls(context.kl_mmq_dense_calls),
-      previous_moe_calls(context.kl_mmq_moe_calls),
-      previous_fallback_calls(context.kl_mmq_fallback_calls) {
-    execution.kl_mmq_mode = mode;
-    execution.kl_mmq_activation_quantize_calls = 0;
-    execution.kl_mmq_dense_calls = 0;
-    execution.kl_mmq_moe_calls = 0;
-    execution.kl_mmq_fallback_calls = 0;
+KlMmqScope::KlMmqScope(KlMmqMode mode, KlMmqState& current)
+    : state(current), previous(current) {
+    state.mode = mode;
+    state.activation_quantize_calls = 0;
+    state.dense_calls = 0;
+    state.moe_calls = 0;
+    state.fallback_calls = 0;
 }
 
 KlMmqScope::~KlMmqScope() {
-    execution.kl_mmq_mode = previous_mode;
-    execution.kl_mmq_activation_quantize_calls =
-        previous_activation_quantize_calls;
-    execution.kl_mmq_dense_calls = previous_dense_calls;
-    execution.kl_mmq_moe_calls = previous_moe_calls;
-    execution.kl_mmq_fallback_calls = previous_fallback_calls;
+    const auto kv_cache_capacity = state.kv_cache_capacity;
+    state = previous;
+    state.kv_cache_capacity = kv_cache_capacity;
 }
 
 KlKvCacheCapacityScope::KlKvCacheCapacityScope(
-        int64_t capacity, CudaExecutionContext& context)
-    : execution(context), previous_capacity(context.kl_kv_cache_capacity) {
-    execution.kl_kv_cache_capacity = capacity;
+        int64_t capacity, KlMmqState& current)
+    : state(current), previous_capacity(current.kv_cache_capacity) {
+    state.kv_cache_capacity = capacity;
 }
 
 KlKvCacheCapacityScope::~KlKvCacheCapacityScope() {
-    execution.kl_kv_cache_capacity = previous_capacity;
+    state.kv_cache_capacity = previous_capacity;
 }
 
 CudaExecutionContext::CudaExecutionContext()
@@ -479,12 +470,7 @@ void CudaExecutionContext::reset() noexcept {
     decode_graph_tp_projection_major = false;
     continuous_batch_cache_serial = false;
     moe_route_stats.clear();
-    kl_mmq_mode = KlMmqMode::Default;
-    kl_mmq_activation_quantize_calls = 0;
-    kl_mmq_dense_calls = 0;
-    kl_mmq_moe_calls = 0;
-    kl_mmq_fallback_calls = 0;
-    kl_kv_cache_capacity = 0;
+    kl_mmq.reset();
     force_moe_pool_path = false;
     force_moe_unfused_reduce = false;
     force_moe_materialized_swiglu = false;
@@ -570,14 +556,18 @@ const char * kl_mmq_mode_name(KlMmqMode mode) {
 
 
 
-mfq_tensor_backend::Tensor CudaExecutionContext::kl_mmq_prepare_activation(
-        mfq_tensor_backend::Tensor x) {
-    if (kl_mmq_mode != KlMmqMode::Nint8One) return x;
-    const auto original_shape = x.sizes().vec();
-    auto flat = x.reshape({-1, x.size(-1)}).contiguous();
+mfq_tensor_backend::Tensor KlMmqState::prepare_activation(
+        mfq_tensor_backend::Tensor input) {
+    if (mode != KlMmqMode::Nint8One) return input;
+    const auto original_shape = input.sizes().vec();
+    auto flat = input.reshape({-1, input.size(-1)}).contiguous();
     auto quantized = nint8_one_quantize_reconstruct_cuda(flat);
-    ++kl_mmq_activation_quantize_calls;
+    ++activation_quantize_calls;
     return quantized.at(3).reshape(original_shape).contiguous();
+}
+
+void KlMmqState::reset() noexcept {
+    *this = {};
 }
 
 

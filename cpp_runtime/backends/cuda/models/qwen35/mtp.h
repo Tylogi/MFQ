@@ -117,7 +117,7 @@ struct Qwen35Mtp final : MtpModule {
         trace_gemma_stage(*execution, 0, "mtp.fusion", x);
         auto pos = positions.defined()
             ? tensor_to_cuda_device(
-                  *execution, positions,
+                  execution->model_parallel_collectives, positions,
                   execution->layer_placement.primary_device())
                   .to(mfq_tensor_backend::kInt64).contiguous()
             : mfq_tensor_backend::arange(

@@ -26,17 +26,16 @@ struct QuantLinearGroup;
 struct DenseLinearGroup;
 
 struct MfqDropFileCacheGuard {
-    CudaExecutionContext& execution;
+    bool& setting;
     bool previous;
 
-    MfqDropFileCacheGuard(
-            bool enabled, CudaExecutionContext& context)
-        : execution(context), previous(context.drop_file_cache) {
-        execution.drop_file_cache = enabled;
+    MfqDropFileCacheGuard(bool enabled, bool& value)
+        : setting(value), previous(value) {
+        setting = enabled;
     }
 
     ~MfqDropFileCacheGuard() {
-        execution.drop_file_cache = previous;
+        setting = previous;
     }
 };
 
@@ -46,51 +45,50 @@ bool decode_branch_parallel_enabled(
     std::int64_t rows);
 
 mfq_tensor_backend::Tensor run_nint_linear(
-    CudaExecutionContext& execution, const NintWeight& weight,
-    mfq_tensor_backend::Tensor input,
+    CudaProfiler& profiler, KlMmqState& kl_mmq,
+    const NintWeight& weight, mfq_tensor_backend::Tensor input,
     MfqOptional<mfq_tensor_backend::Tensor> gate = mfq_nullopt, int mode = 0);
 mfq_tensor_backend::Tensor run_nvq_linear(
-    CudaExecutionContext& execution, const NvqWeight& weight,
-    mfq_tensor_backend::Tensor input,
+    CudaProfiler& profiler, KlMmqState& kl_mmq,
+    const NvqWeight& weight, mfq_tensor_backend::Tensor input,
     MfqOptional<mfq_tensor_backend::Tensor> gate = mfq_nullopt, int mode = 0);
 
 mfq_tensor_backend::Tensor tensor_to_cuda_device(
-    CudaExecutionContext& execution,
+    ModelParallelCollectiveRuntime& collectives,
     mfq_tensor_backend::Tensor value,
     int device,
     mfq_tensor_backend::Tensor reusable = {});
 mfq_tensor_backend::Tensor run_quant_linear_shard(
-    CudaExecutionContext& execution,
+    CudaProfiler& profiler,
+    KlMmqState& kl_mmq,
     const struct QuantLinearShard& shard,
     mfq_tensor_backend::Tensor input,
     MfqOptional<mfq_tensor_backend::Tensor> gate = mfq_nullopt,
     int gate_mode = 0);
 
 struct DecodeGraphBranchScope {
-    CudaExecutionContext& execution;
+    bool& setting;
     bool previous;
 
-    explicit DecodeGraphBranchScope(CudaExecutionContext& context)
-        : execution(context),
-          previous(context.decode_graph_serial_branches) {
-        execution.decode_graph_serial_branches = true;
+    explicit DecodeGraphBranchScope(bool& value)
+        : setting(value), previous(value) {
+        setting = true;
     }
     ~DecodeGraphBranchScope() {
-        execution.decode_graph_serial_branches = previous;
+        setting = previous;
     }
 };
 
 struct DecodeGraphTpProjectionScope {
-    CudaExecutionContext& execution;
+    bool& setting;
     bool previous;
 
-    explicit DecodeGraphTpProjectionScope(CudaExecutionContext& context)
-        : execution(context),
-          previous(context.decode_graph_tp_projection_major) {
-        execution.decode_graph_tp_projection_major = true;
+    explicit DecodeGraphTpProjectionScope(bool& value)
+        : setting(value), previous(value) {
+        setting = true;
     }
     ~DecodeGraphTpProjectionScope() {
-        execution.decode_graph_tp_projection_major = previous;
+        setting = previous;
     }
 };
 

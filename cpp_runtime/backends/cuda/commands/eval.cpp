@@ -129,7 +129,7 @@ struct EvalCommand : mfq::cuda::EvalCommandOptions {
             ? kl_mmq_mode : kl_mmq_sequence.front();
         if (load_mmq_mode != KlMmqMode::Default) {
             kl_mmq_scope =
-                std::make_unique<KlMmqScope>(load_mmq_mode, execution);
+                std::make_unique<KlMmqScope>(load_mmq_mode, execution.kl_mmq);
         }
         if (!kl_chunks_sequence_arg.empty()) {
             kl_chunks_sequence = parse_ids(kl_chunks_sequence_arg);
@@ -194,7 +194,7 @@ struct EvalCommand : mfq::cuda::EvalCommandOptions {
                               << kl_mmq_mode_name(kl_mmq_sequence[index])
                               << " chunks=" << kl_chunks << "\n";
                     KlMmqScope run_scope(
-                        kl_mmq_sequence[index], execution);
+                        kl_mmq_sequence[index], execution.kl_mmq);
                     const int status = run_kl_eval_batched(
                         model, kl_base, kl_chunks,
                         kl_n_batch, kl_score_count,

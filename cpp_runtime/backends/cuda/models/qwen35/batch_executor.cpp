@@ -1121,9 +1121,10 @@ struct QwenBatchOperations {
                     decode_graph->invalidate();
                     mfq_cuda_empty_cache();
                     try {
-                        DecodeGraphBranchScope branch_scope(execution_);
+                        DecodeGraphBranchScope branch_scope(
+                            execution_.decode_graph_serial_branches);
                         DecodeGraphTpProjectionScope tp_projection_scope(
-                            execution_);
+                            execution_.decode_graph_tp_projection_major);
                         decode_graph->graph =
                             std::make_unique<MfqCudaGraph>();
                         prepare_decode_graph_memory(

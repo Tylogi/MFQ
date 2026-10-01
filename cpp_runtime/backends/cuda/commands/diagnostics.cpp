@@ -304,7 +304,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 throw std::runtime_error("--check-mfe-tensor requires --model");
             }
             KlMmqScope check_kl_mmq_scope(
-                parse_kl_mmq_mode(kl_mmq_arg), execution);
+                parse_kl_mmq_mode(kl_mmq_arg), execution.kl_mmq);
             const auto tensor_names =
                 parse_tensor_names(check_mfe_tensor);
             if (execution.moe_expert_cache &&

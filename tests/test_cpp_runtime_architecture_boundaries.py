@@ -189,6 +189,31 @@ def test_cuda_format_operators_only_receive_the_profiler() -> None:
         assert "KlMmqMode" not in source
 
 
+def test_cuda_leaf_ops_receive_only_their_required_resources() -> None:
+    quant_common = (CUDA_OPS / "include" / "quant_linear_common.h").read_text(
+        encoding="utf-8"
+    )
+    mixed_moe = (CUDA_OPS / "include" / "mixed_moe.h").read_text(
+        encoding="utf-8"
+    )
+    nint_group = (CUDA_OPS / "include" / "nint_linear_group.h").read_text(
+        encoding="utf-8"
+    )
+    moe_types = (CUDA_OPS / "include" / "moe_types.h").read_text(
+        encoding="utf-8"
+    )
+
+    assert "CudaExecutionContext" not in quant_common
+    assert "CudaExecutionContext" not in mixed_moe
+    assert "CudaExecutionContext" not in nint_group
+    assert "CudaProfiler& profiler, KlMmqState& kl_mmq" in quant_common
+    assert "ModelParallelCollectiveRuntime& collectives" in quant_common
+    for helper in ("moe_tensor_to_device", "moe_route_to_device"):
+        signature = moe_types.split(helper, 1)[1].split(");", 1)[0]
+        assert "ModelParallelCollectiveRuntime& collectives" in signature
+        assert "CudaExecutionContext" not in signature
+
+
 def test_model_sources_are_backend_neutral_and_shared() -> None:
     assert "class ModelSource" in MODEL_SOURCE_HEADER
     assert "class MfqModelSource final : public ModelSource" in (

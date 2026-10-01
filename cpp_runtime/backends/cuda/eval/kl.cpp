@@ -664,7 +664,7 @@ int run_kl_eval_batched(
     validate_kl_execution_geometry(
         n_batch, n_batch, reference_contract, "optimized");
     KlKvCacheCapacityScope kv_cache_capacity_scope(
-        n_ctx, *model.execution);
+        n_ctx, model.execution->kl_mmq);
     const int target_start = input.chunks[0].target_start;
     int score_count = input.chunks[0].score_count;
     for (const auto & chunk : input.chunks) {
@@ -796,12 +796,12 @@ int run_kl_eval_batched(
                << "\n";
     const auto& execution = *model.execution;
     std::cout << "cpp_kl_mmq"
-              << " mmq=" << kl_mmq_mode_name(execution.kl_mmq_mode)
+              << " mmq=" << kl_mmq_mode_name(execution.kl_mmq.mode)
               << " activation_quantize_calls="
-              << execution.kl_mmq_activation_quantize_calls
-              << " dense_calls=" << execution.kl_mmq_dense_calls
-              << " moe_calls=" << execution.kl_mmq_moe_calls
-              << " fallback_calls=" << execution.kl_mmq_fallback_calls
+              << execution.kl_mmq.activation_quantize_calls
+              << " dense_calls=" << execution.kl_mmq.dense_calls
+              << " moe_calls=" << execution.kl_mmq.moe_calls
+              << " fallback_calls=" << execution.kl_mmq.fallback_calls
               << "\n";
     return 0;
 }
@@ -841,7 +841,8 @@ int run_kl_eval_streamed(
             "streamed KL layer group and chunk batch must be positive");
     }
     execution.moe_route_stats.clear();
-    MfqDropFileCacheGuard drop_cache_guard(true, execution);
+    MfqDropFileCacheGuard drop_cache_guard(
+        true, execution.drop_file_cache);
     auto input = load_streamed_kl_input(reference_path, max_chunks);
     const int chunks = (int)input.chunks.size();
     const int64_t n_ctx = (int64_t)input.chunks[0].tokens.size();

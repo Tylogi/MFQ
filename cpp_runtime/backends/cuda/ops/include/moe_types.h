@@ -26,11 +26,11 @@ struct MixedMoeRuntime;
 struct MoeRoutePlan;
 
 mfq_tensor_backend::Tensor moe_tensor_to_device(
-    CudaExecutionContext& execution,
+    ModelParallelCollectiveRuntime& collectives,
     mfq_tensor_backend::Tensor value,
     int device);
 const MoeRoutePlan& moe_route_to_device(
-    CudaExecutionContext& execution,
+    ModelParallelCollectiveRuntime& collectives,
     const MoeRoutePlan& route,
     int device);
 mfq_tensor_backend::Tensor reduce_model_parallel_outputs(

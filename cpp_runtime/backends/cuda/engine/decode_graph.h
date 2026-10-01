@@ -143,7 +143,8 @@ bool DecodeGraphCache::ensure_captured(
 
     invalidate();
     mfq_cuda_empty_cache();
-    DecodeGraphBranchScope branch_scope(*model.execution);
+    DecodeGraphBranchScope branch_scope(
+        model.execution->decode_graph_serial_branches);
     graph = std::make_unique<MfqCudaGraph>();
     try {
         prepare_decode_graph_memory(
