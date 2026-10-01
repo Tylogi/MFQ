@@ -87,7 +87,10 @@ set(MFQ_CUDA_KERNEL_SOURCES
     ${MFQ_CUDA_KERNEL_ROOT}/ssm_conv.cu
 )
 
-add_library(mfq-cuda-native-kernels STATIC ${MFQ_CUDA_KERNEL_SOURCES})
+add_library(mfq-cuda-native-kernels STATIC
+    ${MFQ_CUDA_KERNEL_SOURCES}
+    ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
+)
 add_library(mfq::cuda-native-kernels ALIAS mfq-cuda-native-kernels)
 target_compile_definitions(mfq-cuda-native-kernels PRIVATE
     MFQ_NATIVE_CUDA_RUNTIME=1
@@ -312,7 +315,6 @@ add_library(mfq-cuda-runtime STATIC
     ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
     ${MFQ_CUDA_ROOT}/commands/cli.cpp
     ${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp
-    ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
     ${MFQ_CUDA_MODEL_SOURCES}
 )
 add_library(mfq::cuda-runtime ALIAS mfq-cuda-runtime)

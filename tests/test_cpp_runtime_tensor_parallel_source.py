@@ -98,10 +98,10 @@ def test_tensor_parallel_graph_primes_and_captures_nccl_peer_transfers():
 
 
 def test_expert_parallel_graph_uses_capture_safe_peer_transfers():
-    assert "tensor_to_cuda_device(execution, std::move(value), device)" in SOURCE
+    assert "tensor_to_cuda_device(collectives, std::move(value), device)" in SOURCE
     assert (
         "destination = tensor_to_cuda_device(\n"
-        "            execution, source, device, std::move(destination));"
+        "            collectives, source, device, std::move(destination));"
         in SOURCE
     )
     assert "auto destination = destination_tensor();" in SOURCE
@@ -123,7 +123,11 @@ def test_tensor_parallel_projection_groups_share_each_rank_input_transfer():
     assert "execution.config.tensor_parallel_grouped_projections" in SOURCE
     assert "tensor_parallel_output_compatible()" in SOURCE
     assert "forward_tensor_parallel_output_group(execution, x)" in SOURCE
-    assert "auto local_x = tensor_to_cuda_device(execution, flat, device);" in SOURCE
+    assert (
+        "auto local_x = tensor_to_cuda_device(\n"
+        "            execution.model_parallel_collectives, flat, device);"
+        in SOURCE
+    )
 
 
 def test_batched_decode_graph_orders_tp_groups_by_projection():
@@ -131,7 +135,11 @@ def test_batched_decode_graph_orders_tp_groups_by_projection():
     assert "thread_local bool g_decode_graph_tp_projection_major" not in SOURCE
     assert "DecodeGraphTpProjectionScope" in SOURCE
     assert "std::vector<mfq_tensor_backend::Tensor> local_inputs" in SOURCE
-    assert "local_inputs[shard] = tensor_to_cuda_device(\n                execution, flat, device)" in SOURCE
+    assert (
+        "local_inputs[shard] = tensor_to_cuda_device(\n"
+        "                execution.model_parallel_collectives, flat, device)"
+        in SOURCE
+    )
 
 
 def test_tensor_parallel_peer_first_launch_preserves_rank_indexing():
