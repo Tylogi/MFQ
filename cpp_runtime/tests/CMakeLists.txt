@@ -38,6 +38,7 @@ endfunction()
 
 mfq_add_core_test(mfq-model-graph-test mfq_model_graph_test.cpp)
 mfq_add_core_test(mfq-model-source-test model_source_test.cpp)
+mfq_add_core_test(mfq-nint-rows-test nint_rows_test.cpp)
 mfq_add_core_test(mfq-grid-vision-test grid_vision_test.cpp)
 mfq_add_core_test(mfq-deepseek-v41-config-test deepseek_v41_config_test.cpp)
 mfq_add_core_test(mfq-model-config-test model_config_test.cpp)

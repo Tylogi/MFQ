@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -471,6 +472,42 @@ void MfqModelSource::read_range_into(
         throw std::overflow_error("model tensor byte offset overflow");
     }
     read_exact(record.source_path, record.offset + relative_offset, destination, size);
+}
+
+ModelSource::TensorReader MfqModelSource::tensor_reader(std::string_view name) const {
+    auto found = impl_->records_by_name.find(std::string(name));
+    if (found == impl_->records_by_name.end()) {
+        const auto alias = impl_->legacy_tensor_compatibility.canonical_to_stored.find(std::string(name));
+        if (alias != impl_->legacy_tensor_compatibility.canonical_to_stored.end())
+            found = impl_->records_by_name.find(alias->second);
+    }
+    if (found == impl_->records_by_name.end() || impl_->records[found->second].asset)
+        throw std::runtime_error("model tensor not found: " + std::string(name));
+    struct Range {
+        MfqStoredRecord record;
+        std::ifstream stream;
+        std::mutex mutex;
+        explicit Range(MfqStoredRecord value)
+            : record(std::move(value)), stream(record.source_path, std::ios::binary) {
+            if (!stream) throw std::runtime_error("cannot open MFQ row source");
+        }
+    };
+    auto range = std::make_shared<Range>(impl_->records[found->second]);
+    return [range](std::uint64_t offset, std::byte* destination, std::size_t size) {
+        const auto& record = range->record;
+        if (offset > record.tensor.nbytes || size > record.tensor.nbytes - offset)
+            throw std::out_of_range("model tensor row range is out of bounds");
+        if (offset > std::numeric_limits<std::uint64_t>::max() - record.offset ||
+            record.offset + offset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()) ||
+            size > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max()))
+            throw std::overflow_error("model tensor row range overflow");
+        if (!size) return;
+        std::lock_guard<std::mutex> lock(range->mutex);
+        range->stream.clear();
+        range->stream.seekg(static_cast<std::streamoff>(record.offset + offset));
+        range->stream.read(reinterpret_cast<char*>(destination), static_cast<std::streamsize>(size));
+        if (!range->stream) throw std::runtime_error("MFQ row source was truncated");
+    };
 }
 
 void MfqModelSource::drop_file_cache() const noexcept {

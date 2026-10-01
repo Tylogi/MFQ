@@ -5,6 +5,7 @@
 #include "mfq/kernels/cuda/fp8_sq.h"
 #include "mfq/kernels/cuda/mxfp4_sq.h"
 #include "mfq/model_source.h"
+#include "mfq/nint_rows.h"
 #include "moe_cache_profile.h"
 
 #include <cuda_runtime_api.h>
@@ -37,6 +38,11 @@ extern thread_local bool g_decode_graph_serial_branches;
 extern thread_local bool g_decode_graph_tp_projection_major;
 extern bool g_mfq_drop_file_cache;
 extern std::shared_ptr<MoeExpertCache> g_moe_expert_cache;
+
+std::shared_ptr<mfq::NintRows> load_nint_row_table(
+    const mfq::ModelSource& source, const std::string& name);
+mfq_tensor_backend::Tensor nint_row_embedding_lookup(
+    const mfq::NintRows& table, const mfq_tensor_backend::Tensor& ids);
 
 struct MfqDropFileCacheGuard {
     bool previous;

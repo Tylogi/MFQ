@@ -153,6 +153,14 @@ inline std::unique_ptr<mfq::flash_next::Ple> qwen_ple(const mfq::ModelSource& fi
     int64_t rows=0,width=c.hidden/((c.ngram-1)*c.ngram_heads);
     for (int64_t i=0;i<c.shards;++i) {
         const auto name=p+".ngram.shard."+std::to_string(i)+".weight";
+        if (require_tensor(file,name).dtype=="NINT") {
+            auto table=load_nint_row_table(file,name);
+            MFQ_RUNTIME_CHECK(table->width()==width && (!rows || table->rows()==rows),
+                "Qwen4 PLE embedding shard dimensions disagree");
+            rows=table->rows();
+            shards.push_back([table](const Tensor& ids) {return nint_row_embedding_lookup(*table,ids);});
+            continue;
+        }
         auto weight=std::make_shared<QuantLinear>(load_quant_linear(file,name));
         // QuantLinear reports logical dimensions regardless of storage format.
         std::vector<int64_t> shape{weight->out(),weight->neuron_len()};

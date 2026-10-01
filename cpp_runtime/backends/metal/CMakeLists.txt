@@ -239,6 +239,7 @@ add_library(mfq-metal-runtime STATIC
     ops/mlx_mx.cpp
     ops/mlx_mxfp4_sq.cpp
     ops/mlx_nint.cpp
+    ops/mlx_nint_rows.cpp
     ops/mlx_nint8_zero.cpp
     ops/mlx_sparse_attention.cpp
     ops/mlx_vq.cpp
@@ -412,6 +413,13 @@ set_target_properties(mfq-metal-nint-test PROPERTIES
     BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
 )
 add_test(NAME mfq-metal-nint-test COMMAND mfq-metal-nint-test)
+
+add_executable(mfq-metal-nint-rows-test tests/mlx_nint_rows_test.cpp)
+target_link_libraries(mfq-metal-nint-rows-test PRIVATE mfq-metal-runtime)
+target_compile_features(mfq-metal-nint-rows-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-nint-rows-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib")
+add_test(NAME mfq-metal-nint-rows-test COMMAND mfq-metal-nint-rows-test)
 
 add_executable(mfq-metal-mx-test
     tests/mlx_mx_test.cpp
