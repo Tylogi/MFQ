@@ -6,6 +6,7 @@
 namespace mfq::cuda::glm_dsa {
 
 void load_ffn(
+        CudaExecutionContext& execution,
         const mfq::ModelSource& mfq,
         const Config& c,
         int i,
@@ -17,13 +18,13 @@ void load_ffn(
             const std::string expert_gate_up = p + "experts.gate_up.weight";
             const std::string expert_down = p + "experts.down.weight";
             f.is_moe = true;
-            f.moe_gate_up = load_mfe_gpu(
+            f.moe_gate_up = load_mfe_gpu(execution,
                 mfq, expert_gate_up, true, i, "gate_up");
-            f.moe_down = load_mfe_gpu(
+            f.moe_down = load_mfe_gpu(execution,
                 mfq, expert_down, true, i, "down");
-            f.moe_router = load_dense_gpu(
+            f.moe_router = load_dense_gpu(execution,
                 mfq, p + "router.weight").to(mfq_tensor_backend::kFloat32).contiguous();
-            f.moe_router_bias = load_dense_gpu(
+            f.moe_router_bias = load_dense_gpu(execution,
                 mfq, p + "router.bias")
                 .to(mfq_tensor_backend::kFloat32).contiguous();
             f.moe_top_k = static_cast<int>(c.num_experts_per_tok);
@@ -34,13 +35,13 @@ void load_ffn(
             f.moe_shared_ungated = true;
             f.moe_router_scale = c.routed_scaling_factor;
             f.shared = std::make_unique<FFN>();
-            f.shared->down = load_quant_linear(
+            f.shared->down = load_quant_linear(execution,
                 mfq, p + "shared_expert.down.weight");
-            f.shared->gate_up = load_paired_gate_up(mfq, {
+            f.shared->gate_up = load_paired_gate_up(execution, mfq, {
                 p + "shared_expert.gate.weight",
                 p + "shared_expert.up.weight"},
                 f.shared->down);
-            prepare_ffn_workspaces(*f.shared);
+            prepare_ffn_workspaces(execution, *f.shared);
             if (f.moe_gate_up.n_experts != c.num_experts ||
                 f.moe_down.n_experts != c.num_experts ||
                 f.moe_gate_up.neuron_len != c.hidden_size ||
@@ -60,18 +61,19 @@ void load_ffn(
         const std::string down_name = p + "down.weight";
         const std::string gate_name = p + "gate.weight";
         const std::string up_name = p + "up.weight";
-        f.down = load_quant_linear(mfq, down_name);
-        f.gate_up = load_paired_gate_up(mfq, {
+        f.down = load_quant_linear(execution, mfq, down_name);
+        f.gate_up = load_paired_gate_up(execution, mfq, {
             gate_name, up_name},
             f.down);
         load_important_neuron_branch(
-            mfq, c.hidden_size, c.intermediate_size,
+            execution, mfq, c.hidden_size, c.intermediate_size,
             f, down_name, gate_name, up_name);
-        prepare_ffn_workspaces(f);
+        prepare_ffn_workspaces(execution, f);
 }
 
 
 std::unique_ptr<::Block> load_block(
+        CudaExecutionContext& execution,
         const mfq::ModelSource& mfq,
         const Config& c,
         int i,
@@ -90,12 +92,12 @@ std::unique_ptr<::Block> load_block(
         b->full_indexer =
             config.indexer_types.at(static_cast<size_t>(i)) == "full";
         b->shared_state = state;
-        b->attn_norm = load_dense_gpu(mfq, ap + "norm.weight");
-        b->ffn_norm = load_dense_gpu(
+        b->attn_norm = load_dense_gpu(execution, mfq, ap + "norm.weight");
+        b->ffn_norm = load_dense_gpu(execution,
             mfq, lp + "mlp.norm.weight");
-        b->q_a_norm = load_dense_gpu(
+        b->q_a_norm = load_dense_gpu(execution,
             mfq, ap + "query_a_norm.weight");
-        b->kv_a_norm = load_dense_gpu(
+        b->kv_a_norm = load_dense_gpu(execution,
             mfq, ap + "key_value_a_norm.weight");
         std::vector<std::string> first_names = {
             ap + "query_a.weight",
@@ -108,19 +110,19 @@ std::unique_ptr<::Block> load_block(
             first_names.push_back(ap + "indexer.key.weight");
             first_names.push_back(ap + "indexer.score.weight");
             second_names.push_back(ap + "indexer.query.weight");
-            b->index_k_norm = load_dense_gpu(
+            b->index_k_norm = load_dense_gpu(execution,
                 mfq, ap + "indexer.key_norm.weight");
-            b->index_k_bias = load_dense_gpu(
+            b->index_k_bias = load_dense_gpu(execution,
                 mfq, ap + "indexer.key_norm.bias");
         }
-        b->input_proj = load_quant_group(mfq, first_names);
-        b->q_proj = load_quant_group(mfq, second_names);
-        b->embed_q = load_mfe_gpu(
+        b->input_proj = load_quant_group(execution, mfq, first_names);
+        b->q_proj = load_quant_group(execution, mfq, second_names);
+        b->embed_q = load_mfe_gpu(execution,
             mfq, ap + "latent.query_embedding.weight");
-        b->unembed_out = load_mfe_gpu(
+        b->unembed_out = load_mfe_gpu(execution,
             mfq, ap + "latent.output_unembedding.weight");
-        b->o_proj = load_quant_linear(mfq, ap + "output.weight");
-        load_ffn(mfq, c, i, b->ffn);
+        b->o_proj = load_quant_linear(execution, mfq, ap + "output.weight");
+        load_ffn(execution, mfq, c, i, b->ffn);
 
         const bool input_shape_ok =
             b->input_proj.outs.size() == (b->full_indexer ? 4u : 2u) &&
@@ -232,7 +234,7 @@ GlmDsaModel::adapter_load_block(
     auto& state = block_states[device];
     if (!state) state = std::make_shared<GlmDsaSharedState>();
     return glm_dsa::load_block(
-        source, config, layer, type, state);
+        *execution, source, config, layer, type, state);
 }
 
 TextSessionStateKind

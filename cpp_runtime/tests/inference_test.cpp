@@ -185,6 +185,18 @@ int main() {
     producer.join();
     require(batch_tokens == 1 && batch_prefilled);
 
+    mfq::engine::ContinuousBatchRequest synchronous_request(
+        {1, 2}, {}, {}, {});
+    bool producer_continued = true;
+    std::thread synchronous_producer([&] {
+        producer_continued = synchronous_request.publish_token_sync(4);
+        synchronous_request.complete();
+    });
+    require(synchronous_request.consume(
+        [](int64_t) { return false; }, {}) == 1);
+    synchronous_producer.join();
+    require(!producer_continued);
+
     mfq::engine::ContinuousBatchConfig batch_config;
     batch_config.max_sequences = 2;
     batch_config.initial_batch_wait = std::chrono::microseconds(0);

@@ -29,6 +29,18 @@ For an A/B build, configure a separate tree with LibTorch discoverable and
 `-DMFQ_BUILD_TORCH_REFERENCE_RUNTIME=ON`. This adds `mfq-runtime-torch`; it does
 not alter `mfq-runtime`.
 
+Run the model-backed scheduler and execution-isolation gates on a machine with
+enough device memory. The second command loads and generates with two complete
+engines concurrently and compares each result with its serial oracle:
+
+```shell
+mfq-diagnostics --model model.mfq --check-continuous-batching
+mfq-diagnostics --model model.mfq --check-engine-isolation
+```
+
+The continuous-batching gate covers stable slot retirement, paged-KV reuse and
+release, CUDA Graph capture/replay, callback cancellation, and prefix reuse.
+
 ## Tensor and expert parallel execution
 
 The native runtime accepts either a rank count or an ordered CUDA device list.

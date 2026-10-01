@@ -229,6 +229,7 @@ function(mfq_configure_cuda_runtime_target target)
         ${MFQ_CUDA_ROOT}/ops/include
         ${MFQ_CUDA_ROOT}/commands
         ${MFQ_CUDA_ROOT}/engine
+        ${MFQ_CUDA_ROOT}/storage
         ${MFQ_CUDA_KERNEL_ROOT}
         ${CUDAToolkit_INCLUDE_DIRS}
     )
@@ -278,17 +279,35 @@ set(MFQ_CUDA_RUNTIME_OP_SOURCES
     ${MFQ_CUDA_ROOT}/ops/vq.cpp
 )
 
+add_library(mfq-cuda-ops OBJECT ${MFQ_CUDA_RUNTIME_OP_SOURCES})
+mfq_configure_cuda_runtime_target(mfq-cuda-ops)
+target_compile_definitions(mfq-cuda-ops PRIVATE
+    MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+set_target_properties(mfq-cuda-ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+set(MFQ_CUDA_LOADING_SOURCES
+    ${MFQ_CUDA_ROOT}/engine/options.cpp
+    ${MFQ_CUDA_ROOT}/models/loader.cpp
+    ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp
+)
+add_library(mfq-cuda-loading OBJECT ${MFQ_CUDA_LOADING_SOURCES})
+mfq_configure_cuda_runtime_target(mfq-cuda-loading)
+target_compile_definitions(mfq-cuda-loading PRIVATE
+    MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+set_target_properties(mfq-cuda-loading PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+list(REMOVE_ITEM MFQ_CUDA_MODEL_SOURCES
+    ${MFQ_CUDA_ROOT}/models/loader.cpp)
 add_library(mfq-cuda-runtime STATIC
-    ${MFQ_CUDA_RUNTIME_OP_SOURCES}
+    $<TARGET_OBJECTS:mfq-cuda-ops>
+    $<TARGET_OBJECTS:mfq-cuda-loading>
     ${MFQ_CUDA_ROOT}/engine/cuda_engine.cpp
     ${MFQ_CUDA_ROOT}/engine/generation.cpp
     ${MFQ_CUDA_ROOT}/engine/text_session_cache.cpp
-    ${MFQ_CUDA_ROOT}/engine/options.cpp
     ${MFQ_CUDA_ROOT}/engine/decode_graph.cpp
     ${MFQ_CUDA_ROOT}/engine/cuda_execution.cpp
     ${MFQ_CUDA_ROOT}/models/causal_lm.cpp
     ${MFQ_CUDA_ROOT}/engine/mtp.cpp
-    ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp
     ${MFQ_CUDA_ROOT}/models/components.cpp
     ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
     ${MFQ_CUDA_ROOT}/commands/cli.cpp
@@ -311,13 +330,15 @@ target_compile_definitions(mfq-cuda-runtime PRIVATE
     NOMINMAX
 )
 if(MSVC)
-    target_compile_options(mfq-cuda-runtime PRIVATE
-        "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>"
-        "$<$<COMPILE_LANGUAGE:CXX>:/EHsc>"
-        "$<$<COMPILE_LANGUAGE:CXX>:/bigobj>"
-        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>"
-        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>"
-    )
+    foreach(target mfq-cuda-ops mfq-cuda-loading mfq-cuda-runtime)
+        target_compile_options(${target} PRIVATE
+            "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>"
+            "$<$<COMPILE_LANGUAGE:CXX>:/EHsc>"
+            "$<$<COMPILE_LANGUAGE:CXX>:/bigobj>"
+            "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>"
+            "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>"
+        )
+    endforeach()
 endif()
 set_target_properties(mfq-cuda-runtime PROPERTIES
     CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
@@ -487,6 +508,7 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         ${MFQ_CUDA_ROOT}/engine/decode_graph.cpp
         ${MFQ_CUDA_ROOT}/engine/cuda_execution.cpp
         ${MFQ_CUDA_ROOT}/models/causal_lm.cpp
+        ${MFQ_CUDA_ROOT}/models/loader.cpp
         ${MFQ_CUDA_ROOT}/engine/mtp.cpp
         ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp
         ${MFQ_CUDA_ROOT}/models/components.cpp

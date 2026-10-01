@@ -9,6 +9,7 @@
 namespace mfq::cuda::gemma4 {
 
 std::unique_ptr<::Block> load_block(
+        CudaExecutionContext& execution,
         const mfq::ModelSource& mfq,
         const Config& config,
         int i,
@@ -45,57 +46,57 @@ std::unique_ptr<::Block> load_block(
             b->sliding ? -1 : (int64_t)std::llround(
                 c.full_rotary_factor * (double)b->attention_head_dim / 2.0));
 
-        b->attn_norm = load_dense_gpu(mfq, ap + "norm.weight");
-        b->attn_post_norm = load_dense_gpu(
+        b->attn_norm = load_dense_gpu(execution, mfq, ap + "norm.weight");
+        b->attn_post_norm = load_dense_gpu(execution,
             mfq, ap + "output_norm.weight");
-        b->q_norm = load_dense_gpu(mfq, ap + "query_norm.weight");
-        b->k_norm = load_dense_gpu(mfq, ap + "key_norm.weight");
+        b->q_norm = load_dense_gpu(execution, mfq, ap + "query_norm.weight");
+        b->k_norm = load_dense_gpu(execution, mfq, ap + "key_norm.weight");
         b->v_norm = mfq_tensor_backend::ones(
             {b->attention_head_dim},
             mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32));
         std::vector<std::string> projections = {
             ap + "query.weight", ap + "key.weight"};
         if (!b->value_equals_key) projections.push_back(ap + "value.weight");
-        b->qkv = load_quant_group(mfq, projections, 2);
-        b->o = load_quant_linear(mfq, ap + "output.weight");
+        b->qkv = load_quant_group(execution, mfq, projections, 2);
+        b->o = load_quant_linear(execution, mfq, ap + "output.weight");
 
-        b->ffn_norm = load_dense_gpu(
+        b->ffn_norm = load_dense_gpu(execution,
             mfq, lp + "mlp.dense.input_norm.weight");
-        b->ffn_post_norm = load_dense_gpu(
+        b->ffn_post_norm = load_dense_gpu(execution,
             mfq, lp + "mlp.output_norm.weight");
-        b->layer_scale = load_dense_gpu(mfq, lp + "output_scale")
+        b->layer_scale = load_dense_gpu(execution, mfq, lp + "output_scale")
             .to(mfq_tensor_backend::kFloat16).contiguous();
         if (b->gemma4_moe) {
-            b->ffn_post_norm_1 = load_dense_gpu(
+            b->ffn_post_norm_1 = load_dense_gpu(execution,
                 mfq, lp + "mlp.dense.output_norm.weight");
-            b->ffn_pre_norm_2 = load_dense_gpu(
+            b->ffn_pre_norm_2 = load_dense_gpu(execution,
                 mfq, lp + "mlp.experts.input_norm.weight");
-            b->ffn_post_norm_2 = load_dense_gpu(
+            b->ffn_post_norm_2 = load_dense_gpu(execution,
                 mfq, lp + "mlp.experts.output_norm.weight");
         }
 
         const std::string mp = lp + "mlp.";
         b->ffn.geglu = true;
-        b->ffn.down = load_quant_linear(mfq, mp + "down.weight");
-        b->ffn.gate_up = load_paired_gate_up(mfq, {
+        b->ffn.down = load_quant_linear(execution, mfq, mp + "down.weight");
+        b->ffn.gate_up = load_paired_gate_up(execution, mfq, {
             mp + "gate.weight", mp + "up.weight"},
             b->ffn.down);
-        prepare_ffn_workspaces(b->ffn);
+        prepare_ffn_workspaces(execution, b->ffn);
 
         if (!b->gemma4_moe) return b;
 
-        b->gemma_moe_gate_up = load_mfe_gpu(
+        b->gemma_moe_gate_up = load_mfe_gpu(execution,
             mfq, mp + "experts.gate_up.weight",
             true, i, "gate_up");
-        b->gemma_moe_down = load_mfe_gpu(
+        b->gemma_moe_down = load_mfe_gpu(execution,
             mfq, mp + "experts.down.weight",
             true, i, "down");
-        b->gemma_router = load_dense_gpu(
+        b->gemma_router = load_dense_gpu(execution,
             mfq, mp + "router.weight").to(mfq_tensor_backend::kFloat32).contiguous();
         b->gemma_router_norm_scale = (
-            load_dense_gpu(mfq, mp + "router.norm.weight").to(mfq_tensor_backend::kFloat32) /
+            load_dense_gpu(execution, mfq, mp + "router.norm.weight").to(mfq_tensor_backend::kFloat32) /
             std::sqrt((double)c.hidden_size)).contiguous();
-        b->gemma_expert_scale = load_dense_gpu(
+        b->gemma_expert_scale = load_dense_gpu(execution,
             mfq, mp + "router.expert_scale").to(mfq_tensor_backend::kFloat32).contiguous();
         b->gemma_top_k = static_cast<int>(c.num_experts_per_tok);
 
@@ -157,7 +158,8 @@ Gemma4Model::adapter_load_block(
         int layer,
         int,
         const std::string& type) {
-    return gemma4::load_block(source, config, layer, type);
+    return gemma4::load_block(
+        *execution, source, config, layer, type);
 }
 
 mfq_tensor_backend::Tensor

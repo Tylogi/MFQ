@@ -22,12 +22,13 @@ using Tensor = mfq_tensor_backend::Tensor;
 namespace detail {
 
 inline Tensor required_vector(
+        CudaExecutionContext& execution,
         const mfq::ModelSource& model,
         GridVisionTensorRole role,
         int64_t width,
         size_t block = 0) {
     const auto name = grid_vision_canonical_name(role, block);
-    auto value = load_dense_gpu(model, name);
+    auto value = load_dense_gpu(execution, model, name);
     if (value.dim() != 1 || value.size(0) != width) {
         throw std::runtime_error("grid-ViT vector shape mismatch: " + name);
     }
@@ -39,15 +40,16 @@ struct Affine {
     Tensor bias;
 
     static Affine load(
+            CudaExecutionContext& execution,
             const mfq::ModelSource& model,
             GridVisionTensorRole weight,
             GridVisionTensorRole bias_role,
             size_t block = 0) {
         const auto weight_name = grid_vision_canonical_name(weight, block);
         const auto bias_name = grid_vision_canonical_name(bias_role, block);
-        Affine result{load_quant_linear(model, weight_name), {}};
+        Affine result{load_quant_linear(execution, model, weight_name), {}};
         if (has_tensor(model, bias_name)) {
-            result.bias = load_dense_gpu(model, bias_name);
+            result.bias = load_dense_gpu(execution, model, bias_name);
             if (result.bias.dim() != 1 ||
                     result.bias.size(0) != result.linear.out()) {
                 throw std::runtime_error(
@@ -73,6 +75,7 @@ struct LayerNorm {
     double epsilon = 1e-6;
 
     static LayerNorm load(
+            CudaExecutionContext& execution,
             const mfq::ModelSource& model,
             GridVisionTensorRole weight,
             GridVisionTensorRole bias,
@@ -80,8 +83,8 @@ struct LayerNorm {
             double epsilon,
             size_t block = 0) {
         return {
-            required_vector(model, weight, width, block),
-            required_vector(model, bias, width, block),
+            required_vector(execution, model, weight, width, block),
+            required_vector(execution, model, bias, width, block),
             epsilon,
         };
     }
@@ -240,11 +243,12 @@ struct VisionBlock {
 class CudaGridVisionEncoder {
 public:
     static CudaGridVisionEncoder load(
+            CudaExecutionContext& execution,
             const mfq::ModelSource& model,
             const GridVisionConfig& config) {
         config.validate();
         const auto hidden = config.hidden_size;
-        auto patch_weight = load_dense_gpu(
+        auto patch_weight = load_dense_gpu(execution,
             model, grid_vision_canonical_name(
                 GridVisionTensorRole::patch_weight));
         const std::vector<int64_t> expected_patch{
@@ -254,8 +258,8 @@ public:
             throw std::runtime_error("grid-ViT patch weight shape mismatch");
         }
         auto patch_bias = detail::required_vector(
-            model, GridVisionTensorRole::patch_bias, hidden);
-        auto position_weight = load_dense_gpu(
+            execution, model, GridVisionTensorRole::patch_bias, hidden);
+        auto position_weight = load_dense_gpu(execution,
             model, grid_vision_canonical_name(
                 GridVisionTensorRole::position_weight));
         if (position_weight.dim() != 2 ||
@@ -269,27 +273,27 @@ public:
         for (size_t index = 0; index < static_cast<size_t>(config.depth); ++index) {
             detail::VisionBlock block{
                 detail::LayerNorm::load(
-                    model, GridVisionTensorRole::block_norm1_weight,
+                    execution, model, GridVisionTensorRole::block_norm1_weight,
                     GridVisionTensorRole::block_norm1_bias, hidden,
                     config.layer_norm_eps, index),
                 {
                     detail::Affine::load(
-                        model, GridVisionTensorRole::block_attention_qkv_weight,
+                        execution, model, GridVisionTensorRole::block_attention_qkv_weight,
                         GridVisionTensorRole::block_attention_qkv_bias, index),
                     detail::Affine::load(
-                        model, GridVisionTensorRole::block_attention_output_weight,
+                        execution, model, GridVisionTensorRole::block_attention_output_weight,
                         GridVisionTensorRole::block_attention_output_bias, index),
                     hidden, config.num_heads, config.head_dim(), config.rope_theta,
                 },
                 detail::LayerNorm::load(
-                    model, GridVisionTensorRole::block_norm2_weight,
+                    execution, model, GridVisionTensorRole::block_norm2_weight,
                     GridVisionTensorRole::block_norm2_bias, hidden,
                     config.layer_norm_eps, index),
                 detail::Affine::load(
-                    model, GridVisionTensorRole::block_mlp_up_weight,
+                    execution, model, GridVisionTensorRole::block_mlp_up_weight,
                     GridVisionTensorRole::block_mlp_up_bias, index),
                 detail::Affine::load(
-                    model, GridVisionTensorRole::block_mlp_down_weight,
+                    execution, model, GridVisionTensorRole::block_mlp_down_weight,
                     GridVisionTensorRole::block_mlp_down_bias, index),
             };
             if (block.attention.qkv.linear.neuron_len() != hidden ||
@@ -382,6 +386,7 @@ private:
 class CudaGridVisionPromptComponent {
 public:
     static CudaGridVisionPromptComponent load(
+            CudaExecutionContext& execution,
             const mfq::ModelSource& model,
             const GridVisionConfig& vision,
             int64_t image_token_id,
@@ -405,14 +410,14 @@ public:
         const int64_t unit = vision.spatial_merge_size *
             vision.spatial_merge_size;
         auto merger_norm = detail::LayerNorm::load(
-            model, GridVisionTensorRole::merger_norm_weight,
+            execution, model, GridVisionTensorRole::merger_norm_weight,
             GridVisionTensorRole::merger_norm_bias, vision.hidden_size,
             vision.layer_norm_eps);
         auto merger_up = detail::Affine::load(
-            model, GridVisionTensorRole::merger_mlp_up_weight,
+            execution, model, GridVisionTensorRole::merger_mlp_up_weight,
             GridVisionTensorRole::merger_mlp_up_bias);
         auto merger_down = detail::Affine::load(
-            model, GridVisionTensorRole::merger_mlp_down_weight,
+            execution, model, GridVisionTensorRole::merger_mlp_down_weight,
             GridVisionTensorRole::merger_mlp_down_bias);
         if (merger_up.linear.neuron_len() != unit * vision.hidden_size ||
                 merger_down.linear.neuron_len() != merger_up.linear.out() ||
@@ -420,7 +425,7 @@ public:
             throw std::runtime_error("grid-Vision merger geometry mismatch");
         }
         return CudaGridVisionPromptComponent(
-            CudaGridVisionEncoder::load(model, vision),
+            CudaGridVisionEncoder::load(execution, model, vision),
             std::move(merger_norm), std::move(merger_up),
             std::move(merger_down), image_token_id, video_token_id,
             std::move(input_contract), std::move(position_policy));

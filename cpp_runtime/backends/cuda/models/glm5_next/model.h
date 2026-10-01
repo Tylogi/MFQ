@@ -18,12 +18,14 @@ public:
             "invalid GLM KDA configuration");
     }
     void reset() {
-        conv_ = {}; recurrent_ = {}; commit();
+        conv_ = Tensor(); recurrent_ = Tensor(); commit();
     }
     const Tensor& conv_state() const { return conv_; }
     const Tensor& recurrent_state() const { return recurrent_; }
     bool pending() const { return rollback_conv_.defined(); }
-    void commit() { rollback_conv_ = {}; rollback_recurrent_ = {}; }
+    void commit() {
+        rollback_conv_ = Tensor(); rollback_recurrent_ = Tensor();
+    }
     void rollback() {
         MFQ_RUNTIME_CHECK(pending(), "GLM KDA has no speculative checkpoint");
         conv_ = rollback_conv_; recurrent_ = rollback_recurrent_; commit();

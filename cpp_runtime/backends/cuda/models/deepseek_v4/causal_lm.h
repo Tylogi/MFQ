@@ -447,7 +447,7 @@ struct Dsv4Block : Block {
             auto low_rank = profiler.measure(
                 "dsv4.output_a", [&]() {
                     return output_a.forward_mxfp8_groupwise(
-                        profiler, grouped, groups);
+                        execution, grouped, groups);
                 });
             return profiler.measure("dsv4.output_b", [&]() {
                 return output_b.forward(execution, low_rank)
@@ -870,7 +870,9 @@ std::unique_ptr<::Block> load_block(
 void validate_load_options(
     const Config& config,
     CudaExecutionContext& execution);
-OutputHeadWeights load_output_head(const mfq::ModelSource& source);
+OutputHeadWeights load_output_head(
+    CudaExecutionContext& execution,
+    const mfq::ModelSource& source);
 mfq_tensor_backend::Tensor finalize_hidden(
     mfq_tensor_backend::Tensor hidden,
     const OutputHeadWeights& output_head,

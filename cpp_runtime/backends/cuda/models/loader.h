@@ -18,7 +18,6 @@ auto with_loaded_cuda_model(
         const CudaLoadOptions& options,
         bool load_optional_components,
         F&& run) {
-    CudaExecutionContextScope context_scope(execution);
     auto source = mfq::open_model_source(options.model_path);
     auto load = [&]<typename Model>() {
         auto started = std::chrono::steady_clock::now();
@@ -32,9 +31,9 @@ auto with_loaded_cuda_model(
             source);
         auto runtime_components =
             load_runtime_components(model, load_optional_components);
-        if (moe_expert_cache_has_sources() &&
-                !moe_expert_cache_finalized()) {
-            finalize_moe_expert_cache();
+        if (moe_expert_cache_has_sources(execution.moe_expert_cache) &&
+                !moe_expert_cache_finalized(execution.moe_expert_cache)) {
+            finalize_moe_expert_cache(execution.moe_expert_cache);
         }
         mfq_cuda_synchronize();
         auto loaded = std::chrono::steady_clock::now();

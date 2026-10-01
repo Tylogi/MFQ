@@ -1,6 +1,7 @@
 #pragma once
 
 #include "quant_linear.h"
+#include "mfe_weight.h"
 #include "models/include/model_config.h"
 #include "cuda_execution.h"
 #include "storage/moe_expert_cache.h"
@@ -389,9 +390,12 @@ struct FullBlock : Block {
             int64_t decode_attention_parts);
 };
 
-void prepare_ffn_workspaces(FFN & f);
+void prepare_ffn_workspaces(
+    CudaExecutionContext& execution,
+    FFN& f);
 
 FFN load_ffn(
+    CudaExecutionContext& execution,
     const mfq::ModelSource& source,
     const mfq::models::ModelConfig& config,
     int layer,
@@ -399,6 +403,7 @@ FFN load_ffn(
     std::string_view tensor_root = "model");
 
 std::unique_ptr<Block> load_transformer_block(
+    CudaExecutionContext& execution,
     const mfq::ModelSource& source,
     const mfq::models::ModelConfig& config,
     int layer,
@@ -407,6 +412,7 @@ std::unique_ptr<Block> load_transformer_block(
     std::string_view tensor_root = "model");
 
 void load_important_neuron_branch(
+        CudaExecutionContext& execution,
         const mfq::ModelSource & mfq,
         int64_t hidden_size,
         int64_t intermediate_size,

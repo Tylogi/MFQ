@@ -2,7 +2,7 @@
 
 #include "format.h"
 #include "fp8_sq.h"
-#include "moe.h"
+#include "mfe_weight.h"
 #include "mx.h"
 #include "mxfp4_sq.h"
 #include "nint.h"
@@ -92,7 +92,6 @@ bool has_tensor_prefix(
 }
 
 std::vector<std::uint8_t> read_tensor(
-        const CudaExecutionContext& execution,
         const mfq::ModelSource& source,
         std::string_view name) {
     const auto& tensor = require_tensor(source, name);
@@ -103,16 +102,16 @@ std::vector<std::uint8_t> read_tensor(
         static_cast<std::size_t>(tensor.nbytes));
     source.read_range_into(
         name, 0, reinterpret_cast<std::byte*>(result.data()), result.size());
-    if (execution.drop_file_cache) {
-        source.drop_file_cache();
-    }
     return result;
 }
 
-std::vector<std::uint8_t> read_tensor(
+static std::vector<std::uint8_t> read_tensor(
+        const CudaExecutionContext& execution,
         const mfq::ModelSource& source,
         std::string_view name) {
-    return read_tensor(cuda_execution_context(), source, name);
+    auto result = read_tensor(source, name);
+    if (execution.drop_file_cache) source.drop_file_cache();
+    return result;
 }
 
 std::vector<std::uint8_t> read_asset(
@@ -135,14 +134,17 @@ std::string read_asset_text(
 }
 
 mfq_tensor_backend::Tensor reduce_model_parallel_outputs(
+    CudaExecutionContext& execution,
     std::vector<mfq_tensor_backend::Tensor> outputs);
 
 std::vector<mfq::TensorParallelSlice>
 plan_moe_expert_parallel_slices(
+    const CudaExecutionContext& execution,
     int64_t extent,
     const std::string & name);
 
 MfeWeight load_mfe_gpu(
+    CudaExecutionContext& execution,
     const mfq::ModelSource & mfq, const std::string & name,
     bool cacheable,
     int layer_id,
@@ -152,12 +154,13 @@ static mfq_tensor_backend::Tensor dequant_nint_dense_f32(
     const NintWeight & weight);
 
 mfq_tensor_backend::Tensor load_dense_gpu(
+        CudaExecutionContext& execution,
         const mfq::ModelSource& mfq,
         const std::string& name) {
-    const bool cpu_layer = cuda_execution_context().loading_cpu_layer;
-    MfqCudaGuard guard(active_weight_load_device());
+    const bool cpu_layer = execution.loading_cpu_layer;
+    MfqCudaGuard guard(active_weight_load_device(execution));
     const auto & rec = require_tensor(mfq, name);
-    auto blob = read_tensor(mfq, name);
+    auto blob = read_tensor(execution, mfq, name);
     if (rec.dtype == "NINT8-0") {
         const auto source = unpack_nint8_zero(blob);
         if (cpu_layer) {
@@ -472,6 +475,7 @@ mfq_tensor_backend::Tensor run_quant_linear_shard(
 }
 
 mfq_tensor_backend::Tensor tensor_to_cuda_device(
+        CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor value,
         int device,
         mfq_tensor_backend::Tensor reusable) {
@@ -498,7 +502,7 @@ mfq_tensor_backend::Tensor tensor_to_cuda_device(
         return destination_tensor();
     }
 #if defined(MFQ_NATIVE_CUDA_RUNTIME) && defined(MFQ_HAVE_NCCL)
-    auto& runtime = cuda_execution_context().model_parallel_collectives;
+    auto& runtime = execution.model_parallel_collectives;
     if (value.is_cuda() && runtime.collectives_enabled) {
         const int source_device = value.get_device();
         const auto source_rank_it = std::find(
@@ -588,13 +592,14 @@ mfq_tensor_backend::Tensor tensor_to_cuda_device(
 }
 
 mfq_tensor_backend::Tensor reduce_model_parallel_outputs(
+        CudaExecutionContext& execution,
         std::vector<mfq_tensor_backend::Tensor> outputs) {
     if (outputs.empty()) {
         throw std::runtime_error(
             "cannot reduce an empty model-parallel output");
     }
 #ifdef MFQ_HAVE_NCCL
-    auto& runtime = cuda_execution_context().model_parallel_collectives;
+    auto& runtime = execution.model_parallel_collectives;
     if (runtime.collectives_enabled &&
             outputs.size() == runtime.devices.size()) {
         const auto shape = outputs.front().sizes().vec();
@@ -609,7 +614,7 @@ mfq_tensor_backend::Tensor reduce_model_parallel_outputs(
             reduce_to_primary &&
             outputs.size() == 2 &&
             output_dtype == mfq_tensor_backend::kFloat16;
-        const int primary = model_parallel_primary_device();
+        const int primary = model_parallel_primary_device(execution);
         const auto primary_rank_it = std::find(
             runtime.devices.begin(), runtime.devices.end(), primary);
         if (primary_rank_it == runtime.devices.end()) {
@@ -708,14 +713,14 @@ mfq_tensor_backend::Tensor reduce_model_parallel_outputs(
         return result;
     }
 #endif
-    const int primary = model_parallel_primary_device();
+    const int primary = model_parallel_primary_device(execution);
     MfqCudaGuard primary_guard(primary);
     const auto output_dtype =
         outputs.front().scalar_type();
     mfq_tensor_backend::Tensor reduced;
     for (auto & output : outputs) {
         auto partial =
-            tensor_to_cuda_device(output, primary)
+            tensor_to_cuda_device(execution, output, primary)
                 .to(mfq_tensor_backend::kFloat32);
         if (!reduced.defined()) {
             reduced = std::move(partial);
@@ -831,10 +836,11 @@ forward_tensor_parallel_output_projections(
             const int device =
                 projections.front()->tensor_parallel_shards[shard].device;
             MfqCudaGuard guard(device);
-            local_inputs[shard] = tensor_to_cuda_device(flat, device);
+            local_inputs[shard] = tensor_to_cuda_device(
+                execution, flat, device);
         }
 
-        const int primary = model_parallel_primary_device();
+        const int primary = model_parallel_primary_device(execution);
         std::vector<mfq_tensor_backend::Tensor> result;
         result.reserve(projections.size());
         for (const auto * projection : projections) {
@@ -853,7 +859,8 @@ forward_tensor_parallel_output_projections(
             std::vector<mfq_tensor_backend::Tensor> gathered;
             gathered.reserve(shard_count);
             for (auto & output : local_outputs) {
-                gathered.push_back(tensor_to_cuda_device(output, primary));
+                gathered.push_back(tensor_to_cuda_device(
+                    execution, output, primary));
             }
             auto combined = mfq_tensor_backend::cat(
                 gathered, -1).contiguous();
@@ -878,7 +885,7 @@ forward_tensor_parallel_output_projections(
         // All projections consume the same immutable activation. Transfer it
         // once per rank, then keep the independent local projection work on
         // that rank before gathering each output.
-        auto local_x = tensor_to_cuda_device(flat, device);
+        auto local_x = tensor_to_cuda_device(execution, flat, device);
         for (size_t projection = 0;
                 projection < projections.size(); ++projection) {
             local_outputs[projection][shard] =
@@ -888,7 +895,7 @@ forward_tensor_parallel_output_projections(
         }
     }
 
-    const int primary = model_parallel_primary_device();
+    const int primary = model_parallel_primary_device(execution);
     MfqCudaGuard primary_guard(primary);
     std::vector<mfq_tensor_backend::Tensor> result;
     result.reserve(projections.size());
@@ -896,7 +903,8 @@ forward_tensor_parallel_output_projections(
         std::vector<mfq_tensor_backend::Tensor> gathered;
         gathered.reserve(shard_count);
         for (auto & output : projection_outputs) {
-            gathered.push_back(tensor_to_cuda_device(output, primary));
+            gathered.push_back(tensor_to_cuda_device(
+                execution, output, primary));
         }
         auto combined = mfq_tensor_backend::cat(
             gathered, -1).contiguous();
@@ -973,19 +981,20 @@ plan_parallel_slices(
 
 std::vector<mfq::TensorParallelSlice>
 plan_moe_expert_parallel_slices(
+        const CudaExecutionContext& execution,
         int64_t extent,
         const std::string & name) {
     return plan_parallel_slices(
-        extent, 1, moe_parallel_config(), name);
+        extent, 1, moe_parallel_config(execution), name);
 }
 
 QuantLinear load_quant_linear(
+        CudaExecutionContext& execution,
         const mfq::ModelSource & mfq,
         const std::string & name,
         std::optional<TensorParallelAxis> axis_override,
         const std::vector<mfq::TensorParallelSlice> *
             slices_override) {
-    auto& execution = cuda_execution_context();
     const bool cpu_layer = execution.loading_cpu_layer;
     const auto & dtype = require_tensor(mfq, name).dtype;
     QuantLinear result;
@@ -1025,7 +1034,7 @@ QuantLinear load_quant_linear(
     result.tensor_parallel_axis = axis;
     if (is_nint_linear_dtype(dtype)) {
         result.kind = QuantLinearKind::Nint;
-        const auto blob = read_tensor(mfq, name);
+        const auto blob = read_tensor(execution, mfq, name);
         if (dtype == "NINT8-0") {
             const auto cpu = unpack_nint8_zero(blob);
             result.logical_out = cpu.out;
@@ -1076,7 +1085,7 @@ QuantLinear load_quant_linear(
                 if (cpu_layer) {
                     result.nint = to_device_nint8_zero(cpu, false);
                 } else {
-                    MfqCudaGuard guard(active_weight_load_device());
+                    MfqCudaGuard guard(active_weight_load_device(execution));
                     result.nint =
                         to_device_nint8_zero(cpu, true);
                 }
@@ -1130,7 +1139,7 @@ QuantLinear load_quant_linear(
                 if (cpu_layer) {
                     result.nint = to_device_nint(cpu, false);
                 } else {
-                    MfqCudaGuard guard(active_weight_load_device());
+                    MfqCudaGuard guard(active_weight_load_device(execution));
                     result.nint =
                         to_device_nint(cpu, true);
                 }
@@ -1138,7 +1147,8 @@ QuantLinear load_quant_linear(
         }
     } else if (is_nvq_linear_dtype(dtype)) {
         result.kind = QuantLinearKind::Nvq;
-        const auto cpu = unpack_nvq(read_tensor(mfq, name), dtype);
+        const auto cpu = unpack_nvq(
+            read_tensor(execution, mfq, name), dtype);
         result.logical_out = cpu.out;
         result.logical_neuron_len = cpu.neuron_len;
         if (execution.tensor_parallel.enabled() &&
@@ -1182,7 +1192,7 @@ QuantLinear load_quant_linear(
             if (cpu_layer) {
                 result.nvq = to_device_nvq(cpu, false);
             } else {
-                MfqCudaGuard guard(active_weight_load_device());
+                MfqCudaGuard guard(active_weight_load_device(execution));
                 result.nvq = to_device_nvq(cpu, true);
             }
         }
@@ -1198,7 +1208,8 @@ QuantLinear load_quant_linear(
                 "MXFP4-SQ does not support dense CPU-layer offload: " + name);
         }
         result.mxfp4_sq.weight = to_device_mxfp4_sq(
-            read_tensor(mfq, name), true, active_weight_load_device());
+            read_tensor(execution, mfq, name), true,
+            active_weight_load_device(execution));
         result.logical_out = result.mxfp4_sq.weight.out;
         result.logical_neuron_len =
             result.mxfp4_sq.weight.neuron_len;
@@ -1214,14 +1225,15 @@ QuantLinear load_quant_linear(
                 "FP8-SQ does not support dense CPU-layer offload: " + name);
         }
         result.fp8_sq.weight = to_device_fp8_sq(
-            dtype, read_tensor(mfq, name), true,
-            active_weight_load_device());
+            dtype, read_tensor(execution, mfq, name), true,
+            active_weight_load_device(execution));
         result.logical_out = result.fp8_sq.weight.out;
         result.logical_neuron_len =
             result.fp8_sq.weight.neuron_len;
     } else if (dtype == "MXFP4") {
         result.kind = QuantLinearKind::Mxfp4;
-        const auto cpu = unpack_mxfp4(read_tensor(mfq, name));
+        const auto cpu = unpack_mxfp4(
+            read_tensor(execution, mfq, name));
         result.logical_out = cpu.out;
         result.logical_neuron_len = cpu.neuron_len;
         if (execution.tensor_parallel.enabled() &&
@@ -1251,11 +1263,12 @@ QuantLinear load_quant_linear(
         } else {
             result.mxfp4.weight = to_device_mxfp4(
                 cpu, !cpu_layer,
-                cpu_layer ? -1 : active_weight_load_device());
+                cpu_layer ? -1 : active_weight_load_device(execution));
         }
     } else if (dtype == "MXFP8") {
         result.kind = QuantLinearKind::Mxfp8;
-        const auto cpu = unpack_mxfp8(read_tensor(mfq, name));
+        const auto cpu = unpack_mxfp8(
+            read_tensor(execution, mfq, name));
         result.logical_out = cpu.out;
         result.logical_neuron_len = cpu.neuron_len;
         if (execution.tensor_parallel.enabled() &&
@@ -1285,7 +1298,7 @@ QuantLinear load_quant_linear(
             result.mxfp8.weight = to_device_mxfp8(cpu, false);
         } else {
             result.mxfp8.weight = to_cuda_device_mxfp8(
-                cpu, active_weight_load_device());
+                cpu, active_weight_load_device(execution));
         }
     } else if (dtype == "BF16" || dtype == "F16" || dtype == "F32") {
         result.kind = QuantLinearKind::Dense;
@@ -1333,7 +1346,7 @@ QuantLinear load_quant_linear(
         } else if (cpu_layer) {
             result.dense = cpu.contiguous();
         } else {
-            MfqCudaGuard guard(active_weight_load_device());
+            MfqCudaGuard guard(active_weight_load_device(execution));
             result.dense = cpu.to(mfq_tensor_backend::kCUDA).contiguous();
         }
     } else {
@@ -1352,6 +1365,7 @@ bool is_quant_dtype(const std::string & dtype) {
 }
 
 QuantLinearGroup make_quant_group(
+        CudaExecutionContext& execution,
         std::vector<QuantLinear> layers,
         bool preserve_projection_boundaries) {
     if (layers.empty()) throw std::runtime_error("empty quantized linear group");
@@ -1372,7 +1386,7 @@ QuantLinearGroup make_quant_group(
         std::getenv("MFQ_DIAGNOSTIC_DISABLE_NINT_GROUP");
     const bool diagnostic_keep_nint_separate =
         disable_nint_group != nullptr && disable_nint_group[0] == '1';
-    const bool cpu_layer = cuda_execution_context().loading_cpu_layer;
+    const bool cpu_layer = execution.loading_cpu_layer;
     const bool any_tensor_parallel = std::any_of(
         layers.begin(), layers.end(),
         [](const QuantLinear & layer) {
@@ -1430,6 +1444,7 @@ static bool quant_linear_pair_compatible(const QuantLinear & a, const QuantLinea
 }
 
 QuantLinearGroup load_quant_group(
+    CudaExecutionContext& execution,
     const mfq::ModelSource & mfq, const std::vector<std::string> & names,
     size_t required_compatible_prefix,
     const std::vector<mfq::TensorParallelSlice> *
@@ -1440,7 +1455,7 @@ QuantLinearGroup load_quant_group(
     for (const auto & name : names) {
         layers.push_back(
             load_quant_linear(
-                mfq, name,
+                execution, mfq, name,
                 slices_override != nullptr
                     ? std::optional<TensorParallelAxis>(
                         TensorParallelAxis::Output)
@@ -1454,7 +1469,7 @@ QuantLinearGroup load_quant_group(
     // Mixed-precision Q/K and gate/up pairs remain separate QuantLinear
     // branches and preserve the recipe-selected layouts.
     return make_quant_group(
-        std::move(layers), preserve_projection_boundaries);
+        execution, std::move(layers), preserve_projection_boundaries);
 }
 
 static std::vector<mfq::TensorParallelSlice>
@@ -1484,6 +1499,7 @@ tensor_parallel_output_slices_for_input(
 }
 
 QuantLinearGroup load_paired_gate_up(
+        CudaExecutionContext& execution,
         const mfq::ModelSource & mfq,
         const std::vector<std::string> & names,
         const QuantLinear & down,
@@ -1494,12 +1510,12 @@ QuantLinearGroup load_paired_gate_up(
             down);
     return slices.empty()
         ? load_quant_group(
-            mfq, names,
+            execution, mfq, names,
             required_compatible_prefix,
             nullptr,
             preserve_projection_boundaries)
         : load_quant_group(
-            mfq, names,
+            execution, mfq, names,
             required_compatible_prefix,
             &slices,
             preserve_projection_boundaries);
@@ -1588,7 +1604,7 @@ static mfq_tensor_backend::Tensor dequant_quant_linear_f32(
         throw std::runtime_error(
             "cannot reconstruct a mirrored tensor-parallel linear");
     }
-    const int primary = model_parallel_primary_device();
+    const int primary = model_parallel_primary_device(execution);
     std::vector<mfq_tensor_backend::Tensor> parts;
     parts.reserve(linear.tensor_parallel_shards.size());
     for (const auto & shard : linear.tensor_parallel_shards) {
@@ -1615,7 +1631,7 @@ static mfq_tensor_backend::Tensor dequant_quant_linear_f32(
                 "unsupported tensor-parallel shard kind for reconstruction");
         }
         parts.push_back(
-            tensor_to_cuda_device(part, primary)
+            tensor_to_cuda_device(execution, part, primary)
                 .to(mfq_tensor_backend::kFloat32).contiguous());
     }
     MfqCudaGuard primary_guard(primary);
@@ -1631,7 +1647,9 @@ static mfq_tensor_backend::Tensor dequant_quant_linear_f32(
     return dense;
 }
 
-DenseLinearGroup make_fp32_quant_group(QuantLinearGroup group) {
+DenseLinearGroup make_fp32_quant_group(
+        CudaExecutionContext& execution,
+        QuantLinearGroup group) {
     DenseLinearGroup dense;
     dense.outs = group.outs;
     if (group.nint_grouped) {
@@ -1650,7 +1668,7 @@ DenseLinearGroup make_fp32_quant_group(QuantLinearGroup group) {
         parts.reserve(group.layers.size());
         for (const auto & linear : group.layers) {
             parts.push_back(dequant_quant_linear_f32(
-                cuda_execution_context(), linear));
+                execution, linear));
         }
         dense.w = mfq_tensor_backend::cat(parts, 0).contiguous();
     }

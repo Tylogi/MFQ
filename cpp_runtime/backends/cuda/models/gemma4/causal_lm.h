@@ -14,6 +14,7 @@ namespace mfq::cuda::gemma4 {
 using Config = mfq::models::gemma4::Config;
 
 std::unique_ptr<::Block> load_block(
+    CudaExecutionContext& execution,
     const mfq::ModelSource& source,
     const Config& config,
     int layer,

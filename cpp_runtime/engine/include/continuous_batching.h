@@ -46,6 +46,7 @@ struct ContinuousBatchRequest {
 
     void publish_prefill(MfqPrefillTiming timing);
     void publish_token(int64_t token);
+    bool publish_token_sync(int64_t token);
     void complete(std::exception_ptr error = {});
     int32_t consume(
         const MfqTokenCallback& on_token,
@@ -65,6 +66,8 @@ private:
     std::condition_variable output_ready_;
     std::optional<MfqPrefillTiming> prefill_timing_;
     std::deque<int64_t> output_tokens_;
+    std::uint64_t published_tokens_ = 0;
+    std::uint64_t consumed_tokens_ = 0;
     bool done_ = false;
     std::exception_ptr error_;
 };
@@ -331,7 +334,8 @@ public:
         const MfqPrefillCallback& on_prefill,
         const MfqPromptCachePlan& cache_plan,
         const MfqTokenConstraintPtr& token_constraint,
-        const MfqCancellationCheck& cancelled) = 0;
+        const MfqCancellationCheck& cancelled,
+        const MfqMultimodalInput* media = nullptr) = 0;
 
     virtual std::vector<std::pair<std::string, double>> metrics() const = 0;
 };

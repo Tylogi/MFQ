@@ -12,6 +12,7 @@ namespace mfq::cuda::qwen35 {
 namespace {
 
 FFN load_qwen_ffn(
+        CudaExecutionContext& execution,
         const mfq::ModelSource& source,
         const Config& config,
         int layer,
@@ -31,7 +32,8 @@ FFN load_qwen_ffn(
 
     if (!has_expert_gate_up && !has_expert_gate &&
             !has_expert_up && !has_expert_down) {
-        return load_ffn(source, config, layer, false, tensor_root);
+        return load_ffn(
+            execution, source, config, layer, false, tensor_root);
     }
     if (has_expert_gate != has_expert_up) {
         throw std::runtime_error(
@@ -53,19 +55,19 @@ FFN load_qwen_ffn(
     ffn.is_moe = true;
     ffn.moe_split_gate_up = has_expert_gate;
     if (ffn.moe_split_gate_up) {
-        ffn.moe_gate = load_mfe_gpu(
+        ffn.moe_gate = load_mfe_gpu(execution,
             source, expert_gate, true, layer, "gate");
-        ffn.moe_up = load_mfe_gpu(
+        ffn.moe_up = load_mfe_gpu(execution,
             source, expert_up, true, layer, "up");
     } else {
-        ffn.moe_gate_up = load_mfe_gpu(
+        ffn.moe_gate_up = load_mfe_gpu(execution,
             source, expert_gate_up, true, layer, "gate_up");
     }
-    ffn.moe_down = load_mfe_gpu(
+    ffn.moe_down = load_mfe_gpu(execution,
         source, expert_down, true, layer, "down");
-    ffn.moe_router = load_dense_gpu(source, prefix + "router.weight")
+    ffn.moe_router = load_dense_gpu(execution, source, prefix + "router.weight")
         .to(mfq_tensor_backend::kFloat32).contiguous();
-    ffn.moe_shared_gate = load_dense_gpu(
+    ffn.moe_shared_gate = load_dense_gpu(execution,
         source, prefix + "shared_expert.router.weight")
         .to(mfq_tensor_backend::kFloat32).contiguous();
     ffn.moe_top_k = static_cast<int>(config.num_experts_per_tok);
@@ -82,13 +84,13 @@ FFN load_qwen_ffn(
     }
     ffn.moe_layer = layer;
     ffn.shared = std::make_unique<FFN>();
-    ffn.shared->down = load_quant_linear(
+    ffn.shared->down = load_quant_linear(execution,
         source, prefix + "shared_expert.down.weight");
-    ffn.shared->gate_up = load_paired_gate_up(source, {
+    ffn.shared->gate_up = load_paired_gate_up(execution, source, {
         prefix + "shared_expert.gate.weight",
         prefix + "shared_expert.up.weight"},
         ffn.shared->down);
-    prepare_ffn_workspaces(*ffn.shared);
+    prepare_ffn_workspaces(execution, *ffn.shared);
 
     const bool routed_gate_shapes = ffn.moe_split_gate_up
         ? ffn.moe_gate.n_experts == config.num_experts &&
@@ -121,6 +123,7 @@ FFN load_qwen_ffn(
 } // namespace
 
 std::unique_ptr<::Block> load_block(
+        CudaExecutionContext& execution,
         const mfq::ModelSource& source,
         const Config& config,
         int layer,
@@ -141,9 +144,9 @@ std::unique_ptr<::Block> load_block(
         b->norm_weight_offset =
             config.legacy_tensor_layout.norm_weight_offset;
         b->attention_output_gate = config.attention_output_gate;
-        b->attn_norm = load_dense_gpu(
+        b->attn_norm = load_dense_gpu(execution,
             source, lp + "attention.norm.weight");
-        b->ffn_norm = load_dense_gpu(source, lp + "mlp.norm.weight");
+        b->ffn_norm = load_dense_gpu(execution, source, lp + "mlp.norm.weight");
         const std::string ap = lp + "attention.";
         const std::string query_name = ap + "query.weight";
         const std::string key_name = ap + "key.weight";
@@ -155,28 +158,28 @@ std::unique_ptr<::Block> load_block(
             is_quant_dtype(require_tensor(source, value_name).dtype);
         if (mirror_kv) {
             b->split_q_kv_projections = true;
-            b->q_projection = load_quant_linear(source, query_name);
+            b->q_projection = load_quant_linear(execution, source, query_name);
             const auto mirrored = std::optional<TensorParallelAxis>(
                 TensorParallelAxis::Mirrored);
-            b->k_projection = load_quant_linear(
+            b->k_projection = load_quant_linear(execution,
                 source, key_name, mirrored);
-            b->v_projection = load_quant_linear(
+            b->v_projection = load_quant_linear(execution,
                 source, value_name, mirrored);
         } else {
-            b->qkv = load_quant_group(
+            b->qkv = load_quant_group(execution,
                 source, {query_name, key_name, value_name}, 2);
         }
-        b->o = load_quant_linear(source, ap + "output.weight");
+        b->o = load_quant_linear(execution, source, ap + "output.weight");
         if (has_tensor(source, ap + "query_norm.weight")) {
-            b->q_norm = load_dense_gpu(
+            b->q_norm = load_dense_gpu(execution,
                 source, ap + "query_norm.weight");
         }
         if (has_tensor(source, ap + "key_norm.weight")) {
-            b->k_norm = load_dense_gpu(
+            b->k_norm = load_dense_gpu(execution,
                 source, ap + "key_norm.weight");
         }
         b->ffn = load_qwen_ffn(
-            source, config, layer, tensor_root);
+            execution, source, config, layer, tensor_root);
         return b;
     }
     if (type == "linear_attention") {
@@ -184,18 +187,18 @@ std::unique_ptr<::Block> load_block(
         b->qwen_config = config;
         b->tiled_v_heads =
             config.legacy_tensor_layout.qwen_gdn_gguf_layout;
-        b->attn_norm = load_dense_gpu(source, lp + "attention.norm.weight");
-        b->ffn_norm = load_dense_gpu(source, lp + "mlp.norm.weight");
+        b->attn_norm = load_dense_gpu(execution, source, lp + "attention.norm.weight");
+        b->ffn_norm = load_dense_gpu(execution, source, lp + "mlp.norm.weight");
         const std::string sp = lp + "linear_attention.";
         const std::string alpha_name = sp + "alpha.weight";
         const std::string beta_name = sp + "beta.weight";
         if (has_tensor(source, sp + "qk.weight") &&
                 has_tensor(source, sp + "value.weight")) {
             b->split_in_proj = true;
-            b->qkv_proj = load_quant_group(
+            b->qkv_proj = load_quant_group(execution,
                 source, {sp + "qk.weight", sp + "value.weight"});
             if (is_quant_dtype(require_tensor(source, sp + "gate.weight").dtype)) {
-                b->z_proj = load_quant_linear(source, sp + "gate.weight");
+                b->z_proj = load_quant_linear(execution, source, sp + "gate.weight");
                 const bool a_nint = is_quant_dtype(require_tensor(source, alpha_name).dtype);
                 const bool b_nint = is_quant_dtype(require_tensor(source, beta_name).dtype);
                 if (a_nint != b_nint) throw std::runtime_error("linear_attn a/b must use the same storage kind");
@@ -206,22 +209,22 @@ std::unique_ptr<::Block> load_block(
                             ? std::optional<TensorParallelAxis>(
                                 TensorParallelAxis::Mirrored)
                             : std::nullopt;
-                    b->ab_nint_proj = make_quant_group({
-                        load_quant_linear(source, alpha_name, scalar_axis),
-                        load_quant_linear(source, beta_name, scalar_axis),
+                    b->ab_nint_proj = make_quant_group(execution, {
+                        load_quant_linear(execution, source, alpha_name, scalar_axis),
+                        load_quant_linear(execution, source, beta_name, scalar_axis),
                     });
                 } else {
                     b->ab_proj = make_dense_group({
-                        load_dense_gpu(source, alpha_name),
-                        load_dense_gpu(source, beta_name),
+                        load_dense_gpu(execution, source, alpha_name),
+                        load_dense_gpu(execution, source, beta_name),
                     });
                 }
             } else {
                 b->split_dense_zab = true;
                 b->zab_proj = make_dense_group({
-                    load_dense_gpu(source, sp + "gate.weight"),
-                    load_dense_gpu(source, alpha_name),
-                    load_dense_gpu(source, beta_name),
+                    load_dense_gpu(execution, source, sp + "gate.weight"),
+                    load_dense_gpu(execution, source, alpha_name),
+                    load_dense_gpu(execution, source, beta_name),
                 });
             }
         } else {
@@ -234,35 +237,35 @@ std::unique_ptr<::Block> load_block(
                     "linear_attention alpha/beta must use the same storage kind");
             }
             if (alpha_quant) {
-                b->in_proj = load_quant_group(source, {
+                b->in_proj = load_quant_group(execution, source, {
                     sp + "qkv.weight", sp + "gate.weight",
                     alpha_name, beta_name});
             } else {
                 b->dense_ab_tail = true;
-                b->in_proj = load_quant_group(
+                b->in_proj = load_quant_group(execution,
                     source, {sp + "qkv.weight", sp + "gate.weight"});
                 b->ab_proj = make_dense_group({
-                    load_dense_gpu(source, alpha_name),
-                    load_dense_gpu(source, beta_name),
+                    load_dense_gpu(execution, source, alpha_name),
+                    load_dense_gpu(execution, source, beta_name),
                 });
             }
         }
-        b->conv_weight = load_dense_gpu(source, sp + "conv.weight");
+        b->conv_weight = load_dense_gpu(execution, source, sp + "conv.weight");
         if (has_tensor(source, sp + "conv.bias")) {
-            b->conv_bias = load_dense_gpu(source, sp + "conv.bias");
+            b->conv_bias = load_dense_gpu(execution, source, sp + "conv.bias");
         }
-        b->dt_bias = load_dense_gpu(source, sp + "dt_bias");
-        const auto a_parameter = load_dense_gpu(source, sp + "a");
+        b->dt_bias = load_dense_gpu(execution, source, sp + "dt_bias");
+        const auto a_parameter = load_dense_gpu(execution, source, sp + "a");
         b->a_log = config.legacy_tensor_layout.linear_attention_a_is_log
             ? a_parameter
             : mfq_tensor_backend::log(-a_parameter);
-        b->linear_norm = load_dense_gpu(source, sp + "norm.weight");
+        b->linear_norm = load_dense_gpu(execution, source, sp + "norm.weight");
         const std::string out_name = sp + "output.weight";
         if (is_quant_dtype(require_tensor(source, out_name).dtype)) {
-            b->out_proj = load_quant_linear(source, out_name);
+            b->out_proj = load_quant_linear(execution, source, out_name);
         } else {
             b->dense_out_proj = true;
-            b->out_proj_dense = load_dense_gpu(source, out_name);
+            b->out_proj_dense = load_dense_gpu(execution, source, out_name);
             if (require_tensor(source, out_name).dtype == "F16") {
                 b->out_proj_dense = b->out_proj_dense
                     .to(mfq_tensor_backend::kFloat16).contiguous();
@@ -273,15 +276,15 @@ std::unique_ptr<::Block> load_block(
             }
         }
         b->ffn = load_qwen_ffn(
-            source, config, layer, tensor_root);
+            execution, source, config, layer, tensor_root);
         return b;
     }
     return load_transformer_block(
-        source, config, layer, type, false, tensor_root);
+        execution, source, config, layer, type, false, tensor_root);
 }
 
 void LinearAttentionBlock::clear_speculative() noexcept {
-    speculative_recurrent = {};
+    speculative_recurrent = LinearRecurrentInputs();
     speculative_start = -1;
     speculative_confirmed = 0;
     speculative_tokens = 0;
@@ -480,8 +483,8 @@ void restore_text_session_state(
             linear->conv_state, saved.convolution_state);
         restore_session_tensor(
             linear->gdn_state, saved.recurrent_state);
-        linear->speculative_conv = {};
-        linear->speculative_gdn = {};
+        linear->speculative_conv = mfq_tensor_backend::Tensor();
+        linear->speculative_gdn = mfq_tensor_backend::Tensor();
         linear->clear_speculative();
     }
 }
@@ -544,7 +547,8 @@ Qwen35Model::adapter_load_block(
         int layer,
         int,
         const std::string& type) {
-    return qwen35::load_block(source, config, layer, type);
+    return qwen35::load_block(
+        *execution, source, config, layer, type);
 }
 
 TextSessionStateKind
@@ -640,7 +644,7 @@ RuntimeComponents<mfq::cuda::Qwen35CausalLm> load_runtime_components(
         }
         result.grid_vision.emplace(
             mfq::cuda::grid_vision_runtime::CudaGridVisionPromptComponent::load(
-                *model.source, *config.grid_vision,
+                *model.execution, *model.source, *config.grid_vision,
                 *config.image_token_id, *config.video_token_id,
                 component->input_contract, component->position_policy));
         result.vision_available = true;

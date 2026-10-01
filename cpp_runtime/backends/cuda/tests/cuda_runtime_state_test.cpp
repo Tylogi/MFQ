@@ -62,28 +62,23 @@ static void check_linear_execution() {
             other.kl_mmq_mode = mode == KlMmqMode::Nint8One
                 ? KlMmqMode::Fp16 : KlMmqMode::Nint8One;
             auto verify = [&](auto run) {
-                mfq_tensor_backend::Tensor expected;
-                {
-                    CudaExecutionContextScope scope(owner);
-                    expected = run(input.reshape({16, linear->neuron_len()}))
-                        .reshape({2, 8, 2});
-                }
+                auto expected = run(input.reshape({16, linear->neuron_len()}))
+                    .reshape({2, 8, 2});
                 const auto calls = owner.kl_mmq_activation_quantize_calls;
                 const auto dense_calls = owner.kl_mmq_dense_calls;
-                {
-                    // Explicit execution must win over an unrelated TLS scope.
-                    CudaExecutionContextScope scope(other);
-                    const auto actual = run(input);
-                    check(actual.scalar_type() == expected.scalar_type() && actual.equal(expected),
-                          "linear output followed TLS or lost its shape/dtype");
-                }
+                const auto actual = run(input);
+                check(actual.scalar_type() == expected.scalar_type() &&
+                          actual.equal(expected),
+                      "linear output lost its shape/dtype");
                 check(owner.kl_mmq_activation_quantize_calls == calls +
                           (mode == KlMmqMode::Nint8One ? 1 : 0) &&
-                      owner.kl_mmq_dense_calls == dense_calls + (mode != KlMmqMode::Default ? 1 : 0) &&
-                      other.kl_mmq_activation_quantize_calls == 0 && other.kl_mmq_dense_calls == 0,
-                      "linear diagnostics followed TLS instead of explicit execution");
-                check(current_cuda_execution_context() == nullptr && run(input).equal(expected),
-                      "linear execution requires a TLS scope");
+                      owner.kl_mmq_dense_calls == dense_calls +
+                          (mode != KlMmqMode::Default ? 1 : 0) &&
+                      other.kl_mmq_activation_quantize_calls == 0 &&
+                      other.kl_mmq_dense_calls == 0,
+                      "linear diagnostics escaped the explicit execution");
+                check(run(input).equal(expected),
+                      "linear execution changed without hidden state");
             };
             verify([&](auto x) { return linear->forward(owner, x); });
             verify([&](auto x) { return linear->forward_bf16_output(owner, x); });
@@ -251,7 +246,6 @@ int main(int argc, char** argv) try {
     check_linear_execution();
     {
         CudaExecutionContext execution;
-        CudaExecutionContextScope scope(execution);
         check_snapshots(execution, false);
         check_snapshots(execution, true);
     }

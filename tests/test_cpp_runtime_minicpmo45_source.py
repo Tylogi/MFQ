@@ -31,8 +31,9 @@ NORM = (ROOT / "mfq" / "kernels" / "cuda" / "norm.cu").read_text(
     encoding="utf-8"
 )
 GRAPH = "\n".join(
-    (CUDA_ROOT / "models" / "minicpmo45" / name).read_text(encoding="utf-8")
-    for name in ("causal_lm.h", "causal_lm.cpp")
+    path.read_text(encoding="utf-8")
+    for path in (CUDA_ROOT / "models" / "minicpmo45").glob("*")
+    if path.suffix in {".h", ".cpp"}
 )
 METAL_GRAPH = (ROOT / "cpp_runtime" / "backends" / "metal" / "models/minicpmo45" / "mlx_minicpmo45.cpp").read_text(
     encoding="utf-8"
@@ -69,7 +70,7 @@ REALTIME_GATEWAY = (
 def test_minicpmo45_uses_native_composite_graph_and_canonical_names():
     assert "models/minicpmo45/causal_lm.h" in DECODE
     assert 'const std::string embed_name = "model.token_embedding.weight"' in DECODE
-    assert 'output_norm = load_dense_gpu(source, "model.output_norm.weight")' in DECODE
+    assert 'source, "model.output_norm.weight"' in DECODE
     assert 'const std::string output_name = "model.output.weight"' in DECODE
     assert "using MiniCPMO45CausalLm = CausalLm<MiniCPMO45Model>" in DECODE
     assert "llm.model." not in DECODE
@@ -84,7 +85,7 @@ def test_minicpmo45_graph_binds_all_checkpoint_components():
         "audio.patch_embedding.conv1.weight",
         "audio.block.",
         "audio.projector.input",
-        'result.config, index, "full_attention", false, "tts"',
+        'result.config, index,\n                "full_attention", false, "tts"',
         "tts.text_embedding.weight",
         "tts.code_embedding.0.weight",
         "tts.semantic_projector.input",

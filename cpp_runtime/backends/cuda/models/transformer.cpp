@@ -271,7 +271,7 @@ mfq_tensor_backend::Tensor FFN::forward_tensor_parallel_dense(
                 gate_shard.device);
             auto local_x =
                 tensor_to_cuda_device(
-                    flat, gate_shard.device);
+                    execution, flat, gate_shard.device);
             auto gate_output =
                 run_quant_linear_shard(
                     execution, gate_shard, local_x);
@@ -309,7 +309,7 @@ mfq_tensor_backend::Tensor FFN::forward_tensor_parallel_dense(
         }
         auto output =
             reduce_model_parallel_outputs(
-                std::move(partials));
+                execution, std::move(partials));
         shape.back() = output.size(-1);
         return output.reshape(shape);
     }
@@ -365,11 +365,12 @@ mfq_tensor_backend::Tensor FFN::forward_expert_parallel_moe(
             const auto & down_shard =
                 moe_down.expert_parallel_shards[index];
             MfqCudaGuard guard(gate_shard.device);
-            auto local_x = tensor_to_cuda_device(x, gate_shard.device);
+            auto local_x = tensor_to_cuda_device(
+                execution, x, gate_shard.device);
             auto local_weights = tensor_to_cuda_device(
-                route_weights, gate_shard.device);
-            auto local_route = moe_route_to_device(
-                route, gate_shard.device);
+                execution, route_weights, gate_shard.device);
+            const auto& local_route = moe_route_to_device(
+                execution, route, gate_shard.device);
             mfq_tensor_backend::Tensor gate_up_pair;
             mfq_tensor_backend::Tensor projected_hidden;
             if (swiglu_limit <= 0.0 &&
@@ -377,10 +378,10 @@ mfq_tensor_backend::Tensor FFN::forward_expert_parallel_moe(
                     gate_shard.weight
                         ->supports_projection_glu_epilogue()) {
                 projected_hidden = gate_shard.weight->forward_glu_output(
-                    local_x, local_route, false);
+                    execution, local_x, local_route, false);
             } else {
                 gate_up_pair = gate_shard.weight->forward(
-                    local_x, local_route);
+                    execution, local_x, local_route);
             }
             mfq_tensor_backend::Tensor down_pair;
             const bool allow_fusion =
@@ -391,14 +392,14 @@ mfq_tensor_backend::Tensor FFN::forward_expert_parallel_moe(
                     static_cast<int>(gate_up_pair.size(0)));
             if (projected_hidden.defined()) {
                 down_pair = down_shard.weight->forward(
-                    projected_hidden, local_route);
+                    execution, projected_hidden, local_route);
             } else if (swiglu_limit <= 0.0 && allow_fusion) {
                 down_pair = down_shard.weight->forward_swiglu(
-                    gate_up_pair, local_route);
+                    execution, gate_up_pair, local_route);
             } else if (swiglu_limit > 0.0 && allow_fusion &&
                     down_shard.weight->supports_clamped_swiglu()) {
                 down_pair = down_shard.weight->forward_clamped_swiglu(
-                    gate_up_pair, local_route, swiglu_limit);
+                    execution, gate_up_pair, local_route, swiglu_limit);
             } else {
                 mfq_tensor_backend::Tensor hidden;
                 if (swiglu_limit <= 0.0) {
@@ -417,7 +418,7 @@ mfq_tensor_backend::Tensor FFN::forward_expert_parallel_moe(
                         .to(mfq_tensor_backend::kFloat16).contiguous();
                 }
                 down_pair = down_shard.weight->forward(
-                    hidden, local_route);
+                    execution, hidden, local_route);
             }
             if (collect_output_energy) {
                 down_partials[index] = down_pair;
@@ -429,14 +430,14 @@ mfq_tensor_backend::Tensor FFN::forward_expert_parallel_moe(
             mfq_tensor_backend::Tensor complete_down;
             if (collect_output_energy) {
                 complete_down = reduce_model_parallel_outputs(
-                    std::move(down_partials));
+                    execution, std::move(down_partials));
             }
             record_moe_route_stats(
-                moe_layer, route.ids, route_weights,
+                execution, moe_layer, route.ids, route_weights,
                 complete_down, moe_gate_up.n_experts);
         }
         return reduce_model_parallel_outputs(
-            std::move(routed_partials));
+            execution, std::move(routed_partials));
     }
 
 mfq_tensor_backend::Tensor FFN::forward_dense_f32_down_kld(
@@ -529,7 +530,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
         }
         if (is_moe) {
             const int64_t rows = xh.numel() / xh.size(-1);
-            if (moe_continuous_batch_cache_serial() &&
+            if (execution.continuous_batch_cache_serial &&
                     uses_moe_expert_cache() && rows > 1) {
                 // A bounded expert cache cannot safely admit the union of an
                 // arbitrary request batch: a miss in that union otherwise
@@ -650,7 +651,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
             }();
             auto prefetch_projection_bundle = [&]() {
                 if (disable_projection_bundle || cpu_moe_down ||
-                        moe_continuous_batch_cache_serial()) {
+                        execution.continuous_batch_cache_serial) {
                     return false;
                 }
                 if (moe_split_gate_up) {
@@ -743,7 +744,7 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                             KlMmqMode::Default &&
                         xf.size(0) <= 8 &&
                         active_gate->can_reuse_activation_for(*active_up);
-                    auto gate = active_gate->forward(xf, route);
+                    auto gate = active_gate->forward(execution, xf, route);
                     if (!projection_bundle_prefetched) {
                         active_up->prefetch(route);
                     }
@@ -758,8 +759,8 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                             });
                     }
                     auto up = reuse_gate_activation
-                        ? active_up->forward_prequantized(xf, route)
-                        : active_up->forward(xf, route);
+                        ? active_up->forward_prequantized(execution, xf, route)
+                        : active_up->forward(execution, xf, route);
                     return mfq_tensor_backend::cat({gate, up}, -1).contiguous();
                 });
             } else {
@@ -778,11 +779,12 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                     projected_hidden = profiler.measure(
                         "moe.gate_up_swiglu", [&]() {
                             return active_gate_up->forward_glu_output(
-                                xf, route, false);
+                                execution, xf, route, false);
                         });
                 } else {
                     gate_up_pair = profiler.measure("moe.gate_up", [&]() {
-                        return active_gate_up->forward(xf, route);
+                        return active_gate_up->forward(
+                            execution, xf, route);
                     });
                 }
             }
@@ -814,17 +816,19 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                     static_cast<int>(gate_up_pair.size(0)));
             if (projected_hidden.defined()) {
                 down_pair = profiler.measure("moe.down", [&]() {
-                    return active_down->forward(projected_hidden, route);
+                    return active_down->forward(
+                        execution, projected_hidden, route);
                 });
             } else if (swiglu_limit <= 0.0 && allow_swiglu_quant_fusion) {
                 down_pair = profiler.measure("moe.swiglu_down", [&]() {
-                    return active_down->forward_swiglu(gate_up_pair, route);
+                    return active_down->forward_swiglu(
+                        execution, gate_up_pair, route);
                 });
             } else if (swiglu_limit > 0.0 && allow_swiglu_quant_fusion &&
                     active_down->supports_clamped_swiglu()) {
                 down_pair = profiler.measure("moe.swiglu_down", [&]() {
                     return active_down->forward_clamped_swiglu(
-                        gate_up_pair, route, swiglu_limit);
+                        execution, gate_up_pair, route, swiglu_limit);
                 });
             } else {
                 auto hidden = profiler.measure("moe.swiglu", [&]() {
@@ -843,11 +847,11 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                         .to(mfq_tensor_backend::kFloat16).contiguous();
                 });
                 down_pair = profiler.measure("moe.down", [&]() {
-                    return active_down->forward(hidden, route);
+                    return active_down->forward(execution, hidden, route);
                 });
             }
             record_moe_route_stats(
-                moe_layer, selected.at(0), selected.at(1), down_pair,
+                execution, moe_layer, selected.at(0), selected.at(1), down_pair,
                 moe_split_gate_up ? moe_gate.n_experts : moe_gate_up.n_experts);
             staged_down.reset();
             static const bool disable_reduce_gate_fusion = [] {
@@ -1156,7 +1160,8 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                     execution.gemma_stage_trace == nullptr ||
                     layer != execution.gemma_trace_layer) return;
             auto ordered = token_axis == 1 ? value : value.transpose(1, token_axis).contiguous();
-            trace_gemma_stage(layer, name, ordered.reshape({B, T, -1}));
+            trace_gemma_stage(
+                execution, layer, name, ordered.reshape({B, T, -1}));
         };
         if (official_bf16 &&
                 x.scalar_type() != mfq_tensor_backend::kBFloat16) {
@@ -1757,7 +1762,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
             oo = oo.to(mfq_tensor_backend::kBFloat16).contiguous();
         }
         if (gemma4) {
-            trace_gemma_stage(layer, "attention_output", oo);
+            trace_gemma_stage(execution, layer, "attention_output", oo);
             const bool fused_norms = gemma4_moe &&
                 gemma4_fused_norms_enabled() &&
                 execution.gemma_stage_trace == nullptr &&
@@ -1786,7 +1791,8 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                 x = profiler.measure("gemma.attn_residual", [&]() {
                     return acc_cuda(residual.reshape({B * T, H}), attn_post).reshape({B, T, H});
                 });
-                trace_gemma_stage(layer, "attention_residual", x);
+                trace_gemma_stage(
+                    execution, layer, "attention_residual", x);
                 residual = x;
                 dense_input = profiler.measure("gemma.ffn_pre_norm", [&]() {
                     return gemma_rms_norm_f16(
@@ -1835,7 +1841,8 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                         return result * layer_scale;
                     });
                 }
-                trace_gemma_stage(layer, "layer_output", result);
+                trace_gemma_stage(
+                    execution, layer, "layer_output", result);
                 return result;
             }
             if (!fused_norms) {
@@ -1844,7 +1851,8 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                         dense_output, ffn_post_norm_1,
                         rms_norm_eps, norm_weight_offset);
                 });
-                trace_gemma_stage(layer, "dense_output", dense_output);
+                trace_gemma_stage(
+                    execution, layer, "dense_output", dense_output);
             }
             auto router_logits = profiler.measure("gemma.router", [&]() {
                 return mfq_tensor_backend::matmul(router_input, gemma_router.transpose(0, 1));
@@ -1854,13 +1862,16 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                     router_logits.contiguous(), gemma_top_k,
                     false, false, false, true, mfq_nullopt, 1e-20, 1.0);
             });
-            trace_gemma_stage(layer, "route_ids", selected.at(0));
-            trace_gemma_stage(layer, "route_weights_before_scale", selected.at(1));
+            trace_gemma_stage(
+                execution, layer, "route_ids", selected.at(0));
+            trace_gemma_stage(
+                execution, layer, "route_weights_before_scale", selected.at(1));
             profiler.measure("gemma.route_scale", [&]() {
                 return moe_apply_expert_scale_cuda(
                     selected.at(1), selected.at(0), gemma_expert_scale);
             });
-            trace_gemma_stage(layer, "route_weights", selected.at(1));
+            trace_gemma_stage(
+                execution, layer, "route_weights", selected.at(1));
             auto route = profiler.measure("gemma.route_map", [&]() {
                 return build_moe_route_plan(selected.at(0), gemma_moe_gate_up.n_experts);
             });
@@ -1875,41 +1886,50 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                     gemma_moe_gate_up
                         .supports_projection_glu_epilogue()) {
                 auto moe_hidden = profiler.measure("gemma.moe_gate_up_geglu", [&]() {
-                    return gemma_moe_gate_up.forward_glu_output(moe_input, route, true);
+                    return gemma_moe_gate_up.forward_glu_output(
+                        execution, moe_input, route, true);
                 });
                 if (!projection_bundle_prefetched) {
                     gemma_moe_down.prefetch(route);
                 }
                 down_pair = profiler.measure("gemma.moe_down", [&]() {
-                    return gemma_moe_down.forward(moe_hidden, route);
+                    return gemma_moe_down.forward(
+                        execution, moe_hidden, route);
                 });
             } else {
                 auto gate_up_pair = profiler.measure("gemma.moe_gate_up", [&]() {
-                    return gemma_moe_gate_up.forward(moe_input, route);
+                    return gemma_moe_gate_up.forward(
+                        execution, moe_input, route);
                 });
                 if (!projection_bundle_prefetched) {
                     gemma_moe_down.prefetch(route);
                 }
-                trace_gemma_stage(layer, "moe_gate_up", gate_up_pair);
+                trace_gemma_stage(
+                    execution, layer, "moe_gate_up", gate_up_pair);
                 if (tracing_layer || gate_up_pair.size(0) > 4) {
                     auto moe_hidden = profiler.measure("gemma.moe_geglu", [&]() {
                         return moe_geglu_split_cuda(gate_up_pair);
                     });
-                    if (tracing_layer) trace_gemma_stage(layer, "moe_hidden", moe_hidden);
+                    if (tracing_layer) {
+                        trace_gemma_stage(
+                            execution, layer, "moe_hidden", moe_hidden);
+                    }
                     down_pair = profiler.measure("gemma.moe_down", [&]() {
-                        return gemma_moe_down.forward(moe_hidden, route);
+                        return gemma_moe_down.forward(
+                            execution, moe_hidden, route);
                     });
                 } else {
                     down_pair = profiler.measure("gemma.moe_geglu_down", [&]() {
-                        return gemma_moe_down.forward_geglu(gate_up_pair, route);
+                        return gemma_moe_down.forward_geglu(
+                            execution, gate_up_pair, route);
                     });
                 }
             }
-            trace_gemma_stage(layer, "moe_down", down_pair);
+            trace_gemma_stage(execution, layer, "moe_down", down_pair);
             auto moe_output = profiler.measure("gemma.moe_reduce", [&]() {
                 return moe_weighted_reduce_cuda(down_pair, selected.at(1));
             });
-            trace_gemma_stage(layer, "moe_reduce", moe_output);
+            trace_gemma_stage(execution, layer, "moe_reduce", moe_output);
             if (fused_norms) {
                 auto result = profiler.measure("gemma.ffn_merge", [&]() {
                     return gemma4_ffn_merge_f16_cuda(
@@ -1940,7 +1960,8 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                     return result * layer_scale;
                 });
             }
-            trace_gemma_stage(layer, "layer_output", result);
+            trace_gemma_stage(
+                execution, layer, "layer_output", result);
             return result;
         }
         auto attn_pair = profiler.measure("full.attn_residual_ffn_norm", [&]() {
@@ -2131,8 +2152,10 @@ mfq_tensor_backend::Tensor gemma_rms_norm_f16(
         x.contiguous(), weight, eps, weight_offset);
 }
 
-void prepare_ffn_workspaces(FFN & f) {
-    if (cuda_execution_context().loading_cpu_layer) return;
+void prepare_ffn_workspaces(
+        CudaExecutionContext& execution,
+        FFN& f) {
+    if (execution.loading_cpu_layer) return;
     if (f.down.tensor_parallel()) return;
     if (f.gate_up.nvq_prefix2 && f.gate_up.layers.size() == 2 && f.down.is_nvq() &&
         f.gate_up.outs.size() == 2 && f.gate_up.outs[0] == f.gate_up.outs[1] &&
@@ -2143,11 +2166,12 @@ void prepare_ffn_workspaces(FFN & f) {
         (void)f.down.nvq.workspace(1);
     }
     if (f.important_neurons) {
-        prepare_ffn_workspaces(*f.important_neurons);
+        prepare_ffn_workspaces(execution, *f.important_neurons);
     }
 }
 
 void load_important_neuron_branch(
+        CudaExecutionContext& execution,
         const mfq::ModelSource & mfq,
         int64_t hidden_size,
         int64_t intermediate_size,
@@ -2174,10 +2198,8 @@ void load_important_neuron_branch(
     }
 
     auto high = std::make_unique<FFN>();
-    high->down = load_quant_linear(
-        mfq, down_high, TensorParallelAxis::Input);
-    high->gate_up = load_paired_gate_up(
-        mfq, {gate_high, up_high}, high->down);
+    high->down = load_quant_linear(execution, mfq, down_high, TensorParallelAxis::Input);
+    high->gate_up = load_paired_gate_up(execution, mfq, {gate_high, up_high}, high->down);
     high->geglu = f.geglu;
     high->swiglu_limit = f.swiglu_limit;
 
@@ -2198,6 +2220,7 @@ void load_important_neuron_branch(
 }
 
 std::unique_ptr<Block> load_transformer_block(
+        CudaExecutionContext& execution,
         const mfq::ModelSource& source,
         const mfq::models::ModelConfig& config,
         int layer,
@@ -2220,30 +2243,27 @@ std::unique_ptr<Block> load_transformer_block(
     block->rms_norm_eps = config.rms_norm_eps;
     block->norm_weight_offset = minicpmo45 ? 0.0 : 1.0;
     block->official_bf16 = minicpmo45;
-    block->attn_norm = load_dense_gpu(
-        source, prefix + "attention.norm.weight");
-    block->ffn_norm = load_dense_gpu(
-        source, prefix + "mlp.norm.weight");
+    block->attn_norm = load_dense_gpu(execution, source, prefix + "attention.norm.weight");
+    block->ffn_norm = load_dense_gpu(execution, source, prefix + "mlp.norm.weight");
     const std::string attention = prefix + "attention.";
-    block->qkv = load_quant_group(source, {
+    block->qkv = load_quant_group(execution, source, {
         attention + "query.weight",
         attention + "key.weight",
         attention + "value.weight"}, 2, nullptr, minicpmo45);
-    block->o = load_quant_linear(source, attention + "output.weight");
+    block->o = load_quant_linear(execution, source, attention + "output.weight");
     if (has_tensor(source, attention + "query_norm.weight")) {
-        block->q_norm = load_dense_gpu(
-            source, attention + "query_norm.weight");
+        block->q_norm = load_dense_gpu(execution, source, attention + "query_norm.weight");
     }
     if (has_tensor(source, attention + "key_norm.weight")) {
-        block->k_norm = load_dense_gpu(
-            source, attention + "key_norm.weight");
+        block->k_norm = load_dense_gpu(execution, source, attention + "key_norm.weight");
     }
     block->ffn = load_ffn(
-        source, config, layer, minicpmo45, tensor_root);
+        execution, source, config, layer, minicpmo45, tensor_root);
     return block;
 }
 
 FFN load_ffn(
+        CudaExecutionContext& execution,
         const mfq::ModelSource& source,
         const mfq::models::ModelConfig& config,
         int layer,
@@ -2256,12 +2276,11 @@ FFN load_ffn(
     const std::string down = prefix + "down.weight";
     const std::string gate = prefix + "gate.weight";
     const std::string up = prefix + "up.weight";
-    ffn.down = load_quant_linear(source, down);
-    ffn.gate_up = load_paired_gate_up(
-        source, {gate, up}, ffn.down, 2, minicpmo45);
+    ffn.down = load_quant_linear(execution, source, down);
+    ffn.gate_up = load_paired_gate_up(execution, source, {gate, up}, ffn.down, 2, minicpmo45);
     load_important_neuron_branch(
-        source, config.hidden_size, config.intermediate_size,
+        execution, source, config.hidden_size, config.intermediate_size,
         ffn, down, gate, up);
-    prepare_ffn_workspaces(ffn);
+    prepare_ffn_workspaces(execution, ffn);
     return ffn;
 }

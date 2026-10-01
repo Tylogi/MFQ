@@ -16,6 +16,8 @@
 #include <optional>
 
 struct CudaExecutionContext;
+struct DecodeGraphCache;
+namespace mfq::cuda::internal { class TextSessionCache; }
 
 template <typename Model>
 struct RuntimeComponents {
@@ -51,8 +53,10 @@ make_cuda_continuous_batching(
     Model& model,
     CudaExecutionContext& execution,
     std::mutex& model_mutex,
-    const mfq::cuda::CudaContinuousBatchConfig& config,
-    mfq::engine::GenerationConfig generation);
+    DecodeGraphCache& decode_graph,
+    mfq::cuda::internal::TextSessionCache& session_cache,
+    RuntimeComponents<Model>& components,
+    const mfq::cuda::CudaRuntimeConfig& config);
 
 template <>
 RuntimeComponents<mfq::cuda::Qwen35CausalLm>
@@ -84,8 +88,10 @@ make_cuda_continuous_batching(
     mfq::cuda::Qwen35CausalLm& model,
     CudaExecutionContext& execution,
     std::mutex& model_mutex,
-    const mfq::cuda::CudaContinuousBatchConfig& config,
-    mfq::engine::GenerationConfig generation);
+    DecodeGraphCache& decode_graph,
+    mfq::cuda::internal::TextSessionCache& session_cache,
+    RuntimeComponents<mfq::cuda::Qwen35CausalLm>& components,
+    const mfq::cuda::CudaRuntimeConfig& config);
 
 template <>
 RuntimeComponents<mfq::cuda::MiniCPMO45CausalLm>

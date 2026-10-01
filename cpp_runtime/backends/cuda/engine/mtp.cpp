@@ -157,7 +157,9 @@ int32_t run_mtp_generation(
         },
         &model.rope,
     };
-    if (session_last_hidden != nullptr) *session_last_hidden = {};
+    if (session_last_hidden != nullptr) {
+        *session_last_hidden = Tensor();
+    }
     if (cancelled && cancelled()) {
         throw mfq::engine::InferenceCancelled{};
     }
@@ -867,7 +869,9 @@ int32_t run_mtp_generation(
     } catch (...) {
         // A failed partial pass must never become the next request's history.
         try { model.reset(1); mtp.reset(1); } catch (...) {}
-        if (session_last_hidden != nullptr) *session_last_hidden = {};
+        if (session_last_hidden != nullptr) {
+            *session_last_hidden = Tensor();
+        }
         throw;
     }
 }

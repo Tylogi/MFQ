@@ -42,7 +42,7 @@ def test_grid_vision_policies_are_owned_by_core() -> None:
 
 
 def test_cuda_grid_vision_uses_existing_primitives_and_canonical_names() -> None:
-    assert "load_quant_linear(model, weight_name)" in CUDA
+    assert "load_quant_linear(execution, model, weight_name)" in CUDA
     assert "mfq_tensor_backend::layer_norm(" in CUDA
     assert "attention_cuda(" in CUDA
     assert "Tensor gelu_tanh(" in CUDA

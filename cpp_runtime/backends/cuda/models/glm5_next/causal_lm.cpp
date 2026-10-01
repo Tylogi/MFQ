@@ -6,10 +6,12 @@
 namespace mfq::cuda::glm5_next {
 
 std::unique_ptr<::Block> load_block(
+        CudaExecutionContext& execution,
         const mfq::ModelSource& source,
         const mfq::models::glm5_next::Config& config,
         int layer) {
-    return std::make_unique<Glm5NextBlock>(source, config, layer);
+    return std::make_unique<Glm5NextBlock>(
+        execution, source, config, layer);
 }
 
 Tensor finalize_hidden(
@@ -56,7 +58,8 @@ Glm5Model::adapter_load_block(
         int layer,
         int,
         const std::string&) {
-    return glm5_next::load_block(source, config, layer);
+    return glm5_next::load_block(
+        *execution, source, config, layer);
 }
 
 void Glm5Model::adapter_validate_forward(

@@ -153,7 +153,10 @@ def test_mfe_nint_projection_fuses_glu_in_the_unified_kernel():
     assert "FragmentC accumulators[projections]" in NINT
     assert "constexpr int projections = FusedGlu ? 2 : 1;" in NINT
     assert "row * result_rows" in NINT
-    assert "return forward_impl(x, route, false, gelu ? 2 : 1);" in RUNTIME
+    assert (
+        "return forward_impl(execution, x, route, false, gelu ? 2 : 1);"
+        in RUNTIME
+    )
     assert "supports_projection_glu_epilogue()" in RUNTIME
     assert '"moe.gate_up_swiglu"' in RUNTIME
 

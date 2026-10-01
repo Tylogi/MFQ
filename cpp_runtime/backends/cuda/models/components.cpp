@@ -23,8 +23,10 @@ make_cuda_continuous_batching(
         Model&,
         CudaExecutionContext&,
         std::mutex&,
-        const mfq::cuda::CudaContinuousBatchConfig&,
-        mfq::engine::GenerationConfig) {
+        DecodeGraphCache&,
+        mfq::cuda::internal::TextSessionCache&,
+        RuntimeComponents<Model>&,
+        const mfq::cuda::CudaRuntimeConfig&) {
     return {};
 }
 
@@ -38,9 +40,9 @@ MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::DeepseekV4CausalLm);
 #define MFQ_INSTANTIATE_BATCHING(TYPE)                                      \
     template std::unique_ptr<mfq::engine::ContinuousBatching>               \
     make_cuda_continuous_batching(                                          \
-        TYPE&, CudaExecutionContext&, std::mutex&,                          \
-        const mfq::cuda::CudaContinuousBatchConfig&,                        \
-        mfq::engine::GenerationConfig)
+        TYPE&, CudaExecutionContext&, std::mutex&, DecodeGraphCache&,       \
+        mfq::cuda::internal::TextSessionCache&, RuntimeComponents<TYPE>&,    \
+        const mfq::cuda::CudaRuntimeConfig&)
 
 MFQ_INSTANTIATE_BATCHING(mfq::cuda::MiniCPMO45CausalLm);
 MFQ_INSTANTIATE_BATCHING(mfq::cuda::MiniCPMOTtsCausalLm);

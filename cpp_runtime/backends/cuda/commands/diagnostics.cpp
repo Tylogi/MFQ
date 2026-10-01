@@ -94,6 +94,7 @@ struct DiagnosticsCommandOptions : CudaLoadOptions, TokenInputOptions {
     bool check_text_session_state = false;
     bool check_qwen35_mtp = false;
     bool check_continuous_batching = false;
+    bool check_engine_isolation = false;
     bool check_flash_next = false;
     bool check_flash_next_mtp = false;
     bool compare_dsv4_hc_ops = false;
@@ -117,8 +118,13 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
     explicit DiagnosticsCommand(mfq::cuda::DiagnosticsCommandOptions options)
         : mfq::cuda::DiagnosticsCommandOptions(std::move(options)) {}
     int run() { return with_command_errors([&]() -> int {
+        if (check_engine_isolation) {
+            mfq::cuda::CudaEngineOptions options;
+            static_cast<mfq::cuda::CudaLoadOptions&>(options) =
+                static_cast<const mfq::cuda::CudaLoadOptions&>(*this);
+            return run_cuda_engine_isolation_check(std::move(options));
+        }
         CudaExecutionContext execution;
-        CudaExecutionContextScope context_scope(execution);
         // Operator-only checks do not require loading a model.
         if (check_backend_bf16_add) return run_backend_bf16_add_check(4096, 10000);
         if (check_backend_argmax) return run_backend_argmax_check(151748, 2000);
@@ -187,7 +193,8 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             if (model_path.empty()) {
                 throw std::runtime_error("--check-q8-embedding requires --model");
             }
-            return run_q8_embedding_check(model_path, check_q8_embedding);
+            return run_q8_embedding_check(
+                execution, model_path, check_q8_embedding);
         }
         if (!check_gdn_input.empty()) {
             if (check_gdn_output.empty() || check_gdn_state.empty()) {
@@ -300,7 +307,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 parse_kl_mmq_mode(kl_mmq_arg), execution);
             const auto tensor_names =
                 parse_tensor_names(check_mfe_tensor);
-            if (moe_expert_cache() &&
+            if (execution.moe_expert_cache &&
                     tensor_names.size() != 1) {
                 throw std::runtime_error(
                     "cached --check-mfe-tensor accepts one tensor "
@@ -308,7 +315,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             }
             for (const auto & tensor_name : tensor_names) {
                 const int result = run_mfe_tensor_check(
-                    model_path, tensor_name, check_mfe_tokens,
+                    execution, model_path, tensor_name, check_mfe_tokens,
                     check_mfe_routes, check_mfe_reps,
                     check_mfe_split_width, check_mfe_routed_input,
                     check_mfe_benchmark_only);
@@ -484,8 +491,9 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
         if (!prefill_sweep_sizes.empty()) {
             const int status = run_prefill_sweep(
                 model, prefill_sweep_sizes, prefill_sweep_reps);
-            if (moe_expert_cache()) {
-                print_moe_expert_cache_stats(std::cout);
+            if (execution.moe_expert_cache) {
+                print_moe_expert_cache_stats(
+                    execution.moe_expert_cache, std::cout);
             }
             return status;
         }
@@ -785,6 +793,7 @@ void print_diagnostics_help() {
         << "  --check-flash-next              check Flash-Next\n"
         << "  --check-flash-next-mtp          check Flash-Next MTP\n"
         << "  --check-continuous-batching     check continuous batching\n"
+        << "  --check-engine-isolation        check two concurrent CUDA engines\n"
         << "  --check-backend-bf16-add        check backend BF16 add\n"
         << "  --check-backend-argmax          check backend argmax\n"
         << "  --check-runtime-assets          validate embedded assets\n"
@@ -830,6 +839,7 @@ bool has_diagnostic_action(const DiagnosticsCommandOptions& value) {
         value.check_dsv4_attention || value.check_dsv4_hc ||
         value.check_deepseek_v41 || value.check_text_session_state ||
         value.check_qwen35_mtp || value.check_continuous_batching ||
+        value.check_engine_isolation ||
         value.check_flash_next || value.check_flash_next_mtp ||
         value.check_runtime_assets || value.check_mfq_container ||
         value.compare_dsv4_hc_ops || value.compare_dsv4_hc_model ||
@@ -951,6 +961,7 @@ DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
         }
         else if (option == "--prefill-sweep-reps") result.prefill_sweep_reps = integer<int>(args.value(option), option);
         else if (option == "--check-continuous-batching") result.check_continuous_batching = true;
+        else if (option == "--check-engine-isolation") result.check_engine_isolation = true;
         else if (option == "--check-runtime-assets") result.check_runtime_assets = true;
         else if (option == "--check-mfq-container") result.check_mfq_container = true;
         else if (option == "--check-tokenizer-text") result.check_tokenizer_text = args.value(option);

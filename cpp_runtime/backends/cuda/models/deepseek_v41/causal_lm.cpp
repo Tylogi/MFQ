@@ -6,6 +6,7 @@
 namespace mfq::cuda::deepseek_v41_runtime {
 
 std::unique_ptr<::Block> load_block(
+    CudaExecutionContext& execution,
     const mfq::ModelSource& model,
     std::int64_t layer,
     const std::shared_ptr<SharedState>& shared) {
@@ -21,75 +22,75 @@ std::unique_ptr<::Block> load_block(
     result->shared = shared;
     if (config.has_engram(layer)) {
         result->engram = Engram::load(
-            model, config, static_cast<int>(layer));
+            execution, model, config, static_cast<int>(layer));
     }
-    result->attention_norm = load_dense_gpu(
+    result->attention_norm = load_dense_gpu(execution,
         model, prefix + "attention.norm.weight");
-    result->mlp_norm = load_dense_gpu(
+    result->mlp_norm = load_dense_gpu(execution,
         model, prefix + "mlp.norm.weight");
-    result->query_a_norm = load_dense_gpu(
+    result->query_a_norm = load_dense_gpu(execution,
         model, prefix + "attention.query_a_norm.weight");
-    result->key_value_norm = load_dense_gpu(
+    result->key_value_norm = load_dense_gpu(execution,
         model, prefix + "attention.key_value_norm.weight");
-    result->sinks = load_dense_gpu(
+    result->sinks = load_dense_gpu(execution,
         model, prefix + "attention.sink")
                             .to(mfq_tensor_backend::kFloat32)
                             .contiguous();
-    result->attention_mhc_function = load_dense_gpu(
+    result->attention_mhc_function = load_dense_gpu(execution,
         model, prefix + "attention.mhc.pre.function")
                                          .to(mfq_tensor_backend::kFloat32)
                                          .contiguous();
-    result->attention_mhc_scale = load_dense_gpu(
+    result->attention_mhc_scale = load_dense_gpu(execution,
         model, prefix + "attention.mhc.pre.scale")
                                       .to(mfq_tensor_backend::kFloat32)
                                       .contiguous();
-    result->attention_mhc_base = load_dense_gpu(
+    result->attention_mhc_base = load_dense_gpu(execution,
         model, prefix + "attention.mhc.pre.base")
                                      .to(mfq_tensor_backend::kFloat32)
                                      .contiguous();
-    result->mlp_mhc_function = load_dense_gpu(
+    result->mlp_mhc_function = load_dense_gpu(execution,
         model, prefix + "mlp.mhc.pre.function")
                                    .to(mfq_tensor_backend::kFloat32)
                                    .contiguous();
-    result->mlp_mhc_scale = load_dense_gpu(
+    result->mlp_mhc_scale = load_dense_gpu(execution,
         model, prefix + "mlp.mhc.pre.scale")
                                 .to(mfq_tensor_backend::kFloat32)
                                 .contiguous();
-    result->mlp_mhc_base = load_dense_gpu(
+    result->mlp_mhc_base = load_dense_gpu(execution,
         model, prefix + "mlp.mhc.pre.base")
                                .to(mfq_tensor_backend::kFloat32)
                                .contiguous();
-    result->query_a = load_quant_linear(
+    result->query_a = load_quant_linear(execution,
         model, prefix + "attention.query_a.weight");
-    result->query_b = load_quant_linear(
+    result->query_b = load_quant_linear(execution,
         model, prefix + "attention.query_b.weight");
-    result->key_value = load_quant_linear(
+    result->key_value = load_quant_linear(execution,
         model, prefix + "attention.key_value.weight");
-    result->output_a = load_quant_linear(
+    result->output_a = load_quant_linear(execution,
         model, prefix + "attention.output_a.weight");
-    result->output_b = load_quant_linear(
+    result->output_b = load_quant_linear(execution,
         model, prefix + "attention.output_b.weight");
     if (result->kv_source()) {
-        result->compressor_key_value = load_quant_linear(
+        result->compressor_key_value = load_quant_linear(execution,
             model, prefix + "attention.compressor.key_value.weight");
-        result->compressor_norm = load_dense_gpu(
+        result->compressor_norm = load_dense_gpu(execution,
             model, prefix + "attention.compressor.norm.weight");
-        result->index_key = load_quant_linear(
+        result->index_key = load_quant_linear(execution,
             model, prefix + "attention.indexer.key.weight");
-        result->index_key_norm = load_dense_gpu(
+        result->index_key_norm = load_dense_gpu(execution,
             model, prefix + "attention.indexer.key_norm.weight");
         if (result->ratio > 1) {
-            result->compressor_gate = load_quant_linear(
+            result->compressor_gate = load_quant_linear(execution,
                 model, prefix + "attention.compressor.gate.weight");
         }
     }
     if (result->index_source()) {
-        result->index_query = load_quant_linear(
+        result->index_query = load_quant_linear(execution,
             model, prefix + "attention.indexer.query.weight");
-        result->index_score = load_quant_linear(
+        result->index_score = load_quant_linear(execution,
             model, prefix + "attention.indexer.score.weight");
     }
-    result->mlp = load_moe(model, config, layer);
+    result->mlp = load_moe(execution, model, config, layer);
     result->rope = Dsv4RopeTable(
         config.max_position_embeddings,
         config.rope_theta,
@@ -247,7 +248,8 @@ DeepseekV41Model::adapter_load_block(
     MFQ_RUNTIME_CHECK(
         type == "deepseek_v41" && shared,
         "invalid DeepSeek-V4.1 block loader state");
-    return deepseek_v41_runtime::load_block(source, layer, shared);
+    return deepseek_v41_runtime::load_block(
+        *execution, source, layer, shared);
 }
 
 void DeepseekV41Model::adapter_validate_forward(

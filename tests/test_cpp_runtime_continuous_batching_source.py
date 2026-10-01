@@ -54,7 +54,8 @@ def test_continuous_batching_is_an_explicit_server_mode():
     assert "worker_" not in BATCHING
     assert "queue_" not in BATCHING
     assert "queue_mutex_" not in BATCHING
-    assert "decode=target_only mtp=disabled" in DECODE
+    assert "special_requests=exclusive" in DECODE
+    assert "run_exclusive_generation" in BATCHING
 
 
 def test_cuda_server_prefill_is_bounded_for_serial_mtp_and_batched_paths():
@@ -75,7 +76,8 @@ def test_cuda_server_prefill_is_bounded_for_serial_mtp_and_batched_paths():
 def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
     assert "take_qwen_batch_state" in BATCHING
     assert "restore_qwen_batch_states" in BATCHING
-    assert "compact_qwen_batch_state" in BATCHING
+    assert "make_qwen_slot_state" in BATCHING
+    assert "copy_qwen_state_to_slot" in BATCHING
     assert "mfq::cuda::sample_logits" in BATCHING
     assert "request->sampler" in BATCHING
     assert "request->token_constraint" in BATCHING
@@ -91,9 +93,9 @@ def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
     assert "config_.greedy" in BATCHING
     assert "continuous_batching_batched_greedy_batches" in BATCHING
     assert "sample_greedy_cuda(" in BATCHING
-    assert "MFQ_CONTINUOUS_BATCH_PACKED_METADATA" in RUNTIME_OPTIONS
-    assert "config_.packed_metadata" in BATCHING
+    assert "MFQ_CONTINUOUS_BATCH_PACKED_METADATA" not in RUNTIME_OPTIONS
     assert "continuous_batching_packed_metadata_batches" in BATCHING
+    assert "continuous_batching_stable_slot_releases" in BATCHING
     assert "ensure_decode_metadata_buffers" in BATCHING
     assert "MFQ_CONTINUOUS_BATCH_CUDA_GRAPH" in RUNTIME_OPTIONS
     assert "QwenContinuousDecodeGraph" in BATCHING
@@ -111,11 +113,11 @@ def test_scheduler_supports_resident_and_cached_qwen_moe():
     assert "qwen_continuous_batch_has_cached_moe" in BATCHING
     assert "uses_moe_expert_cache()" in DECODE
     assert "MoeContinuousBatchCacheScope moe_cache_scope" in BATCHING
-    assert "moe_continuous_batch_cache_serial()" in DECODE
+    assert "execution.continuous_batch_cache_serial" in DECODE
     assert "each routed FFN row independently" in DECODE
     assert (
         "cpu_moe_down ||\n"
-        "                        moe_continuous_batch_cache_serial()"
+        "                        execution.continuous_batch_cache_serial"
         in DECODE
     )
 
@@ -164,7 +166,8 @@ def test_real_weight_gate_exercises_join_and_compaction():
     assert "a blocked response callback stalled the scheduler" in BATCHING
     assert "cancellation_produced == 1" in BATCHING
     assert 'metric("continuous_batching_max_batch") >= 2.0' in BATCHING
-    assert 'metric("continuous_batching_compactions") >= 1.0' in BATCHING
+    assert 'metric("continuous_batching_compactions") == 0.0' in BATCHING
+    assert 'metric("continuous_batching_stable_slot_releases") >= 1.0' in BATCHING
     assert "std::vector<int64_t> first_prompt(193)" in BATCHING
     assert '" prompt_lengths=193,17 split_k=1"' in BATCHING
 

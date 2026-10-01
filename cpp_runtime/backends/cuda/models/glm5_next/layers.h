@@ -5,13 +5,13 @@
 
 namespace mfq::cuda::glm5_next {
 
-inline Linear glm_ffn(const mfq::ModelSource& file,const mfq::models::glm5_next::Config& c,int i,const std::string& root="model") {
+inline Linear glm_ffn(CudaExecutionContext& execution, const mfq::ModelSource& file,const mfq::models::glm5_next::Config& c,int i,const std::string& root="model") {
     const auto p=root+".block."+std::to_string(i)+".mlp";
-    if (root=="model" && c.mlp_types.at(i)=="dense") return dense_ffn(file,p,c.swiglu_limit);
-    auto gate_up=routed_gate_up(file,p,i,c.experts,c.moe_intermediate,c.hidden);
-    auto down=routed(file,p+".experts.down.weight",i,c.experts,c.hidden,c.moe_intermediate);
-    auto router=linear(file,p+".router.weight"),shared=dense_ffn(file,p+".shared_expert",c.swiglu_limit);
-    auto bias=dense(file,p+".router.bias").to(tb::kFloat32).contiguous();
+    if (root=="model" && c.mlp_types.at(i)=="dense") return dense_ffn(execution,file,p,c.swiglu_limit);
+    auto gate_up=routed_gate_up(execution,file,p,i,c.experts,c.moe_intermediate,c.hidden);
+    auto down=routed(execution,file,p+".experts.down.weight",i,c.experts,c.hidden,c.moe_intermediate);
+    auto router=linear(execution,file,p+".router.weight"),shared=dense_ffn(execution,file,p+".shared_expert",c.swiglu_limit);
+    auto bias=dense(execution,file,p+".router.bias").to(tb::kFloat32).contiguous();
     return [gate_up,down,router,shared,bias,c](
             CudaExecutionContext& execution, const Tensor& x) {
         auto source=x.reshape({-1,c.hidden}).to(tb::kFloat16);
@@ -19,10 +19,10 @@ inline Linear glm_ffn(const mfq::ModelSource& file,const mfq::models::glm5_next:
             router(execution,source.to(tb::kFloat32))
                 .to(tb::kFloat32).contiguous(),
             c.topk,true,false,c.normalize_routes,false,bias,1e-20,c.router_scale);
-        auto gu=gate_up(source,selected[0]);
+        auto gu=gate_up(execution,source,selected[0]);
         auto gate=tb::clamp_max(gu.narrow(-1,0,c.moe_intermediate),c.swiglu_limit);
         auto up=tb::clamp(gu.narrow(-1,c.moe_intermediate,c.moe_intermediate),-c.swiglu_limit,c.swiglu_limit);
-        auto pairs=down((gate*tb::sigmoid(gate))*up,selected[0]);
+        auto pairs=down(execution,(gate*tb::sigmoid(gate))*up,selected[0]);
         auto reduced=tb::zeros({source.size(0),c.hidden},source.options().dtype(tb::kFloat32));
         for (int64_t r=0;r<c.topk;++r)
             reduced=reduced+pairs.select(1,r).to(tb::kFloat32)*selected[1].select(1,r).unsqueeze(-1);
@@ -33,8 +33,8 @@ inline Linear glm_ffn(const mfq::ModelSource& file,const mfq::models::glm5_next:
 
 struct Mhc {
     Tensor function,base,scale;
-    explicit Mhc(const mfq::ModelSource& file,const std::string& p)
-        : function(dense(file,p+".function")),base(dense(file,p+".base")),scale(dense(file,p+".scale")) {}
+    Mhc(CudaExecutionContext& execution, const mfq::ModelSource& file,const std::string& p)
+        : function(dense(execution,file,p+".function")),base(dense(execution,file,p+".base")),scale(dense(execution,file,p+".scale")) {}
     std::vector<Tensor> pre(const Tensor& x,const mfq::models::glm5_next::Config& c) const {
         return mfq_glm5_next::mhc_pre(x,function,base,scale,c.sinkhorn,c.hc_eps,c.eps);
     }
@@ -49,31 +49,31 @@ struct Glm5NextBlock final : Block {
     std::unique_ptr<Kda> kda;
     std::unique_ptr<SparseMla> mla;
 
-    Glm5NextBlock(const mfq::ModelSource& file,const mfq::models::glm5_next::Config& c,int i)
-        : config(c),attention_hc(file,"model.block."+std::to_string(i)+".attention.mhc.pre"),
-          ffn_hc(file,"model.block."+std::to_string(i)+".mlp.mhc.pre") {
+    Glm5NextBlock(CudaExecutionContext& execution, const mfq::ModelSource& file,const mfq::models::glm5_next::Config& c,int i)
+        : config(c),attention_hc(execution,file,"model.block."+std::to_string(i)+".attention.mhc.pre"),
+          ffn_hc(execution,file,"model.block."+std::to_string(i)+".mlp.mhc.pre") {
         const auto p="model.block."+std::to_string(i);
-        attention_norm=dense(file,p+".attention.norm.weight"); ffn_norm=dense(file,p+".mlp.norm.weight");
-        ffn=glm_ffn(file,c,i);
+        attention_norm=dense(execution,file,p+".attention.norm.weight"); ffn_norm=dense(execution,file,p+".mlp.norm.weight");
+        ffn=glm_ffn(execution,file,c,i);
         if (c.layer_types.at(i)=="linear_attention") {
             const auto a=p+".linear_attention";
-            KdaWeights w{linear(file,a+".query.weight"),linear(file,a+".key.weight"),
-                linear(file,a+".value.weight"),linear(file,a+".beta.weight"),linear(file,a+".gate_a.weight"),
-                linear(file,a+".gate_b.weight"),linear(file,a+".output.weight"),
-                tb::cat({dense(file,a+".query_conv.weight"),dense(file,a+".key_conv.weight"),dense(file,a+".value_conv.weight")},0),
-                dense(file,a+".forget_a.weight"),dense(file,a+".forget_b.weight"),dense(file,a+".dt_bias"),
-                dense(file,a+".a"),dense(file,a+".output_norm.weight")};
+            KdaWeights w{linear(execution,file,a+".query.weight"),linear(execution,file,a+".key.weight"),
+                linear(execution,file,a+".value.weight"),linear(execution,file,a+".beta.weight"),linear(execution,file,a+".gate_a.weight"),
+                linear(execution,file,a+".gate_b.weight"),linear(execution,file,a+".output.weight"),
+                tb::cat({dense(execution,file,a+".query_conv.weight"),dense(execution,file,a+".key_conv.weight"),dense(execution,file,a+".value_conv.weight")},0),
+                dense(execution,file,a+".forget_a.weight"),dense(execution,file,a+".forget_b.weight"),dense(execution,file,a+".dt_bias"),
+                dense(execution,file,a+".a"),dense(execution,file,a+".output_norm.weight")};
             kda=std::make_unique<Kda>(std::move(w),c.kda_heads,c.kda_width,c.kda_kernel,c.lower_bound,c.eps);
         } else {
             const auto a=p+".attention";
-            MlaWeights w{linear(file,a+".query_a.weight"),linear(file,a+".key_value_a.weight"),
-                linear(file,a+".query_b.weight"),linear(file,a+".output.weight"),linear(file,a+".indexer.query.weight"),
-                linear(file,a+".indexer.key.weight"),linear(file,a+".indexer.score.weight"),
-                headwise(routed(file,a+".latent.query_embedding.weight",i,c.heads,c.latent,c.nope),c.heads,c.latent),
-                headwise(routed(file,a+".latent.output_unembedding.weight",i,c.heads,c.value_width,c.latent),c.heads,c.value_width),
-                dense(file,a+".query_a_norm.weight"),dense(file,a+".key_value_a_norm.weight"),
-                dense(file,a+".indexer.key_norm.weight"),dense(file,a+".indexer.key_norm.bias"),
-                dense(file,a+".indexer.pool.gate"),dense(file,a+".indexer.pool.position")};
+            MlaWeights w{linear(execution,file,a+".query_a.weight"),linear(execution,file,a+".key_value_a.weight"),
+                linear(execution,file,a+".query_b.weight"),linear(execution,file,a+".output.weight"),linear(execution,file,a+".indexer.query.weight"),
+                linear(execution,file,a+".indexer.key.weight"),linear(execution,file,a+".indexer.score.weight"),
+                headwise(routed(execution,file,a+".latent.query_embedding.weight",i,c.heads,c.latent,c.nope),c.heads,c.latent),
+                headwise(routed(execution,file,a+".latent.output_unembedding.weight",i,c.heads,c.value_width,c.latent),c.heads,c.value_width),
+                dense(execution,file,a+".query_a_norm.weight"),dense(execution,file,a+".key_value_a_norm.weight"),
+                dense(execution,file,a+".indexer.key_norm.weight"),dense(execution,file,a+".indexer.key_norm.bias"),
+                dense(execution,file,a+".indexer.pool.gate"),dense(execution,file,a+".indexer.pool.position")};
             MlaConfig mc{c.heads,c.nope,c.latent,c.value_width,c.index_heads,c.index_width,c.pool,c.budget,c.maximum,c.tail,c.eps};
             mla=std::make_unique<SparseMla>(std::move(w),mc);
         }

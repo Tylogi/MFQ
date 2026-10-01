@@ -83,7 +83,7 @@ def test_stateless_text_requests_use_the_content_addressed_prefix_cache() -> Non
     assert "stable_prefix_tokens" not in SERVER
     assert "persistent_prefix_enabled()" in DECODE
     assert "persistent_prefix_enabled()" in METAL_DECODE
-    assert "!cache_plan.session_id.empty() ||" in DECODE
+    assert "!request.cache_plan.session_id.empty() ||" in DECODE
     assert "!cache_plan.session_id.empty() ||" in METAL_DECODE
     assert "if (!requested_session.empty())" in DECODE
     assert "if (!requested_session.empty())" in METAL_DECODE

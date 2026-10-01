@@ -1,5 +1,6 @@
 #include "runtime_checks.h"
 
+#include "engine/cuda_engine.h"
 #include "engine/generation.h"
 #include "engine/options.h"
 #include "engine/runtime_config.h"
@@ -10,8 +11,11 @@
 
 #include <chrono>
 #include <cmath>
+#include <atomic>
 #include <iostream>
+#include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace mfq::cuda::diagnostics {
@@ -125,6 +129,118 @@ int run_cuda_continuous_batching_check(
         mfq::cuda::Qwen35CausalLm& model) {
     return mfq::cuda::qwen35::run_qwen_continuous_batching_check(
         model, resolve_cuda_runtime_config({}));
+}
+
+int run_cuda_engine_isolation_check(CudaEngineOptions options) {
+    MFQ_RUNTIME_CHECK(!options.model_path.empty(),
+        "engine isolation check requires --model");
+    if (options.context_size == 0) options.context_size = 64;
+    options.continuous_batching = 0;
+
+    std::unique_ptr<CudaEngine> first;
+    std::unique_ptr<CudaEngine> second;
+    std::exception_ptr first_error;
+    std::exception_ptr second_error;
+    std::atomic<int> load_ready{0};
+    auto load = [&](std::unique_ptr<CudaEngine>& engine,
+                    std::exception_ptr& error) {
+        try {
+            load_ready.fetch_add(1, std::memory_order_release);
+            while (load_ready.load(std::memory_order_acquire) != 2) {
+                std::this_thread::yield();
+            }
+            engine = std::make_unique<CudaEngine>(load_cuda_engine(options));
+        } catch (...) {
+            error = std::current_exception();
+        }
+    };
+    std::thread first_load(load, std::ref(first), std::ref(first_error));
+    std::thread second_load(load, std::ref(second), std::ref(second_error));
+    first_load.join();
+    second_load.join();
+    if (first_error) std::rethrow_exception(first_error);
+    if (second_error) std::rethrow_exception(second_error);
+
+    MfqSamplingParams sampling;
+    sampling.max_tokens = 2;
+    sampling.temperature = 0.0;
+    sampling.top_k = 1;
+    sampling.top_p = 1.0;
+    sampling.enable_mtp = false;
+    const std::vector<int64_t> first_prompt{101, 138, 175, 212, 249};
+    const std::vector<int64_t> second_prompt{113, 166, 219, 272, 325, 378};
+    const auto serial = [&](CudaEngine& engine,
+                            const std::vector<int64_t>& prompt) {
+        std::vector<int64_t> output;
+        const auto produced = engine.generate(
+            prompt, sampling,
+            [&](int64_t token) {
+                output.push_back(token);
+                return true;
+            }, {}, {}, {}, {});
+        MFQ_RUNTIME_CHECK(
+            produced == sampling.max_tokens &&
+            output.size() == static_cast<size_t>(sampling.max_tokens),
+            "CUDA engine isolation oracle failed");
+        return output;
+    };
+    const auto first_reference = serial(*first, first_prompt);
+    const auto second_reference = serial(*second, second_prompt);
+    std::vector<int64_t> first_output;
+    std::vector<int64_t> second_output;
+    int32_t first_produced = 0;
+    int32_t second_produced = 0;
+    std::atomic<int> ready{0};
+    auto generate = [&](CudaEngine& engine,
+                        const std::vector<int64_t>& prompt,
+                        std::vector<int64_t>& output,
+                        int32_t& produced,
+                        std::exception_ptr& error) {
+        try {
+            ready.fetch_add(1, std::memory_order_release);
+            while (ready.load(std::memory_order_acquire) != 2) {
+                std::this_thread::yield();
+            }
+            produced = engine.generate(
+                prompt, sampling,
+                [&](int64_t token) {
+                    output.push_back(token);
+                    return true;
+                }, {}, {}, {}, {});
+        } catch (...) {
+            error = std::current_exception();
+        }
+    };
+    first_error = nullptr;
+    second_error = nullptr;
+    std::thread first_generate(
+        generate, std::ref(*first), std::cref(first_prompt),
+        std::ref(first_output), std::ref(first_produced),
+        std::ref(first_error));
+    std::thread second_generate(
+        generate, std::ref(*second), std::cref(second_prompt),
+        std::ref(second_output), std::ref(second_produced),
+        std::ref(second_error));
+    first_generate.join();
+    second_generate.join();
+    if (first_error) std::rethrow_exception(first_error);
+    if (second_error) std::rethrow_exception(second_error);
+
+    MFQ_RUNTIME_CHECK(
+        first_produced == sampling.max_tokens &&
+        second_produced == sampling.max_tokens &&
+        first_output == first_reference &&
+        second_output == second_reference &&
+        first->metadata.model_type == second->metadata.model_type &&
+        first->metadata.max_context == options.context_size &&
+        second->metadata.max_context == options.context_size &&
+        !first->runtime_metrics().empty() &&
+        !second->runtime_metrics().empty(),
+        "concurrent CUDA engines did not remain isolated");
+    std::cout << "cuda_engine_isolation_check PASS engines=2 generated="
+              << first_produced + second_produced
+              << " context=" << options.context_size << '\n';
+    return 0;
 }
 
 } // namespace mfq::cuda::diagnostics

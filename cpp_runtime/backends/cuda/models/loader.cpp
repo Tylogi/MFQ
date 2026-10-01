@@ -78,7 +78,6 @@ Model mfq::cuda::load_causal_lm(
         bool load_blocks,
         bool defer_moe_cache_finalize,
         std::shared_ptr<const mfq::ModelSource> model_source) {
-    CudaExecutionContextScope context_scope(execution);
     Model model;
     model.execution = &execution;
     model.source = model_source
@@ -112,7 +111,7 @@ Model mfq::cuda::load_causal_lm(
             std::max<int64_t>(
                 model.num_hidden_layers() - execution.n_gpu_layers, 0));
         if (execution.dense_cpu_layer_count > 0) {
-            if (model_parallel_enabled() ||
+            if (model_parallel_enabled(execution) ||
                     execution.layer_placement.enabled()) {
                 throw std::runtime_error(
                     "--n-gpu-layers cannot be combined with tensor/expert/layer parallelism");
@@ -185,15 +184,15 @@ Model mfq::cuda::load_causal_lm(
 
     const std::string embed_name = "model.token_embedding.weight";
     const std::string output_name = "model.output.weight";
-    model.embed = load_quant_linear(source, embed_name);
+    model.embed = load_quant_linear(execution, source, embed_name);
     model.adapter_load_final_state(source, model.output_norm);
     if (model.tie_word_embeddings() || !has_tensor(source, output_name)) {
         model.lm_head = execution.tensor_parallel.enabled()
-            ? load_quant_linear(
+            ? load_quant_linear(execution,
                 source, embed_name, TensorParallelAxis::Output)
             : model.embed;
     } else {
-        model.lm_head = load_quant_linear(
+        model.lm_head = load_quant_linear(execution,
             source, output_name, TensorParallelAxis::Output);
     }
 
@@ -209,10 +208,10 @@ Model mfq::cuda::load_causal_lm(
     execution.loading_cpu_layer = false;
     execution.layer_placement.load_device =
         execution.layer_placement.primary_device();
-    if (moe_expert_cache_has_sources() &&
-            !moe_expert_cache_finalized() &&
+    if (moe_expert_cache_has_sources(execution.moe_expert_cache) &&
+            !moe_expert_cache_finalized(execution.moe_expert_cache) &&
             !defer_moe_cache_finalize) {
-        finalize_moe_expert_cache();
+        finalize_moe_expert_cache(execution.moe_expert_cache);
     }
     return model;
 }

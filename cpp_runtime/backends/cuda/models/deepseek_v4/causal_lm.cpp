@@ -35,44 +35,44 @@ std::unique_ptr<::Block> load_block(
         b->hc_eps = c.hc_eps;
         b->shared_state = state;
 
-        b->attn_norm = load_dense_gpu(
+        b->attn_norm = load_dense_gpu(execution,
             mfq, p + "attention.norm.weight");
-        b->ffn_norm = load_dense_gpu(
+        b->ffn_norm = load_dense_gpu(execution,
             mfq, p + "mlp.norm.weight");
-        b->q_a_norm = load_dense_gpu(
+        b->q_a_norm = load_dense_gpu(execution,
             mfq, p + "attention.query_a_norm.weight");
-        b->kv_norm = load_dense_gpu(
+        b->kv_norm = load_dense_gpu(execution,
             mfq, p + "attention.key_value_a_norm.weight");
-        b->sinks = load_dense_gpu(
+        b->sinks = load_dense_gpu(execution,
             mfq, p + "attention.sink")
             .to(mfq_tensor_backend::kFloat32).contiguous();
-        b->hc_attn_fn = load_dense_gpu(
+        b->hc_attn_fn = load_dense_gpu(execution,
             mfq, p + "attention.mhc.pre.function")
             .to(mfq_tensor_backend::kFloat32).contiguous();
-        b->hc_attn_scale = load_dense_gpu(
+        b->hc_attn_scale = load_dense_gpu(execution,
             mfq, p + "attention.mhc.pre.scale")
             .to(mfq_tensor_backend::kFloat32).contiguous();
-        b->hc_attn_base = load_dense_gpu(
+        b->hc_attn_base = load_dense_gpu(execution,
             mfq, p + "attention.mhc.pre.base")
             .to(mfq_tensor_backend::kFloat32).contiguous();
-        b->hc_ffn_fn = load_dense_gpu(
+        b->hc_ffn_fn = load_dense_gpu(execution,
             mfq, p + "mlp.mhc.pre.function")
             .to(mfq_tensor_backend::kFloat32).contiguous();
-        b->hc_ffn_scale = load_dense_gpu(
+        b->hc_ffn_scale = load_dense_gpu(execution,
             mfq, p + "mlp.mhc.pre.scale")
             .to(mfq_tensor_backend::kFloat32).contiguous();
-        b->hc_ffn_base = load_dense_gpu(
+        b->hc_ffn_base = load_dense_gpu(execution,
             mfq, p + "mlp.mhc.pre.base")
             .to(mfq_tensor_backend::kFloat32).contiguous();
-        b->q_a = load_quant_linear(
+        b->q_a = load_quant_linear(execution,
             mfq, p + "attention.query_a.weight");
-        b->q_b = load_quant_linear(
+        b->q_b = load_quant_linear(execution,
             mfq, p + "attention.query_b.weight");
-        b->kv = load_quant_linear(
+        b->kv = load_quant_linear(execution,
             mfq, p + "attention.key_value_a.weight");
-        b->output_a = load_quant_linear(
+        b->output_a = load_quant_linear(execution,
             mfq, p + "attention.output_a.weight");
-        b->output_b = load_quant_linear(
+        b->output_b = load_quant_linear(execution,
             mfq, p + "attention.output_b.weight");
         b->attention_rope = Dsv4RopeTable(
             c.max_position_embeddings, c.rope_base,
@@ -90,13 +90,13 @@ std::unique_ptr<::Block> load_block(
                 b->compress_ratio == 4;
             b->compressor.cache_quant_mode = 1;
             b->compressor.projection = make_fp32_quant_group(
-                load_quant_group(mfq, {
+                execution, load_quant_group(execution, mfq, {
                     p + "attention.compressor.key_value.weight",
                     p + "attention.compressor.gate.weight"}));
-            b->compressor.ape = load_dense_gpu(
+            b->compressor.ape = load_dense_gpu(execution,
                 mfq, p + "attention.compressor.position")
                 .to(mfq_tensor_backend::kFloat32).contiguous();
-            b->compressor.norm = load_dense_gpu(
+            b->compressor.norm = load_dense_gpu(execution,
                 mfq, p + "attention.compressor.norm.weight")
                 .to(mfq_tensor_backend::kFloat32).contiguous();
         }
@@ -106,18 +106,19 @@ std::unique_ptr<::Block> load_block(
             b->indexer_compressor.overlap = true;
             b->indexer_compressor.cache_quant_mode = 2;
             b->indexer_compressor.projection =
-                make_fp32_quant_group(load_quant_group(mfq, {
+                make_fp32_quant_group(
+                    execution, load_quant_group(execution, mfq, {
                     p + "attention.indexer.compressor.key_value.weight",
                     p + "attention.indexer.compressor.gate.weight"}));
-            b->indexer_compressor.ape = load_dense_gpu(
+            b->indexer_compressor.ape = load_dense_gpu(execution,
                 mfq, p + "attention.indexer.compressor.position")
                 .to(mfq_tensor_backend::kFloat32).contiguous();
-            b->indexer_compressor.norm = load_dense_gpu(
+            b->indexer_compressor.norm = load_dense_gpu(execution,
                 mfq, p + "attention.indexer.compressor.norm.weight")
                 .to(mfq_tensor_backend::kFloat32).contiguous();
-            b->indexer_q = load_quant_linear(
+            b->indexer_q = load_quant_linear(execution,
                 mfq, p + "attention.indexer.query.weight");
-            b->indexer_weight = load_dense_gpu(
+            b->indexer_weight = load_dense_gpu(execution,
                 mfq, p + "attention.indexer.score.weight")
                 .to(mfq_tensor_backend::kFloat32).contiguous();
         }
@@ -172,31 +173,31 @@ std::unique_ptr<::Block> load_block(
                 << std::endl;
         } else {
             if (b->ffn.moe_split_gate_up) {
-                b->ffn.moe_gate = load_mfe_gpu(
+                b->ffn.moe_gate = load_mfe_gpu(execution,
                     mfq, p + "mlp.experts.gate.weight",
                     true, i, "gate");
-                b->ffn.moe_up = load_mfe_gpu(
+                b->ffn.moe_up = load_mfe_gpu(execution,
                     mfq, p + "mlp.experts.up.weight",
                     true, i, "up");
             } else {
-                b->ffn.moe_gate_up = load_mfe_gpu(
+                b->ffn.moe_gate_up = load_mfe_gpu(execution,
                     mfq, p + "mlp.experts.gate_up.weight",
                     true, i, "gate_up");
             }
-            b->ffn.moe_down = load_mfe_gpu(
+            b->ffn.moe_down = load_mfe_gpu(execution,
                 mfq, p + "mlp.experts.down.weight",
                 true, i, "down");
         }
-        b->ffn.moe_router = load_dense_gpu(
+        b->ffn.moe_router = load_dense_gpu(execution,
             mfq, p + "mlp.router.weight")
             .to(mfq_tensor_backend::kFloat32).contiguous();
         if (has_tensor(mfq, p + "mlp.router.bias")) {
-            b->ffn.moe_router_bias = load_dense_gpu(
+            b->ffn.moe_router_bias = load_dense_gpu(execution,
                 mfq, p + "mlp.router.bias")
                 .to(mfq_tensor_backend::kFloat32).contiguous();
         }
         if (i < config.hash_layer_count) {
-            b->ffn.moe_hash_ids = load_dense_gpu(
+            b->ffn.moe_hash_ids = load_dense_gpu(execution,
                 mfq, p + "mlp.router.token_to_expert")
                 .to(mfq_tensor_backend::kInt32).contiguous();
         }
@@ -211,14 +212,14 @@ std::unique_ptr<::Block> load_block(
         b->ffn.swiglu_limit = c.swiglu_limit;
         b->ffn.moe_layer = i;
         b->ffn.shared = std::make_unique<FFN>();
-        b->ffn.shared->down = load_quant_linear(
+        b->ffn.shared->down = load_quant_linear(execution,
             mfq, p + "mlp.shared_expert.down.weight");
-        b->ffn.shared->gate_up = load_paired_gate_up(mfq, {
+        b->ffn.shared->gate_up = load_paired_gate_up(execution, mfq, {
             p + "mlp.shared_expert.gate.weight",
             p + "mlp.shared_expert.up.weight"},
             b->ffn.shared->down, 0);
         b->ffn.shared->swiglu_limit = c.swiglu_limit;
-        prepare_ffn_workspaces(*b->ffn.shared);
+        prepare_ffn_workspaces(execution, *b->ffn.shared);
 
         const bool base_shapes =
             b->attn_norm.numel() == c.hidden_size &&
@@ -292,13 +293,14 @@ void validate_load_options(
 }
 
 OutputHeadWeights load_output_head(
+        CudaExecutionContext& execution,
         const mfq::ModelSource& source) {
     return {
-        load_dense_gpu(source, "model.mhc.output.function")
+        load_dense_gpu(execution, source, "model.mhc.output.function")
             .to(mfq_tensor_backend::kFloat32).contiguous(),
-        load_dense_gpu(source, "model.mhc.output.scale")
+        load_dense_gpu(execution, source, "model.mhc.output.scale")
             .to(mfq_tensor_backend::kFloat32).contiguous(),
-        load_dense_gpu(source, "model.mhc.output.base")
+        load_dense_gpu(execution, source, "model.mhc.output.base")
             .to(mfq_tensor_backend::kFloat32).contiguous(),
     };
 }
@@ -363,7 +365,7 @@ void DeepseekV4Model::adapter_load_final_state(
         const mfq::ModelSource& source,
         mfq_tensor_backend::Tensor& output_norm) {
     CausalLmArchitecture::adapter_load_final_state(source, output_norm);
-    output_head = deepseek_v4::load_output_head(source);
+    output_head = deepseek_v4::load_output_head(*execution, source);
 }
 
 std::unique_ptr<Block>

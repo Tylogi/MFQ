@@ -12,6 +12,12 @@
 #include <vector>
 
 struct CudaExecutionContext;
+struct DecodeGraphCache;
+class MtpModule;
+namespace mfq::cuda::internal { class TextSessionCache; }
+namespace mfq::cuda::grid_vision_runtime {
+class CudaGridVisionPromptComponent;
+}
 
 namespace mfq::cuda {
 struct Qwen35Model;
@@ -33,8 +39,11 @@ public:
         Qwen35CausalLm& model,
         CudaExecutionContext& execution,
         std::mutex& model_mutex,
-        CudaContinuousBatchConfig config,
-        mfq::engine::GenerationConfig generation);
+        DecodeGraphCache& decode_graph,
+        internal::TextSessionCache& session_cache,
+        MtpModule* mtp,
+        grid_vision_runtime::CudaGridVisionPromptComponent* grid_vision,
+        const CudaRuntimeConfig& config);
     ~QwenBatchExecutor() override;
 
     QwenBatchExecutor(const QwenBatchExecutor&) = delete;
@@ -47,7 +56,8 @@ public:
         const MfqPrefillCallback& on_prefill,
         const MfqPromptCachePlan& cache_plan,
         const MfqTokenConstraintPtr& token_constraint,
-        const MfqCancellationCheck& cancelled) override;
+        const MfqCancellationCheck& cancelled,
+        const MfqMultimodalInput* media = nullptr) override;
     std::vector<std::pair<std::string, double>> metrics() const override;
 
     std::int64_t queued_requests() const;

@@ -36,7 +36,7 @@ public:
         : maximum_(maximum), width_(width) {
         MFQ_RUNTIME_CHECK(maximum > 0 && width > 0, "invalid GLM cache dimensions");
     }
-    void reset() { values_ = {}; position_ = 0; }
+    void reset() { values_ = Tensor(); position_ = 0; }
     int64_t position() const { return position_; }
     const Tensor& storage() const { return values_; }
     void truncate(int64_t keep) {

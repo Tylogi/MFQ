@@ -53,19 +53,14 @@ struct CudaEngineState {
                   language->max_position_embeddings(),
                   language->supports_paged_text_session_state(),
                   runtime_config.prefix_cache),
-              language->supports_text_session_state() &&
-                  runtime_config.continuous_batch.scheduling.max_sequences == 0,
-              language->supports_text_session_state()
-                  ? (runtime_config.continuous_batch.scheduling.max_sequences == 0
-                        ? 0 : 2)
-                  : 1) {
+              language->supports_text_session_state(),
+              language->supports_text_session_state() ? 0 : 1) {
         if (runtime_config.continuous_batch.scheduling.max_sequences == 0) {
             return;
         }
         continuous_batching = make_cuda_continuous_batching(
-            *language, execution, model_mutex,
-            runtime_config.continuous_batch,
-            runtime_config.generation);
+            *language, execution, model_mutex, decode_graph, session_cache,
+            components, runtime_config);
         if (!continuous_batching) {
             throw std::runtime_error(
                 "continuous batching is unavailable for this model adapter");
@@ -75,8 +70,9 @@ struct CudaEngineState {
             << runtime_config.continuous_batch.scheduling.max_sequences
             << " prefill_chunk_size="
             << runtime_config.generation.prefill_chunk_size
-            << " decode=target_only mtp=disabled"
-            << " prefix_cache=fresh_prefill\n";
+            << " prefill_token_budget="
+            << runtime_config.continuous_batch.prefill_token_budget
+            << " special_requests=exclusive\n";
     }
 
     std::shared_ptr<CudaExecutionContext> execution_owner;
@@ -95,16 +91,13 @@ struct CudaEngineState {
 template <typename Model>
 std::vector<std::pair<std::string, double>> engine_metrics(
         const std::shared_ptr<CudaEngineState<Model>>& state) {
-    CudaExecutionContextScope context_scope(state->execution);
     size_t free_bytes = 0;
     size_t total_bytes = 0;
     MFQ_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
     const auto memory = mfq_cuda_memory_stats(mfq_current_cuda_device());
     const auto components = state->components.state();
-    const bool vision_available =
-        components.vision_available && !state->continuous_batching;
-    const bool mtp_available =
-        components.mtp_available && !state->continuous_batching;
+    const bool vision_available = components.vision_available;
+    const bool mtp_available = components.mtp_available;
     std::vector<std::pair<std::string, double>> result{
         {"device_free_bytes", static_cast<double>(free_bytes)},
         {"device_total_bytes", static_cast<double>(total_bytes)},
@@ -156,8 +149,12 @@ CudaEngine make_cuda_engine(
             const MfqPromptCachePlan& cache_plan,
             const MfqTokenConstraintPtr& token_constraint,
             const MfqCancellationCheck& cancelled) {
-        CudaExecutionContextScope context_scope(state->execution);
         PreparedPromptFactory<typename State::Model> prepare;
+        if (state->continuous_batching) {
+            return state->continuous_batching->submit(
+                prompt, sampling, on_token, on_prefill,
+                cache_plan, token_constraint, cancelled, media);
+        }
         if (media) {
             if (!state->components.grid_vision) {
                 throw std::invalid_argument(
@@ -168,10 +165,6 @@ CudaEngine make_cuda_engine(
                     state->components.grid_vision->prepare(
                         language, prompt, *media)};
             };
-        } else if (state->continuous_batching) {
-            return state->continuous_batching->submit(
-                prompt, sampling, on_token, on_prefill,
-                cache_plan, token_constraint, cancelled);
         }
         return mfq::cuda::internal::generate(
             *state->language, state->model_mutex,
@@ -196,32 +189,25 @@ CudaEngine make_cuda_engine(
     engine.session_control = {
         [state](const std::string& source_session_id,
                 const std::string& target_session_id) {
-            CudaExecutionContextScope context_scope(state->execution);
             std::lock_guard<std::mutex> lock(state->model_mutex);
             return state->session_cache.fork_session(
                 source_session_id, target_session_id);
         },
         [state](const std::string& session_id) {
-            CudaExecutionContextScope context_scope(state->execution);
             std::lock_guard<std::mutex> lock(state->model_mutex);
             return state->session_cache.close_session(session_id);
         },
         [state] {
-            CudaExecutionContextScope context_scope(state->execution);
             return state->session_cache.metrics();
         },
         [state] {
-            CudaExecutionContextScope context_scope(state->execution);
             std::lock_guard<std::mutex> lock(state->model_mutex);
             return state->session_cache.clear();
         },
         [state](uint64_t target_bytes) {
-            CudaExecutionContextScope context_scope(state->execution);
             return state->session_cache.trim_hot(target_bytes);
         },
     };
-    // ponytail: batching owns shared model state; enable media only after
-    // per-request KV/recurrent state isolation is implemented.
     if (!state->continuous_batching && state->components.engine_binder) {
         state->components.engine_binder(
             engine, state->model_mutex);
@@ -236,7 +222,6 @@ CudaEngine make_cuda_engine(
                     const MfqPromptCachePlan& cache_plan,
                     const MfqTokenConstraintPtr& token_constraint,
                     const MfqCancellationCheck& cancelled) {
-                CudaExecutionContextScope context_scope(state->execution);
                 return generate(
                     prompt, media, sampling, on_token, on_prefill,
                     cache_plan, token_constraint, cancelled);
@@ -248,20 +233,17 @@ CudaEngine make_cuda_engine(
             auto stop = std::move(engine.duplex.stop);
             engine.duplex.start = [state, start = std::move(start)](
                     const MfqDuplexSessionParams& params) {
-                CudaExecutionContextScope context_scope(state->execution);
                 start(params);
             };
             engine.duplex.step = [state, step = std::move(step)](
                     const MfqDuplexStepInput& input) {
-                CudaExecutionContextScope context_scope(state->execution);
                 return step(input);
             };
             engine.duplex.stop = [state, stop = std::move(stop)] {
-                CudaExecutionContextScope context_scope(state->execution);
                 stop();
             };
         }
-    } else if (!state->continuous_batching && state->components.grid_vision) {
+    } else if (state->components.grid_vision) {
         engine.multimodal_generate = [generate_request](
                 const std::vector<int64_t>& prompt,
                 const MfqMultimodalInput& media,
@@ -291,7 +273,7 @@ CudaEngine make_cuda_engine(
     engine.metadata.capabilities.text =
         state->components.graph.has_component("text");
     engine.metadata.capabilities.image_input =
-        component_state.vision_available && !state->continuous_batching;
+        component_state.vision_available;
     engine.metadata.capabilities.video_input =
         engine.metadata.capabilities.image_input &&
         !state->components.grid_vision.has_value();
@@ -301,8 +283,7 @@ CudaEngine make_cuda_engine(
         state->components.graph.has_component("audio_output");
     engine.metadata.capabilities.full_duplex = model_adapter_loaded &&
         state->components.graph.has_component("duplex");
-    engine.metadata.capabilities.mtp =
-        component_state.mtp_available && !state->continuous_batching;
+    engine.metadata.capabilities.mtp = component_state.mtp_available;
     return engine;
 }
 
@@ -313,7 +294,6 @@ CudaEngine load_cuda_engine(CudaEngineOptions options) {
     auto runtime_config = resolve_cuda_runtime_config(options);
     auto execution = std::make_shared<CudaExecutionContext>();
     setup_cuda_load(options, *execution);
-    CudaExecutionContextScope context_scope(*execution);
     execution->profiler.enabled = false;
     mfq_tensor_backend::NoGradGuard no_grad;
     auto engine = with_loaded_cuda_model(

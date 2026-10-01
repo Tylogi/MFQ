@@ -176,8 +176,6 @@ struct ModelParallelCollectiveRuntime {
         bool allow_duplicate_devices);
 };
 
-int model_parallel_primary_device();
-
 struct LayerPlacementConfig {
     std::vector<int> devices;
     std::vector<double> split;
@@ -189,9 +187,7 @@ struct LayerPlacementConfig {
     }
 
     int primary_device() const {
-        return devices.empty()
-            ? model_parallel_primary_device()
-            : devices.front();
+        return devices.empty() ? 0 : devices.front();
     }
 
     void prepare(int64_t layers);
@@ -226,6 +222,7 @@ struct CudaExecutionContext {
     bool drop_file_cache = false;
     bool decode_graph_serial_branches = false;
     bool decode_graph_tp_projection_major = false;
+    bool continuous_batch_cache_serial = false;
     int moe_cache_registration_min_slots = 8;
     int gemma_trace_layer = -1;
     std::vector<std::pair<std::string, mfq_tensor_backend::Tensor>>*
@@ -241,28 +238,14 @@ struct CudaExecutionContext {
     void reset() noexcept;
 };
 
-CudaExecutionContext* current_cuda_execution_context() noexcept;
-CudaExecutionContext& cuda_execution_context();
-
-class CudaExecutionContextScope {
-public:
-    explicit CudaExecutionContextScope(CudaExecutionContext& context) noexcept;
-    ~CudaExecutionContextScope();
-
-    CudaExecutionContextScope(const CudaExecutionContextScope&) = delete;
-    CudaExecutionContextScope& operator=(
-        const CudaExecutionContextScope&) = delete;
-
-private:
-    CudaExecutionContext* previous_;
-};
-
 void mfq_set_env(const char* name, const char* value);
 void mfq_release_host_allocator_cache() noexcept;
-bool model_parallel_enabled();
-const ParallelConfig& model_parallel_config();
-const ParallelConfig& moe_parallel_config();
-int model_parallel_primary_device();
+bool model_parallel_enabled(const CudaExecutionContext& execution);
+const ParallelConfig& model_parallel_config(
+    const CudaExecutionContext& execution);
+const ParallelConfig& moe_parallel_config(
+    const CudaExecutionContext& execution);
+int model_parallel_primary_device(const CudaExecutionContext& execution);
 bool model_parallel_cuda_graph_enabled(
     const ParallelConfig& tensor_parallel,
     const ParallelConfig& expert_parallel,
@@ -275,11 +258,12 @@ bool model_parallel_reduce_to_primary_enabled();
 bool model_parallel_fp16_reduce_enabled();
 bool model_parallel_peer_first_launch_enabled();
 size_t model_parallel_launch_index(size_t launch_position, size_t shard_count);
-int active_weight_load_device();
+int active_weight_load_device(const CudaExecutionContext& execution);
 const char* kl_mmq_mode_name(KlMmqMode mode);
 const char* moe_route_stats_path();
 bool moe_route_output_energy_enabled();
 void record_moe_route_stats(
+    CudaExecutionContext& execution,
     int layer,
     const mfq_tensor_backend::Tensor& ids,
     const mfq_tensor_backend::Tensor& weights,
@@ -287,7 +271,11 @@ void record_moe_route_stats(
     int n_experts);
 void write_moe_route_stats(
     const std::unordered_map<int, MoeRouteLayerStats>& stats);
-void trace_gemma_stage(int layer, const char* name, const mfq_tensor_backend::Tensor& value);
+void trace_gemma_stage(
+    CudaExecutionContext& execution,
+    int layer,
+    const char* name,
+    const mfq_tensor_backend::Tensor& value);
 bool gemma4_fused_norms_enabled();
 void report_cuda_memory(const char* stage);
 bool moe_small_glu_path_enabled(int tokens);

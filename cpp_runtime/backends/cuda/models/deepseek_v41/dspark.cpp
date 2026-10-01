@@ -75,54 +75,54 @@ struct DeepseekV41Dspark final : MtpModule {
         result->layer = config.n_layers + stage;
         result->ratio = 0;
         result->max_context = config.max_position_embeddings;
-        result->attention_norm = load_dense_gpu(
+        result->attention_norm = load_dense_gpu(execution,
             model, prefix + "attention.norm.weight");
-        result->mlp_norm = load_dense_gpu(
+        result->mlp_norm = load_dense_gpu(execution,
             model, prefix + "mlp.norm.weight");
-        result->query_a_norm = load_dense_gpu(
+        result->query_a_norm = load_dense_gpu(execution,
             model, prefix + "attention.query_a_norm.weight");
-        result->key_value_norm = load_dense_gpu(
+        result->key_value_norm = load_dense_gpu(execution,
             model, prefix + "attention.key_value_norm.weight");
-        result->sinks = load_dense_gpu(
+        result->sinks = load_dense_gpu(execution,
             model, prefix + "attention.sink")
                                 .to(mfq_tensor_backend::kFloat32)
                                 .contiguous();
-        result->attention_mhc_function = load_dense_gpu(
+        result->attention_mhc_function = load_dense_gpu(execution,
             model, prefix + "attention.mhc.pre.function")
                                              .to(mfq_tensor_backend::kFloat32)
                                              .contiguous();
-        result->attention_mhc_scale = load_dense_gpu(
+        result->attention_mhc_scale = load_dense_gpu(execution,
             model, prefix + "attention.mhc.pre.scale")
                                           .to(mfq_tensor_backend::kFloat32)
                                           .contiguous();
-        result->attention_mhc_base = load_dense_gpu(
+        result->attention_mhc_base = load_dense_gpu(execution,
             model, prefix + "attention.mhc.pre.base")
                                          .to(mfq_tensor_backend::kFloat32)
                                          .contiguous();
-        result->mlp_mhc_function = load_dense_gpu(
+        result->mlp_mhc_function = load_dense_gpu(execution,
             model, prefix + "mlp.mhc.pre.function")
                                        .to(mfq_tensor_backend::kFloat32)
                                        .contiguous();
-        result->mlp_mhc_scale = load_dense_gpu(
+        result->mlp_mhc_scale = load_dense_gpu(execution,
             model, prefix + "mlp.mhc.pre.scale")
                                     .to(mfq_tensor_backend::kFloat32)
                                     .contiguous();
-        result->mlp_mhc_base = load_dense_gpu(
+        result->mlp_mhc_base = load_dense_gpu(execution,
             model, prefix + "mlp.mhc.pre.base")
                                    .to(mfq_tensor_backend::kFloat32)
                                    .contiguous();
-        result->query_a = load_quant_linear(
+        result->query_a = load_quant_linear(execution,
             model, prefix + "attention.query_a.weight");
-        result->query_b = load_quant_linear(
+        result->query_b = load_quant_linear(execution,
             model, prefix + "attention.query_b.weight");
-        result->key_value = load_quant_linear(
+        result->key_value = load_quant_linear(execution,
             model, prefix + "attention.key_value.weight");
-        result->output_a = load_quant_linear(
+        result->output_a = load_quant_linear(execution,
             model, prefix + "attention.output_a.weight");
-        result->output_b = load_quant_linear(
+        result->output_b = load_quant_linear(execution,
             model, prefix + "attention.output_b.weight");
         result->mlp = load_moe_at(
-            model,
+            execution, model,
             config,
             prefix + "mlp.",
             config.n_layers + stage,
@@ -206,17 +206,17 @@ struct DeepseekV41Dspark final : MtpModule {
         const auto first = std::string("predictor.stage.0.");
         const auto last = "predictor.stage." +
             std::to_string(result.config.n_mtp_layers - 1) + ".";
-        result.main_projection = load_quant_linear(
+        result.main_projection = load_quant_linear(execution,
             model, first + "main_projection.weight");
-        result.main_norm = load_dense_gpu(
+        result.main_norm = load_dense_gpu(execution,
             model, first + "main_norm.weight");
-        result.output_norm = load_dense_gpu(
+        result.output_norm = load_dense_gpu(execution,
             model, last + "output_norm.weight");
-        result.markov_embedding = load_quant_linear(
+        result.markov_embedding = load_quant_linear(execution,
             model, last + "markov.embedding.weight");
-        result.markov_output = load_quant_linear(
+        result.markov_output = load_quant_linear(execution,
             model, last + "markov.output.weight");
-        result.confidence_projection = load_quant_linear(
+        result.confidence_projection = load_quant_linear(execution,
             model, last + "confidence.projection.weight");
         result.stages.reserve(
             static_cast<std::size_t>(result.config.n_mtp_layers));

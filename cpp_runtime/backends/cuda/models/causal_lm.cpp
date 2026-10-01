@@ -150,7 +150,8 @@ void CausalLmArchitecture::adapter_configure_rope(
 void CausalLmArchitecture::adapter_load_final_state(
         const mfq::ModelSource& source,
         mfq_tensor_backend::Tensor& output_norm) {
-    output_norm = load_dense_gpu(source, "model.output_norm.weight");
+    output_norm = load_dense_gpu(
+        *execution, source, "model.output_norm.weight");
 }
 
 void CausalLmArchitecture::adapter_prepare_blocks(

@@ -106,17 +106,8 @@ CUDA_CAUSAL_LM_IMPL = (CUDA_MODELS / "causal_lm_impl.h").read_text(
     encoding="utf-8"
 )
 CUDA_MODEL_HEADERS = "\n".join(
-    (CUDA_MODELS / path / "causal_lm.h").read_text(encoding="utf-8")
-    for path in (
-        "qwen35",
-        "minicpmo45",
-        "gemma4",
-        "glm_dsa",
-        "glm5_next",
-        "qwen4_exp",
-        "deepseek_v4",
-        "deepseek_v41",
-    )
+    path.read_text(encoding="utf-8")
+    for path in CUDA_MODELS.rglob("*.h")
 )
 CUDA_MODEL_FINALIZERS = {
     name: (CUDA_MODELS / name / "causal_lm.cpp").read_text(encoding="utf-8")
@@ -403,7 +394,7 @@ def test_cuda_model_finalizers_live_with_their_models() -> None:
         "x.mean(2)",
     ):
         assert implementation not in CUDA_CAUSAL_LM_SOURCE
-    assert "output_head = deepseek_v4::load_output_head(source);" in (
+    assert "output_head = deepseek_v4::load_output_head(*execution, source);" in (
         CUDA_MODEL_FINALIZERS["deepseek_v4"]
     )
 
@@ -1052,8 +1043,9 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
     ops = cuda / "ops"
     assert "${MFQ_CUDA_ROOT}/ops/include" in cmake
     assert not any(path.suffix == ".h" for path in ops.iterdir())
-    quant_header = (ops / "include" / "quant_linear.h").read_text(
-        encoding="utf-8"
+    quant_header = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (ops / "include").glob("quant_linear*.h")
     )
     assert "struct QuantLinear" in quant_header
     owned_types = {
@@ -1062,7 +1054,8 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         "ops/include/mx.h": ("Mxfp4Weight", "Mxfp8Weight"),
         "ops/include/fp8_sq.h": ("Fp8SqWeight",),
         "ops/include/mxfp4_sq.h": ("Mxfp4SqWeight",),
-        "ops/include/moe.h": ("MfeWeight", "MoeRoutePlan"),
+        "ops/include/mfe_weight.h": ("MfeWeight",),
+        "ops/include/moe_types.h": ("MoeRoutePlan",),
     }
     for relative, names in owned_types.items():
         source = (cuda / relative).read_text(encoding="utf-8")

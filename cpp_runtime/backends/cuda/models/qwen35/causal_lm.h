@@ -18,6 +18,7 @@ namespace mfq::cuda::qwen35 {
 using Config = mfq::models::qwen35::Config;
 
 std::unique_ptr<::Block> load_block(
+    CudaExecutionContext& execution,
     const mfq::ModelSource& source,
     const Config& config,
     int layer,

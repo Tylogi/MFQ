@@ -39,8 +39,20 @@ void ContinuousBatchRequest::publish_token(int64_t token) {
     {
         std::lock_guard<std::mutex> lock(output_mutex_);
         output_tokens_.push_back(token);
+        ++published_tokens_;
     }
     output_ready_.notify_one();
+}
+
+bool ContinuousBatchRequest::publish_token_sync(int64_t token) {
+    std::unique_lock<std::mutex> lock(output_mutex_);
+    output_tokens_.push_back(token);
+    const auto published = ++published_tokens_;
+    output_ready_.notify_one();
+    output_ready_.wait(lock, [&] {
+        return consumed_tokens_ >= published || done_;
+    });
+    return !cancel_requested.load(std::memory_order_acquire);
 }
 
 void ContinuousBatchRequest::complete(std::exception_ptr error) {
@@ -100,6 +112,13 @@ int32_t ContinuousBatchRequest::consume(
             callbacks_enabled = false;
             cancel_requested.store(true, std::memory_order_release);
             if (wake_executor) wake_executor();
+        }
+        if (token.has_value()) {
+            {
+                std::lock_guard<std::mutex> lock(output_mutex_);
+                ++consumed_tokens_;
+            }
+            output_ready_.notify_one();
         }
     }
     if (callback_error) std::rethrow_exception(callback_error);

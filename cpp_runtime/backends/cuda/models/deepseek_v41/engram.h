@@ -855,6 +855,7 @@ private:
 class Engram {
 public:
     static std::unique_ptr<Engram> load(
+        CudaExecutionContext& execution,
         const mfq::ModelSource& model,
         const EngramConfig& config,
         int layer) {
@@ -870,10 +871,10 @@ public:
             config.engram_layer_ids.begin(), found));
         const auto prefix = "model.block." + std::to_string(layer) +
             ".associative_memory.";
-        auto query = load_dense_gpu(model, prefix + "query.weight")
+        auto query = load_dense_gpu(execution, model, prefix + "query.weight")
             .to(mfq_tensor_backend::kFloat32)
             .contiguous();
-        auto key = load_dense_gpu(model, prefix + "key.weight")
+        auto key = load_dense_gpu(execution, model, prefix + "key.weight")
             .to(mfq_tensor_backend::kFloat32)
             .contiguous();
         if (query.dim() != 2 || query.size(0) != config.hc_mult ||
@@ -881,7 +882,7 @@ public:
             throw std::runtime_error(
                 "DeepSeek-V4.1 Engram query/key geometry disagrees");
         }
-        auto projection = load_quant_linear(
+        auto projection = load_quant_linear(execution,
             model, prefix + "projection.weight");
         const auto hash_columns =
             (config.engram_max_ngram_size - 1) * config.engram_n_heads;

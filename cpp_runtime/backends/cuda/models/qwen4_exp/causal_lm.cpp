@@ -6,17 +6,20 @@
 namespace mfq::cuda::qwen4_exp {
 
 std::unique_ptr<::Block> load_block(
+        CudaExecutionContext& execution,
         const mfq::ModelSource& source,
         const mfq::models::qwen4_exp::Config& config,
         int layer) {
-    return std::make_unique<Qwen4Block>(source, config, layer);
+    return std::make_unique<Qwen4Block>(
+        execution, source, config, layer);
 }
 
 std::unique_ptr<Gr> load_final_mixer(
+        CudaExecutionContext& execution,
         const mfq::ModelSource& source,
         const mfq::models::qwen4_exp::Config& config) {
     return std::make_unique<Gr>(
-        source, config, "model.mhc.pre", false);
+        execution, source, config, "model.mhc.pre", false);
 }
 
 Tensor finalize_hidden(const Gr& mixer, const Tensor& hidden) {
@@ -58,8 +61,9 @@ void Qwen4Model::adapter_validate_load_options() const {
 void Qwen4Model::adapter_load_final_state(
         const mfq::ModelSource& source,
         mfq_tensor_backend::Tensor& output_norm) {
-    final_mixer = qwen4_exp::load_final_mixer(source, config);
-    output_norm = {};
+    final_mixer = qwen4_exp::load_final_mixer(
+        *execution, source, config);
+    output_norm = mfq_tensor_backend::Tensor();
 }
 
 std::unique_ptr<Block>
@@ -68,12 +72,12 @@ Qwen4Model::adapter_load_block(
         int layer,
         int,
         const std::string&) {
-    return qwen4_exp::load_block(source, config, layer);
+    return qwen4_exp::load_block(*execution, source, config, layer);
 }
 
 void Qwen4Model::adapter_reset(
         int64_t new_batch) {
-    positions = {};
+    positions = mfq_tensor_backend::Tensor();
     batch = new_batch;
 }
 
@@ -143,7 +147,7 @@ Qwen4Model::adapter_block_positions(
         const mfq_tensor_backend::Tensor& full_positions,
         const mfq_tensor_backend::Tensor&,
         int device) const {
-    return tensor_to_cuda_device(full_positions, device);
+    return tensor_to_cuda_device(*execution, full_positions, device);
 }
 
 void Qwen4Model::adapter_finish_forward(

@@ -102,11 +102,11 @@ struct SharedState {
     }
 
     void reset_session(std::int64_t current_batch) {
-        compressed_kv = {};
-        index_k = {};
-        topk = {};
-        candidate_blocks = {};
-        previous_pre = {};
+        compressed_kv = Tensor();
+        index_k = Tensor();
+        topk = Tensor();
+        candidate_blocks = Tensor();
+        previous_pre = Tensor();
         engram_hashes = {};
         dspark_target_hiddens.clear();
         capture_dspark_targets = false;
@@ -132,10 +132,10 @@ struct SharedState {
         const mfq_tensor_backend::Device& device,
         const Tensor& token_ids) {
         if (layer == 0) {
-            compressed_kv = {};
-            index_k = {};
-            topk = {};
-            candidate_blocks = {};
+            compressed_kv = Tensor();
+            index_k = Tensor();
+            topk = Tensor();
+            candidate_blocks = Tensor();
             compressed_length = 0;
             ratio = 0;
             cache_position = current_position;
@@ -442,10 +442,10 @@ struct Block final : ::Block {
             .dtype(mfq_tensor_backend::kFloat16);
         state.local_kv = mfq_tensor_backend::zeros(
             {batch, config.sliding_window, config.head_dim}, half);
-        state.compressed_kv = {};
-        state.index_k = {};
-        state.partial_kv = {};
-        state.partial_score = {};
+        state.compressed_kv = Tensor();
+        state.index_k = Tensor();
+        state.partial_kv = Tensor();
+        state.partial_score = Tensor();
         if (kv_source()) {
             const auto capacity = std::max<std::int64_t>(
                 1, max_context / ratio);
@@ -465,10 +465,10 @@ struct Block final : ::Block {
         state.position = 0;
         state.compressed_length = 0;
         state.partial_length = 0;
-        speculative_local_slots = {};
-        speculative_slot_ids = {};
-        speculative_partial_kv = {};
-        speculative_partial_score = {};
+        speculative_local_slots = Tensor();
+        speculative_slot_ids = Tensor();
+        speculative_partial_kv = Tensor();
+        speculative_partial_score = Tensor();
         speculative_position = -1;
         speculative_pending = false;
         if (layer == 0) shared->reset_session(batch);
@@ -504,10 +504,10 @@ struct Block final : ::Block {
 
     void commit_speculative() override {
         speculative_pending = false;
-        speculative_local_slots = {};
-        speculative_slot_ids = {};
-        speculative_partial_kv = {};
-        speculative_partial_score = {};
+        speculative_local_slots = Tensor();
+        speculative_slot_ids = Tensor();
+        speculative_partial_kv = Tensor();
+        speculative_partial_score = Tensor();
         speculative_position = -1;
     }
 
@@ -609,7 +609,7 @@ struct Block final : ::Block {
         if (output_a.is_mxfp8() &&
             output_a.out() == groups * config.o_lora_rank) {
             auto low_rank = output_a.forward_mxfp8_groupwise(
-                execution.profiler, grouped, groups);
+                execution, grouped, groups);
             return output_b.forward(execution, low_rank)
                 .reshape({batch, tokens, config.hidden});
         }
@@ -1050,6 +1050,7 @@ struct Block final : ::Block {
 };
 
 inline FFN load_moe_at(
+    CudaExecutionContext& execution,
     const mfq::ModelSource& model,
     const CommonConfig& config,
     const std::string& prefix,
@@ -1067,24 +1068,24 @@ inline FFN load_moe_at(
     }
     result.moe_split_gate_up = split_gate;
     if (split_gate) {
-        result.moe_gate = load_mfe_gpu(
+        result.moe_gate = load_mfe_gpu(execution,
             model, prefix + "experts.gate.weight", cacheable,
             static_cast<int>(layer), "gate");
-        result.moe_up = load_mfe_gpu(
+        result.moe_up = load_mfe_gpu(execution,
             model, prefix + "experts.up.weight", cacheable,
             static_cast<int>(layer), "up");
     } else {
-        result.moe_gate_up = load_mfe_gpu(
+        result.moe_gate_up = load_mfe_gpu(execution,
             model, prefix + "experts.gate_up.weight", cacheable,
             static_cast<int>(layer), "gate_up");
     }
-    result.moe_down = load_mfe_gpu(
+    result.moe_down = load_mfe_gpu(execution,
         model, prefix + "experts.down.weight", cacheable,
         static_cast<int>(layer), "down");
-    result.moe_router = load_dense_gpu(model, prefix + "router.weight")
+    result.moe_router = load_dense_gpu(execution, model, prefix + "router.weight")
         .to(mfq_tensor_backend::kFloat32)
         .contiguous();
-    result.moe_router_bias = load_dense_gpu(model, prefix + "router.bias")
+    result.moe_router_bias = load_dense_gpu(execution, model, prefix + "router.bias")
         .to(mfq_tensor_backend::kFloat32)
         .contiguous();
     result.moe_top_k = static_cast<int>(top_k);
@@ -1096,25 +1097,26 @@ inline FFN load_moe_at(
     result.swiglu_limit = config.swiglu_limit;
     result.moe_layer = static_cast<int>(layer);
     result.shared = std::make_unique<FFN>();
-    result.shared->down = load_quant_linear(
+    result.shared->down = load_quant_linear(execution,
         model, prefix + "shared_expert.down.weight");
-    result.shared->gate_up = load_paired_gate_up(
+    result.shared->gate_up = load_paired_gate_up(execution,
         model,
         {prefix + "shared_expert.gate.weight",
          prefix + "shared_expert.up.weight"},
         result.shared->down,
         0);
     result.shared->swiglu_limit = config.swiglu_limit;
-    prepare_ffn_workspaces(*result.shared);
+    prepare_ffn_workspaces(execution, *result.shared);
     return result;
 }
 
 inline FFN load_moe(
+    CudaExecutionContext& execution,
     const mfq::ModelSource& model,
     const CommonConfig& config,
     std::int64_t layer) {
     return load_moe_at(
-        model,
+        execution, model,
         config,
         "model.block." + std::to_string(layer) + ".mlp.",
         layer,
@@ -1123,6 +1125,7 @@ inline FFN load_moe(
 }
 
 std::unique_ptr<::Block> load_block(
+    CudaExecutionContext& execution,
     const mfq::ModelSource& model,
     std::int64_t layer,
     const std::shared_ptr<SharedState>& shared);

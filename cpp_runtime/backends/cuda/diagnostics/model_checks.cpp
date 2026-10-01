@@ -42,7 +42,7 @@ int run_linear_check(
     int reps) {
     auto model_source = mfq::open_model_source(model_path);
     const auto& mfq = *model_source;
-    auto linear = load_quant_linear(mfq, name);
+    auto linear = load_quant_linear(execution, mfq, name);
     MFQ_RUNTIME_CHECK(M >= 1 && M <= 4096, "--check-linear-m must be in [1, 4096]");
     MFQ_RUNTIME_CHECK(reps >= 1, "--check-linear-reps must be positive");
     int64_t neuron_len = linear.neuron_len();
@@ -207,13 +207,13 @@ int run_cpu_linear_check(
     execution.loading_cpu_layer = true;
     QuantLinear cpu_linear;
     try {
-        cpu_linear = load_quant_linear(mfq, name);
+        cpu_linear = load_quant_linear(execution, mfq, name);
     } catch (...) {
         execution.loading_cpu_layer = false;
         throw;
     }
     execution.loading_cpu_layer = false;
-    auto cuda_linear = load_quant_linear(mfq, name);
+    auto cuda_linear = load_quant_linear(execution, mfq, name);
     const int64_t width = cpu_linear.neuron_len();
     auto x = mfq_tensor_backend::arange(
         static_cast<int64_t>(rows) * width,
@@ -289,14 +289,14 @@ int run_tensor_parallel_linear_check(
     execution.tensor_parallel.devices = {saved.primary_device()};
     QuantLinear full;
     try {
-        full = load_quant_linear(
+        full = load_quant_linear(execution,
             mfq, name, TensorParallelAxis::Mirrored);
     } catch (...) {
         execution.tensor_parallel = saved;
         throw;
     }
     execution.tensor_parallel = saved;
-    auto sharded = load_quant_linear(
+    auto sharded = load_quant_linear(execution,
         mfq, name, axis);
     MFQ_RUNTIME_CHECK(
         sharded.tensor_parallel(),
@@ -395,7 +395,7 @@ int run_linear_group_check(
         std::getenv("MFQ_CHECK_LINEAR_GROUP_BF16");
     const bool check_bf16 =
         bf16_env != nullptr && bf16_env[0] == '1';
-    auto group = load_quant_group(
+    auto group = load_quant_group(execution,
         mfq, names, names.size(), nullptr,
         preserve_projection_boundaries);
     const int64_t width = group.nint_grouped
@@ -501,7 +501,7 @@ int run_linear_group_check(
     fp32_references.reserve(names.size());
     separate_production.reserve(names.size());
     for (size_t index = 0; index < names.size(); ++index) {
-        auto linear = load_quant_linear(mfq, names[index]);
+        auto linear = load_quant_linear(execution, mfq, names[index]);
         MFQ_RUNTIME_CHECK(
             linear.is_nint(),
             "--check-linear-group currently requires NINT tensors");
@@ -745,11 +745,12 @@ int run_linear_conv_operator_check(
 }
 
 int run_q8_embedding_check(
+        CudaExecutionContext& execution,
         const std::string & model_path,
         const std::string & name) {
     auto model_source = mfq::open_model_source(model_path);
     const auto& mfq = *model_source;
-    auto linear = load_quant_linear(mfq, name);
+    auto linear = load_quant_linear(execution, mfq, name);
     MFQ_RUNTIME_CHECK(
         linear.is_nint() && linear.nint.q8_zero,
         "--check-q8-embedding requires an NINT8-0 tensor");
@@ -803,7 +804,7 @@ int run_dsv4_output_a_check(
     MFQ_RUNTIME_CHECK(batch > 0 && reps > 0, "DSV4 output_a check requires positive batch and reps");
     auto model_source = mfq::open_model_source(model_path);
     const auto& mfq = *model_source;
-    auto linear = load_quant_linear(
+    auto linear = load_quant_linear(execution,
         mfq, name, TensorParallelAxis::Input);
     const bool supported_nint =
         linear.is_nint() &&
@@ -843,7 +844,7 @@ int run_dsv4_output_a_check(
     auto groupwise = [&]() {
         return linear.is_mxfp8()
             ? linear.forward_mxfp8_groupwise(
-                execution.profiler, grouped, kGroups)
+                execution, grouped, kGroups)
             : nint_matmul_groupwise_u8(
                 execution.profiler, linear.nint, grouped, kGroups);
     };
@@ -918,9 +919,9 @@ int run_gemma_geglu_check(
     mfq::cuda::validate_model_source(mfq);
     const std::string prefix =
         "model.block." + std::to_string(layer) + ".mlp.";
-    auto gate_up = load_quant_group(
+    auto gate_up = load_quant_group(execution,
         mfq, {prefix + "gate.weight", prefix + "up.weight"}, 2);
-    auto down = load_quant_linear(mfq, prefix + "down.weight");
+    auto down = load_quant_linear(execution, mfq, prefix + "down.weight");
     if (!gate_up.nint_grouped || !gate_up.nint.split_w.empty() || !down.is_nint() ||
         gate_up.outs.size() != 2 || gate_up.outs[0] != gate_up.outs[1]) {
         throw std::runtime_error("Gemma GeGLU check requires packed NINT gate/up and NINT down tensors");
@@ -1038,7 +1039,7 @@ int run_expert_parallel_moe_check(
         int tokens,
         int routes) {
     MFQ_RUNTIME_CHECK(
-        moe_parallel_config().enabled(),
+        moe_parallel_config(execution).enabled(),
         "--check-ep-moe requires --expert-parallel or --tensor-parallel");
     MFQ_RUNTIME_CHECK(
         tokens >= 1 && tokens <= 4096,
@@ -1053,13 +1054,13 @@ int run_expert_parallel_moe_check(
         ? "gate_up" : "diagnostic";
     const ParallelConfig saved_tensor = execution.tensor_parallel;
     const ParallelConfig saved_expert = execution.expert_parallel;
-    const ParallelConfig saved = moe_parallel_config();
+    const ParallelConfig saved = moe_parallel_config(execution);
     execution.tensor_parallel = {};
     execution.expert_parallel = {};
     execution.expert_parallel.devices = {saved.primary_device()};
     MfeWeight full;
     try {
-        full = load_mfe_gpu(
+        full = load_mfe_gpu(execution,
             mfq, tensor_name, false, 0, role);
     } catch (...) {
         execution.tensor_parallel = saved_tensor;
@@ -1068,7 +1069,7 @@ int run_expert_parallel_moe_check(
     }
     execution.tensor_parallel = saved_tensor;
     execution.expert_parallel = saved_expert;
-    auto sharded = load_mfe_gpu(
+    auto sharded = load_mfe_gpu(execution,
         mfq, tensor_name, false, 0, role);
     MFQ_RUNTIME_CHECK(
         sharded.expert_parallel(),
@@ -1124,10 +1125,10 @@ int run_expert_parallel_moe_check(
         build_moe_route_plan(
             ids, full.n_experts);
     auto reference =
-        full.forward(x, route)
+        full.forward(execution, x, route)
             .to(mfq_tensor_backend::kFloat32);
     auto test =
-        sharded.forward(x, route)
+        sharded.forward(execution, x, route)
             .to(mfq_tensor_backend::kFloat32);
     mfq_cuda_synchronize();
     auto difference = test - reference;
@@ -1169,6 +1170,7 @@ int run_expert_parallel_moe_check(
 }
 
 int run_mfe_tensor_check(
+        CudaExecutionContext& execution,
         const std::string & model_path,
         const std::string & tensor_name,
         int tokens,
@@ -1188,11 +1190,11 @@ int run_mfe_tensor_check(
     }
     auto model_source = mfq::open_model_source(model_path);
     const auto& mfq = *model_source;
-    auto weight = load_mfe_gpu(
+    auto weight = load_mfe_gpu(execution,
         mfq, tensor_name, true, 0, "diagnostic");
-    if (moe_expert_cache() &&
-            !moe_expert_cache_finalized()) {
-        finalize_moe_expert_cache();
+    if (execution.moe_expert_cache &&
+            !moe_expert_cache_finalized(execution.moe_expert_cache)) {
+        finalize_moe_expert_cache(execution.moe_expert_cache);
     }
     if (routes > weight.n_experts) {
         throw std::runtime_error("MFE tensor check routes exceed expert count");
@@ -1240,7 +1242,7 @@ int run_mfe_tensor_check(
     auto route = build_moe_route_plan(ids, weight.n_experts);
     mfq_tensor_backend::Tensor output;
     for (int warmup = 0; warmup < 5; ++warmup) {
-        output = weight.forward(x, route);
+        output = weight.forward(execution, x, route);
         if (warmup == 0) weight.prefetch(route);
     }
     mfq_cuda_synchronize();
@@ -1249,7 +1251,7 @@ int run_mfe_tensor_check(
     MFQ_CUDA_CHECK(cudaEventCreate(&stop));
     auto stream = mfq_get_current_cuda_stream().stream();
     MFQ_CUDA_CHECK(cudaEventRecord(start, stream));
-    for (int index = 0; index < reps; ++index) output = weight.forward(x, route);
+    for (int index = 0; index < reps; ++index) output = weight.forward(execution, x, route);
     MFQ_CUDA_CHECK(cudaEventRecord(stop, stream));
     MFQ_CUDA_CHECK(cudaEventSynchronize(stop));
     float elapsed = 0.0f;
@@ -1327,7 +1329,7 @@ int run_mfe_tensor_check(
 
     if (split_width > 0) {
         auto run_segment = [&](int width, int row_offset) {
-            return weight.forward(x, route)
+            return weight.forward(execution, x, route)
                 .narrow(2, row_offset, width).contiguous();
         };
         mfq_tensor_backend::Tensor merged;
@@ -1410,9 +1412,9 @@ int run_mfe_tensor_check(
         };
         set_env("MFQ_NVQ_MOE_WARPS", "0");
         set_env("MFQ_NVQ_MOE_EXACT_REDUCTION", "1");
-        auto candidate = weight.forward(x, route);
+        auto candidate = weight.forward(execution, x, route);
         set_env("MFQ_NVQ_MOE_EXACT_REDUCTION", "0");
-        auto baseline = weight.forward(x, route);
+        auto baseline = weight.forward(execution, x, route);
         mfq_cuda_synchronize();
         restore_env(
             "MFQ_NVQ_MOE_WARPS", had_original_env, original_value);
@@ -1455,7 +1457,8 @@ int run_mfe_tensor_check(
             .reshape({tokens, routes, 2 * weight.neuron_len})
             .contiguous();
         auto run_candidate = [&]() {
-            return weight.forward_clamped_swiglu(gate_up, route, limit);
+            return weight.forward_clamped_swiglu(
+                execution, gate_up, route, limit);
         };
         auto run_baseline = [&]() {
             const int64_t width = weight.neuron_len;
@@ -1466,7 +1469,7 @@ int run_mfe_tensor_check(
                 -limit, limit);
             auto hidden = (mfq_tensor_backend::silu(gate) * up)
                 .to(mfq_tensor_backend::kFloat16).contiguous();
-            return weight.forward(hidden, route);
+            return weight.forward(execution, hidden, route);
         };
         mfq_tensor_backend::Tensor candidate;
         mfq_tensor_backend::Tensor baseline;
@@ -1516,8 +1519,8 @@ int run_mfe_tensor_check(
                   << " max_abs=" << diff.abs().max().item<double>()
                   << "\n";
     }
-    if (moe_expert_cache()) {
-        print_moe_expert_cache_stats(std::cout);
+    if (execution.moe_expert_cache) {
+        print_moe_expert_cache_stats(execution.moe_expert_cache, std::cout);
     }
     return 0;
 }
@@ -1531,15 +1534,15 @@ static int run_gemma_moe_check(
     int reps) {
     const std::string prefix =
         "model.block." + std::to_string(layer) + ".mlp.experts.";
-    auto gate_up = load_mfe_gpu(
+    auto gate_up = load_mfe_gpu(execution,
         mfq, prefix + "gate_up.weight",
         true, layer, "gate_up");
-    auto down = load_mfe_gpu(
+    auto down = load_mfe_gpu(execution,
         mfq, prefix + "down.weight",
         true, layer, "down");
-    if (moe_expert_cache() &&
-            !moe_expert_cache_finalized()) {
-        finalize_moe_expert_cache();
+    if (execution.moe_expert_cache &&
+            !moe_expert_cache_finalized(execution.moe_expert_cache)) {
+        finalize_moe_expert_cache(execution.moe_expert_cache);
     }
     const int routes = static_cast<int>(config.num_experts_per_tok);
     const int experts = static_cast<int>(config.num_experts);
@@ -1631,10 +1634,10 @@ static int run_gemma_moe_check(
             const bool projection_bundle_prefetched =
                 prefetch_cached_moe_projection_bundle(
                     gate_up, down, route);
-            auto gate_pair = gate_up.forward(x, route);
+            auto gate_pair = gate_up.forward(execution, x, route);
             auto hidden = moe_geglu_split_cuda(gate_pair);
             if (!projection_bundle_prefetched) down.prefetch(route);
-            auto down_pair = down.forward(hidden, route);
+            auto down_pair = down.forward(execution, hidden, route);
             return moe_weighted_reduce_cuda(down_pair, weights);
         };
         auto forward_gate_glu = [&]() {
@@ -1642,9 +1645,9 @@ static int run_gemma_moe_check(
             const bool projection_bundle_prefetched =
                 prefetch_cached_moe_projection_bundle(
                     gate_up, down, route);
-            auto hidden = gate_up.forward_glu_output(x, route, true);
+            auto hidden = gate_up.forward_glu_output(execution, x, route, true);
             if (!projection_bundle_prefetched) down.prefetch(route);
-            auto down_pair = down.forward(hidden, route);
+            auto down_pair = down.forward(execution, hidden, route);
             return moe_weighted_reduce_cuda(down_pair, weights);
         };
         const bool gate_glu_supported = tokens <= 4;
@@ -1681,13 +1684,13 @@ static int run_gemma_moe_check(
 
         if (tokens == 1) {
             auto stage_route = build_moe_route_plan(ids, experts);
-            auto stage_hidden = gate_up.forward_glu_output(x, stage_route, true);
-            auto stage_down = down.forward(stage_hidden, stage_route);
+            auto stage_hidden = gate_up.forward_glu_output(execution, x, stage_route, true);
+            auto stage_down = down.forward(execution, stage_hidden, stage_route);
             mfq_cuda_synchronize();
             auto gate_stage = time_ms(
-                [&]() { return gate_up.forward_glu_output(x, stage_route, true); }, reps);
+                [&]() { return gate_up.forward_glu_output(execution, x, stage_route, true); }, reps);
             auto down_stage = time_ms(
-                [&]() { return down.forward(stage_hidden, stage_route); }, reps);
+                [&]() { return down.forward(execution, stage_hidden, stage_route); }, reps);
             auto reduce_stage = time_ms(
                 [&]() { return moe_weighted_reduce_cuda(stage_down, weights); }, reps);
             std::cout << "gemma_moe_stage"
@@ -1764,8 +1767,8 @@ static int run_gemma_moe_check(
             }
         }
     }
-    if (moe_expert_cache()) {
-        print_moe_expert_cache_stats(std::cout);
+    if (execution.moe_expert_cache) {
+        print_moe_expert_cache_stats(execution.moe_expert_cache, std::cout);
     }
     return 0;
 }
@@ -1806,7 +1809,8 @@ int run_moe_check(
             throw std::runtime_error(
                 "MoE benchmark layer is out of range");
         }
-        mfq::cuda::glm_dsa::load_ffn(mfq, config, layer, ffn);
+        mfq::cuda::glm_dsa::load_ffn(
+            execution, mfq, config, layer, ffn);
         hidden_size = config.hidden_size;
     } else if (graph.backbone == "deepseek_v4") {
         const auto config =
@@ -1828,7 +1832,7 @@ int run_moe_check(
                 "MoE benchmark layer is out of range");
         }
         ffn = mfq::cuda::deepseek_v41_runtime::load_moe(
-            mfq, config, layer);
+            execution, mfq, config, layer);
         hidden_size = config.hidden;
     } else {
         throw std::runtime_error(
@@ -1838,9 +1842,9 @@ int run_moe_check(
         throw std::runtime_error(
             "selected layer does not contain MFE MoE weights");
     }
-    if (moe_expert_cache() &&
-            !moe_expert_cache_finalized()) {
-        finalize_moe_expert_cache();
+    if (execution.moe_expert_cache &&
+            !moe_expert_cache_finalized(execution.moe_expert_cache)) {
+        finalize_moe_expert_cache(execution.moe_expert_cache);
     }
     const double routed_weight_bytes =
         mfe_weight_bytes(ffn.moe_gate_up) + mfe_weight_bytes(ffn.moe_down);
@@ -1956,8 +1960,8 @@ int run_moe_check(
         execution.profiler.enabled = false;
         execution.profiler.reset();
     }
-    if (moe_expert_cache()) {
-        print_moe_expert_cache_stats(std::cout);
+    if (execution.moe_expert_cache) {
+        print_moe_expert_cache_stats(execution.moe_expert_cache, std::cout);
     }
     return 0;
 }

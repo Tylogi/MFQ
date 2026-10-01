@@ -140,8 +140,6 @@ CudaRuntimeConfig resolve_cuda_runtime_config(
         static_cast<std::size_t>(options.continuous_batching);
     config.continuous_batch.greedy = environment_enabled(
         "MFQ_CONTINUOUS_BATCH_GREEDY", true);
-    config.continuous_batch.packed_metadata = environment_enabled(
-        "MFQ_CONTINUOUS_BATCH_PACKED_METADATA", true);
     config.continuous_batch.cuda_graph =
         config.decode_graph.enabled && environment_enabled(
             "MFQ_CONTINUOUS_BATCH_CUDA_GRAPH", true);
@@ -149,6 +147,17 @@ CudaRuntimeConfig resolve_cuda_runtime_config(
         "MFQ_CONTINUOUS_PAGED_KV", true);
     config.continuous_batch.cuda_graph_minimum_tokens = graph_minimum(
         "MFQ_CONTINUOUS_BATCH_CUDA_GRAPH_MIN_TOKENS");
+    config.continuous_batch.prefill_token_budget =
+        static_cast<std::int64_t>(std::min<std::uint64_t>(
+            environment_uint64(
+                "MFQ_CONTINUOUS_BATCH_PREFILL_TOKEN_BUDGET",
+                static_cast<std::uint64_t>(options.prefill_chunk_size)),
+            static_cast<std::uint64_t>(
+                std::numeric_limits<std::int64_t>::max())));
+    if (config.continuous_batch.prefill_token_budget < 1) {
+        throw std::invalid_argument(
+            "continuous batching prefill token budget must be positive");
+    }
 
     auto& sessions = config.session_cache;
     sessions.snapshots.max_sessions = checked_size(environment_uint64(
@@ -397,6 +406,8 @@ static void configure_layer_placement(
             throw std::runtime_error(
                 "--layer-split requires --layer-parallel");
         }
+        placement.devices = {
+            model_parallel_primary_device(execution)};
         return;
     }
     if (execution.tensor_parallel.enabled() ||
@@ -523,7 +534,6 @@ static std::unordered_set<int> parse_layer_ranges(
 void setup_cuda_load(
         const mfq::cuda::CudaLoadOptions& options,
         CudaExecutionContext& execution) {
-    CudaExecutionContextScope context_scope(execution);
     execution.reset();
     const auto& tensor_parallel_arg = options.tensor_parallel_arg;
     const auto& tensor_split_arg = options.tensor_split_arg;
@@ -612,6 +622,7 @@ void setup_cuda_load(
                     static_cast<int64_t>(bytes));
             if (!moe_cache_profile_path.empty()) {
                 set_moe_expert_cache_profile(
+                    *execution.moe_expert_cache,
                     mfq::load_moe_cache_profile(
                         moe_cache_profile_path));
             }
@@ -623,7 +634,6 @@ int with_cuda_load(
         const CudaLoadOptions& options,
         const std::function<int(CudaExecutionContext&)>& run) {
     CudaExecutionContext execution;
-    CudaExecutionContextScope context_scope(execution);
     setup_cuda_load(options, execution);
     return run(execution);
 }

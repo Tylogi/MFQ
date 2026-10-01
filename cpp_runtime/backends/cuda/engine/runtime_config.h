@@ -19,10 +19,10 @@ struct CudaDecodeGraphConfig {
 struct CudaContinuousBatchConfig {
     mfq::engine::ContinuousBatchConfig scheduling;
     bool greedy = true;
-    bool packed_metadata = true;
     bool cuda_graph = true;
     bool paged_kv = true;
     std::int32_t cuda_graph_minimum_tokens = 16;
+    std::int64_t prefill_token_budget = 2048;
 };
 
 struct CudaSessionCacheConfig {

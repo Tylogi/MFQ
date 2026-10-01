@@ -184,92 +184,66 @@ static MfeCpu unpack_mfe_delta(
 static std::atomic<uint64_t> g_moe_route_generation{1};
 
 mfq_tensor_backend::Tensor moe_tensor_to_device(
+        CudaExecutionContext& execution,
         mfq_tensor_backend::Tensor value, int device) {
     return value.defined()
-        ? tensor_to_cuda_device(std::move(value), device)
+        ? tensor_to_cuda_device(execution, std::move(value), device)
         : value;
 }
 
-struct MoeRouteReplicaEntry {
-    uint64_t generation = 0;
-    MoeRoutePlan plan;
-};
-
-class MoeRouteReplicaCache {
-public:
-    const MoeRoutePlan & get(
-            const MoeRoutePlan & source, int device) {
-        auto & entry = entries_[device];
-        if (entry.generation == source.generation &&
-                entry.plan.generation == source.generation) {
-            return entry.plan;
-        }
-        copy_plan(entry.plan, source, device);
-        entry.generation = source.generation;
-        return entry.plan;
-    }
-
-private:
-    static void copy_tensor(
-            mfq_tensor_backend::Tensor & destination,
-            const mfq_tensor_backend::Tensor & source,
-            int device) {
-        if (!source.defined()) {
-            destination = mfq_tensor_backend::Tensor();
-            return;
-        }
-        if (source.is_cuda() && source.get_device() == device) {
-            destination = source.contiguous();
-            return;
-        }
+static void copy_route_tensor(
+        CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor& destination,
+        const mfq_tensor_backend::Tensor& source,
+        int device) {
+    if (!source.defined()) {
+        destination = mfq_tensor_backend::Tensor();
+    } else if (source.is_cuda() && source.get_device() == device) {
+        destination = source.contiguous();
+    } else {
         destination = tensor_to_cuda_device(
-            source, device, std::move(destination));
+            execution, source, device, std::move(destination));
     }
+}
 
-    static void copy_plan(
-            MoeRoutePlan & destination,
-            const MoeRoutePlan & source,
-            int device) {
-        copy_tensor(destination.ids, source.ids, device);
-        copy_tensor(destination.ids_dst, source.ids_dst, device);
-        copy_tensor(destination.expert_bounds, source.expert_bounds, device);
-        copy_tensor(destination.tile_bounds, source.tile_bounds, device);
-        copy_tensor(destination.tile_experts, source.tile_experts, device);
-        if (source.mma_tile_m == 8) {
-            destination.mma_tile_bounds = destination.tile_bounds;
-            destination.mma_tile_experts = destination.tile_experts;
-        } else {
-            copy_tensor(destination.mma_tile_bounds, source.mma_tile_bounds, device);
-            copy_tensor(destination.mma_tile_experts, source.mma_tile_experts, device);
-        }
-        if (source.wide_tile_m == 8) {
-            destination.wide_tile_bounds = destination.tile_bounds;
-            destination.wide_tile_experts = destination.tile_experts;
-        } else if (source.wide_tile_m == source.mma_tile_m) {
-            destination.wide_tile_bounds = destination.mma_tile_bounds;
-            destination.wide_tile_experts = destination.mma_tile_experts;
-        } else {
-            copy_tensor(destination.wide_tile_bounds, source.wide_tile_bounds, device);
-            copy_tensor(destination.wide_tile_experts, source.wide_tile_experts, device);
-        }
-        copy_tensor(destination.counts, source.counts, device);
-        copy_tensor(destination.cursors, source.cursors, device);
-        destination.n_experts = source.n_experts;
-        destination.mma_tile_m = source.mma_tile_m;
-        destination.wide_tile_m = source.wide_tile_m;
-        destination.map_ready = source.map_ready;
-        destination.generation = source.generation;
-        destination.host_unique_experts = source.host_unique_experts;
+const MoeRoutePlan& moe_route_to_device(
+        CudaExecutionContext& execution,
+        const MoeRoutePlan& source,
+        int device) {
+    auto& replica = (*source.device_replicas)[device];
+    if (!replica) replica = std::make_shared<MoeRoutePlan>();
+    if (replica->generation == source.generation) return *replica;
+    copy_route_tensor(execution, replica->ids, source.ids, device);
+    copy_route_tensor(execution, replica->ids_dst, source.ids_dst, device);
+    copy_route_tensor(execution, replica->expert_bounds, source.expert_bounds, device);
+    copy_route_tensor(execution, replica->tile_bounds, source.tile_bounds, device);
+    copy_route_tensor(execution, replica->tile_experts, source.tile_experts, device);
+    if (source.mma_tile_m == 8) {
+        replica->mma_tile_bounds = replica->tile_bounds;
+        replica->mma_tile_experts = replica->tile_experts;
+    } else {
+        copy_route_tensor(execution, replica->mma_tile_bounds, source.mma_tile_bounds, device);
+        copy_route_tensor(execution, replica->mma_tile_experts, source.mma_tile_experts, device);
     }
-
-    std::unordered_map<int, MoeRouteReplicaEntry> entries_;
-};
-
-static thread_local MoeRouteReplicaCache g_moe_route_replica_cache;
-
-MoeRoutePlan moe_route_to_device(
-        const MoeRoutePlan & source, int device) {
-    return g_moe_route_replica_cache.get(source, device);
+    if (source.wide_tile_m == 8) {
+        replica->wide_tile_bounds = replica->tile_bounds;
+        replica->wide_tile_experts = replica->tile_experts;
+    } else if (source.wide_tile_m == source.mma_tile_m) {
+        replica->wide_tile_bounds = replica->mma_tile_bounds;
+        replica->wide_tile_experts = replica->mma_tile_experts;
+    } else {
+        copy_route_tensor(execution, replica->wide_tile_bounds, source.wide_tile_bounds, device);
+        copy_route_tensor(execution, replica->wide_tile_experts, source.wide_tile_experts, device);
+    }
+    copy_route_tensor(execution, replica->counts, source.counts, device);
+    copy_route_tensor(execution, replica->cursors, source.cursors, device);
+    replica->n_experts = source.n_experts;
+    replica->mma_tile_m = source.mma_tile_m;
+    replica->wide_tile_m = source.wide_tile_m;
+    replica->map_ready = source.map_ready;
+    replica->generation = source.generation;
+    replica->host_unique_experts = source.host_unique_experts;
+    return *replica;
 }
 
 MoeRoutePlan build_moe_route_plan(mfq_tensor_backend::Tensor ids, int n_experts) {
@@ -799,25 +773,30 @@ static MfeWeight wrap_mixed_moe_runtime(
     result.activation_geometries = runtime->activation_geometry();
     result.activation_workspace_domain = 2;
     result.mixed_forward = [runtime](
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x, const MoeRoutePlan & route) {
-        return runtime->forward(x, route);
+        return runtime->forward(execution, x, route);
     };
     result.mixed_prequantized_forward = [runtime](
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x, const MoeRoutePlan & route) {
-        return runtime->forward(x, route, true);
+        return runtime->forward(execution, x, route, true);
     };
     result.mixed_glu_output_forward = [runtime](
+            CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route,
             bool gelu) {
-        return runtime->forward_glu_output(x, route, gelu);
+        return runtime->forward_glu_output(execution, x, route, gelu);
     };
     if (runtime->supports_clamped_swiglu()) {
         result.mixed_clamped_swiglu_forward = [runtime](
+                CudaExecutionContext& execution,
                 mfq_tensor_backend::Tensor gate_up,
                 const MoeRoutePlan & route,
                 double limit) {
-            return runtime->forward_clamped_swiglu(gate_up, route, limit);
+            return runtime->forward_clamped_swiglu(
+                execution, gate_up, route, limit);
         };
     }
     return result;

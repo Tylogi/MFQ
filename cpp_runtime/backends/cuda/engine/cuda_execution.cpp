@@ -43,10 +43,6 @@ void mfq_release_host_allocator_cache() noexcept {
 
 using mfq_tensor_backend::indexing::Slice;
 
-namespace {
-thread_local CudaExecutionContext* active_execution_context = nullptr;
-}
-
 namespace mfq::cuda::internal {
 
 PrefillCudaTimer::PrefillCudaTimer()
@@ -286,27 +282,6 @@ KlKvCacheCapacityScope::~KlKvCacheCapacityScope() {
     execution.kl_kv_cache_capacity = previous_capacity;
 }
 
-CudaExecutionContext* current_cuda_execution_context() noexcept {
-    return active_execution_context;
-}
-
-CudaExecutionContext& cuda_execution_context() {
-    if (active_execution_context == nullptr) {
-        throw std::logic_error("CUDA execution context is not active");
-    }
-    return *active_execution_context;
-}
-
-CudaExecutionContextScope::CudaExecutionContextScope(
-        CudaExecutionContext& context) noexcept
-    : previous_(active_execution_context) {
-    active_execution_context = &context;
-}
-
-CudaExecutionContextScope::~CudaExecutionContextScope() {
-    active_execution_context = previous_;
-}
-
 void CudaExecutionContext::reset() noexcept {
     profiler.reset();
     moe_expert_cache.reset();
@@ -322,6 +297,7 @@ void CudaExecutionContext::reset() noexcept {
     drop_file_cache = false;
     decode_graph_serial_branches = false;
     decode_graph_tp_projection_major = false;
+    continuous_batch_cache_serial = false;
     moe_route_stats.clear();
     kl_mmq_mode = KlMmqMode::Default;
     kl_mmq_activation_quantize_calls = 0;
@@ -338,28 +314,26 @@ void CudaExecutionContext::reset() noexcept {
     gemma_stage_trace = nullptr;
 }
 
-bool model_parallel_enabled() {
-    const auto& execution = cuda_execution_context();
+bool model_parallel_enabled(const CudaExecutionContext& execution) {
     return execution.tensor_parallel.enabled() ||
         execution.expert_parallel.enabled();
 }
 
-const ParallelConfig & model_parallel_config() {
-    const auto& execution = cuda_execution_context();
+const ParallelConfig & model_parallel_config(
+        const CudaExecutionContext& execution) {
     return execution.tensor_parallel.enabled()
         ? execution.tensor_parallel
         : execution.expert_parallel;
 }
 
-const ParallelConfig & moe_parallel_config() {
-    const auto& execution = cuda_execution_context();
+const ParallelConfig & moe_parallel_config(
+        const CudaExecutionContext& execution) {
     return execution.expert_parallel.enabled()
         ? execution.expert_parallel
         : execution.tensor_parallel;
 }
 
-int model_parallel_primary_device() {
-    const auto& execution = cuda_execution_context();
+int model_parallel_primary_device(const CudaExecutionContext& execution) {
     if (!execution.tensor_parallel.devices.empty()) {
         return execution.tensor_parallel.primary_device();
     }
@@ -455,11 +429,11 @@ size_t model_parallel_launch_index(
 
 
 
-int active_weight_load_device() {
-    const auto& placement = cuda_execution_context().layer_placement;
+int active_weight_load_device(const CudaExecutionContext& execution) {
+    const auto& placement = execution.layer_placement;
     return placement.load_device >= 0
         ? placement.load_device
-        : model_parallel_primary_device();
+        : model_parallel_primary_device(execution);
 }
 
 const char * kl_mmq_mode_name(KlMmqMode mode) {
@@ -498,13 +472,14 @@ bool moe_route_output_energy_enabled() {
 }
 
 void record_moe_route_stats(
+        CudaExecutionContext& execution,
         int layer,
         const mfq_tensor_backend::Tensor & ids,
         const mfq_tensor_backend::Tensor & weights,
         const mfq_tensor_backend::Tensor & output,
         int n_experts) {
     if (layer < 0 || moe_route_stats_path() == nullptr) return;
-    auto& stats = cuda_execution_context().moe_route_stats;
+    auto& stats = execution.moe_route_stats;
     auto found = stats.find(layer);
     if (found == stats.end()) {
         auto options = mfq_tensor_backend::TensorOptions()
@@ -585,8 +560,11 @@ void write_moe_route_stats(
               << (moe_route_output_energy_enabled() ? 1 : 0) << "\n";
 }
 
-void trace_gemma_stage(int layer, const char * name, const mfq_tensor_backend::Tensor & value) {
-    auto& execution = cuda_execution_context();
+void trace_gemma_stage(
+        CudaExecutionContext& execution,
+        int layer,
+        const char * name,
+        const mfq_tensor_backend::Tensor & value) {
     if (execution.gemma_stage_trace != nullptr &&
             layer == execution.gemma_trace_layer) {
         execution.gemma_stage_trace->emplace_back(

@@ -39,13 +39,13 @@ struct Qwen4ExpMtp final : MtpModule {
         Qwen4ExpMtp result;
         result.execution=&execution;
         result.config=main;
-        result.embedding_norm=dense(file,"predictor.embedding_norm.weight").to(tb::kFloat32);
-        result.hidden_norm=dense(file,"predictor.hidden_norm.weight").to(tb::kFloat32);
-        result.embedding_fusion=linear(file,"predictor.fusion.embedding.weight");
-        result.hidden_fusion=linear(file,"predictor.fusion.hidden.weight");
-        result.final_mixer=std::make_unique<Gr>(file,main,"predictor.mhc.pre",false);
+        result.embedding_norm=dense(execution,file,"predictor.embedding_norm.weight").to(tb::kFloat32);
+        result.hidden_norm=dense(execution,file,"predictor.hidden_norm.weight").to(tb::kFloat32);
+        result.embedding_fusion=linear(execution,file,"predictor.fusion.embedding.weight");
+        result.hidden_fusion=linear(execution,file,"predictor.fusion.hidden.weight");
+        result.final_mixer=std::make_unique<Gr>(execution,file,main,"predictor.mhc.pre",false);
         for (int64_t i=0;i<count;++i)
-            result.layers.push_back(std::make_unique<Qwen4Block>(file,main,int(i),"predictor"));
+            result.layers.push_back(std::make_unique<Qwen4Block>(execution,file,main,int(i),"predictor"));
         MFQ_RUNTIME_CHECK(result.embedding_norm.dim()==1 && result.embedding_norm.numel()==main.hidden &&
             result.hidden_norm.dim()==1 && result.hidden_norm.numel()==main.hidden*main.streams,
             "Qwen4-Exp MTP normalization width disagrees with backbone");
@@ -56,7 +56,7 @@ struct Qwen4ExpMtp final : MtpModule {
     void reset(int64_t next_batch=1) override {
         MFQ_RUNTIME_CHECK(next_batch>0,"Qwen4-Exp MTP batch must be positive");
         for (auto& layer:layers) layer->reset(next_batch);
-        for (auto& pos:positions) pos={};
+        for (auto& pos:positions) pos=Tensor();
         std::fill(lengths.begin(),lengths.end(),0);batch=next_batch;
     }
 

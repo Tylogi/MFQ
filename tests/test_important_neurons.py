@@ -166,4 +166,7 @@ def test_runtime_parallelizes_in_branches_only_for_decode() -> None:
         ) :
     ]
     branch = branch[: branch.index("if (tensor_parallel_dense_compatible())")]
-    assert "decode_branch_parallel_enabled(rows) &&" in branch
+    assert (
+        "decode_branch_parallel_enabled(execution.decode_graph_serial_branches, rows) &&"
+        in branch
+    )

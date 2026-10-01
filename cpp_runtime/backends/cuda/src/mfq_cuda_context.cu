@@ -6,6 +6,7 @@
 #include <iostream>
 #include <mutex>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -15,7 +16,11 @@ namespace {
 
 std::mutex default_context_mutex;
 std::unordered_map<int, std::weak_ptr<Context>> default_contexts;
-thread_local std::unordered_map<int, StreamHandle> active_streams;
+// ponytail: global lock is sufficient; shard by thread if stream switching contends.
+std::mutex active_streams_mutex;
+std::unordered_map<
+    std::thread::id,
+    std::unordered_map<int, StreamHandle>> active_streams;
 
 template <typename Function>
 void on_device_noexcept(int device, Function&& function) noexcept {
@@ -179,9 +184,15 @@ StreamHandle current_stream(int device) {
     if (device < 0) {
         MFQ_NATIVE_CUDA_CHECK(cudaGetDevice(&device));
     }
-    if (const auto found = active_streams.find(device);
-        found != active_streams.end() && found->second) {
-        return found->second;
+    {
+        std::lock_guard lock(active_streams_mutex);
+        const auto thread = active_streams.find(std::this_thread::get_id());
+        if (thread != active_streams.end()) {
+            const auto found = thread->second.find(device);
+            if (found != thread->second.end() && found->second) {
+                return found->second;
+            }
+        }
     }
     auto context = default_context(device);
     auto* stream = &context->stream();
@@ -217,17 +228,23 @@ StreamHandle stream_from_pool(bool high_priority, int device) {
 }
 
 StreamGuard::StreamGuard(StreamHandle stream) : device_(stream.device_index()) {
-    if (const auto found = active_streams.find(device_); found != active_streams.end()) {
+    std::lock_guard lock(active_streams_mutex);
+    auto& streams = active_streams[std::this_thread::get_id()];
+    if (const auto found = streams.find(device_); found != streams.end()) {
         previous_ = found->second;
     }
-    active_streams[device_] = std::move(stream);
+    streams[device_] = std::move(stream);
 }
 
 StreamGuard::~StreamGuard() noexcept {
+    std::lock_guard lock(active_streams_mutex);
+    const auto thread_id = std::this_thread::get_id();
+    auto& streams = active_streams[thread_id];
     if (previous_.has_value()) {
-        active_streams[device_] = std::move(*previous_);
+        streams[device_] = std::move(*previous_);
     } else {
-        active_streams.erase(device_);
+        streams.erase(device_);
+        if (streams.empty()) active_streams.erase(thread_id);
     }
 }
 

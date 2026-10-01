@@ -95,7 +95,7 @@ def test_optional_predictor_experts_join_the_shared_moe_cache() -> None:
     assert "!defer_moe_cache_finalize" in MODEL_LOADER
     assert "bool load_optional_components" in CUDA_RUNTIME
     assert CUDA_RUNTIME.index("load_runtime_components(") < CUDA_RUNTIME.index(
-        "finalize_moe_expert_cache();"
+        "finalize_moe_expert_cache(execution.moe_expert_cache);"
     )
 
 

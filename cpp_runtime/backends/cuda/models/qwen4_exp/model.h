@@ -21,8 +21,8 @@ public:
         MFQ_RUNTIME_CHECK(nk_>0 && nv_>0 && nv_%nk_==0 && d_>0 && kernel_>1 && eps_>0,
             "invalid Qwen4 GDN head/convolution geometry");
     }
-    void reset() {conv_={};state_={};commit();}
-    void commit() {saved_conv_={};saved_state_={};}
+    void reset() {conv_=Tensor();state_=Tensor();commit();}
+    void commit() {saved_conv_=Tensor();saved_state_=Tensor();}
     void rollback() {
         MFQ_RUNTIME_CHECK(saved_conv_.defined(),"Qwen4 GDN has no speculative checkpoint");
         conv_=saved_conv_;state_=saved_state_;commit();
@@ -176,8 +176,8 @@ class Ple {
 public:
     Ple(NgramEmbedding embedding,PleWeights weights,int64_t hidden,int64_t streams,int64_t dilation,double eps)
         : embedding_(std::move(embedding)),w_(std::move(weights)),hidden_(hidden),streams_(streams),dilation_(dilation),eps_(eps) {}
-    void reset() {embedding_.reset();conv_={};commit();}
-    void commit() {saved_=false;saved_conv_={};saved_context_={};}
+    void reset() {embedding_.reset();conv_=Tensor();commit();}
+    void commit() {saved_=false;saved_conv_=Tensor();saved_context_={};}
     void rollback() {
         MFQ_RUNTIME_CHECK(saved_,"Qwen4 PLE has no speculative checkpoint");
         conv_=saved_conv_;embedding_.restore(saved_context_);commit();

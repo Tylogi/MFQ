@@ -171,7 +171,8 @@ int generate_diagnostic_tokens(
         }
         std::cout << "\n";
         if (execution.moe_expert_cache) {
-            print_moe_expert_cache_stats(std::cout);
+            print_moe_expert_cache_stats(
+                execution.moe_expert_cache, std::cout);
         }
         return 0;
  }

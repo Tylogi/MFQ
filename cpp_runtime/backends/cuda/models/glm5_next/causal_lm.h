@@ -10,6 +10,7 @@
 namespace mfq::cuda::glm5_next {
 
 std::unique_ptr<::Block> load_block(
+    CudaExecutionContext& execution,
     const mfq::ModelSource& source,
     const mfq::models::glm5_next::Config& config,
     int layer);

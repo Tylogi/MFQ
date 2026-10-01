@@ -112,6 +112,7 @@ struct GlmDsaBlock : Block {
     }
 
     mfq_tensor_backend::Tensor headwise_project(
+        CudaExecutionContext& execution,
         const MfeWeight & weight, mfq_tensor_backend::Tensor x,
         int64_t B, int64_t T, int64_t heads) const {
         if (x.dim() != 4 || x.size(0) != B || x.size(1) != T ||
@@ -121,7 +122,9 @@ struct GlmDsaBlock : Block {
         }
         const int64_t rows = B * T * heads;
         const auto & route = shared_state->head_route(rows, static_cast<int>(heads));
-        auto y = weight.forward(x.contiguous().reshape({rows, weight.neuron_len}), route);
+        auto y = weight.forward(
+            execution,
+            x.contiguous().reshape({rows, weight.neuron_len}), route);
         return y.reshape({B, T, heads, weight.out_per_expert});
     }
 
@@ -364,7 +367,8 @@ struct GlmDsaBlock : Block {
         }
 
         auto q_absorbed = profiler.measure("glm.embed_q", [&]() {
-            return headwise_project(embed_q, q_nope, B, T, kHeads);
+            return headwise_project(
+                execution, embed_q, q_nope, B, T, kHeads);
         }).permute({0, 2, 1, 3}).contiguous();
         auto q_mla = mfq_tensor_backend::cat({q_absorbed, q_pe}, -1)
             .to(mfq_tensor_backend::kFloat32).contiguous();
@@ -405,7 +409,8 @@ struct GlmDsaBlock : Block {
         }
         auto value_heads = profiler.measure("glm.unembed_out", [&]() {
             return headwise_project(
-                unembed_out, attended.to(mfq_tensor_backend::kFloat16).contiguous(),
+                execution, unembed_out,
+                attended.to(mfq_tensor_backend::kFloat16).contiguous(),
                 B, T, kHeads);
         });
         auto attn_out = profiler.measure("glm.o_proj", [&]() {
@@ -432,11 +437,13 @@ struct GlmDsaBlock : Block {
 namespace mfq::cuda::glm_dsa {
 
 void load_ffn(
+    CudaExecutionContext& execution,
     const mfq::ModelSource& source,
     const Config& config,
     int layer,
     ::FFN& ffn);
 std::unique_ptr<::Block> load_block(
+    CudaExecutionContext& execution,
     const mfq::ModelSource& source,
     const Config& config,
     int layer,

@@ -41,22 +41,22 @@ struct Glm5NextMtp final : MtpModule {
         Glm5NextMtp result;
         result.execution=&execution;
         result.config=main;
-        result.embedding_norm=dense(file,"predictor.embedding_norm.weight").to(tb::kFloat32);
-        result.hidden_norm=dense(file,"predictor.hidden_norm.weight").to(tb::kFloat32);
-        result.output_norm=dense(file,"predictor.output_norm.weight");
-        result.fusion=linear(file,"predictor.fusion.weight");
+        result.embedding_norm=dense(execution,file,"predictor.embedding_norm.weight").to(tb::kFloat32);
+        result.hidden_norm=dense(execution,file,"predictor.hidden_norm.weight").to(tb::kFloat32);
+        result.output_norm=dense(execution,file,"predictor.output_norm.weight");
+        result.fusion=linear(execution,file,"predictor.fusion.weight");
         for (int64_t i=0;i<count;++i) {
             const auto p="predictor.block."+std::to_string(i),a=p+".attention";
-            Layer layer;layer.attention_norm=dense(file,a+".norm.weight");layer.ffn_norm=dense(file,p+".mlp.norm.weight");
-            layer.ffn=glm_ffn(file,main,int(i),"predictor");
-            MlaWeights w{linear(file,a+".query_a.weight"),linear(file,a+".key_value_a.weight"),
-                linear(file,a+".query_b.weight"),linear(file,a+".output.weight"),linear(file,a+".indexer.query.weight"),
-                linear(file,a+".indexer.key.weight"),linear(file,a+".indexer.score.weight"),
-                headwise(routed(file,a+".latent.query_embedding.weight",int(i),main.heads,main.latent,main.nope),main.heads,main.latent),
-                headwise(routed(file,a+".latent.output_unembedding.weight",int(i),main.heads,main.value_width,main.latent),main.heads,main.value_width),
-                dense(file,a+".query_a_norm.weight"),dense(file,a+".key_value_a_norm.weight"),
-                dense(file,a+".indexer.key_norm.weight"),dense(file,a+".indexer.key_norm.bias"),
-                dense(file,a+".indexer.pool.gate"),dense(file,a+".indexer.pool.position")};
+            Layer layer;layer.attention_norm=dense(execution,file,a+".norm.weight");layer.ffn_norm=dense(execution,file,p+".mlp.norm.weight");
+            layer.ffn=glm_ffn(execution,file,main,int(i),"predictor");
+            MlaWeights w{linear(execution,file,a+".query_a.weight"),linear(execution,file,a+".key_value_a.weight"),
+                linear(execution,file,a+".query_b.weight"),linear(execution,file,a+".output.weight"),linear(execution,file,a+".indexer.query.weight"),
+                linear(execution,file,a+".indexer.key.weight"),linear(execution,file,a+".indexer.score.weight"),
+                headwise(routed(execution,file,a+".latent.query_embedding.weight",int(i),main.heads,main.latent,main.nope),main.heads,main.latent),
+                headwise(routed(execution,file,a+".latent.output_unembedding.weight",int(i),main.heads,main.value_width,main.latent),main.heads,main.value_width),
+                dense(execution,file,a+".query_a_norm.weight"),dense(execution,file,a+".key_value_a_norm.weight"),
+                dense(execution,file,a+".indexer.key_norm.weight"),dense(execution,file,a+".indexer.key_norm.bias"),
+                dense(execution,file,a+".indexer.pool.gate"),dense(execution,file,a+".indexer.pool.position")};
             MlaConfig mc{main.heads,main.nope,main.latent,main.value_width,main.index_heads,
                 main.index_width,main.pool,main.budget,main.maximum,main.tail,main.eps};
             layer.attention=std::make_unique<SparseMla>(std::move(w),mc);

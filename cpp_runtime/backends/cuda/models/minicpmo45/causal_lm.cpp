@@ -64,7 +64,8 @@ MiniCPMO45Model::adapter_load_block(
         int layer,
         int,
         const std::string& type) {
-    return load_transformer_block(source, config, layer, type, true);
+    return load_transformer_block(
+        *execution, source, config, layer, type, true);
 }
 
 void MiniCPMOTtsModel::adapter_load_config(
@@ -90,7 +91,8 @@ MiniCPMOTtsModel::adapter_load_block(
         int layer,
         int,
         const std::string& type) {
-    return load_transformer_block(source, config, layer, type, false);
+    return load_transformer_block(
+        *execution, source, config, layer, type, false);
 }
 
 mfq_tensor_backend::Tensor

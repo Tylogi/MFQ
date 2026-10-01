@@ -33,13 +33,10 @@ struct Qwen35Mtp final : MtpModule {
         Qwen35Mtp result;
         result.config = main;
         result.execution = &execution;
-        result.hidden_norm = load_dense_gpu(
-            file, "predictor.hidden_norm.weight");
-        result.embedding_norm = load_dense_gpu(
-            file, "predictor.embedding_norm.weight");
-        result.output_norm = load_dense_gpu(
-            file, "predictor.output_norm.weight");
-        result.fusion = load_quant_linear(file, "predictor.fusion.weight");
+        result.hidden_norm = load_dense_gpu(execution, file, "predictor.hidden_norm.weight");
+        result.embedding_norm = load_dense_gpu(execution, file, "predictor.embedding_norm.weight");
+        result.output_norm = load_dense_gpu(execution, file, "predictor.output_norm.weight");
+        result.fusion = load_quant_linear(execution, file, "predictor.fusion.weight");
         MFQ_RUNTIME_CHECK(
             result.fusion.neuron_len() == 2 * main.hidden_size &&
                 result.fusion.out() == main.hidden_size &&
@@ -49,7 +46,8 @@ struct Qwen35Mtp final : MtpModule {
             "Qwen MTP component dimensions disagree with the backbone");
         for (int layer = 0; layer < main.mtp_num_hidden_layers; ++layer) {
             auto block = mfq::cuda::qwen35::load_block(
-                file, result.config, layer, "full_attention", "predictor");
+                execution, file, result.config, layer,
+                "full_attention", "predictor");
             block->cuda_device =
                 execution.layer_placement.primary_device();
             result.blocks.push_back(std::move(block));
@@ -112,14 +110,15 @@ struct Qwen35Mtp final : MtpModule {
                 .to(mfq_tensor_backend::kFloat32),
             hidden_norm, config.rms_norm_eps, norm_weight_offset)
             .reshape_as(hidden);
-        trace_gemma_stage(0, "mtp.embedding_norm", e);
-        trace_gemma_stage(0, "mtp.hidden_norm", h);
+        trace_gemma_stage(*execution, 0, "mtp.embedding_norm", e);
+        trace_gemma_stage(*execution, 0, "mtp.hidden_norm", h);
         auto x = fusion.forward(
             *execution, mfq_tensor_backend::cat({e, h}, -1));
-        trace_gemma_stage(0, "mtp.fusion", x);
+        trace_gemma_stage(*execution, 0, "mtp.fusion", x);
         auto pos = positions.defined()
             ? tensor_to_cuda_device(
-                  positions, execution->layer_placement.primary_device())
+                  *execution, positions,
+                  execution->layer_placement.primary_device())
                   .to(mfq_tensor_backend::kInt64).contiguous()
             : mfq_tensor_backend::arange(
                   cache_pos, cache_pos + tokens,
@@ -154,7 +153,7 @@ struct Qwen35Mtp final : MtpModule {
                 .to(mfq_tensor_backend::kFloat32),
             output_norm, config.rms_norm_eps, norm_weight_offset)
             .reshape({batch, tokens, config.hidden_size});
-        trace_gemma_stage(0, "mtp.output_norm", output);
+        trace_gemma_stage(*execution, 0, "mtp.output_norm", output);
         return output;
     }
 
