@@ -180,7 +180,8 @@ public:
             prefill_callback = {},
         const MfqTokenConstraintPtr& token_constraint = {},
         std::optional<std::size_t> stable_prefix_tokens =
-            std::nullopt);
+            std::nullopt,
+        int prefill_chunk_size = 2048);
 
     // All optional input components converge here. Sampling, penalties,
     // cache management and MTP are deliberately shared with text generation.
@@ -232,15 +233,28 @@ public:
     const MlxMtpGenerationStats& last_mtp_stats() const noexcept {
         return last_mtp_stats_;
     }
+    const std::vector<std::size_t>& last_prefill_chunk_sizes() const noexcept {
+        return last_prefill_chunk_sizes_;
+    }
     std::string_view multimodal_input_contract() const noexcept {
         return vision_ ? vision_->input_contract() : std::string_view{};
     }
 
 private:
+    std::int32_t generate_prepared_impl(
+        const MlxPreparedPrompt& prompt,
+        const MlxSamplingParams& sampling,
+        std::int32_t max_tokens,
+        const MlxTokenCallback& callback,
+        const std::function<void(std::size_t, double)>& prefill_callback,
+        const MfqTokenConstraintPtr& token_constraint,
+        std::optional<std::size_t> stable_prefix_tokens,
+        int prefill_chunk_size);
     void validate_components() const;
     void prepare_cache_for_prefill(
         int batch,
         int prompt_tokens);
+    void materialize_prefill_state();
     std::pair<mlx::core::array, mlx::core::array>
     forward_embeddings_impl(
         const mlx::core::array& embeddings,
@@ -271,6 +285,7 @@ private:
     std::optional<MlxQwen35MtpModule> mtp_;
     std::optional<MlxGridVisionPromptComponent> vision_;
     MlxMtpGenerationStats last_mtp_stats_;
+    std::vector<std::size_t> last_prefill_chunk_sizes_;
     int cache_position_ = 0;
     int cache_batch_ = 0;
     std::vector<std::int64_t> stable_cache_tokens_;

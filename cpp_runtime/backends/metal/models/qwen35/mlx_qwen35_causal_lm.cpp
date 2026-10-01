@@ -832,6 +832,16 @@ void MlxQwen35CausalLm::prepare_cache_for_prefill(
     }
 }
 
+void MlxQwen35CausalLm::materialize_prefill_state() {
+    detail::measure_evaluation([this]() {
+        visit_layers(
+            layers_,
+            [](auto& layer) {
+                layer.materialize_cache();
+            });
+    });
+}
+
 void MlxQwen35CausalLm::clear_cache() noexcept {
     visit_layers(
         layers_,
@@ -941,17 +951,19 @@ std::int32_t MlxQwen35CausalLm::generate(
     const std::function<void(std::size_t, double)>&
         prefill_callback,
     const MfqTokenConstraintPtr& token_constraint,
-    std::optional<std::size_t> stable_prefix_tokens) {
+    std::optional<std::size_t> stable_prefix_tokens,
+    int prefill_chunk_size) {
     MlxPreparedPrompt prepared;
     prepared.token_ids = prompt;
-    return generate_prepared(
+    return generate_prepared_impl(
         prepared,
         sampling,
         max_tokens,
         callback,
         prefill_callback,
         token_constraint,
-        stable_prefix_tokens);
+        stable_prefix_tokens,
+        prefill_chunk_size);
 }
 
 std::int32_t MlxQwen35CausalLm::generate_prepared(
@@ -962,6 +974,26 @@ std::int32_t MlxQwen35CausalLm::generate_prepared(
     const std::function<void(std::size_t, double)>& prefill_callback,
     const MfqTokenConstraintPtr& token_constraint,
     std::optional<std::size_t> stable_prefix_tokens) {
+    return generate_prepared_impl(
+        prepared,
+        sampling,
+        max_tokens,
+        callback,
+        prefill_callback,
+        token_constraint,
+        stable_prefix_tokens,
+        static_cast<int>(prepared.token_ids.size()));
+}
+
+std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
+    const MlxPreparedPrompt& prepared,
+    const MlxSamplingParams& sampling,
+    std::int32_t max_tokens,
+    const MlxTokenCallback& callback,
+    const std::function<void(std::size_t, double)>& prefill_callback,
+    const MfqTokenConstraintPtr& token_constraint,
+    std::optional<std::size_t> stable_prefix_tokens,
+    int prefill_chunk_size) {
     const auto& prompt = prepared.token_ids;
     if (prompt.empty()) {
         throw std::invalid_argument(
@@ -971,6 +1003,11 @@ std::int32_t MlxQwen35CausalLm::generate_prepared(
         throw std::invalid_argument(
             "Qwen3.5 generation max_tokens cannot be negative");
     }
+    if (prefill_chunk_size <= 0) {
+        throw std::invalid_argument(
+            "Qwen3.5 prefill chunk size must be positive");
+    }
+    last_prefill_chunk_sizes_.clear();
     const int vocab = static_cast<int>(config_.vocab_size);
     const int maximum_sequence =
         static_cast<int>(config_.max_position_embeddings);
@@ -1130,6 +1167,7 @@ std::int32_t MlxQwen35CausalLm::generate_prepared(
                 }
             }
             const auto run = [&](bool retain_hidden) {
+                last_prefill_chunk_sizes_.push_back(end - begin);
                 if (embeddings) {
                     auto result = forward_embeddings_impl(
                         *embeddings,
@@ -1170,13 +1208,34 @@ std::int32_t MlxQwen35CausalLm::generate_prepared(
             }
             return run(false);
         };
+        const auto prefill_range = [&](std::size_t begin, std::size_t end) {
+            if (mtp_active) {
+                return forward_range(begin, end);
+            }
+            std::optional<array> last;
+            for (std::size_t offset = begin; offset < end;
+                 offset += static_cast<std::size_t>(prefill_chunk_size)) {
+                const auto stop = std::min(
+                    end,
+                    offset + static_cast<std::size_t>(prefill_chunk_size));
+                last = forward_range(offset, stop);
+                if (stop < end) {
+                    materialize_prefill_state();
+                }
+            }
+            if (!last) {
+                throw std::runtime_error(
+                    "Qwen3.5 session prefill range is empty");
+            }
+            return std::move(*last);
+        };
         std::optional<array> stable_logits;
         array value = [&]() {
             if (stable_count == 0) {
-                return forward_range(0, prompt.size());
+                return prefill_range(0, prompt.size());
             }
             if (reused_tokens < stable_count) {
-                stable_logits = forward_range(
+                stable_logits = prefill_range(
                     reused_tokens, stable_count);
             }
             if (cache_position_ != static_cast<int>(stable_count)) {
@@ -1190,7 +1249,7 @@ std::int32_t MlxQwen35CausalLm::generate_prepared(
             stable_snapshot =
                 capture_text_session_state(stable_tokens);
             if (stable_count < prompt.size()) {
-                return forward_range(stable_count, prompt.size());
+                return prefill_range(stable_count, prompt.size());
             }
             if (!stable_logits) {
                 throw std::runtime_error(

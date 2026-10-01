@@ -355,8 +355,9 @@ static std::vector<mfq_tensor_backend::Tensor> gdn_cuda_impl(
 
     const float *qd = q.data_ptr<float>(), *kd = k.data_ptr<float>(), *vd = v.data_ptr<float>();
     const float *gd = g.data_ptr<float>(), *bd = beta.data_ptr<float>();
-    const float* sd = state.has_value() && state->defined() && state->numel() > 0
-                          ? state->contiguous().data_ptr<float>() : nullptr;
+    auto initial_state = state.has_value() && state->defined() && state->numel() > 0
+        ? state->contiguous() : mfq_tensor_backend::Tensor{};
+    const float* sd = initial_state.defined() ? initial_state.data_ptr<float>() : nullptr;
     float* od = out.data_ptr<float>();
     float* sod = s_out.data_ptr<float>();
     cudaStream_t stream = mfq_current_cuda_stream();

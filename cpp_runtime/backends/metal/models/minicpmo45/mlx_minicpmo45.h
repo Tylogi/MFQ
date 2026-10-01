@@ -117,6 +117,10 @@ struct MlxMiniCPMO45DuplexResult {
     std::int64_t tts_cache_position = 0;
 };
 
+namespace detail {
+void test_minicpmo45_chunked_prefill_generation();
+} // namespace detail
+
 // Native C++/MLX implementation of the official MiniCPM-o 4.5 composite
 // graph. Processor-owned image/audio tensors use the same layouts as the
 // CUDA runtime documented in docs/minicpmo45.md. Token2wav waveform rendering
@@ -183,7 +187,8 @@ public:
             prefill_callback = {},
         const MfqTokenConstraintPtr& token_constraint = {},
         std::optional<std::size_t> stable_prefix_tokens =
-            std::nullopt);
+            std::nullopt,
+        int prefill_chunk_size = 2048);
 
     std::int32_t generate_multimodal(
         const MlxMiniCPMO45Inputs& inputs,
@@ -209,13 +214,18 @@ public:
     std::int64_t maximum_context() const noexcept;
     std::int64_t vocabulary_size() const noexcept;
     int cache_position() const noexcept;
+    const std::vector<std::size_t>& last_prefill_chunk_sizes() const noexcept {
+        return last_prefill_chunk_sizes_;
+    }
 
 private:
+    friend void detail::test_minicpmo45_chunked_prefill_generation();
     class Impl;
     explicit MlxMiniCPMO45Runtime(std::unique_ptr<Impl> implementation);
     MlxMiniCPMO45ForwardResult prepare_inputs(
         const MlxMiniCPMO45Inputs& inputs);
     std::unique_ptr<Impl> implementation_;
+    std::vector<std::size_t> last_prefill_chunk_sizes_;
 };
 
 namespace detail {
@@ -224,6 +234,7 @@ namespace detail {
 // It compares causal prefill with token-by-token BF16 KV-cache execution.
 void test_minicpmo45_metal_profile_dispatch();
 void test_minicpmo45_qwen3_cache_equivalence();
+void test_minicpmo45_chunked_prefill_generation();
 void test_minicpmo45_qk_norm_rope();
 void test_minicpmo45_gqa_attention();
 
