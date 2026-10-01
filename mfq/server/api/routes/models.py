@@ -22,10 +22,12 @@ from mfq.server.protocol.models import (
     EvaluationResultList,
     HubModelInfo,
     HubModelSearchResult,
+    HubReferenceRequest,
     ModelArtifactList,
     ModelDirectoryList,
     ModelLoadRequest,
     ModelUnloadRequest,
+    OfficialModelList,
     OperationAccepted,
     RegisterModelDirectoryRequest,
     RemoteNodeList,
@@ -36,6 +38,32 @@ from mfq.server.services.service import ServiceError
 
 hub_router = APIRouter()
 router = APIRouter()
+
+
+@hub_router.get(
+    "/api/v1/hub/official",
+    response_model=OfficialModelList,
+    responses=ERROR_RESPONSES,
+    tags=["models"],
+)
+async def official_hub_models(
+    service: ServiceDependency,
+    refresh: bool = False,
+) -> OfficialModelList:
+    return await service.official_hub_models(refresh=refresh)
+
+
+@hub_router.post(
+    "/api/v1/hub/resolve",
+    response_model=HubModelInfo,
+    responses=ERROR_RESPONSES,
+    tags=["models"],
+)
+async def resolve_hub_model(
+    service: ServiceDependency,
+    body: HubReferenceRequest,
+) -> HubModelInfo:
+    return await service.resolve_hub_model(body)
 
 
 @hub_router.get(

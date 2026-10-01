@@ -8,6 +8,8 @@
 @import './features/runtime/logs.css';
 @import './features/connections/connections.css';
 @import './features/settings/settings.css';
+@import './features/settings/update-manager.css';
+@import './features/models/model-browser.css';
 @import './features/jobs/jobs.css';
 @import './features/chat/chat.css';
 @import './shared/styles/dialogs.css';

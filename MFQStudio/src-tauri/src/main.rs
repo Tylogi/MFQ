@@ -1,3 +1,5 @@
+mod updater;
+
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -430,14 +432,20 @@ async fn studio_select_model_directory(app: AppHandle) -> Result<Option<Vec<Stri
     if !response.status().is_success() {
         let status = response.status();
         let detail = response.text().await.unwrap_or_default();
-        return Err(format!("model directory registration failed ({status}): {detail}"));
+        return Err(format!(
+            "model directory registration failed ({status}): {detail}"
+        ));
     }
     let registered = response
         .json::<RegisteredModelList>()
         .await
         .map_err(|error| format!("invalid model registration response: {error}"))?;
     Ok(Some(
-        registered.data.into_iter().map(|model| model.name).collect(),
+        registered
+            .data
+            .into_iter()
+            .map(|model| model.name)
+            .collect(),
     ))
 }
 
@@ -479,9 +487,50 @@ fn studio_credential_set(token: String) -> Result<(), String> {
     }
 }
 
+#[tauri::command]
+fn studio_open_external(url: String) -> Result<(), String> {
+    let parsed = Url::parse(&url).map_err(|error| format!("invalid external URL: {error}"))?;
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port_or_known_default() != Some(443)
+        || !matches!(
+            host.as_str(),
+            "github.com"
+                | "www.github.com"
+                | "huggingface.co"
+                | "www.huggingface.co"
+                | "modelscope.cn"
+                | "www.modelscope.cn"
+        )
+    {
+        return Err("external links are limited to trusted MFQ model and release hosts".into());
+    }
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("/usr/bin/open");
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut value = Command::new("rundll32.exe");
+        value.arg("url.dll,FileProtocolHandler");
+        value
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = Command::new("xdg-open");
+    command
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("could not open external link: {error}"))
+}
+
 fn main() {
+    if updater::maybe_run_update_helper() {
+        return;
+    }
     tauri::Builder::default()
         .manage(StudioState::default())
+        .manage(updater::UpdateState::default())
         .invoke_handler(tauri::generate_handler![
             studio_status,
             studio_configure,
@@ -489,7 +538,14 @@ fn main() {
             studio_select_model_directory,
             studio_confirm,
             studio_credential_get,
-            studio_credential_set
+            studio_credential_set,
+            studio_open_external,
+            updater::studio_update_status,
+            updater::studio_update_progress,
+            updater::studio_update_set_automatic,
+            updater::studio_update_download,
+            updater::studio_update_install,
+            updater::studio_update_delete
         ])
         .run(tauri::generate_context!())
         .expect("MFQ Studio failed");
