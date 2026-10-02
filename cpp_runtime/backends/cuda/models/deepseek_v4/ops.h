@@ -807,7 +807,7 @@ mfq_tensor_backend::Tensor finalize_hidden(mfq_tensor_backend::Tensor hidden,
 
 namespace mfq::cuda {
 
-struct DeepseekV4Model : CausalLmArchitecture {
+struct DeepseekV4Model : CausalResources {
     template <class Backend> using CausalModel = mfq::models::deepseek_v4::CausalLm<Backend>;
     mfq::models::deepseek_v4::Config config;
     deepseek_v4::OutputHeadWeights output_head;
@@ -819,8 +819,6 @@ struct DeepseekV4Model : CausalLmArchitecture {
     std::unique_ptr<Block> adapter_load_block(const mfq::ModelSource &source, int layer, int device,
                                               const std::string &type);
 
-    mfq_tensor_backend::Tensor adapter_prepare_hidden(mfq_tensor_backend::Tensor hidden,
-                                                      int64_t batch, int64_t tokens) const;
     mfq_tensor_backend::Tensor collapse_hidden(mfq_tensor_backend::Tensor hidden, int64_t batch,
                                                int64_t tokens) const;
     mfq_tensor_backend::Tensor normalize_hidden(mfq_tensor_backend::Tensor hidden,

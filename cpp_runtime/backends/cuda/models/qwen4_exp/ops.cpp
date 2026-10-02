@@ -40,32 +40,6 @@ void Qwen4Model::adapter_reset(int64_t new_batch) {
     batch = new_batch;
 }
 
-CudaPreparedPositions Qwen4Model::adapter_prepare_positions(mfq_tensor_backend::Tensor current,
-                                                            int64_t, int64_t) {
-    if ((current.dim() == 2 || current.dim() == 3) && current.size(0) == 4) {
-        current = current.narrow(0, 1, 3);
-    }
-    auto full = current;
-    if (positions.defined()) {
-        full = mfq_tensor_backend::cat({positions, current}, -1);
-    }
-    return {std::move(current), std::move(full)};
-}
-
-void Qwen4Model::adapter_validate_positions(const mfq_tensor_backend::Tensor &current,
-                                            int64_t batch_size, int64_t tokens, bool) const {
-    MFQ_RUNTIME_CHECK(
-        (current.dim() == 1 || (current.dim() == 2 && current.size(0) == 3) ||
-         (current.dim() == 3 && current.size(0) == 3 && current.size(1) == batch_size)) &&
-            current.size(-1) == tokens,
-        "Qwen4 positions require [T], [3,T], [4,T], [3,B,T] or [4,B,T]");
-}
-
-mfq_tensor_backend::Tensor Qwen4Model::adapter_prepare_hidden(mfq_tensor_backend::Tensor hidden,
-                                                              int64_t, int64_t) const {
-    return hidden.to(mfq_tensor_backend::kFloat16).repeat({1, 1, metadata.hc_mult});
-}
-
 mfq_tensor_backend::Tensor
 Qwen4Model::adapter_block_positions(const mfq_tensor_backend::Tensor &full_positions,
                                     const mfq_tensor_backend::Tensor &, int device) const {

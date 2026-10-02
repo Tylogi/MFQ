@@ -1,14 +1,15 @@
-#include "engine/cuda_engine.h"
-#include "diagnostics/generation_result.h"
 #include "cuda_execution.h"
 #include "cuda_runtime_config.h"
+#include "diagnostics/generation_result.h"
+#include "engine/cuda_engine.h"
 #include "engine/text_session_cache.h"
+#include "mfq_paged_prefix_cache.h"
+#include "models/gemma4/causal_lm.h"
 #include "models/minicpmo45/ops.h"
 #include "models/minicpmo45/tts.h"
-#include "models/qwen35/ops.h"
 #include "models/qwen35/linear_attention.h"
+#include "models/qwen35/ops.h"
 #include "models/session_state.h"
-#include "mfq_paged_prefix_cache.h"
 
 #include <chrono>
 #include <filesystem>
@@ -18,8 +19,43 @@
 using namespace mfq::cuda;
 using namespace mfq::cuda::internal;
 
-static void check(bool ok, const char* message) {
-    if (!ok) throw std::runtime_error(message);
+static void check(bool ok, const char *message) {
+    if (!ok)
+        throw std::runtime_error(message);
+}
+
+static void check_gemma_composition() {
+    using namespace mfq_tensor_backend;
+    using mfq::models::gemma4::FfnNorm;
+    auto fp32 = TensorOptions().dtype(kFloat32).device(kCUDA);
+    auto values = arange(16, fp32).reshape({2, 8});
+    auto dense = ((values - 8) * 0.09).to(kFloat16);
+    auto routed = ((values + 2) * 0.13).to(kFloat16);
+    auto residual = ((values - 3) * 0.05).to(kFloat16);
+    auto weight = arange(8, fp32) * 0.02 + 1;
+    auto dense_norm = weight, expert_norm = weight + 0.1, output_norm = weight + 0.2;
+    auto scale = full({1}, 0.8, fp32).to(kFloat16);
+    auto run = [&](bool fused) {
+        return mfq::models::gemma4::feed_forward(
+            true, true, fused, residual, [&] { return dense; }, [&] { return routed; },
+            [&](Tensor x, FfnNorm role) {
+                auto norm = role == FfnNorm::dense     ? dense_norm
+                            : role == FfnNorm::experts ? expert_norm
+                                                       : output_norm;
+                return rms_norm_f16_cuda(x.contiguous(), norm, 1e-6, 0.0);
+            },
+            [](Tensor x, Tensor y) { return x + y; },
+            [](Tensor x, Tensor y) { return acc_cuda(x.contiguous(), y.contiguous()); },
+            [&](Tensor x) { return x * scale; },
+            [&](Tensor d, Tensor e, Tensor r) {
+                return gemma4_ffn_merge_f16_cuda(d, e, r, dense_norm, expert_norm, output_norm,
+                                                 scale, 1e-6);
+            });
+    };
+    auto expected = run(false).to(kFloat32);
+    auto actual = run(true).to(kFloat32);
+    check((actual - expected).abs().max().item<float>() < 3e-3F,
+          "shared Gemma FFN composition differs from the fused kernel");
 }
 
 static void check_tts_sampling() {
@@ -316,6 +352,7 @@ int main(int argc, char** argv) try {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     check_linear_execution();
+    check_gemma_composition();
     check_tts_sampling();
     check_ffn_branches();
     {

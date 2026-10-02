@@ -18,6 +18,10 @@ template <class Tensor, class Plan> struct CausalForwardInputs {
     Plan plan{};
 };
 
+template <class Tensor> struct CausalPositions {
+    Tensor positions, full_positions;
+};
+
 // Backend owns tensors, weights, physical state and numerical operations.
 // This class owns the causal model entry points and their logical transitions.
 template <class Backend, class Derived> struct CausalModelBase : Backend, CausalState {
@@ -27,6 +31,62 @@ template <class Backend, class Derived> struct CausalModelBase : Backend, Causal
     using SessionState = typename Backend::SessionState;
     using SessionStateKind = typename Backend::SessionStateKind;
     using SessionCodec = typename Backend::SessionCodec;
+
+    template <class Graph, class Source>
+    void load_definition(std::string_view payload, const Graph &graph, const Source &source,
+                         int64_t context_size = 0) {
+        require_model(Derived::accepts_backbone(graph.backbone),
+                      "model backbone does not match the requested causal model");
+        model().adapter_load_config(payload, graph, source);
+        require_model(num_hidden_layers() == graph.topology.text_layers,
+                      "model graph/config text-layer topology mismatch");
+        if (context_size > 0) {
+            require_model(context_size <= max_position_embeddings(),
+                          "--ctx-size exceeds max_position_embeddings");
+            set_max_position_embeddings(context_size);
+        }
+    }
+
+    template <class Loader> void load_weights(Loader &loader, bool with_blocks = true) {
+        constexpr auto embedding = "model.token_embedding.weight";
+        constexpr auto output = "model.output.weight";
+        this->embed = loader.embedding(embedding);
+        loader.final_state(this->output_norm);
+        this->lm_head = tie_word_embeddings() || !loader.has_weight(output)
+                            ? loader.tied_output(this->embed, embedding)
+                            : loader.output(output);
+        if (with_blocks) {
+            loader.prepare_blocks();
+            this->blocks.reserve(static_cast<size_t>(num_hidden_layers()));
+            for (int layer = 0; layer < num_hidden_layers(); ++layer)
+                this->blocks.push_back(loader.block(layer, std::string(layer_type(layer))));
+        }
+    }
+
+    CausalPositions<Tensor> adapter_prepare_positions(Tensor positions, int64_t, int64_t) const {
+        return {positions, positions};
+    }
+    std::optional<Tensor> adapter_attention_mask(std::optional<Tensor> mask, int64_t,
+                                                 int64_t) const {
+        return mask;
+    }
+    void adapter_validate_forward(int64_t, int64_t, int64_t, bool, bool, bool) const {}
+    bool adapter_allows_speculative_position_override() const noexcept { return false; }
+    void adapter_validate_positions(const Tensor &positions, int64_t batch, int64_t tokens,
+                                    bool) const {
+        require_model((Backend::rank(positions) == 1 && Backend::size(positions, 0) == tokens) ||
+                          (Backend::rank(positions) == 2 && Backend::size(positions, 0) == batch &&
+                           Backend::size(positions, 1) == tokens),
+                      "position_ids must have shape [tokens] or [batch,tokens]");
+    }
+    bool adapter_pass_cache_positions(bool has_mrope, bool has_override) const noexcept {
+        return has_mrope || has_override;
+    }
+    bool adapter_pass_attention_mask() const noexcept { return false; }
+    bool adapter_force_cache_advance() const noexcept { return false; }
+    bool adapter_uses_decode_sequence_length() const noexcept { return true; }
+    bool adapter_supports_speculation() const noexcept { return false; }
+    bool adapter_supports_suffix_speculation() const noexcept { return false; }
 
     int64_t vocab_size() const noexcept { return this->metadata.vocab_size; }
 
@@ -125,7 +185,7 @@ template <class Backend, class Derived> struct CausalModelBase : Backend, Causal
         return cap > 0.0 ? this->softcap(std::move(logits), cap) : std::move(logits);
     }
     Tensor logits_from_hidden(Tensor hidden) {
-        return model().adapter_logits(this->lm_head, std::move(hidden));
+        return apply_final_logit_softcap(model().adapter_logits(this->lm_head, std::move(hidden)));
     }
     Tensor forward(Tensor ids) { return logits_from_hidden(hidden_forward(std::move(ids))); }
     Tensor forward_inputs(Tensor ids, Tensor embeddings, std::optional<Tensor> positions = {},
@@ -136,7 +196,8 @@ template <class Backend, class Derived> struct CausalModelBase : Backend, Causal
     Tensor last_logits(Tensor ids) {
         const auto lengths = decode_lengths(ids);
         auto hidden = hidden_forward(std::move(ids), {}, lengths);
-        return model().adapter_last_logits(this->lm_head, this->last_hidden(std::move(hidden)));
+        return apply_final_logit_softcap(
+            model().adapter_last_logits(this->lm_head, this->last_hidden(std::move(hidden))));
     }
     Tensor next_token(Tensor ids) {
         const auto lengths = decode_lengths(ids);
@@ -154,7 +215,8 @@ template <class Backend, class Derived> struct CausalModelBase : Backend, Causal
     Tensor last_logits_static(Tensor ids, Tensor positions, Tensor lengths, ForwardPlan plan = {}) {
         auto hidden =
             hidden_forward_static(std::move(ids), std::move(positions), std::move(lengths), plan);
-        return model().adapter_last_logits(this->lm_head, this->last_hidden(std::move(hidden)));
+        return apply_final_logit_softcap(
+            model().adapter_last_logits(this->lm_head, this->last_hidden(std::move(hidden))));
     }
     Tensor next_token_static(Tensor ids, Tensor positions, Tensor lengths, ForwardPlan plan = {}) {
         return next_token_from_hidden(

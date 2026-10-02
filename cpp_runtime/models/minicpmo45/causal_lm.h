@@ -12,6 +12,86 @@
 
 namespace mfq::models::minicpmo45 {
 
+struct MediaBound {
+    int64_t batch = 0, source = 0, begin = 0, end = 0;
+};
+
+inline std::vector<MediaBound> media_bounds(std::span<const int64_t> values) {
+    require_model(values.size() % 4 == 0, "media bounds require four columns");
+    std::vector<MediaBound> result;
+    result.reserve(values.size() / 4);
+    for (size_t i = 0; i < values.size(); i += 4) {
+        MediaBound bound{values[i], values[i + 1], values[i + 2], values[i + 3]};
+        require_model(bound.batch >= 0 && bound.source >= 0 && bound.begin >= 0 &&
+                          bound.end > bound.begin,
+                      "invalid media bound");
+        result.push_back(bound);
+    }
+    return result;
+}
+
+template <class Tensor> struct MultimodalInputs {
+    Tensor ids, pixels, patch_mask, target_sizes, audio_features, audio_lengths;
+    std::vector<MediaBound> images, audios;
+};
+template <class Tensor> struct MultimodalResult {
+    Tensor vision_states, image_embeddings, audio_embeddings, input_embeddings, hidden_states,
+        logits;
+};
+
+// The model owns modality order, resampling, and replacement geometry. Device
+// copies and the actual slice/scatter operations are supplied by the backend.
+template <class Ops> auto encode(Ops &ops, MultimodalInputs<typename Ops::Tensor> &input) {
+    if (ops.rank(input.ids) == 1)
+        input.ids = ops.batch_ids(std::move(input.ids));
+    require_model(ops.rank(input.ids) == 2, "MiniCPM-o input_ids must have shape [batch,tokens]");
+    input.ids = ops.device_ids(std::move(input.ids));
+    MultimodalResult<typename Ops::Tensor> result;
+    result.input_embeddings = ops.embed(input.ids);
+    auto check_bound = [&](const MediaBound &bound, const auto &encoded, int64_t length) {
+        require_model(bound.batch >= 0 && bound.batch < ops.size(input.ids, 0) &&
+                          bound.source >= 0 && bound.source < ops.size(encoded, 0) &&
+                          bound.begin >= 0 && bound.end > bound.begin &&
+                          bound.end <= ops.size(input.ids, 1) && bound.end - bound.begin == length,
+                      "MiniCPM-o media bound does not match encoded length");
+    };
+    if (!input.images.empty()) {
+        require_model(ops.defined(input.pixels) && ops.defined(input.patch_mask) &&
+                          ops.defined(input.target_sizes),
+                      "image bounds require image tensors");
+        result.vision_states = ops.vision(input.pixels, input.patch_mask, input.target_sizes);
+        result.image_embeddings = ops.resample(result.vision_states, input.target_sizes);
+        for (const auto &bound : input.images) {
+            check_bound(bound, result.image_embeddings, ops.size(result.image_embeddings, 1));
+            ops.scatter(result.input_embeddings, result.image_embeddings, bound);
+        }
+    }
+    if (!input.audios.empty()) {
+        require_model(ops.defined(input.audio_features) && ops.defined(input.audio_lengths),
+                      "audio bounds require audio tensors");
+        ops.reset_audio();
+        result.audio_embeddings = ops.audio(input.audio_features, input.audio_lengths);
+        auto lengths = ops.audio_lengths(input.audio_lengths);
+        for (const auto &bound : input.audios) {
+            require_model(bound.source >= 0 && size_t(bound.source) < lengths.size(),
+                          "audio bound source is out of range");
+            check_bound(bound, result.audio_embeddings, lengths[bound.source]);
+            ops.scatter(result.input_embeddings, result.audio_embeddings, bound);
+        }
+    }
+    return result;
+}
+
+template <class Model, class Tensor>
+auto multimodal_forward(Model &model, Tensor ids, MultimodalResult<Tensor> result,
+                        std::optional<Tensor> positions, std::optional<Tensor> mask) {
+    model.reset(Model::size(ids, 0));
+    result.hidden_states = model.hidden_forward_inputs(ids, result.input_embeddings, positions, {},
+                                                       nullptr, mask, positions.has_value());
+    result.logits = model.logits_from_hidden(result.hidden_states);
+    return result;
+}
+
 struct TtsSampling {
     int64_t eos_token = 6561, minimum_steps = 50, top_k = 25, minimum_keep = 0;
     double temperature = 0.8, top_p = 0.85, repetition_penalty = 1.05, min_p = 0.0;
@@ -171,6 +251,7 @@ inline void set_standard_metadata(mfq::models::CausalLmMetadata &metadata,
 
 template <class Backend> struct CausalLm : models::CausalModelBase<Backend, CausalLm<Backend>> {
     using Tensor = typename Backend::Tensor;
+    static bool accepts_backbone(std::string_view backbone) { return backbone == "minicpmo45"; }
     template <class Graph, class Source>
     void adapter_load_config(std::string_view payload, const Graph &graph, const Source &source) {
         auto &config = this->config;
@@ -195,6 +276,12 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
     void adapter_set_max_position_embeddings(int64_t value) {
         this->config.max_position_embeddings = value;
     }
+    std::optional<Tensor> adapter_attention_mask(std::optional<Tensor> mask, int64_t tokens,
+                                                 int64_t cache_position) const {
+        if (mask && (tokens == 1 || cache_position == 0) && this->mask_all_ones(*mask))
+            return {};
+        return mask;
+    }
     bool adapter_uses_decode_sequence_length() const noexcept { return false; }
     bool adapter_pass_cache_positions(bool, bool) const noexcept { return true; }
     bool adapter_pass_attention_mask() const noexcept { return true; }
@@ -203,6 +290,7 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
 template <class Backend>
 struct TtsCausalLm : models::CausalModelBase<Backend, TtsCausalLm<Backend>> {
     using Tensor = typename Backend::Tensor;
+    static bool accepts_backbone(std::string_view backbone) { return backbone == "minicpmo_tts"; }
     template <class Graph, class Source>
     void adapter_load_config(std::string_view payload, const Graph &graph, const Source &source) {
         auto &config = this->config;

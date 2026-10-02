@@ -27,14 +27,8 @@ mfq_tensor_backend::Tensor MiniCPMO45Model::adapter_embed(mfq_tensor_backend::Te
     return output.to(mfq_tensor_backend::kBFloat16).contiguous();
 }
 
-MfqOptional<mfq_tensor_backend::Tensor>
-MiniCPMO45Model::adapter_attention_mask(MfqOptional<mfq_tensor_backend::Tensor> mask,
-                                        int64_t tokens, int64_t cache_position) const {
-    if (mask.has_value() && (tokens == 1 || cache_position == 0) &&
-        mask.value().eq(1).all().item<bool>()) {
-        return mfq_nullopt;
-    }
-    return mask;
+bool MiniCPMO45Model::mask_all_ones(const mfq_tensor_backend::Tensor &mask) const {
+    return mask.eq(1).all().item<bool>();
 }
 
 mfq_tensor_backend::Tensor

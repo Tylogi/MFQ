@@ -178,7 +178,7 @@ void DeepseekV41Model::adapter_validate_load_options() const {
 
 void DeepseekV41Model::adapter_load_final_state(const mfq::ModelSource &source,
                                                 mfq_tensor_backend::Tensor &output_norm) {
-    CausalLmArchitecture::adapter_load_final_state(source, output_norm);
+    CausalResources::adapter_load_final_state(source, output_norm);
 }
 
 void DeepseekV41Model::adapter_prepare_blocks(const mfq::ModelSource &source) {
@@ -190,15 +190,6 @@ std::unique_ptr<Block> DeepseekV41Model::adapter_load_block(const mfq::ModelSour
                                                             const std::string &type) {
     MFQ_RUNTIME_CHECK(type == "deepseek_v41" && shared, "invalid DeepSeek-V4.1 block loader state");
     return deepseek_v41_runtime::load_block(*execution, source, layer, shared);
-}
-
-mfq_tensor_backend::Tensor
-DeepseekV41Model::adapter_prepare_hidden(mfq_tensor_backend::Tensor hidden, int64_t batch,
-                                         int64_t tokens) const {
-    return hidden.to(mfq_tensor_backend::kFloat16)
-        .unsqueeze(2)
-        .expand({batch, tokens, metadata.hc_mult, metadata.hidden_size})
-        .contiguous();
 }
 
 void DeepseekV41Model::adapter_begin_forward(bool capture_raw_hidden) {

@@ -23,16 +23,13 @@ std::unique_ptr<::Block> load_block(CudaExecutionContext &execution, const mfq::
 
 namespace mfq::cuda {
 
-struct Gemma4Model : CausalLmArchitecture {
+struct Gemma4Model : CausalResources {
     template <class Backend> using CausalModel = mfq::models::gemma4::CausalLm<Backend>;
     mfq::models::gemma4::Config config;
     double embed_scale = 1.0;
 
     std::unique_ptr<Block> adapter_load_block(const mfq::ModelSource &source, int layer, int device,
                                               const std::string &type);
-
-    mfq_tensor_backend::Tensor adapter_prepare_hidden(mfq_tensor_backend::Tensor hidden,
-                                                      int64_t batch, int64_t tokens) const;
 };
 
 extern template struct CudaSessionCodec<Gemma4Model>;

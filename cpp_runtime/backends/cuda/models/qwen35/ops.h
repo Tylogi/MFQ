@@ -37,7 +37,7 @@ void restore_text_session_state(std::vector<std::unique_ptr<::Block>> &blocks,
 
 namespace mfq::cuda {
 
-struct Qwen35Model : CausalLmArchitecture {
+struct Qwen35Model : CausalResources {
     template <class Backend> using CausalModel = mfq::models::qwen35::CausalLm<Backend>;
     mfq::models::qwen35::Config config;
 
@@ -49,8 +49,7 @@ struct Qwen35Model : CausalLmArchitecture {
                                               const std::string &type);
 
     mfq_tensor_backend::Tensor adapter_embed(mfq_tensor_backend::Tensor output) const;
-    void adapter_validate_positions(const mfq_tensor_backend::Tensor &positions, int64_t batch,
-                                    int64_t tokens, bool has_mrope) const;
+
     bool adapter_supports_prepared_prompt() const noexcept;
 };
 

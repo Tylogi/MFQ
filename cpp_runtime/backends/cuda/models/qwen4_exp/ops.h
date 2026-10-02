@@ -22,7 +22,7 @@ Tensor finalize_hidden(const Gr &mixer, const Tensor &hidden);
 
 namespace mfq::cuda {
 
-struct Qwen4Model : CausalLmArchitecture {
+struct Qwen4Model : CausalResources {
     template <class Backend> using CausalModel = mfq::models::qwen4_exp::CausalLm<Backend>;
     mfq::models::qwen4_exp::Config config;
     std::unique_ptr<qwen4_exp::Gr> final_mixer;
@@ -36,12 +36,7 @@ struct Qwen4Model : CausalLmArchitecture {
                                               const std::string &type);
 
     void adapter_reset(int64_t batch);
-    CudaPreparedPositions adapter_prepare_positions(mfq_tensor_backend::Tensor positions,
-                                                    int64_t batch, int64_t tokens);
-    void adapter_validate_positions(const mfq_tensor_backend::Tensor &positions, int64_t batch,
-                                    int64_t tokens, bool has_mrope) const;
-    mfq_tensor_backend::Tensor adapter_prepare_hidden(mfq_tensor_backend::Tensor hidden,
-                                                      int64_t batch, int64_t tokens) const;
+
     mfq_tensor_backend::Tensor
     adapter_block_positions(const mfq_tensor_backend::Tensor &full_positions,
                             const mfq_tensor_backend::Tensor &local_positions, int device) const;

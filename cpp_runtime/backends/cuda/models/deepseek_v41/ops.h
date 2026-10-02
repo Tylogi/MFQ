@@ -810,7 +810,7 @@ inline int run_self_check() {
 
 namespace mfq::cuda {
 
-struct DeepseekV41Model : CausalLmArchitecture {
+struct DeepseekV41Model : CausalResources {
     template <class Backend> using CausalModel = mfq::models::deepseek_v41::CausalLm<Backend>;
     mfq::models::deepseek_v41::Config config;
     std::shared_ptr<deepseek_v41_runtime::SharedState> shared;
@@ -822,8 +822,6 @@ struct DeepseekV41Model : CausalLmArchitecture {
     std::unique_ptr<Block> adapter_load_block(const mfq::ModelSource &source, int layer, int device,
                                               const std::string &type);
 
-    mfq_tensor_backend::Tensor adapter_prepare_hidden(mfq_tensor_backend::Tensor hidden,
-                                                      int64_t batch, int64_t tokens) const;
     void adapter_begin_forward(bool capture_raw_hidden);
     mfq_tensor_backend::Tensor collapse_hidden(mfq_tensor_backend::Tensor hidden, int64_t batch,
                                                int64_t tokens) const;

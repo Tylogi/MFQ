@@ -69,10 +69,11 @@ REALTIME_GATEWAY = (
 
 
 def test_minicpmo45_uses_native_composite_graph_and_canonical_names():
+    common = (ROOT / "cpp_runtime/models/common/causal_model.h").read_text()
     assert "models/minicpmo45/causal_lm.h" in DECODE
-    assert 'const std::string embed_name = "model.token_embedding.weight"' in DECODE
+    assert 'constexpr auto embedding = "model.token_embedding.weight"' in common
     assert 'source, "model.output_norm.weight"' in DECODE
-    assert 'const std::string output_name = "model.output.weight"' in DECODE
+    assert 'constexpr auto output = "model.output.weight"' in common
     assert "models::minicpmo45::CausalLm<CudaCausalOps<MiniCPMO45Model>>" in DECODE
     assert "llm.model." not in DECODE
     assert "llm.lm_head.weight" not in DECODE
@@ -182,7 +183,8 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
     shared = (ROOT / "cpp_runtime/models/minicpmo45/causal_lm.h").read_text(encoding="utf-8")
     assert "bool adapter_uses_decode_sequence_length() const noexcept { return false; }" in shared
     assert "model().adapter_uses_decode_sequence_length() &&" in (ROOT / "cpp_runtime/models/common/causal_model.h").read_text(encoding="utf-8")
-    assert "mask.value().eq(1).all().item<bool>()" in GRAPH
+    assert "mask.eq(1).all().item<bool>()" in GRAPH
+    assert "(tokens == 1 || cache_position == 0) && this->mask_all_ones(*mask)" in shared
 
 
 def test_minicpmo45_preserves_qkv_projection_boundaries():

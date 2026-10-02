@@ -69,6 +69,9 @@ auto mtp_predictor(Ops &ops, typename Ops::Tensor hidden, typename Ops::Tensor i
 
 template <class Backend> struct CausalLm : models::CausalModelBase<Backend, CausalLm<Backend>> {
     using Tensor = typename Backend::Tensor;
+    static bool accepts_backbone(std::string_view backbone) {
+        return backbone == "qwen3_5" || backbone == "generic_qwen";
+    }
     template <class Graph, class Source>
     void adapter_load_config(std::string_view payload, const Graph &graph, const Source &source) {
         auto &config = this->config;
@@ -92,6 +95,15 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
         metadata.model_type = config.model_type;
         metadata.layer_types = config.layer_types;
         this->adapter_validate_components(graph);
+    }
+    void adapter_validate_positions(const Tensor &positions, int64_t batch, int64_t tokens,
+                                    bool has_mrope) const {
+        const auto rank = Backend::rank(positions);
+        require_model(this->config.valid_positions(rank, rank > 1 ? Backend::size(positions, 0) : 0,
+                                                   Backend::size(positions, -1), batch, tokens,
+                                                   has_mrope),
+                      "position_ids must have shape [tokens], [batch,tokens], or configured "
+                      "grid-MRoPE [3,tokens]");
     }
     void adapter_set_max_position_embeddings(int64_t value) {
         this->config.max_position_embeddings = value;

@@ -4,11 +4,12 @@
 #include "models/common/causal_forward.h"
 #include "models/common/causal_model.h"
 #include "models/common/gated_mlp.h"
+#include "models/common/grid_vision_model.h"
 #include "models/common/moe.h"
 #include "models/common/transformer_layer.h"
 #include "models/deepseek_v4/causal_lm.h"
 #include "models/deepseek_v41/causal_lm.h"
-#include "models/deepseek_v41/engram_hash.h"
+#include "models/deepseek_v41/engram.h"
 #include "models/gemma4/causal_lm.h"
 #include "models/glm5_next/causal_lm.h"
 #include "models/glm_dsa/causal_lm.h"
@@ -228,9 +229,16 @@ void model_test() {
         return 10;
     };
     auto dense = [] { return 2; };
-    auto post = [](int x) { return x * 2; };
-    assert(gemma4::feed_forward(false, dense, post, experts, add, post) == 4 && expert_calls == 0);
-    assert(gemma4::feed_forward(true, dense, post, experts, add, post) == 14 && expert_calls == 1);
+    auto post = [](int x, gemma4::FfnNorm) { return x * 2; };
+    auto scale = [](int x) { return x * 2; };
+    auto fused_gemma = [](int d, int e, int r) { return ((d * 2 + e * 2) * 2 + r) * 2; };
+    assert(gemma4::feed_forward(false, true, false, 1, dense, experts, post, add, add, scale,
+                                fused_gemma) == 10 &&
+           expert_calls == 0);
+    for (bool fusion : {false, true})
+        assert(gemma4::feed_forward(true, true, fusion, 1, dense, experts, post, add, add, scale,
+                                    fused_gemma) == 98);
+    assert(expert_calls == 2);
     assert(pre_norm_layer(
                4, [](int x, int stage) { return x - stage; }, [](int x) { return x * 2; }, ffn,
                add) == 45);
@@ -364,7 +372,9 @@ struct PredictorOps {
     std::vector<int> visited;
     std::optional<Tensor> seen_lengths, seen_cache;
     static int rank(const Tensor &t) { return t.shape.size(); }
-    static int64_t size(const Tensor &t, int axis) { return t.shape.at(axis); }
+    static int64_t size(const Tensor &t, int axis) {
+        return t.shape.at(axis < 0 ? t.shape.size() + axis : axis);
+    }
     static int64_t elements(const Tensor &t) {
         int64_t count = 1;
         for (auto n : t.shape)
@@ -464,7 +474,7 @@ struct CausalTestOps {
     mfq::models::CausalLmMetadata metadata;
     std::vector<std::unique_ptr<Block>> blocks;
     Tensor output_norm;
-    int lm_head = 0;
+    int embed = 0, lm_head = 0;
     bool fail_layer = false;
     int seen_position = -1, seen_cache = -1, seen_plan = -1;
     std::optional<Tensor> seen_lengths;
@@ -474,10 +484,13 @@ struct CausalTestOps {
         blocks.push_back(std::make_unique<Block>(Block{1}));
         blocks.push_back(std::make_unique<Block>(Block{2}));
     }
+    static bool mask_all_ones(const Tensor &value) { return value.value == 1; }
     static int execution_scope() { return 0; }
     static int block_scope(const std::unique_ptr<Block> &) { return 0; }
     static int64_t rank(const Tensor &t) { return t.shape.size(); }
-    static int64_t size(const Tensor &t, int axis) { return t.shape.at(axis); }
+    static int64_t size(const Tensor &t, int axis) {
+        return t.shape.at(axis < 0 ? t.shape.size() + axis : axis);
+    }
     static Tensor batch_ids(Tensor t) {
         t.shape.insert(t.shape.begin(), 1);
         return t;
@@ -513,24 +526,10 @@ struct CausalTestOps {
         t.value %= 11;
         return t;
     }
-    static bool adapter_uses_decode_sequence_length() { return true; }
-    static bool adapter_supports_speculation() { return true; }
-    static bool adapter_supports_suffix_speculation() { return true; }
     static void adapter_reset(int64_t) {}
     static bool adapter_requires_batch_reset(int64_t) { return false; }
-    static void adapter_validate_forward(int64_t, int64_t, int64_t, bool, bool, bool) {}
-    static bool adapter_allows_speculative_position_override() { return false; }
-    static auto adapter_prepare_positions(Tensor t, int64_t, int64_t) {
-        struct Positions {
-            Tensor positions, full_positions;
-        };
-        return Positions{t, t};
-    }
-    static void adapter_validate_positions(const Tensor &, int64_t, int64_t, bool) {}
-    static auto adapter_attention_mask(std::optional<Tensor> t, int64_t, int64_t) { return t; }
     static void adapter_begin_forward(bool) {}
     static void adapter_finish_forward(const Tensor &, int64_t, int64_t) {}
-    static bool adapter_force_cache_advance() { return false; }
     static void adapter_begin_speculative() {}
     static void adapter_commit_speculative() {}
     static void adapter_rollback_speculative(int64_t) {}
@@ -581,6 +580,8 @@ struct CausalTestOps {
 void causal_lm_test() {
     using Tensor = CausalTestOps::Tensor;
     struct TestModel : mfq::models::CausalModelBase<CausalTestOps, TestModel> {
+        bool adapter_supports_speculation() const { return true; }
+        bool adapter_supports_suffix_speculation() const { return true; }
     } model;
     Tensor ids{{1, 2}, 2}, raw;
     std::vector<Tensor> trace;
@@ -650,6 +651,17 @@ struct FinalCausalTestOps : CausalTestOps {
 void family_model_test() {
     using namespace mfq::models;
     struct QwenOps : CausalTestOps {
+        Tensor positions;
+        static bool defined(const Tensor &t) { return !t.shape.empty(); }
+        static Tensor position_axes(Tensor t, int64_t start, int64_t count) {
+            assert(start == 1 && count == 3);
+            t.shape[0] = count;
+            return t;
+        }
+        static Tensor concat_positions(Tensor first, Tensor second) {
+            second.shape.back() += first.shape.back();
+            return second;
+        }
         qwen4_exp::Config config{};
         int batch = 1;
         static bool adapter_supports_speculation() { return false; }
@@ -659,6 +671,10 @@ void family_model_test() {
     assert(qwen.supports_speculation());
     qwen.hidden_forward_inputs({{1, 2}, 2}, {{1, 2, 4}, 6}, CausalTestOps::Tensor{{2}, 10});
     assert(qwen.cache_pos == 2); // Qwen4 advances even with explicit semantic positions.
+    qwen.positions = {{3, 2}, 0};
+    auto prepared = qwen.adapter_prepare_positions({{4, 1}, 9}, 1, 1);
+    assert(prepared.positions.shape == std::vector<int64_t>({3, 1}));
+    assert(prepared.full_positions.shape == std::vector<int64_t>({3, 3}));
     glm5_next::CausalLm<FinalCausalTestOps> glm;
     try {
         glm.hidden_forward({{1, 2}, 2}, CausalTestOps::Tensor{{2}, 10});
@@ -670,6 +686,11 @@ void family_model_test() {
     mini.next_token({{1}, 2});
     mini.next_token({{1}, 2});
     assert(!mini.seen_lengths); // Its BF16 attention uses a different decode contract.
+    const CausalTestOps::Tensor ones{{1, 2}, 1}, masked{{1, 2}, 0};
+    assert(!mini.adapter_attention_mask(ones, 2, 0));
+    assert(!mini.adapter_attention_mask(ones, 1, 3));
+    assert(mini.adapter_attention_mask(ones, 2, 3));
+    assert(mini.adapter_attention_mask(masked, 2, 0));
 }
 
 void remaining_family_flows_test() {
@@ -988,7 +1009,276 @@ void token_generation_test() {
     }
 }
 
+struct LoadTestModel : mfq::models::CausalModelBase<CausalTestOps, LoadTestModel> {
+    static bool accepts_backbone(std::string_view value) { return value == "fixture"; }
+    void adapter_set_max_position_embeddings(int64_t) {}
+    template <class Graph, class Source>
+    void adapter_load_config(std::string_view, const Graph &, const Source &) {
+        metadata.num_hidden_layers = 2;
+        metadata.layer_types = {"first", "second"};
+    }
+};
+void model_loading_test() {
+    struct Graph {
+        std::string backbone = "fixture";
+        struct {
+            int64_t text_layers = 2;
+        } topology;
+    } graph;
+    struct Loader {
+        bool has_output = true;
+        std::vector<std::string> calls;
+        int embedding(const std::string &name) {
+            calls.push_back(name);
+            return 11;
+        }
+        int output(const std::string &name) {
+            calls.push_back(name);
+            return 22;
+        }
+        int tied_output(int value, const std::string &name) {
+            calls.push_back("tie:" + name);
+            return value;
+        }
+        bool has_weight(const std::string &) { return has_output; }
+        void final_state(CausalTestOps::Tensor &) { calls.push_back("norm"); }
+        void prepare_blocks() { calls.push_back("prepare"); }
+        auto block(int layer, const std::string &type) {
+            calls.push_back(type);
+            return std::make_unique<CausalTestOps::Block>(CausalTestOps::Block{layer});
+        }
+    };
+    for (int mode = 0; mode < 3; ++mode) {
+        LoadTestModel model;
+        model.blocks.clear();
+        model.load_definition("", graph, 0, 16);
+        assert(model.max_position_embeddings() == 16);
+        model.metadata.tie_word_embeddings = mode == 1;
+        Loader loader;
+        loader.has_output = mode != 2;
+        model.load_weights(loader);
+        assert(model.embed == 11 && model.lm_head == (mode ? 11 : 22) && model.blocks.size() == 2);
+        assert(loader.calls == std::vector<std::string>({"model.token_embedding.weight", "norm",
+                                                         mode ? "tie:model.token_embedding.weight"
+                                                              : "model.output.weight",
+                                                         "prepare", "first", "second"}));
+    }
+    LoadTestModel model;
+    model.blocks.clear();
+    model.load_definition("", graph, 0);
+    Loader loader;
+    model.load_weights(loader, false);
+    assert(model.blocks.empty() && loader.calls.size() == 3);
+    for (int invalid = 0; invalid < 3; ++invalid) {
+        auto broken = graph;
+        if (invalid == 0)
+            broken.backbone = "other";
+        if (invalid == 1)
+            broken.topology.text_layers = 3;
+        try {
+            model.load_definition("", broken, 0, invalid == 2 ? 33 : 0);
+            assert(false);
+        } catch (const std::runtime_error &) {
+        }
+    }
+}
+
+struct MediaTestOps {
+    using Tensor = CausalTestOps::Tensor;
+    std::string calls;
+    static int64_t rank(const Tensor &t) { return t.shape.size(); }
+    static int64_t size(const Tensor &t, int axis) { return t.shape.at(axis); }
+    static bool defined(const Tensor &t) { return !t.shape.empty(); }
+    static Tensor batch_ids(Tensor t) {
+        t.shape.insert(t.shape.begin(), 1);
+        return t;
+    }
+    static Tensor device_ids(Tensor t) { return t; }
+    Tensor embed(Tensor ids) {
+        calls += 'E';
+        return {{ids.shape[0], ids.shape[1], 4}, 4};
+    }
+    Tensor vision(Tensor, Tensor, Tensor) {
+        calls += 'V';
+        return {{1, 4, 3}, 7};
+    }
+    Tensor resample(Tensor t, Tensor) {
+        calls += 'R';
+        assert(t.value == 7);
+        return {{1, 2, 4}, 10};
+    }
+    void reset_audio() { calls += 'A'; }
+    Tensor audio(Tensor, Tensor) {
+        calls += 'U';
+        return {{1, 3, 4}, 20};
+    }
+    auto audio_lengths(Tensor) {
+        calls += 'L';
+        return std::vector<int64_t>{3};
+    }
+    void scatter(Tensor &target, const Tensor &source,
+                 const mfq::models::minicpmo45::MediaBound &bound) {
+        calls += 'S';
+        assert(bound.end - bound.begin == source.shape[1]);
+        target.value += source.value;
+    }
+};
+
+void composition_boundary_test() {
+    using namespace mfq::models;
+    using Tensor = CausalTestOps::Tensor;
+    MediaTestOps ops;
+    minicpmo45::MultimodalInputs<Tensor> input{{{6}, 1}, {{1}, 1}, {{1}, 1},       {{1}, 1},
+                                               {{1}, 1}, {{1}, 1}, {{0, 0, 1, 3}}, {{0, 0, 3, 6}}};
+    auto result = minicpmo45::encode(ops, input);
+    assert(ops.calls == "EVRSAULS" && result.input_embeddings.value == 34);
+    assert(input.ids.shape == std::vector<int64_t>({1, 6}));
+    minicpmo45::CausalLm<CausalTestOps> model;
+    auto forwarded = minicpmo45::multimodal_forward(
+        model, input.ids, result, std::optional<Tensor>{}, std::optional<Tensor>{});
+    assert(model.cache_pos == 6 && forwarded.hidden_states.value == 143 &&
+           forwarded.logits.value == 715);
+    for (int invalid = 0; invalid < 4; ++invalid) {
+        auto broken = input;
+        if (invalid == 0)
+            broken.images[0].end = 4;
+        if (invalid == 1)
+            broken.images[0].source = 1;
+        if (invalid == 2)
+            broken.audios[0].source = -1;
+        if (invalid == 3)
+            broken.pixels = {};
+        try {
+            minicpmo45::encode(ops, broken);
+            assert(false);
+        } catch (const std::runtime_error &) {
+        }
+    }
+    auto text = input;
+    text.images.clear();
+    text.audios.clear();
+    ops.calls.clear();
+    assert(minicpmo45::encode(ops, text).input_embeddings.value == 4 && ops.calls == "E");
+    try {
+        minicpmo45::media_bounds(std::array<int64_t, 4>{0, 0, 2, 1});
+        assert(false);
+    } catch (const std::runtime_error &) {
+    }
+
+    mfq::GridVisionConfig config;
+    config.spatial_merge_size = 2;
+    config.hidden_size = 3;
+    config.num_position_embeddings = 4;
+    std::array<int, 2> layers{1, 2};
+    std::string order;
+    const auto encoded = grid_vision::encode(
+        1, config, {{1, 2, 2}}, layers,
+        [&](int x, int64_t count) {
+            order += 'P';
+            assert(count == 4);
+            return x + 2;
+        },
+        [&](const mfq::LearnedPositionInterpolation &p) {
+            order += 'I';
+            assert(p.patch_count == 4);
+            return 5;
+        },
+        [&](int x, int y) {
+            order += 'A';
+            return x + y;
+        },
+        [&](int layer, int x, const mfq::GridVisionLayout &layout) {
+            order += 'L';
+            assert(layout.patch_count == 4);
+            return x * layer;
+        });
+    assert(encoded == 16 && order == "PIALL");
+    order.clear();
+    auto merge = [&](int64_t count) {
+        return grid_vision::merge(
+            encoded, count, config,
+            [&](int x) {
+                order += 'N';
+                return x + 1;
+            },
+            [&](int x, int64_t rows, int64_t width) {
+                order += 'R';
+                assert(rows == 1 && width == 12);
+                return x;
+            },
+            [&](int x) {
+                order += 'U';
+                return x * 2;
+            },
+            [&](int x) {
+                order += 'G';
+                return x + 3;
+            },
+            [&](int x) {
+                order += 'D';
+                return x * 5;
+            });
+    };
+    assert(merge(4) == 185 && order == "NRUGD");
+    try {
+        merge(3);
+        assert(false);
+    } catch (const std::runtime_error &) {
+    }
+    int scatters = 0;
+    auto prepare = [&](std::vector<int64_t> ids) {
+        return grid_vision::prepare(
+            ids, 185, 1, 99, 98, config, {{1, 2, 2}}, [](const auto &) { return 7; },
+            [&](int &embedding, int vision, const auto &indices) {
+                ++scatters;
+                assert(indices == std::vector<int64_t>{1});
+                embedding += vision;
+            },
+            [](const mfq::GridMropePositions &positions) {
+                assert(positions.token_count == 3);
+                return 1;
+            });
+    };
+    assert(prepare({1, 99, 2}).embeddings == 192 && scatters == 1);
+    for (const auto &ids : {std::vector<int64_t>{1, 2, 3}, std::vector<int64_t>{1, 98, 3}}) {
+        try {
+            prepare(ids);
+            assert(false);
+        } catch (const std::invalid_argument &) {
+        }
+    }
+    assert(scatters == 1);
+
+    gemma4::Config gemma;
+    gemma.num_attention_heads = 8;
+    gemma.num_key_value_heads = 2;
+    gemma.num_global_key_value_heads = 1;
+    gemma.head_dim = 4;
+    gemma.global_head_dim = 8;
+    gemma.sliding_window = 16;
+    gemma.full_rotary_factor = 0.5;
+    gemma.attention_key_equals_value = true;
+    auto local = gemma4::layer_spec(gemma, "sliding_attention");
+    auto global = gemma4::layer_spec(gemma, "full_attention");
+    assert(local.head_dim == 4 && local.kv_heads == 2 && local.window == 16 &&
+           !local.value_equals_key);
+    assert(global.head_dim == 8 && global.kv_heads == 1 && global.window == 0 &&
+           global.value_equals_key && global.rotary_pairs == 2);
+    try {
+        gemma4::layer_spec(gemma, "unknown");
+        assert(false);
+    } catch (const std::runtime_error &) {
+    }
+
+    // Model head policy is shared even for a backend whose projection is just an integer operation.
+    model.metadata.final_logit_softcapping = 1;
+    assert(model.logits_from_hidden({{1, 4}, 3}).value == -15);
+    assert(model.last_logits({{1}, 2}).value == -217);
+}
+
 int main() {
+    model_loading_test();
+    composition_boundary_test();
     boundary_model_test();
     token_generation_test();
     family_model_test();

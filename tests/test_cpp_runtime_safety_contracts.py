@@ -10,7 +10,7 @@ DECODE = "\n".join(
     for path in sorted(CUDA_ROOT.rglob("*"))
     if path.suffix in {".h", ".cpp"}
 )
-MODEL_LOADER = (CUDA_ROOT / "models" / "loader.cpp").read_text(
+MODEL_LOADER = (CUDA_ROOT / "storage" / "model_loader.cpp").read_text(
     encoding="utf-8"
 )
 CUDA_RUNTIME = "\n".join(

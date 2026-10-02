@@ -424,15 +424,6 @@ mfq_tensor_backend::Tensor Qwen35Model::adapter_embed(mfq_tensor_backend::Tensor
     return output.to(mfq_tensor_backend::kFloat16).contiguous();
 }
 
-void Qwen35Model::adapter_validate_positions(const mfq_tensor_backend::Tensor &positions,
-                                             int64_t batch, int64_t tokens, bool has_mrope) const {
-    if (!config.valid_positions(positions.dim(), positions.dim() > 1 ? positions.size(0) : 0,
-                                positions.size(-1), batch, tokens, has_mrope)) {
-        throw std::runtime_error("position_ids must have shape [tokens], [batch,tokens], or "
-                                 "configured grid-MRoPE [3,tokens]");
-    }
-}
-
 bool Qwen35Model::adapter_supports_prepared_prompt() const noexcept { return true; }
 
 } // namespace mfq::cuda

@@ -18,7 +18,7 @@ std::unique_ptr<::Block> load_block(CudaExecutionContext &execution, const mfq::
 
 namespace mfq::cuda {
 
-struct Glm5Model : CausalLmArchitecture {
+struct Glm5Model : CausalResources {
     template <class Backend> using CausalModel = mfq::models::glm5_next::CausalLm<Backend>;
     mfq::models::glm5_next::Config config;
 
@@ -26,8 +26,6 @@ struct Glm5Model : CausalLmArchitecture {
     std::unique_ptr<Block> adapter_load_block(const mfq::ModelSource &source, int layer, int device,
                                               const std::string &type);
 
-    mfq_tensor_backend::Tensor adapter_prepare_hidden(mfq_tensor_backend::Tensor hidden,
-                                                      int64_t batch, int64_t tokens) const;
     mfq_tensor_backend::Tensor collapse_hidden(mfq_tensor_backend::Tensor hidden, int64_t batch,
                                                int64_t tokens) const;
     mfq_tensor_backend::Tensor normalize_hidden(mfq_tensor_backend::Tensor hidden,

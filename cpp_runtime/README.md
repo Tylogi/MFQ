@@ -49,8 +49,12 @@ DeepSeek/GLM5 output collapse/norm order are shared. Local and parallel FFNs
 use shared gated-MLP composition; CUDA owns shard placement, reduction, and
 stream scheduling. MiniCPM ordinary TTS and text evaluation use the Engine's
 synchronous token loop, with TTS sampling order in its shared model.
-Native input preparation and composite operator bindings still need an
-ownership audit. Metal integration and duplex control remain pending;
+HC input expansion choices, Gemma FFN finishing, position/mask rules, and
+MiniCPM/Grid-Vision multimodal composition are shared. Model definition,
+output-weight tying and layer traversal live in `CausalModelBase`; Gemma also
+owns its layer geometry and parameter-role assembly. CUDA's `CausalResources`
+supplies native bindings, and `storage/model_loader.cpp` handles device loading
+and placement. Metal integration and duplex control remain pending;
 multi-device and non-Qwen3.5 real-weight validation are also incomplete.
 Qwen3.8-27B uses the `qwen3_5` backbone;
 Qwen3.8-Flash-Next uses `qwen4_exp`.

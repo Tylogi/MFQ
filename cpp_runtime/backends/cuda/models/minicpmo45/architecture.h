@@ -32,7 +32,7 @@
 
 namespace mfq::cuda {
 
-struct MiniCPMO45Model : CausalLmArchitecture {
+struct MiniCPMO45Model : CausalResources {
     template <class Backend> using CausalModel = mfq::models::minicpmo45::CausalLm<Backend>;
     mfq::models::minicpmo45::Config config;
 
@@ -42,9 +42,7 @@ struct MiniCPMO45Model : CausalLmArchitecture {
                                               const std::string &type);
 
     mfq_tensor_backend::Tensor adapter_embed(mfq_tensor_backend::Tensor output) const;
-    MfqOptional<mfq_tensor_backend::Tensor>
-    adapter_attention_mask(MfqOptional<mfq_tensor_backend::Tensor> mask, int64_t tokens,
-                           int64_t cache_position) const;
+    bool mask_all_ones(const mfq_tensor_backend::Tensor &mask) const;
     mfq_tensor_backend::Tensor adapter_prepare_hidden(mfq_tensor_backend::Tensor hidden,
                                                       int64_t batch, int64_t tokens) const;
     mfq_tensor_backend::Tensor
@@ -64,7 +62,7 @@ struct CudaSessionCodec<MiniCPMO45Model> : FullAttentionSessionCodec<MiniCPMO45M
 
 extern template struct FullAttentionSessionCodec<MiniCPMO45Model>;
 
-struct MiniCPMOTtsModel : CausalLmArchitecture {
+struct MiniCPMOTtsModel : CausalResources {
     template <class Backend> using CausalModel = mfq::models::minicpmo45::TtsCausalLm<Backend>;
     mfq::models::ModelConfig config;
 

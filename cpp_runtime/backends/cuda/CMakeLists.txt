@@ -279,7 +279,7 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/qwen35/ops.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/batch_state.cpp
     ${MFQ_CUDA_ROOT}/models/registry.cpp
-    ${MFQ_CUDA_ROOT}/models/loader.cpp
+    ${MFQ_CUDA_ROOT}/storage/model_loader.cpp
     ${MFQ_CUDA_ROOT}/models/ffn.cpp
     ${MFQ_CUDA_ROOT}/models/full_block.cpp
     ${MFQ_CUDA_ROOT}/models/kv_cache.cpp
@@ -307,7 +307,7 @@ set_target_properties(mfq-cuda-ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set(MFQ_CUDA_LOADING_SOURCES
     ${MFQ_CUDA_ROOT}/engine/options.cpp
-    ${MFQ_CUDA_ROOT}/models/loader.cpp
+    ${MFQ_CUDA_ROOT}/storage/model_loader.cpp
     ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp
 )
 add_library(mfq-cuda-loading OBJECT ${MFQ_CUDA_LOADING_SOURCES})
@@ -317,7 +317,7 @@ target_compile_definitions(mfq-cuda-loading PRIVATE
 set_target_properties(mfq-cuda-loading PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 list(REMOVE_ITEM MFQ_CUDA_MODEL_SOURCES
-    ${MFQ_CUDA_ROOT}/models/loader.cpp)
+    ${MFQ_CUDA_ROOT}/storage/model_loader.cpp)
 add_library(mfq-cuda-runtime STATIC
     $<TARGET_OBJECTS:mfq-cuda-ops>
     $<TARGET_OBJECTS:mfq-cuda-loading>
@@ -539,7 +539,7 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         ${MFQ_CUDA_ROOT}/engine/options.cpp
         ${MFQ_CUDA_ROOT}/engine/decode_graph.cpp
         ${MFQ_CUDA_ROOT}/models/causal_ops.cpp
-        ${MFQ_CUDA_ROOT}/models/loader.cpp
+        ${MFQ_CUDA_ROOT}/storage/model_loader.cpp
         ${MFQ_CUDA_ROOT}/engine/mtp.cpp
         ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp
         ${MFQ_CUDA_ROOT}/engine/components.cpp

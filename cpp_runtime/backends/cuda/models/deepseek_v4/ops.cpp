@@ -280,7 +280,7 @@ void DeepseekV4Model::adapter_validate_load_options() const {
 
 void DeepseekV4Model::adapter_load_final_state(const mfq::ModelSource &source,
                                                mfq_tensor_backend::Tensor &output_norm) {
-    CausalLmArchitecture::adapter_load_final_state(source, output_norm);
+    CausalResources::adapter_load_final_state(source, output_norm);
     output_head = deepseek_v4::load_output_head(*execution, source);
 }
 
@@ -358,15 +358,6 @@ void CudaSessionCodec<DeepseekV4Model>::restore(Model &model, const TextSessionS
         dsv4->shared_state->ensure();
     }
     model.cache_pos = state.cache_pos;
-}
-
-mfq_tensor_backend::Tensor
-DeepseekV4Model::adapter_prepare_hidden(mfq_tensor_backend::Tensor hidden, int64_t batch,
-                                        int64_t tokens) const {
-    return hidden.to(mfq_tensor_backend::kFloat16)
-        .unsqueeze(2)
-        .expand({batch, tokens, metadata.hc_mult, metadata.hidden_size})
-        .contiguous();
 }
 
 mfq_tensor_backend::Tensor DeepseekV4Model::collapse_hidden(mfq_tensor_backend::Tensor hidden,

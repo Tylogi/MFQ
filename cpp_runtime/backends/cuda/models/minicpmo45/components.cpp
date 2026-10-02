@@ -79,7 +79,7 @@ CudaPreparedPrompt Components::prepare(
     }
 
 
-    auto result = runtime_.encode(input_ids, {}, {}, pixels, patch_mask,
+    auto result = runtime_.encode(input_ids, pixels, patch_mask,
         target_sizes, image_bounds, audio_features, audio_lengths, audio_bounds);
     CudaPreparedPrompt prepared;
     prepared.token_ids = prompt;

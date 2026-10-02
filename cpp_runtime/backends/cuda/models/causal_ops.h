@@ -46,12 +46,7 @@ template <class Backend> struct TtsCausalLm;
 
 namespace mfq::cuda {
 
-struct CudaPreparedPositions {
-    mfq_tensor_backend::Tensor positions;
-    mfq_tensor_backend::Tensor full_positions;
-};
-
-struct CausalLmArchitecture {
+struct CausalResources {
     mfq::models::CausalLmMetadata metadata;
     CudaExecutionContext *execution = nullptr;
 
@@ -66,28 +61,18 @@ struct CausalLmArchitecture {
     mfq_tensor_backend::Tensor adapter_embed(mfq_tensor_backend::Tensor output) const;
     void adapter_reset(int64_t batch);
     bool adapter_requires_batch_reset(int64_t batch) const noexcept;
-    void adapter_validate_forward(int64_t batch, int64_t tokens, int64_t cache_position,
-                                  bool has_position_override, bool has_cache_position_override,
-                                  bool has_attention_mask) const;
-    bool adapter_allows_speculative_position_override() const noexcept;
-    CudaPreparedPositions adapter_prepare_positions(mfq_tensor_backend::Tensor positions,
-                                                    int64_t batch, int64_t tokens);
-    void adapter_validate_positions(const mfq_tensor_backend::Tensor &positions, int64_t batch,
-                                    int64_t tokens, bool has_mrope) const;
-    MfqOptional<mfq_tensor_backend::Tensor>
-    adapter_attention_mask(MfqOptional<mfq_tensor_backend::Tensor> mask, int64_t tokens,
-                           int64_t cache_position) const;
+
     mfq_tensor_backend::Tensor adapter_prepare_hidden(mfq_tensor_backend::Tensor hidden,
                                                       int64_t batch, int64_t tokens) const;
     void adapter_begin_forward(bool capture_raw_hidden);
-    bool adapter_pass_cache_positions(bool has_mrope, bool has_override) const noexcept;
+
     mfq_tensor_backend::Tensor
     adapter_block_positions(const mfq_tensor_backend::Tensor &full_positions,
                             const mfq_tensor_backend::Tensor &local_positions, int device) const;
-    bool adapter_pass_attention_mask() const noexcept;
+
     void adapter_finish_forward(const mfq_tensor_backend::Tensor &full_positions, int64_t batch,
                                 int64_t tokens);
-    bool adapter_force_cache_advance() const noexcept;
+
     mfq_tensor_backend::Tensor
     adapter_finalize_hidden(mfq_tensor_backend::Tensor hidden,
                             const mfq_tensor_backend::Tensor &output_norm, int64_t batch,
@@ -101,10 +86,9 @@ struct CausalLmArchitecture {
                                                    mfq_tensor_backend::Tensor hidden) const;
     mfq_tensor_backend::Tensor adapter_next_token(const QuantLinear &lm_head,
                                                   mfq_tensor_backend::Tensor hidden) const;
-    bool adapter_uses_decode_sequence_length() const noexcept;
+
     bool adapter_supports_prepared_prompt() const noexcept;
-    bool adapter_supports_speculation() const noexcept;
-    bool adapter_supports_suffix_speculation() const noexcept;
+
     void adapter_begin_speculative();
     void adapter_commit_speculative();
     void adapter_rollback_speculative(int64_t keep);
@@ -161,6 +145,13 @@ template <typename Model> struct CudaCausalOps : Model {
     static auto block_scope(const std::unique_ptr<Block> &block) {
         return MfqCudaGuard(block->cuda_device);
     }
+    static bool defined(const Tensor &value) { return value.defined(); }
+    static Tensor position_axes(Tensor value, int64_t start, int64_t count) {
+        return value.narrow(0, start, count);
+    }
+    static Tensor concat_positions(Tensor first, Tensor second) {
+        return mfq_tensor_backend::cat({first, second}, -1);
+    }
     static int64_t rank(const Tensor &value) { return value.dim(); }
     static int64_t size(const Tensor &value, int axis) { return value.size(axis); }
     static Tensor batch_ids(Tensor ids) { return ids.unsqueeze(0); }
@@ -184,6 +175,20 @@ template <typename Model> struct CudaCausalOps : Model {
     static Tensor last_hidden(Tensor hidden) { return hidden.index({Slice(), -1, Slice()}); }
     static Tensor softcap(Tensor logits, double cap) {
         return mfq_tensor_backend::tanh(logits / cap) * cap;
+    }
+    Tensor scale_hidden(Tensor hidden, double scale) const {
+        return this->execution->profiler.measure("model.embed_scale",
+                                                 [&] { return hidden * scale; });
+    }
+    static Tensor repeat_hidden(Tensor hidden, int64_t streams) {
+        return hidden.to(mfq_tensor_backend::kFloat16).repeat({1, 1, streams});
+    }
+    static Tensor expand_hidden(Tensor hidden, int64_t batch, int64_t tokens, int64_t streams) {
+        const auto width = hidden.size(-1);
+        return hidden.to(mfq_tensor_backend::kFloat16)
+            .unsqueeze(2)
+            .expand({batch, tokens, streams, width})
+            .contiguous();
     }
     struct ForwardOps : mfq::models::CausalForwardInputs<Tensor, ForwardPlan> {
         using Inputs = mfq::models::CausalForwardInputs<Tensor, ForwardPlan>;

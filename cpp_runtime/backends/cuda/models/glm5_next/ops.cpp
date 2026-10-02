@@ -21,14 +21,6 @@ std::unique_ptr<Block> Glm5Model::adapter_load_block(const mfq::ModelSource &sou
     return glm5_next::load_block(*execution, source, config, layer);
 }
 
-mfq_tensor_backend::Tensor Glm5Model::adapter_prepare_hidden(mfq_tensor_backend::Tensor hidden,
-                                                             int64_t batch, int64_t tokens) const {
-    return hidden.to(mfq_tensor_backend::kFloat16)
-        .unsqueeze(2)
-        .expand({batch, tokens, metadata.hc_mult, metadata.hidden_size})
-        .contiguous();
-}
-
 mfq_tensor_backend::Tensor Glm5Model::collapse_hidden(mfq_tensor_backend::Tensor hidden, int64_t,
                                                       int64_t) const {
     return hidden.mean(2);

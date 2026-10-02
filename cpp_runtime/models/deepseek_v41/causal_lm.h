@@ -158,6 +158,7 @@ auto dspark_attention(int64_t context, Query query, Key key, Cache cache, Plan p
 
 template <class Backend> struct CausalLm : models::CausalModelBase<Backend, CausalLm<Backend>> {
     using Tensor = typename Backend::Tensor;
+    static bool accepts_backbone(std::string_view backbone) { return backbone == "deepseek_v41"; }
     template <class Graph, class Source>
     void adapter_load_config(std::string_view payload, const Graph &graph, const Source &source) {
         auto &config = this->config;
@@ -184,6 +185,9 @@ template <class Backend> struct CausalLm : models::CausalModelBase<Backend, Caus
                                    int64_t tokens) const {
         auto collapsed = this->collapse_hidden(std::move(hidden), batch, tokens);
         return this->normalize_hidden(std::move(collapsed), output_norm, batch, tokens);
+    }
+    Tensor adapter_prepare_hidden(Tensor hidden, int64_t batch, int64_t tokens) const {
+        return this->expand_hidden(std::move(hidden), batch, tokens, this->metadata.hc_mult);
     }
     void adapter_set_max_position_embeddings(int64_t value) {
         this->config.max_position_embeddings = value;

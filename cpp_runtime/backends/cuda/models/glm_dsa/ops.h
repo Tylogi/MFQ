@@ -489,7 +489,7 @@ std::unique_ptr<::Block> load_block(CudaExecutionContext &execution, const mfq::
 
 namespace mfq::cuda {
 
-struct GlmDsaModel : CausalLmArchitecture {
+struct GlmDsaModel : CausalResources {
     void adapter_validate_model_geometry() const;
     template <class Backend> using CausalModel = mfq::models::glm_dsa::CausalLm<Backend>;
     mfq::models::glm_dsa::Config config;

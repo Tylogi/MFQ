@@ -129,7 +129,7 @@ CUDA_QWEN_BATCH_STATE = "\n".join(
     (CUDA_MODELS / "qwen35" / name).read_text(encoding="utf-8")
     for name in ("batch_state.h", "batch_state.cpp")
 )
-CUDA_CAUSAL_LM_LOADER = (CUDA_MODELS / "loader.cpp").read_text(
+CUDA_CAUSAL_LM_LOADER = (CUDA_MODELS.parent / "storage/model_loader.cpp").read_text(
     encoding="utf-8"
 )
 SPARSE_OPERATOR = (METAL / "ops" / "mlx_sparse_attention.cpp").read_text(
@@ -511,7 +511,7 @@ def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
     assert "execution.reset();" in options
     assert "CudaExecutionContext&execution" in "".join(CUDA_CAUSAL_LM.split())
     assert "model.execution = &execution;" in (
-        CUDA_MODELS / "loader.cpp"
+        CUDA_MODELS.parent / "storage/model_loader.cpp"
     ).read_text(encoding="utf-8")
     assert "struct CudaSessionCodec" in CUDA_CAUSAL_LM
     assert "CudaSessionCodec<Model>::capture" in CUDA_CAUSAL_LM_IMPL
@@ -1173,7 +1173,7 @@ def test_cuda_model_runtime_uses_compiled_operator_bindings() -> None:
     ):
         assert concrete_definition not in CUDA_RUNTIME_SOURCE
     causal_lm = (CUDA_MODELS / "causal_ops.h").read_text(encoding="utf-8")
-    causal_lm_loader = (CUDA_MODELS / "loader.cpp").read_text(
+    causal_lm_loader = (CUDA_MODELS.parent / "storage/model_loader.cpp").read_text(
         encoding="utf-8"
     )
     assert re.search(r"\bCudaModel\b", CUDA_BACKEND_SOURCE) is None
@@ -1215,7 +1215,7 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         "engine/options.cpp",
         "commands/cli.cpp",
         "models/causal_ops.cpp",
-        "models/loader.cpp",
+        "storage/model_loader.cpp",
         "models/transformer.cpp",
         "engine/mtp.cpp",
         "storage/moe_expert_cache.cpp",
@@ -1350,3 +1350,41 @@ def test_cuda_family_layers_and_offline_generation_use_shared_flows() -> None:
     ffn = (CUDA_MODELS / "ffn.cpp").read_text(encoding="utf-8")
     assert "mfq::models::additive_branches(" in ffn
     assert ffn.count("mfq::models::gated_mlp(") == 4
+
+
+def test_shared_models_own_composition_loading_and_input_rules() -> None:
+    shared = ROOT / "cpp_runtime/models"
+    causal = (shared / "common/causal_model.h").read_text()
+    loader = (CUDA_MODELS.parent / "storage/model_loader.cpp").read_text()
+    assert "void load_definition(" in causal and "void load_weights(" in causal
+    assert "tie_word_embeddings() || !loader.has_weight(output)" in causal
+    assert "model.load_definition(" in loader and "model.load_weights(weights, load_blocks)" in loader
+    assert "expected_backbone" not in loader and '"model.output.weight"' not in loader
+    assert not (CUDA_MODELS / "loader.cpp").exists()
+    for family in ("gemma4", "qwen4_exp", "glm5_next", "deepseek_v4", "deepseek_v41"):
+        assert "Tensor adapter_prepare_hidden(" in (shared / family / "causal_lm.h").read_text()
+        assert "::adapter_prepare_hidden(" not in (CUDA_MODELS / family / "ops.cpp").read_text()
+    common_native = (CUDA_MODELS / "causal_ops.cpp").read_text()
+    for rule in ("adapter_validate_positions", "adapter_supports_speculation", "adapter_force_cache_advance"):
+        assert rule in causal
+        assert f"CausalResources::{rule}" not in common_native
+    assert "softcap_logits" not in common_native
+    gemma = (shared / "gemma4/causal_lm.h").read_text()
+    native_gemma = (CUDA_MODELS / "gemma4/ops.cpp").read_text()
+    assert "inline LayerSpec layer_spec(" in gemma
+    assert "ops.projections(projections)" in gemma
+    assert "mfq::models::gemma4::load_block(" in native_gemma
+    assert "gemma4_ffn_merge_f16_cuda(" in native_gemma
+    assert 'type == "sliding_attention"' not in native_gemma
+    mini = (CUDA_MODELS / "minicpmo45/runtime.h").read_text()
+    assert "mfq::models::minicpmo45::encode(ops, input)" in mini
+    assert "mfq::models::minicpmo45::multimodal_forward(" in mini
+    assert "for (const auto & bound : images)" not in mini
+    grid = (CUDA_MODELS / "grid_vision_component.h").read_text()
+    for stage in ("attention", "encode", "merge", "prepare"):
+        assert f"mfq::models::grid_vision::{stage}(" in grid
+    assert "token_ids[index] == image_token_id_" not in grid
+    for source in shared.rglob("*.h"):
+        text = source.read_text()
+        assert "mfq_tensor_backend" not in text
+        assert '#include "backends/' not in text

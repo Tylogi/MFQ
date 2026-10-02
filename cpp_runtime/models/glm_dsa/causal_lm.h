@@ -39,6 +39,7 @@ auto indexed_attention(bool indexed, int64_t tokens, int64_t prefix, int64_t spa
 
 template <class Backend> struct CausalLm : models::CausalModelBase<Backend, CausalLm<Backend>> {
     using Tensor = typename Backend::Tensor;
+    static bool accepts_backbone(std::string_view backbone) { return backbone == "glm_dsa"; }
     template <class Graph, class Source>
     void adapter_load_config(std::string_view payload, const Graph &graph, const Source &source) {
         auto &config = this->config;
