@@ -91,6 +91,17 @@ array dense(
     return mlx::core::contiguous(result);
 }
 
+// MHC projections are small resident matrices consumed by the existing fused
+// gated-residual operators. Decode only these weights once; keep dense() strict
+// for norms/integer metadata and leave large PLE tables on their row reader.
+array mhc_projection(const MfqContainer& model, const std::string& name) {
+    if (!is_nint_dtype(model.record(name).dtype)) return dense(model, name);
+    const auto mapped = model.map_record(name);
+    auto result = MlxNintWeight::from_blob(mapped.view()).dequantize();
+    result.eval();
+    return result;
+}
+
 array dense_vector(
     const MfqContainer& model,
     const std::string& name,
@@ -177,7 +188,8 @@ public:
         if (model.record(gate).dtype == "MFE" &&
             model.record(up).dtype == "MFE") {
             return Qwen4RoutedWeight(
-                load_routed_gate_up_weight(model, prefix));
+                load_routed_gate_up_weight(model, prefix)
+                    .materialize_packed_projections());
         }
         auto gate_values = dense(model, gate);
         auto up_values = dense(model, up);
@@ -354,13 +366,13 @@ public:
                 throw std::runtime_error("Qwen4 gated residual prefix is invalid");
             }
             root.resize(root.size() - 4);
-            injection = dense(model, root + ".post.inject.weight");
+            injection = mhc_projection(model, root + ".post.inject.weight");
         }
         return GatedResidual(
             config,
             dense_vector(model, prefix + ".norm.weight"),
-            dense(model, prefix + ".down.weight"),
-            dense(model, prefix + ".up.weight"),
+            mhc_projection(model, prefix + ".down.weight"),
+            mhc_projection(model, prefix + ".up.weight"),
             std::move(injection));
     }
 
@@ -454,15 +466,15 @@ public:
         const auto up_name = split_gate_up
             ? std::optional<std::string>(expert_prefix + "up.weight")
             : std::nullopt;
-    const auto down_name = expert_prefix + "down.weight";
-    if (mfe_offload_cache &&
-        (!mfe_offload_cache->can_group_mfe(gate_name)
-         || (up_name && !mfe_offload_cache->can_group_mfe(*up_name))
-         || !mfe_offload_cache->can_group_mfe(down_name))) {
-            // A requested offload policy is projection-selective. Unsupported
-            // records remain on the ordinary eager path; other layers still
-            // page through the same shared cache.
-            mfe_offload_cache.reset();
+        const auto down_name = expert_prefix + "down.weight";
+        if (mfe_offload_cache) {
+            for (const auto& name : {gate_name, up_name.value_or(gate_name), down_name}) {
+                if (!mfe_offload_cache->can_group_mfe(name)) {
+                    throw std::runtime_error(
+                        "Qwen4 expert cache cannot page " + name +
+                        "; refusing to bypass the configured cache budget");
+                }
+            }
         }
         std::optional<Qwen4RoutedWeight> gate_up;
         std::optional<Qwen4RoutedWeight> down;
@@ -3059,13 +3071,14 @@ std::int32_t MlxQwen4CausalLm::generate(
         }
         return value;
     }();
+    // Include route synchronization, host paging and graph construction, not
+    // only evaluations wrapped by eval_with_timing().
+    const double wall_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - profile_started).count();
+    prefill_ms = wall_ms;
     if (profile_prefill) {
-        const double wall_ms =
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - profile_started)
-                .count();
         const double evaluated_ms = component_profile.evaluated_ms();
-        prefill_ms = wall_ms;
         std::cout
             << "component_profile model=qwen4 phase=prefill"
             << " tokens=" << prompt.size()

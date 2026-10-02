@@ -306,6 +306,26 @@ def test_qwen4_small_m_down_reduce_is_format_neutral() -> None:
     assert "supports_mxfp4_blocks" not in moe
 
 
+def test_qwen4_requested_mfe_budget_never_falls_back_to_eager_layers() -> None:
+    moe = QWEN4[QWEN4.index("class Qwen4Moe") :]
+    moe = moe[: moe.index("array operator()")]
+    assert "mfe_offload_cache.reset()" not in moe
+    assert "refusing to bypass the configured cache budget" in moe
+    assert "can_group_mfe(name)" in moe
+
+
+def test_metal_residency_is_configured_before_model_allocation() -> None:
+    configure = DECODE_APP[DECODE_APP.index("void configure_mlx_metal()") :]
+    configure = configure[: configure.index("void self_test_metal()")]
+    assert 'info.at("max_recommended_working_set_size")' in configure
+    assert "mlx::core::set_wired_limit(limit)" in configure
+    assert "Metal memory residency unavailable" in configure
+    server = DECODE_APP[DECODE_APP.index("if (arguments.server)") :]
+    assert server.index("configure_mlx_metal();") < server.index(
+        "run_native_server(arguments, model)"
+    )
+
+
 def test_qwen4_nint_ple_uses_shared_row_decode_without_resident_weights() -> None:
     embedding = QWEN4[QWEN4.index("class Qwen4NgramEmbedding") :]
     embedding = embedding[: embedding.index("class Qwen4Ple")]

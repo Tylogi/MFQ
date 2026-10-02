@@ -6447,7 +6447,7 @@ void test_concatenate_resident_mfe_experts() {
 }
 
 void test_streamed_mixed_mfe_residency() {
-    constexpr int experts = 8;
+    constexpr int experts = 12;
     constexpr int output = 13;
     constexpr int input = 96;
     constexpr int tokens = 5;
@@ -6458,6 +6458,8 @@ void test_streamed_mixed_mfe_residency() {
         5, 2 * output, input, 47, 24);
     const auto mx = make_mxfp4(2 * output, input);
     const auto vq = make_jsc_nvq(2 * output, input);
+    const auto nvq_s = make_nvq1_s(2 * output, input);
+    const auto nvq_l = make_nvq1_l(2 * output, input);
     const TensorFixture mx_tensor{
         mx.blob, mx.dense, 2 * output, input};
     const TensorFixture vq_tensor{
@@ -6467,6 +6469,8 @@ void test_streamed_mixed_mfe_residency() {
         {{6, 2}, "NINT5", legacy_nint, {}},
         {{3, 0}, "MXFP4", mx_tensor, {}},
         {{7, 5}, vq.dtype, vq_tensor, vq.runtime},
+        {{10, 8}, nvq_s.dtype, {nvq_s.blob, nvq_s.dense, 2 * output, input}, {}},
+        {{9, 11}, nvq_l.dtype, {nvq_l.blob, nvq_l.dense, 2 * output, input}, {}},
     };
     const auto blob = make_raw_nim2(
         experts, output, input, pools);
@@ -6545,11 +6549,16 @@ void test_streamed_mixed_mfe_residency() {
             actual.size() == expected.size(),
             "mixed streamed MFE output shape mismatch");
         for (std::size_t index = 0; index < actual.size(); ++index) {
-            require_close(actual[index], expected[index], 1e-6f);
+            if (!std::isfinite(actual[index]) || !std::isfinite(expected[index]) ||
+                std::fabs(actual[index] - expected[index]) > 1e-6f) {
+                throw std::runtime_error("mixed streamed MFE mismatch: expert=" +
+                    std::to_string(global_ids[index / output]) + " actual=" +
+                    std::to_string(actual[index]) + " expected=" + std::to_string(expected[index]));
+            }
         }
     };
-    exercise({1, 2, 3, 5});
-    exercise({4, 6, 0, 7});
+    exercise({1, 2, 3, 5, 8, 9});
+    exercise({4, 6, 0, 7, 10, 11});
     require(
         residency.cached_expert_count() == experts
             && residency.resident_packed_bytes() > 0,
@@ -6559,6 +6568,210 @@ void test_streamed_mixed_mfe_residency() {
         residency.cached_expert_count() == 0
             && residency.resident_packed_bytes() == 0,
         "mixed streamed MFE record discard mismatch");
+}
+
+void test_materialized_mfe_projections() {
+    constexpr int experts = 4;
+    constexpr int output = 1024;
+    constexpr int input = 768;
+    const auto nint = make_nint_v2_tensor(2 * output, input, 17, 24);
+    const auto vq = make_jsc_nvq(2 * output, input);
+    const auto blob = make_raw_nim2(experts, output, input, {
+        {{0, 2}, "NINTv2", nint, {}},
+        {{3, 1}, vq.dtype, {vq.blob, vq.dense, 2 * output, input}, vq.runtime},
+    });
+    const auto up_vq = make_nvq1_s(2 * output, input);
+    const auto up_blob = make_raw_nim2(experts, output, input, {
+        {{1, 2}, "NINTv2", make_nint_v2_tensor(2 * output, input, 23, 24), {}},
+        {{0, 3}, up_vq.dtype, {up_vq.blob, up_vq.dense, 2 * output, input}, {}},
+    });
+    const auto build = [&] {
+        return mfq::metal::MlxMfeWeight::concatenate_projections({
+            mfq::metal::MlxMfeWeight::from_blob(blob),
+            mfq::metal::MlxMfeWeight::from_blob(up_blob),
+        });
+    };
+    mlx::core::synchronize();
+    const auto initial = mlx::core::get_active_memory();
+    const auto reference = build();
+    const auto exercise = [&](const mfq::metal::MlxMfeWeight& weight, int tokens, bool sorted) {
+        std::vector<float> source(tokens * input);
+        for (std::size_t i = 0; i < source.size(); ++i) {
+            source[i] = static_cast<float>(static_cast<int>(i % 17) - 8) / 4096.0f;
+        }
+        std::vector<std::int32_t> ids(tokens * 2);
+        for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = (i * 3 + 1) % experts;
+        auto x = mlx::core::astype(mlx::core::array(
+            source.begin(), mlx::core::Shape{tokens, input}), mlx::core::float16);
+        auto routes = mlx::core::array(ids.begin(), mlx::core::Shape{tokens, 2});
+        if (!sorted) return evaluated_floats(weight.routed_swiglu(x, routes));
+        auto order = mlx::core::astype(mlx::core::argsort(
+            mlx::core::reshape(routes, mlx::core::Shape{tokens * 2})), mlx::core::int32);
+        auto plan = weight.build_grouped_mmq_plan(routes, order, 32);
+        return evaluated_floats(weight.routed_matmul_sorted(
+            x, routes, order, false, true, 0.0f, &plan));
+    };
+    std::vector<std::vector<float>> expected;
+    for (int tokens : {1, 5, 32, 65}) expected.push_back(exercise(reference, tokens, tokens >= 32));
+    mlx::core::synchronize();
+    mlx::core::clear_cache();
+    const auto before = mlx::core::get_active_memory();
+    const auto candidate = build().materialize_packed_projections();
+    require(candidate.supports_grouped_mmq(), "materialized projections lost grouped MMQ");
+    int run = 0;
+    for (int tokens : {1, 5, 32, 65}) {
+        const auto actual = exercise(candidate, tokens, tokens >= 32);
+        require(actual.size() == expected[run].size(), "materialized projection shape mismatch");
+        for (std::size_t i = 0; i < actual.size(); ++i) {
+            require_close(actual[i], expected[run][i], 1e-6f);
+        }
+        ++run;
+    }
+    // Allow small descriptor/allocator overhead, but never a second Gate/Up copy.
+    mlx::core::synchronize();
+    const auto allocated = mlx::core::get_active_memory() - before;
+    require(allocated < candidate.packed_nbytes() + (64u << 10),
+        "materialized projections retained duplicate source weight buffers: allocated=" +
+        std::to_string(allocated) + " packed=" + std::to_string(candidate.packed_nbytes()));
+    require(before - initial > allocated + candidate.packed_nbytes() / 2,
+        "projection fixture did not reproduce lazy duplicate storage");
+}
+
+void test_streamed_nvq1_residency() {
+    constexpr int experts = 3;
+    constexpr int output = 3;
+    // Odd expert row counts exercise unaligned state/index/delta boundaries.
+    // Cover both embedded tables and the implicit NVQ1-L table, including K tails.
+    for (int variant = 0; variant < 4; ++variant) {
+        const bool short_profile = variant == 0;
+        const bool custom_table = variant == 2;
+        const int input = short_profile ? 40 : 37;
+        const int state_bits = short_profile ? 4 : variant == 3 ? 8 : 3;
+        const int index_bits = short_profile ? 9 : 11;
+        const int groups = (input + 23) / 24;
+        const int vectors = (input + 7) / 8;
+        const std::string dtype = short_profile ? "NVQ1-S" : "NVQ1-L";
+        std::vector<std::uint8_t> payload;
+        append_vq_matrix_header(payload, short_profile ? "NQ1S" : "NQ1L",
+            custom_table ? 2 : 1, state_bits, 24, experts * output, input);
+        if (short_profile) {
+            // Distinct banks make delta slicing observable independently of scale.
+            for (int bank = 0; bank < 2; ++bank) {
+                for (int entry = 0; entry < 512; ++entry) {
+                    append<std::uint16_t>(payload,
+                        mfq::nvq_codebooks::kNvq1LCodebookPacked[
+                            bank == 0 ? entry * 4 : (511 - entry) * 4]);
+                }
+            }
+        } else if (custom_table) {
+            for (int entry = 0; entry < 2048; ++entry) {
+                append<std::uint16_t>(payload,
+                    mfq::nvq_codebooks::kNvq1LCodebookPacked[2047 - entry]);
+            }
+        }
+        std::vector<std::uint16_t> states, indices, deltas;
+        for (int row = 0; row < experts * output; ++row) {
+            append<std::uint16_t>(payload, static_cast<std::uint16_t>(0x3400 + row * 128));
+            for (int group = 0; group < groups; ++group) {
+                states.push_back((row * 3 + group + 1) % (1 << state_bits));
+                deltas.push_back((row + group) % 2);
+            }
+            for (int vector = 0; vector < vectors; ++vector) {
+                indices.push_back((row * 71 + vector * 37) % (1 << index_bits));
+            }
+        }
+        append_bytes(payload, pack_vq_values(states, state_bits));
+        append_bytes(payload, pack_vq_values(indices, index_bits));
+        append_bytes(payload, pack_vq_values(deltas, 1));
+        const auto wrap = [&](const std::vector<std::uint8_t>& bytes) {
+            return make_raw_nim2(experts, output, input,
+                {{{2, 0, 1}, dtype, {bytes, {}, experts * output, input}, {}}});
+        };
+        auto truncated = payload;
+        truncated.pop_back();
+        auto trailing = payload;
+        trailing.push_back(0);
+        auto wrong_shape = payload;
+        wrong_shape[20] = 1;
+        auto wrong_profile = payload;
+        wrong_profile[4] = 9;
+        const auto blob = wrap(payload);
+        const TemporaryMfq file({
+            {"valid", "MFE", blob},
+            {"truncated", "MFE", wrap(truncated)},
+            {"trailing", "MFE", wrap(trailing)},
+            {"shape", "MFE", wrap(wrong_shape)},
+            {"profile", "MFE", wrap(wrong_profile)},
+        });
+        const mfq::metal::MfqContainer model(file.path());
+        mfq::metal::MlxMfeOffloadCache cache(model, 1);
+        require(cache.can_group_mfe("valid"), "NVQ1 MFE was not pageable");
+        for (const auto* name : {"truncated", "trailing", "shape", "profile"}) {
+            require_stream_rejected([&] { (void)cache.can_group_mfe(name); }, name);
+        }
+        const auto full = mfq::metal::MlxMfeWeight::from_blob(blob);
+        const auto check = [&](const mfq::metal::MlxMfeWeight& paged,
+                               const std::vector<std::int32_t>& active) {
+            for (const int tokens : {1, 5, 17}) {
+                std::vector<float> source(static_cast<std::size_t>(tokens) * input);
+                for (std::size_t i = 0; i < source.size(); ++i) {
+                    source[i] = static_cast<float>(static_cast<int>(i % 23) - 11) / 128.0f;
+                }
+                std::vector<std::int32_t> global_ids(tokens * 2), local_ids(tokens * 2);
+                for (std::size_t i = 0; i < local_ids.size(); ++i) {
+                    local_ids[i] = i % active.size();
+                    global_ids[i] = active[local_ids[i]];
+                }
+                const auto x = mlx::core::astype(mlx::core::array(
+                    source.begin(), mlx::core::Shape{tokens, input}), mlx::core::float16);
+                const auto expected = evaluated_floats(full.routed_matmul(x,
+                    mlx::core::array(global_ids.begin(), mlx::core::Shape{tokens, 2})));
+                const auto actual = evaluated_floats(paged.routed_matmul(x,
+                    mlx::core::array(local_ids.begin(), mlx::core::Shape{tokens, 2})));
+                require(actual.size() == expected.size(), "paged NVQ1 shape mismatch");
+                for (std::size_t i = 0; i < actual.size(); ++i) {
+                    if (!std::isfinite(actual[i]) || !std::isfinite(expected[i]) ||
+                        std::fabs(actual[i] - expected[i]) > 1e-6f) {
+                        throw std::runtime_error("paged NVQ1 mismatch: variant=" +
+                            std::to_string(variant) + " tokens=" + std::to_string(tokens) +
+                            " index=" + std::to_string(i) + " actual=" +
+                            std::to_string(actual[i]) + " expected=" + std::to_string(expected[i]));
+                    }
+                    // Independent scalar oracle also catches shared packed-kernel
+                    // errors (in particular reads beyond a partial final vector).
+                    const int route = i / output;
+                    const int local_expert = (global_ids[route] + 1) % experts;
+                    const int row = local_expert * output + i % output;
+                    float reference = 0.0f;
+                    for (int column = 0; column < input; ++column) {
+                        const int group = column / 24;
+                        const int delta_bit = deltas[row * groups + group];
+                        const int index = indices[row * vectors + column / 8];
+                        const int table_index = short_profile
+                            ? (delta_bit ? (511 - index) * 4 : index * 4)
+                            : custom_table ? 2047 - index : index;
+                        const auto word = mfq::nvq_codebooks::kNvq1LCodebookPacked[table_index];
+                        const float code = static_cast<int>((word >> (2 * (column % 8))) & 3u) - 1;
+                        const float delta = (short_profile ? 0.15625f : 0.125f) *
+                            (delta_bit ? -1.0f : 1.0f);
+                        const float weight = (0.25f + row * 0.03125f) *
+                            states[row * groups + group] * (code + delta);
+                        reference += source[(route / 2) * input + column] * weight;
+                    }
+                    require_close(actual[i], reference, 2e-2f);
+                }
+            }
+        };
+        const auto retained = cache.grouped_mfe("valid", {2, 0});
+        check(retained, {2, 0});
+        require(cache.cached_expert_count() == 2, "NVQ1 active set accounting mismatch");
+        check(cache.grouped_mfe("valid", {1}), {1});
+        require(cache.cached_expert_count() == 1, "NVQ1 LRU did not evict inactive experts");
+        cache.clear();
+        require(cache.resident_packed_bytes() == 0, "NVQ1 cache clear retained bytes");
+        check(retained, {2, 0});
+        check(cache.grouped_mfe("valid", {0, 2, 1}), {0, 2, 1});
+    }
 }
 
 void test_container_validation() {
@@ -6828,6 +7041,13 @@ void test_container_validation() {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--test-streamed-mfe") {
+            test_streamed_mixed_mfe_residency();
+            test_streamed_nvq1_residency();
+            test_materialized_mfe_projections();
+            std::cout << "MFQ streamed MFE residency tests passed\n";
+            return 0;
+        }
         if (
             argc == 2
             && std::string_view(argv[1])
@@ -6847,7 +7067,7 @@ int main(int argc, char** argv) {
         if (argc != 1) {
             throw std::runtime_error(
                 "usage: mfq-metal-moe-test "
-                "[--benchmark-nepq-a|--benchmark-nint-shared]");
+                "[--benchmark-nepq-a|--benchmark-nint-shared|--test-streamed-mfe]");
         }
         test_all_families_and_projections();
         test_swiglu_ffn();
@@ -6876,6 +7096,8 @@ int main(int argc, char** argv) {
         test_grouped_mxfp4_vq_mmq_prefill();
         test_concatenate_resident_mfe_experts();
         test_streamed_mixed_mfe_residency();
+        test_streamed_nvq1_residency();
+        test_materialized_mfe_projections();
         test_container_validation();
         test_streamed_tpq_residency();
         std::cout
