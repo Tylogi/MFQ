@@ -1,7 +1,7 @@
 #include "model_checks.h"
 
-#include "models/deepseek_v4/causal_lm.h"
-#include "models/glm_dsa/causal_lm.h"
+#include "models/deepseek_v4/ops.h"
+#include "models/glm_dsa/ops.h"
 #include "models/session_state.h"
 
 #include <cstdint>

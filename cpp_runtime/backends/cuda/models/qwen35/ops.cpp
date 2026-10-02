@@ -1,0 +1,448 @@
+#include "ops.h"
+#include "../session_codec_impl.h"
+#include "linear_attention.h"
+
+#include "models/transformer.h"
+
+namespace mfq::cuda::qwen35 {
+namespace {
+
+FFN load_qwen_ffn(CudaExecutionContext &execution, const mfq::ModelSource &source,
+                  const Config &config, int layer, std::string_view tensor_root) {
+    const std::string prefix =
+        std::string(tensor_root) + ".block." + std::to_string(layer) + ".mlp.";
+    if (!has_tensor(source, prefix + "experts.gate_up.weight") &&
+        !has_tensor(source, prefix + "experts.gate.weight") &&
+        !has_tensor(source, prefix + "experts.up.weight") &&
+        !has_tensor(source, prefix + "experts.down.weight")) {
+        return load_ffn(execution, source, config, layer, false, tensor_root);
+    }
+    if (config.num_experts <= 0 || config.num_experts_per_tok <= 0 ||
+        config.moe_intermediate_size <= 0 || config.shared_expert_intermediate_size <= 0) {
+        throw std::runtime_error("Qwen MoE config fields are missing");
+    }
+
+    auto ffn = load_moe_weights(execution, source, prefix, {.layer = layer});
+    ffn.moe_shared_gate = load_dense_gpu(execution, source, prefix + "shared_expert.router.weight")
+                              .to(mfq_tensor_backend::kFloat32)
+                              .contiguous();
+    ffn.moe_top_k = static_cast<int>(config.num_experts_per_tok);
+    const auto routing = config.routing();
+    ffn.moe_use_sqrt_softplus = routing.activation == mfq::models::RouterActivation::sqrt_softplus;
+    ffn.moe_normalize = routing.normalize;
+    ffn.moe_delayed_softmax = routing.delayed_softmax;
+    ffn.moe_router_scale = routing.scale;
+    const bool routed_gate_shapes =
+        ffn.moe_split_gate_up
+            ? ffn.moe_gate.n_experts == config.num_experts &&
+                  ffn.moe_up.n_experts == config.num_experts &&
+                  ffn.moe_gate.neuron_len == config.hidden_size &&
+                  ffn.moe_up.neuron_len == config.hidden_size &&
+                  ffn.moe_gate.out_per_expert == config.moe_intermediate_size &&
+                  ffn.moe_up.out_per_expert == config.moe_intermediate_size
+            : ffn.moe_gate_up.n_experts == config.num_experts &&
+                  ffn.moe_gate_up.neuron_len == config.hidden_size &&
+                  ffn.moe_gate_up.out_per_expert == 2 * config.moe_intermediate_size;
+    if (!routed_gate_shapes || ffn.moe_down.n_experts != config.num_experts ||
+        ffn.moe_down.neuron_len != config.moe_intermediate_size ||
+        ffn.moe_down.out_per_expert != config.hidden_size || ffn.moe_router.dim() != 2 ||
+        ffn.moe_router.size(0) != config.num_experts ||
+        ffn.moe_router.size(1) != config.hidden_size || ffn.moe_shared_gate.dim() != 2 ||
+        ffn.moe_shared_gate.size(0) != 1 || ffn.moe_shared_gate.size(1) != config.hidden_size) {
+        throw std::runtime_error("Qwen MoE tensor shapes disagree with config at layer " +
+                                 std::to_string(layer));
+    }
+    return ffn;
+}
+
+} // namespace
+
+std::unique_ptr<::Block> load_block(CudaExecutionContext &execution, const mfq::ModelSource &source,
+                                    const Config &config, int layer, const std::string &type,
+                                    std::string_view tensor_root) {
+    const int i = layer;
+    const std::string lp = std::string(tensor_root) + ".block." + std::to_string(i) + ".";
+    const auto kind = Config::attention_kind(type);
+    if (kind == Config::AttentionKind::full) {
+        auto b = std::make_unique<FullBlock>();
+        b->layer = i;
+        b->attention_heads = config.num_attention_heads;
+        b->kv_heads = config.num_key_value_heads;
+        b->attention_head_dim = config.head_dim;
+        b->max_position_embeddings = config.max_position_embeddings;
+        b->rms_norm_eps = config.rms_norm_eps;
+        b->norm_weight_offset = config.legacy_tensor_layout.norm_weight_offset;
+        b->attention_output_gate = config.attention_output_gate;
+        b->attn_norm = load_dense_gpu(execution, source, lp + "attention.norm.weight");
+        b->ffn_norm = load_dense_gpu(execution, source, lp + "mlp.norm.weight");
+        const std::string ap = lp + "attention.";
+        const std::string query_name = ap + "query.weight";
+        const std::string key_name = ap + "key.weight";
+        const std::string value_name = ap + "value.weight";
+        const bool mirror_kv = config.attention_output_gate &&
+                               execution.config.tensor_parallel_mirror_qwen35_attention_kv &&
+                               is_quant_dtype(require_tensor(source, key_name).dtype) &&
+                               is_quant_dtype(require_tensor(source, value_name).dtype);
+        if (mirror_kv) {
+            b->split_q_kv_projections = true;
+            b->q_projection = load_quant_linear(execution, source, query_name);
+            const auto mirrored = std::optional<TensorParallelAxis>(TensorParallelAxis::Mirrored);
+            b->k_projection = load_quant_linear(execution, source, key_name, mirrored);
+            b->v_projection = load_quant_linear(execution, source, value_name, mirrored);
+        } else {
+            b->qkv = load_quant_group(execution, source, {query_name, key_name, value_name}, 2);
+        }
+        b->o = load_quant_linear(execution, source, ap + "output.weight");
+        if (has_tensor(source, ap + "query_norm.weight")) {
+            b->q_norm = load_dense_gpu(execution, source, ap + "query_norm.weight");
+        }
+        if (has_tensor(source, ap + "key_norm.weight")) {
+            b->k_norm = load_dense_gpu(execution, source, ap + "key_norm.weight");
+        }
+        b->ffn = load_qwen_ffn(execution, source, config, layer, tensor_root);
+        return b;
+    }
+    {
+        auto b = std::make_unique<LinearAttentionBlock>();
+        b->qwen_config = config;
+        b->tiled_v_heads = config.legacy_tensor_layout.qwen_gdn_gguf_layout;
+        b->attn_norm = load_dense_gpu(execution, source, lp + "attention.norm.weight");
+        b->ffn_norm = load_dense_gpu(execution, source, lp + "mlp.norm.weight");
+        const std::string sp = lp + "linear_attention.";
+        const std::string alpha_name = sp + "alpha.weight";
+        const std::string beta_name = sp + "beta.weight";
+        if (has_tensor(source, sp + "qk.weight") && has_tensor(source, sp + "value.weight")) {
+            b->split_in_proj = true;
+            b->qkv_proj =
+                load_quant_group(execution, source, {sp + "qk.weight", sp + "value.weight"});
+            if (is_quant_dtype(require_tensor(source, sp + "gate.weight").dtype)) {
+                b->z_proj = load_quant_linear(execution, source, sp + "gate.weight");
+                const bool a_nint = is_quant_dtype(require_tensor(source, alpha_name).dtype);
+                const bool b_nint = is_quant_dtype(require_tensor(source, beta_name).dtype);
+                if (a_nint != b_nint)
+                    throw std::runtime_error("linear_attn a/b must use the same storage kind");
+                b->ab_is_nint = a_nint;
+                if (b->ab_is_nint) {
+                    const auto scalar_axis =
+                        execution.config.tensor_parallel_mirror_linear_attention_scalars
+                            ? std::optional<TensorParallelAxis>(TensorParallelAxis::Mirrored)
+                            : std::nullopt;
+                    b->ab_nint_proj = make_quant_group(
+                        execution,
+                        {
+                            load_quant_linear(execution, source, alpha_name, scalar_axis),
+                            load_quant_linear(execution, source, beta_name, scalar_axis),
+                        });
+                } else {
+                    b->ab_proj = make_dense_group({
+                        load_dense_gpu(execution, source, alpha_name),
+                        load_dense_gpu(execution, source, beta_name),
+                    });
+                }
+            } else {
+                b->split_dense_zab = true;
+                b->zab_proj = make_dense_group({
+                    load_dense_gpu(execution, source, sp + "gate.weight"),
+                    load_dense_gpu(execution, source, alpha_name),
+                    load_dense_gpu(execution, source, beta_name),
+                });
+            }
+        } else {
+            const bool alpha_quant = is_quant_dtype(require_tensor(source, alpha_name).dtype);
+            const bool beta_quant = is_quant_dtype(require_tensor(source, beta_name).dtype);
+            if (alpha_quant != beta_quant) {
+                throw std::runtime_error(
+                    "linear_attention alpha/beta must use the same storage kind");
+            }
+            if (alpha_quant) {
+                b->in_proj = load_quant_group(
+                    execution, source,
+                    {sp + "qkv.weight", sp + "gate.weight", alpha_name, beta_name});
+            } else {
+                b->dense_ab_tail = true;
+                b->in_proj =
+                    load_quant_group(execution, source, {sp + "qkv.weight", sp + "gate.weight"});
+                b->ab_proj = make_dense_group({
+                    load_dense_gpu(execution, source, alpha_name),
+                    load_dense_gpu(execution, source, beta_name),
+                });
+            }
+        }
+        b->conv_weight = load_dense_gpu(execution, source, sp + "conv.weight");
+        if (has_tensor(source, sp + "conv.bias")) {
+            b->conv_bias = load_dense_gpu(execution, source, sp + "conv.bias");
+        }
+        b->dt_bias = load_dense_gpu(execution, source, sp + "dt_bias");
+        const auto a_parameter = load_dense_gpu(execution, source, sp + "a");
+        b->a_log = config.legacy_tensor_layout.linear_attention_a_is_log
+                       ? a_parameter
+                       : mfq_tensor_backend::log(-a_parameter);
+        b->linear_norm = load_dense_gpu(execution, source, sp + "norm.weight");
+        const std::string out_name = sp + "output.weight";
+        if (is_quant_dtype(require_tensor(source, out_name).dtype)) {
+            b->out_proj = load_quant_linear(execution, source, out_name);
+        } else {
+            b->dense_out_proj = true;
+            b->out_proj_dense = load_dense_gpu(execution, source, out_name);
+            if (require_tensor(source, out_name).dtype == "F16") {
+                b->out_proj_dense = b->out_proj_dense.to(mfq_tensor_backend::kFloat16).contiguous();
+            }
+            if (b->out_proj_dense.dim() != 2) {
+                throw std::runtime_error("dense linear_attention output projection must be 2D");
+            }
+        }
+        b->ffn = load_qwen_ffn(execution, source, config, layer, tensor_root);
+        return b;
+    }
+}
+
+void LinearAttentionBlock::clear_speculative() noexcept {
+    speculative_recurrent = LinearRecurrentInputs();
+    speculative_start = -1;
+    speculative_confirmed = 0;
+    speculative_tokens = 0;
+    speculative_pending = false;
+}
+
+mfq_tensor_backend::Tensor LinearAttentionBlock::forward_context(CudaExecutionContext &execution,
+                                                                 mfq_tensor_backend::Tensor input,
+                                                                 const Block::Context &context,
+                                                                 const RopeCache &rope) {
+    if (context.confirmed_prefix == 0) {
+        return Block::forward_context(execution, std::move(input), context, rope);
+    }
+    MFQ_RUNTIME_CHECK(input.is_cuda() && !speculative_pending && context.confirmed_prefix > 0 &&
+                          context.confirmed_prefix < input.size(1) && conv_state.defined() &&
+                          gdn_state.defined(),
+                      "invalid Qwen3.5 speculative linear-attention transaction");
+
+    if (!speculative_conv.defined() || speculative_conv.sizes() != conv_state.sizes() ||
+        !speculative_gdn.defined() || speculative_gdn.sizes() != gdn_state.sizes()) {
+        speculative_conv = conv_state.clone();
+        speculative_gdn = gdn_state.clone();
+    } else {
+        speculative_conv.copy_(conv_state);
+        speculative_gdn.copy_(gdn_state);
+    }
+    speculative_start = context.cache_position;
+    speculative_confirmed = context.confirmed_prefix;
+    speculative_tokens = input.size(1);
+    speculative_pending = true;
+
+    try {
+        // Match Metal: evaluate the complete [confirmed, drafts...] window
+        // once so projections and FFN stay batched. Rollback replays only the
+        // recurrent state prefix from this layer's retained projections.
+        auto attention =
+            forward_attention_cuda(execution, std::move(input), &speculative_recurrent);
+        auto result = forward_ffn_cuda(execution, std::move(attention[0]), std::move(attention[1]));
+        ++speculative_projection_batches;
+        ++speculative_ffn_batches;
+        return result;
+    } catch (...) {
+        conv_state.copy_(speculative_conv);
+        gdn_state.copy_(speculative_gdn);
+        clear_speculative();
+        throw;
+    }
+}
+
+void LinearAttentionBlock::commit_speculative() noexcept { clear_speculative(); }
+
+void LinearAttentionBlock::rollback_speculative(int64_t keep_position) {
+    MFQ_RUNTIME_CHECK(speculative_pending &&
+                          keep_position >= speculative_start + speculative_confirmed &&
+                          keep_position < speculative_start + speculative_tokens,
+                      "invalid Qwen3.5 speculative rollback position");
+    const int64_t retained = keep_position - speculative_start;
+    conv_state.copy_(speculative_conv);
+    gdn_state.copy_(speculative_gdn);
+    try {
+        // Restore only convolution/GDN state from the retained projected
+        // rows; target projections, output projection and FFN are not rerun.
+        replay_recurrent_cuda(speculative_recurrent, retained);
+        clear_speculative();
+    } catch (...) {
+        clear_speculative();
+        throw;
+    }
+}
+
+bool supports_text_session_state(const std::vector<std::unique_ptr<::Block>> &blocks) {
+    return !blocks.empty() &&
+           std::all_of(blocks.begin(), blocks.end(), [](const std::unique_ptr<::Block> &block) {
+               return dynamic_cast<const FullBlock *>(block.get()) != nullptr ||
+                      dynamic_cast<const LinearAttentionBlock *>(block.get()) != nullptr;
+           });
+}
+
+TextSessionState capture_text_session_state(const std::vector<std::unique_ptr<::Block>> &blocks,
+                                            const std::vector<std::int64_t> &tokens,
+                                            std::int64_t cache_position) {
+    if (!supports_text_session_state(blocks) || cache_position <= 0 ||
+        static_cast<std::size_t>(cache_position) != tokens.size()) {
+        throw std::runtime_error("Qwen hybrid session token count does not match the cache");
+    }
+    TextSessionState state;
+    state.tokens = tokens;
+    state.cache_pos = cache_position;
+    state.payload = std::vector<HybridBlockSessionState>{};
+    auto &layers = std::get<std::vector<HybridBlockSessionState>>(state.payload);
+    layers.reserve(blocks.size());
+    for (const auto &block : blocks) {
+        MfqCudaGuard guard(block->cuda_device);
+        HybridBlockSessionState saved;
+        if (const auto *full = dynamic_cast<const FullBlock *>(block.get())) {
+            saved.kind = HybridBlockSessionStateKind::FullAttention;
+            saved.full_attention =
+                capture_full_attention_session_state(*full, cache_position, state.bytes);
+        } else if (const auto *linear = dynamic_cast<const LinearAttentionBlock *>(block.get())) {
+            if (linear->speculative_pending || !linear->conv_state.defined() ||
+                !linear->gdn_state.defined()) {
+                throw std::runtime_error("Qwen recurrent session state is unavailable");
+            }
+            saved.kind = HybridBlockSessionStateKind::Recurrent;
+            saved.convolution_state = linear->conv_state.clone();
+            saved.recurrent_state = linear->gdn_state.clone();
+            state.bytes += session_tensor_bytes(saved.convolution_state);
+            state.bytes += session_tensor_bytes(saved.recurrent_state);
+        } else {
+            throw std::runtime_error("Qwen hybrid session layer type changed");
+        }
+        layers.push_back(std::move(saved));
+    }
+    return state;
+}
+
+void restore_text_session_state(std::vector<std::unique_ptr<::Block>> &blocks,
+                                const TextSessionState &state) {
+    const auto *layers = std::get_if<std::vector<HybridBlockSessionState>>(&state.payload);
+    if (state.kind() != TextSessionStateKind::HybridAttention || state.cache_pos <= 0 ||
+        state.tokens.size() != static_cast<std::size_t>(state.cache_pos) || layers == nullptr ||
+        layers->size() != blocks.size()) {
+        throw CudaSessionStateError("Qwen hybrid session state is incompatible");
+    }
+    for (std::size_t index = 0; index < blocks.size(); ++index) {
+        auto &block = blocks[index];
+        const auto &saved = (*layers)[index];
+        MfqCudaGuard guard(block->cuda_device);
+        if (saved.kind == HybridBlockSessionStateKind::FullAttention) {
+            auto *full = dynamic_cast<FullBlock *>(block.get());
+            if (full == nullptr) {
+                throw CudaSessionStateError("Qwen hybrid full-attention layer changed");
+            }
+            restore_full_attention_session_state(*full, saved.full_attention);
+            continue;
+        }
+        auto *linear = dynamic_cast<LinearAttentionBlock *>(block.get());
+        const auto convolution_width = linear != nullptr ? 2 * linear->qwen_config.linear_k_size() +
+                                                               linear->qwen_config.linear_v_size()
+                                                         : 0;
+        if (linear == nullptr || !saved.convolution_state.defined() ||
+            !saved.recurrent_state.defined() ||
+            saved.convolution_state.scalar_type() != mfq_tensor_backend::kFloat32 ||
+            saved.recurrent_state.scalar_type() != mfq_tensor_backend::kFloat32 ||
+            saved.convolution_state.dim() != 3 || saved.convolution_state.size(0) != 1 ||
+            saved.convolution_state.size(1) != linear->qwen_config.linear_conv_kernel_dim - 1 ||
+            saved.convolution_state.size(2) != convolution_width ||
+            saved.recurrent_state.dim() != 4 || saved.recurrent_state.size(0) != 1 ||
+            saved.recurrent_state.size(1) != linear->qwen_config.linear_num_value_heads ||
+            saved.recurrent_state.size(2) != linear->qwen_config.linear_value_head_dim ||
+            saved.recurrent_state.size(3) != linear->qwen_config.linear_value_head_dim ||
+            !saved.convolution_state.is_cuda() || !saved.recurrent_state.is_cuda() ||
+            saved.convolution_state.get_device() != block->cuda_device ||
+            saved.recurrent_state.get_device() != block->cuda_device) {
+            throw CudaSessionStateError("Qwen recurrent session topology changed");
+        }
+        restore_session_tensor(linear->conv_state, saved.convolution_state);
+        restore_session_tensor(linear->gdn_state, saved.recurrent_state);
+        linear->speculative_conv = mfq_tensor_backend::Tensor();
+        linear->speculative_gdn = mfq_tensor_backend::Tensor();
+        linear->clear_speculative();
+    }
+}
+
+} // namespace mfq::cuda::qwen35
+
+namespace mfq::cuda {
+
+void Qwen35Model::adapter_validate_components(const mfq::ModelGraph &graph) const {
+    if (graph.component("vision") != nullptr &&
+        cuda_model_plan(graph).vision != CudaVisionAdapter::grid_vit) {
+        throw std::runtime_error("Qwen CUDA vision requires grid_vit/grid_vision.v1/grid_mrope");
+    }
+}
+
+void Qwen35Model::adapter_configure_rope(RopeCache &rope, mfq_tensor_backend::Device device) const {
+    rope.configure_mrope(config.mrope_sections, config.mrope_interleaved, config.rotary_dim,
+                         device);
+}
+
+bool Qwen35Model::adapter_uses_common_rope() const noexcept { return true; }
+
+bool Qwen35Model::adapter_supports_dense_cpu_offload() const noexcept { return true; }
+
+std::unique_ptr<Block> Qwen35Model::adapter_load_block(const mfq::ModelSource &source, int layer,
+                                                       int, const std::string &type) {
+    return qwen35::load_block(*execution, source, config, layer, type);
+}
+
+TextSessionStateKind CudaSessionCodec<Qwen35Model>::kind(const Model &model) {
+    const auto full = FullAttentionSessionCodec<Qwen35Model>::kind(model);
+    if (full != TextSessionStateKind::Unsupported)
+        return full;
+    return qwen35::supports_text_session_state(model.blocks) ? TextSessionStateKind::HybridAttention
+                                                             : TextSessionStateKind::Unsupported;
+}
+
+bool CudaSessionCodec<Qwen35Model>::supports_paged(const Model &model) {
+    return FullAttentionSessionCodec<Qwen35Model>::supports_paged(model);
+}
+
+TextSessionState CudaSessionCodec<Qwen35Model>::capture(const Model &model,
+                                                        const std::vector<int64_t> &tokens) {
+    if (kind(model) == TextSessionStateKind::HybridAttention) {
+        if (model.cache_pos <= 0 || static_cast<size_t>(model.cache_pos) != tokens.size()) {
+            throw std::runtime_error("text session token count does not match the model cache");
+        }
+        return qwen35::capture_text_session_state(model.blocks, tokens, model.cache_pos);
+    }
+    return FullAttentionSessionCodec<Qwen35Model>::capture(model, tokens);
+}
+
+void CudaSessionCodec<Qwen35Model>::restore(Model &model, const TextSessionState &state) {
+    if (kind(model) == TextSessionStateKind::HybridAttention &&
+        state.kind() == TextSessionStateKind::HybridAttention) {
+        qwen35::restore_text_session_state(model.blocks, state);
+        model.cache_pos = state.cache_pos;
+        return;
+    }
+    FullAttentionSessionCodec<Qwen35Model>::restore(model, state);
+}
+
+mfq_tensor_backend::Tensor Qwen35Model::adapter_embed(mfq_tensor_backend::Tensor output) const {
+    return output.to(mfq_tensor_backend::kFloat16).contiguous();
+}
+
+void Qwen35Model::adapter_validate_positions(const mfq_tensor_backend::Tensor &positions,
+                                             int64_t batch, int64_t tokens, bool has_mrope) const {
+    if (!config.valid_positions(positions.dim(), positions.dim() > 1 ? positions.size(0) : 0,
+                                positions.size(-1), batch, tokens, has_mrope)) {
+        throw std::runtime_error("position_ids must have shape [tokens], [batch,tokens], or "
+                                 "configured grid-MRoPE [3,tokens]");
+    }
+}
+
+bool Qwen35Model::adapter_supports_prepared_prompt() const noexcept { return true; }
+
+} // namespace mfq::cuda
+
+namespace mfq::cuda {
+
+template struct FullAttentionSessionCodec<Qwen35Model>;
+
+} // namespace mfq::cuda
+
+namespace mfq::models {
+template struct qwen35::CausalLm<cuda::CudaCausalOps<cuda::Qwen35Model>>;
+} // namespace mfq::models

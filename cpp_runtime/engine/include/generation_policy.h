@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <stdexcept>
 
 namespace mfq::engine {
 
@@ -34,5 +35,28 @@ PrefillChunk next_prefill_chunk(
     std::int64_t total_tokens,
     std::int64_t offset,
     std::int64_t chunk_size);
+
+struct TokenGenerationResult {
+    std::int64_t tokens = 0;
+    bool hit_eos = false;
+};
+
+// Synchronous evaluation/TTS shares token acceptance and termination ordering.
+// Native bindings provide tensor sampling and one decode operation at a time.
+template <class Sample, class Accept, class Stop, class Advance>
+TokenGenerationResult generate_tokens(std::int64_t limit, Sample sample, Accept accept, Stop stop,
+                                      Advance advance) {
+    if (limit < 0)
+        throw std::invalid_argument("negative generation limit");
+    for (std::int64_t step = 0; step < limit; ++step) {
+        auto token = sample(step);
+        accept(token, step);
+        if (stop(token))
+            return {step + 1, true};
+        if (step + 1 < limit)
+            advance(token);
+    }
+    return {limit, false};
+}
 
 } // namespace mfq::engine

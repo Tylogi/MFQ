@@ -209,6 +209,7 @@ if(BUILD_TESTING)
         mfq-cuda-native-kernels mfq-json)
     target_compile_definitions(mfq-flash-next-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     target_include_directories(mfq-flash-next-test PRIVATE
+        ${PROJECT_SOURCE_DIR}
         ${MFQ_REPOSITORY_ROOT}
         ${MFQ_CUDA_ROOT}/models
         ${MFQ_CUDA_ROOT}/ops/include
@@ -267,15 +268,15 @@ function(mfq_configure_cuda_runtime_target target)
 endfunction()
 
 set(MFQ_CUDA_MODEL_SOURCES
-    ${MFQ_CUDA_ROOT}/models/deepseek_v4/causal_lm.cpp
-    ${MFQ_CUDA_ROOT}/models/deepseek_v41/causal_lm.cpp
+    ${MFQ_CUDA_ROOT}/models/deepseek_v4/ops.cpp
+    ${MFQ_CUDA_ROOT}/models/deepseek_v41/ops.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/dspark.cpp
-    ${MFQ_CUDA_ROOT}/models/qwen4_exp/causal_lm.cpp
-    ${MFQ_CUDA_ROOT}/models/glm5_next/causal_lm.cpp
-    ${MFQ_CUDA_ROOT}/models/gemma4/causal_lm.cpp
-    ${MFQ_CUDA_ROOT}/models/glm_dsa/causal_lm.cpp
-    ${MFQ_CUDA_ROOT}/models/minicpmo45/causal_lm.cpp
-    ${MFQ_CUDA_ROOT}/models/qwen35/causal_lm.cpp
+    ${MFQ_CUDA_ROOT}/models/qwen4_exp/ops.cpp
+    ${MFQ_CUDA_ROOT}/models/glm5_next/ops.cpp
+    ${MFQ_CUDA_ROOT}/models/gemma4/ops.cpp
+    ${MFQ_CUDA_ROOT}/models/glm_dsa/ops.cpp
+    ${MFQ_CUDA_ROOT}/models/minicpmo45/ops.cpp
+    ${MFQ_CUDA_ROOT}/models/qwen35/ops.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/batch_state.cpp
     ${MFQ_CUDA_ROOT}/models/registry.cpp
     ${MFQ_CUDA_ROOT}/models/loader.cpp

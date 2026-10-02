@@ -3,8 +3,9 @@
 #include "cuda_execution.h"
 #include "cuda_runtime_config.h"
 #include "engine/text_session_cache.h"
-#include "models/minicpmo45/causal_lm.h"
-#include "models/qwen35/causal_lm.h"
+#include "models/minicpmo45/ops.h"
+#include "models/minicpmo45/tts.h"
+#include "models/qwen35/ops.h"
 #include "models/qwen35/linear_attention.h"
 #include "models/session_state.h"
 #include "mfq_paged_prefix_cache.h"
@@ -19,6 +20,96 @@ using namespace mfq::cuda::internal;
 
 static void check(bool ok, const char* message) {
     if (!ok) throw std::runtime_error(message);
+}
+
+static void check_tts_sampling() {
+    using namespace mfq_tensor_backend;
+    MiniCPMO45TtsSamplingOps ops;
+    auto float_options = TensorOptions().dtype(kFloat32).device(kCUDA);
+    auto scores = tensor(std::vector<float>{-2, 4, 3, 1, 0, 20}, float_options).reshape({1, 6});
+    auto token = tensor(std::vector<int64_t>{1}, TensorOptions().dtype(kInt64).device(kCUDA));
+    std::vector<Tensor> history(16, token);
+    auto penalized = ops.penalties(scores.clone(), history, 1.1).cpu();
+    check(std::abs(penalized.data_ptr<float>()[1] - 4.0F / std::pow(1.1F, 16)) < 2e-6F,
+          "TTS repeated-token penalty changed");
+    auto top = ops.top_k(scores.clone(), 3).cpu();
+    check(std::isinf(top.data_ptr<float>()[0]) && top.data_ptr<float>()[2] == 3,
+          "TTS top-k filtering changed");
+    mfq::models::minicpmo45::TtsSampling options{5, 1, 3, 0, 0.8, 0.0001, 1.1, 0.0};
+    std::mt19937 rng(42);
+    for (bool reference : {false, true}) {
+        ops.evaluator_rng = reference ? &rng : nullptr;
+        auto sample = [&](int64_t step) {
+            return mfq::models::minicpmo45::sample_tts(ops, scores.clone(), options,
+                                                       std::span<const Tensor>(history), step,
+                                                       reference)
+                .item<int64_t>();
+        };
+        check(sample(0) == 2, "TTS did not mask EOS or penalize history before selection");
+        check(sample(1) == 5, "TTS did not release EOS after minimum length");
+    }
+}
+
+static void check_ffn_branches() {
+    using namespace mfq_tensor_backend;
+    const auto options = TensorOptions().dtype(kFloat32).device(kCUDA);
+    auto linear = [&](int64_t out, int64_t in, float scale) {
+        QuantLinear result;
+        result.kind = QuantLinearKind::Dense;
+        result.dense =
+            ((arange(out * in, options).reshape({out, in}) - out * in / 2) * scale).to(kFloat16);
+        return result;
+    };
+    auto dense_ffn = [&](float scale) {
+        FFN result;
+        result.gate_up.layers = {linear(16, 8, scale), linear(16, 8, scale / 2)};
+        result.gate_up.outs = {16, 16};
+        result.down = linear(8, 16, scale / 3);
+        return result;
+    };
+    auto input = ((arange(24, options).reshape({3, 8}) - 12) * 0.05).to(kFloat16);
+    CudaExecutionContext execution;
+    auto low = dense_ffn(0.01F);
+    auto high = std::make_unique<FFN>(dense_ffn(0.015F));
+    execution.config.decode_branch_parallel = true;
+    auto decode = input.narrow(0, 0, 1);
+    auto expected = acc_cuda(low.forward(execution, decode), high->forward(execution, decode));
+    low.important_neurons = std::move(high);
+    for (bool parallel : {false, true}) {
+        execution.config.important_neuron_branch_parallel = parallel;
+        auto actual = low.forward(execution, decode);
+        if (parallel)
+            check(low.important_neuron_executor->streams.size() == 2,
+                  "IN parallel fixture did not use two streams");
+        check((actual.to(kFloat32) - expected.to(kFloat32)).abs().max().item<float>() < 1e-3,
+              "important-neuron branch composition changed");
+    }
+    // One physical shard exercises the TP operation binding on single-GPU hosts.
+    auto shard = [](QuantLinear &weight, TensorParallelAxis axis) {
+        QuantLinearShard piece;
+        piece.kind = QuantLinearKind::Dense;
+        piece.dense = weight.dense;
+        piece.input_end = weight.dense.size(1);
+        piece.output_end = weight.dense.size(0);
+        weight.logical_out = piece.output_end;
+        weight.logical_neuron_len = piece.input_end;
+        weight.tensor_parallel_axis = axis;
+        weight.tensor_parallel_shards = {std::move(piece)};
+    };
+    for (int activation = 0; activation < 3; ++activation) {
+        auto local = dense_ffn(0.01F);
+        auto parallel = dense_ffn(0.01F);
+        local.geglu = parallel.geglu = activation == 1;
+        local.swiglu_limit = parallel.swiglu_limit = activation == 2 ? 0.1 : 0.0;
+        auto expected = local.forward(execution, input);
+        for (auto &projection : parallel.gate_up.layers)
+            shard(projection, TensorParallelAxis::Output);
+        shard(parallel.down, TensorParallelAxis::Input);
+        check(parallel.tensor_parallel_dense_compatible(), "TP fixture is not eligible");
+        auto actual = parallel.forward(execution, input);
+        check((actual.to(kFloat32) - expected.to(kFloat32)).abs().max().item<float>() < 1e-3,
+              "tensor-parallel gated MLP differs from local composition");
+    }
 }
 
 static void check_linear_execution() {
@@ -225,6 +316,8 @@ int main(int argc, char** argv) try {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     check_linear_execution();
+    check_tts_sampling();
+    check_ffn_branches();
     {
         CudaExecutionContext execution;
         check_snapshots(execution, false);

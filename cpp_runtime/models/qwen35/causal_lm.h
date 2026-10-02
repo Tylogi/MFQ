@@ -1,5 +1,7 @@
 #pragma once
+#include "config.h"
 #include "models/common/causal_forward.h"
+#include "models/common/causal_model.h"
 #include <optional>
 #include <utility>
 
@@ -64,5 +66,37 @@ auto mtp_predictor(Ops &ops, typename Ops::Tensor hidden, typename Ops::Tensor i
     ops.trace("mtp.output_norm", output);
     return output;
 }
+
+template <class Backend> struct CausalLm : models::CausalModelBase<Backend, CausalLm<Backend>> {
+    using Tensor = typename Backend::Tensor;
+    template <class Graph, class Source>
+    void adapter_load_config(std::string_view payload, const Graph &graph, const Source &source) {
+        auto &config = this->config;
+        auto &metadata = this->metadata;
+
+        config = Config::from_json(payload, graph);
+        config.legacy_tensor_layout = source.legacy_tensor_compatibility().layout;
+        metadata.vocab_size = config.vocab_size;
+        metadata.hidden_size = config.hidden_size;
+        metadata.num_hidden_layers = config.num_hidden_layers;
+        metadata.num_attention_heads = config.num_attention_heads;
+        metadata.num_key_value_heads = config.num_key_value_heads;
+        metadata.head_dim = config.head_dim;
+        metadata.max_position_embeddings = config.max_position_embeddings;
+        metadata.rotary_dim = config.rotary_dim;
+        metadata.num_experts = config.num_experts;
+        metadata.rope_base = config.rope_base;
+        metadata.rms_norm_eps = config.rms_norm_eps;
+        metadata.norm_weight_offset = config.legacy_tensor_layout.norm_weight_offset;
+        metadata.tie_word_embeddings = config.tie_word_embeddings;
+        metadata.model_type = config.model_type;
+        metadata.layer_types = config.layer_types;
+        this->adapter_validate_components(graph);
+    }
+    void adapter_set_max_position_embeddings(int64_t value) {
+        this->config.max_position_embeddings = value;
+    }
+    bool adapter_supports_speculation() const noexcept { return true; }
+};
 
 } // namespace mfq::models::qwen35

@@ -140,7 +140,7 @@ def test_stdio_transport_owns_stdin_and_isolates_stdout() -> None:
         ):
             stdin_users.add(path.relative_to(ROOT / "cpp_runtime").as_posix())
     assert stdin_users == {
-        "backends/cuda/models/minicpmo45/causal_lm.cpp",
+        "backends/cuda/models/minicpmo45/ops.cpp",
         "transport/src/stdio.cpp",
     }
     assert "if (minicpmo_eval_batch)" in CUDA_RUNTIME

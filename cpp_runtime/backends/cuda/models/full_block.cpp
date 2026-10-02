@@ -1,5 +1,6 @@
 #include "full_block.h"
 #include "models/common/attention.h"
+#include "models/common/gated_mlp.h"
 #include "models/common/transformer_layer.h"
 #include <array>
 
@@ -807,26 +808,39 @@ mfq_tensor_backend::Tensor FullBlock::forward_ffn(CudaExecutionContext &executio
                     mfq_tensor_backend::Tensor ff;
                     if (official_bf16) {
                         auto ffn_input = xn.reshape({B * T, H});
-                        auto gate_up = profiler.measure("full.minicpmo45_ffn_gate_up", [&]() {
-                            return ffn.gate_up.forward(execution, ffn_input);
-                        });
-                        MFQ_RUNTIME_CHECK(
-                            gate_up.size() == 2,
-                            "MiniCPM-o Qwen3 FFN requires separate Gate and Up outputs");
-                        auto gate = gate_up[0].to(mfq_tensor_backend::kBFloat16).contiguous();
-                        auto up = gate_up[1].to(mfq_tensor_backend::kBFloat16).contiguous();
-                        auto activation = profiler.measure("full.minicpmo45_ffn_swiglu", [&]() {
-                            if (execution.config.minicpm_bf16_swiglu_fusion) {
-                                return silu_mul_cuda(gate, up);
-                            }
-                            return (mfq_tensor_backend::silu(gate) * up).contiguous();
-                        });
-                        ff = profiler
-                                 .measure("full.minicpmo45_ffn_down",
-                                          [&]() {
-                                              return ffn.down.forward_bf16_output(execution,
-                                                                                  activation);
-                                          })
+                        using Tensor = mfq_tensor_backend::Tensor;
+                        using Activation = mfq::models::GatedActivation;
+                        ff = mfq::models::gated_mlp(
+                                 ffn_input, false, 0.0,
+                                 [](const Tensor &, Activation, double) {
+                                     return std::optional<Tensor>{};
+                                 },
+                                 [](const Tensor &, Activation, double) {
+                                     return std::optional<Tensor>{};
+                                 },
+                                 [&](Tensor ffn_input) {
+                                     return profiler.measure("full.minicpmo45_ffn_gate_up", [&]() {
+                                         return ffn.gate_up.forward(execution, ffn_input);
+                                     });
+                                 },
+                                 [&](Tensor gate, Tensor up, Activation, double) {
+                                     gate = gate.to(mfq_tensor_backend::kBFloat16).contiguous();
+                                     up = up.to(mfq_tensor_backend::kBFloat16).contiguous();
+                                     return profiler.measure("full.minicpmo45_ffn_swiglu", [&]() {
+                                         if (execution.config.minicpm_bf16_swiglu_fusion) {
+                                             return silu_mul_cuda(gate, up);
+                                         }
+                                         return (mfq_tensor_backend::silu(gate) * up).contiguous();
+                                     });
+                                 },
+                                 [&](Tensor activation) {
+                                     return profiler.measure("full.minicpmo45_ffn_down", [&] {
+                                         return ffn.down.forward_bf16_output(execution, activation);
+                                     });
+                                 },
+                                 [](const Tensor &, const Tensor &, Activation, double) {
+                                     return std::optional<Tensor>{};
+                                 })
                                  .reshape({B, T, H})
                                  .to(mfq_tensor_backend::kBFloat16)
                                  .contiguous();

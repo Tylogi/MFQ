@@ -7,16 +7,16 @@
 namespace mfq::cuda::minicpmo45 {
 
 class Components {
-public:
+  public:
     explicit Components(mfq::cuda::MiniCPMO45CausalLm language);
 
-    mfq::cuda::MiniCPMO45CausalLm& language() noexcept;
-    CudaPreparedPrompt prepare(const std::vector<int64_t>& prompt, const MfqMultimodalInput& media);
-    void start(const MfqDuplexSessionParams& parameters);
-    MfqDuplexStepResult step(const MfqDuplexStepInput& input);
+    mfq::cuda::MiniCPMO45CausalLm &language() noexcept;
+    CudaPreparedPrompt prepare(const std::vector<int64_t> &prompt, const MfqMultimodalInput &media);
+    void start(const MfqDuplexSessionParams &parameters);
+    MfqDuplexStepResult step(const MfqDuplexStepInput &input);
     void stop();
 
-private:
+  private:
     MiniCPMO45Runtime runtime_;
     std::optional<MiniCPMO45DuplexSession> duplex_session_;
 };

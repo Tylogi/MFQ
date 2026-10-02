@@ -1,11 +1,11 @@
 #pragma once
 
 #include "causal_ops.h"
-#include "deepseek_v4/causal_lm.h"
-#include "deepseek_v41/causal_lm.h"
-#include "gemma4/causal_lm.h"
-#include "glm5_next/causal_lm.h"
-#include "glm_dsa/causal_lm.h"
+#include "deepseek_v4/ops.h"
+#include "deepseek_v41/ops.h"
+#include "gemma4/ops.h"
+#include "glm5_next/ops.h"
+#include "glm_dsa/ops.h"
 #include "minicpmo45/architecture.h"
-#include "qwen35/causal_lm.h"
-#include "qwen4_exp/causal_lm.h"
+#include "qwen35/ops.h"
+#include "qwen4_exp/ops.h"

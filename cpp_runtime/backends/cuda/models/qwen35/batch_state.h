@@ -10,13 +10,14 @@
 
 struct CudaExecutionContext;
 
-namespace mfq::models { template <class Backend> struct CausalLm; }
+namespace mfq::models::qwen35 {
+template <class Backend> struct CausalLm;
+}
 
 namespace mfq::cuda {
 struct Qwen35Model;
 template <typename Model> struct CudaCausalOps;
-template <typename Model> using CausalLm = mfq::models::CausalLm<CudaCausalOps<Model>>;
-using Qwen35CausalLm = CausalLm<Qwen35Model>;
+using Qwen35CausalLm = mfq::models::qwen35::CausalLm<CudaCausalOps<Qwen35Model>>;
 } // namespace mfq::cuda
 
 namespace mfq::cuda::continuous {

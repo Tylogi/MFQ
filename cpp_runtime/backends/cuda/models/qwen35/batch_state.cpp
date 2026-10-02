@@ -1,8 +1,8 @@
 #include "batch_state.h"
 
-#include "causal_lm.h"
 #include "cuda_execution.h"
 #include "linear_attention.h"
+#include "ops.h"
 #include "paged_kv.h"
 
 #include <limits>

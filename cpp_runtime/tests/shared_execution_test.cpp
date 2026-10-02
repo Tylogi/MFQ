@@ -1,12 +1,24 @@
 #include "continuous_batch.h"
+#include "generation_policy.h"
 #include "models/common/attention.h"
 #include "models/common/causal_forward.h"
-#include "models/common/causal_lm.h"
+#include "models/common/causal_model.h"
 #include "models/common/gated_mlp.h"
+#include "models/common/moe.h"
 #include "models/common/transformer_layer.h"
-#include "models/qwen35/forward.h"
+#include "models/deepseek_v4/causal_lm.h"
+#include "models/deepseek_v41/causal_lm.h"
+#include "models/deepseek_v41/engram_hash.h"
+#include "models/gemma4/causal_lm.h"
+#include "models/glm5_next/causal_lm.h"
+#include "models/glm_dsa/causal_lm.h"
+#include "models/minicpmo45/causal_lm.h"
+#include "models/qwen35/causal_lm.h"
+#include "models/qwen4_exp/causal_lm.h"
+#include "sampling.h"
 #include <array>
 #include <cassert>
+#include <numeric>
 
 using namespace mfq::engine;
 
@@ -217,8 +229,8 @@ void model_test() {
     };
     auto dense = [] { return 2; };
     auto post = [](int x) { return x * 2; };
-    assert(gemma_ffn(false, dense, post, experts, add, post) == 4 && expert_calls == 0);
-    assert(gemma_ffn(true, dense, post, experts, add, post) == 14 && expert_calls == 1);
+    assert(gemma4::feed_forward(false, dense, post, experts, add, post) == 4 && expert_calls == 0);
+    assert(gemma4::feed_forward(true, dense, post, experts, add, post) == 14 && expert_calls == 1);
     assert(pre_norm_layer(
                4, [](int x, int stage) { return x - stage; }, [](int x) { return x * 2; }, ffn,
                add) == 45);
@@ -451,7 +463,8 @@ struct CausalTestOps {
     };
     mfq::models::CausalLmMetadata metadata;
     std::vector<std::unique_ptr<Block>> blocks;
-    int output_norm = 0, lm_head = 0;
+    Tensor output_norm;
+    int lm_head = 0;
     bool fail_layer = false;
     int seen_position = -1, seen_cache = -1, seen_plan = -1;
     std::optional<Tensor> seen_lengths;
@@ -484,7 +497,7 @@ struct CausalTestOps {
         t.value = -t.value;
         return t;
     }
-    static Tensor adapter_finalize_hidden(Tensor t, int, int64_t, int64_t) {
+    static Tensor adapter_finalize_hidden(Tensor t, const Tensor &, int64_t, int64_t) {
         t.value += 3;
         return t;
     }
@@ -567,7 +580,8 @@ struct CausalTestOps {
 
 void causal_lm_test() {
     using Tensor = CausalTestOps::Tensor;
-    mfq::models::CausalLm<CausalTestOps> model;
+    struct TestModel : mfq::models::CausalModelBase<CausalTestOps, TestModel> {
+    } model;
     Tensor ids{{1, 2}, 2}, raw;
     std::vector<Tensor> trace;
     auto hidden = model.hidden_forward(ids, {}, {}, &trace, {}, &raw);
@@ -622,7 +636,363 @@ void causal_lm_test() {
     assert(model.cache_pos == 9);
 }
 
+struct FinalCausalTestOps : CausalTestOps {
+    Tensor collapse_hidden(Tensor t, int64_t, int64_t) const {
+        t.value = t.value * 2 + 1;
+        return t;
+    }
+    Tensor normalize_hidden(Tensor t, const Tensor &, int64_t, int64_t) const {
+        t.value *= 3;
+        return t;
+    }
+};
+
+void family_model_test() {
+    using namespace mfq::models;
+    struct QwenOps : CausalTestOps {
+        qwen4_exp::Config config{};
+        int batch = 1;
+        static bool adapter_supports_speculation() { return false; }
+    };
+    qwen4_exp::CausalLm<QwenOps> qwen;
+    // Dispatch must reach the family's rules, including from inherited entry points.
+    assert(qwen.supports_speculation());
+    qwen.hidden_forward_inputs({{1, 2}, 2}, {{1, 2, 4}, 6}, CausalTestOps::Tensor{{2}, 10});
+    assert(qwen.cache_pos == 2); // Qwen4 advances even with explicit semantic positions.
+    glm5_next::CausalLm<FinalCausalTestOps> glm;
+    try {
+        glm.hidden_forward({{1, 2}, 2}, CausalTestOps::Tensor{{2}, 10});
+        assert(false);
+    } catch (const std::runtime_error &) {
+    }
+    assert(glm.cache_pos == 0); // GLM accepts only contiguous implicit positions.
+    minicpmo45::CausalLm<CausalTestOps> mini;
+    mini.next_token({{1}, 2});
+    mini.next_token({{1}, 2});
+    assert(!mini.seen_lengths); // Its BF16 attention uses a different decode contract.
+}
+
+void remaining_family_flows_test() {
+    using namespace mfq::models;
+    int state = 0, saved = -1;
+    auto run = [&](int64_t start, int64_t count) {
+        state += count;
+        return int(start + count);
+    };
+    auto checkpoint = [&] { saved = state; };
+    auto rollback = [&] { state = saved; };
+    auto concat = [](int a, int b) { return a * 10 + b; };
+    assert(recurrent_window(5, true, 2, false, run, checkpoint, rollback, concat) == 25);
+    assert(saved == 2 && state == 5);
+    state = 0;
+    try {
+        recurrent_window(
+            5, true, 2, false,
+            [&](int64_t start, int64_t count) {
+                state += count;
+                if (start)
+                    throw std::runtime_error("suffix failed");
+                return int(count);
+            },
+            checkpoint, rollback, concat);
+        assert(false);
+    } catch (const std::runtime_error &) {
+    }
+    assert(state == 2);
+
+    assert(deepseek_v4::select_compressed(
+               4, 513, [] { return 1; }, [] { return 2; }, [] { return 3; }) == 1);
+    assert(deepseek_v4::select_compressed(
+               128, 513, [] { return 1; }, [] { return 2; }, [] { return 3; }) == 2);
+    assert(deepseek_v4::select_compressed(
+               4, 0, [] { return 1; }, [] { return 2; }, [] { return 3; }) == 3);
+    assert(glm_dsa::indexed_attention(
+               true, 5, 2, 3, [] { return 9; }, [] { return 2; }, [] { return 3; }, concat) == 23);
+    try {
+        glm_dsa::indexed_attention(
+            true, 5, 1, 3, [] { return 9; }, [] { return 2; }, [] { return 3; }, concat);
+        assert(false);
+    } catch (const std::runtime_error &) {
+    }
+
+    // Compression must emit the same complete groups across an unaligned chunk boundary.
+    struct Compression {
+        int64_t partial_length = 0;
+        std::array<int, 4> values{};
+    };
+    auto compress = [](Compression &state, const std::vector<int> &input, int64_t position) {
+        return deepseek_v41::compress(
+            state, input.size(), position, 4, [&] { return input; }, [] {},
+            [&](int64_t complete, int64_t) {
+                std::vector<int> result;
+                for (int64_t i = 0; i < complete; ++i)
+                    result.push_back(
+                        std::accumulate(input.begin() + i * 4, input.begin() + (i + 1) * 4, 0));
+                return result;
+            },
+            [&](int64_t start, int64_t count) {
+                std::copy_n(input.begin() + start, count, state.values.begin());
+            },
+            [&](int64_t token, int64_t slot) { state.values[slot] = input[token]; },
+            [&] {
+                return std::vector<int>{
+                    std::accumulate(state.values.begin(), state.values.end(), 0)};
+            },
+            [](const auto &parts) {
+                std::vector<int> result;
+                for (const auto &part : parts)
+                    result.insert(result.end(), part.begin(), part.end());
+                return result;
+            });
+    };
+    Compression full, chunks;
+    const auto expected = compress(full, {1, 2, 3, 4, 5, 6, 7, 8}, 0);
+    assert(!compress(chunks, {1, 2, 3}, 0));
+    assert(compress(chunks, {4, 5, 6, 7, 8}, 3) == expected);
+    assert(full.partial_length == 0 && chunks.partial_length == 0);
+
+    const int64_t sizes[]{2, 2};
+    const bool mask[]{true, false, true, true, true};
+    auto positions = minicpmo45::patch_positions(1, 5, 70, sizes, mask);
+    assert(!positions.all_active && (positions.ids == std::vector<int64_t>{0, 0, 35, 2450, 2485}));
+
+    int64_t tts_position = 0;
+    int tts_resets = 0, tts_layers = 0;
+    std::array<int, 2> decoder_layers{2, 3};
+    auto tts = [&](int64_t tokens) {
+        return minicpmo45::tts_forward(
+            1, 1, tokens, 4, tts_position, decoder_layers, [&] { ++tts_resets; },
+            [](int hidden) { return hidden + 1; }, [&] { return tts_position; },
+            [&](int block, int hidden, int64_t position) {
+                ++tts_layers;
+                assert(position == tts_position);
+                return hidden * block;
+            },
+            [](int hidden) { return hidden + 1; });
+    };
+    assert(tts(2) == 13 && tts_position == 2 && tts_resets == 1);
+    assert(tts(1) == 13 && tts_position == 3 && tts_resets == 1);
+    try {
+        tts(2);
+        assert(false);
+    } catch (const std::runtime_error &) {
+    }
+    assert(tts_position == 3 && tts_layers == 4);
+
+    deepseek_v41::EngramHashState hashes(8, 3, 2, 0, {1}, {36}, {5, 7, 11, 13}, {0, 5, 12, 23},
+                                         {3, 5, 7}, {0, 1, 2, 3, 4, 5, 6, 7});
+    const int64_t ids[]{1, 2, 3, 4};
+    const auto all = hashes.forward(ids, 1, 4, 0).values;
+    assert((all == std::vector<int64_t>{3, 8, 15, 26, 3, 8, 15, 26, 3, 8, 16, 27, 3, 8, 14, 23}));
+    auto first = hashes.forward(ids, 1, 2, 0).values;
+    hashes.begin_speculative();
+    auto second = hashes.forward(ids + 2, 1, 2, 2).values;
+    hashes.rollback_speculative();
+    assert(hashes.forward(ids + 2, 1, 2, 2).values == second);
+    first.insert(first.end(), second.begin(), second.end());
+    assert(first == all);
+
+    auto reduce = [](int x) { return x * 2; };
+    auto gate = [] { return 3; };
+    auto add = [](int x, int y) { return x + y; };
+    auto gated = [](int x, int y, int g) { return x + y * g; };
+    const auto fallback = [](int, int) { return std::optional<int>{}; };
+    const auto fused = [](int x, int y) { return std::optional<int>{x * 2 + y * 3}; };
+    assert(combine_experts(5, 7, false, false, fallback, reduce, gate, add, gated) == 31);
+    assert(combine_experts(5, 7, false, false, fused, reduce, gate, add, gated) == 31);
+    assert(combine_experts(10, 7, true, true, fallback, reduce, gate, add, gated) == 17);
+}
+
+void boundary_model_test() {
+    using namespace mfq::models;
+    for (bool ple : {false, true})
+        for (bool linear : {false, true}) {
+            int selected = 0, embedded = 0;
+            auto result = qwen4_exp::decoder_layer(
+                2, ple, linear,
+                [&](int x) {
+                    ++embedded;
+                    return x * 3;
+                },
+                [](int x, int y) { return x + y; },
+                [](int x) { return std::array<int, 2>{x + 2, x}; },
+                [&](int x) {
+                    selected = 1;
+                    return x * 3;
+                },
+                [&](int x) {
+                    selected = 2;
+                    return x * 5;
+                },
+                [](int x, auto mix) { return x + mix[1]; },
+                [](int x) { return std::array<int, 2>{x - 1, x}; }, [](int x) { return x * 7; },
+                [](int x, auto mix) { return x + mix[1]; });
+            const int residual = ple ? 8 : 2;
+            const int attended = (residual + 2) * (linear ? 3 : 5) + residual;
+            assert(result == (attended - 1) * 7 + attended);
+            assert(embedded == int(ple) && selected == (linear ? 1 : 2));
+        }
+    for (bool linear : {false, true}) {
+        std::vector<int> norms;
+        auto pre = [](int x) { return std::array<int, 3>{1, 2, x}; };
+        auto result = glm5_next::decoder_layer(
+            3, linear, pre,
+            [&](int x, int role) {
+                norms.push_back(role);
+                return x + role + 1;
+            },
+            [](int x) { return x * 2; }, [](int x) { return x * 3; },
+            [](int branch, int residual, const auto &) { return branch + residual; }, pre,
+            [](int x) { return x * 5; });
+        const int attended = 3 + 4 * (linear ? 2 : 3);
+        assert(result == attended + (attended + 2) * 5);
+        assert((norms == std::vector<int>{0, 1}));
+    }
+    struct Mix {
+        int branch, next_pre;
+    };
+    int previous = 1, captured = 0;
+    auto collapse = [](int hidden, int pre, int role) { return Mix{hidden + pre, pre + role + 1}; };
+    auto expand = [](int branch, int residual, const Mix &, int) { return residual + branch; };
+    auto result = deepseek_v41::decoder_layer(
+        2, true, previous, [](int x) { return x * 3; }, [&](int x) { captured = x; }, collapse,
+        [](int x) { return x * 2; }, expand, [](int x) { return x * 3; });
+    assert(captured == 6 && result == 86 && previous == 4);
+    previous = 1;
+    try {
+        deepseek_v41::mega_layer(
+            2, previous, collapse, [](int x) { return x; }, expand,
+            [](int) -> int { throw std::runtime_error("ffn failed"); });
+        assert(false);
+    } catch (const std::runtime_error &) {
+    }
+    assert(previous == 1); // Never commit pre-weights from a failed layer.
+
+    glm5_next::CausalLm<FinalCausalTestOps> glm;
+    assert(glm.adapter_finalize_hidden({{1, 1, 4}, 2}, {}, 1, 1).value == 15);
+    deepseek_v4::CausalLm<FinalCausalTestOps> v4;
+    deepseek_v41::CausalLm<FinalCausalTestOps> v41;
+    assert(v4.adapter_finalize_hidden({{1, 1, 4}, 2}, {}, 1, 1).value == 15);
+    assert(v41.adapter_finalize_hidden({{1, 1, 4}, 2}, {}, 1, 1).value == 15);
+
+    for (bool parallel : {false, true}) {
+        std::array<int, 2> calls{};
+        auto result = additive_branches(
+            [&](int i) {
+                ++calls[i];
+                return i == 0 ? 3 : 5;
+            },
+            [&](auto &run, auto &outputs) {
+                if (parallel)
+                    outputs = {run(0), run(1)};
+                return parallel;
+            },
+            [](int low, int high) { return low * 10 + high; });
+        assert(result == 35 && calls[0] == 1 && calls[1] == 1);
+    }
+    try {
+        additive_branches([](int) { return 1; }, [](auto &, auto &) { return true; },
+                          [](int a, int b) { return a + b; });
+        assert(false);
+    } catch (const std::runtime_error &) {
+    }
+}
+
+struct TtsTraceOps {
+    using Tensor = int;
+    std::string order;
+    int temperature(int value, double) {
+        order += 'T';
+        return value;
+    }
+    int penalties(int value, std::span<const int> history, double) {
+        order += 'P';
+        assert(history.size() == 16 && history.front() == 4);
+        return value;
+    }
+    void mask_eos(int &, int64_t) { order += 'E'; }
+    int reference(int value, int64_t, double, int64_t keep) {
+        order += 'R';
+        assert(keep == 3);
+        return value;
+    }
+    int top_k(int value, int64_t) {
+        order += 'K';
+        return value;
+    }
+    int top_p(int value, double) {
+        order += 'N';
+        return value;
+    }
+    int min_p(int value, double) {
+        order += 'M';
+        return value;
+    }
+    int sample(int value) {
+        order += 'S';
+        return value;
+    }
+};
+void token_generation_test() {
+    for (int limit : {0, 1, 4})
+        for (bool eos : {false, true}) {
+            std::vector<int> accepted;
+            int samples = 0, advances = 0;
+            const auto result = generate_tokens(
+                limit,
+                [&](int64_t step) {
+                    ++samples;
+                    return int(step);
+                },
+                [&](int token, int64_t) { accepted.push_back(token); }, [&](int) { return eos; },
+                [&](int) { ++advances; });
+            const int count = eos && limit ? 1 : limit;
+            assert(samples == count && accepted.size() == size_t(count) && result.tokens == count);
+            assert(advances == std::max(0, count - 1) && result.hit_eos == (eos && limit > 0));
+        }
+    int accepted = 0;
+    try {
+        generate_tokens(
+            3, [](int64_t step) { return step; }, [&](int, int64_t) { ++accepted; },
+            [](int) { return false; }, [](int) { throw std::runtime_error("decode failed"); });
+        assert(false);
+    } catch (const std::runtime_error &) {
+    }
+    assert(accepted == 1);
+    std::array<int, 20> history{};
+    std::iota(history.begin(), history.end(), 0);
+    mfq::models::minicpmo45::TtsSampling options;
+    options.minimum_keep = 3;
+    options.min_p = 0.1;
+    options.validate(3, 6562);
+    TtsTraceOps ops;
+    mfq::models::minicpmo45::sample_tts(ops, 0, options, history, 0, false);
+    assert(ops.order == "PEKNMTS");
+    ops.order.clear();
+    mfq::models::minicpmo45::sample_tts(ops, 0, options, history, 0, true);
+    assert(ops.order == "TPER");
+    ops.order.clear();
+    options.minimum_steps = 0;
+    options.repetition_penalty = 1;
+    mfq::models::minicpmo45::sample_tts(ops, 0, options, {}, 0, false);
+    assert(ops.order == "KNMTS");
+    std::mt19937 rng(42);
+    const float scores[]{0, 1, 5, -1};
+    for (int i = 0; i < 10; ++i)
+        assert(sample_top_k_top_p(scores, 3, 0.01, 0, rng) == 2);
+    const float invalid[]{-INFINITY, -INFINITY};
+    try {
+        sample_top_k_top_p(invalid, 1, 1, 0, rng);
+        assert(false);
+    } catch (const std::invalid_argument &) {
+    }
+}
+
 int main() {
+    boundary_model_test();
+    token_generation_test();
+    family_model_test();
+    remaining_family_flows_test();
     causal_lm_test();
     inner_model_flow_test();
     predictor_flow_test();

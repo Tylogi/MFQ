@@ -35,6 +35,7 @@ GRAPH = "\n".join(
     for path in (CUDA_ROOT / "models" / "minicpmo45").glob("*")
     if path.suffix in {".h", ".cpp"}
 )
+SHARED = "\n".join(p.read_text(encoding="utf-8") for p in (ROOT / "cpp_runtime/models/minicpmo45").glob("*.h"))
 METAL_GRAPH = (ROOT / "cpp_runtime" / "backends" / "metal" / "models/minicpmo45" / "mlx_minicpmo45.cpp").read_text(
     encoding="utf-8"
 )
@@ -72,7 +73,7 @@ def test_minicpmo45_uses_native_composite_graph_and_canonical_names():
     assert 'const std::string embed_name = "model.token_embedding.weight"' in DECODE
     assert 'source, "model.output_norm.weight"' in DECODE
     assert 'const std::string output_name = "model.output.weight"' in DECODE
-    assert "using MiniCPMO45CausalLm = CausalLm<MiniCPMO45Model>" in DECODE
+    assert "models::minicpmo45::CausalLm<CudaCausalOps<MiniCPMO45Model>>" in DECODE
     assert "llm.model." not in DECODE
     assert "llm.lm_head.weight" not in DECODE
 
@@ -97,21 +98,23 @@ def test_minicpmo45_graph_binds_all_checkpoint_components():
 
 
 def test_minicpmo45_audio_and_tts_follow_official_attention_contracts():
-    assert "query_positions / 50 + 1" in GRAPH
+    assert "query_positions / mfq::models::minicpmo45::audio_chunk_frames + 1" in GRAPH
+    assert "audio_chunk_frames = 50" in SHARED
     assert "raw_lengths.to(" in GRAPH
     assert "mfq_scaled_dot_product_attention(" in GRAPH
     assert "mfq_tensor_backend::baddbmm(" in GRAPH
     assert "mfq_linear(" in GRAPH
-    assert 'result.model_type = "minicpmtts"' in GRAPH
+    assert 'result.model_type = "minicpmtts"' in SHARED
     assert "block->official_bf16 = minicpmo45" in DECODE
     assert "CudaBackbone::minicpmo_tts" in DECODE
     assert "norm_weight_offset = 0.0" in GRAPH
-    assert "cache_position += tokens" in GRAPH
+    assert "cache_position += tokens" in SHARED
+    assert "mfq::models::minicpmo45::tts_forward(" in GRAPH
     assert "generate_official(" in GRAPH
     assert "mfq_tensor_backend::multinomial(" in GRAPH
     assert "repetition_penalty = 1.05" in GRAPH
-    assert "if (!generated.empty())" in GRAPH
-    assert "sampled.size(1) - (hit_eos ? 1 : 0)" in GRAPH
+    assert "!history.empty() && config.repetition_penalty != 1.0" in SHARED
+    assert "result.tokens - (result.hit_eos ? 1 : 0)" in GRAPH
     assert "logits_trace->push_back(raw_step_logits.clone())" in GRAPH
 
 
@@ -165,25 +168,20 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
     assert "official_bf16 && !bf16_gqa_decode" in DECODE
     assert "MiniCPMO45Model::adapter_logits(" in GRAPH
     assert (
-        "return lm_head.forward(*execution, hidden)\n"
-        "            .to(mfq_tensor_backend::kBFloat16).contiguous();"
-        in GRAPH
+        "returnlm_head.forward(*execution,hidden).to(mfq_tensor_backend::kBFloat16).contiguous();"
+        in "".join(GRAPH.split())
     )
     assert "repeated_k = kh.repeat_interleave(repeat, 1)" in DECODE
     assert '"full.minicpmo45_ffn_swiglu"' in DECODE
     assert "mfq_tensor_backend::silu(gate) * up" in DECODE
-    assert "return logits_from_hidden(" in (ROOT / "cpp_runtime/models/common/causal_lm.h").read_text(encoding="utf-8")
+    assert "return logits_from_hidden(" in (ROOT / "cpp_runtime/models/common/causal_model.h").read_text(encoding="utf-8")
     assert "hidden.to(mfq_tensor_backend::kBFloat16)" in GRAPH
     assert "cache_pos > 0 && T > 1" in DECODE
     assert "minicpmo45_attention_mask" in DECODE
     assert "std::numeric_limits<mfq_bfloat16>::lowest()" in DECODE
-    assert (
-        "bool MiniCPMO45Model::adapter_uses_decode_sequence_length() const noexcept {\n"
-        "    return false;\n"
-        "}"
-        in GRAPH
-    )
-    assert "this->adapter_uses_decode_sequence_length() &&" in (ROOT / "cpp_runtime/models/common/causal_lm.h").read_text(encoding="utf-8")
+    shared = (ROOT / "cpp_runtime/models/minicpmo45/causal_lm.h").read_text(encoding="utf-8")
+    assert "bool adapter_uses_decode_sequence_length() const noexcept { return false; }" in shared
+    assert "model().adapter_uses_decode_sequence_length() &&" in (ROOT / "cpp_runtime/models/common/causal_model.h").read_text(encoding="utf-8")
     assert "mask.value().eq(1).all().item<bool>()" in GRAPH
 
 
@@ -203,7 +201,7 @@ def test_minicpmo45_matches_official_rope_frequency_construction():
     assert "bool official_reciprocal_frequencies = false" in DECODE
     assert "mfq_tensor_backend::reciprocal(" in DECODE
     assert "freq.copy_(official_freq)" in DECODE
-    assert "metadata.rope_interleaved = true" in GRAPH
+    assert "metadata.rope_interleaved = true" in SHARED
     assert "model.metadata.rope_interleaved" in DECODE
     assert "rope_table_bf16_cuda" in DECODE
     assert "rope_table_bf16_kernel" in ROPE
@@ -370,14 +368,15 @@ def test_minicpmo45_cuda_duplex_uses_runtime_profile_tts_sampling():
 
 
 def test_minicpmo45_eval_batch_matches_pr_tts_sampler_and_optional_media():
-    assert "std::mt19937 * evaluator_rng = nullptr" in GRAPH
-    assert "std::uniform_real_distribution<float> distribution" in GRAPH
+    assert "std::mt19937*evaluator_rng=nullptr" in "".join(GRAPH.split())
+    assert "std::uniform_real_distribution<float> distribution" in (ROOT / "cpp_runtime/engine/include/sampling.h").read_text(encoding="utf-8")
+    assert "mfq::engine::sample_top_k_top_p(" in GRAPH
     assert 'request.value("tts_temperature", 0.8)' in GRAPH
     assert 'request.value("tts_top_p", 0.85)' in GRAPH
     assert 'request.value("tts_top_k", int64_t{25})' in GRAPH
     assert 'request.value("tts_min_tokens_to_keep", int64_t{3})' in GRAPH
     assert 'input_prefix + ".pixel_values.pt", false' in GRAPH
-    assert '(reuse_prefix_cache &&\n                     prefix_length >= input_ids.size(1))' in GRAPH
+    assert '(reuse_prefix_cache&&prefix_length>=input_ids.size(1))' in ''.join(GRAPH.split())
 
 
 def test_minicpmo45_eval_batch_maps_each_audio_bound_to_its_source():

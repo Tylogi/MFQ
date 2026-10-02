@@ -99,7 +99,7 @@ CUDA_TRANSFORMER_PARTS = {
 CUDA_QWEN_LINEAR = (
     CUDA_MODELS / "qwen35" / "linear_attention.h"
 ).read_text(encoding="utf-8") + (\
-    CUDA_MODELS / "qwen35" / "causal_lm.cpp"
+    CUDA_MODELS / "qwen35" / "ops.cpp"
 ).read_text(encoding="utf-8")
 CUDA_CAUSAL_LM = (CUDA_MODELS / "causal_ops.h").read_text(
     encoding="utf-8"
@@ -110,13 +110,13 @@ CUDA_CAUSAL_LM_SOURCE = (CUDA_MODELS / "causal_ops.cpp").read_text(
 CUDA_CAUSAL_LM_IMPL = (CUDA_MODELS / "session_codec_impl.h").read_text(
     encoding="utf-8"
 )
-SHARED_CAUSAL_LM = (ROOT / "cpp_runtime/models/common/causal_lm.h").read_text(encoding="utf-8")
+SHARED_CAUSAL_LM = (ROOT / "cpp_runtime/models/common/causal_model.h").read_text(encoding="utf-8")
 CUDA_MODEL_HEADERS = "\n".join(
     path.read_text(encoding="utf-8")
     for path in CUDA_MODELS.rglob("*.h")
 )
 CUDA_MODEL_FINALIZERS = {
-    name: (CUDA_MODELS / name / "causal_lm.cpp").read_text(encoding="utf-8")
+    name: (CUDA_MODELS / name / "ops.cpp").read_text(encoding="utf-8")
     for name in ("qwen4_exp", "glm5_next", "deepseek_v4", "deepseek_v41")
 }
 CUDA_QWEN_BATCH_HEADER = (
@@ -284,20 +284,20 @@ def test_cuda_transformer_header_stays_declarative() -> None:
 
 def test_cuda_dsv4_projection_and_moe_loading_are_shared() -> None:
     ffn = (CUDA_MODELS / "ffn.cpp").read_text(encoding="utf-8")
-    v4 = (CUDA_MODELS / "deepseek_v4" / "causal_lm.cpp").read_text(
+    v4 = (CUDA_MODELS / "deepseek_v4" / "ops.cpp").read_text(
         encoding="utf-8"
     )
     headers = "\n".join(
-        (CUDA_MODELS / name / "causal_lm.h").read_text(encoding="utf-8")
+        (CUDA_MODELS / name / "ops.h").read_text(encoding="utf-8")
         for name in ("deepseek_v4", "deepseek_v41")
     )
     loaders = [
         (CUDA_MODELS / path).read_text(encoding="utf-8")
         for path in (
-            "qwen35/causal_lm.cpp",
-            "deepseek_v4/causal_lm.cpp",
-            "deepseek_v41/causal_lm.cpp",
-            "glm_dsa/causal_lm.cpp",
+            "qwen35/ops.cpp",
+            "deepseek_v4/ops.cpp",
+            "deepseek_v41/ops.cpp",
+            "glm_dsa/ops.cpp",
         )
     ]
 
@@ -518,9 +518,9 @@ def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
     assert "state.decode_position_delta = decode_position_delta" in SHARED_CAUSAL_LM
     assert "decode_position_delta = state.decode_position_delta" in SHARED_CAUSAL_LM
     assert "void begin_speculative_suffix(int64_t draft_tokens)" in SHARED_CAUSAL_LM
-    assert "models::begin_speculative_suffix(*this" in "".join(SHARED_CAUSAL_LM.split())
+    assert "models::begin_speculative_suffix(model()" in "".join(SHARED_CAUSAL_LM.split())
     assert "Tensor finalize_hidden(" in SHARED_CAUSAL_LM
-    assert "using CausalLm = mfq::models::CausalLm<CudaCausalOps<Model>>" in CUDA_CAUSAL_LM
+    assert "using CausalLm = typename Model::template CausalModel<CudaCausalOps<Model>>" in CUDA_CAUSAL_LM
     assert "mfq_tensor_backend" not in SHARED_CAUSAL_LM
     assert "planned_kv_length" not in SHARED_CAUSAL_LM
     assert "Cuda" not in SHARED_CAUSAL_LM
@@ -538,10 +538,11 @@ def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
         ("DeepseekV4Model", "deepseek_v4"),
         ("DeepseekV41Model", "deepseek_v41"),
     ):
-        source = (CUDA_MODELS / path / "causal_lm.cpp").read_text(
+        source = (CUDA_MODELS / path / "ops.cpp").read_text(
             encoding="utf-8"
         )
-        assert f"template struct CausalLm<cuda::CudaCausalOps<cuda::{model}>>;" in source
+        shared_class = "TtsCausalLm" if model == "MiniCPMOTtsModel" else "CausalLm"
+        assert f"template struct {path}::{shared_class}<cuda::CudaCausalOps<cuda::{model}>>;" in source
     assert "CudaBackbone" not in CUDA_CAUSAL_LM + CUDA_CAUSAL_LM_IMPL
     assert "struct Request" not in CUDA_QWEN_BATCH_HEADER
     assert "struct QwenBatchExecutor::Impl" in CUDA_QWEN_BATCH_SOURCE
@@ -555,7 +556,13 @@ def test_cuda_model_finalizers_live_with_their_models() -> None:
     for name, source in CUDA_MODEL_FINALIZERS.items():
         namespace = "deepseek_v41_runtime" if name == "deepseek_v41" else name
         assert f"{namespace}::finalize_hidden" not in CUDA_CAUSAL_LM_SOURCE
-        assert f"{namespace}::finalize_hidden" in source
+        if name == "qwen4_exp":
+            assert f"{namespace}::finalize_hidden" in source
+        else:
+            shared = (ROOT / "cpp_runtime/models" / name / "causal_lm.h").read_text(encoding="utf-8")
+            assert shared.index("this->collapse_hidden(") < shared.index("this->normalize_hidden(")
+            assert "adapter_finalize_hidden(" not in source
+            assert "::collapse_hidden(" in source and "::normalize_hidden(" in source
     for implementation in (
         '"model.dsv4_hc_head"',
         '"model.deepseek_v41.final_collapse"',
@@ -1103,7 +1110,7 @@ def test_model_config_parsing_is_backend_neutral() -> None:
         "deepseek_v4",
     )
     model_loaders = "\n".join(
-        (CUDA_MODELS / name / "causal_lm.cpp").read_text(encoding="utf-8")
+        (ROOT / "cpp_runtime/models" / name / "causal_lm.h").read_text(encoding="utf-8")
         for name in model_names
     )
     assert model_loaders.count("Config::from_json") == 9
@@ -1130,7 +1137,7 @@ def test_cuda_qwen4_and_glm5_own_their_model_implementations() -> None:
     assert "qwen4_exp" not in glm
 
 
-def test_cuda_model_runtime_uses_compiled_causal_lm_adapters() -> None:
+def test_cuda_model_runtime_uses_compiled_operator_bindings() -> None:
     cmake = (ROOT / "cpp_runtime" / "backends" / "cuda" / "CMakeLists.txt").read_text(
         encoding="utf-8"
     )
@@ -1149,12 +1156,12 @@ def test_cuda_model_runtime_uses_compiled_causal_lm_adapters() -> None:
     assert not list((ROOT / "cpp_runtime" / "backends" / "cuda").rglob("*.inc"))
     for namespace in adapters:
         model_dir = CUDA_MODELS / namespace
-        header = model_dir / "causal_lm.h"
-        source = model_dir / "causal_lm.cpp"
+        header = model_dir / "ops.h"
+        source = model_dir / "ops.cpp"
         assert header.is_file()
         assert source.is_file()
-        assert f"models/{namespace}/causal_lm.cpp" in cmake
-        assert '#include "causal_lm.h"' in source.read_text(encoding="utf-8")
+        assert f"models/{namespace}/ops.cpp" in cmake
+        assert '#include "ops.h"' in source.read_text(encoding="utf-8")
 
     for concrete_definition in (
         "struct Glm5NextBlock",
@@ -1181,7 +1188,7 @@ def test_cuda_model_runtime_uses_compiled_causal_lm_adapters() -> None:
         "DeepseekV4CausalLm",
         "DeepseekV41CausalLm",
     ):
-        assert f"using {runtime} = CausalLm<" in causal_lm
+        assert re.search(rf"using\s+{runtime}\s*=\s*mfq::models::\w+::CausalLm<", causal_lm)
 
     assert "std::make_unique<FullBlock>" in CUDA_TRANSFORMER_LOADER
     assert "std::make_unique<LinearAttentionBlock>" in CUDA_QWEN_LINEAR
@@ -1306,3 +1313,40 @@ def test_generic_generation_and_sequence_cache_helpers_are_not_redeclared() -> N
     )
     for pattern in forbidden_definitions:
         assert re.search(pattern, sources) is None, pattern
+
+
+def test_each_family_owns_its_causal_model_and_forward_definition() -> None:
+    shared = ROOT / "cpp_runtime/models"
+    for family in ("qwen35", "qwen4_exp", "glm5_next", "glm_dsa", "gemma4",
+                   "deepseek_v4", "deepseek_v41", "minicpmo45"):
+        source = (shared / family / "causal_lm.h").read_text(encoding="utf-8")
+        assert "struct CausalLm : models::CausalModelBase<Backend, CausalLm<Backend>>" in source
+        assert "void adapter_load_config(" in source
+        assert "metadata.layer_types" in source or "set_standard_metadata(metadata, config)" in source
+        assert not (shared / family / "forward.h").exists()
+        assert not (CUDA_MODELS / family / "causal_lm.h").exists()
+        assert not (CUDA_MODELS / family / "causal_lm.cpp").exists()
+        assert "mfq_tensor_backend" not in source
+        assert "Cuda" not in source
+        native = "\n".join(p.read_text(encoding="utf-8") for p in (CUDA_MODELS / family).glob("*.h"))
+        assert f"mfq::models::{family}::CausalLm<Backend>" in native
+
+
+def test_cuda_family_layers_and_offline_generation_use_shared_flows() -> None:
+    for family in ("qwen4_exp", "glm5_next"):
+        source = (CUDA_MODELS / family / "layers.h").read_text(encoding="utf-8")
+        assert f"mfq::models::{family}::decoder_layer(" in source
+        assert "mfq::models::hyperconnection_layer(" not in source
+    source = (CUDA_MODELS / "deepseek_v41/ops.h").read_text(encoding="utf-8")
+    assert "mfq::models::deepseek_v41::decoder_layer(" in source
+    assert "mfq::models::deepseek_v41::mega_layer(" in (CUDA_MODELS / "deepseek_v41/dspark.cpp").read_text(encoding="utf-8")
+    tts = (CUDA_MODELS / "minicpmo45/tts.h").read_text(encoding="utf-8").split("    mfq_tensor_backend::Tensor generate_official(")[1]
+    assert "mfq::engine::generate_tokens(" in tts
+    assert "mfq::models::minicpmo45::sample_tts(" in tts
+    assert "for (" not in tts
+    evaluation = (CUDA_MODELS / "minicpmo45/ops.cpp").read_text(encoding="utf-8")
+    assert "mfq::engine::generate_tokens(" in evaluation
+    assert "step < max_new_tokens" not in evaluation
+    ffn = (CUDA_MODELS / "ffn.cpp").read_text(encoding="utf-8")
+    assert "mfq::models::additive_branches(" in ffn
+    assert ffn.count("mfq::models::gated_mlp(") == 4

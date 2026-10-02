@@ -1,6 +1,6 @@
 #include "components.h"
 
-#include "models/minicpmo45/causal_lm.h"
+#include "models/minicpmo45/ops.h"
 #include "cuda_batching.h"
 #include "generation.h"
 

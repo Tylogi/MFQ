@@ -1,6 +1,7 @@
 #pragma once
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace mfq::models {
 
@@ -25,6 +26,26 @@ Tensor gated_mlp(Tensor input, bool geglu, double swiglu_limit, Fused fused,
     if (auto output = fused_down(parts[0], parts[1], activation, limit))
         return std::move(*output);
     return down(activate(std::move(parts[0]), std::move(parts[1]), activation, limit));
+}
+
+// Independent low/high neuron branches may run concurrently. Scheduling is
+// native; selecting both results and merging them is part of the model graph.
+template <class Branch, class Parallel, class Add>
+auto additive_branches(Branch branch, Parallel parallel, Add add) {
+    using Tensor = decltype(branch(0));
+    std::vector<Tensor> outputs;
+    if (!parallel(branch, outputs)) {
+        outputs.push_back(branch(0));
+        outputs.push_back(branch(1));
+    }
+    if (outputs.size() != 2)
+        throw std::runtime_error("additive FFN requires two branch outputs");
+    return add(std::move(outputs[0]), std::move(outputs[1]));
+}
+
+template <class Tensor, class Up, class Activate, class Down>
+auto mlp(Tensor hidden, Up up, Activate activate, Down down) {
+    return down(activate(up(std::move(hidden))));
 }
 
 } // namespace mfq::models

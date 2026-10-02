@@ -32,7 +32,7 @@ KV_CACHE = (ROOT / "mfq" / "kernels" / "cuda" / "kv_cache.cu").read_text(
     encoding="utf-8"
 )
 QWEN_LOADER = (
-    CUDA_ROOT / "models" / "qwen35" / "causal_lm.cpp"
+    CUDA_ROOT / "models" / "qwen35" / "ops.cpp"
 ).read_text(encoding="utf-8")
 QWEN_CONFIG = (
     ROOT / "cpp_runtime" / "models" / "qwen35" / "config.cpp"
@@ -147,9 +147,8 @@ def test_scheduler_supports_resident_and_cached_qwen_moe():
     assert "execution.continuous_batch_cache_serial" in DECODE
     assert "each routed FFN row independently" in DECODE
     assert (
-        "cpu_moe_down ||\n"
-        "                        execution.continuous_batch_cache_serial"
-        in DECODE
+        "cpu_moe_down||execution.continuous_batch_cache_serial"
+        in "".join(DECODE.split())
     )
 
 
@@ -163,7 +162,7 @@ def test_generic_qwen_loader_constructs_moe_ffns():
     assert "load_mfe_gpu(" in DECODE
     assert "result.is_moe = true" in DECODE
     assert "load_qwen_ffn(" in QWEN_LOADER
-    assert "metadata.num_experts = config.num_experts" in QWEN_LOADER
+    assert "metadata.num_experts = config.num_experts" in (ROOT / "cpp_runtime/models/qwen35/causal_lm.h").read_text(encoding="utf-8")
     assert "return this->metadata.num_experts" in CAUSAL_LM
     assert "dense Qwen model config intermediate_size must be positive" in QWEN_CONFIG
     assert '"Qwen model config intermediate_size must be positive"' not in QWEN_CONFIG

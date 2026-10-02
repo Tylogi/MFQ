@@ -1,6 +1,6 @@
 #include "minicpmo45.h"
 
-#include "models/minicpmo45/causal_lm.h"
+#include "models/minicpmo45/ops.h"
 #include "cli.h"
 #include "engine/options.h"
 

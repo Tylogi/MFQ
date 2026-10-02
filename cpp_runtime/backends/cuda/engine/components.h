@@ -1,7 +1,7 @@
 #pragma once
 
 #include "models/causal_models.h"
-#include "models/minicpmo45/causal_lm.h"
+#include "models/minicpmo45/ops.h"
 #include "models/mtp.h"
 #include "models/grid_vision_component.h"
 #include "cuda_runtime_config.h"

@@ -6,7 +6,7 @@
 #include "decode_graph.h"
 #include "models/full_block.h"
 #include "models/qwen35/batch_state.h"
-#include "models/qwen35/causal_lm.h"
+#include "models/qwen35/ops.h"
 
 #include <algorithm>
 #include <exception>
@@ -389,8 +389,8 @@ struct QwenBatchOperations {
         try {
             if (graph_decode) {
                 const auto invoke = [&]() {
-                    auto hidden = model_.hidden_forward_static(ids, pos, lengths, {planned_len,
-                                                               graph_attention_parts});
+                    auto hidden = model_.hidden_forward_static(
+                        ids, pos, lengths, {planned_len, graph_attention_parts});
                     auto current_logits = state_adapter_.logits_from_last_hidden(std::move(hidden));
                     return sample_greedy_cuda(current_logits.contiguous().view({batch, -1}));
                 };

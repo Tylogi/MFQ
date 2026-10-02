@@ -20,7 +20,7 @@ template <class Tensor, class Plan> struct CausalForwardInputs {
 
 // Backend owns tensors, weights, physical state and numerical operations.
 // This class owns the causal model entry points and their logical transitions.
-template <class Backend> struct CausalLm : Backend, CausalState {
+template <class Backend, class Derived> struct CausalModelBase : Backend, CausalState {
     using Tensor = typename Backend::Tensor;
     using ForwardPlan = typename Backend::ForwardPlan;
     using Inputs = CausalForwardInputs<Tensor, ForwardPlan>;
@@ -49,7 +49,7 @@ template <class Backend> struct CausalLm : Backend, CausalState {
     double rope_base() const noexcept { return this->metadata.rope_base; }
 
     void set_max_position_embeddings(int64_t value) noexcept {
-        this->adapter_set_max_position_embeddings(value);
+        model().adapter_set_max_position_embeddings(value);
         this->metadata.max_position_embeddings = value;
     }
 
@@ -82,7 +82,7 @@ template <class Backend> struct CausalLm : Backend, CausalState {
         return this->embed_tokens(this->device_ids(std::move(ids)));
     }
     void reset(int64_t batch) {
-        reset_model(*this, batch, [](const auto &block) { return Backend::block_scope(block); });
+        reset_model(model(), batch, [](const auto &block) { return Backend::block_scope(block); });
     }
     Tensor hidden_forward(Tensor ids, std::optional<Tensor> positions = {},
                           std::optional<Tensor> lengths = {}, std::vector<Tensor> *trace = nullptr,
@@ -114,18 +114,18 @@ template <class Backend> struct CausalLm : Backend, CausalState {
                      advance_cache_with_position_ids,
                      confirmed_prefix,
                      plan};
-        auto ops = this->forward_ops(*this, std::move(input));
+        auto ops = this->forward_ops(model(), std::move(input));
         return causal_forward(ops);
     }
     Tensor finalize_hidden(Tensor hidden, int64_t batch, int64_t tokens) {
-        return this->adapter_finalize_hidden(std::move(hidden), this->output_norm, batch, tokens);
+        return model().adapter_finalize_hidden(std::move(hidden), this->output_norm, batch, tokens);
     }
     Tensor apply_final_logit_softcap(Tensor logits) const {
         const auto cap = final_logit_softcapping();
         return cap > 0.0 ? this->softcap(std::move(logits), cap) : std::move(logits);
     }
     Tensor logits_from_hidden(Tensor hidden) {
-        return this->adapter_logits(this->lm_head, std::move(hidden));
+        return model().adapter_logits(this->lm_head, std::move(hidden));
     }
     Tensor forward(Tensor ids) { return logits_from_hidden(hidden_forward(std::move(ids))); }
     Tensor forward_inputs(Tensor ids, Tensor embeddings, std::optional<Tensor> positions = {},
@@ -136,14 +136,14 @@ template <class Backend> struct CausalLm : Backend, CausalState {
     Tensor last_logits(Tensor ids) {
         const auto lengths = decode_lengths(ids);
         auto hidden = hidden_forward(std::move(ids), {}, lengths);
-        return this->adapter_last_logits(this->lm_head, this->last_hidden(std::move(hidden)));
+        return model().adapter_last_logits(this->lm_head, this->last_hidden(std::move(hidden)));
     }
     Tensor next_token(Tensor ids) {
         const auto lengths = decode_lengths(ids);
         return next_token_from_hidden(hidden_forward(std::move(ids), {}, lengths));
     }
     Tensor next_token_from_hidden(Tensor hidden) {
-        return this->adapter_next_token(this->lm_head, this->last_hidden(std::move(hidden)));
+        return model().adapter_next_token(this->lm_head, this->last_hidden(std::move(hidden)));
     }
     Tensor hidden_forward_static(Tensor ids, Tensor positions, Tensor lengths,
                                  ForwardPlan plan = {}) {
@@ -154,28 +154,28 @@ template <class Backend> struct CausalLm : Backend, CausalState {
     Tensor last_logits_static(Tensor ids, Tensor positions, Tensor lengths, ForwardPlan plan = {}) {
         auto hidden =
             hidden_forward_static(std::move(ids), std::move(positions), std::move(lengths), plan);
-        return this->adapter_last_logits(this->lm_head, this->last_hidden(std::move(hidden)));
+        return model().adapter_last_logits(this->lm_head, this->last_hidden(std::move(hidden)));
     }
     Tensor next_token_static(Tensor ids, Tensor positions, Tensor lengths, ForwardPlan plan = {}) {
         return next_token_from_hidden(
             hidden_forward_static(std::move(ids), std::move(positions), std::move(lengths), plan));
     }
     bool supports_speculation() const {
-        return this->adapter_supports_speculation() && speculative_blocks();
+        return model().adapter_supports_speculation() && speculative_blocks();
     }
     bool supports_suffix_speculation() const {
-        return this->adapter_supports_suffix_speculation() && speculative_blocks();
+        return model().adapter_supports_suffix_speculation() && speculative_blocks();
     }
     void begin_speculative_suffix(int64_t draft_tokens) {
         models::begin_speculative_suffix(
-            *this, draft_tokens, [](const auto &block) { return Backend::block_scope(block); });
+            model(), draft_tokens, [](const auto &block) { return Backend::block_scope(block); });
     }
     void commit_speculative() {
-        finish_speculative(*this, true, 0,
+        finish_speculative(model(), true, 0,
                            [](const auto &block) { return Backend::block_scope(block); });
     }
     void rollback_speculative(int64_t accepted_suffix = 0) {
-        finish_speculative(*this, false, accepted_suffix,
+        finish_speculative(model(), false, accepted_suffix,
                            [](const auto &block) { return Backend::block_scope(block); });
     }
     Tensor hidden_forward_speculative_suffix(Tensor ids, Tensor *raw_hidden = nullptr) {
@@ -192,22 +192,24 @@ template <class Backend> struct CausalLm : Backend, CausalState {
             throw;
         }
     }
-    SessionStateKind text_session_state_kind() const { return SessionCodec::kind(*this); }
+    SessionStateKind text_session_state_kind() const { return SessionCodec::kind(model()); }
     bool supports_text_session_state() const {
         return text_session_state_kind() != SessionStateKind::Unsupported;
     }
-    bool supports_paged_text_session_state() const { return SessionCodec::supports_paged(*this); }
+    bool supports_paged_text_session_state() const { return SessionCodec::supports_paged(model()); }
     SessionState capture_text_session_state(const std::vector<int64_t> &tokens) const {
-        auto state = SessionCodec::capture(*this, tokens);
+        auto state = SessionCodec::capture(model(), tokens);
         state.decode_position_delta = decode_position_delta;
         return state;
     }
     void restore_text_session_state(const SessionState &state) {
-        SessionCodec::restore(*this, state);
+        SessionCodec::restore(model(), state);
         decode_position_delta = state.decode_position_delta;
     }
 
   private:
+    Derived &model() { return static_cast<Derived &>(*this); }
+    const Derived &model() const { return static_cast<const Derived &>(*this); }
     Tensor normalize_ids(Tensor ids) const {
         const auto rank = this->rank(ids);
         require_model(rank == 1 || rank == 2,
@@ -224,7 +226,7 @@ template <class Backend> struct CausalLm : Backend, CausalState {
                       "token IDs must have shape [tokens] or [batch,tokens]");
         const auto tokens = this->size(ids, rank - 1);
         const auto batch = rank == 1 ? 1 : this->size(ids, 0);
-        if (this->adapter_uses_decode_sequence_length() && cache_pos > 0 && tokens == 1)
+        if (model().adapter_uses_decode_sequence_length() && cache_pos > 0 && tokens == 1)
             return this->sequence_lengths(batch, cache_pos + 1);
         return {};
     }

@@ -1,9 +1,9 @@
 #pragma once
 
 #include "../mtp.h"
-#include "causal_lm.h"
 #include "models/full_block.h"
-#include "models/qwen35/forward.h"
+#include "models/qwen35/causal_lm.h"
+#include "ops.h"
 
 // Qwen3.5's predictor shares the main embedding/output head and owns only
 // its fusion/norm/attention/FFN weights and an independent attention history.

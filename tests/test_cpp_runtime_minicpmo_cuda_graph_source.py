@@ -15,7 +15,7 @@ BACKEND_CHECKS = (
     CUDA_ROOT / "diagnostics" / "backend_checks.cpp"
 ).read_text(encoding="utf-8")
 MODEL_METADATA_SOURCE = "\n".join(
-    (CUDA_ROOT / "models" / model / "causal_lm.cpp").read_text(
+    (ROOT / "cpp_runtime/models" / model / "causal_lm.h").read_text(
         encoding="utf-8"
     )
     for model in ("glm_dsa", "minicpmo45")
@@ -94,7 +94,7 @@ def test_minicpmo_native_runtime_keeps_cuda_graph_enabled() -> None:
 
 
 def test_static_decode_uses_dynamic_position_for_kv_writes() -> None:
-    causal_lm = (ROOT / "cpp_runtime/models/common/causal_lm.h").read_text(
+    causal_lm = (ROOT / "cpp_runtime/models/common/causal_model.h").read_text(
         encoding="utf-8"
     )
     static_forward = causal_lm.split(

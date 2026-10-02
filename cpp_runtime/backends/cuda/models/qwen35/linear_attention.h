@@ -4,7 +4,7 @@
 #include "models/block.h"
 #include "models/ffn.h"
 #include "models/qwen35/config.h"
-#include "models/qwen35/forward.h"
+#include "models/qwen35/causal_lm.h"
 
 namespace mfq::cuda::qwen35 {
 

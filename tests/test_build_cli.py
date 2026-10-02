@@ -162,8 +162,8 @@ def test_native_cuda_runtime_compilation_units_do_not_include_torch() -> None:
     sources = [
         ROOT / "cpp_runtime" / "backends" / "cuda" / "apps" / "runtime_main.cpp",
         ROOT / "cpp_runtime" / "backends" / "cuda" / "commands" / "runtime.cpp",
-        ROOT / "cpp_runtime" / "backends" / "cuda" / "models" / "minicpmo45" / "causal_lm.h",
-        ROOT / "cpp_runtime" / "backends" / "cuda" / "models" / "minicpmo45" / "causal_lm.cpp",
+        ROOT / "cpp_runtime" / "backends" / "cuda" / "models" / "minicpmo45" / "ops.h",
+        ROOT / "cpp_runtime" / "backends" / "cuda" / "models" / "minicpmo45" / "ops.cpp",
         *(
             ROOT / "mfq" / "kernels" / "cuda" / name
             for name in re.findall(r"MFQ_CUDA_KERNEL_ROOT}/([^\s]+\.cu)", source_block)

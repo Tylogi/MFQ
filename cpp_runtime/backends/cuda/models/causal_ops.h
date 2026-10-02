@@ -2,7 +2,7 @@
 
 #include "cuda_model_plan.h"
 #include "models/block.h"
-#include "models/common/causal_lm.h"
+#include "models/common/causal_model.h"
 #include "quant_linear.h"
 
 #include <cstdint>
@@ -15,6 +15,34 @@
 
 enum class TextSessionStateKind : int;
 struct TextSessionState;
+
+namespace mfq::models::qwen35 {
+template <class Backend> struct CausalLm;
+}
+namespace mfq::models::qwen4_exp {
+template <class Backend> struct CausalLm;
+}
+namespace mfq::models::glm5_next {
+template <class Backend> struct CausalLm;
+}
+namespace mfq::models::glm_dsa {
+template <class Backend> struct CausalLm;
+}
+namespace mfq::models::gemma4 {
+template <class Backend> struct CausalLm;
+}
+namespace mfq::models::deepseek_v4 {
+template <class Backend> struct CausalLm;
+}
+namespace mfq::models::deepseek_v41 {
+template <class Backend> struct CausalLm;
+}
+namespace mfq::models::minicpmo45 {
+template <class Backend> struct CausalLm;
+}
+namespace mfq::models::minicpmo45 {
+template <class Backend> struct TtsCausalLm;
+}
 
 namespace mfq::cuda {
 
@@ -93,7 +121,8 @@ struct DeepseekV4Model;
 struct DeepseekV41Model;
 
 template <typename Model> struct CudaCausalOps;
-template <typename Model> using CausalLm = mfq::models::CausalLm<CudaCausalOps<Model>>;
+template <typename Model>
+using CausalLm = typename Model::template CausalModel<CudaCausalOps<Model>>;
 
 template <typename Model> struct CudaSessionCodec {
     using CausalModel = CausalLm<Model>;
@@ -295,15 +324,15 @@ template <typename Model> struct CudaCausalOps : Model {
     }
 };
 
-using Qwen35CausalLm = CausalLm<Qwen35Model>;
-using MiniCPMO45CausalLm = CausalLm<MiniCPMO45Model>;
-using MiniCPMOTtsCausalLm = CausalLm<MiniCPMOTtsModel>;
-using Gemma4CausalLm = CausalLm<Gemma4Model>;
-using GlmDsaCausalLm = CausalLm<GlmDsaModel>;
-using Glm5CausalLm = CausalLm<Glm5Model>;
-using Qwen4CausalLm = CausalLm<Qwen4Model>;
-using DeepseekV4CausalLm = CausalLm<DeepseekV4Model>;
-using DeepseekV41CausalLm = CausalLm<DeepseekV41Model>;
+using Qwen35CausalLm = mfq::models::qwen35::CausalLm<CudaCausalOps<Qwen35Model>>;
+using MiniCPMO45CausalLm = mfq::models::minicpmo45::CausalLm<CudaCausalOps<MiniCPMO45Model>>;
+using MiniCPMOTtsCausalLm = mfq::models::minicpmo45::TtsCausalLm<CudaCausalOps<MiniCPMOTtsModel>>;
+using Gemma4CausalLm = mfq::models::gemma4::CausalLm<CudaCausalOps<Gemma4Model>>;
+using GlmDsaCausalLm = mfq::models::glm_dsa::CausalLm<CudaCausalOps<GlmDsaModel>>;
+using Glm5CausalLm = mfq::models::glm5_next::CausalLm<CudaCausalOps<Glm5Model>>;
+using Qwen4CausalLm = mfq::models::qwen4_exp::CausalLm<CudaCausalOps<Qwen4Model>>;
+using DeepseekV4CausalLm = mfq::models::deepseek_v4::CausalLm<CudaCausalOps<DeepseekV4Model>>;
+using DeepseekV41CausalLm = mfq::models::deepseek_v41::CausalLm<CudaCausalOps<DeepseekV41Model>>;
 
 template <typename Model>
 Model load_causal_lm(CudaExecutionContext &execution, const std::string &model_path,

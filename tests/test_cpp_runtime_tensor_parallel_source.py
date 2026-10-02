@@ -18,7 +18,7 @@ COMPONENTS = "\n".join(
     for path in (
         CUDA_ROOT / "engine" / "components.h",
         CUDA_ROOT / "engine" / "components.cpp",
-        CUDA_ROOT / "models" / "qwen35" / "causal_lm.cpp",
+        CUDA_ROOT / "models" / "qwen35" / "ops.cpp",
     )
 )
 
@@ -150,7 +150,7 @@ def test_tensor_parallel_peer_first_launch_preserves_rank_indexing():
     assert "peer_first_parallel_launch_index" in SOURCE
     assert "launch_position < primary_rank" in CORE
     assert "local_outputs[index] =" in SOURCE
-    assert "partials[index] = run_quant_linear_shard(" in SOURCE
+    assert "partials[index]=mfq::models::gated_mlp(" in "".join(SOURCE.split())
 
 
 def test_qwen35_mtp_accepts_dense_tensor_parallel_placement():

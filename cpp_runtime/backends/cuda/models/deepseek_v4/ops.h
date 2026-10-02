@@ -1,0 +1,843 @@
+#pragma once
+#include "models/common/transformer_layer.h"
+#include "models/deepseek_v4/causal_lm.h"
+
+#include "../causal_ops.h"
+#include "mfq/kernels/cuda/deepseek_v4_attention.h"
+#include "mfq/kernels/cuda/deepseek_v4_hc.h"
+#include "models/block.h"
+#include "models/deepseek_v4/config.h"
+#include "models/ffn.h"
+
+#include <iomanip>
+#include <iostream>
+#include <memory>
+#include <vector>
+
+namespace mfq::cuda::deepseek_v4 {
+using Config = mfq::models::deepseek_v4::Config;
+
+mfq_tensor_backend::Tensor output_projection(CudaExecutionContext &execution,
+                                             mfq_tensor_backend::Tensor attention,
+                                             const QuantLinear &output_a,
+                                             const QuantLinear &output_b, std::int64_t groups,
+                                             bool groupwise, bool profile);
+} // namespace mfq::cuda::deepseek_v4
+
+struct Dsv4RopeTable {
+    mfq_tensor_backend::Tensor cos;
+    mfq_tensor_backend::Tensor sin;
+    mfq_tensor_backend::Tensor negative_sin;
+
+    Dsv4RopeTable() = default;
+
+    Dsv4RopeTable(int64_t max_position_embeddings, double rope_base, int64_t compress_ratio,
+                  double compress_rope_base = 0.0, int64_t original_positions = 0,
+                  double rope_factor = 1.0, double beta_fast = 32.0, double beta_slow = 1.0) {
+        constexpr int64_t rotary_dim = 64;
+        const int64_t half = rotary_dim / 2;
+        const int64_t positions = std::max<int64_t>(1, max_position_embeddings);
+        const double base =
+            compress_ratio > 0 && compress_rope_base > 0.0 ? compress_rope_base : rope_base;
+        auto opts = mfq_tensor_backend::TensorOptions()
+                        .device(mfq_tensor_backend::kCUDA)
+                        .dtype(mfq_tensor_backend::kFloat32);
+        auto dims = mfq_tensor_backend::arange(0, rotary_dim, 2, opts);
+        auto freqs = mfq_tensor_backend::pow(mfq_tensor_backend::full({half}, base, opts),
+                                             -dims / static_cast<double>(rotary_dim));
+        if (compress_ratio > 0 && original_positions > 0) {
+            auto correction = [&](double rotations) {
+                return static_cast<double>(rotary_dim) *
+                       std::log(static_cast<double>(original_positions) /
+                                (rotations * 6.28318530717958647692)) /
+                       (2.0 * std::log(base));
+            };
+            const double low = std::max(0.0, std::floor(correction(beta_fast)));
+            const double high =
+                std::min(static_cast<double>(rotary_dim - 1), std::ceil(correction(beta_slow)));
+            const double denominator = high == low ? 0.001 : high - low;
+            auto ramp = mfq_tensor_backend::clamp(
+                (mfq_tensor_backend::arange(half, opts) - low) / denominator, 0.0, 1.0);
+            auto smooth = 1.0 - ramp;
+            freqs = freqs / rope_factor * (1.0 - smooth) + freqs * smooth;
+        }
+        auto angles = mfq_tensor_backend::arange(positions, opts).unsqueeze(1) * freqs.unsqueeze(0);
+        cos = mfq_tensor_backend::cos(angles).contiguous();
+        sin = mfq_tensor_backend::sin(angles).contiguous();
+        negative_sin = (-sin).contiguous();
+    }
+};
+
+inline mfq_tensor_backend::Tensor dsv4_rotate_rope_tail(mfq_tensor_backend::Tensor x,
+                                                        mfq_tensor_backend::Tensor positions,
+                                                        const Dsv4RopeTable &table,
+                                                        bool inverse = false) {
+    if (x.dim() != 4 || x.size(-1) < 64) {
+        throw std::runtime_error("DeepSeek V4 RoPE expects contiguous [B,H,T,D>=64]");
+    }
+    const int64_t width = x.size(-1);
+    auto head = x.slice(-1, 0, width - 64).contiguous();
+    auto tail = x.slice(-1, width - 64, width).contiguous();
+    auto rotated = glm_interleaved_rope_cuda(
+        tail, positions.contiguous().to(mfq_tensor_backend::kCUDA, mfq_tensor_backend::kInt64),
+        table.cos, inverse ? table.negative_sin : table.sin, 64);
+    return mfq_tensor_backend::cat({head, rotated}, -1).contiguous();
+}
+
+inline std::vector<mfq_tensor_backend::Tensor>
+dsv4_hc_split_sinkhorn(mfq_tensor_backend::Tensor mixes, mfq_tensor_backend::Tensor scale,
+                       mfq_tensor_backend::Tensor base, int64_t hc_mult, int64_t iterations,
+                       double eps) {
+    const int64_t prefix = 2 * hc_mult;
+    auto pre = mfq_tensor_backend::sigmoid(mixes.slice(-1, 0, hc_mult) * scale.index({0}) +
+                                           base.slice(0, 0, hc_mult)) +
+               eps;
+    auto post =
+        2.0 * mfq_tensor_backend::sigmoid(mixes.slice(-1, hc_mult, prefix) * scale.index({1}) +
+                                          base.slice(0, hc_mult, prefix));
+    auto comb = (mixes.slice(-1, prefix, mixes.size(-1)) * scale.index({2}) +
+                 base.slice(0, prefix, base.size(0)))
+                    .reshape({mixes.size(0), mixes.size(1), hc_mult, hc_mult});
+    comb = mfq_tensor_backend::softmax(comb, -1) + eps;
+    comb = comb / (comb.sum(-2, true) + eps);
+    for (int64_t i = 1; i < iterations; ++i) {
+        comb = comb / (comb.sum(-1, true) + eps);
+        comb = comb / (comb.sum(-2, true) + eps);
+    }
+    return {pre, post, comb};
+}
+
+inline bool g_dsv4_fused_hc = true;
+inline bool g_dsv4_compare_hc_ops = false;
+
+inline void dsv4_report_hc_difference(int layer, const char *stage, const char *tensor_name,
+                                      const mfq_tensor_backend::Tensor &reference,
+                                      const mfq_tensor_backend::Tensor &candidate) {
+    auto reference_f32 = reference.to(mfq_tensor_backend::kFloat32);
+    auto candidate_f32 = candidate.to(mfq_tensor_backend::kFloat32);
+    auto difference = candidate_f32 - reference_f32;
+    const double reference_norm = std::max(reference_f32.norm().item<double>(), 1.0e-30);
+    std::cout << std::scientific << std::setprecision(9) << "dsv4_hc_op_ab layer=" << layer
+              << " stage=" << stage << " tensor=" << tensor_name
+              << " differing=" << candidate.ne(reference).sum().item<int64_t>()
+              << " rel_l2=" << difference.norm().item<double>() / reference_norm
+              << " mean_abs=" << difference.abs().mean().item<double>()
+              << " max_abs=" << difference.abs().max().item<double>() << "\n";
+}
+
+struct Dsv4SharedState {
+    mfq_tensor_backend::Tensor attention_meta;
+    mfq_tensor_backend::Tensor hadamard_signs;
+
+    void ensure() {
+        auto cuda = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA);
+        if (!attention_meta.defined()) {
+            attention_meta = mfq_tensor_backend::empty({8 * 1024 * 1024},
+                                                       cuda.dtype(mfq_tensor_backend::kFloat32));
+        }
+        if (!hadamard_signs.defined()) {
+            hadamard_signs = mfq_tensor_backend::ones({128}, cuda.dtype(mfq_tensor_backend::kInt8));
+        }
+    }
+};
+
+struct Dsv4PoolState {
+    int64_t ratio = 0;
+    int64_t head_dim = 0;
+    bool overlap = false;
+    int64_t cache_quant_mode = 0;
+    int64_t capacity = 0;
+    DenseLinearGroup projection;
+    mfq_tensor_backend::Tensor ape;
+    mfq_tensor_backend::Tensor norm;
+    mfq_tensor_backend::Tensor state_kv;
+    mfq_tensor_backend::Tensor state_gate;
+    mfq_tensor_backend::Tensor previous_kv;
+    mfq_tensor_backend::Tensor previous_gate;
+    mfq_tensor_backend::Tensor pool;
+
+    void reset(int64_t batch, int64_t max_positions) {
+        if (ratio <= 0 || head_dim <= 0)
+            return;
+        capacity = std::max<int64_t>(1, (max_positions + ratio - 1) / ratio);
+        const int64_t output_dim = overlap ? 2 * head_dim : head_dim;
+        auto fp32 = mfq_tensor_backend::TensorOptions()
+                        .device(mfq_tensor_backend::kCUDA)
+                        .dtype(mfq_tensor_backend::kFloat32);
+        auto half = fp32.dtype(mfq_tensor_backend::kFloat16);
+        if (state_kv.defined() && state_kv.size(0) == batch && pool.size(1) == capacity) {
+            state_kv.zero_();
+            state_gate.fill_(-std::numeric_limits<float>::infinity());
+            if (overlap) {
+                previous_kv.zero_();
+                previous_gate.fill_(-std::numeric_limits<float>::infinity());
+            }
+            pool.zero_();
+            return;
+        }
+        state_kv = mfq_tensor_backend::zeros({batch, ratio, output_dim}, fp32);
+        state_gate = mfq_tensor_backend::full({batch, ratio, output_dim},
+                                              -std::numeric_limits<float>::infinity(), fp32);
+        if (overlap) {
+            previous_kv = mfq_tensor_backend::zeros({batch, ratio, head_dim}, fp32);
+            previous_gate = mfq_tensor_backend::full({batch, ratio, head_dim},
+                                                     -std::numeric_limits<float>::infinity(), fp32);
+        } else {
+            previous_kv = mfq_tensor_backend::empty({0}, fp32);
+            previous_gate = mfq_tensor_backend::empty({0}, fp32);
+        }
+        pool = mfq_tensor_backend::zeros({batch, capacity, head_dim}, half);
+    }
+
+    std::vector<mfq_tensor_backend::Tensor> project(mfq_tensor_backend::Tensor x, int64_t batch,
+                                                    int64_t tokens) const {
+        auto parts = projection.forward(x.to(mfq_tensor_backend::kFloat32));
+        const int64_t output_dim = overlap ? 2 * head_dim : head_dim;
+        return {
+            parts.at(0)
+                .reshape({batch, tokens, output_dim})
+                .to(mfq_tensor_backend::kFloat32)
+                .contiguous(),
+            parts.at(1)
+                .reshape({batch, tokens, output_dim})
+                .to(mfq_tensor_backend::kFloat32)
+                .contiguous(),
+        };
+    }
+
+    void update(mfq_tensor_backend::Tensor kv, mfq_tensor_backend::Tensor gate,
+                mfq_tensor_backend::Tensor length, const Dsv4RopeTable &rope) {
+        dsv4_decode_pool_update_cuda(kv, gate, ape, norm, state_kv, state_gate, previous_kv,
+                                     previous_gate, pool, length, rope.cos, rope.sin, ratio,
+                                     overlap, cache_quant_mode, 1e-6);
+    }
+
+    int64_t prefill(const mfq_tensor_backend::Tensor &kv, const mfq_tensor_backend::Tensor &gate,
+                    const Dsv4RopeTable &rope) {
+        if (ratio <= 0)
+            return 0;
+        if (kv.dim() != 3 || gate.sizes() != kv.sizes()) {
+            throw std::runtime_error(
+                "DeepSeek V4 compressor prefill expects matching [B,T,D] tensors");
+        }
+        const int64_t batch = kv.size(0);
+        const int64_t tokens = kv.size(1);
+        const int64_t output_dim = overlap ? 2 * head_dim : head_dim;
+        if (kv.size(2) != output_dim) {
+            throw std::runtime_error("DeepSeek V4 compressor prefill projection width mismatch");
+        }
+        const int64_t windows = tokens / ratio;
+        const int64_t cutoff = windows * ratio;
+        if (windows > 0) {
+            auto grouped_kv =
+                kv.narrow(1, 0, cutoff).reshape({batch, windows, ratio, output_dim}).contiguous();
+            auto grouped_gate =
+                gate.narrow(1, 0, cutoff).reshape({batch, windows, ratio, output_dim}).contiguous();
+            auto positions =
+                mfq_tensor_backend::arange(windows, mfq_tensor_backend::TensorOptions()
+                                                        .device(kv.device())
+                                                        .dtype(mfq_tensor_backend::kInt64))
+                    .reshape({1, windows})
+                    .expand({batch, windows})
+                    .contiguous();
+            auto empty = mfq_tensor_backend::empty({0}, kv.options());
+            auto compressed =
+                dsv4_compress_cuda(grouped_kv, grouped_gate, ape, norm, empty, empty, positions,
+                                   rope.cos, rope.sin, ratio, overlap, cache_quant_mode, 1e-6);
+            pool.narrow(1, 0, windows).copy_(compressed);
+
+            state_kv.copy_(kv.narrow(1, cutoff - ratio, ratio).contiguous());
+            state_gate.copy_(gate.narrow(1, cutoff - ratio, ratio).contiguous());
+            if (overlap) {
+                previous_kv.copy_(state_kv.narrow(2, 0, head_dim));
+                previous_gate.copy_(state_gate.narrow(2, 0, head_dim));
+            }
+        }
+        const int64_t remainder = tokens - cutoff;
+        if (remainder > 0) {
+            state_kv.narrow(1, 0, remainder).copy_(kv.narrow(1, cutoff, remainder));
+            state_gate.narrow(1, 0, remainder).copy_(gate.narrow(1, cutoff, remainder));
+        }
+        return windows;
+    }
+};
+
+struct Dsv4Block : Block {
+    int layer = -1;
+    int64_t max_positions = 0;
+    int64_t compress_ratio = 0;
+    int64_t hidden_size = 4096;
+    int64_t heads = 64;
+    int64_t head_dim = 512;
+    int64_t groups = 8;
+    int64_t hc_mult = 4;
+    int64_t hc_iterations = 20;
+    double eps = 1e-6;
+    double hc_eps = 1e-6;
+    std::shared_ptr<Dsv4SharedState> shared_state;
+    mfq_tensor_backend::Tensor current_ids;
+
+    mfq_tensor_backend::Tensor attn_norm;
+    mfq_tensor_backend::Tensor ffn_norm;
+    mfq_tensor_backend::Tensor q_a_norm;
+    mfq_tensor_backend::Tensor kv_norm;
+    mfq_tensor_backend::Tensor sinks;
+    mfq_tensor_backend::Tensor hc_attn_fn;
+    mfq_tensor_backend::Tensor hc_attn_scale;
+    mfq_tensor_backend::Tensor hc_attn_base;
+    mfq_tensor_backend::Tensor hc_ffn_fn;
+    mfq_tensor_backend::Tensor hc_ffn_scale;
+    mfq_tensor_backend::Tensor hc_ffn_base;
+    QuantLinear q_a;
+    QuantLinear q_b;
+    QuantLinear kv;
+    QuantLinear output_a;
+    QuantLinear output_b;
+    Dsv4PoolState compressor;
+    Dsv4PoolState indexer_compressor;
+    QuantLinear indexer_q;
+    mfq_tensor_backend::Tensor indexer_weight;
+    FFN ffn;
+    Dsv4RopeTable attention_rope;
+
+    mfq_tensor_backend::Tensor local_cache;
+
+    void reset(int64_t batch) override {
+        auto half = mfq_tensor_backend::TensorOptions()
+                        .device(mfq_tensor_backend::kCUDA)
+                        .dtype(mfq_tensor_backend::kFloat16);
+        if (!local_cache.defined() || local_cache.size(0) != batch) {
+            local_cache = mfq_tensor_backend::zeros({batch, 128, head_dim}, half);
+        } else {
+            local_cache.zero_();
+        }
+        compressor.reset(batch, max_positions);
+        indexer_compressor.reset(batch, max_positions);
+        shared_state->ensure();
+    }
+
+    void set_token_ids(const mfq_tensor_backend::Tensor &ids) override { current_ids = ids; }
+
+    std::vector<mfq_tensor_backend::Tensor> hc_pre(mfq_tensor_backend::Tensor x,
+                                                   mfq_tensor_backend::Tensor function,
+                                                   mfq_tensor_backend::Tensor scale,
+                                                   mfq_tensor_backend::Tensor base,
+                                                   const char *stage) const {
+        auto flat = x.flatten(2).to(mfq_tensor_backend::kFloat32);
+        auto inverse_rms = mfq_tensor_backend::rsqrt(flat.square().mean(-1, true) + eps);
+        auto mixes = mfq_tensor_backend::matmul(flat, function.transpose(0, 1)) * inverse_rms;
+        std::vector<mfq_tensor_backend::Tensor> candidate;
+        if (g_dsv4_fused_hc || g_dsv4_compare_hc_ops) {
+            candidate = dsv4_hc_pre_cuda(x, mixes.contiguous(), scale, base, hc_iterations, hc_eps);
+        }
+        std::vector<mfq_tensor_backend::Tensor> reference;
+        if (!g_dsv4_fused_hc || g_dsv4_compare_hc_ops) {
+            auto split = dsv4_hc_split_sinkhorn(mixes, scale, base, hc_mult, hc_iterations, hc_eps);
+            auto reduced = (split.at(0).unsqueeze(-1) * flat.reshape(x.sizes()))
+                               .sum(2)
+                               .to(mfq_tensor_backend::kFloat16)
+                               .contiguous();
+            reference = {reduced, split.at(1), split.at(2)};
+        }
+        if (g_dsv4_compare_hc_ops && layer == 0) {
+            dsv4_report_hc_difference(layer, stage, "reduced", reference.at(0), candidate.at(0));
+            dsv4_report_hc_difference(layer, stage, "post", reference.at(1), candidate.at(1));
+            dsv4_report_hc_difference(layer, stage, "combination", reference.at(2),
+                                      candidate.at(2));
+        }
+        return g_dsv4_fused_hc ? candidate : reference;
+    }
+
+    mfq_tensor_backend::Tensor hc_post(mfq_tensor_backend::Tensor x,
+                                       mfq_tensor_backend::Tensor residual,
+                                       mfq_tensor_backend::Tensor post,
+                                       mfq_tensor_backend::Tensor combination,
+                                       const char *stage) const {
+        mfq_tensor_backend::Tensor candidate;
+        if (g_dsv4_fused_hc || g_dsv4_compare_hc_ops) {
+            candidate = dsv4_hc_post_cuda(x.contiguous(), residual.contiguous(), post.contiguous(),
+                                          combination.contiguous());
+        }
+        mfq_tensor_backend::Tensor reference;
+        if (!g_dsv4_fused_hc || g_dsv4_compare_hc_ops) {
+            reference = (post.unsqueeze(-1) * x.unsqueeze(-2) +
+                         (combination.unsqueeze(-1) *
+                          residual.to(mfq_tensor_backend::kFloat32).unsqueeze(-2))
+                             .sum(2))
+                            .to(mfq_tensor_backend::kFloat16)
+                            .contiguous();
+        }
+        if (g_dsv4_compare_hc_ops && layer == 0) {
+            dsv4_report_hc_difference(layer, stage, "expanded", reference, candidate);
+        }
+        return g_dsv4_fused_hc ? candidate : reference;
+    }
+
+    mfq_tensor_backend::Tensor output_projection(CudaExecutionContext &execution,
+                                                 mfq_tensor_backend::Tensor attention) const {
+        return mfq::cuda::deepseek_v4::output_projection(
+            execution, attention, output_a, output_b, groups,
+            execution.config.dsv4_groupwise_output_a, true);
+    }
+
+    mfq_tensor_backend::Tensor
+    attention_forward(CudaExecutionContext &execution, mfq_tensor_backend::Tensor x,
+                      mfq_tensor_backend::Tensor positions, int64_t cache_pos,
+                      const MfqOptional<mfq_tensor_backend::Tensor> &seq_len) {
+        auto &profiler = execution.profiler;
+        const int64_t batch = x.size(0);
+        const int64_t tokens = x.size(1);
+        auto flat =
+            x.reshape({batch * tokens, hidden_size}).to(mfq_tensor_backend::kFloat16).contiguous();
+
+        using Tensor = mfq_tensor_backend::Tensor;
+        return mfq::models::deepseek_v4::attention(
+            tokens, cache_pos, seq_len.has_value(), compress_ratio,
+            [&] {
+                auto qr =
+                    profiler.measure("dsv4.q_a", [&]() { return q_a.forward(execution, flat); });
+                qr = profiler.measure("dsv4.q_a_norm", [&]() {
+                    return rms_norm_cuda(
+                               qr.reshape({-1, qr.size(-1)}).to(mfq_tensor_backend::kFloat32),
+                               q_a_norm, eps)
+                        .to(mfq_tensor_backend::kFloat16)
+                        .contiguous();
+                });
+                auto queries = profiler.measure("dsv4.q_b", [&]() {
+                    return q_b.forward(execution, qr)
+                        .reshape({batch, tokens, heads, head_dim})
+                        .transpose(1, 2)
+                        .contiguous()
+                        .to(mfq_tensor_backend::kFloat32);
+                });
+                queries = profiler.measure("dsv4.q_norm_rope", [&]() {
+                    auto normalized =
+                        queries * mfq_tensor_backend::rsqrt(queries.square().mean(-1, true) + eps);
+                    return dsv4_rotate_rope_tail(normalized, positions, attention_rope, false);
+                });
+
+                return std::array<Tensor, 2>{qr, queries};
+            },
+            [&] {
+                auto values = profiler.measure("dsv4.kv", [&]() {
+                    return kv.forward(execution, flat).reshape({batch, tokens, head_dim});
+                });
+                values = profiler.measure("dsv4.kv_norm_rope", [&]() {
+                    auto normalized =
+                        rms_norm_cuda(
+                            values.reshape({-1, head_dim}).to(mfq_tensor_backend::kFloat32),
+                            kv_norm, eps)
+                            .reshape({batch, tokens, head_dim})
+                            .to(mfq_tensor_backend::kFloat16);
+                    auto values_heads = normalized.unsqueeze(1).contiguous();
+                    values_heads =
+                        dsv4_rotate_rope_tail(values_heads, positions, attention_rope, false);
+                    return values_heads.squeeze(1).contiguous();
+                });
+
+                return values;
+            },
+            [&] {
+                return profiler.measure("dsv4.compressor_proj",
+                                        [&] { return compressor.project(flat, batch, tokens); });
+            },
+            [&] {
+                return profiler.measure("dsv4.indexer_compressor_proj", [&] {
+                    return indexer_compressor.project(flat, batch, tokens);
+                });
+            },
+            [&](const auto &projected) {
+                auto qr = projected.rank, queries = projected.queries, values = projected.values;
+                const auto &compressor_parts = projected.compressor;
+                const auto &indexer_parts = projected.indexer;
+                return mfq::models::deepseek_v4::compressed_step(
+                    compress_ratio, true,
+                    [&] {
+                        const int64_t local_tokens = std::min<int64_t>(tokens, 128);
+                        auto local_positions =
+                            positions.narrow(0, tokens - local_tokens, local_tokens)
+                                .remainder(128)
+                                .to(mfq_tensor_backend::kInt64)
+                                .contiguous();
+                        profiler.measure("dsv4.local_cache_prefill", [&]() {
+                            local_cache.index_copy_(
+                                1, local_positions,
+                                values.narrow(1, tokens - local_tokens, local_tokens));
+                            return 0;
+                        });
+                    },
+                    [&] {
+                        return profiler.measure("dsv4.compressor_prefill", [&] {
+                            return compressor.prefill(compressor_parts.at(0),
+                                                      compressor_parts.at(1), attention_rope);
+                        });
+                    },
+                    [&] {
+                        return profiler.measure("dsv4.indexer_compressor_prefill", [&] {
+                            return indexer_compressor.prefill(indexer_parts.at(0),
+                                                              indexer_parts.at(1), attention_rope);
+                        });
+                    },
+                    [&](int64_t visible) {
+                        auto int_options = mfq_tensor_backend::TensorOptions()
+                                               .device(x.device())
+                                               .dtype(mfq_tensor_backend::kInt32);
+                        return mfq::models::deepseek_v4::select_compressed(
+                            compress_ratio, visible,
+                            [&] {
+                                auto index_query =
+                                    profiler.measure("dsv4.indexer_q_prefill", [&]() {
+                                        return indexer_q.forward(execution, qr)
+                                            .reshape({batch, tokens, heads, 128})
+                                            .transpose(1, 2)
+                                            .contiguous();
+                                    });
+                                index_query = dsv4_rotate_rope_tail(index_query, positions,
+                                                                    attention_rope, false)
+                                                  .transpose(1, 2)
+                                                  .contiguous();
+                                index_query = nepq_hadamard_input_cuda(
+                                                  index_query.reshape({batch * tokens * heads, 128})
+                                                      .to(mfq_tensor_backend::kFloat16)
+                                                      .contiguous(),
+                                                  shared_state->hadamard_signs, 128)
+                                                  .reshape({batch, tokens, heads, 128});
+                                index_query = dsv4_fp4_sim_cuda(index_query.contiguous());
+                                auto weights =
+                                    profiler.measure("dsv4.indexer_weight_prefill", [&]() {
+                                        return mfq_tensor_backend::matmul(
+                                                   x.reshape({batch * tokens, hidden_size})
+                                                       .to(mfq_tensor_backend::kFloat32),
+                                                   indexer_weight.transpose(0, 1))
+                                            .reshape({batch, tokens, heads})
+                                            .to(mfq_tensor_backend::kFloat16)
+                                            .contiguous();
+                                    });
+                                auto scores =
+                                    profiler.measure("dsv4.indexer_scores_prefill", [&]() {
+                                        return dsv4_indexer_scores_cuda(
+                                            index_query,
+                                            indexer_compressor.pool.narrow(1, 0, visible)
+                                                .contiguous(),
+                                            weights, 0, 4);
+                                    });
+                                return profiler.measure("dsv4.indexer_topk_prefill", [&]() {
+                                    return dsv4_topk512_cuda(scores);
+                                });
+                            },
+                            [&] {
+                                return mfq_tensor_backend::arange(visible, int_options)
+                                    .reshape({1, 1, visible})
+                                    .expand({batch, tokens, visible})
+                                    .contiguous();
+                            },
+                            [&] {
+                                return mfq_tensor_backend::zeros({batch, tokens, 1}, int_options);
+                            });
+                    },
+                    [&](Tensor selected, int64_t visible) {
+                        const int64_t plan_ratio = compress_ratio > 0 ? compress_ratio : 1;
+                        return profiler.measure("dsv4.attention_plan_prefill", [&]() {
+                            return dsv4_build_prefill_plan_cuda(selected, 0, 0, visible, plan_ratio,
+                                                                128);
+                        });
+                    },
+                    [&](int64_t visible) {
+                        return profiler.measure("dsv4.attention_cache_prefill", [&]() {
+                            return visible > 0
+                                       ? mfq_tensor_backend::cat(
+                                             {values, compressor.pool.narrow(1, 0, visible)}, 1)
+                                             .contiguous()
+                                       : values.contiguous();
+                        });
+                    },
+                    [&](Tensor cache, const auto &plan) {
+                        return profiler.measure("dsv4.sparse_attention_prefill", [&]() {
+                            return attention_dsv4_sparse_cuda(
+                                queries, cache, plan.at(0), plan.at(1), sinks,
+                                shared_state->attention_meta,
+                                1.0 / std::sqrt(static_cast<double>(head_dim)));
+                        });
+                    },
+                    [&](Tensor attention) {
+                        return profiler.measure("dsv4.attention_inverse_rope_prefill", [&]() {
+                            auto transposed = attention.transpose(1, 2).contiguous();
+                            transposed =
+                                dsv4_rotate_rope_tail(transposed, positions, attention_rope, true);
+                            return transposed.transpose(1, 2).contiguous();
+                        });
+                    },
+                    [&](Tensor attention) { return output_projection(execution, attention); });
+            },
+            [&](const auto &projected, int64_t token, int64_t absolute_length) {
+                auto qr = projected.rank, queries = projected.queries, values = projected.values;
+                const auto &compressor_parts = projected.compressor;
+                const auto &indexer_parts = projected.indexer;
+                auto position = positions.narrow(0, token, 1);
+                auto slot = mfq_tensor_backend::remainder(position, 128)
+                                .to(mfq_tensor_backend::kInt64)
+                                .contiguous();
+                mfq_tensor_backend::Tensor length;
+                if (tokens == 1 && seq_len.has_value()) {
+                    length = seq_len.value().contiguous();
+                } else {
+                    length = mfq_tensor_backend::full({batch}, absolute_length,
+                                                      mfq_tensor_backend::TensorOptions()
+                                                          .device(mfq_tensor_backend::kCUDA)
+                                                          .dtype(mfq_tensor_backend::kInt64));
+                }
+                return mfq::models::deepseek_v4::compressed_step(
+                    compress_ratio, false,
+                    [&] {
+                        profiler.measure("dsv4.local_cache_write", [&]() {
+                            glm_dsa_cache_write_cuda(local_cache,
+                                                     values.narrow(1, token, 1).contiguous(), slot);
+                            return 0;
+                        });
+                    },
+                    [&] {
+                        profiler.measure("dsv4.compressor_update", [&]() {
+                            compressor.update(
+                                compressor_parts.at(0).narrow(1, token, 1).contiguous(),
+                                compressor_parts.at(1).narrow(1, token, 1).contiguous(), length,
+                                attention_rope);
+                            return 0;
+                        });
+                        return absolute_length / compress_ratio;
+                    },
+                    [&] {
+                        profiler.measure("dsv4.indexer_compressor_update", [&]() {
+                            indexer_compressor.update(
+                                indexer_parts.at(0).narrow(1, token, 1).contiguous(),
+                                indexer_parts.at(1).narrow(1, token, 1).contiguous(), length,
+                                attention_rope);
+                            return 0;
+                        });
+                        return int64_t{0};
+                    },
+                    [&](int64_t visible) {
+                        auto int_options = mfq_tensor_backend::TensorOptions()
+                                               .device(mfq_tensor_backend::kCUDA)
+                                               .dtype(mfq_tensor_backend::kInt32);
+                        return mfq::models::deepseek_v4::select_compressed(
+                            compress_ratio, visible,
+                            [&] {
+                                auto qr_token = qr.reshape({batch, tokens, qr.size(-1)})
+                                                    .narrow(1, token, 1)
+                                                    .reshape({batch, qr.size(-1)})
+                                                    .contiguous();
+                                auto index_query = profiler.measure("dsv4.indexer_q", [&]() {
+                                    return indexer_q.forward(execution, qr_token)
+                                        .reshape({batch, 1, heads, 128})
+                                        .transpose(1, 2)
+                                        .contiguous();
+                                });
+                                index_query = dsv4_rotate_rope_tail(index_query, position,
+                                                                    attention_rope, false)
+                                                  .transpose(1, 2)
+                                                  .contiguous();
+                                index_query = nepq_hadamard_input_cuda(
+                                                  index_query.reshape({batch * heads, 128})
+                                                      .to(mfq_tensor_backend::kFloat16)
+                                                      .contiguous(),
+                                                  shared_state->hadamard_signs, 128)
+                                                  .reshape({batch, 1, heads, 128});
+                                index_query = dsv4_fp4_sim_cuda(index_query.contiguous());
+                                auto weights = profiler.measure("dsv4.indexer_weight", [&]() {
+                                    return mfq_tensor_backend::matmul(
+                                               x.narrow(1, token, 1)
+                                                   .reshape({batch, hidden_size})
+                                                   .to(mfq_tensor_backend::kFloat32),
+                                               indexer_weight.transpose(0, 1))
+                                        .reshape({batch, 1, heads})
+                                        .to(mfq_tensor_backend::kFloat16)
+                                        .contiguous();
+                                });
+                                auto scores = profiler.measure("dsv4.indexer_scores", [&]() {
+                                    return dsv4_indexer_scores_cuda(
+                                        index_query,
+                                        indexer_compressor.pool.narrow(1, 0, visible).contiguous(),
+                                        weights, cache_pos + token, 4);
+                                });
+                                return profiler.measure("dsv4.indexer_topk", [&]() {
+                                    return dsv4_topk512_cuda(scores);
+                                });
+                            },
+                            [&] {
+                                return mfq_tensor_backend::arange(visible, int_options)
+                                    .reshape({1, 1, visible})
+                                    .expand({batch, 1, visible})
+                                    .contiguous();
+                            },
+                            [&] {
+                                return mfq_tensor_backend::arange(visible, int_options)
+                                    .reshape({1, 1, visible})
+                                    .expand({batch, 1, visible})
+                                    .contiguous();
+                            });
+                    },
+                    [&](Tensor selected, int64_t visible) {
+                        const int64_t plan_ratio = compress_ratio > 0 ? compress_ratio : 1;
+                        return profiler.measure("dsv4.attention_plan", [&]() {
+                            return dsv4_build_decode_plan_cuda(selected, length, visible,
+                                                               plan_ratio, 128);
+                        });
+                    },
+                    [&](int64_t visible) {
+                        return profiler.measure("dsv4.attention_cache", [&]() {
+                            return visible > 0
+                                       ? mfq_tensor_backend::cat(
+                                             {local_cache, compressor.pool.narrow(1, 0, visible)},
+                                             1)
+                                             .contiguous()
+                                       : local_cache;
+                        });
+                    },
+                    [&](Tensor cache, const auto &plan) {
+                        auto query = queries.narrow(2, token, 1).contiguous();
+                        return profiler.measure("dsv4.sparse_attention", [&]() {
+                            return attention_dsv4_sparse_cuda(
+                                query, cache, plan.at(0), plan.at(1), sinks,
+                                shared_state->attention_meta,
+                                1.0 / std::sqrt(static_cast<double>(head_dim)));
+                        });
+                    },
+                    [&](Tensor attention) {
+                        return profiler.measure("dsv4.attention_inverse_rope", [&]() {
+                            auto transposed = attention.transpose(1, 2).contiguous();
+                            transposed =
+                                dsv4_rotate_rope_tail(transposed, position, attention_rope, true);
+                            return transposed.transpose(1, 2).contiguous();
+                        });
+                    },
+                    [&](Tensor attention) { return output_projection(execution, attention); });
+            },
+            [](const auto &outputs) { return mfq_tensor_backend::cat(outputs, 1); });
+    }
+
+    mfq_tensor_backend::Tensor
+    forward(CudaExecutionContext &execution, mfq_tensor_backend::Tensor x,
+            mfq_tensor_backend::Tensor pos, int64_t cache_pos,
+            const MfqOptional<mfq_tensor_backend::Tensor> &seq_len, const RopeCache &,
+            const MfqOptional<mfq_tensor_backend::Tensor> &cache_positions = mfq_nullopt,
+            const MfqOptional<mfq_tensor_backend::Tensor> &attention_mask = mfq_nullopt) override {
+        (void)cache_positions;
+        (void)attention_mask;
+        auto &profiler = execution.profiler;
+        if (!current_ids.defined()) {
+            throw std::runtime_error("DeepSeek V4 block did not receive token ids");
+        }
+        const int64_t batch = x.size(0);
+        const int64_t tokens = x.size(1);
+        return mfq::models::hyperconnection_layer(
+            std::move(x),
+            [&](mfq_tensor_backend::Tensor x) {
+                auto pre = profiler.measure("dsv4.hc_attn_pre", [&]() {
+                    return hc_pre(x, hc_attn_fn, hc_attn_scale, hc_attn_base, "attn_pre");
+                });
+                auto normalized = profiler.measure("dsv4.attn_norm", [&]() {
+                    return rms_norm_cuda(pre.at(0)
+                                             .reshape({batch * tokens, hidden_size})
+                                             .to(mfq_tensor_backend::kFloat32),
+                                         attn_norm, eps)
+                        .reshape({batch, tokens, hidden_size})
+                        .to(mfq_tensor_backend::kFloat16);
+                });
+                return std::make_pair(normalized, pre);
+            },
+            [&](const auto &mix) {
+                return attention_forward(execution, mix.first, pos, cache_pos, seq_len);
+            },
+            [&](mfq_tensor_backend::Tensor attention, mfq_tensor_backend::Tensor residual,
+                const auto &mix) {
+                return profiler.measure("dsv4.hc_attn_post", [&]() {
+                    return hc_post(attention, residual, mix.second.at(1), mix.second.at(2),
+                                   "attn_post");
+                });
+            },
+            [&](mfq_tensor_backend::Tensor x, const auto &) {
+                auto pre = profiler.measure("dsv4.hc_ffn_pre", [&]() {
+                    return hc_pre(x, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, "ffn_pre");
+                });
+                auto normalized = profiler.measure("dsv4.ffn_norm", [&]() {
+                    return rms_norm_cuda(pre.at(0)
+                                             .reshape({batch * tokens, hidden_size})
+                                             .to(mfq_tensor_backend::kFloat32),
+                                         ffn_norm, eps)
+                        .reshape({batch, tokens, hidden_size})
+                        .to(mfq_tensor_backend::kFloat16);
+                });
+                return std::make_pair(normalized, pre);
+            },
+            [&](const auto &mix) {
+                auto feed_forward = ffn.forward(
+                    execution, mix.first.reshape({batch * tokens, hidden_size}), current_ids);
+                feed_forward = feed_forward.reshape({batch, tokens, hidden_size});
+                return feed_forward;
+            },
+            [&](mfq_tensor_backend::Tensor feed_forward, mfq_tensor_backend::Tensor residual,
+                const auto &mix) {
+                return profiler.measure("dsv4.hc_ffn_post", [&]() {
+                    return hc_post(feed_forward, residual, mix.second.at(1), mix.second.at(2),
+                                   "ffn_post");
+                });
+            },
+            [](const auto &) {});
+    }
+};
+namespace mfq::cuda::deepseek_v4 {
+
+struct OutputHeadWeights {
+    mfq_tensor_backend::Tensor function;
+    mfq_tensor_backend::Tensor scale;
+    mfq_tensor_backend::Tensor base;
+};
+
+std::unique_ptr<::Block> load_block(CudaExecutionContext &execution, const mfq::ModelSource &source,
+                                    const Config &config, int layer, const std::string &type,
+                                    const std::shared_ptr<::Dsv4SharedState> &state);
+void validate_load_options(const Config &config, CudaExecutionContext &execution);
+OutputHeadWeights load_output_head(CudaExecutionContext &execution, const mfq::ModelSource &source);
+mfq_tensor_backend::Tensor finalize_hidden(mfq_tensor_backend::Tensor hidden,
+                                           const OutputHeadWeights &output_head,
+                                           const Config &config, CudaProfiler &profiler,
+                                           int64_t batch, int64_t tokens);
+
+} // namespace mfq::cuda::deepseek_v4
+
+namespace mfq::cuda {
+
+struct DeepseekV4Model : CausalLmArchitecture {
+    template <class Backend> using CausalModel = mfq::models::deepseek_v4::CausalLm<Backend>;
+    mfq::models::deepseek_v4::Config config;
+    deepseek_v4::OutputHeadWeights output_head;
+    std::unordered_map<int, std::shared_ptr<Dsv4SharedState>> block_states;
+
+    void adapter_validate_load_options() const;
+    void adapter_load_final_state(const mfq::ModelSource &source,
+                                  mfq_tensor_backend::Tensor &output_norm);
+    std::unique_ptr<Block> adapter_load_block(const mfq::ModelSource &source, int layer, int device,
+                                              const std::string &type);
+
+    mfq_tensor_backend::Tensor adapter_prepare_hidden(mfq_tensor_backend::Tensor hidden,
+                                                      int64_t batch, int64_t tokens) const;
+    mfq_tensor_backend::Tensor collapse_hidden(mfq_tensor_backend::Tensor hidden, int64_t batch,
+                                               int64_t tokens) const;
+    mfq_tensor_backend::Tensor normalize_hidden(mfq_tensor_backend::Tensor hidden,
+                                                const mfq_tensor_backend::Tensor &output_norm,
+                                                int64_t batch, int64_t tokens) const;
+};
+
+template <> struct CudaSessionCodec<DeepseekV4Model> {
+    using Model = CausalLm<DeepseekV4Model>;
+    static TextSessionStateKind kind(const Model &model);
+    static bool supports_paged(const Model &model);
+    static TextSessionState capture(const Model &model, const std::vector<int64_t> &tokens);
+    static void restore(Model &model, const TextSessionState &state);
+};
+
+} // namespace mfq::cuda
+
+namespace mfq::models {
+extern template struct deepseek_v4::CausalLm<cuda::CudaCausalOps<cuda::DeepseekV4Model>>;
+} // namespace mfq::models

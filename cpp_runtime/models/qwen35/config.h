@@ -4,6 +4,7 @@
 #include "mfq_legacy_tensor_names.h"
 #include "mfq_model_graph.h"
 #include "models/common/model_config.h"
+#include "models/common/moe.h"
 
 #include <cstdint>
 #include <optional>
@@ -37,6 +38,26 @@ struct Config : ModelConfig {
     std::optional<std::int64_t> image_token_id;
     std::optional<std::int64_t> video_token_id;
 
+    enum class AttentionKind { full, linear };
+    static AttentionKind attention_kind(std::string_view type) {
+        if (type == "full_attention")
+            return AttentionKind::full;
+        if (type == "linear_attention")
+            return AttentionKind::linear;
+        throw std::runtime_error("unsupported Qwen attention type: " + std::string(type));
+    }
+    MoeRouting routing() const {
+        if (expert_gating_func == "sqrtsoftplus")
+            return {RouterActivation::sqrt_softplus, norm_topk_prob, false, routed_scaling_factor};
+        // Full softmax -> top-k -> renormalize equals softmax on selected logits.
+        return {RouterActivation::softmax, false, true, 1.0};
+    }
+    static bool valid_positions(int64_t rank, int64_t rows, int64_t columns, int64_t batch,
+                                int64_t tokens, bool mrope) {
+        return (rank == 1 && columns == tokens) ||
+               (rank == 2 && columns == tokens && (rows == batch || (mrope && rows == 3)));
+    }
+
     std::int64_t linear_k_size() const noexcept {
         return linear_num_key_heads * linear_key_head_dim;
     }
@@ -44,17 +65,12 @@ struct Config : ModelConfig {
         return linear_num_value_heads * linear_value_head_dim;
     }
 
-    static Config from_json(
-        std::string_view payload,
-        const MfqModelGraph& graph);
+    static Config from_json(std::string_view payload, const MfqModelGraph &graph);
 
-    template <class Source>
-    static Config from_source(const Source& source) {
+    template <class Source> static Config from_source(const Source &source) {
         const auto graph = source.resolved_model_graph();
-        if (graph.backbone != "qwen3_5" &&
-                graph.backbone != "generic_qwen") {
-            throw std::runtime_error(
-                "Qwen3.5 loading requires a Qwen-compatible model graph");
+        if (graph.backbone != "qwen3_5" && graph.backbone != "generic_qwen") {
+            throw std::runtime_error("Qwen3.5 loading requires a Qwen-compatible model graph");
         }
         return from_json(source.model_config_json(), graph);
     }

@@ -1,4 +1,4 @@
-#include "causal_lm.h"
+#include "ops.h"
 
 #include "cuda_execution.h"
 #include "cuda_sampling.h"

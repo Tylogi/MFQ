@@ -6,9 +6,10 @@ by model family:
 - `core/` — canonical model graph, request/value contracts, policies, and
   generated tables; temporary old-artifact name adapters live in
   `core/compat/`;
-- `models/<family>/` — shared family configuration and forward composition;
-  `models/common/` contains the shared `CausalLm` class, causal traversal, attention,
-  gated MLP, and layer compositions;
+- `models/<family>/` — each family owns `config.h` and `causal_lm.h`; the latter
+  defines its concrete `CausalLm`, forward graph, topology, and position rules.
+  MiniCPM also defines `TtsCausalLm`. `models/common/` contains `CausalModelBase`,
+  causal traversal, attention, MLP, MoE, recurrence, and shared layer compositions;
 - `transport/` — private stdio/HTTP protocol adapters;
 - `scheduler/` — backend-neutral request dispatch and lifecycle boundary;
 - `engine/` — the sole cross-backend `Engine` interface plus reusable
@@ -39,8 +40,19 @@ restore/prefill/output/snapshot lifecycle. Media embeddings, positions, cache
 identity materialization, numerical verification, CUDA Graph execution, and
 physical batch operations stay CUDA-specific. Generation, MTP draft/accept/commit
 rules, and the continuous-batching request state machine are shared. Qwen3.5
-inner attention, dense FFN, and predictor ordering also use shared model code;
-other families still require migration of their inner forward definitions. Qwen3.8-27B uses the `qwen3_5` backbone;
+and the other seven model families now keep their forward definitions in
+`models/<family>/causal_lm.h`, including sparse/recurrent attention, MoE,
+predictors, and MiniCPM audio/vision/TTS traversal. CUDA family `ops.h/.cpp`
+files bind these definitions to native tensors, kernels, weights, and caches.
+Qwen4/GLM5 decoder order, DeepSeek-V4.1 target/DSpark mega-layers, and
+DeepSeek/GLM5 output collapse/norm order are shared. Local and parallel FFNs
+use shared gated-MLP composition; CUDA owns shard placement, reduction, and
+stream scheduling. MiniCPM ordinary TTS and text evaluation use the Engine's
+synchronous token loop, with TTS sampling order in its shared model.
+Native input preparation and composite operator bindings still need an
+ownership audit. Metal integration and duplex control remain pending;
+multi-device and non-Qwen3.5 real-weight validation are also incomplete.
+Qwen3.8-27B uses the `qwen3_5` backbone;
 Qwen3.8-Flash-Next uses `qwen4_exp`.
 
 `CMakeLists.txt` is the single entry point. Runtime executable targets are

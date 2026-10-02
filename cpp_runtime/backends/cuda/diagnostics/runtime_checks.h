@@ -3,7 +3,7 @@
 #include "engine/generation.h"
 #include "generation_result.h"
 #include "engine/mtp.h"
-#include "models/deepseek_v4/causal_lm.h"
+#include "models/deepseek_v4/ops.h"
 #include "diagnostics/flash_next_mtp.h"
 #include "qwen35/mtp.h"
 #include "quant_linear.h"

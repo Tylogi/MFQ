@@ -29,10 +29,10 @@ auto feed_forward(Tensor residual, Tensor normalized, Fused fused, FeedForward p
 // DeepSeek HC/MHC uses a separate residual stream and branch preparation for
 // attention and FFN. MHC's next_pre travels from attention to the FFN branch.
 template <class Tensor, class AttnPre, class Attention, class AttnPost, class FfnPre,
-    class FeedForward, class FfnPost, class Commit>
+          class FeedForward, class FfnPost, class Commit>
 auto hyperconnection_layer(Tensor hidden, AttnPre attention_pre, Attention attention,
-    AttnPost attention_post, FfnPre ffn_pre, FeedForward feed_forward, FfnPost ffn_post,
-    Commit commit) {
+                           AttnPost attention_post, FfnPre ffn_pre, FeedForward feed_forward,
+                           FfnPost ffn_post, Commit commit) {
     auto attention_mix = attention_pre(hidden);
     auto attended = attention(attention_mix);
     hidden = attention_post(std::move(attended), hidden, attention_mix);
@@ -41,19 +41,6 @@ auto hyperconnection_layer(Tensor hidden, AttnPre attention_pre, Attention atten
     hidden = ffn_post(std::move(output), hidden, ffn_mix);
     commit(ffn_mix);
     return hidden;
-}
-
-// Gemma combines a dense branch with routed experts before its final residual.
-// Dense-post and merge may fuse the family's normalization arithmetic.
-template <class Dense, class DensePost, class Experts, class Merge, class Finish>
-auto gemma_ffn(bool moe, Dense dense, DensePost dense_post, Experts experts, Merge merge,
-    Finish finish_dense) {
-    auto output = dense();
-    if (!moe)
-        return finish_dense(std::move(output));
-    output = dense_post(std::move(output));
-    auto routed = experts();
-    return merge(std::move(output), std::move(routed));
 }
 
 template <class Tensor, class Layers, class Apply>
