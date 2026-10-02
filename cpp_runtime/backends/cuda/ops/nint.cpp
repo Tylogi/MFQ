@@ -1,3 +1,5 @@
+#include "mfq_cuda_activation_ops.h"
+#include "mfq_cuda_quant_ops.h"
 #include "nint.h"
 #include "cuda_execution.h"
 #include "format.h"

@@ -1,3 +1,4 @@
+#include "mfq_cuda_sampling_ops.h"
 #include "cuda_batching.h"
 
 #include "cuda_execution.h"

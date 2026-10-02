@@ -1,3 +1,5 @@
+#include "mfq_cuda_moe_ops.h"
+#include "mfq_cuda_quant_ops.h"
 #include "storage/weight_loader.h"
 #include "moe.h"
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mfq_cuda_sampling_ops.h"
 #include "cuda_execution.h"
 #include "core/decode_graph.h"
 #include "core/full_block.h"

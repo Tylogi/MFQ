@@ -1,0 +1,43 @@
+#pragma once
+
+#include "mfq_tensor_backend.h"
+
+#include <cstdint>
+#include <vector>
+
+mfq_tensor_backend::Tensor rms_norm_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, double eps);
+mfq_tensor_backend::Tensor rms_norm_offset_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, double eps, double weight_offset);
+mfq_tensor_backend::Tensor rms_norm_f16_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, double eps,
+                                double weight_offset);
+mfq_tensor_backend::Tensor qwen_rms_norm_bf16_cuda(
+    mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor weight, double eps,
+    double weight_offset);
+std::vector<mfq_tensor_backend::Tensor> qwen_rms_norm_pair_bf16_cuda(
+    mfq_tensor_backend::Tensor first, mfq_tensor_backend::Tensor second,
+    mfq_tensor_backend::Tensor first_weight, mfq_tensor_backend::Tensor second_weight,
+    double eps, double weight_offset);
+std::vector<mfq_tensor_backend::Tensor> rms_norm_pair_f16_f32_offset_cuda(
+    mfq_tensor_backend::Tensor first, mfq_tensor_backend::Tensor second,
+    mfq_tensor_backend::Tensor first_weight, mfq_tensor_backend::Tensor second_weight,
+    double eps, double weight_offset);
+mfq_tensor_backend::Tensor l2_norm_cuda(mfq_tensor_backend::Tensor x, double eps);
+mfq_tensor_backend::Tensor acc_cuda(mfq_tensor_backend::Tensor a, mfq_tensor_backend::Tensor b);
+std::vector<mfq_tensor_backend::Tensor> acc_rms_norm_cuda(mfq_tensor_backend::Tensor a, mfq_tensor_backend::Tensor b,
+                                             mfq_tensor_backend::Tensor weight, double eps,
+                                             double weight_offset);
+std::vector<mfq_tensor_backend::Tensor> acc_rms_norm_f16_cuda(mfq_tensor_backend::Tensor a, mfq_tensor_backend::Tensor b,
+                                                 mfq_tensor_backend::Tensor weight, double eps,
+                                                 double weight_offset);
+std::vector<mfq_tensor_backend::Tensor> acc_rms_norm_bf16_cuda(
+    mfq_tensor_backend::Tensor a, mfq_tensor_backend::Tensor b,
+    mfq_tensor_backend::Tensor weight, double eps, double weight_offset);
+std::vector<mfq_tensor_backend::Tensor> gemma4_attn_residual_pre_norms_f16_cuda(
+    mfq_tensor_backend::Tensor residual, mfq_tensor_backend::Tensor attn,
+    mfq_tensor_backend::Tensor attn_post_weight, mfq_tensor_backend::Tensor dense_pre_weight,
+    mfq_tensor_backend::Tensor router_weight, mfq_tensor_backend::Tensor moe_pre_weight, double eps);
+mfq_tensor_backend::Tensor gemma4_ffn_merge_f16_cuda(
+    mfq_tensor_backend::Tensor dense, mfq_tensor_backend::Tensor moe, mfq_tensor_backend::Tensor residual,
+    mfq_tensor_backend::Tensor dense_post_weight, mfq_tensor_backend::Tensor moe_post_weight,
+    mfq_tensor_backend::Tensor final_post_weight, mfq_tensor_backend::Tensor layer_scale, double eps);
+mfq_tensor_backend::Tensor glm_dsa_indexer_layer_norm_cuda(
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, mfq_tensor_backend::Tensor bias, double eps);

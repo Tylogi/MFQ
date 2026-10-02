@@ -2,7 +2,7 @@
 
 #include "sampling.h"
 #include "mfq/runtime.h"
-#include "mfq_cuda_ops.h"
+#include "mfq_cuda_sampling_ops.h"
 
 #include <cstddef>
 #include <cstdint>

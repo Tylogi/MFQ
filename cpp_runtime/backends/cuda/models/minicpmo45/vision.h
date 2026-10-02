@@ -5,7 +5,7 @@
 #include "models/minicpmo45/causal_lm.h"
 
 #include "ops.h"
-#include "mfq_cuda_ops.h"
+#include "mfq_tensor_backend.h"
 
 #include <algorithm>
 #include <array>

@@ -8,7 +8,7 @@
 #include "quant_linear.h"
 #include "cuda_execution.h"
 #include "storage/moe_expert_cache.h"
-#include "mfq_cuda_ops.h"
+#include "mfq_cuda_moe_ops.h"
 
 #include <cuda_runtime_api.h>
 

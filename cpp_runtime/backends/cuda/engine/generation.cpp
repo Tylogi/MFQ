@@ -11,7 +11,7 @@
 #include "core/full_block.h"
 #include "cuda_sampling.h"
 #include "storage/text_session_cache.h"
-#include "mfq_cuda_ops.h"
+#include "mfq_cuda_sampling_ops.h"
 
 #include <algorithm>
 #include <iostream>

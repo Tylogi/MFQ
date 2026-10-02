@@ -15,7 +15,7 @@
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"
 #include "mfq/kernels/cuda/deepseek_v41.h"
-#include "mfq_cuda_ops.h"
+#include "mfq_tensor_backend.h"
 
 #include <cuda_runtime_api.h>
 

@@ -1,4 +1,8 @@
 #pragma once
+#include "mfq_cuda_attention_ops.h"
+#include "mfq_cuda_cache_ops.h"
+#include "mfq_cuda_norm_ops.h"
+#include "mfq_cuda_quant_ops.h"
 #include "models/common/transformer_layer.h"
 #include "models/deepseek_v4/causal_lm.h"
 

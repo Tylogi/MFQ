@@ -1,4 +1,5 @@
 #pragma once
+#include "mfq_cuda_linear_attention_ops.h"
 #include "models/qwen4_exp/causal_lm.h"
 #include "models/qwen4_exp/ngram.h"
 #include "core/attention.h"

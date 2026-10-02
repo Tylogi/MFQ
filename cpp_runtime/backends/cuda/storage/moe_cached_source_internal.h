@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mfq_cuda_moe_ops.h"
 #include "moe_expert_cache_internal.h"
 
 struct MoeCachedCohort {

@@ -7,7 +7,7 @@
 #include "core/causal_model.h"
 #include "grid_vision.h"
 #include "mfq/runtime.h"
-#include "mfq_cuda_ops.h"
+#include "mfq_cuda_attention_ops.h"
 #include "mfq_paged_prefix_cache.h"
 
 #include <algorithm>

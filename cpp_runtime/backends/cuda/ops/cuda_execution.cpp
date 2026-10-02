@@ -1,6 +1,6 @@
 #include "cuda_execution.h"
 
-#include "mfq_cuda_ops.h"
+#include "mfq_cuda_quant_ops.h"
 
 #include <algorithm>
 #include <charconv>

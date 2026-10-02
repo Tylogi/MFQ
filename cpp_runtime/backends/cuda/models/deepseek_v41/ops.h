@@ -1,4 +1,5 @@
 #pragma once
+#include "mfq_cuda_norm_ops.h"
 #include "models/common/transformer_layer.h"
 #include "models/deepseek_v41/causal_lm.h"
 

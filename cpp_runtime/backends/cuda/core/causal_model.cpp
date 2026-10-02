@@ -1,3 +1,4 @@
+#include "mfq_cuda_sampling_ops.h"
 #include "storage/weight_loader.h"
 #include "core/causal_model.h"
 #include "core/full_block.h"

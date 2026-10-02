@@ -4,7 +4,9 @@
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"
 #include "mfq/kernels/cuda/deepseek_v41.h"
-#include "mfq_cuda_ops.h"
+#include "mfq_cuda_attention_ops.h"
+#include "mfq_cuda_moe_ops.h"
+#include "mfq_cuda_norm_ops.h"
 
 #include <cuda_runtime_api.h>
 

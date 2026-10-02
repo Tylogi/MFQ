@@ -1,3 +1,4 @@
+#include "mfq_cuda_norm_ops.h"
 #include "cuda_execution.h"
 #include "cuda_runtime_config.h"
 #include "cuda_sampling.h"

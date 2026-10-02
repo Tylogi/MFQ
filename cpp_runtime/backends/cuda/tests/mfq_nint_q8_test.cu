@@ -1,4 +1,4 @@
-#include "mfq_cuda_ops.h"
+#include "mfq_cuda_quant_ops.h"
 
 #include <cuda_runtime_api.h>
 #include <cstdint>

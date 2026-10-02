@@ -5,7 +5,7 @@
 #include "cuda_sampling.h"
 #include "generation_policy.h"
 #include "inference.h"
-#include "mfq_cuda_ops.h"
+#include "mfq_cuda_sampling_ops.h"
 #include "models/deepseek_v4/ops.h"
 #include "models/deepseek_v41/ops.h"
 #include "models/gemma4/ops.h"

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq_cuda_ops.h"
+#include "mfq_tensor_backend.h"
 #include "mfq/model_source.h"
 
 #include <cstdint>
