@@ -1873,3 +1873,408 @@ mfq_tensor_backend::Tensor quant_linear_reference_weight(
     if (linear.is_dense()) return linear.dense;
     throw std::runtime_error("unsupported linear reference format");
 }
+
+mfq_tensor_backend::Tensor QuantLinear::forward_tensor_parallel_flat(
+        CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor x,
+        MfqOptional<mfq_tensor_backend::Tensor> gate,
+        int gate_mode) const {
+    MFQ_RUNTIME_CHECK(
+        tensor_parallel(),
+        "tensor-parallel linear has no shards");
+    MFQ_RUNTIME_CHECK(
+        tensor_parallel_axis == TensorParallelAxis::Output ||
+        tensor_parallel_axis == TensorParallelAxis::Input,
+        "tensor-parallel linear has an invalid axis");
+    std::vector<mfq_tensor_backend::Tensor> local_outputs(
+        tensor_parallel_shards.size());
+    for (size_t launch_position = 0;
+         launch_position < tensor_parallel_shards.size();
+         ++launch_position) {
+        const size_t index = model_parallel_launch_index(
+            execution.config, launch_position, tensor_parallel_shards.size());
+        const auto & shard = tensor_parallel_shards[index];
+        MfqCudaGuard guard(shard.device);
+        mfq_tensor_backend::Tensor local_x = x;
+        mfq_tensor_backend::Tensor local_gate;
+        if (tensor_parallel_axis == TensorParallelAxis::Input) {
+            local_x = x.narrow(
+                -1, shard.input_begin,
+                shard.input_end - shard.input_begin);
+            if (gate.has_value()) {
+                local_gate = gate.value().narrow(
+                    -1, shard.input_begin,
+                    shard.input_end - shard.input_begin);
+            }
+        } else if (gate.has_value()) {
+            local_gate = gate.value();
+        }
+        local_x = tensor_to_cuda_device(
+            execution.model_parallel_collectives,
+            local_x, shard.device);
+        if (gate.has_value()) {
+            local_gate =
+                tensor_to_cuda_device(
+                    execution.model_parallel_collectives,
+                    local_gate, shard.device);
+        }
+        if (is_mxfp8() &&
+                tensor_parallel_axis == TensorParallelAxis::Input) {
+            MFQ_RUNTIME_CHECK(
+                !gate.has_value(),
+                "MXFP8 input-axis tensor parallelism does not support gating");
+            local_outputs[index] =
+                mxfp8_matmul_f32(
+                    execution.profiler, shard.mxfp8, local_x);
+        } else {
+            local_outputs[index] =
+                run_quant_linear_shard(
+                    execution.profiler, execution.kl_mmq,
+                    shard, local_x,
+                    gate.has_value()
+                        ? MfqOptional<mfq_tensor_backend::Tensor>(
+                            local_gate)
+                        : mfq_nullopt,
+                    gate_mode);
+        }
+    }
+
+    const int primary = model_parallel_primary_device(execution);
+    MfqCudaGuard primary_guard(primary);
+    if (tensor_parallel_axis == TensorParallelAxis::Output) {
+        std::vector<mfq_tensor_backend::Tensor> gathered;
+        gathered.reserve(local_outputs.size());
+        for (auto & output : local_outputs) {
+            gathered.push_back(
+                tensor_to_cuda_device(
+                    execution.model_parallel_collectives,
+                    output, primary));
+        }
+        return mfq_tensor_backend::cat(gathered, -1).contiguous();
+    }
+
+    auto reduced = reduce_model_parallel_outputs(
+        execution, std::move(local_outputs));
+    return is_mxfp8()
+        ? reduced.to(x.scalar_type()).contiguous()
+        : reduced;
+}
+
+mfq_tensor_backend::Tensor QuantLinear::forward_dense(mfq_tensor_backend::Tensor x) const {
+    auto input = x.to(dense.scalar_type());
+    const int64_t rows = input.numel() / input.size(-1);
+    if (dense_small_m_rowwise && rows > 1 && rows <= 6) {
+        auto shape = input.sizes().vec();
+        shape.back() = dense.size(0);
+        // Native matmul issues the same M=1 cuBLAS operation per row.
+        return mfq_tensor_backend::matmul(
+            input.reshape({rows, 1, input.size(-1)}), dense.transpose(0, 1))
+            .reshape(shape);
+    }
+    return mfq_tensor_backend::matmul(input, dense.transpose(0, 1));
+}
+
+mfq_tensor_backend::Tensor QuantLinear::forward(
+        CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor x) const {
+    if (tensor_parallel() || is_nint() || is_nvq()) {
+        auto shape = x.sizes().vec();
+        auto flat = x.reshape({-1, x.size(-1)});
+        auto y = tensor_parallel()
+            ? forward_tensor_parallel_flat(execution, flat, mfq_nullopt, 0)
+            : is_nint() ? run_nint_linear(
+                  execution.profiler, execution.kl_mmq, nint, flat)
+                        : run_nvq_linear(
+                  execution.profiler, execution.kl_mmq, nvq, flat);
+        shape.back() = y.size(-1);
+        return y.reshape(shape);
+    }
+    if (is_mxfp4()) return mxfp4.forward(x);
+    if (is_mxfp4_sq()) return mxfp4_sq.forward(x);
+    if (is_fp8_sq()) return fp8_sq.forward(x);
+    if (is_dense()) return forward_dense(x);
+    return mxfp8.forward(execution.profiler, x);
+}
+
+mfq_tensor_backend::Tensor QuantLinear::forward_bf16_output(
+        CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor x) const {
+    return forward(execution, x)
+        .to(mfq_tensor_backend::kBFloat16).contiguous();
+}
+
+mfq_tensor_backend::Tensor QuantLinear::forward_mxfp8_groupwise(
+        CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor grouped,
+        int64_t groups) const {
+    MFQ_RUNTIME_CHECK(
+        is_mxfp8(),
+        "groupwise MXFP8 projection requires an MXFP8 tensor");
+    if (!tensor_parallel()) {
+        return mxfp8_groupwise_matmul(
+            execution.profiler, mxfp8.weight, grouped, groups);
+    }
+    MFQ_RUNTIME_CHECK(
+        tensor_parallel_axis == TensorParallelAxis::Input,
+        "groupwise MXFP8 tensor parallelism requires input-axis shards");
+    std::vector<mfq_tensor_backend::Tensor> partials;
+    partials.reserve(tensor_parallel_shards.size());
+    for (const auto & shard : tensor_parallel_shards) {
+        MFQ_RUNTIME_CHECK(
+            shard.kind == QuantLinearKind::Mxfp8,
+            "groupwise MXFP8 tensor-parallel shard kind mismatch");
+        MfqCudaGuard guard(shard.device);
+        auto local = grouped.narrow(
+            -1, shard.input_begin,
+            shard.input_end - shard.input_begin);
+        local = tensor_to_cuda_device(
+            execution.model_parallel_collectives,
+            local, shard.device);
+        partials.push_back(mxfp8_groupwise_matmul_f32(
+            execution.profiler, shard.mxfp8, local, groups));
+    }
+    return reduce_model_parallel_outputs(execution, std::move(partials))
+        .to(grouped.scalar_type()).contiguous();
+}
+
+mfq_tensor_backend::Tensor QuantLinear::forward_input_mul(
+        CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor gate,
+        int mode) const {
+    if (tensor_parallel() || is_nint() || is_nvq()) {
+        auto shape = x.sizes().vec();
+        auto flat = x.reshape({-1, x.size(-1)});
+        auto flat_gate = gate.reshape({-1, gate.size(-1)});
+        auto y = tensor_parallel()
+            ? forward_tensor_parallel_flat(execution, flat, flat_gate, mode)
+            : is_nint() ? run_nint_linear(
+                  execution.profiler, execution.kl_mmq,
+                  nint, flat, flat_gate, mode)
+                        : run_nvq_linear(
+                  execution.profiler, execution.kl_mmq,
+                  nvq, flat, flat_gate, mode);
+        shape.back() = y.size(-1);
+        return y.reshape(shape);
+    }
+    if (is_dense()) {
+        MFQ_RUNTIME_CHECK(mode == 1 || mode == 2,
+            "dense input gate mode must be sigmoid or SiLU");
+        // Match the existing dense shard path, including dtype rounding.
+        auto local = x.to(dense.scalar_type());
+        auto local_gate = gate.to(dense.scalar_type());
+        auto gated = mode == 1
+            ? local * mfq_tensor_backend::sigmoid(local_gate)
+            : local * mfq_tensor_backend::silu(local_gate);
+        return forward_dense(gated);
+    }
+    MFQ_RUNTIME_CHECK(mode == 1 || mode == 2,
+        "input gate mode must be sigmoid or SiLU");
+    auto local_gate = gate.to(x.scalar_type());
+    auto gated = mode == 1
+        ? x * mfq_tensor_backend::sigmoid(local_gate)
+        : x * mfq_tensor_backend::silu(local_gate);
+    return forward(execution, gated);
+}
+
+mfq_tensor_backend::Tensor QuantLinear::forward_input_mul_f32_kld(
+        CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor gate,
+        int mode) const {
+    MFQ_RUNTIME_CHECK(
+        !tensor_parallel() && is_nint(),
+        "FP32-output KLD down projection requires a local NINT tensor");
+    MFQ_RUNTIME_CHECK(
+        execution.kl_mmq.mode == KlMmqMode::Fp16,
+        "FP32-output NINT MMQ is restricted to the FP16 KLD path");
+    auto shape = x.sizes().vec();
+    auto y = nint_matmul_input_mul_f32(
+        execution.profiler, nint, x.reshape({-1, x.size(-1)}),
+        gate.reshape({-1, gate.size(-1)}), mode);
+    if (nint.q8_zero) ++execution.kl_mmq.dense_calls;
+    shape.back() = y.size(-1);
+    return y.reshape(shape);
+}
+
+int64_t QuantLinear::out() const {
+    if (tensor_parallel()) return logical_out;
+    if (is_nint()) return nint.out;
+    if (is_nvq()) return nvq.out;
+    if (is_mxfp4()) return mxfp4.weight.out;
+    if (is_mxfp4_sq()) return mxfp4_sq.weight.out;
+    if (is_fp8_sq()) return fp8_sq.weight.out;
+    if (is_dense()) return dense.size(0);
+    return mxfp8.weight.out;
+}
+
+int64_t QuantLinear::neuron_len() const {
+    if (tensor_parallel()) return logical_neuron_len;
+    if (is_nint()) return nint.neuron_len;
+    if (is_nvq()) return nvq.neuron_len;
+    if (is_mxfp4()) return mxfp4.weight.neuron_len;
+    if (is_mxfp4_sq()) return mxfp4_sq.weight.neuron_len;
+    if (is_fp8_sq()) return fp8_sq.weight.neuron_len;
+    if (is_dense()) return dense.size(1);
+    return mxfp8.weight.neuron_len;
+}
+
+QuantLinearProjectionRefs QuantLinearGroup::tensor_parallel_output_projections() const {
+    QuantLinearProjectionRefs projections;
+    projections.reserve(layers.size());
+    for (const auto & layer : layers) {
+        projections.push_back(&layer);
+    }
+    return projections;
+}
+
+bool QuantLinearGroup::tensor_parallel_output_compatible() const {
+    return tensor_parallel_output_projections_compatible(
+        tensor_parallel_output_projections());
+}
+
+std::vector<mfq_tensor_backend::Tensor>
+QuantLinearGroup::forward_tensor_parallel_output_group(
+        CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor x) const {
+    return forward_tensor_parallel_output_projections(
+        execution, x, tensor_parallel_output_projections());
+}
+
+std::vector<mfq_tensor_backend::Tensor> QuantLinearGroup::forward(
+        CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor x) const {
+    const bool default_mmq =
+        execution.kl_mmq.mode == KlMmqMode::Default;
+    if (!x.is_cuda()) {
+        MFQ_RUNTIME_CHECK(
+            !nint_grouped,
+            "CPU dense offload requires separate compact linear weights");
+        std::vector<mfq_tensor_backend::Tensor> result;
+        result.reserve(layers.size());
+        for (const auto & layer : layers) {
+            result.push_back(layer.forward(execution, x));
+        }
+        return result;
+    }
+    if (execution.config.tensor_parallel_grouped_projections &&
+            tensor_parallel_output_compatible()) {
+        return forward_tensor_parallel_output_group(execution, x);
+    }
+    if (nint_grouped) {
+        return nint.forward(
+            execution.profiler, execution.kl_mmq,
+            execution.config, execution.decode_graph_serial_branches, x);
+    }
+    if (default_mmq && nvq_prefix2 && nvq_fusion_enabled(execution.config)) {
+        auto shape = x.sizes().vec();
+        const auto flat =
+            x.reshape({-1, x.size(-1)});
+        std::vector<mfq_tensor_backend::Tensor> branch_outputs;
+        const bool parallel =
+            decode_branch_parallel &&
+            decode_branch_parallel_enabled(
+                execution.config, execution.decode_graph_serial_branches, flat.size(0)) &&
+            layers.size() > 2 &&
+            branch_executor->run(
+                layers.size() - 1,
+                [&](size_t branch) {
+                    if (branch == 0) {
+                        return nvq_matmul_multi2(
+                            execution.profiler, layers[0].nvq,
+                            layers[1].nvq, flat);
+                    }
+                    return layers[branch + 1].forward(execution, x);
+                },
+                branch_outputs);
+        auto combined = parallel
+            ? branch_outputs[0]
+            : nvq_matmul_multi2(
+                execution.profiler, layers[0].nvq,
+                layers[1].nvq, flat);
+        auto pair = combined.split_with_sizes({outs[0], outs[1]}, -1);
+        std::vector<mfq_tensor_backend::Tensor> result;
+        result.reserve(layers.size());
+        for (size_t i = 0; i < 2; ++i) {
+            auto part_shape = shape;
+            part_shape.back() = outs[i];
+            result.push_back(pair[i].reshape(part_shape));
+        }
+        for (size_t i = 2; i < layers.size(); ++i) {
+            result.push_back(
+                parallel
+                    ? branch_outputs[i - 1]
+                    : layers[i].forward(execution, x));
+        }
+        return result;
+    }
+    std::vector<mfq_tensor_backend::Tensor> result;
+    if (default_mmq && decode_branch_parallel &&
+            decode_branch_parallel_enabled(
+                execution.config, execution.decode_graph_serial_branches, x.numel() / x.size(-1)) &&
+            branch_executor->run(
+                layers.size(),
+                [&](size_t index) {
+                    return layers[index].forward(execution, x);
+                },
+                result)) {
+        return result;
+    }
+    result.reserve(layers.size());
+    for (const auto & layer : layers) {
+        result.push_back(layer.forward(execution, x));
+    }
+    return result;
+}
+
+mfq_tensor_backend::Tensor QuantLinearGroup::forward_swiglu(
+        CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor x) const {
+    const bool default_mmq =
+        execution.kl_mmq.mode == KlMmqMode::Default;
+    if (default_mmq && nint_grouped && nint.split_w.empty() &&
+            x.numel() / x.size(-1) >= 1 && x.numel() / x.size(-1) <= 6) {
+        return nint.forward_swiglu(execution.profiler, x);
+    }
+    if (default_mmq && nvq_prefix2 && layers.size() == 2 &&
+            nvq_fusion_enabled(execution.config)) {
+        auto shape = x.sizes().vec();
+        auto y = nvq_matmul_swiglu(
+            execution.profiler, layers[0].nvq, layers[1].nvq,
+            x.reshape({-1, x.size(-1)}));
+        shape.back() = y.size(-1);
+        return y.reshape(shape);
+    }
+    if (outs.size() != 2 || outs[0] != outs[1]) {
+        throw std::runtime_error("SwiGLU requires equal gate/up output widths");
+    }
+    auto parts = forward(execution, x);
+    return mfq_tensor_backend::silu(parts[0]) * parts[1];
+}
+
+mfq_tensor_backend::Tensor QuantLinearGroup::forward_geglu(
+        CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor x) const {
+    if (execution.kl_mmq.mode == KlMmqMode::Default &&
+            nint_grouped && nint.split_w.empty() &&
+            x.numel() / x.size(-1) == 1) {
+        return nint.forward_geglu(execution.profiler, x);
+    }
+    if (outs.size() != 2 || outs[0] != outs[1]) {
+        throw std::runtime_error("GeGLU requires equal gate/up output widths");
+    }
+    auto parts = forward(execution, x);
+    return gelu_mul_cuda(parts[0].contiguous(), parts[1].contiguous());
+}
+
+std::vector<mfq_tensor_backend::Tensor> DenseLinearGroup::forward(mfq_tensor_backend::Tensor x) const {
+    auto shape = x.sizes().vec();
+    auto y = mfq_tensor_backend::matmul(x.reshape({-1, x.size(-1)}).to(mfq_tensor_backend::kFloat32), w.transpose(0, 1));
+    auto parts = y.split_with_sizes(outs, -1);
+    for (auto & p : parts) {
+        auto s = shape;
+        s.back() = p.size(-1);
+        p = p.reshape(s);
+    }
+    return parts;
+}

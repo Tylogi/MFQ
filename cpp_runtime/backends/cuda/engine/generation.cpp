@@ -2,6 +2,7 @@
 
 #include "inference.h"
 #include "models/causal_models.h"
+#include "models/full_block.h"
 #include "cuda_sampling.h"
 #include "text_session_cache.h"
 #include "mtp.h"

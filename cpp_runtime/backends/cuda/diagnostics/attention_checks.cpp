@@ -1,7 +1,6 @@
 #include "model_checks.h"
 
 #include "models/deepseek_v4/causal_lm.h"
-#include "models/transformer.h"
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"
 #include "mfq/kernels/cuda/deepseek_v41.h"

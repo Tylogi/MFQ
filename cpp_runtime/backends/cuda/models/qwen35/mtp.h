@@ -1,6 +1,7 @@
 #pragma once
 
 #include "causal_lm.h"
+#include "models/full_block.h"
 
 // Qwen3.5's predictor shares the main embedding/output head and owns only
 // its fusion/norm/attention/FFN weights and an independent attention history.

@@ -15,168 +15,31 @@ struct QuantLinearGroup {
         branch_executor =
             std::make_shared<CudaIndependentBranchExecutor>();
 
-    QuantLinearProjectionRefs tensor_parallel_output_projections() const {
-        QuantLinearProjectionRefs projections;
-        projections.reserve(layers.size());
-        for (const auto & layer : layers) {
-            projections.push_back(&layer);
-        }
-        return projections;
-    }
+    QuantLinearProjectionRefs tensor_parallel_output_projections() const;
 
-    bool tensor_parallel_output_compatible() const {
-        return tensor_parallel_output_projections_compatible(
-            tensor_parallel_output_projections());
-    }
+    bool tensor_parallel_output_compatible() const;
 
     std::vector<mfq_tensor_backend::Tensor>
     forward_tensor_parallel_output_group(
             CudaExecutionContext& execution,
-            mfq_tensor_backend::Tensor x) const {
-        return forward_tensor_parallel_output_projections(
-            execution, x, tensor_parallel_output_projections());
-    }
+            mfq_tensor_backend::Tensor x) const;
 
     std::vector<mfq_tensor_backend::Tensor> forward(
             CudaExecutionContext& execution,
-            mfq_tensor_backend::Tensor x) const {
-        const bool default_mmq =
-            execution.kl_mmq.mode == KlMmqMode::Default;
-        if (!x.is_cuda()) {
-            MFQ_RUNTIME_CHECK(
-                !nint_grouped,
-                "CPU dense offload requires separate compact linear weights");
-            std::vector<mfq_tensor_backend::Tensor> result;
-            result.reserve(layers.size());
-            for (const auto & layer : layers) {
-                result.push_back(layer.forward(execution, x));
-            }
-            return result;
-        }
-        if (execution.config.tensor_parallel_grouped_projections &&
-                tensor_parallel_output_compatible()) {
-            return forward_tensor_parallel_output_group(execution, x);
-        }
-        if (nint_grouped) {
-            return nint.forward(
-                execution.profiler, execution.kl_mmq,
-                execution.config, execution.decode_graph_serial_branches, x);
-        }
-        if (default_mmq && nvq_prefix2 && nvq_fusion_enabled(execution.config)) {
-            auto shape = x.sizes().vec();
-            const auto flat =
-                x.reshape({-1, x.size(-1)});
-            std::vector<mfq_tensor_backend::Tensor> branch_outputs;
-            const bool parallel =
-                decode_branch_parallel &&
-                decode_branch_parallel_enabled(
-                    execution.config, execution.decode_graph_serial_branches, flat.size(0)) &&
-                layers.size() > 2 &&
-                branch_executor->run(
-                    layers.size() - 1,
-                    [&](size_t branch) {
-                        if (branch == 0) {
-                            return nvq_matmul_multi2(
-                                execution.profiler, layers[0].nvq,
-                                layers[1].nvq, flat);
-                        }
-                        return layers[branch + 1].forward(execution, x);
-                    },
-                    branch_outputs);
-            auto combined = parallel
-                ? branch_outputs[0]
-                : nvq_matmul_multi2(
-                    execution.profiler, layers[0].nvq,
-                    layers[1].nvq, flat);
-            auto pair = combined.split_with_sizes({outs[0], outs[1]}, -1);
-            std::vector<mfq_tensor_backend::Tensor> result;
-            result.reserve(layers.size());
-            for (size_t i = 0; i < 2; ++i) {
-                auto part_shape = shape;
-                part_shape.back() = outs[i];
-                result.push_back(pair[i].reshape(part_shape));
-            }
-            for (size_t i = 2; i < layers.size(); ++i) {
-                result.push_back(
-                    parallel
-                        ? branch_outputs[i - 1]
-                        : layers[i].forward(execution, x));
-            }
-            return result;
-        }
-        std::vector<mfq_tensor_backend::Tensor> result;
-        if (default_mmq && decode_branch_parallel &&
-                decode_branch_parallel_enabled(
-                    execution.config, execution.decode_graph_serial_branches, x.numel() / x.size(-1)) &&
-                branch_executor->run(
-                    layers.size(),
-                    [&](size_t index) {
-                        return layers[index].forward(execution, x);
-                    },
-                    result)) {
-            return result;
-        }
-        result.reserve(layers.size());
-        for (const auto & layer : layers) {
-            result.push_back(layer.forward(execution, x));
-        }
-        return result;
-    }
+            mfq_tensor_backend::Tensor x) const;
     mfq_tensor_backend::Tensor forward_swiglu(
             CudaExecutionContext& execution,
-            mfq_tensor_backend::Tensor x) const {
-        const bool default_mmq =
-            execution.kl_mmq.mode == KlMmqMode::Default;
-        if (default_mmq && nint_grouped && nint.split_w.empty() &&
-                x.numel() / x.size(-1) >= 1 && x.numel() / x.size(-1) <= 6) {
-            return nint.forward_swiglu(execution.profiler, x);
-        }
-        if (default_mmq && nvq_prefix2 && layers.size() == 2 &&
-                nvq_fusion_enabled(execution.config)) {
-            auto shape = x.sizes().vec();
-            auto y = nvq_matmul_swiglu(
-                execution.profiler, layers[0].nvq, layers[1].nvq,
-                x.reshape({-1, x.size(-1)}));
-            shape.back() = y.size(-1);
-            return y.reshape(shape);
-        }
-        if (outs.size() != 2 || outs[0] != outs[1]) {
-            throw std::runtime_error("SwiGLU requires equal gate/up output widths");
-        }
-        auto parts = forward(execution, x);
-        return mfq_tensor_backend::silu(parts[0]) * parts[1];
-    }
+            mfq_tensor_backend::Tensor x) const;
     mfq_tensor_backend::Tensor forward_geglu(
             CudaExecutionContext& execution,
-            mfq_tensor_backend::Tensor x) const {
-        if (execution.kl_mmq.mode == KlMmqMode::Default &&
-                nint_grouped && nint.split_w.empty() &&
-                x.numel() / x.size(-1) == 1) {
-            return nint.forward_geglu(execution.profiler, x);
-        }
-        if (outs.size() != 2 || outs[0] != outs[1]) {
-            throw std::runtime_error("GeGLU requires equal gate/up output widths");
-        }
-        auto parts = forward(execution, x);
-        return gelu_mul_cuda(parts[0].contiguous(), parts[1].contiguous());
-    }
+            mfq_tensor_backend::Tensor x) const;
 };
 
 struct DenseLinearGroup {
     mfq_tensor_backend::Tensor w;
     std::vector<int64_t> outs;
 
-    std::vector<mfq_tensor_backend::Tensor> forward(mfq_tensor_backend::Tensor x) const {
-        auto shape = x.sizes().vec();
-        auto y = mfq_tensor_backend::matmul(x.reshape({-1, x.size(-1)}).to(mfq_tensor_backend::kFloat32), w.transpose(0, 1));
-        auto parts = y.split_with_sizes(outs, -1);
-        for (auto & p : parts) {
-            auto s = shape;
-            s.back() = p.size(-1);
-            p = p.reshape(s);
-        }
-        return parts;
-    }
+    std::vector<mfq_tensor_backend::Tensor> forward(mfq_tensor_backend::Tensor x) const;
 };
 
 bool has_tensor(const mfq::ModelSource& source, std::string_view name) noexcept;

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../causal_lm.h"
-#include "models/transformer.h"
+#include "models/ffn.h"
 #include "../deepseek_v4/causal_lm.h"
 #include "engram.h"
 #include "dspark.h"
@@ -14,6 +14,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <string>

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "models/transformer.h"
+#include "quant_linear.h"
 #include "models/include/deepseek_v41.h"
 #include "mfe_expert_store.h"
 

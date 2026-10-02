@@ -1,6 +1,7 @@
 #pragma once
 
-#include "models/transformer.h"
+#include "models/block.h"
+#include "quant_linear.h"
 #include "cuda_model_plan.h"
 
 #include <cstdint>

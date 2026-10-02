@@ -1,6 +1,8 @@
 #pragma once
 
 #include "audio.h"
+#include "models/full_block.h"
+#include "models/transformer.h"
 
 struct MiniCPMO45TtsDecoder {
     CudaExecutionContext* execution = nullptr;

@@ -1,6 +1,7 @@
 #pragma once
 
-#include "models/transformer.h"
+#include "quant_linear.h"
+#include "mfe_weight.h"
 #include "storage/moe_expert_cache.h"
 #include "models/include/glm5_next.h"
 #include "runtime.h"

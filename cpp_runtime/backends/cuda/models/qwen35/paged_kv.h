@@ -1,6 +1,7 @@
 #pragma once
 
 #include "paged_kv_allocator.h"
+#include "models/full_block.h"
 
 #include <cuda_runtime_api.h>
 

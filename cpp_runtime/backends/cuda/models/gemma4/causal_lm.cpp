@@ -1,12 +1,260 @@
 #include "causal_lm.h"
 #include "../causal_lm_impl.h"
 
-#include "models/transformer.h"
+#include "models/full_block.h"
 
 #include <bit>
 #include <cmath>
 
 namespace mfq::cuda::gemma4 {
+
+struct Gemma4Block final : ::FullBlock {
+    bool gemma4_moe = false;
+    mfq_tensor_backend::Tensor attn_post_norm;
+    mfq_tensor_backend::Tensor ffn_post_norm;
+    mfq_tensor_backend::Tensor ffn_post_norm_1;
+    mfq_tensor_backend::Tensor ffn_pre_norm_2;
+    mfq_tensor_backend::Tensor ffn_post_norm_2;
+    mfq_tensor_backend::Tensor layer_scale;
+    MfeWeight gemma_moe_gate_up;
+    MfeWeight gemma_moe_down;
+    mfq_tensor_backend::Tensor gemma_router;
+    mfq_tensor_backend::Tensor gemma_router_norm_scale;
+    mfq_tensor_backend::Tensor gemma_expert_scale;
+    int gemma_top_k = 0;
+
+    mfq_tensor_backend::Tensor forward_ffn(
+        CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor residual,
+        mfq_tensor_backend::Tensor attention_output,
+        int64_t batch,
+        int64_t tokens,
+        int64_t hidden) override;
+};
+
+static mfq_tensor_backend::Tensor gemma_rms_norm_f16(
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor weight,
+        double eps,
+        double weight_offset) {
+    MFQ_RUNTIME_CHECK(
+        x.scalar_type() == mfq_tensor_backend::kFloat16,
+        "gemma_rms_norm_f16: activation must remain f16");
+    return rms_norm_f16_cuda(
+        x.contiguous(), weight, eps, weight_offset);
+}
+
+mfq_tensor_backend::Tensor Gemma4Block::forward_ffn(
+        CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor residual,
+        mfq_tensor_backend::Tensor oo,
+        int64_t B,
+        int64_t T,
+        int64_t H) {
+    auto& profiler = execution.profiler;
+    mfq_tensor_backend::Tensor x;
+    trace_gemma_stage(execution, layer, "attention_output", oo);
+    const bool fused_norms = gemma4_moe &&
+        execution.config.gemma4_fused_norms &&
+        execution.gemma_stage_trace == nullptr &&
+        layer_scale.defined();
+    mfq_tensor_backend::Tensor dense_input;
+    mfq_tensor_backend::Tensor router_input;
+    mfq_tensor_backend::Tensor moe_input;
+    if (fused_norms) {
+        auto prepared = profiler.measure("gemma.attn_residual_pre_norms", [&]() {
+            return gemma4_attn_residual_pre_norms_f16_cuda(
+                residual.reshape({B * T, H}), oo.reshape({B * T, H}),
+                attn_post_norm, ffn_norm, gemma_router_norm_scale,
+                ffn_pre_norm_2, rms_norm_eps);
+        });
+        x = prepared[0].reshape({B, T, H});
+        residual = x;
+        dense_input = prepared[1];
+        router_input = prepared[2];
+        moe_input = prepared[3];
+    } else {
+        auto attn_post = profiler.measure("gemma.attn_post_norm", [&]() {
+            return gemma_rms_norm_f16(
+                oo.reshape({B * T, H}), attn_post_norm,
+                rms_norm_eps, norm_weight_offset);
+        });
+        x = profiler.measure("gemma.attn_residual", [&]() {
+            return acc_cuda(residual.reshape({B * T, H}), attn_post).reshape({B, T, H});
+        });
+        trace_gemma_stage(
+            execution, layer, "attention_residual", x);
+        residual = x;
+        dense_input = profiler.measure("gemma.ffn_pre_norm", [&]() {
+            return gemma_rms_norm_f16(
+                x.reshape({B * T, H}), ffn_norm,
+                rms_norm_eps, norm_weight_offset);
+        });
+        if (gemma4_moe) {
+            router_input = profiler.measure("gemma.router_norm", [&]() {
+                return qwen_rms_norm(
+                    x.reshape({B * T, H})
+                        .to(mfq_tensor_backend::kFloat32),
+                    gemma_router_norm_scale,
+                    rms_norm_eps, norm_weight_offset);
+            });
+            moe_input = profiler.measure("gemma.ffn_pre_norm_2", [&]() {
+                return gemma_rms_norm_f16(
+                    x.reshape({B * T, H}), ffn_pre_norm_2,
+                    rms_norm_eps, norm_weight_offset);
+            });
+        }
+    }
+    auto dense_output = profiler.measure("gemma.ffn_dense", [&]() {
+        return ffn.forward(execution, dense_input)
+            .reshape({B * T, H});
+    });
+    if (!gemma4_moe) {
+        auto dense_post = profiler.measure("gemma.ffn_post_norm", [&]() {
+            return dense_output.scalar_type() == mfq_tensor_backend::kFloat16
+                ? gemma_rms_norm_f16(
+                    dense_output, ffn_post_norm,
+                    rms_norm_eps, norm_weight_offset)
+                : qwen_rms_norm(
+                    dense_output.to(mfq_tensor_backend::kFloat32),
+                    ffn_post_norm,
+                    rms_norm_eps, norm_weight_offset)
+                    .to(mfq_tensor_backend::kFloat16)
+                    .contiguous();
+        });
+        auto result = profiler.measure("gemma.ffn_residual", [&]() {
+            return acc_cuda(
+                residual.reshape({B * T, H}), dense_post)
+                .reshape({B, T, H});
+        });
+        if (layer_scale.defined()) {
+            result = profiler.measure("gemma.layer_scale", [&]() {
+                return result * layer_scale;
+            });
+        }
+        trace_gemma_stage(
+            execution, layer, "layer_output", result);
+        return result;
+    }
+    if (!fused_norms) {
+        dense_output = profiler.measure("gemma.ffn_post_norm_1", [&]() {
+            return gemma_rms_norm_f16(
+                dense_output, ffn_post_norm_1,
+                rms_norm_eps, norm_weight_offset);
+        });
+        trace_gemma_stage(
+            execution, layer, "dense_output", dense_output);
+    }
+    auto router_logits = profiler.measure("gemma.router", [&]() {
+        return mfq_tensor_backend::matmul(router_input, gemma_router.transpose(0, 1));
+    });
+    auto selected = profiler.measure("gemma.topk", [&]() {
+        return moe_topk_cuda(
+            router_logits.contiguous(), gemma_top_k,
+            false, false, false, true, mfq_nullopt, 1e-20, 1.0);
+    });
+    trace_gemma_stage(
+        execution, layer, "route_ids", selected.at(0));
+    trace_gemma_stage(
+        execution, layer, "route_weights_before_scale", selected.at(1));
+    profiler.measure("gemma.route_scale", [&]() {
+        return moe_apply_expert_scale_cuda(
+            selected.at(1), selected.at(0), gemma_expert_scale);
+    });
+    trace_gemma_stage(
+        execution, layer, "route_weights", selected.at(1));
+    auto route = profiler.measure("gemma.route_map", [&]() {
+        return build_moe_route_plan(selected.at(0), gemma_moe_gate_up.n_experts);
+    });
+    const bool projection_bundle_prefetched =
+        prefetch_cached_moe_projection_bundle(
+            gemma_moe_gate_up, gemma_moe_down, route);
+    mfq_tensor_backend::Tensor down_pair;
+    const bool tracing_layer =
+        execution.gemma_stage_trace != nullptr &&
+        layer == execution.gemma_trace_layer;
+    if (!tracing_layer &&
+            gemma_moe_gate_up
+                .supports_projection_glu_epilogue()) {
+        auto moe_hidden = profiler.measure("gemma.moe_gate_up_geglu", [&]() {
+            return gemma_moe_gate_up.forward_glu_output(
+                execution, moe_input, route, true);
+        });
+        if (!projection_bundle_prefetched) {
+            gemma_moe_down.prefetch(route);
+        }
+        down_pair = profiler.measure("gemma.moe_down", [&]() {
+            return gemma_moe_down.forward(
+                execution, moe_hidden, route);
+        });
+    } else {
+        auto gate_up_pair = profiler.measure("gemma.moe_gate_up", [&]() {
+            return gemma_moe_gate_up.forward(
+                execution, moe_input, route);
+        });
+        if (!projection_bundle_prefetched) {
+            gemma_moe_down.prefetch(route);
+        }
+        trace_gemma_stage(
+            execution, layer, "moe_gate_up", gate_up_pair);
+        if (tracing_layer || gate_up_pair.size(0) > 4) {
+            auto moe_hidden = profiler.measure("gemma.moe_geglu", [&]() {
+                return moe_geglu_split_cuda(gate_up_pair);
+            });
+            if (tracing_layer) {
+                trace_gemma_stage(
+                    execution, layer, "moe_hidden", moe_hidden);
+            }
+            down_pair = profiler.measure("gemma.moe_down", [&]() {
+                return gemma_moe_down.forward(
+                    execution, moe_hidden, route);
+            });
+        } else {
+            down_pair = profiler.measure("gemma.moe_geglu_down", [&]() {
+                return gemma_moe_down.forward_geglu(
+                    execution, gate_up_pair, route);
+            });
+        }
+    }
+    trace_gemma_stage(execution, layer, "moe_down", down_pair);
+    auto moe_output = profiler.measure("gemma.moe_reduce", [&]() {
+        return moe_weighted_reduce_cuda(down_pair, selected.at(1));
+    });
+    trace_gemma_stage(execution, layer, "moe_reduce", moe_output);
+    if (fused_norms) {
+        auto result = profiler.measure("gemma.ffn_merge", [&]() {
+            return gemma4_ffn_merge_f16_cuda(
+                dense_output, moe_output, residual.reshape({B * T, H}),
+                ffn_post_norm_1, ffn_post_norm_2, ffn_post_norm,
+                layer_scale, rms_norm_eps).reshape({B, T, H});
+        });
+        return result;
+    }
+    moe_output = profiler.measure("gemma.ffn_post_norm_2", [&]() {
+        return gemma_rms_norm_f16(
+            moe_output, ffn_post_norm_2,
+            rms_norm_eps, norm_weight_offset);
+    });
+    auto combined = profiler.measure("gemma.ffn_combine", [&]() {
+        return dense_output + moe_output;
+    });
+    auto post = profiler.measure("gemma.ffn_post_norm", [&]() {
+        return gemma_rms_norm_f16(
+            combined, ffn_post_norm,
+            rms_norm_eps, norm_weight_offset);
+    });
+    auto result = profiler.measure("gemma.ffn_residual", [&]() {
+        return acc_cuda(residual.reshape({B * T, H}), post).reshape({B, T, H});
+    });
+    if (layer_scale.defined()) {
+        result = profiler.measure("gemma.layer_scale", [&]() {
+            return result * layer_scale;
+        });
+    }
+    trace_gemma_stage(
+        execution, layer, "layer_output", result);
+    return result;
+}
 
 std::unique_ptr<::Block> load_block(
         CudaExecutionContext& execution,
@@ -21,9 +269,8 @@ std::unique_ptr<::Block> load_block(
         const std::string lp =
             "model.block." + std::to_string(i) + ".";
         const std::string ap = lp + "attention.";
-        auto b = std::make_unique<FullBlock>();
+        auto b = std::make_unique<Gemma4Block>();
         b->layer = i;
-        b->gemma4 = true;
         b->gemma4_moe = c.num_experts > 0;
         b->max_position_embeddings = c.max_position_embeddings;
         b->rms_norm_eps = c.rms_norm_eps;

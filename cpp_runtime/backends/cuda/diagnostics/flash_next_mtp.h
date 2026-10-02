@@ -1,5 +1,11 @@
 #pragma once
 
+#include "nlohmann/json.hpp"
+
+#include <cstdint>
+#include <utility>
+#include <vector>
+
 // Architecture-specific CLI diagnostics. Production generation uses the
 // common MtpModule path and does not depend on these concrete types.
 

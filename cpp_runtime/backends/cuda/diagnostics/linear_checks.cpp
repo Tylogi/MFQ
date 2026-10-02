@@ -3,7 +3,6 @@
 #include "../models/registry.h"
 #include "quant_linear.h"
 #include "cuda_execution.h"
-#include "models/transformer.h"
 #include "mfq_cuda_ops.h"
 
 #include <cuda_runtime_api.h>
@@ -23,6 +22,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+using mfq_tensor_backend::indexing::Slice;
 
 int run_linear_check(
     CudaExecutionContext& execution,

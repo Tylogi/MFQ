@@ -1,7 +1,8 @@
 #pragma once
 
 #include "../causal_lm.h"
-#include "models/transformer.h"
+#include "models/block.h"
+#include "models/ffn.h"
 #include "models/include/glm_dsa.h"
 
 #include <memory>

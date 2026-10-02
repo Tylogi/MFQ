@@ -2,7 +2,8 @@
 
 #include "../causal_lm.h"
 #include "../full_attention_session_codec.h"
-#include "models/transformer.h"
+#include "models/block.h"
+#include "quant_linear.h"
 #include "models/include/minicpmo45.h"
 #include "mfq_cuda_ops.h"
 #include "inference.h"

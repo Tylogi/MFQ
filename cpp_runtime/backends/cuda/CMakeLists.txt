@@ -37,7 +37,13 @@ add_library(mfq-cuda-core STATIC
     ${MFQ_CUDA_ROOT}/src/mfq_cuda_context.cu
     ${MFQ_CUDA_ROOT}/src/mfq_native_tensor.cpp
     ${MFQ_CUDA_ROOT}/src/mfq_native_tensor.cu
+    ${MFQ_CUDA_ROOT}/src/mfq_native_tensor_blas.cu
+    ${MFQ_CUDA_ROOT}/src/mfq_native_tensor_creation.cu
+    ${MFQ_CUDA_ROOT}/src/mfq_native_tensor_indexing.cu
     ${MFQ_CUDA_ROOT}/src/mfq_native_tensor_ops.cu
+    ${MFQ_CUDA_ROOT}/src/mfq_native_tensor_reduction.cu
+    ${MFQ_CUDA_ROOT}/src/mfq_native_tensor_signal.cu
+    ${MFQ_CUDA_ROOT}/src/mfq_native_tensor_sort.cu
 )
 add_library(mfq::cuda-core ALIAS mfq-cuda-core)
 target_include_directories(mfq-cuda-core PUBLIC
@@ -273,6 +279,10 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/qwen35/batch_executor.cpp
     ${MFQ_CUDA_ROOT}/models/registry.cpp
     ${MFQ_CUDA_ROOT}/models/loader.cpp
+    ${MFQ_CUDA_ROOT}/models/ffn.cpp
+    ${MFQ_CUDA_ROOT}/models/full_block.cpp
+    ${MFQ_CUDA_ROOT}/models/kv_cache.cpp
+    ${MFQ_CUDA_ROOT}/models/rope.cpp
     ${MFQ_CUDA_ROOT}/models/transformer.cpp
 )
 

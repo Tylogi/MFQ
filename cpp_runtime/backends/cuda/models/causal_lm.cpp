@@ -1,4 +1,5 @@
 #include "causal_lm.h"
+#include "full_block.h"
 #include "session_state.h"
 
 void CudaPagedWriter::raw(const void * data, size_t size) {

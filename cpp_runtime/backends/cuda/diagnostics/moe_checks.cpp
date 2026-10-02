@@ -7,7 +7,6 @@
 #include "models/glm_dsa/causal_lm.h"
 #include "quant_linear.h"
 #include "cuda_execution.h"
-#include "models/transformer.h"
 #include "storage/moe_expert_cache.h"
 #include "mfq_cuda_ops.h"
 

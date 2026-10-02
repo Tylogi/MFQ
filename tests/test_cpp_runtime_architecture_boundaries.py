@@ -92,6 +92,10 @@ CUDA_TRANSFORMER_LOADER = (
 CUDA_TRANSFORMER_HEADER = (
     CUDA_MODELS / "transformer.h"
 ).read_text(encoding="utf-8")
+CUDA_TRANSFORMER_PARTS = {
+    name: (CUDA_MODELS / f"{name}.cpp").read_text(encoding="utf-8")
+    for name in ("rope", "ffn", "kv_cache", "full_block")
+}
 CUDA_QWEN_LINEAR = (
     CUDA_MODELS / "qwen35" / "linear_attention.h"
 ).read_text(encoding="utf-8") + (\
@@ -212,6 +216,60 @@ def test_cuda_leaf_ops_receive_only_their_required_resources() -> None:
         signature = moe_types.split(helper, 1)[1].split(");", 1)[0]
         assert "ModelParallelCollectiveRuntime& collectives" in signature
         assert "CudaExecutionContext" not in signature
+
+
+def test_cuda_quant_runtime_implementations_stay_out_of_headers() -> None:
+    headers = {
+        "mixed_moe.h": 220,
+        "quant_linear_groups.h": 170,
+        "quant_linear_weight.h": 120,
+    }
+    for name, limit in headers.items():
+        source = (CUDA_OPS / "include" / name).read_text(encoding="utf-8")
+        assert len(source.splitlines()) < limit
+
+    moe = (CUDA_OPS / "moe.cpp").read_text(encoding="utf-8")
+    quant = (CUDA_OPS / "quant_linear.cpp").read_text(encoding="utf-8")
+    assert "MixedMoeRuntime::forward(" in moe
+    assert "QuantLinear::forward(" in quant
+    assert "QuantLinearGroup::forward(" in quant
+
+
+def test_cuda_transformer_header_stays_declarative() -> None:
+    assert len(CUDA_TRANSFORMER_HEADER.splitlines()) < 30
+    assert '#include "full_block.h"' not in CUDA_TRANSFORMER_HEADER
+    limits = {"rope": 60, "ffn": 120, "kv_cache": 80, "full_block": 100}
+    for name, limit in limits.items():
+        header = (CUDA_MODELS / f"{name}.h").read_text(encoding="utf-8")
+        assert len(header.splitlines()) < limit
+
+    implementations = {
+        "rope": ("RopeCache::RopeCache(",),
+        "ffn": ("FFN::forward(", "FFN::forward_impl("),
+        "kv_cache": ("KVCache::KVCache(", "KVCache::paged_view("),
+        "full_block": ("Block::forward_context(", "FullBlock::forward_impl("),
+    }
+    for name, symbols in implementations.items():
+        header = (CUDA_MODELS / f"{name}.h").read_text(encoding="utf-8")
+        for symbol in symbols:
+            assert symbol in CUDA_TRANSFORMER_PARTS[name]
+            assert symbol not in header
+
+
+def test_cuda_native_tensor_ops_stay_split_by_domain() -> None:
+    sources = {
+        name: (CUDA_RUNTIME.parent / "src" / f"mfq_native_tensor_{name}.cu")
+        for name in (
+            "ops", "blas", "creation", "indexing", "reduction", "signal", "sort"
+        )
+    }
+    assert all(len(path.read_text(encoding="utf-8").splitlines()) < 1000
+               for path in sources.values())
+    assert "Tensor matmul(" in sources["blas"].read_text(encoding="utf-8")
+    assert "Tensor index_select_cuda(" in sources["indexing"].read_text(encoding="utf-8")
+    assert "Tensor reduce_cuda(" in sources["reduction"].read_text(encoding="utf-8")
+    assert "Tensor conv1d(" in sources["signal"].read_text(encoding="utf-8")
+    assert "std::tuple<Tensor, Tensor> topk(" in sources["sort"].read_text(encoding="utf-8")
 
 
 def test_model_sources_are_backend_neutral_and_shared() -> None:

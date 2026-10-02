@@ -1,7 +1,8 @@
 #pragma once
 
 #include "../causal_lm.h"
-#include "models/transformer.h"
+#include "models/block.h"
+#include "quant_linear.h"
 #include "models/include/qwen4_exp.h"
 #include "layers.h"
 

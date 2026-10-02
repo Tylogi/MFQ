@@ -4,7 +4,6 @@
 #include "../models/registry.h"
 #include "quant_linear.h"
 #include "cuda_execution.h"
-#include "models/transformer.h"
 #include "storage/moe_expert_cache.h"
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"

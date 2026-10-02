@@ -1,11 +1,14 @@
 #pragma once
 
 #include "../causal_lm.h"
-#include "models/transformer.h"
+#include "models/block.h"
+#include "models/ffn.h"
 #include "models/include/deepseek_v4.h"
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"
 
+#include <iomanip>
+#include <iostream>
 #include <memory>
 #include <vector>
 

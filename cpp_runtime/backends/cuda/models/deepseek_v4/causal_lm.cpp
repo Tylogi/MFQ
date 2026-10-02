@@ -1,7 +1,6 @@
 #include "causal_lm.h"
 #include "../causal_lm_impl.h"
 
-#include "models/transformer.h"
 
 namespace mfq::cuda::deepseek_v4 {
 

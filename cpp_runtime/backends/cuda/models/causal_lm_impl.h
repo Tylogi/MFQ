@@ -2,6 +2,7 @@
 
 #include "causal_lm.h"
 #include "full_attention_session_codec.h"
+#include "full_block.h"
 #include "session_state.h"
 
 namespace mfq::cuda {

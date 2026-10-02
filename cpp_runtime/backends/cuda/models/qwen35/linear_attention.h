@@ -1,6 +1,7 @@
 #pragma once
 
-#include "models/transformer.h"
+#include "models/block.h"
+#include "models/ffn.h"
 #include "models/include/qwen35.h"
 
 namespace mfq::cuda::qwen35 {
