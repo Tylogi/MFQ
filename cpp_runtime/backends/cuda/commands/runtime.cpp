@@ -1,5 +1,5 @@
 #include "cli.h"
-#include "engine/cuda_engine.h"
+#include "cuda_runtime_config.h"
 #include "minicpmo45.h"
 #include "storage/model_source.h"
 #include "mfq/model_source.h"
@@ -172,8 +172,8 @@ int run_transport_runtime(RuntimeOptions& options) {
             "model runtime requires model config and tokenizer GGUF");
     }
 
-    CudaEngineOptions engine_options = options;
-    auto engine = load_cuda_engine(std::move(engine_options));
+    auto engine = load_cuda_engine(options);
+    const auto info = engine->info();
     if (options.transport_api_key.empty()) {
         const char* env_key = std::getenv("MFQ_API_KEY");
         if (env_key != nullptr) options.transport_api_key = env_key;
@@ -183,27 +183,17 @@ int run_transport_runtime(RuntimeOptions& options) {
     transport_config.host = options.transport_host;
     transport_config.port = options.transport_port;
     transport_config.model_name = options.runtime_model_name;
-    transport_config.model_type = engine.metadata().model_type;
+    transport_config.model_type = info.model_type;
     transport_config.api_key = options.transport_api_key;
-    transport_config.max_context = engine.metadata().max_context;
-    transport_config.vocab_size = engine.metadata().vocab_size;
-    transport_config.model_capabilities = MfqModelCapabilities{
-        engine.metadata().architecture,
-        engine.metadata().capabilities.text,
-        engine.metadata().capabilities.image_input,
-        engine.metadata().capabilities.video_input,
-        engine.metadata().capabilities.audio_input,
-        engine.metadata().capabilities.audio_output,
-        engine.metadata().capabilities.full_duplex,
-        engine.metadata().capabilities.mtp,
-        "model-graph+cuda-adapters",
-    };
-    const auto& runtime_assets = *engine.metadata().source;
+    transport_config.max_context = info.max_context;
+    transport_config.vocab_size = info.vocab_size;
+    transport_config.model_capabilities = info.capabilities;
+    const auto& runtime_assets = *source;
     const auto embedded_profile = runtime_assets.metadata().find(
         "runtime.sampling.v1");
     transport_config.runtime_profile = resolve_mfq_runtime_profile(
         options.model_path,
-        engine.metadata().architecture,
+        info.capabilities.family,
         transport_config.model_type,
         transport_config.model_name,
         embedded_profile == runtime_assets.metadata().end()

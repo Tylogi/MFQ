@@ -5,7 +5,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
+
+namespace mfq::engine { class Engine; }
 
 namespace mfq::cuda {
 
@@ -52,6 +55,8 @@ struct CudaEngineOptions : CudaLoadOptions {
     int continuous_batching = 0;
     int64_t prefill_chunk_size = 2048;
 };
+
+std::unique_ptr<mfq::engine::Engine> load_cuda_engine(CudaEngineOptions options);
 
 } // namespace mfq::cuda
 

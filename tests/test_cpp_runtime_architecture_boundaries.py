@@ -198,7 +198,6 @@ def test_cuda_models_do_not_depend_on_cuda_engine_implementation() -> None:
         for header in (
             "components.h",
             "cuda_batching.h",
-            "cuda_engine.h",
             "decode_graph.h",
             "generation.h",
             "model_loader.h",
@@ -552,8 +551,9 @@ def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
         assert f"template struct {path}::{shared_class}<cuda::CudaCausalOps<cuda::{model}>>;" in source
     assert "CudaBackbone" not in CUDA_CAUSAL_LM + CUDA_CAUSAL_LM_IMPL
     assert "struct Request" not in CUDA_QWEN_BATCH_HEADER
-    assert "struct QwenBatchExecutor::Impl" in CUDA_QWEN_BATCH_SOURCE
-    assert len(CUDA_QWEN_BATCH_HEADER.splitlines()) < 80
+    assert "class QwenBatchOperations" in CUDA_QWEN_BATCH_HEADER
+    assert "QwenBatchExecutor" not in CUDA_QWEN_BATCH_HEADER + CUDA_QWEN_BATCH_SOURCE
+    assert "Impl" not in CUDA_QWEN_BATCH_HEADER + CUDA_QWEN_BATCH_SOURCE
     assert "Qwen35BatchStateAdapter" in CUDA_QWEN_BATCH_STATE
     assert "ContinuousBatchRequest" not in CUDA_QWEN_BATCH_STATE
     assert "continuous_batching_requests" not in CUDA_QWEN_BATCH_STATE
@@ -590,9 +590,7 @@ def test_cuda_runtime_composes_transport_scheduler_and_engine() -> None:
     scheduler = (
         ROOT / "cpp_runtime" / "scheduler" / "include" / "scheduler.h"
     ).read_text(encoding="utf-8")
-    cuda_engine_header = (
-        CUDA_RUNTIME / "cuda_engine.h"
-    ).read_text(encoding="utf-8")
+    assert not (CUDA_RUNTIME / "cuda_engine.h").exists()
     assert "class Engine" in engine_contract
     assert "virtual ~Engine() = default" in engine_contract
     for method in ("info(", "admit(", "cancel(", "step(", "status(", "session(", "reload(", "shutdown("):
@@ -603,8 +601,11 @@ def test_cuda_runtime_composes_transport_scheduler_and_engine() -> None:
     assert "metrics.mtp" in request_metrics
     assert "scheduler" not in request_metrics
     assert "CallbackEngine" not in engine_contract
-    assert "struct CudaEngine final : mfq::engine::Engine" in cuda_engine_header
-    assert "std::unique_ptr<QwenBatchExecutor>" in CUDA_ENGINE_SOURCE
+    assert "class EngineInstance final : public Engine" in SHARED_EXECUTOR
+    assert "std::unique_ptr<Engine> load_cuda_engine" in CUDA_ENGINE_SOURCE
+    assert "CudaEngine::" not in CUDA_ENGINE_SOURCE
+    assert "CudaEngineMetadata" not in CUDA_BACKEND_SOURCE
+    assert "ContinuousBatch<QwenBatchOperations>" in CUDA_ENGINE_SOURCE
     assert "ContinuousBatchingController" not in CUDA_ENGINE_SOURCE
     assert "current.generation.next()" in SHARED_EXECUTOR
     assert "EngineInstance<CudaBackend>" in CUDA_ENGINE_SOURCE

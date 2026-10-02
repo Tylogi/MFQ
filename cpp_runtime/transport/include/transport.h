@@ -8,7 +8,6 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -53,18 +52,6 @@ struct MfqRuntimeProfile {
     std::string source = "generic-defaults";
 };
 
-struct MfqModelCapabilities {
-    std::string family = "unknown";
-    bool text = true;
-    bool image_input = false;
-    bool video_input = false;
-    bool audio_input = false;
-    bool audio_output = false;
-    bool full_duplex = false;
-    bool mtp = false;
-    std::string source;
-};
-
 struct MfqRuntimeTransportConfig {
     std::string model_name = "mfq-model";
     std::string model_type;
@@ -95,16 +82,6 @@ public:
         : engine_(require_engine(std::move(engine))),
           transport_(require_transport(std::move(transport))),
           scheduler_(*engine_) {}
-
-    template <typename ConcreteEngine,
-              std::enable_if_t<std::is_base_of_v<
-                  mfq::engine::Engine, ConcreteEngine>, int> = 0>
-    MfqRuntime(
-            ConcreteEngine engine,
-            std::unique_ptr<MfqTransport> transport)
-        : MfqRuntime(
-              std::make_unique<ConcreteEngine>(std::move(engine)),
-              std::move(transport)) {}
 
     int run() {
         return transport_->run(scheduler_);

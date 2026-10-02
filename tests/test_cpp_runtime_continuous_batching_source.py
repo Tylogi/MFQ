@@ -62,7 +62,8 @@ CAUSAL_LM += SHARED_MODELS
 def test_continuous_batching_is_an_explicit_server_mode():
     assert '"--continuous-batching"' in DECODE
     assert '"--check-continuous-batching"' in DECODE
-    assert "QwenBatchExecutor::step(" in BATCHING
+    assert "ContinuousBatch<QwenBatchOperations>" in BATCHING_CHECK
+    assert "QwenBatchExecutor" not in BATCHING
     assert "ContinuousBatchingController" not in BATCHING
     assert "ContinuousBatchQueue" not in BATCHING
     assert "std::thread" not in BATCHING
@@ -94,7 +95,7 @@ def test_cuda_server_prefill_is_bounded_for_serial_mtp_and_batched_paths():
 def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
     for internal in ("take", "restore", "make_slot_state", "copy_to_slot", "bind_paged_slots"):
         assert f"state_adapter_.{internal}(" not in BATCHING
-    assert "QwenBatchRequestState cache" in BATCHING
+    assert "qwen35::QwenBatchRequestState cache" in BATCHING
     assert "state_adapter_.prepare_prefill(" in BATCHING
     assert "state_adapter_.activate(" in BATCHING
     assert "state_adapter_.resume_decode(" in BATCHING

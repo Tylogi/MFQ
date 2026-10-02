@@ -17,7 +17,7 @@ by model family:
   continuous-batching, cache, tokenizer, output, and MTP components; CUDA tensors and device execution stay in `backends/cuda/`;
 - `components/` — focused integrated components (`ggml`, `tokenizer`, `http`,
   and `json`);
-- `backends/cuda/` — the concrete `CudaEngine`, model execution adapters,
+- `backends/cuda/` — native Engine bindings, model execution adapters,
   operators, applications, build definition, and tests; `core/causal_model.h`
   supplies native resources and operations to the shared causal model.
   Native Transformer, predictor and graph resources belong to `core/`, lower-level
@@ -59,8 +59,11 @@ MiniCPM/Grid-Vision multimodal composition are shared. Model definition,
 output-weight tying and layer traversal live in `CausalModelBase`; Gemma also
 owns its layer geometry and parameter-role assembly. CUDA's `CausalResources`
 supplies native bindings, and `storage/model_loader.cpp` handles device loading
-and placement. `EngineInstance<Backend>` owns request execution, text controls and ordered
-reload/shutdown. Session/prefix settings and batch budgets use shared config;
+and placement. `EngineInstance<Backend>` directly implements `Engine` and owns
+request execution, text controls and ordered reload/shutdown. CUDA's construction
+entry returns `std::unique_ptr<Engine>`; model metadata and capabilities use
+`EngineInfo`. There is no public `CudaEngine` facade or PImpl. Native batch operations
+feed `ContinuousBatch<QwenBatchOperations>` directly, without a batch executor wrapper. Session/prefix settings and batch budgets use shared config;
 CUDA load settings stay in `storage/load_options.cpp`. Ordinary, speculative
 and batch generation share CUDA sampling buffer/count initialization. Model
 users include their actual family headers directly; there is no include-only

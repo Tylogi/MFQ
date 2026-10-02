@@ -1,8 +1,7 @@
 #include "runtime_checks.h"
 
-#include "engine/cuda_engine.h"
-#include "engine/generation.h"
 #include "cuda_runtime_config.h"
+#include "engine/generation.h"
 #include "storage/text_session_cache.h"
 #include "engine/cuda_batching.h"
 
@@ -142,7 +141,8 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
     const auto first_reference = serial(first_prompt), second_reference = serial(second_prompt);
     graph.invalidate(); // Physical batch slots replace the serial graph's storage.
     {
-        QwenBatchExecutor batcher(model, *model.execution, config.continuous_batch, 64);
+        mfq::engine::ContinuousBatch<QwenBatchOperations> batcher(
+            64, config.continuous_batch.prefill_token_budget, model, *model.execution, config.continuous_batch);
         InferenceRequest first, second;
         first.prompt = first_prompt; first.sampling = sampling;
         second.prompt = second_prompt; second.sampling = sampling;
@@ -239,19 +239,19 @@ int run_cuda_engine_isolation_check(CudaEngineOptions options) {
     if (options.context_size == 0) options.context_size = 64;
     options.continuous_batching = 0;
 
-    std::unique_ptr<CudaEngine> first;
-    std::unique_ptr<CudaEngine> second;
+    std::unique_ptr<mfq::engine::Engine> first;
+    std::unique_ptr<mfq::engine::Engine> second;
     std::exception_ptr first_error;
     std::exception_ptr second_error;
     std::atomic<int> load_ready{0};
-    auto load = [&](std::unique_ptr<CudaEngine>& engine,
+    auto load = [&](std::unique_ptr<mfq::engine::Engine>& engine,
                     std::exception_ptr& error) {
         try {
             load_ready.fetch_add(1, std::memory_order_release);
             while (load_ready.load(std::memory_order_acquire) != 2) {
                 std::this_thread::yield();
             }
-            engine = std::make_unique<CudaEngine>(load_cuda_engine(options));
+            engine = load_cuda_engine(options);
         } catch (...) {
             error = std::current_exception();
         }
@@ -271,7 +271,7 @@ int run_cuda_engine_isolation_check(CudaEngineOptions options) {
     sampling.enable_mtp = false;
     const std::vector<int64_t> first_prompt{101, 138, 175, 212, 249};
     const std::vector<int64_t> second_prompt{113, 166, 219, 272, 325, 378};
-    const auto serial = [&](CudaEngine& engine,
+    const auto serial = [&](mfq::engine::Engine& engine,
                             const std::vector<int64_t>& prompt) {
         std::vector<int64_t> output;
         output = check_engine_steps(engine, prompt, sampling);
@@ -289,7 +289,7 @@ int run_cuda_engine_isolation_check(CudaEngineOptions options) {
     int32_t first_produced = 0;
     int32_t second_produced = 0;
     std::atomic<int> ready{0};
-    auto generate = [&](CudaEngine& engine,
+    auto generate = [&](mfq::engine::Engine& engine,
                         const std::vector<int64_t>& prompt,
                         std::vector<int64_t>& output,
                         int32_t& produced,
@@ -325,9 +325,9 @@ int run_cuda_engine_isolation_check(CudaEngineOptions options) {
         second_produced == sampling.max_tokens &&
         first_output == first_reference &&
         second_output == second_reference &&
-        first->metadata().model_type == second->metadata().model_type &&
-        first->metadata().max_context == options.context_size &&
-        second->metadata().max_context == options.context_size &&
+        first->info().model_type == second->info().model_type &&
+        first->info().max_context == options.context_size &&
+        second->info().max_context == options.context_size &&
         !std::get<mfq::engine::Metrics>(first->control(mfq::engine::RuntimeMetrics{})).empty() &&
         !std::get<mfq::engine::Metrics>(second->control(mfq::engine::RuntimeMetrics{})).empty(),
         "concurrent CUDA engines did not remain isolated");

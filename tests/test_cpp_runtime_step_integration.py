@@ -57,6 +57,14 @@ def test_stdio_step_lifecycle(batch_size: int, tmp_path: Path) -> None:
 
             try:
                 assert (await receive())["type"] == "ready"
+                await send("models", "models")
+                metadata = (await until("models", "result"))[0]["data"]["models"][0]
+                assert metadata["type"]
+                assert metadata["capabilities"]["architecture_family"] != "unknown"
+                assert metadata["capabilities"]["source"] == "model-graph+cuda-adapters"
+                assert metadata["capabilities"]["features"]["text"]
+                if os.environ.get("MFQ_STEP_TEST_MTP") == "1":
+                    assert metadata["capabilities"]["features"]["mtp"]
                 await send("plain", "generate", generation(False))
                 plain = await until("plain")
                 result = next(frame["data"] for frame in plain if frame["type"] == "event")

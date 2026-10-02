@@ -1,4 +1,3 @@
-#include "cuda_engine.h"
 #include "cuda_execution.h"
 
 #include <atomic>

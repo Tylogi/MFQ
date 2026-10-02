@@ -86,7 +86,22 @@ static const EventData &terminal_event(const EngineStepResult &result) {
 
 struct TestBackend {
     struct Options { std::int64_t context_size = 32; } options;
-    TestOps ops;
+    struct Operations : TestOps {
+        struct Cache {
+            std::uint64_t count = 0;
+            std::uint64_t fork_session(const std::string &, const std::string &) { return 0; }
+            std::uint64_t close_session(const std::string &) { return 0; }
+            std::uint64_t clear() { return std::exchange(count, 0); }
+            std::uint64_t trim_hot(std::uint64_t) { return clear(); }
+            Metrics metrics() const { return {{"sessions", double(count)}}; }
+        } cache;
+        template <class T> ControlResult control(T) {
+            if constexpr (std::is_same_v<T, RuntimeMetrics>)
+                return Metrics{{"advances", double(advances)}};
+            else throw std::invalid_argument("no duplex in test backend");
+        }
+    } ops;
+    ~TestBackend() { assert(ops.live == 0); }
     bool loaded = false, fail_load = false;
     int loads = 0;
     auto load() {
@@ -94,7 +109,7 @@ struct TestBackend {
         loaded = true;
         ++loads;
         if (fail_load) throw std::runtime_error("load failed after allocation");
-        ops = TestOps{};
+        ops = Operations{};
         auto metadata = info();
         metadata.max_context = options.context_size;
         return std::pair{metadata, std::unique_ptr<TextProcessor>{}};
@@ -118,34 +133,45 @@ template <class F> static void rejects(F&& run) {
 }
 
 static void check_engine_lifecycle() {
-    EngineInstance<TestBackend> first({32}), second({64});
+    EngineInstance<TestBackend> first_instance({32}), second_instance({64});
+    Engine &first = first_instance, &second = second_instance;
+    first_instance.backend.ops.cache.count = 3;
+    assert(first.session({SessionCommand::Kind::clear}).count == 3);
+    assert(first.session({SessionCommand::Kind::metrics}).metrics == Metrics({{"sessions", 0}}));
+    assert(std::get<Metrics>(first.control(RuntimeMetrics{})) == Metrics({{"advances", 0}}));
+    rejects([&] { first.control(DecodeTokens{{1, 2}, {}}); });
     assert(first.info().max_context == 32 && second.info().max_context == 64);
     assert(first.admit(request()) == Admission::accepted);
     first.step({"one"});
-    assert(first.backend.ops.live == 1);
+    assert(first_instance.backend.ops.live == 1);
     rejects([&] { first.reload(48); });
     rejects([&] { second.reload(0); });
-    assert(first.backend.loads == 1 && second.backend.loads == 1);
+    assert(first_instance.backend.loads == 1 && second_instance.backend.loads == 1);
     first.cancel("one");
     assert(std::holds_alternative<Cancelled>(terminal_event(first.step({}))));
     assert(first.reload(48) == 48 && first.status().healthy);
-    assert(second.info().max_context == 64 && second.backend.loads == 1);
-    first.backend.ops.failure = 2;
+    assert(second.info().max_context == 64 && second_instance.backend.loads == 1);
+    first_instance.backend.ops.failure = 2;
     first.admit(request());
     assert(std::holds_alternative<Failed>(terminal_event(first.step({"one"}))));
     assert(!first.status().healthy);
     assert(first.reload(32) == 32 && first.status().healthy);
-    first.backend.fail_load = true;
+    first_instance.backend.fail_load = true;
     rejects([&] { first.reload(40); });
-    assert(!first.status().healthy && !first.backend.loaded);
-    first.backend.fail_load = false;
+    assert(!first.status().healthy && !first_instance.backend.loaded);
+    first_instance.backend.fail_load = false;
     assert(first.reload(40) == 40 && first.status().available == 2);
     first.admit(request());
     first.step({"one"});
     first.shutdown();
     first.shutdown();
-    assert(!first.status().healthy && first.backend.ops.live == 0);
+    assert(!first.status().healthy && first_instance.backend.ops.live == 0);
     assert(second.status().healthy);
+    std::unique_ptr<Engine> owned = std::make_unique<EngineInstance<TestBackend>>(TestBackend::Options{});
+    owned->admit(request());
+    owned->step({"one"});
+    // Virtual destruction must release a suspended coroutine before its backend.
+    owned.reset();
 }
 
 struct Environment {

@@ -2,7 +2,6 @@
 #include "cuda_runtime_config.h"
 #include "cuda_sampling.h"
 #include "diagnostics/generation_result.h"
-#include "engine/cuda_engine.h"
 #include "storage/text_session_cache.h"
 #include "mfq_paged_prefix_cache.h"
 #include "models/gemma4/causal_lm.h"
@@ -531,27 +530,27 @@ static void check_batching(const char* model_path, const char* tokenizer) {
     using namespace mfq::engine;
     MfqSamplingParams sampling;
     sampling.max_tokens = 32; sampling.temperature = 0; sampling.top_k = 1; sampling.enable_mtp = false;
-    const auto reference = mfq::cuda::diagnostics::check_engine_steps(engine, {101, 202, 303}, sampling);
+    const auto reference = mfq::cuda::diagnostics::check_engine_steps(*engine, {101, 202, 303}, sampling);
     check(reference.size() == 32, "batched generation length");
-    check(mfq::cuda::diagnostics::check_engine_steps(engine, {101, 202, 303}, sampling) == reference,
+    check(mfq::cuda::diagnostics::check_engine_steps(*engine, {101, 202, 303}, sampling) == reference,
           "batched repeat changed output");
     EngineRequest cancelled; cancelled.id = "cancel";
     cancelled.token_ids = {101, 202, 303}; cancelled.input.sampling = sampling;
-    check(engine.admit(cancelled) == Admission::accepted, "cancel admission");
-    engine.cancel("cancel");
-    auto result = engine.step({});
+    check(engine->admit(cancelled) == Admission::accepted, "cancel admission");
+    engine->cancel("cancel");
+    auto result = engine->step({});
     check(result.events.size() == 1 && std::holds_alternative<Cancelled>(result.events[0].data),
           "cancel before prefill did not release");
     cancelled.token_ids.assign(32, 101);
-    check(engine.admit(cancelled) == Admission::accepted, "prefill cancel admission");
-    result = engine.step({"cancel"});
+    check(engine->admit(cancelled) == Admission::accepted, "prefill cancel admission");
+    result = engine->step({"cancel"});
     check(result.events.size() == 1 && std::holds_alternative<PrefillProgress>(result.events[0].data),
           "prefill did not yield after one chunk");
-    engine.cancel("cancel");
-    result = engine.step({});
+    engine->cancel("cancel");
+    result = engine->step({});
     check(result.events.size() == 1 && std::holds_alternative<Cancelled>(result.events[0].data),
           "cancel during prefill did not release");
-    check(mfq::cuda::diagnostics::check_engine_steps(engine, {101, 202, 303}, sampling) == reference,
+    check(mfq::cuda::diagnostics::check_engine_steps(*engine, {101, 202, 303}, sampling) == reference,
           "cancel changed subsequent output");
 
 }
