@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cstddef>
-#include <functional>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -11,9 +11,8 @@ namespace mfq::engine {
 // of the wire protocol and of the device executing the model.
 class TextEmitter {
 public:
-    using Emit = std::function<bool(const std::string&)>;
-
-    TextEmitter(std::vector<std::string> stops, Emit emit);
+    explicit TextEmitter(std::vector<std::string> stops);
+    std::string take() { return std::exchange(output_, {}); }
     bool append(const std::string& piece);
     bool flush();
     bool stopped() const noexcept { return stopped_; }
@@ -23,7 +22,7 @@ private:
     bool emit_bytes(std::size_t count);
 
     std::vector<std::string> stops_;
-    Emit emit_;
+    std::string output_;
     std::string pending_;
     bool stopped_ = false;
 };

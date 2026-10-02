@@ -4,7 +4,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -114,21 +113,6 @@ struct MfqDuplexStepResult {
     double inference_ms = 0.0;
 };
 
-struct MfqDuplexBackend {
-    std::string name = "native";
-    std::function<void(const MfqDuplexSessionParams &)> start;
-    std::function<MfqDuplexStepResult(const MfqDuplexStepInput &)> step;
-    std::function<void()> stop;
-
-    explicit operator bool() const noexcept {
-        return static_cast<bool>(start) && static_cast<bool>(step) &&
-            static_cast<bool>(stop);
-    }
-};
-
-using MfqTokenCallback = std::function<bool(int64_t token)>;
-using MfqCancellationCheck = std::function<bool()>;
-
 struct MfqPrefillTiming {
     size_t prompt_tokens = 0;
     // Language-model prompt evaluation only.
@@ -137,37 +121,4 @@ struct MfqPrefillTiming {
     double multimodal_ms = 0.0;
     // Complete model-side prefill wall time.
     double model_ms = 0.0;
-};
-
-using MfqPrefillCallback =
-    std::function<void(const MfqPrefillTiming & timing)>;
-using MfqGenerateFn = std::function<int32_t(
-    const std::vector<int64_t> & prompt,
-    const MfqSamplingParams & sampling,
-    const MfqTokenCallback & on_token,
-    const MfqPrefillCallback & on_prefill,
-    const MfqPromptCachePlan & cache_plan,
-    const MfqTokenConstraintPtr & token_constraint,
-    const MfqCancellationCheck & cancelled)>;
-using MfqMultimodalGenerateFn = std::function<int32_t(
-    const std::vector<int64_t> & prompt,
-    const MfqMultimodalInput & media,
-    const MfqSamplingParams & sampling,
-    const MfqTokenCallback & on_token,
-    const MfqPrefillCallback & on_prefill,
-    const MfqPromptCachePlan & cache_plan,
-    const MfqTokenConstraintPtr & token_constraint,
-    const MfqCancellationCheck & cancelled)>;
-using MfqReloadFn = std::function<int64_t(int64_t context_size)>;
-using MfqRuntimeMetricsFn =
-    std::function<std::vector<std::pair<std::string, double>>() >;
-
-struct MfqSessionControl {
-    std::function<size_t(
-        const std::string & source_session_id,
-        const std::string & target_session_id)> fork;
-    std::function<size_t(const std::string & session_id)> close;
-    std::function<std::vector<std::pair<std::string, double>>()> metrics;
-    std::function<size_t()> clear;
-    std::function<uint64_t(uint64_t target_bytes)> trim_hot;
 };

@@ -1,6 +1,5 @@
 #pragma once
 
-#include "continuous_batching.h"
 #include "generation_policy.h"
 #include "session_snapshot_cache.h"
 
@@ -17,7 +16,7 @@ struct CudaDecodeGraphConfig {
 };
 
 struct CudaContinuousBatchConfig {
-    mfq::engine::ContinuousBatchConfig scheduling;
+    std::size_t max_sequences = 0;
     bool greedy = true;
     bool cuda_graph = true;
     bool paged_kv = true;

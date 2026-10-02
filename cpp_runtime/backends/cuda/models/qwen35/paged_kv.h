@@ -146,9 +146,13 @@ public:
         const size_t bytes = rows * row_width * sizeof(std::int32_t);
         for (auto & [device, table] : device_page_tables_) {
             MfqCudaGuard guard(device);
-            MFQ_CUDA_CHECK(cudaMemcpy(
+            const auto stream = mfq_get_current_cuda_stream();
+            MFQ_CUDA_CHECK(cudaMemcpyAsync(
                 table.data_ptr<std::int32_t>(), host_page_table_.data(),
-                bytes, cudaMemcpyHostToDevice));
+                bytes, cudaMemcpyHostToDevice, stream));
+            // The next bind may rewrite this host buffer and device table.
+            // Order it after all previous users on the execution stream.
+            MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));
         }
         const int64_t batch = static_cast<int64_t>(rows);
         for (auto & layer : layers_) {
@@ -268,12 +272,14 @@ private:
                 const int64_t v_pointer = reinterpret_cast<int64_t>(
                     chunk.v.data_ptr());
                 MfqCudaGuard guard(layer.device);
-                MFQ_CUDA_CHECK(cudaMemcpy(
+                const auto stream = mfq_get_current_cuda_stream();
+                MFQ_CUDA_CHECK(cudaMemcpyAsync(
                     layer.k_chunk_ptrs.data_ptr<int64_t>() + chunk_index,
-                    &k_pointer, sizeof(k_pointer), cudaMemcpyHostToDevice));
-                MFQ_CUDA_CHECK(cudaMemcpy(
+                    &k_pointer, sizeof(k_pointer), cudaMemcpyHostToDevice, stream));
+                MFQ_CUDA_CHECK(cudaMemcpyAsync(
                     layer.v_chunk_ptrs.data_ptr<int64_t>() + chunk_index,
-                    &v_pointer, sizeof(v_pointer), cudaMemcpyHostToDevice));
+                    &v_pointer, sizeof(v_pointer), cudaMemcpyHostToDevice, stream));
+                MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));
             }
             for (size_t index = 0; index < layers_.size(); ++index) {
                 reserved_bytes_ += pending[index].k.nbytes() +

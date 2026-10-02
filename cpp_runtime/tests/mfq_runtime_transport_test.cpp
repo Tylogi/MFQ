@@ -1,128 +1,184 @@
-#include "transport.h"
-
+#include "scheduler.h"
+#include <array>
+#include <atomic>
 #include <cassert>
-#include <condition_variable>
-#include <memory>
-#include <mutex>
+#include <chrono>
+#include <map>
 #include <thread>
-#include <type_traits>
-#include <utility>
-#include <vector>
+using namespace mfq::engine;
+using namespace std::chrono_literals;
 
-class TestTransport final : public MfqTransport {
-public:
-    int run(const MfqScheduler& scheduler) override {
-        assert(scheduler.supports_generation());
-        auto request = scheduler.activate_request("request-1");
-        assert(request);
-        assert(!scheduler.activate_request("request-1"));
-        assert(!scheduler.cancel_session(""));
-        request->set_session_id("session-1");
-        assert(scheduler.cancel_session("session-1"));
-        assert(request->cancel_flag()->load());
-        request->finish();
-        assert(!scheduler.cancel_request("request-1"));
-
-        bool saw_token = false;
-        bool saw_prefill = false;
-        const int result = scheduler.generate(
-            {1, 2}, {},
-            [&](int64_t token) {
-                saw_token = token == 3;
-                return true;
-            },
-            [&](const MfqPrefillTiming& timing) {
-                saw_prefill = timing.prompt_tokens == 2;
-            },
-            {}, {});
-        assert(saw_token);
-        assert(saw_prefill);
-        return result;
+struct FakeEngine final : Engine {
+    struct Work { EngineRequest request; int steps = 0; bool cancelled = false; };
+    std::map<std::string, Work> active;
+    std::array<std::atomic<int>, 16> advances{};
+    std::atomic<int> released{0}, reloads{0};
+    std::thread::id owner;
+    bool fail = false;
+    EngineInfo info() const override { return {2, 128, 64, false, false, true, {}}; }
+    void check_thread() {
+        if (owner == std::thread::id{}) owner = std::this_thread::get_id();
+        assert(owner == std::this_thread::get_id());
     }
+    Admission admit(EngineRequest request) override {
+        check_thread();
+        if (active.size() == 2) return Admission::deferred;
+        auto id = request.id; active.emplace(id, Work{std::move(request)});
+        return Admission::accepted;
+    }
+    void cancel(const RequestId& id) override {
+        check_thread(); if (active.contains(id)) active.at(id).cancelled = true;
+    }
+    EngineStatus status() const override { return {2 - active.size(), true}; }
+    EngineStepResult step(const std::vector<RequestId>& eligible) override {
+        check_thread();
+        EngineStepResult result;
+        for (auto it = active.begin(); it != active.end();) {
+            auto& work = it->second;
+            const auto id = it->first;
+            if (work.cancelled) {
+                it = active.erase(it); ++released;
+                result.events.push_back({id, Cancelled{}}); continue;
+            }
+            if (std::find(eligible.begin(), eligible.end(), id) == eligible.end()) { ++it; continue; }
+            if (work.request.token_ids == std::vector<int64_t>{63}) throw std::runtime_error("device failure");
+            ++advances.at(std::stoi(id));
+            ++work.steps;
+            result.advanced.push_back(id);
+            if (work.steps <= int(work.request.token_ids.size()))
+                result.events.push_back({id, PrefillProgress{{std::size_t(work.steps), 1, 0, 1}}});
+            else if (work.steps <= int(work.request.token_ids.size()) + work.request.input.sampling.max_tokens) {
+                OutputDelta delta{{1, 2, 3}, {}};
+                if (work.request.token_ids == std::vector<int64_t>{61} ||
+                        work.request.token_ids == std::vector<int64_t>{62}) {
+                    common_chat_msg_diff diff;
+                    diff.content_delta.assign(work.request.token_ids.front() == 61 ? 1024 : 8192, 'x');
+                    delta.diffs.push_back(std::move(diff));
+                }
+                result.events.push_back({id, std::move(delta)});
+            }
+            else {
+                it = active.erase(it); ++released;
+                InferenceMetrics metrics;
+                metrics.mtp.available = true;
+                metrics.mtp.cycles = std::stoi(id);
+                result.events.push_back({id, Completed{{}, {}, metrics}}); continue;
+            }
+            ++it;
+        }
+        result.status = status(); result.has_work = !active.empty(); return result;
+    }
+    SessionResult session(const SessionCommand&) override { check_thread(); return {7, {}}; }
+    int64_t reload(int64_t context) override {
+        check_thread(); assert(active.empty());
+        if (context == 13) throw std::runtime_error("load failed");
+        ++reloads; return context;
+    }
+    void shutdown() override { check_thread(); assert(active.empty()); }
+    ControlResult control(ControlRequest) override { check_thread(); return Metrics{}; }
 };
-
+EngineRequest request(int id, int tokens = 12) {
+    EngineRequest result;
+    result.id = std::to_string(id); result.token_ids = {1, 2};
+    result.input.sampling.max_tokens = tokens; return result;
+}
+int drain(const std::shared_ptr<MfqScheduledRequest>& handle, bool cancelled = false, bool failed = false) {
+    int terminals = 0;
+    while (!handle->done()) for (const auto& event : handle->wait()) {
+        if (const auto* delta = std::get_if<OutputDelta>(&event.data))
+            assert(delta->token_ids == std::vector<int64_t>({1, 2, 3}));
+        if (terminal(event.data)) {
+            ++terminals;
+            assert(std::holds_alternative<Cancelled>(event.data) == cancelled);
+            assert(std::holds_alternative<Failed>(event.data) == failed);
+            if (const auto* completed = std::get_if<Completed>(&event.data)) {
+                assert(completed->metrics.mtp.available);
+                assert(completed->metrics.mtp.cycles == std::stoul(event.id));
+            }
+        }
+    }
+    assert(terminals == 1);
+    assert(handle->wait().empty());
+    return terminals;
+}
 int main() {
-    static_assert(std::is_abstract_v<MfqTransport>);
-    static_assert(std::is_abstract_v<mfq::engine::Engine>);
-    mfq::engine::CallbackEngine engine;
-    engine.generate = [](
-            const std::vector<int64_t>& prompt,
-            const MfqSamplingParams&,
-            const MfqTokenCallback& on_token,
-            const MfqPrefillCallback& on_prefill,
-            const MfqPromptCachePlan&,
-            const MfqTokenConstraintPtr&,
-            const MfqCancellationCheck& cancelled) {
-        assert(!cancelled());
-        on_prefill({prompt.size(), 0.0, 0.0, 0.0});
-        on_token(3);
-        return 1;
-    };
-    MfqRuntime runtime(
-        std::move(engine), std::make_unique<TestTransport>());
-    assert(runtime.run() == 1);
-
-    mfq::engine::CallbackEngine queued_engine;
-    queued_engine.max_concurrent_requests = 1;
-    std::mutex gate;
-    std::condition_variable changed;
-    bool first_running = false;
-    bool release_first = false;
-    bool backend_saw_cancel = false;
-    int engine_calls = 0;
-    queued_engine.generate = [&](
-            const std::vector<int64_t>&,
-            const MfqSamplingParams&,
-            const MfqTokenCallback& on_token,
-            const MfqPrefillCallback&,
-            const MfqPromptCachePlan&,
-            const MfqTokenConstraintPtr&,
-            const MfqCancellationCheck& cancelled) {
-        std::unique_lock<std::mutex> lock(gate);
-        ++engine_calls;
-        first_running = true;
-        changed.notify_all();
-        changed.wait(lock, [&] { return release_first; });
-        backend_saw_cancel = cancelled();
-        lock.unlock();
-        on_token(3);
-        return 1;
-    };
-    MfqScheduler scheduler(queued_engine);
-    auto previous = scheduler.activate_request("previous", "session", false);
-    auto replacement = scheduler.activate_request(
-        "replacement", "session", true);
-    assert(previous && replacement && previous->cancelled());
-    previous->finish();
-    replacement->finish();
-
-    auto first = scheduler.activate_request("first");
-    auto second = scheduler.activate_request("second");
-    assert(first && second);
-    int first_result = 0;
-    int second_result = -1;
-    std::thread first_thread([&] {
-        first_result = scheduler.generate(
-            *first, {1}, {}, [](int64_t) { return true; }, {}, {}, {});
-    });
     {
-        std::unique_lock<std::mutex> lock(gate);
-        changed.wait(lock, [&] { return first_running; });
+        FakeEngine engine;
+        MfqScheduler scheduler(engine, {8, 4096});
+        auto slow = scheduler.submit(request(0));
+        auto fast = scheduler.submit(request(1));
+        drain(fast);
+        const auto paused = engine.advances[0].load();
+        assert(paused > 0 && paused < 12);
+        auto another = scheduler.submit(request(2, 3));
+        drain(another);
+        assert(engine.advances[0] == paused);
+        drain(slow);
+        auto blocked = scheduler.submit(request(3, 100));
+        while (engine.advances[3] == 0) std::this_thread::yield();
+        assert(scheduler.cancel_request("3"));
+        assert(!scheduler.cancel_request("unknown"));
+        drain(blocked, true);
+        auto session = request(4, 100); session.input.cache_plan.session_id = "session";
+        auto handle = scheduler.submit(session);
+        session.id = "5";
+        bool conflict = false;
+        try { scheduler.submit(session); } catch (const std::invalid_argument&) { conflict = true; }
+        assert(conflict);
+        conflict = false;
+        try { scheduler.session({SessionCommand::Kind::close, "session"}); } catch (const std::runtime_error&) { conflict = true; }
+        assert(conflict);
+        assert(scheduler.cancel_session("session"));
+        drain(handle, true);
+        assert(scheduler.session({SessionCommand::Kind::close, "session"}).count == 7);
+        auto deadline = request(6, 100); deadline.deadline = Clock::now() + 15ms;
+        auto expiring = scheduler.submit(deadline);
+        std::this_thread::sleep_for(30ms);
+        drain(expiring, true);
+        auto active = scheduler.submit(request(7, 100));
+        auto queued = scheduler.submit(request(8, 100));
+        auto waiting = scheduler.submit(request(9, 100));
+        assert(scheduler.cancel_request("9"));
+        drain(waiting, true);
+        assert(scheduler.reload(64) == 64 && engine.reloads == 1);
+        drain(active, true); drain(queued, true);
+        auto shutdown = scheduler.submit(request(10, 100));
+        scheduler.shutdown();
+        drain(shutdown, true);
     }
-    std::thread second_thread([&] {
-        second_result = scheduler.generate(
-            *second, {2}, {}, [](int64_t) { return true; }, {}, {}, {});
-    });
-    const bool cancelled = scheduler.cancel_request("second");
-    assert(cancelled);
-    second_thread.join();
-    assert(second_result == 0 && engine_calls == 1);
-    assert(scheduler.cancel_request("first"));
     {
-        std::lock_guard<std::mutex> lock(gate);
-        release_first = true;
+        FakeEngine engine;
+        MfqScheduler scheduler(engine);
+        auto first = scheduler.submit(request(0, 100));
+        auto bad = request(1); bad.token_ids = {63};
+        auto second = scheduler.submit(bad);
+        drain(first, false, true); drain(second, false, true);
+        assert(engine.active.empty());
     }
-    changed.notify_all();
-    first_thread.join();
-    assert(first_result == 1 && backend_saw_cancel);
+    {
+        FakeEngine engine;
+        MfqScheduler scheduler(engine, {64, 4096}); // bytes, not event count, limits progress
+        auto large = request(0, 100); large.token_ids = {61};
+        auto slow = scheduler.submit(large);
+        drain(scheduler.submit(request(1, 4)));
+        const auto paused = engine.advances[0].load();
+        assert(paused >= 2 && paused <= 3);
+        drain(scheduler.submit(request(2, 4)));
+        assert(engine.advances[0] == paused);
+        scheduler.cancel_request("0");
+        drain(slow, true); // reserved terminal space remains available
+        auto oversized = request(3); oversized.token_ids = {62};
+        auto bad = scheduler.submit(oversized);
+        drain(scheduler.submit(request(4, 4)));
+        drain(bad, false, true);
+        assert(engine.released == 5);
+        bool failed = false;
+        try { scheduler.reload(13); } catch (const std::runtime_error&) { failed = true; }
+        assert(failed);
+        failed = false;
+        try { scheduler.submit(request(5)); } catch (const std::runtime_error&) { failed = true; }
+        assert(failed);
+        assert(scheduler.reload(64) == 64);
+        drain(scheduler.submit(request(6, 4)));
+    }
 }

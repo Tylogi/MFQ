@@ -74,7 +74,7 @@ def test_native_session_identifier_reaches_the_cuda_runtime() -> None:
     assert "std::string session_id;" in HEADER
     assert 'body.contains("mfq_session_id")' in SERVER
     assert "valid_mfq_session_id" in SERVER
-    assert "const MfqPromptCachePlan& cache_plan" in DECODE
+    assert "const auto& cache_plan = request.cache_plan" in DECODE
     assert "cache_plan.session_id" in DECODE
 
 
@@ -83,7 +83,7 @@ def test_stateless_text_requests_use_the_content_addressed_prefix_cache() -> Non
     assert "stable_prefix_tokens" not in SERVER
     assert "persistent_prefix_enabled()" in DECODE
     assert "persistent_prefix_enabled()" in METAL_DECODE
-    assert "!request.cache_plan.session_id.empty() ||" in DECODE
+    assert "!cache_plan.session_id.empty() ||" in DECODE
     assert "!cache_plan.session_id.empty() ||" in METAL_DECODE
     assert "if (!requested_session.empty())" in DECODE
     assert "if (!requested_session.empty())" in METAL_DECODE
@@ -117,9 +117,9 @@ def test_glm_dsa_session_state_preserves_mla_and_index_caches() -> None:
 
 
 def test_partial_stable_prefix_is_saved_before_generation_suffix() -> None:
-    assert "stable > 0 && stable < prompt.size()" in DECODE
-    assert "checkpoint(stable);" in DECODE
-    assert "model.snapshot(std::vector<std::int64_t>(" in ENGINE_FLOW
+    assert "offset < static_cast<int64_t>(plan.stable_prefix_tokens)" in DECODE
+    assert "offset == static_cast<int64_t>(plan.stable_prefix_tokens)) snapshot();" in DECODE
+    assert "model.capture_text_session_state(tokens)" in DECODE
     assert "tokens.size() > maximum_prefix_tokens" in SESSION_CACHE
 
 
@@ -169,7 +169,9 @@ def test_session_cache_retains_history_and_exposes_lifecycle_controls() -> None:
     assert "close_session(" in DECODE
     assert 'server.Post("/runtime/sessions/fork"' in SERVER
     assert 'R"(/runtime/sessions/' in SERVER
-    assert "MfqSessionControl" in HEADER
+    assert "SessionCommand::Kind::fork" in SERVER
+    assert "SessionCommand::Kind::close" in SERVER
+    assert "MfqSessionControl" not in HEADER
 
 
 def test_metal_runtime_matches_native_session_lifecycle_and_limits() -> None:
@@ -265,9 +267,9 @@ def test_tiered_prefix_cache_can_release_only_its_hot_payloads() -> None:
     assert "std::uint64_t trim_hot(" in PAGED_HEADER
     assert "pins_.count(iterator->first) != 0" in PAGED_SOURCE
     assert 'server.Post("/runtime/cache/trim"' in SERVER
-    assert "session_control.trim_hot" in SERVER
+    assert "SessionCommand::Kind::trim" in SERVER
     assert "session_control.trim_hot" in METAL_DECODE
-    assert "state->session_cache.trim_hot(target_bytes)" in DECODE
+    assert "state.cache.trim_hot(command.bytes)" in DECODE
     assert "release_host_allocator_cache()" in METAL_DECODE
     assert "mfq_release_host_allocator_cache()" in DECODE
 

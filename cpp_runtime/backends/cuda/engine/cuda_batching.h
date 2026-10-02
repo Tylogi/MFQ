@@ -1,71 +1,22 @@
 #pragma once
-
-#include "continuous_batching.h"
+#include "engine.h"
 #include "cuda_runtime_config.h"
-
-#include <cstdint>
-#include <functional>
 #include <memory>
-#include <mutex>
-#include <string>
-#include <utility>
-#include <vector>
-
 struct CudaExecutionContext;
-
 namespace mfq::cuda {
-
 struct Qwen35Model;
-template <typename Model>
-struct CausalLm;
+template <typename Model> struct CausalLm;
 using Qwen35CausalLm = CausalLm<Qwen35Model>;
-
-bool qwen_continuous_batch_cuda_graph_enabled(
-    const Qwen35CausalLm& model,
-    const CudaContinuousBatchConfig& config);
-
-using QwenExclusiveGeneration = std::function<std::int32_t(
-    const std::vector<std::int64_t>&,
-    const MfqMultimodalInput*,
-    const MfqSamplingParams&,
-    const MfqTokenCallback&,
-    const MfqPrefillCallback&,
-    const MfqPromptCachePlan&,
-    const MfqTokenConstraintPtr&,
-    const MfqCancellationCheck&)>;
-
-class QwenBatchExecutor final : public mfq::engine::ContinuousBatching {
+bool qwen_continuous_batch_cuda_graph_enabled(const Qwen35CausalLm&, const CudaContinuousBatchConfig&);
+class QwenBatchExecutor final {
 public:
-    QwenBatchExecutor(
-        Qwen35CausalLm& model,
-        CudaExecutionContext& execution,
-        std::mutex& model_mutex,
-        const CudaContinuousBatchConfig& config,
-        std::int64_t prefill_chunk_size,
-        QwenExclusiveGeneration exclusive_generation);
-    ~QwenBatchExecutor() override;
-
-    QwenBatchExecutor(const QwenBatchExecutor&) = delete;
-    QwenBatchExecutor& operator=(const QwenBatchExecutor&) = delete;
-
-    std::int32_t submit(
-        const std::vector<std::int64_t>& prompt,
-        const MfqSamplingParams& sampling,
-        const MfqTokenCallback& on_token,
-        const MfqPrefillCallback& on_prefill,
-        const MfqPromptCachePlan& cache_plan,
-        const MfqTokenConstraintPtr& token_constraint,
-        const MfqCancellationCheck& cancelled,
-        const MfqMultimodalInput* media = nullptr) override;
-    std::vector<std::pair<std::string, double>> metrics() const override;
-
-    std::int64_t queued_requests() const;
-    bool paged_kv_enabled() const noexcept;
-    std::int64_t paged_kv_page_size() const noexcept;
-
+    QwenBatchExecutor(Qwen35CausalLm&, CudaExecutionContext&, const CudaContinuousBatchConfig&, std::int64_t chunk);
+    ~QwenBatchExecutor();
+    void admit(std::string id, const mfq::engine::InferenceRequest&, mfq::engine::InferenceOutput&);
+    mfq::engine::EngineStepResult step(const std::vector<std::string>& eligible);
+    std::vector<std::pair<std::string, double>> metrics() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
-
 } // namespace mfq::cuda

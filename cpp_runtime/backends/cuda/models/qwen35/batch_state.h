@@ -90,6 +90,8 @@ public:
     mfq_tensor_backend::Tensor logits_from_last_hidden(
         mfq_tensor_backend::Tensor hidden);
     std::vector<const void*> decode_state_addresses();
+    QwenBatchState capture_recurrent_slots(const std::vector<std::int32_t>& slots) const;
+    void restore_recurrent_slots(const std::vector<std::int32_t>& slots, const QwenBatchState& state);
 
 private:
     Qwen35CausalLm& model_;

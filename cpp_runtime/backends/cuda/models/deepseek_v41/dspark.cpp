@@ -414,16 +414,15 @@ struct DeepseekV41Dspark final : MtpModule {
         return stage.output_projection(*execution, attended);
     }
 
-    MtpBlockDraft draft_block(
+    Tensor draft_block(
         const MtpTarget& target,
         Tensor anchor_ids,
-        const MtpTokenSelector& select_token,
         int requested) override {
         const auto physical_width = std::min<std::int64_t>(
             config.dspark_block_size,
             maximum_context - position);
         MFQ_RUNTIME_CHECK(
-            select_token && batch == 1 && anchor_ids.dim() == 2 &&
+            batch == 1 && anchor_ids.dim() == 2 &&
                 anchor_ids.size(0) == batch && anchor_ids.size(1) == 1 &&
                 requested > 0 && requested <= config.dspark_block_size &&
                 requested <= physical_width && position > 0 &&
@@ -498,43 +497,14 @@ struct DeepseekV41Dspark final : MtpModule {
             head_hidden, output_norm, config.rms_eps))
                                .to(mfq_tensor_backend::kFloat32)
                                .contiguous();
-        std::vector<Tensor> token_tensors;
-        std::vector<Tensor> logit_rows;
-        std::vector<Tensor> markov_rows;
-        token_tensors.reserve(static_cast<std::size_t>(requested));
-        logit_rows.reserve(static_cast<std::size_t>(requested));
-        markov_rows.reserve(static_cast<std::size_t>(requested));
-        auto previous = anchor_ids;
-        for (int index = 0; index < requested; ++index) {
-            auto markov = quant_embedding_lookup(
-                markov_embedding, previous)
-                              .to(head_hidden.scalar_type())
-                              .contiguous();
-            auto bias = markov_output.forward(*execution, markov)
-                            .to(mfq_tensor_backend::kFloat32);
-            auto logits = base_logits.narrow(1, index, 1) + bias;
-            const auto token = select_token(logits);
-            MFQ_RUNTIME_CHECK(
-                token >= 0 && token < config.vocab,
-                "DeepSeek-V4.1 DSpark selector returned an invalid token");
-            previous = mfq_tensor_backend::full(
-                {batch, 1}, token, anchor_ids.options());
-            token_tensors.push_back(previous);
-            logit_rows.push_back(std::move(logits));
-            markov_rows.push_back(std::move(markov));
-        }
-        auto returned_hidden = head_hidden.narrow(1, 0, requested);
-        auto confidence = confidence_projection.forward(
-            *execution, mfq_tensor_backend::cat(
-                {returned_hidden,
-                 mfq_tensor_backend::cat(markov_rows, 1)},
-                -1).contiguous())
-                              .reshape({batch, requested});
-        return {
-            mfq_tensor_backend::cat(token_tensors, 1).contiguous(),
-            mfq_tensor_backend::cat(logit_rows, 1).contiguous(),
-            std::move(confidence),
-        };
+        return base_logits.narrow(1, 0, requested);
+    }
+
+    Tensor draft_next(Tensor logits, Tensor previous) override {
+        auto markov = quant_embedding_lookup(markov_embedding, previous)
+            .to(mfq_tensor_backend::kFloat16).contiguous();
+        return logits + markov_output.forward(*execution, markov)
+            .to(mfq_tensor_backend::kFloat32);
     }
 };
 

@@ -73,21 +73,11 @@ public:
     explicit MfqStdioTransport(MfqRuntimeTransportConfig config)
         : config_(std::move(config)) {}
 
-    void configure_engine(mfq::engine::Engine & engine) override {
-        configure_text_processor(engine, config_);
-    }
-
     int run(const MfqScheduler & scheduler) override {
-        const auto & duplex = scheduler.duplex();
-        const auto & session_control = scheduler.session_control();
-        const auto & runtime_metrics = scheduler.runtime_metrics();
+        const bool duplex = scheduler.info().duplex;
         if (stdio_protocol_fd < 0) {
             throw std::runtime_error(
                 "prepare_mfq_stdio_transport must be called before model loading");
-        }
-        if (!scheduler.supports_generation()) {
-            throw std::runtime_error(
-                "MFQ runtime transport requires a generation engine");
         }
         const MfqSamplingParams sampling_defaults =
             default_sampling_params(config_);
@@ -115,7 +105,6 @@ public:
         RuntimeRequestMetrics request_metrics_store;
         std::atomic<int64_t> active_context{config_.max_context};
         std::atomic<bool> reloading{false};
-        std::mutex reload_gate;
         struct RealtimeState {
             std::string channel_id;
             std::string session_id;
@@ -171,40 +160,17 @@ public:
             });
         };
         const auto add_runtime_metrics = [&](json & value) {
-            if (!runtime_metrics) return;
-            for (const auto & item : runtime_metrics()) {
+
+            const auto metrics = std::get<mfq::engine::Metrics>(scheduler.control(mfq::engine::RuntimeMetrics{}));
+
+            for (const auto& item : metrics) {
                 value[item.first] = item.second;
             }
         };
         const auto add_session_metrics = [&](json & value) {
-            if (!session_control.metrics) return;
-            for (const auto & item : session_control.metrics()) {
+
+            for (const auto & item : scheduler.session({mfq::engine::SessionCommand::Kind::metrics}).metrics) {
                 value[item.first] = item.second;
-            }
-        };
-        const auto add_request_runtime_metrics = [&](json & value) {
-            if (!runtime_metrics) return;
-            static const std::unordered_set<std::string> names{
-                "mtp_available", "mtp_used", "mtp_cycles",
-                "mtp_drafted_tokens", "mtp_accepted_tokens",
-                "mtp_acceptance_rate", "mtp_selected_depth",
-                "mtp_depth_0_cycles", "mtp_depth_1_cycles",
-                "mtp_depth_2_cycles", "mtp_depth_3_cycles",
-                "mtp_depth_4_cycles", "mtp_depth_5_cycles",
-                "mtp_position_1_acceptance_rate",
-                "mtp_position_2_acceptance_rate",
-                "mtp_position_3_acceptance_rate",
-                "mtp_position_4_acceptance_rate",
-                "mtp_position_5_acceptance_rate",
-                "mtp_depth_0_cycle_ms", "mtp_depth_1_cycle_ms",
-                "mtp_depth_2_cycle_ms", "mtp_depth_3_cycle_ms",
-                "mtp_depth_4_cycle_ms", "mtp_depth_5_cycle_ms",
-                "mtp_target_ms", "mtp_head_ms", "mtp_rollback_ms",
-            };
-            for (const auto & item : runtime_metrics()) {
-                if (names.count(item.first) != 0) {
-                    value[item.first] = item.second;
-                }
             }
         };
         const auto health = [&] {
@@ -280,7 +246,7 @@ public:
                 stop_backend = realtime.backend_started;
                 realtime = {};
             }
-            if (stop_backend) duplex.stop();
+            if (stop_backend) (void)scheduler.control(mfq::engine::StopDuplex{});
             return true;
         };
         const auto emit_realtime = [&](json event) {
@@ -395,11 +361,7 @@ public:
                     continue;
                 }
                 if (op == "session.fork") {
-                    if (!session_control.fork) {
-                        throw ApiError(
-                            501, "unsupported_operation",
-                            "this runtime does not support session forks");
-                    }
+
                     const std::string source = params.value(
                         "source_session_id", std::string());
                     const std::string target = params.value(
@@ -412,16 +374,12 @@ public:
                     }
                     send_result(id, {
                         {"status", "ok"},
-                        {"copied_snapshots", session_control.fork(source, target)},
+                        {"copied_snapshots", scheduler.session({mfq::engine::SessionCommand::Kind::fork, source, target}).count},
                     });
                     continue;
                 }
                 if (op == "session.close") {
-                    if (!session_control.close) {
-                        throw ApiError(
-                            501, "unsupported_operation",
-                            "this runtime does not support session close");
-                    }
+
                     const std::string session_id = params.value(
                         "session_id", std::string());
                     if (!valid_mfq_session_id(session_id)) {
@@ -431,34 +389,17 @@ public:
                     }
                     send_result(id, {
                         {"status", "ok"},
-                        {"released_snapshots", session_control.close(session_id)},
+                        {"released_snapshots", scheduler.session({mfq::engine::SessionCommand::Kind::close, session_id}).count},
                     });
                     continue;
                 }
                 if (op == "cache.clear") {
-                    if (!session_control.clear) {
-                        throw ApiError(
-                            501, "unsupported_operation",
-                            "this runtime does not expose a prefix cache");
-                    }
-                    {
-                        std::lock_guard<std::mutex> lock(reload_gate);
-                        if (reloading.exchange(true)) {
-                            throw ApiError(
-                                409, "conflict",
-                                "a runtime control operation is already in progress");
-                        }
-                        if (request_metrics_store.active_requests() != 0) {
-                            reloading.store(false);
-                            throw ApiError(
-                                409, "conflict",
-                                "cannot clear the prefix cache during generation");
-                        }
-                    }
+
+
                     try {
                         json result = {
                             {"status", "ok"},
-                            {"released_snapshots", session_control.clear()},
+                            {"released_snapshots", scheduler.session({mfq::engine::SessionCommand::Kind::clear}).count},
                         };
                         add_session_metrics(result);
                         reloading.store(false);
@@ -470,11 +411,7 @@ public:
                     continue;
                 }
                 if (op == "cache.trim") {
-                    if (!session_control.trim_hot) {
-                        throw ApiError(
-                            501, "unsupported_operation",
-                            "this runtime does not expose a tiered prefix cache");
-                    }
+
                     const int64_t target = integer_field(
                         params, "target_bytes", 0);
                     if (target < 0) {
@@ -484,8 +421,7 @@ public:
                     }
                     json result = {
                         {"status", "ok"},
-                        {"released_bytes", session_control.trim_hot(
-                            static_cast<uint64_t>(target))},
+                        {"released_bytes", scheduler.session({mfq::engine::SessionCommand::Kind::trim, {}, {}, static_cast<uint64_t>(target)}).count},
                         {"target_bytes", target},
                     };
                     add_session_metrics(result);
@@ -498,20 +434,7 @@ public:
                             501, "unsupported_operation",
                             "this runtime does not support model reload");
                     }
-                    {
-                        std::lock_guard<std::mutex> lock(reload_gate);
-                        if (reloading.exchange(true)) {
-                            throw ApiError(
-                                409, "conflict",
-                                "model reload is already in progress");
-                        }
-                        if (request_metrics_store.active_requests() != 0) {
-                            reloading.store(false);
-                            throw ApiError(
-                                409, "conflict",
-                                "cannot reload during generation");
-                        }
-                    }
+
                     try {
                         const int64_t requested = integer_field(
                             params, "context_size", active_context.load());
@@ -524,6 +447,7 @@ public:
                                 400, "invalid_request_error",
                                 "context_size exceeds model capacity");
                         }
+                        reloading.store(true);
                         const int64_t loaded = scheduler.reload(requested);
                         if (loaded < 1 ||
                             (capacity > 0 && loaded > capacity)) {
@@ -713,7 +637,7 @@ public:
                                     parameters.special_ids.end());
                         }
                         try {
-                            duplex.start(parameters);
+                            (void)scheduler.control(parameters);
                             std::lock_guard<std::mutex> lock(realtime_gate);
                             realtime.backend_started = true;
                         } catch (...) {
@@ -728,7 +652,7 @@ public:
                             {"mode", "full_duplex"},
                             {"metrics", {{
                                 "backend",
-                                duplex.name.empty() ? "native" : duplex.name
+                                "cuda"
                             }}},
                         });
                         send_result(id, {{"status", "ok"}});
@@ -803,10 +727,10 @@ public:
                             400, "invalid_request_error",
                             "force_listen and force_speak are mutually exclusive");
                     }
-                    const auto result = duplex.step(step);
+                    const auto result = std::get<MfqDuplexStepResult>(scheduler.control(step));
                     const std::string response_id = request_id("resp-");
                     json metrics = {
-                        {"backend", duplex.name.empty() ? "native" : duplex.name},
+                        {"backend", "cuda"},
                         {"wall_clock_ms", result.inference_ms},
                         {"kv_cache_length", result.language_cache_position},
                         {"audio_cache_length", result.audio_cache_position},
@@ -863,80 +787,59 @@ public:
                         404, "unsupported_operation",
                         "unsupported stdio operation: " + op);
                 }
-                if (duplex_active()) {
-                    throw ApiError(
-                        409, "conflict",
-                        "the model is reserved by an active realtime session");
+                const json body = runtime_generate_body(params);
+                auto input = parse_input(
+                    body, true, sampling_defaults);
+                if (body.contains("mfq_multimodal")) {
+                    if (!input.sampling.enable_vision) {
+                        throw ApiError(
+                            400, "invalid_request_error",
+                            "vision is disabled for this request");
+                    }
+                    if (!scheduler.supports_multimodal_generation()) {
+                        throw ApiError(
+                            501, "unsupported_parameter",
+                            "the loaded model has no native vision runtime");
+                    }
+                    input.media = parse_mfq_vision(
+                        body["mfq_multimodal"]);
                 }
-                if (reloading.load()) {
-                    throw ApiError(
-                        503, "service_unavailable",
-                        "model reload is in progress");
-                }
-                auto cancellation = scheduler.activate_request(id);
-                if (!cancellation) {
-                    throw ApiError(
-                        409, "conflict",
-                        "stdio request id is already active");
-                }
+                RequestWork work = std::move(input);
+                auto completion = std::make_shared<CompletionStream>(scheduler, work, id);
                 auto done = std::make_shared<std::atomic<bool>>(false);
                 tasks.push_back({
                     std::thread([
-                        &, id, params, cancellation, done
+                        &, id, work = std::move(work), completion, done
                     ]() mutable {
                         try {
-                            const json body = runtime_generate_body(params);
-                            auto input = parse_input(
-                                body, true, sampling_defaults);
-                            if (body.contains("mfq_multimodal")) {
-                                if (!input.sampling.enable_vision) {
-                                    throw ApiError(
-                                        400, "invalid_request_error",
-                                        "vision is disabled for this request");
-                                }
-                                if (!scheduler.supports_multimodal_generation()) {
-                                    throw ApiError(
-                                        501, "unsupported_parameter",
-                                        "the loaded model has no native vision runtime");
-                                }
-                                input.media = parse_mfq_vision(
-                                    body["mfq_multimodal"]);
-                            }
-                            RequestWork work = scheduler.prepare_inference(
-                                std::move(input), active_context.load());
-                            cancellation->set_session_id(
-                                work.cache_plan.session_id);
                             const std::string response_id =
                                 request_id("run-");
                             const int64_t created = unix_time_seconds();
                             ActiveRequest active_request(request_metrics_store);
-                            RequestMetrics metrics;
-                            CompletionResult result = scheduler.run_inference(
-                                work, *cancellation,
-                                [&](const common_chat_msg_diff & diff) {
-                                    if (!work.stream) return true;
+                            while (auto diffs = completion->next()) {
+                                if (!work.stream) continue;
+                                for (const auto& diff : *diffs) {
                                     json delta = chat_diff_json(diff);
-                                    if (delta.empty()) return true;
-                                    auto event = runtime_generation_event(
-                                        "delta", response_id, created,
-                                        config_.model_name);
+                                    if (delta.empty()) continue;
+                                    auto event = runtime_generation_event("delta", response_id, created, config_.model_name);
                                     event["delta"] = std::move(delta);
-                                    return send_event(id, std::move(event));
-                                },
-                                &metrics, !work.stream,
-                                [] { return request_id("call_"); });
+                                    if (!send_event(id, std::move(event))) { completion->cancel(); break; }
+                                }
+                            }
+                            auto result = std::move(completion->result);
+                            auto metrics = completion->metrics;
                             const RequestMetricValues metric_values =
                                 request_metric_values(result, metrics);
                             log_request_metrics(
                                 response_id, true, work.stream,
-                                work.prompt.size(), work.sampling,
+                                completion->prompt_tokens, work.sampling,
                                 result, metric_values);
                             active_request.complete(
                                 response_id, true, work.stream,
-                                work.prompt.size(), result, metric_values);
+                                completion->prompt_tokens, result, metric_values);
                             auto performance = request_metric_values_json(
                                 metric_values, work.sampling);
-                            add_request_runtime_metrics(performance);
+                            add_request_runtime_metrics(performance, metrics);
                             if (work.stream) {
                                 auto complete = runtime_generation_event(
                                     "complete", response_id, created,
@@ -949,7 +852,7 @@ public:
                                         "usage", response_id, created,
                                         config_.model_name);
                                     usage["usage"] = usage_json(
-                                        work.prompt.size(),
+                                        completion->prompt_tokens,
                                         result.completion_tokens);
                                     send_event(id, std::move(usage));
                                 }
@@ -958,7 +861,7 @@ public:
                                     response_id, created, config_.model_name,
                                     result,
                                     usage_json(
-                                        work.prompt.size(),
+                                        completion->prompt_tokens,
                                         result.completion_tokens),
                                     std::move(performance)));
                             }
@@ -974,7 +877,6 @@ public:
                             send_error(
                                 id, 500, "server_error", error.what());
                         }
-                        cancellation->finish();
                         done->store(true, std::memory_order_release);
                     }),
                     done,

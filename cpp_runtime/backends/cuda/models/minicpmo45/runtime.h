@@ -83,7 +83,7 @@ struct MiniCPMO45Runtime {
         return result;
     }
 
-    MiniCPMO45ForwardResult forward(
+    MiniCPMO45ForwardResult encode(
             mfq_tensor_backend::Tensor input_ids,
             mfq_tensor_backend::Tensor position_ids,
             mfq_tensor_backend::Tensor attention_mask,
@@ -93,16 +93,7 @@ struct MiniCPMO45Runtime {
             mfq_tensor_backend::Tensor image_bounds,
             mfq_tensor_backend::Tensor audio_features,
             mfq_tensor_backend::Tensor audio_lengths,
-            mfq_tensor_backend::Tensor audio_bounds,
-            const MfqCancellationCheck& cancelled = {}) {
-        // ponytail: cancel at encoder/prefill boundaries; add chunk/layer
-        // checks if cancellation latency needs a tighter bound.
-        const auto check_cancelled = [&] {
-            if (cancelled && cancelled()) {
-                throw mfq::engine::InferenceCancelled{};
-            }
-        };
-        check_cancelled();
+            mfq_tensor_backend::Tensor audio_bounds) {
         if (input_ids.dim() == 1) input_ids = input_ids.unsqueeze(0);
         if (input_ids.dim() != 2) {
             throw std::runtime_error(
@@ -111,7 +102,6 @@ struct MiniCPMO45Runtime {
         input_ids = input_ids.to(mfq_tensor_backend::kCUDA, mfq_tensor_backend::kInt64).contiguous();
         MiniCPMO45ForwardResult result;
         result.input_embeddings = language.embed_forward(input_ids);
-        check_cancelled();
         const auto images = minicpmo45_parse_bounds(
             image_bounds, "image");
         if (!images.empty()) {
@@ -123,7 +113,6 @@ struct MiniCPMO45Runtime {
             result.vision_states = vision.forward(
                 *language.execution,
                 pixels.to(mfq_tensor_backend::kCUDA), patch_mask, target_sizes);
-            check_cancelled();
             result.image_embeddings = resampler.forward(
                 *language.execution, result.vision_states, target_sizes);
             for (const auto & bound : images) {
@@ -141,7 +130,6 @@ struct MiniCPMO45Runtime {
                         .to(result.input_embeddings.scalar_type()));
             }
         }
-        check_cancelled();
         const auto audios = minicpmo45_parse_bounds(
             audio_bounds, "audio");
         if (!audios.empty()) {
@@ -175,7 +163,24 @@ struct MiniCPMO45Runtime {
                         .to(result.input_embeddings.scalar_type()));
             }
         }
-        check_cancelled();
+        return result;
+    }
+
+    MiniCPMO45ForwardResult forward(
+            mfq_tensor_backend::Tensor input_ids,
+            mfq_tensor_backend::Tensor position_ids,
+            mfq_tensor_backend::Tensor attention_mask,
+            mfq_tensor_backend::Tensor pixels,
+            mfq_tensor_backend::Tensor patch_mask,
+            mfq_tensor_backend::Tensor target_sizes,
+            mfq_tensor_backend::Tensor image_bounds,
+            mfq_tensor_backend::Tensor audio_features,
+            mfq_tensor_backend::Tensor audio_lengths,
+            mfq_tensor_backend::Tensor audio_bounds) {
+        if (input_ids.dim() == 1) input_ids = input_ids.unsqueeze(0);
+        input_ids = input_ids.to(mfq_tensor_backend::kCUDA, mfq_tensor_backend::kInt64).contiguous();
+        auto result = encode(input_ids, position_ids, attention_mask, pixels,
+            patch_mask, target_sizes, image_bounds, audio_features, audio_lengths, audio_bounds);
         language.reset(input_ids.size(0));
         MfqOptional<mfq_tensor_backend::Tensor> positions = mfq_nullopt;
         if (position_ids.defined()) positions = position_ids;
@@ -185,7 +190,6 @@ struct MiniCPMO45Runtime {
             input_ids, result.input_embeddings,
             positions, mfq_nullopt, nullptr, mask,
             position_ids.defined());
-        check_cancelled();
         result.logits = language.logits_from_hidden(result.hidden_states);
         return result;
     }

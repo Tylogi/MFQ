@@ -289,18 +289,20 @@ def test_minicpmo45_cli_exposes_native_duplex_tensor_contract():
 
 def test_minicpmo45_cuda_server_binds_the_realtime_backend():
     assert 'option == "--minicpmo-duplex"' not in DECODE
-    assert "make_cuda_minicpmo45_duplex_backend(" in MINICPM_ENGINE
-    assert "Components::multimodal_generate(" in MINICPM_ENGINE
+    assert "Components::start(" in MINICPM_ENGINE
+    assert "Components::step(" in MINICPM_ENGINE
+    assert "Components::stop(" in MINICPM_ENGINE
+    assert "Components::prepare(" in MINICPM_ENGINE
     assert "mfq::engine::Engine" not in MINICPM_ENGINE
-    assert "bind_runtime" in CUDA_COMPONENTS
+    assert "bind_runtime" not in CUDA_COMPONENTS
     assert "load_runtime_components(" in CUDA_COMPONENTS
-    assert 'backend.name = "cuda"' in MINICPM_ENGINE
+    assert "runtime_.encode(" in MINICPM_ENGINE
     assert "MiniCPMO45Runtime::load_with_language(" in MINICPM_ENGINE
-    assert "MiniCPM" not in CUDA_ENGINE
+    assert "MiniCPMO45Runtime" not in CUDA_ENGINE
     assert "minicpmo" not in CUDA_OPTIONS.lower()
     assert "MiniCPMO45Runtime" not in CUDA_COMPONENTS
     assert "components.minicpmo" not in CUDA_COMPONENTS
-    assert "session->prepare(" in DECODE
+    assert "duplex_session_->prepare(" in DECODE
     assert "parameters.reference_audio_features" in DECODE
     assert "input.force_speak" in DECODE
     assert "result.tts_force_flush" in DECODE
@@ -310,7 +312,7 @@ def test_minicpmo45_native_servers_share_mfqd_vision_tensors():
     assert "struct MfqMultimodalInput" in SERVER_HEADER
     assert "using MfqVisionInput = MfqMultimodalInput" in SERVER_HEADER
     assert "enum class MfqMultimodalProcessor" in SERVER_HEADER
-    assert "MfqMultimodalGenerateFn" in SERVER_HEADER
+    assert "MfqMultimodalGenerateFn" not in SERVER_HEADER
     assert "parse_mfq_vision(" in SERVER_SOURCE
     assert "class TensorFileReader final" in SERVER_SOURCE
     assert 'value.contains("binary_file")' in SERVER_SOURCE
@@ -318,12 +320,10 @@ def test_minicpmo45_native_servers_share_mfqd_vision_tensors():
     assert 'special_token(tokenizer, "<image>")' in TEXT_PROCESSOR
     assert "MiniCPM-o image placeholder must contain 64 query tokens" in TEXT_PROCESSOR
     assert "special_token(" not in SERVER_SOURCE
-    assert "generate_multimodal_tokens(" in DECODE
-    assert "const MfqCancellationCheck& cancelled" in MINICPM_ENGINE
-    assert "token_constraint,\n            cancelled);" in MINICPM_ENGINE
-    assert "audio_bounds,\n            cancelled);" in MINICPM_ENGINE
-    assert "catch (const mfq::engine::InferenceCancelled&)" in MINICPM_ENGINE
-    assert "check_cancelled();" in GRAPH
+    assert "MfqCancellationCheck" not in MINICPM_ENGINE
+    assert "InferenceCancelled" not in MINICPM_ENGINE
+    assert "check_cancelled" not in GRAPH
+    assert "CudaPreparedPrompt Components::prepare(" in MINICPM_ENGINE
     assert "runtime.forward(" in DECODE
     assert "mfq::cuda::sample_logits(" in DECODE
     assert "generate_multimodal(" in METAL_HEADER

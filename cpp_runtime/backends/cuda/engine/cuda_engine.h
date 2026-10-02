@@ -33,7 +33,24 @@ struct CudaEngineMetadata {
 };
 
 struct CudaEngine final : mfq::engine::Engine {
+    struct Impl;
+    explicit CudaEngine(std::unique_ptr<Impl> impl);
+    CudaEngine(CudaEngine&&) noexcept;
+    CudaEngine& operator=(CudaEngine&&) noexcept;
+    ~CudaEngine() override;
+    mfq::engine::EngineInfo info() const override;
+    mfq::engine::Admission admit(mfq::engine::EngineRequest request) override;
+    void cancel(const mfq::engine::RequestId& id) override;
+    mfq::engine::EngineStepResult step(const std::vector<mfq::engine::RequestId>& eligible) override;
+    mfq::engine::EngineStatus status() const override;
+    mfq::engine::SessionResult session(const mfq::engine::SessionCommand& command) override;
+    std::int64_t reload(std::int64_t context) override;
+    void shutdown() override;
+    mfq::engine::ControlResult control(mfq::engine::ControlRequest request) override;
     CudaEngineMetadata metadata;
+private:
+    friend CudaEngine load_cuda_engine(CudaEngineOptions options);
+    std::unique_ptr<Impl> impl_;
 };
 
 CudaEngine load_cuda_engine(CudaEngineOptions options);

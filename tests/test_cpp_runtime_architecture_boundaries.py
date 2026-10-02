@@ -418,9 +418,12 @@ def test_cuda_runtime_has_one_shared_generation_path() -> None:
 
     assert "generate_tokens" not in generation + header
     assert "MFQ_RUNTIME_QWEN38_TEXT_FLOW" not in CUDA_ENGINE_SOURCE
-    assert "mfq::cuda::internal::generate(" in CUDA_ENGINE_SOURCE
-    assert "mfq::engine::generate(" in generation
-    assert "mfq::engine::generate_target(" in generation
+    assert "current.generation = generate(" in CUDA_ENGINE_SOURCE
+    assert "Generation generate(" in generation
+    assert "co_yield" in generation
+    assert "InferenceOutput& output" in generation
+    assert "class Generation" in header
+    assert "std::function" not in header
     assert "while (generated < max_tokens)" not in generation
     assert "generate_cli_tokens" not in header
     assert not (
@@ -436,7 +439,9 @@ def test_cuda_runtime_has_one_shared_generation_path() -> None:
     assert '"--ids-file"' not in CUDA_RUNTIME_COMMAND
     assert '"--gen"' not in CUDA_RUNTIME_COMMAND
     assert "run_token_mode" not in CUDA_RUNTIME_COMMAND
-    assert "generate_target(" in shared
+    assert "class InferenceOutput" in shared
+    assert "InferenceExecute" not in shared
+    assert "InferenceEmit" not in shared
     assert "InferenceRequest" in shared
     assert "TextGeneration" not in shared
     assert not (
@@ -456,7 +461,7 @@ def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
     assert "class CudaProfilerAccess" not in execution
     assert "inline const CudaProfilerAccess g_profiler" not in execution
     assert "extern CudaProfiler&" not in execution
-    assert "CudaExecutionContext& execution;" in CUDA_ENGINE_SOURCE
+    assert "std::shared_ptr<CudaExecutionContext> execution;" in CUDA_ENGINE_SOURCE
     assert "std::make_shared<CudaExecutionContext>()" in CUDA_ENGINE_SOURCE
     execution_source = (CUDA_OPS / "cuda_execution.cpp").read_text(
         encoding="utf-8"
@@ -564,13 +569,23 @@ def test_cuda_runtime_composes_transport_scheduler_and_engine() -> None:
         CUDA_RUNTIME / "cuda_engine.h"
     ).read_text(encoding="utf-8")
     assert "class Engine" in engine_contract
-    assert "virtual ~Engine() = 0" in engine_contract
+    assert "virtual ~Engine() = default" in engine_contract
+    for method in ("info(", "admit(", "cancel(", "step(", "status(", "session(", "reload(", "shutdown("):
+        assert method in engine_contract
+    assert "std::function" not in engine_contract
+    transport_common = (ROOT / "cpp_runtime" / "transport" / "src" / "common.cpp").read_text(encoding="utf-8")
+    request_metrics = transport_common.split("void add_request_runtime_metrics(", 1)[1].split("RequestMetricValues request_metric_values(", 1)[0]
+    assert "metrics.mtp" in request_metrics
+    assert "scheduler" not in request_metrics
+    assert "CallbackEngine" not in engine_contract
     assert "struct CudaEngine final : mfq::engine::Engine" in cuda_engine_header
-    assert "CudaEngine engine;" in CUDA_ENGINE_SOURCE
-    assert "std::unique_ptr<mfq::engine::ContinuousBatching>" in CUDA_ENGINE_SOURCE
-    assert "make_cuda_continuous_batching(" in CUDA_ENGINE_SOURCE
+    assert "std::unique_ptr<QwenBatchExecutor>" in CUDA_ENGINE_SOURCE
+    assert "ContinuousBatchingController" not in CUDA_ENGINE_SOURCE
+    assert "current.generation.next()" in CUDA_ENGINE_SOURCE
     assert "qwen35::QwenBatchExecutor" not in CUDA_ENGINE_SOURCE
-    assert "const mfq::engine::Engine& engine_" in scheduler
+    assert "mfq::engine::Engine& engine_" in scheduler
+    assert "mailbox_" in scheduler
+    assert "std::thread worker_" in scheduler
     assert "MfqInferenceEngine" not in (
         ROOT / "cpp_runtime" / "core" / "include" / "mfq" / "runtime.h"
     ).read_text(encoding="utf-8")

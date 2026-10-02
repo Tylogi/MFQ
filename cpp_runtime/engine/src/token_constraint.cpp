@@ -15,7 +15,6 @@
 #include <vector>
 
 namespace mfq::engine {
-namespace {
 
 class GrammarConstraint {
 public:
@@ -162,32 +161,23 @@ private:
     std::vector<mfq_text_token_data> candidates_;
 };
 
-MfqTokenConstraintPtr wrap_constraint(
-        std::shared_ptr<GrammarConstraint> implementation) {
-    auto constraint = std::make_shared<MfqTokenConstraint>();
-    constraint->allows = [implementation](std::int64_t token) {
-        return implementation->allows(token);
-    };
-    constraint->apply = [implementation](float* logits, std::size_t count) {
-        implementation->apply(logits, count);
-    };
-    constraint->accept = [implementation](std::int64_t token) {
-        implementation->accept(token);
-    };
-    constraint->clone = [implementation] {
-        return wrap_constraint(implementation->clone());
-    };
-    return constraint;
-}
-
-} // namespace
-
 MfqTokenConstraintPtr make_chat_token_constraint(
         const MfqTokenizer& tokenizer,
         const common_chat_params& params) {
     if (params.grammar.empty()) return {};
-    return wrap_constraint(
+    return std::make_shared<MfqTokenConstraint>(
         std::make_shared<GrammarConstraint>(tokenizer, params));
 }
 
 } // namespace mfq::engine
+
+MfqTokenConstraint::MfqTokenConstraint(std::shared_ptr<mfq::engine::GrammarConstraint> implementation)
+    : implementation_(std::move(implementation)) {
+    if (!implementation_) throw std::invalid_argument("grammar cursor is empty");
+}
+bool MfqTokenConstraint::allows(std::int64_t token) { return implementation_->allows(token); }
+void MfqTokenConstraint::apply(float* logits, std::size_t count) { implementation_->apply(logits, count); }
+void MfqTokenConstraint::accept(std::int64_t token) { implementation_->accept(token); }
+std::shared_ptr<MfqTokenConstraint> MfqTokenConstraint::clone() const {
+    return std::make_shared<MfqTokenConstraint>(implementation_->clone());
+}

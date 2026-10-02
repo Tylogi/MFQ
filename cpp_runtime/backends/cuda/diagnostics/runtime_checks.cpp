@@ -14,7 +14,6 @@
 #include <atomic>
 #include <iostream>
 #include <memory>
-#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -37,7 +36,6 @@ int run_qwen35_mtp_bench(
     const auto runtime_config = resolve_cuda_runtime_config({});
     TextSessionCache session_cache(
         runtime_config.session_cache, runtime_config.prefix_cache);
-    std::mutex model_mutex;
     MfqSamplingParams params;
     params.max_tokens = generated_tokens;
     params.temperature = 0.;
@@ -84,12 +82,13 @@ int run_qwen35_mtp_bench(
                 MFQ_CUDA_CHECK(cudaProfilerStart());
             }
             const auto started = Clock::now();
-            const int produced = generate(model, model_mutex, graph_cache,
-                session_cache, runtime_config, prompt, params, [&](int64_t token) {
-                    if (output.empty()) first_token = Clock::now();
-                    output.push_back(token);
-                    return true;
-                }, [&](const MfqPrefillTiming& timing) { prefill = timing; }, {}, {}, &mtp);
+            mfq::engine::InferenceRequest request;
+            request.prompt = prompt; request.sampling = params;
+            mfq::engine::InferenceOutput parsed(request, nullptr, "bench");
+            auto result = collect_generation(generate(model, graph_cache, session_cache,
+                runtime_config, request, parsed, &mtp));
+            output = std::move(result.tokens); prefill = result.prefill; first_token = result.first_token;
+            const int produced = static_cast<int>(output.size());
             mfq_cuda_synchronize();
             const auto finished = Clock::now();
             if (capture_request) {
@@ -125,321 +124,74 @@ int run_qwen35_mtp_bench(
 }
 
 
-int run_qwen_continuous_batching_check(
-        Qwen35CausalLm& model,
-        const CudaRuntimeConfig& runtime_config) {
-    auto check_config = runtime_config;
-    check_config.generation.prefill_chunk_size = 64;
-    check_config.continuous_batch.scheduling.max_sequences = 4;
-    check_config.continuous_batch.scheduling.initial_batch_wait =
-        std::chrono::milliseconds(100);
-    auto& execution = *model.execution;
-    MFQ_RUNTIME_CHECK(model.vocab_size() > 1024 &&
-        model.max_position_embeddings() >= 208,
-        "continuous batching check requires vocab>1024 and context>=208");
-
-    MfqSamplingParams first_params;
-    first_params.max_tokens = 20;
-    first_params.temperature = 0.0;
-    first_params.top_k = 1;
-    first_params.top_p = 1.0;
-    first_params.enable_mtp = false;
-    first_params.seed = 20260907;
-    auto second_params = first_params;
-    second_params.max_tokens = 18;
-    second_params.seed += 1;
-    std::vector<int64_t> first_prompt(193);
-    std::vector<int64_t> second_prompt(17);
-    for (size_t index = 0; index < first_prompt.size(); ++index) {
-        first_prompt[index] = 101 +
-            static_cast<int64_t>((index * 37) % 900);
-    }
-    for (size_t index = 0; index < second_prompt.size(); ++index) {
-        second_prompt[index] = 113 +
-            static_cast<int64_t>((index * 53) % 880);
-    }
-    auto serial = [&](const std::vector<int64_t> & prompt,
-                      const MfqSamplingParams & params) {
-        std::vector<int64_t> output;
-        std::mutex mutex;
-        DecodeGraphCache graph_cache(
-            model.max_position_embeddings());
-        TextSessionCache session_cache(
-            check_config.session_cache, check_config.prefix_cache);
-        const int32_t produced = generate(
-            model, mutex, graph_cache, session_cache, check_config,
-            prompt, params,
-            [&](int64_t token) {
-                output.push_back(token);
-                return true;
-            }, {}, {}, {}, nullptr);
-        MFQ_RUNTIME_CHECK(
-            produced == params.max_tokens &&
-                output.size() == static_cast<size_t>(produced),
-            "continuous batching serial oracle length mismatch");
-        return output;
+int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeConfig& runtime_config) {
+    using namespace mfq::engine;
+    auto config = runtime_config;
+    config.generation.prefill_chunk_size = 64;
+    config.continuous_batch.max_sequences = 4;
+    MfqSamplingParams sampling;
+    sampling.max_tokens = 20; sampling.temperature = 0; sampling.top_k = 1; sampling.enable_mtp = false;
+    std::vector<int64_t> first_prompt(193), second_prompt(17);
+    for (size_t i = 0; i < first_prompt.size(); ++i) first_prompt[i] = 101 + (i * 37) % 900;
+    for (size_t i = 0; i < second_prompt.size(); ++i) second_prompt[i] = 113 + (i * 53) % 880;
+    DecodeGraphCache graph(model.max_position_embeddings());
+    TextSessionCache cache(config.session_cache, config.prefix_cache);
+    auto serial = [&](const std::vector<int64_t>& prompt, MfqPromptCachePlan plan = {}) {
+        InferenceRequest request; request.prompt = prompt; request.sampling = sampling; request.cache_plan = std::move(plan);
+        InferenceOutput output(request, nullptr, "serial");
+        return collect_generation(generate(model, graph, cache, config, request, output)).tokens;
     };
-    const auto first_reference = serial(first_prompt, first_params);
-    const auto second_reference = serial(second_prompt, second_params);
-    model.reset(1);
-
-    std::mutex model_mutex;
-    DecodeGraphCache batch_graph(model.max_position_embeddings());
-    TextSessionCache batch_sessions(
-        check_config.session_cache, check_config.prefix_cache);
-    auto exclusive_generation = [
-            &model, &batch_graph, &batch_sessions, &check_config](
-            const std::vector<int64_t>& prompt,
-            const MfqMultimodalInput* media,
-            const MfqSamplingParams& sampling,
-            const MfqTokenCallback& on_token,
-            const MfqPrefillCallback& on_prefill,
-            const MfqPromptCachePlan& cache_plan,
-            const MfqTokenConstraintPtr& token_constraint,
-            const MfqCancellationCheck& cancelled) {
-        MFQ_RUNTIME_CHECK(
-            media == nullptr && !sampling.enable_mtp,
-            "continuous batching check received an unsupported special request");
-        std::mutex already_locked_model;
-        return generate(
-            model, already_locked_model, batch_graph, batch_sessions,
-            check_config, prompt, sampling, on_token, on_prefill,
-            cache_plan, token_constraint, nullptr, {}, cancelled);
-    };
-    mfq::cuda::QwenBatchExecutor batcher(
-        model, execution, model_mutex, check_config.continuous_batch,
-        check_config.generation.prefill_chunk_size,
-        std::move(exclusive_generation));
-    std::mutex gate_mutex;
-    std::condition_variable gate_ready;
-    bool first_prefilled = false;
-    bool second_delivered = false;
-    bool release_first = false;
-    std::vector<int64_t> first_output;
-    std::vector<int64_t> second_output;
-    std::exception_ptr first_error;
-    std::exception_ptr second_error;
-    int32_t first_produced = 0;
-    int32_t second_produced = 0;
-
-    std::thread first_thread([&] {
-        try {
-            first_produced = batcher.submit(
-                first_prompt, first_params,
-                [&](int64_t token) {
-                    first_output.push_back(token);
-                    if (first_output.size() == 1) {
-                        std::unique_lock<std::mutex> lock(gate_mutex);
-                        first_prefilled = true;
-                        gate_ready.notify_one();
-                        gate_ready.wait(lock, [&] { return release_first; });
-                    }
-                    return true;
-                }, {}, {}, {}, {});
-        } catch (...) {
-            first_error = std::current_exception();
-        }
-    });
-    bool first_queued = false;
-    for (int attempt = 0; attempt < 50; ++attempt) {
-        if (batcher.queued_requests() > 0) {
-            first_queued = true;
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    std::thread second_thread([&] {
-        try {
-            second_produced = batcher.submit(
-                second_prompt, second_params,
-                [&](int64_t token) {
-                    second_output.push_back(token);
-                    if (second_output.size() == 1) {
-                        std::lock_guard<std::mutex> lock(gate_mutex);
-                        second_delivered = true;
-                        gate_ready.notify_one();
-                    }
-                    return true;
-                }, {}, {}, {}, {});
-        } catch (...) {
-            second_error = std::current_exception();
-        }
-    });
-    bool first_callback_started = false;
-    bool callback_isolated = false;
+    const auto first_reference = serial(first_prompt), second_reference = serial(second_prompt);
+    graph.invalidate(); // Physical batch slots replace the serial graph's storage.
     {
-        std::unique_lock<std::mutex> lock(gate_mutex);
-        first_callback_started = gate_ready.wait_for(
-            lock, std::chrono::seconds(10), [&] {
-                return first_prefilled;
-            });
-        callback_isolated = first_callback_started && gate_ready.wait_for(
-            lock, std::chrono::seconds(10), [&] {
-                return second_delivered;
-            });
-        release_first = true;
+        QwenBatchExecutor batcher(model, *model.execution, config.continuous_batch, 64);
+        InferenceRequest first, second;
+        first.prompt = first_prompt; first.sampling = sampling;
+        second.prompt = second_prompt; second.sampling = sampling;
+        InferenceOutput first_output(first, nullptr, "first"), second_output(second, nullptr, "second");
+        batcher.admit("first", first, first_output); batcher.admit("second", second, second_output);
+        std::vector<int64_t> a, b;
+        bool first_done = false, second_done = false;
+        int paused_ticks = 0;
+        while (!first_done || !second_done) {
+            const bool pause = !a.empty() && paused_ticks < 4 && !second_done;
+            const auto prior = a.size();
+            auto step = batcher.step(pause ? std::vector<std::string>{"second"} : std::vector<std::string>{"first", "second"});
+            for (auto& event : step.events) {
+                if (auto* failure = std::get_if<Failed>(&event.data)) throw std::runtime_error(failure->message);
+                if (auto* delta = std::get_if<OutputDelta>(&event.data)) {
+                    auto& tokens = event.id == "first" ? a : b;
+                    tokens.insert(tokens.end(), delta->token_ids.begin(), delta->token_ids.end());
+                }
+                if (terminal(event.data)) (event.id == "first" ? first_done : second_done) = true;
+            }
+            if (pause) { ++paused_ticks; MFQ_RUNTIME_CHECK(a.size() == prior, "paused row advanced"); }
+        }
+        if (a != first_reference || b != second_reference) {
+            for (const auto& [name, values] : std::vector<std::pair<const char*, std::vector<int64_t>>>{
+                    {"first_serial", first_reference}, {"first_batch", a},
+                    {"second_serial", second_reference}, {"second_batch", b}}) {
+                std::cerr << name << ':';
+                for (auto token : values) std::cerr << ' ' << token;
+                std::cerr << '\n';
+            }
+        }
+        MFQ_RUNTIME_CHECK(a == first_reference && b == second_reference && paused_ticks == 4,
+            "batched or resumed output differs from serial oracle");
+        InferenceOutput output(second, nullptr, "cancel");
+        batcher.admit("cancel", second, output);
+        while (!output.result.completion_tokens) (void)batcher.step({"cancel"});
+        output.result.cancelled = true;
+        auto cleanup = batcher.step({});
+        MFQ_RUNTIME_CHECK(cleanup.events.size() == 1 && std::holds_alternative<Cancelled>(cleanup.events[0].data),
+            "cancelled physical request did not release exactly once");
+        for (const auto& [key, value] : batcher.metrics())
+            if (key == "paged_kv_live_pages") MFQ_RUNTIME_CHECK(value == 0, "paged KV leaked");
     }
-    gate_ready.notify_one();
-    first_thread.join();
-    second_thread.join();
-    if (first_error) std::rethrow_exception(first_error);
-    if (second_error) std::rethrow_exception(second_error);
-    MFQ_RUNTIME_CHECK(first_queued && first_callback_started &&
-        callback_isolated,
-        "a blocked response callback stalled the scheduler");
-    MFQ_RUNTIME_CHECK(first_produced == first_params.max_tokens &&
-        second_produced == second_params.max_tokens,
-        "continuous batching generated token count mismatch");
-    const auto print_mismatch = [](const char * name,
-            const std::vector<int64_t> & reference,
-            const std::vector<int64_t> & actual) {
-        if (reference == actual) return;
-        std::cerr << "continuous_batching_check mismatch " << name << " reference=";
-        for (auto token : reference) std::cerr << token << ',';
-        std::cerr << " actual=";
-        for (auto token : actual) std::cerr << token << ',';
-        std::cerr << '\n';
-    };
-    print_mismatch("first", first_reference, first_output);
-    print_mismatch("second", second_reference, second_output);
-    MFQ_RUNTIME_CHECK(first_output == first_reference,
-        "continuous batching first request differs from serial greedy oracle");
-    MFQ_RUNTIME_CHECK(second_output == second_reference,
-        "continuous batching second request differs from serial greedy oracle");
-    auto cancel_params = second_params;
-    cancel_params.max_tokens = 12;
-    int32_t cancellation_callbacks = 0;
-    const int32_t cancellation_produced = batcher.submit(
-        second_prompt, cancel_params,
-        [&](int64_t) {
-            ++cancellation_callbacks;
-            return false;
-        }, {}, {}, {}, {});
-    MFQ_RUNTIME_CHECK(cancellation_produced == 1 &&
-        cancellation_callbacks == 1,
-        "continuous batching callback cancellation did not stop at one token");
-
-    auto prefix_params = first_params;
-    prefix_params.max_tokens = 2;
-    const auto prefix_reference = serial(first_prompt, prefix_params);
-    model.reset(1);
-    MfqPromptCachePlan prefix_plan{
-        "continuous-batch-check", first_prompt.size() - 1};
-    std::vector<int64_t> first_cached;
-    std::vector<int64_t> second_cached;
-    const auto first_cached_count = batcher.submit(
-        first_prompt, prefix_params,
-        [&](int64_t token) {
-            first_cached.push_back(token);
-            return true;
-        }, {}, prefix_plan, {}, {});
-    const auto second_cached_count = batcher.submit(
-        first_prompt, prefix_params,
-        [&](int64_t token) {
-            second_cached.push_back(token);
-            return true;
-        }, {}, prefix_plan, {}, {});
-    MFQ_RUNTIME_CHECK(
-        first_cached_count == prefix_params.max_tokens &&
-        second_cached_count == prefix_params.max_tokens &&
-        first_cached == prefix_reference &&
-        second_cached == prefix_reference,
-        "continuous batching prefix reuse differs from serial oracle");
-
-    const auto values = batcher.metrics();
-    auto metric = [&](const std::string & name) {
-        const auto found = std::find_if(
-            values.begin(), values.end(), [&](const auto & item) {
-                return item.first == name;
-            });
-        return found == values.end() ? 0.0 : found->second;
-    };
-    const auto cache_values = batch_sessions.metrics();
-    const auto cache_metric = [&](const std::string& name) {
-        const auto found = std::find_if(
-            cache_values.begin(), cache_values.end(), [&](const auto& item) {
-                return item.first == name;
-            });
-        return found == cache_values.end() ? 0.0 : found->second;
-    };
-    std::cout << "continuous_batching_check metrics max_batch="
-              << metric("continuous_batching_max_batch")
-              << " stable_slot_releases="
-              << metric("continuous_batching_stable_slot_releases")
-              << " batched_greedy_batches="
-              << metric("continuous_batching_batched_greedy_batches")
-              << " packed_metadata_batches="
-              << metric("continuous_batching_packed_metadata_batches")
-              << " cuda_graph_captures="
-              << metric("continuous_batching_cuda_graph_captures")
-              << " cuda_graph_replays="
-              << metric("continuous_batching_cuda_graph_replays")
-              << " paged_kv="
-              << metric("continuous_batching_paged_kv")
-              << " page_size="
-              << metric("paged_kv_page_size")
-              << " live_pages="
-              << metric("paged_kv_live_pages")
-              << " peak_pages="
-              << metric("paged_kv_peak_live_pages")
-              << " capacity_pages="
-              << metric("paged_kv_capacity_pages")
-              << " page_allocations="
-              << metric("paged_kv_page_allocations")
-              << " page_reuses="
-              << metric("paged_kv_page_reuses")
-              << " page_releases="
-              << metric("paged_kv_page_releases")
-              << " active="
-              << metric("continuous_batching_active")
-              << " prefilling="
-              << metric("continuous_batching_prefilling")
-              << " prefill_chunks="
-              << metric("continuous_batching_prefill_chunks")
-              << " prefill_yields="
-              << metric("continuous_batching_prefill_yields")
-              << " queued="
-              << metric("continuous_batching_queued") << '\n';
-    MFQ_RUNTIME_CHECK(metric("continuous_batching_max_batch") >= 2.0 &&
-        metric("continuous_batching_compactions") == 0.0 &&
-        metric("continuous_batching_stable_slot_releases") >= 1.0 &&
-        (!check_config.continuous_batch.greedy ||
-            metric("continuous_batching_batched_greedy_batches") >= 1.0) &&
-        metric("continuous_batching_packed_metadata_batches") >= 1.0 &&
-        (!mfq::cuda::qwen_continuous_batch_cuda_graph_enabled(
-                model, check_config.continuous_batch) ||
-             (metric("continuous_batching_cuda_graph_captures") >= 1.0 &&
-             metric("continuous_batching_cuda_graph_replays") >= 2.0)) &&
-        (!check_config.continuous_batch.paged_kv ||
-            (metric("continuous_batching_paged_kv") == 1.0 &&
-             metric("paged_kv_page_size") ==
-                static_cast<double>(batcher.paged_kv_page_size()) &&
-             metric("paged_kv_live_pages") == 0.0 &&
-             metric("paged_kv_peak_live_pages") > 0.0 &&
-             metric("paged_kv_capacity_pages") >=
-                metric("paged_kv_peak_live_pages") &&
-             metric("paged_kv_page_allocations") ==
-                metric("paged_kv_page_releases") &&
-             metric("paged_kv_page_reuses") > 0.0)) &&
-        metric("continuous_batching_prefill_chunks") >= 4.0 &&
-        metric("continuous_batching_prefix_cache_exclusive_requests") == 2.0 &&
-        cache_metric("prefix_cache_hits") >= 1.0 &&
-        cache_metric("prefix_cache_hit_tokens") >=
-            static_cast<double>(first_prompt.size() - 1) &&
-        metric("continuous_batching_active") == 0.0 &&
-        metric("continuous_batching_prefilling") == 0.0 &&
-        metric("continuous_batching_queued") == 0.0,
-        "continuous batching check did not exercise join and retire");
-    std::cout << "continuous_batching_check PASS concurrent_requests=2"
-              << " cancellation_tokens=1 prefix_cache_hits="
-              << cache_metric("prefix_cache_hits")
-              << " max_batch="
-              << metric("continuous_batching_max_batch")
-              << " prompt_lengths=193,17 split_k=1"
-              << " decode_batches="
-              << metric("continuous_batching_decode_batches")
-              << " stable_slot_releases="
-              << metric("continuous_batching_stable_slot_releases") << '\n';
+    MfqPromptCachePlan plan{"batch-check", first_prompt.size() - 1};
+    MFQ_RUNTIME_CHECK(serial(first_prompt, plan) == first_reference &&
+        serial(first_prompt, plan) == first_reference, "session restore differs from serial oracle");
+    std::cout << "continuous_batching_check PASS requests=2 paused_ticks=4 cancellation=1 session_reuse=1\n";
     return 0;
 }
 
@@ -490,12 +242,8 @@ int run_cuda_engine_isolation_check(CudaEngineOptions options) {
     const auto serial = [&](CudaEngine& engine,
                             const std::vector<int64_t>& prompt) {
         std::vector<int64_t> output;
-        const auto produced = engine.generate(
-            prompt, sampling,
-            [&](int64_t token) {
-                output.push_back(token);
-                return true;
-            }, {}, {}, {}, {});
+        output = check_engine_steps(engine, prompt, sampling);
+        const auto produced = output.size();
         MFQ_RUNTIME_CHECK(
             produced == sampling.max_tokens &&
             output.size() == static_cast<size_t>(sampling.max_tokens),
@@ -519,12 +267,8 @@ int run_cuda_engine_isolation_check(CudaEngineOptions options) {
             while (ready.load(std::memory_order_acquire) != 2) {
                 std::this_thread::yield();
             }
-            produced = engine.generate(
-                prompt, sampling,
-                [&](int64_t token) {
-                    output.push_back(token);
-                    return true;
-                }, {}, {}, {}, {});
+            output = check_engine_steps(engine, prompt, sampling);
+            produced = static_cast<int32_t>(output.size());
         } catch (...) {
             error = std::current_exception();
         }
@@ -552,8 +296,8 @@ int run_cuda_engine_isolation_check(CudaEngineOptions options) {
         first->metadata.model_type == second->metadata.model_type &&
         first->metadata.max_context == options.context_size &&
         second->metadata.max_context == options.context_size &&
-        !first->runtime_metrics().empty() &&
-        !second->runtime_metrics().empty(),
+        !std::get<mfq::engine::Metrics>(first->control(mfq::engine::RuntimeMetrics{})).empty() &&
+        !std::get<mfq::engine::Metrics>(second->control(mfq::engine::RuntimeMetrics{})).empty(),
         "concurrent CUDA engines did not remain isolated");
     std::cout << "cuda_engine_isolation_check PASS engines=2 generated="
               << first_produced + second_produced

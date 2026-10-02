@@ -185,15 +185,8 @@ load_runtime_components(
             "unsupported MiniCPM-o CUDA vision adapter");
     }
 
-    auto state = std::make_shared<mfq::cuda::minicpmo45::Components>(
-        std::move(model));
-    result.language_override = &state->language();
-    result.bind_runtime = [state](std::mutex& model_mutex) {
-        return CudaRuntimeBindings{
-            state->multimodal_generate(model_mutex),
-            state->duplex(model_mutex),
-        };
-    };
+    result.composite = std::make_unique<mfq::cuda::minicpmo45::Components>(std::move(model));
+    result.language_override = &result.composite->language();
     result.vision_available = true;
     return result;
 }
@@ -209,66 +202,6 @@ load_runtime_components(
     return result;
 }
 
-template <typename Model>
-std::unique_ptr<mfq::engine::ContinuousBatching>
-make_cuda_continuous_batching(
-        Model&,
-        CudaExecutionContext&,
-        std::mutex&,
-        DecodeGraphCache&,
-        mfq::cuda::internal::TextSessionCache&,
-        RuntimeComponents<Model>&,
-        const mfq::cuda::CudaRuntimeConfig&) {
-    return {};
-}
-
-template <>
-std::unique_ptr<mfq::engine::ContinuousBatching>
-make_cuda_continuous_batching(
-        mfq::cuda::Qwen35CausalLm& model,
-        CudaExecutionContext& execution,
-        std::mutex& model_mutex,
-        DecodeGraphCache& decode_graph,
-        mfq::cuda::internal::TextSessionCache& session_cache,
-        RuntimeComponents<mfq::cuda::Qwen35CausalLm>& components,
-        const mfq::cuda::CudaRuntimeConfig& config) {
-    auto exclusive_generation = [
-            &model, &decode_graph, &session_cache, &components, &config](
-            const std::vector<int64_t>& prompt,
-            const MfqMultimodalInput* media,
-            const MfqSamplingParams& sampling,
-            const MfqTokenCallback& on_token,
-            const MfqPrefillCallback& on_prefill,
-            const MfqPromptCachePlan& cache_plan,
-            const MfqTokenConstraintPtr& token_constraint,
-            const MfqCancellationCheck& cancelled) {
-        mfq::cuda::internal::PreparedPromptFactory<
-            mfq::cuda::Qwen35CausalLm> prepare;
-        if (media != nullptr) {
-            if (!components.grid_vision) {
-                throw std::runtime_error(
-                    "continuous batching received unavailable grid vision input");
-            }
-            prepare = [&components, &prompt, media](auto& language) {
-                return std::optional<CudaPreparedPrompt>{
-                    components.grid_vision->prepare(
-                        language, prompt, *media)};
-            };
-        }
-        std::mutex already_locked_model;
-        return mfq::cuda::internal::generate(
-            model, already_locked_model, decode_graph, session_cache,
-            config, prompt, sampling, on_token, on_prefill,
-            cache_plan, token_constraint,
-            sampling.enable_mtp ? components.mtp.get() : nullptr,
-            std::move(prepare), cancelled);
-    };
-    return std::make_unique<mfq::cuda::QwenBatchExecutor>(
-        model, execution, model_mutex, config.continuous_batch,
-        config.generation.prefill_chunk_size,
-        std::move(exclusive_generation));
-}
-
 #define MFQ_INSTANTIATE_COMPONENTS(TYPE)                                  \
     template RuntimeComponents<TYPE> load_runtime_components(TYPE&, bool)
 
@@ -276,21 +209,5 @@ MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::Gemma4CausalLm);
 MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::GlmDsaCausalLm);
 MFQ_INSTANTIATE_COMPONENTS(mfq::cuda::DeepseekV4CausalLm);
 
-#define MFQ_INSTANTIATE_BATCHING(TYPE)                                      \
-    template std::unique_ptr<mfq::engine::ContinuousBatching>               \
-    make_cuda_continuous_batching(                                          \
-        TYPE&, CudaExecutionContext&, std::mutex&, DecodeGraphCache&,       \
-        mfq::cuda::internal::TextSessionCache&, RuntimeComponents<TYPE>&,    \
-        const mfq::cuda::CudaRuntimeConfig&)
 
-MFQ_INSTANTIATE_BATCHING(mfq::cuda::MiniCPMO45CausalLm);
-MFQ_INSTANTIATE_BATCHING(mfq::cuda::MiniCPMOTtsCausalLm);
-MFQ_INSTANTIATE_BATCHING(mfq::cuda::Gemma4CausalLm);
-MFQ_INSTANTIATE_BATCHING(mfq::cuda::GlmDsaCausalLm);
-MFQ_INSTANTIATE_BATCHING(mfq::cuda::Glm5CausalLm);
-MFQ_INSTANTIATE_BATCHING(mfq::cuda::Qwen4CausalLm);
-MFQ_INSTANTIATE_BATCHING(mfq::cuda::DeepseekV4CausalLm);
-MFQ_INSTANTIATE_BATCHING(mfq::cuda::DeepseekV41CausalLm);
-
-#undef MFQ_INSTANTIATE_BATCHING
 #undef MFQ_INSTANTIATE_COMPONENTS

@@ -2,7 +2,6 @@
 
 #include "runtime.h"
 
-#include <mutex>
 #include <optional>
 
 namespace mfq::cuda::minicpmo45 {
@@ -12,8 +11,10 @@ public:
     explicit Components(mfq::cuda::MiniCPMO45CausalLm language);
 
     mfq::cuda::MiniCPMO45CausalLm& language() noexcept;
-    MfqMultimodalGenerateFn multimodal_generate(std::mutex& model_mutex);
-    MfqDuplexBackend duplex(std::mutex& model_mutex);
+    CudaPreparedPrompt prepare(const std::vector<int64_t>& prompt, const MfqMultimodalInput& media);
+    void start(const MfqDuplexSessionParams& parameters);
+    MfqDuplexStepResult step(const MfqDuplexStepInput& input);
+    void stop();
 
 private:
     MiniCPMO45Runtime runtime_;

@@ -484,17 +484,8 @@ InferenceRequest TextProcessor::prepare(
     return work;
 }
 
-InferenceResult TextProcessor::run(
-        const InferenceRequest& request,
-        const InferenceExecute& execute,
-        const std::function<bool()>& cancelled,
-        const InferenceEmit& emit,
-        InferenceMetrics* metrics,
-        bool defer_token_parsing,
-        const std::function<std::string()>& make_tool_call_id) const {
-    return mfq::engine::run_inference(
-        request, *impl_->tokenizer, execute, cancelled, emit, metrics,
-        defer_token_parsing, make_tool_call_id);
+const MfqTokenizer& TextProcessor::tokenizer() const {
+    return *impl_->tokenizer;
 }
 
 void TextProcessor::prepare_duplex_session(

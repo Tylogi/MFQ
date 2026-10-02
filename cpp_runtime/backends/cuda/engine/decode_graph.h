@@ -6,7 +6,6 @@
 #include "../models/qwen35/linear_attention.h"
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <vector>
 
@@ -66,9 +65,9 @@ struct DecodeGraphCache {
         Commit&& commit);
 };
 
-template <typename Model>
+template <typename Model, typename Warmup>
 void prepare_decode_graph_memory(Model& model, MfqCudaGraph& graph,
-        const std::function<void()>& warmup,
+        Warmup&& warmup,
         const std::vector<MfqCudaStream>& participant_streams = {}) {
     using Tensor = mfq_tensor_backend::Tensor;
     struct SavedRecurrentState {
@@ -142,7 +141,6 @@ bool DecodeGraphCache::ensure_captured(
     }
 
     invalidate();
-    mfq_cuda_empty_cache();
     DecodeGraphBranchScope branch_scope(
         model.execution->decode_graph_serial_branches);
     graph = std::make_unique<MfqCudaGraph>();

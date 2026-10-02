@@ -99,9 +99,10 @@ def test_optional_predictor_experts_join_the_shared_moe_cache() -> None:
     )
 
 
-def test_reload_and_request_registration_share_one_gate() -> None:
-    assert "std::mutex reload_gate;" in SERVER
-    assert SERVER.count("std::lock_guard<std::mutex> gate(reload_gate);") >= 2
+def test_reload_and_request_registration_use_scheduler_mailbox() -> None:
+    assert "reload_gate" not in SERVER
+    assert "scheduler.reload(" in SERVER
+    assert "scheduler_.submit(" in SERVER
     assert "std::make_shared<ActiveRequest>(request_metrics_store)" in SERVER
     assert "active_request->complete(" in SERVER
 

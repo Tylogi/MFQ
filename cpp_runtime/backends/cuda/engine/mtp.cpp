@@ -21,148 +21,26 @@
 
 using mfq::cuda::internal::PrefillCudaTimer;
 
-namespace {
-
+using mfq::cuda::internal::Generation;
+using namespace mfq::engine;
 template <typename Model>
-static mfq_tensor_backend::Tensor hidden_forward_chunked(
-    Model& model,
-    const mfq_tensor_backend::Tensor & ids,
-    int64_t chunk_size,
-    const MfqCancellationCheck& cancelled,
-    mfq_tensor_backend::Tensor * raw_hidden = nullptr) {
-    MFQ_RUNTIME_CHECK(
-        chunk_size > 0,
-        "runtime prefill chunk size must be positive");
-    MFQ_RUNTIME_CHECK(
-        ids.dim() == 2 && ids.size(0) == 1 && ids.size(1) > 0,
-        "runtime prefill IDs must have shape [1, tokens]");
-    std::vector<mfq_tensor_backend::Tensor> raw_chunks;
-    if (raw_hidden != nullptr) {
-        raw_chunks.reserve(static_cast<std::size_t>(
-            (ids.size(1) + chunk_size - 1) / chunk_size));
-    }
-    mfq_tensor_backend::Tensor hidden;
-    for (int64_t offset = 0; offset < ids.size(1);) {
-        if (cancelled && cancelled()) {
-            throw mfq::engine::InferenceCancelled{};
-        }
-        const auto chunk = mfq::engine::next_prefill_chunk(
-            ids.size(1), offset, chunk_size);
-        mfq_tensor_backend::Tensor raw_chunk;
-        hidden = model.hidden_forward(
-            ids.narrow(1, chunk.offset, chunk.count).contiguous(),
-            mfq_nullopt,
-            mfq_nullopt,
-            nullptr,
-            mfq_nullopt,
-            raw_hidden != nullptr ? &raw_chunk : nullptr);
-        if (raw_hidden != nullptr) {
-            raw_chunks.push_back(std::move(raw_chunk));
-        }
-        if (cancelled && cancelled()) {
-            throw mfq::engine::InferenceCancelled{};
-        }
-        offset += chunk.count;
-    }
-    if (raw_hidden != nullptr) {
-        *raw_hidden = raw_chunks.size() == 1
-            ? std::move(raw_chunks.front())
-            : mfq_tensor_backend::cat(raw_chunks, 1).contiguous();
-    }
-    return hidden;
-}
-
-template <typename Model>
-static mfq_tensor_backend::Tensor hidden_forward_prepared_chunked(
-    Model& model,
-    const mfq_tensor_backend::Tensor& ids,
-    const CudaPreparedPrompt& prepared,
-    int64_t chunk_size,
-    const MfqCancellationCheck& cancelled,
-    mfq_tensor_backend::Tensor* raw_hidden = nullptr,
-    int64_t prepared_offset = 0) {
-    MFQ_RUNTIME_CHECK(
-        chunk_size > 0 && prepared.transformed() && prepared_offset >= 0 &&
-            ids.dim() == 2 && ids.size(0) == 1 && ids.size(1) > 0 &&
-            prepared.embeddings.defined() && prepared.positions.defined() &&
-            prepared.embeddings.dim() == 3 &&
-            prepared.embeddings.size(0) == 1 &&
-            prepared_offset + ids.size(1) <= prepared.embeddings.size(1) &&
-            prepared.embeddings.size(2) == model.hidden_size() &&
-            (prepared.positions.dim() == 1 ||
-             prepared.positions.dim() == 2) &&
-            prepared_offset + ids.size(1) <= prepared.positions.size(-1),
-        "prepared CUDA prefill tensors disagree with prompt geometry");
-    std::vector<mfq_tensor_backend::Tensor> raw_chunks;
-    if (raw_hidden != nullptr) {
-        raw_chunks.reserve(static_cast<std::size_t>(
-            (ids.size(1) + chunk_size - 1) / chunk_size));
-    }
-    mfq_tensor_backend::Tensor hidden;
-    for (int64_t offset = 0; offset < ids.size(1);) {
-        if (cancelled && cancelled()) {
-            throw mfq::engine::InferenceCancelled{};
-        }
-        const auto chunk = mfq::engine::next_prefill_chunk(
-            ids.size(1), offset, chunk_size);
-        mfq_tensor_backend::Tensor raw_chunk;
-        hidden = model.hidden_forward_inputs(
-            ids.narrow(1, chunk.offset, chunk.count).contiguous(),
-            prepared.embeddings.narrow(
-                1, prepared_offset + chunk.offset, chunk.count).contiguous(),
-            prepared.positions.narrow(
-                -1, prepared_offset + chunk.offset, chunk.count).contiguous(),
-            mfq_nullopt, nullptr, mfq_nullopt, true, mfq_nullopt,
-            raw_hidden != nullptr ? &raw_chunk : nullptr);
-        if (raw_hidden != nullptr) raw_chunks.push_back(std::move(raw_chunk));
-        if (cancelled && cancelled()) {
-            throw mfq::engine::InferenceCancelled{};
-        }
-        offset += chunk.count;
-    }
-    model.decode_position_delta = prepared.decode_position_delta;
-    if (raw_hidden != nullptr) {
-        *raw_hidden = raw_chunks.size() == 1
-            ? std::move(raw_chunks.front())
-            : mfq_tensor_backend::cat(raw_chunks, 1).contiguous();
-    }
-    return hidden;
-}
-
-} // namespace
-
-template <typename Model>
-int32_t run_mtp_generation(
-        Model& model, MtpModule& mtp,
-        const std::vector<int64_t>& prompt, const MfqSamplingParams& sampling,
-        const MfqTokenCallback& on_token, const MfqPrefillCallback& on_prefill,
-        int64_t prefill_chunk_size,
-        const MfqTokenConstraintPtr& token_constraint,
-        const CudaPreparedPrompt* prepared,
-        std::size_t reused_tokens,
-        const mfq_tensor_backend::Tensor& restored_last_hidden,
-        mfq_tensor_backend::Tensor* session_last_hidden,
-        double multimodal_ms,
-        const MfqCancellationCheck& cancelled) {
+Generation run_mtp_generation(Model& model, MtpModule& mtp, InferenceRequest& request,
+        InferenceOutput& output, int64_t prefill_chunk_size,
+        const CudaPreparedPrompt* prepared, std::size_t reused_tokens,
+        mfq_tensor_backend::Tensor restored_last_hidden,
+        mfq_tensor_backend::Tensor* session_last_hidden) {
+    const auto& prompt = request.prompt;
+    const auto& sampling = request.sampling;
+    const auto& token_constraint = request.token_constraint;
     using Tensor = mfq_tensor_backend::Tensor;
     using Clock = std::chrono::steady_clock;
     namespace policy = mfq::engine::mtp;
     using policy::CompactDistribution;
-    const MtpTarget target{
-        [&model](Tensor ids) {
-            return model.embed_forward(std::move(ids));
-        },
-        [&model](Tensor hidden) {
-            return model.logits_from_hidden(std::move(hidden));
-        },
-        &model.rope,
-    };
+    const MtpTarget target(model);
     if (session_last_hidden != nullptr) {
         *session_last_hidden = Tensor();
     }
-    if (cancelled && cancelled()) {
-        throw mfq::engine::InferenceCancelled{};
-    }
+    if (output.result.cancelled) co_return;
     MFQ_RUNTIME_CHECK(
         reused_tokens < prompt.size(),
         "restored MTP prefix must be shorter than the prompt");
@@ -180,9 +58,6 @@ int32_t run_mtp_generation(
              model.cache_pos == static_cast<int64_t>(reused_tokens) &&
              mtp.cache_position() == static_cast<int64_t>(reused_tokens) - 1),
         "restored CUDA MTP session boundary is incompatible");
-    MFQ_RUNTIME_CHECK(
-        mfq_token_constraint_supports_speculation(token_constraint),
-        "CUDA MTP token constraint must support allows/apply/accept/clone");
     mtp.last_stats = {};
     mtp.last_stats.available = true;
     mtp.last_stats.used = true;
@@ -200,7 +75,7 @@ int32_t run_mtp_generation(
         prompt, model.vocab_size(), model.max_position_embeddings(),
         sampling.max_tokens, 0, occupied_context);
     const int32_t limit = generation_plan.generation_tokens;
-    if (limit <= 0) return 0;
+    if (limit <= 0) co_return;
     const auto options = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA)
         .dtype(mfq_tensor_backend::kInt64);
     auto ids_for = [&](std::vector<int64_t> tokens) {
@@ -339,14 +214,13 @@ int32_t run_mtp_generation(
             normalized.to(mfq_tensor_backend::kFloat16)).contiguous());
     };
     int32_t generated = 0;
-    auto emit = [&](int32_t token) {
-        MFQ_RUNTIME_CHECK(
-            token >= 0 && token < model.vocab_size(),
-            "MTP sampled token outside vocabulary");
-        if (token_constraint) token_constraint->accept(token);
-        ++generated;
-        if (penalties) sample_token_counts_add_cuda(counts, ids_for({token}));
-        return !on_token || on_token(token);
+    auto accept = [&](const TokenOutput& delta) {
+        for (const auto token : delta.token_ids) {
+            MFQ_RUNTIME_CHECK(token >= 0 && token < model.vocab_size(), "MTP sampled token outside vocabulary");
+            if (token_constraint) token_constraint->accept(token);
+            ++generated;
+            if (penalties) sample_token_counts_add_cuda(counts, ids_for({token}));
+        }
     };
     struct DraftChain {
         std::vector<int32_t> tokens;
@@ -368,49 +242,54 @@ int32_t run_mtp_generation(
                               policy::kMaximumDraftDepth));
     policy::DepthController depth_controller(maximum_depth);
 
-    auto generate = [&]() {
+    {
         if (reused_tokens == 0) {
             model.reset(1);
             mtp.reset(1);
         }
-        PrefillCudaTimer timer;
-        Tensor raw;
-        auto prefill_ids = input_ids.narrow(
-            1, static_cast<int64_t>(reused_tokens),
-            static_cast<int64_t>(prompt.size() - reused_tokens)).contiguous();
-        auto hidden = transformed_prompt
-            ? hidden_forward_prepared_chunked(
-                  model, prefill_ids, *prepared, prefill_chunk_size,
-                  cancelled, &raw, static_cast<int64_t>(reused_tokens))
-            : hidden_forward_chunked(
-                  model, prefill_ids, prefill_chunk_size, cancelled, &raw);
+        Tensor raw, hidden;
+        std::vector<Tensor> raw_chunks;
+        double prefill_ms = 0.0;
+        for (int64_t offset = static_cast<int64_t>(reused_tokens); offset < input_ids.size(1);) {
+            if (output.result.cancelled) co_return;
+            const auto chunk = next_prefill_chunk(input_ids.size(1), offset, prefill_chunk_size);
+            PrefillCudaTimer timer;
+            Tensor raw_chunk;
+            auto ids = input_ids.narrow(1, chunk.offset, chunk.count).contiguous();
+            hidden = transformed_prompt
+                ? model.hidden_forward_inputs(ids,
+                    prepared->embeddings.narrow(1, chunk.offset, chunk.count).contiguous(),
+                    prepared->positions.narrow(-1, chunk.offset, chunk.count).contiguous(),
+                    mfq_nullopt, nullptr, mfq_nullopt, true, mfq_nullopt, &raw_chunk)
+                : model.hidden_forward(ids, mfq_nullopt, mfq_nullopt, nullptr, mfq_nullopt, &raw_chunk);
+            raw_chunks.push_back(std::move(raw_chunk));
+            offset += chunk.count;
+            MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
+            prefill_ms += timer.elapsed_ms();
+            co_yield PrefillProgress{{static_cast<std::size_t>(offset) - reused_tokens, prefill_ms, 0.0, prefill_ms}};
+        }
+        if (output.result.cancelled) co_return;
+        if (transformed_prompt) model.decode_position_delta = prepared->decode_position_delta;
+        raw = raw_chunks.size() == 1 ? std::move(raw_chunks.front()) : mfq_tensor_backend::cat(raw_chunks, 1).contiguous();
+        raw_chunks.clear();
         auto committed_last_hidden = raw.narrow(
             1, raw.size(1) - 1, 1);
         auto finish = [&]() {
+            output.metrics.mtp = mtp.last_stats;
             if (session_last_hidden != nullptr) {
                 *session_last_hidden = committed_last_hidden;
             }
-            return generated;
         };
         auto logits = logits_for(hidden.narrow(1, hidden.size(1) - 1, 1));
-        MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
         auto initial_constraint = token_constraint
             ? token_constraint->clone()
             : MfqTokenConstraintPtr{};
         MFQ_RUNTIME_CHECK(
             !token_constraint ||
-                (initial_constraint &&
-                 mfq_token_constraint_supports_speculation(
-                     initial_constraint)),
+                initial_constraint,
             "CUDA MTP token constraint clone is incomplete");
         int32_t pending = sample_constrained(
             logits, counts, initial_constraint);
-        const double prefill_ms = timer.elapsed_ms();
-        if (on_prefill) on_prefill(MfqPrefillTiming{
-            prompt.size() - reused_tokens,
-            prefill_ms,
-            multimodal_ms,
-            prefill_ms + multimodal_ms});
 
         MFQ_RUNTIME_CHECK(
             reused_tokens == 0 || !mtp.blockwise_drafting(),
@@ -420,7 +299,7 @@ int32_t run_mtp_generation(
         }
 
         if (mtp.teacher_forced_prompt_prime()) {
-            constexpr int64_t chunk_size = 512;
+            const int64_t chunk_size = std::min<int64_t>(512, prefill_chunk_size);
             Tensor prime_hidden;
             int64_t prime_ids_offset = 1;
             int64_t pairs = raw.size(1) - 1;
@@ -437,9 +316,7 @@ int32_t run_mtp_generation(
                 prime_hidden = raw.narrow(1, 0, pairs);
             }
             for (int64_t offset = 0; offset < pairs;) {
-                if (cancelled && cancelled()) {
-                    throw mfq::engine::InferenceCancelled{};
-                }
+                if (output.result.cancelled) co_return;
                 const auto chunk = mfq::engine::next_prefill_chunk(
                     pairs, offset, chunk_size);
                 (void)predictor_step(
@@ -451,23 +328,24 @@ int32_t run_mtp_generation(
                               -1, prime_ids_offset + chunk.offset,
                               chunk.count).contiguous()
                         : Tensor{});
-                if (cancelled && cancelled()) {
-                    throw mfq::engine::InferenceCancelled{};
-                }
+                if (output.result.cancelled) co_return;
                 offset += chunk.count;
+                co_yield PrefillProgress{{prompt.size() - reused_tokens, prefill_ms, 0.0, prefill_ms}};
             }
         }
 
-        if (!emit(pending) || generated == limit) return finish();
-        if (cancelled && cancelled()) return finish();
+        if (output.result.cancelled) co_return;
+        auto first = output.append(std::vector<int64_t>{pending});
+        accept(first);
+        finish();
+        co_yield std::move(first);
+        if (output.stopped()) co_return;
         auto constraint_cursor = token_constraint
             ? token_constraint->clone()
             : MfqTokenConstraintPtr{};
         MFQ_RUNTIME_CHECK(
             !token_constraint ||
-                (constraint_cursor &&
-                 mfq_token_constraint_supports_speculation(
-                     constraint_cursor)),
+                constraint_cursor,
             "CUDA MTP token constraint cursor is incomplete");
 
         auto initial_hidden = committed_last_hidden;
@@ -490,7 +368,11 @@ int32_t run_mtp_generation(
             pending = sample_constrained(
                 logits_for(next_hidden), counts, constraint_cursor);
             if (constraint_cursor) constraint_cursor->accept(pending);
-            if (!emit(pending) || generated == limit) return finish();
+            auto delta = output.append(std::vector<int64_t>{pending});
+            accept(delta);
+            finish();
+            co_yield std::move(delta);
+            if (output.stopped()) co_return;
             initial_hidden = committed_last_hidden;
         }
 
@@ -559,15 +441,15 @@ int32_t run_mtp_generation(
                     auto block = mtp.draft_block(
                         target,
                         ids_for({next_ids.back()}),
-                        select_draft,
                         requested_depth);
                     MFQ_RUNTIME_CHECK(
-                        block.tokens.numel() == requested_depth &&
-                            block.logits.size(1) == requested_depth &&
-                            block.confidence.numel() == requested_depth &&
-                            result.tokens.size() ==
-                                static_cast<size_t>(requested_depth),
+                        block.size(1) == requested_depth,
                         "CUDA block predictor returned an incomplete draft");
+                    auto previous = ids_for({next_ids.back()});
+                    for (int position = 0; position < requested_depth; ++position) {
+                        const auto token = select_draft(mtp.draft_next(block.narrow(1, position, 1), previous));
+                        previous = ids_for({token});
+                    }
                 }
                 return result;
             }
@@ -611,7 +493,7 @@ int32_t run_mtp_generation(
             initial_hidden, {pending},
             bounded_depth(depth_controller.depth()), true);
         while (generated < limit) {
-            if (cancelled && cancelled()) return finish();
+            if (output.stopped()) { finish(); co_return; }
             const auto cycle_started = Clock::now();
             const int draft_count = static_cast<int>(draft.tokens.size());
             Tensor verified_raw;
@@ -771,15 +653,11 @@ int32_t run_mtp_generation(
                 ++mtp.last_stats.position_accepted.at(static_cast<size_t>(position));
             }
 
-            int emitted_accepted = 0;
-            bool continue_generation = true;
-            for (int position = 0; position < accepted; ++position) {
-                ++emitted_accepted;
-                if (!emit(draft.tokens[static_cast<size_t>(position)])) {
-                    continue_generation = false;
-                    break;
-                }
-            }
+            std::vector<int64_t> candidates(draft.tokens.begin(), draft.tokens.begin() + accepted);
+            candidates.push_back(result.next_token);
+            auto delta = output.append(candidates);
+            accept(delta);
+            const int emitted_accepted = std::min<int>(accepted, delta.token_ids.size());
             if (draft_count > 0) {
                 if (emitted_accepted == draft_count) {
                     model.commit_speculative();
@@ -798,29 +676,14 @@ int32_t run_mtp_generation(
             }
             committed_last_hidden = verified_raw.narrow(
                 1, emitted_accepted, 1);
-            if (!continue_generation) {
-                if (emitted_accepted > 0 &&
-                        mtp.teacher_forced_prompt_prime()) {
-                    std::vector<int32_t> committed_ids(
-                        draft.tokens.begin(),
-                        draft.tokens.begin() + emitted_accepted);
-                    (void)prepare_draft(
-                        verified_raw.narrow(1, 0, emitted_accepted),
-                        committed_ids, 0, false);
+            if (output.stopped()) {
+                if (mtp.teacher_forced_prompt_prime() && !delta.token_ids.empty()) {
+                    std::vector<int32_t> committed_ids(delta.token_ids.begin(), delta.token_ids.end());
+                    (void)prepare_draft(verified_raw.narrow(1, 0, committed_ids.size()), committed_ids, 0, false);
                 }
-                return finish();
-            }
-            if (!emit(result.next_token)) {
-                if (mtp.teacher_forced_prompt_prime()) {
-                    std::vector<int32_t> committed_ids(
-                        draft.tokens.begin(),
-                        draft.tokens.begin() + accepted);
-                    committed_ids.push_back(result.next_token);
-                    (void)prepare_draft(
-                        verified_raw.narrow(1, 0, accepted + 1),
-                        committed_ids, 0, false);
-                }
-                return finish();
+                finish();
+                co_yield std::move(delta);
+                co_return;
             }
 
             const double cycle_ms = std::chrono::duration<double, std::milli>(
@@ -855,35 +718,16 @@ int32_t run_mtp_generation(
                 next_ids,
                 bounded_depth(depth_controller.depth()),
                 false);
+            finish();
+            co_yield std::move(delta);
         }
-        return finish();
-    };
-    try {
-        const auto result = generate();
-        std::cerr << "mtp generated=" << result << " cycles=" << mtp.last_cycles
-            << " drafted=" << mtp.last_stats.drafted_tokens
-            << " accepted=" << mtp.last_accepted
-            << " rejected=" << mtp.last_rejected
-            << " depth=" << mtp.last_stats.selected_depth << '\n';
-        return result;
-    } catch (...) {
-        // A failed partial pass must never become the next request's history.
-        try { model.reset(1); mtp.reset(1); } catch (...) {}
-        if (session_last_hidden != nullptr) {
-            *session_last_hidden = Tensor();
-        }
-        throw;
+        finish();
     }
 }
-
-#define MFQ_INSTANTIATE_MTP(MODEL)                                         \
-    template int32_t run_mtp_generation<MODEL>(                            \
-        MODEL&, MtpModule&, const std::vector<int64_t>&,                    \
-        const MfqSamplingParams&, const MfqTokenCallback&,                  \
-        const MfqPrefillCallback&, int64_t,                                 \
-        const MfqTokenConstraintPtr&, const CudaPreparedPrompt*,            \
-        std::size_t, const mfq_tensor_backend::Tensor&,                     \
-        mfq_tensor_backend::Tensor*, double, const MfqCancellationCheck&)
+#define MFQ_INSTANTIATE_MTP(MODEL) \
+    template Generation run_mtp_generation<MODEL>(MODEL&, MtpModule&, \
+        InferenceRequest&, InferenceOutput&, int64_t, const CudaPreparedPrompt*, \
+        std::size_t, mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor*)
 
 MFQ_INSTANTIATE_MTP(mfq::cuda::Qwen35CausalLm);
 MFQ_INSTANTIATE_MTP(mfq::cuda::MiniCPMO45CausalLm);

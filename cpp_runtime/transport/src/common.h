@@ -39,7 +39,7 @@ public:
     std::string param;
 };
 
-using RequestWork = mfq::engine::InferenceRequest;
+using RequestWork = mfq::engine::InferenceInput;
 using RequestInput = mfq::engine::InferenceInput;
 using RequestMetrics = mfq::engine::InferenceMetrics;
 using CompletionResult = mfq::engine::InferenceResult;
@@ -127,9 +127,6 @@ json duplex_profile_json(const MfqDuplexSamplingProfile & value);
 json tts_profile_json(const MfqTtsSamplingProfile & value);
 json chat_template_capabilities_json(
     const mfq::engine::ChatTemplateCapabilities & capabilities);
-void configure_text_processor(
-    mfq::engine::Engine & engine,
-    const MfqRuntimeTransportConfig & config);
 bool valid_mfq_session_id(const std::string & session_id);
 json runtime_generate_body(const json & params);
 RequestInput parse_input(
@@ -139,6 +136,7 @@ RequestInput parse_input(
 RequestMetricValues request_metric_values(
     const CompletionResult & result,
     const RequestMetrics & metrics);
+void add_request_runtime_metrics(json& value, const RequestMetrics& metrics);
 json request_metric_values_json(
     const RequestMetricValues & values,
     const MfqSamplingParams & sampling);
@@ -168,5 +166,24 @@ MfqMultimodalInput parse_mfq_vision(const json & value);
 std::vector<float> decode_audio_features(
     const std::string & encoded,
     int32_t frames);
+
+} // namespace mfq::transport_detail
+
+namespace mfq::transport_detail {
+class CompletionStream {
+public:
+    CompletionStream(const MfqScheduler& scheduler, const RequestWork& work, std::string id);
+    ~CompletionStream();
+    std::optional<std::vector<common_chat_msg_diff>> next();
+    void cancel();
+    CompletionResult result;
+    RequestMetrics metrics;
+    std::size_t prompt_tokens = 0;
+private:
+    const MfqScheduler& scheduler_;
+    std::string id_;
+    std::shared_ptr<MfqScheduledRequest> request_;
+    bool terminal_ = false;
+};
 
 } // namespace mfq::transport_detail

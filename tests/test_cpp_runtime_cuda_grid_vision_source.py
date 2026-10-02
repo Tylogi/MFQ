@@ -73,8 +73,8 @@ def test_prepared_prompt_separates_semantic_and_cache_positions() -> None:
 def test_prepared_prompt_supports_mtp_and_safe_session_reuse() -> None:
     assert 'rope_parameters.value("mrope_interleaved", false)' in QWEN_CONFIG
     assert "interleaved_order" in CUDA_APP
-    assert "hidden_forward_prepared_chunked" in CUDA_APP
-    assert "prepared_offset + chunk.offset" in CUDA_APP
+    assert "prepared->embeddings.narrow(1, chunk.offset, chunk.count)" in CUDA_APP
+    assert "co_yield PrefillProgress" in CUDA_APP
     assert "model.last_logits_prepared(*prepared)" not in CUDA_APP
     assert "mtp.step_positioned(" in CUDA_APP
     assert "cache_pos, cache_pos + tokens, pos.options()" in CUDA_APP
@@ -82,9 +82,9 @@ def test_prepared_prompt_supports_mtp_and_safe_session_reuse() -> None:
     assert "transformed_prompt ? 0" not in CUDA_APP
     assert "state.input_key = input_key" in CUDA_APP
     assert "(!prepared || !prepared->transformed()) && !constraint" in CUDA_APP
-    assert "state->components.grid_vision->prepare(" in CUDA_APP
-    assert "state->components.mtp.get()" in CUDA_APP
-    assert "continuous_batching->submit(" in CUDA_APP
+    assert "state.components.grid_vision->prepare(" in CUDA_APP
+    assert "state.components.mtp.get()" in CUDA_APP
+    assert "state.batching->admit(" in CUDA_APP
 
 
 def test_batched_text_positions_do_not_select_grid_mrope_sections() -> None:

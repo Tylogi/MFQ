@@ -68,7 +68,7 @@ inline SamplingOps::Tensor sample_logits(
     }
 
     auto next = sampler.sample(logits);
-    if (token_constraint && token_constraint->allows &&
+    if (token_constraint &&
         !token_constraint->allows(next.item<std::int64_t>())) {
         auto masked = logits
             .to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kFloat32)
@@ -82,7 +82,7 @@ inline SamplingOps::Tensor sample_logits(
                 "CUDA constrained sampler returned an invalid token");
         }
     }
-    if (token_constraint && token_constraint->accept) {
+    if (token_constraint) {
         token_constraint->accept(next.item<std::int64_t>());
     }
     return next;

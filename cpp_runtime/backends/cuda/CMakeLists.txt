@@ -532,6 +532,7 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         ${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp
         ${MFQ_CUDA_RUNTIME_OP_SOURCES}
         ${MFQ_CUDA_ROOT}/engine/cuda_engine.cpp
+        ${MFQ_CUDA_ROOT}/engine/cuda_batching.cpp
         ${MFQ_CUDA_ROOT}/engine/generation.cpp
         ${MFQ_CUDA_ROOT}/engine/text_session_cache.cpp
         ${MFQ_CUDA_ROOT}/engine/options.cpp

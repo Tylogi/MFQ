@@ -1,6 +1,7 @@
 #pragma once
 
 #include "nlohmann/json.hpp"
+#include "generation_result.h"
 
 #include <cstdint>
 #include <utility>
@@ -12,15 +13,7 @@
 template <typename Model, typename Predictor>
 static int run_flash_next_mtp_check(Model& model, Predictor& mtp) {
     namespace tb=mfq_tensor_backend;
-    const MtpTarget target{
-        [&model](tb::Tensor ids) {
-            return model.embed_forward(std::move(ids));
-        },
-        [&model](tb::Tensor hidden) {
-            return model.logits_from_hidden(std::move(hidden));
-        },
-        &model.rope,
-    };
+    const MtpTarget target(model);
     MFQ_RUNTIME_CHECK(
         model.metadata.flash_next && model.vocab_size() >= 8 &&
             model.max_position_embeddings() >= 24,
@@ -68,15 +61,15 @@ static int run_flash_next_mtp_check(Model& model, Predictor& mtp) {
     auto normalized=model.hidden_forward(ids,mfq_nullopt,mfq_nullopt,nullptr,mfq_nullopt,&raw);
     result["target_raw"]=json_tensor(raw);result["target_normalized"]=json_tensor(normalized);
     // Exercise the production runtime generation path, target rollback and
-    // callback early-stop. The two architectures retain distinct head equations.
+    // step output limits. The two architectures retain distinct head equations.
     MfqSamplingParams sampling;sampling.max_tokens=12;sampling.temperature=0;sampling.top_k=1;
     std::vector<int64_t> prompt{1,2,3,4,5,6,7},expected,generated;
     model.reset(1);auto current=ids;
     for (int i=0;i<sampling.max_tokens;++i) {
         auto next=model.next_token(current);expected.push_back(next.template item<int64_t>());current=next.reshape({1,1});
     }
-    const auto count=run_mtp_generation(model,mtp,prompt,sampling,
-        [&](int64_t token) {generated.push_back(token);return true;},{});
+    generated=mfq::cuda::diagnostics::check_mtp_steps(model,mtp,prompt,sampling);
+    const auto count=generated.size();
     MFQ_RUNTIME_CHECK(count==sampling.max_tokens && generated==expected && mtp.last_cycles>0,
         "Flash-Next MTP greedy tokens disagree with incremental target");
     result["greedy"]=generated;result["cycles"]=mtp.last_cycles;
@@ -85,13 +78,13 @@ static int run_flash_next_mtp_check(Model& model, Predictor& mtp) {
     result["selected_depth"]=mtp.last_stats.selected_depth;
     result["depth_cycles"]=mtp.last_stats.depth_cycles;
     generated.clear();
-    const auto stopped=run_mtp_generation(model,mtp,prompt,sampling,
-        [&](int64_t token) {generated.push_back(token);return generated.size()<3;},{});
+    generated=mfq::cuda::diagnostics::check_mtp_steps(model,mtp,prompt,sampling,3);
+    const auto stopped=generated.size();
     MFQ_RUNTIME_CHECK(stopped==3 && generated==std::vector<int64_t>(expected.begin(),expected.begin()+3),
-        "Flash-Next MTP callback emitted extra or incorrect tokens");
+        "Flash-Next MTP step emitted extra or incorrect tokens");
     sampling.max_tokens=8;sampling.temperature=.8;sampling.top_k=16;sampling.top_p=.95;
     sampling.presence_penalty=.2;sampling.frequency_penalty=.1;sampling.repetition_penalty=1.05;sampling.seed=20260907;
-    MFQ_RUNTIME_CHECK(run_mtp_generation(model,mtp,prompt,sampling,[](int64_t){return true;},{})==8,
+    MFQ_RUNTIME_CHECK(mfq::cuda::diagnostics::check_mtp_steps(model,mtp,prompt,sampling).size()==8,
         "Flash-Next stochastic MTP failed to generate requested tokens");
     std::cout<<"flash_next_mtp_check "<<result.dump()<<'\n';return 0;
 }

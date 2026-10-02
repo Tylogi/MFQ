@@ -136,7 +136,7 @@ CudaRuntimeConfig resolve_cuda_runtime_config(
     config.decode_graph.minimum_generation_tokens = graph_minimum(
         "MFQ_RUNTIME_CUDA_GRAPH_MIN_TOKENS");
 
-    config.continuous_batch.scheduling.max_sequences =
+    config.continuous_batch.max_sequences =
         static_cast<std::size_t>(options.continuous_batching);
     config.continuous_batch.greedy = environment_enabled(
         "MFQ_CONTINUOUS_BATCH_GREEDY", true);

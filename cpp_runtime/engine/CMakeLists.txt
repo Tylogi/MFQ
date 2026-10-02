@@ -1,5 +1,4 @@
 add_library(mfq-engine STATIC
-    src/continuous_batching.cpp
     src/generation_policy.cpp
     src/mtp_metrics.cpp
     src/text_emitter.cpp

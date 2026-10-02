@@ -1,149 +1,82 @@
 #pragma once
 
 #include "engine.h"
-#ifdef MFQ_ENGINE_TEXT
-#include "text_processor.h"
-#endif
 
-#include <atomic>
-#include <functional>
-#include <memory>
-#include <string>
-#include <unordered_set>
+#include <condition_variable>
+#include <deque>
+#include <future>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+
+class MfqScheduler;
 
 class MfqScheduledRequest {
 public:
-    ~MfqScheduledRequest();
-
-    const std::shared_ptr<std::atomic<bool>> & cancel_flag() const noexcept;
-    bool cancelled() const noexcept;
-    void set_session_id(std::string session_id);
-    void finish();
+    std::vector<mfq::engine::EngineEvent> wait();
+    bool done() const;
 
 private:
     friend class MfqScheduler;
-
-    MfqScheduledRequest(
-        std::shared_ptr<std::atomic<bool>> cancel_flag,
-        std::function<void(std::string)> set_session_id,
-        std::function<void()> release);
-
-    std::shared_ptr<std::atomic<bool>> cancel_flag_;
-    std::function<void(std::string)> set_session_id_;
-    std::function<void()> release_;
+    mutable std::mutex mutex_;
+    std::condition_variable ready_;
+    std::deque<mfq::engine::EngineEvent> events_;
+    std::size_t bytes_ = 0;
+    bool terminal_ = false;
+    std::shared_ptr<std::condition_variable> wake_;
 };
 
-// Owns dispatch and request lifecycle between transports and the inference
-// engine. Backend-specific batch execution remains inside the engine callback.
 class MfqScheduler {
 public:
-    explicit MfqScheduler(const mfq::engine::Engine& engine);
+    struct Limits { std::size_t events = 64, bytes = 1024 * 1024; };
+    explicit MfqScheduler(mfq::engine::Engine& engine);
+    MfqScheduler(mfq::engine::Engine& engine, Limits limits);
     ~MfqScheduler();
-
-    bool supports_generation() const noexcept;
-    int32_t generate(
-        const std::vector<int64_t> & prompt,
-        const MfqSamplingParams & sampling,
-        const MfqTokenCallback & on_token,
-        const MfqPrefillCallback & on_prefill,
-        const MfqPromptCachePlan & cache_plan,
-        const MfqTokenConstraintPtr & token_constraint) const;
-    int32_t generate(
-        const MfqScheduledRequest & request,
-        const std::vector<int64_t> & prompt,
-        const MfqSamplingParams & sampling,
-        const MfqTokenCallback & on_token,
-        const MfqPrefillCallback & on_prefill,
-        const MfqPromptCachePlan & cache_plan,
-        const MfqTokenConstraintPtr & token_constraint) const;
-    bool supports_multimodal_generation() const noexcept;
-    int32_t generate_multimodal(
-        const std::vector<int64_t> & prompt,
-        const MfqMultimodalInput & media,
-        const MfqSamplingParams & sampling,
-        const MfqTokenCallback & on_token,
-        const MfqPrefillCallback & on_prefill,
-        const MfqPromptCachePlan & cache_plan,
-        const MfqTokenConstraintPtr & token_constraint) const;
-    int32_t generate_multimodal(
-        const MfqScheduledRequest & request,
-        const std::vector<int64_t> & prompt,
-        const MfqMultimodalInput & media,
-        const MfqSamplingParams & sampling,
-        const MfqTokenCallback & on_token,
-        const MfqPrefillCallback & on_prefill,
-        const MfqPromptCachePlan & cache_plan,
-        const MfqTokenConstraintPtr & token_constraint) const;
-
-#ifdef MFQ_ENGINE_TEXT
-    mfq::engine::InferenceRequest prepare_inference(
-        mfq::engine::InferenceInput input,
-        int64_t max_context) const;
-    mfq::engine::InferenceResult run_inference(
-        const mfq::engine::InferenceRequest & request,
-        const MfqScheduledRequest & scheduled,
-        const mfq::engine::InferenceEmit & emit,
-        mfq::engine::InferenceMetrics * metrics = nullptr,
-        bool defer_token_parsing = false,
-        const std::function<std::string()> & make_tool_call_id = {}) const;
-    mfq::engine::ChatTemplateCapabilities chat_template_capabilities() const;
-    int32_t vocab_size() const;
-    void prepare_duplex_session(
-        const std::string & system_prompt,
-        MfqDuplexSessionParams & parameters) const;
-    void prepare_duplex_step(
-        const std::string & text,
-        MfqDuplexStepInput & step) const;
-    std::string decode_tokens(
-        const std::vector<int64_t> & tokens,
-        const std::unordered_set<int64_t> & excluded = {}) const;
-#endif
-
-    bool supports_reload() const noexcept;
-    int64_t reload(int64_t context_size) const;
-    const MfqDuplexBackend & duplex() const noexcept;
-    const MfqSessionControl & session_control() const noexcept;
-    const MfqRuntimeMetricsFn & runtime_metrics() const noexcept;
-
-    std::shared_ptr<MfqScheduledRequest> activate_request(
-        const std::string & request_id,
-        bool replace = false) const;
-    std::shared_ptr<MfqScheduledRequest> activate_request(
-        const std::string & request_id,
-        const std::string & session_id,
-        bool replace_session) const;
-    bool cancel_request(const std::string & request_id) const;
-    bool cancel_session(const std::string & session_id) const;
+    std::shared_ptr<MfqScheduledRequest> submit(mfq::engine::EngineRequest request) const;
+    bool cancel_request(const std::string& id) const;
+    bool cancel_session(const std::string& id) const;
     void cancel_all() const;
+    void shutdown();
+    mfq::engine::EngineInfo info() const;
+    mfq::engine::ControlResult control(mfq::engine::ControlRequest request) const;
+    mfq::engine::SessionResult session(mfq::engine::SessionCommand command) const;
+    std::int64_t reload(std::int64_t context) const;
+
+    bool supports_multimodal_generation() const { return info().multimodal; }
+    bool supports_reload() const { return info().reload; }
+    auto chat_template_capabilities() const { return info().chat; }
+    std::int32_t vocab_size() const { return info().vocab_size; }
+    void prepare_duplex_session(const std::string& prompt, MfqDuplexSessionParams& params) const;
+    void prepare_duplex_step(const std::string& text, MfqDuplexStepInput& input) const;
+    std::string decode_tokens(const std::vector<std::int64_t>& tokens,
+        const std::unordered_set<std::int64_t>& excluded = {}) const;
 
 private:
-    struct State;
+    struct Request {
+        mfq::engine::EngineRequest input;
+        std::shared_ptr<MfqScheduledRequest> outbox;
+        bool admitted = false, cancelling = false;
+        std::optional<mfq::engine::Failed> failure;
+    };
+    struct Submit { Request request; std::promise<void> reply; };
+    struct Cancel { std::string id; bool session = false, all = false; std::promise<bool> reply; };
+    struct Control { mfq::engine::ControlRequest request; std::promise<mfq::engine::ControlResult> reply; };
+    struct Session { mfq::engine::SessionCommand request; std::promise<mfq::engine::SessionResult> reply; };
+    struct Reload { std::int64_t context; std::promise<std::int64_t> reply; };
+    using Command = std::variant<Submit, Cancel, Control, Session, Reload>;
+    void enqueue(Command command) const;
+    void loop() noexcept;
+    void publish(Request& request, mfq::engine::EngineEvent event);
+    void cancel(Request& request);
 
-    std::shared_ptr<MfqScheduledRequest> activate_request_impl(
-        const std::string & request_id,
-        const std::string & session_id,
-        bool replace_request,
-        bool replace_session) const;
-    bool admit(const std::shared_ptr<std::atomic<bool>> & cancel_flag) const;
-    void release_admission() const;
-    int32_t generate_with_cancel(
-        const std::shared_ptr<std::atomic<bool>> & cancel_flag,
-        const std::vector<int64_t> & prompt,
-        const MfqSamplingParams & sampling,
-        const MfqTokenCallback & on_token,
-        const MfqPrefillCallback & on_prefill,
-        const MfqPromptCachePlan & cache_plan,
-        const MfqTokenConstraintPtr & token_constraint) const;
-    int32_t generate_multimodal_with_cancel(
-        const std::shared_ptr<std::atomic<bool>> & cancel_flag,
-        const std::vector<int64_t> & prompt,
-        const MfqMultimodalInput & media,
-        const MfqSamplingParams & sampling,
-        const MfqTokenCallback & on_token,
-        const MfqPrefillCallback & on_prefill,
-        const MfqPromptCachePlan & cache_plan,
-        const MfqTokenConstraintPtr & token_constraint) const;
-
-    const mfq::engine::Engine& engine_;
-    std::shared_ptr<State> state_;
+    mfq::engine::Engine& engine_;
+    Limits limits_;
+    mutable std::mutex mutex_;
+    std::shared_ptr<std::condition_variable> wake_ = std::make_shared<std::condition_variable>();
+    mutable std::deque<Command> mailbox_;
+    mfq::engine::EngineInfo info_;
+    bool stopping_ = false;
+    std::thread worker_;
+    std::unordered_map<std::string, Request> requests_;
+    std::deque<std::string> order_;
 };

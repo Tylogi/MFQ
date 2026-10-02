@@ -35,10 +35,13 @@ std::size_t complete_utf8_prefix(const std::string& value, std::size_t limit) {
 
 } // namespace
 
-TextEmitter::TextEmitter(std::vector<std::string> stops, Emit emit)
-    : stops_(std::move(stops)), emit_(std::move(emit)) {}
+TextEmitter::TextEmitter(std::vector<std::string> stops)
+    : stops_(std::move(stops)) {
+    stops_.erase(std::remove(stops_.begin(), stops_.end(), std::string{}), stops_.end());
+}
 
 bool TextEmitter::append(const std::string& piece) {
+    if (stopped_) return false;
     pending_ += piece;
     std::size_t stop_pos = std::string::npos;
     for (const auto& stop : stops_) {
@@ -72,7 +75,8 @@ bool TextEmitter::flush() {
     if (complete > 0 && !emit_bytes(complete)) return false;
     if (!pending_.empty()) {
         pending_.clear();
-        return emit_("\xEF\xBF\xBD");
+        output_ += "\xEF\xBF\xBD";
+        return true;
     }
     return true;
 }
@@ -85,7 +89,8 @@ bool TextEmitter::emit_prefix(std::size_t limit) {
 bool TextEmitter::emit_bytes(std::size_t count) {
     std::string text = pending_.substr(0, count);
     pending_.erase(0, count);
-    return text.empty() || emit_(text);
+    output_ += text;
+    return true;
 }
 
 } // namespace mfq::engine

@@ -74,13 +74,7 @@ static ApiError api_error(const mfq::engine::InferenceInputError & error) {
 int run_mfq_http_transport(
         const MfqHttpRuntimeTransportConfig & config,
         const MfqScheduler & scheduler) {
-    const auto & duplex = scheduler.duplex();
-    const auto & session_control = scheduler.session_control();
-    const auto & runtime_metrics = scheduler.runtime_metrics();
-    if (!scheduler.supports_generation()) {
-        throw std::runtime_error(
-            "MFQ runtime transport requires a generation engine");
-    }
+    const bool duplex = scheduler.info().duplex;
     if (config.port < 1 || config.port > 65535) {
         throw std::runtime_error("runtime transport port must be in [1, 65535]");
     }
@@ -92,7 +86,7 @@ int run_mfq_http_transport(
     const json tts_sampling_defaults =
         tts_profile_json(config.runtime_profile.tts);
     const std::string duplex_backend_name =
-        duplex.name.empty() ? "native" : duplex.name;
+        "cuda";
     const json chat_template_capabilities =
         chat_template_capabilities_json(
             scheduler.chat_template_capabilities());
@@ -115,7 +109,6 @@ int run_mfq_http_transport(
     RuntimeRequestMetrics request_metrics_store;
     std::atomic<int64_t> active_context{config.max_context};
     std::atomic<bool> reloading{false};
-    std::mutex reload_gate;
     std::mutex duplex_gate;
     std::string duplex_session_id;
     httplib::ws::WebSocket * duplex_socket = nullptr;
@@ -141,7 +134,7 @@ int run_mfq_http_transport(
             duplex_socket = nullptr;
             duplex_backend_started = false;
         }
-        if (stop_backend) duplex.stop();
+        if (stop_backend) (void)scheduler.control(mfq::engine::StopDuplex{});
         if (close_socket && socket != nullptr && socket->is_open()) {
             socket->close(
                 httplib::ws::CloseStatus::Normal, "session closed");
@@ -319,7 +312,7 @@ int run_mfq_http_transport(
                         }
 
                         try {
-                            duplex.start(parameters);
+                            (void)scheduler.control(parameters);
                             std::lock_guard<std::mutex> lock(duplex_gate);
                             if (duplex_session_id == owned_session) {
                                 duplex_backend_started = true;
@@ -420,7 +413,7 @@ int run_mfq_http_transport(
                             "force_listen and force_speak are mutually exclusive");
                     }
 
-                    const auto result = duplex.step(step);
+                    const auto result = std::get<MfqDuplexStepResult>(scheduler.control(step));
                     const std::string response_id = request_id("resp-");
                     json metrics = {
                         {"backend", duplex_backend_name},
@@ -538,52 +531,16 @@ int run_mfq_http_transport(
     });
 
     const auto add_runtime_metrics = [&](json & value) {
-        if (!runtime_metrics) return;
-        for (const auto & item : runtime_metrics()) {
+
+        const auto metrics = std::get<mfq::engine::Metrics>(scheduler.control(mfq::engine::RuntimeMetrics{}));
+
+        for (const auto& item : metrics) {
             value[item.first] = item.second;
         }
     };
-    const auto add_request_runtime_metrics = [&](json & value) {
-        if (!runtime_metrics) return;
-        static const std::unordered_set<std::string> request_metric_names{
-            "mtp_available",
-            "mtp_used",
-            "mtp_cycles",
-            "mtp_drafted_tokens",
-            "mtp_accepted_tokens",
-            "mtp_acceptance_rate",
-            "mtp_selected_depth",
-            "mtp_depth_0_cycles",
-            "mtp_depth_1_cycles",
-            "mtp_depth_2_cycles",
-            "mtp_depth_3_cycles",
-            "mtp_depth_4_cycles",
-            "mtp_depth_5_cycles",
-            "mtp_position_1_acceptance_rate",
-            "mtp_position_2_acceptance_rate",
-            "mtp_position_3_acceptance_rate",
-            "mtp_position_4_acceptance_rate",
-            "mtp_position_5_acceptance_rate",
-            "mtp_depth_0_cycle_ms",
-            "mtp_depth_1_cycle_ms",
-            "mtp_depth_2_cycle_ms",
-            "mtp_depth_3_cycle_ms",
-            "mtp_depth_4_cycle_ms",
-            "mtp_depth_5_cycle_ms",
-            "mtp_target_ms",
-            "mtp_head_ms",
-            "mtp_rollback_ms",
-        };
-        for (const auto & item : runtime_metrics()) {
-            if (request_metric_names.find(item.first) !=
-                request_metric_names.end()) {
-                value[item.first] = item.second;
-            }
-        }
-    };
     const auto add_session_metrics = [&](json & value) {
-        if (!session_control.metrics) return;
-        for (const auto & item : session_control.metrics()) {
+
+        for (const auto & item : scheduler.session({mfq::engine::SessionCommand::Kind::metrics}).metrics) {
             value[item.first] = item.second;
         }
     };
@@ -653,33 +610,10 @@ int run_mfq_http_transport(
     server.Post("/runtime/cache/clear", [&] (
             const httplib::Request & req, httplib::Response & res) {
         if (!authorized(req, res, config.api_key)) return;
-        if (!session_control.clear) {
-            set_json(res, error_body(
-                "this runtime does not expose a prefix cache",
-                "unsupported_operation"), 501);
-            return;
-        }
-        {
-            std::lock_guard<std::mutex> gate(reload_gate);
-            bool expected = false;
-            if (!reloading.compare_exchange_strong(expected, true)) {
-                set_json(res, error_body(
-                    "a runtime control operation is already in progress",
-                    "conflict"), 409);
-                return;
-            }
-            if (request_metrics_store.active_requests() != 0 ||
-                duplex_is_active()) {
-                reloading.store(false);
-                set_json(res, error_body(
-                    "cannot clear the prefix cache while a generation or "
-                    "duplex session is active",
-                    "conflict"), 409);
-                return;
-            }
-        }
+
+
         try {
-            const size_t released = session_control.clear();
+            const size_t released = scheduler.session({mfq::engine::SessionCommand::Kind::clear}).count;
             json result = {
                 {"status", "ok"},
                 {"released_snapshots", released},
@@ -696,12 +630,7 @@ int run_mfq_http_transport(
     server.Post("/runtime/cache/trim", [&] (
             const httplib::Request & req, httplib::Response & res) {
         if (!authorized(req, res, config.api_key)) return;
-        if (!session_control.trim_hot) {
-            set_json(res, error_body(
-                "this runtime does not expose a tiered prefix cache",
-                "unsupported_operation"), 501);
-            return;
-        }
+
         try {
             const json body = parse_body(req);
             if (!body.is_object()) {
@@ -721,7 +650,7 @@ int run_mfq_http_transport(
                 }
                 target_bytes = body["target_bytes"].get<std::uint64_t>();
             }
-            const auto released = session_control.trim_hot(target_bytes);
+            const auto released = scheduler.session({mfq::engine::SessionCommand::Kind::trim, {}, {}, target_bytes}).count;
             json result = {
                 {"status", "ok"},
                 {"released_bytes", released},
@@ -750,12 +679,7 @@ int run_mfq_http_transport(
     server.Post("/runtime/sessions/fork", [&] (
             const httplib::Request & req, httplib::Response & res) {
         if (!authorized(req, res, config.api_key)) return;
-        if (!session_control.fork) {
-            set_json(res, error_body(
-                "this runtime does not support session forks",
-                "unsupported_operation"), 501);
-            return;
-        }
+
         try {
             const json body = parse_body(req);
             const auto read_session_id = [&](const char * field) {
@@ -784,8 +708,7 @@ int run_mfq_http_transport(
                     "source and target sessions must differ",
                     "target_session_id");
             }
-            const size_t copied = session_control.fork(
-                source_session_id, target_session_id);
+            const size_t copied = scheduler.session({mfq::engine::SessionCommand::Kind::fork, source_session_id, target_session_id}).count;
             set_json(res, {
                 {"status", "ok"},
                 {"copied_snapshots", copied},
@@ -801,15 +724,10 @@ int run_mfq_http_transport(
         R"(/runtime/sessions/([A-Za-z0-9._:-]{1,128}))",
         [&] (const httplib::Request & req, httplib::Response & res) {
             if (!authorized(req, res, config.api_key)) return;
-            if (!session_control.close) {
-                set_json(res, error_body(
-                    "this runtime does not support session close",
-                    "unsupported_operation"), 501);
-                return;
-            }
+
             try {
                 const std::string session_id = req.matches[1].str();
-                const size_t released = session_control.close(session_id);
+                const size_t released = scheduler.session({mfq::engine::SessionCommand::Kind::close, session_id}).count;
                 set_json(res, {
                     {"status", "ok"},
                     {"released_snapshots", released},
@@ -827,23 +745,7 @@ int run_mfq_http_transport(
                 "unsupported_operation"), 501);
             return;
         }
-        {
-            std::lock_guard<std::mutex> gate(reload_gate);
-            bool expected = false;
-            if (!reloading.compare_exchange_strong(expected, true)) {
-                set_json(res, error_body(
-                    "model reload is already in progress", "conflict"), 409);
-                return;
-            }
-            if (request_metrics_store.active_requests() != 0 ||
-                duplex_is_active()) {
-                reloading.store(false);
-                set_json(res, error_body(
-                    "cannot reload while a generation or duplex session is active",
-                    "conflict"), 409);
-                return;
-            }
-        }
+
         const auto finish_reload = [&] {
             reloading.store(false);
         };
@@ -861,6 +763,7 @@ int run_mfq_http_transport(
                     "context_size must be within the model context capacity",
                     "context_size");
             }
+            reloading.store(true);
             const int64_t loaded_context = scheduler.reload(context_size);
             if (loaded_context < 1 ||
                 (capacity > 0 && loaded_context > capacity)) {
@@ -897,17 +800,6 @@ int run_mfq_http_transport(
 
     auto runtime_generate_handler = [&](const httplib::Request & req, httplib::Response & res) {
         if (!authorized(req, res, config.api_key)) return;
-        if (duplex_is_active()) {
-            set_json(res, error_body(
-                "the model is reserved by an active duplex session",
-                "conflict"), 409);
-            return;
-        }
-        if (reloading.load()) {
-            set_json(res, error_body(
-                "model reload is in progress", "service_unavailable"), 503);
-            return;
-        }
         try {
             const json body = runtime_generate_body(parse_body(req));
             auto input = parse_input(body, true, sampling_defaults);
@@ -926,48 +818,30 @@ int run_mfq_http_transport(
                 }
                 input.media = parse_mfq_vision(body["mfq_multimodal"]);
             }
-            RequestWork work = scheduler.prepare_inference(
-                std::move(input), active_context.load());
+            RequestWork work = std::move(input);
             const std::string id = request_id("run-");
             const int64_t created = unix_time_seconds();
             std::shared_ptr<ActiveRequest> active_request;
-            {
-                std::lock_guard<std::mutex> gate(reload_gate);
-                if (reloading.load()) {
-                    set_json(res, error_body(
-                        "model reload is in progress",
-                        "service_unavailable"), 503);
-                    return;
-                }
-                active_request =
-                    std::make_shared<ActiveRequest>(request_metrics_store);
-            }
-            auto cancellation = scheduler.activate_request(
-                id, work.cache_plan.session_id, true);
-            if (!cancellation) {
-                throw ApiError(
-                    409, "conflict", "request id is already active");
-            }
+            active_request = std::make_shared<ActiveRequest>(request_metrics_store);
+            auto completion = std::make_shared<CompletionStream>(scheduler, work, id);
 
             if (!work.stream) {
-                RequestMetrics metrics;
-                CompletionResult result = scheduler.run_inference(
-                    work, *cancellation,
-                    [](const common_chat_msg_diff &) { return true; },
-                    &metrics, true, [] { return request_id("call_"); });
+                while (completion->next()) {}
+                auto result = std::move(completion->result);
+                auto metrics = completion->metrics;
                 const RequestMetricValues metric_values =
                     request_metric_values(result, metrics);
                 log_request_metrics(
-                    id, true, false, work.prompt.size(), work.sampling,
+                    id, true, false, completion->prompt_tokens, work.sampling,
                     result, metric_values);
                 active_request->complete(
-                    id, true, false, work.prompt.size(), result, metric_values);
+                    id, true, false, completion->prompt_tokens, result, metric_values);
                 auto performance =
                     request_metric_values_json(metric_values, work.sampling);
-                add_request_runtime_metrics(performance);
+                add_request_runtime_metrics(performance, metrics);
                 set_json(res, runtime_generation_result(
                     id, created, config.model_name, result,
-                    usage_json(work.prompt.size(), result.completion_tokens),
+                    usage_json(completion->prompt_tokens, result.completion_tokens),
                     std::move(performance)));
                 return;
             }
@@ -977,33 +851,31 @@ int run_mfq_http_transport(
             res.set_chunked_content_provider(
                 "text/event-stream; charset=utf-8",
                 [work = std::move(work), id, created, &scheduler,
-                 &config, active_request, cancellation,
-                 &add_request_runtime_metrics]
+                 &config, active_request, completion]
                 (size_t offset, httplib::DataSink & sink) mutable -> bool {
                     if (offset != 0) {
                         sink.done();
                         return false;
                     }
                     try {
-                        RequestMetrics metrics;
-                        CompletionResult result = scheduler.run_inference(
-                            work, *cancellation,
-                            [&](const common_chat_msg_diff & diff) {
+                        while (auto diffs = completion->next()) {
+                            for (const auto& diff : *diffs) {
                                 json delta = chat_diff_json(diff);
-                                if (delta.empty()) return true;
-                                auto event = runtime_generation_event(
-                                    "delta", id, created, config.model_name);
+                                if (delta.empty()) continue;
+                                auto event = runtime_generation_event("delta", id, created, config.model_name);
                                 event["delta"] = std::move(delta);
-                                return write_sse(sink, event);
-                            }, &metrics, false,
-                            [] { return request_id("call_"); });
+                                if (!write_sse(sink, event)) { completion->cancel(); return false; }
+                            }
+                        }
+                        auto result = std::move(completion->result);
+                        auto metrics = completion->metrics;
                         const RequestMetricValues metric_values =
                             request_metric_values(result, metrics);
                         log_request_metrics(
-                            id, true, true, work.prompt.size(), work.sampling,
+                            id, true, true, completion->prompt_tokens, work.sampling,
                             result, metric_values);
                         active_request->complete(
-                            id, true, true, work.prompt.size(), result,
+                            id, true, true, completion->prompt_tokens, result,
                             metric_values);
                         if (!result.client_connected) return false;
                         auto complete = runtime_generation_event(
@@ -1011,14 +883,14 @@ int run_mfq_http_transport(
                         complete["finish_reason"] = result.finish_reason;
                         auto performance = request_metric_values_json(
                             metric_values, work.sampling);
-                        add_request_runtime_metrics(performance);
+                        add_request_runtime_metrics(performance, metrics);
                         complete["metrics"] = std::move(performance);
                         if (!write_sse(sink, complete)) return false;
                         if (work.include_usage) {
                             auto usage = runtime_generation_event(
                                 "usage", id, created, config.model_name);
                             usage["usage"] = usage_json(
-                                work.prompt.size(), result.completion_tokens);
+                                completion->prompt_tokens, result.completion_tokens);
                             if (!write_sse(sink, usage)) return false;
                         }
                         static constexpr char done[] = "data: [DONE]\n\n";
@@ -1073,10 +945,6 @@ class MfqHttpTransport final : public MfqTransport {
 public:
     explicit MfqHttpTransport(MfqHttpRuntimeTransportConfig config)
         : config_(std::move(config)) {}
-
-    void configure_engine(mfq::engine::Engine & engine) override {
-        configure_text_processor(engine, config_);
-    }
 
     int run(const MfqScheduler & scheduler) override {
         return run_mfq_http_transport(config_, scheduler);

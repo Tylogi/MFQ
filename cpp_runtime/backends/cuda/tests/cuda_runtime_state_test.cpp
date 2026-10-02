@@ -1,4 +1,5 @@
 #include "engine/cuda_engine.h"
+#include "diagnostics/generation_result.h"
 #include "cuda_execution.h"
 #include "cuda_runtime_config.h"
 #include "engine/text_session_cache.h"
@@ -190,57 +191,37 @@ static void check_batching(const char* model_path, const char* tokenizer) {
     options.tokenizer_model = tokenizer;
     options.context_size = 256;
     options.continuous_batching = 2;
+    options.prefill_chunk_size = 8;
     auto engine = load_cuda_engine(options);
-    check(!engine.multimodal_generate && !engine.duplex,
-          "batching exposed a serial media entry point");
-    check(!engine.metadata.capabilities.image_input &&
-          !engine.metadata.capabilities.video_input,
-          "batching advertised media input");
-    bool vision_loaded = false;
-    for (const auto& [name, value] : engine.runtime_metrics()) {
-        if (name == "vision_supported") vision_loaded = value == 1;
-        if (name == "vision_available") check(value == 0, "wrong vision metric");
-    }
-    check(vision_loaded, "regression requires a vision-capable model");
+    using namespace mfq::engine;
     MfqSamplingParams sampling;
-    sampling.max_tokens = 32;
-    sampling.temperature = 0;
-    sampling.top_k = 1;
-    sampling.enable_mtp = false;
-    auto generate = [&](bool attempt_media) {
-        std::vector<int64_t> tokens;
-        engine.generate({101, 202, 303}, sampling, [&](int64_t token) {
-            tokens.push_back(token);
-            if (attempt_media && tokens.size() == 2) {
-                bool rejected = false;
-                try {
-                    engine.multimodal_generate({101}, {}, sampling,
-                        [](int64_t) { return true; }, {}, {}, {}, {});
-                } catch (const std::bad_function_call&) {
-                    rejected = true;
-                }
-                check(rejected, "media request entered an active text batch");
-            }
-            return true;
-        }, {}, {}, {}, {});
-        check(tokens.size() == 32, "batched text generation stopped early");
-        return tokens;
-    };
-    const auto reference = generate(false);
-    check(generate(true) == reference, "rejected media changed batched text");
+    sampling.max_tokens = 32; sampling.temperature = 0; sampling.top_k = 1; sampling.enable_mtp = false;
+    const auto reference = mfq::cuda::diagnostics::check_engine_steps(engine, {101, 202, 303}, sampling);
+    check(reference.size() == 32, "batched generation length");
+    check(mfq::cuda::diagnostics::check_engine_steps(engine, {101, 202, 303}, sampling) == reference,
+          "batched repeat changed output");
+    EngineRequest cancelled; cancelled.id = "cancel";
+    cancelled.token_ids = {101, 202, 303}; cancelled.input.sampling = sampling;
+    check(engine.admit(cancelled) == Admission::accepted, "cancel admission");
+    engine.cancel("cancel");
+    auto result = engine.step({});
+    check(result.events.size() == 1 && std::holds_alternative<Cancelled>(result.events[0].data),
+          "cancel before prefill did not release");
+    cancelled.token_ids.assign(32, 101);
+    check(engine.admit(cancelled) == Admission::accepted, "prefill cancel admission");
+    result = engine.step({"cancel"});
+    check(result.events.size() == 1 && std::holds_alternative<PrefillProgress>(result.events[0].data),
+          "prefill did not yield after one chunk");
+    engine.cancel("cancel");
+    result = engine.step({});
+    check(result.events.size() == 1 && std::holds_alternative<Cancelled>(result.events[0].data),
+          "cancel during prefill did not release");
+    check(mfq::cuda::diagnostics::check_engine_steps(engine, {101, 202, 303}, sampling) == reference,
+          "cancel changed subsequent output");
+
 }
 
 int main(int argc, char** argv) try {
-    // Cancellation must win before touching uninitialized model/tensor state.
-    MiniCPMO45Runtime runtime;
-    bool cancelled = false;
-    try {
-        (void)runtime.forward({}, {}, {}, {}, {}, {}, {}, {}, {}, {},
-                              [] { return true; });
-    } catch (const mfq::engine::InferenceCancelled&) {
-        cancelled = true;
-    }
-    check(cancelled, "MiniCPM-o ignored cancellation");
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     check_linear_execution();

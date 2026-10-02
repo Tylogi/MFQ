@@ -101,7 +101,7 @@ def test_engine_owns_native_gguf_jinja_template_and_common_parser() -> None:
     assert "common_chat_parse" not in SERVER
     assert "MfqTokenizer" not in SERVER
     assert ".tokenize(" not in SERVER
-    assert "std::make_shared<mfq::engine::TextProcessor>" in CUDA_ENGINE
+    assert "std::make_unique<TextProcessor>" in CUDA_ENGINE
     assert "format_gemma4_chat_prompt" not in SERVER
     assert "format_dsv4_chat_prompt" not in SERVER
 
@@ -110,7 +110,7 @@ def test_processor_owned_prompts_bypass_cached_jinja_templates() -> None:
     prepare = _section(
         ENGINE,
         "InferenceRequest TextProcessor::prepare",
-        "InferenceResult TextProcessor::run",
+        "const MfqTokenizer& TextProcessor::tokenizer",
     )
 
     assert "if (chat.preformatted_prompt)" in prepare
@@ -139,21 +139,21 @@ def test_server_enforces_complete_chat_template_tool_calls() -> None:
     assert "token_constraint," in METAL_DECODE
     assert "CUDA constrained sampler returned an invalid token" in DECODE
     assert "masked.to(logits.device())" in DECODE
-    assert "mfq_token_constraint_supports_speculation(token_constraint)" in DECODE
-    assert "chunk_size, constraint, prepared, reused" in DECODE
+    assert "token_constraint->clone()" in DECODE
+    assert "restored.tokens, restored.mtp_last_target_hidden" in DECODE
     assert "if (constraint_cursor) constraint_cursor->accept(pending);" in DECODE
     assert "constraint_cursor->accept(result.next_token);" in DECODE
 
 
-def test_native_server_cancels_active_session_generation_per_token() -> None:
+def test_native_server_cancels_active_session_between_steps() -> None:
     assert 'R"(/runtime/sessions/([A-Za-z0-9._:-]{1,128})/cancel)"' in SERVER
     assert "scheduler.cancel_session(session_id)" in SERVER
-    assert "cancel_flag->load(std::memory_order_acquire)" in SCHEDULER
+    assert "engine_.cancel(request.input.id)" in SCHEDULER
     assert 'result.finish_reason = "cancelled"' in ENGINE
-    assert "!result.cancelled && !result.tool_calls.empty()" in ENGINE
+    assert "else if (!result.tool_calls.empty())" in ENGINE
     assert "cancel_requested" not in SERVER
     assert "work.cache_plan.stable_prefix_tokens = 0;" not in SERVER
-    assert "on_token, on_prefill, request.cache_plan" in SCHEDULER
+    assert "engine_.step(eligible)" in SCHEDULER
     assert "request.cache_plan = {};" not in SCHEDULER
 
 

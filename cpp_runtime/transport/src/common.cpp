@@ -2,6 +2,7 @@
 
 #include "nlohmann/json.hpp"
 #include "chat.h"
+#include "mtp_metrics.h"
 
 #include <algorithm>
 #include <array>
@@ -773,26 +774,6 @@ json chat_template_capabilities_json(
     };
 }
 
-void configure_text_processor(
-        mfq::engine::Engine & engine,
-        const MfqRuntimeTransportConfig & config) {
-    if (engine.text) return;
-    if (!config.tokenizer_gguf.empty() && !config.tokenizer_model.empty()) {
-        throw std::runtime_error("runtime tokenizer source is ambiguous");
-    }
-    if (!config.tokenizer_gguf.empty()) {
-        engine.text = std::make_shared<mfq::engine::TextProcessor>(
-            config.tokenizer_gguf, static_cast<int32_t>(config.vocab_size),
-            config.model_type);
-    } else if (!config.tokenizer_model.empty()) {
-        engine.text = std::make_shared<mfq::engine::TextProcessor>(
-            config.tokenizer_model, static_cast<int32_t>(config.vocab_size),
-            config.model_type);
-    } else {
-        throw std::runtime_error(
-            "runtime requires an embedded or external tokenizer GGUF");
-    }
-}
 
 static std::vector<std::string> parse_stops(const json & body) {
     std::vector<std::string> stops;
@@ -1066,6 +1047,14 @@ json request_metric_values_json(
             {"mtp_max_draft_tokens", sampling.mtp_max_draft_tokens},
         }},
     };
+}
+
+void add_request_runtime_metrics(json& value, const RequestMetrics& metrics) {
+    value["mtp_available"] = metrics.mtp.available ? 1.0 : 0.0;
+    if (!metrics.mtp.available) return;
+    mfq::engine::Metrics values;
+    mfq::engine::mtp::append_generation_metrics(values, metrics.mtp);
+    for (const auto& [name, number] : values) value[name] = number;
 }
 
 RequestMetricValues request_metric_values(
@@ -2186,3 +2175,55 @@ MfqRuntimeProfile resolve_mfq_runtime_profile(
     }
     return result;
 }
+
+namespace mfq::transport_detail {
+CompletionStream::CompletionStream(const MfqScheduler& scheduler, const RequestWork& work, std::string id)
+    : scheduler_(scheduler), id_(std::move(id)),
+      request_(scheduler_.submit(mfq::engine::EngineRequest{id_, work})) {}
+CompletionStream::~CompletionStream() {
+    if (!terminal_) try { cancel(); } catch (...) {}
+}
+void CompletionStream::cancel() {
+    scheduler_.cancel_request(id_);
+    result.client_connected = false;
+}
+std::optional<std::vector<common_chat_msg_diff>> CompletionStream::next() {
+    if (terminal_) return {};
+    std::vector<common_chat_msg_diff> diffs;
+    for (auto& event : request_->wait()) {
+        std::visit([&](auto& data) {
+            using T = std::decay_t<decltype(data)>;
+            if constexpr (std::is_same_v<T, mfq::engine::OutputDelta>) {
+                for (const auto& diff : data.diffs) {
+                    result.text += diff.content_delta;
+                    result.reasoning_text += diff.reasoning_content_delta;
+                    if (diff.tool_call_index == std::string::npos) continue;
+                    if (result.tool_calls.size() <= diff.tool_call_index)
+                        result.tool_calls.resize(diff.tool_call_index + 1);
+                    auto& call = result.tool_calls[diff.tool_call_index];
+                    call.id += diff.tool_call_delta.id;
+                    call.name += diff.tool_call_delta.name;
+                    call.arguments += diff.tool_call_delta.arguments;
+                }
+                diffs.insert(diffs.end(), std::make_move_iterator(data.diffs.begin()),
+                             std::make_move_iterator(data.diffs.end()));
+            } else if constexpr (std::is_same_v<T, mfq::engine::Completed> ||
+                                 std::is_same_v<T, mfq::engine::Cancelled>) {
+                result.completion_tokens = static_cast<std::int32_t>(data.usage.completion_tokens);
+                prompt_tokens = data.usage.prompt_tokens;
+                result.cancelled = std::is_same_v<T, mfq::engine::Cancelled>;
+                if constexpr (std::is_same_v<T, mfq::engine::Completed>) result.finish_reason = std::move(data.finish_reason);
+                else result.finish_reason = "cancelled";
+                metrics = data.metrics; terminal_ = true;
+            } else if constexpr (std::is_same_v<T, mfq::engine::Failed>) {
+                terminal_ = true;
+                if (data.code == "invalid_request") throw ApiError(400, "invalid_request_error", data.message);
+                if (data.code == "unsupported_input") throw ApiError(501, "unsupported_parameter", data.message);
+                throw std::runtime_error(data.message);
+            }
+        }, event.data);
+    }
+    return diffs;
+}
+
+} // namespace mfq::transport_detail

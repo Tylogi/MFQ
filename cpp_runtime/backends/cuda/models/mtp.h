@@ -3,32 +3,33 @@
 #include "session_state.h"
 #include "mtp_policy.h"
 #include "mfq_tensor_backend.h"
+#include "causal_models.h"
 
 #include <cstdint>
-#include <functional>
+#include <variant>
 #include <stdexcept>
 #include <utility>
 
 struct RopeCache;
 
 struct MtpTarget {
-    std::function<mfq_tensor_backend::Tensor(mfq_tensor_backend::Tensor)> embed;
-    std::function<mfq_tensor_backend::Tensor(mfq_tensor_backend::Tensor)> logits;
+    std::variant<mfq::cuda::Qwen35CausalLm*, mfq::cuda::MiniCPMO45CausalLm*,
+        mfq::cuda::MiniCPMOTtsCausalLm*, mfq::cuda::Gemma4CausalLm*,
+        mfq::cuda::GlmDsaCausalLm*, mfq::cuda::Glm5CausalLm*, mfq::cuda::Qwen4CausalLm*,
+        mfq::cuda::DeepseekV4CausalLm*, mfq::cuda::DeepseekV41CausalLm*> model;
     const RopeCache* rope = nullptr;
+    template <class Model> explicit MtpTarget(Model& target) : model(&target), rope(&target.rope) {}
+    mfq_tensor_backend::Tensor embed(mfq_tensor_backend::Tensor ids) const {
+        return std::visit([&](auto* target) { return target->embed_forward(std::move(ids)); }, model);
+    }
+    mfq_tensor_backend::Tensor logits(mfq_tensor_backend::Tensor hidden) const {
+        return std::visit([&](auto* target) { return target->logits_from_hidden(std::move(hidden)); }, model);
+    }
 };
 
 struct MtpStep {
     mfq_tensor_backend::Tensor sample_hidden;
     mfq_tensor_backend::Tensor chain_hidden;
-};
-
-using MtpTokenSelector = std::function<std::int32_t(
-    mfq_tensor_backend::Tensor)>;
-
-struct MtpBlockDraft {
-    mfq_tensor_backend::Tensor tokens;
-    mfq_tensor_backend::Tensor logits;
-    mfq_tensor_backend::Tensor confidence;
 };
 
 // Architecture-specific predictors implement device math and cache state only.
@@ -85,13 +86,17 @@ struct MtpModule {
         throw std::runtime_error(
             "this CUDA MTP predictor has no target-context adapter");
     }
-    virtual MtpBlockDraft draft_block(
+    virtual mfq_tensor_backend::Tensor draft_block(
         const MtpTarget&,
         mfq_tensor_backend::Tensor,
-        const MtpTokenSelector&,
         int) {
         throw std::runtime_error(
             "this CUDA MTP predictor has no block-draft adapter");
+    }
+    virtual mfq_tensor_backend::Tensor draft_next(
+        mfq_tensor_backend::Tensor,
+        mfq_tensor_backend::Tensor) {
+        throw std::runtime_error("this CUDA MTP predictor has no block-draft adapter");
     }
 
     mfq::engine::mtp::GenerationStats last_stats;

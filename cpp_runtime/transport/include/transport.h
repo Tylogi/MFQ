@@ -2,7 +2,6 @@
 
 #include "engine.h"
 #include "scheduler.h"
-#include "tokenizer.h"
 
 #include <cstdint>
 #include <memory>
@@ -69,8 +68,6 @@ struct MfqModelCapabilities {
 struct MfqRuntimeTransportConfig {
     std::string model_name = "mfq-model";
     std::string model_type;
-    std::vector<uint8_t> tokenizer_gguf;
-    std::string tokenizer_model;
     int64_t max_context = 0;
     int64_t context_capacity = 0;
     int64_t vocab_size = 0;
@@ -87,7 +84,6 @@ struct MfqHttpRuntimeTransportConfig : MfqRuntimeTransportConfig {
 class MfqTransport {
 public:
     virtual ~MfqTransport() = default;
-    virtual void configure_engine(mfq::engine::Engine &) {}
     virtual int run(const MfqScheduler & scheduler) = 0;
 };
 
@@ -98,7 +94,7 @@ public:
             std::unique_ptr<MfqTransport> transport)
         : engine_(require_engine(std::move(engine))),
           transport_(require_transport(std::move(transport))),
-          scheduler_(configure_engine(*engine_, *transport_)) {}
+          scheduler_(*engine_) {}
 
     template <typename ConcreteEngine,
               std::enable_if_t<std::is_base_of_v<
@@ -129,13 +125,6 @@ private:
         }
         return transport;
     }
-    static const mfq::engine::Engine & configure_engine(
-            mfq::engine::Engine & engine,
-            MfqTransport & transport) {
-        transport.configure_engine(engine);
-        return engine;
-    }
-
     std::unique_ptr<mfq::engine::Engine> engine_;
     std::unique_ptr<MfqTransport> transport_;
     MfqScheduler scheduler_;

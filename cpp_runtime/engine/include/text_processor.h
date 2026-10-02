@@ -76,14 +76,7 @@ public:
     InferenceRequest prepare(
         InferenceInput input,
         std::int64_t max_context) const;
-    InferenceResult run(
-        const InferenceRequest& request,
-        const InferenceExecute& execute,
-        const std::function<bool()>& cancelled,
-        const InferenceEmit& emit,
-        InferenceMetrics* metrics,
-        bool defer_token_parsing,
-        const std::function<std::string()>& make_tool_call_id) const;
+    const MfqTokenizer& tokenizer() const;
 
     void prepare_duplex_session(
         const std::string& system_prompt,

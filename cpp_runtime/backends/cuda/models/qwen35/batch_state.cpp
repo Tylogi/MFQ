@@ -400,4 +400,38 @@ std::vector<const void*> Qwen35BatchStateAdapter::decode_state_addresses() {
     return addresses;
 }
 
+QwenBatchState Qwen35BatchStateAdapter::capture_recurrent_slots(
+        const std::vector<std::int32_t>& slots) const {
+    QwenBatchState state;
+    if (slots.empty()) return state;
+    state.layers.resize(model_.blocks.size());
+    for (std::size_t i = 0; i < model_.blocks.size(); ++i) {
+        auto* linear = dynamic_cast<LinearBlock*>(model_.blocks[i].get());
+        if (!linear) continue;
+        MfqCudaGuard guard(linear->cuda_device);
+        std::vector<Tensor> conv, gdn;
+        for (auto slot : slots) {
+            conv.push_back(linear->conv_state.narrow(0, slot, 1));
+            gdn.push_back(linear->gdn_state.narrow(0, slot, 1));
+        }
+        state.layers[i].first = mfq_tensor_backend::cat(conv, 0).clone();
+        state.layers[i].second = mfq_tensor_backend::cat(gdn, 0).clone();
+    }
+    return state;
+}
+
+void Qwen35BatchStateAdapter::restore_recurrent_slots(
+        const std::vector<std::int32_t>& slots, const QwenBatchState& state) {
+    if (slots.empty()) return;
+    for (std::size_t i = 0; i < model_.blocks.size(); ++i) {
+        auto* linear = dynamic_cast<LinearBlock*>(model_.blocks[i].get());
+        if (!linear) continue;
+        MfqCudaGuard guard(linear->cuda_device);
+        for (std::size_t row = 0; row < slots.size(); ++row) {
+            linear->conv_state.narrow(0, slots[row], 1).copy_(state.layers[i].first.narrow(0, row, 1));
+            linear->gdn_state.narrow(0, slots[row], 1).copy_(state.layers[i].second.narrow(0, row, 1));
+        }
+    }
+}
+
 } // namespace mfq::cuda::qwen35

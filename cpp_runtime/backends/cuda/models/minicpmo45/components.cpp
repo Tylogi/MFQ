@@ -9,7 +9,6 @@
 #include <chrono>
 #include <cmath>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -19,67 +18,16 @@ namespace mfq::cuda::minicpmo45 {
 
 using internal::PrefillCudaTimer;
 
-namespace {
-template <typename Model>
-static mfq_tensor_backend::Tensor sample_token(
-    Model& model,
-    mfq_tensor_backend::Tensor ids,
-    mfq::cuda::Sampler& sampler,
-    mfq_tensor_backend::Tensor counts,
-    const MfqTokenConstraintPtr & token_constraint,
-    cudaEvent_t prefill_finished = nullptr)
-{
-    if (sampler.greedy() && !sampler.has_penalties() && !token_constraint) {
-        auto next = model.next_token(ids);
-        if (prefill_finished != nullptr) {
-            MFQ_CUDA_CHECK(cudaEventRecord(
-                prefill_finished, mfq_get_current_cuda_stream()));
-        }
-        return next;
-    }
+Components::Components(mfq::cuda::MiniCPMO45CausalLm language)
+    : runtime_(MiniCPMO45Runtime::load_with_language(
+          std::move(language))) {}
 
-    auto logits = model.last_logits(ids).contiguous().view({1, -1});
-    if (prefill_finished != nullptr) {
-        MFQ_CUDA_CHECK(cudaEventRecord(
-            prefill_finished, mfq_get_current_cuda_stream()));
-    }
-    return mfq::cuda::sample_logits(
-        sampler, std::move(logits), counts, token_constraint);
+mfq::cuda::MiniCPMO45CausalLm& Components::language() noexcept {
+    return runtime_.language;
 }
 
-} // namespace
-
-static int32_t generate_multimodal_tokens(
-    MiniCPMO45Runtime & runtime,
-    std::mutex & model_mutex,
-    const std::vector<int64_t> & prompt,
-    const MfqVisionInput & vision,
-    const MfqSamplingParams & sampling,
-    const MfqTokenCallback & on_token,
-    const MfqPrefillCallback & on_prefill,
-    const MfqTokenConstraintPtr & token_constraint,
-    const MfqCancellationCheck & cancelled)
-{
-    std::lock_guard<std::mutex> lock(model_mutex);
-    if (cancelled && cancelled()) return 0;
-    if (prompt.empty() || sampling.max_tokens < 0) {
-        throw std::invalid_argument(
-            "MiniCPM-o multimodal generation input is invalid");
-    }
-    if (sampling.max_tokens == 0) {
-        runtime.language.reset(1);
-        return 0;
-    }
-    const auto generation_limit = std::min<int32_t>(
-        sampling.max_tokens,
-        static_cast<int32_t>(
-            runtime.language.max_position_embeddings() -
-            static_cast<int64_t>(prompt.size()) + 1));
-    if (generation_limit <= 0) {
-        throw std::invalid_argument(
-            "MiniCPM-o multimodal prompt exceeds the context capacity");
-    }
-
+CudaPreparedPrompt Components::prepare(
+        const std::vector<int64_t>& prompt, const MfqMultimodalInput& vision) {
     const auto cpu_i64 =
         mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCPU);
     const auto cuda_i64 =
@@ -130,88 +78,17 @@ static int32_t generate_multimodal_tokens(
             cpu_i64).clone();
     }
 
-    auto random_host = mfq_tensor_backend::empty(
-        {1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32)
-            .device(mfq_tensor_backend::kCPU).pinned_memory(true));
-    auto random_cuda = mfq_tensor_backend::empty(
-        {1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32)
-            .device(mfq_tensor_backend::kCUDA));
-    mfq::cuda::Sampler sampler(
-        sampling,
-        mfq::cuda::SamplingOps(
-            std::move(random_host), std::move(random_cuda)));
-    const bool has_penalties = sampler.has_penalties();
-    auto counts = has_penalties
-        ? mfq_tensor_backend::zeros(
-              {runtime.language.vocab_size()},
-              mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32).device(mfq_tensor_backend::kCUDA))
-        : mfq_tensor_backend::Tensor();
-    if (has_penalties) {
-        sample_token_counts_add_cuda(counts, input_ids);
-    }
 
-    PrefillCudaTimer prefill_timer;
-    MiniCPMO45ForwardResult result;
-    try {
-        result = runtime.forward(
-            input_ids,
-            mfq_tensor_backend::Tensor(),
-            mfq_tensor_backend::Tensor(),
-            pixels,
-            patch_mask,
-            target_sizes,
-            image_bounds,
-            audio_features,
-            audio_lengths,
-            audio_bounds,
-            cancelled);
-    } catch (const mfq::engine::InferenceCancelled&) {
-        runtime.language.reset(1);
-        runtime.audio.reset();
-        return 0;
-    }
-    auto logits = result.logits.index({Slice(), -1, Slice()})
-        .contiguous().view({1, -1});
-    MFQ_CUDA_CHECK(cudaEventRecord(
-        prefill_timer.finished_event(),
-        mfq_get_current_cuda_stream()));
-    auto next = mfq::cuda::sample_logits(
-        sampler, std::move(logits), counts, token_constraint);
-    if (on_prefill) {
-        const double model_ms = prefill_timer.elapsed_ms();
-        // The current CUDA composite timer covers both the multimodal encoder
-        // and language prefill. Keep that total explicit instead of falsely
-        // presenting it as comparable language-model-only time.
-        on_prefill(MfqPrefillTiming{
-            prompt.size(),
-            0.0,
-            0.0,
-            model_ms});
-    }
-
-    int32_t generated = 0;
-    while (generated < generation_limit && (!cancelled || !cancelled())) {
-        const int64_t token = next.template item<int64_t>();
-        ++generated;
-        if (!on_token(token) || generated >= generation_limit ||
-                (cancelled && cancelled())) break;
-        if (has_penalties) {
-            sample_token_counts_add_cuda(counts, next.contiguous());
-        }
-        next = sample_token(
-            runtime.language, next.reshape({1, 1}), sampler, counts,
-            token_constraint);
-    }
-    return generated;
+    auto result = runtime_.encode(input_ids, {}, {}, pixels, patch_mask,
+        target_sizes, image_bounds, audio_features, audio_lengths, audio_bounds);
+    CudaPreparedPrompt prepared;
+    prepared.token_ids = prompt;
+    prepared.embeddings = std::move(result.input_embeddings);
+    prepared.positions = mfq_tensor_backend::arange(static_cast<int64_t>(prompt.size()), cuda_i64);
+    return prepared;
 }
 
-static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
-        MiniCPMO45Runtime & runtime,
-        std::mutex & model_mutex,
-        std::optional<MiniCPMO45DuplexSession> & session) {
-    MfqDuplexBackend backend;
-    backend.name = "cuda";
-    backend.start = [&](const MfqDuplexSessionParams & parameters) {
+void Components::start(const MfqDuplexSessionParams& parameters) {
         if (parameters.special_ids.size() != 15) {
             throw std::invalid_argument(
                 "MiniCPM-o duplex requires 15 special token IDs");
@@ -222,7 +99,7 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
                 parameters.top_k < 0 ||
                 parameters.top_k >
                     std::min<int64_t>(
-                        runtime.language.vocab_size(), 1024) ||
+                        runtime_.language.vocab_size(), 1024) ||
                 !std::isfinite(parameters.top_p) ||
                 parameters.top_p <= 0.0 || parameters.top_p > 1.0 ||
                 !std::isfinite(parameters.listen_probability_scale) ||
@@ -246,14 +123,14 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
                     parameters.special_ids.end() - 1,
                     [&](int64_t token) {
                         return token < 0 ||
-                            token >= runtime.language.vocab_size();
+                            token >= runtime_.language.vocab_size();
                     }) ||
                 std::any_of(
                     parameters.forbidden_ids.begin(),
                     parameters.forbidden_ids.end(),
                     [&](int64_t token) {
                         return token < 0 ||
-                            token >= runtime.language.vocab_size();
+                            token >= runtime_.language.vocab_size();
                     })) {
             throw std::invalid_argument(
                 "MiniCPM-o duplex token ID is out of range");
@@ -270,29 +147,28 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
                 "MiniCPM-o reference Mel geometry is invalid");
         }
 
-        std::lock_guard<std::mutex> lock(model_mutex);
         MfqCudaGuard guard(
-            runtime.language.execution->layer_placement.primary_device());
+            runtime_.language.execution->layer_placement.primary_device());
         mfq_tensor_backend::manual_seed(static_cast<int64_t>(parameters.seed));
         mfq_cuda_manual_seed_all(parameters.seed);
         auto special_ids = MiniCPMO45DuplexSpecialIds::from_tensor(
             mfq_tensor_backend::tensor(
                 parameters.special_ids,
                 mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64)));
-        session.reset();
-        session.emplace(
-            runtime, special_ids, parameters.forbidden_ids,
+        duplex_session_.reset();
+        duplex_session_.emplace(
+            runtime_, special_ids, parameters.forbidden_ids,
             parameters.greedy);
-        session->temperature = parameters.temperature;
-        session->top_k = parameters.top_k;
-        session->top_p = parameters.top_p;
-        session->listen_probability_scale =
+        duplex_session_->temperature = parameters.temperature;
+        duplex_session_->top_k = parameters.top_k;
+        duplex_session_->top_p = parameters.top_p;
+        duplex_session_->listen_probability_scale =
             parameters.listen_probability_scale;
-        session->repetition_penalty = parameters.repetition_penalty;
-        session->repetition_window = parameters.repetition_window;
-        session->length_penalty = parameters.length_penalty;
-        session->tts_temperature = parameters.tts_temperature;
-        session->tts_repetition_penalty =
+        duplex_session_->repetition_penalty = parameters.repetition_penalty;
+        duplex_session_->repetition_window = parameters.repetition_window;
+        duplex_session_->length_penalty = parameters.length_penalty;
+        duplex_session_->tts_temperature = parameters.tts_temperature;
+        duplex_session_->tts_repetition_penalty =
             parameters.tts_repetition_penalty;
 
         const auto ids_tensor = [](const std::vector<int64_t> & values) {
@@ -309,13 +185,14 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
                 mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32))
                 .reshape({1, 80, parameters.reference_audio_frames});
         }
-        session->prepare(
+        duplex_session_->prepare(
             ids_tensor(parameters.system_prefix),
             reference_features,
             ids_tensor(parameters.system_suffix));
         mfq_cuda_synchronize();
-    };
-    backend.step = [&](const MfqDuplexStepInput & input) {
+}
+
+MfqDuplexStepResult Components::step(const MfqDuplexStepInput& input) {
         const bool has_audio = input.audio_frames > 0;
         const bool has_text = !input.text_tokens.empty();
         if (has_audio && input.audio_features.size() !=
@@ -332,12 +209,11 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
                 "MiniCPM-o duplex generation requires at least two token slots");
         }
 
-        std::lock_guard<std::mutex> lock(model_mutex);
         MfqCudaGuard guard(
-            runtime.language.execution->layer_placement.primary_device());
-        if (!session) {
+            runtime_.language.execution->layer_placement.primary_device());
+        if (!duplex_session_) {
             throw std::runtime_error(
-                "MiniCPM-o duplex session is not prepared");
+                "MiniCPM-o duplex duplex_session_ is not prepared");
         }
         mfq_tensor_backend::Tensor audio_features;
         if (has_audio) {
@@ -354,7 +230,7 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
                 .reshape({1, static_cast<int64_t>(input.text_tokens.size())});
         }
         const auto started = std::chrono::steady_clock::now();
-        auto result = session->run_step(
+        auto result = duplex_session_->run_step(
             {}, {}, {}, {}, audio_features,
             input.audio_prefix_extra_frames,
             input.audio_suffix_extra_frames,
@@ -377,58 +253,23 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
         response.is_listen = result.is_listen;
         response.end_of_turn = result.end_of_turn;
         response.tts_force_flush = result.tts_force_flush;
-        response.audio_chunk_index = session->audio_chunk_index;
-        response.language_cache_position = runtime.language.cache_pos;
-        response.audio_cache_position = runtime.audio.cache_length();
-        response.tts_cache_position = runtime.tts.cache_position;
+        response.audio_chunk_index = duplex_session_->audio_chunk_index;
+        response.language_cache_position = runtime_.language.cache_pos;
+        response.audio_cache_position = runtime_.audio.cache_length();
+        response.tts_cache_position = runtime_.tts.cache_position;
         response.inference_ms =
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - started).count();
         return response;
-    };
-    backend.stop = [&]() {
-        std::lock_guard<std::mutex> lock(model_mutex);
+}
+
+void Components::stop() {
         MfqCudaGuard guard(
-            runtime.language.execution->layer_placement.primary_device());
-        session.reset();
-        runtime.language.reset(1);
-        runtime.audio.reset();
-        runtime.tts.reset(1);
+            runtime_.language.execution->layer_placement.primary_device());
+        duplex_session_.reset();
+        runtime_.language.reset(1);
+        runtime_.audio.reset();
+        runtime_.tts.reset(1);
         mfq_cuda_synchronize();
-    };
-    return backend;
 }
-
-
-Components::Components(mfq::cuda::MiniCPMO45CausalLm language)
-    : runtime_(MiniCPMO45Runtime::load_with_language(
-          std::move(language))) {}
-
-mfq::cuda::MiniCPMO45CausalLm& Components::language() noexcept {
-    return runtime_.language;
-}
-
-MfqMultimodalGenerateFn Components::multimodal_generate(
-        std::mutex& model_mutex) {
-    return [this, &model_mutex](
-            const std::vector<int64_t>& prompt,
-            const MfqVisionInput& vision,
-            const MfqSamplingParams& sampling,
-            const MfqTokenCallback& on_token,
-            const MfqPrefillCallback& on_prefill,
-            const MfqPromptCachePlan&,
-            const MfqTokenConstraintPtr& token_constraint,
-            const MfqCancellationCheck& cancelled) {
-        return generate_multimodal_tokens(
-            runtime_, model_mutex, prompt, vision, sampling,
-            on_token, on_prefill, token_constraint,
-            cancelled);
-    };
-}
-
-MfqDuplexBackend Components::duplex(std::mutex& model_mutex) {
-    return make_cuda_minicpmo45_duplex_backend(
-        runtime_, model_mutex, duplex_session_);
-}
-
 } // namespace mfq::cuda::minicpmo45

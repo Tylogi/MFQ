@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/generation.h"
+#include "generation_result.h"
 #include "engine/mtp.h"
 #include "models/deepseek_v4/causal_lm.h"
 #include "diagnostics/flash_next_mtp.h"
@@ -414,15 +415,7 @@ static int run_qwen35_mtp_check(
         mfq::cuda::Qwen35CausalLm& model, Qwen35Mtp& mtp) {
     using Tensor = mfq_tensor_backend::Tensor;
     auto& execution = *model.execution;
-    const MtpTarget target{
-        [&model](Tensor ids) {
-            return model.embed_forward(std::move(ids));
-        },
-        [&model](Tensor hidden) {
-            return model.logits_from_hidden(std::move(hidden));
-        },
-        &model.rope,
-    };
+    const MtpTarget target(model);
     // Identity projection isolates both dense gate modes and their dtype casts.
     const auto float_options = mfq_tensor_backend::TensorOptions()
         .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32);
@@ -599,21 +592,21 @@ static int run_qwen35_mtp_check(
             current = next.reshape({1, 1});
         }
         std::vector<int64_t> got;
-        const int produced = run_mtp_generation(model, mtp, input, params,
-            [&](int64_t token) { got.push_back(token); return true; }, {});
+        got = check_mtp_steps(model, mtp, input, params);
+        const int produced = static_cast<int>(got.size());
         total_cycles += mtp.last_cycles;
         std::cout << "mtp_check greedy_prompt_tokens=" << input.size() << " produced=" << produced
             << " exact=" << (got == expected) << " accepted=" << mtp.last_accepted
             << " rejected=" << mtp.last_rejected << '\n';
         MFQ_RUNTIME_CHECK(produced == params.max_tokens && got == expected,
             "MTP greedy generation differs from ordinary incremental decode");
-        // Callback stop then a fresh request exercises state reset after an
+        // Output limit then a fresh request exercises state reset after an
         // early return, including stopping before a computed bonus is emitted.
         got.clear();
-        const int stopped = run_mtp_generation(model, mtp, input, params,
-            [&](int64_t token) { got.push_back(token); return got.size() < 3; }, {});
+        got = check_mtp_steps(model, mtp, input, params, 3);
+        const int stopped = static_cast<int>(got.size());
         MFQ_RUNTIME_CHECK(stopped == 3 && got == std::vector<int64_t>(expected.begin(), expected.begin() + 3),
-            "MTP callback emitted extra or incorrect tokens");
+            "MTP step emitted extra or incorrect tokens");
     }
     MfqSamplingParams stochastic;
     stochastic.max_tokens = 8;
@@ -624,8 +617,7 @@ static int run_qwen35_mtp_check(
     stochastic.frequency_penalty = .1;
     stochastic.repetition_penalty = 1.05;
     stochastic.seed = 20260907;
-    const int produced = run_mtp_generation(model, mtp, prompt, stochastic,
-        [](int64_t) { return true; }, {});
+    const int produced = static_cast<int>(check_mtp_steps(model, mtp, prompt, stochastic).size());
     MFQ_RUNTIME_CHECK(produced == 8 && mtp.last_cycles > 0 && total_cycles > 0,
         "MTP runtime gate did not execute speculative cycles");
     int64_t linear_layers = 0, ffn_batches = 0, projection_batches = 0;

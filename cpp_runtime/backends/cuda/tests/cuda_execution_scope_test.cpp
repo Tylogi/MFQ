@@ -30,23 +30,9 @@ int main() {
     first.config.nvq_fusion = false;
     second.decode_graph_serial_branches = true;
 
-    mfq::cuda::CudaEngine first_engine;
-    mfq::cuda::CudaEngine second_engine;
-    first_engine.metadata.architecture = "first";
-    second_engine.metadata.architecture = "second";
-    first_engine.runtime_metrics = [&first] {
-        return std::vector<std::pair<std::string, double>>{
-            {"calls", static_cast<double>(first.kl_mmq.dense_calls)}};
-    };
-    second_engine.runtime_metrics = [&second] {
-        return std::vector<std::pair<std::string, double>>{
-            {"calls", static_cast<double>(second.kl_mmq.dense_calls)}};
-    };
-
     std::atomic<int> ready{0};
     std::atomic<bool> isolated{true};
     auto run = [&](CudaExecutionContext& context,
-                   mfq::cuda::CudaEngine& engine,
                    bool first_context) {
         context.kl_mmq.dense_calls = first_context ? 11 : 29;
         context.continuous_batch_cache_serial = first_context;
@@ -68,17 +54,14 @@ int main() {
                 context.kl_mmq.dense_calls == 29 &&
                 context.profiler.stats.at("engine").calls == 7 &&
                 context.config.nvq_fusion;
-        const auto metrics = engine.runtime_metrics();
-        const auto expected = first_context ? 11.0 : 29.0;
-        if (!valid || metrics.size() != 1 ||
-                metrics.front().second != expected) {
+        if (!valid) {
             isolated.store(false, std::memory_order_relaxed);
         }
     };
     std::thread first_thread(
-        run, std::ref(first), std::ref(first_engine), true);
+        run, std::ref(first), true);
     std::thread second_thread(
-        run, std::ref(second), std::ref(second_engine), false);
+        run, std::ref(second), false);
     first_thread.join();
     second_thread.join();
 

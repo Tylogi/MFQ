@@ -1,413 +1,310 @@
 #include "scheduler.h"
 
 #include <algorithm>
-#include <condition_variable>
-#include <deque>
-#include <mutex>
-#include <unordered_map>
-#include <utility>
+#include <stdexcept>
 
-struct MfqScheduler::State {
-    struct Request {
-        std::shared_ptr<std::atomic<bool>> cancel_flag;
-        std::string session_id;
-    };
+using namespace mfq::engine;
 
-    explicit State(std::size_t request_limit)
-        : request_limit(std::max<std::size_t>(request_limit, 1)) {}
-
-    std::mutex mutex;
-    std::condition_variable changed;
-    std::unordered_map<std::string, Request> requests;
-    std::deque<std::uint64_t> waiting;
-    std::size_t request_limit = 1;
-    std::size_t running = 0;
-    std::uint64_t next_ticket = 0;
-    bool stopping = false;
-};
-
-MfqScheduledRequest::MfqScheduledRequest(
-        std::shared_ptr<std::atomic<bool>> cancel_flag,
-        std::function<void(std::string)> set_session_id,
-        std::function<void()> release)
-    : cancel_flag_(std::move(cancel_flag)),
-      set_session_id_(std::move(set_session_id)),
-      release_(std::move(release)) {}
-
-MfqScheduledRequest::~MfqScheduledRequest() {
-    finish();
-}
-
-const std::shared_ptr<std::atomic<bool>> &
-MfqScheduledRequest::cancel_flag() const noexcept {
-    return cancel_flag_;
-}
-
-bool MfqScheduledRequest::cancelled() const noexcept {
-    return cancel_flag_->load(std::memory_order_acquire);
-}
-
-void MfqScheduledRequest::set_session_id(std::string session_id) {
-    if (set_session_id_) set_session_id_(std::move(session_id));
-}
-
-void MfqScheduledRequest::finish() {
-    if (!release_) return;
-    auto release = std::move(release_);
-    set_session_id_ = {};
-    release();
-}
-
-MfqScheduler::MfqScheduler(const mfq::engine::Engine& engine)
-    : engine_(engine),
-      state_(std::make_shared<State>(engine.max_concurrent_requests)) {}
-
-MfqScheduler::~MfqScheduler() {
-    cancel_all();
-    std::unique_lock<std::mutex> lock(state_->mutex);
-    state_->stopping = true;
-    state_->changed.notify_all();
-    state_->changed.wait(lock, [&] {
-        return state_->running == 0 && state_->waiting.empty();
-    });
-}
-
-bool MfqScheduler::supports_generation() const noexcept {
-    return static_cast<bool>(engine_.generate);
-}
-
-int32_t MfqScheduler::generate(
-        const std::vector<int64_t> & prompt,
-        const MfqSamplingParams & sampling,
-        const MfqTokenCallback & on_token,
-        const MfqPrefillCallback & on_prefill,
-        const MfqPromptCachePlan & cache_plan,
-        const MfqTokenConstraintPtr & token_constraint) const {
-    return generate_with_cancel(
-        std::make_shared<std::atomic<bool>>(false), prompt, sampling,
-        on_token, on_prefill, cache_plan, token_constraint);
-}
-
-int32_t MfqScheduler::generate(
-        const MfqScheduledRequest & request,
-        const std::vector<int64_t> & prompt,
-        const MfqSamplingParams & sampling,
-        const MfqTokenCallback & on_token,
-        const MfqPrefillCallback & on_prefill,
-        const MfqPromptCachePlan & cache_plan,
-        const MfqTokenConstraintPtr & token_constraint) const {
-    return generate_with_cancel(
-        request.cancel_flag(), prompt, sampling, on_token, on_prefill,
-        cache_plan, token_constraint);
-}
-
-int32_t MfqScheduler::generate_with_cancel(
-        const std::shared_ptr<std::atomic<bool>> & cancel_flag,
-        const std::vector<int64_t> & prompt,
-        const MfqSamplingParams & sampling,
-        const MfqTokenCallback & on_token,
-        const MfqPrefillCallback & on_prefill,
-        const MfqPromptCachePlan & cache_plan,
-        const MfqTokenConstraintPtr & token_constraint) const {
-    if (!admit(cancel_flag)) return 0;
-    try {
-        const auto cancelled = [cancel_flag] {
-            return cancel_flag->load(std::memory_order_acquire);
-        };
-        const auto emit = [cancelled, &on_token](int64_t token) {
-            return !cancelled() && (!on_token || on_token(token));
-        };
-        const auto result = engine_.generate(
-            prompt, sampling, emit, on_prefill, cache_plan, token_constraint,
-            cancelled);
-        release_admission();
-        return result;
-    } catch (...) {
-        release_admission();
-        throw;
-    }
-}
-
-bool MfqScheduler::supports_multimodal_generation() const noexcept {
-    return static_cast<bool>(engine_.multimodal_generate);
-}
-
-int32_t MfqScheduler::generate_multimodal(
-        const std::vector<int64_t> & prompt,
-        const MfqMultimodalInput & media,
-        const MfqSamplingParams & sampling,
-        const MfqTokenCallback & on_token,
-        const MfqPrefillCallback & on_prefill,
-        const MfqPromptCachePlan & cache_plan,
-        const MfqTokenConstraintPtr & token_constraint) const {
-    return generate_multimodal_with_cancel(
-        std::make_shared<std::atomic<bool>>(false), prompt, media, sampling,
-        on_token, on_prefill, cache_plan, token_constraint);
-}
-
-int32_t MfqScheduler::generate_multimodal(
-        const MfqScheduledRequest & request,
-        const std::vector<int64_t> & prompt,
-        const MfqMultimodalInput & media,
-        const MfqSamplingParams & sampling,
-        const MfqTokenCallback & on_token,
-        const MfqPrefillCallback & on_prefill,
-        const MfqPromptCachePlan & cache_plan,
-        const MfqTokenConstraintPtr & token_constraint) const {
-    return generate_multimodal_with_cancel(
-        request.cancel_flag(), prompt, media, sampling, on_token, on_prefill,
-        cache_plan, token_constraint);
-}
-
-int32_t MfqScheduler::generate_multimodal_with_cancel(
-        const std::shared_ptr<std::atomic<bool>> & cancel_flag,
-        const std::vector<int64_t> & prompt,
-        const MfqMultimodalInput & media,
-        const MfqSamplingParams & sampling,
-        const MfqTokenCallback & on_token,
-        const MfqPrefillCallback & on_prefill,
-        const MfqPromptCachePlan & cache_plan,
-        const MfqTokenConstraintPtr & token_constraint) const {
-    if (!admit(cancel_flag)) return 0;
-    try {
-        const auto cancelled = [cancel_flag] {
-            return cancel_flag->load(std::memory_order_acquire);
-        };
-        const auto emit = [cancelled, &on_token](int64_t token) {
-            return !cancelled() && (!on_token || on_token(token));
-        };
-        const auto result = engine_.multimodal_generate(
-            prompt, media, sampling, emit, on_prefill, cache_plan,
-            token_constraint, cancelled);
-        release_admission();
-        return result;
-    } catch (...) {
-        release_admission();
-        throw;
-    }
-}
-
-#ifdef MFQ_ENGINE_TEXT
-mfq::engine::InferenceRequest MfqScheduler::prepare_inference(
-        mfq::engine::InferenceInput input,
-        int64_t max_context) const {
-    if (!engine_.text) {
-        throw std::runtime_error("engine has no text processor");
-    }
-    return engine_.text->prepare(std::move(input), max_context);
-}
-
-mfq::engine::InferenceResult MfqScheduler::run_inference(
-        const mfq::engine::InferenceRequest & request,
-        const MfqScheduledRequest & scheduled,
-        const mfq::engine::InferenceEmit & emit,
-        mfq::engine::InferenceMetrics * metrics,
-        bool defer_token_parsing,
-        const std::function<std::string()> & make_tool_call_id) const {
-    if (!engine_.text) {
-        throw std::runtime_error("engine has no text processor");
-    }
-    const auto execute = [&](const MfqTokenCallback & on_token,
-                             const MfqPrefillCallback & on_prefill) {
-        return request.vision
-            ? generate_multimodal(
-                  scheduled, request.prompt, *request.vision, request.sampling,
-                  on_token, on_prefill, request.cache_plan,
-                  request.token_constraint)
-            : generate(
-                  scheduled, request.prompt, request.sampling, on_token,
-                  on_prefill, request.cache_plan, request.token_constraint);
-    };
-    return engine_.text->run(
-        request, execute, [&] { return scheduled.cancelled(); }, emit,
-        metrics, defer_token_parsing, make_tool_call_id);
-}
-
-mfq::engine::ChatTemplateCapabilities
-MfqScheduler::chat_template_capabilities() const {
-    if (!engine_.text) return {};
-    return engine_.text->chat_template_capabilities();
-}
-
-int32_t MfqScheduler::vocab_size() const {
-    return engine_.text ? engine_.text->vocab_size() : 0;
-}
-
-void MfqScheduler::prepare_duplex_session(
-        const std::string & system_prompt,
-        MfqDuplexSessionParams & parameters) const {
-    if (!engine_.text) {
-        throw std::runtime_error("engine has no text processor");
-    }
-    engine_.text->prepare_duplex_session(system_prompt, parameters);
-}
-
-void MfqScheduler::prepare_duplex_step(
-        const std::string & text,
-        MfqDuplexStepInput & step) const {
-    if (!engine_.text) {
-        throw std::runtime_error("engine has no text processor");
-    }
-    engine_.text->prepare_duplex_step(text, step);
-}
-
-std::string MfqScheduler::decode_tokens(
-        const std::vector<int64_t> & tokens,
-        const std::unordered_set<int64_t> & excluded) const {
-    if (!engine_.text) {
-        throw std::runtime_error("engine has no text processor");
-    }
-    return engine_.text->decode_tokens(tokens, excluded);
-}
-#endif
-
-bool MfqScheduler::supports_reload() const noexcept {
-    return static_cast<bool>(engine_.reload);
-}
-
-int64_t MfqScheduler::reload(int64_t context_size) const {
-    return engine_.reload(context_size);
-}
-
-const MfqDuplexBackend & MfqScheduler::duplex() const noexcept {
-    return engine_.duplex;
-}
-
-const MfqSessionControl & MfqScheduler::session_control() const noexcept {
-    return engine_.session_control;
-}
-
-const MfqRuntimeMetricsFn & MfqScheduler::runtime_metrics() const noexcept {
-    return engine_.runtime_metrics;
-}
-
-bool MfqScheduler::admit(
-        const std::shared_ptr<std::atomic<bool>> & cancel_flag) const {
-    std::unique_lock<std::mutex> lock(state_->mutex);
-    const auto ticket = state_->next_ticket++;
-    state_->waiting.push_back(ticket);
-    state_->changed.wait(lock, [&] {
-        return state_->stopping ||
-            cancel_flag->load(std::memory_order_acquire) ||
-            (state_->waiting.front() == ticket &&
-             state_->running < state_->request_limit);
-    });
-    if (state_->stopping ||
-            cancel_flag->load(std::memory_order_acquire)) {
-        const auto found = std::find(
-            state_->waiting.begin(), state_->waiting.end(), ticket);
-        if (found != state_->waiting.end()) state_->waiting.erase(found);
-        state_->changed.notify_all();
-        return false;
-    }
-    state_->waiting.pop_front();
-    ++state_->running;
-    state_->changed.notify_all();
-    return true;
-}
-
-void MfqScheduler::release_admission() const {
-    std::lock_guard<std::mutex> lock(state_->mutex);
-    if (state_->running > 0) --state_->running;
-    state_->changed.notify_all();
-}
-
-std::shared_ptr<MfqScheduledRequest> MfqScheduler::activate_request(
-        const std::string & request_id,
-        bool replace) const {
-    return activate_request_impl(request_id, {}, replace, false);
-}
-
-std::shared_ptr<MfqScheduledRequest> MfqScheduler::activate_request(
-        const std::string & request_id,
-        const std::string & session_id,
-        bool replace_session) const {
-    return activate_request_impl(
-        request_id, session_id, false, replace_session);
-}
-
-std::shared_ptr<MfqScheduledRequest> MfqScheduler::activate_request_impl(
-        const std::string & request_id,
-        const std::string & session_id,
-        bool replace_request,
-        bool replace_session) const {
-    auto cancel_flag = std::make_shared<std::atomic<bool>>(false);
-    if (request_id.empty()) {
-        return std::shared_ptr<MfqScheduledRequest>(new MfqScheduledRequest(
-            std::move(cancel_flag), nullptr, nullptr));
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(state_->mutex);
-        const auto found = state_->requests.find(request_id);
-        if (found != state_->requests.end()) {
-            if (!replace_request) return nullptr;
-            found->second.cancel_flag->store(true, std::memory_order_release);
+namespace {
+constexpr std::size_t terminal_reserve = sizeof(EngineEvent) + 128 + 64 + 512;
+std::size_t event_bytes(const EventData& data) {
+    return std::visit([](const auto& value) -> std::size_t {
+        using T = std::decay_t<decltype(value)>;
+        std::size_t bytes = sizeof(EngineEvent);
+        if constexpr (std::is_same_v<T, OutputDelta>) {
+            bytes += value.token_ids.size() * sizeof(std::int64_t) + value.diffs.size() * sizeof(common_chat_msg_diff);
+            for (const auto& diff : value.diffs) {
+                bytes += diff.content_delta.size() + diff.reasoning_content_delta.size();
+                bytes += diff.tool_call_delta.name.size() + diff.tool_call_delta.arguments.size() + diff.tool_call_delta.id.size();
+            }
+        } else if constexpr (std::is_same_v<T, Completed>) {
+            bytes += value.finish_reason.size();
+        } else if constexpr (std::is_same_v<T, Failed>) {
+            bytes += value.code.size() + value.message.size();
         }
-        if (replace_session && !session_id.empty()) {
-            for (const auto& item : state_->requests) {
-                if (item.second.session_id == session_id) {
-                    item.second.cancel_flag->store(
-                        true, std::memory_order_release);
+        return bytes;
+    }, data);
+}
+}
+
+std::vector<EngineEvent> MfqScheduledRequest::wait() {
+    std::unique_lock lock(mutex_);
+    ready_.wait(lock, [&] { return terminal_ || !events_.empty(); });
+    std::vector<EngineEvent> result;
+    while (!events_.empty()) {
+        result.push_back(std::move(events_.front()));
+        events_.pop_front();
+    }
+    bytes_ = 0;
+    lock.unlock();
+    wake_->notify_one();
+    return result;
+}
+
+bool MfqScheduledRequest::done() const {
+    std::lock_guard lock(mutex_);
+    return terminal_ && events_.empty();
+}
+
+MfqScheduler::MfqScheduler(Engine& engine) : MfqScheduler(engine, Limits{}) {}
+MfqScheduler::MfqScheduler(Engine& engine, Limits limits)
+    : engine_(engine), limits_(limits), info_(engine.info()) {
+    if (limits.events < 4 || limits.bytes < 4096)
+        throw std::invalid_argument("outbox requires at least 4 events and 4096 bytes");
+    worker_ = std::thread([this] { loop(); });
+}
+MfqScheduler::~MfqScheduler() { shutdown(); }
+void MfqScheduler::shutdown() {
+    { std::lock_guard lock(mutex_); stopping_ = true; }
+    wake_->notify_one();
+    if (worker_.joinable()) worker_.join();
+}
+void MfqScheduler::enqueue(Command command) const {
+    std::lock_guard lock(mutex_);
+    if (stopping_) throw std::runtime_error("scheduler is stopping");
+    mailbox_.push_back(std::move(command));
+    wake_->notify_one();
+}
+EngineInfo MfqScheduler::info() const {
+    std::lock_guard lock(mutex_);
+    return info_;
+}
+std::shared_ptr<MfqScheduledRequest> MfqScheduler::submit(EngineRequest input) const {
+    if (input.id.empty() || input.id.size() > 128)
+        throw std::invalid_argument("request ID must contain 1-128 bytes");
+    auto outbox = std::make_shared<MfqScheduledRequest>();
+    outbox->wake_ = wake_;
+    Submit command{{std::move(input), outbox}, {}};
+    auto result = command.reply.get_future();
+    enqueue(std::move(command));
+    result.get();
+    return outbox;
+}
+bool MfqScheduler::cancel_request(const std::string& id) const {
+    Cancel command{id, false, false, {}};
+    auto result = command.reply.get_future(); enqueue(std::move(command)); return result.get();
+}
+bool MfqScheduler::cancel_session(const std::string& id) const {
+    Cancel command{id, true, false, {}};
+    auto result = command.reply.get_future(); enqueue(std::move(command)); return result.get();
+}
+void MfqScheduler::cancel_all() const {
+    Cancel command{{}, false, true, {}};
+    auto result = command.reply.get_future(); enqueue(std::move(command)); result.get();
+}
+ControlResult MfqScheduler::control(ControlRequest request) const {
+    Control command{std::move(request), {}};
+    auto result = command.reply.get_future(); enqueue(std::move(command)); return result.get();
+}
+SessionResult MfqScheduler::session(SessionCommand request) const {
+    Session command{std::move(request), {}};
+    auto result = command.reply.get_future(); enqueue(std::move(command)); return result.get();
+}
+std::int64_t MfqScheduler::reload(std::int64_t context) const {
+    Reload command{context, {}};
+    auto result = command.reply.get_future(); enqueue(std::move(command)); return result.get();
+}
+void MfqScheduler::prepare_duplex_session(const std::string& prompt, MfqDuplexSessionParams& params) const {
+    params = std::get<MfqDuplexSessionParams>(control(PrepareDuplex{prompt, params}));
+}
+void MfqScheduler::prepare_duplex_step(const std::string& text, MfqDuplexStepInput& input) const {
+    input = std::get<MfqDuplexStepInput>(control(PrepareDuplexStep{text, input}));
+}
+std::string MfqScheduler::decode_tokens(const std::vector<std::int64_t>& tokens,
+        const std::unordered_set<std::int64_t>& excluded) const {
+    return std::get<std::string>(control(DecodeTokens{tokens, excluded}));
+}
+
+void MfqScheduler::publish(Request& request, EngineEvent event) {
+    auto& box = *request.outbox;
+    std::unique_lock lock(box.mutex_);
+    if (box.terminal_) return;
+    const bool end = terminal(event.data);
+    if (request.failure) {
+        if (!end) return;
+        event.data = *request.failure;
+    }
+    if (auto* failed = std::get_if<Failed>(&event.data)) {
+        failed->code.resize(std::min<std::size_t>(failed->code.size(), 64));
+        failed->message.resize(std::min<std::size_t>(failed->message.size(), 512));
+    }
+    if (auto* completed = std::get_if<Completed>(&event.data))
+        completed->finish_reason.resize(std::min<std::size_t>(completed->finish_reason.size(), 64));
+    const auto bytes = event_bytes(event.data) + event.id.size();
+    if (!end && (box.events_.size() >= limits_.events - 1 ||
+                 box.bytes_ + bytes > limits_.bytes - terminal_reserve)) {
+        request.failure = Failed{"output_limit", "engine output exceeds the request outbox budget"};
+        lock.unlock();
+        cancel(request);
+        return;
+    }
+    box.bytes_ += bytes;
+    box.terminal_ = end;
+    box.events_.push_back(std::move(event));
+    box.ready_.notify_all();
+}
+void MfqScheduler::cancel(Request& request) {
+    if (request.cancelling) return;
+    request.cancelling = true;
+    if (request.admitted) engine_.cancel(request.input.id);
+    else {
+        publish(request, {request.input.id, Cancelled{}});
+    }
+}
+
+void MfqScheduler::loop() noexcept {
+    std::optional<Reload> reload;
+    bool healthy = true;
+    bool duplex_active = false;
+    for (;;) {
+        std::deque<Command> commands;
+        bool stopping;
+        { std::lock_guard lock(mutex_); commands.swap(mailbox_); stopping = stopping_; }
+        for (auto& command : commands) std::visit([&](auto& value) {
+            using T = std::decay_t<decltype(value)>;
+            try {
+                if constexpr (std::is_same_v<T, Submit>) {
+                    auto& request = value.request;
+                    const auto id = request.input.id;
+                    if (stopping || !healthy || reload || duplex_active)
+                        throw std::runtime_error("scheduler is not accepting requests");
+                    if (requests_.contains(id)) throw std::invalid_argument("request ID is already active");
+                    const auto& session = request.input.input.cache_plan.session_id;
+                    if (!session.empty()) for (const auto& [other_id, other] : requests_)
+                        if (other.input.input.cache_plan.session_id == session)
+                            throw std::invalid_argument("session already has an active request");
+                    order_.push_back(id); requests_.emplace(id, std::move(request));
+                    value.reply.set_value();
+                } else if constexpr (std::is_same_v<T, Cancel>) {
+                    bool found = false;
+                    for (auto& [id, request] : requests_) {
+                        if (value.all || (value.session ? request.input.input.cache_plan.session_id == value.id : id == value.id)) {
+                            cancel(request); found = true;
+                        }
+                    }
+                    value.reply.set_value(found);
+                } else if constexpr (std::is_same_v<T, Control>) {
+                    const bool start_duplex = std::holds_alternative<MfqDuplexSessionParams>(value.request);
+                    const bool stop_duplex = std::holds_alternative<StopDuplex>(value.request);
+                    if (reload) throw std::runtime_error("reload is pending");
+                    if ((std::holds_alternative<MfqDuplexSessionParams>(value.request) ||
+                         std::holds_alternative<MfqDuplexStepInput>(value.request) ||
+                         std::holds_alternative<StopDuplex>(value.request)) && !requests_.empty())
+                        throw std::runtime_error("duplex conflicts with active generation");
+                    auto result = engine_.control(std::move(value.request));
+                    if (start_duplex) duplex_active = true;
+                    if (stop_duplex) duplex_active = false;
+                    value.reply.set_value(std::move(result));
+                } else if constexpr (std::is_same_v<T, Session>) {
+                    if (value.request.kind != SessionCommand::Kind::metrics) {
+                        if (duplex_active || reload) throw std::runtime_error("session operation conflicts with runtime control");
+                        for (const auto& [id, request] : requests_) {
+                            const auto& session = request.input.input.cache_plan.session_id;
+                            if (value.request.kind == SessionCommand::Kind::clear ||
+                                value.request.kind == SessionCommand::Kind::trim ||
+                                session == value.request.source || session == value.request.target)
+                                throw std::runtime_error("session operation conflicts with active generation");
+                        }
+                    }
+                    value.reply.set_value(engine_.session(value.request));
+                } else {
+                    if (reload) throw std::runtime_error("reload already pending");
+                    if (duplex_active) {
+                        (void)engine_.control(StopDuplex{});
+                        duplex_active = false;
+                    }
+                    for (auto& [id, request] : requests_) cancel(request);
+                    reload.emplace(std::move(value));
                 }
+            } catch (...) { value.reply.set_exception(std::current_exception()); }
+        }, command);
+        bool executable = false;
+        auto wake_at = Clock::time_point::max();
+        try {
+            std::vector<RequestId> eligible;
+            std::vector<RequestId> ordered(order_.begin(), order_.end());
+            std::stable_sort(ordered.begin(), ordered.end(), [&](const auto& a, const auto& b) {
+                return requests_.at(a).input.priority > requests_.at(b).input.priority;
+            });
+            bool admission_blocked = false;
+            for (const auto& id : ordered) {
+                auto& request = requests_.at(id);
+                if (stopping || (request.input.deadline && *request.input.deadline <= Clock::now())) cancel(request);
+                if (request.input.deadline && !request.cancelling) wake_at = std::min(wake_at, *request.input.deadline);
+                if (request.cancelling) { executable |= request.admitted; continue; }
+                if (!request.admitted && !reload && !admission_blocked && engine_.status().available > 0) {
+                    try {
+                        request.admitted = engine_.admit(request.input) == Admission::accepted;
+                        admission_blocked = !request.admitted;
+                    }
+                    catch (const InferenceInputError& error) {
+                        publish(request, {id, Failed{error.code == InferenceInputErrorCode::Unsupported
+                            ? "unsupported_input" : "invalid_request", error.what()}}); continue;
+                    } catch (const std::invalid_argument& error) {
+                        publish(request, {id, Failed{"invalid_request", error.what()}}); continue;
+                    }
+                }
+                if (!request.admitted) continue;
+                auto& box = *request.outbox;
+                std::lock_guard lock(box.mutex_);
+                // Reserve one quantum and a separate terminal slot. No wait or
+                // consumer acknowledgement occurs on the execution thread.
+                if (!box.terminal_ && box.events_.size() + 3 < limits_.events &&
+                        box.bytes_ < (limits_.bytes - terminal_reserve) / 2)
+                    eligible.push_back(id);
+            }
+            executable |= !eligible.empty();
+            if (executable) {
+                auto result = engine_.step(eligible);
+                for (auto& event : result.events) {
+                    auto found = requests_.find(event.id);
+                    if (found != requests_.end()) publish(found->second, std::move(event));
+                }
+                if (!result.status.healthy) throw std::runtime_error("engine is unhealthy");
+                executable = !result.advanced.empty() || !result.events.empty();
+                if (result.wake_at) wake_at = std::min(wake_at, *result.wake_at);
+            }
+        } catch (const std::exception& error) {
+            healthy = false;
+            for (auto& [id, request] : requests_) {
+                try { if (request.admitted) engine_.cancel(id); } catch (...) {}
+            }
+            try { (void)engine_.step({}); } catch (...) {}
+            for (auto& [id, request] : requests_)
+                try { publish(request, {id, Failed{"backend_failure", error.what()}}); } catch (...) {}
+        } catch (...) {
+            healthy = false;
+            for (auto& [id, request] : requests_)
+                try { engine_.cancel(id); } catch (...) {}
+            try { (void)engine_.step({}); } catch (...) {}
+            for (auto& [id, request] : requests_)
+                try { publish(request, {id, Failed{"backend_failure", "unknown backend error"}}); } catch (...) {}
+        }
+        for (auto it = order_.begin(); it != order_.end();) {
+            auto box = requests_.at(*it).outbox;
+            std::lock_guard lock(box->mutex_);
+            if (box->terminal_) { requests_.erase(*it); it = order_.erase(it); }
+            else ++it;
+        }
+        if (reload && requests_.empty()) {
+            try {
+                const auto context = engine_.reload(reload->context);
+                { std::lock_guard lock(mutex_); info_ = engine_.info(); }
+                healthy = true; reload->reply.set_value(context);
+            } catch (...) { healthy = false; reload->reply.set_exception(std::current_exception()); }
+            reload.reset();
+        }
+        if (!order_.empty()) { order_.push_back(order_.front()); order_.pop_front(); }
+        if (stopping && requests_.empty()) {
+            try { engine_.shutdown(); } catch (...) {}
+            return;
+        }
+        if (!executable) {
+            std::unique_lock lock(mutex_);
+            if (mailbox_.empty() && !stopping_) {
+                // A timed recheck also covers a drain racing the wait setup.
+                wake_->wait_until(lock, std::min(wake_at, Clock::now() + std::chrono::milliseconds(10)));
             }
         }
-        state_->requests[request_id] = {cancel_flag, session_id};
-        state_->changed.notify_all();
     }
-
-    const std::weak_ptr<State> state = state_;
-    auto set_session_id = [state, request_id, cancel_flag](std::string value) {
-        const auto shared = state.lock();
-        if (!shared) return;
-        std::lock_guard<std::mutex> lock(shared->mutex);
-        const auto found = shared->requests.find(request_id);
-        if (found != shared->requests.end() &&
-            found->second.cancel_flag == cancel_flag) {
-            found->second.session_id = std::move(value);
-        }
-    };
-    auto release = [state, request_id, cancel_flag] {
-        const auto shared = state.lock();
-        if (!shared) return;
-        std::lock_guard<std::mutex> lock(shared->mutex);
-        const auto found = shared->requests.find(request_id);
-        if (found != shared->requests.end() &&
-            found->second.cancel_flag == cancel_flag) {
-            shared->requests.erase(found);
-        }
-    };
-    return std::shared_ptr<MfqScheduledRequest>(new MfqScheduledRequest(
-        std::move(cancel_flag), std::move(set_session_id), std::move(release)));
-}
-
-bool MfqScheduler::cancel_request(const std::string & request_id) const {
-    std::lock_guard<std::mutex> lock(state_->mutex);
-    const auto found = state_->requests.find(request_id);
-    if (found == state_->requests.end()) return false;
-    found->second.cancel_flag->store(true, std::memory_order_release);
-    state_->changed.notify_all();
-    return true;
-}
-
-bool MfqScheduler::cancel_session(const std::string & session_id) const {
-    if (session_id.empty()) return false;
-    bool cancelled = false;
-    std::lock_guard<std::mutex> lock(state_->mutex);
-    for (const auto & item : state_->requests) {
-        if (item.second.session_id == session_id) {
-            item.second.cancel_flag->store(true, std::memory_order_release);
-            cancelled = true;
-        }
-    }
-    if (cancelled) state_->changed.notify_all();
-    return cancelled;
-}
-
-void MfqScheduler::cancel_all() const {
-    std::lock_guard<std::mutex> lock(state_->mutex);
-    for (const auto & item : state_->requests) {
-        item.second.cancel_flag->store(true, std::memory_order_release);
-    }
-    state_->changed.notify_all();
 }
