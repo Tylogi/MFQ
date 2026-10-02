@@ -4,7 +4,7 @@
 #include "models/common/grid_vision_model.h"
 #include <array>
 
-#include "causal_ops.h"
+#include "core/causal_model.h"
 #include "grid_vision.h"
 #include "mfq/runtime.h"
 #include "mfq_cuda_ops.h"

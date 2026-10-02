@@ -279,10 +279,11 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/minicpmo45/ops.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/ops.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/batch_state.cpp
-    ${MFQ_CUDA_ROOT}/models/registry.cpp
 )
 
 set(MFQ_CUDA_TRANSFORMER_SOURCES
+    ${MFQ_CUDA_ROOT}/core/causal_model.cpp
+    ${MFQ_CUDA_ROOT}/core/decode_graph.cpp
     ${MFQ_CUDA_ROOT}/core/ffn.cpp
     ${MFQ_CUDA_ROOT}/core/full_block.cpp
     ${MFQ_CUDA_ROOT}/core/kv_cache.cpp
@@ -325,11 +326,8 @@ add_library(mfq-cuda-runtime STATIC
     $<TARGET_OBJECTS:mfq-cuda-loading>
     ${MFQ_CUDA_ROOT}/engine/cuda_engine.cpp
     ${MFQ_CUDA_ROOT}/engine/generation.cpp
-    ${MFQ_CUDA_ROOT}/engine/text_session_cache.cpp
-    ${MFQ_CUDA_ROOT}/engine/decode_graph.cpp
-    ${MFQ_CUDA_ROOT}/models/causal_ops.cpp
+    ${MFQ_CUDA_ROOT}/storage/text_session_cache.cpp
     ${MFQ_CUDA_ROOT}/engine/mtp.cpp
-    ${MFQ_CUDA_ROOT}/engine/components.cpp
     ${MFQ_CUDA_ROOT}/engine/cuda_batching.cpp
     ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
     ${MFQ_CUDA_ROOT}/commands/cli.cpp
@@ -431,6 +429,7 @@ target_link_libraries(mfq-runtime PRIVATE
     mfq-cuda-runtime mfq-runtime-communication)
 target_include_directories(mfq-runtime PRIVATE
     ${MFQ_CUDA_ROOT}
+    ${MFQ_CUDA_ROOT}/include
     ${MFQ_CUDA_ROOT}/engine
 )
 target_compile_features(mfq-runtime PRIVATE cxx_std_20)
@@ -538,16 +537,13 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         ${MFQ_CUDA_ROOT}/engine/cuda_engine.cpp
         ${MFQ_CUDA_ROOT}/engine/cuda_batching.cpp
         ${MFQ_CUDA_ROOT}/engine/generation.cpp
-        ${MFQ_CUDA_ROOT}/engine/text_session_cache.cpp
+        ${MFQ_CUDA_ROOT}/storage/text_session_cache.cpp
         ${MFQ_CUDA_ROOT}/engine/options.cpp
-        ${MFQ_CUDA_ROOT}/engine/decode_graph.cpp
-        ${MFQ_CUDA_ROOT}/models/causal_ops.cpp
         ${MFQ_CUDA_ROOT}/storage/model_loader.cpp
         ${MFQ_CUDA_ROOT}/engine/mtp.cpp
         ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp
         ${MFQ_CUDA_ROOT}/storage/weight_loader.cpp
         ${MFQ_CUDA_ROOT}/storage/transformer_loader.cpp
-        ${MFQ_CUDA_ROOT}/engine/components.cpp
         ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
         ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
         ${MFQ_CUDA_MODEL_SOURCES}

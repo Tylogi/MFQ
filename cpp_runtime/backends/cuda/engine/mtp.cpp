@@ -1,4 +1,4 @@
-#include "mtp.h"
+#include "generation.h"
 #include "speculative_sequence.h"
 
 #include "cuda_execution.h"
@@ -6,7 +6,7 @@
 #include "generation_policy.h"
 #include "inference.h"
 #include "mfq_cuda_ops.h"
-#include "models/causal_models.h"
+#include "models/registry.h"
 
 #include <cuda_runtime_api.h>
 

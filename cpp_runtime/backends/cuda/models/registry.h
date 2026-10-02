@@ -1,18 +1,11 @@
 #pragma once
 
-#include "mfq/model_source.h"
-
-#include <string>
-
-namespace mfq::cuda {
-
-inline constexpr const char* kTokenizerGgufAsset =
-    "__mfq_asset__/tokenizer.gguf";
-
-std::string load_model_config_json(
-    const mfq::ModelSource& source,
-    const std::string& external_path = {});
-
-void validate_model_source(const mfq::ModelSource& source);
-
-} // namespace mfq::cuda
+#include "core/causal_model.h"
+#include "deepseek_v4/ops.h"
+#include "deepseek_v41/ops.h"
+#include "gemma4/ops.h"
+#include "glm5_next/ops.h"
+#include "glm_dsa/ops.h"
+#include "minicpmo45/ops.h"
+#include "qwen35/ops.h"
+#include "qwen4_exp/ops.h"

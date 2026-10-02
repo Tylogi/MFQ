@@ -2,9 +2,8 @@
 
 #include "engine/cuda_engine.h"
 #include "engine/generation.h"
-#include "engine/options.h"
 #include "cuda_runtime_config.h"
-#include "engine/text_session_cache.h"
+#include "storage/text_session_cache.h"
 #include "engine/cuda_batching.h"
 
 #include <cuda_profiler_api.h>

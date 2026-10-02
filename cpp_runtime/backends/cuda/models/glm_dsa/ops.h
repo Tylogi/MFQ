@@ -2,7 +2,7 @@
 #include "models/common/transformer_layer.h"
 #include "models/glm_dsa/causal_lm.h"
 
-#include "../causal_ops.h"
+#include "core/causal_model.h"
 #include "core/block.h"
 #include "core/ffn.h"
 #include "models/glm_dsa/config.h"

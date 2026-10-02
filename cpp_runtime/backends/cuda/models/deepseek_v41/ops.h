@@ -2,7 +2,7 @@
 #include "models/common/transformer_layer.h"
 #include "models/deepseek_v41/causal_lm.h"
 
-#include "../causal_ops.h"
+#include "core/causal_model.h"
 #include "../deepseek_v4/ops.h"
 #include "dspark.h"
 #include "engram.h"

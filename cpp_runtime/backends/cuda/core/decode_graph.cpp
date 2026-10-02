@@ -1,4 +1,4 @@
-#include "decode_graph.h"
+#include "core/decode_graph.h"
 #include "cuda_execution.h"
 
 #include <algorithm>

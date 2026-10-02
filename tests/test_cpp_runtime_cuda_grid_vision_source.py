@@ -10,7 +10,7 @@ COMMON_CONFIG = (
     ROOT / "cpp_runtime/models/common/model_config.cpp"
 ).read_text()
 CUDA_ROOT = ROOT / "cpp_runtime/backends/cuda"
-CUDA = (CUDA_ROOT / "models/grid_vision_component.h").read_text()
+CUDA = (CUDA_ROOT / "core/grid_vision_component.h").read_text()
 CUDA_APP = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(CUDA_ROOT.rglob("*"))
@@ -24,8 +24,8 @@ PREPARED = (ROOT / "cpp_runtime/backends/cuda/ops/include/cuda_execution.h").rea
 CUDA_COMPONENTS = "\n".join(
     path.read_text()
     for path in (
-        CUDA_ROOT / "engine" / "components.h",
-        CUDA_ROOT / "engine" / "components.cpp",
+        CUDA_ROOT / "storage" / "model_loader.h",
+        CUDA_ROOT / "storage" / "model_loader.cpp",
     )
 )
 

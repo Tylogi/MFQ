@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../causal_ops.h"
-#include "../full_attention_session_codec.h"
+#include "core/causal_model.h"
+#include "storage/session_state.h"
 #include "inference.h"
 #include "core/block.h"
 #include "models/minicpmo45/causal_lm.h"

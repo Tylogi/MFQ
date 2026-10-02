@@ -5,7 +5,7 @@
 #include "models/common/gated_mlp.h"
 #include "models/common/moe.h"
 #include "models/common/transformer_layer.h"
-#include "../session_codec_impl.h"
+#include "storage/session_codec.h"
 
 namespace mfq::cuda::qwen4_exp {
 using Config = mfq::models::qwen4_exp::Config;

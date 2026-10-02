@@ -1,5 +1,7 @@
 #include "weight_loader.h"
 #include <limits>
+#include <fstream>
+#include <iterator>
 #include "moe.h"
 #include "moe_expert_cache.h"
 #include "mfe_expert_store.h"
@@ -219,3 +221,31 @@ mfq_tensor_backend::Tensor load_dense_native_gpu(CudaExecutionContext &execution
     MfqCudaGuard guard(active_weight_load_device(execution));
     return load_dense_cpu(execution, source, name).to(mfq_tensor_backend::kCUDA).contiguous();
 }
+
+namespace mfq::cuda {
+
+std::string load_model_config_json(
+        const mfq::ModelSource& source,
+        const std::string& external_path) {
+    if (external_path.empty()) return source.model_config_json();
+    std::ifstream input(external_path, std::ios::binary);
+    if (!input) throw std::runtime_error("cannot open config: " + external_path);
+    return {std::istreambuf_iterator<char>(input), {}};
+}
+
+void validate_model_source(const mfq::ModelSource& source) {
+    if (source.find_tensor("model.token_embedding.weight") == nullptr) {
+        throw std::runtime_error(
+            "canonical text tensor inventory has no token embedding");
+    }
+    for (const auto& component : source.resolved_model_graph().components) {
+        if (component.tensor_root != "runtime" &&
+                !has_tensor_prefix(source, component.tensor_root)) {
+            throw std::runtime_error(
+                "model graph declares " + component.kind +
+                " but its canonical tensor inventory is missing");
+        }
+    }
+}
+
+} // namespace mfq::cuda

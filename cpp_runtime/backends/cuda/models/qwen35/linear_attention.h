@@ -51,6 +51,11 @@ struct LinearAttentionBlock final : ::Block {
   int64_t speculative_tokens = 0;
 
   bool supports_speculation() const noexcept override { return true; }
+  std::vector<mfq_tensor_backend::Tensor*> graph_warmup_state() override {
+    MFQ_RUNTIME_CHECK(!speculative_pending && conv_state.defined() && gdn_state.defined(),
+                      "decode warmup requires confirmed recurrent state");
+    return {&conv_state, &gdn_state};
+  }
   mfq_tensor_backend::Tensor forward_context(CudaExecutionContext &execution,
                                              mfq_tensor_backend::Tensor input,
                                              const Block::Context &context,

@@ -3,7 +3,8 @@
 #include "mfq_tensor_backend.h"
 #include "cuda_model_plan.h"
 #include "mfq/runtime.h"
-#include "../models/qwen35/linear_attention.h"
+#include "block.h"
+#include "cuda_execution.h"
 
 #include <cstdint>
 #include <memory>
@@ -71,31 +72,24 @@ void prepare_decode_graph_memory(Model& model, MfqCudaGraph& graph,
         const std::vector<MfqCudaStream>& participant_streams = {}) {
     using Tensor = mfq_tensor_backend::Tensor;
     struct SavedRecurrentState {
-        mfq::cuda::qwen35::LinearAttentionBlock* block;
-        Tensor conv, gdn;
-        const void* conv_address;
-        const void* gdn_address;
+        Tensor* target;
+        Tensor value;
+        const void* address;
     };
     // Snapshot before entering the private graph allocator. These copies are
     // temporary and must not become retained allocations in the captured pool.
     std::vector<SavedRecurrentState> saved;
     for (const auto& block : model.blocks) {
-        if (auto* linear = dynamic_cast<
-                mfq::cuda::qwen35::LinearAttentionBlock*>(block.get())) {
-            MFQ_RUNTIME_CHECK(!linear->speculative_pending && linear->conv_state.defined() &&
-                linear->gdn_state.defined(), "decode warmup requires confirmed recurrent state");
-            saved.push_back({linear, linear->conv_state.clone(), linear->gdn_state.clone(),
-                linear->conv_state.data_ptr(), linear->gdn_state.data_ptr()});
+        for (auto* state : block->graph_warmup_state()) {
+            saved.push_back({state, state->clone(), state->data_ptr()});
         }
     }
     const int64_t saved_position = model.cache_pos;
     auto restore = [&]() {
         for (const auto& state : saved) {
-            MFQ_RUNTIME_CHECK(state.block->conv_state.data_ptr() == state.conv_address &&
-                state.block->gdn_state.data_ptr() == state.gdn_address,
+            MFQ_RUNTIME_CHECK(state.target->data_ptr() == state.address,
                 "decode warmup changed recurrent storage addresses");
-            state.block->conv_state.copy_(state.conv);
-            state.block->gdn_state.copy_(state.gdn);
+            state.target->copy_(state.value);
         }
         MFQ_RUNTIME_CHECK(model.cache_pos == saved_position, "static decode warmup changed cache position");
         if (participant_streams.empty()) {

@@ -1,9 +1,8 @@
 #pragma once
 
-#include "causal_ops.h"
-#include "full_attention_session_codec.h"
+#include "core/causal_model.h"
 #include "core/full_block.h"
-#include "session_state.h"
+#include "storage/session_state.h"
 
 namespace mfq::cuda {
 

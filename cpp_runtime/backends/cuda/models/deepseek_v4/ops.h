@@ -2,7 +2,7 @@
 #include "models/common/transformer_layer.h"
 #include "models/deepseek_v4/causal_lm.h"
 
-#include "../causal_ops.h"
+#include "core/causal_model.h"
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"
 #include "core/block.h"

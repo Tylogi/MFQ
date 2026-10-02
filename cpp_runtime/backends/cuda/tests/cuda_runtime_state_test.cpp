@@ -2,14 +2,14 @@
 #include "cuda_runtime_config.h"
 #include "diagnostics/generation_result.h"
 #include "engine/cuda_engine.h"
-#include "engine/text_session_cache.h"
+#include "storage/text_session_cache.h"
 #include "mfq_paged_prefix_cache.h"
 #include "models/gemma4/causal_lm.h"
 #include "models/minicpmo45/ops.h"
 #include "models/minicpmo45/tts.h"
 #include "models/qwen35/linear_attention.h"
 #include "models/qwen35/ops.h"
-#include "models/session_state.h"
+#include "storage/session_state.h"
 #include "moe.h"
 #include "storage/mfe_expert_store.h"
 #include "storage/moe_expert_cache.h"
@@ -27,6 +27,45 @@ using namespace mfq::cuda::internal;
 static void check(bool ok, const char *message) {
     if (!ok)
         throw std::runtime_error(message);
+}
+
+static void check_graph_warmup_state() {
+    using namespace mfq_tensor_backend;
+    Qwen35CausalLm model;
+    auto block = std::make_unique<qwen35::LinearAttentionBlock>();
+    auto* recurrent = block.get();
+    const auto options = TensorOptions().device(kCUDA).dtype(kFloat32);
+    recurrent->conv_state = ones({2}, options);
+    recurrent->gdn_state = ones({3}, options);
+    const auto* conv_address = recurrent->conv_state.data_ptr();
+    const auto* gdn_address = recurrent->gdn_state.data_ptr();
+    model.blocks.push_back(std::move(block));
+    model.cache_pos = 5;
+    for (bool fail : {false, true}) {
+        MfqCudaGraph graph;
+        int calls = 0;
+        bool threw = false;
+        try {
+            prepare_decode_graph_memory(model, graph, [&] {
+                ++calls;
+                recurrent->conv_state.zero_();
+                recurrent->gdn_state.zero_();
+                if (fail) throw std::runtime_error("warmup failed");
+            });
+        } catch (const std::runtime_error&) { threw = true; }
+        check(threw == fail && calls == (fail ? 1 : 2), "graph warmup execution changed");
+        check(model.cache_pos == 5 && recurrent->conv_state.data_ptr() == conv_address &&
+                  recurrent->gdn_state.data_ptr() == gdn_address,
+              "graph warmup changed persistent state addresses");
+        check(recurrent->conv_state.sum().item<float>() == 2 &&
+                  recurrent->gdn_state.sum().item<float>() == 3,
+              "graph warmup did not restore recurrent state");
+    }
+    recurrent->speculative_pending = true;
+    bool rejected = false;
+    try { (void)recurrent->graph_warmup_state(); }
+    catch (const std::exception&) { rejected = true; }
+    check(rejected, "graph warmup accepted unconfirmed recurrent state");
 }
 
 static void check_dense_loading() {
@@ -490,6 +529,7 @@ int main(int argc, char** argv) try {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     check_linear_execution();
+    check_graph_warmup_state();
     check_dense_loading();
     check_cached_moe_binding();
     check_gemma_composition();

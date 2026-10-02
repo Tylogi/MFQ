@@ -1,6 +1,6 @@
 #include "storage/weight_loader.h"
 #include "ops.h"
-#include "../session_codec_impl.h"
+#include "storage/session_codec.h"
 #include "models/common/transformer_layer.h"
 #include "models/gemma4/causal_lm.h"
 

@@ -23,9 +23,9 @@ MODEL_METADATA_SOURCE = "\n".join(
 SOURCE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in (
-        CUDA_ROOT / "models" / "causal_ops.h",
-        CUDA_ROOT / "models" / "causal_ops.cpp",
-        CUDA_ROOT / "models" / "session_codec_impl.h",
+        CUDA_ROOT / "core" / "causal_model.h",
+        CUDA_ROOT / "core" / "causal_model.cpp",
+        CUDA_ROOT / "storage" / "session_codec.h",
         CUDA_ROOT / "storage" / "transformer_loader.h",
         CUDA_ROOT / "storage" / "transformer_loader.cpp",
         CUDA_ROOT / "core" / "full_block.h",
@@ -35,7 +35,7 @@ SOURCE = "\n".join(
         CUDA_ROOT / "include" / "mfq_cuda_ops.h",
         CUDA_ROOT / "ops" / "include" / "cuda_execution.h",
         CUDA_ROOT / "ops" / "cuda_execution.cpp",
-        CUDA_ROOT / "engine" / "decode_graph.h",
+        CUDA_ROOT / "core" / "decode_graph.h",
     )
 ) + "\n" + BACKEND_CHECKS + "\n" + CUDA_RUNTIME + "\n" + (
     CUDA_ROOT / "commands" / "diagnostics.cpp"

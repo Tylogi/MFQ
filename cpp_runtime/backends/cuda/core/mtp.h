@@ -1,9 +1,9 @@
 #pragma once
 
-#include "session_state.h"
+#include "storage/session_state.h"
 #include "mtp_policy.h"
 #include "mfq_tensor_backend.h"
-#include "causal_ops.h"
+#include "core/causal_model.h"
 
 #include <cstdint>
 #include <variant>

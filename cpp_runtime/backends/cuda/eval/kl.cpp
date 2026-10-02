@@ -1,7 +1,7 @@
 #include "kl.h"
 
-#include "models/causal_models.h"
-#include "../models/registry.h"
+#include "models/registry.h"
+#include "storage/weight_loader.h"
 #include "quant_linear.h"
 #include "cuda_execution.h"
 #include "storage/moe_expert_cache.h"

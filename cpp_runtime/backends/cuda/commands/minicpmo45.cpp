@@ -2,7 +2,7 @@
 
 #include "models/minicpmo45/runtime.h"
 #include "cli.h"
-#include "engine/options.h"
+#include "cuda_runtime_config.h"
 
 #include <nlohmann/json.hpp>
 #include <chrono>

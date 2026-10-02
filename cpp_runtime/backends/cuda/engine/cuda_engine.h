@@ -1,6 +1,6 @@
 #pragma once
 
-#include "options.h"
+#include "cuda_runtime_config.h"
 #include "engine.h"
 
 #include <cstdint>

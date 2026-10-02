@@ -71,12 +71,12 @@ CUDA_ENGINE_SOURCE = (CUDA_RUNTIME / "cuda_engine.cpp").read_text(
     encoding="utf-8"
 )
 CUDA_RUNTIME_SOURCE = "\n".join(
-    (CUDA_RUNTIME / name).read_text(encoding="utf-8")
+    (CUDA_RUNTIME.parent / name).read_text(encoding="utf-8")
     for name in (
-        "cuda_engine.cpp",
-        "generation.cpp",
-        "text_session_cache.cpp",
-        "options.cpp",
+        "engine/cuda_engine.cpp",
+        "engine/generation.cpp",
+        "storage/text_session_cache.cpp",
+        "engine/options.cpp",
     )
 )
 CUDA_MTP_SOURCE = (CUDA_RUNTIME / "mtp.cpp").read_text(encoding="utf-8")
@@ -86,7 +86,7 @@ CUDA_BACKEND_SOURCE = "\n".join(
     for path in (ROOT / "cpp_runtime" / "backends" / "cuda").rglob("*")
     if path.suffix in {".h", ".cpp"}
 )
-CUDA_REGISTRY = (CUDA_MODELS / "registry.cpp").read_text(encoding="utf-8")
+CUDA_REGISTRY = (CUDA_MODELS.parent / "storage/weight_loader.cpp").read_text(encoding="utf-8")
 CUDA_TRANSFORMER_LOADER = (
     CUDA_OPS.parent / "storage/transformer_loader.cpp"
 ).read_text(encoding="utf-8")
@@ -102,13 +102,13 @@ CUDA_QWEN_LINEAR = (
 ).read_text(encoding="utf-8") + (\
     CUDA_MODELS / "qwen35" / "ops.cpp"
 ).read_text(encoding="utf-8")
-CUDA_CAUSAL_LM = (CUDA_MODELS / "causal_ops.h").read_text(
+CUDA_CAUSAL_LM = (CUDA_MODELS.parent / "core/causal_model.h").read_text(
     encoding="utf-8"
 )
-CUDA_CAUSAL_LM_SOURCE = (CUDA_MODELS / "causal_ops.cpp").read_text(
+CUDA_CAUSAL_LM_SOURCE = (CUDA_MODELS.parent / "core/causal_model.cpp").read_text(
     encoding="utf-8"
 )
-CUDA_CAUSAL_LM_IMPL = (CUDA_MODELS / "session_codec_impl.h").read_text(
+CUDA_CAUSAL_LM_IMPL = (CUDA_MODELS.parent / "storage/session_codec.h").read_text(
     encoding="utf-8"
 )
 SHARED_CAUSAL_LM = (ROOT / "cpp_runtime/models/common/causal_model.h").read_text(encoding="utf-8")
@@ -172,8 +172,8 @@ def model_sources() -> str:
     )
 
 
-def test_cuda_ops_do_not_depend_on_engine_or_parse_environment() -> None:
-    for path in CUDA_OPS.rglob("*"):
+def test_cuda_ops_and_core_do_not_depend_on_engine_or_parse_environment() -> None:
+    for path in (*CUDA_OPS.rglob("*"), *CUDA_CORE.rglob("*")):
         if path.suffix not in {".h", ".cpp", ".cu"}:
             continue
         source = path.read_text(encoding="utf-8")
@@ -396,7 +396,7 @@ def test_cuda_cli_is_a_thin_client_of_the_runtime_library() -> None:
     assert "engine/cuda_runtime.cpp" not in cmake
     assert "engine/cuda_engine.cpp" in cmake
     assert "engine/generation.cpp" in cmake
-    assert "engine/text_session_cache.cpp" in cmake
+    assert "storage/text_session_cache.cpp" in cmake
     assert "add_executable(mfq-runtime\n" in cmake
     torch_sources = cmake.split("add_executable(mfq-runtime-torch", 1)[1].split(")", 1)[0]
     assert "${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp" in torch_sources
@@ -513,7 +513,9 @@ def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
     assert "class GrammarConstraint" in constraint
     assert "class MfqGrammarConstraint" not in transport
     assert "execution.reset();" in options
-    assert "CudaExecutionContext&execution" in "".join(CUDA_CAUSAL_LM.split())
+    loader_api = (CUDA_RUNTIME.parent / "storage/weight_loader.h").read_text()
+    assert "CudaExecutionContext&execution" in "".join(loader_api.split())
+    assert "load_causal_lm(" not in CUDA_CAUSAL_LM
     assert "model.execution = &execution;" in (
         CUDA_MODELS.parent / "storage/model_loader.cpp"
     ).read_text(encoding="utf-8")
@@ -1102,7 +1104,7 @@ def test_model_config_parsing_is_backend_neutral() -> None:
     assert "Config::from_json" not in CUDA_CAUSAL_LM_LOADER
     assert "if constexpr" not in CUDA_CAUSAL_LM_LOADER
     assert "if constexpr" not in (
-        CUDA_RUNTIME / "components.cpp"
+        CUDA_RUNTIME.parent / "storage/model_loader.cpp"
     ).read_text(encoding="utf-8")
     model_names = (
         "minicpmo45",
@@ -1177,7 +1179,7 @@ def test_cuda_model_runtime_uses_compiled_operator_bindings() -> None:
         "class MoeExpertCache",
     ):
         assert concrete_definition not in CUDA_RUNTIME_SOURCE
-    causal_lm = (CUDA_MODELS / "causal_ops.h").read_text(encoding="utf-8")
+    causal_lm = (CUDA_MODELS.parent / "core/causal_model.h").read_text(encoding="utf-8")
     causal_lm_loader = (CUDA_MODELS.parent / "storage/model_loader.cpp").read_text(
         encoding="utf-8"
     )
@@ -1216,10 +1218,10 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         "ops/quant_linear.cpp",
         "ops/vq.cpp",
         "ops/cuda_execution.cpp",
-        "engine/decode_graph.cpp",
+        "core/decode_graph.cpp",
         "engine/options.cpp",
         "commands/cli.cpp",
-        "models/causal_ops.cpp",
+        "core/causal_model.cpp",
         "storage/model_loader.cpp",
         "storage/transformer_loader.cpp",
         "core/rope.cpp",
@@ -1228,7 +1230,7 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         "core/full_block.cpp",
         "engine/mtp.cpp",
         "storage/moe_expert_cache.cpp",
-        "engine/components.cpp",
+        "storage/model_loader.cpp",
         "engine/cuda_batching.cpp",
         "models/qwen35/batch_state.cpp",
         "diagnostics/attention_checks.cpp",
@@ -1374,7 +1376,7 @@ def test_shared_models_own_composition_loading_and_input_rules() -> None:
     for family in ("gemma4", "qwen4_exp", "glm5_next", "deepseek_v4", "deepseek_v41"):
         assert "Tensor adapter_prepare_hidden(" in (shared / family / "causal_lm.h").read_text()
         assert "::adapter_prepare_hidden(" not in (CUDA_MODELS / family / "ops.cpp").read_text()
-    common_native = (CUDA_MODELS / "causal_ops.cpp").read_text()
+    common_native = (CUDA_MODELS.parent / "core/causal_model.cpp").read_text()
     for rule in ("adapter_validate_positions", "adapter_supports_speculation", "adapter_force_cache_advance"):
         assert rule in causal
         assert f"CausalResources::{rule}" not in common_native
@@ -1390,7 +1392,7 @@ def test_shared_models_own_composition_loading_and_input_rules() -> None:
     assert "mfq::models::minicpmo45::encode(ops, input)" in mini
     assert "mfq::models::minicpmo45::multimodal_forward(" in mini
     assert "for (const auto & bound : images)" not in mini
-    grid = (CUDA_MODELS / "grid_vision_component.h").read_text()
+    grid = (CUDA_MODELS.parent / "core/grid_vision_component.h").read_text()
     for stage in ("attention", "encode", "merge", "prepare"):
         assert f"mfq::models::grid_vision::{stage}(" in grid
     assert "token_ids[index] == image_token_id_" not in grid

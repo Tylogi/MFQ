@@ -2,12 +2,11 @@
 
 #include "engine/generation.h"
 #include "generation_result.h"
-#include "engine/mtp.h"
 #include "models/deepseek_v4/ops.h"
 #include "diagnostics/flash_next_mtp.h"
 #include "qwen35/mtp.h"
 #include "quant_linear.h"
-#include "registry.h"
+#include "storage/weight_loader.h"
 #include "cuda_execution.h"
 #include "qwen35/linear_attention.h"
 #include "mfq/kernels/cuda/deepseek_v41.h"

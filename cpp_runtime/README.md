@@ -18,8 +18,12 @@ by model family:
 - `components/` — focused integrated components (`ggml`, `tokenizer`, `http`,
   and `json`);
 - `backends/cuda/` — the concrete `CudaEngine`, model execution adapters,
-  operators, applications, build definition, and tests; `models/causal_ops.h`
-  supplies native resources and operations to the shared causal model;
+  operators, applications, build definition, and tests; `core/causal_model.h`
+  supplies native resources and operations to the shared causal model.
+  Native Transformer, predictor and graph resources belong to `core/`, lower-level
+  operators to `ops/`, and loading plus session codecs/cache storage to `storage/`.
+  `models/` contains family bindings and implementations; `engine/` contains
+  request, generation, batching, MTP and runtime configuration adapters;
 - `backends/metal/` — Metal/MLX storage, runtime utilities, operators, model
   implementations, kernels, applications, tests, benchmarks, and diagnostics;
 - `tests/` — backend-independent native tests;

@@ -1,6 +1,5 @@
 #pragma once
 #include "engine/generation.h"
-#include "engine/mtp.h"
 
 namespace mfq::cuda::diagnostics {
 struct GenerationResult {

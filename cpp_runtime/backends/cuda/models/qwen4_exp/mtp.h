@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../mtp.h"
+#include "core/mtp.h"
 #include "core/attention.h"
 #include "models/qwen4_exp/config.h"
 

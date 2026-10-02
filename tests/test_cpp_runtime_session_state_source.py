@@ -2,17 +2,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
-CUDA_SESSION_CACHE = (CUDA_ROOT / "engine" / "text_session_cache.cpp").read_text(
+CUDA_SESSION_CACHE = (CUDA_ROOT / "storage" / "text_session_cache.cpp").read_text(
     encoding="utf-8"
 )
-CUDA_CAUSAL_LM_HEADER = (CUDA_ROOT / "models" / "causal_ops.h").read_text(
+CUDA_CAUSAL_LM_HEADER = (CUDA_ROOT / "core" / "causal_model.h").read_text(
     encoding="utf-8"
 )
-CUDA_CAUSAL_LM_SOURCE = (CUDA_ROOT / "models" / "causal_ops.cpp").read_text(
+CUDA_CAUSAL_LM_SOURCE = (CUDA_ROOT / "core" / "causal_model.cpp").read_text(
     encoding="utf-8"
 )
 CUDA_SESSION_STATE_HEADER = (
-    CUDA_ROOT / "models" / "session_state.h"
+    CUDA_ROOT / "storage" / "session_state.h"
 ).read_text(encoding="utf-8")
 DECODE = "\n".join(
     path.read_text(encoding="utf-8")
@@ -302,7 +302,7 @@ def test_metal_paged_codec_preserves_raw_kv_tensor_storage() -> None:
 
 def test_cuda_paged_restore_invalidates_only_deterministic_state_errors() -> None:
     assert "class CudaSessionStateError" in CUDA_SESSION_STATE_HEADER
-    assert "throw CudaSessionStateError(" in CUDA_CAUSAL_LM_SOURCE
+    assert "throw CudaSessionStateError(" in CUDA_SESSION_CACHE
     restore = CUDA_SESSION_CACHE.split("size_t restore_paged(", 1)[1].split(
         "void store_paged(", 1
     )[0]

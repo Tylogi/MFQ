@@ -38,8 +38,8 @@ QWEN_CONFIG = (
     ROOT / "cpp_runtime" / "models" / "qwen35" / "config.cpp"
 ).read_text(encoding="utf-8")
 CAUSAL_LM = "\n".join(
-    (CUDA_ROOT / "models" / name).read_text(encoding="utf-8")
-    for name in ("causal_ops.h", "causal_ops.cpp", "session_codec_impl.h")
+    (CUDA_ROOT / name).read_text(encoding="utf-8")
+    for name in ("core/causal_model.h", "core/causal_model.cpp", "storage/session_codec.h")
 )
 RUNTIME_OPTIONS = (
     CUDA_ROOT / "engine" / "options.cpp"

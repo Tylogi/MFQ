@@ -1,7 +1,6 @@
 #include "storage/weight_loader.h"
 #include "model_checks.h"
 
-#include "../models/registry.h"
 #include "quant_linear.h"
 #include "cuda_execution.h"
 #include "mfq_cuda_ops.h"

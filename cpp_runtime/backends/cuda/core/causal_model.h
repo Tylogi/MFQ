@@ -339,10 +339,4 @@ using Qwen4CausalLm = mfq::models::qwen4_exp::CausalLm<CudaCausalOps<Qwen4Model>
 using DeepseekV4CausalLm = mfq::models::deepseek_v4::CausalLm<CudaCausalOps<DeepseekV4Model>>;
 using DeepseekV41CausalLm = mfq::models::deepseek_v41::CausalLm<CudaCausalOps<DeepseekV41Model>>;
 
-template <typename Model>
-Model load_causal_lm(CudaExecutionContext &execution, const std::string &model_path,
-                     const std::string &config_path, std::int64_t context_size_override = 0,
-                     bool load_blocks = true, bool defer_moe_cache_finalize = false,
-                     std::shared_ptr<const mfq::ModelSource> source = {});
-
 } // namespace mfq::cuda

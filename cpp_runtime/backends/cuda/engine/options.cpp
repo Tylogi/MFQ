@@ -1,4 +1,3 @@
-#include "options.h"
 #include "cuda_runtime_config.h"
 #include "cuda_execution.h"
 #include "storage/moe_expert_cache.h"

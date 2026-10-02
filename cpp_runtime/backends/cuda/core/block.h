@@ -3,6 +3,7 @@
 #include "rope.h"
 
 #include <cstdint>
+#include <vector>
 
 struct CudaExecutionContext;
 
@@ -40,6 +41,7 @@ struct Block {
     virtual void reset(int64_t batch) = 0;
     virtual void set_token_ids(const mfq_tensor_backend::Tensor&) {}
     virtual bool supports_speculation() const noexcept { return false; }
+    virtual std::vector<mfq_tensor_backend::Tensor*> graph_warmup_state() { return {}; }
     virtual void begin_speculative(int64_t) {}
     virtual void commit_speculative() {}
     virtual void rollback_speculative(int64_t) {}
