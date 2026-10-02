@@ -6,7 +6,14 @@
 #include "generation_policy.h"
 #include "inference.h"
 #include "mfq_cuda_ops.h"
-#include "models/registry.h"
+#include "models/deepseek_v4/ops.h"
+#include "models/deepseek_v41/ops.h"
+#include "models/gemma4/ops.h"
+#include "models/glm5_next/ops.h"
+#include "models/glm_dsa/ops.h"
+#include "models/minicpmo45/ops.h"
+#include "models/qwen35/ops.h"
+#include "models/qwen4_exp/ops.h"
 
 #include <cuda_runtime_api.h>
 
@@ -58,20 +65,10 @@ template <class Model> struct CudaMtpOps {
   void initialize(const std::vector<int64_t> &prompt,
                   const MfqSamplingParams &sampling) {
     input_ids = ids_for(prompt);
-    auto random_host =
-        mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions()
-                                           .device(mfq_tensor_backend::kCPU)
-                                           .dtype(mfq_tensor_backend::kFloat32)
-                                           .pinned_memory(true));
-    auto random_gpu = mfq_tensor_backend::empty(
-        {1}, options.dtype(mfq_tensor_backend::kFloat32));
-    sampler_.emplace(sampling, mfq::cuda::SamplingOps(std::move(random_host),
-                                                      std::move(random_gpu)));
+    sampler_.emplace(sampling);
     penalties = sampler().has_penalties();
     if (penalties) {
-      counts = mfq_tensor_backend::zeros(
-          {model.vocab_size()}, options.dtype(mfq_tensor_backend::kInt32));
-      add_counts(counts, input_ids);
+      counts = mfq::cuda::SamplingOps::token_counts(input_ids, model.vocab_size());
     }
   }
   auto &sampler() { return *sampler_; }

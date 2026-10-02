@@ -1,6 +1,8 @@
 #include "request_executor.h"
+#include "runtime_config.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <map>
 
 using namespace mfq::engine;
@@ -82,7 +84,120 @@ static const EventData &terminal_event(const EngineStepResult &result) {
     return result.events.back().data;
 }
 
+struct TestBackend {
+    struct Options { std::int64_t context_size = 32; } options;
+    TestOps ops;
+    bool loaded = false, fail_load = false;
+    int loads = 0;
+    auto load() {
+        assert(!loaded && ops.live == 0);
+        loaded = true;
+        ++loads;
+        if (fail_load) throw std::runtime_error("load failed after allocation");
+        ops = TestOps{};
+        auto metadata = info();
+        metadata.max_context = options.context_size;
+        return std::pair{metadata, std::unique_ptr<TextProcessor>{}};
+    }
+    template <class F> decltype(auto) visit(F&& run) {
+        if (!loaded) throw std::runtime_error("unloaded");
+        return run(ops);
+    }
+    bool exclusive() const { return false; }
+    void unload() {
+        assert(ops.live == 0); // Suspended requests must die before native state.
+        ops.batched.clear();
+        loaded = false;
+    }
+};
+
+template <class F> static void rejects(F&& run) {
+    bool failed = false;
+    try { run(); } catch (const std::exception&) { failed = true; }
+    assert(failed);
+}
+
+static void check_engine_lifecycle() {
+    EngineInstance<TestBackend> first({32}), second({64});
+    assert(first.info().max_context == 32 && second.info().max_context == 64);
+    assert(first.admit(request()) == Admission::accepted);
+    first.step({"one"});
+    assert(first.backend.ops.live == 1);
+    rejects([&] { first.reload(48); });
+    rejects([&] { second.reload(0); });
+    assert(first.backend.loads == 1 && second.backend.loads == 1);
+    first.cancel("one");
+    assert(std::holds_alternative<Cancelled>(terminal_event(first.step({}))));
+    assert(first.reload(48) == 48 && first.status().healthy);
+    assert(second.info().max_context == 64 && second.backend.loads == 1);
+    first.backend.ops.failure = 2;
+    first.admit(request());
+    assert(std::holds_alternative<Failed>(terminal_event(first.step({"one"}))));
+    assert(!first.status().healthy);
+    assert(first.reload(32) == 32 && first.status().healthy);
+    first.backend.fail_load = true;
+    rejects([&] { first.reload(40); });
+    assert(!first.status().healthy && !first.backend.loaded);
+    first.backend.fail_load = false;
+    assert(first.reload(40) == 40 && first.status().available == 2);
+    first.admit(request());
+    first.step({"one"});
+    first.shutdown();
+    first.shutdown();
+    assert(!first.status().healthy && first.backend.ops.live == 0);
+    assert(second.status().healthy);
+}
+
+struct Environment {
+    const char* name;
+    std::optional<std::string> previous;
+    Environment(const char* name, const char* value) : name(name) {
+        if (const char* old = std::getenv(name)) previous = old;
+        set(value);
+    }
+    void set(const char* value) {
+#ifdef _WIN32
+        _putenv_s(name, value ? value : "");
+#else
+        if (value) setenv(name, value, 1); else unsetenv(name);
+#endif
+    }
+    ~Environment() { set(previous ? previous->c_str() : nullptr); }
+};
+
+static void check_runtime_config() {
+    Environment sessions("MFQ_RUNTIME_MAX_KV_SESSIONS", "3");
+    Environment block("MFQ_RUNTIME_PREFIX_CACHE_BLOCK_TOKENS", "512");
+    Environment directory("MFQ_RUNTIME_PREFIX_CACHE_DIR", "cache-example");
+    Environment budget("MFQ_CONTINUOUS_BATCH_PREFILL_TOKEN_BUDGET", "7");
+    auto config = resolve_runtime_config(16);
+    assert(config.generation.prefill_chunk_size == 16);
+    assert(config.session_cache.snapshots.max_sessions == 3);
+    assert(config.prefix_cache.block_tokens == 512 && config.prefix_cache.directory == "cache-example");
+    auto batch = resolve_batch_config(2, 16);
+    assert(batch.max_sequences == 2 && batch.prefill_token_budget == 7);
+    rejects([] { resolve_runtime_config(0); });
+    rejects([] { resolve_batch_config(-1, 16); });
+    for (const char* bad : {"-1", "12x", "18446744073709551616"}) {
+        sessions.set(bad);
+        rejects([] { resolve_runtime_config(16); });
+    }
+    sessions.set("3");
+    for (const char* bad : {"0", "65537"}) {
+        block.set(bad);
+        rejects([] { resolve_runtime_config(16); });
+    }
+    budget.set("0");
+    rejects([] { resolve_batch_config(2, 16); });
+    budget.set(nullptr);
+    assert(resolve_batch_config(2, 16).prefill_token_budget == 16);
+    Environment enabled("MFQ_RUNTIME_TRACE_SESSION_CACHE", "false");
+    rejects([] { environment_enabled("MFQ_RUNTIME_TRACE_SESSION_CACHE"); });
+}
+
 int main() {
+    check_engine_lifecycle();
+    check_runtime_config();
     // A restored prefix and snapshot boundary must not enlarge a prefill tick.
     {
         TestOps ops;

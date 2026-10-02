@@ -19,7 +19,7 @@ CUDA_RUNTIME = "\n".join(
         CUDA_ROOT / "commands" / "runtime.cpp",
         CUDA_ROOT / "storage" / "model_loader.h",
         CUDA_ROOT / "commands" / "cli.cpp",
-        CUDA_ROOT / "engine" / "options.cpp",
+        CUDA_ROOT / "storage" / "load_options.cpp",
         CUDA_ROOT / "commands" / "diagnostics.cpp",
     )
 )

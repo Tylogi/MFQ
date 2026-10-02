@@ -112,7 +112,8 @@ def test_engine_owns_native_gguf_jinja_template_and_common_parser() -> None:
     assert "common_chat_parse" not in SERVER
     assert "MfqTokenizer" not in SERVER
     assert ".tokenize(" not in SERVER
-    assert "std::make_unique<TextProcessor>" in CUDA_ENGINE
+    assert "TextProcessor::load(" in CUDA_ENGINE
+    assert "std::make_unique<TextProcessor>" in ENGINE
     assert "format_gemma4_chat_prompt" not in SERVER
     assert "format_dsv4_chat_prompt" not in SERVER
 

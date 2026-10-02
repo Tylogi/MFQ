@@ -17,6 +17,8 @@
 
 namespace mfq {
 
+inline constexpr const char* kTokenizerGgufAsset = "__mfq_asset__/tokenizer.gguf";
+
 inline constexpr std::string_view kModelConfigAsset =
     "__mfq_asset__/model_config.json";
 

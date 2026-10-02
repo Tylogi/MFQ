@@ -11,6 +11,8 @@
 #include <unordered_set>
 #include <vector>
 
+namespace mfq { class ModelSource; }
+
 namespace mfq::engine {
 
 enum class InferenceInputErrorCode {
@@ -58,6 +60,8 @@ struct ChatTemplateCapabilities {
 // grammar constraints, output parsing, stop handling, and media placeholders.
 class TextProcessor {
 public:
+    static std::unique_ptr<TextProcessor> load(const ModelSource& source,
+        const std::string& tokenizer_path, std::int32_t vocabulary, const std::string& model_type);
     TextProcessor(
         const std::string& tokenizer_path,
         std::int32_t expected_vocabulary,

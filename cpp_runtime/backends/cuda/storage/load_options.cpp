@@ -11,8 +11,6 @@
 #include <charconv>
 #include <cctype>
 #include <cmath>
-#include <cstdlib>
-#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -23,6 +21,8 @@
 #include <vector>
 
 namespace mfq::cuda::internal {
+using mfq::engine::environment_uint64;
+using mfq::engine::environment_enabled;
 namespace {
 
 int strict_int(const std::string& text, const char* option) {
@@ -48,62 +48,6 @@ double strict_double(const std::string& text, const char* option) {
     return result;
 }
 
-std::uint64_t environment_uint64(
-        const char* name, std::uint64_t fallback) {
-    const char* value = std::getenv(name);
-    if (value == nullptr || value[0] == '\0') return fallback;
-    std::uint64_t result = 0;
-    const auto length = std::char_traits<char>::length(value);
-    const auto [end, error] = std::from_chars(value, value + length, result);
-    if (error != std::errc{} || end != value + length) {
-        throw std::runtime_error(std::string("invalid ") + name);
-    }
-    return result;
-}
-
-bool environment_enabled(const char* name, bool fallback = true) {
-    const char* value = std::getenv(name);
-    if (value == nullptr || value[0] == '\0') return fallback;
-    return strict_int(value, name) != 0;
-}
-
-std::filesystem::path default_prefix_cache_directory() {
-    if (const char* configured =
-            std::getenv("MFQ_RUNTIME_PREFIX_CACHE_DIR")) {
-        if (configured[0] != '\0') return configured;
-    }
-#ifdef _WIN32
-    if (const char* local = std::getenv("LOCALAPPDATA")) {
-        if (local[0] != '\0') {
-            return std::filesystem::path(local) /
-                "TyloQuant" / "MFQ" / "prefix-cache";
-        }
-    }
-#else
-    if (const char* xdg = std::getenv("XDG_CACHE_HOME")) {
-        if (xdg[0] != '\0') {
-            return std::filesystem::path(xdg) /
-                "tyloquant" / "mfq" / "prefix-cache";
-        }
-    }
-    if (const char* home = std::getenv("HOME")) {
-        if (home[0] != '\0') {
-            return std::filesystem::path(home) / ".cache" /
-                "tyloquant" / "mfq" / "prefix-cache";
-        }
-    }
-#endif
-    return std::filesystem::temp_directory_path() /
-        "tyloquant-mfq-prefix-cache";
-}
-
-std::size_t checked_size(std::uint64_t value, const char* name) {
-    if (value > std::numeric_limits<std::size_t>::max()) {
-        throw std::runtime_error(std::string(name) + " exceeds size_t");
-    }
-    return static_cast<std::size_t>(value);
-}
-
 std::int32_t graph_minimum(const char* name) {
     const auto value = std::max<std::uint64_t>(
         2, environment_uint64(name, 16));
@@ -118,16 +62,11 @@ std::int32_t graph_minimum(const char* name) {
 
 CudaRuntimeConfig resolve_cuda_runtime_config(
         const CudaEngineOptions& options) {
-    if (options.prefill_chunk_size <= 0) {
-        throw std::invalid_argument("prefill chunk size must be positive");
-    }
-    if (options.continuous_batching < 0) {
-        throw std::invalid_argument(
-            "continuous batching capacity must be non-negative");
-    }
-
     CudaRuntimeConfig config;
-    config.generation.prefill_chunk_size = options.prefill_chunk_size;
+    static_cast<mfq::engine::RuntimeConfig&>(config) =
+        mfq::engine::resolve_runtime_config(options.prefill_chunk_size);
+    static_cast<mfq::engine::ContinuousBatchConfig&>(config.continuous_batch) =
+        mfq::engine::resolve_batch_config(options.continuous_batching, options.prefill_chunk_size);
     config.decode_graph.enabled = environment_enabled(
         "MFQ_RUNTIME_CUDA_GRAPH", true);
     config.decode_graph.trace = environment_enabled(
@@ -135,8 +74,6 @@ CudaRuntimeConfig resolve_cuda_runtime_config(
     config.decode_graph.minimum_generation_tokens = graph_minimum(
         "MFQ_RUNTIME_CUDA_GRAPH_MIN_TOKENS");
 
-    config.continuous_batch.max_sequences =
-        static_cast<std::size_t>(options.continuous_batching);
     config.continuous_batch.greedy = environment_enabled(
         "MFQ_CONTINUOUS_BATCH_GREEDY", true);
     config.continuous_batch.cuda_graph =
@@ -146,52 +83,6 @@ CudaRuntimeConfig resolve_cuda_runtime_config(
         "MFQ_CONTINUOUS_PAGED_KV", true);
     config.continuous_batch.cuda_graph_minimum_tokens = graph_minimum(
         "MFQ_CONTINUOUS_BATCH_CUDA_GRAPH_MIN_TOKENS");
-    config.continuous_batch.prefill_token_budget =
-        static_cast<std::int64_t>(std::min<std::uint64_t>(
-            environment_uint64(
-                "MFQ_CONTINUOUS_BATCH_PREFILL_TOKEN_BUDGET",
-                static_cast<std::uint64_t>(options.prefill_chunk_size)),
-            static_cast<std::uint64_t>(
-                std::numeric_limits<std::int64_t>::max())));
-    if (config.continuous_batch.prefill_token_budget < 1) {
-        throw std::invalid_argument(
-            "continuous batching prefill token budget must be positive");
-    }
-
-    auto& sessions = config.session_cache;
-    sessions.snapshots.max_sessions = checked_size(environment_uint64(
-        "MFQ_RUNTIME_MAX_KV_SESSIONS", sessions.snapshots.max_sessions),
-        "MFQ_RUNTIME_MAX_KV_SESSIONS");
-    sessions.snapshots.max_snapshots_per_session = checked_size(
-        environment_uint64(
-            "MFQ_RUNTIME_MAX_KV_SNAPSHOTS_PER_SESSION",
-            sessions.snapshots.max_snapshots_per_session),
-        "MFQ_RUNTIME_MAX_KV_SNAPSHOTS_PER_SESSION");
-    sessions.snapshots.max_bytes = checked_size(environment_uint64(
-        "MFQ_RUNTIME_KV_SESSION_BYTES", sessions.snapshots.max_bytes),
-        "MFQ_RUNTIME_KV_SESSION_BYTES");
-    sessions.trace = environment_enabled(
-        "MFQ_RUNTIME_TRACE_SESSION_CACHE", false);
-
-    auto& prefix = config.prefix_cache;
-    prefix.directory = default_prefix_cache_directory();
-    prefix.enabled = !environment_enabled(
-        "MFQ_RUNTIME_DISABLE_PREFIX_CACHE", false);
-    prefix.block_tokens = environment_uint64(
-        "MFQ_RUNTIME_PREFIX_CACHE_BLOCK_TOKENS", prefix.block_tokens);
-    if (prefix.block_tokens == 0 || prefix.block_tokens > 65536) {
-        throw std::runtime_error(
-            "MFQ_RUNTIME_PREFIX_CACHE_BLOCK_TOKENS must be in [1, 65536]");
-    }
-    prefix.disk_bytes = environment_uint64(
-        "MFQ_RUNTIME_PREFIX_CACHE_DISK_BYTES", prefix.disk_bytes);
-    prefix.hot_bytes = environment_uint64(
-        "MFQ_RUNTIME_PREFIX_CACHE_HOT_BYTES", prefix.hot_bytes);
-    prefix.pending_writes = checked_size(environment_uint64(
-        "MFQ_RUNTIME_PREFIX_CACHE_PENDING_WRITES", prefix.pending_writes),
-        "MFQ_RUNTIME_PREFIX_CACHE_PENDING_WRITES");
-    prefix.pending_bytes = environment_uint64(
-        "MFQ_RUNTIME_PREFIX_CACHE_PENDING_BYTES", prefix.pending_bytes);
     return config;
 }
 
@@ -415,73 +306,14 @@ static void configure_layer_placement(
             "--layer-parallel cannot be combined with tensor/expert parallelism");
     }
 
-    const auto device_values =
-        split_csv_values(devices_arg, "--layer-parallel");
-    if (device_values.size() == 1 &&
-            devices_arg.find(',') == std::string::npos) {
-        const int count = strict_int(
-            device_values.front(), "--layer-parallel");
-        if (count < 2) {
-            throw std::runtime_error(
-                "--layer-parallel device count must be at least 2");
-        }
-        placement.devices.resize(static_cast<size_t>(count));
-        std::iota(
-            placement.devices.begin(), placement.devices.end(), 0);
-    } else {
-        for (const auto & item : device_values) {
-            placement.devices.push_back(
-                strict_int(item, "--layer-parallel"));
-        }
-        if (placement.devices.size() < 2) {
-            throw std::runtime_error(
-                "--layer-parallel requires at least two devices");
-        }
-    }
-
     int available = 0;
     MFQ_CUDA_CHECK(cudaGetDeviceCount(&available));
-    std::unordered_set<int> unique_devices;
-    for (int device : placement.devices) {
-        if (device < 0 || device >= available) {
-            throw std::runtime_error(
-                "layer-placement CUDA device is unavailable: " +
-                std::to_string(device));
-        }
-        if (!unique_devices.insert(device).second) {
-            throw std::runtime_error(
-                "layer-placement CUDA devices must be unique");
-        }
-    }
-    if (!split_arg.empty()) {
-        for (const auto & item :
-             split_csv_values(split_arg, "--layer-split")) {
-            const double weight = strict_double(item, "--layer-split");
-            if (weight <= 0.0) {
-                throw std::runtime_error(
-                    "--layer-split values must be positive");
-            }
-            placement.split.push_back(weight);
-        }
-        if (placement.split.size() != placement.devices.size()) {
-            throw std::runtime_error(
-                "--layer-split count must match --layer-parallel devices");
-        }
-    }
-    MFQ_CUDA_CHECK(cudaSetDevice(placement.primary_device()));
-    std::cerr << "layer_parallel devices=";
-    for (size_t index = 0; index < placement.devices.size(); ++index) {
-        if (index) std::cerr << ',';
-        std::cerr << placement.devices[index];
-    }
-    if (!placement.split.empty()) {
-        std::cerr << " split=";
-        for (size_t index = 0; index < placement.split.size(); ++index) {
-            if (index) std::cerr << ',';
-            std::cerr << placement.split[index];
-        }
-    }
-    std::cerr << '\n';
+    auto parsed = parse_parallel_config(devices_arg, split_arg,
+        "--layer-parallel", "--layer-split", available, false);
+    MFQ_CUDA_CHECK(cudaSetDevice(parsed.primary_device()));
+    print_parallel_config("layer_parallel", parsed);
+    placement.devices = std::move(parsed.devices);
+    placement.split = std::move(parsed.split);
 }
 
 static std::unordered_set<int> parse_layer_ranges(
@@ -534,99 +366,85 @@ void setup_cuda_load(
         const mfq::cuda::CudaLoadOptions& options,
         CudaExecutionContext& execution) {
     execution.reset();
-    const auto& tensor_parallel_arg = options.tensor_parallel_arg;
-    const auto& tensor_split_arg = options.tensor_split_arg;
-    const auto& expert_parallel_arg = options.expert_parallel_arg;
-    const auto& expert_split_arg = options.expert_split_arg;
-    const auto& parallel_test_duplicates = options.parallel_test_duplicates;
-    const auto& layer_parallel_arg = options.layer_parallel_arg;
-    const auto& layer_split_arg = options.layer_split_arg;
-    const auto& cpu_offload_layers_arg = options.cpu_offload_layers_arg;
-    const auto& moe_gpu_cache_gb = options.moe_gpu_cache_gb;
-    const auto& moe_cache_profile_path = options.moe_cache_profile_path;
-    const auto& n_gpu_layers_set = options.n_gpu_layers_set;
-    const auto& n_gpu_layers = options.n_gpu_layers;
-    const auto& cpu_threads_set = options.cpu_threads_set;
-    const auto& cpu_threads = options.cpu_threads;
-        if (n_gpu_layers_set) execution.n_gpu_layers = n_gpu_layers;
-        if (cpu_threads_set && cpu_threads <= 0) {
-            throw std::runtime_error("--threads must be positive");
+    if (options.n_gpu_layers_set) execution.n_gpu_layers = options.n_gpu_layers;
+    if (options.cpu_threads_set && options.cpu_threads <= 0) {
+        throw std::runtime_error("--threads must be positive");
+    }
+    if (options.cpu_threads > 0) {
+        mfq_set_num_threads(options.cpu_threads);
+    }
+    configure_model_parallel(
+        execution, options.tensor_parallel_arg, options.tensor_split_arg,
+        options.expert_parallel_arg, options.expert_split_arg,
+        options.parallel_test_duplicates);
+    configure_layer_placement(
+        execution, options.layer_parallel_arg, options.layer_split_arg);
+    if (!options.cpu_offload_layers_arg.empty()) {
+        execution.dsv4_cpu_offload_layers =
+            parse_layer_ranges(options.cpu_offload_layers_arg);
+        std::vector<int> ordered(
+            execution.dsv4_cpu_offload_layers.begin(),
+            execution.dsv4_cpu_offload_layers.end());
+        std::sort(ordered.begin(), ordered.end());
+        std::cerr << "cpu_offload_layers=";
+        for (size_t index = 0; index < ordered.size(); ++index) {
+            if (index) std::cerr << ',';
+            std::cerr << ordered[index];
         }
-        if (cpu_threads > 0) {
-            mfq_set_num_threads(cpu_threads);
-        }
-        configure_model_parallel(
-            execution, tensor_parallel_arg, tensor_split_arg,
-            expert_parallel_arg, expert_split_arg,
-            parallel_test_duplicates);
-        configure_layer_placement(
-            execution, layer_parallel_arg, layer_split_arg);
-        if (!cpu_offload_layers_arg.empty()) {
-            execution.dsv4_cpu_offload_layers =
-                parse_layer_ranges(cpu_offload_layers_arg);
-            std::vector<int> ordered(
-                execution.dsv4_cpu_offload_layers.begin(),
-                execution.dsv4_cpu_offload_layers.end());
-            std::sort(ordered.begin(), ordered.end());
-            std::cerr << "cpu_offload_layers=";
-            for (size_t index = 0; index < ordered.size(); ++index) {
-                if (index) std::cerr << ',';
-                std::cerr << ordered[index];
-            }
-            std::cerr << std::endl;
-        }
-        if (n_gpu_layers_set && execution.n_gpu_layers < 0) {
-            throw std::runtime_error("--n-gpu-layers must be non-negative");
-        }
-        if (n_gpu_layers_set && !cpu_offload_layers_arg.empty()) {
+        std::cerr << std::endl;
+    }
+    if (options.n_gpu_layers_set && execution.n_gpu_layers < 0) {
+        throw std::runtime_error("--n-gpu-layers must be non-negative");
+    }
+    if (options.n_gpu_layers_set && !options.cpu_offload_layers_arg.empty()) {
+        throw std::runtime_error(
+            "--n-gpu-layers cannot be combined with --cpu-offload-layers");
+    }
+    if (options.moe_gpu_cache_gb < 0.0 ||
+            !std::isfinite(options.moe_gpu_cache_gb)) {
+        throw std::runtime_error(
+            "--moe-gpu-cache-gb must be finite and non-negative");
+    }
+    if (options.moe_gpu_cache_gb > 0.0 &&
+            !options.cpu_offload_layers_arg.empty()) {
+        throw std::runtime_error(
+            "--moe-gpu-cache-gb cannot be combined with "
+            "--cpu-offload-layers");
+    }
+    if (options.moe_gpu_cache_gb > 0.0 &&
+            (execution.tensor_parallel.enabled() ||
+             execution.expert_parallel.enabled())) {
+        throw std::runtime_error(
+            "--moe-gpu-cache-gb cannot be combined with "
+            "tensor/expert parallelism");
+    }
+    if (!options.moe_cache_profile_path.empty() &&
+            options.moe_gpu_cache_gb <= 0.0) {
+        throw std::runtime_error(
+            "--moe-cache-profile requires --moe-gpu-cache-gb");
+    }
+    if (options.moe_gpu_cache_gb > 0.0) {
+        constexpr double gib =
+            1024.0 * 1024.0 * 1024.0;
+        const double bytes = options.moe_gpu_cache_gb * gib;
+        if (bytes < 1.0 ||
+                bytes >
+                    static_cast<double>(
+                        std::numeric_limits<int64_t>::max())) {
             throw std::runtime_error(
-                "--n-gpu-layers cannot be combined with --cpu-offload-layers");
+                "--moe-gpu-cache-gb is outside the supported range");
         }
-        if (moe_gpu_cache_gb < 0.0 ||
-                !std::isfinite(moe_gpu_cache_gb)) {
-            throw std::runtime_error(
-                "--moe-gpu-cache-gb must be finite and non-negative");
+        execution.moe_expert_cache =
+            make_moe_expert_cache(
+                static_cast<int64_t>(bytes), execution.config);
+        if (!options.moe_cache_profile_path.empty()) {
+            set_moe_expert_cache_profile(
+                *execution.moe_expert_cache,
+                mfq::load_moe_cache_profile(
+                    options.moe_cache_profile_path));
         }
-        if (moe_gpu_cache_gb > 0.0 &&
-                !cpu_offload_layers_arg.empty()) {
-            throw std::runtime_error(
-                "--moe-gpu-cache-gb cannot be combined with "
-                "--cpu-offload-layers");
-        }
-        if (moe_gpu_cache_gb > 0.0 &&
-                (execution.tensor_parallel.enabled() ||
-                 execution.expert_parallel.enabled())) {
-            throw std::runtime_error(
-                "--moe-gpu-cache-gb cannot be combined with "
-                "tensor/expert parallelism");
-        }
-        if (!moe_cache_profile_path.empty() &&
-                moe_gpu_cache_gb <= 0.0) {
-            throw std::runtime_error(
-                "--moe-cache-profile requires --moe-gpu-cache-gb");
-        }
-        if (moe_gpu_cache_gb > 0.0) {
-            constexpr double gib =
-                1024.0 * 1024.0 * 1024.0;
-            const double bytes = moe_gpu_cache_gb * gib;
-            if (bytes < 1.0 ||
-                    bytes >
-                        static_cast<double>(
-                            std::numeric_limits<int64_t>::max())) {
-                throw std::runtime_error(
-                    "--moe-gpu-cache-gb is outside the supported range");
-            }
-            execution.moe_expert_cache =
-                make_moe_expert_cache(
-                    static_cast<int64_t>(bytes), execution.config);
-            if (!moe_cache_profile_path.empty()) {
-                set_moe_expert_cache_profile(
-                    *execution.moe_expert_cache,
-                    mfq::load_moe_cache_profile(
-                        moe_cache_profile_path));
-            }
-            execution.drop_file_cache = true;
-        }
+        execution.drop_file_cache = true;
+    }
 }
 
 int with_cuda_load(

@@ -16,9 +16,22 @@ public:
     using Tensor = mfq_tensor_backend::Tensor;
     using Params = ::MfqSamplingParams;
 
-    SamplingOps(Tensor random_host, Tensor random_cuda)
-        : random_host_(std::move(random_host)),
-          random_cuda_(std::move(random_cuda)) {}
+    SamplingOps()
+        : random_host_(mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions()
+              .dtype(mfq_tensor_backend::kFloat32).device(mfq_tensor_backend::kCPU)
+              .pinned_memory(true))),
+          random_cuda_(mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions()
+              .dtype(mfq_tensor_backend::kFloat32).device(mfq_tensor_backend::kCUDA))) {}
+
+    const Tensor& random_host() const noexcept { return random_host_; }
+
+    static Tensor token_counts(const Tensor& ids, std::int64_t vocabulary, Tensor storage = {}) {
+        if (!storage.defined())
+            storage = mfq_tensor_backend::empty({vocabulary}, ids.options().dtype(mfq_tensor_backend::kInt32));
+        storage.zero_();
+        sample_token_counts_add_cuda(storage, ids);
+        return storage;
+    }
 
     Tensor sample_greedy(Tensor logits) {
         return ::sample_greedy_cuda(std::move(logits));

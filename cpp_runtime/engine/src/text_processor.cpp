@@ -1,4 +1,5 @@
 #include "text_processor.h"
+#include "mfq/model_source.h"
 
 #include "token_constraint.h"
 #include "tokenizer.h"
@@ -324,6 +325,17 @@ struct TextProcessor::Impl {
     std::string model_type;
     ChatTemplateCapabilities capabilities;
 };
+
+std::unique_ptr<TextProcessor> TextProcessor::load(const ModelSource& source,
+        const std::string& tokenizer_path, std::int32_t vocabulary, const std::string& model_type) {
+    if (source.has_asset(kTokenizerGgufAsset)) {
+        const auto bytes = source.read_asset(kTokenizerGgufAsset);
+        return std::make_unique<TextProcessor>(std::vector<std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(bytes.data()),
+            reinterpret_cast<const std::uint8_t*>(bytes.data()) + bytes.size()), vocabulary, model_type);
+    }
+    return std::make_unique<TextProcessor>(tokenizer_path, vocabulary, model_type);
+}
 
 TextProcessor::TextProcessor(
         const std::string& tokenizer_path,

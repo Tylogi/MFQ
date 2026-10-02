@@ -6,8 +6,6 @@
 
 namespace mfq::cuda {
 
-inline constexpr const char* kTokenizerGgufAsset = "__mfq_asset__/tokenizer.gguf";
-
 std::string load_model_config_json(
     const mfq::ModelSource& source,
     const std::string& external_path = {});

@@ -1,7 +1,13 @@
 #pragma once
 
-#include "models/registry.h"
+#include "models/deepseek_v4/ops.h"
+#include "models/deepseek_v41/ops.h"
+#include "models/gemma4/ops.h"
+#include "models/glm5_next/ops.h"
+#include "models/glm_dsa/ops.h"
 #include "models/minicpmo45/ops.h"
+#include "models/qwen35/ops.h"
+#include "models/qwen4_exp/ops.h"
 #include "core/mtp.h"
 #include "core/grid_vision_component.h"
 #include "cuda_runtime_config.h"

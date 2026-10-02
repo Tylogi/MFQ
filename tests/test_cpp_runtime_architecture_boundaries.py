@@ -76,7 +76,7 @@ CUDA_RUNTIME_SOURCE = "\n".join(
         "engine/cuda_engine.cpp",
         "engine/generation.cpp",
         "storage/text_session_cache.cpp",
-        "engine/options.cpp",
+        "storage/load_options.cpp",
     )
 )
 CUDA_MTP_SOURCE = (CUDA_RUNTIME / "mtp.cpp").read_text(encoding="utf-8")
@@ -426,7 +426,8 @@ def test_cuda_runtime_has_one_shared_generation_path() -> None:
 
     assert "generate_tokens" not in generation + header
     assert "MFQ_RUNTIME_QWEN38_TEXT_FLOW" not in CUDA_ENGINE_SOURCE
-    assert "RequestExecutor requests;" in CUDA_ENGINE_SOURCE
+    assert "RequestExecutor requests_" in SHARED_EXECUTOR
+    assert "RequestExecutor requests;" not in CUDA_ENGINE_SOURCE
     assert "mfq::engine::generate_request(" in generation
     assert "Generation generate(" in generation
     assert "co_yield" not in generation
@@ -465,7 +466,7 @@ def test_cuda_runtime_has_one_shared_generation_path() -> None:
 
 def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
     execution = (CUDA_OPS / "include" / "cuda_execution.h").read_text(encoding="utf-8")
-    options = (CUDA_RUNTIME / "options.cpp").read_text(encoding="utf-8")
+    options = (CUDA_RUNTIME.parent / "storage/load_options.cpp").read_text(encoding="utf-8")
 
     assert "struct CudaExecutionContext" in execution
     assert "class CudaProfilerAccess" not in execution
@@ -606,7 +607,8 @@ def test_cuda_runtime_composes_transport_scheduler_and_engine() -> None:
     assert "std::unique_ptr<QwenBatchExecutor>" in CUDA_ENGINE_SOURCE
     assert "ContinuousBatchingController" not in CUDA_ENGINE_SOURCE
     assert "current.generation.next()" in SHARED_EXECUTOR
-    assert "state.requests.step(eligible, state)" in CUDA_ENGINE_SOURCE
+    assert "EngineInstance<CudaBackend>" in CUDA_ENGINE_SOURCE
+    assert "requests_.step(eligible, ops)" in SHARED_EXECUTOR
     assert "qwen35::QwenBatchExecutor" not in CUDA_ENGINE_SOURCE
     assert "mfq::engine::Engine& engine_" in scheduler
     assert "mailbox_" in scheduler
@@ -1219,7 +1221,7 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         "ops/vq.cpp",
         "ops/cuda_execution.cpp",
         "core/decode_graph.cpp",
-        "engine/options.cpp",
+        "storage/load_options.cpp",
         "commands/cli.cpp",
         "core/causal_model.cpp",
         "storage/model_loader.cpp",

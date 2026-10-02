@@ -153,22 +153,9 @@ struct QwenBatchOperations {
     }
 
     void initialize_sampling(Request &request, const Tensor &prompt_ids) {
-        const int primary = execution_.layer_placement.primary_device();
-        const auto cuda_options = mfq_tensor_backend::TensorOptions().device(
-            mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA, primary));
-        auto random_host = mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions()
-                                                              .device(mfq_tensor_backend::kCPU)
-                                                              .dtype(mfq_tensor_backend::kFloat32)
-                                                              .pinned_memory(true));
-        auto random_cuda =
-            mfq_tensor_backend::empty({1}, cuda_options.dtype(mfq_tensor_backend::kFloat32));
-        request.sampler.emplace(request.sampling, mfq::cuda::SamplingOps(std::move(random_host),
-                                                                         std::move(random_cuda)));
-        if (request.sampler->has_penalties()) {
-            request.counts = mfq_tensor_backend::zeros(
-                {model_.vocab_size()}, cuda_options.dtype(mfq_tensor_backend::kInt32));
-            sample_token_counts_add_cuda(request.counts, prompt_ids);
-        }
+        request.sampler.emplace(request.sampling);
+        if (request.sampler->has_penalties())
+            request.counts = SamplingOps::token_counts(prompt_ids, model_.vocab_size());
     }
 
     struct Sample {

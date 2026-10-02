@@ -325,9 +325,9 @@ int run_cuda_engine_isolation_check(CudaEngineOptions options) {
         second_produced == sampling.max_tokens &&
         first_output == first_reference &&
         second_output == second_reference &&
-        first->metadata.model_type == second->metadata.model_type &&
-        first->metadata.max_context == options.context_size &&
-        second->metadata.max_context == options.context_size &&
+        first->metadata().model_type == second->metadata().model_type &&
+        first->metadata().max_context == options.context_size &&
+        second->metadata().max_context == options.context_size &&
         !std::get<mfq::engine::Metrics>(first->control(mfq::engine::RuntimeMetrics{})).empty() &&
         !std::get<mfq::engine::Metrics>(second->control(mfq::engine::RuntimeMetrics{})).empty(),
         "concurrent CUDA engines did not remain isolated");

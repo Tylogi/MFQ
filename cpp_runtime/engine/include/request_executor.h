@@ -177,4 +177,85 @@ class RequestExecutor {
     std::unordered_map<RequestId, std::unique_ptr<ExecutionRequest>> requests_;
 };
 
+// Backend owns native resources and guards; this composition owns the common
+// Engine lifecycle. Destroy request coroutines before their text/model resources.
+template <class Backend> class EngineInstance {
+  public:
+    Backend backend;
+
+    explicit EngineInstance(typename Backend::Options options) : backend{std::move(options)} {
+        load();
+    }
+    EngineInfo info() const { return info_; }
+    EngineStatus status() const {
+        return loaded_ ? requests_.status(backend.exclusive()) : EngineStatus{0, false};
+    }
+    Admission admit(EngineRequest request) {
+        return backend.visit([&](auto& ops) {
+            return requests_.admit(std::move(request), text_.get(), info_, ops);
+        });
+    }
+    void cancel(const RequestId& id) { requests_.cancel(id); }
+    EngineStepResult step(const std::vector<RequestId>& eligible) {
+        return backend.visit([&](auto& ops) { return requests_.step(eligible, ops); });
+    }
+    SessionResult session(const SessionCommand& command) {
+        return backend.visit([&](auto& ops) { return control_session(ops.cache, command); });
+    }
+    ControlResult control(ControlRequest request) {
+        if (!loaded_) throw std::runtime_error("engine is unloaded");
+        return std::visit([&](auto&& value) -> ControlResult {
+            using T = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<T, DecodeTokens> ||
+                          std::is_same_v<T, PrepareDuplex> || std::is_same_v<T, PrepareDuplexStep>) {
+                if (!text_) throw std::invalid_argument("text control requires a tokenizer");
+                if constexpr (std::is_same_v<T, DecodeTokens>)
+                    return text_->decode_tokens(value.tokens, value.excluded);
+                else if constexpr (std::is_same_v<T, PrepareDuplex>) {
+                    text_->prepare_duplex_session(value.prompt, value.parameters);
+                    return std::move(value.parameters);
+                } else {
+                    text_->prepare_duplex_step(value.text, value.input);
+                    return std::move(value.input);
+                }
+            } else
+                return backend.visit([&](auto& ops) { return ops.control(std::move(value)); });
+        }, std::move(request));
+    }
+    std::int64_t reload(std::int64_t context) {
+        if (context < 1) throw std::invalid_argument("reload context must be positive");
+        if (!requests_.empty()) throw std::runtime_error("reload requires a quiescent engine");
+        shutdown();
+        backend.options.context_size = context;
+        load();
+        return info_.max_context;
+    }
+    void shutdown() {
+        loaded_ = false;
+        requests_ = RequestExecutor{};
+        text_.reset();
+        backend.unload();
+    }
+
+  private:
+    std::unique_ptr<TextProcessor> text_;
+    EngineInfo info_;
+    RequestExecutor requests_;
+    bool loaded_ = false;
+
+    void load() {
+        try {
+            auto [info, text] = backend.load();
+            info_ = std::move(info);
+            text_ = std::move(text);
+            if (text_) info_.chat = text_->chat_template_capabilities();
+            requests_ = RequestExecutor(info_.max_requests);
+            loaded_ = true;
+        } catch (...) {
+            shutdown();
+            throw;
+        }
+    }
+};
+
 } // namespace mfq::engine

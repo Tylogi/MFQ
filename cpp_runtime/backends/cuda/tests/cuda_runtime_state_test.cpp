@@ -1,5 +1,6 @@
 #include "cuda_execution.h"
 #include "cuda_runtime_config.h"
+#include "cuda_sampling.h"
 #include "diagnostics/generation_result.h"
 #include "engine/cuda_engine.h"
 #include "storage/text_session_cache.h"
@@ -27,6 +28,36 @@ using namespace mfq::cuda::internal;
 static void check(bool ok, const char *message) {
     if (!ok)
         throw std::runtime_error(message);
+}
+
+static void check_sampling_storage() {
+    using namespace mfq_tensor_backend;
+    auto ids = tensor(std::vector<int64_t>{1, 2, 1}, TensorOptions().device(kCUDA).dtype(kInt64));
+    auto storage = full({6}, 99, ids.options().dtype(kInt32));
+    auto counts = SamplingOps::token_counts(ids, 6, storage);
+    auto owned = SamplingOps::token_counts(ids, 6);
+    check(counts.data_ptr() == storage.data_ptr(), "sampling replaced graph count storage");
+    const auto expected = tensor(std::vector<int32_t>{0, 2, 1, 0, 0, 0});
+    for (const auto& value : {counts, owned}) {
+        auto host = value.cpu().contiguous();
+        check(host.scalar_type() == kInt32 && host.nbytes() == expected.nbytes() &&
+              std::memcmp(host.data_ptr(), expected.data_ptr(), host.nbytes()) == 0,
+              "sampling counts were not reset from the prompt");
+    }
+    MfqSamplingParams params;
+    params.temperature = 0.8; params.top_k = 4; params.top_p = 0.9;
+    params.seed = 73; params.repetition_penalty = 1.2;
+    Sampler first(params), second(params);
+    check(first.ops().random_host().data_ptr() != second.ops().random_host().data_ptr(),
+          "samplers share their host random buffer");
+    auto logits = tensor(std::vector<float>{1, 2, 3, 4, 5, 6},
+                         TensorOptions().device(kCUDA).dtype(kFloat32)).reshape({1, 6});
+    for (int i = 0; i < 16; ++i)
+        check(sample_logits(first, logits.clone(), counts).item<int64_t>() ==
+              sample_logits(second, logits.clone(), owned).item<int64_t>(),
+              "owned/reused sampling storage changed seeded output");
+    (void)SamplingOps::token_counts(ids, 6, storage);
+    check(owned.sum().item<int64_t>() == 3, "resetting one sampler changed another");
 }
 
 static void check_graph_warmup_state() {
@@ -528,6 +559,7 @@ static void check_batching(const char* model_path, const char* tokenizer) {
 int main(int argc, char** argv) try {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
+    check_sampling_storage();
     check_linear_execution();
     check_graph_warmup_state();
     check_dense_loading();

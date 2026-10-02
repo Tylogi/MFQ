@@ -4,7 +4,14 @@
 #include <cstring>
 
 #include "cuda_runtime_config.h"
-#include "models/registry.h"
+#include "models/deepseek_v4/ops.h"
+#include "models/deepseek_v41/ops.h"
+#include "models/gemma4/ops.h"
+#include "models/glm5_next/ops.h"
+#include "models/glm_dsa/ops.h"
+#include "models/minicpmo45/ops.h"
+#include "models/qwen35/ops.h"
+#include "models/qwen4_exp/ops.h"
 #include "storage/session_state.h"
 #include "core/mtp.h"
 #include "mfq_paged_prefix_cache.h"
@@ -53,7 +60,7 @@ static std::string cuda_prefix_cache_compatibility_key(
 
 std::shared_ptr<mfq::cache::PagedPrefixCache> make_cuda_paged_prefix_cache(
     const mfq::ModelSource &source, int64_t max_position_embeddings,
-    bool supports_paged_text_session_state, const CudaPrefixCacheConfig &config) {
+    bool supports_paged_text_session_state, const mfq::engine::PrefixCacheConfig &config) {
     const auto format = source.metadata().find("source.format");
     // ponytail: HF source fingerprints exclude config sidecars for now.
     if (!config.enabled ||
@@ -92,8 +99,8 @@ struct TextSessionCache::Impl : mfq::engine::SessionCache<CudaSessionOps> {
     using SessionCache::SessionCache;
 };
 
-TextSessionCache::TextSessionCache(const CudaSessionCacheConfig &session_config,
-    const CudaPrefixCacheConfig &prefix_config,
+TextSessionCache::TextSessionCache(const mfq::engine::SessionCacheConfig &session_config,
+    const mfq::engine::PrefixCacheConfig &prefix_config,
     std::shared_ptr<mfq::cache::PagedPrefixCache> paged_cache, bool supported, int disabled_reason)
     : impl_(std::make_unique<Impl>(
           session_config, prefix_config, std::move(paged_cache), supported, disabled_reason)) {}

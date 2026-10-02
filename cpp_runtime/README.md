@@ -13,17 +13,18 @@ by model family:
 - `transport/` — private stdio/HTTP protocol adapters;
 - `scheduler/` — backend-neutral request dispatch and lifecycle boundary;
 - `engine/` — the sole cross-backend `Engine` interface plus reusable
-  generation, continuous-batching, cache, tokenizer, output, and MTP
-  components; CUDA tensors and device execution stay in `backends/cuda/`;
+  Engine instance lifecycle, shared runtime configuration, generation,
+  continuous-batching, cache, tokenizer, output, and MTP components; CUDA tensors and device execution stay in `backends/cuda/`;
 - `components/` — focused integrated components (`ggml`, `tokenizer`, `http`,
   and `json`);
 - `backends/cuda/` — the concrete `CudaEngine`, model execution adapters,
   operators, applications, build definition, and tests; `core/causal_model.h`
   supplies native resources and operations to the shared causal model.
   Native Transformer, predictor and graph resources belong to `core/`, lower-level
-  operators to `ops/`, and loading plus session codecs/cache storage to `storage/`.
+  operators to `ops/`, and device setup, loading plus session codecs/cache storage
+  to `storage/`.
   `models/` contains family bindings and implementations; `engine/` contains
-  request, generation, batching, MTP and runtime configuration adapters;
+  Engine, generation, batching and MTP execution bindings;
 - `backends/metal/` — Metal/MLX storage, runtime utilities, operators, model
   implementations, kernels, applications, tests, benchmarks, and diagnostics;
 - `tests/` — backend-independent native tests;
@@ -58,7 +59,13 @@ MiniCPM/Grid-Vision multimodal composition are shared. Model definition,
 output-weight tying and layer traversal live in `CausalModelBase`; Gemma also
 owns its layer geometry and parameter-role assembly. CUDA's `CausalResources`
 supplies native bindings, and `storage/model_loader.cpp` handles device loading
-and placement. Metal integration and duplex control remain pending;
+and placement. `EngineInstance<Backend>` owns request execution, text controls and ordered
+reload/shutdown. Session/prefix settings and batch budgets use shared config;
+CUDA load settings stay in `storage/load_options.cpp`. Ordinary, speculative
+and batch generation share CUDA sampling buffer/count initialization. Model
+users include their actual family headers directly; there is no include-only
+model registry or CUDA MXFP4 blob forwarding header.
+Metal integration and duplex control remain pending;
 multi-device and non-Qwen3.5 real-weight validation are also incomplete.
 Qwen3.8-27B uses the `qwen3_5` backbone;
 Qwen3.8-Flash-Next uses `qwen4_exp`.

@@ -79,7 +79,9 @@ SHARED_MODELS = "\n".join(
     for path in (ROOT / "cpp_runtime" / "models").rglob("*.h")
 )
 
-DECODE += SHARED_ENGINE + SHARED_MODELS
+DECODE += SHARED_ENGINE + SHARED_MODELS + (
+    ROOT / "cpp_runtime/engine/src/runtime_config.cpp"
+).read_text(encoding="utf-8")
 CUDA_SESSION_CACHE += SHARED_ENGINE
 
 def test_native_session_identifier_reaches_the_cuda_runtime() -> None:

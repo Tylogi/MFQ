@@ -1,6 +1,13 @@
 #include "generation.h"
 #include "generation_flow.h"
-#include "models/registry.h"
+#include "models/deepseek_v4/ops.h"
+#include "models/deepseek_v41/ops.h"
+#include "models/gemma4/ops.h"
+#include "models/glm5_next/ops.h"
+#include "models/glm_dsa/ops.h"
+#include "models/minicpmo45/ops.h"
+#include "models/qwen35/ops.h"
+#include "models/qwen4_exp/ops.h"
 #include "core/full_block.h"
 #include "cuda_sampling.h"
 #include "storage/text_session_cache.h"
@@ -28,7 +35,7 @@ template <typename Model> struct CudaGenerationOps {
     Model &model;
     DecodeGraphCache &graph;
     const MfqTokenConstraintPtr &constraint;
-    mfq_tensor_backend::Tensor pending, counts, random_host;
+    mfq_tensor_backend::Tensor pending, counts;
     mfq::cuda::Sampler sampler;
     bool has_penalties;
     const CudaPreparedPrompt *prepared;
@@ -42,15 +49,7 @@ template <typename Model> struct CudaGenerationOps {
         const mfq::engine::InferenceRequest &request, const CudaPreparedPrompt *prepared,
         const CudaDecodeGraphConfig &graph_config)
         : model(model), graph(graph), constraint(request.token_constraint),
-          random_host(mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions()
-                                                         .dtype(mfq_tensor_backend::kFloat32)
-                                                         .device(mfq_tensor_backend::kCPU)
-                                                         .pinned_memory(true))),
-          sampler(request.sampling,
-              mfq::cuda::SamplingOps(random_host,
-                  mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions()
-                                                     .dtype(mfq_tensor_backend::kFloat32)
-                                                     .device(mfq_tensor_backend::kCUDA)))),
+          sampler(request.sampling),
           has_penalties(sampler.has_penalties()), prepared(prepared), graph_config(graph_config) {
         full_ids = mfq_tensor_backend::tensor(request.prompt,
             mfq_tensor_backend::TensorOptions()
@@ -60,9 +59,7 @@ template <typename Model> struct CudaGenerationOps {
                        .contiguous();
         graph.ensure_storage(model.vocab_size());
         if (has_penalties) {
-            counts = graph.counts;
-            counts.zero_();
-            sample_token_counts_add_cuda(counts, full_ids);
+            counts = mfq::cuda::SamplingOps::token_counts(full_ids, model.vocab_size(), graph.counts);
         }
         generation_limit = request.sampling.max_tokens;
         graph_active = graph_eligible();
@@ -151,9 +148,9 @@ template <typename Model> struct CudaGenerationOps {
             sizeof(int64_t),
             cudaMemcpyHostToDevice,
             graph_stream));
-        *random_host.template data_ptr<float>() = 0.5f;
+        *sampler.ops().random_host().template data_ptr<float>() = 0.5f;
         MFQ_CUDA_CHECK(cudaMemcpyAsync(graph.random.template data_ptr<float>(),
-            random_host.template data_ptr<float>(),
+            sampler.ops().random_host().template data_ptr<float>(),
             sizeof(float),
             cudaMemcpyHostToDevice,
             graph_stream));
@@ -220,9 +217,9 @@ template <typename Model> struct CudaGenerationOps {
         auto graph_stream_guards = activate_cuda_graph_compute_streams(graph.compute_streams);
         cudaStream_t graph_stream = graph.stream.stream();
         if (!sampler.greedy()) {
-            *random_host.template data_ptr<float>() = sampler.next_uniform_float();
+            *sampler.ops().random_host().template data_ptr<float>() = sampler.next_uniform_float();
             MFQ_CUDA_CHECK(cudaMemcpyAsync(graph.random.template data_ptr<float>(),
-                random_host.template data_ptr<float>(),
+                sampler.ops().random_host().template data_ptr<float>(),
                 sizeof(float),
                 cudaMemcpyHostToDevice,
                 graph_stream));

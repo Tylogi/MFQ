@@ -19,9 +19,9 @@ class PagedPrefixCache;
 }
 }
 
-namespace mfq::cuda {
-struct CudaPrefixCacheConfig;
-struct CudaSessionCacheConfig;
+namespace mfq::engine {
+struct PrefixCacheConfig;
+struct SessionCacheConfig;
 }
 
 namespace mfq::cuda::internal {
@@ -36,13 +36,13 @@ make_cuda_paged_prefix_cache(
     const mfq::ModelSource& source,
     std::int64_t max_position_embeddings,
     bool supports_paged_text_session_state,
-    const CudaPrefixCacheConfig& config);
+    const mfq::engine::PrefixCacheConfig& config);
 
 class TextSessionCache {
 public:
     explicit TextSessionCache(
-        const CudaSessionCacheConfig& session_config,
-        const CudaPrefixCacheConfig& prefix_config,
+        const mfq::engine::SessionCacheConfig& session_config,
+        const mfq::engine::PrefixCacheConfig& prefix_config,
         std::shared_ptr<mfq::cache::PagedPrefixCache> paged_cache = {},
         bool supported = true,
         int disabled_reason = 0);

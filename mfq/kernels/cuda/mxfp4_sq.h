@@ -1,6 +1,6 @@
 #pragma once
 #include "cpp_runtime/backends/cuda/include/mfq_tensor_backend.h"
-#include "cpp_runtime/backends/cuda/include/mfq_mxfp4_sq_blob.h"
+#include "cpp_runtime/core/include/mfq/mxfp4_sq_blob.h"
 
 // Parse the self-describing blob on CPU before upload.  These capture-safe
 // entry points consume loader-expanded row metadata without GPU-to-CPU reads.

@@ -42,7 +42,7 @@ CAUSAL_LM = "\n".join(
     for name in ("core/causal_model.h", "core/causal_model.cpp", "storage/session_codec.h")
 )
 RUNTIME_OPTIONS = (
-    CUDA_ROOT / "engine" / "options.cpp"
+    CUDA_ROOT / "storage" / "load_options.cpp"
 ).read_text(encoding="utf-8")
 
 

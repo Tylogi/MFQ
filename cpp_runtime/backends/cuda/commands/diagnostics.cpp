@@ -251,12 +251,12 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             const auto& mfq = *model_source;
             const auto config = mfq::models::ModelConfig::from_json(
                 mfq::cuda::load_model_config_json(mfq, config_path));
-            if (!mfq.has_asset(mfq::cuda::kTokenizerGgufAsset)) {
+            if (!mfq.has_asset(mfq::kTokenizerGgufAsset)) {
                 throw std::runtime_error(
                     "model source has no tokenizer GGUF");
             }
             const auto tokenizer_blob =
-                read_asset(mfq, mfq::cuda::kTokenizerGgufAsset);
+                read_asset(mfq, mfq::kTokenizerGgufAsset);
             const auto embedded =
                 probe_mfq_tokenizer(tokenizer_blob, check_tokenizer_text);
             if (embedded.vocab_size != config.vocab_size) {

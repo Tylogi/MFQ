@@ -47,7 +47,7 @@ struct CudaEngine final : mfq::engine::Engine {
     std::int64_t reload(std::int64_t context) override;
     void shutdown() override;
     mfq::engine::ControlResult control(mfq::engine::ControlRequest request) override;
-    CudaEngineMetadata metadata;
+    const CudaEngineMetadata& metadata() const;
 private:
     friend CudaEngine load_cuda_engine(CudaEngineOptions options);
     std::unique_ptr<Impl> impl_;

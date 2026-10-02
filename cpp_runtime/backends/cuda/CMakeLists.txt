@@ -309,7 +309,7 @@ target_compile_definitions(mfq-cuda-ops PRIVATE
 set_target_properties(mfq-cuda-ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set(MFQ_CUDA_LOADING_SOURCES
-    ${MFQ_CUDA_ROOT}/engine/options.cpp
+    ${MFQ_CUDA_ROOT}/storage/load_options.cpp
     ${MFQ_CUDA_ROOT}/storage/model_loader.cpp
     ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp
     ${MFQ_CUDA_ROOT}/storage/weight_loader.cpp
@@ -538,7 +538,7 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         ${MFQ_CUDA_ROOT}/engine/cuda_batching.cpp
         ${MFQ_CUDA_ROOT}/engine/generation.cpp
         ${MFQ_CUDA_ROOT}/storage/text_session_cache.cpp
-        ${MFQ_CUDA_ROOT}/engine/options.cpp
+        ${MFQ_CUDA_ROOT}/storage/load_options.cpp
         ${MFQ_CUDA_ROOT}/storage/model_loader.cpp
         ${MFQ_CUDA_ROOT}/engine/mtp.cpp
         ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp
