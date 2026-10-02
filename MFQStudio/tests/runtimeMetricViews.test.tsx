@@ -32,9 +32,10 @@ vi.mock('../src/features/settings/SettingsProvider', () => ({
 
 it('概览预填充卡片展示原生速度与耗时，而非媒体准备总时间或预报速度', () => {
   render(<MemoryRouter><OverviewPage /></MemoryRouter>);
-  expect(screen.getByText('200 tok/s')).toBeInTheDocument();
+  const prefill = screen.getByText('Prefill').closest('.metric-tile');
+  expect(prefill?.querySelector('strong')).toHaveTextContent(/^200 tok\/s$/);
   expect(screen.getByText('200 ms · Prompt processing')).toBeInTheDocument();
-  expect(screen.queryByText('999 tok/s')).not.toBeInTheDocument();
+  expect(prefill).not.toHaveTextContent('999 tok/s');
 });
 
 it('历史响应使用同一预填充速度，并单独显示媒体准备耗时', () => {

@@ -1,6 +1,7 @@
 /** 设置页面：展示推理草稿、采样参数、外观与数据导入导出操作。 */
 import type { Dispatch, ReactNode, SetStateAction } from 'react';
 import { SectionLabel, SettingRow, TMPanel } from '../../app/display';
+import { Switch } from '../../shared/ui/Switch';
 import type { GenerationSettings, PresetName, UiLanguage, UiTheme } from './configuration';
 
 export interface SettingsActions {
@@ -49,19 +50,19 @@ export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable
             "优先读取模型元数据，缺失参数由模型型号或架构默认值补齐。",
             "Read model metadata first, then fill missing values from model or architecture defaults.",
           )}
-          trailing={<input aria-label={tr("使用模型或架构默认值", "Use model or architecture defaults")} checked={settingsDraft.inheritModelDefaults} onChange={(event) => setModelDefaultInheritance(event.target.checked)} type="checkbox" />}
+          trailing={<Switch label={tr("使用模型或架构默认值", "Use model or architecture defaults")} checked={settingsDraft.inheritModelDefaults} onCheckedChange={setModelDefaultInheritance} />}
         />
         <SettingRow
           title={tr("视觉输入", "Vision input")}
           detail={tr("默认启用；关闭后图片和视频请求会被明确拒绝。", "On by default; when off, image and video requests are rejected explicitly.")}
-          trailing={<input aria-label={tr("视觉输入", "Vision input")} checked={settingsDraft.enableVision} onChange={(event) => setSettingsDraft((current) => ({ ...current, enableVision: event.target.checked, inheritModelDefaults: false }))} type="checkbox" />}
+          trailing={<Switch label={tr("视觉输入", "Vision input")} checked={settingsDraft.enableVision} onCheckedChange={(checked) => setSettingsDraft((current) => ({ ...current, enableVision: checked, inheritModelDefaults: false }))} />}
         />
         <SettingRow
           title="MTP"
           detail={mtpAvailable
             ? tr("当前模型支持 MTP 投机解码。", "The current model supports MTP speculative decoding.")
             : tr("当前模型无法使用 MTP，将使用普通 Decode。", "MTP is unavailable for the current model; ordinary Decode will be used.")}
-          trailing={<input aria-label="MTP" checked={mtpAvailable && settingsDraft.enableMtp} disabled={!mtpAvailable} onChange={(event) => setSettingsDraft((current) => ({ ...current, enableMtp: event.target.checked, inheritModelDefaults: false }))} type="checkbox" />}
+          trailing={<Switch label="MTP" checked={mtpAvailable && settingsDraft.enableMtp} disabled={!mtpAvailable} onCheckedChange={(checked) => setSettingsDraft((current) => ({ ...current, enableMtp: checked, inheritModelDefaults: false }))} />}
         />
       </TMPanel>
 
@@ -88,7 +89,7 @@ export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable
               <SettingRow
                 title={tr("排除历史思考", "Exclude reasoning history")}
                 detail={tr("后续请求不再发送已保存的思考内容。", "Do not send saved reasoning in later requests.")}
-                trailing={<input aria-label={tr("排除历史思考", "Exclude reasoning history")} checked={settingsDraft.excludeReasoning} onChange={(event) => setSettingsDraft((current) => ({ ...current, excludeReasoning: event.target.checked }))} type="checkbox" />}
+                trailing={<Switch label={tr("排除历史思考", "Exclude reasoning history")} checked={settingsDraft.excludeReasoning} onCheckedChange={(checked) => setSettingsDraft((current) => ({ ...current, excludeReasoning: checked }))} />}
               />
               <SettingRow
                 title={tr("最大生成 token 数", "Maximum output tokens")}
@@ -141,12 +142,12 @@ export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable
             <SettingRow
               title={tr("界面语言", "Interface language")}
               detail={tr("选择 MFQ Studio 的显示语言。", "Choose the display language for MFQ Studio.")}
-              trailing={<select onChange={(event) => setSettingsDraft((current) => ({ ...current, language: event.target.value as UiLanguage }))} value={settingsDraft.language}><option value="system">{tr("跟随系统", "System")}</option><option value="zh-CN">简体中文</option><option value="en">English</option></select>}
+              trailing={<select aria-label={tr("界面语言", "Interface language")} onChange={(event) => setSettingsDraft((current) => ({ ...current, language: event.target.value as UiLanguage }))} value={settingsDraft.language}><option value="system">{tr("跟随系统", "System")}</option><option value="zh-CN">简体中文</option><option value="en">English</option></select>}
             />
             <SettingRow
               title={tr("主题", "Theme")}
               detail={tr("跟随系统，或固定使用浅色或深色外观。", "Follow the system or use a fixed light or dark appearance.")}
-              trailing={<select onChange={(event) => setSettingsDraft((current) => ({ ...current, theme: event.target.value as UiTheme }))} value={settingsDraft.theme}><option value="system">{tr("跟随系统", "System")}</option><option value="light">{tr("浅色", "Light")}</option><option value="dark">{tr("深色", "Dark")}</option></select>}
+              trailing={<select aria-label={tr("主题", "Theme")} onChange={(event) => setSettingsDraft((current) => ({ ...current, theme: event.target.value as UiTheme }))} value={settingsDraft.theme}><option value="system">{tr("跟随系统", "System")}</option><option value="light">{tr("浅色", "Light")}</option><option value="dark">{tr("深色", "Dark")}</option></select>}
             />
           </TMPanel>
         </div>

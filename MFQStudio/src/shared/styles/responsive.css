@@ -15,6 +15,8 @@
 
 @media (max-width: 1080px) {
   .metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .metric-grid > .metric-tile:nth-child(3n) { border-right: 0; }
+  .metric-grid > .metric-tile:nth-child(n + 4) { border-top: 1px solid var(--line-soft); }
   .server-tools-grid { grid-template-columns: 1fr; }
 }
 
@@ -34,13 +36,23 @@
 @media (max-width: 760px) {
   .screen-header { min-height: 0; align-items: flex-start; }
   .screen-header h1 { font-size: 24px; }
+  .screen-header { flex-wrap: wrap; gap: 16px; }
+  .screen-header-trailing { flex-wrap: wrap; }
+  .section-label { align-items: flex-start; flex-wrap: wrap; gap: 5px 12px; }
   .screen-header p { max-width: 70vw; }
   .chat-screen-header { align-items: flex-start; padding: 14px; }
   .chat-model-summary { display: none; }
   .chat-screen-title h1 { display: none; }
   .chat-session-select { max-width: min(52vw, 260px); }
   .runtime-status-pill { display: none; }
-  .metric-grid, .logs-grid { grid-template-columns: 1fr; }
+  .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .metric-grid > .metric-tile { min-height: 124px; padding: 18px; }
+  .metric-grid > .metric-tile:nth-child(3n) { border-right: 1px solid var(--line-soft); }
+  .metric-grid > .metric-tile:nth-child(2n),
+  .metric-grid > .metric-tile:last-child { border-right: 0; }
+  .metric-grid > .metric-tile:nth-child(n + 3) { border-top: 1px solid var(--line-soft); }
+  .metric-grid > .metric-tile:last-child:nth-child(odd) { grid-column: 1 / -1; }
+  .logs-grid { grid-template-columns: 1fr; }
   .logs-grid > .runtime-log-panel { grid-column: 1; }
   .overview-footer-grid { grid-template-columns: 1fr; }
   .settings-page-grid { grid-template-columns: 1fr; }
@@ -57,8 +69,8 @@
 @media (max-width: 680px) {
   body { overflow: hidden; }
   .app-shell { display: block; height: 100vh; height: 100dvh; overflow: hidden; }
+  .workspace { height: 100%; }
   .mobile-menu-trigger { display: grid; }
-  .dashboard-view, .lab-view { padding-top: 54px; }
   .chat-screen-header { padding-left: 56px; }
   .sidebar {
     position: fixed;
@@ -95,11 +107,19 @@
   .composer-hint { display: none; }
   .composer-toolbar { flex-wrap: wrap; }
   .composer-toolbar .send-button { margin-left: auto; }
-  .dashboard-view, .lab-view { padding: 26px 14px 42px; }
+  .dashboard-view, .lab-view { padding: 64px 18px 36px; }
   .tm-panel.runtime-hero { padding: 15px; }
+  .overview-memory-panel { padding: 18px; }
+  .overview-memory-heading { flex-wrap: wrap; gap: 12px; }
+  .usage-bar > div:first-child { align-items: flex-start; flex-wrap: wrap; gap: 5px; }
+  .tm-panel { padding: 18px; }
+  .setting-row { flex-wrap: wrap; gap: 12px; }
+  .setting-row-trailing { max-width: 100%; }
+  .server-page .setting-row-trailing { max-width: 100%; }
+  .settings-page .portable-actions { flex-wrap: wrap; }
 }
 
 @media (max-width: 420px) {
-  .metric-grid { grid-template-columns: 1fr; }
+  .metric-grid > .metric-tile > strong { font-size: 25px; }
   .runtime-hero-actions button { flex: 1; justify-content: center; }
 }

@@ -148,19 +148,22 @@ export function OverviewPage() {
       <div className="metric-grid">
         <MetricTile
           label={tr('预填充', 'Prefill')}
-          value={`${formatNumber(lastPrefill.tokensPerSecond, 1)} tok/s`}
+          value={formatNumber(lastPrefill.tokensPerSecond, 1)}
+          unit="tok/s"
           detail={`${formatNumber(lastPrefill.milliseconds, 1)} ms · ${tr('输入处理', 'Prompt processing')}`}
           icon="text-forward"
         />
         <MetricTile
           label={tr('解码', 'Decode')}
-          value={`${formatNumber(last?.decode_tps, 1)} tok/s`}
+          value={formatNumber(last?.decode_tps, 1)}
+          unit="tok/s"
           detail={tr('输出生成', 'Token generation')}
           icon="waveform"
         />
         <MetricTile
           label={tr('首字延迟', 'TTFT')}
-          value={`${formatNumber(lastTtftMs, 1)} ms`}
+          value={formatNumber(lastTtftMs, 1)}
+          unit="ms"
           detail={tr('首次输出耗时', 'Time to first token')}
           icon="clock"
         />
