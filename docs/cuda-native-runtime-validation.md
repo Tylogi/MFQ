@@ -150,3 +150,64 @@ The legacy MiniCPM-o diagnostic `.pt` filenames use MFQ's `MFQTNSR1` tensor
 envelope in the native executable. Python pickle files created by `torch.save`
 are intentionally handled only by `mfq-runtime-torch`; production HTTP media
 requests do not cross this file boundary.
+
+## CUDA backend modularization (2026-10-03)
+
+Kernel declarations now live in domain headers for norm, activation, attention,
+linear attention, MoE, quant, cache, and sampling. Callers include the domains
+that they use. Each Engine load owns its MoE cache; target and predictor weights
+retain that cache through aliasing source handles, including copied projection
+operations. Cache registration and lifecycle APIs take cache resources directly.
+
+Qwen full/linear attention, GLM DSA indexer/MLP choices, MiniCPM text/TTS norm
+semantics, and common dense/MoE parameter assembly live in shared models.
+CUDA loaders retain quantization layout, projection fusion, important-neuron
+materialization, CPU placement, and TP/EP choices.
+
+The build boundaries use the existing targets:
+
+| Target | Responsibility |
+| --- | --- |
+| `mfq-models`, `mfq-engine` | Backend-neutral model definitions/configuration and Engine execution |
+| `mfq-cuda-ops` | CUDA numerical operations and execution resources; no Engine/model-family/transport dependency |
+| `mfq-cuda-loading` | Weight materialization, cache loading and model-load bindings |
+| `mfq-cuda-runtime` | Concrete Engine/model instantiation and native execution plans |
+
+Native and optional Torch executables use the same loading and instantiation
+source lists. Only runtime executables link transport. The generated Ninja
+order dependencies for `mfq-cuda-ops` contain only shared model-graph and
+model-source targets, with no Engine, model-family, scheduler, or transport.
+
+Incremental build probes used the existing Release/Ninja/CUDA 13.2 build. After
+a completed build, touch each source and run `cmake --build build/cpp_runtime`.
+Each probe compiled exactly one translation unit before and after the boundary
+change; no unrelated CUDA/model compilation occurred.
+
+| Touched source | Before (seconds) | After (seconds) | Recompiled target |
+| --- | ---: | ---: | --- |
+| `backends/cuda/ops/format.cpp` | 0.96 | 0.99 | `mfq-cuda-ops` |
+| `engine/src/generation_policy.cpp` | 0.56 | 0.57 | `mfq-engine` |
+| `models/qwen35/config.cpp` | 2.11 | 2.21 | `mfq-models` |
+
+These are single warm-build observations including required relinks, not a
+performance benchmark. There is no measured benefit supporting additional
+library targets, so none were added. Splitting targets would not remove the
+concrete instantiations' actual template-header dependencies.
+
+Validation: full native build and all 52 CTest tests passed on the local RTX
+4090. The offset regression compares embedding and KV writers against CPU
+assignment with nonzero aligned/unaligned offsets, dispatch thresholds, FP16,
+BF16 and FP32, independent K/V/cache misalignment, per-batch positions, ring
+wraparound and untouched storage guards. The cache regression covers independent
+instances, execution reset, retained projections and final destruction. Shared
+assembly tests cover full/linear attention, dense/split/fused MoE, GLM indexers,
+MiniCPM norm variants and malformed shapes/partial expert representations.
+
+`pytest -q tests/test_cpp_runtime_*` passed 203 tests with 11 skips. Full Python
+execution with `--continue-on-collection-errors` had 1012 passes, 146 skips,
+17 failures and 56 collection errors. Its limitations remain separate from
+this refactor: Torch/MLX/SciPy are missing,
+and the health-metrics and prefill-timing source contracts already fail at the
+starting revision `96be1553`. Real model numerical/performance A/B, multi-GPU
+communication and the LibTorch build remain subject to the gates above; these
+modularization checks do not substitute for them.

@@ -9,7 +9,6 @@
 #include "diagnostics/runtime_checks.h"
 #include "diagnostics/flash_next_mtp.h"
 #include "minicpmo45.h"
-#include "transport.h"
 #include "cuda_execution.h"
 #include "storage/moe_expert_cache.h"
 #include "mfq/kernels/cuda/deepseek_v41.h"

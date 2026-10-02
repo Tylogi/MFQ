@@ -240,25 +240,19 @@ endif()
 
 find_package(OpenMP QUIET)
 
-function(mfq_configure_cuda_runtime_target target)
+function(mfq_configure_cuda_backend_target target)
     target_include_directories(${target} PRIVATE
         ${MFQ_REPOSITORY_ROOT}
         ${MFQ_CUDA_ROOT}
         ${MFQ_CUDA_ROOT}/include
-        ${MFQ_CUDA_ROOT}/models
         ${MFQ_CUDA_ROOT}/ops/include
-        ${MFQ_CUDA_ROOT}/commands
-        ${MFQ_CUDA_ROOT}/engine
         ${MFQ_CUDA_ROOT}/storage
         ${MFQ_CUDA_KERNEL_ROOT}
         ${CUDAToolkit_INCLUDE_DIRS}
     )
     target_link_libraries(${target} PRIVATE
         mfq-core
-        mfq-models
-        mfq-engine
         mfq-json
-        mfq-runtime-communication
         mfq-ggml-internal-headers
     )
     target_compile_features(${target} PRIVATE cxx_std_20)
@@ -270,6 +264,18 @@ function(mfq_configure_cuda_runtime_target target)
         target_link_libraries(${target} PRIVATE "${MFQ_NCCL_LIBRARY}")
         target_compile_definitions(${target} PRIVATE MFQ_HAVE_NCCL=1)
     endif()
+endfunction()
+
+# Shared Engine/model templates are instantiated only by backend runtime/loading
+# units. Kernel/quant ops have no Engine, model-family, scheduler or transport link.
+function(mfq_configure_cuda_runtime_target target)
+    mfq_configure_cuda_backend_target(${target})
+    target_include_directories(${target} PRIVATE
+        ${MFQ_CUDA_ROOT}/models
+        ${MFQ_CUDA_ROOT}/commands
+        ${MFQ_CUDA_ROOT}/engine
+    )
+    target_link_libraries(${target} PRIVATE mfq-models mfq-engine)
 endfunction()
 
 set(MFQ_CUDA_MODEL_SOURCES
@@ -307,7 +313,7 @@ set(MFQ_CUDA_RUNTIME_OP_SOURCES
 )
 
 add_library(mfq-cuda-ops OBJECT ${MFQ_CUDA_RUNTIME_OP_SOURCES})
-mfq_configure_cuda_runtime_target(mfq-cuda-ops)
+mfq_configure_cuda_backend_target(mfq-cuda-ops)
 target_compile_definitions(mfq-cuda-ops PRIVATE
     MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
 set_target_properties(mfq-cuda-ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -325,9 +331,9 @@ target_compile_definitions(mfq-cuda-loading PRIVATE
     MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
 set_target_properties(mfq-cuda-loading PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-add_library(mfq-cuda-runtime STATIC
-    $<TARGET_OBJECTS:mfq-cuda-ops>
-    $<TARGET_OBJECTS:mfq-cuda-loading>
+# Concrete Engine/model bindings stay in this source group for both native and
+# optional Torch builds. Extra targets do not reduce their header dependencies.
+set(MFQ_CUDA_INSTANTIATION_SOURCES
     ${MFQ_CUDA_ROOT}/engine/cuda_engine.cpp
     ${MFQ_CUDA_ROOT}/engine/generation.cpp
     ${MFQ_CUDA_ROOT}/storage/text_session_cache.cpp
@@ -338,6 +344,11 @@ add_library(mfq-cuda-runtime STATIC
     ${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp
     ${MFQ_CUDA_MODEL_SOURCES}
     ${MFQ_CUDA_TRANSFORMER_SOURCES}
+)
+add_library(mfq-cuda-runtime STATIC
+    $<TARGET_OBJECTS:mfq-cuda-ops>
+    $<TARGET_OBJECTS:mfq-cuda-loading>
+    ${MFQ_CUDA_INSTANTIATION_SOURCES}
 )
 add_library(mfq::cuda-runtime ALIAS mfq-cuda-runtime)
 mfq_configure_cuda_runtime_target(mfq-cuda-runtime)
@@ -535,28 +546,16 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
     add_executable(mfq-runtime-torch
         ${MFQ_CUDA_ROOT}/apps/runtime_main.cpp
         ${MFQ_CUDA_ROOT}/commands/runtime.cpp
-        ${MFQ_CUDA_ROOT}/commands/cli.cpp
-        ${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp
         ${MFQ_CUDA_RUNTIME_OP_SOURCES}
-        ${MFQ_CUDA_ROOT}/engine/cuda_engine.cpp
-        ${MFQ_CUDA_ROOT}/engine/cuda_batching.cpp
-        ${MFQ_CUDA_ROOT}/engine/generation.cpp
-        ${MFQ_CUDA_ROOT}/storage/text_session_cache.cpp
-        ${MFQ_CUDA_ROOT}/storage/load_options.cpp
-        ${MFQ_CUDA_ROOT}/storage/model_loader.cpp
-        ${MFQ_CUDA_ROOT}/engine/mtp.cpp
-        ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp
-        ${MFQ_CUDA_ROOT}/storage/weight_loader.cpp
-        ${MFQ_CUDA_ROOT}/storage/transformer_loader.cpp
-        ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
+        ${MFQ_CUDA_LOADING_SOURCES}
+        ${MFQ_CUDA_INSTANTIATION_SOURCES}
         ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
-        ${MFQ_CUDA_MODEL_SOURCES}
-        ${MFQ_CUDA_TRANSFORMER_SOURCES}
         ${MFQ_CUDA_KERNEL_SOURCES}
     )
     mfq_configure_cuda_runtime_target(mfq-runtime-torch)
     target_include_directories(mfq-runtime-torch PRIVATE ${Python_INCLUDE_DIRS})
     target_link_libraries(mfq-runtime-torch PRIVATE
+        mfq-runtime-communication
         ${TORCH_LIBRARIES}
         Python::Python
         CUDA::cuda_driver

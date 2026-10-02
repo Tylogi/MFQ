@@ -417,8 +417,10 @@ def test_cuda_cli_is_a_thin_client_of_the_runtime_library() -> None:
     assert "storage/text_session_cache.cpp" in cmake
     assert "add_executable(mfq-runtime\n" in cmake
     torch_sources = cmake.split("add_executable(mfq-runtime-torch", 1)[1].split(")", 1)[0]
-    assert "${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp" in torch_sources
-    assert "${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp" in torch_sources
+    assert "${MFQ_CUDA_INSTANTIATION_SOURCES}" in torch_sources
+    instances = cmake.split("set(MFQ_CUDA_INSTANTIATION_SOURCES", 1)[1].split(")", 1)[0]
+    assert "${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp" in instances
+    assert "${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp" in instances
     assert "mfq-cuda-runtime mfq-runtime-communication" in cmake
     assert "${MFQ_CUDA_ROOT}/commands/runtime.cpp" in cmake
     assert "${MFQ_CUDA_ROOT}/commands/diagnostics.cpp" in cmake
@@ -1292,6 +1294,25 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
     assert "struct QuantLinear" not in CUDA_RUNTIME_SOURCE
     assert "cuda_quantized_ops" not in CUDA_BACKEND_SOURCE
     assert not re.search(r'#include\s+["<][^">]+\.inc[">]', CUDA_BACKEND_SOURCE)
+
+
+def test_cuda_build_dependencies_separate_ops_from_shared_execution() -> None:
+    cmake = (CUDA_OPS.parent / "CMakeLists.txt").read_text()
+    backend = cmake.split("function(mfq_configure_cuda_backend_target target)", 1)[1].split("endfunction()", 1)[0]
+    for dependency in ("mfq-engine", "mfq-models", "mfq-runtime-communication"):
+        assert dependency not in backend
+    runtime = cmake.split("function(mfq_configure_cuda_runtime_target target)", 1)[1].split("endfunction()", 1)[0]
+    assert "PRIVATE mfq-models mfq-engine" in runtime
+    assert "mfq-runtime-communication" not in runtime
+    assert "mfq_configure_cuda_backend_target(mfq-cuda-ops)" in cmake
+    native = cmake.split("add_library(mfq-cuda-runtime STATIC", 1)[1].split(")", 1)[0]
+    torch = cmake.split("add_executable(mfq-runtime-torch", 1)[1].split(")", 1)[0]
+    assert "${MFQ_CUDA_INSTANTIATION_SOURCES}" in native
+    assert "${MFQ_CUDA_INSTANTIATION_SOURCES}" in torch
+    assert "${MFQ_CUDA_LOADING_SOURCES}" in torch
+    for target in ("engine", "models"):
+        shared = (ROOT / "cpp_runtime" / target / "CMakeLists.txt").read_text()
+        assert "backends/" not in shared and "mfq-cuda" not in shared
 
 
 def test_cuda_qwen_speculation_is_model_owned() -> None:
