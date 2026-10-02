@@ -37,8 +37,19 @@ enum class CudaPredictorAdapter {
 };
 
 struct CudaModelPlan {
+    CudaBackbone backbone = CudaBackbone::unsupported;
     CudaVisionAdapter vision = CudaVisionAdapter::none;
     CudaPredictorAdapter predictor = CudaPredictorAdapter::none;
+};
+
+struct CudaCapabilityMatrix {
+    bool text = false;
+    bool image_input = false;
+    bool video_input = false;
+    bool audio_input = false;
+    bool audio_output = false;
+    bool full_duplex = false;
+    bool mtp = false;
 };
 
 struct CudaComponentState {
@@ -80,6 +91,7 @@ inline constexpr CudaBackbone cuda_backbone(
 inline CudaModelPlan cuda_model_plan(
         const ModelGraph& graph) noexcept {
     CudaModelPlan result;
+    result.backbone = cuda_backbone(graph.backbone);
     const auto* vision = graph.component("vision");
     if (graph.backbone == "qwen3_5" && vision != nullptr &&
         vision->tensor_root == "vision" &&
@@ -93,7 +105,8 @@ inline CudaModelPlan cuda_model_plan(
     // The current CUDA MiniCPM adapter is one composite implementation.  Do
     // not advertise a partially declared graph as supported until those
     // weighted components have independent adapters.
-    if (vision != nullptr && audio != nullptr && tts != nullptr &&
+    if (result.backbone == CudaBackbone::minicpmo45 &&
+        vision != nullptr && audio != nullptr && tts != nullptr &&
         vision->implementation == "minicpmo45_vision" &&
         audio->implementation == "minicpmo45_audio" &&
         tts->implementation == "minicpmo45_tts") {
@@ -117,6 +130,22 @@ inline CudaModelPlan cuda_model_plan(
     return result;
 }
 
+inline constexpr CudaCapabilityMatrix cuda_capability_matrix(
+        const CudaModelPlan& plan) noexcept {
+    CudaCapabilityMatrix result;
+    result.text = plan.backbone != CudaBackbone::unsupported;
+    if (!result.text) return result;
+    result.image_input =
+        plan.vision == CudaVisionAdapter::grid_vit ||
+        plan.vision == CudaVisionAdapter::minicpmo45;
+    result.video_input = plan.vision == CudaVisionAdapter::minicpmo45;
+    result.audio_input = plan.vision == CudaVisionAdapter::minicpmo45;
+    result.audio_output = plan.vision == CudaVisionAdapter::minicpmo45;
+    result.full_duplex = plan.vision == CudaVisionAdapter::minicpmo45;
+    result.mtp = plan.predictor != CudaPredictorAdapter::none;
+    return result;
+}
+
 inline CudaComponentState cuda_component_state(
         const ModelGraph& graph,
         const CudaModelPlan& plan,
@@ -135,6 +164,28 @@ inline CudaComponentState cuda_component_state(
         plan.predictor != CudaPredictorAdapter::none;
     result.mtp_available = result.mtp_supported && mtp_loaded;
     result.mtp_enabled = result.mtp_available && enable_mtp;
+    return result;
+}
+
+inline CudaCapabilityMatrix cuda_runtime_capabilities(
+        const ModelGraph& graph,
+        const CudaModelPlan& plan,
+        const CudaComponentState& components,
+        bool multimodal_available,
+        bool duplex_available) noexcept {
+    auto result = cuda_capability_matrix(plan);
+    result.text = result.text && graph.has_component("text");
+    result.image_input = result.image_input &&
+        components.vision_available && multimodal_available;
+    result.video_input = result.video_input &&
+        components.vision_available && multimodal_available;
+    result.audio_input = result.audio_input && multimodal_available &&
+        graph.has_component("audio_input");
+    result.audio_output = result.audio_output && duplex_available &&
+        graph.has_component("audio_output");
+    result.full_duplex = result.full_duplex && duplex_available &&
+        graph.has_component("duplex");
+    result.mtp = result.mtp && components.mtp_available;
     return result;
 }
 

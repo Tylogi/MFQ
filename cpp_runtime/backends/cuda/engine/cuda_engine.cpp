@@ -262,28 +262,26 @@ CudaEngine make_cuda_engine(
         return engine_metrics(state);
     };
 
-    const auto component_state = state->components.state();
-    const bool model_adapter_loaded =
-        state->components.engine_binder && !state->continuous_batching;
     engine.metadata.source = state->language->source;
     engine.metadata.architecture = state->components.graph.architecture;
     engine.metadata.model_type = state->language->model_type();
     engine.metadata.max_context = state->language->max_position_embeddings();
     engine.metadata.vocab_size = state->language->vocab_size();
-    engine.metadata.capabilities.text =
-        state->components.graph.has_component("text");
-    engine.metadata.capabilities.image_input =
-        component_state.vision_available;
-    engine.metadata.capabilities.video_input =
-        engine.metadata.capabilities.image_input &&
-        !state->components.grid_vision.has_value();
-    engine.metadata.capabilities.audio_input = model_adapter_loaded &&
-        state->components.graph.has_component("audio_input");
-    engine.metadata.capabilities.audio_output = model_adapter_loaded &&
-        state->components.graph.has_component("audio_output");
-    engine.metadata.capabilities.full_duplex = model_adapter_loaded &&
-        state->components.graph.has_component("duplex");
-    engine.metadata.capabilities.mtp = component_state.mtp_available;
+    const auto capabilities = cuda_runtime_capabilities(
+        state->components.graph,
+        state->components.plan,
+        state->components.state(),
+        static_cast<bool>(engine.multimodal_generate),
+        static_cast<bool>(engine.duplex));
+    engine.metadata.capabilities = {
+        capabilities.text,
+        capabilities.image_input,
+        capabilities.video_input,
+        capabilities.audio_input,
+        capabilities.audio_output,
+        capabilities.full_duplex,
+        capabilities.mtp,
+    };
     return engine;
 }
 
