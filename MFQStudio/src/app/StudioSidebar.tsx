@@ -106,7 +106,7 @@ export function StudioSidebar() {
                 <div className="sidebar-group-label">{tr(...group.label)}</div>
                 {group.items.map((item) => (
                   <button
-                    aria-current={item.current && item.active ? 'page' : undefined}
+                    aria-current={item.active ? 'page' : undefined}
                     className={item.active ? 'active' : ''}
                     key={item.path}
                     onClick={() => open(item.path)}

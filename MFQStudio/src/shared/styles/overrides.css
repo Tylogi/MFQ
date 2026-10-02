@@ -1,23 +1,31 @@
 /* 保持既有级联顺序的模型工作台和会话布局覆盖规则。 */
 /* Model workbench hierarchy */
-.model-workbench-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) auto; gap: 8px; margin-bottom: 14px; }
-.model-workbench-summary > div { display: grid; min-width: 0; gap: 4px; border: 1px solid var(--line-soft); border-radius: 9px; padding: 12px; background: var(--surface-subtle); }
-.model-workbench-summary span, .model-workbench-summary small { color: var(--muted); font-size: 10.5px; }
-.model-workbench-summary strong { overflow: hidden; color: var(--ink-strong); font-size: 16px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
-.model-workbench-links { display: flex !important; align-items: stretch; justify-content: center; gap: 6px; border: 0 !important; padding: 0 !important; background: transparent !important; }
-.model-workbench-links button { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; color: var(--accent-ink); background: var(--surface); font-size: 10.5px; white-space: nowrap; }
-.model-workbench-links button:hover { border-color: var(--accent-border); background: var(--accent-soft); }
-.model-catalog-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--line-soft); padding-bottom: 15px; }
+.model-load-policy { margin-top: 16px; }
+.model-policy-panel { margin-top: 16px; }
+.loaded-model-panel .model-list { grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr)); margin-top: 0; }
+.loaded-model-panel .model-row { border: 0; padding: 4px 0; background: transparent; }
+.model-library-panel .model-list { margin-top: 0; }
+.model-workbench-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-bottom: 30px; }
+.model-workbench-summary > div { display: grid; min-width: 0; gap: 8px; border: 1px solid var(--panel-line); border-radius: 12px; padding: 20px; background: var(--panel-surface); }
+.model-workbench-summary span { color: var(--muted); font-size: 12px; }
+.model-workbench-summary small { color: var(--muted-light); font-size: 11px; line-height: 1.6; }
+.model-workbench-summary strong { overflow: hidden; color: var(--ink-strong); font-size: 28px; font-weight: 550; font-variant-numeric: tabular-nums; letter-spacing: -0.03em; text-overflow: ellipsis; white-space: nowrap; }
+.model-workbench-summary > div:last-child strong { align-self: center; font-size: 17px; letter-spacing: -0.015em; }
+.model-workbench-links { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin-top: 24px; color: var(--muted); font-size: 12px; }
+.model-workbench-links button { display: inline-flex; align-items: center; gap: 8px; border: 0; border-radius: 7px; padding: 8px 0; color: var(--accent-ink); background: transparent; font-size: 12px; }
+.model-workbench-links button:hover { color: var(--accent-hover); text-decoration: underline; text-underline-offset: 3px; }
+.model-catalog-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--line-soft); padding-bottom: 18px; }
 .model-catalog-toolbar > div { display: grid; min-width: 0; gap: 4px; }
 .model-catalog-toolbar h2 { margin: 0; color: var(--ink-strong); font-size: 15px; font-weight: 650; line-height: 1.35; }
-.model-catalog-toolbar > div span { color: var(--muted); font-size: 11px; line-height: 1.45; }
-.model-catalog-toolbar label { display: flex; min-width: 190px; align-items: center; gap: 7px; border: 1px solid var(--line); border-radius: 8px; padding: 6px 9px; color: var(--muted); background: var(--surface); }
+.model-catalog-toolbar > div span { color: var(--muted); font-size: 12px; line-height: 1.6; }
+.model-catalog-toolbar label { display: flex; min-width: 220px; min-height: 36px; align-items: center; gap: 9px; border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; color: var(--muted); background: var(--surface); }
+.model-catalog-toolbar label:focus-within { border-color: var(--accent-border); box-shadow: 0 0 0 3px var(--accent-soft); }
 .model-catalog-toolbar label span { color: var(--muted); font-size: 10.5px; }
-.model-catalog-toolbar input { width: 100%; min-width: 0; border: 0; outline: 0; color: var(--ink); background: transparent; font-size: 10.5px; }
+.model-catalog-toolbar input { width: 100%; min-width: 0; border: 0; outline: 0; color: var(--ink); background: transparent; font-size: 12px; }
 .model-catalog-toolbar + .section-label { margin-top: 18px; }
 .screen-header-trailing button.primary { border-color: var(--accent); color: var(--on-accent); background: var(--accent); font-weight: 700; }
 .screen-header-trailing button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent); background: var(--accent-hover); }
-@media (max-width: 820px) { .model-workbench-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } .model-workbench-links { grid-column: 1 / -1; flex-direction: row; justify-content: flex-start; } }
+@media (max-width: 820px) { .model-workbench-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } .model-workbench-summary > div:last-child { grid-column: 1 / -1; } }
 @media (max-width: 560px) { .model-catalog-toolbar { align-items: stretch; flex-direction: column; } .model-catalog-toolbar label { min-width: 0; } .model-workbench-summary { grid-template-columns: 1fr 1fr; } }
 
 
@@ -37,8 +45,8 @@ button:active, a:active { transform: translateY(1px); }
 .chat-session-list button:hover, .chat-session-list button.active { background: var(--surface-subtle); }
 .chat-session-list button.active { color: var(--ink-strong); box-shadow: inset 2px 0 0 var(--accent); }
 .chat-session-list strong, .chat-session-list small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.chat-session-list strong { font-size: 11px; font-weight: 620; }
-.chat-session-list small, .chat-session-list p { margin: 0; color: var(--muted-light); font-size: 10px; }
+.chat-session-list strong { font-size: 12px; font-weight: 550; }
+.chat-session-list small, .chat-session-list p { margin: 0; color: var(--muted-light); font-size: 11px; }
 .chat-session-list p { padding: 16px 10px; text-align: center; }
 .chat-session-row { display: grid; grid-template-columns: minmax(0, 1fr) 30px; align-items: center; border-radius: 8px; }
 .chat-session-row:hover, .chat-session-row.active { background: var(--surface-subtle); }
@@ -56,16 +64,17 @@ button:active, a:active { transform: translateY(1px); }
 .message-body, .message-assistant .message-body { width: fit-content; max-width: min(760px, 100%); border-radius: 0; padding: 0; background: transparent; }
 .message-user .message-body { width: fit-content; max-width: min(760px, 82%); margin-left: auto; }
 .message-user .message-content { border: 0; border-radius: 18px; padding: 10px 14px; background: var(--surface-user); }
-.message-user .message-content .rich-text { font-size: 13px; }
+.message-user .message-content .rich-text { font-size: 14px; }
 .message-actions { gap: 3px; margin-top: 7px; }
 .message-actions button { display: grid; width: 27px; height: 27px; place-items: center; border-radius: 7px; padding: 0; }
 .message-assistant .message-actions { justify-content: flex-start; }
 .message-user .message-actions { justify-content: flex-end; }
 .message[title] { cursor: default; }
 .composer-region { border-top: 0; padding-top: 10px; background: var(--canvas); }
-.composer { border-radius: 16px; background: var(--surface); }
-.composer textarea { padding: 13px 15px 7px; }
-.composer-toolbar { padding: 5px 9px 9px; }
+.composer { border-radius: 16px; background: var(--surface); box-shadow: var(--shadow-sm); }
+.composer:focus-within { border-color: var(--accent-border); box-shadow: 0 0 0 3px var(--accent-soft); }
+.composer textarea { padding: 16px 17px 9px; font-size: 14px; line-height: 1.6; }
+.composer-toolbar { padding: 7px 11px 11px; }
 @media (max-width: 680px) { .chat-view { grid-template-columns: minmax(0, 1fr); } .chat-session-sidebar { position: absolute; z-index: 5; top: 0; bottom: 0; left: 0; width: min(286px, 86vw); box-shadow: 14px 0 35px rgb(0 0 0 / 16%); } .chat-session-sidebar-header { height: 58px; } .chat-screen-header, .message-scroller, .error-banner, .composer-region { grid-column: 1; } .sessions-collapsed { grid-template-columns: minmax(0, 1fr); } .message-user .message-body { max-width: 88%; } }
 
 

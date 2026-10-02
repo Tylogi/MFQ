@@ -44,7 +44,7 @@ it('空列表操作仍打开模型目录', () => {
 it('固定与空闲卸载仍调用对应策略操作', () => {
   const state = catalog();
   render(<ModelLoadPolicy catalog={state} />);
-  fireEvent.click(screen.getByRole('checkbox', { name: '固定到内存' }));
+  fireEvent.click(screen.getByRole('switch', { name: '固定到内存' }));
   fireEvent.change(screen.getByRole('combobox'), { target: { value: '900' } });
   expect(state.setLoadPinned).toHaveBeenCalledWith(true);
   expect(state.setLoadIdleTtl).toHaveBeenCalledWith(900);

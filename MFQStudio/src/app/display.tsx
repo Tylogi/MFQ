@@ -155,18 +155,20 @@ export function ModelMonogram({
 export function MetricTile({
   label,
   value,
+  unit,
   detail,
   icon,
 }: {
   label: string;
   value: string;
+  unit?: string;
   detail: string;
   icon: IconName;
 }) {
   return (
     <TMPanel className="metric-tile">
       <div className="metric-tile-label"><Icon name={icon} size={14} /><span>{label}</span></div>
-      <strong>{value}</strong>
+      <strong>{value}{unit && <span className="metric-unit"> {unit}</span>}</strong>
       <small>{detail}</small>
     </TMPanel>
   );

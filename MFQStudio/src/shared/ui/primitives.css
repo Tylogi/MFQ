@@ -43,7 +43,7 @@ button.studio-switch:disabled {
   width: 14px;
   height: 14px;
   border-radius: 50%;
-  background: var(--surface);
+  background: var(--on-accent);
   transition: transform 120ms ease;
 }
 .studio-switch-thumb[data-state='checked'] {

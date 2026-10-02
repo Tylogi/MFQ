@@ -15,7 +15,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 24px;
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--line-soft);
   padding: 14px 24px;
   background: var(--surface-overlay);
 }
@@ -54,7 +54,7 @@
   font-weight: 630;
 }
 .chat-model-summary select:focus, .chat-session-select:focus { border-color: var(--line-strong); box-shadow: 0 0 0 3px var(--accent-soft); }
-.chat-model-summary small { color: var(--muted); font-size: 10px; white-space: nowrap; }
+.chat-model-summary small { color: var(--muted); font-size: 11px; white-space: nowrap; }
 .chat-icon-button {
   display: grid;
   width: 31px;
@@ -126,7 +126,7 @@
 .response-metrics summary span + span { border-left: 1px solid var(--line); padding-left: 8px; }
 .response-metrics > div { display: flex; flex-wrap: wrap; gap: 5px 10px; margin-top: 6px; }
 
-.rich-text { color: var(--ink); font-size: 13.5px; line-height: 1.62; overflow-wrap: anywhere; }
+.rich-text { color: var(--ink); font-size: 14px; line-height: 1.75; overflow-wrap: anywhere; }
 .rich-text > :first-child { margin-top: 0; }
 .rich-text > :last-child { margin-bottom: 0; }
 .rich-text p, .rich-text ul, .rich-text ol, .rich-text pre, .rich-text blockquote { margin: 0.68em 0; }
