@@ -1,5 +1,6 @@
 #pragma once
 #include "config.h"
+#include "models/common/weight_loading.h"
 #include "models/common/causal_forward.h"
 #include "models/common/causal_model.h"
 #include "models/common/gated_mlp.h"
@@ -11,6 +12,23 @@
 #include <vector>
 
 namespace mfq::models::minicpmo45 {
+
+enum class LanguageComponent { text, tts, standalone_tts };
+
+template <class Block, class Loader>
+void load_language_block(Block& block, Loader& ops, const ModelConfig& config, int layer,
+                         std::string_view type, LanguageComponent component,
+                         std::string_view tensor_root = "model") {
+    if (type != "full_attention")
+        throw std::runtime_error("unsupported MiniCPM layer type: " + std::string(type));
+    const auto prefix = std::string(tensor_root) + ".block." + std::to_string(layer) + ".";
+    // The standalone TTS checkpoint stores offset RMS weights; the composite
+    // TTS and text checkpoints store direct RMS weights.
+    models::load_full_attention(block, ops, config, layer, prefix,
+                                component == LanguageComponent::standalone_tts ? 1.0 : 0.0);
+    block.ffn = models::load_dense_ffn<std::decay_t<decltype(block.ffn)>>(ops, config, prefix + "mlp.");
+}
+
 
 struct MediaBound {
     int64_t batch = 0, source = 0, begin = 0, end = 0;

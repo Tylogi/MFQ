@@ -88,7 +88,7 @@ def test_minicpmo45_graph_binds_all_checkpoint_components():
         "audio.patch_embedding.conv1.weight",
         "audio.block.",
         "audio.projector.input",
-        'result.config, index,\n                "full_attention", false, "tts"',
+        'result.config, index,\n                "full_attention", mfq::models::minicpmo45::LanguageComponent::tts, "tts"',
         "tts.text_embedding.weight",
         "tts.code_embedding.0.weight",
         "tts.semantic_projector.input",
@@ -107,9 +107,9 @@ def test_minicpmo45_audio_and_tts_follow_official_attention_contracts():
     assert "mfq_tensor_backend::baddbmm(" in GRAPH
     assert "mfq_linear(" in GRAPH
     assert 'result.model_type = "minicpmtts"' in SHARED
-    assert "block->official_bf16 = minicpmo45" in DECODE
+    assert "block->official_bf16 = component == mfq::models::minicpmo45::LanguageComponent::text" in DECODE
     assert "CudaBackbone::minicpmo_tts" in DECODE
-    assert "norm_weight_offset = 0.0" in GRAPH
+    assert "component == LanguageComponent::standalone_tts ? 1.0 : 0.0" in SHARED
     assert "cache_position += tokens" in SHARED
     assert "mfq::models::minicpmo45::tts_forward(" in GRAPH
     assert "generate_official(" in GRAPH
@@ -191,12 +191,11 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
 def test_minicpmo45_preserves_qkv_projection_boundaries():
     assert "bool preserve_projection_boundaries = false" in DECODE
     assert "std::move(layers), preserve_projection_boundaries" in DECODE
-    assert (
-        'attention + "query.weight",\n'
-        '        attention + "key.weight",\n'
-        '        attention + "value.weight"}, 2, nullptr, minicpmo45)'
-    ) in DECODE
-    assert "ffn.down, 2, minicpmo45)" in DECODE
+    assert "loader.preserve_projection_boundaries = block->official_bf16" in DECODE
+    loader = (CUDA_ROOT / "storage/transformer_loader.cpp").read_text()
+    assert "names, 2, nullptr," in loader
+    assert "down, shared_gate_up_compatible_prefix," in loader
+    assert loader.count("preserve_projection_boundaries);") == 2
     assert "MFQ_DIAGNOSTIC_DISABLE_NINT_GROUP" in DECODE
 
 

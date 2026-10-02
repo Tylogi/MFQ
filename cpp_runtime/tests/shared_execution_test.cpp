@@ -1400,7 +1400,182 @@ static void family_parameter_loading_test() {
     check_head(g, [](auto &p, auto &ops, const auto &c) { return glm5_next::load_predictor(p, ops, c); });
 }
 
+// Shape handles verify that model assembly needs no CUDA tensor or loader type.
+namespace assembly_test {
+struct Tensor { std::string name; std::vector<int64_t> dims; };
+struct Linear {
+    Tensor weight;
+    int64_t out() const { return weight.dims.at(0); }
+    int64_t neuron_len() const { return weight.dims.at(1); }
+};
+struct Group { std::vector<std::string> names; std::vector<int64_t> outs; };
+struct Experts { int64_t n_experts = 0, out_per_expert = 0, neuron_len = 0; };
+struct Ffn {
+    Linear down;
+    Group gate_up;
+    Experts moe_gate, moe_up, moe_gate_up, moe_down;
+    Tensor moe_router, moe_router_bias, moe_shared_gate;
+    std::unique_ptr<Ffn> shared;
+    bool is_moe = false, moe_split_gate_up = false, moe_use_sigmoid = false,
+         moe_use_sqrt_softplus = false, moe_normalize = false, moe_delayed_softmax = true,
+         moe_shared_ungated = false, prepared = false;
+    int moe_layer = -1, moe_top_k = 0;
+    double moe_router_scale = 1;
+};
+struct Layer {
+    Ffn ffn;
+    mfq::models::qwen35::Config qwen_config;
+    mfq::models::glm_dsa::Config config;
+    int layer = -1;
+    int64_t attention_heads = 0, kv_heads = 0, attention_head_dim = 0, max_position_embeddings = 0;
+    double rms_norm_eps = 0, norm_weight_offset = 0;
+    bool attention_output_gate = false, tiled_v_heads = false, linear = false,
+         split_in_proj = false, full_indexer = false;
+    Tensor attn_norm, ffn_norm, q_norm, k_norm, conv_weight, conv_bias, dt_bias, a_log,
+           linear_norm, q_a_norm, kv_a_norm, index_k_norm, index_k_bias;
+    Group qkv, input_proj, q_proj;
+    Linear o, o_proj, out_proj;
+    Experts embed_q, unembed_out;
+};
+struct Loader {
+    using Ffn = assembly_test::Ffn;
+    std::unordered_map<std::string, std::vector<int64_t>> weights;
+    bool has(const std::string& name) const { return weights.count(name); }
+    Tensor dense(const std::string& name) const { return {name, weights.at(name)}; }
+    Tensor router_parameter(const std::string& name) const { return dense(name); }
+    Linear linear(const std::string& name) const { return {dense(name)}; }
+    Group projections(const std::vector<std::string>& names) const {
+        Group result{names, {}};
+        for (const auto& name : names) result.outs.push_back(weights.at(name).at(0));
+        return result;
+    }
+    Group gate_up(const std::vector<std::string>& names, const Linear&) const { return projections(names); }
+    void qkv(Layer& b, const std::vector<std::string>& names) const { b.qkv = projections(names); }
+    static void workspace(Ffn& f) { f.prepared = true; }
+    static void important_neurons(int64_t, int64_t, Ffn&, const std::string&, const std::string&,
+                                  const std::string&) {}
+    Experts headwise(const std::string& name) const {
+        const auto& s = weights.at(name);
+        return {s.at(0), s.at(1), s.at(2)};
+    }
+    void experts(Ffn& f, mfq::models::ExpertProjection role, const std::string& name, int) const {
+        using Role = mfq::models::ExpertProjection;
+        auto& value = role == Role::gate ? f.moe_gate : role == Role::up ? f.moe_up
+                    : role == Role::down ? f.moe_down : f.moe_gate_up;
+        value = headwise(name);
+    }
+    static auto shape(const Tensor& value) { return value.dims; }
+    static int64_t elements(const Tensor& value) {
+        return std::accumulate(value.dims.begin(), value.dims.end(), int64_t{1}, std::multiplies<>{});
+    }
+    static auto full_block() { return std::make_unique<Layer>(); }
+    static auto linear_block() { auto b = full_block(); b->linear = true; return b; }
+    static auto finish(std::unique_ptr<Layer> value) { return value; }
+    static Tensor log_negative(Tensor value) { value.name = "log(-" + value.name + ")"; return value; }
+    void linear_projections(Layer& b, const mfq::models::qwen35::LinearWeightNames& n, bool split) const {
+        b.split_in_proj = split;
+        b.input_proj = projections(split ? std::vector{n.qk, n.value, n.gate, n.alpha, n.beta}
+                                          : std::vector{n.qkv, n.gate, n.alpha, n.beta});
+    }
+    void linear_output(Layer& b, const std::string& name) const { b.out_proj = linear(name); }
+    void dense_ffn(const std::string& p) {
+        weights[p + "down.weight"] = {8, 16};
+        weights[p + "gate.weight"] = weights[p + "up.weight"] = {16, 8};
+    }
+    void moe(const std::string& p, bool split) {
+        if (split) weights[p + "experts.gate.weight"] = weights[p + "experts.up.weight"] = {2, 4, 8};
+        else weights[p + "experts.gate_up.weight"] = {2, 8, 8};
+        weights[p + "experts.down.weight"] = {2, 8, 4};
+        weights[p + "router.weight"] = {2, 8};
+        weights[p + "router.bias"] = {2};
+        weights[p + "shared_expert.router.weight"] = {1, 8};
+        dense_ffn(p + "shared_expert.");
+    }
+};
+void run() {
+    using namespace mfq::models;
+    qwen35::Config q{};
+    q.hidden_size = 8; q.intermediate_size = 16; q.num_attention_heads = 2;
+    q.num_key_value_heads = 1; q.head_dim = 4; q.max_position_embeddings = 32;
+    q.num_experts = 2; q.num_experts_per_tok = 1; q.moe_intermediate_size = 4;
+    q.shared_expert_intermediate_size = 16; q.attention_output_gate = true;
+    q.legacy_tensor_layout.norm_weight_offset = 0.25;
+    Loader base;
+    const std::string p = "model.block.0.", a = p + "attention.", f = p + "mlp.";
+    base.weights[a + "norm.weight"] = base.weights[f + "norm.weight"] = {8};
+    for (const auto* name : {"query", "key", "value", "output"}) base.weights[a + name + ".weight"] = {8, 8};
+    base.weights[a + "query_norm.weight"] = {4};
+    base.dense_ffn(f);
+    auto full = qwen35::load_block(base, q, 0, "full_attention");
+    assert(full->qkv.names == std::vector({a + "query.weight", a + "key.weight", a + "value.weight"}));
+    assert(full->attention_output_gate && full->norm_weight_offset == 0.25 && full->k_norm.name.empty());
+    assert(full->ffn.prepared && !full->ffn.is_moe && full->ffn.down.weight.name == f + "down.weight");
+    for (bool split : {false, true}) {
+        auto ops = base;
+        ops.moe(f, split);
+        auto moe = qwen35::load_block(ops, q, 0, "full_attention");
+        assert(moe->ffn.is_moe && moe->ffn.moe_split_gate_up == split && moe->ffn.shared->prepared);
+        assert(moe->ffn.moe_top_k == 1 && moe->ffn.moe_delayed_softmax);
+        auto bad = ops;
+        bad.weights[f + "experts.down.weight"] = {2, 7, 4};
+        try { qwen35::load_block(bad, q, 0, "full_attention"); assert(false); } catch (const std::runtime_error&) {}
+        bad = ops;
+        if (split) bad.weights.erase(f + "experts.up.weight");
+        else bad.weights[f + "experts.gate.weight"] = {2, 4, 8};
+        try { qwen35::load_block(bad, q, 0, "full_attention"); assert(false); } catch (const std::runtime_error&) {}
+    }
+    for (bool split : {false, true}) {
+        auto ops = base;
+        const auto l = p + "linear_attention.";
+        for (const auto* name : {"qkv", "gate", "alpha", "beta", "output", "conv", "norm"})
+            ops.weights[l + name + ".weight"] = {8, 8};
+        if (split) ops.weights[l + "qk.weight"] = ops.weights[l + "value.weight"] = {8, 8};
+        ops.weights[l + "dt_bias"] = ops.weights[l + "a"] = {2};
+        q.legacy_tensor_layout.linear_attention_a_is_log = split;
+        auto linear = qwen35::load_block(ops, q, 0, "linear_attention");
+        assert(linear->linear && linear->split_in_proj == split && linear->ffn.prepared);
+        assert(linear->input_proj.names.front() == l + (split ? "qk.weight" : "qkv.weight"));
+        assert(linear->a_log.name == (split ? l + "a" : "log(-" + l + "a)"));
+        assert(linear->conv_bias.name.empty() && linear->out_proj.weight.name == l + "output.weight");
+    }
+    for (auto component : {minicpmo45::LanguageComponent::text, minicpmo45::LanguageComponent::tts,
+                           minicpmo45::LanguageComponent::standalone_tts}) {
+        Layer mini;
+        minicpmo45::load_language_block(mini, base, q, 0, "full_attention", component);
+        assert(mini.ffn.prepared && !mini.attention_output_gate);
+        assert(mini.norm_weight_offset == (component == minicpmo45::LanguageComponent::standalone_tts ? 1 : 0));
+    }
+    glm_dsa::Config g{};
+    g.hidden_size = 8; g.intermediate_size = 16; g.num_attention_heads = 2;
+    g.q_lora_rank = 3; g.kv_lora_rank = 4; g.qk_nope_head_dim = 2; g.qk_rope_head_dim = 2;
+    g.v_head_dim = 4; g.index_head_dim = 3; g.index_n_heads = 2;
+    g.num_experts = 2; g.num_experts_per_tok = 1; g.moe_intermediate_size = 4;
+    for (bool indexer : {false, true}) {
+        auto ops = base;
+        g.indexer_types = {indexer ? "full" : "shared"};
+        g.mlp_layer_types = {indexer ? "sparse" : "dense"};
+        if (indexer) ops.moe(f, false);
+        ops.weights[a + "query_a_norm.weight"] = {3}; ops.weights[a + "key_value_a_norm.weight"] = {4};
+        ops.weights[a + "query_a.weight"] = {3, 8}; ops.weights[a + "key_value_a.weight"] = {6, 8};
+        ops.weights[a + "query_b.weight"] = {8, 3};
+        ops.weights[a + "latent.query_embedding.weight"] = {2, 4, 2};
+        ops.weights[a + "latent.output_unembedding.weight"] = {2, 4, 4};
+        ops.weights[a + "indexer.key.weight"] = {3, 8}; ops.weights[a + "indexer.score.weight"] = {2, 8};
+        ops.weights[a + "indexer.query.weight"] = {6, 3};
+        ops.weights[a + "indexer.key_norm.weight"] = ops.weights[a + "indexer.key_norm.bias"] = {3};
+        Layer b;
+        glm_dsa::load_block(b, ops, g, 0, "glm_dsa");
+        assert(b.full_indexer == indexer && b.input_proj.names.size() == (indexer ? 4 : 2));
+        assert(b.q_proj.names.size() == (indexer ? 2 : 1) && b.ffn.is_moe == indexer);
+        if (indexer) assert(b.ffn.moe_use_sigmoid && b.ffn.moe_shared_ungated && !b.ffn.moe_delayed_softmax);
+        ops.weights[a + "latent.query_embedding.weight"] = {2, 5, 2};
+        try { glm_dsa::load_block(b, ops, g, 0, "glm_dsa"); assert(false); } catch (const std::runtime_error&) {}
+    }
+}
+} // namespace assembly_test
+
 int main() {
+    assembly_test::run();
     family_parameter_loading_test();
     model_loading_test();
     composition_boundary_test();

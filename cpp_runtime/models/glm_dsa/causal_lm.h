@@ -1,10 +1,103 @@
 #pragma once
 #include "config.h"
+#include "models/common/weight_loading.h"
 #include "models/common/causal_forward.h"
 #include "models/common/causal_model.h"
 #include <utility>
 
 namespace mfq::models::glm_dsa {
+
+template <class Ffn, class Loader>
+void load_ffn(Loader& ops, const Config& c, int i, Ffn& f) {
+    const auto &config = c;
+    const std::string p = "model.block." + std::to_string(i) + ".mlp.";
+    if (config.mlp_layer_types.at(static_cast<size_t>(i)) == "sparse") {
+        f = models::load_moe_weights<Ffn>(ops, p, i, true);
+        f.moe_top_k = static_cast<int>(c.num_experts_per_tok);
+        f.moe_use_sigmoid = true;
+        f.moe_use_sqrt_softplus = false;
+        f.moe_normalize = c.norm_topk_prob;
+        f.moe_delayed_softmax = false;
+        f.moe_shared_ungated = true;
+        f.moe_router_scale = c.routed_scaling_factor;
+        if (f.moe_gate_up.n_experts != c.num_experts || f.moe_down.n_experts != c.num_experts ||
+            f.moe_gate_up.neuron_len != c.hidden_size ||
+            f.moe_gate_up.out_per_expert != 2 * c.moe_intermediate_size ||
+            f.moe_down.neuron_len != c.moe_intermediate_size ||
+            f.moe_down.out_per_expert != c.hidden_size || ops.shape(f.moe_router).size() != 2 ||
+            ops.shape(f.moe_router)[0] != c.num_experts || ops.shape(f.moe_router)[1] != c.hidden_size ||
+            ops.elements(f.moe_router_bias) != c.num_experts) {
+            throw std::runtime_error("GLM DSA MoE tensor shapes disagree with config at layer " +
+                                     std::to_string(i));
+        }
+        return;
+    }
+    f = models::load_dense_ffn<Ffn>(ops, c, p);
+}
+
+template <class Block, class Loader>
+void load_block(Block& b, Loader& ops, const Config& c, int i, const std::string& type) {
+    const auto &config = c;
+    if (type != "glm_dsa") {
+        throw std::runtime_error("invalid GLM DSA block loader state");
+    }
+    const std::string lp = "model.block." + std::to_string(i) + ".";
+    const std::string ap = lp + "attention.";
+    b.config = c;
+    b.layer = i;
+    b.full_indexer = config.indexer_types.at(static_cast<size_t>(i)) == "full";
+    b.attn_norm = ops.dense(ap + "norm.weight");
+    b.ffn_norm = ops.dense(lp + "mlp.norm.weight");
+    b.q_a_norm = ops.dense(ap + "query_a_norm.weight");
+    b.kv_a_norm = ops.dense(ap + "key_value_a_norm.weight");
+    std::vector<std::string> first_names = {
+        ap + "query_a.weight",
+        ap + "key_value_a.weight",
+    };
+    std::vector<std::string> second_names = {
+        ap + "query_b.weight",
+    };
+    if (b.full_indexer) {
+        first_names.push_back(ap + "indexer.key.weight");
+        first_names.push_back(ap + "indexer.score.weight");
+        second_names.push_back(ap + "indexer.query.weight");
+        b.index_k_norm = ops.dense(ap + "indexer.key_norm.weight");
+        b.index_k_bias = ops.dense(ap + "indexer.key_norm.bias");
+    }
+    b.input_proj = ops.projections(first_names);
+    b.q_proj = ops.projections(second_names);
+    b.embed_q = ops.headwise(ap + "latent.query_embedding.weight");
+    b.unembed_out = ops.headwise(ap + "latent.output_unembedding.weight");
+    b.o_proj = ops.linear(ap + "output.weight");
+    load_ffn(ops, c, i, b.ffn);
+
+    const bool input_shape_ok = b.input_proj.outs.size() == (b.full_indexer ? 4u : 2u) &&
+                                b.input_proj.outs[0] == c.q_lora_rank &&
+                                b.input_proj.outs[1] == c.kv_lora_rank + c.qk_rope_head_dim &&
+                                (!b.full_indexer || (b.input_proj.outs[2] == c.index_head_dim &&
+                                                      b.input_proj.outs[3] == c.index_n_heads));
+    const bool q_shape_ok =
+        b.q_proj.outs.size() == (b.full_indexer ? 2u : 1u) &&
+        b.q_proj.outs[0] == c.num_attention_heads * (c.qk_nope_head_dim + c.qk_rope_head_dim) &&
+        (!b.full_indexer || b.q_proj.outs[1] == c.index_n_heads * c.index_head_dim);
+    const bool head_shape_ok = b.embed_q.n_experts == c.num_attention_heads &&
+                               b.embed_q.neuron_len == c.qk_nope_head_dim &&
+                               b.embed_q.out_per_expert == c.kv_lora_rank &&
+                               b.unembed_out.n_experts == c.num_attention_heads &&
+                               b.unembed_out.neuron_len == c.kv_lora_rank &&
+                               b.unembed_out.out_per_expert == c.v_head_dim &&
+                               b.o_proj.neuron_len() == c.num_attention_heads * c.v_head_dim &&
+                               b.o_proj.out() == c.hidden_size;
+    if (!input_shape_ok || !q_shape_ok || !head_shape_ok || ops.elements(b.attn_norm) != c.hidden_size ||
+        ops.elements(b.ffn_norm) != c.hidden_size || ops.elements(b.q_a_norm) != c.q_lora_rank ||
+        ops.elements(b.kv_a_norm) != c.kv_lora_rank ||
+        (b.full_indexer && (ops.elements(b.index_k_norm) != c.index_head_dim ||
+                             ops.elements(b.index_k_bias) != c.index_head_dim))) {
+        throw std::runtime_error("GLM DSA tensor shapes disagree with config at layer " +
+                                 std::to_string(i));
+    }
+}
+
 
 template <class Input, class QueryNorm, class Query, class Prepare, class Cache, class Index,
           class Absorb, class Attend, class Unembed, class Output>

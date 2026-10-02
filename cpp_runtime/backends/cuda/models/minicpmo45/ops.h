@@ -85,3 +85,10 @@ class Components {
 };
 
 } // namespace mfq::cuda::minicpmo45
+
+namespace mfq::cuda::minicpmo45 {
+std::unique_ptr<Block> load_language_block(CudaExecutionContext& execution,
+    const mfq::ModelSource& source, const mfq::models::ModelConfig& config, int layer,
+    const std::string& type, mfq::models::minicpmo45::LanguageComponent component,
+    std::string_view tensor_root = "model");
+}

@@ -1,8 +1,23 @@
 #include "ops.h"
 #include "storage/transformer_loader.h"
 #include "storage/session_codec.h"
+#include "core/full_block.h"
 
 namespace mfq::cuda {
+
+std::unique_ptr<Block> minicpmo45::load_language_block(CudaExecutionContext& execution,
+    const mfq::ModelSource& source, const mfq::models::ModelConfig& config, int layer,
+    const std::string& type, mfq::models::minicpmo45::LanguageComponent component,
+    std::string_view tensor_root) {
+    auto block = std::make_unique<FullBlock>();
+    block->official_bf16 = component == mfq::models::minicpmo45::LanguageComponent::text;
+    TransformerWeightLoader loader{execution, source};
+    loader.preserve_projection_boundaries = block->official_bf16;
+    mfq::models::minicpmo45::load_language_block(*block, loader, config, layer, type, component,
+                                                tensor_root);
+    return block;
+}
+
 
 bool MiniCPMO45Model::adapter_uses_common_rope() const noexcept { return true; }
 
@@ -11,7 +26,8 @@ bool MiniCPMO45Model::adapter_supports_dense_cpu_offload() const noexcept { retu
 std::unique_ptr<Block> MiniCPMO45Model::adapter_load_block(const mfq::ModelSource &source,
                                                            int layer, int,
                                                            const std::string &type) {
-    return load_transformer_block(*execution, source, config, layer, type, true);
+    return minicpmo45::load_language_block(*execution, source, config, layer, type,
+        mfq::models::minicpmo45::LanguageComponent::text);
 }
 
 bool MiniCPMOTtsModel::adapter_uses_common_rope() const noexcept { return true; }
@@ -21,7 +37,8 @@ bool MiniCPMOTtsModel::adapter_supports_dense_cpu_offload() const noexcept { ret
 std::unique_ptr<Block> MiniCPMOTtsModel::adapter_load_block(const mfq::ModelSource &source,
                                                             int layer, int,
                                                             const std::string &type) {
-    return load_transformer_block(*execution, source, config, layer, type, false);
+    return minicpmo45::load_language_block(*execution, source, config, layer, type,
+        mfq::models::minicpmo45::LanguageComponent::standalone_tts);
 }
 
 mfq_tensor_backend::Tensor MiniCPMO45Model::adapter_embed(mfq_tensor_backend::Tensor output) const {

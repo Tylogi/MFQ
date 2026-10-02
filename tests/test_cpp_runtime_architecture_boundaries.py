@@ -302,10 +302,8 @@ def test_cuda_dsv4_projection_and_moe_loading_are_shared() -> None:
     loaders = [
         (CUDA_MODELS / path).read_text(encoding="utf-8")
         for path in (
-            "qwen35/ops.cpp",
             "deepseek_v4/ops.cpp",
             "deepseek_v41/ops.cpp",
-            "glm_dsa/ops.cpp",
         )
     ]
 
@@ -314,6 +312,21 @@ def test_cuda_dsv4_projection_and_moe_loading_are_shared() -> None:
     assert "FFN load_moe_weights(" in CUDA_TRANSFORMER_LOADER
     assert "load_moe_weights(" not in ffn
     assert all("load_moe_weights(" in source for source in loaders)
+
+
+def test_remaining_model_assembly_lives_in_shared_models() -> None:
+    for family in ("qwen35", "glm_dsa", "minicpmo45"):
+        shared = (ROOT / "cpp_runtime/models" / family / "causal_lm.h").read_text()
+        native = (CUDA_MODELS / family / "ops.cpp").read_text()
+        assert "load_block(" in shared or "load_language_block(" in shared
+        assert f"mfq::models::{family}::load_" in native
+        assert '"model.block."' not in native
+        assert '"experts.gate_up.weight"' not in native
+    shared = (ROOT / "cpp_runtime/models/common/weight_loading.h").read_text()
+    assert 'prefix + "experts.gate.weight"' in shared
+    assert "split != ops.has(up) || fused == split" in shared
+    assert '"experts.gate.weight"' not in CUDA_TRANSFORMER_LOADER
+    assert "load_transformer_block" not in CUDA_TRANSFORMER_LOADER
 
 
 def test_cuda_native_tensor_ops_stay_split_by_domain() -> None:
@@ -1206,7 +1219,7 @@ def test_cuda_model_runtime_uses_compiled_operator_bindings() -> None:
     ):
         assert re.search(rf"using\s+{runtime}\s*=\s*mfq::models::\w+::CausalLm<", causal_lm)
 
-    assert "std::make_unique<FullBlock>" in CUDA_TRANSFORMER_LOADER
+    assert "models::load_moe_weights<FFN>" in CUDA_TRANSFORMER_LOADER
     assert "std::make_unique<LinearAttentionBlock>" in CUDA_QWEN_LINEAR
     assert 'type == "linear_attention"' not in CUDA_TRANSFORMER_LOADER
     assert len(CUDA_RUNTIME_SOURCE.splitlines()) < 12_000

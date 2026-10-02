@@ -1,54 +1,7 @@
-#include "storage/weight_loader.h"
 #include "transformer_loader.h"
-
+#include "storage/weight_loader.h"
 #include "core/full_block.h"
 #include "moe.h"
-
-#include <stdexcept>
-#include <string>
-
-std::unique_ptr<Block> load_transformer_block(
-        CudaExecutionContext& execution,
-        const mfq::ModelSource& source,
-        const mfq::models::ModelConfig& config,
-        int layer,
-        const std::string& type,
-        bool minicpmo45,
-        std::string_view tensor_root) {
-    if (type != "full_attention") {
-        throw std::runtime_error("unsupported layer type: " + type);
-    }
-
-    const std::string prefix =
-        std::string(tensor_root) + ".block." +
-        std::to_string(layer) + ".";
-    auto block = std::make_unique<FullBlock>();
-    block->layer = layer;
-    block->attention_heads = config.num_attention_heads;
-    block->kv_heads = config.num_key_value_heads;
-    block->attention_head_dim = config.head_dim;
-    block->max_position_embeddings = config.max_position_embeddings;
-    block->rms_norm_eps = config.rms_norm_eps;
-    block->norm_weight_offset = minicpmo45 ? 0.0 : 1.0;
-    block->official_bf16 = minicpmo45;
-    block->attn_norm = load_dense_gpu(execution, source, prefix + "attention.norm.weight");
-    block->ffn_norm = load_dense_gpu(execution, source, prefix + "mlp.norm.weight");
-    const std::string attention = prefix + "attention.";
-    block->qkv = load_quant_group(execution, source, {
-        attention + "query.weight",
-        attention + "key.weight",
-        attention + "value.weight"}, 2, nullptr, minicpmo45);
-    block->o = load_quant_linear(execution, source, attention + "output.weight");
-    if (has_tensor(source, attention + "query_norm.weight")) {
-        block->q_norm = load_dense_gpu(execution, source, attention + "query_norm.weight");
-    }
-    if (has_tensor(source, attention + "key_norm.weight")) {
-        block->k_norm = load_dense_gpu(execution, source, attention + "key_norm.weight");
-    }
-    block->ffn = load_ffn(
-        execution, source, config, layer, minicpmo45, tensor_root);
-    return block;
-}
 
 void load_important_neuron_branch(CudaExecutionContext &execution, const mfq::ModelSource &mfq,
                                   int64_t hidden_size, int64_t intermediate_size, FFN &f,
@@ -88,79 +41,71 @@ void load_important_neuron_branch(CudaExecutionContext &execution, const mfq::Mo
     f.important_neurons = std::move(high);
 }
 
-FFN load_moe_weights(CudaExecutionContext &execution, const mfq::ModelSource &source,
-                     std::string_view prefix, const MoeWeightLoadOptions &options) {
-    const std::string base(prefix);
-    const std::string gate_up = base + "experts.gate_up.weight";
-    const std::string gate = base + "experts.gate.weight";
-    const std::string up = base + "experts.up.weight";
-    const std::string down = base + "experts.down.weight";
-    const bool fused = has_tensor(source, gate_up);
-    const bool split_gate = has_tensor(source, gate);
-    const bool split_up = has_tensor(source, up);
-    if (split_gate != split_up || fused == split_gate || !has_tensor(source, down)) {
-        throw std::runtime_error("routed MoE requires down and exactly one fused or split "
-                                 "Gate/Up representation at layer " +
-                                 std::to_string(options.layer));
-    }
-
-    FFN result;
-    result.is_moe = true;
-    result.moe_split_gate_up = split_gate;
-    result.moe_layer = options.layer;
-    if (options.cpu_offloaded) {
-        if (split_gate) {
-            result.cpu_moe_gate = load_mfe_cpu_offloaded(source, gate);
-            result.cpu_moe_up = load_mfe_cpu_offloaded(source, up);
-            result.moe_gate = cpu_mixed_moe_metadata(result.cpu_moe_gate);
-            result.moe_up = cpu_mixed_moe_metadata(result.cpu_moe_up);
-        } else {
-            result.cpu_moe_gate_up = load_mfe_cpu_offloaded(source, gate_up);
-            result.moe_gate_up = cpu_mixed_moe_metadata(result.cpu_moe_gate_up);
-        }
-        result.cpu_moe_down = load_mfe_cpu_offloaded(source, down);
-        result.moe_down = cpu_mixed_moe_metadata(result.cpu_moe_down);
-    } else {
-        if (split_gate) {
-            result.moe_gate = load_mfe_gpu(execution, source, gate, true, options.layer, "gate");
-            result.moe_up = load_mfe_gpu(execution, source, up, true, options.layer, "up");
-        } else {
-            result.moe_gate_up =
-                load_mfe_gpu(execution, source, gate_up, true, options.layer, "gate_up");
-        }
-        result.moe_down = load_mfe_gpu(execution, source, down, true, options.layer, "down");
-    }
-    result.moe_router = load_dense_gpu(execution, source, base + "router.weight")
-                            .to(mfq_tensor_backend::kFloat32)
-                            .contiguous();
-    const std::string router_bias = base + "router.bias";
-    if (options.router_bias_required || has_tensor(source, router_bias)) {
-        result.moe_router_bias = load_dense_gpu(execution, source, router_bias)
-                                     .to(mfq_tensor_backend::kFloat32)
-                                     .contiguous();
-    }
-    result.shared = std::make_unique<FFN>();
-    result.shared->down = load_quant_linear(execution, source, base + "shared_expert.down.weight");
-    result.shared->gate_up = load_paired_gate_up(
-        execution, source, {base + "shared_expert.gate.weight", base + "shared_expert.up.weight"},
-        result.shared->down, options.shared_gate_up_compatible_prefix);
-    prepare_ffn_workspaces(execution, *result.shared);
-    return result;
+mfq_tensor_backend::Tensor TransformerWeightLoader::dense(const std::string& name) const {
+    return load_dense_gpu(execution, source, name);
 }
-
-FFN load_ffn(CudaExecutionContext &execution, const mfq::ModelSource &source,
-             const mfq::models::ModelConfig &config, int layer, bool minicpmo45,
-             std::string_view tensor_root) {
-    FFN ffn;
-    const std::string prefix =
-        std::string(tensor_root) + ".block." + std::to_string(layer) + ".mlp.";
-    const std::string down = prefix + "down.weight";
-    const std::string gate = prefix + "gate.weight";
-    const std::string up = prefix + "up.weight";
-    ffn.down = load_quant_linear(execution, source, down);
-    ffn.gate_up = load_paired_gate_up(execution, source, {gate, up}, ffn.down, 2, minicpmo45);
-    load_important_neuron_branch(execution, source, config.hidden_size, config.intermediate_size,
-                                 ffn, down, gate, up);
-    prepare_ffn_workspaces(execution, ffn);
-    return ffn;
+QuantLinear TransformerWeightLoader::linear(const std::string& name) const {
+    return load_quant_linear(execution, source, name);
+}
+bool TransformerWeightLoader::has(const std::string& name) const { return has_tensor(source, name); }
+mfq_tensor_backend::Tensor TransformerWeightLoader::router_parameter(const std::string& name) const {
+    return dense(name).to(mfq_tensor_backend::kFloat32).contiguous();
+}
+QuantLinearGroup TransformerWeightLoader::projections(const std::vector<std::string>& names) const {
+    return load_quant_group(execution, source, names);
+}
+QuantLinearGroup TransformerWeightLoader::gate_up(const std::vector<std::string>& names,
+                                                 const QuantLinear& down) const {
+    return load_paired_gate_up(execution, source, names, down, shared_gate_up_compatible_prefix,
+                              preserve_projection_boundaries);
+}
+void TransformerWeightLoader::qkv(FullBlock& block, const std::vector<std::string>& names) const {
+    const bool mirror_kv = block.attention_output_gate &&
+        execution.config.tensor_parallel_mirror_qwen35_attention_kv &&
+        is_quant_dtype(require_tensor(source, names[1]).dtype) &&
+        is_quant_dtype(require_tensor(source, names[2]).dtype);
+    if (mirror_kv) {
+        block.split_q_kv_projections = true;
+        block.q_projection = linear(names[0]);
+        block.k_projection = load_quant_linear(execution, source, names[1], TensorParallelAxis::Mirrored);
+        block.v_projection = load_quant_linear(execution, source, names[2], TensorParallelAxis::Mirrored);
+    } else {
+        block.qkv = load_quant_group(execution, source, names, 2, nullptr,
+                                    preserve_projection_boundaries);
+    }
+}
+void TransformerWeightLoader::workspace(FFN& ffn) const { prepare_ffn_workspaces(execution, ffn); }
+void TransformerWeightLoader::important_neurons(int64_t hidden, int64_t intermediate, FFN& ffn,
+    const std::string& down, const std::string& gate, const std::string& up) const {
+    load_important_neuron_branch(execution, source, hidden, intermediate, ffn, down, gate, up);
+}
+void TransformerWeightLoader::experts(FFN& ffn, mfq::models::ExpertProjection projection,
+                                     const std::string& name, int layer) const {
+    using Role = mfq::models::ExpertProjection;
+    MfeWeight* weight = nullptr;
+    std::shared_ptr<MixedMoeRuntime>* cpu = nullptr;
+    const char* role = nullptr;
+    switch (projection) {
+        case Role::gate: weight = &ffn.moe_gate; cpu = &ffn.cpu_moe_gate; role = "gate"; break;
+        case Role::up: weight = &ffn.moe_up; cpu = &ffn.cpu_moe_up; role = "up"; break;
+        case Role::gate_up: weight = &ffn.moe_gate_up; cpu = &ffn.cpu_moe_gate_up; role = "gate_up"; break;
+        case Role::down: weight = &ffn.moe_down; cpu = &ffn.cpu_moe_down; role = "down"; break;
+    }
+    if (cpu_offloaded) {
+        *cpu = load_mfe_cpu_offloaded(source, name);
+        *weight = cpu_mixed_moe_metadata(*cpu);
+    } else {
+        *weight = load_mfe_gpu(execution, source, name, true, layer, role);
+    }
+}
+MfeWeight TransformerWeightLoader::headwise(const std::string& name) const {
+    return load_mfe_gpu(execution, source, name);
+}
+FFN load_moe_weights(CudaExecutionContext& execution, const mfq::ModelSource& source,
+                     std::string_view prefix, const MoeWeightLoadOptions& options) {
+    TransformerWeightLoader loader{execution, source};
+    loader.cpu_offloaded = options.cpu_offloaded;
+    loader.shared_gate_up_compatible_prefix = options.shared_gate_up_compatible_prefix;
+    return mfq::models::load_moe_weights<FFN>(loader, std::string(prefix), options.layer,
+                                             options.router_bias_required);
 }

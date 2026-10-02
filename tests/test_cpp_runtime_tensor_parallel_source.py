@@ -167,25 +167,25 @@ def test_quantized_tp_weights_and_workspaces_follow_the_shard_device():
 
 
 def test_deepseek_v4_split_gate_up_uses_existing_moe_runtime_and_cache():
-    assert 'base + "experts.gate.weight"' in SOURCE
-    assert 'base + "experts.up.weight"' in SOURCE
-    assert "split_gate != split_up" in SOURCE
-    assert "moe_split_gate_up" in SOURCE
-    assert 'options.layer, "gate"' in SOURCE
-    assert 'options.layer, "up"' in SOURCE
+    shared = (CUDA_ROOT.parents[1] / "models/common/weight_loading.h").read_text()
+    assert 'prefix + "experts.gate.weight"' in shared
+    assert 'prefix + "experts.up.weight"' in shared
+    assert "split != ops.has(up)" in shared
+    assert "moe_split_gate_up" in shared
+    assert 'role = "gate"' in SOURCE
+    assert 'role = "up"' in SOURCE
     assert '"moe.gate_up_split"' in SOURCE
     assert "mfq_tensor_backend::cat({gate, up}, -1).contiguous()" in SOURCE
 
 
 def test_generic_ffn_loader_stays_dense_and_model_moe_loaders_are_typed():
-    loader = (
-        CUDA_ROOT / "storage" / "transformer_loader.cpp"
-    ).read_text(encoding="utf-8")
-    assert "experts.gate.weight" not in loader.split("void load_important_neuron_branch(")[0]
-    assert "const mfq::models::ModelConfig& config" in loader
+    shared = (CUDA_ROOT.parents[1] / "models/common/weight_loading.h").read_text()
+    dense = shared.split("Ffn load_dense_ffn", 1)[1].split("Ffn load_moe_weights", 1)[0]
+    assert "experts.gate.weight" not in dense
+    assert "const ModelConfig& config" in dense
     assert "deepseek_v4::load_block(" in SOURCE
     assert "glm_dsa::load_ffn(" in SOURCE
-    assert SOURCE.count("load_moe_weights(") >= 5
+    assert "models::load_moe_weights<FFN>" in SOURCE
 
 
 def test_native_float_linears_are_supported_without_forcing_tp_shards():

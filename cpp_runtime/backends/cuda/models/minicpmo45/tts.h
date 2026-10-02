@@ -7,7 +7,7 @@
 #include "generation_policy.h"
 #include "sampling.h"
 #include "core/full_block.h"
-#include "storage/transformer_loader.h"
+#include "ops.h"
 
 struct MiniCPMO45TtsSamplingOps {
     using Tensor = mfq_tensor_backend::Tensor;
@@ -131,10 +131,9 @@ struct MiniCPMO45TtsDecoder {
             row_norm).to(head_v.scalar_type()).contiguous();
         result.blocks.reserve(20);
         for (int index = 0; index < 20; ++index) {
-            auto block = load_transformer_block(
+            auto block = mfq::cuda::minicpmo45::load_language_block(
                 execution, mfq, result.config, index,
-                "full_attention", false, "tts");
-            static_cast<FullBlock&>(*block).norm_weight_offset = 0.0;
+                "full_attention", mfq::models::minicpmo45::LanguageComponent::tts, "tts");
             block->cuda_device =
                 execution.layer_placement.primary_device();
             result.blocks.push_back(std::move(block));
