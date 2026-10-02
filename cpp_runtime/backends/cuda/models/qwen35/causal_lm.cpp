@@ -20,30 +20,12 @@ FFN load_qwen_ffn(
     const std::string prefix =
         std::string(tensor_root) + ".block." +
         std::to_string(layer) + ".mlp.";
-    const std::string expert_gate_up =
-        prefix + "experts.gate_up.weight";
-    const std::string expert_gate = prefix + "experts.gate.weight";
-    const std::string expert_up = prefix + "experts.up.weight";
-    const std::string expert_down = prefix + "experts.down.weight";
-    const bool has_expert_gate_up = has_tensor(source, expert_gate_up);
-    const bool has_expert_gate = has_tensor(source, expert_gate);
-    const bool has_expert_up = has_tensor(source, expert_up);
-    const bool has_expert_down = has_tensor(source, expert_down);
-
-    if (!has_expert_gate_up && !has_expert_gate &&
-            !has_expert_up && !has_expert_down) {
+    if (!has_tensor(source, prefix + "experts.gate_up.weight") &&
+            !has_tensor(source, prefix + "experts.gate.weight") &&
+            !has_tensor(source, prefix + "experts.up.weight") &&
+            !has_tensor(source, prefix + "experts.down.weight")) {
         return load_ffn(
             execution, source, config, layer, false, tensor_root);
-    }
-    if (has_expert_gate != has_expert_up) {
-        throw std::runtime_error(
-            "Qwen MoE split Gate/Up records are incomplete at layer " +
-            std::to_string(layer));
-    }
-    if (has_expert_gate_up == has_expert_gate || !has_expert_down) {
-        throw std::runtime_error(
-            "Qwen MoE layer requires exactly one fused or split Gate/Up representation at layer " +
-            std::to_string(layer));
     }
     if (config.num_experts <= 0 || config.num_experts_per_tok <= 0 ||
             config.moe_intermediate_size <= 0 ||
@@ -51,22 +33,8 @@ FFN load_qwen_ffn(
         throw std::runtime_error("Qwen MoE config fields are missing");
     }
 
-    FFN ffn;
-    ffn.is_moe = true;
-    ffn.moe_split_gate_up = has_expert_gate;
-    if (ffn.moe_split_gate_up) {
-        ffn.moe_gate = load_mfe_gpu(execution,
-            source, expert_gate, true, layer, "gate");
-        ffn.moe_up = load_mfe_gpu(execution,
-            source, expert_up, true, layer, "up");
-    } else {
-        ffn.moe_gate_up = load_mfe_gpu(execution,
-            source, expert_gate_up, true, layer, "gate_up");
-    }
-    ffn.moe_down = load_mfe_gpu(execution,
-        source, expert_down, true, layer, "down");
-    ffn.moe_router = load_dense_gpu(execution, source, prefix + "router.weight")
-        .to(mfq_tensor_backend::kFloat32).contiguous();
+    auto ffn = load_moe_weights(
+        execution, source, prefix, {.layer = layer});
     ffn.moe_shared_gate = load_dense_gpu(execution,
         source, prefix + "shared_expert.router.weight")
         .to(mfq_tensor_backend::kFloat32).contiguous();
@@ -82,16 +50,6 @@ FFN load_qwen_ffn(
         // softmax over the selected logits; keep that fused delayed form.
         ffn.moe_delayed_softmax = true;
     }
-    ffn.moe_layer = layer;
-    ffn.shared = std::make_unique<FFN>();
-    ffn.shared->down = load_quant_linear(execution,
-        source, prefix + "shared_expert.down.weight");
-    ffn.shared->gate_up = load_paired_gate_up(execution, source, {
-        prefix + "shared_expert.gate.weight",
-        prefix + "shared_expert.up.weight"},
-        ffn.shared->down);
-    prepare_ffn_workspaces(execution, *ffn.shared);
-
     const bool routed_gate_shapes = ffn.moe_split_gate_up
         ? ffn.moe_gate.n_experts == config.num_experts &&
             ffn.moe_up.n_experts == config.num_experts &&

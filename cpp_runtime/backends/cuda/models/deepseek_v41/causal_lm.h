@@ -590,45 +590,9 @@ struct Block final : ::Block {
     Tensor output_projection(
         CudaExecutionContext& execution,
         Tensor attention) const {
-        const auto batch = attention.size(0);
-        const auto tokens = attention.size(1);
-        const auto rows = batch * tokens;
-        const auto groups = config.o_groups;
-        const auto group_width =
-            config.n_heads * config.head_dim / groups;
-        auto grouped = attention.contiguous()
-            .reshape({rows, groups, group_width})
-            .to(mfq_tensor_backend::kFloat16);
-        if (output_a.is_nint() && output_a.nint.bits == 8 &&
-            output_a.nint.gs == 48 &&
-            output_a.nint.out == groups * config.o_lora_rank) {
-            auto low_rank = nint_matmul_groupwise_u8(
-                execution.profiler, output_a.nint, grouped, groups);
-            return output_b.forward(execution, low_rank)
-                .reshape({batch, tokens, config.hidden});
-        }
-        if (output_a.is_mxfp8() &&
-            output_a.out() == groups * config.o_lora_rank) {
-            auto low_rank = output_a.forward_mxfp8_groupwise(
-                execution, grouped, groups);
-            return output_b.forward(execution, low_rank)
-                .reshape({batch, tokens, config.hidden});
-        }
-        auto expanded = output_a.forward(
-            execution, grouped.reshape({rows * groups, group_width}))
-            .reshape({rows, groups, groups, config.o_lora_rank});
-        std::vector<Tensor> diagonal;
-        diagonal.reserve(static_cast<std::size_t>(groups));
-        for (std::int64_t group = 0; group < groups; ++group) {
-            diagonal.push_back(
-                expanded.index({Slice(), group, group, Slice()}));
-        }
-        auto low_rank = mfq_tensor_backend::stack(diagonal, 1)
-            .reshape({rows, groups * config.o_lora_rank})
-            .to(mfq_tensor_backend::kFloat16)
-            .contiguous();
-        return output_b.forward(execution, low_rank)
-            .reshape({batch, tokens, config.hidden});
+        return mfq::cuda::deepseek_v4::output_projection(
+            execution, attention, output_a, output_b,
+            config.o_groups, true, false);
     }
 
     std::optional<Tensor> update_compressed_source(
@@ -1050,80 +1014,13 @@ struct Block final : ::Block {
     }
 };
 
-inline FFN load_moe_at(
+FFN load_moe_at(
     CudaExecutionContext& execution,
     const mfq::ModelSource& model,
     const CommonConfig& config,
     const std::string& prefix,
     std::int64_t layer,
-    std::int64_t top_k,
-    bool cacheable) {
-    FFN result;
-    result.is_moe = true;
-    const bool split_gate = has_tensor(model, prefix + "experts.gate.weight");
-    const bool split_up = has_tensor(model, prefix + "experts.up.weight");
-    if (split_gate != split_up) {
-        throw std::runtime_error(
-            "DeepSeek-V4.1 split routed Gate/Up records are incomplete at layer " +
-            std::to_string(layer));
-    }
-    result.moe_split_gate_up = split_gate;
-    if (split_gate) {
-        result.moe_gate = load_mfe_gpu(execution,
-            model, prefix + "experts.gate.weight", cacheable,
-            static_cast<int>(layer), "gate");
-        result.moe_up = load_mfe_gpu(execution,
-            model, prefix + "experts.up.weight", cacheable,
-            static_cast<int>(layer), "up");
-    } else {
-        result.moe_gate_up = load_mfe_gpu(execution,
-            model, prefix + "experts.gate_up.weight", cacheable,
-            static_cast<int>(layer), "gate_up");
-    }
-    result.moe_down = load_mfe_gpu(execution,
-        model, prefix + "experts.down.weight", cacheable,
-        static_cast<int>(layer), "down");
-    result.moe_router = load_dense_gpu(execution, model, prefix + "router.weight")
-        .to(mfq_tensor_backend::kFloat32)
-        .contiguous();
-    result.moe_router_bias = load_dense_gpu(execution, model, prefix + "router.bias")
-        .to(mfq_tensor_backend::kFloat32)
-        .contiguous();
-    result.moe_top_k = static_cast<int>(top_k);
-    result.moe_use_sqrt_softplus = true;
-    result.moe_normalize = config.norm_topk_prob;
-    result.moe_delayed_softmax = false;
-    result.moe_shared_ungated = true;
-    result.moe_router_scale = config.routed_scaling;
-    result.swiglu_limit = config.swiglu_limit;
-    result.moe_layer = static_cast<int>(layer);
-    result.shared = std::make_unique<FFN>();
-    result.shared->down = load_quant_linear(execution,
-        model, prefix + "shared_expert.down.weight");
-    result.shared->gate_up = load_paired_gate_up(execution,
-        model,
-        {prefix + "shared_expert.gate.weight",
-         prefix + "shared_expert.up.weight"},
-        result.shared->down,
-        0);
-    result.shared->swiglu_limit = config.swiglu_limit;
-    prepare_ffn_workspaces(execution, *result.shared);
-    return result;
-}
-
-inline FFN load_moe(
-    CudaExecutionContext& execution,
-    const mfq::ModelSource& model,
-    const CommonConfig& config,
-    std::int64_t layer) {
-    return load_moe_at(
-        execution, model,
-        config,
-        "model.block." + std::to_string(layer) + ".mlp.",
-        layer,
-        config.top_k,
-        true);
-}
+    std::int64_t top_k);
 
 std::unique_ptr<::Block> load_block(
     CudaExecutionContext& execution,

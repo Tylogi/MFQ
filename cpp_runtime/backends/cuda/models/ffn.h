@@ -3,6 +3,7 @@
 #include "quant_linear.h"
 #include "mfe_weight.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -80,7 +81,19 @@ struct FFN {
         MfqOptional<mfq_tensor_backend::Tensor> input_ids = mfq_nullopt) const;
 };
 
+struct MoeWeightLoadOptions {
+    int layer;
+    bool cpu_offloaded = false;
+    bool router_bias_required = false;
+    std::size_t shared_gate_up_compatible_prefix = 2;
+};
+
 void prepare_ffn_workspaces(CudaExecutionContext& execution, FFN& ffn);
+FFN load_moe_weights(
+    CudaExecutionContext& execution,
+    const mfq::ModelSource& source,
+    std::string_view prefix,
+    const MoeWeightLoadOptions& options);
 FFN load_ffn(
     CudaExecutionContext& execution,
     const mfq::ModelSource& source,

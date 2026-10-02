@@ -5,6 +5,29 @@
 
 namespace mfq::cuda::deepseek_v41_runtime {
 
+FFN load_moe_at(
+        CudaExecutionContext& execution,
+        const mfq::ModelSource& model,
+        const CommonConfig& config,
+        const std::string& prefix,
+        std::int64_t layer,
+        std::int64_t top_k) {
+    auto result = load_moe_weights(
+        execution, model, prefix,
+        {.layer = static_cast<int>(layer),
+         .router_bias_required = true,
+         .shared_gate_up_compatible_prefix = 0});
+    result.moe_top_k = static_cast<int>(top_k);
+    result.moe_use_sqrt_softplus = true;
+    result.moe_normalize = config.norm_topk_prob;
+    result.moe_delayed_softmax = false;
+    result.moe_shared_ungated = true;
+    result.moe_router_scale = config.routed_scaling;
+    result.swiglu_limit = config.swiglu_limit;
+    result.shared->swiglu_limit = config.swiglu_limit;
+    return result;
+}
+
 std::unique_ptr<::Block> load_block(
     CudaExecutionContext& execution,
     const mfq::ModelSource& model,
@@ -90,7 +113,9 @@ std::unique_ptr<::Block> load_block(
         result->index_score = load_quant_linear(execution,
             model, prefix + "attention.indexer.score.weight");
     }
-    result->mlp = load_moe(execution, model, config, layer);
+    result->mlp = load_moe_at(
+        execution, model, config,
+        prefix + "mlp.", layer, config.top_k);
     result->rope = Dsv4RopeTable(
         config.max_position_embeddings,
         config.rope_theta,

@@ -14,6 +14,15 @@
 
 namespace mfq::cuda::deepseek_v4 {
 using Config = mfq::models::deepseek_v4::Config;
+
+mfq_tensor_backend::Tensor output_projection(
+    CudaExecutionContext& execution,
+    mfq_tensor_backend::Tensor attention,
+    const QuantLinear& output_a,
+    const QuantLinear& output_b,
+    std::int64_t groups,
+    bool groupwise,
+    bool profile);
 }
 
 struct Dsv4RopeTable {
@@ -303,7 +312,6 @@ struct Dsv4Block : Block {
     int64_t heads = 64;
     int64_t head_dim = 512;
     int64_t groups = 8;
-    int64_t o_rank = 1024;
     int64_t hc_mult = 4;
     int64_t hc_iterations = 20;
     double eps = 1e-6;
@@ -422,56 +430,9 @@ struct Dsv4Block : Block {
     mfq_tensor_backend::Tensor output_projection(
             CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor attention) const {
-        auto& profiler = execution.profiler;
-        const int64_t batch = attention.size(0);
-        const int64_t tokens = attention.size(1);
-        const int64_t rows = batch * tokens;
-        auto grouped = attention.contiguous()
-            .reshape({rows, groups, heads / groups * head_dim})
-            .to(mfq_tensor_backend::kFloat16);
-        if (execution.config.dsv4_groupwise_output_a &&
-                output_a.is_nint() &&
-                output_a.nint.bits == 8 && output_a.nint.gs == 48 &&
-                output_a.nint.out == groups * o_rank) {
-            auto low_rank = profiler.measure("dsv4.output_a", [&]() {
-                return nint_matmul_groupwise_u8(
-                    profiler, output_a.nint, grouped, groups);
-            });
-            return profiler.measure("dsv4.output_b", [&]() {
-                return output_b.forward(execution, low_rank)
-                    .reshape({batch, tokens, hidden_size});
-            });
-        }
-        if (execution.config.dsv4_groupwise_output_a && output_a.is_mxfp8() &&
-                output_a.out() == groups * o_rank) {
-            auto low_rank = profiler.measure(
-                "dsv4.output_a", [&]() {
-                    return output_a.forward_mxfp8_groupwise(
-                        execution, grouped, groups);
-                });
-            return profiler.measure("dsv4.output_b", [&]() {
-                return output_b.forward(execution, low_rank)
-                    .reshape({batch, tokens, hidden_size});
-            });
-        }
-        auto expanded = profiler.measure("dsv4.output_a", [&]() {
-            return output_a.forward(
-                execution, grouped.reshape({rows * groups, grouped.size(-1)}))
-                .reshape({rows, groups, groups, o_rank});
-        });
-        std::vector<mfq_tensor_backend::Tensor> diagonal;
-        diagonal.reserve(static_cast<size_t>(groups));
-        for (int64_t group = 0; group < groups; ++group) {
-            diagonal.push_back(
-                expanded.index({Slice(), group, group, Slice()}));
-        }
-        auto low_rank = mfq_tensor_backend::stack(diagonal, 1)
-            .reshape({rows, groups * o_rank})
-            .to(mfq_tensor_backend::kFloat16).contiguous();
-        return profiler.measure("dsv4.output_b", [&]() {
-            return output_b.forward(execution, low_rank)
-                .reshape({batch, tokens, hidden_size});
-        });
+        return mfq::cuda::deepseek_v4::output_projection(
+            execution, attention, output_a, output_b,
+            groups, execution.config.dsv4_groupwise_output_a, true);
     }
 
     mfq_tensor_backend::Tensor attention_forward(

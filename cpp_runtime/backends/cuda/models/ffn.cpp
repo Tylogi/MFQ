@@ -879,6 +879,79 @@ void load_important_neuron_branch(
     f.important_neurons = std::move(high);
 }
 
+FFN load_moe_weights(
+        CudaExecutionContext& execution,
+        const mfq::ModelSource& source,
+        std::string_view prefix,
+        const MoeWeightLoadOptions& options) {
+    const std::string base(prefix);
+    const std::string gate_up = base + "experts.gate_up.weight";
+    const std::string gate = base + "experts.gate.weight";
+    const std::string up = base + "experts.up.weight";
+    const std::string down = base + "experts.down.weight";
+    const bool fused = has_tensor(source, gate_up);
+    const bool split_gate = has_tensor(source, gate);
+    const bool split_up = has_tensor(source, up);
+    if (split_gate != split_up || fused == split_gate ||
+            !has_tensor(source, down)) {
+        throw std::runtime_error(
+            "routed MoE requires down and exactly one fused or split "
+            "Gate/Up representation at layer " +
+            std::to_string(options.layer));
+    }
+
+    FFN result;
+    result.is_moe = true;
+    result.moe_split_gate_up = split_gate;
+    result.moe_layer = options.layer;
+    if (options.cpu_offloaded) {
+        if (split_gate) {
+            result.cpu_moe_gate = load_mfe_cpu_offloaded(source, gate);
+            result.cpu_moe_up = load_mfe_cpu_offloaded(source, up);
+            result.moe_gate = cpu_mixed_moe_metadata(result.cpu_moe_gate);
+            result.moe_up = cpu_mixed_moe_metadata(result.cpu_moe_up);
+        } else {
+            result.cpu_moe_gate_up = load_mfe_cpu_offloaded(source, gate_up);
+            result.moe_gate_up =
+                cpu_mixed_moe_metadata(result.cpu_moe_gate_up);
+        }
+        result.cpu_moe_down = load_mfe_cpu_offloaded(source, down);
+        result.moe_down = cpu_mixed_moe_metadata(result.cpu_moe_down);
+    } else {
+        if (split_gate) {
+            result.moe_gate = load_mfe_gpu(
+                execution, source, gate, true, options.layer, "gate");
+            result.moe_up = load_mfe_gpu(
+                execution, source, up, true, options.layer, "up");
+        } else {
+            result.moe_gate_up = load_mfe_gpu(
+                execution, source, gate_up, true, options.layer, "gate_up");
+        }
+        result.moe_down = load_mfe_gpu(
+            execution, source, down, true, options.layer, "down");
+    }
+    result.moe_router = load_dense_gpu(
+        execution, source, base + "router.weight")
+        .to(mfq_tensor_backend::kFloat32).contiguous();
+    const std::string router_bias = base + "router.bias";
+    if (options.router_bias_required || has_tensor(source, router_bias)) {
+        result.moe_router_bias = load_dense_gpu(
+            execution, source, router_bias)
+            .to(mfq_tensor_backend::kFloat32).contiguous();
+    }
+    result.shared = std::make_unique<FFN>();
+    result.shared->down = load_quant_linear(
+        execution, source, base + "shared_expert.down.weight");
+    result.shared->gate_up = load_paired_gate_up(
+        execution, source,
+        {base + "shared_expert.gate.weight",
+         base + "shared_expert.up.weight"},
+        result.shared->down,
+        options.shared_gate_up_compatible_prefix);
+    prepare_ffn_workspaces(execution, *result.shared);
+    return result;
+}
+
 FFN load_ffn(
         CudaExecutionContext& execution,
         const mfq::ModelSource& source,

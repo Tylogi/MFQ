@@ -126,8 +126,7 @@ struct DeepseekV41Dspark final : MtpModule {
             config,
             prefix + "mlp.",
             config.n_layers + stage,
-            config.dspark_top_k,
-            true);
+            config.dspark_top_k);
         result->rope = Dsv4RopeTable(
             config.max_position_embeddings, config.rope_theta, 0);
         result->cuda_device =

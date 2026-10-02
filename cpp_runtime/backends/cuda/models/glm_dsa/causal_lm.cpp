@@ -14,18 +14,9 @@ void load_ffn(
         const std::string p =
             "model.block." + std::to_string(i) + ".mlp.";
         if (config.mlp_layer_types.at(static_cast<size_t>(i)) == "sparse") {
-            const std::string expert_gate_up = p + "experts.gate_up.weight";
-            const std::string expert_down = p + "experts.down.weight";
-            f.is_moe = true;
-            f.moe_gate_up = load_mfe_gpu(execution,
-                mfq, expert_gate_up, true, i, "gate_up");
-            f.moe_down = load_mfe_gpu(execution,
-                mfq, expert_down, true, i, "down");
-            f.moe_router = load_dense_gpu(execution,
-                mfq, p + "router.weight").to(mfq_tensor_backend::kFloat32).contiguous();
-            f.moe_router_bias = load_dense_gpu(execution,
-                mfq, p + "router.bias")
-                .to(mfq_tensor_backend::kFloat32).contiguous();
+            f = load_moe_weights(
+                execution, mfq, p,
+                {.layer = i, .router_bias_required = true});
             f.moe_top_k = static_cast<int>(c.num_experts_per_tok);
             f.moe_use_sigmoid = true;
             f.moe_use_sqrt_softplus = false;
@@ -33,14 +24,6 @@ void load_ffn(
             f.moe_delayed_softmax = false;
             f.moe_shared_ungated = true;
             f.moe_router_scale = c.routed_scaling_factor;
-            f.shared = std::make_unique<FFN>();
-            f.shared->down = load_quant_linear(execution,
-                mfq, p + "shared_expert.down.weight");
-            f.shared->gate_up = load_paired_gate_up(execution, mfq, {
-                p + "shared_expert.gate.weight",
-                p + "shared_expert.up.weight"},
-                f.shared->down);
-            prepare_ffn_workspaces(execution, *f.shared);
             if (f.moe_gate_up.n_experts != c.num_experts ||
                 f.moe_down.n_experts != c.num_experts ||
                 f.moe_gate_up.neuron_len != c.hidden_size ||

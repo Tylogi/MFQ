@@ -4,6 +4,71 @@
 
 namespace mfq::cuda::deepseek_v4 {
 
+mfq_tensor_backend::Tensor output_projection(
+        CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor attention,
+        const QuantLinear& output_a,
+        const QuantLinear& output_b,
+        std::int64_t groups,
+        bool groupwise,
+        bool profile) {
+    auto& profiler = execution.profiler;
+    const auto batch = attention.size(0);
+    const auto tokens = attention.size(1);
+    const auto rows = batch * tokens;
+    const auto rank = output_a.out() / groups;
+    auto grouped = attention.contiguous()
+        .reshape({rows, groups, output_a.neuron_len()})
+        .to(mfq_tensor_backend::kFloat16);
+    const auto measure = [&](const char* name, auto&& operation) {
+        return profile
+            ? profiler.measure(name, operation)
+            : operation();
+    };
+    if (groupwise && output_a.is_nint() &&
+            output_a.nint.bits == 8 && output_a.nint.gs == 48 &&
+            output_a.nint.out == groups * rank) {
+        auto low_rank = measure("dsv4.output_a", [&]() {
+            return nint_matmul_groupwise_u8(
+                profiler, output_a.nint, grouped, groups);
+        });
+        return measure("dsv4.output_b", [&]() {
+            return output_b.forward(execution, low_rank)
+                .reshape({batch, tokens, output_b.out()});
+        });
+    }
+    if (groupwise && output_a.is_mxfp8() &&
+            output_a.out() == groups * rank) {
+        auto low_rank = measure("dsv4.output_a", [&]() {
+            return output_a.forward_mxfp8_groupwise(
+                execution, grouped, groups);
+        });
+        return measure("dsv4.output_b", [&]() {
+            return output_b.forward(execution, low_rank)
+                .reshape({batch, tokens, output_b.out()});
+        });
+    }
+    auto expanded = measure("dsv4.output_a", [&]() {
+        return output_a.forward(
+            execution,
+            grouped.reshape({rows * groups, grouped.size(-1)}))
+            .reshape({rows, groups, groups, rank});
+    });
+    std::vector<mfq_tensor_backend::Tensor> diagonal;
+    diagonal.reserve(static_cast<std::size_t>(groups));
+    for (std::int64_t group = 0; group < groups; ++group) {
+        diagonal.push_back(
+            expanded.index({Slice(), group, group, Slice()}));
+    }
+    auto low_rank = mfq_tensor_backend::stack(diagonal, 1)
+        .reshape({rows, output_a.out()})
+        .to(mfq_tensor_backend::kFloat16).contiguous();
+    return measure("dsv4.output_b", [&]() {
+        return output_b.forward(execution, low_rank)
+            .reshape({batch, tokens, output_b.out()});
+    });
+}
+
 std::unique_ptr<::Block> load_block(
         CudaExecutionContext& execution,
         const mfq::ModelSource& mfq,
@@ -27,7 +92,6 @@ std::unique_ptr<::Block> load_block(
         b->heads = c.num_attention_heads;
         b->head_dim = c.head_dim;
         b->groups = c.o_groups;
-        b->o_rank = c.o_lora_rank;
         b->hc_mult = c.hc_mult;
         b->hc_iterations = c.hc_sinkhorn_iters;
         b->eps = c.rms_norm_eps;
@@ -122,39 +186,14 @@ std::unique_ptr<::Block> load_block(
                 .to(mfq_tensor_backend::kFloat32).contiguous();
         }
 
-        b->ffn.is_moe = true;
-        const bool has_split_gate =
-            has_tensor(mfq, p + "mlp.experts.gate.weight");
-        const bool has_split_up =
-            has_tensor(mfq, p + "mlp.experts.up.weight");
-        if (has_split_gate != has_split_up) {
-            throw std::runtime_error(
-                "DeepSeek V4 split routed Gate/Up records are incomplete at layer " +
-                std::to_string(i));
-        }
-        b->ffn.moe_split_gate_up = has_split_gate;
         const bool cpu_offload =
             execution.dsv4_cpu_offload_layers.count(i) != 0;
+        b->ffn = load_moe_weights(
+            execution, mfq, p + "mlp.",
+            {.layer = i,
+             .cpu_offloaded = cpu_offload,
+             .shared_gate_up_compatible_prefix = 0});
         if (cpu_offload) {
-            if (b->ffn.moe_split_gate_up) {
-                b->ffn.cpu_moe_gate = load_mfe_cpu_offloaded(
-                    mfq, p + "mlp.experts.gate.weight");
-                b->ffn.cpu_moe_up = load_mfe_cpu_offloaded(
-                    mfq, p + "mlp.experts.up.weight");
-                b->ffn.moe_gate =
-                    cpu_mixed_moe_metadata(b->ffn.cpu_moe_gate);
-                b->ffn.moe_up =
-                    cpu_mixed_moe_metadata(b->ffn.cpu_moe_up);
-            } else {
-                b->ffn.cpu_moe_gate_up = load_mfe_cpu_offloaded(
-                    mfq, p + "mlp.experts.gate_up.weight");
-                b->ffn.moe_gate_up =
-                    cpu_mixed_moe_metadata(b->ffn.cpu_moe_gate_up);
-            }
-            b->ffn.cpu_moe_down = load_mfe_cpu_offloaded(
-                mfq, p + "mlp.experts.down.weight");
-            b->ffn.moe_down =
-                cpu_mixed_moe_metadata(b->ffn.cpu_moe_down);
             const int64_t gate_up_bytes = b->ffn.moe_split_gate_up
                 ? b->ffn.moe_gate.mixed_weight_bytes +
                     b->ffn.moe_up.mixed_weight_bytes
@@ -170,30 +209,6 @@ std::unique_ptr<::Block> load_block(
                 << " total_host_bytes="
                 << execution.dsv4_cpu_offload_host_bytes
                 << std::endl;
-        } else {
-            if (b->ffn.moe_split_gate_up) {
-                b->ffn.moe_gate = load_mfe_gpu(execution,
-                    mfq, p + "mlp.experts.gate.weight",
-                    true, i, "gate");
-                b->ffn.moe_up = load_mfe_gpu(execution,
-                    mfq, p + "mlp.experts.up.weight",
-                    true, i, "up");
-            } else {
-                b->ffn.moe_gate_up = load_mfe_gpu(execution,
-                    mfq, p + "mlp.experts.gate_up.weight",
-                    true, i, "gate_up");
-            }
-            b->ffn.moe_down = load_mfe_gpu(execution,
-                mfq, p + "mlp.experts.down.weight",
-                true, i, "down");
-        }
-        b->ffn.moe_router = load_dense_gpu(execution,
-            mfq, p + "mlp.router.weight")
-            .to(mfq_tensor_backend::kFloat32).contiguous();
-        if (has_tensor(mfq, p + "mlp.router.bias")) {
-            b->ffn.moe_router_bias = load_dense_gpu(execution,
-                mfq, p + "mlp.router.bias")
-                .to(mfq_tensor_backend::kFloat32).contiguous();
         }
         if (i < config.hash_layer_count) {
             b->ffn.moe_hash_ids = load_dense_gpu(execution,
@@ -209,16 +224,7 @@ std::unique_ptr<::Block> load_block(
         b->ffn.moe_router_scale =
             c.routed_scaling_factor;
         b->ffn.swiglu_limit = c.swiglu_limit;
-        b->ffn.moe_layer = i;
-        b->ffn.shared = std::make_unique<FFN>();
-        b->ffn.shared->down = load_quant_linear(execution,
-            mfq, p + "mlp.shared_expert.down.weight");
-        b->ffn.shared->gate_up = load_paired_gate_up(execution, mfq, {
-            p + "mlp.shared_expert.gate.weight",
-            p + "mlp.shared_expert.up.weight"},
-            b->ffn.shared->down, 0);
         b->ffn.shared->swiglu_limit = c.swiglu_limit;
-        prepare_ffn_workspaces(execution, *b->ffn.shared);
 
         const bool base_shapes =
             b->attn_norm.numel() == c.hidden_size &&

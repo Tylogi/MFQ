@@ -846,8 +846,10 @@ int run_moe_check(
             throw std::runtime_error(
                 "MoE benchmark layer is out of range");
         }
-        ffn = mfq::cuda::deepseek_v41_runtime::load_moe(
-            execution, mfq, config, layer);
+        ffn = mfq::cuda::deepseek_v41_runtime::load_moe_at(
+            execution, mfq, config,
+            "model.block." + std::to_string(layer) + ".mlp.",
+            layer, config.top_k);
         hidden_size = config.hidden;
     } else {
         throw std::runtime_error(

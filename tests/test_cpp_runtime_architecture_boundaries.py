@@ -256,6 +256,31 @@ def test_cuda_transformer_header_stays_declarative() -> None:
             assert symbol not in header
 
 
+def test_cuda_dsv4_projection_and_moe_loading_are_shared() -> None:
+    ffn = (CUDA_MODELS / "ffn.cpp").read_text(encoding="utf-8")
+    v4 = (CUDA_MODELS / "deepseek_v4" / "causal_lm.cpp").read_text(
+        encoding="utf-8"
+    )
+    headers = "\n".join(
+        (CUDA_MODELS / name / "causal_lm.h").read_text(encoding="utf-8")
+        for name in ("deepseek_v4", "deepseek_v41")
+    )
+    loaders = [
+        (CUDA_MODELS / path).read_text(encoding="utf-8")
+        for path in (
+            "qwen35/causal_lm.cpp",
+            "deepseek_v4/causal_lm.cpp",
+            "deepseek_v41/causal_lm.cpp",
+            "glm_dsa/causal_lm.cpp",
+        )
+    ]
+
+    assert v4.count("nint_matmul_groupwise_u8(") == 1
+    assert "nint_matmul_groupwise_u8(" not in headers
+    assert "FFN load_moe_weights(" in ffn
+    assert all("load_moe_weights(" in source for source in loaders)
+
+
 def test_cuda_native_tensor_ops_stay_split_by_domain() -> None:
     sources = {
         name: (CUDA_RUNTIME.parent / "src" / f"mfq_native_tensor_{name}.cu")
