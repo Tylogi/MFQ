@@ -1,7 +1,7 @@
 #include "generation.h"
 #include "generation_flow.h"
 #include "models/causal_models.h"
-#include "models/full_block.h"
+#include "core/full_block.h"
 #include "cuda_sampling.h"
 #include "text_session_cache.h"
 #include "mtp.h"

@@ -41,3 +41,22 @@ struct RopeCache {
         mfq_tensor_backend::Tensor x,
         mfq_tensor_backend::Tensor pos) const;
 };
+
+namespace mfq::cuda {
+
+// Computes rotate-half frequencies for logical [axis,batch,token] positions.
+// Uses FP32 for F32 inputs and FP16 otherwise, without a resident table.
+class RotaryEmbedding {
+public:
+    RotaryEmbedding(int64_t dimension, int64_t maximum, double base,
+                    std::vector<int64_t> sections = {}, bool interleaved = false);
+    mfq_tensor_backend::Tensor forward(const mfq_tensor_backend::Tensor& value,
+                                       const mfq_tensor_backend::Tensor& positions) const;
+private:
+    int64_t dimension_, maximum_;
+    double base_;
+    std::vector<int64_t> sections_;
+    bool interleaved_;
+};
+
+} // namespace mfq::cuda

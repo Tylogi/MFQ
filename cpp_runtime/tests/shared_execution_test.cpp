@@ -1276,7 +1276,132 @@ void composition_boundary_test() {
     assert(model.last_logits({{1}, 2}).value == -217);
 }
 
+template <class Config> struct LayerParameters {
+    Config config;
+    std::string attention_gr, ffn_gr, attention_hc, ffn_hc, attention_norm, ffn_norm, ffn;
+    std::string gdn, qsa, ple, kda, mla, attention;
+};
+
+template <class Config> struct PredictorParameters {
+    using Layer = LayerParameters<Config>;
+    Config config;
+    std::string embedding_norm, hidden_norm, output_norm, embedding_fusion, hidden_fusion, fusion, final_mixer;
+    std::vector<Layer> layers;
+    std::vector<std::string> positions;
+    std::vector<int64_t> lengths;
+};
+
+// String handles exercise model assembly without a device or tensor implementation.
+struct ParameterLoader {
+    using Tensor = std::string;
+    using Embedding = std::string;
+    using GdnWeights = std::array<std::string, 9>;
+    using QsaWeights = std::array<std::string, 9>;
+    using PleWeights = std::array<std::string, 6>;
+    using KdaWeights = std::array<std::string, 13>;
+    using MlaWeights = std::array<std::string, 15>;
+    bool qwen = false, present = true, partial = false, bad_norm = false, bad_shard = false;
+    std::vector<std::string> names;
+    Tensor dense(const std::string &name) { names.push_back(name); return name; }
+    Tensor linear(const std::string &name) { return dense(name); }
+    static Tensor fp32(Tensor value) { return value; }
+    bool has(const std::string &) const { return present; }
+    bool has_prefix(const std::string &) const { return present || partial; }
+    std::vector<int64_t> shape(const Tensor &value) const {
+        return {value == "predictor.hidden_norm.weight" && qwen ? 16 : bad_norm ? 7 : 8};
+    }
+    int64_t elements(const Tensor &value) const { return shape(value)[0]; }
+    Tensor routed(const std::string &name, int, int64_t, int64_t, int64_t) { return dense(name); }
+    Tensor routed_gate_up(const std::string &p, int, int64_t, int64_t, int64_t) {
+        return dense(p + ".experts.gate_up.weight");
+    }
+    static Tensor residual(Tensor norm, Tensor, Tensor, Tensor, const mfq::models::qwen4_exp::Config &) { return norm; }
+    static Tensor final_mixer(Tensor value) { return value; }
+    static Tensor gdn(GdnWeights w, const mfq::models::qwen4_exp::Config &) { return w[0]; }
+    static Tensor qsa(QsaWeights w, const mfq::models::qwen4_exp::Config &) { return w[0]; }
+    template <class... Args> static Tensor moe(Args &&...) { return "moe"; }
+    static Tensor gated_mlp(Tensor gate, Tensor, Tensor, double) { return gate; }
+    auto embedding(const std::string &name) {
+        return std::pair{dense(name), std::array<int64_t, 2>{32, bad_shard ? 7 : 8}};
+    }
+    std::vector<int64_t> integers(const std::string &name) { dense(name); return {1}; }
+    static Tensor ple(std::vector<Embedding> shards, int64_t, int64_t,
+                      const mfq::models::qwen4_exp::Config &, std::vector<int64_t>,
+                      std::vector<int64_t>, std::vector<int64_t>, PleWeights) { return shards.front(); }
+    auto block(const mfq::models::qwen4_exp::Config &c, int layer, bool predictor) {
+        LayerParameters<mfq::models::qwen4_exp::Config> result;
+        mfq::models::qwen4_exp::load_block(result, *this, c, layer, predictor);
+        return result;
+    }
+    static Tensor mhc(Tensor function, Tensor, Tensor) { return function; }
+    static Tensor concat(const std::vector<Tensor> &parts) { return parts[0]; }
+    static Tensor headwise(Tensor weight, int64_t, int64_t) { return weight; }
+    static Tensor kda(KdaWeights w, const mfq::models::glm5_next::Config &) { return w[0]; }
+    static Tensor mla(MlaWeights w, const mfq::models::glm5_next::Config &) { return w[0]; }
+};
+
+static void family_parameter_loading_test() {
+    using namespace mfq::models;
+    qwen4_exp::Config q{};
+    q.hidden = 8; q.streams = 2; q.ngram = 2; q.ngram_heads = 1; q.shards = 2;
+    q.layer_types = {"linear_attention", "full_attention"}; q.ple_layers = {1};
+    q.predictor_layers = 3; // Predictor depth is independent of the backbone schedule.
+    ParameterLoader qops;
+    qops.qwen = true;
+    auto linear = qops.block(q, 0, false), sparse = qops.block(q, 1, false);
+    assert(linear.gdn == "model.block.0.linear_attention.qkv.weight" && linear.qsa.empty());
+    assert(linear.ple == "model.block.0.position_embedding.ngram.shard.0.weight");
+    assert(sparse.qsa == "model.block.1.attention.query.weight" && sparse.gdn.empty() && sparse.ple.empty());
+    PredictorParameters<qwen4_exp::Config> qp;
+    assert(qwen4_exp::load_predictor(qp, qops, q) && qp.layers.size() == 3 && qp.lengths.size() == 3);
+    for (size_t i = 0; i < qp.layers.size(); ++i) {
+        assert(qp.layers[i].gdn.empty() && qp.layers[i].ple.empty());
+        assert(qp.layers[i].qsa == "predictor.block." + std::to_string(i) + ".attention.query.weight");
+    }
+    qops.bad_shard = true;
+    try { qops.block(q, 0, false); assert(false); } catch (const std::runtime_error &) {}
+
+    glm5_next::Config g{};
+    g.hidden = 8; g.predictor_layers = 3;
+    g.layer_types = {"linear_attention", "deepseek_sparse_attention"};
+    g.mlp_types = {"dense", "sparse"};
+    ParameterLoader gops;
+    LayerParameters<glm5_next::Config> kda, mla;
+    glm5_next::load_block(kda, gops, g, 0);
+    glm5_next::load_block(mla, gops, g, 1);
+    assert(kda.kda == "model.block.0.linear_attention.query.weight" && kda.mla.empty());
+    assert(kda.ffn == "model.block.0.mlp.gate.weight" && mla.ffn == "moe");
+    assert(mla.mla == "model.block.1.attention.query_a.weight" && mla.kda.empty());
+    PredictorParameters<glm5_next::Config> gp;
+    assert(glm5_next::load_predictor(gp, gops, g) && gp.layers.size() == 3 && gp.lengths.size() == 3);
+    for (size_t i = 0; i < gp.layers.size(); ++i) {
+        assert(gp.layers[i].ffn == "moe");
+        assert(gp.layers[i].attention == "predictor.block." + std::to_string(i) + ".attention.query_a.weight");
+    }
+    // Absence is allowed; a partial, undeclared, or incorrectly sized head is not.
+    auto check_head = [](auto c, auto load) {
+        ParameterLoader ops;
+        using Config = decltype(c);
+        ops.qwen = std::is_same_v<Config, qwen4_exp::Config>;
+        ops.present = false;
+        PredictorParameters<Config> absent;
+        assert(!load(absent, ops, c));
+        for (int mode = 0; mode < 3; ++mode) {
+            ops.present = mode != 0;
+            ops.partial = mode == 0;
+            ops.bad_norm = mode == 2;
+            auto config = c;
+            if (mode == 1) config.predictor_layers = 0;
+            PredictorParameters<Config> result;
+            try { load(result, ops, config); assert(false); } catch (const std::runtime_error &) {}
+        }
+    };
+    check_head(q, [](auto &p, auto &ops, const auto &c) { return qwen4_exp::load_predictor(p, ops, c); });
+    check_head(g, [](auto &p, auto &ops, const auto &c) { return glm5_next::load_predictor(p, ops, c); });
+}
+
 int main() {
+    family_parameter_loading_test();
     model_loading_test();
     composition_boundary_test();
     boundary_model_test();

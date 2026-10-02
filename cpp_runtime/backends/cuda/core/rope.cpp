@@ -3,7 +3,9 @@
 #include "cuda_execution.h"
 #include "mfq_cuda_ops.h"
 
+#include <algorithm>
 #include <array>
+#include <numeric>
 #include <cmath>
 #include <stdexcept>
 #include <vector>
@@ -253,3 +255,80 @@ mfq_tensor_backend::Tensor RopeCache::apply_bf16(
         return output.contiguous();
     }
 
+namespace mfq::cuda {
+namespace tb = mfq_tensor_backend;
+using Tensor = tb::Tensor;
+
+RotaryEmbedding::RotaryEmbedding(int64_t dimension, int64_t maximum, double base,
+                               std::vector<int64_t> sections, bool interleaved)
+    : dimension_(dimension), maximum_(maximum), base_(base), sections_(std::move(sections)),
+      interleaved_(interleaved) {
+    MFQ_RUNTIME_CHECK(dimension > 0 && dimension % 2 == 0 && maximum > 0 &&
+                          std::isfinite(base) && base > 0,
+                      "invalid rotary configuration");
+    MFQ_RUNTIME_CHECK(
+        (sections_.empty() && !interleaved_) ||
+            (sections_.size() == 3 &&
+             std::all_of(sections_.begin(), sections_.end(), [](auto n) { return n >= 0; }) &&
+             std::accumulate(sections_.begin(), sections_.end(), int64_t(0)) == dimension / 2),
+        "MRoPE sections disagree with rotary width");
+}
+
+mfq_tensor_backend::Tensor RotaryEmbedding::forward(const Tensor &value, const Tensor &positions) const {
+    MFQ_RUNTIME_CHECK(value.is_cuda() && value.dim() == 4 && value.size(-1) >= dimension_ &&
+                          positions.is_cuda() && positions.device() == value.device() &&
+                          positions.dim() >= 1 && positions.dim() <= 3 &&
+                          positions.size(-1) == value.size(2),
+                      "RoPE requires [B,H,T,D] with compatible positions");
+    const auto b = value.size(0), t = value.size(2), pairs = dimension_ / 2;
+    const auto axes = positions.dim() == 1 ? 1 : positions.size(0);
+    const auto batches = positions.dim() < 3 ? 1 : positions.size(1);
+    MFQ_RUNTIME_CHECK(axes > 0 && (batches == 1 || batches == b),
+                      "RoPE position batch mismatch");
+    auto input = value.scalar_type() == tb::kFloat32 ? value : value.to(tb::kFloat16);
+    auto f = input.to(tb::kFloat32);
+    auto pair = tb::arange(pairs, value.options().dtype(tb::kInt64));
+    auto frequencies = tb::pow(tb::full({pairs}, base_, f.options()),
+                               -(pair.to(tb::kFloat32) * 2) / double(dimension_));
+    auto axis_ids = tb::zeros({pairs}, pair.options());
+    if (!sections_.empty()) {
+        if (interleaved_) {
+            auto remainder = pair.remainder(3);
+            auto a1 = (remainder == 1) & (pair < sections_[1] * 3);
+            auto a2 = (remainder == 2) & (pair < sections_[2] * 3);
+            axis_ids = tb::where(a1, tb::full_like(pair, 1),
+                                 tb::where(a2, tb::full_like(pair, 2), axis_ids));
+        } else {
+            axis_ids = tb::where(pair < sections_[0], axis_ids,
+                                 tb::where(pair < sections_[0] + sections_[1],
+                                           tb::full_like(pair, 1), tb::full_like(pair, 2)));
+        }
+        axis_ids = tb::where(axis_ids < axes, axis_ids, tb::zeros_like(axis_ids));
+    }
+    Tensor cosine, sine;
+    for (int64_t axis = 0; axis < std::min<int64_t>(axes, 3); ++axis) {
+        auto pos = (positions.dim() == 1 ? positions : positions.select(0, axis))
+                       .reshape({batches, t})
+                       .to(tb::kInt32)
+                       .clamp(0, maximum_ - 1)
+                       .to(tb::kFloat32);
+        auto angles = pos.unsqueeze(-1) * frequencies;
+        auto ca = tb::cos(angles), sa = tb::sin(angles);
+        if (axis == 0) {
+            cosine = ca;
+            sine = sa;
+        } else {
+            cosine = tb::where(axis_ids == axis, ca, cosine);
+            sine = tb::where(axis_ids == axis, sa, sine);
+        }
+    }
+    cosine = cosine.unsqueeze(1);
+    sine = sine.unsqueeze(1);
+    auto first = f.narrow(-1, 0, pairs), second = f.narrow(-1, pairs, pairs);
+    return tb::cat({first * cosine - second * sine, second * cosine + first * sine,
+                    f.narrow(-1, dimension_, f.size(-1) - dimension_)},
+                   -1)
+        .to(input.scalar_type());
+}
+
+} // namespace mfq::cuda

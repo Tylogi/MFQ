@@ -3,7 +3,7 @@
 #include "../causal_ops.h"
 #include "../full_attention_session_codec.h"
 #include "inference.h"
-#include "models/block.h"
+#include "core/block.h"
 #include "models/minicpmo45/causal_lm.h"
 #include "models/minicpmo45/config.h"
 #include "quant_linear.h"

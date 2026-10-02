@@ -4,7 +4,7 @@
 #include "cuda_execution.h"
 #include "cuda_sampling.h"
 #include "decode_graph.h"
-#include "models/full_block.h"
+#include "core/full_block.h"
 #include "models/qwen35/batch_state.h"
 #include "models/qwen35/ops.h"
 

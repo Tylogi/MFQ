@@ -1,3 +1,4 @@
+#include "storage/transformer_loader.h"
 #include "storage/weight_loader.h"
 #include "ops.h"
 #include "../session_codec_impl.h"

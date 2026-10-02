@@ -209,6 +209,7 @@ if(BUILD_TESTING)
         mfq-cuda-native-kernels mfq-json)
     target_compile_definitions(mfq-flash-next-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     target_include_directories(mfq-flash-next-test PRIVATE
+        ${MFQ_CUDA_ROOT}
         ${PROJECT_SOURCE_DIR}
         ${MFQ_REPOSITORY_ROOT}
         ${MFQ_CUDA_ROOT}/models
@@ -279,12 +280,13 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/qwen35/ops.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/batch_state.cpp
     ${MFQ_CUDA_ROOT}/models/registry.cpp
-    ${MFQ_CUDA_ROOT}/storage/model_loader.cpp
-    ${MFQ_CUDA_ROOT}/models/ffn.cpp
-    ${MFQ_CUDA_ROOT}/models/full_block.cpp
-    ${MFQ_CUDA_ROOT}/models/kv_cache.cpp
-    ${MFQ_CUDA_ROOT}/models/rope.cpp
-    ${MFQ_CUDA_ROOT}/models/transformer.cpp
+)
+
+set(MFQ_CUDA_TRANSFORMER_SOURCES
+    ${MFQ_CUDA_ROOT}/core/ffn.cpp
+    ${MFQ_CUDA_ROOT}/core/full_block.cpp
+    ${MFQ_CUDA_ROOT}/core/kv_cache.cpp
+    ${MFQ_CUDA_ROOT}/core/rope.cpp
 )
 
 set(MFQ_CUDA_RUNTIME_OP_SOURCES
@@ -310,6 +312,7 @@ set(MFQ_CUDA_LOADING_SOURCES
     ${MFQ_CUDA_ROOT}/storage/model_loader.cpp
     ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp
     ${MFQ_CUDA_ROOT}/storage/weight_loader.cpp
+    ${MFQ_CUDA_ROOT}/storage/transformer_loader.cpp
 )
 add_library(mfq-cuda-loading OBJECT ${MFQ_CUDA_LOADING_SOURCES})
 mfq_configure_cuda_runtime_target(mfq-cuda-loading)
@@ -317,8 +320,6 @@ target_compile_definitions(mfq-cuda-loading PRIVATE
     MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
 set_target_properties(mfq-cuda-loading PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-list(REMOVE_ITEM MFQ_CUDA_MODEL_SOURCES
-    ${MFQ_CUDA_ROOT}/storage/model_loader.cpp)
 add_library(mfq-cuda-runtime STATIC
     $<TARGET_OBJECTS:mfq-cuda-ops>
     $<TARGET_OBJECTS:mfq-cuda-loading>
@@ -334,6 +335,7 @@ add_library(mfq-cuda-runtime STATIC
     ${MFQ_CUDA_ROOT}/commands/cli.cpp
     ${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp
     ${MFQ_CUDA_MODEL_SOURCES}
+    ${MFQ_CUDA_TRANSFORMER_SOURCES}
 )
 add_library(mfq::cuda-runtime ALIAS mfq-cuda-runtime)
 mfq_configure_cuda_runtime_target(mfq-cuda-runtime)
@@ -544,10 +546,12 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         ${MFQ_CUDA_ROOT}/engine/mtp.cpp
         ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp
         ${MFQ_CUDA_ROOT}/storage/weight_loader.cpp
+        ${MFQ_CUDA_ROOT}/storage/transformer_loader.cpp
         ${MFQ_CUDA_ROOT}/engine/components.cpp
         ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
         ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
         ${MFQ_CUDA_MODEL_SOURCES}
+        ${MFQ_CUDA_TRANSFORMER_SOURCES}
         ${MFQ_CUDA_KERNEL_SOURCES}
     )
     mfq_configure_cuda_runtime_target(mfq-runtime-torch)

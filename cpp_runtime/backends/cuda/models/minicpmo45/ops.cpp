@@ -1,5 +1,5 @@
 #include "ops.h"
-#include "models/transformer.h"
+#include "storage/transformer_loader.h"
 #include "../session_codec_impl.h"
 
 namespace mfq::cuda {

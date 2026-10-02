@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../causal_ops.h"
-#include "models/block.h"
+#include "core/block.h"
 #include "models/qwen4_exp/causal_lm.h"
 #include "models/qwen4_exp/config.h"
 #include "quant_linear.h"

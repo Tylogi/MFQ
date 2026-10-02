@@ -5,9 +5,9 @@
 #include "../causal_ops.h"
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"
-#include "models/block.h"
+#include "core/block.h"
 #include "models/deepseek_v4/config.h"
-#include "models/ffn.h"
+#include "core/ffn.h"
 
 #include <iomanip>
 #include <iostream>

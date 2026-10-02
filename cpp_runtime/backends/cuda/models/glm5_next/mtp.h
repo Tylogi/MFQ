@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../mtp.h"
-#include "../attention_ops.h"
+#include "core/attention.h"
 #include "models/glm5_next/config.h"
 
 namespace mfq::cuda::glm5_next {

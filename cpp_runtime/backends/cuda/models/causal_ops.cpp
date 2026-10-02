@@ -1,6 +1,6 @@
 #include "storage/weight_loader.h"
 #include "causal_ops.h"
-#include "full_block.h"
+#include "core/full_block.h"
 #include "session_state.h"
 
 void CudaPagedWriter::raw(const void *data, size_t size) {

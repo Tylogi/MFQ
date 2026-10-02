@@ -1,6 +1,6 @@
 #pragma once
 #include "models/glm5_next/causal_lm.h"
-#include "../attention_ops.h"
+#include "core/attention.h"
 #include "mfq/kernels/cuda/glm5_next.h"
 #include <array>
 

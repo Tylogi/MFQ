@@ -8,10 +8,7 @@
 #include "../session_codec_impl.h"
 
 namespace mfq::cuda::glm5_next {
-using weight_loader::linear;
-using weight_loader::dense;
-using weight_loader::routed;
-using weight_loader::routed_gate_up;
+using Config = mfq::models::glm5_next::Config;
 
 static Linear headwise(weight_loader::Routed projection,int64_t heads,int64_t output) {
     return [projection=std::move(projection),heads,output](
@@ -23,11 +20,7 @@ static Linear headwise(weight_loader::Routed projection,int64_t heads,int64_t ou
     };
 }
 
-static Linear dense_ffn(CudaExecutionContext &execution, const mfq::ModelSource &file,
-                        const std::string &p, double limit) {
-    auto gate = linear(execution, file, p + ".gate.weight"),
-         up = linear(execution, file, p + ".up.weight"),
-         down = linear(execution, file, p + ".down.weight");
+static Linear dense_ffn(Linear gate, Linear up, Linear down, double limit) {
     return [gate, up, down, limit](CudaExecutionContext &execution, const Tensor &x) {
         auto unfused = [](const auto &...) { return std::optional<Tensor>{}; };
         return mfq::models::gated_mlp(
@@ -44,18 +37,8 @@ static Linear dense_ffn(CudaExecutionContext &execution, const mfq::ModelSource 
     };
 }
 
-static Linear glm_ffn(CudaExecutionContext &execution, const mfq::ModelSource &file,
-                      const mfq::models::glm5_next::Config &c, int i,
-                      const std::string &root = "model") {
-    const auto p = root + ".block." + std::to_string(i) + ".mlp";
-    if (c.dense_layer(i, root != "model"))
-        return dense_ffn(execution, file, p, c.swiglu_limit);
-    auto gate_up = routed_gate_up(execution, file, p, i, c.experts, c.moe_intermediate, c.hidden, "glm5_next");
-    auto down = routed(execution, file, p + ".experts.down.weight", i, c.experts, c.hidden,
-                       c.moe_intermediate, "glm5_next");
-    auto router = linear(execution, file, p + ".router.weight"),
-         shared = dense_ffn(execution, file, p + ".shared_expert", c.swiglu_limit);
-    auto bias = dense(execution, file, p + ".router.bias").to(tb::kFloat32).contiguous();
+static Linear glm_moe(weight_loader::Routed gate_up, weight_loader::Routed down,
+                      Linear router, Linear shared, Tensor bias, const Config &c) {
     return [gate_up, down, router, shared, bias, c](CudaExecutionContext &execution,
                                                     const Tensor &x) {
         auto source = x.reshape({-1, c.hidden}).to(tb::kFloat16);
@@ -99,11 +82,38 @@ static Linear glm_ffn(CudaExecutionContext &execution, const mfq::ModelSource &f
 
 struct Mhc {
     Tensor function, base, scale;
-    Mhc(CudaExecutionContext &execution, const mfq::ModelSource &file, const std::string &p)
-        : function(dense(execution, file, p + ".function")),
-          base(dense(execution, file, p + ".base")), scale(dense(execution, file, p + ".scale")) {}
     std::vector<Tensor> pre(const Tensor &x, const mfq::models::glm5_next::Config &c) const {
         return mfq_glm5_next::mhc_pre(x, function, base, scale, c.sinkhorn, c.hc_eps, c.eps);
+    }
+};
+
+struct BlockLoader : weight_loader::Loader {
+    using KdaWeights = glm5_next::KdaWeights;
+    using MlaWeights = glm5_next::MlaWeights;
+
+    static Mhc mhc(Tensor function, Tensor base, Tensor scale) {
+        return {std::move(function), std::move(base), std::move(scale)};
+    }
+    static Tensor concat(const std::vector<Tensor> &parts) { return tb::cat(parts, 0); }
+    static auto headwise(weight_loader::Routed projection, int64_t heads, int64_t output) {
+        return glm5_next::headwise(std::move(projection), heads, output);
+    }
+    static auto kda(KdaWeights weights, const Config &c) {
+        return std::make_unique<Kda>(std::move(weights), c.kda_heads, c.kda_width, c.kda_kernel,
+                                     c.lower_bound, c.eps);
+    }
+    static auto mla(MlaWeights weights, const Config &c) {
+        MlaConfig geometry{c.heads, c.nope, c.latent, c.value_width, c.index_heads, c.index_width,
+                           c.pool, c.budget, c.maximum, c.tail, c.eps};
+        return std::make_unique<SparseMla>(std::move(weights), geometry);
+    }
+    static auto gated_mlp(Linear gate, Linear up, Linear down, double limit) {
+        return dense_ffn(std::move(gate), std::move(up), std::move(down), limit);
+    }
+    static auto moe(weight_loader::Routed gate_up, weight_loader::Routed down, Linear router,
+                    Linear shared, Tensor bias, const Config &c) {
+        return glm_moe(std::move(gate_up), std::move(down), std::move(router), std::move(shared),
+                       std::move(bias), c);
     }
 };
 
@@ -117,59 +127,9 @@ struct Glm5NextBlock final : Block {
     std::unique_ptr<SparseMla> mla;
 
     Glm5NextBlock(CudaExecutionContext &execution, const mfq::ModelSource &file,
-                  const mfq::models::glm5_next::Config &c, int i)
-        : config(c),
-          attention_hc(execution, file, "model.block." + std::to_string(i) + ".attention.mhc.pre"),
-          ffn_hc(execution, file, "model.block." + std::to_string(i) + ".mlp.mhc.pre") {
-        const auto p = "model.block." + std::to_string(i);
-        attention_norm = dense(execution, file, p + ".attention.norm.weight");
-        ffn_norm = dense(execution, file, p + ".mlp.norm.weight");
-        ffn = glm_ffn(execution, file, c, i);
-        if (c.linear_layer(i)) {
-            const auto a = p + ".linear_attention";
-            KdaWeights w{linear(execution, file, a + ".query.weight"),
-                         linear(execution, file, a + ".key.weight"),
-                         linear(execution, file, a + ".value.weight"),
-                         linear(execution, file, a + ".beta.weight"),
-                         linear(execution, file, a + ".gate_a.weight"),
-                         linear(execution, file, a + ".gate_b.weight"),
-                         linear(execution, file, a + ".output.weight"),
-                         tb::cat({dense(execution, file, a + ".query_conv.weight"),
-                                  dense(execution, file, a + ".key_conv.weight"),
-                                  dense(execution, file, a + ".value_conv.weight")},
-                                 0),
-                         dense(execution, file, a + ".forget_a.weight"),
-                         dense(execution, file, a + ".forget_b.weight"),
-                         dense(execution, file, a + ".dt_bias"),
-                         dense(execution, file, a + ".a"),
-                         dense(execution, file, a + ".output_norm.weight")};
-            kda = std::make_unique<Kda>(std::move(w), c.kda_heads, c.kda_width, c.kda_kernel,
-                                        c.lower_bound, c.eps);
-        } else {
-            const auto a = p + ".attention";
-            MlaWeights w{linear(execution, file, a + ".query_a.weight"),
-                         linear(execution, file, a + ".key_value_a.weight"),
-                         linear(execution, file, a + ".query_b.weight"),
-                         linear(execution, file, a + ".output.weight"),
-                         linear(execution, file, a + ".indexer.query.weight"),
-                         linear(execution, file, a + ".indexer.key.weight"),
-                         linear(execution, file, a + ".indexer.score.weight"),
-                         headwise(routed(execution, file, a + ".latent.query_embedding.weight", i,
-                                         c.heads, c.latent, c.nope, "glm5_next"),
-                                  c.heads, c.latent),
-                         headwise(routed(execution, file, a + ".latent.output_unembedding.weight",
-                                         i, c.heads, c.value_width, c.latent, "glm5_next"),
-                                  c.heads, c.value_width),
-                         dense(execution, file, a + ".query_a_norm.weight"),
-                         dense(execution, file, a + ".key_value_a_norm.weight"),
-                         dense(execution, file, a + ".indexer.key_norm.weight"),
-                         dense(execution, file, a + ".indexer.key_norm.bias"),
-                         dense(execution, file, a + ".indexer.pool.gate"),
-                         dense(execution, file, a + ".indexer.pool.position")};
-            MlaConfig mc{c.heads, c.nope,   c.latent,  c.value_width, c.index_heads, c.index_width,
-                         c.pool,  c.budget, c.maximum, c.tail,        c.eps};
-            mla = std::make_unique<SparseMla>(std::move(w), mc);
-        }
+                  const Config &c, int layer) {
+        BlockLoader loader{{execution, file, "glm5_next"}};
+        mfq::models::glm5_next::load_block(*this, loader, c, layer);
     }
     void reset(int64_t) override {
         if (kda)
@@ -227,62 +187,11 @@ Glm5NextMtp& Glm5NextMtp::operator=(Glm5NextMtp&&) noexcept = default;
 std::optional<Glm5NextMtp> Glm5NextMtp::load_if_present(CudaExecutionContext &execution,
                                                       const mfq::ModelSource &file,
                                                       const mfq::models::glm5_next::Config &main) {
-    const bool any = std::any_of(file.tensors().begin(), file.tensors().end(),
-                                 [](const mfq::TensorMetadata &tensor) {
-                                     return tensor.name.rfind("predictor.", 0) == 0;
-                                 });
-    const auto count = main.predictor_layers;
-    if (!has_tensor(file, "predictor.embedding_norm.weight") || count <= 0) {
-        MFQ_RUNTIME_CHECK(
-            !any, "GLM5-Next model source contains an incomplete or undeclared MTP head");
-        return std::nullopt;
-    }
     Glm5NextMtp result;
     result.execution = &execution;
-    result.config = main;
-    result.embedding_norm =
-        dense(execution, file, "predictor.embedding_norm.weight").to(tb::kFloat32);
-    result.hidden_norm =
-        dense(execution, file, "predictor.hidden_norm.weight").to(tb::kFloat32);
-    result.output_norm = dense(execution, file, "predictor.output_norm.weight");
-    result.fusion = linear(execution, file, "predictor.fusion.weight");
-    for (int64_t i = 0; i < count; ++i) {
-        const auto p = "predictor.block." + std::to_string(i), a = p + ".attention";
-        Layer layer;
-        layer.attention_norm = dense(execution, file, a + ".norm.weight");
-        layer.ffn_norm = dense(execution, file, p + ".mlp.norm.weight");
-        layer.ffn = glm_ffn(execution, file, main, int(i), "predictor");
-        MlaWeights w{linear(execution, file, a + ".query_a.weight"),
-                     linear(execution, file, a + ".key_value_a.weight"),
-                     linear(execution, file, a + ".query_b.weight"),
-                     linear(execution, file, a + ".output.weight"),
-                     linear(execution, file, a + ".indexer.query.weight"),
-                     linear(execution, file, a + ".indexer.key.weight"),
-                     linear(execution, file, a + ".indexer.score.weight"),
-                     headwise(routed(execution, file, a + ".latent.query_embedding.weight",
-                                     int(i), main.heads, main.latent, main.nope, "glm5_next"),
-                              main.heads, main.latent),
-                     headwise(routed(execution, file, a + ".latent.output_unembedding.weight",
-                                     int(i), main.heads, main.value_width, main.latent, "glm5_next"),
-                              main.heads, main.value_width),
-                     dense(execution, file, a + ".query_a_norm.weight"),
-                     dense(execution, file, a + ".key_value_a_norm.weight"),
-                     dense(execution, file, a + ".indexer.key_norm.weight"),
-                     dense(execution, file, a + ".indexer.key_norm.bias"),
-                     dense(execution, file, a + ".indexer.pool.gate"),
-                     dense(execution, file, a + ".indexer.pool.position")};
-        MlaConfig mc{main.heads,       main.nope,        main.latent, main.value_width,
-                     main.index_heads, main.index_width, main.pool,   main.budget,
-                     main.maximum,     main.tail,        main.eps};
-        layer.attention = std::make_unique<SparseMla>(std::move(w), mc);
-        result.layers.push_back(std::move(layer));
-    }
-    MFQ_RUNTIME_CHECK(
-        result.embedding_norm.dim() == 1 && result.embedding_norm.numel() == main.hidden &&
-            result.hidden_norm.dim() == 1 && result.hidden_norm.numel() == main.hidden &&
-            result.output_norm.numel() == main.hidden,
-        "GLM5-Next MTP normalization width disagrees with backbone");
-    result.lengths.resize(count, 0);
+    BlockLoader loader{{execution, file, "glm5_next"}};
+    if (!mfq::models::glm5_next::load_predictor(result, loader, main))
+        return std::nullopt;
     return result;
 }
 

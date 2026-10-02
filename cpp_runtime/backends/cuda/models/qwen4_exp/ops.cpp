@@ -8,24 +8,12 @@
 #include "../session_codec_impl.h"
 
 namespace mfq::cuda::qwen4_exp {
-using weight_loader::linear;
-using weight_loader::dense;
-using weight_loader::routed;
-using weight_loader::routed_gate_up;
+using Config = mfq::models::qwen4_exp::Config;
 
 struct Gr {
     Tensor norm, down, up, injection;
     int64_t hidden, streams;
     double eps;
-    Gr(CudaExecutionContext &execution, const mfq::ModelSource &file,
-       const mfq::models::qwen4_exp::Config &c, const std::string &p, bool combine = true)
-        : norm(dense(execution, file, p + ".norm.weight").to(tb::kFloat32)),
-          down(dense(execution, file, p + ".down.weight")),
-          up(dense(execution, file, p + ".up.weight")), hidden(c.hidden), streams(c.streams),
-          eps(c.eps) {
-        if (combine)
-            injection = dense(execution, file, p.substr(0, p.size() - 4) + ".post.inject.weight");
-    }
     std::vector<Tensor> pre(const Tensor &x) const {
         return mfq_qwen4_exp::gated_residual_pre(
             x, norm, down, up,
@@ -37,18 +25,9 @@ struct Gr {
     }
 };
 
-static Linear qwen_ffn(CudaExecutionContext &execution, const mfq::ModelSource &file,
-                       const mfq::models::qwen4_exp::Config &c, int i,
-                       const std::string &root = "model") {
-    const auto p = root + ".block." + std::to_string(i) + ".mlp";
-    auto gate_up = routed_gate_up(execution, file, p, i, c.experts, c.moe_width, c.hidden, "qwen4_exp");
-    auto down =
-        routed(execution, file, p + ".experts.down.weight", i, c.experts, c.hidden, c.moe_width, "qwen4_exp");
-    auto router = linear(execution, file, p + ".router.weight"),
-         shared_gate = linear(execution, file, p + ".shared_expert.router.weight");
-    auto sg = linear(execution, file, p + ".shared_expert.gate.weight"),
-         su = linear(execution, file, p + ".shared_expert.up.weight"),
-         sd = linear(execution, file, p + ".shared_expert.down.weight");
+static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down,
+                       Linear router, Linear shared_gate, Linear sg, Linear su, Linear sd,
+                       const Config &c) {
     return [gate_up, down, router, shared_gate, sg, su, sd, c](CudaExecutionContext &execution,
                                                                const Tensor &x) {
         auto source = x.reshape({-1, c.hidden}).to(tb::kFloat16);
@@ -99,45 +78,55 @@ static Linear qwen_ffn(CudaExecutionContext &execution, const mfq::ModelSource &
     };
 }
 
-static std::vector<int64_t> integers(CudaExecutionContext &execution, const mfq::ModelSource &file,
-                                     const std::string &name) {
-    const auto &type = require_tensor(file, name).dtype;
-    MFQ_RUNTIME_CHECK(type == "I64" || type == "I32",
-                      "Qwen4 PLE metadata must be a dense integer array: ", name);
-    auto host = load_dense_gpu(execution, file, name).to(tb::kInt64).contiguous().cpu();
-    MFQ_RUNTIME_CHECK(host.dim() == 1, "Qwen4 PLE metadata must be a vector");
-    return {host.data_ptr<int64_t>(), host.data_ptr<int64_t>() + host.numel()};
-}
+struct BlockLoader : weight_loader::Loader {
+    using GdnWeights = qwen4_exp::GdnWeights;
+    using QsaWeights = qwen4_exp::QsaWeights;
+    using PleWeights = qwen4_exp::PleWeights;
+    using Embedding = attention_ops::Embedding;
 
-static std::unique_ptr<Ple> qwen_ple(CudaExecutionContext &execution, const mfq::ModelSource &file,
-                                     const mfq::models::qwen4_exp::Config &c,
-                                     const std::string &p) {
-    std::vector<Embedding> shards;
-    int64_t rows = 0, width = c.hidden / ((c.ngram - 1) * c.ngram_heads);
-    for (int64_t i = 0; i < c.shards; ++i) {
-        const auto name = p + ".ngram.shard." + std::to_string(i) + ".weight";
-        auto weight = std::make_shared<QuantLinear>(load_quant_linear(execution, file, name));
-        std::vector<int64_t> shape{weight->out(), weight->neuron_len()};
-        MFQ_RUNTIME_CHECK(shape.size() == 2 && shape[1] == width && shape[0] > 0 &&
-                              (!rows || shape[0] == rows),
-                          "Qwen4 PLE embedding shard dimensions disagree");
-        rows = shape[0];
-        shards.push_back(
-            [weight](const Tensor &ids) { return quant_embedding_lookup(*weight, ids); });
+    static Gr residual(Tensor norm, Tensor down, Tensor up, Tensor injection, const Config &c) {
+        return {std::move(norm), std::move(down), std::move(up), std::move(injection),
+                c.hidden, c.streams, c.eps};
     }
-    NgramEmbedding embedding(std::move(shards), rows, width, c.ngram, c.ngram_heads, c.eos,
-                             integers(execution, file, p + ".ngram.layer_multipliers"),
-                             integers(execution, file, p + ".ngram.head_offsets"),
-                             integers(execution, file, p + ".ngram.head_vocab_sizes"));
-    PleWeights w{linear(execution, file, p + ".key.weight"),
-                 linear(execution, file, p + ".value.weight"),
-                 dense(execution, file, p + ".key_norm.weight"),
-                 dense(execution, file, p + ".query_norm.weight"),
-                 dense(execution, file, p + ".conv_norm.weight"),
-                 dense(execution, file, p + ".conv.weight")};
-    return std::make_unique<Ple>(std::move(embedding), std::move(w), c.hidden, c.streams, c.ngram,
-                                 c.eps);
-}
+    static auto final_mixer(Gr weights) { return std::make_unique<Gr>(std::move(weights)); }
+    static auto gdn(GdnWeights weights, const Config &c) {
+        return std::make_unique<Gdn>(std::move(weights), c.key_heads, c.value_heads, c.linear_width,
+                                     c.kernel, c.eps, c.silu_gate);
+    }
+    static auto qsa(QsaWeights weights, const Config &c) {
+        QsaConfig geometry{c.heads, c.kv_heads, c.width, c.index_heads, c.index_width,
+                           c.pool, c.budget, c.maximum, c.eps};
+        auto rotary = std::make_shared<RotaryEmbedding>(c.rotary, c.maximum, c.rope_base, c.sections, c.interleaved);
+        return std::make_unique<Qsa>(std::move(weights), geometry, std::move(rotary));
+    }
+    static auto moe(weight_loader::Routed gate_up, weight_loader::Routed down, Linear router,
+                    Linear shared_gate, Linear sg, Linear su, Linear sd, const Config &c) {
+        return qwen_moe(std::move(gate_up), std::move(down), std::move(router), std::move(shared_gate),
+                        std::move(sg), std::move(su), std::move(sd), c);
+    }
+    auto embedding(const std::string &name) const {
+        auto weight = std::make_shared<QuantLinear>(load_quant_linear(execution, source, name));
+        Embedding lookup = [weight](const Tensor &ids) { return quant_embedding_lookup(*weight, ids); };
+        return std::pair{std::move(lookup), std::array<int64_t, 2>{weight->out(), weight->neuron_len()}};
+    }
+    std::vector<int64_t> integers(const std::string &name) const {
+        const auto &type = require_tensor(source, name).dtype;
+        MFQ_RUNTIME_CHECK(type == "I64" || type == "I32",
+                          "Qwen4 PLE metadata must be a dense integer array: ", name);
+        auto host = load_dense_gpu(execution, source, name).to(tb::kInt64).contiguous().cpu();
+        MFQ_RUNTIME_CHECK(host.dim() == 1, "Qwen4 PLE metadata must be a vector");
+        return {host.data_ptr<int64_t>(), host.data_ptr<int64_t>() + host.numel()};
+    }
+    static auto ple(std::vector<Embedding> shards, int64_t rows, int64_t width, const Config &c,
+                    std::vector<int64_t> multipliers, std::vector<int64_t> offsets,
+                    std::vector<int64_t> sizes, PleWeights weights) {
+        NgramEmbedding embedding(std::move(shards), rows, width, c.ngram, c.ngram_heads, c.eos,
+                                 std::move(multipliers), std::move(offsets), std::move(sizes));
+        return std::make_unique<Ple>(std::move(embedding), std::move(weights), c.hidden, c.streams,
+                                     c.ngram, c.eps);
+    }
+    std::unique_ptr<Qwen4Block> block(const Config &c, int layer, bool predictor);
+};
 
 struct Qwen4Block final : Block {
     using Tensor = mfq_tensor_backend::Tensor;
@@ -148,44 +137,9 @@ struct Qwen4Block final : Block {
     std::unique_ptr<Qsa> qsa;
     std::unique_ptr<Ple> ple;
     Qwen4Block(CudaExecutionContext &execution, const mfq::ModelSource &file,
-               const mfq::models::qwen4_exp::Config &c, int i, const std::string &root = "model")
-        : config(c), attention_gr(execution, file, c,
-                                  root + ".block." + std::to_string(i) + ".attention.mhc.pre"),
-          ffn_gr(execution, file, c, root + ".block." + std::to_string(i) + ".mlp.mhc.pre"),
-          ffn(qwen_ffn(execution, file, c, i, root)) {
-        const auto p = root + ".block." + std::to_string(i);
-        if (c.linear_layer(i, root != "model")) {
-            const auto a = p + ".linear_attention";
-            GdnWeights w{linear(execution, file, a + ".qkv.weight"),
-                         linear(execution, file, a + ".gate.weight"),
-                         linear(execution, file, a + ".alpha.weight"),
-                         linear(execution, file, a + ".beta.weight"),
-                         linear(execution, file, a + ".output.weight"),
-                         dense(execution, file, a + ".conv.weight"),
-                         dense(execution, file, a + ".dt_bias"),
-                         dense(execution, file, a + ".a"),
-                         dense(execution, file, a + ".norm.weight")};
-            gdn = std::make_unique<Gdn>(std::move(w), c.key_heads, c.value_heads, c.linear_width,
-                                        c.kernel, c.eps, c.silu_gate);
-        } else {
-            const auto a = p + ".attention";
-            QsaWeights w{linear(execution, file, a + ".query.weight"),
-                         linear(execution, file, a + ".key.weight"),
-                         linear(execution, file, a + ".value.weight"),
-                         linear(execution, file, a + ".output.weight"),
-                         linear(execution, file, a + ".indexer.query_key.weight"),
-                         dense(execution, file, a + ".query_norm.weight"),
-                         dense(execution, file, a + ".key_norm.weight"),
-                         dense(execution, file, a + ".indexer.query_norm.weight"),
-                         dense(execution, file, a + ".indexer.key_norm.weight")};
-            QsaConfig qc{c.heads, c.kv_heads, c.width,   c.index_heads, c.index_width,
-                         c.pool,  c.budget,   c.maximum, c.eps};
-            auto rotary = std::make_shared<Rotary>(c.rotary, c.maximum, c.rope_base, c.sections,
-                                                   c.interleaved);
-            qsa = std::make_unique<Qsa>(std::move(w), qc, std::move(rotary));
-        }
-        if (c.position_embedding_layer(i, root != "model"))
-            ple = qwen_ple(execution, file, c, p + ".position_embedding");
+               const Config &c, int layer, bool predictor = false) {
+        BlockLoader loader{{execution, file, "qwen4_exp"}};
+        mfq::models::qwen4_exp::load_block(*this, loader, c, layer, predictor);
     }
     void reset(int64_t) override {
         if (gdn)
@@ -241,6 +195,10 @@ struct Qwen4Block final : Block {
     }
 };
 
+std::unique_ptr<Qwen4Block> BlockLoader::block(const Config &c, int layer, bool predictor) {
+    return std::make_unique<Qwen4Block>(execution, source, c, layer, predictor);
+}
+
 Qwen4ExpMtp::Qwen4ExpMtp() = default;
 Qwen4ExpMtp::~Qwen4ExpMtp() = default;
 Qwen4ExpMtp::Qwen4ExpMtp(Qwen4ExpMtp&&) noexcept = default;
@@ -249,37 +207,11 @@ Qwen4ExpMtp& Qwen4ExpMtp::operator=(Qwen4ExpMtp&&) noexcept = default;
 std::optional<Qwen4ExpMtp> Qwen4ExpMtp::load_if_present(CudaExecutionContext &execution,
                                                       const mfq::ModelSource &file,
                                                       const mfq::models::qwen4_exp::Config &main) {
-    const bool any = std::any_of(file.tensors().begin(), file.tensors().end(),
-                                 [](const mfq::TensorMetadata &tensor) {
-                                     return tensor.name.rfind("predictor.", 0) == 0;
-                                 });
-    const auto count = main.predictor_layers;
-    if (!has_tensor(file, "predictor.embedding_norm.weight") || count <= 0) {
-        MFQ_RUNTIME_CHECK(
-            !any, "Qwen4-Exp model source contains an incomplete or undeclared MTP head");
-        return std::nullopt;
-    }
     Qwen4ExpMtp result;
     result.execution = &execution;
-    result.config = main;
-    result.embedding_norm =
-        dense(execution, file, "predictor.embedding_norm.weight").to(tb::kFloat32);
-    result.hidden_norm =
-        dense(execution, file, "predictor.hidden_norm.weight").to(tb::kFloat32);
-    result.embedding_fusion = linear(execution, file, "predictor.fusion.embedding.weight");
-    result.hidden_fusion = linear(execution, file, "predictor.fusion.hidden.weight");
-    result.final_mixer =
-        std::make_unique<Gr>(execution, file, main, "predictor.mhc.pre", false);
-    for (int64_t i = 0; i < count; ++i)
-        result.layers.push_back(
-            std::make_unique<Qwen4Block>(execution, file, main, int(i), "predictor"));
-    MFQ_RUNTIME_CHECK(result.embedding_norm.dim() == 1 &&
-                          result.embedding_norm.numel() == main.hidden &&
-                          result.hidden_norm.dim() == 1 &&
-                          result.hidden_norm.numel() == main.hidden * main.streams,
-                      "Qwen4-Exp MTP normalization width disagrees with backbone");
-    result.positions.resize(count);
-    result.lengths.resize(count, 0);
+    BlockLoader loader{{execution, file, "qwen4_exp"}};
+    if (!mfq::models::qwen4_exp::load_predictor(result, loader, main))
+        return std::nullopt;
     return result;
 }
 
@@ -413,7 +345,9 @@ void Qwen4Model::adapter_validate_load_options() const {
 
 void Qwen4Model::adapter_load_final_state(const mfq::ModelSource &source,
                                           mfq_tensor_backend::Tensor &output_norm) {
-    final_mixer = std::make_unique<qwen4_exp::Gr>(*execution, source, config, "model.mhc.pre", false);
+    qwen4_exp::BlockLoader loader{{*execution, source, "qwen4_exp"}};
+    final_mixer = loader.final_mixer(
+        mfq::models::qwen4_exp::load_residual(loader, config, "model.mhc.pre", false));
     output_norm = mfq_tensor_backend::Tensor();
 }
 

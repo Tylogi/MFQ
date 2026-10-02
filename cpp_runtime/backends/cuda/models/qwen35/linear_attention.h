@@ -1,8 +1,8 @@
 #pragma once
 #include "models/common/transformer_layer.h"
 
-#include "models/block.h"
-#include "models/ffn.h"
+#include "core/block.h"
+#include "core/ffn.h"
 #include "models/qwen35/config.h"
 #include "models/qwen35/causal_lm.h"
 

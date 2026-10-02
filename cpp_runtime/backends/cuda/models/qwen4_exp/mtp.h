@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../mtp.h"
-#include "../attention_ops.h"
+#include "core/attention.h"
 #include "models/qwen4_exp/config.h"
 
 namespace mfq::cuda::qwen4_exp {

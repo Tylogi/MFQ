@@ -7,6 +7,105 @@
 
 namespace mfq::models::qwen4_exp {
 
+template <class Loader>
+auto load_residual(Loader &ops, const Config &c, const std::string &p, bool combine) {
+    auto norm = ops.fp32(ops.dense(p + ".norm.weight"));
+    auto down = ops.dense(p + ".down.weight"), up = ops.dense(p + ".up.weight");
+    typename Loader::Tensor injection;
+    if (combine)
+        injection = ops.dense(p.substr(0, p.size() - 4) + ".post.inject.weight");
+    return ops.residual(std::move(norm), std::move(down), std::move(up), std::move(injection), c);
+}
+
+template <class Loader>
+auto load_ffn(Loader &ops, const Config &c, int layer, const std::string &p) {
+    auto gate_up = ops.routed_gate_up(p, layer, c.experts, c.moe_width, c.hidden);
+    auto down = ops.routed(p + ".experts.down.weight", layer, c.experts, c.hidden, c.moe_width);
+    auto router = ops.linear(p + ".router.weight");
+    auto shared_gate = ops.linear(p + ".shared_expert.router.weight");
+    auto sg = ops.linear(p + ".shared_expert.gate.weight"),
+         su = ops.linear(p + ".shared_expert.up.weight"),
+         sd = ops.linear(p + ".shared_expert.down.weight");
+    return ops.moe(std::move(gate_up), std::move(down), std::move(router), std::move(shared_gate),
+                   std::move(sg), std::move(su), std::move(sd), c);
+}
+
+template <class Loader>
+auto load_ple(Loader &ops, const Config &c, const std::string &p) {
+    std::vector<typename Loader::Embedding> shards;
+    int64_t rows = 0, width = c.hidden / ((c.ngram - 1) * c.ngram_heads);
+    for (int64_t i = 0; i < c.shards; ++i) {
+        auto [embedding, shape] = ops.embedding(p + ".ngram.shard." + std::to_string(i) + ".weight");
+        require_model(shape[1] == width && shape[0] > 0 && (!rows || shape[0] == rows),
+                      "Qwen4 PLE embedding shard dimensions disagree");
+        rows = shape[0];
+        shards.push_back(std::move(embedding));
+    }
+    auto multipliers = ops.integers(p + ".ngram.layer_multipliers"),
+         offsets = ops.integers(p + ".ngram.head_offsets"),
+         sizes = ops.integers(p + ".ngram.head_vocab_sizes");
+    typename Loader::PleWeights w{
+        ops.linear(p + ".key.weight"), ops.linear(p + ".value.weight"),
+        ops.dense(p + ".key_norm.weight"), ops.dense(p + ".query_norm.weight"),
+        ops.dense(p + ".conv_norm.weight"), ops.dense(p + ".conv.weight")};
+    return ops.ple(std::move(shards), rows, width, c, std::move(multipliers), std::move(offsets),
+                   std::move(sizes), std::move(w));
+}
+
+// The same layer definition loads the backbone and its QSA-only predictor.
+template <class Block, class Loader>
+void load_block(Block &b, Loader &ops, const Config &c, int layer, bool predictor = false) {
+    const auto p = std::string(predictor ? "predictor" : "model") + ".block." + std::to_string(layer);
+    b.config = c;
+    b.attention_gr = load_residual(ops, c, p + ".attention.mhc.pre", true);
+    b.ffn_gr = load_residual(ops, c, p + ".mlp.mhc.pre", true);
+    b.ffn = load_ffn(ops, c, layer, p + ".mlp");
+    if (c.linear_layer(layer, predictor)) {
+        const auto a = p + ".linear_attention";
+        typename Loader::GdnWeights w{
+            ops.linear(a + ".qkv.weight"), ops.linear(a + ".gate.weight"),
+            ops.linear(a + ".alpha.weight"), ops.linear(a + ".beta.weight"),
+            ops.linear(a + ".output.weight"), ops.dense(a + ".conv.weight"),
+            ops.dense(a + ".dt_bias"), ops.dense(a + ".a"), ops.dense(a + ".norm.weight")};
+        b.gdn = ops.gdn(std::move(w), c);
+    } else {
+        const auto a = p + ".attention";
+        typename Loader::QsaWeights w{
+            ops.linear(a + ".query.weight"), ops.linear(a + ".key.weight"),
+            ops.linear(a + ".value.weight"), ops.linear(a + ".output.weight"),
+            ops.linear(a + ".indexer.query_key.weight"), ops.dense(a + ".query_norm.weight"),
+            ops.dense(a + ".key_norm.weight"), ops.dense(a + ".indexer.query_norm.weight"),
+            ops.dense(a + ".indexer.key_norm.weight")};
+        b.qsa = ops.qsa(std::move(w), c);
+    }
+    if (c.position_embedding_layer(layer, predictor))
+        b.ple = load_ple(ops, c, p + ".position_embedding");
+}
+
+template <class Predictor, class Loader>
+bool load_predictor(Predictor &result, Loader &ops, const Config &c) {
+    const auto count = c.predictor_layers;
+    if (!ops.has("predictor.embedding_norm.weight") || count <= 0) {
+        require_model(!ops.has_prefix("predictor"),
+                      "Qwen4-Exp model source contains an incomplete or undeclared MTP head");
+        return false;
+    }
+    result.config = c;
+    result.embedding_norm = ops.fp32(ops.dense("predictor.embedding_norm.weight"));
+    result.hidden_norm = ops.fp32(ops.dense("predictor.hidden_norm.weight"));
+    result.embedding_fusion = ops.linear("predictor.fusion.embedding.weight");
+    result.hidden_fusion = ops.linear("predictor.fusion.hidden.weight");
+    result.final_mixer = ops.final_mixer(load_residual(ops, c, "predictor.mhc.pre", false));
+    for (int64_t i = 0; i < count; ++i)
+        result.layers.push_back(ops.block(c, int(i), true));
+    require_model(ops.shape(result.embedding_norm) == std::vector<int64_t>{c.hidden} &&
+                      ops.shape(result.hidden_norm) == std::vector<int64_t>{c.hidden * c.streams},
+                  "Qwen4-Exp MTP normalization width disagrees with backbone");
+    result.positions.resize(count);
+    result.lengths.resize(count, 0);
+    return true;
+}
+
 // The sparse indexer consumes pooled keys only after the dense budget is exceeded.
 template <class Project, class Cache, class Dense, class Pool, class Score, class Select,
           class Sparse, class Output, class Rollback>

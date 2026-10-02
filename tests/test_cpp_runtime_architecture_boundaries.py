@@ -65,6 +65,7 @@ CUDA_CLI = (
 ).read_text(encoding="utf-8")
 CUDA_MODELS = ROOT / "cpp_runtime" / "backends" / "cuda" / "models"
 CUDA_OPS = ROOT / "cpp_runtime" / "backends" / "cuda" / "ops"
+CUDA_CORE = CUDA_OPS.parent / "core"
 CUDA_RUNTIME = ROOT / "cpp_runtime" / "backends" / "cuda" / "engine"
 CUDA_ENGINE_SOURCE = (CUDA_RUNTIME / "cuda_engine.cpp").read_text(
     encoding="utf-8"
@@ -87,13 +88,13 @@ CUDA_BACKEND_SOURCE = "\n".join(
 )
 CUDA_REGISTRY = (CUDA_MODELS / "registry.cpp").read_text(encoding="utf-8")
 CUDA_TRANSFORMER_LOADER = (
-    CUDA_MODELS / "transformer.cpp"
+    CUDA_OPS.parent / "storage/transformer_loader.cpp"
 ).read_text(encoding="utf-8")
 CUDA_TRANSFORMER_HEADER = (
-    CUDA_MODELS / "transformer.h"
+    CUDA_OPS.parent / "storage/transformer_loader.h"
 ).read_text(encoding="utf-8")
 CUDA_TRANSFORMER_PARTS = {
-    name: (CUDA_MODELS / f"{name}.cpp").read_text(encoding="utf-8")
+    name: (CUDA_CORE / f"{name}.cpp").read_text(encoding="utf-8")
     for name in ("rope", "ffn", "kv_cache", "full_block")
 }
 CUDA_QWEN_LINEAR = (
@@ -259,29 +260,33 @@ def test_cuda_quant_runtime_implementations_stay_out_of_headers() -> None:
 
 
 
-def test_cuda_transformer_header_stays_declarative() -> None:
-    assert len(CUDA_TRANSFORMER_HEADER.splitlines()) < 30
+def test_cuda_transformer_core_stays_declarative_and_separate_from_loading() -> None:
+    assert len(CUDA_TRANSFORMER_HEADER.splitlines()) < 60
     assert '#include "full_block.h"' not in CUDA_TRANSFORMER_HEADER
-    limits = {"rope": 60, "ffn": 120, "kv_cache": 80, "full_block": 100}
+    limits = {"rope": 70, "ffn": 120, "kv_cache": 80, "full_block": 100}
     for name, limit in limits.items():
-        header = (CUDA_MODELS / f"{name}.h").read_text(encoding="utf-8")
+        header = (CUDA_CORE / f"{name}.h").read_text(encoding="utf-8")
         assert len(header.splitlines()) < limit
+        assert not (CUDA_MODELS / f"{name}.h").exists()
+        assert not (CUDA_MODELS / f"{name}.cpp").exists()
+        assert "ModelSource" not in header
+        assert "load_ffn(" not in CUDA_TRANSFORMER_PARTS[name]
 
     implementations = {
-        "rope": ("RopeCache::RopeCache(",),
+        "rope": ("RopeCache::RopeCache(", "RotaryEmbedding::forward("),
         "ffn": ("FFN::forward(", "FFN::forward_impl("),
         "kv_cache": ("KVCache::KVCache(", "KVCache::paged_view("),
         "full_block": ("Block::forward_context(", "FullBlock::forward_impl("),
     }
     for name, symbols in implementations.items():
-        header = (CUDA_MODELS / f"{name}.h").read_text(encoding="utf-8")
+        header = (CUDA_CORE / f"{name}.h").read_text(encoding="utf-8")
         for symbol in symbols:
             assert symbol in CUDA_TRANSFORMER_PARTS[name]
             assert symbol not in header
 
 
 def test_cuda_dsv4_projection_and_moe_loading_are_shared() -> None:
-    ffn = (CUDA_MODELS / "ffn.cpp").read_text(encoding="utf-8")
+    ffn = (CUDA_CORE / "ffn.cpp").read_text(encoding="utf-8")
     v4 = (CUDA_MODELS / "deepseek_v4" / "ops.cpp").read_text(
         encoding="utf-8"
     )
@@ -301,7 +306,8 @@ def test_cuda_dsv4_projection_and_moe_loading_are_shared() -> None:
 
     assert v4.count("nint_matmul_groupwise_u8(") == 1
     assert "nint_matmul_groupwise_u8(" not in headers
-    assert "FFN load_moe_weights(" in ffn
+    assert "FFN load_moe_weights(" in CUDA_TRANSFORMER_LOADER
+    assert "load_moe_weights(" not in ffn
     assert all("load_moe_weights(" in source for source in loaders)
 
 
@@ -1215,7 +1221,11 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         "commands/cli.cpp",
         "models/causal_ops.cpp",
         "storage/model_loader.cpp",
-        "models/transformer.cpp",
+        "storage/transformer_loader.cpp",
+        "core/rope.cpp",
+        "core/ffn.cpp",
+        "core/kv_cache.cpp",
+        "core/full_block.cpp",
         "engine/mtp.cpp",
         "storage/moe_expert_cache.cpp",
         "engine/components.cpp",
@@ -1347,7 +1357,7 @@ def test_cuda_family_layers_and_offline_generation_use_shared_flows() -> None:
     evaluation = (CUDA_MODELS.parent / "commands/minicpmo45.cpp").read_text(encoding="utf-8")
     assert "mfq::engine::generate_tokens(" in evaluation
     assert "step < max_new_tokens" not in evaluation
-    ffn = (CUDA_MODELS / "ffn.cpp").read_text(encoding="utf-8")
+    ffn = (CUDA_CORE / "ffn.cpp").read_text(encoding="utf-8")
     assert "mfq::models::additive_branches(" in ffn
     assert ffn.count("mfq::models::gated_mlp(") == 4
 

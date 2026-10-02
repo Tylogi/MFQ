@@ -6,8 +6,8 @@
 #include <random>
 #include "generation_policy.h"
 #include "sampling.h"
-#include "models/full_block.h"
-#include "models/transformer.h"
+#include "core/full_block.h"
+#include "storage/transformer_loader.h"
 
 struct MiniCPMO45TtsSamplingOps {
     using Tensor = mfq_tensor_backend::Tensor;

@@ -179,9 +179,9 @@ def test_deepseek_v4_split_gate_up_uses_existing_moe_runtime_and_cache():
 
 def test_generic_ffn_loader_stays_dense_and_model_moe_loaders_are_typed():
     loader = (
-        CUDA_ROOT / "models" / "transformer.cpp"
+        CUDA_ROOT / "storage" / "transformer_loader.cpp"
     ).read_text(encoding="utf-8")
-    assert "experts.gate.weight" not in loader
+    assert "experts.gate.weight" not in loader.split("void load_important_neuron_branch(")[0]
     assert "const mfq::models::ModelConfig& config" in loader
     assert "deepseek_v4::load_block(" in SOURCE
     assert "glm_dsa::load_ffn(" in SOURCE

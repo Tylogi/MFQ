@@ -4,7 +4,7 @@
 #include "models/common/transformer_layer.h"
 #include "models/gemma4/causal_lm.h"
 
-#include "models/full_block.h"
+#include "core/full_block.h"
 
 #include "models/common/gated_mlp.h"
 #include <array>

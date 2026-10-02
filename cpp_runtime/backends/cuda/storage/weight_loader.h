@@ -109,4 +109,27 @@ Routed routed_gate_up(CudaExecutionContext& execution, const mfq::ModelSource& f
 
 void validate_load_options(
         const CudaExecutionContext& execution);
+
+// Bind shared layer definitions to this model's native weight resources.
+struct Loader {
+    using Tensor = mfq_tensor_backend::Tensor;
+    CudaExecutionContext &execution;
+    const mfq::ModelSource &source;
+    const char *role;
+
+    bool has(const std::string &name) const { return has_tensor(source, name); }
+    bool has_prefix(const std::string &prefix) const { return has_tensor_prefix(source, prefix); }
+    Tensor dense(const std::string &name) const { return weight_loader::dense(execution, source, name); }
+    Linear linear(const std::string &name) const { return weight_loader::linear(execution, source, name); }
+    Routed routed(const std::string &name, int layer, int64_t experts, int64_t output, int64_t input) const {
+        return weight_loader::routed(execution, source, name, layer, experts, output, input, role);
+    }
+    Routed routed_gate_up(const std::string &prefix, int layer, int64_t experts, int64_t width,
+                         int64_t input) const {
+        return weight_loader::routed_gate_up(execution, source, prefix, layer, experts, width, input, role);
+    }
+    static Tensor fp32(const Tensor &value) { return value.to(mfq_tensor_backend::kFloat32).contiguous(); }
+    static auto shape(const Tensor &value) { return value.sizes().vec(); }
+    static int64_t elements(const Tensor &value) { return value.numel(); }
+};
 } // namespace mfq::cuda::weight_loader

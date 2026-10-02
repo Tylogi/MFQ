@@ -222,7 +222,7 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
         return out;
     }
     if (op == "runtime_rotary") {
-        mfq::cuda::qwen4_exp::Rotary rotary(p.at("rotary"),p.at("maximum"),p.value("base",1e7),
+        mfq::cuda::RotaryEmbedding rotary(p.at("rotary"),p.at("maximum"),p.value("base",1e7),
             p.value("sections",std::vector<int64_t>{}),p.value("interleaved",false));
         return {rotary.forward(a.at(0),a.at(1))};
     }
@@ -231,7 +231,7 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
             auto weight=a.at(index);
             return [weight](CudaExecutionContext&, const Tensor& x) {return matmul(x.to(weight.scalar_type()),weight.transpose(-1,-2));};
         };
-        auto rotary=std::make_shared<mfq::cuda::qwen4_exp::Rotary>(p.at("rotary"),p.at("maximum"),p.value("base",1e7),
+        auto rotary=std::make_shared<mfq::cuda::RotaryEmbedding>(p.at("rotary"),p.at("maximum"),p.value("base",1e7),
             p.value("sections",std::vector<int64_t>{}),p.value("interleaved",false));
         mfq::cuda::qwen4_exp::QsaWeights weights{linear(1),linear(2),linear(3),linear(4),linear(5),a.at(6),a.at(7),a.at(8),a.at(9)};
         mfq::cuda::qwen4_exp::QsaConfig config{p.at("heads"),p.at("kv_heads"),p.at("width"),p.at("index_heads"),

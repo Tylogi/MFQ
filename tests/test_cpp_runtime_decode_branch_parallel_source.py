@@ -23,6 +23,13 @@ def test_decode_branch_parallelism_is_decode_only_and_graph_safe() -> None:
     assert "capture_status != cudaStreamCaptureStatusNone" in SOURCE
 
 
+def test_runtime_parallelizes_important_neuron_branches_only_for_decode() -> None:
+    source = (CUDA_ROOT / "core/ffn.cpp").read_text(encoding="utf-8")
+    branch = source.split("if (allow_important_neurons && important_neurons)", 1)[1]
+    branch = branch.split("if (tensor_parallel_dense_compatible())", 1)[0]
+    assert "decode_branch_parallel_enabled(execution.config,execution.decode_graph_serial_branches,rows)&&" in "".join(branch.split())
+
+
 def test_incompatible_projection_groups_use_the_common_executor() -> None:
     assert "split_w.size()," in SOURCE
     assert "layers.size() - 1," in SOURCE

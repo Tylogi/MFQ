@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -153,20 +152,3 @@ def test_important_neuron_asset_is_deterministic() -> None:
     second = _indices_asset(indices, 3)
     assert first == second
     assert first[:4] == b"IN01"
-
-
-def test_runtime_parallelizes_in_branches_only_for_decode() -> None:
-    source = (
-        Path(__file__).parents[1]
-        / "cpp_runtime" / "backends" / "cuda" / "models" / "transformer.cpp"
-    ).read_text(encoding="utf-8")
-    branch = source[
-        source.index(
-            "if (allow_important_neurons && important_neurons)"
-        ) :
-    ]
-    branch = branch[: branch.index("if (tensor_parallel_dense_compatible())")]
-    assert (
-        "decode_branch_parallel_enabled(execution.decode_graph_serial_branches, rows) &&"
-        in branch
-    )

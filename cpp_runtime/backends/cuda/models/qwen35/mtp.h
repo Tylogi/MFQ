@@ -3,7 +3,7 @@
 #include "storage/weight_loader.h"
 
 #include "../mtp.h"
-#include "models/full_block.h"
+#include "core/full_block.h"
 #include "models/qwen35/causal_lm.h"
 #include "ops.h"
 

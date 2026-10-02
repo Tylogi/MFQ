@@ -10,7 +10,7 @@
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"
 #include "models/deepseek_v41/config.h"
-#include "models/ffn.h"
+#include "core/ffn.h"
 
 #include <algorithm>
 #include <array>

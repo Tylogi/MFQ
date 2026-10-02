@@ -3,7 +3,7 @@
 #include "../session_codec_impl.h"
 #include "linear_attention.h"
 
-#include "models/transformer.h"
+#include "storage/transformer_loader.h"
 
 namespace mfq::cuda::qwen35 {
 namespace {
