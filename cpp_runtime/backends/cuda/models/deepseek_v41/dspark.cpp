@@ -1,3 +1,4 @@
+#include "storage/weight_loader.h"
 #include "dspark.h"
 
 #include "../causal_ops.h"

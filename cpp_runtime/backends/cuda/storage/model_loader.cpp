@@ -1,3 +1,4 @@
+#include "storage/weight_loader.h"
 #include "models/causal_models.h"
 
 #include "cuda_execution.h"

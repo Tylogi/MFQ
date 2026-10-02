@@ -1,3 +1,4 @@
+#include "storage/weight_loader.h"
 #include "registry.h"
 
 #include <fstream>

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <ostream>
+#include <string>
 
 class MoeExpertCache;
 struct CudaExecutionConfig;
@@ -24,3 +25,16 @@ void print_moe_expert_cache_stats(
 void set_moe_expert_cache_profile(
     MoeExpertCache& cache,
     mfq::MoeCacheProfile profile);
+
+struct MfeWeight;
+struct MixedMoeRuntime;
+namespace mfq::cuda { class MfeMxfp4ExpertStore; }
+
+MfeWeight cache_moe_weight(
+    const std::shared_ptr<MoeExpertCache>& cache,
+    const std::string& name,
+    const std::shared_ptr<MixedMoeRuntime>& runtime,
+    int minimum_slots,
+    int layer_id,
+    const std::string& projection_role,
+    std::shared_ptr<mfq::cuda::MfeMxfp4ExpertStore> range_store = {});

@@ -376,3 +376,24 @@ struct MfeWeight {
     }
 };
 
+
+MoeRoutePlan build_moe_route_plan(
+    mfq_tensor_backend::Tensor ids, int n_experts);
+
+MfeWeight cpu_mixed_moe_metadata(
+    const std::shared_ptr<MixedMoeRuntime>& runtime);
+
+MfeWeight stage_cpu_mixed_moe(
+    const std::shared_ptr<MixedMoeRuntime>& runtime,
+    const CudaExecutionConfig& config = {});
+
+bool prefetch_cached_moe_projection_bundle(
+    const MfeWeight& gate,
+    const MfeWeight& up,
+    const MfeWeight& down,
+    const MoeRoutePlan& route);
+
+bool prefetch_cached_moe_projection_bundle(
+    const MfeWeight& gate_up,
+    const MfeWeight& down,
+    const MoeRoutePlan& route);

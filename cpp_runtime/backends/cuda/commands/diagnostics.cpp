@@ -1,3 +1,6 @@
+#include "models/qwen4_exp/mtp.h"
+#include "models/glm5_next/mtp.h"
+#include "storage/weight_loader.h"
 #include "cli.h"
 #include "diagnostics/token_generation.h"
 #include "engine/model_loader.h"

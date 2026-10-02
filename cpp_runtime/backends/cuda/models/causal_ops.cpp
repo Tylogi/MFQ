@@ -1,3 +1,4 @@
+#include "storage/weight_loader.h"
 #include "causal_ops.h"
 #include "full_block.h"
 #include "session_state.h"

@@ -10,8 +10,13 @@
 #include "models/qwen35/linear_attention.h"
 #include "models/qwen35/ops.h"
 #include "models/session_state.h"
+#include "moe.h"
+#include "storage/mfe_expert_store.h"
+#include "storage/moe_expert_cache.h"
+#include "storage/weight_loader.h"
 
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -22,6 +27,139 @@ using namespace mfq::cuda::internal;
 static void check(bool ok, const char *message) {
     if (!ok)
         throw std::runtime_error(message);
+}
+
+static void check_dense_loading() {
+    using namespace mfq_tensor_backend;
+    struct Source final : mfq::ModelSource {
+        std::vector<uint8_t> bytes;
+        std::vector<mfq::TensorMetadata> records{{"weight", "F32", "F32", std::nullopt, 0}};
+        std::vector<std::filesystem::path> paths;
+        std::unordered_map<std::string, std::string> meta;
+        std::vector<std::string> asset_names;
+        const std::vector<std::filesystem::path>& source_paths() const noexcept override { return paths; }
+        std::string_view architecture() const noexcept override { return {}; }
+        const std::unordered_map<std::string, std::string>& metadata() const noexcept override { return meta; }
+        const std::vector<mfq::TensorMetadata>& tensors() const noexcept override { return records; }
+        const mfq::TensorMetadata* find_tensor(std::string_view name) const noexcept override {
+            return name == "weight" ? &records[0] : nullptr;
+        }
+        void read_range_into(std::string_view, uint64_t offset, std::byte* output, size_t size) const override {
+            check(offset <= bytes.size() && size <= bytes.size() - offset, "dense fixture range");
+            if (size) std::memcpy(output, bytes.data() + offset, size);
+        }
+        const std::vector<std::string>& assets() const noexcept override { return asset_names; }
+        bool has_asset(std::string_view) const noexcept override { return false; }
+        std::vector<std::byte> read_asset(std::string_view) const override { throw std::runtime_error("no assets"); }
+        std::optional<mfq::ModelGraph> model_graph() const override { return std::nullopt; }
+    } source;
+    CudaExecutionContext execution;
+    const uint32_t rank = 2;
+    const int64_t shape[] = {2, 2};
+    const size_t header = sizeof(rank) + sizeof(shape);
+    auto same = [](Tensor value, const Tensor &expected) {
+        value = value.cpu().contiguous();
+        return value.scalar_type() == expected.scalar_type() && value.sizes() == expected.sizes() &&
+               std::memcmp(value.data_ptr(), expected.data_ptr(), expected.nbytes()) == 0;
+    };
+    for (const auto &[name, dtype] : std::vector<std::pair<std::string, ScalarType>>{
+             {"BF16", kBFloat16}, {"F16", kFloat16}, {"F32", kFloat32}, {"I64", kInt64}, {"I32", kInt32}}) {
+        const auto expected = tensor(std::vector<float>{-3.25, 0, 1.125, 7}).reshape({2, 2}).to(dtype);
+        source.records[0].dtype = name;
+        source.bytes.resize(header + expected.nbytes());
+        std::memcpy(source.bytes.data(), &rank, sizeof(rank));
+        std::memcpy(source.bytes.data() + sizeof(rank), shape, sizeof(shape));
+        std::memcpy(source.bytes.data() + header, expected.data_ptr(), expected.nbytes());
+        source.records[0].nbytes = source.bytes.size();
+        auto native = load_dense_native_gpu(execution, source, "weight");
+        check(same(native, expected), "dense native dtype/value changed");
+        const auto promoted = name == "BF16" || name == "F16" ? kFloat32 : dtype;
+        for (bool cpu_layer : {false, true}) {
+            execution.loading_cpu_layer = cpu_layer;
+            auto value = load_dense_gpu(execution, source, "weight");
+            check(value.is_cuda() != cpu_layer && value.scalar_type() == promoted &&
+                      same(value, expected.to(promoted)), "dense load placement/promotion changed");
+        }
+    }
+    const auto valid = source.bytes;
+    auto rejects = [&] {
+        source.records[0].nbytes = source.bytes.size();
+        bool rejected = false;
+        try { (void)load_dense_cpu(execution, source, "weight"); }
+        catch (const std::exception&) { rejected = true; }
+        check(rejected, "malformed dense tensor accepted");
+    };
+    for (size_t size : {size_t(0), size_t(3), header - 1, valid.size() - 1}) {
+        source.bytes = valid;
+        source.bytes.resize(size);
+        rejects();
+    }
+    for (int64_t extent : {int64_t(-1), std::numeric_limits<int64_t>::max()}) {
+        source.bytes = valid;
+        std::memcpy(source.bytes.data() + sizeof(rank), &extent, sizeof(extent));
+        rejects();
+    }
+}
+
+static void check_cached_moe_binding() {
+    using namespace mfq_tensor_backend;
+    MfeCpu cpu;
+    cpu.n_experts = 2;
+    cpu.out_per_expert = 4;
+    cpu.neuron_len = 32;
+    MfeCpuPool pool;
+    pool.dtype = "MXFP4";
+    pool.expert_ids = {0, 1};
+    pool.mxfp4 = {8, 32, std::vector<uint8_t>(128), std::vector<uint8_t>(8, 127)};
+    for (size_t i = 0; i < pool.mxfp4.values.size(); ++i)
+        pool.mxfp4.values[i] = static_cast<uint8_t>(i * 17);
+    cpu.pools.push_back(pool);
+
+    // The same weights exercise host-backed and exact-range cache registration.
+    auto append = [](auto& bytes, uint64_t value, int width) {
+        for (int i = 0; i < width; ++i) bytes.push_back(static_cast<uint8_t>(value >> (8 * i)));
+    };
+    std::vector<uint8_t> payload{'M', 'X', 'T', '1', 1, 4, 0, 0};
+    for (uint64_t value : {8, 32, 8, 16, 8, 1}) append(payload, value, 8);
+    payload.insert(payload.end(), pool.mxfp4.values.begin(), pool.mxfp4.values.end());
+    payload.insert(payload.end(), pool.mxfp4.scales.begin(), pool.mxfp4.scales.end());
+    std::vector<uint8_t> blob{'N', 'I', 'M', '2'};
+    for (uint64_t value : {2, 4, 32, 1, 2, 5}) append(blob, value, 4);
+    append(blob, payload.size(), 8);
+    append(blob, 0, 8);
+    append(blob, 0, 4);
+    append(blob, 1, 4);
+    blob.insert(blob.end(), pool.dtype.begin(), pool.dtype.end());
+    blob.insert(blob.end(), payload.begin(), payload.end());
+    auto store = std::make_shared<MfeMxfp4ExpertStore>(MfqRecordRange{
+        "experts", "MFE", {}, 0, blob.size(),
+        [&blob](uint64_t offset, std::span<uint8_t> output) {
+            check(offset <= blob.size() && output.size() <= blob.size() - offset,
+                  "expert range is out of bounds");
+            std::copy_n(blob.data() + offset, output.size(), output.data());
+        }});
+    CudaExecutionContext execution;
+    const auto resident = to_gpu_mixed_moe(cpu, execution.config);
+    auto options = TensorOptions().device(kCUDA);
+    auto input = (arange(32, options.dtype(kFloat32)) * 0.01 - 0.1)
+                     .to(kFloat16).reshape({1, 32});
+    for (bool ranges : {false, true}) {
+        auto cache = make_moe_expert_cache(1 << 20, execution.config);
+        auto runtime = ranges ? make_mxfp4_range_runtime(*store)
+                              : make_mixed_moe_runtime(cpu, false);
+        auto weight = cache_moe_weight(cache, "experts", runtime, 1, 0, "gate",
+                                       ranges ? store : nullptr);
+        check(moe_expert_cache_has_sources(cache), "MoE source was not registered");
+        finalize_moe_expert_cache(cache);
+        for (int32_t expert : {0, 1, 0}) {
+            auto ids = tensor(std::vector<int32_t>{expert}, options.dtype(kInt32)).reshape({1, 1});
+            auto route = build_moe_route_plan(ids, 2);
+            auto expected = resident.forward(execution, input, route).to(kFloat32);
+            auto actual = weight.forward(execution, input, route).to(kFloat32);
+            check((actual - expected).abs().max().item<float>() == 0,
+                  "cache registration changed expert output");
+        }
+    }
 }
 
 static void check_gemma_composition() {
@@ -352,6 +490,8 @@ int main(int argc, char** argv) try {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     check_linear_execution();
+    check_dense_loading();
+    check_cached_moe_binding();
     check_gemma_composition();
     check_tts_sampling();
     check_ffn_branches();

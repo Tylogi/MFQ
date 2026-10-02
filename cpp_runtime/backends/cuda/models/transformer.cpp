@@ -1,3 +1,4 @@
+#include "storage/weight_loader.h"
 #include "transformer.h"
 
 #include "full_block.h"

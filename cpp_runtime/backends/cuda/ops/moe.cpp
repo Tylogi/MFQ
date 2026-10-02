@@ -1,3 +1,4 @@
+#include "storage/weight_loader.h"
 #include "moe.h"
 
 #include "quant_linear.h"

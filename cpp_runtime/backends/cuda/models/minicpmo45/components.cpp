@@ -1,4 +1,5 @@
 #include "ops.h"
+#include "runtime.h"
 
 #include "cuda_execution.h"
 #include "cuda_sampling.h"
@@ -16,14 +17,21 @@
 
 namespace mfq::cuda::minicpmo45 {
 
-using internal::PrefillCudaTimer;
+struct Components::State {
+    MiniCPMO45Runtime runtime;
+    std::optional<MiniCPMO45DuplexSession> duplex_session;
+
+    explicit State(mfq::cuda::MiniCPMO45CausalLm language)
+        : runtime(MiniCPMO45Runtime::load_with_language(std::move(language))) {}
+};
 
 Components::Components(mfq::cuda::MiniCPMO45CausalLm language)
-    : runtime_(MiniCPMO45Runtime::load_with_language(
-          std::move(language))) {}
+    : state_(std::make_unique<State>(std::move(language))) {}
+
+Components::~Components() = default;
 
 mfq::cuda::MiniCPMO45CausalLm& Components::language() noexcept {
-    return runtime_.language;
+    return state_->runtime.language;
 }
 
 CudaPreparedPrompt Components::prepare(
@@ -79,7 +87,7 @@ CudaPreparedPrompt Components::prepare(
     }
 
 
-    auto result = runtime_.encode(input_ids, pixels, patch_mask,
+    auto result = state_->runtime.encode(input_ids, pixels, patch_mask,
         target_sizes, image_bounds, audio_features, audio_lengths, audio_bounds);
     CudaPreparedPrompt prepared;
     prepared.token_ids = prompt;
@@ -99,7 +107,7 @@ void Components::start(const MfqDuplexSessionParams& parameters) {
                 parameters.top_k < 0 ||
                 parameters.top_k >
                     std::min<int64_t>(
-                        runtime_.language.vocab_size(), 1024) ||
+                        state_->runtime.language.vocab_size(), 1024) ||
                 !std::isfinite(parameters.top_p) ||
                 parameters.top_p <= 0.0 || parameters.top_p > 1.0 ||
                 !std::isfinite(parameters.listen_probability_scale) ||
@@ -123,14 +131,14 @@ void Components::start(const MfqDuplexSessionParams& parameters) {
                     parameters.special_ids.end() - 1,
                     [&](int64_t token) {
                         return token < 0 ||
-                            token >= runtime_.language.vocab_size();
+                            token >= state_->runtime.language.vocab_size();
                     }) ||
                 std::any_of(
                     parameters.forbidden_ids.begin(),
                     parameters.forbidden_ids.end(),
                     [&](int64_t token) {
                         return token < 0 ||
-                            token >= runtime_.language.vocab_size();
+                            token >= state_->runtime.language.vocab_size();
                     })) {
             throw std::invalid_argument(
                 "MiniCPM-o duplex token ID is out of range");
@@ -148,27 +156,27 @@ void Components::start(const MfqDuplexSessionParams& parameters) {
         }
 
         MfqCudaGuard guard(
-            runtime_.language.execution->layer_placement.primary_device());
+            state_->runtime.language.execution->layer_placement.primary_device());
         mfq_tensor_backend::manual_seed(static_cast<int64_t>(parameters.seed));
         mfq_cuda_manual_seed_all(parameters.seed);
         auto special_ids = MiniCPMO45DuplexSpecialIds::from_tensor(
             mfq_tensor_backend::tensor(
                 parameters.special_ids,
                 mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64)));
-        duplex_session_.reset();
-        duplex_session_.emplace(
-            runtime_, special_ids, parameters.forbidden_ids,
+        state_->duplex_session.reset();
+        state_->duplex_session.emplace(
+            state_->runtime, special_ids, parameters.forbidden_ids,
             parameters.greedy);
-        duplex_session_->temperature = parameters.temperature;
-        duplex_session_->top_k = parameters.top_k;
-        duplex_session_->top_p = parameters.top_p;
-        duplex_session_->listen_probability_scale =
+        state_->duplex_session->temperature = parameters.temperature;
+        state_->duplex_session->top_k = parameters.top_k;
+        state_->duplex_session->top_p = parameters.top_p;
+        state_->duplex_session->listen_probability_scale =
             parameters.listen_probability_scale;
-        duplex_session_->repetition_penalty = parameters.repetition_penalty;
-        duplex_session_->repetition_window = parameters.repetition_window;
-        duplex_session_->length_penalty = parameters.length_penalty;
-        duplex_session_->tts_temperature = parameters.tts_temperature;
-        duplex_session_->tts_repetition_penalty =
+        state_->duplex_session->repetition_penalty = parameters.repetition_penalty;
+        state_->duplex_session->repetition_window = parameters.repetition_window;
+        state_->duplex_session->length_penalty = parameters.length_penalty;
+        state_->duplex_session->tts_temperature = parameters.tts_temperature;
+        state_->duplex_session->tts_repetition_penalty =
             parameters.tts_repetition_penalty;
 
         const auto ids_tensor = [](const std::vector<int64_t> & values) {
@@ -185,7 +193,7 @@ void Components::start(const MfqDuplexSessionParams& parameters) {
                 mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32))
                 .reshape({1, 80, parameters.reference_audio_frames});
         }
-        duplex_session_->prepare(
+        state_->duplex_session->prepare(
             ids_tensor(parameters.system_prefix),
             reference_features,
             ids_tensor(parameters.system_suffix));
@@ -210,10 +218,10 @@ MfqDuplexStepResult Components::step(const MfqDuplexStepInput& input) {
         }
 
         MfqCudaGuard guard(
-            runtime_.language.execution->layer_placement.primary_device());
-        if (!duplex_session_) {
+            state_->runtime.language.execution->layer_placement.primary_device());
+        if (!state_->duplex_session) {
             throw std::runtime_error(
-                "MiniCPM-o duplex duplex_session_ is not prepared");
+                "MiniCPM-o duplex session is not prepared");
         }
         mfq_tensor_backend::Tensor audio_features;
         if (has_audio) {
@@ -230,7 +238,7 @@ MfqDuplexStepResult Components::step(const MfqDuplexStepInput& input) {
                 .reshape({1, static_cast<int64_t>(input.text_tokens.size())});
         }
         const auto started = std::chrono::steady_clock::now();
-        auto result = duplex_session_->run_step(
+        auto result = state_->duplex_session->run_step(
             {}, {}, {}, {}, audio_features,
             input.audio_prefix_extra_frames,
             input.audio_suffix_extra_frames,
@@ -253,10 +261,10 @@ MfqDuplexStepResult Components::step(const MfqDuplexStepInput& input) {
         response.is_listen = result.is_listen;
         response.end_of_turn = result.end_of_turn;
         response.tts_force_flush = result.tts_force_flush;
-        response.audio_chunk_index = duplex_session_->audio_chunk_index;
-        response.language_cache_position = runtime_.language.cache_pos;
-        response.audio_cache_position = runtime_.audio.cache_length();
-        response.tts_cache_position = runtime_.tts.cache_position;
+        response.audio_chunk_index = state_->duplex_session->audio_chunk_index;
+        response.language_cache_position = state_->runtime.language.cache_pos;
+        response.audio_cache_position = state_->runtime.audio.cache_length();
+        response.tts_cache_position = state_->runtime.tts.cache_position;
         response.inference_ms =
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - started).count();
@@ -265,11 +273,11 @@ MfqDuplexStepResult Components::step(const MfqDuplexStepInput& input) {
 
 void Components::stop() {
         MfqCudaGuard guard(
-            runtime_.language.execution->layer_placement.primary_device());
-        duplex_session_.reset();
-        runtime_.language.reset(1);
-        runtime_.audio.reset();
-        runtime_.tts.reset(1);
+            state_->runtime.language.execution->layer_placement.primary_device());
+        state_->duplex_session.reset();
+        state_->runtime.language.reset(1);
+        state_->runtime.audio.reset();
+        state_->runtime.tts.reset(1);
         mfq_cuda_synchronize();
 }
 } // namespace mfq::cuda::minicpmo45

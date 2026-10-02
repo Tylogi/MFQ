@@ -1,20 +1,12 @@
 #pragma once
 
 #include "../causal_ops.h"
-#include "layers.h"
 #include "models/block.h"
 #include "models/glm5_next/causal_lm.h"
 #include "models/glm5_next/config.h"
 #include "quant_linear.h"
 
 #include <memory>
-
-namespace mfq::cuda::glm5_next {
-
-std::unique_ptr<::Block> load_block(CudaExecutionContext &execution, const mfq::ModelSource &source,
-                                    const mfq::models::glm5_next::Config &config, int layer);
-
-} // namespace mfq::cuda::glm5_next
 
 namespace mfq::cuda {
 

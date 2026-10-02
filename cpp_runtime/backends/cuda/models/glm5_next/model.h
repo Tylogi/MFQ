@@ -1,9 +1,18 @@
 #pragma once
 #include "models/glm5_next/causal_lm.h"
-#include "runtime.h"
+#include "../attention_ops.h"
+#include "mfq/kernels/cuda/glm5_next.h"
 #include <array>
 
 namespace mfq::cuda::glm5_next {
+namespace tb = mfq_tensor_backend;
+using attention_ops::Tensor;
+using attention_ops::Linear;
+using attention_ops::Embedding;
+using attention_ops::rms_norm;
+using attention_ops::SequenceCache;
+using attention_ops::select_pooled_blocks;
+
 struct KdaWeights {
     Linear query, key, value, beta, gate_a, gate_b, output;
     Tensor conv, forget_a, forget_b, dt_bias, a_log, output_norm;

@@ -6,6 +6,6 @@
 #include "gemma4/ops.h"
 #include "glm5_next/ops.h"
 #include "glm_dsa/ops.h"
-#include "minicpmo45/architecture.h"
+#include "minicpmo45/ops.h"
 #include "qwen35/ops.h"
 #include "qwen4_exp/ops.h"

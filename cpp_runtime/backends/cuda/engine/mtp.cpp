@@ -22,6 +22,14 @@
 
 using mfq::cuda::internal::PrefillCudaTimer;
 
+mfq_tensor_backend::Tensor MtpTarget::embed(mfq_tensor_backend::Tensor ids) const {
+    return std::visit([&](auto* target) { return target->embed_forward(std::move(ids)); }, model);
+}
+
+mfq_tensor_backend::Tensor MtpTarget::logits(mfq_tensor_backend::Tensor hidden) const {
+    return std::visit([&](auto* target) { return target->logits_from_hidden(std::move(hidden)); }, model);
+}
+
 using mfq::engine::Generation;
 using namespace mfq::engine;
 template <class Model> struct CudaMtpOps {

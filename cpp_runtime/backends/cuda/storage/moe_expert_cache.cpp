@@ -902,107 +902,21 @@ bool prefetch_cached_moe_projection_bundle(
         {gate_up.cached_source, down.cached_source}, route);
 }
 
-MfeWeight load_mfe_gpu(
-        CudaExecutionContext& execution,
-        const mfq::ModelSource & mfq, const std::string & name,
-        bool cacheable,
+MfeWeight cache_moe_weight(
+        const std::shared_ptr<MoeExpertCache>& cache,
+        const std::string& name,
+        const std::shared_ptr<MixedMoeRuntime>& runtime,
+        int minimum_slots,
         int layer_id,
-        const std::string & projection_role) {
-    auto& cache = execution.moe_expert_cache;
-    if (cache && cacheable &&
-            !moe_parallel_config(execution).enabled() &&
-            execution.config.moe_ssd_ranges) {
-        const auto & record = require_tensor(mfq, name);
-        try {
-            auto store =
-                std::make_shared<mfq::cuda::MfeMxfp4ExpertStore>(
-                    mfq::cuda::MfqRecordRange{
-                        name,
-                        record.dtype,
-                        {},
-                        0,
-                        record.nbytes,
-                        [&mfq, name](
-                                std::uint64_t offset,
-                                std::span<std::uint8_t> destination) {
-                            mfq.read_range_into(
-                                name,
-                                offset,
-                                reinterpret_cast<std::byte*>(destination.data()),
-                                destination.size());
-                        },
-                    });
-            auto runtime = make_mxfp4_range_runtime(*store);
-            auto source = cache->register_range_source(
-                name,
-                runtime,
-                std::move(store),
-                std::min(
-                    execution.moe_cache_registration_min_slots,
-                    runtime->n_experts),
-                layer_id,
-                projection_role);
-            return wrap_cached_moe_source(source, runtime);
-        } catch (const mfq::cuda::MfeMxfp4Unsupported &) {
-        }
-    }
-    auto cpu = load_mfe_cpu(mfq, name);
-    const bool has_matrix_local_sq = std::any_of(
-        cpu.pools.begin(), cpu.pools.end(), [](const MfeCpuPool & pool) {
-            return pool.dtype == "MXFP4-SQ" ||
-                mfq::fp8sq::is_dtype(pool.dtype);
-        });
-    if (moe_parallel_config(execution).enabled()) {
-        auto slices = plan_moe_expert_parallel_slices(
-            moe_parallel_config(execution), cpu.n_experts, name);
-        MfeWeight result;
-        result.n_experts = cpu.n_experts;
-        result.out_per_expert =
-            cpu.out_per_expert;
-        result.neuron_len =
-            cpu.neuron_len;
-        for (const auto & slice : slices) {
-            auto shard =
-                std::make_shared<MfeWeight>(
-                    to_cuda_device_moe_expert_slice(
-                        cpu, slice.begin,
-                        slice.end,
-                        slice.device,
-                        execution.config));
-            result.expert_parallel_shards.push_back({
-                slice.device,
-                slice.begin,
-                slice.end,
-                std::move(shard),
-            });
-        }
-        return result;
-    }
-    if (cache && cacheable && !has_matrix_local_sq) {
-        auto runtime =
-            make_mixed_moe_runtime(cpu, false);
-        auto source = cache->register_source(
-            name, runtime,
-            std::min(
-                execution.moe_cache_registration_min_slots,
-                runtime->n_experts),
-            layer_id,
-            projection_role);
-        return wrap_cached_moe_source(source, runtime);
-    }
-    const bool all_nint = std::all_of(
-        cpu.pools.begin(), cpu.pools.end(), [](const MfeCpuPool & pool) {
-            return pool.dtype == "NINT";
-        });
-    return all_nint
-        ? to_gpu_mfe(cpu)
-        : to_gpu_mixed_moe(cpu, execution.config);
+        const std::string& projection_role,
+        std::shared_ptr<mfq::cuda::MfeMxfp4ExpertStore> range_store) {
+    auto source = range_store
+        ? cache->register_range_source(name, runtime, std::move(range_store),
+                                       minimum_slots, layer_id, projection_role)
+        : cache->register_source(name, runtime, minimum_slots, layer_id, projection_role);
+    return wrap_cached_moe_source(source, runtime);
 }
 
-std::shared_ptr<MixedMoeRuntime> load_mfe_cpu_offloaded(
-        const mfq::ModelSource & mfq, const std::string & name) {
-    return make_mixed_moe_runtime(load_mfe_cpu(mfq, name), false);
-}
 std::shared_ptr<MoeExpertCache> make_moe_expert_cache(
         std::int64_t bytes,
         const CudaExecutionConfig& config) {

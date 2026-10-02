@@ -5,10 +5,6 @@
 #include "models/mtp.h"
 #include "models/grid_vision_component.h"
 #include "cuda_runtime_config.h"
-#include "models/deepseek_v41/dspark.h"
-#include "models/glm5_next/mtp.h"
-#include "models/qwen4_exp/mtp.h"
-#include "models/qwen35/mtp.h"
 
 #include <memory>
 #include <optional>

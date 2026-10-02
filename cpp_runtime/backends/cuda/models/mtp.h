@@ -3,7 +3,7 @@
 #include "session_state.h"
 #include "mtp_policy.h"
 #include "mfq_tensor_backend.h"
-#include "causal_models.h"
+#include "causal_ops.h"
 
 #include <cstdint>
 #include <variant>
@@ -19,12 +19,8 @@ struct MtpTarget {
         mfq::cuda::DeepseekV4CausalLm*, mfq::cuda::DeepseekV41CausalLm*> model;
     const RopeCache* rope = nullptr;
     template <class Model> explicit MtpTarget(Model& target) : model(&target), rope(&target.rope) {}
-    mfq_tensor_backend::Tensor embed(mfq_tensor_backend::Tensor ids) const {
-        return std::visit([&](auto* target) { return target->embed_forward(std::move(ids)); }, model);
-    }
-    mfq_tensor_backend::Tensor logits(mfq_tensor_backend::Tensor hidden) const {
-        return std::visit([&](auto* target) { return target->logits_from_hidden(std::move(hidden)); }, model);
-    }
+    mfq_tensor_backend::Tensor embed(mfq_tensor_backend::Tensor ids) const;
+    mfq_tensor_backend::Tensor logits(mfq_tensor_backend::Tensor hidden) const;
 };
 
 struct MtpStep {

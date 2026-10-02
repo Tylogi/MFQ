@@ -1,3 +1,4 @@
+#include "storage/weight_loader.h"
 #include "model_checks.h"
 
 #include "../models/registry.h"

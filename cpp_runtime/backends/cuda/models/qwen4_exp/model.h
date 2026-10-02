@@ -1,7 +1,8 @@
 #pragma once
 #include "models/qwen4_exp/causal_lm.h"
 #include "models/qwen4_exp/ngram.h"
-#include "runtime.h"
+#include "../attention_ops.h"
+#include "mfq/kernels/cuda/qwen4_exp.h"
 #include <array>
 #include <cstring>
 #include <memory>
@@ -9,6 +10,14 @@
 #include <set>
 
 namespace mfq::cuda::qwen4_exp {
+namespace tb = mfq_tensor_backend;
+using attention_ops::Tensor;
+using attention_ops::Linear;
+using attention_ops::Embedding;
+using attention_ops::rms_norm;
+using attention_ops::SequenceCache;
+using attention_ops::select_pooled_blocks;
+
 
 struct GdnWeights {
     Linear qkv, gate, alpha, beta, output;

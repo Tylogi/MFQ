@@ -1,5 +1,7 @@
 #pragma once
 
+#include "storage/weight_loader.h"
+
 #include "mfe_expert_store.h"
 #include "models/deepseek_v41/config.h"
 #include "cpp_runtime/models/deepseek_v41/engram.h"

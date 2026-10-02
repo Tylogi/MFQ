@@ -1,6 +1,9 @@
 #pragma once
 
+#include "storage/weight_loader.h"
+
 #include "audio.h"
+#include <random>
 #include "generation_policy.h"
 #include "sampling.h"
 #include "models/full_block.h"

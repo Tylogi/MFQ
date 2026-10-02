@@ -3,8 +3,7 @@
 #include "storage/moe_expert_cache.h"
 
 #include "cuda_execution.h"
-#include "mixed_moe.h"
-#include "quant_linear.h"
+#include "moe.h"
 #include "mfe_expert_store.h"
 #include "moe_cache_policy.h"
 #include "moe_cache_transfer.h"

@@ -257,10 +257,10 @@ std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, con
         }
         return out;
     }
-    if (op == "runtime_select_pooled_blocks") return {mfq::cuda::qwen4_exp::select_pooled_blocks(
+    if (op == "runtime_select_pooled_blocks") return {mfq::cuda::attention_ops::select_pooled_blocks(
         a.at(0), p.at("query_offset"), p.at("logical_length"), p.at("pool"), p.at("budget"), p.at("tail"))};
     if (op == "runtime_sequence_cache") {
-        mfq::cuda::qwen4_exp::SequenceCache cache(p.at("maximum"), a.at(0).size(-1));
+        mfq::cuda::attention_ops::SequenceCache cache(p.at("maximum"), a.at(0).size(-1));
         std::vector<Tensor> out;
         for (const auto& step : p.at("steps")) {
             if (step.contains("truncate")) cache.truncate(step.at("truncate"));

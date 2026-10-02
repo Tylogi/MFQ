@@ -309,6 +309,7 @@ set(MFQ_CUDA_LOADING_SOURCES
     ${MFQ_CUDA_ROOT}/engine/options.cpp
     ${MFQ_CUDA_ROOT}/storage/model_loader.cpp
     ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp
+    ${MFQ_CUDA_ROOT}/storage/weight_loader.cpp
 )
 add_library(mfq-cuda-loading OBJECT ${MFQ_CUDA_LOADING_SOURCES})
 mfq_configure_cuda_runtime_target(mfq-cuda-loading)
@@ -542,6 +543,7 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         ${MFQ_CUDA_ROOT}/storage/model_loader.cpp
         ${MFQ_CUDA_ROOT}/engine/mtp.cpp
         ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp
+        ${MFQ_CUDA_ROOT}/storage/weight_loader.cpp
         ${MFQ_CUDA_ROOT}/engine/components.cpp
         ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
         ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu

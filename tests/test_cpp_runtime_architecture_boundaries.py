@@ -220,24 +220,21 @@ def test_cuda_format_operators_only_receive_the_profiler() -> None:
 
 
 def test_cuda_leaf_ops_receive_only_their_required_resources() -> None:
-    quant_common = (CUDA_OPS / "include" / "quant_linear_common.h").read_text(
-        encoding="utf-8"
-    )
-    mixed_moe = (CUDA_OPS / "include" / "mixed_moe.h").read_text(
-        encoding="utf-8"
-    )
-    nint_group = (CUDA_OPS / "include" / "nint_linear_group.h").read_text(
-        encoding="utf-8"
-    )
+    quant = (CUDA_OPS / "include/quant_linear.h").read_text()
+    mixed_moe = (CUDA_OPS / "include/moe.h").read_text()
     moe_types = (CUDA_OPS / "include" / "moe_types.h").read_text(
         encoding="utf-8"
     )
 
-    assert "CudaExecutionContext" not in quant_common
     assert "CudaExecutionContext" not in mixed_moe
+    nint_group = quant.split("struct NintLinearGroup {", 1)[1].split("};", 1)[0]
     assert "CudaExecutionContext" not in nint_group
-    assert "CudaProfiler& profiler, KlMmqState& kl_mmq" in quant_common
-    assert "ModelParallelCollectiveRuntime& collectives" in quant_common
+    for helper, resource in (("run_nint_linear", "CudaProfiler& profiler, KlMmqState& kl_mmq"),
+                             ("run_nvq_linear", "CudaProfiler& profiler, KlMmqState& kl_mmq"),
+                             ("tensor_to_cuda_device", "ModelParallelCollectiveRuntime& collectives")):
+        signature = quant.split(helper, 1)[1].split(");", 1)[0]
+        assert resource in signature
+        assert "CudaExecutionContext" not in signature
     for helper in ("moe_tensor_to_device", "moe_route_to_device"):
         signature = moe_types.split(helper, 1)[1].split(");", 1)[0]
         assert "ModelParallelCollectiveRuntime& collectives" in signature
@@ -245,20 +242,21 @@ def test_cuda_leaf_ops_receive_only_their_required_resources() -> None:
 
 
 def test_cuda_quant_runtime_implementations_stay_out_of_headers() -> None:
-    headers = {
-        "mixed_moe.h": 220,
-        "quant_linear_groups.h": 170,
-        "quant_linear_weight.h": 120,
-    }
-    for name, limit in headers.items():
-        source = (CUDA_OPS / "include" / name).read_text(encoding="utf-8")
-        assert len(source.splitlines()) < limit
-
     moe = (CUDA_OPS / "moe.cpp").read_text(encoding="utf-8")
     quant = (CUDA_OPS / "quant_linear.cpp").read_text(encoding="utf-8")
     assert "MixedMoeRuntime::forward(" in moe
     assert "QuantLinear::forward(" in quant
     assert "QuantLinearGroup::forward(" in quant
+    assert "NintLinearGroup::forward(" in quant
+    header = (CUDA_OPS / "include/quant_linear.h").read_text()
+    loader = (CUDA_OPS.parent / "storage/weight_loader.h").read_text()
+    cache = (CUDA_OPS.parent / "storage/moe_expert_cache.cpp").read_text()
+    for function in ("load_quant_linear(", "load_mfe_gpu(", "load_quant_group("):
+        assert function in loader
+        assert function not in header
+        assert function not in cache
+    assert "MoeRoutePlan" not in header
+
 
 
 def test_cuda_transformer_header_stays_declarative() -> None:
@@ -557,7 +555,8 @@ def test_cuda_model_finalizers_live_with_their_models() -> None:
         namespace = "deepseek_v41_runtime" if name == "deepseek_v41" else name
         assert f"{namespace}::finalize_hidden" not in CUDA_CAUSAL_LM_SOURCE
         if name == "qwen4_exp":
-            assert f"{namespace}::finalize_hidden" in source
+            assert "Qwen4Model::adapter_finalize_hidden(" in source
+            assert "return final_mixer->pre(hidden)[0];" in source
         else:
             shared = (ROOT / "cpp_runtime/models" / name / "causal_lm.h").read_text(encoding="utf-8")
             assert shared.index("this->collapse_hidden(") < shared.index("this->normalize_hidden(")
@@ -1334,9 +1333,10 @@ def test_each_family_owns_its_causal_model_and_forward_definition() -> None:
 
 def test_cuda_family_layers_and_offline_generation_use_shared_flows() -> None:
     for family in ("qwen4_exp", "glm5_next"):
-        source = (CUDA_MODELS / family / "layers.h").read_text(encoding="utf-8")
+        source = (CUDA_MODELS / family / "ops.cpp").read_text(encoding="utf-8")
         assert f"mfq::models::{family}::decoder_layer(" in source
         assert "mfq::models::hyperconnection_layer(" not in source
+        assert "mfq::models::gated_mlp(" in source
     source = (CUDA_MODELS / "deepseek_v41/ops.h").read_text(encoding="utf-8")
     assert "mfq::models::deepseek_v41::decoder_layer(" in source
     assert "mfq::models::deepseek_v41::mega_layer(" in (CUDA_MODELS / "deepseek_v41/dspark.cpp").read_text(encoding="utf-8")
@@ -1344,7 +1344,7 @@ def test_cuda_family_layers_and_offline_generation_use_shared_flows() -> None:
     assert "mfq::engine::generate_tokens(" in tts
     assert "mfq::models::minicpmo45::sample_tts(" in tts
     assert "for (" not in tts
-    evaluation = (CUDA_MODELS / "minicpmo45/ops.cpp").read_text(encoding="utf-8")
+    evaluation = (CUDA_MODELS.parent / "commands/minicpmo45.cpp").read_text(encoding="utf-8")
     assert "mfq::engine::generate_tokens(" in evaluation
     assert "step < max_new_tokens" not in evaluation
     ffn = (CUDA_MODELS / "ffn.cpp").read_text(encoding="utf-8")
@@ -1388,3 +1388,20 @@ def test_shared_models_own_composition_loading_and_input_rules() -> None:
         text = source.read_text()
         assert "mfq_tensor_backend" not in text
         assert '#include "backends/' not in text
+
+
+def test_cuda_model_headers_keep_family_implementation_private() -> None:
+    for family in ("qwen4_exp", "glm5_next", "minicpmo45"):
+        public = (CUDA_MODELS / family / "ops.h").read_text()
+        for private in ("model.h", "layers.h", "runtime.h", "tts.h", "audio.h", "vision.h"):
+            assert f'#include "{private}"' not in public
+    for family in ("qwen4_exp", "glm5_next"):
+        predictor = (CUDA_MODELS / family / "mtp.h").read_text()
+        assert '#include "layers.h"' not in predictor
+        assert "projected_predictor(" not in predictor
+        assert "projected_predictor(" in (CUDA_MODELS / family / "ops.cpp").read_text()
+    mini = "\n".join(p.read_text() for p in (CUDA_MODELS / "minicpmo45").glob("*.[ch]*"))
+    for io in ("std::ifstream", "std::ofstream", "pickle_load(", "pickle_save(", "read_tensor("):
+        assert io not in mini
+    loader = (CUDA_MODELS.parent / "storage/weight_loader.cpp").read_text()
+    assert "load_dense_native_gpu(" in loader and "load_dense_cpu(" in loader

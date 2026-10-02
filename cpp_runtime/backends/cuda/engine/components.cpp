@@ -1,5 +1,9 @@
 #include "components.h"
 
+#include "models/qwen4_exp/mtp.h"
+#include "models/glm5_next/mtp.h"
+#include "models/qwen35/mtp.h"
+#include "models/deepseek_v41/dspark.h"
 #include "models/minicpmo45/ops.h"
 #include "cuda_batching.h"
 #include "generation.h"

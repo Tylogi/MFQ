@@ -1,8 +1,23 @@
 #pragma once
+
+#include "storage/weight_loader.h"
 #include "models/common/transformer_layer.h"
 #include "models/minicpmo45/causal_lm.h"
 
-#include "architecture.h"
+#include "ops.h"
+#include "mfq_cuda_ops.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <optional>
+#include <stdexcept>
+#include <utility>
+
+inline constexpr const char *MINICPMO45_RESAMPLER_POS_EMBED_ASSET =
+    "__mfq_asset__/minicpmo45-resampler-pos-embed-v1.bf16";
 
 struct MiniCPMO45Linear {
     QuantLinear weight;
@@ -39,65 +54,6 @@ struct MiniCPMO45Linear {
         return output.to(output_dtype).contiguous();
     }
 };
-
-inline mfq_tensor_backend::Tensor load_dense_native_gpu(CudaExecutionContext &execution,
-                                                        const mfq::ModelSource &mfq,
-                                                        const std::string &name) {
-    MfqCudaGuard guard(active_weight_load_device(execution));
-    const auto &record = require_tensor(mfq, name);
-    const auto blob = read_tensor(mfq, name);
-    size_t offset = 0;
-    const uint32_t dimensions = read_u32_from(blob, offset);
-    std::vector<int64_t> shape(dimensions);
-    for (uint32_t index = 0; index < dimensions; ++index) {
-        shape[index] = read_i64_from(blob, offset);
-    }
-    mfq_tensor_backend::Tensor value;
-    if (record.dtype == "BF16") {
-        value = mfq_tensor_backend::from_blob(
-                    const_cast<uint8_t *>(blob.data()) + offset, shape,
-                    mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kBFloat16))
-                    .clone();
-    } else if (record.dtype == "F16") {
-        value = mfq_tensor_backend::from_blob(
-                    const_cast<uint8_t *>(blob.data()) + offset, shape,
-                    mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat16))
-                    .clone();
-    } else if (record.dtype == "F32") {
-        value = mfq_tensor_backend::from_blob(
-                    const_cast<uint8_t *>(blob.data()) + offset, shape,
-                    mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32))
-                    .clone();
-    } else if (record.dtype == "I64") {
-        value = mfq_tensor_backend::from_blob(
-                    const_cast<uint8_t *>(blob.data()) + offset, shape,
-                    mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
-                    .clone();
-    } else if (record.dtype == "I32") {
-        value = mfq_tensor_backend::from_blob(
-                    const_cast<uint8_t *>(blob.data()) + offset, shape,
-                    mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
-                    .clone();
-    } else {
-        throw std::runtime_error("MiniCPM-o dense tensor has unsupported dtype: " + name +
-                                 " dtype=" + record.dtype);
-    }
-    return value.to(mfq_tensor_backend::kCUDA).contiguous();
-}
-
-inline void minicpmo45_write_pickle_tensor(const mfq_tensor_backend::Tensor &value,
-                                           const std::string &path) {
-    auto bytes =
-        mfq_tensor_backend::pickle_save(value.detach().to(mfq_tensor_backend::kCPU).contiguous());
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    if (!output) {
-        throw std::runtime_error("failed to create MiniCPM-o tensor file: " + path);
-    }
-    output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-    if (!output) {
-        throw std::runtime_error("failed to write MiniCPM-o tensor file: " + path);
-    }
-}
 
 inline mfq_tensor_backend::Tensor
 minicpmo45_embedding(const QuantLinear &embedding, mfq_tensor_backend::Tensor ids,

@@ -35,6 +35,7 @@ GRAPH = "\n".join(
     for path in (CUDA_ROOT / "models" / "minicpmo45").glob("*")
     if path.suffix in {".h", ".cpp"}
 )
+COMMAND = (CUDA_ROOT / "commands/minicpmo45.cpp").read_text(encoding="utf-8")
 SHARED = "\n".join(p.read_text(encoding="utf-8") for p in (ROOT / "cpp_runtime/models/minicpmo45").glob("*.h"))
 METAL_GRAPH = (ROOT / "cpp_runtime" / "backends" / "metal" / "models/minicpmo45" / "mlx_minicpmo45.cpp").read_text(
     encoding="utf-8"
@@ -127,8 +128,8 @@ def test_minicpmo45_resampler_requires_exact_numpy_position_asset():
 
 
 def test_minicpmo45_supports_native_tensor_files_and_bfloat16_tts():
-    assert "mfq_tensor_backend::pickle_load(bytes)" in GRAPH
-    assert "mfq_tensor_backend::pickle_save(" in GRAPH
+    assert "mfq_tensor_backend::pickle_load(bytes)" in COMMAND
+    assert "mfq_tensor_backend::pickle_save(" in COMMAND
     assert "MFQTNSR1" in (ROOT / "cpp_runtime" / "backends" / "cuda" / "src" / "mfq_native_tensor.cpp").read_text(
         encoding="utf-8"
     )
@@ -149,7 +150,7 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
     assert "MFQ_DISABLE_NATIVE_PARALLEL_F32_MEAN" in (
         ROOT / "cpp_runtime" / "backends" / "cuda" / "src" / "mfq_native_tensor_reduction.cu"
     ).read_text(encoding="utf-8")
-    assert 'rec.dtype == "NINT"' in DECODE
+    assert 'rec.dtype != "NINT"' in DECODE
     assert "dequant_nint_dense_f32(to_gpu_nint(unpack_nint(blob)))" in DECODE
     assert "attention_cache_decode_split_gqa4_d128_part_kernel" in ATTENTION
     assert "mfq_dispatch_bfloat16" in ATTENTION
@@ -219,12 +220,12 @@ def test_minicpmo45_cli_exposes_tensor_fixture_contract():
     assert 'option == "--minicpmo-input-prefix"' in DECODE
     assert 'option == "--minicpmo-output-prefix"' in DECODE
     assert 'option == "--minicpmo-tts-steps"' in DECODE
-    assert 'input_prefix + ".input_ids.pt"' in GRAPH
-    assert 'input_prefix + ".position_ids.pt"' in GRAPH
-    assert 'input_prefix + ".attention_mask.pt"' in GRAPH
-    assert 'output_prefix + ".image_embeddings.pt"' in GRAPH
-    assert 'output_prefix + ".audio_embeddings.pt"' in GRAPH
-    assert 'output_prefix + ".tts_codes.pt"' in GRAPH
+    assert 'input_prefix + ".input_ids.pt"' in COMMAND
+    assert 'input_prefix + ".position_ids.pt"' in COMMAND
+    assert 'input_prefix + ".attention_mask.pt"' in COMMAND
+    assert 'output_prefix + ".image_embeddings.pt"' in COMMAND
+    assert 'output_prefix + ".audio_embeddings.pt"' in COMMAND
+    assert 'output_prefix + ".tts_codes.pt"' in COMMAND
 
 
 def test_minicpmo45_native_duplex_preserves_streaming_caches():
@@ -239,7 +240,7 @@ def test_minicpmo45_native_duplex_preserves_streaming_caches():
     assert "runtime.language.cache_pos" in GRAPH
     assert "runtime.audio.cache_length()" in GRAPH
     assert "runtime.tts.cache_position" in GRAPH
-    assert "session.audio_chunk_index" in GRAPH
+    assert "session.audio_chunk_index" in COMMAND
 
 
 def test_minicpmo45_native_duplex_follows_official_unit_state_machine():
@@ -278,13 +279,13 @@ def test_minicpmo45_cli_exposes_native_duplex_tensor_contract():
     assert 'option == "--minicpmo-duplex-max-speak-tokens"' in DECODE
     assert 'option == "--minicpmo-duplex-seed"' in DECODE
     assert 'option == "--minicpmo-duplex-greedy"' in DECODE
-    assert 'input_prefix + ".special_ids.pt"' in GRAPH
-    assert 'input + ".audio_features.pt"' in GRAPH
-    assert 'input + ".force_listen.pt"' in GRAPH
-    assert 'input + ".reset_session.pt"' in GRAPH
-    assert 'output + ".generated_ids.pt"' in GRAPH
-    assert 'output + ".tts_codes.pt"' in GRAPH
-    assert 'output + ".state.pt"' in GRAPH
+    assert 'input_prefix + ".special_ids.pt"' in COMMAND
+    assert 'input + ".audio_features.pt"' in COMMAND
+    assert 'input + ".force_listen.pt"' in COMMAND
+    assert 'input + ".reset_session.pt"' in COMMAND
+    assert 'output + ".generated_ids.pt"' in COMMAND
+    assert 'output + ".tts_codes.pt"' in COMMAND
+    assert 'output + ".state.pt"' in COMMAND
 
 
 def test_minicpmo45_cuda_server_binds_the_realtime_backend():
@@ -296,13 +297,13 @@ def test_minicpmo45_cuda_server_binds_the_realtime_backend():
     assert "mfq::engine::Engine" not in MINICPM_ENGINE
     assert "bind_runtime" not in CUDA_COMPONENTS
     assert "load_runtime_components(" in CUDA_COMPONENTS
-    assert "runtime_.encode(" in MINICPM_ENGINE
+    assert "state_->runtime.encode(" in MINICPM_ENGINE
     assert "MiniCPMO45Runtime::load_with_language(" in MINICPM_ENGINE
     assert "MiniCPMO45Runtime" not in CUDA_ENGINE
     assert "minicpmo" not in CUDA_OPTIONS.lower()
     assert "MiniCPMO45Runtime" not in CUDA_COMPONENTS
     assert "components.minicpmo" not in CUDA_COMPONENTS
-    assert "duplex_session_->prepare(" in DECODE
+    assert "state_->duplex_session->prepare(" in MINICPM_ENGINE
     assert "parameters.reference_audio_features" in DECODE
     assert "input.force_speak" in DECODE
     assert "result.tts_force_flush" in DECODE
@@ -373,42 +374,42 @@ def test_minicpmo45_eval_batch_matches_pr_tts_sampler_and_optional_media():
     assert "std::mt19937*evaluator_rng=nullptr" in "".join(GRAPH.split())
     assert "std::uniform_real_distribution<float> distribution" in (ROOT / "cpp_runtime/engine/include/sampling.h").read_text(encoding="utf-8")
     assert "mfq::engine::sample_top_k_top_p(" in GRAPH
-    assert 'request.value("tts_temperature", 0.8)' in GRAPH
-    assert 'request.value("tts_top_p", 0.85)' in GRAPH
-    assert 'request.value("tts_top_k", int64_t{25})' in GRAPH
-    assert 'request.value("tts_min_tokens_to_keep", int64_t{3})' in GRAPH
-    assert 'input_prefix + ".pixel_values.pt", false' in GRAPH
-    assert '(reuse_prefix_cache&&prefix_length>=input_ids.size(1))' in ''.join(GRAPH.split())
+    assert 'request.value("tts_temperature", 0.8)' in COMMAND
+    assert 'request.value("tts_top_p", 0.85)' in COMMAND
+    assert 'request.value("tts_top_k", int64_t{25})' in COMMAND
+    assert 'request.value("tts_min_tokens_to_keep", int64_t{3})' in COMMAND
+    assert 'input_prefix + ".pixel_values.pt", false' in COMMAND
+    assert '(reuse_prefix_cache&&prefix_length>=input_ids.size(1))' in ''.join(COMMAND.split())
 
 
 def test_minicpmo45_eval_batch_maps_each_audio_bound_to_its_source():
-    assert "valid_lengths[bound.source]" in GRAPH
-    assert "bound.source, Slice(0, available), Slice()" in GRAPH
-    assert "used_audio[static_cast<size_t>(bound.source)] = true" in GRAPH
-    assert "MiniCPM-o eval batch has unused Whisper segments" in GRAPH
+    assert "valid_lengths[bound.source]" in COMMAND
+    assert "bound.source, Slice(0, available), Slice()" in COMMAND
+    assert "used_audio[static_cast<size_t>(bound.source)] = true" in COMMAND
+    assert "MiniCPM-o eval batch has unused Whisper segments" in COMMAND
 
 
 def test_minicpmo45_eval_batch_preserves_pr_teacher_forcing_segments():
-    assert 'current_prefix + ".prefill_splits.pt",' in GRAPH
-    assert "tts_teacher_forcing || require_segmented_prefill" in GRAPH
-    assert "segment_begin == text_begin && segment_end == text_end" in GRAPH
-    assert "teacher_text_hidden = segment_hidden" in GRAPH
-    assert "teacher-forcing splits omit the text span" in GRAPH
+    assert 'current_prefix + ".prefill_splits.pt",' in COMMAND
+    assert "tts_teacher_forcing || require_segmented_prefill" in COMMAND
+    assert "segment_begin == text_begin && segment_end == text_end" in COMMAND
+    assert "teacher_text_hidden = segment_hidden" in COMMAND
+    assert "teacher-forcing splits omit the text span" in COMMAND
 
 
 def test_minicpmo45_eval_batch_can_match_pr_prefill_call_boundaries():
-    assert 'request.value("require_segmented_prefill", false)' in GRAPH
-    assert 'request.value("segmented_prefill_chunk_tokens", int64_t{0})' in GRAPH
-    assert 'first_prefix + ".prefill_splits.pt"' in GRAPH
-    assert "minicpmo45_prefill_segments(" in GRAPH
-    assert "minicpmo45_teacher_prefill_segments(" in GRAPH
-    assert "boundary - segment_begin >= chunk_tokens" in GRAPH
-    assert "segments.emplace_back(text)" in GRAPH
-    assert "teacher-forcing splits omit the text span" in GRAPH
-    assert "MiniCPM-o segmented prefill omits a prompt span" in GRAPH
-    assert "image_embedding_parts.push_back(runtime.resampler.forward(" in GRAPH
-    assert "MiniCPM-o per-segment Whisper length mismatch" in GRAPH
-    assert "Slice(0, raw_lengths[index])" in GRAPH
+    assert 'request.value("require_segmented_prefill", false)' in COMMAND
+    assert 'request.value("segmented_prefill_chunk_tokens", int64_t{0})' in COMMAND
+    assert 'first_prefix + ".prefill_splits.pt"' in COMMAND
+    assert "minicpmo45_prefill_segments(" in COMMAND
+    assert "minicpmo45_teacher_prefill_segments(" in COMMAND
+    assert "boundary - segment_begin >= chunk_tokens" in COMMAND
+    assert "segments.emplace_back(text)" in COMMAND
+    assert "teacher-forcing splits omit the text span" in COMMAND
+    assert "MiniCPM-o segmented prefill omits a prompt span" in COMMAND
+    assert "image_embedding_parts.push_back(runtime.resampler.forward(" in COMMAND
+    assert "MiniCPM-o per-segment Whisper length mismatch" in COMMAND
+    assert "Slice(0, raw_lengths[index])" in COMMAND
 
 
 def test_minicpmo45_realtime_renderer_prefers_cuda_when_available():

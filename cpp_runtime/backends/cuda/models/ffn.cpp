@@ -1,3 +1,4 @@
+#include "storage/weight_loader.h"
 #include "ffn.h"
 #include "models/common/gated_mlp.h"
 #include "models/common/moe.h"

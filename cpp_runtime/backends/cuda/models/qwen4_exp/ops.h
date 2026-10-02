@@ -1,7 +1,6 @@
 #pragma once
 
 #include "../causal_ops.h"
-#include "layers.h"
 #include "models/block.h"
 #include "models/qwen4_exp/causal_lm.h"
 #include "models/qwen4_exp/config.h"
@@ -9,20 +8,15 @@
 
 #include <memory>
 
-namespace mfq::cuda::qwen4_exp {
-
-std::unique_ptr<::Block> load_block(CudaExecutionContext &execution, const mfq::ModelSource &source,
-                                    const mfq::models::qwen4_exp::Config &config, int layer);
-std::unique_ptr<Gr> load_final_mixer(CudaExecutionContext &execution,
-                                     const mfq::ModelSource &source,
-                                     const mfq::models::qwen4_exp::Config &config);
-Tensor finalize_hidden(const Gr &mixer, const Tensor &hidden);
-
-} // namespace mfq::cuda::qwen4_exp
+namespace mfq::cuda::qwen4_exp { struct Gr; }
 
 namespace mfq::cuda {
 
 struct Qwen4Model : CausalResources {
+    Qwen4Model();
+    ~Qwen4Model();
+    Qwen4Model(Qwen4Model&&) noexcept;
+    Qwen4Model& operator=(Qwen4Model&&) noexcept;
     template <class Backend> using CausalModel = mfq::models::qwen4_exp::CausalLm<Backend>;
     mfq::models::qwen4_exp::Config config;
     std::unique_ptr<qwen4_exp::Gr> final_mixer;

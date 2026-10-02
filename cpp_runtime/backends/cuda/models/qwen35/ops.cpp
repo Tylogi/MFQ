@@ -1,3 +1,4 @@
+#include "storage/weight_loader.h"
 #include "ops.h"
 #include "../session_codec_impl.h"
 #include "linear_attention.h"

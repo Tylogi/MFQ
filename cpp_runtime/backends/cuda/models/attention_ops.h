@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq/kernels/cuda/glm5_next.h"
+#include "mfq_cuda_ops.h"
 
 #include <algorithm>
 #include <cmath>
@@ -9,20 +9,14 @@
 #include <utility>
 #include <vector>
 
-std::vector<mfq_tensor_backend::Tensor> gdn_cuda(
-    mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor,
-    mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor,
-    mfq_tensor_backend::Tensor, MfqOptional<mfq_tensor_backend::Tensor>);
-mfq_tensor_backend::Tensor ssm_conv_silu_cuda(
-    mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor,
-    mfq_tensor_backend::Tensor, int64_t);
 struct CudaExecutionContext;
 
-namespace mfq::cuda::glm5_next {
+namespace mfq::cuda::attention_ops {
 namespace tb = mfq_tensor_backend;
 using Tensor = tb::Tensor;
 using Linear =
     std::function<Tensor(CudaExecutionContext&, const Tensor&)>;
+using Embedding = std::function<Tensor(const Tensor&)>;
 
 inline Tensor rms_norm(const Tensor& value, const Tensor& weight, double eps) {
     auto f = value.to(tb::kFloat32);
@@ -34,21 +28,21 @@ class SequenceCache {
 public:
     SequenceCache(int64_t maximum, int64_t width)
         : maximum_(maximum), width_(width) {
-        MFQ_RUNTIME_CHECK(maximum > 0 && width > 0, "invalid GLM cache dimensions");
+        MFQ_RUNTIME_CHECK(maximum > 0 && width > 0, "invalid sequence cache dimensions");
     }
     void reset() { values_ = Tensor(); position_ = 0; }
     int64_t position() const { return position_; }
     const Tensor& storage() const { return values_; }
     void truncate(int64_t keep) {
-        MFQ_RUNTIME_CHECK(keep >= 0 && keep <= position_, "invalid GLM cache truncation");
+        MFQ_RUNTIME_CHECK(keep >= 0 && keep <= position_, "invalid sequence cache truncation");
         position_ = keep;
     }
     Tensor append(const Tensor& value) {
         MFQ_RUNTIME_CHECK(value.is_cuda() && value.dim() == 3 && value.size(0) > 0 &&
-            value.size(1) > 0 && value.size(2) == width_, "invalid GLM cache append");
+            value.size(1) > 0 && value.size(2) == width_, "invalid sequence cache append");
         MFQ_RUNTIME_CHECK(!values_.defined() || (value.size(0) == values_.size(0) &&
-            value.device() == values_.device()), "reset GLM cache before changing batch/device");
-        MFQ_RUNTIME_CHECK(value.size(1) <= maximum_ - position_, "GLM cache exceeds max_context");
+            value.device() == values_.device()), "reset sequence cache before changing batch/device");
+        MFQ_RUNTIME_CHECK(value.size(1) <= maximum_ - position_, "sequence cache exceeds max_context");
         const auto required = position_ + value.size(1);
         if (!values_.defined() || required > values_.size(1)) {
             int64_t capacity = values_.defined() ? values_.size(1) : std::min<int64_t>(16, maximum_);
@@ -71,7 +65,7 @@ inline Tensor select_pooled_blocks(const Tensor& scores, int64_t query_offset,
     MFQ_RUNTIME_CHECK(scores.is_cuda() && scores.dim() == 3 && pool > 0 && budget > 0 &&
         budget % pool == 0 && query_offset >= 0 && logical_length >= query_offset &&
         scores.size(1) <= logical_length - query_offset && scores.size(2) == logical_length / pool,
-        "GLM pool selection geometry mismatch");
+        "pooled attention selection geometry mismatch");
     const auto b = scores.size(0), t = scores.size(1), pools = scores.size(2);
     const auto options = scores.options().dtype(tb::kInt64);
     auto absolute = tb::arange(t, options) + query_offset;
@@ -97,4 +91,4 @@ inline Tensor select_pooled_blocks(const Tensor& scores, int64_t query_offset,
     return selected.to(tb::kInt32).contiguous();
 }
 
-} // namespace mfq::cuda::glm5_next
+} // namespace mfq::cuda::attention_ops
