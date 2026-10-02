@@ -1,10 +1,10 @@
 #pragma once
 
 #include "continuous_batching.h"
-#include "cuda_model_plan.h"
-#include "engine/runtime_config.h"
+#include "cuda_runtime_config.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -12,38 +12,37 @@
 #include <vector>
 
 struct CudaExecutionContext;
-struct DecodeGraphCache;
-class MtpModule;
-namespace mfq::cuda::internal { class TextSessionCache; }
-namespace mfq::cuda::grid_vision_runtime {
-class CudaGridVisionPromptComponent;
-}
 
 namespace mfq::cuda {
+
 struct Qwen35Model;
 template <typename Model>
 struct CausalLm;
 using Qwen35CausalLm = CausalLm<Qwen35Model>;
-}
 
-namespace mfq::cuda::qwen35 {
+bool qwen_continuous_batch_cuda_graph_enabled(
+    const Qwen35CausalLm& model,
+    const CudaContinuousBatchConfig& config);
 
-bool qwen_continuous_batch_has_moe(const Qwen35CausalLm& model);
-bool qwen_continuous_batch_has_cached_moe(const Qwen35CausalLm& model);
+using QwenExclusiveGeneration = std::function<std::int32_t(
+    const std::vector<std::int64_t>&,
+    const MfqMultimodalInput*,
+    const MfqSamplingParams&,
+    const MfqTokenCallback&,
+    const MfqPrefillCallback&,
+    const MfqPromptCachePlan&,
+    const MfqTokenConstraintPtr&,
+    const MfqCancellationCheck&)>;
 
-// The shared controller owns queueing and request lifecycle. This adapter
-// supplies Qwen CUDA batch operations and per-sequence device state.
 class QwenBatchExecutor final : public mfq::engine::ContinuousBatching {
 public:
     QwenBatchExecutor(
         Qwen35CausalLm& model,
         CudaExecutionContext& execution,
         std::mutex& model_mutex,
-        DecodeGraphCache& decode_graph,
-        internal::TextSessionCache& session_cache,
-        MtpModule* mtp,
-        grid_vision_runtime::CudaGridVisionPromptComponent* grid_vision,
-        const CudaRuntimeConfig& config);
+        const CudaContinuousBatchConfig& config,
+        std::int64_t prefill_chunk_size,
+        QwenExclusiveGeneration exclusive_generation);
     ~QwenBatchExecutor() override;
 
     QwenBatchExecutor(const QwenBatchExecutor&) = delete;
@@ -69,8 +68,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-int run_qwen_continuous_batching_check(
-    Qwen35CausalLm& model,
-    const CudaRuntimeConfig& config);
-
-} // namespace mfq::cuda::qwen35
+} // namespace mfq::cuda

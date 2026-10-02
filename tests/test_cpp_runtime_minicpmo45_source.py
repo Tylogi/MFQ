@@ -9,7 +9,7 @@ DECODE = "\n".join(
     if path.suffix in {".h", ".cpp"}
 )
 CUDA_COMPONENTS = "\n".join(
-    (CUDA_ROOT / "models" / name).read_text(encoding="utf-8")
+    (CUDA_ROOT / "engine" / name).read_text(encoding="utf-8")
     for name in ("components.h", "components.cpp")
 )
 CUDA_ENGINE = (CUDA_ROOT / "engine" / "cuda_engine.cpp").read_text(
@@ -143,7 +143,7 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
     assert "qwen_rms_norm_bf16_kernel" in NORM
     assert "qwen_rms_norm_pair_bf16_finalize_kernel" in NORM
     assert "MFQ_DISABLE_NATIVE_PARALLEL_F32_MEAN" in (
-        ROOT / "cpp_runtime" / "backends" / "cuda" / "src" / "mfq_native_tensor_ops.cu"
+        ROOT / "cpp_runtime" / "backends" / "cuda" / "src" / "mfq_native_tensor_reduction.cu"
     ).read_text(encoding="utf-8")
     assert 'rec.dtype == "NINT"' in DECODE
     assert "dequant_nint_dense_f32(to_gpu_nint(unpack_nint(blob)))" in DECODE
@@ -290,8 +290,10 @@ def test_minicpmo45_cli_exposes_native_duplex_tensor_contract():
 def test_minicpmo45_cuda_server_binds_the_realtime_backend():
     assert 'option == "--minicpmo-duplex"' not in DECODE
     assert "make_cuda_minicpmo45_duplex_backend(" in MINICPM_ENGINE
-    assert "engine_binder" in MINICPM_ENGINE
-    assert "load_runtime_components(" in MINICPM_ENGINE
+    assert "Components::multimodal_generate(" in MINICPM_ENGINE
+    assert "mfq::engine::Engine" not in MINICPM_ENGINE
+    assert "bind_runtime" in CUDA_COMPONENTS
+    assert "load_runtime_components(" in CUDA_COMPONENTS
     assert 'backend.name = "cuda"' in MINICPM_ENGINE
     assert "MiniCPMO45Runtime::load_with_language(" in MINICPM_ENGINE
     assert "MiniCPM" not in CUDA_ENGINE
@@ -318,7 +320,7 @@ def test_minicpmo45_native_servers_share_mfqd_vision_tensors():
     assert "special_token(" not in SERVER_SOURCE
     assert "generate_multimodal_tokens(" in DECODE
     assert "const MfqCancellationCheck& cancelled" in MINICPM_ENGINE
-    assert "token_constraint,\n                cancelled);" in MINICPM_ENGINE
+    assert "token_constraint,\n            cancelled);" in MINICPM_ENGINE
     assert "audio_bounds,\n            cancelled);" in MINICPM_ENGINE
     assert "catch (const mfq::engine::InferenceCancelled&)" in MINICPM_ENGINE
     assert "check_cancelled();" in GRAPH

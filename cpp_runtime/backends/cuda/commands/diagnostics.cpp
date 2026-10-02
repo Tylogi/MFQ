@@ -1,6 +1,6 @@
 #include "cli.h"
 #include "diagnostics/token_generation.h"
-#include "models/loader.h"
+#include "engine/model_loader.h"
 #include "diagnostics/backend_checks.h"
 #include "diagnostics/model_checks.h"
 #include "diagnostics/runtime_checks.h"

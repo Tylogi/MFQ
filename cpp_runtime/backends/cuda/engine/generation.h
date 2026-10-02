@@ -2,7 +2,7 @@
 
 #include "cuda_execution.h"
 #include "decode_graph.h"
-#include "runtime_config.h"
+#include "cuda_runtime_config.h"
 #include "mfq/runtime.h"
 
 #include <cstdint>

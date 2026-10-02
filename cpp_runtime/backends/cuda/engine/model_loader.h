@@ -1,10 +1,10 @@
 #pragma once
 
-#include "causal_models.h"
+#include "models/causal_models.h"
 #include "cuda_execution.h"
 #include "storage/moe_expert_cache.h"
 #include "options.h"
-#include "models/components.h"
+#include "components.h"
 
 #include <chrono>
 #include <stdexcept>

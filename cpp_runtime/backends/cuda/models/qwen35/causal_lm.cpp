@@ -2,11 +2,7 @@
 #include "../causal_lm_impl.h"
 #include "linear_attention.h"
 
-#include "../components.h"
 #include "models/transformer.h"
-#include "storage/moe_expert_cache.h"
-
-#include <iostream>
 
 namespace mfq::cuda::qwen35 {
 namespace {
@@ -582,61 +578,6 @@ bool Qwen35Model::adapter_supports_speculation() const noexcept {
 }
 
 } // namespace mfq::cuda
-
-template <>
-RuntimeComponents<mfq::cuda::Qwen35CausalLm> load_runtime_components(
-        mfq::cuda::Qwen35CausalLm& model,
-        bool load_optional_components) {
-    RuntimeComponents<mfq::cuda::Qwen35CausalLm> result;
-    result.graph = model.graph;
-    result.plan = model.plan;
-    if (!load_optional_components) return result;
-
-    if (result.plan.vision == mfq::cuda::CudaVisionAdapter::grid_vit) {
-        const auto* component = result.graph.component("vision");
-        const auto& config = model.config;
-        if (component == nullptr || !config.grid_vision ||
-                !config.image_token_id || !config.video_token_id) {
-            throw std::runtime_error(
-                "CUDA grid-Vision configuration is incomplete");
-        }
-        result.grid_vision.emplace(
-            mfq::cuda::grid_vision_runtime::CudaGridVisionPromptComponent::load(
-                *model.execution, *model.source, *config.grid_vision,
-                *config.image_token_id, *config.video_token_id,
-                component->input_contract, component->position_policy));
-        result.vision_available = true;
-    } else if (result.plan.vision != mfq::cuda::CudaVisionAdapter::none) {
-        throw std::runtime_error(
-            "CUDA vision adapter is unsupported for Qwen");
-    }
-
-    if (result.plan.predictor == mfq::cuda::CudaPredictorAdapter::qwen35) {
-        const auto& model_execution = *model.execution;
-        const bool supported_placement =
-            !model_execution.layer_placement.enabled() &&
-            model_execution.dense_cpu_layer_count == 0 &&
-            model_execution.dsv4_cpu_offload_layers.empty() &&
-            !model_execution.moe_expert_cache;
-        if (supported_placement && model.num_experts() == 0 &&
-                model.supports_speculation()) {
-            auto predictor = Qwen35Mtp::load_if_present(
-                *model.source, model.config, *model.execution);
-            if (predictor) {
-                result.mtp = std::make_unique<Qwen35Mtp>(
-                    std::move(*predictor));
-            }
-            result.mtp_available = static_cast<bool>(result.mtp);
-        } else {
-            std::cerr << "qwen_mtp unavailable: CUDA adapter requires dense GPU-resident Qwen blocks\n";
-        }
-    } else if (result.plan.predictor !=
-            mfq::cuda::CudaPredictorAdapter::none) {
-        throw std::runtime_error(
-            "CUDA predictor adapter is unsupported for Qwen");
-    }
-    return result;
-}
 
 namespace mfq::cuda {
 

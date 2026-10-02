@@ -3,10 +3,10 @@
 #include "cuda_execution.h"
 #include "decode_graph.h"
 #include "generation.h"
-#include "runtime_config.h"
+#include "cuda_runtime_config.h"
 #include "storage/moe_expert_cache.h"
-#include "models/loader.h"
-#include "models/components.h"
+#include "model_loader.h"
+#include "components.h"
 #include "models/registry.h"
 #include "text_processor.h"
 #include "mtp_metrics.h"
@@ -208,11 +208,10 @@ CudaEngine make_cuda_engine(
             return state->session_cache.trim_hot(target_bytes);
         },
     };
-    if (!state->continuous_batching && state->components.engine_binder) {
-        state->components.engine_binder(
-            engine, state->model_mutex);
-        if (engine.multimodal_generate) {
-            auto generate = std::move(engine.multimodal_generate);
+    if (!state->continuous_batching && state->components.bind_runtime) {
+        auto bindings = state->components.bind_runtime(state->model_mutex);
+        if (bindings.multimodal_generate) {
+            auto generate = std::move(bindings.multimodal_generate);
             engine.multimodal_generate = [state, generate = std::move(generate)](
                     const std::vector<int64_t>& prompt,
                     const MfqMultimodalInput& media,
@@ -227,10 +226,10 @@ CudaEngine make_cuda_engine(
                     cache_plan, token_constraint, cancelled);
             };
         }
-        if (engine.duplex) {
-            auto start = std::move(engine.duplex.start);
-            auto step = std::move(engine.duplex.step);
-            auto stop = std::move(engine.duplex.stop);
+        if (bindings.duplex) {
+            auto start = std::move(bindings.duplex.start);
+            auto step = std::move(bindings.duplex.step);
+            auto stop = std::move(bindings.duplex.stop);
             engine.duplex.start = [state, start = std::move(start)](
                     const MfqDuplexSessionParams& params) {
                 start(params);

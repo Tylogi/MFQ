@@ -1,5 +1,5 @@
 #include "cli.h"
-#include "models/loader.h"
+#include "engine/model_loader.h"
 #include "eval/kl.h"
 #include "cuda_execution.h"
 #include "storage/moe_expert_cache.h"

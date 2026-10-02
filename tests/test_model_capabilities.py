@@ -21,7 +21,7 @@ CUDA_DECODE = "\n".join(
     if path.suffix in {".h", ".cpp"}
 )
 CUDA_COMPONENTS = "\n".join(
-    (CUDA_ROOT / "models" / name).read_text(encoding="utf-8")
+    (CUDA_ROOT / "engine" / name).read_text(encoding="utf-8")
     for name in ("components.h", "components.cpp")
 )
 

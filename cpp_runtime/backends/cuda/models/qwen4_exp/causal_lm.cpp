@@ -1,8 +1,6 @@
 #include "causal_lm.h"
 #include "../causal_lm_impl.h"
 
-#include "../components.h"
-
 namespace mfq::cuda::qwen4_exp {
 
 std::unique_ptr<::Block> load_block(
@@ -197,37 +195,6 @@ void Qwen4Model::adapter_rollback_speculative(int64_t keep) {
 }
 
 } // namespace mfq::cuda
-
-template <>
-RuntimeComponents<mfq::cuda::Qwen4CausalLm> load_runtime_components(
-        mfq::cuda::Qwen4CausalLm& model,
-        bool load_optional_components) {
-    RuntimeComponents<mfq::cuda::Qwen4CausalLm> result;
-    result.graph = model.graph;
-    result.plan = model.plan;
-    if (!load_optional_components) return result;
-    if (result.plan.vision != mfq::cuda::CudaVisionAdapter::none ||
-            (result.plan.predictor != mfq::cuda::CudaPredictorAdapter::none &&
-             result.plan.predictor !=
-                 mfq::cuda::CudaPredictorAdapter::flash_next)) {
-        throw std::runtime_error(
-            "unsupported Qwen4 CUDA component adapter");
-    }
-    if (result.plan.predictor ==
-            mfq::cuda::CudaPredictorAdapter::none) return result;
-    MFQ_RUNTIME_CHECK(
-        model.supports_speculation(),
-        "invalid Flash-Next predictor model");
-    auto predictor = mfq::cuda::qwen4_exp::Qwen4ExpMtp::load_if_present(
-        *model.execution, *model.source, model.config);
-    if (predictor) {
-        result.mtp =
-            std::make_unique<mfq::cuda::qwen4_exp::Qwen4ExpMtp>(
-                std::move(*predictor));
-    }
-    result.mtp_available = static_cast<bool>(result.mtp);
-    return result;
-}
 
 namespace mfq::cuda {
 

@@ -8,9 +8,16 @@ DECODE = "\n".join(
     if path.suffix in {".h", ".cpp"}
 )
 BATCHING = "\n".join(
-    (CUDA_ROOT / "models" / "qwen35" / name).read_text(encoding="utf-8")
-    for name in ("batch_executor.h", "batch_executor.cpp")
+    (CUDA_ROOT / "engine" / name).read_text(encoding="utf-8")
+    for name in ("cuda_batching.h", "cuda_batching.cpp")
 )
+BATCH_STATE = "\n".join(
+    (CUDA_ROOT / "models" / "qwen35" / name).read_text(encoding="utf-8")
+    for name in ("batch_state.h", "batch_state.cpp")
+)
+BATCHING_CHECK = (
+    CUDA_ROOT / "diagnostics" / "runtime_checks.cpp"
+).read_text(encoding="utf-8")
 COMMON_BATCHING = (
     ROOT / "cpp_runtime" / "engine" / "include" / "continuous_batching.h"
 ).read_text(encoding="utf-8")
@@ -74,10 +81,19 @@ def test_cuda_server_prefill_is_bounded_for_serial_mtp_and_batched_paths():
 
 
 def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
-    assert "take_qwen_batch_state" in BATCHING
-    assert "restore_qwen_batch_states" in BATCHING
-    assert "make_qwen_slot_state" in BATCHING
-    assert "copy_qwen_state_to_slot" in BATCHING
+    assert "state_adapter_.take(" in BATCHING
+    assert "state_adapter_.restore(" in BATCHING
+    assert "state_adapter_.make_slot_state(" in BATCHING
+    assert "state_adapter_.copy_to_slot(" in BATCHING
+    for operation in (
+        "Qwen35BatchStateAdapter::take(",
+        "Qwen35BatchStateAdapter::restore(",
+        "Qwen35BatchStateAdapter::copy_to_slot(",
+        "Qwen35BatchStateAdapter::release_paged_slot(",
+        "Qwen35BatchStateAdapter::bind_paged_slots(",
+    ):
+        assert operation in BATCH_STATE
+    assert "QwenPagedKvArena" not in BATCHING
     assert "mfq::cuda::sample_logits" in BATCHING
     assert "request->sampler" in BATCHING
     assert "request->token_constraint" in BATCHING
@@ -105,12 +121,12 @@ def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
 
 
 def test_scheduler_supports_resident_and_cached_qwen_moe():
-    assert "qwen_continuous_batch_has_moe" in BATCHING
+    assert "state_adapter_.has_moe()" in BATCHING
     assert "continuous_batching_moe" in BATCHING
     assert "continuous_batching_moe_cached_row_serial" in BATCHING
     assert "continuous batching requires dense Qwen blocks" not in BATCHING
     assert "continuous batching cannot use the expert cache" not in BATCHING
-    assert "qwen_continuous_batch_has_cached_moe" in BATCHING
+    assert "state_adapter_.has_cached_moe()" in BATCHING
     assert "uses_moe_expert_cache()" in DECODE
     assert "MoeContinuousBatchCacheScope moe_cache_scope" in BATCHING
     assert "execution.continuous_batch_cache_serial" in DECODE
@@ -128,8 +144,9 @@ def test_generic_qwen_loader_constructs_moe_ffns():
     assert '"experts.up.weight"' in QWEN_LOADER
     assert '"experts.down.weight"' in QWEN_LOADER
     assert '"shared_expert.router.weight"' in QWEN_LOADER
-    assert "load_mfe_gpu(" in QWEN_LOADER
-    assert "ffn.is_moe = true" in QWEN_LOADER
+    assert "load_moe_weights(" in QWEN_LOADER
+    assert "load_mfe_gpu(" in DECODE
+    assert "result.is_moe = true" in DECODE
     assert "load_qwen_ffn(" in QWEN_LOADER
     assert "metadata.num_experts = config.num_experts" in QWEN_LOADER
     assert "return this->metadata.num_experts" in CAUSAL_LM
@@ -162,14 +179,14 @@ def test_qwen_decode_accepts_independent_batch_positions():
 
 
 def test_real_weight_gate_exercises_join_and_compaction():
-    assert "run_qwen_continuous_batching_check" in BATCHING
-    assert "a blocked response callback stalled the scheduler" in BATCHING
-    assert "cancellation_produced == 1" in BATCHING
-    assert 'metric("continuous_batching_max_batch") >= 2.0' in BATCHING
-    assert 'metric("continuous_batching_compactions") == 0.0' in BATCHING
-    assert 'metric("continuous_batching_stable_slot_releases") >= 1.0' in BATCHING
-    assert "std::vector<int64_t> first_prompt(193)" in BATCHING
-    assert '" prompt_lengths=193,17 split_k=1"' in BATCHING
+    assert "run_qwen_continuous_batching_check" in BATCHING_CHECK
+    assert "a blocked response callback stalled the scheduler" in BATCHING_CHECK
+    assert "cancellation_produced == 1" in BATCHING_CHECK
+    assert 'metric("continuous_batching_max_batch") >= 2.0' in BATCHING_CHECK
+    assert 'metric("continuous_batching_compactions") == 0.0' in BATCHING_CHECK
+    assert 'metric("continuous_batching_stable_slot_releases") >= 1.0' in BATCHING_CHECK
+    assert "std::vector<int64_t> first_prompt(193)" in BATCHING_CHECK
+    assert '" prompt_lengths=193,17 split_k=1"' in BATCHING_CHECK
 
 
 def test_linear_attention_uses_the_canonical_nint_operator():

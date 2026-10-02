@@ -1,6 +1,7 @@
 #pragma once
 
 #include "causal_lm.h"
+#include "../mtp.h"
 #include "models/full_block.h"
 
 // Qwen3.5's predictor shares the main embedding/output head and owns only

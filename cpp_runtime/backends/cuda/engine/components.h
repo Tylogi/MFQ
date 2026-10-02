@@ -1,14 +1,13 @@
 #pragma once
 
-#include "causal_models.h"
-#include "../engine/mtp.h"
-#include "grid_vision_component.h"
-#include "engine.h"
-#include "engine/runtime_config.h"
-#include "deepseek_v41/dspark.h"
-#include "glm5_next/mtp.h"
-#include "qwen4_exp/mtp.h"
-#include "qwen35/mtp.h"
+#include "models/causal_models.h"
+#include "models/mtp.h"
+#include "models/grid_vision_component.h"
+#include "cuda_runtime_config.h"
+#include "models/deepseek_v41/dspark.h"
+#include "models/glm5_next/mtp.h"
+#include "models/qwen4_exp/mtp.h"
+#include "models/qwen35/mtp.h"
 
 #include <functional>
 #include <memory>
@@ -19,6 +18,11 @@ struct CudaExecutionContext;
 struct DecodeGraphCache;
 namespace mfq::cuda::internal { class TextSessionCache; }
 
+struct CudaRuntimeBindings {
+    MfqMultimodalGenerateFn multimodal_generate;
+    MfqDuplexBackend duplex;
+};
+
 template <typename Model>
 struct RuntimeComponents {
     mfq::ModelGraph graph;
@@ -28,7 +32,7 @@ struct RuntimeComponents {
         grid_vision;
     std::unique_ptr<MtpModule> mtp;
     Model* language_override = nullptr;
-    std::function<void(mfq::engine::Engine&, std::mutex&)> engine_binder;
+    std::function<CudaRuntimeBindings(std::mutex&)> bind_runtime;
     bool vision_available = false;
     bool mtp_available = false;
 

@@ -1,5 +1,5 @@
 #include "options.h"
-#include "runtime_config.h"
+#include "cuda_runtime_config.h"
 #include "cuda_execution.h"
 #include "storage/moe_expert_cache.h"
 #include "moe_cache_profile.h"

@@ -16,8 +16,8 @@ CMAKE = (ROOT / "cpp_runtime" / "tests" / "CMakeLists.txt").read_text(
 COMPONENTS = "\n".join(
     path.read_text(encoding="utf-8")
     for path in (
-        CUDA_ROOT / "models" / "components.h",
-        CUDA_ROOT / "models" / "components.cpp",
+        CUDA_ROOT / "engine" / "components.h",
+        CUDA_ROOT / "engine" / "components.cpp",
         CUDA_ROOT / "models" / "qwen35" / "causal_lm.cpp",
     )
 )
@@ -167,12 +167,12 @@ def test_quantized_tp_weights_and_workspaces_follow_the_shard_device():
 
 
 def test_deepseek_v4_split_gate_up_uses_existing_moe_runtime_and_cache():
-    assert 'p + "mlp.experts.gate.weight"' in SOURCE
-    assert 'p + "mlp.experts.up.weight"' in SOURCE
-    assert "has_split_gate != has_split_up" in SOURCE
+    assert 'base + "experts.gate.weight"' in SOURCE
+    assert 'base + "experts.up.weight"' in SOURCE
+    assert "split_gate != split_up" in SOURCE
     assert "moe_split_gate_up" in SOURCE
-    assert 'true, i, "gate"' in SOURCE
-    assert 'true, i, "up"' in SOURCE
+    assert 'options.layer, "gate"' in SOURCE
+    assert 'options.layer, "up"' in SOURCE
     assert '"moe.gate_up_split"' in SOURCE
     assert "mfq_tensor_backend::cat({gate, up}, -1).contiguous()" in SOURCE
 
@@ -185,7 +185,7 @@ def test_generic_ffn_loader_stays_dense_and_model_moe_loaders_are_typed():
     assert "const mfq::models::ModelConfig& config" in loader
     assert "deepseek_v4::load_block(" in SOURCE
     assert "glm_dsa::load_ffn(" in SOURCE
-    assert "deepseek_v41_runtime::load_moe(" in SOURCE
+    assert SOURCE.count("load_moe_weights(") >= 5
 
 
 def test_native_float_linears_are_supported_without_forcing_tp_shards():

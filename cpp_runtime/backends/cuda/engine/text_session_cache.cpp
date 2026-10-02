@@ -1,6 +1,6 @@
 #include "text_session_cache.h"
 
-#include "runtime_config.h"
+#include "cuda_runtime_config.h"
 #include "models/causal_models.h"
 #include "models/session_state.h"
 #include "mtp.h"

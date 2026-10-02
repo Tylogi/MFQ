@@ -276,7 +276,7 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/glm_dsa/causal_lm.cpp
     ${MFQ_CUDA_ROOT}/models/minicpmo45/causal_lm.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/causal_lm.cpp
-    ${MFQ_CUDA_ROOT}/models/qwen35/batch_executor.cpp
+    ${MFQ_CUDA_ROOT}/models/qwen35/batch_state.cpp
     ${MFQ_CUDA_ROOT}/models/registry.cpp
     ${MFQ_CUDA_ROOT}/models/loader.cpp
     ${MFQ_CUDA_ROOT}/models/ffn.cpp
@@ -326,7 +326,8 @@ add_library(mfq-cuda-runtime STATIC
     ${MFQ_CUDA_ROOT}/engine/decode_graph.cpp
     ${MFQ_CUDA_ROOT}/models/causal_lm.cpp
     ${MFQ_CUDA_ROOT}/engine/mtp.cpp
-    ${MFQ_CUDA_ROOT}/models/components.cpp
+    ${MFQ_CUDA_ROOT}/engine/components.cpp
+    ${MFQ_CUDA_ROOT}/engine/cuda_batching.cpp
     ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
     ${MFQ_CUDA_ROOT}/commands/cli.cpp
     ${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp
@@ -539,7 +540,7 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         ${MFQ_CUDA_ROOT}/models/loader.cpp
         ${MFQ_CUDA_ROOT}/engine/mtp.cpp
         ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp
-        ${MFQ_CUDA_ROOT}/models/components.cpp
+        ${MFQ_CUDA_ROOT}/engine/components.cpp
         ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
         ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
         ${MFQ_CUDA_MODEL_SOURCES}

@@ -119,11 +119,15 @@ CUDA_MODEL_FINALIZERS = {
     for name in ("qwen4_exp", "glm5_next", "deepseek_v4", "deepseek_v41")
 }
 CUDA_QWEN_BATCH_HEADER = (
-    CUDA_MODELS / "qwen35" / "batch_executor.h"
+    CUDA_RUNTIME / "cuda_batching.h"
 ).read_text(encoding="utf-8")
 CUDA_QWEN_BATCH_SOURCE = (
-    CUDA_MODELS / "qwen35" / "batch_executor.cpp"
+    CUDA_RUNTIME / "cuda_batching.cpp"
 ).read_text(encoding="utf-8")
+CUDA_QWEN_BATCH_STATE = "\n".join(
+    (CUDA_MODELS / "qwen35" / name).read_text(encoding="utf-8")
+    for name in ("batch_state.h", "batch_state.cpp")
+)
 CUDA_CAUSAL_LM_LOADER = (CUDA_MODELS / "loader.cpp").read_text(
     encoding="utf-8"
 )
@@ -181,6 +185,27 @@ def test_cuda_models_and_storage_do_not_parse_execution_environment() -> None:
         for path in directory.rglob("*"):
             if path.suffix in {".h", ".cpp", ".cu"}:
                 assert "getenv(" not in path.read_text(encoding="utf-8")
+
+
+def test_cuda_models_do_not_depend_on_cuda_engine_implementation() -> None:
+    for path in CUDA_MODELS.rglob("*"):
+        if path.suffix not in {".h", ".cpp", ".cu"}:
+            continue
+        source = path.read_text(encoding="utf-8")
+        assert not re.search(r'#include\s+"(?:\.\./)*engine/', source)
+        for header in (
+            "components.h",
+            "cuda_batching.h",
+            "cuda_engine.h",
+            "decode_graph.h",
+            "generation.h",
+            "model_loader.h",
+            "options.h",
+            "text_session_cache.h",
+        ):
+            assert f'#include "{header}"' not in source
+        assert "mfq::engine::Engine" not in source
+        assert "engine_binder" not in source
 
 
 def test_cuda_format_operators_only_receive_the_profiler() -> None:
@@ -506,6 +531,9 @@ def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
     assert "struct Request" not in CUDA_QWEN_BATCH_HEADER
     assert "struct QwenBatchExecutor::Impl" in CUDA_QWEN_BATCH_SOURCE
     assert len(CUDA_QWEN_BATCH_HEADER.splitlines()) < 80
+    assert "Qwen35BatchStateAdapter" in CUDA_QWEN_BATCH_STATE
+    assert "ContinuousBatchRequest" not in CUDA_QWEN_BATCH_STATE
+    assert "continuous_batching_requests" not in CUDA_QWEN_BATCH_STATE
 
 
 def test_cuda_model_finalizers_live_with_their_models() -> None:
@@ -1034,7 +1062,7 @@ def test_model_config_parsing_is_backend_neutral() -> None:
     assert "Config::from_json" not in CUDA_CAUSAL_LM_LOADER
     assert "if constexpr" not in CUDA_CAUSAL_LM_LOADER
     assert "if constexpr" not in (
-        CUDA_MODELS / "components.cpp"
+        CUDA_RUNTIME / "components.cpp"
     ).read_text(encoding="utf-8")
     model_names = (
         "minicpmo45",
@@ -1156,7 +1184,9 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         "models/transformer.cpp",
         "engine/mtp.cpp",
         "storage/moe_expert_cache.cpp",
-        "models/components.cpp",
+        "engine/components.cpp",
+        "engine/cuda_batching.cpp",
+        "models/qwen35/batch_state.cpp",
         "diagnostics/attention_checks.cpp",
         "diagnostics/backend_checks.cpp",
         "diagnostics/linear_checks.cpp",

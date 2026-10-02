@@ -22,7 +22,7 @@ RUNTIME = "\n".join(
     )
 )
 SAMPLING = (
-    ROOT / "cpp_runtime" / "backends" / "cuda" / "engine" / "cuda_sampling.h"
+    ROOT / "cpp_runtime" / "backends" / "cuda" / "ops" / "include" / "cuda_sampling.h"
 ).read_text(encoding="utf-8")
 
 

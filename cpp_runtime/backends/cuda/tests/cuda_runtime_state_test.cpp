@@ -1,6 +1,6 @@
 #include "engine/cuda_engine.h"
 #include "cuda_execution.h"
-#include "engine/runtime_config.h"
+#include "cuda_runtime_config.h"
 #include "engine/text_session_cache.h"
 #include "models/minicpmo45/causal_lm.h"
 #include "models/qwen35/causal_lm.h"

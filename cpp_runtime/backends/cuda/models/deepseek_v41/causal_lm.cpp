@@ -1,8 +1,6 @@
 #include "causal_lm.h"
 #include "../causal_lm_impl.h"
 
-#include "../components.h"
-
 namespace mfq::cuda::deepseek_v41_runtime {
 
 FFN load_moe_at(
@@ -363,33 +361,6 @@ void DeepseekV41Model::adapter_rollback_speculative(int64_t) {
 }
 
 } // namespace mfq::cuda
-
-template <>
-RuntimeComponents<mfq::cuda::DeepseekV41CausalLm> load_runtime_components(
-        mfq::cuda::DeepseekV41CausalLm& model,
-        bool load_optional_components) {
-    RuntimeComponents<mfq::cuda::DeepseekV41CausalLm> result;
-    result.graph = model.graph;
-    result.plan = model.plan;
-    if (!load_optional_components) return result;
-    if (result.plan.vision != mfq::cuda::CudaVisionAdapter::none ||
-            (result.plan.predictor != mfq::cuda::CudaPredictorAdapter::none &&
-             result.plan.predictor !=
-                 mfq::cuda::CudaPredictorAdapter::deepseek_v41_dspark)) {
-        throw std::runtime_error(
-            "unsupported DeepSeek-V4.1 CUDA component adapter");
-    }
-    if (result.plan.predictor ==
-            mfq::cuda::CudaPredictorAdapter::none) return result;
-    MFQ_RUNTIME_CHECK(
-        model.supports_suffix_speculation() && model.shared,
-        "invalid DeepSeek-V4.1 DSpark model");
-    result.mtp =
-        mfq::cuda::deepseek_v41_runtime::load_dspark_if_present(
-            *model.execution, *model.source, model.shared->config);
-    result.mtp_available = static_cast<bool>(result.mtp);
-    return result;
-}
 
 namespace mfq::cuda {
 

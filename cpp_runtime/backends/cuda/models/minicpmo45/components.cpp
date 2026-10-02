@@ -1,9 +1,7 @@
-#include "../components.h"
+#include "causal_lm.h"
 
-#include "models/minicpmo45/causal_lm.h"
 #include "cuda_execution.h"
 #include "cuda_sampling.h"
-#include "generation.h"
 #include "mfq_tensor_backend.h"
 #include "tensor_parallel.h"
 
@@ -402,78 +400,35 @@ static MfqDuplexBackend make_cuda_minicpmo45_duplex_backend(
 }
 
 
-struct EngineComponents {
-    explicit EngineComponents(mfq::cuda::MiniCPMO45CausalLm language)
-        : runtime(MiniCPMO45Runtime::load_with_language(
-              std::move(language))) {}
+Components::Components(mfq::cuda::MiniCPMO45CausalLm language)
+    : runtime_(MiniCPMO45Runtime::load_with_language(
+          std::move(language))) {}
 
-    MiniCPMO45Runtime runtime;
-    std::optional<MiniCPMO45DuplexSession> duplex_session;
-};
+mfq::cuda::MiniCPMO45CausalLm& Components::language() noexcept {
+    return runtime_.language;
+}
+
+MfqMultimodalGenerateFn Components::multimodal_generate(
+        std::mutex& model_mutex) {
+    return [this, &model_mutex](
+            const std::vector<int64_t>& prompt,
+            const MfqVisionInput& vision,
+            const MfqSamplingParams& sampling,
+            const MfqTokenCallback& on_token,
+            const MfqPrefillCallback& on_prefill,
+            const MfqPromptCachePlan&,
+            const MfqTokenConstraintPtr& token_constraint,
+            const MfqCancellationCheck& cancelled) {
+        return generate_multimodal_tokens(
+            runtime_, model_mutex, prompt, vision, sampling,
+            on_token, on_prefill, token_constraint,
+            cancelled);
+    };
+}
+
+MfqDuplexBackend Components::duplex(std::mutex& model_mutex) {
+    return make_cuda_minicpmo45_duplex_backend(
+        runtime_, model_mutex, duplex_session_);
+}
 
 } // namespace mfq::cuda::minicpmo45
-
-template <>
-RuntimeComponents<mfq::cuda::MiniCPMO45CausalLm>
-load_runtime_components(
-        mfq::cuda::MiniCPMO45CausalLm& model,
-        bool load_optional_components) {
-    RuntimeComponents<mfq::cuda::MiniCPMO45CausalLm> result;
-    result.graph = model.graph;
-    result.plan = model.plan;
-    if (!load_optional_components ||
-            result.plan.vision == mfq::cuda::CudaVisionAdapter::none) {
-        return result;
-    }
-    if (result.plan.vision !=
-            mfq::cuda::CudaVisionAdapter::minicpmo45) {
-        throw std::runtime_error(
-            "unsupported MiniCPM-o CUDA vision adapter");
-    }
-
-    auto state = std::make_shared<
-        mfq::cuda::minicpmo45::EngineComponents>(std::move(model));
-    result.language_override = &state->runtime.language;
-    result.engine_binder = [state](
-            mfq::engine::Engine& engine,
-            std::mutex& model_mutex) {
-        engine.multimodal_generate = [state, &model_mutex](
-                const std::vector<int64_t>& prompt,
-                const MfqVisionInput& vision,
-                const MfqSamplingParams& sampling,
-                const MfqTokenCallback& on_token,
-                const MfqPrefillCallback& on_prefill,
-                const MfqPromptCachePlan&,
-                const MfqTokenConstraintPtr& token_constraint,
-                const MfqCancellationCheck& cancelled) {
-            return mfq::cuda::minicpmo45::generate_multimodal_tokens(
-                state->runtime,
-                model_mutex,
-                prompt,
-                vision,
-                sampling,
-                on_token,
-                on_prefill,
-                token_constraint,
-                cancelled);
-        };
-        engine.duplex =
-            mfq::cuda::minicpmo45::make_cuda_minicpmo45_duplex_backend(
-                state->runtime,
-                model_mutex,
-                state->duplex_session);
-    };
-    result.vision_available = true;
-    return result;
-}
-
-template <>
-RuntimeComponents<mfq::cuda::MiniCPMOTtsCausalLm>
-load_runtime_components(
-        mfq::cuda::MiniCPMOTtsCausalLm& model,
-        bool) {
-    RuntimeComponents<mfq::cuda::MiniCPMOTtsCausalLm> result;
-    result.graph = model.graph;
-    result.plan = model.plan;
-    return result;
-}

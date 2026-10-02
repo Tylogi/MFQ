@@ -24,9 +24,8 @@ PREPARED = (ROOT / "cpp_runtime/backends/cuda/ops/include/cuda_execution.h").rea
 CUDA_COMPONENTS = "\n".join(
     path.read_text()
     for path in (
-        CUDA_ROOT / "models" / "components.h",
-        CUDA_ROOT / "models" / "components.cpp",
-        CUDA_ROOT / "models" / "qwen35" / "causal_lm.cpp",
+        CUDA_ROOT / "engine" / "components.h",
+        CUDA_ROOT / "engine" / "components.cpp",
     )
 )
 
@@ -111,7 +110,10 @@ def test_cuda_registration_is_exact_and_video_is_not_advertised() -> None:
         "kMfqGridMropePositionPolicy",
     ):
         assert value in PLAN
-    assert "!state->components.grid_vision.has_value()" in CUDA_APP
+    assert (
+        "result.video_input = plan.vision == CudaVisionAdapter::minicpmo45;"
+        in PLAN
+    )
     assert "accepts exactly one image and no video" in CUDA
     for mutation in (
         "wrong_backbone",

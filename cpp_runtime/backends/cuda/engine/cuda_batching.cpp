@@ -1,91 +1,40 @@
-#include "batch_executor.h"
+#include "cuda_batching.h"
 
+#include "decode_graph.h"
+#include "models/qwen35/batch_state.h"
 #include "models/qwen35/causal_lm.h"
-#include "models/components.h"
+#include "models/qwen35/paged_kv.h"
+#include "cuda_execution.h"
 #include "cuda_sampling.h"
-#include "generation.h"
-#include "text_session_cache.h"
-#include "storage/moe_expert_cache.h"
-#include "paged_kv.h"
-#include "linear_attention.h"
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
-#include <condition_variable>
-#include <deque>
 #include <exception>
-#include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
-// Shared engine code owns queueing, worker lifetime, and request transitions.
-// This adapter owns Qwen CUDA batch assembly and device state.
+namespace mfq::cuda {
 
-namespace mfq::cuda::qwen35 {
-
-using internal::generate;
 using internal::PrefillCudaTimer;
-using internal::TextSessionCache;
 using Tensor = mfq_tensor_backend::Tensor;
-using LinearBlock = LinearAttentionBlock;
-using mfq::cuda::continuous::QwenPagedKvArena;
-using mfq::cuda::continuous::QwenPagedKvSequence;
+using qwen35::Qwen35BatchStateAdapter;
+using qwen35::QwenBatchState;
+using continuous::QwenPagedKvSequence;
 
-struct QwenBatchLayerState {
-    enum class Kind { FullAttention, Recurrent };
-    Kind kind = Kind::FullAttention;
-    Tensor first;
-    Tensor second;
-    bool ring = false;
-    bool paged = false;
-};
-
-struct QwenBatchState {
-    int64_t batch = 0;
-    std::vector<QwenBatchLayerState> layers;
-};
-
-static void clear_full_attention_decode_workspaces(FullBlock & block) {
-    block.decode_partial_o = Tensor();
-    block.decode_partial_m = Tensor();
-    block.decode_partial_l = Tensor();
-    block.decode_mma_mask = Tensor();
-    block.decode_mma_kv_max = Tensor();
-    block.decode_mma_meta = Tensor();
-}
-
-bool qwen_continuous_batch_has_moe(
-        const mfq::cuda::Qwen35CausalLm & model) {
-    for (const auto & block : model.blocks) {
-        if (const auto * full = dynamic_cast<const FullBlock *>(block.get())) {
-            if (full->ffn.is_moe) return true;
-        } else if (const auto * linear =
-                dynamic_cast<const LinearBlock *>(block.get())) {
-            if (linear->ffn.is_moe) return true;
-        }
-    }
-    return false;
-}
-
-bool qwen_continuous_batch_has_cached_moe(
-        const mfq::cuda::Qwen35CausalLm & model) {
-    for (const auto & block : model.blocks) {
-        if (const auto * full = dynamic_cast<const FullBlock *>(block.get())) {
-            if (full->ffn.uses_moe_expert_cache()) return true;
-        } else if (const auto * linear =
-                dynamic_cast<const LinearBlock *>(block.get())) {
-            if (linear->ffn.uses_moe_expert_cache()) return true;
-        }
-    }
-    return false;
+bool qwen_continuous_batch_cuda_graph_enabled(
+        const Qwen35CausalLm& model,
+        const CudaContinuousBatchConfig& config) {
+    const auto& execution = *model.execution;
+    return config.cuda_graph &&
+        !Qwen35BatchStateAdapter::has_cached_moe(model) &&
+        mfq_cuda_graph_capture_supported() &&
+        model_parallel_cuda_graph_enabled(execution);
 }
 
 class MoeContinuousBatchCacheScope {
@@ -111,271 +60,6 @@ private:
     CudaExecutionContext& execution_;
     bool previous_ = false;
 };
-
-static std::string qwen_continuous_batching_incompatibility(
-        const mfq::cuda::Qwen35CausalLm & model,
-        const CudaExecutionContext& execution) {
-    if (model.blocks.empty()) {
-        return "continuous batching requires at least one model block";
-    }
-    if (execution.dense_cpu_layer_count != 0 ||
-            !execution.dsv4_cpu_offload_layers.empty()) {
-        return "continuous batching requires GPU-resident model blocks";
-    }
-    for (const auto & block : model.blocks) {
-        if (block->cpu_offloaded) {
-            return "continuous batching cannot use CPU-offloaded blocks";
-        }
-        if (const auto * full = dynamic_cast<const FullBlock *>(block.get())) {
-            if (full->sliding) {
-                return "continuous batching requires non-sliding Qwen attention";
-            }
-            if (full->ffn.uses_moe_expert_cache() &&
-                    full->ffn.moe_top_k >
-                        execution.moe_cache_registration_min_slots) {
-                return "continuous batching requires one cached slot per routed expert";
-            }
-            continue;
-        }
-        if (const auto * linear = dynamic_cast<const LinearBlock *>(block.get())) {
-            if (linear->ffn.uses_moe_expert_cache() &&
-                    linear->ffn.moe_top_k >
-                        execution.moe_cache_registration_min_slots) {
-                return "continuous batching requires one cached slot per routed expert";
-            }
-            continue;
-        }
-        return "continuous batching encountered an unsupported Qwen block";
-    }
-    return {};
-}
-
-static bool qwen_continuous_batch_cuda_graph_enabled(
-        const mfq::cuda::Qwen35CausalLm& model,
-        const CudaContinuousBatchConfig& config) {
-    const auto& execution = *model.execution;
-    return config.cuda_graph &&
-        !qwen_continuous_batch_has_cached_moe(model) &&
-        mfq_cuda_graph_capture_supported() &&
-        model_parallel_cuda_graph_enabled(execution);
-}
-
-static QwenBatchState take_qwen_batch_state(
-        mfq::cuda::Qwen35CausalLm & model, int64_t batch, QwenPagedKvArena * paged_kv) {
-    MFQ_RUNTIME_CHECK(model.speculative_start < 0,
-        "continuous batching cannot detach speculative state");
-    QwenBatchState state;
-    state.batch = batch;
-    state.layers.reserve(model.blocks.size());
-    for (auto & block : model.blocks) {
-        MfqCudaGuard guard(block->cuda_device);
-        QwenBatchLayerState layer;
-        if (auto * full = dynamic_cast<FullBlock *>(block.get())) {
-            layer.kind = QwenBatchLayerState::Kind::FullAttention;
-            layer.paged = paged_kv != nullptr;
-            if (layer.paged) {
-                MFQ_RUNTIME_CHECK(full->cache.is_paged() &&
-                    full->cache.batch_size() == batch,
-                    "continuous batching paged KV state is unavailable");
-            } else {
-                MFQ_RUNTIME_CHECK(
-                    full->cache.k.defined() && full->cache.v.defined() &&
-                    full->cache.k.dim() == 4 &&
-                    full->cache.k.size(0) == batch &&
-                    full->cache.v.sizes() == full->cache.k.sizes(),
-                    "continuous batching full-attention state is unavailable");
-                layer.first = full->cache.k;
-                layer.second = full->cache.v;
-                layer.ring = full->cache.ring;
-            }
-            full->cache = KVCache();
-            clear_full_attention_decode_workspaces(*full);
-        } else if (auto * linear = dynamic_cast<LinearBlock *>(block.get())) {
-            MFQ_RUNTIME_CHECK(linear->conv_state.defined() &&
-                linear->gdn_state.defined() &&
-                linear->conv_state.size(0) == batch &&
-                linear->gdn_state.size(0) == batch &&
-                !linear->speculative_pending,
-                "continuous batching recurrent state is unavailable");
-            layer.kind = QwenBatchLayerState::Kind::Recurrent;
-            layer.first = linear->conv_state;
-            layer.second = linear->gdn_state;
-            linear->conv_state = Tensor();
-            linear->gdn_state = Tensor();
-            linear->speculative_conv = Tensor();
-            linear->speculative_gdn = Tensor();
-            linear->speculative_pending = false;
-        } else {
-            throw std::runtime_error(
-                "continuous batching encountered an unsupported block state");
-        }
-        state.layers.push_back(std::move(layer));
-    }
-    model.cache_pos = 0;
-    return state;
-}
-
-static Tensor merge_batch_tensors(
-        const std::vector<QwenBatchState> & states, size_t layer,
-        bool second) {
-    std::vector<Tensor> values;
-    values.reserve(states.size());
-    for (const auto & state : states) {
-        values.push_back(second
-            ? state.layers[layer].second
-            : state.layers[layer].first);
-    }
-    return values.size() == 1 ? values.front() :
-        mfq_tensor_backend::cat(values, 0).contiguous();
-}
-
-static void restore_qwen_batch_states(
-        mfq::cuda::Qwen35CausalLm & model, const std::vector<QwenBatchState> & states,
-        int64_t cache_position, QwenPagedKvArena * paged_kv) {
-    MFQ_RUNTIME_CHECK(!states.empty(),
-        "continuous batching cannot restore an empty state list");
-    int64_t batch = 0;
-    for (const auto & state : states) {
-        MFQ_RUNTIME_CHECK(state.batch > 0 &&
-            state.layers.size() == model.blocks.size(),
-            "continuous batching state layout changed");
-        batch += state.batch;
-    }
-    for (size_t layer_index = 0;
-            layer_index < model.blocks.size(); ++layer_index) {
-        auto & block = model.blocks[layer_index];
-        MfqCudaGuard guard(block->cuda_device);
-        const auto kind = states.front().layers[layer_index].kind;
-        for (const auto & state : states) {
-            MFQ_RUNTIME_CHECK(state.layers[layer_index].kind == kind,
-                "continuous batching mixed incompatible layer states");
-        }
-        if (auto * full = dynamic_cast<FullBlock *>(block.get())) {
-            MFQ_RUNTIME_CHECK(kind ==
-                QwenBatchLayerState::Kind::FullAttention,
-                "continuous batching full-attention state kind changed");
-            if (paged_kv != nullptr) {
-                for (const auto & state : states) {
-                    MFQ_RUNTIME_CHECK(state.layers[layer_index].paged,
-                        "continuous batching lost paged KV state");
-                }
-                full->cache = KVCache();
-                clear_full_attention_decode_workspaces(*full);
-                continue;
-            }
-            const auto shape = states.front().layers[layer_index].first.sizes();
-            for (const auto & state : states) {
-                const auto & saved = state.layers[layer_index];
-                MFQ_RUNTIME_CHECK(!saved.paged && !saved.ring &&
-                    saved.first.dim() == 4 &&
-                    saved.second.sizes() == saved.first.sizes() &&
-                    saved.first.size(1) == shape[1] &&
-                    saved.first.size(2) == shape[2] &&
-                    saved.first.size(3) == shape[3],
-                    "continuous batching KV cache geometry changed");
-            }
-            full->cache.k = merge_batch_tensors(
-                states, layer_index, false);
-            full->cache.v = merge_batch_tensors(
-                states, layer_index, true);
-            full->cache.ring = false;
-            MFQ_RUNTIME_CHECK(full->cache.k.size(0) == batch,
-                "continuous batching KV merge produced the wrong batch");
-            clear_full_attention_decode_workspaces(*full);
-        } else if (auto * linear = dynamic_cast<LinearBlock *>(block.get())) {
-            MFQ_RUNTIME_CHECK(kind == QwenBatchLayerState::Kind::Recurrent,
-                "continuous batching recurrent state kind changed");
-            linear->conv_state = merge_batch_tensors(
-                states, layer_index, false);
-            linear->gdn_state = merge_batch_tensors(
-                states, layer_index, true);
-            linear->speculative_conv = Tensor();
-            linear->speculative_gdn = Tensor();
-            linear->speculative_pending = false;
-            MFQ_RUNTIME_CHECK(linear->conv_state.size(0) == batch &&
-                linear->gdn_state.size(0) == batch,
-                "continuous batching recurrent merge produced the wrong batch");
-        } else {
-            throw std::runtime_error(
-                "continuous batching restore encountered an unsupported block");
-        }
-    }
-    model.cache_pos = cache_position;
-    model.speculative_start = -1;
-    model.speculative_confirmed = 0;
-}
-
-static QwenBatchState make_qwen_slot_state(
-        const QwenBatchState& source, int64_t slots) {
-    MFQ_RUNTIME_CHECK(source.batch == 1 && slots > 0,
-        "continuous batching slot state requires one source row");
-    QwenBatchState result;
-    result.batch = slots;
-    result.layers.reserve(source.layers.size());
-    for (const auto& saved : source.layers) {
-        QwenBatchLayerState layer;
-        layer.kind = saved.kind;
-        layer.ring = saved.ring;
-        layer.paged = saved.paged;
-        if (saved.first.defined()) {
-            auto first_shape = saved.first.sizes().vec();
-            auto second_shape = saved.second.sizes().vec();
-            first_shape[0] = slots;
-            second_shape[0] = slots;
-            layer.first = mfq_tensor_backend::zeros(
-                first_shape, saved.first.options());
-            layer.second = mfq_tensor_backend::zeros(
-                second_shape, saved.second.options());
-        }
-        result.layers.push_back(std::move(layer));
-    }
-    return result;
-}
-
-static void copy_qwen_state_to_slot(
-        QwenBatchState& slots, const QwenBatchState& source, int64_t slot) {
-    MFQ_RUNTIME_CHECK(source.batch == 1 && slot >= 0 && slot < slots.batch &&
-        slots.layers.size() == source.layers.size(),
-        "continuous batching received an invalid stable slot");
-    for (size_t layer = 0; layer < slots.layers.size(); ++layer) {
-        auto& target = slots.layers[layer];
-        const auto& saved = source.layers[layer];
-        MFQ_RUNTIME_CHECK(target.kind == saved.kind &&
-            target.paged == saved.paged,
-            "continuous batching stable slot layout changed");
-        if (!target.first.defined()) continue;
-        target.first.narrow(0, slot, 1).copy_(saved.first);
-        target.second.narrow(0, slot, 1).copy_(saved.second);
-    }
-}
-
-static Tensor qwen_logits_from_last_hidden(mfq::cuda::Qwen35CausalLm & model, Tensor hidden) {
-    auto last = hidden.index({Slice(), -1, Slice()})
-        .to(mfq_tensor_backend::kFloat16).contiguous();
-    return model.apply_final_logit_softcap(
-        model.lm_head.forward(*model.execution, last));
-}
-
-static std::vector<const void *> qwen_decode_state_addresses(mfq::cuda::Qwen35CausalLm & model) {
-    std::vector<const void *> addresses;
-    addresses.reserve(2 * model.blocks.size());
-    for (auto & block : model.blocks) {
-        if (auto * full = dynamic_cast<FullBlock *>(block.get())) {
-            if (full->cache.is_paged()) {
-                addresses.push_back(full->cache.k_chunk_ptrs.data_ptr());
-                addresses.push_back(full->cache.v_chunk_ptrs.data_ptr());
-                addresses.push_back(full->cache.page_table.data_ptr());
-            } else {
-                addresses.push_back(full->cache.k.data_ptr());
-                addresses.push_back(full->cache.v.data_ptr());
-            }
-        } else if (auto * linear = dynamic_cast<LinearBlock *>(block.get())) {
-            addresses.push_back(linear->conv_state.data_ptr());
-            addresses.push_back(linear->gdn_state.data_ptr());
-        }
-    }
-    return addresses;
-}
 
 struct QwenContinuousDecodeGraph {
     decltype(mfq_get_stream_from_pool(false)) stream;
@@ -461,22 +145,18 @@ struct QwenBatchOperations {
             mfq::cuda::Qwen35CausalLm& model,
             CudaExecutionContext& execution,
             std::mutex& model_mutex,
-            DecodeGraphCache& decode_graph,
-            TextSessionCache& session_cache,
-            MtpModule* mtp,
-            grid_vision_runtime::CudaGridVisionPromptComponent* grid_vision,
-            const CudaRuntimeConfig& runtime_config)
-        : model_(model), execution_(execution), model_mutex_(model_mutex),
-          decode_graph_cache_(decode_graph), session_cache_(session_cache),
-          mtp_(mtp), grid_vision_(grid_vision),
-          runtime_config_(runtime_config),
-          config_(runtime_config.continuous_batch),
+            CudaContinuousBatchConfig config,
+            int64_t prefill_chunk_size,
+            QwenExclusiveGeneration exclusive_generation)
+        : model_(model), state_adapter_(model), execution_(execution),
+          model_mutex_(model_mutex),
+          config_(std::move(config)),
           max_sequences_(static_cast<int32_t>(
               config_.scheduling.max_sequences)),
-          prefill_chunk_size_(runtime_config.generation.prefill_chunk_size),
-          moe_enabled_(qwen_continuous_batch_has_moe(model)),
-          cached_moe_enabled_(
-              qwen_continuous_batch_has_cached_moe(model)) {
+          prefill_chunk_size_(prefill_chunk_size),
+          exclusive_generation_(std::move(exclusive_generation)),
+          moe_enabled_(state_adapter_.has_moe()),
+          cached_moe_enabled_(state_adapter_.has_cached_moe()) {
         if (config_.scheduling.max_sequences >
                 static_cast<std::size_t>(
                     std::numeric_limits<int32_t>::max()) ||
@@ -484,20 +164,18 @@ struct QwenBatchOperations {
             throw std::invalid_argument(
                 "continuous batching max sequences must be positive");
         }
-        if (prefill_chunk_size_ < 1) {
+        if (prefill_chunk_size_ < 1 || !exclusive_generation_) {
             throw std::invalid_argument(
-                "continuous batching prefill chunk size must be positive");
+                "continuous batching requires prefill and exclusive generation");
         }
         const auto incompatibility =
-            qwen_continuous_batching_incompatibility(model_, execution_);
+            state_adapter_.incompatibility(execution_);
         if (!incompatibility.empty()) {
             throw std::runtime_error(incompatibility);
         }
         slots_.resize(static_cast<size_t>(max_sequences_));
-        paged_slots_.resize(static_cast<size_t>(max_sequences_));
         if (config_.paged_kv) {
-            paged_kv_ = std::make_unique<QwenPagedKvArena>(
-                model_, max_sequences_);
+            state_adapter_.enable_paged_kv(max_sequences_);
         }
     }
 
@@ -505,6 +183,7 @@ struct QwenBatchOperations {
     QwenBatchOperations& operator=(const QwenBatchOperations&) = delete;
 
     std::vector<std::pair<std::string, double>> metrics() const {
+        const auto paged = state_adapter_.paged_kv_stats();
         return {
             {"continuous_batching_requests",
                 static_cast<double>(requests_.load())},
@@ -544,53 +223,40 @@ struct QwenBatchOperations {
             {"continuous_batching_prefix_cache_exclusive_requests",
                 static_cast<double>(prefix_cache_exclusive_.load())},
             {"continuous_batching_paged_kv",
-                paged_kv_ ? 1.0 : 0.0},
-            {"paged_kv_page_size",
-                paged_kv_ ? static_cast<double>(paged_kv_->page_size()) : 0.0},
-            {"paged_kv_live_pages",
-                paged_kv_ ? static_cast<double>(paged_kv_->live_pages()) : 0.0},
+                state_adapter_.paged_kv_enabled() ? 1.0 : 0.0},
+            {"paged_kv_page_size", static_cast<double>(paged.page_size)},
+            {"paged_kv_live_pages", static_cast<double>(paged.live_pages)},
             {"paged_kv_peak_live_pages",
-                paged_kv_ ? static_cast<double>(paged_kv_->peak_live_pages()) : 0.0},
+                static_cast<double>(paged.peak_live_pages)},
             {"paged_kv_capacity_pages",
-                paged_kv_ ? static_cast<double>(paged_kv_->capacity_pages()) : 0.0},
+                static_cast<double>(paged.capacity_pages)},
             {"paged_kv_reserved_bytes",
-                paged_kv_ ? static_cast<double>(paged_kv_->reserved_bytes()) : 0.0},
+                static_cast<double>(paged.reserved_bytes)},
             {"paged_kv_page_allocations",
-                paged_kv_ ? static_cast<double>(paged_kv_->allocation_count()) : 0.0},
-            {"paged_kv_page_reuses",
-                paged_kv_ ? static_cast<double>(paged_kv_->reuse_count()) : 0.0},
+                static_cast<double>(paged.allocations)},
+            {"paged_kv_page_reuses", static_cast<double>(paged.reuses)},
             {"paged_kv_page_releases",
-                paged_kv_ ? static_cast<double>(paged_kv_->release_count()) : 0.0},
+                static_cast<double>(paged.releases)},
             {"paged_kv_table_updates",
-                paged_kv_ ? static_cast<double>(paged_kv_->page_table_updates()) : 0.0},
+                static_cast<double>(paged.table_updates)},
         };
     }
 
-    bool paged_kv_enabled() const noexcept { return paged_kv_ != nullptr; }
+    bool paged_kv_enabled() const noexcept {
+        return state_adapter_.paged_kv_enabled();
+    }
     int64_t paged_kv_page_size() const noexcept {
-        return paged_kv_ ? paged_kv_->page_size() : 0;
+        return state_adapter_.paged_kv_stats().page_size;
     }
 
     void bind_paged_requests(
-            const std::vector<std::shared_ptr<Request>> & requests) {
-        if (!paged_kv_) return;
-        std::vector<const QwenPagedKvSequence *> sequences;
+            const std::vector<std::shared_ptr<Request>>& requests) {
+        std::vector<const QwenPagedKvSequence*> sequences;
         sequences.reserve(requests.size());
-        for (const auto & request : requests) {
+        for (const auto& request : requests) {
             sequences.push_back(&request->paged_kv);
         }
-        paged_kv_->bind(sequences);
-    }
-
-    void bind_paged_slots() {
-        if (!paged_kv_) return;
-        std::vector<const QwenPagedKvSequence*> sequences;
-        sequences.reserve(paged_slots_.size());
-        for (auto& sequence : paged_slots_) {
-            paged_kv_->ensure_tokens(sequence, 1);
-            sequences.push_back(&sequence);
-        }
-        paged_kv_->bind(sequences);
+        state_adapter_.bind_paged_requests(sequences);
     }
 
     int32_t acquire_slot(const std::shared_ptr<Request>& request) {
@@ -598,11 +264,7 @@ struct QwenBatchOperations {
         MFQ_RUNTIME_CHECK(found != slots_.end(),
             "continuous batching has no free stable slot");
         const auto slot = static_cast<int32_t>(found - slots_.begin());
-        if (paged_kv_) {
-            paged_kv_->release(paged_slots_[static_cast<size_t>(slot)]);
-            std::swap(
-                paged_slots_[static_cast<size_t>(slot)], request->paged_kv);
-        }
+        state_adapter_.move_paged_to_slot(slot, request->paged_kv);
         *found = request;
         request->slot = slot;
         return slot;
@@ -610,14 +272,14 @@ struct QwenBatchOperations {
 
     void release_slot(const std::shared_ptr<Request>& request) {
         if (request->slot < 0) {
-            if (paged_kv_) paged_kv_->release(request->paged_kv);
+            state_adapter_.release_paged(request->paged_kv);
             return;
         }
         const auto slot = static_cast<size_t>(request->slot);
         MFQ_RUNTIME_CHECK(slot < slots_.size() && slots_[slot] == request,
             "continuous batching stable slot ownership changed");
         slots_[slot].reset();
-        if (paged_kv_) paged_kv_->release(paged_slots_[slot]);
+        state_adapter_.release_paged_slot(request->slot);
         request->slot = -1;
     }
 
@@ -626,14 +288,6 @@ struct QwenBatchOperations {
         for (const auto & request : requests) release_slot(request);
     }
 
-    void release_idle_paged_slots() {
-        if (!paged_kv_) return;
-        for (auto& sequence : paged_slots_) paged_kv_->release(sequence);
-    }
-
-    void detach_paged_kv() {
-        if (paged_kv_) paged_kv_->detach();
-    }
 
     void fail_requests(
             const std::vector<std::shared_ptr<Request>> & requests,
@@ -681,30 +335,18 @@ struct QwenBatchOperations {
                 request->cache_plan.stable_prefix_tokens != 0) {
             ++prefix_cache_exclusive_;
         }
-        internal::PreparedPromptFactory<Qwen35CausalLm> prepare;
-        if (request->media) {
-            if (grid_vision_ == nullptr) {
-                throw std::runtime_error(
-                    "continuous batching received unavailable grid vision input");
-            }
-            prepare = [this, request](Qwen35CausalLm& language) {
-                return std::optional<CudaPreparedPrompt>{grid_vision_->prepare(
-                    language, request->prompt, *request->media)};
-            };
-        }
-        std::mutex already_locked_model;
-        request->produced = internal::generate(
-            model_, already_locked_model, decode_graph_cache_, session_cache_,
-            runtime_config_, request->prompt, request->sampling,
+        request->produced = exclusive_generation_(
+            request->prompt,
+            request->media ? &*request->media : nullptr,
+            request->sampling,
             [request](int64_t token) {
                 return request->publish_token_sync(token);
             },
             [request](MfqPrefillTiming timing) {
                 request->publish_prefill(timing);
             },
-            request->cache_plan, request->token_constraint,
-            request->sampling.enable_mtp ? mtp_ : nullptr,
-            std::move(prepare),
+            request->cache_plan,
+            request->token_constraint,
             [request] {
                 return request->cancel_requested.load(
                     std::memory_order_acquire);
@@ -726,8 +368,7 @@ struct QwenBatchOperations {
         MfqCudaGuard primary_guard(primary);
         std::optional<QwenBatchState> slot_state;
         if (!state.active.empty()) {
-            slot_state = take_qwen_batch_state(
-                model_, max_sequences_, paged_kv_.get());
+            slot_state = state_adapter_.take(max_sequences_);
         }
         std::vector<std::shared_ptr<Request>> admitted;
         admitted.reserve(state.prefilling.size());
@@ -740,9 +381,9 @@ struct QwenBatchOperations {
             state.prefilling.pop_front();
             if (request->cancel_requested.load(std::memory_order_acquire)) {
                 try { mfq_cuda_synchronize(); } catch (...) {}
-                if (paged_kv_) {
-                    paged_kv_->release(request->paged_kv);
-                    detach_paged_kv();
+                if (state_adapter_.paged_kv_enabled()) {
+                    state_adapter_.release_paged(request->paged_kv);
+                    state_adapter_.detach_paged_kv();
                 }
                 request->prefill_state.reset();
                 request->prefill_timers.clear();
@@ -754,7 +395,7 @@ struct QwenBatchOperations {
                 // ponytail: special requests serialize behind the batch until
                 // target/MTP/media kernels support per-row heterogeneous state.
                 try {
-                    detach_paged_kv();
+                    state_adapter_.detach_paged_kv();
                     run_exclusive_generation(request);
                     model_.reset(1);
                     request->complete();
@@ -773,14 +414,13 @@ struct QwenBatchOperations {
                     std::vector<QwenBatchState> resumed;
                     resumed.push_back(std::move(*request->prefill_state));
                     request->prefill_state.reset();
-                    restore_qwen_batch_states(
-                        model_, resumed, request->prefill_offset,
-                        paged_kv_.get());
+                    state_adapter_.restore(
+                        resumed, request->prefill_offset);
                     bind_paged_requests({request});
                 } else {
                     model_.reset(1);
-                    if (paged_kv_) {
-                        paged_kv_->ensure_tokens(
+                    if (state_adapter_.paged_kv_enabled()) {
+                        state_adapter_.ensure_request_tokens(
                             request->paged_kv,
                             static_cast<int64_t>(request->prompt.size()));
                         bind_paged_requests({request});
@@ -828,9 +468,9 @@ struct QwenBatchOperations {
                 if (request->cancel_requested.load(
                         std::memory_order_acquire)) {
                     try { mfq_cuda_synchronize(); } catch (...) {}
-                    if (paged_kv_) {
-                        paged_kv_->release(request->paged_kv);
-                        detach_paged_kv();
+                    if (state_adapter_.paged_kv_enabled()) {
+                        state_adapter_.release_paged(request->paged_kv);
+                        state_adapter_.detach_paged_kv();
                     }
                     request->prefill_timers.clear();
                     request->prefill_ids = Tensor();
@@ -843,15 +483,13 @@ struct QwenBatchOperations {
                         "continuous batching scheduler stopped during prefill");
                 }
                 if (request->prefill_offset < request->prefill_ids.size(1)) {
-                    request->prefill_state = take_qwen_batch_state(
-                        model_, 1, paged_kv_.get());
-                    detach_paged_kv();
+                    request->prefill_state = state_adapter_.take(1);
+                    state_adapter_.detach_paged_kv();
                     state.prefilling.push_back(std::move(request));
                     ++prefill_yields_;
                     continue;
                 }
-                auto logits = qwen_logits_from_last_hidden(
-                    model_, std::move(hidden));
+                auto logits = state_adapter_.logits_from_last_hidden(std::move(hidden));
                 MFQ_RUNTIME_CHECK(final_timer != nullptr,
                     "continuous batching lost the prefill timer");
                 MFQ_CUDA_CHECK(cudaEventRecord(
@@ -878,9 +516,9 @@ struct QwenBatchOperations {
                 if (request->cancel_requested.load(
                             std::memory_order_acquire) ||
                         request->produced >= request->generation_limit) {
-                    if (paged_kv_) {
-                        paged_kv_->release(request->paged_kv);
-                        detach_paged_kv();
+                    if (state_adapter_.paged_kv_enabled()) {
+                        state_adapter_.release_paged(request->paged_kv);
+                        state_adapter_.detach_paged_kv();
                     }
                     request->complete();
                     continue;
@@ -889,14 +527,13 @@ struct QwenBatchOperations {
                     sample_token_counts_add_cuda(
                         request->counts, next.contiguous());
                 }
-                auto admitted_state = take_qwen_batch_state(
-                    model_, 1, paged_kv_.get());
+                auto admitted_state = state_adapter_.take(1);
                 const auto slot = acquire_slot(request);
                 if (!slot_state) {
-                    slot_state = make_qwen_slot_state(
+                    slot_state = state_adapter_.make_slot_state(
                         admitted_state, max_sequences_);
                 }
-                copy_qwen_state_to_slot(
+                state_adapter_.copy_to_slot(
                     *slot_state, admitted_state, slot);
                 admitted.push_back(request);
                 ++admissions_;
@@ -905,7 +542,7 @@ struct QwenBatchOperations {
                 auto error = std::current_exception();
                 try { mfq_cuda_synchronize(); } catch (...) {}
                 try { release_slot(request); } catch (...) {}
-                detach_paged_kv();
+                state_adapter_.detach_paged_kv();
                 request->prefill_state.reset();
                 request->prefill_timers.clear();
                 request->prefill_ids = Tensor();
@@ -923,12 +560,12 @@ struct QwenBatchOperations {
             }
             std::vector<QwenBatchState> states;
             states.push_back(std::move(*slot_state));
-            restore_qwen_batch_states(
-                model_, states, max_cache_position, paged_kv_.get());
-            bind_paged_slots();
+            state_adapter_.restore(
+                states, max_cache_position);
+            state_adapter_.bind_paged_slots();
         } else {
             model_.reset(1);
-            detach_paged_kv();
+            state_adapter_.detach_paged_kv();
         }
     }
 
@@ -956,11 +593,11 @@ struct QwenBatchOperations {
         if (survivors.empty()) {
             invalidate_decode_graph();
             model_.reset(1);
-            release_idle_paged_slots();
-            detach_paged_kv();
+            state_adapter_.release_idle_paged_slots();
+            state_adapter_.detach_paged_kv();
         } else {
             model_.cache_pos = survivor_max_position;
-            bind_paged_slots();
+            state_adapter_.bind_paged_slots();
         }
         state.active = std::move(survivors);
         for (const auto& request : cancelled) {
@@ -995,14 +632,14 @@ struct QwenBatchOperations {
         MfqCudaGuard primary_guard(primary);
         retire_cancelled_requests(state);
         if (state.active.empty()) return;
-        if (paged_kv_) {
+        if (state_adapter_.paged_kv_enabled()) {
             bool page_table_changed = false;
             for (const auto& request : state.active) {
-                page_table_changed = paged_kv_->ensure_tokens(
-                    paged_slots_[static_cast<size_t>(request->slot)],
-                    request->cache_length + 1) || page_table_changed;
+                page_table_changed = state_adapter_.ensure_slot_tokens(
+                    request->slot, request->cache_length + 1) ||
+                    page_table_changed;
             }
-            if (page_table_changed) bind_paged_slots();
+            if (page_table_changed) state_adapter_.bind_paged_slots();
         }
         const int64_t batch = max_sequences_;
         const bool batch_greedy = std::all_of(
@@ -1033,7 +670,7 @@ struct QwenBatchOperations {
         if (batch >= 2 && batch_greedy && config_.greedy &&
                 qwen_continuous_batch_cuda_graph_enabled(
                     model_, config_)) {
-            graph_state_addresses = qwen_decode_state_addresses(model_);
+            graph_state_addresses = state_adapter_.decode_state_addresses();
             const auto found = std::find_if(
                 decode_graphs_.begin(), decode_graphs_.end(),
                 [&](const auto& graph) {
@@ -1112,8 +749,7 @@ struct QwenBatchOperations {
                     auto hidden = model_.hidden_forward_static(
                         ids, pos, lengths, planned_len,
                         graph_attention_parts);
-                    auto current_logits = qwen_logits_from_last_hidden(
-                        model_, std::move(hidden));
+                    auto current_logits = state_adapter_.logits_from_last_hidden(std::move(hidden));
                     return sample_greedy_cuda(
                         current_logits.contiguous().view({batch, -1}));
                 };
@@ -1137,7 +773,7 @@ struct QwenBatchOperations {
                         decode_graph->graph->capture_end();
                         decode_graph->set_key(
                             batch, planned_len,
-                            qwen_decode_state_addresses(model_));
+                            state_adapter_.decode_state_addresses());
                         ++cuda_graph_captures_;
                     } catch (...) {
                         decode_graph->invalidate();
@@ -1150,8 +786,7 @@ struct QwenBatchOperations {
             } else {
                 auto hidden = model_.hidden_forward(
                     ids, pos, lengths, nullptr, pos);
-                logits = qwen_logits_from_last_hidden(
-                    model_, std::move(hidden));
+                logits = state_adapter_.logits_from_last_hidden(std::move(hidden));
             }
             model_.cache_pos = max_sequence_length;
         } catch (...) {
@@ -1160,8 +795,8 @@ struct QwenBatchOperations {
             try { model_.reset(1); } catch (...) {}
             fail_requests(state.active, error);
             release_paged_requests(state.active);
-            release_idle_paged_slots();
-            detach_paged_kv();
+            state_adapter_.release_idle_paged_slots();
+            state_adapter_.detach_paged_kv();
             state.active.clear();
             return;
         }
@@ -1250,8 +885,8 @@ struct QwenBatchOperations {
             stable_slot_releases_.fetch_add(
                 static_cast<int64_t>(state.active.size()),
                 std::memory_order_relaxed);
-            release_idle_paged_slots();
-            detach_paged_kv();
+            state_adapter_.release_idle_paged_slots();
+            state_adapter_.detach_paged_kv();
         } else {
             if (survivors.size() != state.active.size()) {
                 std::vector<std::shared_ptr<Request>> retired;
@@ -1263,7 +898,7 @@ struct QwenBatchOperations {
                 stable_slot_releases_.fetch_add(
                     static_cast<int64_t>(retired.size()),
                     std::memory_order_relaxed);
-                bind_paged_slots();
+                state_adapter_.bind_paged_slots();
             }
             model_.cache_pos = survivor_max_position;
         }
@@ -1286,26 +921,23 @@ struct QwenBatchOperations {
         try { mfq_cuda_synchronize(); } catch (...) {}
         release_paged_requests(prefilling);
         release_paged_requests(state.active);
-        release_idle_paged_slots();
+        state_adapter_.release_idle_paged_slots();
         model_.reset(1);
-        detach_paged_kv();
+        state_adapter_.detach_paged_kv();
     }
 
     void recover(State& state, std::exception_ptr error) {
         shutdown({}, state, error);
     }
 
-    mfq::cuda::Qwen35CausalLm & model_;
+    Qwen35CausalLm& model_;
+    Qwen35BatchStateAdapter state_adapter_;
     CudaExecutionContext& execution_;
     std::mutex & model_mutex_;
-    DecodeGraphCache& decode_graph_cache_;
-    TextSessionCache& session_cache_;
-    MtpModule* mtp_ = nullptr;
-    grid_vision_runtime::CudaGridVisionPromptComponent* grid_vision_ = nullptr;
-    const CudaRuntimeConfig& runtime_config_;
     const CudaContinuousBatchConfig config_;
     int32_t max_sequences_ = 0;
     int64_t prefill_chunk_size_ = 2048;
+    QwenExclusiveGeneration exclusive_generation_;
     bool moe_enabled_ = false;
     bool cached_moe_enabled_ = false;
     std::atomic<int64_t> requests_{0};
@@ -1326,8 +958,6 @@ struct QwenBatchOperations {
     Tensor decode_metadata_host_;
     Tensor decode_metadata_cuda_;
     std::vector<std::shared_ptr<Request>> slots_;
-    std::vector<QwenPagedKvSequence> paged_slots_;
-    std::unique_ptr<QwenPagedKvArena> paged_kv_;
     std::vector<std::unique_ptr<QwenContinuousDecodeGraph>> decode_graphs_;
 };
 
@@ -1339,16 +969,14 @@ struct QwenBatchExecutor::Impl {
             Qwen35CausalLm& model,
             CudaExecutionContext& execution,
             std::mutex& model_mutex,
-            DecodeGraphCache& decode_graph,
-            TextSessionCache& session_cache,
-            MtpModule* mtp,
-            grid_vision_runtime::CudaGridVisionPromptComponent* grid_vision,
-            const CudaRuntimeConfig& config)
+            const CudaContinuousBatchConfig& config,
+            int64_t prefill_chunk_size,
+            QwenExclusiveGeneration exclusive_generation)
         : controller_(
-              config.continuous_batch.scheduling,
+              config.scheduling,
               std::make_unique<QwenBatchOperations>(
-                  model, execution, model_mutex, decode_graph, session_cache,
-                  mtp, grid_vision, config)) {}
+                  model, execution, model_mutex, config,
+                  prefill_chunk_size, std::move(exclusive_generation))) {}
 
     int32_t submit(
             const std::vector<int64_t>& prompt,
@@ -1399,13 +1027,13 @@ struct QwenBatchExecutor::Impl {
 
 QwenBatchExecutor::QwenBatchExecutor(
         Qwen35CausalLm& model, CudaExecutionContext& execution,
-        std::mutex& model_mutex, DecodeGraphCache& decode_graph,
-        TextSessionCache& session_cache, MtpModule* mtp,
-        grid_vision_runtime::CudaGridVisionPromptComponent* grid_vision,
-        const CudaRuntimeConfig& config)
+        std::mutex& model_mutex,
+        const CudaContinuousBatchConfig& config,
+        int64_t prefill_chunk_size,
+        QwenExclusiveGeneration exclusive_generation)
     : impl_(std::make_unique<Impl>(
-          model, execution, model_mutex, decode_graph, session_cache,
-          mtp, grid_vision, config)) {}
+          model, execution, model_mutex, config,
+          prefill_chunk_size, std::move(exclusive_generation))) {}
 
 QwenBatchExecutor::~QwenBatchExecutor() = default;
 
@@ -1440,322 +1068,4 @@ std::int64_t QwenBatchExecutor::paged_kv_page_size() const noexcept {
     return impl_->paged_kv_page_size();
 }
 
-int run_qwen_continuous_batching_check(
-        Qwen35CausalLm& model,
-        const CudaRuntimeConfig& runtime_config) {
-    auto check_config = runtime_config;
-    check_config.generation.prefill_chunk_size = 64;
-    check_config.continuous_batch.scheduling.max_sequences = 4;
-    check_config.continuous_batch.scheduling.initial_batch_wait =
-        std::chrono::milliseconds(100);
-    auto& execution = *model.execution;
-    const auto incompatibility =
-        qwen_continuous_batching_incompatibility(model, execution);
-    MFQ_RUNTIME_CHECK(incompatibility.empty(), incompatibility);
-    MFQ_RUNTIME_CHECK(model.vocab_size() > 1024 &&
-        model.max_position_embeddings() >= 208,
-        "continuous batching check requires vocab>1024 and context>=208");
-
-    MfqSamplingParams first_params;
-    first_params.max_tokens = 20;
-    first_params.temperature = 0.0;
-    first_params.top_k = 1;
-    first_params.top_p = 1.0;
-    first_params.enable_mtp = false;
-    first_params.seed = 20260907;
-    auto second_params = first_params;
-    second_params.max_tokens = 18;
-    second_params.seed += 1;
-    std::vector<int64_t> first_prompt(193);
-    std::vector<int64_t> second_prompt(17);
-    for (size_t index = 0; index < first_prompt.size(); ++index) {
-        first_prompt[index] = 101 +
-            static_cast<int64_t>((index * 37) % 900);
-    }
-    for (size_t index = 0; index < second_prompt.size(); ++index) {
-        second_prompt[index] = 113 +
-            static_cast<int64_t>((index * 53) % 880);
-    }
-    auto serial = [&](const std::vector<int64_t> & prompt,
-                      const MfqSamplingParams & params) {
-        std::vector<int64_t> output;
-        std::mutex mutex;
-        DecodeGraphCache graph_cache(
-            model.max_position_embeddings());
-        TextSessionCache session_cache(
-            check_config.session_cache, check_config.prefix_cache);
-        const int32_t produced = generate(
-            model, mutex, graph_cache, session_cache, check_config,
-            prompt, params,
-            [&](int64_t token) {
-                output.push_back(token);
-                return true;
-            }, {}, {}, {}, nullptr);
-        MFQ_RUNTIME_CHECK(
-            produced == params.max_tokens &&
-                output.size() == static_cast<size_t>(produced),
-            "continuous batching serial oracle length mismatch");
-        return output;
-    };
-    const auto first_reference = serial(first_prompt, first_params);
-    const auto second_reference = serial(second_prompt, second_params);
-    model.reset(1);
-
-    std::mutex model_mutex;
-    DecodeGraphCache batch_graph(model.max_position_embeddings());
-    TextSessionCache batch_sessions(
-        check_config.session_cache, check_config.prefix_cache);
-    QwenBatchExecutor batcher(
-        model, execution, model_mutex, batch_graph, batch_sessions,
-        nullptr, nullptr, check_config);
-    std::mutex gate_mutex;
-    std::condition_variable gate_ready;
-    bool first_prefilled = false;
-    bool second_delivered = false;
-    bool release_first = false;
-    std::vector<int64_t> first_output;
-    std::vector<int64_t> second_output;
-    std::exception_ptr first_error;
-    std::exception_ptr second_error;
-    int32_t first_produced = 0;
-    int32_t second_produced = 0;
-
-    std::thread first_thread([&] {
-        try {
-            first_produced = batcher.submit(
-                first_prompt, first_params,
-                [&](int64_t token) {
-                    first_output.push_back(token);
-                    if (first_output.size() == 1) {
-                        std::unique_lock<std::mutex> lock(gate_mutex);
-                        first_prefilled = true;
-                        gate_ready.notify_one();
-                        gate_ready.wait(lock, [&] { return release_first; });
-                    }
-                    return true;
-                }, {}, {}, {}, {});
-        } catch (...) {
-            first_error = std::current_exception();
-        }
-    });
-    bool first_queued = false;
-    for (int attempt = 0; attempt < 50; ++attempt) {
-        if (batcher.queued_requests() > 0) {
-            first_queued = true;
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    std::thread second_thread([&] {
-        try {
-            second_produced = batcher.submit(
-                second_prompt, second_params,
-                [&](int64_t token) {
-                    second_output.push_back(token);
-                    if (second_output.size() == 1) {
-                        std::lock_guard<std::mutex> lock(gate_mutex);
-                        second_delivered = true;
-                        gate_ready.notify_one();
-                    }
-                    return true;
-                }, {}, {}, {}, {});
-        } catch (...) {
-            second_error = std::current_exception();
-        }
-    });
-    bool first_callback_started = false;
-    bool callback_isolated = false;
-    {
-        std::unique_lock<std::mutex> lock(gate_mutex);
-        first_callback_started = gate_ready.wait_for(
-            lock, std::chrono::seconds(10), [&] {
-                return first_prefilled;
-            });
-        callback_isolated = first_callback_started && gate_ready.wait_for(
-            lock, std::chrono::seconds(10), [&] {
-                return second_delivered;
-            });
-        release_first = true;
-    }
-    gate_ready.notify_one();
-    first_thread.join();
-    second_thread.join();
-    if (first_error) std::rethrow_exception(first_error);
-    if (second_error) std::rethrow_exception(second_error);
-    MFQ_RUNTIME_CHECK(first_queued && first_callback_started &&
-        callback_isolated,
-        "a blocked response callback stalled the scheduler");
-    MFQ_RUNTIME_CHECK(first_produced == first_params.max_tokens &&
-        second_produced == second_params.max_tokens,
-        "continuous batching generated token count mismatch");
-    const auto print_mismatch = [](const char * name,
-            const std::vector<int64_t> & reference,
-            const std::vector<int64_t> & actual) {
-        if (reference == actual) return;
-        std::cerr << "continuous_batching_check mismatch " << name << " reference=";
-        for (auto token : reference) std::cerr << token << ',';
-        std::cerr << " actual=";
-        for (auto token : actual) std::cerr << token << ',';
-        std::cerr << '\n';
-    };
-    print_mismatch("first", first_reference, first_output);
-    print_mismatch("second", second_reference, second_output);
-    MFQ_RUNTIME_CHECK(first_output == first_reference,
-        "continuous batching first request differs from serial greedy oracle");
-    MFQ_RUNTIME_CHECK(second_output == second_reference,
-        "continuous batching second request differs from serial greedy oracle");
-    auto cancel_params = second_params;
-    cancel_params.max_tokens = 12;
-    int32_t cancellation_callbacks = 0;
-    const int32_t cancellation_produced = batcher.submit(
-        second_prompt, cancel_params,
-        [&](int64_t) {
-            ++cancellation_callbacks;
-            return false;
-        }, {}, {}, {}, {});
-    MFQ_RUNTIME_CHECK(cancellation_produced == 1 &&
-        cancellation_callbacks == 1,
-        "continuous batching callback cancellation did not stop at one token");
-
-    auto prefix_params = first_params;
-    prefix_params.max_tokens = 2;
-    const auto prefix_reference = serial(first_prompt, prefix_params);
-    model.reset(1);
-    MfqPromptCachePlan prefix_plan{
-        "continuous-batch-check", first_prompt.size() - 1};
-    std::vector<int64_t> first_cached;
-    std::vector<int64_t> second_cached;
-    const auto first_cached_count = batcher.submit(
-        first_prompt, prefix_params,
-        [&](int64_t token) {
-            first_cached.push_back(token);
-            return true;
-        }, {}, prefix_plan, {}, {});
-    const auto second_cached_count = batcher.submit(
-        first_prompt, prefix_params,
-        [&](int64_t token) {
-            second_cached.push_back(token);
-            return true;
-        }, {}, prefix_plan, {}, {});
-    MFQ_RUNTIME_CHECK(
-        first_cached_count == prefix_params.max_tokens &&
-        second_cached_count == prefix_params.max_tokens &&
-        first_cached == prefix_reference &&
-        second_cached == prefix_reference,
-        "continuous batching prefix reuse differs from serial oracle");
-
-    const auto values = batcher.metrics();
-    auto metric = [&](const std::string & name) {
-        const auto found = std::find_if(
-            values.begin(), values.end(), [&](const auto & item) {
-                return item.first == name;
-            });
-        return found == values.end() ? 0.0 : found->second;
-    };
-    const auto cache_values = batch_sessions.metrics();
-    const auto cache_metric = [&](const std::string& name) {
-        const auto found = std::find_if(
-            cache_values.begin(), cache_values.end(), [&](const auto& item) {
-                return item.first == name;
-            });
-        return found == cache_values.end() ? 0.0 : found->second;
-    };
-    std::cout << "continuous_batching_check metrics max_batch="
-              << metric("continuous_batching_max_batch")
-              << " stable_slot_releases="
-              << metric("continuous_batching_stable_slot_releases")
-              << " batched_greedy_batches="
-              << metric("continuous_batching_batched_greedy_batches")
-              << " packed_metadata_batches="
-              << metric("continuous_batching_packed_metadata_batches")
-              << " cuda_graph_captures="
-              << metric("continuous_batching_cuda_graph_captures")
-              << " cuda_graph_replays="
-              << metric("continuous_batching_cuda_graph_replays")
-              << " paged_kv="
-              << metric("continuous_batching_paged_kv")
-              << " page_size="
-              << metric("paged_kv_page_size")
-              << " live_pages="
-              << metric("paged_kv_live_pages")
-              << " peak_pages="
-              << metric("paged_kv_peak_live_pages")
-              << " capacity_pages="
-              << metric("paged_kv_capacity_pages")
-              << " page_allocations="
-              << metric("paged_kv_page_allocations")
-              << " page_reuses="
-              << metric("paged_kv_page_reuses")
-              << " page_releases="
-              << metric("paged_kv_page_releases")
-              << " active="
-              << metric("continuous_batching_active")
-              << " prefilling="
-              << metric("continuous_batching_prefilling")
-              << " prefill_chunks="
-              << metric("continuous_batching_prefill_chunks")
-              << " prefill_yields="
-              << metric("continuous_batching_prefill_yields")
-              << " queued="
-              << metric("continuous_batching_queued") << '\n';
-    MFQ_RUNTIME_CHECK(metric("continuous_batching_max_batch") >= 2.0 &&
-        metric("continuous_batching_compactions") == 0.0 &&
-        metric("continuous_batching_stable_slot_releases") >= 1.0 &&
-        (!check_config.continuous_batch.greedy ||
-            metric("continuous_batching_batched_greedy_batches") >= 1.0) &&
-        metric("continuous_batching_packed_metadata_batches") >= 1.0 &&
-        (!qwen_continuous_batch_cuda_graph_enabled(
-                model, check_config.continuous_batch) ||
-             (metric("continuous_batching_cuda_graph_captures") >= 1.0 &&
-             metric("continuous_batching_cuda_graph_replays") >= 2.0)) &&
-        (!check_config.continuous_batch.paged_kv ||
-            (metric("continuous_batching_paged_kv") == 1.0 &&
-             metric("paged_kv_page_size") ==
-                static_cast<double>(QwenPagedKvArena::kPageSize) &&
-             metric("paged_kv_live_pages") == 0.0 &&
-             metric("paged_kv_peak_live_pages") > 0.0 &&
-             metric("paged_kv_capacity_pages") >=
-                metric("paged_kv_peak_live_pages") &&
-             metric("paged_kv_page_allocations") ==
-                metric("paged_kv_page_releases") &&
-             metric("paged_kv_page_reuses") > 0.0)) &&
-        metric("continuous_batching_prefill_chunks") >= 4.0 &&
-        metric("continuous_batching_prefix_cache_exclusive_requests") == 2.0 &&
-        cache_metric("prefix_cache_hits") >= 1.0 &&
-        cache_metric("prefix_cache_hit_tokens") >=
-            static_cast<double>(first_prompt.size() - 1) &&
-        metric("continuous_batching_active") == 0.0 &&
-        metric("continuous_batching_prefilling") == 0.0 &&
-        metric("continuous_batching_queued") == 0.0,
-        "continuous batching check did not exercise join and retire");
-    std::cout << "continuous_batching_check PASS concurrent_requests=2"
-              << " cancellation_tokens=1 prefix_cache_hits="
-              << cache_metric("prefix_cache_hits")
-              << " max_batch="
-              << metric("continuous_batching_max_batch")
-              << " prompt_lengths=193,17 split_k=1"
-              << " decode_batches="
-              << metric("continuous_batching_decode_batches")
-              << " stable_slot_releases="
-              << metric("continuous_batching_stable_slot_releases") << '\n';
-    return 0;
-}
-
-} // namespace mfq::cuda::qwen35
-
-template <>
-std::unique_ptr<mfq::engine::ContinuousBatching>
-make_cuda_continuous_batching(
-        mfq::cuda::Qwen35CausalLm& model,
-        CudaExecutionContext& execution,
-        std::mutex& model_mutex,
-        DecodeGraphCache& decode_graph,
-        mfq::cuda::internal::TextSessionCache& session_cache,
-        RuntimeComponents<mfq::cuda::Qwen35CausalLm>& components,
-        const mfq::cuda::CudaRuntimeConfig& config) {
-    return std::make_unique<mfq::cuda::qwen35::QwenBatchExecutor>(
-        model, execution, model_mutex, decode_graph, session_cache,
-        components.mtp.get(),
-        components.grid_vision ? &*components.grid_vision : nullptr,
-        config);
-}
+} // namespace mfq::cuda
