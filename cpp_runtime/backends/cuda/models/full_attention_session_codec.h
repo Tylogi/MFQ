@@ -2,10 +2,12 @@
 
 #include "session_state.h"
 
+namespace mfq::models { template <class Backend> struct CausalLm; }
+
 namespace mfq::cuda {
 
-template <typename Model>
-struct CausalLm;
+template <typename Model> struct CudaCausalOps;
+template <typename Model> using CausalLm = mfq::models::CausalLm<CudaCausalOps<Model>>;
 
 template <typename Model>
 struct FullAttentionSessionCodec {

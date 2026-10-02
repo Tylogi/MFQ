@@ -64,6 +64,17 @@ def _section(text: str, start: str, end: str) -> str:
     return text[start_index:end_index]
 
 
+SHARED_ENGINE = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in (ROOT / "cpp_runtime" / "engine" / "include").glob("*.h")
+)
+SHARED_MODELS = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in (ROOT / "cpp_runtime" / "models").rglob("*.h")
+)
+
+DECODE += SHARED_ENGINE + SHARED_MODELS
+
 def test_cpp_runtime_dependencies_are_integrated() -> None:
     assert not (ROOT / "third_party").exists()
     assert not (ROOT / "cpp_runtime" / "llama").exists()
@@ -139,9 +150,9 @@ def test_server_enforces_complete_chat_template_tool_calls() -> None:
     assert "token_constraint," in METAL_DECODE
     assert "CUDA constrained sampler returned an invalid token" in DECODE
     assert "masked.to(logits.device())" in DECODE
-    assert "token_constraint->clone()" in DECODE
+    assert "constraint->clone()" in DECODE
     assert "restored.tokens, restored.mtp_last_target_hidden" in DECODE
-    assert "if (constraint_cursor) constraint_cursor->accept(pending);" in DECODE
+    assert "if(constraint_cursor)constraint_cursor->accept(pending);" in "".join(DECODE.split())
     assert "constraint_cursor->accept(result.next_token);" in DECODE
 
 

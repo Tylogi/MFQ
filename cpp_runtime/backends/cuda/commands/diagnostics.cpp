@@ -604,7 +604,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 auto seq_len = mfq_tensor_backend::tensor({decode_len}, cuda_i64);
                 auto hidden = model.hidden_forward(
                     input, mfq_nullopt, seq_len, nullptr, mfq_nullopt,
-                    nullptr, 0, planned_kv_length, 0);
+                    nullptr, 0, {planned_kv_length, 0});
                 auto last = hidden.index({Slice(), -1, Slice()}).to(mfq_tensor_backend::kFloat16).contiguous();
                 auto test = model.lm_head.forward(execution, last).to(mfq_tensor_backend::kFloat32);
                 const auto & ref = reference_logits[(size_t)step];

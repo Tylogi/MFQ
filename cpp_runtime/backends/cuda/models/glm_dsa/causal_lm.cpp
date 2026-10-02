@@ -1,6 +1,5 @@
 #include "causal_lm.h"
-#include "../causal_lm_impl.h"
-
+#include "../session_codec_impl.h"
 
 namespace mfq::cuda::glm_dsa {
 
@@ -52,7 +51,6 @@ void load_ffn(
             f, down_name, gate_name, up_name);
         prepare_ffn_workspaces(execution, f);
 }
-
 
 std::unique_ptr<::Block> load_block(
         CudaExecutionContext& execution,
@@ -144,7 +142,6 @@ std::unique_ptr<::Block> load_block(
         }
         return b;
 }
-
 
 } // namespace mfq::cuda::glm_dsa
 
@@ -336,6 +333,8 @@ void CudaSessionCodec<GlmDsaModel>::restore(
 
 namespace mfq::cuda {
 
-template struct CausalLm<GlmDsaModel>;
-
 } // namespace mfq::cuda
+
+namespace mfq::models {
+template struct CausalLm<cuda::CudaCausalOps<cuda::GlmDsaModel>>;
+} // namespace mfq::models

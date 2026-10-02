@@ -5,10 +5,10 @@ CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
 CUDA_SESSION_CACHE = (CUDA_ROOT / "engine" / "text_session_cache.cpp").read_text(
     encoding="utf-8"
 )
-CUDA_CAUSAL_LM_HEADER = (CUDA_ROOT / "models" / "causal_lm.h").read_text(
+CUDA_CAUSAL_LM_HEADER = (CUDA_ROOT / "models" / "causal_ops.h").read_text(
     encoding="utf-8"
 )
-CUDA_CAUSAL_LM_SOURCE = (CUDA_ROOT / "models" / "causal_lm.cpp").read_text(
+CUDA_CAUSAL_LM_SOURCE = (CUDA_ROOT / "models" / "causal_ops.cpp").read_text(
     encoding="utf-8"
 )
 CUDA_SESSION_STATE_HEADER = (
@@ -70,11 +70,23 @@ METAL_STREAM_SYNC = (
 ).read_text(encoding="utf-8")
 
 
+SHARED_ENGINE = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in (ROOT / "cpp_runtime" / "engine" / "include").glob("*.h")
+)
+SHARED_MODELS = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in (ROOT / "cpp_runtime" / "models").rglob("*.h")
+)
+
+DECODE += SHARED_ENGINE + SHARED_MODELS
+CUDA_SESSION_CACHE += SHARED_ENGINE
+
 def test_native_session_identifier_reaches_the_cuda_runtime() -> None:
     assert "std::string session_id;" in HEADER
     assert 'body.contains("mfq_session_id")' in SERVER
     assert "valid_mfq_session_id" in SERVER
-    assert "const auto& cache_plan = request.cache_plan" in DECODE
+    assert "constauto&cache_plan=request.cache_plan" in "".join(DECODE.split())
     assert "cache_plan.session_id" in DECODE
 
 
@@ -117,8 +129,8 @@ def test_glm_dsa_session_state_preserves_mla_and_index_caches() -> None:
 
 
 def test_partial_stable_prefix_is_saved_before_generation_suffix() -> None:
-    assert "offset < static_cast<int64_t>(plan.stable_prefix_tokens)" in DECODE
-    assert "offset == static_cast<int64_t>(plan.stable_prefix_tokens)) snapshot();" in DECODE
+    assert "generate_sequence(plain,output" in "".join(DECODE.split())
+    assert "progress->timing.prompt_tokens+restored.tokens==plan.stable_prefix_tokens" in "".join(DECODE.split())
     assert "model.capture_text_session_state(tokens)" in DECODE
     assert "tokens.size() > maximum_prefix_tokens" in SESSION_CACHE
 
@@ -164,7 +176,7 @@ def test_session_cache_uses_exact_prefixes_and_reports_suffix_prefill() -> None:
 
 
 def test_session_cache_retains_history_and_exposes_lifecycle_controls() -> None:
-    assert "SessionSnapshotCache<TextSessionState> snapshots_" in DECODE
+    assert "SessionSnapshotCache<Snapshot> snapshots_" in DECODE
     assert "fork_session(" in DECODE
     assert "close_session(" in DECODE
     assert 'server.Post("/runtime/sessions/fork"' in SERVER
@@ -269,7 +281,7 @@ def test_tiered_prefix_cache_can_release_only_its_hot_payloads() -> None:
     assert 'server.Post("/runtime/cache/trim"' in SERVER
     assert "SessionCommand::Kind::trim" in SERVER
     assert "session_control.trim_hot" in METAL_DECODE
-    assert "state.cache.trim_hot(command.bytes)" in DECODE
+    assert "cache.trim_hot(command.bytes)" in DECODE
     assert "release_host_allocator_cache()" in METAL_DECODE
     assert "mfq_release_host_allocator_cache()" in DECODE
 
@@ -295,8 +307,8 @@ def test_cuda_paged_restore_invalidates_only_deterministic_state_errors() -> Non
         "void store_paged(", 1
     )[0]
     corrupt, transient = restore.split(
-        "catch (const CudaSessionStateError& error)", 1
-    )[1].split("catch (const std::exception& error)", 1)
+        "catch (const StateError &error)", 1
+    )[1].split("catch (const std::exception &error)", 1)
     assert "return fail(invalid_action, error, true);" in corrupt
     assert "return fail(failure_action, error, false);" in transient
 
@@ -309,7 +321,7 @@ def test_cuda_paged_cache_only_accepts_linear_full_attention_kv() -> None:
     assert "decode_cuda_paged_session(" in DECODE
     assert "if (layer.ring" in DECODE
     assert "make_cuda_paged_prefix_cache(" in DECODE
-    assert "backend=cuda action=paged_hit" in DECODE
+    assert "runtime_session_cache action=paged_hit" in DECODE
     assert "prefix_cache_disk_blocks" in DECODE
     assert "MFQ_RUNTIME_PREFIX_CACHE_PENDING_BYTES" in DECODE
     assert "prefix_cache_pending_max_bytes" in DECODE

@@ -1,5 +1,5 @@
 #include "causal_lm.h"
-#include "../causal_lm_impl.h"
+#include "../session_codec_impl.h"
 
 namespace mfq::cuda::glm5_next {
 
@@ -128,6 +128,9 @@ bool Glm5Model::adapter_supports_speculation() const noexcept {
 namespace mfq::cuda {
 
 template struct CudaSessionCodec<Glm5Model>;
-template struct CausalLm<Glm5Model>;
 
 } // namespace mfq::cuda
+
+namespace mfq::models {
+template struct CausalLm<cuda::CudaCausalOps<cuda::Glm5Model>>;
+} // namespace mfq::models

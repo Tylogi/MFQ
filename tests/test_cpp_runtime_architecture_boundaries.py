@@ -101,15 +101,16 @@ CUDA_QWEN_LINEAR = (
 ).read_text(encoding="utf-8") + (\
     CUDA_MODELS / "qwen35" / "causal_lm.cpp"
 ).read_text(encoding="utf-8")
-CUDA_CAUSAL_LM = (CUDA_MODELS / "causal_lm.h").read_text(
+CUDA_CAUSAL_LM = (CUDA_MODELS / "causal_ops.h").read_text(
     encoding="utf-8"
 )
-CUDA_CAUSAL_LM_SOURCE = (CUDA_MODELS / "causal_lm.cpp").read_text(
+CUDA_CAUSAL_LM_SOURCE = (CUDA_MODELS / "causal_ops.cpp").read_text(
     encoding="utf-8"
 )
-CUDA_CAUSAL_LM_IMPL = (CUDA_MODELS / "causal_lm_impl.h").read_text(
+CUDA_CAUSAL_LM_IMPL = (CUDA_MODELS / "session_codec_impl.h").read_text(
     encoding="utf-8"
 )
+SHARED_CAUSAL_LM = (ROOT / "cpp_runtime/models/common/causal_lm.h").read_text(encoding="utf-8")
 CUDA_MODEL_HEADERS = "\n".join(
     path.read_text(encoding="utf-8")
     for path in CUDA_MODELS.rglob("*.h")
@@ -409,6 +410,9 @@ def test_cuda_cli_is_a_thin_client_of_the_runtime_library() -> None:
     assert "MFQ_SERVER_" not in CUDA_RUNTIME_SOURCE
 
 
+SHARED_GENERATION = (ROOT / "cpp_runtime/engine/include/generation_step.h").read_text(encoding="utf-8")
+SHARED_EXECUTOR = (ROOT / "cpp_runtime/engine/include/request_executor.h").read_text(encoding="utf-8")
+
 def test_cuda_runtime_has_one_shared_generation_path() -> None:
     generation = (CUDA_RUNTIME / "generation.cpp").read_text(encoding="utf-8")
     header = (CUDA_RUNTIME / "generation.h").read_text(encoding="utf-8")
@@ -418,11 +422,13 @@ def test_cuda_runtime_has_one_shared_generation_path() -> None:
 
     assert "generate_tokens" not in generation + header
     assert "MFQ_RUNTIME_QWEN38_TEXT_FLOW" not in CUDA_ENGINE_SOURCE
-    assert "current.generation = generate(" in CUDA_ENGINE_SOURCE
+    assert "RequestExecutor requests;" in CUDA_ENGINE_SOURCE
+    assert "mfq::engine::generate_request(" in generation
     assert "Generation generate(" in generation
-    assert "co_yield" in generation
-    assert "InferenceOutput& output" in generation
-    assert "class Generation" in header
+    assert "co_yield" not in generation
+    assert "InferenceOutput&output" in "".join(generation.split())
+    assert "class Generation" in SHARED_GENERATION
+    assert "class Generation" not in header
     assert "std::function" not in header
     assert "while (generated < max_tokens)" not in generation
     assert "generate_cli_tokens" not in header
@@ -503,17 +509,21 @@ def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
     assert "class GrammarConstraint" in constraint
     assert "class MfqGrammarConstraint" not in transport
     assert "execution.reset();" in options
-    assert "CudaExecutionContext& execution" in CUDA_CAUSAL_LM
+    assert "CudaExecutionContext&execution" in "".join(CUDA_CAUSAL_LM.split())
     assert "model.execution = &execution;" in (
         CUDA_MODELS / "loader.cpp"
     ).read_text(encoding="utf-8")
     assert "struct CudaSessionCodec" in CUDA_CAUSAL_LM
     assert "CudaSessionCodec<Model>::capture" in CUDA_CAUSAL_LM_IMPL
-    assert "state.decode_position_delta = decode_position_delta" in CUDA_CAUSAL_LM_IMPL
-    assert "decode_position_delta = state.decode_position_delta" in CUDA_CAUSAL_LM_IMPL
-    assert "void begin_speculative_suffix(int64_t draft_tokens);" in CUDA_CAUSAL_LM
-    assert "CausalLm<Model>::begin_speculative_suffix" in CUDA_CAUSAL_LM_IMPL
-    assert "CausalLm<Model>::finalize_hidden" in CUDA_CAUSAL_LM_IMPL
+    assert "state.decode_position_delta = decode_position_delta" in SHARED_CAUSAL_LM
+    assert "decode_position_delta = state.decode_position_delta" in SHARED_CAUSAL_LM
+    assert "void begin_speculative_suffix(int64_t draft_tokens)" in SHARED_CAUSAL_LM
+    assert "models::begin_speculative_suffix(*this" in "".join(SHARED_CAUSAL_LM.split())
+    assert "Tensor finalize_hidden(" in SHARED_CAUSAL_LM
+    assert "using CausalLm = mfq::models::CausalLm<CudaCausalOps<Model>>" in CUDA_CAUSAL_LM
+    assert "mfq_tensor_backend" not in SHARED_CAUSAL_LM
+    assert "planned_kv_length" not in SHARED_CAUSAL_LM
+    assert "Cuda" not in SHARED_CAUSAL_LM
     assert "if constexpr" not in CUDA_CAUSAL_LM_IMPL
     assert "struct Qwen35Model :" not in CUDA_CAUSAL_LM
     assert "template struct CausalLm<" not in CUDA_CAUSAL_LM_SOURCE
@@ -531,7 +541,7 @@ def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
         source = (CUDA_MODELS / path / "causal_lm.cpp").read_text(
             encoding="utf-8"
         )
-        assert f"template struct CausalLm<{model}>;" in source
+        assert f"template struct CausalLm<cuda::CudaCausalOps<cuda::{model}>>;" in source
     assert "CudaBackbone" not in CUDA_CAUSAL_LM + CUDA_CAUSAL_LM_IMPL
     assert "struct Request" not in CUDA_QWEN_BATCH_HEADER
     assert "struct QwenBatchExecutor::Impl" in CUDA_QWEN_BATCH_SOURCE
@@ -581,7 +591,8 @@ def test_cuda_runtime_composes_transport_scheduler_and_engine() -> None:
     assert "struct CudaEngine final : mfq::engine::Engine" in cuda_engine_header
     assert "std::unique_ptr<QwenBatchExecutor>" in CUDA_ENGINE_SOURCE
     assert "ContinuousBatchingController" not in CUDA_ENGINE_SOURCE
-    assert "current.generation.next()" in CUDA_ENGINE_SOURCE
+    assert "current.generation.next()" in SHARED_EXECUTOR
+    assert "state.requests.step(eligible, state)" in CUDA_ENGINE_SOURCE
     assert "qwen35::QwenBatchExecutor" not in CUDA_ENGINE_SOURCE
     assert "mfq::engine::Engine& engine_" in scheduler
     assert "mailbox_" in scheduler
@@ -1033,8 +1044,10 @@ def test_model_config_parsing_is_backend_neutral() -> None:
     assert not (CUDA_MODELS / "cuda_model_config.h").exists()
     assert not (CUDA_MODELS / "cuda_model_config.cpp").exists()
     for stem in shared_configs:
-        assert (CORE.parent / "models" / "include" / f"{stem}.h").is_file()
-        assert (CORE.parent / "models" / f"{stem}.cpp").is_file()
+        directory = "common" if stem == "model_config" else stem
+        filename = "model_config" if stem == "model_config" else "config"
+        assert (CORE.parent / "models" / directory / f"{filename}.h").is_file()
+        assert (CORE.parent / "models" / directory / f"{filename}.cpp").is_file()
 
     for config in (
         "mfq::models::qwen35::Config",
@@ -1055,7 +1068,7 @@ def test_model_config_parsing_is_backend_neutral() -> None:
     assert "nlohmann::json" not in CUDA_REGISTRY + CUDA_CAUSAL_LM_LOADER
     assert "Config::from_json" not in CUDA_REGISTRY
 
-    qwen_config = (CORE.parent / "models" / "include" / "qwen35.h").read_text(
+    qwen_config = (CORE.parent / "models" / "qwen35" / "config.h").read_text(
         encoding="utf-8"
     )
     for field in (
@@ -1152,7 +1165,7 @@ def test_cuda_model_runtime_uses_compiled_causal_lm_adapters() -> None:
         "class MoeExpertCache",
     ):
         assert concrete_definition not in CUDA_RUNTIME_SOURCE
-    causal_lm = (CUDA_MODELS / "causal_lm.h").read_text(encoding="utf-8")
+    causal_lm = (CUDA_MODELS / "causal_ops.h").read_text(encoding="utf-8")
     causal_lm_loader = (CUDA_MODELS / "loader.cpp").read_text(
         encoding="utf-8"
     )
@@ -1194,7 +1207,7 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
         "engine/decode_graph.cpp",
         "engine/options.cpp",
         "commands/cli.cpp",
-        "models/causal_lm.cpp",
+        "models/causal_ops.cpp",
         "models/loader.cpp",
         "models/transformer.cpp",
         "engine/mtp.cpp",
@@ -1253,15 +1266,15 @@ def test_cuda_qwen_speculation_is_model_owned() -> None:
 
 def test_cuda_qwen_linear_ffn_matches_residual_dtype() -> None:
     start = CUDA_QWEN_LINEAR.index("linear.ffn_residual")
-    residual = CUDA_QWEN_LINEAR[start : start + 800]
+    residual = CUDA_QWEN_LINEAR[start:].split("mfq_tensor_backend::Tensor forward(", 1)[0]
     assert "ff2.scalar_type() != rr.scalar_type()" in residual
     assert "ff2 = ff2.to(rr.scalar_type()).contiguous();" in residual
 
 
 def test_cuda_mtp_generation_loop_is_architecture_independent_and_reversible() -> None:
-    generation = CUDA_MTP_SOURCE
-    implementation = generation[: generation.index("#define MFQ_INSTANTIATE_MTP")]
-    assert "run_mtp_generation(" in implementation
+    generation = (ROOT / "cpp_runtime/engine/include/speculative_sequence.h").read_text(encoding="utf-8")
+    implementation = generation
+    assert "Generation speculative_sequence(" in implementation
     assert "int32_t run_mtp_generation(" not in CUDA_RUNTIME_SOURCE
     for architecture_name in (
         "Qwen",
@@ -1278,7 +1291,8 @@ def test_cuda_mtp_generation_loop_is_architecture_independent_and_reversible() -
     assert "bounded_depth(depth_controller.depth())" in generation
     assert "retains_partial_target_prefix()" in generation
     assert "CompactDistribution" in generation
-    assert "mfq_tensor_backend::topk(" in generation
+    assert "mfq_tensor_backend::topk(" in CUDA_MTP_SOURCE
+    assert "mfq_tensor_backend" not in generation
 
 
 def test_generic_generation_and_sequence_cache_helpers_are_not_redeclared() -> None:

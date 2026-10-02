@@ -1,0 +1,632 @@
+#include "continuous_batch.h"
+#include "models/common/attention.h"
+#include "models/common/causal_forward.h"
+#include "models/common/causal_lm.h"
+#include "models/common/gated_mlp.h"
+#include "models/common/transformer_layer.h"
+#include "models/qwen35/forward.h"
+#include <array>
+#include <cassert>
+
+using namespace mfq::engine;
+
+struct BatchOps {
+    using Request = BatchRequest;
+    using State = BatchState<Request>;
+    struct Model {
+        int vocab_size() const { return 100; }
+        int max_position_embeddings() const { return 100; }
+    } model_;
+    int64_t vocab_size() const { return model_.vocab_size(); }
+    int64_t max_context() const { return model_.max_position_embeddings(); }
+    struct Sample {
+        int64_t token;
+        MfqPrefillTiming timing;
+    };
+    void suspend_decode() {}
+    Sample prefill(const std::shared_ptr<Request> &request, PrefillChunk chunk) {
+        assert(chunk.offset == request->prefill_offset && chunk.count <= 2);
+        return {10, {request->prompt.size(), 1, 0, 1}};
+    }
+    void activate(const std::shared_ptr<Request> &, const Sample &) {}
+    void resume_decode(int64_t) {}
+    void discard_prefill(const std::shared_ptr<Request> &) {}
+    void retire(const std::vector<std::shared_ptr<Request>> &, int64_t) {}
+    int decode(State &) { return 0; }
+    Sample sample(const std::shared_ptr<Request> &request, int) {
+        return {request->pending_token + 1, {}};
+    }
+    void accept(const std::shared_ptr<Request> &, const Sample &) {}
+    void recover(State &) {}
+    Metrics metrics() const { return {}; }
+};
+
+void batch_test() {
+    InferenceRequest input;
+    input.prompt = {1, 2, 3, 4, 5};
+    input.sampling.max_tokens = 3;
+    ExecutionRequest a(input, nullptr, "a"), b(input, nullptr, "b");
+    ContinuousBatch<BatchOps> batch(8, 2);
+    batch.admit("a", a);
+    batch.admit("b", b);
+    for (int i = 0; i < 3; ++i)
+        batch.step({"a"});
+    assert(!a.done && !b.done && b.events.empty());
+    assert(a.output.result.completion_tokens == 1);
+    batch.step({"a", "b"});
+    batch.step({"a", "b"});
+    assert(a.output.result.completion_tokens == 2);
+    const auto paused = a.output.result.completion_tokens;
+    for (int i = 0; i < 2; ++i)
+        batch.step({"b"});
+    assert(a.output.result.completion_tokens == paused && !a.done);
+    assert(b.output.result.completion_tokens == 1);
+    // Cancellation retires a paused row; the other row continues to its limit.
+    a.output.result.cancelled = true;
+    for (int i = 0; i < 8 && !b.done; ++i)
+        batch.step({"b"});
+    assert(a.done && b.done && b.output.result.completion_tokens == 3);
+    std::vector<int64_t> tokens;
+    for (const auto &event : b.events)
+        if (const auto *delta = std::get_if<OutputDelta>(&event))
+            tokens.insert(tokens.end(), delta->token_ids.begin(), delta->token_ids.end());
+    assert((tokens == std::vector<int64_t>{10, 11, 12}));
+    ExecutionRequest c(input, nullptr, "c");
+    batch.admit("c", c);
+    c.output.result.cancelled = true;
+    batch.step({});
+    assert(c.done && c.output.result.completion_tokens == 0);
+}
+
+void batch_failure_test() {
+    enum Stage { suspend, prefill, activate, resume };
+    struct Fault {
+        Stage stage;
+        bool armed = false;
+        size_t recovered = 0;
+    };
+    struct FailingOps : BatchOps {
+        Fault &fault;
+        explicit FailingOps(Fault &state) : fault(state) {}
+        void check(Stage stage) {
+            if (fault.armed && fault.stage == stage)
+                throw std::runtime_error("device failure");
+        }
+        void suspend_decode() { check(suspend); }
+        Sample prefill(const std::shared_ptr<Request> &request, PrefillChunk chunk) {
+            check(Stage::prefill);
+            return BatchOps::prefill(request, chunk);
+        }
+        void activate(const std::shared_ptr<Request> &, const Sample &) { check(Stage::activate); }
+        void resume_decode(int64_t) { check(resume); }
+        void recover(State &state) { fault.recovered = state.prefilling.size(); }
+    };
+    InferenceRequest input;
+    input.prompt = {1, 2};
+    input.sampling.max_tokens = 3;
+    for (auto stage : {suspend, prefill, activate, resume}) {
+        ExecutionRequest a(input, nullptr, "a"), b(input, nullptr, "b");
+        Fault fault{stage};
+        ContinuousBatch<FailingOps> batch(8, 2, fault);
+        batch.admit("a", a);
+        batch.step({"a"});
+        assert(!a.done && a.output.result.completion_tokens == 1);
+        batch.admit("b", b);
+        fault.armed = true;
+        batch.step({"b"});
+        // Covers a popped prefill row and failure after adding it to active.
+        assert(a.done && a.failure && b.done && b.failure && fault.recovered == 2);
+        for (const auto &[key, value] : batch.metrics())
+            if (key == "continuous_batching_active" || key == "continuous_batching_prefilling")
+                assert(value == 0);
+        batch.step({});
+        fault.armed = false;
+        ExecutionRequest c(input, nullptr, "c");
+        batch.admit("c", c);
+        for (int i = 0; i < 5 && !c.done; ++i)
+            batch.step({"c"});
+        assert(c.done && !c.failure && c.output.result.completion_tokens == 3);
+    }
+    for (const auto limits : {std::pair{0, 2}, std::pair{2, 0}}) {
+        try {
+            ContinuousBatch<BatchOps> batch(limits.first, limits.second);
+            assert(false);
+        } catch (const std::invalid_argument &) {
+        }
+    }
+}
+
+struct Block {
+    int kept = -1, begun = 0, committed = 0;
+    bool fail = false;
+    void reset(int) { kept = 0; }
+    void begin_speculative(int) {
+        if (fail)
+            throw std::runtime_error("begin failed");
+        ++begun;
+    }
+    void commit_speculative() { ++committed; }
+    void rollback_speculative(int64_t keep) { kept = keep; }
+};
+struct Model {
+    int64_t cache_pos = 10, decode_position_delta = 2, speculative_start = -1,
+            speculative_confirmed = 0;
+    bool speculative_suffix_forward = false;
+    std::vector<std::unique_ptr<Block>> blocks;
+    bool supports_suffix_speculation() const { return true; }
+    int max_position_embeddings() const { return 100; }
+    void adapter_begin_speculative() {}
+    void adapter_commit_speculative() {}
+    void adapter_rollback_speculative(int64_t) {}
+    void adapter_reset(int64_t) {}
+};
+void model_test() {
+    using namespace mfq::models;
+    Model model;
+    for (int i = 0; i < 2; ++i)
+        model.blocks.push_back(std::make_unique<Block>());
+    auto guard = [](const auto &) { return 0; };
+    begin_speculative_suffix(model, 4, guard);
+    model.cache_pos = 14;
+    finish_speculative(model, false, 2, guard);
+    assert(model.cache_pos == 12 && model.speculative_start == -1);
+    for (const auto &block : model.blocks)
+        assert(block->kept == 12);
+    model.blocks.back()->fail = true;
+    try {
+        begin_speculative_suffix(model, 3, guard);
+        assert(false);
+    } catch (const std::runtime_error &) {
+    }
+    assert(model.speculative_start == -1 && model.blocks.front()->committed == 1);
+    reset_model(model, 1, guard);
+    assert(model.cache_pos == 0 && model.decode_position_delta == 0);
+
+    // Noncommutative scalar operators detect residual/norm ordering changes.
+    auto fused = [](int normalized, int residual) -> std::optional<int> {
+        return residual + normalized * 3;
+    };
+    auto fallback = [](int, int) { return std::optional<int>{}; };
+    auto ffn = [](int x) { return x * 3; };
+    auto add = [](int a, int b) { return a + b; };
+    assert(feed_forward(7, 2, fused, ffn, add) == feed_forward(7, 2, fallback, ffn, add));
+    auto result = attention_layer(
+        5, [](int x) { return x - 2; }, [](int x) { return x * 4; },
+        [&](int residual, int attention) {
+            return residual_ffn(
+                residual, attention,
+                [](int a, int b) { return std::array<int, 2>{a + b, (a + b) / 2}; },
+                [&](int r, int n) { return feed_forward(r, n, fallback, ffn, add); });
+        });
+    assert(result == 41);
+    int commits = 0;
+    assert(hyperconnection_layer(
+               2, [](int x) { return x + 1; }, [](int x) { return x * 2; },
+               [](int x, int residual, int) { return x + residual; },
+               [](int x, int previous) { return x + previous; }, [](int x) { return x * 3; },
+               [](int x, int residual, int) { return x + residual; },
+               [&](int mix) {
+                   assert(mix == 11);
+                   ++commits;
+               }) == 41);
+    assert(commits == 1);
+    int expert_calls = 0;
+    auto experts = [&] {
+        ++expert_calls;
+        return 10;
+    };
+    auto dense = [] { return 2; };
+    auto post = [](int x) { return x * 2; };
+    assert(gemma_ffn(false, dense, post, experts, add, post) == 4 && expert_calls == 0);
+    assert(gemma_ffn(true, dense, post, experts, add, post) == 14 && expert_calls == 1);
+    assert(pre_norm_layer(
+               4, [](int x, int stage) { return x - stage; }, [](int x) { return x * 2; }, ffn,
+               add) == 45);
+}
+void inner_model_flow_test() {
+    using namespace mfq::models;
+    using Heads = AttentionHeads<int>;
+    // All three native fusion choices must implement the same attention graph.
+    for (int fusion = 0; fusion < 3; ++fusion) {
+        std::string order;
+        int cached = 0;
+        const auto result = full_attention(
+            2,
+            [&](int x) {
+                order += 'P';
+                return Heads{x, 3, 5, 7};
+            },
+            [&](Heads &h) {
+                if (fusion != 2)
+                    return false;
+                order += 'F';
+                cached = h.query = h.query * 2 + 3;
+                return true;
+            },
+            [&](Heads &h) {
+                order += 'N';
+                h.query *= 2;
+            },
+            [&](Heads &h) {
+                if (fusion != 1)
+                    return false;
+                order += 'F';
+                cached = h.query += 3;
+                return true;
+            },
+            [&](Heads &h) {
+                order += 'R';
+                h.query += 3;
+            },
+            [&](const Heads &h) {
+                order += 'C';
+                cached = h.query;
+            },
+            [&](const Heads &h) {
+                order += 'A';
+                assert(cached == h.query);
+                return h.query * h.key + h.value;
+            },
+            [&](int h, std::optional<int> gate) {
+                order += 'O';
+                return h * gate.value();
+            });
+        assert(result == 182 && cached == 7);
+        assert(order == (fusion == 0 ? "PNRCAO" : fusion == 1 ? "PNFAO" : "PFAO"));
+    }
+    std::string order;
+    auto result = qwen35::linear_attention(
+        2,
+        [&](int x) {
+            order += 'P';
+            return qwen35::LinearProjections<int>{x, 3, 4, 5, 6, 7};
+        },
+        [&](const auto &p) {
+            order += 'G';
+            return std::array<int, 2>{p.alpha + 1, p.beta - 1};
+        },
+        [&](const auto &p) {
+            order += 'C';
+            return std::array<int, 3>{p.qkv + 1, p.qk * 2, p.value - 1};
+        },
+        [&](auto qkv, auto gates) {
+            order += 'R';
+            return qkv[0] * gates[0] + qkv[1] * gates[1] + qkv[2];
+        },
+        [&](int h) {
+            order += 'N';
+            return h - 2;
+        },
+        [&](int h, int gate) {
+            order += 'O';
+            return h * gate;
+        });
+    assert(result == 290 && order == "PGCRNO");
+
+    for (bool gelu : {false, true})
+        for (double limit : {0.0, 2.0}) {
+            for (int fusion = 0; fusion < 4; ++fusion) {
+                const double effective_limit = gelu ? 0.0 : limit;
+                auto activate = [](double gate, double up, GatedActivation mode, double limit) {
+                    return (gate + (mode == GatedActivation::gelu ? 10 : 1) + limit) * up;
+                };
+                auto optional = [](bool selected, double value) {
+                    return selected ? std::optional<double>(value) : std::nullopt;
+                };
+                const double hidden = (3 + (gelu ? 10 : 1) + effective_limit) * 4;
+                int down_calls = 0;
+                auto output = gated_mlp(
+                    2.0, gelu, limit,
+                    [&](double x, auto a, double l) {
+                        return optional(fusion == 1, activate(x + 1, x * 2, a, l) - 3);
+                    },
+                    [&](double x, auto a, double l) {
+                        return optional(fusion == 2, activate(x + 1, x * 2, a, l));
+                    },
+                    [](double x) { return std::array<double, 2>{x + 1, x * 2}; }, activate,
+                    [&](double h) {
+                        ++down_calls;
+                        return h - 3;
+                    },
+                    [&](double g, double u, auto a, double l) {
+                        return optional(fusion == 3, activate(g, u, a, l) - 3);
+                    });
+                assert(output == hidden - 3 && down_calls == (fusion == 0 || fusion == 2));
+            }
+        }
+}
+
+struct PredictorOps {
+    struct Tensor {
+        std::vector<int64_t> shape;
+        int value = 0;
+    };
+    struct Model {
+        struct Config {
+            int hidden_size = 4, max_position_embeddings = 8;
+            std::vector<int> mrope_sections;
+        } config;
+        int64_t cache_pos = 0;
+        std::array<int, 2> blocks{1, 2};
+    } model;
+    std::vector<int> visited;
+    std::optional<Tensor> seen_lengths, seen_cache;
+    static int rank(const Tensor &t) { return t.shape.size(); }
+    static int64_t size(const Tensor &t, int axis) { return t.shape.at(axis); }
+    static int64_t elements(const Tensor &t) {
+        int64_t count = 1;
+        for (auto n : t.shape)
+            count *= n;
+        return count;
+    }
+    static bool defined(const Tensor &t) { return !t.shape.empty(); }
+    static Tensor embed(Tensor ids, const Tensor &like) { return {like.shape, ids.value + 2}; }
+    static Tensor normalize(Tensor t, mfq::models::qwen35::PredictorNorm role) {
+        t.value += static_cast<int>(role) + 1;
+        return t;
+    }
+    static void trace(const char *, const Tensor &) {}
+    static Tensor fuse(Tensor e, Tensor h) {
+        h.value += e.value * 10;
+        return h;
+    }
+    static Tensor positions(Tensor t, int64_t start, int64_t tokens) {
+        return defined(t) ? t : Tensor{{tokens}, static_cast<int>(start)};
+    }
+    static Tensor lengths(int64_t batch, int64_t end, const Tensor &) {
+        return {{batch}, static_cast<int>(end)};
+    }
+    static Tensor cache_positions(const Tensor &, int64_t start, int64_t tokens) {
+        return {{tokens}, static_cast<int>(start)};
+    }
+    Tensor layer(int block, Tensor h, const Tensor &, const std::optional<Tensor> &lengths,
+                 const std::optional<Tensor> &cache) {
+        visited.push_back(block);
+        seen_lengths = lengths;
+        seen_cache = cache;
+        h.value = h.value * 2 + block;
+        return h;
+    }
+};
+
+void predictor_flow_test() {
+    using mfq::models::qwen35::mtp_predictor;
+    PredictorOps ops;
+    auto run = [&](int64_t tokens, PredictorOps::Tensor pos = {}) {
+        return mtp_predictor(ops, {{1, tokens, 4}, 3}, {{1, tokens}, 5}, pos);
+    };
+    assert(run(2).value == 347 && ops.model.cache_pos == 2);
+    assert((ops.visited == std::vector<int>{1, 2}));
+    assert(!ops.seen_lengths && !ops.seen_cache);
+    assert(run(1, {{1}, 90}).value == 347 && ops.model.cache_pos == 3);
+    assert(ops.seen_lengths->value == 3 && ops.seen_cache->value == 2);
+    ops.model.config.mrope_sections = {1, 1, 1};
+    run(1, {{3, 1}, 20});
+    assert(ops.model.cache_pos == 4 && ops.seen_cache->value == 3);
+    const auto layer_calls = ops.visited.size();
+    for (int invalid = 0; invalid < 3; ++invalid) {
+        try {
+            if (invalid == 0)
+                run(5); // Context overflow.
+            if (invalid == 1)
+                run(1, {{2, 1}, 0}); // Invalid position shape.
+            if (invalid == 2)
+                mtp_predictor(ops, {{1, 1, 4}, 3}, {{2, 1}, 5}, {});
+            assert(false);
+        } catch (const std::runtime_error &) {
+        }
+        assert(ops.model.cache_pos == 4 && ops.visited.size() == layer_calls);
+    }
+}
+
+// A non-CUDA tensor exercises the actual shared CausalLm class end to end.
+struct CausalTestOps {
+    using Tensor = PredictorOps::Tensor;
+    struct ForwardPlan {
+        int tag = 0;
+    };
+    struct SessionState {
+        int64_t cache_pos = 0, decode_position_delta = 0;
+    };
+    enum class SessionStateKind { Unsupported, Full };
+    struct SessionCodec {
+        template <class Model> static auto kind(const Model &) { return SessionStateKind::Full; }
+        template <class Model> static bool supports_paged(const Model &) { return true; }
+        template <class Model>
+        static SessionState capture(const Model &m, const std::vector<int64_t> &) {
+            return {m.cache_pos, 0};
+        }
+        template <class Model> static void restore(Model &m, const SessionState &s) {
+            m.cache_pos = s.cache_pos;
+        }
+    };
+    struct Block {
+        int id;
+        int64_t kept = -1;
+        bool supports_speculation() const { return true; }
+        void reset(int64_t) {}
+        void begin_speculative(int64_t) {}
+        void commit_speculative() {}
+        void rollback_speculative(int64_t value) { kept = value; }
+    };
+    mfq::models::CausalLmMetadata metadata;
+    std::vector<std::unique_ptr<Block>> blocks;
+    int output_norm = 0, lm_head = 0;
+    bool fail_layer = false;
+    int seen_position = -1, seen_cache = -1, seen_plan = -1;
+    std::optional<Tensor> seen_lengths;
+    CausalTestOps() {
+        metadata.hidden_size = 4;
+        metadata.max_position_embeddings = 32;
+        blocks.push_back(std::make_unique<Block>(Block{1}));
+        blocks.push_back(std::make_unique<Block>(Block{2}));
+    }
+    static int execution_scope() { return 0; }
+    static int block_scope(const std::unique_ptr<Block> &) { return 0; }
+    static int64_t rank(const Tensor &t) { return t.shape.size(); }
+    static int64_t size(const Tensor &t, int axis) { return t.shape.at(axis); }
+    static Tensor batch_ids(Tensor t) {
+        t.shape.insert(t.shape.begin(), 1);
+        return t;
+    }
+    static Tensor device_ids(Tensor t) { return t; }
+    static Tensor embed_tokens(Tensor t) {
+        t.shape.push_back(4);
+        t.value += 4;
+        return t;
+    }
+    static Tensor sequence_lengths(int64_t batch, int64_t end) { return {{batch}, int(end)}; }
+    static Tensor last_hidden(Tensor t) {
+        t.shape.erase(t.shape.begin() + 1);
+        return t;
+    }
+    static Tensor softcap(Tensor t, double) {
+        t.value = -t.value;
+        return t;
+    }
+    static Tensor adapter_finalize_hidden(Tensor t, int, int64_t, int64_t) {
+        t.value += 3;
+        return t;
+    }
+    static Tensor adapter_logits(int, Tensor t) {
+        t.value *= 5;
+        return t;
+    }
+    static Tensor adapter_last_logits(int, Tensor t) {
+        t.value *= 7;
+        return t;
+    }
+    static Tensor adapter_next_token(int, Tensor t) {
+        t.value %= 11;
+        return t;
+    }
+    static bool adapter_uses_decode_sequence_length() { return true; }
+    static bool adapter_supports_speculation() { return true; }
+    static bool adapter_supports_suffix_speculation() { return true; }
+    static void adapter_reset(int64_t) {}
+    static bool adapter_requires_batch_reset(int64_t) { return false; }
+    static void adapter_validate_forward(int64_t, int64_t, int64_t, bool, bool, bool) {}
+    static bool adapter_allows_speculative_position_override() { return false; }
+    static auto adapter_prepare_positions(Tensor t, int64_t, int64_t) {
+        struct Positions {
+            Tensor positions, full_positions;
+        };
+        return Positions{t, t};
+    }
+    static void adapter_validate_positions(const Tensor &, int64_t, int64_t, bool) {}
+    static auto adapter_attention_mask(std::optional<Tensor> t, int64_t, int64_t) { return t; }
+    static void adapter_begin_forward(bool) {}
+    static void adapter_finish_forward(const Tensor &, int64_t, int64_t) {}
+    static bool adapter_force_cache_advance() { return false; }
+    static void adapter_begin_speculative() {}
+    static void adapter_commit_speculative() {}
+    static void adapter_rollback_speculative(int64_t) {}
+    template <class Model> static auto forward_ops(Model &model, typename Model::Inputs input) {
+        struct Ops : Model::Inputs {
+            Model &model;
+            Tensor pos, full_positions, cache_positions;
+            std::optional<Tensor> effective_attention_mask;
+            Ops(Model &m, typename Model::Inputs i) : Model::Inputs(std::move(i)), model(m) {}
+            static int64_t rank(const Tensor &t) { return CausalTestOps::rank(t); }
+            static int64_t size(const Tensor &t, int axis) { return CausalTestOps::size(t, axis); }
+            static int64_t elements(const Tensor &t) { return PredictorOps::elements(t); }
+            static Tensor device_ids(Tensor t) { return t; }
+            static Tensor position_range(int64_t start, int64_t n) { return {{n}, int(start)}; }
+            static Tensor offset_positions(Tensor t, int64_t delta) {
+                t.value += delta;
+                return t;
+            }
+            static bool has_mrope() { return false; }
+            void prepare_inputs() {}
+            Tensor prepare_hidden(int64_t, int64_t) {
+                model.seen_position = pos.value;
+                model.seen_cache = cache_positions.value;
+                model.seen_plan = this->plan.tag;
+                model.seen_lengths = this->seq_len;
+                return this->input_embeddings;
+            }
+            Tensor layer(const std::unique_ptr<Block> &block, Tensor t) {
+                if (model.fail_layer)
+                    throw std::runtime_error("injected layer failure");
+                t.value = t.value * 2 + block->id;
+                return t;
+            }
+            void trace(const Tensor &t) {
+                if (this->block_trace)
+                    this->block_trace->push_back(t);
+            }
+            Tensor finish(Tensor t, int64_t b, int64_t n) {
+                if (this->raw_hidden)
+                    *this->raw_hidden = t;
+                return model.finalize_hidden(t, b, n);
+            }
+        };
+        return Ops(model, std::move(input));
+    }
+};
+
+void causal_lm_test() {
+    using Tensor = CausalTestOps::Tensor;
+    mfq::models::CausalLm<CausalTestOps> model;
+    Tensor ids{{1, 2}, 2}, raw;
+    std::vector<Tensor> trace;
+    auto hidden = model.hidden_forward(ids, {}, {}, &trace, {}, &raw);
+    assert(hidden.value == 31 && raw.value == 28 && model.cache_pos == 2);
+    assert(trace.size() == 3 && trace[0].value == 6 && trace[1].value == 13 &&
+           trace[2].value == 28);
+    assert(model.forward(Tensor{{1}, 2}).value == 155 && model.cache_pos == 3);
+    assert(model.last_logits(Tensor{{1}, 2}).value == 217 && model.cache_pos == 4);
+    assert(model.seen_lengths->value == 4);
+    assert(model.next_token(Tensor{{1}, 2}).value == 9 && model.cache_pos == 5);
+    model.decode_position_delta = 10;
+    model.hidden_forward(Tensor{{1}, 2});
+    assert(model.seen_position == 15 && model.seen_cache == 5 && model.cache_pos == 6);
+    model.next_token_static(Tensor{{1}, 2}, Tensor{{1}, 20}, Tensor{{1}, 21}, {17});
+    assert(model.seen_position == 20 && model.seen_cache == 20 && model.seen_plan == 17 &&
+           model.cache_pos == 6);
+    auto state = model.capture_text_session_state({1, 2, 3, 4, 5, 6});
+    model.reset(1);
+    assert(model.cache_pos == 0 && model.decode_position_delta == 0);
+    model.restore_text_session_state(state);
+    assert(model.cache_pos == 6 && model.decode_position_delta == 10);
+    model.begin_speculative_suffix(2);
+    model.hidden_forward_speculative_suffix(Tensor{{2}, 2});
+    model.rollback_speculative(1);
+    assert(model.cache_pos == 7 && model.blocks[0]->kept == 7 && !model.speculative_suffix_forward);
+    model.begin_speculative_suffix(1);
+    model.fail_layer = true;
+    try {
+        model.hidden_forward_speculative_suffix(Tensor{{1}, 2});
+        assert(false);
+    } catch (const std::runtime_error &) {
+    }
+    assert(!model.speculative_suffix_forward && model.cache_pos == 7);
+    model.fail_layer = false;
+    model.rollback_speculative();
+    for (Tensor invalid : {Tensor{{}, 0}, Tensor{{1, 1, 1}, 0}, Tensor{{0}, 0}}) {
+        try {
+            model.hidden_forward(invalid);
+            assert(false);
+        } catch (const std::runtime_error &) {
+        }
+        assert(model.cache_pos == 7);
+    }
+    // Semantic positions do not advance the logical cache unless requested.
+    model.hidden_forward_inputs(ids, Tensor{{1, 2, 4}, 6}, Tensor{{2}, 100}, {}, nullptr, {}, true);
+    assert(model.cache_pos == 9 && model.seen_position == 100 && model.seen_cache == 7);
+    try {
+        model.hidden_forward_inputs(ids, Tensor{{1, 2, 3}, 0});
+        assert(false);
+    } catch (const std::runtime_error &) {
+    }
+    assert(model.cache_pos == 9);
+}
+
+int main() {
+    causal_lm_test();
+    inner_model_flow_test();
+    predictor_flow_test();
+    batch_test();
+    batch_failure_test();
+    model_test();
+}

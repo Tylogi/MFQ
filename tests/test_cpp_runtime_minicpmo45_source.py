@@ -161,7 +161,7 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
     assert "k.scalar_type() != mfq_tensor_backend::kFloat16" in DECODE
     assert '"MFQ_MINICPM_BF16_GQA_DECODE"' in DECODE
     assert "execution.config.minicpm_bf16_gqa_decode" in DECODE
-    assert "const bool bf16_gqa_decode = official_bf16 && T == 1" in DECODE
+    assert "constboolbf16_gqa_decode=official_bf16&&T==1" in "".join(DECODE.split())
     assert "official_bf16 && !bf16_gqa_decode" in DECODE
     assert "MiniCPMO45Model::adapter_logits(" in GRAPH
     assert (
@@ -172,7 +172,7 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
     assert "repeated_k = kh.repeat_interleave(repeat, 1)" in DECODE
     assert '"full.minicpmo45_ffn_swiglu"' in DECODE
     assert "mfq_tensor_backend::silu(gate) * up" in DECODE
-    assert "return logits_from_hidden(" in DECODE
+    assert "return logits_from_hidden(" in (ROOT / "cpp_runtime/models/common/causal_lm.h").read_text(encoding="utf-8")
     assert "hidden.to(mfq_tensor_backend::kBFloat16)" in GRAPH
     assert "cache_pos > 0 && T > 1" in DECODE
     assert "minicpmo45_attention_mask" in DECODE
@@ -183,7 +183,7 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
         "}"
         in GRAPH
     )
-    assert "this->adapter_uses_decode_sequence_length() &&" in DECODE
+    assert "this->adapter_uses_decode_sequence_length() &&" in (ROOT / "cpp_runtime/models/common/causal_lm.h").read_text(encoding="utf-8")
     assert "mask.value().eq(1).all().item<bool>()" in GRAPH
 
 

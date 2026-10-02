@@ -175,7 +175,7 @@ public:
         };
         const auto health = [&] {
             json value = {
-                {"status", reloading.load() ? "loading" : "ok"},
+                {"status", reloading.load() ? "loading" : (scheduler.status().healthy ? "ok" : "unhealthy")},
                 {"model", config_.model_name},
                 {"model_type", config_.model_type},
                 {"model_capabilities", model_capabilities},

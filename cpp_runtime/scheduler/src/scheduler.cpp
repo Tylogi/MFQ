@@ -69,6 +69,10 @@ EngineInfo MfqScheduler::info() const {
     std::lock_guard lock(mutex_);
     return info_;
 }
+EngineStatus MfqScheduler::status() const {
+    Status command;
+    auto result = command.reply.get_future(); enqueue(std::move(command)); return result.get();
+}
 std::shared_ptr<MfqScheduledRequest> MfqScheduler::submit(EngineRequest input) const {
     if (input.id.empty() || input.id.size() > 128)
         throw std::invalid_argument("request ID must contain 1-128 bytes");
@@ -120,6 +124,7 @@ void MfqScheduler::publish(Request& request, EngineEvent event) {
     std::unique_lock lock(box.mutex_);
     if (box.terminal_) return;
     const bool end = terminal(event.data);
+    request.finished |= end;
     if (request.failure) {
         if (!end) return;
         event.data = *request.failure;
@@ -131,11 +136,15 @@ void MfqScheduler::publish(Request& request, EngineEvent event) {
     if (auto* completed = std::get_if<Completed>(&event.data))
         completed->finish_reason.resize(std::min<std::size_t>(completed->finish_reason.size(), 64));
     const auto bytes = event_bytes(event.data) + event.id.size();
-    if (!end && (box.events_.size() >= limits_.events - 1 ||
-                 box.bytes_ + bytes > limits_.bytes - terminal_reserve)) {
+    if (!end && bytes > limits_.bytes - terminal_reserve) {
         request.failure = Failed{"output_limit", "engine output exceeds the request outbox budget"};
         lock.unlock();
         cancel(request);
+        return;
+    }
+    if (!request.pending.empty() || (!end &&
+            (box.events_.size() >= limits_.events - 1 || box.bytes_ + bytes > limits_.bytes - terminal_reserve))) {
+        request.pending.push_back(std::move(event));
         return;
     }
     box.bytes_ += bytes;
@@ -143,9 +152,33 @@ void MfqScheduler::publish(Request& request, EngineEvent event) {
     box.events_.push_back(std::move(event));
     box.ready_.notify_all();
 }
+void MfqScheduler::flush(Request& request) {
+    auto& box = *request.outbox;
+    std::lock_guard lock(box.mutex_);
+    while (!request.pending.empty()) {
+        auto& event = request.pending.front();
+        const bool end = terminal(event.data);
+        const auto bytes = event_bytes(event.data) + event.id.size();
+        if (!end && (box.events_.size() >= limits_.events - 1 ||
+                box.bytes_ + bytes > limits_.bytes - terminal_reserve)) break;
+        box.bytes_ += bytes;
+        box.terminal_ = end;
+        box.events_.push_back(std::move(event));
+        request.pending.pop_front();
+        box.ready_.notify_all();
+    }
+}
 void MfqScheduler::cancel(Request& request) {
+    if (request.finished) {
+        if (request.pending.empty()) return;
+        auto terminal = std::move(request.pending.back());
+        request.pending.clear();
+        publish(request, std::move(terminal));
+        return;
+    }
     if (request.cancelling) return;
     request.cancelling = true;
+    request.pending.clear();
     if (request.admitted) engine_.cancel(request.input.id);
     else {
         publish(request, {request.input.id, Cancelled{}});
@@ -207,6 +240,11 @@ void MfqScheduler::loop() noexcept {
                         }
                     }
                     value.reply.set_value(engine_.session(value.request));
+                } else if constexpr (std::is_same_v<T, Status>) {
+                    auto status = engine_.status();
+                    status.healthy &= healthy;
+                    if (!status.healthy || reload || duplex_active || stopping) status.available = 0;
+                    value.reply.set_value(status);
                 } else {
                     if (reload) throw std::runtime_error("reload already pending");
                     if (duplex_active) {
@@ -229,7 +267,9 @@ void MfqScheduler::loop() noexcept {
             bool admission_blocked = false;
             for (const auto& id : ordered) {
                 auto& request = requests_.at(id);
+                flush(request);
                 if (stopping || (request.input.deadline && *request.input.deadline <= Clock::now())) cancel(request);
+                if (request.finished) continue;
                 if (request.input.deadline && !request.cancelling) wake_at = std::min(wake_at, *request.input.deadline);
                 if (request.cancelling) { executable |= request.admitted; continue; }
                 if (!request.admitted && !reload && !admission_blocked && engine_.status().available > 0) {
@@ -245,6 +285,7 @@ void MfqScheduler::loop() noexcept {
                     }
                 }
                 if (!request.admitted) continue;
+                if (!request.pending.empty()) continue;
                 auto& box = *request.outbox;
                 std::lock_guard lock(box.mutex_);
                 // Reserve one quantum and a separate terminal slot. No wait or
@@ -271,14 +312,16 @@ void MfqScheduler::loop() noexcept {
             }
             try { (void)engine_.step({}); } catch (...) {}
             for (auto& [id, request] : requests_)
-                try { publish(request, {id, Failed{"backend_failure", error.what()}}); } catch (...) {}
+                if (!request.finished)
+                    try { publish(request, {id, Failed{"backend_failure", error.what()}}); } catch (...) {}
         } catch (...) {
             healthy = false;
             for (auto& [id, request] : requests_)
                 try { engine_.cancel(id); } catch (...) {}
             try { (void)engine_.step({}); } catch (...) {}
             for (auto& [id, request] : requests_)
-                try { publish(request, {id, Failed{"backend_failure", "unknown backend error"}}); } catch (...) {}
+                if (!request.finished)
+                    try { publish(request, {id, Failed{"backend_failure", "unknown backend error"}}); } catch (...) {}
         }
         for (auto it = order_.begin(); it != order_.end();) {
             auto box = requests_.at(*it).outbox;

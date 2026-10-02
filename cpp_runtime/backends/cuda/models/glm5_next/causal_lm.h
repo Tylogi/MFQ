@@ -1,9 +1,9 @@
 #pragma once
 
-#include "../causal_lm.h"
+#include "../causal_ops.h"
 #include "models/block.h"
 #include "quant_linear.h"
-#include "models/include/glm5_next.h"
+#include "models/glm5_next/config.h"
 #include "layers.h"
 
 #include <memory>
@@ -70,6 +70,8 @@ struct Glm5Model : CausalLmArchitecture {
 
 extern template struct CudaSessionCodec<Glm5Model>;
 
-extern template struct CausalLm<Glm5Model>;
-
 } // namespace mfq::cuda
+
+namespace mfq::models {
+extern template struct CausalLm<cuda::CudaCausalOps<cuda::Glm5Model>>;
+} // namespace mfq::models

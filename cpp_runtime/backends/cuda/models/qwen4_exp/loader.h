@@ -3,7 +3,7 @@
 #include "quant_linear.h"
 #include "mfe_weight.h"
 #include "storage/moe_expert_cache.h"
-#include "models/include/qwen4_exp.h"
+#include "models/qwen4_exp/config.h"
 #include "runtime.h"
 
 #include <functional>

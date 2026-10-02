@@ -1,4 +1,4 @@
-#include "causal_lm.h"
+#include "causal_ops.h"
 #include "full_block.h"
 #include "session_state.h"
 
@@ -115,7 +115,7 @@ mfq_tensor_backend::Tensor softcap_logits(
 mfq_tensor_backend::Tensor normalize_hidden(
         mfq_tensor_backend::Tensor hidden,
         const mfq_tensor_backend::Tensor& output_norm,
-        const CausalLmMetadata& metadata,
+        const mfq::models::CausalLmMetadata& metadata,
         int64_t batch,
         int64_t tokens,
         CudaProfiler& profiler) {
@@ -309,7 +309,6 @@ bool CausalLmArchitecture::adapter_supports_suffix_speculation()
 void CausalLmArchitecture::adapter_begin_speculative() {}
 void CausalLmArchitecture::adapter_commit_speculative() {}
 void CausalLmArchitecture::adapter_rollback_speculative(int64_t) {}
-
 
 } // namespace mfq::cuda
 

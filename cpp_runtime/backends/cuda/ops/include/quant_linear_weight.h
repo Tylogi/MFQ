@@ -27,7 +27,6 @@ struct QuantLinear {
     Fp8SqLinear fp8_sq;
     Mxfp8Linear mxfp8;
     mfq_tensor_backend::Tensor dense;
-    bool dense_small_m_rowwise = false;
     TensorParallelAxis tensor_parallel_axis =
         TensorParallelAxis::Mirrored;
     std::vector<QuantLinearShard> tensor_parallel_shards;
@@ -88,4 +87,3 @@ forward_tensor_parallel_output_projections(
     CudaExecutionContext& execution,
     mfq_tensor_backend::Tensor input,
     const QuantLinearProjectionRefs& projections);
-

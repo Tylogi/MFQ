@@ -123,7 +123,6 @@ int run_qwen35_mtp_bench(
     return 0;
 }
 
-
 int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeConfig& runtime_config) {
     using namespace mfq::engine;
     auto config = runtime_config;
@@ -148,23 +147,23 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
         InferenceRequest first, second;
         first.prompt = first_prompt; first.sampling = sampling;
         second.prompt = second_prompt; second.sampling = sampling;
-        InferenceOutput first_output(first, nullptr, "first"), second_output(second, nullptr, "second");
-        batcher.admit("first", first, first_output); batcher.admit("second", second, second_output);
+        ExecutionRequest first_request(first, nullptr, "first"), second_request(second, nullptr, "second");
+        batcher.admit("first", first_request); batcher.admit("second", second_request);
         std::vector<int64_t> a, b;
-        bool first_done = false, second_done = false;
         int paused_ticks = 0;
-        while (!first_done || !second_done) {
-            const bool pause = !a.empty() && paused_ticks < 4 && !second_done;
+        while (!first_request.done || !second_request.done) {
+            const bool pause = !a.empty() && paused_ticks < 4 && !second_request.done;
             const auto prior = a.size();
-            auto step = batcher.step(pause ? std::vector<std::string>{"second"} : std::vector<std::string>{"first", "second"});
-            for (auto& event : step.events) {
-                if (auto* failure = std::get_if<Failed>(&event.data)) throw std::runtime_error(failure->message);
-                if (auto* delta = std::get_if<OutputDelta>(&event.data)) {
-                    auto& tokens = event.id == "first" ? a : b;
+            batcher.step(pause ? std::vector<std::string>{"second"} : std::vector<std::string>{"first", "second"});
+            const auto drain = [](ExecutionRequest& request, std::vector<int64_t>& tokens) {
+                if (request.failure) std::rethrow_exception(request.failure);
+                for (auto& event : request.events)
+                    if (auto* delta = std::get_if<OutputDelta>(&event))
                     tokens.insert(tokens.end(), delta->token_ids.begin(), delta->token_ids.end());
-                }
-                if (terminal(event.data)) (event.id == "first" ? first_done : second_done) = true;
-            }
+                request.events.clear();
+            };
+            drain(first_request, a);
+            drain(second_request, b);
             if (pause) { ++paused_ticks; MFQ_RUNTIME_CHECK(a.size() == prior, "paused row advanced"); }
         }
         if (a != first_reference || b != second_reference) {
@@ -178,15 +177,49 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
         }
         MFQ_RUNTIME_CHECK(a == first_reference && b == second_reference && paused_ticks == 4,
             "batched or resumed output differs from serial oracle");
-        InferenceOutput output(second, nullptr, "cancel");
-        batcher.admit("cancel", second, output);
-        while (!output.result.completion_tokens) (void)batcher.step({"cancel"});
-        output.result.cancelled = true;
-        auto cleanup = batcher.step({});
-        MFQ_RUNTIME_CHECK(cleanup.events.size() == 1 && std::holds_alternative<Cancelled>(cleanup.events[0].data),
-            "cancelled physical request did not release exactly once");
-        for (const auto& [key, value] : batcher.metrics())
+        ExecutionRequest cancelled(second, nullptr, "cancel");
+        batcher.admit("cancel", cancelled);
+        while (!cancelled.output.result.completion_tokens) batcher.step({"cancel"});
+        cancelled.events.clear();
+        cancelled.output.result.cancelled = true;
+        batcher.step({});
+        MFQ_RUNTIME_CHECK(cancelled.done && !cancelled.failure && cancelled.events.empty(),
+                          "cancelled physical request did not release before completion");
+        batcher.step({});
+        MFQ_RUNTIME_CHECK(cancelled.events.empty(), "released request published more output");
+        // Cancel a partially prefetched request while another row owns a slot.
+        ExecutionRequest survivor(second, nullptr, "survivor"), partial(first, nullptr, "partial");
+        batcher.admit("survivor", survivor);
+        batcher.step({"survivor"});
+        batcher.admit("partial", partial);
+        batcher.step({"partial"});
+        MFQ_RUNTIME_CHECK(!partial.done && partial.output.result.completion_tokens == 0 &&
+            !partial.events.empty(), "partial prefill did not yield");
+        partial.events.clear();
+        partial.output.result.cancelled = true;
+        for (int ticks = 0; ticks < 100 && (!partial.done || !survivor.done); ++ticks)
+            batcher.step({"survivor"});
+        MFQ_RUNTIME_CHECK(partial.done && !partial.failure && partial.events.empty() &&
+            survivor.done && !survivor.failure, "prefill cancellation corrupted a live slot");
+        std::vector<int64_t> resumed;
+        for (const auto& event : survivor.events)
+            if (const auto* delta = std::get_if<OutputDelta>(&event))
+                resumed.insert(resumed.end(), delta->token_ids.begin(), delta->token_ids.end());
+        MFQ_RUNTIME_CHECK(resumed == second_reference, "survivor differs after prefill cancellation");
+        double captures = 0, replays = 0;
+        for (const auto& [key, value] : batcher.metrics()) {
             if (key == "paged_kv_live_pages") MFQ_RUNTIME_CHECK(value == 0, "paged KV leaked");
+            if (key == "continuous_batching_active" || key == "continuous_batching_prefilling")
+                MFQ_RUNTIME_CHECK(value == 0, "batch retained finished requests");
+            if (key == "continuous_batching_cuda_graph_captures") captures = value;
+            if (key == "continuous_batching_cuda_graph_replays") replays = value;
+        }
+        if (config.continuous_batch.greedy &&
+            qwen_continuous_batch_cuda_graph_enabled(model, config.continuous_batch))
+            MFQ_RUNTIME_CHECK(captures > 0 && replays > captures, "batch graph was not replayed");
+        std::cout << "continuous_batching_state_check paged=" << config.continuous_batch.paged_kv
+            << " captures=" << captures << " replays=" << replays
+            << " prefill_cancel=1 slot_reuse=1\n";
     }
     MfqPromptCachePlan plan{"batch-check", first_prompt.size() - 1};
     MFQ_RUNTIME_CHECK(serial(first_prompt, plan) == first_reference &&

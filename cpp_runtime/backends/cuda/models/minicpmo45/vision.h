@@ -1,4 +1,5 @@
 #pragma once
+#include "models/common/transformer_layer.h"
 
 #include "architecture.h"
 
@@ -213,21 +214,18 @@ struct MiniCPMO45VisionLayer {
         return result;
     }
 
-    mfq_tensor_backend::Tensor forward(
-            CudaExecutionContext& execution,
-            mfq_tensor_backend::Tensor input,
-            MfqOptional<mfq_tensor_backend::Tensor> mask) const {
-        auto normalized = minicpmo45_layer_norm(
-            input, norm1_weight, norm1_bias, 1e-6);
-        auto hidden = input + attention.forward(
-            execution, normalized, mask);
-        normalized = minicpmo45_layer_norm(
-            hidden, norm2_weight, norm2_bias, 1e-6);
-        auto mlp = fc2.forward(
-            execution,
-            mfq_tensor_backend::gelu(
-                fc1.forward(execution, normalized), "tanh"));
-        return (hidden + mlp).contiguous();
+    mfq_tensor_backend::Tensor forward(CudaExecutionContext &execution,
+        mfq_tensor_backend::Tensor input, MfqOptional<mfq_tensor_backend::Tensor> mask) const {
+        using Tensor = mfq_tensor_backend::Tensor;
+        return mfq::models::pre_norm_layer(std::move(input), [&](const Tensor &x, int stage) {
+            return minicpmo45_layer_norm(x,
+                stage == 0 ? norm1_weight : norm2_weight,
+                stage == 0 ? norm1_bias : norm2_bias,
+                1e-6);
+        }, [&](Tensor x) { return attention.forward(execution, x, mask); }, [&](Tensor x) {
+            return fc2.forward(
+                execution, mfq_tensor_backend::gelu(fc1.forward(execution, x), "tanh"));
+        }, [](Tensor residual, Tensor branch) { return (residual + branch).contiguous(); });
     }
 };
 
@@ -270,48 +268,46 @@ struct MiniCPMO45VisionEncoder {
         return result;
     }
 
-    mfq_tensor_backend::Tensor forward(
-            CudaExecutionContext& execution,
-            mfq_tensor_backend::Tensor pixels,
-            mfq_tensor_backend::Tensor patch_mask,
-            mfq_tensor_backend::Tensor target_sizes) const {
+    mfq_tensor_backend::Tensor forward(CudaExecutionContext &execution,
+        mfq_tensor_backend::Tensor pixels, mfq_tensor_backend::Tensor patch_mask,
+        mfq_tensor_backend::Tensor target_sizes) const {
         if (patch_mask.dim() == 3) {
             patch_mask = patch_mask.flatten(1);
         }
-        if (pixels.dim() != 4 || pixels.size(1) != 3 ||
-                patch_mask.dim() != 2 || target_sizes.dim() != 2 ||
-                target_sizes.size(1) != 2 ||
-                pixels.size(0) != patch_mask.size(0) ||
-                pixels.size(0) != target_sizes.size(0) ||
-                target_sizes.device().is_cuda()) {
-            throw std::runtime_error(
-                "MiniCPM-o vision input geometry is invalid");
+        if (pixels.dim() != 4 || pixels.size(1) != 3 || patch_mask.dim() != 2 ||
+            target_sizes.dim() != 2 || target_sizes.size(1) != 2 ||
+            pixels.size(0) != patch_mask.size(0) || pixels.size(0) != target_sizes.size(0) ||
+            target_sizes.device().is_cuda()) {
+            throw std::runtime_error("MiniCPM-o vision input geometry is invalid");
         }
-        auto embedded = mfq_tensor_backend::conv2d(
-            pixels.to(patch_weight.scalar_type()),
-            patch_weight, patch_bias,
+        auto embedded = mfq_tensor_backend::conv2d(pixels.to(patch_weight.scalar_type()),
+            patch_weight,
+            patch_bias,
             std::vector<int64_t>{patch_size, patch_size},
             std::vector<int64_t>{0, 0},
-            std::vector<int64_t>{1, 1}, 1)
-            .flatten(2).transpose(1, 2).contiguous();
+            std::vector<int64_t>{1, 1},
+            1)
+                            .flatten(2)
+                            .transpose(1, 2)
+                            .contiguous();
         if (embedded.size(1) != patch_mask.size(1)) {
             throw std::runtime_error(
                 "MiniCPM-o patch mask length does not match patch convolution");
         }
         std::vector<int64_t> position_ids(
             static_cast<size_t>(embedded.size(0) * embedded.size(1)), 0);
-        auto sizes = target_sizes.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
-        auto mask_cpu = patch_mask.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kBool).contiguous();
-        const auto * size_data = sizes.data_ptr<int64_t>();
-        const auto * mask_data = mask_cpu.data_ptr<bool>();
+        auto sizes =
+            target_sizes.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
+        auto mask_cpu =
+            patch_mask.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kBool).contiguous();
+        const auto *size_data = sizes.data_ptr<int64_t>();
+        const auto *mask_data = mask_cpu.data_ptr<bool>();
         bool all_patches_active = true;
         for (int64_t batch = 0; batch < embedded.size(0); ++batch) {
             const int64_t height = size_data[2 * batch];
             const int64_t width = size_data[2 * batch + 1];
-            if (height <= 0 || width <= 0 ||
-                    height * width > embedded.size(1)) {
-                throw std::runtime_error(
-                    "MiniCPM-o target patch size is invalid");
+            if (height <= 0 || width <= 0 || height * width > embedded.size(1)) {
+                throw std::runtime_error("MiniCPM-o target patch size is invalid");
             }
             int64_t active = 0;
             for (int64_t patch = 0; patch < embedded.size(1); ++patch) {
@@ -320,17 +316,15 @@ struct MiniCPMO45VisionEncoder {
                     continue;
                 }
                 if (active >= height * width) {
-                    throw std::runtime_error(
-                        "MiniCPM-o patch mask has too many active entries");
+                    throw std::runtime_error("MiniCPM-o patch mask has too many active entries");
                 }
                 const int64_t row = active / width;
                 const int64_t column = active % width;
-                const int64_t bucket_column = std::min<int64_t>(
-                    position_side - 1, column * position_side / width);
-                const int64_t bucket_row = std::min<int64_t>(
-                    position_side - 1, row * position_side / height);
-                position_ids[static_cast<size_t>(
-                    batch * embedded.size(1) + patch)] =
+                const int64_t bucket_column =
+                    std::min<int64_t>(position_side - 1, column * position_side / width);
+                const int64_t bucket_row =
+                    std::min<int64_t>(position_side - 1, row * position_side / height);
+                position_ids[static_cast<size_t>(batch * embedded.size(1) + patch)] =
                     bucket_row * position_side + bucket_column;
                 ++active;
             }
@@ -339,27 +333,28 @@ struct MiniCPMO45VisionEncoder {
                     "MiniCPM-o patch mask active count disagrees with target size");
             }
         }
-        auto ids = mfq_tensor_backend::from_blob(
-            position_ids.data(),
+        auto ids = mfq_tensor_backend::from_blob(position_ids.data(),
             std::vector<int64_t>{embedded.size(0), embedded.size(1)},
-            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64)).clone().to(mfq_tensor_backend::kCUDA);
-        embedded = embedded + position_embedding.index_select(
-            0, ids.reshape({-1})).reshape(embedded.sizes());
+            mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64))
+                       .clone()
+                       .to(mfq_tensor_backend::kCUDA);
+        embedded = embedded +
+                   position_embedding.index_select(0, ids.reshape({-1})).reshape(embedded.sizes());
         MfqOptional<mfq_tensor_backend::Tensor> attention_mask = mfq_nullopt;
         if (!all_patches_active) {
             auto invalid = patch_mask.to(mfq_tensor_backend::kCUDA, mfq_tensor_backend::kBool)
-                .logical_not().unsqueeze(1).unsqueeze(2);
-            attention_mask = mfq_tensor_backend::zeros(
-                {embedded.size(0), 1, embedded.size(1), embedded.size(1)},
-                embedded.options().dtype(mfq_tensor_backend::kFloat32))
-                .masked_fill(invalid, -std::numeric_limits<float>::infinity());
+                               .logical_not()
+                               .unsqueeze(1)
+                               .unsqueeze(2);
+            attention_mask =
+                mfq_tensor_backend::zeros({embedded.size(0), 1, embedded.size(1), embedded.size(1)},
+                    embedded.options().dtype(mfq_tensor_backend::kFloat32))
+                    .masked_fill(invalid, -std::numeric_limits<float>::infinity());
         }
-        for (const auto & layer : layers) {
-            embedded = layer.forward(
-                execution, embedded, attention_mask);
-        }
-        embedded = minicpmo45_layer_norm(
-            embedded, post_norm_weight, post_norm_bias, 1e-6);
+        embedded = mfq::models::layer_stack(std::move(embedded),
+            layers,
+            [&](const auto &layer, auto x) { return layer.forward(execution, x, attention_mask); });
+        embedded = minicpmo45_layer_norm(embedded, post_norm_weight, post_norm_bias, 1e-6);
         return embedded;
     }
 };
@@ -565,4 +560,3 @@ struct MiniCPMO45Resampler {
             final_projection).to(dtype).contiguous();
     }
 };
-

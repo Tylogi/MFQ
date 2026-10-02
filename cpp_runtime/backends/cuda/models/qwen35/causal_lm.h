@@ -1,8 +1,8 @@
 #pragma once
 
-#include "../causal_lm.h"
+#include "../causal_ops.h"
 #include "../full_attention_session_codec.h"
-#include "models/include/qwen35.h"
+#include "models/qwen35/config.h"
 
 #include <cstdint>
 #include <memory>
@@ -87,6 +87,8 @@ struct CudaSessionCodec<Qwen35Model> {
 
 extern template struct FullAttentionSessionCodec<Qwen35Model>;
 
-extern template struct CausalLm<Qwen35Model>;
-
 } // namespace mfq::cuda
+
+namespace mfq::models {
+extern template struct CausalLm<cuda::CudaCausalOps<cuda::Qwen35Model>>;
+} // namespace mfq::models

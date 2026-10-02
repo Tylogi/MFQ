@@ -6,26 +6,18 @@
 #include "cuda_batching.h"
 #include "text_session_cache.h"
 #include "mtp_metrics.h"
+#include "request_executor.h"
+#include "generation_flow.h"
 
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <variant>
-#include <unordered_map>
 
 namespace mfq::cuda {
 using namespace mfq::engine;
 using namespace mfq::cuda::internal;
 
 namespace {
-struct RequestState {
-    InferenceRequest input;
-    InferenceOutput output;
-    Generation generation;
-    bool started = false, batched = false;
-    RequestState(InferenceRequest prepared, const MfqTokenizer* tokenizer, const RequestId& id)
-        : input(std::move(prepared)), output(input, tokenizer, id) {}
-};
-
 template <typename Model>
 struct CudaEngineState {
     std::shared_ptr<CudaExecutionContext> execution;
@@ -36,9 +28,8 @@ struct CudaEngineState {
     DecodeGraphCache graph;
     TextSessionCache cache;
     std::unique_ptr<QwenBatchExecutor> batching;
-    std::unordered_map<RequestId, std::unique_ptr<RequestState>> requests;
+    RequestExecutor requests;
     bool duplex_active = false;
-    bool healthy = true;
 
     CudaEngineState(std::shared_ptr<CudaExecutionContext> owner, Model loaded,
             RuntimeComponents<Model> optional, CudaRuntimeConfig runtime_config)
@@ -48,7 +39,8 @@ struct CudaEngineState {
           cache(config.session_cache, config.prefix_cache,
               make_cuda_paged_prefix_cache(*language.source, language.max_position_embeddings(),
                   language.supports_paged_text_session_state(), config.prefix_cache),
-              language.supports_text_session_state(), language.supports_text_session_state() ? 0 : 1) {
+                language.supports_text_session_state(), language.supports_text_session_state() ? 0 : 1),
+          requests(std::max<std::size_t>(1, config.continuous_batch.max_sequences)) {
         if (config.continuous_batch.max_sequences) {
             if constexpr (std::is_same_v<Model, Qwen35CausalLm>)
                 batching = std::make_unique<QwenBatchExecutor>(language, *execution,
@@ -56,18 +48,38 @@ struct CudaEngineState {
             else throw std::invalid_argument("continuous batching is unavailable for this model");
         }
     }
-    bool special(const EngineRequest& request) const {
-        const auto& input = request.input;
-        return input.media || !input.cache_plan.session_id.empty() ||
-            ((request.token_ids.empty() || input.cache_plan.stable_prefix_tokens) && cache.persistent_prefix_enabled()) ||
-            (input.sampling.enable_mtp && components.mtp);
+    bool can_batch(const EngineRequest& request) const {
+        return batching && batch_compatible(request, cache.persistent_prefix_enabled(), bool(components.mtp));
     }
-    EngineStatus status() const {
-        if (!healthy) return {0, false};
-        const auto capacity = std::max<std::size_t>(1, config.continuous_batch.max_sequences);
-        if (duplex_active) return {0, true};
-        for (const auto& [id, state] : requests) if (!state->batched) return {0, true};
-        return {capacity - requests.size(), true};
+    bool exclusive() const { return duplex_active; }
+    bool mtp_available() const { return bool(components.mtp); }
+    EngineStatus status() const { return requests.status(duplex_active); }
+    void admit_batch(const RequestId& id, ExecutionRequest& request) {
+        graph.invalidate();
+        batching->admit(id, request);
+    }
+    void step_batch(const std::vector<RequestId>& eligible) { batching->step(eligible); }
+    void reset() {
+        language.reset(1);
+        if (components.mtp) components.mtp->reset(1);
+        graph.invalidate();
+    }
+    using Prepared = CudaPreparedPrompt;
+    std::pair<Prepared, double> prepare(InferenceRequest& input) {
+        PrefillCudaTimer timer;
+        Prepared prepared;
+        if (components.composite) prepared = components.composite->prepare(input.prompt, *input.vision);
+        else if (components.grid_vision) prepared = components.grid_vision->prepare(language, input.prompt, *input.vision);
+        else throw std::invalid_argument("model has no multimodal component");
+        MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
+        return {std::move(prepared), timer.elapsed_ms()};
+    }
+    Generation generate_text(InferenceRequest& input, InferenceOutput& output, std::optional<Prepared> prepared) {
+        return internal::generate(language, graph, cache, config,
+                                  input, output, components.mtp.get(), std::move(prepared));
+    }
+    Generation generate(InferenceRequest& input, InferenceOutput& output) {
+        return generate_prepared(*this, input, output);
     }
 };
 using State = std::variant<
@@ -108,125 +120,21 @@ EngineStatus CudaEngine::status() const {
 
 Admission CudaEngine::admit(EngineRequest request) {
     return impl_->visit([&](auto& state) {
-        if (state.requests.contains(request.id)) throw std::invalid_argument("duplicate request ID");
-        if (!state.status().available || ((!state.batching || state.special(request)) && !state.requests.empty()))
-            return Admission::deferred;
-        const bool batched = state.batching && !state.special(request);
-        const bool raw = !request.token_ids.empty();
-        InferenceRequest input;
-        if (raw) {
-            input.prompt = std::move(request.token_ids);
-            input.sampling = request.input.sampling;
-            input.cache_plan = request.input.cache_plan;
-        } else input = impl_->text->prepare(std::move(request.input), metadata.max_context);
-        auto plan = plan_generation(input.prompt, metadata.vocab_size,
-            metadata.max_context, input.sampling.max_tokens, input.cache_plan.stable_prefix_tokens);
-        input.sampling.max_tokens = plan.generation_tokens;
-        input.cache_plan.stable_prefix_tokens = plan.stable_prefix_tokens;
-        const auto* tokenizer = raw ? nullptr : &impl_->text->tokenizer();
-        auto current = std::make_unique<RequestState>(std::move(input), tokenizer, request.id);
-        current->output.metrics.mtp.available = bool(state.components.mtp);
-        current->batched = batched;
-        if (current->batched) {
-            state.graph.invalidate();
-            state.batching->admit(request.id, current->input, current->output);
-        }
-        state.requests.emplace(request.id, std::move(current));
-        return Admission::accepted;
+        return state.requests.admit(std::move(request), impl_->text.get(), impl_->info, state);
     });
 }
 
 void CudaEngine::cancel(const RequestId& id) {
-    impl_->visit([&](auto& state) {
-        auto found = state.requests.find(id);
-        if (found != state.requests.end()) found->second->output.result.cancelled = true;
-    });
+    impl_->visit([&](auto& state) { state.requests.cancel(id); });
 }
 
 EngineStepResult CudaEngine::step(const std::vector<RequestId>& eligible) {
-    return impl_->visit([&](auto& state) {
-        EngineStepResult result;
-        bool has_batch = false;
-        for (const auto& [id, request] : state.requests) has_batch |= request->batched;
-        if (has_batch) {
-            result = state.batching->step(eligible);
-            for (const auto& event : result.events)
-                if (terminal(event.data)) state.requests.erase(event.id);
-        } else {
-            for (auto it = state.requests.begin(); it != state.requests.end();) {
-                auto& current = *it->second;
-                auto& input = current.input;
-                if (!current.output.result.cancelled && std::find(eligible.begin(), eligible.end(), it->first) == eligible.end()) {
-                    ++it; continue;
-                }
-                try {
-                    if (!current.started) {
-                        current.started = true;
-                        std::optional<CudaPreparedPrompt> prepared;
-                        if (input.vision && !current.output.result.cancelled) {
-                            PrefillCudaTimer timer;
-                            if (state.components.composite) prepared = state.components.composite->prepare(input.prompt, *input.vision);
-                            else if (state.components.grid_vision) prepared = state.components.grid_vision->prepare(state.language, input.prompt, *input.vision);
-                            else throw std::invalid_argument("model has no multimodal component");
-                            MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
-                            current.output.metrics.multimodal_ms = timer.elapsed_ms();
-                        }
-                        current.generation = generate(state.language, state.graph, state.cache, state.config,
-                            input, current.output, state.components.mtp.get(), std::move(prepared));
-                        if (input.vision && !current.output.result.cancelled) {
-                            result.events.push_back({it->first, PrefillProgress{{0, 0.0,
-                                current.output.metrics.multimodal_ms, current.output.metrics.multimodal_ms}}});
-                            result.advanced.push_back(it->first);
-                            ++it; continue;
-                        }
-                    }
-                    if (auto event = current.generation.next()) {
-                        if (auto* progress = std::get_if<PrefillProgress>(&*event)) {
-                            progress->timing.multimodal_ms = current.output.metrics.multimodal_ms;
-                            progress->timing.model_ms += progress->timing.multimodal_ms;
-                            current.output.metrics.mark_prefill(progress->timing);
-                        }
-                        result.events.push_back({it->first, std::move(*event)});
-                        result.advanced.push_back(it->first);
-                        ++it; continue;
-                    }
-                    current.generation = {};
-                    auto delta = current.output.finish();
-                    if (!delta.diffs.empty()) result.events.push_back({it->first, std::move(delta)});
-                    result.events.push_back({it->first, UsageUpdate{input.prompt.size(),
-                        static_cast<std::size_t>(current.output.result.completion_tokens)}});
-                    if (current.output.result.cancelled)
-                        result.events.push_back({it->first, Cancelled{{input.prompt.size(),
-                            static_cast<std::size_t>(current.output.result.completion_tokens)}, current.output.metrics}});
-                    else result.events.push_back({it->first, Completed{current.output.result.finish_reason,
-                        {input.prompt.size(), static_cast<std::size_t>(current.output.result.completion_tokens)}, current.output.metrics}});
-                } catch (const std::exception& error) {
-                    current.generation = {};
-                    try { state.language.reset(1); if (state.components.mtp) state.components.mtp->reset(1); state.graph.invalidate(); } catch (...) {}
-                    result.events.push_back({it->first, Failed{"backend_failure", error.what()}});
-                }
-                it = state.requests.erase(it);
-            }
-        }
-        for (const auto& event : result.events)
-            if (const auto* failure = std::get_if<Failed>(&event.data);
-                    failure && failure->code == "backend_failure") state.healthy = false;
-        result.status = state.status();
-        result.has_work = !state.requests.empty();
-        return result;
-    });
+    return impl_->visit([&](auto& state) { return state.requests.step(eligible, state); });
 }
 
 SessionResult CudaEngine::session(const SessionCommand& command) {
     return impl_->visit([&](auto& state) -> SessionResult {
-        switch (command.kind) {
-            case SessionCommand::Kind::fork: return {state.cache.fork_session(command.source, command.target), {}};
-            case SessionCommand::Kind::close: return {state.cache.close_session(command.source), {}};
-            case SessionCommand::Kind::clear: return {state.cache.clear(), {}};
-            case SessionCommand::Kind::trim: return {state.cache.trim_hot(command.bytes), {}};
-            case SessionCommand::Kind::metrics: return {0, state.cache.metrics()};
-        }
-        throw std::invalid_argument("unknown session command");
+        return control_session(state.cache, command);
     });
 }
 

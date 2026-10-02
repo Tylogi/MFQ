@@ -1,9 +1,10 @@
 #pragma once
+#include "models/common/transformer_layer.h"
 
-#include "../causal_lm.h"
+#include "../causal_ops.h"
 #include "models/block.h"
 #include "models/ffn.h"
-#include "models/include/deepseek_v4.h"
+#include "models/deepseek_v4/config.h"
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"
 
@@ -15,15 +16,10 @@
 namespace mfq::cuda::deepseek_v4 {
 using Config = mfq::models::deepseek_v4::Config;
 
-mfq_tensor_backend::Tensor output_projection(
-    CudaExecutionContext& execution,
-    mfq_tensor_backend::Tensor attention,
-    const QuantLinear& output_a,
-    const QuantLinear& output_b,
-    std::int64_t groups,
-    bool groupwise,
-    bool profile);
-}
+mfq_tensor_backend::Tensor output_projection(CudaExecutionContext &execution,
+    mfq_tensor_backend::Tensor attention, const QuantLinear &output_a, const QuantLinear &output_b,
+    std::int64_t groups, bool groupwise, bool profile);
+} // namespace mfq::cuda::deepseek_v4
 
 struct Dsv4RopeTable {
     mfq_tensor_backend::Tensor cos;
@@ -750,67 +746,74 @@ struct Dsv4Block : Block {
         return mfq_tensor_backend::cat(outputs, 1);
     }
 
-    mfq_tensor_backend::Tensor forward(
-        CudaExecutionContext& execution,
-        mfq_tensor_backend::Tensor x,
-        mfq_tensor_backend::Tensor pos,
-        int64_t cache_pos,
-        const MfqOptional<mfq_tensor_backend::Tensor> & seq_len,
-        const RopeCache &,
-        const MfqOptional<mfq_tensor_backend::Tensor> & cache_positions = mfq_nullopt,
-        const MfqOptional<mfq_tensor_backend::Tensor> & attention_mask = mfq_nullopt) override {
+    mfq_tensor_backend::Tensor forward(CudaExecutionContext &execution,
+        mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor pos, int64_t cache_pos,
+        const MfqOptional<mfq_tensor_backend::Tensor> &seq_len, const RopeCache &,
+        const MfqOptional<mfq_tensor_backend::Tensor> &cache_positions = mfq_nullopt,
+        const MfqOptional<mfq_tensor_backend::Tensor> &attention_mask = mfq_nullopt) override {
         (void)cache_positions;
         (void)attention_mask;
-        auto& profiler = execution.profiler;
+        auto &profiler = execution.profiler;
         if (!current_ids.defined()) {
-            throw std::runtime_error(
-                "DeepSeek V4 block did not receive token ids");
+            throw std::runtime_error("DeepSeek V4 block did not receive token ids");
         }
         const int64_t batch = x.size(0);
         const int64_t tokens = x.size(1);
-        auto residual = x;
-        auto pre = profiler.measure("dsv4.hc_attn_pre", [&]() {
-            return hc_pre(
-                x, hc_attn_fn, hc_attn_scale, hc_attn_base, "attn_pre");
-        });
-        auto normalized = profiler.measure("dsv4.attn_norm", [&]() {
-            return rms_norm_cuda(
-                pre.at(0).reshape({batch * tokens, hidden_size})
-                    .to(mfq_tensor_backend::kFloat32),
-                attn_norm, eps)
-                .reshape({batch, tokens, hidden_size})
-                .to(mfq_tensor_backend::kFloat16);
-        });
-        auto attention = attention_forward(
-            execution, normalized, pos, cache_pos, seq_len);
-        x = profiler.measure("dsv4.hc_attn_post", [&]() {
-            return hc_post(
-                attention, residual, pre.at(1), pre.at(2), "attn_post");
-        });
-
-        residual = x;
-        pre = profiler.measure("dsv4.hc_ffn_pre", [&]() {
-            return hc_pre(
-                x, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, "ffn_pre");
-        });
-        normalized = profiler.measure("dsv4.ffn_norm", [&]() {
-            return rms_norm_cuda(
-                pre.at(0).reshape({batch * tokens, hidden_size})
-                    .to(mfq_tensor_backend::kFloat32),
-                ffn_norm, eps)
-                .reshape({batch, tokens, hidden_size})
-                .to(mfq_tensor_backend::kFloat16);
-        });
-        auto feed_forward = ffn.forward(
-            execution,
-            normalized.reshape({batch * tokens, hidden_size}),
-            current_ids);
-        feed_forward = feed_forward.reshape(
-            {batch, tokens, hidden_size});
-        return profiler.measure("dsv4.hc_ffn_post", [&]() {
-            return hc_post(
-                feed_forward, residual, pre.at(1), pre.at(2), "ffn_post");
-        });
+        return mfq::models::hyperconnection_layer(std::move(x),
+            [&](mfq_tensor_backend::Tensor x) {
+            auto pre = profiler.measure("dsv4.hc_attn_pre",
+                [&]() { return hc_pre(x, hc_attn_fn, hc_attn_scale, hc_attn_base, "attn_pre"); });
+            auto normalized = profiler.measure("dsv4.attn_norm", [&]() {
+                return rms_norm_cuda(pre.at(0)
+                                         .reshape({batch * tokens, hidden_size})
+                                         .to(mfq_tensor_backend::kFloat32),
+                    attn_norm,
+                    eps)
+                    .reshape({batch, tokens, hidden_size})
+                    .to(mfq_tensor_backend::kFloat16);
+            });
+            return std::make_pair(normalized, pre);
+        },
+            [&](const auto &mix) {
+            return attention_forward(execution, mix.first, pos, cache_pos, seq_len);
+        },
+            [&](mfq_tensor_backend::Tensor attention,
+                mfq_tensor_backend::Tensor residual,
+                const auto &mix) {
+            return profiler.measure("dsv4.hc_attn_post", [&]() {
+                return hc_post(
+                    attention, residual, mix.second.at(1), mix.second.at(2), "attn_post");
+            });
+        },
+            [&](mfq_tensor_backend::Tensor x, const auto &) {
+            auto pre = profiler.measure("dsv4.hc_ffn_pre",
+                [&]() { return hc_pre(x, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, "ffn_pre"); });
+            auto normalized = profiler.measure("dsv4.ffn_norm", [&]() {
+                return rms_norm_cuda(pre.at(0)
+                                         .reshape({batch * tokens, hidden_size})
+                                         .to(mfq_tensor_backend::kFloat32),
+                    ffn_norm,
+                    eps)
+                    .reshape({batch, tokens, hidden_size})
+                    .to(mfq_tensor_backend::kFloat16);
+            });
+            return std::make_pair(normalized, pre);
+        },
+            [&](const auto &mix) {
+            auto feed_forward = ffn.forward(
+                execution, mix.first.reshape({batch * tokens, hidden_size}), current_ids);
+            feed_forward = feed_forward.reshape({batch, tokens, hidden_size});
+            return feed_forward;
+        },
+            [&](mfq_tensor_backend::Tensor feed_forward,
+                mfq_tensor_backend::Tensor residual,
+                const auto &mix) {
+            return profiler.measure("dsv4.hc_ffn_post", [&]() {
+                return hc_post(
+                    feed_forward, residual, mix.second.at(1), mix.second.at(2), "ffn_post");
+            });
+        },
+            [](const auto &) {});
     }
 };
 namespace mfq::cuda::deepseek_v4 {
@@ -821,26 +824,14 @@ struct OutputHeadWeights {
     mfq_tensor_backend::Tensor base;
 };
 
-std::unique_ptr<::Block> load_block(
-    CudaExecutionContext& execution,
-    const mfq::ModelSource& source,
-    const Config& config,
-    int layer,
-    const std::string& type,
-    const std::shared_ptr<::Dsv4SharedState>& state);
-void validate_load_options(
-    const Config& config,
-    CudaExecutionContext& execution);
-OutputHeadWeights load_output_head(
-    CudaExecutionContext& execution,
-    const mfq::ModelSource& source);
-mfq_tensor_backend::Tensor finalize_hidden(
-    mfq_tensor_backend::Tensor hidden,
-    const OutputHeadWeights& output_head,
-    const Config& config,
-    CudaProfiler& profiler,
-    int64_t batch,
-    int64_t tokens);
+std::unique_ptr<::Block> load_block(CudaExecutionContext &execution, const mfq::ModelSource &source,
+    const Config &config, int layer, const std::string &type,
+    const std::shared_ptr<::Dsv4SharedState> &state);
+void validate_load_options(const Config &config, CudaExecutionContext &execution);
+OutputHeadWeights load_output_head(CudaExecutionContext &execution, const mfq::ModelSource &source);
+mfq_tensor_backend::Tensor finalize_hidden(mfq_tensor_backend::Tensor hidden,
+    const OutputHeadWeights &output_head, const Config &config, CudaProfiler &profiler,
+    int64_t batch, int64_t tokens);
 
 } // namespace mfq::cuda::deepseek_v4
 
@@ -852,18 +843,12 @@ struct DeepseekV4Model : CausalLmArchitecture {
     std::unordered_map<int, std::shared_ptr<Dsv4SharedState>> block_states;
 
     void adapter_load_config(
-        std::string_view payload,
-        const mfq::ModelGraph& graph,
-        const mfq::ModelSource& source);
+        std::string_view payload, const mfq::ModelGraph &graph, const mfq::ModelSource &source);
     void adapter_validate_load_options() const;
     void adapter_load_final_state(
-        const mfq::ModelSource& source,
-        mfq_tensor_backend::Tensor& output_norm);
+        const mfq::ModelSource &source, mfq_tensor_backend::Tensor &output_norm);
     std::unique_ptr<Block> adapter_load_block(
-        const mfq::ModelSource& source,
-        int layer,
-        int device,
-        const std::string& type);
+        const mfq::ModelSource &source, int layer, int device, const std::string &type);
     void adapter_set_max_position_embeddings(int64_t value) {
         config.max_position_embeddings = value;
     }
@@ -891,6 +876,8 @@ struct CudaSessionCodec<DeepseekV4Model> {
         const TextSessionState& state);
 };
 
-extern template struct CausalLm<DeepseekV4Model>;
-
 } // namespace mfq::cuda
+
+namespace mfq::models {
+extern template struct CausalLm<cuda::CudaCausalOps<cuda::DeepseekV4Model>>;
+} // namespace mfq::models

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "causal_lm.h"
+#include "causal_ops.h"
 #include "deepseek_v4/causal_lm.h"
 #include "deepseek_v41/causal_lm.h"
 #include "gemma4/causal_lm.h"

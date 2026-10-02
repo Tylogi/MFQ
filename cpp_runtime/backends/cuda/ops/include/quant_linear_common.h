@@ -25,6 +25,9 @@ struct QuantLinear;
 struct QuantLinearGroup;
 struct DenseLinearGroup;
 
+mfq_tensor_backend::Tensor dense_projection(
+    mfq_tensor_backend::Tensor input, const mfq_tensor_backend::Tensor& weight);
+
 struct MfqDropFileCacheGuard {
     bool& setting;
     bool previous;

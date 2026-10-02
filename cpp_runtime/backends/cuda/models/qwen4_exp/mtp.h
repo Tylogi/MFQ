@@ -13,27 +13,28 @@ namespace mfq::cuda::qwen4_exp {
 
 // Qwen4-Exp predictor shares the target embedding and output projection.
 struct Qwen4ExpMtp final : MtpModule {
-    using Tensor=mfq_tensor_backend::Tensor;
+    using Tensor = mfq_tensor_backend::Tensor;
 
     mfq::models::qwen4_exp::Config config;
-    Tensor embedding_norm,hidden_norm;
-    Linear embedding_fusion,hidden_fusion;
+    Tensor embedding_norm, hidden_norm;
+    Linear embedding_fusion, hidden_fusion;
     std::unique_ptr<Gr> final_mixer;
     std::vector<std::unique_ptr<Qwen4Block>> layers;
     std::vector<Tensor> positions;
     std::vector<int64_t> lengths;
-    CudaExecutionContext* execution=nullptr;
-    int64_t batch=0;
+    CudaExecutionContext *execution = nullptr;
+    int64_t batch = 0;
 
-    static std::optional<Qwen4ExpMtp> load_if_present(
-            CudaExecutionContext& execution,
-            const mfq::ModelSource& file,
-            const mfq::models::qwen4_exp::Config& main) {
-        const bool any=std::any_of(file.tensors().begin(),file.tensors().end(),
-            [](const mfq::TensorMetadata& tensor) {return tensor.name.rfind("predictor.",0)==0;});
-        const auto count=main.predictor_layers;
-        if (!has_tensor(file,"predictor.embedding_norm.weight") || count<=0) {
-            MFQ_RUNTIME_CHECK(!any,"Qwen4-Exp model source contains an incomplete or undeclared MTP head");
+    static std::optional<Qwen4ExpMtp> load_if_present(CudaExecutionContext &execution,
+        const mfq::ModelSource &file, const mfq::models::qwen4_exp::Config &main) {
+        const bool any = std::any_of(
+            file.tensors().begin(), file.tensors().end(), [](const mfq::TensorMetadata &tensor) {
+            return tensor.name.rfind("predictor.", 0) == 0;
+        });
+        const auto count = main.predictor_layers;
+        if (!has_tensor(file, "predictor.embedding_norm.weight") || count <= 0) {
+            MFQ_RUNTIME_CHECK(
+                !any, "Qwen4-Exp model source contains an incomplete or undeclared MTP head");
             return std::nullopt;
         }
         Qwen4ExpMtp result;
@@ -60,45 +61,66 @@ struct Qwen4ExpMtp final : MtpModule {
         std::fill(lengths.begin(),lengths.end(),0);batch=next_batch;
     }
 
-    std::pair<Tensor,Tensor> evaluate(const MtpTarget& target,const Tensor& hidden,const Tensor& ids,int64_t depth=0,
-        bool cache=true,const Tensor& supplied_positions={},const Tensor& supplied_embeddings={}) {
-        namespace tb=mfq_tensor_backend;
-        MFQ_RUNTIME_CHECK(ids.dim()==2 && ids.size(0)>0 && ids.size(1)>0 && hidden.dim()==3 &&
-            hidden.size(0)==ids.size(0) && hidden.size(1)==ids.size(1) && hidden.size(2)==hidden_norm.numel(),
+    std::pair<Tensor, Tensor> evaluate(const MtpTarget &target, const Tensor &hidden,
+        const Tensor &ids, int64_t depth = 0, bool cache = true,
+        const Tensor &supplied_positions = {}, const Tensor &supplied_embeddings = {}) {
+        namespace tb = mfq_tensor_backend;
+        MFQ_RUNTIME_CHECK(ids.dim() == 2 && ids.size(0) > 0 && ids.size(1) > 0 &&
+                              hidden.dim() == 3 && hidden.size(0) == ids.size(0) &&
+                              hidden.size(1) == ids.size(1) &&
+                              hidden.size(2) == hidden_norm.numel(),
             "Qwen4-Exp MTP input geometry mismatch");
-        const auto b=ids.size(0),t=ids.size(1),n=int64_t(lengths.size());
-        const auto layer=(depth%n+n)%n;
-        if (cache && batch && batch!=b) reset(b);
-        const auto start=cache?lengths[layer]:0;
-        MFQ_RUNTIME_CHECK(start+t<=config.maximum,"Qwen4-Exp MTP history exceeds context capacity");
-        auto embeds=supplied_embeddings.defined()?supplied_embeddings:target.embed(ids);
-        MFQ_RUNTIME_CHECK(embeds.sizes().vec()==std::vector<int64_t>({b,t,config.hidden}),
+        const auto b = ids.size(0), t = ids.size(1), n = int64_t(lengths.size());
+        const auto layer = (depth % n + n) % n;
+        if (cache && batch && batch != b)
+            reset(b);
+        const auto start = cache ? lengths[layer] : 0;
+        MFQ_RUNTIME_CHECK(
+            start + t <= config.maximum, "Qwen4-Exp MTP history exceeds context capacity");
+        auto embeds = supplied_embeddings.defined() ? supplied_embeddings : target.embed(ids);
+        MFQ_RUNTIME_CHECK(embeds.sizes().vec() == std::vector<int64_t>({b, t, config.hidden}),
             "Qwen4-Exp MTP embedding shape mismatch");
-        auto current=supplied_positions.defined()?supplied_positions:tb::arange(start,start+t,ids.options().dtype(tb::kInt32));
-        if (current.dim()==1) current=current.reshape({1,1,t}).expand({3,1,t}).contiguous();
-        else if (current.dim()==2) current=current.unsqueeze(1);
-        if (current.dim()==3 && current.size(0)==4) current=current.narrow(0,1,3);
-        MFQ_RUNTIME_CHECK(current.dim()==3 && current.size(0)==3 && current.size(-1)==t &&
-            (current.size(1)==1 || current.size(1)==b),"Qwen4 MTP positions require [T]/[3,T]/[3,B,T]");
-        current=current.to(tb::kInt32).expand({3,b,t}).contiguous();
-        auto full=cache && positions[layer].defined()?tb::cat({positions[layer],current},-1):current;
-        auto e=embedding_fusion(
-            *execution,rms_norm(embeds,embedding_norm+1,config.eps));
-        auto streams=hidden_fusion(
-            *execution,rms_norm(hidden,hidden_norm+1,config.eps)
-            .reshape({b,t,config.streams,config.hidden}));
-        auto x=(streams+e.unsqueeze(-2)).reshape({b,t,config.streams*config.hidden});
-        auto& block=*layers[layer];
-        auto first=block.attention_gr.pre(x);
-        auto branch=block.qsa->forward(
-            *execution,first[0],current,full,cache);
-        x=block.attention_gr.post(branch,first);
-        auto second=block.ffn_gr.pre(x);
-        auto multi=block.ffn_gr.post(
-            block.ffn(*execution,second[0]),second);
-        auto output=final_mixer->pre(multi)[0];
-        if (cache) {positions[layer]=full;batch=b;lengths[layer]=start+t;}
-        return {output,multi};
+        auto current = supplied_positions.defined()
+                           ? supplied_positions
+                           : tb::arange(start, start + t, ids.options().dtype(tb::kInt32));
+        if (current.dim() == 1)
+            current = current.reshape({1, 1, t}).expand({3, 1, t}).contiguous();
+        else if (current.dim() == 2)
+            current = current.unsqueeze(1);
+        if (current.dim() == 3 && current.size(0) == 4)
+            current = current.narrow(0, 1, 3);
+        MFQ_RUNTIME_CHECK(current.dim() == 3 && current.size(0) == 3 && current.size(-1) == t &&
+                              (current.size(1) == 1 || current.size(1) == b),
+            "Qwen4 MTP positions require [T]/[3,T]/[3,B,T]");
+        current = current.to(tb::kInt32).expand({3, b, t}).contiguous();
+        auto full = cache && positions[layer].defined() ? tb::cat({positions[layer], current}, -1)
+                                                        : current;
+        auto e = embedding_fusion(*execution, rms_norm(embeds, embedding_norm + 1, config.eps));
+        auto streams = hidden_fusion(*execution,
+            rms_norm(hidden, hidden_norm + 1, config.eps)
+                .reshape({b, t, config.streams, config.hidden}));
+        auto x = (streams + e.unsqueeze(-2)).reshape({b, t, config.streams * config.hidden});
+        auto &block = *layers[layer];
+        auto multi = mfq::models::hyperconnection_layer(std::move(x), [&](const Tensor &value) {
+            return block.attention_gr.pre(value);
+        }, [&](const auto &mix) {
+            return block.qsa->forward(*execution, mix[0], current, full, cache);
+        }, [&](Tensor branch, const Tensor &, const auto &mix) {
+            return block.attention_gr.post(branch, mix);
+        }, [&](const Tensor &value, const auto &) {
+            return block.ffn_gr.pre(value);
+        }, [&](const auto &mix) {
+            return block.ffn(*execution, mix[0]);
+        }, [&](Tensor branch, const Tensor &, const auto &mix) {
+            return block.ffn_gr.post(branch, mix);
+        }, [](const auto &) {});
+        auto output = final_mixer->pre(multi)[0];
+        if (cache) {
+            positions[layer] = full;
+            batch = b;
+            lengths[layer] = start + t;
+        }
+        return {output, multi};
     }
 
     Tensor forward(const MtpTarget& target,Tensor hidden,Tensor ids) override {return evaluate(target,hidden,ids).first;}

@@ -12,30 +12,31 @@ namespace mfq::cuda::glm5_next {
 
 // GLM5-Next predictor shares the target embedding and output projection.
 struct Glm5NextMtp final : MtpModule {
-    using Tensor=mfq_tensor_backend::Tensor;
+    using Tensor = mfq_tensor_backend::Tensor;
     struct Layer {
-        Tensor attention_norm,ffn_norm;
+        Tensor attention_norm, ffn_norm;
         std::unique_ptr<SparseMla> attention;
         Linear ffn;
     };
 
     mfq::models::glm5_next::Config config;
-    Tensor embedding_norm,hidden_norm,output_norm;
+    Tensor embedding_norm, hidden_norm, output_norm;
     Linear fusion;
     std::vector<Layer> layers;
     std::vector<int64_t> lengths;
-    CudaExecutionContext* execution=nullptr;
-    int64_t batch=0;
+    CudaExecutionContext *execution = nullptr;
+    int64_t batch = 0;
 
-    static std::optional<Glm5NextMtp> load_if_present(
-            CudaExecutionContext& execution,
-            const mfq::ModelSource& file,
-            const mfq::models::glm5_next::Config& main) {
-        const bool any=std::any_of(file.tensors().begin(),file.tensors().end(),
-            [](const mfq::TensorMetadata& tensor) {return tensor.name.rfind("predictor.",0)==0;});
-        const auto count=main.predictor_layers;
-        if (!has_tensor(file,"predictor.embedding_norm.weight") || count<=0) {
-            MFQ_RUNTIME_CHECK(!any,"GLM5-Next model source contains an incomplete or undeclared MTP head");
+    static std::optional<Glm5NextMtp> load_if_present(CudaExecutionContext &execution,
+        const mfq::ModelSource &file, const mfq::models::glm5_next::Config &main) {
+        const bool any = std::any_of(
+            file.tensors().begin(), file.tensors().end(), [](const mfq::TensorMetadata &tensor) {
+            return tensor.name.rfind("predictor.", 0) == 0;
+        });
+        const auto count = main.predictor_layers;
+        if (!has_tensor(file, "predictor.embedding_norm.weight") || count <= 0) {
+            MFQ_RUNTIME_CHECK(
+                !any, "GLM5-Next model source contains an incomplete or undeclared MTP head");
             return std::nullopt;
         }
         Glm5NextMtp result;
@@ -75,39 +76,57 @@ struct Glm5NextMtp final : MtpModule {
         std::fill(lengths.begin(),lengths.end(),0);batch=next_batch;
     }
 
-    std::pair<Tensor,Tensor> evaluate(const MtpTarget& target,const Tensor& hidden,const Tensor& ids,int64_t depth=0,
-        bool cache=true,const Tensor& supplied_positions={},const Tensor& supplied_embeddings={}) {
-        namespace tb=mfq_tensor_backend;
-        MFQ_RUNTIME_CHECK(ids.dim()==2 && ids.size(0)>0 && ids.size(1)>0 && hidden.dim()==3 &&
-            hidden.size(0)==ids.size(0) && hidden.size(1)==ids.size(1) && hidden.size(2)==hidden_norm.numel(),
+    std::pair<Tensor, Tensor> evaluate(const MtpTarget &target, const Tensor &hidden,
+        const Tensor &ids, int64_t depth = 0, bool cache = true,
+        const Tensor &supplied_positions = {}, const Tensor &supplied_embeddings = {}) {
+        namespace tb = mfq_tensor_backend;
+        MFQ_RUNTIME_CHECK(ids.dim() == 2 && ids.size(0) > 0 && ids.size(1) > 0 &&
+                              hidden.dim() == 3 && hidden.size(0) == ids.size(0) &&
+                              hidden.size(1) == ids.size(1) &&
+                              hidden.size(2) == hidden_norm.numel(),
             "GLM5-Next MTP input geometry mismatch");
-        const auto b=ids.size(0),t=ids.size(1),n=int64_t(lengths.size());
-        const auto layer=(depth%n+n)%n;
-        if (cache && batch && batch!=b) reset(b);
-        const auto start=cache?lengths[layer]:0;
-        MFQ_RUNTIME_CHECK(start+t<=config.maximum,"GLM5-Next MTP history exceeds context capacity");
-        auto embeds=supplied_embeddings.defined()?supplied_embeddings:target.embed(ids);
-        MFQ_RUNTIME_CHECK(embeds.sizes().vec()==std::vector<int64_t>({b,t,config.hidden}),
+        const auto b = ids.size(0), t = ids.size(1), n = int64_t(lengths.size());
+        const auto layer = (depth % n + n) % n;
+        if (cache && batch && batch != b)
+            reset(b);
+        const auto start = cache ? lengths[layer] : 0;
+        MFQ_RUNTIME_CHECK(
+            start + t <= config.maximum, "GLM5-Next MTP history exceeds context capacity");
+        auto embeds = supplied_embeddings.defined() ? supplied_embeddings : target.embed(ids);
+        MFQ_RUNTIME_CHECK(embeds.sizes().vec() == std::vector<int64_t>({b, t, config.hidden}),
             "GLM5-Next MTP embedding shape mismatch");
-        auto current=supplied_positions.defined()?supplied_positions:tb::arange(start,start+t,ids.options().dtype(tb::kInt32));
-        MFQ_RUNTIME_CHECK((current.dim()==1 || current.dim()==2) && current.size(-1)==t &&
-            (current.dim()==1 || current.size(0)==b),"GLM MTP positions require [T] or [B,T]");
-        current=current.to(tb::kInt32);
-        auto mask=(current==0).reshape({current.dim()==1?1:b,t,1});
-        auto e=tb::where(mask,tb::zeros_like(embeds),embeds);
-        auto x=fusion(*execution,tb::cat({rms_norm(e,embedding_norm,config.eps),
-            rms_norm(hidden,hidden_norm,config.eps)},-1));
-        auto& block=layers[layer];
-        auto attention=block.attention->forward(
-            *execution,rms_norm(x,block.attention_norm,config.eps),cache);
-        auto residual=x.to(tb::kFloat32)+attention.to(tb::kFloat32);
-        const auto dtype=x.scalar_type()==tb::kFloat32?tb::kFloat32:tb::kFloat16;
-        auto branch=rms_norm(residual,block.ffn_norm,config.eps).to(dtype);
-        auto multi=residual+block.ffn(
-            *execution,branch).to(tb::kFloat32);
-        auto output=rms_norm(multi,output_norm,config.eps).to(dtype);
-        if (cache) {batch=b;lengths[layer]=start+t;}
-        return {output,multi};
+        auto current = supplied_positions.defined()
+                           ? supplied_positions
+                           : tb::arange(start, start + t, ids.options().dtype(tb::kInt32));
+        MFQ_RUNTIME_CHECK((current.dim() == 1 || current.dim() == 2) && current.size(-1) == t &&
+                              (current.dim() == 1 || current.size(0) == b),
+            "GLM MTP positions require [T] or [B,T]");
+        current = current.to(tb::kInt32);
+        auto mask = (current == 0).reshape({current.dim() == 1 ? 1 : b, t, 1});
+        auto e = tb::where(mask, tb::zeros_like(embeds), embeds);
+        auto x = fusion(*execution,
+            tb::cat({rms_norm(e, embedding_norm, config.eps),
+                        rms_norm(hidden, hidden_norm, config.eps)},
+                -1));
+        auto &block = layers[layer];
+        const auto dtype = x.scalar_type() == tb::kFloat32 ? tb::kFloat32 : tb::kFloat16;
+        auto multi = mfq::models::pre_norm_layer(std::move(x), [&](const Tensor &value, int stage) {
+            auto normalized =
+                rms_norm(value, stage == 0 ? block.attention_norm : block.ffn_norm, config.eps);
+            return stage == 0 ? normalized : normalized.to(dtype);
+        }, [&](Tensor value) {
+            return block.attention->forward(*execution, value, cache);
+        }, [&](Tensor value) {
+            return block.ffn(*execution, value);
+        }, [](Tensor residual, Tensor branch) {
+            return residual.to(tb::kFloat32) + branch.to(tb::kFloat32);
+        });
+        auto output = rms_norm(multi, output_norm, config.eps).to(dtype);
+        if (cache) {
+            batch = b;
+            lengths[layer] = start + t;
+        }
+        return {output, multi};
     }
 
     Tensor forward(const MtpTarget& target,Tensor hidden,Tensor ids) override {return evaluate(target,hidden,ids).first;}

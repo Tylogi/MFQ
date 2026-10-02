@@ -8,7 +8,7 @@ struct GenerationResult {
     MfqPrefillTiming prefill;
     std::chrono::steady_clock::time_point first_token;
 };
-inline GenerationResult collect_generation(internal::Generation generation) {
+inline GenerationResult collect_generation(mfq::engine::Generation generation) {
     GenerationResult result;
     while (auto event = generation.next()) {
         if (auto* progress = std::get_if<mfq::engine::PrefillProgress>(&*event))

@@ -1,10 +1,10 @@
 #pragma once
 #include "generation.h"
-#include "models/causal_lm.h"
+#include "models/causal_ops.h"
 #include "models/mtp.h"
 
 template <typename Model>
-mfq::cuda::internal::Generation run_mtp_generation(
+mfq::engine::Generation run_mtp_generation(
     Model& model, MtpModule& mtp, mfq::engine::InferenceRequest& request,
     mfq::engine::InferenceOutput& output, int64_t prefill_chunk_size = 2048,
     const CudaPreparedPrompt* prepared = nullptr, std::size_t reused_tokens = 0,

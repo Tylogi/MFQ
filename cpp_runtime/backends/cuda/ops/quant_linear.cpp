@@ -554,7 +554,7 @@ mfq_tensor_backend::Tensor run_quant_linear_shard(
                 ? local * mfq_tensor_backend::sigmoid(local_gate)
                 : local * mfq_tensor_backend::silu(local_gate);
         }
-        return mfq_tensor_backend::matmul(local, shard.dense.transpose(0, 1));
+        return dense_projection(std::move(local), shard.dense);
     }
     MFQ_RUNTIME_CHECK(
         !gate.has_value(),
@@ -1431,7 +1431,6 @@ QuantLinear load_quant_linear(
         }
     } else if (dtype == "BF16" || dtype == "F16" || dtype == "F32") {
         result.kind = QuantLinearKind::Dense;
-        result.dense_small_m_rowwise = name.rfind("predictor.", 0) == 0;
         auto cpu = load_dense_linear_cpu(execution, mfq, name);
         result.logical_out = cpu.size(0);
         result.logical_neuron_len = cpu.size(1);
@@ -1960,18 +1959,28 @@ mfq_tensor_backend::Tensor QuantLinear::forward_tensor_parallel_flat(
         : reduced;
 }
 
-mfq_tensor_backend::Tensor QuantLinear::forward_dense(mfq_tensor_backend::Tensor x) const {
-    auto input = x.to(dense.scalar_type());
+mfq_tensor_backend::Tensor dense_projection(
+        mfq_tensor_backend::Tensor input, const mfq_tensor_backend::Tensor& weight) {
+    input = input.to(weight.scalar_type());
     const int64_t rows = input.numel() / input.size(-1);
-    if (dense_small_m_rowwise && rows > 1 && rows <= 6) {
+    if (rows > 1 && rows <= 6) {
         auto shape = input.sizes().vec();
-        shape.back() = dense.size(0);
-        // Native matmul issues the same M=1 cuBLAS operation per row.
-        return mfq_tensor_backend::matmul(
-            input.reshape({rows, 1, input.size(-1)}), dense.transpose(0, 1))
-            .reshape(shape);
+        shape.back() = weight.size(0);
+        auto flat = input.reshape({rows, input.size(-1)});
+        std::vector<mfq_tensor_backend::Tensor> outputs;
+        outputs.reserve(rows);
+        // A strided-batched GEMM may select different accumulation from M=1.
+        // Keep short target/predictor windows on the decode projection path.
+        // ponytail: at most six launches; fuse only with decode-equivalent accumulation.
+        for (int64_t row = 0; row < rows; ++row)
+            outputs.push_back(mfq_tensor_backend::matmul(flat.narrow(0, row, 1), weight.transpose(0, 1)));
+        return mfq_tensor_backend::cat(outputs, 0).reshape(shape);
     }
-    return mfq_tensor_backend::matmul(input, dense.transpose(0, 1));
+    return mfq_tensor_backend::matmul(input, weight.transpose(0, 1));
+}
+
+mfq_tensor_backend::Tensor QuantLinear::forward_dense(mfq_tensor_backend::Tensor x) const {
+    return dense_projection(std::move(x), dense);
 }
 
 mfq_tensor_backend::Tensor QuantLinear::forward(
@@ -2269,7 +2278,7 @@ mfq_tensor_backend::Tensor QuantLinearGroup::forward_geglu(
 
 std::vector<mfq_tensor_backend::Tensor> DenseLinearGroup::forward(mfq_tensor_backend::Tensor x) const {
     auto shape = x.sizes().vec();
-    auto y = mfq_tensor_backend::matmul(x.reshape({-1, x.size(-1)}).to(mfq_tensor_backend::kFloat32), w.transpose(0, 1));
+    auto y = dense_projection(x.reshape({-1, x.size(-1)}), w);
     auto parts = y.split_with_sizes(outs, -1);
     for (auto & p : parts) {
         auto s = shape;

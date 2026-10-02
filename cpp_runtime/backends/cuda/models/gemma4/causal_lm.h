@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../causal_lm.h"
-#include "models/include/gemma4.h"
+#include "../causal_ops.h"
+#include "models/gemma4/config.h"
 
 #include <memory>
 #include <string>
@@ -48,6 +48,8 @@ struct Gemma4Model : CausalLmArchitecture {
 
 extern template struct CudaSessionCodec<Gemma4Model>;
 
-extern template struct CausalLm<Gemma4Model>;
-
 } // namespace mfq::cuda
+
+namespace mfq::models {
+extern template struct CausalLm<cuda::CudaCausalOps<cuda::Gemma4Model>>;
+} // namespace mfq::models

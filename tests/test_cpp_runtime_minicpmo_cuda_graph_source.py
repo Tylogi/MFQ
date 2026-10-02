@@ -1,7 +1,8 @@
 from pathlib import Path
 
 
-CUDA_ROOT = Path(__file__).parents[1] / "cpp_runtime" / "backends" / "cuda"
+ROOT = Path(__file__).parents[1]
+CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
 CUDA_RUNTIME = "\n".join(
     path.read_text(encoding="utf-8")
     for path in (
@@ -22,9 +23,9 @@ MODEL_METADATA_SOURCE = "\n".join(
 SOURCE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in (
-        CUDA_ROOT / "models" / "causal_lm.h",
-        CUDA_ROOT / "models" / "causal_lm.cpp",
-        CUDA_ROOT / "models" / "causal_lm_impl.h",
+        CUDA_ROOT / "models" / "causal_ops.h",
+        CUDA_ROOT / "models" / "causal_ops.cpp",
+        CUDA_ROOT / "models" / "session_codec_impl.h",
         CUDA_ROOT / "models" / "transformer.h",
         CUDA_ROOT / "models" / "transformer.cpp",
         CUDA_ROOT / "models" / "full_block.h",
@@ -71,6 +72,17 @@ ACC_SOURCE = (
 ).read_text(encoding="utf-8")
 
 
+SHARED_ENGINE = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in (ROOT / "cpp_runtime" / "engine" / "include").glob("*.h")
+)
+SHARED_MODELS = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in (ROOT / "cpp_runtime" / "models").rglob("*.h")
+)
+
+SOURCE += SHARED_ENGINE + SHARED_MODELS
+
 def test_minicpmo_native_runtime_keeps_cuda_graph_enabled() -> None:
     assert "graph_architecture_supported" not in SOURCE
     graph_gate = CUDA_RUNTIME.split(
@@ -82,14 +94,14 @@ def test_minicpmo_native_runtime_keeps_cuda_graph_enabled() -> None:
 
 
 def test_static_decode_uses_dynamic_position_for_kv_writes() -> None:
-    causal_lm = (CUDA_ROOT / "models" / "causal_lm_impl.h").read_text(
+    causal_lm = (ROOT / "cpp_runtime/models/common/causal_lm.h").read_text(
         encoding="utf-8"
     )
     static_forward = causal_lm.split(
-        "CausalLm<Model>::hidden_forward_static", 1
-    )[1].split("CausalLm<Model>::last_logits_static", 1)[0]
-    assert "nullptr, pos, nullptr, 0" in static_forward
-    assert "cache_positions_override.value(), primary" in SOURCE
+        "Tensor hidden_forward_static", 1
+    )[1].split("Tensor last_logits_static", 1)[0]
+    assert "nullptr,positions,nullptr,0" in "".join(static_forward.split())
+    assert "ops.device_ids(*ops.cache_positions_override)" in SOURCE
     assert (
         '"cache_positions must have shape [tokens] or [batch,tokens]"'
         in SOURCE

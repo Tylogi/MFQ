@@ -1,13 +1,13 @@
 add_library(mfq-models STATIC
-    model_config.cpp
-    deepseek_v4.cpp
-    deepseek_v41.cpp
-    glm5_next.cpp
-    qwen4_exp.cpp
-    gemma4.cpp
-    glm_dsa.cpp
-    minicpmo45.cpp
-    qwen35.cpp
+    common/model_config.cpp
+    deepseek_v4/config.cpp
+    deepseek_v41/config.cpp
+    glm5_next/config.cpp
+    qwen4_exp/config.cpp
+    gemma4/config.cpp
+    glm_dsa/config.cpp
+    minicpmo45/config.cpp
+    qwen35/config.cpp
 )
 add_library(mfq::models ALIAS mfq-models)
 target_include_directories(mfq-models PUBLIC ${PROJECT_SOURCE_DIR})

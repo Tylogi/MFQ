@@ -1,4 +1,4 @@
-#include "models/include/minicpmo45.h"
+#include "models/minicpmo45/config.h"
 
 #include "nlohmann/json.hpp"
 

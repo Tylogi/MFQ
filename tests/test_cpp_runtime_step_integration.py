@@ -1,8 +1,10 @@
 """Real-weight stdio gate. Set MFQ_STEP_TEST_MODEL and MFQ_STEP_TEST_TOKENIZER."""
 
 import asyncio
+import base64
 import json
 import os
+import struct
 from pathlib import Path
 
 import pytest
@@ -61,12 +63,43 @@ def test_stdio_step_lifecycle(batch_size: int, tmp_path: Path) -> None:
                 assert result["usage"]["prompt_tokens"] > 0
                 assert result["usage"]["completion_tokens"] > 0
                 assert "mtp_available" in result["metrics"]
+                if os.environ.get("MFQ_STEP_TEST_MTP") == "1":
+                    assert result["metrics"]["mtp_available"]
+                if result["metrics"]["mtp_available"]:
+                    speculative = generation(False)
+                    speculative["sampling"]["enable_mtp"] = True
+                    await send("mtp", "generate", speculative)
+                    mtp = next(frame["data"] for frame in await until("mtp") if frame["type"] == "event")
+                    assert mtp["output"] == result["output"]
+                    assert mtp["metrics"]["mtp_used"]
+                    assert mtp["metrics"]["mtp_cycles"] > 0
                 await send("stream", "generate", generation(True))
                 streamed = await until("stream")
                 deltas = [frame["data"]["delta"] for frame in streamed if frame.get("data", {}).get("event") == "delta"]
                 assert "".join(delta.get("content", "") for delta in deltas) == result["output"]["text"]
                 assert "".join(delta.get("reasoning_content", "") for delta in deltas) == result["output"].get("reasoning", "")
                 assert sum(frame.get("data", {}).get("event") == "complete" for frame in streamed) == 1
+                # Media preparation happens after admission. A request error
+                # must release its state without poisoning the entire engine.
+                def tensor(dtype: str, shape: list[int], values: list[int]) -> dict:
+                    code = "f" if dtype == "float32" else "i"
+                    return {"dtype": dtype, "shape": shape, "encoding": "base64",
+                            "data": base64.b64encode(struct.pack("<" + code * len(values), *values)).decode()}
+
+                invalid_media = generation(False)
+                invalid_media["input"]["preformatted_prompt"] = "Hello"
+                invalid_media["media"] = {
+                    "pixel_values": tensor("float32", [1, 3, 1, 1], [1, 1, 1]),
+                    "vision_types": tensor("int32", [1], [1]),
+                    "image_grid_thw": tensor("int32", [1, 3], [1, 1, 1]),
+                }
+                await send("invalid-media", "generate", invalid_media)
+                error = await receive()
+                assert error["id"] == "invalid-media" and error["type"] == "error"
+                assert error["error"]["status_code"] == 400
+                await send("after-invalid", "generate", generation(False))
+                recovered = await until("after-invalid")
+                assert next(frame["data"]["output"] for frame in recovered if frame["type"] == "event") == result["output"]
                 constrained = generation(False, 32)
                 constrained["template"] = {"enable_thinking": False}
                 constrained["response_format"] = {

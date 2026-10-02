@@ -1,12 +1,14 @@
 # MFQ C++ runtime
 
-The native runtime is organized by responsibility rather than checkpoint
-family or source origin:
+The native runtime is organized by responsibility. Shared models are grouped
+by model family:
 
 - `core/` — canonical model graph, request/value contracts, policies, and
   generated tables; temporary old-artifact name adapters live in
   `core/compat/`;
-- `models/` — shared model configuration and architecture geometry; public headers in `models/include/`;
+- `models/<family>/` — shared family configuration and forward composition;
+  `models/common/` contains the shared `CausalLm` class, causal traversal, attention,
+  gated MLP, and layer compositions;
 - `transport/` — private stdio/HTTP protocol adapters;
 - `scheduler/` — backend-neutral request dispatch and lifecycle boundary;
 - `engine/` — the sole cross-backend `Engine` interface plus reusable
@@ -15,7 +17,8 @@ family or source origin:
 - `components/` — focused integrated components (`ggml`, `tokenizer`, `http`,
   and `json`);
 - `backends/cuda/` — the concrete `CudaEngine`, model execution adapters,
-  operators, applications, build definition, and tests;
+  operators, applications, build definition, and tests; `models/causal_ops.h`
+  supplies native resources and operations to the shared causal model;
 - `backends/metal/` — Metal/MLX storage, runtime utilities, operators, model
   implementations, kernels, applications, tests, benchmarks, and diagnostics;
 - `tests/` — backend-independent native tests;
@@ -33,9 +36,11 @@ directory.
 
 CUDA text and prepared grid-Vision requests share one
 restore/prefill/output/snapshot lifecycle. Media embeddings, positions, cache
-identity, MTP drafting/verification, CUDA Graph execution, and physical batch
-operations stay CUDA-specific; the continuous-batching request state machine
-is shared. Qwen3.8-27B uses the `qwen3_5` backbone;
+identity materialization, numerical verification, CUDA Graph execution, and
+physical batch operations stay CUDA-specific. Generation, MTP draft/accept/commit
+rules, and the continuous-batching request state machine are shared. Qwen3.5
+inner attention, dense FFN, and predictor ordering also use shared model code;
+other families still require migration of their inner forward definitions. Qwen3.8-27B uses the `qwen3_5` backbone;
 Qwen3.8-Flash-Next uses `qwen4_exp`.
 
 `CMakeLists.txt` is the single entry point. Runtime executable targets are

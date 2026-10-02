@@ -1,6 +1,7 @@
 #include "ffn.h"
+#include "models/common/gated_mlp.h"
 
-#include "models/include/model_config.h"
+#include "models/common/model_config.h"
 #include "storage/moe_expert_cache.h"
 #include "mfq_cuda_ops.h"
 
@@ -689,70 +690,51 @@ mfq_tensor_backend::Tensor FFN::forward_impl(
                     shared_gate_logits);
             });
         }
-        if (geglu) {
-            const bool geglu_fusion_enabled =
-                execution.config.ffn_geglu_fusion;
-            if (geglu_fusion_enabled && xh.numel() / xh.size(-1) == 1 && gate_up.nint_grouped &&
-                gate_up.nint.split_w.empty()) {
-                auto act = profiler.measure("ffn.gate_up_geglu", [&]() {
-                    return gate_up.forward_geglu(execution, xh);
-                });
-                return profiler.measure("ffn.down", [&]() { return down.forward(execution, act); });
-            }
-            auto parts = profiler.measure("ffn.gate_up", [&]() { return gate_up.forward(execution, xh); });
-            auto act = profiler.measure("ffn.geglu", [&]() {
-                return gelu_mul_cuda(parts[0].contiguous(), parts[1].contiguous());
+        using Tensor = mfq_tensor_backend::Tensor;
+        using Activation = mfq::models::GatedActivation;
+        return mfq::models::gated_mlp(xh, geglu, swiglu_limit,
+            [&](const Tensor& input, Activation activation, double limit) -> std::optional<Tensor> {
+                if (activation != Activation::silu || limit > 0.0) return {};
+                if (nvq_fusion_enabled(execution.config) && input.numel() / input.size(-1) == 1 &&
+                    gate_up.nvq_prefix2 && gate_up.layers.size() == 2 &&
+                    gate_up.layers[0].is_nvq() && gate_up.layers[1].is_nvq() && down.is_nvq() &&
+                    gate_up.outs.size() == 2 && gate_up.outs[0] == gate_up.outs[1] &&
+                    gate_up.outs[0] == down.nvq.neuron_len &&
+                    (down.nvq.gs == 24 || down.nvq.gs == 28 || down.nvq.gs == 32)) {
+                    auto shape = input.sizes().vec();
+                    shape.back() = down.nvq.out;
+                    return nvq_ffn_swiglu_down(profiler, gate_up.layers[0].nvq,
+                        gate_up.layers[1].nvq, down.nvq, input.reshape({-1, input.size(-1)})).reshape(shape);
+                }
+                return {};
+            },
+            [&](const Tensor& input, Activation activation, double limit) -> std::optional<Tensor> {
+                if (limit > 0.0 || !gate_up.nint_grouped || !gate_up.nint.split_w.empty()) return {};
+                const auto rows = input.numel() / input.size(-1);
+                if (activation == Activation::gelu && execution.config.ffn_geglu_fusion && rows == 1)
+                    return profiler.measure("ffn.gate_up_geglu", [&] { return gate_up.forward_geglu(execution, input); });
+                if (activation == Activation::silu && execution.config.ffn_swiglu_fusion && rows >= 1 && rows <= 6 &&
+                    gate_up.outs.size() == 2 && gate_up.outs[0] == gate_up.outs[1])
+                    return profiler.measure("ffn.gate_up_swiglu", [&] { return gate_up.forward_swiglu(execution, input); });
+                return {};
+            },
+            [&](Tensor input) { return profiler.measure("ffn.gate_up", [&] { return gate_up.forward(execution, input); }); },
+            [&](Tensor gate, Tensor up, Activation activation, double limit) {
+                if (activation == Activation::gelu)
+                    return profiler.measure("ffn.geglu", [&] { return gelu_mul_cuda(gate.contiguous(), up.contiguous()); });
+                if (limit > 0.0)
+                    return profiler.measure("ffn.swiglu_clamped", [&] {
+                        auto g = mfq_tensor_backend::clamp_max(gate.to(mfq_tensor_backend::kFloat32), limit);
+                        auto u = mfq_tensor_backend::clamp(up.to(mfq_tensor_backend::kFloat32), -limit, limit);
+                        return (mfq_tensor_backend::silu(g) * u).to(mfq_tensor_backend::kFloat16).contiguous();
+                    });
+                return profiler.measure("ffn.swiglu", [&] { return (up * mfq_tensor_backend::silu(gate)).contiguous(); });
+            },
+            [&](Tensor hidden) { return profiler.measure("ffn.down", [&] { return down.forward(execution, hidden); }); },
+            [&](const Tensor& gate, const Tensor& up, Activation activation, double limit) -> std::optional<Tensor> {
+                if (activation != Activation::silu || limit > 0.0 || down.is_dense() || down.is_mxfp8()) return {};
+                return profiler.measure("ffn.down", [&] { return down.forward_input_mul(execution, up, gate, 2); });
             });
-            return profiler.measure("ffn.down", [&]() { return down.forward(execution, act); });
-        }
-        if (swiglu_limit > 0.0) {
-            auto parts = profiler.measure("ffn.gate_up", [&]() {
-                return gate_up.forward(execution, xh);
-            });
-            auto act = profiler.measure("ffn.swiglu_clamped", [&]() {
-                auto gate = mfq_tensor_backend::clamp_max(
-                    parts[0].to(mfq_tensor_backend::kFloat32), swiglu_limit);
-                auto up = mfq_tensor_backend::clamp(
-                    parts[1].to(mfq_tensor_backend::kFloat32),
-                    -swiglu_limit, swiglu_limit);
-                return (mfq_tensor_backend::silu(gate) * up)
-                    .to(mfq_tensor_backend::kFloat16).contiguous();
-            });
-            return profiler.measure("ffn.down", [&]() {
-                return down.forward(execution, act);
-            });
-        }
-        if (nvq_fusion_enabled(execution.config) && xh.numel() / xh.size(-1) == 1 &&
-            gate_up.nvq_prefix2 && gate_up.layers.size() == 2 &&
-            gate_up.layers[0].is_nvq() && gate_up.layers[1].is_nvq() && down.is_nvq() &&
-            gate_up.outs.size() == 2 && gate_up.outs[0] == gate_up.outs[1] &&
-            gate_up.outs[0] == down.nvq.neuron_len &&
-            (down.nvq.gs == 24 || down.nvq.gs == 28 || down.nvq.gs == 32)) {
-            auto shape = xh.sizes().vec();
-            shape.back() = down.nvq.out;
-            auto y = nvq_ffn_swiglu_down(
-                profiler, gate_up.layers[0].nvq,
-                gate_up.layers[1].nvq, down.nvq,
-                xh.reshape({-1, xh.size(-1)}));
-            return y.reshape(shape);
-        }
-        if (execution.config.ffn_swiglu_fusion &&
-            xh.numel() / xh.size(-1) >= 1 && xh.numel() / xh.size(-1) <= 6 &&
-            gate_up.nint_grouped && gate_up.nint.split_w.empty() &&
-            gate_up.outs.size() == 2 && gate_up.outs[0] == gate_up.outs[1]) {
-            auto act = profiler.measure("ffn.gate_up_swiglu", [&]() { return gate_up.forward_swiglu(execution, xh); });
-            return profiler.measure("ffn.down", [&]() { return down.forward(execution, act); });
-        }
-        auto parts = profiler.measure("ffn.gate_up", [&]() { return gate_up.forward(execution, xh); });
-        if (down.is_dense() || down.is_mxfp8()) {
-            auto activation = profiler.measure("ffn.swiglu", [&]() {
-                return (parts[1] * mfq_tensor_backend::silu(parts[0])).contiguous();
-            });
-            return profiler.measure("ffn.down", [&]() {
-                return down.forward(execution, activation);
-            });
-        }
-        return profiler.measure("ffn.down", [&]() { return down.forward_input_mul(execution, parts[1], parts[0], 2); });
     }
 
 bool FFN::can_forward_fused_residual(

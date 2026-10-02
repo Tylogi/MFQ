@@ -1,5 +1,5 @@
 #include "causal_lm.h"
-#include "../causal_lm_impl.h"
+#include "../session_codec_impl.h"
 #include "linear_attention.h"
 
 #include "models/transformer.h"
@@ -582,6 +582,9 @@ bool Qwen35Model::adapter_supports_speculation() const noexcept {
 namespace mfq::cuda {
 
 template struct FullAttentionSessionCodec<Qwen35Model>;
-template struct CausalLm<Qwen35Model>;
 
 } // namespace mfq::cuda
+
+namespace mfq::models {
+template struct CausalLm<cuda::CudaCausalOps<cuda::Qwen35Model>>;
+} // namespace mfq::models

@@ -1,6 +1,5 @@
 #include "causal_lm.h"
-#include "../causal_lm_impl.h"
-
+#include "../session_codec_impl.h"
 
 namespace mfq::cuda::deepseek_v4 {
 
@@ -577,6 +576,8 @@ void restore_dsv4_pool_session_state(
 
 namespace mfq::cuda {
 
-template struct CausalLm<DeepseekV4Model>;
-
 } // namespace mfq::cuda
+
+namespace mfq::models {
+template struct CausalLm<cuda::CudaCausalOps<cuda::DeepseekV4Model>>;
+} // namespace mfq::models

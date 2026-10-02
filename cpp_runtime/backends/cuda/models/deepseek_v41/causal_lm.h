@@ -1,11 +1,12 @@
 #pragma once
+#include "models/common/transformer_layer.h"
 
-#include "../causal_lm.h"
+#include "../causal_ops.h"
 #include "models/ffn.h"
 #include "../deepseek_v4/causal_lm.h"
 #include "engram.h"
 #include "dspark.h"
-#include "models/include/deepseek_v41.h"
+#include "models/deepseek_v41/config.h"
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"
 #include "mfq/kernels/cuda/deepseek_v41.h"
@@ -48,7 +49,8 @@ struct SharedState {
     void begin_forward(bool capture, std::size_t target_count) {
         capture_dspark_targets = capture;
         dspark_target_hiddens.clear();
-        if (capture) dspark_target_hiddens.resize(target_count);
+        if (capture)
+            dspark_target_hiddens.resize(target_count);
     }
 
     void capture_dspark_target(
@@ -929,28 +931,18 @@ struct Block final : ::Block {
         return output_projection(execution, attended);
     }
 
-    Tensor forward(
-        CudaExecutionContext& execution,
-        Tensor hidden,
-        Tensor positions,
-        std::int64_t cache_position,
-        const MfqOptional<Tensor>& sequence_lengths,
-        const RopeCache&,
-        const MfqOptional<Tensor>& cache_positions = mfq_nullopt,
-        const MfqOptional<Tensor>& attention_mask = mfq_nullopt) override {
-        auto& profiler = execution.profiler;
-        MFQ_RUNTIME_CHECK(
-            current_ids.defined() && hidden.dim() == 4 &&
-                hidden.size(2) == config.hc_mult &&
-                hidden.size(3) == config.hidden &&
-                positions.dim() == 1 &&
-                positions.numel() == hidden.size(1) &&
-                !cache_positions.has_value() &&
-                !attention_mask.has_value() &&
-                state.position == cache_position,
+    Tensor forward(CudaExecutionContext &execution, Tensor hidden, Tensor positions,
+        std::int64_t cache_position, const MfqOptional<Tensor> &sequence_lengths, const RopeCache &,
+        const MfqOptional<Tensor> &cache_positions = mfq_nullopt,
+        const MfqOptional<Tensor> &attention_mask = mfq_nullopt) override {
+        auto &profiler = execution.profiler;
+        MFQ_RUNTIME_CHECK(current_ids.defined() && hidden.dim() == 4 &&
+                              hidden.size(2) == config.hc_mult && hidden.size(3) == config.hidden &&
+                              positions.dim() == 1 && positions.numel() == hidden.size(1) &&
+                              !cache_positions.has_value() && !attention_mask.has_value() &&
+                              state.position == cache_position,
             "DeepSeek-V4.1 block input/cache mismatch");
-        shared->enter_layer(
-            layer,
+        shared->enter_layer(layer,
             config.n_layers,
             hidden.size(0),
             hidden.size(1),
@@ -959,58 +951,47 @@ struct Block final : ::Block {
             current_ids);
 
         if (engram) {
-            hidden = profiler.measure("deepseek_v41.engram", [&]() {
-                return engram->forward(
-                    execution, hidden, shared->engram_hashes);
-            });
+            hidden = profiler.measure("deepseek_v41.engram",
+                [&]() { return engram->forward(execution, hidden, shared->engram_hashes); });
         }
 
         shared->capture_dspark_target(layer, config, hidden);
 
-        auto attention_residual = hidden;
-        auto attention_mix = collapse(
-            profiler, attention_residual,
-            shared->previous_pre,
-            attention_mhc_function,
-            attention_mhc_scale,
-            attention_mhc_base,
-            attention_norm,
-            "deepseek_v41.mhc.attention.collapse");
-        auto attention = attention_forward(
-            execution, attention_mix.branch,
-            positions,
-            cache_position,
-            sequence_lengths);
-        hidden = expand(
-            profiler, attention,
-            attention_residual,
-            attention_mix,
-            "deepseek_v41.mhc.attention.expand");
-
-        auto mlp_residual = hidden;
-        auto mlp_mix = collapse(
-            profiler, mlp_residual,
-            attention_mix.next_pre,
-            mlp_mhc_function,
-            mlp_mhc_scale,
-            mlp_mhc_base,
-            mlp_norm,
-            "deepseek_v41.mhc.mlp.collapse");
-        auto feed_forward = mlp.forward(
-            execution, mlp_mix.branch.reshape(
-                {-1, config.hidden}),
-            current_ids)
-                                .reshape(
-                                    {hidden.size(0),
-                                     hidden.size(1),
-                                     config.hidden});
-        hidden = expand(
-            profiler, feed_forward,
-            mlp_residual,
-            mlp_mix,
-            "deepseek_v41.mhc.mlp.expand");
-        shared->previous_pre = std::move(mlp_mix.next_pre);
-        return hidden;
+        const auto batch = hidden.size(0), tokens = hidden.size(1);
+        return mfq::models::hyperconnection_layer(std::move(hidden), [&](Tensor hidden) {
+            return collapse(profiler,
+                hidden,
+                shared->previous_pre,
+                attention_mhc_function,
+                attention_mhc_scale,
+                attention_mhc_base,
+                attention_norm,
+                "deepseek_v41.mhc.attention.collapse");
+        }, [&](const auto &attention_mix) {
+            return attention_forward(
+                execution, attention_mix.branch, positions, cache_position, sequence_lengths);
+        }, [&](Tensor attention, Tensor attention_residual, const auto &attention_mix) {
+            return expand(profiler,
+                attention,
+                attention_residual,
+                attention_mix,
+                "deepseek_v41.mhc.attention.expand");
+        }, [&](Tensor hidden, const auto &attention_mix) {
+            return collapse(profiler,
+                hidden,
+                attention_mix.next_pre,
+                mlp_mhc_function,
+                mlp_mhc_scale,
+                mlp_mhc_base,
+                mlp_norm,
+                "deepseek_v41.mhc.mlp.collapse");
+        }, [&](const auto &mlp_mix) {
+            return mlp.forward(execution, mlp_mix.branch.reshape({-1, config.hidden}), current_ids)
+                .reshape({batch, tokens, config.hidden});
+        }, [&](Tensor feed_forward, Tensor mlp_residual, const auto &mlp_mix) {
+            return expand(
+                profiler, feed_forward, mlp_residual, mlp_mix, "deepseek_v41.mhc.mlp.expand");
+        }, [&](auto &mlp_mix) { shared->previous_pre = std::move(mlp_mix.next_pre); });
     }
 };
 
@@ -1051,9 +1032,8 @@ inline int run_self_check() {
     const std::vector<std::int64_t> expected{
         0, 1, 4, -1, -1, -1};
     const auto* values = positions.data_ptr<std::int64_t>();
-    MFQ_RUNTIME_CHECK(
-        positions.numel() == static_cast<std::int64_t>(expected.size()) &&
-            std::equal(expected.begin(), expected.end(), values),
+    MFQ_RUNTIME_CHECK(positions.numel() == static_cast<std::int64_t>(expected.size()) &&
+                          std::equal(expected.begin(), expected.end(), values),
         "DeepSeek-V4.1 candidate hierarchy contract failed");
     std::cout << "deepseek_v41_runtime_check=ok\n";
     return 0;
@@ -1068,19 +1048,13 @@ struct DeepseekV41Model : CausalLmArchitecture {
     std::shared_ptr<deepseek_v41_runtime::SharedState> shared;
 
     void adapter_load_config(
-        std::string_view payload,
-        const mfq::ModelGraph& graph,
-        const mfq::ModelSource& source);
+        std::string_view payload, const mfq::ModelGraph &graph, const mfq::ModelSource &source);
     void adapter_validate_load_options() const;
     void adapter_load_final_state(
-        const mfq::ModelSource& source,
-        mfq_tensor_backend::Tensor& output_norm);
-    void adapter_prepare_blocks(const mfq::ModelSource& source);
+        const mfq::ModelSource &source, mfq_tensor_backend::Tensor &output_norm);
+    void adapter_prepare_blocks(const mfq::ModelSource &source);
     std::unique_ptr<Block> adapter_load_block(
-        const mfq::ModelSource& source,
-        int layer,
-        int device,
-        const std::string& type);
+        const mfq::ModelSource &source, int layer, int device, const std::string &type);
     void adapter_set_max_position_embeddings(int64_t value) {
         config.max_position_embeddings = value;
     }
@@ -1112,6 +1086,8 @@ struct DeepseekV41Model : CausalLmArchitecture {
 
 extern template struct CudaSessionCodec<DeepseekV41Model>;
 
-extern template struct CausalLm<DeepseekV41Model>;
-
 } // namespace mfq::cuda
+
+namespace mfq::models {
+extern template struct CausalLm<cuda::CudaCausalOps<cuda::DeepseekV41Model>>;
+} // namespace mfq::models

@@ -35,16 +35,29 @@ QWEN_LOADER = (
     CUDA_ROOT / "models" / "qwen35" / "causal_lm.cpp"
 ).read_text(encoding="utf-8")
 QWEN_CONFIG = (
-    ROOT / "cpp_runtime" / "models" / "qwen35.cpp"
+    ROOT / "cpp_runtime" / "models" / "qwen35" / "config.cpp"
 ).read_text(encoding="utf-8")
 CAUSAL_LM = "\n".join(
     (CUDA_ROOT / "models" / name).read_text(encoding="utf-8")
-    for name in ("causal_lm.h", "causal_lm.cpp", "causal_lm_impl.h")
+    for name in ("causal_ops.h", "causal_ops.cpp", "session_codec_impl.h")
 )
 RUNTIME_OPTIONS = (
     CUDA_ROOT / "engine" / "options.cpp"
 ).read_text(encoding="utf-8")
 
+
+SHARED_ENGINE = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in (ROOT / "cpp_runtime" / "engine" / "include").glob("*.h")
+)
+SHARED_MODELS = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in (ROOT / "cpp_runtime" / "models").rglob("*.h")
+)
+
+DECODE += SHARED_ENGINE + SHARED_MODELS
+BATCHING += SHARED_ENGINE
+CAUSAL_LM += SHARED_MODELS
 
 def test_continuous_batching_is_an_explicit_server_mode():
     assert '"--continuous-batching"' in DECODE
@@ -57,7 +70,7 @@ def test_continuous_batching_is_an_explicit_server_mode():
     assert "worker_" not in BATCHING
     assert "queue_" not in BATCHING
     assert "queue_mutex_" not in BATCHING
-    assert "bool special(const EngineRequest& request)" in DECODE
+    assert "batch_compatible(constEngineRequest&request," in "".join(DECODE.split())
     assert "run_exclusive_generation" not in BATCHING
 
 
@@ -65,27 +78,33 @@ def test_cuda_server_prefill_is_bounded_for_serial_mtp_and_batched_paths():
     assert '"--prefill-chunk-size"' in DECODE
     assert "co_yield PrefillProgress" in DECODE
     assert "InferenceOutput& output" in DECODE
-    assert "prefill_chunk_size_" in BATCHING
-    assert "std::optional<QwenBatchState> prefill_state" in BATCHING
-    assert "impl.operations.advance_prefills(impl.state)" in BATCHING
-    assert "void advance_prefills(" in BATCHING
-    assert "request->prefill_offset += chunk.count" in BATCHING
+    assert "prefill_chunk_size" in SHARED_ENGINE
+    assert "std::min(chunk_size, token_budget)" in SHARED_ENGINE
+    assert "std::optional<QwenBatchState> prefill_" in BATCH_STATE
+    assert "operations.prefill(request, chunk)" in BATCHING
+    assert "void prefill(" in BATCHING
+    assert "request->prefill_offset = chunk.offset + chunk.count" in SHARED_ENGINE
+    assert "request->prefill_offset =" not in (CUDA_ROOT / "engine/cuda_batching.cpp").read_text()
     assert "next_prefill_chunk(" in BATCHING
-    assert "impl.state.prefilling" in BATCHING
+    assert "state.prefilling" in BATCHING
     assert "continuous_batching_prefill_chunks" in BATCHING
     assert "continuous_batching_prefill_yields" in BATCHING
 
 
 def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
-    assert "state_adapter_.take(" in BATCHING
-    assert "state_adapter_.restore(" in BATCHING
-    assert "state_adapter_.make_slot_state(" in BATCHING
-    assert "state_adapter_.copy_to_slot(" in BATCHING
+    for internal in ("take", "restore", "make_slot_state", "copy_to_slot", "bind_paged_slots"):
+        assert f"state_adapter_.{internal}(" not in BATCHING
+    assert "QwenBatchRequestState cache" in BATCHING
+    assert "state_adapter_.prepare_prefill(" in BATCHING
+    assert "state_adapter_.activate(" in BATCHING
+    assert "state_adapter_.resume_decode(" in BATCHING
+    assert "model_.cache_pos =" not in BATCHING
+    assert "slots_" not in (CUDA_ROOT / "engine/cuda_batching.cpp").read_text()
     for operation in (
         "Qwen35BatchStateAdapter::take(",
         "Qwen35BatchStateAdapter::restore(",
         "Qwen35BatchStateAdapter::copy_to_slot(",
-        "Qwen35BatchStateAdapter::release_paged_slot(",
+        "Qwen35BatchStateAdapter::release(",
         "Qwen35BatchStateAdapter::bind_paged_slots(",
     ):
         assert operation in BATCH_STATE
@@ -94,11 +113,12 @@ def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
     assert "request->sampler" in BATCHING
     assert "request->token_constraint" in BATCHING
     assert "state.active" in BATCHING
-    assert "output.append(" in BATCHING
+    assert "execution.append(token)" in BATCHING
+    assert "output.finish(" not in BATCHING
     assert "request->eligible" in BATCHING
     assert "capture_recurrent_slots" in BATCHING
     assert "restore_recurrent_slots" in BATCHING
-    assert "retire_cancelled_requests" in BATCHING
+    assert "retire_cancelled" in BATCHING
     assert "MFQ_CONTINUOUS_BATCH_GREEDY" in RUNTIME_OPTIONS
     assert "std::getenv(" not in BATCHING
     assert "config_.greedy" in BATCHING
@@ -150,14 +170,14 @@ def test_generic_qwen_loader_constructs_moe_ffns():
 
 
 def test_step_alternates_bounded_prefill_and_decode():
-    assert "decode && (!prefill || impl.decode_next)" in BATCHING
-    assert "impl.decode_next = !impl.decode_next" in BATCHING
-    assert "tokens_advanced == 0" in BATCHING
-    assert "impl.operations.retire_cancelled_requests(impl.state)" in BATCHING
+    assert "has_decode && (!has_prefill || decode_next)" in BATCHING
+    assert "decode_next = !decode_next" in BATCHING
+    assert "operations.prefill(request, chunk)" in BATCHING
+    assert "retire_cancelled();" in BATCHING
 
 
 def test_qwen_decode_accepts_independent_batch_positions():
-    assert "cache_positions.size(0) == B" in DECODE
+    assert "positions.size(0) == B" in DECODE
     assert "write_positions.size(0) == B" in DECODE
     assert "cache_positions_override.has_value()" in DECODE
     assert "pos_batches" in ROPE
@@ -174,7 +194,7 @@ def test_real_weight_gate_exercises_join_and_compaction():
     assert "run_qwen_continuous_batching_check" in BATCHING_CHECK
     assert "paused row advanced" in BATCHING_CHECK
     assert "a == first_reference && b == second_reference" in BATCHING_CHECK
-    assert "std::holds_alternative<Cancelled>" in BATCHING_CHECK
+    assert "cancelled.done && !cancelled.failure && cancelled.events.empty()" in BATCHING_CHECK
     assert '"paged_kv_live_pages"' in BATCHING_CHECK
     assert "std::vector<int64_t> first_prompt(193)" in BATCHING_CHECK
     assert "session restore differs from serial oracle" in BATCHING_CHECK

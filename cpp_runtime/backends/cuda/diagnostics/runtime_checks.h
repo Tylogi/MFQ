@@ -431,7 +431,6 @@ static int run_qwen35_mtp_check(
                        mfq_tensor_backend::kBFloat16}) {
         QuantLinear linear;
         linear.kind = QuantLinearKind::Dense;
-        linear.dense_small_m_rowwise = true;
         linear.dense = mfq_tensor_backend::tensor(identity, float_options)
             .reshape({33, 33}).to(dtype);
         const double tolerance = dtype == mfq_tensor_backend::kBFloat16 ? .008
@@ -454,6 +453,31 @@ static int run_qwen35_mtp_check(
         }
     }
     std::cout << "mtp_check dense_gate_cases=36 PASS\n";
+    // Nonidentity weights expose M-dependent cuBLAS accumulation; identity cannot.
+    std::vector<float> projection_input(6 * 257), projection_weight(131 * 257);
+    for (size_t i = 0; i < projection_input.size(); ++i)
+        projection_input[i] = static_cast<float>(std::sin(double(i) * .37));
+    for (size_t i = 0; i < projection_weight.size(); ++i)
+        projection_weight[i] = static_cast<float>(std::cos(double(i) * .19) / 17.);
+    auto projection = mfq_tensor_backend::tensor(projection_input, float_options)
+        .reshape({1, 6, 257});
+    for (auto dtype : {mfq_tensor_backend::kFloat32, mfq_tensor_backend::kFloat16,
+                       mfq_tensor_backend::kBFloat16}) {
+        QuantLinear linear;
+        linear.kind = QuantLinearKind::Dense;
+        linear.dense = mfq_tensor_backend::tensor(projection_weight, float_options)
+            .reshape({131, 257}).to(dtype);
+        std::vector<Tensor> serial;
+        for (int row = 0; row < 6; ++row)
+            serial.push_back(linear.forward(execution, projection.narrow(1, row, 1)));
+        auto reference = mfq_tensor_backend::cat(serial, 1);
+        for (int rows = 2; rows <= 6; ++rows) {
+            auto actual = linear.forward(execution, projection.narrow(1, 0, rows));
+            MFQ_RUNTIME_CHECK(actual.equal(reference.narrow(1, 0, rows)),
+                "short dense projection differs from per-token decode");
+        }
+    }
+    std::cout << "mtp_check dense_decode_geometry_cases=15 PASS\n";
     const auto options = mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA)
         .dtype(mfq_tensor_backend::kInt64);
     auto ids = [&](const std::vector<int64_t>& tokens) {

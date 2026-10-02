@@ -324,7 +324,7 @@ add_library(mfq-cuda-runtime STATIC
     ${MFQ_CUDA_ROOT}/engine/generation.cpp
     ${MFQ_CUDA_ROOT}/engine/text_session_cache.cpp
     ${MFQ_CUDA_ROOT}/engine/decode_graph.cpp
-    ${MFQ_CUDA_ROOT}/models/causal_lm.cpp
+    ${MFQ_CUDA_ROOT}/models/causal_ops.cpp
     ${MFQ_CUDA_ROOT}/engine/mtp.cpp
     ${MFQ_CUDA_ROOT}/engine/components.cpp
     ${MFQ_CUDA_ROOT}/engine/cuda_batching.cpp
@@ -537,7 +537,7 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
         ${MFQ_CUDA_ROOT}/engine/text_session_cache.cpp
         ${MFQ_CUDA_ROOT}/engine/options.cpp
         ${MFQ_CUDA_ROOT}/engine/decode_graph.cpp
-        ${MFQ_CUDA_ROOT}/models/causal_lm.cpp
+        ${MFQ_CUDA_ROOT}/models/causal_ops.cpp
         ${MFQ_CUDA_ROOT}/models/loader.cpp
         ${MFQ_CUDA_ROOT}/engine/mtp.cpp
         ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp

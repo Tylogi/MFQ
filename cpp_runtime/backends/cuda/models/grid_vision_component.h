@@ -1,6 +1,7 @@
 #pragma once
+#include "models/common/transformer_layer.h"
 
-#include "causal_lm.h"
+#include "causal_ops.h"
 #include "grid_vision.h"
 #include "mfq_cuda_ops.h"
 #include "mfq_paged_prefix_cache.h"
@@ -224,17 +225,15 @@ struct VisionBlock {
     Affine mlp_up;
     Affine mlp_down;
 
-    Tensor operator()(
-            CudaExecutionContext& execution,
-            const Tensor& input,
-            const GridVisionLayout& layout) const {
-        auto attention_output = attention(
-            execution, norm1(input), layout);
-        auto hidden = input + attention_output.to(input.scalar_type());
-        auto mlp_output = mlp_down(
-            execution,
-            gelu_tanh(mlp_up(execution, norm2(hidden))));
-        return hidden + mlp_output.to(hidden.scalar_type());
+    Tensor operator()(CudaExecutionContext &execution, const Tensor &input,
+        const GridVisionLayout &layout) const {
+        return mfq::models::pre_norm_layer(input, [&](const Tensor &x, int stage) {
+            return stage == 0 ? norm1(x) : norm2(x);
+        }, [&](Tensor x) { return attention(execution, x, layout); }, [&](Tensor x) {
+            return mlp_down(execution, gelu_tanh(mlp_up(execution, x)));
+        }, [](Tensor residual, Tensor branch) {
+            return residual + branch.to(residual.scalar_type());
+        });
     }
 };
 
@@ -315,50 +314,46 @@ public:
     }
 
     Tensor encode(
-            CudaExecutionContext& execution,
-            Tensor pixels,
-            const std::vector<GridShape>& grids) const {
-        const auto layout = make_grid_vision_layout(
-            grids, static_cast<int32_t>(config_.spatial_merge_size));
+        CudaExecutionContext &execution, Tensor pixels, const std::vector<GridShape> &grids) const {
+        const auto layout =
+            make_grid_vision_layout(grids, static_cast<int32_t>(config_.spatial_merge_size));
         if (pixels.dim() == 5) {
             pixels = pixels.reshape({pixels.size(0), -1});
         }
         if (pixels.dim() != 2 || pixels.size(0) != layout.patch_count ||
-                pixels.size(1) != config_.patch_width()) {
-            throw std::runtime_error(
-                "grid-ViT pixel values must be flattened CxTxHxW patches");
+            pixels.size(1) != config_.patch_width()) {
+            throw std::runtime_error("grid-ViT pixel values must be flattened CxTxHxW patches");
         }
-        auto flat_weight = patch_weight_.reshape(
-            {config_.hidden_size, config_.patch_width()});
+        auto flat_weight = patch_weight_.reshape({config_.hidden_size, config_.patch_width()});
         auto hidden = mfq_tensor_backend::matmul(
             pixels.to(flat_weight.scalar_type()), flat_weight.transpose(0, 1));
         hidden = hidden + patch_bias_.to(hidden.scalar_type());
 
-        const int side = static_cast<int>(std::sqrt(
-            static_cast<double>(config_.num_position_embeddings)));
+        const int side =
+            static_cast<int>(std::sqrt(static_cast<double>(config_.num_position_embeddings)));
         const auto interpolation = make_learned_position_interpolation(
             grids, static_cast<int32_t>(config_.spatial_merge_size), side);
-        auto index = mfq_tensor_backend::tensor(
-            interpolation.indices,
+        auto index = mfq_tensor_backend::tensor(interpolation.indices,
             mfq_tensor_backend::TensorOptions()
                 .dtype(mfq_tensor_backend::kInt32)
                 .device(mfq_tensor_backend::kCPU))
-            .to(hidden.device()).to(mfq_tensor_backend::kInt64);
-        auto weights = mfq_tensor_backend::tensor(
-            interpolation.weights,
+                         .to(hidden.device())
+                         .to(mfq_tensor_backend::kInt64);
+        auto weights = mfq_tensor_backend::tensor(interpolation.weights,
             mfq_tensor_backend::TensorOptions()
                 .dtype(mfq_tensor_backend::kFloat32)
                 .device(mfq_tensor_backend::kCPU))
-            .reshape({layout.patch_count, 4, 1}).to(hidden.device());
-        auto learned = mfq_tensor_backend::sum(
-            position_weight_.index_select(0, index.reshape({-1}))
-                .reshape({layout.patch_count, 4, config_.hidden_size}) * weights,
-            1);
+                           .reshape({layout.patch_count, 4, 1})
+                           .to(hidden.device());
+        auto learned =
+            mfq_tensor_backend::sum(position_weight_.index_select(0, index.reshape({-1}))
+                                            .reshape({layout.patch_count, 4, config_.hidden_size}) *
+                                        weights,
+                1);
         hidden = hidden + learned.to(hidden.scalar_type());
-        for (const auto& block : blocks_) {
-            hidden = block(execution, hidden, layout);
-        }
-        return hidden;
+        return mfq::models::layer_stack(std::move(hidden),
+            blocks_,
+            [&](const auto &block, Tensor x) { return block(execution, x, layout); });
     }
 
     const GridVisionConfig& config() const noexcept { return config_; }

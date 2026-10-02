@@ -1,6 +1,6 @@
 #include "dspark.h"
 
-#include "../causal_lm.h"
+#include "../causal_ops.h"
 #include "models/mtp.h"
 #include "causal_lm.h"
 

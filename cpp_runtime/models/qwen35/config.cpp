@@ -1,4 +1,4 @@
-#include "models/include/qwen35.h"
+#include "models/qwen35/config.h"
 
 #include "nlohmann/json.hpp"
 

@@ -1,5 +1,5 @@
 #include "causal_lm.h"
-#include "../causal_lm_impl.h"
+#include "../session_codec_impl.h"
 
 namespace mfq::cuda::qwen4_exp {
 
@@ -199,6 +199,9 @@ void Qwen4Model::adapter_rollback_speculative(int64_t keep) {
 namespace mfq::cuda {
 
 template struct CudaSessionCodec<Qwen4Model>;
-template struct CausalLm<Qwen4Model>;
 
 } // namespace mfq::cuda
+
+namespace mfq::models {
+template struct CausalLm<cuda::CudaCausalOps<cuda::Qwen4Model>>;
+} // namespace mfq::models

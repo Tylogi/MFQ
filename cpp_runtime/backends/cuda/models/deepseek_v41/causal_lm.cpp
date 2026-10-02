@@ -1,5 +1,5 @@
 #include "causal_lm.h"
-#include "../causal_lm_impl.h"
+#include "../session_codec_impl.h"
 
 namespace mfq::cuda::deepseek_v41_runtime {
 
@@ -365,6 +365,9 @@ void DeepseekV41Model::adapter_rollback_speculative(int64_t) {
 namespace mfq::cuda {
 
 template struct CudaSessionCodec<DeepseekV41Model>;
-template struct CausalLm<DeepseekV41Model>;
 
 } // namespace mfq::cuda
+
+namespace mfq::models {
+template struct CausalLm<cuda::CudaCausalOps<cuda::DeepseekV41Model>>;
+} // namespace mfq::models

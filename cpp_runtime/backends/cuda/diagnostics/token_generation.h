@@ -103,7 +103,7 @@ int generate_diagnostic_tokens(
                 prepare_decode_graph_memory(model, graph, [&]() {
                     (void)model.next_token_static(
                         static_input, static_pos, static_len,
-                        planned_len, attention_parts);
+                        {planned_len, attention_parts});
                 }, cuda_graph_participant_streams(
                     graph_compute_streams,
                     execution.model_parallel_collectives));
@@ -113,7 +113,7 @@ int generate_diagnostic_tokens(
                 static_next = profiler.measure("decode.model_total", [&]() {
                     return model.next_token_static(
                         static_input, static_pos, static_len,
-                        planned_len, attention_parts);
+                        {planned_len, attention_parts});
                 });
                 profiler.measure("decode.commit", [&]() {
                     decode_graph_commit_cuda(

@@ -547,7 +547,7 @@ int run_mfq_http_transport(
 
     server.Get("/runtime/health", [&](const httplib::Request &, httplib::Response & res) {
         json health = {
-            {"status", reloading.load() ? "loading" : "ok"},
+            {"status", reloading.load() ? "loading" : (scheduler.status().healthy ? "ok" : "unhealthy")},
             {"model", config.model_name},
             {"model_type", config.model_type},
             {"model_capabilities", model_capabilities},

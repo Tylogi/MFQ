@@ -49,15 +49,20 @@ struct FakeEngine final : Engine {
                 result.events.push_back({id, PrefillProgress{{std::size_t(work.steps), 1, 0, 1}}});
             else if (work.steps <= int(work.request.token_ids.size()) + work.request.input.sampling.max_tokens) {
                 OutputDelta delta{{1, 2, 3}, {}};
-                if (work.request.token_ids == std::vector<int64_t>{61} ||
+                if (work.request.token_ids == std::vector<int64_t>{60} ||
+                        work.request.token_ids == std::vector<int64_t>{61} ||
                         work.request.token_ids == std::vector<int64_t>{62}) {
                     common_chat_msg_diff diff;
-                    diff.content_delta.assign(work.request.token_ids.front() == 61 ? 1024 : 8192, 'x');
+                    const auto marker = work.request.token_ids.front();
+                    diff.content_delta.assign(marker == 60 ? (work.steps == 2 ? 2000 : 6000)
+                        : (marker == 61 ? 1024 : 8192), 'x');
                     delta.diffs.push_back(std::move(diff));
                 }
                 result.events.push_back({id, std::move(delta)});
             }
-            else {
+            if (work.steps > int(work.request.token_ids.size()) + work.request.input.sampling.max_tokens ||
+                    (work.request.token_ids == std::vector<int64_t>{60} &&
+                     work.steps == int(work.request.token_ids.size()) + work.request.input.sampling.max_tokens)) {
                 it = active.erase(it); ++released;
                 InferenceMetrics metrics;
                 metrics.mtp.available = true;
@@ -153,6 +158,7 @@ int main() {
         auto bad = request(1); bad.token_ids = {63};
         auto second = scheduler.submit(bad);
         drain(first, false, true); drain(second, false, true);
+        assert(!scheduler.status().healthy);
         assert(engine.active.empty());
     }
     {
@@ -179,6 +185,35 @@ int main() {
         try { scheduler.submit(request(5)); } catch (const std::runtime_error&) { failed = true; }
         assert(failed);
         assert(scheduler.reload(64) == 64);
+        assert(scheduler.status().healthy);
         drain(scheduler.submit(request(6, 4)));
+    }
+    {
+        FakeEngine engine;
+        MfqScheduler scheduler(engine, {64, 8192});
+        auto variable = request(0, 4); variable.token_ids = {60};
+        auto slow = scheduler.submit(variable);
+        drain(scheduler.submit(request(1, 4)));
+        // Both deltas fit individually. Their sum pauses the producer instead
+        // of reporting output_limit or losing the second delta.
+        int outputs = 0, terminals = 0;
+        while (!slow->done()) for (const auto& event : slow->wait()) {
+            outputs += std::holds_alternative<OutputDelta>(event.data);
+            if (terminal(event.data)) {
+                assert(std::holds_alternative<Completed>(event.data));
+                ++terminals;
+            }
+        }
+        assert(outputs == 4 && terminals == 1);
+    }
+    {
+        FakeEngine engine;
+        MfqScheduler scheduler(engine, {64, 8192});
+        auto variable = request(0, 2); variable.token_ids = {60};
+        auto slow = scheduler.submit(variable);
+        // The final delta and terminal arrive together, with the delta blocked.
+        while (engine.released == 0) std::this_thread::yield();
+        scheduler.shutdown();
+        drain(slow); // shutdown must not wait for the consumer to drain
     }
 }

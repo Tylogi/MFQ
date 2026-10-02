@@ -1,9 +1,9 @@
 #pragma once
 
-#include "../causal_lm.h"
+#include "../causal_ops.h"
 #include "models/block.h"
 #include "quant_linear.h"
-#include "models/include/qwen4_exp.h"
+#include "models/qwen4_exp/config.h"
 #include "layers.h"
 
 #include <memory>
@@ -96,6 +96,8 @@ struct Qwen4Model : CausalLmArchitecture {
 
 extern template struct CudaSessionCodec<Qwen4Model>;
 
-extern template struct CausalLm<Qwen4Model>;
-
 } // namespace mfq::cuda
+
+namespace mfq::models {
+extern template struct CausalLm<cuda::CudaCausalOps<cuda::Qwen4Model>>;
+} // namespace mfq::models

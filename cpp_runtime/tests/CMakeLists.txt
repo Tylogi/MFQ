@@ -86,6 +86,14 @@ add_executable(mfq-inference-test inference_test.cpp)
 target_link_libraries(mfq-inference-test PRIVATE mfq-engine)
 add_test(NAME mfq-inference-test COMMAND mfq-inference-test)
 
+add_executable(mfq-request-executor-test request_executor_test.cpp)
+target_link_libraries(mfq-request-executor-test PRIVATE mfq-engine)
+add_test(NAME mfq-request-executor-test COMMAND mfq-request-executor-test)
+
+add_executable(mfq-shared-execution-test shared_execution_test.cpp)
+target_link_libraries(mfq-shared-execution-test PRIVATE mfq-engine mfq-models)
+add_test(NAME mfq-shared-execution-test COMMAND mfq-shared-execution-test)
+
 add_executable(mfq-mtp-policy-test mtp_policy_test.cpp)
 target_link_libraries(mfq-mtp-policy-test PRIVATE mfq-engine)
 target_compile_features(mfq-mtp-policy-test PRIVATE cxx_std_20)

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "quant_linear.h"
-#include "models/include/deepseek_v41.h"
+#include "models/deepseek_v41/config.h"
 #include "mfe_expert_store.h"
 
 #include <algorithm>

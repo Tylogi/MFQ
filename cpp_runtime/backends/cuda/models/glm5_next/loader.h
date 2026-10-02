@@ -3,7 +3,7 @@
 #include "quant_linear.h"
 #include "mfe_weight.h"
 #include "storage/moe_expert_cache.h"
-#include "models/include/glm5_next.h"
+#include "models/glm5_next/config.h"
 #include "runtime.h"
 
 #include <functional>

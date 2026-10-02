@@ -38,6 +38,7 @@ public:
     void cancel_all() const;
     void shutdown();
     mfq::engine::EngineInfo info() const;
+    mfq::engine::EngineStatus status() const;
     mfq::engine::ControlResult control(mfq::engine::ControlRequest request) const;
     mfq::engine::SessionResult session(mfq::engine::SessionCommand command) const;
     std::int64_t reload(std::int64_t context) const;
@@ -56,17 +57,22 @@ private:
         mfq::engine::EngineRequest input;
         std::shared_ptr<MfqScheduledRequest> outbox;
         bool admitted = false, cancelling = false;
+        bool finished = false;
         std::optional<mfq::engine::Failed> failure;
+        // At most one engine quantum waits here; it prevents further execution.
+        std::deque<mfq::engine::EngineEvent> pending;
     };
     struct Submit { Request request; std::promise<void> reply; };
     struct Cancel { std::string id; bool session = false, all = false; std::promise<bool> reply; };
     struct Control { mfq::engine::ControlRequest request; std::promise<mfq::engine::ControlResult> reply; };
     struct Session { mfq::engine::SessionCommand request; std::promise<mfq::engine::SessionResult> reply; };
     struct Reload { std::int64_t context; std::promise<std::int64_t> reply; };
-    using Command = std::variant<Submit, Cancel, Control, Session, Reload>;
+    struct Status { std::promise<mfq::engine::EngineStatus> reply; };
+    using Command = std::variant<Submit, Cancel, Control, Session, Reload, Status>;
     void enqueue(Command command) const;
     void loop() noexcept;
     void publish(Request& request, mfq::engine::EngineEvent event);
+    void flush(Request& request);
     void cancel(Request& request);
 
     mfq::engine::Engine& engine_;

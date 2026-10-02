@@ -1,12 +1,12 @@
 #include "causal_lm.h"
-#include "../causal_lm_impl.h"
+#include "../session_codec_impl.h"
 
 namespace mfq::cuda {
 
 namespace {
 
 void set_standard_metadata(
-        CausalLmMetadata& metadata,
+        mfq::models::CausalLmMetadata& metadata,
         const mfq::models::ModelConfig& config) {
     metadata.vocab_size = config.vocab_size;
     metadata.hidden_size = config.hidden_size;
@@ -288,7 +288,6 @@ int run_minicpmo45_duplex(
               << " seed=" << seed << "\n";
     return 0;
 }
-
 
 static mfq_tensor_backend::Tensor minicpmo45_eval_embeddings(
         MiniCPMO45Runtime & runtime,
@@ -1143,7 +1142,10 @@ namespace mfq::cuda {
 
 template struct FullAttentionSessionCodec<MiniCPMO45Model>;
 template struct FullAttentionSessionCodec<MiniCPMOTtsModel>;
-template struct CausalLm<MiniCPMO45Model>;
-template struct CausalLm<MiniCPMOTtsModel>;
 
 } // namespace mfq::cuda
+
+namespace mfq::models {
+template struct CausalLm<cuda::CudaCausalOps<cuda::MiniCPMO45Model>>;
+template struct CausalLm<cuda::CudaCausalOps<cuda::MiniCPMOTtsModel>>;
+} // namespace mfq::models

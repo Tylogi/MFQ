@@ -1,6 +1,7 @@
 #pragma once
 
 #include "paged_kv_allocator.h"
+#include "batch_state.h"
 #include "models/full_block.h"
 
 #include <cuda_runtime_api.h>
@@ -16,10 +17,6 @@
 #include <vector>
 
 namespace mfq::cuda::continuous {
-
-struct QwenPagedKvSequence {
-    std::vector<std::int32_t> physical_pages;
-};
 
 class QwenPagedKvArena {
 public:

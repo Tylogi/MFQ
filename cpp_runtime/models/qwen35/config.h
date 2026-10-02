@@ -3,7 +3,7 @@
 #include "grid_vision.h"
 #include "mfq_legacy_tensor_names.h"
 #include "mfq_model_graph.h"
-#include "model_config.h"
+#include "models/common/model_config.h"
 
 #include <cstdint>
 #include <optional>

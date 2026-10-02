@@ -1,7 +1,7 @@
 #pragma once
 
 #include "block.h"
-#include "models/include/model_config.h"
+#include "models/common/model_config.h"
 
 #include <memory>
 #include <string>

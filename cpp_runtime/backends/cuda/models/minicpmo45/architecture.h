@@ -1,10 +1,10 @@
 #pragma once
 
-#include "../causal_lm.h"
+#include "../causal_ops.h"
 #include "../full_attention_session_codec.h"
 #include "models/block.h"
 #include "quant_linear.h"
-#include "models/include/minicpmo45.h"
+#include "models/minicpmo45/config.h"
 #include "mfq_cuda_ops.h"
 #include "inference.h"
 
@@ -83,8 +83,6 @@ struct CudaSessionCodec<MiniCPMO45Model>
 
 extern template struct FullAttentionSessionCodec<MiniCPMO45Model>;
 
-extern template struct CausalLm<MiniCPMO45Model>;
-
 struct MiniCPMOTtsModel : CausalLmArchitecture {
     mfq::models::ModelConfig config;
 
@@ -110,9 +108,12 @@ struct CudaSessionCodec<MiniCPMOTtsModel>
 
 extern template struct FullAttentionSessionCodec<MiniCPMOTtsModel>;
 
-extern template struct CausalLm<MiniCPMOTtsModel>;
-
 } // namespace mfq::cuda
 
 inline constexpr const char * MINICPMO45_RESAMPLER_POS_EMBED_ASSET =
     "__mfq_asset__/minicpmo45-resampler-pos-embed-v1.bf16";
+
+namespace mfq::models {
+extern template struct CausalLm<cuda::CudaCausalOps<cuda::MiniCPMO45Model>>;
+extern template struct CausalLm<cuda::CudaCausalOps<cuda::MiniCPMOTtsModel>>;
+} // namespace mfq::models
