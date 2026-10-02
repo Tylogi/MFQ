@@ -5,7 +5,7 @@ on:
     branches: [master]
     paths: ['mfq/**', 'tests/**', 'pyproject.toml', '.github/workflows/calibration.yaml']
   pull_request:
-    branches: [master]
+    branches: [master, feat/alphaq-calibration-free-20261001]
     paths: ['mfq/**', 'tests/**', 'pyproject.toml', '.github/workflows/calibration.yaml']
 
 concurrency:
@@ -34,4 +34,10 @@ jobs:
           python -m pytest tests/test_alphaq.py tests/test_ew_solver.py
           tests/test_hf_source_store.py tests/test_quantize_cli.py tests/test_calibration.py
           tests/test_build_reap_expert_scheme.py tests/test_quantize/test_hf_to_mfq.py
-          tests/test_quantize/test_full_precision_mfq.py -q
+          tests/test_quantize/test_full_precision_mfq.py
+          tests/test_alphaq_fit.py tests/test_alphaq_joint.py tests/test_alphaq_model.py
+          tests/test_alphaq_output.py tests/test_alphaq_parallel.py
+          tests/test_alphaq_payloads.py tests/test_alphaq_spectrum.py
+          tests/test_alphaq_workflow.py tests/test_candidate_streams.py
+          tests/test_dense_scheme.py tests/test_weighted_nint_scheme.py
+          tests/test_quantize/test_nvq_jsc.py tests/test_quantize_package_data.py -q

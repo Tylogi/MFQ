@@ -202,6 +202,72 @@ All produced schemes/reports explicitly say `not evaluated; surrogate only`.
 Quantization quality requires complete WT2 forward KLD and Top1 agreement
 against the reference under the same evaluation contract (normally ctx512).
 
+## Verified joint workflow: AlphaQ with native router frequency
+
+The joint workflow shares one whole-file budget between routed experts and
+eligible non-PLE dense matrices. To use a native routing-count cache collected
+separately from the imatrix, select both options explicitly:
+
+```bash
+mfq quantize model-hf output.mfq --imatrix calibration.gguf \
+  --target-bpw 3.5658365879106404 --backend cuda \
+  --alphaq-dense joint --alphaq-router-cache native-router.json \
+  --alphaq-cache alphaq-cache --devices 0,1
+```
+
+`native-router.json` follows the model-bound `mfq.alphaq-router-frequency.v1`
+schema described below. The evaluated cache contains 1,048,576 calibration
+tokens, 512 experts per layer, and ten selected experts per token. Router
+frequency weights expert importance; the imatrix weights candidate fitting.
+The allocation objective uses analytical AlphaQ distortion. Measured weighted
+SSE is not an extra multiplier in this selected method. The built-in candidate
+set is NVQ1-S, NVQ1-L, NVQ2J, NVQ2J-L, NVQ2J-XL, NVQ3J, NVQ3J-512, NVQ3J-L,
+NINT4, NINT5, NINT6 and NINT8, using their canonical group definitions.
+
+In the Qwen3.8-Flash-Next evaluation, 73,728 expert projections and 768 dense
+matrices participate. Four dense matrices without matching imatrix entries
+retain source BF16. Dense matrices also have a native-precision candidate.
+PLE remains at the selected tier's mapped precision and consumes the same
+whole-file budget. PLE frequency-based allocation is outside this workflow.
+For this model, `--alphaq-dense joint` is necessary: `auto` retains the earlier
+recipe policy for compatibility, as detailed below.
+
+The following frozen experimental allocations completed full WikiText-2 test
+forward evaluation on 580 independent contexts of length 512. Each context
+scores positions 256 through 510, totaling 147,900 positions. KLD is
+`KL(reference || candidate)`; Top1 is agreement with the reference argmax.
+Reference PPL is 4.7181834093. All rows fit their corresponding pinned UD
+whole-file byte caps; labels identify budget tiers rather than uniform formats.
+
+| Budget tier | Actual whole-file BPW | KLD | Top1 agreement | PPL |
+|---|---:|---:|---:|---:|
+| IQ1_S | 3.279974 | 0.275743 | 81.8026% | 5.055572 |
+| IQ1_M | 3.370049 | 0.251235 | 82.9135% | 4.987575 |
+| Q2_K_XL | 3.565835 | 0.184769 | 85.2231% | 4.863464 |
+| IQ3_XXS | 3.705662 | 0.148228 | 86.6315% | 4.830583 |
+| Q3_K_XL | 4.068465 | 0.105772 | 88.6430% | 4.753334 |
+| IQ4_XS | 4.235579 | 0.092440 | 89.3313% | 4.764935 |
+| Q4_K_XL | 5.033566 | 0.047344 | 92.3239% | 4.719553 |
+| Q5_K_XL | 7.155960 | 0.028423 | 94.1028% | 4.714414 |
+| Q6_K_XL | 7.647549 | 0.025251 | 94.4131% | 4.728415 |
+
+Matched fixed-dense controls exist for IQ1_S, IQ1_M and Q2_K_XL; joint allocation
+improves KLD and Top1 in all three comparisons. Comparisons against the earlier
+UD-mapped recipes also change the four missing-imatrix matrices to BF16 and
+therefore do not isolate dense allocation. Q5_K_XL and Q6_K_XL improve all three
+metrics over those earlier recipes; improvement across every budget is not
+claimed.
+
+These measurements use retained canonical candidate views. The normal CLI was
+separately checked for allocator equivalence, candidate-byte preservation and
+complete-file export; a fresh refit is not claimed to reproduce these exact
+metrics. The final joint result summary SHA256 is
+`b9ad8fd29f8a85f4cb4b1664cc3b69672189e7bae39c58a5d002f16b91e07309`.
+Its evidence audit SHA256 is
+`4fa849533cd399b796df7da5daa23bc38bd5bfcf0873ed1d0d49b94138af52a8`.
+The audit reaggregates 21 complete results from 1,491 raw metric batches,
+including nine joint results, nine earlier references and three matched controls.
+
 ## Whole-file quantization
 
 ```bash
