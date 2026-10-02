@@ -11,6 +11,8 @@ from typing import Any
 _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
     "alphaq": (
         "AlphaQTensorStatistics",
+        "ALPHAQ_PROFILES",
+        "alphaq_builtin_candidates",
         "alphaq_weight_statistics",
         "alphaq_importance",
         "alphaq_candidates",
@@ -96,6 +98,8 @@ __all__ = [
     "alphaq_importance",
     "alphaq_candidates",
     "alphaq_nint_candidates",
+    "ALPHAQ_PROFILES",
+    "alphaq_builtin_candidates",
     "allocate_alphaq",
     "collect_alphaq",
     "ActivationImatrixCollector",

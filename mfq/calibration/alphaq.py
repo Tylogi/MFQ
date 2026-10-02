@@ -17,6 +17,7 @@ import numpy as np
 
 from mfq.calibration.artifact import (
     CalibrationScheme,
+    ExpertPrecision,
     ExpertSelection,
     ExpertTensorSelection,
     nint_expert_precision,
@@ -34,6 +35,12 @@ from mfq.calibration.ew_solver import (
 )
 
 STATISTICS_FORMAT = "mfq.alphaq-statistics.v1"
+ALPHAQ_PROFILES = (
+    "NVQ1-S", "NVQ1-L",
+    "NVQ2J", "NVQ2J-L", "NVQ2J-XL",
+    "NVQ3J", "NVQ3J-512", "NVQ3J-L",
+    "NINT4", "NINT5", "NINT6", "NINT8",
+)
 METHOD = {
     "method": "AlphaQ",
     "formula": "median(alpha) / alpha * variance * 2**(-2*b)",
@@ -68,12 +75,13 @@ class AlphaQTensorStatistics:
             raise ValueError("AlphaQ variances must be finite and nonnegative")
 
 
-def alphaq_weight_statistics(weights: Any) -> tuple[np.ndarray, np.ndarray]:
+def alphaq_weight_statistics(weights: Any, *, backend: str = "auto") -> tuple[np.ndarray, np.ndarray]:
     """Batched FARMS/Hill statistics for a floating [E,O,I] torch tensor.
 
-    Uses batched FP32 singular values; no TF32 Gram products, approximate
-    randomized SVD or CPU decoding. Batch size is reduced only after OOM.
-    Tiny/rank-deficient/constant matrices have a finite deterministic result.
+    CUDA uses full-FP32 Gram products and a batched symmetric solver when
+    supported; CPU, tiny matrices and numerically degenerate tails use SVD.
+    ``backend='svd'`` is the reference path; ``'gram'`` also permits CPU
+    comparisons. No block subsampling; batches shrink only after actual OOM.
     """
     import torch
 
@@ -81,6 +89,9 @@ def alphaq_weight_statistics(weights: Any) -> tuple[np.ndarray, np.ndarray]:
         raise ValueError("AlphaQ weights must be a floating [E,O,I] torch tensor")
     if not weights.is_floating_point() or min(weights.shape) <= 0:
         raise ValueError("AlphaQ weights must be nonempty and floating point")
+    if backend not in {"auto", "svd", "gram"}:
+        raise ValueError("AlphaQ spectrum backend must be auto, svd or gram")
+    from mfq.calibration.alphaq_spectrum import cuda_library, gram_eigenvalues
     with torch.no_grad():
         w = weights.detach().float()
         if not bool(torch.isfinite(w).all()):
@@ -97,18 +108,24 @@ def alphaq_weight_statistics(weights: Any) -> tuple[np.ndarray, np.ndarray]:
             )
         else:
             blocks = w
+        gram_backend = min(rows, columns) >= 128 and (
+            backend == "gram" or (backend == "auto" and w.is_cuda and cuda_library() is not None)
+        )
         # Keep the relatively small spectra on the device. Failed batches
         # do not discard spectra from preceding batches.
         spectra = torch.empty(
             (blocks.shape[0], min(blocks.shape[-2:])), dtype=torch.float32, device=w.device
         )
-        start, batch = 0, blocks.shape[0]
+        # cuSOLVER's generic batch interface uses signed-int matrix indexing.
+        batch = min(blocks.shape[0], 2147483647//(128*128)) if gram_backend else blocks.shape[0]
+        start = 0
         while start < blocks.shape[0]:
             count = min(batch, blocks.shape[0] - start)
             try:
-                spectra[start : start + count] = torch.linalg.svdvals(
-                    blocks[start : start + count]
-                ).square()
+                part = blocks[start : start + count]
+                spectra[start : start + count] = (
+                    gram_eigenvalues(part) if gram_backend else torch.linalg.svdvals(part).square()
+                )
             except torch.OutOfMemoryError:
                 if count == 1:
                     raise
@@ -116,6 +133,19 @@ def alphaq_weight_statistics(weights: Any) -> tuple[np.ndarray, np.ndarray]:
                 continue
             start += count
         eigen = spectra.reshape(experts, -1).double().cpu().numpy()
+        if gram_backend:
+            ordered = np.sort(eigen, axis=1)
+            tail_count = min(ordered.shape[1]-1, max(10, int(ordered.shape[1]*.1)))
+            threshold = ordered[:, -tail_count-1]
+            largest = ordered[:, -1]
+            # Gram roundoff can dominate a low-rank tail or nearly constant
+            # spectrum. Recompute those banks with the established SVD path.
+            unstable = (threshold <= largest*128*np.finfo(np.float32).eps) | (
+                largest-threshold <= largest*128*np.finfo(np.float32).eps)
+            if unstable.any():
+                ids = np.flatnonzero(unstable)
+                exact_alpha, exact_variance = alphaq_weight_statistics(
+                    weights[torch.as_tensor(ids, device=weights.device)], backend="svd")
     eigen.sort(axis=1)
     n = eigen.shape[1]
     if n < 2:
@@ -124,7 +154,10 @@ def alphaq_weight_statistics(weights: Any) -> tuple[np.ndarray, np.ndarray]:
     threshold = np.maximum(eigen[:, -k - 1], 1e-12)
     tail = np.maximum(eigen[:, -k:], 1e-12)
     denominator = np.maximum(np.log(tail / threshold[:, None]).sum(axis=1), 1e-12)
-    return 1.0 + k / denominator, variance
+    alpha = 1.0 + k / denominator
+    if gram_backend and unstable.any():
+        alpha[ids], variance[ids] = exact_alpha, exact_variance
+    return alpha, variance
 
 
 def alphaq_importance(statistics: Sequence[AlphaQTensorStatistics]) -> ImportanceTable:
@@ -231,6 +264,67 @@ def alphaq_nint_candidates(
     return alphaq_candidates(table)
 
 
+def alphaq_builtin_candidates(
+    statistics: Sequence[AlphaQTensorStatistics], profiles: Sequence[str] | None = None
+) -> EwCandidateTable:
+    """Canonical NVQ/NINT choices, including MFE headers and shared tables.
+
+    Per-expert rounding is an upper bound on cohort stream packing. Tables
+    are charged once per used tensor/profile pool, never once per expert.
+    No weight fitting is needed to determine these costs.
+    """
+    from mfq.formats.io import _MFE_HDR
+    from mfq.formats.nvq import jsc_payload_nbytes
+    from mfq.formats.nvq1_l import NVQ1_L_T8_S3
+    from mfq.formats.nvq1_s import NVQ1_S
+    from mfq.tools.quantize_hf_to_mfq import _mixed_moe_blob_nbytes, _NVQ_SPECS
+
+    names = ALPHAQ_PROFILES if profiles is None else tuple(profiles)
+    if not names or len(set(names)) != len(names) or set(names) - set(ALPHAQ_PROFILES):
+        raise ValueError("profiles must be distinct built-in AlphaQ profiles")
+    nint_names = tuple(n for n in names if n.startswith("NINT"))
+    nint = alphaq_nint_candidates(statistics, nint_names) if nint_names else None
+    nint_costs = {} if nint is None else {
+        (c.key.tensor, c.profile): c for c in nint.candidates
+    }
+    tensors, candidates = {}, []
+    for s in statistics:
+        experts, rows, columns = s.shape
+        tensors[s.name] = EwTensorSpec(
+            s.name, s.name, s.layer, s.projection, experts, rows, columns,
+            _MFE_HDR.size * 8, None,
+        )
+        for profile in names:
+            if profile.startswith("NINT"):
+                base = nint_costs[s.name, profile]
+                precision = base.precision
+                payload = base.variable_storage_bits // 8 - 4
+            else:
+                # Use explicit bank counts so estimation and streaming agree.
+                options = (("banks", 4 if profile.startswith("NVQ2J") else 2),) if "J" in profile else ()
+                precision = ExpertPrecision(profile, options=options)
+                if profile == "NVQ1-S":
+                    payload = NVQ1_S.payload_nbytes(rows, columns, include_codebook=False)
+                elif profile == "NVQ1-L":
+                    payload = NVQ1_L_T8_S3.payload_nbytes(rows, columns)
+                else:
+                    payload = jsc_payload_nbytes(_NVQ_SPECS[profile], rows, columns)
+            single = _mixed_moe_blob_nbytes((1, rows, columns), (precision,), None)
+            pool = single - _MFE_HDR.size - payload - 4
+            if pool < 0:
+                raise RuntimeError(f"negative pool storage for {profile}")
+            for expert in range(experts):
+                candidates.append(EwCandidate(
+                    EwItemKey(s.name, s.layer, s.projection, expert), profile,
+                    precision, (payload + 4) * 8, profile, pool * 8,
+                    0.0, 0.0, payload * 8 / (rows * columns),
+                ))
+    return alphaq_candidates(EwCandidateTable(tensors, tuple(candidates), None, {
+        "storage_accounting": "per-expert byte-rounded streams + expert IDs + used pool headers/tables + MFE tensor headers; excludes outer container",
+        "profiles": list(names),
+    }))
+
+
 def _hull_allocation(
     choices: Mapping[EwItemKey, Sequence[EwCandidate]],
     weights: Mapping[EwItemKey, float],
@@ -301,6 +395,8 @@ def allocate_alphaq(
     budget: EwBudget,
     *,
     solver: str = "hull",
+    distortion: str = "analytical",
+    importance_multipliers: Mapping[EwItemKey, float] | None = None,
 ) -> EwSolveResult:
     """Allocate AlphaQ into the standard quantizer-consumable scheme.
 
@@ -309,7 +405,22 @@ def allocate_alphaq(
     ``solver='exact'`` and reuse MFQ's existing joint EW solver.
     """
     importance = alphaq_importance(statistics)
-    scored = alphaq_candidates(candidates)
+    if distortion == "analytical":
+        scored = alphaq_candidates(candidates)
+    elif distortion == "imatrix_sse":
+        if candidates.metadata.get("distortion_metric") != "imatrix_weighted_sse":
+            raise ValueError("imatrix_sse requires measured imatrix_weighted_sse candidates")
+        if any(not math.isfinite(c.distortion) or c.distortion < 0
+               for c in candidates.candidates):
+            raise ValueError("candidate SSE must be finite and nonnegative")
+        scored = candidates
+        importance = replace(importance, metadata={
+            **importance.metadata,
+            "formula": "median(alpha) / alpha * variance * imatrix_weighted_sse",
+            "distortion_metric": "imatrix_weighted_sse",
+        })
+    else:
+        raise ValueError("AlphaQ distortion must be analytical or imatrix_sse")
     by_name = {s.name: s for s in statistics}
     for name, tensor in scored.tensors.items():
         if name not in by_name or by_name[name].shape != (
@@ -320,6 +431,17 @@ def allocate_alphaq(
             raise ValueError(f"AlphaQ source/candidate shape or identity mismatch: {name}")
     if set(by_name) != set(scored.tensors):
         raise ValueError("AlphaQ statistics and candidates must cover the same tensors")
+    if importance_multipliers is not None:
+        if set(importance_multipliers) != set(scored.items):
+            raise ValueError("importance multipliers must cover every candidate item exactly")
+        if any(not math.isfinite(v) or v < 0 for v in importance_multipliers.values()):
+            raise ValueError("importance multipliers must be finite and nonnegative")
+        importance = replace(importance, entries=tuple(
+            replace(entry, score=entry.score * importance_multipliers[
+                EwItemKey(entry.tensor, entry.layer, entry.projection, entry.expert_id)])
+            for entry in importance.entries),
+            metadata={**importance.metadata, "external_importance_multiplier": True,
+                      "formula": "(" + importance.metadata["formula"] + ") * importance_multiplier"})
     weights = importance.weights_for(scored.items)
     if budget.model_weight_count < scored.routed_weight_count:
         raise ValueError("model weight count is smaller than routed weight count")
@@ -344,17 +466,42 @@ def allocate_alphaq(
         or budget.projections
         or budget.layers
         or budget.shape_constraints
-        or any(c.pool_storage_bits for c in scored.candidates)
     ):
         raise ValueError(
-            "AlphaQ hull requires one upper budget and zero pool charges; use --solver exact for joint constraints"
+            "AlphaQ hull requires one upper budget; use --solver exact for joint constraints"
         )
     fixed = sum(t.fixed_storage_bits for t in scored.tensors.values())
     available = maximum - budget.model_fixed_storage_bits - fixed
     choices: dict[EwItemKey, list[EwCandidate]] = defaultdict(list)
     for c in scored.candidates:
         choices[c.key].append(c)
-    selected, lower = _hull_allocation(choices, weights, available)
+    pools = {}
+    for c in scored.candidates:
+        pool_key = (c.key.tensor, c.pool_key)
+        pool_spec = (c.pool_storage_bits, c.precision)
+        if pool_key in pools and pools[pool_key] != pool_spec:
+            raise ValueError(f"inconsistent AlphaQ pool storage or precision: {pool_key}")
+        pools[pool_key] = pool_spec
+    reserved_pool_bits = sum(bits for bits, _ in pools.values())
+    try:
+        selected, lower = _hull_allocation(choices, weights, available - reserved_pool_bits)
+    except ValueError as exc:
+        if reserved_pool_bits:
+            raise ValueError(
+                "all-pool reservation exceeds budget; use --solver exact to test shared-pool feasibility"
+            ) from exc
+        raise
+    if reserved_pool_bits:
+        # Ignoring activation costs is a relaxation of the original problem.
+        # The bound from the reserved-budget solve is NOT a valid lower bound.
+        _, lower = _hull_allocation(choices, weights, available)
+    pool_members = defaultdict(list)
+    for key, c in selected.items():
+        pool_members[(key.tensor, c.pool_key)].append(key)
+    pool_charges = {
+        min(members): pools[pool][0] for pool, members in pool_members.items()
+    }
+    used_pool_bits = sum(pool_charges.values())
     tensors = {}
     for name, t in scored.tensors.items():
         experts = []
@@ -366,7 +513,8 @@ def allocate_alphaq(
                 ExpertSelection(
                     expert,
                     c.precision.nint_spec,
-                    c.variable_storage_bits + (t.fixed_storage_bits if expert == 0 else 0),
+                    c.variable_storage_bits + pool_charges.get(key, 0)
+                    + (t.fixed_storage_bits if expert == 0 else 0),
                     loss,
                     loss,
                     c.precision,
@@ -380,6 +528,10 @@ def allocate_alphaq(
         **importance.metadata,
         "solver": "lower-hull LP + feasible rounding",
         "integer_optimality_proven": False,
+        "pool_accounting": "reserve all enabled pools during allocation; charge only selected pools",
+        "reserved_pool_bits": reserved_pool_bits,
+        "used_pool_bits": used_pool_bits,
+        "unused_pool_reservation_bits": reserved_pool_bits - used_pool_bits,
         "storage_accounting": scored.metadata.get(
             "storage_accounting", "candidate variable bits + tensor fixed bits"
         ),
@@ -418,9 +570,11 @@ def allocate_alphaq(
 
 __all__ = [
     "AlphaQTensorStatistics",
+    "ALPHAQ_PROFILES",
     "alphaq_weight_statistics",
     "alphaq_importance",
     "alphaq_candidates",
     "alphaq_nint_candidates",
+    "alphaq_builtin_candidates",
     "allocate_alphaq",
 ]

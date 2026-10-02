@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 def run(args: argparse.Namespace) -> int:
-    from mfq.calibration.alphaq import allocate_alphaq, alphaq_nint_candidates
+    from mfq.calibration.alphaq import allocate_alphaq, alphaq_builtin_candidates
     from mfq.calibration.alphaq_source import _atomic_json, _progress, collect_alphaq
     from mfq.calibration.artifact import save_scheme
     from mfq.calibration.ew_solver import EwBudget, RateBounds, load_budget, load_candidate_table
@@ -47,13 +47,11 @@ def run(args: argparse.Namespace) -> int:
                 or budget.layers
                 or budget.shape_constraints
             )
-        if joint or (
-            candidates is not None and any(c.pool_storage_bits for c in candidates.candidates)
-        ):
-            raise ValueError("shared pool costs or joint constraints require --solver exact")
+        if joint:
+            raise ValueError("joint constraints require --solver exact")
     values = collect_alphaq(args.model, statistics, device=args.device)
     if candidates is None:
-        candidates = alphaq_nint_candidates(values, args.profile)
+        candidates = alphaq_builtin_candidates(values, args.profile)
     if budget is None:
         budget = EwBudget(
             "AlphaQ",
@@ -81,6 +79,8 @@ def run(args: argparse.Namespace) -> int:
 
 
 def add_parser(stages: argparse._SubParsersAction) -> None:
+    from mfq.calibration.alphaq import ALPHAQ_PROFILES
+
     parser = stages.add_parser(
         "alphaq",
         help="allocate MoE precision from weights only (no calibration data)",
@@ -100,7 +100,7 @@ def add_parser(stages: argparse._SubParsersAction) -> None:
     budget.add_argument(
         "--target-bpw",
         type=float,
-        help="global routed-expert payload BPW ceiling; excludes fixed container headers",
+        help="routed-expert BPW ceiling including MFE headers/tables; excludes outer file and non-routed tensors",
     )
     budget.add_argument("--budget", help="existing mfq.ew-budget.v1 document")
     parser.add_argument(
@@ -115,8 +115,8 @@ def add_parser(stages: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--profile",
         action="append",
-        choices=("NINT2", "NINT3", "NINT4", "NINT5", "NINT6", "NINT8"),
-        help="repeat to restrict the built-in standard NINT candidate set",
+        choices=ALPHAQ_PROFILES,
+        help="repeat to restrict the built-in NVQ1, NVQ2J/3J variants and NINT4/5/6/8 candidate set",
     )
     parser.add_argument(
         "--candidates",
@@ -126,7 +126,7 @@ def add_parser(stages: argparse._SubParsersAction) -> None:
         "--solver",
         choices=("hull", "exact"),
         default="hull",
-        help="hull: fast global-budget allocation; exact: EW MILP with shared pool costs/joint constraints (can be expensive)",
+        help="hull: fast global budget with conservative pool reservation; exact: EW MILP with joint constraints (can be expensive)",
     )
     parser.set_defaults(_impl=run)
 

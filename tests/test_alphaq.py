@@ -11,7 +11,9 @@ import pytest
 from mfq import cli
 from mfq.calibration.alphaq import (
     AlphaQTensorStatistics,
+    ALPHAQ_PROFILES,
     allocate_alphaq,
+    alphaq_builtin_candidates,
     alphaq_candidates,
     alphaq_importance,
     alphaq_nint_candidates,
@@ -241,13 +243,16 @@ def test_exact_solver_keeps_pool_activation_charges():
         table, candidates=tuple(replace(c, pool_storage_bits=200) for c in table.candidates)
     )
     budget = _budget(table, 120000)
-    with pytest.raises(ValueError, match="--solver exact"):
-        allocate_alphaq(stats, table, budget)
+    fast = allocate_alphaq(stats, table, budget)
     result = allocate_alphaq(stats, table, budget, solver="exact")
     expected = sum(c.variable_storage_bits for c in result.selected.values())
     expected += 200 * len({c.pool_key for c in result.selected.values()})
     assert result.scheme.storage_bits == expected <= 120000
     assert result.scheme.metadata["method"] == "AlphaQ"
+    assert fast.scheme.storage_bits <= 120000
+    weights = alphaq_importance(stats).weights_for(table.items)
+    exact_objective = sum(weights[k] * c.distortion for k, c in result.selected.items())
+    assert fast.report["relaxation_lower_bound"] <= exact_objective + 1e-10
 
 
 def test_no_silent_shape_mismatch_or_infeasible_budget():
@@ -311,6 +316,7 @@ def test_cli_hf_scheme_is_consumed_by_actual_quantizer_and_cache_reused(
         str(stats),
         "--target-bpw",
         "3.5",
+        "--profile", "NVQ1-L", "--profile", "NINT4",
         "--device",
         "cpu",
     ]
@@ -551,7 +557,8 @@ def test_cli_quantizes_scheme_into_mfe(tmp_path):
                 "--output",
                 str(scheme),
                 "--target-bpw",
-                "5.0",
+                "16.0",
+                "--profile", "NINT4",
                 "--device",
                 "cpu",
             ]
@@ -646,3 +653,68 @@ def test_invalid_solver_contract_rejected_before_collecting_weights(tmp_path, mo
                 str(path),
             ]
         )
+
+@pytest.mark.parametrize('rows,columns', [(640, 2560), (2560, 640), (5, 40)])
+def test_builtin_profile_costs_cover_streamed_mfe(tmp_path, rows, columns):
+    from mfq.tools.quantize_hf_to_mfq import _write_mixed_moe_axis0_blob
+    stats = (replace(_statistics(3)[0], shape=(3, rows, columns)),)
+    table = alphaq_builtin_candidates(stats)
+    assert tuple(dict.fromkeys(c.profile for c in table.candidates)) == ALPHAQ_PROFILES
+    assert not {'NINT2', 'NINT3'} & set(ALPHAQ_PROFILES)
+    for profile in ALPHAQ_PROFILES:
+        choices = [c for c in table.candidates if c.profile == profile]
+        precisions = tuple(c.precision for c in choices)
+        path = tmp_path / (profile + '.bin')
+        count = _write_mixed_moe_axis0_blob(
+            None, (3, rows, columns), (3, rows, columns), precisions,
+            path, 8, 'cpu', 'cpu', None, synthetic=True,
+        )
+        estimate = sum(c.variable_storage_bits for c in choices)
+        estimate += choices[0].pool_storage_bits + table.tensors[stats[0].name].fixed_storage_bits
+        assert path.stat().st_size == count
+        assert count * 8 <= estimate
+        # Only per-expert stream byte rounding may differ.
+        assert estimate - count * 8 <= 3 * 5 * 8
+
+
+def test_shared_pool_hull_bound_against_enumeration():
+    stats = _statistics(3)
+    table = alphaq_nint_candidates(stats, ('NINT4', 'NINT5', 'NINT6'))
+    table = replace(table, candidates=tuple(
+        replace(c, pool_storage_bits={'NINT4': 300, 'NINT5': 1000, 'NINT6': 700}[c.profile])
+        for c in table.candidates
+    ))
+    weights = alphaq_importance(stats).weights_for(table.items)
+    choices = [[c for c in table.candidates if c.key == key] for key in table.items]
+    capacity = 350000
+    result = allocate_alphaq(stats, table, _budget(table, capacity))
+    feasible = []
+    for combination in itertools.product(*choices):
+        pool_cost = {c.pool_key: c.pool_storage_bits for c in combination}
+        cost = sum(c.variable_storage_bits for c in combination) + sum(pool_cost.values())
+        if cost <= capacity:
+            feasible.append(sum(weights[c.key] * c.distortion for c in combination))
+    assert result.report['relaxation_lower_bound'] <= min(feasible) + 1e-12
+    assert result.report['objective'] >= min(feasible) - 1e-12
+    selected_pools = {c.pool_key: c.pool_storage_bits for c in result.selected.values()}
+    assert result.scheme.storage_bits == sum(c.variable_storage_bits for c in result.selected.values()) + sum(selected_pools.values())
+    assert result.scheme.storage_bits <= capacity
+
+
+def test_measured_sse_can_reverse_analytical_precision_ranking():
+    stats = _statistics(1)
+    table = alphaq_nint_candidates(stats, ("NINT4", "NINT8"))
+    measured = replace(table, metadata={**table.metadata, "distortion_metric": "imatrix_weighted_sse"},
+        candidates=tuple(replace(c, distortion=1.0 if c.profile == "NINT4" else 2.0)
+                         for c in table.candidates))
+    budget = _budget(table, max(c.variable_storage_bits for c in table.candidates))
+    old = allocate_alphaq(stats, measured, budget)
+    new = allocate_alphaq(stats, measured, budget, distortion="imatrix_sse")
+    assert next(iter(old.selected.values())).profile == "NINT8"
+    assert next(iter(new.selected.values())).profile == "NINT4"
+    assert new.report["objective"] == 1.0
+    assert "2**" not in new.scheme.metadata["formula"]
+    with pytest.raises(ValueError, match="measured"):
+        allocate_alphaq(stats, table, budget, distortion="imatrix_sse")
+    with pytest.raises(ValueError, match="distortion must"):
+        allocate_alphaq(stats, measured, budget, distortion="unknown")

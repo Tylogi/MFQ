@@ -49,6 +49,7 @@ def collect_alphaq(
     from mfq.tools.quantize_hf_to_mfq import (
         SourceTensorMetadata,
         _MfqGlmExpertRowSource,
+        _PackedExpertProjectionSource,
         _plan,
         _raw_source_for_plan,
         _ScaledFp8TensorSlice,
@@ -115,7 +116,7 @@ def collect_alphaq(
             # bank, and the canonical derived key for separately stored experts.
             name = (
                 item.name
-                if item.expert_source_names is not None
+                if item.expert_source_names is not None or (item.transform and item.transform.startswith("expert_"))
                 else (item.source_name or item.name)
             )
             shape = tuple(item.expert_shape or item.shape)
@@ -183,6 +184,8 @@ def collect_alphaq(
                         )
                 else:
                     source = _raw_source_for_plan(root, item)
+                if item.transform and item.transform.startswith("expert_"):
+                    source = _PackedExpertProjectionSource(source, item)
                 try:
                     alpha, variance = [], []
                     start, batch = 0, shape[0]

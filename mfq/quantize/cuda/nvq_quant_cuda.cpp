@@ -2,6 +2,10 @@
 #include <vector>
 
 torch::Tensor nvq_pack_bits_cuda(torch::Tensor values, int64_t bits);
+std::vector<torch::Tensor> nvq1_s_assign_cuda(
+    torch::Tensor xgroup, torch::Tensor wgroup, torch::Tensor group_anchor,
+    torch::Tensor codebook, int64_t groups_per_row, int64_t valid_last,
+    double delta);
 torch::Tensor nvq_pack_group64_cuda(torch::Tensor state, torch::Tensor indices,
                                    torch::Tensor signs, int64_t neuron_len);
 
@@ -100,6 +104,8 @@ std::vector<torch::Tensor> nint_make_qp_cuda(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     namespace py = pybind11;
+    m.def("nvq1_s_assign", &nvq1_s_assign_cuda,
+          "Exact NVQ1-S banked fixed-anchor group assignment (CUDA)");
     m.def("nvq_pack_bits", &nvq_pack_bits_cuda, "Pack validated NVQ streams (CUDA)");
     m.def("nvq_pack_group64", &nvq_pack_group64_cuda, "Pack validated NVQ2J-XL (CUDA)");
     m.def(
