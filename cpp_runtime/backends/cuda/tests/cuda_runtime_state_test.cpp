@@ -214,13 +214,21 @@ static void check_cached_moe_binding() {
     auto input = (arange(32, options.dtype(kFloat32)) * 0.01 - 0.1)
                      .to(kFloat16).reshape({1, 32});
     for (bool ranges : {false, true}) {
-        auto cache = make_moe_expert_cache(1 << 20, execution.config);
+        execution.moe_expert_cache = make_moe_expert_cache(1 << 20, execution.config);
+        auto& cache = execution.moe_expert_cache;
+        std::weak_ptr<MoeExpertCache> lifetime = cache;
         auto runtime = ranges ? make_mxfp4_range_runtime(*store)
                               : make_mixed_moe_runtime(cpu, false);
         auto weight = cache_moe_weight(cache, "experts", runtime, 1, 0, "gate",
                                        ranges ? store : nullptr);
         check(moe_expert_cache_has_sources(cache), "MoE source was not registered");
         finalize_moe_expert_cache(cache);
+        CudaExecutionContext other;
+        other.moe_expert_cache = make_moe_expert_cache(1 << 20, other.config);
+        execution.reset();
+        check(!lifetime.expired(), "execution reset destroyed a live model cache");
+        check(!moe_expert_cache_has_sources(other.moe_expert_cache),
+              "Engine instances share registered MoE sources");
         for (int32_t expert : {0, 1, 0}) {
             auto ids = tensor(std::vector<int32_t>{expert}, options.dtype(kInt32)).reshape({1, 1});
             auto route = build_moe_route_plan(ids, 2);
@@ -229,6 +237,18 @@ static void check_cached_moe_binding() {
             check((actual - expected).abs().max().item<float>() == 0,
                   "cache registration changed expert output");
         }
+        auto retained_forward = weight.mixed_forward;
+        weight = {};
+        check(!lifetime.expired(), "copied projection lost its cache");
+        auto ids = tensor(std::vector<int32_t>{1}, options.dtype(kInt32)).reshape({1, 1});
+        auto route = build_moe_route_plan(ids, 2);
+        auto actual = retained_forward(execution, input, route).to(kFloat32);
+        auto expected = resident.forward(execution, input, route).to(kFloat32);
+        check((actual - expected).abs().max().item<float>() == 0,
+              "retained projection cannot use its cache");
+        retained_forward = {};
+        check(lifetime.expired(), "registered sources form a cache ownership cycle");
+        check(bool(other.moe_expert_cache), "releasing one cache changed another Engine");
     }
 }
 

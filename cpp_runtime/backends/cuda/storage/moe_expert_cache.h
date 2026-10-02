@@ -10,6 +10,9 @@
 class MoeExpertCache;
 struct CudaExecutionConfig;
 
+// One cache per Engine load, shared by its target and optional predictor weights.
+// Registered weights retain the cache; resetting the Engine's execution resources
+// drops only its ownership. Cache APIs receive the resource, never the execution.
 std::shared_ptr<MoeExpertCache> make_moe_expert_cache(
     std::int64_t bytes,
     const CudaExecutionConfig& config);

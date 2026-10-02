@@ -17,7 +17,7 @@ struct MoeCachedCohort {
     MixedMoePool active;
 };
 
-class MoeCachedSource : public std::enable_shared_from_this<MoeCachedSource> {
+class MoeCachedSource {
 public:
     MoeCachedSource(
             MoeExpertCache * cache,
@@ -540,4 +540,3 @@ private:
     std::vector<int> expert_to_local_;
     std::shared_ptr<MixedMoeRuntime> active_;
 };
-

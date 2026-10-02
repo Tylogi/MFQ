@@ -914,7 +914,10 @@ MfeWeight cache_moe_weight(
         ? cache->register_range_source(name, runtime, std::move(range_store),
                                        minimum_slots, layer_id, projection_role)
         : cache->register_source(name, runtime, minimum_slots, layer_id, projection_role);
-    return wrap_cached_moe_source(source, runtime);
+    // The cache owns registered sources. Export an alias that retains the cache,
+    // so weights and copied forward/prefetch operations cannot outlive its arenas.
+    return wrap_cached_moe_source(
+        std::shared_ptr<MoeCachedSource>(cache, source.get()), runtime);
 }
 
 std::shared_ptr<MoeExpertCache> make_moe_expert_cache(

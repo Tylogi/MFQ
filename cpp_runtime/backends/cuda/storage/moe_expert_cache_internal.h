@@ -2,7 +2,7 @@
 
 #include "moe_cache_types_internal.h"
 
-class MoeExpertCache : public std::enable_shared_from_this<MoeExpertCache> {
+class MoeExpertCache {
 public:
     MoeExpertCache(
             int64_t budget_bytes,
@@ -779,4 +779,3 @@ private:
         pending_range_reads_;
     bool range_overlap_enabled_ = true;
 };
-

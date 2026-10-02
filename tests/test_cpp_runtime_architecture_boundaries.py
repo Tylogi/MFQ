@@ -259,6 +259,12 @@ def test_cuda_quant_runtime_implementations_stay_out_of_headers() -> None:
 
 
 
+def test_moe_cache_api_receives_resources_without_execution_context() -> None:
+    api = (CUDA_OPS.parent / "storage/moe_expert_cache.h").read_text()
+    assert "CudaExecutionContext" not in api
+    assert "const std::shared_ptr<MoeExpertCache>& cache" in api
+
+
 def test_cuda_transformer_core_stays_declarative_and_separate_from_loading() -> None:
     assert len(CUDA_TRANSFORMER_HEADER.splitlines()) < 60
     assert '#include "full_block.h"' not in CUDA_TRANSFORMER_HEADER

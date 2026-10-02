@@ -307,6 +307,7 @@ struct CudaExecutionContext {
     ParallelConfig expert_parallel;
     ModelParallelCollectiveRuntime model_parallel_collectives;
     LayerPlacementConfig layer_placement;
+    // Engine-owned load resource; cached model/MTP weights share its lifetime.
     std::shared_ptr<MoeExpertCache> moe_expert_cache;
     std::unordered_map<int, MoeRouteLayerStats> moe_route_stats;
 
