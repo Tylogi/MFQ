@@ -15,6 +15,7 @@ from typing import Any
 
 import numpy as np
 
+from mfq._alphaq_profiles import ALPHAQ_PROFILES
 from mfq.calibration.artifact import (
     CalibrationScheme,
     ExpertPrecision,
@@ -35,12 +36,6 @@ from mfq.calibration.ew_solver import (
 )
 
 STATISTICS_FORMAT = "mfq.alphaq-statistics.v1"
-ALPHAQ_PROFILES = (
-    "NVQ1-S", "NVQ1-L",
-    "NVQ2J", "NVQ2J-L", "NVQ2J-XL",
-    "NVQ3J", "NVQ3J-512", "NVQ3J-L",
-    "NINT4", "NINT5", "NINT6", "NINT8",
-)
 METHOD = {
     "method": "AlphaQ",
     "formula": "median(alpha) / alpha * variance * 2**(-2*b)",
@@ -97,7 +92,8 @@ def alphaq_weight_statistics(weights: Any, *, backend: str = "auto") -> tuple[np
         if not bool(torch.isfinite(w).all()):
             raise ValueError("AlphaQ weights contain NaN or infinity")
         experts, rows, columns = w.shape
-        variance = w.var(dim=(-2, -1), correction=0).double().cpu().numpy()
+        # MPS has no FP64 tensors; promote only after transferring to the host.
+        variance = w.var(dim=(-2, -1), correction=0).cpu().double().numpy()
         if min(rows, columns) >= 128:
             nr, nc = rows // 128, columns // 128
             blocks = (
@@ -132,7 +128,7 @@ def alphaq_weight_statistics(weights: Any, *, backend: str = "auto") -> tuple[np
                 batch = max(1, count // 2)
                 continue
             start += count
-        eigen = spectra.reshape(experts, -1).double().cpu().numpy()
+        eigen = spectra.reshape(experts, -1).cpu().double().numpy()
         if gram_backend:
             ordered = np.sort(eigen, axis=1)
             tail_count = min(ordered.shape[1]-1, max(10, int(ordered.shape[1]*.1)))

@@ -60,6 +60,28 @@ def test_normal_command_outputs_capped_model_and_reuses_all_statistics(tmp_path,
         main([*argv,'--overwrite'])
 
 
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason='MPS is unavailable')
+@pytest.mark.parametrize('backend', ['auto', 'metal'])
+def test_normal_command_outputs_capped_model_on_metal(tmp_path, backend):
+    from mfq.quantize.backend import resolve_quant_backend
+    assert resolve_quant_backend(backend).device == 'mps'
+    root, imatrix, count = fixture(tmp_path)
+    output = tmp_path/'metal.mfq'
+    argv = ['quantize', str(root), str(output), '--target-bpw', '12',
+            '--imatrix', str(imatrix), '--alphaq-profiles', 'NINT4,NINT8']
+    if backend != 'auto':
+        argv.extend(['--backend', backend])
+    assert main(argv) == 0
+    assert output.stat().st_size <= int(Decimal(12)*count/8)
+    store = open_mmap(output)
+    try:
+        assert store.header.extra['alphaq']['model_weight_count'] == count
+        assert all(store.records[f'model.block.0.mlp.experts.{p}.weight'].dtype == 'MFE'
+                   for p in ('gate', 'up', 'down'))
+    finally:
+        store.close()
+
+
 def test_recipe_mode_keeps_missing_imatrix_recipe_precision(tmp_path):
     root,imatrix,count=fixture(tmp_path)
     recipe=tmp_path/'recipe.json'

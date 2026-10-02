@@ -79,7 +79,7 @@ def run(args: argparse.Namespace) -> int:
 
 
 def add_parser(stages: argparse._SubParsersAction) -> None:
-    from mfq.calibration.alphaq import ALPHAQ_PROFILES
+    from mfq._alphaq_profiles import ALPHAQ_PROFILES
 
     parser = stages.add_parser(
         "alphaq",

@@ -33,6 +33,19 @@ if heavy:
     subprocess.run([sys.executable, "-c", script], check=True)
 
 
+def test_alphaq_cli_profiles_match_allocator() -> None:
+    from mfq.calibration.alphaq import ALPHAQ_PROFILES
+    from mfq.cli import _build_parser
+
+    parser = _build_parser()
+    for profile in ALPHAQ_PROFILES:
+        args = parser.parse_args([
+            "calibrate", "alphaq", "--model", "model-hf", "--output", "scheme.json",
+            "--target-bpw", "3", "--profile", profile,
+        ])
+        assert args.profile == [profile]
+
+
 def test_mlx_namespace_package_root_is_detected(tmp_path: Path, monkeypatch) -> None:
     mlx_root = tmp_path / "mlx"
     (mlx_root / "lib").mkdir(parents=True)

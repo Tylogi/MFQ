@@ -48,6 +48,17 @@ def test_backend_typo_is_not_silently_accepted():
         alphaq_weight_statistics(torch.ones((1, 2, 3)), backend='grma')
 
 
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason='MPS is unavailable')
+@pytest.mark.parametrize('shape', [(2, 17, 31), (2, 129, 257)])
+def test_mps_statistics_match_cpu_without_device_fp64(shape):
+    weight = torch.randn(shape, generator=torch.Generator().manual_seed(47))
+    expected = alphaq_weight_statistics(weight)
+    actual = alphaq_weight_statistics(weight.to('mps'))
+    assert all(value.dtype == np.float64 for value in actual)
+    np.testing.assert_allclose(actual[0], expected[0], rtol=5e-5, atol=0)
+    np.testing.assert_allclose(actual[1], expected[1], rtol=2e-6, atol=0)
+
+
 def test_gram_oom_retries_only_unfinished_blocks(monkeypatch):
     import mfq.calibration.alphaq_spectrum as spectrum
     weight = torch.randn((2, 128, 384), generator=torch.Generator().manual_seed(91))
