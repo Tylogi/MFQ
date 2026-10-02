@@ -77,6 +77,19 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         default="",
         help="native MFQ, GGUF, or legacy llama.cpp importance matrix",
     )
+    precision.add_argument('--target-bpw', default='',
+        help='AlphaQ whole-file BPW ceiling, including PLE, native weights, headers and assets (HF)')
+    precision.add_argument('--alphaq-dense', choices=('auto', 'recipe', 'joint'), default='auto',
+        help='auto uses the evaluated UD recipe for Qwen3.8 Flash Next; otherwise joint allocation')
+    precision.add_argument('--alphaq-router', choices=('imatrix', 'none'), default='imatrix')
+    precision.add_argument('--alphaq-router-cache', default='',
+        help='optional verified native router frequency cache; otherwise use imatrix counts')
+    precision.add_argument('--alphaq-profiles', default='',
+        help='comma-separated canonical candidates; defaults to all 12 NVQ/NINT profiles')
+    precision.add_argument('--ple-dtype', choices=('recipe', 'native', 'NINT4', 'NINT8'), default='recipe',
+        help='AlphaQ PLE lookup precision; recipe defaults to native when no recipe is available')
+    output.add_argument('--alphaq-cache', default='',
+        help='reusable AlphaQ statistics and trained tables; defaults beside the output')
     precision.add_argument(
         "--tokenizer",
         default="",
@@ -229,6 +242,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     execution.add_argument("--nvq-codebook-seed", type=int, default=20260716)
     execution.add_argument("--backend", choices=QUANT_BACKENDS, default="auto")
     execution.add_argument("--device", default="cuda")
+    execution.add_argument('--devices', default='',
+        help='explicit visible CUDA indices for parallel AlphaQ statistics and train/fit, e.g. 0,1,2')
     split = output.add_mutually_exclusive_group()
     split.add_argument(
         "--split-max-size",
@@ -444,6 +459,7 @@ def _hf_arguments(
     _append_value(argv, "--split-max-tensors", args.split_max_tensors)
     _append_value(argv, "--temp-dir", args.temp_dir)
     _append_flag(argv, "--text-only", args.text_only)
+    _append_flag(argv, "--exclude-mtp", args.exclude_mtp)
     _append_flag(argv, "--quantize-vision", args.quantize_vision)
     _append_flag(argv, "--quantize-mtp", args.quantize_mtp)
     _append_flag(
@@ -526,6 +542,17 @@ def _run_in(args: argparse.Namespace, baseline: Path, output: Path) -> None:
 
 
 def _validate(args: argparse.Namespace, source_format: str) -> None:
+    if getattr(args, 'devices', '') and not getattr(args, 'target_bpw', ''):
+        raise ValueError('--devices requires --target-bpw')
+    if getattr(args, 'target_bpw', ''):
+        if source_format != 'hf' or not args.imatrix:
+            raise ValueError('--target-bpw requires an HF source and --imatrix')
+        conflicts = ('bf16', 'base_mfq', 'standard_preset', 'scheme', 'tensor_overrides',
+            'nint_data_free', 'important_neurons', 'split_max_size', 'split_max_tensors',
+            'quantize_vision', 'quantize_mtp', 'model_config', 'nvq3_jsc', 'nvq3_jsc_512',
+            'nvq3_to_nint3', 'iq2_s_to_nint2', 'npq0_l')
+        if any(getattr(args, name, False) for name in conflicts) or args.q8_mode != 'nint8':
+            raise ValueError('--target-bpw cannot combine with conflicting precision/scope/output options')
     if args.staged_blobs and (source_format == "gguf" or args.bf16 or args.important_neurons):
         raise ValueError(
             "--staged-blobs applies only to quantized HF or full-precision MFQ sources"
@@ -598,8 +625,8 @@ def _validate(args: argparse.Namespace, source_format: str) -> None:
         raise ValueError("--temp-dir is only valid for an HF source")
     if source_format == "gguf" and args.resume and not args.important_neurons:
         raise ValueError("GGUF resume requires --resume-completed N")
-    if source_format in {"hf", "mfq"} and args.exclude_mtp:
-        raise ValueError("--exclude-mtp currently requires a GGUF source")
+    if args.exclude_mtp and args.quantize_mtp:
+        raise ValueError("--exclude-mtp cannot be combined with --quantize-mtp")
     if args.resume_completed and source_format != "gguf":
         raise ValueError("--resume-completed is only valid for GGUF quantization")
     if args.important_neurons < 0:
@@ -622,6 +649,10 @@ def run(args: argparse.Namespace) -> int:
     output = Path(args.output).resolve()
     source_format = _detect_source(source, args.source_format)
     _validate(args, source_format)
+    if getattr(args, 'target_bpw', ''):
+        from mfq.calibration.alphaq_workflow import quantize
+        quantize(args)
+        return 0
     print(
         json.dumps(
             {

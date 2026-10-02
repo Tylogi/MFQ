@@ -503,8 +503,11 @@ def _add_candidate_arguments(
 
 def _add_calibration_parsers(sub: argparse._SubParsersAction) -> None:
 
+    from mfq.commands.alphaq import add_parser as add_alphaq_parser
+
     calibrate = sub.add_parser("calibrate", help="build calibration artifacts")
     stages = calibrate.add_subparsers(dest="calibration_stage", metavar="<stage>", required=True)
+    add_alphaq_parser(stages)
 
 
     data = stages.add_parser("data", help="tokenize eaddario calibration records")

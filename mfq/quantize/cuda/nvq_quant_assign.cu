@@ -21,7 +21,7 @@ __device__ __forceinline__ bool better(float value, int index, float best, int b
     return value < best || (value == best && index < best_index);
 }
 
-template <int QCount>
+template <int QCount, int Entries = kCodebookEntries, bool Banked = false>
 __global__ void nvq1_l_assign_kernel(
     const float* __restrict__ xgroup,
     const float* __restrict__ wgroup,
@@ -40,7 +40,8 @@ __global__ void nvq1_l_assign_kernel(
 
     extern __shared__ unsigned char shared_raw[];
     int8_t* shared_codebook = reinterpret_cast<int8_t*>(shared_raw);
-    size_t offset = kCodebookEntries * kVectorSize * sizeof(int8_t);
+    constexpr int table_size = Entries * kVectorSize * (Banked ? 2 : 1);
+    size_t offset = table_size * sizeof(int8_t);
     offset = (offset + alignof(float) - 1) & ~(alignof(float) - 1);
     float* shared_error = reinterpret_cast<float*>(shared_raw + offset);
     offset += QCount * kThreads * sizeof(float);
@@ -49,7 +50,7 @@ __global__ void nvq1_l_assign_kernel(
     __shared__ float vector_best_error[2][kVectorsPerGroup][QCount];
     __shared__ uint16_t vector_best_index[2][kVectorsPerGroup][QCount];
 
-    for (int i = tid; i < kCodebookEntries * kVectorSize; i += kThreads) {
+    for (int i = tid; i < table_size; i += kThreads) {
         shared_codebook[i] = codebook[i];
     }
     __syncthreads();
@@ -82,7 +83,7 @@ __global__ void nvq1_l_assign_kernel(
                 local_index[q] = 0;
             }
 
-            for (int code_index = tid; code_index < kCodebookEntries; code_index += kThreads) {
+            for (int code_index = tid; code_index < Entries; code_index += kThreads) {
                 float dot = 0.0f;
                 float norm = 0.0f;
 #pragma unroll
@@ -92,7 +93,8 @@ __global__ void nvq1_l_assign_kernel(
                             static_cast<int64_t>(group) * kGroupSize
                             + vector * kVectorSize + coordinate];
                         const float code = static_cast<float>(
-                            shared_codebook[code_index * kVectorSize + coordinate]) + delta;
+                            shared_codebook[((Banked ? delta_bit * Entries : 0) + code_index)
+                                            * kVectorSize + coordinate]) + delta;
                         dot = fmaf(weight * x[coordinate], code, dot);
                         norm = fmaf(weight * code, code, norm);
                     }
@@ -378,7 +380,7 @@ __global__ void nvq_reassign_kernel(
 
 }  // namespace
 
-std::vector<torch::Tensor> nvq1_l_assign_cuda(
+static std::vector<torch::Tensor> nvq1_assign_cuda(
     torch::Tensor xgroup,
     torch::Tensor wgroup,
     torch::Tensor group_anchor,
@@ -386,7 +388,8 @@ std::vector<torch::Tensor> nvq1_l_assign_cuda(
     int64_t groups_per_row,
     int64_t valid_last,
     int64_t sub_bits,
-    double delta) {
+    double delta,
+    bool banked) {
     TORCH_CHECK(xgroup.is_cuda() && xgroup.is_contiguous(),
                 "nvq1_l_assign: xgroup must be CUDA contiguous");
     TORCH_CHECK(wgroup.is_cuda() && wgroup.is_contiguous(),
@@ -409,13 +412,18 @@ std::vector<torch::Tensor> nvq1_l_assign_cuda(
                 "nvq1_l_assign: wgroup shape mismatch");
     TORCH_CHECK(group_anchor.dim() == 1 && group_anchor.size(0) == xgroup.size(0),
                 "nvq1_l_assign: group_anchor shape mismatch");
-    TORCH_CHECK(codebook.sizes() == torch::IntArrayRef({kCodebookEntries, kVectorSize}),
-                "nvq1_l_assign: codebook must have shape [2048, 8]");
+    TORCH_CHECK(banked
+                    ? codebook.sizes() == torch::IntArrayRef({2, 512, kVectorSize})
+                    : codebook.sizes() == torch::IntArrayRef({kCodebookEntries, kVectorSize}),
+                "nvq1_assign: codebook shape differs from the canonical profile");
     TORCH_CHECK(groups_per_row > 0, "nvq1_l_assign: groups_per_row must be positive");
     TORCH_CHECK(valid_last > 0 && valid_last <= kGroupSize,
                 "nvq1_l_assign: valid_last must be in [1, 24]");
     TORCH_CHECK(sub_bits == 3 || sub_bits == 4,
                 "nvq1_l_assign: sub_bits must be 3 or 4");
+    TORCH_CHECK(!banked || sub_bits == 4, "nvq1_s_assign requires 4 subscale bits");
+    TORCH_CHECK(xgroup.size(0) > 0 && xgroup.size(0) % groups_per_row == 0,
+                "nvq1_assign: groups must contain complete rows");
     TORCH_CHECK(xgroup.get_device() == wgroup.get_device()
                     && xgroup.get_device() == group_anchor.get_device()
                     && xgroup.get_device() == codebook.get_device(),
@@ -429,10 +437,17 @@ std::vector<torch::Tensor> nvq1_l_assign_cuda(
     auto out_indices = torch::empty({groups, kVectorsPerGroup}, long_options);
     const int q_count = 1 << sub_bits;
     const size_t shared_bytes =
-        kCodebookEntries * kVectorSize * sizeof(int8_t)
+        (banked ? 2 * 512 : kCodebookEntries) * kVectorSize * sizeof(int8_t)
         + q_count * kThreads * (sizeof(float) + sizeof(uint16_t));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    if (sub_bits == 3) {
+    if (banked) {
+        nvq1_l_assign_kernel<16, 512, true><<<groups, kThreads, shared_bytes, stream>>>(
+            xgroup.data_ptr<float>(), wgroup.data_ptr<float>(),
+            group_anchor.data_ptr<float>(), codebook.data_ptr<int8_t>(),
+            out_scale.data_ptr<uint8_t>(), out_delta.data_ptr<uint8_t>(),
+            out_indices.data_ptr<int64_t>(), static_cast<int>(groups_per_row),
+            static_cast<int>(valid_last), static_cast<float>(delta));
+    } else if (sub_bits == 3) {
         nvq1_l_assign_kernel<8><<<groups, kThreads, shared_bytes, stream>>>(
             xgroup.data_ptr<float>(),
             wgroup.data_ptr<float>(),
@@ -459,6 +474,22 @@ std::vector<torch::Tensor> nvq1_l_assign_cuda(
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {out_scale, out_delta, out_indices};
+}
+
+std::vector<torch::Tensor> nvq1_l_assign_cuda(
+    torch::Tensor xgroup, torch::Tensor wgroup, torch::Tensor group_anchor,
+    torch::Tensor codebook, int64_t groups_per_row, int64_t valid_last,
+    int64_t sub_bits, double delta) {
+    return nvq1_assign_cuda(xgroup, wgroup, group_anchor, codebook,
+                           groups_per_row, valid_last, sub_bits, delta, false);
+}
+
+std::vector<torch::Tensor> nvq1_s_assign_cuda(
+    torch::Tensor xgroup, torch::Tensor wgroup, torch::Tensor group_anchor,
+    torch::Tensor codebook, int64_t groups_per_row, int64_t valid_last,
+    double delta) {
+    return nvq1_assign_cuda(xgroup, wgroup, group_anchor, codebook,
+                           groups_per_row, valid_last, 4, delta, true);
 }
 
 namespace {

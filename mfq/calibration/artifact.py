@@ -88,6 +88,10 @@ class ExpertPrecision:
                 raise TypeError(
                     f"expert precision option {key!r} must be a JSON scalar"
                 )
+            if key == "imatrix_weighted" and (
+                self.nint_spec is None or not isinstance(value, bool)
+            ):
+                raise ValueError("imatrix_weighted requires a boolean on affine NINT")
             seen.add(key)
             normalized.append((key, value))
         object.__setattr__(self, "family", family)
@@ -100,6 +104,12 @@ class ExpertPrecision:
 
     def option(self, name: str, default: Any = None) -> Any:
         return dict(self.options).get(name, default)
+
+    @property
+    def nint_uses_imatrix(self) -> bool:
+        if self.nint_spec is None:
+            raise ValueError("NINT imatrix policy requires an affine NINT precision")
+        return self.option("imatrix_weighted", self.nint_spec.bits in {2, 3, 4, 5, 6})
 
 
 def nint_expert_precision(spec: NintSpec) -> ExpertPrecision:

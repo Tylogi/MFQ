@@ -33,6 +33,34 @@ def test_initial_raw_codebooks_are_deterministic_and_valid() -> None:
     assert not np.array_equal(first[0], first[1])
 
 
+@pytest.mark.parametrize("spec", [NVQ2_E8_1024, NVQ2_E8_4096])
+def test_training_initial_search_obeys_requested_group_chunk(monkeypatch, spec):
+    # Exercise the native dispatch on CPU: reject an oversized submission at
+    # the extension boundary, before any CUDA work could endanger the device.
+    from mfq.quantize import nvq_jsc as jsc
+    from mfq.quantize.cuda import _ext
+
+    class ReachedBoundedSearch(Exception):
+        pass
+
+    class CheckedExtension:
+        def nvq2j_search_banks(self, x, w, books, qmax, ng, valid, steps, chunk):
+            assert chunk == 214
+            assert ng == 107 and valid == 16
+            assert x.shape == w.shape == (321, 24)
+            raise ReachedBoundedSearch
+
+    monkeypatch.setattr(jsc, "_native_e8_jsc_assignment_supported", lambda *_: True)
+    monkeypatch.setattr(_ext, "ext", CheckedExtension)
+    with pytest.raises(ReachedBoundedSearch):
+        train_nvq_jsc(
+            torch.ones((3, 2560)) * 0.03,
+            importance=np.linspace(0.01, 6, 2560, dtype=np.float32),
+            config=NvqJscConfig(banks=4, spec=spec, group_chunk=214),
+            device="cpu",
+        )
+
+
 def test_fixed_jsc_quantizer_has_cpu_fallback_and_uses_shared_tables() -> None:
     weight = torch.linspace(-0.05, 0.06, 4 * 24, dtype=torch.float32).reshape(4, 24)
     tables = initial_jsc_tables(
