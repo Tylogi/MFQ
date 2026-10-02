@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <vector>
 
+mfq_tensor_backend::Tensor embedding_lookup_cuda(
+    mfq_tensor_backend::Tensor weight, mfq_tensor_backend::Tensor token_ids);
 mfq_tensor_backend::Tensor nepq_hadamard_input_cuda(
     mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor signs, int64_t block_size);
 mfq_tensor_backend::Tensor nint_embedding_cuda(

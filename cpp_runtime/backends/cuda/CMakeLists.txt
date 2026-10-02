@@ -204,6 +204,10 @@ if(BUILD_TESTING)
         ${MFQ_REPOSITORY_ROOT})
     mfq_add_cuda_test(mfq-native-tensor-cuda-test
         ${MFQ_CUDA_ROOT}/tests/mfq_native_tensor_cuda_test.cu)
+    mfq_add_cuda_test(mfq-cuda-storage-offset-test
+        ${MFQ_CUDA_ROOT}/tests/mfq_cuda_storage_offset_test.cu
+        mfq-cuda-native-kernels)
+    target_compile_definitions(mfq-cuda-storage-offset-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     mfq_add_cuda_test(mfq-flash-next-test
         ${MFQ_CUDA_ROOT}/tests/mfq_flash_next_test.cu
         mfq-cuda-native-kernels mfq-json)
