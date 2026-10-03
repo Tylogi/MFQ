@@ -6,6 +6,19 @@
 #include "moe_expert_cache.h"
 #include "mfe_expert_store.h"
 
+std::shared_ptr<mfq::NintRows> load_nint_row_table(
+        const mfq::ModelSource& source, const std::string& name) {
+    const auto& metadata = require_tensor(source, name);
+    MFQ_RUNTIME_CHECK(metadata.dtype == "NINT", "NINT row table requires packed NINT");
+    MFQ_RUNTIME_CHECK(metadata.nbytes <= std::numeric_limits<std::size_t>::max(),
+        "NINT row table size overflow");
+    auto read = source.tensor_reader(name);
+    return std::make_shared<mfq::NintRows>(static_cast<std::size_t>(metadata.nbytes),
+        [read = std::move(read)](std::size_t offset, std::uint8_t* out, std::size_t count) {
+            read(offset, reinterpret_cast<std::byte*>(out), count);
+        });
+}
+
 MfeWeight load_mfe_gpu(
         CudaExecutionContext& execution,
         const mfq::ModelSource & mfq, const std::string & name,

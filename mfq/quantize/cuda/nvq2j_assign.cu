@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
+#include "nvq_chunk.h"
 
 #include <cfloat>
 #include <cstdint>
@@ -1047,7 +1048,7 @@ void check_nvq2j_inputs(
 
 }  // namespace
 
-std::vector<torch::Tensor> nvq2j_assign_cuda(
+static std::vector<torch::Tensor> nvq2j_assign_part(
     torch::Tensor value,
     torch::Tensor objective_weight,
     torch::Tensor initial_anchor,
@@ -1056,15 +1057,6 @@ std::vector<torch::Tensor> nvq2j_assign_cuda(
     torch::Tensor codebooks,
     int64_t valid_width,
     int64_t refine_steps) {
-    check_nvq2j_inputs(
-        value,
-        objective_weight,
-        initial_anchor,
-        scale_lut,
-        bank_for_state,
-        codebooks,
-        valid_width,
-        refine_steps);
     const int64_t rows = value.size(0);
     const int padded_width = static_cast<int>(value.size(1));
     const int groups_per_row = padded_width / kGroup;
@@ -1230,7 +1222,7 @@ void check_nvq2j_bank_search_inputs(
 
 }  // namespace
 
-std::vector<torch::Tensor> nvq2j_search_banks_cuda(
+static std::vector<torch::Tensor> nvq2j_search_banks_part(
     torch::Tensor xgroup,
     torch::Tensor wgroup,
     torch::Tensor codebooks,
@@ -1358,4 +1350,35 @@ torch::Tensor nvq2j_reassign_banks_cuda(
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return indices;
+}
+
+std::vector<torch::Tensor> nvq2j_assign_cuda(
+    torch::Tensor value, torch::Tensor objective_weight,
+    torch::Tensor initial_anchor, torch::Tensor scale_lut,
+    torch::Tensor bank_for_state, torch::Tensor codebooks,
+    int64_t valid_width, int64_t refine_steps, int64_t group_chunk) {
+    // Validate the small device bank table once, not once per chunk. This
+    // avoids a GPU -> CPU synchronization between every kernel submission.
+    check_nvq2j_inputs(value, objective_weight, initial_anchor, scale_lut,
+                      bank_for_state, codebooks, valid_width, refine_steps);
+    const auto ng = value.size(1) / kGroup;
+    const auto rows = nvq_group_step(ng, group_chunk) / ng;
+    return nvq_chunked(value.size(0), rows, [&](int64_t begin, int64_t length) {
+        return nvq2j_assign_part(value.narrow(0, begin, length),
+            objective_weight.narrow(0, begin, length),
+            initial_anchor.narrow(0, begin, length), scale_lut, bank_for_state,
+            codebooks, valid_width, refine_steps);
+    });
+}
+
+std::vector<torch::Tensor> nvq2j_search_banks_cuda(
+    torch::Tensor xgroup, torch::Tensor wgroup, torch::Tensor codebooks,
+    torch::Tensor bank_qmax, int64_t groups_per_row, int64_t valid_last,
+    int64_t search_steps, int64_t group_chunk) {
+    const auto step = nvq_group_step(groups_per_row, group_chunk);
+    return nvq_chunked(xgroup.size(0), step, [&](int64_t begin, int64_t length) {
+        return nvq2j_search_banks_part(xgroup.narrow(0, begin, length),
+            wgroup.narrow(0, begin, length), codebooks, bank_qmax,
+            groups_per_row, valid_last, search_steps);
+    });
 }

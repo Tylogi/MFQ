@@ -2135,10 +2135,11 @@ def _write_nvq_blob(
             f.seek(anchor_off + start * 2)
             f.write(np.ascontiguousarray(anchors, dtype=np.float16).tobytes())
             f.seek(stream_offsets[0] + (start * stream_bits[0]) // 8)
+            packing_device = device if quant_backend == "cuda" else None
             if target_dtype == "NPQ0-L":
-                f.write(_pack_nvq_bits(tensor.state, spec.state_bits))
+                f.write(_pack_nvq_bits(tensor.state, spec.state_bits, device=packing_device))
                 f.seek(stream_offsets[1] + (start * stream_bits[1]) // 8)
-                f.write(_pack_nvq_bits(tensor.indices, spec.index_bits))
+                f.write(_pack_nvq_bits(tensor.indices, spec.index_bits, device=packing_device))
             elif target_dtype == "NVQ1-L":
                 f.write(_pack_nvq1_l_bits(tensor.sub_scale, spec.sub_bits))
                 f.seek(stream_offsets[1] + (start * stream_bits[1]) // 8)
@@ -2152,14 +2153,15 @@ def _write_nvq_blob(
                         tensor.indices,
                         tensor.signs,
                         neuron_len=neuron_len,
+                        device=packing_device,
                     )
                 )
             else:
-                f.write(_pack_nvq_bits(tensor.sub_scale, spec.sub_bits))
+                f.write(_pack_nvq_bits(tensor.sub_scale, spec.sub_bits, device=packing_device))
                 f.seek(stream_offsets[1] + (start * stream_bits[1]) // 8)
-                f.write(_pack_nvq_bits(tensor.indices, spec.index_bits))
+                f.write(_pack_nvq_bits(tensor.indices, spec.index_bits, device=packing_device))
                 f.seek(stream_offsets[2] + (start * stream_bits[2]) // 8)
-                f.write(_pack_nvq_bits(tensor.signs, 7))
+                f.write(_pack_nvq_bits(tensor.signs, 7, device=packing_device))
             del tensor
 
         gain_calibration = None

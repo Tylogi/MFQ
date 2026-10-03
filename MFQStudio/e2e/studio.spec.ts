@@ -207,10 +207,51 @@ test('路由导航及模型目录弹窗键盘焦点', async ({ page }, testInfo)
     await page.getByRole('button', { name: 'Open sidebar', exact: true }).click();
   await page.getByRole('button', { name: 'Overview', exact: true }).click();
   await expect(page).toHaveURL('/');
+  await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible();
+  await expect(page.locator('.sidebar')).not.toHaveClass(/open/);
   await expect(page.getByRole('main')).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
     true,
   );
   expect(state.unexpected).toEqual([]);
-  await page.screenshot({ path: testInfo.outputPath('overview.png'), fullPage: true });
+  await page.screenshot({ path: testInfo.outputPath('overview.png'), fullPage: true, animations: 'disabled' });
+});
+
+test('明暗主题的页面内容保持在工作区内且可滚动访问', async ({ page }, testInfo) => {
+  const state = await mockStudioServer(page);
+  const routes = [['/', 'Overview'], ['/models', 'Models'], ['/settings', 'Settings'],
+    ['/model-hub', 'Model hub']] as const;
+  for (const theme of ['light', 'dark']) {
+    await page.goto('/settings');
+    await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
+    const inherit = page.getByRole('switch', { name: 'Use model or architecture defaults' });
+    await expect(inherit).toBeChecked();
+    await inherit.click();
+    await expect(page.locator('#settings-system-prompt')).toBeEnabled();
+    await inherit.click();
+    await expect(page.locator('#settings-system-prompt')).toBeDisabled();
+    await page.getByRole('combobox', { name: 'Theme', exact: true }).selectOption(theme);
+    await page.getByRole('button', { name: 'Apply settings', exact: true }).first().click();
+    await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
+    for (const [path, title] of routes) {
+      await navigateClient(page, path);
+      await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible();
+      if (path === '/model-hub') {
+        await expect(page.locator('.model-detail-panel')).toBeVisible();
+        await expect(page.locator('.model-variant')).toHaveCount(3);
+      }
+      const layout = await page.locator('.dashboard-view').evaluate((element) => ({
+        width: element.clientWidth,
+        scrollWidth: element.scrollWidth,
+        height: element.clientHeight,
+        bottom: element.getBoundingClientRect().bottom,
+        viewport: window.innerHeight,
+      }));
+      expect(layout.scrollWidth).toBeLessThanOrEqual(layout.width + 1);
+      expect(layout.height).toBeGreaterThan(0);
+      expect(layout.bottom).toBeLessThanOrEqual(layout.viewport + 1);
+      await page.screenshot({ path: testInfo.outputPath(`${title.replaceAll(' ', '-')}-${theme}.png`), fullPage: true, animations: 'disabled' });
+    }
+  }
+  expect(state.unexpected).toEqual([]);
 });

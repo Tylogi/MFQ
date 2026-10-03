@@ -1,6 +1,6 @@
 /** 模拟 Studio 使用的 HTTP 服务，提供可控的生成、同步失败和取消场景。 */
 import type { Page } from '@playwright/test';
-import type { Message, ResponseResource, Session, StreamRequest } from '../src/shared/api/types';
+import type { Message, OfficialModelList, ResponseResource, Session, StreamRequest } from '../src/shared/api/types';
 
 const createdAt = '2026-09-23T00:00:00Z';
 const model = 'Studio Test Model';
@@ -29,6 +29,35 @@ const modelCapabilities = {
     full_duplex: false,
     mtp: false,
   },
+};
+
+const catalogSource = {
+  provider: 'modelscope' as const, repo_id: 'example/studio-layout-test',
+  url: 'https://www.modelscope.cn/models/example/studio-layout-test', available: true,
+};
+const catalogConfiguration = {
+  status: 'recommended' as const, recommendation: 'two_stars' as const,
+  required_memory_bytes: 64 * 2 ** 30, available_memory_bytes: 96 * 2 ** 30,
+  reasons: ['More than half of the published precision tiers fit fully within the detected runtime memory budget.'],
+};
+const officialCatalog: OfficialModelList = {
+  system: { platform: 'macOS', machine: 'arm64', backend: 'metal',
+    physical_memory_bytes: 128 * 2 ** 30, runtime_memory_budget_bytes: 96 * 2 ** 30 },
+  data: ['Studio Long-Context Mixture Model', 'Studio Compact Model'].map((name, index) => ({
+    id: `catalog-${index}`, name, family: 'Layout fixture', architecture: 'studio_test',
+    description: 'Deterministic catalog fixture for browser layout and memory-pressure checks.',
+    description_zh: '用于浏览器布局与内存压力展示检查的固定目录数据。',
+    parameter_label: '30B', active_parameter_label: '3B', modalities: ['text'],
+    capabilities: ['reasoning'], precision_options: ['S2-L', 'S3-L', 'S4-L'],
+    license: 'Apache-2.0', supports_ssd_streaming: true,
+    sources: [catalogSource], selected_source: catalogSource, revision: 'test',
+    downloads: 1000, likes: 25, updated_at: createdAt, configuration: catalogConfiguration,
+    variants: ['S2-L', 'S3-L', 'S4-L'].map((label, tier) => ({
+      id: label, label, format: 'mfq' as const, files: [`studio-${label}.mfq`],
+      byte_size: (64 + tier * 24) * 2 ** 30,
+      configuration: { ...catalogConfiguration, required_memory_bytes: (64 + tier * 24) * 2 ** 30 },
+    })),
+  })),
 };
 
 interface MockOptions {
@@ -60,6 +89,7 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
     const method = route.request().method();
     state.requests.push(`${method} ${path}`);
     const json = async (value: unknown) => route.fulfill({ json: value });
+    if (path === '/api/v1/hub/official') return json(officialCatalog);
     if (path === '/api/v1/runtime/status')
       return json({
         runtime_state: 'ready',

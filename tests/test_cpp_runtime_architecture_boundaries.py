@@ -769,6 +769,32 @@ def test_qwen4_small_m_down_reduce_is_format_neutral() -> None:
     assert "supports_mxfp4_blocks" not in moe
 
 
+def test_qwen4_nint_ple_uses_shared_row_decode_without_resident_weights() -> None:
+    embedding = QWEN4[QWEN4.index("class Qwen4NgramEmbedding") :]
+    embedding = embedding[: embedding.index("class Qwen4Ple")]
+    assert "std::optional<MlxMappedNintRows> nint" in embedding
+    assert "MlxMappedNintRows table(bytes)" in embedding
+    assert "MlxNintRowBatch selected" in embedding
+    assert "append_row(row % rows_, selected)" in embedding
+    assert "selected.decode()" in embedding
+    assert "MlxNintWeight::from_blob" not in embedding
+    assert "dequantize(" not in embedding
+    assert "Qwen4 PLE cannot mix FP8 and NINT shards" in embedding
+
+
+def test_mapped_nint_rows_keep_quantized_arithmetic_outside_model_owners() -> None:
+    source = (METAL / "ops" / "mlx_nint_rows.cpp").read_text(encoding="utf-8")
+    layout = (CORE / "nint_rows.cpp").read_text(encoding="utf-8")
+    assert "mfq_cpp_nint_mapped_row_decode" in source
+    assert "k_selectors_" in layout and "q_selectors_" in layout
+    assert "cohort_rank(" in layout
+    assert "mfq_nint_row_bits(" in source
+    assert "qbits = layout & 15u" in source
+    assert "kbits = (layout >> 4u) & 15u" in source
+    assert "MlxNintWeight::from_blob" not in source
+    assert "Qwen" not in source
+
+
 def test_qwen4_qsa_caches_completed_index_blocks_incrementally() -> None:
     assert "MlxSequenceCache pooled_index_cache_;" in QWEN4
     assert "const int cached = pooled_index_cache_.position();" in QWEN4

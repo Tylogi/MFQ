@@ -172,6 +172,21 @@ int main() {
         const auto opened_mfq = mfq::open_model_source(mfq_path);
         const auto opened_hf = mfq::open_model_source(hf_path);
 
+        // The retained reader must outlive the source and preserve canonical
+        // legacy-name binding, including strict tensor-relative bounds.
+        auto retained = [&] {
+            mfq::MfqModelSource temporary(legacy_gguf_path);
+            return temporary.tensor_reader("model.token_embedding.weight");
+        }();
+        std::vector<std::byte> retained_bytes(14);
+        retained(0, retained_bytes.data(), retained_bytes.size());
+        require_bytes(retained_bytes);
+        bool range_rejected = false;
+        try { retained(13, retained_bytes.data(), 2); }
+        catch (const std::out_of_range&) { range_rejected = true; }
+        require(range_rejected, "retained reader accepted out-of-range bytes");
+        retained = {}; // Close the independently owned file before cleanup.
+
         require(mfq_source.tensors().size() == 1,
                 "MFQ assets leaked into tensor enumeration");
         require(

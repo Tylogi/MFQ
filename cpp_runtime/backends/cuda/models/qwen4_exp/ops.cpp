@@ -106,6 +106,13 @@ struct BlockLoader : weight_loader::Loader {
                         std::move(sg), std::move(su), std::move(sd), c);
     }
     auto embedding(const std::string &name) const {
+        if (require_tensor(source, name).dtype == "NINT") {
+            auto table = load_nint_row_table(source, name);
+            Embedding lookup = [table](const Tensor &ids) {
+                return nint_row_embedding_lookup(*table, ids);
+            };
+            return std::pair{std::move(lookup), std::array<int64_t, 2>{table->rows(), table->width()}};
+        }
         auto weight = std::make_shared<QuantLinear>(load_quant_linear(execution, source, name));
         Embedding lookup = [weight](const Tensor &ids) { return quant_embedding_lookup(*weight, ids); };
         return std::pair{std::move(lookup), std::array<int64_t, 2>{weight->out(), weight->neuron_len()}};

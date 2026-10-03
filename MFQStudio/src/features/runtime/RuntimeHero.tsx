@@ -106,11 +106,11 @@ export function RuntimeHero() {
         </small>
       </div>
       <div className="runtime-hero-actions">
-        <button onClick={() => openStudioPage()} type="button">
+        <button className={modelHero.state === 'ready' ? undefined : 'primary'} onClick={() => openStudioPage()} type="button">
           <Icon name="folder" size={15} />
           {tr('模型', 'Models')}
         </button>
-        <button className="primary" onClick={openChatPage} type="button">
+        <button className={modelHero.state === 'ready' ? 'primary' : undefined} onClick={openChatPage} type="button">
           <Icon name="chat" size={15} />
           {tr('对话', 'Chat')}
         </button>

@@ -112,6 +112,8 @@ where = ["."]
 include = ["mfq*"]
 
 [tool.setuptools.package-data]
+"mfq.calibration" = ["recipes/*.json"]
+"mfq.quantize.cuda" = ["*.cu", "*.cpp", "*.h"]
 "mfq.server" = [
     "protocol/*.json",
 ]

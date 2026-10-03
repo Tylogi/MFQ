@@ -2,6 +2,7 @@
 
 #include "mfq_tensor_backend.h"
 #include "mfq/model_source.h"
+#include "mfq/nint_rows.h"
 
 #include <cstdint>
 #include <string>
@@ -9,6 +10,9 @@
 #include <vector>
 
 struct CudaProfiler;
+
+mfq_tensor_backend::Tensor nint_row_embedding_lookup(
+    const mfq::NintRows& table, const mfq_tensor_backend::Tensor& ids);
 
 struct Workspace {
     int M = 0;

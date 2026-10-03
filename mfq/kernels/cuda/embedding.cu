@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -135,6 +136,27 @@ __global__ void nint_embedding_kernel(
 }
 
 
+__global__ void nint_selected_rows_kernel(
+        const uint8_t* __restrict__ packed,
+        const uint32_t* __restrict__ descriptors,
+        __half* __restrict__ output, size_t total, int width) {
+    for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < total; index += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const int column = static_cast<int>(index % width);
+        const uint32_t* row = descriptors + (index / width) * 6;
+        const uint32_t layout = row[3];
+        const int qbits = layout & 15u, kbits = (layout >> 4u) & 15u;
+        const int group = column / row[4];
+        const float q = unpack_nint_code(packed + row[0], (layout >> 8u) & 7u, column, qbits);
+        const float s = unpack_nint_code(packed + row[1], (layout >> 12u) & 7u, group, kbits);
+        const float m = unpack_nint_code(packed + row[2], (layout >> 16u) & 7u, group, kbits);
+        const float ns = __half2float(__ushort_as_half(static_cast<unsigned short>(row[5])));
+        const float nm = __half2float(__ushort_as_half(static_cast<unsigned short>(row[5] >> 16u)));
+        // Match the shared/Metal reconstruction order, without contraction.
+        output[index] = __float2half_rn(__fsub_rn(__fmul_rn(__fmul_rn(ns, s), q), __fmul_rn(nm, m)));
+    }
+}
+
 __global__ void nint8_zero_embedding_kernel(
         const int8_t * __restrict__ quantized,
         const __half * __restrict__ scale,
@@ -242,6 +264,36 @@ mfq_tensor_backend::Tensor embedding_lookup_cuda(
     return output;
 }
 
+
+mfq_tensor_backend::Tensor nint_selected_rows_cuda(
+        mfq_tensor_backend::Tensor packed,
+        mfq_tensor_backend::Tensor descriptors, int64_t width) {
+    MFQ_RUNTIME_CHECK(packed.is_cuda() && packed.is_contiguous() &&
+        packed.scalar_type() == mfq_tensor_backend::kUInt8 && packed.dim() == 1,
+        "NINT selected payload must be CUDA uint8 rank-1");
+    MFQ_RUNTIME_CHECK(descriptors.is_cuda() && descriptors.is_contiguous() &&
+        descriptors.scalar_type() == mfq_tensor_backend::kInt32 &&
+        descriptors.dim() == 2 && descriptors.size(1) == 6 &&
+        descriptors.device() == packed.device(),
+        "NINT selected descriptors must be CUDA int32 [rows,6] on the payload device");
+    MFQ_RUNTIME_CHECK(width > 0 && width <= std::numeric_limits<int>::max() &&
+        descriptors.size(0) <= std::numeric_limits<int>::max() / 6 &&
+        static_cast<uint64_t>(descriptors.size(0)) * width <= std::numeric_limits<uint32_t>::max(),
+        "NINT selected row dimensions exceed bounds");
+    const MfqCudaGuard guard(packed.device());
+    auto output = mfq_tensor_backend::empty({descriptors.size(0), width},
+        packed.options().dtype(mfq_tensor_backend::kFloat16));
+    if (descriptors.size(0) == 0) return output;
+    MFQ_RUNTIME_CHECK(packed.numel() > 0, "NINT selected payload is empty");
+    const size_t total = static_cast<size_t>(descriptors.size(0)) * width;
+    nint_selected_rows_kernel<<<launch_blocks(total), 256, 0, mfq_current_cuda_stream()>>>(
+        packed.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint32_t*>(descriptors.data_ptr<int32_t>()),
+        reinterpret_cast<__half*>(output.data_ptr<mfq_half>()),
+        total, static_cast<int>(width));
+    MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
 
 mfq_tensor_backend::Tensor nint_embedding_cuda(
         mfq_tensor_backend::Tensor bitstream,

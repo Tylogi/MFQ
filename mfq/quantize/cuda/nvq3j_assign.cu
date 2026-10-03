@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
+#include "nvq_chunk.h"
 
 #include <cfloat>
 #include <cstdint>
@@ -326,7 +327,7 @@ void check_inputs(
 
 }  // namespace
 
-std::vector<torch::Tensor> nvq3j_assign_cuda(
+static std::vector<torch::Tensor> nvq3j_assign_part(
     torch::Tensor value,
     torch::Tensor objective_weight,
     torch::Tensor initial_anchor,
@@ -335,15 +336,6 @@ std::vector<torch::Tensor> nvq3j_assign_cuda(
     torch::Tensor codebooks,
     int64_t valid_width,
     int64_t refine_steps) {
-    check_inputs(
-        value,
-        objective_weight,
-        initial_anchor,
-        scale_lut,
-        bank_for_state,
-        codebooks,
-        valid_width,
-        refine_steps);
     const int64_t rows = value.size(0);
     const int padded_width = static_cast<int>(value.size(1));
     const int groups_per_row = padded_width / kGroup;
@@ -397,4 +389,21 @@ std::vector<torch::Tensor> nvq3j_assign_cuda(
         std::swap(first_anchor, second_anchor);
     }
     return {first_anchor, states, indices};
+}
+
+std::vector<torch::Tensor> nvq3j_assign_cuda(
+    torch::Tensor value, torch::Tensor objective_weight,
+    torch::Tensor initial_anchor, torch::Tensor scale_lut,
+    torch::Tensor bank_for_state, torch::Tensor codebooks,
+    int64_t valid_width, int64_t refine_steps, int64_t group_chunk) {
+    check_inputs(value, objective_weight, initial_anchor, scale_lut,
+                 bank_for_state, codebooks, valid_width, refine_steps);
+    const auto ng = value.size(1) / kGroup;
+    const auto rows = nvq_group_step(ng, group_chunk) / ng;
+    return nvq_chunked(value.size(0), rows, [&](int64_t begin, int64_t length) {
+        return nvq3j_assign_part(value.narrow(0, begin, length),
+            objective_weight.narrow(0, begin, length),
+            initial_anchor.narrow(0, begin, length), scale_lut, bank_for_state,
+            codebooks, valid_width, refine_steps);
+    });
 }

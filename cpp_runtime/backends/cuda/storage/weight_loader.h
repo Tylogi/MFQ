@@ -20,6 +20,9 @@ struct MfqDropFileCacheGuard {
 
 bool has_tensor(const mfq::ModelSource& source, std::string_view name) noexcept;
 
+std::shared_ptr<mfq::NintRows> load_nint_row_table(
+    const mfq::ModelSource& source, const std::string& name);
+
 bool has_tensor_prefix(const mfq::ModelSource& source, std::string_view prefix);
 
 std::vector<std::uint8_t> read_asset(

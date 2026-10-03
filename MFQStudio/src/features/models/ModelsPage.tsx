@@ -19,10 +19,15 @@ export function ModelsPage() {
         title={tr('模型', 'Models')}
         subtitle={tr('管理本地模型与运行实例。', 'Manage local models and runtime instances.')}
         trailing={
-          <button className="primary" disabled={busy}
-            onClick={() => void chooseModelDirectory()} type="button">
-            <Icon name="folder" size={14} />{tr('添加模型', 'Add model')}
-          </button>
+          <>
+            <button onClick={() => openStudioPage('lab', 'models')} type="button">
+              <Icon name="download" size={14} />{tr('模型仓库', 'Model hub')}
+            </button>
+            <button className="primary" disabled={busy}
+              onClick={() => void chooseModelDirectory()} type="button">
+              <Icon name="folder" size={14} />{tr('添加模型', 'Add model')}
+            </button>
+          </>
         }
       />
       <div className="model-workbench-summary">
@@ -43,14 +48,6 @@ export function ModelsPage() {
             ? tr('切换会话模型不会重新注册资产', 'Switching keeps the registered asset')
             : tr('加载后从这里选择', 'Choose one after loading')}</small>
         </div>
-        <div className="model-workbench-links">
-          <button onClick={() => openStudioPage('lab', 'models')} type="button">
-            <Icon name="download" size={13} />{tr('打开模型仓库', 'Open model hub')}
-          </button>
-          <button onClick={() => openStudioPage('lab', 'quantization')} type="button">
-            <Icon name="memory" size={13} />{tr('去量化', 'Quantize')}
-          </button>
-        </div>
       </div>
       <div className="model-catalog-toolbar">
         <div>
@@ -68,6 +65,13 @@ export function ModelsPage() {
       <LoadedModels catalog={catalog} />
       <ModelLoadPolicy catalog={catalog} />
       <LocalCheckpoints catalog={catalog} />
+      <div className="model-workbench-links">
+        <span>{tr('自定义模型精度', 'Custom model precision')}</span>
+        <button onClick={() => openStudioPage('lab', 'quantization')} type="button">
+          {tr('打开量化工作台', 'Open quantization workspace')}
+          <Icon name="text-forward" size={14} />
+        </button>
+      </div>
       <ModelDirectoryDialog catalog={catalog} />
     </section>
   );

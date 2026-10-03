@@ -12,6 +12,34 @@
 using mfq_tensor_backend::indexing::Slice;
 using namespace mfq::cuda::quant_format;
 
+mfq_tensor_backend::Tensor nint_row_embedding_lookup(
+        const mfq::NintRows& table, const mfq_tensor_backend::Tensor& ids) {
+    MFQ_RUNTIME_CHECK(ids.is_cuda() && ids.scalar_type() == mfq_tensor_backend::kInt64,
+        "NINT row IDs must be CUDA int64");
+    const MfqCudaGuard guard(ids.device());
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    MFQ_CUDA_CHECK(cudaStreamIsCapturing(mfq_current_cuda_stream(), &capture));
+    MFQ_RUNTIME_CHECK(capture == cudaStreamCaptureStatusNone,
+        "range-backed NINT row lookup cannot run inside CUDA graph capture");
+    auto shape = ids.sizes().vec();
+    shape.push_back(table.width());
+    if (ids.numel() == 0)
+        return mfq_tensor_backend::empty(shape, ids.options().dtype(mfq_tensor_backend::kFloat16));
+    MFQ_RUNTIME_CHECK(ids.numel() <= std::numeric_limits<int>::max() / 6 &&
+        static_cast<uint64_t>(ids.numel()) * table.width() <= std::numeric_limits<uint32_t>::max(),
+        "NINT row lookup batch exceeds bounds");
+    auto host = ids.contiguous().cpu();
+    mfq::NintRowBatch selected;
+    for (int64_t i = 0; i < host.numel(); ++i)
+        table.append_row(host.data_ptr<int64_t>()[i], selected);
+    selected.validate();
+    auto packed = cpu_u8_tensor(selected.packed(), {static_cast<int64_t>(selected.packed_nbytes())}).to(ids.device());
+    std::vector<int32_t> words(selected.descriptors().size());
+    std::memcpy(words.data(), selected.descriptors().data(), words.size() * sizeof(uint32_t));
+    auto descriptors = cpu_i32_tensor(words, {static_cast<int64_t>(selected.rows()), 6}).to(ids.device());
+    return nint_selected_rows_cuda(packed, descriptors, table.width()).reshape(shape);
+}
+
 mfq_tensor_backend::Tensor pad_last(mfq_tensor_backend::Tensor x, int64_t target) {
     if (x.size(1) == target) return x;
     if (x.size(1) > target) throw std::runtime_error("activation width exceeds neuron_len");
