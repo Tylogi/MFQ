@@ -1,9 +1,10 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 import type {
   HubModelInfo,
   HubModelSummary,
   HubModelVariant,
+  HubSystemProfile,
   JobKindResource,
   JobResource,
   ModelConfigurationStatus,
@@ -14,13 +15,19 @@ import type {
 import { jobsApi } from '../../shared/api/resources/jobs';
 import { modelsApi } from '../../shared/api/resources/models';
 import { openStudioExternal } from '../../shared/platform/studio';
+import { BackendBadge } from './BackendBadge';
 
 type Translate = (chinese: string, english: string) => string;
+export type ModelBrowserTab = 'official' | 'community' | 'downloads';
+export type DownloadOrigin = { x: number; y: number };
 
 interface ModelBrowserProps {
   jobKinds: JobKindResource[];
   onError(message: string): void;
-  onJobCreated(job: JobResource): void;
+  onJobCreated(job: JobResource, origin: DownloadOrigin): void;
+  tab: ModelBrowserTab;
+  onTabChange(tab: ModelBrowserTab): void;
+  downloadQueue?: ReactNode;
   tr: Translate;
 }
 
@@ -49,6 +56,16 @@ function formatBytes(value?: number | null): string {
 
 function formatCount(value: number): string {
   return new Intl.NumberFormat(undefined, { notation: "compact" }).format(value);
+}
+
+function hardwareSummary(system: HubSystemProfile, tr: Translate): string {
+  const ram = system.physical_memory_bytes ? `${formatBytes(system.physical_memory_bytes).replace(/\.0 /, ' ')} RAM` : null;
+  const gpu = system.gpu_names?.join(' + ');
+  if (system.backend === 'metal') {
+    const cores = [system.cpu_cores && `${system.cpu_cores} CPU`, system.gpu_cores && `${system.gpu_cores} GPU`].filter(Boolean).join(' / ');
+    return [system.cpu_name || gpu, cores, ram].filter(Boolean).join(' · ') || tr('硬件信息未上报', 'Hardware details unavailable');
+  }
+  return [gpu, ram, system.cpu_name].filter(Boolean).join(' · ') || tr('硬件信息未上报', 'Hardware details unavailable');
 }
 
 function formatDate(value?: string | null): string {
@@ -160,7 +177,7 @@ function VariantList({
   variants,
 }: {
   disabled: boolean;
-  onDownload(variant: HubModelVariant): void;
+  onDownload(variant: HubModelVariant, origin: DownloadOrigin): void;
   tr: Translate;
   variants: HubModelVariant[];
 }) {
@@ -193,7 +210,10 @@ function VariantList({
               </div>
               <strong style={{ color }}>{percentageLabel}</strong>
             </div>
-            <button disabled={disabled} onClick={() => onDownload(variant)} type="button">
+            <button disabled={disabled} onClick={(event) => {
+              const rect = event.currentTarget.getBoundingClientRect();
+              onDownload(variant, { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+            }} type="button">
               {tr("下载", "Download")}
             </button>
           </div>
@@ -203,8 +223,7 @@ function VariantList({
   );
 }
 
-export function ModelBrowser({ jobKinds, onError, onJobCreated, tr }: ModelBrowserProps) {
-  const [tab, setTab] = useState<"official" | "community">("official");
+export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange, downloadQueue, tr }: ModelBrowserProps) {
   const [official, setOfficial] = useState<OfficialModelList | null>(null);
   const [officialSelection, setOfficialSelection] = useState<string | null>(null);
   const [officialSource, setOfficialSource] = useState<OfficialModelSource | null>(null);
@@ -354,6 +373,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tr }: ModelBrows
   async function download(
     source: { provider: HubModelSummary["provider"]; repo_id: string; revision: string },
     variant: HubModelVariant,
+    origin: DownloadOrigin,
   ) {
     const marker = `${source.provider}:${source.repo_id}:${variant.id}`;
     setDownloading(marker);
@@ -367,7 +387,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tr }: ModelBrows
         include: downloadPatterns(variant),
         expected_bytes: variant.byte_size || null,
       });
-      onJobCreated(created);
+      onJobCreated(created, origin);
     } catch (cause) {
       onError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -384,16 +404,16 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tr }: ModelBrows
           <p>{tr("查找官方优化模型或浏览社区仓库。", "Find optimized official models or browse community repositories.")}</p>
         </div>
         <div className="model-browser-tabs" role="tablist">
-          <button aria-selected={tab === "official"} onClick={() => setTab("official")} role="tab" type="button">{tr("官方模型", "Official")}</button>
-          <button aria-selected={tab === "community"} onClick={() => setTab("community")} role="tab" type="button">{tr("第三方模型", "Community")}</button>
+          <button aria-selected={tab === "official"} onClick={() => onTabChange("official")} role="tab" type="button">{tr("官方模型", "Official")}</button>
+          <button aria-selected={tab === "community"} onClick={() => onTabChange("community")} role="tab" type="button">{tr("第三方模型", "Community")}</button>
+          <button aria-selected={tab === "downloads"} onClick={() => onTabChange("downloads")} role="tab" type="button">{tr("下载队列", "Download queue")}</button>
         </div>
       </header>
 
       {tab === "official" ? (
         <>
           <div className="detected-configuration">
-            <div><span>{tr("检测到的配置", "Detected configuration")}</span><strong>{system ? `${system.platform} · ${system.machine} · ${system.backend.toUpperCase()}` : tr("正在检测", "Detecting")}</strong></div>
-            <div><span>{tr("物理内存", "Physical memory")}</span><strong>{formatBytes(system?.physical_memory_bytes)}</strong></div>
+            <div><span>{tr("检测到的配置", "Detected configuration")}</span><div className="detected-hardware-summary"><strong>{system ? hardwareSummary(system, tr) : tr("正在检测", "Detecting")}</strong>{system && <BackendBadge backend={system.backend} />}</div></div>
             <div><span>{tr("推理预算", "Runtime budget")}</span><strong>{formatBytes(system?.runtime_memory_budget_bytes)}</strong></div>
             <button disabled={catalogLoading || official?.refreshing} onClick={() => void loadOfficial(true)} type="button">{catalogLoading || official?.refreshing ? tr("刷新中", "Refreshing") : tr("刷新目录", "Refresh")}</button>
           </div>
@@ -437,12 +457,12 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tr }: ModelBrows
                 <label className="model-source-picker"><span>{tr("下载来源", "Download source")}</span><select onChange={(event) => { const source = selectedOfficial.sources[Number(event.target.value)]; if (source) void chooseOfficialSource(source); }} value={String(Math.max(0, selectedOfficial.sources.findIndex((item) => item.provider === selectedSource.provider && item.repo_id === selectedSource.repo_id)))}>{selectedOfficial.sources.map((source, index) => <option disabled={!source.available} key={`${source.provider}:${source.repo_id}`} value={index}>{source.provider === "huggingface" ? "Hugging Face" : "ModelScope"}{source.available ? "" : ` · ${tr("离线", "unavailable")}`}</option>)}</select></label>
                 <div className="repository-line"><button onClick={() => void openStudioExternal(selectedSource.url).catch((cause) => onError(cause instanceof Error ? cause.message : String(cause)))} type="button">{selectedSource.repo_id}</button><span>{officialVariants.length} {tr("个精度版本", "variants")}</span></div>
                 {selectedOfficial.supports_ssd_streaming && <div className="streaming-note">{tr("支持 SSD 专家流式读取；即使无法完整常驻仍可流式运行。上方图标只表示完整常驻时的内存压力。", "SSD expert streaming remains available when the model cannot fit fully in memory. The icon above reflects full-residency memory pressure only.")}</div>}
-                <VariantList disabled={officialLoading || !selectedSource.available || !canDownload(selectedSource.provider) || downloading !== null} onDownload={(variant) => void download({ provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision || selectedOfficial.revision }, variant)} tr={tr} variants={officialVariants} />
+                <VariantList disabled={officialLoading || !selectedSource.available || !canDownload(selectedSource.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision || selectedOfficial.revision }, variant, origin)} tr={tr} variants={officialVariants} />
               </aside>
             )}
           </div>
         </>
-      ) : (
+      ) : tab === 'community' ? (
         <>
           <form className="community-model-search" onSubmit={search}>
             <select onChange={(event) => setProvider(event.target.value as HubModelSummary["provider"])} value={provider}><option value="huggingface">Hugging Face</option><option value="modelscope">ModelScope</option></select>
@@ -472,12 +492,12 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tr }: ModelBrows
                   <div><dt>{tr("MFQ 兼容性", "MFQ compatibility")}</dt><dd>{communityModel.runtime_compatible === true ? tr("已验证", "Verified") : communityModel.runtime_compatible === false ? tr("暂不支持", "Unsupported") : tr("未知", "Unknown")}</dd></div>
                 </dl>
                 {communityModel.source_url && <div className="repository-line"><button onClick={() => void openStudioExternal(communityModel.source_url!).catch((cause) => onError(cause instanceof Error ? cause.message : String(cause)))} type="button">{tr("打开模型卡", "Open model card")}</button><span>{formatCount(communityModel.downloads)} downloads · {formatCount(communityModel.likes)} likes · {communityModel.files.length} files</span></div>}
-                <VariantList disabled={communityLoading || !canDownload(communityModel.provider) || downloading !== null} onDownload={(variant) => void download({ provider: communityModel.provider, repo_id: communityModel.repo_id, revision: communityModel.revision }, variant)} tr={tr} variants={communityModel.variants} />
+                <VariantList disabled={communityLoading || !canDownload(communityModel.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: communityModel.provider, repo_id: communityModel.repo_id, revision: communityModel.revision }, variant, origin)} tr={tr} variants={communityModel.variants} />
               </aside>
             )}
           </div>
         </>
-      )}
+      ) : downloadQueue}
     </section>
   );
 }

@@ -919,7 +919,11 @@ class HubModelVariant(ProtocolModel):
 class HubSystemProfile(ProtocolModel):
     platform: str = Field(min_length=1, max_length=64)
     machine: str = Field(min_length=1, max_length=64)
-    backend: Literal["metal", "cuda", "cpu", "unknown"]
+    backend: Literal["metal", "cuda", "rocm", "cpu", "unknown"]
+    cpu_name: str | None = Field(default=None, max_length=255)
+    cpu_cores: int | None = Field(default=None, ge=1)
+    gpu_names: list[str] = Field(default_factory=list)
+    gpu_cores: int | None = Field(default=None, ge=1)
     physical_memory_bytes: int | None = Field(default=None, ge=0)
     available_memory_bytes: int | None = Field(default=None, ge=0)
     runtime_memory_budget_bytes: int | None = Field(default=None, ge=0)

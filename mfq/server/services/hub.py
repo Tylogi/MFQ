@@ -37,6 +37,7 @@ from mfq.server.runtime.host_memory import (
     metal_recommended_working_set_size,
     total_physical_memory,
 )
+from mfq.server.services.hardware import hardware_identity
 
 HubProvider = Literal["huggingface", "modelscope"]
 
@@ -275,18 +276,23 @@ def resolve_hub_reference(
 def system_profile(
     *, backend: str = "unknown", runtime_memory_budget_bytes: int | None = None
 ) -> HubSystemProfile:
+    hardware = hardware_identity()
     snapshot = host_memory_snapshot()
-    physical = snapshot.total if snapshot is not None else total_physical_memory()
+    physical = snapshot.total if snapshot is not None else total_physical_memory() or hardware.physical_memory_bytes
     available = snapshot.reclaimable(active_ratio=0.35) if snapshot is not None else None
     if backend == "metal":
         recommended = metal_recommended_working_set_size()
         if runtime_memory_budget_bytes is None:
             runtime_memory_budget_bytes = recommended
-    normalized_backend = backend if backend in {"metal", "cuda", "cpu"} else "unknown"
+    normalized_backend = backend if backend in {"metal", "cuda", "rocm", "cpu"} else "unknown"
     return HubSystemProfile(
         platform=platform.system() or "unknown",
         machine=platform.machine() or "unknown",
         backend=normalized_backend,
+        cpu_name=hardware.cpu_name,
+        cpu_cores=hardware.cpu_cores,
+        gpu_names=list(hardware.gpu_names),
+        gpu_cores=hardware.gpu_cores,
         physical_memory_bytes=physical,
         available_memory_bytes=available,
         runtime_memory_budget_bytes=runtime_memory_budget_bytes,

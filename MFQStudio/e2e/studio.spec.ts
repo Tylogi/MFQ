@@ -64,7 +64,7 @@ test('页面按需请求自己的资源，概览不预载其他业务列表', as
   const routes = [
     ['/evaluations', '/api/v1/evaluations'],
     ['/model-hub', null],
-    ['/quantization', '/api/v1/jobs/kinds'],
+    ['/quantization', null],
     ['/settings', '/api/v1/presets'],
     ['/runtime', '/api/v1/mcp/servers'],
     ['/resources', '/api/v1/runtime/profiles'],
@@ -77,6 +77,50 @@ test('页面按需请求自己的资源，概览不预载其他业务列表', as
   }
   expect(errors).toEqual([]);
   expect(state.unexpected).toEqual([]);
+});
+
+test('模型下载留在本页，飞入圆圈后打开第三个队列标签，量化工作台为空', async ({ page }, testInfo) => {
+  const state = await mockStudioServer(page);
+  const jobs: unknown[] = [{ id: 'load', kind: 'model.load', status: 'succeeded', progress: 1,
+    payload: { repo_id: 'Not a download' }, cancel_requested: false, created_at: '2026-01-01', updated_at: '2026-01-01' }];
+  await page.route('**/api/v1/jobs/kinds', (route) => route.fulfill({ json: { data: [{ kind: 'download.modelscope', payload_schema: {} }] } }));
+  await page.route(/\/api\/v1\/jobs(?:\?.*)?$/, async (route) => {
+    if (route.request().method() === 'GET') return route.fulfill({ json: { data: jobs } });
+    const { kind, payload } = route.request().postDataJSON();
+    expect(kind).toBe('download.modelscope');
+    const job = { id: 'download', kind, payload, status: 'succeeded', progress: 1,
+      cancel_requested: false, created_at: '2026-01-01', updated_at: '2026-01-01' };
+    jobs.unshift(job);
+    return route.fulfill({ json: job });
+  });
+  await page.goto('/model-hub');
+  await expect(page.getByRole('img', { name: 'Apple · METAL' })).toBeVisible();
+  await expect(page.getByText('Apple M5 Max · 18 CPU / 40 GPU · 128 GiB RAM')).toBeVisible();
+  await expect(page.getByRole('tab')).toHaveText(['Official', 'Community', 'Download queue']);
+  await page.getByRole('button', { name: 'Download', exact: true }).first().click();
+  await expect(page).toHaveURL('/model-hub');
+  await expect(page.getByRole('tab', { name: 'Official' })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('.download-flight')).toBeVisible();
+  expect(await page.locator('.download-flight').evaluate((node) => getComputedStyle(node).animationName)).toBe('download-fly');
+  expect(await page.locator('.download-circle').evaluate((node) => {
+    const rect = node.getBoundingClientRect();
+    return document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)?.closest('.download-circle') === node;
+  })).toBe(true);
+  await page.getByRole('button', { name: 'Download queue', exact: true }).click();
+  await expect(page.getByRole('tab', { name: 'Download queue' })).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('.download-queue-item')).toHaveCount(1);
+  await expect(page.locator('.download-queue-item')).toContainText('example/studio-layout-test');
+  await expect(page.locator('.download-queue-item')).toContainText('100%');
+  await expect(page.getByText('Not a download')).toHaveCount(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath('download-queue.png'), animations: 'disabled' });
+  await navigateClient(page, '/quantization');
+  await expect(page.locator('.quantization-empty-panel')).toHaveCount(4);
+  await expect(page.locator('.quantization-empty-grid')).toHaveText('');
+  await expect(page.locator('.quantization-empty-grid input, .quantization-empty-grid button')).toHaveCount(0);
+  expect(state.requests).not.toContain('GET /api/v1/artifacts/lineage');
+  expect(state.unexpected).toEqual([]);
+  await page.screenshot({ path: testInfo.outputPath('empty-quantization.png'), animations: 'disabled' });
 });
 
 test('生成期间离开聊天页后返回仍完成同一次请求，草稿按会话保留', async ({ page }) => {

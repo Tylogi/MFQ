@@ -1970,11 +1970,55 @@
             "enum": [
               "metal",
               "cuda",
+              "rocm",
               "cpu",
               "unknown"
             ],
             "title": "Backend",
             "type": "string"
+          },
+          "cpu_cores": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cpu Cores"
+          },
+          "cpu_name": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cpu Name"
+          },
+          "gpu_cores": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gpu Cores"
+          },
+          "gpu_names": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Gpu Names",
+            "type": "array"
           },
           "machine": {
             "maxLength": 64,

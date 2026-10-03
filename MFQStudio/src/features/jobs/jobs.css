@@ -1,5 +1,8 @@
 /* 模型实验、任务与评测页面共享样式。 */
 /* ---------- Lab pages ---------- */
+.quantization-empty-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.quantization-empty-panel { min-height: 220px; }
+@media (max-width: 760px) { .quantization-empty-grid { grid-template-columns: 1fr; } }
 
 .hub-panel { margin-bottom: 10px; }
 .hub-search { display: grid; grid-template-columns: auto minmax(180px, 1fr) auto; gap: 7px; margin-top: 12px; }

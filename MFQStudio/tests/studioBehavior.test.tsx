@@ -180,6 +180,8 @@ describe('test_model_hub_renders_device_recommendation_grades（行为）', () =
     const view = render(
       <MemoryRouter>
         <ModelBrowser
+          tab="official"
+          onTabChange={vi.fn()}
           jobKinds={[]}
           onError={vi.fn()}
           onJobCreated={vi.fn()}

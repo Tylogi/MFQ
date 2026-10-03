@@ -64,7 +64,11 @@ export interface HubModelVariant {
 export interface HubSystemProfile {
   platform: string;
   machine: string;
-  backend: 'metal' | 'cuda' | 'cpu' | 'unknown';
+  backend: 'metal' | 'cuda' | 'rocm' | 'cpu' | 'unknown';
+  cpu_name?: string | null;
+  cpu_cores?: number | null;
+  gpu_names?: string[];
+  gpu_cores?: number | null;
   physical_memory_bytes?: number | null;
   available_memory_bytes?: number | null;
   runtime_memory_budget_bytes?: number | null;

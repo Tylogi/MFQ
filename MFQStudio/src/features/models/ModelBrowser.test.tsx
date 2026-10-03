@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
-import type { HubModelInfo, OfficialModelList } from '../../shared/api/types';
+import type { HubModelInfo, HubSystemProfile, OfficialModelList } from '../../shared/api/types';
 import { modelsApi } from '../../shared/api/resources/models';
 import { ModelBrowser } from './ModelBrowser';
 
@@ -44,7 +44,7 @@ it('renders immediately and preserves the chosen card while metadata arrives', a
   vi.mocked(modelsApi.officialHubModels)
     .mockResolvedValueOnce(catalog(true, false))
     .mockResolvedValueOnce(catalog(false, true));
-  const view = render(<ModelBrowser jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
+  const view = render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
   await act(async () => {});
   expect(screen.getByRole('button', { name: 'Refreshing' })).toBeDisabled();
   fireEvent.click(screen.getByRole('button', { name: /secondTest/ }));
@@ -61,7 +61,7 @@ it('cancels catalog requests and polling on unmount', async () => {
   vi.useFakeTimers();
   vi.mocked(modelsApi.officialHubModels).mockResolvedValue(catalog(true, false));
   const onError = vi.fn();
-  const view = render(<ModelBrowser jobKinds={[]} onError={onError} onJobCreated={vi.fn()} tr={(_, en) => en} />);
+  const view = render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={onError} onJobCreated={vi.fn()} tr={(_, en) => en} />);
   await act(async () => {});
   const signal = vi.mocked(modelsApi.officialHubModels).mock.calls[0][1]!;
   view.unmount();
@@ -83,7 +83,7 @@ it('does not discard a source detail request when the catalog is updated', async
   vi.mocked(modelsApi.officialHubModels).mockResolvedValueOnce(initial).mockResolvedValueOnce(completed);
   let finish!: (info: HubModelInfo) => void;
   vi.mocked(modelsApi.hubModelInfo).mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
-  const view = render(<ModelBrowser jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
+  const view = render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
   await act(async () => {});
   fireEvent.change(screen.getByRole('combobox', { name: 'Download source' }), { target: { value: '1' } });
   await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
@@ -98,4 +98,18 @@ it('does not discard a source detail request when the catalog is updated', async
   expect(screen.getByRole('combobox', { name: 'Download source' })).toHaveValue('1');
   expect(screen.getByText('Alternate S4')).toBeInTheDocument();
   view.unmount();
+});
+
+it.each([
+  [{ backend: 'metal', cpu_name: 'Apple M5 Max', cpu_cores: 18, gpu_names: ['Apple M5 Max'], gpu_cores: 40, physical_memory_bytes: 128 * 2 ** 30 }, 'Apple M5 Max · 18 CPU / 40 GPU · 128 GiB RAM', 'Apple · METAL'],
+  [{ backend: 'cuda', cpu_name: 'AMD Ryzen 5 9600X', gpu_names: ['NVIDIA GeForce RTX 5090'], physical_memory_bytes: 64 * 2 ** 30 }, 'NVIDIA GeForce RTX 5090 · 64 GiB RAM · AMD Ryzen 5 9600X', 'NVIDIA · CUDA'],
+  [{ backend: 'rocm', cpu_name: 'AMD Ryzen 9', gpu_names: ['AMD Radeon'], physical_memory_bytes: 64 * 2 ** 30 }, 'AMD Radeon · 64 GiB RAM · AMD Ryzen 9', 'AMD · ROCM'],
+] as [Partial<HubSystemProfile>, string, string][])('shows concrete hardware and a monochrome backend vendor badge: %s', async (hardware, summary, badge) => {
+  const data = catalog(false, false);
+  data.system = { ...data.system, ...hardware };
+  vi.mocked(modelsApi.officialHubModels).mockResolvedValue(data);
+  render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
+  expect(await screen.findByText(summary)).toBeInTheDocument();
+  expect(screen.getByRole('img', { name: badge }).querySelector('svg')).toHaveAttribute('fill', 'none');
+  expect(screen.queryByText(/test · test/)).not.toBeInTheDocument();
 });
