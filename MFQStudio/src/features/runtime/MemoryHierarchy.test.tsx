@@ -22,6 +22,8 @@ it('shows a dotted model legend even with one loaded model and four resource tie
   expect(container.querySelectorAll('[data-tier]')).toHaveLength(4);
   expect(screen.getByText('1 contexts · 2 cache blocks')).toBeInTheDocument();
   expect(screen.queryByText(/allocator/i)).not.toBeInTheDocument();
+  expect(screen.getAllByText('1 model')).toHaveLength(3);
+  expect(screen.getAllByText('1 KiB')).toHaveLength(4);
 });
 
 it('shares load-order colors across all four tiers and uses each tier’s byte proportions', () => {

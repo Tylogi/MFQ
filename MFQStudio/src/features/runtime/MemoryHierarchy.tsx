@@ -7,6 +7,9 @@ import { useSettings } from '../settings/SettingsProvider';
 
 const MODEL_COLORS = ['var(--accent)', '#e07070', '#65ad83', '#d5ae58', '#a28bd0', '#5eafb5', '#d58dad'];
 type Tier = 'weights' | 'kv' | 'experts' | 'ple';
+const modelCount = (count: number) => `${count} ${count === 1 ? 'model' : 'models'}`;
+const resourceBytes = (bytes: number) => bytes === 0 ? '0 B' :
+  formatBytes(bytes).replace(/\b(KB|MB|GB|TB)\b/g, (unit) => `${unit[0]}iB`);
 
 export function MemoryHierarchy({ instances, connectionRevision = 0 }: {
   instances: RuntimeInstance[];
@@ -37,7 +40,7 @@ export function MemoryHierarchy({ instances, connectionRevision = 0 }: {
   };
   const tiers: { id: Tier; title: string; detail: string }[] = [
     { id: 'weights', title: tr('常驻专家与稠密权重', 'Resident experts and dense weights'),
-      detail: tr(`${loaded.length} 个模型`, `${loaded.length} models`) },
+      detail: tr(`${loaded.length} 个模型`, modelCount(loaded.length)) },
     { id: 'kv', title: tr('常驻 KV Cache 与前缀缓存', 'Resident KV and prefix cache'),
       detail: loaded.every((item) => item.memory?.context_count != null && item.memory?.prefix_cache_blocks != null)
         ? tr(`${formatNumber(loaded.reduce((sum, item) => sum + item.memory!.context_count!, 0))} 组上下文，${formatNumber(loaded.reduce((sum, item) => sum + item.memory!.prefix_cache_blocks!, 0))} 个缓存块`,
@@ -50,7 +53,7 @@ export function MemoryHierarchy({ instances, connectionRevision = 0 }: {
     const known = loaded.filter((item) => item.memory?.[field] === true).length;
     const unknown = loaded.filter((item) => item.memory?.[field] == null).length;
     return tr(`${known} 个模型${unknown ? `，${unknown} 个未上报` : ''}`,
-      `${known} models${unknown ? ` · ${unknown} not reported` : ''}`);
+      `${modelCount(known)}${unknown ? ` · ${unknown} not reported` : ''}`);
   }
   return (
     <TMPanel className="overview-memory-panel">
@@ -78,13 +81,13 @@ export function MemoryHierarchy({ instances, connectionRevision = 0 }: {
             <div className="memory-tier" key={tier.id} data-tier={tier.id}>
               <div className="memory-tier-heading">
                 <div><strong>{tier.title}</strong><small>{tier.detail}</small></div>
-                <span>{unknown ? tr('明细未上报', 'Breakdown not reported') : total === 0 ? '0 B' : formatBytes(total)}</span>
+                <span>{unknown ? tr('明细未上报', 'Breakdown not reported') : resourceBytes(total)}</span>
               </div>
               <div className="memory-tier-track" aria-label={tier.title}>
                 {amounts.filter(({ bytes }) => bytes != null && bytes > 0).map(({ item, bytes }) => (
                   <span key={item.id} data-model-id={item.id}
                     style={{ backgroundColor: color(item), width: `${bytes! / total * 100}%` }}
-                    title={`${item.model} · ${formatBytes(bytes)}${unknown ? '' : ` · ${formatNumber(bytes! / total * 100, 1)}%`}`} />
+                    title={`${item.model} · ${resourceBytes(bytes!)}${unknown ? '' : ` · ${formatNumber(bytes! / total * 100, 1)}%`}`} />
                 ))}
               </div>
               {unknown && <small className="memory-tier-notice"><Icon name="info" size={12} />
