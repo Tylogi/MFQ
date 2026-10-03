@@ -1,6 +1,8 @@
 """Matched native model-graph gate; requires the locally built Metal test."""
 
 import json
+import asyncio
+from contextlib import suppress
 import os
 import subprocess
 from pathlib import Path
@@ -126,6 +128,56 @@ def test_native_qwen_ple_mixed_qk_matches_scaled_fp8_graph(tmp_path):
                             capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "batch logits passed" in result.stdout
+
+
+def test_native_worker_reports_resource_breakdown_over_stdio(tmp_path):
+    from mfq.server.runtime.client import StdioRuntimeClient
+    from mfq.server.runtime.hf_tokenizer import ensure_hf_tokenizer_gguf
+    from tests.test_hf_native_models import _hf_fixture
+
+    executable = Path(__file__).resolve().parents[1] / "build/cpp_runtime/metal/mfq-decode-metal"
+    if not executable.is_file():
+        pytest.skip("build mfq-decode-metal to exercise real worker telemetry")
+    _, model = _models(tmp_path)
+    tokenizer_source = tmp_path / "tokenizer-source"
+    _hf_fixture(tokenizer_source)
+    config = json.loads((tokenizer_source / "config.json").read_text())
+    config["text_config"]["vocab_size"] = 32
+    (tokenizer_source / "config.json").write_text(json.dumps(config))
+    vocabulary = json.loads((tokenizer_source / "tokenizer.json").read_text())
+    vocabulary["model"]["vocab"].update({f"token{index}": index for index in range(5, 32)})
+    (tokenizer_source / "tokenizer.json").write_text(json.dumps(vocabulary))
+    tokenizer = ensure_hf_tokenizer_gguf(tokenizer_source, tmp_path / "tokenizer-cache")
+
+    async def run():
+        with (tmp_path / "worker.log").open("wb") as log:
+            process = await asyncio.create_subprocess_exec(str(executable), "--model", str(model),
+                "--tokenizer", str(tokenizer), "--transport", "stdio", "--ctx-size", "64",
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=log)
+            client = StdioRuntimeClient(process, control_timeout_seconds=10)
+            try:
+                status = await client.status()
+                assert status["resident_weight_bytes"] > 0
+                assert status["kv_cache_bytes"] == 0
+                assert status["kv_cache_contexts"] == 0
+                assert status["ssd_expert_enabled"] == 0
+                assert status["ssd_expert_payload_bytes"] == 0
+                assert status["ssd_ple_enabled"] == 1
+                with io.open_mmap(model) as store:
+                    expected = sum(record.nbytes for record in store.records.values()
+                        if ".position_embedding.ngram.shard." in record.name)
+                assert status["ssd_ple_payload_bytes"] == expected
+                repeated = await client.status()
+                assert repeated["resident_weight_bytes"] == status["resident_weight_bytes"]
+                assert repeated["kv_cache_bytes"] == 0
+            finally:
+                with suppress(Exception):
+                    await client.aclose()
+                if process.returncode is None:
+                    process.terminate()
+                await asyncio.wait_for(process.wait(), timeout=5)
+
+    asyncio.run(run())
 
 
 def test_native_qwen_ple_rejects_mixed_fp8_nint_shards(tmp_path):

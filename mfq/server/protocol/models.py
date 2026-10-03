@@ -735,6 +735,24 @@ class ModelUnloadRequest(ProtocolModel):
     force: bool = False
 
 
+class RuntimeMemoryResources(ProtocolModel):
+    """Physical residency and file payloads are separate, never added together.
+
+    Null means the worker does not report this measurement, not zero usage.
+    Contexts include live KV groups and resident prefix-cache sessions; blocks
+    count resident prefixes only (disk-only prefix blocks are excluded).
+    """
+
+    resident_weight_bytes: int | None = Field(default=None, ge=0)
+    kv_bytes: int | None = Field(default=None, ge=0)
+    context_count: int | None = Field(default=None, ge=0)
+    prefix_cache_blocks: int | None = Field(default=None, ge=0)
+    ssd_experts: bool | None = None
+    ssd_expert_bytes: int | None = Field(default=None, ge=0)
+    ssd_ple: bool | None = None
+    ssd_ple_bytes: int | None = Field(default=None, ge=0)
+
+
 class RuntimeInstanceResource(ProtocolModel):
     id: UUID
     model: str
@@ -744,6 +762,7 @@ class RuntimeInstanceResource(ProtocolModel):
     queued_requests: int = Field(ge=0)
     resident_bytes: int | None = Field(default=None, ge=0)
     kv_bytes: int | None = Field(default=None, ge=0)
+    memory: RuntimeMemoryResources | None = None
     context_size: int | None = Field(default=None, ge=1)
     started_at: AwareDatetime | None = None
     last_used_at: AwareDatetime | None = None

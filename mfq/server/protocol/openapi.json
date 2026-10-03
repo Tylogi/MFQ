@@ -5166,6 +5166,16 @@
             ],
             "title": "Last Used At"
           },
+          "memory": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RuntimeMemoryResources"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "model": {
             "title": "Model",
             "type": "string"
@@ -5312,6 +5322,108 @@
           "data"
         ],
         "title": "RuntimeLogList",
+        "type": "object"
+      },
+      "RuntimeMemoryResources": {
+        "additionalProperties": false,
+        "description": "Physical residency and file payloads are separate, never added together.\n\nNull means the worker does not report this measurement, not zero usage.\nContexts include live KV groups and resident prefix-cache sessions; blocks\ncount resident prefixes only (disk-only prefix blocks are excluded).",
+        "properties": {
+          "context_count": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Count"
+          },
+          "kv_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kv Bytes"
+          },
+          "prefix_cache_blocks": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Cache Blocks"
+          },
+          "resident_weight_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resident Weight Bytes"
+          },
+          "ssd_expert_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ssd Expert Bytes"
+          },
+          "ssd_experts": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ssd Experts"
+          },
+          "ssd_ple": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ssd Ple"
+          },
+          "ssd_ple_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ssd Ple Bytes"
+          }
+        },
+        "title": "RuntimeMemoryResources",
         "type": "object"
       },
       "RuntimeMetricList": {

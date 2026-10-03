@@ -141,6 +141,17 @@ export interface RuntimeModel {
   owned_by?: string;
 }
 
+export interface RuntimeMemoryResources {
+  resident_weight_bytes: number | null;
+  kv_bytes: number | null;
+  context_count: number | null;
+  prefix_cache_blocks: number | null;
+  ssd_experts: boolean | null;
+  ssd_expert_bytes: number | null;
+  ssd_ple: boolean | null;
+  ssd_ple_bytes: number | null;
+}
+
 export interface RuntimeInstance {
   id: string;
   model: string;
@@ -150,6 +161,7 @@ export interface RuntimeInstance {
   queued_requests: number;
   resident_bytes?: number | null;
   kv_bytes?: number | null;
+  memory?: RuntimeMemoryResources | null;
   context_size?: number | null;
   started_at?: string | null;
   last_used_at?: string | null;

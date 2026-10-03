@@ -16,6 +16,34 @@ async function navigateClient(page: Page, path: string) {
   }, path);
 }
 
+test('运行资源按模型分段，四个槽共享颜色，端点包含 v1', async ({ page }, testInfo) => {
+  await mockStudioServer(page);
+  const instances = [1, 2, 3, 4].map((index) => ({
+    id: `resource-${index}`, model: `Resource Model ${index}`, state: 'ready', devices: ['metal'],
+    active_sessions: 0, queued_requests: 0, started_at: `2026-01-01T00:00:0${index}Z`,
+    memory: { resident_weight_bytes: index * 2 ** 30, kv_bytes: index * 2 ** 20,
+      context_count: index, prefix_cache_blocks: index * 2, ssd_experts: true,
+      ssd_expert_bytes: index * 2 ** 30, ssd_ple: true, ssd_ple_bytes: index * 2 ** 30 },
+  }));
+  await page.route('**/api/v1/runtime/instances', (route) => route.fulfill({ json: { data: instances } }));
+  await page.goto('/');
+  await expect(page.getByText('Resource hierarchy', { exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Runtime resources', exact: true })).toBeVisible();
+  await expect(page.locator('.memory-model-legend i')).toHaveCount(4);
+  await expect(page.getByText('10 contexts · 20 cache blocks')).toBeVisible();
+  const colors = await page.locator('.memory-model-legend i').evaluateAll((dots) => dots.map((dot) => getComputedStyle(dot).backgroundColor));
+  expect(new Set(colors).size).toBe(4);
+  for (const tier of ['weights', 'kv', 'experts', 'ple']) {
+    const bars = page.locator(`[data-tier="${tier}"] .memory-tier-track > span`);
+    await expect(bars).toHaveCount(4);
+    expect(await bars.evaluateAll((segments) => segments.map((segment) => getComputedStyle(segment).backgroundColor))).toEqual(colors);
+    expect(await bars.first().evaluate((segment) => (segment as HTMLElement).style.width)).toBe('10%');
+  }
+  await expect(page.locator('.overview-endpoint-panel code')).toHaveText('http://127.0.0.1:8090/v1');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.locator('.overview-memory-panel').screenshot({ path: testInfo.outputPath('resource-hierarchy.png') });
+});
+
 test('页面按需请求自己的资源，概览不预载其他业务列表', async ({ page }) => {
   const state = await mockStudioServer(page);
   const errors: string[] = [];
@@ -220,7 +248,7 @@ test('路由导航及模型目录弹窗键盘焦点', async ({ page }, testInfo)
 test('明暗主题的页面内容保持在工作区内且可滚动访问', async ({ page }, testInfo) => {
   const state = await mockStudioServer(page);
   const routes = [['/', 'Overview'], ['/models', 'Models'], ['/settings', 'Settings'],
-    ['/model-hub', 'Model hub']] as const;
+    ['/model-hub', 'Model downloads']] as const;
   for (const theme of ['light', 'dark']) {
     await page.goto('/settings');
     await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();

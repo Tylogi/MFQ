@@ -1318,6 +1318,10 @@ public:
         batch_ = 0;
     }
 
+    std::size_t cache_bytes() const noexcept {
+        return convolution_state_ ? convolution_state_->nbytes() : 0;
+    }
+
     array forward(
         const array& hidden_streams,
         const array& token_ids,
@@ -1516,6 +1520,7 @@ public:
         int speculative_confirmed = 0) = 0;
     virtual void reset(int batch) = 0;
     virtual void clear() noexcept = 0;
+    virtual std::size_t cache_bytes() const noexcept = 0;
     virtual void commit_speculative() noexcept = 0;
     virtual void rollback_speculative(int accepted_tokens) = 0;
     virtual void trim_cache_to(int) {
@@ -1526,6 +1531,10 @@ public:
 
 class Qwen4Gdn final : public Qwen4Attention {
 public:
+    std::size_t cache_bytes() const noexcept override {
+        return (convolution_state_ ? convolution_state_->nbytes() : 0) +
+            (recurrent_state_ ? recurrent_state_->nbytes() : 0);
+    }
     std::string_view profile_name() const noexcept override {
         return "qwen4.linear_attention";
     }
@@ -1860,6 +1869,11 @@ private:
 
 class Qwen4Qsa final : public Qwen4Attention {
 public:
+    std::size_t cache_bytes() const noexcept override {
+        return (cache_ ? cache_->key_storage().nbytes() +
+            cache_->value_storage().nbytes() : 0) +
+            index_cache_.storage_bytes() + pooled_index_cache_.storage_bytes();
+    }
     std::string_view profile_name() const noexcept override {
         return "qwen4.full_attention";
     }
@@ -2330,6 +2344,9 @@ private:
 
 class Qwen4Layer {
 public:
+    std::size_t cache_bytes() const noexcept {
+        return attention_->cache_bytes() + (ple_ ? ple_->cache_bytes() : 0);
+    }
     static Qwen4Layer load(
         const MfqContainer& model,
         const Qwen4Config& config,
@@ -2661,6 +2678,12 @@ public:
         return position_;
     }
 
+    std::size_t cache_bytes() const noexcept {
+        std::size_t bytes = 0;
+        for (const auto& layer : layers_) bytes += layer.cache_bytes();
+        return bytes;
+    }
+
     void trim_cache_to(int position) {
         if (position < 0 || position > position_) {
             throw std::runtime_error(
@@ -2954,7 +2977,7 @@ struct MlxQwen4CausalLm::Impl {
             throw std::runtime_error(
                 "Qwen4 predictor topology disagrees with model config");
         }
-        return std::unique_ptr<Impl>(new Impl(
+        auto result = std::unique_ptr<Impl>(new Impl(
             std::move(config),
             maximum,
             std::move(embedding),
@@ -2964,6 +2987,29 @@ struct MlxQwen4CausalLm::Impl {
             std::move(mtp),
             std::move(ssd_expert_cache),
             std::move(mfe_offload_cache)));
+        // Count backing payloads once at load time, not on every UI refresh.
+        for (const auto layer : result->config.ple_layer_ids) {
+            const auto prefix = "model.block." + std::to_string(layer - 1) +
+                ".position_embedding.ngram.shard.";
+            for (std::int64_t shard = 0; shard < result->config.split_ngram_parts; ++shard) {
+                result->ple_payload_bytes += model.record(prefix +
+                    std::to_string(shard) + ".weight").nbytes;
+            }
+        }
+        for (const auto& root : {std::string("model"), std::string("predictor")}) {
+            const auto count = root == "model" ? result->config.num_hidden_layers :
+                (result->mtp ? result->config.mtp_num_hidden_layers : 0);
+            for (std::int64_t layer = 0; layer < count; ++layer) {
+                const auto prefix = root + ".block." + std::to_string(layer) + ".mlp.experts.";
+                for (const auto* projection : {"gate", "up", "gate_up", "down"}) {
+                    for (const auto* suffix : {".weight", ".weight_scale"}) {
+                        const auto name = prefix + projection + suffix;
+                        if (model.contains(name)) result->expert_payload_bytes += model.record(name).nbytes;
+                    }
+                }
+            }
+        }
+        return result;
     }
 
     std::pair<array, array> forward_with_hidden(
@@ -3161,6 +3207,8 @@ public:
     int cache_batch = 0;
     int cache_position = 0;
     bool speculative_pending = false;
+    std::size_t ple_payload_bytes = 0;
+    std::size_t expert_payload_bytes = 0;
 };
 
 MlxQwen4CausalLm::MlxQwen4CausalLm(std::unique_ptr<Impl> impl)
@@ -3193,6 +3241,30 @@ void MlxQwen4CausalLm::reset_cache(int batch) {
 
 void MlxQwen4CausalLm::clear_cache() noexcept {
     impl_->clear();
+}
+
+std::size_t MlxQwen4CausalLm::kv_cache_bytes() const noexcept {
+    std::size_t bytes = 0;
+    for (const auto& layer : impl_->layers) bytes += layer.cache_bytes();
+    if (impl_->mtp) bytes += impl_->mtp->cache_bytes();
+    return bytes;
+}
+
+std::size_t MlxQwen4CausalLm::kv_cache_contexts() const noexcept {
+    return kv_cache_bytes() == 0 ? 0 : static_cast<std::size_t>(impl_->cache_batch);
+}
+
+std::size_t MlxQwen4CausalLm::dynamic_weight_bytes() const noexcept {
+    // MXFP4 arenas are preallocated and already part of the load baseline.
+    return impl_->mfe_offload_cache ? impl_->mfe_offload_cache->resident_packed_bytes() : 0;
+}
+
+std::size_t MlxQwen4CausalLm::ssd_ple_payload_bytes() const noexcept {
+    return impl_->ple_payload_bytes;
+}
+
+std::size_t MlxQwen4CausalLm::ssd_expert_payload_bytes() const noexcept {
+    return (impl_->ssd_expert_cache || impl_->mfe_offload_cache) ? impl_->expert_payload_bytes : 0;
 }
 
 std::int32_t MlxQwen4CausalLm::generate(

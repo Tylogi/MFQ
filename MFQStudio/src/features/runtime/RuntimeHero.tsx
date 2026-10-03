@@ -7,6 +7,7 @@ import { useSettings } from '../settings/SettingsProvider';
 import { Icon, TMPanel, ModelMonogram } from '../../app/display';
 import { formatNumber, formatDuration } from '../../app/formatters';
 import { STUDIO_PATHS } from '../../navigation';
+import { openAIEndpoint } from './endpoint';
 
 /** 按加载任务、当前实例和失败记录推导概览状态，避免仅凭模型名称误判就绪。 */
 export function RuntimeHero() {
@@ -98,7 +99,7 @@ export function RuntimeHero() {
             {modelHeroStatus}
           </span>
         </div>
-        <p className="runtime-endpoint">{studio?.service_url || 'http://127.0.0.1:8090'}</p>
+        <p className="runtime-endpoint">{openAIEndpoint(studio?.service_url)}</p>
         <small>
           {runtime?.model
             ? `${runtime?.model_type || 'MFQ'} · ${formatNumber(runtime?.max_context)} ${tr('上下文', 'context')} · ${formatDuration(runtime?.uptime_seconds)}`

@@ -65,18 +65,24 @@
 .overview-panel-title h2 { margin: 0; color: var(--ink-soft); font-size: 15px; font-weight: 640; line-height: 1.35; }
 .overview-memory-heading p { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
 .overview-memory-heading > strong { color: var(--ink-soft); font: 600 14px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
-.overview-memory-bars { margin-top: 24px; }
-.overview-memory-bars .usage-bar:nth-child(2) .usage-bar-track i { background: var(--muted); }
-.overview-memory-facts {
+.memory-model-legend {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px 24px;
-  border-top: 1px solid var(--line-soft);
-  margin-top: 19px;
-  padding-top: 14px;
+  gap: 8px 20px;
+  margin-top: 18px;
 }
-.overview-memory-facts span { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; line-height: 1.45; }
-.overview-memory-facts .ui-icon { color: var(--muted-light); }
+.memory-model-legend span { display: inline-flex; min-width: 0; align-items: center; gap: 7px; overflow-wrap: anywhere; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.memory-model-legend i { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; }
+.overview-memory-tiers { display: grid; gap: 20px; margin-top: 24px; }
+.memory-tier-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.memory-tier-heading > div { display: grid; gap: 4px; }
+.memory-tier-heading strong { color: var(--ink-soft); font-size: 12px; font-weight: 600; }
+.memory-tier-heading small { color: var(--muted); font-size: 11px; }
+.memory-tier-heading > span { color: var(--muted); font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; }
+.memory-tier-track { display: flex; height: 8px; overflow: hidden; border-radius: 5px; margin-top: 9px; background: var(--line-soft); }
+.memory-tier-track > span { height: 100%; flex: 0 0 auto; }
+.memory-tier-track > span + span { box-shadow: -1px 0 0 var(--surface); }
+.memory-tier-notice { display: flex; align-items: center; gap: 5px; margin-top: 7px; color: var(--muted-light); font-size: 10px; line-height: 1.5; }
 
 .overview-footer-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 16px; }
 .overview-endpoint-panel,

@@ -116,6 +116,12 @@ public:
     std::optional<MlxSsdExpertCacheStats> ssd_expert_cache_stats() const;
     void prewarm_ssd_expert_arena();
     void clear_expert_cache();
+    // Telemetry reads metadata only: no evaluation, copies, or device sync.
+    std::size_t kv_cache_bytes() const noexcept;
+    std::size_t kv_cache_contexts() const noexcept;
+    std::size_t dynamic_weight_bytes() const noexcept;
+    std::size_t ssd_ple_payload_bytes() const noexcept;
+    std::size_t ssd_expert_payload_bytes() const noexcept;
     bool supports_multimodal() const noexcept { return false; }
     bool supports_text_session_state() const noexcept { return false; }
     MlxQwen4TextSessionState capture_text_session_state(

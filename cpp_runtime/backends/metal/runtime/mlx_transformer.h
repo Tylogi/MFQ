@@ -202,6 +202,9 @@ public:
     int position() const noexcept {
         return position_;
     }
+    std::size_t storage_bytes() const noexcept {
+        return values_ ? values_->nbytes() : 0;
+    }
 
 private:
     void ensure_capacity(int required);

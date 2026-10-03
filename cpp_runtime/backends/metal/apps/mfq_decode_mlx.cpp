@@ -1816,7 +1816,9 @@ public:
           session_cache(std::move(cache)), load_runtime(std::move(loader)),
           paged_cache_factory(std::move(factory)), loaded_context(std::move(context)),
           runtime_stream(stream), prefill_chunk_size(chunk_size),
-          allocator_cache_limit(cache_limit), runtime_components(std::move(components)) {}
+          allocator_cache_limit(cache_limit), runtime_components(std::move(components)) {
+        capture_weight_residency();
+    }
 
     void generate(mfq::engine::InferenceRequest& request,
                   mfq::metal::MlxGenerationJob& job) override {
@@ -1957,6 +1959,7 @@ public:
                     "MFQ_SERVER_PREFIX_CACHE_HOT_BYTES",
                     2ULL * 1024ULL * 1024ULL * 1024ULL));
             release_model_load_staging_memory(runtime_stream);
+            capture_weight_residency();
             *loaded_context = requested_context;
             const auto seconds =
                 std::chrono::duration<double>(
@@ -1990,6 +1993,7 @@ public:
                         "MFQ_SERVER_PREFIX_CACHE_HOT_BYTES",
                         2ULL * 1024ULL * 1024ULL * 1024ULL));
                 release_model_load_staging_memory(runtime_stream);
+                capture_weight_residency();
                 *loaded_context = previous_context;
             } catch (const std::exception& restore_error) {
                 throw std::runtime_error(
@@ -2049,6 +2053,17 @@ public:
     }
 
 private:
+    void capture_weight_residency() {
+        if constexpr (requires(const Runtime& value) {
+                value.kv_cache_bytes(); value.dynamic_weight_bytes();
+            }) {
+            const auto& runtime = runtime_holder->value();
+            const auto other = runtime.kv_cache_bytes() + runtime.dynamic_weight_bytes();
+            const auto active = mlx::core::get_active_memory();
+            resident_weight_baseline = active > other ? active - other : 0;
+        }
+    }
+
     mfq::engine::Metrics metrics() const {
         std::vector<std::pair<std::string, double>> metrics{
             {"mlx_active_bytes", static_cast<double>(mlx::core::get_active_memory())},
@@ -2057,6 +2072,25 @@ private:
             {"mlx_peak_bytes", static_cast<double>(mlx::core::get_peak_memory())},
         };
         std::unique_lock lock(*runtime_mutex, std::try_to_lock);
+        if constexpr (requires(const Runtime& value) {
+                value.kv_cache_bytes(); value.kv_cache_contexts();
+                value.dynamic_weight_bytes(); value.ssd_ple_payload_bytes();
+                value.ssd_expert_payload_bytes();
+            }) {
+            if (lock.owns_lock() && runtime_holder->has_value()) {
+                const auto& runtime = runtime_holder->value();
+                metrics.emplace_back("resident_weight_bytes", static_cast<double>(
+                    resident_weight_baseline + runtime.dynamic_weight_bytes()));
+                metrics.emplace_back("kv_cache_bytes", static_cast<double>(runtime.kv_cache_bytes()));
+                metrics.emplace_back("kv_cache_contexts", static_cast<double>(runtime.kv_cache_contexts()));
+                const auto ple = runtime.ssd_ple_payload_bytes();
+                const auto experts = runtime.ssd_expert_payload_bytes();
+                metrics.emplace_back("ssd_ple_enabled", ple > 0 ? 1.0 : 0.0);
+                metrics.emplace_back("ssd_ple_payload_bytes", static_cast<double>(ple));
+                metrics.emplace_back("ssd_expert_enabled", experts > 0 ? 1.0 : 0.0);
+                metrics.emplace_back("ssd_expert_payload_bytes", static_cast<double>(experts));
+            }
+        }
         if constexpr (requires(Runtime& value) {
                 value.supports_mtp();
             }) {
@@ -2248,6 +2282,7 @@ private:
     mlx::core::Stream runtime_stream;
     int prefill_chunk_size;
     std::size_t allocator_cache_limit;
+    std::size_t resident_weight_baseline = 0;
     mfq::metal::MlxEngineComponents runtime_components;
 };
 

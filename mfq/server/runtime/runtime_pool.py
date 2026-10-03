@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import socket
 import subprocess
 import time
@@ -31,6 +32,7 @@ from mfq.server.protocol.models import (
     RuntimeInstanceList,
     RuntimeInstanceResource,
     RuntimeInstanceState,
+    RuntimeMemoryResources,
     RuntimeLogLevel,
     SamplingParams,
     ToolChoice,
@@ -109,6 +111,7 @@ class _Runtime(BaseModel):
     reserved_bytes: int | None = None
     resident_bytes: int | None = None
     kv_bytes: int | None = None
+    memory: RuntimeMemoryResources | None = None
     usage_refreshed_at: float = 0.0
 
 
@@ -920,6 +923,7 @@ class RuntimePool:
                     queued_requests=item.queued_requests,
                     resident_bytes=item.resident_bytes,
                     kv_bytes=item.kv_bytes,
+                    memory=item.memory,
                     context_size=item.context_size,
                     started_at=item.started_at,
                     last_used_at=item.last_used_at,
@@ -982,6 +986,7 @@ class RuntimePool:
                 queued_requests=instance.queued_requests,
                 resident_bytes=instance.resident_bytes,
                 kv_bytes=instance.kv_bytes,
+                memory=instance.memory,
                 context_size=instance.context_size,
                 started_at=instance.started_at,
                 last_used_at=instance.last_used_at,
@@ -1357,6 +1362,7 @@ class RuntimePool:
                             instance.resident_bytes = observed_resident_bytes
                         if isinstance(kv_value, (int, float)) and kv_value >= 0:
                             instance.kv_bytes = int(kv_value)
+                        instance.memory = self._memory_resources(status, instance.memory)
             return status
 
     async def runtime_models(self) -> dict[str, Any]:
@@ -2722,6 +2728,55 @@ class RuntimePool:
                 instance.resident_bytes = observed_resident
             if kv_bytes is not None:
                 instance.kv_bytes = kv_bytes
+            if status is not None:
+                instance.memory = self._memory_resources(status, instance.memory)
+
+    @staticmethod
+    def _memory_resources(
+        status: dict[str, Any], previous: RuntimeMemoryResources | None = None,
+    ) -> RuntimeMemoryResources:
+        """Retain last telemetry when a busy native worker skips its try-lock.
+
+        Do not use RSS/allocator totals as weight bytes, or cumulative I/O as
+        SSD payload size. Those counters describe different resources.
+        """
+        values = previous.model_dump() if previous is not None else {}
+        for target, source in (
+            ("resident_weight_bytes", "resident_weight_bytes"),
+            ("ssd_expert_bytes", "ssd_expert_payload_bytes"),
+            ("ssd_ple_bytes", "ssd_ple_payload_bytes"),
+        ):
+            value = status.get(source)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+                values[target] = int(value)
+        for target, source in (("ssd_experts", "ssd_expert_enabled"), ("ssd_ple", "ssd_ple_enabled")):
+            value = status.get(source)
+            if isinstance(value, (bool, int, float)) and value in (0, 1):
+                values[target] = bool(value)
+        hot = status.get("prefix_cache_hot_bytes", status.get("prefix_cache_bytes"))
+        live = status.get("kv_cache_bytes")
+        groups = status.get("kv_cache_contexts")
+        sessions = status.get("prefix_cache_sessions")
+        hot_sessions = status.get("prefix_cache_resident_sessions")
+        blocks = status.get("prefix_cache_hot_blocks", status.get("prefix_cache_snapshots"))
+        def measured(value: Any) -> bool:
+            return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+        if measured(live) and measured(hot):
+            values["kv_bytes"] = int(live) + int(hot)
+        if measured(groups) and measured(hot):
+            if hot == 0:
+                values["context_count"] = int(groups)
+            elif measured(hot_sessions):
+                values["context_count"] = int(groups) + int(hot_sessions)
+            elif "prefix_cache_hot_blocks" not in status and measured(sessions):
+                # Legacy snapshots are wholly resident. Paged bindings may
+                # refer to disk-only blocks, so their total is not a RAM count.
+                values["context_count"] = int(groups) + int(sessions)
+            else:
+                values["context_count"] = None
+        if measured(blocks):
+            values["prefix_cache_blocks"] = int(blocks)
+        return RuntimeMemoryResources(**values)
 
     async def _stop_process(self, instance: _Runtime) -> None:
         instance.state = RuntimeInstanceState.UNLOADING

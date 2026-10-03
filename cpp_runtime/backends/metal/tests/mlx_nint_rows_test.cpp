@@ -277,6 +277,10 @@ void test_qwen_ple_graph(const char* fp8_path, const char* nint_path) {
     const mfq::metal::MfqContainer fp8_container(fp8_path), nint_container(nint_path);
     auto fp8 = mfq::metal::MlxQwen4CausalLm::load(fp8_container, 64);
     auto nint = mfq::metal::MlxQwen4CausalLm::load(nint_container, 64);
+    require(nint.kv_cache_bytes() == 0 && nint.kv_cache_contexts() == 0,
+        "new Qwen model must not report live KV before reset/forward");
+    require(nint.ssd_ple_payload_bytes() > 0, "PLE backing payload not reported");
+    require(nint.ssd_expert_payload_bytes() == 0, "full resident experts reported as SSD streamed");
     const auto compare = [&](const std::vector<std::int32_t>& tokens, int batch, bool cache) {
         const mlx::core::array ids(tokens.begin(),
             mlx::core::Shape{batch, static_cast<int>(tokens.size()) / batch});
@@ -291,12 +295,22 @@ void test_qwen_ple_graph(const char* fp8_path, const char* nint_path) {
     };
     compare({1, 2, 7, 3, 4, 1}, 1, false);
     fp8.reset_cache(); nint.reset_cache();
+    require(nint.kv_cache_bytes() > 0 && nint.kv_cache_contexts() == 1,
+        "Qwen context cache allocations not reported");
     compare({1, 2, 7}, 1, true);
     compare({3}, 1, true);
     compare({4, 1}, 1, true);
     fp8.reset_cache(2); nint.reset_cache(2);
     compare({1, 7, 3, 2, 4, 1}, 2, true);
     compare({4, 5}, 2, true);
+    require(nint.kv_cache_contexts() == 2, "Qwen batched contexts not reported");
+    const auto active_before = mlx::core::get_active_memory();
+    const auto cache_bytes = nint.kv_cache_bytes();
+    require(cache_bytes > 0 && mlx::core::get_active_memory() == active_before,
+        "resource telemetry must not allocate/evaluate device arrays");
+    nint.clear_cache();
+    require(nint.kv_cache_bytes() == 0 && nint.kv_cache_contexts() == 0,
+        "cleared Qwen context resources not reported as zero");
     std::cout << "matched FP8/NINTv2 PLE graph prefill, decode, EOS and batch logits passed\n";
 }
 
