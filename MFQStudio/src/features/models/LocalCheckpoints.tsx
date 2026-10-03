@@ -3,6 +3,7 @@ import { Icon, SectionLabel, TMPanel, EmptyPanel } from '../../app/display';
 import { formatNumber } from '../../app/formatters';
 import type { useModelCatalog } from './useModelCatalog';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
+import { ModelLoadProgress } from './ModelLoadProgress';
 
 export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
   const { tr } = useSettings();
@@ -36,6 +37,7 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                       {item.architecture} · {item.shard_count} shards ·{' '}
                       {formatNumber(item.total_bytes / 2 ** 30, 1)} GB{policy ? ` · ${policy}` : ''}
                     </small>
+                    <ModelLoadProgress model={item.name} />
                   </div>
                   <div className="model-row-actions"><ModelVendorMark name={item.name} architecture={item.architecture} />{instance ? (
                     <button disabled={busy || instance.state !== 'ready'}

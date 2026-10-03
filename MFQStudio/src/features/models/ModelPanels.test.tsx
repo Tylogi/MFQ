@@ -14,7 +14,6 @@ vi.mock('./useModelCatalog', () => ({ useModelCatalog: vi.fn() }));
 function catalog() {
   return {
     runtime: null,
-    model: '',
     busy: false,
     artifacts: [],
     instances: [],
@@ -25,7 +24,6 @@ function catalog() {
     loadPinned: false,
     loadIdleTtl: null,
     chooseModelDirectory: vi.fn(),
-    selectModel: vi.fn(),
     unloadInstance: vi.fn(),
     loadArtifact: vi.fn(),
     setLoadPinned: vi.fn(),
@@ -70,11 +68,30 @@ it('本地架构标识在模型行右侧，改名的模型仍按架构识别', (
 
 it.each([[[], '0 B'], [[32 * 2 ** 30, 8 * 2 ** 30], '40 GiB']] as [number[], string][])('资产总大小汇总已登记文件，不使用当前会话模型: %s', (sizes, total) => {
   const state = catalog();
-  state.model = 'Loaded but not registered';
+  state.runtime = { model: 'Loaded but not registered' } as typeof state.runtime;
   state.artifacts = sizes.map((total_bytes, index) => ({ id: `asset-${index}`, total_bytes })) as typeof state.artifacts;
   vi.mocked(useModelCatalog).mockReturnValue(state);
   render(<ModelsPage />);
   expect(screen.getByText('注册模型资产总大小').parentElement?.querySelector('strong')).toHaveTextContent(total);
   expect(screen.queryByText('当前对话模型')).not.toBeInTheDocument();
-  expect(screen.queryByText(state.model)).not.toBeInTheDocument();
+  expect(screen.queryByText(state.runtime!.model!)).not.toBeInTheDocument();
+});
+
+it('已加载模型只提供卸载管理，不再重复提供对话模型选择', () => {
+  const state = catalog();
+  state.filteredInstances = ['ready', 'busy', 'loading'].map((status, index) => ({
+    id: `instance-${index}`, model: `Qwen model ${index}`, state: status, context_size: 32768,
+  })) as typeof state.filteredInstances;
+  state.artifacts = state.filteredInstances.map((item) => ({ name: item.model, architecture: 'qwen35' })) as typeof state.artifacts;
+  const { container } = render(<LoadedModels catalog={state} />);
+  expect(screen.queryByRole('button', { name: '用于对话' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: '当前' })).not.toBeInTheDocument();
+  const buttons = screen.getAllByRole('button', { name: '卸载' });
+  expect(buttons).toHaveLength(3);
+  expect(buttons[0]).toBeEnabled();
+  expect(buttons[1]).toBeDisabled();
+  expect(buttons[2]).toBeDisabled();
+  fireEvent.click(buttons[0]);
+  expect(state.unloadInstance).toHaveBeenCalledWith('instance-0');
+  expect(container.querySelector('.model-row-actions')?.firstElementChild).toHaveClass('model-vendor-mark');
 });

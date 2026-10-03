@@ -18,15 +18,19 @@ reuse caches and process RSS are not substituted for these measurements.
 Missing telemetry is `null`, not zero. Busy workers can retain the last reported
 breakdown when their nonblocking telemetry lock is unavailable.
 
-The native Metal Qwen4 worker reports these counters without device evaluation,
-array copies or file reads during refresh. Static weight residency is sampled
+The native Metal worker aggregates counters registered by cache and storage
+components, independently of model names or backbone-specific runner methods.
+New backbones reusing these components inherit telemetry; a new storage/cache
+component registers its own resource lifetime once. Refresh does not evaluate
+devices, copy arrays or read files. Static weight residency is sampled
 after load staging is released, before generation; dynamic MFE weight residency
 is added separately. Preallocated expert arenas belong to weight residency.
 Live cache bytes include attention K/V, index caches, GDN recurrent state and
 PLE convolution state, including predictor caches. They describe retained cache
 storage capacity, not just visible token rows. Temporary speculative work is
 not included. Disk-only prefix blocks/contexts are excluded from resident counts.
-Other workers without these counters explicitly show unavailable breakdowns.
+Workers without these counters explicitly show unavailable breakdowns. Partial
+aggregates retain known values as lower bounds and identify missing models.
 
 Each model gets one color shared by all four tiers. Registration follows load
 order: existing accent blue, then red, green, yellow and additional colors.
@@ -44,3 +48,10 @@ SSD segment widths remain each model's share of that tier's reported bytes.
 Missing measurements are excluded and marked as unavailable. An unknown memory
 limit, or unknown weight residency when calculating KV capacity, is displayed as
 `--` and does not produce a misleading full resident bar.
+
+Loading bars appear in the overview, loaded-model list and local checkpoints.
+Native workers report unique tensor records whose sources have been prepared
+(read, mapped or parsed for streaming), followed by runtime finalization. These
+are preparation steps, not elapsed-time estimates or physical SSD bytes read.
+Aliases share one step and metadata assets do not count. Unsupported workers
+show indeterminate progress; only a ready runtime completes the bar.

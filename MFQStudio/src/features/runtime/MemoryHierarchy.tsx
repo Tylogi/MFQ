@@ -82,12 +82,15 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, connectionRevi
       <div className="overview-memory-tiers">
         {tiers.map((tier) => {
           const amounts = loaded.map((item) => ({ item, bytes: value(item, tier.id) }));
-          const unknown = amounts.some(({ bytes }) => bytes == null);
+          const missing = amounts.filter(({ bytes }) => bytes == null);
+          const unknown = missing.length > 0;
+          const reported = amounts.length - missing.length;
           const total = amounts.reduce((sum, { bytes }) => sum + (bytes ?? 0), 0);
           const resident = tier.id === 'weights' || tier.id === 'kv';
           const capacity = tier.id === 'weights' ? memoryCapacity : tier.id === 'kv' ? cacheCapacity : total;
           const scale = capacity == null ? 0 : Math.max(capacity, total);
-          const used = unknown ? tr('明细未上报', 'Breakdown not reported') : resourceBytes(total);
+          const used = !reported && unknown ? tr('明细未上报', 'Breakdown not reported')
+            : `${unknown ? '≥ ' : ''}${resourceBytes(total)}`;
           return (
             <div className="memory-tier" key={tier.id} data-tier={tier.id}>
               <div className="memory-tier-heading">
@@ -104,7 +107,8 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, connectionRevi
                 ))}
               </div>
               {unknown && <small className="memory-tier-notice"><Icon name="info" size={12} />
-                {tr('缺失统计不计入色条；需要支持明细的后端。', 'Missing telemetry is excluded from the bar; a backend with breakdown support is required.')}
+                {tr(`${missing.map(({ item }) => item.model).join('、')}：明细未上报`,
+                  `${missing.map(({ item }) => item.model).join(', ')}: breakdown not reported`)}
               </small>}
             </div>
           );

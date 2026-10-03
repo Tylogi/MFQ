@@ -1255,6 +1255,19 @@ MlxDeepseekV4LayerState::snapshot() const {
     return result;
 }
 
+void MlxDeepseekV4LayerState::report_resources() {
+    std::size_t bytes = local_.nbytes();
+    const auto append = [&bytes](const auto& pool) {
+        if (!pool) return;
+        bytes += pool->pool().nbytes() + pool->state_kv().nbytes() + pool->state_gate().nbytes();
+        if (pool->prev_kv()) bytes += pool->prev_kv()->nbytes();
+        if (pool->prev_gate()) bytes += pool->prev_gate()->nbytes();
+    };
+    append(main_);
+    append(indexer_);
+    resources_.set({bytes, bytes > 0 ? static_cast<std::size_t>(batch()) : 0});
+}
+
 void MlxDeepseekV4LayerState::restore_snapshot(
     MlxDeepseekV4LayerState snapshot) {
     if (static_cast<bool>(main_) !=
@@ -1275,6 +1288,7 @@ void MlxDeepseekV4LayerState::restore_snapshot(
     }
     speculative_.reset();
     position_ = snapshot.position_;
+    report_resources();
 }
 
 void MlxDeepseekV4LayerState::restore_speculative_snapshot(
@@ -1317,6 +1331,7 @@ void MlxDeepseekV4LayerState::restore_speculative_snapshot(
             std::move(*snapshot.indexer_));
     }
     position_ = start_position;
+    report_resources();
 }
 
 void MlxDeepseekV4LayerState::begin_speculative(
@@ -1465,12 +1480,14 @@ MlxDeepseekV4LayerState::allocate(
             max_context,
             dtype);
     }
-    return MlxDeepseekV4LayerState(
+    MlxDeepseekV4LayerState result(
         mlx::core::zeros(
             Shape{batch, window, head_dim},
             dtype),
         std::move(main),
         std::move(indexer));
+    result.report_resources();
+    return result;
 }
 
 struct MlxDeepseekV4Attention::Impl {

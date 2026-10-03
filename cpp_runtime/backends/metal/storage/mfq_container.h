@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -87,6 +88,9 @@ public:
 
     bool contains(const std::string& name) const;
     const MfqRecord& record(const std::string& name) const;
+    void observe_load_records(std::function<void(std::size_t, std::size_t)> callback) const;
+    void stop_load_observation() const;
+    void record_prepared(const std::string& name) const;
     // Read one exact byte range relative to a record.  This is the native
     // streaming primitive used by bounded expert residency; it never
     // materializes bytes outside [relative_offset, relative_offset+nbytes).
@@ -127,6 +131,7 @@ public:
 private:
     using RecordMap = std::unordered_map<std::string, MfqRecord>;
     struct RandomAccessFiles;
+    struct LoadProgress;
 
     void load_hf_directory(const std::filesystem::path& path);
 
@@ -137,6 +142,7 @@ private:
     std::unordered_map<std::string, std::string> legacy_aliases_;
     mfq::MfqLegacyTensorLayout legacy_tensor_layout_;
     std::shared_ptr<RandomAccessFiles> random_access_files_;
+    mutable std::shared_ptr<LoadProgress> load_progress_;
 };
 
 } // namespace mfq::metal

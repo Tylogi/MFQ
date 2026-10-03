@@ -490,6 +490,7 @@ MlxDeepseekV41AttentionState MlxDeepseekV41AttentionState::allocate(
                 mlx::core::float32);
         }
     }
+    state.resources.set({state.nbytes(), static_cast<std::size_t>(batch)});
     return state;
 }
 
@@ -560,6 +561,7 @@ void MlxDeepseekV41AttentionState::restore_snapshot(
     compressed_length = snapshot.compressed_length;
     partial_length = snapshot.partial_length;
     speculation.reset();
+    resources.set({nbytes(), static_cast<std::size_t>(local_kv.shape(0))});
 }
 
 std::size_t MlxDeepseekV41AttentionState::nbytes() const noexcept {

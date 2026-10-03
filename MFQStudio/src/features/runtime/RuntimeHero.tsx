@@ -8,6 +8,7 @@ import { formatNumber, formatDuration } from '../../app/formatters';
 import { STUDIO_PATHS } from '../../navigation';
 import { openAIEndpoint } from './endpoint';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
+import { ModelLoadProgress } from '../models/ModelLoadProgress';
 
 export function RuntimeHero() {
   const { runtime, instances, studio } = useRuntime();
@@ -104,6 +105,7 @@ export function RuntimeHero() {
             ? `${runtime?.model_type || 'MFQ'} · ${formatNumber(runtime?.max_context)} ${tr('上下文', 'context')} · ${formatDuration(runtime?.uptime_seconds)}`
             : tr('加载本地模型后即可开始推理。', 'Load a local model to begin inference.')}
         </small>
+        {modelHero.state === 'loading' && <ModelLoadProgress model={modelHero.name} />}
       </div>
       <div className="runtime-hero-actions">
         <ModelVendorMark name={modelHero.name} size={34}

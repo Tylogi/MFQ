@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 import socket
 import subprocess
 import time
@@ -113,6 +114,7 @@ class _Runtime(BaseModel):
     kv_bytes: int | None = None
     memory: RuntimeMemoryResources | None = None
     usage_refreshed_at: float = 0.0
+    load_progress: float = 0.02
 
 
 class _RuntimeLoadContext:
@@ -772,7 +774,6 @@ class RuntimePool:
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.startup_timeout_seconds
-        next_progress = 0.05
         while loop.time() < deadline:
             context.raise_if_cancelled()
             status = process.returncode
@@ -789,9 +790,6 @@ class RuntimePool:
                 )
             except (BackendError, TimeoutError):
                 await asyncio.sleep(0.25)
-                if next_progress < 0.9:
-                    next_progress = min(0.9, next_progress + 0.005)
-                    await context.progress(next_progress, message="Loading model")
                 continue
             if capabilities.model != artifact.resource.name:
                 raise _job_error(
@@ -2608,6 +2606,20 @@ class RuntimePool:
                 return
             message = line.decode("utf-8", errors="replace").rstrip()
             if message and instance.state == RuntimeInstanceState.LOADING:
+                match = re.fullmatch(r"mfq_load_progress completed=(\d{1,10}) total=(\d{1,10})", message)
+                value = None
+                data = None
+                if match:
+                    completed, total = map(int, match.groups())
+                    if 0 < total and 0 <= completed <= total:
+                        value = 0.02 + 0.90 * completed / total
+                        data = {"phase": "weights", "completed": completed, "total": total}
+                elif message == "mfq_load_progress stage=finalizing":
+                    value = 0.94
+                    data = {"phase": "finalizing"}
+                if value is not None and value > instance.load_progress:
+                    instance.load_progress = value
+                    await context.progress(value, message="Preparing model" if match else "Finalizing runtime", data=data)
                 await context.log(message[:4096])
             if message and self.store is not None:
                 await asyncio.to_thread(

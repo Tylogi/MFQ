@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mlx_resource_telemetry.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -180,6 +182,7 @@ private:
     mlx::core::array key_;
     mlx::core::array value_;
     int position_ = 0;
+    MlxResourceTelemetry resources_;
 };
 
 // Growable [batch,sequence,width] cache for non-attention recurrent/index
@@ -215,6 +218,7 @@ private:
     int batch_ = 0;
     int position_ = 0;
     std::optional<mlx::core::array> values_;
+    MlxResourceTelemetry resources_;
 };
 
 } // namespace mfq::metal

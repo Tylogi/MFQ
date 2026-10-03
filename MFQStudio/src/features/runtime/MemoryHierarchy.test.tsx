@@ -72,7 +72,7 @@ it('excludes failed/loading models and distinguishes unavailable telemetry from 
   expect(screen.getAllByText('0 B')).toHaveLength(2);
   expect(screen.getAllByText('0 B / 4 KiB')).toHaveLength(2);
   rerender(<MemoryHierarchy instances={[{ ...zero, memory: null }]} memoryCapacityBytes={4096} />);
-  expect(screen.getAllByText(/Breakdown not reported/)).toHaveLength(4);
+  expect(screen.getAllByText('Model 1: breakdown not reported')).toHaveLength(4);
   expect(screen.getByText('Breakdown not reported / --')).toBeInTheDocument();
   expect(container.querySelectorAll('.memory-tier-track > span')).toHaveLength(0);
   expect(screen.getAllByText('0 models · 1 not reported')).toHaveLength(2);
@@ -103,8 +103,9 @@ it('does not invent a full resident bar when the limit or some weight residency 
     .toHaveLength(0);
   expect(container.querySelector('[data-tier="ple"] .memory-tier-track > span')).toHaveStyle({ width: '100%' });
   rerender(<MemoryHierarchy instances={[first, { ...model('2', 1024), memory: null }]} memoryCapacityBytes={4096} />);
-  expect(screen.getByText('Breakdown not reported / 4 KiB')).toBeInTheDocument();
-  expect(screen.getByText('Breakdown not reported / --')).toBeInTheDocument();
+  expect(screen.getByText('≥ 1 KiB / 4 KiB')).toBeInTheDocument();
+  expect(screen.getByText('≥ 1 KiB / --')).toBeInTheDocument();
+  expect(screen.getAllByText('Model 2: breakdown not reported')).toHaveLength(4);
   expect(container.querySelector('[data-tier="weights"] .memory-tier-track > span')).toHaveStyle({ width: '25%' });
   expect(container.querySelector('[data-tier="kv"] .memory-tier-track')?.children).toHaveLength(0);
 });

@@ -1274,6 +1274,9 @@ private:
             width_ * static_cast<std::int64_t>(heads) != config_.hidden_size) {
             throw std::runtime_error("Qwen4 PLE embedding metadata disagrees");
         }
+        std::size_t payload = 0;
+        for (const auto& shard : shards_) payload += shard.mapping.size();
+        resources_.set({0, 0, 0, 0, payload});
     }
 
     Qwen4Config config_;
@@ -1286,6 +1289,7 @@ private:
     std::vector<std::int64_t> vocab_;
     int batch_ = 0;
     std::vector<std::int64_t> context_;
+    MlxResourceTelemetry resources_;
 };
 
 class Qwen4Ple {
@@ -1310,12 +1314,14 @@ public:
         convolution_state_.reset();
         rollback_.reset();
         batch_ = batch;
+        resources_.set({});
     }
 
     void clear() noexcept {
         convolution_state_.reset();
         rollback_.reset();
         batch_ = 0;
+        resources_.set({});
     }
 
     std::size_t cache_bytes() const noexcept {
@@ -1360,6 +1366,7 @@ public:
                 return forward(hidden_streams, token_ids, true);
             } catch (...) {
                 convolution_state_ = rollback_->convolution_state;
+                resources_.set({cache_bytes(), static_cast<std::size_t>(batch_)});
                 embedding_.restore_context(
                     std::move(rollback_->ngram_context));
                 rollback_.reset();
@@ -1427,7 +1434,10 @@ public:
             convolution_weight_,
             use_cache ? convolution_state_ : std::nullopt,
             static_cast<int>(config_.ngram_size));
-        if (use_cache) convolution_state_ = convolution.state;
+        if (use_cache) {
+            convolution_state_ = convolution.state;
+            resources_.set({cache_bytes(), static_cast<std::size_t>(batch_)});
+        }
         auto output = gated + convolution.output;
         return output.dtype() == hidden_streams.dtype()
             ? output : mlx::core::astype(output, hidden_streams.dtype());
@@ -1461,6 +1471,7 @@ public:
             rollback_->convolution_state,
             static_cast<int>(config_.ngram_size));
         convolution_state_ = std::move(convolution.state);
+        resources_.set({cache_bytes(), static_cast<std::size_t>(batch_)});
         embedding_.restore_context(std::move(rollback_->ngram_context));
         embedding_.advance_context(*rollback_->token_ids, keep);
         rollback_.reset();
@@ -1504,6 +1515,7 @@ private:
     array norm_conv_;
     array convolution_weight_;
     std::optional<array> convolution_state_;
+    MlxResourceTelemetry resources_;
     std::optional<Rollback> rollback_;
     int batch_ = 0;
 };
@@ -1578,6 +1590,7 @@ public:
         rollback_.reset();
         batch_ = batch;
         position_ = 0;
+        resources_.set({cache_bytes(), static_cast<std::size_t>(batch_)});
     }
 
     void clear() noexcept override {
@@ -1586,6 +1599,7 @@ public:
         rollback_.reset();
         batch_ = 0;
         position_ = 0;
+        resources_.set({});
     }
 
     array forward(
@@ -1862,6 +1876,7 @@ private:
     MlxLinear output_;
     std::optional<array> convolution_state_;
     std::optional<array> recurrent_state_;
+    MlxResourceTelemetry resources_;
     std::optional<MlxGatedDeltaSpeculativeState> rollback_;
     int batch_ = 0;
     int position_ = 0;

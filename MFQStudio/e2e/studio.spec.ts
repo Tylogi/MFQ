@@ -46,6 +46,7 @@ test('三家架构标识贯穿模型页面，保持描线、无边框和靠右�
   expect(heroMark!.x + heroMark!.width).toBeLessThan(heroButton!.x);
   for (const item of models) await expect(page.locator(`.overview-model-grid [data-model-vendor="${item.vendor}"]`)).toBeVisible();
   await navigateClient(page, '/models');
+  await expect(page.locator('.loaded-model-panel').getByRole('button', { name: /Use in chat|Current/ })).toHaveCount(0);
   for (const item of models) {
     await expect(page.locator(`.loaded-model-panel [data-model-vendor="${item.vendor}"]`)).toBeVisible();
     await expect(page.locator(`.model-library-panel [data-model-vendor="${item.vendor}"]`)).toBeVisible();
@@ -242,6 +243,59 @@ test('运行资源按模型分段，四个槽共享颜色，端点包含 v1', as
   await expect(page.locator('.overview-endpoint-panel code')).toHaveText('http://127.0.0.1:8090/v1');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.locator('.overview-memory-panel').screenshot({ path: testInfo.outputPath('resource-hierarchy.png') });
+});
+
+test('加载条显示实际任务进度，部分缺失的资源明细保留已知数值', async ({ page }, testInfo) => {
+  await mockStudioServer(page);
+  const job = { id: 'loading-job', kind: 'model.load', payload: { model: 'Loading Model' },
+    progress: 0.25, status: 'running', cancel_requested: false,
+    created_at: '2026-01-01', updated_at: '2026-01-01' };
+  const instances = [{ id: 'loading', model: 'Loading Model', state: 'loading', devices: ['metal'],
+    active_sessions: 0, queued_requests: 0, context_size: 32768 }];
+  let advance!: () => void;
+  const progressEvent = new Promise<void>((resolve) => { advance = resolve; });
+  await page.route(/\/api\/v1\/jobs(?:\?.*)?$/, (route) => route.fulfill({ json: { data: [job] } }));
+  await page.route('**/api/v1/jobs/loading-job/events/stream', async (route) => {
+    await progressEvent;
+    job.progress = 0.75;
+    await route.fulfill({ contentType: 'text/event-stream', body: `data: ${JSON.stringify({
+      job_id: job.id, sequence: 1, type: 'progress', level: 'info', progress: 0.75,
+      data: {}, created_at: job.updated_at,
+    })}\n\n` }).catch(() => undefined);
+  });
+  await page.route('**/api/v1/runtime/instances', (route) => route.fulfill({ json: { data: instances } }));
+  await page.route(/\/api\/v1\/runtime\/status(?:\?.*)?$/, (route) => route.fulfill({ json: {
+    runtime_state: 'loading', model: 'Loading Model', instance_id: 'loading',
+  } }));
+  await page.route(/\/api\/v1\/models(?:\?.*)?$/, (route) => route.fulfill({ json: { data: [{
+    id: 'artifact', name: 'Loading Model', architecture: 'qwen35', loadable: true,
+    total_bytes: 1024, shard_count: 1,
+  }] } }));
+  await page.goto('/');
+  await expect(page.locator('.runtime-hero progress')).toHaveAttribute('value', '0.25');
+  advance();
+  await expect(page.locator('.runtime-hero progress')).toHaveAttribute('value', '0.75');
+  await navigateClient(page, '/models');
+  await expect(page.locator('.loaded-model-panel progress')).toHaveAttribute('value', '0.75');
+  await expect(page.locator('.model-library-panel progress')).toHaveAttribute('value', '0.75');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath('model-loading-progress.png') });
+  job.status = 'succeeded';
+  job.progress = 1;
+  await page.route('**/api/v1/runtime/instances', (route) => route.fulfill({ json: { data: [
+    { id: 'known', model: 'Known Model', state: 'ready', devices: ['metal'], active_sessions: 0, queued_requests: 0, memory: {
+      resident_weight_bytes: 2 ** 30, kv_bytes: 0, context_count: 0, prefix_cache_blocks: 0,
+      ssd_experts: false, ssd_expert_bytes: 0, ssd_ple: false, ssd_ple_bytes: 0,
+    } }, { id: 'unknown', model: 'Unknown Model', state: 'ready', devices: ['metal'], active_sessions: 0, queued_requests: 0, memory: null },
+  ] } }));
+  await page.route(/\/api\/v1\/runtime\/status(?:\?.*)?$/, (route) => route.fulfill({ json: {
+    runtime_state: 'ready', model: 'Known Model', runtime_memory_effective_budget_bytes: 4 * 2 ** 30,
+  } }));
+  await page.goto('/');
+  await expect(page.locator('[data-tier="weights"] .memory-tier-heading > span')).toHaveText('≥ 1 GiB / 4 GiB');
+  await expect(page.locator('[data-tier="weights"] .memory-tier-notice')).toContainText('Unknown Model');
+  await expect(page.locator('[data-tier="weights"] .memory-tier-track > span')).toHaveCount(1);
+  await page.unrouteAll({ behavior: 'ignoreErrors' });
 });
 
 test('页面按需请求自己的资源，概览不预载其他业务列表', async ({ page }) => {

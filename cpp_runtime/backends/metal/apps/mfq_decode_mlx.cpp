@@ -2054,14 +2054,10 @@ public:
 
 private:
     void capture_weight_residency() {
-        if constexpr (requires(const Runtime& value) {
-                value.kv_cache_bytes(); value.dynamic_weight_bytes();
-            }) {
-            const auto& runtime = runtime_holder->value();
-            const auto other = runtime.kv_cache_bytes() + runtime.dynamic_weight_bytes();
-            const auto active = mlx::core::get_active_memory();
-            resident_weight_baseline = active > other ? active - other : 0;
-        }
+        const auto usage = mfq::metal::MlxResourceTelemetry::snapshot();
+        const auto other = usage.cache_bytes + usage.dynamic_weight_bytes;
+        const auto active = mlx::core::get_active_memory();
+        resident_weight_baseline = active > other ? active - other : 0;
     }
 
     mfq::engine::Metrics metrics() const {
@@ -2072,24 +2068,18 @@ private:
             {"mlx_peak_bytes", static_cast<double>(mlx::core::get_peak_memory())},
         };
         std::unique_lock lock(*runtime_mutex, std::try_to_lock);
-        if constexpr (requires(const Runtime& value) {
-                value.kv_cache_bytes(); value.kv_cache_contexts();
-                value.dynamic_weight_bytes(); value.ssd_ple_payload_bytes();
-                value.ssd_expert_payload_bytes();
-            }) {
-            if (lock.owns_lock() && runtime_holder->has_value()) {
-                const auto& runtime = runtime_holder->value();
-                metrics.emplace_back("resident_weight_bytes", static_cast<double>(
-                    resident_weight_baseline + runtime.dynamic_weight_bytes()));
-                metrics.emplace_back("kv_cache_bytes", static_cast<double>(runtime.kv_cache_bytes()));
-                metrics.emplace_back("kv_cache_contexts", static_cast<double>(runtime.kv_cache_contexts()));
-                const auto ple = runtime.ssd_ple_payload_bytes();
-                const auto experts = runtime.ssd_expert_payload_bytes();
-                metrics.emplace_back("ssd_ple_enabled", ple > 0 ? 1.0 : 0.0);
-                metrics.emplace_back("ssd_ple_payload_bytes", static_cast<double>(ple));
-                metrics.emplace_back("ssd_expert_enabled", experts > 0 ? 1.0 : 0.0);
-                metrics.emplace_back("ssd_expert_payload_bytes", static_cast<double>(experts));
-            }
+        if (lock.owns_lock() && runtime_holder->has_value()) {
+            const auto usage = mfq::metal::MlxResourceTelemetry::snapshot();
+            metrics.emplace_back("resident_weight_bytes", static_cast<double>(
+                resident_weight_baseline + usage.dynamic_weight_bytes));
+            metrics.emplace_back("kv_cache_bytes", static_cast<double>(usage.cache_bytes));
+            metrics.emplace_back("kv_cache_contexts", static_cast<double>(usage.contexts));
+            const auto ple = usage.ple_payload_bytes;
+            const auto experts = usage.expert_payload_bytes;
+            metrics.emplace_back("ssd_ple_enabled", ple > 0 ? 1.0 : 0.0);
+            metrics.emplace_back("ssd_ple_payload_bytes", static_cast<double>(ple));
+            metrics.emplace_back("ssd_expert_enabled", experts > 0 ? 1.0 : 0.0);
+            metrics.emplace_back("ssd_expert_payload_bytes", static_cast<double>(experts));
         }
         if constexpr (requires(Runtime& value) {
                 value.supports_mtp();
@@ -2296,6 +2286,8 @@ int run_loaded_runtime(
     std::int64_t maximum_context,
     std::int64_t vocabulary_size,
     mlx::core::Stream runtime_stream) {
+    container.stop_load_observation();
+    std::cerr << "mfq_load_progress stage=finalizing" << std::endl;
     constexpr const char* tokenizer_asset =
         "__mfq_asset__/tokenizer.gguf";
     if constexpr (requires(Runtime& value) {
@@ -2428,6 +2420,10 @@ int run_loaded_runtime(
 int run_native_runtime(
     const Arguments& arguments,
     const mfq::metal::MfqContainer& container) {
+    container.observe_load_records([](std::size_t completed, std::size_t total) {
+        std::cerr << "mfq_load_progress completed=" << completed
+                  << " total=" << total << std::endl;
+    });
     constexpr const char* tokenizer_asset =
         "__mfq_asset__/tokenizer.gguf";
     if (!container.contains(tokenizer_asset) &&

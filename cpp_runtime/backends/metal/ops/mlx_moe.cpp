@@ -1,4 +1,5 @@
 #include "mlx_moe.h"
+#include "mlx_resource_telemetry.h"
 
 #include "mfq_container.h"
 #include "mfq_mfe_prefill_embedded.h"
@@ -7626,6 +7627,12 @@ struct MlxMfeOffloadCache::Impl {
             throw std::invalid_argument(
                 "MFE offload expert count cannot be negative");
         }
+        resources.bind([this] {
+            std::lock_guard lock(mutex);
+            std::size_t payload = 0;
+            for (const auto& item : backing_records) payload += item.second;
+            return MlxResourceUsage{0, 0, resident_bytes, payload, 0};
+        });
     }
 
     std::shared_ptr<const MfeStreamProjection>
@@ -7834,6 +7841,8 @@ struct MlxMfeOffloadCache::Impl {
         }
         auto result = parse_mfe_projection(name);
         mfe_projections.emplace(name, result);
+        backing_records.emplace(name, model.record(name).nbytes);
+        model.record_prepared(name);
         return result;
     }
 
@@ -7896,6 +7905,8 @@ struct MlxMfeOffloadCache::Impl {
     MfeLru mfe_lru;
     MfeExpertCache mfe_cache;
     std::size_t resident_bytes = 0;
+    std::unordered_map<std::string, std::size_t> backing_records;
+    MlxResourceTelemetry resources;
 };
 
 MlxMfeOffloadCache::MlxMfeOffloadCache(
@@ -8130,6 +8141,7 @@ void MlxMfeOffloadCache::discard_record(
         item = impl_->mfe_lru.erase(item);
     }
     impl_->mfe_projections.erase(name);
+    impl_->backing_records.erase(name);
 }
 
 void MlxMfeOffloadCache::clear() {

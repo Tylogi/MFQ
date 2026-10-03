@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mlx_resource_telemetry.h"
+
 #include "deepseek_v4_model.h"
 #include "mlx_dsa.h"
 #include "mlx_tensor.h"
@@ -208,6 +210,8 @@ private:
     std::optional<MlxDeepseekV4PoolState> indexer_;
     std::shared_ptr<MlxDeepseekV4LayerSpeculation> speculative_;
     int position_ = 0;
+    MlxResourceTelemetry resources_;
+    void report_resources();
 };
 
 // Injectable construction keeps the attention graph testable independently of

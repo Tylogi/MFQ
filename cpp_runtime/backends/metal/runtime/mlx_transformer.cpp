@@ -666,6 +666,7 @@ MlxKvCache::MlxKvCache(
          dtype_ != mlx::core::float32)) {
         throw std::runtime_error("invalid KV cache dimensions or dtype");
     }
+    resources_.set({key_.nbytes() + value_.nbytes(), static_cast<std::size_t>(batch_)});
 }
 
 void MlxKvCache::materialize() {
@@ -716,6 +717,7 @@ void MlxKvCache::ensure_capacity(int required) {
     }
     key_ = std::move(next_key);
     value_ = std::move(next_value);
+    resources_.set({key_.nbytes() + value_.nbytes(), static_cast<std::size_t>(batch_)});
 }
 
 std::pair<array, array> MlxKvCache::append(
@@ -840,6 +842,7 @@ void MlxKvCache::restore_snapshot(
     key_ = std::move(key);
     value_ = std::move(value);
     position_ = snapshot.position;
+    resources_.set({key_.nbytes() + value_.nbytes(), static_cast<std::size_t>(batch_)});
 }
 
 void MlxKvCache::restore_snapshot(MlxKvCacheSnapshot&& snapshot) {
@@ -858,6 +861,7 @@ void MlxKvCache::restore_snapshot(MlxKvCacheSnapshot&& snapshot) {
     key_ = std::move(snapshot.key);
     value_ = std::move(snapshot.value);
     position_ = snapshot.position;
+    resources_.set({key_.nbytes() + value_.nbytes(), static_cast<std::size_t>(batch_)});
 }
 
 MlxSequenceCache::MlxSequenceCache(
@@ -887,6 +891,7 @@ void MlxSequenceCache::reset(
         maximum_sequence_, initial_capacity);
     values_ = mlx::core::zeros(
         Shape{batch_, capacity, width_}, dtype_);
+    resources_.set({values_->nbytes(), static_cast<std::size_t>(batch_)});
 }
 
 std::pair<array, int> MlxSequenceCache::append(
@@ -939,6 +944,7 @@ void MlxSequenceCache::clear() noexcept {
     values_.reset();
     batch_ = 0;
     position_ = 0;
+    resources_.set({});
 }
 
 void MlxSequenceCache::ensure_capacity(int required) {
@@ -963,6 +969,7 @@ void MlxSequenceCache::ensure_capacity(int required) {
         Shape{0, 0, 0},
         Shape{batch_, values_->shape(1), width_});
     values_ = std::move(expanded);
+    resources_.set({values_->nbytes(), static_cast<std::size_t>(batch_)});
 }
 
 } // namespace mfq::metal
