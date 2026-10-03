@@ -29,6 +29,8 @@ constexpr const char* kTopKSource = R"METAL(
     }
     threadgroup float transformed[EXPERTS];
     threadgroup float partial[256];
+    threadgroup uint partial_ids[8];
+    threadgroup float selected_weights[TOP_K];
     uint row_offset = row * uint(EXPERTS);
 
     float local_max = -INFINITY;
@@ -83,21 +85,57 @@ constexpr const char* kTopKSource = R"METAL(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tid == 0u) {
-        float selected_weights[TOP_K];
-        for (uint rank = 0u; rank < uint(TOP_K); ++rank) {
-            float best_score = -INFINITY;
-            uint best_expert = uint(EXPERTS);
-            for (uint expert = 0u; expert < uint(EXPERTS); ++expert) {
-                float weight = transformed[expert];
-                float score = (
-                    HAS_AVAILABLE == 0 || available[expert]
-                )
-                    ? weight + (HAS_BIAS != 0 ? bias[expert] : 0.0f)
-                    : -INFINITY;
+    // Every thread scans a strided expert subset, then the eight SIMD groups
+    // reduce their candidates in parallel. This preserves the exact stable
+    // lower-expert-ID tie break without making thread 0 rescan every expert
+    // for every selected route.
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    for (uint rank = 0u; rank < uint(TOP_K); ++rank) {
+        float best_score = -INFINITY;
+        uint best_expert = uint(EXPERTS);
+        for (uint expert = tid; expert < uint(EXPERTS); expert += 256u) {
+            float weight = transformed[expert];
+            float score = (
+                HAS_AVAILABLE == 0 || available[expert]
+            )
+                ? weight + (HAS_BIAS != 0 ? bias[expert] : 0.0f)
+                : -INFINITY;
+            if (
+                score > best_score
+                || (score == best_score && expert < best_expert)
+            ) {
+                best_score = score;
+                best_expert = expert;
+            }
+        }
+        for (uint offset = 16u; offset > 0u; offset >>= 1u) {
+            float other_score = simd_shuffle_down(best_score, offset);
+            uint other_expert = simd_shuffle_down(best_expert, offset);
+            if (
+                lane + offset < 32u &&
+                (other_score > best_score ||
+                 (other_score == best_score &&
+                  other_expert < best_expert))
+            ) {
+                best_score = other_score;
+                best_expert = other_expert;
+            }
+        }
+        if (lane == 0u) {
+            partial[simd_group] = best_score;
+            partial_ids[simd_group] = best_expert;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0u) {
+            best_score = partial[0];
+            best_expert = partial_ids[0];
+            for (uint group = 1u; group < 8u; ++group) {
+                float score = partial[group];
+                uint expert = partial_ids[group];
                 if (
-                    score > best_score
-                    || (score == best_score && expert < best_expert)
+                    score > best_score ||
+                    (score == best_score && expert < best_expert)
                 ) {
                     best_score = score;
                     best_expert = expert;
@@ -108,7 +146,10 @@ constexpr const char* kTopKSource = R"METAL(
             selected_weights[rank] = transformed[best_expert];
             transformed[best_expert] = -INFINITY;
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
+    if (tid == 0u) {
         float denominator = 1.0f;
         if (MODE == 3) {
             float selected_max = -INFINITY;
@@ -136,6 +177,98 @@ constexpr const char* kTopKSource = R"METAL(
             }
             weights[row * uint(TOP_K) + rank] = value * params[1];
         }
+    }
+)METAL";
+
+constexpr const char* kSoftmaxTopKRowSource = R"METAL(
+    constexpr uint PER_LANE =
+        (uint(EXPERTS) + 31u) / 32u;
+    uint lane = thread_index_in_simdgroup;
+    float values[PER_LANE];
+    bool taken[PER_LANE];
+    for (uint local = 0u; local < PER_LANE; ++local) {
+        uint expert = lane + local * 32u;
+        float value = expert < uint(EXPERTS)
+            ? float(logits[expert])
+            : -INFINITY;
+        values[local] = isnan(value) ? -FLT_MAX : value;
+        taken[local] = false;
+    }
+
+    float selected[TOP_K];
+    uint selected_ids[TOP_K];
+    for (uint rank = 0u; rank < uint(TOP_K); ++rank) {
+        float best = -INFINITY;
+        uint best_id = uint(EXPERTS);
+        uint best_local = 0u;
+        for (uint local = 0u; local < PER_LANE; ++local) {
+            uint expert = lane + local * 32u;
+            float value = values[local];
+            if (!taken[local] && expert < uint(EXPERTS) &&
+                (value > best ||
+                 (value == best && expert < best_id))) {
+                best = value;
+                best_id = expert;
+                best_local = local;
+            }
+        }
+        float global_best = simd_max(best);
+        uint candidate = best == global_best
+            ? best_id
+            : uint(EXPERTS);
+        uint global_id = simd_min(candidate);
+        if (best == global_best && best_id == global_id) {
+            taken[best_local] = true;
+        }
+        selected[rank] = global_best;
+        selected_ids[rank] = global_id;
+    }
+
+    if (lane == 0u) {
+        float maximum = selected[0];
+        float denominator = 0.0f;
+        for (uint rank = 0u; rank < uint(TOP_K); ++rank) {
+            selected[rank] = exp(selected[rank] - maximum);
+            denominator += selected[rank];
+        }
+        for (uint rank = 0u; rank < uint(TOP_K); ++rank) {
+            ids[rank] = int(selected_ids[rank]);
+            weights[rank] = selected[rank] / denominator;
+        }
+    }
+)METAL";
+
+// Adapted from oMLX's Qwen router GEMV topology (Apache-2.0): spread one
+// router row over each SIMD group instead of packing a narrow 512-row GEMV
+// into the stock matmul schedule. MFQ supplies ordinary dense FP16/BF16
+// weights here; no external quantized layout is part of this ABI.
+constexpr const char* kDenseRouterLogitsSource = R"METAL(
+    constexpr uint SIMD_GROUPS = 4u;
+    uint lane = thread_index_in_simdgroup;
+    uint row = threadgroup_position_in_grid.y * SIMD_GROUPS
+        + simdgroup_index_in_threadgroup;
+    if (row >= uint(EXPERTS)) {
+        return;
+    }
+
+    float accumulator = 0.0f;
+    device const activation_t* row_weight =
+        weight + row * uint(K);
+    for (uint column = lane * 4u;
+         column < uint(K);
+         column += 128u) {
+        activation4_t activation =
+            *(device const activation4_t*)(input + column);
+        activation4_t values =
+            *(device const activation4_t*)(row_weight + column);
+        accumulator = fma(float(values[0]), float(activation[0]), accumulator);
+        accumulator = fma(float(values[1]), float(activation[1]), accumulator);
+        accumulator = fma(float(values[2]), float(activation[2]), accumulator);
+        accumulator = fma(float(values[3]), float(activation[3]), accumulator);
+    }
+    accumulator = simd_sum(accumulator);
+    if (lane == 0u) {
+        output[row] = activation_t(accumulator);
     }
 )METAL";
 
@@ -277,6 +410,7 @@ constexpr const char* kDenseRouterTopKSource = R"METAL(
         }
     }
 )METAL";
+
 
 constexpr const char* kDenseHashRouterSource = R"METAL(
     uint row = threadgroup_position_in_grid.x;
@@ -600,6 +734,48 @@ const mlx::core::fast::CustomKernelFunction& top_k_kernel() {
         {"ids", "weights"},
         kTopKSource);
     return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+softmax_top_k_row_kernel(mlx::core::Dtype dtype) {
+    static const auto fp16_kernel = make_kernel(
+        "mfq_cpp_moe_softmax_topk_row_f16",
+        {"logits"},
+        {"ids", "weights"},
+        std::string("using T = half;\n") + kSoftmaxTopKRowSource);
+    static const auto bf16_kernel = make_kernel(
+        "mfq_cpp_moe_softmax_topk_row_bf16",
+        {"logits"},
+        {"ids", "weights"},
+        std::string("using T = bfloat;\n") + kSoftmaxTopKRowSource);
+    static const auto fp32_kernel = make_kernel(
+        "mfq_cpp_moe_softmax_topk_row_f32",
+        {"logits"},
+        {"ids", "weights"},
+        std::string("using T = float;\n") + kSoftmaxTopKRowSource);
+    if (dtype == mlx::core::float16) return fp16_kernel;
+    return dtype == mlx::core::bfloat16 ? bf16_kernel : fp32_kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+dense_router_logits_kernel(mlx::core::Dtype dtype) {
+    static const auto fp16_kernel = make_kernel(
+        "mfq_cpp_moe_dense_router_logits_f16",
+        {"input", "weight"},
+        {"output"},
+        std::string(
+            "using activation_t = half;\n"
+            "using activation4_t = half4;\n") +
+            kDenseRouterLogitsSource);
+    static const auto bf16_kernel = make_kernel(
+        "mfq_cpp_moe_dense_router_logits_bf16",
+        {"input", "weight"},
+        {"output"},
+        std::string(
+            "using activation_t = bfloat;\n"
+            "using activation4_t = bfloat4;\n") +
+            kDenseRouterLogitsSource);
+    return dtype == mlx::core::bfloat16 ? bf16_kernel : fp16_kernel;
 }
 
 const mlx::core::fast::CustomKernelFunction&
@@ -960,6 +1136,35 @@ MlxMoeTopKResult moe_topk(
                ? 2
                : (delayed_softmax ? 3 : 0));
 
+    if (rows == 1 && mode == 0 && normalize &&
+        !bias.has_value() && !available.has_value() &&
+        experts >= 32 && experts <= 4096 && experts % 32 == 0) {
+        values = mlx::core::reshape(values, Shape{experts});
+        auto outputs = softmax_top_k_row_kernel(values.dtype())(
+            {std::move(values)},
+            {
+                Shape{1, top_k},
+                Shape{1, top_k},
+            },
+            {
+                mlx::core::int32,
+                mlx::core::float32,
+            },
+            {32, 1, 1},
+            {32, 1, 1},
+            {
+                {"EXPERTS", experts},
+                {"TOP_K", top_k},
+            },
+            std::nullopt,
+            false,
+            {});
+        return {
+            std::move(outputs.at(0)),
+            std::move(outputs.at(1)),
+        };
+    }
+
     array bias_values =
         mlx::core::zeros(Shape{experts}, mlx::core::float32);
     if (bias.has_value()) {
@@ -1023,6 +1228,53 @@ MlxMoeTopKResult moe_topk(
         std::move(outputs.at(0)),
         std::move(outputs.at(1)),
     };
+}
+
+bool moe_dense_router_logits_supported(
+    const array& input,
+    const array& weight) noexcept {
+    const bool dense16 = weight.dtype() == mlx::core::float16 ||
+        weight.dtype() == mlx::core::bfloat16;
+    if (!dense16 || weight.ndim() != 2 ||
+        !weight.flags().row_contiguous || input.ndim() == 0) {
+        return false;
+    }
+    const int experts = weight.shape(0);
+    const int width = weight.shape(1);
+    return (experts == 256 || experts == 384 || experts == 512) &&
+        width > 64 && width < 16 * experts && width % 128 == 0 &&
+        input.shape(-1) == width &&
+        input.size() == static_cast<std::size_t>(width);
+}
+
+array moe_dense_router_logits(
+    const array& input,
+    const array& weight) {
+    if (!moe_dense_router_logits_supported(input, weight)) {
+        throw std::invalid_argument(
+            "dense router GEMV requires one row, 256/384/512 experts, "
+            "and contiguous FP16/BF16 weights");
+    }
+    auto source = mlx::core::contiguous(mlx::core::reshape(
+        input.dtype() == weight.dtype()
+            ? input
+            : mlx::core::astype(input, weight.dtype()),
+        Shape{weight.shape(1)}));
+    const int experts = weight.shape(0);
+    auto outputs = dense_router_logits_kernel(weight.dtype())(
+        {std::move(source), weight},
+        {Shape{1, experts}},
+        {weight.dtype()},
+        {32, experts, 1},
+        {32, 4, 1},
+        {
+            {"K", weight.shape(1)},
+            {"EXPERTS", experts},
+        },
+        std::nullopt,
+        false,
+        {});
+    return std::move(outputs.front());
 }
 
 bool moe_dense_router_topk_supported(

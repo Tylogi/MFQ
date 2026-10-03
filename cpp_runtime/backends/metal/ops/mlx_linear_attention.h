@@ -11,6 +11,47 @@ struct MlxGatedDeltaNetResult {
     mlx::core::array state;
 };
 
+struct MlxGatedDeltaGates {
+    mlx::core::array gate;
+    mlx::core::array beta;
+};
+
+struct MlxGatedDeltaDecodeResult {
+    mlx::core::array output;
+    mlx::core::array convolution_state;
+    mlx::core::array recurrent_state;
+};
+
+// Projected inputs are [B,T,H]; outputs are FP32 [B,H,T]. The caller
+// precomputes decay_scale = -exp(a_log), preserving the model's storage
+// precision before promotion. No packed-weight format is involved here.
+MlxGatedDeltaGates gated_delta_gates(
+    const mlx::core::array& alpha,
+    const mlx::core::array& beta,
+    const mlx::core::array& dt_bias,
+    const mlx::core::array& decay_scale);
+
+// Single-row decode fast path for scalar-gated DeltaNet layers. The recurrent
+// state uses the transposed [value,key] layout accepted by gated_delta_net.
+MlxGatedDeltaDecodeResult gated_delta_decode_step(
+    const mlx::core::array& qk,
+    const mlx::core::array& value,
+    const mlx::core::array& output_gate,
+    const mlx::core::array& alpha,
+    const mlx::core::array& beta,
+    const mlx::core::array& convolution_state,
+    const mlx::core::array& recurrent_state,
+    const mlx::core::array& convolution_weight,
+    const mlx::core::array& dt_bias,
+    const mlx::core::array& decay_scale,
+    const mlx::core::array& norm_weight,
+    int key_heads,
+    int value_heads,
+    int dimension,
+    float convolution_eps,
+    float norm_eps,
+    bool output_gate_silu = false);
+
 struct MlxLinearConvQkvResult {
     mlx::core::array query;
     mlx::core::array key;

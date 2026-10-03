@@ -1,8 +1,10 @@
 #include "mlx_linear_attention.h"
 
 #include <cmath>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -82,6 +84,286 @@ void require_vector_close(
                 std::to_string(actual[index]) + " expected=" +
                 std::to_string(expected[index]));
         }
+    }
+}
+
+mfq::metal::MlxGatedDeltaGates reference_gates(
+    const mlx::core::array& alpha,
+    const mlx::core::array& beta,
+    const mlx::core::array& bias,
+    const mlx::core::array& decay) {
+    using namespace mlx::core;
+    auto input = astype(alpha, float32) + astype(bias, float32);
+    auto softplus = maximum(input, array(0.0f)) +
+        log1p(exp(-abs(input)));
+    return {
+        transpose(astype(decay, float32) * softplus, {0, 2, 1}),
+        transpose(sigmoid(astype(beta, float32)), {0, 2, 1}),
+    };
+}
+
+void test_gdn_gates() {
+    using namespace mlx::core;
+    for (const auto alpha_type : {float16, bfloat16, float32}) {
+        for (const auto beta_type : {float16, bfloat16, float32}) {
+            for (const auto weight_type : {float16, bfloat16, float32}) {
+                for (const int tokens : {1, 7}) {
+                    constexpr int batch = 2;
+                    constexpr int heads = 17;
+                    const Shape shape{batch, tokens, heads};
+                    std::vector<float> values(batch * tokens * heads);
+                    for (std::size_t i = 0; i < values.size(); ++i) {
+                        values[i] = float(int(i % 101) - 50) * 0.713f;
+                    }
+                    values[0] = -1000.0f;
+                    values[1] = 1000.0f;
+                    auto alpha = astype(array(values.begin(), shape), alpha_type);
+                    auto beta = astype(array(values.rbegin(), shape), beta_type);
+                    auto bias = astype(arange(heads) * array(0.0193f), weight_type);
+                    auto decay = astype(-exp(arange(heads) * array(0.0321f)), weight_type);
+                    auto expected = reference_gates(alpha, beta, bias, decay);
+                    auto actual = mfq::metal::gated_delta_gates(alpha, beta, bias, decay);
+                    eval(actual.gate, actual.beta, expected.gate, expected.beta);
+                    for (const auto& pair : {
+                             std::pair{actual.gate, contiguous(expected.gate)},
+                             std::pair{actual.beta, contiguous(expected.beta)}}) {
+                        if (pair.first.dtype() != float32 ||
+                            pair.first.shape() != Shape{batch, heads, tokens}) {
+                            throw std::runtime_error("GDN gates output shape/dtype mismatch");
+                        }
+                        eval(pair.second);
+                        const auto* a = pair.first.data<float>();
+                        const auto* e = pair.second.data<float>();
+                        for (std::size_t i = 0; i < pair.first.size(); ++i) {
+                            if (!std::isfinite(a[i]) ||
+                                a[i] != e[i]) {
+                                throw std::runtime_error("GDN fused gates numerical mismatch: actual=" +
+                                    std::to_string(a[i]) + " expected=" + std::to_string(e[i]) +
+                                    " index=" + std::to_string(i) + " types=" +
+                                    std::to_string(static_cast<int>(alpha_type.val())) + "," +
+                                    std::to_string(static_cast<int>(beta_type.val())) + "," +
+                                    std::to_string(static_cast<int>(weight_type.val())) +
+                                    " delta=" + std::to_string((a[i] - e[i]) * 1e8f) + "e-8");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    bool rejected = false;
+    try {
+        mfq::metal::gated_delta_gates(
+            zeros({1, 1, 4}), zeros({1, 1, 3}), zeros({4}), zeros({4}));
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    if (!rejected) throw std::runtime_error("GDN gates accepted invalid geometry");
+}
+
+void benchmark_gdn_gates() {
+    using namespace mlx::core;
+    constexpr int heads = 48;
+    auto alpha = reshape(arange(heads) * array(0.0713f), Shape{1, 1, heads});
+    auto beta = alpha - array(1.1f);
+    auto bias = arange(heads) * array(0.0193f);
+    auto decay = -exp(arange(heads) * array(0.0321f));
+    eval(alpha, beta, bias, decay);
+    auto execute = [&](bool fused) {
+        auto gates = fused
+            ? mfq::metal::gated_delta_gates(alpha, beta, bias, decay)
+            : reference_gates(alpha, beta, bias, decay);
+        eval(gates.gate, gates.beta);
+    };
+    for (int warm = 0; warm < 24; ++warm) execute(warm % 2 != 0);
+    for (int pair = 0; pair < 12; ++pair) {
+        double times[2]{};
+        for (int arm = 0; arm < 2; ++arm) {
+            const int fused = (pair + arm) % 2;
+            const auto start = std::chrono::steady_clock::now();
+            for (int rep = 0; rep < 100; ++rep) execute(fused != 0);
+            times[fused] = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count() / 100.0;
+        }
+        std::cout << "gdn_gates pair=" << pair << " reference_ms=" << times[0]
+                  << " fused_ms=" << times[1] << '\n';
+    }
+}
+
+void test_gdn_decode_step() {
+    using namespace mlx::core;
+    constexpr int key_heads = 1;
+    constexpr int value_heads = 2;
+    constexpr int dimension = 128;
+    constexpr int qk_width = 2 * key_heads * dimension;
+    constexpr int value_width = value_heads * dimension;
+    constexpr int channels = qk_width + value_width;
+
+    std::vector<float> qk_data(qk_width);
+    std::vector<float> value_data(value_width);
+    std::vector<float> output_gate_data(value_width);
+    std::vector<float> convolution_state_data(3 * channels);
+    std::vector<float> convolution_weight_data(4 * channels);
+    std::vector<float> recurrent_state_data(
+        value_heads * dimension * dimension);
+    std::vector<float> alpha_data(value_heads);
+    std::vector<float> beta_data(value_heads);
+    std::vector<float> bias_data(value_heads);
+    std::vector<float> decay_data(value_heads);
+    std::vector<float> norm_data(dimension);
+    const auto fill = [](std::vector<float>& values, int stride, float scale) {
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            values[index] =
+                static_cast<float>(static_cast<int>((index * stride) % 67) - 33) *
+                scale;
+        }
+    };
+    fill(qk_data, 11, 0.007f);
+    fill(value_data, 13, 0.006f);
+    fill(output_gate_data, 17, 0.009f);
+    fill(convolution_state_data, 19, 0.002f);
+    fill(convolution_weight_data, 23, 0.001f);
+    fill(recurrent_state_data, 29, 0.0002f);
+    fill(alpha_data, 31, 0.03f);
+    fill(beta_data, 37, 0.04f);
+    fill(bias_data, 41, 0.01f);
+    fill(decay_data, 43, -0.02f);
+    fill(norm_data, 47, 0.002f);
+    for (auto& value : norm_data) value += 1.0f;
+    for (auto& value : decay_data) value -= 0.4f;
+
+    const auto qk = astype(
+        array(qk_data.begin(), Shape{1, 1, qk_width}), float16);
+    const auto value = astype(
+        array(value_data.begin(), Shape{1, 1, value_width}), float16);
+    const auto output_gate = astype(
+        array(output_gate_data.begin(), Shape{1, 1, value_width}), float16);
+    const auto alpha = astype(
+        array(alpha_data.begin(), Shape{1, 1, value_heads}), float16);
+    const auto beta = astype(
+        array(beta_data.begin(), Shape{1, 1, value_heads}), float16);
+    const array convolution_state(
+        convolution_state_data.begin(), Shape{1, 3, channels});
+    const array recurrent_state(
+        recurrent_state_data.begin(),
+        Shape{1, value_heads, dimension, dimension});
+    const array convolution_weight(
+        convolution_weight_data.begin(), Shape{channels, 4});
+    const array bias(bias_data.begin(), Shape{value_heads});
+    const array decay(decay_data.begin(), Shape{value_heads});
+    const array norm(norm_data.begin(), Shape{dimension});
+
+    const auto convolved = mfq::metal::linear_conv_qkv(
+        convolution_state,
+        qk,
+        value,
+        convolution_weight,
+        key_heads,
+        value_heads,
+        dimension,
+        dimension,
+        std::nullopt,
+        1e-6f);
+    const auto gates = mfq::metal::gated_delta_gates(
+        alpha, beta, bias, decay);
+    const auto recurrent = mfq::metal::gated_delta_net(
+        convolved.query,
+        convolved.key,
+        convolved.value,
+        gates.gate,
+        gates.beta,
+        recurrent_state,
+        true);
+
+    for (const bool silu_gate : {false, true}) {
+        auto normalized = fast::rms_norm(
+            recurrent.output,
+            std::optional<array>(norm),
+            1e-6f);
+        auto gate = astype(
+            transpose(
+                reshape(
+                    output_gate,
+                    Shape{1, 1, value_heads, dimension}),
+                {0, 2, 1, 3}),
+            float32);
+        gate = silu_gate ? gate * sigmoid(gate) : sigmoid(gate);
+        auto reference_output = reshape(
+            transpose(normalized * gate, {0, 2, 1, 3}),
+            Shape{1, 1, value_width});
+        auto actual = mfq::metal::gated_delta_decode_step(
+            qk,
+            value,
+            output_gate,
+            alpha,
+            beta,
+            convolution_state,
+            recurrent_state,
+            convolution_weight,
+            bias,
+            decay,
+            norm,
+            key_heads,
+            value_heads,
+            dimension,
+            1e-6f,
+            1e-6f,
+            silu_gate);
+        eval(
+            reference_output,
+            convolved.state,
+            recurrent.state,
+            actual.output,
+            actual.convolution_state,
+            actual.recurrent_state);
+        require_vector_close(
+            actual.output.data<float>(),
+            std::vector<float>(
+                reference_output.data<float>(),
+                reference_output.data<float>() + reference_output.size()),
+            5e-5f,
+            silu_gate ? "GDN fused SiLU output" : "GDN fused sigmoid output");
+        require_vector_close(
+            actual.convolution_state.data<float>(),
+            std::vector<float>(
+                convolved.state.data<float>(),
+                convolved.state.data<float>() + convolved.state.size()),
+            0.0f,
+            "GDN fused convolution state");
+        require_vector_close(
+            actual.recurrent_state.data<float>(),
+            std::vector<float>(
+                recurrent.state.data<float>(),
+                recurrent.state.data<float>() + recurrent.state.size()),
+            5e-6f,
+            "GDN fused recurrent state");
+    }
+
+    bool rejected = false;
+    try {
+        mfq::metal::gated_delta_decode_step(
+            qk,
+            value,
+            output_gate,
+            alpha,
+            beta,
+            convolution_state,
+            recurrent_state,
+            convolution_weight,
+            bias,
+            decay,
+            norm,
+            key_heads,
+            value_heads,
+            64,
+            1e-6f,
+            1e-6f);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    if (!rejected) {
+        throw std::runtime_error(
+            "GDN decode step accepted unsupported geometry");
     }
 }
 
@@ -271,10 +553,16 @@ void test_cached_depthwise_dilated_decode() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
         using namespace mlx::core;
 
+        test_gdn_gates();
+        test_gdn_decode_step();
+        if (argc == 2 && std::string(argv[1]) == "--benchmark-gates") {
+            benchmark_gdn_gates();
+            return 0;
+        }
         test_cached_depthwise_dilated_decode();
         test_blocked_gdn_prefill(false);
         test_blocked_gdn_prefill(true);

@@ -79,10 +79,14 @@ void release_model_load_staging_memory(
 struct Arguments {
     std::filesystem::path mfq;
     std::string tensor;
+    std::string benchmark_mfq_moe_prefix;
     int benchmark_reps = 1;
     int benchmark_tokens = 1;
     int benchmark_distributed_routes = 0;
     std::vector<std::int32_t> benchmark_experts;
+    std::vector<std::string> benchmark_concat_tensors;
+    int benchmark_batch_size = 1;
+    bool benchmark_routed_input = false;
     bool benchmark_swiglu = false;
     bool check_container = false;
     bool list_tensors = false;
@@ -123,8 +127,22 @@ Arguments parse_arguments(int argc, char** argv) {
             result.mfq = require_value("--model");
         } else if (value == "--tensor") {
             result.tensor = require_value("--tensor");
+        } else if (value == "--benchmark-mfq-moe") {
+            result.benchmark_mfq_moe_prefix =
+                require_value("--benchmark-mfq-moe");
         } else if (value == "--benchmark-swiglu") {
             result.benchmark_swiglu = true;
+        } else if (value == "--benchmark-concat-tensor") {
+            result.benchmark_concat_tensors.push_back(
+                require_value("--benchmark-concat-tensor"));
+        } else if (value == "--benchmark-routed-input") {
+            result.benchmark_routed_input = true;
+        } else if (value == "--benchmark-batch-size") {
+            const auto parsed = std::stoll(require_value("--benchmark-batch-size"));
+            if (parsed <= 0 || parsed > 10000) {
+                usage_error("--benchmark-batch-size must be in [1, 10000]");
+            }
+            result.benchmark_batch_size = static_cast<int>(parsed);
         } else if (value == "--benchmark-reps") {
             const auto parsed = std::stoll(
                 require_value("--benchmark-reps"));
@@ -287,12 +305,20 @@ void print_help() {
         << "  --check-mfq-container  validate headers, records, and shard set\n"
         << "  --list-tensors         print record dtype, bytes, and name\n"
         << "  --tensor NAME          load and execute one supported linear weight\n"
-        << "  --benchmark-reps N     timed executions for --tensor (default 1)\n"
+        << "  --benchmark-mfq-moe PREFIX\n"
+        << "                          benchmark one native MFQ Qwen MoE block\n"
+        << "  --benchmark-reps N     timed benchmark executions (default 1)\n"
         << "  --benchmark-tokens N   routed input rows for --tensor (default 1)\n"
         << "  --benchmark-experts L  comma-separated MFE expert IDs\n"
         << "  --benchmark-distributed-experts N\n"
         << "                          vary N routed experts across benchmark tokens\n"
         << "  --benchmark-swiglu     fuse an even-width MFE gate/up record\n"
+        << "  --benchmark-concat-tensor NAME\n"
+        << "                          append an MFE projection (repeatable)\n"
+        << "  --benchmark-routed-input\n"
+        << "                          use distinct [tokens,routes,in] MFE inputs\n"
+        << "  --benchmark-batch-size N\n"
+        << "                          MFE executions per synchronization (default 1)\n"
         << "  --self-test-metal      execute an MLX C++ graph on Metal\n"
         << "  --transport TYPE       runtime communication: stdio or http\n"
         << "  --server               deprecated alias for --transport http\n"
@@ -575,6 +601,182 @@ void self_test_metal() {
         }
     }
     std::cout << "MLX C++ Metal self-test passed\n";
+}
+
+int benchmark_native_mfq_moe(
+    const Arguments& arguments,
+    const mfq::metal::MfqContainer& model) {
+    if (!arguments.tensor.empty() || arguments.server) {
+        usage_error(
+            "--benchmark-mfq-moe cannot be combined with --tensor or "
+            "--server");
+    }
+    if (arguments.benchmark_tokens != 1) {
+        usage_error("--benchmark-mfq-moe requires --benchmark-tokens 1");
+    }
+    if (arguments.benchmark_distributed_routes != 0 ||
+        arguments.benchmark_swiglu ||
+        arguments.benchmark_routed_input ||
+        !arguments.benchmark_concat_tensors.empty()) {
+        usage_error(
+            "single-tensor MFE benchmark options cannot be combined with "
+            "--benchmark-mfq-moe");
+    }
+
+    const auto name = [&](std::string_view suffix) {
+        return arguments.benchmark_mfq_moe_prefix + std::string(suffix);
+    };
+    const auto gate_name = name(".experts.gate.weight");
+    const auto up_name = name(".experts.up.weight");
+    const auto down_name = name(".experts.down.weight");
+    for (const auto* record_name : {&gate_name, &up_name, &down_name}) {
+        if (model.record(*record_name).dtype != "MFE") {
+            usage_error(
+                "--benchmark-mfq-moe requires native MFE expert records");
+        }
+    }
+
+    auto gate_up = mfq::metal::MlxMfeWeight::concatenate_projections({
+        mfq::metal::MlxMfeWeight::from_blob(model.read(gate_name)),
+        mfq::metal::MlxMfeWeight::from_blob(model.read(up_name)),
+    }).materialize_packed_projections();
+    auto down = mfq::metal::MlxMfeWeight::from_blob(
+        model.read(down_name));
+
+    const auto shared_gate = mfq::metal::MlxLinear::load(
+        model, name(".shared_expert.gate.weight"));
+    const auto shared_up = mfq::metal::MlxLinear::load(
+        model, name(".shared_expert.up.weight"));
+    const auto shared_down = mfq::metal::MlxLinear::load(
+        model, name(".shared_expert.down.weight"));
+    const auto shared_router = mfq::metal::MlxLinear::load(
+        model, name(".shared_expert.router.weight"));
+    const auto* shared_gate_nint = shared_gate.nint_weight_ref();
+    const auto* shared_up_nint = shared_up.nint_weight_ref();
+    const auto* shared_down_nint = shared_down.nint_weight_ref();
+    const auto* shared_router_dense = shared_router.dense_weight_ref();
+    if (shared_gate_nint == nullptr || shared_up_nint == nullptr ||
+        shared_down_nint == nullptr || shared_router_dense == nullptr) {
+        usage_error(
+            "--benchmark-mfq-moe requires NINT shared Gate/Up/Down and a "
+            "dense shared router");
+    }
+    const auto shared_gate_up =
+        mfq::metal::MlxNintSwiGluPair::from_weights(
+            *shared_gate_nint, *shared_up_nint);
+    if (!shared_gate_up.has_value()) {
+        throw std::runtime_error(
+            "MFQ shared-expert NINT Gate/Up pair is not fuseable");
+    }
+
+    std::vector<std::int32_t> expert_values =
+        arguments.benchmark_experts;
+    if (expert_values.empty()) {
+        const int routes = std::min(10, gate_up.experts());
+        expert_values.resize(static_cast<std::size_t>(routes));
+        for (int route = 0; route < routes; ++route) {
+            expert_values[static_cast<std::size_t>(route)] = route;
+        }
+    }
+    if (expert_values.size() > 16) {
+        usage_error("--benchmark-mfq-moe supports at most 16 routes");
+    }
+    for (const auto expert : expert_values) {
+        if (expert < 0 || expert >= gate_up.experts()) {
+            usage_error(
+                "--benchmark-experts contains an out-of-range expert ID");
+        }
+    }
+    const int routes = static_cast<int>(expert_values.size());
+    std::vector<float> route_values(static_cast<std::size_t>(routes));
+    float route_total = 0.0f;
+    for (int route = 0; route < routes; ++route) {
+        route_values[static_cast<std::size_t>(route)] =
+            static_cast<float>(route + 1);
+        route_total += static_cast<float>(route + 1);
+    }
+    for (auto& value : route_values) value /= route_total;
+
+    std::vector<float> input_values(
+        static_cast<std::size_t>(gate_up.neuron_len()));
+    for (std::size_t index = 0; index < input_values.size(); ++index) {
+        input_values[index] = static_cast<float>(
+            static_cast<int>(index % 23) - 11) / 32.0f;
+    }
+    const auto input = mlx::core::astype(
+        mlx::core::array(
+            input_values.begin(),
+            mlx::core::Shape{1, gate_up.neuron_len()}),
+        mlx::core::float16);
+    const auto expert_ids = mlx::core::array(
+        expert_values.begin(), mlx::core::Shape{1, routes});
+    const auto route_weights = mlx::core::array(
+        route_values.begin(), mlx::core::Shape{1, routes});
+
+    auto execute = [&]() -> mlx::core::array {
+        auto output = gate_up.decode_nint_shared(
+            down,
+            *shared_gate_up,
+            *shared_down_nint,
+            *shared_router_dense,
+            input,
+            expert_ids,
+            route_weights);
+        if (!output.has_value()) {
+            throw std::runtime_error(
+                "native MFQ two-stage MoE decode path is unsupported for "
+                "this block");
+        }
+        return std::move(*output);
+    };
+
+    auto output = execute();
+    output.eval();
+    const auto started = std::chrono::steady_clock::now();
+    std::vector<mlx::core::array> pending;
+    pending.reserve(static_cast<std::size_t>(std::min(
+        arguments.benchmark_batch_size, arguments.benchmark_reps)));
+    for (int rep = 0; rep < arguments.benchmark_reps; ++rep) {
+        output = execute();
+        pending.push_back(output);
+        if (pending.size() ==
+                static_cast<std::size_t>(arguments.benchmark_batch_size) ||
+            rep + 1 == arguments.benchmark_reps) {
+            mlx::core::eval(pending);
+            pending.clear();
+        }
+    }
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started)
+            .count();
+
+    auto checked = mlx::core::astype(output, mlx::core::float32);
+    checked.eval();
+    const auto* values = checked.data<float>();
+    double checksum = 0.0;
+    for (std::size_t index = 0; index < checked.size(); ++index) {
+        if (!std::isfinite(values[index])) {
+            throw std::runtime_error(
+                "native MFQ MoE benchmark returned non-finite data");
+        }
+        checksum += static_cast<double>(values[index]) *
+            static_cast<double>(index % 251u + 1u);
+    }
+    std::cout
+        << "Native MFQ two-stage MoE benchmark passed"
+        << " prefix=" << arguments.benchmark_mfq_moe_prefix
+        << " experts=" << gate_up.experts()
+        << " routes=" << routes
+        << " hidden=" << gate_up.neuron_len()
+        << " intermediate=" << gate_up.out_per_expert()
+        << " packed=" << gate_up.packed_nbytes() + down.packed_nbytes()
+        << " reps=" << arguments.benchmark_reps
+        << " batch_size=" << arguments.benchmark_batch_size
+        << " ms_per_decode=" << elapsed_ms / arguments.benchmark_reps
+        << " checksum=" << checksum
+        << "\n";
+    return EXIT_SUCCESS;
 }
 
 #ifdef MFQ_METAL_RUNTIME_COMMUNICATION
@@ -2462,13 +2664,29 @@ int main(int argc, char** argv) {
                     << value.name << "\n";
             }
         }
+        if (!arguments.benchmark_mfq_moe_prefix.empty()) {
+            configure_mlx_metal();
+            return benchmark_native_mfq_moe(arguments, model);
+        }
         if (!arguments.tensor.empty()) {
             configure_mlx_metal();
             const auto& record = model.record(arguments.tensor);
             if (record.dtype == "MFE") {
-                const auto weight =
+                auto weight =
                     mfq::metal::MlxMfeWeight::from_blob(
                         model.read(arguments.tensor));
+                if (!arguments.benchmark_concat_tensors.empty()) {
+                    std::vector<mfq::metal::MlxMfeWeight> projections{weight};
+                    for (const auto& name : arguments.benchmark_concat_tensors) {
+                        if (model.record(name).dtype != "MFE") {
+                            usage_error("--benchmark-concat-tensor requires MFE records");
+                        }
+                        projections.push_back(mfq::metal::MlxMfeWeight::from_blob(
+                            model.read(name)));
+                    }
+                    weight = mfq::metal::MlxMfeWeight::concatenate_projections(projections)
+                        .materialize_packed_projections();
+                }
                 if (arguments.benchmark_distributed_routes > 0
                     && !arguments.benchmark_experts.empty()) {
                     usage_error(
@@ -2487,6 +2705,8 @@ int main(int argc, char** argv) {
                 }
                 std::vector<float> input_values(
                     static_cast<std::size_t>(arguments.benchmark_tokens)
+                        * static_cast<std::size_t>(
+                              arguments.benchmark_routed_input ? routes : 1)
                         * static_cast<std::size_t>(weight.neuron_len()));
                 for (std::size_t index = 0;
                      index < input_values.size();
@@ -2494,13 +2714,13 @@ int main(int argc, char** argv) {
                     input_values[index] = static_cast<float>(
                         static_cast<int>(index % 17) - 8) / 16.0f;
                 }
+                const mlx::core::Shape input_shape = arguments.benchmark_routed_input
+                    ? mlx::core::Shape{arguments.benchmark_tokens, routes, weight.neuron_len()}
+                    : mlx::core::Shape{arguments.benchmark_tokens, weight.neuron_len()};
                 auto input = mlx::core::astype(
                     mlx::core::array(
                         input_values.begin(),
-                        mlx::core::Shape{
-                            arguments.benchmark_tokens,
-                            weight.neuron_len(),
-                        }),
+                        input_shape),
                     mlx::core::float16);
                 std::vector<std::int32_t> expert_values =
                     arguments.benchmark_experts;
@@ -2549,11 +2769,18 @@ int main(int argc, char** argv) {
                 warm.eval();
                 const auto started = std::chrono::steady_clock::now();
                 mlx::core::array output = warm;
+                std::vector<mlx::core::array> pending;
+                pending.reserve(std::min(arguments.benchmark_batch_size, arguments.benchmark_reps));
                 for (int rep = 0;
                      rep < arguments.benchmark_reps;
-                     ++rep) {
+                    ++rep) {
                     output = execute();
-                    output.eval();
+                    pending.push_back(output);
+                    if (pending.size() == static_cast<std::size_t>(arguments.benchmark_batch_size) ||
+                        rep + 1 == arguments.benchmark_reps) {
+                        mlx::core::eval(pending);
+                        pending.clear();
+                    }
                 }
                 const auto elapsed_ms =
                     std::chrono::duration<double, std::milli>(
@@ -2602,6 +2829,8 @@ int main(int argc, char** argv) {
                            arguments.benchmark_swiglu)
                     << " packed=" << weight.packed_nbytes()
                     << " reps=" << arguments.benchmark_reps
+                    << " batch_size=" << arguments.benchmark_batch_size
+                    << " routed_input=" << static_cast<int>(arguments.benchmark_routed_input)
                     << " ms_per_dispatch="
                     << elapsed_ms / arguments.benchmark_reps
                     << " checksum=" << checksum
@@ -2610,6 +2839,10 @@ int main(int argc, char** argv) {
                     << " l2=" << l2
                     << "\n";
                 return EXIT_SUCCESS;
+            }
+            if (!arguments.benchmark_concat_tensors.empty() ||
+                arguments.benchmark_routed_input || arguments.benchmark_batch_size != 1) {
+                usage_error("MFE benchmark options require an MFE --tensor record");
             }
             const auto weight = mfq::metal::MlxLinear::load(
                 model,
@@ -2690,12 +2923,13 @@ int main(int argc, char** argv) {
         }
         if (!arguments.check_container &&
             !arguments.list_tensors &&
+            arguments.benchmark_mfq_moe_prefix.empty() &&
             arguments.tensor.empty() &&
             !arguments.self_test_metal &&
             !arguments.server) {
             usage_error(
                 "select --check-mfq-container, --list-tensors, --tensor, "
-                "--transport, or --self-test-metal");
+                "--benchmark-mfq-moe, --transport, or --self-test-metal");
         }
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {

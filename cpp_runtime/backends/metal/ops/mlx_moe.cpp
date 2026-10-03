@@ -70,7 +70,7 @@ constexpr int kNintGroups = 6;
 constexpr int kNintQOffset = 7;
 constexpr int kNintSubOffset = 8;
 constexpr int kNintAnchorOffset = 9;
-constexpr int kNintQ5Execution = 10;
+constexpr int kNintExecution = 10;
 constexpr int kNintRowQLayoutOffset = 11;
 constexpr int kNintRowQByteOffsetsOffset = 12;
 constexpr int kNintV2 = 13;
@@ -261,15 +261,40 @@ int mxfp4_decode_down_reduce_rows() noexcept {
     return 2;
 }
 
-int mxfp4_decode_rows_per_simd() noexcept {
+int mfe_decode_rows_per_simd(int automatic_rows) noexcept {
     const char* value = std::getenv(
         "MFQ_METAL_MFE_DECODE_ROWS_PER_SIMD");
     if (value != nullptr) {
         const auto setting = std::string_view(value);
         if (setting == "1") return 1;
+        if (setting == "2") return 2;
         if (setting == "4") return 4;
     }
-    return 2;
+    return automatic_rows;
+}
+
+bool mfe_narrow_bindings_enabled() noexcept {
+    const char* value = std::getenv(
+        "MFQ_METAL_MFE_NARROW_BINDINGS");
+    if (value == nullptr) {
+        return true;
+    }
+    const auto setting = std::string_view(value);
+    return setting != "0"
+        && setting != "false"
+        && setting != "off";
+}
+
+bool mfe_split_swiglu_enabled() noexcept {
+    const char* value = std::getenv(
+        "MFQ_METAL_MFE_SPLIT_SWIGLU");
+    if (value == nullptr) {
+        return true;
+    }
+    const auto setting = std::string_view(value);
+    return setting != "0"
+        && setting != "false"
+        && setting != "off";
 }
 
 bool routed_sort_enabled(int tokens) noexcept {
@@ -314,7 +339,7 @@ constexpr int kVqBankOffset = 25;
 constexpr int kVqParameterOffset = 26;
 constexpr int kVqRotationVariant = 27;
 constexpr int kVqProfile = 28;
-constexpr int kVqJscExecution = 29;
+constexpr int kVqExecutionLayout = 29;
 constexpr int kVqResidualCodebookOffset = 30;
 constexpr int kVqResidualRecordOffset = 31;
 constexpr int kVqProfileGeneric = 0;
@@ -325,14 +350,17 @@ constexpr int kVqProfileJsc8 = 4;
 constexpr int kVqProfileNpqL = 5;
 constexpr int kVqProfileNvq1S = 6;
 constexpr int kVqProfileJscExtended8 = 7;
+constexpr int kVqProfileJscExtended4 = 8;
 constexpr std::uint32_t kGroupedVqVectorProfileMask =
     (std::uint32_t{1} << kVqProfileGeneric)
     | (std::uint32_t{1} << kVqProfileNpqS)
     | (std::uint32_t{1} << kVqProfileNvq1L)
     | (std::uint32_t{1} << kVqProfileNpqL)
-    | (std::uint32_t{1} << kVqProfileNvq1S);
+    | (std::uint32_t{1} << kVqProfileNvq1S)
+    | (std::uint32_t{1} << kVqProfileJscExtended4);
 constexpr std::uint32_t kGroupedJscExtendedProfileMask =
-    std::uint32_t{1} << kVqProfileJscExtended8;
+    (std::uint32_t{1} << kVqProfileJscExtended8)
+    | (std::uint32_t{1} << kVqProfileJscExtended4);
 
 constexpr const char* kMoeHeader = R"METAL(
 template <typename Stream>
@@ -356,16 +384,12 @@ inline uint mfq_moe_read_bits(
         & ((1u << bits) - 1u);
 }
 
-inline ushort4 mfq_moe_read_nint_row_quad(
+inline ushort4 mfq_moe_decode_nint_quad_at(
     device const uchar* stream,
-    uint row_byte_offset,
-    uint row_bit_shift,
-    uint value_index,
+    uint byte_index,
+    uint shift,
     uint bits
 ) {
-    uint row_relative_bits = row_bit_shift + value_index * bits;
-    uint byte_index = row_byte_offset + (row_relative_bits >> 3u);
-    uint shift = row_relative_bits & 7u;
     uint required_bits = shift + 4u * bits;
     packed_uchar4 bytes =
         *reinterpret_cast<device const packed_uchar4*>(stream + byte_index);
@@ -382,6 +406,127 @@ inline ushort4 mfq_moe_read_nint_row_quad(
         (packed >> bits) & mask,
         (packed >> (2u * bits)) & mask,
         (packed >> (3u * bits)) & mask);
+}
+
+inline ushort4 mfq_moe_read_nint_row_quad(
+    device const uchar* stream,
+    uint row_byte_offset,
+    uint row_bit_shift,
+    uint value_index,
+    uint bits
+) {
+    uint row_relative_bits = row_bit_shift + value_index * bits;
+    return mfq_moe_decode_nint_quad_at(
+        stream,
+        row_byte_offset + (row_relative_bits >> 3u),
+        row_relative_bits & 7u,
+        bits);
+}
+
+template <
+    uint GROUP_SIZE,
+    uint MATRIX_ROWS,
+    typename XStream,
+    typename SubScaleStream,
+    typename SubMinStream
+>
+inline void mfq_moe_nint_profile(
+    XStream x,
+    device const uchar* q_stream,
+    SubScaleStream sub_scale_stream,
+    SubMinStream sub_min_stream,
+    uint x_offset,
+    uint q_offset,
+    uint sub_offset,
+    thread const uint* outputs,
+    thread const uint* q_widths,
+    thread const uint* q_row_byte_offsets,
+    thread const uint* q_row_bit_shifts,
+    thread const float* neuron_scales,
+    thread const float* neuron_minimums,
+    thread float* accumulators,
+    uint groups,
+    uint k_lane,
+    uint k_lanes,
+    uint k_size
+) {
+    for (
+        uint group = k_lane;
+        group < groups;
+        group += k_lanes
+    ) {
+        float scales[MATRIX_ROWS];
+        float minimums[MATRIX_ROWS];
+        uint q_byte_cursors[MATRIX_ROWS];
+        uint q_bit_cursors[MATRIX_ROWS];
+        uint column_base = group * GROUP_SIZE;
+        for (uint row = 0u; row < MATRIX_ROWS; ++row) {
+            uint metadata = outputs[row] * groups + group;
+            scales[row] = neuron_scales[row]
+                * float(sub_scale_stream[sub_offset + metadata]);
+            minimums[row] = neuron_minimums[row]
+                * float(sub_min_stream[sub_offset + metadata]);
+            uint group_bit = q_row_bit_shifts[row]
+                + column_base * q_widths[row];
+            q_byte_cursors[row] = q_row_byte_offsets[row]
+                + (group_bit >> 3u);
+            q_bit_cursors[row] = group_bit & 7u;
+        }
+        float activation_sum = 0.0f;
+        float quantized_dots[MATRIX_ROWS] = {0.0f};
+        for (
+            uint element = 0u;
+            element < GROUP_SIZE;
+            element += 4u
+        ) {
+            uint column = column_base + element;
+            if (column >= k_size) {
+                break;
+            }
+            float4 activations;
+            if (column + 3u < k_size) {
+                activations = float4(
+                    x[x_offset + column],
+                    x[x_offset + column + 1u],
+                    x[x_offset + column + 2u],
+                    x[x_offset + column + 3u]);
+            } else {
+                activations = float4(
+                    column < k_size
+                        ? float(x[x_offset + column]) : 0.0f,
+                    column + 1u < k_size
+                        ? float(x[x_offset + column + 1u]) : 0.0f,
+                    column + 2u < k_size
+                        ? float(x[x_offset + column + 2u]) : 0.0f,
+                    column + 3u < k_size
+                        ? float(x[x_offset + column + 3u]) : 0.0f);
+            }
+            activation_sum += activations.x + activations.y
+                + activations.z + activations.w;
+            for (uint row = 0u; row < MATRIX_ROWS; ++row) {
+                ushort4 quantized = mfq_moe_decode_nint_quad_at(
+                    q_stream + q_offset,
+                    q_byte_cursors[row],
+                    q_bit_cursors[row],
+                    q_widths[row]);
+                quantized_dots[row] +=
+                    dot(activations, float4(quantized));
+                uint next_bit = q_bit_cursors[row]
+                    + 4u * q_widths[row];
+                q_byte_cursors[row] += next_bit >> 3u;
+                q_bit_cursors[row] = next_bit & 7u;
+            }
+        }
+        for (uint row = 0u; row < MATRIX_ROWS; ++row) {
+            accumulators[row] = fma(
+                scales[row],
+                quantized_dots[row],
+                fma(
+                    -minimums[row],
+                    activation_sum,
+                    accumulators[row]));
+        }
+    }
 }
 
 template <uint BITS, typename Stream>
@@ -516,6 +661,8 @@ inline void mfq_moe_jsc_profile(
         VECTOR_SIZE == 4u ? 2u : 3u;
     constexpr uint BYTES_PER_SIGN =
         VECTOR_SIZE == 4u ? 3u : 2u;
+    constexpr uint WIDE_BYTES_PER_SIGN =
+        VECTOR_SIZE == 4u ? 4u : 3u;
     for (
         uint group = k_lane;
         group < groups;
@@ -587,6 +734,24 @@ inline void mfq_moe_jsc_profile(
                             : (record.y >> 8u) & 0xfffffu);
                     index0 = segment & 4095u;
                     sign_value = segment >> 12u;
+                } else if (EXECUTION_LAYOUT != 0u && execution_layout == 3u) {
+                    uint execution_offset = indices_offset + (
+                        outputs[row] * signs + column_base / 8u
+                    ) * WIDE_BYTES_PER_SIGN;
+                    uint record = uint(indices_stream[execution_offset])
+                        | (uint(indices_stream[execution_offset + 1u]) << 8u)
+                        | (uint(indices_stream[execution_offset + 2u]) << 16u);
+                    if (VECTOR_SIZE == 4u) {
+                        record |= uint(indices_stream[
+                            execution_offset + 3u]) << 24u;
+                    }
+                    uint index_mask = (1u << index_bits) - 1u;
+                    index0 = record & index_mask;
+                    if (VECTOR_SIZE == 4u) {
+                        index1 = (record >> index_bits) & index_mask;
+                    }
+                    sign_value = record >> (
+                        index_bits * (VECTOR_SIZE == 4u ? 2u : 1u));
                 } else if (EXECUTION_LAYOUT != 0u && execution_layout == 1u) {
                     uint execution_offset = indices_offset + (
                         outputs[row] * signs + column_base / 8u
@@ -668,14 +833,24 @@ constexpr const char* kMoeSource = R"METAL(
     constexpr uint K_LANES = uint(K_LANES_VALUE);
     constexpr uint LANE_GROUPS = 32u / K_LANES;
     constexpr uint ROWS_PER_SIMD = uint(ROWS_PER_SIMD_VALUE);
+    // A split Gate/Up MFE stores the two projections under independent
+    // descriptors, and the descriptors may name completely different
+    // decoder families.  Pair the two physical SIMD groups instead of
+    // pretending the Up rows are the second half of the Gate descriptor.
+    constexpr bool SPLIT_SWIGLU =
+        uint(FUSED_SWIGLU) != 0u && uint(PROJECTIONS) == 2u;
+    constexpr bool PACKED_SWIGLU =
+        uint(FUSED_SWIGLU) != 0u && uint(PROJECTIONS) == 1u;
     constexpr uint MATRIX_ROWS =
-        uint(FUSED_SWIGLU) != 0u
+        PACKED_SWIGLU
             ? 2u * ROWS_PER_SIMD
             : ROWS_PER_SIMD;
     constexpr uint ROWS_PER_PHYSICAL_SIMD =
         LANE_GROUPS * ROWS_PER_SIMD;
     constexpr uint ROWS_PER_TG =
-        SIMD_GROUPS * ROWS_PER_PHYSICAL_SIMD;
+        SPLIT_SWIGLU
+            ? ROWS_PER_PHYSICAL_SIMD
+            : SIMD_GROUPS * ROWS_PER_PHYSICAL_SIMD;
     constexpr uint OUTPUT_TILES =
         (uint(OUT) + ROWS_PER_TG - 1u) / ROWS_PER_TG;
 
@@ -686,10 +861,12 @@ constexpr const char* kMoeSource = R"METAL(
     uint workgroup = threadgroup_position_in_grid.x;
     uint output_tile = workgroup % OUTPUT_TILES;
     uint projection_index = workgroup / OUTPUT_TILES;
-    uint projection =
-        projection_index % uint(PROJECTIONS);
-    uint sorted_slot =
-        projection_index / uint(PROJECTIONS);
+    uint projection = SPLIT_SWIGLU
+        ? simd_group
+        : projection_index % uint(PROJECTIONS);
+    uint sorted_slot = SPLIT_SWIGLU
+        ? projection_index
+        : projection_index / uint(PROJECTIONS);
     uint route_index = uint(SORTED_ROUTES) != 0u
         ? uint(route_order[sorted_slot])
         : sorted_slot;
@@ -701,7 +878,7 @@ constexpr const char* kMoeSource = R"METAL(
 
     uint output_base =
         output_tile * ROWS_PER_TG
-        + simd_group * ROWS_PER_PHYSICAL_SIMD
+        + (SPLIT_SWIGLU ? 0u : simd_group * ROWS_PER_PHYSICAL_SIMD)
         + lane_group * ROWS_PER_SIMD;
     int logical_expert =
         int(expert_ids[token * uint(ROUTES) + route]);
@@ -721,16 +898,22 @@ constexpr const char* kMoeSource = R"METAL(
             ++row
         ) {
             uint output = output_base + row;
-            if (k_lane == 0u && output < uint(OUT)) {
-                y[
-                    (
+            if (
+                k_lane == 0u
+                && output < uint(OUT)
+                && (!SPLIT_SWIGLU || projection == 0u)
+            ) {
+                uint destination = SPLIT_SWIGLU
+                    ? (token * uint(ROUTES) + route) * uint(OUT) + output
+                    : (
                         (
-                            token * uint(ROUTES) + route
-                        ) * uint(PROJECTIONS)
-                        + projection
-                    ) * uint(OUT)
-                    + output
-                ] = T(0.0f);
+                            (token * uint(ROUTES) + route)
+                                * uint(PROJECTIONS)
+                            + projection
+                        ) * uint(OUT)
+                        + output
+                    );
+                y[destination] = T(0.0f);
             }
         }
         return;
@@ -755,6 +938,8 @@ constexpr const char* kMoeSource = R"METAL(
         )
     ) * uint(K);
     float accumulators[MATRIX_ROWS] = {0.0f};
+    threadgroup T split_values[
+        2u * ROWS_PER_PHYSICAL_SIMD];
 
     if (
         (uint(FAMILY_MASK) & 1u) != 0u
@@ -787,7 +972,7 @@ constexpr const char* kMoeSource = R"METAL(
         for (uint row = 0u; row < MATRIX_ROWS; ++row) {
             uint output = min(
                 output_base + (
-                    uint(FUSED_SWIGLU) != 0u
+                    PACKED_SWIGLU
                         ? (row / ROWS_PER_SIMD) * uint(OUT)
                             + row % ROWS_PER_SIMD
                         : row
@@ -808,6 +993,47 @@ constexpr const char* kMoeSource = R"METAL(
                 nint_anchor_min[anchor_offset + pool_output];
         }
 
+        if (group_size == 24u) {
+            mfq_moe_nint_profile<24u, MATRIX_ROWS>(
+                x,
+                nint_q,
+                nint_sub_scale,
+                nint_sub_min,
+                x_offset,
+                q_offset,
+                sub_offset,
+                outputs,
+                q_widths,
+                q_row_byte_offsets,
+                q_row_bit_shifts,
+                neuron_scales,
+                neuron_minimums,
+                accumulators,
+                groups,
+                k_lane,
+                K_LANES,
+                uint(K));
+        } else if (group_size == 28u) {
+            mfq_moe_nint_profile<28u, MATRIX_ROWS>(
+                x,
+                nint_q,
+                nint_sub_scale,
+                nint_sub_min,
+                x_offset,
+                q_offset,
+                sub_offset,
+                outputs,
+                q_widths,
+                q_row_byte_offsets,
+                q_row_bit_shifts,
+                neuron_scales,
+                neuron_minimums,
+                accumulators,
+                groups,
+                k_lane,
+                K_LANES,
+                uint(K));
+        } else {
         for (uint group = k_lane; group < groups; group += K_LANES) {
             float scales[MATRIX_ROWS];
             float minimums[MATRIX_ROWS];
@@ -851,6 +1077,7 @@ constexpr const char* kMoeSource = R"METAL(
                     accumulators[row] += dot(activations, decoded);
                 }
             }
+        }
         }
     } else if (
         (uint(FAMILY_MASK) & 2u) != 0u
@@ -917,7 +1144,7 @@ constexpr const char* kMoeSource = R"METAL(
         ) {
             uint output = min(
                 output_base + (
-                    uint(FUSED_SWIGLU) != 0u
+                    PACKED_SWIGLU
                         ? (row / ROWS_PER_SIMD) * uint(OUT)
                             + row % ROWS_PER_SIMD
                         : row
@@ -932,7 +1159,7 @@ constexpr const char* kMoeSource = R"METAL(
 
         uint profile =
             uint(descriptors[descriptor_base + 28u]) & 255u;
-        uint cohort_jsc_layout =
+        uint cohort_execution_layout =
             uint(descriptors[descriptor_base + 29u]);
         if (
             (uint(VQ_PROFILE_MASK) & 2u) != 0u
@@ -998,7 +1225,8 @@ constexpr const char* kMoeSource = R"METAL(
                     ) {
                         uint indices[2] = {0u, 0u};
                         uint sign_value;
-                        if (uint(JSC_EXECUTION_LAYOUT) != 0u) {
+                        if (uint(VQ_EXECUTION_LAYOUT) != 0u
+                            && cohort_execution_layout == 1u) {
                             constexpr uint bytes_per_sign = 3u;
                             uint execution_offset =
                                 indices_offset
@@ -1046,7 +1274,8 @@ constexpr const char* kMoeSource = R"METAL(
                             (sign_value & 16u) != 0u,
                             (sign_value & 32u) != 0u,
                             (sign_value & 64u) != 0u,
-                            uint(JSC_EXECUTION_LAYOUT) != 0u
+                            uint(VQ_EXECUTION_LAYOUT) != 0u
+                                && cohort_execution_layout == 1u
                                 ? (sign_value & 128u) != 0u
                                 : (popcount(sign_value) & 1u) != 0u);
                         float4 code0 = mfq_moe_load_code4(
@@ -1074,7 +1303,7 @@ constexpr const char* kMoeSource = R"METAL(
             mfq_moe_jsc_profile<
                 8u,
                 MATRIX_ROWS,
-                JSC_EXECUTION_LAYOUT
+                VQ_EXECUTION_LAYOUT
             >(
                 x,
                 vq_indices,
@@ -1101,7 +1330,7 @@ constexpr const char* kMoeSource = R"METAL(
                 k_lane,
                 K_LANES,
                 uint(K),
-                cohort_jsc_layout);
+                cohort_execution_layout);
         } else if (
             (uint(VQ_PROFILE_MASK) & 128u) != 0u
             && profile == 7u
@@ -1112,7 +1341,7 @@ constexpr const char* kMoeSource = R"METAL(
             mfq_moe_jsc_profile<
                 8u,
                 MATRIX_ROWS,
-                JSC_EXECUTION_LAYOUT
+                VQ_EXECUTION_LAYOUT
             >(
                 x,
                 vq_indices,
@@ -1139,7 +1368,46 @@ constexpr const char* kMoeSource = R"METAL(
                 k_lane,
                 K_LANES,
                 uint(K),
-                cohort_jsc_layout);
+                cohort_execution_layout);
+        } else if (
+            (uint(VQ_PROFILE_MASK) & 256u) != 0u
+            && profile == 8u
+        ) {
+            // Extended D4 JSC profiles differ from NVQ3J only in their
+            // 9/10-bit indices and 512/1024-entry codebooks. Keep the same
+            // vectorized 24-column decoder instead of falling through to the
+            // scalar, fully generic VQ loop.
+            mfq_moe_jsc_profile<
+                4u,
+                MATRIX_ROWS,
+                VQ_EXECUTION_LAYOUT
+            >(
+                x,
+                vq_indices,
+                vq_state,
+                vq_aux,
+                vq_scales,
+                vq_state_to_codebank,
+                vq_codebooks,
+                x_offset,
+                outputs,
+                row_anchors,
+                accumulators,
+                groups,
+                vectors,
+                index_bits,
+                entries,
+                indices_offset,
+                state_offset,
+                aux_offset,
+                codebook_offset,
+                scale_offset,
+                state_bank_offset,
+                signs,
+                k_lane,
+                K_LANES,
+                uint(K),
+                cohort_execution_layout);
         } else if (
             (uint(VQ_PROFILE_MASK) & 4u) != 0u
             && profile == 2u
@@ -1340,6 +1608,7 @@ constexpr const char* kMoeSource = R"METAL(
                 group += K_LANES
             ) {
                 uint delta_by_row[MATRIX_ROWS];
+                uint execution_records[MATRIX_ROWS];
                 float weight_scales[MATRIX_ROWS];
                 for (
                     uint row = 0u;
@@ -1348,17 +1617,34 @@ constexpr const char* kMoeSource = R"METAL(
                 ) {
                     uint state_index =
                         outputs[row] * groups + group;
-                    uint state_byte = uint(vq_state[
-                        state_offset + (state_index >> 1)
-                    ]);
-                    uint state = (
-                        state_byte
-                        >> ((state_index & 1u) * 4u)
-                    ) & 15u;
-                    delta_by_row[row] = mfq_moe_read_bits(
-                        vq_aux + aux_offset,
-                        state_index,
-                        1u);
+                    uint record = 0u;
+                    uint state;
+                    if (
+                        uint(VQ_EXECUTION_LAYOUT) != 0u
+                        && cohort_execution_layout == 4u
+                    ) {
+                        uint record_offset =
+                            indices_offset + state_index * 4u;
+                        record = uint(vq_indices[record_offset])
+                            | (uint(vq_indices[record_offset + 1u]) << 8u)
+                            | (uint(vq_indices[record_offset + 2u]) << 16u)
+                            | (uint(vq_indices[record_offset + 3u]) << 24u);
+                        state = (record >> 27u) & 15u;
+                        delta_by_row[row] = record >> 31u;
+                    } else {
+                        uint state_byte = uint(vq_state[
+                            state_offset + (state_index >> 1)
+                        ]);
+                        state = (
+                            state_byte
+                            >> ((state_index & 1u) * 4u)
+                        ) & 15u;
+                        delta_by_row[row] = mfq_moe_read_bits(
+                            vq_aux + aux_offset,
+                            state_index,
+                            1u);
+                    }
+                    execution_records[row] = record;
                     weight_scales[row] =
                         row_anchors[row]
                         * vq_scales[scale_offset + state];
@@ -1390,10 +1676,15 @@ constexpr const char* kMoeSource = R"METAL(
                         row < MATRIX_ROWS;
                         ++row
                     ) {
-                        uint index = mfq_moe_read_bits(
-                            vq_indices + indices_offset,
-                            outputs[row] * vectors + vector,
-                            9u);
+                        uint index =
+                            uint(VQ_EXECUTION_LAYOUT) != 0u
+                                && cohort_execution_layout == 4u
+                            ? (execution_records[row]
+                                  >> (local_vector * 9u)) & 511u
+                            : mfq_moe_read_bits(
+                                  vq_indices + indices_offset,
+                                  outputs[row] * vectors + vector,
+                                  9u);
                         uint bank = delta_by_row[row];
                         float signed_delta =
                             bank != 0u ? -delta : delta;
@@ -1707,7 +1998,7 @@ constexpr const char* kMoeSource = R"METAL(
             ) {
                 uint output = min(
                     output_base + (
-                        uint(FUSED_SWIGLU) != 0u
+                        PACKED_SWIGLU
                             ? (row / ROWS_PER_SIMD) * uint(OUT)
                                 + row % ROWS_PER_SIMD
                             : row
@@ -1776,7 +2067,7 @@ constexpr const char* kMoeSource = R"METAL(
             ) {
                 uint output = min(
                     output_base + (
-                        uint(FUSED_SWIGLU) != 0u
+                        PACKED_SWIGLU
                             ? (row / ROWS_PER_SIMD) * uint(OUT)
                                 + row % ROWS_PER_SIMD
                             : row
@@ -1875,7 +2166,7 @@ constexpr const char* kMoeSource = R"METAL(
             for (uint row = 0u; row < MATRIX_ROWS; ++row) {
                 uint output = min(
                     output_base + (
-                        uint(FUSED_SWIGLU) != 0u
+                        PACKED_SWIGLU
                             ? (row / ROWS_PER_SIMD) * uint(OUT)
                                 + row % ROWS_PER_SIMD
                             : row
@@ -1922,7 +2213,7 @@ constexpr const char* kMoeSource = R"METAL(
             for (uint row = 0u; row < MATRIX_ROWS; ++row) {
                 uint output = min(
                     output_base + (
-                        uint(FUSED_SWIGLU) != 0u
+                        PACKED_SWIGLU
                             ? (row / ROWS_PER_SIMD) * uint(OUT)
                                 + row % ROWS_PER_SIMD
                             : row
@@ -1971,7 +2262,7 @@ constexpr const char* kMoeSource = R"METAL(
                 for (uint row = 0u; row < MATRIX_ROWS; ++row) {
                     uint output = min(
                         output_base + (
-                            uint(FUSED_SWIGLU) != 0u
+                            PACKED_SWIGLU
                                 ? (row / ROWS_PER_SIMD) * uint(OUT)
                                     + row % ROWS_PER_SIMD
                                 : row
@@ -2012,7 +2303,49 @@ constexpr const char* kMoeSource = R"METAL(
         }
     }
 
-    if (uint(FUSED_SWIGLU) != 0u) {
+    if (SPLIT_SWIGLU) {
+        for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+            float total = accumulators[row];
+            for (
+                uint offset = K_LANES >> 1;
+                offset > 0u;
+                offset >>= 1
+            ) {
+                total += simd_shuffle_down(total, offset);
+            }
+            if (k_lane == 0u) {
+                split_values[
+                    projection * ROWS_PER_PHYSICAL_SIMD
+                    + lane_group * ROWS_PER_SIMD
+                    + row
+                ] = T(total);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0u && k_lane == 0u) {
+            for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+                uint local_output =
+                    lane_group * ROWS_PER_SIMD + row;
+                uint output = output_tile * ROWS_PER_TG + local_output;
+                if (output < uint(OUT)) {
+                    // Preserve the exact unfused graph boundary: both
+                    // projections round before the elementwise activation.
+                    float gate = float(split_values[local_output]);
+                    float up = float(split_values[
+                        ROWS_PER_PHYSICAL_SIMD + local_output]);
+                    if (params[0] > 0.0f) {
+                        gate = min(gate, params[0]);
+                        up = clamp(up, -params[0], params[0]);
+                    }
+                    float activated = gate / (1.0f + exp(-gate));
+                    y[
+                        (token * uint(ROUTES) + route) * uint(OUT)
+                        + output
+                    ] = T(activated * up);
+                }
+            }
+        }
+    } else if (uint(FUSED_SWIGLU) != 0u) {
         for (
             uint row = 0u;
             row < ROWS_PER_SIMD;
@@ -2414,7 +2747,7 @@ struct NativeMoeConfig {
     int descriptor_size = 0;
     int variant_stride = 0;
     int shared_input = 0;
-    int jsc_execution_layout = 0;
+    int vq_execution_layout = 0;
     int family_mask = 0;
     int vq_profile_mask = 0;
     int has_nepq_residual = 0;
@@ -2803,7 +3136,7 @@ std::string native_moe_kernel_name(
         << "_rs" << config.rows_per_simd
         << "_vs" << config.variant_stride
         << "_si" << config.shared_input
-        << "_jl" << config.jsc_execution_layout
+        << "_vl" << config.vq_execution_layout
         << "_fm" << config.family_mask
         << "_vm" << config.vq_profile_mask
         << "_nr" << config.has_nepq_residual
@@ -2887,8 +3220,8 @@ std::string make_native_moe_source(
         << config.variant_stride << ";\n"
         << "constexpr int SHARED_INPUT = "
         << config.shared_input << ";\n"
-        << "constexpr int JSC_EXECUTION_LAYOUT = "
-        << config.jsc_execution_layout << ";\n"
+        << "constexpr int VQ_EXECUTION_LAYOUT = "
+        << config.vq_execution_layout << ";\n"
         << "constexpr int FAMILY_MASK = "
         << config.family_mask << ";\n"
         << "constexpr int VQ_PROFILE_MASK = "
@@ -3010,6 +3343,506 @@ array native_moe_dispatch(
         std::make_shared<NativeMfePrimitive>(
             stream,
             std::move(config)),
+        std::move(inputs));
+}
+
+// Adapted from oMLX's two-launch Qwen routed-decode topology (Apache-2.0):
+// the first expert launch runs routed and shared Gate/Up with their SwiGLU
+// epilogues plus the shared gate; the second assigns one SIMD group to every
+// routed expert and one to the shared expert, then combines in-threadgroup.
+// MFQ deliberately computes top-k once with its parallel router kernel before
+// these launches. Repeating the selection in every output block is profitable
+// for oMLX's uniform QMV layout but duplicates substantially more work across
+// MFQ's finer heterogeneous descriptor blocks.
+
+struct MfeNintDecodeConfig {
+    Dtype dtype;
+    Dtype shared_gate_dtype;
+    Shape stage_one_shape;
+    Shape output_shape;
+    int routes = 0;
+    int experts = 0;
+    int hidden = 0;
+    int intermediate = 0;
+    int descriptor_size = 0;
+    int gate_family_mask = 0;
+    int gate_vq_profile_mask = 0;
+    int gate_vq_execution_layout = 0;
+    int gate_has_nepq_residual = 0;
+    int gate_npq_grouped_indices = 0;
+    int down_family_mask = 0;
+    int down_vq_profile_mask = 0;
+    int down_vq_execution_layout = 0;
+    int down_has_nepq_residual = 0;
+    int down_npq_grouped_indices = 0;
+    int shared_gate_group_size = 0;
+    int shared_gate_groups = 0;
+    int shared_down_group_size = 0;
+    int shared_down_groups = 0;
+    int k_lanes = 8;
+    int down_rows_per_simd = 1;
+    int stage_one_workgroups = 0;
+    int stage_two_workgroups = 0;
+};
+
+std::string metal_activation_type(Dtype dtype) {
+    if (dtype == mlx::core::float16) return "half";
+    if (dtype == mlx::core::bfloat16) return "bfloat";
+    if (dtype == mlx::core::float32) return "float";
+    throw std::invalid_argument("unsupported fused MoE activation dtype");
+}
+
+std::string mfe_decode_kernel_name(
+    const MfeNintDecodeConfig& config,
+    int stage) {
+    std::ostringstream name;
+    name << "mfq_mfe_nint_decode_stage" << stage
+         << "_r" << config.routes
+         << "_e" << config.experts
+         << "_h" << config.hidden
+         << "_i" << config.intermediate
+         << "_gf" << config.gate_family_mask
+         << "_gv" << config.gate_vq_profile_mask
+         << "_df" << config.down_family_mask
+         << "_dv" << config.down_vq_profile_mask
+         << "_ggs" << config.shared_gate_group_size
+         << "_gg" << config.shared_gate_groups
+         << "_dgs" << config.shared_down_group_size
+         << "_dg" << config.shared_down_groups
+         << "_kl" << config.k_lanes
+         << "_dr" << config.down_rows_per_simd
+         << "_gt" << static_cast<int>(config.shared_gate_dtype.val());
+    return name.str();
+}
+
+void append_mfe_pool_arguments(std::ostringstream& source) {
+    source
+        << "device const int* descriptors [[buffer(0)]],\n"
+        << "device const uchar* nint_q [[buffer(1)]],\n"
+        << "device const uchar* nint_sub_scale [[buffer(2)]],\n"
+        << "device const uchar* nint_sub_min [[buffer(3)]],\n"
+        << "device const float* nint_anchor_scale [[buffer(4)]],\n"
+        << "device const float* nint_anchor_min [[buffer(5)]],\n"
+        << "device const int8_t* q8_q [[buffer(6)]],\n"
+        << "device const half* q8_scales [[buffer(7)]],\n"
+        << "device const uchar* vq_indices [[buffer(8)]],\n"
+        << "device const uchar* vq_state [[buffer(9)]],\n"
+        << "device const uchar* vq_aux [[buffer(10)]],\n"
+        << "device const float* vq_anchors [[buffer(11)]],\n"
+        << "device const int8_t* vq_codebooks [[buffer(12)]],\n"
+        << "device const float* vq_scales [[buffer(13)]],\n"
+        << "device const uchar* vq_state_to_codebank [[buffer(14)]],\n"
+        << "device const uchar* vq_banks [[buffer(15)]],\n"
+        << "device const float* vq_parameters [[buffer(16)]],\n"
+        << "device const float* vq_residual_codebooks [[buffer(17)]],\n"
+        << "device const short* vq_residual_first [[buffer(18)]],\n"
+        << "device const short* vq_residual_second [[buffer(19)]],\n"
+        << "device const uchar* mx_values [[buffer(20)]],\n"
+        << "device const uchar* mx_scales [[buffer(21)]],\n";
+}
+
+std::string_view mfe_decode_body() {
+    static const std::string_view body = [] {
+        const std::string_view source(kMoeSource);
+        const auto begin = source.find("    uint descriptor_base = (\n");
+        const auto end = source.find("    if (SPLIT_SWIGLU) {\n", begin);
+        if (begin == std::string_view::npos || end == std::string_view::npos) {
+            throw std::logic_error("MFE decoder body markers are missing");
+        }
+        return source.substr(begin, end - begin);
+    }();
+    return body;
+}
+
+std::string mfe_swiglu_tail() {
+    const std::string_view source(kMoeSource);
+    const auto begin = source.find("    if (SPLIT_SWIGLU) {\n");
+    if (begin == std::string_view::npos) {
+        throw std::logic_error("MFE SwiGLU tail marker is missing");
+    }
+    std::string tail(source.substr(begin));
+    const std::string needle = "params[0]";
+    std::size_t offset = 0;
+    while ((offset = tail.find(needle, offset)) != std::string::npos) {
+        tail.replace(offset, needle.size(), "SWIGLU_LIMIT");
+        offset += std::string_view("SWIGLU_LIMIT").size();
+    }
+    return tail;
+}
+
+void append_mfe_decode_constants(
+    std::ostringstream& source,
+    const MfeNintDecodeConfig& config,
+    bool gate_up) {
+    source
+        << "constexpr int TOKENS = 1;\n"
+        << "constexpr int ROUTES = " << config.routes << ";\n"
+        << "constexpr int EXPERTS = " << config.experts << ";\n"
+        << "constexpr int OUT = "
+        << (gate_up ? config.intermediate : config.hidden) << ";\n"
+        << "constexpr int MATRIX_OUT = OUT;\n"
+        << "constexpr int PROJECTIONS = " << (gate_up ? 2 : 1) << ";\n"
+        << "constexpr int FUSED_SWIGLU = " << (gate_up ? 1 : 0) << ";\n"
+        << "constexpr int K = "
+        << (gate_up ? config.hidden : config.intermediate) << ";\n"
+        << "constexpr int K_LANES_VALUE = " << config.k_lanes << ";\n"
+        << "constexpr int ROWS_PER_SIMD_VALUE = "
+        << (gate_up ? 1 : config.down_rows_per_simd) << ";\n"
+        << "constexpr int DESCRIPTOR_SIZE = "
+        << config.descriptor_size << ";\n"
+        << "constexpr int VARIANT_STRIDE = ROUTES;\n"
+        << "constexpr int SHARED_INPUT = " << (gate_up ? 1 : 0) << ";\n"
+        << "constexpr int VQ_EXECUTION_LAYOUT = "
+        << (gate_up ? config.gate_vq_execution_layout
+                    : config.down_vq_execution_layout) << ";\n"
+        << "constexpr int FAMILY_MASK = "
+        << (gate_up ? config.gate_family_mask
+                    : config.down_family_mask) << ";\n"
+        << "constexpr int VQ_PROFILE_MASK = "
+        << (gate_up ? config.gate_vq_profile_mask
+                    : config.down_vq_profile_mask) << ";\n"
+        << "constexpr int HAS_NEPQ_RESIDUAL = "
+        << (gate_up ? config.gate_has_nepq_residual
+                    : config.down_has_nepq_residual) << ";\n"
+        << "constexpr int NPQ_GROUPED_INDICES = "
+        << (gate_up ? config.gate_npq_grouped_indices
+                    : config.down_npq_grouped_indices) << ";\n"
+        << "constexpr int SORTED_ROUTES = 0;\n"
+        << "constexpr int EXPERT_MAP_SIZE = 0;\n"
+        << "constexpr int PACKED_EXPERT_IDS = 0;\n";
+}
+
+std::string make_mfe_nint_gate_up_source(
+    const MfeNintDecodeConfig& config,
+    const std::string& kernel_name) {
+    std::ostringstream source;
+    source
+        << "#include <metal_stdlib>\nusing namespace metal;\n"
+        << "using T = " << metal_activation_type(config.dtype) << ";\n"
+        << "using SharedGateT = "
+        << metal_activation_type(config.shared_gate_dtype) << ";\n"
+        << kMoeHeader
+        << "kernel void " << kernel_name << "(\n";
+    append_mfe_pool_arguments(source);
+    source
+        << "device const T* x [[buffer(22)]],\n"
+        << "device const int* expert_ids [[buffer(23)]],\n"
+        << "device const uchar* shared_q [[buffer(24)]],\n"
+        << "device const uint* shared_row_metadata [[buffer(25)]],\n"
+        << "device const uchar* shared_sub_scale [[buffer(26)]],\n"
+        << "device const uchar* shared_sub_min [[buffer(27)]],\n"
+        << "device const SharedGateT* shared_gate_weight [[buffer(28)]],\n"
+        << "device T* y [[buffer(29)]],\n"
+        << "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]],\n"
+        << "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],\n"
+        << "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]) {\n";
+    append_mfe_decode_constants(source, config, true);
+    source
+        << "constexpr float SWIGLU_LIMIT = 0.0f;\n"
+        << "constexpr uint SIMD_GROUPS = 2u;\n"
+        << "constexpr uint K_LANES = uint(K_LANES_VALUE);\n"
+        << "constexpr uint LANE_GROUPS = 32u / K_LANES;\n"
+        << "constexpr uint ROWS_PER_SIMD = uint(ROWS_PER_SIMD_VALUE);\n"
+        << "constexpr bool SPLIT_SWIGLU = true;\n"
+        << "constexpr bool PACKED_SWIGLU = false;\n"
+        << "constexpr uint MATRIX_ROWS = ROWS_PER_SIMD;\n"
+        << "constexpr uint ROWS_PER_PHYSICAL_SIMD = LANE_GROUPS * ROWS_PER_SIMD;\n"
+        << "constexpr uint ROWS_PER_TG = ROWS_PER_PHYSICAL_SIMD;\n"
+        << "constexpr uint OUTPUT_TILES = (uint(OUT) + ROWS_PER_TG - 1u) / ROWS_PER_TG;\n"
+        << "constexpr uint ROUTED_SIZE = uint(ROUTES) * uint(OUT);\n"
+        << "constexpr uint SHARED_OFFSET = ROUTED_SIZE;\n"
+        << "constexpr uint GATE_OFFSET = SHARED_OFFSET + uint(OUT);\n"
+        << "uint lane = thread_index_in_simdgroup;\n"
+        << "uint k_lane = lane & (K_LANES - 1u);\n"
+        << "uint lane_group = lane / K_LANES;\n"
+        << "uint simd_group = simdgroup_index_in_threadgroup;\n"
+        << "uint workgroup = threadgroup_position_in_grid.x;\n"
+        << "if (workgroup == 0u) {\n"
+        << "  if (simd_group == 0u) {\n"
+        << "    float gate = 0.0f;\n"
+        << "    for (uint column = lane; column < uint(K); column += 32u)\n"
+        << "      gate = fma(float(x[column]), float(shared_gate_weight[column]), gate);\n"
+        << "    gate = simd_sum(gate);\n"
+        << "    if (lane == 0u) y[GATE_OFFSET] = T(gate);\n"
+        << "  }\n"
+        << "  return;\n"
+        << "}\n"
+        << "if (workgroup <= OUTPUT_TILES) {\n"
+        << "  uint output_tile = workgroup - 1u;\n"
+        << "  uint output_base = output_tile * ROWS_PER_TG + lane_group * ROWS_PER_SIMD;\n"
+        << "  float accumulators[ROWS_PER_SIMD] = {0.0f};\n"
+        << "  uint projection = simd_group;\n"
+        << "  for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {\n"
+        << "    uint output = min(output_base + row, uint(OUT) - 1u);\n"
+        << "    uint physical = projection * uint(OUT) + output;\n"
+        << "    uint metadata_base = physical * 4u;\n"
+        << "    uint layout = shared_row_metadata[metadata_base];\n"
+        << "    uint q_width = layout & 15u;\n"
+        << "    uint q_byte_offset = shared_row_metadata[metadata_base + 1u];\n"
+        << "    uint q_bit_shift = layout >> 4u;\n"
+        << "    float neuron_scale = as_type<float>(shared_row_metadata[metadata_base + 2u]);\n"
+        << "    float neuron_minimum = as_type<float>(shared_row_metadata[metadata_base + 3u]);\n"
+        << "    for (uint group = k_lane; group < uint(" << config.shared_gate_groups
+        << "); group += K_LANES) {\n"
+        << "      uint metadata = physical * uint(" << config.shared_gate_groups << ") + group;\n"
+        << "      float scale = neuron_scale * float(shared_sub_scale[metadata]);\n"
+        << "      float minimum = neuron_minimum * float(shared_sub_min[metadata]);\n"
+        << "      uint column_base = group * uint(" << config.shared_gate_group_size << ");\n"
+        << "      for (uint element = 0u; element < uint(" << config.shared_gate_group_size
+        << "); element += 4u) {\n"
+        << "        uint column = column_base + element;\n"
+        << "        float4 activation = float4(0.0f);\n"
+        << "        for (uint item = 0u; item < 4u; ++item)\n"
+        << "          if (element + item < uint(" << config.shared_gate_group_size
+        << ") && column + item < uint(K)) activation[item] = float(x[column + item]);\n"
+        << "        ushort4 quantized = mfq_moe_read_nint_row_quad(\n"
+        << "          shared_q, q_byte_offset, q_bit_shift, column, q_width);\n"
+        << "        accumulators[row] += dot(activation, scale * float4(quantized) - minimum);\n"
+        << "      }\n"
+        << "    }\n"
+        << "  }\n"
+        << "  threadgroup T values[2u * ROWS_PER_PHYSICAL_SIMD];\n"
+        << "  for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {\n"
+        << "    float total = accumulators[row];\n"
+        << "    for (uint offset = K_LANES >> 1; offset > 0u; offset >>= 1u)\n"
+        << "      total += simd_shuffle_down(total, offset);\n"
+        << "    if (k_lane == 0u) values[projection * ROWS_PER_PHYSICAL_SIMD + lane_group * ROWS_PER_SIMD + row] = T(total);\n"
+        << "  }\n"
+        << "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        << "  if (simd_group == 0u && k_lane == 0u) {\n"
+        << "    for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {\n"
+        << "      uint local = lane_group * ROWS_PER_SIMD + row;\n"
+        << "      uint output = output_tile * ROWS_PER_TG + local;\n"
+        << "      if (output < uint(OUT)) {\n"
+        << "        T gate = values[local]; T up = values[ROWS_PER_PHYSICAL_SIMD + local];\n"
+        << "        y[SHARED_OFFSET + output] = T((float(gate) / (1.0f + exp(-float(gate)))) * float(up));\n"
+        << "      }\n"
+        << "    }\n"
+        << "  }\n"
+        << "  return;\n"
+        << "}\n"
+        << "workgroup -= 1u + OUTPUT_TILES;\n"
+        << "uint output_tile = workgroup % OUTPUT_TILES;\n"
+        << "uint projection_index = workgroup / OUTPUT_TILES;\n"
+        << "uint projection = simd_group;\n"
+        << "uint sorted_slot = projection_index;\n"
+        << "uint route_index = sorted_slot;\n"
+        << "uint route = route_index;\n"
+        << "uint token = 0u;\n"
+        << "uint output_base = output_tile * ROWS_PER_TG + lane_group * ROWS_PER_SIMD;\n"
+        << "int logical_expert = expert_ids[route];\n"
+        << "int expert = logical_expert;\n";
+    source << mfe_decode_body();
+    source << mfe_swiglu_tail();
+    source << "\n}\n";
+    return source.str();
+}
+
+std::string make_mfe_nint_down_source(
+    const MfeNintDecodeConfig& config,
+    const std::string& kernel_name) {
+    std::ostringstream source;
+    source
+        << "#include <metal_stdlib>\nusing namespace metal;\n"
+        << "using T = " << metal_activation_type(config.dtype) << ";\n"
+        << kMoeHeader
+        << "kernel void " << kernel_name << "(\n";
+    append_mfe_pool_arguments(source);
+    source
+        << "device const T* x [[buffer(22)]],\n"
+        << "device const uchar* shared_q [[buffer(23)]],\n"
+        << "device const uint* shared_row_metadata [[buffer(24)]],\n"
+        << "device const uchar* shared_sub_scale [[buffer(25)]],\n"
+        << "device const uchar* shared_sub_min [[buffer(26)]],\n"
+        << "device const int* expert_ids [[buffer(27)]],\n"
+        << "device const float* route_weights [[buffer(28)]],\n"
+        << "device T* y [[buffer(29)]],\n"
+        << "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]],\n"
+        << "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],\n"
+        << "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]) {\n";
+    append_mfe_decode_constants(source, config, false);
+    source
+        << "constexpr uint K_LANES = uint(K_LANES_VALUE);\n"
+        << "constexpr uint LANE_GROUPS = 32u / K_LANES;\n"
+        << "constexpr uint ROWS_PER_SIMD = uint(ROWS_PER_SIMD_VALUE);\n"
+        << "constexpr bool SPLIT_SWIGLU = false;\n"
+        << "constexpr bool PACKED_SWIGLU = false;\n"
+        << "constexpr uint MATRIX_ROWS = ROWS_PER_SIMD;\n"
+        << "constexpr uint ROWS_PER_PHYSICAL_SIMD = LANE_GROUPS * ROWS_PER_SIMD;\n"
+        << "constexpr uint OUTPUT_TILES = (uint(OUT) + ROWS_PER_PHYSICAL_SIMD - 1u) / ROWS_PER_PHYSICAL_SIMD;\n"
+        << "constexpr uint ROUTED_SIZE = uint(ROUTES) * uint(K);\n"
+        << "constexpr uint SHARED_OFFSET = ROUTED_SIZE;\n"
+        << "constexpr uint GATE_OFFSET = SHARED_OFFSET + uint(K);\n"
+        << "uint lane = thread_index_in_simdgroup;\n"
+        << "uint k_lane = lane & (K_LANES - 1u);\n"
+        << "uint lane_group = lane / K_LANES;\n"
+        << "uint route = simdgroup_index_in_threadgroup;\n"
+        << "uint output_tile = threadgroup_position_in_grid.x;\n"
+        << "uint output_base = output_tile * ROWS_PER_PHYSICAL_SIMD + lane_group * ROWS_PER_SIMD;\n"
+        << "threadgroup T partials[(ROUTES + 1) * ROWS_PER_PHYSICAL_SIMD];\n"
+        << "if (route < uint(ROUTES)) {\n"
+        << "  int expert = expert_ids[route];\n"
+        << "  uint projection = 0u; uint token = 0u;\n"
+        << "  if (expert >= 0 && expert < EXPERTS) {\n";
+    source << mfe_decode_body();
+    source
+        << "    for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {\n"
+        << "      float total = accumulators[row];\n"
+        << "      for (uint offset = K_LANES >> 1; offset > 0u; offset >>= 1u) total += simd_shuffle_down(total, offset);\n"
+        << "      if (k_lane == 0u) partials[route * ROWS_PER_PHYSICAL_SIMD + lane_group * ROWS_PER_SIMD + row] = T(total);\n"
+        << "    }\n"
+        << "  } else if (k_lane == 0u) {\n"
+        << "    for (uint row = 0u; row < ROWS_PER_SIMD; ++row) partials[route * ROWS_PER_PHYSICAL_SIMD + lane_group * ROWS_PER_SIMD + row] = T(0.0f);\n"
+        << "  }\n"
+        << "} else {\n"
+        << "  float accumulators[ROWS_PER_SIMD] = {0.0f};\n"
+        << "  for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {\n"
+        << "    uint output = min(output_base + row, uint(OUT) - 1u);\n"
+        << "    uint metadata_base = output * 4u;\n"
+        << "    uint layout = shared_row_metadata[metadata_base];\n"
+        << "    uint q_width = layout & 15u; uint q_byte_offset = shared_row_metadata[metadata_base + 1u];\n"
+        << "    uint q_bit_shift = layout >> 4u;\n"
+        << "    float neuron_scale = as_type<float>(shared_row_metadata[metadata_base + 2u]);\n"
+        << "    float neuron_minimum = as_type<float>(shared_row_metadata[metadata_base + 3u]);\n"
+        << "    for (uint group = k_lane; group < uint(" << config.shared_down_groups
+        << "); group += K_LANES) {\n"
+        << "      uint metadata = output * uint(" << config.shared_down_groups << ") + group;\n"
+        << "      float scale = neuron_scale * float(shared_sub_scale[metadata]);\n"
+        << "      float minimum = neuron_minimum * float(shared_sub_min[metadata]);\n"
+        << "      uint column_base = group * uint(" << config.shared_down_group_size << ");\n"
+        << "      for (uint element = 0u; element < uint(" << config.shared_down_group_size
+        << "); element += 4u) {\n"
+        << "        uint column = column_base + element; float4 activation = float4(0.0f);\n"
+        << "        for (uint item = 0u; item < 4u; ++item) if (element + item < uint("
+        << config.shared_down_group_size << ") && column + item < uint(K)) activation[item] = float(x[SHARED_OFFSET + column + item]);\n"
+        << "        ushort4 quantized = mfq_moe_read_nint_row_quad(shared_q, q_byte_offset, q_bit_shift, column, q_width);\n"
+        << "        accumulators[row] += dot(activation, scale * float4(quantized) - minimum);\n"
+        << "      }\n"
+        << "    }\n"
+        << "  }\n"
+        << "  for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {\n"
+        << "    float total = accumulators[row];\n"
+        << "    for (uint offset = K_LANES >> 1; offset > 0u; offset >>= 1u) total += simd_shuffle_down(total, offset);\n"
+        << "    if (k_lane == 0u) partials[uint(ROUTES) * ROWS_PER_PHYSICAL_SIMD + lane_group * ROWS_PER_SIMD + row] = T(total);\n"
+        << "  }\n"
+        << "}\n"
+        << "threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        << "if (route == 0u && k_lane == 0u) {\n"
+        << "  float gate = float(x[GATE_OFFSET]); float shared_scale = 1.0f / (1.0f + exp(-gate));\n"
+        << "  for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {\n"
+        << "    uint local = lane_group * ROWS_PER_SIMD + row; uint output = output_tile * ROWS_PER_PHYSICAL_SIMD + local;\n"
+        << "    if (output < uint(OUT)) {\n"
+        << "      float total = 0.0f;\n"
+        << "      for (uint selected = 0u; selected < uint(ROUTES); ++selected)\n"
+        << "        total = fma(float(partials[selected * ROWS_PER_PHYSICAL_SIMD + local]), route_weights[selected], total);\n"
+        << "      total += shared_scale * float(partials[uint(ROUTES) * ROWS_PER_PHYSICAL_SIMD + local]);\n"
+        << "      y[output] = T(total);\n"
+        << "    }\n"
+        << "  }\n"
+        << "}\n}\n";
+    return source.str();
+}
+
+class MfeNintDecodePrimitive final : public mlx::core::UnaryPrimitive {
+public:
+    MfeNintDecodePrimitive(
+        mlx::core::Stream stream,
+        MfeNintDecodeConfig config,
+        int stage)
+        : UnaryPrimitive(stream),
+          config_(std::move(config)),
+          stage_(stage),
+          kernel_name_(mfe_decode_kernel_name(config_, stage_)) {}
+
+    void eval_cpu(const std::vector<array>&, array&) override {
+        throw std::runtime_error(
+            "two-stage MFE/NINT decode has no CPU path");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        array& output) override {
+        constexpr int input_count = 29;
+        if (inputs.size() != static_cast<std::size_t>(input_count)) {
+            throw std::logic_error(
+                "two-stage MFE/NINT decode input count mismatch");
+        }
+        output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        auto& selected_stream = stream();
+        auto& device = mlx::core::metal::device(selected_stream.device);
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(
+            kernel_name_,
+            options,
+            [config = config_, name = kernel_name_, stage = stage_] {
+                return stage == 1
+                    ? make_mfe_nint_gate_up_source(config, name)
+                    : make_mfe_nint_down_source(config, name);
+            });
+        auto* kernel = device.get_kernel(kernel_name_, library);
+        auto& encoder = mlx::core::metal::get_command_encoder(
+            selected_stream);
+        encoder.set_compute_pipeline_state(kernel);
+        for (int index = 0; index < input_count; ++index) {
+            encoder.set_input_array(
+                inputs[static_cast<std::size_t>(index)], index);
+        }
+        encoder.set_output_array(output, input_count);
+        encoder.dispatch_threadgroups(
+            MTL::Size(
+                stage_ == 1
+                    ? config_.stage_one_workgroups
+                    : config_.stage_two_workgroups,
+                1,
+                1),
+            MTL::Size(
+                stage_ == 1
+                    ? 64
+                    : (config_.routes + 1) * 32,
+                1,
+                1));
+    }
+
+    const char* name() const override {
+        return "MfeNintDecodePrimitive";
+    }
+
+    bool is_equivalent(const mlx::core::Primitive& other) const override {
+        const auto* primitive =
+            dynamic_cast<const MfeNintDecodePrimitive*>(&other);
+        return primitive != nullptr &&
+            primitive->kernel_name_ == kernel_name_;
+    }
+
+    std::vector<Shape> output_shapes(
+        const std::vector<array>&) override {
+        return {stage_ == 1
+            ? config_.stage_one_shape
+            : config_.output_shape};
+    }
+
+private:
+    MfeNintDecodeConfig config_;
+    int stage_ = 0;
+    std::string kernel_name_;
+};
+
+array mfe_nint_decode_dispatch(
+    std::vector<array> inputs,
+    const MfeNintDecodeConfig& config,
+    int stage) {
+    auto stream = mlx::core::default_stream(
+        mlx::core::default_device());
+    if (stream.device != mlx::core::Device::gpu) {
+        throw std::invalid_argument(
+            "two-stage MFE/NINT decode requires the Metal device");
+    }
+    return array(
+        stage == 1 ? config.stage_one_shape : config.output_shape,
+        config.dtype,
+        std::make_shared<MfeNintDecodePrimitive>(
+            stream, config, stage),
         std::move(inputs));
 }
 
@@ -4340,7 +5173,7 @@ MlxNintWeight add_nint_pool(
         descriptors[base + kNintQOffset] = q_offset;
         descriptors[base + kNintSubOffset] = sub_offset;
         descriptors[base + kNintAnchorOffset] = anchor_offset;
-        descriptors[base + kNintQ5Execution] = 0;
+        descriptors[base + kNintExecution] = 0;
         descriptors[base + kNintRowQLayoutOffset] = row_layout_offset;
         descriptors[base + kNintRowQByteOffsetsOffset] =
             row_byte_offsets_offset;
@@ -4862,15 +5695,32 @@ MlxVqWeight add_vq_pool(
     const char* jsc_exec_env = std::getenv(
         "MFQ_METAL_MFE_JSC_EXEC");
     const auto& profile = weight.format_label();
+    const bool group64_execution =
+        profile == "NVQ2J-XL"
+        && weight.execution_layout() == 1;
     const bool packed_jsc_execution =
-        (profile == "NVQ2J" || profile == "NVQ3J")
+        !group64_execution
+        && (
+            profile == "NVQ2J"
+            || profile == "NVQ3J"
+            || profile == "NVQ3J-512"
+            || profile == "NVQ2J-L"
+            || profile == "NVQ2J-XL"
+            || profile == "NVQ3J-L"
+        )
         && (
             jsc_exec_env == nullptr
             || std::string_view(jsc_exec_env) != "0"
         );
-    const bool group64_execution =
-        profile == "NVQ2J-XL"
-        && weight.execution_layout() == 1;
+    const bool wide_jsc_execution =
+        packed_jsc_execution && weight.index_bits() > 8;
+    const bool packed_nvq1s_execution =
+        profile == "NVQ1-S"
+        && weight.group_size() == 24
+        && weight.vector_size() == 8
+        && weight.index_bits() == 9
+        && weight.state_bits() == 4
+        && weight.aux_mode() == 3;
     const bool jsc_execution =
         packed_jsc_execution || group64_execution;
     detail::StagingVector<std::uint8_t>
@@ -4885,8 +5735,9 @@ MlxVqWeight add_vq_pool(
         const auto* aux_data =
             packed_aux.data<std::uint8_t>();
         const int signs = (neuron_len + 7) / 8;
-        const int bytes_per_sign =
-            weight.vector_size() == 4 ? 3 : 2;
+        const int bytes_per_sign = wide_jsc_execution
+            ? (weight.vector_size() == 4 ? 4 : 3)
+            : (weight.vector_size() == 4 ? 3 : 2);
         const auto execution_bytes = checked_product(
             checked_product(
                 expected_rows,
@@ -4907,6 +5758,26 @@ MlxVqWeight add_vq_pool(
             }
             return (packed >> shift) & 0x7fu;
         };
+        const auto read_index = [&](std::size_t linear) {
+            if (weight.index_bits() == 8) {
+                return static_cast<std::uint32_t>(index_data[linear]);
+            }
+            const auto bit = linear * static_cast<std::size_t>(
+                weight.index_bits());
+            const auto byte = bit >> 3;
+            const int shift = static_cast<int>(bit & 7u);
+            std::uint32_t packed = index_data[byte];
+            if (byte + 1 < packed_indices.size()) {
+                packed |= static_cast<std::uint32_t>(
+                    index_data[byte + 1]) << 8u;
+            }
+            if (byte + 2 < packed_indices.size()) {
+                packed |= static_cast<std::uint32_t>(
+                    index_data[byte + 2]) << 16u;
+            }
+            return (packed >> shift)
+                & ((std::uint32_t{1} << weight.index_bits()) - 1u);
+        };
         const auto pack_rows = [&](std::size_t begin, std::size_t end) {
             for (std::size_t row = begin; row < end; ++row) {
                 for (int sign = 0; sign < signs; ++sign) {
@@ -4918,24 +5789,42 @@ MlxVqWeight add_vq_pool(
                         static_cast<std::size_t>(
                             sign)
                         * (weight.vector_size() == 4 ? 2 : 1);
-                    jsc_execution_indices[target] =
-                        index_data[
-                            row * weight.vectors()
-                            + first_vector];
-                    if (weight.vector_size() == 4) {
-                        jsc_execution_indices[target + 1] =
-                            index_data[
-                                row * weight.vectors()
-                                + first_vector + 1];
-                    }
+                    const auto index0 = read_index(
+                        row * weight.vectors() + first_vector);
+                    const auto index1 = weight.vector_size() == 4
+                        ? read_index(
+                              row * weight.vectors() + first_vector + 1)
+                        : 0u;
                     const auto mask7 = read_aux(
                         source_sign);
                     const auto parity =
                         std::popcount(mask7) & 1u;
-                    jsc_execution_indices[
-                        target + bytes_per_sign - 1] =
-                        static_cast<std::uint8_t>(
-                            mask7 | (parity << 7));
+                    const auto sign_value = mask7 | (parity << 7);
+                    if (wide_jsc_execution) {
+                        const int index_count =
+                            weight.vector_size() == 4 ? 2 : 1;
+                        std::uint32_t record = index0;
+                        if (index_count == 2) {
+                            record |= index1 << weight.index_bits();
+                        }
+                        record |= sign_value << (
+                            weight.index_bits() * index_count);
+                        for (int byte = 0; byte < bytes_per_sign; ++byte) {
+                            jsc_execution_indices[target + byte] =
+                                static_cast<std::uint8_t>(
+                                    record >> (8 * byte));
+                        }
+                    } else {
+                        jsc_execution_indices[target] =
+                            static_cast<std::uint8_t>(index0);
+                        if (weight.vector_size() == 4) {
+                            jsc_execution_indices[target + 1] =
+                                static_cast<std::uint8_t>(index1);
+                        }
+                        jsc_execution_indices[
+                            target + bytes_per_sign - 1] =
+                            static_cast<std::uint8_t>(sign_value);
+                    }
                 }
             }
         };
@@ -4959,6 +5848,113 @@ MlxVqWeight add_vq_pool(
                     expected_rows * worker / worker_count;
                 const auto end =
                     expected_rows * (worker + 1) / worker_count;
+                workers.emplace_back(pack_rows, begin, end);
+            }
+            for (auto& worker : workers) {
+                worker.join();
+            }
+        }
+    }
+
+    // NVQ1-S has exactly three 9-bit indices, one 4-bit state, and one
+    // delta-sign bit per 24-weight group.  Interleave those fields into one
+    // 32-bit execution record: it is effectively storage-neutral and removes
+    // five unrelated packed-bit lookups from the hot decoder loop.
+    detail::StagingVector<std::uint8_t>
+        nvq1s_execution_indices;
+    if (packed_nvq1s_execution) {
+        auto packed_indices = weight.packed_indices();
+        auto packed_states = weight.packed_states();
+        auto packed_aux = weight.packed_auxiliary();
+        packed_indices.eval();
+        packed_states.eval();
+        packed_aux.eval();
+        const auto* index_data = packed_indices.data<std::uint8_t>();
+        const auto* state_data = packed_states.data<std::uint8_t>();
+        const auto* aux_data = packed_aux.data<std::uint8_t>();
+        const auto read_bits = [](
+            const std::uint8_t* data,
+            std::size_t size,
+            std::size_t linear,
+            int bits) {
+            const auto bit = linear * static_cast<std::size_t>(bits);
+            const auto byte = bit >> 3;
+            const int shift = static_cast<int>(bit & 7u);
+            std::uint32_t packed = data[byte];
+            if (byte + 1 < size) {
+                packed |= static_cast<std::uint32_t>(
+                    data[byte + 1]) << 8u;
+            }
+            if (byte + 2 < size) {
+                packed |= static_cast<std::uint32_t>(
+                    data[byte + 2]) << 16u;
+            }
+            return (packed >> shift)
+                & ((std::uint32_t{1} << bits) - 1u);
+        };
+        const auto records = checked_product(
+            expected_rows,
+            static_cast<std::size_t>(weight.groups()),
+            "NVQ1-S execution record count");
+        const auto execution_bytes = checked_product(
+            records,
+            sizeof(std::uint32_t),
+            "NVQ1-S execution stream size");
+        nvq1s_execution_indices.resize(execution_bytes);
+        const auto pack_rows = [&](std::size_t begin, std::size_t end) {
+            for (std::size_t row = begin; row < end; ++row) {
+                for (int group = 0; group < weight.groups(); ++group) {
+                    const auto state_index =
+                        row * static_cast<std::size_t>(weight.groups())
+                        + static_cast<std::size_t>(group);
+                    const auto first_vector =
+                        static_cast<std::size_t>(group) * 3u;
+                    std::uint32_t record = 0;
+                    for (int local = 0; local < 3; ++local) {
+                        const auto vector = first_vector
+                            + static_cast<std::size_t>(local);
+                        const auto index = vector <
+                                static_cast<std::size_t>(weight.vectors())
+                            ? read_bits(
+                                  index_data,
+                                  packed_indices.size(),
+                                  row * static_cast<std::size_t>(weight.vectors())
+                                      + vector,
+                                  9)
+                            : 0u;
+                        record |= index << (9 * local);
+                    }
+                    record |= read_bits(
+                        state_data,
+                        packed_states.size(),
+                        state_index,
+                        4) << 27u;
+                    record |= read_bits(
+                        aux_data,
+                        packed_aux.size(),
+                        state_index,
+                        1) << 31u;
+                    const auto target = state_index * sizeof(record);
+                    for (int byte = 0; byte < 4; ++byte) {
+                        nvq1s_execution_indices[target + byte] =
+                            static_cast<std::uint8_t>(record >> (8 * byte));
+                    }
+                }
+            }
+        };
+        constexpr std::size_t kParallelThreshold =
+            8u * 1024u * 1024u;
+        const auto worker_count = execution_bytes >= kParallelThreshold
+            ? std::min<std::size_t>(8, expected_rows)
+            : 1;
+        if (worker_count == 1) {
+            pack_rows(0, expected_rows);
+        } else {
+            std::vector<std::thread> workers;
+            workers.reserve(worker_count);
+            for (std::size_t worker = 0; worker < worker_count; ++worker) {
+                const auto begin = expected_rows * worker / worker_count;
+                const auto end = expected_rows * (worker + 1) / worker_count;
                 workers.emplace_back(pack_rows, begin, end);
             }
             for (auto& worker : workers) {
@@ -5079,6 +6075,8 @@ MlxVqWeight add_vq_pool(
         const int execution_profile =
             profile == "NVQ2J-L" || profile == "NVQ2J-XL"
                 ? kVqProfileJscExtended8
+                : profile == "NVQ3J-512" || profile == "NVQ3J-L"
+                ? kVqProfileJscExtended4
                 : profile == "NVQ2J" || profile == "NVQ3J"
                 ? (
                     weight.vector_size() == 4
@@ -5112,10 +6110,14 @@ MlxVqWeight add_vq_pool(
             execution_profile
             | (weight.residual_position_bits() << 8)
             | (weight.residual_block_vectors() << 16);
-        descriptors[base + kVqJscExecution] =
+        descriptors[base + kVqExecutionLayout] =
             group64_execution
                 ? 2
-                : static_cast<int>(packed_jsc_execution);
+                : packed_jsc_execution
+                    ? (wide_jsc_execution ? 3 : 1)
+                    : packed_nvq1s_execution
+                        ? 4
+                    : 0;
         descriptors[base + kVqResidualCodebookOffset] =
             residual_codebook_offset;
         descriptors[base + kVqResidualRecordOffset] =
@@ -5133,6 +6135,11 @@ MlxVqWeight add_vq_pool(
             streams.vq_indices.end(),
             jsc_execution_indices.begin(),
             jsc_execution_indices.end());
+    } else if (packed_nvq1s_execution) {
+        streams.vq_indices.insert(
+            streams.vq_indices.end(),
+            nvq1s_execution_indices.begin(),
+            nvq1s_execution_indices.end());
     } else {
         append_raw(
             streams.vq_indices,
@@ -5140,12 +6147,14 @@ MlxVqWeight add_vq_pool(
             mlx::core::uint8,
             "VQ indices");
     }
-    append_raw(
-        streams.vq_state,
-        weight.packed_states(),
-        mlx::core::uint8,
-        "VQ states");
-    if (!jsc_execution) {
+    if (!packed_nvq1s_execution) {
+        append_raw(
+            streams.vq_state,
+            weight.packed_states(),
+            mlx::core::uint8,
+            "VQ states");
+    }
+    if (!jsc_execution && !packed_nvq1s_execution) {
         append_raw(
             streams.vq_aux,
             weight.packed_auxiliary(),
@@ -5990,19 +6999,19 @@ MfeNvqJscStreamLayout parse_streamed_nvq1_layout(
     const bool long_profile = std::memcmp(header.data(), "NQ1L", 4) == 0;
     const int profile = header[4];
     const int state_bits = header[5];
-    const auto group_size = tpq_scalar<std::uint16_t>(header, 6, "NVQ1 group size");
+    const auto group_size = read_scalar<std::uint16_t>(header, 6, "NVQ1 group size");
     if ((!short_profile && !long_profile) ||
         (short_profile && (profile != 1 || state_bits != 4 ||
                            group_size != 24 || expected_columns % 8 != 0)) ||
         (long_profile && ((profile != 1 && profile != 2) ||
                           state_bits < 1 || state_bits > 8 ||
                           group_size == 0 || group_size % 8 != 0)) ||
-        tpq_scalar<std::int32_t>(header, 8, "NVQ1 axis") != 0 ||
-        tpq_scalar<std::int32_t>(header, 12, "NVQ1 width") != expected_columns ||
-        tpq_scalar<std::uint32_t>(header, 16, "NVQ1 dimensions") != 2 ||
-        tpq_scalar<std::int64_t>(header, 20, "NVQ1 rows") != expected_rows ||
-        tpq_scalar<std::int64_t>(header, 28, "NVQ1 columns") != expected_columns ||
-        tpq_scalar<std::uint32_t>(header, 36, "NVQ1 output size") !=
+        read_scalar<std::int32_t>(header, 8, "NVQ1 axis") != 0 ||
+        read_scalar<std::int32_t>(header, 12, "NVQ1 width") != expected_columns ||
+        read_scalar<std::uint32_t>(header, 16, "NVQ1 dimensions") != 2 ||
+        read_scalar<std::int64_t>(header, 20, "NVQ1 rows") != expected_rows ||
+        read_scalar<std::int64_t>(header, 28, "NVQ1 columns") != expected_columns ||
+        read_scalar<std::uint32_t>(header, 36, "NVQ1 output size") !=
             static_cast<std::uint32_t>(expected_rows)) {
         throw std::runtime_error("invalid streamed NVQ1 geometry: " + name);
     }
@@ -6985,6 +7994,12 @@ struct MlxMfeWeight::Impl {
     array vq_residual_second;
     array mx_values;
     array mx_scales;
+    // Metal kernels address packed pools through descriptor offsets, so their
+    // logical MLX shape is not part of the ABI. Prefix views retain the same
+    // backing buffer and base address while preventing MLX's command-buffer
+    // heuristic from counting every resident expert as touched by each
+    // decode launch.
+    std::vector<array> narrow_bindings;
     std::vector<RotationSpec> rotations;
     std::vector<std::int32_t> descriptor_values;
     std::vector<std::shared_ptr<const Impl>> projection_views;
@@ -7004,7 +8019,7 @@ struct MlxMfeWeight::Impl {
     int logical_experts = 0;
     std::uint32_t family_mask = 0;
     std::uint32_t vq_profile_mask = 0;
-    bool jsc_execution_layout = false;
+    bool vq_execution_layout = false;
     bool npq_grouped_indices = true;
     bool native_primitive = true;
     bool grouped_mmq = false;
@@ -7097,7 +8112,7 @@ struct MlxMfeWeight::Impl {
             if (family == kFamilyVq) {
                 const auto profile = descriptor_values[
                     base + kVqProfile] & 255;
-                if (profile >= 0 && profile < 8) {
+                if (profile >= 0 && profile < 9) {
                     vq_profile_mask |= std::uint32_t{1}
                         << static_cast<unsigned>(profile);
                 }
@@ -7142,9 +8157,9 @@ struct MlxMfeWeight::Impl {
             }
             if (
                 descriptor_values[
-                    base + kVqJscExecution] != 0
+                    base + kVqExecutionLayout] != 0
             ) {
-                jsc_execution_layout = true;
+                vq_execution_layout = true;
             }
         }
         if (
@@ -7284,7 +8299,7 @@ struct MlxMfeWeight::Impl {
             && std::string_view(specialize_env) == "0"
         ) {
             family_mask = 126;
-            vq_profile_mask = 255;
+            vq_profile_mask = 511;
         }
         const char* npq_indices_env = std::getenv(
             "MFQ_METAL_MFE_NPQ_INDICES");
@@ -7333,6 +8348,40 @@ struct MlxMfeWeight::Impl {
         for (const auto& rotation : rotations) {
             packed_bytes += rotation.signs.nbytes();
         }
+
+        const auto narrow = [](const array& source) {
+            if (source.ndim() == 0 || source.size() <= 1) {
+                return source;
+            }
+            Shape begin(static_cast<std::size_t>(source.ndim()), 0);
+            Shape end = source.shape();
+            end.front() = 1;
+            return mlx::core::slice(source, std::move(begin), std::move(end));
+        };
+        narrow_bindings = {
+            descriptors,
+            narrow(nint_q),
+            narrow(nint_sub_scale),
+            narrow(nint_sub_min),
+            narrow(nint_anchor_scale),
+            narrow(nint_anchor_min),
+            narrow(q8_q),
+            narrow(q8_scales),
+            narrow(vq_indices),
+            narrow(vq_state),
+            narrow(vq_aux),
+            narrow(vq_anchors),
+            narrow(vq_codebooks),
+            narrow(vq_scales),
+            narrow(vq_state_to_codebank),
+            narrow(vq_banks),
+            narrow(vq_parameters),
+            narrow(vq_residual_codebooks),
+            narrow(vq_residual_first),
+            narrow(vq_residual_second),
+            narrow(mx_values),
+            narrow(mx_scales),
+        };
     }
 };
 
@@ -8360,6 +9409,12 @@ MlxMfeWeight MlxMfeWeight::concatenate_projections(
         [](const MlxMfeWeight& weight) {
             return weight.impl_->automatic_mxfp4_nax_prefill;
         });
+    impl->has_generic_cohorts = std::all_of(
+        weights.begin(),
+        weights.end(),
+        [](const MlxMfeWeight& weight) {
+            return weight.impl_->has_generic_cohorts;
+        });
     impl->logical_experts = first.logical_experts > 0
         ? first.logical_experts
         : first.experts;
@@ -8890,6 +9945,22 @@ array MlxMfeWeight::routed_swiglu(
                 true,
                 limit);
         }
+        const bool has_standalone_projection = std::any_of(
+            impl_->projection_views.begin(),
+            impl_->projection_views.end(),
+            [](const auto& projection) {
+                return !projection->mxfp4_sq_cohorts.empty()
+                    || !projection->fp8_sq_cohorts.empty();
+            });
+        if (mfe_split_swiglu_enabled()
+            && impl_->native_primitive
+            && !has_standalone_projection) {
+            return routed_matmul_impl(
+                input,
+                expert_ids,
+                true,
+                limit);
+        }
         auto gate_up = routed_matmul_impl(
             input,
             expert_ids,
@@ -9104,6 +10175,178 @@ array MlxMfeWeight::routed_swiglu_pair(
         });
 }
 
+std::optional<array> MlxMfeWeight::decode_nint_shared(
+    const MlxMfeWeight& down,
+    const MlxNintSwiGluPair& shared_gate_up,
+    const MlxNintWeight& shared_down,
+    const array& shared_gate_weight,
+    const array& input,
+    const array& expert_ids,
+    const array& route_weights) const {
+    const auto supported_impl = [](const Impl& impl, int projections) {
+        return impl.native_primitive &&
+            impl.projections == projections &&
+            impl.rotations.empty() &&
+            impl.reference_cohorts.empty() &&
+            impl.mxfp4_sq_cohorts.empty() &&
+            impl.fp8_sq_cohorts.empty() &&
+            !impl.standalone_owner.has_value() &&
+            impl.has_generic_cohorts &&
+            impl.descriptor_values.size() ==
+                static_cast<std::size_t>(impl.experts) *
+                    static_cast<std::size_t>(projections) *
+                    kDescriptorSize &&
+            impl.narrow_bindings.size() == 22;
+    };
+    const bool activation16 =
+        input.dtype() == mlx::core::float16 ||
+        input.dtype() == mlx::core::bfloat16;
+    const bool shared_gate16 =
+        shared_gate_weight.dtype() == mlx::core::float16 ||
+        shared_gate_weight.dtype() == mlx::core::bfloat16;
+    const int routes = expert_ids.ndim() == 2
+        ? expert_ids.shape(1) : 0;
+    const bool supported = !mlx_reference_enabled() &&
+        routes > 0 && routes <= 16 &&
+        (routes + 1) * 32 <= 1024 &&
+        impl_->experts > 0 && impl_->experts % 32 == 0 &&
+        routes <= impl_->experts &&
+        supported_impl(*impl_, 2) &&
+        supported_impl(*down.impl_, 1) &&
+        impl_->experts == down.impl_->experts &&
+        impl_->out_per_expert > 0 &&
+        impl_->neuron_len > 0 &&
+        down.impl_->out_per_expert == impl_->neuron_len &&
+        down.impl_->neuron_len == impl_->out_per_expert &&
+        input.ndim() == 2 && input.shape(0) == 1 &&
+        input.shape(1) == impl_->neuron_len && activation16 &&
+        expert_ids.dtype() == mlx::core::int32 &&
+        expert_ids.shape() == Shape{1, routes} &&
+        route_weights.dtype() == mlx::core::float32 &&
+        route_weights.shape() == Shape{1, routes} &&
+        shared_gate_up.input_size() == impl_->neuron_len &&
+        shared_gate_up.output_size() == impl_->out_per_expert &&
+        shared_down.input_size() == impl_->out_per_expert &&
+        shared_down.output_size() == impl_->neuron_len &&
+        shared_gate_weight.ndim() == 2 &&
+        shared_gate_weight.shape(0) == 1 &&
+        shared_gate_weight.shape(1) == impl_->neuron_len &&
+        shared_gate_weight.flags().row_contiguous && shared_gate16;
+    if (!supported) {
+        return std::nullopt;
+    }
+
+    auto source = mlx::core::contiguous(mlx::core::reshape(
+        input.dtype() == mlx::core::float16
+            ? input
+            : mlx::core::astype(input, mlx::core::float16),
+        Shape{1, impl_->neuron_len}));
+    auto ids = mlx::core::contiguous(mlx::core::reshape(
+        expert_ids, Shape{routes}));
+    auto weights = mlx::core::contiguous(mlx::core::reshape(
+        route_weights, Shape{routes}));
+    auto shared_gate = mlx::core::contiguous(shared_gate_weight);
+
+    const int decode_k_lanes = impl_->k_lanes_override != 0
+        ? impl_->k_lanes_override
+        : apple_m5_family() ? 16 : 8;
+    constexpr int kGateRowsPerSimd = 1;
+    const int gate_rows_per_workgroup =
+        (32 / decode_k_lanes) * kGateRowsPerSimd;
+    const int gate_tiles =
+        (impl_->out_per_expert + gate_rows_per_workgroup - 1) /
+        gate_rows_per_workgroup;
+    const bool mixed_decode_two_rows = apple_m5_family() &&
+        down.impl_->family_mask ==
+            ((std::uint32_t{1} << kFamilyNint) |
+             (std::uint32_t{1} << kFamilyVq));
+    const int down_rows_per_simd = mixed_decode_two_rows ? 2 : 1;
+    const int down_rows_per_workgroup =
+        (32 / decode_k_lanes) * down_rows_per_simd;
+    const int down_tiles =
+        (down.impl_->out_per_expert + down_rows_per_workgroup - 1) /
+        down_rows_per_workgroup;
+    const int stage_one_width =
+        (routes + 1) * impl_->out_per_expert + 1;
+
+    MfeNintDecodeConfig config{
+        .dtype = mlx::core::float16,
+        .shared_gate_dtype = shared_gate.dtype(),
+        .stage_one_shape = Shape{stage_one_width},
+        .output_shape = Shape{1, impl_->neuron_len},
+        .routes = routes,
+        .experts = impl_->experts,
+        .hidden = impl_->neuron_len,
+        .intermediate = impl_->out_per_expert,
+        .descriptor_size = kDescriptorSize,
+        .gate_family_mask = static_cast<int>(impl_->family_mask),
+        .gate_vq_profile_mask = static_cast<int>(impl_->vq_profile_mask),
+        .gate_vq_execution_layout =
+            static_cast<int>(impl_->vq_execution_layout),
+        .gate_has_nepq_residual =
+            static_cast<int>(impl_->has_nepq_residual),
+        .gate_npq_grouped_indices =
+            static_cast<int>(impl_->npq_grouped_indices),
+        .down_family_mask = static_cast<int>(down.impl_->family_mask),
+        .down_vq_profile_mask =
+            static_cast<int>(down.impl_->vq_profile_mask),
+        .down_vq_execution_layout =
+            static_cast<int>(down.impl_->vq_execution_layout),
+        .down_has_nepq_residual =
+            static_cast<int>(down.impl_->has_nepq_residual),
+        .down_npq_grouped_indices =
+            static_cast<int>(down.impl_->npq_grouped_indices),
+        .shared_gate_group_size = shared_gate_up.group_size(),
+        .shared_gate_groups = shared_gate_up.groups(),
+        .shared_down_group_size = shared_down.group_size(),
+        .shared_down_groups = shared_down.groups(),
+        .k_lanes = decode_k_lanes,
+        .down_rows_per_simd = down_rows_per_simd,
+        .stage_one_workgroups = 1 + (routes + 1) * gate_tiles,
+        .stage_two_workgroups = down_tiles,
+    };
+
+    auto stage_one_inputs = impl_->narrow_bindings;
+    stage_one_inputs.reserve(29);
+    stage_one_inputs.push_back(std::move(source));
+    stage_one_inputs.push_back(ids);
+    stage_one_inputs.push_back(shared_gate_up.packed_values());
+    stage_one_inputs.push_back(shared_gate_up.row_metadata());
+    stage_one_inputs.push_back(shared_gate_up.sub_scales());
+    stage_one_inputs.push_back(shared_gate_up.sub_mins());
+    stage_one_inputs.push_back(std::move(shared_gate));
+    auto stage_one = mfe_nint_decode_dispatch(
+        std::move(stage_one_inputs), config, 1);
+
+    auto stage_two_inputs = down.impl_->narrow_bindings;
+    stage_two_inputs.reserve(29);
+    stage_two_inputs.push_back(std::move(stage_one));
+    stage_two_inputs.push_back(shared_down.packed_values());
+    stage_two_inputs.push_back(shared_down.row_metadata());
+    stage_two_inputs.push_back(shared_down.sub_scales());
+    stage_two_inputs.push_back(shared_down.sub_mins());
+    stage_two_inputs.push_back(std::move(ids));
+    stage_two_inputs.push_back(std::move(weights));
+    detail::profile_marker("mfe.dispatch.two_stage_nint_shared");
+    return mfe_nint_decode_dispatch(
+        std::move(stage_two_inputs), config, 2);
+}
+
+bool MlxMfeWeight::supports_fused_routed_reduce() const noexcept {
+    return mxfp4_decode_down_reduce_enabled()
+        && !mlx_reference_enabled()
+        && impl_->native_primitive
+        && impl_->family_mask == (std::uint32_t{1} << kFamilyMxfp4)
+        && impl_->projections == 1
+        && impl_->rotations.empty()
+        && (impl_->k_lanes_override == 0 || impl_->k_lanes_override == 8)
+        && impl_->out_per_expert > 0
+        && impl_->neuron_len > 0
+        && impl_->neuron_len % 32 == 0
+        && impl_->descriptor_values.size()
+            == static_cast<std::size_t>(impl_->experts) * kDescriptorSize;
+}
+
 array MlxMfeWeight::routed_matmul_reduce(
     const array& input,
     const array& expert_ids,
@@ -9113,15 +10356,7 @@ array MlxMfeWeight::routed_matmul_reduce(
             routed_matmul(input, expert_ids),
             route_weights);
     };
-    if (!mxfp4_decode_down_reduce_enabled()
-        || mlx_reference_enabled()
-        || !impl_->native_primitive
-        || impl_->family_mask
-            != (std::uint32_t{1} << kFamilyMxfp4)
-        || impl_->projections != 1
-        || !impl_->rotations.empty()
-        || (impl_->k_lanes_override != 0
-            && impl_->k_lanes_override != 8)
+    if (!supports_fused_routed_reduce()
         || input.ndim() != 3
         || expert_ids.ndim() != 2
         || route_weights.ndim() != 2
@@ -9133,13 +10368,7 @@ array MlxMfeWeight::routed_matmul_reduce(
         || route_weights.shape(1) != expert_ids.shape(1)
         || input.shape(2) != impl_->neuron_len
         || expert_ids.shape(1) <= 0
-        || expert_ids.shape(1) > 16
-        || impl_->out_per_expert <= 0
-        || impl_->neuron_len <= 0
-        || impl_->neuron_len % 32 != 0
-        || impl_->descriptor_values.size()
-            != static_cast<std::size_t>(impl_->experts)
-                * kDescriptorSize) {
+        || expert_ids.shape(1) > 16) {
         detail::profile_marker("mfe.dispatch.mxfp4_down_reduce_fallback");
         return fallback();
     }
@@ -9829,34 +11058,36 @@ array MlxMfeWeight::routed_matmul_sorted(
     }
 
     const array params({0.0f}, mlx::core::float32);
-    std::vector<array> kernel_inputs{
-        impl_->descriptors,
-        impl_->nint_q,
-        impl_->nint_sub_scale,
-        impl_->nint_sub_min,
-        impl_->nint_anchor_scale,
-        impl_->nint_anchor_min,
-        impl_->q8_q,
-        impl_->q8_scales,
-        impl_->vq_indices,
-        impl_->vq_state,
-        impl_->vq_aux,
-        impl_->vq_anchors,
-        impl_->vq_codebooks,
-        impl_->vq_scales,
-        impl_->vq_state_to_codebank,
-        impl_->vq_banks,
-        impl_->vq_parameters,
-        impl_->vq_residual_codebooks,
-        impl_->vq_residual_first,
-        impl_->vq_residual_second,
-        impl_->mx_values,
-        impl_->mx_scales,
-        source,
-        ids,
-        route_order,
-        params,
-    };
+    std::vector<array> kernel_inputs = mfe_narrow_bindings_enabled()
+        ? impl_->narrow_bindings
+        : std::vector<array>{
+              impl_->descriptors,
+              impl_->nint_q,
+              impl_->nint_sub_scale,
+              impl_->nint_sub_min,
+              impl_->nint_anchor_scale,
+              impl_->nint_anchor_min,
+              impl_->q8_q,
+              impl_->q8_scales,
+              impl_->vq_indices,
+              impl_->vq_state,
+              impl_->vq_aux,
+              impl_->vq_anchors,
+              impl_->vq_codebooks,
+              impl_->vq_scales,
+              impl_->vq_state_to_codebank,
+              impl_->vq_banks,
+              impl_->vq_parameters,
+              impl_->vq_residual_codebooks,
+              impl_->vq_residual_first,
+              impl_->vq_residual_second,
+              impl_->mx_values,
+              impl_->mx_scales,
+          };
+    kernel_inputs.push_back(source);
+    kernel_inputs.push_back(ids);
+    kernel_inputs.push_back(route_order);
+    kernel_inputs.push_back(params);
     const int output_width = fused_swiglu
         ? (impl_->projections == 2
             ? impl_->out_per_expert
@@ -10235,24 +11466,38 @@ array MlxMfeWeight::routed_matmul_impl(
         shared_input = false;
     }
 
+    const bool split_fused_swiglu =
+        fused_swiglu && impl_->projections == 2;
     const int k_lanes = impl_->k_lanes_override != 0
         ? impl_->k_lanes_override
         : (fused_swiglu
+            && !split_fused_swiglu
             && impl_->family_mask !=
                 (std::uint32_t{1} << kFamilyMxfp4)
             ? 16
             : 8);
+    // Two rows reuse activation loads on the measured M5 mixed NINT/VQ
+    // 640 -> 2560 decode geometry. Do not apply this to the inverse gate/up
+    // projection: its larger K/register footprint regresses some cohorts.
+    const bool mixed_decode_two_rows = apple_m5_family() &&
+        impl_->projections == 1 && impl_->neuron_len == 640 &&
+        impl_->out_per_expert == 2560 &&
+        impl_->family_mask == ((std::uint32_t{1} << kFamilyNint) |
+                               (std::uint32_t{1} << kFamilyVq));
+    const int automatic_rows = mixed_decode_two_rows ||
+        (impl_->projections == 1 && impl_->family_mask ==
+            (std::uint32_t{1} << kFamilyMxfp4)) ? 2 : 1;
     const int rows_per_simd =
-        tokens == 1
-            && impl_->projections == 1
-            && impl_->family_mask
-                == (std::uint32_t{1} << kFamilyMxfp4)
+        split_fused_swiglu
+        ? 1
+        : tokens == 1
             && impl_->rotations.empty()
             && k_lanes == 8
-        ? mxfp4_decode_rows_per_simd()
+        ? mfe_decode_rows_per_simd(automatic_rows)
         : 1;
-    const auto rows_per_workgroup =
-        static_cast<std::size_t>(64 / k_lanes * rows_per_simd);
+    const auto rows_per_workgroup = static_cast<std::size_t>(
+        (split_fused_swiglu ? 32 : 64)
+        / k_lanes * rows_per_simd);
     const auto output_tiles =
         (
             static_cast<std::size_t>(
@@ -10272,34 +11517,36 @@ array MlxMfeWeight::routed_matmul_impl(
     const array params(
         {swiglu_limit},
         mlx::core::float32);
-    std::vector<array> kernel_inputs{
-        impl_->descriptors,
-        impl_->nint_q,
-        impl_->nint_sub_scale,
-        impl_->nint_sub_min,
-        impl_->nint_anchor_scale,
-        impl_->nint_anchor_min,
-        impl_->q8_q,
-        impl_->q8_scales,
-        impl_->vq_indices,
-        impl_->vq_state,
-        impl_->vq_aux,
-        impl_->vq_anchors,
-        impl_->vq_codebooks,
-        impl_->vq_scales,
-        impl_->vq_state_to_codebank,
-        impl_->vq_banks,
-        impl_->vq_parameters,
-        impl_->vq_residual_codebooks,
-        impl_->vq_residual_first,
-        impl_->vq_residual_second,
-        impl_->mx_values,
-        impl_->mx_scales,
-        source,
-        ids,
-        route_order,
-        params,
-    };
+    std::vector<array> kernel_inputs = mfe_narrow_bindings_enabled()
+        ? impl_->narrow_bindings
+        : std::vector<array>{
+              impl_->descriptors,
+              impl_->nint_q,
+              impl_->nint_sub_scale,
+              impl_->nint_sub_min,
+              impl_->nint_anchor_scale,
+              impl_->nint_anchor_min,
+              impl_->q8_q,
+              impl_->q8_scales,
+              impl_->vq_indices,
+              impl_->vq_state,
+              impl_->vq_aux,
+              impl_->vq_anchors,
+              impl_->vq_codebooks,
+              impl_->vq_scales,
+              impl_->vq_state_to_codebank,
+              impl_->vq_banks,
+              impl_->vq_parameters,
+              impl_->vq_residual_codebooks,
+              impl_->vq_residual_first,
+              impl_->vq_residual_second,
+              impl_->mx_values,
+              impl_->mx_scales,
+          };
+    kernel_inputs.push_back(source);
+    kernel_inputs.push_back(ids);
+    kernel_inputs.push_back(route_order);
+    kernel_inputs.push_back(params);
     if (
         sorted_routes
         && tokens >= 32
@@ -10315,11 +11562,9 @@ array MlxMfeWeight::routed_matmul_impl(
         const bool use_grouped_nax = !impl_->has_nepq_residual
             && mixed_grouped_nax_enabled(variant_stride);
         constexpr bool use_direct_nax = false;
-        auto plan = make_grouped_mmq_plan(
+        auto plan = build_grouped_mmq_plan(
             ids,
             route_order,
-            *impl_->expert_order,
-            impl_->experts,
             recommended_grouped_mmq_block_rows(
                 variant_stride,
                 fused_swiglu));
@@ -10401,8 +11646,8 @@ array MlxMfeWeight::routed_matmul_impl(
                 .descriptor_size = kDescriptorSize,
                 .variant_stride = variant_stride,
                 .shared_input = static_cast<int>(shared_input),
-                .jsc_execution_layout = static_cast<int>(
-                    impl_->jsc_execution_layout),
+                .vq_execution_layout = static_cast<int>(
+                    impl_->vq_execution_layout),
                 .family_mask = static_cast<int>(impl_->family_mask),
                 .vq_profile_mask = static_cast<int>(
                     impl_->vq_profile_mask),
@@ -10462,9 +11707,9 @@ array MlxMfeWeight::routed_matmul_impl(
                 static_cast<int>(shared_input),
             },
             {
-                "JSC_EXECUTION_LAYOUT",
+                "VQ_EXECUTION_LAYOUT",
                 static_cast<int>(
-                    impl_->jsc_execution_layout),
+                    impl_->vq_execution_layout),
             },
             {
                 "FAMILY_MASK",

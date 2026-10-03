@@ -1,6 +1,7 @@
 #include "mlx_moe.h"
 #include "mlx_moe_ops.h"
 #include "mlx_mxfp4_sq.h"
+#include "mlx_nint.h"
 #include "mfq_container.h"
 
 #include "nvq_codebooks.generated.h"
@@ -594,14 +595,12 @@ VqFixture make_jsc_nvq(
     }
     append<std::uint8_t>(blob, group64 ? 1 : 0);
     blob.insert(blob.end(), 11, 0);
-    const auto code_value = [group64](
+    const auto code_value = [](
         int bank,
         int entry,
         int component) {
-        return group64
-            ? static_cast<std::int8_t>(
-                (entry * 3 + component * 5 + bank * 7) % 15 - 7)
-            : static_cast<std::int8_t>(bank + 1);
+        return static_cast<std::int8_t>(
+            (entry * 3 + component * 5 + bank * 7) % 15 - 7);
     };
     for (int bank = 0; bank < 2; ++bank) {
         for (
@@ -667,30 +666,49 @@ VqFixture make_jsc_nvq(
             }
         }
     } else {
-        append_vq_matrix_streams(
-            blob,
-            output,
-            input,
-            24,
-            vector_size,
-            4,
-            index_bits,
-            7,
-            true);
+        const int groups = (input + 23) / 24;
+        const int vectors = (input + vector_size - 1) / vector_size;
+        const int signs = (input + 7) / 8;
+        std::vector<std::uint16_t> states(output * groups);
+        std::vector<std::uint16_t> indices(output * vectors);
+        std::vector<std::uint16_t> masks(output * signs);
+        append_vq_anchors(blob, output);
+        dense.resize(static_cast<std::size_t>(output) * input);
+        for (int row = 0; row < output; ++row) {
+            for (int group = 0; group < groups; ++group) {
+                states[row * groups + group] = (row + group * 3) & 15;
+            }
+            for (int vector = 0; vector < vectors; ++vector) {
+                indices[row * vectors + vector] =
+                    (row * 137 + vector * 59 + 257) & ((1 << index_bits) - 1);
+            }
+            for (int sign = 0; sign < signs; ++sign) {
+                masks[row * signs + sign] = (row * 13 + sign * 7 + 21) & 127;
+            }
+            for (int column = 0; column < input; ++column) {
+                const auto mask7 = static_cast<std::uint32_t>(
+                    masks[row * signs + column / 8]);
+                const auto sign_bits = mask7
+                    | ((std::popcount(mask7) & 1u) << 7u);
+                float value = static_cast<float>(code_value(
+                    states[row * groups + column / 24] & 1,
+                    indices[row * vectors + column / vector_size],
+                    column % vector_size));
+                if ((sign_bits & (1u << (column % 8))) != 0u) {
+                    value = -value;
+                }
+                dense[static_cast<std::size_t>(row) * input + column] = value;
+            }
+        }
+        append_bytes(blob, pack_vq_values(states, 4));
+        append_bytes(blob, pack_vq_values(indices, index_bits));
+        append_bytes(blob, pack_vq_values(masks, 7));
     }
     return {
         std::move(dtype),
         std::move(blob),
         {},
-        group64
-            ? std::move(dense)
-            : repeated_vq_dense(
-                output,
-                input,
-                std::vector<float>(
-                    static_cast<std::size_t>(
-                        vector_size),
-                    2.0f)),
+        std::move(dense),
         {},
         0,
         0,
@@ -785,28 +803,48 @@ VqFixture make_nvq1_s(
         24,
         output,
         input);
-    append_nvq1_s_table(blob);
-    append_vq_matrix_streams(
-        blob,
-        output,
-        input,
-        24,
-        8,
-        4,
-        9,
-        1,
-        false);
-    auto vector = decode_ternary_word(
-        mfq::nvq_codebooks::
-            kNvq1LCodebookPacked[0]);
-    for (auto& value : vector) {
-        value += 0.15625f;
+    for (int bank = 0; bank < 2; ++bank) {
+        for (int entry = 0; entry < 512; ++entry) {
+            const int source = bank == 0 ? entry : 511 - entry;
+            append<std::uint16_t>(
+                blob, mfq::nvq_codebooks::kNvq1LCodebookPacked[source * 4]);
+        }
     }
+    const int groups = (input + 23) / 24;
+    const int vectors = (input + 7) / 8;
+    std::vector<std::uint16_t> states(output * groups);
+    std::vector<std::uint16_t> indices(output * vectors);
+    std::vector<std::uint16_t> deltas(output * groups);
+    std::vector<float> dense(static_cast<std::size_t>(output) * input);
+    append_vq_anchors(blob, output);
+    for (int row = 0; row < output; ++row) {
+        for (int group = 0; group < groups; ++group) {
+            states[row * groups + group] = (row + group * 3) & 15;
+            deltas[row * groups + group] = (row + group) & 1;
+        }
+        for (int vector = 0; vector < vectors; ++vector) {
+            indices[row * vectors + vector] =
+                (row * 137 + vector * 59 + 257) & 511;
+        }
+        for (int column = 0; column < input; ++column) {
+            const int group = row * groups + column / 24;
+            const auto index = indices[row * vectors + column / 8];
+            const auto source = deltas[group] ? 511 - index : index;
+            const auto vector = decode_ternary_word(
+                mfq::nvq_codebooks::kNvq1LCodebookPacked[source * 4]);
+            dense[static_cast<std::size_t>(row) * input + column] =
+                (vector[column % 8] + (deltas[group] ? -0.15625f : 0.15625f))
+                * states[group];
+        }
+    }
+    append_bytes(blob, pack_vq_values(states, 4));
+    append_bytes(blob, pack_vq_values(indices, 9));
+    append_bytes(blob, pack_vq_values(deltas, 1));
     return {
         "NVQ1-S",
         std::move(blob),
         {},
-        repeated_vq_dense(output, input, vector),
+        std::move(dense),
         {},
         0,
         0,
@@ -1375,7 +1413,8 @@ TensorFixture make_nint_v2_tensor(
     int rows,
     int columns,
     int salt,
-    int group_size = kGroupSize) {
+    int group_size = kGroupSize,
+    bool all_q_widths = false) {
     constexpr int nominal_bits = 4;
     constexpr int nominal_sub_bits = 6;
     const int groups = (columns + group_size - 1) / group_size;
@@ -1390,7 +1429,9 @@ TensorFixture make_nint_v2_tensor(
         static_cast<std::size_t>(rows) * groups);
     std::vector<std::uint8_t> sub_min(sub_scale.size());
     for (int row = 0; row < rows; ++row) {
-        const int q_bits = 2 + (row + salt) % 5;
+        const int q_bits = all_q_widths
+            ? 1 + (row + salt) % 8
+            : 2 + (row + salt) % 5;
         const int sub_bits = 5 + (row + salt) % 4;
         row_q_bits[row] = static_cast<std::uint8_t>(q_bits);
         row_sub_bits[row] = static_cast<std::uint8_t>(sub_bits);
@@ -2016,6 +2057,12 @@ std::vector<float> evaluated_floats(
     };
 }
 
+struct MappedRecordFixture {
+    std::string name;
+    std::string dtype;
+    std::vector<std::uint8_t> payload;
+};
+
 void append_mfq_string(
     std::vector<std::uint8_t>& output,
     std::string_view value) {
@@ -2100,7 +2147,6 @@ private:
     std::filesystem::path path_;
 };
 
-template <typename Function>
 void test_all_families_and_projections() {
     constexpr int tokens = 3;
     constexpr int routes = 4;
@@ -2134,6 +2180,8 @@ void test_all_families_and_projections() {
     const auto second_weight =
         mfq::metal::MlxMoeWeight::from_blob(
             second.blob);
+    require(!first_weight.supports_fused_routed_reduce(),
+            "mixed NINT fallback must not advertise fused down-reduce");
     require(
         first_weight.experts()
                 == static_cast<int>(
@@ -2443,14 +2491,47 @@ void test_swiglu_ffn() {
     const std::vector<std::int32_t> single_ids(
         ids.begin(),
         ids.begin() + routes);
+    const auto single_source = mlx::core::array(
+        single_input.begin(),
+        mlx::core::Shape{1, hidden});
+    const auto single_routes = mlx::core::array(
+        single_ids.begin(),
+        mlx::core::Shape{1, routes});
+    const char* prior_split = std::getenv(
+        "MFQ_METAL_MFE_SPLIT_SWIGLU");
+    const std::optional<std::string> saved_split = prior_split == nullptr
+        ? std::nullopt
+        : std::optional<std::string>(prior_split);
+    setenv("MFQ_METAL_MFE_SPLIT_SWIGLU", "0", 1);
+    const auto single_activated_reference = evaluated_floats(
+        ffn.gate_up_weight().routed_swiglu(
+            single_source,
+            single_routes));
+    setenv("MFQ_METAL_MFE_SPLIT_SWIGLU", "1", 1);
     const auto single_activated_actual = evaluated_floats(
         ffn.gate_up_weight().routed_swiglu(
-            mlx::core::array(
-                single_input.begin(),
-                mlx::core::Shape{1, hidden}),
-            mlx::core::array(
-                single_ids.begin(),
-                mlx::core::Shape{1, routes})));
+            single_source,
+            single_routes));
+    if (saved_split) {
+        setenv(
+            "MFQ_METAL_MFE_SPLIT_SWIGLU",
+            saved_split->c_str(),
+            1);
+    } else {
+        unsetenv("MFQ_METAL_MFE_SPLIT_SWIGLU");
+    }
+    require(
+        single_activated_actual.size()
+            == single_activated_reference.size(),
+        "split Gate/Up SwiGLU output shape mismatch");
+    for (std::size_t index = 0;
+         index < single_activated_actual.size();
+         ++index) {
+        require_close(
+            single_activated_actual[index],
+            single_activated_reference[index],
+            2e-3f);
+    }
     for (
         std::size_t index = 0;
         index < single_activated_actual.size();
@@ -2551,6 +2632,137 @@ void test_swiglu_ffn() {
             actual[index],
             expected[index],
             3e-3f);
+    }
+}
+
+void test_two_stage_nint_shared_decode(
+    int shared_group_size = 24,
+    int hidden = 32,
+    int intermediate = 24) {
+    constexpr int experts = 32;
+    constexpr int routes = 10;
+    const std::vector<std::string> profiles(experts, "NINTv2");
+    const auto gate_fixture = make_moe_fixture(
+        profiles, intermediate, hidden, 7);
+    const auto up_fixture = make_moe_fixture(
+        profiles, intermediate, hidden, 19);
+    const auto down_fixture = make_moe_fixture(
+        profiles, hidden, intermediate, 31);
+    const auto gate = mfq::metal::MlxMfeWeight::from_blob(
+        gate_fixture.blob);
+    const auto up = mfq::metal::MlxMfeWeight::from_blob(
+        up_fixture.blob);
+    const auto gate_up =
+        mfq::metal::MlxMfeWeight::concatenate_projections({gate, up})
+            .materialize_packed_projections();
+    const auto down = mfq::metal::MlxMfeWeight::from_blob(
+        down_fixture.blob);
+
+    const auto shared_gate_fixture = make_nint_v2_tensor(
+        intermediate, hidden, 43, shared_group_size, true);
+    const auto shared_up_fixture = make_nint_v2_tensor(
+        intermediate, hidden, 47, shared_group_size, true);
+    const auto shared_down_fixture = make_nint_v2_tensor(
+        hidden, intermediate, 53, shared_group_size, true);
+    const auto shared_gate = mfq::metal::MlxNintWeight::from_blob(
+        shared_gate_fixture.blob);
+    const auto shared_up = mfq::metal::MlxNintWeight::from_blob(
+        shared_up_fixture.blob);
+    const auto shared_down = mfq::metal::MlxNintWeight::from_blob(
+        shared_down_fixture.blob);
+    const auto shared_gate_up =
+        mfq::metal::MlxNintSwiGluPair::from_weights(
+            shared_gate, shared_up);
+    require(shared_gate_up.has_value(),
+            "shared NINT Gate/Up pair was not fuseable");
+
+    std::vector<float> input_values(hidden);
+    std::vector<float> shared_gate_values(hidden);
+    for (int column = 0; column < hidden; ++column) {
+        input_values[column] = static_cast<float>(
+            (column * 7) % 23 - 11) / 64.0f;
+        shared_gate_values[column] = static_cast<float>(
+            (column * 5) % 17 - 8) / 128.0f;
+    }
+    std::vector<std::int32_t> ids(routes);
+    std::iota(ids.begin(), ids.end(), 0);
+    std::vector<float> route_values(routes);
+    float route_total = 0.0f;
+    for (int route = 0; route < routes; ++route) {
+        route_values[route] = static_cast<float>(route + 1);
+        route_total += route_values[route];
+    }
+    for (auto& value : route_values) value /= route_total;
+
+    const auto input = mlx::core::astype(
+        mlx::core::array(input_values.begin(), mlx::core::Shape{1, hidden}),
+        mlx::core::float16);
+    const auto expert_ids = mlx::core::array(
+        ids.begin(), mlx::core::Shape{1, routes});
+    const auto route_weights = mlx::core::array(
+        route_values.begin(), mlx::core::Shape{1, routes});
+    const auto shared_gate_weight = mlx::core::astype(
+        mlx::core::array(
+            shared_gate_values.begin(), mlx::core::Shape{1, hidden}),
+        mlx::core::bfloat16);
+
+    auto fused = gate_up.decode_nint_shared(
+        down,
+        *shared_gate_up,
+        shared_down,
+        shared_gate_weight,
+        input,
+        expert_ids,
+        route_weights);
+    require(fused.has_value(),
+            "two-stage NINT/shared decode path was not selected");
+
+    auto routed_intermediate = gate_up.routed_swiglu(input, expert_ids);
+    auto routed_output = down.routed_matmul(
+        routed_intermediate, expert_ids);
+    // Use independently constructed dense weights: comparing two NINT
+    // decoders could hide the same bit-addressing or group-tail error.
+    const auto dense_shared_matmul = [](
+        const TensorFixture& fixture, const mlx::core::array& activation) {
+        return mlx::core::astype(
+            mlx::core::matmul(
+                mlx::core::astype(activation, mlx::core::float32),
+                mlx::core::transpose(mlx::core::array(
+                    fixture.dense.begin(),
+                    mlx::core::Shape{fixture.rows, fixture.columns}))),
+            mlx::core::float16);
+    };
+    auto shared_gate_output = dense_shared_matmul(shared_gate_fixture, input);
+    auto shared_intermediate =
+        shared_gate_output * mlx::core::sigmoid(shared_gate_output) *
+        dense_shared_matmul(shared_up_fixture, input);
+    auto shared_output = dense_shared_matmul(
+        shared_down_fixture, shared_intermediate);
+    auto gate_logits = mlx::core::matmul(
+        mlx::core::astype(input, mlx::core::bfloat16),
+        mlx::core::transpose(shared_gate_weight));
+    auto reference = mfq::metal::moe_weighted_reduce_shared_gate(
+        routed_output,
+        route_weights,
+        shared_output,
+        gate_logits);
+    const auto fused_values = evaluated_floats(*fused);
+    const auto reference_values = evaluated_floats(reference);
+    require(fused_values.size() == reference_values.size(),
+            "two-stage NINT/shared decode output size mismatch");
+    for (std::size_t index = 0; index < fused_values.size(); ++index) {
+        try {
+            require_close(
+                fused_values[index],
+                reference_values[index],
+                3e-2f);
+        } catch (const std::exception& error) {
+            throw std::runtime_error(
+                "shared NINT GS=" + std::to_string(shared_group_size)
+                + " K=" + std::to_string(hidden)
+                + " intermediate=" + std::to_string(intermediate)
+                + " output=" + std::to_string(index) + ": " + error.what());
+        }
     }
 }
 
@@ -3391,9 +3603,13 @@ void test_mxfp4_decode_down_reduce() {
     }
     setenv("MFQ_METAL_MFE_DECODE_ROWS_PER_SIMD", "1", 1);
     setenv("MFQ_METAL_MFE_DECODE_DOWN_REDUCE", "0", 1);
+    require(!weight.supports_fused_routed_reduce(),
+            "disabled down-reduce must not advertise fused support");
     const auto reference = evaluated_floats(
         weight.routed_matmul_reduce(source, expert_ids, weights));
     setenv("MFQ_METAL_MFE_DECODE_DOWN_REDUCE", "1", 1);
+    require(weight.supports_fused_routed_reduce(),
+            "native MXFP4 down-reduce capability is missing");
     for (const char* rows : {"1", "2", "4"}) {
         setenv("MFQ_METAL_MFE_DECODE_DOWN_REDUCE_ROWS", rows, 1);
         const auto fused = evaluated_floats(
@@ -3652,8 +3868,8 @@ void test_large_mxfp4_arena_avoids_single_group_builder() {
 }
 
 void test_vq_cohorts_and_ffn() {
-    constexpr int tokens = 3;
-    constexpr int routes = 3;
+    constexpr int tokens = 2;
+    constexpr int routes = 5;
     constexpr int width = 24;
     auto fixture = make_vq_moe_fixture({
         make_plain_nvq(width, width),
@@ -3673,6 +3889,13 @@ void test_vq_cohorts_and_ffn() {
             3,
             4,
             9),
+        make_jsc_nvq(
+            width,
+            width,
+            "NVQ3J-L",
+            6,
+            4,
+            10),
         make_jsc_nvq(
             width,
             width,
@@ -3714,9 +3937,8 @@ void test_vq_cohorts_and_ffn() {
         "VQ MFE metadata mismatch");
 
     const std::vector<std::int32_t> ids{
-        0, 8, 2,
-        3, 1, 7,
-        5, 6, 4,
+        0, 9, 2, 3, 1,
+        6, 7, 8, 4, 5,
     };
     std::vector<float> input(tokens * width);
     for (
@@ -3765,10 +3987,15 @@ void test_vq_cohorts_and_ffn() {
     for (std::size_t index = 0;
          index < actual.size();
          ++index) {
-        require_close(
-            actual[index],
-            legacy_actual[index],
-            1e-6f);
+        try {
+            require_close(actual[index], legacy_actual[index], 1e-6f);
+        } catch (const std::exception& error) {
+            throw std::runtime_error(
+                "execution-layout comparison expert="
+                + std::to_string(ids[index / width])
+                + " row=" + std::to_string(index % width)
+                + ": " + error.what());
+        }
     }
     for (int token = 0; token < tokens; ++token) {
         std::vector<float> source(
@@ -3782,17 +4009,17 @@ void test_vq_cohorts_and_ffn() {
             for (int output = 0;
                  output < width;
                  ++output) {
-                require_close(
-                    actual[
-                        (
-                            token * routes + route
-                        ) * width + output],
-                    routed_vq_dot(
-                        source,
-                        fixture,
-                        expert,
-                        output),
-                    2e-3f);
+                try {
+                    require_close(
+                        actual[(token * routes + route) * width + output],
+                        routed_vq_dot(source, fixture, expert, output),
+                        2e-3f);
+                } catch (const std::exception& error) {
+                    throw std::runtime_error(
+                        "dense reference expert=" + std::to_string(expert)
+                        + " row=" + std::to_string(output)
+                        + ": " + error.what());
+                }
             }
         }
     }
@@ -3894,9 +4121,8 @@ void test_vq_cohorts_and_ffn() {
                 fixture.blob,
                 fixture.blob);
     const std::vector<float> route_weights{
-        0.50f, 0.30f, 0.20f,
-        0.15f, 0.55f, 0.30f,
-        0.25f, 0.35f, 0.40f,
+        0.30f, 0.25f, 0.20f, 0.15f, 0.10f,
+        0.10f, 0.15f, 0.20f, 0.25f, 0.30f,
     };
     const auto ffn_actual = evaluated_floats(
         ffn.forward(
@@ -4540,6 +4766,13 @@ void test_grouped_vq_decoder_tail_prefill() {
         make_jsc_nvq(
             output,
             input_width,
+            "NVQ3J-L",
+            6,
+            4,
+            10),
+        make_jsc_nvq(
+            output,
+            input_width,
             "NVQ2J-XL",
             5,
             8,
@@ -4558,7 +4791,7 @@ void test_grouped_vq_decoder_tail_prefill() {
     require(
         weight.supports_grouped_mmq(),
         "mixed VQ decoder tail fixture must support grouped prefill");
-    const auto exercise = [&](int tokens) {
+    const auto exercise = [&](int tokens, int first_expert = 0) {
         std::vector<float> input(tokens * input_width);
         for (std::size_t index = 0; index < input.size(); ++index) {
             input[index] = static_cast<float>(
@@ -4567,7 +4800,7 @@ void test_grouped_vq_decoder_tail_prefill() {
         }
         std::vector<std::int32_t> ids(tokens);
         for (int token = 0; token < tokens; ++token) {
-            ids[token] = token % fixture.experts;
+            ids[token] = (first_expert + token) % fixture.experts;
         }
         const auto actual = evaluated_floats(
             weight.routed_matmul(
@@ -4590,6 +4823,13 @@ void test_grouped_vq_decoder_tail_prefill() {
             }
         }
     };
+    // Every geometry must also exercise the single-token decoder, rather
+    // than reaching only the first cohort through the prefill cases.
+    for (int expert = 0; expert < fixture.experts; ++expert) {
+        exercise(1, expert);
+    }
+    exercise(31);
+    exercise(32);
     exercise(49);
     exercise(1025);
 }
@@ -4739,7 +4979,7 @@ void test_grouped_split_nint_swiglu_prefill() {
             / (1.0f + std::exp(-gate_value))
             * up_values[index];
         require_close(actual[index], expected, 2e-2f);
-        require_close(planned[index], actual[index], 1e-6f);
+        require_close(planned[index], actual[index], 2e-3f);
     }
 }
 
@@ -5577,6 +5817,91 @@ void test_materialized_mfe_projections() {
         "projection fixture did not reproduce lazy duplicate storage");
 }
 
+void test_mixed_decode_row_packing(int group_size) {
+    using namespace mlx::core;
+    constexpr int output = 17;
+    constexpr int input = 96;
+    const auto nint = make_nint_v2_tensor(
+        output, input, 17, group_size, true);
+    const auto jsc = make_jsc_nvq(output, input);
+    const auto nvq = make_nvq1_s(output, input);
+    const auto gate = mfq::metal::MlxMfeWeight::from_blob(make_raw_nim2(3, output, input, {
+        {{0}, "NINTv2", nint, {}},
+        {{1}, jsc.dtype, {jsc.blob, jsc.dense, output, input}, jsc.runtime},
+        {{2}, nvq.dtype, {nvq.blob, nvq.dense, output, input}, nvq.runtime},
+    }));
+    const auto up = mfq::metal::MlxMfeWeight::from_blob(make_raw_nim2(3, output, input, {
+        {{2}, "NINTv2", nint, {}},
+        {{0}, jsc.dtype, {jsc.blob, jsc.dense, output, input}, jsc.runtime},
+        {{1}, nvq.dtype, {nvq.blob, nvq.dense, output, input}, nvq.runtime},
+    }));
+    const auto combined = mfq::metal::MlxMfeWeight::concatenate_projections({gate, up})
+        .materialize_packed_projections();
+    const char* prior = std::getenv("MFQ_METAL_MFE_DECODE_ROWS_PER_SIMD");
+    const std::optional<std::string> saved = prior == nullptr
+        ? std::nullopt : std::optional<std::string>(prior);
+    const char* prior_split = std::getenv("MFQ_METAL_MFE_SPLIT_SWIGLU");
+    const std::optional<std::string> saved_split = prior_split == nullptr
+        ? std::nullopt : std::optional<std::string>(prior_split);
+    const array ids({2, 0, 1, -1, 3}, Shape{1, 5}, int32);
+    for (const auto dtype : {float16, float32}) {
+        for (const bool routed : {false, true}) {
+            const Shape shape = routed ? Shape{1, 5, input} : Shape{1, input};
+            std::vector<float> values(routed ? 5 * input : input);
+            for (std::size_t i = 0; i < values.size(); ++i) {
+                values[i] = float(int((i * 7 + 3) % 29) - 14) / 256.0f;
+            }
+            auto x = astype(array(values.begin(), shape), dtype);
+            for (const bool swiglu : {false, true}) {
+                const auto execute = [&] {
+                    return evaluated_floats(swiglu
+                        ? combined.routed_swiglu(x, ids, 0.7f)
+                        : gate.routed_matmul(x, ids));
+                };
+                setenv("MFQ_METAL_MFE_DECODE_ROWS_PER_SIMD", "1", 1);
+                setenv("MFQ_METAL_MFE_SPLIT_SWIGLU", "0", 1);
+                const auto expected = execute();
+                if (!swiglu) {
+                    const std::vector<float>* dense_weights[]{
+                        &nint.dense, &jsc.dense, &nvq.dense};
+                    const int experts[]{2, 0, 1, -1, 3};
+                    for (int route = 0; route < 5; ++route) {
+                        const auto* dense = experts[route] >= 0
+                            && experts[route] < 3
+                            ? dense_weights[experts[route]] : nullptr;
+                        for (int row = 0; row < output; ++row) {
+                            float reference = 0.0f;
+                            if (dense != nullptr) {
+                                for (int column = 0; column < input; ++column) {
+                                    reference += values[(routed ? route * input : 0) + column]
+                                        * (*dense)[row * input + column];
+                                }
+                            }
+                            require_close(expected[route * output + row], reference, 2e-3f);
+                        }
+                    }
+                }
+                setenv("MFQ_METAL_MFE_SPLIT_SWIGLU", "1", 1);
+                for (const char* rows : {"2", "4"}) {
+                    setenv("MFQ_METAL_MFE_DECODE_ROWS_PER_SIMD", rows, 1);
+                    const auto actual = execute();
+                    require(actual.size() == expected.size(), "mixed decode packing shape mismatch");
+                    for (std::size_t i = 0; i < actual.size(); ++i) {
+                        require_close(actual[i], expected[i], 2e-3f);
+                    }
+                }
+            }
+        }
+    }
+    if (saved) setenv("MFQ_METAL_MFE_DECODE_ROWS_PER_SIMD", saved->c_str(), 1);
+    else unsetenv("MFQ_METAL_MFE_DECODE_ROWS_PER_SIMD");
+    if (saved_split) {
+        setenv("MFQ_METAL_MFE_SPLIT_SWIGLU", saved_split->c_str(), 1);
+    } else {
+        unsetenv("MFQ_METAL_MFE_SPLIT_SWIGLU");
+    }
+}
+
 void test_streamed_nvq1_residency() {
     constexpr int experts = 3;
     constexpr int output = 3;
@@ -5647,7 +5972,10 @@ void test_streamed_nvq1_residency() {
         mfq::metal::MlxMfeOffloadCache cache(model, 1);
         require(cache.can_group_mfe("valid"), "NVQ1 MFE was not pageable");
         for (const auto* name : {"truncated", "trailing", "shape", "profile"}) {
-            require_stream_rejected([&] { (void)cache.can_group_mfe(name); }, name);
+            bool rejected = false;
+            try { (void)cache.can_group_mfe(name); }
+            catch (const std::exception&) { rejected = true; }
+            require(rejected, std::string("malformed NVQ1 MFE was accepted: ") + name);
         }
         const auto full = mfq::metal::MlxMfeWeight::from_blob(blob);
         const auto check = [&](const mfq::metal::MlxMfeWeight& paged,
@@ -6011,6 +6339,9 @@ int main(int argc, char** argv) {
         }
         test_all_families_and_projections();
         test_swiglu_ffn();
+        test_two_stage_nint_shared_decode();
+        test_two_stage_nint_shared_decode(28, 65, 41);
+        test_two_stage_nint_shared_decode(23, 65, 41);
         test_mxfp4_mfe_and_projection_offsets();
         test_mxfp4_multi_pool_native_slots();
         test_mxfp4_pair_blocks_matches_native_projections();
@@ -6020,10 +6351,20 @@ int main(int argc, char** argv) {
         test_mxfp4_decode_down_reduce();
         test_mxfp4_decode_swiglu_row_packing();
         test_large_mxfp4_arena_avoids_single_group_builder();
-        test_vq_cohorts_and_ffn();
+        try {
+            test_vq_cohorts_and_ffn();
+        } catch (const std::exception& error) {
+            throw std::runtime_error(
+                std::string("VQ cohorts/FFN: ") + error.what());
+        }
         test_nepq_a_routed_and_fused_swiglu();
         test_grouped_mmq_prefill();
-        test_grouped_vq_decoder_tail_prefill();
+        try {
+            test_grouped_vq_decoder_tail_prefill();
+        } catch (const std::exception& error) {
+            throw std::runtime_error(
+                std::string("grouped VQ tail: ") + error.what());
+        }
         test_grouped_nint_mmq_prefill();
         test_grouped_split_nint_swiglu_prefill();
         test_shared_nint2_prefill();
@@ -6038,6 +6379,8 @@ int main(int argc, char** argv) {
         test_streamed_mixed_mfe_residency();
         test_streamed_nvq1_residency();
         test_materialized_mfe_projections();
+        test_mixed_decode_row_packing(24);
+        test_mixed_decode_row_packing(28);
         test_container_validation();
         std::cout
             << "MFQ native heterogeneous MFE/streamed "

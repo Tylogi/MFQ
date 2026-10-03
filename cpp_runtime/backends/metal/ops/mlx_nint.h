@@ -4,6 +4,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <mlx/mlx.h>
@@ -27,6 +28,14 @@ public:
     mlx::core::array matmul_add(
         const mlx::core::array& input,
         const mlx::core::array& residual) const;
+    // Decode/small-M epilogue for a shared expert. The NINT projection keeps
+    // its output in registers, while routed expert rows are reduced and the
+    // sigmoid shared gate is applied before the single final write.
+    mlx::core::array matmul_moe_shared(
+        const mlx::core::array& input,
+        const mlx::core::array& routed_pairs,
+        const mlx::core::array& route_weights,
+        const mlx::core::array& gate_logits) const;
     // Routed MFE projection over this packed expert cohort.  This is another
     // invocation mode of the ordinary NINT matmul kernel, not a separate MoE
     // decoder. expert_map maps global expert IDs to cohort-local rows and -1
@@ -107,11 +116,13 @@ public:
     bool has_uniform_q_bits() const noexcept {
         return uniform_q_bits_;
     }
-
 private:
     mlx::core::array matmul_impl(
         const mlx::core::array& input,
-        const mlx::core::array* residual) const;
+        const mlx::core::array* residual,
+        const mlx::core::array* routed_pairs = nullptr,
+        const mlx::core::array* route_weights = nullptr,
+        const mlx::core::array* gate_logits = nullptr) const;
 
     MlxNintWeight(
         mlx::core::array q_packed,
@@ -148,6 +159,61 @@ private:
     int output_size_ = 0;
     NintDescriptor descriptor_;
     bool uniform_q_bits_ = false;
+};
+
+// Load-time packed view of two shape-compatible NINT projections. The
+// combined buffers let a fused Gate/Up kernel bind both projections without
+// exceeding Metal's buffer-slot limit. Canonical weights remain unchanged.
+class MlxNintSwiGluPair {
+public:
+    static std::optional<MlxNintSwiGluPair> from_weights(
+        const MlxNintWeight& gate,
+        const MlxNintWeight& up);
+
+    const mlx::core::array& packed_values() const noexcept {
+        return q_packed_;
+    }
+    const mlx::core::array& row_metadata() const noexcept {
+        return row_metadata_;
+    }
+    const mlx::core::array& sub_scales() const noexcept {
+        return sub_scale_;
+    }
+    const mlx::core::array& sub_mins() const noexcept {
+        return sub_min_;
+    }
+    int group_size() const noexcept { return group_size_; }
+    int groups() const noexcept { return groups_; }
+    int input_size() const noexcept { return input_size_; }
+    int output_size() const noexcept { return output_size_; }
+
+private:
+    MlxNintSwiGluPair(
+        mlx::core::array q_packed,
+        mlx::core::array row_metadata,
+        mlx::core::array sub_scale,
+        mlx::core::array sub_min,
+        int group_size,
+        int groups,
+        int input_size,
+        int output_size)
+        : q_packed_(std::move(q_packed)),
+          row_metadata_(std::move(row_metadata)),
+          sub_scale_(std::move(sub_scale)),
+          sub_min_(std::move(sub_min)),
+          group_size_(group_size),
+          groups_(groups),
+          input_size_(input_size),
+          output_size_(output_size) {}
+
+    mlx::core::array q_packed_;
+    mlx::core::array row_metadata_;
+    mlx::core::array sub_scale_;
+    mlx::core::array sub_min_;
+    int group_size_ = 0;
+    int groups_ = 0;
+    int input_size_ = 0;
+    int output_size_ = 0;
 };
 
 } // namespace mfq::metal

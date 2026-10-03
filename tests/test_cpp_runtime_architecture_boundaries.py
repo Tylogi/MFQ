@@ -764,7 +764,9 @@ def test_qwen4_uses_the_shared_ssd_expert_cache() -> None:
 
 def test_qwen4_small_m_down_reduce_is_format_neutral() -> None:
     moe = QWEN4[QWEN4.index("class Qwen4Moe") :]
-    assert moe.count("const bool combine_routes = tokens <= 6;") == 2
+    assert moe.count("const bool combine_routes = tokens <= 6 &&") == 2
+    assert "down.supports_fused_routed_reduce()" in moe
+    assert "down_->supports_fused_routed_reduce()" in moe
     assert moe.count("routed_matmul_reduce(") >= 2
     assert "supports_mxfp4_blocks" not in moe
 

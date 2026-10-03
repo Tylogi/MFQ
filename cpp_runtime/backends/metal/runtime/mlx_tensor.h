@@ -48,6 +48,15 @@ public:
 
     mlx::core::array operator()(const mlx::core::array& input) const;
 
+    // Project one shared-expert activation and combine it with routed MoE
+    // rows. NINT uses a register-resident projection/reduce/gate epilogue;
+    // other formats retain the exact composed implementation.
+    mlx::core::array moe_shared(
+        const mlx::core::array& input,
+        const mlx::core::array& routed_pairs,
+        const mlx::core::array& route_weights,
+        const mlx::core::array& gate_logits) const;
+
     // Returns a token id when the packed layout has a fused single-row
     // LM-head/greedy implementation; otherwise returns std::nullopt.
     std::optional<mlx::core::array> greedy_argmax(

@@ -20,6 +20,233 @@ using mlx::core::MathMode;
 using mlx::core::Shape;
 using mlx::core::array;
 
+const mlx::core::fast::CustomKernelFunction& gdn_gates_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Safe;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_gated_delta_gates",
+            {"alpha", "beta", "bias", "decay"},
+            {"gate_out", "beta_out"},
+            R"METAL(
+                uint index = thread_position_in_grid.x;
+                if (index >= uint(BATCH * TOKENS * HEADS)) return;
+                uint head = index % uint(HEADS);
+                uint token = (index / uint(HEADS)) % uint(TOKENS);
+                uint batch = index / uint(TOKENS * HEADS);
+                uint output_index = (batch * uint(HEADS) + head) *
+                    uint(TOKENS) + token;
+                float x = float(alpha[index]) + float(bias[head]);
+                // Match MLX's precise unary exp/log path, including log1p's
+                // correction when 1 + exp_term rounds to one. The generic
+                // custom-kernel log1p helper uses an approximate log.
+                float exp_term = metal::precise::exp(-metal::abs(x));
+                float plus_one = 1.0f + exp_term;
+                float log_term = plus_one == 1.0f ? exp_term :
+                    exp_term * (metal::precise::log(plus_one) / (plus_one - 1.0f));
+                float softplus = metal::max(x, 0.0f) + log_term;
+                gate_out[output_index] = float(decay[head]) * softplus;
+                float b = float(beta[index]);
+                float tail = 1.0f / (1.0f + metal::precise::exp(metal::abs(b)));
+                beta_out[output_index] = b < 0.0f ? tail : 1.0f - tail;
+            )METAL",
+            "",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
+// The one-token layout follows oMLX's Qwen4 decode-step scheduling (see
+// NOTICE), while retaining MFQ's FP32 convolution/recurrent state, its
+// [value,key] transposed cache contract, and the arithmetic order of the
+// existing generic operators. One threadgroup owns one value head; its 16
+// simdgroups keep q/k/v and the recurrent outputs in threadgroup memory.
+constexpr const char* kGatedDeltaDecodeStepSource = R"METAL(
+    const uint lane = thread_index_in_simdgroup;
+    const uint simd_group = simdgroup_index_in_threadgroup;
+    const uint value_head = threadgroup_position_in_grid.z;
+    const uint key_head = value_head / uint(HV / HK);
+
+    threadgroup float query_values[D];
+    threadgroup float key_values[D];
+    threadgroup float value_values[D];
+    threadgroup float recurrent_output[D];
+    threadgroup float recurrent_decay[1];
+    threadgroup float recurrent_beta[1];
+
+    if (simd_group < 3u) {
+        const bool is_query = simd_group == 0u;
+        const bool is_key = simd_group == 1u;
+        const uint head = is_query || is_key ? key_head : value_head;
+        const uint channel_base = is_query
+            ? head * uint(D)
+            : (is_key
+                   ? uint(HK * D) + head * uint(D)
+                   : uint(2 * HK * D) + head * uint(D));
+        const bool write_shared_state =
+            !(is_query || is_key) || value_head % uint(HV / HK) == 0u;
+
+        float activated[4];
+        float square_sum = 0.0f;
+        for (uint item = 0u; item < 4u; ++item) {
+            const uint dimension = lane + item * 32u;
+            const uint channel = channel_base + dimension;
+            float convolution = 0.0f;
+            for (uint tap = 0u; tap < 3u; ++tap) {
+                convolution += convolution_state[tap * uint(C) + channel] *
+                    convolution_weight[channel * 4u + tap];
+            }
+            const float source = is_query || is_key
+                ? float(qk[channel])
+                : float(value[channel - uint(2 * HK * D)]);
+            convolution += source * convolution_weight[channel * 4u + 3u];
+            const float activated_value =
+                convolution / (1.0f + exp(-convolution));
+            activated[item] = activated_value;
+            square_sum += activated_value * activated_value;
+
+            if (write_shared_state) {
+                convolution_out[channel] =
+                    convolution_state[uint(C) + channel];
+                convolution_out[uint(C) + channel] =
+                    convolution_state[2u * uint(C) + channel];
+                convolution_out[2u * uint(C) + channel] = source;
+            }
+        }
+
+        if (is_query || is_key) {
+            square_sum = simd_sum(square_sum);
+            const float inverse =
+                1.0f / max(sqrt(square_sum), params[0]);
+            for (uint item = 0u; item < 4u; ++item) {
+                const uint dimension = lane + item * 32u;
+                if (is_query) {
+                    query_values[dimension] = activated[item] * inverse;
+                } else {
+                    key_values[dimension] = activated[item] * inverse;
+                }
+            }
+        } else {
+            for (uint item = 0u; item < 4u; ++item) {
+                value_values[lane + item * 32u] = activated[item];
+            }
+        }
+    } else if (simd_group == 3u && lane == 0u) {
+        const float gate_input =
+            float(alpha[value_head]) + float(dt_bias[value_head]);
+        const float exp_term = metal::precise::exp(-metal::abs(gate_input));
+        const float plus_one = 1.0f + exp_term;
+        const float log_term = plus_one == 1.0f
+            ? exp_term
+            : exp_term *
+                  (metal::precise::log(plus_one) / (plus_one - 1.0f));
+        const float softplus = max(gate_input, 0.0f) + log_term;
+        const float gate_log = decay_scale[value_head] * softplus;
+        recurrent_decay[0] = exp(gate_log);
+
+        const float beta_input = float(beta[value_head]);
+        const float tail =
+            1.0f / (1.0f + metal::precise::exp(metal::abs(beta_input)));
+        recurrent_beta[0] = beta_input < 0.0f ? tail : 1.0f - tail;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each simdgroup owns eight output columns. For every column all 32 lanes
+    // retain the generic kernel's four interleaved key rows and simd_sum
+    // reduction order, while q/k are reused from threadgroup memory.
+    constexpr uint COLUMNS_PER_SIMDGROUP = uint(D) / 16u;
+    const float decay = recurrent_decay[0];
+    const float beta_value = recurrent_beta[0];
+    const uint state_head = value_head * uint(D * D);
+    for (uint item = 0u; item < COLUMNS_PER_SIMDGROUP; ++item) {
+        const uint column = simd_group * COLUMNS_PER_SIMDGROUP + item;
+        float state_values[4];
+        float projected_key = 0.0f;
+        for (uint row = 0u; row < 4u; ++row) {
+            const uint key_row = lane + row * 32u;
+            state_values[row] =
+                recurrent_state[state_head + column * uint(D) + key_row];
+            projected_key += state_values[row] * key_values[key_row];
+        }
+        projected_key = simd_sum(projected_key);
+        const float delta =
+            (value_values[column] - decay * projected_key) * beta_value;
+
+        float result = 0.0f;
+        for (uint row = 0u; row < 4u; ++row) {
+            const uint key_row = lane + row * 32u;
+            state_values[row] = decay * state_values[row] +
+                key_values[key_row] * delta;
+            result += state_values[row] * query_values[key_row];
+            recurrent_out[state_head + column * uint(D) + key_row] =
+                state_values[row];
+        }
+        result = simd_sum(result);
+        if (lane == 0u) {
+            recurrent_output[column] = result * rsqrt(float(D));
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0u) {
+        float values[4];
+        float square_sum = 0.0f;
+        for (uint item = 0u; item < 4u; ++item) {
+            const uint dimension = lane + item * 32u;
+            values[item] = recurrent_output[dimension];
+            square_sum += values[item] * values[item];
+        }
+        square_sum = simd_sum(square_sum);
+        const float inverse = metal::precise::rsqrt(
+            square_sum / float(D) + params[1]);
+        const uint output_base = value_head * uint(D);
+        for (uint item = 0u; item < 4u; ++item) {
+            const uint dimension = lane + item * 32u;
+            const float normalized =
+                values[item] * inverse * norm_weight[dimension];
+            const float z = float(output_gate[output_base + dimension]);
+            const float tail =
+                1.0f / (1.0f + metal::precise::exp(metal::abs(z)));
+            const float sigmoid = z < 0.0f ? tail : 1.0f - tail;
+            const float gate = OUTPUT_GATE_SILU != 0 ? z * sigmoid : sigmoid;
+            output[output_base + dimension] = normalized * gate;
+        }
+    }
+)METAL";
+
+const mlx::core::fast::CustomKernelFunction&
+gdn_decode_step_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_gated_delta_decode_step",
+            {
+                "qk",
+                "value",
+                "output_gate",
+                "alpha",
+                "beta",
+                "convolution_state",
+                "recurrent_state",
+                "convolution_weight",
+                "dt_bias",
+                "decay_scale",
+                "norm_weight",
+                "params",
+            },
+            {"output", "convolution_out", "recurrent_out"},
+            kGatedDeltaDecodeStepSource,
+            "",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
 constexpr const char* kCachedDepthwiseConvHeader = R"METAL(
 template <
     typename StateT,
@@ -797,6 +1024,164 @@ gdn_templates(
 }
 
 } // namespace
+
+MlxGatedDeltaGates gated_delta_gates(
+    const array& alpha,
+    const array& beta,
+    const array& dt_bias,
+    const array& decay_scale) {
+    const auto floating = [](Dtype dtype) {
+        return dtype == mlx::core::float32 ||
+            dtype == mlx::core::float16 || dtype == mlx::core::bfloat16;
+    };
+    if (alpha.ndim() != 3 || alpha.shape(0) <= 0 ||
+        alpha.shape(1) <= 0 || alpha.shape(2) <= 0 ||
+        beta.shape() != alpha.shape() || dt_bias.ndim() != 1 ||
+        decay_scale.ndim() != 1 || dt_bias.shape(0) != alpha.shape(2) ||
+        decay_scale.shape(0) != alpha.shape(2) ||
+        !floating(alpha.dtype()) || !floating(beta.dtype()) ||
+        !floating(dt_bias.dtype()) || !floating(decay_scale.dtype())) {
+        throw std::invalid_argument("Gated DeltaNet gate geometry/dtype mismatch");
+    }
+    const char* setting = std::getenv("MFQ_METAL_GDN_GATES");
+    if (setting != nullptr && std::string(setting) == "0") {
+        auto input = mlx::core::astype(alpha, mlx::core::float32) +
+            mlx::core::astype(dt_bias, mlx::core::float32);
+        auto softplus = mlx::core::maximum(input, array(0.0f)) +
+            mlx::core::log1p(mlx::core::exp(-mlx::core::abs(input)));
+        return {
+            mlx::core::transpose(
+                mlx::core::astype(decay_scale, mlx::core::float32) * softplus,
+                {0, 2, 1}),
+            mlx::core::transpose(
+                mlx::core::sigmoid(mlx::core::astype(beta, mlx::core::float32)),
+                {0, 2, 1}),
+        };
+    }
+    const Shape output_shape{alpha.shape(0), alpha.shape(2), alpha.shape(1)};
+    auto outputs = gdn_gates_kernel()(
+        {alpha, beta, dt_bias, decay_scale},
+        {output_shape, output_shape},
+        {mlx::core::float32, mlx::core::float32},
+        {checked_int(alpha.size(), "Gated DeltaNet gate grid"), 1, 1},
+        {256, 1, 1},
+        {
+            {"BATCH", alpha.shape(0)},
+            {"TOKENS", alpha.shape(1)},
+            {"HEADS", alpha.shape(2)},
+        },
+        std::nullopt,
+        false,
+        {});
+    return {std::move(outputs.at(0)), std::move(outputs.at(1))};
+}
+
+MlxGatedDeltaDecodeResult gated_delta_decode_step(
+    const array& qk,
+    const array& value,
+    const array& output_gate,
+    const array& alpha,
+    const array& beta,
+    const array& convolution_state,
+    const array& recurrent_state,
+    const array& convolution_weight,
+    const array& dt_bias,
+    const array& decay_scale,
+    const array& norm_weight,
+    int key_heads,
+    int value_heads,
+    int dimension,
+    float convolution_eps,
+    float norm_eps,
+    bool output_gate_silu) {
+    auto qk_values = real_contiguous(qk);
+    auto value_values = real_contiguous(value);
+    auto output_gate_values = real_contiguous(output_gate);
+    auto alpha_values = real_contiguous(alpha);
+    auto beta_values = real_contiguous(beta);
+    auto convolution_state_values = float32_contiguous(convolution_state);
+    auto recurrent_state_values = float32_contiguous(recurrent_state);
+    auto bias_values = float32_contiguous(dt_bias);
+    auto decay_values = float32_contiguous(decay_scale);
+    auto norm_values = float32_contiguous(norm_weight);
+
+    if (key_heads <= 0 || value_heads <= 0 ||
+        value_heads % key_heads != 0 || dimension != 128 ||
+        !std::isfinite(convolution_eps) || convolution_eps <= 0.0f ||
+        !std::isfinite(norm_eps) || norm_eps <= 0.0f) {
+        throw std::invalid_argument(
+            "Gated DeltaNet decode-step geometry is unsupported");
+    }
+    const int qk_width = 2 * key_heads * dimension;
+    const int value_width = value_heads * dimension;
+    const int channels = qk_width + value_width;
+    if (qk_values.shape() != Shape{1, 1, qk_width} ||
+        value_values.shape() != Shape{1, 1, value_width} ||
+        output_gate_values.shape() != Shape{1, 1, value_width} ||
+        alpha_values.shape() != Shape{1, 1, value_heads} ||
+        beta_values.shape() != Shape{1, 1, value_heads} ||
+        convolution_state_values.shape() != Shape{1, 3, channels} ||
+        recurrent_state_values.shape() !=
+            Shape{1, value_heads, dimension, dimension} ||
+        bias_values.shape() != Shape{value_heads} ||
+        decay_values.shape() != Shape{value_heads} ||
+        norm_values.shape() != Shape{dimension}) {
+        throw std::invalid_argument(
+            "Gated DeltaNet decode-step tensors disagree with geometry");
+    }
+    const auto packed_weight =
+        normalize_conv_weight(convolution_weight, channels);
+    if (packed_weight.kernel != 4) {
+        throw std::invalid_argument(
+            "Gated DeltaNet decode-step requires four convolution taps");
+    }
+
+    const array parameters(
+        {convolution_eps, norm_eps},
+        Shape{2});
+    auto outputs = gdn_decode_step_kernel()(
+        {
+            qk_values,
+            value_values,
+            output_gate_values,
+            alpha_values,
+            beta_values,
+            convolution_state_values,
+            recurrent_state_values,
+            packed_weight.values,
+            bias_values,
+            decay_values,
+            norm_values,
+            parameters,
+        },
+        {
+            Shape{1, 1, value_width},
+            convolution_state_values.shape(),
+            recurrent_state_values.shape(),
+        },
+        {
+            mlx::core::float32,
+            mlx::core::float32,
+            mlx::core::float32,
+        },
+        {32, dimension / 8, value_heads},
+        {32, dimension / 8, 1},
+        {
+            {"HK", key_heads},
+            {"HV", value_heads},
+            {"D", dimension},
+            {"C", channels},
+            {"OUTPUT_GATE_SILU", static_cast<int>(output_gate_silu)},
+        },
+        std::nullopt,
+        false,
+        {});
+    return {
+        std::move(outputs.at(0)),
+        std::move(outputs.at(1)),
+        std::move(outputs.at(2)),
+    };
+}
 
 MlxGatedDeltaNetResult gated_delta_net(
     const array& query,
