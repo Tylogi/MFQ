@@ -194,13 +194,15 @@ def _worker_tokenizer(tmp_path, *, cacheable_tokens=False):
     return ensure_hf_tokenizer_gguf(tokenizer_source, tmp_path / "tokenizer-cache")
 
 
-def test_native_worker_reports_resource_breakdown_over_stdio(tmp_path):
+@pytest.mark.parametrize("quantized", [False, True])
+def test_native_worker_reports_resource_breakdown_over_stdio(tmp_path, quantized):
     from mfq.server.runtime.client import StdioRuntimeClient
 
     executable = Path(__file__).resolve().parents[1] / "build/cpp_runtime/metal/mfq-decode-metal"
     if not executable.is_file():
         pytest.skip("build mfq-decode-metal to exercise real worker telemetry")
-    _, model = _models(tmp_path)
+    models = _models(tmp_path)
+    model = models[int(quantized)]
     tokenizer = _worker_tokenizer(tmp_path)
 
     async def run():
@@ -224,6 +226,14 @@ def test_native_worker_reports_resource_breakdown_over_stdio(tmp_path):
                 repeated = await client.status()
                 assert repeated["resident_weight_bytes"] == status["resident_weight_bytes"]
                 assert repeated["kv_cache_bytes"] == 0
+                before = repeated["ple_source_bytes_read"]
+                async with client.generate({"messages": [{"role": "user", "content": "ab" * 4}],
+                        "temperature": 0, "max_tokens": 2, "stream": True}) as events:
+                    chunks = [event async for event in events if event is not None]
+                assert chunks
+                after = await client.status()
+                assert after["ple_source_bytes_read"] > before
+                assert (await client.status())["ple_source_bytes_read"] == after["ple_source_bytes_read"]
             finally:
                 with suppress(Exception):
                     await client.aclose()

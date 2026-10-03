@@ -1202,6 +1202,8 @@ public:
                 const auto shard = static_cast<std::size_t>(row / rows_);
                 shards_[shard].nint->append_row(row % rows_, selected);
             }
+            MlxResourceTelemetry::ple_read_counter().fetch_add(
+                selected.source_bytes_read(), std::memory_order_relaxed);
             return mlx::core::reshape(
                 selected.decode(), Shape{batch, tokens, heads * static_cast<int>(width_)});
         }
@@ -1223,6 +1225,8 @@ public:
         auto output = array(
             result.begin(),
             Shape{batch, tokens, heads * static_cast<int>(width_)});
+        MlxResourceTelemetry::ple_read_counter().fetch_add(
+            global.size() * static_cast<std::size_t>(width_), std::memory_order_relaxed);
         return output;
     }
 

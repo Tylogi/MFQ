@@ -14,6 +14,7 @@ vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh:
 vi.mock('./MemorySettingsPanel', () => ({ MemorySettingsPanel: () => null }));
 vi.mock('./InferenceDefaultsPanel', () => ({ InferenceDefaultsPanel: () => null }));
 vi.mock('./ToolsRoutingPanel', () => ({ ToolsRoutingPanel: () => null }));
+vi.mock('../runtime/RuntimeProfilesPanel', () => ({ RuntimeProfilesPanel: () => <h2>Runtime profiles</h2> }));
 vi.mock('../../studio', () => ({ isStudio: () => false, studioCredential: async () => '' }));
 
 beforeEach(() => {
@@ -27,6 +28,8 @@ afterEach(() => { vi.restoreAllMocks(); localStorage.clear(); setApiBaseUrl('');
 it('网页端可编辑端口，保存实际更改监听并持久化连接地址', async () => {
   const change = vi.spyOn(runtimeApi, 'configureRuntimeListener').mockResolvedValue({ host: '127.0.0.1', port: 8091, configurable: true });
   render(<MemoryRouter><ConnectionsPage /></MemoryRouter>);
+  expect(screen.getByRole('heading', { name: /^Service$/ })).toBeInTheDocument();
+  expect(screen.getByRole('heading', { name: 'Runtime profiles' })).toBeInTheDocument();
   const port = screen.getByRole('spinbutton', { name: 'Port' });
   await waitFor(() => expect(runtimeApi.runtimeListener).toHaveBeenCalled());
   fireEvent.change(port, { target: { value: '8091' } });

@@ -15,6 +15,7 @@ import { getApiBaseUrl, setApiToken, setBrowserServiceUrl } from '../../shared/a
 import { useSettings } from '../settings/SettingsProvider';
 import { ToolsRoutingPanel } from './ToolsRoutingPanel';
 import { MemorySettingsPanel } from './MemorySettingsPanel';
+import { RuntimeProfilesPanel } from '../runtime/RuntimeProfilesPanel';
 import { ModelAliasMapping } from './ModelAliasMapping';
 import { toast } from '../../stores/toastStore';
 
@@ -123,7 +124,7 @@ export function ConnectionsPage() {
   return (
     <section className="dashboard-view">
       <ScreenHeader
-        title={tr('服务器', 'Server')}
+        title={tr('服务', 'Service')}
         subtitle={tr(
           '运行服务、连接与模型默认值。',
           'Runtime service, connections, and model defaults.',
@@ -292,6 +293,7 @@ export function ConnectionsPage() {
           </button>
         </div>
       </div>
+      <RuntimeProfilesPanel />
       <ToolsRoutingPanel />
     </section>
   );

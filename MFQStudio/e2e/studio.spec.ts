@@ -2,6 +2,34 @@
 import { expect, test, type Page } from '@playwright/test';
 import { mockStudioServer, officialCatalog } from './mockServer';
 
+test('resource telemetry and service profiles have separate responsive homes', async ({ page }, testInfo) => {
+  await mockStudioServer(page);
+  let samples = 0;
+  await page.route('**/api/v1/runtime/resources', (route) => {
+    samples++;
+    return route.fulfill({ json: { sampled_at: 100 + samples * 2, interval_seconds: 2,
+      cpu_utilization_percent: samples > 1 ? 43 : 36, gpus: [{ name: 'Apple M5 Max', utilization_percent: 24 }],
+      memory_bandwidth_bytes_per_second: null, memory_bandwidth_limit_bytes_per_second: 614e9,
+      memory_bandwidth_utilization_percent: null, disks: [{ name: 'disk0', read_bytes_per_second: 2 ** 30,
+        write_bytes_per_second: 2 ** 20, busy_percent: null, bandwidth_utilization_percent: null }],
+      weights: [{ instance_id: 'test-model', model: 'Qwen3.8-Flash-Next', expert_read_bytes_per_second: 0,
+        ple_read_bytes_per_second: 2 ** 20, engram_read_bytes_per_second: null }] } });
+  });
+  await page.goto('/resources');
+  await expect(page.getByText('Resource monitoring', { exact: true })).toBeVisible();
+  await expect(page.getByRole('meter', { name: 'CPU' })).toHaveAttribute('aria-valuenow', '36');
+  await expect(page.getByRole('meter', { name: 'CPU' })).toHaveAttribute('aria-valuenow', '43');
+  await expect(page.getByText('Runtime profiles', { exact: true })).toHaveCount(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.locator('.resource-monitor-panel').screenshot({ path: testInfo.outputPath('resource-monitor.png') });
+  await page.goto('/runtime');
+  await expect(page.getByRole('heading', { name: 'Service', exact: true })).toBeVisible();
+  await expect(page.getByText('Runtime profiles', { exact: true })).toBeVisible();
+  await expect(page.getByText('Resource monitoring', { exact: true })).toHaveCount(0);
+  await page.goto('/resources');
+  await expect(page.getByRole('meter', { name: 'CPU' })).toHaveAttribute('aria-valuenow', '43');
+});
+
 declare global {
   interface Window {
     revokedPreviews: string[];
@@ -324,7 +352,7 @@ test('运行资源按模型分段，四个槽共享颜色，端点包含 v1', as
     runtime_memory_budget_bytes: 32 * 2 ** 30, runtime_memory_effective_budget_bytes: 20 * 2 ** 30,
   } }));
   await page.goto('/');
-  await expect(page.getByText('Resource hierarchy', { exact: true })).toBeVisible();
+  await expect(page.getByText('Resource overview', { exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Runtime resources', exact: true })).toBeVisible();
   await expect(page.locator('.memory-model-legend i')).toHaveCount(4);
   await expect(page.getByText('10 contexts · 20 cache blocks')).toBeVisible();

@@ -46,7 +46,7 @@ it('displays and copies the same OpenAI SDK URL with /v1', async () => {
     .toHaveTextContent('http://127.0.0.1:8090/v1');
   fireEvent.click(screen.getByRole('button', { name: 'Copy endpoint' }));
   await waitFor(() => expect(writeText).toHaveBeenCalledWith('http://127.0.0.1:8090/v1'));
-  expect(screen.getByText('Resource hierarchy')).toBeInTheDocument();
+  expect(screen.getByText('Resource overview')).toBeInTheDocument();
   expect(screen.getByText('Runtime resources')).toBeInTheDocument();
 });
 

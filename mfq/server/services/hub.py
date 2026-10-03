@@ -152,12 +152,12 @@ _OFFICIAL_MODELS = (
         family="DeepSeek-V4-Flash Series",
         architecture="deepseek_v4",
         description=(
-            "Official native-QAT release with expert-wise MFQ variants, MTP, "
-            "and SSD-streamed expert execution for memory-constrained systems."
+            "DeepSeek V4 Flash-series MoE model with approximately 160B total and "
+            "6B active parameters per token. Supports MTP and SSD expert streaming."
         ),
         description_zh=(
-            "官方原生 QAT 版本，提供逐专家 MFQ 精度版本、MTP，以及面向内存受限设备的 "
-            "SSD 专家流式推理。"
+            "DeepSeek V4 Flash 系列 MoE 模型，约 160B 总参数、每 token 激活约 6B，"
+            "支持 MTP 与 SSD 专家流式加载。"
         ),
         parameter_label="~160B total",
         active_parameter_label="~6B active per token",
@@ -178,14 +178,14 @@ _OFFICIAL_MODELS = (
     _OfficialModelSpec(
         id="qwen3-8-27b",
         name="Qwen3.8-27B",
-        family="Qwen3.5–3.8",
+        family="Qwen3.8",
         architecture="qwen3_5",
         description=(
-            "Dense 27B MFQ release with scalar and vector-quantized quality tiers "
-            "for high-throughput local inference."
+            "A 27B dense model in the Qwen3.8 series for coding, reasoning, and "
+            "multi-step agent tasks, with native image and video understanding."
         ),
         description_zh=(
-            "27B 稠密 MFQ 版本，提供标量与向量量化的多档质量选择，面向高吞吐本地推理。"
+            "Qwen3.8 系列的 27B 稠密模型，面向编程、推理与多步骤智能体任务，原生支持图像与视频理解。"
         ),
         parameter_label="27B",
         active_parameter_label="27B active per token",
@@ -198,14 +198,14 @@ _OFFICIAL_MODELS = (
     _OfficialModelSpec(
         id="qwen3-6-27b",
         name="Qwen3.6-27B",
-        family="Qwen3.5–3.8",
+        family="Qwen3.6",
         architecture="qwen3_5",
         description=(
-            "Dense 27B MFQ release spanning compact VQ and higher-fidelity SQ "
-            "tiers for Apple and CUDA runtimes."
+            "A 27B dense model in the Qwen3.6 series with text reasoning, image "
+            "and video understanding, and multi-token prediction."
         ),
         description_zh=(
-            "27B 稠密 MFQ 版本，覆盖紧凑 VQ 与更高保真 SQ 精度档，支持 Apple 与 CUDA 运行时。"
+            "Qwen3.6 系列的 27B 稠密模型，支持文本推理、图像与视频理解，以及多 token 预测。"
         ),
         parameter_label="27B",
         active_parameter_label="27B active per token",
@@ -221,11 +221,11 @@ _OFFICIAL_MODELS = (
         family="MiniCPM-o",
         architecture="minicpmo",
         description=(
-            "Omnimodal MFQ release for text, image, video, audio, speech output, "
+            "MiniCPM-o 4.5 omnimodal model for text, image, video, audio, speech output, "
             "and full-duplex interaction."
         ),
         description_zh=(
-            "全模态 MFQ 版本，支持文本、图像、视频、音频、语音输出与全双工交互。"
+            "MiniCPM-o 4.5 全模态模型，支持文本、图像、视频、音频、语音输出与全双工交互。"
         ),
         parameter_label=None,
         active_parameter_label=None,
@@ -880,12 +880,13 @@ class HubCatalog:
             info = self._official_cache.get((provider, repo_id)) or next((value for (_, repo), value in self._official_cache.items() if repo.casefold() == repo_id.casefold() and value is not None), None)
             display_name = re.split(r'-(?:EWQ?|MFQ)(?:-|$)', name, maxsplit=1, flags=re.IGNORECASE)[0]
             ple_label = f'约 {info.ple_parameter_count / 1e9:.1f}B 参数' if info and info.ple_parameter_count else '大规模'
-            flash_next = bool(info and any(architecture.lower().startswith(('qwen4', 'qwen3next')) for architecture in info.architectures) and 'flash-next' in display_name.casefold())
+            ple_label_en = f'approximately {info.ple_parameter_count / 1e9:.1f}B parameters' if info and info.ple_parameter_count else 'large PLE tables'
+            flash_next = 'flash-next' in display_name.casefold()
             specs[key] = _OfficialModelSpec(
                 id='tylogi-' + hashlib.sha256(key.encode()).hexdigest()[:16], name=display_name,
                 family=display_name, architecture=info.architectures[0] if info and info.architectures else 'unknown',
-                description=(f'High-performance low-precision compact MoE model with approximately {info.ple_parameter_count / 1e9:.1f}B PLE parameters. PLE tables stream row-wise from SSD without full-table memory residency.' if flash_next and info.ple_parameter_count else info.description if info and info.description else 'Official MFQ model published by Tylogi.'),
-                description_zh=f'高性能、低精度的中小型 MoE 模型，带有{ple_label}的 PLE 表，可高效卸载至 SSD，按行读取且无需整表常驻内存。' if flash_next else 'Tylogi 发布的官方 MFQ 模型。', parameter_label=None, active_parameter_label=None,
+                description=(f'High-performance, fast compact MoE model with {ple_label_en}. PLE tables stream row-wise from SSD without full-table memory residency.' if flash_next else info.description if info and info.description else f'{display_name} model published by Tylogi in MFQ format.'),
+                description_zh=f'高性能、快速的中小型 MoE 模型，带有{ple_label}的 PLE 表，可高效卸载至 SSD，按行读取且无需整表常驻内存。' if flash_next else f'{display_name} 模型，提供 MFQ 格式的精度版本。', parameter_label=None, active_parameter_label=None,
                 modalities=tuple(info.modalities) if info and info.modalities else ('text',), capabilities=('MoE', 'PLE', 'SSD PLE streaming') if flash_next else (), precision_options=(),
                 license=info.license if info else None, sources=(source,),
             )

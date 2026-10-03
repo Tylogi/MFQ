@@ -2150,6 +2150,8 @@ private:
             {"mlx_cache_bytes", static_cast<double>(mlx::core::get_cache_memory())},
             {"mlx_cache_limit_bytes", static_cast<double>(allocator_cache_limit)},
             {"mlx_peak_bytes", static_cast<double>(mlx::core::get_peak_memory())},
+            {"ple_source_bytes_read", static_cast<double>(
+                mfq::metal::MlxResourceTelemetry::ple_read_counter().load(std::memory_order_relaxed))},
         };
         std::unique_lock lock(*runtime_mutex, std::try_to_lock);
         if (lock.owns_lock() && runtime_holder->has_value()) {

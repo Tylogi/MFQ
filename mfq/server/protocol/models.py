@@ -745,6 +745,39 @@ class ModelUnloadRequest(ProtocolModel):
     force: bool = False
 
 
+class RuntimeGpuUtilization(ProtocolModel):
+    name: str
+    utilization_percent: float | None = Field(default=None, ge=0, le=100)
+
+
+class RuntimeDiskTraffic(ProtocolModel):
+    name: str
+    read_bytes_per_second: float | None = Field(default=None, ge=0)
+    write_bytes_per_second: float | None = Field(default=None, ge=0)
+    busy_percent: float | None = Field(default=None, ge=0, le=100)
+    bandwidth_utilization_percent: float | None = Field(default=None, ge=0, le=100)
+
+
+class RuntimeWeightTraffic(ProtocolModel):
+    instance_id: str
+    model: str
+    expert_read_bytes_per_second: float | None = Field(default=None, ge=0)
+    ple_read_bytes_per_second: float | None = Field(default=None, ge=0)
+    engram_read_bytes_per_second: float | None = Field(default=None, ge=0)
+
+
+class RuntimeResourceSnapshot(ProtocolModel):
+    sampled_at: float = Field(ge=0)
+    interval_seconds: float | None = Field(default=None, ge=0)
+    cpu_utilization_percent: float | None = Field(default=None, ge=0, le=100)
+    gpus: list[RuntimeGpuUtilization]
+    disks: list[RuntimeDiskTraffic]
+    memory_bandwidth_bytes_per_second: float | None = Field(default=None, ge=0)
+    memory_bandwidth_limit_bytes_per_second: int | None = Field(default=None, gt=0)
+    memory_bandwidth_utilization_percent: float | None = Field(default=None, ge=0, le=100)
+    weights: list[RuntimeWeightTraffic]
+
+
 class RuntimeMemoryResources(ProtocolModel):
     """Physical residency and file payloads are separate, never added together.
 

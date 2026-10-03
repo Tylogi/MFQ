@@ -34,6 +34,22 @@ from tests.test_server_service import FakeBackend
 _DISCOVER_OFFICIAL = HubCatalog._discover_official
 
 
+def test_official_model_descriptions_use_exact_generations_and_model_capabilities():
+    specs = {item.name: item for item in _OFFICIAL_MODELS}
+    for version in ("3.6", "3.8"):
+        spec = specs[f"Qwen{version}-27B"]
+        assert spec.family == f"Qwen{version}"
+        assert f"Qwen{version} 系列的 27B 稠密模型" in spec.description_zh
+        assert "图像与视频理解" in spec.description_zh
+        assert "27B 稠密 MFQ 版本" not in spec.description_zh
+    catalog = HubCatalog()
+    catalog._discovered_sources.add(("modelscope", "Tylogi/Qwen3.8-Flash-Next-EWQ-V1-MFQ"))
+    flash = next(item for item in catalog._official_specs() if "Flash-Next" in item.name)
+    assert "高性能、快速" in flash.description_zh
+    assert "低精度" not in flash.description_zh
+    assert "PLE" in flash.description_zh
+
+
 @pytest.fixture(autouse=True)
 def no_live_author_discovery(monkeypatch):
     async def discover(provider):

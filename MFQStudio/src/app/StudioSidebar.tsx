@@ -61,7 +61,7 @@ export function StudioSidebar() {
         count: activeRequests > 0 ? activeRequests : undefined },
       { label: ['模型', 'Models'], icon: 'folder', path: dashboard('models'),
         active: view === 'dashboard' && dashboardPage === 'models', current: true },
-      { label: ['服务器', 'Server'], icon: 'server-rack', path: '/runtime',
+      { label: ['服务', 'Service'], icon: 'server-rack', path: '/runtime',
         active: view === 'dashboard' && dashboardPage === 'connections', current: true },
       { label: ['资源', 'Resources'], icon: 'memory', path: dashboard('cache'),
         active: view === 'dashboard' && dashboardPage === 'cache', current: true },

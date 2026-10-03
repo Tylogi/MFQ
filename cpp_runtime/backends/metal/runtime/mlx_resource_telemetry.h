@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -42,6 +43,11 @@ class MlxResourceTelemetry {
     }
 
 public:
+    static std::atomic<std::size_t>& ple_read_counter() {
+        static std::atomic<std::size_t> value{0};
+        return value;
+    }
+
     MlxResourceTelemetry() = default;
     MlxResourceTelemetry(MlxResourceTelemetry&&) noexcept = default;
     MlxResourceTelemetry& operator=(MlxResourceTelemetry&&) noexcept = default;

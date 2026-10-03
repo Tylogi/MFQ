@@ -31,6 +31,7 @@ from mfq.server.protocol.models import (
     RuntimeProfileLoadRequest,
     RuntimeProfileResource,
     RuntimeReloadRequest,
+    RuntimeResourceSnapshot,
     RuntimeListenerRequest,
     RuntimeMemoryPolicy,
     RuntimeModelAliases,
@@ -40,6 +41,15 @@ from mfq.server.protocol.models import (
 
 profile_router = APIRouter()
 router = APIRouter()
+
+
+@router.get("/api/v1/runtime/resources", response_model=RuntimeResourceSnapshot, responses=ERROR_RESPONSES, tags=["runtime"])
+async def runtime_resources(service: ServiceDependency) -> dict[str, Any]:
+    from mfq.server.services.resource_monitor import ResourceMonitor
+
+    if not hasattr(service, "resource_monitor"):
+        service.resource_monitor = ResourceMonitor()
+    return await service.resource_monitor.sample(service)
 
 
 @router.get("/api/v1/runtime/model-aliases", response_model=RuntimeModelAliases, responses=ERROR_RESPONSES, tags=["runtime"])

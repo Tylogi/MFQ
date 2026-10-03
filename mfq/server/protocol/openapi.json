@@ -5201,6 +5201,97 @@
         "title": "RuntimeCapabilitiesResource",
         "type": "object"
       },
+      "RuntimeDiskTraffic": {
+        "additionalProperties": false,
+        "properties": {
+          "bandwidth_utilization_percent": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bandwidth Utilization Percent"
+          },
+          "busy_percent": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Busy Percent"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "read_bytes_per_second": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Read Bytes Per Second"
+          },
+          "write_bytes_per_second": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Write Bytes Per Second"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "RuntimeDiskTraffic",
+        "type": "object"
+      },
+      "RuntimeGpuUtilization": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "utilization_percent": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Utilization Percent"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "RuntimeGpuUtilization",
+        "type": "object"
+      },
       "RuntimeIdentity": {
         "additionalProperties": false,
         "properties": {
@@ -5989,6 +6080,162 @@
           "context_size"
         ],
         "title": "RuntimeReloadRequest",
+        "type": "object"
+      },
+      "RuntimeResourceSnapshot": {
+        "additionalProperties": false,
+        "properties": {
+          "cpu_utilization_percent": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cpu Utilization Percent"
+          },
+          "disks": {
+            "items": {
+              "$ref": "#/components/schemas/RuntimeDiskTraffic"
+            },
+            "title": "Disks",
+            "type": "array"
+          },
+          "gpus": {
+            "items": {
+              "$ref": "#/components/schemas/RuntimeGpuUtilization"
+            },
+            "title": "Gpus",
+            "type": "array"
+          },
+          "interval_seconds": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interval Seconds"
+          },
+          "memory_bandwidth_bytes_per_second": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Bandwidth Bytes Per Second"
+          },
+          "memory_bandwidth_limit_bytes_per_second": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Bandwidth Limit Bytes Per Second"
+          },
+          "memory_bandwidth_utilization_percent": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Bandwidth Utilization Percent"
+          },
+          "sampled_at": {
+            "minimum": 0.0,
+            "title": "Sampled At",
+            "type": "number"
+          },
+          "weights": {
+            "items": {
+              "$ref": "#/components/schemas/RuntimeWeightTraffic"
+            },
+            "title": "Weights",
+            "type": "array"
+          }
+        },
+        "required": [
+          "sampled_at",
+          "gpus",
+          "disks",
+          "weights"
+        ],
+        "title": "RuntimeResourceSnapshot",
+        "type": "object"
+      },
+      "RuntimeWeightTraffic": {
+        "additionalProperties": false,
+        "properties": {
+          "engram_read_bytes_per_second": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Engram Read Bytes Per Second"
+          },
+          "expert_read_bytes_per_second": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expert Read Bytes Per Second"
+          },
+          "instance_id": {
+            "title": "Instance Id",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "ple_read_bytes_per_second": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ple Read Bytes Per Second"
+          }
+        },
+        "required": [
+          "instance_id",
+          "model"
+        ],
+        "title": "RuntimeWeightTraffic",
         "type": "object"
       },
       "SamplingParams": {
@@ -17342,6 +17589,137 @@
           }
         },
         "summary": "Reload Runtime",
+        "tags": [
+          "runtime"
+        ]
+      }
+    },
+    "/api/v1/runtime/resources": {
+      "get": {
+        "operationId": "runtime_resources_api_v1_runtime_resources_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeResourceSnapshot"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Runtime Resources",
         "tags": [
           "runtime"
         ]

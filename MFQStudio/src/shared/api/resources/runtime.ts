@@ -2,6 +2,7 @@
 import type {
   RuntimeCapabilities,
   RuntimeStatus,
+  RuntimeResources,
   RuntimeListener,
   RuntimeModel,
   RuntimeInstance,
@@ -21,6 +22,9 @@ export interface RuntimeMemoryPolicy {
 }
 
 export const runtimeApi = {
+  runtimeResources(): Promise<RuntimeResources> {
+    return request('/api/v1/runtime/resources');
+  },
   modelAliases(): Promise<{ aliases: Record<string, string> }> {
     return request('/api/v1/runtime/model-aliases');
   },

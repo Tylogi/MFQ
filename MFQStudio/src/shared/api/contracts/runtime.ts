@@ -141,6 +141,21 @@ export interface RuntimeListener {
   configurable: boolean;
 }
 
+export interface RuntimeResources {
+  sampled_at: number;
+  interval_seconds: number | null;
+  cpu_utilization_percent: number | null;
+  gpus: { name: string; utilization_percent: number | null }[];
+  memory_bandwidth_bytes_per_second: number | null;
+  memory_bandwidth_limit_bytes_per_second: number | null;
+  memory_bandwidth_utilization_percent: number | null;
+  disks: { name: string; read_bytes_per_second: number | null;
+    write_bytes_per_second: number | null; busy_percent: number | null;
+    bandwidth_utilization_percent: number | null }[];
+  weights: { instance_id: string; model: string; expert_read_bytes_per_second: number | null;
+    ple_read_bytes_per_second: number | null; engram_read_bytes_per_second: number | null }[];
+}
+
 export interface RuntimeModel {
   id: string;
   object?: string;
