@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { SettingRow } from '../../app/display';
 import { errorMessage, formatNumber } from '../../app/formatters';
-import { ModelVendorMark } from '../../app/ModelVendorMark';
 import { useSettings } from '../settings/SettingsProvider';
 import { toast } from '../../stores/toastStore';
 import { runtimeApi } from '../../shared/api/resources/runtime';
@@ -65,7 +64,6 @@ export function ModelContextSettings() {
               onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: event.target.value }))} />
             <span>tokens</span>
           </div>
-          <ModelVendorMark name={item.model} size={18} />
           <button aria-label={tr(`重载 ${item.model}`, `Reload ${item.model}`)}
             disabled={busy || !valid} onClick={() => void reload(item.id, size, item.model)} type="button">
             {busy ? tr('重载中…', 'Reloading…') : tr('重载', 'Reload')}

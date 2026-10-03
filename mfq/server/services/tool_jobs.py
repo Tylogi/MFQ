@@ -20,7 +20,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from mfq.server.api.network import system_proxy_environment
+from mfq.server.api.network import download_environment
 from mfq.server.protocol.models import ErrorDetail
 from mfq.server.services.jobs import JobContext, JobExecutionError, TypedJobHandler
 from mfq.server.state.catalog import ModelArtifactNotFoundError, ModelCatalog
@@ -513,7 +513,8 @@ class ToolJobHandlers:
                     argv.extend(["--exclude", pattern])
             else:
                 argv.extend(["--exclude", *request.exclude])
-        env = self._environment(direct=request.direct)
+        env, proxy = await download_environment("https://modelscope.cn", direct=request.direct)
+        await context.log("Download connection: proxy fallback" if proxy else "Download connection: direct")
         await context.progress(0.01, message="Starting ModelScope download")
         await self._run(context, argv, env=env)
         return await self._download_result(
@@ -557,7 +558,9 @@ class ToolJobHandlers:
         for pattern in request.exclude:
             argv.extend(["--exclude", pattern])
         await context.progress(0.01, message="Starting Hugging Face download")
-        await self._run(context, argv, env=self._environment())
+        env, proxy = await download_environment(os.environ.get("HF_ENDPOINT", "https://huggingface.co"))
+        await context.log("Download connection: proxy fallback" if proxy else "Download connection: direct")
+        await self._run(context, argv, env=env)
         return await self._download_result(
             context,
             destination,
@@ -1144,23 +1147,6 @@ class ToolJobHandlers:
         if value is None or not value.is_file():
             raise ToolJobHandlers._failure("tool_unavailable", f"{name} executable is unavailable")
         return value
-
-    @staticmethod
-    def _environment(*, direct: bool = False) -> dict[str, str]:
-        env = system_proxy_environment()
-        if direct:
-            for name in (
-                "http_proxy",
-                "https_proxy",
-                "HTTP_PROXY",
-                "HTTPS_PROXY",
-                "ALL_PROXY",
-                "all_proxy",
-            ):
-                env.pop(name, None)
-            env["NO_PROXY"] = "*"
-            env["no_proxy"] = "*"
-        return env
 
     @staticmethod
     def _failure(code: str, message: str, *, retryable: bool = False) -> JobExecutionError:

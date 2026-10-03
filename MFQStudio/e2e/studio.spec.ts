@@ -52,6 +52,14 @@ test('每个模型独立修改 ctx，点击立即发送重载且不丢失另一�
   const dense = page.getByRole('spinbutton', { name: 'Qwen3.8-27B-S4-M maximum context' });
   await expect(flash).toHaveValue('32768');
   await expect(dense).toHaveValue('16384');
+  const contexts = page.locator('.model-context-settings');
+  await expect(contexts.locator('svg')).toHaveCount(0);
+  expect(await contexts.evaluate((element) => {
+    const heading = element.querySelector('.model-context-heading')!;
+    const row = heading.nextElementSibling!;
+    return Number.parseFloat(getComputedStyle(heading).paddingTop) >= 16
+      && getComputedStyle(row).borderTopWidth === '0px';
+  })).toBe(true);
   await flash.fill('8192');
   await dense.fill('65536');
   await page.getByRole('button', { name: 'Reload Qwen3.8-Flash-S4-L' }).click();

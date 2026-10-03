@@ -60,31 +60,32 @@ class HubError(RuntimeError):
     pass
 
 
-class _ProxyFallbackTransport(httpx.AsyncBaseTransport):
-    """Try the configured proxy first, then direct for a failed metadata connection."""
-
+class _DirectFirstTransport(httpx.AsyncBaseTransport):
     def __init__(self, proxy: str, verify: ssl.SSLContext | bool) -> None:
-        self._proxy = httpx.AsyncHTTPTransport(proxy=proxy, verify=verify, trust_env=False)
-        self._direct: httpx.AsyncHTTPTransport | None = None
+        self._proxy_url = proxy
+        self._proxy: httpx.AsyncHTTPTransport | None = None
+        self._direct = httpx.AsyncHTTPTransport(verify=verify, trust_env=False)
+        self._proxy_hosts: set[str] = set()
         self._verify = verify
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        if self._direct is None:
+        if request.url.host not in self._proxy_hosts:
             try:
-                return await self._proxy.handle_async_request(request)
-            except (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout):
+                return await self._direct.handle_async_request(request)
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError):
                 if request.method not in {"GET", "HEAD"}:
                     raise
-                if self._direct is None:
-                    self._direct = httpx.AsyncHTTPTransport(verify=self._verify, trust_env=False)
-        return await self._direct.handle_async_request(request)
+                self._proxy_hosts.add(request.url.host)
+        if self._proxy is None:
+            self._proxy = httpx.AsyncHTTPTransport(proxy=self._proxy_url, verify=self._verify, trust_env=False)
+        return await self._proxy.handle_async_request(request)
 
     async def aclose(self) -> None:
         try:
-            await self._proxy.aclose()
+            await self._direct.aclose()
         finally:
-            if self._direct is not None:
-                await self._direct.aclose()
+            if self._proxy is not None:
+                await self._proxy.aclose()
 
 
 def _metadata_client(endpoint: str, **kwargs: Any) -> httpx.AsyncClient:
@@ -107,7 +108,7 @@ def _metadata_client(endpoint: str, **kwargs: Any) -> httpx.AsyncClient:
     return httpx.AsyncClient(
         timeout=httpx.Timeout(_METADATA_TIMEOUT, connect=4.0),
         follow_redirects=True, trust_env=False, verify=verify,
-        transport=_ProxyFallbackTransport(proxy, verify) if proxy else None, **kwargs,
+        transport=_DirectFirstTransport(proxy, verify) if proxy else None, **kwargs,
     )
 
 

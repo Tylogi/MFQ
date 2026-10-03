@@ -7,6 +7,7 @@ import textwrap
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from mfq.formats.header import FileHeader
 from mfq.formats.io import save
@@ -467,6 +468,52 @@ def test_packaged_download_reinvokes_the_unified_cli(tmp_path: Path) -> None:
         assert result.result["files"] == 1
         assert result.result["artifact"] == "workspace://models/owner/model"
         assert (model_root / "owner" / "model" / "config.json").is_file()
+        await manager.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("provider", ("modelscope", "huggingface"))
+@pytest.mark.parametrize("internal", (False, True))
+@pytest.mark.parametrize("proxy", (False, True))
+def test_download_passes_selected_route_to_sdk_and_external_cli(tmp_path, monkeypatch, provider, internal, proxy) -> None:
+    import os
+    import mfq.server.services.tool_jobs as tool_jobs
+
+    async def select(endpoint, *, direct=False):
+        assert endpoint == ("https://modelscope.cn" if provider == "modelscope" else "https://huggingface.co")
+        env = dict(os.environ)
+        for key in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+            env.pop(key, None)
+        env["NO_PROXY"] = "localhost" if proxy else "*"
+        env["MFQ_EXPECT_PROXY"] = str(proxy)
+        if proxy:
+            env["HTTPS_PROXY"] = "http://proxy.test:8080"
+        return env, proxy
+
+    monkeypatch.delenv("HF_ENDPOINT", raising=False)
+    monkeypatch.setattr(tool_jobs, "download_environment", select)
+
+    async def run():
+        executable = _executable(tmp_path / "download-cli", """\
+            #!/usr/bin/env python3
+            import os, pathlib, sys
+            proxy = os.environ['MFQ_EXPECT_PROXY'] == 'True'
+            assert os.environ.get('HTTPS_PROXY') == ('http://proxy.test:8080' if proxy else None)
+            assert os.environ['NO_PROXY'] == ('localhost' if proxy else '*')
+            root = pathlib.Path(sys.argv[sys.argv.index('--local-dir') + 1])
+            root.mkdir(parents=True, exist_ok=True)
+            (root / 'config.json').write_text('{}')
+            """)
+        paths = ToolJobPaths(tmp_path, executable, executable, executable, None, None,
+            standalone_cli=internal, internal_modelscope=internal, internal_huggingface=internal)
+        handlers = ToolJobHandlers(ModelCatalog([]), paths)
+        store = SessionStore(tmp_path / "jobs.sqlite3")
+        manager = JobManager(store, handlers.handlers())
+        submitted = await manager.submit(CreateJobRequest(kind=f"download.{provider}",
+            payload={"repo_id": "owner/model", "destination": "downloads/model"}))
+        result = await _wait(store, submitted.id)
+        assert result.status == JobStatus.SUCCEEDED and result.result["files"] == 1
         await manager.close()
 
     asyncio.run(run())

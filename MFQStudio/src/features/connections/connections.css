@@ -58,7 +58,8 @@
 }
 .server-wide-input { width: min(32vw, 360px); }
 .server-number-input { width: 96px; text-align: right; }
-.model-context-heading { padding-top: 14px; color: var(--ink-soft); font-size: 11px; font-weight: 610; }
+.model-context-heading { border-top: 1px solid var(--line-soft); padding: 18px 0 14px; color: var(--ink-soft); font-size: 11px; font-weight: 610; line-height: 1.5; }
+.model-context-heading + .setting-row { border-top: 0; padding-top: 0; }
 .model-context-settings .setting-row > div:first-child { min-width: 0; }
 .model-context-settings .setting-row > div:first-child > strong { display: block; overflow-wrap: anywhere; }
 .model-context-settings .setting-row-trailing { flex-shrink: 0; }
