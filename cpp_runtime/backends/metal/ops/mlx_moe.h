@@ -61,7 +61,7 @@ public:
 
     // Materialize only the requested experts from a native MFE record and
     // return one ordinary heterogeneous execution weight whose local expert
-    // order matches active_experts. NINTv2, NVQ-JSC, MXFP4, and aligned
+    // order matches active_experts. NINTv2, NVQ1-S/L, NVQ-JSC, MXFP4, and aligned
     // MXFP8 reuse their existing packed kernels after paging.
     MlxMfeWeight grouped_mfe(
         const std::string& name,
@@ -119,6 +119,10 @@ public:
     // projections() * out_per_expert(), in projection-major order.
     static MlxMfeWeight concatenate_projections(
         const std::vector<MlxMfeWeight>& weights);
+
+    // Finalize native two-projection storage at load time and release the
+    // separate source pools. Unsupported split/rotated layouts are unchanged.
+    MlxMfeWeight materialize_packed_projections() const;
 
     // Assemble independently resident single-expert pages into one routed
     // dispatch.  This changes only the packed storage view: every source must

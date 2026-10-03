@@ -1460,14 +1460,14 @@ constexpr const char* kMoeSource = R"METAL(
                     }
                     float4 activation0 = float4(
                         float(x[x_offset + column_base]),
-                        float(x[x_offset + column_base + 1u]),
-                        float(x[x_offset + column_base + 2u]),
-                        float(x[x_offset + column_base + 3u]));
+                        column_base + 1u < uint(K) ? float(x[x_offset + column_base + 1u]) : 0.0f,
+                        column_base + 2u < uint(K) ? float(x[x_offset + column_base + 2u]) : 0.0f,
+                        column_base + 3u < uint(K) ? float(x[x_offset + column_base + 3u]) : 0.0f);
                     float4 activation1 = float4(
-                        float(x[x_offset + column_base + 4u]),
-                        float(x[x_offset + column_base + 5u]),
-                        float(x[x_offset + column_base + 6u]),
-                        float(x[x_offset + column_base + 7u]));
+                        column_base + 4u < uint(K) ? float(x[x_offset + column_base + 4u]) : 0.0f,
+                        column_base + 5u < uint(K) ? float(x[x_offset + column_base + 5u]) : 0.0f,
+                        column_base + 6u < uint(K) ? float(x[x_offset + column_base + 6u]) : 0.0f,
+                        column_base + 7u < uint(K) ? float(x[x_offset + column_base + 7u]) : 0.0f);
                     uint vector = column_base >> 3;
                     for (
                         uint row = 0u;
@@ -5629,6 +5629,7 @@ struct MfeNvqJscStreamLayout {
     int signs = 0;
     int state_bits = 0;
     int index_bits = 0;
+    int auxiliary_bits = 7;
     bool group64 = false;
     std::uint64_t payload_offset = 0;
     std::uint64_t prefix_bytes = 0;
@@ -5970,6 +5971,72 @@ MfeNvqJscStreamLayout parse_streamed_nvq_jsc_layout(
     return result;
 }
 
+// NVQ1-S/L have the same row-major anchor/state/index/auxiliary structure as
+// planar JSC, but use a one-bit delta per group instead of seven-bit signs.
+// Keep the codebook prefix intact and slice packed streams at bit boundaries.
+MfeNvqJscStreamLayout parse_streamed_nvq1_layout(
+    const MfqContainer& model,
+    const std::string& name,
+    std::uint64_t payload_offset,
+    std::uint64_t payload_bytes,
+    int expected_rows,
+    int expected_columns) {
+    constexpr std::size_t header_bytes = 40;
+    if (payload_bytes < header_bytes) {
+        throw std::runtime_error("truncated streamed NVQ1 header: " + name);
+    }
+    const auto header = model.read_range(name, payload_offset, header_bytes);
+    const bool short_profile = std::memcmp(header.data(), "NQ1S", 4) == 0;
+    const bool long_profile = std::memcmp(header.data(), "NQ1L", 4) == 0;
+    const int profile = header[4];
+    const int state_bits = header[5];
+    const auto group_size = tpq_scalar<std::uint16_t>(header, 6, "NVQ1 group size");
+    if ((!short_profile && !long_profile) ||
+        (short_profile && (profile != 1 || state_bits != 4 ||
+                           group_size != 24 || expected_columns % 8 != 0)) ||
+        (long_profile && ((profile != 1 && profile != 2) ||
+                          state_bits < 1 || state_bits > 8 ||
+                          group_size == 0 || group_size % 8 != 0)) ||
+        tpq_scalar<std::int32_t>(header, 8, "NVQ1 axis") != 0 ||
+        tpq_scalar<std::int32_t>(header, 12, "NVQ1 width") != expected_columns ||
+        tpq_scalar<std::uint32_t>(header, 16, "NVQ1 dimensions") != 2 ||
+        tpq_scalar<std::int64_t>(header, 20, "NVQ1 rows") != expected_rows ||
+        tpq_scalar<std::int64_t>(header, 28, "NVQ1 columns") != expected_columns ||
+        tpq_scalar<std::uint32_t>(header, 36, "NVQ1 output size") !=
+            static_cast<std::uint32_t>(expected_rows)) {
+        throw std::runtime_error("invalid streamed NVQ1 geometry: " + name);
+    }
+    MfeNvqJscStreamLayout result;
+    result.rows = expected_rows;
+    result.groups = (expected_columns - 1) / group_size + 1;
+    result.vectors = (expected_columns - 1) / 8 + 1;
+    result.signs = result.groups;
+    result.state_bits = state_bits;
+    result.index_bits = short_profile ? 9 : 11;
+    result.auxiliary_bits = 1;
+    result.payload_offset = payload_offset;
+    result.prefix_bytes = header_bytes + (short_profile ? 2048 : profile == 2 ? 4096 : 0);
+    auto cursor = checked_range_add(payload_offset, result.prefix_bytes, "NVQ1 prefix");
+    result.anchors_offset = cursor;
+    cursor = checked_range_add(cursor, checked_range_product(
+        expected_rows, 2, "NVQ1 anchors"), "NVQ1 anchors end");
+    const auto advance = [&](int values_per_row, int bits) {
+        const auto offset = cursor;
+        cursor = checked_range_add(cursor, checked_packed_size(
+            checked_product(static_cast<std::size_t>(expected_rows),
+                static_cast<std::size_t>(values_per_row), "NVQ1 stream values"),
+            bits, "NVQ1 packed stream"), "NVQ1 stream end");
+        return offset;
+    };
+    result.state_offset = advance(result.groups, state_bits);
+    result.indices_offset = advance(result.vectors, result.index_bits);
+    result.signs_offset = advance(result.groups, 1);
+    if (cursor != checked_range_add(payload_offset, payload_bytes, "NVQ1 payload end")) {
+        throw std::runtime_error("invalid streamed NVQ1 payload length: " + name);
+    }
+    return result;
+}
+
 MfeMxStreamLayout parse_streamed_mx_layout(
     const MfqContainer& model,
     const std::string& name,
@@ -6227,7 +6294,7 @@ std::vector<std::uint8_t> slice_streamed_nvq_expert(
     };
     append_bits(layout.state_offset, layout.groups, layout.state_bits);
     append_bits(layout.indices_offset, layout.vectors, layout.index_bits);
-    append_bits(layout.signs_offset, layout.signs, 7);
+    append_bits(layout.signs_offset, layout.signs, layout.auxiliary_bits);
     return result;
 }
 
@@ -6514,9 +6581,23 @@ struct MlxMfeOffloadCache::Impl {
                     pool_rows, static_cast<int>(columns),
                     canonical == "MXFP4" ? 4 : 8);
             } else if (is_vq_dtype(canonical)) {
-                layout = parse_streamed_nvq_jsc_layout(
-                    model, name, payload_offset, payload_bytes,
-                    pool_rows, static_cast<int>(columns));
+                if (payload_bytes < 4) {
+                    throw std::runtime_error("truncated streamed VQ magic: " + name);
+                }
+                const auto magic = model.read_range(name, payload_offset, 4);
+                if (std::memcmp(magic.data(), "NQ1S", 4) == 0 ||
+                    std::memcmp(magic.data(), "NQ1L", 4) == 0) {
+                    if (canonical != mfq::kNvqDtype || runtime_bytes != 0) {
+                        throw std::runtime_error("invalid streamed NVQ1 cohort metadata: " + name);
+                    }
+                    layout = parse_streamed_nvq1_layout(
+                        model, name, payload_offset, payload_bytes,
+                        pool_rows, static_cast<int>(columns));
+                } else {
+                    layout = parse_streamed_nvq_jsc_layout(
+                        model, name, payload_offset, payload_bytes,
+                        pool_rows, static_cast<int>(columns));
+                }
             } else {
                 throw MfeStreamUnsupported(
                     "MFE contains a cohort without expert slicing support: "
@@ -8304,6 +8385,55 @@ MlxMfeWeight MlxMfeWeight::concatenate_projections(
                 weight.impl_->packed_bytes,
                 "split MFE projection bytes");
         }
+    }
+    return MlxMfeWeight(std::move(impl));
+}
+
+MlxMfeWeight MlxMfeWeight::materialize_packed_projections() const {
+    if (impl_->projections != 2 || impl_->projection_views.empty() ||
+        !impl_->rotations.empty() ||
+        std::any_of(impl_->projection_views.begin(), impl_->projection_views.end(),
+            [](const auto& source) {
+                return !source->reference_cohorts.empty() ||
+                    !source->mxfp4_sq_cohorts.empty() || !source->fp8_sq_cohorts.empty();
+            })) {
+        return *this;
+    }
+    auto impl = std::make_shared<Impl>(*impl_);
+    mlx::core::eval(std::vector<array>{
+        impl->descriptors, impl->nint_q, impl->nint_sub_scale, impl->nint_sub_min,
+        impl->nint_anchor_scale, impl->nint_anchor_min, impl->q8_q, impl->q8_scales,
+        impl->vq_indices, impl->vq_state, impl->vq_aux, impl->vq_anchors,
+        impl->vq_codebooks, impl->vq_scales, impl->vq_state_to_codebank, impl->vq_banks,
+        impl->vq_parameters, impl->vq_residual_codebooks, impl->vq_residual_first,
+        impl->vq_residual_second, impl->mx_values, impl->mx_scales,
+    });
+    // Preserve split dispatch and its arithmetic, but rebase each projection
+    // onto the same combined buffers. No original Gate/Up pool stays resident.
+    const auto sources = std::move(impl->projection_views);
+    impl->projection_views.clear();
+    for (std::size_t projection = 0; projection < sources.size(); ++projection) {
+        std::vector<std::int32_t> descriptors;
+        descriptors.reserve(static_cast<std::size_t>(impl->experts) * kDescriptorSize);
+        for (int expert = 0; expert < impl->experts; ++expert) {
+            const auto begin = impl->descriptor_values.begin() +
+                (static_cast<std::size_t>(expert) * sources.size() + projection) * kDescriptorSize;
+            descriptors.insert(descriptors.end(), begin, begin + kDescriptorSize);
+        }
+        auto view = std::make_shared<Impl>(
+            make_int32_array(descriptors, Shape{impl->experts, kDescriptorSize}),
+            impl->nint_q, impl->nint_sub_scale, impl->nint_sub_min,
+            impl->nint_anchor_scale, impl->nint_anchor_min, impl->q8_q, impl->q8_scales,
+            impl->vq_indices, impl->vq_state, impl->vq_aux, impl->vq_anchors,
+            impl->vq_codebooks, impl->vq_scales, impl->vq_state_to_codebank, impl->vq_banks,
+            impl->vq_parameters, impl->vq_residual_codebooks, impl->vq_residual_first,
+            impl->vq_residual_second, impl->mx_values, impl->mx_scales,
+            impl->rotations, std::move(descriptors), impl->experts,
+            impl->out_per_expert, impl->neuron_len, 1);
+        view->automatic_mxfp4_nax_prefill = sources[projection]->automatic_mxfp4_nax_prefill;
+        view->logical_experts = sources[projection]->logical_experts;
+        view->packed_bytes = sources[projection]->packed_bytes;
+        impl->projection_views.push_back(std::move(view));
     }
     return MlxMfeWeight(std::move(impl));
 }

@@ -535,6 +535,24 @@ void configure_mlx_metal() {
         if (std::filesystem::is_regular_file(candidate, error) && !error) {
             mlx::core::metal::set_metallib_path(candidate.string());
             mlx::core::set_default_device(mlx::core::Device::gpu);
+            // Set residency before loading weights: otherwise macOS can
+            // compress early layers while later layers are being loaded.
+            // This is a ceiling, not an allocation or a system-wide change.
+            try {
+                const auto& info = mlx::core::device_info();
+                const auto limit = std::get<std::size_t>(
+                    info.at("max_recommended_working_set_size"));
+                if (limit == 0) {
+                    throw std::runtime_error("device returned a zero limit");
+                }
+                mlx::core::set_wired_limit(limit);
+                std::cerr << "Metal wired memory limit: " << limit
+                          << " bytes (device recommendation)\n";
+            } catch (const std::exception& error) {
+                // Older MLX/macOS versions may not support memory wiring.
+                std::cerr << "Warning: Metal memory residency unavailable: "
+                          << error.what() << "\n";
+            }
             return;
         }
     }
