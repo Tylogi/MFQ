@@ -295,6 +295,85 @@ int main() {
             short_recurrent),
         "hybrid fallback restored the wrong recurrent checkpoint");
 
+    const auto hybrid_tail = MlxPagedSessionCodec<MlxQwen35TextSessionState>::encode_block(
+        unaligned_hybrid, 4, 1);
+    const auto tail_decoded = MlxPagedSessionCodec<MlxQwen35TextSessionState>::decode(
+        {unaligned_encoded[0], hybrid_tail}, unaligned_hybrid.tokens, 4);
+    require(tail_decoded.cache_position == 6 &&
+        byte_equal(std::get<MlxQwen35LinearAttentionCacheSnapshot>(tail_decoded.layers[1]).recurrent_state,
+            recurrent), "hybrid tail did not retain its exact state");
+    auto short_tail = unaligned_hybrid;
+    short_tail.tokens.resize(2);
+    short_tail.cache_position = 2;
+    std::get<MlxKvCacheSnapshot>(short_tail.layers[0]).position = 2;
+    std::get<MlxQwen35LinearAttentionCacheSnapshot>(short_tail.layers[1]).position = 2;
+    short_tail.last_hidden = mlx::core::ones({1, 1, 4}, mlx::core::float16);
+    auto head = mini.layers.front();
+    head.position = 1;
+    short_tail.mtp_layers.push_back(head);
+    const auto short_payload = MlxPagedSessionCodec<MlxQwen35TextSessionState>::encode_block(short_tail, 4, 0);
+    require(MlxPagedSessionCodec<MlxQwen35TextSessionState>::has_mtp(short_payload) &&
+        !MlxPagedSessionCodec<MlxQwen35TextSessionState>::has_mtp(hybrid_tail),
+        "hybrid codec did not distinguish predictor-ready checkpoints");
+    const auto short_restored = MlxPagedSessionCodec<MlxQwen35TextSessionState>::decode(
+        {short_payload}, short_tail.tokens, 4);
+    require(short_restored.cache_position == 2 && short_restored.mtp_layers.size() == 1 &&
+        short_restored.mtp_layers[0].position == 1 &&
+        byte_equal(*short_restored.last_hidden, *short_tail.last_hidden),
+        "short hybrid MTP tail did not round trip");
+
+    MlxQwen4TextSessionState flash;
+    flash.tokens = unaligned_hybrid.tokens;
+    flash.cache_position = 6;
+    flash.cache_batch = 1;
+    MlxQwen4LayerCacheSnapshot qsa;
+    qsa.position = 6;
+    qsa.batch = 1;
+    qsa.kv = std::get<MlxKvCacheSnapshot>(unaligned_hybrid.layers[0]);
+    qsa.index_keys = mlx::core::ones({1, 6, 3}, mlx::core::float16);
+    qsa.pooled_keys = mlx::core::ones({1, 3, 3}, mlx::core::float16);
+    qsa.ple_convolution = convolution;
+    qsa.ple_context = {3, 4};
+    flash.layers.push_back(qsa);
+    MlxQwen4LayerCacheSnapshot gdn;
+    gdn.position = 6;
+    gdn.batch = 1;
+    gdn.convolution = convolution;
+    gdn.recurrent = recurrent;
+    gdn.ple_convolution = convolution;
+    gdn.ple_context = {5, 6};
+    flash.layers.push_back(gdn);
+    flash.last_hidden = mlx::core::ones({1, 1, 2, 4}, mlx::core::float16);
+    auto flash_head = qsa;
+    flash_head.position = 5;
+    flash_head.kv->position = 5;
+    flash_head.index_keys = mlx::core::ones({1, 5, 3}, mlx::core::float16);
+    flash_head.pooled_keys = mlx::core::ones({1, 2, 3}, mlx::core::float16);
+    flash_head.ple_convolution.reset();
+    flash_head.ple_context.clear();
+    flash.mtp_layers.push_back(flash_head);
+    const auto flash_first = MlxPagedSessionCodec<MlxQwen4TextSessionState>::encode_block(flash, 4, 0);
+    const auto flash_last = MlxPagedSessionCodec<MlxQwen4TextSessionState>::encode_block(flash, 4, 1);
+    require(MlxPagedSessionCodec<MlxQwen4TextSessionState>::has_mtp(flash_last) &&
+        !MlxPagedSessionCodec<MlxQwen4TextSessionState>::has_mtp(flash_first),
+        "Flash-Next codec did not distinguish predictor-ready checkpoints");
+    require(!MlxPagedSessionCodec<MlxQwen4TextSessionState>::has_exact_boundary(flash_first) &&
+        MlxPagedSessionCodec<MlxQwen4TextSessionState>::has_exact_boundary(flash_last),
+        "Flash-Next accepted a non-checkpoint block");
+    const auto flash_restored = MlxPagedSessionCodec<MlxQwen4TextSessionState>::decode(
+        {flash_first, flash_last}, flash.tokens, 4);
+    require(byte_equal(*flash_restored.layers[0].index_keys, *qsa.index_keys) &&
+        byte_equal(*flash_restored.layers[0].pooled_keys, *qsa.pooled_keys) &&
+        byte_equal(*flash_restored.layers[1].recurrent, recurrent) &&
+        flash_restored.layers[0].ple_context == qsa.ple_context &&
+        flash_restored.layers[1].ple_context == gdn.ple_context &&
+        flash_restored.mtp_layers.size() == 1 && flash_restored.mtp_layers[0].position == 5,
+        "Flash-Next QSA/GDN/PLE/MTP checkpoint did not round trip");
+    flash.layers.pop_back();
+    const auto qsa_nonfinal = MlxPagedSessionCodec<MlxQwen4TextSessionState>::encode_block(flash, 4, 0);
+    require(!MlxPagedSessionCodec<MlxQwen4TextSessionState>::has_exact_boundary(qsa_nonfinal),
+        "QSA-only prefix accepted a missing pooled/PLE checkpoint");
+
     if (const auto* enabled = std::getenv("MFQ_PAGED_CODEC_BENCHMARK");
         enabled != nullptr && enabled[0] == '1') {
         run_codec_benchmark();

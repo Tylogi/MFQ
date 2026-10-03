@@ -29,6 +29,7 @@ struct MfqSamplingParams {
 struct MfqPromptCachePlan {
     std::string session_id;
     size_t stable_prefix_tokens = 0;
+    bool cache_output_tokens = false;
 };
 
 enum class MfqMultimodalProcessor {

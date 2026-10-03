@@ -788,14 +788,14 @@ std::pair<array, array> MlxKvCache::view() const {
     };
 }
 
-MlxKvCacheSnapshot MlxKvCache::snapshot() const {
+MlxKvCacheSnapshot MlxKvCache::snapshot(bool detached) const {
     if (position_ <= 0 || position_ > capacity()) {
         throw std::runtime_error(
             "cannot snapshot an empty or inconsistent KV cache");
     }
     auto visible = view();
-    auto key = detached_copy(visible.first);
-    auto value = detached_copy(visible.second);
+    auto key = detached ? detached_copy(visible.first) : visible.first;
+    auto value = detached ? detached_copy(visible.second) : visible.second;
     mlx::core::eval(key, value);
     return MlxKvCacheSnapshot{
         batch_,
