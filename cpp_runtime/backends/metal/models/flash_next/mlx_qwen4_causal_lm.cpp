@@ -230,8 +230,7 @@ public:
         if (model.record(gate).dtype == "MFE" &&
             model.record(up).dtype == "MFE") {
             return Qwen4RoutedWeight(
-                load_routed_gate_up_weight(model, prefix)
-                    .materialize_packed_projections());
+                load_routed_gate_up_weight(model, prefix));
         }
         auto gate_values = dense(model, gate);
         auto up_values = dense(model, up);
