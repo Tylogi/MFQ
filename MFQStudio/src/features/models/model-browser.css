@@ -69,8 +69,6 @@
 .model-variant { display: grid; grid-template-columns: minmax(0, 1fr) minmax(110px, 0.35fr) auto; align-items: center; gap: 10px; overflow: hidden; border: 1px solid var(--panel-line); border-radius: 8px; background: var(--panel-control); }
 .model-variant > div:first-child { display: grid; min-width: 0; gap: 5px; padding: 12px 0 12px 12px; }
 .model-variant strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.model-variant-title { display: flex; align-items: center; gap: 8px; }
-.model-variant-title > span { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .model-variant small { color: var(--muted); font-size: 10.5px; }
 .variant-memory-pressure { display: grid; grid-template-columns: minmax(70px, 1fr) auto; align-items: center; gap: 7px; min-width: 110px; }
 .variant-memory-pressure > strong { min-width: 39px; font-size: 11px; font-variant-numeric: tabular-nums; text-align: right; }

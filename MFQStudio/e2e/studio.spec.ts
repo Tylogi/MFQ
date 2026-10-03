@@ -66,7 +66,7 @@ test('三家架构标识贯穿模型页面，保持描线、无边框和靠右�
   await expect(page.locator('.model-detail-heading [data-model-vendor="qwen"]')).toBeVisible();
   await page.locator('.official-model-card').last().click();
   await expect(page.locator('.model-detail-heading [data-model-vendor="zai"]')).toBeVisible();
-  await expect(page.locator('.model-variant-title [data-model-vendor="zai"]')).toHaveCount(3);
+  await expect(page.locator('.model-variant .model-vendor-mark')).toHaveCount(0);
   for (const mark of await page.locator('.official-model-card .model-vendor-mark').all()) {
     const appearance = await mark.evaluate((node) => {
       const css = getComputedStyle(node);
