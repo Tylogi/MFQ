@@ -58,6 +58,33 @@ class HubError(RuntimeError):
     pass
 
 
+class _ProxyFallbackTransport(httpx.AsyncBaseTransport):
+    """Try the configured proxy first, then direct for a failed metadata connection."""
+
+    def __init__(self, proxy: str, verify: ssl.SSLContext | bool) -> None:
+        self._proxy = httpx.AsyncHTTPTransport(proxy=proxy, verify=verify, trust_env=False)
+        self._direct: httpx.AsyncHTTPTransport | None = None
+        self._verify = verify
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if self._direct is None:
+            try:
+                return await self._proxy.handle_async_request(request)
+            except (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout):
+                if request.method not in {"GET", "HEAD"}:
+                    raise
+                if self._direct is None:
+                    self._direct = httpx.AsyncHTTPTransport(verify=self._verify, trust_env=False)
+        return await self._direct.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        try:
+            await self._proxy.aclose()
+        finally:
+            if self._direct is not None:
+                await self._direct.aclose()
+
+
 def _metadata_client(endpoint: str, **kwargs: Any) -> httpx.AsyncClient:
     from mfq.server.api.network import system_proxy_environment
 
@@ -77,7 +104,8 @@ def _metadata_client(endpoint: str, **kwargs: Any) -> httpx.AsyncClient:
         )
     return httpx.AsyncClient(
         timeout=httpx.Timeout(_METADATA_TIMEOUT, connect=4.0),
-        follow_redirects=True, proxy=proxy, trust_env=False, verify=verify, **kwargs,
+        follow_redirects=True, trust_env=False, verify=verify,
+        transport=_ProxyFallbackTransport(proxy, verify) if proxy else None, **kwargs,
     )
 
 

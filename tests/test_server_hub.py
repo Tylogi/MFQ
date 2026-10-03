@@ -220,9 +220,104 @@ def test_metadata_client_defaults_to_direct_when_proxy_discovery_fails(
         monkeypatch.setattr(network.urllib.request, name, unavailable, raising=False)
     monkeypatch.setattr(hub.httpx, "AsyncClient", lambda **kwargs: kwargs)
     options = hub._metadata_client(endpoint)
-    assert options["proxy"] == expected
+    transport = options["transport"]
+    assert isinstance(transport, hub._ProxyFallbackTransport) if expected else transport is None
     assert options["trust_env"] is False
     assert options["timeout"].connect == 4 and options["timeout"].read == 8
+
+
+@pytest.mark.parametrize("failure", (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout))
+def test_unreachable_proxy_falls_back_to_direct_once(monkeypatch, failure) -> None:
+    from mfq.server.services import hub
+
+    async def run() -> None:
+        calls = []
+
+        def transport(*, proxy=None, **kwargs):
+            def respond(request):
+                calls.append(proxy)
+                if proxy:
+                    raise failure("proxy unavailable", request=request)
+                return httpx.Response(200, json={"ok": True})
+            return httpx.MockTransport(respond)
+
+        monkeypatch.setattr(hub.httpx, "AsyncHTTPTransport", transport)
+        async with httpx.AsyncClient(transport=hub._ProxyFallbackTransport("http://proxy.test:8080", True)) as client:
+            assert (await client.get("https://huggingface.co/api/models/owner/model")).status_code == 200
+            assert (await client.get("https://huggingface.co/api/models/owner/other")).status_code == 200
+        assert calls == ["http://proxy.test:8080", None, None]
+
+    asyncio.run(run())
+
+
+def test_failed_direct_fallback_is_not_retried(monkeypatch) -> None:
+    from mfq.server.services import hub
+
+    async def run() -> None:
+        calls = []
+
+        def transport(*, proxy=None, **kwargs):
+            def respond(request):
+                calls.append(proxy)
+                raise httpx.ConnectError("unavailable", request=request)
+            return httpx.MockTransport(respond)
+
+        monkeypatch.setattr(hub.httpx, "AsyncHTTPTransport", transport)
+        async with httpx.AsyncClient(transport=hub._ProxyFallbackTransport("http://proxy.test:8080", True)) as client:
+            with pytest.raises(httpx.ConnectError):
+                await client.get("https://huggingface.co/api/models/owner/model")
+        assert calls == ["http://proxy.test:8080", None]
+
+    asyncio.run(run())
+
+
+def test_concurrent_proxy_failures_share_one_direct_pool(monkeypatch) -> None:
+    from mfq.server.services import hub
+
+    async def run() -> None:
+        created = []
+        proxy_calls = []
+        both_started = asyncio.Event()
+
+        def transport(*, proxy=None, **kwargs):
+            created.append(proxy)
+
+            async def respond(request):
+                if proxy:
+                    proxy_calls.append(request)
+                    if len(proxy_calls) == 2:
+                        both_started.set()
+                    await both_started.wait()
+                    raise httpx.ProxyError("unavailable", request=request)
+                return httpx.Response(200, json={"ok": True})
+            return httpx.MockTransport(respond)
+
+        monkeypatch.setattr(hub.httpx, "AsyncHTTPTransport", transport)
+        async with httpx.AsyncClient(transport=hub._ProxyFallbackTransport("http://proxy.test:8080", True)) as client:
+            responses = await asyncio.gather(*(client.get(f"https://modelscope.cn/{index}") for index in range(2)))
+        assert all(response.status_code == 200 for response in responses)
+        assert created == ["http://proxy.test:8080", None]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("status", (401, 404, 503))
+def test_proxy_http_response_does_not_trigger_direct_retry(monkeypatch, status) -> None:
+    from mfq.server.services import hub
+
+    async def run() -> None:
+        created = []
+
+        def transport(*, proxy=None, **kwargs):
+            created.append(proxy)
+            return httpx.MockTransport(lambda request: httpx.Response(status))
+
+        monkeypatch.setattr(hub.httpx, "AsyncHTTPTransport", transport)
+        async with httpx.AsyncClient(transport=hub._ProxyFallbackTransport("http://proxy.test:8080", True)) as client:
+            assert (await client.get("https://huggingface.co/api/models/owner/model")).status_code == status
+        assert created == ["http://proxy.test:8080"]
+
+    asyncio.run(run())
 
 
 class FakeHub:
