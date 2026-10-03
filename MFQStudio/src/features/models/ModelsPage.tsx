@@ -1,4 +1,3 @@
-/** 模型路由页面组合目录摘要、实例、加载策略及本地检查点。 */
 import { useSettings } from '../settings/SettingsProvider';
 import { Icon, ScreenHeader } from '../../app/display';
 import { useModelCatalog } from './useModelCatalog';
@@ -6,8 +5,8 @@ import { ModelDirectoryDialog } from './ModelDirectoryDialog';
 import { LoadedModels } from './LoadedModels';
 import { ModelLoadPolicy } from './ModelLoadPolicy';
 import { LocalCheckpoints } from './LocalCheckpoints';
+import { ModelVendorMark } from '../../app/ModelVendorMark';
 
-/** 仅在模型页请求目录数据，并组合各展示面板。 */
 export function ModelsPage() {
   const catalog = useModelCatalog();
   const { tr } = useSettings();
@@ -43,7 +42,7 @@ export function ModelsPage() {
         </div>
         <div>
           <span>{tr('当前对话模型', 'Chat model')}</span>
-          <strong title={model || undefined}>{model || tr('未选择', 'None')}</strong>
+          <div className="model-summary-identity"><strong title={model || undefined}>{model || tr('未选择', 'None')}</strong><ModelVendorMark name={model} architecture={artifacts.find((item) => item.name === model)?.architecture} size={28} /></div>
           <small>{model
             ? tr('切换会话模型不会重新注册资产', 'Switching keeps the registered asset')
             : tr('加载后从这里选择', 'Choose one after loading')}</small>

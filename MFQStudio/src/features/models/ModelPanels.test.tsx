@@ -1,4 +1,3 @@
-/** 验证模型面板拆分后仍将交互交给目录控制器。 */
 import { fireEvent, render, screen } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
 import type { useModelCatalog } from './useModelCatalog';
@@ -10,7 +9,6 @@ vi.mock('../settings/SettingsProvider', () => ({
   useSettings: () => ({ tr: (zh: string) => zh }),
 }));
 
-/** 构造供展示面板使用的最小模型目录。 */
 function catalog() {
   return {
     runtime: null,
@@ -48,4 +46,22 @@ it('固定与空闲卸载仍调用对应策略操作', () => {
   fireEvent.change(screen.getByRole('combobox'), { target: { value: '900' } });
   expect(state.setLoadPinned).toHaveBeenCalledWith(true);
   expect(state.setLoadIdleTtl).toHaveBeenCalledWith(900);
+});
+
+it('本地架构标识在模型行右侧，改名的模型仍按架构识别', () => {
+  const state = catalog();
+  state.filteredArtifacts = [
+    { id: 'qwen', name: 'renamed-checkpoint', architecture: 'qwen4_exp', loadable: true },
+    { id: 'ds', name: 'DeepSeek-V4.1', architecture: 'deepseek_v4', loadable: true },
+    { id: 'glm', name: 'GLM-5.3', architecture: 'glm5_next', loadable: true },
+    { id: 'other', name: 'MiniCPM-o', architecture: 'minicpm', loadable: true },
+  ] as typeof state.filteredArtifacts;
+  state.artifacts = state.filteredArtifacts;
+  render(<LocalCheckpoints catalog={state} />);
+  for (const name of ['Qwen', 'DeepSeek', 'Z.ai']) {
+    expect(screen.getByRole('img', { name }).closest('.model-row-actions')).not.toBeNull();
+  }
+  expect(screen.getAllByRole('img')).toHaveLength(3);
+  fireEvent.click(screen.getAllByRole('button', { name: '加载' })[0]);
+  expect(state.loadArtifact).toHaveBeenCalledWith('renamed-checkpoint');
 });

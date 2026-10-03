@@ -11,6 +11,7 @@
 .model-workbench-summary small { color: var(--muted-light); font-size: 11px; line-height: 1.6; }
 .model-workbench-summary strong { overflow: hidden; color: var(--ink-strong); font-size: 28px; font-weight: 550; font-variant-numeric: tabular-nums; letter-spacing: -0.03em; text-overflow: ellipsis; white-space: nowrap; }
 .model-workbench-summary > div:last-child strong { align-self: center; font-size: 17px; letter-spacing: -0.015em; }
+.model-summary-identity { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 12px; }
 .model-workbench-links { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin-top: 24px; color: var(--muted); font-size: 12px; }
 .model-workbench-links button { display: inline-flex; align-items: center; gap: 8px; border: 0; border-radius: 7px; padding: 8px 0; color: var(--accent-ink); background: transparent; font-size: 12px; }
 .model-workbench-links button:hover { color: var(--accent-hover); text-decoration: underline; text-underline-offset: 3px; }

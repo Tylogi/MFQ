@@ -1,4 +1,3 @@
-/** 连接页面负责服务器配置草稿、凭据保存及服务重连，业务状态不流入应用外壳。 */
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { connectionsApi } from '../../shared/api/resources/connections';
@@ -20,8 +19,8 @@ import { ToolsRoutingPanel } from './ToolsRoutingPanel';
 import { MemorySettingsPanel } from './MemorySettingsPanel';
 import { toast } from '../../stores/toastStore';
 import { InferenceDefaultsPanel } from './InferenceDefaultsPanel';
+import { ModelVendorMark } from '../../app/ModelVendorMark';
 
-/** 提供运行配置、内存与缓存概览，以及连接页自己的保存和重载操作。 */
 export function ConnectionsPage() {
   const { settings, replaceSettings, tr, contextSize, setContextSize } = useSettings();
   const {
@@ -62,7 +61,6 @@ export function ConnectionsPage() {
   const modelNames = runtimeModelNames(models, instances);
 
 
-  /** 将局部服务草稿提交平台并触发应用级连接版本更新。 */
   async function save() {
     if (!draft || busy) return;
     setBusy(true);
@@ -149,6 +147,8 @@ export function ConnectionsPage() {
                   <button onClick={() => navigate(STUDIO_PATHS.models)} type="button">
                     {tr('选择…', 'Choose…')}
                   </button>
+                  <ModelVendorMark name={selectedModel}
+                    architecture={selectedModel === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined} />
                 </div>
               }
             />

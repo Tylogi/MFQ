@@ -1,11 +1,10 @@
-/** 聊天页头展示当前会话、模型和运行状态。 */
 import { useSettings } from '../../settings/SettingsProvider';
 import { useConversationSelector } from '../state/conversationStore';
 import { Icon } from '../../../app/display';
 import { formatNumber } from '../../../app/formatters';
 import type { ChatPageState } from '../hooks/useChatPageState';
+import { ModelVendorMark } from '../../../app/ModelVendorMark';
 
-/** 渲染会话标题、模型切换和清空入口。 */
 export function ChatPageHeader({ page }: { page: ChatPageState }) {
   const { tr } = useSettings();
   const messages = useConversationSelector((state) => state.messages);
@@ -56,6 +55,8 @@ export function ChatPageHeader({ page }: { page: ChatPageState }) {
             {tr('流式', 'streaming')}
           </small>
         </div>
+        <ModelVendorMark name={inference.selectedModel}
+          architecture={inference.selectedModel === inference.runtime?.model ? inference.runtime.model_capabilities?.architecture_family || inference.runtime.model_type : undefined} />
         <span className={'runtime-status-pill ' + (conversation.conversationReady ? 'running' : 'stopped')}>
           <i />
           {conversation.conversationReady

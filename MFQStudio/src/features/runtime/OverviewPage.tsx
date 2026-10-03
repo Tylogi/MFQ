@@ -1,4 +1,3 @@
-/** 概览页负责展示运行快照、模型选择和端点复制。 */
 import { useEffect, useRef, useState } from 'react';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useSettings } from '../settings/SettingsProvider';
@@ -18,8 +17,8 @@ import { RuntimeHero } from './RuntimeHero';
 import { MemoryHierarchy } from './MemoryHierarchy';
 import { openAIEndpoint } from './endpoint';
 import { toast } from '../../stores/toastStore';
+import { ModelVendorMark } from '../../app/ModelVendorMark';
 
-/** 展示共享运行状态，页面卸载时清理复制提示计时器。 */
 export function OverviewPage() {
   const {
     runtime,
@@ -46,7 +45,6 @@ export function OverviewPage() {
   const lastPrefill = displayPrefillMetric(last);
   const lastTtftMs = preferPositiveMetric(last?.ttft_ms, last?.complete_prefill_ms);
   const endpoint = openAIEndpoint(studio?.service_url);
-  /** 复制当前服务地址，并在页面仍挂载时短暂展示成功状态。 */
   async function copyEndpoint() {
     try {
       await navigator.clipboard.writeText(endpoint);
@@ -140,9 +138,12 @@ export function OverviewPage() {
                       <strong title={name}>{name}</strong>
                       <small>{details || stateLabel}</small>
                     </span>
-                    <span className="runtime-status-pill ready">
-                      <i />
-                      {selected ? tr('当前', 'Current') : stateLabel}
+                    <span className="model-identity-trailing">
+                      <span className="runtime-status-pill ready">
+                        <i />
+                        {selected ? tr('当前', 'Current') : stateLabel}
+                      </span>
+                      <ModelVendorMark name={name} architecture={name === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined} />
                     </span>
                   </button>
                 );

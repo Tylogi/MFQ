@@ -1,10 +1,9 @@
-/** 本地检查点目录列表及模型加载入口。 */
 import { useSettings } from '../settings/SettingsProvider';
 import { Icon, SectionLabel, TMPanel, EmptyPanel } from '../../app/display';
 import { formatNumber } from '../../app/formatters';
 import type { useModelCatalog } from './useModelCatalog';
+import { ModelVendorMark } from '../../app/ModelVendorMark';
 
-/** 展示已登记检查点及加载能力。 */
 export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
   const { tr } = useSettings();
   const { runtime, artifacts, busy, instances, modelFilter,
@@ -38,7 +37,7 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                       {formatNumber(item.total_bytes / 2 ** 30, 1)} GB{policy ? ` · ${policy}` : ''}
                     </small>
                   </div>
-                  {instance ? (
+                  <div className="model-row-actions">{instance ? (
                     <button disabled={busy || instance.state !== 'ready'}
                       onClick={() => void unloadInstance(instance.id)} type="button">
                       {tr('卸载', 'Unload')}
@@ -54,7 +53,7 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                     <button disabled={busy} onClick={() => void loadArtifact(item.name)} type="button">
                       {tr('加载', 'Load')}
                     </button>
-                  )}
+                  )}<ModelVendorMark name={item.name} architecture={item.architecture} /></div>
                 </div>
               );
             })}

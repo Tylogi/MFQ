@@ -1,6 +1,6 @@
 /** 验证真实浏览器中的发送、恢复、取消、输入法与弹窗交互，并检查响应式布局。 */
 import { expect, test, type Page } from '@playwright/test';
-import { mockStudioServer } from './mockServer';
+import { mockStudioServer, officialCatalog } from './mockServer';
 
 declare global {
   interface Window {
@@ -15,6 +15,70 @@ async function navigateClient(page: Page, path: string) {
     window.dispatchEvent(new PopStateEvent('popstate'));
   }, path);
 }
+
+test('三家架构标识贯穿模型页面，保持描线、无边框和靠右布局', async ({ page }, testInfo) => {
+  const state = await mockStudioServer(page);
+  const models = [
+    { name: 'Qwen3.8-Flash-Next-S4-L', architecture: 'qwen4_exp', vendor: 'qwen' },
+    { name: 'DeepSeek-V4.1-Flash', architecture: 'deepseek_v4', vendor: 'deepseek' },
+    { name: 'GLM-5.3', architecture: 'glm5_next', vendor: 'zai' },
+  ];
+  const artifacts = models.map((item, index) => ({ ...item, id: `model-${index}`, format: 'mfq',
+    shard_count: 1, total_bytes: 1 << 20, tensor_count: 1, record_count: 1, dtypes: [],
+    complete: true, loadable: true, modified_at: '2026-01-01' }));
+  const instances = models.map((item, index) => ({ id: `instance-${index}`, model: item.name,
+    state: 'ready', devices: ['metal'], active_sessions: 0, queued_requests: 0, context_size: 32768 }));
+  await page.route('**/api/v1/runtime/models', (route) => route.fulfill({ json: { data: models.map((item) => ({ id: item.name })) } }));
+  await page.route('**/api/v1/runtime/instances', (route) => route.fulfill({ json: { data: instances } }));
+  await page.route(/\/api\/v1\/runtime\/status(?:\?.*)?$/, (route) => route.fulfill({ json: {
+    model: models[0].name, model_type: models[0].architecture, runtime_state: 'ready', instance_id: 'instance-0', max_context: 32768,
+  } }));
+  await page.route(/\/api\/v1\/models(?:\?.*)?$/, (route) => route.fulfill({ json: { data: artifacts } }));
+  await page.route(/\/api\/v1\/hub\/official(?:\?.*)?$/, (route) => route.fulfill({ json: {
+    ...officialCatalog, data: models.map((item, index) => ({ ...officialCatalog.data[0], ...item, id: `catalog-${index}` })),
+  } }));
+  const errors: string[] = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  await page.goto('/');
+  await expect(page.locator('.runtime-hero-actions [data-model-vendor="qwen"]')).toBeVisible();
+  for (const item of models) await expect(page.locator(`.overview-model-grid [data-model-vendor="${item.vendor}"]`)).toBeVisible();
+  await navigateClient(page, '/models');
+  for (const item of models) {
+    await expect(page.locator(`.loaded-model-panel [data-model-vendor="${item.vendor}"]`)).toBeVisible();
+    await expect(page.locator(`.model-library-panel [data-model-vendor="${item.vendor}"]`)).toBeVisible();
+  }
+  const row = page.locator('.model-library-panel .model-row').first();
+  const nameBox = await row.locator('strong').boundingBox();
+  const markBox = await row.locator('.model-vendor-mark').boundingBox();
+  expect(markBox!.x).toBeGreaterThan(nameBox!.x + nameBox!.width);
+  await page.screenshot({ path: testInfo.outputPath('model-vendors-local.png'), animations: 'disabled' });
+  await navigateClient(page, '/model-hub');
+  for (const item of models) await expect(page.locator(`.official-model-card [data-model-vendor="${item.vendor}"]`)).toBeVisible();
+  await expect(page.locator('.model-detail-heading [data-model-vendor="qwen"]')).toBeVisible();
+  await page.locator('.official-model-card').last().click();
+  await expect(page.locator('.model-detail-heading [data-model-vendor="zai"]')).toBeVisible();
+  await expect(page.locator('.model-variant-title [data-model-vendor="zai"]')).toHaveCount(3);
+  for (const mark of await page.locator('.official-model-card .model-vendor-mark').all()) {
+    const appearance = await mark.evaluate((node) => {
+      const css = getComputedStyle(node);
+      return { fill: css.fill, border: css.borderWidth, background: css.backgroundColor, stroke: css.stroke };
+    });
+    expect(appearance.fill).toBe('none');
+    expect(appearance.border).toBe('0px');
+    expect(appearance.background).toBe('rgba(0, 0, 0, 0)');
+    const channels = appearance.stroke.match(/\d+/g);
+    expect(new Set(channels).size).toBe(1);
+  }
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath('model-vendors-downloads-light.png'), animations: 'disabled' });
+  await page.evaluate(() => {
+    document.documentElement.dataset.theme = 'dark';
+    document.documentElement.style.colorScheme = 'dark';
+  });
+  await page.screenshot({ path: testInfo.outputPath('model-vendors-downloads-dark.png'), animations: 'disabled' });
+  expect(errors).toEqual([]);
+  expect(state.unexpected).toEqual([]);
+});
 
 test('运行资源按模型分段，四个槽共享颜色，端点包含 v1', async ({ page }, testInfo) => {
   await mockStudioServer(page);

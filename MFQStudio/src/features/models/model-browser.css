@@ -27,7 +27,7 @@
 .official-model-card { display: grid; min-width: 0; gap: 9px; border: 1px solid var(--panel-line); border-radius: 12px; padding: 16px; color: var(--ink); background: var(--surface-raised); text-align: left; }
 .official-model-card:hover { border-color: var(--line-strong); background: var(--surface-control); }
 .official-model-card.selected { border-color: var(--accent-border); background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
-.official-model-card-title { display: grid; grid-template-columns: 32px minmax(0, 1fr); align-items: center; gap: 9px; }
+.official-model-card-title { display: grid; grid-template-columns: 32px minmax(0, 1fr) auto; align-items: center; gap: 9px; }
 .official-model-card-title > span { display: grid; width: 32px; height: 32px; place-items: center; border-radius: 8px; color: var(--ink); background: var(--panel-control); font-size: 13px; font-weight: 800; }
 .official-model-card-title > div { display: grid; min-width: 0; gap: 2px; }
 .official-model-card strong { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
@@ -69,6 +69,8 @@
 .model-variant { display: grid; grid-template-columns: minmax(0, 1fr) minmax(110px, 0.35fr) auto; align-items: center; gap: 10px; overflow: hidden; border: 1px solid var(--panel-line); border-radius: 8px; background: var(--panel-control); }
 .model-variant > div:first-child { display: grid; min-width: 0; gap: 5px; padding: 12px 0 12px 12px; }
 .model-variant strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.model-variant-title { display: flex; align-items: center; gap: 8px; }
+.model-variant-title > span { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .model-variant small { color: var(--muted); font-size: 10.5px; }
 .variant-memory-pressure { display: grid; grid-template-columns: minmax(70px, 1fr) auto; align-items: center; gap: 7px; min-width: 110px; }
 .variant-memory-pressure > strong { min-width: 39px; font-size: 11px; font-variant-numeric: tabular-nums; text-align: right; }
@@ -148,5 +150,6 @@ body:has(.model-download-page) .studio-toast-container { bottom: calc(96px + env
   .download-queue-item { flex-wrap: wrap; gap: 10px; padding: 14px; }
   .download-item-icon { flex-basis: 32px; height: 32px; }
   .download-item-heading { align-items: start; flex-direction: column; gap: 4px; }
+  .download-item-heading > .model-identity-trailing { align-self: stretch; justify-content: space-between; margin-left: 0; }
   .download-queue-item > button { margin-left: 42px; }
 }

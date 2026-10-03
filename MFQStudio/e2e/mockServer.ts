@@ -40,7 +40,7 @@ const catalogConfiguration = {
   required_memory_bytes: 64 * 2 ** 30, available_memory_bytes: 96 * 2 ** 30,
   reasons: ['More than half of the published precision tiers fit fully within the detected runtime memory budget.'],
 };
-const officialCatalog: OfficialModelList = {
+export const officialCatalog: OfficialModelList = {
   system: { platform: 'macOS', machine: 'arm64', backend: 'metal',
     cpu_name: 'Apple M5 Max', cpu_cores: 18, gpu_names: ['Apple M5 Max'], gpu_cores: 40,
     physical_memory_bytes: 128 * 2 ** 30, runtime_memory_budget_bytes: 96 * 2 ** 30 },

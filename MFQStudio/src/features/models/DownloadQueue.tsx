@@ -7,6 +7,7 @@ import { useJobStore } from '../../stores/jobStore';
 import { toast } from '../../stores/toastStore';
 import { useSettings } from '../settings/SettingsProvider';
 import type { DownloadOrigin } from './ModelBrowser';
+import { ModelVendorMark } from '../../app/ModelVendorMark';
 
 export const isModelDownload = (job: JobResource) => job.kind === 'download.huggingface' || job.kind === 'download.modelscope';
 export const isActiveDownload = (job: JobResource) => ['queued', 'running', 'cancelling'].includes(job.status);
@@ -55,7 +56,7 @@ export function DownloadQueue({ jobs, onJobCreated }: {
           <article className={`download-queue-item ${job.status}`} key={job.id} data-job-id={job.id}>
             <div className="download-item-icon"><Icon name={job.status === 'succeeded' ? 'check' : 'download'} size={20} /></div>
             <div className="download-item-body">
-              <div className="download-item-heading"><strong>{String(job.payload.repo_id || job.kind)}</strong><span>{statusLabels[job.status]}</span></div>
+              <div className="download-item-heading"><strong>{String(job.payload.repo_id || job.kind)}</strong><span className="model-identity-trailing">{statusLabels[job.status]}<ModelVendorMark name={String(job.payload.repo_id || '')} /></span></div>
               <small>{job.kind === 'download.huggingface' ? 'Hugging Face' : 'ModelScope'} · {String(job.payload.destination || '')}</small>
               <div className="download-item-progress"><progress aria-label={tr('下载进度', 'Download progress')} max={1} value={progress} /><span>{formatNumber(progress * 100, 1)}%</span></div>
               {job.error && <p className="download-item-error">{job.error.message}</p>}

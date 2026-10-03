@@ -16,6 +16,7 @@ import { jobsApi } from '../../shared/api/resources/jobs';
 import { modelsApi } from '../../shared/api/resources/models';
 import { openStudioExternal } from '../../shared/platform/studio';
 import { BackendBadge } from './BackendBadge';
+import { ModelVendorMark } from '../../app/ModelVendorMark';
 
 type Translate = (chinese: string, english: string) => string;
 export type ModelBrowserTab = 'official' | 'community' | 'downloads';
@@ -171,11 +172,15 @@ function ConfigurationDetails({ status, tr }: { status: ModelConfigurationStatus
 }
 
 function VariantList({
+  architecture,
+  modelName,
   disabled,
   onDownload,
   tr,
   variants,
 }: {
+  architecture?: string | string[];
+  modelName: string;
   disabled: boolean;
   onDownload(variant: HubModelVariant, origin: DownloadOrigin): void;
   tr: Translate;
@@ -193,7 +198,7 @@ function VariantList({
         return (
           <div className="model-variant" key={variant.id}>
             <div>
-              <strong>{variant.label}</strong>
+              <strong className="model-variant-title"><span>{variant.label}</span><ModelVendorMark name={modelName} architecture={architecture} size={18} /></strong>
               <small>{variant.precision || variant.format.toUpperCase()} · {tr("文件", "file")} {formatBytes(variant.byte_size)} · {tr("完整常驻约", "est. full residency")} {formatBytes(variant.configuration.required_memory_bytes)}</small>
             </div>
             <div className="variant-memory-pressure">
@@ -430,7 +435,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
             <div className="official-model-grid">
               {official?.data.map((item) => (
                 <button className={selectedOfficial?.id === item.id ? "official-model-card selected" : "official-model-card"} key={item.id} onClick={() => chooseOfficial(item)} type="button">
-                  <div className="official-model-card-title"><span>{item.name.slice(0, 1).toUpperCase()}</span><div><strong>{item.name}</strong><small>{item.family}</small></div></div>
+                  <div className="official-model-card-title"><span>{item.name.slice(0, 1).toUpperCase()}</span><div><strong>{item.name}</strong><small>{item.family}</small></div><ModelVendorMark name={item.name} architecture={item.architecture} size={28} /></div>
                   <p>{tr(item.description_zh, item.description)}</p>
                   <div className="model-chip-row">{item.precision_options.map((value) => <span key={value}>{value}</span>)}</div>
                   <ConfigurationBadge status={item.configuration} tr={tr} />
@@ -440,7 +445,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
             </div>
             {selectedOfficial && selectedSource && (
               <aside className="model-detail-panel">
-                <div className="model-detail-heading"><div><small>{selectedOfficial.family}</small><h3>{selectedOfficial.name}</h3></div><ConfigurationBadge status={selectedOfficial.configuration} tr={tr} /></div>
+                <div className="model-detail-heading"><div><small>{selectedOfficial.family}</small><h3>{selectedOfficial.name}</h3></div><div className="model-identity-trailing"><ConfigurationBadge status={selectedOfficial.configuration} tr={tr} /><ModelVendorMark name={selectedOfficial.name} architecture={selectedOfficial.architecture} size={30} /></div></div>
                 <p>{tr(selectedOfficial.description_zh, selectedOfficial.description)}</p>
                 <ConfigurationDetails status={selectedOfficial.configuration} tr={tr} />
                 <dl className="model-metadata-grid">
@@ -457,7 +462,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
                 <label className="model-source-picker"><span>{tr("下载来源", "Download source")}</span><select onChange={(event) => { const source = selectedOfficial.sources[Number(event.target.value)]; if (source) void chooseOfficialSource(source); }} value={String(Math.max(0, selectedOfficial.sources.findIndex((item) => item.provider === selectedSource.provider && item.repo_id === selectedSource.repo_id)))}>{selectedOfficial.sources.map((source, index) => <option disabled={!source.available} key={`${source.provider}:${source.repo_id}`} value={index}>{source.provider === "huggingface" ? "Hugging Face" : "ModelScope"}{source.available ? "" : ` · ${tr("离线", "unavailable")}`}</option>)}</select></label>
                 <div className="repository-line"><button onClick={() => void openStudioExternal(selectedSource.url).catch((cause) => onError(cause instanceof Error ? cause.message : String(cause)))} type="button">{selectedSource.repo_id}</button><span>{officialVariants.length} {tr("个精度版本", "variants")}</span></div>
                 {selectedOfficial.supports_ssd_streaming && <div className="streaming-note">{tr("支持 SSD 专家流式读取；即使无法完整常驻仍可流式运行。上方图标只表示完整常驻时的内存压力。", "SSD expert streaming remains available when the model cannot fit fully in memory. The icon above reflects full-residency memory pressure only.")}</div>}
-                <VariantList disabled={officialLoading || !selectedSource.available || !canDownload(selectedSource.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision || selectedOfficial.revision }, variant, origin)} tr={tr} variants={officialVariants} />
+                <VariantList architecture={selectedOfficial.architecture} modelName={selectedOfficial.name} disabled={officialLoading || !selectedSource.available || !canDownload(selectedSource.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision || selectedOfficial.revision }, variant, origin)} tr={tr} variants={officialVariants} />
               </aside>
             )}
           </div>
@@ -472,12 +477,12 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
           <p className="community-search-hint">{tr("支持直接粘贴 Hugging Face 与 ModelScope 链接；下载仍由可续传后台任务管理。", "Paste a Hugging Face or ModelScope link directly; downloads remain resumable background jobs.")}</p>
           <div className="model-browser-layout community-layout">
             <div className="community-results">
-              {results.map((item) => <button className={communityModel?.repo_id === item.repo_id && communityModel.provider === item.provider ? "selected" : ""} key={`${item.provider}:${item.repo_id}`} onClick={() => void inspect(item)} type="button"><div><strong>{item.repo_id}</strong><small>{item.provider === "huggingface" ? "Hugging Face" : "ModelScope"} · {formatCount(item.downloads)} downloads</small></div><span>{formatBytes(item.total_bytes)}</span></button>)}
+              {results.map((item) => <button className={communityModel?.repo_id === item.repo_id && communityModel.provider === item.provider ? "selected" : ""} key={`${item.provider}:${item.repo_id}`} onClick={() => void inspect(item)} type="button"><div><strong>{item.repo_id}</strong><small>{item.provider === "huggingface" ? "Hugging Face" : "ModelScope"} · {formatCount(item.downloads)} downloads</small></div><span className="model-identity-trailing">{formatBytes(item.total_bytes)}<ModelVendorMark name={item.repo_id} architecture={communityModel?.repo_id === item.repo_id && communityModel.provider === item.provider ? communityModel.architectures : undefined} /></span></button>)}
               {!results.length && <div className="model-browser-empty">{tr("搜索社区模型，或粘贴仓库链接直接打开。", "Search community models or paste a repository link to open it directly.")}</div>}
             </div>
             {communityModel && (
               <aside className="model-detail-panel">
-                <div className="model-detail-heading"><div><small>{communityModel.author || communityModel.provider}</small><h3>{communityModel.repo_id.split("/").pop()}</h3></div>{communityModel.gated && <span className="gated-badge">{tr("需要授权", "Gated")}</span>}</div>
+                <div className="model-detail-heading"><div><small>{communityModel.author || communityModel.provider}</small><h3>{communityModel.repo_id.split("/").pop()}</h3></div><div className="model-identity-trailing">{communityModel.gated && <span className="gated-badge">{tr("需要授权", "Gated")}</span>}<ModelVendorMark name={communityModel.repo_id} architecture={communityModel.architectures} size={30} /></div></div>
                 {communityModel.description && <p>{communityModel.description}</p>}
                 <dl className="model-metadata-grid">
                   <div><dt>{tr("架构", "Architecture")}</dt><dd>{communityModel.architectures.join(", ") || tr("未声明", "Not declared")}</dd></div>
@@ -492,7 +497,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
                   <div><dt>{tr("MFQ 兼容性", "MFQ compatibility")}</dt><dd>{communityModel.runtime_compatible === true ? tr("已验证", "Verified") : communityModel.runtime_compatible === false ? tr("暂不支持", "Unsupported") : tr("未知", "Unknown")}</dd></div>
                 </dl>
                 {communityModel.source_url && <div className="repository-line"><button onClick={() => void openStudioExternal(communityModel.source_url!).catch((cause) => onError(cause instanceof Error ? cause.message : String(cause)))} type="button">{tr("打开模型卡", "Open model card")}</button><span>{formatCount(communityModel.downloads)} downloads · {formatCount(communityModel.likes)} likes · {communityModel.files.length} files</span></div>}
-                <VariantList disabled={communityLoading || !canDownload(communityModel.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: communityModel.provider, repo_id: communityModel.repo_id, revision: communityModel.revision }, variant, origin)} tr={tr} variants={communityModel.variants} />
+                <VariantList architecture={communityModel.architectures} modelName={communityModel.repo_id} disabled={communityLoading || !canDownload(communityModel.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: communityModel.provider, repo_id: communityModel.repo_id, revision: communityModel.revision }, variant, origin)} tr={tr} variants={communityModel.variants} />
               </aside>
             )}
           </div>

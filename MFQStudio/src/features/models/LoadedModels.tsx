@@ -1,13 +1,12 @@
-/** 已加载模型列表及切换、卸载入口。 */
 import { useSettings } from '../settings/SettingsProvider';
 import { Icon, SectionLabel, TMPanel, EmptyPanel } from '../../app/display';
 import { formatNumber } from '../../app/formatters';
 import type { useModelCatalog } from './useModelCatalog';
+import { ModelVendorMark } from '../../app/ModelVendorMark';
 
-/** 展示当前实例及模型选择操作。 */
 export function LoadedModels({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
   const { tr } = useSettings();
-  const { model, busy, availableModelNames, modelFilter, filteredInstances,
+  const { model, busy, artifacts, availableModelNames, modelFilter, filteredInstances,
     selectModel, unloadInstance, chooseModelDirectory } = catalog;
   return (
     <>
@@ -63,6 +62,7 @@ export function LoadedModels({ catalog }: { catalog: ReturnType<typeof useModelC
                     >
                       {tr('卸载', 'Unload')}
                     </button>
+                    <ModelVendorMark name={instance.model} architecture={artifacts.find((item) => item.name === instance.model)?.architecture} />
                   </div>
                 </div>
               );

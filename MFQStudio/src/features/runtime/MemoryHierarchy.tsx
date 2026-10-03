@@ -1,9 +1,9 @@
-/** Model colors are shared by every memory/storage tier. Missing telemetry is not zero. */
 import { useRef } from 'react';
 import type { RuntimeInstance } from '../../shared/api/types';
 import { formatBytes, formatNumber } from '../../app/formatters';
 import { Icon, TMPanel } from '../../app/display';
 import { useSettings } from '../settings/SettingsProvider';
+import { ModelVendorMark } from '../../app/ModelVendorMark';
 
 const MODEL_COLORS = ['var(--accent)', '#e07070', '#65ad83', '#d5ae58', '#a28bd0', '#5eafb5', '#d58dad'];
 type Tier = 'weights' | 'kv' | 'experts' | 'ple';
@@ -22,7 +22,6 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, connectionRevi
     palette.current = { revision: connectionRevision, ids: [] };
   }
   const loaded = instances.filter((item) => item.state === 'ready' || item.state === 'busy');
-  // Register in load order, never in byte-size or selected-model order.
   [...loaded].sort((a, b) => (a.started_at || '').localeCompare(b.started_at || '')).forEach((item) => {
     if (!palette.current.ids.includes(item.model)) palette.current.ids.push(item.model);
   });
@@ -75,6 +74,7 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, connectionRevi
         {loaded.map((item) => (
           <span key={item.id} title={item.model} data-model-id={item.id}>
             <i style={{ backgroundColor: color(item) }} />{item.model}
+            <ModelVendorMark name={item.model} size={18} />
           </span>
         ))}
         {!loaded.length && <span>{tr('暂无已加载模型', 'No loaded models')}</span>}
@@ -86,7 +86,6 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, connectionRevi
           const total = amounts.reduce((sum, { bytes }) => sum + (bytes ?? 0), 0);
           const resident = tier.id === 'weights' || tier.id === 'kv';
           const capacity = tier.id === 'weights' ? memoryCapacity : tier.id === 'kv' ? cacheCapacity : total;
-          // Keep every model visible on overcommit without inflating the displayed limit.
           const scale = capacity == null ? 0 : Math.max(capacity, total);
           const used = unknown ? tr('明细未上报', 'Breakdown not reported') : resourceBytes(total);
           return (

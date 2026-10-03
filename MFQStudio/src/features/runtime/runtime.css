@@ -17,7 +17,8 @@
   font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 .runtime-hero-copy > small { color: var(--muted); font-size: 12px; line-height: 1.6; }
-.runtime-hero-actions { display: flex; gap: 8px; }
+.runtime-hero-actions { display: flex; align-items: center; gap: 8px; }
+.runtime-hero-actions > .model-vendor-mark { margin-left: 8px; }
 .runtime-hero-actions button {
   display: inline-flex;
   min-height: 36px;

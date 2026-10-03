@@ -1,4 +1,3 @@
-/** 运行概况条汇总模型加载任务与实例状态，并提供业务页面导航。 */
 import { useMemo } from 'react';
 import { useNavigate } from 'react-router';
 import { useRuntime } from '../../app/RuntimeProvider';
@@ -8,8 +7,8 @@ import { Icon, TMPanel, ModelMonogram } from '../../app/display';
 import { formatNumber, formatDuration } from '../../app/formatters';
 import { STUDIO_PATHS } from '../../navigation';
 import { openAIEndpoint } from './endpoint';
+import { ModelVendorMark } from '../../app/ModelVendorMark';
 
-/** 按加载任务、当前实例和失败记录推导概览状态，避免仅凭模型名称误判就绪。 */
 export function RuntimeHero() {
   const { runtime, instances, studio } = useRuntime();
   const jobs = useJobStore((state) => state.jobs);
@@ -115,6 +114,8 @@ export function RuntimeHero() {
           <Icon name="chat" size={15} />
           {tr('对话', 'Chat')}
         </button>
+        <ModelVendorMark name={modelHero.name} size={34}
+          architecture={modelHero.name === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined} />
       </div>
     </TMPanel>
   );

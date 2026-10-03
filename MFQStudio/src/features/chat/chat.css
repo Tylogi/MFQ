@@ -33,6 +33,8 @@
 }
 .chat-screen-actions { display: flex; min-width: 0; align-items: center; gap: 10px; }
 .chat-model-summary { display: grid; min-width: 0; gap: 2px; text-align: right; }
+.chat-session-select-button { grid-template-columns: minmax(0, 1fr) auto; }
+.chat-session-select-button > .model-vendor-mark { grid-column: 2; grid-row: 1 / span 2; align-self: center; }
 .chat-model-summary strong {
   overflow: hidden;
   max-width: min(27vw, 350px);

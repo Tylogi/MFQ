@@ -1,4 +1,3 @@
-/** 评测页面独立管理结果比较、数据集注册及按需加载。 */
 import { FormEvent, useEffect, useState } from 'react';
 import { evaluationsApi } from '../../shared/api/resources/evaluations';
 import { Icon } from '../../app/display';
@@ -7,7 +6,7 @@ import { errorMessage, formatNumber } from '../../app/formatters';
 import { useSettings } from '../settings/SettingsProvider';
 import type { DatasetResource, EvaluationResult, EvaluationComparison } from '../../shared/api/types';
 import { toast } from '../../stores/toastStore';
-/** 挂载时加载评测资源，提交与错误状态仅影响当前页面。 */
+import { ModelVendorMark } from '../../app/ModelVendorMark';
 export function EvaluationsPage() {
   const { tr } = useSettings();
   const [busy, setBusy] = useState(false);
@@ -44,7 +43,6 @@ export function EvaluationsPage() {
       active = false;
     };
   }, []);
-  /** 注册数据集后重新读取服务器资源列表。 */
   async function registerDataset(event: FormEvent) {
     event.preventDefault();
     if (busy || !datasetDraft.name.trim() || !datasetDraft.artifact_uri.trim()) return;
@@ -64,7 +62,6 @@ export function EvaluationsPage() {
       setBusy(false);
     }
   }
-  /** 比较所选结果并由服务器校验可比性。 */
   async function compareSelectedEvaluations() {
     if (selectedEvaluations.length < 2 || busy) return;
     setBusy(true);
@@ -120,12 +117,13 @@ export function EvaluationsPage() {
                       {item.kind} · {new Date(item.created_at).toLocaleString()}
                     </small>
                   </div>
-                  <span>
+                  <span className="model-identity-trailing">
                     {Object.entries(item.metrics)
                       .filter(([, value]) => typeof value === 'number')
                       .slice(0, 2)
                       .map(([name, value]) => `${name} ${formatNumber(Number(value), 3)}`)
                       .join(' · ')}
+                    <ModelVendorMark name={item.model_id} />
                   </span>
                 </label>
               ))
@@ -149,7 +147,7 @@ export function EvaluationsPage() {
               </header>
               {evaluationComparison.rows.map((row) => (
                 <div key={row.evaluation.id}>
-                  <strong>{row.evaluation.model_id}</strong>
+                  <strong className="model-identity-label">{row.evaluation.model_id}<ModelVendorMark name={row.evaluation.model_id} size={20} /></strong>
                   {evaluationComparison.metrics.map((metric) => (
                     <span key={metric}>
                       {formatNumber(Number(row.evaluation.metrics[metric]), 4)}
