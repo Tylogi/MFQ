@@ -17,7 +17,7 @@ namespace mfq::cuda {
 using namespace mfq::engine;
 using namespace mfq::cuda::internal;
 
-namespace {
+namespace internal {
 template <typename Model>
 struct CudaEngineState {
     std::shared_ptr<CudaExecutionContext> execution;
@@ -105,6 +105,9 @@ struct CudaEngineState {
     }
 
 };
+} // namespace internal
+
+namespace {
 using State = std::variant<
     std::unique_ptr<CudaEngineState<Qwen35CausalLm>>,
     std::unique_ptr<CudaEngineState<MiniCPMO45CausalLm>>,
