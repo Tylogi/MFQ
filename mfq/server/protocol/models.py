@@ -916,6 +916,13 @@ class HubModelVariant(ProtocolModel):
     configuration: ModelConfigurationStatus
 
 
+class HubMemoryPool(ProtocolModel):
+    kind: Literal["uma", "vram", "ram"]
+    device: str | None = Field(default=None, max_length=255)
+    capacity_bytes: int | None = Field(default=None, ge=0)
+    bandwidth_bytes_per_second: int | None = Field(default=None, gt=0)
+
+
 class HubSystemProfile(ProtocolModel):
     platform: str = Field(min_length=1, max_length=64)
     machine: str = Field(min_length=1, max_length=64)
@@ -927,6 +934,7 @@ class HubSystemProfile(ProtocolModel):
     physical_memory_bytes: int | None = Field(default=None, ge=0)
     available_memory_bytes: int | None = Field(default=None, ge=0)
     runtime_memory_budget_bytes: int | None = Field(default=None, ge=0)
+    memory_pools: list[HubMemoryPool] = Field(default_factory=list)
 
 
 class HubModelInfo(HubModelSummary):

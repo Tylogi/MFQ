@@ -2,6 +2,7 @@ import { FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from 
 
 import type {
   HubModelInfo,
+  HubMemoryPool,
   HubModelSummary,
   HubModelVariant,
   HubSystemProfile,
@@ -60,13 +61,29 @@ function formatCount(value: number): string {
 }
 
 function hardwareSummary(system: HubSystemProfile, tr: Translate): string {
-  const ram = system.physical_memory_bytes ? `${formatBytes(system.physical_memory_bytes).replace(/\.0 /, ' ')} RAM` : null;
+  const unified = system.memory_pools?.some((pool) => pool.kind === 'uma') || /^Apple M\d+(?: (?:Pro|Max|Ultra))?$/.test(system.cpu_name || '');
+  const ram = system.physical_memory_bytes ? `${formatBytes(system.physical_memory_bytes).replace(/\.0 /, ' ')} ${unified ? 'URAM' : 'RAM'}` : null;
   const gpu = system.gpu_names?.join(' + ');
   if (system.backend === 'metal') {
     const cores = [system.cpu_cores && `${system.cpu_cores} CPU`, system.gpu_cores && `${system.gpu_cores} GPU`].filter(Boolean).join(' / ');
     return [system.cpu_name || gpu, cores, ram].filter(Boolean).join(' · ') || tr('硬件信息未上报', 'Hardware details unavailable');
   }
   return [gpu, ram, system.cpu_name].filter(Boolean).join(' · ') || tr('硬件信息未上报', 'Hardware details unavailable');
+}
+
+function MemoryBudget({ system, tr }: { system: HubSystemProfile | undefined; tr: Translate }) {
+  const pools: HubMemoryPool[] = system?.memory_pools?.length ? system.memory_pools : system ? [{
+    kind: /^Apple M\d+(?: (?:Pro|Max|Ultra))?$/.test(system.cpu_name || '') ? 'uma' : 'ram',
+    capacity_bytes: system.physical_memory_bytes,
+  }] : [];
+  return <div className="detected-memory-pools">
+    {pools.length ? pools.map((pool, index) => <div className="detected-memory-pool" key={`${pool.kind}:${index}`} title={pool.device || undefined}>
+      <strong>{pool.capacity_bytes ? `${(pool.capacity_bytes / 2 ** 30).toFixed(1).replace(/\.0$/, '')} GiB` : '—'} {pool.kind === 'uma' ? 'URAM' : pool.kind.toUpperCase()}</strong>
+      <small title={pool.bandwidth_bytes_per_second ? tr('规格带宽，非实测吞吐', 'Specified bandwidth, not measured throughput') : undefined}>
+        {pool.bandwidth_bytes_per_second ? `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(pool.bandwidth_bytes_per_second / 2 ** 30)} GiB/s` : tr('带宽未上报', 'Bandwidth unavailable')}
+      </small>
+    </div>) : <strong>—</strong>}
+  </div>;
 }
 
 function formatDate(value?: string | null): string {
@@ -415,7 +432,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
         <>
           <div className="detected-configuration">
             <div><span>{tr("检测到的配置", "Detected configuration")}</span><div className="detected-hardware-summary"><strong>{system ? hardwareSummary(system, tr) : tr("正在检测", "Detecting")}</strong>{system && <BackendBadge backend={system.backend} />}</div></div>
-            <div><span>{tr("推理预算", "Runtime budget")}</span><strong>{formatBytes(system?.runtime_memory_budget_bytes)}</strong></div>
+            <div><span>{tr("推理预算", "Runtime budget")}</span><MemoryBudget system={system || undefined} tr={tr} /></div>
             <button disabled={catalogLoading || official?.refreshing} onClick={() => void loadOfficial(true)} type="button">{catalogLoading || official?.refreshing ? tr("刷新中", "Refreshing") : tr("刷新目录", "Refresh")}</button>
           </div>
           <div className="memory-pressure-guide">

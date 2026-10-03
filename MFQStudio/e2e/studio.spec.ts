@@ -89,6 +89,48 @@ test('三家架构标识贯穿模型页面，保持描线、无边框和靠右�
   expect(state.unexpected).toEqual([]);
 });
 
+test('推理预算按内存架构分列容量，带宽用小号灰字放在下方', async ({ page }, testInfo) => {
+  await mockStudioServer(page);
+  await page.goto('/model-hub');
+  await expect(page.locator('.detected-hardware-summary strong')).toContainText('128 GiB URAM');
+  const unified = page.locator('.detected-memory-pool');
+  await expect(unified).toHaveCount(1);
+  await expect(unified.locator('strong')).toHaveText('128 GiB URAM');
+  await expect(unified.locator('small')).toHaveText('571.8 GiB/s');
+  const errors: string[] = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  const checkLayout = async () => {
+    for (const pool of await page.locator('.detected-memory-pool').all()) {
+      const capacity = await pool.locator('strong').boundingBox();
+      const bandwidth = await pool.locator('small').boundingBox();
+      expect(bandwidth!.y).toBeGreaterThanOrEqual(capacity!.y + capacity!.height);
+      expect(bandwidth!.x).toBe(capacity!.x);
+      const size = await pool.evaluate((node) => ({
+        capacity: getComputedStyle(node.querySelector('strong')!).fontSize,
+        bandwidth: getComputedStyle(node.querySelector('small')!).fontSize,
+        color: getComputedStyle(node.querySelector('small')!).color,
+      }));
+      expect(parseFloat(size.bandwidth)).toBeLessThan(parseFloat(size.capacity));
+      expect(size.color).toBe(await page.locator('.detected-configuration > div > span').first().evaluate((node) => getComputedStyle(node).color));
+    }
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  };
+  await checkLayout();
+  await page.locator('.detected-configuration').screenshot({ path: testInfo.outputPath('unified-memory.png') });
+  await page.route(/\/api\/v1\/hub\/official(?:\?.*)?$/, (route) => route.fulfill({ json: {
+    ...officialCatalog, system: { platform: 'Windows', machine: 'AMD64', backend: 'cuda',
+      cpu_name: 'AMD Ryzen 5 9600X', gpu_names: ['NVIDIA GeForce RTX 5090'], physical_memory_bytes: 64 * 2 ** 30,
+      memory_pools: [{ kind: 'vram', capacity_bytes: 32 * 2 ** 30, bandwidth_bytes_per_second: 1792e9 },
+        { kind: 'ram', capacity_bytes: 64 * 2 ** 30, bandwidth_bytes_per_second: 104 * 2 ** 30 }] },
+  } }));
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(page.locator('.detected-memory-pool strong')).toHaveText(['32 GiB VRAM', '64 GiB RAM']);
+  await expect(page.locator('.detected-memory-pool small')).toHaveText(['1,668.9 GiB/s', '104 GiB/s']);
+  await checkLayout();
+  await page.locator('.detected-configuration').screenshot({ path: testInfo.outputPath('discrete-memory.png') });
+  expect(errors).toEqual([]);
+});
+
 test('运行资源按模型分段，四个槽共享颜色，端点包含 v1', async ({ page }, testInfo) => {
   await mockStudioServer(page);
   const instances = [1, 2, 3, 4].map((index) => ({
@@ -168,7 +210,7 @@ test('模型下载留在本页，飞入圆圈后打开第三个队列标签，�
   });
   await page.goto('/model-hub');
   await expect(page.getByRole('img', { name: 'Apple · METAL' })).toBeVisible();
-  await expect(page.getByText('Apple M5 Max · 18 CPU / 40 GPU · 128 GiB RAM')).toBeVisible();
+  await expect(page.getByText('Apple M5 Max · 18 CPU / 40 GPU · 128 GiB URAM')).toBeVisible();
   await expect(page.getByRole('tab')).toHaveText(['Official', 'Community', 'Download queue']);
   await page.getByRole('button', { name: 'Download', exact: true }).first().click();
   await expect(page).toHaveURL('/model-hub');

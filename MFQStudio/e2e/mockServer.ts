@@ -43,7 +43,8 @@ const catalogConfiguration = {
 export const officialCatalog: OfficialModelList = {
   system: { platform: 'macOS', machine: 'arm64', backend: 'metal',
     cpu_name: 'Apple M5 Max', cpu_cores: 18, gpu_names: ['Apple M5 Max'], gpu_cores: 40,
-    physical_memory_bytes: 128 * 2 ** 30, runtime_memory_budget_bytes: 96 * 2 ** 30 },
+    physical_memory_bytes: 128 * 2 ** 30, runtime_memory_budget_bytes: 96 * 2 ** 30,
+    memory_pools: [{ kind: 'uma', capacity_bytes: 128 * 2 ** 30, bandwidth_bytes_per_second: 614e9 }] },
   data: ['Studio Long-Context Mixture Model', 'Studio Compact Model'].map((name, index) => ({
     id: `catalog-${index}`, name, family: 'Layout fixture', architecture: 'studio_test',
     description: 'Deterministic catalog fixture for browser layout and memory-pressure checks.',

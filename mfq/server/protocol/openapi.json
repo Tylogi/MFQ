@@ -1524,6 +1524,61 @@
         "title": "GenerationPresetResource",
         "type": "object"
       },
+      "HubMemoryPool": {
+        "additionalProperties": false,
+        "properties": {
+          "bandwidth_bytes_per_second": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bandwidth Bytes Per Second"
+          },
+          "capacity_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Capacity Bytes"
+          },
+          "device": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device"
+          },
+          "kind": {
+            "enum": [
+              "uma",
+              "vram",
+              "ram"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "HubMemoryPool",
+        "type": "object"
+      },
       "HubModelFile": {
         "additionalProperties": false,
         "properties": {
@@ -2025,6 +2080,13 @@
             "minLength": 1,
             "title": "Machine",
             "type": "string"
+          },
+          "memory_pools": {
+            "items": {
+              "$ref": "#/components/schemas/HubMemoryPool"
+            },
+            "title": "Memory Pools",
+            "type": "array"
           },
           "physical_memory_bytes": {
             "anyOf": [

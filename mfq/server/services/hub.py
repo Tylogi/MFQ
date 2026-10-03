@@ -21,6 +21,7 @@ import httpx
 
 from mfq.architectures.tensor_schema import tensor_schema_for_config
 from mfq.server.protocol.models import (
+    HubMemoryPool,
     HubModelFile,
     HubModelInfo,
     HubModelSearchResult,
@@ -285,6 +286,21 @@ def system_profile(
         if runtime_memory_budget_bytes is None:
             runtime_memory_budget_bytes = recommended
     normalized_backend = backend if backend in {"metal", "cuda", "rocm", "cpu"} else "unknown"
+    unified = hardware.unified_memory or any(item.unified for item in hardware.gpu_memory)
+    shared_gpu = next((item for item in hardware.gpu_memory if item.unified), None)
+    bandwidth = hardware.memory_bandwidth_bytes_per_second
+    if bandwidth is None and shared_gpu is not None:
+        bandwidth = shared_gpu.bandwidth_bytes_per_second
+    memory_pools = [HubMemoryPool(
+        kind="vram", device=item.name, capacity_bytes=item.capacity_bytes,
+        bandwidth_bytes_per_second=item.bandwidth_bytes_per_second,
+    ) for item in hardware.gpu_memory if not item.unified]
+    if not memory_pools and not unified and backend in {"cuda", "rocm", "metal"}:
+        memory_pools = [HubMemoryPool(kind="vram", device=name) for name in hardware.gpu_names]
+    memory_pools.append(HubMemoryPool(
+        kind="uma" if unified else "ram", capacity_bytes=physical,
+        bandwidth_bytes_per_second=bandwidth,
+    ))
     return HubSystemProfile(
         platform=platform.system() or "unknown",
         machine=platform.machine() or "unknown",
@@ -296,6 +312,7 @@ def system_profile(
         physical_memory_bytes=physical,
         available_memory_bytes=available,
         runtime_memory_budget_bytes=runtime_memory_budget_bytes,
+        memory_pools=memory_pools,
     )
 
 

@@ -101,7 +101,7 @@ it('does not discard a source detail request when the catalog is updated', async
 });
 
 it.each([
-  [{ backend: 'metal', cpu_name: 'Apple M5 Max', cpu_cores: 18, gpu_names: ['Apple M5 Max'], gpu_cores: 40, physical_memory_bytes: 128 * 2 ** 30 }, 'Apple M5 Max · 18 CPU / 40 GPU · 128 GiB RAM', 'Apple · METAL'],
+  [{ backend: 'metal', cpu_name: 'Apple M5 Max', cpu_cores: 18, gpu_names: ['Apple M5 Max'], gpu_cores: 40, physical_memory_bytes: 128 * 2 ** 30 }, 'Apple M5 Max · 18 CPU / 40 GPU · 128 GiB URAM', 'Apple · METAL'],
   [{ backend: 'cuda', cpu_name: 'AMD Ryzen 5 9600X', gpu_names: ['NVIDIA GeForce RTX 5090'], physical_memory_bytes: 64 * 2 ** 30 }, 'NVIDIA GeForce RTX 5090 · 64 GiB RAM · AMD Ryzen 5 9600X', 'NVIDIA · CUDA'],
   [{ backend: 'rocm', cpu_name: 'AMD Ryzen 9', gpu_names: ['AMD Radeon'], physical_memory_bytes: 64 * 2 ** 30 }, 'AMD Radeon · 64 GiB RAM · AMD Ryzen 9', 'AMD · ROCM'],
 ] as [Partial<HubSystemProfile>, string, string][])('shows concrete hardware and a monochrome backend vendor badge: %s', async (hardware, summary, badge) => {
@@ -112,4 +112,25 @@ it.each([
   expect(await screen.findByText(summary)).toBeInTheDocument();
   expect(screen.getByRole('img', { name: badge }).querySelector('svg')).toHaveAttribute('fill', 'none');
   expect(screen.queryByText(/test · test/)).not.toBeInTheDocument();
+});
+
+it.each([
+  [[{ kind: 'uma', capacity_bytes: 128 * 2 ** 30, bandwidth_bytes_per_second: 614e9 }], ['128 GiB URAM'], ['571.8 GiB/s']],
+  [[{ kind: 'vram', capacity_bytes: 32 * 2 ** 30, bandwidth_bytes_per_second: 1726 * 2 ** 30 }, { kind: 'ram', capacity_bytes: 64 * 2 ** 30, bandwidth_bytes_per_second: 104 * 2 ** 30 }], ['32 GiB VRAM', '64 GiB RAM'], ['1,726 GiB/s', '104 GiB/s']],
+  [[{ kind: 'ram', capacity_bytes: 64 * 2 ** 30 }], ['64 GiB RAM'], ['Bandwidth unavailable']],
+  [[{ kind: 'vram' }, { kind: 'ram', capacity_bytes: 64 * 2 ** 30 }], ['— VRAM', '64 GiB RAM'], ['Bandwidth unavailable', 'Bandwidth unavailable']],
+] as [NonNullable<HubSystemProfile['memory_pools']>, string[], string[]][])('shows each memory capacity with its own bandwidth underneath: %s', async (pools, capacities, bandwidths) => {
+  const data = catalog(false, false);
+  data.system = { ...data.system, memory_pools: pools, runtime_memory_budget_bytes: 96 * 2 ** 30 };
+  vi.mocked(modelsApi.officialHubModels).mockResolvedValue(data);
+  render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
+  await screen.findByText(capacities[0]);
+  const rows = document.querySelectorAll('.detected-memory-pool');
+  expect(rows).toHaveLength(capacities.length);
+  rows.forEach((row, index) => {
+    expect(row.querySelector('strong')).toHaveTextContent(capacities[index]);
+    expect(row.querySelector('small')).toHaveTextContent(bandwidths[index]);
+  });
+  expect(screen.queryByText('96.0 GiB')).not.toBeInTheDocument();
+  expect(screen.queryByText('614 GiB/s')).not.toBeInTheDocument();
 });

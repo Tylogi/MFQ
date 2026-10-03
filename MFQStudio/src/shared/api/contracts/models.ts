@@ -61,6 +61,13 @@ export interface HubModelVariant {
   configuration: ModelConfigurationStatus;
 }
 
+export interface HubMemoryPool {
+  kind: 'uma' | 'vram' | 'ram';
+  device?: string | null;
+  capacity_bytes?: number | null;
+  bandwidth_bytes_per_second?: number | null;
+}
+
 export interface HubSystemProfile {
   platform: string;
   machine: string;
@@ -72,6 +79,7 @@ export interface HubSystemProfile {
   physical_memory_bytes?: number | null;
   available_memory_bytes?: number | null;
   runtime_memory_budget_bytes?: number | null;
+  memory_pools?: HubMemoryPool[];
 }
 
 export interface HubModelInfo extends HubModelSummary {
