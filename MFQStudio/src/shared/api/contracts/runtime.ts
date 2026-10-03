@@ -164,6 +164,9 @@ export interface RuntimeModel {
 
 export interface RuntimeMemoryResources {
   resident_weight_bytes: number | null;
+  wired_bytes?: number | null;
+  wired_limit_bytes?: number | null;
+  wired_available?: boolean | null;
   kv_bytes: number | null;
   context_count: number | null;
   prefix_cache_blocks: number | null;

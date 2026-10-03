@@ -5809,6 +5809,41 @@
               }
             ],
             "title": "Ssd Ple Bytes"
+          },
+          "wired_available": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wired Available"
+          },
+          "wired_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wired Bytes"
+          },
+          "wired_limit_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Wired Limit Bytes"
           }
         },
         "title": "RuntimeMemoryResources",

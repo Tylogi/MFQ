@@ -214,6 +214,9 @@ def test_native_worker_reports_resource_breakdown_over_stdio(tmp_path, quantized
             try:
                 status = await client.status()
                 assert status["resident_weight_bytes"] > 0
+                assert status["metal_wired_available"] == 1
+                assert status["metal_wired_bytes"] >= status["resident_weight_bytes"]
+                assert status["metal_wired_bytes"] <= status["metal_wired_limit_bytes"]
                 assert status["kv_cache_bytes"] == 0
                 assert status["kv_cache_contexts"] == 0
                 assert status["ssd_expert_enabled"] == 0
@@ -232,8 +235,15 @@ def test_native_worker_reports_resource_breakdown_over_stdio(tmp_path, quantized
                     chunks = [event async for event in events if event is not None]
                 assert chunks
                 after = await client.status()
+                assert after["metal_wired_bytes"] >= status["resident_weight_bytes"]
+                assert after["metal_wired_limit_bytes"] == status["metal_wired_limit_bytes"]
                 assert after["ple_source_bytes_read"] > before
                 assert (await client.status())["ple_source_bytes_read"] == after["ple_source_bytes_read"]
+                await client.reload(32)
+                reloaded = await client.status()
+                assert reloaded["metal_wired_available"] == 1
+                assert reloaded["metal_wired_bytes"] >= reloaded["resident_weight_bytes"]
+                assert reloaded["metal_wired_limit_bytes"] == status["metal_wired_limit_bytes"]
             finally:
                 with suppress(Exception):
                     await client.aclose()

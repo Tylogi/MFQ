@@ -343,6 +343,7 @@ test('运行资源按模型分段，四个槽共享颜色，端点包含 v1', as
     id: `resource-${index}`, model: `Resource Model ${index}`, state: 'ready', devices: ['metal'],
     active_sessions: 0, queued_requests: 0, started_at: `2026-01-01T00:00:0${index}Z`,
     memory: { resident_weight_bytes: index * 2 ** 30, kv_bytes: index * 2 ** 20,
+      wired_available: true, wired_bytes: index * 2 ** 30, wired_limit_bytes: 20 * 2 ** 30,
       context_count: index, prefix_cache_blocks: index * 2, ssd_experts: true,
       ssd_expert_bytes: index * 2 ** 30, ssd_ple: true, ssd_ple_bytes: index * 2 ** 30 },
   }));
@@ -355,6 +356,7 @@ test('运行资源按模型分段，四个槽共享颜色，端点包含 v1', as
   await expect(page.getByText('Resource overview', { exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Runtime resources', exact: true })).toBeVisible();
   await expect(page.locator('.memory-model-legend i')).toHaveCount(4);
+  await expect(page.getByTitle('Resource Model 1 · Metal wired 1 GiB / 20 GiB')).toBeVisible();
   await expect(page.getByText('10 contexts · 20 cache blocks')).toBeVisible();
   const colors = await page.locator('.memory-model-legend i').evaluateAll((dots) => dots.map((dot) => getComputedStyle(dot).backgroundColor));
   expect(new Set(colors).size).toBe(4);

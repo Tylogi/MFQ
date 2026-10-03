@@ -164,7 +164,7 @@ def test_automatic_memory_budget_tracks_current_reclaimable_memory(
     explicit._load_bytes["resident"] = 30 * gib
 
     assert automatic._effective_runtime_memory_budget_locked() == 32 * gib
-    assert explicit._effective_runtime_memory_budget_locked() == 100 * gib
+    assert explicit._effective_runtime_memory_budget_locked() == 32 * gib
     assert HostMemorySnapshot(0, -1, 10, -1, 0).reclaimable(
         active_ratio=2.0
     ) == 10
@@ -1142,6 +1142,7 @@ def test_empty_runtime_pool_reports_idle_state(tmp_path: Path) -> None:
             "runtime_memory_headroom_bytes": None,
             "runtime_memory_pressure_level": "disabled",
             "runtime_memory_pressure_ratio": None,
+            "runtime_memory_host_paging_pressure": False,
             "runtime_memory_shared_cache_reclaims": 0,
             "runtime_memory_shared_cache_released_bytes": 0,
             "runtime_memory_shared_cache_reclaim_failures": 0,

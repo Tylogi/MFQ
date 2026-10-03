@@ -431,6 +431,14 @@ set_target_properties(mfq-metal-nint-rows-test PROPERTIES
     BUILD_RPATH "${MFQ_MLX_ROOT}/lib")
 add_test(NAME mfq-metal-nint-rows-test COMMAND mfq-metal-nint-rows-test)
 
+add_executable(mfq-metal-memory-residency-test tests/mlx_memory_residency_test.cpp)
+target_link_libraries(mfq-metal-memory-residency-test PRIVATE mfq-metal-runtime)
+target_compile_features(mfq-metal-memory-residency-test PRIVATE cxx_std_20)
+target_compile_options(mfq-metal-memory-residency-test PRIVATE -UNDEBUG)
+set_target_properties(mfq-metal-memory-residency-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib")
+add_test(NAME mfq-metal-memory-residency-test COMMAND mfq-metal-memory-residency-test)
+
 add_executable(mfq-metal-mx-test
     tests/mlx_mx_test.cpp
 )

@@ -72,7 +72,10 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, connectionRevi
       </div>
       <div className="memory-model-legend" aria-label={tr('模型颜色图例', 'Model color legend')}>
         {loaded.map((item) => (
-          <span key={item.id} title={item.model} data-model-id={item.id}>
+          <span key={item.id} title={item.memory?.wired_available == null ? item.model :
+            item.memory.wired_available
+              ? `${item.model} · Metal ${tr('锁页', 'wired')} ${item.memory.wired_bytes == null ? '--' : resourceBytes(item.memory.wired_bytes)} / ${item.memory.wired_limit_bytes == null ? '--' : resourceBytes(item.memory.wired_limit_bytes)}`
+              : `${item.model} · ${tr('Metal 锁页不可用', 'Metal memory wiring unavailable')}`} data-model-id={item.id}>
             <i style={{ backgroundColor: color(item) }} />{item.model}
             <ModelVendorMark name={item.model} size={18} />
           </span>
@@ -113,6 +116,11 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, connectionRevi
                 {' / '}{loaded.every((item) => item.memory?.prefix_cache_limit_bytes != null)
                   ? resourceBytes(loaded.reduce((sum, item) => sum + item.memory!.prefix_cache_limit_bytes!, 0)) : '--'}
               </small>}
+              {tier.id === 'weights' && loaded.some((item) => item.memory?.wired_available === false) &&
+                <small className="memory-tier-notice"><Icon name="info" size={12} />
+                  {tr('部分模型的 Metal 锁页不可用，权重可能被系统换出。',
+                    'Metal memory wiring is unavailable for some models; weights may be paged out.')}
+                </small>}
               {unknown && <small className="memory-tier-notice"><Icon name="info" size={12} />
                 {tr(`${missing.map(({ item }) => item.model).join('、')}：明细未上报`,
                   `${missing.map(({ item }) => item.model).join(', ')}: breakdown not reported`)}

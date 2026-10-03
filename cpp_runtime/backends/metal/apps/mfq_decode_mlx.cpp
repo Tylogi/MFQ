@@ -4,6 +4,7 @@
 #include "mlx_legacy_tensor_compat.h"
 #include "mlx_minicpmo45.h"
 #include "mlx_moe.h"
+#include "mlx_memory_residency.h"
 #include "mlx_qwen4_causal_lm.h"
 #include "mlx_qwen35_causal_lm.h"
 #include "mlx_stream_sync.h"
@@ -572,11 +573,13 @@ void configure_mlx_metal() {
                 if (limit == 0) {
                     throw std::runtime_error("device returned a zero limit");
                 }
-                mlx::core::set_wired_limit(limit);
+                mfq::metal::MlxMemoryResidency::configure(limit);
                 std::cerr << "Metal wired memory limit: " << limit
                           << " bytes (device recommendation)\n";
             } catch (const std::exception& error) {
-                // Older MLX/macOS versions may not support memory wiring.
+                if (__builtin_available(macOS 15, *)) {
+                    throw;
+                }
                 std::cerr << "Warning: Metal memory residency unavailable: "
                           << error.what() << "\n";
             }
@@ -2138,6 +2141,7 @@ public:
 
 private:
     void capture_weight_residency() {
+        mfq::metal::MlxMemoryResidency::refresh();
         const auto usage = mfq::metal::MlxResourceTelemetry::snapshot();
         const auto other = usage.cache_bytes + usage.dynamic_weight_bytes;
         const auto active = mlx::core::get_active_memory();
@@ -2150,6 +2154,12 @@ private:
             {"mlx_cache_bytes", static_cast<double>(mlx::core::get_cache_memory())},
             {"mlx_cache_limit_bytes", static_cast<double>(allocator_cache_limit)},
             {"mlx_peak_bytes", static_cast<double>(mlx::core::get_peak_memory())},
+            {"metal_wired_limit_bytes", static_cast<double>(
+                mfq::metal::MlxMemoryResidency::configured_limit())},
+            {"metal_wired_bytes", static_cast<double>(
+                mfq::metal::MlxMemoryResidency::wired_bytes())},
+            {"metal_wired_available",
+                mfq::metal::MlxMemoryResidency::configured_limit() > 0 ? 1.0 : 0.0},
             {"ple_source_bytes_read", static_cast<double>(
                 mfq::metal::MlxResourceTelemetry::ple_read_counter().load(std::memory_order_relaxed))},
         };

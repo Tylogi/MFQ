@@ -309,6 +309,8 @@ class RuntimePool:
         self._shared_cache_released_bytes = 0
         self._shared_cache_reclaim_failures = 0
         self._shared_cache_pressure_checked_at = 0.0
+        self._host_vm_counters: tuple[int, int] | None = None
+        self._host_vm_pressure_until = 0.0
         self.store = None
         self._instances: dict[UUID, _Runtime] = {}
         self._loading_model_names: set[str] = set()
@@ -1460,6 +1462,9 @@ class RuntimePool:
                 ),
                 "runtime_memory_pressure_level": memory_pressure_level,
                 "runtime_memory_pressure_ratio": memory_pressure_ratio,
+                "runtime_memory_host_paging_pressure": (
+                    time.monotonic() < self._host_vm_pressure_until
+                ),
                 "runtime_memory_shared_cache_reclaims": self._shared_cache_reclaims,
                 "runtime_memory_shared_cache_released_bytes": (
                     self._shared_cache_released_bytes
@@ -2186,7 +2191,7 @@ class RuntimePool:
         """Release server-process caches before trimming or evicting models."""
 
         reclaimer = self.shared_cache_reclaimer
-        if reclaimer is None or not self.automatic_memory_budget:
+        if reclaimer is None:
             return 0
         async with self._lock:
             if self._closed:
@@ -2209,7 +2214,7 @@ class RuntimePool:
         return await self._run_shared_cache_reclaimer()
 
     async def _reclaim_shared_cache_under_pressure(self) -> int:
-        if self.shared_cache_reclaimer is None or not self.automatic_memory_budget:
+        if self.shared_cache_reclaimer is None:
             return 0
         async with self._lock:
             if self._closed:
@@ -2217,7 +2222,7 @@ class RuntimePool:
             level, _ratio, _ceiling, _committed = (
                 self._runtime_memory_pressure_locked()
             )
-            if level == "normal":
+            if level in {"normal", "disabled"}:
                 return 0
             now = time.monotonic()
             if now - self._shared_cache_pressure_checked_at < max(
@@ -2407,10 +2412,8 @@ class RuntimePool:
         )
 
     def _effective_runtime_memory_budget_locked(self) -> int | None:
-        """Cap automatic admission by memory the host can reclaim right now."""
-
         ceiling = self.max_runtime_memory_bytes
-        if ceiling is None or not self.automatic_memory_budget:
+        if ceiling is None or self.backend != "metal":
             return ceiling
         snapshot = host_memory_snapshot()
         if snapshot is None:
@@ -2431,16 +2434,40 @@ class RuntimePool:
     ) -> tuple[str, float | None, int | None, int]:
         committed = self._committed_pool_bytes_locked()
         effective = self._effective_runtime_memory_budget_locked()
-        if not self.automatic_memory_budget or effective is None:
+        if effective is None or (self.backend != "metal" and not self.automatic_memory_budget):
             return "disabled", None, effective, committed
         ratio = committed / max(1, effective)
-        if ratio >= _AUTOMATIC_MEMORY_HARD_RATIO:
+        if (
+            ratio >= _AUTOMATIC_MEMORY_HARD_RATIO
+            or time.monotonic() < self._host_vm_pressure_until
+        ):
             level = "hard"
         elif ratio >= _AUTOMATIC_MEMORY_SOFT_RATIO:
             level = "soft"
         else:
             level = "normal"
         return level, ratio, effective, committed
+
+    def _observe_host_memory_pressure_locked(self) -> None:
+        if self.backend != "metal":
+            return
+        snapshot = host_memory_snapshot()
+        if snapshot is None or snapshot.compression_bytes is None or snapshot.swapout_bytes is None:
+            self._host_vm_counters = None
+            self._host_vm_pressure_until = 0.0
+            return
+        current = (snapshot.compression_bytes, snapshot.swapout_bytes)
+        previous, self._host_vm_counters = self._host_vm_counters, current
+        reserve = 4 << 30 if snapshot.total < 24 << 30 else 6 << 30
+        headroom = max(1 << 30, snapshot.total // 32)
+        if snapshot.reclaimable(active_ratio=0.0) > reserve + headroom:
+            self._host_vm_pressure_until = 0.0
+            return
+        if previous is None or any(now < before for now, before in zip(current, previous)):
+            self._host_vm_pressure_until = 0.0
+            return
+        if current[0] - previous[0] >= 128 << 20 or current[1] - previous[1] >= 64 << 20:
+            self._host_vm_pressure_until = time.monotonic() + max(5.0, self.metric_interval_seconds * 2)
 
     def _estimated_load_bytes(
         self,
@@ -2604,6 +2631,8 @@ class RuntimePool:
                     *(self._refresh_instance_usage(item) for item in refresh)
                 )
 
+            async with self._lock:
+                self._observe_host_memory_pressure_locked()
             await self._reclaim_shared_cache_under_pressure()
             async with self._lock:
                 pressure_level, _ratio, pressure_ceiling, _committed = (
@@ -2652,7 +2681,7 @@ class RuntimePool:
                     ttl_victims.append(instance)
                     victims.append((instance, "idle_ttl"))
                 victims.extend(
-                    (instance, "memory_budget")
+                    (instance, "host_memory_pressure" if time.monotonic() < self._host_vm_pressure_until else "memory_budget")
                     for instance in self._claim_over_budget_instances_for_unload_locked(
                         memory_ceiling=pressure_target,
                         pending_releases=ttl_victims,
@@ -2669,6 +2698,8 @@ class RuntimePool:
                             f"runtime unloaded after {instance.idle_ttl_seconds}s "
                             "of inactivity"
                             if reason == "idle_ttl"
+                            else "idle LRU runtime unloaded after host compression or paging pressure"
+                            if reason == "host_memory_pressure"
                             else "runtime unloaded to enforce the aggregate memory budget"
                         )
                         await asyncio.to_thread(
@@ -2939,13 +2970,15 @@ class RuntimePool:
         values = previous.model_dump() if previous is not None else {}
         for target, source in (
             ("resident_weight_bytes", "resident_weight_bytes"),
+            ("wired_bytes", "metal_wired_bytes"),
+            ("wired_limit_bytes", "metal_wired_limit_bytes"),
             ("ssd_expert_bytes", "ssd_expert_payload_bytes"),
             ("ssd_ple_bytes", "ssd_ple_payload_bytes"),
         ):
             value = status.get(source)
             if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
                 values[target] = int(value)
-        for target, source in (("ssd_experts", "ssd_expert_enabled"), ("ssd_ple", "ssd_ple_enabled")):
+        for target, source in (("ssd_experts", "ssd_expert_enabled"), ("ssd_ple", "ssd_ple_enabled"), ("wired_available", "metal_wired_available")):
             value = status.get(source)
             if isinstance(value, (bool, int, float)) and value in (0, 1):
                 values[target] = bool(value)

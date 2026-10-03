@@ -26,6 +26,21 @@ it('shows prefix usage against the combined quota without adding it to KV twice'
   expect(container.querySelector('[data-tier="kv"]')).toHaveTextContent('4 KiB / 28 KiB');
 });
 
+it('reports Metal wiring separately from weight size and warns on unavailable wiring', () => {
+  const instance = model('1', 1024);
+  Object.assign(instance.memory!, { wired_available: true, wired_bytes: 2048, wired_limit_bytes: 4096 });
+  const { container, rerender } = render(<MemoryHierarchy instances={[instance]} memoryCapacityBytes={8192} />);
+  expect(screen.getByTitle('Model 1 · Metal wired 2 KiB / 4 KiB')).toBeInTheDocument();
+  expect(container.querySelector('[data-tier="weights"]')).toHaveTextContent('1 KiB / 8 KiB');
+  instance.memory!.wired_available = false;
+  rerender(<MemoryHierarchy instances={[instance]} memoryCapacityBytes={8192} />);
+  expect(screen.getByText(/weights may be paged out/)).toBeInTheDocument();
+  instance.memory!.wired_available = null;
+  rerender(<MemoryHierarchy instances={[instance]} memoryCapacityBytes={8192} />);
+  expect(screen.queryByText(/weights may be paged out/)).not.toBeInTheDocument();
+  expect(screen.getByTitle('Model 1')).toBeInTheDocument();
+});
+
 it('shows a dotted model legend even with one loaded model and four resource tiers', () => {
   const { container } = render(<MemoryHierarchy instances={[model('1', 1024)]} memoryCapacityBytes={4096} />);
   expect(screen.getByText('Runtime resources')).toBeInTheDocument();
