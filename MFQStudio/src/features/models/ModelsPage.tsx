@@ -34,7 +34,7 @@ export function ModelsPage() {
         <div>
           <span>{tr('运行中的模型', 'Loaded models')}</span>
           <strong>{availableModelNames.length}</strong>
-          <small>{tr('可直接用于对话', 'Ready for chat')}</small>
+          <small>{tr('可直接用于服务', 'Ready for serving')}</small>
         </div>
         <div>
           <span>{tr('本地检查点', 'Local checkpoints')}</span>
