@@ -37,7 +37,7 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                       {formatNumber(item.total_bytes / 2 ** 30, 1)} GB{policy ? ` · ${policy}` : ''}
                     </small>
                   </div>
-                  <div className="model-row-actions">{instance ? (
+                  <div className="model-row-actions"><ModelVendorMark name={item.name} architecture={item.architecture} />{instance ? (
                     <button disabled={busy || instance.state !== 'ready'}
                       onClick={() => void unloadInstance(instance.id)} type="button">
                       {tr('卸载', 'Unload')}
@@ -53,7 +53,7 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                     <button disabled={busy} onClick={() => void loadArtifact(item.name)} type="button">
                       {tr('加载', 'Load')}
                     </button>
-                  )}<ModelVendorMark name={item.name} architecture={item.architecture} /></div>
+                  )}</div>
                 </div>
               );
             })}

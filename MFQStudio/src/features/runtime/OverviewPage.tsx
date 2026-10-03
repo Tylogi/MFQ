@@ -139,11 +139,11 @@ export function OverviewPage() {
                       <small>{details || stateLabel}</small>
                     </span>
                     <span className="model-identity-trailing">
+                      <ModelVendorMark name={name} architecture={name === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined} />
                       <span className="runtime-status-pill ready">
                         <i />
                         {selected ? tr('当前', 'Current') : stateLabel}
                       </span>
-                      <ModelVendorMark name={name} architecture={name === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined} />
                     </span>
                   </button>
                 );

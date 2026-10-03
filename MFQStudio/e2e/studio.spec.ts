@@ -41,6 +41,9 @@ test('三家架构标识贯穿模型页面，保持描线、无边框和靠右�
   page.on('pageerror', (error) => errors.push(error.message));
   await page.goto('/');
   await expect(page.locator('.runtime-hero-actions [data-model-vendor="qwen"]')).toBeVisible();
+  const heroMark = await page.locator('.runtime-hero-actions .model-vendor-mark').boundingBox();
+  const heroButton = await page.locator('.runtime-hero-actions button').first().boundingBox();
+  expect(heroMark!.x + heroMark!.width).toBeLessThan(heroButton!.x);
   for (const item of models) await expect(page.locator(`.overview-model-grid [data-model-vendor="${item.vendor}"]`)).toBeVisible();
   await navigateClient(page, '/models');
   for (const item of models) {
@@ -51,6 +54,12 @@ test('三家架构标识贯穿模型页面，保持描线、无边框和靠右�
   const nameBox = await row.locator('strong').boundingBox();
   const markBox = await row.locator('.model-vendor-mark').boundingBox();
   expect(markBox!.x).toBeGreaterThan(nameBox!.x + nameBox!.width);
+  const rowButton = await row.locator('button').first().boundingBox();
+  expect(markBox!.x + markBox!.width).toBeLessThan(rowButton!.x);
+  await navigateClient(page, '/runtime');
+  await expect(page.locator('.server-model-control')).toBeVisible();
+  await expect(page.locator('.server-model-control .model-vendor-mark')).toHaveCount(0);
+  await navigateClient(page, '/models');
   await page.screenshot({ path: testInfo.outputPath('model-vendors-local.png'), animations: 'disabled' });
   await navigateClient(page, '/model-hub');
   for (const item of models) await expect(page.locator(`.official-model-card [data-model-vendor="${item.vendor}"]`)).toBeVisible();

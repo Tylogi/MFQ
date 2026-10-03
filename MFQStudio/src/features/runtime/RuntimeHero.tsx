@@ -106,6 +106,8 @@ export function RuntimeHero() {
         </small>
       </div>
       <div className="runtime-hero-actions">
+        <ModelVendorMark name={modelHero.name} size={34}
+          architecture={modelHero.name === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined} />
         <button className={modelHero.state === 'ready' ? undefined : 'primary'} onClick={() => openStudioPage()} type="button">
           <Icon name="folder" size={15} />
           {tr('模型', 'Models')}
@@ -114,8 +116,6 @@ export function RuntimeHero() {
           <Icon name="chat" size={15} />
           {tr('对话', 'Chat')}
         </button>
-        <ModelVendorMark name={modelHero.name} size={34}
-          architecture={modelHero.name === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined} />
       </div>
     </TMPanel>
   );

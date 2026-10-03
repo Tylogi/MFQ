@@ -19,7 +19,6 @@ import { ToolsRoutingPanel } from './ToolsRoutingPanel';
 import { MemorySettingsPanel } from './MemorySettingsPanel';
 import { toast } from '../../stores/toastStore';
 import { InferenceDefaultsPanel } from './InferenceDefaultsPanel';
-import { ModelVendorMark } from '../../app/ModelVendorMark';
 
 export function ConnectionsPage() {
   const { settings, replaceSettings, tr, contextSize, setContextSize } = useSettings();
@@ -147,8 +146,6 @@ export function ConnectionsPage() {
                   <button onClick={() => navigate(STUDIO_PATHS.models)} type="button">
                     {tr('选择…', 'Choose…')}
                   </button>
-                  <ModelVendorMark name={selectedModel}
-                    architecture={selectedModel === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined} />
                 </div>
               }
             />
