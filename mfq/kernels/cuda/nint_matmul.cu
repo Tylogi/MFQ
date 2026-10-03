@@ -1248,6 +1248,84 @@ __global__ void __launch_bounds__(128) nint_matmul_aligned_q8_kernel(
 
 
 // One metadata-driven packed input-gradient kernel covers every NINT q/k
+// The ordinary decode path can prove a uniform, byte-aligned low-bit layout
+// from CPU metadata. Keep the same accumulation and warp reduction order as
+// the generic M=1 kernel while removing per-row q-width and tail handling.
+template<int Bits>
+__global__ void __launch_bounds__(128) nint_matmul_uniform_q46_m1_kernel(
+        const uint8_t * __restrict__ bitstream,
+        const int64_t * __restrict__ row_q_bit_offsets,
+        const uint8_t * __restrict__ subgroup_scale,
+        const uint8_t * __restrict__ subgroup_minimum,
+        const float * __restrict__ neuron_scale,
+        const float * __restrict__ neuron_minimum,
+        const int8_t * __restrict__ activation,
+        const float * __restrict__ activation_scale,
+        __half * __restrict__ output,
+        int output_rows, int groups, int padded_width, int group_size) {
+    static_assert(Bits == 4 || Bits == 6);
+    const int output_row = static_cast<int>(blockIdx.x) * 4 +
+        static_cast<int>(threadIdx.y);
+    if (output_row >= output_rows) return;
+    const int chunks = group_size / 4;
+    const int groups_per_warp = 32 / chunks;
+    const int lane = static_cast<int>(threadIdx.x);
+    const int relative_group = lane / chunks;
+    const int element = (lane - relative_group * chunks) * 4;
+    const uint8_t * weight_row = bitstream +
+        (static_cast<uint64_t>(row_q_bit_offsets[output_row]) >> 3);
+    const uint8_t * scale_row = subgroup_scale +
+        static_cast<size_t>(output_row) * groups;
+    const uint8_t * minimum_row = subgroup_minimum +
+        static_cast<size_t>(output_row) * groups;
+    const float outer_scale = neuron_scale[output_row];
+    const float outer_minimum = neuron_minimum[output_row];
+    float accumulator = 0.0f;
+    for (int group_base = 0; group_base < groups;
+         group_base += groups_per_warp) {
+        const int group = group_base + relative_group;
+        if (relative_group >= groups_per_warp || group >= groups) continue;
+        const float inner_scale = static_cast<float>(scale_row[group]);
+        const float inner_minimum = static_cast<float>(minimum_row[group]);
+        const int column = group * group_size + element;
+        const size_t byte = static_cast<size_t>(column * Bits / 8);
+        uint32_t packed = static_cast<uint32_t>(weight_row[byte]) |
+            (static_cast<uint32_t>(weight_row[byte + 1]) << 8);
+        if constexpr (Bits == 6) {
+            packed |= static_cast<uint32_t>(weight_row[byte + 2]) << 16;
+        }
+        int weight_codes;
+        if constexpr (Bits == 4) {
+            weight_codes = static_cast<int>((packed & 0x0fu) |
+                ((packed & 0x00f0u) << 4) |
+                ((packed & 0x0f00u) << 8) |
+                ((packed & 0xf000u) << 12));
+        } else {
+            weight_codes = static_cast<int>((packed & 0x3fu) |
+                ((packed & 0x0fc0u) << 2) |
+                ((packed & 0x3f000u) << 4) |
+                ((packed & 0xfc0000u) << 6));
+        }
+        const int activation_codes = load_i8x4(activation + column);
+        const int activation_sum = __dp4a(0x01010101, activation_codes, 0);
+        const int dot = __dp4a(weight_codes, activation_codes, 0);
+        const float input_scale = activation_scale[group];
+        accumulator += input_scale * (
+            outer_scale * inner_scale * static_cast<float>(dot) -
+            outer_minimum * inner_minimum *
+                static_cast<float>(activation_sum));
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        accumulator += __shfl_xor_sync(0xffffffffu, accumulator, offset);
+    }
+    if (lane == 0) {
+        output[output_row] = __float2half_rn(accumulator);
+    }
+}
+
+
+// One metadata-driven packed input-gradient kernel covers every NINT q/k
 // allocation.  Each warp owns four adjacent input columns and reduces over
 // output neurons; q is read from row metadata and k is already represented by
 // the baked subgroup metadata.
@@ -1880,7 +1958,8 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
         int64_t group_size,
         mfq_tensor_backend::Tensor quantized_input,
         mfq_tensor_backend::Tensor input_scale,
-        bool aligned_q8 = false) {
+        bool aligned_q8 = false,
+        int uniform_q46 = 0) {
     MFQ_RUNTIME_CHECK(
         input.is_cuda() && input.is_contiguous() &&
         input.scalar_type() == mfq_tensor_backend::kFloat16 &&
@@ -2016,6 +2095,23 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
                 activation_rows, output_rows, groups, padded_width,
                 static_cast<int>(group_size));
         }
+    } else if (activation_rows == 1 && group_size % 4 == 0 &&
+               (uniform_q46 == 4 || uniform_q46 == 6)) {
+#define NINT_Q46_LAUNCH(BITS) nint_matmul_uniform_q46_m1_kernel<BITS><<<          \
+        dim3((output_rows + 3) / 4), dim3(32, 4), 0, stream>>>(                 \
+            bitstream.data_ptr<uint8_t>(),                                    \
+            row_q_bit_offsets.data_ptr<int64_t>(),                            \
+            subgroup_scale.data_ptr<uint8_t>(),                               \
+            subgroup_minimum.data_ptr<uint8_t>(),                             \
+            neuron_scale.data_ptr<float>(),                                   \
+            neuron_minimum.data_ptr<float>(),                                 \
+            quantized_input.data_ptr<int8_t>(),                               \
+            input_scale.data_ptr<float>(),                                    \
+            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),         \
+            output_rows, groups, padded_width, static_cast<int>(group_size))
+        if (uniform_q46 == 4) { NINT_Q46_LAUNCH(4); }
+        else { NINT_Q46_LAUNCH(6); }
+#undef NINT_Q46_LAUNCH
     } else {
     nint_matmul_kernel<<<
         dim3((output_rows + 3) / 4), dim3(32, 4), 0, stream>>>(
@@ -2090,6 +2186,27 @@ mfq_tensor_backend::Tensor nint_matmul_q8_ws_cuda(
 }
 
 
+mfq_tensor_backend::Tensor nint_matmul_q46_ws_cuda(
+        mfq_tensor_backend::Tensor bitstream,
+        mfq_tensor_backend::Tensor row_q_bits,
+        mfq_tensor_backend::Tensor row_q_bit_offsets,
+        mfq_tensor_backend::Tensor subgroup_scale,
+        mfq_tensor_backend::Tensor subgroup_minimum,
+        mfq_tensor_backend::Tensor neuron_scale,
+        mfq_tensor_backend::Tensor neuron_minimum,
+        mfq_tensor_backend::Tensor input,
+        int64_t group_size,
+        mfq_tensor_backend::Tensor quantized_input,
+        mfq_tensor_backend::Tensor input_scale,
+        int uniform_bits) {
+    return nint_matmul_ws_impl(
+        bitstream, row_q_bits, row_q_bit_offsets,
+        subgroup_scale, subgroup_minimum, neuron_scale, neuron_minimum,
+        input, nullptr, 0, group_size, quantized_input, input_scale,
+        false, uniform_bits);
+}
+
+
 mfq_tensor_backend::Tensor nint_matmul_input_mul_ws_cuda(
         mfq_tensor_backend::Tensor bitstream,
         mfq_tensor_backend::Tensor row_q_bits,
@@ -2131,6 +2248,29 @@ mfq_tensor_backend::Tensor nint_matmul_input_mul_q8_ws_cuda(
         subgroup_scale, subgroup_minimum, neuron_scale, neuron_minimum,
         input, &gate, activation_mode, group_size,
         quantized_input, input_scale, true);
+}
+
+
+mfq_tensor_backend::Tensor nint_matmul_input_mul_q46_ws_cuda(
+        mfq_tensor_backend::Tensor bitstream,
+        mfq_tensor_backend::Tensor row_q_bits,
+        mfq_tensor_backend::Tensor row_q_bit_offsets,
+        mfq_tensor_backend::Tensor subgroup_scale,
+        mfq_tensor_backend::Tensor subgroup_minimum,
+        mfq_tensor_backend::Tensor neuron_scale,
+        mfq_tensor_backend::Tensor neuron_minimum,
+        mfq_tensor_backend::Tensor input,
+        mfq_tensor_backend::Tensor gate,
+        int64_t activation_mode,
+        int64_t group_size,
+        mfq_tensor_backend::Tensor quantized_input,
+        mfq_tensor_backend::Tensor input_scale,
+        int uniform_bits) {
+    return nint_matmul_ws_impl(
+        bitstream, row_q_bits, row_q_bit_offsets,
+        subgroup_scale, subgroup_minimum, neuron_scale, neuron_minimum,
+        input, &gate, activation_mode, group_size,
+        quantized_input, input_scale, false, uniform_bits);
 }
 
 

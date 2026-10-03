@@ -118,7 +118,8 @@ def test_mfe_nint_large_m_uses_one_heterogeneous_tiled_decoder():
     assert "MFQ_LAUNCH_NINT_TILED_PREFILL(128" in NINT
     assert "rows_per_expert <= 16" in RUNTIME
     assert "rows_per_expert <= 32" in RUNTIME
-    assert "uniform_q" not in NINT
+    # Single-row decode may specialize uniform q4/q6; tiled MFE prefill remains
+    # metadata-driven and must keep reading the per-row bit widths above.
     assert "uniform_k" not in NINT
 
 
