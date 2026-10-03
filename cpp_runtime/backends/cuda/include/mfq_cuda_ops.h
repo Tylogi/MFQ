@@ -304,6 +304,15 @@ mfq_tensor_backend::Tensor nint_matmul_ws_cuda(
     mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
     mfq_tensor_backend::Tensor x, int64_t gs,
     mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
+// Caller proves uniform q4/q6 rows, byte-aligned offsets and four-element groups.
+mfq_tensor_backend::Tensor nint_matmul_q46_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor row_q_bits,
+    mfq_tensor_backend::Tensor row_q_bit_offsets,
+    mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
+    mfq_tensor_backend::Tensor x, int64_t gs,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale,
+    int uniform_bits);
 // Caller proves every row is q8 with a 32-bit-aligned row bit offset.
 // Misaligned storage or a non-four-element group uses the generic kernel.
 mfq_tensor_backend::Tensor nint_matmul_q8_ws_cuda(
@@ -321,6 +330,15 @@ mfq_tensor_backend::Tensor nint_matmul_input_mul_ws_cuda(
     mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate,
     int64_t activation_mode, int64_t gs,
     mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale);
+mfq_tensor_backend::Tensor nint_matmul_input_mul_q46_ws_cuda(
+    mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor row_q_bits,
+    mfq_tensor_backend::Tensor row_q_bit_offsets,
+    mfq_tensor_backend::Tensor sub_scale, mfq_tensor_backend::Tensor sub_min,
+    mfq_tensor_backend::Tensor neuron_scale, mfq_tensor_backend::Tensor neuron_min,
+    mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor gate,
+    int64_t activation_mode, int64_t gs,
+    mfq_tensor_backend::Tensor qx, mfq_tensor_backend::Tensor xscale,
+    int uniform_bits);
 // Same all-row q8 proof and storage fallback as nint_matmul_q8_ws_cuda.
 mfq_tensor_backend::Tensor nint_matmul_input_mul_q8_ws_cuda(
     mfq_tensor_backend::Tensor q_packed, mfq_tensor_backend::Tensor row_q_bits,

@@ -244,14 +244,35 @@ __device__ __forceinline__ void mmq_body(
             ? local_expert * out_per_expert + logical_output
             : logical_output;
         float accumulator[TILE_M] = {};
+        float block_scale = 0.0f;
         for (int column = lane; column < layout.width; column += 32) {
-            const float weight = decode_weight<MXFP8>(
-                blob,
-                row_q,
-                row_symbol_byte_offsets,
-                layout,
-                weight_row,
-                column);
+            float weight;
+            if constexpr (MXFP8) {
+                if (layout.block_rows == 1 && layout.block_columns == 32) {
+                    const auto scale_index =
+                        static_cast<std::size_t>(weight_row) * layout.scale_columns +
+                        static_cast<unsigned>(column) / 32u;
+                    const float scale = decode_e8m0(
+                        blob[layout.scales + scale_index]);
+                    weight = decode_e4m3fn(decode_code(
+                        blob, row_q, row_symbol_byte_offsets,
+                        layout, weight_row, column)) * scale;
+                } else {
+                    weight = decode_weight<true>(
+                        blob, row_q, row_symbol_byte_offsets,
+                        layout, weight_row, column);
+                }
+            } else {
+                // FP8-128SQ shares one scale across four warp-width columns.
+                // Refresh it only at the first column of each 128-column block.
+                if ((column & 127) == lane) {
+                    block_scale = decode_scale<false>(
+                        blob, layout, weight_row, column);
+                }
+                weight = decode_e4m3fn(decode_code(
+                    blob, row_q, row_symbol_byte_offsets,
+                    layout, weight_row, column)) * block_scale;
+            }
 #pragma unroll
             for (int item = 0; item < TILE_M; ++item) {
                 if (first_row + item >= rows) continue;

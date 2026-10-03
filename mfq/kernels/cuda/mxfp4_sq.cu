@@ -227,7 +227,7 @@ __global__ void sq_dequant(
 
 // One warp per output, coalesced K loads, decode reuse across TILE_M rows.
 // All batch sizes use packed weights; M=1..6 have exact tile specializations.
-template<int TILE_M, typename T, bool ROUTED = false>
+template<int TILE_M, typename T, bool ROUTED = false, bool ALL_Q4 = false>
 __global__ void sq_mmq(
                        const std::uint8_t* blob,
                        const std::uint8_t* row_q,
@@ -263,7 +263,7 @@ __global__ void sq_mmq(
         const auto output = ROUTED
             ? std::int64_t(local_expert) * out_per_expert + logical_output
             : logical_output;
-        const int bits = row_q[output];
+        const int bits = ALL_Q4 ? 4 : row_q[output];
         const auto auxiliary = std::size_t(row_auxiliary[output]);
         const auto* row_symbols =
             symbols + std::size_t(row_symbol_byte_offsets[output]);
@@ -272,7 +272,10 @@ __global__ void sq_mmq(
             const auto block = std::size_t(column / 32);
             unsigned state_value = 0;
             if (lane == 0) {
-                if (bits == 4) {
+                if constexpr (ALL_Q4) {
+                    state_value = blob[
+                        q.native_scales + auxiliary * (q.width / 32) + block];
+                } else if (bits == 4) {
                     state_value = blob[
                         q.native_scales + auxiliary * (q.width / 32) + block];
                 } else {
@@ -288,13 +291,18 @@ __global__ void sq_mmq(
             state_value = __shfl_sync(0xffffffffu, state_value, 0);
             const auto symbol = read_bits(
                 row_symbols, std::size_t(column + lane), bits);
-            const float w = bits == 4
-                ? decode_native(symbol, state_value)
-                : decode_value(
-                    state_value >> 8,
-                    symbol,
-                    state_value & 255,
-                    bits);
+            float w;
+            if constexpr (ALL_Q4) {
+                w = decode_native(symbol, state_value);
+            } else {
+                w = bits == 4
+                    ? decode_native(symbol, state_value)
+                    : decode_value(
+                        state_value >> 8,
+                        symbol,
+                        state_value & 255,
+                        bits);
+            }
 #pragma unroll
             for (int m = 0; m < TILE_M; ++m)
                 if (first_row + m < rows)
@@ -425,7 +433,7 @@ mfq::sq::Layout validate(
     return q;
 }
 
-template<int M, typename T>
+template<int M, typename T, bool ALL_Q4 = false>
 void launch_mmq(
                 const std::uint8_t* blob,
                 const std::uint8_t* row_q,
@@ -435,7 +443,7 @@ void launch_mmq(
                 mfq::sq::Layout q, int rows, cudaStream_t stream) {
     const auto tasks = ((std::int64_t(q.outputs) + 3) / 4) * ((std::int64_t(rows) + M - 1) / M);
     const int blocks = int(std::min<std::int64_t>(tasks, 65535));
-    sq_mmq<M, T><<<blocks, 128, 0, stream>>>(
+    sq_mmq<M, T, false, ALL_Q4><<<blocks, 128, 0, stream>>>(
         blob, row_q, row_symbol_byte_offsets, row_auxiliary,
         x, y, q, rows,
         nullptr, nullptr, 0, 0, q.outputs, 1, false);
@@ -487,6 +495,12 @@ void dispatch_mmq(
                   const std::int32_t* row_auxiliary,
                   const T* x, T* y,
                   mfq::sq::Layout q, int rows, cudaStream_t stream) {
+    if (rows == 1 && q.sq4_rows == q.outputs) {
+        launch_mmq<1, T, true>(
+            blob, row_q, row_symbol_byte_offsets, row_auxiliary,
+            x, y, q, rows, stream);
+        return;
+    }
 #define MFQ_SQ_M_CASE(M) case M: launch_mmq<M>(blob, row_q, row_symbol_byte_offsets, row_auxiliary, x, y, q, rows, stream); break
     switch (rows) {
         MFQ_SQ_M_CASE(1); MFQ_SQ_M_CASE(2); MFQ_SQ_M_CASE(3);
