@@ -11,7 +11,7 @@ from xml.parsers.expat import ExpatError
 
 import psutil
 
-from mfq.server.services.hardware import _command, hardware_identity
+from mfq.server.services.hardware import _command, _positive_int, hardware_identity
 
 
 def _number(value: Any) -> float | None:
@@ -30,6 +30,7 @@ def _gpu_usage() -> list[dict[str, Any]]:
         try:
             devices = plistlib.loads(_command(["ioreg", "-r", "-c", "AGXAccelerator", "-d", "1", "-a"]).encode())
             return [{"name": item.get("model", "GPU"),
+                     "core_count": _positive_int(item.get("gpu-core-count")),
                      "utilization_percent": _percent(item.get("PerformanceStatistics", {}).get("Device Utilization %"))}
                     for item in devices if isinstance(item, dict)]
         except (ValueError, plistlib.InvalidFileException, ExpatError):
@@ -107,6 +108,7 @@ class ResourceMonitor:
         self._sample_time = now
         hardware = hardware_identity()
         return {"sampled_at": time.time(), "interval_seconds": elapsed,
+                "cpu_name": hardware.cpu_name, "cpu_cores": hardware.cpu_cores,
                 "cpu_utilization_percent": cpu, "gpus": _gpu_usage(), "disks": disks,
                 "memory_bandwidth_bytes_per_second": None,
                 "memory_bandwidth_limit_bytes_per_second": hardware.memory_bandwidth_bytes_per_second,

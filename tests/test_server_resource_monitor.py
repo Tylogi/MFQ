@@ -26,9 +26,12 @@ def test_host_intervals_are_measured_and_missing_bandwidth_stays_unknown(monkeyp
     monkeypatch.setattr(module.psutil, "cpu_times", lambda: next(times))
     monkeypatch.setattr(module.psutil, "disk_io_counters", lambda **kwargs: next(disks))
     monkeypatch.setattr(module, "_gpu_usage", lambda: [{"name": "GPU", "utilization_percent": 0}])
-    monkeypatch.setattr(module, "hardware_identity", lambda: SimpleNamespace(memory_bandwidth_bytes_per_second=614_000_000_000))
+    monkeypatch.setattr(module, "hardware_identity", lambda: SimpleNamespace(
+        cpu_name="Apple M5 Max", cpu_cores=18, memory_bandwidth_bytes_per_second=614_000_000_000))
     monitor = ResourceMonitor()
     first = monitor._host_sample()
+    assert first["cpu_name"] == "Apple M5 Max"
+    assert first["cpu_cores"] == 18
     assert first["cpu_utilization_percent"] is None
     assert first["disks"][0]["read_bytes_per_second"] is None
     second = monitor._host_sample()
@@ -63,9 +66,11 @@ def test_weight_rates_are_per_instance_and_never_reuse_missing_or_reset_counters
 def test_gpu_statistics_missing_is_not_idle(monkeypatch):
     import plistlib
     monkeypatch.setattr(module.platform, "system", lambda: "Darwin")
-    devices = [{"model": "GPU 1", "PerformanceStatistics": {"Device Utilization %": 36}}, {"model": "GPU 2"}]
+    devices = [{"model": "GPU 1", "gpu-core-count": 40,
+                "PerformanceStatistics": {"Device Utilization %": 36}}, {"model": "GPU 2", "gpu-core-count": 0}]
     monkeypatch.setattr(module, "_command", lambda args: plistlib.dumps(devices).decode())
-    assert module._gpu_usage() == [{"name": "GPU 1", "utilization_percent": 36}, {"name": "GPU 2", "utilization_percent": None}]
+    assert module._gpu_usage() == [{"name": "GPU 1", "core_count": 40, "utilization_percent": 36},
+                                   {"name": "GPU 2", "core_count": None, "utilization_percent": None}]
 
 
 def test_resource_endpoint_works_without_loaded_models_and_coalesces_samples(tmp_path, monkeypatch):

@@ -144,8 +144,10 @@ export interface RuntimeListener {
 export interface RuntimeResources {
   sampled_at: number;
   interval_seconds: number | null;
+  cpu_name?: string | null;
+  cpu_cores?: number | null;
   cpu_utilization_percent: number | null;
-  gpus: { name: string; utilization_percent: number | null }[];
+  gpus: { name: string; core_count?: number | null; utilization_percent: number | null }[];
   memory_bandwidth_bytes_per_second: number | null;
   memory_bandwidth_limit_bytes_per_second: number | null;
   memory_bandwidth_utilization_percent: number | null;

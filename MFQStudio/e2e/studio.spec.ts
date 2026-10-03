@@ -8,7 +8,8 @@ test('resource telemetry and service profiles have separate responsive homes', a
   await page.route('**/api/v1/runtime/resources', (route) => {
     samples++;
     return route.fulfill({ json: { sampled_at: 100 + samples * 2, interval_seconds: 2,
-      cpu_utilization_percent: samples > 1 ? 43 : 36, gpus: [{ name: 'Apple M5 Max', utilization_percent: 24 }],
+      cpu_name: 'Apple M5 Max', cpu_cores: 18, cpu_utilization_percent: samples > 1 ? 43 : 36,
+      gpus: [{ name: 'Apple M5 Max', core_count: 40, utilization_percent: 24 }],
       memory_bandwidth_bytes_per_second: null, memory_bandwidth_limit_bytes_per_second: 614e9,
       memory_bandwidth_utilization_percent: null, disks: [{ name: 'disk0', read_bytes_per_second: 2 ** 30,
         write_bytes_per_second: 2 ** 20, busy_percent: null, bandwidth_utilization_percent: null }],
@@ -17,8 +18,9 @@ test('resource telemetry and service profiles have separate responsive homes', a
   });
   await page.goto('/resources');
   await expect(page.getByText('Resource monitoring', { exact: true })).toBeVisible();
-  await expect(page.getByRole('meter', { name: 'CPU' })).toHaveAttribute('aria-valuenow', '36');
-  await expect(page.getByRole('meter', { name: 'CPU' })).toHaveAttribute('aria-valuenow', '43');
+  await expect(page.getByRole('meter', { name: 'CPU: Apple M5 Max 18C' })).toHaveAttribute('aria-valuenow', '36');
+  await expect(page.getByRole('meter', { name: 'GPU: Apple M5 Max 40C' })).toBeVisible();
+  await expect(page.getByRole('meter', { name: 'CPU: Apple M5 Max 18C' })).toHaveAttribute('aria-valuenow', '43');
   await expect(page.getByText('Runtime profiles', { exact: true })).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.locator('.resource-monitor-panel').screenshot({ path: testInfo.outputPath('resource-monitor.png') });
@@ -27,7 +29,7 @@ test('resource telemetry and service profiles have separate responsive homes', a
   await expect(page.getByText('Runtime profiles', { exact: true })).toBeVisible();
   await expect(page.getByText('Resource monitoring', { exact: true })).toHaveCount(0);
   await page.goto('/resources');
-  await expect(page.getByRole('meter', { name: 'CPU' })).toHaveAttribute('aria-valuenow', '43');
+  await expect(page.getByRole('meter', { name: 'CPU: Apple M5 Max 18C' })).toHaveAttribute('aria-valuenow', '43');
 });
 
 declare global {

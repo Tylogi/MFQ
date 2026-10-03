@@ -5268,6 +5268,18 @@
       "RuntimeGpuUtilization": {
         "additionalProperties": false,
         "properties": {
+          "core_count": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Core Count"
+          },
           "name": {
             "title": "Name",
             "type": "string"
@@ -6120,6 +6132,29 @@
       "RuntimeResourceSnapshot": {
         "additionalProperties": false,
         "properties": {
+          "cpu_cores": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cpu Cores"
+          },
+          "cpu_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cpu Name"
+          },
           "cpu_utilization_percent": {
             "anyOf": [
               {

@@ -747,6 +747,7 @@ class ModelUnloadRequest(ProtocolModel):
 
 class RuntimeGpuUtilization(ProtocolModel):
     name: str
+    core_count: int | None = Field(default=None, ge=1)
     utilization_percent: float | None = Field(default=None, ge=0, le=100)
 
 
@@ -769,6 +770,8 @@ class RuntimeWeightTraffic(ProtocolModel):
 class RuntimeResourceSnapshot(ProtocolModel):
     sampled_at: float = Field(ge=0)
     interval_seconds: float | None = Field(default=None, ge=0)
+    cpu_name: str | None = None
+    cpu_cores: int | None = Field(default=None, ge=1)
     cpu_utilization_percent: float | None = Field(default=None, ge=0, le=100)
     gpus: list[RuntimeGpuUtilization]
     disks: list[RuntimeDiskTraffic]

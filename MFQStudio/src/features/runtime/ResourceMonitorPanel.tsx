@@ -39,8 +39,14 @@ export function ResourceMonitorPanel() {
   function utilization(value: number | null | undefined) {
     return value == null ? unavailable : `${formatNumber(value, 1)}%`;
   }
-  const compute = [{ name: 'CPU', utilization_percent: resources?.cpu_utilization_percent },
-    ...(resources?.gpus.length ? resources.gpus : [{ name: 'GPU', utilization_percent: null }])];
+  function deviceLabel(kind: string, name?: string | null, cores?: number | null) {
+    return `${kind}${tr('：', ': ')}${name && name !== kind ? name : unavailable}${cores != null ? ` ${cores}C` : ''}`;
+  }
+  const compute = [{ name: deviceLabel('CPU', resources?.cpu_name, resources?.cpu_cores),
+    utilization_percent: resources?.cpu_utilization_percent },
+    ...(resources?.gpus.length ? resources.gpus.map((gpu) => ({
+      name: deviceLabel('GPU', gpu.name, gpu.core_count), utilization_percent: gpu.utilization_percent,
+    })) : [{ name: deviceLabel('GPU'), utilization_percent: null }])];
   return <>
     <SectionLabel title={tr('资源监控', 'Resource monitoring')}
       subtitle={tr('服务所在设备 · 每 2 秒采样', 'Server device · sampled every 2 seconds')} />
