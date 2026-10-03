@@ -45,11 +45,12 @@ class _FakeStdin:
 
 def _client(
     handler: Callable[[dict[str, Any]], list[dict[str, Any]]],
+    **options: Any,
 ) -> StdioRuntimeClient:
     stdout = asyncio.StreamReader()
     stdout.feed_data(b'{"v":1,"type":"ready"}\n')
     process = SimpleNamespace(pid=123, stdout=stdout, stdin=_FakeStdin(stdout, handler))
-    return StdioRuntimeClient(process)
+    return StdioRuntimeClient(process, **options)
 
 
 def test_stdio_runtime_client_handles_unary_and_streaming_frames() -> None:
@@ -162,5 +163,47 @@ def test_stdio_runtime_client_fails_pending_requests_on_eof() -> None:
         with pytest.raises(BackendError, match="closed stdout"):
             await request
         await client.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("event_limit", [2, 64])
+@pytest.mark.parametrize("abandon", [False, True])
+def test_stdio_full_stream_does_not_block_control_replies(event_limit, abandon) -> None:
+    async def run() -> None:
+        cancelled: list[str] = []
+
+        def handler(request: dict[str, Any]) -> list[dict[str, Any]]:
+            request_id = request.get("id")
+            if request["op"] == "generate":
+                return [
+                    {"v": 1, "id": request_id, "type": "event",
+                     "data": {"event": "delta", "delta": {"content": "x"}}}
+                    for _ in range(event_limit + 8)
+                ]
+            if request["op"] == "health":
+                return [{"v": 1, "id": request_id, "type": "result",
+                         "data": {"status": "ok"}}]
+            if request["op"] == "request.cancel":
+                cancelled.append(request["params"]["target_id"])
+            return []
+
+        client = _client(handler, pending_event_limit=event_limit,
+                         control_timeout_seconds=0.25)
+        try:
+            async with client.generate({"messages": [], "max_tokens": 128}) as events:
+                if abandon:
+                    await asyncio.sleep(0)
+                else:
+                    assert await client.health() == {"status": "ok"}
+                    with pytest.raises(BackendError) as raised:
+                        await anext(events)
+                    assert raised.value.code == "backend_backpressure"
+            assert await client.health() == {"status": "ok"}
+            assert not client._pending
+            assert client._reader_task is not None and not client._reader_task.done()
+            assert cancelled == ["1"]
+        finally:
+            await client.aclose()
 
     asyncio.run(run())

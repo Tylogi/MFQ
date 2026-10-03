@@ -3233,7 +3233,6 @@ std::int32_t MlxQwen4CausalLm::generate(
         impl_->maximum - static_cast<int>(prompt.size()) + 1);
     const bool mtp_active =
         impl_->mtp.has_value() && sampling.enable_mtp &&
-        mfq_token_constraint_supports_speculation(token_constraint) &&
         limit > 1;
     impl_->last_mtp_stats = {
         impl_->mtp.has_value(), mtp_active, 0, 0, 0};
@@ -3491,7 +3490,7 @@ std::int32_t MlxQwen4CausalLm::generate(
         if (token < 0 || token >= vocab) {
             throw std::runtime_error("Qwen4 sampler returned an invalid token");
         }
-        if (token_constraint && token_constraint->allows &&
+        if (token_constraint &&
             !token_constraint->allows(token)) {
             auto adjusted = counts
                 ? sampler.apply_penalties(logits, *counts)
@@ -3513,7 +3512,7 @@ std::int32_t MlxQwen4CausalLm::generate(
                     "Qwen4 constrained sampler returned an invalid token");
             }
         }
-        if (token_constraint && token_constraint->accept) {
+        if (token_constraint) {
             token_constraint->accept(token);
         }
         const array token_ids(

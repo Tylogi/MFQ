@@ -838,6 +838,7 @@ class _FakeWorker:
 
     def prepare(self, request: dict[str, object]) -> _PreparedRequest:
         assert request["model"] == self.model_name
+        self.last_request = request
         return _PreparedRequest(
             request_id="chatcmpl-test",
             session_id=str(request.get("mfq_session_id") or "session"),
@@ -942,7 +943,25 @@ def test_flash_next_worker_protocol_matches_common_backend() -> None:
             assert performance.mtp_used
             assert performance.mtp_accepted_tokens == 1
             assert await backend.cancel_response("session")
+            assert worker.last_request["messages"] == [{"role": "user", "content": "Hello"}]
+            assert worker.last_request["max_tokens"] == 8
+            assert worker.last_request["temperature"] == 0.0
+            assert "input" not in worker.last_request
         finally:
             await client.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("payload", [[], {}, {"input": []}, {"input": {}, "sampling": []}])
+def test_flash_next_worker_rejects_malformed_private_runtime_input(payload) -> None:
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=create_app(_FakeWorker())),
+            base_url="http://worker",
+        ) as client:
+            response = await client.post("/runtime/generate", json=payload)
+            assert response.status_code == 400
+            assert response.json()["error"]["code"] == "invalid_request"
 
     asyncio.run(run())

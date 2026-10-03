@@ -1079,7 +1079,6 @@ std::int32_t MlxDeepseekV41CausalLm::generate_from_prefill(
     }
     const bool mtp_active = dspark_.has_value() &&
         dspark_state_.has_value() && sampling.enable_mtp &&
-        mfq_token_constraint_supports_speculation(token_constraint) &&
         limit > 1;
     last_mtp_stats_ = {
         dspark_.has_value(),
@@ -1198,7 +1197,7 @@ std::int32_t MlxDeepseekV41CausalLm::generate_from_prefill(
             throw std::runtime_error(
                 "DeepSeek-V4.1 sampler returned an invalid token");
         }
-        if (token_constraint && token_constraint->allows &&
+        if (token_constraint &&
             !token_constraint->allows(token)) {
             auto adjusted = counts
                 ? sampler.apply_penalties(logits, *counts)
@@ -1219,7 +1218,7 @@ std::int32_t MlxDeepseekV41CausalLm::generate_from_prefill(
                     "DeepSeek-V4.1 constrained sampler returned an invalid token");
             }
         }
-        if (token_constraint && token_constraint->accept) {
+        if (token_constraint) {
             token_constraint->accept(token);
         }
         const array token_ids(
@@ -1272,7 +1271,6 @@ std::int32_t MlxDeepseekV41CausalLm::generate(
         values.begin(), Shape{1, static_cast<int>(values.size())},
         mlx::core::int32);
     const bool mtp_candidate = supports_mtp() && sampling.enable_mtp &&
-        mfq_token_constraint_supports_speculation(token_constraint) &&
         max_tokens > 1;
     mtp_context_requested_ = mtp_candidate;
     const std::size_t requested_stable_count = stable_prefix_tokens
@@ -1510,7 +1508,6 @@ std::int32_t MlxDeepseekV41CausalLm::generate_multimodal(
     }
     const auto started = std::chrono::steady_clock::now();
     mtp_context_requested_ = supports_mtp() && sampling.enable_mtp &&
-        mfq_token_constraint_supports_speculation(token_constraint) &&
         max_tokens > 1;
     array logits(0.0f);
     try {

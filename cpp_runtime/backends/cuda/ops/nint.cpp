@@ -4,6 +4,9 @@
 #include "cuda_execution.h"
 #include "format.h"
 
+#include <cstring>
+#include <limits>
+
 #if defined(__x86_64__) && defined(__GNUC__)
 #include <immintrin.h>
 #define MFQ_CPU_X86_GNU 1

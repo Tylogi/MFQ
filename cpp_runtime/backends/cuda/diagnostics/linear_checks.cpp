@@ -998,5 +998,3 @@ int run_gemma_geglu_check(
               << " pair_ms=" << pair_ms << "\n";
     return 0;
 }
-
-

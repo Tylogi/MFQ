@@ -1825,6 +1825,8 @@ def create_app(worker: FlashNextTextWorker) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.state.worker = worker
 
+    @app.get("/runtime/health")
+    @app.get("/runtime/status")
     @app.get("/health")
     @app.get("/api/status")
     def health() -> dict[str, Any]:
@@ -1855,6 +1857,7 @@ def create_app(worker: FlashNextTextWorker) -> FastAPI:
         status["duplex_available"] = False
         return status
 
+    @app.get("/runtime/models")
     @app.get("/v1/models")
     def models() -> dict[str, Any]:
         return {
@@ -1869,10 +1872,12 @@ def create_app(worker: FlashNextTextWorker) -> FastAPI:
             ],
         }
 
+    @app.get("/runtime/realtime/capabilities")
     @app.get("/realtime/capabilities")
     def realtime_capabilities() -> dict[str, Any]:
         return {"available": False, "modes": []}
 
+    @app.post("/runtime/sessions/fork")
     @app.post("/api/runtime/sessions/fork")
     async def fork_session(request: Request) -> Any:
         payload = await request.json()
@@ -1891,6 +1896,7 @@ def create_app(worker: FlashNextTextWorker) -> FastAPI:
             return JSONResponse(status_code=400, content={"error": str(error)})
         return {"status": "ok", "copied_snapshots": copied}
 
+    @app.delete("/runtime/sessions/{session_id}")
     @app.delete("/api/runtime/sessions/{session_id}")
     def close_session(session_id: str) -> dict[str, Any]:
         released, cancelled = worker.close_session(session_id)
@@ -1900,16 +1906,19 @@ def create_app(worker: FlashNextTextWorker) -> FastAPI:
             "cancelled": cancelled,
         }
 
+    @app.post("/runtime/sessions/{session_id}/cancel")
     @app.post("/api/runtime/sessions/{session_id}/cancel")
     def cancel_session(session_id: str) -> dict[str, Any]:
         return {"cancelled": worker.cancel(session_id)}
 
+    @app.post("/runtime/cache/clear")
     @app.post("/api/runtime/cache/clear")
     def clear_cache() -> dict[str, Any]:
         if not worker.clear_cache():
             return {"cleared": False, "reason": "runtime_busy"}
         return {"cleared": True}
 
+    @app.post("/runtime/reload")
     @app.post("/api/reload")
     async def reload_runtime(request: Request) -> Any:
         payload = await request.json()
@@ -1928,6 +1937,7 @@ def create_app(worker: FlashNextTextWorker) -> FastAPI:
             },
         )
 
+    @app.post("/runtime/generate")
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Any:
         try:
@@ -1937,6 +1947,32 @@ def create_app(worker: FlashNextTextWorker) -> FastAPI:
                 raise FlashNextWorkerError("request body must be valid JSON") from error
             if not isinstance(payload, dict):
                 raise FlashNextWorkerError("request body must be an object")
+            if request.url.path == "/runtime/generate":
+                input_ = payload.get("input")
+                sampling = payload.get("sampling", {})
+                if not isinstance(input_, dict) or not isinstance(sampling, dict):
+                    raise FlashNextWorkerError("input and sampling must be objects")
+                params = dict(sampling)
+                if "max_new_tokens" in params:
+                    params["max_tokens"] = params.pop("max_new_tokens")
+                params.update(
+                    model=payload.get("model"),
+                    messages=input_.get("messages"),
+                    stream=payload.get("stream", False),
+                )
+                for source, target in (
+                    ("template", "chat_template_kwargs"),
+                    ("session_id", "mfq_session_id"),
+                    ("media", "mfq_multimodal"),
+                    ("tools", "tools"),
+                    ("tool_choice", "tool_choice"),
+                    ("response_format", "response_format"),
+                ):
+                    if source in payload:
+                        params[target] = payload[source]
+                if "preformatted_prompt" in input_:
+                    params["mfq_preformatted_prompt"] = input_["preformatted_prompt"]
+                payload = params
             prepared = worker.prepare(payload)
         except FlashNextWorkerError as error:
             return JSONResponse(

@@ -724,4 +724,3 @@ class OpenAIChatBackend:
                 )
             )
         return tuple(parsed)
-

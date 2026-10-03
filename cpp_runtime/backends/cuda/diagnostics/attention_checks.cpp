@@ -1209,4 +1209,3 @@ int run_dsv4_attention_check(int reps) {
               << " cuda_ms=" << time_ms(run_sparse) << "\n";
     return 0;
 }
-

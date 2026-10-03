@@ -17,6 +17,7 @@
 #include "transport.h"
 #include "mlx_paged_session_codec.h"
 #include "mlx_server_components.h"
+#include "mlx_engine.h"
 #endif
 
 #include <algorithm>
@@ -1656,8 +1657,8 @@ std::int32_t generate_with_prefill_metrics(
     const std::vector<std::int64_t>& prompt,
     const mfq::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
-    const MfqTokenCallback& callback,
-    const MfqPrefillCallback& on_prefill,
+    const std::function<bool(std::int64_t)>& callback,
+    const std::function<void(MfqPrefillTiming)>& on_prefill,
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size) {
@@ -1686,8 +1687,8 @@ std::int32_t generate_with_prefill_metrics(
     const std::vector<std::int64_t>& prompt,
     const mfq::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
-    const MfqTokenCallback& callback,
-    const MfqPrefillCallback& on_prefill,
+    const std::function<bool(std::int64_t)>& callback,
+    const std::function<void(MfqPrefillTiming)>& on_prefill,
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size) {
@@ -1716,8 +1717,8 @@ std::int32_t generate_with_prefill_metrics(
     const std::vector<std::int64_t>& prompt,
     const mfq::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
-    const MfqTokenCallback& callback,
-    const MfqPrefillCallback& on_prefill,
+    const std::function<bool(std::int64_t)>& callback,
+    const std::function<void(MfqPrefillTiming)>& on_prefill,
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size) {
@@ -1747,8 +1748,8 @@ std::int32_t generate_with_prefill_metrics(
     const std::vector<std::int64_t>& prompt,
     const mfq::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
-    const MfqTokenCallback& callback,
-    const MfqPrefillCallback& on_prefill,
+    const std::function<bool(std::int64_t)>& callback,
+    const std::function<void(MfqPrefillTiming)>& on_prefill,
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int prefill_chunk_size) {
@@ -1777,8 +1778,8 @@ std::int32_t generate_with_prefill_metrics(
     const std::vector<std::int64_t>& prompt,
     const mfq::metal::MlxSamplingParams& sampling,
     std::int32_t max_tokens,
-    const MfqTokenCallback& callback,
-    const MfqPrefillCallback& on_prefill,
+    const std::function<bool(std::int64_t)>& callback,
+    const std::function<void(MfqPrefillTiming)>& on_prefill,
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
     int) {
@@ -1799,6 +1800,456 @@ std::int32_t generate_with_prefill_metrics(
             ? std::optional<std::size_t>(cache_plan.stable_prefix_tokens)
             : std::nullopt);
 }
+
+template <typename Runtime, typename Loader>
+class LoadedMetalModel final : public mfq::metal::MlxEngineModel {
+public:
+    using Cache = MlxServerTextSessionCache<Runtime>;
+    using PagedCacheFactory = std::function<std::shared_ptr<mfq::cache::PagedPrefixCache>(std::int64_t)>;
+    LoadedMetalModel(std::shared_ptr<std::mutex> mutex,
+        std::shared_ptr<std::optional<Runtime>> runtime,
+        std::shared_ptr<Cache> cache, Loader loader, PagedCacheFactory factory,
+        std::shared_ptr<std::int64_t> context, mlx::core::Stream stream,
+        int chunk_size, std::size_t cache_limit,
+        mfq::metal::MlxEngineComponents components)
+        : runtime_mutex(std::move(mutex)), runtime_holder(std::move(runtime)),
+          session_cache(std::move(cache)), load_runtime(std::move(loader)),
+          paged_cache_factory(std::move(factory)), loaded_context(std::move(context)),
+          runtime_stream(stream), prefill_chunk_size(chunk_size),
+          allocator_cache_limit(cache_limit), runtime_components(std::move(components)) {}
+
+    void generate(mfq::engine::InferenceRequest& request,
+                  mfq::metal::MlxGenerationJob& job) override {
+        const auto& prompt = request.prompt;
+        const auto& sampling = request.sampling;
+        const auto& cache_plan = request.cache_plan;
+        const auto& token_constraint = request.token_constraint;
+        const std::function<bool(std::int64_t)> callback =
+            [&job](std::int64_t token) { return job.token(token); };
+        const std::function<void(MfqPrefillTiming)> on_prefill =
+            [&job](MfqPrefillTiming timing) { job.prefill(timing); };
+        job.mtp.available = runtime_components.mtp_available;
+        try {
+            if (request.vision) {
+                if (!runtime_components.multimodal_generate)
+                    throw std::invalid_argument("model has no multimodal component");
+                runtime_components.multimodal_generate(prompt, *request.vision,
+                    sampling, job, token_constraint);
+            } else {
+                std::lock_guard<std::mutex> lock(*runtime_mutex);
+                if (!runtime_holder->has_value()) {
+                    throw std::runtime_error(
+                        "model runtime is unavailable after a failed reload");
+                }
+                mlx::core::set_default_device(
+                    mlx::core::Device::gpu);
+                mlx::core::set_default_stream(runtime_stream);
+                mfq::metal::MlxSamplingParams parameters;
+                parameters.temperature = sampling.temperature;
+                parameters.top_k = sampling.top_k;
+                parameters.top_p = sampling.top_p;
+                parameters.presence_penalty =
+                    sampling.presence_penalty;
+                parameters.frequency_penalty =
+                    sampling.frequency_penalty;
+                parameters.repetition_penalty =
+                    sampling.repetition_penalty;
+                parameters.enable_mtp = sampling.enable_mtp;
+                parameters.mtp_max_draft_tokens =
+                    sampling.mtp_max_draft_tokens;
+                parameters.seed = sampling.seed;
+                auto& loaded_runtime = runtime_holder->value();
+                const auto stable_prefix_tokens =
+                    session_cache->normalize_stable_prefix_tokens(std::min(
+                        cache_plan.stable_prefix_tokens, prompt.size()));
+                const bool cache_enabled =
+                    stable_prefix_tokens > 0 &&
+                    (!cache_plan.session_id.empty() ||
+                     session_cache->persistent_prefix_enabled()) &&
+                    loaded_runtime.supports_text_session_state();
+                if (cache_enabled) {
+                    (void)session_cache->restore_best(
+                        loaded_runtime,
+                        cache_plan.session_id,
+                        prompt,
+                        stable_prefix_tokens);
+                }
+                auto effective_cache_plan = cache_plan;
+                effective_cache_plan.stable_prefix_tokens = cache_enabled
+                    ? stable_prefix_tokens
+                    : 0;
+                const auto generated = generate_with_prefill_metrics(
+                    loaded_runtime,
+                    prompt,
+                    parameters,
+                    sampling.max_tokens,
+                    callback,
+                    on_prefill,
+                    effective_cache_plan,
+                    token_constraint,
+                    prefill_chunk_size);
+                if (cache_enabled &&
+                    loaded_runtime.cache_position() ==
+                        static_cast<int>(stable_prefix_tokens)) {
+                    try {
+                        std::vector<std::int64_t> stable_tokens(
+                            prompt.begin(),
+                            prompt.begin() + static_cast<std::ptrdiff_t>(
+                                stable_prefix_tokens));
+                        session_cache->store(
+                            cache_plan.session_id,
+                            loaded_runtime.capture_text_session_state(
+                                stable_tokens));
+                    } catch (const std::exception& error) {
+                        std::cerr
+                            << "server_session_cache backend=metal action=skip "
+                            << "session=" << cache_plan.session_id
+                            << " error=" << error.what() << std::endl;
+                    }
+                }
+                (void)generated;
+            }
+            mfq::metal::drain_metal_work(runtime_stream);
+            if constexpr (requires(Runtime& value) { value.last_mtp_stats(); }) {
+                const auto& stats = runtime_holder->value().last_mtp_stats();
+                job.mtp = {stats.available, stats.used, stats.cycles,
+                    stats.drafted_tokens, stats.accepted_tokens, stats.depth_cycles,
+                    stats.position_drafted, stats.position_accepted,
+                    stats.measured_depth_ms, stats.selected_depth};
+            }
+        } catch (...) {
+            mfq::metal::drain_metal_work(runtime_stream);
+            throw;
+        }
+    }
+
+    std::int64_t reload(std::int64_t requested_context) override {
+        std::lock_guard<std::mutex> lock(*runtime_mutex);
+        mlx::core::set_default_device(
+            mlx::core::Device::gpu);
+        mlx::core::set_default_stream(runtime_stream);
+        mfq::metal::drain_metal_work(runtime_stream);
+
+        const auto previous_context = *loaded_context;
+        session_cache->clear_live_sessions();
+        runtime_holder->reset();
+        release_model_load_staging_memory(runtime_stream);
+        const auto started =
+            std::chrono::steady_clock::now();
+        std::cout
+            << "Reloading native Metal model with context="
+            << requested_context << "..." << std::endl;
+        try {
+            runtime_holder->emplace(
+                load_runtime(requested_context));
+            if constexpr (requires(Runtime& value) {
+                    value.prewarm_ssd_expert_arena();
+                }) {
+                runtime_holder->value()
+                    .prewarm_ssd_expert_arena();
+            }
+            session_cache->replace_paged_cache(
+                paged_cache_factory(requested_context),
+                cache_bytes_from_environment(
+                    "MFQ_SERVER_PREFIX_CACHE_DISK_BYTES",
+                    100ULL * 1024ULL * 1024ULL * 1024ULL),
+                cache_bytes_from_environment(
+                    "MFQ_SERVER_PREFIX_CACHE_HOT_BYTES",
+                    2ULL * 1024ULL * 1024ULL * 1024ULL));
+            release_model_load_staging_memory(runtime_stream);
+            *loaded_context = requested_context;
+            const auto seconds =
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() -
+                    started).count();
+            std::cout
+                << "Reloaded native Metal model in "
+                << seconds << " s context="
+                << requested_context << std::endl;
+            return requested_context;
+        } catch (const std::exception& reload_error) {
+            const std::string message = reload_error.what();
+            std::cerr
+                << "Model reload failed; restoring context="
+                << previous_context << std::endl;
+            try {
+                runtime_holder->emplace(
+                    load_runtime(previous_context));
+                if constexpr (requires(Runtime& value) {
+                        value.prewarm_ssd_expert_arena();
+                    }) {
+                    runtime_holder->value()
+                        .prewarm_ssd_expert_arena();
+                }
+                session_cache->replace_paged_cache(
+                    paged_cache_factory(previous_context),
+                    cache_bytes_from_environment(
+                        "MFQ_SERVER_PREFIX_CACHE_DISK_BYTES",
+                        100ULL * 1024ULL * 1024ULL * 1024ULL),
+                    cache_bytes_from_environment(
+                        "MFQ_SERVER_PREFIX_CACHE_HOT_BYTES",
+                        2ULL * 1024ULL * 1024ULL * 1024ULL));
+                release_model_load_staging_memory(runtime_stream);
+                *loaded_context = previous_context;
+            } catch (const std::exception& restore_error) {
+                throw std::runtime_error(
+                    "model reload failed: " + message +
+                    "; restoring the previous model also failed: " +
+                    restore_error.what());
+            }
+            throw std::runtime_error(
+                "model reload failed and the previous model was "
+                "restored: " + message);
+        }
+    }
+
+    mfq::engine::SessionResult session(const mfq::engine::SessionCommand& command) override {
+        using Kind = mfq::engine::SessionCommand::Kind;
+        if (command.kind == Kind::metrics) return {0, session_cache->metrics()};
+        std::lock_guard lock(*runtime_mutex);
+        switch (command.kind) {
+        case Kind::fork:
+            return {session_cache->fork_session(command.source, command.target), {}};
+        case Kind::close:
+            return {session_cache->close_session(command.source), {}};
+        case Kind::trim:
+            return {session_cache->trim_hot(command.bytes), {}};
+        case Kind::clear: {
+            mlx::core::set_default_device(mlx::core::Device::gpu);
+            mlx::core::set_default_stream(runtime_stream);
+            mfq::metal::drain_metal_work(runtime_stream);
+            const auto released = session_cache->clear();
+            if (runtime_holder->has_value()) {
+                if constexpr (requires(Runtime& value) { value.reset_cache(1); })
+                    runtime_holder->value().reset_cache(1);
+                else runtime_holder->value().reset();
+            }
+            release_allocator_caches();
+            return {released, {}};
+        }
+        case Kind::metrics: break;
+        }
+        throw std::invalid_argument("unknown Metal session command");
+    }
+
+    mfq::engine::ControlResult control(mfq::engine::ControlRequest request) override {
+        return std::visit([&](auto value) -> mfq::engine::ControlResult {
+            using T = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<T, mfq::engine::RuntimeMetrics>) return metrics();
+            else {
+                auto& duplex = runtime_components.duplex;
+                if (!duplex) throw std::invalid_argument("model has no duplex component");
+                if constexpr (std::is_same_v<T, MfqDuplexSessionParams>) duplex.start(value);
+                else if constexpr (std::is_same_v<T, MfqDuplexStepInput>) return duplex.step(value);
+                else if constexpr (std::is_same_v<T, mfq::engine::StopDuplex>) duplex.stop();
+                else throw std::invalid_argument("text control belongs to the engine");
+                return std::monostate{};
+            }
+        }, std::move(request));
+    }
+
+private:
+    mfq::engine::Metrics metrics() const {
+        std::vector<std::pair<std::string, double>> metrics{
+            {"mlx_active_bytes", static_cast<double>(mlx::core::get_active_memory())},
+            {"mlx_cache_bytes", static_cast<double>(mlx::core::get_cache_memory())},
+            {"mlx_cache_limit_bytes", static_cast<double>(allocator_cache_limit)},
+            {"mlx_peak_bytes", static_cast<double>(mlx::core::get_peak_memory())},
+        };
+        std::unique_lock lock(*runtime_mutex, std::try_to_lock);
+        if constexpr (requires(Runtime& value) {
+                value.supports_mtp();
+            }) {
+            if (lock.owns_lock() && runtime_holder->has_value()) {
+                metrics.emplace_back(
+                    "mtp_available",
+                    runtime_holder->value().supports_mtp() ? 1.0 : 0.0);
+            }
+        }
+        if constexpr (requires(Runtime& value) {
+                value.last_mtp_stats();
+            }) {
+            if (lock.owns_lock() && runtime_holder->has_value()) {
+                const auto& stats =
+                    runtime_holder->value().last_mtp_stats();
+                metrics.emplace_back("mtp_used", stats.used ? 1.0 : 0.0);
+                metrics.emplace_back(
+                    "mtp_cycles", static_cast<double>(stats.cycles));
+                metrics.emplace_back(
+                    "mtp_drafted_tokens",
+                    static_cast<double>(stats.drafted_tokens));
+                metrics.emplace_back(
+                    "mtp_accepted_tokens",
+                    static_cast<double>(stats.accepted_tokens));
+                metrics.emplace_back(
+                    "mtp_acceptance_rate",
+                    stats.drafted_tokens == 0
+                        ? 0.0
+                        : static_cast<double>(stats.accepted_tokens) /
+                              stats.drafted_tokens);
+                metrics.emplace_back(
+                    "mtp_selected_depth",
+                    static_cast<double>(stats.selected_depth));
+                for (std::size_t depth = 0;
+                     depth < stats.depth_cycles.size();
+                     ++depth) {
+                    metrics.emplace_back(
+                        "mtp_depth_" + std::to_string(depth) + "_cycles",
+                        static_cast<double>(stats.depth_cycles[depth]));
+                }
+                for (std::size_t position = 0;
+                     position < stats.position_drafted.size();
+                     ++position) {
+                    metrics.emplace_back(
+                        "mtp_position_" + std::to_string(position + 1) +
+                            "_acceptance_rate",
+                        stats.position_drafted[position] == 0
+                            ? 0.0
+                            : static_cast<double>(
+                                  stats.position_accepted[position]) /
+                              stats.position_drafted[position]);
+                }
+                for (std::size_t depth = 0;
+                     depth < stats.measured_depth_ms.size();
+                     ++depth) {
+                    metrics.emplace_back(
+                        "mtp_depth_" + std::to_string(depth) +
+                            "_cycle_ms",
+                        stats.measured_depth_ms[depth]);
+                }
+            }
+        }
+        if constexpr (requires(Runtime& value) {
+                value.supports_multimodal();
+            }) {
+            if (lock.owns_lock() && runtime_holder->has_value()) {
+                metrics.emplace_back(
+                    "vision_available",
+                    runtime_holder->value().supports_multimodal()
+                        ? 1.0 : 0.0);
+            }
+        }
+        if constexpr (requires(Runtime& value) {
+                value.ssd_expert_cache_stats();
+            }) {
+            if (lock.owns_lock() && runtime_holder->has_value()) {
+                const auto stats =
+                    runtime_holder->value().ssd_expert_cache_stats();
+                if (stats.has_value()) {
+                    metrics.emplace_back(
+                        "ssd_expert_requests",
+                        static_cast<double>(stats->requests));
+                    metrics.emplace_back(
+                        "ssd_expert_hits",
+                        static_cast<double>(stats->hits));
+                    metrics.emplace_back(
+                        "ssd_expert_misses",
+                        static_cast<double>(stats->misses));
+                    metrics.emplace_back(
+                        "ssd_expert_evictions",
+                        static_cast<double>(stats->evictions));
+                    metrics.emplace_back(
+                        "ssd_expert_loads",
+                        static_cast<double>(stats->loads));
+                    metrics.emplace_back(
+                        "ssd_expert_hit_rate",
+                        stats->hit_rate());
+                    metrics.emplace_back(
+                        "ssd_expert_bytes_read",
+                        static_cast<double>(stats->bytes_read));
+                    metrics.emplace_back(
+                        "ssd_expert_resident_bytes",
+                        static_cast<double>(stats->resident_bytes));
+                    metrics.emplace_back(
+                        "ssd_expert_resident_count",
+                        static_cast<double>(stats->resident_experts));
+                    metrics.emplace_back(
+                        "ssd_expert_cache_slots",
+                        static_cast<double>(stats->cache_slots));
+                    metrics.emplace_back(
+                        "ssd_expert_cache_limit_bytes",
+                        static_cast<double>(
+                            runtime_holder->value()
+                                .expert_cache_limit_bytes()));
+                    metrics.emplace_back(
+                        "ssd_expert_io_seconds",
+                        stats->io_seconds);
+                    metrics.emplace_back(
+                        "ssd_expert_wait_seconds",
+                        stats->wait_seconds);
+                }
+            }
+        }
+        if constexpr (requires(Runtime& value) {
+                value.engram_ssd_stats();
+            }) {
+            if (lock.owns_lock() && runtime_holder->has_value()) {
+                const auto stats =
+                    runtime_holder->value().engram_ssd_stats();
+                if (stats.has_value()) {
+                    metrics.emplace_back(
+                        "engram_row_requests",
+                        static_cast<double>(stats->row_requests));
+                    metrics.emplace_back(
+                        "engram_cache_hits",
+                        static_cast<double>(stats->cache_hits));
+                    metrics.emplace_back(
+                        "engram_cache_misses",
+                        static_cast<double>(stats->cache_misses));
+                    metrics.emplace_back(
+                        "engram_hit_rate",
+                        stats->hit_rate());
+                    metrics.emplace_back(
+                        "engram_rows_loaded",
+                        static_cast<double>(stats->rows_loaded));
+                    metrics.emplace_back(
+                        "engram_bytes_read",
+                        static_cast<double>(stats->bytes_read));
+                    metrics.emplace_back(
+                        "engram_read_calls",
+                        static_cast<double>(stats->read_calls));
+                    metrics.emplace_back(
+                        "engram_io_seconds",
+                        stats->io_seconds);
+                    metrics.emplace_back(
+                        "engram_resident_rows",
+                        static_cast<double>(stats->resident_rows));
+                    metrics.emplace_back(
+                        "engram_resident_bytes",
+                        static_cast<double>(
+                            stats->resident_payload_bytes));
+                    metrics.emplace_back(
+                        "engram_cache_limit_bytes",
+                        static_cast<double>(stats->cache_limit_bytes));
+                }
+            }
+        }
+        if constexpr (requires(Runtime& value) {
+                value.fused_hyper_connections_active();
+            }) {
+            if (lock.owns_lock() && runtime_holder->has_value()) {
+                metrics.emplace_back(
+                    "fused_hyper_connections",
+                    runtime_holder->value()
+                            .fused_hyper_connections_active()
+                        ? 1.0
+                        : 0.0);
+            }
+        }
+        return metrics;
+    }
+
+    std::shared_ptr<std::mutex> runtime_mutex;
+    std::shared_ptr<std::optional<Runtime>> runtime_holder;
+    std::shared_ptr<Cache> session_cache;
+    Loader load_runtime;
+    PagedCacheFactory paged_cache_factory;
+    std::shared_ptr<std::int64_t> loaded_context;
+    mlx::core::Stream runtime_stream;
+    int prefill_chunk_size;
+    std::size_t allocator_cache_limit;
+    mfq::metal::MlxEngineComponents runtime_components;
+};
 
 template <typename Runtime, typename Loader>
 int run_loaded_runtime(
@@ -1844,13 +2295,6 @@ int run_loaded_runtime(
         : arguments.model_name;
     transport_config.model_type = std::move(model_type);
     const auto model_graph = mfq::metal::effective_model_graph(container);
-    if (container.contains(tokenizer_asset)) {
-        transport_config.tokenizer_gguf =
-            container.read(tokenizer_asset);
-    } else {
-        transport_config.tokenizer_model =
-            arguments.tokenizer_gguf.string();
-    }
     transport_config.api_key = arguments.api_key;
     transport_config.max_context = std::min<std::int64_t>(
         arguments.context_size,
@@ -1893,7 +2337,7 @@ int run_loaded_runtime(
             paged_cache_factory(transport_config.max_context));
     auto loaded_context =
         std::make_shared<std::int64_t>(transport_config.max_context);
-    auto runtime_components = mfq::metal::make_mlx_server_components(
+    auto runtime_components = mfq::metal::make_mlx_engine_components(
         &model_graph,
         runtime_mutex,
         runtime_holder,
@@ -1920,408 +2364,25 @@ int run_loaded_runtime(
             static_cast<bool>(runtime_components.duplex);
         transport_config.model_capabilities = std::move(capabilities);
     }
-    const MfqGenerateFn generate =
-        [runtime_mutex, runtime_holder, session_cache, runtime_stream,
-         prefill_chunk_size](
-            const std::vector<std::int64_t>& prompt,
-            const MfqSamplingParams& sampling,
-            const MfqTokenCallback& callback,
-            const MfqPrefillCallback& on_prefill,
-            const MfqPromptCachePlan& cache_plan,
-            const MfqTokenConstraintPtr& token_constraint,
-            const MfqCancellationCheck&) {
-            std::lock_guard<std::mutex> lock(*runtime_mutex);
-            if (!runtime_holder->has_value()) {
-                throw std::runtime_error(
-                    "model runtime is unavailable after a failed reload");
-            }
-            mlx::core::set_default_device(
-                mlx::core::Device::gpu);
-            mlx::core::set_default_stream(runtime_stream);
-            mfq::metal::MlxSamplingParams parameters;
-            parameters.temperature = sampling.temperature;
-            parameters.top_k = sampling.top_k;
-            parameters.top_p = sampling.top_p;
-            parameters.presence_penalty =
-                sampling.presence_penalty;
-            parameters.frequency_penalty =
-                sampling.frequency_penalty;
-            parameters.repetition_penalty =
-                sampling.repetition_penalty;
-            parameters.enable_mtp = sampling.enable_mtp;
-            parameters.mtp_max_draft_tokens =
-                sampling.mtp_max_draft_tokens;
-            parameters.seed = sampling.seed;
-            auto& loaded_runtime = runtime_holder->value();
-            const auto stable_prefix_tokens =
-                session_cache->normalize_stable_prefix_tokens(std::min(
-                    cache_plan.stable_prefix_tokens, prompt.size()));
-            const bool cache_enabled =
-                stable_prefix_tokens > 0 &&
-                (!cache_plan.session_id.empty() ||
-                 session_cache->persistent_prefix_enabled()) &&
-                loaded_runtime.supports_text_session_state();
-            if (cache_enabled) {
-                (void)session_cache->restore_best(
-                    loaded_runtime,
-                    cache_plan.session_id,
-                    prompt,
-                    stable_prefix_tokens);
-            }
-            auto effective_cache_plan = cache_plan;
-            effective_cache_plan.stable_prefix_tokens = cache_enabled
-                ? stable_prefix_tokens
-                : 0;
-            const auto generated = generate_with_prefill_metrics(
-                loaded_runtime,
-                prompt,
-                parameters,
-                sampling.max_tokens,
-                callback,
-                on_prefill,
-                effective_cache_plan,
-                token_constraint,
-                prefill_chunk_size);
-            if (cache_enabled &&
-                loaded_runtime.cache_position() ==
-                    static_cast<int>(stable_prefix_tokens)) {
-                try {
-                    std::vector<std::int64_t> stable_tokens(
-                        prompt.begin(),
-                        prompt.begin() + static_cast<std::ptrdiff_t>(
-                            stable_prefix_tokens));
-                    session_cache->store(
-                        cache_plan.session_id,
-                        loaded_runtime.capture_text_session_state(
-                            stable_tokens));
-                } catch (const std::exception& error) {
-                    std::cerr
-                        << "server_session_cache backend=metal action=skip "
-                        << "session=" << cache_plan.session_id
-                        << " error=" << error.what() << std::endl;
-                }
-            }
-            return generated;
-        };
-    const auto multimodal_generate =
-        runtime_components.multimodal_generate;
-    const MfqReloadFn reload =
-        [runtime_mutex, runtime_holder, loaded_context, session_cache,
-         load_runtime, paged_cache_factory, runtime_stream](
-            std::int64_t requested_context) mutable {
-            std::lock_guard<std::mutex> lock(*runtime_mutex);
-            mlx::core::set_default_device(
-                mlx::core::Device::gpu);
-            mlx::core::set_default_stream(runtime_stream);
-            mfq::metal::drain_metal_work(runtime_stream);
-
-            const auto previous_context = *loaded_context;
-            session_cache->clear_live_sessions();
-            runtime_holder->reset();
-            release_model_load_staging_memory(runtime_stream);
-            const auto started =
-                std::chrono::steady_clock::now();
-            std::cout
-                << "Reloading native Metal model with context="
-                << requested_context << "..." << std::endl;
-            try {
-                runtime_holder->emplace(
-                    load_runtime(requested_context));
-                if constexpr (requires(Runtime& value) {
-                        value.prewarm_ssd_expert_arena();
-                    }) {
-                    runtime_holder->value()
-                        .prewarm_ssd_expert_arena();
-                }
-                session_cache->replace_paged_cache(
-                    paged_cache_factory(requested_context),
-                    cache_bytes_from_environment(
-                        "MFQ_SERVER_PREFIX_CACHE_DISK_BYTES",
-                        100ULL * 1024ULL * 1024ULL * 1024ULL),
-                    cache_bytes_from_environment(
-                        "MFQ_SERVER_PREFIX_CACHE_HOT_BYTES",
-                        2ULL * 1024ULL * 1024ULL * 1024ULL));
-                release_model_load_staging_memory(runtime_stream);
-                *loaded_context = requested_context;
-                const auto seconds =
-                    std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() -
-                        started).count();
-                std::cout
-                    << "Reloaded native Metal model in "
-                    << seconds << " s context="
-                    << requested_context << std::endl;
-                return requested_context;
-            } catch (const std::exception& reload_error) {
-                const std::string message = reload_error.what();
-                std::cerr
-                    << "Model reload failed; restoring context="
-                    << previous_context << std::endl;
-                try {
-                    runtime_holder->emplace(
-                        load_runtime(previous_context));
-                    if constexpr (requires(Runtime& value) {
-                            value.prewarm_ssd_expert_arena();
-                        }) {
-                        runtime_holder->value()
-                            .prewarm_ssd_expert_arena();
-                    }
-                    session_cache->replace_paged_cache(
-                        paged_cache_factory(previous_context),
-                        cache_bytes_from_environment(
-                            "MFQ_SERVER_PREFIX_CACHE_DISK_BYTES",
-                            100ULL * 1024ULL * 1024ULL * 1024ULL),
-                        cache_bytes_from_environment(
-                            "MFQ_SERVER_PREFIX_CACHE_HOT_BYTES",
-                            2ULL * 1024ULL * 1024ULL * 1024ULL));
-                    release_model_load_staging_memory(runtime_stream);
-                    *loaded_context = previous_context;
-                } catch (const std::exception& restore_error) {
-                    throw std::runtime_error(
-                        "model reload failed: " + message +
-                        "; restoring the previous model also failed: " +
-                        restore_error.what());
-                }
-                throw std::runtime_error(
-                    "model reload failed and the previous model was "
-                    "restored: " + message);
-            }
-        };
-    auto duplex = std::move(runtime_components.duplex);
-    MfqSessionControl session_control;
-    session_control.fork =
-        [runtime_mutex, session_cache](
-            const std::string& source_session_id,
-            const std::string& target_session_id) {
-            std::lock_guard<std::mutex> lock(*runtime_mutex);
-            return session_cache->fork_session(
-                source_session_id, target_session_id);
-        };
-    session_control.close =
-        [runtime_mutex, session_cache](const std::string& session_id) {
-            std::lock_guard<std::mutex> lock(*runtime_mutex);
-            return session_cache->close_session(session_id);
-        };
-    session_control.metrics = [session_cache] {
-        return session_cache->metrics();
-    };
-    session_control.clear = [runtime_mutex, runtime_holder, session_cache,
-                             runtime_stream] {
-        std::lock_guard<std::mutex> lock(*runtime_mutex);
-        mlx::core::set_default_device(mlx::core::Device::gpu);
-        mlx::core::set_default_stream(runtime_stream);
-        mfq::metal::drain_metal_work(runtime_stream);
-        const auto released = session_cache->clear();
-        if (runtime_holder->has_value()) {
-            auto& loaded_runtime = runtime_holder->value();
-            if constexpr (requires { loaded_runtime.reset_cache(1); }) {
-                loaded_runtime.reset_cache(1);
-            } else if constexpr (requires { loaded_runtime.reset(); }) {
-                loaded_runtime.reset();
-            }
-        }
-        release_allocator_caches();
-        return released;
-    };
-    session_control.trim_hot = [session_cache](std::uint64_t target_bytes) {
-        return session_cache->trim_hot(target_bytes);
-    };
-    MfqInferenceEngine inference_engine;
-    inference_engine.generate = generate;
-    inference_engine.reload = reload;
-    inference_engine.duplex = std::move(duplex);
-    inference_engine.session_control = std::move(session_control);
-    inference_engine.multimodal_generate = multimodal_generate;
-    inference_engine.runtime_metrics =
-        [runtime_mutex, runtime_holder, allocator_cache_limit] {
-            std::vector<std::pair<std::string, double>> metrics{
-                {"mlx_active_bytes", static_cast<double>(mlx::core::get_active_memory())},
-                {"mlx_cache_bytes", static_cast<double>(mlx::core::get_cache_memory())},
-                {"mlx_cache_limit_bytes", static_cast<double>(allocator_cache_limit)},
-                {"mlx_peak_bytes", static_cast<double>(mlx::core::get_peak_memory())},
-            };
-            std::unique_lock lock(*runtime_mutex, std::try_to_lock);
-            if constexpr (requires(Runtime& value) {
-                    value.supports_mtp();
-                }) {
-                if (lock.owns_lock() && runtime_holder->has_value()) {
-                    metrics.emplace_back(
-                        "mtp_available",
-                        runtime_holder->value().supports_mtp() ? 1.0 : 0.0);
-                }
-            }
-            if constexpr (requires(Runtime& value) {
-                    value.last_mtp_stats();
-                }) {
-                if (lock.owns_lock() && runtime_holder->has_value()) {
-                    const auto& stats =
-                        runtime_holder->value().last_mtp_stats();
-                    metrics.emplace_back("mtp_used", stats.used ? 1.0 : 0.0);
-                    metrics.emplace_back(
-                        "mtp_cycles", static_cast<double>(stats.cycles));
-                    metrics.emplace_back(
-                        "mtp_drafted_tokens",
-                        static_cast<double>(stats.drafted_tokens));
-                    metrics.emplace_back(
-                        "mtp_accepted_tokens",
-                        static_cast<double>(stats.accepted_tokens));
-                    metrics.emplace_back(
-                        "mtp_acceptance_rate",
-                        stats.drafted_tokens == 0
-                            ? 0.0
-                            : static_cast<double>(stats.accepted_tokens) /
-                                  stats.drafted_tokens);
-                    metrics.emplace_back(
-                        "mtp_selected_depth",
-                        static_cast<double>(stats.selected_depth));
-                    for (std::size_t depth = 0;
-                         depth < stats.depth_cycles.size();
-                         ++depth) {
-                        metrics.emplace_back(
-                            "mtp_depth_" + std::to_string(depth) + "_cycles",
-                            static_cast<double>(stats.depth_cycles[depth]));
-                    }
-                    for (std::size_t position = 0;
-                         position < stats.position_drafted.size();
-                         ++position) {
-                        metrics.emplace_back(
-                            "mtp_position_" + std::to_string(position + 1) +
-                                "_acceptance_rate",
-                            stats.position_drafted[position] == 0
-                                ? 0.0
-                                : static_cast<double>(
-                                      stats.position_accepted[position]) /
-                                  stats.position_drafted[position]);
-                    }
-                    for (std::size_t depth = 0;
-                         depth < stats.measured_depth_ms.size();
-                         ++depth) {
-                        metrics.emplace_back(
-                            "mtp_depth_" + std::to_string(depth) +
-                                "_cycle_ms",
-                            stats.measured_depth_ms[depth]);
-                    }
-                }
-            }
-            if constexpr (requires(Runtime& value) {
-                    value.supports_multimodal();
-                }) {
-                if (lock.owns_lock() && runtime_holder->has_value()) {
-                    metrics.emplace_back(
-                        "vision_available",
-                        runtime_holder->value().supports_multimodal()
-                            ? 1.0 : 0.0);
-                }
-            }
-            if constexpr (requires(Runtime& value) {
-                    value.ssd_expert_cache_stats();
-                }) {
-                if (lock.owns_lock() && runtime_holder->has_value()) {
-                    const auto stats =
-                        runtime_holder->value().ssd_expert_cache_stats();
-                    if (stats.has_value()) {
-                        metrics.emplace_back(
-                            "ssd_expert_requests",
-                            static_cast<double>(stats->requests));
-                        metrics.emplace_back(
-                            "ssd_expert_hits",
-                            static_cast<double>(stats->hits));
-                        metrics.emplace_back(
-                            "ssd_expert_misses",
-                            static_cast<double>(stats->misses));
-                        metrics.emplace_back(
-                            "ssd_expert_evictions",
-                            static_cast<double>(stats->evictions));
-                        metrics.emplace_back(
-                            "ssd_expert_loads",
-                            static_cast<double>(stats->loads));
-                        metrics.emplace_back(
-                            "ssd_expert_hit_rate",
-                            stats->hit_rate());
-                        metrics.emplace_back(
-                            "ssd_expert_bytes_read",
-                            static_cast<double>(stats->bytes_read));
-                        metrics.emplace_back(
-                            "ssd_expert_resident_bytes",
-                            static_cast<double>(stats->resident_bytes));
-                        metrics.emplace_back(
-                            "ssd_expert_resident_count",
-                            static_cast<double>(stats->resident_experts));
-                        metrics.emplace_back(
-                            "ssd_expert_cache_slots",
-                            static_cast<double>(stats->cache_slots));
-                        metrics.emplace_back(
-                            "ssd_expert_cache_limit_bytes",
-                            static_cast<double>(
-                                runtime_holder->value()
-                                    .expert_cache_limit_bytes()));
-                        metrics.emplace_back(
-                            "ssd_expert_io_seconds",
-                            stats->io_seconds);
-                        metrics.emplace_back(
-                            "ssd_expert_wait_seconds",
-                            stats->wait_seconds);
-                    }
-                }
-            }
-            if constexpr (requires(Runtime& value) {
-                    value.engram_ssd_stats();
-                }) {
-                if (lock.owns_lock() && runtime_holder->has_value()) {
-                    const auto stats =
-                        runtime_holder->value().engram_ssd_stats();
-                    if (stats.has_value()) {
-                        metrics.emplace_back(
-                            "engram_row_requests",
-                            static_cast<double>(stats->row_requests));
-                        metrics.emplace_back(
-                            "engram_cache_hits",
-                            static_cast<double>(stats->cache_hits));
-                        metrics.emplace_back(
-                            "engram_cache_misses",
-                            static_cast<double>(stats->cache_misses));
-                        metrics.emplace_back(
-                            "engram_hit_rate",
-                            stats->hit_rate());
-                        metrics.emplace_back(
-                            "engram_rows_loaded",
-                            static_cast<double>(stats->rows_loaded));
-                        metrics.emplace_back(
-                            "engram_bytes_read",
-                            static_cast<double>(stats->bytes_read));
-                        metrics.emplace_back(
-                            "engram_read_calls",
-                            static_cast<double>(stats->read_calls));
-                        metrics.emplace_back(
-                            "engram_io_seconds",
-                            stats->io_seconds);
-                        metrics.emplace_back(
-                            "engram_resident_rows",
-                            static_cast<double>(stats->resident_rows));
-                        metrics.emplace_back(
-                            "engram_resident_bytes",
-                            static_cast<double>(
-                                stats->resident_payload_bytes));
-                        metrics.emplace_back(
-                            "engram_cache_limit_bytes",
-                            static_cast<double>(stats->cache_limit_bytes));
-                    }
-                }
-            }
-            if constexpr (requires(Runtime& value) {
-                    value.fused_hyper_connections_active();
-                }) {
-                if (lock.owns_lock() && runtime_holder->has_value()) {
-                    metrics.emplace_back(
-                        "fused_hyper_connections",
-                        runtime_holder->value()
-                                .fused_hyper_connections_active()
-                            ? 1.0
-                            : 0.0);
-                }
-            }
-            return metrics;
-        };
+    auto text = container.contains(tokenizer_asset)
+        ? std::make_unique<mfq::engine::TextProcessor>(container.read(tokenizer_asset),
+              static_cast<std::int32_t>(vocabulary_size), transport_config.model_type)
+        : std::make_unique<mfq::engine::TextProcessor>(arguments.tokenizer_gguf.string(),
+              static_cast<std::int32_t>(vocabulary_size), transport_config.model_type);
+    mfq::engine::EngineInfo info;
+    info.max_context = transport_config.max_context;
+    info.vocab_size = static_cast<std::int32_t>(vocabulary_size);
+    info.model_type = transport_config.model_type;
+    info.capabilities = *transport_config.model_capabilities;
+    info.multimodal = static_cast<bool>(runtime_components.multimodal_generate);
+    info.duplex = static_cast<bool>(runtime_components.duplex);
+    info.reload = true;
+    auto engine_model = std::make_unique<LoadedMetalModel<Runtime, Loader>>(
+        runtime_mutex, runtime_holder, session_cache, std::move(load_runtime),
+        paged_cache_factory, loaded_context, runtime_stream, prefill_chunk_size,
+        allocator_cache_limit, std::move(runtime_components));
+    auto inference_engine = std::make_unique<mfq::metal::MlxEngine>(
+        std::move(engine_model), std::move(text), std::move(info));
     auto transport = arguments.stdio
         ? make_mfq_stdio_transport(transport_config)
         : make_mfq_http_transport(std::move(transport_config));

@@ -2056,7 +2056,6 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
     }
     const bool dspark_candidate =
         dspark_.has_value() && sampling.enable_mtp &&
-        mfq_token_constraint_supports_speculation(token_constraint) &&
         max_tokens > 1;
 
     const int prompt_count =
@@ -2621,7 +2620,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                 "DeepSeek-V4 sampler returned an "
                 "out-of-range token");
         }
-        if (token_constraint && token_constraint->allows &&
+        if (token_constraint &&
             !token_constraint->allows(token)) {
             auto adjusted = counts
                 ? sampler.apply_penalties(logits, *counts)
@@ -2647,7 +2646,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
                     "invalid token");
             }
         }
-        if (token_constraint && token_constraint->accept) {
+        if (token_constraint) {
             token_constraint->accept(token);
         }
         const array token_ids(

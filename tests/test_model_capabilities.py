@@ -186,8 +186,10 @@ def test_cpp_server_publishes_the_same_architecture_capability_contract() -> Non
 
 
 def test_cpp_transports_keep_health_metrics_out_of_response_performance() -> None:
-    assert SERVER.count("add_request_runtime_metrics(performance)") == 3
+    assert SERVER.count("add_request_runtime_metrics(performance, metrics)") == 3
     assert "add_runtime_metrics(performance)" not in SERVER
+    assert "append_generation_metrics(values, metrics.mtp)" in SERVER
+    mtp_metrics = (ROOT / "cpp_runtime/engine/src/mtp_metrics.cpp").read_text()
     for metric in (
         "mtp_available",
         "mtp_used",
@@ -195,11 +197,8 @@ def test_cpp_transports_keep_health_metrics_out_of_response_performance() -> Non
         "mtp_drafted_tokens",
         "mtp_accepted_tokens",
         "mtp_acceptance_rate",
-        "mtp_target_ms",
-        "mtp_head_ms",
-        "mtp_rollback_ms",
     ):
-        assert f'"{metric}"' in SERVER
+        assert f'"{metric}"' in SERVER + mtp_metrics
 
 
 def test_cuda_uses_one_architecture_and_optional_component_registry() -> None:

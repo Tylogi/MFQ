@@ -522,7 +522,6 @@ class StdioRuntimeClient:
             while True:
                 frame = await queue.get()
                 if isinstance(frame, BaseException):
-                    finished = True
                     raise frame
                 frame_type = frame.get("type")
                 if frame_type == "event":
@@ -755,7 +754,20 @@ class StdioRuntimeClient:
                     raise BackendProtocolError("stdio response requires a string id")
                 queue = self._pending.get(request_id)
                 if queue is not None:
-                    await queue.put(frame)
+                    try:
+                        queue.put_nowait(frame)
+                    except asyncio.QueueFull:
+                        # One stalled stream must not block every control reply.
+                        self._pending.pop(request_id, None)
+                        while not queue.empty():
+                            queue.get_nowait()
+                        queue.put_nowait(
+                            BackendError(
+                                "backend_backpressure",
+                                "stdio request response queue exceeded its limit",
+                                retryable=True,
+                            )
+                        )
         except asyncio.CancelledError:
             raise
         except BackendError as error:

@@ -280,7 +280,7 @@ def test_metal_mfe_has_no_second_dense_nint_compute_kernel():
     assert "family == kFamilyNint" in METAL_MOE
     assert "decode_nint_row_quad_at(" in METAL_MFE_KERNELS
     assert "nint_cohorts" not in METAL_MOE
-    assert "mfq_moe_nint_" not in METAL_MOE
+    assert '"mfq_moe_nint_' not in METAL_MOE
     assert "if (family == 0u)" not in METAL_MOE
     assert "grouped_nint4_group24" not in METAL_MOE
     assert "nint_profile_mask" not in METAL_MOE

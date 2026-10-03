@@ -195,7 +195,9 @@ def test_metal_runtime_matches_native_session_lifecycle_and_limits() -> None:
     assert "MFQ_SERVER_KV_SESSION_BYTES" in METAL_DECODE
     assert "fork_session(" in METAL_DECODE
     assert "close_session(" in METAL_DECODE
-    assert "MfqSessionControl session_control" in METAL_DECODE
+    assert "mfq::engine::SessionResult session(" in METAL_DECODE
+    assert "case Kind::fork:" in METAL_DECODE
+    assert "case Kind::close:" in METAL_DECODE
     assert "backend=metal" in METAL_DECODE
 
 
@@ -204,7 +206,7 @@ def test_metal_server_bounds_and_explicitly_reclaims_allocator_cache() -> None:
     assert "physical_memory_bytes() / 16" in METAL_DECODE
     assert "mlx::core::set_cache_limit(allocator_cache_limit)" in METAL_DECODE
     assert '"mlx_cache_limit_bytes"' in METAL_DECODE
-    assert "loaded_runtime.reset_cache(1)" in METAL_DECODE
+    assert "runtime_holder->value().reset_cache(1)" in METAL_DECODE
     assert "drain_metal_work(runtime_stream)" in METAL_DECODE
     assert "release_model_load_staging_memory(runtime_stream);" in METAL_DECODE
 
@@ -213,8 +215,8 @@ def test_metal_server_drains_async_work_before_releasing_cache_storage() -> None
     assert METAL_STREAM_SYNC.index("synchronize(runtime_stream)") < METAL_STREAM_SYNC.index(
         "synchronize();"
     )
-    clear_control = METAL_DECODE.split("session_control.clear =", 1)[1].split(
-        "session_control.trim_hot =", 1
+    clear_control = METAL_DECODE.split("case Kind::clear: {", 1)[1].split(
+        "case Kind::metrics:", 1
     )[0]
     assert clear_control.index("drain_metal_work(runtime_stream)") < clear_control.index(
         "session_cache->clear()"
@@ -282,7 +284,7 @@ def test_tiered_prefix_cache_can_release_only_its_hot_payloads() -> None:
     assert "pins_.count(iterator->first) != 0" in PAGED_SOURCE
     assert 'server.Post("/runtime/cache/trim"' in SERVER
     assert "SessionCommand::Kind::trim" in SERVER
-    assert "session_control.trim_hot" in METAL_DECODE
+    assert "session_cache->trim_hot(command.bytes)" in METAL_DECODE
     assert "cache.trim_hot(command.bytes)" in DECODE
     assert "release_host_allocator_cache()" in METAL_DECODE
     assert "mfq_release_host_allocator_cache()" in DECODE

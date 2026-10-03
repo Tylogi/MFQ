@@ -787,7 +787,7 @@ def test_metal_residency_is_configured_before_model_allocation() -> None:
     assert "Metal memory residency unavailable" in configure
     server = DECODE_APP[DECODE_APP.index("if (arguments.server)") :]
     assert server.index("configure_mlx_metal();") < server.index(
-        "run_native_server(arguments, model)"
+        "run_native_runtime(arguments, model)"
     )
 
 
@@ -827,7 +827,7 @@ def test_qwen4_qsa_caches_completed_index_blocks_incrementally() -> None:
 
 def test_native_runtime_prewarms_shared_ssd_arenas_on_load_and_reload() -> None:
     serving = DECODE_APP[
-        DECODE_APP.index("int run_loaded_runtime(") :
+        DECODE_APP.index("class LoadedMetalModel final") :
         DECODE_APP.index("int run_native_runtime(")
     ]
     assert "model.prewarm_ssd_expert_arena();" in serving
