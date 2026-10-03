@@ -347,7 +347,7 @@ function Build-NativeSidecar {
     # Python and LibTorch. Explicitly disable the optional A/B reference target
     # so a reused CMake cache cannot pull those dependencies back into a release.
     Invoke-Checked $Context.Tools.CMake @(
-        "-S", (Join-Path $Context.ProjectDirectory "cpp_runtime"),
+        "-S", (Join-Path $Context.ProjectDirectory "csrc"),
         "-B", $Context.NativeBuildDirectory,
         "-G", "Ninja",
         "-DCMAKE_BUILD_TYPE=Release",

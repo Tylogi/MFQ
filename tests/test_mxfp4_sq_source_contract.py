@@ -1,7 +1,7 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CUDA_OPS = ROOT / "cpp_runtime/backends/cuda/ops"
+CUDA_OPS = ROOT / "csrc/backends/cuda/ops"
 CUDA_RUNTIME = "\n".join(
     path.read_text()
     for path in sorted(CUDA_OPS.rglob("*"))
@@ -11,7 +11,7 @@ CUDA_RUNTIME = "\n".join(
 
 def test_metal_mxfp4_sq_uses_one_profile_independent_compute_kernel() -> None:
     source = (
-        ROOT / "cpp_runtime/backends/metal/ops/mlx_mxfp4_sq.cpp"
+        ROOT / "csrc/backends/metal/ops/mlx_mxfp4_sq.cpp"
     ).read_text()
     assert source.count('"mfq_cpp_mxfp4_sq_matmul"') == 1
     assert source.count('"mfq_cpp_mxfp4_sq_backward_matrix"') == 1
@@ -30,7 +30,7 @@ def test_metal_mxfp4_sq_uses_one_profile_independent_compute_kernel() -> None:
 
 def test_metal_runtime_builds_only_the_unified_mxfp4_sq_implementation() -> None:
     cmake = (
-        ROOT / "cpp_runtime/backends/metal/CMakeLists.txt"
+        ROOT / "csrc/backends/metal/CMakeLists.txt"
     ).read_text()
     runtime_sources = cmake.split("add_library(mfq-metal-runtime STATIC", 1)[1]
     runtime_sources = runtime_sources.split(")", 1)[0]
@@ -55,7 +55,7 @@ def test_cuda_dense_and_routed_sq_share_one_compute_kernel_definition() -> None:
 
 def test_cpp_runtimes_route_mfe_sq_through_the_shared_linear_kernel() -> None:
     metal = (
-        ROOT / "cpp_runtime/backends/metal/ops/mlx_moe.cpp"
+        ROOT / "csrc/backends/metal/ops/mlx_moe.cpp"
     ).read_text()
     cuda = CUDA_RUNTIME
     assert "cohort.weight.routed_matmul(" in metal
@@ -75,7 +75,7 @@ def test_python_cuda_mfe_registers_mxfp4_sq_as_its_own_family() -> None:
 
 def test_cpp_loader_uses_shared_variable_width_row_selection() -> None:
     shared = (
-        ROOT / "cpp_runtime/core/include/mfq/mxfp4_sq_blob.h"
+        ROOT / "csrc/core/include/mfq/mxfp4_sq_blob.h"
     ).read_text()
     cuda = CUDA_RUNTIME
     assert "inline std::vector<std::uint8_t> select_rows(" in shared

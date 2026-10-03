@@ -5,16 +5,16 @@ from mfq.server.protocol.output_protocols import output_protocol_for_architectur
 from mfq.server.runtime.capabilities import capabilities_for_architecture
 
 ROOT = Path(__file__).resolve().parents[1]
-TRANSPORT_SRC = ROOT / "cpp_runtime" / "transport"
+TRANSPORT_SRC = ROOT / "csrc" / "transport"
 SERVER = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(TRANSPORT_SRC.rglob("*"))
     if path.suffix in {".cpp", ".h"}
 )
 CUDA_PLAN = (
-    ROOT / "cpp_runtime" / "backends" / "cuda" / "include" / "cuda_model_plan.h"
+    ROOT / "csrc" / "backends" / "cuda" / "include" / "cuda_model_plan.h"
 ).read_text(encoding="utf-8")
-CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
+CUDA_ROOT = ROOT / "csrc" / "backends" / "cuda"
 CUDA_DECODE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(CUDA_ROOT.rglob("*"))
@@ -189,7 +189,7 @@ def test_cpp_transports_keep_health_metrics_out_of_response_performance() -> Non
     assert SERVER.count("add_request_runtime_metrics(performance, metrics)") == 3
     assert "add_runtime_metrics(performance)" not in SERVER
     assert "append_generation_metrics(values, metrics.mtp)" in SERVER
-    mtp_metrics = (ROOT / "cpp_runtime/engine/src/mtp_metrics.cpp").read_text()
+    mtp_metrics = (ROOT / "csrc/engine/src/mtp_metrics.cpp").read_text()
     for metric in (
         "mtp_available",
         "mtp_used",

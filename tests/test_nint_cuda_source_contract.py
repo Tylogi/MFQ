@@ -8,17 +8,17 @@ ROOT = Path(__file__).resolve().parents[1]
 NINT = (ROOT / "mfq/kernels/cuda/nint_matmul.cu").read_text()
 BINDINGS = (ROOT / "mfq/kernels/cuda/mfq_cuda.cpp").read_text()
 EXTENSION = (ROOT / "mfq/kernels/cuda/_ext.py").read_text()
-CMAKE = (ROOT / "cpp_runtime/backends/cuda/CMakeLists.txt").read_text()
+CMAKE = (ROOT / "csrc/backends/cuda/CMakeLists.txt").read_text()
 MOE = (ROOT / "mfq/kernels/cuda/moe.cu").read_text()
 MOE_PYTHON = (ROOT / "mfq/kernels/cuda/moe.py").read_text()
-CUDA_ROOT = ROOT / "cpp_runtime/backends/cuda"
+CUDA_ROOT = ROOT / "csrc/backends/cuda"
 RUNTIME = "\n".join(
     path.read_text()
     for path in sorted(CUDA_ROOT.rglob("*"))
     if path.suffix in {".h", ".cpp"}
 )
 METAL_NINT = (
-    ROOT / "cpp_runtime/backends/metal/ops/mlx_nint.cpp"
+    ROOT / "csrc/backends/metal/ops/mlx_nint.cpp"
 ).read_text()
 METAL_NINT_PYTHON = (
     ROOT / "mfq/kernels/metal/nint.py"
@@ -33,13 +33,13 @@ MLX_LINEAR_PYTHON = (
     ROOT / "mfq/runtime/mlx_linear.py"
 ).read_text()
 METAL_GROUPED = (
-    ROOT / "cpp_runtime/backends/metal/ops/mlx_grouped_linear.cpp"
+    ROOT / "csrc/backends/metal/ops/mlx_grouped_linear.cpp"
 ).read_text()
 METAL_MOE = (
-    ROOT / "cpp_runtime/backends/metal/ops/mlx_moe.cpp"
+    ROOT / "csrc/backends/metal/ops/mlx_moe.cpp"
 ).read_text()
 METAL_MFE_KERNELS = (
-    ROOT / "cpp_runtime/backends/metal/kernels/mfq_mfe_prefill.metal"
+    ROOT / "csrc/backends/metal/kernels/mfq_mfe_prefill.metal"
 ).read_text()
 
 

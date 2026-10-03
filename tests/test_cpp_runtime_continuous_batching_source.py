@@ -1,7 +1,7 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
+CUDA_ROOT = ROOT / "csrc" / "backends" / "cuda"
 DECODE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(CUDA_ROOT.rglob("*"))
@@ -18,7 +18,7 @@ BATCH_STATE = "\n".join(
 BATCHING_CHECK = (
     CUDA_ROOT / "diagnostics" / "runtime_checks.cpp"
 ).read_text(encoding="utf-8")
-SCHEDULER = (ROOT / "cpp_runtime" / "scheduler" / "src" / "scheduler.cpp").read_text(encoding="utf-8")
+SCHEDULER = (ROOT / "csrc" / "scheduler" / "src" / "scheduler.cpp").read_text(encoding="utf-8")
 ROPE = (ROOT / "mfq" / "kernels" / "cuda" / "rope.cu").read_text(
     encoding="utf-8"
 )
@@ -32,10 +32,10 @@ KV_CACHE = (ROOT / "mfq" / "kernels" / "cuda" / "kv_cache.cu").read_text(
     encoding="utf-8"
 )
 QWEN_LOADER = (
-    ROOT / "cpp_runtime" / "models" / "qwen35" / "causal_lm.h"
+    ROOT / "csrc" / "models" / "qwen35" / "causal_lm.h"
 ).read_text(encoding="utf-8")
 QWEN_CONFIG = (
-    ROOT / "cpp_runtime" / "models" / "qwen35" / "config.cpp"
+    ROOT / "csrc" / "models" / "qwen35" / "config.cpp"
 ).read_text(encoding="utf-8")
 CAUSAL_LM = "\n".join(
     (CUDA_ROOT / name).read_text(encoding="utf-8")
@@ -48,11 +48,11 @@ RUNTIME_OPTIONS = (
 
 SHARED_ENGINE = "\n".join(
     path.read_text(encoding="utf-8")
-    for path in (ROOT / "cpp_runtime" / "engine" / "include").glob("*.h")
+    for path in (ROOT / "csrc" / "engine" / "include").glob("*.h")
 )
 SHARED_MODELS = "\n".join(
     path.read_text(encoding="utf-8")
-    for path in (ROOT / "cpp_runtime" / "models").rglob("*.h")
+    for path in (ROOT / "csrc" / "models").rglob("*.h")
 )
 
 DECODE += SHARED_ENGINE + SHARED_MODELS
@@ -167,7 +167,7 @@ def test_generic_qwen_loader_constructs_moe_ffns():
     assert "load_mfe_gpu(" in DECODE
     assert "result.is_moe = true" in DECODE
     assert "load_ffn<typename Loader::Ffn>(" in QWEN_LOADER
-    assert "metadata.num_experts = config.num_experts" in (ROOT / "cpp_runtime/models/qwen35/causal_lm.h").read_text(encoding="utf-8")
+    assert "metadata.num_experts = config.num_experts" in (ROOT / "csrc/models/qwen35/causal_lm.h").read_text(encoding="utf-8")
     assert "return this->metadata.num_experts" in CAUSAL_LM
     assert "dense Qwen model config intermediate_size must be positive" in QWEN_CONFIG
     assert '"Qwen model config intermediate_size must be positive"' not in QWEN_CONFIG

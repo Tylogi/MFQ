@@ -51,7 +51,7 @@ or replace full-model quality evaluation.
 Configure the production runtime on both Linux and Windows:
 
 ```shell
-cmake -S cpp_runtime -B build/cuda-native \
+cmake -S csrc -B build/cuda-native \
   -DMFQ_BUILD_TORCH_REFERENCE_RUNTIME=OFF \
   -DBUILD_TESTING=ON
 cmake --build build/cuda-native --config Release -j
@@ -179,7 +179,7 @@ order dependencies for `mfq-cuda-ops` contain only shared model-graph and
 model-source targets, with no Engine, model-family, scheduler, or transport.
 
 Incremental build probes used the existing Release/Ninja/CUDA 13.2 build. After
-a completed build, touch each source and run `cmake --build build/cpp_runtime`.
+a completed build, touch each source and run `cmake --build build/csrc`.
 Each probe compiled exactly one translation unit before and after the boundary
 change; no unrelated CUDA/model compilation occurred.
 

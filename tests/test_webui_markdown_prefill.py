@@ -2,16 +2,16 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SERVER_HEADER = (ROOT / "cpp_runtime" / "core" / "include" / "mfq" / "runtime.h").read_text(
+SERVER_HEADER = (ROOT / "csrc" / "core" / "include" / "mfq" / "runtime.h").read_text(
     encoding="utf-8"
 )
-TRANSPORT_SRC = ROOT / "cpp_runtime" / "transport"
+TRANSPORT_SRC = ROOT / "csrc" / "transport"
 SERVER = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(TRANSPORT_SRC.rglob("*"))
     if path.suffix in {".cpp", ".h"}
 )
-CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
+CUDA_ROOT = ROOT / "csrc" / "backends" / "cuda"
 RUNTIME = "\n".join(
     (CUDA_ROOT / name).read_text(encoding="utf-8")
     for name in (
@@ -22,7 +22,7 @@ RUNTIME = "\n".join(
     )
 )
 SAMPLING = (
-    ROOT / "cpp_runtime" / "backends" / "cuda" / "ops" / "include" / "cuda_sampling.h"
+    ROOT / "csrc" / "backends" / "cuda" / "ops" / "include" / "cuda_sampling.h"
 ).read_text(encoding="utf-8")
 
 
@@ -38,7 +38,7 @@ def test_prefill_speed_uses_cuda_events_per_bounded_model_chunk() -> None:
     sampling = prefill.index("mfq::cuda::sample_logits(", logits)
     assert logits < finished < sampling
     assert "return timer.elapsed_ms()" in prefill
-    flow = (ROOT / "cpp_runtime/engine/include/generation_step.h").read_text()
+    flow = (ROOT / "csrc/engine/include/generation_step.h").read_text()
     assert "next_prefill_chunk(end, offset, chunk_size)" in flow
     assert "elapsed += ops.prefill(chunk)" in flow
     assert "co_yield PrefillProgress" in flow

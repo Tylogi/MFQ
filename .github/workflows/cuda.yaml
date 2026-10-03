@@ -32,7 +32,7 @@ jobs:
           echo "TMPDIR=$GITHUB_WORKSPACE/.cuda-ci-tmp" >> "$GITHUB_ENV"
       - name: Build native CUDA regression targets
         run: |
-          cmake -S cpp_runtime -B build/cuda-ci -G Ninja -DCMAKE_BUILD_TYPE=Release -DMFQ_CUDA_ARCHITECTURES=native -DBUILD_TESTING=ON -DMFQ_BUILD_METAL_RUNTIME=OFF
+          cmake -S csrc -B build/cuda-ci -G Ninja -DCMAKE_BUILD_TYPE=Release -DMFQ_CUDA_ARCHITECTURES=native -DBUILD_TESTING=ON -DMFQ_BUILD_METAL_RUNTIME=OFF
           cmake --build build/cuda-ci --target mfq-native-tensor-cuda-test mfq-cuda-context-test mfq-nint-q8-test mfq-mxfp4-sq-test mfq-packed-prefill-test mfq-sq-linear-test
       - name: Run GPU numerical, graph and timing checks
         run: |

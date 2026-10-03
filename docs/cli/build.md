@@ -5,7 +5,7 @@ detects Metal or CUDA, invokes CMake, and records the resulting executable so
 that [`mfq serve`](serve.md) can find it without a binary path.
 
 The `mfq` command must come from an MFQ source checkout containing
-`cpp_runtime/CMakeLists.txt`. MFQ derives the repository root from the installed
+`csrc/CMakeLists.txt`. MFQ derives the repository root from the installed
 Python package, not from the current working directory. In an editable
 development environment, run the CLI through uv from that checkout.
 
@@ -45,14 +45,14 @@ uv run mfq build --backend cuda
 
 ## Output and build manifest
 
-The default CMake build directory is `<repo>/build/cpp_runtime`. Executable
+The default CMake build directory is `<repo>/build/csrc`. Executable
 paths:
 
 | Backend | Executable |
 | --- | --- |
-| Metal | `<repo>/build/cpp_runtime/metal/mfq-decode-metal` |
-| CUDA | `<repo>/build/cpp_runtime/mfq-runtime`, `mfq-diagnostics`, `mfq-eval` |
-| CUDA on Windows | Usually `<repo>\build\cpp_runtime\mfq-runtime.exe` (plus `mfq-diagnostics.exe`, `mfq-eval.exe`); multi-configuration generators may add `Release\` |
+| Metal | `<repo>/build/csrc/metal/mfq-decode-metal` |
+| CUDA | `<repo>/build/csrc/mfq-runtime`, `mfq-diagnostics`, `mfq-eval` |
+| CUDA on Windows | Usually `<repo>\build\csrc\mfq-runtime.exe` (plus `mfq-diagnostics.exe`, `mfq-eval.exe`); multi-configuration generators may add `Release\` |
 
 `mfq-runtime` runs inference and service mode; CUDA checks and benchmarks use
 `mfq-diagnostics`, and KL evaluation uses `mfq-eval kl`:
@@ -121,7 +121,7 @@ missing executable.
 | Option | Meaning | Default |
 | --- | --- | --- |
 | `--backend {auto,cuda,metal}` | Select or detect the accelerator backend. | `auto` |
-| `--build-dir PATH` | Set the CMake build directory. | `<repo>/build/cpp_runtime` |
+| `--build-dir PATH` | Set the CMake build directory. | `<repo>/build/csrc` |
 | `--build-type TYPE` | Set `CMAKE_BUILD_TYPE` and the build configuration. | `Release` |
 | `-j N`, `--jobs N` | Set parallel build jobs. | Host CPU count |
 | `--generator NAME` | Select a CMake generator. | Ninja when available, otherwise CMake default |

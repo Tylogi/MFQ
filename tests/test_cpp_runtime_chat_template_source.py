@@ -3,13 +3,13 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-TRANSPORT_SRC = ROOT / "cpp_runtime" / "transport"
+TRANSPORT_SRC = ROOT / "csrc" / "transport"
 SERVER = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(TRANSPORT_SRC.rglob("*"))
     if path.suffix in {".cpp", ".h"}
 )
-ENGINE_SRC = ROOT / "cpp_runtime" / "engine"
+ENGINE_SRC = ROOT / "csrc" / "engine"
 ENGINE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(ENGINE_SRC.rglob("*"))
@@ -17,46 +17,46 @@ ENGINE = "\n".join(
 )
 SCHEDULER = "\n".join(
     path.read_text(encoding="utf-8")
-    for path in sorted((ROOT / "cpp_runtime" / "scheduler").rglob("*"))
+    for path in sorted((ROOT / "csrc" / "scheduler").rglob("*"))
     if path.suffix in {".cpp", ".h"}
 )
-CUDA_RUNTIME = ROOT / "cpp_runtime" / "backends" / "cuda" / "engine"
+CUDA_RUNTIME = ROOT / "csrc" / "backends" / "cuda" / "engine"
 DECODE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in (
         CUDA_RUNTIME / "generation.cpp",
         CUDA_RUNTIME.parent / "ops" / "include" / "cuda_sampling.h",
         CUDA_RUNTIME / "mtp.cpp",
-        ROOT / "cpp_runtime" / "backends" / "cuda" / "commands" / "runtime.cpp",
+        ROOT / "csrc" / "backends" / "cuda" / "commands" / "runtime.cpp",
     )
 )
-CMAKE = (ROOT / "cpp_runtime" / "CMakeLists.txt").read_text(
+CMAKE = (ROOT / "csrc" / "CMakeLists.txt").read_text(
     encoding="utf-8"
 )
 TOKENIZER_CMAKE = (
-    ROOT / "cpp_runtime" / "components" / "tokenizer" / "CMakeLists.txt"
+    ROOT / "csrc" / "components" / "tokenizer" / "CMakeLists.txt"
 ).read_text(encoding="utf-8")
 SERVER_CMAKE = (
-    ROOT / "cpp_runtime" / "transport" / "CMakeLists.txt"
+    ROOT / "csrc" / "transport" / "CMakeLists.txt"
 ).read_text(encoding="utf-8")
 ENGINE_CMAKE = (
-    ROOT / "cpp_runtime" / "engine" / "CMakeLists.txt"
+    ROOT / "csrc" / "engine" / "CMakeLists.txt"
 ).read_text(encoding="utf-8")
 CUDA_ENGINE = (CUDA_RUNTIME / "cuda_engine.cpp").read_text(encoding="utf-8")
 METAL_CMAKE = (
-    ROOT / "cpp_runtime" / "backends" / "metal" / "CMakeLists.txt"
+    ROOT / "csrc" / "backends" / "metal" / "CMakeLists.txt"
 ).read_text(encoding="utf-8")
 METAL_DECODE = (
-    ROOT / "cpp_runtime" / "backends" / "metal" / "apps" / "mfq_decode_mlx.cpp"
+    ROOT / "csrc" / "backends" / "metal" / "apps" / "mfq_decode_mlx.cpp"
 ).read_text(encoding="utf-8")
 METAL_DSV4 = (
-    ROOT / "cpp_runtime" / "backends" / "metal" / "models/deepseek_v4" / "mlx_deepseek_v4_causal_lm.cpp"
+    ROOT / "csrc" / "backends" / "metal" / "models/deepseek_v4" / "mlx_deepseek_v4_causal_lm.cpp"
 ).read_text(encoding="utf-8")
 TEXT_CHAT = (
-    ROOT / "cpp_runtime" / "components" / "tokenizer" / "chat" / "chat.cpp"
+    ROOT / "csrc" / "components" / "tokenizer" / "chat" / "chat.cpp"
 ).read_text(encoding="utf-8")
 TEXT_CHAT_H = (
-    ROOT / "cpp_runtime" / "components" / "tokenizer" / "chat" / "chat.h"
+    ROOT / "csrc" / "components" / "tokenizer" / "chat" / "chat.h"
 ).read_text(encoding="utf-8")
 def _section(text: str, start: str, end: str) -> str:
     start_index = text.index(start)
@@ -66,20 +66,20 @@ def _section(text: str, start: str, end: str) -> str:
 
 SHARED_ENGINE = "\n".join(
     path.read_text(encoding="utf-8")
-    for path in (ROOT / "cpp_runtime" / "engine" / "include").glob("*.h")
+    for path in (ROOT / "csrc" / "engine" / "include").glob("*.h")
 )
 SHARED_MODELS = "\n".join(
     path.read_text(encoding="utf-8")
-    for path in (ROOT / "cpp_runtime" / "models").rglob("*.h")
+    for path in (ROOT / "csrc" / "models").rglob("*.h")
 )
 
 DECODE += SHARED_ENGINE + SHARED_MODELS
 
 def test_cpp_runtime_dependencies_are_integrated() -> None:
     assert not (ROOT / "third_party").exists()
-    assert not (ROOT / "cpp_runtime" / "llama").exists()
+    assert not (ROOT / "csrc" / "llama").exists()
     active_roots = [
-        ROOT / "cpp_runtime" / "components" / "tokenizer",
+        ROOT / "csrc" / "components" / "tokenizer",
         ROOT / "mfq" / "kernels" / "cuda",
     ]
     assert not [
@@ -94,11 +94,11 @@ def test_cpp_runtime_dependencies_are_integrated() -> None:
         if path.suffix in {".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp"}
     )
     assert re.search(r"\b(?:llama_|LLAMA_|MFQ_LLAMA)", active_source) is None
-    assert (ROOT / "cpp_runtime" / "components" / "tokenizer" / "include" / "mfq_text.h").is_file()
-    assert not (ROOT / "cpp_runtime" / "components" / "tokenizer" / "include" / "llama.h").exists()
-    assert (ROOT / "cpp_runtime" / "components" / "tokenizer" / "CMakeLists.txt").is_file()
-    assert (ROOT / "cpp_runtime" / "components" / "http" / "httplib.cpp").is_file()
-    assert (ROOT / "cpp_runtime" / "components" / "json" / "nlohmann" / "json.hpp").is_file()
+    assert (ROOT / "csrc" / "components" / "tokenizer" / "include" / "mfq_text.h").is_file()
+    assert not (ROOT / "csrc" / "components" / "tokenizer" / "include" / "llama.h").exists()
+    assert (ROOT / "csrc" / "components" / "tokenizer" / "CMakeLists.txt").is_file()
+    assert (ROOT / "csrc" / "components" / "http" / "httplib.cpp").is_file()
+    assert (ROOT / "csrc" / "components" / "json" / "nlohmann" / "json.hpp").is_file()
     assert (ROOT / "NOTICE").is_file()
     assert "third_party" not in CMAKE
 

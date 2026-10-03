@@ -118,7 +118,7 @@ def _models(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def test_native_qwen_ple_mixed_qk_matches_scaled_fp8_graph(tmp_path):
-    executable = Path(__file__).resolve().parents[1] / "build/cpp_runtime/metal/mfq-metal-nint-rows-test"
+    executable = Path(__file__).resolve().parents[1] / "build/csrc/metal/mfq-metal-nint-rows-test"
     if not executable.is_file():
         pytest.skip("build mfq-metal-nint-rows-test to exercise the native model graph")
     fp8, nint = _models(tmp_path)
@@ -129,7 +129,7 @@ def test_native_qwen_ple_mixed_qk_matches_scaled_fp8_graph(tmp_path):
 
 
 def test_native_qwen_ple_rejects_mixed_fp8_nint_shards(tmp_path):
-    executable = Path(__file__).resolve().parents[1] / "build/cpp_runtime/metal/mfq-metal-nint-rows-test"
+    executable = Path(__file__).resolve().parents[1] / "build/csrc/metal/mfq-metal-nint-rows-test"
     if not executable.is_file():
         pytest.skip("build mfq-metal-nint-rows-test to exercise the native model graph")
     fp8, nint = _models(tmp_path)
@@ -186,7 +186,7 @@ def _mhc_models(tmp_path, *, adaptive, projections):
 @pytest.mark.parametrize("adaptive", [False, True])
 @pytest.mark.parametrize("projections", ["down", "all"])
 def test_native_qwen_nint_mhc_matches_dense_graph(tmp_path, adaptive, projections):
-    executable = Path(__file__).resolve().parents[1] / "build/cpp_runtime/metal/mfq-metal-nint-rows-test"
+    executable = Path(__file__).resolve().parents[1] / "build/csrc/metal/mfq-metal-nint-rows-test"
     if not executable.is_file():
         pytest.skip("build mfq-metal-nint-rows-test to exercise the native model graph")
     reference, packed = _mhc_models(tmp_path, adaptive=adaptive, projections=projections)
@@ -201,7 +201,7 @@ def test_native_qwen_nint_mhc_matches_dense_graph(tmp_path, adaptive, projection
     "model.block.0.attention.mhc.pre.norm.weight",
 ])
 def test_native_qwen_nint_mhc_does_not_relax_metadata_loading(tmp_path, name):
-    executable = Path(__file__).resolve().parents[1] / "build/cpp_runtime/metal/mfq-metal-nint-rows-test"
+    executable = Path(__file__).resolve().parents[1] / "build/csrc/metal/mfq-metal-nint-rows-test"
     if not executable.is_file():
         pytest.skip("build mfq-metal-nint-rows-test to exercise the native model graph")
     reference, packed = _mhc_models(tmp_path, adaptive=True, projections="down")

@@ -4,7 +4,7 @@
 
 #include "mfe_expert_store.h"
 #include "models/deepseek_v41/config.h"
-#include "cpp_runtime/models/deepseek_v41/engram.h"
+#include "csrc/models/deepseek_v41/engram.h"
 #include "models/deepseek_v41/causal_lm.h"
 #include "quant_linear.h"
 

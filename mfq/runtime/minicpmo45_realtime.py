@@ -22,7 +22,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 SAMPLE_RATE_IN = 16_000
 SAMPLE_RATE_OUT = 24_000
-DEFAULT_WEB_ROOT = Path(__file__).resolve().parents[2] / "cpp_runtime" / "web"
+DEFAULT_WEB_ROOT = Path(__file__).resolve().parents[2] / "csrc" / "web"
 DEFAULT_DUPLEX_SYSTEM_PROMPT = "Streaming Omni Conversation."
 DEFAULT_DUPLEX_CONFIG: dict[str, Any] = {
     "system_prompt": DEFAULT_DUPLEX_SYSTEM_PROMPT,

@@ -171,7 +171,7 @@ def test_cpp_runtime_matches_python_for_all_mfe_families(tmp_path, tokens: int):
         (
             candidate
             for candidate in (
-                root / "build" / "cpp_runtime" / "mfq-diagnostics.exe",
+                root / "build" / "csrc" / "mfq-diagnostics.exe",
                 root / "build" / "cuda-local" / "mfq-diagnostics.exe",
             )
             if candidate.exists()

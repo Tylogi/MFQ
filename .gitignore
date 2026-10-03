@@ -67,10 +67,10 @@ runs/
 
 # ---- 模型、校准数据与实验工件 ----
 models/
-!cpp_runtime/models/
-!cpp_runtime/models/**
-!cpp_runtime/backends/cuda/models/
-!cpp_runtime/backends/cuda/models/**
+!csrc/models/
+!csrc/models/**
+!csrc/backends/cuda/models/
+!csrc/backends/cuda/models/**
 data/*
 !data/wikitext-2-raw/
 data/wikitext-2-raw/*

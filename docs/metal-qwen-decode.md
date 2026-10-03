@@ -37,9 +37,9 @@ GPU kernel times. Do not use instrumented request throughput as a benchmark.
 ## Validation and timing
 
 ```sh
-ctest --test-dir build/cpp_runtime/metal \
+ctest --test-dir build/csrc/metal \
   -R '^mfq-metal-qwen-gated-hc-test$' --output-on-failure
-build/cpp_runtime/metal/mfq-metal-qwen-gated-hc-test --benchmark-mixed
+build/csrc/metal/mfq-metal-qwen-gated-hc-test --benchmark-mixed
 ```
 
 The mixed-storage microbenchmark warms both paths, then alternates reference /

@@ -4,9 +4,9 @@ name: Studio frontend
 on:
   push:
     branches: [master]
-    paths: ['MFQStudio/**', 'tests/**', 'mfq/**', 'cpp_runtime/**', 'packaging/**', 'third_party/**', 'pyproject.toml', 'NOTICE', '.github/workflows/frontend.yaml']
+    paths: ['MFQStudio/**', 'tests/**', 'mfq/**', 'csrc/**', 'packaging/**', 'third_party/**', 'pyproject.toml', 'NOTICE', '.github/workflows/frontend.yaml']
   pull_request:
-    paths: ['MFQStudio/**', 'tests/**', 'mfq/**', 'cpp_runtime/**', 'packaging/**', 'third_party/**', 'pyproject.toml', 'NOTICE', '.github/workflows/frontend.yaml']
+    paths: ['MFQStudio/**', 'tests/**', 'mfq/**', 'csrc/**', 'packaging/**', 'third_party/**', 'pyproject.toml', 'NOTICE', '.github/workflows/frontend.yaml']
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

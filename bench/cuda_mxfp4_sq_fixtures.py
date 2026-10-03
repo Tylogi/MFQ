@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def palette_nibbles(bits: int) -> list[int]:
-    source = (ROOT / "cpp_runtime/backends/metal/ops/mlx_mxfp4_sq.h").read_text()
+    source = (ROOT / "csrc/backends/metal/ops/mlx_mxfp4_sq.h").read_text()
     match = re.search(rf"kMxfp4Sq{bits}PaletteNibbles\s*\{{(.*?)\}};", source, re.S)
     if match is None:
         raise ValueError("frozen Metal palette definition missing")

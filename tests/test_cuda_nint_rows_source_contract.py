@@ -17,7 +17,7 @@ def test_cuda_row_kernel_consumes_packed_q_and_k():
 
 
 def test_cuda_ple_nint_uses_retained_selected_row_source():
-    root = ROOT / "cpp_runtime/backends/cuda"
+    root = ROOT / "csrc/backends/cuda"
     layers = (root / "models/qwen4_exp/ops.cpp").read_text()
     branch = layers.split('if (require_tensor(source, name).dtype == "NINT")', 1)[1].split(
         "auto weight =", 1)[0]
@@ -34,8 +34,8 @@ def test_cuda_ple_nint_uses_retained_selected_row_source():
 
 
 def test_shared_row_parser_and_cuda_test_are_build_targets():
-    core = (ROOT / "cpp_runtime/core/CMakeLists.txt").read_text()
-    cmake = (ROOT / "cpp_runtime/backends/cuda/CMakeLists.txt").read_text()
+    core = (ROOT / "csrc/core/CMakeLists.txt").read_text()
+    cmake = (ROOT / "csrc/backends/cuda/CMakeLists.txt").read_text()
     assert "nint_rows.cpp" in core
     assert "mfq-nint-rows-cuda-test" in cmake
     assert "mfq_nint_rows_test.cu" in cmake

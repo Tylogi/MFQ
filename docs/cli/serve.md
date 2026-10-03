@@ -56,7 +56,7 @@ architecture, and backend. Mismatched manifests are ignored.
 
 The manifest is always read from `<repo>/build/mfq-runtime.json`, where
 `<repo>` is the checkout supplying the running `mfq` command. A default build
-uses `<repo>/cpp_runtime` as its source and `<repo>/build/cpp_runtime` as its
+uses `<repo>/csrc` as its source and `<repo>/build/csrc` as its
 build directory. `--build-dir` changes only the CMake build tree; the manifest
 remains under `<repo>/build`.
 

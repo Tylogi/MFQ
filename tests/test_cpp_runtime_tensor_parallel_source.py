@@ -1,16 +1,16 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
+CUDA_ROOT = ROOT / "csrc" / "backends" / "cuda"
 SOURCE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(CUDA_ROOT.rglob("*"))
     if path.suffix in {".h", ".cpp"}
 )
-CORE = (ROOT / "cpp_runtime" / "core" / "tensor_parallel.h").read_text(
+CORE = (ROOT / "csrc" / "core" / "tensor_parallel.h").read_text(
     encoding="utf-8"
 )
-CMAKE = (ROOT / "cpp_runtime" / "tests" / "CMakeLists.txt").read_text(
+CMAKE = (ROOT / "csrc" / "tests" / "CMakeLists.txt").read_text(
     encoding="utf-8"
 )
 COMPONENTS = "\n".join(

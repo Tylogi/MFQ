@@ -1,7 +1,7 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
+CUDA_ROOT = ROOT / "csrc" / "backends" / "cuda"
 CUDA_SESSION_CACHE = (CUDA_ROOT / "storage" / "text_session_cache.cpp").read_text(
     encoding="utf-8"
 )
@@ -19,68 +19,68 @@ DECODE = "\n".join(
     for path in sorted(CUDA_ROOT.rglob("*"))
     if path.suffix in {".h", ".cpp"}
 )
-METAL_DECODE = (ROOT / "cpp_runtime" / "backends" / "metal" / "apps" / "mfq_decode_mlx.cpp").read_text(
+METAL_DECODE = (ROOT / "csrc" / "backends" / "metal" / "apps" / "mfq_decode_mlx.cpp").read_text(
     encoding="utf-8"
 )
 METAL_QWEN = (
-    ROOT / "cpp_runtime" / "backends" / "metal" / "models/qwen35" / "mlx_qwen35_causal_lm.cpp"
+    ROOT / "csrc" / "backends" / "metal" / "models/qwen35" / "mlx_qwen35_causal_lm.cpp"
 ).read_text(encoding="utf-8")
 METAL_DSV4 = (
-    ROOT / "cpp_runtime" / "backends" / "metal" / "models/deepseek_v4" / "mlx_deepseek_v4_causal_lm.cpp"
+    ROOT / "csrc" / "backends" / "metal" / "models/deepseek_v4" / "mlx_deepseek_v4_causal_lm.cpp"
 ).read_text(encoding="utf-8")
 METAL_DSV41 = (
-    ROOT / "cpp_runtime" / "backends" / "metal" / "models/deepseek_v41"
+    ROOT / "csrc" / "backends" / "metal" / "models/deepseek_v41"
     / "mlx_deepseek_v41_causal_lm.cpp"
 ).read_text(encoding="utf-8")
 METAL_MINICPM = (
-    ROOT / "cpp_runtime" / "backends" / "metal" / "models/minicpmo45" / "mlx_minicpmo45.cpp"
+    ROOT / "csrc" / "backends" / "metal" / "models/minicpmo45" / "mlx_minicpmo45.cpp"
 ).read_text(encoding="utf-8")
-TRANSPORT_SRC = ROOT / "cpp_runtime" / "transport"
+TRANSPORT_SRC = ROOT / "csrc" / "transport"
 SERVER = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(TRANSPORT_SRC.rglob("*"))
     if path.suffix in {".cpp", ".h"}
 )
-HEADER = (ROOT / "cpp_runtime" / "core" / "include" / "mfq" / "runtime.h").read_text(encoding="utf-8")
-PAGED_HEADER = (ROOT / "cpp_runtime" / "core" / "mfq_paged_prefix_cache.h").read_text(
+HEADER = (ROOT / "csrc" / "core" / "include" / "mfq" / "runtime.h").read_text(encoding="utf-8")
+PAGED_HEADER = (ROOT / "csrc" / "core" / "mfq_paged_prefix_cache.h").read_text(
     encoding="utf-8"
 )
-PAGED_SOURCE = (ROOT / "cpp_runtime" / "core" / "mfq_paged_prefix_cache.cpp").read_text(
+PAGED_SOURCE = (ROOT / "csrc" / "core" / "mfq_paged_prefix_cache.cpp").read_text(
     encoding="utf-8"
 )
 ENGINE_FLOW = "\n".join(
-    (ROOT / "cpp_runtime" / "engine" / part).read_text(encoding="utf-8")
+    (ROOT / "csrc" / "engine" / part).read_text(encoding="utf-8")
     for part in ("include/inference.h", "src/text_processor.cpp")
 )
 SESSION_CACHE = (
-    ROOT / "cpp_runtime" / "engine" / "include" /
+    ROOT / "csrc" / "engine" / "include" /
     "session_snapshot_cache.h"
 ).read_text(encoding="utf-8")
 METAL_PAGED_CODEC = (
-    ROOT / "cpp_runtime" / "backends" / "metal" / "runtime" / "mlx_paged_session_codec.cpp"
+    ROOT / "csrc" / "backends" / "metal" / "runtime" / "mlx_paged_session_codec.cpp"
 ).read_text(encoding="utf-8")
 METAL_PAGED_CODEC_HEADER = (
-    ROOT / "cpp_runtime" / "backends" / "metal" / "runtime" / "mlx_paged_session_codec.h"
+    ROOT / "csrc" / "backends" / "metal" / "runtime" / "mlx_paged_session_codec.h"
 ).read_text(encoding="utf-8")
 METAL_COMPONENTS = (
-    ROOT / "cpp_runtime" / "backends" / "metal" / "runtime" / "mlx_server_components.cpp"
+    ROOT / "csrc" / "backends" / "metal" / "runtime" / "mlx_server_components.cpp"
 ).read_text(encoding="utf-8")
 METAL_STREAM_SYNC = (
-    ROOT / "cpp_runtime" / "backends" / "metal" / "runtime" / "mlx_stream_sync.h"
+    ROOT / "csrc" / "backends" / "metal" / "runtime" / "mlx_stream_sync.h"
 ).read_text(encoding="utf-8")
 
 
 SHARED_ENGINE = "\n".join(
     path.read_text(encoding="utf-8")
-    for path in (ROOT / "cpp_runtime" / "engine" / "include").glob("*.h")
+    for path in (ROOT / "csrc" / "engine" / "include").glob("*.h")
 )
 SHARED_MODELS = "\n".join(
     path.read_text(encoding="utf-8")
-    for path in (ROOT / "cpp_runtime" / "models").rglob("*.h")
+    for path in (ROOT / "csrc" / "models").rglob("*.h")
 )
 
 DECODE += SHARED_ENGINE + SHARED_MODELS + (
-    ROOT / "cpp_runtime/engine/src/runtime_config.cpp"
+    ROOT / "csrc/engine/src/runtime_config.cpp"
 ).read_text(encoding="utf-8")
 CUDA_SESSION_CACHE += SHARED_ENGINE
 

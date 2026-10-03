@@ -18,10 +18,10 @@ from pathlib import Path
 _DIR = os.path.dirname(__file__)
 _REPOSITORY_ROOT = str(Path(_DIR).resolve().parents[2])
 _CUDA_RUNTIME_INCLUDE = str(
-    Path(_REPOSITORY_ROOT) / "cpp_runtime" / "backends" / "cuda" / "include"
+    Path(_REPOSITORY_ROOT) / "csrc" / "backends" / "cuda" / "include"
 )
-_CORE_INCLUDE = str(Path(_REPOSITORY_ROOT) / "cpp_runtime" / "core" / "include")
-_GGML_ROOT = Path(_REPOSITORY_ROOT) / "cpp_runtime" / "components" / "ggml"
+_CORE_INCLUDE = str(Path(_REPOSITORY_ROOT) / "csrc" / "core" / "include")
+_GGML_ROOT = Path(_REPOSITORY_ROOT) / "csrc" / "components" / "ggml"
 _GGML_INCLUDE = str(_GGML_ROOT / "include")
 _GGML_SOURCE_INCLUDE = str(_GGML_ROOT / "src")
 _GGML_CUDA_INCLUDE = str(_GGML_ROOT / "src" / "ggml-cuda")

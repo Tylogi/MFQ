@@ -16,7 +16,7 @@ def test_public_formats_keep_distinct_scale_kernels() -> None:
     assert "fp8_128_sq_backward_input_cuda" in header
 
     metal = (
-        ROOT / "cpp_runtime/backends/metal/ops/mlx_fp8_sq.cpp"
+        ROOT / "csrc/backends/metal/ops/mlx_fp8_sq.cpp"
     ).read_text()
     assert metal.count('"mfq_cpp_mxfp8_sq_backward_matrix"') == 1
     assert metal.count('"mfq_cpp_fp8_128_sq_backward_matrix"') == 1
@@ -36,7 +36,7 @@ def test_cuda_dense_dispatch_keeps_packed_decode_and_transient_gemm() -> None:
 
 
 def test_cuda_runtime_routes_dense_and_mfe_without_model_branches() -> None:
-    ops = ROOT / "cpp_runtime/backends/cuda/ops"
+    ops = ROOT / "csrc/backends/cuda/ops"
     source = "\n".join(
         path.read_text()
         for path in sorted(ops.rglob("*"))
@@ -62,7 +62,7 @@ def test_python_cuda_mfe_registers_both_fp8_sq_families() -> None:
 
 
 def test_cuda_builds_include_fp8_sq_once() -> None:
-    cmake = (ROOT / "cpp_runtime/backends/cuda/CMakeLists.txt").read_text()
+    cmake = (ROOT / "csrc/backends/cuda/CMakeLists.txt").read_text()
     extension = (ROOT / "mfq/kernels/cuda/_ext.py").read_text()
     assert cmake.count("${MFQ_CUDA_KERNEL_ROOT}/fp8_sq.cu") == 1
     assert extension.count('os.path.join(_DIR, "fp8_sq.cu")') == 1
@@ -70,7 +70,7 @@ def test_cuda_builds_include_fp8_sq_once() -> None:
 
 def test_wire_parser_and_runtime_share_the_three_bit_descriptor() -> None:
     parser = (
-        ROOT / "cpp_runtime/core/include/mfq/fp8_sq_blob.h"
+        ROOT / "csrc/core/include/mfq/fp8_sq_blob.h"
     ).read_text()
     cuda = (ROOT / "mfq/kernels/cuda/fp8_sq.cu").read_text()
     assert "row * 3" in parser

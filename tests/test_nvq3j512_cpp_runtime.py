@@ -31,7 +31,7 @@ def _executable() -> Path:
     path = (
         Path(__file__).resolve().parents[1]
         / "build"
-        / "cpp_runtime"
+        / "csrc"
         / "mfq-diagnostics.exe"
     )
     if not path.exists():

@@ -28,7 +28,7 @@ cold-SSD latency, whole-model speedup or quantization-quality gain is claimed.
 From the repository root on Linux with CUDA installed:
 
 ```sh
-cmake -S cpp_runtime -B build/cuda -DCMAKE_BUILD_TYPE=Release -DMFQ_BUILD_CPP_SERVER=ON -DMFQ_BUILD_METAL_RUNTIME=OFF -DMFQ_CUDA_ARCHITECTURES=native -DBUILD_TESTING=ON
+cmake -S csrc -B build/cuda -DCMAKE_BUILD_TYPE=Release -DMFQ_BUILD_CPP_SERVER=ON -DMFQ_BUILD_METAL_RUNTIME=OFF -DMFQ_CUDA_ARCHITECTURES=native -DBUILD_TESTING=ON
 cmake --build build/cuda --target mfq-decode mfq-nint-rows-cuda-test mfq-nint-rows-test -j 8
 ctest --test-dir build/cuda --output-on-failure -V -R '^mfq-nint-rows(-cuda)?-test$'
 MFQ_NINT_PLE_CUDA_DECODE="$PWD/build/cuda/mfq-decode" python -m pytest -q tests/test_native_nint_ple.py

@@ -22,7 +22,7 @@ def test_stdio_step_lifecycle(batch_size: int, tmp_path: Path) -> None:
     async def run() -> None:
         with (tmp_path / "runtime.log").open("wb") as log:
             process = await asyncio.create_subprocess_exec(
-                os.environ.get("MFQ_STEP_TEST_RUNTIME", str(ROOT / "build/cpp_runtime/mfq-runtime")),
+                os.environ.get("MFQ_STEP_TEST_RUNTIME", str(ROOT / "build/csrc/mfq-runtime")),
                 "--model", model, "--tokenizer", tokenizer,
                 "--transport", "stdio", "--ctx-size", "256",
                 "--prefill-chunk-size", "8", "--continuous-batching", str(batch_size),

@@ -4,7 +4,7 @@ import ast
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
+CUDA_ROOT = ROOT / "csrc" / "backends" / "cuda"
 DECODE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(CUDA_ROOT.rglob("*"))
@@ -24,7 +24,7 @@ CUDA_RUNTIME = "\n".join(
     )
 )
 CUDA_NINT = (CUDA_ROOT / "ops" / "nint.cpp").read_text(encoding="utf-8")
-TRANSPORT_SRC = ROOT / "cpp_runtime" / "transport"
+TRANSPORT_SRC = ROOT / "csrc" / "transport"
 TRANSPORT = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(TRANSPORT_SRC.rglob("*"))
@@ -37,9 +37,9 @@ TRANSPORT_BASE = (
 HTTP_TRANSPORT = (TRANSPORT_SRC / "src" / "http.cpp").read_text(encoding="utf-8")
 STDIO_TRANSPORT = (TRANSPORT_SRC / "src" / "stdio.cpp").read_text(encoding="utf-8")
 METAL_RUNTIME = (
-    ROOT / "cpp_runtime" / "backends" / "metal" / "apps" / "mfq_decode_mlx.cpp"
+    ROOT / "csrc" / "backends" / "metal" / "apps" / "mfq_decode_mlx.cpp"
 ).read_text(encoding="utf-8")
-METAL_VQ = (ROOT / "cpp_runtime" / "backends" / "metal" / "ops" / "mlx_vq.cpp").read_text(
+METAL_VQ = (ROOT / "csrc" / "backends" / "metal" / "ops" / "mlx_vq.cpp").read_text(
     encoding="utf-8"
 )
 NVQ2J_CUDA = (ROOT / "mfq" / "quantize" / "cuda" / "nvq2j_assign.cu").read_text(
@@ -65,7 +65,7 @@ CUDA_MOE_PYTHON = (ROOT / "mfq" / "kernels" / "cuda" / "moe.py").read_text(
 )
 CUDA_FATTN_SWIZZLE = (
     ROOT
-    / "cpp_runtime"
+    / "csrc"
     / "components"
     / "ggml"
     / "src"
@@ -128,7 +128,7 @@ def test_stdio_transport_owns_stdin_and_isolates_stdout() -> None:
     )
 
     stdin_users: set[str] = set()
-    for path in (ROOT / "cpp_runtime").rglob("*"):
+    for path in (ROOT / "csrc").rglob("*"):
         if path.suffix not in {".cpp", ".cc", ".cxx", ".cu", ".h", ".hpp"}:
             continue
         if "tests" in path.parts:
@@ -138,7 +138,7 @@ def test_stdio_transport_owns_stdin_and_isolates_stdout() -> None:
             marker in source
             for marker in ("std::cin", "STDIN_FILENO", "_fileno(stdin)")
         ):
-            stdin_users.add(path.relative_to(ROOT / "cpp_runtime").as_posix())
+            stdin_users.add(path.relative_to(ROOT / "csrc").as_posix())
     assert stdin_users == {
         "backends/cuda/commands/minicpmo45.cpp",
         "transport/src/stdio.cpp",

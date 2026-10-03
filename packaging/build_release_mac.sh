@@ -78,7 +78,7 @@ for mfq_mlx_file in \
   [[ -f "${mfq_mlx_file}" ]] || fail "missing MLX runtime file: ${mfq_mlx_file}"
 done
 
-cmake -S "${mfq_project_dir}/cpp_runtime" -B "${mfq_native_build_dir}" -G Ninja \
+cmake -S "${mfq_project_dir}/csrc" -B "${mfq_native_build_dir}" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_ARCHITECTURES=arm64 \
   -DCMAKE_OSX_DEPLOYMENT_TARGET="${mfq_macos_deployment_target}" \

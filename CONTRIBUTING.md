@@ -10,8 +10,8 @@ be implemented in `models/<architecture>/` or hidden behind an
 architecture-named entry point.
 
 - Backend-neutral contracts, policies, schemas, and canonical names belong in
-  `cpp_runtime/core/` or `cpp_runtime/server/`; shared model-family
-  configurations belong in `cpp_runtime/models/`.
+  `csrc/core/` or `csrc/server/`; shared model-family
+  configurations belong in `csrc/models/`.
 - Backend-wide lifecycle code, scheduling, sampling, cache policy, batching,
   metrics, and dispatch belong in `backends/<backend>/runtime/`.
 - Reusable mathematical operations and packed kernels belong in

@@ -2,25 +2,25 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CORE = (ROOT / "cpp_runtime/core/grid_vision.cpp").read_text()
+CORE = (ROOT / "csrc/core/grid_vision.cpp").read_text()
 QWEN_CONFIG = (
-    ROOT / "cpp_runtime/models/qwen35/config.cpp"
+    ROOT / "csrc/models/qwen35/config.cpp"
 ).read_text()
 COMMON_CONFIG = (
-    ROOT / "cpp_runtime/models/common/model_config.cpp"
+    ROOT / "csrc/models/common/model_config.cpp"
 ).read_text()
-CUDA_ROOT = ROOT / "cpp_runtime/backends/cuda"
+CUDA_ROOT = ROOT / "csrc/backends/cuda"
 CUDA = (CUDA_ROOT / "core/grid_vision_component.h").read_text()
 CUDA_APP = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(CUDA_ROOT.rglob("*"))
     if path.suffix in {".h", ".cpp"}
 )
-CUDA_PLAN_TEST = (ROOT / "cpp_runtime/backends/cuda/tests/cuda_model_plan_test.cpp").read_text()
-METAL = (ROOT / "cpp_runtime/backends/metal/runtime/mlx_grid_vision.cpp").read_text()
-METAL_MM = (ROOT / "cpp_runtime/backends/metal/runtime/mlx_multimodal.cpp").read_text()
-PLAN = (ROOT / "cpp_runtime/backends/cuda/include/cuda_model_plan.h").read_text()
-PREPARED = (ROOT / "cpp_runtime/backends/cuda/ops/include/cuda_execution.h").read_text()
+CUDA_PLAN_TEST = (ROOT / "csrc/backends/cuda/tests/cuda_model_plan_test.cpp").read_text()
+METAL = (ROOT / "csrc/backends/metal/runtime/mlx_grid_vision.cpp").read_text()
+METAL_MM = (ROOT / "csrc/backends/metal/runtime/mlx_multimodal.cpp").read_text()
+PLAN = (ROOT / "csrc/backends/cuda/include/cuda_model_plan.h").read_text()
+PREPARED = (ROOT / "csrc/backends/cuda/ops/include/cuda_execution.h").read_text()
 CUDA_COMPONENTS = "\n".join(
     path.read_text()
     for path in (
@@ -32,11 +32,11 @@ CUDA_COMPONENTS = "\n".join(
 
 SHARED_ENGINE = "\n".join(
     path.read_text(encoding="utf-8")
-    for path in (ROOT / "cpp_runtime" / "engine" / "include").glob("*.h")
+    for path in (ROOT / "csrc" / "engine" / "include").glob("*.h")
 )
 SHARED_MODELS = "\n".join(
     path.read_text(encoding="utf-8")
-    for path in (ROOT / "cpp_runtime" / "models").rglob("*.h")
+    for path in (ROOT / "csrc" / "models").rglob("*.h")
 )
 
 CUDA_APP += SHARED_ENGINE + SHARED_MODELS
@@ -46,7 +46,7 @@ def test_grid_vision_policies_are_owned_by_core() -> None:
     assert "make_grid_vision_layout" in CORE
     assert "make_learned_position_interpolation" in CORE
     assert "build_grid_mrope_positions" in CORE
-    assert "GridVisionTensorSchema" not in (ROOT / "cpp_runtime/core/grid_vision.h").read_text()
+    assert "GridVisionTensorSchema" not in (ROOT / "csrc/core/grid_vision.h").read_text()
     assert "spatial_positions(" not in METAL
     assert "::mfq::build_grid_mrope_positions(" in METAL_MM
 

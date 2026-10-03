@@ -2,7 +2,7 @@
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
-CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
+CUDA_ROOT = ROOT / "csrc" / "backends" / "cuda"
 DECODE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(CUDA_ROOT.rglob("*"))
@@ -36,33 +36,33 @@ GRAPH = "\n".join(
     if path.suffix in {".h", ".cpp"}
 )
 COMMAND = (CUDA_ROOT / "commands/minicpmo45.cpp").read_text(encoding="utf-8")
-SHARED = "\n".join(p.read_text(encoding="utf-8") for p in (ROOT / "cpp_runtime/models/minicpmo45").glob("*.h"))
-METAL_GRAPH = (ROOT / "cpp_runtime" / "backends" / "metal" / "models/minicpmo45" / "mlx_minicpmo45.cpp").read_text(
+SHARED = "\n".join(p.read_text(encoding="utf-8") for p in (ROOT / "csrc/models/minicpmo45").glob("*.h"))
+METAL_GRAPH = (ROOT / "csrc" / "backends" / "metal" / "models/minicpmo45" / "mlx_minicpmo45.cpp").read_text(
     encoding="utf-8"
 )
-METAL_HEADER = (ROOT / "cpp_runtime" / "backends" / "metal" / "models/minicpmo45" / "mlx_minicpmo45.h").read_text(
+METAL_HEADER = (ROOT / "csrc" / "backends" / "metal" / "models/minicpmo45" / "mlx_minicpmo45.h").read_text(
     encoding="utf-8"
 )
-METAL_DECODE = (ROOT / "cpp_runtime" / "backends" / "metal" / "apps" / "mfq_decode_mlx.cpp").read_text(
+METAL_DECODE = (ROOT / "csrc" / "backends" / "metal" / "apps" / "mfq_decode_mlx.cpp").read_text(
     encoding="utf-8"
 )
 METAL_COMPONENTS = (
-    ROOT / "cpp_runtime" / "backends" / "metal" / "runtime" / "mlx_server_components.cpp"
+    ROOT / "csrc" / "backends" / "metal" / "runtime" / "mlx_server_components.cpp"
 ).read_text(encoding="utf-8")
 METAL_PLATFORM = (
-    ROOT / "cpp_runtime" / "backends" / "metal" / "runtime" / "mlx_platform.h"
+    ROOT / "csrc" / "backends" / "metal" / "runtime" / "mlx_platform.h"
 ).read_text(encoding="utf-8")
-SERVER_HEADER = (ROOT / "cpp_runtime" / "core" / "include" / "mfq" / "runtime.h").read_text(
+SERVER_HEADER = (ROOT / "csrc" / "core" / "include" / "mfq" / "runtime.h").read_text(
     encoding="utf-8"
 )
-TRANSPORT_SRC = ROOT / "cpp_runtime" / "transport"
+TRANSPORT_SRC = ROOT / "csrc" / "transport"
 SERVER_SOURCE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(TRANSPORT_SRC.rglob("*"))
     if path.suffix in {".cpp", ".h"}
 )
 TEXT_PROCESSOR = (
-    ROOT / "cpp_runtime" / "engine" / "src" / "text_processor.cpp"
+    ROOT / "csrc" / "engine" / "src" / "text_processor.cpp"
 ).read_text(encoding="utf-8")
 REALTIME_GATEWAY = (
     ROOT / "mfq" / "runtime" / "minicpmo45_realtime.py"
@@ -70,7 +70,7 @@ REALTIME_GATEWAY = (
 
 
 def test_minicpmo45_uses_native_composite_graph_and_canonical_names():
-    common = (ROOT / "cpp_runtime/models/common/causal_model.h").read_text()
+    common = (ROOT / "csrc/models/common/causal_model.h").read_text()
     assert "models/minicpmo45/causal_lm.h" in DECODE
     assert 'constexpr auto embedding = "model.token_embedding.weight"' in common
     assert 'source, "model.output_norm.weight"' in DECODE
@@ -130,7 +130,7 @@ def test_minicpmo45_resampler_requires_exact_numpy_position_asset():
 def test_minicpmo45_supports_native_tensor_files_and_bfloat16_tts():
     assert "mfq_tensor_backend::pickle_load(bytes)" in COMMAND
     assert "mfq_tensor_backend::pickle_save(" in COMMAND
-    assert "MFQTNSR1" in (ROOT / "cpp_runtime" / "backends" / "cuda" / "src" / "mfq_native_tensor.cpp").read_text(
+    assert "MFQTNSR1" in (ROOT / "csrc" / "backends" / "cuda" / "src" / "mfq_native_tensor.cpp").read_text(
         encoding="utf-8"
     )
     assert "rr.scalar_type() == mfq_tensor_backend::kBFloat16" in DECODE
@@ -148,7 +148,7 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
     assert "qwen_rms_norm_bf16_kernel" in NORM
     assert "qwen_rms_norm_pair_bf16_finalize_kernel" in NORM
     assert "MFQ_DISABLE_NATIVE_PARALLEL_F32_MEAN" in (
-        ROOT / "cpp_runtime" / "backends" / "cuda" / "src" / "mfq_native_tensor_reduction.cu"
+        ROOT / "csrc" / "backends" / "cuda" / "src" / "mfq_native_tensor_reduction.cu"
     ).read_text(encoding="utf-8")
     assert 'rec.dtype != "NINT"' in DECODE
     assert "dequant_nint_dense_f32(to_gpu_nint(unpack_nint(blob)))" in DECODE
@@ -176,14 +176,14 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
     assert "repeated_k = kh.repeat_interleave(repeat, 1)" in DECODE
     assert '"full.minicpmo45_ffn_swiglu"' in DECODE
     assert "mfq_tensor_backend::silu(gate) * up" in DECODE
-    assert "return logits_from_hidden(" in (ROOT / "cpp_runtime/models/common/causal_model.h").read_text(encoding="utf-8")
+    assert "return logits_from_hidden(" in (ROOT / "csrc/models/common/causal_model.h").read_text(encoding="utf-8")
     assert "hidden.to(mfq_tensor_backend::kBFloat16)" in GRAPH
     assert "cache_pos > 0 && T > 1" in DECODE
     assert "minicpmo45_attention_mask" in DECODE
     assert "std::numeric_limits<mfq_bfloat16>::lowest()" in DECODE
-    shared = (ROOT / "cpp_runtime/models/minicpmo45/causal_lm.h").read_text(encoding="utf-8")
+    shared = (ROOT / "csrc/models/minicpmo45/causal_lm.h").read_text(encoding="utf-8")
     assert "bool adapter_uses_decode_sequence_length() const noexcept { return false; }" in shared
-    assert "model().adapter_uses_decode_sequence_length() &&" in (ROOT / "cpp_runtime/models/common/causal_model.h").read_text(encoding="utf-8")
+    assert "model().adapter_uses_decode_sequence_length() &&" in (ROOT / "csrc/models/common/causal_model.h").read_text(encoding="utf-8")
     assert "mask.eq(1).all().item<bool>()" in GRAPH
     assert "(tokens == 1 || cache_position == 0) && this->mask_all_ones(*mask)" in shared
 
@@ -371,7 +371,7 @@ def test_minicpmo45_cuda_duplex_uses_runtime_profile_tts_sampling():
 
 def test_minicpmo45_eval_batch_matches_pr_tts_sampler_and_optional_media():
     assert "std::mt19937*evaluator_rng=nullptr" in "".join(GRAPH.split())
-    assert "std::uniform_real_distribution<float> distribution" in (ROOT / "cpp_runtime/engine/include/sampling.h").read_text(encoding="utf-8")
+    assert "std::uniform_real_distribution<float> distribution" in (ROOT / "csrc/engine/include/sampling.h").read_text(encoding="utf-8")
     assert "mfq::engine::sample_top_k_top_p(" in GRAPH
     assert 'request.value("tts_temperature", 0.8)' in COMMAND
     assert 'request.value("tts_top_p", 0.85)' in COMMAND
