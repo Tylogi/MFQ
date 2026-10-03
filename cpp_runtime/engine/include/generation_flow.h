@@ -19,19 +19,31 @@ template <class Ops>
 Generation generate_prepared(Ops &ops, InferenceRequest &input, InferenceOutput &output,
                              const RequestId& id, bool batched) {
     std::optional<typename Ops::Prepared> prepared;
-    if (input.vision && !output.result.cancelled) {
-        auto [prompt, elapsed] = ops.prepare(input);
-        prepared = std::move(prompt);
-        output.metrics.multimodal_ms = elapsed;
+    if (input.vision && !output.stopped()) {
+        auto preparation = ops.prepare(input);
+        while (!output.stopped()) {
+            auto [step, elapsed] = ops.advance_preparation(preparation);
+            output.metrics.multimodal_ms += elapsed;
+            if (step.value) {
+                prepared = std::move(*step.value);
+                break;
+            }
+            if (!step) throw std::runtime_error("media preparation returned no prompt");
+            co_yield step.state;
+        }
+        if (output.stopped()) co_return;
+        const auto elapsed = output.metrics.multimodal_ms;
         co_yield PrefillProgress{{0, 0.0, elapsed, elapsed}};
     }
+    if (output.stopped()) co_return;
     auto sequence = ops.generate_text(input, output, std::move(prepared), id, batched);
-    while (auto event = sequence.next()) {
-        if (auto *progress = std::get_if<PrefillProgress>(&*event)) {
+    while (auto step = sequence.next()) {
+        auto& event = step.value;
+        if (auto *progress = event ? std::get_if<PrefillProgress>(&*event) : nullptr) {
             progress->timing.multimodal_ms = output.metrics.multimodal_ms;
             progress->timing.model_ms += progress->timing.multimodal_ms;
         }
-        co_yield std::move(*event);
+        co_yield std::move(step);
     }
 }
 
@@ -75,6 +87,7 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
         mtp->last_stats = {};
         mtp->last_stats.available = true;
     }
+    ExecutionCleanup cleanup{output.cleanup_failure, [&] { ops.release(); }};
     typename Ops::Restore restored;
     if (caching && (!use_mtp || mtp->supports_session_state()))
         restored = session_cache.restore_best(model,
@@ -86,17 +99,6 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
     if (restored.tokens || use_mtp)
         ops.invalidate_plan();
     if (!restored.tokens) ops.reset();
-    struct ResetOnFailure {
-        Ops &ops;
-        bool success = false;
-        ~ResetOnFailure() {
-            if (!success)
-                try {
-                    ops.reset();
-                } catch (...) {
-                }
-        }
-    } cleanup{ops};
     std::vector<int64_t> history = prompt;
     Hidden last_target_hidden;
     std::size_t last_snapshot = 0;
@@ -126,18 +128,18 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
         ? ops.speculate(request, output, restored.tokens, restored.mtp_last_target_hidden,
                         &last_target_hidden)
         : ops.plain(request, output, restored.tokens, caching ? plan.stable_prefix_tokens : 0);
-    while (auto event = sequence.next()) {
-        if (auto *progress = std::get_if<PrefillProgress>(&*event);
+    while (auto step = sequence.next()) {
+        auto& event = step.value;
+        if (auto *progress = event ? std::get_if<PrefillProgress>(&*event) : nullptr;
             progress && !use_mtp && caching &&
             progress->timing.prompt_tokens + restored.tokens == plan.stable_prefix_tokens)
             snapshot();
-        if (auto *delta = std::get_if<OutputDelta>(&*event))
+        if (auto *delta = event ? std::get_if<OutputDelta>(&*event) : nullptr)
             history.insert(history.end(), delta->token_ids.begin(), delta->token_ids.end());
-        co_yield std::move(*event);
+        co_yield std::move(step);
     }
     snapshot();
-    ops.reset();
-    cleanup.success = true;
+    cleanup.finish();
 }
 
 } // namespace mfq::engine

@@ -539,6 +539,69 @@ static void check_snapshots(CudaExecutionContext& execution, bool hybrid) {
     std::filesystem::remove_all(directory);
 }
 
+static void check_media_steps(mfq::engine::Engine& engine, const char* model_path) {
+    using namespace mfq::engine;
+    if (!engine.info().capabilities.image_input) return;
+    const auto source = mfq::open_model_source(model_path);
+    const auto config = mfq::models::qwen35::Config::from_source(*source);
+    const auto& vision = config.grid_vision.value();
+    const auto side = static_cast<int32_t>(vision.spatial_merge_size);
+    EngineRequest image;
+    image.id = "image";
+    image.input.chat_input.emplace().preformatted_prompt =
+        "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>Describe this image."
+        "<|im_end|>\n<|im_start|>assistant\n";
+    image.input.sampling.temperature = 0;
+    image.input.sampling.top_k = 1;
+    image.input.sampling.max_tokens = 8;
+    image.input.sampling.enable_mtp = false;
+    auto& media = image.input.media.emplace();
+    media.processor = MfqMultimodalProcessor::grid_vision;
+    media.processor_name = mfq::kMfqGridVisionInputContract;
+    media.vision_grid = media.image_grid = {1, side, side};
+    media.vision_grid_shape = media.image_grid_shape = {1, 3};
+    media.vision_types = {1};
+    media.pixel_shape = {side * side, vision.patch_width()};
+    media.pixel_values.assign(side * side * vision.patch_width(), 0.1F);
+    const auto run = [&] {
+        check(engine.admit(image) == Admission::accepted, "image admission");
+        std::vector<int64_t> tokens;
+        int terminals = 0, preparation_steps = 0;
+        bool preparing = true;
+        for (int tick = 0; tick < 128 && !terminals; ++tick) {
+            auto result = engine.step({image.id});
+            if (preparing && result.events.empty() && !result.advanced.empty()) ++preparation_steps;
+            for (const auto& event : result.events) {
+                if (auto* failure = std::get_if<Failed>(&event.data)) throw std::runtime_error(failure->message);
+                if (std::holds_alternative<PrefillProgress>(event.data)) preparing = false;
+                if (auto* delta = std::get_if<OutputDelta>(&event.data))
+                    tokens.insert(tokens.end(), delta->token_ids.begin(), delta->token_ids.end());
+                terminals += terminal(event.data);
+            }
+        }
+        check(terminals == 1 && !tokens.empty(), "image request did not finish");
+        return std::pair{tokens, preparation_steps};
+    };
+    const auto [reference, steps] = run();
+    check(steps >= vision.depth + 2, "image encoder did not yield between layers");
+    for (const auto stop : {int64_t(0), int64_t(2), 2 + vision.depth / 2, 2 + vision.depth}) {
+        auto interrupted = image;
+        interrupted.input.media->pixel_values[0] += static_cast<float>(stop + 1); // Bypass the image cache.
+        check(engine.admit(std::move(interrupted)) == Admission::accepted, "image cancellation admission");
+        for (int tick = 0; tick < stop; ++tick) {
+            auto result = engine.step({image.id});
+            check(result.events.empty() && result.advanced.size() == 1, "image preparation crossed its quantum");
+        }
+        engine.cancel(image.id);
+        auto result = engine.step({});
+        check(result.events.size() == 2 && std::holds_alternative<Cancelled>(result.events.back().data),
+              "image cancellation did not release before its terminal");
+        check(engine.step({}).events.empty(), "image emitted after cancellation");
+        check(run().first == reference, "image cancellation changed subsequent output");
+    }
+    std::cout << "CUDA media step checks passed layers=" << vision.depth << " cancellation=4\n";
+}
+
 // Optional real-model check: pass a Qwen3.5 model directory and tokenizer GGUF.
 static void check_batching(const char* model_path, const char* tokenizer) {
     CudaEngineOptions options;
@@ -580,7 +643,7 @@ static void check_batching(const char* model_path, const char* tokenizer) {
           "cancel during prefill did not release");
     check(mfq::cuda::diagnostics::check_engine_steps(*engine, {101, 202, 303}, sampling) == reference,
           "cancel changed subsequent output");
-
+    check_media_steps(*engine, model_path);
 }
 
 int main(int argc, char** argv) try {

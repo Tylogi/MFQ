@@ -101,10 +101,6 @@ Generation speculative_sequence(Ops ops, InferenceRequest &request, InferenceOut
     policy::DepthController depth_controller(maximum_depth);
 
     {
-        if (reused_tokens == 0) {
-            model.reset(1);
-            mtp.reset(1);
-        }
         Tensor raw, hidden;
         std::vector<Tensor> raw_chunks;
         double prefill_ms = 0.0;

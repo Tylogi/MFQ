@@ -34,7 +34,7 @@ mfq::cuda::MiniCPMO45CausalLm& Components::language() noexcept {
     return state_->runtime.language;
 }
 
-CudaPreparedPrompt Components::prepare(
+mfq::StepSequence<CudaPreparedPrompt> Components::prepare(
         const std::vector<int64_t>& prompt, const MfqMultimodalInput& vision) {
     const auto cpu_i64 =
         mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCPU);
@@ -87,13 +87,19 @@ CudaPreparedPrompt Components::prepare(
     }
 
 
-    auto result = state_->runtime.encode(input_ids, pixels, patch_mask,
+    co_yield mfq::StepState::advanced;
+    auto encoding = state_->runtime.encode(input_ids, pixels, patch_mask,
         target_sizes, image_bounds, audio_features, audio_lengths, audio_bounds);
+    mfq::models::minicpmo45::MultimodalResult<mfq_tensor_backend::Tensor> result;
+    while (auto step = encoding.next()) {
+        if (step.value) result = std::move(*step.value);
+        else co_yield step.state;
+    }
     CudaPreparedPrompt prepared;
     prepared.token_ids = prompt;
     prepared.embeddings = std::move(result.input_embeddings);
     prepared.positions = mfq_tensor_backend::arange(static_cast<int64_t>(prompt.size()), cuda_i64);
-    return prepared;
+    co_yield std::move(prepared);
 }
 
 void Components::start(const MfqDuplexSessionParams& parameters) {

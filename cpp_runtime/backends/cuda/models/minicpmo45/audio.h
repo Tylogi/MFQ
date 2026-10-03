@@ -188,7 +188,7 @@ struct MiniCPMO45AudioEncoder {
         }
 
         using Tensor = mfq_tensor_backend::Tensor;
-        return mfq::models::minicpmo45::audio_encoder(
+        return mfq::finish_steps(mfq::models::minicpmo45::audio_encoder(
             features, layers,
             [&](Tensor features) {
                 return mfq_tensor_backend::conv1d(
@@ -247,7 +247,7 @@ struct MiniCPMO45AudioEncoder {
                            hidden.transpose(1, 2), std::vector<int64_t>{5}, std::vector<int64_t>{5})
                     .transpose(1, 2)
                     .contiguous();
-            });
+            }));
     }
 
     static std::vector<int64_t> pooled_lengths(mfq_tensor_backend::Tensor raw_lengths) {
@@ -262,16 +262,17 @@ struct MiniCPMO45AudioEncoder {
         return result;
     }
 
-    mfq_tensor_backend::Tensor forward(CudaExecutionContext &execution,
-                                       mfq_tensor_backend::Tensor features,
-                                       mfq_tensor_backend::Tensor raw_lengths,
-                                       bool use_cache = false) {
+    mfq::StepSequence<mfq_tensor_backend::Tensor> forward_steps(
+        CudaExecutionContext &execution,
+        mfq_tensor_backend::Tensor features,
+        mfq_tensor_backend::Tensor raw_lengths,
+        bool use_cache = false) {
         if (features.dim() != 3 || features.size(1) != 80 || raw_lengths.dim() != 1 ||
             raw_lengths.size(0) != features.size(0)) {
             throw std::runtime_error("MiniCPM-o audio input geometry is invalid");
         }
         using Tensor = mfq_tensor_backend::Tensor;
-        return mfq::models::minicpmo45::audio_encoder(
+        auto encoding = mfq::models::minicpmo45::audio_encoder(
             features, layers,
             [&](Tensor features) {
                 return mfq_tensor_backend::conv1d(
@@ -345,5 +346,12 @@ struct MiniCPMO45AudioEncoder {
                     .transpose(1, 2)
                     .contiguous();
             });
+        while (auto step = encoding.next()) co_yield std::move(step);
+    }
+
+    mfq_tensor_backend::Tensor forward(CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor features, mfq_tensor_backend::Tensor lengths, bool use_cache = false) {
+        return mfq::finish_steps(
+            forward_steps(execution, std::move(features), std::move(lengths), use_cache));
     }
 };

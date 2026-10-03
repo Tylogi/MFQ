@@ -21,6 +21,18 @@ MTP, session reuse or multimodal preparation currently execute individually
 through this same lifecycle. Duplex migration is deferred and retains its
 existing control API.
 
+Internal execution steps distinguish waiting, progress and completion; these
+states are separate from public request events. Waiting does not count as an
+advanced request. Grid-Vision and MiniCPM image/audio preparation yield between
+encoder layers and preparation stages, so cancellation can release their
+suspended tensors before text prefill. CUDA measures each preparation quantum
+separately, excluding time spent between steps.
+
+The generation flow owns serial model cleanup, and each batch row owns its
+physical slot cleanup. The executor destroys the suspended flow, observes any
+cleanup failure, and only then publishes a terminal event. Cleanup errors mark
+the engine unhealthy, including errors encountered during explicit shutdown.
+
 Select it with:
 
 ```bash

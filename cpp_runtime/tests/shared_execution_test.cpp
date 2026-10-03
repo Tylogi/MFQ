@@ -64,7 +64,6 @@ template <class Physical> struct BatchExecution {
     bool exclusive() const { return false; }
     bool mtp_available() const { return false; }
     void execute(const std::vector<RequestId>& eligible) { batch.step(eligible); }
-    void reset() {}
     Generation generate(const RequestId& id, ExecutionRequest& request) {
         return batch.generate(id, request.input, request.output);
     }
@@ -89,7 +88,6 @@ void batch_test() {
     const auto tick = [&](std::vector<RequestId> eligible) {
         auto result = executor.step(eligible, ops);
         for (const auto& event : result.events) {
-            assert(!std::holds_alternative<ExecutionYield>(event.data));
             if (const auto* delta = std::get_if<OutputDelta>(&event.data))
                 tokens[event.id].insert(tokens[event.id].end(), delta->token_ids.begin(), delta->token_ids.end());
             if (terminal(event.data)) ++terminals[event.id];
@@ -142,10 +140,44 @@ void batch_failure_test() {
         // Register both physical rows before the device fault.
         executor.step({"a", "b"}, ops);
         fault.armed = true;
-        const auto result = executor.step({"a", "b"}, ops);
+        const auto result = executor.step({"a"}, ops); // Paused peers must also fail and release.
         assert(!result.status.healthy && executor.empty() && fault.recovered == 2);
         assert(result.events.size() == 2);
         for (const auto& event : result.events) assert(std::holds_alternative<Failed>(event.data));
+        for (const auto& [key, value] : ops.batch.metrics())
+            if (key == "continuous_batching_active" || key == "continuous_batching_prefilling") assert(value == 0);
+    }
+    // Cleanup must fail the request even if a backend reports invalid_argument;
+    // neither normal teardown nor forced destruction may retry the release.
+    struct CleanupFault { int releases = 0, recoveries = 0; bool recovery_fails; };
+    struct ReleaseOps : BatchOps {
+        CleanupFault& fault;
+        explicit ReleaseOps(CleanupFault& value) : fault(value) {}
+        void fail() { ++fault.releases; throw std::invalid_argument("slot release failed"); }
+        void retire(const std::vector<std::shared_ptr<Request>>&, int64_t) { fail(); }
+        void discard_prefill(const std::shared_ptr<Request>&) { fail(); }
+        void recover(State& state) {
+            ++fault.recoveries;
+            assert(state.prefilling.size() == 1);
+            if (fault.recovery_fails) throw std::runtime_error("recovery failed");
+        }
+    };
+    for (bool active : {false, true}) for (bool recovery_fails : {false, true}) {
+        CleanupFault fault{0, 0, recovery_fails};
+        BatchExecution<ReleaseOps> ops(fault);
+        RequestExecutor executor;
+        executor.admit(batch_request("a", active ? 1 : 5, 1), nullptr, batch_info(), ops);
+        EngineStepResult result;
+        if (!active) {
+            executor.step({"a"}, ops); // A pending prefill is owned but has no slot.
+            executor.cancel("a");
+        }
+        for (int tick = 0; tick < 10 && !executor.empty(); ++tick) result = executor.step({"a"}, ops);
+        assert(executor.empty() && !result.status.healthy && fault.releases == 1 && fault.recoveries == 1);
+        assert(std::count_if(result.events.begin(), result.events.end(), [](const auto& event) {
+            return std::holds_alternative<Failed>(event.data);
+        }) == 1);
+        assert(std::get<Failed>(result.events.back().data).code == "backend_failure");
         for (const auto& [key, value] : ops.batch.metrics())
             if (key == "continuous_batching_active" || key == "continuous_batching_prefilling") assert(value == 0);
     }
@@ -1104,9 +1136,9 @@ struct MediaTestOps {
         calls += 'E';
         return {{ids.shape[0], ids.shape[1], 4}, 4};
     }
-    Tensor vision(Tensor, Tensor, Tensor) {
+    mfq::StepSequence<Tensor> vision(Tensor, Tensor, Tensor) {
         calls += 'V';
-        return {{1, 4, 3}, 7};
+        co_yield Tensor{{1, 4, 3}, 7};
     }
     Tensor resample(Tensor t, Tensor) {
         calls += 'R';
@@ -1114,9 +1146,9 @@ struct MediaTestOps {
         return {{1, 2, 4}, 10};
     }
     void reset_audio() { calls += 'A'; }
-    Tensor audio(Tensor, Tensor) {
+    mfq::StepSequence<Tensor> audio(Tensor, Tensor) {
         calls += 'U';
-        return {{1, 3, 4}, 20};
+        co_yield Tensor{{1, 3, 4}, 20};
     }
     auto audio_lengths(Tensor) {
         calls += 'L';
@@ -1130,13 +1162,42 @@ struct MediaTestOps {
     }
 };
 
+void bounded_encoder_test() {
+    using namespace mfq::models;
+    std::array<int, 3> layers{1, 2, 3};
+    for (bool audio : {false, true}) {
+        for (int stop = 0; stop <= 5; ++stop) {
+            int visits = 0;
+            const auto layer = [&](int n, int hidden) { ++visits; return hidden + n; };
+            auto sequence = audio
+                ? minicpmo45::audio_encoder(1, layers, [](int x) { return x * 2; },
+                    [](int x) { return x; }, [](int x) { return x + 1; },
+                    [](int x) { return std::array{x, 0}; },
+                    [&](int n, int x, int) { return layer(n, x); },
+                    [](int x) { return x; }, [](int x) { return x * 2; },
+                    [](int x) { return x; }, [](int x) { return x + 1; }, [](int x) { return x; })
+                : minicpmo45::vision_encoder(1, layers, [](int x) { return x * 2; },
+                    [](int x) { return x + 1; }, layer, [](int x) { return x * 2 + 1; });
+            for (int tick = 0; tick < stop; ++tick) {
+                auto step = sequence.next();
+                assert(step.state == StepState::advanced);
+                assert(visits == std::min(tick, 3));
+                if (tick == 4) assert(step.value == 19);
+                else assert(!step.value);
+            }
+            sequence = {}; // Cancellation cannot execute another encoder layer.
+            assert(visits == std::clamp(stop - 1, 0, 3));
+        }
+    }
+}
+
 void composition_boundary_test() {
     using namespace mfq::models;
     using Tensor = CausalTestOps::Tensor;
     MediaTestOps ops;
     minicpmo45::MultimodalInputs<Tensor> input{{{6}, 1}, {{1}, 1}, {{1}, 1},       {{1}, 1},
                                                {{1}, 1}, {{1}, 1}, {{0, 0, 1, 3}}, {{0, 0, 3, 6}}};
-    auto result = minicpmo45::encode(ops, input);
+    auto result = mfq::finish_steps(minicpmo45::encode(ops, input));
     assert(ops.calls == "EVRSAULS" && result.input_embeddings.value == 34);
     assert(input.ids.shape == std::vector<int64_t>({1, 6}));
     minicpmo45::CausalLm<CausalTestOps> model;
@@ -1155,7 +1216,7 @@ void composition_boundary_test() {
         if (invalid == 3)
             broken.pixels = {};
         try {
-            minicpmo45::encode(ops, broken);
+            mfq::finish_steps(minicpmo45::encode(ops, broken));
             assert(false);
         } catch (const std::runtime_error &) {
         }
@@ -1164,7 +1225,7 @@ void composition_boundary_test() {
     text.images.clear();
     text.audios.clear();
     ops.calls.clear();
-    assert(minicpmo45::encode(ops, text).input_embeddings.value == 4 && ops.calls == "E");
+    assert(mfq::finish_steps(minicpmo45::encode(ops, text)).input_embeddings.value == 4 && ops.calls == "E");
     try {
         minicpmo45::media_bounds(std::array<int64_t, 4>{0, 0, 2, 1});
         assert(false);
@@ -1177,7 +1238,7 @@ void composition_boundary_test() {
     config.num_position_embeddings = 4;
     std::array<int, 2> layers{1, 2};
     std::string order;
-    const auto encoded = grid_vision::encode(
+    const auto encoded = mfq::finish_steps(grid_vision::encode(
         1, config, {{1, 2, 2}}, layers,
         [&](int x, int64_t count) {
             order += 'P';
@@ -1197,7 +1258,7 @@ void composition_boundary_test() {
             order += 'L';
             assert(layout.patch_count == 4);
             return x * layer;
-        });
+        }));
     assert(encoded == 16 && order == "PIALL");
     order.clear();
     auto merge = [&](int64_t count) {
@@ -1584,6 +1645,7 @@ int main() {
     assembly_test::run();
     family_parameter_loading_test();
     model_loading_test();
+    bounded_encoder_test();
     composition_boundary_test();
     boundary_model_test();
     token_generation_test();

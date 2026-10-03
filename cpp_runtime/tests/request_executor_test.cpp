@@ -1,4 +1,5 @@
 #include "request_executor.h"
+#include "generation_flow.h"
 #include "runtime_config.h"
 
 #include <cassert>
@@ -40,6 +41,7 @@ struct TestOps {
             }
             ~Storage() { --ops.live; ops.batched.erase(id); }
         } storage(*this, id, request);
+        ExecutionCleanup cleanup{output.cleanup_failure, [&] { reset(); }};
         if (failure == 1)
             throw InferenceInputError(InferenceInputErrorCode::Invalid, "invalid media");
         if (failure == 2)
@@ -47,7 +49,8 @@ struct TestOps {
         auto sequence = generate_sequence(
             std::ref(*this), output, input.prompt.size(), 0, input.cache_plan.stable_prefix_tokens, 2);
         while (auto event = sequence.next())
-            co_yield std::move(*event);
+            co_yield std::move(event);
+        cleanup.finish();
     }
 };
 
@@ -165,6 +168,109 @@ static void check_engine_lifecycle() {
     owned.reset();
 }
 
+
+static void check_waiting_and_cleanup() {
+    struct WaitingOps : TestOps {
+        Generation generate(const RequestId&, ExecutionRequest& request) {
+            ExecutionCleanup cleanup{request.output.cleanup_failure, [&] { reset(); }};
+            co_yield StepState::advanced; // Work was submitted.
+            while (!request.output.stopped()) co_yield StepState::waiting;
+            cleanup.finish();
+        }
+    };
+    WaitingOps ops;
+    RequestExecutor executor;
+    executor.admit(request(), nullptr, info(), ops);
+    auto submitted = executor.step({"one"}, ops);
+    assert(submitted.advanced == std::vector<RequestId>{"one"} && submitted.events.empty());
+    for (int i = 0; i < 3; ++i) {
+        auto waiting = executor.step({"one"}, ops);
+        assert(waiting.advanced.empty() && waiting.events.empty() && waiting.has_work);
+    }
+    executor.cancel("one");
+    auto cancelled = executor.step({}, ops);
+    assert(std::holds_alternative<Cancelled>(terminal_event(cancelled)) && ops.resets == 1);
+
+    // A cleanup error overrides cancellation, is reported once, and closes admission.
+    WaitingOps broken;
+    RequestExecutor failed;
+    failed.admit(request(), nullptr, info(), broken);
+    failed.step({"one"}, broken);
+    broken.reset_fails = true;
+    failed.cancel("one");
+    auto result = failed.step({}, broken);
+    assert(std::get<Failed>(terminal_event(result)).message == "cleanup failed");
+    assert(!result.status.healthy && failed.empty() && broken.resets == 1);
+    assert(failed.step({}, broken).events.empty() && broken.resets == 1);
+
+    // Forced destruction observes the same cleanup error before unloading resources.
+    EngineInstance<TestBackend> engine({32});
+    engine.admit(request());
+    engine.step({"one"});
+    engine.backend.ops.reset_fails = true;
+    rejects([&] { engine.shutdown(); });
+    assert(!engine.backend.loaded && engine.backend.ops.live == 0 && engine.backend.ops.resets == 1);
+    engine.shutdown();
+}
+
+static void check_preparation_steps() {
+    struct MediaOps : TestOps {
+        using Prepared = int;
+        int encoded = 0, media_live = 0, text_runs = 0, fail_at = 0;
+        mfq::StepSequence<Prepared> prepare(InferenceRequest&) {
+            ++media_live;
+            struct Storage { int& live; ~Storage() { --live; } } storage{media_live};
+            for (int i = 0; i < 3; ++i) {
+                if (++encoded == fail_at) throw std::runtime_error("encoder failed");
+                co_yield StepState::advanced;
+            }
+            co_yield 42;
+        }
+        auto advance_preparation(mfq::StepSequence<Prepared>& preparation) {
+            return std::pair{preparation.next(), 1.0};
+        }
+        Generation generate_text(InferenceRequest& input, InferenceOutput& output,
+            std::optional<Prepared> prepared, const RequestId&, bool) {
+            assert(prepared == 42);
+            ++text_runs;
+            ExecutionCleanup cleanup{output.cleanup_failure, [&] { reset(); }};
+            auto sequence = generate_sequence(std::ref(*this), output, input.prompt.size(), 0, 0, 2);
+            while (auto step = sequence.next()) co_yield std::move(step);
+            cleanup.finish();
+        }
+        Generation generate(const RequestId& id, ExecutionRequest& request) {
+            request.input.vision.emplace();
+            return generate_prepared(*this, request.input, request.output, id, false);
+        }
+    };
+    for (int stop_after = 0; stop_after <= 4; ++stop_after) {
+        MediaOps ops;
+        RequestExecutor executor;
+        executor.admit(request(), nullptr, info(), ops);
+        for (int tick = 0; tick < stop_after; ++tick) {
+            const auto step = executor.step({"one"}, ops);
+            assert(step.advanced == std::vector<RequestId>{"one"});
+        }
+        const auto encoded = ops.encoded;
+        executor.cancel("one");
+        const auto result = executor.step({}, ops);
+        assert(std::holds_alternative<Cancelled>(terminal_event(result)));
+        assert(executor.empty() && ops.media_live == 0 && ops.encoded == encoded && ops.text_runs == 0);
+    }
+    for (bool fail : {false, true}) {
+        MediaOps ops;
+        ops.fail_at = fail ? 2 : 0;
+        RequestExecutor executor;
+        executor.admit(request(), nullptr, info(), ops);
+        EngineStepResult result;
+        for (int ticks = 0; ticks < 20 && !executor.empty(); ++ticks) result = executor.step({"one"}, ops);
+        assert(executor.empty() && ops.media_live == 0);
+        assert(std::holds_alternative<Failed>(terminal_event(result)) == fail);
+        assert(ops.text_runs == (fail ? 0 : 1));
+        if (!fail) assert(std::get<Completed>(terminal_event(result)).metrics.multimodal_ms == 4);
+    }
+}
+
 struct Environment {
     const char* name;
     std::optional<std::string> previous;
@@ -213,6 +319,8 @@ static void check_runtime_config() {
 }
 
 int main() {
+    check_waiting_and_cleanup();
+    check_preparation_steps();
     check_engine_lifecycle();
     check_runtime_config();
     // A restored prefix and snapshot boundary must not enlarge a prefill tick.
@@ -225,7 +333,9 @@ int main() {
         auto sequence = generate_sequence(std::ref(ops), output, 7, 1, 4, 2);
         std::vector<std::int64_t> tokens;
         std::size_t prefilled = 0;
-        while (auto event = sequence.next()) {
+        while (auto step = sequence.next()) {
+            auto& event = step.value;
+            if (!event) continue;
             if (auto *progress = std::get_if<PrefillProgress>(&*event))
                 prefilled = progress->timing.prompt_tokens;
             if (auto *delta = std::get_if<OutputDelta>(&*event))

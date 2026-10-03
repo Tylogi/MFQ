@@ -1,4 +1,5 @@
 #pragma once
+#include "step_sequence.h"
 
 #include "core/causal_model.h"
 #include "storage/session_state.h"
@@ -74,7 +75,7 @@ class Components {
     ~Components();
 
     mfq::cuda::MiniCPMO45CausalLm &language() noexcept;
-    CudaPreparedPrompt prepare(const std::vector<int64_t> &prompt, const MfqMultimodalInput &media);
+    mfq::StepSequence<CudaPreparedPrompt> prepare(const std::vector<int64_t> &prompt, const MfqMultimodalInput &media);
     void start(const MfqDuplexSessionParams &parameters);
     MfqDuplexStepResult step(const MfqDuplexStepInput &input);
     void stop();

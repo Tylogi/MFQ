@@ -1,5 +1,6 @@
 #pragma once
 #include "config.h"
+#include "step_sequence.h"
 #include "models/common/weight_loading.h"
 #include "models/common/causal_forward.h"
 #include "models/common/causal_model.h"
@@ -59,13 +60,16 @@ template <class Tensor> struct MultimodalResult {
 
 // The model owns modality order, resampling, and replacement geometry. Device
 // copies and the actual slice/scatter operations are supplied by the backend.
-template <class Ops> auto encode(Ops &ops, MultimodalInputs<typename Ops::Tensor> &input) {
+template <class Ops>
+mfq::StepSequence<MultimodalResult<typename Ops::Tensor>>
+encode(Ops &ops, MultimodalInputs<typename Ops::Tensor> &input) {
     if (ops.rank(input.ids) == 1)
         input.ids = ops.batch_ids(std::move(input.ids));
     require_model(ops.rank(input.ids) == 2, "MiniCPM-o input_ids must have shape [batch,tokens]");
     input.ids = ops.device_ids(std::move(input.ids));
     MultimodalResult<typename Ops::Tensor> result;
     result.input_embeddings = ops.embed(input.ids);
+    co_yield mfq::StepState::advanced;
     auto check_bound = [&](const MediaBound &bound, const auto &encoded, int64_t length) {
         require_model(bound.batch >= 0 && bound.batch < ops.size(input.ids, 0) &&
                           bound.source >= 0 && bound.source < ops.size(encoded, 0) &&
@@ -77,27 +81,38 @@ template <class Ops> auto encode(Ops &ops, MultimodalInputs<typename Ops::Tensor
         require_model(ops.defined(input.pixels) && ops.defined(input.patch_mask) &&
                           ops.defined(input.target_sizes),
                       "image bounds require image tensors");
-        result.vision_states = ops.vision(input.pixels, input.patch_mask, input.target_sizes);
+        auto vision = ops.vision(input.pixels, input.patch_mask, input.target_sizes);
+        while (auto step = vision.next()) {
+            if (step.value) result.vision_states = std::move(*step.value);
+            else co_yield step.state;
+        }
         result.image_embeddings = ops.resample(result.vision_states, input.target_sizes);
+        co_yield mfq::StepState::advanced;
         for (const auto &bound : input.images) {
             check_bound(bound, result.image_embeddings, ops.size(result.image_embeddings, 1));
             ops.scatter(result.input_embeddings, result.image_embeddings, bound);
+            co_yield mfq::StepState::advanced;
         }
     }
     if (!input.audios.empty()) {
         require_model(ops.defined(input.audio_features) && ops.defined(input.audio_lengths),
                       "audio bounds require audio tensors");
         ops.reset_audio();
-        result.audio_embeddings = ops.audio(input.audio_features, input.audio_lengths);
+        auto audio = ops.audio(input.audio_features, input.audio_lengths);
+        while (auto step = audio.next()) {
+            if (step.value) result.audio_embeddings = std::move(*step.value);
+            else co_yield step.state;
+        }
         auto lengths = ops.audio_lengths(input.audio_lengths);
         for (const auto &bound : input.audios) {
             require_model(bound.source >= 0 && size_t(bound.source) < lengths.size(),
                           "audio bound source is out of range");
             check_bound(bound, result.audio_embeddings, lengths[bound.source]);
             ops.scatter(result.input_embeddings, result.audio_embeddings, bound);
+            co_yield mfq::StepState::advanced;
         }
     }
-    return result;
+    co_yield std::move(result);
 }
 
 template <class Model, class Tensor>
@@ -200,23 +215,31 @@ auto encoder_attention(Tensor hidden, bool cached, Query query, Key key, Value v
 
 template <class Tensor, class Layers, class Conv1, class Gelu, class Conv2, class Prepare,
           class Layer, class Normalize, class Project1, class Relu, class Project2, class Pool>
-auto audio_encoder(Tensor features, Layers &layers, Conv1 conv1, Gelu gelu, Conv2 conv2,
+mfq::StepSequence<Tensor> audio_encoder(Tensor features, Layers &layers, Conv1 conv1, Gelu gelu, Conv2 conv2,
                    Prepare prepare, Layer layer, Normalize normalize, Project1 project1, Relu relu,
                    Project2 project2, Pool pool) {
     auto hidden = gelu(conv1(std::move(features)));
     hidden = gelu(conv2(std::move(hidden)));
     auto prepared = prepare(std::move(hidden));
-    hidden = layer_stack(std::move(prepared[0]), layers, [&](auto &block, auto value) {
-        return layer(block, std::move(value), prepared[1]);
-    });
-    return pool(mlp(normalize(std::move(hidden)), project1, relu, project2));
+    hidden = std::move(prepared[0]);
+    co_yield mfq::StepState::advanced;
+    for (auto& block : layers) {
+        hidden = layer(block, std::move(hidden), prepared[1]);
+        co_yield mfq::StepState::advanced;
+    }
+    co_yield pool(mlp(normalize(std::move(hidden)), project1, relu, project2));
 }
 
 template <class Tensor, class Layers, class Patch, class Prepare, class Layer, class Normalize>
-auto vision_encoder(Tensor pixels, Layers &layers, Patch patch, Prepare prepare, Layer layer,
+mfq::StepSequence<Tensor> vision_encoder(Tensor pixels, Layers &layers, Patch patch, Prepare prepare, Layer layer,
                     Normalize normalize) {
     auto hidden = prepare(patch(std::move(pixels)));
-    return normalize(layer_stack(std::move(hidden), layers, layer));
+    co_yield mfq::StepState::advanced;
+    for (const auto& block : layers) {
+        hidden = layer(block, std::move(hidden));
+        co_yield mfq::StepState::advanced;
+    }
+    co_yield normalize(std::move(hidden));
 }
 
 template <class ProjectKv, class NormKv, class NormQ, class Query, class Key, class Value,

@@ -259,6 +259,12 @@ template <class Model> struct CudaGenerationContext {
         if (mtp)
             mtp->reset(1);
     }
+    void release() {
+        if (batching) return; // Each row owns its slot cleanup.
+        try { reset(); }
+        catch (...) { graph.invalidate(); throw; }
+        if (std::uncaught_exceptions()) graph.invalidate();
+    }
     Generation plain(mfq::engine::InferenceRequest& input, mfq::engine::InferenceOutput& output,
                      size_t reused, size_t stable) {
         if (batching) return batching->generate(request_id, input, output);

@@ -452,7 +452,13 @@ def test_cuda_runtime_has_one_shared_generation_path() -> None:
     assert "Generation generate(" in generation
     assert "co_yield" not in generation
     assert "InferenceOutput&output" in "".join(generation.split())
-    assert "class Generation" in SHARED_GENERATION
+    assert "using Generation = mfq::StepSequence<EventData>" in SHARED_GENERATION
+    steps = (ROOT / "cpp_runtime/core/step_sequence.h").read_text()
+    assert "enum class StepState { waiting, advanced, complete }" in steps
+    assert "ExecutionYield" not in (ROOT / "cpp_runtime/engine/include/engine.h").read_text()
+    assert "step.state == StepState::advanced" in SHARED_EXECUTOR
+    assert "ops.reset()" not in SHARED_EXECUTOR
+    assert "current.output.cleanup_failure" in SHARED_EXECUTOR
     assert "class Generation" not in header
     assert "std::function" not in header
     assert "while (generated < max_tokens)" not in generation

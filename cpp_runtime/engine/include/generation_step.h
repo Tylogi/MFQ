@@ -2,61 +2,29 @@
 
 #include "engine.h"
 #include "generation_policy.h"
+#include "step_sequence.h"
 
-#include <coroutine>
 #include <exception>
 #include <functional>
 #include <utility>
 
 namespace mfq::engine {
 
-// One resume executes one quantum. Destroying the sequence also releases its
-// suspended execution state; it must happen before publishing a terminal event.
-class Generation {
-  public:
-    struct promise_type {
-        std::optional<EventData> event;
-        std::exception_ptr error;
-        Generation get_return_object() {
-            return Generation{std::coroutine_handle<promise_type>::from_promise(*this)};
-        }
-        std::suspend_always initial_suspend() noexcept { return {}; }
-        std::suspend_always final_suspend() noexcept { return {}; }
-        std::suspend_always yield_value(EventData value) {
-            event.emplace(std::move(value));
-            return {};
-        }
-        void return_void() noexcept {}
-        void unhandled_exception() noexcept { error = std::current_exception(); }
-    };
-    Generation() = default;
-    explicit Generation(std::coroutine_handle<promise_type> handle) : handle_(handle) {}
-    Generation(Generation &&other) noexcept : handle_(std::exchange(other.handle_, {})) {}
-    Generation &operator=(Generation &&other) noexcept {
-        if (this != &other) {
-            if (handle_)
-                handle_.destroy();
-            handle_ = std::exchange(other.handle_, {});
-        }
-        return *this;
-    }
-    ~Generation() {
-        if (handle_)
-            handle_.destroy();
-    }
-    std::optional<EventData> next() {
-        if (!handle_ || handle_.done())
-            return {};
-        auto &promise = handle_.promise();
-        promise.event.reset();
-        handle_.resume();
-        if (promise.error)
-            std::rethrow_exception(promise.error);
-        return std::move(promise.event);
-    }
+using mfq::StepState;
+using Generation = mfq::StepSequence<EventData>;
 
-  private:
-    std::coroutine_handle<promise_type> handle_;
+// Resource owners release exactly once, including coroutine destruction. The
+// executor observes teardown failures before publishing a terminal event.
+template <class Release> struct ExecutionCleanup {
+    std::exception_ptr& failure;
+    Release release;
+    bool pending = true;
+    void finish() {
+        if (!std::exchange(pending, false)) return;
+        try { release(); }
+        catch (...) { failure = std::current_exception(); throw; }
+    }
+    ~ExecutionCleanup() { try { finish(); } catch (...) {} }
 };
 
 // Ops performs one device prefill/decode operation. Chunking, cancellation,
@@ -74,7 +42,8 @@ Generation generate_sequence(Operations operations, InferenceOutput &output, std
         const auto chunk = next_prefill_chunk(end, offset, chunk_size);
         if constexpr (requires { ops.schedule_prefill(chunk); }) {
             ops.schedule_prefill(chunk);
-            do { co_yield ExecutionYield{}; } while (!ops.ready() && !output.stopped());
+            co_yield StepState::advanced;
+            while (!ops.ready() && !output.stopped()) co_yield StepState::waiting;
             if (output.stopped()) co_return;
         }
         elapsed += ops.prefill(chunk);
@@ -92,7 +61,8 @@ Generation generate_sequence(Operations operations, InferenceOutput &output, std
         if (!output.stopped()) {
             if constexpr (requires { ops.schedule_decode(); }) {
                 ops.schedule_decode();
-                do { co_yield ExecutionYield{}; } while (!ops.ready() && !output.stopped());
+                co_yield StepState::advanced;
+                while (!ops.ready() && !output.stopped()) co_yield StepState::waiting;
                 if (output.stopped()) co_return;
             }
             token = ops.advance();

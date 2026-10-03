@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -73,6 +74,8 @@ public:
     bool stopped() const noexcept;
     InferenceResult result;
     InferenceMetrics metrics;
+    // Internal teardown result, checked before the terminal event is built.
+    std::exception_ptr cleanup_failure;
 private:
     void parse(std::string piece, bool partial, TokenOutput& output);
     const InferenceRequest& request_;

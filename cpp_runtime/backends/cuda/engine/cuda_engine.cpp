@@ -55,20 +55,17 @@ struct CudaEngineState {
     void execute(const std::vector<RequestId>& eligible) {
         if (batching) batching->step(eligible);
     }
-    void reset() {
-        language.reset(1);
-        if (components.mtp) components.mtp->reset(1);
-        graph.invalidate();
-    }
     using Prepared = CudaPreparedPrompt;
-    std::pair<Prepared, double> prepare(InferenceRequest& input) {
+    mfq::StepSequence<Prepared> prepare(InferenceRequest& input) {
+        if (components.composite) return components.composite->prepare(input.prompt, *input.vision);
+        if (components.grid_vision) return components.grid_vision->prepare(language, input.prompt, *input.vision);
+        throw std::invalid_argument("model has no multimodal component");
+    }
+    auto advance_preparation(mfq::StepSequence<Prepared>& preparation) {
         PrefillCudaTimer timer;
-        Prepared prepared;
-        if (components.composite) prepared = components.composite->prepare(input.prompt, *input.vision);
-        else if (components.grid_vision) prepared = components.grid_vision->prepare(language, input.prompt, *input.vision);
-        else throw std::invalid_argument("model has no multimodal component");
+        auto step = preparation.next();
         MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
-        return {std::move(prepared), timer.elapsed_ms()};
+        return std::pair{std::move(step), timer.elapsed_ms()};
     }
     Generation generate_text(InferenceRequest& input, InferenceOutput& output, std::optional<Prepared> prepared,
                              const RequestId& id, bool batched) {

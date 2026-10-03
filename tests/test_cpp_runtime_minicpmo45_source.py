@@ -323,7 +323,7 @@ def test_minicpmo45_native_servers_share_mfqd_vision_tensors():
     assert "MfqCancellationCheck" not in MINICPM_ENGINE
     assert "InferenceCancelled" not in MINICPM_ENGINE
     assert "check_cancelled" not in GRAPH
-    assert "CudaPreparedPrompt Components::prepare(" in MINICPM_ENGINE
+    assert "mfq::StepSequence<CudaPreparedPrompt> Components::prepare(" in MINICPM_ENGINE
     assert "runtime.forward(" in DECODE
     assert "mfq::cuda::sample_logits(" in DECODE
     assert "generate_multimodal(" in METAL_HEADER

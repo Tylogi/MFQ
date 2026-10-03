@@ -52,16 +52,16 @@ struct MiniCPMO45Runtime {
             return t.to(mfq_tensor_backend::kCUDA, mfq_tensor_backend::kInt64).contiguous();
         }
         Tensor embed(Tensor ids) { return runtime.language.embed_forward(ids); }
-        Tensor vision(Tensor pixels, Tensor mask, Tensor sizes) {
-            return runtime.vision.forward(*runtime.language.execution,
+        auto vision(Tensor pixels, Tensor mask, Tensor sizes) {
+            return runtime.vision.forward_steps(*runtime.language.execution,
                                           pixels.to(mfq_tensor_backend::kCUDA), mask, sizes);
         }
         Tensor resample(Tensor hidden, Tensor sizes) {
             return runtime.resampler.forward(*runtime.language.execution, hidden, sizes);
         }
         void reset_audio() { runtime.audio.reset(); }
-        Tensor audio(Tensor features, Tensor lengths) {
-            return runtime.audio.forward(*runtime.language.execution,
+        auto audio(Tensor features, Tensor lengths) {
+            return runtime.audio.forward_steps(*runtime.language.execution,
                                          features.to(mfq_tensor_backend::kCUDA), lengths, false);
         }
         static auto audio_lengths(Tensor lengths) {
@@ -75,7 +75,8 @@ struct MiniCPMO45Runtime {
         }
     };
 
-    auto encode(mfq_tensor_backend::Tensor input_ids, mfq_tensor_backend::Tensor pixels,
+    mfq::StepSequence<mfq::models::minicpmo45::MultimodalResult<mfq_tensor_backend::Tensor>>
+    encode(mfq_tensor_backend::Tensor input_ids, mfq_tensor_backend::Tensor pixels,
                 mfq_tensor_backend::Tensor patch_mask, mfq_tensor_backend::Tensor target_sizes,
                 mfq_tensor_backend::Tensor image_bounds, mfq_tensor_backend::Tensor audio_features,
                 mfq_tensor_backend::Tensor audio_lengths, mfq_tensor_backend::Tensor audio_bounds) {
@@ -89,7 +90,8 @@ struct MiniCPMO45Runtime {
             audio_lengths,
             minicpmo45_parse_bounds(image_bounds, "image"),
             minicpmo45_parse_bounds(audio_bounds, "audio")};
-        return mfq::models::minicpmo45::encode(ops, input);
+        auto encoding = mfq::models::minicpmo45::encode(ops, input);
+        while (auto step = encoding.next()) co_yield std::move(step);
     }
 
     auto forward(mfq_tensor_backend::Tensor input_ids, mfq_tensor_backend::Tensor position_ids,
@@ -102,8 +104,8 @@ struct MiniCPMO45Runtime {
             input_ids = input_ids.unsqueeze(0);
         input_ids =
             input_ids.to(mfq_tensor_backend::kCUDA, mfq_tensor_backend::kInt64).contiguous();
-        auto result = encode(input_ids, pixels, patch_mask, target_sizes, image_bounds,
-                             audio_features, audio_lengths, audio_bounds);
+        auto result = mfq::finish_steps(encode(input_ids, pixels, patch_mask, target_sizes, image_bounds,
+                             audio_features, audio_lengths, audio_bounds));
         return mfq::models::minicpmo45::multimodal_forward(
             language, input_ids, std::move(result),
             position_ids.defined() ? std::optional{position_ids} : std::nullopt,

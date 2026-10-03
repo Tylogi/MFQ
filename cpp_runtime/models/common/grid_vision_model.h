@@ -1,6 +1,7 @@
 #pragma once
 
 #include "causal_forward.h"
+#include "step_sequence.h"
 #include "gated_mlp.h"
 #include "grid_vision.h"
 #include "transformer_layer.h"
@@ -19,7 +20,7 @@ auto attention(Tensor hidden, Project project, Split split, Rope rope, Attend at
 }
 
 template <class Tensor, class Layers, class Patch, class Position, class Add, class Layer>
-auto encode(Tensor pixels, const GridVisionConfig &config, const std::vector<GridShape> &grids,
+mfq::StepSequence<Tensor> encode(Tensor pixels, const GridVisionConfig &config, std::vector<GridShape> grids,
             Layers &layers, Patch patch, Position position, Add add, Layer layer) {
     const auto layout =
         make_grid_vision_layout(grids, static_cast<int32_t>(config.spatial_merge_size));
@@ -29,9 +30,12 @@ auto encode(Tensor pixels, const GridVisionConfig &config, const std::vector<Gri
         grids, static_cast<int32_t>(config.spatial_merge_size), side);
     auto hidden = patch(std::move(pixels), layout.patch_count);
     hidden = add(std::move(hidden), position(interpolation));
-    return layer_stack(std::move(hidden), layers, [&](const auto &block, auto value) {
-        return layer(block, std::move(value), layout);
-    });
+    co_yield mfq::StepState::advanced;
+    for (const auto& block : layers) {
+        hidden = layer(block, std::move(hidden), layout);
+        co_yield mfq::StepState::advanced;
+    }
+    co_yield std::move(hidden);
 }
 
 template <class Tensor, class Norm, class Pack, class Up, class Gelu, class Down>

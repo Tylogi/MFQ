@@ -52,15 +52,33 @@ template <class Ops> class ContinuousBatch {
             position = std::max(position, request->cache_length);
         return position;
     }
+    void recover(std::exception_ptr error) {
+        State failed;
+        for (const auto& [id, work] : requests) {
+            work->failure = error;
+            work->prefill.reset();
+            work->decode = work->active = false;
+            failed.prefilling.push_back(work->request);
+        }
+        state = {};
+        operations.recover(failed);
+    }
     void release(Work& work) {
         if (!requests.contains(work.request->id)) return;
-        if (work.active) {
-            std::erase(state.active, work.request);
-            operations.retire({work.request}, cache_position());
-        } else if (!work.failure) {
-            operations.suspend_decode();
-            operations.discard_prefill(work.request);
-            operations.resume_decode(cache_position());
+        try {
+            if (work.active) {
+                std::erase(state.active, work.request);
+                operations.retire({work.request}, cache_position());
+            } else if (!work.failure) {
+                operations.suspend_decode();
+                operations.discard_prefill(work.request);
+                operations.resume_decode(cache_position());
+            }
+        } catch (...) {
+            auto error = std::current_exception();
+            try { recover(error); } catch (...) { error = std::current_exception(); }
+            requests.erase(work.request->id);
+            std::rethrow_exception(error);
         }
         requests.erase(work.request->id);
     }
@@ -101,19 +119,11 @@ template <class Ops> class ContinuousBatch {
         work->request = std::make_shared<Request>(std::move(id), input);
         if (!requests.emplace(work->request->id, work).second)
             throw std::invalid_argument("duplicate batch request id");
-        struct Cleanup {
-            ContinuousBatch& batch;
-            Work& work;
-            ~Cleanup() { try { batch.release(work); } catch (...) {} }
-        } cleanup{*this, *work};
+        ExecutionCleanup cleanup{output.cleanup_failure, [&] { release(*work); }};
         SequenceOps ops{*this, *work};
-        std::exception_ptr failure;
-        try {
-            auto sequence = generate_sequence(ops, output, input.prompt.size(), 0, 0, prefill_chunk_size);
-            while (auto event = sequence.next()) co_yield std::move(*event);
-        } catch (...) { failure = std::current_exception(); }
-        release(*work);
-        if (failure) std::rethrow_exception(failure);
+        auto sequence = generate_sequence(ops, output, input.prompt.size(), 0, 0, prefill_chunk_size);
+        while (auto step = sequence.next()) co_yield std::move(step);
+        cleanup.finish();
     }
 
     void step(const std::vector<std::string>& eligible) {
@@ -159,16 +169,8 @@ template <class Ops> class ContinuousBatch {
             }
             decode_next = !decode_next;
         } catch (...) {
-            const auto error = std::current_exception();
-            State failed;
-            for (const auto& [id, work] : requests) {
-                work->failure = error;
-                work->prefill.reset();
-                work->decode = work->active = false;
-                failed.prefilling.push_back(work->request);
-            }
-            operations.recover(failed);
-            state = {};
+            recover(std::current_exception());
+            throw;
         }
     }
 

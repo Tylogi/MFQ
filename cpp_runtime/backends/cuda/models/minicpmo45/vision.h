@@ -205,10 +205,11 @@ struct MiniCPMO45VisionEncoder {
         return result;
     }
 
-    mfq_tensor_backend::Tensor forward(CudaExecutionContext &execution,
-                                       mfq_tensor_backend::Tensor pixels,
-                                       mfq_tensor_backend::Tensor patch_mask,
-                                       mfq_tensor_backend::Tensor target_sizes) const {
+    mfq::StepSequence<mfq_tensor_backend::Tensor> forward_steps(
+        CudaExecutionContext &execution,
+        mfq_tensor_backend::Tensor pixels,
+        mfq_tensor_backend::Tensor patch_mask,
+        mfq_tensor_backend::Tensor target_sizes) const {
         if (patch_mask.dim() == 3) {
             patch_mask = patch_mask.flatten(1);
         }
@@ -220,7 +221,7 @@ struct MiniCPMO45VisionEncoder {
         }
         using Tensor = mfq_tensor_backend::Tensor;
         MfqOptional<Tensor> attention_mask = mfq_nullopt;
-        return mfq::models::minicpmo45::vision_encoder(
+        auto encoding = mfq::models::minicpmo45::vision_encoder(
             pixels, layers,
             [&](Tensor pixels) {
                 return mfq_tensor_backend::conv2d(
@@ -277,6 +278,14 @@ struct MiniCPMO45VisionEncoder {
             [&](Tensor hidden) {
                 return minicpmo45_layer_norm(hidden, post_norm_weight, post_norm_bias, 1e-6);
             });
+        while (auto step = encoding.next()) co_yield std::move(step);
+    }
+
+    mfq_tensor_backend::Tensor forward(CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor pixels, mfq_tensor_backend::Tensor mask,
+        mfq_tensor_backend::Tensor sizes) const {
+        return mfq::finish_steps(
+            forward_steps(execution, std::move(pixels), std::move(mask), std::move(sizes)));
     }
 };
 

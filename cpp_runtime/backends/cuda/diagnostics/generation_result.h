@@ -9,7 +9,9 @@ struct GenerationResult {
 };
 inline GenerationResult collect_generation(mfq::engine::Generation generation) {
     GenerationResult result;
-    while (auto event = generation.next()) {
+    while (auto step = generation.next()) {
+        auto& event = step.value;
+        if (!event) continue;
         if (auto* progress = std::get_if<mfq::engine::PrefillProgress>(&*event))
             result.prefill = progress->timing;
         if (auto* delta = std::get_if<mfq::engine::OutputDelta>(&*event)) {
@@ -25,10 +27,14 @@ std::vector<int64_t> check_mtp_steps(Model& model, MtpModule& mtp,
     mfq::engine::InferenceRequest request;
     request.prompt = prompt; request.sampling = sampling;
     mfq::engine::InferenceOutput output(request, nullptr, "mtp-check");
+    model.reset(1);
+    mtp.reset(1);
     auto generation = run_mtp_generation(model, mtp, request, output);
     std::vector<int64_t> tokens;
     std::size_t largest_delta = 0;
-    while (auto event = generation.next()) {
+    while (auto step = generation.next()) {
+        auto& event = step.value;
+        if (!event) continue;
         if (auto* delta = std::get_if<mfq::engine::OutputDelta>(&*event)) {
             MFQ_RUNTIME_CHECK(model.speculative_start < 0, "MTP published an uncommitted transaction");
             largest_delta = std::max(largest_delta, delta->token_ids.size());

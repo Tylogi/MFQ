@@ -35,8 +35,6 @@ struct EngineRequest {
 };
 
 struct PrefillProgress { MfqPrefillTiming timing; };
-// Internal suspension at a physical batching boundary, consumed by the executor.
-struct ExecutionYield {};
 using OutputDelta = TokenOutput;
 struct UsageUpdate { std::size_t prompt_tokens = 0, completion_tokens = 0; };
 // Text/tool output travels only in deltas, so terminals have a bounded size.
@@ -44,7 +42,7 @@ struct Completed { std::string finish_reason; UsageUpdate usage; InferenceMetric
 struct Cancelled { UsageUpdate usage; InferenceMetrics metrics; };
 struct Failed { std::string code, message; bool retryable = false; };
 using EventData = std::variant<PrefillProgress, OutputDelta, UsageUpdate,
-                               Completed, Cancelled, Failed, ExecutionYield>;
+                               Completed, Cancelled, Failed>;
 struct EngineEvent { RequestId id; EventData data; };
 
 inline bool terminal(const EventData& event) {

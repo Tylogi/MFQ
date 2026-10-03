@@ -280,7 +280,7 @@ class CudaGridVisionEncoder {
                                      std::move(position_weight), std::move(blocks));
     }
 
-    Tensor encode(CudaExecutionContext &execution, Tensor pixels,
+    mfq::StepSequence<Tensor> encode(CudaExecutionContext &execution, Tensor pixels,
                   const std::vector<GridShape> &grids) const {
         return mfq::models::grid_vision::encode(
             std::move(pixels), config_, grids, blocks_,
@@ -377,7 +377,7 @@ class CudaGridVisionPromptComponent {
     }
 
     template <typename Model>
-    CudaPreparedPrompt prepare(Model &language, const std::vector<int64_t> &token_ids,
+    mfq::StepSequence<CudaPreparedPrompt> prepare(Model &language, const std::vector<int64_t> &token_ids,
                                const MfqMultimodalInput &media) const {
         if (media.processor != MfqMultimodalProcessor::grid_vision ||
             media.processor_name != input_contract_ ||
@@ -422,7 +422,13 @@ class CudaGridVisionPromptComponent {
                                   .device(mfq_tensor_backend::kCPU))
                               .clone()
                               .to(mfq_tensor_backend::kCUDA);
-            auto patches = encoder_.encode(*language.execution, std::move(pixels), {grid});
+            co_yield mfq::StepState::advanced;
+            auto encoding = encoder_.encode(*language.execution, std::move(pixels), {grid});
+            Tensor patches;
+            while (auto step = encoding.next()) {
+                if (step.value) patches = std::move(*step.value);
+                else co_yield step.state;
+            }
             merged = mfq::models::grid_vision::merge(
                 patches, patches.size(0), encoder_.config(),
                 [&](Tensor value) { return merger_norm_(value); },
@@ -436,6 +442,7 @@ class CudaGridVisionPromptComponent {
             // only when alternating concurrent images becomes measurable.
             cached_vision_key_ = cache_key;
             cached_vision_ = merged;
+            co_yield mfq::StepState::advanced;
         }
 
         auto prepared = mfq::models::grid_vision::prepare(
@@ -465,7 +472,7 @@ class CudaGridVisionPromptComponent {
                     .to(mfq_tensor_backend::kCUDA)
                     .to(mfq_tensor_backend::kInt64);
             });
-        return {token_ids, std::move(prepared.embeddings), std::move(prepared.positions),
+        co_yield CudaPreparedPrompt{token_ids, std::move(prepared.embeddings), std::move(prepared.positions),
                 prepared.decode_delta, std::move(cache_key)};
     }
 

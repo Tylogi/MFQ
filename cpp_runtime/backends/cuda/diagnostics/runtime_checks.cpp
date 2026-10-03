@@ -158,7 +158,6 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
             bool exclusive() const { return false; }
             bool mtp_available() const { return false; }
             void execute(const std::vector<RequestId>& eligible) { batcher.step(eligible); }
-            void reset() {}
             Generation generate(const RequestId& id, ExecutionRequest& request) {
                 return internal::generate(model, graph, cache, config, request.input,
                                           request.output, nullptr, {}, &batcher, id);
@@ -187,7 +186,6 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
                 prefills[event.id] += std::holds_alternative<PrefillProgress>(event.data);
                 cancellations[event.id] += std::holds_alternative<Cancelled>(event.data);
                 terminals[event.id] += terminal(event.data);
-                MFQ_RUNTIME_CHECK(!std::holds_alternative<ExecutionYield>(event.data), "internal yield escaped Engine");
             }
         };
         admit("first", first_prompt); admit("second", second_prompt);

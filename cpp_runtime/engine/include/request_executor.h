@@ -29,7 +29,6 @@ struct ExecutionRequest {
     InferenceRequest input;
     InferenceOutput output;
     Generation generation;
-    std::vector<EventData> events;
     std::exception_ptr failure;
     bool started = false, batched = false, done = false;
 
@@ -96,52 +95,56 @@ class RequestExecutor {
             it->second->output.result.cancelled = true;
     }
 
+    std::exception_ptr clear() {
+        std::exception_ptr failure;
+        for (auto& [id, request] : requests_) {
+            request->generation = {};
+            if (request->output.cleanup_failure) failure = request->output.cleanup_failure;
+        }
+        requests_.clear();
+        return failure;
+    }
+
     template <class Ops> EngineStepResult step(const std::vector<RequestId> &eligible, Ops &ops) {
         try {
             ops.execute(eligible);
         } catch (...) {
             healthy_ = false;
-            throw;
+            for (auto& [id, request] : requests_)
+                request->complete(std::current_exception());
         }
         EngineStepResult result;
         for (auto it = requests_.begin(); it != requests_.end();) {
             auto &current = *it->second;
-            if (current.output.result.cancelled ||
-                std::find(eligible.begin(), eligible.end(), it->first) != eligible.end()) {
+            if (!current.done && (current.output.result.cancelled ||
+                std::find(eligible.begin(), eligible.end(), it->first) != eligible.end())) {
                 try {
                     if (!current.started) {
                         current.started = true;
                         current.generation = ops.generate(it->first, current);
                     }
-                    if (auto event = current.generation.next()) {
+                    auto step = current.generation.next();
+                    if (step.state == StepState::advanced)
                         result.advanced.push_back(it->first);
-                        if (auto *progress = std::get_if<PrefillProgress>(&*event))
+                    if (step.value) {
+                        if (auto* progress = std::get_if<PrefillProgress>(&*step.value))
                             current.output.metrics.mark_prefill(progress->timing);
-                        if (!std::holds_alternative<ExecutionYield>(*event))
-                            current.events.push_back(std::move(*event));
-                    } else
-                        current.complete();
-                } catch (...) {
-                    current.generation = {};
-                    current.complete(std::current_exception());
-                    // A cleanup failure is a backend failure even when the
-                    // original request was invalid.
-                    try {
-                        if (!current.batched) ops.reset();
-                    } catch (...) {
-                        current.failure = std::current_exception();
-                        healthy_ = false;
+                        result.events.push_back({it->first, std::move(*step.value)});
                     }
+                    if (!step) current.complete();
+                } catch (...) {
+                    current.complete(std::current_exception());
                 }
             }
-            for (auto &event : current.events)
-                result.events.push_back({it->first, std::move(event)});
-            current.events.clear();
             if (!current.done) {
                 ++it;
                 continue;
             }
             current.generation = {};
+            if (current.output.cleanup_failure) {
+                healthy_ = false;
+                current.failure = current.output.cleanup_failure;
+            }
             finish(it->first, current, result);
             it = requests_.erase(it);
         }
@@ -212,9 +215,10 @@ template <class Backend> class EngineInstance final : public Engine {
     }
     void shutdown() override {
         loaded_ = false;
-        requests_ = RequestExecutor{};
+        auto failure = requests_.clear();
         text_.reset();
         backend.unload();
+        if (failure) std::rethrow_exception(failure);
     }
 
   private:
