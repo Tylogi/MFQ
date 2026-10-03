@@ -52,11 +52,9 @@ struct CudaEngineState {
     }
     bool exclusive() const { return duplex_active; }
     bool mtp_available() const { return bool(components.mtp); }
-    void admit_batch(const RequestId& id, ExecutionRequest& request) {
-        graph.invalidate();
-        batching->admit(id, request);
+    void execute(const std::vector<RequestId>& eligible) {
+        if (batching) batching->step(eligible);
     }
-    void step_batch(const std::vector<RequestId>& eligible) { batching->step(eligible); }
     void reset() {
         language.reset(1);
         if (components.mtp) components.mtp->reset(1);
@@ -72,12 +70,15 @@ struct CudaEngineState {
         MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(), mfq_get_current_cuda_stream()));
         return {std::move(prepared), timer.elapsed_ms()};
     }
-    Generation generate_text(InferenceRequest& input, InferenceOutput& output, std::optional<Prepared> prepared) {
+    Generation generate_text(InferenceRequest& input, InferenceOutput& output, std::optional<Prepared> prepared,
+                             const RequestId& id, bool batched) {
         return internal::generate(language, graph, cache, config,
-                                  input, output, components.mtp.get(), std::move(prepared));
+                                  input, output, batched ? nullptr : components.mtp.get(), std::move(prepared),
+                                  batched ? batching.get() : nullptr, id);
     }
-    Generation generate(InferenceRequest& input, InferenceOutput& output) {
-        return generate_prepared(*this, input, output);
+    Generation generate(const RequestId& id, ExecutionRequest& request) {
+        if (request.batched) graph.invalidate();
+        return generate_prepared(*this, request.input, request.output, id, request.batched);
     }
     template <class T> ControlResult control(T value) {
         if constexpr (std::is_same_v<T, RuntimeMetrics>) {

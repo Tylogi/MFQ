@@ -36,11 +36,6 @@ struct ExecutionRequest {
     ExecutionRequest(InferenceRequest prepared, const MfqTokenizer *tokenizer, const RequestId &id)
         : input(std::move(prepared)), output(input, tokenizer, id) {}
 
-    void prefill(MfqPrefillTiming timing) {
-        output.metrics.mark_prefill(timing);
-        events.emplace_back(PrefillProgress{timing});
-    }
-    void append(std::int64_t token) { events.emplace_back(output.append({token})); }
     void complete(std::exception_ptr error = {}) {
         done = true;
         failure = error;
@@ -92,16 +87,7 @@ class RequestExecutor {
             std::move(input), raw ? nullptr : &text->tokenizer(), request.id);
         current->output.metrics.mtp.available = ops.mtp_available();
         current->batched = batched;
-        // Insert first so allocation failure cannot leave the backend holding
-        // a reference to an unowned request.
-        auto [it, inserted] = requests_.emplace(request.id, std::move(current));
-        try {
-            if (batched)
-                ops.admit_batch(it->first, *it->second);
-        } catch (...) {
-            requests_.erase(it);
-            throw;
-        }
+        requests_.emplace(request.id, std::move(current));
         return Admission::accepted;
     }
 
@@ -111,32 +97,28 @@ class RequestExecutor {
     }
 
     template <class Ops> EngineStepResult step(const std::vector<RequestId> &eligible, Ops &ops) {
-        const bool batched = std::any_of(requests_.begin(), requests_.end(), [](const auto &entry) {
-            return entry.second->batched;
-        });
-        if (batched) {
-            try {
-                ops.step_batch(eligible);
-            } catch (...) {
-                healthy_ = false;
-                throw;
-            }
+        try {
+            ops.execute(eligible);
+        } catch (...) {
+            healthy_ = false;
+            throw;
         }
         EngineStepResult result;
         for (auto it = requests_.begin(); it != requests_.end();) {
             auto &current = *it->second;
-            if (!current.batched &&
-                (current.output.result.cancelled ||
-                    std::find(eligible.begin(), eligible.end(), it->first) != eligible.end())) {
+            if (current.output.result.cancelled ||
+                std::find(eligible.begin(), eligible.end(), it->first) != eligible.end()) {
                 try {
                     if (!current.started) {
                         current.started = true;
-                        current.generation = ops.generate(current.input, current.output);
+                        current.generation = ops.generate(it->first, current);
                     }
                     if (auto event = current.generation.next()) {
+                        result.advanced.push_back(it->first);
                         if (auto *progress = std::get_if<PrefillProgress>(&*event))
                             current.output.metrics.mark_prefill(progress->timing);
-                        current.events.push_back(std::move(*event));
+                        if (!std::holds_alternative<ExecutionYield>(*event))
+                            current.events.push_back(std::move(*event));
                     } else
                         current.complete();
                 } catch (...) {
@@ -145,15 +127,13 @@ class RequestExecutor {
                     // A cleanup failure is a backend failure even when the
                     // original request was invalid.
                     try {
-                        ops.reset();
+                        if (!current.batched) ops.reset();
                     } catch (...) {
                         current.failure = std::current_exception();
                         healthy_ = false;
                     }
                 }
             }
-            if (!current.events.empty())
-                result.advanced.push_back(it->first);
             for (auto &event : current.events)
                 result.events.push_back({it->first, std::move(event)});
             current.events.clear();

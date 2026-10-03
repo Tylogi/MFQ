@@ -11,6 +11,16 @@ Python Server -> RuntimeClient -> stdio or private HTTP -> C++ Runtime
 The transport only speaks the private protocol; scheduling owns request
 lifecycle and dispatches work to the backend inference engine.
 
+Finite generation requests (text, prepared multimodal input, MTP and continuous
+batches) all enter `Scheduler::submit` and advance through `Engine::step` and
+one `RequestExecutor`. They share preparation, session transactions, output,
+cancellation and terminal cleanup. Batching groups pending numerical operations;
+each row uses the same prefill/decode sequence as single-request execution.
+Internal batching yields never enter transport outboxes. Requests requiring
+MTP, session reuse or multimodal preparation currently execute individually
+through this same lifecycle. Duplex migration is deferred and retains its
+existing control API.
+
 Select it with:
 
 ```bash

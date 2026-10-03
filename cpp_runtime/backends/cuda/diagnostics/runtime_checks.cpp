@@ -1,4 +1,6 @@
+#include "request_executor.h"
 #include "runtime_checks.h"
+#include <map>
 
 #include "cuda_runtime_config.h"
 #include "engine/generation.h"
@@ -141,70 +143,83 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
     const auto first_reference = serial(first_prompt), second_reference = serial(second_prompt);
     graph.invalidate(); // Physical batch slots replace the serial graph's storage.
     {
-        mfq::engine::ContinuousBatch<QwenBatchOperations> batcher(
-            64, config.continuous_batch.prefill_token_budget, model, *model.execution, config.continuous_batch);
-        InferenceRequest first, second;
-        first.prompt = first_prompt; first.sampling = sampling;
-        second.prompt = second_prompt; second.sampling = sampling;
-        ExecutionRequest first_request(first, nullptr, "first"), second_request(second, nullptr, "second");
-        batcher.admit("first", first_request); batcher.admit("second", second_request);
-        std::vector<int64_t> a, b;
-        int paused_ticks = 0;
-        while (!first_request.done || !second_request.done) {
-            const bool pause = !a.empty() && paused_ticks < 4 && !second_request.done;
-            const auto prior = a.size();
-            batcher.step(pause ? std::vector<std::string>{"second"} : std::vector<std::string>{"first", "second"});
-            const auto drain = [](ExecutionRequest& request, std::vector<int64_t>& tokens) {
-                if (request.failure) std::rethrow_exception(request.failure);
-                for (auto& event : request.events)
-                    if (auto* delta = std::get_if<OutputDelta>(&event))
-                    tokens.insert(tokens.end(), delta->token_ids.begin(), delta->token_ids.end());
-                request.events.clear();
-            };
-            drain(first_request, a);
-            drain(second_request, b);
-            if (pause) { ++paused_ticks; MFQ_RUNTIME_CHECK(a.size() == prior, "paused row advanced"); }
-        }
-        if (a != first_reference || b != second_reference) {
-            for (const auto& [name, values] : std::vector<std::pair<const char*, std::vector<int64_t>>>{
-                    {"first_serial", first_reference}, {"first_batch", a},
-                    {"second_serial", second_reference}, {"second_batch", b}}) {
-                std::cerr << name << ':';
-                for (auto token : values) std::cerr << ' ' << token;
-                std::cerr << '\n';
+        struct Execution {
+            Qwen35CausalLm& model;
+            DecodeGraphCache& graph;
+            TextSessionCache& cache;
+            const CudaRuntimeConfig& config;
+            ContinuousBatch<QwenBatchOperations> batcher;
+            Execution(Qwen35CausalLm& model, DecodeGraphCache& graph, TextSessionCache& cache,
+                      const CudaRuntimeConfig& config)
+                : model(model), graph(graph), cache(cache), config(config),
+                  batcher(64, config.continuous_batch.prefill_token_budget,
+                          model, *model.execution, config.continuous_batch) {}
+            bool can_batch(const EngineRequest&) const { return true; }
+            bool exclusive() const { return false; }
+            bool mtp_available() const { return false; }
+            void execute(const std::vector<RequestId>& eligible) { batcher.step(eligible); }
+            void reset() {}
+            Generation generate(const RequestId& id, ExecutionRequest& request) {
+                return internal::generate(model, graph, cache, config, request.input,
+                                          request.output, nullptr, {}, &batcher, id);
             }
+        } execution(model, graph, cache, config);
+        auto& batcher = execution.batcher;
+        RequestExecutor executor(4);
+        EngineInfo info;
+        info.max_requests = 4;
+        info.vocab_size = model.vocab_size();
+        info.max_context = model.max_position_embeddings();
+        std::map<std::string, std::vector<int64_t>> tokens;
+        std::map<std::string, int> terminals, cancellations, prefills;
+        const auto admit = [&](const std::string& id, const std::vector<int64_t>& prompt) {
+            EngineRequest request;
+            request.id = id; request.token_ids = prompt; request.input.sampling = sampling;
+            MFQ_RUNTIME_CHECK(executor.admit(std::move(request), nullptr, info, execution) == Admission::accepted,
+                              "diagnostic request was not admitted");
+        };
+        const auto tick = [&](std::vector<RequestId> eligible) {
+            auto result = executor.step(eligible, execution);
+            for (const auto& event : result.events) {
+                if (const auto* error = std::get_if<Failed>(&event.data)) throw std::runtime_error(error->message);
+                if (const auto* delta = std::get_if<OutputDelta>(&event.data))
+                    tokens[event.id].insert(tokens[event.id].end(), delta->token_ids.begin(), delta->token_ids.end());
+                prefills[event.id] += std::holds_alternative<PrefillProgress>(event.data);
+                cancellations[event.id] += std::holds_alternative<Cancelled>(event.data);
+                terminals[event.id] += terminal(event.data);
+                MFQ_RUNTIME_CHECK(!std::holds_alternative<ExecutionYield>(event.data), "internal yield escaped Engine");
+            }
+        };
+        admit("first", first_prompt); admit("second", second_prompt);
+        int paused_ticks = 0;
+        for (int ticks = 0; ticks < 500 && !executor.empty(); ++ticks) {
+            const bool pause = !tokens["first"].empty() && paused_ticks < 4 && !terminals["second"];
+            const auto prior = tokens["first"].size();
+            tick(pause ? std::vector<std::string>{"second"} : std::vector<std::string>{"first", "second"});
+            if (pause) { ++paused_ticks; MFQ_RUNTIME_CHECK(tokens["first"].size() == prior, "paused row advanced"); }
         }
-        MFQ_RUNTIME_CHECK(a == first_reference && b == second_reference && paused_ticks == 4,
+        MFQ_RUNTIME_CHECK(executor.empty() && tokens["first"] == first_reference &&
+            tokens["second"] == second_reference && paused_ticks == 4 &&
+            terminals["first"] == 1 && terminals["second"] == 1,
             "batched or resumed output differs from serial oracle");
-        ExecutionRequest cancelled(second, nullptr, "cancel");
-        batcher.admit("cancel", cancelled);
-        while (!cancelled.output.result.completion_tokens) batcher.step({"cancel"});
-        cancelled.events.clear();
-        cancelled.output.result.cancelled = true;
-        batcher.step({});
-        MFQ_RUNTIME_CHECK(cancelled.done && !cancelled.failure && cancelled.events.empty(),
-                          "cancelled physical request did not release before completion");
-        batcher.step({});
-        MFQ_RUNTIME_CHECK(cancelled.events.empty(), "released request published more output");
+        admit("cancel", second_prompt);
+        for (int ticks = 0; ticks < 100 && tokens["cancel"].empty(); ++ticks) tick({"cancel"});
+        MFQ_RUNTIME_CHECK(!tokens["cancel"].empty(), "cancel test never decoded");
+        const auto before_cancel = tokens["cancel"].size();
+        executor.cancel("cancel"); tick({}); tick({});
+        MFQ_RUNTIME_CHECK(executor.empty() && cancellations["cancel"] == 1 && terminals["cancel"] == 1 &&
+            tokens["cancel"].size() == before_cancel, "cancelled request published more output");
         // Cancel a partially prefetched request while another row owns a slot.
-        ExecutionRequest survivor(second, nullptr, "survivor"), partial(first, nullptr, "partial");
-        batcher.admit("survivor", survivor);
-        batcher.step({"survivor"});
-        batcher.admit("partial", partial);
-        batcher.step({"partial"});
-        MFQ_RUNTIME_CHECK(!partial.done && partial.output.result.completion_tokens == 0 &&
-            !partial.events.empty(), "partial prefill did not yield");
-        partial.events.clear();
-        partial.output.result.cancelled = true;
-        for (int ticks = 0; ticks < 100 && (!partial.done || !survivor.done); ++ticks)
-            batcher.step({"survivor"});
-        MFQ_RUNTIME_CHECK(partial.done && !partial.failure && partial.events.empty() &&
-            survivor.done && !survivor.failure, "prefill cancellation corrupted a live slot");
-        std::vector<int64_t> resumed;
-        for (const auto& event : survivor.events)
-            if (const auto* delta = std::get_if<OutputDelta>(&event))
-                resumed.insert(resumed.end(), delta->token_ids.begin(), delta->token_ids.end());
-        MFQ_RUNTIME_CHECK(resumed == second_reference, "survivor differs after prefill cancellation");
+        admit("survivor", second_prompt);
+        for (int ticks = 0; ticks < 100 && tokens["survivor"].empty(); ++ticks) tick({"survivor"});
+        admit("partial", first_prompt);
+        for (int ticks = 0; ticks < 100 && !prefills["partial"]; ++ticks) tick({"partial"});
+        MFQ_RUNTIME_CHECK(prefills["partial"] == 1 && tokens["partial"].empty(), "partial prefill did not yield");
+        executor.cancel("partial");
+        for (int ticks = 0; ticks < 500 && !executor.empty(); ++ticks) tick({"survivor"});
+        MFQ_RUNTIME_CHECK(executor.empty() && cancellations["partial"] == 1 && terminals["partial"] == 1 &&
+            tokens["partial"].empty() && terminals["survivor"] == 1 && tokens["survivor"] == second_reference,
+            "prefill cancellation corrupted a live slot");
         double captures = 0, replays = 0;
         for (const auto& [key, value] : batcher.metrics()) {
             if (key == "paged_kv_live_pages") MFQ_RUNTIME_CHECK(value == 0, "paged KV leaked");

@@ -5,6 +5,7 @@
 
 #include <coroutine>
 #include <exception>
+#include <functional>
 #include <utility>
 
 namespace mfq::engine {
@@ -60,9 +61,10 @@ class Generation {
 
 // Ops performs one device prefill/decode operation. Chunking, cancellation,
 // token acceptance and publication order are independent of tensor storage.
-template <class Ops>
-Generation generate_sequence(Ops &ops, InferenceOutput &output, std::int64_t prompt_tokens,
+template <class Operations>
+Generation generate_sequence(Operations operations, InferenceOutput &output, std::int64_t prompt_tokens,
     std::int64_t reused_tokens, std::int64_t stable_prefix_tokens, std::int64_t chunk_size) {
+    std::unwrap_reference_t<Operations>& ops = operations;
     double elapsed = 0.0;
     auto offset = reused_tokens;
     while (offset < prompt_tokens && !output.stopped()) {
@@ -70,6 +72,11 @@ Generation generate_sequence(Ops &ops, InferenceOutput &output, std::int64_t pro
                              ? std::min(prompt_tokens, stable_prefix_tokens)
                              : prompt_tokens;
         const auto chunk = next_prefill_chunk(end, offset, chunk_size);
+        if constexpr (requires { ops.schedule_prefill(chunk); }) {
+            ops.schedule_prefill(chunk);
+            do { co_yield ExecutionYield{}; } while (!ops.ready() && !output.stopped());
+            if (output.stopped()) co_return;
+        }
         elapsed += ops.prefill(chunk);
         offset += chunk.count;
         co_yield PrefillProgress{
@@ -82,8 +89,14 @@ Generation generate_sequence(Ops &ops, InferenceOutput &output, std::int64_t pro
         auto delta = output.append(std::vector<std::int64_t>{token});
         ops.accept(token);
         co_yield std::move(delta);
-        if (!output.stopped())
+        if (!output.stopped()) {
+            if constexpr (requires { ops.schedule_decode(); }) {
+                ops.schedule_decode();
+                do { co_yield ExecutionYield{}; } while (!ops.ready() && !output.stopped());
+                if (output.stopped()) co_return;
+            }
             token = ops.advance();
+        }
     }
 }
 

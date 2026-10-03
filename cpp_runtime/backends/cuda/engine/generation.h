@@ -1,6 +1,7 @@
 #pragma once
 
 #include "generation_step.h"
+#include "cuda_batching.h"
 #include "cuda_execution.h"
 #include "core/decode_graph.h"
 #include "core/mtp.h"
@@ -17,7 +18,9 @@ mfq::engine::Generation generate(
     Model& model, DecodeGraphCache& graph, TextSessionCache& cache,
     const CudaRuntimeConfig& config, mfq::engine::InferenceRequest& request,
     mfq::engine::InferenceOutput& output, MtpModule* mtp = nullptr,
-    std::optional<CudaPreparedPrompt> prepared = {});
+    std::optional<CudaPreparedPrompt> prepared = {},
+    mfq::engine::ContinuousBatch<QwenBatchOperations>* batching = nullptr,
+    std::string request_id = {});
 } // namespace mfq::cuda::internal
 
 template <typename Model>

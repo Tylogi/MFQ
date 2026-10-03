@@ -15,22 +15,7 @@ struct TestOps {
     bool can_batch(const EngineRequest &) const { return batch; }
     bool exclusive() const { return false; }
     bool mtp_available() const { return false; }
-    void admit_batch(const RequestId &id, ExecutionRequest &request) {
-        batched.emplace(id, &request);
-    }
-    void step_batch(const std::vector<RequestId> &eligible) {
-        for (auto it = batched.begin(); it != batched.end();) {
-            auto &request = *it->second;
-            if (!request.output.stopped() &&
-                std::find(eligible.begin(), eligible.end(), it->first) != eligible.end())
-                request.append(10);
-            if (request.output.stopped()) {
-                request.complete();
-                it = batched.erase(it);
-            } else
-                ++it;
-        }
-    }
+    void execute(const std::vector<RequestId>&) {}
     void reset() {
         ++resets;
         if (reset_fails)
@@ -43,18 +28,24 @@ struct TestOps {
     std::int64_t first_token() { return 10; }
     std::int64_t advance() { return 10 + ++advances; }
     void accept(std::int64_t) { ++accepted; }
-    Generation generate(InferenceRequest &input, InferenceOutput &output) {
+    Generation generate(const RequestId& id, ExecutionRequest& request) {
+        auto& input = request.input;
+        auto& output = request.output;
         struct Storage {
-            int &live;
-            explicit Storage(int &live) : live(live) { ++live; }
-            ~Storage() { --live; }
-        } storage(live);
+            TestOps& ops;
+            RequestId id;
+            Storage(TestOps& ops, const RequestId& id, ExecutionRequest& request) : ops(ops), id(id) {
+                ++ops.live;
+                if (ops.batch) ops.batched.emplace(id, &request);
+            }
+            ~Storage() { --ops.live; ops.batched.erase(id); }
+        } storage(*this, id, request);
         if (failure == 1)
             throw InferenceInputError(InferenceInputErrorCode::Invalid, "invalid media");
         if (failure == 2)
             throw std::runtime_error("device failed");
         auto sequence = generate_sequence(
-            *this, output, input.prompt.size(), 0, input.cache_plan.stable_prefix_tokens, 2);
+            std::ref(*this), output, input.prompt.size(), 0, input.cache_plan.stable_prefix_tokens, 2);
         while (auto event = sequence.next())
             co_yield std::move(*event);
     }
@@ -231,7 +222,7 @@ int main() {
         input.prompt.resize(7, 1);
         input.sampling.max_tokens = 3;
         InferenceOutput output(input, nullptr, "chunks");
-        auto sequence = generate_sequence(ops, output, 7, 1, 4, 2);
+        auto sequence = generate_sequence(std::ref(ops), output, 7, 1, 4, 2);
         std::vector<std::int64_t> tokens;
         std::size_t prefilled = 0;
         while (auto event = sequence.next()) {
@@ -303,7 +294,7 @@ int main() {
         auto cancelled = executor.step({}, ops);
         assert(std::holds_alternative<Cancelled>(terminal_event(cancelled)));
         assert(cancelled.events.back().id == "a" && executor.status().available == 1);
-        assert(ops.batched.at("b")->output.result.completion_tokens == 0);
+        assert(ops.advances == 0 && ops.live == 0);
         executor.cancel("b");
         executor.step({}, ops);
     }

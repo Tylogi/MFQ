@@ -1,33 +1,24 @@
 #pragma once
-#include "generation_policy.h"
-#include "request_executor.h"
-#include <algorithm>
+#include "generation_step.h"
 #include <deque>
 #include <memory>
 #include <unordered_map>
 
 namespace mfq::engine {
 
+// Physical row metadata only. Request lifecycle and output belong to the executor.
 struct BatchRequest {
-    BatchRequest(std::string id, mfq::engine::ExecutionRequest &execution)
-        : id(std::move(id)), prompt(execution.input.prompt), sampling(execution.input.sampling),
-          token_constraint(execution.input.token_constraint), output(execution.output),
-          execution(execution) {}
+    BatchRequest(std::string id, const InferenceRequest& input)
+        : id(std::move(id)), prompt(input.prompt), sampling(input.sampling),
+          token_constraint(input.token_constraint), generation_limit(input.sampling.max_tokens) {}
     std::string id;
     std::vector<int64_t> prompt;
     MfqSamplingParams sampling;
     MfqTokenConstraintPtr token_constraint;
-    mfq::engine::InferenceOutput &output;
-    mfq::engine::ExecutionRequest &execution;
     int32_t generation_limit = 0, produced = 0;
     int64_t pending_token = 0;
     bool eligible = false;
-    bool stopped() const { return output.stopped(); }
-    void publish_prefill(MfqPrefillTiming timing) { execution.prefill(timing); }
-    void publish_token(int64_t token) { execution.append(token); }
-    void complete(std::exception_ptr failure = {}) { execution.complete(failure); }
-    int64_t prefill_offset = 0;
-    int64_t cache_length = 0;
+    int64_t prefill_offset = 0, cache_length = 0;
 };
 
 template <class Request> struct BatchState {
@@ -35,178 +26,156 @@ template <class Request> struct BatchState {
     std::vector<std::shared_ptr<Request>> active;
 };
 
-// The engine chooses work and accepts tokens; Ops owns device state and kernels.
+// Groups pending numerical operations. All rows run generate_sequence(), also
+// used by B=1 execution; this component never accepts tokens or publishes events.
 template <class Ops> class ContinuousBatch {
     using Request = typename Ops::Request;
+    using Sample = typename Ops::Sample;
     using State = BatchState<Request>;
+    struct Work {
+        std::shared_ptr<Request> request;
+        std::optional<PrefillChunk> prefill;
+        std::optional<Sample> result;
+        std::exception_ptr failure;
+        bool decode = false, active = false;
+    };
     int64_t prefill_chunk_size;
     Ops operations;
     State state;
-    std::unordered_map<std::string, std::shared_ptr<Request>> requests;
+    std::unordered_map<std::string, std::shared_ptr<Work>> requests;
     bool decode_next = true;
     int64_t admissions = 0, prefill_chunks = 0, prefill_yields = 0;
 
-    static int64_t cache_position(const std::vector<std::shared_ptr<Request>> &active) {
+    int64_t cache_position() const {
         int64_t position = 0;
-        for (const auto &request : active)
+        for (const auto& request : state.active)
             position = std::max(position, request->cache_length);
         return position;
     }
-
-    void retire_cancelled() {
-        std::vector<std::shared_ptr<Request>> survivors, retired;
-        for (const auto &request : state.active)
-            (request->stopped() ? retired : survivors).push_back(request);
-        if (retired.empty())
-            return;
-        operations.retire(retired, cache_position(survivors));
-        state.active = std::move(survivors);
-        for (const auto &request : retired)
-            request->complete();
-    }
-
-    void prefill() {
-        auto remaining = state.prefilling.size();
-        while (remaining--) {
-            auto request = state.prefilling.front();
-            state.prefilling.pop_front();
-            if (!request->eligible && !request->stopped()) {
-                state.prefilling.push_back(request);
-                continue;
-            }
+    void release(Work& work) {
+        if (!requests.contains(work.request->id)) return;
+        if (work.active) {
+            std::erase(state.active, work.request);
+            operations.retire({work.request}, cache_position());
+        } else if (!work.failure) {
             operations.suspend_decode();
-            if (!request->stopped()) {
-                const auto chunk = next_prefill_chunk(request->prompt.size(),
-                                                      request->prefill_offset, prefill_chunk_size);
-                auto sample = operations.prefill(request, chunk);
-                request->prefill_offset = chunk.offset + chunk.count;
-                ++prefill_chunks;
-                if (!request->stopped() &&
-                    request->prefill_offset < static_cast<int64_t>(request->prompt.size())) {
-                    state.prefilling.push_back(request);
-                    ++prefill_yields;
-                    request->publish_prefill(
-                        {static_cast<size_t>(request->prefill_offset), 0.0, 0.0, 0.0});
-                    operations.resume_decode(cache_position(state.active));
-                    return;
-                }
-                if (!request->stopped()) {
-                    request->publish_prefill(sample.timing);
-                    request->cache_length = request->prompt.size();
-                    request->pending_token = sample.token;
-                    request->produced = 1;
-                    request->publish_token(sample.token);
-                    if (!request->stopped() && request->produced < request->generation_limit) {
-                        operations.activate(request, sample);
-                        state.active.push_back(request);
-                        ++admissions;
-                        operations.resume_decode(cache_position(state.active));
-                        return;
-                    }
-                }
-            }
-            operations.discard_prefill(request);
-            request->complete();
-            operations.resume_decode(cache_position(state.active));
-            return;
+            operations.discard_prefill(work.request);
+            operations.resume_decode(cache_position());
         }
+        requests.erase(work.request->id);
     }
-
-    void decode() {
-        auto decoded = operations.decode(state);
-        std::vector<std::shared_ptr<Request>> survivors, retired;
-        std::vector<std::exception_ptr> failures;
-        for (const auto &request : state.active) {
-            if (!request->eligible) {
-                survivors.push_back(request);
-                continue;
-            }
-            ++request->cache_length;
-            std::exception_ptr error;
-            try {
-                if (!request->stopped()) {
-                    auto sample = operations.sample(request, decoded);
-                    request->pending_token = sample.token;
-                    ++request->produced;
-                    request->publish_token(sample.token);
-                    if (!request->stopped() && request->produced < request->generation_limit) {
-                        operations.accept(request, sample);
-                        survivors.push_back(request);
-                        continue;
-                    }
-                }
-            } catch (...) {
-                error = std::current_exception();
-            }
-            retired.push_back(request);
-            failures.push_back(error);
+    struct SequenceOps {
+        ContinuousBatch& batch;
+        Work& work;
+        void schedule_prefill(PrefillChunk chunk) { work.result.reset(); work.prefill = chunk; }
+        void schedule_decode() { work.result.reset(); work.decode = true; }
+        bool ready() const { return work.result.has_value() || work.failure; }
+        const Sample& sample() const {
+            if (work.failure) std::rethrow_exception(work.failure);
+            return work.result.value();
         }
-        operations.retire(retired, cache_position(survivors));
-        state.active = std::move(survivors);
-        for (size_t i = 0; i < retired.size(); ++i)
-            retired[i]->complete(failures[i]);
-    }
+        double prefill(PrefillChunk) { return sample().timing.llm_ms; }
+        int64_t first_token() { return sample().token; }
+        int64_t advance() { return sample().token; }
+        void accept(int64_t token) {
+            auto& request = *work.request;
+            // activate() initializes counts for the first sample.
+            if (request.produced) batch.operations.accept(work.request, sample());
+            request.pending_token = token;
+            ++request.produced;
+        }
+    };
 
   public:
     template <class... Args>
-    explicit ContinuousBatch(int64_t chunk_size, int64_t token_budget, Args &&...args)
+    explicit ContinuousBatch(int64_t chunk_size, int64_t token_budget, Args&&... args)
         : prefill_chunk_size(std::min(chunk_size, token_budget)),
           operations(std::forward<Args>(args)...) {
         if (prefill_chunk_size <= 0)
             throw std::invalid_argument("continuous batching requires a positive prefill chunk");
     }
 
-    void admit(std::string id, ExecutionRequest &execution) {
-        const auto &input = execution.input;
-        const auto plan = plan_generation(input.prompt, operations.vocab_size(),
-                                          operations.max_context(), input.sampling.max_tokens);
-        auto request = std::make_shared<Request>(std::move(id), execution);
-        request->generation_limit = plan.generation_tokens;
-        auto [it, inserted] = requests.emplace(request->id, request);
-        if (!inserted)
+    Generation generate(std::string id, InferenceRequest& input, InferenceOutput& output) {
+        if (output.stopped()) co_return;
+        auto work = std::make_shared<Work>();
+        work->request = std::make_shared<Request>(std::move(id), input);
+        if (!requests.emplace(work->request->id, work).second)
             throw std::invalid_argument("duplicate batch request id");
+        struct Cleanup {
+            ContinuousBatch& batch;
+            Work& work;
+            ~Cleanup() { try { batch.release(work); } catch (...) {} }
+        } cleanup{*this, *work};
+        SequenceOps ops{*this, *work};
+        std::exception_ptr failure;
         try {
-            state.prefilling.push_back(std::move(request));
-        } catch (...) {
-            requests.erase(it);
-            throw;
-        }
+            auto sequence = generate_sequence(ops, output, input.prompt.size(), 0, 0, prefill_chunk_size);
+            while (auto event = sequence.next()) co_yield std::move(*event);
+        } catch (...) { failure = std::current_exception(); }
+        release(*work);
+        if (failure) std::rethrow_exception(failure);
     }
 
-    void step(const std::vector<std::string> &eligible) {
-        for (auto &[id, request] : requests)
-            request->eligible = std::find(eligible.begin(), eligible.end(), id) != eligible.end();
+    void step(const std::vector<std::string>& eligible) {
+        for (const auto& request : state.active) {
+            const auto& work = *requests.at(request->id);
+            request->eligible = work.decode &&
+                std::find(eligible.begin(), eligible.end(), request->id) != eligible.end();
+        }
+        auto prefill = requests.end();
+        for (const auto& id : eligible) {
+            auto it = requests.find(id);
+            if (it != requests.end() && it->second->prefill) { prefill = it; break; }
+        }
+        const bool has_decode = std::any_of(state.active.begin(), state.active.end(),
+            [](const auto& request) { return request->eligible; });
         try {
-            retire_cancelled();
-            const bool has_decode =
-                std::any_of(state.active.begin(), state.active.end(),
-                            [](const auto &request) { return request->eligible; });
-            const bool has_prefill = std::any_of(
-                state.prefilling.begin(), state.prefilling.end(),
-                [](const auto &request) { return request->eligible || request->stopped(); });
-            if (has_decode && (!has_prefill || decode_next))
-                decode();
-            else if (has_prefill)
-                prefill();
+            if (has_decode && (prefill == requests.end() || decode_next)) {
+                auto decoded = operations.decode(state);
+                for (const auto& request : state.active) if (request->eligible) {
+                    auto& work = *requests.at(request->id);
+                    work.result = operations.sample(request, decoded);
+                    ++request->cache_length;
+                    work.decode = false;
+                }
+            } else if (prefill != requests.end()) {
+                auto& work = *prefill->second;
+                auto& request = work.request;
+                const auto chunk = *work.prefill;
+                operations.suspend_decode();
+                auto sample = operations.prefill(request, chunk);
+                request->prefill_offset = chunk.offset + chunk.count;
+                ++prefill_chunks;
+                if (request->prefill_offset == static_cast<int64_t>(request->prompt.size())) {
+                    request->cache_length = request->prompt.size();
+                    operations.activate(request, sample);
+                    state.active.push_back(request);
+                    work.active = true;
+                    ++admissions;
+                } else ++prefill_yields;
+                operations.resume_decode(cache_position());
+                work.result = std::move(sample);
+                work.prefill.reset();
+            }
             decode_next = !decode_next;
         } catch (...) {
             const auto error = std::current_exception();
-            // Include a request removed from the prefill queue before a device failure.
             State failed;
-            for (const auto &[id, request] : requests) {
-                request->complete(error);
-                failed.prefilling.push_back(request);
+            for (const auto& [id, work] : requests) {
+                work->failure = error;
+                work->prefill.reset();
+                work->decode = work->active = false;
+                failed.prefilling.push_back(work->request);
             }
             operations.recover(failed);
             state = {};
         }
-        std::erase_if(requests, [](const auto &entry) { return entry.second->execution.done; });
     }
 
-    std::vector<std::pair<std::string, double>> metrics() const {
+    Metrics metrics() const {
         auto result = operations.metrics();
         result.emplace_back("continuous_batching_active", state.active.size());
-        result.emplace_back("continuous_batching_prefilling", state.prefilling.size());
+        result.emplace_back("continuous_batching_prefilling", requests.size() - state.active.size());
         result.emplace_back("continuous_batching_requests", admissions);
         result.emplace_back("continuous_batching_admissions", admissions);
         result.emplace_back("continuous_batching_prefill_chunks", prefill_chunks);

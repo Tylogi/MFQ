@@ -83,11 +83,11 @@ def test_cuda_server_prefill_is_bounded_for_serial_mtp_and_batched_paths():
     assert "std::min(chunk_size, token_budget)" in SHARED_ENGINE
     assert "std::optional<QwenBatchState> prefill_" in BATCH_STATE
     assert "operations.prefill(request, chunk)" in BATCHING
-    assert "void prefill(" in BATCHING
+    assert "schedule_prefill(PrefillChunk chunk)" in BATCHING
     assert "request->prefill_offset = chunk.offset + chunk.count" in SHARED_ENGINE
     assert "request->prefill_offset =" not in (CUDA_ROOT / "engine/cuda_batching.cpp").read_text()
     assert "next_prefill_chunk(" in BATCHING
-    assert "state.prefilling" in BATCHING
+    assert "work.prefill" in BATCHING
     assert "continuous_batching_prefill_chunks" in BATCHING
     assert "continuous_batching_prefill_yields" in BATCHING
 
@@ -114,12 +114,16 @@ def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
     assert "request->sampler" in BATCHING
     assert "request->token_constraint" in BATCHING
     assert "state.active" in BATCHING
-    assert "execution.append(token)" in BATCHING
+    assert "generate_sequence(ops, output" in SHARED_ENGINE
+    assert "execution.append(token)" not in BATCHING
     assert "output.finish(" not in BATCHING
     assert "request->eligible" in BATCHING
     assert "capture_recurrent_slots" in BATCHING
     assert "restore_recurrent_slots" in BATCHING
-    assert "retire_cancelled" in BATCHING
+    assert "retire_cancelled" not in BATCHING
+    assert "ops.generate(it->first, current)" in SHARED_ENGINE
+    assert "step_batch(" not in SHARED_ENGINE
+    assert "admit_batch(" not in SHARED_ENGINE
     assert "MFQ_CONTINUOUS_BATCH_GREEDY" in RUNTIME_OPTIONS
     assert "std::getenv(" not in BATCHING
     assert "config_.greedy" in BATCHING
@@ -170,10 +174,10 @@ def test_generic_qwen_loader_constructs_moe_ffns():
 
 
 def test_step_alternates_bounded_prefill_and_decode():
-    assert "has_decode && (!has_prefill || decode_next)" in BATCHING
+    assert "has_decode && (prefill == requests.end() || decode_next)" in BATCHING
     assert "decode_next = !decode_next" in BATCHING
     assert "operations.prefill(request, chunk)" in BATCHING
-    assert "retire_cancelled();" in BATCHING
+    assert "release(*work);" in BATCHING
 
 
 def test_qwen_decode_accepts_independent_batch_positions():
@@ -193,8 +197,10 @@ def test_qwen_decode_accepts_independent_batch_positions():
 def test_real_weight_gate_exercises_join_and_compaction():
     assert "run_qwen_continuous_batching_check" in BATCHING_CHECK
     assert "paused row advanced" in BATCHING_CHECK
-    assert "a == first_reference && b == second_reference" in BATCHING_CHECK
-    assert "cancelled.done && !cancelled.failure && cancelled.events.empty()" in BATCHING_CHECK
+    assert 'tokens["first"] == first_reference' in BATCHING_CHECK
+    assert 'tokens["second"] == second_reference' in BATCHING_CHECK
+    assert 'cancellations["cancel"] == 1 && terminals["cancel"] == 1' in BATCHING_CHECK
+    assert 'tokens["cancel"].size() == before_cancel' in BATCHING_CHECK
     assert '"paged_kv_live_pages"' in BATCHING_CHECK
     assert "std::vector<int64_t> first_prompt(193)" in BATCHING_CHECK
     assert "session restore differs from serial oracle" in BATCHING_CHECK

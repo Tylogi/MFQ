@@ -16,7 +16,8 @@ inline bool batch_compatible(const EngineRequest &request, bool persistent_prefi
 }
 
 template <class Ops>
-Generation generate_prepared(Ops &ops, InferenceRequest &input, InferenceOutput &output) {
+Generation generate_prepared(Ops &ops, InferenceRequest &input, InferenceOutput &output,
+                             const RequestId& id, bool batched) {
     std::optional<typename Ops::Prepared> prepared;
     if (input.vision && !output.result.cancelled) {
         auto [prompt, elapsed] = ops.prepare(input);
@@ -24,7 +25,7 @@ Generation generate_prepared(Ops &ops, InferenceRequest &input, InferenceOutput 
         output.metrics.multimodal_ms = elapsed;
         co_yield PrefillProgress{{0, 0.0, elapsed, elapsed}};
     }
-    auto sequence = ops.generate_text(input, output, std::move(prepared));
+    auto sequence = ops.generate_text(input, output, std::move(prepared), id, batched);
     while (auto event = sequence.next()) {
         if (auto *progress = std::get_if<PrefillProgress>(&*event)) {
             progress->timing.multimodal_ms = output.metrics.multimodal_ms;
@@ -65,7 +66,7 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
         co_return;
     const std::string input_key = prepared ? prepared->cache_key : std::string{};
     const bool caching =
-        model.supports_text_session_state() &&
+        !ops.batched() && model.supports_text_session_state() &&
         (!prepared || !prepared->transformed() || !input_key.empty()) &&
         plan.stable_prefix_tokens > 0 &&
         (!cache_plan.session_id.empty() || session_cache.persistent_prefix_enabled());
@@ -84,11 +85,7 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
             input_key);
     if (restored.tokens || use_mtp)
         ops.invalidate_plan();
-    if (!restored.tokens) {
-        model.reset(1);
-        if (mtp)
-            mtp->reset(1);
-    }
+    if (!restored.tokens) ops.reset();
     struct ResetOnFailure {
         Ops &ops;
         bool success = false;
@@ -125,31 +122,18 @@ Generation generate_request(Ops ops, InferenceRequest &request, InferenceOutput 
             std::cerr << "runtime_session_cache action=skip error=" << error.what() << '\n';
         }
     };
-    if (use_mtp) {
-        auto generation = ops.speculate(
-            request, output, restored.tokens, restored.mtp_last_target_hidden, &last_target_hidden);
-        while (auto event = generation.next()) {
-            if (auto *delta = std::get_if<OutputDelta>(&*event))
-                history.insert(history.end(), delta->token_ids.begin(), delta->token_ids.end());
-            co_yield std::move(*event);
-        }
-    } else {
-        auto plain = ops.plain(request);
-        auto sequence = generate_sequence(plain,
-            output,
-            prompt.size(),
-            restored.tokens,
-            caching ? plan.stable_prefix_tokens : 0,
-            config.generation.prefill_chunk_size);
-        while (auto event = sequence.next()) {
-            if (auto *progress = std::get_if<PrefillProgress>(&*event);
-                progress && caching &&
-                progress->timing.prompt_tokens + restored.tokens == plan.stable_prefix_tokens)
-                snapshot();
-            if (auto *delta = std::get_if<OutputDelta>(&*event))
-                history.insert(history.end(), delta->token_ids.begin(), delta->token_ids.end());
-            co_yield std::move(*event);
-        }
+    auto sequence = use_mtp
+        ? ops.speculate(request, output, restored.tokens, restored.mtp_last_target_hidden,
+                        &last_target_hidden)
+        : ops.plain(request, output, restored.tokens, caching ? plan.stable_prefix_tokens : 0);
+    while (auto event = sequence.next()) {
+        if (auto *progress = std::get_if<PrefillProgress>(&*event);
+            progress && !use_mtp && caching &&
+            progress->timing.prompt_tokens + restored.tokens == plan.stable_prefix_tokens)
+            snapshot();
+        if (auto *delta = std::get_if<OutputDelta>(&*event))
+            history.insert(history.end(), delta->token_ids.begin(), delta->token_ids.end());
+        co_yield std::move(*event);
     }
     snapshot();
     ops.reset();

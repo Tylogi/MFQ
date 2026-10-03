@@ -1,4 +1,5 @@
 #include "continuous_batch.h"
+#include "request_executor.h"
 #include "generation_policy.h"
 #include "models/common/attention.h"
 #include "models/common/causal_forward.h"
@@ -20,6 +21,7 @@
 #include <array>
 #include <cassert>
 #include <numeric>
+#include <map>
 
 using namespace mfq::engine;
 
@@ -54,98 +56,102 @@ struct BatchOps {
     Metrics metrics() const { return {}; }
 };
 
+template <class Physical> struct BatchExecution {
+    ContinuousBatch<Physical> batch;
+    template <class... Args> explicit BatchExecution(Args&&... args)
+        : batch(8, 2, std::forward<Args>(args)...) {}
+    bool can_batch(const EngineRequest&) const { return true; }
+    bool exclusive() const { return false; }
+    bool mtp_available() const { return false; }
+    void execute(const std::vector<RequestId>& eligible) { batch.step(eligible); }
+    void reset() {}
+    Generation generate(const RequestId& id, ExecutionRequest& request) {
+        return batch.generate(id, request.input, request.output);
+    }
+};
+
+static EngineRequest batch_request(std::string id, int prompt = 5, int tokens = 3) {
+    EngineRequest result;
+    result.id = std::move(id);
+    result.token_ids.assign(prompt, 1);
+    result.input.sampling.max_tokens = tokens;
+    return result;
+}
+static EngineInfo batch_info() { return {2, 100, 100}; }
+
 void batch_test() {
-    InferenceRequest input;
-    input.prompt = {1, 2, 3, 4, 5};
-    input.sampling.max_tokens = 3;
-    ExecutionRequest a(input, nullptr, "a"), b(input, nullptr, "b");
-    ContinuousBatch<BatchOps> batch(8, 2);
-    batch.admit("a", a);
-    batch.admit("b", b);
-    for (int i = 0; i < 3; ++i)
-        batch.step({"a"});
-    assert(!a.done && !b.done && b.events.empty());
-    assert(a.output.result.completion_tokens == 1);
-    batch.step({"a", "b"});
-    batch.step({"a", "b"});
-    assert(a.output.result.completion_tokens == 2);
-    const auto paused = a.output.result.completion_tokens;
-    for (int i = 0; i < 2; ++i)
-        batch.step({"b"});
-    assert(a.output.result.completion_tokens == paused && !a.done);
-    assert(b.output.result.completion_tokens == 1);
-    // Cancellation retires a paused row; the other row continues to its limit.
-    a.output.result.cancelled = true;
-    for (int i = 0; i < 8 && !b.done; ++i)
-        batch.step({"b"});
-    assert(a.done && b.done && b.output.result.completion_tokens == 3);
-    std::vector<int64_t> tokens;
-    for (const auto &event : b.events)
-        if (const auto *delta = std::get_if<OutputDelta>(&event))
-            tokens.insert(tokens.end(), delta->token_ids.begin(), delta->token_ids.end());
-    assert((tokens == std::vector<int64_t>{10, 11, 12}));
-    ExecutionRequest c(input, nullptr, "c");
-    batch.admit("c", c);
-    c.output.result.cancelled = true;
-    batch.step({});
-    assert(c.done && c.output.result.completion_tokens == 0);
+    BatchExecution<BatchOps> ops;
+    RequestExecutor executor(2);
+    executor.admit(batch_request("a"), nullptr, batch_info(), ops);
+    executor.admit(batch_request("b"), nullptr, batch_info(), ops);
+    std::map<std::string, std::vector<int64_t>> tokens;
+    std::map<std::string, int> terminals;
+    const auto tick = [&](std::vector<RequestId> eligible) {
+        auto result = executor.step(eligible, ops);
+        for (const auto& event : result.events) {
+            assert(!std::holds_alternative<ExecutionYield>(event.data));
+            if (const auto* delta = std::get_if<OutputDelta>(&event.data))
+                tokens[event.id].insert(tokens[event.id].end(), delta->token_ids.begin(), delta->token_ids.end());
+            if (terminal(event.data)) ++terminals[event.id];
+        }
+    };
+    for (int i = 0; i < 20 && tokens["a"].empty(); ++i) tick({"a"});
+    assert(tokens["a"].size() == 1 && tokens["b"].empty());
+    for (int i = 0; i < 20 && tokens["b"].empty(); ++i) tick({"b"});
+    assert(tokens["a"].size() == 1 && tokens["b"].size() == 1);
+    // Cancellation is serviced even when a request is excluded by backpressure.
+    executor.cancel("a");
+    for (int i = 0; i < 40 && !executor.empty(); ++i) tick({"b"});
+    assert(executor.empty() && terminals["a"] == 1 && terminals["b"] == 1);
+    assert(tokens["b"] == std::vector<int64_t>({10, 11, 12}));
+    executor.admit(batch_request("c"), nullptr, batch_info(), ops);
+    executor.cancel("c");
+    tick({});
+    assert(executor.empty() && terminals["c"] == 1 && tokens["c"].empty());
+    // B=1 uses the same sequence, with no detached batch completion path.
+    executor.admit(batch_request("single", 1, 1), nullptr, batch_info(), ops);
+    for (int i = 0; i < 10 && !executor.empty(); ++i) tick({"single"});
+    assert(executor.empty() && tokens["single"] == std::vector<int64_t>{10} && terminals["single"] == 1);
+    for (const auto& [key, value] : ops.batch.metrics())
+        if (key == "continuous_batching_active" || key == "continuous_batching_prefilling") assert(value == 0);
 }
 
 void batch_failure_test() {
     enum Stage { suspend, prefill, activate, resume };
-    struct Fault {
-        Stage stage;
-        bool armed = false;
-        size_t recovered = 0;
-    };
+    struct Fault { Stage stage; bool armed = false; size_t recovered = 0; };
     struct FailingOps : BatchOps {
-        Fault &fault;
-        explicit FailingOps(Fault &state) : fault(state) {}
+        Fault& fault;
+        explicit FailingOps(Fault& state) : fault(state) {}
         void check(Stage stage) {
-            if (fault.armed && fault.stage == stage)
-                throw std::runtime_error("device failure");
+            if (fault.armed && fault.stage == stage) throw std::runtime_error("device failure");
         }
         void suspend_decode() { check(suspend); }
-        Sample prefill(const std::shared_ptr<Request> &request, PrefillChunk chunk) {
-            check(Stage::prefill);
-            return BatchOps::prefill(request, chunk);
+        Sample prefill(const std::shared_ptr<Request>& request, PrefillChunk chunk) {
+            check(Stage::prefill); return BatchOps::prefill(request, chunk);
         }
-        void activate(const std::shared_ptr<Request> &, const Sample &) { check(Stage::activate); }
+        void activate(const std::shared_ptr<Request>&, const Sample&) { check(Stage::activate); }
         void resume_decode(int64_t) { check(resume); }
-        void recover(State &state) { fault.recovered = state.prefilling.size(); }
+        void recover(State& state) { fault.recovered = state.prefilling.size(); }
     };
-    InferenceRequest input;
-    input.prompt = {1, 2};
-    input.sampling.max_tokens = 3;
     for (auto stage : {suspend, prefill, activate, resume}) {
-        ExecutionRequest a(input, nullptr, "a"), b(input, nullptr, "b");
         Fault fault{stage};
-        ContinuousBatch<FailingOps> batch(8, 2, fault);
-        batch.admit("a", a);
-        batch.step({"a"});
-        assert(!a.done && a.output.result.completion_tokens == 1);
-        batch.admit("b", b);
+        BatchExecution<FailingOps> ops(fault);
+        RequestExecutor executor(2);
+        executor.admit(batch_request("a", 2, 20), nullptr, batch_info(), ops);
+        executor.admit(batch_request("b", 2, 20), nullptr, batch_info(), ops);
+        // Register both physical rows before the device fault.
+        executor.step({"a", "b"}, ops);
         fault.armed = true;
-        batch.step({"b"});
-        // Covers a popped prefill row and failure after adding it to active.
-        assert(a.done && a.failure && b.done && b.failure && fault.recovered == 2);
-        for (const auto &[key, value] : batch.metrics())
-            if (key == "continuous_batching_active" || key == "continuous_batching_prefilling")
-                assert(value == 0);
-        batch.step({});
-        fault.armed = false;
-        ExecutionRequest c(input, nullptr, "c");
-        batch.admit("c", c);
-        for (int i = 0; i < 5 && !c.done; ++i)
-            batch.step({"c"});
-        assert(c.done && !c.failure && c.output.result.completion_tokens == 3);
+        const auto result = executor.step({"a", "b"}, ops);
+        assert(!result.status.healthy && executor.empty() && fault.recovered == 2);
+        assert(result.events.size() == 2);
+        for (const auto& event : result.events) assert(std::holds_alternative<Failed>(event.data));
+        for (const auto& [key, value] : ops.batch.metrics())
+            if (key == "continuous_batching_active" || key == "continuous_batching_prefilling") assert(value == 0);
     }
     for (const auto limits : {std::pair{0, 2}, std::pair{2, 0}}) {
-        try {
-            ContinuousBatch<BatchOps> batch(limits.first, limits.second);
-            assert(false);
-        } catch (const std::invalid_argument &) {
-        }
+        try { ContinuousBatch<BatchOps> batch(limits.first, limits.second); assert(false); }
+        catch (const std::invalid_argument&) {}
     }
 }
 

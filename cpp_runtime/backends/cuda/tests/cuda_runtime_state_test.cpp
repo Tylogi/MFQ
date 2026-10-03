@@ -560,16 +560,23 @@ static void check_batching(const char* model_path, const char* tokenizer) {
     check(engine->admit(cancelled) == Admission::accepted, "cancel admission");
     engine->cancel("cancel");
     auto result = engine->step({});
-    check(result.events.size() == 1 && std::holds_alternative<Cancelled>(result.events[0].data),
+    check(std::count_if(result.events.begin(), result.events.end(), [](const auto& event) {
+              return terminal(event.data);
+          }) == 1 && std::holds_alternative<Cancelled>(result.events.back().data),
           "cancel before prefill did not release");
     cancelled.token_ids.assign(32, 101);
     check(engine->admit(cancelled) == Admission::accepted, "prefill cancel admission");
-    result = engine->step({"cancel"});
+    for (int tick = 0; tick < 8; ++tick) {
+        result = engine->step({"cancel"});
+        if (!result.events.empty()) break;
+    }
     check(result.events.size() == 1 && std::holds_alternative<PrefillProgress>(result.events[0].data),
           "prefill did not yield after one chunk");
     engine->cancel("cancel");
     result = engine->step({});
-    check(result.events.size() == 1 && std::holds_alternative<Cancelled>(result.events[0].data),
+    check(std::count_if(result.events.begin(), result.events.end(), [](const auto& event) {
+              return terminal(event.data);
+          }) == 1 && std::holds_alternative<Cancelled>(result.events.back().data),
           "cancel during prefill did not release");
     check(mfq::cuda::diagnostics::check_engine_steps(*engine, {101, 202, 303}, sampling) == reference,
           "cancel changed subsequent output");
