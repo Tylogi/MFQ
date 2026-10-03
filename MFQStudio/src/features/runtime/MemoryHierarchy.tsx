@@ -11,8 +11,9 @@ const modelCount = (count: number) => `${count} ${count === 1 ? 'model' : 'model
 const resourceBytes = (bytes: number) => bytes === 0 ? '0 B' :
   formatBytes(bytes).replace(/\b(KB|MB|GB|TB)\b/g, (unit) => `${unit[0]}iB`);
 
-export function MemoryHierarchy({ instances, connectionRevision = 0 }: {
+export function MemoryHierarchy({ instances, memoryCapacityBytes, connectionRevision = 0 }: {
   instances: RuntimeInstance[];
+  memoryCapacityBytes?: number | null;
   connectionRevision?: number;
 }) {
   const { tr } = useSettings();
@@ -38,6 +39,12 @@ export function MemoryHierarchy({ instances, connectionRevision = 0 }: {
     if (tier === 'experts') return memory.ssd_experts === false ? 0 : memory.ssd_expert_bytes;
     return memory.ssd_ple === false ? 0 : memory.ssd_ple_bytes;
   };
+  const weightAmounts = loaded.map((item) => value(item, 'weights'));
+  const weightTotal = weightAmounts.reduce<number>((sum, bytes) => sum + (bytes ?? 0), 0);
+  const memoryCapacity = memoryCapacityBytes != null && Number.isFinite(memoryCapacityBytes) && memoryCapacityBytes >= 0
+    ? memoryCapacityBytes : null;
+  const cacheCapacity = memoryCapacity != null && weightAmounts.every((bytes) => bytes != null)
+    ? Math.max(0, memoryCapacity - weightTotal) : null;
   const tiers: { id: Tier; title: string; detail: string }[] = [
     { id: 'weights', title: tr('常驻专家与稠密权重', 'Resident experts and dense weights'),
       detail: tr(`${loaded.length} 个模型`, modelCount(loaded.length)) },
@@ -60,8 +67,8 @@ export function MemoryHierarchy({ instances, connectionRevision = 0 }: {
       <div className="overview-memory-heading">
         <div>
           <h2>{tr('运行资源', 'Runtime resources')}</h2>
-          <p>{tr('前两项为常驻内存，后两项为 SSD 上的流式权重；色块表示各模型占比。',
-            'The first two tiers reside in memory; the last two are streamed from SSD. Colors show each model’s share.')}</p>
+          <p>{tr('前两项为常驻内存，后两项为 SSD 上的流式权重。',
+            'The first two tiers reside in memory; the last two are streamed from SSD.')}</p>
         </div>
       </div>
       <div className="memory-model-legend" aria-label={tr('模型颜色图例', 'Model color legend')}>
@@ -77,17 +84,24 @@ export function MemoryHierarchy({ instances, connectionRevision = 0 }: {
           const amounts = loaded.map((item) => ({ item, bytes: value(item, tier.id) }));
           const unknown = amounts.some(({ bytes }) => bytes == null);
           const total = amounts.reduce((sum, { bytes }) => sum + (bytes ?? 0), 0);
+          const resident = tier.id === 'weights' || tier.id === 'kv';
+          const capacity = tier.id === 'weights' ? memoryCapacity : tier.id === 'kv' ? cacheCapacity : total;
+          // Keep every model visible on overcommit without inflating the displayed limit.
+          const scale = capacity == null ? 0 : Math.max(capacity, total);
+          const used = unknown ? tr('明细未上报', 'Breakdown not reported') : resourceBytes(total);
           return (
             <div className="memory-tier" key={tier.id} data-tier={tier.id}>
               <div className="memory-tier-heading">
                 <div><strong>{tier.title}</strong><small>{tier.detail}</small></div>
-                <span>{unknown ? tr('明细未上报', 'Breakdown not reported') : resourceBytes(total)}</span>
+                <span className={unknown ? 'memory-tier-unavailable' : undefined}>
+                  {resident ? `${used} / ${capacity == null ? '--' : resourceBytes(capacity)}` : used}
+                </span>
               </div>
               <div className="memory-tier-track" aria-label={tier.title}>
-                {amounts.filter(({ bytes }) => bytes != null && bytes > 0).map(({ item, bytes }) => (
+                {amounts.filter(({ bytes }) => scale > 0 && bytes != null && bytes > 0).map(({ item, bytes }) => (
                   <span key={item.id} data-model-id={item.id}
-                    style={{ backgroundColor: color(item), width: `${bytes! / total * 100}%` }}
-                    title={`${item.model} · ${resourceBytes(bytes!)}${unknown ? '' : ` · ${formatNumber(bytes! / total * 100, 1)}%`}`} />
+                    style={{ backgroundColor: color(item), width: `${bytes! / scale * 100}%` }}
+                    title={`${item.model} · ${resourceBytes(bytes!)}${unknown || !capacity ? '' : ` · ${formatNumber(bytes! / capacity * 100, 1)}%`}`} />
                 ))}
               </div>
               {unknown && <small className="memory-tier-notice"><Icon name="info" size={12} />

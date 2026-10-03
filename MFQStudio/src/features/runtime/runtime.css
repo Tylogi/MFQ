@@ -78,7 +78,8 @@
 .memory-tier-heading > div { display: grid; gap: 4px; }
 .memory-tier-heading strong { color: var(--ink-soft); font-size: 12px; font-weight: 600; }
 .memory-tier-heading small { color: var(--muted); font-size: 11px; }
-.memory-tier-heading > span { color: var(--muted); font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; }
+.memory-tier-heading > span { color: var(--muted); font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; white-space: nowrap; flex-shrink: 0; }
+.memory-tier-heading > .memory-tier-unavailable { white-space: normal; flex-shrink: 1; }
 .memory-tier-track { display: flex; height: 8px; overflow: hidden; border-radius: 5px; margin-top: 9px; background: var(--line-soft); }
 .memory-tier-track > span { height: 100%; flex: 0 0 auto; }
 .memory-tier-track > span + span { box-shadow: -1px 0 0 var(--surface); }

@@ -31,7 +31,16 @@ Other workers without these counters explicitly show unavailable breakdowns.
 Each model gets one color shared by all four tiers. Registration follows load
 order: existing accent blue, then red, green, yellow and additional colors.
 Unloading a model does not recolor the remaining models during the view's
-lifetime. The legend is present even for a single model. Within each tier,
-segment widths represent the model's share of the reported bytes; these are
-not device-capacity utilization bars. Missing measurements are excluded and
-marked as unavailable, so no unknown bytes are silently treated as zero.
+lifetime. The legend is present even for a single model.
+
+The resident-weight track uses the detected usable inference memory limit
+(`runtime_memory_effective_budget_bytes`, falling back to the configured runtime
+budget on older servers). Its right-hand label displays numeric used / limit
+values. The KV/prefix track uses that same limit minus the resident weights of
+all ready/busy instances, clamped to zero. Resident segments represent utilization
+of their respective limits, not shares normalized to a full bar. On overcommit,
+the bar is full and retains all model colors; the numeric limit is not increased.
+SSD segment widths remain each model's share of that tier's reported bytes.
+Missing measurements are excluded and marked as unavailable. An unknown memory
+limit, or unknown weight residency when calculating KV capacity, is displayed as
+`--` and does not produce a misleading full resident bar.

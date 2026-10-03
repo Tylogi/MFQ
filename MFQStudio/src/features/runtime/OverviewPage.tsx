@@ -208,7 +208,8 @@ export function OverviewPage() {
       </div>
       <SectionLabel title={tr('资源层级', 'Resource hierarchy')} />
       {runtime ? (
-        <MemoryHierarchy instances={instances} connectionRevision={connectionRevision} />
+        <MemoryHierarchy instances={instances} connectionRevision={connectionRevision}
+          memoryCapacityBytes={runtime.runtime_memory_effective_budget_bytes ?? runtime.runtime_memory_budget_bytes} />
       ) : (
         <EmptyPanel
           icon="memory"

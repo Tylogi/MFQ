@@ -26,6 +26,10 @@ test('运行资源按模型分段，四个槽共享颜色，端点包含 v1', as
       ssd_expert_bytes: index * 2 ** 30, ssd_ple: true, ssd_ple_bytes: index * 2 ** 30 },
   }));
   await page.route('**/api/v1/runtime/instances', (route) => route.fulfill({ json: { data: instances } }));
+  await page.route(/\/api\/v1\/runtime\/status(?:\?.*)?$/, (route) => route.fulfill({ json: {
+    runtime_state: 'ready', model: 'Resource Model 1', instance_id: 'resource-1',
+    runtime_memory_budget_bytes: 32 * 2 ** 30, runtime_memory_effective_budget_bytes: 20 * 2 ** 30,
+  } }));
   await page.goto('/');
   await expect(page.getByText('Resource hierarchy', { exact: true })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Runtime resources', exact: true })).toBeVisible();
@@ -37,8 +41,12 @@ test('运行资源按模型分段，四个槽共享颜色，端点包含 v1', as
     const bars = page.locator(`[data-tier="${tier}"] .memory-tier-track > span`);
     await expect(bars).toHaveCount(4);
     expect(await bars.evaluateAll((segments) => segments.map((segment) => getComputedStyle(segment).backgroundColor))).toEqual(colors);
-    expect(await bars.first().evaluate((segment) => (segment as HTMLElement).style.width)).toBe('10%');
+    const width = parseFloat(await bars.first().evaluate((segment) => (segment as HTMLElement).style.width));
+    expect(width).toBeCloseTo(tier === 'weights' ? 5 : tier === 'kv' ? 1 / 1024 / 10 * 100 : 10);
   }
+  await expect(page.locator('[data-tier="weights"] .memory-tier-heading > span')).toHaveText('10 GiB / 20 GiB');
+  await expect(page.locator('[data-tier="kv"] .memory-tier-heading > span')).toHaveText('10 MiB / 10 GiB');
+  await expect(page.getByText(/Colors show each model/)).toHaveCount(0);
   await expect(page.locator('.overview-endpoint-panel code')).toHaveText('http://127.0.0.1:8090/v1');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.locator('.overview-memory-panel').screenshot({ path: testInfo.outputPath('resource-hierarchy.png') });
