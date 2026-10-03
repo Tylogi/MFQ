@@ -742,11 +742,6 @@ std::int32_t run_mlx_mtp_generation(
         !callbacks.verify_target || !callbacks.resolve_target) {
         throw std::invalid_argument("invalid MTP engine configuration");
     }
-    if (!mfq_token_constraint_supports_speculation(
-            request.token_constraint)) {
-        throw std::invalid_argument(
-            "MTP token constraint must support allows/apply/accept/clone");
-    }
     mlx_validate_token_set(request.eos_token_ids, request.vocab);
 
     stats = {};
@@ -758,9 +753,7 @@ std::int32_t run_mlx_mtp_generation(
     auto constraint_cursor = request.token_constraint
         ? request.token_constraint->clone()
         : MfqTokenConstraintPtr{};
-    if (request.token_constraint &&
-        (!constraint_cursor || !constraint_cursor->allows ||
-         !constraint_cursor->apply || !constraint_cursor->accept)) {
+    if (request.token_constraint && !constraint_cursor) {
         throw std::runtime_error(
             "MTP token constraint clone is incomplete");
     }

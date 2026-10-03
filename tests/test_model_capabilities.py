@@ -5,7 +5,12 @@ from mfq.server.protocol.output_protocols import output_protocol_for_architectur
 from mfq.server.runtime.capabilities import capabilities_for_architecture
 
 ROOT = Path(__file__).resolve().parents[1]
-SERVER = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_text(encoding="utf-8")
+TRANSPORT_SRC = ROOT / "cpp_runtime" / "transport"
+SERVER = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted(TRANSPORT_SRC.rglob("*"))
+    if path.suffix in {".cpp", ".h"}
+)
 CUDA_PLAN = (
     ROOT / "cpp_runtime" / "backends" / "cuda" / "include" / "cuda_model_plan.h"
 ).read_text(encoding="utf-8")
@@ -16,8 +21,8 @@ CUDA_DECODE = "\n".join(
     if path.suffix in {".h", ".cpp"}
 )
 CUDA_COMPONENTS = "\n".join(
-    (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
-    for name in ("server_components.h", "server_components.cpp")
+    (CUDA_ROOT / "storage" / name).read_text(encoding="utf-8")
+    for name in ("model_loader.h", "model_loader.cpp")
 )
 
 
@@ -180,9 +185,11 @@ def test_cpp_server_publishes_the_same_architecture_capability_contract() -> Non
         assert f'"{state}"' in SERVER
 
 
-def test_cpp_server_keeps_health_metrics_out_of_response_performance() -> None:
-    assert SERVER.count("add_request_runtime_metrics(performance)") == 2
+def test_cpp_transports_keep_health_metrics_out_of_response_performance() -> None:
+    assert SERVER.count("add_request_runtime_metrics(performance, metrics)") == 3
     assert "add_runtime_metrics(performance)" not in SERVER
+    assert "append_generation_metrics(values, metrics.mtp)" in SERVER
+    mtp_metrics = (ROOT / "cpp_runtime/engine/src/mtp_metrics.cpp").read_text()
     for metric in (
         "mtp_available",
         "mtp_used",
@@ -190,11 +197,8 @@ def test_cpp_server_keeps_health_metrics_out_of_response_performance() -> None:
         "mtp_drafted_tokens",
         "mtp_accepted_tokens",
         "mtp_acceptance_rate",
-        "mtp_target_ms",
-        "mtp_head_ms",
-        "mtp_rollback_ms",
     ):
-        assert f'"{metric}"' in SERVER
+        assert f'"{metric}"' in SERVER + mtp_metrics
 
 
 def test_cuda_uses_one_architecture_and_optional_component_registry() -> None:
@@ -212,6 +216,7 @@ def test_cuda_uses_one_architecture_and_optional_component_registry() -> None:
         assert f'"{implementation}"' in CUDA_PLAN
 
     assert "load_runtime_components(" in CUDA_DECODE
-    assert "auto server_components" in CUDA_DECODE
-    assert "switch (result.plan.vision)" in CUDA_COMPONENTS
+    assert "auto runtime_components" in CUDA_DECODE
+    assert "RuntimeComponents<mfq::cuda::Qwen35CausalLm>" in CUDA_COMPONENTS
+    assert "RuntimeComponents<mfq::cuda::MiniCPMO45CausalLm>" in CUDA_COMPONENTS
     assert "server_minicpmo_runtime" not in CUDA_DECODE

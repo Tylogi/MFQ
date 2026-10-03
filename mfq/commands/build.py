@@ -8,7 +8,7 @@ import os
 import platform
 import shutil
 import subprocess
-import sys
+import sys  # noqa: F401 - tests patch namespace-package discovery through this module
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -218,7 +218,7 @@ def runtime_executable(build_dir: Path, backend: str) -> Path:
     if backend == "metal":
         return build_dir / "metal" / "mfq-decode-metal"
     suffix = ".exe" if os.name == "nt" else ""
-    return build_dir / f"mfq-decode{suffix}"
+    return build_dir / f"mfq-runtime{suffix}"
 
 
 def _find_built_executable(plan: BuildPlan) -> Path | None:
@@ -249,7 +249,7 @@ def create_build_plan(
         raise BuildError("cmake was not found; install CMake 3.26 or newer")
     output = (build_dir or root / "build" / "cpp_runtime").expanduser().resolve()
     source = root / "cpp_runtime"
-    target = "mfq-decode-metal" if selected == "metal" else "mfq-decode"
+    target = "mfq-decode-metal" if selected == "metal" else "mfq-runtime"
     configure = [
         cmake,
         "-S",
@@ -257,7 +257,7 @@ def create_build_plan(
         "-B",
         str(output),
         f"-DCMAKE_BUILD_TYPE={build_type}",
-        "-DMFQ_BUILD_CPP_SERVER=ON",
+        "-DMFQ_BUILD_RUNTIME_COMMUNICATION=ON",
     ]
     selected_generator = generator
     if selected_generator is None and shutil.which("ninja"):
@@ -290,6 +290,7 @@ def create_build_plan(
         build_type,
         "--target",
         target,
+        *([] if selected == "metal" else ["mfq-diagnostics", "mfq-eval"]),
         "-j",
         str(parallelism),
     ]

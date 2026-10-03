@@ -1,7 +1,9 @@
-#include <cuda_runtime_api.h>
-
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+
+#include <cuda_runtime_api.h>
 
 // MFQ's custom kernels use the integrated GGML CUDA helper headers without
 // linking the complete ggml-cuda backend. Provide the host symbols they need.

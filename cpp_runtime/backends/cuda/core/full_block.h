@@ -1,0 +1,82 @@
+#pragma once
+
+#include "block.h"
+#include "ffn.h"
+#include "kv_cache.h"
+
+#include <cstdint>
+
+struct FullBlock : Block {
+    int layer = -1;
+    bool sliding = false;
+    bool value_equals_key = false;
+    int64_t attention_heads = 0;
+    int64_t kv_heads = 0;
+    int64_t attention_head_dim = 0;
+    int64_t attention_rotary_dim = 0;
+    int64_t attention_window = 0;
+    int64_t max_position_embeddings = 0;
+    double attention_scale = 0.0;
+    double rms_norm_eps = 1e-6;
+    double norm_weight_offset = 1.0;
+    bool official_bf16 = false;
+    RopeCache attention_rope;
+
+    mfq_tensor_backend::Tensor attn_norm;
+    mfq_tensor_backend::Tensor ffn_norm;
+    mfq_tensor_backend::Tensor q_norm;
+    mfq_tensor_backend::Tensor k_norm;
+    mfq_tensor_backend::Tensor v_norm;
+    QuantLinearGroup qkv;
+    bool attention_output_gate = false;
+    bool split_q_kv_projections = false;
+    QuantLinear q_projection;
+    QuantLinear k_projection;
+    QuantLinear v_projection;
+    QuantLinear o;
+    FFN ffn;
+    KVCache cache;
+    mfq_tensor_backend::Tensor decode_partial_o;
+    mfq_tensor_backend::Tensor decode_partial_m;
+    mfq_tensor_backend::Tensor decode_partial_l;
+    mfq_tensor_backend::Tensor decode_mma_mask;
+    mfq_tensor_backend::Tensor decode_mma_kv_max;
+    mfq_tensor_backend::Tensor decode_mma_meta;
+
+    static constexpr int64_t kDecodeAttentionMaxParts = 16;
+
+    bool supports_speculation() const noexcept override { return !sliding; }
+    void reset(int64_t batch) override;
+    mfq_tensor_backend::Tensor forward(
+        CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor positions,
+        int64_t cache_position,
+        const MfqOptional<mfq_tensor_backend::Tensor>& sequence_lengths,
+        const RopeCache& rope,
+        const MfqOptional<mfq_tensor_backend::Tensor>& cache_positions = mfq_nullopt,
+        const MfqOptional<mfq_tensor_backend::Tensor>& attention_mask = mfq_nullopt) override;
+    mfq_tensor_backend::Tensor forward_context(
+        CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor x,
+        const Context& context,
+        const RopeCache& rope) override;
+    mfq_tensor_backend::Tensor forward_impl(
+        CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor x,
+        mfq_tensor_backend::Tensor positions,
+        int64_t cache_position,
+        const MfqOptional<mfq_tensor_backend::Tensor>& sequence_lengths,
+        const RopeCache& rope,
+        const MfqOptional<mfq_tensor_backend::Tensor>& cache_positions,
+        const MfqOptional<mfq_tensor_backend::Tensor>& attention_mask,
+        int64_t planned_kv_length,
+        int64_t decode_attention_parts);
+    virtual mfq_tensor_backend::Tensor forward_ffn(
+        CudaExecutionContext& execution,
+        mfq_tensor_backend::Tensor residual,
+        mfq_tensor_backend::Tensor attention_output,
+        int64_t batch,
+        int64_t tokens,
+        int64_t hidden);
+};

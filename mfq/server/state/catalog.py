@@ -36,7 +36,8 @@ _ROUTED_EXPERT_RE = re.compile(
     r"(?:weight|weight_scale)$"
 )
 _ALWAYS_STREAMED_RE = re.compile(
-    r"(?:\.associative_memory\.embedding\.weight|\.engram\.embed\.weight)$"
+    r"(?:\.associative_memory\.embedding\.weight|\.engram\.embed\.weight"
+    r"|\.position_embedding\.ngram\.shard\.\d+\.weight)$"
 )
 _LOGGER = logging.getLogger(__name__)
 

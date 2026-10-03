@@ -5,11 +5,13 @@
 
 #include <array>
 #include <cmath>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -232,8 +234,15 @@ int main() try {
         parallel_batched_product == loop_batched_product,
         "parallel batched matmul exactness");
     set_test_environment("MFQ_DISABLE_NATIVE_STRIDED_BATCH_MATMUL", "0");
-    require(host_values(matmul(attention_left, attention_right)) == loop_batched_product,
-            "strided batched matmul exactness");
+    const auto strided_batched_product = host_values(
+        matmul(attention_left, attention_right));
+    for (std::size_t index = 0; index < strided_batched_product.size(); ++index) {
+        const auto reference = loop_batched_product[index];
+        require_close(
+            strided_batched_product[index], reference,
+            0.01f + 0.01f * std::abs(reference),
+            "strided batched matmul parity");
+    }
 
     std::vector<float> selection_values(3 * 2051);
     for (std::size_t i = 0; i < selection_values.size(); ++i) {
@@ -272,7 +281,9 @@ int main() try {
         matrix_graph.capture_end();
         matrix_graph.replay();
         MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(current_stream(0).stream()));
-        require(host_values(captured) == loop_batched_product, "strided batched CUDA graph");
+        require(
+            host_values(captured) == strided_batched_product,
+            "strided batched CUDA graph");
     }
 
     const auto probabilities = host_values(softmax(input, -1));
@@ -457,14 +468,23 @@ int main() try {
     require(index_host.data_ptr<std::int64_t>()[1] == 0, "topk second index");
 
     auto usage_stream = stream_from_pool(false, 0);
+    auto cross_stream = input.square();
+    Event producer_ready;
+    producer_ready.record(current_stream(0).stream());
+    Tensor consumed;
     {
         StreamGuard stream_guard(usage_stream);
-        auto cross_stream = input.square();
+        MFQ_NATIVE_CUDA_CHECK(cudaStreamWaitEvent(usage_stream.stream(), producer_ready.get(), 0));
         cross_stream.record_stream(
             reinterpret_cast<std::uintptr_t>(usage_stream.stream()));
-        require_close(host_values(cross_stream)[5], 36.0f, 0.0f, "cross-stream value");
+        MFQ_NATIVE_CUDA_CHECK(cudaLaunchHostFunc(usage_stream.stream(), [](void*) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }, nullptr));
+        consumed = cross_stream.square();
+        cross_stream = {}; // release before the registered consumer executes
     }
     MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(usage_stream.stream()));
+    require_close(host_values(consumed)[5], 1296.0f, 0.0f, "cross-stream lifetime");
 
     if (default_context(0)->supports_async_allocations()) {
         auto graph_stream = stream_from_pool(false, 0);

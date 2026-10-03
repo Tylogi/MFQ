@@ -1,4 +1,4 @@
-#include "cuda_quantized_ops.h"
+#include "quant_linear.h"
 #include <cmath>
 #include <fstream>
 #include <iostream>
@@ -8,6 +8,7 @@
 
 namespace {
 using namespace mfq::cuda;
+using namespace mfq::cuda::internal;
 Mxfp4SqWeight weight(const std::vector<std::uint8_t>& bytes, bool cuda) {
     const auto layout = mfq::sq::parse(bytes.data(), bytes.size());
     const auto rows = mfq::sq::row_metadata(bytes.data(), layout);
@@ -38,7 +39,7 @@ void close(const Tensor& value, const std::vector<float>& reference, float toler
         if (!std::isfinite(actual[i]) || std::abs(actual[i]-reference[i])>tolerance)
             throw std::runtime_error("SQ linear numerical mismatch at "+std::to_string(i));
 }
-void fp8_cpu(bool mx) {
+void fp8_cpu(CudaExecutionContext& execution, bool mx) {
     const int n = 3, k = mx ? 32 : 128;
     const int br = mx ? 1 : 128, bc = k, sr = mx ? n : 1;
     const int symbols = 44 + 4 + 256, scales = symbols + n * k;
@@ -72,7 +73,7 @@ void fp8_cpu(bool mx) {
     for (auto dtype : {kFloat32,kFloat16}) close(layer.fp8_sq.forward(tensor(values).reshape({3,k}).to(dtype)),expected,0);
     close(quant_linear_reference_weight(layer),dense,0);
     QuantLinearGroup group; group.layers.push_back(layer); group.outs={n};
-    close(make_fp32_quant_group(group).w,dense,0);
+    close(make_fp32_quant_group(execution, group).w,dense,0);
 }
 
 }
@@ -89,12 +90,13 @@ int main(int argc, char** argv) try {
     for (int m=0;m<3;++m) for (int n=0;n<7;++n) for (int k=0;k<96;++k)
         expected[m*7+n]+=values[m*96+k]*dense[n*96+k];
     auto x=tensor(values).reshape({3,96});
+    CudaExecutionContext execution;
     Mxfp4SqLinear cpu{weight(bytes,false)};
     close(cpu.forward(x),expected,1e-5f);
     QuantLinear cpu_layer; cpu_layer.kind=QuantLinearKind::Mxfp4Sq; cpu_layer.mxfp4_sq=cpu;
     QuantLinearGroup cpu_group; cpu_group.layers.push_back(cpu_layer); cpu_group.outs={7};
-    close(make_fp32_quant_group(cpu_group).w,dense,0);
-    fp8_cpu(true); fp8_cpu(false);
+    close(make_fp32_quant_group(execution, cpu_group).w,dense,0);
+    fp8_cpu(execution, true); fp8_cpu(execution, false);
     int devices=0;
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || devices==0) return 77;
     auto device_x=x.to(Device{DeviceType::cuda,0}).to(kFloat16);
@@ -116,7 +118,8 @@ int main(int argc, char** argv) try {
             shard.mxfp4_sq.weight=weight(mfq::sq::select_rows(bytes,rows,shard.input_begin,shard.input_end),true);
             layer.tensor_parallel_shards.push_back(std::move(shard));
         }
-        close(layer.forward_tensor_parallel_flat(device_x,mfq_nullopt,0),expected,0.002f);
+        close(layer.forward_tensor_parallel_flat(
+            execution, device_x, mfq_nullopt, 0), expected, 0.002f);
     }
     std::cout<<"PASS SQ CPU linear and packed input/output shards\n";
     return 0;

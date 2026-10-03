@@ -18,33 +18,25 @@ export function displayPrefillMetric(metrics?: PrefillMetricLike | null): {
   tokensPerSecond: number | undefined;
 } {
   if (!metrics) return { milliseconds: undefined, tokensPerSecond: undefined };
-  const nativeMilliseconds = Number(metrics.ttft_ms);
-  if (Number.isFinite(nativeMilliseconds) && nativeMilliseconds > 0) {
-    const tokens = Number(metrics.prefill_tokens ?? metrics.prompt_tokens);
-    return {
-      milliseconds: nativeMilliseconds,
-      tokensPerSecond:
-        Number.isFinite(tokens) && tokens > 0
-          ? (tokens * 1000) / nativeMilliseconds
-          : undefined,
-    };
-  }
-  const modelMilliseconds = Number(metrics.model_prefill_ms);
   const languageMilliseconds = Number(metrics.prefill_ms);
+  const modelMilliseconds = Number(metrics.model_prefill_ms);
   const milliseconds =
-    Number.isFinite(modelMilliseconds) && modelMilliseconds > 0
-      ? modelMilliseconds
-      : Number.isFinite(languageMilliseconds) && languageMilliseconds > 0
-        ? languageMilliseconds
+    Number.isFinite(languageMilliseconds) && languageMilliseconds > 0
+      ? languageMilliseconds
+      : Number.isFinite(modelMilliseconds) && modelMilliseconds > 0
+        ? modelMilliseconds
         : undefined;
-  const tokens = Number(metrics.prefill_tokens ?? metrics.prompt_tokens);
-  if (milliseconds !== undefined && Number.isFinite(tokens) && tokens > 0) {
-    return { milliseconds, tokensPerSecond: (tokens * 1000) / milliseconds };
-  }
   const reported = Number(metrics.prefill_tps);
+  if (Number.isFinite(reported) && reported > 0) {
+    return { milliseconds, tokensPerSecond: reported };
+  }
+  const tokens = Number(metrics.prefill_tokens ?? metrics.prompt_tokens);
   return {
     milliseconds,
-    tokensPerSecond: Number.isFinite(reported) ? reported : undefined,
+    tokensPerSecond:
+      milliseconds !== undefined && Number.isFinite(tokens) && tokens > 0
+        ? (tokens * 1000) / milliseconds
+        : undefined,
   };
 }
 

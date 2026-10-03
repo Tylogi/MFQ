@@ -69,6 +69,20 @@ export function OverviewPage() {
   const prefixCacheHits = Number(runtime?.prefix_cache_hits || 0);
   const prefixCacheHitRate =
     prefixCacheQueries > 0 ? (prefixCacheHits / prefixCacheQueries) * 100 : 0;
+  const prefixCacheHotOnly = runtime?.prefix_cache_mode === 'single_device_hot_prefix';
+  const prefixCachePersistent = typeof runtime?.prefix_cache_max_bytes === 'number';
+  const prefixCacheSupported = runtime?.prefix_cache_supported !== undefined
+    ? Number(runtime.prefix_cache_supported) > 0
+    : prefixCachePersistent || prefixCacheHotOnly;
+  const prefixCacheUnavailableReason = Number(runtime?.prefix_cache_disabled_reason) === 2
+    ? tr(
+        '连续批处理模式暂不支持 Session KV 缓存',
+        'Session KV cache is unavailable with continuous batching',
+      )
+    : tr(
+        '当前模型不支持 Session KV 缓存',
+        'The current model does not support Session KV cache',
+      );
 
   return (
     <section className="dashboard-view" id="dashboard-overview">
@@ -169,11 +183,21 @@ export function OverviewPage() {
         />
         <MetricTile
           label={tr('前缀复用', 'Prefix reuse')}
-          value={prefixCacheQueries > 0 ? `${formatNumber(prefixCacheHitRate, 1)}%` : '--'}
-          detail={tr(
-            `已恢复 ${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens`,
-            `${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens restored`,
-          )}
+          value={
+            !prefixCacheSupported
+              ? tr('不支持', 'Unavailable')
+              : prefixCacheQueries > 0
+                ? `${formatNumber(prefixCacheHitRate, 1)}%`
+                : '--'
+          }
+          detail={
+            !prefixCacheSupported
+              ? prefixCacheUnavailableReason
+              : tr(
+                  `已恢复 ${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens`,
+                  `${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens restored`,
+                )
+          }
           icon="reuse"
         />
         <MetricTile

@@ -3,7 +3,7 @@
 #include "mlx_qwen35_causal_lm.h"
 #include "qwen35_model.h"
 
-#include "mfq/server.h"
+#include "transport.h"
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
@@ -1215,8 +1215,7 @@ std::string inferred_precision(
             dtype == "NINT8-0" ||
             dtype == "NVQ" ||
             dtype == "NPQ" ||
-            dtype == "NEPQ" ||
-            dtype.rfind("TPQ", 0) == 0) {
+            dtype == "NEPQ") {
             quantized = true;
         }
     }

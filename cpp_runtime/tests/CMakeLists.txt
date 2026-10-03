@@ -1,4 +1,9 @@
-# Backend-independent native tests.
+# Backend-independent native tests. Keep assert checks in Release too.
+if(MSVC)
+    add_compile_options(/UNDEBUG)
+else()
+    add_compile_options(-UNDEBUG)
+endif()
 
 add_executable(mfq-cuda-tensor-view-test
     ${PROJECT_SOURCE_DIR}/backends/cuda/tests/mfq_cuda_tensor_view_test.cpp
@@ -23,8 +28,17 @@ add_test(NAME mfq-native-tensor-test COMMAND mfq-native-tensor-test)
 add_executable(mfq-paged-kv-allocator-test
     mfq_paged_kv_allocator_test.cpp
 )
+target_link_libraries(mfq-paged-kv-allocator-test PRIVATE mfq-engine)
 target_compile_features(mfq-paged-kv-allocator-test PRIVATE cxx_std_17)
 add_test(NAME mfq-paged-kv-allocator-test COMMAND mfq-paged-kv-allocator-test)
+
+add_executable(mfq-session-snapshot-cache-test
+    mfq_session_snapshot_cache_test.cpp
+)
+target_link_libraries(mfq-session-snapshot-cache-test PRIVATE mfq-engine)
+target_compile_features(mfq-session-snapshot-cache-test PRIVATE cxx_std_17)
+add_test(NAME mfq-session-snapshot-cache-test
+    COMMAND mfq-session-snapshot-cache-test)
 
 function(mfq_add_core_test target source)
     add_executable(${target} ${source})
@@ -36,14 +50,27 @@ function(mfq_add_core_test target source)
     add_test(NAME ${target} COMMAND ${target})
 endfunction()
 
+add_executable(mfq-text-emitter-test mfq_text_emitter_test.cpp)
+target_link_libraries(mfq-text-emitter-test PRIVATE mfq-engine)
+target_compile_features(mfq-text-emitter-test PRIVATE cxx_std_17)
+add_test(NAME mfq-text-emitter-test COMMAND mfq-text-emitter-test)
+
 mfq_add_core_test(mfq-model-graph-test mfq_model_graph_test.cpp)
 mfq_add_core_test(mfq-model-source-test model_source_test.cpp)
 mfq_add_core_test(mfq-nint-rows-test nint_rows_test.cpp)
 mfq_add_core_test(mfq-grid-vision-test grid_vision_test.cpp)
 mfq_add_core_test(mfq-deepseek-v41-config-test deepseek_v41_config_test.cpp)
+target_link_libraries(mfq-deepseek-v41-config-test PRIVATE mfq-models)
 mfq_add_core_test(mfq-model-config-test model_config_test.cpp)
-mfq_add_core_test(mfq-sampling-test mfq_sampling_test.cpp)
-mfq_add_core_test(mfq-moe-cache-policy-test moe_cache_policy_test.cpp)
+target_link_libraries(mfq-model-config-test PRIVATE mfq-models)
+add_executable(mfq-sampling-test mfq_sampling_test.cpp)
+target_link_libraries(mfq-sampling-test PRIVATE mfq-engine)
+target_compile_features(mfq-sampling-test PRIVATE cxx_std_17)
+add_test(NAME mfq-sampling-test COMMAND mfq-sampling-test)
+add_executable(mfq-moe-cache-policy-test moe_cache_policy_test.cpp)
+target_link_libraries(mfq-moe-cache-policy-test PRIVATE mfq-engine)
+target_compile_features(mfq-moe-cache-policy-test PRIVATE cxx_std_17)
+add_test(NAME mfq-moe-cache-policy-test COMMAND mfq-moe-cache-policy-test)
 mfq_add_core_test(mfq-tensor-parallel-test tensor_parallel_test.cpp)
 
 add_executable(mfq-cuda-model-plan-test
@@ -56,12 +83,22 @@ target_link_libraries(mfq-cuda-model-plan-test PRIVATE mfq-core)
 target_compile_features(mfq-cuda-model-plan-test PRIVATE cxx_std_20)
 add_test(NAME mfq-cuda-model-plan-test COMMAND mfq-cuda-model-plan-test)
 
-add_executable(mfq-cuda-mtp-test
-    ${PROJECT_SOURCE_DIR}/backends/cuda/tests/mfq_cuda_mtp_test.cpp)
-target_include_directories(mfq-cuda-mtp-test PRIVATE
-    ${PROJECT_SOURCE_DIR}/backends/cuda/include)
-target_compile_features(mfq-cuda-mtp-test PRIVATE cxx_std_20)
-add_test(NAME mfq-cuda-mtp-test COMMAND mfq-cuda-mtp-test)
+add_executable(mfq-inference-test inference_test.cpp)
+target_link_libraries(mfq-inference-test PRIVATE mfq-engine)
+add_test(NAME mfq-inference-test COMMAND mfq-inference-test)
+
+add_executable(mfq-request-executor-test request_executor_test.cpp)
+target_link_libraries(mfq-request-executor-test PRIVATE mfq-engine)
+add_test(NAME mfq-request-executor-test COMMAND mfq-request-executor-test)
+
+add_executable(mfq-shared-execution-test shared_execution_test.cpp)
+target_link_libraries(mfq-shared-execution-test PRIVATE mfq-engine mfq-models)
+add_test(NAME mfq-shared-execution-test COMMAND mfq-shared-execution-test)
+
+add_executable(mfq-mtp-policy-test mtp_policy_test.cpp)
+target_link_libraries(mfq-mtp-policy-test PRIVATE mfq-engine)
+target_compile_features(mfq-mtp-policy-test PRIVATE cxx_std_20)
+add_test(NAME mfq-mtp-policy-test COMMAND mfq-mtp-policy-test)
 
 add_executable(mfq-moe-cache-profile-test moe_cache_profile_test.cpp)
 target_link_libraries(mfq-moe-cache-profile-test PRIVATE mfq-core mfq-json)
@@ -76,15 +113,19 @@ if(TARGET mfq-paged-prefix-cache)
         mfq_paged_prefix_cache_test.cpp
     )
     target_link_libraries(mfq-paged-prefix-cache-test PRIVATE
+        mfq-engine
         mfq-paged-prefix-cache
     )
     target_compile_features(mfq-paged-prefix-cache-test PRIVATE cxx_std_17)
     add_test(NAME mfq-paged-prefix-cache-test COMMAND mfq-paged-prefix-cache-test)
 endif()
 
-if(TARGET mfq-server)
+if(TARGET mfq-runtime-communication)
+    mfq_add_core_test(mfq-runtime-transport-test mfq_runtime_transport_test.cpp)
+    target_link_libraries(mfq-runtime-transport-test PRIVATE mfq-runtime-communication)
+
     add_executable(mfq-runtime-profile-test mfq_runtime_profile_test.cpp)
-    target_link_libraries(mfq-runtime-profile-test PRIVATE mfq-server)
+    target_link_libraries(mfq-runtime-profile-test PRIVATE mfq-runtime-communication)
     target_compile_features(mfq-runtime-profile-test PRIVATE cxx_std_17)
     add_test(NAME mfq-runtime-profile-test COMMAND mfq-runtime-profile-test)
 endif()

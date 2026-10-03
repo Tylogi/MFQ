@@ -215,6 +215,109 @@ void test_router_modes() {
     }
 }
 
+void test_dense_router_logits() {
+    constexpr int experts = 256;
+    constexpr int width = 512;
+    std::vector<float> input_values(width);
+    std::vector<float> weight_values(
+        static_cast<std::size_t>(experts) * width);
+    for (int column = 0; column < width; ++column) {
+        input_values[column] = static_cast<float>(
+            (column * 7) % 31 - 15) / 128.0f;
+    }
+    for (std::size_t index = 0; index < weight_values.size(); ++index) {
+        weight_values[index] = static_cast<float>(
+            static_cast<int>((index * 11 + index / width) % 37) - 18)
+            / 256.0f;
+    }
+
+    for (const auto dtype : {
+             mlx::core::float16,
+             mlx::core::bfloat16,
+         }) {
+        auto input = mlx::core::contiguous(mlx::core::astype(
+            array(input_values.begin(), Shape{1, width}), dtype));
+        auto weight = mlx::core::contiguous(mlx::core::astype(
+            array(weight_values.begin(), Shape{experts, width}), dtype));
+        require(
+            mfq::metal::moe_dense_router_logits_supported(input, weight),
+            "valid dense router GEMV shape was rejected");
+        const auto actual = floats(
+            mfq::metal::moe_dense_router_logits(input, weight));
+        const auto expected = floats(mlx::core::matmul(
+            input, mlx::core::transpose(weight)));
+        require(actual.size() == expected.size(),
+                "dense router GEMV output size mismatch");
+        for (std::size_t index = 0; index < actual.size(); ++index) {
+            require_close(actual[index], expected[index], 2e-2f);
+        }
+    }
+
+    const std::vector<float> two_row_values(2 * width, 0.0f);
+    auto two_rows = mlx::core::astype(
+        array(
+            two_row_values.data(),
+            Shape{2, width}),
+        mlx::core::float16);
+    auto weight = mlx::core::astype(
+        array(weight_values.begin(), Shape{experts, width}),
+        mlx::core::float16);
+    require(
+        !mfq::metal::moe_dense_router_logits_supported(two_rows, weight),
+        "multi-row input unexpectedly accepted dense router GEMV");
+}
+
+void test_single_row_softmax_topk() {
+    constexpr int experts = 512;
+    constexpr int top_k = 10;
+    std::vector<float> logits(experts);
+    for (int expert = 0; expert < experts; ++expert) {
+        logits[expert] = static_cast<float>(
+            (expert * 97) % 509 - 254) / 64.0f;
+    }
+    auto result = mfq::metal::moe_topk(
+        mlx::core::astype(
+            array(logits.begin(), Shape{1, experts}),
+            mlx::core::float16),
+        top_k,
+        false,
+        false,
+        true);
+    const auto ids = integers(result.ids);
+    const auto weights = floats(result.weights);
+    const auto expected = stable_top_k(logits, top_k);
+    float denominator = 0.0f;
+    for (const int expert : expected) {
+        denominator += std::exp(logits[expert] - logits[expected.front()]);
+    }
+    for (int rank = 0; rank < top_k; ++rank) {
+        require(ids[rank] == expected[rank],
+                "single-row softmax Top-K selected wrong expert");
+        require_close(
+            weights[rank],
+            std::exp(logits[expected[rank]] - logits[expected.front()]) /
+                denominator,
+            2e-3f);
+    }
+
+    const std::vector<float> ties(experts, 0.0f);
+    auto tied = mfq::metal::moe_topk(
+        mlx::core::astype(
+            array(ties.begin(), Shape{1, experts}),
+            mlx::core::bfloat16),
+        top_k,
+        false,
+        false,
+        true);
+    const auto tied_ids = integers(tied.ids);
+    const auto tied_weights = floats(tied.weights);
+    for (int rank = 0; rank < top_k; ++rank) {
+        require(tied_ids[rank] == rank,
+                "single-row softmax Top-K tie order changed");
+        require_close(tied_weights[rank], 0.1f, 1e-6f);
+    }
+}
+
 void test_fused_dense_router_topk() {
     constexpr int experts = 256;
     constexpr int width = 4096;
@@ -649,6 +752,7 @@ void test_sqrtsoftplus_weights() {
         }
     }
 }
+
 
 void test_fused_dense_hash_router() {
     constexpr int experts = 256;
@@ -1095,6 +1199,8 @@ int main() {
             mlx::core::Device::gpu);
 #endif
         test_router_modes();
+        test_dense_router_logits();
+        test_single_row_softmax_topk();
         test_fused_dense_router_topk();
         test_fused_dense_hash_router();
         test_sqrtsoftplus_weights();

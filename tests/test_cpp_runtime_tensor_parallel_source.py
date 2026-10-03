@@ -14,8 +14,12 @@ CMAKE = (ROOT / "cpp_runtime" / "tests" / "CMakeLists.txt").read_text(
     encoding="utf-8"
 )
 COMPONENTS = "\n".join(
-    (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
-    for name in ("server_components.h", "server_components.cpp")
+    path.read_text(encoding="utf-8")
+    for path in (
+        CUDA_ROOT / "storage" / "model_loader.h",
+        CUDA_ROOT / "storage" / "model_loader.cpp",
+        CUDA_ROOT / "models" / "qwen35" / "ops.cpp",
+    )
 )
 
 
@@ -47,9 +51,10 @@ def test_routed_moe_all_compact_families_are_expert_sharded():
 def test_expert_parallel_cli_and_hybrid_device_contract_are_wired():
     assert '"--expert-parallel"' in SOURCE
     assert '"--expert-split"' in SOURCE
-    assert "g_expert_parallel" in SOURCE
+    assert "execution.expert_parallel" in SOURCE
     assert "plan_moe_expert_parallel_slices" in SOURCE
-    assert "g_tensor_parallel.devices != g_expert_parallel.devices" in SOURCE
+    assert "execution.tensor_parallel.devices !=" in SOURCE
+    assert "execution.expert_parallel.devices" in SOURCE
 
 
 def test_tensor_parallel_has_a_native_partition_test_target():
@@ -62,7 +67,7 @@ def test_model_parallel_rejects_silent_moe_cache_bypass():
         '"--moe-gpu-cache-gb cannot be combined with "'
         in SOURCE
     )
-    assert "model_parallel_enabled()" in SOURCE
+    assert "model_parallel_enabled(execution)" in SOURCE
     assert '"tensor/expert parallelism"' in SOURCE
 
 
@@ -70,13 +75,15 @@ def test_tensor_parallel_graph_capture_registers_all_participant_streams():
     assert '"MFQ_MODEL_PARALLEL_CUDA_GRAPH"' in SOURCE
     assert '"MFQ_TP_CUDA_GRAPH"' in SOURCE
     assert '"MFQ_EP_CUDA_GRAPH"' in SOURCE
-    assert "model_parallel_cuda_graph_enabled()" in SOURCE
-    assert "environment == nullptr || environment[0] != '0'" in SOURCE
+    assert "model_parallel_cuda_graph_enabled(" in SOURCE
+    assert "execution.model_parallel_collectives" in SOURCE
+    assert "execution.config.tensor_parallel_cuda_graph" in SOURCE
+    assert "execution.config.expert_parallel_cuda_graph" in SOURCE
     assert "graph_participant_streams" in SOURCE
-    assert "g_model_parallel_collectives.streams.begin()" in SOURCE
-    assert "graph_cache.compute_streams" in SOURCE
+    assert "collectives.streams.begin()" in SOURCE
+    assert "graph.compute_streams" in SOURCE
     assert "participant_streams" in SOURCE
-    assert "const bool graph_enabled" in SOURCE
+    assert "bool graph_eligible() const" in SOURCE
     assert "bool use_cuda_graph" in SOURCE
 
 
@@ -91,10 +98,10 @@ def test_tensor_parallel_graph_primes_and_captures_nccl_peer_transfers():
 
 
 def test_expert_parallel_graph_uses_capture_safe_peer_transfers():
-    assert "tensor_to_cuda_device(std::move(value), device)" in SOURCE
+    assert "tensor_to_cuda_device(collectives, std::move(value), device)" in SOURCE
     assert (
         "destination = tensor_to_cuda_device(\n"
-        "            source, device, std::move(destination));"
+        "            collectives, source, device, std::move(destination));"
         in SOURCE
     )
     assert "auto destination = destination_tensor();" in SOURCE
@@ -104,8 +111,7 @@ def test_expert_parallel_graph_uses_capture_safe_peer_transfers():
 def test_two_rank_fp16_reduce_avoids_round_trip_casts():
     assert '"MFQ_MODEL_PARALLEL_FP16_REDUCE"' in SOURCE
     assert '"MFQ_TP_FP16_REDUCE"' in SOURCE
-    assert "model_parallel_fp16_reduce_enabled()" in SOURCE
-    assert "environment == nullptr || std::atoi(environment) != 0" in SOURCE
+    assert "execution.config.model_parallel_fp16_reduce" in SOURCE
     assert "outputs.size() == 2" in SOURCE
     assert "output_dtype == mfq_tensor_backend::kFloat16" in SOURCE
     assert "fp16_reduce ? ncclFloat16 : ncclFloat32" in SOURCE
@@ -113,35 +119,44 @@ def test_two_rank_fp16_reduce_avoids_round_trip_casts():
 
 
 def test_tensor_parallel_projection_groups_share_each_rank_input_transfer():
-    assert 'std::getenv(\n        "MFQ_TP_GROUPED_PROJECTIONS")' in SOURCE
-    assert "environment == nullptr || std::atoi(environment) != 0" in SOURCE
+    assert '"MFQ_TP_GROUPED_PROJECTIONS"' in SOURCE
+    assert "execution.config.tensor_parallel_grouped_projections" in SOURCE
     assert "tensor_parallel_output_compatible()" in SOURCE
-    assert "forward_tensor_parallel_output_group(x)" in SOURCE
-    assert "auto local_x = tensor_to_cuda_device(flat, device);" in SOURCE
+    assert "forward_tensor_parallel_output_group(execution, x)" in SOURCE
+    assert (
+        "auto local_x = tensor_to_cuda_device(\n"
+        "            execution.model_parallel_collectives, flat, device);"
+        in SOURCE
+    )
 
 
 def test_batched_decode_graph_orders_tp_groups_by_projection():
-    assert "g_decode_graph_tp_projection_major" in SOURCE
+    assert "decode_graph_tp_projection_major" in SOURCE
+    assert "thread_local bool g_decode_graph_tp_projection_major" not in SOURCE
     assert "DecodeGraphTpProjectionScope" in SOURCE
     assert "std::vector<mfq_tensor_backend::Tensor> local_inputs" in SOURCE
-    assert "local_inputs[shard] = tensor_to_cuda_device(flat, device)" in SOURCE
+    assert (
+        "local_inputs[shard] = tensor_to_cuda_device(\n"
+        "                execution.model_parallel_collectives, flat, device)"
+        in SOURCE
+    )
 
 
 def test_tensor_parallel_peer_first_launch_preserves_rank_indexing():
     assert '"MFQ_MODEL_PARALLEL_PEER_FIRST_LAUNCH"' in SOURCE
     assert '"MFQ_TP_PEER_FIRST_LAUNCH"' in SOURCE
     assert "model_parallel_launch_index(" in SOURCE
-    assert "environment == nullptr || std::atoi(environment) != 0" in SOURCE
+    assert "config.model_parallel_peer_first_launch" in SOURCE
     assert "peer_first_parallel_launch_index" in SOURCE
     assert "launch_position < primary_rank" in CORE
     assert "local_outputs[index] =" in SOURCE
-    assert "partials[index] = run_quant_linear_shard(" in SOURCE
+    assert "partials[index]=mfq::models::gated_mlp(" in "".join(SOURCE.split())
 
 
 def test_qwen35_mtp_accepts_dense_tensor_parallel_placement():
     assert "const bool supported_placement" in COMPONENTS
-    assert "!g_layer_placement.enabled()" in COMPONENTS
-    assert "!g_tensor_parallel.enabled()" not in COMPONENTS
+    assert "!model_execution.layer_placement.enabled()" in COMPONENTS
+    assert "!execution.tensor_parallel.enabled()" not in COMPONENTS
     assert "dense GPU-resident Qwen blocks" in COMPONENTS
 
 
@@ -152,31 +167,32 @@ def test_quantized_tp_weights_and_workspaces_follow_the_shard_device():
 
 
 def test_deepseek_v4_split_gate_up_uses_existing_moe_runtime_and_cache():
-    assert 'p + "mlp.experts.gate.weight"' in SOURCE
-    assert 'p + "mlp.experts.up.weight"' in SOURCE
-    assert "has_split_gate != has_split_up" in SOURCE
-    assert "moe_split_gate_up" in SOURCE
-    assert 'true, i, "gate"' in SOURCE
-    assert 'true, i, "up"' in SOURCE
+    shared = (CUDA_ROOT.parents[1] / "models/common/weight_loading.h").read_text()
+    assert 'prefix + "experts.gate.weight"' in shared
+    assert 'prefix + "experts.up.weight"' in shared
+    assert "split != ops.has(up)" in shared
+    assert "moe_split_gate_up" in shared
+    assert 'role = "gate"' in SOURCE
+    assert 'role = "up"' in SOURCE
     assert '"moe.gate_up_split"' in SOURCE
     assert "mfq_tensor_backend::cat({gate, up}, -1).contiguous()" in SOURCE
 
 
 def test_generic_ffn_loader_stays_dense_and_model_moe_loaders_are_typed():
-    loader = (
-        CUDA_ROOT / "runtime" / "cuda_transformer_loader.cpp"
-    ).read_text(encoding="utf-8")
-    assert "experts.gate.weight" not in loader
-    assert "const mfq::models::ModelConfig& config" in loader
+    shared = (CUDA_ROOT.parents[1] / "models/common/weight_loading.h").read_text()
+    dense = shared.split("Ffn load_dense_ffn", 1)[1].split("Ffn load_moe_weights", 1)[0]
+    assert "experts.gate.weight" not in dense
+    assert "const ModelConfig& config" in dense
     assert "deepseek_v4::load_block(" in SOURCE
     assert "glm_dsa::load_ffn(" in SOURCE
-    assert "deepseek_v41_runtime::load_moe(" in SOURCE
+    assert "models::load_moe_weights<FFN>" in SOURCE
 
 
 def test_native_float_linears_are_supported_without_forcing_tp_shards():
     assert "QuantLinearKind::Dense" in SOURCE
     assert 'dtype == "BF16" || dtype == "F16" || dtype == "F32"' in SOURCE
-    assert 'std::getenv("MFQ_TP_SHARD_NATIVE_FLOAT")' in SOURCE
+    assert '"MFQ_TP_SHARD_NATIVE_FLOAT"' in SOURCE
+    assert "execution.config.tensor_parallel_shard_native_float" in SOURCE
     assert (
         "result.dense = cpu.to(mfq_tensor_backend::kCUDA).contiguous()" in SOURCE
     )

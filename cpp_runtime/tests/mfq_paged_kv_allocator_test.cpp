@@ -1,4 +1,4 @@
-#include "../backends/cuda/runtime/paged_kv_allocator.h"
+#include "paged_kv_allocator.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -16,7 +16,7 @@ void require(bool condition, const char * message) {
 } // namespace
 
 int main() {
-    using mfq::cuda::continuous::PagedKvPageAllocator;
+    using mfq::engine::PagedKvPageAllocator;
 
     PagedKvPageAllocator allocator(8);
     const auto pages = allocator.allocate(8);

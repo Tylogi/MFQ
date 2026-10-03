@@ -4,11 +4,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -184,12 +187,103 @@ void test_block_gqa_matches_expanded_reference() {
               << " rms=" << rms << "\n";
 }
 
+void test_block_gqa_decode() {
+    using namespace mlx::core;
+    for (const auto dtype : {float16, bfloat16}) {
+        for (const int keys : {1, 2, 3, 4, 16, 17, 18, 19, 2048, 2051, 4096}) {
+            for (const bool invalid_blocks : {false, true}) {
+                const int count = keys < 2048 ? 3 : 512;
+                auto query = astype(patterned_half(
+                    24 * 256, Shape{1, 24, 1, 256}, 37, 1.0f / 511.0f), dtype);
+                auto key = astype(patterned_half(
+                    2 * keys * 256, Shape{1, 2, keys, 256}, 53, 1.0f / 487.0f), dtype);
+                auto value = astype(patterned_half(
+                    2 * keys * 256, Shape{1, 2, keys, 256}, 71, 1.0f / 463.0f), dtype);
+                std::vector<std::int32_t> ids(count);
+                for (int i = 0; i < count; ++i) ids[i] = i * (keys / 4) / count;
+                if (invalid_blocks) {
+                    ids[0] = -1;
+                    ids[count - 1] = keys / 4 + 1;
+                }
+                array blocks(ids.begin(), Shape{1, 1, count});
+                setenv("MFQ_METAL_SPARSE_GQA_DECODE_GATHER", "0", 1);
+                auto expected = mfq::metal::mlx_sparse_block_gqa_attention(
+                    query, key, value, blocks, keys - 1, 4);
+                setenv("MFQ_METAL_SPARSE_GQA_DECODE_GATHER", "1", 1);
+                auto actual = mfq::metal::mlx_sparse_block_gqa_attention(
+                    query, key, value, blocks, keys - 1, 4);
+                if (actual.shape() != expected.shape() || actual.dtype() != dtype) {
+                    throw std::runtime_error("sparse GQA decode shape/dtype mismatch");
+                }
+                actual = astype(contiguous(actual), float32);
+                expected = astype(contiguous(expected), float32);
+                eval(actual, expected);
+                const auto* a = actual.data<float>();
+                const auto* e = expected.data<float>();
+                float maximum = 0.0f;
+                for (std::size_t i = 0; i < actual.size(); ++i) {
+                    maximum = std::max(maximum, std::fabs(a[i] - e[i]));
+                    if (!std::isfinite(a[i]) || maximum > 2e-3f) {
+                        throw std::runtime_error(
+                            "sparse GQA decode mismatch: " + std::to_string(maximum));
+                    }
+                }
+            }
+        }
+    }
+    unsetenv("MFQ_METAL_SPARSE_GQA_DECODE_GATHER");
+}
+
+void benchmark_block_gqa_decode() {
+    using namespace mlx::core;
+    for (const int keys : {2051, 4096, 16387}) {
+        constexpr int count = 512;
+        auto query = patterned_half(
+            24 * 256, Shape{1, 24, 1, 256}, 37, 1.0f / 511.0f);
+        auto key = patterned_half(
+            2 * keys * 256, Shape{1, 2, keys, 256}, 53, 1.0f / 487.0f);
+        auto value = patterned_half(
+            2 * keys * 256, Shape{1, 2, keys, 256}, 71, 1.0f / 463.0f);
+        std::vector<std::int32_t> ids(count);
+        for (int i = 0; i < count; ++i) ids[i] = i * (keys / 4) / count;
+        array blocks(ids.begin(), Shape{1, 1, count});
+        eval(query, key, value, blocks);
+        auto execute = [&] {
+            auto output = mfq::metal::mlx_sparse_block_gqa_attention(
+                query, key, value, blocks, keys - 1, 4);
+            output.eval();
+        };
+        for (int warm = 0; warm < 24; ++warm) {
+            setenv("MFQ_METAL_SPARSE_GQA_DECODE_GATHER", warm % 2 ? "1" : "0", 1);
+            execute();
+        }
+        for (int pair = 0; pair < 8; ++pair) {
+            double times[2]{};
+            for (int arm = 0; arm < 2; ++arm) {
+                const int gather = (pair + arm) % 2;
+                setenv("MFQ_METAL_SPARSE_GQA_DECODE_GATHER", gather ? "1" : "0", 1);
+                const auto start = std::chrono::steady_clock::now();
+                for (int rep = 0; rep < 50; ++rep) execute();
+                times[gather] = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - start).count() / 50.0;
+            }
+            std::cout << "sparse_gqa keys=" << keys << " pair=" << pair
+                      << " direct_ms=" << times[0] << " gather_ms=" << times[1] << '\n';
+        }
+    }
+    unsetenv("MFQ_METAL_SPARSE_GQA_DECODE_GATHER");
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
         mlx::core::set_default_device(mlx::core::Device::gpu);
         test_block_gqa_matches_expanded_reference();
+        test_block_gqa_decode();
+        if (argc == 2 && std::string(argv[1]) == "--benchmark-decode") {
+            benchmark_block_gqa_decode();
+        }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << "\n";

@@ -1,9 +1,10 @@
-#include "models/deepseek_v4.h"
-#include "models/flash_next.h"
-#include "models/gemma4.h"
-#include "models/glm_dsa.h"
-#include "models/minicpmo45.h"
-#include "models/qwen35.h"
+#include "models/deepseek_v4/config.h"
+#include "models/glm5_next/config.h"
+#include "models/qwen4_exp/config.h"
+#include "models/gemma4/config.h"
+#include "models/glm_dsa/config.h"
+#include "models/minicpmo45/config.h"
+#include "models/qwen35/config.h"
 
 #include <iostream>
 #include <stdexcept>

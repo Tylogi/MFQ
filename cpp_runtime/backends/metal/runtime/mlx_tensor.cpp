@@ -318,8 +318,7 @@ array materialize_weight_fp16(
                     ? value
                     : mlx::core::astype(value, mlx::core::float16);
             } else if constexpr (
-                std::is_same_v<Weight, MlxTpqPqWeight>
-                || std::is_same_v<Weight, MlxFp8SqWeight>
+                std::is_same_v<Weight, MlxFp8SqWeight>
                 || std::is_same_v<Weight, MlxMxWeight>
                 || std::is_same_v<Weight, MlxMxfp4SqWeight>
             ) {
@@ -351,7 +350,6 @@ std::optional<array> unpack_quantized_weight(
                 std::is_same_v<Weight, MlxNintWeight>
                 || std::is_same_v<Weight, MlxNint8ZeroWeight>
                 || std::is_same_v<Weight, MlxVqWeight>
-                || std::is_same_v<Weight, MlxTpqInt4Weight>
             ) {
                 return mlx::core::astype(
                     value.embedding(
@@ -359,8 +357,7 @@ std::optional<array> unpack_quantized_weight(
                         mlx::core::float32),
                     mlx::core::float16);
             } else if constexpr (
-                std::is_same_v<Weight, MlxTpqPqWeight>
-                || std::is_same_v<Weight, MlxFp8SqWeight>
+                std::is_same_v<Weight, MlxFp8SqWeight>
                 || std::is_same_v<Weight, MlxMxfp4SqWeight>
             ) {
                 return mlx::core::astype(
@@ -541,17 +538,6 @@ MlxLinear MlxLinear::load(
         return finish(MlxLinear(
             MlxFp8SqWeight::from_blob(record.dtype, mapped.view())));
     }
-    if (record.dtype == "TPQ-I4G64" ||
-        record.dtype == "TPQ-I4G64") {
-        return finish(MlxLinear(
-            MlxTpqInt4Weight::from_blob(model.read(name))));
-    }
-    if (is_tpq_dtype(record.dtype)) {
-        return finish(MlxLinear(
-            MlxTpqPqWeight::from_blob(
-                record.dtype,
-                model.read(name))));
-    }
     if (is_mx_dtype(record.dtype)) {
         return finish(MlxLinear(
             MlxMxWeight::from_blob(record.dtype, model.read(name))));
@@ -570,16 +556,6 @@ MlxLinear::MlxLinear(MlxNint8ZeroWeight weight)
       weight_(std::move(weight)) {}
 
 MlxLinear::MlxLinear(MlxVqWeight weight)
-    : input_size_(weight.input_size()),
-      output_size_(weight.output_size()),
-      weight_(std::move(weight)) {}
-
-MlxLinear::MlxLinear(MlxTpqInt4Weight weight)
-    : input_size_(weight.input_size()),
-      output_size_(weight.output_size()),
-      weight_(std::move(weight)) {}
-
-MlxLinear::MlxLinear(MlxTpqPqWeight weight)
     : input_size_(weight.input_size()),
       output_size_(weight.output_size()),
       weight_(std::move(weight)) {}
@@ -643,14 +619,6 @@ array MlxLinear::operator()(const array& input) const {
     if (const auto* packed = std::get_if<MlxVqWeight>(&weight_)) {
         return preserve_input_dtype(packed->matmul(input));
     }
-    if (const auto* packed =
-            std::get_if<MlxTpqInt4Weight>(&weight_)) {
-        return preserve_input_dtype(packed->matmul(input));
-    }
-    if (const auto* packed =
-            std::get_if<MlxTpqPqWeight>(&weight_)) {
-        return preserve_input_dtype(packed->matmul(input));
-    }
     if (const auto* packed = std::get_if<MlxFp8SqWeight>(&weight_)) {
         return preserve_input_dtype(packed->matmul(input));
     }
@@ -667,6 +635,14 @@ array MlxLinear::operator()(const array& input) const {
         source = mlx::core::astype(source, dense.dtype());
     }
     const auto rows = source.size() / static_cast<std::size_t>(input_size_);
+    if (rows == 1 &&
+        moe_dense_router_logits_supported(source, dense)) {
+        auto output_shape = input.shape();
+        output_shape.back() = output_size_;
+        return mlx::core::reshape(
+            moe_dense_router_logits(source, dense),
+            std::move(output_shape));
+    }
     if (rows >= 2 && rows <= 6 &&
         input_size_ % 4 == 0 &&
         dense.size() >= 65536 &&
@@ -695,6 +671,26 @@ array MlxLinear::operator()(const array& input) const {
         }
     }
     return mlx::core::matmul(source, mlx::core::transpose(dense));
+}
+
+array MlxLinear::moe_shared(
+    const array& input,
+    const array& routed_pairs,
+    const array& route_weights,
+    const array& gate_logits) const {
+    if (const auto* packed = std::get_if<MlxNintWeight>(&weight_);
+        packed != nullptr && !mlx_reference_enabled()) {
+        return packed->matmul_moe_shared(
+            input,
+            routed_pairs,
+            route_weights,
+            gate_logits);
+    }
+    return moe_weighted_reduce_shared_gate(
+        routed_pairs,
+        route_weights,
+        (*this)(input),
+        gate_logits);
 }
 
 array MlxLinear::grouped_row_matmul(
@@ -738,12 +734,6 @@ array MlxLinear::grouped_row_matmul(
         }
     }
     if (const auto* packed =
-            std::get_if<MlxTpqInt4Weight>(&weight_)) {
-        return packed->grouped_row_matmul(
-            input,
-            group_count);
-    }
-    if (const auto* packed =
             std::get_if<MlxNint8ZeroWeight>(&weight_)) {
         return packed->grouped_row_matmul(
             input,
@@ -780,8 +770,7 @@ array MlxLinear::grouped_row_matmul(
 
     // The fallback intentionally stays on the original packed representation:
     // project each input group, then keep the output rows assigned to that
-    // group. This matches the reference implementation for NINT/VQ/TPQ-PQ
-    // and keeps correctness for uncommon O-LoRA weight formats.
+    // group. This keeps correctness for uncommon O-LoRA weight formats.
     const auto complete = (*this)(input);
     const int output_per_group =
         output_size_ / group_count;
@@ -907,14 +896,6 @@ MlxLinear::grouped_weight_ref() const noexcept {
     }
     if (const auto* packed =
             std::get_if<MlxVqWeight>(&weight_)) {
-        return MlxGroupedLinearWeightRef{packed};
-    }
-    if (const auto* packed =
-            std::get_if<MlxTpqInt4Weight>(&weight_)) {
-        return MlxGroupedLinearWeightRef{packed};
-    }
-    if (const auto* packed =
-            std::get_if<MlxTpqPqWeight>(&weight_)) {
         return MlxGroupedLinearWeightRef{packed};
     }
     if (const auto* packed =
@@ -1193,16 +1174,6 @@ MlxEmbedding MlxEmbedding::load(
         throw std::runtime_error(
             "FP8-SQ tensors do not support embedding lookup: " + name);
     }
-    if (record.dtype == "TPQ-I4G64" ||
-        record.dtype == "TPQ-I4G64") {
-        return finish(MlxEmbedding(
-            MlxTpqInt4Weight::from_blob(model.read(name))));
-    }
-    if (is_tpq_dtype(record.dtype)) {
-        throw std::runtime_error(
-            "TPQ learned-PQ tensors do not support embedding lookup: " +
-            name);
-    }
     if (is_mx_dtype(record.dtype)) {
         return finish(MlxEmbedding(
             MlxMxWeight::from_blob(record.dtype, model.read(name))));
@@ -1221,11 +1192,6 @@ MlxEmbedding::MlxEmbedding(MlxNint8ZeroWeight weight)
       weight_(std::move(weight)) {}
 
 MlxEmbedding::MlxEmbedding(MlxVqWeight weight)
-    : vocabulary_size_(weight.output_size()),
-      hidden_size_(weight.input_size()),
-      weight_(std::move(weight)) {}
-
-MlxEmbedding::MlxEmbedding(MlxTpqInt4Weight weight)
     : vocabulary_size_(weight.output_size()),
       hidden_size_(weight.input_size()),
       weight_(std::move(weight)) {}
@@ -1281,10 +1247,6 @@ array MlxEmbedding::operator()(
     if (const auto* packed = std::get_if<MlxVqWeight>(&weight_)) {
         return finish_quantized(*packed);
     }
-    if (const auto* packed =
-            std::get_if<MlxTpqInt4Weight>(&weight_)) {
-        return finish_quantized(*packed);
-    }
     if (const auto* packed = std::get_if<MlxMxWeight>(&weight_)) {
         auto result = packed->embedding(
             token_ids,
@@ -1329,10 +1291,6 @@ array MlxEmbedding::project(const array& input) const {
         return packed->matmul(input);
     }
     if (const auto* packed = std::get_if<MlxVqWeight>(&weight_)) {
-        return packed->matmul(input);
-    }
-    if (const auto* packed =
-            std::get_if<MlxTpqInt4Weight>(&weight_)) {
         return packed->matmul(input);
     }
     if (const auto* packed = std::get_if<MlxMxWeight>(&weight_)) {

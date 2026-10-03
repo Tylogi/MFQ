@@ -10,15 +10,35 @@ DECODE = "\n".join(
     for path in sorted(CUDA_ROOT.rglob("*"))
     if path.suffix in {".h", ".cpp"}
 )
-MODEL_LOADER = (CUDA_ROOT / "runtime" / "causal_lm_loader.cpp").read_text(
+MODEL_LOADER = (CUDA_ROOT / "storage" / "model_loader.cpp").read_text(
     encoding="utf-8"
 )
-CUDA_RUNTIME = (CUDA_ROOT / "runtime" / "cuda_decode_runtime.cpp").read_text(
-    encoding="utf-8"
+CUDA_RUNTIME = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in (
+        CUDA_ROOT / "commands" / "runtime.cpp",
+        CUDA_ROOT / "storage" / "model_loader.h",
+        CUDA_ROOT / "commands" / "cli.cpp",
+        CUDA_ROOT / "storage" / "load_options.cpp",
+        CUDA_ROOT / "commands" / "diagnostics.cpp",
+    )
 )
-SERVER = (ROOT / "cpp_runtime" / "server" / "src" / "server.cpp").read_text(
-    encoding="utf-8"
+CUDA_NINT = (CUDA_ROOT / "ops" / "nint.cpp").read_text(encoding="utf-8")
+TRANSPORT_SRC = ROOT / "cpp_runtime" / "transport"
+TRANSPORT = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted(TRANSPORT_SRC.rglob("*"))
+    if path.suffix in {".cpp", ".h"}
 )
+SERVER = TRANSPORT
+TRANSPORT_BASE = (
+    TRANSPORT_SRC / "include" / "transport.h"
+).read_text(encoding="utf-8")
+HTTP_TRANSPORT = (TRANSPORT_SRC / "src" / "http.cpp").read_text(encoding="utf-8")
+STDIO_TRANSPORT = (TRANSPORT_SRC / "src" / "stdio.cpp").read_text(encoding="utf-8")
+METAL_RUNTIME = (
+    ROOT / "cpp_runtime" / "backends" / "metal" / "apps" / "mfq_decode_mlx.cpp"
+).read_text(encoding="utf-8")
 METAL_VQ = (ROOT / "cpp_runtime" / "backends" / "metal" / "ops" / "mlx_vq.cpp").read_text(
     encoding="utf-8"
 )
@@ -67,23 +87,64 @@ def test_single_source_moe_cache_holds_full_demand_set() -> None:
 def test_moe_cache_capacity_failure_uses_full_projection_path() -> None:
     assert "if (!cache_->prepare(" in DECODE
     assert "count_full_projection_fallback" in DECODE
-    assert "stage_cpu_mixed_moe(cpu_)" in DECODE
+    assert "stage_cpu_mixed_moe(cpu_, execution.config)" in DECODE
 
 
 def test_optional_predictor_experts_join_the_shared_moe_cache() -> None:
     assert "bool defer_moe_cache_finalize = false" in DECODE
     assert "!defer_moe_cache_finalize" in MODEL_LOADER
-    assert "const bool load_optional_components" in CUDA_RUNTIME
+    assert "bool load_optional_components" in CUDA_RUNTIME
     assert CUDA_RUNTIME.index("load_runtime_components(") < CUDA_RUNTIME.index(
-        "finalize_moe_expert_cache();"
+        "finalize_moe_expert_cache(execution.moe_expert_cache);"
     )
 
 
-def test_reload_and_request_registration_share_one_gate() -> None:
-    assert "std::mutex reload_gate;" in SERVER
-    assert SERVER.count("std::lock_guard<std::mutex> gate(reload_gate);") >= 2
-    assert "std::make_shared<ActiveRequest>(server_metrics)" in SERVER
+def test_reload_and_request_registration_use_scheduler_mailbox() -> None:
+    assert "reload_gate" not in SERVER
+    assert "scheduler.reload(" in SERVER
+    assert "scheduler_.submit(" in SERVER
+    assert "std::make_shared<ActiveRequest>(request_metrics_store)" in SERVER
     assert "active_request->complete(" in SERVER
+
+
+def test_http_and_stdio_are_separate_transport_implementations() -> None:
+    assert "class MfqTransport" in TRANSPORT_BASE
+    assert "class MfqHttpTransport final : public MfqTransport" in HTTP_TRANSPORT
+    assert "class MfqStdioTransport final : public MfqTransport" in STDIO_TRANSPORT
+    assert "std::cin" not in HTTP_TRANSPORT
+    assert "httplib::" not in STDIO_TRANSPORT
+
+
+def test_stdio_transport_owns_stdin_and_isolates_stdout() -> None:
+    assert "::dup2(STDERR_FILENO, STDOUT_FILENO)" in TRANSPORT
+    assert "FD_CLOEXEC" in TRANSPORT
+    assert "DuplicateHandle(" in TRANSPORT
+    assert "FALSE, DUPLICATE_SAME_ACCESS" in TRANSPORT
+    assert CUDA_RUNTIME.index("prepare_mfq_stdio_transport();") < CUDA_RUNTIME.index(
+        "Model model ="
+    )
+    assert METAL_RUNTIME.index("prepare_mfq_stdio_transport();") < METAL_RUNTIME.index(
+        "const mfq::metal::MfqContainer model(arguments.mfq);"
+    )
+
+    stdin_users: set[str] = set()
+    for path in (ROOT / "cpp_runtime").rglob("*"):
+        if path.suffix not in {".cpp", ".cc", ".cxx", ".cu", ".h", ".hpp"}:
+            continue
+        if "tests" in path.parts:
+            continue
+        source = path.read_text(encoding="utf-8", errors="ignore")
+        if any(
+            marker in source
+            for marker in ("std::cin", "STDIN_FILENO", "_fileno(stdin)")
+        ):
+            stdin_users.add(path.relative_to(ROOT / "cpp_runtime").as_posix())
+    assert stdin_users == {
+        "backends/cuda/commands/minicpmo45.cpp",
+        "transport/src/stdio.cpp",
+    }
+    assert "if (minicpmo_eval_batch)" in CUDA_RUNTIME
+    assert "MiniCPM-o eval mode cannot be combined with" in CUDA_RUNTIME
 
 
 def test_metal_jsc_rejects_partial_code_vectors() -> None:
@@ -100,9 +161,9 @@ def test_cuda_kl_rejects_context_larger_than_model_capacity() -> None:
 
 
 def test_cuda_nint_loader_expands_v2_metadata_before_kernel_dispatch() -> None:
-    start = DECODE.index("static NintCpu unpack_nint(")
-    stop = DECODE.index("struct Nint8ZeroCpu", start)
-    loader = DECODE[start:stop]
+    start = CUDA_NINT.index("NintCpu unpack_nint(")
+    stop = CUDA_NINT.index("Nint8ZeroCpu unpack_nint8_zero(", start)
+    loader = CUDA_NINT[start:stop]
     assert "const bool is_nint_v2 = (raw_bits & 0x80) != 0;" in loader
     assert "t.sub_bits = blob[off++];" in loader
     assert "if (is_nint_v2)" in loader

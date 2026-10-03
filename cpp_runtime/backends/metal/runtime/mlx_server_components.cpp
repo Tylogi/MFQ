@@ -78,13 +78,12 @@ std::vector<MlxGridShape> grid_shapes(
 
 } // namespace
 
-MlxServerComponentCallbacks make_mlx_server_components(
+MlxEngineComponents make_mlx_engine_components(
     const MfqModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxQwen35CausalLm>> runtime_holder,
     mlx::core::Stream runtime_stream) {
-    MlxServerComponentCallbacks result;
-    result.duplex.name = "metal";
+    MlxEngineComponents result;
     result.mtp_available =
         component_declared(graph, "predictor") &&
         runtime_holder->has_value() &&
@@ -101,9 +100,10 @@ MlxServerComponentCallbacks make_mlx_server_components(
             const std::vector<std::int64_t>& prompt,
             const MfqMultimodalInput& media,
             const MfqSamplingParams& sampling,
-            const MfqTokenCallback& callback,
-            const MfqPrefillCallback& on_prefill,
+            MlxGenerationJob& job,
             const MfqTokenConstraintPtr& token_constraint) {
+            const auto callback = [&job](std::int64_t token) { return job.token(token); };
+            const auto on_prefill = [&job](MfqPrefillTiming timing) { job.prefill(timing); };
             std::lock_guard<std::mutex> lock(*runtime_mutex);
             if (!runtime_holder->has_value()) {
                 throw std::runtime_error(
@@ -150,7 +150,7 @@ MlxServerComponentCallbacks make_mlx_server_components(
                     .count();
 
             std::function<void(std::size_t, double)> report_prefill;
-            if (on_prefill) {
+            {
                 report_prefill = [on_prefill, component_ms](
                     std::size_t tokens, double llm_ms) {
                     on_prefill(MfqPrefillTiming{
@@ -169,13 +169,12 @@ MlxServerComponentCallbacks make_mlx_server_components(
     return result;
 }
 
-MlxServerComponentCallbacks make_mlx_server_components(
+MlxEngineComponents make_mlx_engine_components(
     const MfqModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxMiniCPMO45Runtime>> runtime_holder,
     mlx::core::Stream runtime_stream) {
-    MlxServerComponentCallbacks result;
-    result.duplex.name = "metal";
+    MlxEngineComponents result;
     if (component_with_implementation(
             graph, "vision", "minicpmo45_vision") != nullptr) {
         result.multimodal_generate =
@@ -183,9 +182,10 @@ MlxServerComponentCallbacks make_mlx_server_components(
                 const std::vector<std::int64_t>& prompt,
                 const MfqMultimodalInput& media,
                 const MfqSamplingParams& sampling,
-                const MfqTokenCallback& callback,
-                const MfqPrefillCallback& on_prefill,
+                MlxGenerationJob& job,
                 const MfqTokenConstraintPtr& token_constraint) {
+                const auto callback = [&job](std::int64_t token) { return job.token(token); };
+                const auto on_prefill = [&job](MfqPrefillTiming timing) { job.prefill(timing); };
                 std::lock_guard<std::mutex> lock(*runtime_mutex);
                 if (!runtime_holder->has_value()) {
                     throw std::runtime_error(
@@ -274,7 +274,7 @@ MlxServerComponentCallbacks make_mlx_server_components(
 
                 std::function<void(std::size_t, double, double, double)>
                     report_prefill;
-                if (on_prefill) {
+                {
                     report_prefill = [on_prefill](
                         std::size_t tokens,
                         double llm_ms,
@@ -488,13 +488,12 @@ MlxServerComponentCallbacks make_mlx_server_components(
     return result;
 }
 
-MlxServerComponentCallbacks make_mlx_server_components(
+MlxEngineComponents make_mlx_engine_components(
     const MfqModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxDeepseekV4CausalLm>> runtime_holder,
     mlx::core::Stream runtime_stream) {
-    MlxServerComponentCallbacks result;
-    result.duplex.name = "metal";
+    MlxEngineComponents result;
     const bool legacy_hf = graph == nullptr;
     result.mtp_available =
         component_declared(graph, "predictor") &&
@@ -512,9 +511,10 @@ MlxServerComponentCallbacks make_mlx_server_components(
             const std::vector<std::int64_t>& prompt,
             const MfqMultimodalInput& media,
             const MfqSamplingParams& sampling,
-            const MfqTokenCallback& callback,
-            const MfqPrefillCallback& on_prefill,
+            MlxGenerationJob& job,
             const MfqTokenConstraintPtr& token_constraint) {
+            const auto callback = [&job](std::int64_t token) { return job.token(token); };
+            const auto on_prefill = [&job](MfqPrefillTiming timing) { job.prefill(timing); };
             std::lock_guard<std::mutex> lock(*runtime_mutex);
             if (!runtime_holder->has_value()) {
                 throw std::runtime_error(
@@ -615,7 +615,7 @@ MlxServerComponentCallbacks make_mlx_server_components(
                 });
             }
             MlxDeepseekV4PrefillCallback report_prefill;
-            if (on_prefill) {
+            {
                 report_prefill = [on_prefill](
                     std::size_t tokens,
                     double llm_ms,
@@ -638,13 +638,12 @@ MlxServerComponentCallbacks make_mlx_server_components(
     return result;
 }
 
-MlxServerComponentCallbacks make_mlx_server_components(
+MlxEngineComponents make_mlx_engine_components(
     const MfqModelGraph* graph,
     std::shared_ptr<std::mutex> runtime_mutex,
     std::shared_ptr<std::optional<MlxDeepseekV41CausalLm>> runtime_holder,
     mlx::core::Stream runtime_stream) {
-    MlxServerComponentCallbacks result;
-    result.duplex.name = "metal";
+    MlxEngineComponents result;
     result.mtp_available =
         component_declared(graph, "predictor") &&
         runtime_holder->has_value() &&
@@ -661,9 +660,10 @@ MlxServerComponentCallbacks make_mlx_server_components(
             const std::vector<std::int64_t>& prompt,
             const MfqMultimodalInput& media,
             const MfqSamplingParams& sampling,
-            const MfqTokenCallback& callback,
-            const MfqPrefillCallback& on_prefill,
+            MlxGenerationJob& job,
             const MfqTokenConstraintPtr& token_constraint) {
+            const auto callback = [&job](std::int64_t token) { return job.token(token); };
+            const auto on_prefill = [&job](MfqPrefillTiming timing) { job.prefill(timing); };
             std::lock_guard<std::mutex> lock(*runtime_mutex);
             if (!runtime_holder->has_value()) {
                 throw std::runtime_error(
@@ -745,7 +745,7 @@ MlxServerComponentCallbacks make_mlx_server_components(
                     std::move(types)});
             }
             std::function<void(std::size_t, double)> report_prefill;
-            if (on_prefill) {
+            {
                 report_prefill = [on_prefill](
                     std::size_t tokens, double total_ms) {
                     on_prefill(MfqPrefillTiming{
@@ -764,13 +764,12 @@ MlxServerComponentCallbacks make_mlx_server_components(
     return result;
 }
 
-MlxServerComponentCallbacks make_mlx_server_components(
+MlxEngineComponents make_mlx_engine_components(
     const MfqModelGraph* graph,
     std::shared_ptr<std::mutex>,
     std::shared_ptr<std::optional<MlxQwen4CausalLm>> runtime_holder,
     mlx::core::Stream) {
-    MlxServerComponentCallbacks result;
-    result.duplex.name = "metal";
+    MlxEngineComponents result;
     result.mtp_available =
         component_declared(graph, "predictor") &&
         runtime_holder->has_value() &&

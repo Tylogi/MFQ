@@ -1,11 +1,11 @@
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 CUDA_OPS = ROOT / "cpp_runtime/backends/cuda/ops"
 CUDA_RUNTIME = "\n".join(
-    (CUDA_OPS / name).read_text()
-    for name in ("cuda_quantized_ops.h", "cuda_quantized_ops.cpp")
+    path.read_text()
+    for path in sorted(CUDA_OPS.rglob("*"))
+    if path.suffix in {".h", ".cpp"}
 )
 
 

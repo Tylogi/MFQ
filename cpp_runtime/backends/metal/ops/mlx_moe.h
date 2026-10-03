@@ -16,39 +16,14 @@ namespace mfq::metal {
 
 class MfqContainer;
 class MlxMfeWeight;
+class MlxNintSwiGluPair;
+class MlxNintWeight;
 
 struct MlxMfeProjectionInfo {
     int experts = 0;
     int out_per_expert = 0;
     int neuron_len = 0;
-    std::size_t shared_codebook_nbytes = 0;
     std::vector<std::int32_t> available_experts;
-};
-
-// One transient single-dispatch view over the currently active TPQ experts.
-// Expert IDs remain global.  Packed indices are assembled only for the active
-// set, while every cohort codebook is retained once by the residency object
-// and shared by all expert views from that projection.
-class MlxTpqRoutedWeight {
-public:
-    mlx::core::array routed_matmul(
-        const mlx::core::array& input,
-        const mlx::core::array& expert_ids) const;
-    int experts() const noexcept;
-    int out_per_expert() const noexcept;
-    int neuron_len() const noexcept;
-    std::size_t packed_nbytes() const noexcept;
-    std::size_t shared_codebook_nbytes() const noexcept;
-
-private:
-    struct Impl;
-
-    explicit MlxTpqRoutedWeight(
-        std::shared_ptr<const Impl> impl);
-
-    std::shared_ptr<const Impl> impl_;
-
-    friend class MlxMfeOffloadCache;
 };
 
 // Optional bounded per-expert residency for MFE records.
@@ -81,23 +56,14 @@ public:
     }
     bool can_group_mfe(const std::string& name);
 
-    // Compatibility discriminator for the retired TPQ execution adapter.
-    // New formats must use grouped_mfe(); this exists only so old containers
-    // can stay readable without leaking TPQ parsing into model loaders.
-    bool is_legacy_tpq(const std::string& name);
-
     MlxMfeProjectionInfo projection_info(
         const std::string& name);
     std::vector<std::uint8_t> availability(
         const std::string& name);
 
-    MlxTpqRoutedWeight grouped(
-        const std::string& name,
-        const std::vector<std::int32_t>& active_experts);
-
     // Materialize only the requested experts from a native MFE record and
     // return one ordinary heterogeneous execution weight whose local expert
-    // order matches active_experts. NINTv2, NVQ-JSC, MXFP4, and aligned
+    // order matches active_experts. NINTv2, NVQ1-S/L, NVQ-JSC, MXFP4, and aligned
     // MXFP8 reuse their existing packed kernels after paging.
     MlxMfeWeight grouped_mfe(
         const std::string& name,
@@ -118,11 +84,6 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
-
-// Compatibility names for callers that used the original TPQ-specific API.
-// New model/runtime code must use the generic MFE names above.
-using MlxTpqProjectionInfo = MlxMfeProjectionInfo;
-using MlxTpqExpertResidency = MlxMfeOffloadCache;
 
 // A sorted routed-MoE row block list.  The plan is built once on the GPU and
 // shared by gate/up and down projections so every populated row block can be
@@ -160,6 +121,10 @@ public:
     // projections() * out_per_expert(), in projection-major order.
     static MlxMfeWeight concatenate_projections(
         const std::vector<MlxMfeWeight>& weights);
+
+    // Finalize native two-projection storage at load time and release the
+    // separate source pools. Unsupported split/rotated layouts are unchanged.
+    MlxMfeWeight materialize_packed_projections() const;
 
     // Assemble independently resident single-expert pages into one routed
     // dispatch.  This changes only the packed storage view: every source must
@@ -218,6 +183,18 @@ public:
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
         float limit = 0.0f) const;
+    // One-row heterogeneous MoE decode in two expert Metal launches after
+    // routing. The first runs routed and shared Gate/Up; the second runs
+    // routed and shared Down in parallel and combines them in-threadgroup.
+    // Unsupported geometry returns nullopt.
+    std::optional<mlx::core::array> decode_nint_shared(
+        const MlxMfeWeight& down,
+        const MlxNintSwiGluPair& shared_gate_up,
+        const MlxNintWeight& shared_down,
+        const mlx::core::array& shared_gate_weight,
+        const mlx::core::array& input,
+        const mlx::core::array& expert_ids,
+        const mlx::core::array& route_weights) const;
     // Decode/small-M MXFP4 fast path. For one through six tokens, project
     // every selected expert and apply its routing weight in one Metal
     // dispatch, avoiding the transient [M,routes,hidden] down-projection
@@ -227,6 +204,9 @@ public:
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
         const mlx::core::array& route_weights) const;
+    // Whether this representation has a fused projection/reduction kernel.
+    // Callers may otherwise fuse reduction with their following epilogue.
+    bool supports_fused_routed_reduce() const noexcept;
     mlx::core::array routed_matmul_reduce_packed(
         const mlx::core::array& input,
         const mlx::core::array& packed_expert_ids,

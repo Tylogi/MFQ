@@ -1,7 +1,6 @@
 #pragma once
 
 #include "mfq_container.h"
-#include "mlx_tpq.h"
 #include "mlx_grouped_linear.h"
 #include "mlx_fp8_sq.h"
 #include "mlx_mx.h"
@@ -42,14 +41,21 @@ public:
     explicit MlxLinear(MlxNintWeight weight);
     explicit MlxLinear(MlxNint8ZeroWeight weight);
     explicit MlxLinear(MlxVqWeight weight);
-    explicit MlxLinear(MlxTpqInt4Weight weight);
-    explicit MlxLinear(MlxTpqPqWeight weight);
     explicit MlxLinear(MlxFp8SqWeight weight);
     explicit MlxLinear(MlxMxWeight weight);
     explicit MlxLinear(MlxMxfp4SqWeight weight);
     explicit MlxLinear(mlx::core::array weight);
 
     mlx::core::array operator()(const mlx::core::array& input) const;
+
+    // Project one shared-expert activation and combine it with routed MoE
+    // rows. NINT uses a register-resident projection/reduce/gate epilogue;
+    // other formats retain the exact composed implementation.
+    mlx::core::array moe_shared(
+        const mlx::core::array& input,
+        const mlx::core::array& routed_pairs,
+        const mlx::core::array& route_weights,
+        const mlx::core::array& gate_logits) const;
 
     // Returns a token id when the packed layout has a fused single-row
     // LM-head/greedy implementation; otherwise returns std::nullopt.
@@ -58,9 +64,6 @@ public:
 
     // Diagonal grouped-projection layout:
     // input [...,groups,K] -> [...,groups,OUT/groups].
-    // TPQ-I4G64 uses its dedicated Metal kernel; every other supported
-    // linear format takes the exact packed/dense fallback without changing
-    // model semantics.
     mlx::core::array grouped_row_matmul(
         const mlx::core::array& input,
         int group_count) const;
@@ -100,8 +103,6 @@ private:
         MlxNintWeight,
         MlxNint8ZeroWeight,
         MlxVqWeight,
-        MlxTpqInt4Weight,
-        MlxTpqPqWeight,
         MlxFp8SqWeight,
         MlxMxWeight,
         MlxMxfp4SqWeight,
@@ -160,7 +161,6 @@ public:
     explicit MlxEmbedding(MlxNintWeight weight);
     explicit MlxEmbedding(MlxNint8ZeroWeight weight);
     explicit MlxEmbedding(MlxVqWeight weight);
-    explicit MlxEmbedding(MlxTpqInt4Weight weight);
     explicit MlxEmbedding(MlxMxWeight weight);
     explicit MlxEmbedding(mlx::core::array weight);
 
@@ -188,7 +188,6 @@ private:
         MlxNintWeight,
         MlxNint8ZeroWeight,
         MlxVqWeight,
-        MlxTpqInt4Weight,
         MlxMxWeight,
         mlx::core::array> weight_;
     int vocabulary_size_ = 0;

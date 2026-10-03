@@ -6,7 +6,6 @@ set(MFQ_METAL_INCLUDE_DIRS
     ${MFQ_METAL_ROOT}/storage/compat
     ${MFQ_METAL_ROOT}/runtime
     ${MFQ_METAL_ROOT}/ops
-    ${MFQ_METAL_ROOT}/legacy/tpq
     ${MFQ_METAL_ROOT}/models/deepseek_v4
     ${MFQ_METAL_ROOT}/models/deepseek_v41
     ${MFQ_METAL_ROOT}/models/flash_next
@@ -243,8 +242,6 @@ add_library(mfq-metal-runtime STATIC
     ops/mlx_nint8_zero.cpp
     ops/mlx_sparse_attention.cpp
     ops/mlx_vq.cpp
-    # Isolated compatibility reader/operator for old TPQ artifacts only.
-    legacy/tpq/mlx_tpq.cpp
     models/deepseek_v4/deepseek_v4_model.cpp
     models/deepseek_v4/mlx_deepseek_v4_attention.cpp
     models/deepseek_v4/mlx_deepseek_v4_causal_lm.cpp
@@ -277,6 +274,8 @@ target_include_directories(mfq-metal-runtime PRIVATE
 )
 target_link_libraries(mfq-metal-runtime PUBLIC
     mfq-core
+    mfq-models
+    mfq-engine
     mfq-mlx
     mfq-jaccl
     Threads::Threads
@@ -291,6 +290,19 @@ target_compile_definitions(mfq-metal-runtime PUBLIC
     MFQ_NATIVE_MLX_RUNTIME=1
     MFQ_MLX_METALLIB_DEFAULT="${MFQ_MLX_METALLIB_DEFAULT}"
 )
+
+add_library(mfq-metal-engine STATIC
+    runtime/mlx_engine.cpp
+    runtime/mlx_generation_job.cpp
+    runtime/mlx_server_components.cpp
+)
+target_link_libraries(mfq-metal-engine PUBLIC mfq-metal-runtime mfq-engine)
+target_compile_features(mfq-metal-engine PUBLIC cxx_std_20)
+
+add_executable(mfq-metal-engine-test tests/mlx_engine_test.cpp)
+target_link_libraries(mfq-metal-engine-test PRIVATE mfq-metal-engine)
+target_compile_features(mfq-metal-engine-test PRIVATE cxx_std_20)
+add_test(NAME mfq-metal-engine-test COMMAND mfq-metal-engine-test)
 
 add_executable(mfq-decode-metal
     apps/mfq_decode_mlx.cpp
@@ -356,19 +368,17 @@ add_custom_command(
     COMMENT "Building the shared native Metal runtime bundle"
 )
 
-if(TARGET mfq-server)
-    target_sources(mfq-decode-metal PRIVATE
-        runtime/mlx_server_components.cpp
-    )
-    target_link_libraries(mfq-decode-metal PRIVATE mfq-server)
-    target_compile_definitions(mfq-decode-metal PRIVATE MFQ_METAL_SERVER=1)
+if(TARGET mfq-runtime-communication)
+    target_link_libraries(mfq-decode-metal PRIVATE mfq-metal-engine mfq-runtime-communication)
+    target_compile_definitions(
+        mfq-decode-metal PRIVATE MFQ_METAL_RUNTIME_COMMUNICATION=1)
 
     add_executable(mfq-perplexity
         apps/mfq_perplexity_mlx.cpp
     )
     target_link_libraries(mfq-perplexity PRIVATE
         mfq-metal-runtime
-        mfq-server
+        mfq-runtime-communication
     )
     target_compile_features(mfq-perplexity PRIVATE cxx_std_20)
     set_target_properties(mfq-perplexity PROPERTIES
@@ -613,24 +623,6 @@ set_target_properties(mfq-metal-grouped-linear-test PROPERTIES
 add_test(
     NAME mfq-metal-grouped-linear-test
     COMMAND mfq-metal-grouped-linear-test
-)
-
-add_executable(mfq-metal-legacy-tpq-test
-    legacy/tpq/tests/mlx_tpq_test.cpp
-)
-target_link_libraries(
-    mfq-metal-legacy-tpq-test PRIVATE
-    mfq-metal-runtime
-)
-target_compile_features(
-    mfq-metal-legacy-tpq-test PRIVATE cxx_std_20)
-set_target_properties(
-    mfq-metal-legacy-tpq-test PROPERTIES
-    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
-)
-add_test(
-    NAME mfq-metal-legacy-tpq-test
-    COMMAND mfq-metal-legacy-tpq-test
 )
 
 add_executable(mfq-metal-deepseek-v4-hc-test

@@ -1,6 +1,5 @@
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -39,17 +38,15 @@ def test_cuda_dense_dispatch_keeps_packed_decode_and_transient_gemm() -> None:
 def test_cuda_runtime_routes_dense_and_mfe_without_model_branches() -> None:
     ops = ROOT / "cpp_runtime/backends/cuda/ops"
     source = "\n".join(
-        (ops / name).read_text()
-        for name in ("cuda_quantized_ops.h", "cuda_quantized_ops.cpp")
+        path.read_text()
+        for path in sorted(ops.rglob("*"))
+        if path.suffix in {".h", ".cpp"}
     )
     assert 'weight.dtype == "MXFP8-SQ"' in source
     assert 'weight.dtype == "FP8-128SQ"' in source
     assert "mxfp8_sq_moe_matmul_cuda(" in source
     assert "fp8_128_sq_moe_matmul_cuda(" in source
-    fp8_section = source[source.index("struct Fp8SqWeight") :]
-    fp8_section = fp8_section[
-        : fp8_section.index("static Mxfp4SqWeight to_device_mxfp4_sq")
-    ]
+    fp8_section = (ops / "fp8_sq.cpp").read_text()
     for architecture in ("qwen", "deepseek", "glm", "gemma"):
         assert architecture not in fp8_section.lower()
 
@@ -65,7 +62,7 @@ def test_python_cuda_mfe_registers_both_fp8_sq_families() -> None:
 
 
 def test_cuda_builds_include_fp8_sq_once() -> None:
-    cmake = (ROOT / "cpp_runtime/cmake/CudaRuntime.cmake").read_text()
+    cmake = (ROOT / "cpp_runtime/backends/cuda/CMakeLists.txt").read_text()
     extension = (ROOT / "mfq/kernels/cuda/_ext.py").read_text()
     assert cmake.count("${MFQ_CUDA_KERNEL_ROOT}/fp8_sq.cu") == 1
     assert extension.count('os.path.join(_DIR, "fp8_sq.cu")') == 1

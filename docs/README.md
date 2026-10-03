@@ -25,6 +25,7 @@ matches what you want to do.
 - [MiniCPM-o 4.5 multimodal runtime](minicpmo45.md)
 - [CUDA runtime validation](cuda-native-runtime-validation.md)
 - [C++ runtime layout](../cpp_runtime/README.md)
+- [Python/C++ runtime transport](runtime-transport.md)
 
 ## APIs
 

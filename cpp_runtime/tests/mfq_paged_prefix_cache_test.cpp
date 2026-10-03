@@ -1,4 +1,5 @@
 #include "mfq_paged_prefix_cache.h"
+#include "paged_session_bindings.h"
 
 #include <algorithm>
 #include <array>
@@ -216,6 +217,32 @@ int main() try {
         require(stats.writes == 3, "unexpected physical write count");
         require(stats.deduplicated_writes == 1, "deduplication was not counted");
         require(stats.disk_blocks == 2, "disk block count mismatch");
+    }
+
+    {
+        auto cache = std::make_shared<PagedPrefixCache>(
+            PagedPrefixCacheConfig{
+                root,
+                "model-sha|layout-v1|fp16",
+                4,
+                4096,
+                64,
+                2,
+            });
+        mfq::engine::PagedSessionBindings bindings(cache, 2);
+        bindings.bind("first", {first}, 4);
+        require(bindings.fork("first", "fork") == 1,
+                "paged session fork failed");
+        require(bindings.sessions() == 2 && bindings.tokens() == 8,
+                "paged session telemetry mismatch");
+        bindings.bind("new", {first, second}, 8);
+        require(bindings.close("first") == 0,
+                "paged session LRU eviction failed");
+        require(bindings.sessions() == 2 && bindings.tokens() == 12,
+                "paged session replacement telemetry mismatch");
+        require(bindings.clear() == 2 && bindings.sessions() == 0 &&
+                    bindings.tokens() == 0,
+                "paged session clear failed");
     }
 
     const auto namespace_dir =

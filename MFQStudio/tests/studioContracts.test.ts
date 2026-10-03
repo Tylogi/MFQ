@@ -178,12 +178,15 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
 
   it('test_studio_adapts_prefix_cache_panel_to_flash_next_hot_cache', () => {
     const cache = readSources('features/runtime/CachePage.tsx');
-    for (const field of ['prefix_cache_mode', 'prefix_cache_pending_bytes', 'prefix_cache_pending_max_bytes']) {
+    for (const field of ['prefix_cache_mode', 'prefix_cache_pending_bytes', 'prefix_cache_pending_max_bytes', 'prefix_cache_supported', 'prefix_cache_disabled_reason']) {
       expect(API).toContain(field);
     }
+    expect(cache).toContain('runtime?.prefix_cache_supported !== undefined');
+    expect(cache).toContain('prefixCachePersistent || prefixCacheHotOnly');
     expect(cache).toContain('single_device_hot_prefix');
     expect(cache).toContain('Device-hot prefix');
     expect(cache).toContain('Process lifetime');
+    expect(cache).toContain('Session KV cache is unavailable with continuous batching');
     expect(cache).toContain('runtimeApi.clearRuntimeCache');
   });
 

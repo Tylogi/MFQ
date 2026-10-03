@@ -116,7 +116,6 @@ include = ["mfq*"]
 "mfq.quantize.cuda" = ["*.cu", "*.cpp", "*.h"]
 "mfq.server" = [
     "protocol/*.json",
-    "protocol/*.proto",
 ]
 
 [tool.uv]

@@ -1,23 +1,48 @@
 from pathlib import Path
-import re
 
 
-CUDA_ROOT = Path(__file__).parents[1] / "cpp_runtime" / "backends" / "cuda"
-CUDA_RUNTIME = (CUDA_ROOT / "runtime" / "cuda_decode_runtime.cpp").read_text(
-    encoding="utf-8"
+ROOT = Path(__file__).parents[1]
+CUDA_ROOT = ROOT / "cpp_runtime" / "backends" / "cuda"
+CUDA_RUNTIME = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in (
+        CUDA_ROOT / "engine" / "generation.cpp",
+        CUDA_ROOT / "engine" / "generation.h",
+        CUDA_ROOT / "diagnostics" / "token_generation.h",
+    )
 )
 BACKEND_CHECKS = (
-    CUDA_ROOT / "runtime" / "diagnostics" / "backend_checks.cpp"
+    CUDA_ROOT / "diagnostics" / "backend_checks.cpp"
 ).read_text(encoding="utf-8")
-SOURCE = "\n".join(
-    (CUDA_ROOT / "runtime" / name).read_text(encoding="utf-8")
-    for name in (
-        "causal_lm.h",
-        "cuda_transformer.h",
-        "cuda_execution.h",
-        "cuda_execution.cpp",
+MODEL_METADATA_SOURCE = "\n".join(
+    (ROOT / "cpp_runtime/models" / model / "causal_lm.h").read_text(
+        encoding="utf-8"
     )
-) + "\n" + BACKEND_CHECKS + "\n" + CUDA_RUNTIME
+    for model in ("glm_dsa", "minicpmo45")
+)
+SOURCE = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in (
+        CUDA_ROOT / "core" / "causal_model.h",
+        CUDA_ROOT / "core" / "causal_model.cpp",
+        CUDA_ROOT / "storage" / "session_codec.h",
+        CUDA_ROOT / "storage" / "transformer_loader.h",
+        CUDA_ROOT / "storage" / "transformer_loader.cpp",
+        CUDA_ROOT / "core" / "full_block.h",
+        CUDA_ROOT / "core" / "full_block.cpp",
+        CUDA_ROOT / "core" / "kv_cache.h",
+        CUDA_ROOT / "core" / "kv_cache.cpp",
+        CUDA_ROOT / "include" / "mfq_cuda_attention_ops.h",
+        CUDA_ROOT / "include" / "mfq_cuda_cache_ops.h",
+        CUDA_ROOT / "include" / "mfq_cuda_norm_ops.h",
+        CUDA_ROOT / "include" / "mfq_cuda_sampling_ops.h",
+        CUDA_ROOT / "ops" / "include" / "cuda_execution.h",
+        CUDA_ROOT / "ops" / "cuda_execution.cpp",
+        CUDA_ROOT / "core" / "decode_graph.h",
+    )
+) + "\n" + BACKEND_CHECKS + "\n" + CUDA_RUNTIME + "\n" + (
+    CUDA_ROOT / "commands" / "diagnostics.cpp"
+).read_text(encoding="utf-8")
 ATTENTION_SOURCE = (
     Path(__file__).parents[1] / "mfq" / "kernels" / "cuda" / "attention.cu"
 ).read_text(encoding="utf-8")
@@ -34,9 +59,11 @@ BACKEND_SOURCE = (
 CONTEXT_SOURCE = (
     Path(__file__).parents[1] / "cpp_runtime" / "backends" / "cuda" / "src" / "mfq_cuda_context.cu"
 ).read_text(encoding="utf-8")
-NATIVE_OPS_SOURCE = (
-    Path(__file__).parents[1] / "cpp_runtime" / "backends" / "cuda" / "src" / "mfq_native_tensor_ops.cu"
-).read_text(encoding="utf-8")
+NATIVE_OPS_SOURCE = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted((CUDA_ROOT / "src").glob("mfq_native_tensor*"))
+    if path.suffix in {".cpp", ".cu", ".cuh"}
+)
 NATIVE_TENSOR_SOURCE = (
     Path(__file__).parents[1] / "cpp_runtime" / "backends" / "cuda" / "src" / "mfq_native_tensor.cu"
 ).read_text(encoding="utf-8")
@@ -48,19 +75,36 @@ ACC_SOURCE = (
 ).read_text(encoding="utf-8")
 
 
-def test_minicpmo_native_server_keeps_cuda_graph_enabled() -> None:
+SHARED_ENGINE = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in (ROOT / "cpp_runtime" / "engine" / "include").glob("*.h")
+)
+SHARED_MODELS = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in (ROOT / "cpp_runtime" / "models").rglob("*.h")
+)
+
+SOURCE += SHARED_ENGINE + SHARED_MODELS
+
+def test_minicpmo_native_runtime_keeps_cuda_graph_enabled() -> None:
     assert "graph_architecture_supported" not in SOURCE
-    graph_gate = SOURCE.split(
-        'const char * graph_env = std::getenv("MFQ_SERVER_CUDA_GRAPH");', 1
+    graph_gate = CUDA_RUNTIME.split(
+        "bool graph_eligible() const {", 1
     )[1].split(
-        'const char * graph_min_env = std::getenv(', 1
+        "void prepare_graph()", 1
     )[0]
     assert "is_minicpmo45" not in graph_gate
 
 
 def test_static_decode_uses_dynamic_position_for_kv_writes() -> None:
-    assert SOURCE.count("hidden_forward(ids, pos, seq_len, nullptr, pos)") == 2
-    assert "cache_positions_override.value(), primary" in SOURCE
+    causal_lm = (ROOT / "cpp_runtime/models/common/causal_model.h").read_text(
+        encoding="utf-8"
+    )
+    static_forward = causal_lm.split(
+        "Tensor hidden_forward_static", 1
+    )[1].split("Tensor last_logits_static", 1)[0]
+    assert "nullptr,positions,nullptr,0" in "".join(static_forward.split())
+    assert "ops.device_ids(*ops.cache_positions_override)" in SOURCE
     assert (
         '"cache_positions must have shape [tokens] or [batch,tokens]"'
         in SOURCE
@@ -68,13 +112,12 @@ def test_static_decode_uses_dynamic_position_for_kv_writes() -> None:
 
 
 def test_minicpmo_persistent_decode_workspaces_are_warmed_before_capture() -> None:
-    warmup_gates = re.findall(
-        r"Model::backbone == mfq::cuda::CudaBackbone::glm_dsa\) \|\|\s+"
-        r"Model::is_minicpmo45\) \{",
-        SOURCE,
-    )
-    assert len(warmup_gates) == 1
-    assert SOURCE.count("prepare_decode_graph_memory(model,") == 2
+    assert MODEL_METADATA_SOURCE.count(
+        "metadata.decode_graph_double_warmup = true;"
+    ) == 2
+    assert "model.metadata.decode_graph_double_warmup" in SOURCE
+    assert "graph.ensure_captured(" in CUDA_RUNTIME
+    assert CUDA_RUNTIME.count("prepare_decode_graph_memory(model,") == 1
 
 
 def test_graph_stage_events_start_after_decode_workspace_warmup() -> None:
@@ -83,10 +126,10 @@ def test_graph_stage_events_start_after_decode_workspace_warmup() -> None:
     )[1].split(
         "graph.capture_end();", 1
     )[0]
-    warmup = graph_path.index("model.next_token_static(static_input, static_pos, static_len)")
-    profiler_reset = graph_path.index("g_profiler.reset();")
+    warmup = graph_path.index("model.next_token_static(")
+    profiler_reset = graph_path.index("profiler.reset();")
     external_events = graph_path.index(
-        "g_profiler.graph_events = profile_cuda_graph;"
+        "profiler.graph_events = profile_cuda_graph;"
     )
     capture = graph_path.index("graph.capture_begin();")
     assert warmup < profiler_reset < external_events < capture
@@ -98,10 +141,10 @@ def test_graph_profile_covers_model_and_commit_boundaries() -> None:
     )[1].split(
         "graph.capture_end();", 1
     )[0]
-    assert 'g_profiler.measure("decode.model_total"' in graph_path
-    assert 'g_profiler.measure("decode.commit"' in graph_path
-    assert graph_path.index('g_profiler.measure("decode.model_total"') < graph_path.index(
-        'g_profiler.measure("decode.commit"'
+    assert 'profiler.measure("decode.model_total"' in graph_path
+    assert 'profiler.measure("decode.commit"' in graph_path
+    assert graph_path.index('profiler.measure("decode.model_total"') < graph_path.index(
+        'profiler.measure("decode.commit"'
     )
 
 
@@ -114,7 +157,7 @@ def test_torch_reference_graph_can_emit_a_debug_dump() -> None:
 
 def test_backend_bf16_add_check_covers_eager_and_graph_paths() -> None:
     assert "run_backend_bf16_add_check" in SOURCE
-    assert 'a == "--check-backend-bf16-add"' in SOURCE
+    assert 'option == "--check-backend-bf16-add"' in SOURCE
     check = BACKEND_CHECKS.split("int run_backend_bf16_add_check", 1)[1].split(
         "int run_backend_argmax_check", 1
     )[0]
@@ -181,7 +224,7 @@ def test_native_bf16_softmax_preserves_serial_reduction_order() -> None:
 
 def test_minicpmo_bf16_prefill_flash128_is_strictly_bounded() -> None:
     selection = SOURCE.split(
-        'std::getenv("MFQ_DISABLE_MINICPM_BF16_FLASH128")', 1
+        "const bool bf16_flash128 =", 1
     )[1].split("if (bf16_flash128)", 1)[0]
     assert "!sliding && hd == 128" in selection
     assert "nh == 4 * nkh" in selection
@@ -199,7 +242,7 @@ def test_minicpmo_bf16_prefill_flash128_is_strictly_bounded() -> None:
     assert "mfq_attention_mma_launch<128, 128, 16, 4>" in implementation
     assert "mfq_attention_mma_launch<128, 128, 8, 8>" in implementation
     casts = SOURCE.split(
-        '"MFQ_DISABLE_MINICPM_FLASH128_SPECIALIZED_CASTS"', 1
+        "const bool specialized_casts =", 1
     )[1].split("attention_token_major = true", 1)[0]
     assert "minicpm_flash128_q_cast_cuda" in casts
     assert "minicpm_flash128_kv_cast_cuda" in casts
@@ -221,17 +264,17 @@ def test_full_flash_attention_accepts_gqa8_with_matching_tiles() -> None:
     assert "mfq_attention_mma_launch<256, 256, 16, 4>" in implementation
     assert "mfq_attention_mma_launch<256, 256, 8, 8>" in implementation
     selection = SOURCE.split(
-        'const char * mma_attention_env = std::getenv("MFQ_MMA_ATTENTION")', 1
+        "const bool mma_attention_enabled =", 1
     )[1].split("else if (sliding)", 1)[0]
     assert "nh == 4 * nkh || nh == 8 * nkh" in selection
 
 
 def test_minicpmo_bf16_residual_uses_contiguous_specialized_add() -> None:
     selection = SOURCE.split(
-        'std::getenv("MFQ_DISABLE_MINICPM_BF16_RESIDUAL_ACC")', 1
-    )[1].split("return acc_cuda(rr, ff2)", 1)[0]
+        "if (execution.config.minicpm_bf16_residual_acc)", 1
+    )[1].split("return (rr + ff2)", 1)[0]
     assert "rr.scalar_type() == mfq_tensor_backend::kBFloat16" in SOURCE
-    assert "specialized_acc_disabled == nullptr" in selection
+    assert "return acc_cuda(rr, ff2)" in selection
     assert "acc_bf16_kernel" in ACC_SOURCE
     assert "a.is_cuda() && a.is_contiguous()" in ACC_SOURCE
     assert "a.sizes() == b.sizes()" in ACC_SOURCE
@@ -239,13 +282,14 @@ def test_minicpmo_bf16_residual_uses_contiguous_specialized_add() -> None:
 
 
 def test_cuda_profiler_filter_supports_low_perturbation_eager_attribution() -> None:
-    assert 'std::getenv("MFQ_PROFILE_CUDA_FILTER")' in SOURCE
+    assert '"MFQ_PROFILE_CUDA_FILTER"' in SOURCE
+    assert "profiler.filter = config.profile_filter" in SOURCE
     assert "if (!enabled || !selected(name)) return fn();" in SOURCE
     eager_path = CUDA_RUNTIME.rsplit("} else {", 1)[1].split(
         "mfq_cuda_synchronize();", 1
     )[0]
-    assert 'g_profiler.measure("decode.eager_model"' in eager_path
-    assert 'g_profiler.measure("decode.eager_commit"' in eager_path
+    assert 'profiler.measure("decode.eager_model"' in eager_path
+    assert 'profiler.measure("decode.eager_commit"' in eager_path
 
 
 def test_bf16_head_to_token_candidate_is_exactly_stride_bounded() -> None:
@@ -288,7 +332,9 @@ def test_native_bf16_kv_cache_uses_the_fused_writer() -> None:
 
 def test_graph_attention_tracks_eager_split_count_from_device_length() -> None:
     assert "attention_cache_decode_dynamic_cuda" in SOURCE
-    assert "g_decode_graph_attention_parts > 1" in SOURCE
+    assert "decode_attention_parts > 1" in SOURCE
+    assert "context.decode_attention_parts" in SOURCE
+    assert "g_decode_graph_attention_parts" not in SOURCE
     active_parts = ATTENTION_SOURCE.split(
         "__device__ __forceinline__ int attention_decode_active_parts", 1
     )[1].split("template <int BD, typename scalar_t>", 1)[0]

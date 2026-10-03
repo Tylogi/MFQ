@@ -1,0 +1,145 @@
+#pragma once
+
+#include "models/deepseek_v4/ops.h"
+#include "models/deepseek_v41/ops.h"
+#include "models/gemma4/ops.h"
+#include "models/glm5_next/ops.h"
+#include "models/glm_dsa/ops.h"
+#include "models/minicpmo45/ops.h"
+#include "models/qwen35/ops.h"
+#include "models/qwen4_exp/ops.h"
+#include "core/mtp.h"
+#include "core/grid_vision_component.h"
+#include "cuda_runtime_config.h"
+#include "storage/weight_loader.h"
+#include "storage/moe_expert_cache.h"
+
+#include <chrono>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <utility>
+
+template <typename Model>
+struct RuntimeComponents {
+    mfq::ModelGraph graph;
+    mfq::cuda::CudaModelPlan plan;
+    std::optional<
+        mfq::cuda::grid_vision_runtime::CudaGridVisionPromptComponent>
+        grid_vision;
+    std::unique_ptr<MtpModule> mtp;
+    Model* language_override = nullptr;
+    std::unique_ptr<mfq::cuda::minicpmo45::Components> composite;
+    bool vision_available = false;
+    bool mtp_available = false;
+
+    Model& language(Model& fallback) {
+        return language_override ? *language_override : fallback;
+    }
+
+    mfq::cuda::CudaComponentState state() const noexcept {
+        return mfq::cuda::cuda_component_state(
+            graph, plan, vision_available, mtp_available);
+    }
+};
+
+template <typename Model>
+RuntimeComponents<Model> load_runtime_components(
+    Model& model,
+    bool load_optional_components);
+
+
+template <>
+RuntimeComponents<mfq::cuda::Qwen35CausalLm>
+load_runtime_components(
+    mfq::cuda::Qwen35CausalLm& model,
+    bool load_optional_components);
+
+template <>
+RuntimeComponents<mfq::cuda::Qwen4CausalLm>
+load_runtime_components(
+    mfq::cuda::Qwen4CausalLm& model,
+    bool load_optional_components);
+
+template <>
+RuntimeComponents<mfq::cuda::Glm5CausalLm>
+load_runtime_components(
+    mfq::cuda::Glm5CausalLm& model,
+    bool load_optional_components);
+
+template <>
+RuntimeComponents<mfq::cuda::DeepseekV41CausalLm>
+load_runtime_components(
+    mfq::cuda::DeepseekV41CausalLm& model,
+    bool load_optional_components);
+
+
+template <>
+RuntimeComponents<mfq::cuda::MiniCPMO45CausalLm>
+load_runtime_components(
+    mfq::cuda::MiniCPMO45CausalLm& model,
+    bool load_optional_components);
+
+template <>
+RuntimeComponents<mfq::cuda::MiniCPMOTtsCausalLm>
+load_runtime_components(
+    mfq::cuda::MiniCPMOTtsCausalLm& model,
+    bool load_optional_components);
+
+namespace mfq::cuda::internal {
+
+template <typename F>
+auto with_loaded_cuda_model(
+        CudaExecutionContext& execution,
+        const CudaLoadOptions& options,
+        bool load_optional_components,
+        F&& run) {
+    auto source = mfq::open_model_source(options.model_path);
+    auto load = [&]<typename Model>() {
+        auto started = std::chrono::steady_clock::now();
+        Model model = load_causal_lm<Model>(
+            execution,
+            options.model_path,
+            options.config_path,
+            options.context_size,
+            true,
+            load_optional_components,
+            source);
+        auto runtime_components =
+            load_runtime_components(model, load_optional_components);
+        if (moe_expert_cache_has_sources(execution.moe_expert_cache) &&
+                !moe_expert_cache_finalized(execution.moe_expert_cache)) {
+            finalize_moe_expert_cache(execution.moe_expert_cache);
+        }
+        mfq_cuda_synchronize();
+        auto loaded = std::chrono::steady_clock::now();
+        report_cuda_memory(execution.config, "loaded");
+        return run(model, runtime_components, started, loaded);
+    };
+
+    switch (cuda_backbone(source->resolved_model_graph().backbone)) {
+        case CudaBackbone::generic_qwen:
+            return load.template operator()<Qwen35CausalLm>();
+        case CudaBackbone::minicpmo45:
+            return load.template operator()<MiniCPMO45CausalLm>();
+        case CudaBackbone::minicpmo_tts:
+            return load.template operator()<MiniCPMOTtsCausalLm>();
+        case CudaBackbone::gemma4:
+            return load.template operator()<Gemma4CausalLm>();
+        case CudaBackbone::glm_dsa:
+            return load.template operator()<GlmDsaCausalLm>();
+        case CudaBackbone::glm5_next:
+            return load.template operator()<Glm5CausalLm>();
+        case CudaBackbone::qwen4_exp:
+            return load.template operator()<Qwen4CausalLm>();
+        case CudaBackbone::deepseek_v4:
+            return load.template operator()<DeepseekV4CausalLm>();
+        case CudaBackbone::deepseek_v41:
+            return load.template operator()<DeepseekV41CausalLm>();
+        case CudaBackbone::unsupported:
+            throw std::runtime_error("unsupported CUDA model backbone");
+    }
+    throw std::runtime_error("invalid CUDA model backbone");
+}
+
+} // namespace mfq::cuda::internal

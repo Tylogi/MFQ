@@ -18,15 +18,15 @@ def test_cuda_row_kernel_consumes_packed_q_and_k():
 
 def test_cuda_ple_nint_uses_retained_selected_row_source():
     root = ROOT / "cpp_runtime/backends/cuda"
-    layers = (root / "models/flash_next/flash_next_layers.h").read_text()
-    branch = layers.split('if (require_tensor(file,name).dtype=="NINT")', 1)[1].split(
-        "continue;", 1)[0]
-    assert "load_nint_row_table(file,name)" in branch
-    assert "nint_row_embedding_lookup(*table,ids)" in branch
+    layers = (root / "models/qwen4_exp/ops.cpp").read_text()
+    branch = layers.split('if (require_tensor(source, name).dtype == "NINT")', 1)[1].split(
+        "auto weight =", 1)[0]
+    assert "load_nint_row_table(source, name)" in branch
+    assert "nint_row_embedding_lookup(*table, ids)" in branch
     assert "load_quant_linear" not in branch
-    ops = (root / "ops/cuda_quantized_ops.cpp").read_text()
+    ops = (root / "ops/nint.cpp").read_text()
     lookup = ops.split("mfq_tensor_backend::Tensor nint_row_embedding_lookup(", 1)[1].split(
-        "mfq_tensor_backend::Tensor quant_embedding_lookup(", 1)[0]
+        "mfq_tensor_backend::Tensor pad_last(", 1)[0]
     assert "table.append_row(" in lookup and "selected.packed()" in lookup
     assert "nint_selected_rows_cuda(" in lookup
     assert "cudaStreamIsCapturing" in lookup
@@ -35,7 +35,7 @@ def test_cuda_ple_nint_uses_retained_selected_row_source():
 
 def test_shared_row_parser_and_cuda_test_are_build_targets():
     core = (ROOT / "cpp_runtime/core/CMakeLists.txt").read_text()
-    cmake = (ROOT / "cpp_runtime/cmake/CudaRuntime.cmake").read_text()
+    cmake = (ROOT / "cpp_runtime/backends/cuda/CMakeLists.txt").read_text()
     assert "nint_rows.cpp" in core
     assert "mfq-nint-rows-cuda-test" in cmake
     assert "mfq_nint_rows_test.cu" in cmake

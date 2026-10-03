@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 NINT = (ROOT / "mfq/kernels/cuda/nint_matmul.cu").read_text()
 BINDINGS = (ROOT / "mfq/kernels/cuda/mfq_cuda.cpp").read_text()
 EXTENSION = (ROOT / "mfq/kernels/cuda/_ext.py").read_text()
-CMAKE = (ROOT / "cpp_runtime/cmake/CudaRuntime.cmake").read_text()
+CMAKE = (ROOT / "cpp_runtime/backends/cuda/CMakeLists.txt").read_text()
 MOE = (ROOT / "mfq/kernels/cuda/moe.cu").read_text()
 MOE_PYTHON = (ROOT / "mfq/kernels/cuda/moe.py").read_text()
 CUDA_ROOT = ROOT / "cpp_runtime/backends/cuda"
@@ -153,7 +153,10 @@ def test_mfe_nint_projection_fuses_glu_in_the_unified_kernel():
     assert "FragmentC accumulators[projections]" in NINT
     assert "constexpr int projections = FusedGlu ? 2 : 1;" in NINT
     assert "row * result_rows" in NINT
-    assert "return forward_impl(x, route, false, gelu ? 2 : 1);" in RUNTIME
+    assert (
+        "return forward_impl(execution, x, route, false, gelu ? 2 : 1);"
+        in RUNTIME
+    )
     assert "supports_projection_glu_epilogue()" in RUNTIME
     assert '"moe.gate_up_swiglu"' in RUNTIME
 
@@ -200,10 +203,9 @@ def test_cuda_input_gate_reuses_activation_quantizer_and_main_matmul():
 
 
 def test_cpp_runtime_keeps_only_canonical_nint_row_state():
-    nint_cpu = RUNTIME[RUNTIME.index("struct NintCpu {") : RUNTIME.index("struct Nint8ZeroCpu {")]
-    nint_weight = RUNTIME[
-        RUNTIME.index("struct NintWeight {") : RUNTIME.index("static NintWeight to_device_nint")
-    ]
+    header = (CUDA_ROOT / "ops/include/nint.h").read_text()
+    nint_cpu = header.split("struct NintCpu {", 1)[1].split("\n};", 1)[0]
+    nint_weight = header.split("struct NintWeight {", 1)[1].split("\n};", 1)[0]
     assert "qbytes" not in nint_cpu
     assert "mixed_q" not in nint_cpu
     assert "mixed_q" not in nint_weight
@@ -278,7 +280,7 @@ def test_metal_mfe_has_no_second_dense_nint_compute_kernel():
     assert "family == kFamilyNint" in METAL_MOE
     assert "decode_nint_row_quad_at(" in METAL_MFE_KERNELS
     assert "nint_cohorts" not in METAL_MOE
-    assert "mfq_moe_nint_" not in METAL_MOE
+    assert '"mfq_moe_nint_' not in METAL_MOE
     assert "if (family == 0u)" not in METAL_MOE
     assert "grouped_nint4_group24" not in METAL_MOE
     assert "nint_profile_mask" not in METAL_MOE

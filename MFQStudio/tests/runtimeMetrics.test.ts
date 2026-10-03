@@ -4,27 +4,27 @@ import { displayPrefillMetric, preferPositiveMetric } from '../src/features/runt
 import { textParts } from '../src/features/chat/messageParts';
 import type { Message } from '../src/shared/api/types';
 
-it('优先使用原生首 token 耗时和实际预填充 token，排除完整媒体准备时间', () => {
+it('优先使用运行时上报的预填充耗时与速度，不把 TTFT 当作预填充', () => {
   expect(displayPrefillMetric({
     ttft_ms: 200, prefill_tokens: 40, prompt_tokens: 100,
     model_prefill_ms: 100, prefill_ms: 50, prefill_tps: 999,
     complete_prefill_ms: 2000, complete_prefill_tps: 50,
-  })).toEqual({ milliseconds: 200, tokensPerSecond: 200 });
+  })).toEqual({ milliseconds: 50, tokensPerSecond: 999 });
 });
 
-it('原生耗时缺失时按模型耗时、语言耗时回退，并可使用 prompt token', () => {
+it('运行时指标缺失时按语言耗时、模型耗时回退，并可使用 prompt token', () => {
   expect(displayPrefillMetric({ prompt_tokens: 30, model_prefill_ms: 100, prefill_ms: 50 }))
-    .toEqual({ milliseconds: 100, tokensPerSecond: 300 });
-  expect(displayPrefillMetric({ prefill_tokens: 20, ttft_ms: 0, model_prefill_ms: -1, prefill_ms: 50 }))
-    .toEqual({ milliseconds: 50, tokensPerSecond: 400 });
+    .toEqual({ milliseconds: 50, tokensPerSecond: 600 });
+  expect(displayPrefillMetric({ prefill_tokens: 20, ttft_ms: 0, model_prefill_ms: 100 }))
+    .toEqual({ milliseconds: 100, tokensPerSecond: 200 });
 });
 
-it('缺失和非有限指标不生成虚假速度，只有报告速度时保留它', () => {
+it('缺失和非正指标不生成虚假速度，只有报告速度时保留它', () => {
   expect(displayPrefillMetric()).toEqual({ milliseconds: undefined, tokensPerSecond: undefined });
-  expect(displayPrefillMetric({ ttft_ms: 100 })).toEqual({ milliseconds: 100, tokensPerSecond: undefined });
+  expect(displayPrefillMetric({ ttft_ms: 100 })).toEqual({ milliseconds: undefined, tokensPerSecond: undefined });
   expect(displayPrefillMetric({ ttft_ms: Infinity, prefill_tps: 12 }))
     .toEqual({ milliseconds: undefined, tokensPerSecond: 12 });
-  expect(displayPrefillMetric({ prefill_tps: NaN })).toEqual({ milliseconds: undefined, tokensPerSecond: undefined });
+  expect(displayPrefillMetric({ prefill_tps: -1 })).toEqual({ milliseconds: undefined, tokensPerSecond: undefined });
 });
 
 it('首 token 指标使用正数主值，缺失时使用有效回退', () => {

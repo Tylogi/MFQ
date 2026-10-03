@@ -1,0 +1,342 @@
+#pragma once
+
+#include "cuda_model_plan.h"
+#include "core/block.h"
+#include "models/common/causal_model.h"
+#include "quant_linear.h"
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+enum class TextSessionStateKind : int;
+struct TextSessionState;
+
+namespace mfq::models::qwen35 {
+template <class Backend> struct CausalLm;
+}
+namespace mfq::models::qwen4_exp {
+template <class Backend> struct CausalLm;
+}
+namespace mfq::models::glm5_next {
+template <class Backend> struct CausalLm;
+}
+namespace mfq::models::glm_dsa {
+template <class Backend> struct CausalLm;
+}
+namespace mfq::models::gemma4 {
+template <class Backend> struct CausalLm;
+}
+namespace mfq::models::deepseek_v4 {
+template <class Backend> struct CausalLm;
+}
+namespace mfq::models::deepseek_v41 {
+template <class Backend> struct CausalLm;
+}
+namespace mfq::models::minicpmo45 {
+template <class Backend> struct CausalLm;
+}
+namespace mfq::models::minicpmo45 {
+template <class Backend> struct TtsCausalLm;
+}
+
+namespace mfq::cuda {
+
+struct CausalResources {
+    mfq::models::CausalLmMetadata metadata;
+    CudaExecutionContext *execution = nullptr;
+
+    void adapter_validate_load_options() const;
+    bool adapter_uses_common_rope() const noexcept;
+    void adapter_configure_rope(RopeCache &rope, mfq_tensor_backend::Device device) const;
+    void adapter_load_final_state(const mfq::ModelSource &source,
+                                  mfq_tensor_backend::Tensor &output_norm);
+    void adapter_prepare_blocks(const mfq::ModelSource &source);
+    bool adapter_supports_dense_cpu_offload() const noexcept;
+
+    mfq_tensor_backend::Tensor adapter_embed(mfq_tensor_backend::Tensor output) const;
+    void adapter_reset(int64_t batch);
+    bool adapter_requires_batch_reset(int64_t batch) const noexcept;
+
+    mfq_tensor_backend::Tensor adapter_prepare_hidden(mfq_tensor_backend::Tensor hidden,
+                                                      int64_t batch, int64_t tokens) const;
+    void adapter_begin_forward(bool capture_raw_hidden);
+
+    mfq_tensor_backend::Tensor
+    adapter_block_positions(const mfq_tensor_backend::Tensor &full_positions,
+                            const mfq_tensor_backend::Tensor &local_positions, int device) const;
+
+    void adapter_finish_forward(const mfq_tensor_backend::Tensor &full_positions, int64_t batch,
+                                int64_t tokens);
+
+    mfq_tensor_backend::Tensor
+    adapter_finalize_hidden(mfq_tensor_backend::Tensor hidden,
+                            const mfq_tensor_backend::Tensor &output_norm, int64_t batch,
+                            int64_t tokens) const;
+    mfq_tensor_backend::Tensor
+    adapter_raw_hidden(const mfq_tensor_backend::Tensor &hidden,
+                       const mfq_tensor_backend::Tensor &finalized) const;
+    mfq_tensor_backend::Tensor adapter_logits(const QuantLinear &lm_head,
+                                              mfq_tensor_backend::Tensor hidden) const;
+    mfq_tensor_backend::Tensor adapter_last_logits(const QuantLinear &lm_head,
+                                                   mfq_tensor_backend::Tensor hidden) const;
+    mfq_tensor_backend::Tensor adapter_next_token(const QuantLinear &lm_head,
+                                                  mfq_tensor_backend::Tensor hidden) const;
+
+    bool adapter_supports_prepared_prompt() const noexcept;
+
+    void adapter_begin_speculative();
+    void adapter_commit_speculative();
+    void adapter_rollback_speculative(int64_t keep);
+};
+
+struct Qwen35Model;
+struct MiniCPMO45Model;
+struct MiniCPMOTtsModel;
+struct Gemma4Model;
+struct GlmDsaModel;
+struct Glm5Model;
+struct Qwen4Model;
+struct DeepseekV4Model;
+struct DeepseekV41Model;
+
+template <typename Model> struct CudaCausalOps;
+template <typename Model>
+using CausalLm = typename Model::template CausalModel<CudaCausalOps<Model>>;
+
+template <typename Model> struct CudaSessionCodec {
+    using CausalModel = CausalLm<Model>;
+    static TextSessionStateKind kind(const CausalModel &model);
+    static bool supports_paged(const CausalModel &model);
+    static TextSessionState capture(const CausalModel &model, const std::vector<int64_t> &tokens);
+    static void restore(CausalModel &model, const TextSessionState &state);
+};
+
+struct CudaForwardPlan {
+    int64_t kv_length = 0;
+    int64_t attention_parts = 0;
+};
+
+template <typename Model> struct CudaCausalOps : Model {
+    using Tensor = mfq_tensor_backend::Tensor;
+    using ForwardPlan = CudaForwardPlan;
+    using CausalModel = CausalLm<Model>;
+    using SessionState = TextSessionState;
+    using SessionStateKind = TextSessionStateKind;
+    using SessionCodec = CudaSessionCodec<Model>;
+    std::shared_ptr<const mfq::ModelSource> source;
+    mfq::ModelGraph graph;
+    CudaModelPlan plan;
+    RopeCache rope;
+    RopeCache cpu_rope;
+    std::unordered_map<int, RopeCache> device_ropes;
+    QuantLinear embed;
+    std::vector<std::unique_ptr<Block>> blocks;
+    mfq_tensor_backend::Tensor output_norm;
+    QuantLinear lm_head;
+
+    auto execution_scope() const {
+        return MfqCudaGuard(this->execution->layer_placement.primary_device());
+    }
+    static auto block_scope(const std::unique_ptr<Block> &block) {
+        return MfqCudaGuard(block->cuda_device);
+    }
+    static bool defined(const Tensor &value) { return value.defined(); }
+    static Tensor position_axes(Tensor value, int64_t start, int64_t count) {
+        return value.narrow(0, start, count);
+    }
+    static Tensor concat_positions(Tensor first, Tensor second) {
+        return mfq_tensor_backend::cat({first, second}, -1);
+    }
+    static int64_t rank(const Tensor &value) { return value.dim(); }
+    static int64_t size(const Tensor &value, int axis) { return value.size(axis); }
+    static Tensor batch_ids(Tensor ids) { return ids.unsqueeze(0); }
+    Tensor device_ids(Tensor ids) const {
+        return tensor_to_cuda_device(this->execution->model_parallel_collectives,
+                                     ids.to(mfq_tensor_backend::kInt64),
+                                     this->execution->layer_placement.primary_device())
+            .contiguous();
+    }
+    Tensor embed_tokens(Tensor ids) const {
+        return this->execution->profiler.measure(
+            "model.embed", [&] { return this->adapter_embed(quant_embedding_lookup(embed, ids)); });
+    }
+    Tensor sequence_lengths(int64_t batch, int64_t end) const {
+        auto scope = execution_scope();
+        return mfq_tensor_backend::full({batch}, end,
+                                        mfq_tensor_backend::TensorOptions()
+                                            .dtype(mfq_tensor_backend::kInt64)
+                                            .device(mfq_tensor_backend::kCUDA));
+    }
+    static Tensor last_hidden(Tensor hidden) { return hidden.index({Slice(), -1, Slice()}); }
+    static Tensor softcap(Tensor logits, double cap) {
+        return mfq_tensor_backend::tanh(logits / cap) * cap;
+    }
+    Tensor scale_hidden(Tensor hidden, double scale) const {
+        return this->execution->profiler.measure("model.embed_scale",
+                                                 [&] { return hidden * scale; });
+    }
+    static Tensor repeat_hidden(Tensor hidden, int64_t streams) {
+        return hidden.to(mfq_tensor_backend::kFloat16).repeat({1, 1, streams});
+    }
+    static Tensor expand_hidden(Tensor hidden, int64_t batch, int64_t tokens, int64_t streams) {
+        const auto width = hidden.size(-1);
+        return hidden.to(mfq_tensor_backend::kFloat16)
+            .unsqueeze(2)
+            .expand({batch, tokens, streams, width})
+            .contiguous();
+    }
+    struct ForwardOps : mfq::models::CausalForwardInputs<Tensor, ForwardPlan> {
+        using Inputs = mfq::models::CausalForwardInputs<Tensor, ForwardPlan>;
+        CausalModel &model;
+        ForwardOps(CausalModel &model, Inputs input)
+            : Inputs(std::move(input)), model(model),
+              primary(model.execution->layer_placement.primary_device()) {}
+        int primary;
+        Tensor pos, full_positions, cache_positions, cpu_ids, cpu_pos, cpu_cache_positions;
+        MfqOptional<Tensor> effective_attention_mask, cpu_attention_mask, cpu_seq_len;
+
+        static int64_t size(const Tensor &value, int axis) { return value.size(axis); }
+        static int64_t rank(const Tensor &value) { return value.dim(); }
+        static int64_t elements(const Tensor &value) { return value.numel(); }
+
+        Tensor device_ids(Tensor value) {
+            return tensor_to_cuda_device(model.execution->model_parallel_collectives,
+                                         value.to(mfq_tensor_backend::kInt64), primary)
+                .contiguous();
+        }
+        void prepare_inputs() { ids = device_ids(ids); }
+        bool has_mrope() const { return model.rope.sections.numel() > 0; }
+        Tensor position_range(int64_t start, int64_t tokens) {
+            return mfq_tensor_backend::arange(start, start + tokens,
+                                              mfq_tensor_backend::TensorOptions()
+                                                  .device(mfq_tensor_backend::kCUDA)
+                                                  .dtype(mfq_tensor_backend::kInt64));
+        }
+        static Tensor offset_positions(Tensor positions, int64_t delta) {
+            return positions + delta;
+        }
+        Tensor prepare_hidden(int64_t B, int64_t T) {
+            if (model.execution->dense_cpu_layer_count > 0) {
+                cpu_ids = ids.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
+                cpu_pos = pos.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
+                cpu_cache_positions =
+                    cache_positions.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64)
+                        .contiguous();
+                if (seq_len.has_value()) {
+                    cpu_seq_len = seq_len.value()
+                                      .to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64)
+                                      .contiguous();
+                }
+                if (effective_attention_mask.has_value()) {
+                    cpu_attention_mask =
+                        effective_attention_mask.value().to(mfq_tensor_backend::kCPU).contiguous();
+                }
+            }
+            return model.adapter_prepare_hidden(
+                tensor_to_cuda_device(model.execution->model_parallel_collectives, input_embeddings,
+                                      primary)
+                    .contiguous(),
+                B, T);
+        }
+        Tensor layer(std::unique_ptr<Block> &b, Tensor x) {
+            MfqCudaGuard block_guard(b->cuda_device);
+            auto local_ids =
+                b->cpu_offloaded
+                    ? cpu_ids
+                    : tensor_to_cuda_device(model.execution->model_parallel_collectives, ids,
+                                            b->cuda_device);
+            auto local_pos =
+                b->cpu_offloaded
+                    ? cpu_pos
+                    : tensor_to_cuda_device(model.execution->model_parallel_collectives, pos,
+                                            b->cuda_device);
+            MfqOptional<mfq_tensor_backend::Tensor> local_cache_positions = mfq_nullopt;
+            // Grid-MRoPE semantic coordinates never double as physical KV
+            // slots, during either prepared prefill or delta-adjusted decode.
+            if (model.adapter_pass_cache_positions(model.rope.sections.numel() > 0,
+                                                   cache_positions_override.has_value())) {
+                local_cache_positions =
+                    b->cpu_offloaded
+                        ? cpu_cache_positions
+                        : tensor_to_cuda_device(model.execution->model_parallel_collectives,
+                                                cache_positions, b->cuda_device);
+            }
+            MfqOptional<mfq_tensor_backend::Tensor> local_seq_len = mfq_nullopt;
+            if (seq_len.has_value()) {
+                local_seq_len =
+                    b->cpu_offloaded
+                        ? cpu_seq_len.value()
+                        : tensor_to_cuda_device(model.execution->model_parallel_collectives,
+                                                seq_len.value(), b->cuda_device);
+            }
+            MfqOptional<mfq_tensor_backend::Tensor> local_attention_mask = mfq_nullopt;
+            if (effective_attention_mask.has_value()) {
+                local_attention_mask =
+                    b->cpu_offloaded
+                        ? cpu_attention_mask.value()
+                        : tensor_to_cuda_device(model.execution->model_parallel_collectives,
+                                                effective_attention_mask.value(), b->cuda_device);
+            }
+            x = b->cpu_offloaded
+                    ? x.to(mfq_tensor_backend::kCPU).contiguous()
+                    : tensor_to_cuda_device(model.execution->model_parallel_collectives, x,
+                                            b->cuda_device);
+            b->set_token_ids(local_ids);
+            const RopeCache &active_rope =
+                b->cpu_offloaded
+                    ? model.cpu_rope
+                    : (model.device_ropes.empty() ? model.rope
+                                                  : model.device_ropes.at(b->cuda_device));
+            Block::Context context;
+            context.token_ids = local_ids;
+            context.positions = local_pos;
+            context.full_positions =
+                model.adapter_block_positions(full_positions, local_pos, b->cuda_device);
+            context.cache_position = model.cache_pos;
+            context.confirmed_prefix = confirmed_prefix;
+            context.planned_kv_length = plan.kv_length;
+            context.decode_attention_parts = plan.attention_parts;
+            context.sequence_lengths = local_seq_len;
+            context.cache_positions = local_cache_positions;
+            if (model.adapter_pass_attention_mask()) {
+                context.attention_mask = local_attention_mask;
+            }
+            x = b->forward_context(*model.execution, std::move(x), context, active_rope);
+            return x;
+        }
+        void trace(const Tensor &x) {
+            if (block_trace)
+                block_trace->push_back(
+                    tensor_to_cuda_device(model.execution->model_parallel_collectives, x, primary)
+                        .to(mfq_tensor_backend::kFloat32)
+                        .clone());
+        }
+        Tensor finish(Tensor x, int64_t B, int64_t T) {
+            x = tensor_to_cuda_device(model.execution->model_parallel_collectives, x, primary);
+            auto finalized = model.finalize_hidden(x, B, T);
+            if (raw_hidden)
+                *raw_hidden = model.adapter_raw_hidden(x, finalized);
+            return finalized;
+        }
+    };
+    static ForwardOps forward_ops(CausalModel &model, typename ForwardOps::Inputs input) {
+        return ForwardOps(model, std::move(input));
+    }
+};
+
+using Qwen35CausalLm = mfq::models::qwen35::CausalLm<CudaCausalOps<Qwen35Model>>;
+using MiniCPMO45CausalLm = mfq::models::minicpmo45::CausalLm<CudaCausalOps<MiniCPMO45Model>>;
+using MiniCPMOTtsCausalLm = mfq::models::minicpmo45::TtsCausalLm<CudaCausalOps<MiniCPMOTtsModel>>;
+using Gemma4CausalLm = mfq::models::gemma4::CausalLm<CudaCausalOps<Gemma4Model>>;
+using GlmDsaCausalLm = mfq::models::glm_dsa::CausalLm<CudaCausalOps<GlmDsaModel>>;
+using Glm5CausalLm = mfq::models::glm5_next::CausalLm<CudaCausalOps<Glm5Model>>;
+using Qwen4CausalLm = mfq::models::qwen4_exp::CausalLm<CudaCausalOps<Qwen4Model>>;
+using DeepseekV4CausalLm = mfq::models::deepseek_v4::CausalLm<CudaCausalOps<DeepseekV4Model>>;
+using DeepseekV41CausalLm = mfq::models::deepseek_v41::CausalLm<CudaCausalOps<DeepseekV41Model>>;
+
+} // namespace mfq::cuda

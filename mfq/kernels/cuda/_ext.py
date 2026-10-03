@@ -34,7 +34,9 @@ _SOURCES = [
     os.path.join(_DIR, "kv_cache.cu"),
     os.path.join(_DIR, "activation.cu"),
     os.path.join(_DIR, "embedding.cu"),
-    os.path.join(_DIR, "flash_next.cu"),
+    os.path.join(_DIR, "selected_attention.cu"),
+    os.path.join(_DIR, "qwen4_exp.cu"),
+    os.path.join(_DIR, "glm5_next.cu"),
     os.path.join(_DIR, "sampling.cu"),
     os.path.join(_DIR, "ssm_conv.cu"),
     os.path.join(_DIR, "moe.cu"),
@@ -45,7 +47,6 @@ _SOURCES = [
     os.path.join(_DIR, "nvq_matmul.cu"),
     os.path.join(_DIR, "nepq.cu"),
     os.path.join(_DIR, "nepq_residual.cu"),
-    os.path.join(_DIR, "tpq_matmul.cu"),
     os.path.join(_DIR, "mfq_cuda.cpp"),
 ]
 _module = None

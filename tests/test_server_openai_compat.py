@@ -9,13 +9,13 @@ import httpx
 import pytest
 
 from mfq.server.api import create_app
+from mfq.server.runtime.backend import BackendDelta, BackendError
+from mfq.server.protocol.models import ResponsePerformance, SamplingParams, TokenUsage
 from mfq.server.api.openai_compat import (
     collect_chat_completion,
     parse_chat_request,
     stream_chat_completion,
 )
-from mfq.server.protocol.models import ResponsePerformance, SamplingParams, TokenUsage
-from mfq.server.runtime.backend import BackendDelta, BackendError
 
 
 class _Backend:

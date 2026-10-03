@@ -30,12 +30,12 @@ vi.mock('../src/features/settings/SettingsProvider', () => ({
   useSettings: () => ({ tr: (_chinese: string, english: string) => english }),
 }));
 
-it('概览预填充卡片展示原生速度与耗时，而非媒体准备总时间或预报速度', () => {
+it('概览预填充卡片展示运行时速度与耗时，而非 TTFT 或媒体准备总时间', () => {
   render(<MemoryRouter><OverviewPage /></MemoryRouter>);
   const prefill = screen.getByText('Prefill').closest('.metric-tile');
-  expect(prefill?.querySelector('strong')).toHaveTextContent(/^200 tok\/s$/);
-  expect(screen.getByText('200 ms · Prompt processing')).toBeInTheDocument();
-  expect(prefill).not.toHaveTextContent('999 tok/s');
+  expect(prefill?.querySelector('strong')).toHaveTextContent(/^999 tok\/s$/);
+  expect(screen.getByText('50 ms · Prompt processing')).toBeInTheDocument();
+  expect(prefill).not.toHaveTextContent('200 tok/s');
 });
 
 it('历史响应使用同一预填充速度，并单独显示媒体准备耗时', () => {
@@ -50,7 +50,7 @@ it('历史响应使用同一预填充速度，并单独显示媒体准备耗时'
     tr={(_chinese, english) => english} editDraft={null} setEditDraft={vi.fn()}
     actions={{ saveEdit: vi.fn(), copyMessage: vi.fn(), regenerate: vi.fn(), executeToolCalls: vi.fn() }}
   /></TooltipProvider>);
-  expect(screen.getByText('200 pp')).toBeInTheDocument();
+  expect(screen.getByText('999 pp')).toBeInTheDocument();
   expect(screen.getByText('200 ms TTFT')).toBeInTheDocument();
   expect(screen.getByText('Media preparation 1,800 ms')).toBeInTheDocument();
 });

@@ -141,6 +141,15 @@ def test_container_validation_and_workspace_path_boundary(tmp_path: Path) -> Non
             print('MFQ container OK version=2 architecture=test shards=1 records=1')
             """,
         )
+        diagnostics = _executable(
+            tmp_path / "mfq-diagnostics",
+            """\
+            #!/usr/bin/env python3
+            import sys
+            assert '--check-mfq-container' in sys.argv
+            print('MFQ container OK via diagnostics')
+            """,
+        )
         python = _executable(
             tmp_path / "python",
             """\
@@ -162,6 +171,7 @@ def test_container_validation_and_workspace_path_boundary(tmp_path: Path) -> Non
                 huggingface=None,
                 runtime=runtime,
                 perplexity=None,
+                diagnostics=diagnostics,
             ),
         )
         store = SessionStore(tmp_path / "jobs.sqlite3")
@@ -177,7 +187,7 @@ def test_container_validation_and_workspace_path_boundary(tmp_path: Path) -> Non
         )
         result = await _wait(store, checked.id)
         assert result.status == JobStatus.SUCCEEDED
-        assert result.result["summary"].startswith("MFQ container OK")
+        assert result.result["summary"] == "MFQ container OK via diagnostics"
 
         source = tmp_path / "source"
         source.mkdir()

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "mfq_container.h"
-#include "models/deepseek_v41.h"
+#include "models/deepseek_v41/config.h"
 
 namespace mfq::metal {
 

@@ -1,0 +1,56 @@
+#pragma once
+
+#include "core/mtp.h"
+#include "core/attention.h"
+#include "models/qwen4_exp/config.h"
+
+namespace mfq::cuda::qwen4_exp {
+using attention_ops::Linear;
+struct Gr;
+struct Qwen4Block;
+
+struct Qwen4ExpMtp final : MtpModule {
+    using Tensor = mfq_tensor_backend::Tensor;
+
+    mfq::models::qwen4_exp::Config config;
+    Tensor embedding_norm, hidden_norm;
+    Linear embedding_fusion, hidden_fusion;
+    std::unique_ptr<Gr> final_mixer;
+    std::vector<std::unique_ptr<Qwen4Block>> layers;
+    std::vector<Tensor> positions;
+    std::vector<int64_t> lengths;
+    CudaExecutionContext *execution = nullptr;
+    int64_t batch = 0;
+
+    Qwen4ExpMtp();
+    ~Qwen4ExpMtp() override;
+    Qwen4ExpMtp(Qwen4ExpMtp&&) noexcept;
+    Qwen4ExpMtp& operator=(Qwen4ExpMtp&&) noexcept;
+
+    static std::optional<Qwen4ExpMtp> load_if_present(CudaExecutionContext &execution,
+                                                      const mfq::ModelSource &file,
+                                                      const mfq::models::qwen4_exp::Config &main);
+
+    void reset(int64_t next_batch = 1) override;
+
+    std::pair<Tensor, Tensor> evaluate(const MtpTarget &target, const Tensor &hidden,
+                                       const Tensor &ids, int64_t depth = 0, bool cache = true,
+                                       const Tensor &supplied_positions = {},
+                                       const Tensor &supplied_embeddings = {});
+
+    Tensor forward(const MtpTarget &target, Tensor hidden, Tensor ids) override;
+
+    MtpStep step(const MtpTarget &target, Tensor hidden, Tensor ids) override;
+
+    int64_t cache_position() const noexcept override;
+
+    void trim_cache_to(int64_t position) override;
+
+    bool teacher_forced_prompt_prime() const noexcept override;
+
+    bool target_bootstrap_decode() const noexcept override;
+
+    bool preserve_output_dtype() const noexcept override;
+};
+
+} // namespace mfq::cuda::qwen4_exp

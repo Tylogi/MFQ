@@ -67,8 +67,8 @@ runs/
 
 # ---- 模型、校准数据与实验工件 ----
 models/
-!cpp_runtime/core/models/
-!cpp_runtime/core/models/**
+!cpp_runtime/models/
+!cpp_runtime/models/**
 !cpp_runtime/backends/cuda/models/
 !cpp_runtime/backends/cuda/models/**
 data/*

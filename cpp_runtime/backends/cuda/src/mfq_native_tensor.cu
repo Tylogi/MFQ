@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <type_traits>
 
@@ -23,8 +24,20 @@ std::shared_ptr<TensorStorage> allocate_cuda_storage(
     const Device& device) {
     auto context = default_context(device.index);
     const auto allocation_stream = current_stream(device.index);
+    struct StreamUses { std::mutex mutex; std::vector<cudaStream_t> streams; };
+    auto uses = std::make_shared<StreamUses>();
     void* pointer = context->allocate(bytes, allocation_stream.stream());
-    auto owner = std::shared_ptr<void>(pointer, [context, allocation_stream, bytes](void* value) {
+    auto owner = std::shared_ptr<void>(pointer, [context, allocation_stream, bytes, uses](void* value) {
+        // record_stream registers future consumers, not just work already
+        // queued at registration. Fence their last uses when storage dies.
+        try {
+            DeviceGuard guard(allocation_stream.device_index());
+            for (auto usage_stream : uses->streams) {
+                Event consumed;
+                consumed.record(usage_stream);
+                MFQ_NATIVE_CUDA_CHECK(cudaStreamWaitEvent(allocation_stream.stream(), consumed.get(), 0));
+            }
+        } catch (...) { (void)cudaDeviceSynchronize(); }
         context->release(value, bytes, allocation_stream.stream());
     });
     auto storage = std::make_shared<TensorStorage>();
@@ -33,19 +46,12 @@ std::shared_ptr<TensorStorage> allocate_cuda_storage(
     storage->bytes = bytes;
     storage->device = device;
     const auto allocation_stream_value = allocation_stream.stream();
-    storage->record_stream = [allocation_stream_value](std::uintptr_t raw_stream) {
+    storage->record_stream = [allocation_stream_value, uses](std::uintptr_t raw_stream) {
         const auto usage_stream = reinterpret_cast<cudaStream_t>(raw_stream);
         if (usage_stream == nullptr || usage_stream == allocation_stream_value) return;
-        cudaEvent_t event = nullptr;
-        MFQ_NATIVE_CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
-        try {
-            MFQ_NATIVE_CUDA_CHECK(cudaEventRecord(event, usage_stream));
-            MFQ_NATIVE_CUDA_CHECK(cudaStreamWaitEvent(allocation_stream_value, event, 0));
-        } catch (...) {
-            (void)cudaEventDestroy(event);
-            throw;
-        }
-        (void)cudaEventDestroy(event);
+        std::lock_guard lock(uses->mutex);
+        if (std::find(uses->streams.begin(), uses->streams.end(), usage_stream) == uses->streams.end())
+            uses->streams.push_back(usage_stream);
     };
     return storage;
 }

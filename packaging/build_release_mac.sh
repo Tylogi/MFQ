@@ -82,7 +82,7 @@ cmake -S "${mfq_project_dir}/cpp_runtime" -B "${mfq_native_build_dir}" -G Ninja 
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_ARCHITECTURES=arm64 \
   -DCMAKE_OSX_DEPLOYMENT_TARGET="${mfq_macos_deployment_target}" \
-  -DMFQ_BUILD_CPP_SERVER=ON \
+  -DMFQ_BUILD_RUNTIME_COMMUNICATION=ON \
   -DMFQ_BUILD_METAL_RUNTIME=ON \
   -DMFQ_MLX_ROOT="${mfq_mlx_root}" \
   -DMFQ_MLX_METALLIB_DEFAULT:STRING=

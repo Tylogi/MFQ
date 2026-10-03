@@ -27,7 +27,18 @@ export function CachePage() {
     prefixCacheQueries > 0 ? (prefixCacheHits / prefixCacheQueries) * 100 : 0;
   const prefixCacheHotOnly = runtime?.prefix_cache_mode === 'single_device_hot_prefix';
   const prefixCachePersistent = typeof runtime?.prefix_cache_max_bytes === 'number';
-  const prefixCacheSupported = prefixCachePersistent || prefixCacheHotOnly;
+  const prefixCacheSupported = runtime?.prefix_cache_supported !== undefined
+    ? Number(runtime.prefix_cache_supported) > 0
+    : prefixCachePersistent || prefixCacheHotOnly;
+  const prefixCacheUnavailableReason = Number(runtime?.prefix_cache_disabled_reason) === 2
+    ? tr(
+        '连续批处理模式暂不支持 Session KV 缓存',
+        'Session KV cache is unavailable with continuous batching',
+      )
+    : tr(
+        '当前模型不支持 Session KV 缓存',
+        'The current model does not support Session KV cache',
+      );
   /** 提交缓存或配置操作，保留确认语义并刷新对应资源。 */
   async function clearRuntimeCache() {
     const snapshots = Number(runtime?.prefix_cache_snapshots || 0);
@@ -212,11 +223,19 @@ export function CachePage() {
       ) : (
         <EmptyPanel
           icon="settings"
-          title={tr('Runtime 诊断未启用', 'Runtime diagnostics are offline')}
-          message={tr(
-            '加载模型后可查看内存与前缀缓存状态。',
-            'Load a model to inspect memory and prefix-cache state.',
-          )}
+          title={
+            runtime
+              ? tr('Session KV 缓存不可用', 'Session KV cache unavailable')
+              : tr('Runtime 诊断未启用', 'Runtime diagnostics are offline')
+          }
+          message={
+            runtime
+              ? prefixCacheUnavailableReason
+              : tr(
+                  '加载模型后可查看内存与前缀缓存状态。',
+                  'Load a model to inspect memory and prefix-cache state.',
+                )
+          }
         />
       )}
       <RuntimeProfilesPanel />

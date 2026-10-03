@@ -179,42 +179,6 @@ std::vector<std::uint8_t> dense_payload(
     return result;
 }
 
-std::vector<std::uint8_t> tpq_int4_payload(
-    const std::vector<std::int64_t>& shape) {
-    require(
-        shape.size() == 2 &&
-            shape[0] > 0 &&
-            shape[1] > 0 &&
-            shape[1] % 64 == 0,
-        "invalid synthetic TPQ-I4 shape");
-    const auto rows =
-        static_cast<std::uint32_t>(shape[0]);
-    const auto columns =
-        static_cast<std::int32_t>(shape[1]);
-    const auto groups =
-        static_cast<std::uint32_t>(columns / 64);
-
-    std::vector<std::uint8_t> result;
-    append_bytes(result, "CI41");
-    append_scalar<std::uint8_t>(result, 1);
-    result.insert(result.end(), 3, 0);
-    append_scalar<std::uint32_t>(result, 64);
-    append_scalar<std::int32_t>(result, 0);
-    append_scalar<std::int32_t>(result, columns);
-    append_scalar<std::uint32_t>(result, 2);
-    append_scalar<std::int64_t>(result, shape[0]);
-    append_scalar<std::int64_t>(result, shape[1]);
-    append_scalar<std::uint32_t>(result, rows);
-    append_scalar<std::uint32_t>(result, groups);
-    result.resize(
-        result.size() +
-            static_cast<std::size_t>(rows) *
-                static_cast<std::size_t>(columns / 2) +
-            static_cast<std::size_t>(rows) * groups * 2,
-        0);
-    return result;
-}
-
 std::vector<std::uint8_t> mfe_payload(
     const std::vector<std::int64_t>& shape) {
     require(
@@ -369,12 +333,6 @@ void test_manifest_and_hf_normalization() {
     const auto manifest = manifest_config();
     const auto manifest_model =
         DeepseekV4Config::from_json(manifest.dump());
-    const auto wrapped_model =
-        DeepseekV4Config::from_json(
-            json{
-                {"format", "tpq-1"},
-                {"config", manifest},
-            }.dump());
     const auto hf_model =
         DeepseekV4Config::from_json(hf_config().dump());
 
@@ -384,10 +342,6 @@ void test_manifest_and_hf_normalization() {
             manifest_model.compress_ratios ==
                 std::vector<std::int64_t>({0, 4, 128}),
         "manifest config normalization mismatch");
-    require(
-        wrapped_model.compress_ratios ==
-            manifest_model.compress_ratios,
-        "complete manifest config was not unwrapped");
     require(
         hf_model.n_layers == manifest_model.n_layers &&
             hf_model.hidden == manifest_model.hidden &&

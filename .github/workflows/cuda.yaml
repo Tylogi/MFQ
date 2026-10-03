@@ -38,5 +38,5 @@ jobs:
         run: |
           ctest --test-dir build/cuda-ci --output-on-failure -V -R '^mfq-(native-tensor-cuda|cuda-context|nint-q8|packed-prefill)-test$'
           python3 bench/cuda_mxfp4_sq_fixtures.py build/cuda-ci/sq-fixtures
-          build/cuda-ci/mfq-mxfp4-sq-test build/cuda-ci/sq-fixtures
-          build/cuda-ci/mfq-sq-linear-test build/cuda-ci/sq-fixtures
+          build/cuda-ci/cuda/mfq-mxfp4-sq-test build/cuda-ci/sq-fixtures
+          build/cuda-ci/cuda/mfq-sq-linear-test build/cuda-ci/sq-fixtures

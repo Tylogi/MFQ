@@ -145,6 +145,76 @@ def test_native_qwen_ple_rejects_mixed_fp8_nint_shards(tmp_path):
     assert "cannot mix FP8 and NINT shards" in result.stderr
 
 
+def _mhc_models(tmp_path, *, adaptive, projections):
+    _, source = _models(tmp_path)
+    header, tensors = io.load(source)
+    reference, packed = dict(tensors), dict(tensors)
+    names = [name for name in tensors if ".mhc." in name and
+             name.endswith((".pre.down.weight", ".pre.up.weight", ".post.inject.weight"))]
+    if projections == "down":
+        # Match EWQ's first failure while retaining dense companion matrices.
+        names = ["model.block.0.attention.mhc.pre.down.weight"]
+    for name in names:
+        rows, width = tensors[name].shape
+        gs = 7
+        groups = (width + gs - 1) // gs
+        qbits = np.arange(rows, dtype=np.uint8) % 8 + 1 if adaptive else np.full(rows, 4, dtype=np.uint8)
+        kbits = np.arange(rows, dtype=np.uint8) % 4 + 5 if adaptive else np.full(rows, 6, dtype=np.uint8)
+        codes = np.empty((rows, groups, gs), dtype=np.uint8)
+        for row in range(rows):
+            codes[row].reshape(-1)[:] = (np.arange(groups * gs) * 3 + row) % min(8, 1 << int(qbits[row]))
+        table = NintTensor(
+            spec=NintSpec(4, gs, 6), shape=(rows, width), axis=0, q=codes,
+            neuron_scale=np.full(rows, 1 / 8192, dtype=np.float32),
+            neuron_min=np.full(rows, 1 / 4096, dtype=np.float32),
+            sub_scale=np.broadcast_to(np.arange(groups, dtype=np.uint8) % 7 + 1, (rows, groups)).copy(),
+            sub_min=np.ones((rows, groups), dtype=np.uint8),
+            neuron_len=width,
+            row_q_bits=qbits if adaptive else None,
+            row_sub_bits=kbits if adaptive else None,
+        )
+        scales = table.neuron_scale[:, None, None] * table.sub_scale[:, :, None]
+        minima = table.neuron_min[:, None, None] * table.sub_min[:, :, None]
+        reference[name] = ((scales * codes - minima).reshape(rows, -1)[:, :width]).astype(np.float16)
+        packed[name] = table
+    paths = (tmp_path / "dense_mhc.mfq", tmp_path / "nint_mhc.mfq")
+    for path, values in zip(paths, (reference, packed), strict=True):
+        io.save(path, header, values)
+    return paths
+
+
+@pytest.mark.parametrize("adaptive", [False, True])
+@pytest.mark.parametrize("projections", ["down", "all"])
+def test_native_qwen_nint_mhc_matches_dense_graph(tmp_path, adaptive, projections):
+    executable = Path(__file__).resolve().parents[1] / "build/cpp_runtime/metal/mfq-metal-nint-rows-test"
+    if not executable.is_file():
+        pytest.skip("build mfq-metal-nint-rows-test to exercise the native model graph")
+    reference, packed = _mhc_models(tmp_path, adaptive=adaptive, projections=projections)
+    result = subprocess.run([str(executable), "--qwen-ple", str(reference), str(packed)],
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "batch logits passed" in result.stdout
+
+
+@pytest.mark.parametrize("name", [
+    "model.block.0.position_embedding.ngram.head_offsets",
+    "model.block.0.attention.mhc.pre.norm.weight",
+])
+def test_native_qwen_nint_mhc_does_not_relax_metadata_loading(tmp_path, name):
+    executable = Path(__file__).resolve().parents[1] / "build/cpp_runtime/metal/mfq-metal-nint-rows-test"
+    if not executable.is_file():
+        pytest.skip("build mfq-metal-nint-rows-test to exercise the native model graph")
+    reference, packed = _mhc_models(tmp_path, adaptive=True, projections="down")
+    header, tensors = io.load(packed)
+    tensors[name] = tensors["model.block.0.attention.mhc.pre.down.weight"]
+    invalid = tmp_path / "invalid_metadata.mfq"
+    io.save(invalid, header, tensors)
+    result = subprocess.run([str(executable), "--qwen-ple", str(reference), str(invalid)],
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode != 0
+    assert f"requires a dense tensor: {name} (got NINT)" in result.stderr
+
+
 def _cuda_models(tmp_path):
     fp8, nint = _models(tmp_path)
     header, tensors = io.load(fp8)

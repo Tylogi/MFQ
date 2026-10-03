@@ -4,13 +4,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CORE = (ROOT / "cpp_runtime/core/grid_vision.cpp").read_text()
 QWEN_CONFIG = (
-    ROOT / "cpp_runtime/core/models/qwen35.cpp"
+    ROOT / "cpp_runtime/models/qwen35/config.cpp"
 ).read_text()
 COMMON_CONFIG = (
-    ROOT / "cpp_runtime/core/models/model_config.cpp"
+    ROOT / "cpp_runtime/models/common/model_config.cpp"
 ).read_text()
 CUDA_ROOT = ROOT / "cpp_runtime/backends/cuda"
-CUDA = (CUDA_ROOT / "runtime/grid_vision_runtime.h").read_text()
+CUDA = (CUDA_ROOT / "core/grid_vision_component.h").read_text()
 CUDA_APP = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(CUDA_ROOT.rglob("*"))
@@ -20,12 +20,26 @@ CUDA_PLAN_TEST = (ROOT / "cpp_runtime/backends/cuda/tests/cuda_model_plan_test.c
 METAL = (ROOT / "cpp_runtime/backends/metal/runtime/mlx_grid_vision.cpp").read_text()
 METAL_MM = (ROOT / "cpp_runtime/backends/metal/runtime/mlx_multimodal.cpp").read_text()
 PLAN = (ROOT / "cpp_runtime/backends/cuda/include/cuda_model_plan.h").read_text()
-PREPARED = (ROOT / "cpp_runtime/backends/cuda/runtime/prepared_prompt.h").read_text()
+PREPARED = (ROOT / "cpp_runtime/backends/cuda/ops/include/cuda_execution.h").read_text()
 CUDA_COMPONENTS = "\n".join(
-    (CUDA_ROOT / "runtime" / name).read_text()
-    for name in ("server_components.h", "server_components.cpp")
+    path.read_text()
+    for path in (
+        CUDA_ROOT / "storage" / "model_loader.h",
+        CUDA_ROOT / "storage" / "model_loader.cpp",
+    )
 )
 
+
+SHARED_ENGINE = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in (ROOT / "cpp_runtime" / "engine" / "include").glob("*.h")
+)
+SHARED_MODELS = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in (ROOT / "cpp_runtime" / "models").rglob("*.h")
+)
+
+CUDA_APP += SHARED_ENGINE + SHARED_MODELS
 
 def test_grid_vision_policies_are_owned_by_core() -> None:
     assert "grid_vision_canonical_name" in CORE
@@ -38,13 +52,15 @@ def test_grid_vision_policies_are_owned_by_core() -> None:
 
 
 def test_cuda_grid_vision_uses_existing_primitives_and_canonical_names() -> None:
-    assert "load_quant_linear(model, weight_name)" in CUDA
+    assert "load_quant_linear(execution, model, weight_name)" in CUDA
     assert "mfq_tensor_backend::layer_norm(" in CUDA
     assert "attention_cuda(" in CUDA
     assert "Tensor gelu_tanh(" in CUDA
     assert "mfq_tensor_backend::tanh(" in CUDA
-    assert 'merger_up_(merger_norm_(patches)' in CUDA
-    assert '})), "none"))' in CUDA
+    assert "mfq::models::grid_vision::merge(" in CUDA
+    assert "mfq::models::grid_vision::prepare(" in CUDA
+    assert "mfq_tensor_backend::gelu(value, \"none\")" in CUDA
+    assert "return mlp(std::move(grouped), up, gelu, down)" in SHARED_MODELS
     assert "grid_vision_canonical_name(" in CUDA
     assert "index_select(0, index.reshape({-1}))" in CUDA
     assert "model.visual" not in CUDA
@@ -57,35 +73,39 @@ def test_cuda_grid_vision_uses_existing_primitives_and_canonical_names() -> None
 
 def test_prepared_prompt_separates_semantic_and_cache_positions() -> None:
     assert "struct CudaPreparedPrompt" in PREPARED
-    assert "ids, prepared.embeddings, prepared.positions" in CUDA_APP
-    assert "mfq_nullopt, nullptr, mfq_nullopt, true" in CUDA_APP
-    assert "cache_positions + decode_position_delta" in CUDA_APP
+    assert "prepared->embeddings.narrow(1, chunk.offset, chunk.count)" in CUDA_APP
+    assert "prepared->positions.narrow(-1, chunk.offset, chunk.count)" in CUDA_APP
+    assert "mfq_nullopt,nullptr,mfq_nullopt,true" in "".join(CUDA_APP.split())
+    assert "ops.offset_positions(ops.cache_positions, model.decode_position_delta)" in CUDA_APP
     assert "rope.sections.numel() > 0" in CUDA_APP
-    assert "context.positions=local_pos" in CUDA_APP
-    assert "context.cache_positions=local_cache_positions" in CUDA_APP
+    assert "context.positions=local_pos" in "".join(CUDA_APP.split())
+    assert "context.cache_positions=local_cache_positions" in "".join(CUDA_APP.split())
     assert "cache_positions.has_value()" in CUDA_APP
 
 
-def test_prepared_prompt_supports_mtp_but_disables_remaining_fast_paths() -> None:
+def test_prepared_prompt_supports_mtp_and_safe_session_reuse() -> None:
     assert 'rope_parameters.value("mrope_interleaved", false)' in QWEN_CONFIG
     assert "interleaved_order" in CUDA_APP
-    assert "server_hidden_forward_prepared_chunked" in CUDA_APP
-    assert "model, full_ids, *prepared, prefill_chunk_size" in CUDA_APP
+    assert "prepared->embeddings.narrow(1, chunk.offset, chunk.count)" in CUDA_APP
+    assert "co_yield PrefillProgress" in CUDA_APP
     assert "model.last_logits_prepared(*prepared)" not in CUDA_APP
     assert "mtp.step_positioned(" in CUDA_APP
-    assert "cache_pos, cache_pos + tokens, pos.options()" in CUDA_APP
+    assert "ops.cache_positions(pos, model.cache_pos, tokens)" in CUDA_APP
+    assert "arange(start, start + tokens, positions.options())" in CUDA_APP
     assert "!transformed_prompt && mtp != nullptr" not in CUDA_APP
-    assert "transformed_prompt ? 0" in CUDA_APP
-    assert "!transformed_prompt && graph_enabled" in CUDA_APP
-    assert "server_components.grid_vision->prepare(" in CUDA_APP
-    assert "server_components.mtp.get()" in CUDA_APP
-    assert "continuous_batcher->submit(" in CUDA_APP
+    assert "transformed_prompt ? 0" not in CUDA_APP
+    assert "state.input_key = input_key" in CUDA_APP
+    assert "(!prepared || !prepared->transformed()) && !constraint" in CUDA_APP
+    assert "components.grid_vision->prepare(" in CUDA_APP
+    assert "components.mtp.get()" in CUDA_APP
+    assert "return batching->generate(request_id, input, output)" in CUDA_APP
+    assert "advance_preparation" in CUDA_APP
 
 
 def test_batched_text_positions_do_not_select_grid_mrope_sections() -> None:
     assert "bool grid_mrope_positions = false" in CUDA_APP
     assert "grid_mrope_positions ? sections : empty_sections" in CUDA_APP
-    assert "const bool grid_mrope_positions = B == 1" in CUDA_APP
+    assert "constboolgrid_mrope_positions=B==1" in "".join(CUDA_APP.split())
     assert "cache_positions.has_value() && pos.dim() == 2" in CUDA_APP
     assert "pos.size(0) == 3" in CUDA_APP
     assert "!grid_mrope_positions && positions.dim() == 2" in CUDA_APP
@@ -105,7 +125,10 @@ def test_cuda_registration_is_exact_and_video_is_not_advertised() -> None:
         "kMfqGridMropePositionPolicy",
     ):
         assert value in PLAN
-    assert "!server_components.grid_vision.has_value()" in CUDA_APP
+    assert (
+        "result.video_input = plan.vision == CudaVisionAdapter::minicpmo45;"
+        in PLAN
+    )
     assert "accepts exactly one image and no video" in CUDA
     for mutation in (
         "wrong_backbone",
