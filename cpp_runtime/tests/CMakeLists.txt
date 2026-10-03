@@ -57,6 +57,7 @@ add_test(NAME mfq-text-emitter-test COMMAND mfq-text-emitter-test)
 
 mfq_add_core_test(mfq-model-graph-test mfq_model_graph_test.cpp)
 mfq_add_core_test(mfq-model-source-test model_source_test.cpp)
+mfq_add_core_test(mfq-nint-rows-test nint_rows_test.cpp)
 mfq_add_core_test(mfq-grid-vision-test grid_vision_test.cpp)
 mfq_add_core_test(mfq-deepseek-v41-config-test deepseek_v41_config_test.cpp)
 target_link_libraries(mfq-deepseek-v41-config-test PRIVATE mfq-models)

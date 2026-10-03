@@ -856,6 +856,8 @@ def _quantize_nvq1_l(
     candidate_count: int,
     custom_codebook: np.ndarray | None,
     native_assignment: bool,
+    row_sse_only: bool = False,
+    return_packed_sse: bool = False,
 ) -> Nvq1LTensor:
     value, out, neuron_len = _prepare_weight(weight, device)
     value, objective_weight, ng = _pad_weight(value, spec.groupsize, importance)
@@ -925,6 +927,13 @@ def _quantize_nvq1_l(
         best_anchor[improve] = anchor[improve]
         best_error[improve] = error[improve]
 
+    if row_sse_only:
+        return best_error
+    if return_packed_sse:
+        from mfq.quantize.cuda.packed_result import nvq1
+        return nvq1(spec, neuron_len, best_anchor, best_scale, best_indices,
+                    best_delta, None if custom_codebook is None else codebook_cpu,
+                    small=False), best_error
     nvec = math.ceil(neuron_len / spec.vector_size)
     indices = best_indices.reshape(out, -1)[:, :nvec]
     return Nvq1LTensor(
@@ -955,6 +964,8 @@ def quantize_axis0(
     codebook: np.ndarray | None = None,
     nvq_native_assignment: bool = True,
     nvq1_l_native_assignment: bool = True,
+    row_sse_only: bool = False,
+    return_packed_sse: bool = False,
 ) -> NvqTensor | Nvq1LTensor:
     """Quantize one ``[out, in]`` chunk with native CUDA or Metal assignment."""
 
@@ -963,6 +974,8 @@ def quantize_axis0(
     if refine_steps < 0:
         raise ValueError("refine_steps must be non-negative")
     use_cuda = str(torch.device(device)).startswith("cuda")
+    if return_packed_sse and (not use_cuda or row_sse_only):
+        raise ValueError("packed SSE requires CUDA and excludes row_sse_only")
     old_tf32 = torch.backends.cuda.matmul.allow_tf32
     if use_cuda:
         torch.backends.cuda.matmul.allow_tf32 = False
@@ -979,7 +992,11 @@ def quantize_axis0(
                 candidate_count=nvq1_l_candidates,
                 custom_codebook=codebook,
                 native_assignment=nvq1_l_native_assignment,
+                row_sse_only=row_sse_only,
+                return_packed_sse=return_packed_sse,
             )
+        if row_sse_only or return_packed_sse:
+            raise ValueError("row_sse_only currently requires NVQ1-L")
         return _quantize_nvq(
             weight,
             spec,

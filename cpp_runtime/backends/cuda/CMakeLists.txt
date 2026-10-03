@@ -185,6 +185,13 @@ if(BUILD_TESTING)
         mfq-cuda-native-kernels)
     target_compile_definitions(mfq-nint-q8-test PRIVATE
         MFQ_NATIVE_CUDA_RUNTIME=1)
+    mfq_add_cuda_test(mfq-nint-rows-cuda-test
+        ${MFQ_CUDA_ROOT}/tests/mfq_nint_rows_test.cu
+        mfq-cuda-native-kernels mfq-core)
+    target_compile_definitions(mfq-nint-rows-cuda-test PRIVATE
+        MFQ_NATIVE_CUDA_RUNTIME=1)
+    target_include_directories(mfq-nint-rows-cuda-test PRIVATE
+        ${MFQ_REPOSITORY_ROOT})
     mfq_add_cuda_test(mfq-packed-prefill-test
         ${MFQ_CUDA_ROOT}/tests/mfq_packed_prefill_test.cu
         mfq-cuda-native-kernels mfq-core)

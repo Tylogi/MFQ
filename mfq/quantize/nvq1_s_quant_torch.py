@@ -100,7 +100,11 @@ def _solve(
     torch.Tensor,
     torch.Tensor,
 ]:
-    from mfq.quantize.metal.nvq import nvq1_s_assign
+    if xgroup.is_cuda:
+        from mfq.quantize.cuda._ext import ext
+        nvq1_s_assign = ext().nvq1_s_assign
+    else:
+        from mfq.quantize.metal.nvq import nvq1_s_assign
 
     anchor = _fp16_round(initial_anchor)
 
@@ -177,12 +181,16 @@ def quantize_axis0(
     codebook: np.ndarray = NVQ1_S_SYNTHETIC_BANKS,
     anchor_multipliers: Sequence[float] = (0.75, 1.0, 1.25),
     refine_steps: int = 2,
+    row_sse_only: bool = False,
+    return_packed_sse: bool = False,
 ) -> Nvq1STensor:
-    """Quantize a matrix with native Metal NVQ1-S assignment."""
+    """Quantize a matrix with native CUDA or Metal NVQ1-S assignment."""
 
     target = torch.device(device)
-    if target.type != "mps":
-        raise ValueError("native NVQ1-S accelerator quantization requires MPS")
+    if target.type not in {"cuda", "mps"}:
+        raise ValueError("native NVQ1-S accelerator quantization requires CUDA or MPS")
+    if return_packed_sse and (target.type != "cuda" or row_sse_only):
+        raise ValueError("packed SSE requires CUDA and excludes row_sse_only")
     if refine_steps < 0:
         raise ValueError("refine_steps must be non-negative")
     multipliers = tuple(float(value) for value in anchor_multipliers)
@@ -255,6 +263,12 @@ def quantize_axis0(
         )
         best_anchor = torch.where(improve, anchor, best_anchor)
         best_error = torch.where(improve, error, best_error)
+    if row_sse_only:
+        return best_error
+    if return_packed_sse:
+        from mfq.quantize.cuda.packed_result import nvq1
+        return nvq1(spec, neuron_len, best_anchor, best_scale, best_indices,
+                    best_delta, table, small=True), best_error
     nvec = neuron_len // spec.vector_size
     return Nvq1STensor(
         spec=spec,

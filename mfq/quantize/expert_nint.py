@@ -360,6 +360,8 @@ def _quantize_flat_cohort(
         assert precision.nint_spec is not None
         if artifact is not None:
             raise ValueError(f"{family} does not consume a quantizer artifact")
+        if precision.option("imatrix_weighted", False) and importance is None:
+            raise ValueError("explicit imatrix_weighted precision requires importance")
         if torch.device(device).type == "mps":
             from mfq.quantize.nint_quant_torch import quantize_axis0
 
@@ -369,7 +371,7 @@ def _quantize_flat_cohort(
                 device=device,
                 importance=(
                     importance
-                    if precision.nint_spec.bits in {2, 3, 4, 5, 6}
+                    if precision.nint_uses_imatrix
                     else None
                 ),
             )
@@ -379,7 +381,7 @@ def _quantize_flat_cohort(
             axis=0,
             importance=(
                 _numpy_importance(importance)
-                if precision.nint_spec.bits in {2, 3, 4, 5, 6}
+                if precision.nint_uses_imatrix
                 else None
             ),
         )

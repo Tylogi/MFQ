@@ -785,6 +785,66 @@ def _map_qwen_vision(source_name: str) -> TensorNameMapping | None:
     )
 
 
+def qwen4_recipe_name(canonical_name: str) -> str | None:
+    """Qwen4-Exp GGUF aliases; canonical MFQ storage names stay unchanged."""
+    roots = {
+        "model.token_embedding.weight": "token_embd.weight",
+        "model.output.weight": "output.weight",
+        "model.mhc.pre.norm.weight": "output_hc_norm.weight",
+        "model.mhc.pre.down.weight": "output_hc_down.weight",
+        "model.mhc.pre.up.weight": "output_hc_up.weight",
+    }
+    if canonical_name in roots:
+        return roots[canonical_name]
+    match = re.fullmatch(r"model\.block\.(\d+)\.(.+)", canonical_name)
+    if match is None:
+        return None
+    layer, suffix = match.groups()
+    if re.fullmatch(r"position_embedding\.ngram\.shard\.\d+\.weight", suffix):
+        return "per_layer_token_embd.weight"
+    aliases = {
+        "linear_attention.qkv.weight": "attn_qkv.weight",
+        "linear_attention.gate.weight": "attn_gate.weight",
+        "linear_attention.alpha.weight": "ssm_alpha.weight",
+        "linear_attention.beta.weight": "ssm_beta.weight",
+        "linear_attention.conv.weight": "ssm_conv1d.weight",
+        "linear_attention.dt_bias": "ssm_dt.bias",
+        "linear_attention.a": "ssm_a",
+        "linear_attention.norm.weight": "ssm_norm.weight",
+        "linear_attention.output.weight": "ssm_out.weight",
+        "attention.query.weight": "attn_q.weight",
+        "attention.key.weight": "attn_k.weight",
+        "attention.value.weight": "attn_v.weight",
+        "attention.output.weight": "attn_output.weight",
+        "attention.query_norm.weight": "attn_q_norm.weight",
+        "attention.key_norm.weight": "attn_k_norm.weight",
+        "attention.indexer.query_key.weight": "indexer.q_proj.weight",
+        "attention.indexer.query_norm.weight": "indexer.q_norm.weight",
+        "attention.indexer.key_norm.weight": "indexer.k_norm.weight",
+        "mlp.router.weight": "ffn_gate_inp.weight",
+        "mlp.shared_expert.router.weight": "ffn_gate_inp_shexp.weight",
+        "position_embedding.key.weight": "ple_key.weight",
+        "position_embedding.value.weight": "ple_value.weight",
+        "position_embedding.key_norm.weight": "ple_norm_key.weight",
+        "position_embedding.query_norm.weight": "ple_norm_query.weight",
+        "position_embedding.conv_norm.weight": "ple_norm_conv.weight",
+        "position_embedding.conv.weight": "ple_conv1d.weight",
+    }
+    for projection in ("gate", "up", "down"):
+        aliases[f"mlp.experts.{projection}.weight"] = f"ffn_{projection}_exps.weight"
+        aliases[f"mlp.shared_expert.{projection}.weight"] = f"ffn_{projection}_shexp.weight"
+    for scope, gguf_scope in (("attention", "attn"), ("mlp", "ffn")):
+        for field in ("norm", "down", "up"):
+            aliases[f"{scope}.mhc.pre.{field}.weight"] = f"hc_{gguf_scope}_{field}.weight"
+        aliases[f"{scope}.mhc.post.inject.weight"] = f"hc_{gguf_scope}_inject.weight"
+    alias = aliases.get(suffix)
+    return f"blk.{layer}.{alias}" if alias is not None else None
+
+
+def _qwen4_mapping(name: str, component: TensorComponent) -> TensorNameMapping:
+    return TensorNameMapping(name, component, qwen4_recipe_name(name))
+
+
 def _qwen4_source_mapper(
     source_name: str,
     topology: GraphTopology,
@@ -792,7 +852,7 @@ def _qwen4_source_mapper(
 ) -> TensorNameMapping | None:
     canonical = _already_canonical(source_name)
     if canonical is not None:
-        return canonical
+        return _qwen4_mapping(canonical.canonical_name, canonical.component)
     roots = {
         "model.language_model.embed_tokens.weight": "model.token_embedding.weight",
         "model.language_model.runtime_hash_metadata": "model.runtime.hash_metadata",
@@ -825,7 +885,7 @@ def _qwen4_source_mapper(
             if root.startswith("predictor.")
             else TensorComponent.MODEL
         )
-        return TensorNameMapping(root, component)
+        return _qwen4_mapping(root, component)
 
     vision = _map_qwen_vision(source_name)
     if vision is not None:
@@ -833,7 +893,7 @@ def _qwen4_source_mapper(
 
     ngram = _QWEN4_NGRAM_SHARD_RE.match(source_name)
     if ngram is not None:
-        return TensorNameMapping(
+        return _qwen4_mapping(
             model_block(
                 int(ngram.group(1)),
                 f"position_embedding.ngram.shard.{int(ngram.group(2))}.weight",
@@ -852,7 +912,7 @@ def _qwen4_source_mapper(
             "down_proj": "down",
         }[expert.group(4)]
         leaf = expert.group(5)
-        return TensorNameMapping(
+        return _qwen4_mapping(
             _component_block(
                 component,
                 layer,
@@ -874,7 +934,7 @@ def _qwen4_source_mapper(
         component, layer = _qwen4_component_block(
             source_prefix, int(match.group(1)), topology
         )
-        return TensorNameMapping(
+        return _qwen4_mapping(
             _component_block(component, layer, suffix),
             component,
         )

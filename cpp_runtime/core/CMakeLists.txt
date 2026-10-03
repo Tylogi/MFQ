@@ -23,6 +23,8 @@ set_target_properties(mfq-model-graph PROPERTIES
 )
 
 add_library(mfq-model-source STATIC
+    nint_rows.cpp
+    include/mfq/nint_rows.h
     hf_model_source.cpp
     hf_safetensors_source.cpp
     include/mfq/hf_model_source.h

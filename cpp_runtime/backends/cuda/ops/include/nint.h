@@ -2,13 +2,20 @@
 
 #include "mfq_tensor_backend.h"
 #include "mfq/model_source.h"
+#include "mfq/nint_rows.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 struct CudaProfiler;
+
+std::shared_ptr<mfq::NintRows> load_nint_row_table(
+    const mfq::ModelSource& source, const std::string& name);
+mfq_tensor_backend::Tensor nint_row_embedding_lookup(
+    const mfq::NintRows& table, const mfq_tensor_backend::Tensor& ids);
 
 struct Workspace {
     int M = 0;

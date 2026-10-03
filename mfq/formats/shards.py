@@ -8,7 +8,7 @@ import json
 import os
 import re
 import struct
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from pathlib import Path
 from typing import Protocol
@@ -311,6 +311,15 @@ def copy_sparse_range(source, target, nbytes: int, *, offset: int = 0) -> None:
 
 
 def _copy_record(record: BlobRecordLike, target) -> None:
+    # Encoded candidate records stream existing fields directly into the same
+    # container writer, without decoding or a second whole-model staging copy.
+    writer = getattr(record, 'write_to', None)
+    if writer is not None:
+        start = target.tell()
+        writer(target)
+        if target.tell() - start != int(record.nbytes):
+            raise ValueError(f'generated MFQ blob size mismatch for {record.name}')
+        return
     try:
         with Path(record.path).open("rb") as source:
             copy_sparse_range(
@@ -586,6 +595,7 @@ def write_blob_record_shards(
     split_max_tensors: int = 0,
     overwrite: bool = False,
     consume_blobs: bool = False,
+    before_publish: Callable[[Sequence[Path]], None] | None = None,
 ) -> list[Path]:
     """Stage all output files, then publish an MFQ file or shard set."""
 
@@ -637,6 +647,8 @@ def write_blob_record_shards(
             if tmp.stat().st_size <= 0:
                 raise RuntimeError(f"empty MFQ shard output: {tmp}")
 
+        if before_publish is not None:
+            before_publish(temporary)
         for tmp, destination in zip(temporary, destinations, strict=True):
             os.replace(tmp, destination)
         for stale in stale_outputs.difference(destinations):

@@ -51,6 +51,7 @@ public:
         std::byte* destination,
         std::size_t size) const override;
     void drop_file_cache() const noexcept override;
+    TensorReader tensor_reader(std::string_view name) const override;
     const std::vector<std::string>& assets() const noexcept override;
     bool has_asset(std::string_view name) const noexcept override;
     std::vector<std::byte> read_asset(std::string_view name) const override;

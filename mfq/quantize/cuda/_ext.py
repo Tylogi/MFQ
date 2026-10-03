@@ -16,6 +16,7 @@ _SOURCES = [
     str(_DIR / "npq0_l_assign.cu"),
     str(_DIR / "nvq2j_assign.cu"),
     str(_DIR / "nvq3j_assign.cu"),
+    str(_DIR / "nvq_pack.cu"),
     str(_DIR / "nint_quant.cu"),
     str(_DIR / "nvq_quant_cuda.cpp"),
 ]
