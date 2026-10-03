@@ -8,6 +8,12 @@ from mfq.commands import serve
 from mfq.server.api import network
 
 
+@pytest.fixture(autouse=True)
+def isolated_native_proxy_settings(monkeypatch):
+    for name in ("getproxies_macosx_sysconf", "getproxies_registry"):
+        monkeypatch.setattr(network.urllib.request, name, lambda: {}, raising=False)
+
+
 @pytest.mark.parametrize(
     "host",
     (
@@ -74,6 +80,12 @@ def test_system_proxy_environment_discovers_os_proxy_and_bypasses_loopback(monke
 
 def test_system_proxy_environment_preserves_explicit_proxy_and_bypass(monkeypatch) -> None:
     monkeypatch.setattr(
+        network.urllib.request, "getproxies_macosx_sysconf", lambda: {}, raising=False
+    )
+    monkeypatch.setattr(
+        network.urllib.request, "getproxies_registry", lambda: {}, raising=False
+    )
+    monkeypatch.setattr(
         network,
         "getproxies",
         lambda: {"https": "http://system-proxy.test:8080"},
@@ -89,3 +101,61 @@ def test_system_proxy_environment_preserves_explicit_proxy_and_bypass(monkeypatc
     assert environment["HTTPS_PROXY"] == "http://explicit-proxy.test:9090"
     assert environment["https_proxy"] == "http://explicit-proxy.test:9090"
     assert environment["NO_PROXY"] == "*.example.test,localhost,127.0.0.1,::1"
+
+
+@pytest.mark.parametrize("discovery", ("getproxies_macosx_sysconf", "getproxies_registry"))
+def test_bypass_only_environment_does_not_hide_native_proxy(monkeypatch, discovery) -> None:
+    for name in ("getproxies_macosx_sysconf", "getproxies_registry"):
+        monkeypatch.setattr(network.urllib.request, name, lambda: {}, raising=False)
+    monkeypatch.setattr(network, "getproxies", lambda: {"no": "localhost"})
+    monkeypatch.setattr(
+        network.urllib.request,
+        discovery,
+        lambda: {"https": "http://proxy.test:8080", "no": "*.internal.test"},
+    )
+
+    environment = network.system_proxy_environment({"NO_PROXY": "localhost"})
+
+    assert environment["HTTPS_PROXY"] == "http://proxy.test:8080"
+    assert environment["NO_PROXY"] == "localhost,*.internal.test,127.0.0.1,::1"
+
+
+def test_explicit_environment_proxy_wins_over_native_settings(monkeypatch) -> None:
+    monkeypatch.setattr(network, "getproxies", lambda: {"no": "localhost"})
+    monkeypatch.setattr(
+        network.urllib.request,
+        "getproxies_macosx_sysconf",
+        lambda: {"https": "http://system-proxy.test:8080"},
+        raising=False,
+    )
+    monkeypatch.setattr(network.urllib.request, "getproxies_registry", lambda: {}, raising=False)
+
+    environment = network.system_proxy_environment(
+        {"https_proxy": "http://explicit-proxy.test:9090", "NO_PROXY": "localhost"}
+    )
+
+    assert environment["HTTPS_PROXY"] == "http://explicit-proxy.test:9090"
+    assert environment["https_proxy"] == "http://explicit-proxy.test:9090"
+
+
+@pytest.mark.parametrize("error", (OSError, ValueError, RuntimeError))
+def test_proxy_discovery_failure_defaults_to_direct(monkeypatch, error) -> None:
+    def unavailable():
+        raise error("system settings unavailable")
+
+    monkeypatch.setattr(network, "getproxies", unavailable)
+    for name in ("getproxies_macosx_sysconf", "getproxies_registry"):
+        monkeypatch.setattr(network.urllib.request, name, unavailable, raising=False)
+    environment = network.system_proxy_environment({})
+    assert "HTTP_PROXY" not in environment
+    assert "HTTPS_PROXY" not in environment
+    assert environment["NO_PROXY"] == "127.0.0.1,localhost,::1"
+    explicit = network.system_proxy_environment({"HTTPS_PROXY": "http://proxy.test:8080"})
+    assert explicit["https_proxy"] == "http://proxy.test:8080"
+
+
+def test_explicit_all_proxy_takes_priority_over_system_proxy(monkeypatch) -> None:
+    monkeypatch.setattr(network, "getproxies", lambda: {"https": "http://os.test:8080"})
+    environment = network.system_proxy_environment({"ALL_PROXY": "http://explicit.test:8080"})
+    assert environment["ALL_PROXY"] == "http://explicit.test:8080"
+    assert "https_proxy" not in environment

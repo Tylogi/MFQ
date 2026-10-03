@@ -120,6 +120,7 @@ export interface OfficialModelInfo {
 export interface OfficialModelList {
   system: HubSystemProfile;
   data: OfficialModelInfo[];
+  refreshing?: boolean;
 }
 
 export interface ArtifactLineage {

@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import math
 import os
 import platform
 import re
+import ssl
+import tempfile
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
+from urllib.request import proxy_bypass_environment
 
 import httpx
 
@@ -43,10 +49,36 @@ _PRECISION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _GIB = 1 << 30
+_METADATA_TIMEOUT = 8.0
+_METADATA_DEADLINE = 12.0
+_OFFICIAL_CACHE_TTL = 900
 
 
 class HubError(RuntimeError):
     pass
+
+
+def _metadata_client(endpoint: str, **kwargs: Any) -> httpx.AsyncClient:
+    from mfq.server.api.network import system_proxy_environment
+
+    environment = system_proxy_environment()
+    parsed = urlparse(endpoint)
+    proxy = None
+    if not proxy_bypass_environment(parsed.hostname or "", {"no": environment["NO_PROXY"]}):
+        proxy = (
+            environment.get(f"{parsed.scheme}_proxy")
+            or environment.get(f"{parsed.scheme.upper()}_PROXY")
+            or environment.get("all_proxy") or environment.get("ALL_PROXY")
+        )
+    verify: ssl.SSLContext | bool = True
+    if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
+        verify = ssl.create_default_context(
+            cafile=os.environ.get("SSL_CERT_FILE"), capath=os.environ.get("SSL_CERT_DIR")
+        )
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(_METADATA_TIMEOUT, connect=4.0),
+        follow_redirects=True, proxy=proxy, trust_env=False, verify=verify, **kwargs,
+    )
 
 
 @dataclass(frozen=True)
@@ -492,10 +524,95 @@ def _optional_text(value: Any, *, limit: int = 2048) -> str | None:
 
 
 class HubCatalog:
-    def __init__(self) -> None:
+    def __init__(self, *, cache_path: Path | None = None) -> None:
         self._official_cache: dict[tuple[HubProvider, str], HubModelInfo | None] = {}
         self._official_cache_time = 0.0
-        self._official_lock = asyncio.Lock()
+        self._source_cache_times: dict[tuple[HubProvider, str], float] = {}
+        self._cache_path = cache_path
+        self._refresh_task: asyncio.Task[None] | None = None
+        self._closed = False
+        self._load_cache()
+
+    def _load_cache(self) -> None:
+        if self._cache_path is None:
+            return
+        try:
+            if self._cache_path.stat().st_size > 1 << 20:
+                return
+            payload = json.loads(self._cache_path.read_text(encoding="utf-8"))
+            if payload["version"] != 1:
+                return
+            now = time.time()
+            updated_at = float(payload["updated_at"])
+            if not math.isfinite(updated_at) or updated_at > now:
+                return
+            age = now - updated_at
+            sources = {
+                (source.provider, source.repo_id)
+                for model in _OFFICIAL_MODELS
+                for source in model.sources
+            }
+            cache = {}
+            times = {}
+            for item in payload["models"]:
+                model = HubModelInfo.model_validate(item["model"])
+                cached_at = float(item["cached_at"])
+                if not math.isfinite(cached_at) or cached_at > now:
+                    return
+                key = (model.provider, model.repo_id)
+                if key in sources:
+                    cache[key] = model
+                    times[key] = time.monotonic() - (now - cached_at)
+            self._official_cache = cache
+            self._source_cache_times = times
+            self._official_cache_time = time.monotonic() - age
+        except (OSError, ValueError, KeyError, TypeError):
+            # A missing or damaged cache must not prevent browsing.
+            return
+
+    def _save_cache(self) -> None:
+        if self._cache_path is None:
+            return
+        temporary = None
+        try:
+            payload = json.dumps({
+                "version": 1,
+                "updated_at": time.time(),
+                "models": [
+                    {
+                        "model": model.model_dump(mode="json"),
+                        "cached_at": time.time() - max(
+                            0.0, time.monotonic() - self._source_cache_times.get(key, 0.0)
+                        ),
+                    }
+                    for key, model in self._official_cache.items()
+                    if model is not None
+                ],
+            })
+            if len(payload.encode("utf-8")) > 1 << 20:
+                return
+            self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self._cache_path.parent,
+                prefix=f".{self._cache_path.name}.", delete=False,
+            ) as output:
+                temporary = Path(output.name)
+                output.write(payload)
+            temporary.replace(self._cache_path)
+        except OSError:
+            pass
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    async def aclose(self) -> None:
+        self._closed = True
+        if self._refresh_task is not None:
+            self._refresh_task.cancel()
+            await asyncio.gather(self._refresh_task, return_exceptions=True)
 
     async def search(
         self, provider: HubProvider, query: str, *, limit: int
@@ -513,11 +630,32 @@ class HubCatalog:
         profile: HubSystemProfile | None = None,
     ) -> HubModelInfo:
         profile = profile or system_profile()
-        if provider == "huggingface":
-            return await asyncio.to_thread(
-                self._info_huggingface, repo_id, revision, profile
-            )
-        return await asyncio.to_thread(self._info_modelscope, repo_id, revision, profile)
+        cached = self._official_cache.get((provider, repo_id))
+        if (
+            cached is not None
+            and revision in {None, cached.revision}
+            and time.monotonic() - self._source_cache_times.get(
+                (provider, repo_id), self._official_cache_time
+            ) < _OFFICIAL_CACHE_TTL
+        ):
+            return cached.model_copy(update={
+                "variants": _model_variants(
+                    cached.files, profile, runtime_compatible=cached.runtime_compatible
+                ),
+            })
+        return await self._fetch_info(provider, repo_id, revision, profile)
+
+    async def _fetch_info(
+        self, provider: HubProvider, repo_id: str, revision: str | None,
+        profile: HubSystemProfile,
+    ) -> HubModelInfo:
+        try:
+            async with asyncio.timeout(_METADATA_DEADLINE):
+                if provider == "huggingface":
+                    return await self._info_huggingface(repo_id, revision, profile)
+                return await self._info_modelscope(repo_id, revision, profile)
+        except TimeoutError as error:
+            raise HubError("Model repository metadata request timed out.") from error
 
     async def resolve(
         self,
@@ -533,42 +671,40 @@ class HubCatalog:
         self, *, profile: HubSystemProfile | None = None, refresh: bool = False
     ) -> OfficialModelList:
         profile = profile or system_profile()
-        await self._refresh_official_cache(profile, refresh=refresh)
+        refreshing = self._refresh_task is not None and not self._refresh_task.done()
+        stale = (
+            not self._official_cache
+            or time.monotonic() - self._official_cache_time >= _OFFICIAL_CACHE_TTL
+        )
+        if not self._closed and not refreshing and (refresh or stale):
+            self._refresh_task = asyncio.create_task(self._refresh_official_cache(profile))
+            refreshing = True
         models = [self._official_model(spec, profile) for spec in _OFFICIAL_MODELS]
-        return OfficialModelList(system=profile, data=models)
+        return OfficialModelList(system=profile, data=models, refreshing=refreshing)
 
     async def _refresh_official_cache(
-        self, profile: HubSystemProfile, *, refresh: bool
+        self, profile: HubSystemProfile
     ) -> None:
-        if (
-            not refresh
-            and self._official_cache
-            and time.monotonic() - self._official_cache_time < 900
-        ):
-            return
-        async with self._official_lock:
-            if (
-                not refresh
-                and self._official_cache
-                and time.monotonic() - self._official_cache_time < 900
-            ):
-                return
-            sources = {
-                (source.provider, source.repo_id)
-                for model in _OFFICIAL_MODELS
-                for source in model.sources
-            }
+        sources = {
+            (source.provider, source.repo_id)
+            for model in _OFFICIAL_MODELS
+            for source in model.sources
+        }
 
-            async def inspect(provider: HubProvider, repo_id: str) -> HubModelInfo | None:
-                try:
-                    return await self.info(provider, repo_id, None, profile=profile)
-                except HubError:
-                    return None
+        async def inspect(provider: HubProvider, repo_id: str) -> None:
+            key = (provider, repo_id)
+            try:
+                self._official_cache[key] = await self._fetch_info(
+                    provider, repo_id, None, profile
+                )
+                self._source_cache_times[key] = time.monotonic()
+            except HubError:
+                # Keep the last usable snapshot when a hub is temporarily offline.
+                self._official_cache.setdefault(key, None)
 
-            keys = sorted(sources)
-            values = await asyncio.gather(*(inspect(*key) for key in keys))
-            self._official_cache = dict(zip(keys, values, strict=True))
-            self._official_cache_time = time.monotonic()
+        await asyncio.gather(*(inspect(*key) for key in sorted(sources)))
+        self._official_cache_time = time.monotonic()
+        self._save_cache()
 
     def _official_model(
         self, spec: _OfficialModelSpec, profile: HubSystemProfile
@@ -656,18 +792,22 @@ class HubCatalog:
             raise HubError(str(error)) from error
 
     @staticmethod
-    def _info_huggingface(
+    async def _info_huggingface(
         repo_id: str, revision: str | None, profile: HubSystemProfile
     ) -> HubModelInfo:
         try:
-            from huggingface_hub import HfApi
+            from huggingface_hub import ModelInfo, constants, get_token
 
-            info = HfApi().model_info(
-                repo_id,
-                revision=revision,
-                files_metadata=True,
-                token=os.environ.get("HF_TOKEN") or None,
-            )
+            endpoint = constants.ENDPOINT
+            path = f"{endpoint}/api/models/{repo_id}"
+            if revision is not None:
+                path += f"/revision/{quote(revision, safe='')}"
+            token = get_token()
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            async with _metadata_client(endpoint, headers=headers) as client:
+                response = await client.get(path, params={"blobs": "true"})
+                response.raise_for_status()
+                info = ModelInfo(**response.json())
             files = []
             for item in info.siblings or []:
                 lfs = _mapping(getattr(item, "lfs", None))
@@ -767,45 +907,82 @@ class HubCatalog:
             raise HubError(str(error)) from error
 
     @staticmethod
-    def _info_modelscope(
+    async def _info_modelscope(
         repo_id: str, revision: str | None, profile: HubSystemProfile
     ) -> HubModelInfo:
         try:
-            from modelscope_hub import HubApi
+            from modelscope_hub.config import get_default_config
 
-            api = HubApi()
-            model = api.get_repo(repo_id, "model", revision=revision)
+            config = get_default_config()
+            endpoint = str(config.endpoint).rstrip("/")
+            headers = {"Authorization": f"Bearer {config.token}"} if config.token else {}
+            cookies = httpx.Cookies()
+            if config.token:
+                cookies.set("m_session_id", config.token, domain=urlparse(endpoint).hostname)
+            async with _metadata_client(endpoint, headers=headers, cookies=cookies) as client:
+                async def metadata() -> dict[str, Any]:
+                    response = await client.get(f"{endpoint}/openapi/v1/models/{repo_id}")
+                    if response.status_code == 404:
+                        response = await client.get(f"{endpoint}/api/v1/models/{repo_id}")
+                    response.raise_for_status()
+                    payload = response.json()
+                    if payload.get("success") is False or payload.get("Code", 200) != 200:
+                        raise HubError("ModelScope repository metadata request failed.")
+                    return _mapping(payload.get("data", payload.get("Data", payload)))
+
+                async def listing() -> list[dict[str, Any]]:
+                    response = await client.get(
+                        f"{endpoint}/api/v1/models/{repo_id}/repo/files",
+                        params={"Revision": revision or "master", "Recursive": "True"},
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    if payload.get("success") is False or payload.get("Code", 200) != 200:
+                        raise HubError("ModelScope repository file listing failed.")
+                    data = payload.get("data", payload.get("Data", payload))
+                    if isinstance(data, dict):
+                        data = data.get("Files", data.get("files", []))
+                    return data
+
+                async with asyncio.TaskGroup() as group:
+                    model_task = group.create_task(metadata())
+                    entries_task = group.create_task(listing())
+                model, entries = model_task.result(), entries_task.result()
             files = [
                 HubModelFile(
-                    name=item.path,
-                    byte_size=int(item.size or 0),
+                    name=item.get("Path") or item.get("path") or item.get("Name") or "",
+                    byte_size=int(item.get("Size") or item.get("size") or 0),
                     sha256=(
-                        str(item.sha256)
-                        if getattr(item, "sha256", None)
-                        and re.fullmatch(r"[0-9a-f]{64}", str(item.sha256))
+                        str(item.get("Sha256") or item.get("sha256"))
+                        if re.fullmatch(
+                            r"[0-9a-f]{64}", str(item.get("Sha256") or item.get("sha256"))
+                        )
                         else None
                     ),
                 )
-                for item in api.list_repo_files(
-                    repo_id, "model", revision=revision, recursive=True
-                )
+                for item in entries
+                if item.get("Type", item.get("type", "blob")) != "tree"
             ]
-            tags = list(getattr(model, "tags", None) or [])
-            license_name = getattr(model, "license", None)
+            tags = list(model.get("tags") or model.get("Tags") or [])
+            license_name = model.get("license") or model.get("License")
             return HubModelInfo(
                 provider="modelscope",
-                repo_id=model.id,
-                source_url=f"https://modelscope.cn/models/{model.id}",
-                author=model.id.split("/", 1)[0] if "/" in model.id else None,
-                description=_optional_text(getattr(model, "description", None)),
+                repo_id=repo_id,
+                source_url=f"https://modelscope.cn/models/{repo_id}",
+                author=repo_id.split("/", 1)[0],
+                description=_optional_text(model.get("description") or model.get("Description")),
                 revision=revision or "master",
-                downloads=int(model.downloads or 0),
-                likes=int(model.likes or 0),
+                downloads=int(model.get("downloads") or model.get("Downloads") or 0),
+                likes=int(model.get("likes") or model.get("Likes") or 0),
                 total_bytes=sum(item.byte_size for item in files),
-                updated_at=model.last_modified,
+                updated_at=(
+                    model.get("last_modified") or model.get("updated_at")
+                    or model.get("LastModified") or model.get("UpdatedAt")
+                ),
                 files=files,
                 tags=tags,
                 license=_optional_text(license_name, limit=255),
+                gated=bool(model.get("gated", False)),
                 modalities=[
                     modality
                     for modality in ("text", "image", "video", "audio")

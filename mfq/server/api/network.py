@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import urllib.request
 from collections.abc import Mapping
 from urllib.request import getproxies
 
@@ -49,13 +50,32 @@ def system_proxy_environment(base: Mapping[str, str] | None = None) -> dict[str,
     """Return an environment that honors OS proxies without proxying loopback traffic."""
 
     environment = dict(os.environ if base is None else base)
-    proxies = getproxies()
+    try:
+        proxies = getproxies()
+    except (OSError, ValueError, RuntimeError):
+        proxies = {}
+    # NO_PROXY alone makes urllib skip OS settings on macOS and Windows.
+    # Merge native discovery without overwriting explicit environment proxies.
+    for name in ("getproxies_macosx_sysconf", "getproxies_registry"):
+        discover = getattr(urllib.request, name, None)
+        if discover is not None:
+            try:
+                discovered = discover()
+            except (OSError, ValueError, RuntimeError):
+                continue
+            for scheme, value in discovered.items():
+                if scheme == "no":
+                    proxies[scheme] = ",".join(filter(None, (proxies.get(scheme), value)))
+                else:
+                    proxies.setdefault(scheme, value)
     for scheme in ("http", "https"):
         lower = f"{scheme}_proxy"
         upper = lower.upper()
         configured = environment.get(lower) or environment.get(upper)
         discovered = proxies.get(scheme)
-        value = configured or discovered
+        value = configured or (
+            discovered if not (environment.get("all_proxy") or environment.get("ALL_PROXY")) else None
+        )
         if value:
             environment.setdefault(lower, value)
             environment.setdefault(upper, value)

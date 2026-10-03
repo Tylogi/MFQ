@@ -961,6 +961,7 @@ class OfficialModelInfo(ProtocolModel):
 class OfficialModelList(ProtocolModel):
     system: HubSystemProfile
     data: list[OfficialModelInfo]
+    refreshing: bool = False
 
 
 class ArtifactLineageResource(ProtocolModel):

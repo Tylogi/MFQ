@@ -299,7 +299,9 @@ class ServerService:
         self.jobs = jobs or JobManager(store)
         self.catalog = catalog
         self.runtime_manager = runtime_manager
-        self.hub_catalog = hub_catalog or HubCatalog()
+        self.hub_catalog = hub_catalog or HubCatalog(
+            cache_path=store.path.parent / "hub-official.json"
+        )
         self.tool_handlers = tool_handlers
         self.cluster = cluster
         self.voice_component = voice_component
@@ -327,6 +329,8 @@ class ServerService:
             if self._closed:
                 return
             self._closed = True
+            if isinstance(self.hub_catalog, HubCatalog):
+                await self.hub_catalog.aclose()
             await self.jobs.close()
 
             active = tuple(self._active_responses.items())

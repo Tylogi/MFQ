@@ -214,41 +214,68 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tr }: ModelBrows
   const [results, setResults] = useState<HubModelSummary[]>([]);
   const [communityModel, setCommunityModel] = useState<HubModelInfo | null>(null);
   const [officialLoading, setOfficialLoading] = useState(false);
+  const [catalogLoading, setCatalogLoading] = useState(false);
   const [communityLoading, setCommunityLoading] = useState(false);
   const [downloading, setDownloading] = useState<string | null>(null);
   const officialRequest = useRef(0);
+  const catalogRequest = useRef(0);
+  const catalogTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const catalogController = useRef<AbortController | null>(null);
   const communityRequest = useRef(0);
 
   const selectedOfficial = useMemo(
     () => official?.data.find((item) => item.id === officialSelection) ?? official?.data[0] ?? null,
     [official, officialSelection],
   );
-  const selectedSource = officialSource ?? selectedOfficial?.selected_source ?? null;
-  const officialVariants = officialSourceInfo?.variants ?? selectedOfficial?.variants ?? [];
+  const selectedSource = selectedOfficial?.sources.find((source) =>
+    source.provider === officialSource?.provider && source.repo_id === officialSource.repo_id)
+    ?? selectedOfficial?.selected_source ?? null;
+  const sourceInfoMatches = !!officialSourceInfo && officialSourceInfo.provider === selectedSource?.provider
+    && officialSourceInfo?.repo_id === selectedSource?.repo_id
+    && (!selectedSource?.revision || officialSourceInfo?.revision === selectedSource.revision);
+  const officialVariants = sourceInfoMatches ? officialSourceInfo!.variants
+    : selectedSource?.provider === selectedOfficial?.selected_source.provider
+      ? selectedOfficial?.variants ?? [] : [];
   const canDownload = (targetProvider: HubModelSummary["provider"]) =>
     jobKinds.some((item) => item.kind === `download.${targetProvider}`);
 
   async function loadOfficial(refresh = false) {
-    const request = ++officialRequest.current;
-    setOfficialLoading(true);
-    try {
-      const catalog = await modelsApi.officialHubModels(refresh);
-      if (request !== officialRequest.current) return;
-      setOfficial(catalog);
-      setOfficialSelection((current) => current && catalog.data.some((item) => item.id === current)
-        ? current
-        : catalog.data[0]?.id ?? null);
-      setOfficialSource(null);
-      setOfficialSourceInfo(null);
-    } catch (cause) {
-      if (request === officialRequest.current) onError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      if (request === officialRequest.current) setOfficialLoading(false);
+    const request = ++catalogRequest.current;
+    if (catalogTimer.current !== null) clearTimeout(catalogTimer.current);
+    catalogController.current?.abort();
+    const controller = new AbortController();
+    catalogController.current = controller;
+    setCatalogLoading(true);
+    async function readCatalog(force: boolean) {
+      try {
+        const catalog = await modelsApi.officialHubModels(force, controller.signal);
+        if (request !== catalogRequest.current) return;
+        setOfficial(catalog);
+        setOfficialSelection((current) => current && catalog.data.some((item) => item.id === current)
+          ? current : catalog.data[0]?.id ?? null);
+        if (catalog.refreshing) {
+          catalogTimer.current = setTimeout(() => void readCatalog(false), 1000);
+        }
+      } catch (cause) {
+        if (request === catalogRequest.current && !controller.signal.aborted) {
+          onError(cause instanceof Error ? cause.message : String(cause));
+        }
+      } finally {
+        if (request === catalogRequest.current) setCatalogLoading(false);
+      }
     }
+    await readCatalog(refresh);
   }
 
   useEffect(() => {
     void loadOfficial(false);
+    return () => {
+      catalogRequest.current += 1;
+      officialRequest.current += 1;
+      communityRequest.current += 1;
+      catalogController.current?.abort();
+      if (catalogTimer.current !== null) clearTimeout(catalogTimer.current);
+    };
   }, []);
 
   function chooseOfficial(item: OfficialModelInfo) {
@@ -368,7 +395,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tr }: ModelBrows
             <div><span>{tr("检测到的配置", "Detected configuration")}</span><strong>{system ? `${system.platform} · ${system.machine} · ${system.backend.toUpperCase()}` : tr("正在检测", "Detecting")}</strong></div>
             <div><span>{tr("物理内存", "Physical memory")}</span><strong>{formatBytes(system?.physical_memory_bytes)}</strong></div>
             <div><span>{tr("推理预算", "Runtime budget")}</span><strong>{formatBytes(system?.runtime_memory_budget_bytes)}</strong></div>
-            <button disabled={officialLoading} onClick={() => void loadOfficial(true)} type="button">{officialLoading ? tr("刷新中", "Refreshing") : tr("刷新目录", "Refresh")}</button>
+            <button disabled={catalogLoading || official?.refreshing} onClick={() => void loadOfficial(true)} type="button">{catalogLoading || official?.refreshing ? tr("刷新中", "Refreshing") : tr("刷新目录", "Refresh")}</button>
           </div>
           <div className="memory-pressure-guide">
             <strong>{tr("内存压力", "Memory pressure")}</strong>

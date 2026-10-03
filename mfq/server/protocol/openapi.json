@@ -3644,6 +3644,11 @@
             "title": "Data",
             "type": "array"
           },
+          "refreshing": {
+            "default": false,
+            "title": "Refreshing",
+            "type": "boolean"
+          },
           "system": {
             "$ref": "#/components/schemas/HubSystemProfile"
           }

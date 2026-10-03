@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 import httpx
+import pytest
 
 from mfq.server.api import create_app
 from mfq.server.protocol.models import (
@@ -29,6 +30,199 @@ from mfq.server.services.hub import (
 from mfq.server.services.service import ServerService
 from mfq.server.state.storage import SessionStore
 from tests.test_server_service import FakeBackend
+
+
+def test_official_refresh_is_incremental_coalesced_and_cancelable(monkeypatch) -> None:
+    async def run() -> None:
+        catalog = HubCatalog()
+        started = asyncio.Event()
+        blocked = asyncio.Event()
+        calls = []
+        canceled = []
+
+        async def fetch(provider, repo_id, revision, profile):
+            calls.append((provider, repo_id))
+            if provider == "huggingface":
+                started.set()
+                try:
+                    await blocked.wait()
+                finally:
+                    canceled.append(repo_id)
+            return HubModelInfo(
+                provider=provider, repo_id=repo_id, revision="master",
+                files=[HubModelFile(name="S4.mfq", byte_size=42)],
+            )
+
+        monkeypatch.setattr(catalog, "_fetch_info", fetch)
+        first = await asyncio.wait_for(catalog.official(), timeout=0.5)
+        assert first.refreshing and len(first.data) == 4
+        await started.wait()
+        await asyncio.sleep(0)
+        partial = await catalog.official(refresh=True)
+        assert partial.refreshing and len(calls) == 5
+        available = next(item for item in partial.data if item.id == "qwen3-8-27b")
+        assert available.variants and available.selected_source.available
+        cached = await catalog.info("modelscope", available.selected_source.repo_id, "master")
+        assert cached.files[0].byte_size == 42 and len(calls) == 5
+        await catalog.aclose()
+        assert len(canceled) == 2 and catalog._refresh_task.done()
+
+    asyncio.run(run())
+
+
+def test_official_cache_survives_restart_and_failed_refresh(tmp_path, monkeypatch) -> None:
+    async def run() -> None:
+        path = tmp_path / "hub-official.json"
+        catalog = HubCatalog(cache_path=path)
+
+        async def fetch(provider, repo_id, revision, profile):
+            return HubModelInfo(
+                provider=provider, repo_id=repo_id, revision="master",
+                files=[HubModelFile(name="S4.mfq", byte_size=42)],
+            )
+
+        monkeypatch.setattr(catalog, "_fetch_info", fetch)
+        await catalog.official()
+        await catalog._refresh_task
+        assert path.exists()
+        restored = HubCatalog(cache_path=path)
+        assert not (await restored.official()).refreshing
+        assert len(restored._official_cache) == 5
+        original_times = restored._source_cache_times.copy()
+
+        async def offline(*args):
+            raise HubError("offline")
+
+        monkeypatch.setattr(restored, "_fetch_info", offline)
+        pending = await restored.official(refresh=True)
+        assert pending.refreshing and all(item.variants for item in pending.data)
+        await restored._refresh_task
+        assert restored._source_cache_times == original_times
+        assert all(item.variants for item in (await restored.official()).data)
+        reloaded = HubCatalog(cache_path=path)
+        assert all(item.variants for item in (await reloaded.official()).data)
+        await catalog.aclose()
+        await restored.aclose()
+        await reloaded.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("content", ('{"version":99}', '{"version":1,"updated_at":NaN}', 'broken'))
+def test_corrupt_official_cache_is_ignored(tmp_path, content) -> None:
+    path = tmp_path / "hub-official.json"
+    path.write_text(content)
+    assert not HubCatalog(cache_path=path)._official_cache
+
+
+def test_metadata_deadline_cancels_slow_source(monkeypatch) -> None:
+    from mfq.server.services import hub
+
+    async def run() -> None:
+        canceled = asyncio.Event()
+
+        async def slow(*args):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                canceled.set()
+
+        monkeypatch.setattr(hub, "_METADATA_DEADLINE", 0.01)
+        monkeypatch.setattr(HubCatalog, "_info_huggingface", slow)
+        with pytest.raises(HubError, match="timed out"):
+            await HubCatalog().info("huggingface", "owner/model", None)
+        assert canceled.is_set()
+
+    asyncio.run(run())
+
+
+def test_huggingface_metadata_uses_one_bounded_request(monkeypatch) -> None:
+    from mfq.server.services import hub
+    import huggingface_hub
+
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json={
+            "id": "owner/model", "sha": "revision", "downloads": 3,
+            "siblings": [{"rfilename": "S4.mfq", "size": 42,
+                          "lfs": {"size": 42, "sha256": "a" * 64, "pointerSize": 1}}],
+        })
+
+    monkeypatch.setattr(huggingface_hub, "get_token", lambda: None)
+    monkeypatch.setattr(hub, "_metadata_client", lambda *args, **kwargs:
+                        httpx.AsyncClient(transport=httpx.MockTransport(respond), **kwargs))
+    info = asyncio.run(HubCatalog().info("huggingface", "owner/model", "feature/test"))
+    assert len(requests) == 1
+    assert requests[0].url.raw_path.startswith(b"/api/models/owner/model/revision/feature%2Ftest?")
+    assert requests[0].url.params["blobs"] == "true"
+    assert info.files[0].sha256 == "a" * 64 and info.total_bytes == 42
+
+
+def test_modelscope_metadata_and_listing_run_in_parallel(monkeypatch) -> None:
+    from mfq.server.services import hub
+    from modelscope_hub import config
+    from types import SimpleNamespace
+
+    async def run() -> None:
+        requests = []
+        both_started = asyncio.Event()
+
+        async def respond(request):
+            requests.append(request)
+            if len(requests) == 2:
+                both_started.set()
+            await both_started.wait()
+            if "repo/files" in request.url.path:
+                return httpx.Response(200, json={"Data": {"Files": [
+                    {"Path": "folder", "Type": "tree"},
+                    {"Path": "S4.mfq", "Size": 42, "Sha256": "b" * 64},
+                ]}})
+            return httpx.Response(200, json={"success": True, "data": {
+                "license": "apache-2.0", "downloads": 7,
+            }})
+
+        monkeypatch.setattr(config, "get_default_config", lambda:
+                            SimpleNamespace(endpoint="https://modelscope.cn", token=None))
+        monkeypatch.setattr(hub, "_metadata_client", lambda *args, **kwargs:
+                            httpx.AsyncClient(transport=httpx.MockTransport(respond), **kwargs))
+        info = await asyncio.wait_for(HubCatalog().info("modelscope", "owner/model", None), 0.5)
+        assert len(requests) == 2 and info.license == "apache-2.0"
+        assert info.downloads == 7 and info.total_bytes == 42 and len(info.files) == 1
+        assert info.files[0].sha256 == "b" * 64
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("endpoint,explicit,expected", (
+    ("https://huggingface.co", None, None),
+    ("https://huggingface.co", "http://proxy.test:8080", "http://proxy.test:8080"),
+    ("http://localhost", "http://proxy.test:8080", None),
+))
+def test_metadata_client_defaults_to_direct_when_proxy_discovery_fails(
+    monkeypatch, endpoint, explicit, expected
+) -> None:
+    from mfq.server.api import network
+    from mfq.server.services import hub
+
+    def unavailable():
+        raise OSError("settings unavailable")
+
+    for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("NO_PROXY", "localhost")
+    if explicit:
+        monkeypatch.setenv("HTTPS_PROXY", explicit)
+        monkeypatch.setenv("HTTP_PROXY", explicit)
+    monkeypatch.setattr(network, "getproxies", unavailable)
+    for name in ("getproxies_macosx_sysconf", "getproxies_registry"):
+        monkeypatch.setattr(network.urllib.request, name, unavailable, raising=False)
+    monkeypatch.setattr(hub.httpx, "AsyncClient", lambda **kwargs: kwargs)
+    options = hub._metadata_client(endpoint)
+    assert options["proxy"] == expected
+    assert options["trust_env"] is False
+    assert options["timeout"].connect == 4 and options["timeout"].read == 8
 
 
 class FakeHub:
