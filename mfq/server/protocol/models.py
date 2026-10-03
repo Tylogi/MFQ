@@ -603,6 +603,16 @@ class McpToolCallResult(ProtocolModel):
     is_error: bool = False
 
 
+class RuntimeMemoryPolicy(ProtocolModel):
+    model_limit_bytes: int | None = Field(default=None, ge=1)
+    prefix_limit_bytes: int | None = Field(default=None, ge=0)
+    prefix_directory: str | None = Field(default=None, min_length=1, max_length=4096)
+
+
+class RuntimeModelAliases(ProtocolModel):
+    aliases: dict[str, str] = Field(default_factory=dict, max_length=128)
+
+
 class ModelLoadRequest(ProtocolModel):
     model: str = Field(min_length=1, max_length=255)
     artifact_uri: str | None = Field(default=None, min_length=1)
@@ -735,6 +745,65 @@ class ModelUnloadRequest(ProtocolModel):
     force: bool = False
 
 
+class RuntimeGpuUtilization(ProtocolModel):
+    name: str
+    core_count: int | None = Field(default=None, ge=1)
+    utilization_percent: float | None = Field(default=None, ge=0, le=100)
+
+
+class RuntimeDiskTraffic(ProtocolModel):
+    name: str
+    read_bytes_per_second: float | None = Field(default=None, ge=0)
+    write_bytes_per_second: float | None = Field(default=None, ge=0)
+    busy_percent: float | None = Field(default=None, ge=0, le=100)
+    bandwidth_utilization_percent: float | None = Field(default=None, ge=0, le=100)
+
+
+class RuntimeWeightTraffic(ProtocolModel):
+    instance_id: str
+    model: str
+    expert_read_bytes_per_second: float | None = Field(default=None, ge=0)
+    ple_read_bytes_per_second: float | None = Field(default=None, ge=0)
+    engram_read_bytes_per_second: float | None = Field(default=None, ge=0)
+
+
+class RuntimeResourceSnapshot(ProtocolModel):
+    sampled_at: float = Field(ge=0)
+    interval_seconds: float | None = Field(default=None, ge=0)
+    cpu_name: str | None = None
+    cpu_cores: int | None = Field(default=None, ge=1)
+    cpu_utilization_percent: float | None = Field(default=None, ge=0, le=100)
+    gpus: list[RuntimeGpuUtilization]
+    disks: list[RuntimeDiskTraffic]
+    memory_bandwidth_bytes_per_second: float | None = Field(default=None, ge=0)
+    memory_bandwidth_limit_bytes_per_second: int | None = Field(default=None, gt=0)
+    memory_bandwidth_utilization_percent: float | None = Field(default=None, ge=0, le=100)
+    weights: list[RuntimeWeightTraffic]
+
+
+class RuntimeMemoryResources(ProtocolModel):
+    """Physical residency and file payloads are separate, never added together.
+
+    Null means the worker does not report this measurement, not zero usage.
+    Contexts include live KV groups and resident prefix-cache sessions; blocks
+    count resident prefixes only (disk-only prefix blocks are excluded).
+    """
+
+    resident_weight_bytes: int | None = Field(default=None, ge=0)
+    wired_bytes: int | None = Field(default=None, ge=0)
+    wired_limit_bytes: int | None = Field(default=None, ge=0)
+    wired_available: bool | None = None
+    kv_bytes: int | None = Field(default=None, ge=0)
+    context_count: int | None = Field(default=None, ge=0)
+    prefix_cache_blocks: int | None = Field(default=None, ge=0)
+    prefix_cache_bytes: int | None = Field(default=None, ge=0)
+    prefix_cache_limit_bytes: int | None = Field(default=None, ge=0)
+    ssd_experts: bool | None = None
+    ssd_expert_bytes: int | None = Field(default=None, ge=0)
+    ssd_ple: bool | None = None
+    ssd_ple_bytes: int | None = Field(default=None, ge=0)
+
+
 class RuntimeInstanceResource(ProtocolModel):
     id: UUID
     model: str
@@ -744,7 +813,9 @@ class RuntimeInstanceResource(ProtocolModel):
     queued_requests: int = Field(ge=0)
     resident_bytes: int | None = Field(default=None, ge=0)
     kv_bytes: int | None = Field(default=None, ge=0)
+    memory: RuntimeMemoryResources | None = None
     context_size: int | None = Field(default=None, ge=1)
+    context_capacity: int | None = Field(default=None, ge=1)
     started_at: AwareDatetime | None = None
     last_used_at: AwareDatetime | None = None
     idle_ttl_seconds: int | None = Field(default=None, ge=0)
@@ -810,6 +881,7 @@ class ModelArtifactResource(ProtocolModel):
     architecture: str = Field(min_length=1, max_length=128)
     format: Literal["mfq", "hf"] = "mfq"
     shard_count: int = Field(ge=1)
+    missing_shards: int = Field(default=0, ge=0)
     total_bytes: int = Field(ge=0)
     tensor_count: int = Field(ge=0)
     record_count: int = Field(ge=0)
@@ -870,6 +942,8 @@ class HubModelFile(ProtocolModel):
     name: str = Field(min_length=1, max_length=1024)
     byte_size: int = Field(default=0, ge=0)
     sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    weight_bytes: int | None = Field(default=None, ge=0)
+    ssd_ple_bytes: int | None = Field(default=None, ge=0)
 
 
 class ModelConfigurationStatus(ProtocolModel):
@@ -894,16 +968,30 @@ class HubModelVariant(ProtocolModel):
     precision: str | None = Field(default=None, max_length=128)
     files: list[str] = Field(default_factory=list, max_length=256)
     byte_size: int = Field(default=0, ge=0)
+    resident_weight_bytes: int | None = Field(default=None, ge=0)
+    ssd_ple_bytes: int | None = Field(default=None, ge=0)
     configuration: ModelConfigurationStatus
+
+
+class HubMemoryPool(ProtocolModel):
+    kind: Literal["uma", "vram", "ram"]
+    device: str | None = Field(default=None, max_length=255)
+    capacity_bytes: int | None = Field(default=None, ge=0)
+    bandwidth_bytes_per_second: int | None = Field(default=None, gt=0)
 
 
 class HubSystemProfile(ProtocolModel):
     platform: str = Field(min_length=1, max_length=64)
     machine: str = Field(min_length=1, max_length=64)
-    backend: Literal["metal", "cuda", "cpu", "unknown"]
+    backend: Literal["metal", "cuda", "rocm", "cpu", "unknown"]
+    cpu_name: str | None = Field(default=None, max_length=255)
+    cpu_cores: int | None = Field(default=None, ge=1)
+    gpu_names: list[str] = Field(default_factory=list)
+    gpu_cores: int | None = Field(default=None, ge=1)
     physical_memory_bytes: int | None = Field(default=None, ge=0)
     available_memory_bytes: int | None = Field(default=None, ge=0)
     runtime_memory_budget_bytes: int | None = Field(default=None, ge=0)
+    memory_pools: list[HubMemoryPool] = Field(default_factory=list)
 
 
 class HubModelInfo(HubModelSummary):
@@ -916,6 +1004,8 @@ class HubModelInfo(HubModelSummary):
     architectures: list[str] = Field(default_factory=list)
     modalities: list[str] = Field(default_factory=list)
     parameter_count: int | None = Field(default=None, ge=0)
+    ple_parameter_count: int | None = Field(default=None, ge=0)
+    published_at: AwareDatetime | None = None
     gated: bool = False
     runtime_compatible: bool | None = None
     variants: list[HubModelVariant] = Field(default_factory=list)
@@ -954,6 +1044,7 @@ class OfficialModelInfo(ProtocolModel):
     downloads: int = Field(default=0, ge=0)
     likes: int = Field(default=0, ge=0)
     updated_at: AwareDatetime | None = None
+    published_at: AwareDatetime | None = None
     variants: list[HubModelVariant] = Field(default_factory=list)
     configuration: ModelConfigurationStatus
 
@@ -961,6 +1052,7 @@ class OfficialModelInfo(ProtocolModel):
 class OfficialModelList(ProtocolModel):
     system: HubSystemProfile
     data: list[OfficialModelInfo]
+    refreshing: bool = False
 
 
 class ArtifactLineageResource(ProtocolModel):
@@ -1103,6 +1195,7 @@ class JobResource(ProtocolModel):
     status: JobStatus
     payload: dict[str, Any]
     progress: float = Field(ge=0.0, le=1.0)
+    progress_data: dict[str, Any] = Field(default_factory=dict)
     cancel_requested: bool = False
     result: dict[str, Any] | None = None
     error: ErrorDetail | None = None
@@ -1129,6 +1222,10 @@ class JobEventResource(ProtocolModel):
 
 class JobEventList(ProtocolModel):
     data: list[JobEventResource]
+
+
+class RuntimeListenerRequest(ProtocolModel):
+    port: int = Field(ge=1, le=65535)
 
 
 class RuntimeReloadRequest(ProtocolModel):

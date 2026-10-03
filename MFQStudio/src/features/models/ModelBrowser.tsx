@@ -1,9 +1,11 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 import type {
   HubModelInfo,
+  HubMemoryPool,
   HubModelSummary,
   HubModelVariant,
+  HubSystemProfile,
   JobKindResource,
   JobResource,
   ModelConfigurationStatus,
@@ -14,13 +16,21 @@ import type {
 import { jobsApi } from '../../shared/api/resources/jobs';
 import { modelsApi } from '../../shared/api/resources/models';
 import { openStudioExternal } from '../../shared/platform/studio';
+import { BackendBadge } from './BackendBadge';
+import { ModelVendorMark } from '../../app/ModelVendorMark';
+import { RepositoryFiles } from './RepositoryFiles';
 
 type Translate = (chinese: string, english: string) => string;
+export type ModelBrowserTab = 'official' | 'community' | 'downloads';
+export type DownloadOrigin = { x: number; y: number };
 
 interface ModelBrowserProps {
   jobKinds: JobKindResource[];
   onError(message: string): void;
-  onJobCreated(job: JobResource): void;
+  onJobCreated(job: JobResource, origin: DownloadOrigin): void;
+  tab: ModelBrowserTab;
+  onTabChange(tab: ModelBrowserTab): void;
+  downloadQueue?: ReactNode;
   tr: Translate;
 }
 
@@ -49,6 +59,32 @@ function formatBytes(value?: number | null): string {
 
 function formatCount(value: number): string {
   return new Intl.NumberFormat(undefined, { notation: "compact" }).format(value);
+}
+
+function hardwareSummary(system: HubSystemProfile, tr: Translate): string {
+  const unified = system.memory_pools?.some((pool) => pool.kind === 'uma') || /^Apple M\d+(?: (?:Pro|Max|Ultra))?$/.test(system.cpu_name || '');
+  const ram = system.physical_memory_bytes ? `${formatBytes(system.physical_memory_bytes).replace(/\.0 /, ' ')} ${unified ? 'URAM' : 'RAM'}` : null;
+  const gpu = system.gpu_names?.join(' + ');
+  if (system.backend === 'metal') {
+    const cores = [system.cpu_cores && `${system.cpu_cores} CPU`, system.gpu_cores && `${system.gpu_cores} GPU`].filter(Boolean).join(' / ');
+    return [system.cpu_name || gpu, cores, ram].filter(Boolean).join(' · ') || tr('硬件信息未上报', 'Hardware details unavailable');
+  }
+  return [gpu, ram, system.cpu_name].filter(Boolean).join(' · ') || tr('硬件信息未上报', 'Hardware details unavailable');
+}
+
+function MemoryBudget({ system, tr }: { system: HubSystemProfile | undefined; tr: Translate }) {
+  const pools: HubMemoryPool[] = system?.memory_pools?.length ? system.memory_pools : system ? [{
+    kind: /^Apple M\d+(?: (?:Pro|Max|Ultra))?$/.test(system.cpu_name || '') ? 'uma' : 'ram',
+    capacity_bytes: system.physical_memory_bytes,
+  }] : [];
+  return <div className="detected-memory-pools">
+    {pools.length ? pools.map((pool, index) => <div className="detected-memory-pool" key={`${pool.kind}:${index}`} title={pool.device || undefined}>
+      <strong>{pool.capacity_bytes ? `${(pool.capacity_bytes / 2 ** 30).toFixed(1).replace(/\.0$/, '')} GiB` : '—'} {pool.kind === 'uma' ? 'URAM' : pool.kind.toUpperCase()}</strong>
+      <small title={pool.bandwidth_bytes_per_second ? tr('规格带宽，非实测吞吐', 'Specified bandwidth, not measured throughput') : undefined}>
+        {pool.bandwidth_bytes_per_second ? `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(pool.bandwidth_bytes_per_second / 2 ** 30)} GiB/s` : tr('带宽未上报', 'Bandwidth unavailable')}
+      </small>
+    </div>) : <strong>—</strong>}
+  </div>;
 }
 
 function formatDate(value?: string | null): string {
@@ -93,6 +129,13 @@ function configurationReasons(status: ModelConfigurationStatus, tr: Translate): 
     if (reason === "This format is not directly loadable by MFQ.") return tr("MFQ 无法直接加载此格式。", reason);
     if (reason === "This model architecture is not registered in MFQ.") return tr("MFQ 尚未注册此模型架构。", reason);
     if (reason === "Runtime compatibility could not be verified from repository metadata.") return tr("无法根据仓库元数据验证 MFQ Runtime 兼容性。", reason);
+    if (reason === "Tensor payload baseline; excludes streamed PLE, KV cache and runtime repacking.") return tr("按张量载荷计算权重常驻基线，已扣除流式 PLE；不包含 KV 缓存和运行时重排开销。", reason);
+    if (reason === "File-size estimate; tensor metadata is unavailable.") return tr("未读取到张量元数据，暂按文件大小估计权重占用。", reason);
+    if (reason === "All published precision tiers' weight baselines fit within the detected runtime memory budget.") return tr("所有已发布精度档的权重基线均在当前推理预算以内。", reason);
+    if (reason === "More than half of the published precision tiers' weight baselines fit within the detected runtime memory budget.") return tr("超过一半的已发布精度档权重基线在当前推理预算以内。", reason);
+    if (reason === "At most half of the published precision tiers' weight baselines fit within the detected runtime memory budget.") return tr("仅部分已发布精度档的权重基线在当前推理预算以内。", reason);
+    if (reason === "The detected runtime memory budget covers at least 70% of the weight baseline requirement for the smallest published precision tier.") return tr("当前推理预算达到最低档权重基线的 70%，处于临界区间。", reason);
+    if (reason === "The detected runtime memory budget is below 70% of the weight baseline requirement for the smallest published precision tier.") return tr("当前推理预算不足最低档权重基线的 70%。", reason);
     return reason;
   });
 }
@@ -103,7 +146,7 @@ function safeSegment(value: string): string {
 
 function downloadPatterns(variant: HubModelVariant | null): string[] {
   if (!variant) return [];
-  if (variant.format === "unknown") return [];
+  if (variant.format === "unknown") return variant.files;
   const weights = variant.files.length <= 48
     ? variant.files
     : variant.format === "mfq"
@@ -113,17 +156,17 @@ function downloadPatterns(variant: HubModelVariant | null): string[] {
         : variant.format === "gguf"
           ? ["*.gguf"]
           : variant.files.slice(0, 48);
-  return Array.from(new Set([...weights, ...SUPPORT_FILES])).slice(0, 64);
+  return Array.from(new Set([...weights, ...SUPPORT_FILES]));
 }
 
 function ConfigurationBadge({ status, tr }: { status: ModelConfigurationStatus; tr: Translate }) {
   const reason = configurationReasons(status, tr).join(" ");
   const presentation = {
-    three_stars: ["★★★", tr("内存压力低：全部精度档均可完整常驻", "Low memory pressure: all precision tiers fit fully in memory")],
-    two_stars: ["★★", tr("内存压力中等：多数精度档可完整常驻", "Moderate memory pressure: most precision tiers fit fully in memory")],
-    one_star: ["★", tr("内存压力较高：仅部分精度档可完整常驻", "High memory pressure: only some precision tiers fit fully in memory")],
-    caution: ["▲", tr("内存临界：最低档接近完整常驻门槛", "Memory near limit: the smallest tier is close to fitting fully")],
-    not_recommended: ["✕", tr("内存不足：最低档无法完整常驻", "Insufficient memory: the smallest tier does not fit fully")],
+    three_stars: ["★★★", tr("权重压力低：全部精度档的权重基线在预算以内", "Low weight pressure: all tier baselines fit the budget")],
+    two_stars: ["★★", tr("权重压力中等：多数精度档的权重基线在预算以内", "Moderate weight pressure: most tier baselines fit the budget")],
+    one_star: ["★", tr("权重压力较高：仅部分精度档的权重基线在预算以内", "High weight pressure: only some tier baselines fit the budget")],
+    caution: ["▲", tr("权重临界：最低档基线接近预算上限", "Weight budget near limit: the smallest tier baseline nearly fits")],
+    not_recommended: ["✕", tr("权重预算不足：最低档基线超出预算", "Insufficient weight budget: the smallest tier baseline exceeds it")],
     unknown: ["?", tr("内存压力未知", "Memory pressure unknown")],
   }[status.recommendation];
   return (
@@ -141,7 +184,7 @@ function ConfigurationDetails({ status, tr }: { status: ModelConfigurationStatus
   return (
     <div className={`configuration-details ${status.status} ${status.recommendation.replaceAll("_", "-")}`}>
       <div>
-        <span>{tr("预计最低内存", "Estimated minimum memory")}</span>
+        <span>{tr("最低档权重基线", "Smallest tier weight baseline")}</span>
         <strong>{formatBytes(status.required_memory_bytes)}</strong>
       </div>
       <div>
@@ -160,7 +203,7 @@ function VariantList({
   variants,
 }: {
   disabled: boolean;
-  onDownload(variant: HubModelVariant): void;
+  onDownload(variant: HubModelVariant, origin: DownloadOrigin): void;
   tr: Translate;
   variants: HubModelVariant[];
 }) {
@@ -177,7 +220,7 @@ function VariantList({
           <div className="model-variant" key={variant.id}>
             <div>
               <strong>{variant.label}</strong>
-              <small>{variant.precision || variant.format.toUpperCase()} · {tr("文件", "file")} {formatBytes(variant.byte_size)} · {tr("完整常驻约", "est. full residency")} {formatBytes(variant.configuration.required_memory_bytes)}</small>
+              <small>{variant.precision || variant.format.toUpperCase()} · {tr("文件", "file")} {formatBytes(variant.byte_size)} · {variant.resident_weight_bytes != null ? tr("权重常驻基线", "resident weight baseline") : tr("权重占用估计", "est. weight memory")} {formatBytes(variant.configuration.required_memory_bytes)}{(variant.ssd_ple_bytes ?? 0) > 0 && ` · SSD PLE ${formatBytes(variant.ssd_ple_bytes)}`}</small>
             </div>
             <div className="variant-memory-pressure">
               <div
@@ -193,7 +236,10 @@ function VariantList({
               </div>
               <strong style={{ color }}>{percentageLabel}</strong>
             </div>
-            <button disabled={disabled} onClick={() => onDownload(variant)} type="button">
+            <button disabled={disabled} onClick={(event) => {
+              const rect = event.currentTarget.getBoundingClientRect();
+              onDownload(variant, { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+            }} type="button">
               {tr("下载", "Download")}
             </button>
           </div>
@@ -203,8 +249,7 @@ function VariantList({
   );
 }
 
-export function ModelBrowser({ jobKinds, onError, onJobCreated, tr }: ModelBrowserProps) {
-  const [tab, setTab] = useState<"official" | "community">("official");
+export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange, downloadQueue, tr }: ModelBrowserProps) {
   const [official, setOfficial] = useState<OfficialModelList | null>(null);
   const [officialSelection, setOfficialSelection] = useState<string | null>(null);
   const [officialSource, setOfficialSource] = useState<OfficialModelSource | null>(null);
@@ -214,41 +259,69 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tr }: ModelBrows
   const [results, setResults] = useState<HubModelSummary[]>([]);
   const [communityModel, setCommunityModel] = useState<HubModelInfo | null>(null);
   const [officialLoading, setOfficialLoading] = useState(false);
+  const [catalogLoading, setCatalogLoading] = useState(false);
   const [communityLoading, setCommunityLoading] = useState(false);
   const [downloading, setDownloading] = useState<string | null>(null);
+  const [maxWorkers, setMaxWorkers] = useState(8);
   const officialRequest = useRef(0);
+  const catalogRequest = useRef(0);
+  const catalogTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const catalogController = useRef<AbortController | null>(null);
   const communityRequest = useRef(0);
 
   const selectedOfficial = useMemo(
     () => official?.data.find((item) => item.id === officialSelection) ?? official?.data[0] ?? null,
     [official, officialSelection],
   );
-  const selectedSource = officialSource ?? selectedOfficial?.selected_source ?? null;
-  const officialVariants = officialSourceInfo?.variants ?? selectedOfficial?.variants ?? [];
+  const selectedSource = selectedOfficial?.sources.find((source) =>
+    source.provider === officialSource?.provider && source.repo_id === officialSource.repo_id)
+    ?? selectedOfficial?.selected_source ?? null;
+  const sourceInfoMatches = !!officialSourceInfo && officialSourceInfo.provider === selectedSource?.provider
+    && officialSourceInfo?.repo_id === selectedSource?.repo_id
+    && (!selectedSource?.revision || officialSourceInfo?.revision === selectedSource.revision);
+  const officialVariants = sourceInfoMatches ? officialSourceInfo!.variants
+    : selectedSource?.provider === selectedOfficial?.selected_source.provider
+      ? selectedOfficial?.variants ?? [] : [];
   const canDownload = (targetProvider: HubModelSummary["provider"]) =>
     jobKinds.some((item) => item.kind === `download.${targetProvider}`);
 
   async function loadOfficial(refresh = false) {
-    const request = ++officialRequest.current;
-    setOfficialLoading(true);
-    try {
-      const catalog = await modelsApi.officialHubModels(refresh);
-      if (request !== officialRequest.current) return;
-      setOfficial(catalog);
-      setOfficialSelection((current) => current && catalog.data.some((item) => item.id === current)
-        ? current
-        : catalog.data[0]?.id ?? null);
-      setOfficialSource(null);
-      setOfficialSourceInfo(null);
-    } catch (cause) {
-      if (request === officialRequest.current) onError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      if (request === officialRequest.current) setOfficialLoading(false);
+    const request = ++catalogRequest.current;
+    if (catalogTimer.current !== null) clearTimeout(catalogTimer.current);
+    catalogController.current?.abort();
+    const controller = new AbortController();
+    catalogController.current = controller;
+    setCatalogLoading(true);
+    async function readCatalog(force: boolean) {
+      try {
+        const catalog = await modelsApi.officialHubModels(force, controller.signal);
+        if (request !== catalogRequest.current) return;
+        setOfficial(catalog);
+        setOfficialSelection((current) => current && catalog.data.some((item) => item.id === current)
+          ? current : catalog.data[0]?.id ?? null);
+        if (catalog.refreshing) {
+          catalogTimer.current = setTimeout(() => void readCatalog(false), 1000);
+        }
+      } catch (cause) {
+        if (request === catalogRequest.current && !controller.signal.aborted) {
+          onError(cause instanceof Error ? cause.message : String(cause));
+        }
+      } finally {
+        if (request === catalogRequest.current) setCatalogLoading(false);
+      }
     }
+    await readCatalog(refresh);
   }
 
   useEffect(() => {
     void loadOfficial(false);
+    return () => {
+      catalogRequest.current += 1;
+      officialRequest.current += 1;
+      communityRequest.current += 1;
+      catalogController.current?.abort();
+      if (catalogTimer.current !== null) clearTimeout(catalogTimer.current);
+    };
   }, []);
 
   function chooseOfficial(item: OfficialModelInfo) {
@@ -327,6 +400,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tr }: ModelBrows
   async function download(
     source: { provider: HubModelSummary["provider"]; repo_id: string; revision: string },
     variant: HubModelVariant,
+    origin: DownloadOrigin,
   ) {
     const marker = `${source.provider}:${source.repo_id}:${variant.id}`;
     setDownloading(marker);
@@ -339,8 +413,9 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tr }: ModelBrows
         revision: source.revision,
         include: downloadPatterns(variant),
         expected_bytes: variant.byte_size || null,
+        max_workers: maxWorkers,
       });
-      onJobCreated(created);
+      onJobCreated(created, origin);
     } catch (cause) {
       onError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -356,19 +431,26 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tr }: ModelBrows
           <h2>{tr("模型浏览器", "Model browser")}</h2>
           <p>{tr("查找官方优化模型或浏览社区仓库。", "Find optimized official models or browse community repositories.")}</p>
         </div>
+        <div className="model-browser-actions">
+          <label className="download-concurrency">{tr('最大并发下载上限', 'Maximum concurrent downloads')}
+            <select aria-label={tr('最大并发下载上限', 'Maximum concurrent downloads')} value={maxWorkers} onChange={(event) => setMaxWorkers(Number(event.target.value))}>
+              {[1, 2, 4, 8, 16].map((count) => <option key={count} value={count}>{count}</option>)}
+            </select>
+          </label>
         <div className="model-browser-tabs" role="tablist">
-          <button aria-selected={tab === "official"} onClick={() => setTab("official")} role="tab" type="button">{tr("官方模型", "Official")}</button>
-          <button aria-selected={tab === "community"} onClick={() => setTab("community")} role="tab" type="button">{tr("第三方模型", "Community")}</button>
+          <button aria-selected={tab === "official"} onClick={() => onTabChange("official")} role="tab" type="button">{tr("官方模型", "Official")}</button>
+          <button aria-selected={tab === "community"} onClick={() => onTabChange("community")} role="tab" type="button">{tr("第三方模型", "Community")}</button>
+          <button aria-selected={tab === "downloads"} onClick={() => onTabChange("downloads")} role="tab" type="button">{tr("下载队列", "Download queue")}</button>
+        </div>
         </div>
       </header>
 
       {tab === "official" ? (
         <>
           <div className="detected-configuration">
-            <div><span>{tr("检测到的配置", "Detected configuration")}</span><strong>{system ? `${system.platform} · ${system.machine} · ${system.backend.toUpperCase()}` : tr("正在检测", "Detecting")}</strong></div>
-            <div><span>{tr("物理内存", "Physical memory")}</span><strong>{formatBytes(system?.physical_memory_bytes)}</strong></div>
-            <div><span>{tr("推理预算", "Runtime budget")}</span><strong>{formatBytes(system?.runtime_memory_budget_bytes)}</strong></div>
-            <button disabled={officialLoading} onClick={() => void loadOfficial(true)} type="button">{officialLoading ? tr("刷新中", "Refreshing") : tr("刷新目录", "Refresh")}</button>
+            <div><span>{tr("检测到的配置", "Detected configuration")}</span><div className="detected-hardware-summary"><strong>{system ? hardwareSummary(system, tr) : tr("正在检测", "Detecting")}</strong>{system && <BackendBadge backend={system.backend} />}</div></div>
+            <div><span>{tr("推理预算", "Runtime budget")}</span><MemoryBudget system={system || undefined} tr={tr} /></div>
+            <button disabled={catalogLoading || official?.refreshing} onClick={() => void loadOfficial(true)} type="button">{catalogLoading || official?.refreshing ? tr("刷新中", "Refreshing") : tr("刷新目录", "Refresh")}</button>
           </div>
           <div className="memory-pressure-guide">
             <strong>{tr("内存压力", "Memory pressure")}</strong>
@@ -377,13 +459,13 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tr }: ModelBrows
             <span><b>★</b>{tr("高", "High")}</span>
             <span><b>▲</b>{tr("临界", "Near limit")}</span>
             <span><b>✕</b>{tr("不足", "Insufficient")}</span>
-            <small>{tr("只反映当前设备可完整常驻的精度档比例，不代表模型能力或质量。", "Reflects only how many precision tiers fit fully in this device's memory, not model capability or quality.")}</small>
+            <small>{tr("按权重常驻基线估算；还需预留 KV 缓存及运行时开销。", "Based on resident weight baselines; KV cache and runtime overhead need additional memory.")}</small>
           </div>
           <div className="model-browser-layout">
             <div className="official-model-grid">
               {official?.data.map((item) => (
                 <button className={selectedOfficial?.id === item.id ? "official-model-card selected" : "official-model-card"} key={item.id} onClick={() => chooseOfficial(item)} type="button">
-                  <div className="official-model-card-title"><span>{item.name.slice(0, 1).toUpperCase()}</span><div><strong>{item.name}</strong><small>{item.family}</small></div></div>
+                  <div className="official-model-card-title"><span>{item.name.slice(0, 1).toUpperCase()}</span><div><strong>{item.name}</strong><small>{item.family}</small></div><ModelVendorMark name={item.name} architecture={item.architecture} size={28} /></div>
                   <p>{tr(item.description_zh, item.description)}</p>
                   <div className="model-chip-row">{item.precision_options.map((value) => <span key={value}>{value}</span>)}</div>
                   <ConfigurationBadge status={item.configuration} tr={tr} />
@@ -393,7 +475,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tr }: ModelBrows
             </div>
             {selectedOfficial && selectedSource && (
               <aside className="model-detail-panel">
-                <div className="model-detail-heading"><div><small>{selectedOfficial.family}</small><h3>{selectedOfficial.name}</h3></div><ConfigurationBadge status={selectedOfficial.configuration} tr={tr} /></div>
+                <div className="model-detail-heading"><div><small>{selectedOfficial.family}</small><h3>{selectedOfficial.name}</h3></div><div className="model-identity-trailing"><ConfigurationBadge status={selectedOfficial.configuration} tr={tr} /><ModelVendorMark name={selectedOfficial.name} architecture={selectedOfficial.architecture} size={30} /></div></div>
                 <p>{tr(selectedOfficial.description_zh, selectedOfficial.description)}</p>
                 <ConfigurationDetails status={selectedOfficial.configuration} tr={tr} />
                 <dl className="model-metadata-grid">
@@ -405,17 +487,23 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tr }: ModelBrows
                   <div><dt>{tr("许可", "License")}</dt><dd>{selectedOfficial.license || tr("查看模型卡", "See model card")}</dd></div>
                   <div><dt>{tr("下载", "Downloads")}</dt><dd>{formatCount(selectedOfficial.downloads)}</dd></div>
                   <div><dt>{tr("收藏", "Likes")}</dt><dd>{formatCount(selectedOfficial.likes)}</dd></div>
-                  <div><dt>{tr("更新时间", "Updated")}</dt><dd>{formatDate(selectedOfficial.updated_at)}</dd></div>
+                  <div><dt>{tr("发布时间", "Published")}</dt><dd>{formatDate(selectedOfficial.published_at || selectedOfficial.updated_at)}</dd></div>
                 </dl>
                 <label className="model-source-picker"><span>{tr("下载来源", "Download source")}</span><select onChange={(event) => { const source = selectedOfficial.sources[Number(event.target.value)]; if (source) void chooseOfficialSource(source); }} value={String(Math.max(0, selectedOfficial.sources.findIndex((item) => item.provider === selectedSource.provider && item.repo_id === selectedSource.repo_id)))}>{selectedOfficial.sources.map((source, index) => <option disabled={!source.available} key={`${source.provider}:${source.repo_id}`} value={index}>{source.provider === "huggingface" ? "Hugging Face" : "ModelScope"}{source.available ? "" : ` · ${tr("离线", "unavailable")}`}</option>)}</select></label>
                 <div className="repository-line"><button onClick={() => void openStudioExternal(selectedSource.url).catch((cause) => onError(cause instanceof Error ? cause.message : String(cause)))} type="button">{selectedSource.repo_id}</button><span>{officialVariants.length} {tr("个精度版本", "variants")}</span></div>
                 {selectedOfficial.supports_ssd_streaming && <div className="streaming-note">{tr("支持 SSD 专家流式读取；即使无法完整常驻仍可流式运行。上方图标只表示完整常驻时的内存压力。", "SSD expert streaming remains available when the model cannot fit fully in memory. The icon above reflects full-residency memory pressure only.")}</div>}
-                <VariantList disabled={officialLoading || !selectedSource.available || !canDownload(selectedSource.provider) || downloading !== null} onDownload={(variant) => void download({ provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision || selectedOfficial.revision }, variant)} tr={tr} variants={officialVariants} />
+                <VariantList disabled={officialLoading || !selectedSource.available || !canDownload(selectedSource.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision || selectedOfficial.revision }, variant, origin)} tr={tr} variants={officialVariants} />
+                {sourceInfoMatches && <RepositoryFiles key={`${selectedSource.provider}:${selectedSource.repo_id}:${officialSourceInfo!.revision}`}
+                  files={officialSourceInfo!.files} disabled={officialLoading || !canDownload(selectedSource.provider) || downloading !== null} tr={tr}
+                  onDownload={(files, label, origin) => void download(officialSourceInfo!, {
+                    id: label, label, format: 'unknown', files: files.map((file) => file.name),
+                    byte_size: files.reduce((sum, file) => sum + file.byte_size, 0), configuration: { status: 'unknown', recommendation: 'unknown', reasons: [] },
+                  }, origin)} />}
               </aside>
             )}
           </div>
         </>
-      ) : (
+      ) : tab === 'community' ? (
         <>
           <form className="community-model-search" onSubmit={search}>
             <select onChange={(event) => setProvider(event.target.value as HubModelSummary["provider"])} value={provider}><option value="huggingface">Hugging Face</option><option value="modelscope">ModelScope</option></select>
@@ -425,12 +513,12 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tr }: ModelBrows
           <p className="community-search-hint">{tr("支持直接粘贴 Hugging Face 与 ModelScope 链接；下载仍由可续传后台任务管理。", "Paste a Hugging Face or ModelScope link directly; downloads remain resumable background jobs.")}</p>
           <div className="model-browser-layout community-layout">
             <div className="community-results">
-              {results.map((item) => <button className={communityModel?.repo_id === item.repo_id && communityModel.provider === item.provider ? "selected" : ""} key={`${item.provider}:${item.repo_id}`} onClick={() => void inspect(item)} type="button"><div><strong>{item.repo_id}</strong><small>{item.provider === "huggingface" ? "Hugging Face" : "ModelScope"} · {formatCount(item.downloads)} downloads</small></div><span>{formatBytes(item.total_bytes)}</span></button>)}
+              {results.map((item) => <button className={communityModel?.repo_id === item.repo_id && communityModel.provider === item.provider ? "selected" : ""} key={`${item.provider}:${item.repo_id}`} onClick={() => void inspect(item)} type="button"><div><strong>{item.repo_id}</strong><small>{item.provider === "huggingface" ? "Hugging Face" : "ModelScope"} · {formatCount(item.downloads)} downloads</small></div><span className="model-identity-trailing">{formatBytes(item.total_bytes)}<ModelVendorMark name={item.repo_id} architecture={communityModel?.repo_id === item.repo_id && communityModel.provider === item.provider ? communityModel.architectures : undefined} /></span></button>)}
               {!results.length && <div className="model-browser-empty">{tr("搜索社区模型，或粘贴仓库链接直接打开。", "Search community models or paste a repository link to open it directly.")}</div>}
             </div>
             {communityModel && (
               <aside className="model-detail-panel">
-                <div className="model-detail-heading"><div><small>{communityModel.author || communityModel.provider}</small><h3>{communityModel.repo_id.split("/").pop()}</h3></div>{communityModel.gated && <span className="gated-badge">{tr("需要授权", "Gated")}</span>}</div>
+                <div className="model-detail-heading"><div><small>{communityModel.author || communityModel.provider}</small><h3>{communityModel.repo_id.split("/").pop()}</h3></div><div className="model-identity-trailing">{communityModel.gated && <span className="gated-badge">{tr("需要授权", "Gated")}</span>}<ModelVendorMark name={communityModel.repo_id} architecture={communityModel.architectures} size={30} /></div></div>
                 {communityModel.description && <p>{communityModel.description}</p>}
                 <dl className="model-metadata-grid">
                   <div><dt>{tr("架构", "Architecture")}</dt><dd>{communityModel.architectures.join(", ") || tr("未声明", "Not declared")}</dd></div>
@@ -445,12 +533,18 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tr }: ModelBrows
                   <div><dt>{tr("MFQ 兼容性", "MFQ compatibility")}</dt><dd>{communityModel.runtime_compatible === true ? tr("已验证", "Verified") : communityModel.runtime_compatible === false ? tr("暂不支持", "Unsupported") : tr("未知", "Unknown")}</dd></div>
                 </dl>
                 {communityModel.source_url && <div className="repository-line"><button onClick={() => void openStudioExternal(communityModel.source_url!).catch((cause) => onError(cause instanceof Error ? cause.message : String(cause)))} type="button">{tr("打开模型卡", "Open model card")}</button><span>{formatCount(communityModel.downloads)} downloads · {formatCount(communityModel.likes)} likes · {communityModel.files.length} files</span></div>}
-                <VariantList disabled={communityLoading || !canDownload(communityModel.provider) || downloading !== null} onDownload={(variant) => void download({ provider: communityModel.provider, repo_id: communityModel.repo_id, revision: communityModel.revision }, variant)} tr={tr} variants={communityModel.variants} />
+                <VariantList disabled={communityLoading || !canDownload(communityModel.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: communityModel.provider, repo_id: communityModel.repo_id, revision: communityModel.revision }, variant, origin)} tr={tr} variants={communityModel.variants} />
+                <RepositoryFiles key={`${communityModel.provider}:${communityModel.repo_id}:${communityModel.revision}`} files={communityModel.files}
+                  disabled={communityLoading || !canDownload(communityModel.provider) || downloading !== null} tr={tr}
+                  onDownload={(files, label, origin) => void download(communityModel, {
+                    id: label, label, format: 'unknown', files: files.map((file) => file.name),
+                    byte_size: files.reduce((sum, file) => sum + file.byte_size, 0), configuration: { status: 'unknown', recommendation: 'unknown', reasons: [] },
+                  }, origin)} />
               </aside>
             )}
           </div>
         </>
-      )}
+      ) : downloadQueue}
     </section>
   );
 }

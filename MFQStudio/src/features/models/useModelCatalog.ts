@@ -19,7 +19,6 @@ export function useModelCatalog() {
     models,
     instances,
     studio,
-    selectedModel: model,
     setSelectedModel,
     refreshRuntime,
     ready,
@@ -43,7 +42,6 @@ export function useModelCatalog() {
   const modelBrowserTriggerRef = useRef<HTMLElement | null>(null);
   const canUseNativeModelPicker = isStudio() && studio?.config.mode !== 'remote';
   const availableModelNames = runtimeModelNames(models, instances);
-  const selectModel = setSelectedModel;
   const openStudioPage = (_view: string, page: 'models' | 'quantization') =>
     navigate(labPath(page));
   const artifactRevision = jobs.map((job) => job.id + ':' + job.status).join(',');
@@ -226,7 +224,6 @@ export function useModelCatalog() {
 
   return {
     runtime,
-    model,
     artifacts,
     busy,
     ready,
@@ -246,7 +243,6 @@ export function useModelCatalog() {
     modelDirectoryPath,
     setModelDirectoryPath,
     modelBrowserTriggerRef,
-    selectModel,
     openStudioPage,
     chooseModelDirectory,
     jumpToModelDirectory,

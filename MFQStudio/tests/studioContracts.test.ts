@@ -68,7 +68,8 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
     expect(sessions).toContain('active.model === selectedModel');
     expect(sessions).toContain('generationBusy');
     expect(sessions).toContain('controller.abort()');
-    expect(readSources('features/chat/components/ChatPageHeader.tsx')).toContain('disabled={busy || conversation.transitioning}');
+    expect(readSources('features/chat/components/ChatPageHeader.tsx')).toContain('disabled={conversation.transitioning}');
+    expect(readSources('features/chat/hooks/useChatPageState.ts')).toContain('availableModelNames.includes(value)');
     expect(API).toContain('model?: string');
   });
 

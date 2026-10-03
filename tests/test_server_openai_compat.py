@@ -57,6 +57,9 @@ class _Service:
     def __init__(self, backend: _Backend) -> None:
         self.backend = backend
 
+    def resolve_model_alias(self, model: str) -> str:
+        return model
+
     async def start(self) -> None:
         return None
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mlx_resource_telemetry.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -149,7 +151,7 @@ public:
     // Session snapshots own a compact copy of the visible prefix. Restoring
     // recreates the original allocation capacity without aliasing the saved
     // arrays, so a resumed decode cannot mutate another session snapshot.
-    MlxKvCacheSnapshot snapshot() const;
+    MlxKvCacheSnapshot snapshot(bool detached = true) const;
     void restore_snapshot(const MlxKvCacheSnapshot& snapshot);
     // A freshly decoded persistent snapshot has no other owner. Adopt its
     // compact K/V allocations directly; the normal growth path reserves more
@@ -180,6 +182,7 @@ private:
     mlx::core::array key_;
     mlx::core::array value_;
     int position_ = 0;
+    MlxResourceTelemetry resources_;
 };
 
 // Growable [batch,sequence,width] cache for non-attention recurrent/index
@@ -202,6 +205,9 @@ public:
     int position() const noexcept {
         return position_;
     }
+    std::size_t storage_bytes() const noexcept {
+        return values_ ? values_->nbytes() : 0;
+    }
 
 private:
     void ensure_capacity(int required);
@@ -212,6 +218,7 @@ private:
     int batch_ = 0;
     int position_ = 0;
     std::optional<mlx::core::array> values_;
+    MlxResourceTelemetry resources_;
 };
 
 } // namespace mfq::metal

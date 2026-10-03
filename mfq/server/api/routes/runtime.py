@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Query, Response, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Query, Request, Response, WebSocket, WebSocketDisconnect
 
 from mfq.server.api.dependencies import (
     ServiceDependency,
@@ -31,12 +31,74 @@ from mfq.server.protocol.models import (
     RuntimeProfileLoadRequest,
     RuntimeProfileResource,
     RuntimeReloadRequest,
+    RuntimeResourceSnapshot,
+    RuntimeListenerRequest,
+    RuntimeMemoryPolicy,
+    RuntimeModelAliases,
     UpdateRuntimeInstanceRequest,
     UpdateRuntimeProfileRequest,
 )
 
 profile_router = APIRouter()
 router = APIRouter()
+
+
+@router.get("/api/v1/runtime/resources", response_model=RuntimeResourceSnapshot, responses=ERROR_RESPONSES, tags=["runtime"])
+async def runtime_resources(service: ServiceDependency) -> dict[str, Any]:
+    from mfq.server.services.resource_monitor import ResourceMonitor
+
+    if not hasattr(service, "resource_monitor"):
+        service.resource_monitor = ResourceMonitor()
+    return await service.resource_monitor.sample(service)
+
+
+@router.get("/api/v1/runtime/model-aliases", response_model=RuntimeModelAliases, responses=ERROR_RESPONSES, tags=["runtime"])
+async def model_aliases(service: ServiceDependency) -> RuntimeModelAliases:
+    return RuntimeModelAliases(aliases=service.model_aliases)
+
+
+@router.put("/api/v1/runtime/model-aliases", response_model=RuntimeModelAliases, responses=ERROR_RESPONSES, tags=["runtime"])
+async def configure_model_aliases(service: ServiceDependency, body: RuntimeModelAliases) -> dict[str, Any]:
+    return await service.configure_model_aliases(body.aliases)
+
+
+@router.get("/api/v1/runtime/memory-policy", responses=ERROR_RESPONSES, tags=["runtime"])
+async def memory_policy(service: ServiceDependency) -> dict[str, Any]:
+    from mfq.server.services.service import ServiceError
+    if not hasattr(service.runtime_manager, "memory_policy_status"):
+        raise ServiceError(501, "memory_planning_unavailable", "runtime memory planning is unavailable")
+    return service.runtime_manager.memory_policy_status()
+
+
+@router.put("/api/v1/runtime/memory-policy", response_model=OperationAccepted, status_code=202, responses=ERROR_RESPONSES, tags=["runtime"])
+async def configure_memory_policy(service: ServiceDependency, body: RuntimeMemoryPolicy) -> OperationAccepted:
+    from mfq.server.protocol.models import CreateJobRequest
+    current = service.runtime_manager.memory_policy.model_dump() if hasattr(service.runtime_manager, "memory_policy") else {}
+    job = await service.create_job(CreateJobRequest(kind="runtime.memory.configure", payload={**current, **body.model_dump(exclude_unset=True)}))
+    return OperationAccepted(operation_id=job.id, status="accepted")
+
+
+@router.get("/api/v1/runtime/listener", responses=ERROR_RESPONSES, tags=["runtime"])
+async def runtime_listener(request: Request) -> dict[str, Any]:
+    listener = getattr(request.app.state, "listener", None)
+    if listener is None:
+        return {"host": request.url.hostname, "port": request.url.port or 80, "configurable": False}
+    return listener.listener_status()
+
+
+@router.put("/api/v1/runtime/listener", responses=ERROR_RESPONSES, tags=["runtime"])
+async def configure_runtime_listener(request: Request, body: RuntimeListenerRequest) -> dict[str, Any]:
+    from mfq.server.services.service import ServiceError
+
+    listener = getattr(request.app.state, "listener", None)
+    if listener is None:
+        raise ServiceError(409, "listener_not_managed", "server listener is managed externally")
+    try:
+        return await listener.change_port(body.port)
+    except OSError as error:
+        raise ServiceError(409, "listener_change_failed", str(error)) from error
+    except RuntimeError as error:
+        raise ServiceError(409, "listener_not_ready", str(error)) from error
 
 
 @profile_router.post(

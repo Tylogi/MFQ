@@ -135,10 +135,49 @@ export interface RuntimeStatus {
   [key: string]: unknown;
 }
 
+export interface RuntimeListener {
+  host: string;
+  port: number;
+  configurable: boolean;
+}
+
+export interface RuntimeResources {
+  sampled_at: number;
+  interval_seconds: number | null;
+  cpu_name?: string | null;
+  cpu_cores?: number | null;
+  cpu_utilization_percent: number | null;
+  gpus: { name: string; core_count?: number | null; utilization_percent: number | null }[];
+  memory_bandwidth_bytes_per_second: number | null;
+  memory_bandwidth_limit_bytes_per_second: number | null;
+  memory_bandwidth_utilization_percent: number | null;
+  disks: { name: string; read_bytes_per_second: number | null;
+    write_bytes_per_second: number | null; busy_percent: number | null;
+    bandwidth_utilization_percent: number | null }[];
+  weights: { instance_id: string; model: string; expert_read_bytes_per_second: number | null;
+    ple_read_bytes_per_second: number | null; engram_read_bytes_per_second: number | null }[];
+}
+
 export interface RuntimeModel {
   id: string;
   object?: string;
   owned_by?: string;
+}
+
+export interface RuntimeMemoryResources {
+  resident_weight_bytes: number | null;
+  wired_bytes?: number | null;
+  wired_limit_bytes?: number | null;
+  wired_available?: boolean | null;
+  kv_bytes: number | null;
+  context_count: number | null;
+  prefix_cache_blocks: number | null;
+  prefix_cache_bytes?: number | null;
+  prefix_cache_limit_bytes?: number | null;
+  ssd_experts: boolean | null;
+  ssd_expert_bytes: number | null;
+  ssd_ple: boolean | null;
+  ssd_ple_bytes: number | null;
 }
 
 export interface RuntimeInstance {
@@ -150,7 +189,9 @@ export interface RuntimeInstance {
   queued_requests: number;
   resident_bytes?: number | null;
   kv_bytes?: number | null;
+  memory?: RuntimeMemoryResources | null;
   context_size?: number | null;
+  context_capacity?: number | null;
   started_at?: string | null;
   last_used_at?: string | null;
   idle_ttl_seconds?: number | null;

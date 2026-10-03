@@ -40,8 +40,11 @@
   .screen-header-trailing { flex-wrap: wrap; }
   .section-label { align-items: flex-start; flex-wrap: wrap; gap: 5px 12px; }
   .screen-header p { max-width: 70vw; }
-  .chat-screen-header { align-items: flex-start; padding: 14px; }
-  .chat-model-summary { display: none; }
+  .chat-screen-header { align-items: center; flex-wrap: wrap; gap: 12px; padding: 14px; }
+  .chat-screen-actions { flex: 1 1 100%; justify-content: flex-end; }
+  .chat-model-summary { display: grid; flex: 1; text-align: left; }
+  .chat-model-summary select, .chat-model-summary strong { width: 100%; min-width: 0; max-width: 100%; }
+  .chat-model-summary small { display: block; font-size: 10px; white-space: normal; }
   .chat-screen-title h1 { display: none; }
   .chat-session-select { max-width: min(52vw, 260px); }
   .runtime-status-pill { display: none; }

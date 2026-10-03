@@ -40,9 +40,11 @@ const catalogConfiguration = {
   required_memory_bytes: 64 * 2 ** 30, available_memory_bytes: 96 * 2 ** 30,
   reasons: ['More than half of the published precision tiers fit fully within the detected runtime memory budget.'],
 };
-const officialCatalog: OfficialModelList = {
+export const officialCatalog: OfficialModelList = {
   system: { platform: 'macOS', machine: 'arm64', backend: 'metal',
-    physical_memory_bytes: 128 * 2 ** 30, runtime_memory_budget_bytes: 96 * 2 ** 30 },
+    cpu_name: 'Apple M5 Max', cpu_cores: 18, gpu_names: ['Apple M5 Max'], gpu_cores: 40,
+    physical_memory_bytes: 128 * 2 ** 30, runtime_memory_budget_bytes: 96 * 2 ** 30,
+    memory_pools: [{ kind: 'uma', capacity_bytes: 128 * 2 ** 30, bandwidth_bytes_per_second: 614e9 }] },
   data: ['Studio Long-Context Mixture Model', 'Studio Compact Model'].map((name, index) => ({
     id: `catalog-${index}`, name, family: 'Layout fixture', architecture: 'studio_test',
     description: 'Deterministic catalog fixture for browser layout and memory-pressure checks.',
@@ -112,6 +114,9 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         duplex_available: false,
       });
     if (path === '/api/v1/runtime/models') return json({ data: [{ id: model }] });
+    if (path === '/api/v1/runtime/listener') return json({ host: '127.0.0.1', port: 8090, configurable: true });
+    if (path === '/api/v1/runtime/memory-policy') return json({ model_limit_bytes: null, prefix_limit_bytes: null, prefix_directory: null, actual_prefix_directory: '/data/mfq/prefix-cache' });
+    if (path === '/api/v1/runtime/model-aliases') return json({ aliases: {} });
     if (path === '/api/v1/runtime/instances')
       return json({
         data: [

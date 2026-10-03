@@ -106,6 +106,7 @@ MlxMfeMxfp4ExpertStore::MlxMfeMxfp4ExpertStore(
             std::size_t input,
             std::span<const ProjectionSlice> slices) {
             const auto& outer = model_.record(name);
+            payload_bytes_ += outer.nbytes;
             if (outer.dtype != "MFE" || outer.nbytes < 20) {
                 throw MlxMfeMxfp4Unsupported(
                     "SSD expert projection is not MFE: " + name);
@@ -260,6 +261,7 @@ MlxMfeMxfp4ExpertStore::MlxMfeMxfp4ExpertStore(
                 throw std::runtime_error(
                     "SSD expert MFE does not cover every expert: " + name);
             }
+            model_.record_prepared(name);
         };
 
         const auto experts = layer_prefixes[layer] + ".mlp.experts.";

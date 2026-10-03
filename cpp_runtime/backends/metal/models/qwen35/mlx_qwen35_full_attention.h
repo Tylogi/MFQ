@@ -121,7 +121,7 @@ public:
         int initial_capacity = 16);
     void materialize_cache();
     void clear_cache() noexcept;
-    MlxKvCacheSnapshot snapshot_cache() const;
+    MlxKvCacheSnapshot snapshot_cache(bool detached = true) const;
     void restore_cache(const MlxKvCacheSnapshot& snapshot);
     void trim_cache(int tokens);
 

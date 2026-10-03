@@ -2,6 +2,8 @@
 import type {
   RuntimeCapabilities,
   RuntimeStatus,
+  RuntimeResources,
+  RuntimeListener,
   RuntimeModel,
   RuntimeInstance,
   RuntimeProfile,
@@ -12,7 +14,38 @@ import type {
 } from '../types';
 import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client';
 
+export interface RuntimeMemoryPolicy {
+  model_limit_bytes: number | null;
+  prefix_limit_bytes: number | null;
+  prefix_directory: string | null;
+  actual_prefix_directory: string;
+}
+
 export const runtimeApi = {
+  runtimeResources(): Promise<RuntimeResources> {
+    return request('/api/v1/runtime/resources');
+  },
+  modelAliases(): Promise<{ aliases: Record<string, string> }> {
+    return request('/api/v1/runtime/model-aliases');
+  },
+  configureModelAliases(aliases: Record<string, string>): Promise<{ aliases: Record<string, string> }> {
+    return request('/api/v1/runtime/model-aliases', { method: 'PUT', body: JSON.stringify({ aliases }) });
+  },
+  memoryPolicy(): Promise<RuntimeMemoryPolicy> {
+    return request('/api/v1/runtime/memory-policy');
+  },
+  configureMemoryPolicy(policy: Partial<Omit<RuntimeMemoryPolicy, 'actual_prefix_directory'>>): Promise<{ operation_id: string }> {
+    return request('/api/v1/runtime/memory-policy', { method: 'PUT', body: JSON.stringify(policy) });
+  },
+  runtimeListener(): Promise<RuntimeListener> {
+    return request('/api/v1/runtime/listener');
+  },
+
+  configureRuntimeListener(port: number): Promise<RuntimeListener> {
+    return request('/api/v1/runtime/listener', {
+      method: 'PUT', body: JSON.stringify({ port }),
+    });
+  },
   /** 读取指定实例或默认实例支持的推理能力。 */
   runtimeCapabilities(instanceId?: string | null): Promise<RuntimeCapabilities> {
     const suffix = instanceId ? `?instance_id=${encodeURIComponent(instanceId)}` : '';

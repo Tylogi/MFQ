@@ -377,14 +377,35 @@ async fn studio_configure(
     config: StudioConfig,
 ) -> Result<StudioStatus, String> {
     let config = validate_config(config)?;
-    save_config(&app, &config)?;
-    match config.mode {
-        RuntimeMode::Remote => status_for(&app, config).await,
-        RuntimeMode::Local => {
-            let _guard = state.start_lock.lock().await;
-            start_local(&app, config).await
+    let _guard = state.start_lock.lock().await;
+    let previous = load_config(&app)?;
+    if matches!(config.mode, RuntimeMode::Local)
+        && previous.local_service_port != config.local_service_port
+    {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|error| error.to_string())?;
+        let previous_url = local_service_url(&previous);
+        if is_mfq_server(&client, &previous_url).await {
+            let token = studio_credential_get()?;
+            let mut request = client.put(format!("{previous_url}/api/v1/runtime/listener"))
+                .json(&serde_json::json!({ "port": config.local_service_port }));
+            if !token.is_empty() {
+                request = request.bearer_auth(token);
+            }
+            let response = request.send().await.map_err(|error| error.to_string())?;
+            if !response.status().is_success() {
+                return Err(format!("failed to change server port: {}", response.text().await.unwrap_or_default()));
+            }
         }
     }
+    let status = match config.mode {
+        RuntimeMode::Remote => status_for(&app, config.clone()).await?,
+        RuntimeMode::Local => start_local(&app, config.clone()).await?,
+    };
+    save_config(&app, &config)?;
+    Ok(status)
 }
 
 #[tauri::command]

@@ -3,6 +3,7 @@
 #include "mfq_paged_prefix_cache.h"
 #include "mlx_minicpmo45.h"
 #include "mlx_qwen35_causal_lm.h"
+#include "mlx_qwen4_causal_lm.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -40,13 +41,10 @@ struct MlxPagedSessionCodec<MlxMiniCPMO45TextSessionState> {
 
 template <>
 struct MlxPagedSessionCodec<MlxQwen35TextSessionState> {
-    // KV deltas are immutable content-addressed blocks. A block payload is
-    // upgraded with the exact recurrent state only when that block is the
-    // stable end of a prompt; restore backs off to the newest such boundary.
     static constexpr bool available = true;
     static constexpr bool refresh_final_block = true;
-    static constexpr bool requires_exact_block_boundary = true;
-    static constexpr std::string_view name = "qwen35-hybrid-kv-v2";
+    static constexpr bool supports_tail_blocks = true;
+    static constexpr std::string_view name = "qwen35-hybrid-kv-v3";
 
     static std::vector<MlxPagedPayload> encode(
         const MlxQwen35TextSessionState& state,
@@ -63,6 +61,25 @@ struct MlxPagedSessionCodec<MlxQwen35TextSessionState> {
     static std::size_t decodable_blocks(
         const std::vector<MlxPagedPayload>& payloads);
     static bool has_exact_boundary(const MlxPagedPayload& payload);
+    static bool has_mtp(const MlxPagedPayload& payload);
+    static std::size_t token_count(const MlxPagedPayload& payload);
+};
+
+template <>
+struct MlxPagedSessionCodec<MlxQwen4TextSessionState> {
+    static constexpr bool available = true;
+    static constexpr bool refresh_final_block = true;
+    static constexpr bool supports_tail_blocks = true;
+    static constexpr std::string_view name = "qwen4-hybrid-qsa-ple-v1";
+
+    static MlxPagedPayload encode_block(const MlxQwen4TextSessionState& state,
+        std::size_t block_size, std::size_t block_index);
+    static MlxQwen4TextSessionState decode(const std::vector<MlxPagedPayload>& payloads,
+        const std::vector<std::int64_t>& tokens, std::size_t block_size);
+    static std::size_t decodable_blocks(const std::vector<MlxPagedPayload>& payloads);
+    static bool has_exact_boundary(const MlxPagedPayload& payload);
+    static bool has_mtp(const MlxPagedPayload& payload);
+    static std::size_t token_count(const MlxPagedPayload& payload);
 };
 
 } // namespace mfq::metal

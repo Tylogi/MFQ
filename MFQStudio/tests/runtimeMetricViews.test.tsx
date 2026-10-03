@@ -1,5 +1,5 @@
 /** 验证概览与历史消息实际展示相同的原生预填充指标。 */
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { expect, it, vi } from 'vitest';
 import { OverviewPage } from '../src/features/runtime/OverviewPage';
@@ -36,6 +36,18 @@ it('概览预填充卡片展示运行时速度与耗时，而非 TTFT 或媒体�
   expect(prefill?.querySelector('strong')).toHaveTextContent(/^999 tok\/s$/);
   expect(screen.getByText('50 ms · Prompt processing')).toBeInTheDocument();
   expect(prefill).not.toHaveTextContent('200 tok/s');
+});
+
+it('displays and copies the same OpenAI SDK URL with /v1', async () => {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+  render(<MemoryRouter><OverviewPage /></MemoryRouter>);
+  expect(screen.getByText('OpenAI-compatible endpoint').closest('.tm-panel')?.querySelector('code'))
+    .toHaveTextContent('http://127.0.0.1:8090/v1');
+  fireEvent.click(screen.getByRole('button', { name: 'Copy endpoint' }));
+  await waitFor(() => expect(writeText).toHaveBeenCalledWith('http://127.0.0.1:8090/v1'));
+  expect(screen.getByText('Resource overview')).toBeInTheDocument();
+  expect(screen.getByText('Runtime resources')).toBeInTheDocument();
 });
 
 it('历史响应使用同一预填充速度，并单独显示媒体准备耗时', () => {

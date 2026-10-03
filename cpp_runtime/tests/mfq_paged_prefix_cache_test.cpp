@@ -154,6 +154,34 @@ void run_benchmark() {
 
 int main() try {
     using namespace mfq::cache;
+    const auto tail_root = temporary_directory();
+    for (const bool disk : {false, true}) {
+        const PagedPrefixCacheConfig config{tail_root, disk ? "tail-disk" : "tail-ram", 4,
+            disk ? 4096U : 0U, disk ? 0U : 4096U, 8};
+        const std::vector<std::int64_t> sequence{1, 2, 3, 4, 5, 6, 7};
+        {
+            PagedPrefixCache cache(config);
+            const auto parent = cache.store({}, sequence.data(), 4, payload({1}));
+            cache.store(parent, sequence.data() + 4, 2, payload({2}));
+            cache.store(parent, sequence.data() + 4, 3, payload({3}));
+            require(cache.match(sequence).matched_tokens == 7, "longest tail did not match");
+            require(cache.match({1, 2, 3, 4, 5, 6, 8}).matched_tokens == 6,
+                "divergent tail did not fall back");
+            require(cache.match({1, 2, 3, 4, 5}).matched_tokens == 4,
+                "tail matched an incomplete token sequence");
+            cache.flush();
+        }
+        if (disk) {
+            PagedPrefixCache cache(config);
+            const auto match = cache.match(sequence);
+            require(match.matched_tokens == 7 && match.blocks.size() == 2,
+                "tail index did not survive restart");
+            require(cache.load_prefix(match.blocks).size() == 2, "tail payload did not reload");
+            cache.clear();
+            require(cache.match(sequence).matched_tokens == 0, "cleared tail still matched");
+        }
+    }
+    std::filesystem::remove_all(tail_root);
     require(
         block_hash_hex(sha256("abc")) ==
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",

@@ -1,4 +1,3 @@
-/** 模型路由页面组合目录摘要、实例、加载策略及本地检查点。 */
 import { useSettings } from '../settings/SettingsProvider';
 import { Icon, ScreenHeader } from '../../app/display';
 import { useModelCatalog } from './useModelCatalog';
@@ -6,13 +5,14 @@ import { ModelDirectoryDialog } from './ModelDirectoryDialog';
 import { LoadedModels } from './LoadedModels';
 import { ModelLoadPolicy } from './ModelLoadPolicy';
 import { LocalCheckpoints } from './LocalCheckpoints';
+import { formatBytes } from '../../app/formatters';
 
-/** 仅在模型页请求目录数据，并组合各展示面板。 */
 export function ModelsPage() {
   const catalog = useModelCatalog();
   const { tr } = useSettings();
-  const { model, artifacts, busy, availableModelNames, modelFilter, setModelFilter,
+  const { artifacts, busy, availableModelNames, modelFilter, setModelFilter,
     openStudioPage, chooseModelDirectory } = catalog;
+  const totalBytes = artifacts.reduce((sum, artifact) => sum + artifact.total_bytes, 0);
   return (
     <section className="dashboard-view">
       <ScreenHeader
@@ -21,7 +21,7 @@ export function ModelsPage() {
         trailing={
           <>
             <button onClick={() => openStudioPage('lab', 'models')} type="button">
-              <Icon name="download" size={14} />{tr('模型仓库', 'Model hub')}
+              <Icon name="download" size={14} />{tr('模型下载', 'Model downloads')}
             </button>
             <button className="primary" disabled={busy}
               onClick={() => void chooseModelDirectory()} type="button">
@@ -34,7 +34,7 @@ export function ModelsPage() {
         <div>
           <span>{tr('运行中的模型', 'Loaded models')}</span>
           <strong>{availableModelNames.length}</strong>
-          <small>{tr('可直接用于对话', 'Ready for chat')}</small>
+          <small>{tr('可直接用于服务', 'Ready for serving')}</small>
         </div>
         <div>
           <span>{tr('本地检查点', 'Local checkpoints')}</span>
@@ -42,17 +42,15 @@ export function ModelsPage() {
           <small>{tr('已登记到 MFQ', 'Registered in MFQ')}</small>
         </div>
         <div>
-          <span>{tr('当前对话模型', 'Chat model')}</span>
-          <strong title={model || undefined}>{model || tr('未选择', 'None')}</strong>
-          <small>{model
-            ? tr('切换会话模型不会重新注册资产', 'Switching keeps the registered asset')
-            : tr('加载后从这里选择', 'Choose one after loading')}</small>
+          <span>{tr('注册模型资产总大小', 'Registered model assets size')}</span>
+          <strong>{totalBytes === 0 ? '0 B' : formatBytes(totalBytes).replace(/\b(KB|MB|GB|TB)\b/g, (unit) => `${unit[0]}iB`)}</strong>
+          <small>{tr('已登记模型的文件总大小', 'Total file size of registered models')}</small>
         </div>
       </div>
       <div className="model-catalog-toolbar">
         <div>
           <h2>{tr('模型资产', 'Model assets')}</h2>
-          <span>{tr('注册、加载和切换对话模型', 'Register, load, and switch chat models')}</span>
+          <span>{tr('管理本地资产与已载入模型', 'Manage local assets and loaded models')}</span>
         </div>
         <label>
           <span aria-hidden="true">/</span>

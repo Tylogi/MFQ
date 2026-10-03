@@ -68,7 +68,7 @@ from mfq.server.protocol.models import (
     UpdateSessionRequest,
 )
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 _CONTENT_PARTS = TypeAdapter(list[ContentPart])
 _MAX_RUNTIME_METRICS = 20_000
 
@@ -394,6 +394,7 @@ class SessionStore:
                     status TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     progress REAL NOT NULL CHECK (progress >= 0 AND progress <= 1),
+                    progress_data_json TEXT NOT NULL DEFAULT '{}',
                     cancel_requested INTEGER NOT NULL CHECK (cancel_requested IN (0, 1)),
                     result_json TEXT,
                     error_json TEXT,
@@ -452,7 +453,7 @@ class SessionStore:
                     (str(SCHEMA_VERSION),),
                 )
             elif int(existing["value"]) in {
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
             }:
                 columns = {
                     row["name"] for row in connection.execute("PRAGMA table_info(responses)")
@@ -481,6 +482,8 @@ class SessionStore:
                 }
                 if "archived_at" not in job_columns:
                     connection.execute("ALTER TABLE jobs ADD COLUMN archived_at TEXT")
+                if "progress_data_json" not in job_columns:
+                    connection.execute("ALTER TABLE jobs ADD COLUMN progress_data_json TEXT NOT NULL DEFAULT '{}'")
                 connection.execute(
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (str(SCHEMA_VERSION),),
@@ -2157,6 +2160,24 @@ class SessionStore:
             )
         return self.get_job(job_id)
 
+    def runtime_memory_policy(self) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute("SELECT value FROM schema_meta WHERE key = 'runtime_memory_policy'").fetchone()
+        return json.loads(row["value"]) if row else {}
+
+    def runtime_model_aliases(self) -> dict[str, str]:
+        with self._connection() as connection:
+            row = connection.execute("SELECT value FROM schema_meta WHERE key = 'runtime_model_aliases'").fetchone()
+        return json.loads(row["value"]) if row else {}
+
+    def save_runtime_model_aliases(self, aliases: dict[str, str]) -> None:
+        with self._connection() as connection:
+            connection.execute("INSERT INTO schema_meta(key, value) VALUES ('runtime_model_aliases', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (json.dumps(aliases),))
+
+    def save_runtime_memory_policy(self, policy: dict[str, Any]) -> None:
+        with self._connection() as connection:
+            connection.execute("INSERT INTO schema_meta(key, value) VALUES ('runtime_memory_policy', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (json.dumps(policy),))
+
     def update_job_progress(
         self,
         job_id: UUID,
@@ -2184,8 +2205,8 @@ class SessionStore:
                 raise InvalidJobStateError(f"cannot update progress while job is {row['status']}")
             next_progress = max(float(row["progress"]), progress)
             connection.execute(
-                "UPDATE jobs SET progress = ?, updated_at = ? WHERE id = ?",
-                (next_progress, _timestamp(updated_at), str(job_id)),
+                "UPDATE jobs SET progress = ?, progress_data_json = COALESCE(?, progress_data_json), updated_at = ? WHERE id = ?",
+                (next_progress, json.dumps(data) if data is not None else None, _timestamp(updated_at), str(job_id)),
             )
             self._append_job_event(
                 connection,
@@ -2847,6 +2868,7 @@ class SessionStore:
             status=JobStatus(row["status"]),
             payload=json.loads(row["payload_json"]),
             progress=float(row["progress"]),
+            progress_data=json.loads(row["progress_data_json"]),
             cancel_requested=bool(row["cancel_requested"]),
             result=json.loads(row["result_json"]) if row["result_json"] else None,
             error=ErrorDetail.model_validate_json(row["error_json"]) if row["error_json"] else None,

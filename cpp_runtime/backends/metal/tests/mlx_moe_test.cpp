@@ -2,6 +2,7 @@
 #include "mlx_moe_ops.h"
 #include "mlx_mxfp4_sq.h"
 #include "mlx_nint.h"
+#include "mlx_reference.h"
 #include "mfq_container.h"
 
 #include "nvq_codebooks.generated.h"
@@ -2648,13 +2649,9 @@ void test_two_stage_nint_shared_decode(
         profiles, intermediate, hidden, 19);
     const auto down_fixture = make_moe_fixture(
         profiles, hidden, intermediate, 31);
-    const auto gate = mfq::metal::MlxMfeWeight::from_blob(
-        gate_fixture.blob);
-    const auto up = mfq::metal::MlxMfeWeight::from_blob(
-        up_fixture.blob);
-    const auto gate_up =
-        mfq::metal::MlxMfeWeight::concatenate_projections({gate, up})
-            .materialize_packed_projections();
+    const std::array<std::span<const std::uint8_t>, 2> gate_up_blobs{
+        gate_fixture.blob, up_fixture.blob};
+    const auto gate_up = mfq::metal::MlxMfeWeight::from_projection_blobs(gate_up_blobs);
     const auto down = mfq::metal::MlxMfeWeight::from_blob(
         down_fixture.blob);
 
@@ -5815,6 +5812,191 @@ void test_materialized_mfe_projections() {
         std::to_string(allocated) + " packed=" + std::to_string(candidate.packed_nbytes()));
     require(before - initial > allocated + candidate.packed_nbytes() / 2,
         "projection fixture did not reproduce lazy duplicate storage");
+
+    const auto before_direct = mlx::core::get_active_memory();
+    const auto direct = [&] {
+        auto gate_bytes = blob;
+        auto up_bytes = up_blob;
+        const std::array<std::span<const std::uint8_t>, 2> sources{gate_bytes, up_bytes};
+        return mfq::metal::MlxMfeWeight::from_projection_blobs(sources);
+    }();
+    // Wire vectors are gone before any GPU use; packed buffers must own data.
+    require(direct.supports_grouped_mmq(), "direct projections lost grouped MMQ");
+    run = 0;
+    for (int tokens : {1, 5, 32, 65}) {
+        const auto actual = exercise(direct, tokens, tokens >= 32);
+        require(actual == expected[run++], "direct packed projection arithmetic changed");
+    }
+    mlx::core::synchronize();
+    const auto direct_allocated = mlx::core::get_active_memory() - before_direct;
+    require(direct_allocated < direct.packed_nbytes() + (64u << 10),
+        "direct projection loader retained duplicate buffers");
+}
+
+void test_direct_mfe_projection_tails() {
+    constexpr int experts = 3;
+    constexpr int output = 33;
+    constexpr int input = 40;
+    const auto nint = make_nint_v2_tensor(output, input, 71, 28, true);
+    const auto wide = make_jsc_nvq(output, input, "NVQ3J-L", 6, 4, 10);
+    const auto compact = make_nvq1_s(output, input);
+    const auto gate = make_raw_nim2(experts, output, input, {
+        {{2}, "NINT", nint, {}},
+        {{0}, wide.dtype, {wide.blob, wide.dense, output, input}, {}},
+        {{1}, compact.dtype, {compact.blob, compact.dense, output, input}, {}},
+    });
+    const auto up = make_raw_nim2(experts, output, input, {
+        {{0}, "NINT", make_nint_v2_tensor(output, input, 73, 23, true), {}},
+        {{1}, wide.dtype, {wide.blob, wide.dense, output, input}, {}},
+        {{2}, compact.dtype, {compact.blob, compact.dense, output, input}, {}},
+    });
+    const std::array<std::span<const std::uint8_t>, 2> sources{gate, up};
+    const auto candidate = mfq::metal::MlxMfeWeight::from_projection_blobs(sources);
+    const auto reference = mfq::metal::MlxMfeWeight::concatenate_projections({
+        mfq::metal::MlxMfeWeight::from_blob(gate),
+        mfq::metal::MlxMfeWeight::from_blob(up),
+    }).materialize_packed_projections();
+    for (int tokens : {1, 2, 5, 32, 65}) {
+        std::vector<float> values(tokens * input);
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            values[i] = static_cast<float>(static_cast<int>(i % 19) - 9) / 4096.0f;
+        }
+        std::vector<std::int32_t> ids(tokens * experts);
+        for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = (i * 2 + 1) % experts;
+        const auto x = mlx::core::astype(mlx::core::array(values.begin(),
+            mlx::core::Shape{tokens, input}), mlx::core::float16);
+        const auto routes = mlx::core::array(ids.begin(), mlx::core::Shape{tokens, experts});
+        require(evaluated_floats(candidate.routed_matmul(x, routes)) ==
+                evaluated_floats(reference.routed_matmul(x, routes)),
+            "direct projection tail matmul mismatch");
+        require(evaluated_floats(candidate.routed_swiglu(x, routes)) ==
+                evaluated_floats(reference.routed_swiglu(x, routes)),
+            "direct projection tail SwiGLU mismatch");
+        const auto order = mlx::core::astype(mlx::core::argsort(mlx::core::reshape(
+            routes, mlx::core::Shape{tokens * experts})), mlx::core::int32);
+        const auto plan = candidate.build_grouped_mmq_plan(routes, order, 32);
+        const auto reference_plan = reference.build_grouped_mmq_plan(routes, order, 32);
+        require(evaluated_floats(candidate.routed_matmul_sorted(
+                    x, routes, order, false, true, 0.0f, &plan)) ==
+                evaluated_floats(reference.routed_matmul_sorted(
+                    x, routes, order, false, true, 0.0f, &reference_plan)),
+            "direct projection sorted tail mismatch");
+    }
+
+    bool rejected = false;
+    try {
+        mfq::metal::MlxMfeWeight::from_projection_blobs({});
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    require(rejected, "empty projection source list must be rejected");
+    auto mismatched = up;
+    const std::uint32_t invalid_output = output + 1;
+    std::memcpy(mismatched.data() + 8, &invalid_output, sizeof(invalid_output));
+    const std::array<std::span<const std::uint8_t>, 2> invalid_sources{gate, mismatched};
+    rejected = false;
+    try {
+        mfq::metal::MlxMfeWeight::from_projection_blobs(invalid_sources);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    require(rejected, "mismatched projection geometry must be rejected");
+}
+
+void test_direct_mfe_projection_families() {
+    const auto check = [](const char* label, const std::vector<std::uint8_t>& gate,
+                          const std::vector<std::uint8_t>& up) {
+        const auto gate_weight = mfq::metal::MlxMfeWeight::from_blob(gate);
+        const auto up_weight = mfq::metal::MlxMfeWeight::from_blob(up);
+        const auto reference = mfq::metal::MlxMfeWeight::concatenate_projections({
+            gate_weight, up_weight,
+        }).materialize_packed_projections();
+        const auto candidate = [&] {
+            auto gate_wire = gate;
+            auto up_wire = up;
+            const std::array<std::span<const std::uint8_t>, 2> sources{gate_wire, up_wire};
+            auto result = mfq::metal::MlxMfeWeight::from_projection_blobs(sources);
+            // Dense/MX payload views must have been copied, not retained.
+            std::fill(gate_wire.begin(), gate_wire.end(), 0xad);
+            std::fill(up_wire.begin(), up_wire.end(), 0xad);
+            return result;
+        }();
+        require(candidate.supports_grouped_mmq() == reference.supports_grouped_mmq(),
+            "direct projection family changed grouped dispatch");
+        for (int tokens : {1, 5, 32}) {
+            std::vector<float> values(tokens * reference.neuron_len());
+            for (std::size_t i = 0; i < values.size(); ++i) {
+                values[i] = static_cast<float>(static_cast<int>(i % 17) - 8) / 4096.0f;
+            }
+            std::vector<std::int32_t> ids(tokens * reference.experts());
+            for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = i % reference.experts();
+            const auto x = mlx::core::astype(mlx::core::array(values.begin(),
+                mlx::core::Shape{tokens, reference.neuron_len()}), mlx::core::float16);
+            const auto routes = mlx::core::array(ids.begin(),
+                mlx::core::Shape{tokens, reference.experts()});
+            const auto actual = evaluated_floats(candidate.routed_matmul(x, routes));
+            const auto independent = evaluated_floats(mlx::core::concatenate({
+                gate_weight.routed_matmul(x, routes), up_weight.routed_matmul(x, routes)}, -1));
+            require(actual == independent,
+                std::string("direct projection disagrees with independent weights: ") + label);
+            const auto expected = evaluated_floats(reference.routed_matmul(x, routes));
+            const auto mismatch = std::mismatch(actual.begin(), actual.end(), expected.begin());
+            require(mismatch.first == actual.end(),
+                std::string("direct projection family matmul mismatch: ") + label +
+                " tokens=" + std::to_string(tokens) + " index=" +
+                std::to_string(mismatch.first - actual.begin()) +
+                (mismatch.first == actual.end() ? "" : " actual=" +
+                    std::to_string(*mismatch.first) + " expected=" + std::to_string(*mismatch.second)));
+            require(evaluated_floats(candidate.routed_swiglu(x, routes)) ==
+                    evaluated_floats(reference.routed_swiglu(x, routes)),
+                std::string("direct projection family SwiGLU mismatch: ") + label);
+        }
+    };
+
+    const std::vector<std::string> profiles{"NINTv2", "NINT8-0", "BF16", "F16"};
+    check("NINT/Q8/dense", make_moe_fixture(profiles, 33, 64, 5, 24).blob,
+          make_moe_fixture(profiles, 33, 64, 7, 28).blob);
+    const auto mx4 = make_mxfp4(33, 128, 3);
+    const auto mx8 = make_mxfp8(33, 128, 5);
+    const auto mx_gate = make_raw_nim2(2, 33, 128, {
+        {{1}, "MXFP4", {mx4.blob, mx4.dense, 33, 128}, {}},
+        {{0}, "MXFP8", {mx8.blob, mx8.dense, 33, 128}, {}},
+    });
+    const auto mx_up = make_raw_nim2(2, 33, 128, {
+        {{0}, "MXFP4", {mx4.blob, mx4.dense, 33, 128}, {}},
+        {{1}, "MXFP8", {mx8.blob, mx8.dense, 33, 128}, {}},
+    });
+    check("MX", mx_gate, mx_up);
+
+    const auto group64 = make_jsc_nvq(33, 40, "NVQ2J-XL", 5, 8, 12, true);
+    const auto nvq_l = make_nvq1_l(33, 40);
+    const auto grouped_gate = make_raw_nim2(2, 33, 40, {
+        {{1}, group64.dtype, {group64.blob, group64.dense, 33, 40}, {}},
+        {{0}, nvq_l.dtype, {nvq_l.blob, nvq_l.dense, 33, 40}, {}},
+    });
+    const auto grouped_up = make_raw_nim2(2, 33, 40, {
+        {{0}, nvq_l.dtype, {nvq_l.blob, nvq_l.dense, 33, 40}, {}},
+        {{1}, group64.dtype, {group64.blob, group64.dense, 33, 40}, {}},
+    });
+    check("group64/unaligned tail", grouped_gate, grouped_up);
+
+    const auto sq = make_mxfp4_sq2(5, 64);
+    const auto sq_blob = make_raw_nim2(2, 5, 64, {
+        {{1}, "MXFP4-SQ2", {sq.blob, sq.dense, 5, 64}, {}},
+        {{0}, "NINT4", make_nint_tensor(4, 5, 64, 11), {}},
+    });
+    check("SQ", sq_blob, sq_blob);
+    const auto rotated = make_rotated_nepq0_s(17, 24);
+    const auto rotated_blob = make_raw_nim2(2, 17, 24, {
+        {{1}, rotated.dtype, {rotated.blob, rotated.dense, 17, 24}, rotated.runtime},
+        {{0}, "NINT4", make_nint_tensor(4, 17, 24, 13), {}},
+    });
+    // The existing embedding-based unpacked oracle cannot handle rotations.
+    // Exercise rotated packed dispatch normally; reference mode audits the
+    // non-rotated native/dense/SQ families above.
+    if (!mfq::metal::mlx_reference_enabled()) {
+        check("rotated", rotated_blob, rotated_blob);
+    }
 }
 
 void test_mixed_decode_row_packing(int group_size) {
@@ -6309,10 +6491,16 @@ void test_container_validation() {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--test-direct-mfe") {
+            test_direct_mfe_projection_families();
+            std::cout << "MFQ direct MFE projection family tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--test-streamed-mfe") {
             test_streamed_mixed_mfe_residency();
             test_streamed_nvq1_residency();
             test_materialized_mfe_projections();
+            test_direct_mfe_projection_tails();
             std::cout << "MFQ streamed MFE residency tests passed\n";
             return 0;
         }
@@ -6335,7 +6523,7 @@ int main(int argc, char** argv) {
         if (argc != 1) {
             throw std::runtime_error(
                 "usage: mfq-metal-moe-test "
-                "[--benchmark-nepq-a|--benchmark-nint-shared|--test-streamed-mfe]");
+                "[--benchmark-nepq-a|--benchmark-nint-shared|--test-streamed-mfe|--test-direct-mfe]");
         }
         test_all_families_and_projections();
         test_swiglu_ffn();
@@ -6379,6 +6567,8 @@ int main(int argc, char** argv) {
         test_streamed_mixed_mfe_residency();
         test_streamed_nvq1_residency();
         test_materialized_mfe_projections();
+        test_direct_mfe_projection_tails();
+        test_direct_mfe_projection_families();
         test_mixed_decode_row_packing(24);
         test_mixed_decode_row_packing(28);
         test_container_validation();

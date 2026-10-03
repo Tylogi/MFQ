@@ -217,6 +217,30 @@ void test_basic_container(
         "out-of-bounds record range was accepted");
 }
 
+void test_load_progress(const std::filesystem::path& root) {
+    const auto path = root / "progress.mfq";
+    write_mfq(path, 2, "unit-test", {}, {
+        {"first", "BLOB", "first"}, {"second", "BLOB", "second"},
+        {"third", "BLOB", "third"}, {"__mfq_asset__/metadata", "BLOB", "asset"},
+    });
+    mfq::metal::MfqContainer model(path);
+    model.install_legacy_aliases({{"alias", "first"}});
+    std::vector<std::pair<std::size_t, std::size_t>> progress;
+    model.observe_load_records([&](auto completed, auto total) {
+        progress.emplace_back(completed, total);
+    });
+    auto shared = model;
+    (void)model.read("__mfq_asset__/metadata");
+    (void)model.read("alias");
+    (void)shared.map_record("first");
+    (void)shared.map_record("second");
+    require(progress == std::vector<std::pair<std::size_t, std::size_t>>{{1, 3}, {2, 3}},
+            "load progress duplicated aliases or included metadata");
+    model.stop_load_observation();
+    (void)shared.read("third");
+    require(progress.size() == 2, "load progress remained active during runtime reads");
+}
+
 void test_malformed_tables(
     const std::filesystem::path& root) {
     const auto huge_string =
@@ -926,6 +950,7 @@ int main() {
     try {
         const TemporaryDirectory root;
         test_basic_container(root.path());
+        test_load_progress(root.path());
         test_malformed_tables(root.path());
         test_sharded_ranges_and_source_lifetime(
             root.path());

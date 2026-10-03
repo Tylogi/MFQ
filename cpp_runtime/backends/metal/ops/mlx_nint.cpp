@@ -918,9 +918,15 @@ public:
 
     detail::StagingVector<std::uint8_t> bytes(
         std::size_t count,
-        const char* name) {
+        const char* name,
+        std::size_t extra_capacity = 0) {
         require(count, name);
-        detail::StagingVector<std::uint8_t> result(
+        if (extra_capacity > std::numeric_limits<std::size_t>::max() - count) {
+            throw std::runtime_error("NINT stream capacity overflows");
+        }
+        detail::StagingVector<std::uint8_t> result;
+        result.reserve(count + extra_capacity);
+        result.insert(result.end(),
             blob_.begin() + static_cast<std::ptrdiff_t>(offset_),
             blob_.begin() + static_cast<std::ptrdiff_t>(offset_ + count));
         offset_ += count;
@@ -979,9 +985,12 @@ detail::StagingVector<std::uint8_t> unpack_values(
 
 detail::StagingVector<std::uint8_t> pack_values(
     std::span<const std::uint8_t> values,
-    int bits) {
-    detail::StagingVector<std::uint8_t> result(
-        packed_size(values.size(), bits), 0);
+    int bits,
+    std::size_t extra_capacity = 0) {
+    const auto bytes = packed_size(values.size(), bits);
+    detail::StagingVector<std::uint8_t> result;
+    result.reserve(bytes + extra_capacity);
+    result.resize(bytes, 0);
     for (std::size_t index = 0; index < values.size(); ++index) {
         const auto bit_index = index * static_cast<std::size_t>(bits);
         for (int bit = 0; bit < bits; ++bit) {
@@ -1567,6 +1576,7 @@ MlxNintWeight MlxNintWeight::from_blob(
             }
             aligned_bytes += row_bytes;
         }
+        q_packed.reserve(aligned_bytes + 4);
         q_packed.resize(aligned_bytes, 0);
         for (int selector = 0; selector < (1 << kQSelectorBits); ++selector) {
             const int row_bits = selector + 1;
@@ -1600,8 +1610,8 @@ MlxNintWeight MlxNintWeight::from_blob(
         q_packed = old_unpacked_storage
             ? pack_values(
                   read_old_values(cursor, q_count, 1, "quantized value"),
-                  bits)
-            : cursor.bytes(packed_q_bytes, "q values");
+                  bits, 4)
+            : cursor.bytes(packed_q_bytes, "q values", 4);
         const auto row_bit_count = values_per_row * bits;
         for (std::size_t row = 0; row < output_size; ++row) {
             const auto bit_offset = row * row_bit_count;

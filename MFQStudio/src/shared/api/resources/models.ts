@@ -76,8 +76,8 @@ export const modelsApi = {
   },
 
   /** 读取内置官方目录以及服务端评估的设备适配建议。 */
-  officialHubModels(refresh = false): Promise<OfficialModelList> {
-    return request(`/api/v1/hub/official${refresh ? '?refresh=true' : ''}`);
+  officialHubModels(refresh = false, signal?: AbortSignal): Promise<OfficialModelList> {
+    return request(`/api/v1/hub/official${refresh ? '?refresh=true' : ''}`, { signal });
   },
 
   /** 解析 owner/repo 或受信任的 Hugging Face、ModelScope 仓库链接。 */

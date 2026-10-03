@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from dataclasses import replace
 
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -79,11 +80,12 @@ async def openai_chat_completions(service: ServiceDependency, request: Request) 
             content=openai_error_body(str(error), param=error.param),
         )
     backend = service.backend
+    parsed = replace(parsed, routing_model=service.resolve_model_alias(parsed.model))
     if parsed.stream:
         try:
             await preflight_backend_request(
                 backend,
-                model=parsed.model,
+                model=parsed.routing_model,
                 messages=parsed.messages,
                 sampling=parsed.sampling,
                 session_id=parsed.session_id,
