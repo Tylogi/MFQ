@@ -123,4 +123,3 @@ std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> KVCache::appen
         return {k.index({Slice(), Slice(), Slice(0, end_pos), Slice()}),
                 v.index({Slice(), Slice(), Slice(0, end_pos), Slice()})};
     }
-

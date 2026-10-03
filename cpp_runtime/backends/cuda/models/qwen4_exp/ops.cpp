@@ -111,8 +111,7 @@ struct BlockLoader : weight_loader::Loader {
             Embedding lookup = [table](const Tensor &ids) {
                 return nint_row_embedding_lookup(*table, ids);
             };
-            return std::pair{std::move(lookup),
-                             std::array<int64_t, 2>{table->rows(), table->width()}};
+            return std::pair{std::move(lookup), std::array<int64_t, 2>{table->rows(), table->width()}};
         }
         auto weight = std::make_shared<QuantLinear>(load_quant_linear(execution, source, name));
         Embedding lookup = [weight](const Tensor &ids) { return quant_embedding_lookup(*weight, ids); };

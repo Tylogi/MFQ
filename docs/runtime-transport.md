@@ -23,10 +23,20 @@ existing control API.
 
 Internal execution steps distinguish waiting, progress and completion; these
 states are separate from public request events. Waiting does not count as an
-advanced request. Grid-Vision and MiniCPM image/audio preparation yield between
+advanced request. CUDA Grid-Vision and MiniCPM image/audio preparation yield between
 encoder layers and preparation stages, so cancellation can release their
 suspended tensors before text prefill. CUDA measures each preparation quantum
 separately, excluding time spent between steps.
+
+Metal uses the same engine interface, text processor and request executor.
+Its existing asynchronous MLX generation pipeline runs on a device-owning
+thread and publishes only owned token/timing values through a four-event
+queue. The scheduler never runs a transport writer on that thread; a paused
+consumer bounds native work without blocking health or cancellation controls.
+Cancellation is observed at native prefill reports and token boundaries;
+in-flight device work is drained and the worker is joined before a terminal
+event, reload, shutdown or resource destruction. MTP, multimodal generation,
+session controls and duplex adapters remain private to the Metal engine.
 
 The generation flow owns serial model cleanup, and each batch row owns its
 physical slot cleanup. The executor destroys the suspended flow, observes any

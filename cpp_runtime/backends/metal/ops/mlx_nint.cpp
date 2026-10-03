@@ -343,6 +343,28 @@ constexpr const char* kNintStoreOutputAdd = R"METAL(
     y[(index)] = T((value) + float(residual[(index)]))
 )METAL";
 
+constexpr const char* kNintStoreOutputMoeShared = R"METAL(
+#define MFQ_NINT_STORE_OUTPUT(index, projected_value) do { \
+    float routed_accumulator = 0.0f; \
+    for (uint selected_route = 0u; \
+         selected_route < uint(MOE_ROUTES); \
+         ++selected_route) { \
+        const uint routed_index = \
+            (row * uint(MOE_ROUTES) + selected_route) \
+                * uint(LOGICAL_OUT) + output; \
+        routed_accumulator += float(pair_output[routed_index]) \
+            * route_weights[row * uint(MOE_ROUTES) + selected_route]; \
+    } \
+    const T rounded_routed = T(routed_accumulator); \
+    const T rounded_shared = T(projected_value); \
+    const float shared_scale = \
+        1.0f / (1.0f + exp(-float(gate_logits[row]))); \
+    y[(index)] = T( \
+        float(rounded_routed) \
+        + shared_scale * float(rounded_shared)); \
+} while (false)
+)METAL";
+
 constexpr const char* kNintMatmul = R"METAL(
     constexpr uint SIMD_GROUPS = 8u;
     constexpr uint OUTPUTS_PER_SIMD = uint(OPS_PER_SIMD);
@@ -604,6 +626,7 @@ constexpr const char* kNintMatmul = R"METAL(
         }
     }
 )METAL";
+
 
 // The fused epilogue is a second operator over the same metadata-driven
 // decoder, not a q-width, shape, or model-specific matmul path. Gate and up
@@ -1053,6 +1076,8 @@ std::int32_t checked_shape(std::int64_t value, const char* name) {
 struct NintMatmulKernelConfig {
     bool float32 = false;
     bool add_residual = false;
+    bool moe_shared = false;
+    int moe_routes = 0;
     int group_size = 0;
     int groups = 0;
     int input_size = 0;
@@ -1074,6 +1099,9 @@ struct NintMatmulKernelConfig {
 std::string nint_matmul_kernel_key(const NintMatmulKernelConfig& config) {
     return std::string(config.float32 ? "f32" : "f16")
         + (config.add_residual ? "_add" : "_plain")
+        + (config.moe_shared
+               ? "_moe" + std::to_string(config.moe_routes)
+               : "")
         + "_" + std::to_string(config.group_size)
         + "_" + std::to_string(config.groups)
         + "_" + std::to_string(config.input_size)
@@ -1112,7 +1140,9 @@ std::string nint_matmul_kernel_header(
         + "#define OUT_PER_EXPERT "
         + std::to_string(config.out_per_expert) + "\n"
         + "#define LOGICAL_OUT "
-        + std::to_string(config.logical_output) + "\n";
+        + std::to_string(config.logical_output) + "\n"
+        + "#define MOE_ROUTES "
+        + std::to_string(config.moe_routes) + "\n";
 }
 
 const mlx::core::fast::CustomKernelFunction& compiled_nint_matmul_kernel(
@@ -1149,6 +1179,10 @@ const mlx::core::fast::CustomKernelFunction& compiled_nint_matmul_kernel(
     };
     if (config.add_residual) {
         inputs.emplace_back("residual");
+    } else if (config.moe_shared) {
+        inputs.emplace_back("pair_output");
+        inputs.emplace_back("route_weights");
+        inputs.emplace_back("gate_logits");
     }
     CompileOptions options;
     options.math_mode = MathMode::Fast;
@@ -1156,7 +1190,9 @@ const mlx::core::fast::CustomKernelFunction& compiled_nint_matmul_kernel(
         + kNintHeader
         + (config.add_residual
                ? kNintStoreOutputAdd
-               : kNintStoreOutput);
+               : (config.moe_shared
+                      ? kNintStoreOutputMoeShared
+                      : kNintStoreOutput));
     auto kernel = mlx::core::fast::metal_kernel(
         "mfq_cpp_nint_runtime_" + key,
         std::move(inputs),
@@ -1335,6 +1371,15 @@ mlx::core::fast::CustomKernelFunction make_nint_embedding_kernel() {
 const mlx::core::fast::CustomKernelFunction& nint_embedding_kernel() {
     static const auto kernel = make_nint_embedding_kernel();
     return kernel;
+}
+
+int nint_decode_outputs_per_simd() noexcept {
+    const char* setting = std::getenv("MFQ_METAL_NINT_OUTPUTS_PER_SIMD");
+    if (setting != nullptr && setting[1] == '\0' &&
+        (setting[0] == '1' || setting[0] == '2' || setting[0] == '4')) {
+        return setting[0] - '0';
+    }
+    return 2;
 }
 
 } // namespace
@@ -1647,9 +1692,25 @@ array MlxNintWeight::matmul_add(
     return matmul_impl(input, &residual);
 }
 
+array MlxNintWeight::matmul_moe_shared(
+    const array& input,
+    const array& routed_pairs,
+    const array& route_weights,
+    const array& gate_logits) const {
+    return matmul_impl(
+        input,
+        nullptr,
+        &routed_pairs,
+        &route_weights,
+        &gate_logits);
+}
+
 array MlxNintWeight::matmul_impl(
     const array& input,
-    const array* residual) const {
+    const array* residual,
+    const array* routed_pairs,
+    const array* route_weights,
+    const array* gate_logits) const {
     if (input.ndim() == 0 || input.shape(-1) != input_size_) {
         throw std::runtime_error("NINT input width does not match packed weight");
     }
@@ -1665,6 +1726,35 @@ array MlxNintWeight::matmul_impl(
     if (residual != nullptr && residual->shape() != output_shape) {
         throw std::runtime_error("NINT residual shape does not match output");
     }
+    const bool has_moe_shared = routed_pairs != nullptr ||
+        route_weights != nullptr || gate_logits != nullptr;
+    if (has_moe_shared &&
+        (routed_pairs == nullptr || route_weights == nullptr ||
+         gate_logits == nullptr)) {
+        throw std::invalid_argument(
+            "NINT MoE shared epilogue requires pairs, weights, and gate");
+    }
+    if (has_moe_shared && residual != nullptr) {
+        throw std::invalid_argument(
+            "NINT residual and MoE shared epilogues are mutually exclusive");
+    }
+    int moe_routes = 0;
+    if (has_moe_shared) {
+        if (input.ndim() != 2 || routed_pairs->ndim() != 3 ||
+            routed_pairs->shape(0) != rows ||
+            routed_pairs->shape(2) != output_size_) {
+            throw std::invalid_argument(
+                "NINT MoE shared pairs must use [rows,routes,output]");
+        }
+        moe_routes = routed_pairs->shape(1);
+        if (moe_routes <= 0 || moe_routes > 16 ||
+            route_weights->shape() !=
+                Shape{static_cast<int>(rows), moe_routes} ||
+            gate_logits->size() != static_cast<std::size_t>(rows)) {
+            throw std::invalid_argument(
+                "NINT MoE shared weights or gate shape mismatch");
+        }
+    }
 
     auto source = input;
     if (rows >= 64 && source.dtype() == mlx::core::float32) {
@@ -1676,7 +1766,6 @@ array MlxNintWeight::matmul_impl(
     source = mlx::core::reshape(
         source,
         Shape{static_cast<std::int32_t>(rows), input_size_});
-
     if (rows >= 64) {
         // Decode packed rows once per matrix tile.  For very long prefills a
         // transient full dequantization wins because each weight tile would
@@ -1701,15 +1790,32 @@ array MlxNintWeight::matmul_impl(
             : mlx::core::matmul(
                   source,
                   mlx::core::transpose(dequantize(mlx::core::float16)));
-        result = mlx::core::reshape(std::move(result), std::move(output_shape));
-        return residual != nullptr ? result + *residual : result;
+        result = mlx::core::reshape(std::move(result), output_shape);
+        if (residual != nullptr) return result + *residual;
+        if (!has_moe_shared) return result;
+        auto pairs = *routed_pairs;
+        if (pairs.dtype() != result.dtype()) {
+            pairs = mlx::core::astype(pairs, result.dtype());
+        }
+        auto weighted = mlx::core::sum(
+            pairs * mlx::core::expand_dims(
+                mlx::core::astype(*route_weights, result.dtype()),
+                -1),
+            1);
+        auto gates = mlx::core::reshape(
+            *gate_logits,
+            Shape{static_cast<int>(rows), 1});
+        return mlx::core::astype(
+            weighted + mlx::core::sigmoid(gates) * result,
+            result.dtype());
     }
 
     const int tile_rows = rows == 1
         ? 1
         : (rows <= 16 ? static_cast<int>(rows) : 8);
     const auto row_tiles = (rows + tile_rows - 1) / tile_rows;
-    constexpr std::int64_t outputs_per_simd = 2;
+    const std::int64_t outputs_per_simd =
+        rows == 1 ? nint_decode_outputs_per_simd() : 2;
     const std::int64_t outputs_per_threadgroup = 8 * outputs_per_simd;
     constexpr std::int64_t threads_per_threadgroup = 256;
     const auto output_threadgroups =
@@ -1732,10 +1838,23 @@ array MlxNintWeight::matmul_impl(
         inputs.push_back(mlx::core::contiguous(mlx::core::reshape(
             *residual,
             Shape{static_cast<std::int32_t>(rows), output_size_})));
+    } else if (has_moe_shared) {
+        auto pairs = *routed_pairs;
+        if (pairs.dtype() != source.dtype()) {
+            pairs = mlx::core::astype(pairs, source.dtype());
+        }
+        inputs.push_back(mlx::core::contiguous(std::move(pairs)));
+        inputs.push_back(mlx::core::contiguous(
+            mlx::core::astype(*route_weights, mlx::core::float32)));
+        inputs.push_back(mlx::core::contiguous(mlx::core::reshape(
+            *gate_logits,
+            Shape{static_cast<std::int32_t>(rows)})));
     }
     const auto& kernel = compiled_nint_matmul_kernel({
         .float32 = source.dtype() == mlx::core::float32,
         .add_residual = residual != nullptr,
+        .moe_shared = has_moe_shared,
+        .moe_routes = moe_routes,
         .group_size = group_size_,
         .groups = groups_,
         .input_size = input_size_,
@@ -1939,6 +2058,101 @@ std::optional<array> MlxNintWeight::greedy_argmax(const array& input) const {
         throw std::runtime_error("NINT greedy input width mismatch");
     }
     return std::nullopt;
+}
+
+std::optional<MlxNintSwiGluPair>
+MlxNintSwiGluPair::from_weights(
+    const MlxNintWeight& gate,
+    const MlxNintWeight& up) {
+    if (!gate.can_fuse_swiglu(up)) {
+        return std::nullopt;
+    }
+    const auto gate_q_bytes = gate.packed_values().size();
+    if (gate_q_bytes > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error(
+            "combined NINT Gate/Up q offset exceeds Metal uint range");
+    }
+
+    const auto& gate_metadata = gate.row_metadata();
+    const auto& up_metadata = up.row_metadata();
+    detail::StagingVector<std::uint32_t> metadata(
+        gate_metadata.size() + up_metadata.size());
+    std::copy_n(
+        gate_metadata.data<std::uint32_t>(),
+        gate_metadata.size(),
+        metadata.begin());
+    std::copy_n(
+        up_metadata.data<std::uint32_t>(),
+        up_metadata.size(),
+        metadata.begin() +
+            static_cast<std::ptrdiff_t>(gate_metadata.size()));
+    for (int row = 0; row < up.output_size(); ++row) {
+        const auto offset = gate_metadata.size() +
+            static_cast<std::size_t>(row) * 4u + 1u;
+        const auto original = metadata[offset];
+        if (original > std::numeric_limits<std::uint32_t>::max() -
+                static_cast<std::uint32_t>(gate_q_bytes)) {
+            throw std::runtime_error(
+                "combined NINT Gate/Up row offset exceeds Metal uint range");
+        }
+        metadata[offset] = original +
+            static_cast<std::uint32_t>(gate_q_bytes);
+    }
+
+    detail::StagingVector<std::uint8_t> q_values(
+        gate.packed_values().size() + up.packed_values().size());
+    std::copy_n(
+        gate.packed_values().data<std::uint8_t>(),
+        gate.packed_values().size(),
+        q_values.begin());
+    std::copy_n(
+        up.packed_values().data<std::uint8_t>(),
+        up.packed_values().size(),
+        q_values.begin() + static_cast<std::ptrdiff_t>(
+            gate.packed_values().size()));
+    detail::StagingVector<std::uint8_t> sub_scale_values(
+        gate.sub_scales().size() + up.sub_scales().size());
+    detail::StagingVector<std::uint8_t> sub_min_values(
+        gate.sub_mins().size() + up.sub_mins().size());
+    std::copy_n(
+        gate.sub_scales().data<std::uint8_t>(),
+        gate.sub_scales().size(),
+        sub_scale_values.begin());
+    std::copy_n(
+        up.sub_scales().data<std::uint8_t>(),
+        up.sub_scales().size(),
+        sub_scale_values.begin() + static_cast<std::ptrdiff_t>(
+            gate.sub_scales().size()));
+    std::copy_n(
+        gate.sub_mins().data<std::uint8_t>(),
+        gate.sub_mins().size(),
+        sub_min_values.begin());
+    std::copy_n(
+        up.sub_mins().data<std::uint8_t>(),
+        up.sub_mins().size(),
+        sub_min_values.begin() + static_cast<std::ptrdiff_t>(
+            gate.sub_mins().size()));
+    auto q_packed = make_array(
+        q_values,
+        Shape{static_cast<int>(q_values.size())});
+    auto sub_scale = make_array(
+        sub_scale_values,
+        Shape{2 * gate.output_size(), gate.groups()});
+    auto sub_min = make_array(
+        sub_min_values,
+        Shape{2 * gate.output_size(), gate.groups()});
+    auto row_metadata = make_array(
+        metadata,
+        Shape{2 * gate.output_size(), 4});
+    return MlxNintSwiGluPair(
+        std::move(q_packed),
+        std::move(row_metadata),
+        std::move(sub_scale),
+        std::move(sub_min),
+        gate.group_size(),
+        gate.groups(),
+        gate.input_size(),
+        gate.output_size());
 }
 
 bool MlxNintWeight::can_fuse_swiglu(

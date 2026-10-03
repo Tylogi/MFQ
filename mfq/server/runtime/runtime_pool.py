@@ -464,6 +464,26 @@ class RuntimePool:
             request,
             memory_ceiling=residency_ceiling,
         )
+        if self.backend == "metal" and artifact.routed_expert_bytes > 0:
+            gib = float(1 << 30)
+            cache_gb = request.moe_gpu_cache_gb
+            policy = (
+                f"paged experts, cache={cache_gb:.2f} GiB"
+                if cache_gb is not None and cache_gb > 0
+                else "native automatic expert cache"
+                if cache_gb is None and artifact.resource.format == "hf"
+                else "fully resident experts"
+            )
+            ceiling_text = (
+                f"{residency_ceiling / gib:.2f} GiB"
+                if residency_ceiling is not None else "unlimited"
+            )
+            await context.log(
+                f"Metal residency: {policy}; budget={ceiling_text}; "
+                f"checkpoint={artifact.resource.total_bytes / gib:.2f} GiB; "
+                f"row-streamed={artifact.always_streamed_bytes / gib:.2f} GiB; "
+                f"experts={artifact.routed_expert_bytes / gib:.2f} GiB"
+            )
         request_capacity = native_request_capacity(
             backend=self.backend,
             routed_expert_bytes=artifact.routed_expert_bytes,

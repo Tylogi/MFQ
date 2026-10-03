@@ -1,4 +1,5 @@
 #include "mlx_deepseek_v4_causal_lm.h"
+#include "grammar_fixture.h"
 #include "mlx_transformer.h"
 
 #include "nlohmann/json.hpp"
@@ -54,16 +55,7 @@ constexpr int kContext = 32;
 constexpr int kNintGroup = 16;
 
 MfqTokenConstraintPtr permissive_cloneable_constraint() {
-    auto constraint = std::make_shared<MfqTokenConstraint>();
-    constraint->allows = [](std::int64_t) {
-        return true;
-    };
-    constraint->apply = [](float*, std::size_t) {};
-    constraint->accept = [](std::int64_t) {};
-    constraint->clone = [] {
-        return permissive_cloneable_constraint();
-    };
-    return constraint;
+    return mfq::metal::test::grammar_constraint(8, "root ::= [a-z]*");
 }
 
 void require(

@@ -635,6 +635,14 @@ array MlxLinear::operator()(const array& input) const {
         source = mlx::core::astype(source, dense.dtype());
     }
     const auto rows = source.size() / static_cast<std::size_t>(input_size_);
+    if (rows == 1 &&
+        moe_dense_router_logits_supported(source, dense)) {
+        auto output_shape = input.shape();
+        output_shape.back() = output_size_;
+        return mlx::core::reshape(
+            moe_dense_router_logits(source, dense),
+            std::move(output_shape));
+    }
     if (rows >= 2 && rows <= 6 &&
         input_size_ % 4 == 0 &&
         dense.size() >= 65536 &&
@@ -663,6 +671,26 @@ array MlxLinear::operator()(const array& input) const {
         }
     }
     return mlx::core::matmul(source, mlx::core::transpose(dense));
+}
+
+array MlxLinear::moe_shared(
+    const array& input,
+    const array& routed_pairs,
+    const array& route_weights,
+    const array& gate_logits) const {
+    if (const auto* packed = std::get_if<MlxNintWeight>(&weight_);
+        packed != nullptr && !mlx_reference_enabled()) {
+        return packed->matmul_moe_shared(
+            input,
+            routed_pairs,
+            route_weights,
+            gate_logits);
+    }
+    return moe_weighted_reduce_shared_gate(
+        routed_pairs,
+        route_weights,
+        (*this)(input),
+        gate_logits);
 }
 
 array MlxLinear::grouped_row_matmul(

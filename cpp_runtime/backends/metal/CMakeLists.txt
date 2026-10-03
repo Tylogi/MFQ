@@ -275,6 +275,7 @@ target_include_directories(mfq-metal-runtime PRIVATE
 target_link_libraries(mfq-metal-runtime PUBLIC
     mfq-core
     mfq-models
+    mfq-engine
     mfq-mlx
     mfq-jaccl
     Threads::Threads
@@ -289,6 +290,19 @@ target_compile_definitions(mfq-metal-runtime PUBLIC
     MFQ_NATIVE_MLX_RUNTIME=1
     MFQ_MLX_METALLIB_DEFAULT="${MFQ_MLX_METALLIB_DEFAULT}"
 )
+
+add_library(mfq-metal-engine STATIC
+    runtime/mlx_engine.cpp
+    runtime/mlx_generation_job.cpp
+    runtime/mlx_server_components.cpp
+)
+target_link_libraries(mfq-metal-engine PUBLIC mfq-metal-runtime mfq-engine)
+target_compile_features(mfq-metal-engine PUBLIC cxx_std_20)
+
+add_executable(mfq-metal-engine-test tests/mlx_engine_test.cpp)
+target_link_libraries(mfq-metal-engine-test PRIVATE mfq-metal-engine)
+target_compile_features(mfq-metal-engine-test PRIVATE cxx_std_20)
+add_test(NAME mfq-metal-engine-test COMMAND mfq-metal-engine-test)
 
 add_executable(mfq-decode-metal
     apps/mfq_decode_mlx.cpp
@@ -355,10 +369,7 @@ add_custom_command(
 )
 
 if(TARGET mfq-runtime-communication)
-    target_sources(mfq-decode-metal PRIVATE
-        runtime/mlx_server_components.cpp
-    )
-    target_link_libraries(mfq-decode-metal PRIVATE mfq-runtime-communication)
+    target_link_libraries(mfq-decode-metal PRIVATE mfq-metal-engine mfq-runtime-communication)
     target_compile_definitions(
         mfq-decode-metal PRIVATE MFQ_METAL_RUNTIME_COMMUNICATION=1)
 

@@ -539,7 +539,6 @@ int run_mfe_tensor_check(
     }
     return 0;
 }
-
 static int run_gemma_moe_check(
         CudaExecutionContext& execution,
         const mfq::ModelSource & mfq,
@@ -982,4 +981,3 @@ int run_moe_check(
     }
     return 0;
 }
-

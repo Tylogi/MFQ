@@ -6,6 +6,7 @@
 #include <mlx/backend/metal/device.h>
 #include <mlx/primitives.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -77,6 +78,40 @@ const Kernel& sparse_selected_mla_decode_kernel() {
         {"q", "kv", "indices", "mask", "sinks", "params"},
         {"out"},
         kSparseAttentionDecodeSource);
+    return kernel;
+}
+
+const Kernel& sparse_block_gqa_gather_kernel() {
+    // Singleton decode benefits from MLX's split-K SDPA rather than the
+    // prefill kernel's one threadgroup per KV head. Gather chronological
+    // selected blocks and the incomplete causal tail first, as in oMLX's
+    // contiguous_causal_gathered_qsa_decode (see NOTICE).
+    static const auto kernel = make_sparse_kernel(
+        "mfq_cpp_sparse_block_gqa_gather",
+        {"keys", "values", "blocks", "params"},
+        {"selected_keys", "selected_values", "valid"},
+        R"METAL(
+            uint index = thread_position_in_grid.x;
+            uint key_count = uint(params[0]);
+            uint selected = uint(params[1]);
+            uint valid_blocks = uint(params[2]);
+            uint complete = key_count / uint(BLOCK_SIZE);
+            if (index >= uint(KV_HEADS) * selected * uint(DIM)) return;
+            uint dim = index % uint(DIM);
+            uint token = (index / uint(DIM)) % selected;
+            uint head = index / (selected * uint(DIM));
+            long source = token < valid_blocks * uint(BLOCK_SIZE)
+                ? long(blocks[token / uint(BLOCK_SIZE)]) * long(BLOCK_SIZE) +
+                    long(token % uint(BLOCK_SIZE))
+                : long(complete * uint(BLOCK_SIZE)) +
+                    long(token - valid_blocks * uint(BLOCK_SIZE));
+            bool present = source >= 0 && source < long(key_count);
+            uint offset = uint(head * key_count * uint(DIM) +
+                uint(present ? source : 0) * uint(DIM) + dim);
+            selected_keys[index] = present ? keys[offset] : 0;
+            selected_values[index] = present ? values[offset] : 0;
+            if (head == 0 && dim == 0) valid[token] = present;
+        )METAL");
     return kernel;
 }
 
@@ -597,6 +632,41 @@ array mlx_sparse_block_gqa_attention(
     if (!std::isfinite(selected_scale)) {
         throw std::invalid_argument(
             "selected-block sparse GQA scale must be finite");
+    }
+
+    const char* gather_setting = std::getenv("MFQ_METAL_SPARSE_GQA_DECODE_GATHER");
+    if (selected_query.shape(0) == 1 && selected_query.shape(2) == 1 &&
+        query_offset + 1 == selected_key.shape(2) &&
+        (gather_setting == nullptr || std::string(gather_setting) != "0")) {
+        const int complete = selected_key.shape(2) / block_size;
+        const int valid_blocks = std::min(blocks.shape(2), complete);
+        const int selected = valid_blocks * block_size +
+            selected_key.shape(2) % block_size;
+        if (selected > 0) {
+            const Shape gathered_shape{1, selected_key.shape(1), selected, 256};
+            // Context length changes every token; keep it in runtime data,
+            // never in the kernel template/cache key.
+            const array gather_params(
+                {selected_key.shape(2), selected, valid_blocks}, mlx::core::int32);
+            auto gathered = sparse_block_gqa_gather_kernel()(
+                {selected_key, selected_value, blocks, gather_params},
+                {gathered_shape, gathered_shape, Shape{1, 1, 1, selected}},
+                {attention_dtype, attention_dtype, mlx::core::bool_},
+                {selected_key.shape(1) * selected * 256, 1, 1},
+                {256, 1, 1},
+                {
+                    {"KV_HEADS", selected_key.shape(1)},
+                    {"DIM", 256},
+                    {"BLOCK_SIZE", block_size},
+                },
+                std::nullopt,
+                false,
+                {});
+            auto output = mlx::core::fast::scaled_dot_product_attention(
+                selected_query, gathered[0], gathered[1], selected_scale,
+                "", gathered[2]);
+            return mlx::core::transpose(output, {0, 2, 1, 3});
+        }
     }
 
     SparseBlockGqaParams params{

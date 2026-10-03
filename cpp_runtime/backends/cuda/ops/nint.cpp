@@ -4,6 +4,9 @@
 #include "cuda_execution.h"
 #include "format.h"
 
+#include <cstring>
+#include <limits>
+
 #if defined(__x86_64__) && defined(__GNUC__)
 #include <immintrin.h>
 #define MFQ_CPU_X86_GNU 1
@@ -11,6 +14,34 @@
 
 using mfq_tensor_backend::indexing::Slice;
 using namespace mfq::cuda::quant_format;
+
+mfq_tensor_backend::Tensor nint_row_embedding_lookup(
+        const mfq::NintRows& table, const mfq_tensor_backend::Tensor& ids) {
+    MFQ_RUNTIME_CHECK(ids.is_cuda() && ids.scalar_type() == mfq_tensor_backend::kInt64,
+        "NINT row IDs must be CUDA int64");
+    const MfqCudaGuard guard(ids.device());
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    MFQ_CUDA_CHECK(cudaStreamIsCapturing(mfq_current_cuda_stream(), &capture));
+    MFQ_RUNTIME_CHECK(capture == cudaStreamCaptureStatusNone,
+        "range-backed NINT row lookup cannot run inside CUDA graph capture");
+    auto shape = ids.sizes().vec();
+    shape.push_back(table.width());
+    if (ids.numel() == 0)
+        return mfq_tensor_backend::empty(shape, ids.options().dtype(mfq_tensor_backend::kFloat16));
+    MFQ_RUNTIME_CHECK(ids.numel() <= std::numeric_limits<int>::max() / 6 &&
+        static_cast<uint64_t>(ids.numel()) * table.width() <= std::numeric_limits<uint32_t>::max(),
+        "NINT row lookup batch exceeds bounds");
+    auto host = ids.contiguous().cpu();
+    mfq::NintRowBatch selected;
+    for (int64_t i = 0; i < host.numel(); ++i)
+        table.append_row(host.data_ptr<int64_t>()[i], selected);
+    selected.validate();
+    auto packed = cpu_u8_tensor(selected.packed(), {static_cast<int64_t>(selected.packed_nbytes())}).to(ids.device());
+    std::vector<int32_t> words(selected.descriptors().size());
+    std::memcpy(words.data(), selected.descriptors().data(), words.size() * sizeof(uint32_t));
+    auto descriptors = cpu_i32_tensor(words, {static_cast<int64_t>(selected.rows()), 6}).to(ids.device());
+    return nint_selected_rows_cuda(packed, descriptors, table.width()).reshape(shape);
+}
 
 mfq_tensor_backend::Tensor pad_last(mfq_tensor_backend::Tensor x, int64_t target) {
     if (x.size(1) == target) return x;
@@ -1360,61 +1391,4 @@ mfq_tensor_backend::Tensor dequant_nint8_zero_cpu(const Nint8ZeroCpu & source) {
         }
     });
     return result.contiguous();
-}
-
-std::shared_ptr<mfq::NintRows> load_nint_row_table(
-        const mfq::ModelSource& source, const std::string& name) {
-    const auto& metadata = require_tensor(source, name);
-    MFQ_RUNTIME_CHECK(metadata.dtype == "NINT",
-        "NINT row table requires packed NINT");
-    MFQ_RUNTIME_CHECK(metadata.nbytes <= std::numeric_limits<std::size_t>::max(),
-        "NINT row table size overflow");
-    auto read = source.tensor_reader(name);
-    return std::make_shared<mfq::NintRows>(
-        static_cast<std::size_t>(metadata.nbytes),
-        [read = std::move(read)](
-                std::size_t offset, std::uint8_t* output, std::size_t count) {
-            read(offset, reinterpret_cast<std::byte*>(output), count);
-        });
-}
-
-mfq_tensor_backend::Tensor nint_row_embedding_lookup(
-        const mfq::NintRows& table,
-        const mfq_tensor_backend::Tensor& ids) {
-    MFQ_RUNTIME_CHECK(
-        ids.is_cuda() && ids.scalar_type() == mfq_tensor_backend::kInt64,
-        "NINT row IDs must be CUDA int64");
-    const MfqCudaGuard guard(ids.device());
-    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-    MFQ_CUDA_CHECK(cudaStreamIsCapturing(mfq_current_cuda_stream(), &capture));
-    MFQ_RUNTIME_CHECK(capture == cudaStreamCaptureStatusNone,
-        "range-backed NINT row lookup cannot run inside CUDA graph capture");
-    auto shape = ids.sizes().vec();
-    shape.push_back(table.width());
-    if (ids.numel() == 0) {
-        return mfq_tensor_backend::empty(
-            shape, ids.options().dtype(mfq_tensor_backend::kFloat16));
-    }
-    MFQ_RUNTIME_CHECK(
-        ids.numel() <= std::numeric_limits<int>::max() / 6 &&
-            static_cast<std::uint64_t>(ids.numel()) * table.width() <=
-                std::numeric_limits<std::uint32_t>::max(),
-        "NINT row lookup batch exceeds bounds");
-    auto host = ids.contiguous().cpu();
-    mfq::NintRowBatch selected;
-    for (std::int64_t index = 0; index < host.numel(); ++index) {
-        table.append_row(host.data_ptr<std::int64_t>()[index], selected);
-    }
-    selected.validate();
-    auto packed = cpu_u8_tensor(
-        selected.packed(),
-        {static_cast<std::int64_t>(selected.packed_nbytes())}).to(ids.device());
-    std::vector<std::int32_t> words(selected.descriptors().size());
-    std::memcpy(
-        words.data(), selected.descriptors().data(),
-        words.size() * sizeof(std::uint32_t));
-    auto descriptors = cpu_i32_tensor(
-        words, {static_cast<std::int64_t>(selected.rows()), 6}).to(ids.device());
-    return nint_selected_rows_cuda(
-        packed, descriptors, table.width()).reshape(shape);
 }

@@ -95,23 +95,23 @@ struct MiniCPMO45TtsDecoder {
             result.config.max_position_embeddings,
             result.config.rotary_dim,
             result.config.rope_base);
-        result.text_embedding = load_quant_linear(execution, 
+        result.text_embedding = load_quant_linear(execution,
             mfq, "tts.text_embedding.weight");
-        result.code_embedding = load_quant_linear(execution, 
+        result.code_embedding = load_quant_linear(execution,
             mfq, "tts.code_embedding.0.weight");
-        result.semantic_projector1 = MiniCPMO45Linear::load(execution, 
+        result.semantic_projector1 = MiniCPMO45Linear::load(execution,
             mfq, "tts.semantic_projector.input");
-        result.semantic_projector2 = MiniCPMO45Linear::load(execution, 
+        result.semantic_projector2 = MiniCPMO45Linear::load(execution,
             mfq, "tts.semantic_projector.output");
-        result.speaker_projector1 = MiniCPMO45Linear::load(execution, 
+        result.speaker_projector1 = MiniCPMO45Linear::load(execution,
             mfq, "tts.speaker_projector.input");
-        result.speaker_projector2 = MiniCPMO45Linear::load(execution, 
+        result.speaker_projector2 = MiniCPMO45Linear::load(execution,
             mfq, "tts.speaker_projector.output");
-        result.output_norm = load_dense_native_gpu(execution, 
+        result.output_norm = load_dense_native_gpu(execution,
             mfq, "tts.output_norm.weight");
-        auto head_g = load_dense_native_gpu(execution, 
+        auto head_g = load_dense_native_gpu(execution,
             mfq, "tts.code_output.0.weight_norm.magnitude");
-        auto head_v = load_dense_native_gpu(execution, 
+        auto head_v = load_dense_native_gpu(execution,
             mfq, "tts.code_output.0.weight_norm.direction");
         if (head_g.sizes().vec() != std::vector<int64_t>({6562, 1}) ||
                 head_v.sizes().vec() != std::vector<int64_t>({6562, 768}) ||

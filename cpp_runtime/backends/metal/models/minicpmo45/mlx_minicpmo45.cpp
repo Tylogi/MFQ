@@ -5475,7 +5475,7 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
             token_array.eval();
         }
         auto token = token_array.data<std::int32_t>()[0];
-        if (token_constraint && token_constraint->allows &&
+        if (token_constraint &&
             !token_constraint->allows(token)) {
             auto adjusted = counts
                 ? sampler.apply_penalties(logits, *counts)
@@ -5497,7 +5497,7 @@ std::int32_t MlxMiniCPMO45Runtime::generate(
                     "MiniCPM-o constrained sampler returned invalid token");
             }
         }
-        if (token_constraint && token_constraint->accept) {
+        if (token_constraint) {
             token_constraint->accept(token);
         }
         const array token_ids(
@@ -5723,7 +5723,7 @@ std::int32_t MlxMiniCPMO45Runtime::generate_multimodal(
             token_array.eval();
         }
         auto token = token_array.data<std::int32_t>()[0];
-        if (token_constraint && token_constraint->allows &&
+        if (token_constraint &&
             !token_constraint->allows(token)) {
             auto adjusted = counts
                 ? sampler.apply_penalties(logits, *counts)
@@ -5745,7 +5745,7 @@ std::int32_t MlxMiniCPMO45Runtime::generate_multimodal(
                     "MiniCPM-o constrained sampler returned invalid token");
             }
         }
-        if (token_constraint && token_constraint->accept) {
+        if (token_constraint) {
             token_constraint->accept(token);
         }
         const auto token_ids = mlx::core::reshape(

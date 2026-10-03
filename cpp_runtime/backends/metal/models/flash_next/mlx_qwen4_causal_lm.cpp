@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -48,6 +49,47 @@ constexpr std::string_view kModelConfigAsset =
 // Qwen4/Flash-Next recursively reuses its single predictor layer to form a
 // draft chain. Predictor layer count and maximum draft depth are independent.
 constexpr int kQwen4MtpMaximumDraftDepth = 5;
+
+bool decode_async_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* setting = std::getenv("MFQ_METAL_QWEN_DECODE_ASYNC");
+        return setting == nullptr || std::atoi(setting) != 0;
+    }();
+    return enabled;
+}
+
+bool gdn_decode_step_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* setting = std::getenv("MFQ_METAL_GDN_DECODE_STEP");
+        return setting == nullptr || std::atoi(setting) != 0;
+    }();
+    return enabled;
+}
+
+bool qsa_decode_prologue_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* setting = std::getenv(
+            "MFQ_METAL_QWEN_QSA_DECODE_PROLOGUE");
+        return setting == nullptr || std::atoi(setting) != 0;
+    }();
+    return enabled;
+}
+
+// Adapted from oMLX's Qwen4 eager-dispatch policy (Apache-2.0), revision
+// 87460f4d50de79aef9b67e99e215c31f0a89b445, language.py. MFQ adaptation:
+// ordinary single-token forward only, with synchronized profiling excluded.
+// Copyright 2025 oMLX contributors. See NOTICE for upstream attribution.
+int decode_async_interval() noexcept {
+    static const int interval = [] {
+        const char* setting = std::getenv("MFQ_METAL_QWEN_DECODE_ASYNC_EVERY");
+        if (setting == nullptr || *setting == '\0') return 3;
+        char* end = nullptr;
+        const long value = std::strtol(setting, &end, 10);
+        return end != setting && *end == '\0' && value >= 1 && value <= 1024
+            ? static_cast<int>(value) : 3;
+    }();
+    return interval;
+}
 
 const json& text_config(const json& outer) {
     const auto found = outer.find("text_config");
@@ -89,6 +131,17 @@ array dense(
         result = mlx::core::astype(result, *dtype);
     }
     return mlx::core::contiguous(result);
+}
+
+// MHC projections are small resident matrices consumed by the existing fused
+// gated-residual operators. Decode only these weights once; keep dense() strict
+// for norms/integer metadata and leave large PLE tables on their row reader.
+array mhc_projection(const MfqContainer& model, const std::string& name) {
+    if (!is_nint_dtype(model.record(name).dtype)) return dense(model, name);
+    const auto mapped = model.map_record(name);
+    auto result = MlxNintWeight::from_blob(mapped.view()).dequantize();
+    result.eval();
+    return result;
 }
 
 array dense_vector(
@@ -177,7 +230,8 @@ public:
         if (model.record(gate).dtype == "MFE" &&
             model.record(up).dtype == "MFE") {
             return Qwen4RoutedWeight(
-                load_routed_gate_up_weight(model, prefix));
+                load_routed_gate_up_weight(model, prefix)
+                    .materialize_packed_projections());
         }
         auto gate_values = dense(model, gate);
         auto up_values = dense(model, up);
@@ -218,6 +272,10 @@ public:
 
     bool supports_grouped_mmq() const noexcept {
         return packed_ && packed_->supports_grouped_mmq();
+    }
+
+    bool supports_fused_routed_reduce() const noexcept {
+        return packed_ && packed_->supports_fused_routed_reduce();
     }
 
     int recommended_grouped_mmq_block_rows(
@@ -274,6 +332,10 @@ public:
     }
     int projections() const noexcept {
         return packed_ ? packed_->projections() : 1;
+    }
+
+    const MlxMfeWeight* packed_weight_ref() const noexcept {
+        return packed_ ? &*packed_ : nullptr;
     }
 
 private:
@@ -354,19 +416,39 @@ public:
                 throw std::runtime_error("Qwen4 gated residual prefix is invalid");
             }
             root.resize(root.size() - 4);
-            injection = dense(model, root + ".post.inject.weight");
+            injection = mhc_projection(model, root + ".post.inject.weight");
         }
         return GatedResidual(
             config,
             dense_vector(model, prefix + ".norm.weight"),
-            dense(model, prefix + ".down.weight"),
-            dense(model, prefix + ".up.weight"),
+            mhc_projection(model, prefix + ".down.weight"),
+            mhc_projection(model, prefix + ".up.weight"),
             std::move(injection));
     }
 
     MlxQwen4GatedResidualPre pre(const array& value) const {
         return qwen4_gated_residual_pre(
             value, norm_, down_, up_, injection_,
+            static_cast<int>(config_.hidden_size),
+            static_cast<int>(config_.hc_count),
+            static_cast<float>(config_.rms_norm_eps));
+    }
+
+    MlxQwen4GatedResidualPre pre_after(
+        const array& branch,
+        const MlxQwen4GatedResidualPre& previous) const {
+        if (!previous.injection) {
+            throw std::logic_error(
+                "Qwen4 chained gated residual has no injection gate");
+        }
+        return qwen4_gated_residual_pre_after(
+            branch,
+            previous.residual,
+            *previous.injection,
+            norm_,
+            down_,
+            up_,
+            injection_,
             static_cast<int>(config_.hidden_size),
             static_cast<int>(config_.hc_count),
             static_cast<float>(config_.rms_norm_eps));
@@ -424,16 +506,44 @@ public:
         return down_(gate_up_.swiglu(value));
     }
 
+    array moe_shared(
+        const array& value,
+        const array& routed_pairs,
+        const array& route_weights,
+        const array& gate_logits) const {
+        return down_.moe_shared(
+            gate_up_.swiglu(value),
+            routed_pairs,
+            route_weights,
+            gate_logits);
+    }
+
+    const MlxNintSwiGluPair* nint_gate_up_pair_ref() const noexcept {
+        return nint_gate_up_ ? &*nint_gate_up_ : nullptr;
+    }
+
+    const MlxNintWeight* nint_down_ref() const noexcept {
+        return down_.nint_weight_ref();
+    }
+
 private:
     DenseFfn(MlxLinear gate, MlxLinear up, MlxLinear down)
         : gate_(std::move(gate)),
           up_(std::move(up)),
           down_(std::move(down)),
-          gate_up_(std::vector<const MlxLinear*>{&gate_, &up_}) {}
+          gate_up_(std::vector<const MlxLinear*>{&gate_, &up_}) {
+        const auto* gate_weight = gate_.nint_weight_ref();
+        const auto* up_weight = up_.nint_weight_ref();
+        if (gate_weight != nullptr && up_weight != nullptr) {
+            nint_gate_up_ = MlxNintSwiGluPair::from_weights(
+                *gate_weight, *up_weight);
+        }
+    }
     MlxLinear gate_;
     MlxLinear up_;
     MlxLinear down_;
     MlxProjectionBatch gate_up_;
+    std::optional<MlxNintSwiGluPair> nint_gate_up_;
 };
 
 class Qwen4Moe {
@@ -454,15 +564,15 @@ public:
         const auto up_name = split_gate_up
             ? std::optional<std::string>(expert_prefix + "up.weight")
             : std::nullopt;
-    const auto down_name = expert_prefix + "down.weight";
-    if (mfe_offload_cache &&
-        (!mfe_offload_cache->can_group_mfe(gate_name)
-         || (up_name && !mfe_offload_cache->can_group_mfe(*up_name))
-         || !mfe_offload_cache->can_group_mfe(down_name))) {
-            // A requested offload policy is projection-selective. Unsupported
-            // records remain on the ordinary eager path; other layers still
-            // page through the same shared cache.
-            mfe_offload_cache.reset();
+        const auto down_name = expert_prefix + "down.weight";
+        if (mfe_offload_cache) {
+            for (const auto& name : {gate_name, up_name.value_or(gate_name), down_name}) {
+                if (!mfe_offload_cache->can_group_mfe(name)) {
+                    throw std::runtime_error(
+                        "Qwen4 expert cache cannot page " + name +
+                        "; refusing to bypass the configured cache budget");
+                }
+            }
         }
         std::optional<Qwen4RoutedWeight> gate_up;
         std::optional<Qwen4RoutedWeight> down;
@@ -507,13 +617,7 @@ public:
                 static_cast<int>(value.size() /
                     static_cast<std::size_t>(config_.hidden_size)),
                 static_cast<int>(config_.hidden_size)});
-        auto routing_projections = routing_projections_(source);
-        if (routing_projections.size() != 2) {
-            throw std::logic_error(
-                "Qwen4 MoE routing projection group output mismatch");
-        }
-        auto router_logits = std::move(routing_projections[0]);
-        auto shared_gate = std::move(routing_projections[1]);
+        auto router_logits = router_(source);
         if (detail::component_profile_active()) {
             detail::profile_eval("qwen4.moe.router", router_logits);
         }
@@ -526,6 +630,35 @@ public:
                 "qwen4.moe.topk",
                 std::vector<array>{routes.ids, routes.weights});
         }
+        if (source.shape(0) == 1 && config_.norm_topk_prob &&
+            gate_up_ && down_) {
+            const auto* gate_up = gate_up_->packed_weight_ref();
+            const auto* down = down_->packed_weight_ref();
+            const auto* shared_gate_up = shared_.nint_gate_up_pair_ref();
+            const auto* shared_down = shared_.nint_down_ref();
+            const auto* shared_gate_weight =
+                shared_gate_.dense_weight_ref();
+            if (gate_up != nullptr && down != nullptr &&
+                shared_gate_up != nullptr && shared_down != nullptr &&
+                shared_gate_weight != nullptr) {
+                if (auto fused = gate_up->decode_nint_shared(
+                        *down,
+                        *shared_gate_up,
+                        *shared_down,
+                        *shared_gate_weight,
+                        source,
+                        routes.ids,
+                        routes.weights)) {
+                    if (detail::component_profile_active()) {
+                        detail::profile_eval(
+                            "qwen4.moe.two_stage", *fused);
+                    }
+                    return mlx::core::reshape(
+                        std::move(*fused), value.shape());
+                }
+            }
+        }
+        auto shared_gate = shared_gate_(source);
         std::optional<array> inverse_route_order;
         bool pairs_are_sorted = false;
         bool routed_is_reduced = false;
@@ -635,7 +768,8 @@ public:
                     detail::profile_eval(
                         "qwen4.moe.routed_gate_up", intermediate);
                 }
-                const bool combine_routes = tokens <= 6;
+                const bool combine_routes = tokens <= 6 &&
+                    down.supports_fused_routed_reduce();
                 auto output = combine_routes
                     ? down.routed_matmul_reduce(
                           intermediate,
@@ -722,7 +856,11 @@ public:
                     "qwen4.moe.routed_gate_up",
                     intermediate);
             }
-            const bool combine_routes = tokens <= 6;
+            // If down has no fused reduction, leave the pairs for the
+            // reduce/shared-gate epilogue instead of separate reduction and
+            // shared-gate launches.
+            const bool combine_routes = tokens <= 6 &&
+                down_->supports_fused_routed_reduce();
             auto output = combine_routes
                 ? down_->routed_matmul_reduce(
                       intermediate,
@@ -735,6 +873,16 @@ public:
             }
             return output;
         }();
+        if (!detail::component_profile_active() &&
+            !routed_is_reduced && !pairs_are_sorted) {
+            return mlx::core::reshape(
+                shared_.moe_shared(
+                    source,
+                    pairs,
+                    routes.weights,
+                    shared_gate),
+                value.shape());
+        }
         auto shared = shared_(source);
         if (detail::component_profile_active()) {
             detail::profile_eval("qwen4.moe.shared", shared);
@@ -785,10 +933,6 @@ private:
           router_(std::move(router)),
           shared_(std::move(shared)),
           shared_gate_(std::move(shared_gate)),
-          routing_projections_(std::vector<const MlxLinear*>{
-              &router_,
-              &shared_gate_,
-          }),
           ssd_expert_cache_(std::move(ssd_expert_cache)),
           mfe_offload_cache_(std::move(mfe_offload_cache)),
           gate_name_(std::move(gate_name)),
@@ -822,7 +966,6 @@ private:
     MlxLinear router_;
     DenseFfn shared_;
     MlxLinear shared_gate_;
-    MlxProjectionBatch routing_projections_;
     std::shared_ptr<MlxMoeSsdExpertCache> ssd_expert_cache_;
     std::shared_ptr<MlxMfeOffloadCache> mfe_offload_cache_;
     std::string gate_name_;
@@ -1502,35 +1645,59 @@ public:
         auto value = std::move(qkv_parts.at(1));
         auto z = std::move(input_projections[1]);
         detail::profile_eval("qwen4.gdn.gate", z);
-        auto beta = mlx::core::reshape(
-            mlx::core::sigmoid(
-                mlx::core::astype(
-                    std::move(input_projections[3]),
-                    mlx::core::float32)),
-            Shape{
-                batch,
-                tokens,
+        const Shape gate_shape{
+            batch, tokens, static_cast<int>(config_.linear_num_value_heads)};
+        auto alpha = mlx::core::reshape(input_projections[2], gate_shape);
+        auto beta = mlx::core::reshape(input_projections[3], gate_shape);
+        const bool fused_decode =
+            gdn_decode_step_enabled() && use_cache && !rollback_ &&
+            batch == 1 && tokens == 1 &&
+            config_.linear_key_head_dim == 128 &&
+            config_.linear_value_head_dim == 128 &&
+            config_.linear_conv_kernel_dim == 4;
+        if (fused_decode) {
+            auto decoded = gated_delta_decode_step(
+                qk,
+                value,
+                z,
+                alpha,
+                beta,
+                *convolution_state_,
+                *recurrent_state_,
+                convolution_weight_,
+                dt_bias_,
+                decay_scale_,
+                output_norm_.weight(),
+                static_cast<int>(config_.linear_num_key_heads),
                 static_cast<int>(config_.linear_num_value_heads),
-            });
-        detail::profile_eval("qwen4.gdn.beta", beta);
-        auto alpha = mlx::core::reshape(
-            mlx::core::astype(
-                std::move(input_projections[2]),
-                mlx::core::float32),
-            beta.shape());
-        detail::profile_eval("qwen4.gdn.alpha", alpha);
-        auto gate_input = alpha + mlx::core::reshape(
+                static_cast<int>(config_.linear_value_head_dim),
+                1e-6f,
+                output_norm_.eps(),
+                config_.output_gate_silu);
+            detail::profile_eval(
+                "qwen4.gdn.decode_step",
+                {
+                    decoded.output,
+                    decoded.convolution_state,
+                    decoded.recurrent_state,
+                });
+            convolution_state_ = std::move(decoded.convolution_state);
+            recurrent_state_ = std::move(decoded.recurrent_state);
+            ++position_;
+            auto output = output_(
+                mlx::core::astype(decoded.output, hidden.dtype()));
+            detail::profile_eval("qwen4.gdn.output", output);
+            return output;
+        }
+        auto gates = gated_delta_gates(
+            alpha,
+            beta,
             dt_bias_,
-            Shape{1, 1, static_cast<int>(config_.linear_num_value_heads)});
-        auto softplus = mlx::core::maximum(gate_input, array(0.0f)) +
-            mlx::core::log1p(mlx::core::exp(-mlx::core::abs(gate_input)));
-        auto decay = -mlx::core::exp(a_log_) * array(1.0f);
-        decay = mlx::core::reshape(
-            decay,
-            Shape{1, 1, static_cast<int>(config_.linear_num_value_heads)}) *
-            softplus;
-        auto recurrent_gate = mlx::core::transpose(decay, {0, 2, 1});
-        auto recurrent_beta = mlx::core::transpose(beta, {0, 2, 1});
+            decay_scale_);
+        auto recurrent_gate = std::move(gates.gate);
+        auto recurrent_beta = std::move(gates.beta);
+        detail::profile_eval(
+            "qwen4.gdn.gates", {recurrent_gate, recurrent_beta});
         if (use_cache && rollback_ &&
             rollback_->position == position_ &&
             rollback_->total_tokens == tokens) {
@@ -1573,7 +1740,8 @@ public:
             convolved.value,
             recurrent_gate,
             recurrent_beta,
-            use_cache ? recurrent_state_ : std::nullopt);
+            use_cache ? recurrent_state_ : std::nullopt,
+            true);
         detail::profile_eval(
             "qwen4.gdn.recurrent",
             {recurrent.output, recurrent.state});
@@ -1626,7 +1794,8 @@ public:
             static_cast<int>(config_.linear_key_head_dim),
             static_cast<int>(config_.linear_value_head_dim),
             std::nullopt,
-            1e-6f);
+            1e-6f,
+            true);
         convolution_state_ = std::move(restored.convolution_state);
         recurrent_state_ = std::move(restored.recurrent_state);
         position_ = restored.position;
@@ -1659,7 +1828,7 @@ private:
           }),
           convolution_weight_(std::move(convolution_weight)),
           dt_bias_(std::move(dt_bias)),
-          a_log_(std::move(a_log)),
+          decay_scale_(-mlx::core::exp(a_log) * array(1.0f)),
           output_norm_(std::move(output_norm)),
           output_(std::move(output)) {}
 
@@ -1680,7 +1849,7 @@ private:
     MlxProjectionBatch input_projections_;
     array convolution_weight_;
     array dt_bias_;
-    array a_log_;
+    array decay_scale_;
     MlxRmsNorm output_norm_;
     MlxLinear output_;
     std::optional<array> convolution_state_;
@@ -1766,30 +1935,101 @@ public:
         auto query_full = std::move(input_projections[0]);
         auto key_full = std::move(input_projections[1]);
         auto value_full = std::move(input_projections[2]);
-        auto query_parts = mlx::core::split(
-            mlx::core::reshape(
-                query_full,
-                Shape{
-                    batch,
-                    tokens,
-                    static_cast<int>(config_.num_attention_heads),
-                    static_cast<int>(2 * config_.head_dim),
-                }),
-            2,
+        auto index_query_key = std::move(input_projections[3]);
+        auto index_parts = mlx::core::split(
+            index_query_key,
+            Shape{static_cast<int>(
+                config_.indexer_n_heads * config_.indexer_head_dim)},
             -1);
-        auto query = mlx::core::transpose(
-            query_norm_(query_parts.at(0)), {0, 2, 1, 3});
-        auto output_gate = std::move(query_parts.at(1));
-        auto key = mlx::core::transpose(
-            key_norm_(mlx::core::reshape(
-                key_full,
+        auto prologue = [&]() -> MlxQwen4QsaDecodePrologue {
+            if (qsa_decode_prologue_enabled() &&
+                batch == 1 && tokens == 1 &&
+                positions_current.dtype() == mlx::core::int32 &&
+                positions_current.shape() == Shape{1} &&
+                query_norm_.eps() == key_norm_.eps() &&
+                query_norm_.eps() == index_query_norm_.eps()) {
+                return qwen4_qsa_decode_prologue(
+                    query_full,
+                    key_full,
+                    index_query_key,
+                    query_norm_.weight(),
+                    key_norm_.weight(),
+                    index_query_norm_.weight(),
+                    positions_current,
+                    static_cast<int>(config_.num_attention_heads),
+                    static_cast<int>(config_.num_key_value_heads),
+                    static_cast<int>(config_.indexer_n_heads),
+                    static_cast<int>(config_.head_dim),
+                    static_cast<int>(config_.indexer_head_dim),
+                    static_cast<int>(config_.rotary_dim),
+                    static_cast<float>(config_.rope_theta),
+                    query_norm_.eps());
+            }
+            auto query_parts = mlx::core::split(
+                mlx::core::reshape(
+                    query_full,
+                    Shape{
+                        batch,
+                        tokens,
+                        static_cast<int>(config_.num_attention_heads),
+                        static_cast<int>(2 * config_.head_dim),
+                    }),
+                2,
+                -1);
+            auto query = mlx::core::transpose(
+                query_norm_(query_parts.at(0)), {0, 2, 1, 3});
+            auto key = mlx::core::transpose(
+                key_norm_(mlx::core::reshape(
+                    key_full,
+                    Shape{
+                        batch,
+                        tokens,
+                        static_cast<int>(config_.num_key_value_heads),
+                        static_cast<int>(config_.head_dim),
+                    })),
+                {0, 2, 1, 3});
+            query = apply_rope(
+                query,
+                positions_current,
+                static_cast<int>(config_.rotary_dim),
+                static_cast<float>(config_.rope_theta),
+                config_.rope_sections,
+                config_.mrope_interleaved);
+            key = apply_rope(
+                key,
+                positions_current,
+                static_cast<int>(config_.rotary_dim),
+                static_cast<float>(config_.rope_theta),
+                config_.rope_sections,
+                config_.mrope_interleaved);
+            auto index_query = index_query_norm_(mlx::core::reshape(
+                index_parts.at(0),
                 Shape{
                     batch,
                     tokens,
-                    static_cast<int>(config_.num_key_value_heads),
-                    static_cast<int>(config_.head_dim),
-                })),
-            {0, 2, 1, 3});
+                    static_cast<int>(config_.indexer_n_heads),
+                    static_cast<int>(config_.indexer_head_dim),
+                }));
+            index_query = mlx::core::transpose(
+                apply_rope(
+                    mlx::core::transpose(index_query, {0, 2, 1, 3}),
+                    positions_current,
+                    static_cast<int>(config_.rotary_dim),
+                    static_cast<float>(config_.rope_theta),
+                    config_.rope_sections,
+                    config_.mrope_interleaved),
+                {0, 2, 1, 3});
+            return {
+                std::move(query),
+                std::move(query_parts.at(1)),
+                std::move(key),
+                std::move(index_query),
+            };
+        }();
+        auto query = std::move(prologue.query);
+        auto output_gate = std::move(prologue.output_gate);
+        auto key = std::move(prologue.key);
+        auto index_query = std::move(prologue.index_query);
         auto value = mlx::core::transpose(
             mlx::core::reshape(
                 value_full,
@@ -1799,42 +2039,6 @@ public:
                     static_cast<int>(config_.num_key_value_heads),
                     static_cast<int>(config_.head_dim),
                 }),
-            {0, 2, 1, 3});
-        query = apply_rope(
-            query,
-            positions_current,
-            static_cast<int>(config_.rotary_dim),
-            static_cast<float>(config_.rope_theta),
-            config_.rope_sections,
-            config_.mrope_interleaved);
-        key = apply_rope(
-            key,
-            positions_current,
-            static_cast<int>(config_.rotary_dim),
-            static_cast<float>(config_.rope_theta),
-            config_.rope_sections,
-            config_.mrope_interleaved);
-        auto index_parts = mlx::core::split(
-            std::move(input_projections[3]),
-            Shape{static_cast<int>(
-                config_.indexer_n_heads * config_.indexer_head_dim)},
-            -1);
-        auto index_query = index_query_norm_(mlx::core::reshape(
-            index_parts.at(0),
-            Shape{
-                batch,
-                tokens,
-                static_cast<int>(config_.indexer_n_heads),
-                static_cast<int>(config_.indexer_head_dim),
-            }));
-        index_query = mlx::core::transpose(
-            apply_rope(
-                mlx::core::transpose(index_query, {0, 2, 1, 3}),
-                positions_current,
-                static_cast<int>(config_.rotary_dim),
-                static_cast<float>(config_.rope_theta),
-                config_.rope_sections,
-                config_.mrope_interleaved),
             {0, 2, 1, 3});
         auto raw_key = mlx::core::reshape(
             index_parts.at(1),
@@ -1898,7 +2102,7 @@ public:
                 tokens,
                 static_cast<int>(
                     config_.num_attention_heads * config_.head_dim),
-            });
+        });
         output_gate = mlx::core::reshape(output_gate, attended.shape());
         auto gated = mlx::core::astype(attended, mlx::core::float32) *
             mlx::core::sigmoid(
@@ -2257,11 +2461,10 @@ public:
             use_cache,
             speculative_confirmed);
         detail::profile_eval(attention_->profile_name(), branch);
-        hidden_streams = attention_gr_.post(branch, attention_values);
+        auto ffn_values = ffn_gr_.pre_after(branch, attention_values);
         detail::profile_eval(
             "qwen4.attention_mhc_post",
-            hidden_streams);
-        auto ffn_values = ffn_gr_.pre(hidden_streams);
+            ffn_values.residual);
         detail::profile_eval("qwen4.ffn_mhc_pre", ffn_values.branch);
         branch = moe_(ffn_values.branch, prefetched);
         detail::profile_eval("qwen4.moe", branch);
@@ -2811,6 +3014,9 @@ struct MlxQwen4CausalLm::Impl {
         auto full_positions = mlx::core::arange(
             0, start + tokens, 1, mlx::core::int32);
         const bool bounded_prefill = tokens > 1;
+        const bool dispatch_decode = tokens == 1 && decode_async_enabled() &&
+            !detail::component_profile_active();
+        const auto dispatch_interval = static_cast<std::size_t>(decode_async_interval());
         const auto rows = static_cast<std::size_t>(batch) *
             static_cast<std::size_t>(tokens);
         std::array<
@@ -2841,9 +3047,15 @@ struct MlxQwen4CausalLm::Impl {
                     routed_pipeline[index % 2] =
                         layers[index + 2].prefetch_routed(rows);
                 }
+            } else if (dispatch_decode &&
+                       (index < 6 || index % dispatch_interval == 0)) {
+                // Fill the GPU queue promptly, then amortize commit overhead
+                // over layer groups while keeping host/GPU work overlapped.
+                mlx::core::async_eval({streams});
             }
         }
         auto output_hidden = mixer.mix(streams);
+        detail::profile_eval("qwen4.final_mhc", output_hidden);
         if (last_token_only && tokens > 1) {
             output_hidden = mlx::core::slice(
                 output_hidden,
@@ -3021,7 +3233,6 @@ std::int32_t MlxQwen4CausalLm::generate(
         impl_->maximum - static_cast<int>(prompt.size()) + 1);
     const bool mtp_active =
         impl_->mtp.has_value() && sampling.enable_mtp &&
-        mfq_token_constraint_supports_speculation(token_constraint) &&
         limit > 1;
     impl_->last_mtp_stats = {
         impl_->mtp.has_value(), mtp_active, 0, 0, 0};
@@ -3059,13 +3270,14 @@ std::int32_t MlxQwen4CausalLm::generate(
         }
         return value;
     }();
+    // Include route synchronization, host paging and graph construction, not
+    // only evaluations wrapped by eval_with_timing().
+    const double wall_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - profile_started).count();
+    prefill_ms = wall_ms;
     if (profile_prefill) {
-        const double wall_ms =
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - profile_started)
-                .count();
         const double evaluated_ms = component_profile.evaluated_ms();
-        prefill_ms = wall_ms;
         std::cout
             << "component_profile model=qwen4 phase=prefill"
             << " tokens=" << prompt.size()
@@ -3278,7 +3490,7 @@ std::int32_t MlxQwen4CausalLm::generate(
         if (token < 0 || token >= vocab) {
             throw std::runtime_error("Qwen4 sampler returned an invalid token");
         }
-        if (token_constraint && token_constraint->allows &&
+        if (token_constraint &&
             !token_constraint->allows(token)) {
             auto adjusted = counts
                 ? sampler.apply_penalties(logits, *counts)
@@ -3300,7 +3512,7 @@ std::int32_t MlxQwen4CausalLm::generate(
                     "Qwen4 constrained sampler returned an invalid token");
             }
         }
-        if (token_constraint && token_constraint->accept) {
+        if (token_constraint) {
             token_constraint->accept(token);
         }
         const array token_ids(
@@ -3311,7 +3523,33 @@ std::int32_t MlxQwen4CausalLm::generate(
         ++generated;
         if (callback && !callback(token)) break;
         if (generated == limit) break;
+        const int decode_step = generated - 1;
+        const int profile_skip = detail::component_profile_skip_steps();
+        const bool profile_step = detail::component_profile_requested()
+            && decode_step >= profile_skip
+            && decode_step - profile_skip < detail::component_profile_steps();
+        detail::ComponentProfile decode_profile;
+        detail::ScopedComponentProfile decode_profile_scope(
+            profile_step ? &decode_profile : nullptr);
+        const auto decode_started = std::chrono::steady_clock::now();
         logits = mlx_last_token_logits(forward(token_ids, true), vocab);
+        if (profile_step) {
+            detail::profile_eval("qwen4.output", logits);
+            const double wall_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - decode_started).count();
+            const double evaluated_ms = decode_profile.evaluated_ms();
+            std::cout << "component_profile model=qwen4 phase=decode step="
+                      << decode_step << " wall_ms=" << wall_ms
+                      << " evaluated_ms=" << evaluated_ms
+                      << " unscoped_ms=" << std::max(0.0, wall_ms - evaluated_ms)
+                      << std::endl;
+            for (const auto& [name, timing] : decode_profile.timings()) {
+                std::cout << "component_cost model=qwen4 phase=decode step="
+                          << decode_step << " name=" << name
+                          << " ms=" << timing.elapsed_ms
+                          << " calls=" << timing.evaluations << std::endl;
+            }
+        }
     }
     return generated;
 }

@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 
 from mfq.formats.header import FileHeader
-from mfq.formats.io import open_mmap, save
+from mfq.formats.io import Float8E4M3Array, open_mmap, save
 from mfq.server.api import create_app
 from mfq.server.runtime.capabilities import capabilities_for_architecture
 from mfq.server.state.catalog import (
@@ -900,6 +900,55 @@ def test_native_hf_residency_excludes_independently_streamed_engram(
     assert automatic.moe_gpu_cache_gb == 86
     assert pool._estimated_load_bytes(artifact, automatic) == 96 << 30
     assert pool._estimated_load_bytes(artifact, full_resident) == 110 << 30
+
+
+def test_catalog_excludes_only_ple_table_payloads_from_resident_weights(tmp_path: Path) -> None:
+    model = tmp_path / "ple.mfq"
+    root = "model.block.0.position_embedding.ngram"
+    tensors = {
+        root + ".shard.0.weight": np.zeros((8, 16), dtype=np.uint8).view(Float8E4M3Array),
+        root + ".shard.12.weight": np.zeros((8, 16), dtype=np.uint8).view(Float8E4M3Array),
+        root + ".weight_scale": np.ones(1, dtype=np.float16),
+        root + ".head_offsets": np.zeros(4, dtype=np.int64),
+        "model.block.0.position_embedding.key.weight": np.zeros((16, 16), dtype=np.float16),
+        "model.block.0.mlp.experts.gate.weight": np.zeros((2, 8, 16), dtype=np.float16),
+    }
+    save(model, FileHeader(model_arch="qwen4_exp", num_tensors=len(tensors)), tensors)
+    artifact = ModelCatalog._inspect(tmp_path, model)
+    with open_mmap(model) as store:
+        ple_bytes = sum(store.records[root + f".shard.{i}.weight"].nbytes for i in (0, 12))
+        expert_bytes = store.records["model.block.0.mlp.experts.gate.weight"].nbytes
+    assert artifact.always_streamed_bytes == ple_bytes
+    assert artifact.routed_expert_bytes == expert_bytes
+
+
+@pytest.mark.parametrize("format", ["mfq", "hf"])
+def test_ple_residency_uses_remaining_budget_for_experts(tmp_path: Path, format: str) -> None:
+    artifact = DiscoveredModel(
+        resource=ModelArtifactResource(
+            id="6" * 32, name="ple", architecture="qwen4_exp", format=format,
+            shard_count=1, total_bytes=104 << 30, tensor_count=1, record_count=1,
+            complete=True, loadable=True, modified_at=datetime.now(timezone.utc),
+        ),
+        path=tmp_path / "ple.mfq", routed_expert_bytes=68 << 30,
+        always_streamed_bytes=30 << 30,
+    )
+    pool = RuntimePool(ModelCatalog([tmp_path]), tmp_path / "runtime",
+                       max_runtime_memory_bytes=100 << 30)
+    request = ModelLoadRequest(model="ple")
+    full = pool._apply_automatic_expert_residency(artifact, request)
+    assert full.moe_gpu_cache_gb in (None, 0)
+    assert pool._estimated_load_bytes(artifact, full) == 74 << 30
+    bounded = pool._apply_automatic_expert_residency(
+        artifact, request, memory_ceiling=60 << 30,
+    )
+    # Six GiB of dense weights, three GiB of headroom; no full PLE reservation.
+    assert bounded.moe_gpu_cache_gb == 51
+    assert pool._estimated_load_bytes(artifact, bounded) == 57 << 30
+    explicit = pool._apply_automatic_expert_residency(
+        artifact, request.model_copy(update={"moe_gpu_cache_gb": 20}),
+    )
+    assert explicit.moe_gpu_cache_gb == 20
 
 
 def test_catalog_loads_registered_external_mfq_files(tmp_path: Path) -> None:

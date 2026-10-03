@@ -1,4 +1,5 @@
 #include "mlx_mtp.h"
+#include "grammar_fixture.h"
 
 #include <array>
 #include <cmath>
@@ -10,31 +11,8 @@
 
 namespace {
 
-MfqTokenConstraintPtr alternating_constraint(int position = 0) {
-    auto state = std::make_shared<int>(position);
-    auto constraint = std::make_shared<MfqTokenConstraint>();
-    constraint->allows = [state](std::int64_t token) {
-        return token == (*state % 2);
-    };
-    constraint->apply = [state](float* logits, std::size_t count) {
-        const auto allowed = static_cast<std::size_t>(*state % 2);
-        for (std::size_t token = 0; token < count; ++token) {
-            if (token != allowed) {
-                logits[token] = -std::numeric_limits<float>::infinity();
-            }
-        }
-    };
-    constraint->accept = [state](std::int64_t token) {
-        if (token != (*state % 2)) {
-            throw std::runtime_error(
-                "alternating constraint accepted an invalid token");
-        }
-        ++*state;
-    };
-    constraint->clone = [state] {
-        return alternating_constraint(*state);
-    };
-    return constraint;
+MfqTokenConstraintPtr alternating_constraint() {
+    return mfq::metal::test::grammar_constraint(3, "root ::= \"a\" \"b\" root");
 }
 
 } // namespace
@@ -46,11 +24,17 @@ int main() {
     using mfq::metal::verify_stochastic_mtp_top_k_chain_device;
     try {
         {
-            auto incomplete = std::make_shared<MfqTokenConstraint>();
-            if (!mfq_token_constraint_supports_speculation({}) ||
-                !mfq_token_constraint_supports_speculation(
-                    alternating_constraint()) ||
-                mfq_token_constraint_supports_speculation(incomplete)) {
+            bool rejected = false;
+            try {
+                (void)std::make_shared<MfqTokenConstraint>(nullptr);
+            } catch (const std::invalid_argument&) {
+                rejected = true;
+            }
+            auto constraint = alternating_constraint();
+            auto cursor = constraint->clone();
+            cursor->accept(0);
+            if (!rejected || !constraint->allows(0) || constraint->allows(1) ||
+                cursor->allows(0) || !cursor->allows(1)) {
                 throw std::runtime_error(
                     "MTP token constraint capability mismatch");
             }

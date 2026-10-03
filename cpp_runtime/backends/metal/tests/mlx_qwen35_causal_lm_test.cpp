@@ -1,4 +1,5 @@
 #include "mlx_qwen35_causal_lm.h"
+#include "grammar_fixture.h"
 
 #include <algorithm>
 #include <cmath>
@@ -39,31 +40,8 @@ void require(bool condition, const std::string& message) {
     }
 }
 
-MfqTokenConstraintPtr alternating_constraint(int position = 0) {
-    auto state = std::make_shared<int>(position);
-    auto constraint = std::make_shared<MfqTokenConstraint>();
-    constraint->allows = [state](std::int64_t token) {
-        return token == (*state % 2);
-    };
-    constraint->apply = [state](float* logits, std::size_t count) {
-        const auto allowed = static_cast<std::size_t>(*state % 2);
-        for (std::size_t token = 0; token < count; ++token) {
-            if (token != allowed) {
-                logits[token] = -std::numeric_limits<float>::infinity();
-            }
-        }
-    };
-    constraint->accept = [state](std::int64_t token) {
-        if (token != (*state % 2)) {
-            throw std::runtime_error(
-                "alternating constraint accepted an invalid token");
-        }
-        ++*state;
-    };
-    constraint->clone = [state] {
-        return alternating_constraint(*state);
-    };
-    return constraint;
+MfqTokenConstraintPtr alternating_constraint() {
+    return mfq::metal::test::grammar_constraint(8, "root ::= \"a\" \"b\" root");
 }
 
 std::vector<float> patterned(

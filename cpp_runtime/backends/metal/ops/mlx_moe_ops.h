@@ -23,6 +23,17 @@ MlxMoeTopKResult moe_topk(
     float norm_floor = 1e-20f,
     float scale = 1.0f);
 
+// One-row dense MoE router GEMV. A SIMD group owns each expert row so the
+// small [experts, hidden] projection uses the whole GPU instead of the stock
+// narrow-output matmul schedule. FP16 and BF16 weights are supported.
+bool moe_dense_router_logits_supported(
+    const mlx::core::array& input,
+    const mlx::core::array& weight) noexcept;
+
+mlx::core::array moe_dense_router_logits(
+    const mlx::core::array& input,
+    const mlx::core::array& weight);
+
 // Small-M normalized top-6 sqrt-softplus router hot path. Compute up to 16
 // FP16/BF16 router rows and selection weights in one Metal dispatch.
 bool moe_dense_router_topk_supported(

@@ -1,4 +1,5 @@
 #include "mlx_nint.h"
+#include "mlx_moe_ops.h"
 
 #include <cmath>
 #include <algorithm>
@@ -975,6 +976,76 @@ void test_nint3_gs24_decode() {
     verify_nint_gs24_decode(3, 37, 111, true);
 }
 
+void test_nint_moe_shared_epilogue() {
+    using namespace mlx::core;
+    constexpr int output_size = 37;
+    constexpr int input_size = 111;
+    constexpr int routes = 3;
+    const auto fixture = make_nint_gs24_scaled_blob(
+        4, output_size, input_size);
+    const auto weight =
+        mfq::metal::MlxNintWeight::from_blob(fixture.blob);
+
+    for (const int rows : {1, 3, 6}) {
+        std::vector<float> input_values(
+            static_cast<std::size_t>(rows) * input_size);
+        std::vector<float> pair_values(
+            static_cast<std::size_t>(rows) * routes * output_size);
+        std::vector<float> route_values(
+            static_cast<std::size_t>(rows) * routes);
+        std::vector<float> gate_values(static_cast<std::size_t>(rows));
+        for (std::size_t index = 0; index < input_values.size(); ++index) {
+            input_values[index] = static_cast<float>(
+                static_cast<int>((index * 7 + rows) % 31) - 15) / 256.0f;
+        }
+        for (std::size_t index = 0; index < pair_values.size(); ++index) {
+            pair_values[index] = static_cast<float>(
+                static_cast<int>((index * 11 + rows) % 29) - 14) / 128.0f;
+        }
+        for (int row = 0; row < rows; ++row) {
+            route_values[static_cast<std::size_t>(row) * routes] = 0.5f;
+            route_values[static_cast<std::size_t>(row) * routes + 1] = 0.3f;
+            route_values[static_cast<std::size_t>(row) * routes + 2] = 0.2f;
+            gate_values[static_cast<std::size_t>(row)] =
+                static_cast<float>(row - 2) * 0.375f;
+        }
+        const auto input = astype(
+            array(input_values.begin(), Shape{rows, input_size}),
+            float16);
+        const auto pairs = astype(
+            array(
+                pair_values.begin(),
+                Shape{rows, routes, output_size}),
+            float16);
+        const auto route_weights = array(
+            route_values.begin(), Shape{rows, routes});
+        const auto gates = astype(
+            array(gate_values.begin(), Shape{rows, 1}),
+            bfloat16);
+        auto reference = astype(
+            mfq::metal::moe_weighted_reduce_shared_gate(
+                pairs,
+                route_weights,
+                weight.matmul(input),
+                gates),
+            float32);
+        auto fused = astype(
+            weight.matmul_moe_shared(
+                input,
+                pairs,
+                route_weights,
+                gates),
+            float32);
+        eval(reference, fused);
+        for (std::size_t index = 0; index < fused.size(); ++index) {
+            require_close(
+                fused.data<float>()[index],
+                reference.data<float>()[index],
+                0.0f);
+        }
+    }
+}
+
 void test_nint6_gs24_decode() {
     // Both dimensions have tails: K is not a multiple of GS24 and OUT is not
     // a multiple of the kernel's 16-row threadgroup tile.
@@ -1159,6 +1230,7 @@ void test_nint4_swiglu() {
 
 } // namespace
 
+
 int main() {
     try {
         using namespace mlx::core;
@@ -1311,6 +1383,7 @@ int main() {
         test_nint3_gs24_decode();
         test_nint4_gs24_decode();
         test_nint4_gs24_grouped_small_m();
+        test_nint_moe_shared_epilogue();
         test_nint6_gs24_decode();
         test_mixed_sub_bits_loads_into_existing_kernel();
         test_mixed_q_bits_inference();

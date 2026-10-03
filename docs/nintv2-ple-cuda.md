@@ -29,14 +29,14 @@ From the repository root on Linux with CUDA installed:
 
 ```sh
 cmake -S cpp_runtime -B build/cuda -DCMAKE_BUILD_TYPE=Release -DMFQ_BUILD_CPP_SERVER=ON -DMFQ_BUILD_METAL_RUNTIME=OFF -DMFQ_CUDA_ARCHITECTURES=native -DBUILD_TESTING=ON
-cmake --build build/cuda --target mfq-diagnostics mfq-nint-rows-cuda-test mfq-nint-rows-test -j 8
+cmake --build build/cuda --target mfq-decode mfq-nint-rows-cuda-test mfq-nint-rows-test -j 8
 ctest --test-dir build/cuda --output-on-failure -V -R '^mfq-nint-rows(-cuda)?-test$'
-MFQ_NINT_PLE_CUDA_DIAGNOSTICS="$PWD/build/cuda/mfq-diagnostics" python -m pytest -q tests/test_native_nint_ple.py
+MFQ_NINT_PLE_CUDA_DECODE="$PWD/build/cuda/mfq-decode" python -m pytest -q tests/test_native_nint_ple.py
 ```
 
 For multi-config Windows generators, add `--config Release` to the build,
-`-C Release` to CTest, and set `MFQ_NINT_PLE_CUDA_DIAGNOSTICS` to the actual
-`Release/mfq-diagnostics.exe` path using PowerShell's `$env:` syntax.
+`-C Release` to CTest, and set `MFQ_NINT_PLE_CUDA_DECODE` to the actual
+`Release/mfq-decode.exe` path using PowerShell's `$env:` syntax.
 
 The CUDA target checks all q1--q8/k1--k8 across legal nominal-k families,
 uniform packed storage, unaligned/tail rows, checkpoint boundaries, duplicate

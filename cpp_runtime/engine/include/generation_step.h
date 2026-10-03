@@ -26,6 +26,8 @@ template <class Release> struct ExecutionCleanup {
     }
     ~ExecutionCleanup() { try { finish(); } catch (...) {} }
 };
+template <class Release>
+ExecutionCleanup(std::exception_ptr&, Release) -> ExecutionCleanup<Release>;
 
 // Ops performs one device prefill/decode operation. Chunking, cancellation,
 // token acceptance and publication order are independent of tensor storage.

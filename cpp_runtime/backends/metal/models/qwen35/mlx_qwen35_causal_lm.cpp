@@ -1059,7 +1059,6 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
     }
     const bool mtp_candidate =
         mtp_.has_value() && sampling.enable_mtp &&
-        mfq_token_constraint_supports_speculation(token_constraint) &&
         max_tokens > 1;
     // MTP head state is not yet part of the persistent session snapshot.
     // Prefer a complete MTP prefill over restoring only the backbone, which
@@ -1574,7 +1573,7 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
             throw std::runtime_error(
                 "Qwen3.5 sampler returned an out-of-range token");
         }
-        if (token_constraint && token_constraint->allows &&
+        if (token_constraint &&
             !token_constraint->allows(token)) {
             auto adjusted = counts.has_value()
                 ? sampler.apply_penalties(logits, *counts)
@@ -1598,7 +1597,7 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
                     "Qwen3.5 constrained sampler returned an invalid token");
             }
         }
-        if (token_constraint && token_constraint->accept) {
+        if (token_constraint) {
             token_constraint->accept(token);
         }
 

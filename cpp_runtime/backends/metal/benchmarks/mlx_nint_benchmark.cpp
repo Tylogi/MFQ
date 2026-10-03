@@ -1,4 +1,5 @@
 #include "mfq_container.h"
+#include "mlx_moe_ops.h"
 #include "mlx_nint.h"
 #include "mlx_nint8_zero.h"
 
@@ -324,6 +325,106 @@ void benchmark_swiglu(
               << std::hex << output_hash(fused) << std::dec << '\n';
 }
 
+void benchmark_moe_shared(
+    MlxNintWeight weight,
+    int repetitions) {
+    constexpr int routes = 10;
+    constexpr int batch_size = 20;
+    require(
+        repetitions >= batch_size && repetitions % batch_size == 0,
+        "MoE shared repetitions must be a positive multiple of 20");
+    const int input_width = weight.input_size();
+    const int output_width = weight.output_size();
+    const auto source = make_input(1, input_width);
+    std::vector<float> pair_values(
+        static_cast<std::size_t>(routes) * output_width);
+    for (std::size_t index = 0; index < pair_values.size(); ++index) {
+        pair_values[index] = static_cast<float>(
+            static_cast<int>((index * 13 + 5) % 47) - 23) / 256.0f;
+    }
+    const auto pairs = mlx::core::astype(
+        array(pair_values.begin(), Shape{1, routes, output_width}),
+        mlx::core::float16);
+    std::vector<float> weight_values(routes);
+    float denominator = 0.0f;
+    for (int route = 0; route < routes; ++route) {
+        weight_values[static_cast<std::size_t>(route)] =
+            static_cast<float>(routes - route);
+        denominator += weight_values[static_cast<std::size_t>(route)];
+    }
+    for (auto& value : weight_values) value /= denominator;
+    const array route_weights(
+        weight_values.begin(), Shape{1, routes});
+    const auto gate = mlx::core::astype(
+        array({0.375f}, Shape{1, 1}),
+        mlx::core::bfloat16);
+
+    const auto fused = [&] {
+        return weight.matmul_moe_shared(
+            source, pairs, route_weights, gate);
+    };
+    const auto split = [&] {
+        return mfq::metal::moe_weighted_reduce_shared_gate(
+            pairs,
+            route_weights,
+            weight.matmul(source),
+            gate);
+    };
+    const auto run_batch = [&](bool use_fused) {
+        std::vector<array> outputs;
+        outputs.reserve(batch_size);
+        for (int index = 0; index < batch_size; ++index) {
+            outputs.push_back(use_fused ? fused() : split());
+        }
+        mlx::core::eval(outputs);
+        mlx::core::synchronize();
+        return outputs.back();
+    };
+    for (int warmup = 0; warmup < 4; ++warmup) {
+        (void)run_batch((warmup & 1) == 0);
+        (void)run_batch((warmup & 1) != 0);
+    }
+
+    double fused_total = 0.0;
+    double split_total = 0.0;
+    array fused_output = fused();
+    array split_output = split();
+    const int batches = repetitions / batch_size;
+    const auto timed = [&](bool use_fused) {
+        const auto started = Clock::now();
+        auto output = run_batch(use_fused);
+        const double elapsed = milliseconds_since(started);
+        return std::pair<array, double>(std::move(output), elapsed);
+    };
+    for (int batch = 0; batch < batches; ++batch) {
+        if ((batch & 1) == 0) {
+            auto [first, first_ms] = timed(true);
+            auto [second, second_ms] = timed(false);
+            fused_output = std::move(first);
+            split_output = std::move(second);
+            fused_total += first_ms;
+            split_total += second_ms;
+        } else {
+            auto [first, first_ms] = timed(false);
+            auto [second, second_ms] = timed(true);
+            split_output = std::move(first);
+            fused_output = std::move(second);
+            split_total += first_ms;
+            fused_total += second_ms;
+        }
+    }
+    const auto fused_hash = output_hash(fused_output);
+    const auto split_hash = output_hash(split_output);
+    require(fused_hash == split_hash, "MoE shared fused output changed");
+    const double fused_ms = fused_total / repetitions;
+    const double split_ms = split_total / repetitions;
+    std::cout << "fused_ms\tsplit_ms\tspeedup\thash\n"
+              << std::fixed << std::setprecision(6)
+              << fused_ms << '\t' << split_ms << '\t'
+              << split_ms / fused_ms << '\t'
+              << std::hex << fused_hash << std::dec << '\n';
+}
+
 void benchmark(
     const MfqContainer& model,
     const std::string& name,
@@ -442,6 +543,7 @@ int main(int argc, char** argv) {
             "usage: mfq-metal-nint-benchmark MODEL.mfq [REPETITIONS] "
             "[--rows ROWS] [TENSOR ...] | --synthetic-q8|"
             "--model-swiglu MODEL.mfq REPETITIONS GATE UP | "
+            "--model-moe-shared MODEL.mfq REPETITIONS DOWN | "
             "--synthetic-nint5 REPETITIONS ROWS OUTPUT INPUT | "
             "--synthetic-nint BITS GROUP_SIZE REPETITIONS ROWS "
                    "OUTPUT INPUT");
@@ -463,6 +565,22 @@ int main(int argc, char** argv) {
                 std::get<MlxNintWeight>(std::move(gate.weight)),
                 std::get<MlxNintWeight>(std::move(up.weight)),
                 3,
+                repetitions);
+            return 0;
+        }
+        if (std::string_view(argv[1]) == "--model-moe-shared") {
+            require(
+                argc == 5,
+                "usage: mfq-metal-nint-benchmark --model-moe-shared "
+                "MODEL.mfq REPETITIONS DOWN");
+            const MfqContainer model(argv[2]);
+            const int repetitions = std::stoi(argv[3]);
+            auto down = load_case(model, argv[4]);
+            require(
+                std::holds_alternative<MlxNintWeight>(down.weight),
+                "model MoE shared benchmark requires a NINT tensor");
+            benchmark_moe_shared(
+                std::get<MlxNintWeight>(std::move(down.weight)),
                 repetitions);
             return 0;
         }

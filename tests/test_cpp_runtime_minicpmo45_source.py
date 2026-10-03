@@ -328,7 +328,7 @@ def test_minicpmo45_native_servers_share_mfqd_vision_tensors():
     assert "mfq::cuda::sample_logits(" in DECODE
     assert "generate_multimodal(" in METAL_HEADER
     assert "MlxMiniCPMO45Runtime::generate_multimodal(" in METAL_GRAPH
-    assert "make_mlx_server_components(" in METAL_DECODE
+    assert "make_mlx_engine_components(" in METAL_DECODE
     assert "runtime_components.multimodal_generate" in METAL_DECODE
     assert "arguments.minicpmo_duplex" not in METAL_DECODE
     assert "std::optional<MlxMiniCPMO45Runtime>" in METAL_COMPONENTS

@@ -764,9 +764,31 @@ def test_qwen4_uses_the_shared_ssd_expert_cache() -> None:
 
 def test_qwen4_small_m_down_reduce_is_format_neutral() -> None:
     moe = QWEN4[QWEN4.index("class Qwen4Moe") :]
-    assert moe.count("const bool combine_routes = tokens <= 6;") == 2
+    assert moe.count("const bool combine_routes = tokens <= 6 &&") == 2
+    assert "down.supports_fused_routed_reduce()" in moe
+    assert "down_->supports_fused_routed_reduce()" in moe
     assert moe.count("routed_matmul_reduce(") >= 2
     assert "supports_mxfp4_blocks" not in moe
+
+
+def test_qwen4_requested_mfe_budget_never_falls_back_to_eager_layers() -> None:
+    moe = QWEN4[QWEN4.index("class Qwen4Moe") :]
+    moe = moe[: moe.index("array operator()")]
+    assert "mfe_offload_cache.reset()" not in moe
+    assert "refusing to bypass the configured cache budget" in moe
+    assert "can_group_mfe(name)" in moe
+
+
+def test_metal_residency_is_configured_before_model_allocation() -> None:
+    configure = DECODE_APP[DECODE_APP.index("void configure_mlx_metal()") :]
+    configure = configure[: configure.index("void self_test_metal()")]
+    assert 'info.at("max_recommended_working_set_size")' in configure
+    assert "mlx::core::set_wired_limit(limit)" in configure
+    assert "Metal memory residency unavailable" in configure
+    server = DECODE_APP[DECODE_APP.index("if (arguments.server)") :]
+    assert server.index("configure_mlx_metal();") < server.index(
+        "run_native_runtime(arguments, model)"
+    )
 
 
 def test_qwen4_nint_ple_uses_shared_row_decode_without_resident_weights() -> None:
@@ -805,7 +827,7 @@ def test_qwen4_qsa_caches_completed_index_blocks_incrementally() -> None:
 
 def test_native_runtime_prewarms_shared_ssd_arenas_on_load_and_reload() -> None:
     serving = DECODE_APP[
-        DECODE_APP.index("int run_loaded_runtime(") :
+        DECODE_APP.index("class LoadedMetalModel final") :
         DECODE_APP.index("int run_native_runtime(")
     ]
     assert "model.prewarm_ssd_expert_arena();" in serving

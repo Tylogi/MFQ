@@ -13,6 +13,25 @@ Copyright (c) 2026 Apple Inc.
 License: Apache License 2.0 (`LICENSE`)
 Source: https://github.com/jundot/omlx
 
+The Flash-Next grouped decode-submission policy is adapted from oMLX's
+Qwen4 eager dispatch in language.py at revision
+87460f4d50de79aef9b67e99e215c31f0a89b445, with MFQ-specific single-token and
+component-profiling guards.
+The singleton selected-block GQA gather/SDPA path follows
+contiguous_causal_gathered_qsa_decode in qsa_fast.py at the same revision;
+MFQ fuses K/V gathering and retains a validity mask for invalid block IDs.
+The single-token Gated DeltaNet step layout follows
+qwen4_decode_step_fused in qwen35_gdn_prework.py at revision
+107e271ad449e2a9a060ec9a76d0c1d42724a2e2; MFQ retains its FP32 recurrent
+state, transposed cache contract, and existing reduction order.
+Copyright 2025 oMLX contributors
+License: Apache License 2.0 (`LICENSE`)
+
+The upstream Qwen4 decode-step kernel carries an adaptation from mlx-serve.
+Copyright (c) 2026 David Dalcu
+License: MIT (`LICENSES/mlx-serve-MIT.txt`)
+Source: https://github.com/ddalcu/mlx-serve
+
 llama.cpp / GGML
 ----------------
 MFQ's GGUF reader, tokenizer, grammar, chat-template/Jinja implementation, and

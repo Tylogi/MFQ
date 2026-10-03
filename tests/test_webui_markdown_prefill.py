@@ -30,14 +30,18 @@ def test_prefill_speed_uses_cuda_events_per_bounded_model_chunk() -> None:
     assert "MfqPrefillCallback" not in SERVER_HEADER + RUNTIME
     assert "class PrefillCudaTimer" in RUNTIME
     assert "cudaEventRecord(started_, stream_)" in RUNTIME
-    prefill = RUNTIME.split("while (offset < full_ids.size(1)", 1)[1]
+    prefill = RUNTIME.split("double prefill(const mfq::engine::PrefillChunk &chunk)", 1)[1]
+    prefill = prefill.split("std::int64_t first_token()", 1)[0]
     assert prefill.index("PrefillCudaTimer timer") < prefill.index("auto ids =")
-    logits = prefill.index("auto logits = model.logits_from_hidden")
+    logits = prefill.index(".logits_from_hidden(")
     finished = prefill.index("cudaEventRecord(timer.finished_event()", logits)
     sampling = prefill.index("mfq::cuda::sample_logits(", logits)
     assert logits < finished < sampling
-    assert "elapsed += timer.elapsed_ms()" in prefill
-    assert "co_yield PrefillProgress" in prefill
+    assert "return timer.elapsed_ms()" in prefill
+    flow = (ROOT / "cpp_runtime/engine/include/generation_step.h").read_text()
+    assert "next_prefill_chunk(end, offset, chunk_size)" in flow
+    assert "elapsed += ops.prefill(chunk)" in flow
+    assert "co_yield PrefillProgress" in flow
     assert "inline SamplingOps::Tensor sample_logits(" in SAMPLING
     assert "sample_apply_penalties_cuda(" in SAMPLING
     assert "1000.0 * metrics.prefill_tokens / metrics.prefill_ms" in SERVER
