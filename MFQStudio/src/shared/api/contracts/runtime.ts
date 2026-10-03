@@ -135,6 +135,12 @@ export interface RuntimeStatus {
   [key: string]: unknown;
 }
 
+export interface RuntimeListener {
+  host: string;
+  port: number;
+  configurable: boolean;
+}
+
 export interface RuntimeModel {
   id: string;
   object?: string;
@@ -163,6 +169,7 @@ export interface RuntimeInstance {
   kv_bytes?: number | null;
   memory?: RuntimeMemoryResources | null;
   context_size?: number | null;
+  context_capacity?: number | null;
   started_at?: string | null;
   last_used_at?: string | null;
   idle_ttl_seconds?: number | null;

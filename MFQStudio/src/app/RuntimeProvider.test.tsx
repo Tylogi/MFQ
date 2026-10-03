@@ -29,6 +29,8 @@ function RuntimeFixture() {
       <button onClick={() => void runtime.reloadService()} type="button">Reconnect</button>
       <button onClick={() => void runtime.refreshRuntime()} type="button">Refresh</button>
       <button onClick={runtime.retryJobStreams} type="button">Retry stream</button>
+      <span data-testid="reloading">{JSON.stringify(runtime.reloadingInstances)}</span>
+      <button onClick={() => void runtime.reloadModelContext('instance-a', 8192)} type="button">Reload model</button>
     </>
   );
 }
@@ -61,6 +63,18 @@ describe('RuntimeProvider 故障状态', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }));
     await waitFor(() => expect(screen.getByTestId('ready').textContent).toBe('true'));
     expect(screen.getByTestId('refresh-error').textContent).toBe('');
+  });
+
+  it('点击立即请求 ctx 重载并持有状态直到服务完成', async () => {
+    let finish!: (status: RuntimeStatus) => void;
+    const reload = vi.spyOn(runtimeApi, 'reloadRuntime').mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+    render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
+    await waitFor(() => expect(screen.getByTestId('ready')).toHaveTextContent('true'));
+    fireEvent.click(screen.getByRole('button', { name: 'Reload model' }));
+    expect(reload).toHaveBeenCalledExactlyOnceWith(8192, 'instance-a');
+    expect(screen.getByTestId('reloading')).toHaveTextContent('"instance-a":8192');
+    await act(async () => { finish({ max_context: 8192 }); });
+    await waitFor(() => expect(screen.getByTestId('reloading')).toHaveTextContent('{}'));
   });
 
   it('刷新恢复不会清除任务流故障，任务收到事件后才恢复', async () => {

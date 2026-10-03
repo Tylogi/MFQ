@@ -7,6 +7,7 @@ import { Icon, TMPanel, ModelMonogram } from '../../app/display';
 import { formatNumber, formatDuration } from '../../app/formatters';
 import { STUDIO_PATHS } from '../../navigation';
 import { openAIEndpoint } from './endpoint';
+import { getApiBaseUrl } from '../../shared/api/client';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
 import { ModelLoadProgress } from '../models/ModelLoadProgress';
 
@@ -99,7 +100,7 @@ export function RuntimeHero() {
             {modelHeroStatus}
           </span>
         </div>
-        <p className="runtime-endpoint">{openAIEndpoint(studio?.service_url)}</p>
+        <p className="runtime-endpoint">{openAIEndpoint(studio?.service_url || getApiBaseUrl())}</p>
         <small>
           {runtime?.model
             ? `${runtime?.model_type || 'MFQ'} · ${formatNumber(runtime?.max_context)} ${tr('上下文', 'context')} · ${formatDuration(runtime?.uptime_seconds)}`

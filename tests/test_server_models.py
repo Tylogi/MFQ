@@ -2137,7 +2137,7 @@ def test_runtime_controls_target_the_requested_model_instance(tmp_path: Path) ->
                 )
 
             async def runtime_status(self) -> dict[str, object]:
-                return {"model": self.name, "active_requests": 0}
+                return {"model": self.name, "active_requests": 0, "context_capacity": 32768}
 
         _model(tmp_path / "first.mfq")
         _model(tmp_path / "second.mfq")
@@ -2167,6 +2167,7 @@ def test_runtime_controls_target_the_requested_model_instance(tmp_path: Path) ->
         pool = RuntimePool(catalog, tmp_path / "runtime", max_instances=2)
         pool._instances = {first.id: first, second.id: second}
         pool._last_instance_id = first.id
+        pool._load_requests["second"] = ModelLoadRequest(model="second", context_size=4096)
         service = ServerService(
             SessionStore(tmp_path / "mfq.server.sqlite3"),
             pool,
@@ -2211,6 +2212,16 @@ def test_runtime_controls_target_the_requested_model_instance(tmp_path: Path) ->
         assert second_backend.cache_clears == 1
         assert second_backend.cache_trims == [4096]
         assert second.context_size == 8192
+        listed = (await pool.instances()).data
+        assert len(listed) == 2
+        assert all(item.state == RuntimeInstanceState.READY for item in listed)
+        assert first.context_size == 4096
+        assert second.context_capacity == 32768
+        assert pool._load_requests["second"].context_size == 8192
+        with pytest.raises(BackendError) as over_capacity:
+            await pool.reload_runtime(65536, second.id)
+        assert over_capacity.value.code == "context_size_exceeded"
+        assert second_backend.reloads == [8192]
         with pytest.raises(BackendError) as missing:
             await pool.clear_runtime_cache(uuid4())
         assert missing.value.code == "runtime_instance_not_found"

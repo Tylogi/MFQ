@@ -139,7 +139,7 @@ it('历史推理默认折叠，流式推理默认展开且只显示当前会话'
 });
 
 it('默认生成限制为 4096，设置界面允许最高 65536', () => {
-  render(<SettingsPage tr={(_zh, en) => en} settingsDraft={{ ...DEFAULT_SETTINGS, inheritModelDefaults: false }} setSettingsDraft={vi.fn()} mtpAvailable={false} presetManager={null} contextSize={4096} setContextSize={vi.fn()} busy={false} hasStudio={false} actions={{ setModelDefaultInheritance: vi.fn(), applyPreset: vi.fn(), reloadRuntime: vi.fn(), exportStudioData: vi.fn(), importStudioData: vi.fn(), openServerPage: vi.fn(), resetSettingsDraft: vi.fn(), saveSettings: vi.fn() }} />);
+  render(<SettingsPage tr={(_zh, en) => en} settingsDraft={{ ...DEFAULT_SETTINGS, inheritModelDefaults: false }} setSettingsDraft={vi.fn()} mtpAvailable={false} presetManager={null} busy={false} hasStudio={false} actions={{ setModelDefaultInheritance: vi.fn(), applyPreset: vi.fn(), exportStudioData: vi.fn(), importStudioData: vi.fn(), openServerPage: vi.fn(), resetSettingsDraft: vi.fn(), saveSettings: vi.fn() }} />);
   const limit = screen.getAllByRole('spinbutton').find((input) => input.getAttribute('max') === '65536');
   expect(limit).toHaveValue(4096);
   expect(limit).toHaveAttribute('min', '1');

@@ -16,6 +16,7 @@ import { displayPrefillMetric, preferPositiveMetric } from './metrics';
 import { RuntimeHero } from './RuntimeHero';
 import { MemoryHierarchy } from './MemoryHierarchy';
 import { openAIEndpoint } from './endpoint';
+import { getApiBaseUrl } from '../../shared/api/client';
 import { toast } from '../../stores/toastStore';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
 
@@ -44,7 +45,7 @@ export function OverviewPage() {
   const last = runtime?.last_request;
   const lastPrefill = displayPrefillMetric(last);
   const lastTtftMs = preferPositiveMetric(last?.ttft_ms, last?.complete_prefill_ms);
-  const endpoint = openAIEndpoint(studio?.service_url);
+  const endpoint = openAIEndpoint(studio?.service_url || getApiBaseUrl());
   async function copyEndpoint() {
     try {
       await navigator.clipboard.writeText(endpoint);

@@ -114,6 +114,7 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         duplex_available: false,
       });
     if (path === '/api/v1/runtime/models') return json({ data: [{ id: model }] });
+    if (path === '/api/v1/runtime/listener') return json({ host: '127.0.0.1', port: 8090, configurable: true });
     if (path === '/api/v1/runtime/instances')
       return json({
         data: [

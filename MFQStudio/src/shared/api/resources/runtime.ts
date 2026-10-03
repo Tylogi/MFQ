@@ -2,6 +2,7 @@
 import type {
   RuntimeCapabilities,
   RuntimeStatus,
+  RuntimeListener,
   RuntimeModel,
   RuntimeInstance,
   RuntimeProfile,
@@ -13,6 +14,15 @@ import type {
 import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client';
 
 export const runtimeApi = {
+  runtimeListener(): Promise<RuntimeListener> {
+    return request('/api/v1/runtime/listener');
+  },
+
+  configureRuntimeListener(port: number): Promise<RuntimeListener> {
+    return request('/api/v1/runtime/listener', {
+      method: 'PUT', body: JSON.stringify({ port }),
+    });
+  },
   /** 读取指定实例或默认实例支持的推理能力。 */
   runtimeCapabilities(instanceId?: string | null): Promise<RuntimeCapabilities> {
     const suffix = instanceId ? `?instance_id=${encodeURIComponent(instanceId)}` : '';

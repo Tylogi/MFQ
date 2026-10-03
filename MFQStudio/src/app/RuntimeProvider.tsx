@@ -1,4 +1,3 @@
-/** 管理平台启动、共享推理实例与后台任务，不加载具体业务页面的数据。 */
 import {
   createContext,
   useCallback,
@@ -11,7 +10,7 @@ import {
 } from 'react';
 import { runtimeApi } from '../shared/api/resources/runtime';
 import { jobsApi } from '../shared/api/resources/jobs';
-import { setApiBaseUrl, setApiToken } from '../shared/api/client';
+import { browserServiceUrl, getApiToken, setApiBaseUrl, setApiToken } from '../shared/api/client';
 import type {
   JobResource,
   RuntimeStatus,
@@ -24,7 +23,6 @@ import type {
 import { studioStatus, studioCredential, startLocalStudio, type StudioStatus } from '../studio';
 import { isRuntimeReady, runtimeSelectionNames } from '../features/runtime/modelSelection';
 import { errorMessage } from './formatters';
-import { useSettings } from '../features/settings/SettingsProvider';
 import { useJobStore } from '../stores/jobStore';
 
 interface RuntimeContextValue {
@@ -36,15 +34,10 @@ interface RuntimeContextValue {
   voiceComponent: VoiceOutputComponentStatus | null;
   studio: StudioStatus | null;
   selectedModel: string;
-  /** 更新全局选中模型，随后刷新该实例能力；聊天模块负责派生会话。 */
   setSelectedModel: (model: string) => void;
-  /** 仅刷新跨页面共享的实例、模型、任务和能力；返回此次请求是否成功。 */
   refreshRuntime: (quiet?: boolean) => Promise<boolean>;
-  /** 将新建任务并入共享列表，自动为运行中的任务建立事件订阅。 */
   addJob: (job: JobResource) => void;
-  /** 重新读取平台地址与凭据，刷新运行时并返回是否重新连接成功。 */
   reloadService: () => Promise<boolean>;
-  /** 重新订阅断开的后台任务事件流。 */
   retryJobStreams: () => void;
   connectionRevision: number;
   ready: boolean;
@@ -52,17 +45,13 @@ interface RuntimeContextValue {
   connectionError: string | null;
   refreshError: string | null;
   jobStreamErrors: Record<string, string>;
+  reloadingInstances: Record<string, number>;
+  reloadModelContext: (instanceId: string, contextSize: number) => Promise<RuntimeStatus>;
 }
 
 const RuntimeContext = createContext<RuntimeContextValue | null>(null);
 
-/**
- * 为页面提供最小共享运行时，任务流跨路由存活，页面数据由各自模块维护。
- *
- * @param props 组件属性，包含子节点
- */
 export function RuntimeProvider({ children }: { children: ReactNode }) {
-  const { setContextSize } = useSettings();
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [models, setModels] = useState<RuntimeModel[]>([]);
   const [instances, setInstances] = useState<RuntimeInstance[]>([]);
@@ -77,6 +66,8 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [jobStreamErrors, setJobStreamErrors] = useState<Record<string, string>>({});
   const [connectionRevision, setConnectionRevision] = useState(0);
+  const [reloadingInstances, setReloadingInstances] = useState<Record<string, number>>({});
+  const reloads = useRef(new Set<string>());
   const mounted = useRef(false);
   const requestVersion = useRef(0);
   const initializationVersion = useRef(0);
@@ -133,6 +124,29 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const reloadModelContext = useCallback(async (instanceId: string, contextSize: number) => {
+    if (reloads.current.has(instanceId)) throw new Error('Model reload is already in progress');
+    reloads.current.add(instanceId);
+    setReloadingInstances((current) => ({ ...current, [instanceId]: contextSize }));
+    try {
+      const result = await runtimeApi.reloadRuntime(contextSize, instanceId);
+      if (mounted.current) {
+        setInstances((current) => current.map((item) => item.id === instanceId
+          ? { ...item, context_size: result.max_context ?? contextSize }
+          : item));
+      }
+      return result;
+    } finally {
+      await refreshRuntime(true);
+      reloads.current.delete(instanceId);
+      if (mounted.current) setReloadingInstances((current) => {
+        const next = { ...current };
+        delete next[instanceId];
+        return next;
+      });
+    }
+  }, [refreshRuntime]);
+
   const reloadService = useCallback(async () => {
     const version = ++initializationVersion.current;
     ++requestVersion.current;
@@ -150,9 +164,9 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
         await startLocalStudio();
         status = await studioStatus();
       }
-      const token = status ? await studioCredential() : '';
+      const token = status ? await studioCredential() : getApiToken();
       if (!mounted.current || version !== initializationVersion.current) return false;
-      setApiBaseUrl(status?.service_url ?? '');
+      setApiBaseUrl(status?.service_url ?? browserServiceUrl());
       setApiToken(token);
       setStudio(status);
       setSelectedModel('');
@@ -190,11 +204,6 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   }, [ready, selectedModel, refreshRuntime]);
 
   const activeJobIds = useJobStore((state) => state.activeJobIds.slice().sort().join(','));
-  useEffect(() => {
-    const capacity = Number(runtime?.max_context);
-    if (Number.isFinite(capacity) && capacity > 0) setContextSize(Math.floor(capacity));
-  }, [runtime?.max_context, setContextSize]);
-  /** 订阅活跃任务，并在各任务恢复传输后分别清除其故障。 */
   const retryJobStreams = useCallback(() => {
     if (!ready) return;
     useJobStore.getState().watchActiveJobs({
@@ -254,6 +263,8 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       connectionError,
       refreshError,
       jobStreamErrors,
+      reloadingInstances,
+      reloadModelContext,
     }),
     [
       runtime,
@@ -275,16 +286,13 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       connectionError,
       refreshError,
       jobStreamErrors,
+      reloadingInstances,
+      reloadModelContext,
     ],
   );
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;
 }
 
-/**
- * 读取平台与共享推理状态，并整合后台任务管理；必须位于 RuntimeProvider 内部。
- *
- * @returns 运行时上下文对象，包含平台就绪状态、模型实例列表与后台任务操作
- */
 export function useRuntime(): RuntimeContextValue {
   const value = useContext(RuntimeContext);
   if (!value) throw new Error('RuntimeProvider is missing');

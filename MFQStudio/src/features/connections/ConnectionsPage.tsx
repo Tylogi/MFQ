@@ -1,45 +1,63 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
-import { connectionsApi } from '../../shared/api/resources/connections';
 import { Icon, ScreenHeader, SectionLabel, SettingRow, TMPanel } from '../../app/display';
-import { errorMessage, formatBytes, formatNumber } from '../../app/formatters';
+import { errorMessage } from '../../app/formatters';
 import { STUDIO_PATHS } from '../../navigation';
 import {
   configureStudio,
+  isStudio,
   saveStudioCredential,
-  studioConfirm,
   studioCredential,
   type StudioConfig,
 } from '../../studio';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { runtimeModelNames } from '../runtime/modelSelection';
-import { modeTemplateSettings, type GenerationSettings } from '../settings/configuration';
+import { runtimeApi } from '../../shared/api/resources/runtime';
+import { getApiBaseUrl, setApiToken, setBrowserServiceUrl } from '../../shared/api/client';
 import { useSettings } from '../settings/SettingsProvider';
 import { ToolsRoutingPanel } from './ToolsRoutingPanel';
 import { MemorySettingsPanel } from './MemorySettingsPanel';
 import { toast } from '../../stores/toastStore';
 import { InferenceDefaultsPanel } from './InferenceDefaultsPanel';
 
+function browserConfig(): StudioConfig {
+  const address = getApiBaseUrl() || 'http://127.0.0.1:8090';
+  const url = new URL(address);
+  return {
+    mode: ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) ? 'local' : 'remote',
+    remote_url: address, local_service_port: Number(url.port) || 8090,
+  };
+}
+
 export function ConnectionsPage() {
-  const { settings, replaceSettings, tr, contextSize, setContextSize } = useSettings();
+  const { tr } = useSettings();
   const {
     runtime,
-    realtime,
     models,
     instances,
     selectedModel,
     setSelectedModel,
     studio,
     reloadService,
-    refreshRuntime,
   } = useRuntime();
   const navigate = useNavigate();
-  const [draft, setDraft] = useState<StudioConfig | null>(studio?.config ?? null);
+  const [draft, setDraft] = useState<StudioConfig>(() => studio?.config ?? browserConfig());
+  const [listeningPort, setListeningPort] = useState<number | null>(null);
   const [token, setToken] = useState('');
   const [credentialWritable, setCredentialWritable] = useState(false);
   const [busy, setBusy] = useState(false);
   useEffect(() => {
-    setDraft(studio?.config ?? null);
+    if (studio) setDraft(studio.config);
+    else {
+      let disposed = false;
+      void runtimeApi.runtimeListener().then((listener) => {
+        if (!disposed) {
+          setDraft((current) => ({ ...current, local_service_port: listener.port }));
+          setListeningPort(listener.port);
+        }
+      }).catch(() => {});
+      return () => { disposed = true; };
+    }
   }, [studio]);
   useEffect(() => {
     let disposed = false;
@@ -56,7 +74,7 @@ export function ConnectionsPage() {
       disposed = true;
     };
   }, []);
-  const active = Boolean(studio?.reachable);
+  const active = Boolean(studio?.reachable ?? runtime);
   const modelNames = runtimeModelNames(models, instances);
 
 
@@ -64,8 +82,37 @@ export function ConnectionsPage() {
     if (!draft || busy) return;
     setBusy(true);
     try {
-      await configureStudio(draft);
-      if (credentialWritable) await saveStudioCredential(token);
+      if (!Number.isInteger(draft.local_service_port) || draft.local_service_port < 1 || draft.local_service_port > 65535) {
+        throw new Error(tr('端口必须为 1–65535 的整数', 'Port must be an integer between 1 and 65535'));
+      }
+      if (isStudio()) {
+        if (studio?.config.mode === 'local' && draft.mode === 'local'
+            && studio.config.local_service_port !== draft.local_service_port) {
+          await runtimeApi.configureRuntimeListener(draft.local_service_port);
+        }
+        await configureStudio(draft);
+        if (credentialWritable) await saveStudioCredential(token);
+      } else {
+        let address = draft.remote_url.trim().replace(/\/+$/, '').replace(/\/v1$/, '');
+        if (draft.mode === 'local') {
+          if (browserConfig().mode === 'local') await runtimeApi.configureRuntimeListener(draft.local_service_port);
+          address = `http://127.0.0.1:${draft.local_service_port}`;
+        } else {
+          const parsed = new URL(address);
+          if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {
+            throw new Error(tr('请输入不含凭据的 HTTP 或 HTTPS 服务地址', 'Enter an HTTP or HTTPS service URL without credentials'));
+          }
+        }
+        setBrowserServiceUrl(address);
+        if (credentialWritable) setApiToken(token);
+        if (draft.mode === 'local' && window.location.port === String(listeningPort)
+            && listeningPort !== draft.local_service_port) {
+          const page = new URL(window.location.href);
+          page.port = String(draft.local_service_port);
+          window.location.assign(page.toString());
+          return;
+        }
+      }
       const reconnected = await reloadService();
       setCredentialWritable(false);
       if (reconnected) toast.success(tr('服务器设置已保存', 'Server settings saved'));
@@ -201,8 +248,8 @@ export function ConnectionsPage() {
                 <SettingRow
                   title={tr('API 密钥', 'API key')}
                   detail={tr(
-                    '凭据只保存在系统凭据库中。',
-                    'The credential is stored only in the system credential vault.',
+                    isStudio() ? '凭据只保存在系统凭据库中。' : '凭据仅保留在当前页面内存中。',
+                    isStudio() ? 'The credential is stored only in the system credential vault.' : 'The credential stays only in this page’s memory.',
                   )}
                   trailing={
                     <input

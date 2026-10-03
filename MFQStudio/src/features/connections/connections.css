@@ -58,6 +58,10 @@
 }
 .server-wide-input { width: min(32vw, 360px); }
 .server-number-input { width: 96px; text-align: right; }
+.model-context-heading { padding-top: 14px; color: var(--ink-soft); font-size: 11px; font-weight: 610; }
+.model-context-settings .setting-row > div:first-child { min-width: 0; }
+.model-context-settings .setting-row > div:first-child > strong { display: block; overflow-wrap: anywhere; }
+.model-context-settings .setting-row-trailing { flex-shrink: 0; }
 .server-managed-value { color: var(--muted); font-size: 11px; }
 .server-unit-value,
 .server-input-unit { display: flex; align-items: center; justify-content: flex-end; gap: 7px; }

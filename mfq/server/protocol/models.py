@@ -764,6 +764,7 @@ class RuntimeInstanceResource(ProtocolModel):
     kv_bytes: int | None = Field(default=None, ge=0)
     memory: RuntimeMemoryResources | None = None
     context_size: int | None = Field(default=None, ge=1)
+    context_capacity: int | None = Field(default=None, ge=1)
     started_at: AwareDatetime | None = None
     last_used_at: AwareDatetime | None = None
     idle_ttl_seconds: int | None = Field(default=None, ge=0)
@@ -1161,6 +1162,10 @@ class JobEventResource(ProtocolModel):
 
 class JobEventList(ProtocolModel):
     data: list[JobEventResource]
+
+
+class RuntimeListenerRequest(ProtocolModel):
+    port: int = Field(ge=1, le=65535)
 
 
 class RuntimeReloadRequest(ProtocolModel):

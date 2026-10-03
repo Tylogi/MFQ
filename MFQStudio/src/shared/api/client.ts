@@ -17,6 +17,16 @@ export class ApiError extends Error {
 
 let apiBaseUrl = '';
 let apiToken = '';
+const BROWSER_SERVICE_KEY = 'mfq.studio.service-url';
+
+export function browserServiceUrl(): string {
+  return localStorage.getItem(BROWSER_SERVICE_KEY) ?? '';
+}
+
+export function setBrowserServiceUrl(value: string): void {
+  if (value) localStorage.setItem(BROWSER_SERVICE_KEY, value);
+  else localStorage.removeItem(BROWSER_SERVICE_KEY);
+}
 
 /** 读取当前内存中的凭据，仅供请求层构造鉴权头。 */
 export function getApiToken(): string {

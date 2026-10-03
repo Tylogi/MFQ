@@ -115,6 +115,7 @@ class _Runtime(BaseModel):
     memory: RuntimeMemoryResources | None = None
     usage_refreshed_at: float = 0.0
     load_progress: float = 0.02
+    context_capacity: int | None = None
 
 
 class _RuntimeLoadContext:
@@ -923,6 +924,7 @@ class RuntimePool:
                     kv_bytes=item.kv_bytes,
                     memory=item.memory,
                     context_size=item.context_size,
+                    context_capacity=item.context_capacity,
                     started_at=item.started_at,
                     last_used_at=item.last_used_at,
                     idle_ttl_seconds=item.idle_ttl_seconds,
@@ -986,6 +988,7 @@ class RuntimePool:
                 kv_bytes=instance.kv_bytes,
                 memory=instance.memory,
                 context_size=instance.context_size,
+                context_capacity=instance.context_capacity,
                 started_at=instance.started_at,
                 last_used_at=instance.last_used_at,
                 idle_ttl_seconds=instance.idle_ttl_seconds,
@@ -1361,6 +1364,9 @@ class RuntimePool:
                         if isinstance(kv_value, (int, float)) and kv_value >= 0:
                             instance.kv_bytes = int(kv_value)
                         instance.memory = self._memory_resources(status, instance.memory)
+                        capacity = status.get("context_capacity")
+                        if isinstance(capacity, int) and capacity > 0:
+                            instance.context_capacity = capacity
             return status
 
     async def runtime_models(self) -> dict[str, Any]:
@@ -1499,11 +1505,18 @@ class RuntimePool:
         async with self._runtime_control_lease(instance_id) as (instance, backend):
             if backend is None:
                 raise BackendError("model_not_loaded", "no runtime is available")
+            if instance is not None and instance.context_capacity is not None and context_size > instance.context_capacity:
+                raise BackendError("context_size_exceeded", "context exceeds the model capacity", status_code=400)
             result = await backend.reload_runtime(context_size)
             if instance is not None:
                 async with self._lock:
                     if self._instances.get(instance.id) is instance:
-                        instance.context_size = context_size
+                        actual = result.get("max_context", context_size)
+                        instance.context_size = actual if isinstance(actual, int) and actual > 0 else context_size
+                        name = instance.artifact.resource.name
+                        request = self._load_requests.get(name)
+                        if request is not None:
+                            self._load_requests[name] = request.model_copy(update={"context_size": instance.context_size})
             return result
 
     async def clear_runtime_cache(
@@ -2742,6 +2755,9 @@ class RuntimePool:
                 instance.kv_bytes = kv_bytes
             if status is not None:
                 instance.memory = self._memory_resources(status, instance.memory)
+                capacity = status.get("context_capacity")
+                if isinstance(capacity, int) and capacity > 0:
+                    instance.context_capacity = capacity
 
     @staticmethod
     def _memory_resources(

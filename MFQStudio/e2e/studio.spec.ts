@@ -16,6 +16,75 @@ async function navigateClient(page: Page, path: string) {
   }, path);
 }
 
+test('每个模型独立修改 ctx，点击立即发送重载且不丢失另一个模型', async ({ page }, testInfo) => {
+  await mockStudioServer(page);
+  const instances = [
+    { id: 'flash', model: 'Qwen3.8-Flash-S4-L', state: 'ready', devices: ['metal'], active_sessions: 0,
+      queued_requests: 0, context_size: 32768, context_capacity: 131072,
+      memory: { resident_weight_bytes: 78.6 * 2 ** 30 } },
+    { id: 'dense', model: 'Qwen3.8-27B-S4-M', state: 'ready', devices: ['metal'], active_sessions: 0,
+      queued_requests: 0, context_size: 16384, context_capacity: 262144,
+      memory: { resident_weight_bytes: 17.7 * 2 ** 30 } },
+  ];
+  await page.route('**/api/v1/runtime/instances', (route) => route.fulfill({ json: { data: instances } }));
+  await page.route('**/api/v1/runtime/models', (route) => route.fulfill({ json: { data: instances.map((item) => ({ id: item.model })) } }));
+  await page.route(/\/api\/v1\/runtime\/status(?:\?.*)?$/, (route) => {
+    const id = new URL(route.request().url()).searchParams.get('instance_id');
+    const item = instances.find((entry) => entry.id === id) ?? instances[0];
+    return route.fulfill({ json: { instance_id: item.id, model: item.model,
+      runtime_state: 'ready', max_context: item.context_size, context_capacity: item.context_capacity } });
+  });
+  let complete!: () => void;
+  const pending = new Promise<void>((resolve) => { complete = resolve; });
+  const reloads: { instance_id: string; context_size: number }[] = [];
+  await page.route('**/api/v1/runtime/reload', async (route) => {
+    const body = route.request().postDataJSON();
+    reloads.push(body);
+    await pending;
+    const item = instances.find((entry) => entry.id === body.instance_id)!;
+    item.context_size = body.context_size;
+    await route.fulfill({ json: { model: item.model, max_context: item.context_size } });
+  });
+  const dialogs: string[] = [];
+  page.on('dialog', async (dialog) => { dialogs.push(dialog.message()); await dialog.dismiss(); });
+  await page.goto('/runtime');
+  const flash = page.getByRole('spinbutton', { name: 'Qwen3.8-Flash-S4-L maximum context' });
+  const dense = page.getByRole('spinbutton', { name: 'Qwen3.8-27B-S4-M maximum context' });
+  await expect(flash).toHaveValue('32768');
+  await expect(dense).toHaveValue('16384');
+  await flash.fill('8192');
+  await dense.fill('65536');
+  await page.getByRole('button', { name: 'Reload Qwen3.8-Flash-S4-L' }).click();
+  await expect.poll(() => reloads).toEqual([{ instance_id: 'flash', context_size: 8192 }]);
+  await expect(page.getByRole('button', { name: 'Reload Qwen3.8-Flash-S4-L' })).toHaveText('Reloading…');
+  await expect(page.getByRole('button', { name: 'Reload Qwen3.8-27B-S4-M' })).toBeEnabled();
+  await expect(page.getByText('Total model residency').locator('..').locator('..')).toContainText('96.3');
+  await page.screenshot({ path: testInfo.outputPath('per-model-context.png'), animations: 'disabled' });
+  complete();
+  await expect(page.getByRole('button', { name: 'Reload Qwen3.8-Flash-S4-L' })).toHaveText('Reload');
+  await expect(flash).toHaveValue('8192');
+  await expect(dense).toHaveValue('65536');
+  expect(dialogs).toEqual([]);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth)).toBe(false);
+});
+
+test('网页运行服务允许编辑端口，无效端口不发送更改', async ({ page }) => {
+  await mockStudioServer(page);
+  const updates: number[] = [];
+  await page.route('**/api/v1/runtime/listener', (route) => {
+    if (route.request().method() === 'PUT') updates.push(route.request().postDataJSON().port);
+    return route.fulfill({ json: { host: '127.0.0.1', port: 8090, configurable: true } });
+  });
+  await page.goto('/runtime');
+  const port = page.getByRole('spinbutton', { name: 'Port', exact: true });
+  await expect(port).toBeEnabled();
+  await expect(port).toHaveValue('8090');
+  await port.fill('65536');
+  await page.getByRole('button', { name: 'Save server settings' }).click();
+  await expect(page.getByText('Port must be an integer between 1 and 65535')).toBeVisible();
+  expect(updates).toEqual([]);
+});
+
 test('三家架构标识贯穿模型页面，保持描线、无边框和靠右布局', async ({ page }, testInfo) => {
   const state = await mockStudioServer(page);
   const models = [
