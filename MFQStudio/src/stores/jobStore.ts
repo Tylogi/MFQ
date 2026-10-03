@@ -102,6 +102,7 @@ export interface JobState {
 
 /** 模块内部持久保存的任务 SSE 控制器映射，按任务 ID 隔离。 */
 const activeStreams = new Map<string, AbortController>();
+const eventSequences = new Map<string, number>();
 
 /** 仅结束仍由当前控制器持有的任务流，避免旧清理函数影响重订阅。 */
 function stopOwnedStream(id: string, controller: AbortController): void {
@@ -116,7 +117,12 @@ export const useJobStore = create<JobState>()((set, get) => ({
   activeJobIds: [],
 
   setJobs: (jobs) => {
-    const nextJobs = jobs.map((job) => ({ ...job }));
+    if (!jobs.length) eventSequences.clear();
+    const current = new Map(get().jobs.map((job) => [job.id, job]));
+    const nextJobs = jobs.map((job) => {
+      const previous = current.get(job.id);
+      return { ...(previous && Date.parse(previous.updated_at) > Date.parse(job.updated_at) ? previous : job) };
+    });
     const activeJobIds = extractActiveJobIds(nextJobs);
     set({ jobs: nextJobs, activeJobIds });
   },
@@ -134,6 +140,7 @@ export const useJobStore = create<JobState>()((set, get) => ({
       let changed = false;
       const jobs = state.jobs.map((job) => {
         if (job.id !== id) return job;
+        if (patch.updated_at && Date.parse(job.updated_at) > Date.parse(patch.updated_at)) return job;
         changed = true;
         return { ...job, ...patch };
       });
@@ -167,6 +174,8 @@ export const useJobStore = create<JobState>()((set, get) => ({
         id,
         (event: JobEventResource) => {
           if (controller.signal.aborted || activeStreams.get(id) !== controller) return;
+          if (event.sequence <= (eventSequences.get(id) ?? 0)) return;
+          eventSequences.set(id, event.sequence);
           options?.onEvent?.();
           if (controller.signal.aborted || activeStreams.get(id) !== controller) return;
           const status =
@@ -181,11 +190,13 @@ export const useJobStore = create<JobState>()((set, get) => ({
           });
           if (status && TERMINAL_STATUSES.has(status)) {
             stop();
+            eventSequences.delete(id);
             const finishedJob = get().jobs.find((j) => j.id === id);
             if (finishedJob) options?.onTerminal?.(finishedJob);
           }
         },
         controller.signal,
+        eventSequences.get(id) ?? 0,
       )
       .then(() => {
         if (!controller.signal.aborted && activeStreams.get(id) === controller) {
@@ -205,6 +216,7 @@ export const useJobStore = create<JobState>()((set, get) => ({
 
   watchActiveJobs: (options) => {
     const currentActive = get().activeJobIds;
+    for (const id of eventSequences.keys()) if (!currentActive.includes(id)) eventSequences.delete(id);
     const ownedStreams = new Map<string, AbortController>();
     // 启动新增活跃任务的监听
     for (const id of currentActive) {

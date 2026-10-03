@@ -59,6 +59,8 @@ export interface HubModelVariant {
   precision?: string | null;
   files: string[];
   byte_size: number;
+  resident_weight_bytes?: number | null;
+  ssd_ple_bytes?: number | null;
   configuration: ModelConfigurationStatus;
 }
 
@@ -85,7 +87,7 @@ export interface HubSystemProfile {
 
 export interface HubModelInfo extends HubModelSummary {
   revision: string;
-  files: Array<{ name: string; byte_size: number; sha256?: string | null }>;
+  files: Array<{ name: string; byte_size: number; sha256?: string | null; weight_bytes?: number | null; ssd_ple_bytes?: number | null }>;
   tags: string[];
   license?: string | null;
   library?: string | null;
@@ -93,6 +95,8 @@ export interface HubModelInfo extends HubModelSummary {
   architectures: string[];
   modalities: string[];
   parameter_count?: number | null;
+  ple_parameter_count?: number | null;
+  published_at?: string | null;
   gated: boolean;
   runtime_compatible?: boolean | null;
   variants: HubModelVariant[];
@@ -127,6 +131,7 @@ export interface OfficialModelInfo {
   likes: number;
   updated_at?: string | null;
   variants: HubModelVariant[];
+  published_at?: string | null;
   configuration: ModelConfigurationStatus;
 }
 

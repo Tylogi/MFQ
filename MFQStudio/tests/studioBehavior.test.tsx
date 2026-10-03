@@ -122,11 +122,11 @@ describe('test_model_hub_accepts_repository_links_and_downloads_into_the_model_c
 describe('test_model_hub_renders_device_recommendation_grades（行为）', () => {
   it('只用图标显示内存压力档位，并明确不代表模型能力或质量', async () => {
     const grades = [
-      ['three_stars', 'recommended', '★★★', 'Low memory pressure: all precision tiers fit fully in memory', 'three-stars'],
-      ['two_stars', 'recommended', '★★', 'Moderate memory pressure: most precision tiers fit fully in memory', 'two-stars'],
-      ['one_star', 'recommended', '★', 'High memory pressure: only some precision tiers fit fully in memory', 'one-star'],
-      ['caution', 'warning', '▲', 'Memory near limit: the smallest tier is close to fitting fully', 'caution'],
-      ['not_recommended', 'warning', '✕', 'Insufficient memory: the smallest tier does not fit fully', 'not-recommended'],
+      ['three_stars', 'recommended', '★★★', 'Low weight pressure: all tier baselines fit the budget', 'three-stars'],
+      ['two_stars', 'recommended', '★★', 'Moderate weight pressure: most tier baselines fit the budget', 'two-stars'],
+      ['one_star', 'recommended', '★', 'High weight pressure: only some tier baselines fit the budget', 'one-star'],
+      ['caution', 'warning', '▲', 'Weight budget near limit: the smallest tier baseline nearly fits', 'caution'],
+      ['not_recommended', 'warning', '✕', 'Insufficient weight budget: the smallest tier baseline exceeds it', 'not-recommended'],
       ['unknown', 'unknown', '?', 'Memory pressure unknown', 'unknown'],
     ] as const;
     const source = {
@@ -191,9 +191,9 @@ describe('test_model_hub_renders_device_recommendation_grades（行为）', () =
       </MemoryRouter>,
     );
 
-    await screen.findAllByLabelText('Low memory pressure: all precision tiers fit fully in memory');
+    await screen.findAllByLabelText('Low weight pressure: all tier baselines fit the budget');
     expect(screen.getByText('Memory pressure')).toBeInTheDocument();
-    expect(screen.getByText("Reflects only how many precision tiers fit fully in this device's memory, not model capability or quality.")).toBeInTheDocument();
+    expect(screen.getByText('Based on resident weight baselines; KV cache and runtime overhead need additional memory.')).toBeInTheDocument();
     expect(screen.queryByText('3-star recommendation')).not.toBeInTheDocument();
     expect(screen.queryByText('2-star recommendation')).not.toBeInTheDocument();
     const tierPressure = screen.getByRole('progressbar', { name: 'Estimated share of runtime budget: 75.0%' });

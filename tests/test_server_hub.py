@@ -615,7 +615,7 @@ def test_streamable_official_model_uses_each_tiers_full_residency_size() -> None
     requirements = [
         variant.configuration.required_memory_bytes for variant in model.variants
     ]
-    expected = [max(size + 2 * gib, int(size * 1.08)) for size in sizes]
+    expected = list(sizes)
     assert requirements == expected
     assert len(set(requirements)) == 3
     assert 48 * gib not in requirements

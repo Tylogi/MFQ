@@ -113,4 +113,20 @@ describe('RuntimeProvider 故障状态', () => {
     }));
     await waitFor(() => expect(screen.getByTestId('stream-error').textContent).toBe(''));
   });
+
+  it.each(['model.load', 'download.modelscope'])('返回窗口后重新同步 %s 的进度并恢复断开的事件流', async (kind) => {
+    const job = { ...activeJob, kind, progress: 0.1, updated_at: '2026-10-03T00:00:00Z' } as JobResource;
+    vi.mocked(jobsApi.jobs).mockResolvedValue([job]);
+    const stream = vi.spyOn(jobsApi, 'streamJobEvents').mockImplementation(() => new Promise<void>(() => {}));
+    render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
+    await waitFor(() => expect(screen.getByTestId('ready')).toHaveTextContent('true'));
+    await waitFor(() => expect(stream).toHaveBeenCalledTimes(1));
+    vi.mocked(jobsApi.jobs).mockResolvedValue([{ ...job, progress: 0.7, updated_at: '2026-10-03T00:00:05Z' }]);
+    fireEvent(window, new Event('focus'));
+    await waitFor(() => expect(useJobStore.getState().jobs[0].progress).toBe(0.7));
+    await waitFor(() => expect(stream).toHaveBeenCalledTimes(2));
+    const calls = stream.mock.calls;
+    expect(calls[0][2].aborted).toBe(true);
+    expect(calls[1][2].aborted).toBe(false);
+  });
 });

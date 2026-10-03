@@ -1,8 +1,9 @@
-"""Model-hub discovery and the curated MFQ model catalog."""
+"""Model-hub discovery and the official Tylogi MFQ catalog."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import math
@@ -13,6 +14,7 @@ import ssl
 import tempfile
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote, unquote, urlparse
@@ -40,6 +42,7 @@ from mfq.server.runtime.host_memory import (
     total_physical_memory,
 )
 from mfq.server.services.hardware import hardware_identity
+from mfq.server.services.hub_metadata import read_mfq_metadata
 
 HubProvider = Literal["huggingface", "modelscope"]
 
@@ -51,7 +54,6 @@ _PRECISION_PATTERN = re.compile(
     r"(?:^|[-_.])((?:S|V|Q|NINT|NVQ)\d+(?:[-_][A-Za-z0-9]+)?)",
     re.IGNORECASE,
 )
-_GIB = 1 << 30
 _METADATA_TIMEOUT = 8.0
 _METADATA_DEADLINE = 12.0
 _OFFICIAL_CACHE_TTL = 900
@@ -325,7 +327,7 @@ def _configuration_status(
     supported: bool | None = True,
     unsupported_reason: str | None = None,
 ) -> ModelConfigurationStatus:
-    required = max(byte_size + 2 * _GIB, int(byte_size * 1.08)) if byte_size > 0 else None
+    required = byte_size if byte_size > 0 else None
     capacity = profile.runtime_memory_budget_bytes or profile.physical_memory_bytes
     reasons: list[str] = []
     if supported is False:
@@ -407,35 +409,35 @@ def _model_configuration_status(
         status: Literal["recommended", "warning", "unknown"] = "recommended"
         recommendation = "three_stars"
         reason = (
-            "All published precision tiers fit fully within the detected runtime memory "
+            "All published precision tiers' weight baselines fit within the detected runtime memory "
             "budget."
         )
     elif fit_count * 2 > total:
         status = "recommended"
         recommendation = "two_stars"
         reason = (
-            "More than half of the published precision tiers fit fully within the "
+            "More than half of the published precision tiers' weight baselines fit within the "
             "detected runtime memory budget."
         )
     elif fit_count > 0:
         status = "recommended"
         recommendation = "one_star"
         reason = (
-            "At most half of the published precision tiers fit fully within the detected "
+            "At most half of the published precision tiers' weight baselines fit within the detected "
             "runtime memory budget."
         )
     elif capacity * 10 >= smallest * 7:
         status = "warning"
         recommendation = "caution"
         reason = (
-            "The detected runtime memory budget covers at least 70% of the full-residency "
+            "The detected runtime memory budget covers at least 70% of the weight baseline "
             "requirement for the smallest published precision tier."
         )
     else:
         status = "warning"
         recommendation = "not_recommended"
         reason = (
-            "The detected runtime memory budget is below 70% of the full-residency "
+            "The detected runtime memory budget is below 70% of the weight baseline "
             "requirement for the smallest published precision tier."
         )
     return ModelConfigurationStatus(
@@ -495,6 +497,14 @@ def _model_variants(
             hf_files.append(item)
     for label, group in mfq_groups.items():
         size = sum(item.byte_size for item in group)
+        inspected = all(item.weight_bytes is not None and item.ssd_ple_bytes is not None for item in group)
+        weights = sum(item.weight_bytes or 0 for item in group) if inspected else None
+        ple = sum(item.ssd_ple_bytes or 0 for item in group) if inspected else None
+        configuration = _configuration_status(
+            weights if weights is not None else size, profile, supported=runtime_compatible,
+            unsupported_reason="This model architecture is not registered in MFQ.",
+        )
+        configuration.reasons.append('Tensor payload baseline; excludes streamed PLE, KV cache and runtime repacking.' if inspected else 'File-size estimate; tensor metadata is unavailable.')
         variants.append(
             HubModelVariant(
                 id=f"mfq:{label}",
@@ -503,12 +513,9 @@ def _model_variants(
                     precision=_precision_from_name(label),
                     files=sorted(item.name for item in group)[:256],
                     byte_size=size,
-                    configuration=_configuration_status(
-                        size,
-                        profile,
-                        supported=runtime_compatible,
-                        unsupported_reason="This model architecture is not registered in MFQ.",
-                    ),
+                    resident_weight_bytes=weights,
+                    ssd_ple_bytes=ple,
+                    configuration=configuration,
                 )
         )
     if hf_files:
@@ -658,10 +665,8 @@ class HubCatalog:
             pass
         finally:
             if temporary is not None:
-                try:
+                with contextlib.suppress(OSError):
                     temporary.unlink(missing_ok=True)
-                except OSError:
-                    pass
 
     async def aclose(self) -> None:
         self._closed = True
@@ -707,10 +712,58 @@ class HubCatalog:
         try:
             async with asyncio.timeout(_METADATA_DEADLINE):
                 if provider == "huggingface":
-                    return await self._info_huggingface(repo_id, revision, profile)
-                return await self._info_modelscope(repo_id, revision, profile)
+                    info = await self._info_huggingface(repo_id, revision, profile)
+                else:
+                    info = await self._info_modelscope(repo_id, revision, profile)
+                return await self._inspect_mfq_files(info, profile)
         except TimeoutError as error:
             raise HubError("Model repository metadata request timed out.") from error
+
+    @staticmethod
+    async def _inspect_mfq_files(info: HubModelInfo, profile: HubSystemProfile) -> HubModelInfo:
+        candidates = [(index, item) for index, item in enumerate(info.files) if item.name.lower().endswith('.mfq') and item.byte_size >= 64]
+        if not candidates:
+            return info
+        files = list(info.files)
+        configs = []
+        architectures = []
+        semaphore = asyncio.Semaphore(8)
+        endpoint = os.environ.get('HF_ENDPOINT', 'https://huggingface.co').rstrip('/') if info.provider == 'huggingface' else 'https://modelscope.cn'
+        async with _metadata_client(endpoint) as client:
+            async def inspect(index: int, item: HubModelFile) -> None:
+                url = f'{endpoint}/{info.repo_id}/resolve/{quote(info.revision, safe="")}/{quote(item.name, safe="/")}' if info.provider == 'huggingface' else f'{endpoint}/api/v1/models/{info.repo_id}/repo'
+                params = None if info.provider == 'huggingface' else {'Revision': info.revision, 'FilePath': item.name}
+                try:
+                    async with semaphore:
+                        metadata = await read_mfq_metadata(client, url, params, item.byte_size)
+                    files[index] = item.model_copy(update={'weight_bytes': metadata.weight_bytes, 'ssd_ple_bytes': metadata.ssd_ple_bytes})
+                    if metadata.config:
+                        configs.append(metadata.config)
+                    if metadata.architecture:
+                        architectures.append(metadata.architecture)
+                except (httpx.HTTPError, ValueError, UnicodeError):
+                    pass
+            try:
+                async with asyncio.timeout(6):
+                    await asyncio.gather(*(inspect(index, item) for index, item in candidates[:256]))
+            except TimeoutError:
+                pass
+        config = configs[0] if configs else {}
+        text = config.get('text_config', config)
+        ple_parameters = None
+        if isinstance(text, dict) and any(item.ssd_ple_bytes for item in files):
+            vocab, width, layers = text.get('ngram_vocab_size_base'), text.get('ple_embed_dim'), text.get('ple_layer_ids')
+            if isinstance(vocab, int) and vocab > 0 and isinstance(width, int) and width > 0 and isinstance(layers, list):
+                ple_parameters = vocab * width * len(layers)
+        declared = config.get('architectures') or architectures or info.architectures
+        if isinstance(declared, str):
+            declared = [declared]
+        return info.model_copy(update={
+            'files': files, 'architectures': list(dict.fromkeys(declared)),
+            'runtime_compatible': tensor_schema_for_config(config) is not None if config else info.runtime_compatible,
+            'ple_parameter_count': ple_parameters,
+            'variants': _model_variants(files, profile, runtime_compatible=tensor_schema_for_config(config) is not None if config else info.runtime_compatible),
+        })
 
     async def resolve(
         self,
@@ -735,6 +788,7 @@ class HubCatalog:
             self._refresh_task = asyncio.create_task(self._refresh_official_cache(profile))
             refreshing = True
         models = [self._official_model(spec, profile) for spec in self._official_specs()]
+        models.sort(key=lambda model: model.published_at or model.updated_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
         return OfficialModelList(system=profile, data=models, refreshing=refreshing)
 
     async def _refresh_official_cache(
@@ -823,13 +877,16 @@ class HubCatalog:
                 if source not in model.sources:
                     specs[key] = replace(model, sources=(*model.sources, source))
                 continue
-            info = self._official_cache.get((provider, repo_id))
+            info = self._official_cache.get((provider, repo_id)) or next((value for (_, repo), value in self._official_cache.items() if repo.casefold() == repo_id.casefold() and value is not None), None)
+            display_name = re.split(r'-(?:EWQ?|MFQ)(?:-|$)', name, maxsplit=1, flags=re.IGNORECASE)[0]
+            ple_label = f'约 {info.ple_parameter_count / 1e9:.1f}B 参数' if info and info.ple_parameter_count else '大规模'
+            flash_next = bool(info and any(architecture.lower().startswith(('qwen4', 'qwen3next')) for architecture in info.architectures) and 'flash-next' in display_name.casefold())
             specs[key] = _OfficialModelSpec(
-                id='tylogi-' + hashlib.sha256(key.encode()).hexdigest()[:16], name=re.sub(r'-MFQ$', '', name, flags=re.IGNORECASE),
-                family='Tylogi MFQ', architecture=info.architectures[0] if info and info.architectures else 'unknown',
-                description=info.description if info and info.description else 'Official MFQ model published by Tylogi.',
-                description_zh='Tylogi 发布的官方 MFQ 模型。', parameter_label=None, active_parameter_label=None,
-                modalities=tuple(info.modalities) if info and info.modalities else ('text',), capabilities=(), precision_options=(),
+                id='tylogi-' + hashlib.sha256(key.encode()).hexdigest()[:16], name=display_name,
+                family=display_name, architecture=info.architectures[0] if info and info.architectures else 'unknown',
+                description=(f'High-performance low-precision compact MoE model with approximately {info.ple_parameter_count / 1e9:.1f}B PLE parameters. PLE tables stream row-wise from SSD without full-table memory residency.' if flash_next and info.ple_parameter_count else info.description if info and info.description else 'Official MFQ model published by Tylogi.'),
+                description_zh=f'高性能、低精度的中小型 MoE 模型，带有{ple_label}的 PLE 表，可高效卸载至 SSD，按行读取且无需整表常驻内存。' if flash_next else 'Tylogi 发布的官方 MFQ 模型。', parameter_label=None, active_parameter_label=None,
+                modalities=tuple(info.modalities) if info and info.modalities else ('text',), capabilities=('MoE', 'PLE', 'SSD PLE streaming') if flash_next else (), precision_options=(),
                 license=info.license if info else None, sources=(source,),
             )
         return list(specs.values())
@@ -886,6 +943,7 @@ class HubCatalog:
             downloads=source_info.downloads if source_info else 0,
             likes=source_info.likes if source_info else 0,
             updated_at=source_info.updated_at if source_info else None,
+            published_at=source_info.published_at if source_info else None,
             variants=variants,
             configuration=configuration,
         )
@@ -979,6 +1037,7 @@ class HubCatalog:
                 likes=info.likes or 0,
                 total_bytes=sum(item.byte_size for item in files),
                 updated_at=info.last_modified,
+                published_at=info.created_at,
                 files=files,
                 tags=tags,
                 license=_optional_text(card.get("license"), limit=255),
@@ -1106,7 +1165,9 @@ class HubCatalog:
                 updated_at=(
                     model.get("last_modified") or model.get("updated_at")
                     or model.get("LastModified") or model.get("UpdatedAt")
+                    or model.get("LastUpdatedTime")
                 ),
+                published_at=model.get("CreatedTime") or model.get("created_at"),
                 files=files,
                 tags=tags,
                 license=_optional_text(license_name, limit=255),

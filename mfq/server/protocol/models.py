@@ -903,6 +903,8 @@ class HubModelFile(ProtocolModel):
     name: str = Field(min_length=1, max_length=1024)
     byte_size: int = Field(default=0, ge=0)
     sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    weight_bytes: int | None = Field(default=None, ge=0)
+    ssd_ple_bytes: int | None = Field(default=None, ge=0)
 
 
 class ModelConfigurationStatus(ProtocolModel):
@@ -927,6 +929,8 @@ class HubModelVariant(ProtocolModel):
     precision: str | None = Field(default=None, max_length=128)
     files: list[str] = Field(default_factory=list, max_length=256)
     byte_size: int = Field(default=0, ge=0)
+    resident_weight_bytes: int | None = Field(default=None, ge=0)
+    ssd_ple_bytes: int | None = Field(default=None, ge=0)
     configuration: ModelConfigurationStatus
 
 
@@ -961,6 +965,8 @@ class HubModelInfo(HubModelSummary):
     architectures: list[str] = Field(default_factory=list)
     modalities: list[str] = Field(default_factory=list)
     parameter_count: int | None = Field(default=None, ge=0)
+    ple_parameter_count: int | None = Field(default=None, ge=0)
+    published_at: AwareDatetime | None = None
     gated: bool = False
     runtime_compatible: bool | None = None
     variants: list[HubModelVariant] = Field(default_factory=list)
@@ -999,6 +1005,7 @@ class OfficialModelInfo(ProtocolModel):
     downloads: int = Field(default=0, ge=0)
     likes: int = Field(default=0, ge=0)
     updated_at: AwareDatetime | None = None
+    published_at: AwareDatetime | None = None
     variants: list[HubModelVariant] = Field(default_factory=list)
     configuration: ModelConfigurationStatus
 

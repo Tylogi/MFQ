@@ -80,8 +80,9 @@ export const jobsApi = {
     id: string,
     onEvent: (event: JobEventResource) => void,
     signal: AbortSignal,
+    after = 0,
   ): Promise<void> {
-    const response = await fetch(apiUrl(`/api/v1/jobs/${id}/events/stream`), {
+    const response = await fetch(apiUrl(`/api/v1/jobs/${id}/events/stream${after > 0 ? `?after=${after}` : ''}`), {
       headers: authorizedHeaders({ Accept: 'text/event-stream' }),
       signal,
     });

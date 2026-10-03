@@ -41,3 +41,9 @@ it('does not create a placeholder or logo for unknown models', () => {
   const { container } = render(<ModelVendorMark name="unknown" />);
   expect(container).toBeEmptyDOMElement();
 });
+
+it('uses the model basename when discovered architecture is unknown', () => {
+  expect(modelVendor('Tylogi/Qwen3.8-Flash-Next-EWQ-V1-MFQ', 'unknown')).toBe('qwen');
+  expect(modelVendor('DeepSeek-V4-MFQ', [' Unknown '])).toBe('deepseek');
+  expect(modelVendor('Qwen-custom', ['unknown', 'LlamaForCausalLM'])).toBeNull();
+});

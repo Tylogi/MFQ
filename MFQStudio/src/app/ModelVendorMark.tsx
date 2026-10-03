@@ -17,7 +17,7 @@ function architectureVendor(value: string): ModelVendor | null {
 }
 
 export function modelVendor(name?: string | null, architecture?: string | readonly string[] | null): ModelVendor | null {
-  const declared = (typeof architecture === 'string' ? [architecture] : architecture || []).filter((value) => value.trim());
+  const declared = (typeof architecture === 'string' ? [architecture] : architecture || []).filter((value) => value.trim() && value.trim().toLowerCase() !== 'unknown');
   if (declared.length) return declared.map(architectureVendor).find((vendor) => vendor !== null) || null;
   const basename = name?.split(/[\\/]/).pop()?.toLowerCase() || '';
   if (/^qwen(?:\d|[-_.]|$)/.test(basename)) return 'qwen';

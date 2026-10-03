@@ -1605,6 +1605,30 @@
               }
             ],
             "title": "Sha256"
+          },
+          "ssd_ple_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ssd Ple Bytes"
+          },
+          "weight_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Weight Bytes"
           }
         },
         "required": [
@@ -1726,6 +1750,18 @@
             ],
             "title": "Pipeline Tag"
           },
+          "ple_parameter_count": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ple Parameter Count"
+          },
           "provider": {
             "enum": [
               "huggingface",
@@ -1733,6 +1769,18 @@
             ],
             "title": "Provider",
             "type": "string"
+          },
+          "published_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Published At"
           },
           "repo_id": {
             "maxLength": 255,
@@ -1970,6 +2018,30 @@
               }
             ],
             "title": "Precision"
+          },
+          "resident_weight_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resident Weight Bytes"
+          },
+          "ssd_ple_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ssd Ple Bytes"
           }
         },
         "required": [
@@ -3696,6 +3768,18 @@
             },
             "title": "Precision Options",
             "type": "array"
+          },
+          "published_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Published At"
           },
           "revision": {
             "title": "Revision",

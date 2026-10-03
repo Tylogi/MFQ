@@ -238,6 +238,47 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     };
   }, [connectionRevision]);
 
+  useEffect(() => {
+    if (!ready) return;
+    let disposed = false;
+    let running = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const syncJobs = async () => {
+      if (running || disposed) return;
+      running = true;
+      clearTimeout(timer);
+      try {
+        const jobs = await jobsApi.jobs(100);
+        if (disposed) return;
+        const previous = useJobStore.getState().activeJobIds;
+        useJobStore.getState().setJobs(jobs);
+        retryJobStreams();
+        const active = useJobStore.getState().activeJobIds;
+        if (previous.slice().sort().join(',') !== active.slice().sort().join(',')) void refreshRuntime();
+      } catch {
+        if (!disposed) retryJobStreams();
+      } finally {
+        running = false;
+        if (!disposed) timer = setTimeout(() => void syncJobs(), useJobStore.getState().activeJobIds.length ? 1000 : 5000);
+      }
+    };
+    const resume = () => {
+      if (document.visibilityState === 'hidden') return;
+      useJobStore.getState().clearJobStreams();
+      void refreshRuntime();
+      void syncJobs();
+    };
+    timer = setTimeout(() => void syncJobs(), 1000);
+    window.addEventListener('focus', resume);
+    document.addEventListener('visibilitychange', resume);
+    return () => {
+      disposed = true;
+      clearTimeout(timer);
+      window.removeEventListener('focus', resume);
+      document.removeEventListener('visibilitychange', resume);
+    };
+  }, [ready, connectionRevision, refreshRuntime, retryJobStreams]);
+
   const addJob = useCallback(
     (job: JobResource) => useJobStore.getState().addJob(job),
     [],

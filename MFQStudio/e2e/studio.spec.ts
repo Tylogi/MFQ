@@ -398,6 +398,40 @@ test('加载条显示实际任务进度，部分缺失的资源明细保留已�
   await page.unrouteAll({ behavior: 'ignoreErrors' });
 });
 
+for (const kind of ['model.load', 'download.modelscope']) {
+  test(`${kind} 事件流中断后切页返回仍同步进度`, async ({ page }) => {
+    await mockStudioServer(page);
+    const loading = kind === 'model.load';
+    const job = { id: 'resume-job', kind, payload: loading ? { model: 'Loading Model' } : { repo_id: 'Tylogi/test-MFQ' },
+      progress: 0.25, status: 'running', cancel_requested: false,
+      created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' };
+    await page.route(/\/api\/v1\/jobs(?:\?.*)?$/, (route) => route.fulfill({ json: { data: [job] } }));
+    await page.route(/\/api\/v1\/jobs\/resume-job\/events\/stream(?:\?.*)?$/, (route) => route.fulfill({ status: 503, json: { error: 'stream offline' } }));
+    if (loading) {
+      await page.route('**/api/v1/runtime/instances', (route) => route.fulfill({ json: { data: [{
+        id: 'loading', model: 'Loading Model', state: 'loading', devices: ['metal'], active_sessions: 0, queued_requests: 0,
+      }] } }));
+      await page.route(/\/api\/v1\/runtime\/status(?:\?.*)?$/, (route) => route.fulfill({ json: {
+        runtime_state: 'loading', model: 'Loading Model', instance_id: 'loading',
+      } }));
+    }
+    const path = loading ? '/' : '/model-hub';
+    await page.goto(path);
+    if (!loading) await page.locator('.download-circle').click();
+    const progress = () => page.locator(loading ? '.runtime-hero progress' : '.download-queue-item progress');
+    await expect(progress()).toHaveAttribute('value', '0.25');
+    await navigateClient(page, '/chat');
+    job.progress = 0.75;
+    job.updated_at = '2026-01-01T00:00:05Z';
+    await navigateClient(page, path);
+    if (!loading) await page.locator('.download-circle').click();
+    await expect(progress()).toHaveAttribute('value', '0.75');
+    job.progress = 0.9;
+    job.updated_at = '2026-01-01T00:00:06Z';
+    await expect(progress()).toHaveAttribute('value', '0.9');
+  });
+}
+
 test('页面按需请求自己的资源，概览不预载其他业务列表', async ({ page }) => {
   const state = await mockStudioServer(page);
   const errors: string[] = [];
