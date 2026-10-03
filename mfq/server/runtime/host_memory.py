@@ -14,6 +14,25 @@ _HOST_INFO64_MAX_COUNT = 256
 _VM_STATS_MIN_COUNT = 4
 
 
+class _VmStatistics64(ctypes.Structure):
+    _fields_ = [
+        (name, ctypes.c_uint32)
+        for name in ("free", "active", "inactive", "wired")
+    ] + [
+        (name, ctypes.c_uint64)
+        for name in (
+            "zero_fill", "reactivations", "pageins", "pageouts", "faults",
+            "cow_faults", "lookups", "hits", "purges",
+        )
+    ] + [
+        (name, ctypes.c_uint32)
+        for name in ("purgeable", "speculative")
+    ] + [
+        (name, ctypes.c_uint64)
+        for name in ("decompressions", "compressions", "swapins", "swapouts")
+    ]
+
+
 @dataclass(frozen=True)
 class HostMemorySnapshot:
     """Stable leading counters from macOS ``vm_statistics64`` in bytes."""
@@ -23,6 +42,8 @@ class HostMemorySnapshot:
     active: int
     inactive: int
     wired: int
+    compression_bytes: int | None = None
+    swapout_bytes: int | None = None
 
     def reclaimable(self, *, active_ratio: float = 0.5) -> int:
         ratio = min(1.0, max(0.0, active_ratio))
@@ -103,7 +124,7 @@ def host_memory_snapshot() -> HostMemorySnapshot | None:
         return None
     libc, host, page_size = _MACH_HOST
     try:
-        stats = (ctypes.c_int * _HOST_INFO64_MAX_COUNT)()
+        stats = (ctypes.c_uint32 * _HOST_INFO64_MAX_COUNT)()
         count = ctypes.c_uint(_HOST_INFO64_MAX_COUNT)
         result = libc.host_statistics64(
             host,
@@ -116,12 +137,19 @@ def host_memory_snapshot() -> HostMemorySnapshot | None:
         total = total_physical_memory()
         if total is None:
             total = sum(max(0, int(stats[index])) for index in range(4)) * page_size
+        extended = (
+            _VmStatistics64.from_buffer(stats)
+            if count.value * ctypes.sizeof(ctypes.c_uint32) >= ctypes.sizeof(_VmStatistics64)
+            else None
+        )
         return HostMemorySnapshot(
             total=total,
             free=max(0, int(stats[0])) * page_size,
             active=max(0, int(stats[1])) * page_size,
             inactive=max(0, int(stats[2])) * page_size,
             wired=max(0, int(stats[3])) * page_size,
+            compression_bytes=int(extended.compressions) * page_size if extended is not None else None,
+            swapout_bytes=int(extended.swapouts) * page_size if extended is not None else None,
         )
     except (
         AttributeError,

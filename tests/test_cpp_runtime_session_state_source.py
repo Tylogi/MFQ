@@ -246,7 +246,8 @@ def test_qwen_hybrid_prefix_cache_uses_exact_recurrent_boundaries() -> None:
     qwen_codec = METAL_PAGED_CODEC_HEADER.split(
         "MlxPagedSessionCodec<MlxQwen35TextSessionState>", 1
     )[1]
-    assert 'name = "qwen35-hybrid-kv-v2"' in qwen_codec
+    assert 'name = "qwen35-hybrid-kv-v3"' in qwen_codec
+    assert "supports_tail_blocks = true" in qwen_codec
     assert "kRecurrentUnavailableLayer" in METAL_PAGED_CODEC
     assert "decodable_blocks" in METAL_PAGED_CODEC
     assert "normalize_stable_prefix_tokens" in METAL_DECODE

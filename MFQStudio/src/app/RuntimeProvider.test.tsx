@@ -29,6 +29,8 @@ function RuntimeFixture() {
       <button onClick={() => void runtime.reloadService()} type="button">Reconnect</button>
       <button onClick={() => void runtime.refreshRuntime()} type="button">Refresh</button>
       <button onClick={runtime.retryJobStreams} type="button">Retry stream</button>
+      <span data-testid="reloading">{JSON.stringify(runtime.reloadingInstances)}</span>
+      <button onClick={() => void runtime.reloadModelContext('instance-a', 8192)} type="button">Reload model</button>
     </>
   );
 }
@@ -61,6 +63,18 @@ describe('RuntimeProvider 故障状态', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }));
     await waitFor(() => expect(screen.getByTestId('ready').textContent).toBe('true'));
     expect(screen.getByTestId('refresh-error').textContent).toBe('');
+  });
+
+  it('点击立即请求 ctx 重载并持有状态直到服务完成', async () => {
+    let finish!: (status: RuntimeStatus) => void;
+    const reload = vi.spyOn(runtimeApi, 'reloadRuntime').mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+    render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
+    await waitFor(() => expect(screen.getByTestId('ready')).toHaveTextContent('true'));
+    fireEvent.click(screen.getByRole('button', { name: 'Reload model' }));
+    expect(reload).toHaveBeenCalledExactlyOnceWith(8192, 'instance-a');
+    expect(screen.getByTestId('reloading')).toHaveTextContent('"instance-a":8192');
+    await act(async () => { finish({ max_context: 8192 }); });
+    await waitFor(() => expect(screen.getByTestId('reloading')).toHaveTextContent('{}'));
   });
 
   it('刷新恢复不会清除任务流故障，任务收到事件后才恢复', async () => {
@@ -98,5 +112,21 @@ describe('RuntimeProvider 故障状态', () => {
       created_at: '2026-09-23T10:10:00Z',
     }));
     await waitFor(() => expect(screen.getByTestId('stream-error').textContent).toBe(''));
+  });
+
+  it.each(['model.load', 'download.modelscope'])('返回窗口后重新同步 %s 的进度并恢复断开的事件流', async (kind) => {
+    const job = { ...activeJob, kind, progress: 0.1, updated_at: '2026-10-03T00:00:00Z' } as JobResource;
+    vi.mocked(jobsApi.jobs).mockResolvedValue([job]);
+    const stream = vi.spyOn(jobsApi, 'streamJobEvents').mockImplementation(() => new Promise<void>(() => {}));
+    render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
+    await waitFor(() => expect(screen.getByTestId('ready')).toHaveTextContent('true'));
+    await waitFor(() => expect(stream).toHaveBeenCalledTimes(1));
+    vi.mocked(jobsApi.jobs).mockResolvedValue([{ ...job, progress: 0.7, updated_at: '2026-10-03T00:00:05Z' }]);
+    fireEvent(window, new Event('focus'));
+    await waitFor(() => expect(useJobStore.getState().jobs[0].progress).toBe(0.7));
+    await waitFor(() => expect(stream).toHaveBeenCalledTimes(2));
+    const calls = stream.mock.calls;
+    expect(calls[0][2].aborted).toBe(true);
+    expect(calls[1][2].aborted).toBe(false);
   });
 });

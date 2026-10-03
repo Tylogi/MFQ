@@ -1,13 +1,17 @@
-/** 聊天页头展示当前会话、模型和运行状态。 */
 import { useSettings } from '../../settings/SettingsProvider';
 import { useConversationSelector } from '../state/conversationStore';
 import { Icon } from '../../../app/display';
 import { formatNumber } from '../../../app/formatters';
 import type { ChatPageState } from '../hooks/useChatPageState';
+import { ModelVendorMark } from '../../../app/ModelVendorMark';
+import { useRef, useState } from 'react';
+import { Dialog } from '../../../shared/ui/Dialog';
+import { InferenceDefaultsPanel } from '../../connections/InferenceDefaultsPanel';
 
-/** 渲染会话标题、模型切换和清空入口。 */
 export function ChatPageHeader({ page }: { page: ChatPageState }) {
   const { tr } = useSettings();
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsTrigger = useRef<HTMLButtonElement>(null);
   const messages = useConversationSelector((state) => state.messages);
   const { active, activeId, chat, chatSessionsOpen, setChatSessionsOpen, selectModel } = page;
   const { conversation, inference, voice, busy, clearActiveConversation } = chat;
@@ -36,7 +40,7 @@ export function ChatPageHeader({ page }: { page: ChatPageState }) {
           {inference.availableModelNames.length > 1 ? (
             <select
               aria-label={tr('对话模型', 'Chat model')}
-              disabled={busy || conversation.transitioning}
+              disabled={conversation.transitioning}
               onChange={(event) => selectModel(event.target.value)}
               value={inference.selectedModel}
             >
@@ -56,6 +60,8 @@ export function ChatPageHeader({ page }: { page: ChatPageState }) {
             {tr('流式', 'streaming')}
           </small>
         </div>
+        <ModelVendorMark name={inference.selectedModel}
+          architecture={inference.selectedModel === inference.runtime?.model ? inference.runtime.model_capabilities?.architecture_family || inference.runtime.model_type : undefined} />
         <span className={'runtime-status-pill ' + (conversation.conversationReady ? 'running' : 'stopped')}>
           <i />
           {conversation.conversationReady
@@ -64,6 +70,13 @@ export function ChatPageHeader({ page }: { page: ChatPageState }) {
               ? tr('加载中', 'Loading')
               : tr('空闲', 'Idle')}
         </span>
+        <button
+          ref={settingsTrigger} aria-label={tr('对话设置', 'Chat settings')} className="chat-icon-button"
+          onClick={() => setSettingsOpen(true)} type="button"><Icon name="settings" size={16} /></button>
+        <Dialog open={settingsOpen} onOpenChange={setSettingsOpen} title={tr('对话设置', 'Chat settings')}
+          closeLabel={tr('关闭', 'Close')} className="chat-settings-dialog" returnFocusRef={settingsTrigger}>
+          <div className="server-page"><InferenceDefaultsPanel /></div>
+        </Dialog>
         <button
           aria-label={tr('清空对话', 'Clear conversation')}
           className="chat-icon-button"

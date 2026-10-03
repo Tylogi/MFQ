@@ -138,6 +138,7 @@ mfq_pyinstaller_args=(
   --collect-all av
   --collect-all fastapi
   --collect-all httpx
+  --collect-all socksio
   --collect-all PIL
   --collect-all pydantic
   --collect-all pypdf

@@ -99,7 +99,7 @@ def test_serve_exposes_public_host_and_port_options(tmp_path: Path) -> None:
     )
 
     assert defaults.host == "127.0.0.1"
-    assert defaults.port == 8090
+    assert defaults.port is None
     assert defaults.model is None
     assert defaults.running_executable is None
     assert defaults.data_dir == Path(".mfq")
@@ -518,11 +518,11 @@ def test_serve_starts_without_loading_an_initial_model(
         lambda _: (_ for _ in ()).throw(AssertionError("must not start a model runtime")),
     )
 
-    def run(app, **options):
-        captured["app"] = app
-        captured.update(options)
+    def run(server):
+        captured["app"] = server.config.app
+        captured.update(host=server.config.host, port=server.config.port, access_log=server.config.access_log)
 
-    monkeypatch.setattr("uvicorn.run", run)
+    monkeypatch.setattr("mfq.server.api.listener.RuntimeServer.run", run)
 
     assert _run(args) == 0
     assert captured["host"] == "127.0.0.1"

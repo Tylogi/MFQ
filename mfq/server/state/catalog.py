@@ -21,7 +21,7 @@ from mfq.architectures.tensor_schema import (
 )
 from mfq.formats.assets import is_asset_record
 from mfq.formats.io import open_mmap
-from mfq.formats.shards import matching_shard_paths, parse_shard_path
+from mfq.formats.shards import format_shard_path, matching_shard_paths, parse_shard_path
 from mfq.server.protocol.models import (
     ModelArtifactList,
     ModelArtifactResource,
@@ -304,14 +304,20 @@ class ModelCatalog:
     @staticmethod
     def _immediate_model_count(path: Path) -> int:
         try:
-            mfq_count = sum(
-                item.is_file() and item.suffix.casefold() == ".mfq" for item in path.iterdir()
-            )
+            mfq_models: set[Path] = set()
+            for item in path.iterdir():
+                if not item.is_file() or item.suffix.casefold() != ".mfq":
+                    continue
+                try:
+                    parsed = parse_shard_path(item)
+                except ValueError:
+                    parsed = None
+                mfq_models.add(parsed[0] if parsed else item)
             hf_count = int(ModelCatalog._is_hf_model_directory(path)) + sum(
                 item.is_dir() and ModelCatalog._is_hf_model_directory(item)
                 for item in path.iterdir()
             )
-            return mfq_count + hf_count
+            return len(mfq_models) + hf_count
         except OSError:
             return 0
 
@@ -688,13 +694,16 @@ class ModelCatalog:
                 )
         except Exception as error:
             stat = path.stat()
+            remaining = tuple(candidate for candidate in (format_shard_path(parsed[0], index, parsed[2]) for index in range(1, parsed[2] + 1)) if candidate.is_file()) if parsed is not None else (path,)
+            remaining_stats = tuple(item.stat() for item in remaining) or (stat,)
             identifier = hashlib.sha256(f"{relative}\0{stat.st_size}".encode()).hexdigest()[:32]
             resource = ModelArtifactResource(
                 id=identifier,
                 name=name,
                 architecture="unknown",
                 shard_count=parsed[2] if parsed is not None else 1,
-                total_bytes=stat.st_size,
+                missing_shards=max(0, parsed[2] - len(remaining)) if parsed else 0,
+                total_bytes=sum(item.st_size for item in remaining_stats),
                 tensor_count=0,
                 record_count=0,
                 complete=False,

@@ -31,7 +31,7 @@ beforeEach(() => {
   vi.mocked(useChat).mockReturnValue({
     busy: false,
     conversation: { selectSession, createSession },
-    inference: { setSelectedModel: vi.fn() },
+    inference: { setSelectedModel: vi.fn(), availableModelNames: ['model-a', 'model-b'] },
     messageActions: { saveEdit },
   } as unknown as ReturnType<typeof useChat>);
 });
@@ -50,4 +50,16 @@ it('移动端切换会话收起侧栏并清空旧编辑草稿', async () => {
   state.activeId = 'second';
   rerender();
   await waitFor(() => expect(result.current.editDraft).toBeNull());
+});
+
+it('生成期间允许选择另一个已载入模型，不选择未载入的资产', () => {
+  const chat = vi.mocked(useChat)();
+  vi.mocked(useChat).mockReturnValue({ ...chat, busy: true });
+  const { result } = renderHook(useChatPageState, {
+    wrapper: ({ children }) => <MemoryRouter>{children}</MemoryRouter>,
+  });
+  act(() => result.current.selectModel('model-b'));
+  expect(chat.inference.setSelectedModel).toHaveBeenCalledWith('model-b');
+  act(() => result.current.selectModel('unloaded-asset'));
+  expect(chat.inference.setSelectedModel).toHaveBeenCalledOnce();
 });

@@ -1,25 +1,15 @@
-/** 设置页面：展示推理草稿、采样参数、外观与数据导入导出操作。 */
 import type { Dispatch, ReactNode, SetStateAction } from 'react';
 import { SectionLabel, SettingRow, TMPanel } from '../../app/display';
 import { Switch } from '../../shared/ui/Switch';
 import type { GenerationSettings, PresetName, UiLanguage, UiTheme } from './configuration';
 
 export interface SettingsActions {
-  /** 切换模型默认值继承，并更新待应用草稿。 */
   setModelDefaultInheritance: (enabled: boolean) => void;
-  /** 将内置采样预设写入待应用草稿。 */
   applyPreset: (name: Exclude<PresetName, 'custom'>) => void;
-  /** 使用当前上下文容量重载模型。 */
-  reloadRuntime: () => Promise<void>;
-  /** 导出本地偏好、预设和会话数据。 */
   exportStudioData: () => void;
-  /** 导入备份数据并同步本地状态。 */
   importStudioData: (file: File) => Promise<void>;
-  /** 导航到服务器配置页。 */
   openServerPage: () => void;
-  /** 恢复草稿默认值，保留界面偏好。 */
   resetSettingsDraft: () => void;
-  /** 应用当前设置草稿。 */
   saveSettings: () => void;
 }
 interface SettingsPageProps {
@@ -28,18 +18,15 @@ interface SettingsPageProps {
   setSettingsDraft: Dispatch<SetStateAction<GenerationSettings>>;
   mtpAvailable: boolean;
   presetManager: ReactNode;
-  contextCapacity?: number;
-  contextSize: number;
-  setContextSize: Dispatch<SetStateAction<number>>;
+  contextControls?: ReactNode;
   busy: boolean;
   hasStudio: boolean;
   updateManager?: ReactNode;
   actions: SettingsActions;
 }
 
-/** 渲染可编辑设置草稿；保存、模型重载及数据操作由明确的业务回调执行。 */
-export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable, presetManager, contextCapacity, contextSize, setContextSize, busy, hasStudio, updateManager, actions }: SettingsPageProps) {
-  const { setModelDefaultInheritance, applyPreset, reloadRuntime, exportStudioData, importStudioData, openServerPage, resetSettingsDraft, saveSettings } = actions;
+export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable, presetManager, contextControls, busy, hasStudio, updateManager, actions }: SettingsPageProps) {
+  const { setModelDefaultInheritance, applyPreset, exportStudioData, importStudioData, openServerPage, resetSettingsDraft, saveSettings } = actions;
   return (
     <div className="settings-page">
       <SectionLabel title={tr("推理默认值", "Generation defaults")} />
@@ -127,12 +114,7 @@ export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable
         <div className="settings-page-section">
           <SectionLabel title={tr("上下文", "Context")} />
           <TMPanel className="settings-page-panel">
-            <SettingRow
-              title={tr("上下文窗口", "Context window")}
-              detail={tr("更改后需要重新加载当前模型。", "Changing this value requires reloading the current model.")}
-              trailing={<input className="settings-number-input settings-context-input" max={Number(contextCapacity) || 1048576} min={512} onChange={(event) => setContextSize(Number(event.target.value))} step={512} type="number" value={contextSize} />}
-            />
-            <div className="settings-panel-actions"><button className="secondary" disabled={busy} onClick={() => void reloadRuntime()} type="button">{tr("按此上下文重载模型", "Reload model with this context")}</button></div>
+            {contextControls}
           </TMPanel>
         </div>
 

@@ -216,6 +216,7 @@ def _run(args: argparse.Namespace) -> int:
     import uvicorn
 
     from mfq.server.api import create_app
+    from mfq.server.api.listener import RuntimeServer, saved_service_port
     from mfq.server.api.auth import ApiKeyManager
     from mfq.server.state.catalog import ModelCatalog
     from mfq.server.runtime.cluster import ClusterBackend
@@ -348,13 +349,14 @@ def _run(args: argparse.Namespace) -> int:
     api_keys = ApiKeyManager(store, client_api_key) if client_api_key else None
     if web_root is None:
         print("Web UI assets were not found; serving the API only")
-    uvicorn.run(
+    listener_settings = data_dir / "listener.json"
+    RuntimeServer(uvicorn.Config(
         create_app(service, web_root=web_root, api_keys=api_keys),
         host=args.host,
-        port=args.port,
+        port=args.port if args.port is not None else saved_service_port(listener_settings),
         log_level=args.log_level,
         access_log=args.access_log,
-    )
+    ), listener_settings).run()
     return 0
 
 
@@ -384,8 +386,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--port",
         type=_port,
-        default=8090,
-        help="public API bind port (default: 8090)",
+        default=None,
+        help="public API bind port (default: saved listener port or 8090)",
     )
     parser.add_argument("--context-size", type=_nonnegative_int, default=0)
     parser.add_argument("--prefill-chunk-size", type=_positive_int, default=2048)

@@ -305,6 +305,29 @@ int MlxQwen35MtpModule::cache_position() const noexcept {
     return layers_.empty() ? 0 : layers_.front().cache_position();
 }
 
+std::vector<MlxKvCacheSnapshot> MlxQwen35MtpModule::snapshot_cache(int position) const {
+    std::vector<MlxKvCacheSnapshot> result;
+    if (position == 0) return result;
+    for (const auto& layer : layers_) {
+        auto state = layer.snapshot_cache();
+        if (position > state.position) throw std::runtime_error("MTP snapshot position exceeds cache");
+        state.position = position;
+        state.key = mlx::core::slice(state.key, Shape{0, 0, 0, 0},
+            Shape{state.batch, state.heads, position, state.head_dimension});
+        state.value = mlx::core::slice(state.value, Shape{0, 0, 0, 0},
+            Shape{state.batch, state.heads, position, state.head_dimension});
+        result.push_back(std::move(state));
+    }
+    return result;
+}
+
+void MlxQwen35MtpModule::restore_cache(const std::vector<MlxKvCacheSnapshot>& state) {
+    if (state.empty()) { reset_cache(1); return; }
+    if (state.size() != layers_.size()) throw std::runtime_error("MTP snapshot layer count changed");
+    reset_cache(1);
+    for (std::size_t i = 0; i < layers_.size(); ++i) layers_[i].restore_cache(state[i]);
+}
+
 MlxQwen35CausalLm MlxQwen35CausalLm::load(
     const MfqContainer& model) {
     const auto graph = effective_model_graph(model);
@@ -784,6 +807,8 @@ void MlxQwen35CausalLm::reset_cache(int batch) {
     cache_position_ = 0;
     cache_batch_ = batch;
     stable_cache_tokens_.clear();
+    last_cache_hidden_.reset();
+    stable_mtp_ready_ = false;
     if (mtp_) {
         mtp_->reset_cache(batch);
     }
@@ -826,6 +851,8 @@ void MlxQwen35CausalLm::prepare_cache_for_prefill(
     cache_position_ = 0;
     cache_batch_ = batch;
     stable_cache_tokens_.clear();
+    last_cache_hidden_.reset();
+    stable_mtp_ready_ = false;
     if (mtp_) {
         mtp_->reset_cache(batch, initial_capacity);
         mtp_->materialize_cache();
@@ -851,6 +878,8 @@ void MlxQwen35CausalLm::clear_cache() noexcept {
     cache_position_ = 0;
     cache_batch_ = 0;
     stable_cache_tokens_.clear();
+    last_cache_hidden_.reset();
+    stable_mtp_ready_ = false;
     if (mtp_) {
         mtp_->clear_cache();
     }
@@ -858,7 +887,7 @@ void MlxQwen35CausalLm::clear_cache() noexcept {
 
 MlxQwen35TextSessionState
 MlxQwen35CausalLm::capture_text_session_state(
-    const std::vector<std::int64_t>& tokens) const {
+    const std::vector<std::int64_t>& tokens, bool detached) const {
     if (cache_batch_ != 1 || cache_position_ <= 0 ||
         static_cast<std::size_t>(cache_position_) != tokens.size() ||
         layers_.empty()) {
@@ -873,11 +902,21 @@ MlxQwen35CausalLm::capture_text_session_state(
     for (const auto& layer : layers_) {
         std::visit(
             [&](const auto& block) {
-                auto snapshot = block.snapshot_cache();
+                auto snapshot = [&] {
+                    if constexpr (std::is_same_v<std::decay_t<decltype(block)>,
+                        MlxQwen35FullAttentionBlock>) return block.snapshot_cache(detached);
+                    else return block.snapshot_cache();
+                }();
                 state.bytes += snapshot.nbytes();
                 state.layers.emplace_back(std::move(snapshot));
             },
             layer);
+    }
+    if (mtp_ && last_cache_hidden_ && mtp_->cache_position() >= cache_position_ - 1) {
+        state.mtp_layers = mtp_->snapshot_cache(cache_position_ - 1);
+        state.last_hidden = last_cache_hidden_;
+        state.bytes += state.last_hidden->nbytes();
+        for (const auto& layer : state.mtp_layers) state.bytes += layer.nbytes();
     }
     return state;
 }
@@ -923,8 +962,11 @@ void MlxQwen35CausalLm::restore_text_session_state(
         cache_batch_ = state.cache_batch;
         stable_cache_tokens_ = state.tokens;
         if (mtp_) {
-            mtp_->clear_cache();
+            mtp_->restore_cache(state.mtp_layers);
         }
+        last_cache_hidden_ = state.last_hidden;
+        stable_mtp_ready_ = state.last_hidden.has_value() &&
+            (state.cache_position == 1 || !state.mtp_layers.empty());
     } catch (...) {
         clear_cache();
         throw;
@@ -952,7 +994,8 @@ std::int32_t MlxQwen35CausalLm::generate(
         prefill_callback,
     const MfqTokenConstraintPtr& token_constraint,
     std::optional<std::size_t> stable_prefix_tokens,
-    int prefill_chunk_size) {
+    int prefill_chunk_size,
+    const MlxPrefixCacheHooks& prefix_cache) {
     MlxPreparedPrompt prepared;
     prepared.token_ids = prompt;
     return generate_prepared_impl(
@@ -963,7 +1006,8 @@ std::int32_t MlxQwen35CausalLm::generate(
         prefill_callback,
         token_constraint,
         stable_prefix_tokens,
-        prefill_chunk_size);
+        prefill_chunk_size,
+        prefix_cache);
 }
 
 std::int32_t MlxQwen35CausalLm::generate_prepared(
@@ -993,7 +1037,8 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
     const std::function<void(std::size_t, double)>& prefill_callback,
     const MfqTokenConstraintPtr& token_constraint,
     std::optional<std::size_t> stable_prefix_tokens,
-    int prefill_chunk_size) {
+    int prefill_chunk_size,
+    const MlxPrefixCacheHooks& prefix_cache) {
     const auto& prompt = prepared.token_ids;
     if (prompt.empty()) {
         throw std::invalid_argument(
@@ -1060,15 +1105,12 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
     const bool mtp_candidate =
         mtp_.has_value() && sampling.enable_mtp &&
         max_tokens > 1;
-    // MTP head state is not yet part of the persistent session snapshot.
-    // Prefer a complete MTP prefill over restoring only the backbone, which
-    // would leave the proposal head with an invalid history.
     const std::size_t stable_count =
-        !prepared.transformed() && !mtp_candidate && stable_prefix_tokens
+        !prepared.transformed() && (!mtp_candidate || prefix_cache) && stable_prefix_tokens
         ? std::min(*stable_prefix_tokens, prompt.size())
         : 0;
     std::size_t reused_tokens = 0;
-    if (stable_count > 0 && cache_batch_ == 1 &&
+    if (stable_count > 0 && (!mtp_candidate || stable_mtp_ready_) && cache_batch_ == 1 &&
         cache_position_ == static_cast<int>(stable_cache_tokens_.size()) &&
         !stable_cache_tokens_.empty() &&
         stable_cache_tokens_.size() <= stable_count &&
@@ -1085,8 +1127,7 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
     }
     const bool mtp_active =
         mtp_candidate &&
-        stable_count == 0 &&
-        reused_tokens == 0 &&
+        (prefix_cache || (stable_count == 0 && reused_tokens == 0)) &&
         max_tokens > 1;
     last_mtp_stats_ = {
         mtp_.has_value(),
@@ -1202,25 +1243,41 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
                 }
                 return result.first;
             };
+            if (prefix_cache && !prepared.transformed()) {
+                auto value = run(true);
+                if (mtp_active) {
+                    mlx_prime_mtp_chunk(*prefill_hidden, ids, last_cache_hidden_,
+                        [&](const array& rows, const array& shifted, int) {
+                            return mtp_->forward(rows, shifted, embedding_, true);
+                        }, static_cast<int>(begin));
+                    stable_mtp_ready_ = true;
+                } else {
+                    last_cache_hidden_ = mlx::core::slice(*prefill_hidden,
+                        Shape{0, prefill_hidden->shape(1) - 1, 0},
+                        Shape{1, prefill_hidden->shape(1), static_cast<int>(config_.hidden_size)});
+                }
+                prefix_cache.checkpoint(end);
+                return value;
+            }
             if (mtp_active && begin == 0 && end == prompt.size()) {
                 return run(true);
             }
             return run(false);
         };
         const auto prefill_range = [&](std::size_t begin, std::size_t end) {
-            if (mtp_active) {
+            if (mtp_active && !prefix_cache) {
                 return forward_range(begin, end);
             }
             std::optional<array> last;
-            for (std::size_t offset = begin; offset < end;
-                 offset += static_cast<std::size_t>(prefill_chunk_size)) {
-                const auto stop = std::min(
+            for (std::size_t offset = begin; offset < end;) {
+                const auto stop = prefix_cache.prefill_end(offset, std::min(
                     end,
-                    offset + static_cast<std::size_t>(prefill_chunk_size));
+                    offset + static_cast<std::size_t>(prefill_chunk_size)));
                 last = forward_range(offset, stop);
                 if (stop < end) {
                     materialize_prefill_state();
                 }
+                offset = stop;
             }
             if (!last) {
                 throw std::runtime_error(
@@ -1230,6 +1287,7 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
         };
         std::optional<array> stable_logits;
         array value = [&]() {
+            if (prefix_cache) return prefill_range(reused_tokens, prompt.size());
             if (stable_count == 0) {
                 return prefill_range(0, prompt.size());
             }
@@ -1370,7 +1428,7 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
 
         // Prime the predictor cache from teacher-forced prompt pairs. The
         // final prompt hidden row is reserved for the first live proposal.
-        if (prompt_count > 1) {
+        if (prompt_count > 1 && !prefix_cache) {
             mlx_prime_mtp_history(
                 *prefill_hidden,
                 prompt_ids,
@@ -1408,20 +1466,54 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
                 });
         }
 
+        const int hidden_count = prefill_hidden->shape(1);
         auto initial_hidden = mlx::core::slice(
             *prefill_hidden,
-            Shape{0, prompt_count - 1, 0},
+            Shape{0, hidden_count - 1, 0},
             Shape{
                 1,
-                prompt_count,
+                hidden_count,
                 static_cast<int>(config_.hidden_size),
             });
         int predictor_history_position = mtp_->cache_position();
+        int folded_history = 0;
+        std::optional<MlxMtpDraftContext> terminal_context;
+        std::optional<array> terminal_hidden;
+        std::vector<std::int32_t> terminal_ids;
+
+        const auto commit_checkpoint = [&](const MlxMtpDraftContext& context, bool terminal) {
+            const int accepted = context.accepted_drafts;
+            last_cache_hidden_ = mlx::core::slice(*context.verified_hidden,
+                Shape{0, accepted, 0}, Shape{1, accepted + 1, static_cast<int>(config_.hidden_size)});
+            if (!prefix_cache.wants(cache_position_, terminal)) return;
+            mtp_->trim_cache_to(predictor_history_position);
+            if (accepted > 0) {
+                auto rows = mlx::core::slice(*context.verified_hidden, Shape{0, 0, 0},
+                    Shape{1, accepted, static_cast<int>(config_.hidden_size)});
+                array shifted(context.next_token_ids.begin(), Shape{1, accepted}, mlx::core::int32);
+                auto value = mtp_->forward(rows, shifted, embedding_, true);
+                value.eval();
+                predictor_history_position += accepted;
+                folded_history = accepted;
+            }
+            prefix_cache.checkpoint(cache_position_, terminal);
+        };
 
         MlxMtpEngineCallbacks mtp_callbacks;
         mtp_callbacks.predictor = mtp_->mtp_descriptor();
         mtp_callbacks.target_cache_position = [this] {
             return cache_position_;
+        };
+        mtp_callbacks.draft_limit = [&](int position, int depth) {
+            return prefix_cache.draft_limit(position, depth);
+        };
+        if (prefix_cache) mtp_callbacks.committed_target = [&](const MlxMtpDraftContext& context) {
+            terminal_hidden = *context.verified_hidden;
+            terminal_ids.assign(context.next_token_ids.begin(), context.next_token_ids.end());
+            terminal_context = context;
+            terminal_context->verified_hidden = &*terminal_hidden;
+            terminal_context->next_token_ids = terminal_ids;
+            commit_checkpoint(*terminal_context, false);
         };
         mtp_callbacks.prepare_draft =
             [&, initial_hidden](
@@ -1461,6 +1553,13 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
                         "Qwen3.5 MTP history fold has incompatible shapes");
                 }
                 mtp_->trim_cache_to(predictor_history_position);
+                if (folded_history > 0) {
+                    hidden_rows = mlx::core::slice(hidden_rows, Shape{0, folded_history, 0},
+                        Shape{1, hidden_rows.shape(1), static_cast<int>(config_.hidden_size)});
+                    next_ids.erase(next_ids.begin(), next_ids.begin() + folded_history);
+                    logical_position += folded_history;
+                    folded_history = 0;
+                }
                 const int committed = static_cast<int>(next_ids.size());
                 const array committed_ids(
                     next_ids.begin(),
@@ -1543,7 +1642,7 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
                         accepted_drafts, draft_count);
                 }
             };
-        return run_mlx_mtp_generation(
+        const auto result = run_mlx_mtp_generation(
             MlxMtpEngineRequest{
                 vocab,
                 generation_limit,
@@ -1558,6 +1657,9 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
             },
             mtp_callbacks,
             last_mtp_stats_);
+        if (terminal_context && folded_history == 0) commit_checkpoint(*terminal_context, true);
+        else prefix_cache.checkpoint(cache_position_, true);
+        return result;
     }
 
     while (generated < generation_limit) {
@@ -1619,10 +1721,16 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
         if (generated == generation_limit) {
             break;
         }
-        logits = mlx_last_token_logits(
-            forward_decode(token_ids),
-            vocab);
+        if (prefix_cache) {
+            auto result = forward_decode_with_hidden(token_ids);
+            last_cache_hidden_ = result.second;
+            logits = mlx_last_token_logits(result.first, vocab);
+            prefix_cache.checkpoint(cache_position_);
+        } else {
+            logits = mlx_last_token_logits(forward_decode(token_ids), vocab);
+        }
     }
+    prefix_cache.checkpoint(cache_position_, true);
     return generated;
 }
 

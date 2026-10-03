@@ -1,10 +1,9 @@
-/** 聊天会话侧栏展示历史列表并转发页面级会话操作。 */
 import { useSettings } from '../../settings/SettingsProvider';
 import { Icon } from '../../../app/display';
 import { useConversationSelector } from '../state/conversationStore';
 import type { ChatPageState } from '../hooks/useChatPageState';
+import { ModelVendorMark } from '../../../app/ModelVendorMark';
 
-/** 展示会话列表与新建入口。 */
 export function ChatSessionSidebar({ page }: { page: ChatPageState }) {
   const { tr } = useSettings();
   const sessions = useConversationSelector((state) => state.sessions);
@@ -42,6 +41,7 @@ export function ChatSessionSidebar({ page }: { page: ChatPageState }) {
               >
                 <strong>{session.title || tr('未命名会话', 'Untitled chat')}</strong>
                 <small>{session.model}</small>
+                <ModelVendorMark name={session.model} size={18} />
               </button>
               <button
                 aria-label={tr(`删除对话：${session.title || '未命名会话'}`, `Delete chat: ${session.title || 'Untitled chat'}`)}

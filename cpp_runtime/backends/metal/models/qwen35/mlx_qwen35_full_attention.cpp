@@ -342,12 +342,12 @@ void MlxQwen35FullAttentionBlock::clear_cache() noexcept {
 }
 
 MlxKvCacheSnapshot
-MlxQwen35FullAttentionBlock::snapshot_cache() const {
+MlxQwen35FullAttentionBlock::snapshot_cache(bool detached) const {
     if (!cache_ || cache_batch_ <= 0) {
         throw std::runtime_error(
             "Qwen3.5 full-attention cache is unavailable");
     }
-    return cache_->snapshot();
+    return cache_->snapshot(detached);
 }
 
 void MlxQwen35FullAttentionBlock::restore_cache(

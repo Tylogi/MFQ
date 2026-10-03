@@ -58,6 +58,11 @@
 }
 .server-wide-input { width: min(32vw, 360px); }
 .server-number-input { width: 96px; text-align: right; }
+.model-context-heading { border-top: 1px solid var(--line-soft); padding: 18px 0 14px; color: var(--ink-soft); font-size: 11px; font-weight: 610; line-height: 1.5; }
+.model-context-heading + .setting-row { border-top: 0; padding-top: 0; }
+.model-context-settings .setting-row > div:first-child { min-width: 0; }
+.model-context-settings .setting-row > div:first-child > strong { display: block; overflow-wrap: anywhere; }
+.model-context-settings .setting-row-trailing { flex-shrink: 0; }
 .server-managed-value { color: var(--muted); font-size: 11px; }
 .server-unit-value,
 .server-input-unit { display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
@@ -71,3 +76,12 @@
 .server-page-footer { display: flex; align-items: center; justify-content: flex-end; gap: 14px; margin-top: 18px; }
 .server-page-footer > span { color: var(--muted-light); font-size: 11px; }
 .server-page-footer > button.primary { border-color: var(--accent); color: var(--on-accent); background: var(--accent); font-weight: 700; }
+.memory-budget-actions { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; padding: 14px 0; color: var(--muted); font-size: 11px; }
+.prefix-directory-controls { flex-wrap: wrap; }
+.prefix-directory-controls input { width: 100%; min-width: 180px; }
+.studio-dialog.model-alias-dialog { width: min(760px, calc(100vw - 40px)); max-width: 760px; padding: 24px; }
+.model-alias-list { display: grid; gap: 16px; margin: 18px 0; }
+.model-alias-list label { display: grid; gap: 7px; min-width: 0; }
+.model-alias-list span { overflow: hidden; text-overflow: ellipsis; font-size: 12px; color: var(--muted); }
+.model-alias-list input { min-width: 0; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-control); color: var(--ink-soft); }
+.memory-tier-prefix-quota { display: block; margin-top: 5px; color: var(--muted); font-size: 10px; }

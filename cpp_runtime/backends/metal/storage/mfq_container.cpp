@@ -12,6 +12,7 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 #include <fcntl.h>
@@ -220,16 +221,56 @@ const MfqRecord& MfqContainer::record(const std::string& name) const {
     return found->second;
 }
 
+struct MfqContainer::LoadProgress {
+    std::mutex mutex;
+    std::unordered_set<std::string> prepared;
+    std::function<void(std::size_t, std::size_t)> callback;
+    std::size_t total = 0;
+    std::size_t last_percent = 0;
+};
+
+void MfqContainer::observe_load_records(
+    std::function<void(std::size_t, std::size_t)> callback) const {
+    auto progress = std::make_shared<LoadProgress>();
+    for (const auto& [name, value] : records_) {
+        if (!name.starts_with("__mfq_asset__/")) ++progress->total;
+    }
+    progress->callback = std::move(callback);
+    load_progress_ = std::move(progress);
+}
+
+void MfqContainer::stop_load_observation() const {
+    if (!load_progress_) return;
+    std::lock_guard lock(load_progress_->mutex);
+    load_progress_->callback = {};
+}
+
+void MfqContainer::record_prepared(const std::string& name) const {
+    if (!load_progress_) return;
+    const auto& stored = record(name).name;
+    if (stored.starts_with("__mfq_asset__/")) return;
+    std::lock_guard lock(load_progress_->mutex);
+    auto& progress = *load_progress_;
+    if (!progress.callback || progress.total == 0 || !progress.prepared.insert(stored).second) return;
+    const auto percent = progress.prepared.size() * 100 / progress.total;
+    if (percent <= progress.last_percent) return;
+    progress.last_percent = percent;
+    progress.callback(progress.prepared.size(), progress.total);
+}
+
 std::vector<std::uint8_t> MfqContainer::read(
     const std::string& name) const {
     const auto& value = record(name);
-    return read_range(name, 0, value.nbytes);
+    auto result = read_range(name, 0, value.nbytes);
+    record_prepared(name);
+    return result;
 }
 
 MfqMappedBytes MfqContainer::map_record(
     const std::string& name) const {
     const auto& value = record(name);
     if (value.nbytes == 0) {
+        record_prepared(name);
         return {};
     }
     if (hf_source_) {
@@ -292,6 +333,7 @@ MfqMappedBytes MfqContainer::map_record(
         [mapped_size](void* address) {
             ::munmap(address, mapped_size);
         });
+    record_prepared(name);
     return MfqMappedBytes(
         std::move(owner),
         static_cast<const std::uint8_t*>(mapping)

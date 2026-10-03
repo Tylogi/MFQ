@@ -6,6 +6,7 @@ export interface ModelArtifact {
   architecture: string;
   format: 'mfq' | 'hf';
   shard_count: number;
+  missing_shards?: number;
   total_bytes: number;
   tensor_count: number;
   record_count: number;
@@ -58,21 +59,35 @@ export interface HubModelVariant {
   precision?: string | null;
   files: string[];
   byte_size: number;
+  resident_weight_bytes?: number | null;
+  ssd_ple_bytes?: number | null;
   configuration: ModelConfigurationStatus;
+}
+
+export interface HubMemoryPool {
+  kind: 'uma' | 'vram' | 'ram';
+  device?: string | null;
+  capacity_bytes?: number | null;
+  bandwidth_bytes_per_second?: number | null;
 }
 
 export interface HubSystemProfile {
   platform: string;
   machine: string;
-  backend: 'metal' | 'cuda' | 'cpu' | 'unknown';
+  backend: 'metal' | 'cuda' | 'rocm' | 'cpu' | 'unknown';
+  cpu_name?: string | null;
+  cpu_cores?: number | null;
+  gpu_names?: string[];
+  gpu_cores?: number | null;
   physical_memory_bytes?: number | null;
   available_memory_bytes?: number | null;
   runtime_memory_budget_bytes?: number | null;
+  memory_pools?: HubMemoryPool[];
 }
 
 export interface HubModelInfo extends HubModelSummary {
   revision: string;
-  files: Array<{ name: string; byte_size: number; sha256?: string | null }>;
+  files: Array<{ name: string; byte_size: number; sha256?: string | null; weight_bytes?: number | null; ssd_ple_bytes?: number | null }>;
   tags: string[];
   license?: string | null;
   library?: string | null;
@@ -80,6 +95,8 @@ export interface HubModelInfo extends HubModelSummary {
   architectures: string[];
   modalities: string[];
   parameter_count?: number | null;
+  ple_parameter_count?: number | null;
+  published_at?: string | null;
   gated: boolean;
   runtime_compatible?: boolean | null;
   variants: HubModelVariant[];
@@ -114,12 +131,14 @@ export interface OfficialModelInfo {
   likes: number;
   updated_at?: string | null;
   variants: HubModelVariant[];
+  published_at?: string | null;
   configuration: ModelConfigurationStatus;
 }
 
 export interface OfficialModelList {
   system: HubSystemProfile;
   data: OfficialModelInfo[];
+  refreshing?: boolean;
 }
 
 export interface ArtifactLineage {
