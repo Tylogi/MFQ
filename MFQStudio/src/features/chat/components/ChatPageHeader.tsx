@@ -35,7 +35,7 @@ export function ChatPageHeader({ page }: { page: ChatPageState }) {
           {inference.availableModelNames.length > 1 ? (
             <select
               aria-label={tr('对话模型', 'Chat model')}
-              disabled={busy || conversation.transitioning}
+              disabled={conversation.transitioning}
               onChange={(event) => selectModel(event.target.value)}
               value={inference.selectedModel}
             >

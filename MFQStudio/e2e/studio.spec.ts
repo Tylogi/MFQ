@@ -131,6 +131,83 @@ test('推理预算按内存架构分列容量，带宽用小号灰字放在下�
   expect(errors).toEqual([]);
 });
 
+test('注册资产显示文件总大小，已载入模型可在生成期间切换且无需登记资产', async ({ page }) => {
+  const state = await mockStudioServer(page, { holdResponse: true });
+  const nextModel = 'Loaded without registration';
+  const assets = [32, 8].map((size, index) => ({ id: `asset-${index}`, name: `Registered checkpoint ${index}`,
+    architecture: 'test', format: 'mfq', total_bytes: size * 2 ** 30, shard_count: 1,
+    tensor_count: 1, record_count: 1, dtypes: [], complete: true, loadable: true, modified_at: '2026-01-01' }));
+  await page.route(/\/api\/v1\/models(?:\?.*)?$/, (route) => route.fulfill({ json: { data: assets } }));
+  await page.route('**/api/v1/runtime/models', (route) => route.fulfill({ json: { data: [] } }));
+  await page.route('**/api/v1/runtime/instances', (route) => route.fulfill({ json: { data: [
+    { id: 'instance-1', model: 'Studio Test Model', state: 'ready', devices: ['cpu'] },
+    { id: 'instance-2', model: nextModel, state: 'ready', devices: ['cpu'] },
+  ] } }));
+  let forks = 0;
+  await page.route('**/api/v1/sessions/session-1/fork', (route) => {
+    forks += 1;
+    expect(route.request().postDataJSON().model).toBe(nextModel);
+    return route.fulfill({ json: { id: 'session-2', model: nextModel, mode: 'text', state: 'idle',
+      revision: 0, title: 'Regression conversation', created_at: '2026-01-01', updated_at: '2026-01-01', metadata: {} } });
+  });
+  await page.route('**/api/v1/sessions/session-2/messages', (route) => route.fulfill({ json: { data: [] } }));
+  await page.route('**/api/v1/sessions/session-2/responses?*', (route) => route.fulfill({ json: { data: [] } }));
+  await page.goto('/models');
+  await expect(page.locator('.model-workbench-summary > div').last()).toContainText('Registered model assets size');
+  await expect(page.locator('.model-workbench-summary > div').last().locator('strong')).toHaveText('40 GiB');
+  await expect(page.getByText('Switching keeps the registered asset')).toHaveCount(0);
+  await navigateClient(page, '/chat');
+  const selector = page.getByRole('combobox', { name: 'Chat model', exact: true });
+  await expect(selector.locator('option')).toHaveText(['Studio Test Model', nextModel]);
+  const input = page.getByRole('textbox', { name: 'Message', exact: true });
+  await expect(input).toBeEnabled();
+  await input.fill('Keep this response on the original model');
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expect.poll(() => state.submissions).toBe(1);
+  await expect(selector).toBeEnabled();
+  await selector.selectOption(nextModel);
+  await expect(selector).toHaveValue(nextModel);
+  expect(forks).toBe(0);
+  state.releaseResponse();
+  await expect.poll(() => forks).toBe(1);
+  await expect(input).toBeEnabled();
+  await expect(selector).toHaveValue(nextModel);
+  expect(state.submissions).toBe(1);
+  expect(state.requests.filter((request) => request.startsWith('POST /api/v1/models'))).toEqual([]);
+  expect(state.unexpected).toEqual([]);
+});
+
+test('下载来源与九宫格保留统一字体，仅降低文字对比度', async ({ page }) => {
+  await mockStudioServer(page);
+  await page.goto('/model-hub');
+  await expect(page.locator('.model-source-picker select')).toBeVisible();
+  for (const theme of ['light', 'dark']) {
+    await page.evaluate((value) => {
+      document.documentElement.dataset.theme = value;
+      document.documentElement.style.colorScheme = value;
+    }, theme);
+    await expect.poll(() => page.evaluate(() => {
+      const color = getComputedStyle(document.querySelector('.model-detail-panel > p')!).color;
+      return Array.from(document.querySelectorAll('.model-source-picker select, .model-metadata-grid dd')).every((node) => getComputedStyle(node).color === color);
+    })).toBe(true);
+    const styles = await page.evaluate(() => {
+      const body = getComputedStyle(document.body);
+      const detail = getComputedStyle(document.querySelector('.model-detail-panel > p')!);
+      return Array.from(document.querySelectorAll('.model-source-picker select, .model-metadata-grid dd')).map((node) => {
+        const css = getComputedStyle(node);
+        return { font: css.fontFamily, expectedFont: body.fontFamily, weight: css.fontWeight,
+          color: css.color, expectedColor: detail.color, primaryColor: body.color };
+      });
+    });
+    for (const css of styles) {
+      expect(css.font).toBe(css.expectedFont);
+      expect(css.weight).toBe('400');
+      expect(css.color).toBe(css.expectedColor);
+      expect(css.color).not.toBe(css.primaryColor);
+    }
+  }
+});
+
 test('运行资源按模型分段，四个槽共享颜色，端点包含 v1', async ({ page }, testInfo) => {
   await mockStudioServer(page);
   const instances = [1, 2, 3, 4].map((index) => ({

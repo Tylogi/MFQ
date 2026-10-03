@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
-import type { useModelCatalog } from './useModelCatalog';
+import { useModelCatalog } from './useModelCatalog';
+import { ModelsPage } from './ModelsPage';
 import { LoadedModels } from './LoadedModels';
 import { LocalCheckpoints } from './LocalCheckpoints';
 import { ModelLoadPolicy } from './ModelLoadPolicy';
@@ -8,6 +9,7 @@ import { ModelLoadPolicy } from './ModelLoadPolicy';
 vi.mock('../settings/SettingsProvider', () => ({
   useSettings: () => ({ tr: (zh: string) => zh }),
 }));
+vi.mock('./useModelCatalog', () => ({ useModelCatalog: vi.fn() }));
 
 function catalog() {
   return {
@@ -64,4 +66,15 @@ it('本地架构标识在模型行右侧，改名的模型仍按架构识别', (
   expect(screen.getAllByRole('img')).toHaveLength(3);
   fireEvent.click(screen.getAllByRole('button', { name: '加载' })[0]);
   expect(state.loadArtifact).toHaveBeenCalledWith('renamed-checkpoint');
+});
+
+it.each([[[], '0 B'], [[32 * 2 ** 30, 8 * 2 ** 30], '40 GiB']] as [number[], string][])('资产总大小汇总已登记文件，不使用当前会话模型: %s', (sizes, total) => {
+  const state = catalog();
+  state.model = 'Loaded but not registered';
+  state.artifacts = sizes.map((total_bytes, index) => ({ id: `asset-${index}`, total_bytes })) as typeof state.artifacts;
+  vi.mocked(useModelCatalog).mockReturnValue(state);
+  render(<ModelsPage />);
+  expect(screen.getByText('注册模型资产总大小').parentElement?.querySelector('strong')).toHaveTextContent(total);
+  expect(screen.queryByText('当前对话模型')).not.toBeInTheDocument();
+  expect(screen.queryByText(state.model)).not.toBeInTheDocument();
 });
