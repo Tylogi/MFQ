@@ -96,7 +96,8 @@ def test_model_hub_resolves_links_and_downloads_selected_variants():
     assert 'tr("官方模型", "Official")' in MODEL_BROWSER
     assert 'tr("第三方模型", "Community")' in MODEL_BROWSER
     assert 'tr("内存压力", "Memory pressure")' in MODEL_BROWSER
-    assert "not model capability or quality" in MODEL_BROWSER
+    assert "Based on resident weight baselines" in MODEL_BROWSER
+    assert "KV cache and runtime overhead need additional memory." in MODEL_BROWSER
     assert "三星推荐" not in MODEL_BROWSER
     assert "3-star recommendation" not in MODEL_BROWSER
     for symbol in ('"★★★"', '"★★"', '"★"', '"▲"', '"✕"'):
