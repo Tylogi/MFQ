@@ -158,3 +158,14 @@ body:has(.model-download-page) .studio-toast-container { bottom: calc(96px + env
   .download-item-heading > .model-identity-trailing { align-self: stretch; justify-content: space-between; margin-left: 0; }
   .download-queue-item > button { margin-left: 42px; }
 }
+.model-browser-actions { display: grid; justify-items: end; gap: 9px; }
+.download-concurrency { display: flex; align-items: center; gap: 8px; margin: 0; color: var(--muted); font-size: 11px; }
+.download-concurrency select { border: 1px solid var(--line); border-radius: 7px; padding: 3px 7px; background: var(--panel-control); color: var(--ink-soft); font-size: 11px; }
+.repository-files { margin-top: 20px; color: var(--ink-soft); font-size: 12px; }
+.repository-files summary { cursor: pointer; padding: 12px 0; }
+.repository-file-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
+.repository-file-toolbar code { flex: 1; overflow-wrap: anywhere; }
+.repository-file-list { display: grid; max-height: 320px; overflow: auto; margin-bottom: 12px; }
+.repository-file-list > label, .repository-folder { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line-soft); }
+.repository-file-list span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.repository-file-list small { flex-shrink: 0; }

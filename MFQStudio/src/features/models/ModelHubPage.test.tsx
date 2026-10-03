@@ -7,7 +7,7 @@ import { useJobStore } from '../../stores/jobStore';
 import { ModelHubPage } from './ModelHubPage';
 
 vi.mock('../../shared/api/resources/models', () => ({ modelsApi: { officialHubModels: vi.fn() } }));
-vi.mock('../../shared/api/resources/jobs', () => ({ jobsApi: { jobKinds: vi.fn(), createJob: vi.fn(), cancelJob: vi.fn(), retryJob: vi.fn() } }));
+vi.mock('../../shared/api/resources/jobs', () => ({ jobsApi: { jobKinds: vi.fn(), createJob: vi.fn(), cancelJob: vi.fn(), retryJob: vi.fn(), deleteJob: vi.fn() } }));
 vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => ({ addJob: (job: JobResource) => useJobStore.getState().addJob(job) }) }));
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh: string, en: string) => en }) }));
 
@@ -76,4 +76,17 @@ it('cancels and retries only the chosen download through the existing jobs API',
   await waitFor(() => expect(useJobStore.getState().jobs).toHaveLength(2));
   expect(jobsApi.retryJob).toHaveBeenCalledWith('download-1');
   expect(screen.getByRole('tab', { name: 'Download queue' })).toHaveAttribute('aria-selected', 'true');
+});
+
+it('shows transfer speed and deletes a completed record without touching files', async () => {
+  useJobStore.getState().setJobs([{ ...download(), status: 'running', progress_data: { downloaded_bytes: 1024, bytes_per_second: 2048, files_completed: 1 } }]);
+  render(<ModelHubPage />);
+  fireEvent.click(screen.getByRole('tab', { name: 'Download queue' }));
+  expect(screen.getByText(/2 KiB\/s/)).toBeVisible();
+  expect(screen.queryByRole('button', { name: 'Delete download record' })).not.toBeInTheDocument();
+  act(() => useJobStore.getState().updateJob('download-1', { status: 'succeeded' }));
+  vi.mocked(jobsApi.deleteJob).mockResolvedValue(undefined);
+  fireEvent.click(screen.getByRole('button', { name: 'Delete download record' }));
+  await waitFor(() => expect(useJobStore.getState().jobs).toHaveLength(0));
+  expect(jobsApi.deleteJob).toHaveBeenCalledExactlyOnceWith('download-1');
 });

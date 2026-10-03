@@ -6,6 +6,7 @@ export interface ModelArtifact {
   architecture: string;
   format: 'mfq' | 'hf';
   shard_count: number;
+  missing_shards?: number;
   total_bytes: number;
   tensor_count: number;
   record_count: number;

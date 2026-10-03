@@ -578,6 +578,9 @@ def test_catalog_validates_complete_and_incomplete_shards(tmp_path: Path) -> Non
         assert len(incomplete.data) == 1
         assert not incomplete.data[0].complete
         assert not incomplete.data[0].loadable
+        assert incomplete.data[0].missing_shards == 1
+        assert incomplete.data[0].total_bytes == shards[0].stat().st_size
+        assert catalog._immediate_model_count(model_dir) == 1
         assert "missing MFQ shard" in (incomplete.data[0].error or "")
         assert str(model_dir) not in incomplete.model_dump_json()
 

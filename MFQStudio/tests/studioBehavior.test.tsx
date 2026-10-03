@@ -106,6 +106,7 @@ describe('test_model_hub_accepts_repository_links_and_downloads_into_the_model_c
     fireEvent.click(download);
     await waitFor(() => expect(createJob).toHaveBeenCalledExactlyOnceWith(`download.${provider}`, {
       repo_id: 'team/model',
+      max_workers: 8,
       destination: `models/${provider}/team/model/model`,
       revision: 'main',
       include: [

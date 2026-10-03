@@ -1,14 +1,11 @@
-/** 管理连接页的即时推理默认值，直接写入共享已应用设置。 */
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useSettings } from '../settings/SettingsProvider';
 import { modeTemplateSettings, type GenerationSettings } from '../settings/configuration';
 import { SectionLabel, SettingRow, TMPanel } from '../../app/display';
 import { formatNumber } from '../../app/formatters';
-/** 修改默认提示词和采样参数时不依赖服务器配置草稿。 */
 export function InferenceDefaultsPanel() {
   const { settings, replaceSettings, tr } = useSettings();
   const { runtime, realtime } = useRuntime();
-  /** 保存推理字段前展开模型默认值，避免修改被继承模式覆盖。 */
   function updateInference(patch: Partial<GenerationSettings>) {
     replaceSettings((current) => ({
       ...(current.inheritModelDefaults

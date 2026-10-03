@@ -31,6 +31,68 @@ from mfq.server.services.service import ServerService
 from mfq.server.state.storage import SessionStore
 from tests.test_server_service import FakeBackend
 
+_DISCOVER_OFFICIAL = HubCatalog._discover_official
+
+
+@pytest.fixture(autouse=True)
+def no_live_author_discovery(monkeypatch):
+    async def discover(provider):
+        return []
+    monkeypatch.setattr(HubCatalog, '_discover_official', staticmethod(discover))
+
+
+def test_new_author_repositories_appear_once_and_survive_offline_restart(tmp_path, monkeypatch):
+    async def run():
+        catalog = HubCatalog(cache_path=tmp_path / 'official.json')
+        repo = 'Tylogi/Qwen3.8-Flash-Next-EWQ-V1-MFQ'
+        async def discover(provider):
+            return [repo, 'Other/Not-Official-MFQ', 'Tylogi/nonquantized']
+        async def fetch(provider, repo_id, revision, profile):
+            return HubModelInfo(provider=provider, repo_id=repo_id, revision='master',
+                files=[HubModelFile(name='S4-L/model-00001-of-00002.mfq', byte_size=1024),
+                       HubModelFile(name='S4-L/model-00002-of-00002.mfq', byte_size=1024)])
+        monkeypatch.setattr(catalog, '_discover_official', discover)
+        monkeypatch.setattr(catalog, '_fetch_info', fetch)
+        assert len((await catalog.official()).data) == 4
+        await catalog._refresh_task
+        result = await catalog.official()
+        assert len(result.data) == 5
+        new = next(item for item in result.data if 'Flash-Next' in item.name)
+        assert {source.provider for source in new.sources} == {'huggingface', 'modelscope'}
+        assert len(new.variants) == 1 and new.variants[0].byte_size == 2048
+        restored = HubCatalog(cache_path=tmp_path / 'official.json')
+        assert len((await restored.official()).data) == 5
+        async def offline(*args): raise HubError('offline')
+        monkeypatch.setattr(restored, '_discover_official', offline)
+        monkeypatch.setattr(restored, '_fetch_info', offline)
+        await restored.official(refresh=True)
+        await restored._refresh_task
+        assert len((await restored.official()).data) == 5
+        await catalog.aclose()
+        await restored.aclose()
+    asyncio.run(run())
+
+
+def test_author_discovery_paginates_and_filters_private_and_other_owners(monkeypatch):
+    import mfq.server.services.hub as hub
+    requests = []
+    def respond(request):
+        requests.append(request)
+        if request.url.path == '/openapi/v1/models':
+            assert request.url.params['owner'] == 'Tylogi'
+            page = int(request.url.params['page_number'])
+            models = [{'id': f'Tylogi/model-{index}-MFQ'} for index in range(20)] if page == 1 else [
+                {'id': 'Tylogi/new-MFQ'}, {'id': 'Other/model-MFQ'}, {'id': 'Tylogi/private-MFQ', 'private': True}, {'id': 'Tylogi/plain'}]
+            return httpx.Response(200, json={'success': True, 'data': {'models': models, 'total_count': 24}})
+        assert request.url.params['author'] == 'Tylogi'
+        return httpx.Response(200, json=[{'id': 'Tylogi/hf-MFQ'}, {'id': 'Other/hf-MFQ'}])
+    monkeypatch.setattr(hub, '_metadata_client', lambda *args, **kwargs: httpx.AsyncClient(transport=httpx.MockTransport(respond)))
+    async def run():
+        assert len(await _DISCOVER_OFFICIAL('modelscope')) == 21
+        assert await _DISCOVER_OFFICIAL('huggingface') == ['Tylogi/hf-MFQ']
+    asyncio.run(run())
+    assert len(requests) == 3
+
 
 def test_official_refresh_is_incremental_coalesced_and_cancelable(monkeypatch) -> None:
     async def run() -> None:

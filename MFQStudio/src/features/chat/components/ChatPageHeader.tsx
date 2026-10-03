@@ -4,9 +4,14 @@ import { Icon } from '../../../app/display';
 import { formatNumber } from '../../../app/formatters';
 import type { ChatPageState } from '../hooks/useChatPageState';
 import { ModelVendorMark } from '../../../app/ModelVendorMark';
+import { useRef, useState } from 'react';
+import { Dialog } from '../../../shared/ui/Dialog';
+import { InferenceDefaultsPanel } from '../../connections/InferenceDefaultsPanel';
 
 export function ChatPageHeader({ page }: { page: ChatPageState }) {
   const { tr } = useSettings();
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsTrigger = useRef<HTMLButtonElement>(null);
   const messages = useConversationSelector((state) => state.messages);
   const { active, activeId, chat, chatSessionsOpen, setChatSessionsOpen, selectModel } = page;
   const { conversation, inference, voice, busy, clearActiveConversation } = chat;
@@ -65,6 +70,13 @@ export function ChatPageHeader({ page }: { page: ChatPageState }) {
               ? tr('加载中', 'Loading')
               : tr('空闲', 'Idle')}
         </span>
+        <button
+          ref={settingsTrigger} aria-label={tr('对话设置', 'Chat settings')} className="chat-icon-button"
+          onClick={() => setSettingsOpen(true)} type="button"><Icon name="settings" size={16} /></button>
+        <Dialog open={settingsOpen} onOpenChange={setSettingsOpen} title={tr('对话设置', 'Chat settings')}
+          closeLabel={tr('关闭', 'Close')} className="chat-settings-dialog" returnFocusRef={settingsTrigger}>
+          <div className="server-page"><InferenceDefaultsPanel /></div>
+        </Dialog>
         <button
           aria-label={tr('清空对话', 'Clear conversation')}
           className="chat-icon-button"

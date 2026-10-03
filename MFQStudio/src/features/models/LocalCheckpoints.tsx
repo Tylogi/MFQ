@@ -34,7 +34,7 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                   <div>
                     <strong>{item.name}</strong>
                     <small>
-                      {item.architecture} · {item.shard_count} shards ·{' '}
+                      {item.architecture} · {item.missing_shards ? tr(`分片不全，缺 ${item.missing_shards} 片`, `${item.missing_shards} shards missing`) : item.complete ? `${item.shard_count} ${tr('个分片', 'shards')}` : tr('文件无效', 'Invalid file')} ·{' '}
                       {formatNumber(item.total_bytes / 2 ** 30, 1)} GB{policy ? ` · ${policy}` : ''}
                     </small>
                     <ModelLoadProgress model={item.name} />
@@ -49,7 +49,8 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                   ) : !item.loadable ? (
                     <em className="failed" title={item.error || undefined}>
                       {item.complete && item.format === 'hf'
-                        ? tr('需先转换', 'Convert first') : tr('不可用', 'Invalid')}
+                        ? tr('需先转换', 'Convert first') : item.missing_shards
+                          ? tr('分片不全', 'Incomplete shards') : tr('不可用', 'Invalid')}
                     </em>
                   ) : (
                     <button disabled={busy} onClick={() => void loadArtifact(item.name)} type="button">

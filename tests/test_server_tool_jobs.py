@@ -32,6 +32,27 @@ def test_imatrix_jobs_default_to_compact_activation_aware_objective() -> None:
     assert payload.imatrix_objective == "naq"
 
 
+def test_download_reports_real_written_bytes_and_speed(tmp_path, monkeypatch):
+    async def run():
+        handlers = ToolJobHandlers(ModelCatalog([]), ToolJobPaths(tmp_path, tmp_path / 'mfq', None, None, None, None))
+        captured = []
+        class Context:
+            async def progress(self, value, **kwargs): captured.append((value, kwargs['data']))
+        async def transfer(*args, **kwargs):
+            await asyncio.sleep(0.1)
+            (tmp_path / 'shard.mfq').write_bytes(b'x' * 1024)
+            (tmp_path / 'part.incomplete').write_bytes(b'x' * 1024)
+            (tmp_path / 'ignored.lock').write_bytes(b'x' * 1024)
+            await asyncio.sleep(1.05)
+        monkeypatch.setattr(handlers, '_run', transfer)
+        await handlers._run_download(Context(), ['fake-download'], {}, tmp_path, 4096)
+        assert captured[-1][0] == 0.5
+        data = captured[-1][1]
+        assert data['downloaded_bytes'] == 2048 and data['files_completed'] == 1
+        assert data['bytes_per_second'] > 0 and data['total_bytes'] == 4096
+    asyncio.run(run())
+
+
 def test_standalone_cli_jobs_reinvoke_the_unified_mfq_binary(tmp_path: Path) -> None:
     catalog = ModelCatalog([tmp_path])
     executable = tmp_path / "mfq"

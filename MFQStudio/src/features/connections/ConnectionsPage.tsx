@@ -1,8 +1,6 @@
 import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router';
 import { Icon, ScreenHeader, SectionLabel, SettingRow, TMPanel } from '../../app/display';
 import { errorMessage } from '../../app/formatters';
-import { STUDIO_PATHS } from '../../navigation';
 import {
   configureStudio,
   isStudio,
@@ -17,8 +15,8 @@ import { getApiBaseUrl, setApiToken, setBrowserServiceUrl } from '../../shared/a
 import { useSettings } from '../settings/SettingsProvider';
 import { ToolsRoutingPanel } from './ToolsRoutingPanel';
 import { MemorySettingsPanel } from './MemorySettingsPanel';
+import { ModelAliasMapping } from './ModelAliasMapping';
 import { toast } from '../../stores/toastStore';
-import { InferenceDefaultsPanel } from './InferenceDefaultsPanel';
 
 function browserConfig(): StudioConfig {
   const address = getApiBaseUrl() || 'http://127.0.0.1:8090';
@@ -36,11 +34,9 @@ export function ConnectionsPage() {
     models,
     instances,
     selectedModel,
-    setSelectedModel,
     studio,
     reloadService,
   } = useRuntime();
-  const navigate = useNavigate();
   const [draft, setDraft] = useState<StudioConfig>(() => studio?.config ?? browserConfig());
   const [listeningPort, setListeningPort] = useState<number | null>(null);
   const [token, setToken] = useState('');
@@ -149,22 +145,6 @@ export function ConnectionsPage() {
         <TMPanel className="server-settings-panel">
           <div className="setting-list">
             <SettingRow
-              title={tr('Runtime 可执行文件', 'Runtime executable')}
-              detail={tr(
-                '应用已包含推理服务，并自动使用本机 Metal Runtime。',
-                'The packaged app includes the inference server and discovers the local Metal runtime automatically.',
-              )}
-              trailing={
-                <div className="server-row-actions">
-                  <code>mfq-cli → mfq-decode-metal</code>
-                  <span className={`runtime-status-pill ${active ? 'running' : 'stopped'}`}>
-                    <i />
-                    {active ? tr('已连接', 'Connected') : tr('离线', 'Offline')}
-                  </span>
-                </div>
-              }
-            />
-            <SettingRow
               title={tr('模型 ID', 'Model ID')}
               detail={tr(
                 '由 /v1/models 公布，并用于对话补全请求。',
@@ -172,27 +152,7 @@ export function ConnectionsPage() {
               )}
               trailing={
                 <div className="server-row-actions server-model-control">
-                  {modelNames.length > 1 ? (
-                    <select
-                      aria-label={tr('当前模型', 'Current model')}
-                      disabled={busy}
-                      onChange={(event) => setSelectedModel(event.target.value)}
-                      value={selectedModel}
-                    >
-                      {modelNames.map((name) => (
-                        <option key={name} value={name}>
-                          {name}
-                        </option>
-                      ))}
-                    </select>
-                  ) : (
-                    <strong title={selectedModel}>
-                      {selectedModel || tr('尚未加载', 'Not loaded')}
-                    </strong>
-                  )}
-                  <button onClick={() => navigate(STUDIO_PATHS.models)} type="button">
-                    {tr('选择…', 'Choose…')}
-                  </button>
+                  <ModelAliasMapping models={modelNames} selectedModel={selectedModel} />
                 </div>
               }
             />
@@ -297,7 +257,6 @@ export function ConnectionsPage() {
           </div>
         </TMPanel>
         <MemorySettingsPanel />
-        <InferenceDefaultsPanel />
         <SectionLabel title={tr('自动化', 'Automation')} />
         <TMPanel className="server-settings-panel">
           <div className="setting-list">
@@ -323,7 +282,6 @@ export function ConnectionsPage() {
           </div>
         </TMPanel>
         <div className="server-page-footer">
-          <span>{tr('对话默认值会自动保存。', 'Chat defaults are saved automatically.')}</span>
           <button
             className="primary"
             disabled={busy || !draft}

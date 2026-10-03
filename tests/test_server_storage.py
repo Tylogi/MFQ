@@ -44,6 +44,16 @@ def make_store(tmp_path) -> SessionStore:
     return SessionStore(tmp_path / "mfq.server.sqlite3")
 
 
+def test_download_progress_data_survives_reopen_and_final_progress(tmp_path):
+    store = make_store(tmp_path)
+    job = store.create_job('download.modelscope', {})
+    store.claim_job(job.id)
+    data = {'downloaded_bytes': 1024, 'total_bytes': 4096, 'bytes_per_second': 2048, 'files_completed': 1}
+    store.update_job_progress(job.id, 0.25, data=data)
+    store.update_job_progress(job.id, 1.0)
+    assert make_store(tmp_path).get_job(job.id).progress_data == data
+
+
 def test_session_persists_in_wal_mode(tmp_path) -> None:
     path = tmp_path / "mfq.server.sqlite3"
     store = SessionStore(path)

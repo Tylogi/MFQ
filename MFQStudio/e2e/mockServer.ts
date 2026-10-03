@@ -115,6 +115,8 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
       });
     if (path === '/api/v1/runtime/models') return json({ data: [{ id: model }] });
     if (path === '/api/v1/runtime/listener') return json({ host: '127.0.0.1', port: 8090, configurable: true });
+    if (path === '/api/v1/runtime/memory-policy') return json({ model_limit_bytes: null, prefix_limit_bytes: null, prefix_directory: null, actual_prefix_directory: '/data/mfq/prefix-cache' });
+    if (path === '/api/v1/runtime/model-aliases') return json({ aliases: {} });
     if (path === '/api/v1/runtime/instances')
       return json({
         data: [

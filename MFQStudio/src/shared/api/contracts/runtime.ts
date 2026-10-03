@@ -152,6 +152,8 @@ export interface RuntimeMemoryResources {
   kv_bytes: number | null;
   context_count: number | null;
   prefix_cache_blocks: number | null;
+  prefix_cache_bytes?: number | null;
+  prefix_cache_limit_bytes?: number | null;
   ssd_experts: boolean | null;
   ssd_expert_bytes: number | null;
   ssd_ple: boolean | null;

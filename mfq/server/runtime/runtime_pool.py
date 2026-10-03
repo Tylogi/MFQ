@@ -7,6 +7,7 @@ import math
 import re
 import socket
 import subprocess
+import tempfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager, suppress
@@ -34,6 +35,7 @@ from mfq.server.protocol.models import (
     RuntimeInstanceResource,
     RuntimeInstanceState,
     RuntimeMemoryResources,
+    RuntimeMemoryPolicy,
     RuntimeLogLevel,
     SamplingParams,
     ToolChoice,
@@ -68,6 +70,26 @@ class RuntimeInstanceNotFoundError(RuntimeManagementError):
 
 class RuntimeConflictError(RuntimeManagementError):
     pass
+
+
+class _MemoryPlanContext:
+    def __init__(self, context: JobContext, start: float = 0.0, end: float = 1.0, recovery: bool = False) -> None:
+        self.context, self.start, self.end, self.recovery = context, start, end, recovery
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.context, name)
+
+    @property
+    def cancel_requested(self) -> bool:
+        return False if self.recovery else self.context.cancel_requested
+
+    def raise_if_cancelled(self) -> None:
+        if not self.recovery:
+            self.context.raise_if_cancelled()
+
+    async def progress(self, value: float, **kwargs: Any) -> None:
+        if not self.recovery:
+            await self.context.progress(self.start + value * (self.end - self.start), **kwargs)
 
 
 _AUTOMATIC_MEMORY_SOFT_RATIO = 0.90
@@ -123,6 +145,8 @@ class _RuntimeLoadContext:
 
     def __init__(self) -> None:
         self._cleanup_callbacks: list[Callable[[], Awaitable[None] | None]] = []
+        self.job_id = uuid4()
+        self.cancel_requested = False
 
     def raise_if_cancelled(self) -> None:
         return None
@@ -263,6 +287,10 @@ class RuntimePool:
             else None
         )
         self.max_runtime_memory_bytes = max_runtime_memory_bytes or automatic_budget
+        self.memory_policy = RuntimeMemoryPolicy()
+        self._policy_model_limits: dict[str, int] = {}
+        self._policy_prefix_limits: dict[str, int] = {}
+        self._memory_configuration_job: UUID | None = None
         self.automatic_memory_budget = automatic_budget is not None
         self.default_idle_ttl_seconds = default_idle_ttl_seconds
         self.load_failure_cooldown_seconds = load_failure_cooldown_seconds
@@ -459,12 +487,50 @@ class RuntimePool:
                 ),
                 artifact.resource.error or "model artifact is incomplete",
             )
+        if self.memory_policy.model_limit_bytes is not None or self.memory_policy.prefix_limit_bytes is not None:
+            async with self._lock:
+                current = [item for item in self._instances.values() if item.state != RuntimeInstanceState.FAILED]
+                candidates = [item.artifact for item in current]
+                new_model = all(item.artifact.resource.name != artifact.resource.name for item in current)
+                limits, hot = self._plan_memory_policy(self.memory_policy, [*candidates, artifact] if new_model else candidates)
+                resize = self._memory_configuration_job is None and new_model and any(
+                    (item.memory.resident_weight_bytes if item.memory and item.memory.resident_weight_bytes is not None else item.reserved_bytes or 0)
+                    > limits.get(item.artifact.resource.name, self.max_runtime_memory_bytes or (1 << 63))
+                    or (self.memory_policy.prefix_limit_bytes is not None and item.memory is not None
+                        and (item.memory.prefix_cache_limit_bytes or 0) > hot.get(item.artifact.resource.name, 0)) for item in current)
+                if not resize and self._memory_configuration_job is None:
+                    self._policy_model_limits = limits
+                    self._policy_prefix_limits = hot
+            if resize:
+                await self.configure_memory_policy(_MemoryPlanContext(context, end=0.7), self.memory_policy.model_dump(), additional=artifact)
+                context = _MemoryPlanContext(context, start=0.7)
         # Automatic residency is recalculated whenever an idle model is restored.
         replay_request = request.model_copy(deep=True)
         async with self._lock:
             if self._closed:
                 raise RuntimeManagementError("runtime pool is closed")
+            if self._memory_configuration_job is not None and self._memory_configuration_job != context.job_id:
+                raise _job_error("memory_plan_busy", "memory settings are being applied", retryable=True)
             residency_ceiling = self._effective_runtime_memory_budget_locked()
+            if self.memory_policy.model_limit_bytes is not None:
+                other_weights = sum((item.memory.resident_weight_bytes if item.memory and item.memory.resident_weight_bytes is not None else item.reserved_bytes or 0)
+                    for item in self._instances.values() if item.artifact.resource.name != artifact.resource.name)
+                other_weights += sum(size for name, size in self._load_bytes.items() if name != artifact.resource.name)
+                available_weights = max(1, self.memory_policy.model_limit_bytes - other_weights)
+                available_weights = min(available_weights, self._policy_model_limits.get(artifact.resource.name, available_weights))
+                residency_ceiling = min(residency_ceiling or available_weights, available_weights)
+            elif artifact.resource.name in self._policy_model_limits:
+                limit = self._policy_model_limits[artifact.resource.name]
+                residency_ceiling = min(residency_ceiling or limit, limit)
+            prefix_limit = self._policy_prefix_limits.get(artifact.resource.name)
+            if prefix_limit is None and self.memory_policy.prefix_limit_bytes is not None:
+                used_limits = sum(self._policy_prefix_limits.get(item.artifact.resource.name, 0) for item in self._instances.values())
+                prefix_limit = max(0, self.memory_policy.prefix_limit_bytes - used_limits)
+                self._policy_prefix_limits[artifact.resource.name] = prefix_limit
+            if prefix_limit is not None:
+                request = request.model_copy(update={"prefix_cache_hot_bytes": prefix_limit, "prefix_cache_max_bytes": prefix_limit})
+        if self.memory_policy.model_limit_bytes is not None or self.memory_policy.prefix_limit_bytes is not None:
+            request = request.model_copy(update={"moe_gpu_cache_gb": None})
         request = self._apply_automatic_expert_residency(
             artifact,
             request,
@@ -570,6 +636,12 @@ class RuntimePool:
                     f"model is already loading: {model_name}",
                     retryable=True,
                 )
+            if self.memory_policy.model_limit_bytes is not None:
+                committed_weights = sum((item.memory.resident_weight_bytes if item.memory and item.memory.resident_weight_bytes is not None else item.reserved_bytes or 0)
+                    for item in self._instances.values() if item not in evicted)
+                committed_weights += sum(self._load_bytes.values())
+                if committed_weights + incoming_bytes > self.memory_policy.model_limit_bytes:
+                    raise _job_error("runtime_memory_limit", "model weights exceed the configured aggregate budget; retry after other loads finish", retryable=True)
             claimed_instance_ids = {item.id for item in evicted}
             resident_names = {
                 item.artifact.resource.name
@@ -851,6 +923,103 @@ class RuntimePool:
             "artifact_id": artifact.resource.id,
             "context_size": request.context_size,
         }
+
+    def memory_policy_status(self) -> dict[str, Any]:
+        return {**self.memory_policy.model_dump(), "actual_prefix_directory": str(self._prefix_cache_directory())}
+
+    def _prefix_cache_directory(self) -> Path:
+        if self.memory_policy.prefix_directory is not None:
+            return Path(self.memory_policy.prefix_directory).expanduser().resolve()
+        if self.store is not None:
+            return self.store.path.parent / "prefix-cache"
+        return Path.home() / ".cache" / "mfq" / "prefix"
+
+    def _plan_memory_policy(self, policy: RuntimeMemoryPolicy, artifacts: Sequence[DiscoveredModel]) -> tuple[dict[str, int], dict[str, int]]:
+        if self.max_runtime_memory_bytes is not None and any(value is not None and value > self.max_runtime_memory_bytes for value in (policy.model_limit_bytes, policy.prefix_limit_bytes)):
+            raise _job_error("memory_budget_exceeds_capacity", "a manual budget cannot exceed detected inference memory")
+        if not artifacts:
+            return {}, {}
+        totals = [max(0, item.resource.total_bytes - item.always_streamed_bytes) for item in artifacts]
+        experts = [min(total, item.routed_expert_bytes) for item, total in zip(artifacts, totals)]
+        dense = [total - expert for total, expert in zip(totals, experts)]
+        ceiling = self.max_runtime_memory_bytes
+        prefixes = policy.prefix_limit_bytes if policy.prefix_limit_bytes is not None else len(artifacts) * (2 << 30)
+        limit = policy.model_limit_bytes
+        if ceiling is not None:
+            available = max(0, ceiling - prefixes - (2 << 30))
+            limit = min(limit, available) if limit is not None else available
+        if limit is None:
+            limit = sum(totals)
+        floors = [min(size, 5 << 30) for size in experts]
+        minimum = sum(dense) + sum(floors)
+        if limit < minimum:
+            raise _job_error("memory_budget_too_small", f"these models require at least {minimum} weight bytes plus prefix and live KV headroom")
+        excess = max(0, sum(totals) - limit)
+        expert_total = sum(experts)
+        allowed_experts = max(0, expert_total - excess)
+        remainder = max(0, allowed_experts - sum(floors))
+        extra_total = sum(expert - floor for expert, floor in zip(experts, floors))
+        limits = {item.resource.name: base + floor + remainder * (expert - floor) // max(1, extra_total)
+            for item, base, expert, floor in zip(artifacts, dense, experts, floors)}
+        if policy.model_limit_bytes is None and policy.prefix_limit_bytes is None:
+            limits = {}
+        share, remainder = divmod(prefixes, len(artifacts))
+        hot = {item.resource.name: share + (index < remainder) for index, item in enumerate(artifacts)}
+        return limits, hot
+
+    async def configure_memory_policy(self, context: JobContext, payload: dict[str, Any], *, additional: DiscoveredModel | None = None) -> dict[str, Any]:
+        policy = RuntimeMemoryPolicy.model_validate(payload)
+        if policy.prefix_directory is not None:
+            directory = Path(policy.prefix_directory).expanduser()
+            if not directory.is_absolute():
+                raise _job_error("invalid_cache_directory", "prefix cache directory must be an absolute path")
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryFile(dir=directory):
+                    pass
+            except OSError as error:
+                raise _job_error("cache_directory_unwritable", str(error)) from error
+            policy = policy.model_copy(update={"prefix_directory": str(directory.resolve())})
+        async with self._lock:
+            if self._memory_configuration_job is not None or self._loading_model_names:
+                raise _job_error("memory_plan_busy", "a model or memory plan is already loading", retryable=True)
+            current = list(self._instances.values())
+            if any(item.state != RuntimeInstanceState.READY or item.active_requests or item.queued_requests or item.control_leases for item in current):
+                raise _job_error("runtime_busy", "wait for model requests to finish before applying memory budgets", retryable=True)
+            limits, hot = self._plan_memory_policy(policy, [*[item.artifact for item in current], *([additional] if additional else [])])
+            previous = self.memory_policy
+            previous_limits, previous_hot = dict(self._policy_model_limits), dict(self._policy_prefix_limits)
+            requests = [self._load_requests[item.artifact.resource.name].model_copy(update={
+                "context_size": item.context_size, "pin": item.pinned, "idle_ttl_seconds": item.idle_ttl_seconds,
+            }) for item in current]
+            self._memory_configuration_job = context.job_id
+        try:
+            for item in current:
+                await self._retire_instance(item)
+            self.memory_policy = policy
+            self._policy_model_limits, self._policy_prefix_limits = limits, hot
+            ordered = sorted(requests, key=lambda request: next(item.artifact.routed_expert_bytes for item in current if item.artifact.resource.name == request.model))
+            for index, request in enumerate(ordered):
+                context.raise_if_cancelled()
+                await self.load(_MemoryPlanContext(context, index / len(ordered), (index + 1) / len(ordered)), request.model_dump(mode="json"))
+            if self.store is not None:
+                await asyncio.to_thread(self.store.save_runtime_memory_policy, policy.model_dump())
+            return {**policy.model_dump(), "models_replanned": len(requests)}
+        except BaseException:
+            for item in list(self._instances.values()):
+                await self._retire_instance(item)
+            self.memory_policy = previous
+            self._policy_model_limits, self._policy_prefix_limits = previous_limits, previous_hot
+            await context.log("Memory planning did not complete; restoring the previous model configuration.")
+            for request in requests:
+                try:
+                    await self.load(_MemoryPlanContext(context, recovery=True), request.model_dump(mode="json"))
+                except BaseException as error:
+                    await context.log(f"Could not restore {request.model}: {type(error).__name__}")
+            raise
+        finally:
+            async with self._lock:
+                self._memory_configuration_job = None
 
     async def unload(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
         request = ModelUnloadRequest.model_validate(payload)
@@ -2318,7 +2487,6 @@ class RuntimePool:
         )
         if (
             request.moe_gpu_cache_gb is not None
-            or self.backend != "metal"
             or ceiling is None
             or artifact.resource.format not in {"hf", "mfq"}
             or artifact.routed_expert_bytes <= 0
@@ -2789,6 +2957,11 @@ class RuntimePool:
         blocks = status.get("prefix_cache_hot_blocks", status.get("prefix_cache_snapshots"))
         def measured(value: Any) -> bool:
             return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+        if measured(hot):
+            values["prefix_cache_bytes"] = int(hot)
+        limit = status.get("prefix_cache_max_bytes")
+        if measured(limit):
+            values["prefix_cache_limit_bytes"] = int(limit)
         if measured(live) and measured(hot):
             values["kv_bytes"] = int(live) + int(hot)
         if measured(groups) and measured(hot):
@@ -2971,6 +3144,9 @@ class RuntimePool:
             self.executable, self.backend, model=artifact.path
         )
         process_environment.update(self.runtime_environment)
+        cache_directory = str(self._prefix_cache_directory())
+        process_environment["MFQ_RUNTIME_PREFIX_CACHE_DIR"] = cache_directory
+        process_environment["MFQ_SERVER_PREFIX_CACHE_DIR"] = cache_directory
         cache_environment = {
             "MFQ_RUNTIME_MAX_KV_SESSIONS": request.prefix_cache_max_sessions,
             "MFQ_RUNTIME_MAX_KV_SNAPSHOTS_PER_SESSION": (

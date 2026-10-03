@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -11,7 +12,7 @@ import re
 import ssl
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote, unquote, urlparse
@@ -578,6 +579,7 @@ def _optional_text(value: Any, *, limit: int = 2048) -> str | None:
 class HubCatalog:
     def __init__(self, *, cache_path: Path | None = None) -> None:
         self._official_cache: dict[tuple[HubProvider, str], HubModelInfo | None] = {}
+        self._discovered_sources: set[tuple[HubProvider, str]] = set()
         self._official_cache_time = 0.0
         self._source_cache_times: dict[tuple[HubProvider, str], float] = {}
         self._cache_path = cache_path
@@ -612,9 +614,10 @@ class HubCatalog:
                 if not math.isfinite(cached_at) or cached_at > now:
                     return
                 key = (model.provider, model.repo_id)
-                if key in sources:
+                if key in sources or self._is_official_repo(model.repo_id):
                     cache[key] = model
                     times[key] = time.monotonic() - (now - cached_at)
+                    self._discovered_sources.add(key)
             self._official_cache = cache
             self._source_cache_times = times
             self._official_cache_time = time.monotonic() - age
@@ -731,7 +734,7 @@ class HubCatalog:
         if not self._closed and not refreshing and (refresh or stale):
             self._refresh_task = asyncio.create_task(self._refresh_official_cache(profile))
             refreshing = True
-        models = [self._official_model(spec, profile) for spec in _OFFICIAL_MODELS]
+        models = [self._official_model(spec, profile) for spec in self._official_specs()]
         return OfficialModelList(system=profile, data=models, refreshing=refreshing)
 
     async def _refresh_official_cache(
@@ -739,24 +742,97 @@ class HubCatalog:
     ) -> None:
         sources = {
             (source.provider, source.repo_id)
-            for model in _OFFICIAL_MODELS
+            for model in self._official_specs()
             for source in model.sources
         }
+
+        semaphore = asyncio.Semaphore(4)
 
         async def inspect(provider: HubProvider, repo_id: str) -> None:
             key = (provider, repo_id)
             try:
-                self._official_cache[key] = await self._fetch_info(
-                    provider, repo_id, None, profile
-                )
+                async with semaphore:
+                    self._official_cache[key] = await self._fetch_info(provider, repo_id, None, profile)
                 self._source_cache_times[key] = time.monotonic()
             except HubError:
                 # Keep the last usable snapshot when a hub is temporarily offline.
                 self._official_cache.setdefault(key, None)
 
-        await asyncio.gather(*(inspect(*key) for key in sorted(sources)))
+        async def discover(provider: HubProvider) -> None:
+            try:
+                async with asyncio.timeout(_METADATA_DEADLINE):
+                    repos = await self._discover_official(provider)
+            except (HubError, TimeoutError):
+                return
+            additions = {(provider, repo) for repo in repos if self._is_official_repo(repo)} - sources
+            self._discovered_sources.update(additions)
+            await asyncio.gather(*(inspect(*key) for key in sorted(additions)))
+
+        await asyncio.gather(*(inspect(*key) for key in sorted(sources)), discover("huggingface"), discover("modelscope"))
         self._official_cache_time = time.monotonic()
         self._save_cache()
+
+    @staticmethod
+    def _is_official_repo(repo_id: str) -> bool:
+        return bool(_REPOSITORY_PATTERN.fullmatch(repo_id) and repo_id.split('/')[0].casefold() == 'tylogi' and 'mfq' in repo_id.split('/')[1].casefold())
+
+    @staticmethod
+    async def _discover_official(provider: HubProvider) -> list[str]:
+        endpoint = 'https://huggingface.co/api/models' if provider == 'huggingface' else 'https://modelscope.cn/openapi/v1/models'
+        repos = []
+        try:
+            async with _metadata_client(endpoint) as client:
+                page, url = 1, endpoint
+                while page <= 150:
+                    params = {'author': 'Tylogi', 'limit': 100} if provider == 'huggingface' and page == 1 else {'owner': 'Tylogi', 'page_number': page, 'page_size': 20} if provider == 'modelscope' else None
+                    response = await client.get(url, params=params)
+                    response.raise_for_status()
+                    payload = response.json()
+                    if provider == 'huggingface':
+                        values = payload
+                    else:
+                        if payload.get('success') is False:
+                            raise HubError('ModelScope author discovery failed')
+                        data = payload.get('data', {})
+                        values = data.get('models', [])
+                    repos.extend(item['id'] for item in values if isinstance(item.get('id'), str) and not item.get('private', False) and HubCatalog._is_official_repo(item['id']))
+                    if provider == 'modelscope':
+                        if len(values) < 20 or page * 20 >= int(data.get('total_count', page * 20 + 1)):
+                            break
+                    else:
+                        next_url = response.links.get('next', {}).get('url')
+                        if not next_url:
+                            break
+                        parsed = urlparse(next_url)
+                        if parsed.scheme != 'https' or parsed.netloc != 'huggingface.co' or parsed.path != '/api/models':
+                            raise HubError('Invalid Hugging Face discovery pagination URL')
+                        url = next_url
+                    page += 1
+            return repos
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as error:
+            raise HubError('Official model discovery failed') from error
+
+    def _official_specs(self) -> list[_OfficialModelSpec]:
+        specs = {model.sources[0].repo_id.split('/')[1].casefold(): model for model in _OFFICIAL_MODELS}
+        for provider, repo_id in sorted(self._discovered_sources):
+            source = _OfficialSourceSpec(provider, repo_id)
+            name = repo_id.split('/')[1]
+            key = name.casefold()
+            if key in specs:
+                model = specs[key]
+                if source not in model.sources:
+                    specs[key] = replace(model, sources=(*model.sources, source))
+                continue
+            info = self._official_cache.get((provider, repo_id))
+            specs[key] = _OfficialModelSpec(
+                id='tylogi-' + hashlib.sha256(key.encode()).hexdigest()[:16], name=re.sub(r'-MFQ$', '', name, flags=re.IGNORECASE),
+                family='Tylogi MFQ', architecture=info.architectures[0] if info and info.architectures else 'unknown',
+                description=info.description if info and info.description else 'Official MFQ model published by Tylogi.',
+                description_zh='Tylogi 发布的官方 MFQ 模型。', parameter_label=None, active_parameter_label=None,
+                modalities=tuple(info.modalities) if info and info.modalities else ('text',), capabilities=(), precision_options=(),
+                license=info.license if info else None, sources=(source,),
+            )
+        return list(specs.values())
 
     def _official_model(
         self, spec: _OfficialModelSpec, profile: HubSystemProfile

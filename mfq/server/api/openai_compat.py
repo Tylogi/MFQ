@@ -48,6 +48,7 @@ class OpenAIChatRequest:
     tool_choice: ToolChoice = "auto"
     response_format: ResponseFormat | None = None
     session_id: UUID | None = None
+    routing_model: str | None = None
 
 
 _TOOL_CHOICE = TypeAdapter(ToolChoice)
@@ -302,7 +303,7 @@ def _backend_stream(
     request: OpenAIChatRequest,
 ) -> AsyncIterator[BackendDelta]:
     return backend.stream(
-        model=request.model,
+        model=request.routing_model or request.model,
         messages=request.messages,
         sampling=request.sampling,
         session_id=request.session_id,

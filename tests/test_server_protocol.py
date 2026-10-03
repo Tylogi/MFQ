@@ -180,6 +180,8 @@ def test_openapi_contract_has_all_native_routes_and_realtime_extension() -> None
         "/api/v1/components/voice-output/activate",
         "/api/v1/runtime/reload",
         "/api/v1/runtime/listener",
+        "/api/v1/runtime/memory-policy",
+        "/api/v1/runtime/model-aliases",
         "/api/v1/runtime/cache/clear",
         "/api/v1/runtime/cache/trim",
         "/api/v1/runtime/profiles",

@@ -3,6 +3,8 @@ import { useSettings } from '../settings/SettingsProvider';
 import { SectionLabel, SettingRow, TMPanel } from '../../app/display';
 import { formatBytes, formatNumber } from '../../app/formatters';
 import { ModelContextSettings } from '../runtime/ModelContextSettings';
+import { MemoryBudgetControls } from './MemoryBudgetControls';
+import { PrefixCacheDirectory } from './PrefixCacheDirectory';
 export function MemorySettingsPanel() {
   const { runtime, instances } = useRuntime();
   const { tr } = useSettings();
@@ -11,7 +13,6 @@ export function MemorySettingsPanel() {
   const memory = amounts.reduce<number>((sum, bytes) => sum + (bytes ?? 0), 0);
   const missing = amounts.some((bytes) => bytes == null);
   const residency = formatBytes(memory).replace(/\b(KB|MB|GB|TB)\b/g, (unit) => `${unit[0]}iB`);
-  const hotBytes = Number(runtime?.prefix_cache_hot_bytes ?? runtime?.prefix_cache_bytes ?? 0);
   const diskBudget = Number(runtime?.prefix_cache_disk_max_bytes ?? 0);
   const persistent = typeof runtime?.prefix_cache_max_bytes === 'number';
   const hotOnly = runtime?.prefix_cache_mode === 'single_device_hot_prefix';
@@ -19,28 +20,7 @@ export function MemorySettingsPanel() {
         <SectionLabel title={tr('内存规划', 'Memory plan')} />
         <TMPanel className="server-settings-panel">
           <div className="setting-list">
-            <SettingRow
-              title={tr('模型总驻留', 'Total model residency')}
-              detail={tr(
-                'MFQ 根据模型、专家缓存和设备可用内存自动规划驻留。',
-                'MFQ plans model, expert-cache, and device residency from the available memory automatically.',
-              )}
-              trailing={
-                <strong>
-                  {memory > 0 ? `${missing ? '≥ ' : ''}${residency}` : loaded.length ? '--' : tr('自动', 'Automatic')}
-                </strong>
-              }
-            />
-            <SettingRow
-              title={tr('前缀 RAM 配额', 'Prefix RAM allowance')}
-              detail={tr(
-                'RAM 热层从统一内存预算中分配，剩余空间可用于模型和专家缓存。',
-                'The RAM hot tier is allocated inside the unified budget, leaving the remainder for model and expert caching.',
-              )}
-              trailing={
-                <strong>{hotBytes > 0 ? formatBytes(hotBytes) : tr('自动', 'Automatic')}</strong>
-              }
-            />
+            <MemoryBudgetControls residency={memory > 0 ? `${missing ? '≥ ' : ''}${residency}` : '--'} />
             <SettingRow
               title={tr('启动时预热专家缓存', 'Warm expert cache on launch')}
               detail={tr(
@@ -84,14 +64,7 @@ export function MemorySettingsPanel() {
                 />
               }
             />
-            <SettingRow
-              title={tr('目录', 'Directory')}
-              detail={tr(
-                'MFQ 自动选择应用数据目录中的本地缓存位置。',
-                'MFQ automatically uses a local cache location inside the application data directory.',
-              )}
-              trailing={<code>{tr('由 MFQ 管理', 'Managed by MFQ')}</code>}
-            />
+            <PrefixCacheDirectory />
             <SettingRow
               title={tr('SSD 配额', 'SSD budget')}
               detail={tr(

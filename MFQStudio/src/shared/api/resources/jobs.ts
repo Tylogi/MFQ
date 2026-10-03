@@ -4,6 +4,9 @@ import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client
 import { readEventStream } from '../eventStream';
 
 export const jobsApi = {
+  getJob(id: string): Promise<JobResource> {
+    return request(`/api/v1/jobs/${id}`);
+  },
   /** 获取最近的后台任务。 */
   async jobs(limit = 100): Promise<JobResource[]> {
     return (await request<{ data: JobResource[] }>(`/api/v1/jobs?limit=${limit}`)).data;

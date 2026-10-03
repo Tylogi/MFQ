@@ -176,6 +176,7 @@ export const useJobStore = create<JobState>()((set, get) => ({
           get().updateJob(id, {
             ...(status ? { status } : {}),
             ...(typeof event.progress === 'number' ? { progress: event.progress } : {}),
+            ...(event.type === 'progress' ? { progress_data: event.data } : {}),
             updated_at: event.created_at,
           });
           if (status && TERMINAL_STATUSES.has(status)) {

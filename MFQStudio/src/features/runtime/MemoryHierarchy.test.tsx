@@ -15,6 +15,17 @@ function model(id: string, bytes: number): RuntimeInstance {
     } };
 }
 
+it('shows prefix usage against the combined quota without adding it to KV twice', () => {
+  const first = model('1', 1024), second = model('2', 3072);
+  first.memory!.prefix_cache_bytes = 256;
+  second.memory!.prefix_cache_bytes = 768;
+  first.memory!.prefix_cache_limit_bytes = 4096;
+  second.memory!.prefix_cache_limit_bytes = 4096;
+  const { container } = render(<MemoryHierarchy instances={[first, second]} memoryCapacityBytes={32768} />);
+  expect(container.querySelector('.memory-tier-prefix-quota')).toHaveTextContent('1 KiB / 8 KiB');
+  expect(container.querySelector('[data-tier="kv"]')).toHaveTextContent('4 KiB / 28 KiB');
+});
+
 it('shows a dotted model legend even with one loaded model and four resource tiers', () => {
   const { container } = render(<MemoryHierarchy instances={[model('1', 1024)]} memoryCapacityBytes={4096} />);
   expect(screen.getByText('Runtime resources')).toBeInTheDocument();

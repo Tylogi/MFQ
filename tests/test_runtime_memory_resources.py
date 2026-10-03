@@ -16,6 +16,7 @@ def test_memory_resources_use_worker_measurements_not_allocator_or_io_totals():
         "resident_weight_bytes": 1024, "mlx_active_bytes": 999999,
         "mlx_cache_bytes": 99999, "kv_cache_bytes": 100, "kv_cache_contexts": 1,
         "prefix_cache_hot_bytes": 50, "prefix_cache_sessions": 2,
+        "prefix_cache_max_bytes": 2048,
         "prefix_cache_resident_sessions": 2,
         "prefix_cache_hot_blocks": 3, "prefix_cache_disk_blocks": 10,
         "ssd_expert_enabled": 1, "ssd_expert_payload_bytes": 5000,
@@ -24,6 +25,8 @@ def test_memory_resources_use_worker_measurements_not_allocator_or_io_totals():
     })
     assert memory.resident_weight_bytes == 1024
     assert memory.kv_bytes == 150
+    assert memory.prefix_cache_bytes == 50
+    assert memory.prefix_cache_limit_bytes == 2048
     assert memory.context_count == 3
     assert memory.prefix_cache_blocks == 3
     assert memory.ssd_experts is True

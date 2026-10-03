@@ -96,6 +96,7 @@ from mfq.server.protocol.models import (
     ModelArtifactList,
     ModelDirectoryList,
     ModelLoadRequest,
+    RuntimeMemoryPolicy,
     ModelUnloadRequest,
     OfficialModelList,
     OperationAccepted,
@@ -295,6 +296,7 @@ class ServerService:
         stream_keepalive_seconds: float = 15.0,
     ) -> None:
         self.store = store
+        self.model_aliases = store.runtime_model_aliases()
         self.backend = backend
         self.jobs = jobs or JobManager(store)
         self.catalog = catalog
@@ -312,6 +314,9 @@ class ServerService:
         self._closed = False
         if runtime_manager is not None:
             runtime_manager.store = store
+            if hasattr(runtime_manager, "configure_memory_policy"):
+                runtime_manager.memory_policy = RuntimeMemoryPolicy.model_validate(store.runtime_memory_policy())
+                self.jobs.register("runtime.memory.configure", TypedJobHandler(runtime_manager.configure_memory_policy, RuntimeMemoryPolicy))
             self.jobs.register(
                 "model.load", TypedJobHandler(runtime_manager.load, ModelLoadRequest)
             )
@@ -1346,7 +1351,24 @@ class ServerService:
     async def runtime_models(self) -> dict[str, Any]:
         return await self._runtime_request("runtime_models")
 
-    async def advertised_models(self) -> dict[str, Any]:
+    def resolve_model_alias(self, model: str) -> str:
+        return next((name for name, alias in self.model_aliases.items() if alias == model), model)
+
+    async def configure_model_aliases(self, aliases: dict[str, str]) -> dict[str, Any]:
+        models = await self.advertised_models(use_aliases=False)
+        names = {item['id'] for item in models.get('data', [])}
+        normalized = {name: alias.strip() for name, alias in aliases.items() if alias.strip() and alias.strip() != name}
+        if any(name not in names for name in normalized):
+            raise ServiceError(400, "unknown_model", "alias mappings must refer to registered or loaded models")
+        if any(len(alias) > 255 or any(ord(char) < 32 for char in alias) for alias in normalized.values()):
+            raise ServiceError(400, "invalid_model_alias", "model aliases must be at most 255 characters without control characters")
+        if len(set(normalized.values())) != len(normalized) or any(alias in names for alias in normalized.values()):
+            raise ServiceError(409, "model_alias_conflict", "model aliases must be unique and cannot shadow another model name")
+        await asyncio.to_thread(self.store.save_runtime_model_aliases, normalized)
+        self.model_aliases = normalized
+        return {"aliases": dict(normalized)}
+
+    async def advertised_models(self, *, use_aliases: bool = True) -> dict[str, Any]:
         """List every model that the OpenAI endpoint can resolve on demand."""
 
         advertised: dict[str, dict[str, Any]] = {}
@@ -1362,7 +1384,7 @@ class ServerService:
             runtime_models = await self.runtime_models()
         except ServiceError:
             if advertised:
-                return {"object": "list", "data": list(advertised.values())}
+                return {"object": "list", "data": [{**item, "id": self.model_aliases.get(name, name) if use_aliases else name} for name, item in advertised.items()]}
             raise
         runtime_data = runtime_models.get("data") if isinstance(runtime_models, dict) else None
         for item in runtime_data if isinstance(runtime_data, list) else []:
@@ -1371,7 +1393,7 @@ class ServerService:
             model_id = item.get("id")
             if isinstance(model_id, str) and model_id:
                 advertised.setdefault(model_id, item)
-        return {"object": "list", "data": list(advertised.values())}
+        return {"object": "list", "data": [{**item, "id": self.model_aliases.get(name, name) if use_aliases else name} for name, item in advertised.items()]}
 
     async def realtime_capabilities(self) -> dict[str, Any]:
         return await self._runtime_request("realtime_capabilities")

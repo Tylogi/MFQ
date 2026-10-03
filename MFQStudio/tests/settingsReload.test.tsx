@@ -73,7 +73,7 @@ it.each(['', '0', '512.5', '131073'])('无效 ctx %s 不发送重载请求', (va
 
 it('模型总驻留汇总两个实例，不随当前模型变成单个模型大小', () => {
   render(<MemorySettingsPanel />);
-  const row = screen.getByText('Total model residency').closest('.setting-row')!;
+  const row = screen.getByText(/Current weight residency/).closest('.memory-budget-actions')!;
   expect(row).toHaveTextContent('96.3');
   expect(row).not.toHaveTextContent('17.7');
 });

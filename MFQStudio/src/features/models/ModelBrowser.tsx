@@ -18,6 +18,7 @@ import { modelsApi } from '../../shared/api/resources/models';
 import { openStudioExternal } from '../../shared/platform/studio';
 import { BackendBadge } from './BackendBadge';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
+import { RepositoryFiles } from './RepositoryFiles';
 
 type Translate = (chinese: string, english: string) => string;
 export type ModelBrowserTab = 'official' | 'community' | 'downloads';
@@ -138,7 +139,7 @@ function safeSegment(value: string): string {
 
 function downloadPatterns(variant: HubModelVariant | null): string[] {
   if (!variant) return [];
-  if (variant.format === "unknown") return [];
+  if (variant.format === "unknown") return variant.files;
   const weights = variant.files.length <= 48
     ? variant.files
     : variant.format === "mfq"
@@ -148,7 +149,7 @@ function downloadPatterns(variant: HubModelVariant | null): string[] {
         : variant.format === "gguf"
           ? ["*.gguf"]
           : variant.files.slice(0, 48);
-  return Array.from(new Set([...weights, ...SUPPORT_FILES])).slice(0, 64);
+  return Array.from(new Set([...weights, ...SUPPORT_FILES]));
 }
 
 function ConfigurationBadge({ status, tr }: { status: ModelConfigurationStatus; tr: Translate }) {
@@ -254,6 +255,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [communityLoading, setCommunityLoading] = useState(false);
   const [downloading, setDownloading] = useState<string | null>(null);
+  const [maxWorkers, setMaxWorkers] = useState(8);
   const officialRequest = useRef(0);
   const catalogRequest = useRef(0);
   const catalogTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -404,6 +406,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
         revision: source.revision,
         include: downloadPatterns(variant),
         expected_bytes: variant.byte_size || null,
+        max_workers: maxWorkers,
       });
       onJobCreated(created, origin);
     } catch (cause) {
@@ -421,10 +424,17 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
           <h2>{tr("模型浏览器", "Model browser")}</h2>
           <p>{tr("查找官方优化模型或浏览社区仓库。", "Find optimized official models or browse community repositories.")}</p>
         </div>
+        <div className="model-browser-actions">
+          <label className="download-concurrency">{tr('最大并发下载上限', 'Maximum concurrent downloads')}
+            <select aria-label={tr('最大并发下载上限', 'Maximum concurrent downloads')} value={maxWorkers} onChange={(event) => setMaxWorkers(Number(event.target.value))}>
+              {[1, 2, 4, 8, 16].map((count) => <option key={count} value={count}>{count}</option>)}
+            </select>
+          </label>
         <div className="model-browser-tabs" role="tablist">
           <button aria-selected={tab === "official"} onClick={() => onTabChange("official")} role="tab" type="button">{tr("官方模型", "Official")}</button>
           <button aria-selected={tab === "community"} onClick={() => onTabChange("community")} role="tab" type="button">{tr("第三方模型", "Community")}</button>
           <button aria-selected={tab === "downloads"} onClick={() => onTabChange("downloads")} role="tab" type="button">{tr("下载队列", "Download queue")}</button>
+        </div>
         </div>
       </header>
 
@@ -476,6 +486,12 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
                 <div className="repository-line"><button onClick={() => void openStudioExternal(selectedSource.url).catch((cause) => onError(cause instanceof Error ? cause.message : String(cause)))} type="button">{selectedSource.repo_id}</button><span>{officialVariants.length} {tr("个精度版本", "variants")}</span></div>
                 {selectedOfficial.supports_ssd_streaming && <div className="streaming-note">{tr("支持 SSD 专家流式读取；即使无法完整常驻仍可流式运行。上方图标只表示完整常驻时的内存压力。", "SSD expert streaming remains available when the model cannot fit fully in memory. The icon above reflects full-residency memory pressure only.")}</div>}
                 <VariantList disabled={officialLoading || !selectedSource.available || !canDownload(selectedSource.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision || selectedOfficial.revision }, variant, origin)} tr={tr} variants={officialVariants} />
+                {sourceInfoMatches && <RepositoryFiles key={`${selectedSource.provider}:${selectedSource.repo_id}:${officialSourceInfo!.revision}`}
+                  files={officialSourceInfo!.files} disabled={officialLoading || !canDownload(selectedSource.provider) || downloading !== null} tr={tr}
+                  onDownload={(files, label, origin) => void download(officialSourceInfo!, {
+                    id: label, label, format: 'unknown', files: files.map((file) => file.name),
+                    byte_size: files.reduce((sum, file) => sum + file.byte_size, 0), configuration: { status: 'unknown', recommendation: 'unknown', reasons: [] },
+                  }, origin)} />}
               </aside>
             )}
           </div>
@@ -511,6 +527,12 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
                 </dl>
                 {communityModel.source_url && <div className="repository-line"><button onClick={() => void openStudioExternal(communityModel.source_url!).catch((cause) => onError(cause instanceof Error ? cause.message : String(cause)))} type="button">{tr("打开模型卡", "Open model card")}</button><span>{formatCount(communityModel.downloads)} downloads · {formatCount(communityModel.likes)} likes · {communityModel.files.length} files</span></div>}
                 <VariantList disabled={communityLoading || !canDownload(communityModel.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: communityModel.provider, repo_id: communityModel.repo_id, revision: communityModel.revision }, variant, origin)} tr={tr} variants={communityModel.variants} />
+                <RepositoryFiles key={`${communityModel.provider}:${communityModel.repo_id}:${communityModel.revision}`} files={communityModel.files}
+                  disabled={communityLoading || !canDownload(communityModel.provider) || downloading !== null} tr={tr}
+                  onDownload={(files, label, origin) => void download(communityModel, {
+                    id: label, label, format: 'unknown', files: files.map((file) => file.name),
+                    byte_size: files.reduce((sum, file) => sum + file.byte_size, 0), configuration: { status: 'unknown', recommendation: 'unknown', reasons: [] },
+                  }, origin)} />
               </aside>
             )}
           </div>

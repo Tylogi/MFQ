@@ -603,6 +603,16 @@ class McpToolCallResult(ProtocolModel):
     is_error: bool = False
 
 
+class RuntimeMemoryPolicy(ProtocolModel):
+    model_limit_bytes: int | None = Field(default=None, ge=1)
+    prefix_limit_bytes: int | None = Field(default=None, ge=0)
+    prefix_directory: str | None = Field(default=None, min_length=1, max_length=4096)
+
+
+class RuntimeModelAliases(ProtocolModel):
+    aliases: dict[str, str] = Field(default_factory=dict, max_length=128)
+
+
 class ModelLoadRequest(ProtocolModel):
     model: str = Field(min_length=1, max_length=255)
     artifact_uri: str | None = Field(default=None, min_length=1)
@@ -747,6 +757,8 @@ class RuntimeMemoryResources(ProtocolModel):
     kv_bytes: int | None = Field(default=None, ge=0)
     context_count: int | None = Field(default=None, ge=0)
     prefix_cache_blocks: int | None = Field(default=None, ge=0)
+    prefix_cache_bytes: int | None = Field(default=None, ge=0)
+    prefix_cache_limit_bytes: int | None = Field(default=None, ge=0)
     ssd_experts: bool | None = None
     ssd_expert_bytes: int | None = Field(default=None, ge=0)
     ssd_ple: bool | None = None
@@ -830,6 +842,7 @@ class ModelArtifactResource(ProtocolModel):
     architecture: str = Field(min_length=1, max_length=128)
     format: Literal["mfq", "hf"] = "mfq"
     shard_count: int = Field(ge=1)
+    missing_shards: int = Field(default=0, ge=0)
     total_bytes: int = Field(ge=0)
     tensor_count: int = Field(ge=0)
     record_count: int = Field(ge=0)
@@ -1136,6 +1149,7 @@ class JobResource(ProtocolModel):
     status: JobStatus
     payload: dict[str, Any]
     progress: float = Field(ge=0.0, le=1.0)
+    progress_data: dict[str, Any] = Field(default_factory=dict)
     cancel_requested: bool = False
     result: dict[str, Any] | None = None
     error: ErrorDetail | None = None

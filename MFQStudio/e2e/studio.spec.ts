@@ -16,6 +16,29 @@ async function navigateClient(page: Page, path: string) {
   }, path);
 }
 
+test('服务器移除对话和可执行文件，设置迁入对话页，模型宽框包含生成参数', async ({ page }, testInfo) => {
+  await mockStudioServer(page);
+  await page.route('**/api/v1/runtime/models', (route) => route.fulfill({ json: { data: [{ id: 'Test Model' }, { id: 'Another Model' }] } }));
+  await page.goto('/runtime');
+  await expect(page.getByText('Runtime executable', { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('textbox', { name: 'System prompt' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Alias mapping' })).toBeEnabled();
+  await expect(page.getByText('/data/mfq/prefix-cache', { exact: true })).toBeVisible();
+  await navigateClient(page, '/chat');
+  const box = page.locator('.chat-model-summary');
+  await expect(box.getByRole('combobox', { name: 'Chat model' })).toBeVisible();
+  await expect(box.locator('small')).toBeVisible();
+  await expect(box).toContainText('max tokens');
+  await expect(box).toContainText('temperature');
+  await expect(box).toContainText('streaming');
+  if (testInfo.project.name === 'desktop') expect((await box.boundingBox())!.width).toBeGreaterThan(400);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.getByRole('button', { name: 'Chat settings' }).click();
+  await expect(page.getByRole('dialog', { name: 'Chat settings' })).toBeVisible();
+  await expect(page.getByRole('textbox', { name: 'System prompt' })).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath('chat-settings-and-selector.png'), animations: 'disabled' });
+});
+
 test('每个模型独立修改 ctx，点击立即发送重载且不丢失另一个模型', async ({ page }, testInfo) => {
   await mockStudioServer(page);
   const instances = [
@@ -66,7 +89,7 @@ test('每个模型独立修改 ctx，点击立即发送重载且不丢失另一�
   await expect.poll(() => reloads).toEqual([{ instance_id: 'flash', context_size: 8192 }]);
   await expect(page.getByRole('button', { name: 'Reload Qwen3.8-Flash-S4-L' })).toHaveText('Reloading…');
   await expect(page.getByRole('button', { name: 'Reload Qwen3.8-27B-S4-M' })).toBeEnabled();
-  await expect(page.getByText('Total model residency').locator('..').locator('..')).toContainText('96.3');
+  await expect(page.locator('.memory-budget-actions')).toContainText('96.3');
   await page.screenshot({ path: testInfo.outputPath('per-model-context.png'), animations: 'disabled' });
   complete();
   await expect(page.getByRole('button', { name: 'Reload Qwen3.8-Flash-S4-L' })).toHaveText('Reload');

@@ -106,6 +106,13 @@ export function MemoryHierarchy({ instances, memoryCapacityBytes, connectionRevi
                     title={`${item.model} · ${resourceBytes(bytes!)}${unknown || !capacity ? '' : ` · ${formatNumber(bytes! / capacity * 100, 1)}%`}`} />
                 ))}
               </div>
+              {tier.id === 'kv' && <small className="memory-tier-prefix-quota">
+                {tr('其中前缀缓存', 'Prefix cache within this tier')}{' '}
+                {loaded.every((item) => item.memory?.prefix_cache_bytes != null)
+                  ? resourceBytes(loaded.reduce((sum, item) => sum + item.memory!.prefix_cache_bytes!, 0)) : '--'}
+                {' / '}{loaded.every((item) => item.memory?.prefix_cache_limit_bytes != null)
+                  ? resourceBytes(loaded.reduce((sum, item) => sum + item.memory!.prefix_cache_limit_bytes!, 0)) : '--'}
+              </small>}
               {unknown && <small className="memory-tier-notice"><Icon name="info" size={12} />
                 {tr(`${missing.map(({ item }) => item.model).join('、')}：明细未上报`,
                   `${missing.map(({ item }) => item.model).join(', ')}: breakdown not reported`)}

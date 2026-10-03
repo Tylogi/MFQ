@@ -13,7 +13,26 @@ import type {
 } from '../types';
 import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client';
 
+export interface RuntimeMemoryPolicy {
+  model_limit_bytes: number | null;
+  prefix_limit_bytes: number | null;
+  prefix_directory: string | null;
+  actual_prefix_directory: string;
+}
+
 export const runtimeApi = {
+  modelAliases(): Promise<{ aliases: Record<string, string> }> {
+    return request('/api/v1/runtime/model-aliases');
+  },
+  configureModelAliases(aliases: Record<string, string>): Promise<{ aliases: Record<string, string> }> {
+    return request('/api/v1/runtime/model-aliases', { method: 'PUT', body: JSON.stringify({ aliases }) });
+  },
+  memoryPolicy(): Promise<RuntimeMemoryPolicy> {
+    return request('/api/v1/runtime/memory-policy');
+  },
+  configureMemoryPolicy(policy: Partial<Omit<RuntimeMemoryPolicy, 'actual_prefix_directory'>>): Promise<{ operation_id: string }> {
+    return request('/api/v1/runtime/memory-policy', { method: 'PUT', body: JSON.stringify(policy) });
+  },
   runtimeListener(): Promise<RuntimeListener> {
     return request('/api/v1/runtime/listener');
   },
