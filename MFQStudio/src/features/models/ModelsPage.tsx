@@ -21,7 +21,7 @@ export function ModelsPage() {
         trailing={
           <>
             <button onClick={() => openStudioPage('lab', 'models')} type="button">
-              <Icon name="download" size={14} />{tr('模型仓库', 'Model hub')}
+              <Icon name="download" size={14} />{tr('模型下载', 'Model downloads')}
             </button>
             <button className="primary" disabled={busy}
               onClick={() => void chooseModelDirectory()} type="button">
