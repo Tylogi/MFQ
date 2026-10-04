@@ -83,22 +83,26 @@ __global__ void moe_cache_scatter_kernel(
         static_cast<std::uintptr_t>(item.destination));
     const auto * source = staging + item.source_offset;
     const std::uint64_t nbytes = item.nbytes;
+    const std::uint64_t worker =
+        static_cast<std::uint64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
+    const std::uint64_t workers =
+        static_cast<std::uint64_t>(gridDim.y) * blockDim.x;
     if ((((reinterpret_cast<std::uintptr_t>(destination) |
             reinterpret_cast<std::uintptr_t>(source) |
             static_cast<std::uintptr_t>(nbytes)) & 15u) == 0u)) {
         auto * output = reinterpret_cast<uint4 *>(destination);
         const auto * input = reinterpret_cast<const uint4 *>(source);
         const std::uint64_t count = nbytes / sizeof(uint4);
-        for (std::uint64_t index = threadIdx.x;
+        for (std::uint64_t index = worker;
              index < count;
-             index += blockDim.x) {
+             index += workers) {
             output[index] = input[index];
         }
         return;
     }
-    for (std::uint64_t index = threadIdx.x;
+    for (std::uint64_t index = worker;
          index < nbytes;
-         index += blockDim.x) {
+         index += workers) {
         destination[index] = source[index];
     }
 }
@@ -1618,7 +1622,10 @@ void mfq::moe_cache_scatter_cuda(
         "MoE cache descriptor offset must be non-negative");
     MFQ_RUNTIME_CHECK(transfer_count > 0,
         "MoE cache scatter requires at least one transfer");
-    moe_cache_scatter_kernel<<<transfer_count, 256, 0, stream>>>(
+    // ponytail: size by batch mean; use per-transfer tiles if size imbalance dominates.
+    const auto blocks = std::min<std::int64_t>(32,
+        1 + descriptor_offset / transfer_count / 4096);
+    moe_cache_scatter_kernel<<<dim3(transfer_count, blocks), 256, 0, stream>>>(
         staging, descriptor_offset, transfer_count);
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
 }

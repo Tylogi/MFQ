@@ -1,5 +1,6 @@
 #include "mfq_cuda_cache_ops.h"
 #include "mfq_cuda_quant_ops.h"
+#include "moe_cache_transfer.h"
 
 #include <array>
 #include <cstring>
@@ -70,6 +71,34 @@ static void embedding_cases() {
                 }
 }
 
+static void moe_scatter_cases() {
+    for (int offset : {0, 1, 8, 16})
+        for (int bytes : {0, 1, 15, 16, 17, 4095, 4096, 4097, 65536, 829448, 5242880}) {
+            std::vector<std::uint8_t> source, expected;
+            std::vector<mfq::MoeCacheScatterDescriptor> descriptors;
+            for (int count : {17, bytes, 4096}) {
+                const auto begin = ((source.size() + 15) & ~std::size_t{15}) + 16 + offset;
+                source.resize(begin + count + 16, 0);
+                expected.resize(source.size(), 165);
+                for (int i = 0; i < count; ++i)
+                    source[begin + i] = expected[begin + i] = (i * 37 + count) % 256;
+                descriptors.push_back({begin, begin, static_cast<std::uint64_t>(count)});
+            }
+            auto destination = full({static_cast<int64_t>(expected.size())}, 165,
+                TensorOptions().device(kCUDA).dtype(kUInt8));
+            for (auto& item : descriptors)
+                item.destination += reinterpret_cast<std::uintptr_t>(destination.data_ptr());
+            const auto descriptor_offset = (source.size() + 15) & ~std::size_t{15};
+            source.resize(descriptor_offset + descriptors.size() * sizeof(descriptors[0]));
+            std::memcpy(source.data() + descriptor_offset, descriptors.data(),
+                descriptors.size() * sizeof(descriptors[0]));
+            auto staging = tensor(source).to(kCUDA);
+            mfq::moe_cache_scatter_cuda(staging.data_ptr<std::uint8_t>(), descriptor_offset,
+                descriptors.size(), mfq_current_cuda_stream());
+            exact(destination, tensor(expected));
+        }
+}
+
 static void kv_case(ScalarType dtype, int tokens, int width, int unaligned, int mode,
                     bool batched_positions) {
     constexpr int batch = 2, heads = 2;
@@ -126,6 +155,7 @@ int main() {
     if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
     try {
         embedding_cases();
+        moe_scatter_cases();
         for (auto dtype : {kFloat16, kBFloat16, kFloat32})
             for (int width : {8, 9})
                 for (int unaligned : {-1, 0, 1, 2, 3}) {
@@ -137,7 +167,7 @@ int main() {
                         for (int tokens : {3, 9})
                             kv_case(dtype, tokens, width, unaligned, mode, false);
                 }
-        std::cout << "embedding and KV storage-offset checks passed\n";
+        std::cout << "embedding, MoE scatter and KV storage-offset checks passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
