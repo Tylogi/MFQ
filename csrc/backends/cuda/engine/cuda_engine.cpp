@@ -127,7 +127,7 @@ struct CudaBackend {
     template <class F> decltype(auto) visit(F&& run) {
         return std::visit([&](auto& state) -> decltype(auto) {
             if (!state) throw std::runtime_error("CUDA engine is unloaded");
-            MfqCudaGuard guard(state->execution->layer_placement.primary_device());
+            CudaExecutionScope guard(*state->execution);
             mfq_tensor_backend::NoGradGuard no_grad;
             return run(*state);
         }, state);
@@ -135,6 +135,7 @@ struct CudaBackend {
     std::pair<EngineInfo, std::unique_ptr<TextProcessor>> load() {
         if (!options.context_size) options.context_size = 32768;
         auto execution = std::make_shared<CudaExecutionContext>();
+        CudaExecutionScope guard(*execution);
         setup_cuda_load(options, *execution);
         execution->profiler.enabled = false;
         mfq_tensor_backend::NoGradGuard no_grad;

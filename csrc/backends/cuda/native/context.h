@@ -166,14 +166,19 @@ private:
     cublasHandle_t handle_ = nullptr;
 };
 
+struct ParallelBatchMatmulContext;
+
 class Context final : public std::enable_shared_from_this<Context> {
 public:
     explicit Context(int device);
+    ~Context() noexcept;
 
     int device() const noexcept { return device_; }
     Stream& stream() noexcept { return stream_; }
     const Stream& stream() const noexcept { return stream_; }
     BlasHandle& blas() noexcept { return blas_; }
+    std::shared_ptr<ParallelBatchMatmulContext> parallel_blas;
+    cudaMemPool_t memory_pool() const noexcept { return pool_; }
     bool supports_async_allocations() const noexcept { return async_allocations_; }
 
     void* allocate(std::size_t bytes, cudaStream_t stream = nullptr);
@@ -202,6 +207,19 @@ private:
     std::unordered_map<cudaStream_t, GraphPool> graph_pools_;
 };
 
+// One set belongs to one Engine. Standalone tensor callers use a thread-local set.
+using ContextSet = std::unordered_map<int, std::shared_ptr<Context>>;
+class ContextGuard final {
+public:
+    explicit ContextGuard(ContextSet& contexts);
+    ~ContextGuard() noexcept;
+    ContextGuard(const ContextGuard&) = delete;
+    ContextGuard& operator=(const ContextGuard&) = delete;
+private:
+    ContextSet* previous_;
+    bool changed_;
+    std::unordered_map<int, StreamHandle> streams_;
+};
 std::shared_ptr<Context> default_context(int device = 0);
 
 class Buffer final {

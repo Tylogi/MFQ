@@ -14,13 +14,9 @@
 namespace mfq::cuda {
 namespace {
 
-std::mutex default_context_mutex;
-std::unordered_map<int, std::weak_ptr<Context>> default_contexts;
-// ponytail: global lock is sufficient; shard by thread if stream switching contends.
-std::mutex active_streams_mutex;
-std::unordered_map<
-    std::thread::id,
-    std::unordered_map<int, StreamHandle>> active_streams;
+thread_local ContextSet fallback_contexts;
+thread_local ContextSet* active_contexts = &fallback_contexts;
+thread_local std::unordered_map<int, StreamHandle> active_streams;
 
 template <typename Function>
 void on_device_noexcept(int device, Function&& function) noexcept {
@@ -66,15 +62,19 @@ const char* cublas_status_name(cublasStatus_t status) {
 
 }  // namespace
 
+ContextGuard::ContextGuard(ContextSet& contexts)
+    : previous_(active_contexts), changed_(previous_ != &contexts) {
+    if (changed_) streams_.swap(active_streams);
+    active_contexts = &contexts;
+}
+ContextGuard::~ContextGuard() noexcept {
+    if (changed_) streams_.swap(active_streams);
+    active_contexts = previous_;
+}
+
 std::shared_ptr<Context> default_context(int device) {
-    std::lock_guard lock(default_context_mutex);
-    if (const auto found = default_contexts.find(device); found != default_contexts.end()) {
-        if (auto context = found->second.lock()) {
-            return context;
-        }
-    }
-    auto context = std::make_shared<Context>(device);
-    default_contexts[device] = context;
+    auto& context = (*active_contexts)[device];
+    if (!context) context = std::make_shared<Context>(device);
     return context;
 }
 
@@ -184,16 +184,8 @@ StreamHandle current_stream(int device) {
     if (device < 0) {
         MFQ_NATIVE_CUDA_CHECK(cudaGetDevice(&device));
     }
-    {
-        std::lock_guard lock(active_streams_mutex);
-        const auto thread = active_streams.find(std::this_thread::get_id());
-        if (thread != active_streams.end()) {
-            const auto found = thread->second.find(device);
-            if (found != thread->second.end() && found->second) {
-                return found->second;
-            }
-        }
-    }
+    if (const auto found = active_streams.find(device); found != active_streams.end())
+        return found->second;
     auto context = default_context(device);
     auto* stream = &context->stream();
     auto owner = std::shared_ptr<Stream>(context, stream);
@@ -228,24 +220,13 @@ StreamHandle stream_from_pool(bool high_priority, int device) {
 }
 
 StreamGuard::StreamGuard(StreamHandle stream) : device_(stream.device_index()) {
-    std::lock_guard lock(active_streams_mutex);
-    auto& streams = active_streams[std::this_thread::get_id()];
-    if (const auto found = streams.find(device_); found != streams.end()) {
+    if (const auto found = active_streams.find(device_); found != active_streams.end())
         previous_ = found->second;
-    }
-    streams[device_] = std::move(stream);
+    active_streams[device_] = std::move(stream);
 }
-
 StreamGuard::~StreamGuard() noexcept {
-    std::lock_guard lock(active_streams_mutex);
-    const auto thread_id = std::this_thread::get_id();
-    auto& streams = active_streams[thread_id];
-    if (previous_.has_value()) {
-        streams[device_] = std::move(*previous_);
-    } else {
-        streams.erase(device_);
-        if (streams.empty()) active_streams.erase(thread_id);
-    }
+    if (previous_) active_streams[device_] = std::move(*previous_);
+    else active_streams.erase(device_);
 }
 
 Graph::~Graph() noexcept {
@@ -332,7 +313,7 @@ void Graph::capture_begin() {
                 pool_streams_[index].stream());
         }
         MFQ_NATIVE_CUDA_CHECK(cudaStreamBeginCapture(
-            stream_.stream(), cudaStreamCaptureModeGlobal));
+            stream_.stream(), cudaStreamCaptureModeThreadLocal));
     } catch (...) {
         for (std::size_t index = 0; index < pool_streams_.size(); ++index) {
             pool_contexts_[index]->end_graph_capture(
@@ -508,12 +489,40 @@ Context::Context(int device)
         &pools_supported, cudaDevAttrMemoryPoolsSupported, device_));
     async_allocations_ = pools_supported != 0;
     if (async_allocations_) {
-        MFQ_NATIVE_CUDA_CHECK(cudaDeviceGetDefaultMemPool(&pool_, device_));
+        cudaMemPoolProps properties{};
+        properties.allocType = cudaMemAllocationTypePinned;
+        properties.location = {cudaMemLocationTypeDevice, device_};
+        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolCreate(&pool_, &properties));
         std::uint64_t threshold = std::numeric_limits<std::uint64_t>::max();
-        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolSetAttribute(
-            pool_, cudaMemPoolAttrReleaseThreshold, &threshold));
+        try {
+            MFQ_NATIVE_CUDA_CHECK(cudaMemPoolSetAttribute(
+                pool_, cudaMemPoolAttrReleaseThreshold, &threshold));
+            int devices = 0;
+            MFQ_NATIVE_CUDA_CHECK(cudaGetDeviceCount(&devices));
+            for (int peer = 0; peer < devices; ++peer) {
+                int accessible = 0;
+                if (peer == device_) continue;
+                MFQ_NATIVE_CUDA_CHECK(cudaDeviceCanAccessPeer(&accessible, peer, device_));
+                if (accessible) {
+                    cudaMemAccessDesc access{};
+                    access.location = {cudaMemLocationTypeDevice, peer};
+                    access.flags = cudaMemAccessFlagsProtReadWrite;
+                    MFQ_NATIVE_CUDA_CHECK(cudaMemPoolSetAccess(pool_, &access, 1));
+                }
+            }
+        } catch (...) {
+            (void)cudaMemPoolDestroy(pool_);
+            throw;
+        }
     }
     blas_.set_stream(stream_.get());
+}
+
+Context::~Context() noexcept {
+    on_device_noexcept(device_, [&] {
+        (void)cudaStreamSynchronize(stream_.get());
+        if (pool_) (void)cudaMemPoolDestroy(pool_);
+    });
 }
 
 void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
@@ -545,8 +554,8 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
     }
     void* pointer = nullptr;
     if (async_allocations_) {
-        MFQ_NATIVE_CUDA_CHECK(cudaMallocAsync(
-            &pointer, bytes, allocation_stream));
+        MFQ_NATIVE_CUDA_CHECK(cudaMallocFromPoolAsync(
+            &pointer, bytes, pool_, allocation_stream));
     } else {
         MFQ_NATIVE_CUDA_CHECK(cudaMalloc(&pointer, bytes));
     }

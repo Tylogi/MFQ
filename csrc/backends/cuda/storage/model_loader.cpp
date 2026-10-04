@@ -97,7 +97,7 @@ Model mfq::cuda::load_causal_lm(CudaExecutionContext &execution, const std::stri
         }
     }
     execution.layer_placement.load_device = execution.layer_placement.primary_device();
-    MfqCudaGuard model_guard(execution.layer_placement.primary_device());
+    CudaExecutionScope model_guard(execution);
     if (model.plan.vision == CudaVisionAdapter::grid_vit && execution.dense_cpu_layer_count > 0) {
         throw std::runtime_error("CUDA grid-Vision currently requires GPU-resident text layers");
     }

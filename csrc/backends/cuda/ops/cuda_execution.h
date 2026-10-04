@@ -283,6 +283,9 @@ struct MoeRouteLayerStats {
 struct CudaExecutionContext {
     CudaExecutionContext();
 
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    mfq::cuda::ContextSet native_contexts;
+#endif
     CudaProfiler profiler;
     CudaExecutionConfig config;
     bool force_moe_pool_path = false;
@@ -315,6 +318,19 @@ struct CudaExecutionContext {
 };
 
 void mfq_release_host_allocator_cache() noexcept;
+struct CudaExecutionScope {
+    MfqCudaGuard device;
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    mfq::cuda::ContextGuard context;
+#endif
+    explicit CudaExecutionScope(CudaExecutionContext& execution)
+        : device(execution.layer_placement.primary_device())
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+        , context(execution.native_contexts)
+#endif
+    {}
+};
+
 bool model_parallel_enabled(const CudaExecutionContext& execution);
 const ParallelConfig& model_parallel_config(
     const CudaExecutionContext& execution);

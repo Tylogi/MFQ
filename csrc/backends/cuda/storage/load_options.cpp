@@ -452,6 +452,7 @@ int with_cuda_load(
         const CudaLoadOptions& options,
         const std::function<int(CudaExecutionContext&)>& run) {
     CudaExecutionContext execution;
+    CudaExecutionScope scope(execution);
     setup_cuda_load(options, execution);
     return run(execution);
 }

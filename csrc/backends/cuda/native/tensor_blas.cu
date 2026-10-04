@@ -128,6 +128,8 @@ std::optional<std::int64_t> regular_batch_stride(
     return step.value_or(0);
 }
 
+} // namespace
+
 struct ParallelBatchMatmulContext {
     static constexpr std::size_t kStreams = 4;
 
@@ -150,18 +152,14 @@ struct ParallelBatchMatmulContext {
     std::vector<Event> done;
 };
 
-std::mutex parallel_batch_matmul_contexts_mutex;
-std::unordered_map<int, std::unique_ptr<ParallelBatchMatmulContext>>
-    parallel_batch_matmul_contexts;
-
+namespace {
 ParallelBatchMatmulContext& parallel_batch_matmul_context(int device) {
-    std::lock_guard<std::mutex> lock(parallel_batch_matmul_contexts_mutex);
-    auto& context = parallel_batch_matmul_contexts[device];
-    if (!context) {
+    auto& parallel = default_context(device)->parallel_blas;
+    if (!parallel) {
         DeviceGuard guard(device);
-        context = std::make_unique<ParallelBatchMatmulContext>(device);
+        parallel = std::make_shared<ParallelBatchMatmulContext>(device);
     }
-    return *context;
+    return *parallel;
 }
 
 }  // namespace

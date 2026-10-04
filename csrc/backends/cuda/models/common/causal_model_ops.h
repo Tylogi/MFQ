@@ -141,7 +141,7 @@ template <typename Model> struct CudaCausalOps : Model {
     QuantLinear lm_head;
 
     auto execution_scope() const {
-        return MfqCudaGuard(this->execution->layer_placement.primary_device());
+        return CudaExecutionScope(*this->execution);
     }
     static auto block_scope(const std::unique_ptr<Block> &block) {
         return MfqCudaGuard(block->cuda_device);
