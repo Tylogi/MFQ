@@ -1,5 +1,5 @@
 #include "storage/text_session_cache.h"
-#include "core/full_block.h"
+#include "models/common/full_block.h"
 #include <array>
 #include <cstring>
 
@@ -13,7 +13,7 @@
 #include "models/qwen35/ops.h"
 #include "models/qwen4_exp/ops.h"
 #include "storage/session_state.h"
-#include "core/mtp.h"
+#include "models/common/mtp.h"
 #include "mfq_paged_prefix_cache.h"
 #include "paged_session_bindings.h"
 #include "session_cache.h"

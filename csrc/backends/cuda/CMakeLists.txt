@@ -33,29 +33,29 @@ if(MSVC)
     target_compile_options(mfq-cuda-storage PRIVATE /utf-8 /EHsc)
 endif()
 
-add_library(mfq-cuda-core STATIC
-    ${MFQ_CUDA_ROOT}/src/mfq_cuda_context.cu
-    ${MFQ_CUDA_ROOT}/src/mfq_native_tensor.cpp
-    ${MFQ_CUDA_ROOT}/src/mfq_native_tensor.cu
-    ${MFQ_CUDA_ROOT}/src/mfq_native_tensor_blas.cu
-    ${MFQ_CUDA_ROOT}/src/mfq_native_tensor_creation.cu
-    ${MFQ_CUDA_ROOT}/src/mfq_native_tensor_indexing.cu
-    ${MFQ_CUDA_ROOT}/src/mfq_native_tensor_ops.cu
-    ${MFQ_CUDA_ROOT}/src/mfq_native_tensor_reduction.cu
-    ${MFQ_CUDA_ROOT}/src/mfq_native_tensor_signal.cu
-    ${MFQ_CUDA_ROOT}/src/mfq_native_tensor_sort.cu
+add_library(mfq-cuda-native STATIC
+    ${MFQ_CUDA_ROOT}/native/context.cu
+    ${MFQ_CUDA_ROOT}/native/tensor.cpp
+    ${MFQ_CUDA_ROOT}/native/tensor.cu
+    ${MFQ_CUDA_ROOT}/native/tensor_blas.cu
+    ${MFQ_CUDA_ROOT}/native/tensor_creation.cu
+    ${MFQ_CUDA_ROOT}/native/tensor_indexing.cu
+    ${MFQ_CUDA_ROOT}/native/tensor_ops.cu
+    ${MFQ_CUDA_ROOT}/native/tensor_reduction.cu
+    ${MFQ_CUDA_ROOT}/native/tensor_signal.cu
+    ${MFQ_CUDA_ROOT}/native/tensor_sort.cu
 )
-add_library(mfq::cuda-core ALIAS mfq-cuda-core)
-target_include_directories(mfq-cuda-core PUBLIC
+add_library(mfq::cuda-native ALIAS mfq-cuda-native)
+target_include_directories(mfq-cuda-native PUBLIC
     ${MFQ_CUDA_ROOT}/include
     ${CUDAToolkit_INCLUDE_DIRS}
 )
-target_link_libraries(mfq-cuda-core PUBLIC CUDA::cudart CUDA::cublas)
-target_compile_features(mfq-cuda-core PUBLIC cxx_std_20)
-target_compile_options(mfq-cuda-core PRIVATE
+target_link_libraries(mfq-cuda-native PUBLIC CUDA::cudart CUDA::cublas)
+target_compile_features(mfq-cuda-native PUBLIC cxx_std_20)
+target_compile_options(mfq-cuda-native PRIVATE
     "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>"
 )
-set_target_properties(mfq-cuda-core PROPERTIES
+set_target_properties(mfq-cuda-native PROPERTIES
     CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
     CUDA_RUNTIME_LIBRARY Shared
     CUDA_STANDARD 20
@@ -108,7 +108,7 @@ target_include_directories(mfq-cuda-native-kernels PRIVATE
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 target_link_libraries(mfq-cuda-native-kernels
-    PUBLIC mfq-cuda-core CUDA::cuda_driver
+    PUBLIC mfq-cuda-native CUDA::cuda_driver
     PRIVATE mfq-core mfq-ggml-internal-headers
 )
 target_compile_options(mfq-cuda-native-kernels PRIVATE
@@ -123,7 +123,7 @@ set_target_properties(mfq-cuda-native-kernels PROPERTIES
 )
 
 if(MSVC)
-    foreach(mfq_cuda_target mfq-cuda-core mfq-cuda-native-kernels)
+    foreach(mfq_cuda_target mfq-cuda-native mfq-cuda-native-kernels)
         target_compile_options(${mfq_cuda_target} PRIVATE
             "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>"
             "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>"
@@ -134,7 +134,7 @@ endif()
 if(BUILD_TESTING)
     function(mfq_add_cuda_test target source)
         add_executable(${target} ${source})
-        target_link_libraries(${target} PRIVATE mfq-cuda-core ${ARGN})
+        target_link_libraries(${target} PRIVATE mfq-cuda-native ${ARGN})
         set_target_properties(${target} PROPERTIES
             CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
             CUDA_RUNTIME_LIBRARY Shared
@@ -160,7 +160,7 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-mxfp4-sq-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     target_include_directories(mfq-mxfp4-sq-test PRIVATE ${MFQ_REPOSITORY_ROOT})
     target_link_libraries(mfq-mxfp4-sq-test PRIVATE
-        mfq-core mfq-cuda-core mfq-cuda-native-kernels)
+        mfq-core mfq-cuda-native mfq-cuda-native-kernels)
     set_target_properties(mfq-mxfp4-sq-test PROPERTIES
         CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
         CUDA_RUNTIME_LIBRARY Shared CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
@@ -170,7 +170,7 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-paged-kv-attention-bench PRIVATE
         MFQ_NATIVE_CUDA_RUNTIME=1)
     target_link_libraries(mfq-paged-kv-attention-bench PRIVATE
-        mfq-cuda-core mfq-cuda-native-kernels)
+        mfq-cuda-native mfq-cuda-native-kernels)
     set_target_properties(mfq-paged-kv-attention-bench PROPERTIES
         CUDA_ARCHITECTURES "${MFQ_CUDA_ARCHITECTURES}"
         CUDA_RUNTIME_LIBRARY Shared CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
@@ -283,6 +283,9 @@ function(mfq_configure_cuda_runtime_target target)
 endfunction()
 
 set(MFQ_CUDA_MODEL_SOURCES
+    ${MFQ_CUDA_ROOT}/models/common/causal_model_ops.cpp
+    ${MFQ_CUDA_ROOT}/models/common/ffn.cpp
+    ${MFQ_CUDA_ROOT}/models/common/full_block.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v4/ops.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/ops.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/dspark.cpp
@@ -295,15 +298,6 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/qwen35/batch_state.cpp
 )
 
-set(MFQ_CUDA_TRANSFORMER_SOURCES
-    ${MFQ_CUDA_ROOT}/core/causal_model.cpp
-    ${MFQ_CUDA_ROOT}/core/decode_graph.cpp
-    ${MFQ_CUDA_ROOT}/core/ffn.cpp
-    ${MFQ_CUDA_ROOT}/core/full_block.cpp
-    ${MFQ_CUDA_ROOT}/core/kv_cache.cpp
-    ${MFQ_CUDA_ROOT}/core/rope.cpp
-)
-
 set(MFQ_CUDA_RUNTIME_OP_SOURCES
     ${MFQ_CUDA_ROOT}/ops/cuda_execution.cpp
     ${MFQ_CUDA_ROOT}/ops/format.cpp
@@ -313,6 +307,7 @@ set(MFQ_CUDA_RUNTIME_OP_SOURCES
     ${MFQ_CUDA_ROOT}/ops/moe.cpp
     ${MFQ_CUDA_ROOT}/ops/nint.cpp
     ${MFQ_CUDA_ROOT}/ops/quant_linear.cpp
+    ${MFQ_CUDA_ROOT}/ops/rope.cpp
     ${MFQ_CUDA_ROOT}/ops/vq.cpp
 )
 
@@ -339,7 +334,9 @@ set_target_properties(mfq-cuda-loading PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # optional Torch builds. Extra targets do not reduce their header dependencies.
 set(MFQ_CUDA_INSTANTIATION_SOURCES
     ${MFQ_CUDA_ROOT}/engine/cuda_engine.cpp
+    ${MFQ_CUDA_ROOT}/engine/decode_graph.cpp
     ${MFQ_CUDA_ROOT}/engine/generation.cpp
+    ${MFQ_CUDA_ROOT}/storage/kv_cache.cpp
     ${MFQ_CUDA_ROOT}/storage/text_session_cache.cpp
     ${MFQ_CUDA_ROOT}/engine/mtp.cpp
     ${MFQ_CUDA_ROOT}/engine/cuda_batching.cpp
@@ -347,7 +344,6 @@ set(MFQ_CUDA_INSTANTIATION_SOURCES
     ${MFQ_CUDA_ROOT}/commands/cli.cpp
     ${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp
     ${MFQ_CUDA_MODEL_SOURCES}
-    ${MFQ_CUDA_TRANSFORMER_SOURCES}
 )
 add_library(mfq-cuda-runtime STATIC
     $<TARGET_OBJECTS:mfq-cuda-ops>
@@ -369,7 +365,7 @@ target_link_libraries(mfq-cuda-runtime PRIVATE
     CUDA::cuda_driver
     CUDA::cudart
     CUDA::cublas
-    mfq-cuda-core
+    mfq-cuda-native
     mfq-cuda-native-kernels
     mfq-cuda-storage
 )

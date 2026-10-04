@@ -2,7 +2,7 @@
 
 #include "paged_kv_allocator.h"
 #include "batch_state.h"
-#include "core/full_block.h"
+#include "models/common/full_block.h"
 
 #include <cuda_runtime_api.h>
 

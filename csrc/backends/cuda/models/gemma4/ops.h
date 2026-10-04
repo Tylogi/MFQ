@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/causal_model.h"
+#include "models/common/causal_model_ops.h"
 #include "models/gemma4/causal_lm.h"
 #include "models/gemma4/config.h"
 

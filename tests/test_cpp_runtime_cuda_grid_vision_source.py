@@ -10,7 +10,7 @@ COMMON_CONFIG = (
     ROOT / "csrc/models/common/model_config.cpp"
 ).read_text()
 CUDA_ROOT = ROOT / "csrc/backends/cuda"
-CUDA = (CUDA_ROOT / "core/grid_vision_component.h").read_text()
+CUDA = (CUDA_ROOT / "models/common/grid_vision_component.h").read_text()
 CUDA_APP = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(CUDA_ROOT.rglob("*"))

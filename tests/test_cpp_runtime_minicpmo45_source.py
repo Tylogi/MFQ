@@ -130,7 +130,7 @@ def test_minicpmo45_resampler_requires_exact_numpy_position_asset():
 def test_minicpmo45_supports_native_tensor_files_and_bfloat16_tts():
     assert "mfq_tensor_backend::pickle_load(bytes)" in COMMAND
     assert "mfq_tensor_backend::pickle_save(" in COMMAND
-    assert "MFQTNSR1" in (ROOT / "csrc" / "backends" / "cuda" / "src" / "mfq_native_tensor.cpp").read_text(
+    assert "MFQTNSR1" in (ROOT / "csrc" / "backends" / "cuda" / "native" / "tensor.cpp").read_text(
         encoding="utf-8"
     )
     assert "rr.scalar_type() == mfq_tensor_backend::kBFloat16" in DECODE
@@ -148,7 +148,7 @@ def test_minicpmo45_qwen_runtime_follows_official_bfloat16_boundaries():
     assert "qwen_rms_norm_bf16_kernel" in NORM
     assert "qwen_rms_norm_pair_bf16_finalize_kernel" in NORM
     assert "MFQ_DISABLE_NATIVE_PARALLEL_F32_MEAN" in (
-        ROOT / "csrc" / "backends" / "cuda" / "src" / "mfq_native_tensor_reduction.cu"
+        ROOT / "csrc" / "backends" / "cuda" / "native" / "tensor_reduction.cu"
     ).read_text(encoding="utf-8")
     assert 'rec.dtype != "NINT"' in DECODE
     assert "dequant_nint_dense_f32(to_gpu_nint(unpack_nint(blob)))" in DECODE

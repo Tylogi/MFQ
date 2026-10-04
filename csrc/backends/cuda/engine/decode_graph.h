@@ -3,7 +3,7 @@
 #include "mfq_tensor_backend.h"
 #include "cuda_model_plan.h"
 #include "mfq/runtime.h"
-#include "block.h"
+#include "models/common/block.h"
 #include "cuda_execution.h"
 
 #include <cstdint>

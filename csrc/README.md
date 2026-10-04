@@ -18,13 +18,16 @@ by model family:
 - `components/` — focused integrated components (`ggml`, `tokenizer`, `http`,
   and `json`);
 - `backends/cuda/` — native Engine bindings, model execution adapters,
-  operators, applications, build definition, and tests; `core/causal_model.h`
-  supplies native resources and operations to the shared causal model.
-  Native Transformer, predictor and graph resources belong to `core/`, lower-level
-  operators to `ops/`, and device setup, loading plus session codecs/cache storage
-  to `storage/`.
-  `models/` contains family bindings and implementations; `engine/` contains
-  Engine, generation, batching and MTP execution bindings;
+  operators, applications, build definition, and tests. `native/` implements
+  Tensor/context primitives in the `mfq-cuda-native` target. `ops/` contains
+  device operators, including RoPE; operators consume loaded weights.
+  `storage/` owns weight loading, KV storage and session codecs/cache storage.
+  `models/common/` supplies common native model bindings, Transformer blocks,
+  predictor interfaces and grid-Vision; `models/<family>/` binds each shared
+  family graph. The common `causal_model_ops.h` and `attention_ops.h` names
+  distinguish CUDA bindings from shared model headers.
+  `engine/` contains Engine, generation, batching, MTP execution and decode
+  Graph bindings;
 - `backends/metal/` — Metal/MLX storage, runtime utilities, operators, model
   implementations, kernels, applications, tests, benchmarks, and diagnostics;
 - `tests/` — backend-independent native tests;

@@ -15,7 +15,7 @@ target_compile_features(mfq-cuda-tensor-view-test PRIVATE cxx_std_20)
 add_test(NAME mfq-cuda-tensor-view-test COMMAND mfq-cuda-tensor-view-test)
 
 add_executable(mfq-native-tensor-test
-    ${PROJECT_SOURCE_DIR}/backends/cuda/src/mfq_native_tensor.cpp
+    ${PROJECT_SOURCE_DIR}/backends/cuda/native/tensor.cpp
     ${PROJECT_SOURCE_DIR}/backends/cuda/tests/mfq_native_tensor_cpu_test_stubs.cpp
     ${PROJECT_SOURCE_DIR}/backends/cuda/tests/mfq_native_tensor_test.cpp
 )

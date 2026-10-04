@@ -1,7 +1,7 @@
 #pragma once
 #include "mfq_cuda_linear_attention_ops.h"
 #include "models/glm5_next/causal_lm.h"
-#include "core/attention.h"
+#include "models/common/attention_ops.h"
 #include "mfq/kernels/cuda/glm5_next.h"
 #include <array>
 

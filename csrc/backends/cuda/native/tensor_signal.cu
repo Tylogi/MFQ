@@ -1,4 +1,4 @@
-#include "mfq_native_tensor_ops_common.cuh"
+#include "tensor_ops_common.cuh"
 
 #include <random>
 #include <stdexcept>

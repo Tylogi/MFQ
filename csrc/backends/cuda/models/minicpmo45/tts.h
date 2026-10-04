@@ -6,7 +6,7 @@
 #include <random>
 #include "generation_policy.h"
 #include "sampling.h"
-#include "core/full_block.h"
+#include "models/common/full_block.h"
 #include "ops.h"
 
 struct MiniCPMO45TtsSamplingOps {

@@ -6,12 +6,12 @@
 #include "models/common/transformer_layer.h"
 #include "models/deepseek_v4/causal_lm.h"
 
-#include "core/causal_model.h"
+#include "models/common/causal_model_ops.h"
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"
-#include "core/block.h"
+#include "models/common/block.h"
 #include "models/deepseek_v4/config.h"
-#include "core/ffn.h"
+#include "models/common/ffn.h"
 
 #include <iomanip>
 #include <iostream>

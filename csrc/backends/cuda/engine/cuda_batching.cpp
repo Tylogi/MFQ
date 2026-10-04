@@ -2,8 +2,8 @@
 #include "cuda_batching.h"
 
 #include "cuda_execution.h"
-#include "core/decode_graph.h"
-#include "core/full_block.h"
+#include "engine/decode_graph.h"
+#include "models/common/full_block.h"
 #include "models/qwen35/ops.h"
 
 #include <algorithm>

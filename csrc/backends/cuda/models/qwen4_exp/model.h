@@ -2,8 +2,8 @@
 #include "mfq_cuda_linear_attention_ops.h"
 #include "models/qwen4_exp/causal_lm.h"
 #include "models/qwen4_exp/ngram.h"
-#include "core/attention.h"
-#include "core/rope.h"
+#include "models/common/attention_ops.h"
+#include "rope.h"
 #include "mfq/kernels/cuda/qwen4_exp.h"
 #include <array>
 #include <cstring>

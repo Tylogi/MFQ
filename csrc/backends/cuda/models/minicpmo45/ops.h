@@ -1,10 +1,10 @@
 #pragma once
 #include "step_sequence.h"
 
-#include "core/causal_model.h"
+#include "models/common/causal_model_ops.h"
 #include "storage/session_state.h"
 #include "inference.h"
-#include "core/block.h"
+#include "models/common/block.h"
 #include "models/minicpmo45/causal_lm.h"
 #include "models/minicpmo45/config.h"
 #include "quant_linear.h"

@@ -197,7 +197,7 @@ void copy_contiguous_cpu(Tensor& destination, const Tensor& source) {
 
 }  // namespace
 
-// Implemented in mfq_native_tensor.cu for CUDA allocations and copies.
+// Implemented in tensor.cu for CUDA allocations and copies.
 Tensor empty_cuda(std::span<const std::int64_t> shape, const TensorOptions& options);
 Tensor empty_pinned(std::span<const std::int64_t> shape, const TensorOptions& options);
 Tensor copy_or_convert_cuda(const Tensor& source, const TensorOptions& options);

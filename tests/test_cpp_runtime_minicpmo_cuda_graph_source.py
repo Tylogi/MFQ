@@ -23,22 +23,22 @@ MODEL_METADATA_SOURCE = "\n".join(
 SOURCE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in (
-        CUDA_ROOT / "core" / "causal_model.h",
-        CUDA_ROOT / "core" / "causal_model.cpp",
+        CUDA_ROOT / "models/common/causal_model_ops.h",
+        CUDA_ROOT / "models/common/causal_model_ops.cpp",
         CUDA_ROOT / "storage" / "session_codec.h",
         CUDA_ROOT / "storage" / "transformer_loader.h",
         CUDA_ROOT / "storage" / "transformer_loader.cpp",
-        CUDA_ROOT / "core" / "full_block.h",
-        CUDA_ROOT / "core" / "full_block.cpp",
-        CUDA_ROOT / "core" / "kv_cache.h",
-        CUDA_ROOT / "core" / "kv_cache.cpp",
+        CUDA_ROOT / "models/common/full_block.h",
+        CUDA_ROOT / "models/common/full_block.cpp",
+        CUDA_ROOT / "storage/kv_cache.h",
+        CUDA_ROOT / "storage/kv_cache.cpp",
         CUDA_ROOT / "include" / "mfq_cuda_attention_ops.h",
         CUDA_ROOT / "include" / "mfq_cuda_cache_ops.h",
         CUDA_ROOT / "include" / "mfq_cuda_norm_ops.h",
         CUDA_ROOT / "include" / "mfq_cuda_sampling_ops.h",
         CUDA_ROOT / "ops" / "include" / "cuda_execution.h",
         CUDA_ROOT / "ops" / "cuda_execution.cpp",
-        CUDA_ROOT / "core" / "decode_graph.h",
+        CUDA_ROOT / "engine/decode_graph.h",
     )
 ) + "\n" + BACKEND_CHECKS + "\n" + CUDA_RUNTIME + "\n" + (
     CUDA_ROOT / "commands" / "diagnostics.cpp"
@@ -57,15 +57,15 @@ BACKEND_SOURCE = (
     Path(__file__).parents[1] / "csrc" / "backends" / "cuda" / "include" / "mfq_tensor_backend.h"
 ).read_text(encoding="utf-8")
 CONTEXT_SOURCE = (
-    Path(__file__).parents[1] / "csrc" / "backends" / "cuda" / "src" / "mfq_cuda_context.cu"
+    Path(__file__).parents[1] / "csrc" / "backends" / "cuda" / "native" / "context.cu"
 ).read_text(encoding="utf-8")
 NATIVE_OPS_SOURCE = "\n".join(
     path.read_text(encoding="utf-8")
-    for path in sorted((CUDA_ROOT / "src").glob("mfq_native_tensor*"))
+    for path in sorted((CUDA_ROOT / "native").glob("tensor*"))
     if path.suffix in {".cpp", ".cu", ".cuh"}
 )
 NATIVE_TENSOR_SOURCE = (
-    Path(__file__).parents[1] / "csrc" / "backends" / "cuda" / "src" / "mfq_native_tensor.cu"
+    Path(__file__).parents[1] / "csrc" / "backends" / "cuda" / "native" / "tensor.cu"
 ).read_text(encoding="utf-8")
 KV_CACHE_SOURCE = (
     Path(__file__).parents[1] / "mfq" / "kernels" / "cuda" / "kv_cache.cu"

@@ -3,8 +3,8 @@
 #include "mfq_cuda_norm_ops.h"
 #include "models/common/transformer_layer.h"
 
-#include "core/block.h"
-#include "core/ffn.h"
+#include "models/common/block.h"
+#include "models/common/ffn.h"
 #include "models/qwen35/config.h"
 #include "models/qwen35/causal_lm.h"
 

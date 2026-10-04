@@ -3,7 +3,7 @@
 #include "models/common/transformer_layer.h"
 #include "models/deepseek_v41/causal_lm.h"
 
-#include "core/causal_model.h"
+#include "models/common/causal_model_ops.h"
 #include "../deepseek_v4/ops.h"
 #include "dspark.h"
 #include "engram.h"
@@ -11,7 +11,7 @@
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"
 #include "models/deepseek_v41/config.h"
-#include "core/ffn.h"
+#include "models/common/ffn.h"
 
 #include <algorithm>
 #include <array>

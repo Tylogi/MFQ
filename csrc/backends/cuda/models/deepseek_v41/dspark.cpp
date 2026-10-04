@@ -1,8 +1,8 @@
 #include "storage/weight_loader.h"
 #include "dspark.h"
 
-#include "core/causal_model.h"
-#include "core/mtp.h"
+#include "models/common/causal_model_ops.h"
+#include "models/common/mtp.h"
 #include "ops.h"
 
 #include <algorithm>

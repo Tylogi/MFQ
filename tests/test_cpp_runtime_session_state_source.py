@@ -5,10 +5,10 @@ CUDA_ROOT = ROOT / "csrc" / "backends" / "cuda"
 CUDA_SESSION_CACHE = (CUDA_ROOT / "storage" / "text_session_cache.cpp").read_text(
     encoding="utf-8"
 )
-CUDA_CAUSAL_LM_HEADER = (CUDA_ROOT / "core" / "causal_model.h").read_text(
+CUDA_CAUSAL_LM_HEADER = (CUDA_ROOT / "models/common/causal_model_ops.h").read_text(
     encoding="utf-8"
 )
-CUDA_CAUSAL_LM_SOURCE = (CUDA_ROOT / "core" / "causal_model.cpp").read_text(
+CUDA_CAUSAL_LM_SOURCE = (CUDA_ROOT / "models/common/causal_model_ops.cpp").read_text(
     encoding="utf-8"
 )
 CUDA_SESSION_STATE_HEADER = (

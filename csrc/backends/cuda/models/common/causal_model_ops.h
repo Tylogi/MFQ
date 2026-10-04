@@ -1,7 +1,7 @@
 #pragma once
 
 #include "cuda_model_plan.h"
-#include "core/block.h"
+#include "models/common/block.h"
 #include "mfq/model_source.h"
 #include "models/common/causal_model.h"
 #include "quant_linear.h"

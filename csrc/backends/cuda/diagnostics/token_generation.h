@@ -2,8 +2,8 @@
 
 #include "mfq_cuda_sampling_ops.h"
 #include "cuda_execution.h"
-#include "core/decode_graph.h"
-#include "core/full_block.h"
+#include "engine/decode_graph.h"
+#include "models/common/full_block.h"
 #include "storage/moe_expert_cache.h"
 #include "mfq_tensor_backend.h"
 

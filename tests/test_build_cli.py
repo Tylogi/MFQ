@@ -155,7 +155,7 @@ def test_default_cuda_cmake_target_has_no_python_or_libtorch_dependency() -> Non
     native_target = cmake[native_start:reference_start]
 
     assert "MFQ_NATIVE_CUDA_RUNTIME=1" in native_target
-    assert "mfq-cuda-core" in native_target
+    assert "mfq-cuda-native" in native_target
     assert "mfq-cuda-native-kernels" in native_target
     assert "TORCH_LIBRARIES" not in native_target
     assert "Python::Python" not in native_target
@@ -216,7 +216,7 @@ def test_native_cuda_buffer_retains_its_selected_stream() -> None:
     header = (ROOT / "csrc" / "backends" / "cuda" / "include" / "mfq_cuda_context.h").read_text(
         encoding="utf-8"
     )
-    source = (ROOT / "csrc" / "backends" / "cuda" / "src" / "mfq_cuda_context.cu").read_text(
+    source = (ROOT / "csrc" / "backends" / "cuda" / "native" / "context.cu").read_text(
         encoding="utf-8"
     )
 
