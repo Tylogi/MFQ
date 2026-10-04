@@ -1,5 +1,5 @@
-#include "mfq_cuda_context.h"
-#include "mfq_native_tensor.h"
+#include "../native/context.h"
+#include "../native/tensor.h"
 
 #include <cuda_runtime_api.h>
 

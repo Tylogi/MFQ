@@ -10,7 +10,7 @@
 #undef MFQ_FATTN_KERNEL_ONLY
 #endif
 
-#include "mfq_tensor_backend.h"
+#include "csrc/backends/cuda/native/tensor_backend.h"
 
 #include <algorithm>
 #include <cstdint>

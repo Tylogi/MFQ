@@ -233,7 +233,7 @@ def test_cuda_models_do_not_depend_on_cuda_engine_implementation() -> None:
 
 def test_cuda_format_operators_only_receive_the_profiler() -> None:
     ops = CUDA_RUNTIME.parent / "ops"
-    for name in ("nint.cpp", "vq.cpp", "include/nint.h", "include/vq.h"):
+    for name in ("nint.cpp", "vq.cpp", "nint.h", "vq.h"):
         source = (ops / name).read_text(encoding="utf-8")
         assert "CudaProfiler&" in source
         assert "CudaExecutionContext" not in source
@@ -242,9 +242,9 @@ def test_cuda_format_operators_only_receive_the_profiler() -> None:
 
 
 def test_cuda_leaf_ops_receive_only_their_required_resources() -> None:
-    quant = (CUDA_OPS / "include/quant_linear.h").read_text()
-    mixed_moe = (CUDA_OPS / "include/moe.h").read_text()
-    moe_types = (CUDA_OPS / "include" / "moe_types.h").read_text(
+    quant = (CUDA_OPS / "quant_linear.h").read_text()
+    mixed_moe = (CUDA_OPS / "moe.h").read_text()
+    moe_types = (CUDA_OPS / "moe_types.h").read_text(
         encoding="utf-8"
     )
 
@@ -270,7 +270,7 @@ def test_cuda_quant_runtime_implementations_stay_out_of_headers() -> None:
     assert "QuantLinear::forward(" in quant
     assert "QuantLinearGroup::forward(" in quant
     assert "NintLinearGroup::forward(" in quant
-    header = (CUDA_OPS / "include/quant_linear.h").read_text()
+    header = (CUDA_OPS / "quant_linear.h").read_text()
     loader = (CUDA_OPS.parent / "storage/weight_loader.h").read_text()
     cache = (CUDA_OPS.parent / "storage/moe_expert_cache.cpp").read_text()
     for function in ("load_quant_linear(", "load_mfe_gpu(", "load_quant_group("):
@@ -292,7 +292,7 @@ def test_cuda_transformer_bindings_stay_declarative_and_separate_from_loading() 
     assert '#include "full_block.h"' not in CUDA_TRANSFORMER_HEADER
     limits = {"rope": 70, "ffn": 120, "kv_cache": 80, "full_block": 100}
     for name, limit in limits.items():
-        header_path = (CUDA_OPS / "include/rope.h" if name == "rope"
+        header_path = (CUDA_OPS / "rope.h" if name == "rope"
                        else CUDA_TRANSFORMER_PATHS[name].with_suffix(".h"))
         header = header_path.read_text(encoding="utf-8")
         assert len(header.splitlines()) < limit
@@ -308,7 +308,7 @@ def test_cuda_transformer_bindings_stay_declarative_and_separate_from_loading() 
         "full_block": ("Block::forward_context(", "FullBlock::forward_impl("),
     }
     for name, symbols in implementations.items():
-        header_path = (CUDA_OPS / "include/rope.h" if name == "rope"
+        header_path = (CUDA_OPS / "rope.h" if name == "rope"
                        else CUDA_TRANSFORMER_PATHS[name].with_suffix(".h"))
         header = header_path.read_text(encoding="utf-8")
         for symbol in symbols:
@@ -445,7 +445,7 @@ def test_cuda_cli_is_a_thin_client_of_the_runtime_library() -> None:
     torch_sources = cmake.split("add_executable(mfq-runtime-torch", 1)[1].split(")", 1)[0]
     assert "${MFQ_CUDA_INSTANTIATION_SOURCES}" in torch_sources
     instances = cmake.split("set(MFQ_CUDA_INSTANTIATION_SOURCES", 1)[1].split(")", 1)[0]
-    assert "${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp" in instances
+    assert "/commands/" not in instances
     assert "${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp" in instances
     assert "mfq-cuda-runtime mfq-runtime-communication" in cmake
     assert "${MFQ_CUDA_ROOT}/commands/runtime.cpp" in cmake
@@ -517,7 +517,7 @@ def test_cuda_runtime_has_one_shared_generation_path() -> None:
 
 
 def test_cuda_runtime_hides_model_session_and_batch_implementation() -> None:
-    execution = (CUDA_OPS / "include" / "cuda_execution.h").read_text(encoding="utf-8")
+    execution = (CUDA_OPS / "cuda_execution.h").read_text(encoding="utf-8")
     options = (CUDA_RUNTIME.parent / "storage/load_options.cpp").read_text(encoding="utf-8")
 
     assert "struct CudaExecutionContext" in execution
@@ -686,6 +686,11 @@ def test_development_rules_forbid_architecture_bound_reuse() -> None:
     normalized = " ".join(CONTRIBUTING.split())
     assert "reusable code must not be architecture-bound" in normalized
     assert "mandatory extraction point" in normalized
+    assert "csrc/server/" not in CONTRIBUTING
+    assert "backends/<backend>/runtime/" not in CONTRIBUTING
+    for owner in ("csrc/engine/", "csrc/scheduler/", "csrc/transport/",
+                  "csrc/models/<family>/"):
+        assert owner in CONTRIBUTING
     runtime_readme = " ".join(
         (ROOT / "csrc" / "README.md")
         .read_text(encoding="utf-8")
@@ -1350,21 +1355,20 @@ def test_cuda_ops_and_execution_are_real_compilation_units() -> None:
     assert not (cuda / "engine" / "runner.h").exists()
     assert not (cuda / "engine" / "runner.cpp").exists()
     ops = cuda / "ops"
-    assert "${MFQ_CUDA_ROOT}/ops/include" in cmake
-    assert not any(path.suffix == ".h" for path in ops.iterdir())
+    assert not (ops / "include").exists()
     quant_header = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in (ops / "include").glob("quant_linear*.h")
+        for path in ops.glob("quant_linear*.h")
     )
     assert "struct QuantLinear" in quant_header
     owned_types = {
-        "ops/include/nint.h": ("NintWeight",),
-        "ops/include/vq.h": ("NvqWeight",),
-        "ops/include/mx.h": ("Mxfp4Weight", "Mxfp8Weight"),
-        "ops/include/fp8_sq.h": ("Fp8SqWeight",),
-        "ops/include/mxfp4_sq.h": ("Mxfp4SqWeight",),
-        "ops/include/mfe_weight.h": ("MfeWeight",),
-        "ops/include/moe_types.h": ("MoeRoutePlan",),
+        "ops/nint.h": ("NintWeight",),
+        "ops/vq.h": ("NvqWeight",),
+        "ops/mx.h": ("Mxfp4Weight", "Mxfp8Weight"),
+        "ops/fp8_sq.h": ("Fp8SqWeight",),
+        "ops/mxfp4_sq.h": ("Mxfp4SqWeight",),
+        "ops/mfe_weight.h": ("MfeWeight",),
+        "ops/moe_types.h": ("MoeRoutePlan",),
     }
     for relative, names in owned_types.items():
         source = (cuda / relative).read_text(encoding="utf-8")
@@ -1380,7 +1384,7 @@ def test_cuda_directories_and_native_target_have_explicit_owners() -> None:
     cuda = CUDA_OPS.parent
     assert not (cuda / "core").exists()
     assert not (cuda / "src").exists()
-    for relative in ("engine/decode_graph.h", "storage/kv_cache.h", "ops/include/rope.h",
+    for relative in ("engine/decode_graph.h", "storage/kv_cache.h", "ops/rope.h",
                      "models/common/causal_model_ops.h", "models/common/attention_ops.h",
                      "models/common/grid_vision_component.h", "models/common/mtp.h"):
         assert (cuda / relative).is_file()
@@ -1391,6 +1395,21 @@ def test_cuda_directories_and_native_target_have_explicit_owners() -> None:
     assert all(path.startswith("native/") and (cuda / path).is_file() for path in sources)
     assert "mfq-cuda-core" not in cmake
     assert "mfq::cuda-core" not in cmake
+
+    public = cuda / "include"
+    assert {str(path.relative_to(public)) for path in public.rglob("*.h")} == {
+        "mfq/cuda/engine.h"
+    }
+    api = (public / "mfq/cuda/engine.h").read_text()
+    assert "load_cuda_engine(CudaEngineOptions options)" in api
+    for private in ("CudaExecutionContext", "CudaRuntimeConfig", "setup_cuda_load",
+                    "native/", "kernels/", "storage/", "models/"):
+        assert private not in api
+    for target, visibility, paths in re.findall(
+        r"target_include_directories\((\S+)\s+(PUBLIC|INTERFACE)\s+([^)]*)\)", cmake
+    ):
+        assert target == "mfq-cuda-runtime"
+        assert paths.strip() == "${MFQ_CUDA_ROOT}/include"
 
 
 def test_cuda_build_dependencies_separate_ops_from_shared_execution() -> None:
@@ -1404,12 +1423,26 @@ def test_cuda_build_dependencies_separate_ops_from_shared_execution() -> None:
     assert "${MFQ_CUDA_ROOT}/storage" in runtime
     assert "PRIVATE mfq-models mfq-engine" in runtime
     assert "mfq-runtime-communication" not in runtime
+    assert "/commands" not in runtime
     assert "mfq_configure_cuda_backend_target(mfq-cuda-ops)" in cmake
     native = cmake.split("add_library(mfq-cuda-runtime STATIC", 1)[1].split(")", 1)[0]
     torch = cmake.split("add_executable(mfq-runtime-torch", 1)[1].split(")", 1)[0]
     assert "${MFQ_CUDA_INSTANTIATION_SOURCES}" in native
     assert "${MFQ_CUDA_INSTANTIATION_SOURCES}" in torch
     assert "${MFQ_CUDA_LOADING_SOURCES}" in torch
+    instances = cmake.split("set(MFQ_CUDA_INSTANTIATION_SOURCES", 1)[1].split(")", 1)[0]
+    assert "/commands/" not in instances
+    for name in ("runtime", "diagnostics", "eval"):
+        application = cmake.split(f"add_executable(mfq-{name}\n", 1)[1].split(")", 1)[0]
+        assert "${MFQ_CUDA_ROOT}/commands/cli.cpp" in application
+        assert ("${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp" in application) == (name != "eval")
+    assert "if(TARGET mfq-runtime-communication)" in cmake
+    assert "if(NOT TARGET mfq-runtime-communication)" not in cmake.split(
+        "if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)", 1
+    )[0]
+    assert "MFQ_BUILD_RUNTIME_COMMUNICATION" not in (CORE / "CMakeLists.txt").read_text()
+    transport = (ROOT / "csrc/transport/CMakeLists.txt").read_text()
+    assert "mfq-paged-prefix-cache" not in transport
     for target in ("engine", "models"):
         shared = (ROOT / "csrc" / target / "CMakeLists.txt").read_text()
         assert "backends/" not in shared and "mfq-cuda" not in shared

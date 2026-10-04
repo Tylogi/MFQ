@@ -1,7 +1,15 @@
 # MFQ development rules
 
-MFQ is organized around reusable inference capabilities, not checkpoint
-families. New code must preserve that boundary.
+The workspace [runtime architecture](../docs/architecture.md) defines ownership
+for CUDA and shared runtime/model code. This guide applies those rules to the
+repository. Pending migrations remain in the workspace [TODO](../docs/todo.md);
+existing backend code is not a precedent for duplicating shared behavior.
+
+`Runtime = Transport + Scheduler + Engine`. Runtime applications compose the
+three components. Transport converts wire messages to scheduler commands;
+Scheduler owns admission, cancellation decisions and bounded request outboxes.
+The shared Engine owns physical execution, models and caches. Execution follows
+`schedule -> bounded step -> typed results -> publish events`.
 
 ## Rule zero: reusable code must not be architecture-bound
 
@@ -9,29 +17,62 @@ Anything that can be shared by more than one model architecture **must not**
 be implemented in `models/<architecture>/` or hidden behind an
 architecture-named entry point.
 
-- Backend-neutral contracts, policies, schemas, and canonical names belong in
-  `csrc/core/` or `csrc/server/`; shared model-family
-  configurations belong in `csrc/models/`.
-- Backend-wide lifecycle code, scheduling, sampling, cache policy, batching,
-  metrics, and dispatch belong in `backends/<backend>/runtime/`.
+- Backend-neutral value contracts, schemas, canonical names and model sources
+  belong in `csrc/core/`.
+- Logical scheduling, cancellation, deadlines and output backpressure belong
+  in `csrc/scheduler/`; wire protocols belong in `csrc/transport/`.
+- Cross-backend request execution, tokenization, sampling semantics, physical
+  batch policy, session/cache lifecycle, metrics and MTP acceptance/commit rules
+  belong in `csrc/engine/`.
+- Shared model configurations and forward definitions belong in
+  `csrc/models/<family>/`; shared layer compositions belong in
+  `csrc/models/common/`. Family equations, positions and topology are defined
+  once and composed with backend operations.
 - Reusable mathematical operations and packed kernels belong in
-  `backends/<backend>/ops/` and `backends/<backend>/kernels/`.
-- An architecture directory may contain only graph/config adaptation, source
-  tensor-name import mapping, genuinely architecture-specific mathematics,
-  and thin adapters to the shared runtime and operators.
+  `csrc/backends/<backend>/ops/` and `csrc/backends/<backend>/kernels/`.
+  Shared CUDA kernel implementations still reside in `mfq/kernels/cuda/`
+  pending the source/package move recorded in TODO.
+- CUDA `native/` owns tensors and contexts, `storage/` owns weight materialization
+  and physical cache storage, and `engine/` binds shared execution to device
+  state and CUDA Graphs. `models/<family>/` supplies native operator/state
+  bindings, with reusable bindings in `models/common/`. These directories are
+  relative to `csrc/backends/cuda/`.
+- CLI parsing and application composition belong in backend `commands/` and
+  `apps/`, compiled into the corresponding executable.
 
 The second architecture that needs an existing behavior is a mandatory
 extraction point: move the behavior to the appropriate shared layer before
 adding the new adapter. Do not copy, rename, or lightly modify an existing
 model loop. A model name in a reusable state machine, sampler, cache
 lifecycle, metric type, precision dispatcher, multimodal pipeline, MTP loop,
-or serving policy is an architectural defect.
+or serving policy is an architectural defect. Model-family forward definitions
+are model-owned; public request lifecycles are not.
 
 An exception is allowed only when checkpoint semantics genuinely differ. The
 implementation must document that invariant next to the code and include a
 test that would fail if the special path were replaced by the shared one.
 Performance preference, deadline pressure, and “only one model uses it today”
 are not exceptions.
+
+## Dependency and header boundaries
+
+Transport depends on scheduler contracts. Scheduler depends on the shared
+Engine interface. Shared Engine/model code must not include backend headers or
+branch on backend identity. Backends provide native types and compile-time
+operations; do not add a universal type-erased tensor/KV layer, callback Engine,
+or per-backend generation loop. Backend operations must not publish request
+events or receive token emitters, cancellation callbacks or transport objects.
+
+CUDA exposes `include/mfq/cuda/engine.h` for Engine options and construction.
+Other headers live beside their owning implementation or in `kernels/` for
+kernel declarations. Internal consumers include those headers explicitly;
+internal include paths stay PRIVATE in CMake. Do not add forwarding headers
+for old paths or expose implementation directories through a PUBLIC include.
+
+`mfq-cuda-runtime` and `mfq-paged-prefix-cache` build independently of transport.
+`MFQ_BUILD_RUNTIME_COMMUNICATION=OFF` removes communication modules and the
+serving executable; it does not disable backend, tokenizer, cache, diagnostics
+or evaluation targets. Only serving applications link backend and transport.
 
 ## Canonical internal representation
 
@@ -58,14 +99,16 @@ explicit user override disables them.
 
 Before submitting a runtime or quantization change:
 
-1. Identify which layer owns the behavior: core, backend runtime, reusable
-   operator/kernel, importer, or architecture adapter.
+1. Identify the owner: core, transport, scheduler, shared Engine/model,
+   backend operation/storage, importer, or application.
 2. Search all architectures and both backends for an equivalent implementation.
 3. Extract reusable behavior before extending it; keep model adapters thin.
-4. Add a behavior test and, for critical ownership rules, a source-boundary
-   test under `tests/`.
+4. Test changed behavior and protect critical ownership rules under `tests/`.
+   Source-boundary checks and compilation do not establish numerical accuracy
+   or performance; use real model weights for those claims.
 5. Run the focused native tests, the Python suite, and the full CTest suite when
-   the change touches shared runtime behavior.
+   the change touches shared runtime behavior. For build-boundary changes,
+   also build and test with `MFQ_BUILD_RUNTIME_COMMUNICATION=OFF`.
 6. Do not publish generated files, local paths, credentials, model weights, or
    disposable benchmark artifacts.
 

@@ -15,7 +15,7 @@ CUDA_COMPONENTS = "\n".join(
 CUDA_ENGINE = (CUDA_ROOT / "engine" / "cuda_engine.cpp").read_text(
     encoding="utf-8"
 )
-CUDA_OPTIONS = (CUDA_ROOT / "include" / "cuda_runtime_config.h").read_text(
+CUDA_OPTIONS = (CUDA_ROOT / "include/mfq/cuda/engine.h").read_text(
     encoding="utf-8"
 )
 MINICPM_ENGINE = (

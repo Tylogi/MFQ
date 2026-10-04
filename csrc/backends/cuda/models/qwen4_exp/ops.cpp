@@ -1,4 +1,4 @@
-#include "mfq_cuda_moe_ops.h"
+#include "../../kernels/mfq_cuda_moe_ops.h"
 #include "ops.h"
 #include "model.h"
 #include "mtp.h"

@@ -19,8 +19,8 @@ CUDA_APP = "\n".join(
 CUDA_PLAN_TEST = (ROOT / "csrc/backends/cuda/tests/cuda_model_plan_test.cpp").read_text()
 METAL = (ROOT / "csrc/backends/metal/runtime/mlx_grid_vision.cpp").read_text()
 METAL_MM = (ROOT / "csrc/backends/metal/runtime/mlx_multimodal.cpp").read_text()
-PLAN = (ROOT / "csrc/backends/cuda/include/cuda_model_plan.h").read_text()
-PREPARED = (ROOT / "csrc/backends/cuda/ops/include/cuda_execution.h").read_text()
+PLAN = (ROOT / "csrc/backends/cuda/models/cuda_model_plan.h").read_text()
+PREPARED = (ROOT / "csrc/backends/cuda/ops/cuda_execution.h").read_text()
 CUDA_COMPONENTS = "\n".join(
     path.read_text()
     for path in (

@@ -1,4 +1,4 @@
-#include "mfq_cuda_quant_ops.h"
+#include "../kernels/mfq_cuda_quant_ops.h"
 #include "mx.h"
 #include "format.h"
 

@@ -1,7 +1,7 @@
 // GLU activation helpers used by materialized prefill paths.
 
 #include <cuda_fp16.h>
-#include "mfq_tensor_backend.h"
+#include "csrc/backends/cuda/native/tensor_backend.h"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -12,7 +12,7 @@
 #include <vector>
 
 #include "glu.cuh"
-#include "mfq_cuda_kernels.h"
+#include "csrc/backends/cuda/kernels/mfq_cuda_kernels.h"
 
 // Calling libdevice explicitly keeps standalone FP32 GeGLU within its FP32
 // tolerance even when Torch compiles the extension with --use_fast_math.

@@ -36,10 +36,8 @@ add_subdirectory(components/json)
 add_subdirectory(core)
 add_subdirectory(models)
 
-if(MFQ_BUILD_RUNTIME_COMMUNICATION OR MFQ_BUILD_METAL_RUNTIME)
-    add_subdirectory(components/ggml)
-    add_subdirectory(components/tokenizer)
-endif()
+add_subdirectory(components/ggml)
+add_subdirectory(components/tokenizer)
 
 if(MFQ_BUILD_RUNTIME_COMMUNICATION)
     add_subdirectory(components/http)

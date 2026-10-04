@@ -1,4 +1,4 @@
-#include "mfq_tensor_backend.h"
+#include "../native/tensor_backend.h"
 #include "mfq/kernels/cuda/fp8_sq.h"
 #include "mfq/kernels/cuda/mxfp4_sq.h"
 #include <cmath>

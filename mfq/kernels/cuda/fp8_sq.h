@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-#include "csrc/backends/cuda/include/mfq_tensor_backend.h"
+#include "csrc/backends/cuda/native/tensor_backend.h"
 #include "mfq/fp8_sq_blob.h"
 
 // The CPU loader validates the self-describing wire payload and expands the

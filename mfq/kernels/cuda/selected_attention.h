@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq_tensor_backend.h"
+#include "csrc/backends/cuda/native/tensor_backend.h"
 
 #include <initializer_list>
 

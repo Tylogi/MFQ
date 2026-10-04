@@ -11,7 +11,8 @@ by model family:
   MiniCPM also defines `TtsCausalLm`. `models/common/` contains `CausalModelBase`,
   causal traversal, attention, MLP, MoE, recurrence, and shared layer compositions;
 - `transport/` — private stdio/HTTP protocol adapters;
-- `scheduler/` — backend-neutral request dispatch and lifecycle boundary;
+- `scheduler/` — backend-neutral logical request lifecycle, admission,
+  cancellation decisions and bounded output queues;
 - `engine/` — the sole cross-backend `Engine` interface plus reusable
   Engine instance lifecycle, shared runtime configuration, generation,
   continuous-batching, cache, tokenizer, output, and MTP components; CUDA tensors and device execution stay in `backends/cuda/`;
@@ -38,10 +39,26 @@ polymorphic boundary. Python owns runtime process lifecycle and the public
 server API.
 
 The mandatory ownership and canonicalization rules are defined in the
-repository [development rules](../CONTRIBUTING.md). In particular, reusable
+workspace [runtime architecture](../../docs/architecture.md) and repository
+[development rules](../CONTRIBUTING.md). In particular, reusable
 state machines, cache lifecycle, sampling, dispatch, metrics, multimodal
 pipelines, and MTP orchestration must never live in a model-architecture
 directory.
+
+Scheduler calls the shared Engine's bounded `step()` and publishes its typed
+results after execution returns. Engine owns physical request state, model
+composition, tokenization, sampling semantics, MTP commit rules and session/cache
+lifecycle. Backend operations own numerical execution and native resources;
+they do not receive output/cancellation callbacks or transport objects. Shared
+model and Engine code must not depend on concrete backend headers.
+
+CUDA's public header is `backends/cuda/include/mfq/cuda/engine.h`, containing
+load options and `load_cuda_engine()`. Tensor/context headers stay in `native/`,
+operator headers beside their sources in `ops/`, model plans in `models/`,
+and execution configuration in `engine/`. `kernels/` contains internal kernel
+declarations; the shared `.cu/.cuh` implementations remain in `mfq/kernels/cuda/`
+until the pending source/package migration. Implementation include paths are
+PRIVATE, and old paths have no forwarding headers.
 
 CUDA text and prepared grid-Vision requests share one
 restore/prefill/output/snapshot lifecycle. Media embeddings, positions, cache
@@ -76,8 +93,15 @@ multi-device and non-Qwen3.5 real-weight validation are also incomplete.
 Qwen3.8-27B uses the `qwen3_5` backbone;
 Qwen3.8-Flash-Next uses `qwen4_exp`.
 
-`CMakeLists.txt` is the single entry point. Runtime executable targets are
-`mfq-runtime`, `mfq-decode-metal`, and `mfq-perplexity`; the established Metal
-build output directory remains unchanged. Integrated upstream-derived
+`CMakeLists.txt` is the single entry point. CUDA executables are `mfq-runtime`,
+`mfq-diagnostics` and `mfq-eval`; Metal executables are `mfq-decode-metal` and
+`mfq-perplexity`. CLI implementations compile into their executables, not the
+CUDA backend library. `mfq-cuda-runtime` exports the Engine construction API
+and has no transport dependency. With `MFQ_BUILD_RUNTIME_COMMUNICATION=OFF`,
+the backend, prefix cache, tokenizer, diagnostics and evaluation still build;
+communication modules and `mfq-runtime` are omitted. The optional serving
+application `mfq-runtime-torch` requires communication to be enabled.
+
+The established Metal build output directory remains unchanged. Integrated upstream-derived
 code retains its original licensing as documented in the repository `NOTICE`
 and `LICENSES/` directory.

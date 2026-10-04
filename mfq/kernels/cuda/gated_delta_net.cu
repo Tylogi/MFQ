@@ -7,7 +7,7 @@
 // 64KB shared-mem opt-in via cudaFuncSetAttribute).
 
 #include <cuda_runtime.h>
-#include "mfq_tensor_backend.h"
+#include "csrc/backends/cuda/native/tensor_backend.h"
 #include <vector>
 #include <cstdlib>
 

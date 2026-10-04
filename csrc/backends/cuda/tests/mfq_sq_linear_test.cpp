@@ -1,4 +1,4 @@
-#include "quant_linear.h"
+#include "../ops/quant_linear.h"
 #include <cmath>
 #include <fstream>
 #include <iostream>

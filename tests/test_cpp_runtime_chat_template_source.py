@@ -25,7 +25,7 @@ DECODE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in (
         CUDA_RUNTIME / "generation.cpp",
-        CUDA_RUNTIME.parent / "ops" / "include" / "cuda_sampling.h",
+        CUDA_RUNTIME.parent / "ops" / "cuda_sampling.h",
         CUDA_RUNTIME / "mtp.cpp",
         ROOT / "csrc" / "backends" / "cuda" / "commands" / "runtime.cpp",
     )

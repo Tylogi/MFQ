@@ -1,5 +1,5 @@
-#include "mfq_cuda_paged_kv.h"
-#include "mfq_native_tensor.h"
+#include "../kernels/mfq_cuda_paged_kv.h"
+#include "../native/tensor.h"
 
 #include <cuda_runtime_api.h>
 

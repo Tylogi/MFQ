@@ -1,7 +1,7 @@
 #pragma once
 
-#include "quant_linear.h"
-#include "moe.h"
+#include "../ops/quant_linear.h"
+#include "../ops/moe.h"
 #include "model_source.h"
 
 namespace mfq::cuda {

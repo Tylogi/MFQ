@@ -1,4 +1,4 @@
-#include "mfq_cuda_context.h"
+#include "../native/context.h"
 
 #include <cuda_runtime_api.h>
 

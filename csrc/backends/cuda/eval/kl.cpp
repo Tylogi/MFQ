@@ -9,13 +9,13 @@
 #include "models/qwen35/ops.h"
 #include "models/qwen4_exp/ops.h"
 #include "storage/weight_loader.h"
-#include "quant_linear.h"
-#include "cuda_execution.h"
+#include "../ops/quant_linear.h"
+#include "../ops/cuda_execution.h"
 #include "storage/moe_expert_cache.h"
 #include "mfq/kernels/cuda/deepseek_v4_attention.h"
 #include "mfq/kernels/cuda/deepseek_v4_hc.h"
 #include "mfq/kernels/cuda/deepseek_v41.h"
-#include "mfq_tensor_backend.h"
+#include "../native/tensor_backend.h"
 
 #include <cuda_runtime_api.h>
 

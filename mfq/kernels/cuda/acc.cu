@@ -2,7 +2,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
-#include "mfq_tensor_backend.h"
+#include "csrc/backends/cuda/native/tensor_backend.h"
 #include <type_traits>
 #include <vector>
 

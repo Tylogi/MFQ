@@ -7,7 +7,7 @@
 #include "models/common/block.h"
 #include "models/minicpmo45/causal_lm.h"
 #include "models/minicpmo45/config.h"
-#include "quant_linear.h"
+#include "../../ops/quant_linear.h"
 
 #include <memory>
 #include <string>

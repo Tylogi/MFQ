@@ -12,7 +12,7 @@ SERVER = "\n".join(
     if path.suffix in {".cpp", ".h"}
 )
 CUDA_PLAN = (
-    ROOT / "csrc" / "backends" / "cuda" / "include" / "cuda_model_plan.h"
+    ROOT / "csrc" / "backends" / "cuda" / "models" / "cuda_model_plan.h"
 ).read_text(encoding="utf-8")
 CUDA_ROOT = ROOT / "csrc" / "backends" / "cuda"
 CUDA_DECODE = "\n".join(

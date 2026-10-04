@@ -3,7 +3,7 @@
 #include <array>
 #include <cstring>
 
-#include "cuda_runtime_config.h"
+#include "../engine/cuda_runtime_config.h"
 #include "models/deepseek_v4/ops.h"
 #include "models/deepseek_v41/ops.h"
 #include "models/gemma4/ops.h"

@@ -10,7 +10,7 @@
 #include "models/qwen4_exp/ops.h"
 #include "models/common/mtp.h"
 #include "models/common/grid_vision_component.h"
-#include "cuda_runtime_config.h"
+#include "mfq/cuda/engine.h"
 #include "storage/weight_loader.h"
 #include "storage/moe_expert_cache.h"
 

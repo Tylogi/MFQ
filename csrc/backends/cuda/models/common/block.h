@@ -1,6 +1,6 @@
 #pragma once
 
-#include "rope.h"
+#include "../../ops/rope.h"
 
 #include <cstdint>
 #include <vector>

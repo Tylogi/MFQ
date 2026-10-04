@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq_cuda_tensor_view.h"
+#include "tensor_view.h"
 
 #include <algorithm>
 #include <cmath>

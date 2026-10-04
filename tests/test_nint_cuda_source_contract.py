@@ -203,7 +203,7 @@ def test_cuda_input_gate_reuses_activation_quantizer_and_main_matmul():
 
 
 def test_cpp_runtime_keeps_only_canonical_nint_row_state():
-    header = (CUDA_ROOT / "ops/include/nint.h").read_text()
+    header = (CUDA_ROOT / "ops/nint.h").read_text()
     nint_cpu = header.split("struct NintCpu {", 1)[1].split("\n};", 1)[0]
     nint_weight = header.split("struct NintWeight {", 1)[1].split("\n};", 1)[0]
     assert "qbytes" not in nint_cpu

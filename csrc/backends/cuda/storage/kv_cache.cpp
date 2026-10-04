@@ -1,8 +1,8 @@
 #include "kv_cache.h"
 
-#include "cuda_execution.h"
-#include "mfq_cuda_cache_ops.h"
-#include "mfq_cuda_paged_kv.h"
+#include "../ops/cuda_execution.h"
+#include "../kernels/mfq_cuda_cache_ops.h"
+#include "../kernels/mfq_cuda_paged_kv.h"
 
 #include <stdexcept>
 #include <utility>

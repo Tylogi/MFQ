@@ -1,11 +1,11 @@
 #pragma once
 
-#include "mfq_cuda_sampling_ops.h"
-#include "cuda_execution.h"
+#include "../kernels/mfq_cuda_sampling_ops.h"
+#include "../ops/cuda_execution.h"
 #include "engine/decode_graph.h"
 #include "models/common/full_block.h"
 #include "storage/moe_expert_cache.h"
-#include "mfq_tensor_backend.h"
+#include "../native/tensor_backend.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime_api.h>

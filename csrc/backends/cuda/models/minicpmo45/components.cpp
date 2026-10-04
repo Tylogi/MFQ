@@ -1,9 +1,9 @@
 #include "ops.h"
 #include "runtime.h"
 
-#include "cuda_execution.h"
-#include "cuda_sampling.h"
-#include "mfq_tensor_backend.h"
+#include "../../ops/cuda_execution.h"
+#include "../../ops/cuda_sampling.h"
+#include "../../native/tensor_backend.h"
 #include "tensor_parallel.h"
 
 #include <algorithm>

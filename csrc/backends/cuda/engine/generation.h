@@ -2,7 +2,7 @@
 
 #include "generation_step.h"
 #include "cuda_batching.h"
-#include "cuda_execution.h"
+#include "../ops/cuda_execution.h"
 #include "engine/decode_graph.h"
 #include "models/common/mtp.h"
 #include "cuda_runtime_config.h"

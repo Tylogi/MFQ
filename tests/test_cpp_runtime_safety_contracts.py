@@ -176,7 +176,6 @@ def test_cuda_nint_loader_expands_v2_metadata_before_kernel_dispatch() -> None:
 def test_unified_cuda_extension_can_include_runtime_headers() -> None:
     for include in (
         "_REPOSITORY_ROOT",
-        "_CUDA_RUNTIME_INCLUDE",
         "_GGML_INCLUDE",
         "_GGML_SOURCE_INCLUDE",
         "_GGML_CUDA_INCLUDE",

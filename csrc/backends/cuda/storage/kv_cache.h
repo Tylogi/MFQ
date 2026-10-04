@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq_tensor_backend.h"
+#include "../native/tensor_backend.h"
 
 #include <cstdint>
 #include <utility>

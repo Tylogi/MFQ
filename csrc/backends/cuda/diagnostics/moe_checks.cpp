@@ -5,10 +5,10 @@
 #include "models/deepseek_v41/ops.h"
 #include "models/gemma4/ops.h"
 #include "models/glm_dsa/ops.h"
-#include "quant_linear.h"
-#include "cuda_execution.h"
+#include "../ops/quant_linear.h"
+#include "../ops/cuda_execution.h"
 #include "storage/moe_expert_cache.h"
-#include "mfq_cuda_moe_ops.h"
+#include "../kernels/mfq_cuda_moe_ops.h"
 
 #include <cuda_runtime_api.h>
 

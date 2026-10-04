@@ -1,5 +1,5 @@
 #pragma once
-#include "csrc/backends/cuda/include/mfq_tensor_backend.h"
+#include "csrc/backends/cuda/native/tensor_backend.h"
 #include "csrc/core/include/mfq/mxfp4_sq_blob.h"
 
 // Parse the self-describing blob on CPU before upload.  These capture-safe

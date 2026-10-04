@@ -6,7 +6,7 @@
 #include "models/deepseek_v41/config.h"
 #include "csrc/models/deepseek_v41/engram.h"
 #include "models/deepseek_v41/causal_lm.h"
-#include "quant_linear.h"
+#include "../../ops/quant_linear.h"
 
 #include <algorithm>
 #include <array>

@@ -32,11 +32,11 @@ SOURCE = "\n".join(
         CUDA_ROOT / "models/common/full_block.cpp",
         CUDA_ROOT / "storage/kv_cache.h",
         CUDA_ROOT / "storage/kv_cache.cpp",
-        CUDA_ROOT / "include" / "mfq_cuda_attention_ops.h",
-        CUDA_ROOT / "include" / "mfq_cuda_cache_ops.h",
-        CUDA_ROOT / "include" / "mfq_cuda_norm_ops.h",
-        CUDA_ROOT / "include" / "mfq_cuda_sampling_ops.h",
-        CUDA_ROOT / "ops" / "include" / "cuda_execution.h",
+        CUDA_ROOT / "kernels" / "mfq_cuda_attention_ops.h",
+        CUDA_ROOT / "kernels" / "mfq_cuda_cache_ops.h",
+        CUDA_ROOT / "kernels" / "mfq_cuda_norm_ops.h",
+        CUDA_ROOT / "kernels" / "mfq_cuda_sampling_ops.h",
+        CUDA_ROOT / "ops" / "cuda_execution.h",
         CUDA_ROOT / "ops" / "cuda_execution.cpp",
         CUDA_ROOT / "engine/decode_graph.h",
     )
@@ -54,7 +54,7 @@ ATTENTION_MMA_SOURCE = (
     / "attention_mma.cu"
 ).read_text(encoding="utf-8")
 BACKEND_SOURCE = (
-    Path(__file__).parents[1] / "csrc" / "backends" / "cuda" / "include" / "mfq_tensor_backend.h"
+    Path(__file__).parents[1] / "csrc" / "backends" / "cuda" / "native" / "tensor_backend.h"
 ).read_text(encoding="utf-8")
 CONTEXT_SOURCE = (
     Path(__file__).parents[1] / "csrc" / "backends" / "cuda" / "native" / "context.cu"

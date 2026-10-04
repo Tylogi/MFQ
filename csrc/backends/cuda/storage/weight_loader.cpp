@@ -1,6 +1,6 @@
 #include "weight_loader.h"
-#include "format.h"
-#include "mfq_cuda_quant_ops.h"
+#include "../ops/format.h"
+#include "../kernels/mfq_cuda_quant_ops.h"
 #include "mfq/mxfp4_sq_decode.h"
 
 #include <algorithm>

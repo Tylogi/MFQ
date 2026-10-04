@@ -1,4 +1,4 @@
-#include "cuda_model_plan.h"
+#include "../models/cuda_model_plan.h"
 
 #include <iostream>
 #include <stdexcept>

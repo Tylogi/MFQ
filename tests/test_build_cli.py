@@ -213,7 +213,7 @@ def test_native_cuda_cmake_uses_consistent_windows_cuda_settings() -> None:
 
 
 def test_native_cuda_buffer_retains_its_selected_stream() -> None:
-    header = (ROOT / "csrc" / "backends" / "cuda" / "include" / "mfq_cuda_context.h").read_text(
+    header = (ROOT / "csrc" / "backends" / "cuda" / "native" / "context.h").read_text(
         encoding="utf-8"
     )
     source = (ROOT / "csrc" / "backends" / "cuda" / "native" / "context.cu").read_text(

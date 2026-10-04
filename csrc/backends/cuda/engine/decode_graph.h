@@ -1,10 +1,10 @@
 #pragma once
 
-#include "mfq_tensor_backend.h"
-#include "cuda_model_plan.h"
+#include "../native/tensor_backend.h"
+#include "../models/cuda_model_plan.h"
 #include "mfq/runtime.h"
 #include "models/common/block.h"
-#include "cuda_execution.h"
+#include "../ops/cuda_execution.h"
 
 #include <cstdint>
 #include <memory>

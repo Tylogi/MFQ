@@ -15,14 +15,14 @@ CUDA_ROOT = ROOT / "csrc" / "backends" / "cuda"
 RUNTIME = "\n".join(
     (CUDA_ROOT / name).read_text(encoding="utf-8")
     for name in (
-        "ops/include/cuda_execution.h",
+        "ops/cuda_execution.h",
         "ops/cuda_execution.cpp",
         "engine/generation.h",
         "engine/generation.cpp",
     )
 )
 SAMPLING = (
-    ROOT / "csrc" / "backends" / "cuda" / "ops" / "include" / "cuda_sampling.h"
+    ROOT / "csrc" / "backends" / "cuda" / "ops" / "cuda_sampling.h"
 ).read_text(encoding="utf-8")
 
 

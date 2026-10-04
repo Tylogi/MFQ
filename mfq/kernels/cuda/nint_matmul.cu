@@ -22,7 +22,7 @@
 
 #include "async_copy.cuh"
 #include "glu.cuh"
-#include "mfq_tensor_backend.h"
+#include "csrc/backends/cuda/native/tensor_backend.h"
 #include "packed_backward.cuh"
 
 

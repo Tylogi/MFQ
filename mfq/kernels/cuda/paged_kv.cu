@@ -5,7 +5,7 @@
 
 #include <cuda_runtime.h>
 
-#include "mfq_cuda_paged_kv.h"
+#include "csrc/backends/cuda/kernels/mfq_cuda_paged_kv.h"
 
 #include <algorithm>
 #include <cstdint>

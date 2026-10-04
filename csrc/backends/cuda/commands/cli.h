@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cuda_runtime_config.h"
+#include "mfq/cuda/engine.h"
 
 #include <charconv>
 #include <cmath>

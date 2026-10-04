@@ -1,3 +1,4 @@
+#include "../storage/load_options.h"
 #include "models/qwen4_exp/mtp.h"
 #include "models/glm5_next/mtp.h"
 #include "storage/weight_loader.h"
@@ -9,7 +10,7 @@
 #include "diagnostics/runtime_checks.h"
 #include "diagnostics/flash_next_mtp.h"
 #include "minicpmo45.h"
-#include "cuda_execution.h"
+#include "../ops/cuda_execution.h"
 #include "storage/moe_expert_cache.h"
 #include "mfq/kernels/cuda/deepseek_v41.h"
 

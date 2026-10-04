@@ -17,8 +17,8 @@
 
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
 
-#include "mfq_cuda_context.h"
-#include "mfq_native_tensor.h"
+#include "context.h"
+#include "tensor.h"
 
 namespace mfq_tensor_backend = ::mfq::cuda;
 using mfq_half = __half;

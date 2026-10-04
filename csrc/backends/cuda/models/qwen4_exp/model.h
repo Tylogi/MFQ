@@ -1,9 +1,9 @@
 #pragma once
-#include "mfq_cuda_linear_attention_ops.h"
+#include "../../kernels/mfq_cuda_linear_attention_ops.h"
 #include "models/qwen4_exp/causal_lm.h"
 #include "models/qwen4_exp/ngram.h"
 #include "models/common/attention_ops.h"
-#include "rope.h"
+#include "../../ops/rope.h"
 #include "mfq/kernels/cuda/qwen4_exp.h"
 #include <array>
 #include <cstring>

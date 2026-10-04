@@ -1,5 +1,6 @@
+#include "../storage/load_options.h"
 #include "cli.h"
-#include "cuda_runtime_config.h"
+#include "mfq/cuda/engine.h"
 #include "minicpmo45.h"
 #include "storage/model_source.h"
 #include "mfq/model_source.h"

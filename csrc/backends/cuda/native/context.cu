@@ -1,4 +1,4 @@
-#include "mfq_cuda_context.h"
+#include "context.h"
 
 #include <algorithm>
 #include <limits>

@@ -1,5 +1,5 @@
-#include "mfq_cuda_moe_ops.h"
-#include "mfq_cuda_quant_ops.h"
+#include "../kernels/mfq_cuda_moe_ops.h"
+#include "../kernels/mfq_cuda_quant_ops.h"
 #include "moe.h"
 
 #include "quant_linear.h"

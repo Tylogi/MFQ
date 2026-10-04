@@ -1,6 +1,6 @@
 #include "batch_state.h"
 
-#include "cuda_execution.h"
+#include "../../ops/cuda_execution.h"
 #include "linear_attention.h"
 #include "ops.h"
 #include "paged_kv.h"

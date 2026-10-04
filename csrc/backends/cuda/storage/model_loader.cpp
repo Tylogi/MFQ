@@ -5,7 +5,7 @@
 #include "models/qwen35/mtp.h"
 #include "models/deepseek_v41/dspark.h"
 
-#include "cuda_execution.h"
+#include "../ops/cuda_execution.h"
 #include "storage/moe_expert_cache.h"
 
 #include <algorithm>

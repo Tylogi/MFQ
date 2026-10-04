@@ -12,7 +12,7 @@
 // nint_matmul.cu; q/k metadata does not create an MFE-specific compute kernel.
 
 #include <cuda_fp16.h>
-#include "mfq_tensor_backend.h"
+#include "csrc/backends/cuda/native/tensor_backend.h"
 #include <cuda_runtime.h>
 #include <mma.h>
 
@@ -24,7 +24,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "moe_cache_transfer.h"
+#include "csrc/backends/cuda/kernels/moe_cache_transfer.h"
 #include "glu.cuh"
 
 

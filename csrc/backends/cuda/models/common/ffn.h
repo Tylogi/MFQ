@@ -1,7 +1,7 @@
 #pragma once
 
-#include "quant_linear.h"
-#include "mfe_weight.h"
+#include "../../ops/quant_linear.h"
+#include "../../ops/mfe_weight.h"
 
 #include <cstddef>
 #include <cstdint>

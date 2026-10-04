@@ -19,7 +19,6 @@ target_link_libraries(mfq-runtime-communication
     PRIVATE
         mfq-http
         mfq-json
-        mfq-paged-prefix-cache
         Threads::Threads
 )
 target_compile_definitions(mfq-runtime-communication PRIVATE NOMINMAX)

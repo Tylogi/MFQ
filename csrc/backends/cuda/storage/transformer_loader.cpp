@@ -1,7 +1,7 @@
 #include "transformer_loader.h"
 #include "storage/weight_loader.h"
 #include "models/common/full_block.h"
-#include "moe.h"
+#include "../ops/moe.h"
 
 void load_important_neuron_branch(CudaExecutionContext &execution, const mfq::ModelSource &mfq,
                                   int64_t hidden_size, int64_t intermediate_size, FFN &f,

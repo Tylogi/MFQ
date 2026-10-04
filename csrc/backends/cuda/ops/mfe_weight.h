@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq_cuda_moe_ops.h"
+#include "../kernels/mfq_cuda_moe_ops.h"
 #include "moe_types.h"
 
 struct MfeWeight {

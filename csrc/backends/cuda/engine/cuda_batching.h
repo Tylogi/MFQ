@@ -1,9 +1,9 @@
 #pragma once
 
 #include "continuous_batch.h"
-#include "cuda_execution.h"
+#include "../ops/cuda_execution.h"
 #include "cuda_runtime_config.h"
-#include "cuda_sampling.h"
+#include "../ops/cuda_sampling.h"
 #include "models/qwen35/batch_state.h"
 
 namespace mfq::cuda {

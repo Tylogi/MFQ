@@ -1,11 +1,11 @@
 #include "storage/weight_loader.h"
 #include "model_checks.h"
 
-#include "quant_linear.h"
-#include "cuda_execution.h"
-#include "mfq_cuda_activation_ops.h"
-#include "mfq_cuda_linear_attention_ops.h"
-#include "mfq_cuda_quant_ops.h"
+#include "../ops/quant_linear.h"
+#include "../ops/cuda_execution.h"
+#include "../kernels/mfq_cuda_activation_ops.h"
+#include "../kernels/mfq_cuda_linear_attention_ops.h"
+#include "../kernels/mfq_cuda_quant_ops.h"
 
 #include <cuda_runtime_api.h>
 

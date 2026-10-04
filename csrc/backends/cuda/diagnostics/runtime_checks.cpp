@@ -2,7 +2,7 @@
 #include "runtime_checks.h"
 #include <map>
 
-#include "cuda_runtime_config.h"
+#include "../engine/cuda_runtime_config.h"
 #include "engine/generation.h"
 #include "storage/text_session_cache.h"
 #include "engine/cuda_batching.h"

@@ -1,7 +1,7 @@
 #pragma once
-#include "mfq_cuda_attention_ops.h"
-#include "mfq_cuda_cache_ops.h"
-#include "mfq_cuda_norm_ops.h"
+#include "../../kernels/mfq_cuda_attention_ops.h"
+#include "../../kernels/mfq_cuda_cache_ops.h"
+#include "../../kernels/mfq_cuda_norm_ops.h"
 #include "models/common/transformer_layer.h"
 #include "models/glm_dsa/causal_lm.h"
 

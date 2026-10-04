@@ -4,10 +4,10 @@
 #include "models/common/transformer_layer.h"
 #include <array>
 
-#include "mfq_cuda_activation_ops.h"
-#include "mfq_cuda_attention_ops.h"
-#include "mfq_cuda_norm_ops.h"
-#include "mfq_cuda_paged_kv.h"
+#include "../../kernels/mfq_cuda_activation_ops.h"
+#include "../../kernels/mfq_cuda_attention_ops.h"
+#include "../../kernels/mfq_cuda_norm_ops.h"
+#include "../../kernels/mfq_cuda_paged_kv.h"
 
 #include <algorithm>
 #include <cmath>

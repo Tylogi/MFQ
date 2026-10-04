@@ -1,10 +1,5 @@
 # Native CUDA backend.
 
-if(NOT TARGET mfq-runtime-communication)
-    message(FATAL_ERROR
-        "The CUDA runtime requires MFQ_BUILD_RUNTIME_COMMUNICATION=ON")
-endif()
-
 set(MFQ_CUDA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 set(MFQ_CUDA_KERNEL_ROOT "${MFQ_REPOSITORY_ROOT}/mfq/kernels/cuda")
 
@@ -21,9 +16,6 @@ add_library(mfq-cuda-storage STATIC
     ${MFQ_CUDA_ROOT}/storage/mfe_expert_store.cpp
 )
 add_library(mfq::cuda-storage ALIAS mfq-cuda-storage)
-target_include_directories(mfq-cuda-storage PUBLIC
-    ${MFQ_CUDA_ROOT}/storage
-)
 target_link_libraries(mfq-cuda-storage PUBLIC Threads::Threads)
 target_compile_features(mfq-cuda-storage PUBLIC cxx_std_20)
 set_target_properties(mfq-cuda-storage PROPERTIES
@@ -46,10 +38,6 @@ add_library(mfq-cuda-native STATIC
     ${MFQ_CUDA_ROOT}/native/tensor_sort.cu
 )
 add_library(mfq::cuda-native ALIAS mfq-cuda-native)
-target_include_directories(mfq-cuda-native PUBLIC
-    ${MFQ_CUDA_ROOT}/include
-    ${CUDAToolkit_INCLUDE_DIRS}
-)
 target_link_libraries(mfq-cuda-native PUBLIC CUDA::cudart CUDA::cublas)
 target_compile_features(mfq-cuda-native PUBLIC cxx_std_20)
 target_compile_options(mfq-cuda-native PRIVATE
@@ -103,7 +91,6 @@ target_compile_definitions(mfq-cuda-native-kernels PRIVATE
 )
 target_include_directories(mfq-cuda-native-kernels PRIVATE
     ${MFQ_REPOSITORY_ROOT}
-    ${MFQ_CUDA_ROOT}/include
     ${MFQ_CUDA_KERNEL_ROOT}
     ${CUDAToolkit_INCLUDE_DIRS}
 )
@@ -169,6 +156,7 @@ if(BUILD_TESTING)
         ${MFQ_REPOSITORY_ROOT}/bench/cuda_paged_kv_attention_bench.cu)
     target_compile_definitions(mfq-paged-kv-attention-bench PRIVATE
         MFQ_NATIVE_CUDA_RUNTIME=1)
+    target_include_directories(mfq-paged-kv-attention-bench PRIVATE ${MFQ_REPOSITORY_ROOT})
     target_link_libraries(mfq-paged-kv-attention-bench PRIVATE
         mfq-cuda-native mfq-cuda-native-kernels)
     set_target_properties(mfq-paged-kv-attention-bench PROPERTIES
@@ -221,7 +209,6 @@ if(BUILD_TESTING)
         ${PROJECT_SOURCE_DIR}
         ${MFQ_REPOSITORY_ROOT}
         ${MFQ_CUDA_ROOT}/models
-        ${MFQ_CUDA_ROOT}/ops/include
         ${MFQ_CUDA_ROOT}/../../core)
 endif()
 
@@ -247,8 +234,6 @@ find_package(OpenMP QUIET)
 function(mfq_configure_cuda_backend_target target)
     target_include_directories(${target} PRIVATE
         ${MFQ_REPOSITORY_ROOT}
-        ${MFQ_CUDA_ROOT}/include
-        ${MFQ_CUDA_ROOT}/ops/include
         ${MFQ_CUDA_KERNEL_ROOT}
         ${CUDAToolkit_INCLUDE_DIRS}
     )
@@ -273,10 +258,10 @@ endfunction()
 function(mfq_configure_cuda_runtime_target target)
     mfq_configure_cuda_backend_target(${target})
     target_include_directories(${target} PRIVATE
+        ${MFQ_CUDA_ROOT}/include
         ${MFQ_CUDA_ROOT}
         ${MFQ_CUDA_ROOT}/storage
         ${MFQ_CUDA_ROOT}/models
-        ${MFQ_CUDA_ROOT}/commands
         ${MFQ_CUDA_ROOT}/engine
     )
     target_link_libraries(${target} PRIVATE mfq-models mfq-engine)
@@ -341,8 +326,6 @@ set(MFQ_CUDA_INSTANTIATION_SOURCES
     ${MFQ_CUDA_ROOT}/engine/mtp.cpp
     ${MFQ_CUDA_ROOT}/engine/cuda_batching.cpp
     ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
-    ${MFQ_CUDA_ROOT}/commands/cli.cpp
-    ${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp
     ${MFQ_CUDA_MODEL_SOURCES}
 )
 add_library(mfq-cuda-runtime STATIC
@@ -352,6 +335,8 @@ add_library(mfq-cuda-runtime STATIC
 )
 add_library(mfq::cuda-runtime ALIAS mfq-cuda-runtime)
 mfq_configure_cuda_runtime_target(mfq-cuda-runtime)
+target_include_directories(mfq-cuda-runtime PUBLIC ${MFQ_CUDA_ROOT}/include)
+target_link_libraries(mfq-cuda-runtime PUBLIC mfq-engine)
 
 if(BUILD_TESTING)
     add_executable(mfq-sq-linear-test
@@ -436,25 +421,30 @@ if(MSVC)
     endforeach()
 endif()
 
-add_executable(mfq-runtime
-    ${MFQ_CUDA_ROOT}/apps/runtime_main.cpp
-    ${MFQ_CUDA_ROOT}/commands/runtime.cpp
-)
-target_link_libraries(mfq-runtime PRIVATE
-    mfq-cuda-runtime mfq-runtime-communication)
-target_include_directories(mfq-runtime PRIVATE
-    ${MFQ_CUDA_ROOT}
-    ${MFQ_CUDA_ROOT}/include
-    ${MFQ_CUDA_ROOT}/engine
-)
-target_compile_features(mfq-runtime PRIVATE cxx_std_20)
-set_target_properties(mfq-runtime PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
-)
+if(TARGET mfq-runtime-communication)
+    add_executable(mfq-runtime
+        ${MFQ_CUDA_ROOT}/apps/runtime_main.cpp
+        ${MFQ_CUDA_ROOT}/commands/runtime.cpp
+        ${MFQ_CUDA_ROOT}/commands/cli.cpp
+        ${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp
+    )
+    mfq_configure_cuda_runtime_target(mfq-runtime)
+    target_compile_definitions(mfq-runtime PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-runtime PRIVATE
+        mfq-cuda-runtime mfq-runtime-communication)
+    if(MSVC)
+        target_compile_options(mfq-runtime PRIVATE /utf-8 /EHsc /bigobj)
+    endif()
+    set_target_properties(mfq-runtime PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
+    )
+endif()
 
 add_executable(mfq-diagnostics
     ${MFQ_CUDA_ROOT}/apps/diagnostics_main.cpp
     ${MFQ_CUDA_ROOT}/commands/diagnostics.cpp
+    ${MFQ_CUDA_ROOT}/commands/cli.cpp
+    ${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp
 )
 mfq_configure_cuda_runtime_target(mfq-diagnostics)
 target_include_directories(mfq-diagnostics PRIVATE ${MFQ_CUDA_ROOT}/storage)
@@ -471,6 +461,7 @@ set_target_properties(mfq-diagnostics PROPERTIES
 add_executable(mfq-eval
     ${MFQ_CUDA_ROOT}/apps/eval_main.cpp
     ${MFQ_CUDA_ROOT}/commands/eval.cpp
+    ${MFQ_CUDA_ROOT}/commands/cli.cpp
 )
 mfq_configure_cuda_runtime_target(mfq-eval)
 target_include_directories(mfq-eval PRIVATE ${MFQ_CUDA_ROOT}/storage)
@@ -492,19 +483,26 @@ if(BUILD_TESTING)
     add_test(NAME mfq-diagnostics-help COMMAND mfq-diagnostics --help)
     add_test(NAME mfq-eval-help COMMAND mfq-eval --help)
     add_test(NAME mfq-eval-kl-help COMMAND mfq-eval kl --help)
-    add_test(NAME mfq-runtime-cli-options COMMAND mfq-runtime --transport stdio --continuous-batching 2 --help)
     add_test(NAME mfq-diagnostics-cli-options COMMAND mfq-diagnostics --ids 1,2 --gen 3 --help)
     add_test(NAME mfq-eval-cli-options COMMAND mfq-eval kl --kl-base x --kl-evaluator optimized --help)
-    add_test(NAME mfq-runtime-rejects-check
-        COMMAND mfq-runtime --check-mfq-container)
-    add_test(NAME mfq-runtime-rejects-kl
-        COMMAND mfq-runtime --kl-base reference.bin)
-    add_test(NAME mfq-runtime-rejects-bad-number
-        COMMAND mfq-runtime --port 3x --help)
-    add_test(NAME mfq-runtime-rejects-missing-value
-        COMMAND mfq-runtime --model --help)
-    add_test(NAME mfq-runtime-rejects-token-input
-        COMMAND mfq-runtime --ids 1,2 --help)
+    if(TARGET mfq-runtime)
+        add_test(NAME mfq-runtime-cli-options COMMAND mfq-runtime --transport stdio --continuous-batching 2 --help)
+        add_test(NAME mfq-runtime-rejects-check
+            COMMAND mfq-runtime --check-mfq-container)
+        add_test(NAME mfq-runtime-rejects-kl
+            COMMAND mfq-runtime --kl-base reference.bin)
+        add_test(NAME mfq-runtime-rejects-bad-number
+            COMMAND mfq-runtime --port 3x --help)
+        add_test(NAME mfq-runtime-rejects-missing-value
+            COMMAND mfq-runtime --model --help)
+        add_test(NAME mfq-runtime-rejects-token-input
+            COMMAND mfq-runtime --ids 1,2 --help)
+        set_tests_properties(
+            mfq-runtime-rejects-check mfq-runtime-rejects-kl
+            mfq-runtime-rejects-bad-number mfq-runtime-rejects-missing-value
+            mfq-runtime-rejects-token-input
+            PROPERTIES WILL_FAIL TRUE)
+    endif()
     add_test(NAME mfq-diagnostics-rejects-bad-ids
         COMMAND mfq-diagnostics --ids 1,x --help)
     add_test(NAME mfq-diagnostics-rejects-kl
@@ -516,9 +514,7 @@ if(BUILD_TESTING)
     add_test(NAME mfq-eval-rejects-bad-number
         COMMAND mfq-eval kl --kl-chunks 1x --help)
     set_tests_properties(
-        mfq-runtime-rejects-check mfq-runtime-rejects-kl
-        mfq-runtime-rejects-bad-number mfq-runtime-rejects-missing-value
-        mfq-runtime-rejects-token-input mfq-diagnostics-rejects-bad-ids
+        mfq-diagnostics-rejects-bad-ids
         mfq-diagnostics-rejects-kl mfq-diagnostics-rejects-missing-value
         mfq-eval-rejects-check mfq-eval-rejects-bad-number
         PROPERTIES WILL_FAIL TRUE)
@@ -528,6 +524,9 @@ option(MFQ_BUILD_TORCH_REFERENCE_RUNTIME
     "Build the optional LibTorch CUDA runtime used only for A/B validation"
     OFF)
 if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
+    if(NOT TARGET mfq-runtime-communication)
+        message(FATAL_ERROR "mfq-runtime-torch requires MFQ_BUILD_RUNTIME_COMMUNICATION=ON")
+    endif()
     find_package(Python REQUIRED COMPONENTS Interpreter Development)
     if(NOT TARGET CUDA::nvToolsExt)
         find_library(NVTOOLSEXT_LIBRARY
@@ -546,6 +545,8 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
     add_executable(mfq-runtime-torch
         ${MFQ_CUDA_ROOT}/apps/runtime_main.cpp
         ${MFQ_CUDA_ROOT}/commands/runtime.cpp
+        ${MFQ_CUDA_ROOT}/commands/cli.cpp
+        ${MFQ_CUDA_ROOT}/commands/minicpmo45.cpp
         ${MFQ_CUDA_RUNTIME_OP_SOURCES}
         ${MFQ_CUDA_LOADING_SOURCES}
         ${MFQ_CUDA_INSTANTIATION_SOURCES}
@@ -576,7 +577,7 @@ if(MFQ_BUILD_TORCH_REFERENCE_RUNTIME)
     )
 endif()
 
-if(NOT WIN32)
+if(NOT WIN32 AND TARGET mfq-runtime)
     set(MFQ_SYSTEM_RUNTIME_DIR
         "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}" CACHE PATH
         "directory containing the host libstdc++ runtime")

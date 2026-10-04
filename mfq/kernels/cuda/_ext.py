@@ -17,9 +17,6 @@ from pathlib import Path
 
 _DIR = os.path.dirname(__file__)
 _REPOSITORY_ROOT = str(Path(_DIR).resolve().parents[2])
-_CUDA_RUNTIME_INCLUDE = str(
-    Path(_REPOSITORY_ROOT) / "csrc" / "backends" / "cuda" / "include"
-)
 _CORE_INCLUDE = str(Path(_REPOSITORY_ROOT) / "csrc" / "core" / "include")
 _GGML_ROOT = Path(_REPOSITORY_ROOT) / "csrc" / "components" / "ggml"
 _GGML_INCLUDE = str(_GGML_ROOT / "include")
@@ -98,7 +95,6 @@ def ext():
             sources=_SOURCES,
             extra_include_paths=[
                 _REPOSITORY_ROOT,
-                _CUDA_RUNTIME_INCLUDE,
                 _CORE_INCLUDE,
                 _GGML_INCLUDE,
                 _GGML_SOURCE_INCLUDE,

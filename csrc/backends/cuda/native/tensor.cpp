@@ -1,4 +1,4 @@
-#include "mfq_native_tensor.h"
+#include "tensor.h"
 
 #include <cstdlib>
 #include <cstring>
