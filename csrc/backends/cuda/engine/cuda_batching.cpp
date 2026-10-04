@@ -109,7 +109,7 @@ int64_t QwenBatchOperations::max_context() const { return model_.max_position_em
 
 std::vector<std::pair<std::string, double>> QwenBatchOperations::metrics() const {
     const auto paged = state_adapter_.paged_kv_stats();
-    return {
+    mfq::engine::Metrics result{
         {"continuous_batching_decode_batches", static_cast<double>(decode_batches_)},
         {"continuous_batching_decode_tokens", static_cast<double>(decode_tokens_)},
 
@@ -136,6 +136,13 @@ std::vector<std::pair<std::string, double>> QwenBatchOperations::metrics() const
         {"paged_kv_page_releases", static_cast<double>(paged.releases)},
         {"paged_kv_table_updates", static_cast<double>(paged.table_updates)},
     };
+    for (const auto& [bucket, counts] : graph_bucket_counts_) {
+        const auto key = "continuous_batching_graph_b" + std::to_string(bucket.first) +
+            "_ctx" + std::to_string(bucket.second);
+        result.emplace_back(key + "_captures", counts.first);
+        result.emplace_back(key + "_replays", counts.second);
+    }
+    return result;
 }
 
 void QwenBatchOperations::initialize_sampling(Request &request, const Tensor &prompt_ids) {
@@ -145,7 +152,6 @@ void QwenBatchOperations::initialize_sampling(Request &request, const Tensor &pr
 }
 
 void QwenBatchOperations::suspend_decode() {
-    invalidate_decode_graph();
     MfqCudaGuard guard(execution_.layer_placement.primary_device());
     state_adapter_.suspend_decode();
 }
@@ -378,6 +384,7 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode(State &state) {
                     decode_graph->set_key(batch, planned_len,
                                           state_adapter_.decode_state_addresses());
                     ++cuda_graph_captures_;
+                    ++graph_bucket_counts_[{batch, planned_len}].first;
                 } catch (...) {
                     decode_graph->invalidate();
                     throw;
@@ -386,6 +393,7 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode(State &state) {
             decode_graph->graph->replay();
             graph_tokens = decode_graph->static_next;
             ++cuda_graph_replays_;
+            ++graph_bucket_counts_[{batch, planned_len}].second;
         } else {
             auto hidden = model_.hidden_forward(ids, pos, lengths, nullptr, pos);
             logits = state_adapter_.logits_from_last_hidden(std::move(hidden));

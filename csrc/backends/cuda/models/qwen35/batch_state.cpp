@@ -358,6 +358,10 @@ std::vector<const void *> Qwen35BatchStateAdapter::decode_state_addresses() {
                 addresses.push_back(full->state->cache.k.data_ptr());
                 addresses.push_back(full->state->cache.v.data_ptr());
             }
+            for (const auto* workspace : {&full->state->decode_partial_o, &full->state->decode_partial_m,
+                    &full->state->decode_partial_l, &full->state->decode_mma_mask,
+                    &full->state->decode_mma_kv_max, &full->state->decode_mma_meta})
+                addresses.push_back(workspace->defined() ? workspace->data_ptr() : nullptr);
         } else if (auto *linear = dynamic_cast<LinearBlock *>(block.get())) {
             addresses.push_back(linear->state->conv_state.data_ptr());
             addresses.push_back(linear->state->gdn_state.data_ptr());

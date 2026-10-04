@@ -230,6 +230,17 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
             for (const auto& [key, value] : batcher.metrics()) if (key == name) return value;
             throw std::runtime_error("missing batching metric");
         };
+        admit("anchor", second_prompt);
+        for (int ticks = 0; ticks < 100 && tokens["anchor"].size() < 4; ++ticks) tick({"anchor"});
+        const auto captures_before_join = metric("continuous_batching_cuda_graph_captures");
+        admit("joined", second_prompt);
+        for (int ticks = 0; ticks < 500 && !executor.empty(); ++ticks) tick({"anchor", "joined"});
+        MFQ_RUNTIME_CHECK(executor.empty() && tokens["anchor"] == second_reference &&
+            tokens["joined"] == second_reference, "prefill join changed decode output");
+        if (config.continuous_batch.greedy &&
+            qwen_continuous_batch_cuda_graph_enabled(model, config.continuous_batch))
+            MFQ_RUNTIME_CHECK(metric("continuous_batching_cuda_graph_captures") == captures_before_join,
+                "joining prefill recaptured a valid decode graph");
         const auto reads_before = metric("continuous_batching_sampling_readbacks");
         const auto batches_before = metric("continuous_batching_decode_batches");
         const auto started = std::chrono::steady_clock::now();
@@ -253,6 +264,8 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() << '\n';
         double captures = 0, replays = 0;
         for (const auto& [key, value] : batcher.metrics()) {
+            if (key.starts_with("continuous_batching_graph_b"))
+                std::cout << key << "=" << value << '\n';
             if (key == "paged_kv_live_pages") MFQ_RUNTIME_CHECK(value == 0, "paged KV leaked");
             if (key == "continuous_batching_active" || key == "continuous_batching_prefilling")
                 MFQ_RUNTIME_CHECK(value == 0, "batch retained finished requests");
