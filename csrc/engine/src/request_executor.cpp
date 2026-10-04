@@ -23,6 +23,10 @@ void RequestExecutor::finish(
                           : error.code == InferenceInputErrorCode::Unsupported ? "unsupported_input"
                                                                                : "invalid_request";
         result.events.push_back({id, Failed{code, error.what()}});
+    } catch (const std::bad_alloc &error) {
+        result.events.push_back({id, Failed{"resource_exhausted", error.what(), false}});
+    } catch (const ResourceExhausted &error) {
+        result.events.push_back({id, Failed{"resource_exhausted", error.what(), false}});
     } catch (const std::invalid_argument &error) {
         result.events.push_back(
             {id, Failed{healthy_ ? "invalid_request" : "backend_failure", error.what()}});

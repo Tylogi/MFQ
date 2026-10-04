@@ -2220,6 +2220,7 @@ std::optional<std::vector<common_chat_msg_diff>> CompletionStream::next() {
                 terminal_ = true;
                 if (data.code == "invalid_request") throw ApiError(400, "invalid_request_error", data.message);
                 if (data.code == "unsupported_input") throw ApiError(501, "unsupported_parameter", data.message);
+                if (data.code == "resource_exhausted") throw ApiError(503, "resource_exhausted", data.message);
                 throw std::runtime_error(data.message);
             }
         }, event.data);

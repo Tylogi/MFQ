@@ -552,13 +552,20 @@ void* Context::allocate(std::size_t bytes, cudaStream_t stream) {
             "CUDA graph capture requested an un-warmed allocation of " +
             std::to_string(bytes) + " bytes");
     }
+    auto allocated = allocated_bytes_.load();
+    do {
+        const auto limit = allocation_limit_.load();
+        if (bytes > std::numeric_limits<std::size_t>::max() - allocated ||
+            (limit && (bytes > limit || allocated > limit - bytes))) throw AllocationLimit();
+    } while (!allocated_bytes_.compare_exchange_weak(allocated, allocated + bytes));
     void* pointer = nullptr;
-    if (async_allocations_) {
-        MFQ_NATIVE_CUDA_CHECK(cudaMallocFromPoolAsync(
-            &pointer, bytes, pool_, allocation_stream));
-    } else {
-        MFQ_NATIVE_CUDA_CHECK(cudaMalloc(&pointer, bytes));
-    }
+    try {
+        if (async_allocations_) {
+            MFQ_NATIVE_CUDA_CHECK(cudaMallocFromPoolAsync(&pointer, bytes, pool_, allocation_stream));
+        } else {
+            MFQ_NATIVE_CUDA_CHECK(cudaMalloc(&pointer, bytes));
+        }
+    } catch (...) { allocated_bytes_ -= bytes; throw; }
     return pointer;
 }
 
@@ -584,6 +591,7 @@ void Context::release(
         // leaking it. During capture the size bucket already exists and the
         // preceding pop leaves enough vector capacity for this push.
     }
+    allocated_bytes_ -= bytes;
     on_device_noexcept(device_, [&] {
         if (async_allocations_) {
             (void)cudaFreeAsync(pointer, allocation_stream);
@@ -636,8 +644,9 @@ void Context::end_graph_pool(cudaStream_t stream) noexcept {
         graph_pools_.erase(found);
     }
     on_device_noexcept(device_, [&] {
-        for (const auto& [_, pointers] : pool.available) {
+        for (const auto& [bytes, pointers] : pool.available) {
             for (void* pointer : pointers) {
+                allocated_bytes_ -= bytes;
                 if (async_allocations_) {
                     (void)cudaFreeAsync(pointer, stream);
                 } else {
@@ -651,6 +660,15 @@ void Context::end_graph_pool(cudaStream_t stream) noexcept {
     });
 }
 
+void Context::reserve_execution_memory(std::size_t bytes) {
+    if (bytes > std::numeric_limits<std::size_t>::max() - allocated_bytes_.load()) throw AllocationLimit();
+    const auto limit = allocated_bytes_.load() + bytes;
+    auto* reservation = allocate(bytes);
+    release(reservation, bytes);
+    stream_.synchronize();
+    allocation_limit_ = limit;
+}
+
 void Context::trim() {
     {
         std::lock_guard lock(graph_pool_mutex_);
@@ -661,7 +679,7 @@ void Context::trim() {
     stream_.synchronize();
     if (async_allocations_) {
         DeviceGuard guard(device_);
-        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolTrimTo(pool_, 0));
+        MFQ_NATIVE_CUDA_CHECK(cudaMemPoolTrimTo(pool_, allocation_limit_.load()));
     }
 }
 

@@ -65,6 +65,21 @@ static void check_native_resources() {
     if (value.sum().item<float>() != 12.0f) throw std::runtime_error("peer Engine teardown changed survivor");
 }
 
+static void check_memory_envelope() {
+    CudaExecutionContext execution;
+    CudaExecutionScope scope(execution);
+    auto context = mfq::cuda::default_context(0);
+    context->reserve_execution_memory(4096);
+    auto* first = context->allocate(3072);
+    bool rejected = false;
+    try { (void)context->allocate(2048); } catch (const std::bad_alloc&) { rejected = true; }
+    if (!rejected) throw std::runtime_error("native allocator exceeded reserved memory");
+    context->release(first, 3072);
+    auto* second = context->allocate(4096);
+    context->release(second, 4096);
+    context->trim();
+}
+
 static void check_engines(const char* model, const char* tokenizer) {
     mfq::cuda::CudaEngineOptions options;
     options.model_path = model;
@@ -108,7 +123,44 @@ static void check_engines(const char* model, const char* tokenizer) {
     if (generate(*first) != reference) throw std::runtime_error("reload changed tokens");
     first->shutdown();
     if (generate(*second) != reference) throw std::runtime_error("peer shutdown changed tokens");
-    std::cout << "two Engine isolation/reload/shutdown passed\n";
+    const auto metric = [](mfq::engine::Engine& engine, const std::string& name) {
+        const auto values = std::get<mfq::engine::Metrics>(engine.control(mfq::engine::RuntimeMetrics{}));
+        for (const auto& [key, value] : values) if (key == name) return value;
+        throw std::runtime_error("missing memory admission metric");
+    };
+    options.continuous_batching = 4;
+    auto probe = mfq::cuda::load_cuda_engine(options);
+    const auto cost = static_cast<std::size_t>(metric(*probe, "admission_device_0_request_bytes"));
+    probe.reset();
+    options.memory_budget_bytes = cost * 2;
+    auto limited = mfq::cuda::load_cuda_engine(options);
+    if (limited->info().max_requests != 2) throw std::runtime_error("memory budget did not clamp slot capacity");
+    for (int run = 0; run < 4; ++run) {
+        using namespace mfq::engine;
+        EngineRequest long_request;
+        long_request.id = "long"; long_request.token_ids.assign(96, 101);
+        long_request.input.sampling.max_tokens = 16; long_request.input.sampling.enable_mtp = false;
+        EngineRequest short_request = long_request; short_request.id = "short"; short_request.token_ids = {101, 202, 303};
+        limited->admit(std::move(long_request)); limited->admit(std::move(short_request));
+        EngineRequest deferred; deferred.id = "deferred"; deferred.token_ids = {101};
+        if (limited->status().available || limited->admit(std::move(deferred)) != Admission::deferred || deferred.token_ids.empty())
+            throw std::runtime_error("memory admission did not defer without consuming input");
+        if (metric(*limited, "admission_device_0_reserved_bytes") != 2 * cost)
+            throw std::runtime_error("request memory reservation was not retained");
+        for (int tick = 0; tick < 5; ++tick) {
+            const auto step = limited->step({"long", "short"});
+            for (const auto& event : step.events) if (auto* error = std::get_if<Failed>(&event.data))
+                throw std::runtime_error(error->message);
+        }
+        limited->cancel("long"); limited->cancel("short"); limited->step({});
+        if (!limited->status().healthy || limited->status().available != 2 ||
+            metric(*limited, "admission_device_0_reserved_bytes") != 0)
+            throw std::runtime_error("cancelled requests retained their memory reservation");
+        if (generate(*limited) != reference) throw std::runtime_error("budget churn changed output");
+        if (metric(*limited, "admission_device_0_reserved_bytes") != 0)
+            throw std::runtime_error("completed request retained its memory reservation");
+    }
+    std::cout << "two Engine isolation/reload/shutdown and memory admission passed\n";
 }
 
 int main(int argc, char** argv) try {
@@ -172,6 +224,7 @@ int main(int argc, char** argv) try {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) == cudaSuccess && devices) {
         check_native_resources();
+        check_memory_envelope();
         if (argc == 3) check_engines(argv[1], argv[2]);
     }
     return isolated.load(std::memory_order_relaxed) &&

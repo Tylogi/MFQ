@@ -1,3 +1,4 @@
+#include "admission_budget.h"
 #include "scheduler.h"
 
 #include <algorithm>
@@ -344,6 +345,8 @@ void MfqScheduler::loop() noexcept {
                     catch (const InferenceInputError& error) {
                         publish(request, {id, Failed{error.code == InferenceInputErrorCode::Unsupported
                             ? "unsupported_input" : "invalid_request", error.what()}}); continue;
+                    } catch (const mfq::engine::ResourceExhausted& error) {
+                        publish(request, {id, Failed{"resource_exhausted", error.what()}}); continue;
                     } catch (const std::invalid_argument& error) {
                         publish(request, {id, Failed{"invalid_request", error.what()}}); continue;
                     }

@@ -26,6 +26,7 @@ struct CudaLoadOptions {
 struct CudaEngineOptions : CudaLoadOptions {
     int continuous_batching = 0;
     int64_t prefill_chunk_size = 2048;
+    std::size_t memory_budget_bytes = 0; // Per-device execution budget; zero uses available memory.
 };
 
 std::unique_ptr<mfq::engine::Engine> load_cuda_engine(CudaEngineOptions options);

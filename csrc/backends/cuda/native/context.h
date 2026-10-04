@@ -4,6 +4,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -15,6 +16,13 @@
 #include <vector>
 
 namespace mfq::cuda {
+
+class AllocationLimit final : public std::bad_alloc {
+public:
+    const char* what() const noexcept override {
+        return "native CUDA execution exceeded its reserved memory envelope";
+    }
+};
 
 class Error final : public std::runtime_error {
 public:
@@ -191,6 +199,8 @@ public:
     void end_graph_capture(cudaStream_t stream) noexcept;
     void end_graph_pool(cudaStream_t stream) noexcept;
     void trim();
+    // Physically retain request headroom in this Engine's pool before serving.
+    void reserve_execution_memory(std::size_t bytes);
 
 private:
     struct GraphPool {
@@ -203,6 +213,7 @@ private:
     BlasHandle blas_;
     cudaMemPool_t pool_ = nullptr;
     bool async_allocations_ = false;
+    std::atomic<std::size_t> allocation_limit_{0}, allocated_bytes_{0};
     std::mutex graph_pool_mutex_;
     std::unordered_map<cudaStream_t, GraphPool> graph_pools_;
 };

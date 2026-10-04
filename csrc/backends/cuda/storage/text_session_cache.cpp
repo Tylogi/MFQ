@@ -107,6 +107,8 @@ TextSessionCache::TextSessionCache(const mfq::engine::SessionCacheConfig &sessio
 
 TextSessionCache::~TextSessionCache() = default;
 
+void TextSessionCache::limit_snapshot_bytes(std::size_t bytes) { impl_->limit_snapshot_bytes(bytes); }
+
 bool TextSessionCache::persistent_prefix_enabled() const noexcept {
     return impl_->persistent_prefix_enabled();
 }

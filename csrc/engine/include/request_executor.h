@@ -1,6 +1,7 @@
 #pragma once
 
 #include "generation_step.h"
+#include "admission_budget.h"
 #include "text_cancel.h"
 
 #include <memory>
@@ -30,6 +31,7 @@ template <class Cache> SessionResult control_session(Cache &cache, const Session
 // Serial and batched execution write into the same request state. Only the
 // executor drains events and finishes the request after device cleanup.
 struct ExecutionRequest {
+    std::optional<AdmissionBudget::Lease> memory;
     InferenceRequest input;
     InferenceOutput output;
     Generation generation;
@@ -80,6 +82,12 @@ class RequestExecutor {
         const bool batched = ops.can_batch(request);
         if (!status(ops.exclusive()).available || (!batched && !empty()))
             return Admission::deferred;
+        std::optional<AdmissionBudget::Lease> memory;
+        if constexpr (requires { ops.reserve(request); }) {
+            auto reservation = ops.reserve(request);
+            if (!reservation) return Admission::deferred;
+            memory.emplace(std::move(*reservation));
+        }
         const bool raw = !request.token_ids.empty();
         const MfqTokenizer *tokenizer = nullptr;
         InferenceRequest input;
@@ -96,6 +104,7 @@ class RequestExecutor {
         if (raw) prepare_plan(input, info);
         auto current = std::make_unique<ExecutionRequest>(
             std::move(input), tokenizer, request.id);
+        if (memory) current->memory.emplace(std::move(*memory));
         current->output.metrics.mtp.available = ops.mtp_available();
         current->batched = batched;
         if (!raw) {
@@ -128,6 +137,10 @@ class RequestExecutor {
     template <class Ops> EngineStepResult step(const std::vector<RequestId> &eligible, Ops &ops) {
         try {
             ops.execute(eligible);
+        } catch (const std::bad_alloc&) {
+            for (auto& [id, request] : requests_) request->complete(std::current_exception());
+        } catch (const ResourceExhausted&) {
+            for (auto& [id, request] : requests_) request->complete(std::current_exception());
         } catch (...) {
             healthy_ = false;
             for (auto& [id, request] : requests_)
@@ -239,7 +252,10 @@ template <class Backend> class EngineInstance final : public Engine {
     }
     EngineInfo info() const override { return info_; }
     EngineStatus status() const override {
-        return loaded_ ? requests_.status(backend.exclusive()) : EngineStatus{0, false};
+        auto result = loaded_ ? requests_.status(backend.exclusive()) : EngineStatus{0, false};
+        if constexpr (requires { backend.available(); })
+            result.available = std::min(result.available, backend.available());
+        return result;
     }
     Admission admit(EngineRequest&& request) override {
         return backend.visit([&](auto& ops) {
@@ -248,7 +264,9 @@ template <class Backend> class EngineInstance final : public Engine {
     }
     void cancel(const RequestId& id) override { requests_.cancel(id); }
     EngineStepResult step(const std::vector<RequestId>& eligible) override {
-        return backend.visit([&](auto& ops) { return requests_.step(eligible, ops); });
+        auto result = backend.visit([&](auto& ops) { return requests_.step(eligible, ops); });
+        result.status = status();
+        return result;
     }
     SessionResult session(const SessionCommand& command) override {
         return backend.visit([&](auto& ops) { return control_session(ops.cache, command); });

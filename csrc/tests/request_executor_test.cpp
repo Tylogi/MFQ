@@ -48,6 +48,7 @@ struct TestOps {
             throw InferenceInputError(InferenceInputErrorCode::Invalid, "invalid media");
         if (failure == 2)
             throw std::runtime_error("device failed");
+        if (failure == 3) throw std::bad_alloc();
         auto sequence = generate_sequence(
             std::ref(*this), output, input.prompt.size(), 0, input.cache_plan.stable_prefix_tokens, 2);
         while (auto event = sequence.next())
@@ -371,7 +372,38 @@ static void check_async_text_preparation() {
     assert(complete && executor.empty());
 }
 
+static void check_admission_memory() {
+    struct BudgetOps : TestOps {
+        AdmissionBudget budget{{100, 50}};
+        auto reserve(const EngineRequest&) { return budget.reserve({60, 20}); }
+    } ops;
+    ops.batch = true;
+    RequestExecutor executor(4);
+    assert(executor.admit(request("one"), nullptr, info(), ops) == Admission::accepted);
+    auto second = request("two");
+    const auto* data = second.token_ids.data();
+    assert(executor.admit(std::move(second), nullptr, info(), ops) == Admission::deferred);
+    assert(second.token_ids.data() == data && ops.budget.used() == std::vector<std::size_t>({60, 20}));
+    executor.cancel("one"); executor.step({}, ops);
+    assert(ops.budget.used() == std::vector<std::size_t>({0, 0}));
+    assert(executor.admit(std::move(second), nullptr, info(), ops) == Admission::accepted);
+    ops.failure = 3;
+    const auto failed = executor.step({"two"}, ops);
+    assert(std::get<Failed>(terminal_event(failed)).code == "resource_exhausted");
+    assert(executor.status().healthy && ops.budget.used() == std::vector<std::size_t>({0, 0}));
+    ops.failure = 0;
+    executor.admit(request("complete"), nullptr, info(), ops);
+    while (!executor.empty()) executor.step({"complete"}, ops);
+    assert(ops.budget.available({60, 20}) == 1);
+    executor.admit(request("clear"), nullptr, info(), ops); executor.clear();
+    assert(ops.budget.available({60, 20}) == 1);
+    bool rejected = false;
+    try { ops.budget.reserve({101, 20}); } catch (const ResourceExhausted&) { rejected = true; }
+    assert(rejected && ops.budget.used() == std::vector<std::size_t>({0, 0}));
+}
+
 int main() {
+    check_admission_memory();
     check_async_text_preparation();
     check_waiting_and_cleanup();
     check_preparation_steps();

@@ -77,6 +77,12 @@ public:
         return config_.max_snapshots_per_session;
     }
     std::size_t max_bytes() const noexcept { return config_.max_bytes; }
+    void limit_bytes(std::size_t bytes) {
+        config_.max_bytes = std::min(config_.max_bytes, bytes);
+        evict_to_budget({}, 0);
+        sync_metrics();
+    }
+
 
     template <typename Eligible>
     std::optional<Match> find_best(

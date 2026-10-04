@@ -31,6 +31,8 @@ template <class Backend> class SessionCache {
           paged_hot_budget_(paged_cache_ ? prefix_config.hot_bytes : 0),
           trace_(session_config.trace), supported_(supported), disabled_reason_(disabled_reason) {}
 
+    void limit_snapshot_bytes(std::size_t bytes) { snapshots_.limit_bytes(bytes); }
+
     bool persistent_prefix_enabled() const noexcept { return static_cast<bool>(paged_cache_); }
 
     template <typename Model>

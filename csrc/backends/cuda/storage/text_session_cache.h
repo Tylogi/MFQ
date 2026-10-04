@@ -51,6 +51,8 @@ public:
     TextSessionCache(const TextSessionCache&) = delete;
     TextSessionCache& operator=(const TextSessionCache&) = delete;
 
+    void limit_snapshot_bytes(std::size_t bytes);
+
     bool persistent_prefix_enabled() const noexcept;
 
     template <typename Model>

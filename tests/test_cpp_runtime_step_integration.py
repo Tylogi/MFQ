@@ -155,7 +155,7 @@ def test_diagnostic_engine_generation() -> None:
                "--ctx-size", "64", "--ids", "1,2,3", "--gen", "16"]
     outputs = []
     for graph in ("0", "1"):
-        result = subprocess.run(command, env={**os.environ, "MFQ_CUDA_GRAPH": graph},
+        result = subprocess.run(command, env={**os.environ, "MFQ_RUNTIME_CUDA_GRAPH": graph},
                                 capture_output=True, text=True, timeout=60, check=True)
         fields = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
         assert fields["generation_path"] == "engine_step"
