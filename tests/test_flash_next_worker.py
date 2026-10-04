@@ -9,10 +9,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
-import mlx.core as mx
 import numpy as np
 import pytest
 from tokenizers import Tokenizer, models, pre_tokenizers
+
+mx = pytest.importorskip("mlx.core")
 
 import mfq.runtime.flash_next_worker as worker_module
 from mfq.formats import io
