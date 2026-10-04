@@ -172,7 +172,7 @@ std::vector<float> decode_audio_features(
 namespace mfq::transport_detail {
 class CompletionStream {
 public:
-    CompletionStream(const MfqScheduler& scheduler, const RequestWork& work, std::string id);
+    CompletionStream(const MfqScheduler& scheduler, RequestWork&& work, std::string id);
     ~CompletionStream();
     std::optional<std::vector<common_chat_msg_diff>> next();
     void cancel();

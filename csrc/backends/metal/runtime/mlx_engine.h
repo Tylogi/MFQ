@@ -23,7 +23,7 @@ public:
     ~MlxEngine() override;
     mfq::engine::EngineInfo info() const override { return info_; }
     mfq::engine::EngineStatus status() const override;
-    mfq::engine::Admission admit(mfq::engine::EngineRequest) override;
+    mfq::engine::Admission admit(mfq::engine::EngineRequest&&) override;
     void cancel(const mfq::engine::RequestId&) override;
     mfq::engine::EngineStepResult step(const std::vector<mfq::engine::RequestId>&) override;
     mfq::engine::SessionResult session(const mfq::engine::SessionCommand&) override;

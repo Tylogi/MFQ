@@ -2177,9 +2177,10 @@ MfqRuntimeProfile resolve_mfq_runtime_profile(
 }
 
 namespace mfq::transport_detail {
-CompletionStream::CompletionStream(const MfqScheduler& scheduler, const RequestWork& work, std::string id)
+CompletionStream::CompletionStream(const MfqScheduler& scheduler, RequestWork&& work, std::string id) try
     : scheduler_(scheduler), id_(std::move(id)),
-      request_(scheduler_.submit(mfq::engine::EngineRequest{id_, work})) {}
+      request_(scheduler_.submit(mfq::engine::EngineRequest{id_, std::move(work)})) {}
+catch (const MfqSchedulerOverloaded& error) { throw ApiError(429, "request_queue_full", error.what()); }
 CompletionStream::~CompletionStream() {
     if (!terminal_) try { cancel(); } catch (...) {}
 }

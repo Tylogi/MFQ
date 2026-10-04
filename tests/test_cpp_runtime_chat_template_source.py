@@ -160,7 +160,7 @@ def test_server_enforces_complete_chat_template_tool_calls() -> None:
 def test_native_server_cancels_active_session_between_steps() -> None:
     assert 'R"(/runtime/sessions/([A-Za-z0-9._:-]{1,128})/cancel)"' in SERVER
     assert "scheduler.cancel_session(session_id)" in SERVER
-    assert "engine_.cancel(request.input.id)" in SCHEDULER
+    assert "if (request.admitted) engine_.cancel(request.id);" in SCHEDULER
     assert 'result.finish_reason = "cancelled"' in ENGINE
     assert "else if (!result.tool_calls.empty())" in ENGINE
     assert "cancel_requested" not in SERVER

@@ -10,6 +10,10 @@
 #include <unordered_map>
 
 class MfqScheduler;
+class MfqSchedulerOverloaded : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 class MfqScheduledRequest {
 public:
@@ -18,6 +22,10 @@ public:
 
 private:
     friend class MfqScheduler;
+class MfqSchedulerOverloaded : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
     mutable std::mutex mutex_;
     std::condition_variable ready_;
     std::deque<mfq::engine::EngineEvent> events_;
@@ -28,7 +36,10 @@ private:
 
 class MfqScheduler {
 public:
-    struct Limits { std::size_t events = 64, bytes = 1024 * 1024; };
+    struct Limits {
+        std::size_t events = 64, bytes = 1024 * 1024;
+        std::size_t requests = 256, input_bytes = 512ULL * 1024 * 1024;
+    };
     explicit MfqScheduler(mfq::engine::Engine& engine);
     MfqScheduler(mfq::engine::Engine& engine, Limits limits);
     ~MfqScheduler();
@@ -56,6 +67,13 @@ private:
     struct Request {
         mfq::engine::EngineRequest input;
         std::shared_ptr<MfqScheduledRequest> outbox;
+        std::string id, session;
+        std::optional<mfq::engine::Clock::time_point> deadline;
+        int priority = 0;
+        std::size_t reserved_bytes = 0;
+        Request(mfq::engine::EngineRequest value, std::shared_ptr<MfqScheduledRequest> box)
+            : input(std::move(value)), outbox(std::move(box)), id(input.id),
+              session(input.input.cache_plan.session_id), deadline(input.deadline), priority(input.priority) {}
         bool admitted = false, cancelling = false;
         bool finished = false;
         std::optional<mfq::engine::Failed> failure;
@@ -74,12 +92,14 @@ private:
     void publish(Request& request, mfq::engine::EngineEvent event);
     void flush(Request& request);
     void cancel(Request& request);
+    void release_input_budget(const Request& request);
 
     mfq::engine::Engine& engine_;
     Limits limits_;
     mutable std::mutex mutex_;
     std::shared_ptr<std::condition_variable> wake_ = std::make_shared<std::condition_variable>();
     mutable std::deque<Command> mailbox_;
+    mutable std::size_t reserved_requests_ = 0, reserved_bytes_ = 0;
     mfq::engine::EngineInfo info_;
     bool stopping_ = false;
     std::thread worker_;

@@ -818,26 +818,27 @@ int run_mfq_http_transport(
                 }
                 input.media = parse_mfq_vision(body["mfq_multimodal"]);
             }
-            RequestWork work = std::move(input);
+            const auto sampling = input.sampling;
+                const bool stream = input.stream, include_usage = input.include_usage;
             const std::string id = request_id("run-");
             const int64_t created = unix_time_seconds();
             std::shared_ptr<ActiveRequest> active_request;
             active_request = std::make_shared<ActiveRequest>(request_metrics_store);
-            auto completion = std::make_shared<CompletionStream>(scheduler, work, id);
+            auto completion = std::make_shared<CompletionStream>(scheduler, std::move(input), id);
 
-            if (!work.stream) {
+            if (!stream) {
                 while (completion->next()) {}
                 auto result = std::move(completion->result);
                 auto metrics = completion->metrics;
                 const RequestMetricValues metric_values =
                     request_metric_values(result, metrics);
                 log_request_metrics(
-                    id, true, false, completion->prompt_tokens, work.sampling,
+                    id, true, false, completion->prompt_tokens, sampling,
                     result, metric_values);
                 active_request->complete(
                     id, true, false, completion->prompt_tokens, result, metric_values);
                 auto performance =
-                    request_metric_values_json(metric_values, work.sampling);
+                    request_metric_values_json(metric_values, sampling);
                 add_request_runtime_metrics(performance, metrics);
                 set_json(res, runtime_generation_result(
                     id, created, config.model_name, result,
@@ -850,7 +851,7 @@ int run_mfq_http_transport(
             res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider(
                 "text/event-stream; charset=utf-8",
-                [work = std::move(work), id, created, &scheduler,
+                [sampling, stream, include_usage, id, created, &scheduler,
                  &config, active_request, completion]
                 (size_t offset, httplib::DataSink & sink) mutable -> bool {
                     if (offset != 0) {
@@ -872,7 +873,7 @@ int run_mfq_http_transport(
                         const RequestMetricValues metric_values =
                             request_metric_values(result, metrics);
                         log_request_metrics(
-                            id, true, true, completion->prompt_tokens, work.sampling,
+                            id, true, true, completion->prompt_tokens, sampling,
                             result, metric_values);
                         active_request->complete(
                             id, true, true, completion->prompt_tokens, result,
@@ -882,11 +883,11 @@ int run_mfq_http_transport(
                             "complete", id, created, config.model_name);
                         complete["finish_reason"] = result.finish_reason;
                         auto performance = request_metric_values_json(
-                            metric_values, work.sampling);
+                            metric_values, sampling);
                         add_request_runtime_metrics(performance, metrics);
                         complete["metrics"] = std::move(performance);
                         if (!write_sse(sink, complete)) return false;
-                        if (work.include_usage) {
+                        if (include_usage) {
                             auto usage = runtime_generation_event(
                                 "usage", id, created, config.model_name);
                             usage["usage"] = usage_json(

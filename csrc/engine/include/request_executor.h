@@ -58,7 +58,7 @@ class RequestExecutor {
 
     template <class Ops>
     Admission admit(
-        EngineRequest request, const TextProcessor *text, const EngineInfo &info, Ops &ops) {
+        EngineRequest&& request, const TextProcessor *text, const EngineInfo &info, Ops &ops) {
         if (requests_.contains(request.id))
             throw std::invalid_argument("duplicate request ID");
         const bool batched = ops.can_batch(request);
@@ -175,7 +175,7 @@ template <class Backend> class EngineInstance final : public Engine {
     EngineStatus status() const override {
         return loaded_ ? requests_.status(backend.exclusive()) : EngineStatus{0, false};
     }
-    Admission admit(EngineRequest request) override {
+    Admission admit(EngineRequest&& request) override {
         return backend.visit([&](auto& ops) {
             return requests_.admit(std::move(request), text_.get(), info_, ops);
         });

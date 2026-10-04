@@ -804,12 +804,13 @@ public:
                     input.media = parse_mfq_vision(
                         body["mfq_multimodal"]);
                 }
-                RequestWork work = std::move(input);
-                auto completion = std::make_shared<CompletionStream>(scheduler, work, id);
+                const auto sampling = input.sampling;
+                const bool stream = input.stream, include_usage = input.include_usage;
+                auto completion = std::make_shared<CompletionStream>(scheduler, std::move(input), id);
                 auto done = std::make_shared<std::atomic<bool>>(false);
                 tasks.push_back({
                     std::thread([
-                        &, id, work = std::move(work), completion, done
+                        &, id, sampling, stream, include_usage, completion, done
                     ]() mutable {
                         try {
                             const std::string response_id =
@@ -817,7 +818,7 @@ public:
                             const int64_t created = unix_time_seconds();
                             ActiveRequest active_request(request_metrics_store);
                             while (auto diffs = completion->next()) {
-                                if (!work.stream) continue;
+                                if (!stream) continue;
                                 for (const auto& diff : *diffs) {
                                     json delta = chat_diff_json(diff);
                                     if (delta.empty()) continue;
@@ -831,23 +832,23 @@ public:
                             const RequestMetricValues metric_values =
                                 request_metric_values(result, metrics);
                             log_request_metrics(
-                                response_id, true, work.stream,
-                                completion->prompt_tokens, work.sampling,
+                                response_id, true, stream,
+                                completion->prompt_tokens, sampling,
                                 result, metric_values);
                             active_request.complete(
-                                response_id, true, work.stream,
+                                response_id, true, stream,
                                 completion->prompt_tokens, result, metric_values);
                             auto performance = request_metric_values_json(
-                                metric_values, work.sampling);
+                                metric_values, sampling);
                             add_request_runtime_metrics(performance, metrics);
-                            if (work.stream) {
+                            if (stream) {
                                 auto complete = runtime_generation_event(
                                     "complete", response_id, created,
                                     config_.model_name);
                                 complete["finish_reason"] = result.finish_reason;
                                 complete["metrics"] = std::move(performance);
                                 send_event(id, std::move(complete));
-                                if (work.include_usage) {
+                                if (include_usage) {
                                     auto usage = runtime_generation_event(
                                         "usage", response_id, created,
                                         config_.model_name);

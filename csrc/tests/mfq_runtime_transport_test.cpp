@@ -15,14 +15,17 @@ struct FakeEngine final : Engine {
     std::atomic<int> released{0}, reloads{0};
     std::thread::id owner;
     bool fail = false;
+    std::atomic<bool> defer{false};
+    std::atomic<const float*> media{nullptr};
     EngineInfo info() const override { return {2, 128, 64, false, false, true, {}}; }
     void check_thread() {
         if (owner == std::thread::id{}) owner = std::this_thread::get_id();
         assert(owner == std::this_thread::get_id());
     }
-    Admission admit(EngineRequest request) override {
+    Admission admit(EngineRequest&& request) override {
         check_thread();
-        if (active.size() == 2) return Admission::deferred;
+        if (defer || active.size() == 2) return Admission::deferred;
+        if (request.input.media) media = request.input.media->pixel_values.data();
         auto id = request.id; active.emplace(id, Work{std::move(request)});
         return Admission::accepted;
     }
@@ -106,7 +109,44 @@ int drain(const std::shared_ptr<MfqScheduledRequest>& handle, bool cancelled = f
     assert(handle->wait().empty());
     return terminals;
 }
+static void check_input_ownership_and_budget() {
+    FakeEngine engine;
+    engine.defer = true;
+    MfqScheduler scheduler(engine, {8, 4096, 2, 65536});
+    auto input = request(0, 1000);
+    input.input.cache_plan.session_id = "media-session";
+    input.input.media.emplace().pixel_values.resize(10000, 0.5f);
+    const auto* pixels = input.input.media->pixel_values.data();
+    auto pending = scheduler.submit(std::move(input));
+    auto too_large = request(1);
+    too_large.input.media.emplace().audio_features.resize(10000);
+    bool rejected = false;
+    try { scheduler.submit(std::move(too_large)); }
+    catch (const MfqSchedulerOverloaded&) { rejected = true; }
+    assert(rejected);
+    auto second = scheduler.submit(request(1, 1000));
+    rejected = false;
+    try { scheduler.submit(request(2)); }
+    catch (const MfqSchedulerOverloaded&) { rejected = true; }
+    assert(rejected);
+    engine.defer = false;
+    while (!engine.media.load()) std::this_thread::yield();
+    assert(engine.media == pixels); // Deferred retries and acceptance never clone the media buffer.
+    assert(scheduler.cancel_session("media-session")); // Logical identity survives moving the payload.
+    drain(pending, true);
+    scheduler.cancel_request("1");
+    drain(second, true);
+    (void)scheduler.status();
+    drain(scheduler.submit(request(2, 1))); // Both count and byte reservations were returned.
+    auto invalid = request(3); invalid.input.media.emplace().pixel_values.reserve(65536);
+    rejected = false;
+    try { scheduler.submit(std::move(invalid)); }
+    catch (const MfqSchedulerOverloaded&) { rejected = true; }
+    assert(rejected); // Account reserved capacity, even when the vector is empty.
+}
+
 int main() {
+    check_input_ownership_and_budget();
     {
         FakeEngine engine;
         MfqScheduler scheduler(engine, {8, 4096});

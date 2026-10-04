@@ -99,7 +99,8 @@ class Engine {
 public:
     virtual ~Engine() = default;
     virtual EngineInfo info() const = 0;
-    virtual Admission admit(EngineRequest request) = 0;
+    // accepted consumes the input; deferred leaves the request intact for retry.
+    virtual Admission admit(EngineRequest&& request) = 0;
     virtual void cancel(const RequestId& id) = 0;
     virtual EngineStepResult step(const std::vector<RequestId>& eligible) = 0;
     virtual EngineStatus status() const = 0;

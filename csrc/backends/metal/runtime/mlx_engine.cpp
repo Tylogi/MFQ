@@ -14,7 +14,7 @@ MlxEngine::~MlxEngine() { try { shutdown(); } catch (...) {} }
 EngineStatus MlxEngine::status() const {
     return model_ ? requests_.status(duplex_active_) : EngineStatus{0, false};
 }
-Admission MlxEngine::admit(EngineRequest request) {
+Admission MlxEngine::admit(EngineRequest&& request) {
     if (!model_) throw std::runtime_error("Metal engine is unloaded");
     return requests_.admit(std::move(request), text_.get(), info_, *this);
 }

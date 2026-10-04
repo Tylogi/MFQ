@@ -2,10 +2,55 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <limits>
 
 using namespace mfq::engine;
 
 namespace {
+// Charge retained capacities, including preallocated media, before entering the mailbox.
+std::size_t input_bytes(const EngineRequest& request) {
+    std::size_t bytes = sizeof(request);
+    const auto add = [&](std::size_t value) {
+        if (value > std::numeric_limits<std::size_t>::max() - bytes)
+            throw MfqSchedulerOverloaded("request input size overflows the queue budget");
+        bytes += value;
+    };
+    const auto strings = [&](const auto&... values) { (add(values.capacity()), ...); };
+    const auto vectors = [&](const auto&... values) { (add(values.capacity() * sizeof(typename std::decay_t<decltype(values)>::value_type)), ...); };
+    const auto fields = [&](const auto& map) {
+        for (const auto& [key, value] : map) { add(sizeof(key) + sizeof(value) + 4 * sizeof(void*)); strings(key, value); }
+    };
+    const auto& input = request.input;
+    strings(request.id, input.prompt, input.cache_plan.session_id);
+    vectors(request.token_ids, input.stops);
+    for (const auto& stop : input.stops) strings(stop);
+    if (input.chat_input) {
+        const auto& chat = *input.chat_input;
+        const auto& value = chat.template_inputs;
+        if (chat.preformatted_prompt) strings(*chat.preformatted_prompt);
+        strings(value.grammar, value.json_schema);
+        vectors(value.messages, value.tools);
+        fields(value.chat_template_kwargs);
+        for (const auto& message : value.messages) {
+            strings(message.role, message.content, message.reasoning_content, message.tool_name, message.tool_call_id);
+            vectors(message.content_parts, message.tool_calls);
+            fields(message.extra_fields);
+            for (const auto& part : message.content_parts) strings(part.type, part.text);
+            for (const auto& call : message.tool_calls) strings(call.name, call.arguments, call.id);
+        }
+        for (const auto& tool : value.tools) strings(tool.name, tool.description, tool.parameters);
+    }
+    if (input.media) {
+        const auto& m = *input.media;
+        strings(m.processor_name);
+        vectors(m.pixel_values, m.pixel_shape, m.patch_mask, m.patch_mask_shape,
+                m.target_sizes, m.target_sizes_shape, m.vision_grid, m.vision_grid_shape,
+                m.vision_types, m.image_grid, m.image_grid_shape, m.video_grid, m.video_grid_shape,
+                m.image_bounds, m.image_permutation, m.image_permutation_offsets,
+                m.audio_features, m.audio_features_shape, m.audio_lengths, m.audio_bounds);
+    }
+    return bytes;
+}
 constexpr std::size_t terminal_reserve = sizeof(EngineEvent) + 128 + 64 + 512;
 std::size_t event_bytes(const EventData& data) {
     return std::visit([](const auto& value) -> std::size_t {
@@ -49,8 +94,8 @@ bool MfqScheduledRequest::done() const {
 MfqScheduler::MfqScheduler(Engine& engine) : MfqScheduler(engine, Limits{}) {}
 MfqScheduler::MfqScheduler(Engine& engine, Limits limits)
     : engine_(engine), limits_(limits), info_(engine.info()) {
-    if (limits.events < 4 || limits.bytes < 4096)
-        throw std::invalid_argument("outbox requires at least 4 events and 4096 bytes");
+    if (limits.events < 4 || limits.bytes < 4096 || !limits.requests || !limits.input_bytes)
+        throw std::invalid_argument("scheduler requires positive input limits and at least 4 outbox events and 4096 bytes");
     worker_ = std::thread([this] { loop(); });
 }
 MfqScheduler::~MfqScheduler() { shutdown(); }
@@ -62,7 +107,13 @@ void MfqScheduler::shutdown() {
 void MfqScheduler::enqueue(Command command) const {
     std::lock_guard lock(mutex_);
     if (stopping_) throw std::runtime_error("scheduler is stopping");
+    const auto* submit = std::get_if<Submit>(&command);
+    const auto bytes = submit ? submit->request.reserved_bytes : 0;
+    if (submit && (reserved_requests_ >= limits_.requests || bytes > limits_.input_bytes - reserved_bytes_))
+        throw MfqSchedulerOverloaded("scheduler input queue budget is exhausted");
+    const bool submitting = submit != nullptr;
     mailbox_.push_back(std::move(command));
+    if (submitting) { ++reserved_requests_; reserved_bytes_ += bytes; }
     wake_->notify_one();
 }
 EngineInfo MfqScheduler::info() const {
@@ -78,7 +129,9 @@ std::shared_ptr<MfqScheduledRequest> MfqScheduler::submit(EngineRequest input) c
         throw std::invalid_argument("request ID must contain 1-128 bytes");
     auto outbox = std::make_shared<MfqScheduledRequest>();
     outbox->wake_ = wake_;
+    const auto bytes = input_bytes(input);
     Submit command{{std::move(input), outbox}, {}};
+    command.request.reserved_bytes = bytes;
     auto result = command.reply.get_future();
     enqueue(std::move(command));
     result.get();
@@ -179,10 +232,17 @@ void MfqScheduler::cancel(Request& request) {
     if (request.cancelling) return;
     request.cancelling = true;
     request.pending.clear();
-    if (request.admitted) engine_.cancel(request.input.id);
+    if (request.admitted) engine_.cancel(request.id);
     else {
-        publish(request, {request.input.id, Cancelled{}});
+        publish(request, {request.id, Cancelled{}});
     }
+}
+
+void MfqScheduler::release_input_budget(const Request& request) {
+    // ponytail: reserve through terminal; release earlier when Engine exposes input retirement.
+    std::lock_guard lock(mutex_);
+    --reserved_requests_;
+    reserved_bytes_ -= request.reserved_bytes;
 }
 
 void MfqScheduler::loop() noexcept {
@@ -198,20 +258,20 @@ void MfqScheduler::loop() noexcept {
             try {
                 if constexpr (std::is_same_v<T, Submit>) {
                     auto& request = value.request;
-                    const auto id = request.input.id;
+                    const auto id = request.id;
                     if (stopping || !healthy || reload || duplex_active)
                         throw std::runtime_error("scheduler is not accepting requests");
                     if (requests_.contains(id)) throw std::invalid_argument("request ID is already active");
-                    const auto& session = request.input.input.cache_plan.session_id;
+                    const auto& session = request.session;
                     if (!session.empty()) for (const auto& [other_id, other] : requests_)
-                        if (other.input.input.cache_plan.session_id == session)
+                        if (other.session == session)
                             throw std::invalid_argument("session already has an active request");
                     order_.push_back(id); requests_.emplace(id, std::move(request));
                     value.reply.set_value();
                 } else if constexpr (std::is_same_v<T, Cancel>) {
                     bool found = false;
                     for (auto& [id, request] : requests_) {
-                        if (value.all || (value.session ? request.input.input.cache_plan.session_id == value.id : id == value.id)) {
+                        if (value.all || (value.session ? request.session == value.id : id == value.id)) {
                             cancel(request); found = true;
                         }
                     }
@@ -232,7 +292,7 @@ void MfqScheduler::loop() noexcept {
                     if (value.request.kind != SessionCommand::Kind::metrics) {
                         if (duplex_active || reload) throw std::runtime_error("session operation conflicts with runtime control");
                         for (const auto& [id, request] : requests_) {
-                            const auto& session = request.input.input.cache_plan.session_id;
+                            const auto& session = request.session;
                             if (value.request.kind == SessionCommand::Kind::clear ||
                                 value.request.kind == SessionCommand::Kind::trim ||
                                 session == value.request.source || session == value.request.target)
@@ -254,7 +314,10 @@ void MfqScheduler::loop() noexcept {
                     for (auto& [id, request] : requests_) cancel(request);
                     reload.emplace(std::move(value));
                 }
-            } catch (...) { value.reply.set_exception(std::current_exception()); }
+            } catch (...) {
+                if constexpr (std::is_same_v<T, Submit>) release_input_budget(value.request);
+                value.reply.set_exception(std::current_exception());
+            }
         }, command);
         bool executable = false;
         auto wake_at = Clock::time_point::max();
@@ -262,19 +325,20 @@ void MfqScheduler::loop() noexcept {
             std::vector<RequestId> eligible;
             std::vector<RequestId> ordered(order_.begin(), order_.end());
             std::stable_sort(ordered.begin(), ordered.end(), [&](const auto& a, const auto& b) {
-                return requests_.at(a).input.priority > requests_.at(b).input.priority;
+                return requests_.at(a).priority > requests_.at(b).priority;
             });
             bool admission_blocked = false;
             for (const auto& id : ordered) {
                 auto& request = requests_.at(id);
                 flush(request);
-                if (stopping || (request.input.deadline && *request.input.deadline <= Clock::now())) cancel(request);
+                if (stopping || (request.deadline && *request.deadline <= Clock::now())) cancel(request);
                 if (request.finished) continue;
-                if (request.input.deadline && !request.cancelling) wake_at = std::min(wake_at, *request.input.deadline);
+                if (request.deadline && !request.cancelling) wake_at = std::min(wake_at, *request.deadline);
                 if (request.cancelling) { executable |= request.admitted; continue; }
                 if (!request.admitted && !reload && !admission_blocked && engine_.status().available > 0) {
                     try {
-                        request.admitted = engine_.admit(request.input) == Admission::accepted;
+                        request.admitted = engine_.admit(std::move(request.input)) == Admission::accepted;
+                        if (request.admitted) request.input = {};
                         admission_blocked = !request.admitted;
                     }
                     catch (const InferenceInputError& error) {
@@ -326,7 +390,10 @@ void MfqScheduler::loop() noexcept {
         for (auto it = order_.begin(); it != order_.end();) {
             auto box = requests_.at(*it).outbox;
             std::lock_guard lock(box->mutex_);
-            if (box->terminal_) { requests_.erase(*it); it = order_.erase(it); }
+            if (box->terminal_) {
+                release_input_budget(requests_.at(*it));
+                requests_.erase(*it); it = order_.erase(it);
+            }
             else ++it;
         }
         if (reload && requests_.empty()) {
