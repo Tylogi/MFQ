@@ -26,6 +26,12 @@ InferenceOutput::InferenceOutput(const InferenceRequest& request,
         const MfqTokenizer* tokenizer, std::string request_id)
     : request_(request), tokenizer_(tokenizer), id_(std::move(request_id)),
       emitter_(request.stops) {
+    prepare(tokenizer);
+}
+
+void InferenceOutput::prepare(const MfqTokenizer* tokenizer) {
+    tokenizer_ = tokenizer;
+    emitter_ = TextEmitter(request_.stops);
     if (tokenizer_ && request_.chat && request_.chat_parser.is_continuation &&
             !request_.chat_parser.echo)
         message_ = common_chat_parse("", true, request_.chat_parser);

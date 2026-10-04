@@ -69,6 +69,7 @@ class InferenceOutput {
 public:
     InferenceOutput(const InferenceRequest& request,
                     const MfqTokenizer* tokenizer, std::string request_id);
+    void prepare(const MfqTokenizer* tokenizer);
     TokenOutput append(const std::vector<std::int64_t>& tokens);
     TokenOutput finish();
     bool stopped() const noexcept;

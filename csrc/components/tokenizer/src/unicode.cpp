@@ -1,3 +1,4 @@
+#include "text_cancel.h"
 #include "unicode.h"
 #include "unicode-data.h"
 
@@ -1132,6 +1133,7 @@ std::vector<uint32_t> unicode_cpts_from_utf8(const std::string & utf8) {
     result.reserve(utf8.size());
     size_t offset = 0;
     while (offset < utf8.size()) {
+        mfq::text::check_cancelled();
         try {
             result.push_back(unicode_cpt_from_utf8(utf8, offset));
         }
@@ -1247,6 +1249,7 @@ std::vector<std::string> unicode_regex_split(const std::string & text, const std
     // compute collapsed codepoints only if needed by at least one regex
     bool need_collapse = false;
     for (const auto & regex_expr : regex_exprs) {
+        mfq::text::check_cancelled();
         // search for unicode categories
         for (const auto & ucat : k_ucat_enum) {
             if (std::string::npos != regex_expr.find(ucat.first)) {
@@ -1289,6 +1292,7 @@ std::vector<std::string> unicode_regex_split(const std::string & text, const std
     std::vector<size_t> bpe_offsets = { cpts.size() };
 
     for (const auto & regex_expr : regex_exprs) {
+        mfq::text::check_cancelled();
         // first, see if we have an efficient custom regex implementation
         auto tmp = unicode_regex_split_custom(text, regex_expr, bpe_offsets);
 
@@ -1393,6 +1397,7 @@ std::vector<std::string> unicode_regex_split(const std::string & text, const std
 
     size_t start = 0;
     for (size_t & offset : bpe_offsets) {
+        mfq::text::check_cancelled();
         bpe_words.emplace_back();
         for (size_t i = start; i < start + offset; ++i) {
             bpe_words.back() += unicode_cpt_to_utf8(cpts[i]);

@@ -1,3 +1,4 @@
+#include "text_cancel.h"
 #include "text_processor.h"
 #include "mfq/model_source.h"
 
@@ -445,7 +446,9 @@ InferenceRequest TextProcessor::prepare(
         parse_special = true;
     }
 
+    mfq::text::check_cancelled();
     work.prompt = impl_->tokenizer->tokenize(prompt, parse_special);
+    mfq::text::check_cancelled();
     if (work.prompt.empty()) {
         throw InferenceInputError(
             InferenceInputErrorCode::Invalid,
@@ -467,6 +470,7 @@ InferenceRequest TextProcessor::prepare(
         }
     }
 
+    mfq::text::check_cancelled();
     if (input.media) {
         prepare_media(
             *impl_->tokenizer, impl_->tokenizer->vocab_size(),

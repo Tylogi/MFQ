@@ -30,7 +30,7 @@ struct EngineRequest {
     std::optional<Clock::time_point> deadline;
     int priority = 0;
     // Diagnostics only. Production submits owned text/media and is tokenized
-    // on admission, never against a tokenizer from before a queued reload.
+    // after admission, using the tokenizer retained by that Engine request.
     std::vector<std::int64_t> token_ids;
 };
 

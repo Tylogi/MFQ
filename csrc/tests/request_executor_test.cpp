@@ -1,6 +1,8 @@
 #include "request_executor.h"
 #include "generation_flow.h"
 #include "runtime_config.h"
+#include "gguf.h"
+#include <cstdio>
 
 #include <cassert>
 #include <cstdlib>
@@ -318,7 +320,59 @@ static void check_runtime_config() {
     rejects([] { environment_enabled("MFQ_RUNTIME_TRACE_SESSION_CACHE"); });
 }
 
+static void check_async_text_preparation() {
+    std::vector<std::string> values{"<unk>", "<s>", "</s>"};
+    std::vector<int32_t> types{2, 3, 3};
+    for (int value = 0; value < 256; ++value) {
+        char token[7]; std::snprintf(token, sizeof(token), "<0x%02X>", value);
+        values.emplace_back(token); types.push_back(6);
+    }
+    std::vector<const char*> tokens;
+    for (const auto& value : values) tokens.push_back(value.c_str());
+    std::vector<float> scores(tokens.size());
+    auto* metadata = gguf_init_empty();
+    gguf_set_val_str(metadata, "tokenizer.ggml.model", "llama");
+    gguf_set_arr_str(metadata, "tokenizer.ggml.tokens", tokens.data(), tokens.size());
+    gguf_set_arr_data(metadata, "tokenizer.ggml.scores", GGUF_TYPE_FLOAT32, scores.data(), scores.size());
+    gguf_set_arr_data(metadata, "tokenizer.ggml.token_type", GGUF_TYPE_INT32, types.data(), types.size());
+    gguf_set_val_bool(metadata, "tokenizer.ggml.add_space_prefix", false);
+    std::vector<uint8_t> bytes(gguf_get_meta_size(metadata));
+    gguf_get_meta_data(metadata, bytes.data()); gguf_free(metadata);
+    auto text = std::make_shared<TextProcessor>(bytes, tokens.size(), "test");
+    auto metadata_info = info(); metadata_info.vocab_size = tokens.size();
+    TestOps ops; ops.batch = true;
+    RequestExecutor executor(2);
+    EngineRequest input; input.id = "text"; input.input.chat = false;
+    input.input.prompt.assign(2 * 1024 * 1024, 'a'); input.input.sampling.max_tokens = 2;
+    assert(executor.admit(std::move(input), text, metadata_info, ops) == Admission::accepted);
+    const auto submitted = executor.step({"text"}, ops);
+    assert(submitted.events.empty() && submitted.wake_at.has_value());
+    executor.admit(request("raw"), nullptr, metadata_info, ops);
+    assert(!executor.step({"raw"}, ops).advanced.empty());
+    executor.cancel("text");
+    auto cancelled = executor.step({}, ops);
+    assert(std::holds_alternative<Cancelled>(terminal_event(cancelled)));
+    assert(cancelled.events.back().id == "text");
+    executor.cancel("raw"); executor.step({}, ops);
+    executor.reset(2); // Reload may reset capacity while the old CPU task still owns its tokenizer.
+    EngineRequest next; next.id = "next"; next.input.chat = false;
+    next.input.prompt = "hello"; next.input.sampling.max_tokens = 2;
+    executor.admit(std::move(next), text, metadata_info, ops);
+    auto deadline = Clock::now() + std::chrono::seconds(3);
+    bool complete = false;
+    while (!executor.empty() && Clock::now() < deadline) {
+        auto result = executor.step({"next"}, ops);
+        for (const auto& event : result.events) {
+            assert(!std::holds_alternative<Failed>(event.data));
+            complete |= std::holds_alternative<Completed>(event.data);
+        }
+        if (result.wake_at) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    assert(complete && executor.empty());
+}
+
 int main() {
+    check_async_text_preparation();
     check_waiting_and_cleanup();
     check_preparation_steps();
     check_engine_lifecycle();

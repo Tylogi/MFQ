@@ -1,4 +1,5 @@
 #include "mfq_vocab.h"
+#include "text_cancel.h"
 
 #include "ggml.h"
 #include "gguf.h"
@@ -119,6 +120,7 @@ struct mfq_text_tokenizer_spm_session {
         int index = 0;
         size_t offs = 0;
         while (offs < text.size()) {
+            mfq::text::check_cancelled();
             mfq_text_symbol sym;
             size_t len = unicode_len_utf8(text[offs]);
             sym.text = text.c_str() + offs;
@@ -132,11 +134,13 @@ struct mfq_text_tokenizer_spm_session {
 
         // seed the work queue with all possible 2-character tokens.
         for (int i = 1; i < (int) symbols.size(); ++i) {
+            mfq::text::check_cancelled();
             try_add_bigram(i - 1, i);
         }
 
         // keep substituting the highest frequency pairs for as long as we can.
         while (!work_queue.empty()) {
+            mfq::text::check_cancelled();
             auto bigram = work_queue.top();
             work_queue.pop();
 
@@ -167,6 +171,7 @@ struct mfq_text_tokenizer_spm_session {
         }
 
         for (int i = 0; i != -1; i = symbols[i].next) {
+            mfq::text::check_cancelled();
             auto & symbol = symbols[i];
             resegment(symbol, output);
         }
@@ -187,7 +192,6 @@ private:
 
         if (p == rev_merge.end()) {
             // output any symbols that did not form tokens as bytes.
-            output.reserve(output.size() + symbol.n);
             for (int j = 0; j < (int)symbol.n; ++j) {
                 mfq_text_token id = vocab.byte_to_token(symbol.text[j]);
                 output.push_back(id);
@@ -602,6 +606,7 @@ struct mfq_text_tokenizer_bpe_session {
         auto tok_pre = vocab.get_pre_type();
 
         for (const auto & word : word_collection) {
+            mfq::text::check_cancelled();
             work_queue = mfq_text_bigram_bpe::queue();
             symbols.clear();
 
@@ -622,6 +627,7 @@ struct mfq_text_tokenizer_bpe_session {
             }
 
             while (offset < word.size()) {
+                mfq::text::check_cancelled();
                 mfq_text_symbol sym;
                 size_t char_len = std::min(word.size() - offset, (size_t) unicode_len_utf8(word[offset]));
                 sym.text = word.c_str() + offset;
@@ -633,11 +639,13 @@ struct mfq_text_tokenizer_bpe_session {
                 symbols.emplace_back(sym);
             }
             for (int i = 1; i < (int) symbols.size(); ++i) {
+                mfq::text::check_cancelled();
                 add_new_bigram(i - 1, i);
             }
 
             // build token(s)
             while (!work_queue.empty()) {
+                mfq::text::check_cancelled();
                 auto bigram = work_queue.pop_move();
 
                 auto & left_symbol = symbols[bigram.left];
@@ -668,6 +676,7 @@ struct mfq_text_tokenizer_bpe_session {
 
             // add the finished tokens to the final list keeping correct order for next and prev
             for (auto & sym : symbols) {
+                mfq::text::check_cancelled();
                 if (sym.n > 0) {
                     sym.prev = final_prev_index;
                     sym.next = -1;
@@ -684,6 +693,7 @@ struct mfq_text_tokenizer_bpe_session {
 
         if (!symbols.empty()) {
             for (int i = 0; i != -1; i = symbols[i].next) {
+                mfq::text::check_cancelled();
                 auto & symbol = symbols[i];
                 if (symbol.n == 0) {
                     continue;
@@ -3116,6 +3126,7 @@ void mfq_text_vocab::impl::init_tokenizer(enum mfq_text_vocab_type type) {
 void mfq_text_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buffer_variant> & buffer, bool parse_special) const {
     // for each special token
     for (const mfq_text_token special_id : cache_special_tokens) {
+        mfq::text::check_cancelled();
         const auto & data = vocab.get_token_data(special_id);
         const auto & text = data.text;
 
@@ -3130,6 +3141,7 @@ void mfq_text_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buf
         // for each text fragment
         std::forward_list<fragment_buffer_variant>::iterator it = buffer.begin();
         while (it != buffer.end()) {
+            mfq::text::check_cancelled();
             auto & fragment = (*it);
 
             // if a fragment is text ( not yet processed )
@@ -3307,6 +3319,7 @@ std::vector<mfq_text_token> mfq_text_vocab::impl::tokenize(
                 }
 
                 for (const auto & fragment : fragment_buffer) {
+                    mfq::text::check_cancelled();
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
                         std::string text;
 
@@ -3361,6 +3374,7 @@ std::vector<mfq_text_token> mfq_text_vocab::impl::tokenize(
                     session->append_bos(output);
                 }
                 for (const auto & fragment : fragment_buffer) {
+                    mfq::text::check_cancelled();
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
                         std::string text = fragment.raw_text.substr(fragment.offset, fragment.length);
 
@@ -3392,6 +3406,7 @@ std::vector<mfq_text_token> mfq_text_vocab::impl::tokenize(
                 mfq_text_tokenizer_wpm_session session(vocab);
 
                 for (const auto & fragment : fragment_buffer) {
+                    mfq::text::check_cancelled();
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
                         std::string text = fragment.raw_text.substr(fragment.offset, fragment.length);
 
@@ -3418,6 +3433,7 @@ std::vector<mfq_text_token> mfq_text_vocab::impl::tokenize(
                 mfq_text_tokenizer_ugm_session session(vocab, *static_cast<const mfq_text_tokenizer_ugm *>(tokenizer.get()));
 
                 for (const auto & fragment : fragment_buffer) {
+                    mfq::text::check_cancelled();
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
                         std::string text = fragment.raw_text.substr(fragment.offset, fragment.length);
 #ifdef PRETOKENIZERDEBUG
@@ -3445,6 +3461,7 @@ std::vector<mfq_text_token> mfq_text_vocab::impl::tokenize(
             {
                 mfq_text_tokenizer_rwkv_session session(vocab, *static_cast<const mfq_text_tokenizer_rwkv *>(tokenizer.get()));
                 for (const auto & fragment : fragment_buffer) {
+                    mfq::text::check_cancelled();
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
                         std::string text = fragment.raw_text.substr(fragment.offset, fragment.length);
 
@@ -3462,6 +3479,7 @@ std::vector<mfq_text_token> mfq_text_vocab::impl::tokenize(
             {
                 mfq_text_tokenizer_plamo2_session session(*static_cast<const mfq_text_tokenizer_plamo2 *>(tokenizer.get()));
                 for (const auto & fragment : fragment_buffer) {
+                    mfq::text::check_cancelled();
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
                         std::string text = fragment.raw_text.substr(fragment.offset, fragment.length);
 

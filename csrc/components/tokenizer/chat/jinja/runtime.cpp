@@ -1,5 +1,6 @@
 #include "lexer.h"
 #include "runtime.h"
+#include "text_cancel.h"
 #include "value.h"
 #include "utils.h"
 
@@ -52,6 +53,7 @@ static void ensure_key_type_allowed(const value & val) {
 
 // execute with error handling
 value statement::execute(context & ctx) {
+    mfq::text::check_cancelled();
     try {
         return execute_impl(ctx);
     } catch (const continue_statement::signal & /* ex */) {

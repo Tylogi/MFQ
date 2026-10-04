@@ -16,7 +16,7 @@ EngineStatus MlxEngine::status() const {
 }
 Admission MlxEngine::admit(EngineRequest&& request) {
     if (!model_) throw std::runtime_error("Metal engine is unloaded");
-    return requests_.admit(std::move(request), text_.get(), info_, *this);
+    return requests_.admit(std::move(request), text_, info_, *this);
 }
 void MlxEngine::cancel(const RequestId& id) { requests_.cancel(id); }
 EngineStepResult MlxEngine::step(const std::vector<RequestId>& eligible) {

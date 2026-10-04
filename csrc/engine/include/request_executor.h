@@ -1,8 +1,12 @@
 #pragma once
 
 #include "generation_step.h"
+#include "text_cancel.h"
 
 #include <memory>
+#include <atomic>
+#include <future>
+#include <thread>
 #include <unordered_map>
 
 namespace mfq::engine {
@@ -29,6 +33,11 @@ struct ExecutionRequest {
     InferenceRequest input;
     InferenceOutput output;
     Generation generation;
+    std::optional<InferenceInput> unprepared;
+    std::shared_ptr<const TextProcessor> text;
+    std::future<InferenceRequest> preparation;
+    std::shared_ptr<std::atomic<bool>> stop = std::make_shared<std::atomic<bool>>(false);
+    EngineInfo limits;
     std::exception_ptr failure;
     bool started = false, batched = false, done = false;
 
@@ -36,6 +45,7 @@ struct ExecutionRequest {
         : input(std::move(prepared)), output(input, tokenizer, id) {}
 
     void complete(std::exception_ptr error = {}) {
+        stop->store(true, std::memory_order_relaxed);
         done = true;
         failure = error;
     }
@@ -44,7 +54,13 @@ struct ExecutionRequest {
 class RequestExecutor {
   public:
     explicit RequestExecutor(std::size_t capacity = 1) : capacity_(capacity) {}
+    ~RequestExecutor() { clear(); }
     bool empty() const { return requests_.empty(); }
+    void reset(std::size_t capacity) {
+        if (!empty()) throw std::logic_error("executor reset requires no requests");
+        capacity_ = capacity;
+        healthy_ = true;
+    }
     EngineStatus status(bool exclusive = false) const {
         if (!healthy_)
             return {0, false};
@@ -58,7 +74,7 @@ class RequestExecutor {
 
     template <class Ops>
     Admission admit(
-        EngineRequest&& request, const TextProcessor *text, const EngineInfo &info, Ops &ops) {
+        EngineRequest&& request, std::shared_ptr<const TextProcessor> text, const EngineInfo &info, Ops &ops) {
         if (requests_.contains(request.id))
             throw std::invalid_argument("duplicate request ID");
         const bool batched = ops.can_batch(request);
@@ -74,32 +90,34 @@ class RequestExecutor {
         } else {
             if (!text)
                 throw std::invalid_argument("text input requires a tokenizer");
-            input = text->prepare(std::move(request.input), info.max_context);
-            tokenizer = &text->tokenizer();
+            // Preparation starts from step(), after ownership and admission are settled.
+            input.sampling = request.input.sampling;
         }
-        const auto plan = plan_generation(input.prompt,
-            info.vocab_size,
-            info.max_context,
-            input.sampling.max_tokens,
-            input.cache_plan.stable_prefix_tokens);
-        input.sampling.max_tokens = plan.generation_tokens;
-        input.cache_plan.stable_prefix_tokens = plan.stable_prefix_tokens;
+        if (raw) prepare_plan(input, info);
         auto current = std::make_unique<ExecutionRequest>(
             std::move(input), tokenizer, request.id);
         current->output.metrics.mtp.available = ops.mtp_available();
         current->batched = batched;
+        if (!raw) {
+            current->unprepared = std::move(request.input);
+            current->text = std::move(text);
+            current->limits = info;
+        }
         requests_.emplace(request.id, std::move(current));
         return Admission::accepted;
     }
 
     void cancel(const RequestId &id) {
-        if (auto it = requests_.find(id); it != requests_.end())
+        if (auto it = requests_.find(id); it != requests_.end()) {
+            it->second->stop->store(true, std::memory_order_relaxed);
             it->second->output.result.cancelled = true;
+        }
     }
 
     std::exception_ptr clear() {
         std::exception_ptr failure;
         for (auto& [id, request] : requests_) {
+            request->stop->store(true, std::memory_order_relaxed);
             request->generation = {};
             if (request->output.cleanup_failure) failure = request->output.cleanup_failure;
         }
@@ -121,11 +139,21 @@ class RequestExecutor {
             if (!current.done && (current.output.result.cancelled ||
                 std::find(eligible.begin(), eligible.end(), it->first) != eligible.end())) {
                 try {
-                    if (!current.started) {
+                    if (current.unprepared || current.preparation.valid()) {
+                        if (current.output.result.cancelled) {
+                            current.unprepared.reset();
+                            current.complete();
+                        } else if (!advance_preparation(current)) {
+                            result.wake_at = Clock::now() + std::chrono::milliseconds(1);
+                            ++it;
+                            continue;
+                        }
+                    }
+                    if (!current.done && !current.started) {
                         current.started = true;
                         current.generation = ops.generate(it->first, current);
                     }
-                    auto step = current.generation.next();
+                    auto step = current.done ? mfq::StepResult<EventData>{} : current.generation.next();
                     if (step.state == StepState::advanced)
                         result.advanced.push_back(it->first);
                     if (step.value) {
@@ -157,6 +185,44 @@ class RequestExecutor {
 
   private:
     void finish(const RequestId &id, ExecutionRequest &request, EngineStepResult &result);
+    static void prepare_plan(InferenceRequest& input, const EngineInfo& info) {
+        const auto plan = plan_generation(input.prompt, info.vocab_size, info.max_context,
+            input.sampling.max_tokens, input.cache_plan.stable_prefix_tokens);
+        input.sampling.max_tokens = plan.generation_tokens;
+        input.cache_plan.stable_prefix_tokens = plan.stable_prefix_tokens;
+    }
+    bool advance_preparation(ExecutionRequest& request) {
+        if (request.unprepared) {
+            if (preparing_->load()) return false;
+            std::promise<InferenceRequest> result;
+            request.preparation = result.get_future();
+            preparing_->store(true);
+            try {
+                // Only one CPU preparation runs per executor, including across reload.
+                // It owns the old tokenizer and input; cancellation never joins it on the scheduler thread.
+                std::thread([busy = preparing_, stop = request.stop, text = request.text, context = request.limits.max_context,
+                             input = std::move(*request.unprepared), result = std::move(result)]() mutable {
+                    mfq::text::CancellationScope cancellation(*stop);
+                    try {
+                        mfq::text::check_cancelled();
+                        result.set_value(text->prepare(std::move(input), context));
+                    }
+                    catch (...) { result.set_exception(std::current_exception()); }
+                    busy->store(false);
+                }).detach();
+            } catch (...) {
+                preparing_->store(false);
+                throw;
+            }
+            request.unprepared.reset();
+        }
+        if (request.preparation.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return false;
+        request.input = request.preparation.get();
+        prepare_plan(request.input, request.limits);
+        request.output.prepare(&request.text->tokenizer());
+        return true;
+    }
+    std::shared_ptr<std::atomic<bool>> preparing_ = std::make_shared<std::atomic<bool>>(false);
     std::size_t capacity_;
     bool healthy_ = true;
     std::unordered_map<RequestId, std::unique_ptr<ExecutionRequest>> requests_;
@@ -177,7 +243,7 @@ template <class Backend> class EngineInstance final : public Engine {
     }
     Admission admit(EngineRequest&& request) override {
         return backend.visit([&](auto& ops) {
-            return requests_.admit(std::move(request), text_.get(), info_, ops);
+            return requests_.admit(std::move(request), text_, info_, ops);
         });
     }
     void cancel(const RequestId& id) override { requests_.cancel(id); }
@@ -224,7 +290,7 @@ template <class Backend> class EngineInstance final : public Engine {
     }
 
   private:
-    std::unique_ptr<TextProcessor> text_;
+    std::shared_ptr<TextProcessor> text_;
     EngineInfo info_;
     RequestExecutor requests_;
     bool loaded_ = false;
@@ -235,7 +301,7 @@ template <class Backend> class EngineInstance final : public Engine {
             info_ = std::move(info);
             text_ = std::move(text);
             if (text_) info_.chat = text_->chat_template_capabilities();
-            requests_ = RequestExecutor(info_.max_requests);
+            requests_.reset(info_.max_requests);
             loaded_ = true;
         } catch (...) {
             shutdown();

@@ -42,7 +42,7 @@ public:
 
 private:
     std::unique_ptr<MlxEngineModel> model_;
-    std::unique_ptr<mfq::engine::TextProcessor> text_;
+    std::shared_ptr<mfq::engine::TextProcessor> text_;
     mfq::engine::EngineInfo info_;
     mfq::engine::RequestExecutor requests_;
     bool duplex_active_ = false;
