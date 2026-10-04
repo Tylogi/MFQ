@@ -190,14 +190,16 @@ void benchmark_gdn_gates() {
     }
 }
 
-void test_gdn_decode_step() {
+void test_gdn_decode_step(
+    int key_heads,
+    int value_heads,
+    mlx::core::Dtype projection_dtype,
+    mlx::core::Dtype gate_dtype) {
     using namespace mlx::core;
-    constexpr int key_heads = 1;
-    constexpr int value_heads = 2;
     constexpr int dimension = 128;
-    constexpr int qk_width = 2 * key_heads * dimension;
-    constexpr int value_width = value_heads * dimension;
-    constexpr int channels = qk_width + value_width;
+    const int qk_width = 2 * key_heads * dimension;
+    const int value_width = value_heads * dimension;
+    const int channels = qk_width + value_width;
 
     std::vector<float> qk_data(qk_width);
     std::vector<float> value_data(value_width);
@@ -233,15 +235,15 @@ void test_gdn_decode_step() {
     for (auto& value : decay_data) value -= 0.4f;
 
     const auto qk = astype(
-        array(qk_data.begin(), Shape{1, 1, qk_width}), float16);
+        array(qk_data.begin(), Shape{1, 1, qk_width}), projection_dtype);
     const auto value = astype(
-        array(value_data.begin(), Shape{1, 1, value_width}), float16);
+        array(value_data.begin(), Shape{1, 1, value_width}), projection_dtype);
     const auto output_gate = astype(
-        array(output_gate_data.begin(), Shape{1, 1, value_width}), float16);
+        array(output_gate_data.begin(), Shape{1, 1, value_width}), projection_dtype);
     const auto alpha = astype(
-        array(alpha_data.begin(), Shape{1, 1, value_heads}), float16);
+        array(alpha_data.begin(), Shape{1, 1, value_heads}), gate_dtype);
     const auto beta = astype(
-        array(beta_data.begin(), Shape{1, 1, value_heads}), float16);
+        array(beta_data.begin(), Shape{1, 1, value_heads}), gate_dtype);
     const array convolution_state(
         convolution_state_data.begin(), Shape{1, 3, channels});
     const array recurrent_state(
@@ -253,91 +255,97 @@ void test_gdn_decode_step() {
     const array decay(decay_data.begin(), Shape{value_heads});
     const array norm(norm_data.begin(), Shape{dimension});
 
-    const auto convolved = mfq::metal::linear_conv_qkv(
-        convolution_state,
-        qk,
-        value,
-        convolution_weight,
-        key_heads,
-        value_heads,
-        dimension,
-        dimension,
-        std::nullopt,
-        1e-6f);
     const auto gates = mfq::metal::gated_delta_gates(
         alpha, beta, bias, decay);
-    const auto recurrent = mfq::metal::gated_delta_net(
-        convolved.query,
-        convolved.key,
-        convolved.value,
-        gates.gate,
-        gates.beta,
-        recurrent_state,
-        true);
 
     for (const bool silu_gate : {false, true}) {
-        auto normalized = fast::rms_norm(
-            recurrent.output,
-            std::optional<array>(norm),
-            1e-6f);
-        auto gate = astype(
-            transpose(
-                reshape(
-                    output_gate,
-                    Shape{1, 1, value_heads, dimension}),
-                {0, 2, 1, 3}),
-            float32);
-        gate = silu_gate ? gate * sigmoid(gate) : sigmoid(gate);
-        auto reference_output = reshape(
-            transpose(normalized * gate, {0, 2, 1, 3}),
-            Shape{1, 1, value_width});
-        auto actual = mfq::metal::gated_delta_decode_step(
-            qk,
-            value,
-            output_gate,
-            alpha,
-            beta,
-            convolution_state,
-            recurrent_state,
-            convolution_weight,
-            bias,
-            decay,
-            norm,
-            key_heads,
-            value_heads,
-            dimension,
-            1e-6f,
-            1e-6f,
-            silu_gate);
-        eval(
-            reference_output,
-            convolved.state,
-            recurrent.state,
-            actual.output,
-            actual.convolution_state,
-            actual.recurrent_state);
-        require_vector_close(
-            actual.output.data<float>(),
-            std::vector<float>(
-                reference_output.data<float>(),
-                reference_output.data<float>() + reference_output.size()),
-            5e-5f,
-            silu_gate ? "GDN fused SiLU output" : "GDN fused sigmoid output");
-        require_vector_close(
-            actual.convolution_state.data<float>(),
-            std::vector<float>(
-                convolved.state.data<float>(),
-                convolved.state.data<float>() + convolved.state.size()),
-            0.0f,
-            "GDN fused convolution state");
-        require_vector_close(
-            actual.recurrent_state.data<float>(),
-            std::vector<float>(
-                recurrent.state.data<float>(),
-                recurrent.state.data<float>() + recurrent.state.size()),
-            5e-6f,
-            "GDN fused recurrent state");
+        auto reference_conv_state = convolution_state;
+        auto reference_recurrent_state = recurrent_state;
+        auto actual_conv_state = convolution_state;
+        auto actual_recurrent_state = recurrent_state;
+        for (int step = 0; step < 8; ++step) {
+            const float convolution_eps = step % 2 ? 1e-5f : 1e-6f;
+            const float norm_eps = step % 3 ? 1e-4f : 1e-6f;
+            const auto convolved = mfq::metal::linear_conv_qkv(
+                reference_conv_state, qk, value, convolution_weight,
+                key_heads, value_heads, dimension, dimension,
+                std::nullopt, convolution_eps);
+            const auto recurrent = mfq::metal::gated_delta_net(
+                convolved.query, convolved.key, convolved.value,
+                gates.gate, gates.beta, reference_recurrent_state, true);
+            auto normalized = fast::rms_norm(
+                recurrent.output,
+                std::optional<array>(norm),
+                norm_eps);
+            auto gate = astype(
+                transpose(
+                    reshape(
+                        output_gate,
+                        Shape{1, 1, value_heads, dimension}),
+                    {0, 2, 1, 3}),
+                float32);
+            gate = silu_gate ? gate * sigmoid(gate) : sigmoid(gate);
+            auto reference_output = reshape(
+                transpose(normalized * gate, {0, 2, 1, 3}),
+                Shape{1, 1, value_width});
+            auto actual = mfq::metal::gated_delta_decode_step(
+                qk,
+                value,
+                output_gate,
+                alpha,
+                beta,
+                actual_conv_state,
+                actual_recurrent_state,
+                convolution_weight,
+                bias,
+                decay,
+                norm,
+                key_heads,
+                value_heads,
+                dimension,
+                convolution_eps,
+                norm_eps,
+                silu_gate);
+            eval(
+                reference_output,
+                convolved.state,
+                recurrent.state,
+                actual.output,
+                actual.convolution_state,
+                actual.recurrent_state);
+            require_vector_close(
+                actual.output.data<float>(),
+                std::vector<float>(
+                    reference_output.data<float>(),
+                    reference_output.data<float>() + reference_output.size()),
+                5e-5f,
+                silu_gate ? "GDN fused SiLU output" : "GDN fused sigmoid output");
+            require_vector_close(
+                actual.convolution_state.data<float>(),
+                std::vector<float>(
+                    convolved.state.data<float>(),
+                    convolved.state.data<float>() + convolved.state.size()),
+                0.0f,
+                "GDN fused convolution state");
+            require_vector_close(
+                actual.recurrent_state.data<float>(),
+                std::vector<float>(
+                    recurrent.state.data<float>(),
+                    recurrent.state.data<float>() + recurrent.state.size()),
+                5e-6f,
+                "GDN fused recurrent state");
+            reference_conv_state = convolved.state;
+            reference_recurrent_state = recurrent.state;
+            actual_conv_state = std::move(actual.convolution_state);
+            actual_recurrent_state = std::move(actual.recurrent_state);
+        }
     }
+    require_vector_close(
+        convolution_state.data<float>(), convolution_state_data, 0.0f,
+        "GDN retained convolution checkpoint");
+    require_vector_close(
+        recurrent_state.data<float>(), recurrent_state_data, 0.0f,
+        "GDN retained recurrent checkpoint");
 
     bool rejected = false;
     try {
@@ -558,7 +566,11 @@ int main(int argc, char** argv) {
         using namespace mlx::core;
 
         test_gdn_gates();
-        test_gdn_decode_step();
+        test_gdn_decode_step(1, 2, float16, float16);
+        test_gdn_decode_step(16, 48, float16, float32);
+        test_gdn_decode_step(16, 48, float16, bfloat16);
+        test_gdn_decode_step(2, 6, bfloat16, bfloat16);
+        test_gdn_decode_step(1, 1, float32, float32);
         if (argc == 2 && std::string(argv[1]) == "--benchmark-gates") {
             benchmark_gdn_gates();
             return 0;

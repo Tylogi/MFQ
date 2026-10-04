@@ -1,10 +1,12 @@
 #include "mlx_vq.h"
 #include "mlx_tensor.h"
+#include "mlx_grouped_linear.h"
 
 #include "nvq_codebooks.generated.h"
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -355,6 +357,76 @@ Fixture make_jsc(
         kMatrixOutput,
         kInputSize,
     };
+}
+
+Fixture make_nvq3jl_shape(int output_size, int input_size) {
+    constexpr int banks = 4;
+    constexpr int entries = 1024;
+    constexpr std::array<std::uint16_t, 4> scale_bits{
+        0x3400, 0x3800, 0x3c00, 0x4000,
+    };
+    constexpr std::array<float, 4> scales{0.25f, 0.5f, 1.0f, 2.0f};
+    const int groups = (input_size + 23) / 24;
+    const int vectors = (input_size + 3) / 4;
+    const int signs = (input_size + 7) / 8;
+    std::vector<std::uint8_t> blob;
+    append_matrix_header(blob, "NVQ1", 0x26, 4, 24, output_size, input_size);
+    append<std::uint8_t>(blob, 1);
+    append<std::uint8_t>(blob, banks);
+    append<std::uint8_t>(blob, 16);
+    append<std::uint8_t>(blob, 0);
+    for (int state = 0; state < 16; ++state) {
+        append<std::uint16_t>(blob, scale_bits[state % 4]);
+    }
+    for (int state = 0; state < 16; ++state) {
+        append<std::uint8_t>(blob, state % banks);
+    }
+    append<std::uint8_t>(blob, 0);
+    blob.insert(blob.end(), 11, 0);
+    const auto code = [](int bank, int index, int component) {
+        return (bank * 3 + index * 5 + component * 7) % 17 - 8;
+    };
+    for (int bank = 0; bank < banks; ++bank) {
+        for (int index = 0; index < entries; ++index) {
+            for (int component = 0; component < 4; ++component) {
+                append<std::int8_t>(blob, code(bank, index, component));
+            }
+        }
+    }
+    std::vector<std::uint16_t> states(output_size * groups);
+    std::vector<std::uint16_t> indices(output_size * vectors);
+    std::vector<std::uint16_t> sign_values(output_size * signs);
+    for (int output = 0; output < output_size; ++output) {
+        append<std::uint16_t>(blob, scale_bits[output % 2]);
+        for (int group = 0; group < groups; ++group) {
+            states[output * groups + group] = (output * 5 + group * 3) % 16;
+        }
+        for (int vector = 0; vector < vectors; ++vector) {
+            indices[output * vectors + vector] = (output * 37 + vector * 13) % entries;
+        }
+        for (int sign = 0; sign < signs; ++sign) {
+            sign_values[output * signs + sign] = (output * 11 + sign * 19) % 128;
+        }
+    }
+    append_bytes(blob, pack_values(states, 4));
+    append_bytes(blob, pack_values(indices, 10));
+    append_bytes(blob, pack_values(sign_values, 7));
+    std::vector<float> dense(output_size * input_size);
+    for (int output = 0; output < output_size; ++output) {
+        for (int column = 0; column < input_size; ++column) {
+            const auto state = states[output * groups + column / 24];
+            const auto index = indices[output * vectors + column / 4];
+            const auto sign = sign_values[output * signs + column / 8];
+            const auto bit = column % 8;
+            const auto negative = bit < 7 ? ((sign >> bit) & 1u)
+                : (std::popcount(sign) & 1u);
+            const float value = code(state % banks, index, column % 4);
+            dense[output * input_size + column] = scales[output % 2]
+                * scales[state % 4] * (negative ? -value : value);
+        }
+    }
+    return {"NVQ3J-L", std::move(blob), {}, std::move(dense),
+        {output_size}, {}, 0, output_size, input_size};
 }
 
 std::vector<float> decode_ternary_word(
@@ -879,6 +951,7 @@ std::vector<float> evaluated_float(
     if (value.dtype() != float32) {
         value = astype(value, float32);
     }
+    value = contiguous(value);
     value.eval();
     const auto* data = value.data<float>();
     return std::vector<float>(
@@ -1053,7 +1126,7 @@ void check_values(
             actual[index],
             expected[index],
             tolerance,
-            context);
+            std::string(context) + " index=" + std::to_string(index));
     }
 }
 
@@ -1272,6 +1345,74 @@ void test_fixture(const Fixture& fixture) {
     }
 }
 
+void test_nvq3jl_projection_shapes() {
+    using namespace mlx::core;
+    test_fixture(make_nvq3jl_shape(24, 24));
+    for (const auto [width, narrow, wide] : {
+             std::array<int, 3>{24, 3, 35},
+             std::array<int, 3>{28, 13, 37},
+             std::array<int, 3>{80, 13, 97},
+             std::array<int, 3>{88, 13, 105},
+             std::array<int, 3>{96, 13, 113},
+         }) {
+        auto contraction = make_nvq3jl_shape(narrow, width);
+        auto expansion = make_nvq3jl_shape(wide, width);
+        test_fixture(contraction);
+        test_fixture(expansion);
+        auto a = mfq::metal::MlxVqWeight::from_blob(contraction.dtype, contraction.blob);
+        auto b = mfq::metal::MlxVqWeight::from_blob(expansion.dtype, expansion.blob);
+        if (!a.nvq3jl_execution_records() || !b.nvq3jl_execution_records()) {
+            throw std::runtime_error("NVQ3J-L execution records were not prepared at load");
+        }
+        const mfq::metal::MlxGroupedLinear group({&a, &b});
+        const mfq::metal::MlxGroupedLinear triple({&a, &b, &a});
+        const mfq::metal::MlxLinear linear_a(a);
+        const mfq::metal::MlxLinear linear_b(b);
+        const mfq::metal::MlxProjectionBatch batch({&linear_a, &linear_b, &linear_a});
+        if (!triple.supports_single_row_projection_fusion()
+            || batch.grouped_projection_count() != 3
+            || !batch.projections_share_group(0, 3)) {
+            throw std::runtime_error("NVQ3J-L production projection fusion was not selected");
+        }
+        for (const int rows : {1, 2, 6, 16}) {
+            const auto values = input_values(rows, width);
+            for (const auto dtype : {float32, float16, bfloat16}) {
+                const auto context = " K=" + std::to_string(width) + " M="
+                    + std::to_string(rows) + (dtype == float32 ? " f32" : dtype == float16 ? " f16" : " bf16");
+                auto input = astype(array(values.begin(), Shape{rows, width}), dtype);
+                const auto outputs = group.matmul(input);
+                if (outputs.size() != 2) {
+                    throw std::runtime_error("NVQ3J-L grouped projection count");
+                }
+                check_values(evaluated_float(outputs[0]),
+                    expected_matmul(contraction, values, rows), dtype == bfloat16 ? 0.13f : 0.02f,
+                    "NVQ3J-L grouped contraction" + context);
+                check_values(evaluated_float(outputs[1]),
+                    expected_matmul(expansion, values, rows), dtype == bfloat16 ? 0.13f : 0.02f,
+                    "NVQ3J-L grouped expansion" + context);
+                check_values(evaluated_float(a.matmul(input)),
+                    expected_matmul(contraction, values, rows), dtype == bfloat16 ? 0.13f : 0.02f,
+                    "NVQ3J-L ordinary contraction");
+                check_values(evaluated_float(b.matmul(input)),
+                    expected_matmul(expansion, values, rows), dtype == bfloat16 ? 0.13f : 0.02f,
+                    "NVQ3J-L ordinary expansion");
+                if (rows == 1) {
+                    for (const auto& fused : {triple.matmul(input), batch(input)}) {
+                        if (fused.size() != 3) {
+                            throw std::runtime_error("NVQ3J-L three-projection output count");
+                        }
+                        for (std::size_t projection = 0; projection < fused.size(); ++projection) {
+                            check_values(evaluated_float(fused[projection]),
+                                expected_matmul(projection == 1 ? expansion : contraction, values, rows),
+                                dtype == bfloat16 ? 0.13f : 0.02f, "NVQ3J-L three-projection fusion");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1330,6 +1471,7 @@ int main() {
             test_fixture(fixture);
         }
         test_fixture(make_jsc("NVQ2J-XL", 5, 8, 12, true));
+        test_nvq3jl_projection_shapes();
 
         auto rotated = make_nepq(0, true);
         test_fixture(rotated);

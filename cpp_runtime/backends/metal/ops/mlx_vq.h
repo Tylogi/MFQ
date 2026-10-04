@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -124,6 +125,9 @@ public:
     const mlx::core::array& packed_indices() const noexcept {
         return indices_packed_;
     }
+    const mlx::core::array* nvq3jl_execution_records() const noexcept {
+        return nvq3jl_records_ ? &*nvq3jl_records_ : nullptr;
+    }
     const mlx::core::array& packed_states() const noexcept {
         return state_packed_;
     }
@@ -236,6 +240,7 @@ private:
     mlx::core::array residual_codebook_;
     mlx::core::array residual_first_;
     mlx::core::array residual_second_;
+    std::optional<mlx::core::array> nvq3jl_records_;
     std::string format_label_;
     std::vector<int> output_shape_;
     int input_size_ = 0;

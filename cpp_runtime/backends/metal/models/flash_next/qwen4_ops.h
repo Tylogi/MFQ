@@ -2,8 +2,9 @@
 
 // Qwen4-Exp model semantics implemented with native MLX/Metal primitives.
 
-#include <optional>
+#include "mlx_tensor.h"
 
+#include <optional>
 #include <mlx/mlx.h>
 
 namespace mfq::metal {
@@ -37,6 +38,16 @@ MlxQwen4GatedResidualPre qwen4_gated_residual_pre(
     int hc_count,
     float eps = 1e-6f);
 
+MlxQwen4GatedResidualPre qwen4_gated_residual_pre(
+    const mlx::core::array& hyper_input,
+    const mlx::core::array& norm_weight,
+    const MlxLinear& down_weight,
+    const MlxLinear& up_weight,
+    const std::optional<MlxLinear>& inject_weight,
+    int hidden_size,
+    int hc_count,
+    float eps = 1e-6f);
+
 // Apply the preceding branch's gated residual write while normalizing for
 // the next hyper-connection. Decode keeps the exact promoted multiply/add
 // and RMS reduction order while removing the intervening materialization
@@ -49,6 +60,18 @@ MlxQwen4GatedResidualPre qwen4_gated_residual_pre_after(
     const mlx::core::array& down_weight,
     const mlx::core::array& up_weight,
     const std::optional<mlx::core::array>& inject_weight,
+    int hidden_size,
+    int hc_count,
+    float eps = 1e-6f);
+
+MlxQwen4GatedResidualPre qwen4_gated_residual_pre_after(
+    const mlx::core::array& previous_branch,
+    const mlx::core::array& previous_residual,
+    const mlx::core::array& previous_injection,
+    const mlx::core::array& norm_weight,
+    const MlxLinear& down_weight,
+    const MlxLinear& up_weight,
+    const std::optional<MlxLinear>& inject_weight,
     int hidden_size,
     int hc_count,
     float eps = 1e-6f);

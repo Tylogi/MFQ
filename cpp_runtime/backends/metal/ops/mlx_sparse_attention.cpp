@@ -7,6 +7,7 @@
 #include <mlx/primitives.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -81,16 +82,7 @@ const Kernel& sparse_selected_mla_decode_kernel() {
     return kernel;
 }
 
-const Kernel& sparse_block_gqa_gather_kernel() {
-    // Singleton decode benefits from MLX's split-K SDPA rather than the
-    // prefill kernel's one threadgroup per KV head. Gather chronological
-    // selected blocks and the incomplete causal tail first, as in oMLX's
-    // contiguous_causal_gathered_qsa_decode (see NOTICE).
-    static const auto kernel = make_sparse_kernel(
-        "mfq_cpp_sparse_block_gqa_gather",
-        {"keys", "values", "blocks", "params"},
-        {"selected_keys", "selected_values", "valid"},
-        R"METAL(
+constexpr const char* kSparseBlockGatherSource = R"METAL(
             uint index = thread_position_in_grid.x;
             uint key_count = uint(params[0]);
             uint selected = uint(params[1]);
@@ -111,9 +103,82 @@ const Kernel& sparse_block_gqa_gather_kernel() {
             selected_keys[index] = present ? keys[offset] : 0;
             selected_values[index] = present ? values[offset] : 0;
             if (head == 0 && dim == 0) valid[token] = present;
-        )METAL");
-    return kernel;
-}
+        )METAL";
+
+class SparseBlockGatherPrimitive final : public mlx::core::Primitive {
+public:
+    SparseBlockGatherPrimitive(
+        mlx::core::Stream stream, Dtype dtype,
+        int kv_heads, int block_size, std::array<int, 3> params)
+        : Primitive(stream), dtype_(dtype), kv_heads_(kv_heads),
+          block_size_(block_size), params_(params),
+          kernel_name_("mfq_sparse_block_gqa_gather") {
+        kernel_name_ += dtype_ == mlx::core::bfloat16 ? "_bf16" : "_f16";
+        kernel_name_ += "_" + std::to_string(kv_heads_) +
+            "_" + std::to_string(block_size_);
+    }
+
+    void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("sparse KV gather requires Metal");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        for (auto& output : outputs) {
+            output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        }
+        auto& device = mlx::core::metal::device(stream().device);
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(
+            kernel_name_, options, [this] { return source(); });
+        auto& encoder = mlx::core::metal::get_command_encoder(stream());
+        encoder.set_compute_pipeline_state(
+            device.get_kernel(kernel_name_, library));
+        for (int index = 0; index < 3; ++index) {
+            encoder.set_input_array(inputs[index], index);
+        }
+        encoder.set_bytes(params_, 3);
+        for (int index = 0; index < 3; ++index) {
+            encoder.set_output_array(outputs[index], index + 4);
+        }
+        encoder.dispatch_threads(
+            MTL::Size(kv_heads_ * params_[1] * 256, 1, 1),
+            MTL::Size(256, 1, 1));
+    }
+
+    const char* name() const override { return "SparseBlockKvGather"; }
+
+private:
+    std::string source() const {
+        std::string code =
+            "#include <metal_stdlib>\nusing namespace metal;\n";
+        code += dtype_ == mlx::core::bfloat16
+            ? "using T = bfloat;\n" : "using T = half;\n";
+        code += "#define KV_HEADS " + std::to_string(kv_heads_) +
+            "\n#define DIM 256\n#define BLOCK_SIZE " +
+            std::to_string(block_size_) + "\n";
+        code += "kernel void " + kernel_name_ + "("
+            "device const T* keys [[buffer(0)]], "
+            "device const T* values [[buffer(1)]], "
+            "device const int* blocks [[buffer(2)]], "
+            "constant int* params [[buffer(3)]], "
+            "device T* selected_keys [[buffer(4)]], "
+            "device T* selected_values [[buffer(5)]], "
+            "device bool* valid [[buffer(6)]], "
+            "uint3 thread_position_in_grid [[thread_position_in_grid]]) {\n";
+        code += kSparseBlockGatherSource;
+        code += "}\n";
+        return code;
+    }
+
+    Dtype dtype_;
+    int kv_heads_;
+    int block_size_;
+    std::array<int, 3> params_;
+    std::string kernel_name_;
+};
 
 const Kernel& sparse_circular_mla_decode_kernel() {
     static const auto kernel = make_sparse_kernel(
@@ -644,24 +709,15 @@ array mlx_sparse_block_gqa_attention(
             selected_key.shape(2) % block_size;
         if (selected > 0) {
             const Shape gathered_shape{1, selected_key.shape(1), selected, 256};
-            // Context length changes every token; keep it in runtime data,
-            // never in the kernel template/cache key.
-            const array gather_params(
-                {selected_key.shape(2), selected, valid_blocks}, mlx::core::int32);
-            auto gathered = sparse_block_gqa_gather_kernel()(
-                {selected_key, selected_value, blocks, gather_params},
+            auto gathered = array::make_arrays(
                 {gathered_shape, gathered_shape, Shape{1, 1, 1, selected}},
                 {attention_dtype, attention_dtype, mlx::core::bool_},
-                {selected_key.shape(1) * selected * 256, 1, 1},
-                {256, 1, 1},
-                {
-                    {"KV_HEADS", selected_key.shape(1)},
-                    {"DIM", 256},
-                    {"BLOCK_SIZE", block_size},
-                },
-                std::nullopt,
-                false,
-                {});
+                std::make_shared<SparseBlockGatherPrimitive>(
+                    mlx::core::default_stream(mlx::core::default_device()),
+                    attention_dtype, selected_key.shape(1), block_size,
+                    std::array<int, 3>{
+                        selected_key.shape(2), selected, valid_blocks}),
+                {selected_key, selected_value, blocks});
             auto output = mlx::core::fast::scaled_dot_product_attention(
                 selected_query, gathered[0], gathered[1], selected_scale,
                 "", gathered[2]);

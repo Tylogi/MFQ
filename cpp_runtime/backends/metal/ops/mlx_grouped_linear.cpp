@@ -1,14 +1,20 @@
 #include "mlx_grouped_linear.h"
+#include "mlx_nvq3jl.h"
 #include "mlx_staging_allocator.h"
 
 #include <mlx/allocator.h>
+#include <mlx/backend/metal/device.h>
+#include <mlx/backend/metal/utils.h>
+#include <mlx/primitives.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -62,6 +68,7 @@ struct DirectProjectionLayout {
     int tile_begin = 0;
     int tile_end = 0;
     int output_offset = 0;
+    bool nvq3jl_execution = false;
 };
 
 using RetainedProjection = std::variant<
@@ -129,7 +136,7 @@ struct MfqGroupedNintValue8 {
     uint4 high;
 };
 
-template <typename Stream>
+template <uint GROUP_SIZE, typename Stream>
 inline MfqGroupedNintValue8 mfq_grouped_nint_read_row_value8(
     Stream stream,
     uint row_byte_offset,
@@ -139,28 +146,31 @@ inline MfqGroupedNintValue8 mfq_grouped_nint_read_row_value8(
 ) {
     const uint row_relative_bits = row_bit_shift + value_index * bits;
     const uint byte_index = row_byte_offset + (row_relative_bits >> 3u);
-    const uint shift = row_relative_bits & 7u;
+    uint shift = row_relative_bits & 7u;
     const uint word0 = as_type<uint>(
         *reinterpret_cast<device const packed_uchar4*>(stream + byte_index));
-    const uint word1 = shift + 8u * bits > 32u
-        ? as_type<uint>(*reinterpret_cast<device const packed_uchar4*>(
-            stream + byte_index + 4u))
-        : 0u;
-    const uint word2 = shift + 8u * bits > 64u
-        ? as_type<uint>(*reinterpret_cast<device const packed_uchar4*>(
-            stream + byte_index + 8u))
-        : 0u;
-    const uint packed0 = shift == 0u
-        ? word0
-        : (word0 >> shift) | (word1 << (32u - shift));
-    const uint second_offset = shift + 4u * bits;
-    const uint second_shift = second_offset & 31u;
-    const uint second_low = second_offset >= 32u ? word1 : word0;
-    const uint second_high = second_offset >= 32u ? word2 : word1;
-    const uint packed1 = second_shift == 0u
-        ? second_low
-        : (second_low >> second_shift)
-            | (second_high << (32u - second_shift));
+    uint packed0, packed1;
+    if constexpr (GROUP_SIZE % 4u == 0u) {
+        if constexpr (GROUP_SIZE % 8u == 0u) shift = 0u;
+        const uint word1 = bits > 4u ? as_type<uint>(
+            *reinterpret_cast<device const packed_uchar4*>(stream + byte_index + 4u)) : 0u;
+        packed0 = shift == 0u ? word0 : (word0 >> 4u) | (word1 << 28u);
+        const uint bit = 4u * bits + shift;
+        packed1 = bit == 32u ? word1 : (word0 >> bit) | (word1 << (32u - bit));
+    } else {
+        const uint word1 = shift + 8u * bits > 32u ? as_type<uint>(
+            *reinterpret_cast<device const packed_uchar4*>(stream + byte_index + 4u)) : 0u;
+        const uint word2 = shift + 8u * bits > 64u ? as_type<uint>(
+            *reinterpret_cast<device const packed_uchar4*>(stream + byte_index + 8u)) : 0u;
+        packed0 = shift == 0u ? word0
+            : (word0 >> shift) | (word1 << (32u - shift));
+        const uint second_offset = shift + 4u * bits;
+        const uint second_shift = second_offset & 31u;
+        const uint second_low = second_offset >= 32u ? word1 : word0;
+        const uint second_high = second_offset >= 32u ? word2 : word1;
+        packed1 = second_shift == 0u ? second_low
+            : (second_low >> second_shift) | (second_high << (32u - second_shift));
+    }
     const uint mask = (1u << bits) - 1u;
     return {
         uint4(
@@ -782,7 +792,7 @@ std::string make_nint_projection_group_source(
             "                     output_row < OUTPUTS_PER_SIMD;\n"
             "                     ++output_row) {\n"
             "                    if constexpr (CHUNK_VALUES == 8u) {\n"
-            "                        const auto values = mfq_grouped_nint_read_row_value8(\n"
+            "                        const auto values = mfq_grouped_nint_read_row_value8<uint(GS)>(\n"
             "                            q_packed_" + suffix + ",\n"
             "                            q_byte_offsets_" + suffix
             + "[output_row],\n"
@@ -998,32 +1008,128 @@ std::string make_nint_projection_group_source(
     return source;
 }
 
-mlx::core::fast::CustomKernelFunction nint_projection_group_kernel(
-    std::size_t projections) {
-    static std::mutex mutex;
-    static std::unordered_map<
-        std::size_t,
-        mlx::core::fast::CustomKernelFunction> kernels;
-    std::lock_guard<std::mutex> lock(mutex);
-    const auto found = kernels.find(projections);
-    if (found != kernels.end()) {
-        return found->second;
+struct NintProjectionConfig {
+    Dtype dtype;
+    int rows;
+    int group_size;
+    int groups;
+    int input_width;
+    std::vector<int> output_widths;
+    bool swiglu;
+    float limit;
+};
+
+class NintProjectionPrimitive final : public mlx::core::UnaryPrimitive {
+public:
+    NintProjectionPrimitive(
+        mlx::core::Stream stream,
+        NintProjectionConfig config)
+        : UnaryPrimitive(stream), config_(std::move(config)),
+          kernel_name_("mfq_nint_projection") {
+        kernel_name_ += config_.dtype == mlx::core::float32 ? "_f32" : "_f16";
+        for (int value : {
+                 config_.rows, config_.group_size, config_.groups,
+                 config_.input_width, static_cast<int>(config_.swiglu)}) {
+            kernel_name_ += "_" + std::to_string(value);
+        }
+        for (int width : config_.output_widths) {
+            kernel_name_ += "_" + std::to_string(width);
+        }
     }
-    CompileOptions options;
-    options.math_mode = MathMode::Fast;
-    auto kernel = mlx::core::fast::metal_kernel(
-        "mfq_cpp_nint_metadata_grouped_p" +
-            std::to_string(projections),
-        nint_projection_group_input_names(projections),
-        {"y"},
-        make_nint_projection_group_source(projections),
-        kNintProjectionHeader,
-        true,
-        false,
-        options);
-    kernels.emplace(projections, kernel);
-    return kernel;
-}
+
+    void eval_cpu(const std::vector<array>&, array&) override {
+        throw std::runtime_error("NINT projection group requires Metal");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        array& output) override {
+        output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        auto& device = mlx::core::metal::device(stream().device);
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(
+            kernel_name_, options, [this] { return source(); });
+        auto& encoder = mlx::core::metal::get_command_encoder(stream());
+        encoder.set_compute_pipeline_state(
+            device.get_kernel(kernel_name_, library));
+        const int input_count = static_cast<int>(inputs.size());
+        for (int index = 0; index < input_count; ++index) {
+            encoder.set_input_array(inputs[index], index);
+        }
+        encoder.set_bytes(config_.limit, input_count);
+        encoder.set_output_array(output, input_count + 1);
+        const int maximum = *std::max_element(
+            config_.output_widths.begin(), config_.output_widths.end());
+        encoder.dispatch_threadgroups(
+            MTL::Size((maximum + 15) / 16, 1, 1),
+            MTL::Size(256, 1, 1));
+    }
+
+    const char* name() const override { return "NintProjectionGroup"; }
+
+private:
+    std::string source() const {
+        const std::string type =
+            config_.dtype == mlx::core::float32 ? "float" : "half";
+        std::string source =
+            "#include <metal_stdlib>\nusing namespace metal;\nusing T = " +
+            type + ";\n";
+        int total = 0;
+        int maximum = 0;
+        for (int width : config_.output_widths) {
+            total += width;
+            maximum = std::max(maximum, width);
+        }
+        for (const auto& [name, value] :
+             std::vector<std::pair<std::string, int>>{
+                 {"GS", config_.group_size}, {"NG", config_.groups},
+                 {"K", config_.input_width}, {"M", config_.rows},
+                 {"TILE_M", config_.rows}, {"MAX_OUT", maximum},
+                 {"TOTAL_OUT", total},
+                 {"SWIGLU", static_cast<int>(config_.swiglu)}}) {
+            source += "#define " + name + " " +
+                std::to_string(value) + "\n";
+        }
+        int offset = 0;
+        for (std::size_t index = 0;
+             index < config_.output_widths.size(); ++index) {
+            source += "#define P" + std::to_string(index) + "_OUT " +
+                std::to_string(config_.output_widths[index]) + "\n";
+            source += "#define P" + std::to_string(index) + "_OFFSET " +
+                std::to_string(offset) + "\n";
+            offset += config_.output_widths[index];
+        }
+        source += kNintProjectionHeader;
+        source += "kernel void " + kernel_name_ + "(";
+        const auto names = nint_projection_group_input_names(
+            config_.output_widths.size());
+        for (std::size_t index = 0; index + 2 < names.size(); ++index) {
+            const auto field = index % 7;
+            const auto field_type = field == 2
+                ? "uint" : (field >= 5 ? "float" : "uchar");
+            source += "device const " + std::string(field_type) + "* " +
+                names[index] + " [[buffer(" + std::to_string(index) + ")]], ";
+        }
+        const int input_index =
+            static_cast<int>(config_.output_widths.size()) * 7;
+        source +=
+            "device const T* x [[buffer(" + std::to_string(input_index) + ")]], "
+            "constant float* params [[buffer(" +
+            std::to_string(input_index + 1) + ")]], "
+            "device T* y [[buffer(" + std::to_string(input_index + 2) + ")]], "
+            "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]], "
+            "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]], "
+            "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]) {\n";
+        source += make_nint_projection_group_source(
+            config_.output_widths.size());
+        source += "}\n";
+        return source;
+    }
+
+    NintProjectionConfig config_;
+    std::string kernel_name_;
+};
 
 std::vector<std::string> dense_projection_group_input_names(
     std::size_t projections) {
@@ -1120,7 +1226,8 @@ std::string direct_kernel_key(
         if (layout.family == kFamilyNint8Zero) {
             key += "q8";
         } else if (layout.family == kFamilyVq) {
-            key += layout.execution_layout == 1 ? "vqg64" : "vq";
+            key += layout.nvq3jl_execution ? "nvq3jl"
+                : (layout.execution_layout == 1 ? "vqg64" : "vq");
         } else if (layout.family == kFamilyMx) {
             key += "mx" + std::to_string(layout.bits);
         } else {
@@ -1483,6 +1590,45 @@ std::string make_direct_source(
         source += "        output_offset = uint(P"
             + suffix + "_OUT_OFFSET);\n";
         source += "    }";
+    }
+
+    if (!batch_rows) {
+        for (std::size_t projection = 0; projection < layouts.size(); ++projection) {
+            if (!layouts[projection].nvq3jl_execution) continue;
+            const auto suffix = std::to_string(projection);
+            source +=
+                "    if constexpr (ROWS == 1) {\n"
+                "        if (projection == " + suffix + "u) {\n"
+                "            constexpr uint K_LANES = 16u;\n"
+                "            const uint k_lane = lane & (K_LANES - 1u);\n"
+                "            const uint base = local_tile * ROWS_PER_TG"
+                " + simd_group * ROWS_PER_SIMD + lane / K_LANES;\n"
+                "            uint outputs[2] = {min(base, output_width - 1u),"
+                " min(base + 2u, output_width - 1u)};\n"
+                "            float row_anchors[2] = {vq_anchors_" + suffix
+                + "[outputs[0]], vq_anchors_" + suffix + "[outputs[1]]};\n"
+                "            float values[2] = {0.0f};\n"
+                "            mfq_nvq3jl_profile<2u, uint(K), K_LANES,"
+                " (P" + suffix + "_OUT > K)>(\n"
+                "                x, vq_indices_" + suffix + ", vq_state_" + suffix
+                + ", vq_scales_" + suffix + ", vq_codebooks_" + suffix + ",\n"
+                "                outputs, row_anchors, values,"
+                " 0u, 0u, 0u, 0u, 0u, k_lane);\n"
+                "            for (uint row = 0u; row < 2u; ++row) {\n"
+                "                for (uint offset = K_LANES / 2u;"
+                " offset > 0u; offset >>= 1u) {\n"
+                "                    values[row] +="
+                " simd_shuffle_down(values[row], offset);\n"
+                "                }\n"
+                "                const uint output = base + row * 2u;\n"
+                "                if (k_lane == 0u && output < output_width) {\n"
+                "                    y[output_offset + output] = T(values[row]);\n"
+                "                }\n"
+                "            }\n"
+                "            return;\n"
+                "        }\n"
+                "    }\n";
+        }
     }
 
     source += batch_rows ? R"METAL(
@@ -2549,84 +2695,156 @@ std::string make_direct_small_m_group64_output_tile_source(
     return source;
 }
 
-mlx::core::fast::CustomKernelFunction make_direct_kernel(
+struct DirectProjectionPlan {
+    std::string kernel_name;
+    std::string source;
+    int threadgroups;
+    int threads;
+};
+
+std::shared_ptr<const DirectProjectionPlan> make_direct_projection_plan(
     const std::vector<DirectProjectionLayout>& layouts,
+    const std::vector<array>& inputs,
+    int rows,
+    int input_width,
+    int output_width,
+    int total_tiles,
+    int work_tiles,
+    int threads,
     bool batch_rows,
     bool blockwise,
     bool vectorized_fp16,
-    int group64_outputs_per_simd,
-    int group64_simd_groups) {
-    CompileOptions options;
-    options.math_mode = MathMode::Fast;
-    const auto key = direct_kernel_key(layouts)
-        + (group64_outputs_per_simd > 0
-            ? "_m2_6_group64_o" + std::to_string(group64_outputs_per_simd)
-                + "s" + std::to_string(group64_simd_groups)
-            : (batch_rows
-            ? (blockwise
-                ? (vectorized_fp16
-                    ? "_m2_6_block_vec"
-                    : "_m2_6_block")
-                : "_m2_6")
-            : "_rows"));
-    return mlx::core::fast::metal_kernel(
-        "mfq_cpp_zero_copy_grouped_linear_" + key,
-        direct_input_names(layouts),
-        {"y"},
-        group64_outputs_per_simd > 0
-            ? make_direct_small_m_group64_output_tile_source(
-                layouts,
-                group64_outputs_per_simd,
-                group64_simd_groups)
-            : (blockwise
-            ? make_direct_small_m_blockwise_source(
-                layouts,
-                vectorized_fp16)
-            : make_direct_source(layouts, batch_rows)),
-        kGroupedHeader,
-        true,
-        false,
-        options);
-}
-
-mlx::core::fast::CustomKernelFunction direct_kernel(
-    const std::vector<DirectProjectionLayout>& layouts,
-    bool batch_rows,
-    bool blockwise = false,
-    bool vectorized_fp16 = false,
-    int group64_outputs_per_simd = 0,
-    int group64_simd_groups = 2) {
-    static std::mutex mutex;
-    static std::unordered_map<
-        std::string,
-        mlx::core::fast::CustomKernelFunction> kernels;
-
-    const auto key = direct_kernel_key(layouts)
-        + (group64_outputs_per_simd > 0
-            ? "_m2_6_group64_o" + std::to_string(group64_outputs_per_simd)
-                + "s" + std::to_string(group64_simd_groups)
-            : (batch_rows
-            ? (blockwise
-                ? (vectorized_fp16
-                    ? "_m2_6_block_vec"
-                    : "_m2_6_block")
-                : "_m2_6")
-            : "_rows"));
-    std::lock_guard<std::mutex> lock(mutex);
-    const auto found = kernels.find(key);
-    if (found != kernels.end()) {
-        return found->second;
+    int outputs_per_simd,
+    int simd_groups) {
+    auto plan = std::make_shared<DirectProjectionPlan>();
+    plan->threadgroups = (batch_rows ? 1 : rows) * work_tiles;
+    plan->threads = threads;
+    plan->kernel_name = "mfq_direct_projection_" + direct_kernel_key(layouts);
+    for (int value : {
+             static_cast<int>(batch_rows), static_cast<int>(blockwise),
+             static_cast<int>(vectorized_fp16), outputs_per_simd, simd_groups}) {
+        plan->kernel_name += "_" + std::to_string(value);
     }
-    auto kernel = make_direct_kernel(
-        layouts,
-        batch_rows,
-        blockwise,
-        vectorized_fp16,
-        group64_outputs_per_simd,
-        group64_simd_groups);
-    kernels.emplace(key, kernel);
-    return kernel;
+    std::string header = "#include <metal_stdlib>\nusing namespace metal;\n";
+    header += inputs.back().dtype() == mlx::core::float32
+        ? "using T = float;\n" : "using T = half;\n";
+    std::string constants;
+    const auto define = [&](const std::string& name, int value) {
+        constants += "#define " + name + " " + std::to_string(value) + "\n";
+        plan->kernel_name += "_" + std::to_string(value);
+    };
+    define("ROWS", rows);
+    define("K", input_width);
+    define("TOTAL_OUT", output_width);
+    define("TOTAL_TILES", total_tiles);
+    int tile_begin = 0;
+    const int tile_outputs = outputs_per_simd > 0
+        ? simd_groups * outputs_per_simd : 8;
+    for (std::size_t index = 0; index < layouts.size(); ++index) {
+        const auto& layout = layouts[index];
+        const auto prefix = "P" + std::to_string(index) + "_";
+        const int tile_end = blockwise
+            ? tile_begin + (layout.output_size + tile_outputs - 1) / tile_outputs
+            : layout.tile_end;
+        define(prefix + "OUT", layout.output_size);
+        define(prefix + "TILE_BEGIN", blockwise ? tile_begin : layout.tile_begin);
+        define(prefix + "TILE_END", tile_end);
+        define(prefix + "OUT_OFFSET", layout.output_offset);
+        define(prefix + "NG", layout.groups);
+        tile_begin = tile_end;
+        if (layout.family == kFamilyVq) {
+            for (const auto& [name, value] :
+                 std::vector<std::pair<std::string, int>>{
+                     {"GS", layout.group_size},
+                     {"VECTOR_SIZE", layout.vector_size},
+                     {"NVEC", layout.vectors},
+                     {"INDEX_BITS", layout.index_bits},
+                     {"STATE_BITS", layout.state_bits},
+                     {"STATES", layout.states},
+                     {"ENTRIES", layout.entries},
+                     {"CODE_BANKS", layout.code_banks},
+                     {"AUX_MODE", layout.aux_mode},
+                     {"CODE_BANK_MODE", layout.code_bank_mode},
+                     {"EXECUTION_LAYOUT", layout.execution_layout},
+                     {"HAS_TABLE_BANKS", static_cast<int>(layout.table_banks > 1)},
+                     {"GROUPS_PER_SUPER", layout.groups_per_supergroup},
+                     {"NSUPER", layout.supergroups}}) {
+                define(prefix + name, value);
+            }
+        } else if (layout.family == kFamilyMx) {
+            define(prefix + "BITS", layout.bits);
+        }
+    }
+    const auto metal_type = [](Dtype dtype) {
+        if (dtype == mlx::core::uint8) return "uchar";
+        if (dtype == mlx::core::int8) return "int8_t";
+        if (dtype == mlx::core::uint32) return "uint";
+        if (dtype == mlx::core::float16) return "half";
+        if (dtype == mlx::core::float32) return "float";
+        throw std::invalid_argument("unsupported direct projection buffer type");
+    };
+    std::string arguments;
+    const auto names = direct_input_names(layouts);
+    for (std::size_t index = 0; index < inputs.size(); ++index) {
+        const auto type = metal_type(inputs[index].dtype());
+        plan->kernel_name += "_" + std::string(type);
+        arguments += "device const " + std::string(type) + "* " +
+            names.at(index) + " [[buffer(" + std::to_string(index) + ")]], ";
+    }
+    arguments +=
+        "device T* y [[buffer(" + std::to_string(inputs.size()) + ")]], "
+        "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]], "
+        "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]], "
+        "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]) {\n";
+    plan->source = header + kGroupedHeader + kNvq3jlHeader + constants +
+        "kernel void " + plan->kernel_name + "(" + arguments +
+        (outputs_per_simd > 0
+             ? make_direct_small_m_group64_output_tile_source(
+                   layouts, outputs_per_simd, simd_groups)
+             : (blockwise
+                    ? make_direct_small_m_blockwise_source(
+                          layouts, vectorized_fp16)
+                    : make_direct_source(layouts, batch_rows))) + "}\n";
+    return plan;
 }
+
+class DirectProjectionPrimitive final : public mlx::core::UnaryPrimitive {
+public:
+    DirectProjectionPrimitive(
+        mlx::core::Stream stream,
+        std::shared_ptr<const DirectProjectionPlan> plan)
+        : UnaryPrimitive(stream), plan_(std::move(plan)) {}
+
+    void eval_cpu(const std::vector<array>&, array&) override {
+        throw std::runtime_error("direct grouped projection requires Metal");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        array& output) override {
+        output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        auto& device = mlx::core::metal::device(stream().device);
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(
+            plan_->kernel_name, options, [this] { return plan_->source; });
+        auto& encoder = mlx::core::metal::get_command_encoder(stream());
+        encoder.set_compute_pipeline_state(
+            device.get_kernel(plan_->kernel_name, library));
+        for (int index = 0; index < static_cast<int>(inputs.size()); ++index) {
+            encoder.set_input_array(inputs[index], index);
+        }
+        encoder.set_output_array(output, static_cast<int>(inputs.size()));
+        encoder.dispatch_threadgroups(
+            MTL::Size(plan_->threadgroups, 1, 1),
+            MTL::Size(plan_->threads, 1, 1));
+    }
+
+    const char* name() const override { return "DirectProjectionGroup"; }
+
+private:
+    std::shared_ptr<const DirectProjectionPlan> plan_;
+};
 
 std::string make_single_row_mxfp8_source(
     const std::vector<DirectProjectionLayout>& layouts) {
@@ -3105,6 +3323,7 @@ struct MlxGroupedLinear::Impl {
     std::vector<array> dense_projection_weights;
     std::vector<DirectProjectionLayout> direct_layouts;
     std::vector<array> direct_weight_inputs;
+    std::vector<array> single_row_weight_inputs;
     std::vector<int> output_sizes;
     int input_size = 0;
     int total_output_size = 0;
@@ -3235,6 +3454,38 @@ struct MlxGroupedLinear::Impl {
         }
     }
 
+
+    mutable std::mutex direct_plan_mutex;
+    mutable std::map<
+        std::array<int, 7>,
+        std::shared_ptr<const DirectProjectionPlan>> direct_plans;
+
+    std::shared_ptr<const DirectProjectionPlan> direct_projection_plan(
+        const std::vector<array>& inputs,
+        int rows,
+        int work_tiles,
+        int threads,
+        bool batch_rows,
+        bool blockwise,
+        bool vectorized,
+        int outputs_per_simd,
+        int simd_groups) const {
+        const std::array<int, 7> key{
+            static_cast<int>(inputs.back().dtype() == mlx::core::float32),
+            rows, static_cast<int>(batch_rows), static_cast<int>(blockwise),
+            static_cast<int>(vectorized), outputs_per_simd, simd_groups};
+        std::lock_guard<std::mutex> lock(direct_plan_mutex);
+        if (const auto found = direct_plans.find(key); found != direct_plans.end()) {
+            return found->second;
+        }
+        auto plan = make_direct_projection_plan(
+            direct_layouts, inputs, rows, input_size, total_output_size,
+            total_tiles, work_tiles, threads, batch_rows, blockwise,
+            vectorized, outputs_per_simd, simd_groups);
+        direct_plans.emplace(key, plan);
+        return plan;
+    }
+
     bool uses_zero_copy_storage() const noexcept {
         return !common_kernel_weights.empty()
             || !nint_projection_weights.empty()
@@ -3333,7 +3584,8 @@ struct MlxGroupedLinear::Impl {
             direct_layouts.end(),
             [](const DirectProjectionLayout& layout) {
                 return layout.family == kFamilyMx ||
-                    layout.family == kFamilyNint8Zero;
+                    layout.family == kFamilyNint8Zero ||
+                    layout.nvq3jl_execution;
             });
     }
 };
@@ -3748,6 +4000,7 @@ MlxGroupedLinear::MlxGroupedLinear(
     if (weights.size() <= 3 || direct_mxfp8_group) {
         std::vector<DirectProjectionLayout> layouts;
         std::vector<array> direct_inputs;
+        std::vector<std::pair<std::size_t, array>> execution_inputs;
         std::vector<int> output_sizes;
         layouts.reserve(weights.size());
         direct_inputs.reserve(weights.size() * 9);
@@ -3853,6 +4106,8 @@ MlxGroupedLinear::MlxGroupedLinear(
                             weight->code_bank_mode();
                         layout.execution_layout =
                             weight->execution_layout();
+                        layout.nvq3jl_execution =
+                            weight->nvq3jl_execution_records() != nullptr;
                         layout.table_banks =
                             weight->table_banks();
                         layout.groups_per_supergroup =
@@ -3895,6 +4150,11 @@ MlxGroupedLinear::MlxGroupedLinear(
                             weight->parameters(),
                             mlx::core::float32,
                             "VQ parameters");
+                        if (const auto* records = weight->nvq3jl_execution_records()) {
+                            validate_direct_array(
+                                *records, mlx::core::uint8, "NVQ3J-L execution records");
+                            execution_inputs.emplace_back(direct_inputs.size(), *records);
+                        }
                         direct_inputs.push_back(
                             weight->packed_indices());
                         direct_inputs.push_back(
@@ -3971,6 +4231,12 @@ MlxGroupedLinear::MlxGroupedLinear(
             total_output,
             total_tiles,
             packed_bytes);
+        if (!execution_inputs.empty()) {
+            impl_->single_row_weight_inputs = impl_->direct_weight_inputs;
+            for (const auto& [index, records] : execution_inputs) {
+                impl_->single_row_weight_inputs[index] = records;
+            }
+        }
         return;
     }
 
@@ -4113,24 +4379,8 @@ array MlxGroupedLinear::run_nint_projection_group(
     }
     const auto projection_count =
         impl_->nint_projection_weights.size();
-    const int max_output = *std::max_element(
-        impl_->output_sizes.begin(),
-        impl_->output_sizes.end());
-    constexpr std::size_t outputs_per_threadgroup = 16;
-    constexpr std::size_t threads_per_threadgroup = 256;
-    const auto output_threadgroups =
-        (static_cast<std::size_t>(max_output)
-            + outputs_per_threadgroup - 1) /
-        outputs_per_threadgroup;
-    const auto grid_x = output_threadgroups * threads_per_threadgroup;
-    if (grid_x > static_cast<std::size_t>(
-            std::numeric_limits<int>::max())) {
-        throw MlxGroupedLinearUnsupported(
-            "grouped NINT Metal grid exceeds MLX limits");
-    }
-
     std::vector<array> inputs;
-    inputs.reserve(projection_count * 7 + 2);
+    inputs.reserve(projection_count * 7 + 1);
     for (const auto& weight : impl_->nint_projection_weights) {
         inputs.push_back(weight.packed_values());
         inputs.push_back(weight.row_q_layout());
@@ -4141,45 +4391,19 @@ array MlxGroupedLinear::run_nint_projection_group(
         inputs.push_back(weight.neuron_mins());
     }
     inputs.push_back(source);
-    inputs.push_back(array({limit}, mlx::core::float32));
-
-    std::vector<
-        std::pair<std::string, mlx::core::fast::TemplateArg>>
-        templates{
-            {"T", source.dtype()},
-            {"GS", impl_->nint_projection_weights.front().group_size()},
-            {"NG", impl_->nint_projection_weights.front().groups()},
-            {"K", impl_->input_size},
-            {"M", static_cast<int>(rows)},
-            {"TILE_M", static_cast<int>(rows)},
-            {"MAX_OUT", max_output},
-            {"TOTAL_OUT", impl_->total_output_size},
-            {"SWIGLU", static_cast<int>(swiglu)},
-        };
-    int output_offset = 0;
-    for (std::size_t projection = 0;
-         projection < projection_count;
-         ++projection) {
-        const auto prefix = "P" + std::to_string(projection) + "_";
-        templates.emplace_back(
-            prefix + "OUT",
-            impl_->output_sizes[projection]);
-        templates.emplace_back(prefix + "OFFSET", output_offset);
-        output_offset += impl_->output_sizes[projection];
-    }
+    const NintProjectionConfig config{
+        source.dtype(), static_cast<int>(rows),
+        impl_->nint_projection_weights.front().group_size(),
+        impl_->nint_projection_weights.front().groups(),
+        impl_->input_size, impl_->output_sizes, swiglu, limit};
     const int output_width = swiglu
-        ? impl_->output_sizes[0]
-        : impl_->total_output_size;
-    return nint_projection_group_kernel(projection_count)(
-        std::move(inputs),
-        {Shape{static_cast<std::int32_t>(rows), output_width}},
-        {source.dtype()},
-        {static_cast<int>(grid_x), 1, 1},
-        {static_cast<int>(threads_per_threadgroup), 1, 1},
-        std::move(templates),
-        std::nullopt,
-        false,
-        {}).front();
+        ? impl_->output_sizes[0] : impl_->total_output_size;
+    return array(
+        Shape{static_cast<std::int32_t>(rows), output_width},
+        source.dtype(),
+        std::make_shared<NintProjectionPrimitive>(
+            mlx::core::default_stream(mlx::core::default_device()), config),
+        std::move(inputs));
 }
 
 bool MlxGroupedLinear::supports(
@@ -4729,7 +4953,8 @@ std::vector<array> MlxGroupedLinear::matmul(
 
     array combined = [&]() {
         if (impl_->uses_zero_copy_storage()) {
-            auto inputs = impl_->direct_weight_inputs;
+            auto inputs = rows == 1 && !impl_->single_row_weight_inputs.empty()
+                ? impl_->single_row_weight_inputs : impl_->direct_weight_inputs;
             inputs.push_back(source);
             if (use_single_row_mxfp8_fast_path) {
                 std::vector<
@@ -4772,119 +4997,18 @@ std::vector<array> MlxGroupedLinear::matmul(
                     false,
                     {}).front();
             }
-            std::vector<
-                std::pair<
-                    std::string,
-                    mlx::core::fast::TemplateArg>>
-                templates{
-                    {"T", source.dtype()},
-                    {"ROWS", static_cast<int>(rows)},
-                    {"K", impl_->input_size},
-                    {"TOTAL_OUT", impl_->total_output_size},
-                    {"TOTAL_TILES", impl_->total_tiles},
-                };
-            int execution_tile_begin = 0;
-            for (
-                std::size_t projection = 0;
-                projection < impl_->direct_layouts.size();
-                ++projection
-            ) {
-                const auto& layout =
-                    impl_->direct_layouts[projection];
-                const auto prefix =
-                    "P" + std::to_string(projection) + "_";
-                const int execution_tile_end =
-                    use_small_m_blockwise
-                    ? execution_tile_begin
-                        + (layout.output_size
-                            + small_m_outputs_per_tile - 1)
-                            / small_m_outputs_per_tile
-                    : layout.tile_end;
-                templates.emplace_back(
-                    prefix + "OUT",
-                    layout.output_size);
-                templates.emplace_back(
-                    prefix + "TILE_BEGIN",
-                    use_small_m_blockwise
-                        ? execution_tile_begin
-                        : layout.tile_begin);
-                templates.emplace_back(
-                    prefix + "TILE_END",
-                    execution_tile_end);
-                execution_tile_begin = execution_tile_end;
-                templates.emplace_back(
-                    prefix + "OUT_OFFSET",
-                    layout.output_offset);
-                templates.emplace_back(
-                    prefix + "NG",
-                    layout.groups);
-                if (layout.family == kFamilyVq) {
-                    templates.emplace_back(
-                        prefix + "GS",
-                        layout.group_size);
-                    templates.emplace_back(
-                        prefix + "VECTOR_SIZE",
-                        layout.vector_size);
-                    templates.emplace_back(
-                        prefix + "NVEC",
-                        layout.vectors);
-                    templates.emplace_back(
-                        prefix + "INDEX_BITS",
-                        layout.index_bits);
-                    templates.emplace_back(
-                        prefix + "STATE_BITS",
-                        layout.state_bits);
-                    templates.emplace_back(
-                        prefix + "STATES",
-                        layout.states);
-                    templates.emplace_back(
-                        prefix + "ENTRIES",
-                        layout.entries);
-                    templates.emplace_back(
-                        prefix + "CODE_BANKS",
-                        layout.code_banks);
-                    templates.emplace_back(
-                        prefix + "AUX_MODE",
-                        layout.aux_mode);
-                    templates.emplace_back(
-                        prefix + "CODE_BANK_MODE",
-                        layout.code_bank_mode);
-                    templates.emplace_back(
-                        prefix + "EXECUTION_LAYOUT",
-                        layout.execution_layout);
-                    templates.emplace_back(
-                        prefix + "HAS_TABLE_BANKS",
-                        static_cast<int>(
-                            layout.table_banks > 1));
-                    templates.emplace_back(
-                        prefix + "GROUPS_PER_SUPER",
-                        layout.groups_per_supergroup);
-                    templates.emplace_back(
-                        prefix + "NSUPER",
-                        layout.supergroups);
-                } else if (layout.family == kFamilyMx) {
-                    templates.emplace_back(
-                        prefix + "BITS",
-                        layout.bits);
-                }
-            }
-            auto kernel = direct_kernel(
-                impl_->direct_layouts,
-                use_small_m_batched_path,
-                use_small_m_blockwise,
-                use_vectorized_fp16,
-                group64_outputs_per_simd,
-                group64_simd_groups);
-            return kernel(
-                inputs,
-                output_shapes,
-                output_dtypes,
-                grid_shape,
-                threadgroup,
-                std::move(templates),
-                std::nullopt,
-                false,
-                {}).front();
+            auto plan = impl_->direct_projection_plan(
+                inputs, static_cast<int>(rows), work_tiles, grouped_threads,
+                use_small_m_batched_path, use_small_m_blockwise,
+                use_vectorized_fp16, specialized_outputs_per_simd,
+                specialized_simd_groups);
+            return array(
+                Shape{static_cast<std::int32_t>(rows), impl_->total_output_size},
+                source.dtype(),
+                std::make_shared<DirectProjectionPrimitive>(
+                    mlx::core::default_stream(mlx::core::default_device()),
+                    std::move(plan)),
+                std::move(inputs));
         }
 
         return grouped_kernel()(

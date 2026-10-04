@@ -185,6 +185,16 @@ array dense_nint_mmq(
 }
 
 constexpr const char* kNintHeader = R"METAL(
+template <typename InputScalar>
+inline float4 mfq_nint_load_input4(device const InputScalar* input, uint offset) {
+    return float4(*reinterpret_cast<device const vec<InputScalar, 4>*>(input + offset));
+}
+
+template <typename InputScalar>
+inline float4 mfq_nint_load_input4(constant const InputScalar* input, uint offset) {
+    return float4(input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]);
+}
+
 inline uint mfq_nint_load_u32(
     device const uchar* stream,
     uint byte_index
@@ -277,7 +287,7 @@ struct MfqNintValue8 {
     uint4 high;
 };
 
-template <typename Stream>
+template <uint GROUP_SIZE, typename Stream>
 inline MfqNintValue8 mfq_nint_decode_value8_at(
     Stream stream,
     uint byte_index,
@@ -285,22 +295,28 @@ inline MfqNintValue8 mfq_nint_decode_value8_at(
     uint bits
 ) {
     const uint word0 = mfq_nint_load_u32(stream, byte_index);
-    const uint word1 = mfq_nint_load_u32(stream, byte_index + 4u);
-    const uint word2 = shift + 8u * bits > 64u
-        ? mfq_nint_load_u32(stream, byte_index + 8u)
-        : 0u;
-    const uint packed0 = shift == 0u
-        ? word0
-        : (word0 >> shift) | (word1 << (32u - shift));
-    const uint raw_second_cursor = shift + 4u * bits;
-    const bool second_word = raw_second_cursor >= 32u;
-    const uint second_cursor = raw_second_cursor & 31u;
-    const uint second_low = second_word ? word1 : word0;
-    const uint second_high = second_word ? word2 : word1;
-    const uint packed1 = second_cursor == 0u
-        ? second_low
-        : (second_low >> second_cursor)
-            | (second_high << (32u - second_cursor));
+    uint packed0, packed1;
+    if constexpr (GROUP_SIZE % 4u == 0u) {
+        if constexpr (GROUP_SIZE % 8u == 0u) shift = 0u;
+        const uint word1 = bits > 4u
+            ? mfq_nint_load_u32(stream, byte_index + 4u) : 0u;
+        packed0 = shift == 0u ? word0 : (word0 >> 4u) | (word1 << 28u);
+        const uint bit = 4u * bits + shift;
+        packed1 = bit == 32u ? word1 : (word0 >> bit) | (word1 << (32u - bit));
+    } else {
+        const uint word1 = mfq_nint_load_u32(stream, byte_index + 4u);
+        const uint word2 = shift + 8u * bits > 64u
+            ? mfq_nint_load_u32(stream, byte_index + 8u) : 0u;
+        packed0 = shift == 0u ? word0
+            : (word0 >> shift) | (word1 << (32u - shift));
+        const uint raw_second_cursor = shift + 4u * bits;
+        const bool second_word = raw_second_cursor >= 32u;
+        const uint second_cursor = raw_second_cursor & 31u;
+        const uint second_low = second_word ? word1 : word0;
+        const uint second_high = second_word ? word2 : word1;
+        packed1 = second_cursor == 0u ? second_low
+            : (second_low >> second_cursor) | (second_high << (32u - second_cursor));
+    }
     const uint mask = (1u << bits) - 1u;
     return {
         uint4(
@@ -470,7 +486,7 @@ constexpr const char* kNintMatmul = R"METAL(
                  output_row < OUTPUTS_PER_SIMD;
                  ++output_row) {
                 const uint bits = q_widths[output_row];
-                codes[output_row] = mfq_nint_decode_value8_at(
+                codes[output_row] = mfq_nint_decode_value8_at<uint(GS)>(
                     q_packed,
                     byte_cursors[output_row],
                     bit_cursors[output_row],
@@ -491,12 +507,8 @@ constexpr const char* kNintMatmul = R"METAL(
                 if (row < uint(M)) {
                     const uint input_base = input_row * uint(K) + column;
                     if (column + 7u < uint(K)) {
-                        activation0 = float4(
-                            *reinterpret_cast<device const vec<T, 4>*>(
-                                x + input_base));
-                        activation1 = float4(
-                            *reinterpret_cast<device const vec<T, 4>*>(
-                                x + input_base + 4u));
+                        activation0 = mfq_nint_load_input4(x, input_base);
+                        activation1 = mfq_nint_load_input4(x, input_base + 4u);
                     } else {
 #pragma unroll
                         for (uint element = 0u; element < 4u; ++element) {
@@ -556,9 +568,7 @@ constexpr const char* kNintMatmul = R"METAL(
                     const uint input_base = input_row * uint(K) + column;
                     if (group_element + 3u < uint(GS) &&
                         column + 3u < uint(K)) {
-                        activation = float4(
-                            *reinterpret_cast<device const vec<T, 4>*>(
-                                x + input_base));
+                        activation = mfq_nint_load_input4(x, input_base);
                     } else {
 #pragma unroll
                         for (uint element = 0u; element < 4u; ++element) {
@@ -748,7 +758,7 @@ constexpr const char* kNintSwiGlu = R"METAL(
             for (uint output_row = 0u;
                  output_row < OUTPUTS_PER_SIMD;
                  ++output_row) {
-                const MfqNintValue8 gate_codes = mfq_nint_decode_value8_at(
+                const MfqNintValue8 gate_codes = mfq_nint_decode_value8_at<uint(GS)>(
                     gate_q,
                     gate_byte_cursors[output_row],
                     gate_bit_cursors[output_row],
@@ -756,7 +766,7 @@ constexpr const char* kNintSwiGlu = R"METAL(
                 gate_quantized_dots[output_row] +=
                     dot(activation0, float4(gate_codes.low))
                     + dot(activation1, float4(gate_codes.high));
-                const MfqNintValue8 up_codes = mfq_nint_decode_value8_at(
+                const MfqNintValue8 up_codes = mfq_nint_decode_value8_at<uint(GS)>(
                     up_q,
                     up_byte_cursors[output_row],
                     up_bit_cursors[output_row],
@@ -1696,6 +1706,10 @@ array MlxNintWeight::matmul(const array& input) const {
     return matmul_impl(input, nullptr);
 }
 
+array MlxNintWeight::matmul_packed(const array& input) const {
+    return matmul_impl(input, nullptr, nullptr, nullptr, nullptr, false);
+}
+
 array MlxNintWeight::matmul_add(
     const array& input,
     const array& residual) const {
@@ -1720,7 +1734,8 @@ array MlxNintWeight::matmul_impl(
     const array* residual,
     const array* routed_pairs,
     const array* route_weights,
-    const array* gate_logits) const {
+    const array* gate_logits,
+    bool allow_dequantize) const {
     if (input.ndim() == 0 || input.shape(-1) != input_size_) {
         throw std::runtime_error("NINT input width does not match packed weight");
     }
@@ -1782,7 +1797,7 @@ array MlxNintWeight::matmul_impl(
         // otherwise be revisited many times; it is never retained as a
         // resident decoded copy.
         constexpr std::int64_t packed_prefill_rows = 2048;
-        auto result = rows < packed_prefill_rows
+        auto result = !allow_dequantize || rows < packed_prefill_rows
             ? dense_nint_mmq(
                   q_packed_,
                   row_metadata_,

@@ -1,8 +1,10 @@
 #include "mlx_vq.h"
+#include "mlx_nvq3jl.h"
 
 #include "../../../core/compat/mfq_format_compat.h"
 #include "nvq_codebooks.generated.h"
 #include "mlx_staging_allocator.h"
+#include <mlx/allocator.h>
 
 #include <algorithm>
 #include <array>
@@ -20,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -337,6 +340,30 @@ constexpr const char* kGemvSource = R"METAL(
     uint output_base =
         threadgroup_position_in_grid.x * ROWS_PER_TG
         + simd_group * ROWS_PER_SIMD;
+    if constexpr (USE_NVQ3JL) {
+        constexpr uint K_LANES = 16u;
+        const uint k_lane = lane & (K_LANES - 1u);
+        const uint base = output_base + lane / K_LANES;
+        uint outputs[2] = {
+            min(base, uint(OUT) - 1u),
+            min(base + 2u, uint(OUT) - 1u),
+        };
+        float row_anchors[2] = {anchors[outputs[0]], anchors[outputs[1]]};
+        float values[2] = {0.0f};
+        mfq_nvq3jl_profile<2u, uint(K), K_LANES, (OUT > K)>(
+            x, indices_packed, state_packed, scale_lut, codebooks,
+            outputs, row_anchors, values, 0u, 0u, 0u, 0u, 0u, k_lane);
+        for (uint row = 0u; row < 2u; ++row) {
+            for (uint offset = K_LANES / 2u; offset > 0u; offset >>= 1u) {
+                values[row] += simd_shuffle_down(values[row], offset);
+            }
+            const uint output = base + row * 2u;
+            if (k_lane == 0u && output < uint(OUT)) {
+                y[output] = T(values[row]);
+            }
+        }
+        return;
+    }
     float accumulators[ROWS_PER_SIMD] = {0.0f};
 
     for (uint group = lane;
@@ -2937,6 +2964,63 @@ array make_array(
     return array(values.begin(), std::move(shape));
 }
 
+array make_nvq3jl_records(const CanonicalVq& weight) {
+    const std::size_t signs = (weight.input_size + 7) / 8;
+    const auto bytes = checked_product(
+        checked_product(
+            static_cast<std::size_t>(weight.output_size),
+            signs,
+            "NVQ3J-L record count"),
+        std::size_t{4},
+        "NVQ3J-L execution stream size");
+    const auto layout = detail::packed_storage_layout(bytes);
+    const Shape shape = layout.is_matrix()
+        ? Shape{layout.rows, layout.columns} : Shape{layout.columns};
+    array records(mlx::core::allocator::malloc(bytes), shape, mlx::core::uint8);
+    auto* destination = records.data<std::uint8_t>();
+    const auto read_bits = [](const auto& stream, std::size_t index, int bits) {
+        const auto bit = index * bits;
+        const auto byte = bit >> 3u;
+        std::uint32_t value = stream[byte];
+        if (byte + 1 < stream.size()) value |= std::uint32_t(stream[byte + 1]) << 8u;
+        if (byte + 2 < stream.size()) value |= std::uint32_t(stream[byte + 2]) << 16u;
+        return (value >> (bit & 7u)) & ((1u << bits) - 1u);
+    };
+    const auto pack_rows = [&](std::size_t begin, std::size_t end) {
+        for (auto row = begin; row < end; ++row) {
+            for (std::size_t sign = 0; sign < signs; ++sign) {
+                const auto vector = sign * 2;
+                const auto index0 = read_bits(weight.indices, row * weight.vectors + vector, 10);
+                const auto index1 = vector + 1 < std::size_t(weight.vectors)
+                    ? read_bits(weight.indices, row * weight.vectors + vector + 1, 10) : 0u;
+                const auto sign7 = read_bits(weight.auxiliary, row * signs + sign, 7);
+                const auto sign8 = sign7 | ((std::popcount(sign7) & 1u) << 7u);
+                const auto state_index = row * weight.groups + sign / 3;
+                const auto state = (weight.states_packed[state_index >> 1u]
+                    >> ((state_index & 1u) * 4u)) & 15u;
+                const auto bank = std::uint32_t(weight.state_to_codebank[state]);
+                const auto record = (index0 | (bank << 10u))
+                    | ((index1 | (bank << 10u)) << 12u) | (sign8 << 24u);
+                std::memcpy(destination + (row * signs + sign) * 4, &record, sizeof(record));
+            }
+        }
+    };
+    const std::size_t rows = weight.output_size;
+    const auto workers = bytes >= 8u * 1024u * 1024u
+        ? std::min<std::size_t>(8, rows) : 1;
+    if (workers == 1) {
+        pack_rows(0, rows);
+    } else {
+        std::vector<std::thread> threads;
+        threads.reserve(workers);
+        for (std::size_t worker = 0; worker < workers; ++worker) {
+            threads.emplace_back(pack_rows, rows * worker / workers, rows * (worker + 1) / workers);
+        }
+        for (auto& thread : threads) thread.join();
+    }
+    return records;
+}
+
 mlx::core::fast::CustomKernelFunction make_vq_matmul_kernel() {
     CompileOptions options;
     options.math_mode = MathMode::Fast;
@@ -2987,7 +3071,7 @@ mlx::core::fast::CustomKernelFunction make_vq_gemv_kernel() {
         },
         {"y"},
         kGemvSource,
-        kBitstreamHeader,
+        std::string(kBitstreamHeader) + kNvq3jlHeader,
         true,
         false,
         options);
@@ -3401,7 +3485,7 @@ MlxVqWeight MlxVqWeight::from_blob(
     if (residual_second.empty()) {
         residual_second.push_back(-1);
     }
-    return MlxVqWeight(
+    auto result = MlxVqWeight(
         make_array(
             parsed.indices,
             Shape{
@@ -3486,6 +3570,10 @@ MlxVqWeight MlxVqWeight::from_blob(
         parsed.residual_position_bits,
         parsed.residual_block_vectors,
         parsed.residual_blocks_per_row);
+    if (result.format_label_ == "NVQ3J-L") {
+        result.nvq3jl_records_.emplace(make_nvq3jl_records(parsed));
+    }
+    return result;
 }
 
 std::size_t MlxVqWeight::packed_nbytes() const noexcept {
@@ -3501,7 +3589,8 @@ std::size_t MlxVqWeight::packed_nbytes() const noexcept {
         + parameters_.nbytes()
         + residual_codebook_.nbytes()
         + residual_first_.nbytes()
-        + residual_second_.nbytes();
+        + residual_second_.nbytes()
+        + (nvq3jl_records_ ? nvq3jl_records_->nbytes() : 0);
 }
 
 array MlxVqWeight::dequantize(Dtype dtype) const {
@@ -3959,6 +4048,9 @@ array MlxVqWeight::packed_matmul(
         groups_per_supergroup_,
         supergroups_);
     templates.emplace_back("M", rows);
+    if (fast_gemv) {
+        templates.emplace_back("USE_NVQ3JL", nvq3jl_records_.has_value());
+    }
     templates.emplace_back(
         "TILE_M",
         effective_tile_rows);
@@ -3982,8 +4074,7 @@ array MlxVqWeight::packed_matmul(
             ? vq_mmq_kernel()
             : vq_matmul_kernel())
         );
-    auto outputs = kernel(
-        {
+    std::vector<array> inputs{
             indices_packed_,
             state_packed_,
             aux_packed_,
@@ -3994,7 +4085,12 @@ array MlxVqWeight::packed_matmul(
             bank_ids_,
             parameters_,
             source,
-        },
+    };
+    if (fast_gemv && nvq3jl_records_) {
+        inputs.front() = *nvq3jl_records_;
+    }
+    auto outputs = kernel(
+        std::move(inputs),
         {Shape{rows, output_size_}},
         {source.dtype()},
         grid,
