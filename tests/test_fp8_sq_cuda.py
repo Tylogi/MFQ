@@ -24,6 +24,8 @@ def extension():
 
 
 def _fixture(dtype: str):
+    from mfq.kernels.cuda.moe import _to_gpu_fp8_sq
+
     rows, columns = 8, 128
     rng = np.random.default_rng(20260912)
     source = rng.choice(E4M3_LEGAL_CODES, size=(rows, columns)).astype(np.uint8)
@@ -42,17 +44,14 @@ def _fixture(dtype: str):
             row_q_bits=q,
         )
     layout = parse_fp8_sq_layout(dtype, tensor.payload)
-    blob = torch.frombuffer(
-        bytearray(tensor.payload), dtype=torch.uint8
-    ).clone().cuda()
-    row_q = torch.tensor(layout.row_q_bits, dtype=torch.uint8, device="cuda")
-    row_offsets = torch.tensor(
-        layout.row_symbol_byte_offsets, dtype=torch.int32, device="cuda"
-    )
+    weight = _to_gpu_fp8_sq(tensor, "cuda")
     dense = torch.from_numpy(
         E4M3_VALUES[decode_fp8_sq_codes(tensor)].astype(np.float32)
     )
-    return tensor, layout, blob, row_q, row_offsets, dense
+    return (
+        tensor, layout, weight["blob"], weight["row_q"],
+        weight["row_symbol_byte_offsets"], dense,
+    )
 
 
 def _dequant(extension, dtype: str, fixture, fp32: bool):
@@ -170,7 +169,7 @@ def test_cuda_dense_dispatch_covers_decode_and_prefill(
     dense = fixture[-1].double()
     for rows in (0, 1, 2, 3, 4, 5, 6, 7, 16, 65):
         values = torch.linspace(-1.0, 1.0, max(1, rows * 128), dtype=torch.float32)
-        values = values[: rows * 128].reshape(rows, 128)
+        values = values[: rows * 128].reshape(rows, 128).to(activation_dtype)
         actual = _matmul(
             extension,
             dtype,
@@ -190,6 +189,7 @@ def test_cuda_dense_dispatch_covers_decode_and_prefill(
 def test_cuda_backward_input(extension, dtype: str, activation_dtype):
     fixture = _fixture(dtype)
     gradient = torch.linspace(-1.0, 1.0, 24, dtype=torch.float32).reshape(3, 8)
+    gradient = gradient.to(activation_dtype)
     actual = _backward_input(
         extension,
         dtype,
