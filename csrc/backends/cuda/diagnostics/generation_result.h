@@ -1,5 +1,6 @@
 #pragma once
 #include "engine/generation.h"
+#include <thread>
 
 namespace mfq::cuda::diagnostics {
 struct GenerationResult {
@@ -51,22 +52,41 @@ std::vector<int64_t> check_mtp_steps(Model& model, MtpModule& mtp,
         "request did not retain its MTP statistics");
     return tokens;
 }
-inline std::vector<int64_t> check_engine_steps(mfq::engine::Engine& engine,
+inline GenerationResult collect_engine_steps(mfq::engine::Engine& engine,
         std::vector<int64_t> prompt, MfqSamplingParams sampling) {
     mfq::engine::EngineRequest request;
     request.id = "check";
     request.token_ids = std::move(prompt); request.input.sampling = sampling;
     if (engine.admit(std::move(request)) != mfq::engine::Admission::accepted)
         throw std::runtime_error("diagnostic request was not admitted");
-    std::vector<int64_t> tokens;
-    bool terminal = false;
-    while (!terminal) for (auto& event : engine.step({"check"}).events) {
-        if (auto* failure = std::get_if<mfq::engine::Failed>(&event.data))
-            throw std::runtime_error(failure->message);
-        if (auto* delta = std::get_if<mfq::engine::OutputDelta>(&event.data))
-            tokens.insert(tokens.end(), delta->token_ids.begin(), delta->token_ids.end());
-        terminal |= mfq::engine::terminal(event.data);
+    GenerationResult result;
+    unsigned terminals = 0;
+    while (!terminals) {
+        auto step = engine.step({"check"});
+        for (auto& event : step.events) {
+            if (event.id != "check") throw std::runtime_error("unexpected diagnostic request ID");
+            if (auto* failure = std::get_if<mfq::engine::Failed>(&event.data))
+                throw std::runtime_error(failure->message);
+            if (std::holds_alternative<mfq::engine::Cancelled>(event.data))
+                throw std::runtime_error("diagnostic generation cancelled");
+            if (auto* progress = std::get_if<mfq::engine::PrefillProgress>(&event.data))
+                result.prefill = progress->timing;
+            if (auto* delta = std::get_if<mfq::engine::OutputDelta>(&event.data)) {
+                if (result.tokens.empty()) result.first_token = std::chrono::steady_clock::now();
+                result.tokens.insert(result.tokens.end(), delta->token_ids.begin(), delta->token_ids.end());
+            }
+            terminals += mfq::engine::terminal(event.data);
+        }
+        if (!terminals && !step.has_work)
+            throw std::runtime_error("diagnostic generation lost its terminal event");
+        if (terminals > 1 || (terminals && step.has_work))
+            throw std::runtime_error("diagnostic generation retired incorrectly");
+        if (!terminals && step.wake_at) std::this_thread::sleep_until(*step.wake_at);
     }
-    return tokens;
+    return result;
+}
+inline std::vector<int64_t> check_engine_steps(mfq::engine::Engine& engine,
+        std::vector<int64_t> prompt, MfqSamplingParams sampling) {
+    return collect_engine_steps(engine, std::move(prompt), sampling).tokens;
 }
 } // namespace mfq::cuda::diagnostics

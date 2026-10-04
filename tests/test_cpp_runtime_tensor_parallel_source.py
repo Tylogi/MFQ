@@ -84,7 +84,9 @@ def test_tensor_parallel_graph_capture_registers_all_participant_streams():
     assert "graph.compute_streams" in SOURCE
     assert "participant_streams" in SOURCE
     assert "bool graph_eligible() const" in SOURCE
-    assert "bool use_cuda_graph" in SOURCE
+    diagnostic = (CUDA_ROOT / "diagnostics" / "token_generation.h").read_text()
+    assert "collect_engine_steps(*engine" in diagnostic
+    assert "capture_begin" not in diagnostic
 
 
 def test_tensor_parallel_graph_primes_and_captures_nccl_peer_transfers():

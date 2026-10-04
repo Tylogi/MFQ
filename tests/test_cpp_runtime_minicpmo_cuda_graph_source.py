@@ -117,42 +117,21 @@ def test_minicpmo_persistent_decode_workspaces_are_warmed_before_capture() -> No
     ) == 2
     assert "model.metadata.decode_graph_double_warmup" in SOURCE
     assert "graph.ensure_captured(" in CUDA_RUNTIME
-    assert CUDA_RUNTIME.count("prepare_decode_graph_memory(model,") == 1
+    assert "model, *graph, sample, graph_participant_streams(" in SOURCE
 
 
-def test_graph_stage_events_start_after_decode_workspace_warmup() -> None:
-    graph_path = CUDA_RUNTIME.rsplit(
-        "MfqCudaGraph graph;", 1
-    )[1].split(
-        "graph.capture_end();", 1
-    )[0]
-    warmup = graph_path.index("model.next_token_static(")
-    profiler_reset = graph_path.index("profiler.reset();")
-    external_events = graph_path.index(
-        "profiler.graph_events = profile_cuda_graph;"
-    )
-    capture = graph_path.index("graph.capture_begin();")
-    assert warmup < profiler_reset < external_events < capture
-
-
-def test_graph_profile_covers_model_and_commit_boundaries() -> None:
-    graph_path = CUDA_RUNTIME.rsplit(
-        "MfqCudaGraph graph;", 1
-    )[1].split(
-        "graph.capture_end();", 1
-    )[0]
-    assert 'profiler.measure("decode.model_total"' in graph_path
-    assert 'profiler.measure("decode.commit"' in graph_path
-    assert graph_path.index('profiler.measure("decode.model_total"') < graph_path.index(
-        'profiler.measure("decode.commit"'
-    )
+def test_production_graph_warms_before_capture_and_commits_before_publish() -> None:
+    graph = (CUDA_ROOT / "engine/decode_graph.h").read_text().split(
+        "bool DecodeGraphCache::ensure_captured(", 1)[1]
+    assert graph.index("prepare_decode_graph_memory(") < graph.index("graph->capture_begin()")
+    assert graph.index("commit(static_next)") < graph.index("graph->capture_end()")
 
 
 def test_torch_reference_graph_can_emit_a_debug_dump() -> None:
     assert 'std::getenv("MFQ_TORCH_CUDA_GRAPH_DUMP")' in BACKEND_SOURCE
     assert "graph.enable_debug_mode();" in BACKEND_SOURCE
     assert "graph.debug_dump(debug_path);" in BACKEND_SOURCE
-    assert "mfq_debug_dump_cuda_graph(graph);" in SOURCE
+    assert "mfq_debug_dump_cuda_graph(*graph);" in SOURCE
 
 
 def test_backend_bf16_add_check_covers_eager_and_graph_paths() -> None:
@@ -285,11 +264,10 @@ def test_cuda_profiler_filter_supports_low_perturbation_eager_attribution() -> N
     assert '"MFQ_PROFILE_CUDA_FILTER"' in SOURCE
     assert "profiler.filter = config.profile_filter" in SOURCE
     assert "if (!enabled || !selected(name)) return fn();" in SOURCE
-    eager_path = CUDA_RUNTIME.rsplit("} else {", 1)[1].split(
-        "mfq_cuda_synchronize();", 1
-    )[0]
-    assert 'profiler.measure("decode.eager_model"' in eager_path
-    assert 'profiler.measure("decode.eager_commit"' in eager_path
+    diagnostic = (CUDA_ROOT / "diagnostics/token_generation.h").read_text()
+    assert "collect_engine_steps(*engine" in diagnostic
+    assert "graph.replay()" not in diagnostic
+    assert "model.next_token" not in diagnostic
 
 
 def test_bf16_head_to_token_candidate_is_exactly_stride_bounded() -> None:

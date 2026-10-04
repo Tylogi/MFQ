@@ -146,6 +146,7 @@ bool DecodeGraphCache::ensure_captured(
         static_next = sample();
         commit(static_next);
         graph->capture_end();
+        mfq_debug_dump_cuda_graph(*graph);
         set_key(candidate_len, sampling, candidate_greedy);
         ++captures;
     } catch (...) {

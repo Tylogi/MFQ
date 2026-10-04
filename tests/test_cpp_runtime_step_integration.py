@@ -143,3 +143,25 @@ def test_stdio_step_lifecycle(batch_size: int, tmp_path: Path) -> None:
                     await process.wait()
 
     asyncio.run(run())
+
+
+def test_diagnostic_engine_generation() -> None:
+    import subprocess
+
+    model = os.environ.get("MFQ_STEP_TEST_MODEL")
+    if not model:
+        pytest.skip("real-weight model not configured")
+    command = [str(ROOT / "build/csrc/mfq-diagnostics"), "--model", model,
+               "--ctx-size", "64", "--ids", "1,2,3", "--gen", "16"]
+    outputs = []
+    for graph in ("0", "1"):
+        result = subprocess.run(command, env={**os.environ, "MFQ_CUDA_GRAPH": graph},
+                                capture_output=True, text=True, timeout=60, check=True)
+        fields = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        assert fields["generation_path"] == "engine_step"
+        tokens = fields["generated_ids"].split(",")
+        assert len(tokens) == 16 and int(fields["decode_tokens"]) == 15
+        assert float(fields["decode_sec"]) > 0
+        assert "decode_steady_tok_per_s" not in fields
+        outputs.append(tokens)
+    assert outputs[0] == outputs[1]

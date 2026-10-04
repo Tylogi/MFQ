@@ -335,6 +335,7 @@ std::unique_ptr<TextProcessor> TextProcessor::load(const ModelSource& source,
             reinterpret_cast<const std::uint8_t*>(bytes.data()),
             reinterpret_cast<const std::uint8_t*>(bytes.data()) + bytes.size()), vocabulary, model_type);
     }
+    if (tokenizer_path.empty()) return {}; // Raw token Engine requests need no tokenizer.
     return std::make_unique<TextProcessor>(tokenizer_path, vocabulary, model_type);
 }
 

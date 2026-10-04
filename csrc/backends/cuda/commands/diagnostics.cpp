@@ -427,12 +427,21 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             context_size = (int64_t)(
                 ids_file.empty() ? parse_ids(ids_arg) : load_ids_file(ids_file)).size();
         }
+        const bool model_check = check_continuous_batching || check_flash_next ||
+            check_flash_next_mtp || check_qwen35_mtp || !bench_qwen35_mtp.empty() ||
+            !prefill_sweep_sizes.empty() || compare_dsv4_hc_ops || compare_dsv4_hc_model ||
+            !block_trace_reference.empty() || !block_trace_output.empty() ||
+            compare_decode_splitk || compare_mma_decode || compare_nvq_vec4 ||
+            prefill_repeat > 0 || compare_mma_attention;
+        if (!model_check)
+            return generate_diagnostic_tokens(*this,
+                ids_file.empty() ? parse_ids(ids_arg) : load_ids_file(ids_file), gen, profile);
         execution.profiler.enabled = false;
         mfq_tensor_backend::NoGradGuard no_grad;
         return with_loaded_cuda_model(execution, *this,
             check_qwen35_mtp || check_flash_next_mtp || !bench_qwen35_mtp.empty(),
             [&](auto& model, auto& runtime_components,
-                    auto t0, auto t1) -> int {
+                    auto, auto) -> int {
         using Model = std::remove_cvref_t<decltype(model)>;
         if (check_continuous_batching) {
             if constexpr (std::is_same_v<Model, mfq::cuda::Qwen35CausalLm>) {
@@ -749,8 +758,7 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             std::cout << "attention_compare_same_top=" << (same_top.template item<bool>() ? 1 : 0) << "\n";
             return 0;
         }
-        return generate_diagnostic_tokens(
-            execution, model, ids, gen, profile, t0, t1);
+        throw std::logic_error("unhandled model diagnostic mode");
             });
     }); }
 };
