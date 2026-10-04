@@ -71,7 +71,7 @@ def test_continuous_batching_is_an_explicit_server_mode():
     assert "worker_" not in BATCHING
     assert "queue_" not in BATCHING
     assert "queue_mutex_" not in BATCHING
-    assert "batch_compatible(constEngineRequest&request," in "".join(DECODE.split())
+    assert "batch_compatible" not in DECODE
     assert "run_exclusive_generation" not in BATCHING
 
 

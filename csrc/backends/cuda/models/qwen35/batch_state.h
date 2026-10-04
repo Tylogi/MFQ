@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../native/tensor_backend.h"
+#include "models/common/causal_metadata.h"
 
 #include <cstdint>
 #include <memory>
@@ -40,6 +41,10 @@ struct QwenBatchLayerState {
 struct QwenBatchState {
     std::int64_t batch = 0;
     std::vector<QwenBatchLayerState> layers;
+    mfq::models::CausalState causal;
+
+    static QwenBatchState empty(const Qwen35CausalLm &model);
+    void swap(Qwen35CausalLm &model) noexcept;
 };
 
 struct QwenPagedKvStats {

@@ -10,6 +10,7 @@
 #include "request_executor.h"
 #include "generation_flow.h"
 #include "models/qwen35/linear_attention.h"
+#include "models/qwen35/mtp.h"
 #include "models/common/full_block.h"
 
 #include <cuda_runtime_api.h>
@@ -59,7 +60,7 @@ struct CudaEngineState {
         const auto chunk = std::min<std::size_t>(context, config.generation.prefill_chunk_size);
         const auto hidden = std::size_t(language.hidden_size());
         const bool batch = config.continuous_batch.max_sequences != 0;
-        const std::size_t kv_copies = batch ? (config.continuous_batch.paged_kv ? 1 : 4) : 3;
+        const std::size_t kv_copies = batch ? 4 : 3;
         const std::size_t recurrent_copies = batch ? 4 : 3;
         const std::size_t graph_copies = batch ? 8 : 1;
         for (const auto& block : language.blocks) {
@@ -95,6 +96,12 @@ struct CudaEngineState {
         cache.limit_snapshot_bytes(snapshot_budget == std::size_t(-1) ? 0 : snapshot_budget);
         const auto primary = execution->layer_placement.primary_device();
         add(primary, product({8, std::size_t(language.vocab_size())}));
+        if (auto *predictor = dynamic_cast<Qwen35Mtp *>(components.mtp.get()))
+            for (const auto &block : predictor->blocks) {
+                const auto &full = dynamic_cast<const FullBlock &>(*block);
+                add(block->cuda_device, product({3, 2, 2, context + 1024,
+                    std::size_t(full.kv_heads), std::size_t(full.attention_head_dim)}));
+            }
         if (components.composite) add(primary, components.composite->state_memory_bytes());
         for (const auto* devices : {&execution->tensor_parallel.devices,
                                    &execution->expert_parallel.devices,
@@ -145,8 +152,8 @@ struct CudaEngineState {
             else throw std::invalid_argument("continuous batching is unavailable for this model");
         }
     }
-    bool can_batch(const EngineRequest& request) const {
-        return batching && batch_compatible(request, cache.persistent_prefix_enabled(), bool(components.mtp));
+    bool can_batch(const EngineRequest&) const {
+        return bool(batching);
     }
     bool exclusive() const { return duplex_active; }
     bool mtp_available() const { return bool(components.mtp); }
@@ -172,8 +179,67 @@ struct CudaEngineState {
                                   batched ? batching.get() : nullptr, id);
     }
     Generation generate(const RequestId& id, ExecutionRequest& request) {
-        if (request.batched) graph.invalidate();
+        if constexpr (std::is_same_v<Model, Qwen35CausalLm>) {
+            if (request.batched && (request.input.vision ||
+                    !request.input.cache_plan.session_id.empty() ||
+                    (cache.persistent_prefix_enabled() && request.input.cache_plan.stable_prefix_tokens) ||
+                    (request.input.sampling.enable_mtp && components.mtp)))
+                return generate_owned(id, request);
+        }
         return generate_prepared(*this, request.input, request.output, id, request.batched);
+    }
+    Generation generate_owned(const RequestId& id, ExecutionRequest& request)
+        requires std::is_same_v<Model, Qwen35CausalLm> {
+        auto native = qwen35::QwenBatchState::empty(language);
+        auto *predictor = dynamic_cast<Qwen35Mtp *>(components.mtp.get());
+        std::optional<Qwen35Mtp::RequestState> predictor_state;
+        if (predictor) predictor_state.emplace(*predictor);
+        DecodeGraphCache request_graph(language.max_position_embeddings());
+        struct Ops {
+            using Prepared = CudaPreparedPrompt;
+            CudaEngineState &owner;
+            DecodeGraphCache &graph;
+            auto prepare(InferenceRequest &input) { return owner.prepare(input); }
+            auto advance_preparation(mfq::StepSequence<Prepared> &sequence) {
+                return owner.advance_preparation(sequence);
+            }
+            Generation generate_text(InferenceRequest &input, InferenceOutput &output,
+                    std::optional<Prepared> prepared, const RequestId &id, bool) {
+                return internal::generate(owner.language, graph, owner.cache, owner.config,
+                    input, output, owner.components.mtp.get(), std::move(prepared), nullptr, id);
+            }
+        } ops{*this, request_graph};
+        struct Binding {
+            Model &model;
+            qwen35::QwenBatchState &native;
+            Qwen35Mtp *predictor;
+            std::optional<Qwen35Mtp::RequestState> &predictor_state;
+            Binding(Model &m, qwen35::QwenBatchState &n, Qwen35Mtp *p,
+                    std::optional<Qwen35Mtp::RequestState> &s)
+                : model(m), native(n), predictor(p), predictor_state(s) { swap(); }
+            void swap() noexcept {
+                native.swap(model);
+                if (predictor) predictor_state->swap(*predictor);
+            }
+            ~Binding() { swap(); }
+        };
+        // A suspended coroutine never leaves its state attached to shared weights.
+        // MTP verification remains a per-request quantum; ordinary rows still batch.
+        auto sequence = generate_prepared(ops, request.input, request.output, id, false);
+        ExecutionCleanup cleanup{request.output.cleanup_failure, [&] {
+            Binding binding(language, native, predictor, predictor_state);
+            sequence = {};
+        }};
+        while (true) {
+            decltype(sequence.next()) step;
+            {
+                Binding binding(language, native, predictor, predictor_state);
+                step = sequence.next();
+            }
+            if (!step) break;
+            co_yield std::move(step);
+        }
+        cleanup.finish();
     }
     mfq::StepSequence<ControlCompletion> start_duplex(MfqDuplexSessionParams parameters) {
         auto start = components.composite->start(std::move(parameters));

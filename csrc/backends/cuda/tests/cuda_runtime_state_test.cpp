@@ -11,6 +11,7 @@
 #include "models/qwen35/linear_attention.h"
 #include "models/qwen35/ops.h"
 #include "models/qwen35/batch_state.h"
+#include "models/qwen35/mtp.h"
 #include "storage/session_state.h"
 #include "../ops/moe.h"
 #include "storage/mfe_expert_store.h"
@@ -507,6 +508,38 @@ static void check_batch_state_ownership() {
           "cancelled prefill corrupted decode state");
     adapter.release(first); adapter.finish_retire(0);
     check(first.slot() == -1 && second.slot() == -1, "request retained a retired slot");
+    auto linear = std::make_unique<qwen35::LinearAttentionBlock>();
+    auto *recurrent = linear.get();
+    model.blocks.push_back(std::move(linear));
+    auto owned = qwen35::QwenBatchState::empty(model);
+    const auto original = full->state;
+    owned.swap(model);
+    model.cache_pos = 7; model.decode_position_delta = 11; model.speculative_start = 6;
+    recurrent->state->speculative_pending = true;
+    const auto speculative = recurrent->state;
+    owned.swap(model);
+    check(full->state == original && model.cache_pos == 0 && model.speculative_start == -1 &&
+        !recurrent->state->speculative_pending, "suspended request leaked speculative metadata");
+    owned.swap(model);
+    check(model.cache_pos == 7 && model.decode_position_delta == 11 && model.speculative_start == 6 &&
+        recurrent->state == speculative && recurrent->state->speculative_pending,
+        "request binding lost speculative state");
+    owned.swap(model);
+    Qwen35Mtp predictor;
+    predictor.blocks.push_back(std::make_unique<FullBlock>());
+    Qwen35Mtp::RequestState predictor_state(predictor);
+    auto *predictor_block = static_cast<FullBlock *>(predictor.blocks[0].get());
+    const auto original_predictor = predictor_block->state;
+    predictor_state.swap(predictor);
+    predictor.cache_pos = 9; predictor.last_accepted = 3;
+    predictor_block->state->cache = KVCache(1, 1, 16, 4);
+    const auto request_predictor = predictor_block->state;
+    predictor_state.swap(predictor);
+    check(predictor.cache_pos == 0 && predictor.last_accepted == 0 &&
+        predictor_block->state == original_predictor, "predictor request state leaked");
+    predictor_state.swap(predictor);
+    check(predictor.cache_pos == 9 && predictor.last_accepted == 3 &&
+        predictor_block->state == request_predictor, "predictor request state was lost");
 }
 
 static void check_snapshots(CudaExecutionContext& execution, bool hybrid) {
@@ -629,6 +662,52 @@ static void check_snapshots(CudaExecutionContext& execution, bool hybrid) {
     std::filesystem::remove_all(directory);
 }
 
+static void check_interleaved_request(mfq::engine::Engine& engine,
+        const mfq::engine::EngineRequest& feature, const std::vector<int64_t>& reference) {
+    using namespace mfq::engine;
+    EngineRequest text;
+    text.id = "peer"; text.token_ids = {101, 202, 303};
+    text.input.sampling.temperature = 0; text.input.sampling.max_tokens = 32;
+    text.input.sampling.enable_mtp = feature.input.sampling.enable_mtp;
+    const auto text_reference = mfq::cuda::diagnostics::check_engine_steps(
+        engine, text.token_ids, text.input.sampling);
+    for (bool cancel : {false, true, false}) {
+        check(engine.admit(EngineRequest(feature)) == Admission::accepted &&
+            engine.admit(EngineRequest(text)) == Admission::accepted,
+            "feature request blocked peer admission");
+        std::vector<int64_t> actual, peer;
+        int feature_terminal = 0, peer_terminal = 0;
+        bool peer_progress = false;
+        for (int tick = 0; tick < 2000 && (!feature_terminal || !peer_terminal); ++tick) {
+            if (cancel && tick == 8) engine.cancel(feature.id);
+            const bool paused = tick >= 3 && tick < 7;
+            auto step = engine.step(paused ? std::vector<RequestId>{text.id} :
+                std::vector<RequestId>{feature.id, text.id});
+            for (const auto& event : step.events) {
+                if (const auto* error = std::get_if<Failed>(&event.data)) throw std::runtime_error(error->message);
+                const bool is_peer = event.id == text.id;
+                if (auto* delta = std::get_if<OutputDelta>(&event.data)) {
+                    auto& tokens = is_peer ? peer : actual;
+                    tokens.insert(tokens.end(), delta->token_ids.begin(), delta->token_ids.end());
+                    peer_progress |= is_peer && !feature_terminal;
+                    check(is_peer || !paused, "paused feature request advanced");
+                }
+                if (terminal(event.data)) {
+                    ++(is_peer ? peer_terminal : feature_terminal);
+                    if (!is_peer) check(std::holds_alternative<Cancelled>(event.data) == cancel,
+                        "interleaved feature terminal changed");
+                }
+            }
+            if (step.wake_at) std::this_thread::sleep_until(*step.wake_at);
+        }
+        check(feature_terminal == 1 && peer_terminal == 1 && !engine.step({}).has_work &&
+            engine.status().available == engine.info().max_requests, "interleaved cleanup failed");
+        check(peer == text_reference && (cancel || actual == reference),
+            "interleaved request differs from serial oracle");
+        if (!cancel) check(peer_progress, "feature request blocked peer decode");
+    }
+}
+
 static void check_media_steps(mfq::engine::Engine& engine, const char* model_path) {
     using namespace mfq::engine;
     if (!engine.info().capabilities.image_input) return;
@@ -674,6 +753,7 @@ static void check_media_steps(mfq::engine::Engine& engine, const char* model_pat
         return std::pair{tokens, preparation_steps};
     };
     const auto [reference, steps] = run();
+    check_interleaved_request(engine, image, reference);
     check(steps >= vision.depth + 2, "image encoder did not yield between layers");
     for (const auto stop : {int64_t(0), int64_t(2), 2 + vision.depth / 2, 2 + vision.depth}) {
         auto interrupted = image;
@@ -692,6 +772,14 @@ static void check_media_steps(mfq::engine::Engine& engine, const char* model_pat
               "image cancellation did not release before its terminal");
         check(engine.step({}).events.empty(), "image emitted after cancellation");
         check(run().first == reference, "image cancellation changed subsequent output");
+    }
+    if (engine.info().capabilities.mtp) {
+        image.input.sampling.enable_mtp = true;
+        image.input.cache_plan.session_id = "image-mtp";
+        image.input.cache_plan.stable_prefix_tokens = 6;
+        const auto mtp_reference = run().first;
+        check_interleaved_request(engine, image, mtp_reference);
+        std::cout << "CUDA interleaved image/session/MTP checks passed\n";
     }
     std::cout << "CUDA media step checks passed layers=" << vision.depth << " cancellation=4\n";
 }
@@ -776,6 +864,7 @@ static void check_batching(const char* model_path, const char* tokenizer) {
     session_request.input.cache_plan.stable_prefix_tokens = session_request.token_ids.size() - 1;
     session_run(3); // Cancel inside a layered snapshot restore.
     const auto restored_tokens = session_run(-1);
+    check_interleaved_request(*engine, session_request, restored_tokens);
     engine->session({SessionCommand::Kind::clear});
     check(session_run(-1) == restored_tokens, "restored session changed greedy tokens");
     session_request.token_ids = previous_prompt;
@@ -783,6 +872,14 @@ static void check_batching(const char* model_path, const char* tokenizer) {
     engine->session({SessionCommand::Kind::clear});
     session_run(12); // Eight prefill chunks followed by layered capture.
     check(session_run(-1) == session_reference, "cancelled capture changed greedy tokens");
+    if (engine->info().capabilities.mtp) {
+        session_request.input.sampling.enable_mtp = true;
+        session_request.input.sampling.max_tokens = 32;
+        engine->session({SessionCommand::Kind::clear});
+        const auto mtp_reference = session_run(-1);
+        check_interleaved_request(*engine, session_request, mtp_reference);
+        std::cout << "CUDA interleaved session/MTP checks passed\n";
+    }
     check_media_steps(*engine, model_path);
 }
 

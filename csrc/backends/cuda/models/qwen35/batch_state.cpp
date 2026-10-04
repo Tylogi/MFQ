@@ -16,6 +16,30 @@ using LinearBlock = LinearAttentionBlock;
 using mfq::cuda::continuous::QwenPagedKvArena;
 using mfq::cuda::continuous::QwenPagedKvSequence;
 
+QwenBatchState QwenBatchState::empty(const Qwen35CausalLm &model) {
+    QwenBatchState result;
+    result.batch = 1;
+    for (const auto &block : model.blocks) {
+        QwenBatchLayerState layer;
+        if (dynamic_cast<const FullBlock *>(block.get()))
+            layer.full = std::make_shared<FullAttentionState>();
+        else if (dynamic_cast<const LinearBlock *>(block.get()))
+            layer.recurrent = std::make_shared<LinearAttentionState>();
+        else throw std::runtime_error("unsupported Qwen request state");
+        result.layers.push_back(std::move(layer));
+    }
+    return result;
+}
+
+void QwenBatchState::swap(Qwen35CausalLm &model) noexcept {
+    for (size_t i = 0; i < layers.size(); ++i) {
+        if (layers[i].full)
+            layers[i].full.swap(static_cast<FullBlock *>(model.blocks[i].get())->state);
+        else layers[i].recurrent.swap(static_cast<LinearBlock *>(model.blocks[i].get())->state);
+    }
+    std::swap(causal, static_cast<mfq::models::CausalState &>(model));
+}
+
 Qwen35BatchStateAdapter::~Qwen35BatchStateAdapter() = default;
 
 Qwen35BatchStateAdapter::Qwen35BatchStateAdapter(Qwen35CausalLm &model, std::size_t slots,

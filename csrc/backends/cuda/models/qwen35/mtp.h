@@ -17,6 +17,29 @@ struct Qwen35Mtp final : MtpModule {
     CudaExecutionContext *execution = nullptr;
     int64_t cache_pos = 0;
 
+    struct RequestState {
+        std::vector<std::shared_ptr<FullAttentionState>> layers;
+        int64_t cache_pos = 0;
+        mfq::engine::mtp::GenerationStats stats;
+        uint64_t cycles = 0, accepted = 0, rejected = 0;
+        explicit RequestState(const Qwen35Mtp &model) {
+            for (const auto &block : model.blocks) {
+                MFQ_RUNTIME_CHECK(dynamic_cast<const FullBlock *>(block.get()),
+                    "Qwen predictor requires full attention state");
+                layers.push_back(std::make_shared<FullAttentionState>());
+            }
+        }
+        void swap(Qwen35Mtp &model) noexcept {
+            for (size_t i = 0; i < layers.size(); ++i)
+                layers[i].swap(static_cast<FullBlock *>(model.blocks[i].get())->state);
+            std::swap(cache_pos, model.cache_pos);
+            std::swap(stats, model.last_stats);
+            std::swap(cycles, model.last_cycles);
+            std::swap(accepted, model.last_accepted);
+            std::swap(rejected, model.last_rejected);
+        }
+    };
+
     static std::optional<Qwen35Mtp> load_if_present(const mfq::ModelSource &file,
                                                     const mfq::cuda::qwen35::Config &main,
                                                     CudaExecutionContext &execution) {
