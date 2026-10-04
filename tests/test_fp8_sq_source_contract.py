@@ -4,8 +4,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_public_formats_keep_distinct_scale_kernels() -> None:
-    source = (ROOT / "mfq/kernels/cuda/fp8_sq.cu").read_text()
-    header = (ROOT / "mfq/kernels/cuda/fp8_sq.h").read_text()
+    source = (ROOT / "csrc/backends/cuda/kernels/fp8_sq.cu").read_text()
+    header = (ROOT / "csrc/backends/cuda/kernels/fp8_sq.h").read_text()
     assert source.count("__global__ void mxfp8_sq_mmq_kernel(") == 1
     assert source.count("__global__ void fp8_128_sq_mmq_kernel(") == 1
     assert "decode_e8m0" in source
@@ -26,7 +26,7 @@ def test_public_formats_keep_distinct_scale_kernels() -> None:
 
 
 def test_cuda_dense_dispatch_keeps_packed_decode_and_transient_gemm() -> None:
-    source = (ROOT / "mfq/kernels/cuda/fp8_sq.cu").read_text()
+    source = (ROOT / "csrc/backends/cuda/kernels/fp8_sq.cu").read_text()
     assert "constexpr int kDirectPackedMaxRows = 48;" in source
     assert "if (rows > kDirectPackedMaxRows)" in source
     assert "auto weight = dequant<MXFP8>(" in source
@@ -65,14 +65,14 @@ def test_cuda_builds_include_fp8_sq_once() -> None:
     cmake = (ROOT / "csrc/backends/cuda/CMakeLists.txt").read_text()
     extension = (ROOT / "mfq/kernels/cuda/_ext.py").read_text()
     assert cmake.count("${MFQ_CUDA_KERNEL_ROOT}/fp8_sq.cu") == 1
-    assert extension.count('os.path.join(_DIR, "fp8_sq.cu")') == 1
+    assert extension.count('os.path.join(_KERNEL_DIR, "fp8_sq.cu")') == 1
 
 
 def test_wire_parser_and_runtime_share_the_three_bit_descriptor() -> None:
     parser = (
         ROOT / "csrc/core/include/mfq/fp8_sq_blob.h"
     ).read_text()
-    cuda = (ROOT / "mfq/kernels/cuda/fp8_sq.cu").read_text()
+    cuda = (ROOT / "csrc/backends/cuda/kernels/fp8_sq.cu").read_text()
     assert "row * 3" in parser
     assert "read_q(data + kHeaderBytes" in parser
     assert "const int bits = static_cast<int>(row_q[output]);" in cuda

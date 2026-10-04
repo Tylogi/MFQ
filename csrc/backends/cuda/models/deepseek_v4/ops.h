@@ -10,8 +10,8 @@
 #include "models/deepseek_v4/causal_lm.h"
 
 #include "models/common/causal_model_ops.h"
-#include "mfq/kernels/cuda/deepseek_v4_attention.h"
-#include "mfq/kernels/cuda/deepseek_v4_hc.h"
+#include "csrc/backends/cuda/kernels/deepseek_v4_attention.h"
+#include "csrc/backends/cuda/kernels/deepseek_v4_hc.h"
 #include "models/common/block.h"
 #include "models/deepseek_v4/config.h"
 #include "models/common/ffn.h"

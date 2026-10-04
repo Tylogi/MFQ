@@ -21,13 +21,13 @@ CUDA_OPTIONS = (CUDA_ROOT / "include/mfq/cuda/engine.h").read_text(
 MINICPM_ENGINE = (
     CUDA_ROOT / "models" / "minicpmo45" / "components.cpp"
 ).read_text(encoding="utf-8")
-ROPE = (ROOT / "mfq" / "kernels" / "cuda" / "rope.cu").read_text(
+ROPE = (ROOT / "csrc" / "backends" / "cuda" / "kernels" / "rope.cu").read_text(
     encoding="utf-8"
 )
-ATTENTION = (ROOT / "mfq" / "kernels" / "cuda" / "attention.cu").read_text(
+ATTENTION = (ROOT / "csrc" / "backends" / "cuda" / "kernels" / "attention.cu").read_text(
     encoding="utf-8"
 )
-NORM = (ROOT / "mfq" / "kernels" / "cuda" / "norm.cu").read_text(
+NORM = (ROOT / "csrc" / "backends" / "cuda" / "kernels" / "norm.cu").read_text(
     encoding="utf-8"
 )
 GRAPH = "\n".join(

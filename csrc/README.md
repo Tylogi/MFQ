@@ -55,10 +55,14 @@ model and Engine code must not depend on concrete backend headers.
 CUDA's public header is `backends/cuda/include/mfq/cuda/engine.h`, containing
 load options and `load_cuda_engine()`. Tensor/context headers stay in `native/`,
 operator headers beside their sources in `ops/`, model plans in `models/`,
-and execution configuration in `engine/`. `kernels/` contains internal kernel
-declarations; the shared `.cu/.cuh` implementations remain in `mfq/kernels/cuda/`
-until the pending source/package migration. Implementation include paths are
-PRIVATE, and old paths have no forwarding headers.
+and execution configuration in `engine/`. `kernels/` owns the shared CUDA
+sources and headers. CMake builds all native kernels; `mfq/kernels/cuda/_ext.py`
+builds the subset exposed by the Python bindings, from these same sources.
+The Python package keeps wrappers and `mfq_cuda.cpp` only. Python extension
+builds require this source checkout, including when using an editable install.
+Python keeps its existing fast-math flags; native fast-math remains limited to
+the attention kernels. Implementation include paths are PRIVATE, and old paths
+have no forwarding headers.
 
 CUDA text and prepared grid-Vision requests share one
 restore/prefill/output/snapshot lifecycle. Media embeddings, positions, cache

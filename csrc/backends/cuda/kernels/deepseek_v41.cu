@@ -1,4 +1,4 @@
-#include "mfq/kernels/cuda/deepseek_v41.h"
+#include "csrc/backends/cuda/kernels/deepseek_v41.h"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>

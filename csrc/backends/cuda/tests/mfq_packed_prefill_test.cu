@@ -1,6 +1,6 @@
 #include "../native/tensor_backend.h"
-#include "mfq/kernels/cuda/fp8_sq.h"
-#include "mfq/kernels/cuda/mxfp4_sq.h"
+#include "csrc/backends/cuda/kernels/fp8_sq.h"
+#include "csrc/backends/cuda/kernels/mxfp4_sq.h"
 #include <cmath>
 #include <cstdlib>
 #include <iostream>

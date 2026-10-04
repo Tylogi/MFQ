@@ -12,7 +12,7 @@
 #include "minicpmo45.h"
 #include "../ops/cuda_execution.h"
 #include "storage/moe_expert_cache.h"
-#include "mfq/kernels/cuda/deepseek_v41.h"
+#include "csrc/backends/cuda/kernels/deepseek_v41.h"
 
 #include <algorithm>
 #include <chrono>

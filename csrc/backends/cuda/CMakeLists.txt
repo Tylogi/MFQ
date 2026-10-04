@@ -1,7 +1,7 @@
 # Native CUDA backend.
 
 set(MFQ_CUDA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
-set(MFQ_CUDA_KERNEL_ROOT "${MFQ_REPOSITORY_ROOT}/mfq/kernels/cuda")
+set(MFQ_CUDA_KERNEL_ROOT "${MFQ_CUDA_ROOT}/kernels")
 
 enable_language(CUDA)
 set(CMAKE_CUDA_STANDARD 17)
@@ -201,7 +201,7 @@ if(BUILD_TESTING)
         mfq-cuda-native-kernels)
     target_compile_definitions(mfq-cuda-storage-offset-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     mfq_add_cuda_test(mfq-flash-next-test
-        ${MFQ_CUDA_ROOT}/tests/mfq_flash_next_test.cu
+        ${MFQ_CUDA_ROOT}/tests/mfq_flash_next_test.cpp
         mfq-cuda-native-kernels mfq-json)
     target_compile_definitions(mfq-flash-next-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     target_include_directories(mfq-flash-next-test PRIVATE

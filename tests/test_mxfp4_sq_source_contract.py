@@ -40,7 +40,7 @@ def test_metal_runtime_builds_only_the_unified_mxfp4_sq_implementation() -> None
 
 
 def test_cuda_dense_and_routed_sq_share_one_compute_kernel_definition() -> None:
-    source = (ROOT / "mfq/kernels/cuda/mxfp4_sq.cu").read_text()
+    source = (ROOT / "csrc/backends/cuda/kernels/mxfp4_sq.cu").read_text()
     assert source.count("__global__ void sq_mmq(") == 1
     assert "sq_mmq<1, __half, true>" in source
     assert "template<int BITS" not in source

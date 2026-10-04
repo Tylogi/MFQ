@@ -1,5 +1,5 @@
 #include <cuda_fp16.h>
-#include "mfq/kernels/cuda/deepseek_v4_hc.h"
+#include "csrc/backends/cuda/kernels/deepseek_v4_hc.h"
 #include "csrc/backends/cuda/native/tensor_backend.h"
 #include <cuda_runtime.h>
 

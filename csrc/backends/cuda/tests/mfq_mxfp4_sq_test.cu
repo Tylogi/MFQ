@@ -1,4 +1,4 @@
-#include "mfq/kernels/cuda/mxfp4_sq.h"
+#include "csrc/backends/cuda/kernels/mxfp4_sq.h"
 #include "mfq/mxfp4_sq_decode.h"
 
 #include <cmath>

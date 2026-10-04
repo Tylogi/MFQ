@@ -1,8 +1,8 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-NVQ = (ROOT / "mfq/kernels/cuda/nvq_matmul.cu").read_text()
-ASYNC_COPY = (ROOT / "mfq/kernels/cuda/async_copy.cuh").read_text()
+NVQ = (ROOT / "csrc/backends/cuda/kernels/nvq_matmul.cu").read_text()
+ASYNC_COPY = (ROOT / "csrc/backends/cuda/kernels/async_copy.cuh").read_text()
 CUDA_OPS = ROOT / "csrc/backends/cuda/ops"
 RUNTIME = "\n".join(
     path.read_text()

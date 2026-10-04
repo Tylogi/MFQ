@@ -7,9 +7,9 @@
 #include "../deepseek_v4/ops.h"
 #include "dspark.h"
 #include "engram.h"
-#include "mfq/kernels/cuda/deepseek_v41.h"
-#include "mfq/kernels/cuda/deepseek_v4_attention.h"
-#include "mfq/kernels/cuda/deepseek_v4_hc.h"
+#include "csrc/backends/cuda/kernels/deepseek_v41.h"
+#include "csrc/backends/cuda/kernels/deepseek_v4_attention.h"
+#include "csrc/backends/cuda/kernels/deepseek_v4_hc.h"
 #include "models/deepseek_v41/config.h"
 #include "models/common/ffn.h"
 

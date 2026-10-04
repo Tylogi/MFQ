@@ -5,7 +5,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_cuda_row_kernel_consumes_packed_q_and_k():
-    source = (ROOT / "mfq/kernels/cuda/embedding.cu").read_text()
+    source = (ROOT / "csrc/backends/cuda/kernels/embedding.cu").read_text()
     kernel = source.split("__global__ void nint_selected_rows_kernel(", 1)[1].split(
         "__global__ void nint8_zero_embedding_kernel(", 1)[0]
     assert "qbits = layout & 15u" in kernel

@@ -281,7 +281,8 @@ inline void mfq_prepare_cuda_graph_memory(
 inline void mfq_debug_dump_cuda_graph(MfqCudaGraph& graph) {
     const char* debug_path = std::getenv("MFQ_TORCH_CUDA_GRAPH_DUMP");
     if (debug_path != nullptr && debug_path[0] != '\0') {
-        graph.debug_dump(debug_path);
+        C10_CUDA_CHECK(cudaGraphDebugDotPrint(graph.raw_cuda_graph(), debug_path,
+            cudaGraphDebugDotFlagsVerbose));
     }
 }
 

@@ -9,7 +9,7 @@
 #include "storage/weight_loader.h"
 #include "../ops/cuda_execution.h"
 #include "qwen35/linear_attention.h"
-#include "mfq/kernels/cuda/deepseek_v41.h"
+#include "csrc/backends/cuda/kernels/deepseek_v41.h"
 #include "nlohmann/json.hpp"
 
 #include <algorithm>

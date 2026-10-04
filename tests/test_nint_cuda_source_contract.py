@@ -5,11 +5,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NINT = (ROOT / "mfq/kernels/cuda/nint_matmul.cu").read_text()
+NINT = (ROOT / "csrc/backends/cuda/kernels/nint_matmul.cu").read_text()
 BINDINGS = (ROOT / "mfq/kernels/cuda/mfq_cuda.cpp").read_text()
 EXTENSION = (ROOT / "mfq/kernels/cuda/_ext.py").read_text()
 CMAKE = (ROOT / "csrc/backends/cuda/CMakeLists.txt").read_text()
-MOE = (ROOT / "mfq/kernels/cuda/moe.cu").read_text()
+MOE = (ROOT / "csrc/backends/cuda/kernels/moe.cu").read_text()
 MOE_PYTHON = (ROOT / "mfq/kernels/cuda/moe.py").read_text()
 CUDA_ROOT = ROOT / "csrc/backends/cuda"
 RUNTIME = "\n".join(

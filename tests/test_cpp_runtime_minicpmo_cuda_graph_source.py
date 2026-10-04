@@ -44,13 +44,14 @@ SOURCE = "\n".join(
     CUDA_ROOT / "commands" / "diagnostics.cpp"
 ).read_text(encoding="utf-8")
 ATTENTION_SOURCE = (
-    Path(__file__).parents[1] / "mfq" / "kernels" / "cuda" / "attention.cu"
+    Path(__file__).parents[1] / "csrc" / "backends" / "cuda" / "kernels" / "attention.cu"
 ).read_text(encoding="utf-8")
 ATTENTION_MMA_SOURCE = (
     Path(__file__).parents[1]
-    / "mfq"
-    / "kernels"
+    / "csrc"
+    / "backends"
     / "cuda"
+    / "kernels"
     / "attention_mma.cu"
 ).read_text(encoding="utf-8")
 BACKEND_SOURCE = (
@@ -68,10 +69,10 @@ NATIVE_TENSOR_SOURCE = (
     Path(__file__).parents[1] / "csrc" / "backends" / "cuda" / "native" / "tensor.cu"
 ).read_text(encoding="utf-8")
 KV_CACHE_SOURCE = (
-    Path(__file__).parents[1] / "mfq" / "kernels" / "cuda" / "kv_cache.cu"
+    Path(__file__).parents[1] / "csrc" / "backends" / "cuda" / "kernels" / "kv_cache.cu"
 ).read_text(encoding="utf-8")
 ACC_SOURCE = (
-    Path(__file__).parents[1] / "mfq" / "kernels" / "cuda" / "acc.cu"
+    Path(__file__).parents[1] / "csrc" / "backends" / "cuda" / "kernels" / "acc.cu"
 ).read_text(encoding="utf-8")
 
 
@@ -130,7 +131,7 @@ def test_production_graph_warms_before_capture_and_commits_before_publish() -> N
 def test_torch_reference_graph_can_emit_a_debug_dump() -> None:
     assert 'std::getenv("MFQ_TORCH_CUDA_GRAPH_DUMP")' in BACKEND_SOURCE
     assert "graph.enable_debug_mode();" in BACKEND_SOURCE
-    assert "graph.debug_dump(debug_path);" in BACKEND_SOURCE
+    assert "cudaGraphDebugDotPrint(graph.raw_cuda_graph(), debug_path," in BACKEND_SOURCE
     assert "mfq_debug_dump_cuda_graph(*graph);" in SOURCE
 
 

@@ -17,33 +17,34 @@ from pathlib import Path
 
 _DIR = os.path.dirname(__file__)
 _REPOSITORY_ROOT = str(Path(_DIR).resolve().parents[2])
+_KERNEL_DIR = str(Path(_REPOSITORY_ROOT) / "csrc" / "backends" / "cuda" / "kernels")
 _CORE_INCLUDE = str(Path(_REPOSITORY_ROOT) / "csrc" / "core" / "include")
 _GGML_ROOT = Path(_REPOSITORY_ROOT) / "csrc" / "components" / "ggml"
 _GGML_INCLUDE = str(_GGML_ROOT / "include")
 _GGML_SOURCE_INCLUDE = str(_GGML_ROOT / "src")
 _GGML_CUDA_INCLUDE = str(_GGML_ROOT / "src" / "ggml-cuda")
 _SOURCES = [
-    os.path.join(_DIR, "norm.cu"),
-    os.path.join(_DIR, "acc.cu"),
-    os.path.join(_DIR, "rope.cu"),
-    os.path.join(_DIR, "attention.cu"),
-    os.path.join(_DIR, "gated_delta_net.cu"),
-    os.path.join(_DIR, "kv_cache.cu"),
-    os.path.join(_DIR, "activation.cu"),
-    os.path.join(_DIR, "embedding.cu"),
-    os.path.join(_DIR, "selected_attention.cu"),
-    os.path.join(_DIR, "qwen4_exp.cu"),
-    os.path.join(_DIR, "glm5_next.cu"),
-    os.path.join(_DIR, "sampling.cu"),
-    os.path.join(_DIR, "ssm_conv.cu"),
-    os.path.join(_DIR, "moe.cu"),
-    os.path.join(_DIR, "mx_matmul.cu"),
-    os.path.join(_DIR, "fp8_sq.cu"),
-    os.path.join(_DIR, "mxfp4_sq.cu"),
-    os.path.join(_DIR, "nint_matmul.cu"),
-    os.path.join(_DIR, "nvq_matmul.cu"),
-    os.path.join(_DIR, "nepq.cu"),
-    os.path.join(_DIR, "nepq_residual.cu"),
+    os.path.join(_KERNEL_DIR, "norm.cu"),
+    os.path.join(_KERNEL_DIR, "acc.cu"),
+    os.path.join(_KERNEL_DIR, "rope.cu"),
+    os.path.join(_KERNEL_DIR, "attention.cu"),
+    os.path.join(_KERNEL_DIR, "gated_delta_net.cu"),
+    os.path.join(_KERNEL_DIR, "kv_cache.cu"),
+    os.path.join(_KERNEL_DIR, "activation.cu"),
+    os.path.join(_KERNEL_DIR, "embedding.cu"),
+    os.path.join(_KERNEL_DIR, "selected_attention.cu"),
+    os.path.join(_KERNEL_DIR, "qwen4_exp.cu"),
+    os.path.join(_KERNEL_DIR, "glm5_next.cu"),
+    os.path.join(_KERNEL_DIR, "sampling.cu"),
+    os.path.join(_KERNEL_DIR, "ssm_conv.cu"),
+    os.path.join(_KERNEL_DIR, "moe.cu"),
+    os.path.join(_KERNEL_DIR, "mx_matmul.cu"),
+    os.path.join(_KERNEL_DIR, "fp8_sq.cu"),
+    os.path.join(_KERNEL_DIR, "mxfp4_sq.cu"),
+    os.path.join(_KERNEL_DIR, "nint_matmul.cu"),
+    os.path.join(_KERNEL_DIR, "nvq_matmul.cu"),
+    os.path.join(_KERNEL_DIR, "nepq.cu"),
+    os.path.join(_KERNEL_DIR, "nepq_residual.cu"),
     os.path.join(_DIR, "mfq_cuda.cpp"),
 ]
 _module = None
@@ -95,6 +96,7 @@ def ext():
             sources=_SOURCES,
             extra_include_paths=[
                 _REPOSITORY_ROOT,
+                _KERNEL_DIR,
                 _CORE_INCLUDE,
                 _GGML_INCLUDE,
                 _GGML_SOURCE_INCLUDE,

@@ -51,13 +51,13 @@ NVQ3J_CUDA = (ROOT / "mfq" / "quantize" / "cuda" / "nvq3j_assign.cu").read_text(
 UNIFIED_CUDA_EXT = (ROOT / "mfq" / "kernels" / "cuda" / "_ext.py").read_text(
     encoding="utf-8"
 )
-CUDA_ATTENTION = (ROOT / "mfq" / "kernels" / "cuda" / "attention_mma.cu").read_text(
+CUDA_ATTENTION = (ROOT / "csrc" / "backends" / "cuda" / "kernels" / "attention_mma.cu").read_text(
     encoding="utf-8"
 )
 CUDA_FATTN = (
-    ROOT / "mfq" / "kernels" / "cuda" / "mfq_fattn_mma_f16.cuh"
+    ROOT / "csrc" / "backends" / "cuda" / "kernels" / "mfq_fattn_mma_f16.cuh"
 ).read_text(encoding="utf-8")
-CUDA_MOE = (ROOT / "mfq" / "kernels" / "cuda" / "moe.cu").read_text(
+CUDA_MOE = (ROOT / "csrc" / "backends" / "cuda" / "kernels" / "moe.cu").read_text(
     encoding="utf-8"
 )
 CUDA_MOE_PYTHON = (ROOT / "mfq" / "kernels" / "cuda" / "moe.py").read_text(

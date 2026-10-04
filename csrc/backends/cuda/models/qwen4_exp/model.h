@@ -4,7 +4,7 @@
 #include "models/qwen4_exp/ngram.h"
 #include "models/common/attention_ops.h"
 #include "../../ops/rope.h"
-#include "mfq/kernels/cuda/qwen4_exp.h"
+#include "csrc/backends/cuda/kernels/qwen4_exp.h"
 #include <array>
 #include <cstring>
 #include <memory>
