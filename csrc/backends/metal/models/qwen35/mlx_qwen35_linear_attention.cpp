@@ -424,6 +424,18 @@ void MlxQwen35LinearAttentionBlock::reset_cache(int batch) {
     cache_position_ = 0;
     cache_batch_ = batch;
     speculative_rollback_.reset();
+    report_cache_resources();
+}
+
+void MlxQwen35LinearAttentionBlock::report_cache_resources() noexcept {
+    std::size_t bytes = 0;
+    const auto count = [&bytes](const auto& live, const auto& zero) {
+        if (live) bytes += live->nbytes();
+        if (zero && (!live || live->id() != zero->id())) bytes += zero->nbytes();
+    };
+    count(convolution_state_, zero_convolution_state_);
+    count(recurrent_state_, zero_recurrent_state_);
+    resources_.set({bytes, bytes ? static_cast<std::size_t>(cache_batch_) : 0});
 }
 
 void MlxQwen35LinearAttentionBlock::materialize_cache() {
@@ -443,6 +455,7 @@ void MlxQwen35LinearAttentionBlock::clear_cache() noexcept {
     cache_position_ = 0;
     cache_batch_ = 0;
     speculative_rollback_.reset();
+    report_cache_resources();
 }
 
 MlxQwen35LinearAttentionCacheSnapshot
@@ -488,6 +501,7 @@ void MlxQwen35LinearAttentionBlock::restore_cache(
     cache_position_ = snapshot.position;
     cache_batch_ = snapshot.batch;
     speculative_rollback_.reset();
+    report_cache_resources();
 }
 
 array MlxQwen35LinearAttentionBlock::forward(
@@ -694,6 +708,7 @@ array MlxQwen35LinearAttentionBlock::forward(
         convolution_state_ = convolved.state;
         recurrent_state_ = recurrent.state;
         cache_position_ += tokens;
+        report_cache_resources();
     }
 
     auto normalized_value = linear_norm_(recurrent.output);
@@ -767,6 +782,7 @@ array MlxQwen35LinearAttentionBlock::forward_speculative(
         cache_position_ = speculative_rollback_->position;
         cache_batch_ = speculative_rollback_->batch;
         speculative_rollback_.reset();
+        report_cache_resources();
         throw;
     }
 }
@@ -802,6 +818,7 @@ void MlxQwen35LinearAttentionBlock::rollback_speculative(
     cache_position_ = restored.position;
     cache_batch_ = speculative_rollback_->batch;
     speculative_rollback_.reset();
+    report_cache_resources();
 }
 
 array MlxQwen35LinearAttentionBlock::forward(

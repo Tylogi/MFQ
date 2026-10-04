@@ -21,12 +21,16 @@ using mlx::core::array;
 
 constexpr std::array<std::uint8_t, 8> kMagic{
     'M', 'F', 'Q', 'M', 'L', 'X', '1', 0};
-constexpr std::uint32_t kVersion = 1;
+constexpr std::uint32_t kVersion = 2;
 constexpr std::uint8_t kKvLayer = 1;
 constexpr std::uint8_t kRecurrentLayer = 2;
 constexpr std::uint8_t kRecurrentUnavailableLayer = 3;
 constexpr std::uint32_t kMiniRuntime = 1;
 constexpr std::uint32_t kQwen35Runtime = 2;
+constexpr std::uint32_t kQwen4Runtime = 3;
+constexpr std::uint8_t kQsaLayer = 4;
+constexpr std::uint8_t kGdnLayer = 5;
+constexpr std::uint8_t kGdnUnavailableLayer = 6;
 
 class Writer {
 public:
@@ -189,6 +193,7 @@ private:
 
 struct DecodedLayer {
     std::uint8_t kind = 0;
+    bool exact = false;
     int batch = 0;
     int heads = 0;
     int maximum_sequence = 0;
@@ -198,6 +203,10 @@ struct DecodedLayer {
     Dtype dtype = mlx::core::float16;
     SerializedTensor first;
     SerializedTensor second;
+    std::optional<SerializedTensor> index;
+    std::optional<SerializedTensor> pooled;
+    std::optional<SerializedTensor> ple;
+    std::vector<std::int64_t> ple_context;
 };
 
 struct DecodedBlock {
@@ -205,6 +214,8 @@ struct DecodedBlock {
     std::uint32_t start = 0;
     std::uint32_t count = 0;
     std::vector<DecodedLayer> layers;
+    std::vector<DecodedLayer> mtp_layers;
+    std::optional<SerializedTensor> last_hidden;
 };
 
 void write_header(
@@ -225,14 +236,16 @@ void write_kv_layer(
     Writer& writer,
     const MlxKvCacheSnapshot& snapshot,
     int start,
-    int count) {
+    int count,
+    std::uint8_t kind = kKvLayer,
+    bool exact = true) {
     if (snapshot.position < start + count || snapshot.batch != 1) {
         throw std::runtime_error("invalid MLX KV cache block range");
     }
-    writer.scalar<std::uint8_t>(kKvLayer);
+    writer.scalar<std::uint8_t>(kind);
     writer.scalar<std::uint8_t>(
         static_cast<std::uint8_t>(snapshot.dtype.val()));
-    writer.scalar<std::uint16_t>(0);
+    writer.scalar<std::uint16_t>(exact ? 1 : 0);
     writer.scalar<std::int32_t>(snapshot.batch);
     writer.scalar<std::int32_t>(snapshot.heads);
     writer.scalar<std::int32_t>(snapshot.maximum_sequence);
@@ -253,11 +266,12 @@ void write_kv_layer(
 void write_recurrent_layer(
     Writer& writer,
     const MlxQwen35LinearAttentionCacheSnapshot& snapshot,
-    int boundary) {
+    int boundary,
+    std::uint8_t kind = kRecurrentLayer) {
     if (snapshot.batch != 1 || snapshot.position < boundary) {
         throw std::runtime_error("invalid recurrent cache boundary");
     }
-    writer.scalar<std::uint8_t>(kRecurrentLayer);
+    writer.scalar<std::uint8_t>(kind);
     writer.scalar<std::uint8_t>(0);
     writer.scalar<std::uint16_t>(0);
     writer.scalar<std::int32_t>(snapshot.batch);
@@ -273,11 +287,12 @@ void write_recurrent_layer(
 void write_recurrent_unavailable_layer(
     Writer& writer,
     const MlxQwen35LinearAttentionCacheSnapshot& snapshot,
-    int boundary) {
+    int boundary,
+    std::uint8_t kind = kRecurrentUnavailableLayer) {
     if (snapshot.batch != 1 || snapshot.position < boundary) {
         throw std::runtime_error("invalid recurrent cache boundary");
     }
-    writer.scalar<std::uint8_t>(kRecurrentUnavailableLayer);
+    writer.scalar<std::uint8_t>(kind);
     writer.scalar<std::uint8_t>(0);
     writer.scalar<std::uint16_t>(0);
     writer.scalar<std::int32_t>(snapshot.batch);
@@ -288,12 +303,77 @@ void write_recurrent_unavailable_layer(
     writer.scalar<std::int32_t>(boundary);
 }
 
+void write_optional_tensor(Writer& writer, const std::optional<array>& value) {
+    writer.scalar<std::uint8_t>(value.has_value());
+    if (value) writer.tensor(*value);
+}
+
+void write_flash_layer(Writer& writer, const MlxQwen4LayerCacheSnapshot& layer,
+    std::size_t start, std::size_t count, bool exact) {
+    const int boundary = static_cast<int>(start + count);
+    if (layer.batch != 1 || layer.position < boundary ||
+        (layer.kv ? !layer.index_keys : (!layer.convolution || !layer.recurrent)))
+        throw std::runtime_error("invalid Flash-Next cache layer");
+    if (layer.kv) {
+        write_kv_layer(writer, *layer.kv, static_cast<int>(start), static_cast<int>(count), kQsaLayer, exact);
+        writer.tensor(mlx::core::slice(*layer.index_keys, Shape{0, static_cast<int>(start), 0},
+            Shape{layer.batch, boundary, layer.index_keys->shape(2)}));
+        write_optional_tensor(writer, exact ? layer.pooled_keys : std::nullopt);
+    } else {
+        MlxQwen35LinearAttentionCacheSnapshot state{*layer.convolution, *layer.recurrent,
+            layer.position, layer.batch};
+        if (exact) write_recurrent_layer(writer, state, boundary, kGdnLayer);
+        else write_recurrent_unavailable_layer(writer, state, boundary, kGdnUnavailableLayer);
+    }
+    write_optional_tensor(writer, exact ? layer.ple_convolution : std::nullopt);
+    writer.scalar<std::uint32_t>(exact ? static_cast<std::uint32_t>(layer.ple_context.size()) : 0);
+    if (exact) for (const auto token : layer.ple_context) writer.scalar<std::int64_t>(token);
+}
+
+DecodedLayer read_layer(Reader& reader) {
+    DecodedLayer layer;
+    layer.kind = reader.scalar<std::uint8_t>("layer kind");
+    const auto dtype_value = reader.scalar<std::uint8_t>("layer dtype");
+    layer.exact = (reader.scalar<std::uint16_t>("layer flags") & 1) != 0;
+    layer.batch = reader.scalar<std::int32_t>("batch");
+    layer.heads = reader.scalar<std::int32_t>("heads");
+    layer.maximum_sequence = reader.scalar<std::int32_t>("maximum sequence");
+    layer.head_dimension = reader.scalar<std::int32_t>("head dimension");
+    layer.capacity = reader.scalar<std::int32_t>("capacity");
+    layer.position = reader.scalar<std::int32_t>("position");
+    const bool unavailable = layer.kind == kRecurrentUnavailableLayer || layer.kind == kGdnUnavailableLayer;
+    if (!unavailable) { layer.first = reader.tensor(); layer.second = reader.tensor(); }
+    if (layer.kind == kKvLayer || layer.kind == kQsaLayer) {
+        layer.dtype = layer.first.dtype;
+        if (dtype_value > static_cast<std::uint8_t>(Dtype::Val::complex64) ||
+            layer.dtype.val() != static_cast<Dtype::Val>(dtype_value))
+            throw std::runtime_error("MLX KV layer dtype mismatch");
+    } else if (unavailable || layer.kind == kRecurrentLayer || layer.kind == kGdnLayer) {
+        if (dtype_value != 0 || layer.batch != 1 || layer.heads != 0 || layer.maximum_sequence != 0 ||
+            layer.head_dimension != 0 || layer.capacity != 0 || layer.position <= 0 ||
+            (!unavailable && (layer.first.dtype != mlx::core::float32 || layer.second.dtype != mlx::core::float32)))
+            throw std::runtime_error("invalid recurrent cache checkpoint");
+    } else throw std::runtime_error("unknown MLX cache layer kind");
+    if (layer.kind == kQsaLayer) {
+        layer.index = reader.tensor();
+        if (reader.scalar<std::uint8_t>("pooled presence")) layer.pooled = reader.tensor();
+    }
+    if (layer.kind == kQsaLayer || layer.kind == kGdnLayer || layer.kind == kGdnUnavailableLayer) {
+        if (reader.scalar<std::uint8_t>("PLE presence")) layer.ple = reader.tensor();
+        const auto count = reader.scalar<std::uint32_t>("PLE context count");
+        if (count > 65536) throw std::runtime_error("invalid PLE context count");
+        for (std::uint32_t i = 0; i < count; ++i)
+            layer.ple_context.push_back(reader.scalar<std::int64_t>("PLE token"));
+    }
+    return layer;
+}
+
 DecodedBlock read_block(const std::vector<std::uint8_t>& payload) {
     Reader reader(payload);
     std::array<std::uint8_t, 8> magic{};
     reader.raw(magic.data(), magic.size(), "magic");
     const auto version = reader.scalar<std::uint32_t>("version");
-    if (magic != kMagic || version != kVersion) {
+    if (magic != kMagic || (version != 1 && version != kVersion)) {
         throw std::runtime_error("unsupported MLX cache payload");
     }
     DecodedBlock block;
@@ -306,52 +386,14 @@ DecodedBlock read_block(const std::vector<std::uint8_t>& payload) {
     }
     block.layers.reserve(layer_count);
     for (std::uint32_t index = 0; index < layer_count; ++index) {
-        DecodedLayer layer;
-        layer.kind = reader.scalar<std::uint8_t>("layer kind");
-        const auto dtype_value = reader.scalar<std::uint8_t>("layer dtype");
-        (void)reader.scalar<std::uint16_t>("layer flags");
-        layer.batch = reader.scalar<std::int32_t>("batch");
-        layer.heads = reader.scalar<std::int32_t>("heads");
-        layer.maximum_sequence =
-            reader.scalar<std::int32_t>("maximum sequence");
-        layer.head_dimension =
-            reader.scalar<std::int32_t>("head dimension");
-        layer.capacity = reader.scalar<std::int32_t>("capacity");
-        layer.position = reader.scalar<std::int32_t>("position");
-        if (layer.kind != kRecurrentUnavailableLayer) {
-            layer.first = reader.tensor();
-            layer.second = reader.tensor();
-        }
-        if (layer.kind == kKvLayer) {
-            if (dtype_value >
-                static_cast<std::uint8_t>(Dtype::Val::complex64)) {
-                throw std::runtime_error("invalid MLX KV layer dtype");
-            }
-            layer.dtype = layer.first.dtype;
-            if (layer.dtype.val() != static_cast<Dtype::Val>(dtype_value)) {
-                throw std::runtime_error("MLX KV layer dtype mismatch");
-            }
-        } else if (layer.kind == kRecurrentUnavailableLayer) {
-            if (dtype_value != 0 || layer.batch != 1 || layer.heads != 0 ||
-                layer.maximum_sequence != 0 || layer.head_dimension != 0 ||
-                layer.capacity != 0 || layer.position <= 0) {
-                throw std::runtime_error(
-                    "invalid unavailable recurrent cache marker");
-            }
-        } else if (layer.kind == kRecurrentLayer) {
-            if (dtype_value != 0 || layer.batch != 1 || layer.heads != 0 ||
-                layer.maximum_sequence != 0 || layer.head_dimension != 0 ||
-                layer.capacity != 0 || layer.position <= 0 ||
-                layer.first.dtype != mlx::core::float32 ||
-                layer.second.dtype != mlx::core::float32 ||
-                layer.first.data == nullptr || layer.second.data == nullptr) {
-                throw std::runtime_error(
-                    "invalid recurrent cache checkpoint");
-            }
-        } else {
-            throw std::runtime_error("unknown MLX cache layer kind");
-        }
-        block.layers.push_back(std::move(layer));
+        block.layers.push_back(read_layer(reader));
+    }
+    if (version >= 2) {
+        if (reader.scalar<std::uint8_t>("MTP hidden presence")) block.last_hidden = reader.tensor();
+        const auto count = reader.scalar<std::uint32_t>("MTP layer count");
+        if (count > 4096 || (count > 0 && !block.last_hidden))
+            throw std::runtime_error("invalid MTP checkpoint");
+        for (std::uint32_t i = 0; i < count; ++i) block.mtp_layers.push_back(read_layer(reader));
     }
     reader.expect_end();
     return block;
@@ -362,7 +404,8 @@ std::vector<DecodedBlock> decode_blocks(
     std::uint32_t expected_runtime,
     std::size_t token_count,
     std::size_t block_size) {
-    if (payloads.empty() || token_count != payloads.size() * block_size) {
+    if (payloads.empty() || block_size == 0 || token_count == 0 ||
+        (token_count + block_size - 1) / block_size != payloads.size()) {
         throw std::runtime_error("MLX cache block chain length mismatch");
     }
     std::vector<DecodedBlock> blocks;
@@ -375,7 +418,7 @@ std::vector<DecodedBlock> decode_blocks(
         }
         auto block = read_block(*payload);
         if (block.runtime != expected_runtime || block.start != expected_start ||
-            block.count != block_size ||
+            block.count != std::min(block_size, token_count - expected_start) ||
             (expected_layers != 0 && block.layers.size() != expected_layers)) {
             throw std::runtime_error("incompatible MLX cache block chain");
         }
@@ -422,7 +465,7 @@ MlxKvCacheSnapshot rebuild_kv(
     };
     for (const auto& block : blocks) {
         const auto& layer = block.layers.at(layer_index);
-        if (layer.kind != kKvLayer || layer.batch != final.batch ||
+        if ((layer.kind != kKvLayer && layer.kind != kQsaLayer) || layer.batch != final.batch ||
             layer.heads != final.heads ||
             layer.maximum_sequence != final.maximum_sequence ||
             layer.head_dimension != final.head_dimension ||
@@ -501,6 +544,49 @@ MlxKvCacheSnapshot rebuild_kv(
     };
 }
 
+array copy_tensor(const SerializedTensor& source) {
+    if (source.data == nullptr || source.bytes == 0) throw std::runtime_error("empty cache tensor");
+    auto result = array(mlx::core::allocator::malloc(source.bytes), source.shape, source.dtype);
+    std::memcpy(result.data<std::uint8_t>(), source.data, source.bytes);
+    return result;
+}
+
+MlxQwen4LayerCacheSnapshot rebuild_flash(const std::vector<DecodedBlock>& blocks,
+    std::size_t index, std::size_t count) {
+    const auto& final = blocks.back().layers.at(index);
+    MlxQwen4LayerCacheSnapshot state;
+    state.batch = final.batch;
+    state.position = static_cast<int>(count);
+    if (final.kind == kQsaLayer) {
+        state.kv = rebuild_kv(blocks, index, count);
+        if (!final.index || final.index->shape.size() != 3)
+            throw std::runtime_error("missing QSA index checkpoint");
+        const int width = final.index->shape[2];
+        const auto dtype = final.index->dtype;
+        if (count > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(width) / dtype.size())
+            throw std::runtime_error("QSA index checkpoint size overflow");
+        auto keys = array(mlx::core::allocator::malloc(count * width * dtype.size()),
+            Shape{1, static_cast<int>(count), width}, dtype);
+        auto* destination = keys.data<std::uint8_t>();
+        for (const auto& block : blocks) {
+            const auto& layer = block.layers.at(index);
+            if (!layer.index || layer.index->dtype != dtype ||
+                layer.index->shape != Shape{1, static_cast<int>(block.count), width})
+                throw std::runtime_error("QSA index block topology mismatch");
+            std::memcpy(destination + block.start * width * dtype.size(),
+                layer.index->data, layer.index->bytes);
+        }
+        state.index_keys = std::move(keys);
+        if (final.pooled) state.pooled_keys = copy_tensor(*final.pooled);
+    } else if (final.kind == kGdnLayer) {
+        state.convolution = copy_tensor(final.first);
+        state.recurrent = copy_tensor(final.second);
+    } else throw std::runtime_error("missing exact GDN checkpoint");
+    if (final.ple) state.ple_convolution = copy_tensor(*final.ple);
+    state.ple_context = final.ple_context;
+    return state;
+}
+
 MlxQwen35LinearAttentionCacheSnapshot rebuild_recurrent(
     const std::vector<DecodedBlock>& blocks,
     std::size_t layer_index,
@@ -534,14 +620,16 @@ std::vector<MlxPagedPayload> encode_state(
     std::size_t first_block,
     std::size_t maximum_blocks,
     std::uint32_t runtime,
-    LayerWriter write_layer) {
+    LayerWriter write_layer,
+    bool allow_tail = false) {
     if (block_size == 0 || state.cache_batch != 1 ||
         state.cache_position <= 0 ||
         state.tokens.size() != static_cast<std::size_t>(state.cache_position) ||
         state.layers.empty()) {
         throw std::runtime_error("invalid MLX session state for paging");
     }
-    const auto full_blocks = state.tokens.size() / block_size;
+    const auto full_blocks = allow_tail ? (state.tokens.size() + block_size - 1) / block_size
+        : state.tokens.size() / block_size;
     if (first_block > full_blocks) {
         throw std::runtime_error("invalid MLX cache first block");
     }
@@ -552,22 +640,35 @@ std::vector<MlxPagedPayload> encode_state(
     result.reserve(end_block - first_block);
     for (std::size_t block = first_block; block < end_block; ++block) {
         const auto start = block * block_size;
-        const bool exact_boundary = block + 1 == full_blocks &&
-            state.tokens.size() == (block + 1) * block_size;
+        const auto count = std::min(block_size, state.tokens.size() - start);
+        const bool exact_boundary = start + count == state.tokens.size();
         Writer writer;
         write_header(
             writer,
             runtime,
             static_cast<std::uint32_t>(start),
-            static_cast<std::uint32_t>(block_size),
+            static_cast<std::uint32_t>(count),
             state.layers.size());
         for (const auto& layer : state.layers) {
             write_layer(
                 writer,
                 layer,
                 start,
-                block_size,
+                count,
                 exact_boundary);
+        }
+        if constexpr (requires { state.mtp_layers; state.last_hidden; }) {
+            write_optional_tensor(writer, exact_boundary ? state.last_hidden : std::nullopt);
+            writer.scalar<std::uint32_t>(exact_boundary && state.last_hidden
+                ? static_cast<std::uint32_t>(state.mtp_layers.size()) : 0);
+            if (exact_boundary && state.last_hidden) for (const auto& layer : state.mtp_layers) {
+                if constexpr (std::is_same_v<std::decay_t<decltype(layer)>, MlxKvCacheSnapshot>)
+                    write_kv_layer(writer, layer, 0, layer.position);
+                else write_flash_layer(writer, layer, 0, layer.position, true);
+            }
+        } else {
+            writer.scalar<std::uint8_t>(0);
+            writer.scalar<std::uint32_t>(0);
         }
         result.push_back(std::move(writer).finish());
     }
@@ -677,7 +778,7 @@ MlxPagedSessionCodec<MlxQwen35TextSessionState>::encode(
                     }
                 },
                 layer);
-        });
+        }, true);
 }
 
 MlxPagedPayload
@@ -716,7 +817,7 @@ MlxPagedSessionCodec<MlxQwen35TextSessionState>::encode_block(
                     }
                 },
                 layer);
-        });
+        }, true);
     if (result.size() != 1) {
         throw std::runtime_error("invalid Qwen3.5 cache block index");
     }
@@ -746,7 +847,110 @@ MlxPagedSessionCodec<MlxQwen35TextSessionState>::decode(
             state.layers.emplace_back(std::move(layer));
         }
     }
+    const auto& final = blocks.back();
+    if (final.last_hidden) {
+        state.last_hidden = copy_tensor(*final.last_hidden);
+        state.bytes += state.last_hidden->nbytes();
+        for (const auto& layer : final.mtp_layers) {
+            if (layer.position != state.cache_position - 1 || layer.kind != kKvLayer)
+                throw std::runtime_error("MTP checkpoint position mismatch");
+            DecodedBlock head;
+            head.count = static_cast<std::uint32_t>(layer.position);
+            head.layers.push_back(layer);
+            auto snapshot = rebuild_kv({head}, 0, layer.position);
+            state.bytes += snapshot.nbytes();
+            state.mtp_layers.push_back(std::move(snapshot));
+        }
+    }
     return state;
+}
+
+std::size_t MlxPagedSessionCodec<MlxQwen35TextSessionState>::token_count(const MlxPagedPayload& payload) {
+    if (!payload) throw std::runtime_error("null cache payload");
+    const auto block = read_block(*payload);
+    return block.start + block.count;
+}
+
+bool MlxPagedSessionCodec<MlxQwen35TextSessionState>::has_mtp(const MlxPagedPayload& payload) {
+    if (!payload) throw std::runtime_error("null cache payload");
+    const auto block = read_block(*payload);
+    if (block.runtime != kQwen35Runtime) throw std::runtime_error("incompatible Qwen3.5 cache block");
+    return block.last_hidden && (block.start + block.count == 1 || !block.mtp_layers.empty());
+}
+
+bool MlxPagedSessionCodec<MlxQwen4TextSessionState>::has_mtp(const MlxPagedPayload& payload) {
+    if (!payload) throw std::runtime_error("null cache payload");
+    const auto block = read_block(*payload);
+    if (block.runtime != kQwen4Runtime) throw std::runtime_error("incompatible Flash-Next cache block");
+    return block.last_hidden && (block.start + block.count == 1 || !block.mtp_layers.empty());
+}
+
+MlxPagedPayload MlxPagedSessionCodec<MlxQwen4TextSessionState>::encode_block(
+    const MlxQwen4TextSessionState& state, std::size_t block_size, std::size_t index) {
+    auto blocks = encode_state(state, block_size, index, 1, kQwen4Runtime, write_flash_layer, true);
+    if (blocks.size() != 1) throw std::runtime_error("invalid Flash-Next cache block index");
+    return std::move(blocks.front());
+}
+
+MlxQwen4TextSessionState MlxPagedSessionCodec<MlxQwen4TextSessionState>::decode(
+    const std::vector<MlxPagedPayload>& payloads, const std::vector<std::int64_t>& tokens,
+    std::size_t block_size) {
+    const auto blocks = decode_blocks(payloads, kQwen4Runtime, tokens.size(), block_size);
+    MlxQwen4TextSessionState state;
+    state.tokens = tokens;
+    state.cache_position = static_cast<int>(tokens.size());
+    state.cache_batch = 1;
+    for (std::size_t i = 0; i < blocks.front().layers.size(); ++i)
+        state.layers.push_back(rebuild_flash(blocks, i, tokens.size()));
+    const auto& final = blocks.back();
+    if (final.last_hidden) {
+        state.last_hidden = copy_tensor(*final.last_hidden);
+        for (const auto& layer : final.mtp_layers) {
+            if (layer.position != state.cache_position - 1 || layer.kind != kQsaLayer)
+                throw std::runtime_error("Flash-Next MTP checkpoint position mismatch");
+            DecodedBlock head;
+            head.count = static_cast<std::uint32_t>(layer.position);
+            head.layers.push_back(layer);
+            state.mtp_layers.push_back(rebuild_flash({head}, 0, layer.position));
+        }
+    }
+    const auto bytes = [&](const MlxQwen4LayerCacheSnapshot& layer) {
+        if (layer.kv) state.bytes += layer.kv->nbytes();
+        for (const auto* value : {&layer.index_keys, &layer.pooled_keys, &layer.convolution,
+            &layer.recurrent, &layer.ple_convolution}) if (*value) state.bytes += (*value)->nbytes();
+        state.bytes += layer.ple_context.size() * sizeof(std::int64_t);
+    };
+    for (const auto& layer : state.layers) bytes(layer);
+    for (const auto& layer : state.mtp_layers) bytes(layer);
+    if (state.last_hidden) state.bytes += state.last_hidden->nbytes();
+    return state;
+}
+
+bool MlxPagedSessionCodec<MlxQwen4TextSessionState>::has_exact_boundary(const MlxPagedPayload& payload) {
+    if (!payload) throw std::runtime_error("null cache payload");
+    const auto block = read_block(*payload);
+    if (block.runtime != kQwen4Runtime) throw std::runtime_error("incompatible Flash-Next cache block");
+    const auto boundary = static_cast<std::uint64_t>(block.start) + block.count;
+    if (boundary > std::numeric_limits<std::int32_t>::max() ||
+        std::any_of(block.layers.begin(), block.layers.end(), [boundary](const DecodedLayer& layer) {
+            return layer.position != static_cast<int>(boundary);
+        })) throw std::runtime_error("Flash-Next cache checkpoint boundary mismatch");
+    return std::none_of(block.layers.begin(), block.layers.end(), [](const DecodedLayer& layer) {
+        return layer.kind == kGdnUnavailableLayer || (layer.kind == kQsaLayer && !layer.exact);
+    });
+}
+
+std::size_t MlxPagedSessionCodec<MlxQwen4TextSessionState>::decodable_blocks(
+    const std::vector<MlxPagedPayload>& payloads) {
+    for (std::size_t count = payloads.size(); count > 0; --count)
+        if (has_exact_boundary(payloads[count - 1])) return count;
+    return 0;
+}
+
+std::size_t MlxPagedSessionCodec<MlxQwen4TextSessionState>::token_count(const MlxPagedPayload& payload) {
+    if (!payload) throw std::runtime_error("null cache payload");
+    const auto block = read_block(*payload);
+    return block.start + block.count;
 }
 
 std::size_t

@@ -17,9 +17,12 @@ void InferenceMetrics::mark_prefill(const MfqPrefillTiming& timing) {
 }
 
 void InferenceMetrics::mark_token() {
-    if (saw_token) return;
-    first_token = Clock::now();
-    saw_token = true;
+    const auto now = Clock::now();
+    if (!saw_token) {
+        first_token = now;
+        saw_token = true;
+    }
+    last_token = now;
 }
 
 InferenceOutput::InferenceOutput(const InferenceRequest& request,

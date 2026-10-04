@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cctype>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <utility>
 
 namespace mfq::engine {
@@ -325,6 +327,39 @@ struct TextProcessor::Impl {
     common_chat_templates_ptr templates;
     std::string model_type;
     ChatTemplateCapabilities capabilities;
+    std::map<std::string, std::pair<std::string, bool>> prefix_policies;
+    std::mutex prefix_policy_mutex;
+
+    std::pair<std::string, bool> prefix_policy(const common_chat_templates_inputs& inputs) {
+        std::lock_guard<std::mutex> lock(prefix_policy_mutex);
+        json key{{"kwargs", inputs.chat_template_kwargs}, {"thinking", inputs.enable_thinking},
+            {"tool_choice", inputs.tool_choice}, {"parallel", inputs.parallel_tool_calls}};
+        for (const auto& tool : inputs.tools)
+            key["tools"].push_back({tool.name, tool.description, tool.parameters});
+        const auto signature = key.dump();
+        if (const auto found = prefix_policies.find(signature); found != prefix_policies.end())
+            return found->second;
+        std::pair<std::string, bool> policy;
+        try {
+            auto probe = inputs;
+            probe.messages = {common_chat_msg{"user", "probe"}};
+            probe.continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
+            probe.add_generation_prompt = true;
+            const auto with = common_chat_templates_apply(templates.get(), probe).prompt;
+            probe.add_generation_prompt = false;
+            const auto without = common_chat_templates_apply(templates.get(), probe).prompt;
+            if (with.starts_with(without)) {
+                policy.first = with.substr(without.size());
+                probe.messages.push_back(common_chat_msg{"assistant", "reply"});
+                probe.messages.push_back(common_chat_msg{"user", "next"});
+                policy.second = common_chat_templates_apply(templates.get(), probe).prompt.starts_with(with);
+            }
+        } catch (const std::exception&) {
+        }
+        if (prefix_policies.size() >= 16) prefix_policies.clear();
+        prefix_policies.emplace(signature, policy);
+        return policy;
+    }
 };
 
 std::unique_ptr<TextProcessor> TextProcessor::load(const ModelSource& source,
@@ -391,6 +426,7 @@ InferenceRequest TextProcessor::prepare(
                 COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY;
         if (chat.preformatted_prompt) {
             prompt = *chat.preformatted_prompt;
+            work.cache_plan.cache_output_tokens = true;
             work.chat_parser.parse_tool_calls = false;
             if (!chat.template_inputs.json_schema.empty()) {
                 common_chat_params constraint;
@@ -425,6 +461,16 @@ InferenceRequest TextProcessor::prepare(
                     "messages");
             }
             prompt = params.prompt;
+            if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_NONE && inputs.add_generation_prompt) {
+                const auto policy = impl_->prefix_policy(inputs);
+                const bool open_think = !params.thinking_start_tag.empty() &&
+                    policy.first.find(params.thinking_start_tag) != std::string::npos &&
+                    (params.thinking_end_tag.empty() || policy.first.find(params.thinking_end_tag) == std::string::npos);
+                work.cache_plan.cache_output_tokens = policy.second && !open_think;
+                if (!work.cache_plan.cache_output_tokens && !policy.first.empty() && prompt.ends_with(policy.first))
+                    work.cache_plan.stable_prefix_tokens = impl_->tokenizer->tokenize(
+                        prompt.substr(0, prompt.size() - policy.first.size()), true).size();
+            }
             work.token_constraint = make_chat_token_constraint(
                 *impl_->tokenizer, params);
             work.chat_parser.format = params.format;
@@ -455,7 +501,9 @@ InferenceRequest TextProcessor::prepare(
             InferenceInputErrorCode::Invalid,
             "prompt tokenized to an empty sequence", "prompt");
     }
-    work.cache_plan.stable_prefix_tokens = work.prompt.size();
+    if (work.cache_plan.stable_prefix_tokens == 0)
+        work.cache_plan.stable_prefix_tokens = work.prompt.size();
+    if (!input.chat) work.cache_plan.cache_output_tokens = true;
     if (input.chat && input.chat_input &&
             normalized_identity(impl_->model_type).rfind(
                 "deepseek_v4", 0) == 0 &&

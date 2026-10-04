@@ -1292,13 +1292,12 @@ detail::StagingVector<std::uint8_t> padded_stream(
     std::size_t count,
     int bits,
     const char* name) {
-    auto result = cursor.bytes(
-        packed_nbytes(count, bits),
-        name);
-    result.insert(result.end(), 2, 0);
-    if (result.size() < 3) {
-        result.resize(3, 0);
-    }
+    const auto size = packed_nbytes(count, bits);
+    const auto* source = cursor.view(size, name);
+    detail::StagingVector<std::uint8_t> result;
+    result.reserve(std::max(size + 2, std::size_t{3}));
+    result.insert(result.end(), source, source + size);
+    result.resize(std::max(size + 2, std::size_t{3}), 0);
     return result;
 }
 
@@ -1880,10 +1879,11 @@ CanonicalVq parse_nvq(
             static_cast<std::size_t>(result.output_size),
             static_cast<std::size_t>(result.groups),
             "group64 record count");
-        result.indices = cursor.bytes(
-            checked_product(records, std::size_t{8},
-                "group64 stream size"),
-            "group64 stream");
+        const auto stream_size = checked_product(
+            records, std::size_t{8}, "group64 stream size");
+        const auto* stream = cursor.view(stream_size, "group64 stream");
+        result.indices.reserve(stream_size + 2);
+        result.indices.insert(result.indices.end(), stream, stream + stream_size);
         for (std::size_t record = 0; record < records; ++record) {
             std::uint64_t packed{};
             std::memcpy(

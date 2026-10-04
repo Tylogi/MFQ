@@ -1232,6 +1232,71 @@ void test_text_session_snapshot_restore() {
         "Qwen3.5 text session snapshot was mutated by resumed decode");
 }
 
+void test_output_prefix_checkpoints() {
+    using namespace mfq::metal;
+    require(mlx_prefix_block_size(false, 2048, 128ULL << 30, true, true) == 256 &&
+        mlx_prefix_block_size(true, 2048, 128ULL << 30, true, false) == 2048 &&
+        mlx_prefix_block_size(true, 2048, 128ULL << 30, true, true) == 8192 &&
+        mlx_prefix_block_size(true, 2048, 128ULL << 30, false, false) == 4096,
+        "adaptive prefix block policy mismatch");
+    require(mlx_prefix_nax_architecture("applegpu_g17s") && mlx_prefix_nax_architecture("applegpu_g18s") &&
+        !mlx_prefix_nax_architecture("applegpu_g16s"), "NAX architecture policy mismatch");
+    MlxSamplingParams sampling;
+    sampling.temperature = 0;
+    const std::vector<std::int64_t> prompt{1, 4, 2};
+    for (const bool mtp : {false, true}) {
+        auto model = make_model(false, false, mtp);
+        std::vector<MlxQwen35TextSessionState> snapshots;
+        std::vector<std::int64_t> tokens = prompt;
+        MlxPrefixCacheHooks hooks{4, prompt.size(), true, [&](std::size_t position) {
+            require(position <= tokens.size(), "checkpoint contains an uncommitted token");
+            snapshots.push_back(model.capture_text_session_state(
+                {tokens.begin(), tokens.begin() + position}));
+        }};
+        const auto generated = model.generate(prompt, sampling, 8, [&](std::int64_t token) {
+            tokens.push_back(token);
+            return true;
+        }, {}, {}, prompt.size(), 2, hooks);
+        require(generated == 8 && !snapshots.empty() && snapshots.front().tokens.size() == 3 &&
+            snapshots.back().tokens.size() == tokens.size() - 1,
+            "prefill/output/tail checkpoints were not captured");
+        auto baseline = make_model();
+        std::vector<std::int64_t> expected;
+        baseline.generate(prompt, sampling, 8, [&](std::int64_t token) {
+            expected.push_back(token);
+            return true;
+        });
+        require(std::vector<std::int64_t>(tokens.begin() + prompt.size(), tokens.end()) == expected,
+            "checkpoint scheduling changed greedy tokens");
+        for (const auto& state : snapshots) {
+            require(!mtp || state.last_hidden.has_value(), "MTP checkpoint lost the target seam");
+            auto restored = make_model(false, false, mtp);
+            restored.restore_text_session_state(state);
+            auto extended = state.tokens;
+            extended.push_back(5);
+            std::size_t prefilled = 0;
+            std::vector<std::int64_t> actual, cold;
+            auto resume_hooks = hooks;
+            resume_hooks.input_tokens = extended.size();
+            resume_hooks.capture = [](std::size_t) {};
+            restored.generate(extended, sampling, 4, [&](std::int64_t token) {
+                actual.push_back(token);
+                return true;
+            }, [&](std::size_t count, double) { prefilled = count; }, {}, state.tokens.size(), 2,
+                resume_hooks);
+            auto fresh = make_model();
+            fresh.generate(extended, sampling, 4, [&](std::int64_t token) {
+                cold.push_back(token);
+                return true;
+            });
+            require(prefilled == 1, "checkpoint restore re-evaluated the cached prefix");
+            require(actual == cold, "restored output checkpoint changed greedy tokens");
+        }
+        model.reset_cache(1);
+        require(model.cache_position() == 0, "checkpoint model reset failed");
+    }
+}
+
 void test_tied_embedding_forward_cache_and_generate() {
     const auto config = test_config(true);
     const auto ids = token_ids({1, 4, 2});
@@ -1671,6 +1736,7 @@ int main(int argc, char** argv) {
         test_mtp_constrained_identity();
         test_mtp_prepared_mrope_generation();
         test_text_session_snapshot_restore();
+        test_output_prefix_checkpoints();
         test_tied_embedding_forward_cache_and_generate();
         test_generation_greedy_seed_and_penalties();
         test_callback_stop_count();

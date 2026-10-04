@@ -10,6 +10,7 @@ import re
 import shutil
 import signal
 import sys
+import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -20,7 +21,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from mfq.server.api.network import system_proxy_environment
+from mfq.server.api.network import download_environment
 from mfq.server.protocol.models import ErrorDetail
 from mfq.server.services.jobs import JobContext, JobExecutionError, TypedJobHandler
 from mfq.server.state.catalog import ModelArtifactNotFoundError, ModelCatalog
@@ -44,7 +45,7 @@ class ModelScopeDownloadPayload(_Payload):
     destination: str = Field(min_length=1, max_length=1024)
     revision: str = Field(default="master", min_length=1, max_length=255)
     repo_type: Literal["model", "dataset"] = "model"
-    include: list[str] = Field(default_factory=list, max_length=64)
+    include: list[str] = Field(default_factory=list, max_length=4096)
     exclude: list[str] = Field(default_factory=list, max_length=64)
     max_workers: int = Field(default=8, ge=1, le=16)
     direct: bool = False
@@ -56,7 +57,7 @@ class HuggingFaceDownloadPayload(_Payload):
     destination: str = Field(min_length=1, max_length=1024)
     revision: str = Field(default="main", min_length=1, max_length=255)
     repo_type: Literal["model", "dataset", "space"] = "model"
-    include: list[str] = Field(default_factory=list, max_length=64)
+    include: list[str] = Field(default_factory=list, max_length=4096)
     exclude: list[str] = Field(default_factory=list, max_length=64)
     max_workers: int = Field(default=8, ge=1, le=16)
     expected_bytes: int | None = Field(default=None, ge=0)
@@ -513,9 +514,10 @@ class ToolJobHandlers:
                     argv.extend(["--exclude", pattern])
             else:
                 argv.extend(["--exclude", *request.exclude])
-        env = self._environment(direct=request.direct)
+        env, proxy = await download_environment("https://modelscope.cn", direct=request.direct)
+        await context.log("Download connection: proxy fallback" if proxy else "Download connection: direct")
         await context.progress(0.01, message="Starting ModelScope download")
-        await self._run(context, argv, env=env)
+        await self._run_download(context, argv, env, destination, request.expected_bytes)
         return await self._download_result(
             context,
             destination,
@@ -557,7 +559,9 @@ class ToolJobHandlers:
         for pattern in request.exclude:
             argv.extend(["--exclude", pattern])
         await context.progress(0.01, message="Starting Hugging Face download")
-        await self._run(context, argv, env=self._environment())
+        env, proxy = await download_environment(os.environ.get("HF_ENDPOINT", "https://huggingface.co"))
+        await context.log("Download connection: proxy fallback" if proxy else "Download connection: direct")
+        await self._run_download(context, argv, env, destination, request.expected_bytes)
         return await self._download_result(
             context,
             destination,
@@ -566,6 +570,43 @@ class ToolJobHandlers:
             revision=request.revision,
             parameters=request.model_dump(mode="json"),
         )
+
+    async def _run_download(self, context: JobContext, argv: list[str], env: dict[str, str], destination: Path, expected_bytes: int | None) -> None:
+        def observed() -> tuple[int, int]:
+            size = files = 0
+            for path in destination.rglob("*"):
+                try:
+                    if not path.is_file() or path.suffix in {".lock", ".metadata"}:
+                        continue
+                    size += path.stat().st_size
+                    if path.suffix not in {".incomplete", ".partial"} and not any(part.startswith(".") for part in path.relative_to(destination).parts):
+                        files += 1
+                except FileNotFoundError:
+                    continue
+            return size, files
+
+        async def monitor() -> None:
+            previous, _ = await asyncio.to_thread(observed)
+            previous_time = time.monotonic()
+            speed = 0.0
+            while True:
+                await asyncio.sleep(1.0)
+                size, files = await asyncio.to_thread(observed)
+                now = time.monotonic()
+                current_speed = max(0, size - previous) / max(0.001, now - previous_time)
+                speed = current_speed if speed == 0 else speed * 0.5 + current_speed * 0.5
+                previous, previous_time = size, now
+                await context.progress(min(0.98, size / expected_bytes) if expected_bytes else 0.01,
+                    data={"downloaded_bytes": size, "total_bytes": expected_bytes,
+                          "bytes_per_second": speed, "files_completed": files})
+
+        task = asyncio.create_task(monitor())
+        try:
+            await self._run(context, argv, env=env)
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
     async def quantize(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
         request = QuantizePayload.model_validate(payload)
@@ -1144,23 +1185,6 @@ class ToolJobHandlers:
         if value is None or not value.is_file():
             raise ToolJobHandlers._failure("tool_unavailable", f"{name} executable is unavailable")
         return value
-
-    @staticmethod
-    def _environment(*, direct: bool = False) -> dict[str, str]:
-        env = system_proxy_environment()
-        if direct:
-            for name in (
-                "http_proxy",
-                "https_proxy",
-                "HTTP_PROXY",
-                "HTTPS_PROXY",
-                "ALL_PROXY",
-                "all_proxy",
-            ):
-                env.pop(name, None)
-            env["NO_PROXY"] = "*"
-            env["no_proxy"] = "*"
-        return env
 
     @staticmethod
     def _failure(code: str, message: str, *, retryable: bool = False) -> JobExecutionError:

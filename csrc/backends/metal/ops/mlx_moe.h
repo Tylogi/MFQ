@@ -115,6 +115,12 @@ public:
     static MlxMfeWeight from_blob(
         std::span<const std::uint8_t> blob);
 
+    // Load compatible packed projections into one final arena, without
+    // separate Gate/Up arenas or model-sized staging vectors. Standalone
+    // SQ, reference and rotated cohorts retain their established dispatch.
+    static MlxMfeWeight from_projection_blobs(
+        std::span<const std::span<const std::uint8_t>> blobs);
+
     // Gate/up and other shape-compatible projections share one packed routed
     // call when their formats participate in the common dispatch. The
     // returned last dimension is

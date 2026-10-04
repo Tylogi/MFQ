@@ -37,6 +37,7 @@ struct InferenceMetrics {
 
     Clock::time_point started = Clock::now();
     Clock::time_point first_token;
+    Clock::time_point last_token;
     std::size_t prefill_tokens = 0;
     double prefill_ms = 0.0;
     double multimodal_ms = 0.0;

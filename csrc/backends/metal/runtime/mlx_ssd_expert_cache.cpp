@@ -1,4 +1,5 @@
 #include "mlx_ssd_expert_cache.h"
+#include "mlx_resource_telemetry.h"
 
 #include "mfe_expert_store.h"
 #include "mlx_eval_timing.h"
@@ -197,6 +198,7 @@ struct MlxMoeSsdExpertCache::Impl {
         if (worker_count == 0) {
             throw std::invalid_argument("SSD expert IO worker count must be positive");
         }
+        resources.set({0, 0, 0, store.payload_bytes(), 0});
         workers.reserve(worker_count);
         for (std::size_t index = 0; index < worker_count; ++index) {
             workers.emplace_back([this] { worker(); });
@@ -822,6 +824,7 @@ struct MlxMoeSsdExpertCache::Impl {
     }
 
     MlxMfeMxfp4ExpertStore store;
+    MlxResourceTelemetry resources;
     const std::size_t slot_bytes;
     const std::size_t prefill_slots;
     const std::size_t total_slots;

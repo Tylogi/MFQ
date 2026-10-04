@@ -96,6 +96,10 @@ std::size_t mlx_prime_mtp_history(
     const MlxMtpHistoryFold& fold,
     int chunk_size = 512);
 
+void mlx_prime_mtp_chunk(const mlx::core::array& hidden,
+    const mlx::core::array& ids, std::optional<mlx::core::array>& previous_hidden,
+    const MlxMtpHistoryFold& fold, int offset);
+
 // Build the teacher-forced target batch shared by every speculative adapter.
 // The result is int32 [1, draft_count + 1] and starts with pending_token.
 mlx::core::array mlx_mtp_verification_ids(
@@ -140,6 +144,9 @@ struct MlxMtpEngineCallbacks {
     // Keep pending_token plus accepted_drafts and discard the rejected draft
     // suffix. This closes the target cache transaction for every verify call.
     std::function<void(int accepted_drafts, int draft_count)> resolve_target;
+
+    std::function<int(int position, int requested)> draft_limit;
+    std::function<void(const MlxMtpDraftContext&)> committed_target;
 
 };
 

@@ -11,6 +11,7 @@
 #include <iomanip>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -474,6 +475,30 @@ public:
             result.blocks.push_back(hash);
             result.matched_tokens += config_.block_size_tokens;
         }
+        std::vector<std::size_t> tail_lengths;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto found = tail_lengths_.find(parent);
+            if (found != tail_lengths_.end()) {
+                const auto remaining = token_ids.size() - result.matched_tokens;
+                for (auto it = found->second.rbegin(); it != found->second.rend(); ++it) {
+                    if (it->first <= remaining) tail_lengths.push_back(it->first);
+                }
+            }
+        }
+        for (const auto count : tail_lengths) {
+            const auto hash = block_hash(parent,
+                token_ids.data() + result.matched_tokens, count, extra_key);
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto disk = disk_.find(hash);
+            if (disk != disk_.end() && (disk->second.parent != parent || disk->second.token_count != count))
+                erase_corrupt_locked(hash);
+            if (disk_.count(hash) == 0 && pending_.count(hash) == 0 && hot_.count(hash) == 0)
+                continue;
+            result.blocks.push_back(hash);
+            result.matched_tokens += count;
+            break;
+        }
         if (record_query && result.matched_tokens > 0) {
             std::lock_guard<std::mutex> lock(mutex_);
             ++metrics_.hits;
@@ -523,6 +548,7 @@ public:
                     return hash;
                 }
                 put_hot_locked(hash, std::move(payload));
+                if (hot_.count(hash) != 0) remember_tail_locked(hash, parent, token_count);
                 sync_metrics_locked();
                 return hash;
             }
@@ -565,6 +591,7 @@ public:
                 pending_[hash] = writes_.back().payload;
             }
             pending_write_bytes_ += payload_bytes;
+            remember_tail_locked(hash, parent, token_count);
             sync_metrics_locked();
         }
         work_available_.notify_one();
@@ -782,6 +809,8 @@ public:
         hot_.clear();
         pending_.clear();
         pins_.clear();
+        tail_lengths_.clear();
+        tail_metadata_.clear();
         disk_bytes_ = 0;
         hot_bytes_ = 0;
         sync_metrics_locked();
@@ -1021,6 +1050,7 @@ private:
             std::filesystem::remove(path, error);
             sync_directory_best_effort(path.parent_path());
         }
+        forget_tail_if_unused_locked(request.hash);
         sync_metrics_locked();
         writes_finished_.notify_all();
     }
@@ -1143,7 +1173,11 @@ private:
             item.entry.last_used = ++clock_;
             const auto file_bytes = item.entry.file_bytes;
             const auto insertion = disk_.emplace(item.hash, std::move(item.entry));
-            if (insertion.second) disk_bytes_ += file_bytes;
+            if (insertion.second) {
+                disk_bytes_ += file_bytes;
+                remember_tail_locked(item.hash, insertion.first->second.parent,
+                    insertion.first->second.token_count);
+            }
         }
         enforce_disk_budget_locked();
         sync_metrics_locked();
@@ -1188,7 +1222,9 @@ private:
             }
             if (victim == hot_.end()) break;
             hot_bytes_ -= victim->second.payload->size();
+            const auto hash = victim->first;
             hot_.erase(victim);
+            forget_tail_if_unused_locked(hash);
         }
         return before - hot_bytes_;
     }
@@ -1210,6 +1246,7 @@ private:
             removed = true;
         }
         if (removed) {
+            forget_tail_if_unused_locked(hash);
             ++metrics_.corrupt_blocks;
             sync_metrics_locked();
         }
@@ -1267,10 +1304,33 @@ private:
             disk_bytes_ -= victim->second.file_bytes;
             // Disk and RAM are independent tiers. A hot payload remains a
             // valid content-addressed hit after its durable copy is evicted.
+            const auto hash = victim->first;
             disk_.erase(victim);
+            forget_tail_if_unused_locked(hash);
             ++metrics_.evictions;
         }
         sync_metrics_locked();
+    }
+
+    void remember_tail_locked(const BlockHash& hash, const BlockHash& parent,
+        std::size_t count) {
+        if (count >= config_.block_size_tokens || tail_metadata_.count(hash) != 0) return;
+        tail_metadata_.emplace(hash, std::make_pair(parent, count));
+        ++tail_lengths_[parent][count];
+    }
+
+    void forget_tail_if_unused_locked(const BlockHash& hash) {
+        if (disk_.count(hash) != 0 || pending_.count(hash) != 0 || hot_.count(hash) != 0) return;
+        const auto metadata = tail_metadata_.find(hash);
+        if (metadata == tail_metadata_.end()) return;
+        auto parent = tail_lengths_.find(metadata->second.first);
+        if (parent != tail_lengths_.end()) {
+            auto length = parent->second.find(metadata->second.second);
+            if (length != parent->second.end() && --length->second == 0)
+                parent->second.erase(length);
+            if (parent->second.empty()) tail_lengths_.erase(parent);
+        }
+        tail_metadata_.erase(metadata);
     }
 
     void sync_metrics_locked() {
@@ -1298,6 +1358,8 @@ private:
     std::unordered_map<BlockHash, DiskEntry, HashHasher> disk_;
     std::unordered_map<BlockHash, HotEntry, HashHasher> hot_;
     std::unordered_map<BlockHash, std::size_t, HashHasher> pins_;
+    std::unordered_map<BlockHash, std::map<std::size_t, std::size_t>, HashHasher> tail_lengths_;
+    std::unordered_map<BlockHash, std::pair<BlockHash, std::size_t>, HashHasher> tail_metadata_;
     std::uint64_t disk_bytes_ = 0;
     std::uint64_t hot_bytes_ = 0;
     std::uint64_t pending_write_bytes_ = 0;

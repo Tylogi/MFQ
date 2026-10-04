@@ -729,6 +729,26 @@ std::optional<array> mlx_generation_token_counts(
         prompt_ids);
 }
 
+void mlx_prime_mtp_chunk(const array& hidden, const array& ids,
+    std::optional<array>& previous_hidden, const MlxMtpHistoryFold& fold, int offset) {
+    const int count = ids.shape(1);
+    const auto last = mlx::core::slice(hidden, Shape{0, count - 1, 0},
+        Shape{hidden.shape(0), count, hidden.shape(2)});
+    if (previous_hidden) {
+        auto rows = count == 1 ? *previous_hidden : mlx::core::concatenate(
+            {*previous_hidden, mlx::core::slice(hidden, Shape{0, 0, 0},
+                Shape{hidden.shape(0), count - 1, hidden.shape(2)})}, 1);
+        auto value = fold(rows, ids, offset - 1);
+        value.eval();
+    } else if (count > 1) {
+        mlx_prime_mtp_history(hidden, ids,
+            [&](const array& rows, const array& shifted, int pair_offset) {
+                return fold(rows, shifted, offset + pair_offset);
+            });
+    }
+    previous_hidden = last;
+}
+
 std::int32_t run_mlx_mtp_generation(
     MlxMtpEngineRequest request,
     const MlxMtpEngineCallbacks& callbacks,
@@ -850,7 +870,10 @@ std::int32_t run_mlx_mtp_generation(
             request.maximum_context - callbacks.target_cache_position() - 1);
         const int output_depth = std::max(
             0, request.generation_limit - generated - 1);
-        return std::min({desired, context_depth, output_depth});
+        const auto depth = std::min({desired, context_depth, output_depth});
+        return callbacks.draft_limit
+            ? std::clamp(callbacks.draft_limit(callbacks.target_cache_position(), depth), 0, depth)
+            : depth;
     };
     MlxMtpDraftContext initial_context{
         true,
@@ -1087,6 +1110,12 @@ std::int32_t run_mlx_mtp_generation(
         }
         const auto resolve_started = std::chrono::steady_clock::now();
         callbacks.resolve_target(emitted_accepted, draft_count);
+        if (callbacks.committed_target) {
+            callbacks.committed_target(MlxMtpDraftContext{
+                false, pending, 0, cycle_cache_start, emitted_accepted,
+                &target.hidden, std::span<const std::int32_t>(draft_ids.data(),
+                    static_cast<std::size_t>(emitted_accepted))});
+        }
         const auto resolve_finished = std::chrono::steady_clock::now();
         if (!continue_generation) {
             return generated;

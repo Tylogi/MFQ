@@ -120,6 +120,30 @@ std::vector<float> reference_mrope(
 int main() {
     try {
         using namespace mlx::core;
+        const auto empty_resources = mfq::metal::MlxResourceTelemetry::snapshot();
+        {
+            mfq::metal::MlxKvCache first(1, 2, 16, 4, 2, float16);
+            first.reserve_append(1);
+            mfq::metal::MlxSequenceCache second(16, 4, float16);
+            second.reset(1, 2);
+            const auto bytes = first.key_storage().nbytes() + first.value_storage().nbytes()
+                + second.storage_bytes();
+            const auto live = mfq::metal::MlxResourceTelemetry::snapshot();
+            if (live.cache_bytes != empty_resources.cache_bytes + bytes || live.contexts != 1)
+                throw std::runtime_error("shared cache resource accounting mismatch");
+            auto saved = first.snapshot();
+            auto checkpoint = first;
+            first = checkpoint;
+            auto moved = std::move(first);
+            if (mfq::metal::MlxResourceTelemetry::snapshot().cache_bytes != live.cache_bytes)
+                throw std::runtime_error("snapshot or move duplicated resource accounting");
+            second.clear();
+            if (mfq::metal::MlxResourceTelemetry::snapshot().cache_bytes !=
+                live.cache_bytes - bytes + moved.key_storage().nbytes() + moved.value_storage().nbytes())
+                throw std::runtime_error("cleared cache retained resource accounting");
+        }
+        if (mfq::metal::MlxResourceTelemetry::snapshot().cache_bytes != empty_resources.cache_bytes)
+            throw std::runtime_error("destroyed cache retained resource accounting");
 
         const mfq::metal::MlxRmsNorm norm(
             array({0.0f, 0.0f}, Shape{2}),

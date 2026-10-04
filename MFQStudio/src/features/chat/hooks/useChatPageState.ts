@@ -59,9 +59,8 @@ export function useChatPageState() {
     navigate('/models');
   }
 
-  /** 生成期间禁止改变选中模型。 */
   function selectModel(value: string) {
-    if (!chat.busy) chat.inference.setSelectedModel(value);
+    if (chat.inference.availableModelNames.includes(value)) chat.inference.setSelectedModel(value);
   }
 
   return {

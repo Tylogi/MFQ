@@ -353,6 +353,16 @@ void test_mfe_format(const std::string& dtype) {
     auto actual = contiguous(astype(weight.routed_matmul(input, expert_ids), float32));
     eval(actual);
     require(actual.shape() == Shape{tokens, routes, output}, dtype + " MFE shape mismatch");
+    const std::array<std::span<const std::uint8_t>, 2> projection_blobs{blob, blob};
+    const auto direct = mfq::metal::MlxMoeWeight::from_projection_blobs(projection_blobs);
+    const auto projected = mfq::metal::MlxMoeWeight::concatenate_projections({weight, weight});
+    require(!direct.supports_grouped_mmq(), dtype + " direct loader changed SQ dispatch");
+    require(all(equal(direct.routed_matmul(input, expert_ids),
+                      projected.routed_matmul(input, expert_ids))).item<bool>(),
+            dtype + " direct projection matmul mismatch");
+    require(all(equal(direct.routed_swiglu(input, expert_ids),
+                      projected.routed_swiglu(input, expert_ids))).item<bool>(),
+            dtype + " direct projection SwiGLU mismatch");
     for (int token = 0; token < tokens; ++token) {
         for (int route = 0; route < routes; ++route) {
             const int expert = ids[static_cast<std::size_t>(token) * routes + route];

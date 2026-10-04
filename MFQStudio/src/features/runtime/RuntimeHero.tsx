@@ -1,4 +1,3 @@
-/** 运行概况条汇总模型加载任务与实例状态，并提供业务页面导航。 */
 import { useMemo } from 'react';
 import { useNavigate } from 'react-router';
 import { useRuntime } from '../../app/RuntimeProvider';
@@ -7,8 +6,11 @@ import { useSettings } from '../settings/SettingsProvider';
 import { Icon, TMPanel, ModelMonogram } from '../../app/display';
 import { formatNumber, formatDuration } from '../../app/formatters';
 import { STUDIO_PATHS } from '../../navigation';
+import { openAIEndpoint } from './endpoint';
+import { getApiBaseUrl } from '../../shared/api/client';
+import { ModelVendorMark } from '../../app/ModelVendorMark';
+import { ModelLoadProgress } from '../models/ModelLoadProgress';
 
-/** 按加载任务、当前实例和失败记录推导概览状态，避免仅凭模型名称误判就绪。 */
 export function RuntimeHero() {
   const { runtime, instances, studio } = useRuntime();
   const jobs = useJobStore((state) => state.jobs);
@@ -98,14 +100,17 @@ export function RuntimeHero() {
             {modelHeroStatus}
           </span>
         </div>
-        <p className="runtime-endpoint">{studio?.service_url || 'http://127.0.0.1:8090'}</p>
+        <p className="runtime-endpoint">{openAIEndpoint(studio?.service_url || getApiBaseUrl())}</p>
         <small>
           {runtime?.model
             ? `${runtime?.model_type || 'MFQ'} · ${formatNumber(runtime?.max_context)} ${tr('上下文', 'context')} · ${formatDuration(runtime?.uptime_seconds)}`
             : tr('加载本地模型后即可开始推理。', 'Load a local model to begin inference.')}
         </small>
+        {modelHero.state === 'loading' && <ModelLoadProgress model={modelHero.name} />}
       </div>
       <div className="runtime-hero-actions">
+        <ModelVendorMark name={modelHero.name} size={34}
+          architecture={modelHero.name === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined} />
         <button className={modelHero.state === 'ready' ? undefined : 'primary'} onClick={() => openStudioPage()} type="button">
           <Icon name="folder" size={15} />
           {tr('模型', 'Models')}

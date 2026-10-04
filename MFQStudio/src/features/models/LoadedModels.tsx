@@ -1,14 +1,14 @@
-/** 已加载模型列表及切换、卸载入口。 */
 import { useSettings } from '../settings/SettingsProvider';
 import { Icon, SectionLabel, TMPanel, EmptyPanel } from '../../app/display';
 import { formatNumber } from '../../app/formatters';
 import type { useModelCatalog } from './useModelCatalog';
+import { ModelVendorMark } from '../../app/ModelVendorMark';
+import { ModelLoadProgress } from './ModelLoadProgress';
 
-/** 展示当前实例及模型选择操作。 */
 export function LoadedModels({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
   const { tr } = useSettings();
-  const { model, busy, availableModelNames, modelFilter, filteredInstances,
-    selectModel, unloadInstance, chooseModelDirectory } = catalog;
+  const { busy, artifacts, availableModelNames, modelFilter, filteredInstances,
+    unloadInstance, chooseModelDirectory } = catalog;
   return (
     <>
       <SectionLabel
@@ -21,7 +21,6 @@ export function LoadedModels({ catalog }: { catalog: ReturnType<typeof useModelC
           <div className="model-list">
             {filteredInstances.map((instance) => {
               const ready = instance.state === 'ready' || instance.state === 'busy';
-              const selected = instance.model === model;
               const stateLabel = instance.state === 'loading'
                 ? tr('加载中', 'Loading')
                 : instance.state === 'unloading'
@@ -44,18 +43,10 @@ export function LoadedModels({ catalog }: { catalog: ReturnType<typeof useModelC
                         : instance.idle_ttl_seconds != null
                           ? ` · TTL ${instance.idle_ttl_seconds}s` : ''}
                     </small>
+                    {instance.state === 'loading' && <ModelLoadProgress model={instance.model} />}
                   </div>
                   <div className="model-row-actions">
-                    {ready && (
-                      <button
-                        className={selected ? 'selected' : ''}
-                        disabled={busy || selected}
-                        onClick={() => selectModel(instance.model)}
-                        type="button"
-                      >
-                        {selected ? tr('当前', 'Current') : tr('用于对话', 'Use in chat')}
-                      </button>
-                    )}
+                    <ModelVendorMark name={instance.model} architecture={artifacts.find((item) => item.name === instance.model)?.architecture} />
                     <button
                       disabled={busy || instance.state !== 'ready'}
                       onClick={() => void unloadInstance(instance.id)}

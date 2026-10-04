@@ -37,6 +37,7 @@ public:
     std::size_t max_num_experts() const noexcept;
     std::size_t total_num_experts() const noexcept;
     std::size_t slot_bytes() const noexcept;
+    std::size_t payload_bytes() const noexcept { return payload_bytes_; }
 
     MlxNativeMxfp4ExpertLoadStats load(
         std::size_t layer,
@@ -92,6 +93,7 @@ private:
     std::size_t num_layers_ = 0;
     std::size_t max_num_experts_ = 0;
     std::size_t slot_bytes_ = 0;
+    std::size_t payload_bytes_ = 0;
     std::array<std::size_t, kParts + 1> slot_offsets_{};
     std::vector<std::size_t> experts_per_layer_;
     std::vector<std::size_t> expert_offsets_;

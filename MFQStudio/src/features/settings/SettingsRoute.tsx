@@ -1,14 +1,12 @@
-/** 设置路由独立管理编辑草稿、生成预设和备份导入导出。 */
 import { useState } from 'react';
 import { useNavigate } from 'react-router';
-import { runtimeApi } from '../../shared/api/resources/runtime';
 import { sessionsApi } from '../../shared/api/resources/sessions';
 import { presetsApi } from '../../shared/api/resources/presets';
 import type { SessionArchive } from '../../shared/api/types';
 import { ScreenHeader } from '../../app/display';
-import { errorMessage, formatNumber } from '../../app/formatters';
+import { errorMessage } from '../../app/formatters';
 import { STUDIO_PATHS } from '../../navigation';
-import { studioConfirm } from '../../studio';
+import { ModelContextSettings } from '../runtime/ModelContextSettings';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useActiveSessionMode } from '../chat/hooks/useActiveSessionMode';
 import { DEFAULT_SETTINGS, PRESETS, modeTemplateSettings, type PresetName } from './configuration';
@@ -19,9 +17,8 @@ import { useGenerationPresets } from './useGenerationPresets';
 import { UpdateManager, useStudioUpdateContext } from './UpdateManager';
 import { toast } from '../../stores/toastStore';
 
-/** 在访问设置路由时创建草稿并加载本领域数据，应用后才更新共享偏好。 */
 export function SettingsRoute() {
-  const { settings, replaceSettings, tr, contextSize, setContextSize } = useSettings();
+  const { settings, replaceSettings, tr } = useSettings();
   const studioUpdates = useStudioUpdateContext();
   const {
     runtime,
@@ -29,7 +26,6 @@ export function SettingsRoute() {
     selectedModel,
     studio,
     ready,
-    refreshRuntime,
     instances,
     capabilities,
   } = useRuntime();
@@ -55,7 +51,6 @@ export function SettingsRoute() {
     ready,
   );
 
-  /** 切换模型默认值继承，并清除不再匹配的预设选择。 */
   function setModelDefaultInheritance(enabled: boolean) {
     setDraft((current) => ({
       ...(enabled ? modeTemplateSettings(current, mode, runtime, realtime) : current),
@@ -63,7 +58,6 @@ export function SettingsRoute() {
     }));
     if (enabled) clearSelection();
   }
-  /** 把内置参数组合写入草稿，不立即改变正在使用的设置。 */
   function applyPreset(name: Exclude<PresetName, 'custom'>) {
     setDraft((current) => ({
       ...current,
@@ -73,29 +67,6 @@ export function SettingsRoute() {
     }));
     clearSelection();
   }
-  /** 确认上下文变更后重载模型并刷新共享状态。 */
-  async function reloadRuntime() {
-    if (
-      busy ||
-      !(await studioConfirm(
-        tr(
-          `以 ${formatNumber(contextSize)} token 上下文重载模型？`,
-          `Reload the model with a ${formatNumber(contextSize)} token context?`,
-        ),
-      ))
-    )
-      return;
-    setBusy(true);
-    try {
-      await runtimeApi.reloadRuntime(contextSize, runtime?.instance_id);
-      await refreshRuntime(true);
-    } catch (cause) {
-      toast.error(errorMessage(cause));
-    } finally {
-      setBusy(false);
-    }
-  }
-  /** 按需读取会话并导出完整备份，及时释放下载对象 URL。 */
   async function exportStudioData() {
     setBusy(true);
     try {
@@ -124,7 +95,6 @@ export function SettingsRoute() {
       setBusy(false);
     }
   }
-  /** 导入预设和会话归档，完成后通知聊天模块重读会话列表。 */
   async function importStudioData(file: File) {
     setBusy(true);
     try {
@@ -164,7 +134,6 @@ export function SettingsRoute() {
       setBusy(false);
     }
   }
-  /** 恢复模型默认参数，同时保留草稿内的外观偏好。 */
   function resetSettingsDraft() {
     setDraft({
       ...modeTemplateSettings(
@@ -181,7 +150,6 @@ export function SettingsRoute() {
       inheritModelDefaults: true,
     });
   }
-  /** 将用户确认的草稿应用到所有后续请求。 */
   function saveSettings() {
     replaceSettings(draft);
     toast.success(tr('设置已应用', 'Settings applied successfully'));
@@ -203,9 +171,7 @@ export function SettingsRoute() {
         setSettingsDraft={setDraft}
         mtpAvailable={mtpAvailable}
         presetManager={manager}
-        contextCapacity={runtime?.context_capacity}
-        contextSize={contextSize}
-        setContextSize={setContextSize}
+        contextControls={<ModelContextSettings />}
         busy={busy}
         hasStudio={Boolean(studio)}
         updateManager={
@@ -214,7 +180,6 @@ export function SettingsRoute() {
         actions={{
           setModelDefaultInheritance,
           applyPreset,
-          reloadRuntime,
           exportStudioData,
           importStudioData,
           openServerPage: () => navigate(STUDIO_PATHS.server),

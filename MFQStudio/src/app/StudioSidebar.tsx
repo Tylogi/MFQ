@@ -1,4 +1,3 @@
-/** 应用导航与移动侧栏交互，页面路由仍由外壳控制。 */
 import { useEffect, type ComponentProps } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { useRuntime } from './RuntimeProvider';
@@ -9,6 +8,7 @@ import {
 } from '../features/settings/UpdateManager';
 import { useUiStore } from '../stores/uiStore';
 import { Icon } from './display';
+import { ModelVendorMark, modelVendor } from './ModelVendorMark';
 import { formatNumber } from './formatters';
 import { runtimeModelNames } from '../features/runtime/modelSelection';
 import { dashboardPath, labPath, resolveStudioLocation, isStudioPath,
@@ -23,7 +23,6 @@ type NavItem = {
   count?: number;
 };
 
-/** 渲染主导航、运行摘要及移动端侧栏开合控件。 */
 export function StudioSidebar() {
   const location = useLocation();
   const navigate = useNavigate();
@@ -62,7 +61,7 @@ export function StudioSidebar() {
         count: activeRequests > 0 ? activeRequests : undefined },
       { label: ['模型', 'Models'], icon: 'folder', path: dashboard('models'),
         active: view === 'dashboard' && dashboardPage === 'models', current: true },
-      { label: ['服务器', 'Server'], icon: 'server-rack', path: '/runtime',
+      { label: ['服务', 'Service'], icon: 'server-rack', path: '/runtime',
         active: view === 'dashboard' && dashboardPage === 'connections', current: true },
       { label: ['资源', 'Resources'], icon: 'memory', path: dashboard('cache'),
         active: view === 'dashboard' && dashboardPage === 'cache', current: true },
@@ -71,7 +70,7 @@ export function StudioSidebar() {
       { label: ['对话', 'Chat'], icon: 'chat', path: '/chat', active: view === 'chat', current: true },
     ] },
     { label: ['模型工具', 'Model tools'], items: [
-      { label: ['模型仓库', 'Model hub'], icon: 'download', path: lab('models'),
+      { label: ['模型下载', 'Model downloads'], icon: 'download', path: lab('models'),
         active: view === 'lab' && labPage === 'models' },
       { label: ['评测与数据集', 'Evaluations'], icon: 'activity', path: lab('evaluations'),
         active: view === 'lab' && labPage === 'evaluations' },
@@ -86,7 +85,6 @@ export function StudioSidebar() {
     ] },
   ];
 
-  /** 切换路由后关闭移动侧栏。 */
   function open(path: string) {
     navigate(path);
     closeSidebar();
@@ -140,7 +138,10 @@ export function StudioSidebar() {
                   ? tr('模型加载中', 'Model loading')
                   : tr('选择模型以开始', 'Choose a model to begin')}</small>
           </span>
-          <Icon name="activity" size={14} />
+          {modelVendor(model, model === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined)
+            ? <ModelVendorMark name={model} size={20}
+              architecture={model === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined} />
+            : <Icon name="activity" size={14} />}
         </button>
       </aside>
       <button aria-controls="studio-sidebar" aria-expanded={sidebarOpen}

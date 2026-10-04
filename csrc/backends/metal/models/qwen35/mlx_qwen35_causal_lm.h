@@ -4,6 +4,7 @@
 #include "mlx_qwen35_full_attention.h"
 #include "mlx_qwen35_linear_attention.h"
 #include "mlx_mtp.h"
+#include "mlx_prefix_cache.h"
 #include "mlx_multimodal.h"
 #include "qwen35_model.h"
 
@@ -34,6 +35,8 @@ struct MlxQwen35TextSessionState {
     int cache_position = 0;
     int cache_batch = 0;
     std::size_t bytes = 0;
+    std::vector<MlxKvCacheSnapshot> mtp_layers;
+    std::optional<mlx::core::array> last_hidden;
 };
 
 using MlxTokenCallback = MlxGenerationTokenCallback;
@@ -69,6 +72,8 @@ public:
     void trim_cache_to(int position);
     void clear_cache() noexcept;
     int cache_position() const noexcept;
+    std::vector<MlxKvCacheSnapshot> snapshot_cache(int position) const;
+    void restore_cache(const std::vector<MlxKvCacheSnapshot>& state);
     MlxMtpPredictorDescriptor mtp_descriptor() const noexcept {
         return MlxMtpPredictorDescriptor::recurrent(
             kMlxMtpEngineMaximumDraftDepth);
@@ -181,7 +186,8 @@ public:
         const MfqTokenConstraintPtr& token_constraint = {},
         std::optional<std::size_t> stable_prefix_tokens =
             std::nullopt,
-        int prefill_chunk_size = 2048);
+        int prefill_chunk_size = 2048,
+        const MlxPrefixCacheHooks& prefix_cache = {});
 
     // All optional input components converge here. Sampling, penalties,
     // cache management and MTP are deliberately shared with text generation.
@@ -204,7 +210,7 @@ public:
         const MlxGridMediaInput& media) const;
 
     MlxQwen35TextSessionState capture_text_session_state(
-        const std::vector<std::int64_t>& tokens) const;
+        const std::vector<std::int64_t>& tokens, bool detached = true) const;
     void restore_text_session_state(
         const MlxQwen35TextSessionState& state);
     bool supports_text_session_state() const noexcept {
@@ -249,7 +255,8 @@ private:
         const std::function<void(std::size_t, double)>& prefill_callback,
         const MfqTokenConstraintPtr& token_constraint,
         std::optional<std::size_t> stable_prefix_tokens,
-        int prefill_chunk_size);
+        int prefill_chunk_size,
+        const MlxPrefixCacheHooks& prefix_cache = {});
     void validate_components() const;
     void prepare_cache_for_prefill(
         int batch,
@@ -289,6 +296,8 @@ private:
     int cache_position_ = 0;
     int cache_batch_ = 0;
     std::vector<std::int64_t> stable_cache_tokens_;
+    std::optional<mlx::core::array> last_cache_hidden_;
+    bool stable_mtp_ready_ = false;
 };
 
 } // namespace mfq::metal

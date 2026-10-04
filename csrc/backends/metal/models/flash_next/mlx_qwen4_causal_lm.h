@@ -4,6 +4,8 @@
 
 #include "mfq_container.h"
 #include "mlx_mtp.h"
+#include "mlx_prefix_cache.h"
+#include "mlx_transformer.h"
 #include "mlx_sampling.h"
 #include "mlx_ssd_expert_cache.h"
 
@@ -70,11 +72,25 @@ struct Qwen4Config {
     static Qwen4Config from_mfq(const MfqContainer& model);
 };
 
-// The first native landing keeps persistent session snapshots disabled.  The
-// type still satisfies the common server contract without routing generation
-// through a Python worker.
+struct MlxQwen4LayerCacheSnapshot {
+    int position = 0;
+    int batch = 0;
+    std::optional<MlxKvCacheSnapshot> kv;
+    std::optional<mlx::core::array> index_keys;
+    std::optional<mlx::core::array> pooled_keys;
+    std::optional<mlx::core::array> convolution;
+    std::optional<mlx::core::array> recurrent;
+    std::optional<mlx::core::array> ple_convolution;
+    std::vector<std::int64_t> ple_context;
+};
+
 struct MlxQwen4TextSessionState {
     std::vector<std::int64_t> tokens;
+    std::vector<MlxQwen4LayerCacheSnapshot> layers;
+    std::vector<MlxQwen4LayerCacheSnapshot> mtp_layers;
+    std::optional<mlx::core::array> last_hidden;
+    int cache_position = 0;
+    int cache_batch = 0;
     std::size_t bytes = 0;
 };
 
@@ -105,7 +121,9 @@ public:
         const std::function<bool(std::int64_t)>& callback = {},
         const std::function<void(std::size_t, double)>& prefill_callback = {},
         const MfqTokenConstraintPtr& token_constraint = {},
-        std::optional<std::size_t> stable_prefix_tokens = std::nullopt);
+        std::optional<std::size_t> stable_prefix_tokens = std::nullopt,
+        int prefill_chunk_size = 2048,
+        const MlxPrefixCacheHooks& prefix_cache = {});
 
     const Qwen4Config& config() const noexcept;
     std::size_t layer_count() const noexcept;
@@ -116,10 +134,16 @@ public:
     std::optional<MlxSsdExpertCacheStats> ssd_expert_cache_stats() const;
     void prewarm_ssd_expert_arena();
     void clear_expert_cache();
+    // Telemetry reads metadata only: no evaluation, copies, or device sync.
+    std::size_t kv_cache_bytes() const noexcept;
+    std::size_t kv_cache_contexts() const noexcept;
+    std::size_t dynamic_weight_bytes() const noexcept;
+    std::size_t ssd_ple_payload_bytes() const noexcept;
+    std::size_t ssd_expert_payload_bytes() const noexcept;
     bool supports_multimodal() const noexcept { return false; }
-    bool supports_text_session_state() const noexcept { return false; }
+    bool supports_text_session_state() const noexcept { return true; }
     MlxQwen4TextSessionState capture_text_session_state(
-        const std::vector<std::int64_t>& tokens) const;
+        const std::vector<std::int64_t>& tokens, bool detached = true) const;
     void restore_text_session_state(const MlxQwen4TextSessionState& state);
 
 private:

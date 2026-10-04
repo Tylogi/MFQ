@@ -1,4 +1,5 @@
 #include "mlx_mxfp8_row_store.h"
+#include "mlx_resource_telemetry.h"
 
 #include <algorithm>
 #include <array>
@@ -225,6 +226,11 @@ struct MlxMxfp8RowStore::Impl {
                             static_cast<std::uint8_t>(value)));
             }
         }
+        resources.bind([this] {
+            std::lock_guard lock(mutex);
+            return MlxResourceUsage{0, 0, cache.size() * decoded_row_bytes, 0, 0};
+        });
+        model.record_prepared(record);
     }
 
     void read_decode(
@@ -395,6 +401,7 @@ struct MlxMxfp8RowStore::Impl {
     mutable std::list<std::int64_t> recency;
     mutable std::unordered_map<std::int64_t, CacheEntry> cache;
     mutable MlxMxfp8RowStoreStats counters;
+    MlxResourceTelemetry resources;
 };
 
 MlxMxfp8RowStore::MlxMxfp8RowStore(

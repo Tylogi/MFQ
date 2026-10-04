@@ -1,6 +1,8 @@
 """Matched native model-graph gate; requires the locally built Metal test."""
 
 import json
+import asyncio
+from contextlib import suppress
 import os
 import subprocess
 from pathlib import Path
@@ -14,25 +16,27 @@ from mfq.formats.header import FileHeader
 from mfq.formats.nint import NintSpec, NintTensor
 
 
-def _models(tmp_path: Path) -> tuple[Path, Path]:
+def _models(tmp_path: Path, *, mtp=False, qsa=False, wide=False) -> tuple[Path, Path]:
     rng = np.random.default_rng(20261001)
     hidden, streams, experts, intermediate = 128, 2, 2, 32
     config = dict(
         model_type="qwen4_exp_text", vocab_size=32, hidden_size=hidden,
-        num_hidden_layers=1, max_position_embeddings=64,
-        num_attention_heads=2, num_key_value_heads=1, head_dim=64,
-        full_attention_interval=2, layer_types=["linear_attention"],
+        num_hidden_layers=2 if qsa else 1, max_position_embeddings=64,
+        num_attention_heads=24 if wide else 2, num_key_value_heads=2 if wide else 1,
+        head_dim=256 if wide else 64,
+        full_attention_interval=2,
+        layer_types=["linear_attention", "full_attention"] if qsa else ["linear_attention"],
         hc_count=streams, hc_lowrank=4, partial_rotary_factor=0.5,
         linear_num_key_heads=1, linear_num_value_heads=2,
         linear_key_head_dim=128, linear_value_head_dim=128,
         linear_conv_kernel_dim=4, num_experts=experts, num_experts_per_tok=1,
         moe_intermediate_size=intermediate, shared_expert_intermediate_size=intermediate,
-        indexer_n_heads=1, indexer_head_dim=64, indexer_compress_ratio=2,
-        indexer_budget=8, indexer_kv_heads=1, ple_conv_kernel_size=4,
+        indexer_n_heads=1, indexer_head_dim=128 if wide else 64, indexer_compress_ratio=2,
+        indexer_budget=8 if wide else 32, indexer_kv_heads=1, ple_conv_kernel_size=4,
         ple_embed_dim=hidden, ple_layer_ids=[1], ngram_size=3,
         ngram_vocab_size_base=8, heads_per_ngram=4, split_ngram_parts=2,
         hidden_act="silu", output_gate_type="silu", rms_norm_eps=1e-6,
-        mtp_num_hidden_layers=0, eos_token_id=7,
+        mtp_num_hidden_layers=int(mtp), eos_token_id=7,
     )
     tensors = {}
 
@@ -73,6 +77,37 @@ def _models(tmp_path: Path) -> tuple[Path, Path]:
     for suffix, shape in {"gate": (intermediate, hidden), "up": (intermediate, hidden),
                           "down": (hidden, intermediate)}.items():
         weight(mlp + ".shared_expert." + suffix + ".weight", shape)
+
+    def attention(root):
+        heads, kv_heads, head_dim = (config[name] for name in
+            ("num_attention_heads", "num_key_value_heads", "head_dim"))
+        index_dim = config["indexer_head_dim"]
+        for suffix, shape in {
+            "query": (2 * heads * head_dim, hidden), "key": (kv_heads * head_dim, hidden),
+            "value": (kv_heads * head_dim, hidden), "output": (hidden, heads * head_dim),
+            "indexer.query_key": (2 * index_dim, hidden),
+        }.items():
+            weight(root + "." + suffix + ".weight", shape)
+        for suffix in ("query_norm", "key_norm", "indexer.query_norm", "indexer.key_norm"):
+            zero(root + "." + suffix + ".weight", (index_dim if suffix.startswith("indexer") else head_dim,))
+
+    if qsa:
+        for name, value in list(tensors.items()):
+            if name.startswith(mlp + ".") or name.startswith(block + ".attention.mhc."):
+                tensors[name.replace(block, "model.block.1", 1)] = value.copy()
+        attention("model.block.1.attention")
+    if mtp:
+        zero("predictor.embedding_norm.weight", (hidden,))
+        zero("predictor.hidden_norm.weight", (streams * hidden,))
+        weight("predictor.fusion.embedding.weight", (hidden, hidden))
+        weight("predictor.fusion.hidden.weight", (hidden, hidden))
+        mixer("predictor.mhc", False)
+        mixer("predictor.block.0.attention.mhc", True)
+        mixer("predictor.block.0.mlp.mhc", True)
+        attention("predictor.block.0.attention")
+        for name, value in list(tensors.items()):
+            if name.startswith(mlp + ".") and ".mhc." not in name:
+                tensors[name.replace(mlp, "predictor.block.0.mlp", 1)] = value.copy()
     ple = block + ".position_embedding"
     weight(ple + ".key.weight", (streams * hidden, hidden))
     weight(ple + ".value.weight", (hidden, hidden))
@@ -126,6 +161,162 @@ def test_native_qwen_ple_mixed_qk_matches_scaled_fp8_graph(tmp_path):
                             capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "batch logits passed" in result.stdout
+
+
+@pytest.mark.parametrize("mtp,qsa,wide", [(False, False, False), (True, False, False),
+    (False, True, False), (True, True, False), (True, True, True)])
+def test_native_flash_prefix_checkpoints(tmp_path, mtp, qsa, wide):
+    executable = Path(__file__).resolve().parents[1] / "build/cpp_runtime/metal/mfq-metal-nint-rows-test"
+    if not executable.is_file():
+        pytest.skip("build mfq-metal-nint-rows-test to exercise native prefix snapshots")
+    fp8, nint = _models(tmp_path, mtp=mtp, qsa=qsa, wide=wide)
+    result = subprocess.run([str(executable), "--qwen-prefix", str(fp8), str(nint)],
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "prefix checkpoints passed" in result.stdout
+
+
+def _worker_tokenizer(tmp_path, *, cacheable_tokens=False):
+    from mfq.server.runtime.hf_tokenizer import ensure_hf_tokenizer_gguf
+    from tests.test_hf_native_models import _hf_fixture
+    tokenizer_source = tmp_path / "tokenizer-source"
+    _hf_fixture(tokenizer_source)
+    config = json.loads((tokenizer_source / "config.json").read_text())
+    config["text_config"]["vocab_size"] = 32
+    (tokenizer_source / "config.json").write_text(json.dumps(config))
+    vocabulary = json.loads((tokenizer_source / "tokenizer.json").read_text())
+    vocabulary["model"]["vocab"].update({f"token{index}": index for index in range(5, 32)})
+    if cacheable_tokens:
+        vocabulary["added_tokens"].extend({"id": index, "content": f"token{index}", "special": False,
+            "single_word": False, "lstrip": False, "rstrip": False, "normalized": False}
+            for index in range(5, 32))
+    (tokenizer_source / "tokenizer.json").write_text(json.dumps(vocabulary))
+    return ensure_hf_tokenizer_gguf(tokenizer_source, tmp_path / "tokenizer-cache")
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_native_worker_reports_resource_breakdown_over_stdio(tmp_path, quantized):
+    from mfq.server.runtime.client import StdioRuntimeClient
+
+    executable = Path(__file__).resolve().parents[1] / "build/cpp_runtime/metal/mfq-decode-metal"
+    if not executable.is_file():
+        pytest.skip("build mfq-decode-metal to exercise real worker telemetry")
+    models = _models(tmp_path)
+    model = models[int(quantized)]
+    tokenizer = _worker_tokenizer(tmp_path)
+
+    async def run():
+        with (tmp_path / "worker.log").open("wb") as log:
+            process = await asyncio.create_subprocess_exec(str(executable), "--model", str(model),
+                "--tokenizer", str(tokenizer), "--transport", "stdio", "--ctx-size", "64",
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=log)
+            client = StdioRuntimeClient(process, control_timeout_seconds=10)
+            try:
+                status = await client.status()
+                assert status["resident_weight_bytes"] > 0
+                assert status["metal_wired_available"] == 1
+                assert status["metal_wired_bytes"] >= status["resident_weight_bytes"]
+                assert status["metal_wired_bytes"] <= status["metal_wired_limit_bytes"]
+                assert status["kv_cache_bytes"] == 0
+                assert status["kv_cache_contexts"] == 0
+                assert status["ssd_expert_enabled"] == 0
+                assert status["ssd_expert_payload_bytes"] == 0
+                assert status["ssd_ple_enabled"] == 1
+                with io.open_mmap(model) as store:
+                    expected = sum(record.nbytes for record in store.records.values()
+                        if ".position_embedding.ngram.shard." in record.name)
+                assert status["ssd_ple_payload_bytes"] == expected
+                repeated = await client.status()
+                assert repeated["resident_weight_bytes"] == status["resident_weight_bytes"]
+                assert repeated["kv_cache_bytes"] == 0
+                before = repeated["ple_source_bytes_read"]
+                async with client.generate({"messages": [{"role": "user", "content": "ab" * 4}],
+                        "temperature": 0, "max_tokens": 2, "stream": True}) as events:
+                    chunks = [event async for event in events if event is not None]
+                assert chunks
+                after = await client.status()
+                assert after["metal_wired_bytes"] >= status["resident_weight_bytes"]
+                assert after["metal_wired_limit_bytes"] == status["metal_wired_limit_bytes"]
+                assert after["ple_source_bytes_read"] > before
+                assert (await client.status())["ple_source_bytes_read"] == after["ple_source_bytes_read"]
+                await client.reload(32)
+                reloaded = await client.status()
+                assert reloaded["metal_wired_available"] == 1
+                assert reloaded["metal_wired_bytes"] >= reloaded["resident_weight_bytes"]
+                assert reloaded["metal_wired_limit_bytes"] == status["metal_wired_limit_bytes"]
+            finally:
+                with suppress(Exception):
+                    await client.aclose()
+                if process.returncode is None:
+                    process.terminate()
+                await asyncio.wait_for(process.wait(), timeout=5)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mtp,toggle,output", [(False, False, False), (True, False, False),
+    (True, True, False), (True, False, True)])
+def test_native_flash_short_prefix_survives_worker_restart(tmp_path, mtp, toggle, output):
+    from mfq.server.runtime.client import StdioRuntimeClient
+
+    executable = Path(__file__).resolve().parents[1] / "build/cpp_runtime/metal/mfq-decode-metal"
+    if not executable.is_file():
+        pytest.skip("build mfq-decode-metal to exercise persisted native prefix reuse")
+    _, model = _models(tmp_path, mtp=mtp, qsa=True)
+    tokenizer = _worker_tokenizer(tmp_path, cacheable_tokens=output)
+    environment = dict(os.environ, MFQ_SERVER_PREFIX_CACHE_DIR=str(tmp_path / "prefix-cache"),
+        MFQ_SERVER_PREFIX_CACHE_BLOCK_TOKENS="8192", MFQ_SERVER_PREFIX_CACHE_HOT_BYTES="0",
+        MFQ_SERVER_TRACE_SESSION_CACHE="1")
+
+    async def run_worker(restart, previous_output=""):
+        with (tmp_path / f"worker-{restart}.log").open("wb") as log:
+            process = await asyncio.create_subprocess_exec(str(executable), "--model", str(model),
+                "--tokenizer", str(tokenizer), "--transport", "stdio", "--ctx-size", "64",
+                env=environment, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=log)
+            client = StdioRuntimeClient(process, control_timeout_seconds=15)
+            try:
+                prompt = "ab" * (6 + 2 * restart) if not output else "ab" * 6 + previous_output + "ab" * (2 * restart)
+                request = {"messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0, "max_tokens": 8, "enable_mtp": mtp and (not toggle or restart > 0),
+                    "stream": True,
+                    "stream_options": {"include_usage": True}}
+                if not output:
+                    request["mfq_preformatted_prompt"] = prompt
+                async with client.generate(request) as events:
+                    chunks = [event async for event in events if event is not None]
+                status = await client.status()
+                assert chunks
+                assert status["prefix_cache_snapshots"] > 0, status
+                assert status["prefix_cache_hot_blocks"] == 0, status
+                if restart:
+                    if toggle and restart == 1:
+                        assert status["prefix_cache_hit_tokens"] == 0, status
+                    else:
+                        assert status["prefix_cache_hit_tokens"] >= 4 + 2 * restart, status
+                    if output:
+                        assert status["prefix_cache_hit_tokens"] > 6, status
+                trace = (tmp_path / f"worker-{restart}.log").read_text()
+                if not restart:
+                    assert "tokens=6 blocks=1" in trace, trace
+                assert "paged_codec_invalidate" not in trace
+                return "".join(choice.get("delta", {}).get("content", "")
+                    for event in chunks for choice in event.get("choices", []))
+            finally:
+                with suppress(Exception):
+                    await client.aclose()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    process.terminate()
+                    await asyncio.wait_for(process.wait(), timeout=5)
+
+    async def run():
+        previous_output = await run_worker(0)
+        await run_worker(1, previous_output)
+        if toggle:
+            await run_worker(2)
+
+    asyncio.run(run())
 
 
 def test_native_qwen_ple_rejects_mixed_fp8_nint_shards(tmp_path):

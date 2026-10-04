@@ -1,4 +1,3 @@
-/** 概览页负责展示运行快照、模型选择和端点复制。 */
 import { useEffect, useRef, useState } from 'react';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useSettings } from '../settings/SettingsProvider';
@@ -9,16 +8,18 @@ import {
   TMPanel,
   ModelMonogram,
   MetricTile,
-  UsageBar,
   EmptyPanel,
 } from '../../app/display';
 import { errorMessage, formatNumber, formatBytes, formatDuration } from '../../app/formatters';
 import { runtimeModelNames } from './modelSelection';
 import { displayPrefillMetric, preferPositiveMetric } from './metrics';
 import { RuntimeHero } from './RuntimeHero';
+import { MemoryHierarchy } from './MemoryHierarchy';
+import { openAIEndpoint } from './endpoint';
+import { getApiBaseUrl } from '../../shared/api/client';
 import { toast } from '../../stores/toastStore';
+import { ModelVendorMark } from '../../app/ModelVendorMark';
 
-/** 展示共享运行状态，页面卸载时清理复制提示计时器。 */
 export function OverviewPage() {
   const {
     runtime,
@@ -29,6 +30,7 @@ export function OverviewPage() {
     setSelectedModel: selectModel,
     refreshRuntime,
     loading: busy,
+    connectionRevision,
   } = useRuntime();
   const { tr } = useSettings();
   const [endpointCopied, setEndpointCopied] = useState(false);
@@ -43,10 +45,10 @@ export function OverviewPage() {
   const last = runtime?.last_request;
   const lastPrefill = displayPrefillMetric(last);
   const lastTtftMs = preferPositiveMetric(last?.ttft_ms, last?.complete_prefill_ms);
-  /** 复制当前服务地址，并在页面仍挂载时短暂展示成功状态。 */
+  const endpoint = openAIEndpoint(studio?.service_url || getApiBaseUrl());
   async function copyEndpoint() {
     try {
-      await navigator.clipboard.writeText(studio?.service_url || 'http://127.0.0.1:8090');
+      await navigator.clipboard.writeText(endpoint);
       setEndpointCopied(true);
       toast.success(tr('服务地址已复制到剪贴板', 'Endpoint URL copied to clipboard'));
       if (timer.current) clearTimeout(timer.current);
@@ -61,10 +63,6 @@ export function OverviewPage() {
       runtime?.process_resident_bytes ??
       0,
   );
-  const runtimeCache = Number(runtime?.mlx_cache_bytes ?? runtime?.cuda_reserved_bytes ?? 0);
-  const runtimeMemoryCapacity =
-    Number(runtime?.device_total_bytes || 0) || Math.max(runtimeMemory + runtimeCache, 1);
-  const runtimeDeviceFree = Number(runtime?.device_free_bytes || 0);
   const prefixCacheQueries = Number(runtime?.prefix_cache_queries || 0);
   const prefixCacheHits = Number(runtime?.prefix_cache_hits || 0);
   const prefixCacheHitRate =
@@ -141,9 +139,12 @@ export function OverviewPage() {
                       <strong title={name}>{name}</strong>
                       <small>{details || stateLabel}</small>
                     </span>
-                    <span className="runtime-status-pill ready">
-                      <i />
-                      {selected ? tr('当前', 'Current') : stateLabel}
+                    <span className="model-identity-trailing">
+                      <ModelVendorMark name={name} architecture={name === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined} />
+                      <span className="runtime-status-pill ready">
+                        <i />
+                        {selected ? tr('当前', 'Current') : stateLabel}
+                      </span>
                     </span>
                   </button>
                 );
@@ -203,67 +204,14 @@ export function OverviewPage() {
         <MetricTile
           label={tr('内存', 'Memory')}
           value={formatBytes(runtimeMemory)}
-          detail={
-            runtimeCache
-              ? tr(
-                  `分配器缓存 ${formatBytes(runtimeCache)}`,
-                  `${formatBytes(runtimeCache)} allocator cache`,
-                )
-              : tr('模型驻留', 'Runtime residency')
-          }
+          detail={tr('当前模型活动内存', 'Current model active memory')}
           icon="memory"
         />
       </div>
-      <SectionLabel title={tr('内存层级', 'Memory hierarchy')} />
+      <SectionLabel title={tr('资源概览', 'Resource overview')} />
       {runtime ? (
-        <TMPanel className="overview-memory-panel">
-          <div className="overview-memory-heading">
-            <div>
-              <h2>{tr('推理内存', 'Runtime memory')}</h2>
-              <p>
-                {tr(
-                  '模型驻留、分配器缓存与可复用前缀共享统一内存。',
-                  'Model residency, allocator cache, and reusable prefixes share unified memory.',
-                )}
-              </p>
-            </div>
-            <strong>{formatBytes(runtimeMemory + runtimeCache)}</strong>
-          </div>
-          <div className="overview-memory-bars">
-            <UsageBar
-              label={tr('模型与活动张量', 'Model and active tensors')}
-              used={runtimeMemory}
-              total={runtimeMemoryCapacity}
-            />
-            <UsageBar
-              label={tr('分配器缓存', 'Allocator cache')}
-              used={runtimeCache}
-              total={runtimeMemoryCapacity}
-            />
-          </div>
-          <div className="overview-memory-facts">
-            <span>
-              <Icon name="memory" size={13} />
-              {formatBytes(runtimeDeviceFree)} {tr('设备可用', 'device free')}
-            </span>
-            <span>
-              <Icon name="reuse" size={13} />
-              {formatNumber(runtime?.prefix_cache_snapshots || 0)}{' '}
-              {tr('个前缀快照', 'prefix snapshots')}
-            </span>
-            <span>
-              <Icon name="text-forward" size={13} />
-              {tr(
-                `已复用 ${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens`,
-                `${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens reused`,
-              )}
-            </span>
-            <span>
-              <Icon name="queue" size={13} />
-              {formatNumber(runtime?.active_requests || 0)} {tr('个活动请求', 'active requests')}
-            </span>
-          </div>
-        </TMPanel>
+        <MemoryHierarchy instances={instances} connectionRevision={connectionRevision}
+          memoryCapacityBytes={runtime.runtime_memory_effective_budget_bytes ?? runtime.runtime_memory_budget_bytes} />
       ) : (
         <EmptyPanel
           icon="memory"
@@ -289,7 +237,7 @@ export function OverviewPage() {
               <Icon name={endpointCopied ? 'check' : 'copy'} size={14} />
             </button>
           </div>
-          <code>{studio?.service_url || 'http://127.0.0.1:8090'}</code>
+          <code>{endpoint}</code>
           <p>
             {tr(
               '可直接用于 OpenAI SDK；默认回环地址不经过云端。',

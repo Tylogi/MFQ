@@ -4,6 +4,7 @@
 #include "mlx_legacy_tensor_compat.h"
 #include "mlx_minicpmo45.h"
 #include "mlx_moe.h"
+#include "mlx_memory_residency.h"
 #include "mlx_qwen4_causal_lm.h"
 #include "mlx_qwen35_causal_lm.h"
 #include "mlx_stream_sync.h"
@@ -572,11 +573,13 @@ void configure_mlx_metal() {
                 if (limit == 0) {
                     throw std::runtime_error("device returned a zero limit");
                 }
-                mlx::core::set_wired_limit(limit);
+                mfq::metal::MlxMemoryResidency::configure(limit);
                 std::cerr << "Metal wired memory limit: " << limit
                           << " bytes (device recommendation)\n";
             } catch (const std::exception& error) {
-                // Older MLX/macOS versions may not support memory wiring.
+                if (__builtin_available(macOS 15, *)) {
+                    throw;
+                }
                 std::cerr << "Warning: Metal memory residency unavailable: "
                           << error.what() << "\n";
             }
@@ -859,10 +862,22 @@ std::string metal_prefix_cache_compatibility_key(
     return key.str();
 }
 
+bool metal_prefix_nax_device() {
+    try {
+        const auto& info = mlx::core::device_info();
+        const auto found = info.find("architecture");
+        if (found != info.end()) if (const auto* architecture = std::get_if<std::string>(&found->second))
+            return mfq::metal::mlx_prefix_nax_architecture(*architecture);
+    } catch (const std::exception&) {
+    }
+    return false;
+}
+
 template <typename Runtime>
 std::shared_ptr<mfq::cache::PagedPrefixCache> make_metal_paged_cache(
     const mfq::metal::MfqContainer& container,
-    std::int64_t context_size) {
+    std::int64_t context_size,
+    int prefill_chunk_size) {
     using SessionState = decltype(
         std::declval<const Runtime&>().capture_text_session_state(
             std::declval<const std::vector<std::int64_t>&>()));
@@ -870,14 +885,19 @@ std::shared_ptr<mfq::cache::PagedPrefixCache> make_metal_paged_cache(
     if constexpr (!Codec::available) {
         (void)container;
         (void)context_size;
+        (void)prefill_chunk_size;
         return {};
     } else {
         if (const char* disabled =
                 std::getenv("MFQ_SERVER_DISABLE_PREFIX_CACHE")) {
             if (disabled[0] == '1') return {};
         }
+        constexpr bool recurrent = std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm> ||
+            std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>;
+        const auto default_block = mfq::metal::mlx_prefix_block_size(recurrent, prefill_chunk_size,
+            physical_memory_bytes(), metal_prefix_nax_device(), std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>);
         const auto block_size = cache_bytes_from_environment(
-            "MFQ_SERVER_PREFIX_CACHE_BLOCK_TOKENS", 256);
+            "MFQ_SERVER_PREFIX_CACHE_BLOCK_TOKENS", default_block);
         if (block_size == 0 || block_size > 65536) {
             throw std::runtime_error(
                 "MFQ_SERVER_PREFIX_CACHE_BLOCK_TOKENS must be in [1, 65536]");
@@ -963,6 +983,10 @@ public:
         return false;
     }
 
+    std::size_t block_size_tokens() const noexcept {
+        return paged_cache_ ? paged_cache_->block_size_tokens() : 256;
+    }
+
     std::size_t normalize_stable_prefix_tokens(
         std::size_t requested) const noexcept {
         if constexpr (requires {
@@ -980,14 +1004,15 @@ public:
         Runtime& runtime,
         const std::string& requested_session,
         const std::vector<std::int64_t>& prompt,
-        std::size_t maximum_prefix_tokens) {
+        std::size_t maximum_prefix_tokens,
+        bool require_mtp = false) {
         if constexpr (Codec::available) {
             if (paged_cache_) {
                 return restore_paged(
                     runtime,
                     requested_session,
                     prompt,
-                    maximum_prefix_tokens);
+                    maximum_prefix_tokens, require_mtp);
             }
         }
         if (requested_session.empty() || max_sessions_ == 0 ||
@@ -1198,6 +1223,7 @@ public:
                     {"prefix_cache_queries", static_cast<double>(value.queries)},
                     {"prefix_cache_hits", static_cast<double>(value.hits)},
                     {"prefix_cache_hit_tokens", static_cast<double>(value.hit_tokens)},
+                    {"prefix_cache_block_tokens", static_cast<double>(paged_cache_->block_size_tokens())},
                     {"prefix_cache_sessions", static_cast<double>(metric_sessions_.load())},
                     {"prefix_cache_snapshots", static_cast<double>(value.disk_blocks)},
                     {"prefix_cache_tokens", static_cast<double>(metric_tokens_.load())},
@@ -1306,7 +1332,8 @@ private:
         Runtime& runtime,
         const std::string& requested_session,
         const std::vector<std::int64_t>& prompt,
-        std::size_t maximum_prefix_tokens) {
+        std::size_t maximum_prefix_tokens,
+        bool require_mtp) {
         if (max_sessions_ == 0 || !runtime.supports_text_session_state() ||
             prompt.size() < 2) {
             return 0;
@@ -1329,15 +1356,21 @@ private:
         }
         if (payloads.size() != match.blocks.size()) {
             match.blocks.resize(payloads.size());
-            match.matched_tokens =
-                payloads.size() * paged_cache_->block_size_tokens();
+            if constexpr (requires { Codec::token_count(payloads.back()); })
+                match.matched_tokens = Codec::token_count(payloads.back());
+            else match.matched_tokens = payloads.size() * paged_cache_->block_size_tokens();
         }
         std::optional<SessionState> decoded;
         try {
             if constexpr (requires {
                     Codec::decodable_blocks(payloads);
                 }) {
-                const auto decodable = Codec::decodable_blocks(payloads);
+                auto decodable = Codec::decodable_blocks(payloads);
+                if constexpr (requires { Codec::has_mtp(payloads.back()); }) {
+                    if (require_mtp) while (decodable > 0 &&
+                        (!Codec::has_exact_boundary(payloads[decodable - 1]) ||
+                         !Codec::has_mtp(payloads[decodable - 1]))) --decodable;
+                }
                 if (decodable == 0) {
                     paged_cache_->record_match(0);
                     return 0;
@@ -1345,8 +1378,9 @@ private:
                 if (decodable < payloads.size()) {
                     payloads.resize(decodable);
                     match.blocks.resize(decodable);
-                    match.matched_tokens = decodable *
-                        paged_cache_->block_size_tokens();
+                    if constexpr (requires { Codec::token_count(payloads.back()); })
+                        match.matched_tokens = Codec::token_count(payloads.back());
+                    else match.matched_tokens = decodable * paged_cache_->block_size_tokens();
                 }
             }
             std::vector<std::int64_t> matched_tokens(
@@ -1412,10 +1446,20 @@ private:
                 return;
             }
         }
-        const auto full_blocks = state.tokens.size() / block_size;
+        constexpr bool tails = [] {
+            if constexpr (requires { Codec::supports_tail_blocks; }) return Codec::supports_tail_blocks;
+            else return false;
+        }();
+        const auto full_blocks = tails ? (state.tokens.size() + block_size - 1) / block_size
+            : state.tokens.size() / block_size;
         if (full_blocks == 0) return;
 
         auto existing = paged_cache_->match(state.tokens, {}, false);
+        if (existing.matched_tokens % block_size != 0 &&
+            existing.matched_tokens != state.tokens.size()) {
+            existing.blocks.pop_back();
+            existing.matched_tokens -= existing.matched_tokens % block_size;
+        }
         if (existing.blocks.size() > full_blocks) {
             throw std::runtime_error(
                 "paged prefix match exceeds the session state");
@@ -1431,7 +1475,7 @@ private:
             parent = paged_cache_->store(
                 parent,
                 state.tokens.data() + token_offset,
-                block_size,
+                std::min(block_size, state.tokens.size() - token_offset),
                 std::move(payload));
             blocks.push_back(parent);
         }
@@ -1447,7 +1491,12 @@ private:
                     {blocks.back()});
                 const bool exact = final_payload.size() == 1 &&
                     Codec::has_exact_boundary(final_payload.front());
-                if (!exact) {
+                bool upgrade_mtp = false;
+                if constexpr (requires { state.last_hidden; state.mtp_layers; Codec::has_mtp(final_payload.front()); }) {
+                    upgrade_mtp = state.last_hidden && (state.cache_position == 1 || !state.mtp_layers.empty()) &&
+                        (final_payload.empty() || !Codec::has_mtp(final_payload.front()));
+                }
+                if (!exact || upgrade_mtp) {
                     const auto index = full_blocks - 1;
                     const auto token_offset = index * block_size;
                     const mfq::cache::BlockHash checkpoint_parent =
@@ -1457,7 +1506,7 @@ private:
                     const auto refreshed = paged_cache_->replace(
                         checkpoint_parent,
                         state.tokens.data() + token_offset,
-                        block_size,
+                        std::min(block_size, state.tokens.size() - token_offset),
                         Codec::encode_block(state, block_size, index));
                     if (refreshed != blocks[index]) {
                         throw std::runtime_error(
@@ -1470,13 +1519,13 @@ private:
             bind_paged_session(
                 session_id,
                 std::move(blocks),
-                full_blocks * block_size);
+                std::min(full_blocks * block_size, state.tokens.size()));
         }
         if (trace_) {
             std::cerr
                 << "server_session_cache backend=metal action=paged_store "
                 << "session=" << session_id
-                << " tokens=" << full_blocks * block_size
+                << " tokens=" << std::min(full_blocks * block_size, state.tokens.size())
                 << " blocks=" << full_blocks << std::endl;
         }
     }
@@ -1661,7 +1710,8 @@ std::int32_t generate_with_prefill_metrics(
     const std::function<void(MfqPrefillTiming)>& on_prefill,
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
-    int prefill_chunk_size) {
+    int prefill_chunk_size,
+    const mfq::metal::MlxPrefixCacheHooks& prefix_cache = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
@@ -1679,7 +1729,8 @@ std::int32_t generate_with_prefill_metrics(
             ? std::optional<std::size_t>(
                   cache_plan.stable_prefix_tokens)
             : std::nullopt,
-        prefill_chunk_size);
+        prefill_chunk_size,
+        prefix_cache);
 }
 
 std::int32_t generate_with_prefill_metrics(
@@ -1691,7 +1742,8 @@ std::int32_t generate_with_prefill_metrics(
     const std::function<void(MfqPrefillTiming)>& on_prefill,
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
-    int prefill_chunk_size) {
+    int prefill_chunk_size,
+    const mfq::metal::MlxPrefixCacheHooks& = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
@@ -1721,7 +1773,8 @@ std::int32_t generate_with_prefill_metrics(
     const std::function<void(MfqPrefillTiming)>& on_prefill,
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
-    int prefill_chunk_size) {
+    int prefill_chunk_size,
+    const mfq::metal::MlxPrefixCacheHooks& = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
@@ -1752,7 +1805,8 @@ std::int32_t generate_with_prefill_metrics(
     const std::function<void(MfqPrefillTiming)>& on_prefill,
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
-    int prefill_chunk_size) {
+    int prefill_chunk_size,
+    const mfq::metal::MlxPrefixCacheHooks& = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
@@ -1782,7 +1836,8 @@ std::int32_t generate_with_prefill_metrics(
     const std::function<void(MfqPrefillTiming)>& on_prefill,
     const MfqPromptCachePlan& cache_plan,
     const MfqTokenConstraintPtr& token_constraint,
-    int) {
+    int prefill_chunk_size,
+    const mfq::metal::MlxPrefixCacheHooks& prefix_cache = {}) {
     std::function<void(std::size_t, double)> report_prefill;
     if (on_prefill) {
         report_prefill = [on_prefill](std::size_t tokens, double llm_ms) {
@@ -1798,7 +1853,9 @@ std::int32_t generate_with_prefill_metrics(
         token_constraint,
         cache_plan.stable_prefix_tokens > 0
             ? std::optional<std::size_t>(cache_plan.stable_prefix_tokens)
-            : std::nullopt);
+            : std::nullopt,
+        prefill_chunk_size,
+        prefix_cache);
 }
 
 template <typename Runtime, typename Loader>
@@ -1816,7 +1873,9 @@ public:
           session_cache(std::move(cache)), load_runtime(std::move(loader)),
           paged_cache_factory(std::move(factory)), loaded_context(std::move(context)),
           runtime_stream(stream), prefill_chunk_size(chunk_size),
-          allocator_cache_limit(cache_limit), runtime_components(std::move(components)) {}
+          allocator_cache_limit(cache_limit), runtime_components(std::move(components)) {
+        capture_weight_residency();
+    }
 
     void generate(mfq::engine::InferenceRequest& request,
                   mfq::metal::MlxGenerationJob& job) override {
@@ -1872,23 +1931,53 @@ public:
                         loaded_runtime,
                         cache_plan.session_id,
                         prompt,
-                        stable_prefix_tokens);
+                        stable_prefix_tokens, parameters.enable_mtp && runtime_components.mtp_available &&
+                            sampling.max_tokens > 1);
                 }
                 auto effective_cache_plan = cache_plan;
                 effective_cache_plan.stable_prefix_tokens = cache_enabled
                     ? stable_prefix_tokens
                     : 0;
+                mfq::metal::MlxPrefixCacheHooks prefix_hooks;
+                auto cache_tokens = prompt;
+                std::size_t last_checkpoint = 0;
+                if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm> ||
+                    std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>) {
+                    if (cache_enabled) {
+                        prefix_hooks.block_size = session_cache->block_size_tokens();
+                        prefix_hooks.input_tokens = stable_prefix_tokens;
+                        prefix_hooks.output_tokens = cache_plan.cache_output_tokens;
+                        prefix_hooks.capture = [&](std::size_t position) {
+                            if (position == last_checkpoint || position > cache_tokens.size()) return;
+                            try {
+                                session_cache->store(cache_plan.session_id,
+                                    loaded_runtime.capture_text_session_state(
+                                        std::vector<std::int64_t>(cache_tokens.begin(),
+                                            cache_tokens.begin() + static_cast<std::ptrdiff_t>(position)), false));
+                                last_checkpoint = position;
+                            } catch (const std::exception& error) {
+                                std::cerr << "server_session_cache backend=metal action=skip error="
+                                          << error.what() << std::endl;
+                            }
+                        };
+                    }
+                }
+                const auto cached_callback = [&](std::int64_t token) {
+                    cache_tokens.push_back(token);
+                    return !callback || callback(token);
+                };
                 const auto generated = generate_with_prefill_metrics(
                     loaded_runtime,
                     prompt,
                     parameters,
                     sampling.max_tokens,
-                    callback,
+                    cached_callback,
                     on_prefill,
                     effective_cache_plan,
                     token_constraint,
-                    prefill_chunk_size);
-                if (cache_enabled &&
+                    prefill_chunk_size,
+                    prefix_hooks);
+                if (!prefix_hooks && cache_enabled &&
                     loaded_runtime.cache_position() ==
                         static_cast<int>(stable_prefix_tokens)) {
                     try {
@@ -1957,6 +2046,7 @@ public:
                     "MFQ_SERVER_PREFIX_CACHE_HOT_BYTES",
                     2ULL * 1024ULL * 1024ULL * 1024ULL));
             release_model_load_staging_memory(runtime_stream);
+            capture_weight_residency();
             *loaded_context = requested_context;
             const auto seconds =
                 std::chrono::duration<double>(
@@ -1990,6 +2080,7 @@ public:
                         "MFQ_SERVER_PREFIX_CACHE_HOT_BYTES",
                         2ULL * 1024ULL * 1024ULL * 1024ULL));
                 release_model_load_staging_memory(runtime_stream);
+                capture_weight_residency();
                 *loaded_context = previous_context;
             } catch (const std::exception& restore_error) {
                 throw std::runtime_error(
@@ -2049,14 +2140,43 @@ public:
     }
 
 private:
+    void capture_weight_residency() {
+        mfq::metal::MlxMemoryResidency::refresh();
+        const auto usage = mfq::metal::MlxResourceTelemetry::snapshot();
+        const auto other = usage.cache_bytes + usage.dynamic_weight_bytes;
+        const auto active = mlx::core::get_active_memory();
+        resident_weight_baseline = active > other ? active - other : 0;
+    }
+
     mfq::engine::Metrics metrics() const {
         std::vector<std::pair<std::string, double>> metrics{
             {"mlx_active_bytes", static_cast<double>(mlx::core::get_active_memory())},
             {"mlx_cache_bytes", static_cast<double>(mlx::core::get_cache_memory())},
             {"mlx_cache_limit_bytes", static_cast<double>(allocator_cache_limit)},
             {"mlx_peak_bytes", static_cast<double>(mlx::core::get_peak_memory())},
+            {"metal_wired_limit_bytes", static_cast<double>(
+                mfq::metal::MlxMemoryResidency::configured_limit())},
+            {"metal_wired_bytes", static_cast<double>(
+                mfq::metal::MlxMemoryResidency::wired_bytes())},
+            {"metal_wired_available",
+                mfq::metal::MlxMemoryResidency::configured_limit() > 0 ? 1.0 : 0.0},
+            {"ple_source_bytes_read", static_cast<double>(
+                mfq::metal::MlxResourceTelemetry::ple_read_counter().load(std::memory_order_relaxed))},
         };
         std::unique_lock lock(*runtime_mutex, std::try_to_lock);
+        if (lock.owns_lock() && runtime_holder->has_value()) {
+            const auto usage = mfq::metal::MlxResourceTelemetry::snapshot();
+            metrics.emplace_back("resident_weight_bytes", static_cast<double>(
+                resident_weight_baseline + usage.dynamic_weight_bytes));
+            metrics.emplace_back("kv_cache_bytes", static_cast<double>(usage.cache_bytes));
+            metrics.emplace_back("kv_cache_contexts", static_cast<double>(usage.contexts));
+            const auto ple = usage.ple_payload_bytes;
+            const auto experts = usage.expert_payload_bytes;
+            metrics.emplace_back("ssd_ple_enabled", ple > 0 ? 1.0 : 0.0);
+            metrics.emplace_back("ssd_ple_payload_bytes", static_cast<double>(ple));
+            metrics.emplace_back("ssd_expert_enabled", experts > 0 ? 1.0 : 0.0);
+            metrics.emplace_back("ssd_expert_payload_bytes", static_cast<double>(experts));
+        }
         if constexpr (requires(Runtime& value) {
                 value.supports_mtp();
             }) {
@@ -2248,6 +2368,7 @@ private:
     mlx::core::Stream runtime_stream;
     int prefill_chunk_size;
     std::size_t allocator_cache_limit;
+    std::size_t resident_weight_baseline = 0;
     mfq::metal::MlxEngineComponents runtime_components;
 };
 
@@ -2261,6 +2382,8 @@ int run_loaded_runtime(
     std::int64_t maximum_context,
     std::int64_t vocabulary_size,
     mlx::core::Stream runtime_stream) {
+    container.stop_load_observation();
+    std::cerr << "mfq_load_progress stage=finalizing" << std::endl;
     constexpr const char* tokenizer_asset =
         "__mfq_asset__/tokenizer.gguf";
     if constexpr (requires(Runtime& value) {
@@ -2272,6 +2395,12 @@ int run_loaded_runtime(
     int prefill_chunk_size = arguments.prefill_chunk_size;
     if (!arguments.prefill_chunk_size_explicit &&
         prefill_autotune_enabled()) {
+        if constexpr (std::is_same_v<Runtime, mfq::metal::MlxQwen35CausalLm> ||
+            std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>) {
+            prefill_chunk_size = static_cast<int>(mfq::metal::mlx_prefix_block_size(true,
+                prefill_chunk_size, physical_memory_bytes(), metal_prefix_nax_device(),
+                std::is_same_v<Runtime, mfq::metal::MlxQwen4CausalLm>));
+        }
         if constexpr (requires(const Runtime& value) {
                 value.preferred_prefill_chunk_size(prefill_chunk_size);
             }) {
@@ -2327,10 +2456,10 @@ int run_loaded_runtime(
         std::make_shared<std::optional<Runtime>>(
             std::move(model));
     const auto paged_cache_factory =
-        [&container](std::int64_t context_size)
+        [&container, prefill_chunk_size](std::int64_t context_size)
             -> std::shared_ptr<mfq::cache::PagedPrefixCache> {
             return make_metal_paged_cache<Runtime>(
-                container, context_size);
+                container, context_size, prefill_chunk_size);
         };
     auto session_cache =
         std::make_shared<MlxServerTextSessionCache<Runtime>>(
@@ -2393,6 +2522,10 @@ int run_loaded_runtime(
 int run_native_runtime(
     const Arguments& arguments,
     const mfq::metal::MfqContainer& container) {
+    container.observe_load_records([](std::size_t completed, std::size_t total) {
+        std::cerr << "mfq_load_progress completed=" << completed
+                  << " total=" << total << std::endl;
+    });
     constexpr const char* tokenizer_asset =
         "__mfq_asset__/tokenizer.gguf";
     if (!container.contains(tokenizer_asset) &&

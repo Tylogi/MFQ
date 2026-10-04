@@ -1,4 +1,3 @@
-/** 运行配置面板独立管理配置列表、名称草稿和保存加载操作。 */
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { runtimeApi } from '../../shared/api/resources/runtime';
@@ -12,8 +11,8 @@ import { errorMessage } from '../../app/formatters';
 import { studioConfirm } from '../../studio';
 import { STUDIO_PATHS } from '../../navigation';
 import { toast } from '../../stores/toastStore';
+import { ModelVendorMark } from '../../app/ModelVendorMark';
 
-/** 按需读取模型与配置档案，保存当前实例策略及推理参数。 */
 export function RuntimeProfilesPanel() {
   const { runtime, instances, realtime, ready, setSelectedModel, refreshRuntime } = useRuntime();
   const { settings, tr, contextSize } = useSettings();
@@ -48,7 +47,6 @@ export function RuntimeProfilesPanel() {
       active = false;
     };
   }, [ready, runtime?.model]);
-  /** 提交缓存或配置操作，保留确认语义并刷新对应资源。 */
   async function saveRuntimeProfile() {
     const name = profileName.replace(/\s+/g, ' ').trim();
     const artifact = artifacts.find((item) => item.name === runtime?.model);
@@ -91,7 +89,6 @@ export function RuntimeProfilesPanel() {
     }
   }
 
-  /** 提交缓存或配置操作，保留确认语义并刷新对应资源。 */
   async function loadRuntimeProfile(profile: RuntimeProfile) {
     if (busy) return;
     if (
@@ -118,7 +115,6 @@ export function RuntimeProfilesPanel() {
     }
   }
 
-  /** 提交缓存或配置操作，保留确认语义并刷新对应资源。 */
   async function deleteRuntimeProfile(id: string) {
     if (busy) return;
     setBusy(true);
@@ -171,7 +167,7 @@ export function RuntimeProfilesPanel() {
             {runtimeProfiles.map((profile) => (
               <div className={`profile-row ${profile.drifted ? 'drifted' : ''}`} key={profile.id}>
                 <div>
-                  <strong>{profile.name}</strong>
+                  <strong className="model-identity-label">{profile.name}<ModelVendorMark name={profile.load.model} architecture={artifacts.find((item) => item.id === profile.artifact_id)?.architecture} size={20} /></strong>
                   <small>
                     {profile.load.context_size.toLocaleString()} ctx ·{' '}
                     {profile.load.prefill_chunk_size.toLocaleString()} chunk

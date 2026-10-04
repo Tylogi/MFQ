@@ -4,7 +4,7 @@ import { useSettings } from '../features/settings/SettingsProvider';
 import { ScreenHeader } from './display';
 
 const tools = [
-  { path: '/model-hub', zh: '模型仓库', en: 'Model hub',
+  { path: '/model-hub', zh: '模型下载', en: 'Model downloads',
     detail: ['浏览模型，选择适合设备的精度版本。', 'Find models and precision tiers for your device.'] },
   { path: '/evaluations', zh: '评测与数据集', en: 'Evaluations',
     detail: ['管理评测任务与校准数据集。', 'Manage evaluations and calibration datasets.'] },

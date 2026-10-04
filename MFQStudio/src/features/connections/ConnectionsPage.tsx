@@ -1,47 +1,60 @@
-/** 连接页面负责服务器配置草稿、凭据保存及服务重连，业务状态不流入应用外壳。 */
 import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router';
-import { connectionsApi } from '../../shared/api/resources/connections';
 import { Icon, ScreenHeader, SectionLabel, SettingRow, TMPanel } from '../../app/display';
-import { errorMessage, formatBytes, formatNumber } from '../../app/formatters';
-import { STUDIO_PATHS } from '../../navigation';
+import { errorMessage } from '../../app/formatters';
 import {
   configureStudio,
+  isStudio,
   saveStudioCredential,
-  studioConfirm,
   studioCredential,
   type StudioConfig,
 } from '../../studio';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { runtimeModelNames } from '../runtime/modelSelection';
-import { modeTemplateSettings, type GenerationSettings } from '../settings/configuration';
+import { runtimeApi } from '../../shared/api/resources/runtime';
+import { getApiBaseUrl, setApiToken, setBrowserServiceUrl } from '../../shared/api/client';
 import { useSettings } from '../settings/SettingsProvider';
 import { ToolsRoutingPanel } from './ToolsRoutingPanel';
 import { MemorySettingsPanel } from './MemorySettingsPanel';
+import { RuntimeProfilesPanel } from '../runtime/RuntimeProfilesPanel';
+import { ModelAliasMapping } from './ModelAliasMapping';
 import { toast } from '../../stores/toastStore';
-import { InferenceDefaultsPanel } from './InferenceDefaultsPanel';
 
-/** 提供运行配置、内存与缓存概览，以及连接页自己的保存和重载操作。 */
+function browserConfig(): StudioConfig {
+  const address = getApiBaseUrl() || 'http://127.0.0.1:8090';
+  const url = new URL(address);
+  return {
+    mode: ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) ? 'local' : 'remote',
+    remote_url: address, local_service_port: Number(url.port) || 8090,
+  };
+}
+
 export function ConnectionsPage() {
-  const { settings, replaceSettings, tr, contextSize, setContextSize } = useSettings();
+  const { tr } = useSettings();
   const {
     runtime,
-    realtime,
     models,
     instances,
     selectedModel,
-    setSelectedModel,
     studio,
     reloadService,
-    refreshRuntime,
   } = useRuntime();
-  const navigate = useNavigate();
-  const [draft, setDraft] = useState<StudioConfig | null>(studio?.config ?? null);
+  const [draft, setDraft] = useState<StudioConfig>(() => studio?.config ?? browserConfig());
+  const [listeningPort, setListeningPort] = useState<number | null>(null);
   const [token, setToken] = useState('');
   const [credentialWritable, setCredentialWritable] = useState(false);
   const [busy, setBusy] = useState(false);
   useEffect(() => {
-    setDraft(studio?.config ?? null);
+    if (studio) setDraft(studio.config);
+    else {
+      let disposed = false;
+      void runtimeApi.runtimeListener().then((listener) => {
+        if (!disposed) {
+          setDraft((current) => ({ ...current, local_service_port: listener.port }));
+          setListeningPort(listener.port);
+        }
+      }).catch(() => {});
+      return () => { disposed = true; };
+    }
   }, [studio]);
   useEffect(() => {
     let disposed = false;
@@ -58,17 +71,45 @@ export function ConnectionsPage() {
       disposed = true;
     };
   }, []);
-  const active = Boolean(studio?.reachable);
+  const active = Boolean(studio?.reachable ?? runtime);
   const modelNames = runtimeModelNames(models, instances);
 
 
-  /** 将局部服务草稿提交平台并触发应用级连接版本更新。 */
   async function save() {
     if (!draft || busy) return;
     setBusy(true);
     try {
-      await configureStudio(draft);
-      if (credentialWritable) await saveStudioCredential(token);
+      if (!Number.isInteger(draft.local_service_port) || draft.local_service_port < 1 || draft.local_service_port > 65535) {
+        throw new Error(tr('端口必须为 1–65535 的整数', 'Port must be an integer between 1 and 65535'));
+      }
+      if (isStudio()) {
+        if (studio?.config.mode === 'local' && draft.mode === 'local'
+            && studio.config.local_service_port !== draft.local_service_port) {
+          await runtimeApi.configureRuntimeListener(draft.local_service_port);
+        }
+        await configureStudio(draft);
+        if (credentialWritable) await saveStudioCredential(token);
+      } else {
+        let address = draft.remote_url.trim().replace(/\/+$/, '').replace(/\/v1$/, '');
+        if (draft.mode === 'local') {
+          if (browserConfig().mode === 'local') await runtimeApi.configureRuntimeListener(draft.local_service_port);
+          address = `http://127.0.0.1:${draft.local_service_port}`;
+        } else {
+          const parsed = new URL(address);
+          if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {
+            throw new Error(tr('请输入不含凭据的 HTTP 或 HTTPS 服务地址', 'Enter an HTTP or HTTPS service URL without credentials'));
+          }
+        }
+        setBrowserServiceUrl(address);
+        if (credentialWritable) setApiToken(token);
+        if (draft.mode === 'local' && window.location.port === String(listeningPort)
+            && listeningPort !== draft.local_service_port) {
+          const page = new URL(window.location.href);
+          page.port = String(draft.local_service_port);
+          window.location.assign(page.toString());
+          return;
+        }
+      }
       const reconnected = await reloadService();
       setCredentialWritable(false);
       if (reconnected) toast.success(tr('服务器设置已保存', 'Server settings saved'));
@@ -83,7 +124,7 @@ export function ConnectionsPage() {
   return (
     <section className="dashboard-view">
       <ScreenHeader
-        title={tr('服务器', 'Server')}
+        title={tr('服务', 'Service')}
         subtitle={tr(
           '运行服务、连接与模型默认值。',
           'Runtime service, connections, and model defaults.',
@@ -105,22 +146,6 @@ export function ConnectionsPage() {
         <TMPanel className="server-settings-panel">
           <div className="setting-list">
             <SettingRow
-              title={tr('Runtime 可执行文件', 'Runtime executable')}
-              detail={tr(
-                '应用已包含推理服务，并自动使用本机 Metal Runtime。',
-                'The packaged app includes the inference server and discovers the local Metal runtime automatically.',
-              )}
-              trailing={
-                <div className="server-row-actions">
-                  <code>mfq-cli → mfq-decode-metal</code>
-                  <span className={`runtime-status-pill ${active ? 'running' : 'stopped'}`}>
-                    <i />
-                    {active ? tr('已连接', 'Connected') : tr('离线', 'Offline')}
-                  </span>
-                </div>
-              }
-            />
-            <SettingRow
               title={tr('模型 ID', 'Model ID')}
               detail={tr(
                 '由 /v1/models 公布，并用于对话补全请求。',
@@ -128,27 +153,7 @@ export function ConnectionsPage() {
               )}
               trailing={
                 <div className="server-row-actions server-model-control">
-                  {modelNames.length > 1 ? (
-                    <select
-                      aria-label={tr('当前模型', 'Current model')}
-                      disabled={busy}
-                      onChange={(event) => setSelectedModel(event.target.value)}
-                      value={selectedModel}
-                    >
-                      {modelNames.map((name) => (
-                        <option key={name} value={name}>
-                          {name}
-                        </option>
-                      ))}
-                    </select>
-                  ) : (
-                    <strong title={selectedModel}>
-                      {selectedModel || tr('尚未加载', 'Not loaded')}
-                    </strong>
-                  )}
-                  <button onClick={() => navigate(STUDIO_PATHS.models)} type="button">
-                    {tr('选择…', 'Choose…')}
-                  </button>
+                  <ModelAliasMapping models={modelNames} selectedModel={selectedModel} />
                 </div>
               }
             />
@@ -204,8 +209,8 @@ export function ConnectionsPage() {
                 <SettingRow
                   title={tr('API 密钥', 'API key')}
                   detail={tr(
-                    '凭据只保存在系统凭据库中。',
-                    'The credential is stored only in the system credential vault.',
+                    isStudio() ? '凭据只保存在系统凭据库中。' : '凭据仅保留在当前页面内存中。',
+                    isStudio() ? 'The credential is stored only in the system credential vault.' : 'The credential stays only in this page’s memory.',
                   )}
                   trailing={
                     <input
@@ -253,7 +258,6 @@ export function ConnectionsPage() {
           </div>
         </TMPanel>
         <MemorySettingsPanel />
-        <InferenceDefaultsPanel />
         <SectionLabel title={tr('自动化', 'Automation')} />
         <TMPanel className="server-settings-panel">
           <div className="setting-list">
@@ -279,7 +283,6 @@ export function ConnectionsPage() {
           </div>
         </TMPanel>
         <div className="server-page-footer">
-          <span>{tr('对话默认值会自动保存。', 'Chat defaults are saved automatically.')}</span>
           <button
             className="primary"
             disabled={busy || !draft}
@@ -290,6 +293,7 @@ export function ConnectionsPage() {
           </button>
         </div>
       </div>
+      <RuntimeProfilesPanel />
       <ToolsRoutingPanel />
     </section>
   );

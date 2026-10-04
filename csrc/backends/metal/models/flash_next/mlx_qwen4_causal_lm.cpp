@@ -1,6 +1,7 @@
 #include "mlx_qwen4_causal_lm.h"
 
 #include "mlx_eval_timing.h"
+#include "mlx_detached_copy.h"
 #include "qwen4_ops.h"
 #include "mlx_legacy_tensor_compat.h"
 #include "mlx_linear_attention.h"
@@ -230,8 +231,7 @@ public:
         if (model.record(gate).dtype == "MFE" &&
             model.record(up).dtype == "MFE") {
             return Qwen4RoutedWeight(
-                load_routed_gate_up_weight(model, prefix)
-                    .materialize_packed_projections());
+                load_routed_gate_up_weight(model, prefix));
         }
         auto gate_values = dense(model, gate);
         auto up_values = dense(model, up);
@@ -1202,6 +1202,8 @@ public:
                 const auto shard = static_cast<std::size_t>(row / rows_);
                 shards_[shard].nint->append_row(row % rows_, selected);
             }
+            MlxResourceTelemetry::ple_read_counter().fetch_add(
+                selected.source_bytes_read(), std::memory_order_relaxed);
             return mlx::core::reshape(
                 selected.decode(), Shape{batch, tokens, heads * static_cast<int>(width_)});
         }
@@ -1223,6 +1225,8 @@ public:
         auto output = array(
             result.begin(),
             Shape{batch, tokens, heads * static_cast<int>(width_)});
+        MlxResourceTelemetry::ple_read_counter().fetch_add(
+            global.size() * static_cast<std::size_t>(width_), std::memory_order_relaxed);
         return output;
     }
 
@@ -1275,6 +1279,9 @@ private:
             width_ * static_cast<std::int64_t>(heads) != config_.hidden_size) {
             throw std::runtime_error("Qwen4 PLE embedding metadata disagrees");
         }
+        std::size_t payload = 0;
+        for (const auto& shard : shards_) payload += shard.mapping.size();
+        resources_.set({0, 0, 0, 0, payload});
     }
 
     Qwen4Config config_;
@@ -1287,10 +1294,32 @@ private:
     std::vector<std::int64_t> vocab_;
     int batch_ = 0;
     std::vector<std::int64_t> context_;
+    MlxResourceTelemetry resources_;
 };
 
 class Qwen4Ple {
 public:
+    void snapshot(MlxQwen4LayerCacheSnapshot& state) const {
+        if (!convolution_state_ || rollback_) throw std::runtime_error("PLE checkpoint is not committed");
+        state.ple_convolution = detached_copy(*convolution_state_);
+        state.ple_convolution->eval();
+        state.ple_context = embedding_.context();
+    }
+
+    void restore(const MlxQwen4LayerCacheSnapshot& state) {
+        if (!state.ple_convolution || state.ple_context.size() !=
+            static_cast<std::size_t>(state.batch * (config_.ngram_size - 1)) ||
+            state.ple_convolution->shape() != Shape{state.batch,
+                static_cast<int>((config_.ple_conv_kernel_size - 1) * config_.ngram_size),
+                static_cast<int>(config_.hc_count * config_.hidden_size)} ||
+            state.ple_convolution->dtype() != mlx::core::float32)
+            throw std::runtime_error("PLE checkpoint topology mismatch");
+        reset(state.batch);
+        convolution_state_ = detached_copy(*state.ple_convolution);
+        convolution_state_->eval();
+        embedding_.restore_context(state.ple_context);
+        resources_.set({cache_bytes(), static_cast<std::size_t>(batch_)});
+    }
     static Qwen4Ple load(
         const MfqContainer& model,
         const Qwen4Config& config,
@@ -1311,12 +1340,18 @@ public:
         convolution_state_.reset();
         rollback_.reset();
         batch_ = batch;
+        resources_.set({});
     }
 
     void clear() noexcept {
         convolution_state_.reset();
         rollback_.reset();
         batch_ = 0;
+        resources_.set({});
+    }
+
+    std::size_t cache_bytes() const noexcept {
+        return convolution_state_ ? convolution_state_->nbytes() : 0;
     }
 
     array forward(
@@ -1357,6 +1392,7 @@ public:
                 return forward(hidden_streams, token_ids, true);
             } catch (...) {
                 convolution_state_ = rollback_->convolution_state;
+                resources_.set({cache_bytes(), static_cast<std::size_t>(batch_)});
                 embedding_.restore_context(
                     std::move(rollback_->ngram_context));
                 rollback_.reset();
@@ -1424,7 +1460,10 @@ public:
             convolution_weight_,
             use_cache ? convolution_state_ : std::nullopt,
             static_cast<int>(config_.ngram_size));
-        if (use_cache) convolution_state_ = convolution.state;
+        if (use_cache) {
+            convolution_state_ = convolution.state;
+            resources_.set({cache_bytes(), static_cast<std::size_t>(batch_)});
+        }
         auto output = gated + convolution.output;
         return output.dtype() == hidden_streams.dtype()
             ? output : mlx::core::astype(output, hidden_streams.dtype());
@@ -1458,6 +1497,7 @@ public:
             rollback_->convolution_state,
             static_cast<int>(config_.ngram_size));
         convolution_state_ = std::move(convolution.state);
+        resources_.set({cache_bytes(), static_cast<std::size_t>(batch_)});
         embedding_.restore_context(std::move(rollback_->ngram_context));
         embedding_.advance_context(*rollback_->token_ids, keep);
         rollback_.reset();
@@ -1501,6 +1541,7 @@ private:
     array norm_conv_;
     array convolution_weight_;
     std::optional<array> convolution_state_;
+    MlxResourceTelemetry resources_;
     std::optional<Rollback> rollback_;
     int batch_ = 0;
 };
@@ -1517,8 +1558,11 @@ public:
         int speculative_confirmed = 0) = 0;
     virtual void reset(int batch) = 0;
     virtual void clear() noexcept = 0;
+    virtual std::size_t cache_bytes() const noexcept = 0;
     virtual void commit_speculative() noexcept = 0;
     virtual void rollback_speculative(int accepted_tokens) = 0;
+    virtual MlxQwen4LayerCacheSnapshot snapshot(bool detached) const = 0;
+    virtual void restore(const MlxQwen4LayerCacheSnapshot& state) = 0;
     virtual void trim_cache_to(int) {
         throw std::runtime_error(
             "Qwen4 attention cache does not support arbitrary trimming");
@@ -1527,6 +1571,41 @@ public:
 
 class Qwen4Gdn final : public Qwen4Attention {
 public:
+    MlxQwen4LayerCacheSnapshot snapshot(bool) const override {
+        if (!convolution_state_ || !recurrent_state_ || rollback_ || position_ <= 0)
+            throw std::runtime_error("GDN checkpoint is not committed");
+        MlxQwen4LayerCacheSnapshot state;
+        state.position = position_;
+        state.batch = batch_;
+        state.convolution = detached_copy(*convolution_state_);
+        state.recurrent = detached_copy(*recurrent_state_);
+        mlx::core::eval(*state.convolution, *state.recurrent);
+        return state;
+    }
+
+    void restore(const MlxQwen4LayerCacheSnapshot& state) override {
+        if (state.kv || !state.convolution || !state.recurrent || state.batch != 1 ||
+            state.position <= 0 || state.position > config_.max_position_embeddings ||
+            state.convolution->shape() != Shape{state.batch,
+                static_cast<int>(config_.linear_conv_kernel_dim - 1), 2 * key_width() + value_width()} ||
+            state.recurrent->shape() != Shape{state.batch,
+                static_cast<int>(config_.linear_num_value_heads),
+                static_cast<int>(config_.linear_value_head_dim),
+                static_cast<int>(config_.linear_value_head_dim)} ||
+            state.convolution->dtype() != mlx::core::float32 || state.recurrent->dtype() != mlx::core::float32)
+            throw std::runtime_error("GDN checkpoint topology mismatch");
+        convolution_state_ = detached_copy(*state.convolution);
+        recurrent_state_ = detached_copy(*state.recurrent);
+        mlx::core::eval(*convolution_state_, *recurrent_state_);
+        batch_ = state.batch;
+        position_ = state.position;
+        rollback_.reset();
+        resources_.set({cache_bytes(), static_cast<std::size_t>(batch_)});
+    }
+    std::size_t cache_bytes() const noexcept override {
+        return (convolution_state_ ? convolution_state_->nbytes() : 0) +
+            (recurrent_state_ ? recurrent_state_->nbytes() : 0);
+    }
     std::string_view profile_name() const noexcept override {
         return "qwen4.linear_attention";
     }
@@ -1570,6 +1649,7 @@ public:
         rollback_.reset();
         batch_ = batch;
         position_ = 0;
+        resources_.set({cache_bytes(), static_cast<std::size_t>(batch_)});
     }
 
     void clear() noexcept override {
@@ -1578,6 +1658,7 @@ public:
         rollback_.reset();
         batch_ = 0;
         position_ = 0;
+        resources_.set({});
     }
 
     array forward(
@@ -1854,6 +1935,7 @@ private:
     MlxLinear output_;
     std::optional<array> convolution_state_;
     std::optional<array> recurrent_state_;
+    MlxResourceTelemetry resources_;
     std::optional<MlxGatedDeltaSpeculativeState> rollback_;
     int batch_ = 0;
     int position_ = 0;
@@ -1861,6 +1943,41 @@ private:
 
 class Qwen4Qsa final : public Qwen4Attention {
 public:
+    MlxQwen4LayerCacheSnapshot snapshot(bool detached) const override {
+        if (!cache_ || speculative_trim_ || index_cache_.position() != cache_->position())
+            throw std::runtime_error("QSA checkpoint is not committed");
+        MlxQwen4LayerCacheSnapshot state;
+        state.position = cache_->position();
+        state.batch = batch_;
+        state.kv = cache_->snapshot(detached);
+        state.index_keys = detached ? detached_copy(index_cache_.view()) : index_cache_.view();
+        if (pooled_index_cache_.position() > 0)
+            state.pooled_keys = detached ? detached_copy(pooled_index_cache_.view()) : pooled_index_cache_.view();
+        state.index_keys->eval();
+        if (state.pooled_keys) state.pooled_keys->eval();
+        return state;
+    }
+
+    void restore(const MlxQwen4LayerCacheSnapshot& state) override {
+        const int width = static_cast<int>(config_.indexer_head_dim);
+        const int pooled = state.position / static_cast<int>(config_.indexer_compress_ratio);
+        if (!state.kv || !state.index_keys || state.batch != 1 || state.position <= 0 ||
+            state.position > maximum_ || state.kv->position != state.position ||
+            state.index_keys->shape() != Shape{state.batch, state.position, width} ||
+            (state.pooled_keys && (state.pooled_keys->ndim() != 3 ||
+                state.pooled_keys->shape(0) != state.batch || state.pooled_keys->shape(1) <= 0 ||
+                state.pooled_keys->shape(1) > pooled || state.pooled_keys->shape(2) != width)))
+            throw std::runtime_error("QSA checkpoint topology mismatch");
+        reset(state.batch);
+        cache_->restore_snapshot(*state.kv);
+        index_cache_.append(*state.index_keys);
+        if (state.pooled_keys) pooled_index_cache_.append(*state.pooled_keys);
+    }
+    std::size_t cache_bytes() const noexcept override {
+        return (cache_ ? cache_->key_storage().nbytes() +
+            cache_->value_storage().nbytes() : 0) +
+            index_cache_.storage_bytes() + pooled_index_cache_.storage_bytes();
+    }
     std::string_view profile_name() const noexcept override {
         return "qwen4.full_attention";
     }
@@ -2331,6 +2448,21 @@ private:
 
 class Qwen4Layer {
 public:
+    MlxQwen4LayerCacheSnapshot snapshot(bool detached = true) const {
+        auto state = attention_->snapshot(detached);
+        if (ple_) ple_->snapshot(state);
+        return state;
+    }
+
+    void restore(const MlxQwen4LayerCacheSnapshot& state) {
+        if (bool(ple_) != bool(state.ple_convolution))
+            throw std::runtime_error("PLE checkpoint layer changed");
+        attention_->restore(state);
+        if (ple_) ple_->restore(state);
+    }
+    std::size_t cache_bytes() const noexcept {
+        return attention_->cache_bytes() + (ple_ ? ple_->cache_bytes() : 0);
+    }
     static Qwen4Layer load(
         const MfqContainer& model,
         const Qwen4Config& config,
@@ -2500,6 +2632,36 @@ struct Qwen4MtpForward {
 
 class Qwen4Mtp {
 public:
+    std::vector<MlxQwen4LayerCacheSnapshot> snapshot(int position) const {
+        std::vector<MlxQwen4LayerCacheSnapshot> result;
+        if (position == 0) return result;
+        if (position < 0 || position > position_) throw std::runtime_error("MTP checkpoint position mismatch");
+        for (const auto& layer : layers_) {
+            auto state = layer.snapshot();
+            state.position = position;
+            state.kv->position = position;
+            const Shape begin{0, 0, 0, 0};
+            const Shape end{state.batch, state.kv->heads, position, state.kv->head_dimension};
+            state.kv->key = mlx::core::slice(state.kv->key, begin, end);
+            state.kv->value = mlx::core::slice(state.kv->value, begin, end);
+            state.index_keys = mlx::core::slice(*state.index_keys, Shape{0, 0, 0},
+                Shape{state.batch, position, state.index_keys->shape(2)});
+            const int pooled = position / static_cast<int>(config_.indexer_compress_ratio);
+            if (pooled == 0 || !state.pooled_keys) state.pooled_keys.reset();
+            else state.pooled_keys = mlx::core::slice(*state.pooled_keys, Shape{0, 0, 0},
+                Shape{state.batch, std::min(pooled, state.pooled_keys->shape(1)), state.pooled_keys->shape(2)});
+            result.push_back(std::move(state));
+        }
+        return result;
+    }
+
+    void restore(const std::vector<MlxQwen4LayerCacheSnapshot>& state) {
+        reset(1);
+        if (state.empty()) return;
+        if (state.size() != layers_.size()) throw std::runtime_error("MTP checkpoint layer count mismatch");
+        for (std::size_t i = 0; i < state.size(); ++i) layers_[i].restore(state[i]);
+        position_ = state.front().position;
+    }
     MlxMtpPredictorDescriptor mtp_descriptor() const noexcept {
         return MlxMtpPredictorDescriptor::recurrent(
             kQwen4MtpMaximumDraftDepth);
@@ -2660,6 +2822,12 @@ public:
 
     int cache_position() const noexcept {
         return position_;
+    }
+
+    std::size_t cache_bytes() const noexcept {
+        std::size_t bytes = 0;
+        for (const auto& layer : layers_) bytes += layer.cache_bytes();
+        return bytes;
     }
 
     void trim_cache_to(int position) {
@@ -2955,7 +3123,7 @@ struct MlxQwen4CausalLm::Impl {
             throw std::runtime_error(
                 "Qwen4 predictor topology disagrees with model config");
         }
-        return std::unique_ptr<Impl>(new Impl(
+        auto result = std::unique_ptr<Impl>(new Impl(
             std::move(config),
             maximum,
             std::move(embedding),
@@ -2965,6 +3133,29 @@ struct MlxQwen4CausalLm::Impl {
             std::move(mtp),
             std::move(ssd_expert_cache),
             std::move(mfe_offload_cache)));
+        // Count backing payloads once at load time, not on every UI refresh.
+        for (const auto layer : result->config.ple_layer_ids) {
+            const auto prefix = "model.block." + std::to_string(layer - 1) +
+                ".position_embedding.ngram.shard.";
+            for (std::int64_t shard = 0; shard < result->config.split_ngram_parts; ++shard) {
+                result->ple_payload_bytes += model.record(prefix +
+                    std::to_string(shard) + ".weight").nbytes;
+            }
+        }
+        for (const auto& root : {std::string("model"), std::string("predictor")}) {
+            const auto count = root == "model" ? result->config.num_hidden_layers :
+                (result->mtp ? result->config.mtp_num_hidden_layers : 0);
+            for (std::int64_t layer = 0; layer < count; ++layer) {
+                const auto prefix = root + ".block." + std::to_string(layer) + ".mlp.experts.";
+                for (const auto* projection : {"gate", "up", "gate_up", "down"}) {
+                    for (const auto* suffix : {".weight", ".weight_scale"}) {
+                        const auto name = prefix + projection + suffix;
+                        if (model.contains(name)) result->expert_payload_bytes += model.record(name).nbytes;
+                    }
+                }
+            }
+        }
+        return result;
     }
 
     std::pair<array, array> forward_with_hidden(
@@ -3117,6 +3308,9 @@ struct MlxQwen4CausalLm::Impl {
         cache_batch = batch;
         cache_position = 0;
         speculative_pending = false;
+        stable_tokens.clear();
+        last_cache_hidden.reset();
+        stable_mtp_ready = false;
     }
 
     void clear() noexcept {
@@ -3125,6 +3319,9 @@ struct MlxQwen4CausalLm::Impl {
         cache_batch = 0;
         cache_position = 0;
         speculative_pending = false;
+        stable_tokens.clear();
+        last_cache_hidden.reset();
+        stable_mtp_ready = false;
     }
 
 private:
@@ -3162,6 +3359,11 @@ public:
     int cache_batch = 0;
     int cache_position = 0;
     bool speculative_pending = false;
+    std::vector<std::int64_t> stable_tokens;
+    std::optional<array> last_cache_hidden;
+    bool stable_mtp_ready = false;
+    std::size_t ple_payload_bytes = 0;
+    std::size_t expert_payload_bytes = 0;
 };
 
 MlxQwen4CausalLm::MlxQwen4CausalLm(std::unique_ptr<Impl> impl)
@@ -3196,6 +3398,30 @@ void MlxQwen4CausalLm::clear_cache() noexcept {
     impl_->clear();
 }
 
+std::size_t MlxQwen4CausalLm::kv_cache_bytes() const noexcept {
+    std::size_t bytes = 0;
+    for (const auto& layer : impl_->layers) bytes += layer.cache_bytes();
+    if (impl_->mtp) bytes += impl_->mtp->cache_bytes();
+    return bytes;
+}
+
+std::size_t MlxQwen4CausalLm::kv_cache_contexts() const noexcept {
+    return kv_cache_bytes() == 0 ? 0 : static_cast<std::size_t>(impl_->cache_batch);
+}
+
+std::size_t MlxQwen4CausalLm::dynamic_weight_bytes() const noexcept {
+    // MXFP4 arenas are preallocated and already part of the load baseline.
+    return impl_->mfe_offload_cache ? impl_->mfe_offload_cache->resident_packed_bytes() : 0;
+}
+
+std::size_t MlxQwen4CausalLm::ssd_ple_payload_bytes() const noexcept {
+    return impl_->ple_payload_bytes;
+}
+
+std::size_t MlxQwen4CausalLm::ssd_expert_payload_bytes() const noexcept {
+    return (impl_->ssd_expert_cache || impl_->mfe_offload_cache) ? impl_->expert_payload_bytes : 0;
+}
+
 std::int32_t MlxQwen4CausalLm::generate(
     const std::vector<std::int64_t>& prompt,
     const MlxSamplingParams& sampling,
@@ -3203,7 +3429,9 @@ std::int32_t MlxQwen4CausalLm::generate(
     const std::function<bool(std::int64_t)>& callback,
     const std::function<void(std::size_t, double)>& prefill_callback,
     const MfqTokenConstraintPtr& token_constraint,
-    std::optional<std::size_t>) {
+    std::optional<std::size_t> stable_prefix_tokens,
+    int prefill_chunk_size,
+    const MlxPrefixCacheHooks& prefix_cache) {
     if (prompt.empty()) {
         throw std::invalid_argument("Qwen4 generation prompt cannot be empty");
     }
@@ -3236,7 +3464,17 @@ std::int32_t MlxQwen4CausalLm::generate(
         limit > 1;
     impl_->last_mtp_stats = {
         impl_->mtp.has_value(), mtp_active, 0, 0, 0};
-    reset_cache(1);
+    std::size_t reused = 0;
+    if (stable_prefix_tokens && (!mtp_active || impl_->stable_mtp_ready) &&
+        impl_->cache_batch == 1 && !impl_->stable_tokens.empty() &&
+        impl_->cache_position == static_cast<int>(impl_->stable_tokens.size()) &&
+        impl_->stable_tokens.size() <= *stable_prefix_tokens && impl_->stable_tokens.size() < prompt.size() &&
+        std::equal(impl_->stable_tokens.begin(), impl_->stable_tokens.end(), prompt.begin())) {
+        reused = impl_->stable_tokens.size();
+    } else {
+        reset_cache(1);
+    }
+    if (prefill_chunk_size <= 0) throw std::invalid_argument("Qwen4 prefill chunk size must be positive");
     const array prompt_ids(
         values.begin(), Shape{1, static_cast<int>(values.size())},
         mlx::core::int32);
@@ -3256,13 +3494,38 @@ std::int32_t MlxQwen4CausalLm::generate(
             profile_prefill ? &component_profile : nullptr);
         detail::ScopedMlxEvaluationTiming timing(
             prefill_callback ? &prefill_ms : nullptr);
-        auto prefill = impl_->forward_with_hidden(
-            prompt_ids, true, true);
-        if (mtp_active) {
-            prefill_hidden = std::move(prefill.second);
+        std::optional<array> last_logits;
+        for (std::size_t offset = reused; offset < prompt.size();) {
+            const auto end = prefix_cache.prefill_end(offset, std::min(prompt.size(),
+                offset + static_cast<std::size_t>(prefill_chunk_size)));
+            auto ids = mlx::core::slice(prompt_ids, Shape{0, static_cast<int>(offset)},
+                Shape{1, static_cast<int>(end)});
+            auto prefill = impl_->forward_with_hidden(ids, true, true);
+            last_logits = std::move(prefill.first);
+            if (prefix_cache) {
+                if (mtp_active) {
+                    mlx_prime_mtp_chunk(prefill.second, ids, impl_->last_cache_hidden,
+                        [&](const array& rows, const array& shifted, int) {
+                            return impl_->mtp->forward(rows, shifted, impl_->embedding, true).sample_hidden;
+                        }, static_cast<int>(offset));
+                    impl_->stable_mtp_ready = true;
+                } else {
+                    impl_->last_cache_hidden = mlx::core::slice(prefill.second,
+                        Shape{0, prefill.second.shape(1) - 1, 0},
+                        Shape{1, prefill.second.shape(1), prefill.second.shape(2)});
+                }
+                prefix_cache.checkpoint(end);
+            }
+            if (mtp_active) {
+                if (prefix_cache) prefill_hidden = impl_->last_cache_hidden;
+                else if (prefill_hidden) prefill_hidden = mlx::core::concatenate({*prefill_hidden, prefill.second}, 1);
+                else prefill_hidden = std::move(prefill.second);
+            }
+            if (end < prompt.size()) last_logits->eval();
+            offset = end;
         }
         auto value = mlx_last_token_logits(
-            prefill.first, vocab);
+            *last_logits, vocab);
         if (profile_prefill) {
             detail::profile_eval("qwen4.output", value);
         } else if (prefill_callback) {
@@ -3298,7 +3561,7 @@ std::int32_t MlxQwen4CausalLm::generate(
                 << std::endl;
         }
     }
-    if (prefill_callback) prefill_callback(prompt.size(), prefill_ms);
+    if (prefill_callback) prefill_callback(prompt.size() - reused, prefill_ms);
 
     MlxSampler sampler(sampling);
     if (mtp_active) {
@@ -3307,7 +3570,7 @@ std::int32_t MlxQwen4CausalLm::generate(
                 throw std::runtime_error(
                     "Qwen4 MTP prefill did not retain hidden streams");
             }
-            if (prompt_ids.shape(1) > 1) {
+            if (prompt_ids.shape(1) > 1 && !prefix_cache) {
                 mlx_prime_mtp_history(
                     *prefill_hidden,
                     prompt_ids,
@@ -3325,22 +3588,56 @@ std::int32_t MlxQwen4CausalLm::generate(
             // later speculative cycle.  The adapter supplies only the final
             // prompt hidden row; pairing it with the engine's pending token
             // completes the teacher-forced predictor seam.
+            const int hidden_count = prefill_hidden->shape(1);
             auto initial_hidden = mlx::core::slice(
                 *prefill_hidden,
-                Shape{0, prompt_ids.shape(1) - 1, 0},
+                Shape{0, hidden_count - 1, 0},
                 Shape{
                     1,
-                    prompt_ids.shape(1),
+                    hidden_count,
                     static_cast<int>(
                         impl_->config.hc_count * impl_->config.hidden_size),
                 });
             int predictor_history_position =
                 impl_->mtp->cache_position();
+            int folded_history = 0;
+            std::optional<MlxMtpDraftContext> terminal_context;
+            std::optional<array> terminal_hidden;
+            std::vector<std::int32_t> terminal_ids;
+            const int hidden_width = static_cast<int>(impl_->config.hc_count * impl_->config.hidden_size);
+            const auto commit_checkpoint = [&](const MlxMtpDraftContext& context, bool terminal) {
+                const int accepted = context.accepted_drafts;
+                impl_->last_cache_hidden = mlx::core::slice(*context.verified_hidden,
+                    Shape{0, accepted, 0}, Shape{1, accepted + 1, hidden_width});
+                if (!prefix_cache.wants(impl_->cache_position, terminal)) return;
+                impl_->mtp->trim_cache_to(predictor_history_position);
+                if (accepted > 0) {
+                    auto rows = mlx::core::slice(*context.verified_hidden, Shape{0, 0, 0},
+                        Shape{1, accepted, hidden_width});
+                    array shifted(context.next_token_ids.begin(), Shape{1, accepted}, mlx::core::int32);
+                    auto value = impl_->mtp->forward(rows, shifted, impl_->embedding, true);
+                    value.sample_hidden.eval();
+                    predictor_history_position += accepted;
+                    folded_history = accepted;
+                }
+                prefix_cache.checkpoint(impl_->cache_position, terminal);
+            };
 
             MlxMtpEngineCallbacks mtp_callbacks;
             mtp_callbacks.predictor = impl_->mtp->mtp_descriptor();
             mtp_callbacks.target_cache_position = [&] {
                 return impl_->cache_position;
+            };
+            mtp_callbacks.draft_limit = [&](int position, int depth) {
+                return prefix_cache.draft_limit(position, depth);
+            };
+            if (prefix_cache) mtp_callbacks.committed_target = [&](const MlxMtpDraftContext& context) {
+                terminal_hidden = *context.verified_hidden;
+                terminal_ids.assign(context.next_token_ids.begin(), context.next_token_ids.end());
+                terminal_context = context;
+                terminal_context->verified_hidden = &*terminal_hidden;
+                terminal_context->next_token_ids = terminal_ids;
+                commit_checkpoint(*terminal_context, false);
             };
             mtp_callbacks.prepare_draft =
                 [&, initial_hidden](
@@ -3370,12 +3667,18 @@ std::int32_t MlxQwen4CausalLm::generate(
                             context.next_token_ids.begin(),
                             context.next_token_ids.end());
                     }
-                    const int committed = static_cast<int>(next_ids.size());
                     // Draft-chain forwards append speculative QSA entries.
                     // Keep the persistent predictor cache committed-only;
                     // the verified history below rebuilds the next boundary.
                     impl_->mtp->trim_cache_to(
                         predictor_history_position);
+                    if (folded_history > 0) {
+                        hidden_rows = mlx::core::slice(hidden_rows, Shape{0, folded_history, 0},
+                            Shape{1, hidden_rows.shape(1), hidden_width});
+                        next_ids.erase(next_ids.begin(), next_ids.begin() + folded_history);
+                        folded_history = 0;
+                    }
+                    const int committed = static_cast<int>(next_ids.size());
                     const array committed_ids(
                         next_ids.begin(),
                         Shape{1, committed},
@@ -3454,7 +3757,7 @@ std::int32_t MlxQwen4CausalLm::generate(
                 };
             const std::array<std::int64_t, 1> eos{
                 impl_->config.eos_token_id};
-            return run_mlx_mtp_generation(
+            const auto result = run_mlx_mtp_generation(
                 MlxMtpEngineRequest{
                     vocab,
                     limit,
@@ -3471,6 +3774,9 @@ std::int32_t MlxQwen4CausalLm::generate(
                 },
                 mtp_callbacks,
                 impl_->last_mtp_stats);
+            if (terminal_context && folded_history == 0) commit_checkpoint(*terminal_context, true);
+            else prefix_cache.checkpoint(impl_->cache_position, true);
+            return result;
         } catch (...) {
             try {
                 impl_->reset(1);
@@ -3532,7 +3838,14 @@ std::int32_t MlxQwen4CausalLm::generate(
         detail::ScopedComponentProfile decode_profile_scope(
             profile_step ? &decode_profile : nullptr);
         const auto decode_started = std::chrono::steady_clock::now();
-        logits = mlx_last_token_logits(forward(token_ids, true), vocab);
+        if (prefix_cache) {
+            auto result = impl_->forward_with_hidden(token_ids, true, false);
+            impl_->last_cache_hidden = result.second;
+            logits = mlx_last_token_logits(result.first, vocab);
+            prefix_cache.checkpoint(impl_->cache_position);
+        } else {
+            logits = mlx_last_token_logits(forward(token_ids, true), vocab);
+        }
         if (profile_step) {
             detail::profile_eval("qwen4.output", logits);
             const double wall_ms = std::chrono::duration<double, std::milli>(
@@ -3551,6 +3864,7 @@ std::int32_t MlxQwen4CausalLm::generate(
             }
         }
     }
+    prefix_cache.checkpoint(impl_->cache_position, true);
     return generated;
 }
 
@@ -3616,15 +3930,56 @@ void MlxQwen4CausalLm::clear_expert_cache() {
 }
 
 MlxQwen4TextSessionState MlxQwen4CausalLm::capture_text_session_state(
-    const std::vector<std::int64_t>&) const {
-    throw std::runtime_error(
-        "Qwen4 persistent text-session snapshots are not enabled yet");
+    const std::vector<std::int64_t>& tokens, bool detached) const {
+    if (impl_->cache_batch != 1 || impl_->cache_position <= 0 || impl_->speculative_pending ||
+        tokens.size() != static_cast<std::size_t>(impl_->cache_position))
+        throw std::runtime_error("Qwen4 checkpoint token count mismatch");
+    MlxQwen4TextSessionState state;
+    state.tokens = tokens;
+    state.cache_position = impl_->cache_position;
+    state.cache_batch = impl_->cache_batch;
+    for (const auto& layer : impl_->layers) state.layers.push_back(layer.snapshot(detached));
+    if (impl_->mtp && impl_->last_cache_hidden &&
+        impl_->mtp->cache_position() >= impl_->cache_position - 1) {
+        state.mtp_layers = impl_->mtp->snapshot(impl_->cache_position - 1);
+        state.last_hidden = impl_->last_cache_hidden;
+    }
+    const auto bytes = [&](const MlxQwen4LayerCacheSnapshot& layer) {
+        if (layer.kv) state.bytes += layer.kv->nbytes();
+        for (const auto* value : {&layer.index_keys, &layer.pooled_keys, &layer.convolution,
+            &layer.recurrent, &layer.ple_convolution}) if (*value) state.bytes += (*value)->nbytes();
+        state.bytes += layer.ple_context.size() * sizeof(std::int64_t);
+    };
+    for (const auto& layer : state.layers) bytes(layer);
+    for (const auto& layer : state.mtp_layers) bytes(layer);
+    if (state.last_hidden) state.bytes += state.last_hidden->nbytes();
+    return state;
 }
 
 void MlxQwen4CausalLm::restore_text_session_state(
-    const MlxQwen4TextSessionState&) {
-    throw std::runtime_error(
-        "Qwen4 persistent text-session snapshots are not enabled yet");
+    const MlxQwen4TextSessionState& state) {
+    if (state.cache_batch != 1 || state.cache_position <= 0 || state.cache_position > impl_->maximum ||
+        state.tokens.size() != static_cast<std::size_t>(state.cache_position) ||
+        state.layers.size() != impl_->layers.size())
+        throw std::runtime_error("Qwen4 checkpoint topology mismatch");
+    try {
+        for (std::size_t i = 0; i < state.layers.size(); ++i) {
+            if (state.layers[i].position != state.cache_position || state.layers[i].batch != state.cache_batch)
+                throw std::runtime_error("Qwen4 checkpoint layer position mismatch");
+            impl_->layers[i].restore(state.layers[i]);
+        }
+        if (impl_->mtp) impl_->mtp->restore(state.mtp_layers);
+        impl_->cache_position = state.cache_position;
+        impl_->cache_batch = state.cache_batch;
+        impl_->stable_tokens = state.tokens;
+        impl_->last_cache_hidden = state.last_hidden;
+        impl_->stable_mtp_ready = state.last_hidden.has_value() &&
+            (state.cache_position == 1 || !state.mtp_layers.empty());
+        impl_->speculative_pending = false;
+    } catch (...) {
+        clear_cache();
+        throw;
+    }
 }
 
 } // namespace mfq::metal

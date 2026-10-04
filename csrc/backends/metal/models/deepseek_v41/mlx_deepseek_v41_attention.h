@@ -2,6 +2,7 @@
 
 #include "deepseek_v41_model.h"
 #include "mlx_tensor.h"
+#include "mlx_resource_telemetry.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -30,6 +31,7 @@ struct MlxDeepseekV41AttentionState {
     int compressed_length = 0;
     int partial_length = 0;
     std::shared_ptr<MlxDeepseekV41AttentionSpeculation> speculation;
+    MlxResourceTelemetry resources;
 
     static MlxDeepseekV41AttentionState allocate(
         const DeepseekV41Config& config,

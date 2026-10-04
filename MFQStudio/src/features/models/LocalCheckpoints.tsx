@@ -1,10 +1,10 @@
-/** 本地检查点目录列表及模型加载入口。 */
 import { useSettings } from '../settings/SettingsProvider';
 import { Icon, SectionLabel, TMPanel, EmptyPanel } from '../../app/display';
 import { formatNumber } from '../../app/formatters';
 import type { useModelCatalog } from './useModelCatalog';
+import { ModelVendorMark } from '../../app/ModelVendorMark';
+import { ModelLoadProgress } from './ModelLoadProgress';
 
-/** 展示已登记检查点及加载能力。 */
 export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
   const { tr } = useSettings();
   const { runtime, artifacts, busy, instances, modelFilter,
@@ -34,11 +34,12 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                   <div>
                     <strong>{item.name}</strong>
                     <small>
-                      {item.architecture} · {item.shard_count} shards ·{' '}
+                      {item.architecture} · {item.missing_shards ? tr(`分片不全，缺 ${item.missing_shards} 片`, `${item.missing_shards} shards missing`) : item.complete ? `${item.shard_count} ${tr('个分片', 'shards')}` : tr('文件无效', 'Invalid file')} ·{' '}
                       {formatNumber(item.total_bytes / 2 ** 30, 1)} GB{policy ? ` · ${policy}` : ''}
                     </small>
+                    <ModelLoadProgress model={item.name} />
                   </div>
-                  {instance ? (
+                  <div className="model-row-actions"><ModelVendorMark name={item.name} architecture={item.architecture} />{instance ? (
                     <button disabled={busy || instance.state !== 'ready'}
                       onClick={() => void unloadInstance(instance.id)} type="button">
                       {tr('卸载', 'Unload')}
@@ -48,13 +49,14 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                   ) : !item.loadable ? (
                     <em className="failed" title={item.error || undefined}>
                       {item.complete && item.format === 'hf'
-                        ? tr('需先转换', 'Convert first') : tr('不可用', 'Invalid')}
+                        ? tr('需先转换', 'Convert first') : item.missing_shards
+                          ? tr('分片不全', 'Incomplete shards') : tr('不可用', 'Invalid')}
                     </em>
                   ) : (
                     <button disabled={busy} onClick={() => void loadArtifact(item.name)} type="button">
                       {tr('加载', 'Load')}
                     </button>
-                  )}
+                  )}</div>
                 </div>
               );
             })}

@@ -137,6 +137,7 @@ public:
 
 private:
     void validate_components() const;
+    void report_cache_resources() noexcept;
 
     Qwen35Config config_;
     bool gguf_layout_ = false;
@@ -163,6 +164,7 @@ private:
     std::optional<mlx::core::array> recurrent_state_;
     std::optional<mlx::core::array> zero_convolution_state_;
     std::optional<mlx::core::array> zero_recurrent_state_;
+    MlxResourceTelemetry resources_;
     int zero_cache_batch_ = 0;
     int cache_position_ = 0;
     int cache_batch_ = 0;

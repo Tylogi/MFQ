@@ -113,7 +113,10 @@ endif()
 
 if(TARGET mfq-runtime-communication)
     mfq_add_core_test(mfq-runtime-transport-test mfq_runtime_transport_test.cpp)
-    target_link_libraries(mfq-runtime-transport-test PRIVATE mfq-runtime-communication)
+    target_link_libraries(mfq-runtime-transport-test PRIVATE mfq-runtime-communication mfq-json)
+    target_include_directories(mfq-runtime-transport-test PRIVATE
+        ${PROJECT_SOURCE_DIR}/transport/src
+    )
 
     add_executable(mfq-runtime-profile-test mfq_runtime_profile_test.cpp)
     target_link_libraries(mfq-runtime-profile-test PRIVATE mfq-runtime-communication)

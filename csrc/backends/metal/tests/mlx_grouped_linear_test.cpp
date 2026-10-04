@@ -1355,6 +1355,20 @@ int main() {
             adaptive_rows,
             {&adaptive_q, &adaptive_k, &adaptive_v},
             0.3f);
+        require_rows_match(
+            adaptive_qkv,
+            slice(adaptive_input, Shape{0, 0}, Shape{1, kInputSize}),
+            adaptive_source,
+            1,
+            {&adaptive_q, &adaptive_k, &adaptive_v},
+            0.3f);
+        require_rows_match(
+            adaptive_qkv,
+            astype(slice(adaptive_input, Shape{0, 0}, Shape{1, kInputSize}), float32),
+            adaptive_source,
+            1,
+            {&adaptive_q, &adaptive_k, &adaptive_v},
+            0.3f);
 
         // MiniCPM uses K=4096 with GS24, so the final packed group has eight
         // padded weights. Keep non-zero values immediately after the logical

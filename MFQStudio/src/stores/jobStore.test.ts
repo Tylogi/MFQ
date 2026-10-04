@@ -42,6 +42,24 @@ describe('jobStore 后台任务状态管理', () => {
     expect(state.activeJobIds).toEqual([]);
   });
 
+  it('历史事件和延迟快照不能倒退当前进度，重连从已消费序号继续', () => {
+    useJobStore.getState().setJobs([{ ...mockJob1, progress: 0.7, updated_at: '2026-09-23T10:10:00Z' }]);
+    let receive!: (event: JobEventResource) => void;
+    const stream = vi.spyOn(jobsApi, 'streamJobEvents').mockImplementation((_id, onEvent) => {
+      receive = onEvent;
+      return new Promise<void>(() => {});
+    });
+    const stop = useJobStore.getState().streamJobEvents('job-1');
+    receive({ job_id: 'job-1', sequence: 8, type: 'progress', level: 'info', data: {}, progress: 0.2, created_at: '2026-09-23T10:05:00Z' });
+    useJobStore.getState().setJobs([{ ...mockJob1, progress: 0.1 }]);
+    expect(useJobStore.getState().jobs[0].progress).toBe(0.7);
+    stop();
+    useJobStore.getState().streamJobEvents('job-1');
+    expect(stream.mock.calls[1][3]).toBe(8);
+    receive({ job_id: 'job-1', sequence: 9, type: 'progress', level: 'info', data: {}, progress: 0.8, created_at: '2026-09-23T10:11:00Z' });
+    expect(useJobStore.getState().jobs[0].progress).toBe(0.8);
+  });
+
   it('setJobs 设置任务列表并正确提取活跃任务标识', () => {
     useJobStore.getState().setJobs([mockJob1, mockJob2]);
     const state = useJobStore.getState();
@@ -126,6 +144,7 @@ describe('jobStore 后台任务状态管理', () => {
       'job-1',
       expect.any(Function),
       expect.any(AbortSignal),
+      0,
     );
     expect(eventCallback).toBeDefined();
 

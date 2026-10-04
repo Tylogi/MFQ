@@ -1,4 +1,5 @@
 #include "mlx_moe.h"
+#include "mlx_resource_telemetry.h"
 
 #include "mfq_container.h"
 #include "mfq_mfe_prefill_embedded.h"
@@ -384,6 +385,7 @@ inline uint mfq_moe_read_bits(
         & ((1u << bits) - 1u);
 }
 
+template <bool ALIGNED_GROUP = true, bool WORD_QUAD = false>
 inline ushort4 mfq_moe_decode_nint_quad_at(
     device const uchar* stream,
     uint byte_index,
@@ -394,11 +396,21 @@ inline ushort4 mfq_moe_decode_nint_quad_at(
     packed_uchar4 bytes =
         *reinterpret_cast<device const packed_uchar4*>(stream + byte_index);
     uint packed = as_type<uint>(bytes);
-    if (shift != 0u) {
-        packed = (packed >> shift)
-            | (required_bits > 32u
-                ? uint(stream[byte_index + 4u]) << (32u - shift)
-                : 0u);
+    if constexpr (WORD_QUAD) {
+        if constexpr (ALIGNED_GROUP) {
+            if (shift != 0u) {
+                packed >>= shift;
+            }
+        } else {
+            packed >>= shift;
+        }
+    } else {
+        if (shift != 0u) {
+            packed = (packed >> shift)
+                | (required_bits > 32u
+                    ? uint(stream[byte_index + 4u]) << (32u - shift)
+                    : 0u);
+        }
     }
     uint mask = (1u << bits) - 1u;
     return ushort4(
@@ -504,7 +516,8 @@ inline void mfq_moe_nint_profile(
             activation_sum += activations.x + activations.y
                 + activations.z + activations.w;
             for (uint row = 0u; row < MATRIX_ROWS; ++row) {
-                ushort4 quantized = mfq_moe_decode_nint_quad_at(
+                ushort4 quantized = mfq_moe_decode_nint_quad_at<
+                    GROUP_SIZE % 8u == 0u, GROUP_SIZE % 4u == 0u>(
                     q_stream + q_offset,
                     q_byte_cursors[row],
                     q_bit_cursors[row],
@@ -617,6 +630,14 @@ inline float4 mfq_moe_load_code4(
         *(constant const char4*)(stream + offset));
 }
 
+inline uint mfq_moe_load_record4(device const uchar* stream, uint offset) {
+    return as_type<uint>(*(device const packed_uchar4*)(stream + offset));
+}
+
+inline uint mfq_moe_load_record4(constant const uchar* stream, uint offset) {
+    return as_type<uint>(*(constant const packed_uchar4*)(stream + offset));
+}
+
 template <
     uint VECTOR_SIZE,
     uint MATRIX_ROWS,
@@ -714,7 +735,8 @@ inline void mfq_moe_jsc_profile(
                 float(x[x_offset + column_base + 1u]),
                 float(x[x_offset + column_base + 2u]),
                 float(x[x_offset + column_base + 3u]));
-            float4 activation1 = float4(
+            float4 activation1 = (k_size & 7u) != 0u
+                && column_base + 4u >= k_size ? float4(0.0f) : float4(
                 float(x[x_offset + column_base + 4u]),
                 float(x[x_offset + column_base + 5u]),
                 float(x[x_offset + column_base + 6u]),
@@ -824,6 +846,78 @@ inline void mfq_moe_jsc_profile(
                     accumulators[row]);
             }
         }
+    }
+}
+
+template <uint MATRIX_ROWS, uint K, uint K_LANES, bool EXPANSION,
+          typename XStream, typename IndexStream, typename StateStream,
+          typename ScaleStream, typename CodebookStream>
+inline void mfq_moe_nvq3jl_profile(
+    XStream x,
+    IndexStream indices,
+    StateStream states,
+    ScaleStream scales,
+    CodebookStream codebooks,
+    thread const uint* outputs,
+    thread const float* anchors,
+    thread float* accumulators,
+    uint x_offset,
+    uint indices_offset,
+    uint state_offset,
+    uint scale_offset,
+    uint codebook_offset,
+    uint k_lane
+) {
+    constexpr uint GROUPS = (K + 23u) / 24u;
+    constexpr uint SIGNS = (K + 7u) / 8u;
+    constexpr bool FLAT_RECORDS = EXPANSION;
+    constexpr uint WORK = FLAT_RECORDS ? SIGNS : GROUPS;
+    uint state_rows[MATRIX_ROWS];
+    uint state_shifts[MATRIX_ROWS];
+    for (uint row = 0u; row < MATRIX_ROWS; ++row) {
+        state_rows[row] = outputs[row] * GROUPS;
+        state_shifts[row] = ((state_rows[row] + k_lane) & 1u) * 4u;
+    }
+    #pragma clang loop unroll_count(2)
+    for (uint work = k_lane; work < WORK; work += K_LANES) {
+        uint group = FLAT_RECORDS ? work / 3u : work;
+        float weight_scales[MATRIX_ROWS];
+        for (uint row = 0u; row < MATRIX_ROWS; ++row) {
+            uint state_index = state_rows[row] + group;
+            uint shift = FLAT_RECORDS ? (state_index & 1u) * 4u : state_shifts[row];
+            uint state = (uint(states[state_offset + (state_index >> 1u)])
+                >> shift) & 15u;
+            weight_scales[row] = scales[scale_offset + state];
+        }
+        for (uint block = 0u; block < (FLAT_RECORDS ? 1u : 3u); ++block) {
+            uint record_index = FLAT_RECORDS ? work : group * 3u + block;
+            uint column = record_index * 8u;
+            if (column >= K) break;
+            uint input = x_offset + column;
+            float4 activation0 = float4(float(x[input]), float(x[input + 1u]),
+                float(x[input + 2u]), float(x[input + 3u]));
+            float4 activation1 = column + 4u >= K ? float4(0.0f) : float4(
+                float(x[input + 4u]), float(x[input + 5u]),
+                float(x[input + 6u]), float(x[input + 7u]));
+            for (uint row = 0u; row < MATRIX_ROWS; ++row) {
+                uint offset = indices_offset + (outputs[row] * SIGNS + record_index) * 4u;
+                uint record = mfq_moe_load_record4(indices, offset);
+                uint index0 = record & 4095u;
+                uint index1 = (record >> 12u) & 4095u;
+                uint sign = record >> 24u;
+                float4 code0 = mfq_moe_load_code4(codebooks, codebook_offset + index0 * 4u);
+                float4 code1 = mfq_moe_load_code4(codebooks, codebook_offset + index1 * 4u);
+                code0 = select(code0, -code0, bool4((sign & 1u) != 0u,
+                    (sign & 2u) != 0u, (sign & 4u) != 0u, (sign & 8u) != 0u));
+                code1 = select(code1, -code1, bool4((sign & 16u) != 0u,
+                    (sign & 32u) != 0u, (sign & 64u) != 0u, (sign & 128u) != 0u));
+                float value = dot(activation0, code0) + dot(activation1, code1);
+                accumulators[row] = fma(weight_scales[row], value, accumulators[row]);
+            }
+        }
+    }
+    for (uint row = 0u; row < MATRIX_ROWS; ++row) {
+        accumulators[row] *= anchors[row];
     }
 }
 )METAL";
@@ -1377,37 +1471,22 @@ constexpr const char* kMoeSource = R"METAL(
             // 9/10-bit indices and 512/1024-entry codebooks. Keep the same
             // vectorized 24-column decoder instead of falling through to the
             // scalar, fully generic VQ loop.
-            mfq_moe_jsc_profile<
-                4u,
-                MATRIX_ROWS,
-                VQ_EXECUTION_LAYOUT
-            >(
-                x,
-                vq_indices,
-                vq_state,
-                vq_aux,
-                vq_scales,
-                vq_state_to_codebank,
-                vq_codebooks,
-                x_offset,
-                outputs,
-                row_anchors,
-                accumulators,
-                groups,
-                vectors,
-                index_bits,
-                entries,
-                indices_offset,
-                state_offset,
-                aux_offset,
-                codebook_offset,
-                scale_offset,
-                state_bank_offset,
-                signs,
-                k_lane,
-                K_LANES,
-                uint(K),
-                cohort_execution_layout);
+            if (cohort_execution_layout == 6u) {
+                mfq_moe_nvq3jl_profile<MATRIX_ROWS, uint(K), K_LANES,
+                    (OUT > K)>(
+                    x, vq_indices, vq_state, vq_scales, vq_codebooks,
+                    outputs, row_anchors, accumulators, x_offset,
+                    indices_offset, state_offset, scale_offset, codebook_offset, k_lane);
+            } else {
+                mfq_moe_jsc_profile<4u, MATRIX_ROWS, VQ_EXECUTION_LAYOUT>(
+                    x, vq_indices, vq_state, vq_aux, vq_scales,
+                    vq_state_to_codebank, vq_codebooks, x_offset,
+                    outputs, row_anchors, accumulators, groups, vectors,
+                    index_bits, entries, indices_offset, state_offset,
+                    aux_offset, codebook_offset, scale_offset,
+                    state_bank_offset, signs, k_lane, K_LANES, uint(K),
+                    cohort_execution_layout);
+            }
         } else if (
             (uint(VQ_PROFILE_MASK) & 4u) != 0u
             && profile == 2u
@@ -1719,6 +1798,7 @@ constexpr const char* kMoeSource = R"METAL(
             ) {
                 uint delta_by_row[MATRIX_ROWS];
                 float weight_scales[MATRIX_ROWS];
+                uint2 execution_records[MATRIX_ROWS];
                 for (
                     uint row = 0u;
                     row < MATRIX_ROWS;
@@ -1726,14 +1806,24 @@ constexpr const char* kMoeSource = R"METAL(
                 ) {
                     uint state_index =
                         outputs[row] * groups + group;
-                    uint state = mfq_moe_read_bits(
-                        vq_state + state_offset,
-                        state_index,
-                        state_bits);
-                    delta_by_row[row] = mfq_moe_read_bits(
-                        vq_aux + aux_offset,
-                        state_index,
-                        1u);
+                    uint state;
+                    if (uint(VQ_EXECUTION_LAYOUT) != 0u
+                        && cohort_execution_layout == 5u) {
+                        uint offset = indices_offset + state_index * 5u;
+                        uint low = uint(vq_indices[offset])
+                            | (uint(vq_indices[offset + 1u]) << 8u)
+                            | (uint(vq_indices[offset + 2u]) << 16u)
+                            | (uint(vq_indices[offset + 3u]) << 24u);
+                        uint high = uint(vq_indices[offset + 4u]);
+                        execution_records[row] = uint2(low, high);
+                        state = (high >> 1u) & 7u;
+                        delta_by_row[row] = (high >> 4u) & 1u;
+                    } else {
+                        state = mfq_moe_read_bits(
+                            vq_state + state_offset, state_index, state_bits);
+                        delta_by_row[row] = mfq_moe_read_bits(
+                            vq_aux + aux_offset, state_index, 1u);
+                    }
                     weight_scales[row] =
                         row_anchors[row]
                         * vq_scales[scale_offset + state];
@@ -1765,10 +1855,18 @@ constexpr const char* kMoeSource = R"METAL(
                         row < MATRIX_ROWS;
                         ++row
                     ) {
-                        uint index = mfq_moe_read_bits(
-                            vq_indices + indices_offset,
-                            outputs[row] * vectors + vector,
-                            11u);
+                        uint index;
+                        if (uint(VQ_EXECUTION_LAYOUT) != 0u
+                            && cohort_execution_layout == 5u) {
+                            uint2 record = execution_records[row];
+                            index = local_vector == 2u
+                                ? ((record.x >> 22u) | (record.y << 10u)) & 2047u
+                                : (record.x >> (local_vector * 11u)) & 2047u;
+                        } else {
+                            index = mfq_moe_read_bits(
+                                vq_indices + indices_offset,
+                                outputs[row] * vectors + vector, 11u);
+                        }
                         float signed_delta =
                             delta_by_row[row] != 0u
                             ? -delta
@@ -2647,9 +2745,104 @@ int checked_positive(
     return static_cast<int>(value);
 }
 
-template <typename Allocator>
+array allocate_packed_array(std::size_t bytes, Dtype dtype) {
+    if (bytes == 0 || bytes % dtype.size() != 0) {
+        throw std::runtime_error("MFE packed stream is misaligned");
+    }
+    const auto layout = detail::packed_storage_layout(bytes / dtype.size());
+    const Shape shape = layout.is_matrix()
+        ? Shape{layout.rows, layout.columns} : Shape{layout.columns};
+    return array(mlx::core::allocator::malloc(bytes), shape, dtype);
+}
+
+// Keep source ownership, not a second model-sized byte vector. Once all chunks
+// are known, write them directly into one exact-sized Metal allocation.
+class PackedStream {
+public:
+    PackedStream() = default;
+    PackedStream(PackedStream&&) = default;
+    PackedStream& operator=(PackedStream&&) = default;
+    PackedStream(const PackedStream&) = delete;
+    PackedStream& operator=(const PackedStream&) = delete;
+
+    std::size_t size() const noexcept { return size_; }
+
+    void append(array source) {
+        const auto bytes = source.nbytes();
+        append_chunk(std::move(source), bytes);
+    }
+
+    void append(std::span<const std::uint8_t> source) {
+        // Borrowed wire views live until from_blob finishes materialization.
+        append_chunk(source, source.size());
+    }
+
+    void push_back(std::uint8_t value) {
+        append_chunk(value, 1);
+    }
+
+    array materialize(Dtype dtype) && {
+        const auto bytes = size_ == 0 ? dtype.size() : size_;
+        if (bytes % dtype.size() != 0) {
+            throw std::runtime_error("MFE packed stream is misaligned");
+        }
+        const auto layout = detail::packed_storage_layout(bytes / dtype.size());
+        const Shape shape = layout.is_matrix()
+            ? Shape{layout.rows, layout.columns} : Shape{layout.columns};
+        if (chunks_.size() == 1) {
+            if (const auto* source = std::get_if<array>(&chunks_.front());
+                source != nullptr && source->dtype() == dtype) {
+                auto result = mlx::core::reshape(*source, shape);
+                result.eval();
+                return result;
+            }
+        }
+        auto result = allocate_packed_array(bytes, dtype);
+        auto* destination = result.data<std::uint8_t>();
+        std::size_t offset = 0;
+        for (const auto& chunk : chunks_) {
+            std::visit([&](const auto& source) {
+                using T = std::decay_t<decltype(source)>;
+                if constexpr (std::is_same_v<T, std::uint8_t>) {
+                    destination[offset++] = source;
+                } else {
+                    const auto count = [&] {
+                        if constexpr (std::is_same_v<T, array>) return source.nbytes();
+                        else return source.size();
+                    }();
+                    const auto* data = [&] {
+                        if constexpr (std::is_same_v<T, array>) return source.template data<std::uint8_t>();
+                        else return source.data();
+                    }();
+                    std::memcpy(destination + offset, data, count);
+                    offset += count;
+                }
+            }, chunk);
+        }
+        if (size_ == 0) {
+            std::memset(destination, 0, bytes);
+        }
+        return result;
+    }
+
+private:
+    using Chunk = std::variant<array, std::span<const std::uint8_t>, std::uint8_t>;
+
+    template <typename T>
+    void append_chunk(T source, std::size_t bytes) {
+        if (bytes != 0) {
+            const auto total = checked_add(size_, bytes, "packed stream size");
+            chunks_.emplace_back(std::move(source));
+            size_ = total;
+        }
+    }
+
+    std::vector<Chunk> chunks_;
+    std::size_t size_ = 0;
+};
+
 void append_raw(
-    std::vector<std::uint8_t, Allocator>& target,
+    PackedStream& target,
     const array& source,
     Dtype expected,
     const char* name) {
@@ -2662,25 +2855,11 @@ void append_raw(
     }
     auto evaluated = source;
     evaluated.eval();
-    if (
-        evaluated.nbytes()
-        > std::numeric_limits<std::size_t>::max()
-            - target.size()
-    ) {
-        throw std::runtime_error(
-            "MFE packed stream size overflows");
-    }
-    const auto previous = target.size();
-    target.resize(previous + evaluated.nbytes());
-    std::memcpy(
-        target.data() + previous,
-        evaluated.data<std::uint8_t>(),
-        evaluated.nbytes());
+    target.append(std::move(evaluated));
 }
 
-template <typename Allocator>
 void append_bytes(
-    std::vector<std::uint8_t, Allocator>& target,
+    PackedStream& target,
     std::span<const std::uint8_t> source,
     const char* name) {
     if (
@@ -2692,10 +2871,11 @@ void append_bytes(
             std::string("MFE packed ") + name
             + " stream size overflows");
     }
-    target.insert(
-        target.end(),
-        source.begin(),
-        source.end());
+    target.append(source);
+}
+
+array make_raw_array(PackedStream bytes, Dtype dtype) {
+    return std::move(bytes).materialize(dtype);
 }
 
 template <typename Allocator>
@@ -2705,24 +2885,21 @@ array make_raw_array(
     if (bytes.empty()) {
         bytes.resize(dtype.size(), 0);
     }
-    if (bytes.size() % dtype.size() != 0) {
-        throw std::runtime_error(
-            "MFE packed stream is misaligned");
-    }
-    const auto layout = detail::packed_storage_layout(
-        bytes.size() / dtype.size());
-    const Shape shape = layout.is_matrix()
-        ? Shape{layout.rows, layout.columns}
-        : Shape{layout.columns};
-    auto result = array(
-        mlx::core::allocator::malloc(bytes.size()),
-        shape,
-        dtype);
+    auto result = allocate_packed_array(bytes.size(), dtype);
     std::memcpy(
-        result.data<std::uint8_t>(),
+        result.template data<std::uint8_t>(),
         bytes.data(),
         bytes.size());
     return result;
+}
+
+void align_packed_stream(
+    std::vector<array>& chunks, std::size_t& offset, std::size_t alignment) {
+    const auto padding = (alignment - offset % alignment) % alignment;
+    if (padding != 0) {
+        chunks.push_back(make_raw_array(std::vector<std::uint8_t>(padding, 0), mlx::core::uint8));
+        offset = checked_add(offset, padding, "packed stream alignment");
+    }
 }
 
 array make_int32_array(
@@ -3379,7 +3556,7 @@ struct MfeNintDecodeConfig {
     int shared_gate_groups = 0;
     int shared_down_group_size = 0;
     int shared_down_groups = 0;
-    int k_lanes = 8;
+    int k_lanes = 16;
     int down_rows_per_simd = 1;
     int stage_one_workgroups = 0;
     int stage_two_workgroups = 0;
@@ -3899,7 +4076,7 @@ std::string make_mxfp4_decode_reduce_source(
         << "constexpr uint ROWS_PER_LANE_GROUP = "
         << config.rows_per_lane_group << "u;\n"
         << R"METAL(
-    constexpr uint K_LANES = 8u;
+    constexpr uint K_LANES = 16u;
     constexpr uint LANE_GROUPS = 32u / K_LANES;
     constexpr uint OUTPUTS_PER_TG = LANE_GROUPS * ROWS_PER_LANE_GROUP;
     threadgroup float route_outputs[ROUTES * OUTPUTS_PER_TG];
@@ -4187,7 +4364,7 @@ std::string make_mxfp4_pair_swiglu_source(
         << "constexpr uint DESCRIPTOR_SIZE = "
         << config.descriptor_size << "u;\n"
         << R"METAL(
-    constexpr uint K_LANES = 8u;
+    constexpr uint K_LANES = 16u;
     constexpr uint LANE_GROUPS = 32u / K_LANES;
     constexpr uint SIMD_GROUPS = 2u;
     constexpr uint OUTPUTS_PER_TG = LANE_GROUPS * SIMD_GROUPS;
@@ -4230,36 +4407,30 @@ std::string make_mxfp4_pair_swiglu_source(
             + ulong(bounded_output);
 
         for (uint group = 0u; group < groups; ++group) {
-            const uint column = group * 32u + k_lane * 4u;
-            const vec<T, 4> raw_activations = *reinterpret_cast<
-                device const vec<T, 4>*>(x + token * K + column);
-            const float4 activations = float4(raw_activations);
+            const uint column = group * 32u + k_lane * 2u;
+            const vec<T, 2> raw_activations = *reinterpret_cast<
+                device const vec<T, 2>*>(x + token * K + column);
+            const float2 activations = float2(raw_activations);
             const ulong gate_packed_offset = ulong(gate_value_offset)
                 + gate_pool_output * (ulong(K) >> 1u)
                 + (ulong(column) >> 1u);
             const ulong up_packed_offset = ulong(up_value_offset)
                 + up_pool_output * (ulong(K) >> 1u)
                 + (ulong(column) >> 1u);
-            const uchar2 gate_codes = *reinterpret_cast<
-                device const uchar2*>(gate_values + gate_packed_offset);
-            const uchar2 up_codes = *reinterpret_cast<
-                device const uchar2*>(up_values + up_packed_offset);
+            const uchar gate_codes = gate_values[gate_packed_offset];
+            const uchar up_codes = up_values[up_packed_offset];
             const float gate_scale = decode_e8m0(gate_scales[
                 ulong(gate_scale_offset)
                     + gate_pool_output * ulong(groups) + ulong(group)]);
             const float up_scale = decode_e8m0(up_scales[
                 ulong(up_scale_offset)
                     + up_pool_output * ulong(groups) + ulong(group)]);
-            const float4 gate_weights = gate_scale * float4(
-                MXFP4_LUT[uint(gate_codes.x & 15u)],
-                MXFP4_LUT[uint(gate_codes.x >> 4u)],
-                MXFP4_LUT[uint(gate_codes.y & 15u)],
-                MXFP4_LUT[uint(gate_codes.y >> 4u)]);
-            const float4 up_weights = up_scale * float4(
-                MXFP4_LUT[uint(up_codes.x & 15u)],
-                MXFP4_LUT[uint(up_codes.x >> 4u)],
-                MXFP4_LUT[uint(up_codes.y & 15u)],
-                MXFP4_LUT[uint(up_codes.y >> 4u)]);
+            const float2 gate_weights = gate_scale * float2(
+                MXFP4_LUT[uint(gate_codes & 15u)],
+                MXFP4_LUT[uint(gate_codes >> 4u)]);
+            const float2 up_weights = up_scale * float2(
+                MXFP4_LUT[uint(up_codes & 15u)],
+                MXFP4_LUT[uint(up_codes >> 4u)]);
             gate_accumulator += dot(activations, gate_weights);
             up_accumulator += dot(activations, up_weights);
         }
@@ -4859,28 +5030,42 @@ struct RotationSpec {
 };
 
 struct PackedStreams {
-    detail::StagingVector<std::uint8_t> nint_q;
-    detail::StagingVector<std::uint8_t> nint_sub_scale;
-    detail::StagingVector<std::uint8_t> nint_sub_min;
-    detail::StagingVector<std::uint8_t> nint_anchor_scale;
-    detail::StagingVector<std::uint8_t> nint_anchor_min;
-    detail::StagingVector<std::uint8_t> q8_q;
-    detail::StagingVector<std::uint8_t> q8_scales;
-    detail::StagingVector<std::uint8_t> vq_indices;
-    detail::StagingVector<std::uint8_t> vq_state;
-    detail::StagingVector<std::uint8_t> vq_aux;
-    detail::StagingVector<std::uint8_t> vq_anchors;
-    detail::StagingVector<std::uint8_t> vq_codebooks;
-    detail::StagingVector<std::uint8_t> vq_scales;
-    detail::StagingVector<std::uint8_t>
-        vq_state_to_codebank;
-    detail::StagingVector<std::uint8_t> vq_banks;
-    detail::StagingVector<std::uint8_t> vq_parameters;
-    detail::StagingVector<std::uint8_t> vq_residual_codebooks;
-    detail::StagingVector<std::uint8_t> vq_residual_first;
-    detail::StagingVector<std::uint8_t> vq_residual_second;
-    detail::StagingVector<std::uint8_t> mx_values;
-    detail::StagingVector<std::uint8_t> mx_scales;
+    PackedStream nint_q;
+    PackedStream nint_sub_scale;
+    PackedStream nint_sub_min;
+    PackedStream nint_anchor_scale;
+    PackedStream nint_anchor_min;
+    PackedStream q8_q;
+    PackedStream q8_scales;
+    PackedStream vq_indices;
+    PackedStream vq_state;
+    PackedStream vq_aux;
+    PackedStream vq_anchors;
+    PackedStream vq_codebooks;
+    PackedStream vq_scales;
+    PackedStream vq_state_to_codebank;
+    PackedStream vq_banks;
+    PackedStream vq_parameters;
+    PackedStream vq_residual_codebooks;
+    PackedStream vq_residual_first;
+    PackedStream vq_residual_second;
+    PackedStream mx_values;
+    PackedStream mx_scales;
+
+    std::size_t size() const {
+        std::size_t bytes = 0;
+        for (const auto count : {
+                 nint_q.size(), nint_sub_scale.size(), nint_sub_min.size(),
+                 nint_anchor_scale.size(), nint_anchor_min.size(), q8_q.size(),
+                 q8_scales.size(), vq_indices.size(), vq_state.size(), vq_aux.size(),
+                 vq_anchors.size(), vq_codebooks.size(), vq_scales.size(),
+                 vq_state_to_codebank.size(), vq_banks.size(), vq_parameters.size(),
+                 vq_residual_codebooks.size(), vq_residual_first.size(),
+                 vq_residual_second.size(), mx_values.size(), mx_scales.size()}) {
+            bytes = checked_add(bytes, count, "packed streams size");
+        }
+        return bytes;
+    }
 };
 
 struct DenseReferenceMoeWeight {
@@ -5714,6 +5899,8 @@ MlxVqWeight add_vq_pool(
         );
     const bool wide_jsc_execution =
         packed_jsc_execution && weight.index_bits() > 8;
+    const bool packed_nvq3jl_execution =
+        packed_jsc_execution && profile == "NVQ3J-L";
     const bool packed_nvq1s_execution =
         profile == "NVQ1-S"
         && weight.group_size() == 24
@@ -5721,15 +5908,35 @@ MlxVqWeight add_vq_pool(
         && weight.index_bits() == 9
         && weight.state_bits() == 4
         && weight.aux_mode() == 3;
+    const bool packed_nvq1l_execution =
+        profile == "NVQ1-L"
+        && weight.group_size() == 24
+        && weight.vector_size() == 8
+        && weight.index_bits() == 11
+        && weight.state_bits() == 3
+        && weight.aux_mode() == 3;
+    const bool packed_nvq1_execution =
+        packed_nvq1s_execution || packed_nvq1l_execution;
     const bool jsc_execution =
         packed_jsc_execution || group64_execution;
-    detail::StagingVector<std::uint8_t>
-        jsc_execution_indices;
+    std::optional<array> jsc_execution_indices;
     if (packed_jsc_execution) {
         auto packed_indices = weight.packed_indices();
         auto packed_aux = weight.packed_auxiliary();
         packed_indices.eval();
         packed_aux.eval();
+        std::optional<array> packed_states;
+        std::optional<array> state_banks;
+        const std::uint8_t* state_data = nullptr;
+        const std::uint8_t* bank_data = nullptr;
+        if (packed_nvq3jl_execution) {
+            packed_states.emplace(weight.packed_states());
+            state_banks.emplace(weight.state_to_codebank());
+            packed_states->eval();
+            state_banks->eval();
+            state_data = packed_states->data<std::uint8_t>();
+            bank_data = state_banks->data<std::uint8_t>();
+        }
         const auto* index_data =
             packed_indices.data<std::uint8_t>();
         const auto* aux_data =
@@ -5745,8 +5952,8 @@ MlxVqWeight add_vq_pool(
                 "VQ JSC execution stream size"),
             static_cast<std::size_t>(bytes_per_sign),
             "VQ JSC execution stream size");
-        jsc_execution_indices.resize(
-            execution_bytes);
+        jsc_execution_indices.emplace(allocate_packed_array(execution_bytes, mlx::core::uint8));
+        auto* execution_data = jsc_execution_indices->data<std::uint8_t>();
         const auto read_aux = [&](std::size_t linear) {
             const auto bit = linear * 7;
             const auto byte = bit >> 3;
@@ -5792,6 +5999,7 @@ MlxVqWeight add_vq_pool(
                     const auto index0 = read_index(
                         row * weight.vectors() + first_vector);
                     const auto index1 = weight.vector_size() == 4
+                        && first_vector + 1 < static_cast<std::size_t>(weight.vectors())
                         ? read_index(
                               row * weight.vectors() + first_vector + 1)
                         : 0u;
@@ -5809,19 +6017,28 @@ MlxVqWeight add_vq_pool(
                         }
                         record |= sign_value << (
                             weight.index_bits() * index_count);
+                        if (packed_nvq3jl_execution) {
+                            const auto state_linear = row * weight.groups() + sign / 3;
+                            const unsigned state = (state_data[state_linear / 2]
+                                >> ((state_linear & 1u) * 4u)) & 15u;
+                            const auto bank = static_cast<std::uint32_t>(bank_data[state]);
+                            record = (index0 | (bank << 10u))
+                                | ((index1 | (bank << 10u)) << 12u)
+                                | (sign_value << 24u);
+                        }
                         for (int byte = 0; byte < bytes_per_sign; ++byte) {
-                            jsc_execution_indices[target + byte] =
+                            execution_data[target + byte] =
                                 static_cast<std::uint8_t>(
                                     record >> (8 * byte));
                         }
                     } else {
-                        jsc_execution_indices[target] =
+                        execution_data[target] =
                             static_cast<std::uint8_t>(index0);
                         if (weight.vector_size() == 4) {
-                            jsc_execution_indices[target + 1] =
+                            execution_data[target + 1] =
                                 static_cast<std::uint8_t>(index1);
                         }
-                        jsc_execution_indices[
+                        execution_data[
                             target + bytes_per_sign - 1] =
                             static_cast<std::uint8_t>(sign_value);
                     }
@@ -5856,13 +6073,8 @@ MlxVqWeight add_vq_pool(
         }
     }
 
-    // NVQ1-S has exactly three 9-bit indices, one 4-bit state, and one
-    // delta-sign bit per 24-weight group.  Interleave those fields into one
-    // 32-bit execution record: it is effectively storage-neutral and removes
-    // five unrelated packed-bit lookups from the hot decoder loop.
-    detail::StagingVector<std::uint8_t>
-        nvq1s_execution_indices;
-    if (packed_nvq1s_execution) {
+    std::optional<array> nvq1_execution_indices;
+    if (packed_nvq1_execution) {
         auto packed_indices = weight.packed_indices();
         auto packed_states = weight.packed_states();
         auto packed_aux = weight.packed_auxiliary();
@@ -5895,12 +6107,14 @@ MlxVqWeight add_vq_pool(
         const auto records = checked_product(
             expected_rows,
             static_cast<std::size_t>(weight.groups()),
-            "NVQ1-S execution record count");
+            "NVQ1 execution record count");
+        const int record_bytes = packed_nvq1s_execution ? 4 : 5;
         const auto execution_bytes = checked_product(
             records,
-            sizeof(std::uint32_t),
-            "NVQ1-S execution stream size");
-        nvq1s_execution_indices.resize(execution_bytes);
+            static_cast<std::size_t>(record_bytes),
+            "NVQ1 execution stream size");
+        nvq1_execution_indices.emplace(allocate_packed_array(execution_bytes, mlx::core::uint8));
+        auto* execution_data = nvq1_execution_indices->data<std::uint8_t>();
         const auto pack_rows = [&](std::size_t begin, std::size_t end) {
             for (std::size_t row = begin; row < end; ++row) {
                 for (int group = 0; group < weight.groups(); ++group) {
@@ -5909,7 +6123,7 @@ MlxVqWeight add_vq_pool(
                         + static_cast<std::size_t>(group);
                     const auto first_vector =
                         static_cast<std::size_t>(group) * 3u;
-                    std::uint32_t record = 0;
+                    std::uint64_t record = 0;
                     for (int local = 0; local < 3; ++local) {
                         const auto vector = first_vector
                             + static_cast<std::size_t>(local);
@@ -5920,23 +6134,23 @@ MlxVqWeight add_vq_pool(
                                   packed_indices.size(),
                                   row * static_cast<std::size_t>(weight.vectors())
                                       + vector,
-                                  9)
+                                  weight.index_bits())
                             : 0u;
-                        record |= index << (9 * local);
+                        record |= std::uint64_t(index) << (weight.index_bits() * local);
                     }
-                    record |= read_bits(
+                    record |= std::uint64_t(read_bits(
                         state_data,
                         packed_states.size(),
                         state_index,
-                        4) << 27u;
-                    record |= read_bits(
+                        weight.state_bits())) << (weight.index_bits() * 3);
+                    record |= std::uint64_t(read_bits(
                         aux_data,
                         packed_aux.size(),
                         state_index,
-                        1) << 31u;
-                    const auto target = state_index * sizeof(record);
-                    for (int byte = 0; byte < 4; ++byte) {
-                        nvq1s_execution_indices[target + byte] =
+                        1)) << (weight.index_bits() * 3 + weight.state_bits());
+                    const auto target = state_index * record_bytes;
+                    for (int byte = 0; byte < record_bytes; ++byte) {
+                        execution_data[target + byte] =
                             static_cast<std::uint8_t>(record >> (8 * byte));
                     }
                 }
@@ -6114,9 +6328,9 @@ MlxVqWeight add_vq_pool(
             group64_execution
                 ? 2
                 : packed_jsc_execution
-                    ? (wide_jsc_execution ? 3 : 1)
-                    : packed_nvq1s_execution
-                        ? 4
+                    ? (packed_nvq3jl_execution ? 6 : wide_jsc_execution ? 3 : 1)
+                    : packed_nvq1_execution
+                        ? (packed_nvq1s_execution ? 4 : 5)
                     : 0;
         descriptors[base + kVqResidualCodebookOffset] =
             residual_codebook_offset;
@@ -6131,15 +6345,9 @@ MlxVqWeight add_vq_pool(
             mlx::core::uint8,
             "VQ group64 values");
     } else if (packed_jsc_execution) {
-        streams.vq_indices.insert(
-            streams.vq_indices.end(),
-            jsc_execution_indices.begin(),
-            jsc_execution_indices.end());
-    } else if (packed_nvq1s_execution) {
-        streams.vq_indices.insert(
-            streams.vq_indices.end(),
-            nvq1s_execution_indices.begin(),
-            nvq1s_execution_indices.end());
+        streams.vq_indices.append(std::move(*jsc_execution_indices));
+    } else if (packed_nvq1_execution) {
+        streams.vq_indices.append(std::move(*nvq1_execution_indices));
     } else {
         append_raw(
             streams.vq_indices,
@@ -6147,14 +6355,14 @@ MlxVqWeight add_vq_pool(
             mlx::core::uint8,
             "VQ indices");
     }
-    if (!packed_nvq1s_execution) {
+    if (!packed_nvq1_execution) {
         append_raw(
             streams.vq_state,
             weight.packed_states(),
             mlx::core::uint8,
             "VQ states");
     }
-    if (!jsc_execution && !packed_nvq1s_execution) {
+    if (!jsc_execution && !packed_nvq1_execution) {
         append_raw(
             streams.vq_aux,
             weight.packed_auxiliary(),
@@ -6220,6 +6428,89 @@ bool is_ascii(
             return byte <= 0x7fu;
         });
 }
+
+struct MfePoolView {
+    std::vector<std::int32_t> expert_ids;
+    std::string dtype;
+    std::span<const std::uint8_t> runtime;
+    std::span<const std::uint8_t> payload;
+};
+
+struct MfeProjectionView {
+    int experts;
+    int output;
+    int input;
+    std::vector<MfePoolView> pools;
+};
+
+MfeProjectionView inspect_mfe_projection(std::span<const std::uint8_t> blob) {
+    BlobCursor cursor(blob);
+    const auto magic_bytes = cursor.bytes(4, "header");
+    const std::string_view magic(
+        reinterpret_cast<const char*>(magic_bytes.data()), magic_bytes.size());
+    if (magic != "MFE1" && magic != "NIM1" && magic != "NIM2") {
+        throw std::runtime_error("invalid MFE magic");
+    }
+    MfeProjectionView result{
+        checked_positive(cursor.scalar<std::uint32_t>("expert count"), "expert count"),
+        checked_positive(cursor.scalar<std::uint32_t>("output width"), "output width"),
+        checked_positive(cursor.scalar<std::uint32_t>("neuron length"), "neuron length"),
+        {},
+    };
+    const auto pool_count = cursor.scalar<std::uint32_t>("pool count");
+    if (pool_count == 0 || pool_count > static_cast<std::uint32_t>(result.experts)) {
+        throw std::runtime_error("invalid MFE pool count");
+    }
+    if (static_cast<std::size_t>(result.experts) > cursor.remaining() / sizeof(std::int32_t)) {
+        throw std::runtime_error("MFE expert count exceeds its payload");
+    }
+    std::vector<int> owners(static_cast<std::size_t>(result.experts), -1);
+    for (std::uint32_t pool = 0; pool < pool_count; ++pool) {
+        const auto count = cursor.scalar<std::uint32_t>("pool header");
+        const auto dtype_bytes = magic == "NIM1" ? 0u
+            : cursor.scalar<std::uint32_t>("v2 pool header");
+        const auto payload_bytes = cursor.scalar<std::uint64_t>("pool header");
+        const auto runtime_bytes = magic == "NIM1" ? std::uint64_t{0}
+            : cursor.scalar<std::uint64_t>("v2 pool header");
+        if (count == 0 || count > static_cast<std::uint32_t>(result.experts) ||
+            (magic != "NIM1" && (dtype_bytes == 0 || dtype_bytes > 32))) {
+            throw std::runtime_error("invalid MFE pool metadata");
+        }
+        MfePoolView current;
+        current.expert_ids.resize(count);
+        for (auto& expert : current.expert_ids) {
+            expert = cursor.scalar<std::int32_t>("expert IDs");
+        }
+        claim_experts(current.expert_ids, owners, static_cast<int>(pool));
+        current.dtype = "NINT";
+        if (magic != "NIM1") {
+            const auto raw_dtype = cursor.bytes(dtype_bytes, "cohort dtype");
+            if (!is_ascii(raw_dtype)) {
+                throw std::runtime_error("MFE cohort dtype must be ASCII");
+            }
+            current.dtype = std::string(mfq::canonical_format_dtype(std::string_view(
+                reinterpret_cast<const char*>(raw_dtype.data()), raw_dtype.size())));
+        }
+        current.runtime = cursor.bytes(
+            checked_size(runtime_bytes, "cohort runtime metadata"), "cohort runtime metadata");
+        current.payload = cursor.bytes(
+            checked_size(payload_bytes, "cohort payload"), "cohort payload");
+        result.pools.push_back(std::move(current));
+    }
+    if (cursor.remaining() != 0) {
+        throw std::runtime_error("trailing bytes in MFE tensor");
+    }
+    if (std::find(owners.begin(), owners.end(), -1) != owners.end()) {
+        throw std::runtime_error("MFE pools do not cover every expert");
+    }
+    return result;
+}
+
+struct ProjectionStorageInfo {
+    std::size_t packed_bytes;
+    bool automatic_mxfp4_nax_prefill;
+    int logical_experts;
+};
 
 array concatenate_1d(
     std::vector<array> values) {
@@ -7457,6 +7748,12 @@ struct MlxMfeOffloadCache::Impl {
             throw std::invalid_argument(
                 "MFE offload expert count cannot be negative");
         }
+        resources.bind([this] {
+            std::lock_guard lock(mutex);
+            std::size_t payload = 0;
+            for (const auto& item : backing_records) payload += item.second;
+            return MlxResourceUsage{0, 0, resident_bytes, payload, 0};
+        });
     }
 
     std::shared_ptr<const MfeStreamProjection>
@@ -7665,6 +7962,8 @@ struct MlxMfeOffloadCache::Impl {
         }
         auto result = parse_mfe_projection(name);
         mfe_projections.emplace(name, result);
+        backing_records.emplace(name, model.record(name).nbytes);
+        model.record_prepared(name);
         return result;
     }
 
@@ -7727,6 +8026,8 @@ struct MlxMfeOffloadCache::Impl {
     MfeLru mfe_lru;
     MfeExpertCache mfe_cache;
     std::size_t resident_bytes = 0;
+    std::unordered_map<std::string, std::size_t> backing_records;
+    MlxResourceTelemetry resources;
 };
 
 MlxMfeOffloadCache::MlxMfeOffloadCache(
@@ -7961,6 +8262,7 @@ void MlxMfeOffloadCache::discard_record(
         item = impl_->mfe_lru.erase(item);
     }
     impl_->mfe_projections.erase(name);
+    impl_->backing_records.erase(name);
 }
 
 void MlxMfeOffloadCache::clear() {
@@ -8314,9 +8616,7 @@ struct MlxMfeWeight::Impl {
             "MFQ_METAL_MFE_K_LANES");
         if (k_lanes_env != nullptr) {
             const auto value = std::string_view(k_lanes_env);
-            if (value == "8") {
-                k_lanes_override = 8;
-            } else if (value == "16") {
+            if (value == "16") {
                 k_lanes_override = 16;
             } else if (value == "32") {
                 k_lanes_override = 32;
@@ -8383,6 +8683,32 @@ struct MlxMfeWeight::Impl {
             narrow(mx_scales),
         };
     }
+
+    void bind_projection_views(const std::vector<ProjectionStorageInfo>& sources) {
+        projection_views.clear();
+        projection_views.reserve(sources.size());
+        for (std::size_t projection = 0; projection < sources.size(); ++projection) {
+            std::vector<std::int32_t> values;
+            values.reserve(static_cast<std::size_t>(experts) * kDescriptorSize);
+            for (int expert = 0; expert < experts; ++expert) {
+                const auto begin = descriptor_values.begin() +
+                    (static_cast<std::size_t>(expert) * sources.size() + projection) * kDescriptorSize;
+                values.insert(values.end(), begin, begin + kDescriptorSize);
+            }
+            auto view = std::make_shared<Impl>(
+                make_int32_array(values, Shape{experts, kDescriptorSize}),
+                nint_q, nint_sub_scale, nint_sub_min, nint_anchor_scale, nint_anchor_min,
+                q8_q, q8_scales, vq_indices, vq_state, vq_aux, vq_anchors,
+                vq_codebooks, vq_scales, vq_state_to_codebank, vq_banks, vq_parameters,
+                vq_residual_codebooks, vq_residual_first, vq_residual_second,
+                mx_values, mx_scales, rotations, std::move(values),
+                experts, out_per_expert, neuron_len, 1);
+            view->automatic_mxfp4_nax_prefill = sources[projection].automatic_mxfp4_nax_prefill;
+            view->logical_experts = sources[projection].logical_experts;
+            view->packed_bytes = sources[projection].packed_bytes;
+            projection_views.push_back(std::move(view));
+        }
+    }
 };
 
 MlxMfeWeight::MlxMfeWeight(
@@ -8396,351 +8722,272 @@ MlxMfeWeight::MlxMfeWeight(
 
 MlxMfeWeight MlxMfeWeight::from_blob(
     std::span<const std::uint8_t> blob) {
-    BlobCursor cursor(blob);
-    const auto magic_bytes = cursor.bytes(4, "header");
-    const std::string_view magic(
-        reinterpret_cast<const char*>(
-            magic_bytes.data()),
-        magic_bytes.size());
-    if (magic != "MFE1" && magic != "NIM1" && magic != "NIM2") {
-        throw std::runtime_error("invalid MFE magic");
+    const std::array blobs{blob};
+    return from_projection_blobs(blobs);
+}
+
+MlxMfeWeight MlxMfeWeight::from_projection_blobs(
+    std::span<const std::span<const std::uint8_t>> blobs) {
+    if (blobs.empty()) {
+        throw std::invalid_argument("at least one MFE projection is required");
+    }
+    const int projection_count = checked_int(blobs.size(), "projection count");
+    std::vector<MfeProjectionView> projections;
+    projections.reserve(blobs.size());
+    for (const auto blob : blobs) {
+        projections.push_back(inspect_mfe_projection(blob));
+    }
+    const int expert_count = projections.front().experts;
+    const int output_width = projections.front().output;
+    const int input_width = projections.front().input;
+    for (const auto& projection : projections) {
+        if (projection.experts != expert_count || projection.output != output_width ||
+            projection.input != input_width) {
+            throw std::invalid_argument("MFE projections have incompatible shapes");
+        }
+    }
+    const bool reference = mlx_reference_enabled();
+    if (projection_count > 1 && (reference || std::any_of(
+        projections.begin(), projections.end(), [](const auto& projection) {
+            return std::any_of(projection.pools.begin(), projection.pools.end(),
+                [](const auto& pool) {
+                    return !pool.runtime.empty() || is_mxfp4_sq_dtype(pool.dtype) ||
+                        is_fp8_sq_dtype(pool.dtype);
+                });
+        }))) {
+        // Standalone SQ/reference and rotated cohorts keep their established
+        // ownership/dispatch path, without parsing or repacking weights twice.
+        std::vector<MlxMfeWeight> weights;
+        weights.reserve(blobs.size());
+        for (const auto blob : blobs) weights.push_back(from_blob(blob));
+        return concatenate_projections(weights).materialize_packed_projections();
     }
 
-    const int expert_count = checked_positive(
-        cursor.scalar<std::uint32_t>("expert count"),
-        "expert count");
-    const int output_width = checked_positive(
-        cursor.scalar<std::uint32_t>(
-            "output width"),
-        "output width");
-    const int input_width = checked_positive(
-        cursor.scalar<std::uint32_t>(
-            "neuron length"),
-        "neuron length");
-    const auto pool_count =
-        cursor.scalar<std::uint32_t>("pool count");
-    if (
-        pool_count == 0
-        || pool_count
-            > static_cast<std::uint32_t>(
-                expert_count)
-    ) {
-        throw std::runtime_error(
-            "invalid MFE pool count");
-    }
-    if (
-        static_cast<std::size_t>(expert_count)
-        > cursor.remaining() / sizeof(std::int32_t)
-    ) {
-        throw std::runtime_error(
-            "MFE expert count exceeds its payload");
-    }
-
-    std::vector<std::int32_t> descriptors(
-        checked_product(
-            static_cast<std::size_t>(expert_count),
-            static_cast<std::size_t>(kDescriptorSize),
-            "descriptor count"),
-        0);
-    std::vector<int> owners(
-        static_cast<std::size_t>(expert_count),
-        -1);
+    const int descriptor_rows = checked_int(checked_product(
+        static_cast<std::size_t>(expert_count), blobs.size(), "projection rows"),
+        "projection rows");
+    std::vector<std::int32_t> descriptors(checked_product(
+        static_cast<std::size_t>(descriptor_rows),
+        static_cast<std::size_t>(kDescriptorSize), "descriptor count"), 0);
     PackedStreams streams;
     std::vector<RotationSpec> rotations;
-    std::vector<ReferenceMoeCohort>
-        reference_cohorts;
-    std::vector<Mxfp4SqMoeCohort>
-        mxfp4_sq_cohorts;
-    std::vector<Fp8SqMoeCohort>
-        fp8_sq_cohorts;
+    std::vector<ReferenceMoeCohort> reference_cohorts;
+    std::vector<Mxfp4SqMoeCohort> mxfp4_sq_cohorts;
+    std::vector<Fp8SqMoeCohort> fp8_sq_cohorts;
     std::vector<std::int32_t> standalone_owner(
         static_cast<std::size_t>(expert_count), -1);
-    bool has_generic_cohorts = false;
-    const bool reference =
-        mlx_reference_enabled();
+    std::vector<ProjectionStorageInfo> projection_info;
+    bool has_generic_cohorts = true;
 
-    for (
-        std::uint32_t pool = 0;
-        pool < pool_count;
-        ++pool
-    ) {
-        std::uint32_t count = 0;
-        std::uint32_t dtype_bytes = 0;
-        std::uint64_t payload_bytes = 0;
-        std::uint64_t runtime_bytes = 0;
-        if (magic == "NIM1") {
-            count =
-                cursor.scalar<std::uint32_t>(
-                    "pool header");
-            payload_bytes =
-                cursor.scalar<std::uint64_t>(
-                    "pool header");
-        } else {
-            count =
-                cursor.scalar<std::uint32_t>(
-                    "v2 pool header");
-            dtype_bytes =
-                cursor.scalar<std::uint32_t>(
-                    "v2 pool header");
-            payload_bytes =
-                cursor.scalar<std::uint64_t>(
-                    "v2 pool header");
-            runtime_bytes =
-                cursor.scalar<std::uint64_t>(
-                    "v2 pool header");
-        }
-        if (
-            count == 0
-            || count
-                > static_cast<std::uint32_t>(
-                    expert_count)
-            || (
-                magic != "NIM1"
-                && (
-                    dtype_bytes == 0
-                    || dtype_bytes > 32
-                )
-            )
-        ) {
-            throw std::runtime_error(
-                "invalid MFE pool metadata");
-        }
-
-        std::vector<std::int32_t> expert_ids(count);
-        for (auto& expert : expert_ids) {
-            expert =
-                cursor.scalar<std::int32_t>(
-                    "expert IDs");
-        }
-        claim_experts(
-            expert_ids,
-            owners,
-            static_cast<int>(pool));
-
-        std::string dtype = "NINT";
-        if (magic != "NIM1") {
-            const auto raw_dtype =
-                cursor.bytes(
-                    dtype_bytes,
-                    "cohort dtype");
-            if (!is_ascii(raw_dtype)) {
-                throw std::runtime_error(
-                    "MFE cohort dtype must be ASCII");
-            }
-            dtype.assign(
-                reinterpret_cast<const char*>(
-                    raw_dtype.data()),
-                raw_dtype.size());
-            dtype = std::string(
-                mfq::canonical_format_dtype(dtype));
-        }
-
-        auto runtime = cursor.bytes(
-            checked_size(
-                runtime_bytes,
-                "cohort runtime metadata"),
-            "cohort runtime metadata");
-        auto payload = cursor.bytes(
-            checked_size(
-                payload_bytes,
-                "cohort payload"),
-            "cohort payload");
-
-        if (is_nint_dtype(dtype)) {
-            has_generic_cohorts = true;
-            if (!runtime.empty()) {
-                throw std::runtime_error(
-                    "unexpected MFE NINT "
-                    "runtime metadata");
-            }
-            auto weight = add_nint_pool(
-                payload,
-                expert_ids,
-                output_width,
-                input_width,
-                streams,
-                descriptors,
-                !reference);
-            if (reference) {
-                reference_cohorts.push_back({
+    for (std::size_t projection = 0; projection < projections.size(); ++projection) {
+        if ((streams.q8_q.size() & 1u) != 0u) streams.q8_q.push_back(0);
+        const auto before = streams.size();
+        std::vector<std::int32_t> local_descriptors(checked_product(
+            static_cast<std::size_t>(expert_count), static_cast<std::size_t>(kDescriptorSize),
+            "descriptor count"), 0);
+        bool projection_generic = false;
+        for (const auto& pool : projections[projection].pools) {
+            const auto& expert_ids = pool.expert_ids;
+            const auto count = expert_ids.size();
+            const auto& dtype = pool.dtype;
+            const auto runtime = pool.runtime;
+            const auto payload = pool.payload;
+            if (is_nint_dtype(dtype)) {
+                projection_generic = true;
+                if (!runtime.empty()) {
+                    throw std::runtime_error(
+                        "unexpected MFE NINT "
+                        "runtime metadata");
+                }
+                auto weight = add_nint_pool(
+                    payload,
                     expert_ids,
+                    output_width,
+                    input_width,
+                    streams,
+                    local_descriptors,
+                    !reference);
+                if (reference) {
+                    reference_cohorts.push_back({
+                        expert_ids,
+                        std::move(weight),
+                    });
+                }
+            } else if (is_nint8_zero_dtype(dtype)) {
+                projection_generic = true;
+                if (!runtime.empty()) {
+                    throw std::runtime_error(
+                        "unexpected MFE NINT8-0 "
+                        "runtime metadata");
+                }
+                auto weight = add_q8_pool(
+                    payload,
+                    expert_ids,
+                    output_width,
+                    input_width,
+                    streams,
+                    local_descriptors,
+                    !reference);
+                if (reference) {
+                    reference_cohorts.push_back({
+                        expert_ids,
+                        std::move(weight),
+                    });
+                }
+            } else if (dtype == "MXFP4" || dtype == "MXFP8") {
+                projection_generic = true;
+                if (!runtime.empty()) {
+                    throw std::runtime_error(
+                        "unexpected MFE MX runtime metadata");
+                }
+                auto weight = add_mx_pool(
+                    dtype,
+                    payload,
+                    expert_ids,
+                    output_width,
+                    input_width,
+                    streams,
+                    local_descriptors,
+                    !reference);
+                if (reference) {
+                    reference_cohorts.push_back({
+                        expert_ids,
+                        std::move(*weight),
+                    });
+                }
+            } else if (dtype == "BF16" || dtype == "F16") {
+                projection_generic = true;
+                if (!runtime.empty()) {
+                    throw std::runtime_error(
+                        "unexpected MFE dense runtime metadata");
+                }
+                auto weight = add_dense_pool(
+                    dtype,
+                    payload,
+                    expert_ids,
+                    output_width,
+                    input_width,
+                    streams,
+                    local_descriptors,
+                    !reference);
+                if (reference) {
+                    reference_cohorts.push_back({
+                        expert_ids,
+                        std::move(*weight),
+                    });
+                }
+            } else if (is_vq_dtype(dtype)) {
+                projection_generic = true;
+                auto weight = add_vq_pool(
+                    dtype,
+                    payload,
+                    runtime,
+                    expert_ids,
+                    output_width,
+                    input_width,
+                    streams,
+                    rotations,
+                    local_descriptors,
+                    !reference);
+                if (reference) {
+                    reference_cohorts.push_back({
+                        expert_ids,
+                        std::move(weight),
+                    });
+                }
+            } else if (is_mxfp4_sq_dtype(dtype)) {
+                if (!runtime.empty()) {
+                    throw std::runtime_error(
+                        "unexpected MFE MXFP4-SQ runtime metadata");
+                }
+                auto weight = MlxMxfp4SqWeight::from_blob(payload);
+                if (weight.input_size() != input_width ||
+                    weight.output_size() != checked_int(
+                        checked_product(
+                            static_cast<std::size_t>(count),
+                            static_cast<std::size_t>(output_width),
+                            "MXFP4-SQ cohort output width"),
+                        "MXFP4-SQ cohort output width")) {
+                    throw std::runtime_error(
+                        "MFE MXFP4-SQ cohort shape is inconsistent");
+                }
+                std::vector<std::int32_t> local_map(
+                    static_cast<std::size_t>(expert_count), -1);
+                const int cohort_index = checked_int(
+                    mxfp4_sq_cohorts.size(),
+                    "MXFP4-SQ cohort count");
+                for (std::size_t local = 0; local < expert_ids.size(); ++local) {
+                    const auto expert = expert_ids[local];
+                    local_map[static_cast<std::size_t>(expert)] =
+                        checked_int(local, "MXFP4-SQ local expert");
+                    standalone_owner[static_cast<std::size_t>(expert)] =
+                        cohort_index;
+                }
+                if (reference) {
+                    reference_cohorts.push_back({expert_ids, weight});
+                }
+                mxfp4_sq_cohorts.push_back({
+                    make_int32_array(local_map, Shape{expert_count}),
                     std::move(weight),
                 });
-            }
-        } else if (is_nint8_zero_dtype(dtype)) {
-            has_generic_cohorts = true;
-            if (!runtime.empty()) {
-                throw std::runtime_error(
-                    "unexpected MFE NINT8-0 "
-                    "runtime metadata");
-            }
-            auto weight = add_q8_pool(
-                payload,
-                expert_ids,
-                output_width,
-                input_width,
-                streams,
-                descriptors,
-                !reference);
-            if (reference) {
-                reference_cohorts.push_back({
-                    expert_ids,
+            } else if (is_fp8_sq_dtype(dtype)) {
+                if (!runtime.empty()) {
+                    throw std::runtime_error(
+                        "unexpected MFE native-FP8 SQ runtime metadata");
+                }
+                auto weight = MlxFp8SqWeight::from_blob(dtype, payload);
+                if (weight.input_size() != input_width ||
+                    weight.output_size() != checked_int(
+                        checked_product(
+                            static_cast<std::size_t>(count),
+                            static_cast<std::size_t>(output_width),
+                            "native-FP8 SQ cohort output width"),
+                        "native-FP8 SQ cohort output width")) {
+                    throw std::runtime_error(
+                        "MFE native-FP8 SQ cohort shape is inconsistent");
+                }
+                std::vector<std::int32_t> local_map(
+                    static_cast<std::size_t>(expert_count), -1);
+                const int cohort_index = checked_int(
+                    fp8_sq_cohorts.size(),
+                    "native-FP8 SQ cohort count");
+                for (std::size_t local = 0; local < expert_ids.size(); ++local) {
+                    const auto expert = expert_ids[local];
+                    local_map[static_cast<std::size_t>(expert)] =
+                        checked_int(local, "native-FP8 SQ local expert");
+                    standalone_owner[static_cast<std::size_t>(expert)] =
+                        cohort_index;
+                }
+                if (reference) {
+                    reference_cohorts.push_back({expert_ids, weight});
+                }
+                fp8_sq_cohorts.push_back({
+                    make_int32_array(local_map, Shape{expert_count}),
                     std::move(weight),
                 });
-            }
-        } else if (dtype == "MXFP4" || dtype == "MXFP8") {
-            has_generic_cohorts = true;
-            if (!runtime.empty()) {
+            } else {
                 throw std::runtime_error(
-                    "unexpected MFE MX runtime metadata");
+                    "unsupported nested MFE cohort dtype: "
+                    + dtype);
             }
-            auto weight = add_mx_pool(
-                dtype,
-                payload,
-                expert_ids,
-                output_width,
-                input_width,
-                streams,
-                descriptors,
-                !reference);
-            if (reference) {
-                reference_cohorts.push_back({
-                    expert_ids,
-                    std::move(*weight),
-                });
-            }
-        } else if (dtype == "BF16" || dtype == "F16") {
-            has_generic_cohorts = true;
-            if (!runtime.empty()) {
-                throw std::runtime_error(
-                    "unexpected MFE dense runtime metadata");
-            }
-            auto weight = add_dense_pool(
-                dtype,
-                payload,
-                expert_ids,
-                output_width,
-                input_width,
-                streams,
-                descriptors,
-                !reference);
-            if (reference) {
-                reference_cohorts.push_back({
-                    expert_ids,
-                    std::move(*weight),
-                });
-            }
-        } else if (is_vq_dtype(dtype)) {
-            has_generic_cohorts = true;
-            auto weight = add_vq_pool(
-                dtype,
-                payload,
-                runtime,
-                expert_ids,
-                output_width,
-                input_width,
-                streams,
-                rotations,
-                descriptors,
-                !reference);
-            if (reference) {
-                reference_cohorts.push_back({
-                    expert_ids,
-                    std::move(weight),
-                });
-            }
-        } else if (is_mxfp4_sq_dtype(dtype)) {
-            if (!runtime.empty()) {
-                throw std::runtime_error(
-                    "unexpected MFE MXFP4-SQ runtime metadata");
-            }
-            auto weight = MlxMxfp4SqWeight::from_blob(payload);
-            if (weight.input_size() != input_width ||
-                weight.output_size() != checked_int(
-                    checked_product(
-                        static_cast<std::size_t>(count),
-                        static_cast<std::size_t>(output_width),
-                        "MXFP4-SQ cohort output width"),
-                    "MXFP4-SQ cohort output width")) {
-                throw std::runtime_error(
-                    "MFE MXFP4-SQ cohort shape is inconsistent");
-            }
-            std::vector<std::int32_t> local_map(
-                static_cast<std::size_t>(expert_count), -1);
-            const int cohort_index = checked_int(
-                mxfp4_sq_cohorts.size(),
-                "MXFP4-SQ cohort count");
-            for (std::size_t local = 0; local < expert_ids.size(); ++local) {
-                const auto expert = expert_ids[local];
-                local_map[static_cast<std::size_t>(expert)] =
-                    checked_int(local, "MXFP4-SQ local expert");
-                standalone_owner[static_cast<std::size_t>(expert)] =
-                    cohort_index;
-            }
-            if (reference) {
-                reference_cohorts.push_back({expert_ids, weight});
-            }
-            mxfp4_sq_cohorts.push_back({
-                make_int32_array(local_map, Shape{expert_count}),
-                std::move(weight),
-            });
-        } else if (is_fp8_sq_dtype(dtype)) {
-            if (!runtime.empty()) {
-                throw std::runtime_error(
-                    "unexpected MFE native-FP8 SQ runtime metadata");
-            }
-            auto weight = MlxFp8SqWeight::from_blob(dtype, payload);
-            if (weight.input_size() != input_width ||
-                weight.output_size() != checked_int(
-                    checked_product(
-                        static_cast<std::size_t>(count),
-                        static_cast<std::size_t>(output_width),
-                        "native-FP8 SQ cohort output width"),
-                    "native-FP8 SQ cohort output width")) {
-                throw std::runtime_error(
-                    "MFE native-FP8 SQ cohort shape is inconsistent");
-            }
-            std::vector<std::int32_t> local_map(
-                static_cast<std::size_t>(expert_count), -1);
-            const int cohort_index = checked_int(
-                fp8_sq_cohorts.size(),
-                "native-FP8 SQ cohort count");
-            for (std::size_t local = 0; local < expert_ids.size(); ++local) {
-                const auto expert = expert_ids[local];
-                local_map[static_cast<std::size_t>(expert)] =
-                    checked_int(local, "native-FP8 SQ local expert");
-                standalone_owner[static_cast<std::size_t>(expert)] =
-                    cohort_index;
-            }
-            if (reference) {
-                reference_cohorts.push_back({expert_ids, weight});
-            }
-            fp8_sq_cohorts.push_back({
-                make_int32_array(local_map, Shape{expert_count}),
-                std::move(weight),
-            });
-        } else {
-            throw std::runtime_error(
-                "unsupported nested MFE cohort dtype: "
-                + dtype);
         }
-    }
-
-    if (cursor.remaining() != 0) {
-        throw std::runtime_error(
-            "trailing bytes in MFE tensor");
-    }
-    const auto missing = std::find(
-        owners.begin(),
-        owners.end(),
-        -1);
-    if (missing != owners.end()) {
-        throw std::runtime_error(
-            "MFE pools do not cover every expert");
+        has_generic_cohorts = has_generic_cohorts && projection_generic;
+        projection_info.push_back({
+            checked_add(streams.size() - before,
+                local_descriptors.size() * sizeof(std::int32_t), "projection bytes"),
+            true, 0,
+        });
+        for (int expert = 0; expert < expert_count; ++expert) {
+            const auto source = static_cast<std::size_t>(expert) * kDescriptorSize;
+            const auto target = (static_cast<std::size_t>(expert) * projections.size()
+                + projection) * kDescriptorSize;
+            std::copy_n(local_descriptors.begin() + source, kDescriptorSize,
+                descriptors.begin() + target);
+        }
     }
 
     const Shape descriptor_shape{
-        expert_count,
+        descriptor_rows,
         kDescriptorSize,
     };
     auto impl = std::make_shared<Impl>(
@@ -8816,7 +9063,7 @@ MlxMfeWeight MlxMfeWeight::from_blob(
         expert_count,
         output_width,
         input_width,
-        1);
+        projection_count);
     impl->reference_cohorts =
         std::move(reference_cohorts);
     impl->mxfp4_sq_cohorts =
@@ -8854,9 +9101,11 @@ MlxMfeWeight MlxMfeWeight::from_blob(
                 cohort.weight);
         }
     }
-    // VQ/MX/dense cohorts are parsed through standalone loaders and repacked
-    // into heterogeneous execution streams. Their temporary MLX arrays are
-    // dead now; NINT/SQ arrays remain live as the shared-kernel cohorts.
+    if (projection_count > 1) {
+        impl->bind_projection_views(projection_info);
+    }
+    // Temporary cohort and execution buffers have been released or adopted.
+    // Only reference/SQ cohorts retain standalone weights.
     mlx::core::clear_cache();
     return MlxMfeWeight(std::move(impl));
 }
@@ -9065,6 +9314,13 @@ MlxMfeWeight MlxMfeWeight::concatenate_projections(
                 rotation_variant(
                     source.rotations[index],
                     combined_rotations);
+        }
+        // Preserve typed row-offset/group64 alignment when rebasing arenas.
+        if ((source.family_mask & (1u << kFamilyNint)) != 0u) {
+            align_packed_stream(nint_q_arrays, nint_q_offset, 4);
+        }
+        if ((source.family_mask & (1u << kFamilyVq)) != 0u) {
+            align_packed_stream(vq_indices_arrays, vq_indices_offset, 8);
         }
         if ((q8_q_offset & 1u) != 0u) {
             q8_q_arrays.push_back(make_raw_array(
@@ -9463,33 +9719,13 @@ MlxMfeWeight MlxMfeWeight::materialize_packed_projections() const {
         impl->vq_parameters, impl->vq_residual_codebooks, impl->vq_residual_first,
         impl->vq_residual_second, impl->mx_values, impl->mx_scales,
     });
-    // Preserve split dispatch and its arithmetic, but rebase each projection
-    // onto the same combined buffers. No original Gate/Up pool stays resident.
-    const auto sources = std::move(impl->projection_views);
-    impl->projection_views.clear();
-    for (std::size_t projection = 0; projection < sources.size(); ++projection) {
-        std::vector<std::int32_t> descriptors;
-        descriptors.reserve(static_cast<std::size_t>(impl->experts) * kDescriptorSize);
-        for (int expert = 0; expert < impl->experts; ++expert) {
-            const auto begin = impl->descriptor_values.begin() +
-                (static_cast<std::size_t>(expert) * sources.size() + projection) * kDescriptorSize;
-            descriptors.insert(descriptors.end(), begin, begin + kDescriptorSize);
-        }
-        auto view = std::make_shared<Impl>(
-            make_int32_array(descriptors, Shape{impl->experts, kDescriptorSize}),
-            impl->nint_q, impl->nint_sub_scale, impl->nint_sub_min,
-            impl->nint_anchor_scale, impl->nint_anchor_min, impl->q8_q, impl->q8_scales,
-            impl->vq_indices, impl->vq_state, impl->vq_aux, impl->vq_anchors,
-            impl->vq_codebooks, impl->vq_scales, impl->vq_state_to_codebank, impl->vq_banks,
-            impl->vq_parameters, impl->vq_residual_codebooks, impl->vq_residual_first,
-            impl->vq_residual_second, impl->mx_values, impl->mx_scales,
-            impl->rotations, std::move(descriptors), impl->experts,
-            impl->out_per_expert, impl->neuron_len, 1);
-        view->automatic_mxfp4_nax_prefill = sources[projection]->automatic_mxfp4_nax_prefill;
-        view->logical_experts = sources[projection]->logical_experts;
-        view->packed_bytes = sources[projection]->packed_bytes;
-        impl->projection_views.push_back(std::move(view));
+    // Preserve split dispatch and its arithmetic while releasing source pools.
+    std::vector<ProjectionStorageInfo> sources;
+    for (const auto& source : impl->projection_views) {
+        sources.push_back({source->packed_bytes, source->automatic_mxfp4_nax_prefill,
+            source->logical_experts});
     }
+    impl->bind_projection_views(sources);
     return MlxMfeWeight(std::move(impl));
 }
 
@@ -9580,6 +9816,12 @@ MlxMfeWeight MlxMfeWeight::concatenate_experts(
             rotation_map[index + 1] = rotation_variant(
                 source.rotations[index],
                 combined_rotations);
+        }
+        if ((source.family_mask & (1u << kFamilyNint)) != 0u) {
+            align_packed_stream(nint_q_arrays, nint_q_offset, 4);
+        }
+        if ((source.family_mask & (1u << kFamilyVq)) != 0u) {
+            align_packed_stream(vq_indices_arrays, vq_indices_offset, 8);
         }
         if ((q8_q_offset & 1u) != 0u) {
             q8_q_arrays.push_back(make_raw_array(
@@ -9875,8 +10117,13 @@ MlxMoeWeight load_routed_gate_up_weight(
         return MlxMoeWeight::from_blob(mapped.view());
     };
     if (has_gate) {
-        return MlxMoeWeight::concatenate_projections(
-            std::vector<MlxMoeWeight>{load(gate_name), load(up_name)});
+        if (model.record(gate_name).dtype != "MFE" || model.record(up_name).dtype != "MFE") {
+            throw std::runtime_error("routed expert tensors must use MFE under " + base);
+        }
+        const auto gate = model.map_record(gate_name);
+        const auto up = model.map_record(up_name);
+        const std::array blobs{gate.view(), up.view()};
+        return MlxMoeWeight::from_projection_blobs(blobs);
     }
     return load(base + ".gate_up.weight");
 }
@@ -9949,7 +10196,8 @@ array MlxMfeWeight::routed_swiglu(
             impl_->projection_views.begin(),
             impl_->projection_views.end(),
             [](const auto& projection) {
-                return !projection->mxfp4_sq_cohorts.empty()
+                return !projection->reference_cohorts.empty()
+                    || !projection->mxfp4_sq_cohorts.empty()
                     || !projection->fp8_sq_cohorts.empty();
             });
         if (mfe_split_swiglu_enabled()
@@ -10092,9 +10340,9 @@ array MlxMfeWeight::routed_swiglu_pair(
         && impl_->rotations.empty()
         && up.impl_->rotations.empty()
         && (impl_->k_lanes_override == 0
-            || impl_->k_lanes_override == 8)
+            || impl_->k_lanes_override == 16)
         && (up.impl_->k_lanes_override == 0
-            || up.impl_->k_lanes_override == 8)
+            || up.impl_->k_lanes_override == 16)
         && input.ndim() == 2
         && expert_ids.ndim() == 2
         && input.shape(0) >= 1
@@ -10129,7 +10377,7 @@ array MlxMfeWeight::routed_swiglu_pair(
         mlx::core::astype(expert_ids, mlx::core::int32));
     const int tokens = ids.shape(0);
     const int routes = ids.shape(1);
-    constexpr int kOutputsPerWorkgroup = 8;
+    constexpr int kOutputsPerWorkgroup = 4;
     const auto output_tiles =
         (static_cast<std::size_t>(impl_->out_per_expert)
              + kOutputsPerWorkgroup - 1u)
@@ -10249,7 +10497,7 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
 
     const int decode_k_lanes = impl_->k_lanes_override != 0
         ? impl_->k_lanes_override
-        : apple_m5_family() ? 16 : 8;
+        : 16;
     constexpr int kGateRowsPerSimd = 1;
     const int gate_rows_per_workgroup =
         (32 / decode_k_lanes) * kGateRowsPerSimd;
@@ -10339,7 +10587,7 @@ bool MlxMfeWeight::supports_fused_routed_reduce() const noexcept {
         && impl_->family_mask == (std::uint32_t{1} << kFamilyMxfp4)
         && impl_->projections == 1
         && impl_->rotations.empty()
-        && (impl_->k_lanes_override == 0 || impl_->k_lanes_override == 8)
+        && (impl_->k_lanes_override == 0 || impl_->k_lanes_override == 16)
         && impl_->out_per_expert > 0
         && impl_->neuron_len > 0
         && impl_->neuron_len % 32 == 0
@@ -10390,7 +10638,7 @@ array MlxMfeWeight::routed_matmul_reduce(
     const int rows_per_lane_group =
         mxfp4_decode_down_reduce_rows();
     const int outputs_per_workgroup =
-        4 * rows_per_lane_group;
+        2 * rows_per_lane_group;
     const int workgroups = checked_int(
         checked_product(
             static_cast<std::size_t>(tokens),
@@ -11177,7 +11425,8 @@ array MlxMfeWeight::routed_matmul_impl(
             impl_->projection_views.begin(),
             impl_->projection_views.end(),
             [](const auto& projection) {
-                return !projection->mxfp4_sq_cohorts.empty()
+                return !projection->reference_cohorts.empty()
+                    || !projection->mxfp4_sq_cohorts.empty()
                     || !projection->fp8_sq_cohorts.empty();
             })) {
         if (fused_swiglu) {
@@ -11470,12 +11719,7 @@ array MlxMfeWeight::routed_matmul_impl(
         fused_swiglu && impl_->projections == 2;
     const int k_lanes = impl_->k_lanes_override != 0
         ? impl_->k_lanes_override
-        : (fused_swiglu
-            && !split_fused_swiglu
-            && impl_->family_mask !=
-                (std::uint32_t{1} << kFamilyMxfp4)
-            ? 16
-            : 8);
+        : 16;
     // Two rows reuse activation loads on the measured M5 mixed NINT/VQ
     // 640 -> 2560 decode geometry. Do not apply this to the inverse gate/up
     // projection: its larger K/register footprint regresses some cohorts.
@@ -11492,7 +11736,6 @@ array MlxMfeWeight::routed_matmul_impl(
         ? 1
         : tokens == 1
             && impl_->rotations.empty()
-            && k_lanes == 8
         ? mfe_decode_rows_per_simd(automatic_rows)
         : 1;
     const auto rows_per_workgroup = static_cast<std::size_t>(

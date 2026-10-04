@@ -2,7 +2,7 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { sessionsApi } from '../../../shared/api/resources/sessions';
-import type { Session, Message } from '../../../shared/api/types';
+import type { Session, Message, RuntimeInstance } from '../../../shared/api/types';
 import { useConversationStore } from '../state/conversationStore';
 import { useConversationSessions } from './useConversationSessions';
 
@@ -12,7 +12,7 @@ const runtime = vi.hoisted(() => ({
   selectedModel: 'model-a',
   setSelectedModel: vi.fn(),
   models: [{ id: 'model-a' }, { id: 'model-b' }],
-  instances: [],
+  instances: [] as RuntimeInstance[],
 }));
 vi.mock('../../../app/RuntimeProvider', () => ({ useRuntime: () => runtime }));
 const first = { id: 'a', model: 'model-a', title: 'A', mode: 'text', revision: 0 } as Session;
@@ -23,6 +23,8 @@ beforeEach(() => {
   runtime.ready = true;
   runtime.connectionRevision = 1;
   runtime.selectedModel = 'model-a';
+  runtime.models = [{ id: 'model-a' }, { id: 'model-b' }];
+  runtime.instances = [];
   runtime.setSelectedModel.mockClear();
   vi.spyOn(sessionsApi, 'listSessions').mockResolvedValue([first, second]);
   vi.spyOn(sessionsApi, 'listMessages').mockResolvedValue([]);
@@ -106,6 +108,16 @@ it('后台生成期间不派生新模型会话，完成后再执行模型切换'
   rerender({ busy: false });
   await waitFor(() => expect(result.current.activeId).toBe('fork'));
   expect(sessionsApi.forkSession).toHaveBeenCalledOnce();
+});
+
+it('模型只在已载入实例里，也能切换并用于会话，无需资产注册', async () => {
+  runtime.models = [];
+  runtime.instances = [{ id: 'loaded-b', model: 'model-b', state: 'ready' }] as RuntimeInstance[];
+  runtime.selectedModel = 'model-b';
+  const { result } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.conversationReady).toBe(true));
+  expect(result.current.active?.model).toBe('model-b');
+  expect(sessionsApi.forkSession).toHaveBeenCalledWith('a', null, true, 'A', 'model-b');
 });
 
 it('删除当前会话后切换到剩余会话并清除旧历史', async () => {

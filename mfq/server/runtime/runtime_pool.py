@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import re
 import socket
 import subprocess
+import tempfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager, suppress
@@ -31,6 +34,8 @@ from mfq.server.protocol.models import (
     RuntimeInstanceList,
     RuntimeInstanceResource,
     RuntimeInstanceState,
+    RuntimeMemoryResources,
+    RuntimeMemoryPolicy,
     RuntimeLogLevel,
     SamplingParams,
     ToolChoice,
@@ -65,6 +70,26 @@ class RuntimeInstanceNotFoundError(RuntimeManagementError):
 
 class RuntimeConflictError(RuntimeManagementError):
     pass
+
+
+class _MemoryPlanContext:
+    def __init__(self, context: JobContext, start: float = 0.0, end: float = 1.0, recovery: bool = False) -> None:
+        self.context, self.start, self.end, self.recovery = context, start, end, recovery
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.context, name)
+
+    @property
+    def cancel_requested(self) -> bool:
+        return False if self.recovery else self.context.cancel_requested
+
+    def raise_if_cancelled(self) -> None:
+        if not self.recovery:
+            self.context.raise_if_cancelled()
+
+    async def progress(self, value: float, **kwargs: Any) -> None:
+        if not self.recovery:
+            await self.context.progress(self.start + value * (self.end - self.start), **kwargs)
 
 
 _AUTOMATIC_MEMORY_SOFT_RATIO = 0.90
@@ -109,7 +134,10 @@ class _Runtime(BaseModel):
     reserved_bytes: int | None = None
     resident_bytes: int | None = None
     kv_bytes: int | None = None
+    memory: RuntimeMemoryResources | None = None
     usage_refreshed_at: float = 0.0
+    load_progress: float = 0.02
+    context_capacity: int | None = None
 
 
 class _RuntimeLoadContext:
@@ -117,6 +145,8 @@ class _RuntimeLoadContext:
 
     def __init__(self) -> None:
         self._cleanup_callbacks: list[Callable[[], Awaitable[None] | None]] = []
+        self.job_id = uuid4()
+        self.cancel_requested = False
 
     def raise_if_cancelled(self) -> None:
         return None
@@ -257,6 +287,10 @@ class RuntimePool:
             else None
         )
         self.max_runtime_memory_bytes = max_runtime_memory_bytes or automatic_budget
+        self.memory_policy = RuntimeMemoryPolicy()
+        self._policy_model_limits: dict[str, int] = {}
+        self._policy_prefix_limits: dict[str, int] = {}
+        self._memory_configuration_job: UUID | None = None
         self.automatic_memory_budget = automatic_budget is not None
         self.default_idle_ttl_seconds = default_idle_ttl_seconds
         self.load_failure_cooldown_seconds = load_failure_cooldown_seconds
@@ -275,6 +309,8 @@ class RuntimePool:
         self._shared_cache_released_bytes = 0
         self._shared_cache_reclaim_failures = 0
         self._shared_cache_pressure_checked_at = 0.0
+        self._host_vm_counters: tuple[int, int] | None = None
+        self._host_vm_pressure_until = 0.0
         self.store = None
         self._instances: dict[UUID, _Runtime] = {}
         self._loading_model_names: set[str] = set()
@@ -453,12 +489,50 @@ class RuntimePool:
                 ),
                 artifact.resource.error or "model artifact is incomplete",
             )
+        if self.memory_policy.model_limit_bytes is not None or self.memory_policy.prefix_limit_bytes is not None:
+            async with self._lock:
+                current = [item for item in self._instances.values() if item.state != RuntimeInstanceState.FAILED]
+                candidates = [item.artifact for item in current]
+                new_model = all(item.artifact.resource.name != artifact.resource.name for item in current)
+                limits, hot = self._plan_memory_policy(self.memory_policy, [*candidates, artifact] if new_model else candidates)
+                resize = self._memory_configuration_job is None and new_model and any(
+                    (item.memory.resident_weight_bytes if item.memory and item.memory.resident_weight_bytes is not None else item.reserved_bytes or 0)
+                    > limits.get(item.artifact.resource.name, self.max_runtime_memory_bytes or (1 << 63))
+                    or (self.memory_policy.prefix_limit_bytes is not None and item.memory is not None
+                        and (item.memory.prefix_cache_limit_bytes or 0) > hot.get(item.artifact.resource.name, 0)) for item in current)
+                if not resize and self._memory_configuration_job is None:
+                    self._policy_model_limits = limits
+                    self._policy_prefix_limits = hot
+            if resize:
+                await self.configure_memory_policy(_MemoryPlanContext(context, end=0.7), self.memory_policy.model_dump(), additional=artifact)
+                context = _MemoryPlanContext(context, start=0.7)
         # Automatic residency is recalculated whenever an idle model is restored.
         replay_request = request.model_copy(deep=True)
         async with self._lock:
             if self._closed:
                 raise RuntimeManagementError("runtime pool is closed")
+            if self._memory_configuration_job is not None and self._memory_configuration_job != context.job_id:
+                raise _job_error("memory_plan_busy", "memory settings are being applied", retryable=True)
             residency_ceiling = self._effective_runtime_memory_budget_locked()
+            if self.memory_policy.model_limit_bytes is not None:
+                other_weights = sum((item.memory.resident_weight_bytes if item.memory and item.memory.resident_weight_bytes is not None else item.reserved_bytes or 0)
+                    for item in self._instances.values() if item.artifact.resource.name != artifact.resource.name)
+                other_weights += sum(size for name, size in self._load_bytes.items() if name != artifact.resource.name)
+                available_weights = max(1, self.memory_policy.model_limit_bytes - other_weights)
+                available_weights = min(available_weights, self._policy_model_limits.get(artifact.resource.name, available_weights))
+                residency_ceiling = min(residency_ceiling or available_weights, available_weights)
+            elif artifact.resource.name in self._policy_model_limits:
+                limit = self._policy_model_limits[artifact.resource.name]
+                residency_ceiling = min(residency_ceiling or limit, limit)
+            prefix_limit = self._policy_prefix_limits.get(artifact.resource.name)
+            if prefix_limit is None and self.memory_policy.prefix_limit_bytes is not None:
+                used_limits = sum(self._policy_prefix_limits.get(item.artifact.resource.name, 0) for item in self._instances.values())
+                prefix_limit = max(0, self.memory_policy.prefix_limit_bytes - used_limits)
+                self._policy_prefix_limits[artifact.resource.name] = prefix_limit
+            if prefix_limit is not None:
+                request = request.model_copy(update={"prefix_cache_hot_bytes": prefix_limit, "prefix_cache_max_bytes": prefix_limit})
+        if self.memory_policy.model_limit_bytes is not None or self.memory_policy.prefix_limit_bytes is not None:
+            request = request.model_copy(update={"moe_gpu_cache_gb": None})
         request = self._apply_automatic_expert_residency(
             artifact,
             request,
@@ -564,6 +638,12 @@ class RuntimePool:
                     f"model is already loading: {model_name}",
                     retryable=True,
                 )
+            if self.memory_policy.model_limit_bytes is not None:
+                committed_weights = sum((item.memory.resident_weight_bytes if item.memory and item.memory.resident_weight_bytes is not None else item.reserved_bytes or 0)
+                    for item in self._instances.values() if item not in evicted)
+                committed_weights += sum(self._load_bytes.values())
+                if committed_weights + incoming_bytes > self.memory_policy.model_limit_bytes:
+                    raise _job_error("runtime_memory_limit", "model weights exceed the configured aggregate budget; retry after other loads finish", retryable=True)
             claimed_instance_ids = {item.id for item in evicted}
             resident_names = {
                 item.artifact.resource.name
@@ -769,7 +849,6 @@ class RuntimePool:
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.startup_timeout_seconds
-        next_progress = 0.05
         while loop.time() < deadline:
             context.raise_if_cancelled()
             status = process.returncode
@@ -786,9 +865,6 @@ class RuntimePool:
                 )
             except (BackendError, TimeoutError):
                 await asyncio.sleep(0.25)
-                if next_progress < 0.9:
-                    next_progress = min(0.9, next_progress + 0.005)
-                    await context.progress(next_progress, message="Loading model")
                 continue
             if capabilities.model != artifact.resource.name:
                 raise _job_error(
@@ -849,6 +925,103 @@ class RuntimePool:
             "artifact_id": artifact.resource.id,
             "context_size": request.context_size,
         }
+
+    def memory_policy_status(self) -> dict[str, Any]:
+        return {**self.memory_policy.model_dump(), "actual_prefix_directory": str(self._prefix_cache_directory())}
+
+    def _prefix_cache_directory(self) -> Path:
+        if self.memory_policy.prefix_directory is not None:
+            return Path(self.memory_policy.prefix_directory).expanduser().resolve()
+        if self.store is not None:
+            return self.store.path.parent / "prefix-cache"
+        return Path.home() / ".cache" / "mfq" / "prefix"
+
+    def _plan_memory_policy(self, policy: RuntimeMemoryPolicy, artifacts: Sequence[DiscoveredModel]) -> tuple[dict[str, int], dict[str, int]]:
+        if self.max_runtime_memory_bytes is not None and any(value is not None and value > self.max_runtime_memory_bytes for value in (policy.model_limit_bytes, policy.prefix_limit_bytes)):
+            raise _job_error("memory_budget_exceeds_capacity", "a manual budget cannot exceed detected inference memory")
+        if not artifacts:
+            return {}, {}
+        totals = [max(0, item.resource.total_bytes - item.always_streamed_bytes) for item in artifacts]
+        experts = [min(total, item.routed_expert_bytes) for item, total in zip(artifacts, totals)]
+        dense = [total - expert for total, expert in zip(totals, experts)]
+        ceiling = self.max_runtime_memory_bytes
+        prefixes = policy.prefix_limit_bytes if policy.prefix_limit_bytes is not None else len(artifacts) * (2 << 30)
+        limit = policy.model_limit_bytes
+        if ceiling is not None:
+            available = max(0, ceiling - prefixes - (2 << 30))
+            limit = min(limit, available) if limit is not None else available
+        if limit is None:
+            limit = sum(totals)
+        floors = [min(size, 5 << 30) for size in experts]
+        minimum = sum(dense) + sum(floors)
+        if limit < minimum:
+            raise _job_error("memory_budget_too_small", f"these models require at least {minimum} weight bytes plus prefix and live KV headroom")
+        excess = max(0, sum(totals) - limit)
+        expert_total = sum(experts)
+        allowed_experts = max(0, expert_total - excess)
+        remainder = max(0, allowed_experts - sum(floors))
+        extra_total = sum(expert - floor for expert, floor in zip(experts, floors))
+        limits = {item.resource.name: base + floor + remainder * (expert - floor) // max(1, extra_total)
+            for item, base, expert, floor in zip(artifacts, dense, experts, floors)}
+        if policy.model_limit_bytes is None and policy.prefix_limit_bytes is None:
+            limits = {}
+        share, remainder = divmod(prefixes, len(artifacts))
+        hot = {item.resource.name: share + (index < remainder) for index, item in enumerate(artifacts)}
+        return limits, hot
+
+    async def configure_memory_policy(self, context: JobContext, payload: dict[str, Any], *, additional: DiscoveredModel | None = None) -> dict[str, Any]:
+        policy = RuntimeMemoryPolicy.model_validate(payload)
+        if policy.prefix_directory is not None:
+            directory = Path(policy.prefix_directory).expanduser()
+            if not directory.is_absolute():
+                raise _job_error("invalid_cache_directory", "prefix cache directory must be an absolute path")
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryFile(dir=directory):
+                    pass
+            except OSError as error:
+                raise _job_error("cache_directory_unwritable", str(error)) from error
+            policy = policy.model_copy(update={"prefix_directory": str(directory.resolve())})
+        async with self._lock:
+            if self._memory_configuration_job is not None or self._loading_model_names:
+                raise _job_error("memory_plan_busy", "a model or memory plan is already loading", retryable=True)
+            current = list(self._instances.values())
+            if any(item.state != RuntimeInstanceState.READY or item.active_requests or item.queued_requests or item.control_leases for item in current):
+                raise _job_error("runtime_busy", "wait for model requests to finish before applying memory budgets", retryable=True)
+            limits, hot = self._plan_memory_policy(policy, [*[item.artifact for item in current], *([additional] if additional else [])])
+            previous = self.memory_policy
+            previous_limits, previous_hot = dict(self._policy_model_limits), dict(self._policy_prefix_limits)
+            requests = [self._load_requests[item.artifact.resource.name].model_copy(update={
+                "context_size": item.context_size, "pin": item.pinned, "idle_ttl_seconds": item.idle_ttl_seconds,
+            }) for item in current]
+            self._memory_configuration_job = context.job_id
+        try:
+            for item in current:
+                await self._retire_instance(item)
+            self.memory_policy = policy
+            self._policy_model_limits, self._policy_prefix_limits = limits, hot
+            ordered = sorted(requests, key=lambda request: next(item.artifact.routed_expert_bytes for item in current if item.artifact.resource.name == request.model))
+            for index, request in enumerate(ordered):
+                context.raise_if_cancelled()
+                await self.load(_MemoryPlanContext(context, index / len(ordered), (index + 1) / len(ordered)), request.model_dump(mode="json"))
+            if self.store is not None:
+                await asyncio.to_thread(self.store.save_runtime_memory_policy, policy.model_dump())
+            return {**policy.model_dump(), "models_replanned": len(requests)}
+        except BaseException:
+            for item in list(self._instances.values()):
+                await self._retire_instance(item)
+            self.memory_policy = previous
+            self._policy_model_limits, self._policy_prefix_limits = previous_limits, previous_hot
+            await context.log("Memory planning did not complete; restoring the previous model configuration.")
+            for request in requests:
+                try:
+                    await self.load(_MemoryPlanContext(context, recovery=True), request.model_dump(mode="json"))
+                except BaseException as error:
+                    await context.log(f"Could not restore {request.model}: {type(error).__name__}")
+            raise
+        finally:
+            async with self._lock:
+                self._memory_configuration_job = None
 
     async def unload(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
         request = ModelUnloadRequest.model_validate(payload)
@@ -920,7 +1093,9 @@ class RuntimePool:
                     queued_requests=item.queued_requests,
                     resident_bytes=item.resident_bytes,
                     kv_bytes=item.kv_bytes,
+                    memory=item.memory,
                     context_size=item.context_size,
+                    context_capacity=item.context_capacity,
                     started_at=item.started_at,
                     last_used_at=item.last_used_at,
                     idle_ttl_seconds=item.idle_ttl_seconds,
@@ -982,7 +1157,9 @@ class RuntimePool:
                 queued_requests=instance.queued_requests,
                 resident_bytes=instance.resident_bytes,
                 kv_bytes=instance.kv_bytes,
+                memory=instance.memory,
                 context_size=instance.context_size,
+                context_capacity=instance.context_capacity,
                 started_at=instance.started_at,
                 last_used_at=instance.last_used_at,
                 idle_ttl_seconds=instance.idle_ttl_seconds,
@@ -1285,6 +1462,9 @@ class RuntimePool:
                 ),
                 "runtime_memory_pressure_level": memory_pressure_level,
                 "runtime_memory_pressure_ratio": memory_pressure_ratio,
+                "runtime_memory_host_paging_pressure": (
+                    time.monotonic() < self._host_vm_pressure_until
+                ),
                 "runtime_memory_shared_cache_reclaims": self._shared_cache_reclaims,
                 "runtime_memory_shared_cache_released_bytes": (
                     self._shared_cache_released_bytes
@@ -1357,6 +1537,10 @@ class RuntimePool:
                             instance.resident_bytes = observed_resident_bytes
                         if isinstance(kv_value, (int, float)) and kv_value >= 0:
                             instance.kv_bytes = int(kv_value)
+                        instance.memory = self._memory_resources(status, instance.memory)
+                        capacity = status.get("context_capacity")
+                        if isinstance(capacity, int) and capacity > 0:
+                            instance.context_capacity = capacity
             return status
 
     async def runtime_models(self) -> dict[str, Any]:
@@ -1495,11 +1679,18 @@ class RuntimePool:
         async with self._runtime_control_lease(instance_id) as (instance, backend):
             if backend is None:
                 raise BackendError("model_not_loaded", "no runtime is available")
+            if instance is not None and instance.context_capacity is not None and context_size > instance.context_capacity:
+                raise BackendError("context_size_exceeded", "context exceeds the model capacity", status_code=400)
             result = await backend.reload_runtime(context_size)
             if instance is not None:
                 async with self._lock:
                     if self._instances.get(instance.id) is instance:
-                        instance.context_size = context_size
+                        actual = result.get("max_context", context_size)
+                        instance.context_size = actual if isinstance(actual, int) and actual > 0 else context_size
+                        name = instance.artifact.resource.name
+                        request = self._load_requests.get(name)
+                        if request is not None:
+                            self._load_requests[name] = request.model_copy(update={"context_size": instance.context_size})
             return result
 
     async def clear_runtime_cache(
@@ -2000,7 +2191,7 @@ class RuntimePool:
         """Release server-process caches before trimming or evicting models."""
 
         reclaimer = self.shared_cache_reclaimer
-        if reclaimer is None or not self.automatic_memory_budget:
+        if reclaimer is None:
             return 0
         async with self._lock:
             if self._closed:
@@ -2023,7 +2214,7 @@ class RuntimePool:
         return await self._run_shared_cache_reclaimer()
 
     async def _reclaim_shared_cache_under_pressure(self) -> int:
-        if self.shared_cache_reclaimer is None or not self.automatic_memory_budget:
+        if self.shared_cache_reclaimer is None:
             return 0
         async with self._lock:
             if self._closed:
@@ -2031,7 +2222,7 @@ class RuntimePool:
             level, _ratio, _ceiling, _committed = (
                 self._runtime_memory_pressure_locked()
             )
-            if level == "normal":
+            if level in {"normal", "disabled"}:
                 return 0
             now = time.monotonic()
             if now - self._shared_cache_pressure_checked_at < max(
@@ -2221,10 +2412,8 @@ class RuntimePool:
         )
 
     def _effective_runtime_memory_budget_locked(self) -> int | None:
-        """Cap automatic admission by memory the host can reclaim right now."""
-
         ceiling = self.max_runtime_memory_bytes
-        if ceiling is None or not self.automatic_memory_budget:
+        if ceiling is None or self.backend != "metal":
             return ceiling
         snapshot = host_memory_snapshot()
         if snapshot is None:
@@ -2245,16 +2434,40 @@ class RuntimePool:
     ) -> tuple[str, float | None, int | None, int]:
         committed = self._committed_pool_bytes_locked()
         effective = self._effective_runtime_memory_budget_locked()
-        if not self.automatic_memory_budget or effective is None:
+        if effective is None or (self.backend != "metal" and not self.automatic_memory_budget):
             return "disabled", None, effective, committed
         ratio = committed / max(1, effective)
-        if ratio >= _AUTOMATIC_MEMORY_HARD_RATIO:
+        if (
+            ratio >= _AUTOMATIC_MEMORY_HARD_RATIO
+            or time.monotonic() < self._host_vm_pressure_until
+        ):
             level = "hard"
         elif ratio >= _AUTOMATIC_MEMORY_SOFT_RATIO:
             level = "soft"
         else:
             level = "normal"
         return level, ratio, effective, committed
+
+    def _observe_host_memory_pressure_locked(self) -> None:
+        if self.backend != "metal":
+            return
+        snapshot = host_memory_snapshot()
+        if snapshot is None or snapshot.compression_bytes is None or snapshot.swapout_bytes is None:
+            self._host_vm_counters = None
+            self._host_vm_pressure_until = 0.0
+            return
+        current = (snapshot.compression_bytes, snapshot.swapout_bytes)
+        previous, self._host_vm_counters = self._host_vm_counters, current
+        reserve = 4 << 30 if snapshot.total < 24 << 30 else 6 << 30
+        headroom = max(1 << 30, snapshot.total // 32)
+        if snapshot.reclaimable(active_ratio=0.0) > reserve + headroom:
+            self._host_vm_pressure_until = 0.0
+            return
+        if previous is None or any(now < before for now, before in zip(current, previous)):
+            self._host_vm_pressure_until = 0.0
+            return
+        if current[0] - previous[0] >= 128 << 20 or current[1] - previous[1] >= 64 << 20:
+            self._host_vm_pressure_until = time.monotonic() + max(5.0, self.metric_interval_seconds * 2)
 
     def _estimated_load_bytes(
         self,
@@ -2301,7 +2514,6 @@ class RuntimePool:
         )
         if (
             request.moe_gpu_cache_gb is not None
-            or self.backend != "metal"
             or ceiling is None
             or artifact.resource.format not in {"hf", "mfq"}
             or artifact.routed_expert_bytes <= 0
@@ -2419,6 +2631,8 @@ class RuntimePool:
                     *(self._refresh_instance_usage(item) for item in refresh)
                 )
 
+            async with self._lock:
+                self._observe_host_memory_pressure_locked()
             await self._reclaim_shared_cache_under_pressure()
             async with self._lock:
                 pressure_level, _ratio, pressure_ceiling, _committed = (
@@ -2467,7 +2681,7 @@ class RuntimePool:
                     ttl_victims.append(instance)
                     victims.append((instance, "idle_ttl"))
                 victims.extend(
-                    (instance, "memory_budget")
+                    (instance, "host_memory_pressure" if time.monotonic() < self._host_vm_pressure_until else "memory_budget")
                     for instance in self._claim_over_budget_instances_for_unload_locked(
                         memory_ceiling=pressure_target,
                         pending_releases=ttl_victims,
@@ -2484,6 +2698,8 @@ class RuntimePool:
                             f"runtime unloaded after {instance.idle_ttl_seconds}s "
                             "of inactivity"
                             if reason == "idle_ttl"
+                            else "idle LRU runtime unloaded after host compression or paging pressure"
+                            if reason == "host_memory_pressure"
                             else "runtime unloaded to enforce the aggregate memory budget"
                         )
                         await asyncio.to_thread(
@@ -2602,6 +2818,20 @@ class RuntimePool:
                 return
             message = line.decode("utf-8", errors="replace").rstrip()
             if message and instance.state == RuntimeInstanceState.LOADING:
+                match = re.fullmatch(r"mfq_load_progress completed=(\d{1,10}) total=(\d{1,10})", message)
+                value = None
+                data = None
+                if match:
+                    completed, total = map(int, match.groups())
+                    if 0 < total and 0 <= completed <= total:
+                        value = 0.02 + 0.90 * completed / total
+                        data = {"phase": "weights", "completed": completed, "total": total}
+                elif message == "mfq_load_progress stage=finalizing":
+                    value = 0.94
+                    data = {"phase": "finalizing"}
+                if value is not None and value > instance.load_progress:
+                    instance.load_progress = value
+                    await context.progress(value, message="Preparing model" if match else "Finalizing runtime", data=data)
                 await context.log(message[:4096])
             if message and self.store is not None:
                 await asyncio.to_thread(
@@ -2722,6 +2952,65 @@ class RuntimePool:
                 instance.resident_bytes = observed_resident
             if kv_bytes is not None:
                 instance.kv_bytes = kv_bytes
+            if status is not None:
+                instance.memory = self._memory_resources(status, instance.memory)
+                capacity = status.get("context_capacity")
+                if isinstance(capacity, int) and capacity > 0:
+                    instance.context_capacity = capacity
+
+    @staticmethod
+    def _memory_resources(
+        status: dict[str, Any], previous: RuntimeMemoryResources | None = None,
+    ) -> RuntimeMemoryResources:
+        """Retain last telemetry when a busy native worker skips its try-lock.
+
+        Do not use RSS/allocator totals as weight bytes, or cumulative I/O as
+        SSD payload size. Those counters describe different resources.
+        """
+        values = previous.model_dump() if previous is not None else {}
+        for target, source in (
+            ("resident_weight_bytes", "resident_weight_bytes"),
+            ("wired_bytes", "metal_wired_bytes"),
+            ("wired_limit_bytes", "metal_wired_limit_bytes"),
+            ("ssd_expert_bytes", "ssd_expert_payload_bytes"),
+            ("ssd_ple_bytes", "ssd_ple_payload_bytes"),
+        ):
+            value = status.get(source)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+                values[target] = int(value)
+        for target, source in (("ssd_experts", "ssd_expert_enabled"), ("ssd_ple", "ssd_ple_enabled"), ("wired_available", "metal_wired_available")):
+            value = status.get(source)
+            if isinstance(value, (bool, int, float)) and value in (0, 1):
+                values[target] = bool(value)
+        hot = status.get("prefix_cache_hot_bytes", status.get("prefix_cache_bytes"))
+        live = status.get("kv_cache_bytes")
+        groups = status.get("kv_cache_contexts")
+        sessions = status.get("prefix_cache_sessions")
+        hot_sessions = status.get("prefix_cache_resident_sessions")
+        blocks = status.get("prefix_cache_hot_blocks", status.get("prefix_cache_snapshots"))
+        def measured(value: Any) -> bool:
+            return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+        if measured(hot):
+            values["prefix_cache_bytes"] = int(hot)
+        limit = status.get("prefix_cache_max_bytes")
+        if measured(limit):
+            values["prefix_cache_limit_bytes"] = int(limit)
+        if measured(live) and measured(hot):
+            values["kv_bytes"] = int(live) + int(hot)
+        if measured(groups) and measured(hot):
+            if hot == 0:
+                values["context_count"] = int(groups)
+            elif measured(hot_sessions):
+                values["context_count"] = int(groups) + int(hot_sessions)
+            elif "prefix_cache_hot_blocks" not in status and measured(sessions):
+                # Legacy snapshots are wholly resident. Paged bindings may
+                # refer to disk-only blocks, so their total is not a RAM count.
+                values["context_count"] = int(groups) + int(sessions)
+            else:
+                values["context_count"] = None
+        if measured(blocks):
+            values["prefix_cache_blocks"] = int(blocks)
+        return RuntimeMemoryResources(**values)
 
     async def _stop_process(self, instance: _Runtime) -> None:
         instance.state = RuntimeInstanceState.UNLOADING
@@ -2888,6 +3177,9 @@ class RuntimePool:
             self.executable, self.backend, model=artifact.path
         )
         process_environment.update(self.runtime_environment)
+        cache_directory = str(self._prefix_cache_directory())
+        process_environment["MFQ_RUNTIME_PREFIX_CACHE_DIR"] = cache_directory
+        process_environment["MFQ_SERVER_PREFIX_CACHE_DIR"] = cache_directory
         cache_environment = {
             "MFQ_RUNTIME_MAX_KV_SESSIONS": request.prefix_cache_max_sessions,
             "MFQ_RUNTIME_MAX_KV_SNAPSHOTS_PER_SESSION": (

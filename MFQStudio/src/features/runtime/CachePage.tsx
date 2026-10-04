@@ -1,4 +1,3 @@
-/** 资源页管理前缀缓存与可复用运行配置，按需读取配置和模型资产。 */
 import { useState } from 'react';
 import { runtimeApi } from '../../shared/api/resources/runtime';
 import { useRuntime } from '../../app/RuntimeProvider';
@@ -6,16 +5,14 @@ import { useSettings } from '../settings/SettingsProvider';
 import { ScreenHeader, SectionLabel, TMPanel, UsageBar, EmptyPanel } from '../../app/display';
 import { errorMessage, formatNumber } from '../../app/formatters';
 import { studioConfirm } from '../../studio';
-import { ToolsRoutingPanel } from '../connections/ToolsRoutingPanel';
-import { RuntimeProfilesPanel } from './RuntimeProfilesPanel';
+import { ResourceMonitorPanel } from './ResourceMonitorPanel';
 import { toast } from '../../stores/toastStore';
 
-/** 管理资源页状态；离开页面后忽略迟到的资源加载结果。 */
 export function CachePage() {
   const { runtime, refreshRuntime } = useRuntime();
   const { tr } = useSettings();
   const [busy, setBusy] = useState(false);
-  const runtimeCache = Number(runtime?.mlx_cache_bytes ?? runtime?.cuda_reserved_bytes ?? 0);
+  const prefixCacheRamBudget = Number(runtime?.prefix_cache_max_bytes ?? 0);
   const prefixCacheQueries = Number(runtime?.prefix_cache_queries || 0);
   const prefixCacheHits = Number(runtime?.prefix_cache_hits || 0);
   const prefixCacheSnapshots = Number(runtime?.prefix_cache_snapshots || 0);
@@ -39,7 +36,6 @@ export function CachePage() {
         '当前模型不支持 Session KV 缓存',
         'The current model does not support Session KV cache',
       );
-  /** 提交缓存或配置操作，保留确认语义并刷新对应资源。 */
   async function clearRuntimeCache() {
     const snapshots = Number(runtime?.prefix_cache_snapshots || 0);
     if (busy || snapshots <= 0 || Number(runtime?.active_requests || 0) > 0) return;
@@ -71,15 +67,13 @@ export function CachePage() {
       <ScreenHeader
         title={tr('资源', 'Resources')}
         subtitle={tr(
-          '检查内存层级、前缀缓存与运行配置。',
-          'Inspect memory, prefix caching, and runtime profiles.',
+          '监视计算占用、权重流量、带宽与前缀缓存。',
+          'Monitor compute utilization, weight traffic, bandwidth, and prefix caching.',
         )}
       />
 
-      <SectionLabel
-        title={tr('内存层级', 'Memory hierarchy')}
-        subtitle={tr('设备、内存与持久缓存', 'Device, memory, and persistent cache')}
-      />
+      <ResourceMonitorPanel />
+      <SectionLabel title={tr('前缀缓存', 'Prefix cache')} />
       {prefixCacheSupported ? (
         <TMPanel className="cache-panel">
           <div className="panel-heading">
@@ -108,7 +102,7 @@ export function CachePage() {
               <UsageBar
                 label={tr('RAM 热前缀', 'RAM hot prefix')}
                 used={prefixCacheHotBytes}
-                total={Math.max(prefixCacheHotBytes, runtimeCache || 0)}
+                total={Math.max(prefixCacheHotBytes, prefixCacheRamBudget)}
               />
               <div className="cache-stats">
                 <div>
@@ -152,7 +146,7 @@ export function CachePage() {
                 <UsageBar
                   label={tr('RAM 热层', 'RAM hot tier')}
                   used={prefixCacheHotBytes}
-                  total={Math.max(prefixCacheHotBytes, runtimeCache || 0)}
+                  total={Math.max(prefixCacheHotBytes, prefixCacheRamBudget)}
                 />
               </div>
               <div className="cache-stats">
@@ -172,16 +166,16 @@ export function CachePage() {
                 </div>
                 <div>
                   <span>{tr('SSD 占用', 'SSD usage')}</span>
-                  <strong>{formatNumber(prefixCacheDiskBytes / 2 ** 30, 2)} GB</strong>
+                  <strong>{formatNumber(prefixCacheDiskBytes / 2 ** 30, 2)} GiB</strong>
                   <small>
                     {prefixCacheDiskBudget > 0
-                      ? `${formatNumber(prefixCacheDiskBudget / 2 ** 30, 0)} GB ${tr('上限', 'limit')}`
+                      ? `${formatNumber(prefixCacheDiskBudget / 2 ** 30, 0)} GiB ${tr('上限', 'limit')}`
                       : ''}
                   </small>
                 </div>
                 <div>
                   <span>{tr('RAM 热层', 'RAM hot tier')}</span>
-                  <strong>{formatNumber(prefixCacheHotBytes / 2 ** 20, 1)} MB</strong>
+                  <strong>{formatNumber(prefixCacheHotBytes / 2 ** 20, 1)} MiB</strong>
                   <small>{formatNumber(runtime?.prefix_cache_hot_blocks)} blocks</small>
                 </div>
                 <div>
@@ -193,7 +187,7 @@ export function CachePage() {
                       Number(runtime?.prefix_cache_pending_max_bytes || 0) / 2 ** 20,
                       0,
                     )}{' '}
-                    MB · {formatNumber(runtime?.prefix_cache_deduplicated_writes)} deduplicated
+                    MiB · {formatNumber(runtime?.prefix_cache_deduplicated_writes)} deduplicated
                   </small>
                 </div>
                 <div>
@@ -238,8 +232,6 @@ export function CachePage() {
           }
         />
       )}
-      <RuntimeProfilesPanel />
-      <ToolsRoutingPanel />
     </section>
   );
 }
