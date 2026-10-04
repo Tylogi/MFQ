@@ -273,7 +273,7 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
         std::cout << "continuous_batching_sampling_check readbacks=" << reads << " batches=" << batches
             << " mixed_seed_replay=1 tokens_per_sec=" << 4 * sampling.max_tokens /
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() << '\n';
-        double captures = 0, replays = 0;
+        double captures = 0, replays = 0, prewarms = 0;
         for (const auto& [key, value] : batcher.metrics()) {
             if (key.starts_with("continuous_batching_graph_b"))
                 std::cout << key << "=" << value << '\n';
@@ -282,12 +282,14 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
                 MFQ_RUNTIME_CHECK(value == 0, "batch retained finished requests");
             if (key == "continuous_batching_cuda_graph_captures") captures = value;
             if (key == "continuous_batching_cuda_graph_replays") replays = value;
+            if (key == "continuous_batching_cuda_graph_prewarms") prewarms = value;
         }
         if (config.continuous_batch.greedy &&
             qwen_continuous_batch_cuda_graph_enabled(model, config.continuous_batch))
-            MFQ_RUNTIME_CHECK(captures > 0 && replays > captures, "batch graph was not replayed");
+            MFQ_RUNTIME_CHECK(captures > 0 && prewarms == captures && replays > captures,
+                "batch graph was not prepared separately and replayed");
         std::cout << "continuous_batching_state_check paged=" << config.continuous_batch.paged_kv
-            << " captures=" << captures << " replays=" << replays
+            << " captures=" << captures << " prewarms=" << prewarms << " replays=" << replays
             << " prefill_cancel=1 slot_reuse=1\n";
     }
     MfqPromptCachePlan plan{"batch-check", first_prompt.size() - 1};

@@ -142,6 +142,8 @@ template <class Ops> class ContinuousBatch {
         try {
             if (has_decode && (prefill == requests.end() || decode_next)) {
                 auto decoded = operations.decode(state);
+                if constexpr (requires { decoded.ready(); })
+                    if (!decoded.ready()) return; // A graph preparation quantum committed no row.
                 for (const auto& request : state.active) if (request->eligible) {
                     auto& work = *requests.at(request->id);
                     work.result = operations.sample(request, decoded);

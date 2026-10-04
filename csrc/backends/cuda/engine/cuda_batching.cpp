@@ -136,6 +136,7 @@ std::vector<std::pair<std::string, double>> QwenBatchOperations::metrics() const
          static_cast<double>(packed_metadata_batches_)},
         {"continuous_batching_cuda_graph_captures", static_cast<double>(cuda_graph_captures_)},
         {"continuous_batching_cuda_graph_replays", static_cast<double>(cuda_graph_replays_)},
+        {"continuous_batching_cuda_graph_prewarms", static_cast<double>(cuda_graph_prewarms_)},
         {"continuous_batching_moe", moe_enabled_ ? 1.0 : 0.0},
         {"continuous_batching_moe_cached_row_serial", cached_moe_enabled_ ? 1.0 : 0.0},
         {"continuous_batching_paged_kv", state_adapter_.paged_kv_enabled() ? 1.0 : 0.0},
@@ -331,7 +332,7 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode(State &state) {
             })->get();
     } else if (graph_decode) {
         if (decode_graphs_.size() >= 8)
-            invalidate_decode_graph();
+            decode_graphs_.erase(decode_graphs_.begin());
         decode_graphs_.push_back(std::make_unique<QwenContinuousDecodeGraph>());
         decode_graph = decode_graphs_.back().get();
     }
@@ -407,6 +408,14 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode(State &state) {
                     decode_graph->invalidate();
                     throw;
                 }
+                // Pre-capture the bucket covering the admitted rows' remaining
+                // context in its own step. Warmup restores recurrent state and
+                // capture does not execute: no request commits a token here.
+                state_adapter_.finish_decode(max_position);
+                for (size_t i = 0; i < previous_streams.size(); ++i)
+                    wait_for_stream(previous_streams[i], decode_graph->compute_streams[i]);
+                ++cuda_graph_prewarms_;
+                return {};
             }
             decode_graph->graph->replay();
             graph_tokens = decode_graph->static_next;

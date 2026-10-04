@@ -36,6 +36,7 @@ class QwenBatchOperations {
     };
     struct Decoded {
         Tensor tokens, host_tokens;
+        bool ready() const { return tokens.defined(); }
     };
 
     QwenBatchOperations(Qwen35CausalLm &, CudaExecutionContext &, CudaContinuousBatchConfig);
@@ -76,6 +77,7 @@ class QwenBatchOperations {
     int64_t sampling_readbacks_{0};
     int64_t cuda_graph_captures_{0};
     int64_t cuda_graph_replays_{0};
+    int64_t cuda_graph_prewarms_{0};
     std::map<std::pair<int64_t, int64_t>, std::pair<int64_t, int64_t>> graph_bucket_counts_;
     Tensor decode_metadata_host_;
     Tensor decode_metadata_cuda_;
