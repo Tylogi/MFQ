@@ -593,7 +593,7 @@ inline uint3 read_jsc_wide_record(
         record >> (index_count * index_bits));
 }
 
-template <uint JSC_VECTOR, uint BYTES_PER_SIGN>
+template <uint JSC_VECTOR, uint BYTES_PER_SIGN, uint PACKED_LAYOUT = 0u>
 inline void decode_jsc_group24(
     const device int* d,
     const device uchar* indices,
@@ -617,15 +617,15 @@ inline void decode_jsc_group24(
     uint codebook_offset = uint(d[22]);
     uint scale_offset = uint(d[23]);
     uint state_bank_offset = uint(d[24]);
-    uint execution = uint(d[29]);
+    uint execution = PACKED_LAYOUT != 0u ? PACKED_LAYOUT : uint(d[29]);
     uint state_index = row * groups + group;
     uint signs = (k_size + 7u) / 8u;
     uint packed_state =
         uint(state_stream[state_offset + (state_index >> 1u)]);
     uint state =
         (packed_state >> ((state_index & 1u) * 4u)) & 15u;
-    uint selected_bank =
-        uint(state_to_bank[state_bank_offset + state]);
+    uint selected_bank = PACKED_LAYOUT == 6u
+        ? 0u : uint(state_to_bank[state_bank_offset + state]);
     float scale = anchors[anchor_offset + row]
         * scales[scale_offset + state];
     uint sign_base = row * signs + group * 3u;
@@ -633,12 +633,25 @@ inline void decode_jsc_group24(
 
 #pragma clang loop unroll(full)
     for (uint chunk = 0u; chunk < 3u; ++chunk) {
+        if constexpr (PACKED_LAYOUT == 6u) {
+            if (group * 24u + chunk * 8u >= k_size) {
+                *reinterpret_cast<threadgroup half4*>(target + chunk * 8u) = half4(0.0h);
+                *reinterpret_cast<threadgroup half4*>(target + chunk * 8u + 4u) = half4(0.0h);
+                continue;
+            }
+        }
         uint sign_index = sign_base + chunk;
         uint first_vector = vector_base + chunk * (8u / JSC_VECTOR);
         uint index0 = 0u;
         uint index1 = 0u;
         uint sign_value = 0u;
-        if (execution != 0u) {
+        if constexpr (PACKED_LAYOUT == 6u) {
+            uint3 record = read_jsc_wide_record(
+                indices, indices_offset, sign_index, 4u, 12u);
+            index0 = record.x;
+            index1 = record.y;
+            sign_value = record.z;
+        } else if (execution != 0u) {
             uint offset = indices_offset
                 + sign_index * BYTES_PER_SIGN;
             if constexpr (DUAL_INDEX) {
@@ -690,6 +703,11 @@ inline void decode_jsc_group24(
             -second_value,
             (uint4(sign_bits) & uint4(16u, 32u, 64u, 128u))
                 != uint4(0u));
+        if constexpr (PACKED_LAYOUT == 6u) {
+            if (group * 24u + chunk * 8u + 4u >= k_size) {
+                second_value = float4(0.0f);
+            }
+        }
         *reinterpret_cast<threadgroup half4*>(
             target + chunk * 8u) = half4(scale * first_value);
         *reinterpret_cast<threadgroup half4*>(
@@ -814,6 +832,18 @@ inline void decode_jsc_extended_group24(
 }
 #endif
 
+inline uint4 read_nvq1_l_group40(
+    const device uchar* indices,
+    uint offset) {
+    uint low = uint(indices[offset])
+        | (uint(indices[offset + 1u]) << 8u)
+        | (uint(indices[offset + 2u]) << 16u)
+        | (uint(indices[offset + 3u]) << 24u);
+    uint high = uint(indices[offset + 4u]);
+    return uint4(low & 2047u, (low >> 11u) & 2047u,
+        ((low >> 22u) | (high << 10u)) & 2047u, high >> 1u);
+}
+
 #ifdef MFQ_ENABLE_LEGACY_VQ_VECTOR
 template <uint STATE_WIDTH, uint INDEX_WIDTH, uint TABLE_SIZE>
 inline void decode_npq_group24(
@@ -914,11 +944,19 @@ inline void decode_nvq1_group24(
                 indices + indices_offset, row, group, vectors);
         }
     } else {
-        state = read_bits(
-            state_stream + state_offset, state_index, STATE_WIDTH);
-        bank = read_bits(aux + aux_offset, state_index, 1u);
-        group_indices = read_vq_group_indices<INDEX_WIDTH>(
-            indices + indices_offset, row, group, vectors);
+        if (uint(d[29]) == 5u) {
+            uint4 record = read_nvq1_l_group40(
+                indices, indices_offset + state_index * 5u);
+            group_indices = record.xyz;
+            state = record.w & 7u;
+            bank = (record.w >> 3u) & 1u;
+        } else {
+            state = read_bits(
+                state_stream + state_offset, state_index, STATE_WIDTH);
+            bank = read_bits(aux + aux_offset, state_index, 1u);
+            group_indices = read_vq_group_indices<INDEX_WIDTH>(
+                indices + indices_offset, row, group, vectors);
+        }
     }
     float delta = parameters[parameter_offset];
     float signed_delta = bank != 0u ? -delta : delta;
@@ -1001,6 +1039,12 @@ inline void decode_vq_group24(
             state_to_bank, target, row, group, k_size);
         return;
     }
+    if (profile == 8u && execution == 6u) {
+        decode_jsc_group24<4u, 4u, 6u>(
+            d, indices, state_stream, aux, anchors, codebooks, scales,
+            state_to_bank, target, row, group, k_size);
+        return;
+    }
 #ifdef MFQ_ENABLE_JSC_EXTENDED_VECTOR
     if (profile == 7u) {
         decode_jsc_extended_group24(
@@ -1062,21 +1106,23 @@ inline void decode_vq_group24(
     }
 
     if (profile == 3u) {
-        uint state = read_bits(
-            state_stream + state_offset,
-            state_index,
-            state_bits);
-        uint sign = read_bits(
-            aux + aux_offset,
-            state_index,
-            1u);
+        uint4 record;
+        uint state;
+        uint sign;
+        if (execution == 5u) {
+            record = read_nvq1_l_group40(indices, indices_offset + state_index * 5u);
+            state = record.w & 7u;
+            sign = (record.w >> 3u) & 1u;
+        } else {
+            state = read_bits(state_stream + state_offset, state_index, state_bits);
+            sign = read_bits(aux + aux_offset, state_index, 1u);
+        }
         float delta = parameters[parameter_offset];
         float scale = anchor * scales[scale_offset + state];
         for (uint chunk = 0u; chunk < 3u; ++chunk) {
-            uint index = read_bits(
-                indices + indices_offset,
-                row * vectors + group * 3u + chunk,
-                11u);
+            uint index = execution == 5u ? record[chunk]
+                : read_bits(indices + indices_offset,
+                    row * vectors + group * 3u + chunk, 11u);
             uint code_base = codebook_offset + index * 8u;
             for (uint inner = 0u; inner < 8u; ++inner) {
                 float code = float(codebooks[code_base + inner]);

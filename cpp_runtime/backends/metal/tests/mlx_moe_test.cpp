@@ -569,7 +569,9 @@ VqFixture make_jsc_nvq(
     int codebook_id = 1,
     int vector_size = 8,
     int index_bits = 8,
-    bool group64 = false) {
+    bool group64 = false,
+    int code_banks = 2,
+    int scale_exponent = 0) {
     constexpr std::uint8_t jsc = 0x20;
     std::vector<std::uint8_t> blob;
     append_vq_matrix_header(
@@ -582,17 +584,17 @@ VqFixture make_jsc_nvq(
         output,
         input);
     append<std::uint8_t>(blob, group64 ? 2 : 1);
-    append<std::uint8_t>(blob, 2);
+    append<std::uint8_t>(blob, code_banks);
     append<std::uint8_t>(blob, 16);
     append<std::uint8_t>(blob, 0);
     for (int state = 0; state < 16; ++state) {
-        append<std::uint16_t>(blob, 0x3c00);
+        append<std::uint16_t>(blob, 0x3c00 + scale_exponent * 1024);
     }
     for (int state = 0; state < 16; ++state) {
         append<std::uint8_t>(
             blob,
             static_cast<std::uint8_t>(
-                state & 1));
+                state % code_banks));
     }
     append<std::uint8_t>(blob, group64 ? 1 : 0);
     blob.insert(blob.end(), 11, 0);
@@ -603,7 +605,7 @@ VqFixture make_jsc_nvq(
         return static_cast<std::int8_t>(
             (entry * 3 + component * 5 + bank * 7) % 15 - 7);
     };
-    for (int bank = 0; bank < 2; ++bank) {
+    for (int bank = 0; bank < code_banks; ++bank) {
         for (
             int entry = 0;
             entry < (1 << index_bits);
@@ -651,12 +653,13 @@ VqFixture make_jsc_nvq(
                         }
                         float value = static_cast<float>(
                             code_value(
-                                static_cast<int>(state & 1u),
+                                static_cast<int>(state % code_banks),
                                 static_cast<int>(index),
                                 component));
                         if ((sign_bits & (1u << component)) != 0u) {
                             value = -value;
                         }
+                        value = std::ldexp(value, scale_exponent);
                         dense[
                             static_cast<std::size_t>(row) * input
                                 + column
@@ -692,13 +695,14 @@ VqFixture make_jsc_nvq(
                 const auto sign_bits = mask7
                     | ((std::popcount(mask7) & 1u) << 7u);
                 float value = static_cast<float>(code_value(
-                    states[row * groups + column / 24] & 1,
+                    states[row * groups + column / 24] % code_banks,
                     indices[row * vectors + column / vector_size],
                     column % vector_size));
                 if ((sign_bits & (1u << (column % 8))) != 0u) {
                     value = -value;
                 }
-                dense[static_cast<std::size_t>(row) * input + column] = value;
+                dense[static_cast<std::size_t>(row) * input + column] =
+                    std::ldexp(value, scale_exponent);
             }
         }
         append_bytes(blob, pack_vq_values(states, 4));
@@ -3892,7 +3896,10 @@ void test_vq_cohorts_and_ffn() {
             "NVQ3J-L",
             6,
             4,
-            10),
+            10,
+            false,
+            4,
+            1),
         make_jsc_nvq(
             width,
             width,
@@ -4831,18 +4838,87 @@ void test_grouped_vq_decoder_tail_prefill() {
     exercise(1025);
 }
 
-void test_grouped_nint_mmq_prefill() {
+void test_nvq3jl_record_dispatch() {
+    constexpr int input_width = 40;
+    constexpr int output_width = 34;
+    auto fixture = make_vq_moe_fixture({
+        make_jsc_nvq(output_width, input_width, "NVQ3J", 2, 4, 8),
+        make_jsc_nvq(output_width, input_width, "NVQ3J-L", 6, 4, 10, false, 4, -1),
+    });
+    const auto weight = mfq::metal::MlxMfeWeight::from_blob(fixture.blob);
+    std::vector<float> values(input_width);
+    for (int i = 0; i < input_width; ++i) values[i] = float((i * 13 + 7) % 29 - 14) / 1024.0f;
+    auto shared = mlx::core::astype(mlx::core::array(values.begin(),
+        mlx::core::Shape{1, input_width}), mlx::core::float16);
+    auto independent = mlx::core::contiguous(mlx::core::broadcast_to(
+        mlx::core::expand_dims(shared, 1), mlx::core::Shape{1, 2, input_width}));
+    const std::vector<std::int32_t> ids{0, 1};
+    auto routes = mlx::core::array(ids.begin(), mlx::core::Shape{1, 2});
+    for (const auto& input : {shared, independent}) {
+        const auto actual = evaluated_floats(weight.routed_swiglu(input, routes));
+        for (int expert = 0; expert < 2; ++expert) {
+            for (int row = 0; row < output_width / 2; ++row) {
+                const float gate = routed_vq_dot(values, fixture, expert, row);
+                const float up = routed_vq_dot(values, fixture, expert, row + output_width / 2);
+                try {
+                    require_close(actual[expert * output_width / 2 + row],
+                        gate / (1.0f + std::exp(-gate)) * up, 1e-4f);
+                } catch (const std::exception& error) {
+                    throw std::runtime_error("NVQ3J-L record dispatch expert="
+                        + std::to_string(expert) + " row=" + std::to_string(row)
+                        + " ndim=" + std::to_string(input.ndim()) + ": " + error.what());
+                }
+            }
+        }
+    }
+}
+
+void test_nvq3jl_half_chunk(int output) {
+    constexpr int input_width = 36;
+    auto fixture = make_vq_moe_fixture({
+        make_jsc_nvq(output, input_width, "NVQ3J-L", 6, 4, 10, false, 4, -1),
+    });
+    const auto weight = mfq::metal::MlxMfeWeight::from_blob(fixture.blob);
+    for (int tokens : {1, 32, 65, 513}) {
+        std::vector<float> values(tokens * input_width);
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            values[i] = static_cast<float>(static_cast<int>((i * 13 + 7) % 29) - 14) / 1024.0f;
+        }
+        std::vector<std::int32_t> ids(tokens, 0);
+        auto x = mlx::core::astype(mlx::core::array(values.begin(),
+            mlx::core::Shape{tokens, input_width}), mlx::core::float16);
+        auto routes = mlx::core::array(ids.begin(), mlx::core::Shape{tokens, 1});
+        auto order = mlx::core::astype(mlx::core::argsort(
+            mlx::core::reshape(routes, mlx::core::Shape{tokens})), mlx::core::int32);
+        auto plan = weight.build_grouped_mmq_plan(routes, order, 32);
+        const auto actual = evaluated_floats(tokens == 1
+            ? weight.routed_matmul(x, routes)
+            : weight.routed_matmul_sorted(x, routes, order, false, false, 0.0f, &plan));
+        for (int token = 0; token < tokens; ++token) {
+            const std::vector<float> source(values.begin() + token * input_width,
+                values.begin() + (token + 1) * input_width);
+            for (int row = 0; row < output; ++row) {
+                require_close(actual[token * output + row],
+                    routed_vq_dot(source, fixture, 0, row), 1e-4f);
+            }
+        }
+    }
+}
+
+void test_grouped_nint_mmq_prefill(
+    int tokens = 513,
+    int group_size = 24,
+    int input_width = 96) {
     // Cross the heterogeneous NAX threshold on supported Apple GPUs while
     // retaining the same reference coverage on compatibility-only devices.
-    constexpr int tokens = 513;
-    constexpr int routes = 2;
     constexpr int output = 48;
-    constexpr int input_width = 96;
-    const std::vector<std::string> profiles{
+    std::vector<std::string> profiles{
         "NINT1", "NINT2", "NINT3", "NINT4", "NINT5",
-        "NINT6", "NINT7", "NINT8", "NINT8-0"};
+        "NINT6", "NINT7", "NINT8"};
+    if (input_width % 32 == 0) profiles.push_back("NINT8-0");
+    const int routes = tokens == 1 ? static_cast<int>(profiles.size()) : 2;
     auto fixture = make_moe_fixture(
-        profiles, output, input_width, 9, 24);
+        profiles, output, input_width, 9, group_size);
     const auto weight = mfq::metal::MlxMoeWeight::from_blob(
         fixture.blob);
     require(
@@ -5838,7 +5914,7 @@ void test_direct_mfe_projection_tails() {
     constexpr int output = 33;
     constexpr int input = 40;
     const auto nint = make_nint_v2_tensor(output, input, 71, 28, true);
-    const auto wide = make_jsc_nvq(output, input, "NVQ3J-L", 6, 4, 10);
+    const auto wide = make_jsc_nvq(output, input, "NVQ3J-L", 6, 4, 10, false, 4, -1);
     const auto compact = make_nvq1_s(output, input);
     const auto gate = make_raw_nim2(experts, output, input, {
         {{2}, "NINT", nint, {}},
@@ -6554,6 +6630,11 @@ int main(int argc, char** argv) {
                 std::string("grouped VQ tail: ") + error.what());
         }
         test_grouped_nint_mmq_prefill();
+        test_nvq3jl_record_dispatch();
+        test_nvq3jl_half_chunk(16);
+        test_nvq3jl_half_chunk(17);
+        test_grouped_nint_mmq_prefill(1, 24, 65);
+        test_grouped_nint_mmq_prefill(1, 28, 57);
         test_grouped_split_nint_swiglu_prefill();
         test_shared_nint2_prefill();
         test_shared_nint5_group28_prefill();

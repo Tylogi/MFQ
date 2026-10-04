@@ -385,6 +385,7 @@ inline uint mfq_moe_read_bits(
         & ((1u << bits) - 1u);
 }
 
+template <bool ALIGNED_GROUP = true, bool WORD_QUAD = false>
 inline ushort4 mfq_moe_decode_nint_quad_at(
     device const uchar* stream,
     uint byte_index,
@@ -395,11 +396,21 @@ inline ushort4 mfq_moe_decode_nint_quad_at(
     packed_uchar4 bytes =
         *reinterpret_cast<device const packed_uchar4*>(stream + byte_index);
     uint packed = as_type<uint>(bytes);
-    if (shift != 0u) {
-        packed = (packed >> shift)
-            | (required_bits > 32u
-                ? uint(stream[byte_index + 4u]) << (32u - shift)
-                : 0u);
+    if constexpr (WORD_QUAD) {
+        if constexpr (ALIGNED_GROUP) {
+            if (shift != 0u) {
+                packed >>= shift;
+            }
+        } else {
+            packed >>= shift;
+        }
+    } else {
+        if (shift != 0u) {
+            packed = (packed >> shift)
+                | (required_bits > 32u
+                    ? uint(stream[byte_index + 4u]) << (32u - shift)
+                    : 0u);
+        }
     }
     uint mask = (1u << bits) - 1u;
     return ushort4(
@@ -505,7 +516,8 @@ inline void mfq_moe_nint_profile(
             activation_sum += activations.x + activations.y
                 + activations.z + activations.w;
             for (uint row = 0u; row < MATRIX_ROWS; ++row) {
-                ushort4 quantized = mfq_moe_decode_nint_quad_at(
+                ushort4 quantized = mfq_moe_decode_nint_quad_at<
+                    GROUP_SIZE % 8u == 0u, GROUP_SIZE % 4u == 0u>(
                     q_stream + q_offset,
                     q_byte_cursors[row],
                     q_bit_cursors[row],
@@ -618,10 +630,20 @@ inline float4 mfq_moe_load_code4(
         *(constant const char4*)(stream + offset));
 }
 
+inline uint mfq_moe_load_record4(device const uchar* stream, uint offset) {
+    return as_type<uint>(*(device const packed_uchar4*)(stream + offset));
+}
+
+inline uint mfq_moe_load_record4(constant const uchar* stream, uint offset) {
+    return as_type<uint>(*(constant const packed_uchar4*)(stream + offset));
+}
+
 template <
     uint VECTOR_SIZE,
     uint MATRIX_ROWS,
     uint EXECUTION_LAYOUT,
+    uint PACKED_LAYOUT = 0u,
+    bool WORD_RECORDS = false,
     typename XStream,
     typename IndexStream,
     typename StateStream,
@@ -658,6 +680,9 @@ inline void mfq_moe_jsc_profile(
     uint k_size,
     uint execution_layout
 ) {
+    if constexpr (PACKED_LAYOUT != 0u) {
+        execution_layout = PACKED_LAYOUT;
+    }
     constexpr uint VECTOR_SHIFT =
         VECTOR_SIZE == 4u ? 2u : 3u;
     constexpr uint BYTES_PER_SIGN =
@@ -695,8 +720,9 @@ inline void mfq_moe_jsc_profile(
                     state_byte >> ((state_index & 1u) * 4u)
                 ) & 15u;
             }
-            selected_code_banks[row] = uint(
-                state_bank_stream[state_bank_offset + state]);
+            selected_code_banks[row] = PACKED_LAYOUT == 6u
+                ? 0u
+                : uint(state_bank_stream[state_bank_offset + state]);
             weight_scales[row] =
                 row_anchors[row]
                 * scale_stream[scale_offset + state];
@@ -715,7 +741,8 @@ inline void mfq_moe_jsc_profile(
                 float(x[x_offset + column_base + 1u]),
                 float(x[x_offset + column_base + 2u]),
                 float(x[x_offset + column_base + 3u]));
-            float4 activation1 = float4(
+            float4 activation1 = (k_size & 7u) != 0u
+                && column_base + 4u >= k_size ? float4(0.0f) : float4(
                 float(x[x_offset + column_base + 4u]),
                 float(x[x_offset + column_base + 5u]),
                 float(x[x_offset + column_base + 6u]),
@@ -725,7 +752,22 @@ inline void mfq_moe_jsc_profile(
                 uint index0;
                 uint index1 = 0u;
                 uint sign_value;
-                if (EXECUTION_LAYOUT != 0u && execution_layout == 2u) {
+                if constexpr (PACKED_LAYOUT == 6u) {
+                    uint execution_offset = indices_offset + (
+                        outputs[row] * signs + column_base / 8u) * 4u;
+                    uint record;
+                    if constexpr (WORD_RECORDS) {
+                        record = mfq_moe_load_record4(indices_stream, execution_offset);
+                    } else {
+                        record = uint(indices_stream[execution_offset])
+                            | (uint(indices_stream[execution_offset + 1u]) << 8u)
+                            | (uint(indices_stream[execution_offset + 2u]) << 16u)
+                            | (uint(indices_stream[execution_offset + 3u]) << 24u);
+                    }
+                    index0 = record & 4095u;
+                    index1 = (record >> 12u) & 4095u;
+                    sign_value = record >> 24u;
+                } else if (EXECUTION_LAYOUT != 0u && execution_layout == 2u) {
                     uint2 record = group_records[row];
                     uint segment = sign_block == 0u
                         ? record.x & 0xfffffu
@@ -1378,37 +1420,26 @@ constexpr const char* kMoeSource = R"METAL(
             // 9/10-bit indices and 512/1024-entry codebooks. Keep the same
             // vectorized 24-column decoder instead of falling through to the
             // scalar, fully generic VQ loop.
-            mfq_moe_jsc_profile<
-                4u,
-                MATRIX_ROWS,
-                VQ_EXECUTION_LAYOUT
-            >(
-                x,
-                vq_indices,
-                vq_state,
-                vq_aux,
-                vq_scales,
-                vq_state_to_codebank,
-                vq_codebooks,
-                x_offset,
-                outputs,
-                row_anchors,
-                accumulators,
-                groups,
-                vectors,
-                index_bits,
-                entries,
-                indices_offset,
-                state_offset,
-                aux_offset,
-                codebook_offset,
-                scale_offset,
-                state_bank_offset,
-                signs,
-                k_lane,
-                K_LANES,
-                uint(K),
-                cohort_execution_layout);
+            if (cohort_execution_layout == 6u) {
+                mfq_moe_jsc_profile<4u, MATRIX_ROWS, VQ_EXECUTION_LAYOUT, 6u,
+                    SHARED_INPUT != 0 && K_LANES == 16>(
+                    x, vq_indices, vq_state, vq_aux, vq_scales,
+                    vq_state_to_codebank, vq_codebooks, x_offset,
+                    outputs, row_anchors, accumulators, groups, vectors,
+                    index_bits, entries, indices_offset, state_offset,
+                    aux_offset, codebook_offset, scale_offset,
+                    state_bank_offset, signs, k_lane, K_LANES, uint(K),
+                    cohort_execution_layout);
+            } else {
+                mfq_moe_jsc_profile<4u, MATRIX_ROWS, VQ_EXECUTION_LAYOUT>(
+                    x, vq_indices, vq_state, vq_aux, vq_scales,
+                    vq_state_to_codebank, vq_codebooks, x_offset,
+                    outputs, row_anchors, accumulators, groups, vectors,
+                    index_bits, entries, indices_offset, state_offset,
+                    aux_offset, codebook_offset, scale_offset,
+                    state_bank_offset, signs, k_lane, K_LANES, uint(K),
+                    cohort_execution_layout);
+            }
         } else if (
             (uint(VQ_PROFILE_MASK) & 4u) != 0u
             && profile == 2u
@@ -1720,6 +1751,7 @@ constexpr const char* kMoeSource = R"METAL(
             ) {
                 uint delta_by_row[MATRIX_ROWS];
                 float weight_scales[MATRIX_ROWS];
+                uint2 execution_records[MATRIX_ROWS];
                 for (
                     uint row = 0u;
                     row < MATRIX_ROWS;
@@ -1727,14 +1759,24 @@ constexpr const char* kMoeSource = R"METAL(
                 ) {
                     uint state_index =
                         outputs[row] * groups + group;
-                    uint state = mfq_moe_read_bits(
-                        vq_state + state_offset,
-                        state_index,
-                        state_bits);
-                    delta_by_row[row] = mfq_moe_read_bits(
-                        vq_aux + aux_offset,
-                        state_index,
-                        1u);
+                    uint state;
+                    if (uint(VQ_EXECUTION_LAYOUT) != 0u
+                        && cohort_execution_layout == 5u) {
+                        uint offset = indices_offset + state_index * 5u;
+                        uint low = uint(vq_indices[offset])
+                            | (uint(vq_indices[offset + 1u]) << 8u)
+                            | (uint(vq_indices[offset + 2u]) << 16u)
+                            | (uint(vq_indices[offset + 3u]) << 24u);
+                        uint high = uint(vq_indices[offset + 4u]);
+                        execution_records[row] = uint2(low, high);
+                        state = (high >> 1u) & 7u;
+                        delta_by_row[row] = (high >> 4u) & 1u;
+                    } else {
+                        state = mfq_moe_read_bits(
+                            vq_state + state_offset, state_index, state_bits);
+                        delta_by_row[row] = mfq_moe_read_bits(
+                            vq_aux + aux_offset, state_index, 1u);
+                    }
                     weight_scales[row] =
                         row_anchors[row]
                         * vq_scales[scale_offset + state];
@@ -1766,10 +1808,18 @@ constexpr const char* kMoeSource = R"METAL(
                         row < MATRIX_ROWS;
                         ++row
                     ) {
-                        uint index = mfq_moe_read_bits(
-                            vq_indices + indices_offset,
-                            outputs[row] * vectors + vector,
-                            11u);
+                        uint index;
+                        if (uint(VQ_EXECUTION_LAYOUT) != 0u
+                            && cohort_execution_layout == 5u) {
+                            uint2 record = execution_records[row];
+                            index = local_vector == 2u
+                                ? ((record.x >> 22u) | (record.y << 10u)) & 2047u
+                                : (record.x >> (local_vector * 11u)) & 2047u;
+                        } else {
+                            index = mfq_moe_read_bits(
+                                vq_indices + indices_offset,
+                                outputs[row] * vectors + vector, 11u);
+                        }
                         float signed_delta =
                             delta_by_row[row] != 0u
                             ? -delta
@@ -5808,6 +5858,8 @@ MlxVqWeight add_vq_pool(
         );
     const bool wide_jsc_execution =
         packed_jsc_execution && weight.index_bits() > 8;
+    const bool packed_nvq3jl_execution =
+        packed_jsc_execution && profile == "NVQ3J-L";
     const bool packed_nvq1s_execution =
         profile == "NVQ1-S"
         && weight.group_size() == 24
@@ -5815,6 +5867,15 @@ MlxVqWeight add_vq_pool(
         && weight.index_bits() == 9
         && weight.state_bits() == 4
         && weight.aux_mode() == 3;
+    const bool packed_nvq1l_execution =
+        profile == "NVQ1-L"
+        && weight.group_size() == 24
+        && weight.vector_size() == 8
+        && weight.index_bits() == 11
+        && weight.state_bits() == 3
+        && weight.aux_mode() == 3;
+    const bool packed_nvq1_execution =
+        packed_nvq1s_execution || packed_nvq1l_execution;
     const bool jsc_execution =
         packed_jsc_execution || group64_execution;
     std::optional<array> jsc_execution_indices;
@@ -5823,6 +5884,18 @@ MlxVqWeight add_vq_pool(
         auto packed_aux = weight.packed_auxiliary();
         packed_indices.eval();
         packed_aux.eval();
+        std::optional<array> packed_states;
+        std::optional<array> state_banks;
+        const std::uint8_t* state_data = nullptr;
+        const std::uint8_t* bank_data = nullptr;
+        if (packed_nvq3jl_execution) {
+            packed_states.emplace(weight.packed_states());
+            state_banks.emplace(weight.state_to_codebank());
+            packed_states->eval();
+            state_banks->eval();
+            state_data = packed_states->data<std::uint8_t>();
+            bank_data = state_banks->data<std::uint8_t>();
+        }
         const auto* index_data =
             packed_indices.data<std::uint8_t>();
         const auto* aux_data =
@@ -5885,6 +5958,7 @@ MlxVqWeight add_vq_pool(
                     const auto index0 = read_index(
                         row * weight.vectors() + first_vector);
                     const auto index1 = weight.vector_size() == 4
+                        && first_vector + 1 < static_cast<std::size_t>(weight.vectors())
                         ? read_index(
                               row * weight.vectors() + first_vector + 1)
                         : 0u;
@@ -5902,6 +5976,15 @@ MlxVqWeight add_vq_pool(
                         }
                         record |= sign_value << (
                             weight.index_bits() * index_count);
+                        if (packed_nvq3jl_execution) {
+                            const auto state_linear = row * weight.groups() + sign / 3;
+                            const unsigned state = (state_data[state_linear / 2]
+                                >> ((state_linear & 1u) * 4u)) & 15u;
+                            const auto bank = static_cast<std::uint32_t>(bank_data[state]);
+                            record = (index0 | (bank << 10u))
+                                | ((index1 | (bank << 10u)) << 12u)
+                                | (sign_value << 24u);
+                        }
                         for (int byte = 0; byte < bytes_per_sign; ++byte) {
                             execution_data[target + byte] =
                                 static_cast<std::uint8_t>(
@@ -5949,12 +6032,8 @@ MlxVqWeight add_vq_pool(
         }
     }
 
-    // NVQ1-S has exactly three 9-bit indices, one 4-bit state, and one
-    // delta-sign bit per 24-weight group.  Interleave those fields into one
-    // 32-bit execution record: it is effectively storage-neutral and removes
-    // five unrelated packed-bit lookups from the hot decoder loop.
-    std::optional<array> nvq1s_execution_indices;
-    if (packed_nvq1s_execution) {
+    std::optional<array> nvq1_execution_indices;
+    if (packed_nvq1_execution) {
         auto packed_indices = weight.packed_indices();
         auto packed_states = weight.packed_states();
         auto packed_aux = weight.packed_auxiliary();
@@ -5987,13 +6066,14 @@ MlxVqWeight add_vq_pool(
         const auto records = checked_product(
             expected_rows,
             static_cast<std::size_t>(weight.groups()),
-            "NVQ1-S execution record count");
+            "NVQ1 execution record count");
+        const int record_bytes = packed_nvq1s_execution ? 4 : 5;
         const auto execution_bytes = checked_product(
             records,
-            sizeof(std::uint32_t),
-            "NVQ1-S execution stream size");
-        nvq1s_execution_indices.emplace(allocate_packed_array(execution_bytes, mlx::core::uint8));
-        auto* execution_data = nvq1s_execution_indices->data<std::uint8_t>();
+            static_cast<std::size_t>(record_bytes),
+            "NVQ1 execution stream size");
+        nvq1_execution_indices.emplace(allocate_packed_array(execution_bytes, mlx::core::uint8));
+        auto* execution_data = nvq1_execution_indices->data<std::uint8_t>();
         const auto pack_rows = [&](std::size_t begin, std::size_t end) {
             for (std::size_t row = begin; row < end; ++row) {
                 for (int group = 0; group < weight.groups(); ++group) {
@@ -6002,7 +6082,7 @@ MlxVqWeight add_vq_pool(
                         + static_cast<std::size_t>(group);
                     const auto first_vector =
                         static_cast<std::size_t>(group) * 3u;
-                    std::uint32_t record = 0;
+                    std::uint64_t record = 0;
                     for (int local = 0; local < 3; ++local) {
                         const auto vector = first_vector
                             + static_cast<std::size_t>(local);
@@ -6013,22 +6093,22 @@ MlxVqWeight add_vq_pool(
                                   packed_indices.size(),
                                   row * static_cast<std::size_t>(weight.vectors())
                                       + vector,
-                                  9)
+                                  weight.index_bits())
                             : 0u;
-                        record |= index << (9 * local);
+                        record |= std::uint64_t(index) << (weight.index_bits() * local);
                     }
-                    record |= read_bits(
+                    record |= std::uint64_t(read_bits(
                         state_data,
                         packed_states.size(),
                         state_index,
-                        4) << 27u;
-                    record |= read_bits(
+                        weight.state_bits())) << (weight.index_bits() * 3);
+                    record |= std::uint64_t(read_bits(
                         aux_data,
                         packed_aux.size(),
                         state_index,
-                        1) << 31u;
-                    const auto target = state_index * sizeof(record);
-                    for (int byte = 0; byte < 4; ++byte) {
+                        1)) << (weight.index_bits() * 3 + weight.state_bits());
+                    const auto target = state_index * record_bytes;
+                    for (int byte = 0; byte < record_bytes; ++byte) {
                         execution_data[target + byte] =
                             static_cast<std::uint8_t>(record >> (8 * byte));
                     }
@@ -6207,9 +6287,9 @@ MlxVqWeight add_vq_pool(
             group64_execution
                 ? 2
                 : packed_jsc_execution
-                    ? (wide_jsc_execution ? 3 : 1)
-                    : packed_nvq1s_execution
-                        ? 4
+                    ? (packed_nvq3jl_execution ? 6 : wide_jsc_execution ? 3 : 1)
+                    : packed_nvq1_execution
+                        ? (packed_nvq1s_execution ? 4 : 5)
                     : 0;
         descriptors[base + kVqResidualCodebookOffset] =
             residual_codebook_offset;
@@ -6225,8 +6305,8 @@ MlxVqWeight add_vq_pool(
             "VQ group64 values");
     } else if (packed_jsc_execution) {
         streams.vq_indices.append(std::move(*jsc_execution_indices));
-    } else if (packed_nvq1s_execution) {
-        streams.vq_indices.append(std::move(*nvq1s_execution_indices));
+    } else if (packed_nvq1_execution) {
+        streams.vq_indices.append(std::move(*nvq1_execution_indices));
     } else {
         append_raw(
             streams.vq_indices,
@@ -6234,14 +6314,14 @@ MlxVqWeight add_vq_pool(
             mlx::core::uint8,
             "VQ indices");
     }
-    if (!packed_nvq1s_execution) {
+    if (!packed_nvq1_execution) {
         append_raw(
             streams.vq_state,
             weight.packed_states(),
             mlx::core::uint8,
             "VQ states");
     }
-    if (!jsc_execution && !packed_nvq1s_execution) {
+    if (!jsc_execution && !packed_nvq1_execution) {
         append_raw(
             streams.vq_aux,
             weight.packed_auxiliary(),
