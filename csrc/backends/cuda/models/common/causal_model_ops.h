@@ -1,5 +1,7 @@
 #pragma once
 
+#include "step_sequence.h"
+
 #include "../cuda_model_plan.h"
 #include "models/common/block.h"
 #include "mfq/model_source.h"
@@ -113,7 +115,9 @@ template <typename Model> struct CudaSessionCodec {
     using CausalModel = CausalLm<Model>;
     static TextSessionStateKind kind(const CausalModel &model);
     static bool supports_paged(const CausalModel &model);
+    static mfq::StepSequence<TextSessionState> capture_steps(const CausalModel &model, const std::vector<int64_t> &tokens);
     static TextSessionState capture(const CausalModel &model, const std::vector<int64_t> &tokens);
+    static mfq::StepSequence<std::monostate> restore_steps(CausalModel &model, const TextSessionState &state);
     static void restore(CausalModel &model, const TextSessionState &state);
 };
 

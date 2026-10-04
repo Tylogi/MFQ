@@ -1,4 +1,7 @@
 #pragma once
+
+#include "step_sequence.h"
+#include "storage/session_state.h"
 #include "../../kernels/mfq_cuda_attention_ops.h"
 #include "../../kernels/mfq_cuda_cache_ops.h"
 #include "../../kernels/mfq_cuda_norm_ops.h"
@@ -507,8 +510,10 @@ template <> struct CudaSessionCodec<GlmDsaModel> {
     using Model = CausalLm<GlmDsaModel>;
     static TextSessionStateKind kind(const Model &model);
     static bool supports_paged(const Model &model);
-    static TextSessionState capture(const Model &model, const std::vector<int64_t> &tokens);
-    static void restore(Model &model, const TextSessionState &state);
+    static mfq::StepSequence<TextSessionState> capture_steps(const Model &model, const std::vector<int64_t> &tokens);
+    static TextSessionState capture(const Model &model, const std::vector<int64_t> &tokens) { return mfq::finish_steps(capture_steps(model, tokens)); }
+    static mfq::StepSequence<std::monostate> restore_steps(Model &model, const TextSessionState &state);
+    static void restore(Model &model, const TextSessionState &state) { (void)mfq::finish_steps(restore_steps(model, state)); }
 };
 
 } // namespace mfq::cuda

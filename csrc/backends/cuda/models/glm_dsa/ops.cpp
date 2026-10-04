@@ -65,76 +65,94 @@ TextSessionStateKind CudaSessionCodec<GlmDsaModel>::kind(const Model &model) {
 
 bool CudaSessionCodec<GlmDsaModel>::supports_paged(const Model &) { return false; }
 
-TextSessionState CudaSessionCodec<GlmDsaModel>::capture(const Model &model,
-                                                        const std::vector<int64_t> &tokens) {
-    if (kind(model) != TextSessionStateKind::GlmDsa || model.cache_pos <= 0 ||
-        static_cast<size_t>(model.cache_pos) != tokens.size()) {
-        throw std::runtime_error("GLM DSA text session state is unavailable");
-    }
-    TextSessionState state;
-    state.tokens = tokens;
-    state.cache_pos = model.cache_pos;
-    state.payload = std::vector<GlmDsaBlockSessionState>{};
-    auto &layers = std::get<std::vector<GlmDsaBlockSessionState>>(state.payload);
-    layers.reserve(model.blocks.size());
-    for (const auto &block : model.blocks) {
-        MfqCudaGuard guard(block->cuda_device);
-        const auto *glm = dynamic_cast<const GlmDsaBlock *>(block.get());
-        if (glm == nullptr || !glm->kv_cache.defined() || glm->kv_cache.dim() != 4 ||
-            glm->kv_cache.size(0) != 1 || model.cache_pos > glm->kv_cache.size(2)) {
-            throw std::runtime_error("GLM DSA session MLA cache is unavailable");
+mfq::StepSequence<TextSessionState>
+CudaSessionCodec<GlmDsaModel>::capture_steps(
+    const Model &model, const std::vector<int64_t> &tokens) {
+  if (kind(model) != TextSessionStateKind::GlmDsa || model.cache_pos <= 0 ||
+      static_cast<size_t>(model.cache_pos) != tokens.size()) {
+    throw std::runtime_error("GLM DSA text session state is unavailable");
+  }
+  TextSessionState state;
+  state.tokens = tokens;
+  state.cache_pos = model.cache_pos;
+  state.payload = std::vector<GlmDsaBlockSessionState>{};
+  auto &layers = std::get<std::vector<GlmDsaBlockSessionState>>(state.payload);
+  layers.reserve(model.blocks.size());
+  for (const auto &block : model.blocks) {
+    {
+      MfqCudaGuard guard(block->cuda_device);
+      const auto *glm = dynamic_cast<const GlmDsaBlock *>(block.get());
+      if (glm == nullptr || !glm->kv_cache.defined() ||
+          glm->kv_cache.dim() != 4 || glm->kv_cache.size(0) != 1 ||
+          model.cache_pos > glm->kv_cache.size(2)) {
+        throw std::runtime_error("GLM DSA session MLA cache is unavailable");
+      }
+      GlmDsaBlockSessionState saved;
+      saved.full_indexer = glm->full_indexer;
+      saved.kv_capacity = glm->kv_cache.size(2);
+      saved.kv_cache = glm->kv_cache.narrow(2, 0, model.cache_pos).clone();
+      state.bytes += session_tensor_bytes(saved.kv_cache);
+      if (glm->full_indexer) {
+        if (!glm->index_cache.defined() || glm->index_cache.dim() != 3 ||
+            glm->index_cache.size(0) != 1 ||
+            model.cache_pos > glm->index_cache.size(1)) {
+          throw std::runtime_error(
+              "GLM DSA session index cache is unavailable");
         }
-        GlmDsaBlockSessionState saved;
-        saved.full_indexer = glm->full_indexer;
-        saved.kv_capacity = glm->kv_cache.size(2);
-        saved.kv_cache = glm->kv_cache.narrow(2, 0, model.cache_pos).clone();
-        state.bytes += session_tensor_bytes(saved.kv_cache);
-        if (glm->full_indexer) {
-            if (!glm->index_cache.defined() || glm->index_cache.dim() != 3 ||
-                glm->index_cache.size(0) != 1 || model.cache_pos > glm->index_cache.size(1)) {
-                throw std::runtime_error("GLM DSA session index cache is unavailable");
-            }
-            saved.index_capacity = glm->index_cache.size(1);
-            saved.index_cache = glm->index_cache.narrow(1, 0, model.cache_pos).clone();
-            state.bytes += session_tensor_bytes(saved.index_cache);
-        }
-        layers.push_back(std::move(saved));
+        saved.index_capacity = glm->index_cache.size(1);
+        saved.index_cache =
+            glm->index_cache.narrow(1, 0, model.cache_pos).clone();
+        state.bytes += session_tensor_bytes(saved.index_cache);
+      }
+      layers.push_back(std::move(saved));
     }
-    return state;
+    co_yield mfq::StepState::advanced;
+  }
+  co_yield std::move(state);
 }
 
-void CudaSessionCodec<GlmDsaModel>::restore(Model &model, const TextSessionState &state) {
-    const auto *layers = std::get_if<std::vector<GlmDsaBlockSessionState>>(&state.payload);
-    if (kind(model) != TextSessionStateKind::GlmDsa ||
-        state.kind() != TextSessionStateKind::GlmDsa || state.cache_pos <= 0 ||
-        static_cast<size_t>(state.cache_pos) != state.tokens.size() || layers == nullptr ||
-        layers->size() != model.blocks.size()) {
-        throw CudaSessionStateError("GLM DSA text session state is incompatible");
-    }
-    for (size_t index = 0; index < model.blocks.size(); ++index) {
-        auto &block = model.blocks[index];
-        MfqCudaGuard guard(block->cuda_device);
-        auto *glm = dynamic_cast<GlmDsaBlock *>(block.get());
-        const auto &saved = (*layers)[index];
-        if (glm == nullptr || glm->full_indexer != saved.full_indexer ||
-            !saved.kv_cache.defined() || saved.kv_cache.dim() != 4 || saved.kv_cache.size(0) != 1 ||
-            saved.kv_cache.size(2) != state.cache_pos) {
-            throw CudaSessionStateError("GLM DSA saved MLA cache is invalid");
+mfq::StepSequence<std::monostate>
+CudaSessionCodec<GlmDsaModel>::restore_steps(Model &model,
+                                             const TextSessionState &state) {
+  const auto *layers =
+      std::get_if<std::vector<GlmDsaBlockSessionState>>(&state.payload);
+  if (kind(model) != TextSessionStateKind::GlmDsa ||
+      state.kind() != TextSessionStateKind::GlmDsa || state.cache_pos <= 0 ||
+      static_cast<size_t>(state.cache_pos) != state.tokens.size() ||
+      layers == nullptr || layers->size() != model.blocks.size()) {
+    throw CudaSessionStateError("GLM DSA text session state is incompatible");
+  }
+  for (size_t index = 0; index < model.blocks.size(); ++index) {
+    {
+      auto &block = model.blocks[index];
+      MfqCudaGuard guard(block->cuda_device);
+      auto *glm = dynamic_cast<GlmDsaBlock *>(block.get());
+      const auto &saved = (*layers)[index];
+      if (glm == nullptr || glm->full_indexer != saved.full_indexer ||
+          !saved.kv_cache.defined() || saved.kv_cache.dim() != 4 ||
+          saved.kv_cache.size(0) != 1 ||
+          saved.kv_cache.size(2) != state.cache_pos) {
+        throw CudaSessionStateError("GLM DSA saved MLA cache is invalid");
+      }
+      restore_session_prefix_tensor(glm->kv_cache, saved.kv_cache, 2,
+                                    saved.kv_capacity);
+      if (saved.full_indexer) {
+        if (!saved.index_cache.defined() || saved.index_cache.dim() != 3 ||
+            saved.index_cache.size(0) != 1 ||
+            saved.index_cache.size(1) != state.cache_pos) {
+          throw CudaSessionStateError("GLM DSA saved index cache is invalid");
         }
-        restore_session_prefix_tensor(glm->kv_cache, saved.kv_cache, 2, saved.kv_capacity);
-        if (saved.full_indexer) {
-            if (!saved.index_cache.defined() || saved.index_cache.dim() != 3 ||
-                saved.index_cache.size(0) != 1 || saved.index_cache.size(1) != state.cache_pos) {
-                throw CudaSessionStateError("GLM DSA saved index cache is invalid");
-            }
-            restore_session_prefix_tensor(glm->index_cache, saved.index_cache, 1,
-                                          saved.index_capacity);
-        } else {
-            glm->index_cache = mfq_tensor_backend::Tensor();
-        }
-        glm->shared_state->reset();
+        restore_session_prefix_tensor(glm->index_cache, saved.index_cache, 1,
+                                      saved.index_capacity);
+      } else {
+        glm->index_cache = mfq_tensor_backend::Tensor();
+      }
+      glm->shared_state->reset();
     }
-    model.cache_pos = state.cache_pos;
+    co_yield mfq::StepState::advanced;
+  }
+  model.cache_pos = state.cache_pos;
+  co_yield std::monostate{};
 }
 
 } // namespace mfq::cuda

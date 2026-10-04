@@ -92,6 +92,15 @@ struct CudaSessionOps {
     static auto encode(const Snapshot &state, size_t block_size, size_t index) {
         return encode_cuda_paged_block(state, block_size, index);
     }
+    static auto decode_steps(const std::vector<CudaPagedPayload> &payloads,
+                             const std::vector<int64_t> &tokens,
+                             size_t block_size) {
+      return decode_cuda_paged_session_steps(payloads, tokens, block_size);
+    }
+    static auto encode_steps(const Snapshot &state, size_t block_size,
+                             size_t index) {
+      return encode_cuda_paged_block_steps(state, block_size, index);
+    }
     static void release_host_cache() { mfq_release_host_allocator_cache(); }
 };
 
@@ -121,6 +130,18 @@ TextSessionRestore TextSessionCache::restore_best(Model &model, MtpModule *mtp,
         model, mtp, requested_session, prompt, maximum_prefix_tokens, input_key);
 }
 
+template <typename Model>
+mfq::StepSequence<TextSessionRestore> TextSessionCache::restore_steps(
+    Model &model, MtpModule *mtp, const std::string &session,
+    const std::vector<int64_t> &prompt, size_t limit, const std::string &key) {
+  return impl_->restore_steps(model, mtp, session, prompt, limit, key);
+}
+mfq::StepSequence<std::monostate>
+TextSessionCache::store_steps(const std::string &session,
+                              TextSessionState state) {
+  return impl_->store_steps(session, std::move(state));
+}
+
 void TextSessionCache::store(const std::string &session_id, TextSessionState state) {
     impl_->store(session_id, std::move(state));
 }
@@ -144,13 +165,15 @@ size_t TextSessionCache::clear() { return impl_->clear(); }
 
 uint64_t TextSessionCache::trim_hot(uint64_t target_bytes) { return impl_->trim_hot(target_bytes); }
 
-#define MFQ_INSTANTIATE_SESSION_CACHE(MODEL)                                                       \
-    template TextSessionRestore TextSessionCache::restore_best(MODEL &,                            \
-        MtpModule *,                                                                               \
-        const std::string &,                                                                       \
-        const std::vector<int64_t> &,                                                              \
-        size_t,                                                                                    \
-        const std::string &);
+#define MFQ_INSTANTIATE_SESSION_CACHE(MODEL)                                   \
+  template mfq::StepSequence<TextSessionRestore>                               \
+  TextSessionCache::restore_steps(MODEL &, MtpModule *, const std::string &,   \
+                                  const std::vector<int64_t> &, size_t,        \
+                                  const std::string &);                        \
+                                                                               \
+  template TextSessionRestore TextSessionCache::restore_best(                  \
+      MODEL &, MtpModule *, const std::string &, const std::vector<int64_t> &, \
+      size_t, const std::string &);
 
 MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::Qwen35CausalLm)
 MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::MiniCPMO45CausalLm)
@@ -249,57 +272,58 @@ void CudaPagedReader::expect_end() const {
 
 size_t CudaPagedReader::remaining() const { return static_cast<size_t>(end_ - cursor_); }
 
-
-
-std::vector<CudaPagedPayload> encode_cuda_paged_session(const TextSessionState &state,
-                                                        size_t block_size, size_t first_block,
-                                                        size_t maximum_blocks) {
-    static constexpr std::array<uint8_t, 8> magic{'M', 'F', 'Q', 'C', 'U', 'D', '1', 0};
-    const auto *layers = std::get_if<std::vector<FullBlockSessionState>>(&state.payload);
-    // Paged prefixes are text-only; media positions are not block-sliceable.
-    if (state.kind() != TextSessionStateKind::FullAttention || state.decode_position_delta != 0 ||
-        !state.input_key.empty() || state.cache_pos <= 0 || layers == nullptr || layers->empty() ||
-        state.tokens.size() != static_cast<size_t>(state.cache_pos)) {
-        throw std::runtime_error("CUDA session state is not block-sliceable");
-    }
-    const size_t full_blocks = state.tokens.size() / block_size;
-    if (first_block > full_blocks) {
-        throw std::runtime_error("invalid CUDA cache first block");
-    }
-    const size_t end_block =
-        maximum_blocks > full_blocks - first_block ? full_blocks : first_block + maximum_blocks;
-    std::vector<CudaPagedPayload> result;
-    result.reserve(end_block - first_block);
-    for (size_t block_index = first_block; block_index < end_block; ++block_index) {
-        const int64_t start = static_cast<int64_t>(block_index * block_size);
-        CudaPagedWriter writer;
-        writer.raw(magic.data(), magic.size());
-        writer.scalar<uint32_t>(1);
-        writer.scalar<uint32_t>(static_cast<uint32_t>(start));
-        writer.scalar<uint32_t>(static_cast<uint32_t>(block_size));
-        writer.scalar<uint32_t>(static_cast<uint32_t>(layers->size()));
-        for (const auto &layer : *layers) {
-            if (layer.ring || layer.capacity <= 0 || !layer.k.defined() || !layer.v.defined() ||
-                layer.k.dim() != 4 || layer.v.sizes() != layer.k.sizes() ||
-                layer.k.size(2) < start + static_cast<int64_t>(block_size)) {
-                throw std::runtime_error("CUDA session layer cannot be block-sliced");
-            }
-            writer.scalar<int64_t>(layer.capacity);
-            writer.tensor(layer.k.narrow(2, start, static_cast<int64_t>(block_size)));
-            writer.tensor(layer.v.narrow(2, start, static_cast<int64_t>(block_size)));
-        }
-        result.push_back(std::move(writer).finish());
-    }
-    return result;
+mfq::StepSequence<CudaPagedPayload>
+encode_cuda_paged_block_steps(const TextSessionState &state, size_t block_size,
+                              size_t block_index) {
+  static constexpr std::array<uint8_t, 8> magic{'M', 'F', 'Q', 'C',
+                                                'U', 'D', '1', 0};
+  const auto *layers =
+      std::get_if<std::vector<FullBlockSessionState>>(&state.payload);
+  if (!block_size || state.kind() != TextSessionStateKind::FullAttention ||
+      state.decode_position_delta != 0 || !state.input_key.empty() ||
+      state.cache_pos <= 0 || layers == nullptr || layers->empty() ||
+      state.tokens.size() != static_cast<size_t>(state.cache_pos) ||
+      block_index >= state.tokens.size() / block_size)
+    throw std::runtime_error("CUDA session state is not block-sliceable");
+  const int64_t start = static_cast<int64_t>(block_index * block_size);
+  CudaPagedWriter writer;
+  writer.raw(magic.data(), magic.size());
+  writer.scalar<uint32_t>(1);
+  writer.scalar<uint32_t>(static_cast<uint32_t>(start));
+  writer.scalar<uint32_t>(static_cast<uint32_t>(block_size));
+  writer.scalar<uint32_t>(static_cast<uint32_t>(layers->size()));
+  for (const auto &layer : *layers) {
+    if (layer.ring || layer.capacity <= 0 || !layer.k.defined() ||
+        !layer.v.defined() || layer.k.dim() != 4 ||
+        layer.v.sizes() != layer.k.sizes() ||
+        layer.k.size(2) < start + static_cast<int64_t>(block_size))
+      throw std::runtime_error("CUDA session layer cannot be block-sliced");
+    writer.scalar<int64_t>(layer.capacity);
+    writer.tensor(layer.k.narrow(2, start, static_cast<int64_t>(block_size)));
+    writer.tensor(layer.v.narrow(2, start, static_cast<int64_t>(block_size)));
+    co_yield mfq::StepState::advanced;
+  }
+  co_yield std::move(writer).finish();
 }
 
-CudaPagedPayload encode_cuda_paged_block(const TextSessionState &state, size_t block_size,
-                                         size_t block_index) {
-    auto result = encode_cuda_paged_session(state, block_size, block_index, 1);
-    if (result.size() != 1) {
-        throw std::runtime_error("invalid CUDA cache block index");
-    }
-    return std::move(result.front());
+std::vector<CudaPagedPayload>
+encode_cuda_paged_session(const TextSessionState &state, size_t block_size,
+                          size_t first_block, size_t maximum_blocks) {
+  if (!block_size || first_block > state.tokens.size() / block_size)
+    throw std::runtime_error("invalid CUDA cache first block");
+  const auto count =
+      std::min(maximum_blocks, state.tokens.size() / block_size - first_block);
+  std::vector<CudaPagedPayload> result;
+  for (size_t i = 0; i < count; ++i)
+    result.push_back(mfq::finish_steps(
+        encode_cuda_paged_block_steps(state, block_size, first_block + i)));
+  return result;
+}
+
+CudaPagedPayload encode_cuda_paged_block(const TextSessionState &state,
+                                         size_t block_size, size_t index) {
+  return mfq::finish_steps(
+      encode_cuda_paged_block_steps(state, block_size, index));
 }
 
 CudaDecodedPagedBlock decode_cuda_paged_block(const std::vector<uint8_t> &payload) {
@@ -337,68 +361,83 @@ CudaDecodedPagedBlock decode_cuda_paged_block(const std::vector<uint8_t> &payloa
     return block;
 }
 
-TextSessionState decode_cuda_paged_session(const std::vector<CudaPagedPayload> &payloads,
-                                           const std::vector<int64_t> &tokens, size_t block_size) {
-    if (payloads.empty() || tokens.size() != payloads.size() * block_size) {
-        throw CudaSessionStateError("CUDA paged cache chain length mismatch");
+mfq::StepSequence<TextSessionState>
+decode_cuda_paged_session_steps(const std::vector<CudaPagedPayload> &payloads,
+                                const std::vector<int64_t> &tokens,
+                                size_t block_size) {
+  if (payloads.empty() || tokens.size() != payloads.size() * block_size) {
+    throw CudaSessionStateError("CUDA paged cache chain length mismatch");
+  }
+  std::vector<CudaDecodedPagedBlock> blocks;
+  blocks.reserve(payloads.size());
+  size_t expected_start = 0;
+  size_t layer_count = 0;
+  for (const auto &payload : payloads) {
+    if (!payload) {
+      throw CudaSessionStateError("CUDA paged cache block payload is null");
     }
-    std::vector<CudaDecodedPagedBlock> blocks;
-    blocks.reserve(payloads.size());
-    size_t expected_start = 0;
-    size_t layer_count = 0;
-    for (const auto &payload : payloads) {
-        if (!payload) {
-            throw CudaSessionStateError("CUDA paged cache block payload is null");
-        }
-        auto block = decode_cuda_paged_block(*payload);
-        if (block.start != expected_start || block.count != block_size ||
-            (layer_count != 0 && block.layers.size() != layer_count)) {
-            throw CudaSessionStateError("incompatible CUDA paged cache chain");
-        }
-        expected_start += block.count;
-        layer_count = block.layers.size();
-        blocks.push_back(std::move(block));
+    auto block = decode_cuda_paged_block(*payload);
+    if (block.start != expected_start || block.count != block_size ||
+        (layer_count != 0 && block.layers.size() != layer_count)) {
+      throw CudaSessionStateError("incompatible CUDA paged cache chain");
     }
-    TextSessionState state;
-    state.tokens = tokens;
-    state.cache_pos = static_cast<int64_t>(tokens.size());
-    state.payload = std::vector<FullBlockSessionState>{};
-    auto &layers = std::get<std::vector<FullBlockSessionState>>(state.payload);
-    layers.reserve(layer_count);
-    for (size_t layer_index = 0; layer_index < layer_count; ++layer_index) {
-        const auto &final = blocks.back().layers[layer_index];
-        std::vector<mfq_tensor_backend::Tensor> keys;
-        std::vector<mfq_tensor_backend::Tensor> values;
-        keys.reserve(blocks.size());
-        values.reserve(blocks.size());
-        for (const auto &block : blocks) {
-            const auto &layer = block.layers[layer_index];
-            if (layer.capacity != final.capacity || layer.device != final.device ||
-                layer.k.scalar_type() != final.k.scalar_type() ||
-                layer.k.size(0) != final.k.size(0) || layer.k.size(1) != final.k.size(1) ||
-                layer.k.size(3) != final.k.size(3)) {
-                throw CudaSessionStateError("inconsistent CUDA paged cache topology");
-            }
-            keys.push_back(layer.k);
-            values.push_back(layer.v);
-        }
-        auto key = mfq_tensor_backend::cat(keys, 2).contiguous();
-        auto value = mfq_tensor_backend::cat(values, 2).contiguous();
-        MfqCudaGuard guard(final.device);
-        const auto options = key.options().device(
-            mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA, final.device));
-        key = key.to(options, true, false).contiguous();
-        value = value.to(options, true, false).contiguous();
-        state.bytes += static_cast<size_t>(key.numel() * key.element_size() +
-                                           value.numel() * value.element_size());
-        layers.push_back(FullBlockSessionState{
-            std::move(key),
-            std::move(value),
-            final.capacity,
-            false,
-        });
+    expected_start += block.count;
+    layer_count = block.layers.size();
+    blocks.push_back(std::move(block));
+    co_yield mfq::StepState::advanced;
+  }
+  TextSessionState state;
+  state.tokens = tokens;
+  state.cache_pos = static_cast<int64_t>(tokens.size());
+  state.payload = std::vector<FullBlockSessionState>{};
+  auto &layers = std::get<std::vector<FullBlockSessionState>>(state.payload);
+  layers.reserve(layer_count);
+  for (size_t layer_index = 0; layer_index < layer_count; ++layer_index) {
+    const auto &final = blocks.back().layers[layer_index];
+    std::vector<mfq_tensor_backend::Tensor> keys;
+    std::vector<mfq_tensor_backend::Tensor> values;
+    keys.reserve(blocks.size());
+    values.reserve(blocks.size());
+    for (const auto &block : blocks) {
+      const auto &layer = block.layers[layer_index];
+      if (layer.capacity != final.capacity || layer.device != final.device ||
+          layer.k.scalar_type() != final.k.scalar_type() ||
+          layer.k.size(0) != final.k.size(0) ||
+          layer.k.size(1) != final.k.size(1) ||
+          layer.k.size(3) != final.k.size(3)) {
+        throw CudaSessionStateError("inconsistent CUDA paged cache topology");
+      }
+      keys.push_back(layer.k);
+      values.push_back(layer.v);
     }
-    return state;
+    auto key = mfq_tensor_backend::cat(keys, 2).contiguous();
+    auto value = mfq_tensor_backend::cat(values, 2).contiguous();
+    {
+      MfqCudaGuard guard(final.device);
+      const auto options = key.options().device(
+          mfq_tensor_backend::Device(mfq_tensor_backend::kCUDA, final.device));
+      key = key.to(options, true, false).contiguous();
+      value = value.to(options, true, false).contiguous();
+      state.bytes += static_cast<size_t>(key.numel() * key.element_size() +
+                                         value.numel() * value.element_size());
+      layers.push_back(FullBlockSessionState{
+          std::move(key),
+          std::move(value),
+          final.capacity,
+          false,
+      });
+    }
+    co_yield mfq::StepState::advanced;
+  }
+  co_yield std::move(state);
+}
+
+TextSessionState
+decode_cuda_paged_session(const std::vector<CudaPagedPayload> &payloads,
+                          const std::vector<int64_t> &tokens,
+                          size_t block_size) {
+  return mfq::finish_steps(
+      decode_cuda_paged_session_steps(payloads, tokens, block_size));
 }
 
 size_t session_tensor_bytes(const mfq_tensor_backend::Tensor &tensor) {

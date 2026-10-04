@@ -1,6 +1,8 @@
 #pragma once
 
 #include "../native/tensor_backend.h"
+#include "step_sequence.h"
+#include <variant>
 
 #include <cstddef>
 #include <cstdint>
@@ -63,6 +65,12 @@ public:
         const std::vector<std::int64_t>& prompt,
         std::size_t maximum_prefix_tokens,
         const std::string& input_key = {});
+
+    template <typename Model>
+    mfq::StepSequence<TextSessionRestore> restore_steps(Model& model, MtpModule* mtp,
+        const std::string& requested_session, const std::vector<std::int64_t>& prompt,
+        std::size_t maximum_prefix_tokens, const std::string& input_key = {});
+    mfq::StepSequence<std::monostate> store_steps(const std::string& session_id, TextSessionState state);
 
     void store(const std::string& session_id, TextSessionState state);
     std::size_t fork_session(

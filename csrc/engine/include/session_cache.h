@@ -1,6 +1,10 @@
 #pragma once
 
 #include "mfq_paged_prefix_cache.h"
+#include "step_sequence.h"
+#include <future>
+#include <thread>
+#include <variant>
 #include "paged_session_bindings.h"
 #include "session_snapshot_cache.h"
 
@@ -31,6 +35,14 @@ template <class Backend> class SessionCache {
           paged_hot_budget_(paged_cache_ ? prefix_config.hot_bytes : 0),
           trace_(session_config.trace), supported_(supported), disabled_reason_(disabled_reason) {}
 
+    ~SessionCache() {
+        // Disk tasks own only the cache. Model/state teardown never waits for persistence.
+        if (paged_cache_) {
+            try { std::thread([cache = paged_cache_] { cache->flush(); }).detach(); }
+            catch (...) {} // Thread creation failure falls back to ordinary cache destruction.
+        }
+    }
+
     void limit_snapshot_bytes(std::size_t bytes) { snapshots_.limit_bytes(bytes); }
 
     bool persistent_prefix_enabled() const noexcept { return static_cast<bool>(paged_cache_); }
@@ -39,53 +51,78 @@ template <class Backend> class SessionCache {
     Restore restore_best(Model &model, Predictor *mtp, const std::string &requested_session,
         const std::vector<int64_t> &prompt, size_t maximum_prefix_tokens,
         const std::string &input_key = {}) {
-        if (!supported_)
-            return {};
+        return mfq::finish_steps(restore_steps(model, mtp, requested_session, prompt,
+            maximum_prefix_tokens, input_key));
+    }
+
+    template <typename Model>
+    mfq::StepSequence<Restore> restore_steps(Model &model, Predictor *mtp,
+        std::string requested_session, const std::vector<int64_t> &prompt,
+        size_t maximum_prefix_tokens, std::string input_key = {}) {
+        if (!supported_ || clearing()) { co_yield Restore{}; co_return; }
         if (paged_cache_ && mtp == nullptr && input_key.empty()) {
-            return {restore_paged(model, requested_session, prompt, maximum_prefix_tokens), {}};
+            auto sequence = restore_paged(model, requested_session, prompt, maximum_prefix_tokens);
+            while (auto step = sequence.next()) co_yield std::move(step);
+            co_return;
         }
-        if (!model.supports_text_session_state())
-            return {};
-        auto match = snapshots_.find_best(
-            requested_session, prompt, maximum_prefix_tokens, [&](const Snapshot &state) {
-            return state.input_key == input_key &&
-                   (mtp == nullptr || (mtp->supports_session_state() && state.mtp.has_value()));
-        });
-        if (!match)
-            return {};
+        if (!model.supports_text_session_state()) { co_yield Restore{}; co_return; }
+        auto match = snapshots_.find_best(requested_session, prompt, maximum_prefix_tokens,
+            [&](const Snapshot &state) {
+                return state.input_key == input_key &&
+                    (mtp == nullptr || (mtp->supports_session_state() && state.mtp.has_value()));
+            });
+        if (!match) { co_yield Restore{}; co_return; }
+        // Controls may evict the cache between steps. Retain native buffers by value.
+        auto state = *match->state;
+        snapshots_.record_hit(*match);
+        auto sequence = restore_model(model, state);
+        bool failed = false;
+        while (true) {
+            mfq::StepResult<std::monostate> step;
+            try { step = sequence.next(); }
+            catch (const std::exception &error) {
+                snapshots_.close(match->session_id);
+                model.reset(1);
+                if (mtp) mtp->reset(1);
+                failed = true;
+                std::cerr << "runtime_session_cache action=invalidate error=" << error.what() << '\n';
+            }
+            if (failed || !step) break;
+            co_yield step.state;
+        }
+        if (failed) { co_yield Restore{}; co_return; }
+        Restore restored{state.tokens.size(), {}};
         try {
-            model.restore_text_session_state(*match->state);
-            Restore restored{match->tokens(), {}};
-            if (mtp != nullptr) {
-                mtp->restore_session_state(*match->state->mtp);
-                restored.mtp_last_target_hidden = match->state->mtp->last_target_hidden;
+            if (mtp) {
+                mtp->restore_session_state(*state.mtp);
+                restored.mtp_last_target_hidden = state.mtp->last_target_hidden;
             }
-            snapshots_.record_hit(*match);
-            if (trace_) {
-                std::cerr << "runtime_session_cache action=hit session=" << requested_session
-                          << " source=" << match->session_id << " reused_tokens=" << match->tokens()
-                          << " prefill_tokens=" << prompt.size() - match->tokens() << std::endl;
-            }
-            return restored;
         } catch (const std::exception &error) {
-            const auto selected_session = match->session_id;
-            snapshots_.erase(*match);
+            snapshots_.close(match->session_id);
             model.reset(1);
-            if (mtp != nullptr)
-                mtp->reset(1);
-            std::cerr << "runtime_session_cache action=invalidate session=" << selected_session
-                      << " error=" << error.what() << std::endl;
-            return {};
+            mtp->reset(1);
+            restored = {};
+            std::cerr << "runtime_session_cache action=invalidate error=" << error.what() << '\n';
         }
+        co_yield std::move(restored);
+    }
+
+    mfq::StepSequence<std::monostate> store_steps(std::string session_id, Snapshot state) {
+        if (!supported_ || clearing()) { co_yield std::monostate{}; co_return; }
+        if (paged_cache_ && state.input_key.empty() && !state.mtp.has_value()) {
+            auto sequence = store_paged(session_id, state);
+            while (auto step = sequence.next()) co_yield std::move(step);
+        } else store_memory(session_id, std::move(state));
+        co_yield std::monostate{};
     }
 
     void store(const std::string &session_id, Snapshot state) {
+        (void)mfq::finish_steps(store_steps(session_id, std::move(state)));
+    }
+
+    void store_memory(const std::string &session_id, Snapshot state) {
         if (!supported_)
             return;
-        if (paged_cache_ && state.input_key.empty() && !state.mtp.has_value()) {
-            store_paged(session_id, state);
-            return;
-        }
         if (session_id.empty() || !snapshots_.enabled())
             return;
         if (state.bytes > snapshots_.max_bytes()) {
@@ -133,7 +170,7 @@ template <class Backend> class SessionCache {
 
     std::vector<std::pair<std::string, double>> metrics() const {
         if (paged_cache_) {
-            const auto value = paged_cache_->metrics();
+            const auto value = clearing() ? mfq::cache::PagedPrefixCacheMetrics{} : paged_cache_->metrics();
             return {
                 {"prefix_cache_supported", supported_ ? 1.0 : 0.0},
                 {"prefix_cache_disabled_reason", static_cast<double>(disabled_reason_)},
@@ -156,6 +193,7 @@ template <class Backend> class SessionCache {
                 {"prefix_cache_pending_bytes", static_cast<double>(value.pending_bytes)},
                 {"prefix_cache_pending_max_bytes", static_cast<double>(value.pending_max_bytes)},
                 {"prefix_cache_writes", static_cast<double>(value.writes)},
+                {"prefix_cache_skipped_writes", static_cast<double>(value.skipped_writes)},
                 {"prefix_cache_deduplicated_writes",
                     static_cast<double>(value.deduplicated_writes)},
                 {"prefix_cache_disk_hits", static_cast<double>(value.disk_hits)},
@@ -182,16 +220,22 @@ template <class Backend> class SessionCache {
         };
     }
 
-    size_t clear_live_sessions() noexcept { return snapshots_.clear() + paged_bindings_.clear(); }
+    size_t clear_live_sessions() noexcept { ++epoch_; return snapshots_.clear() + paged_bindings_.clear(); }
 
     size_t clear() {
+        ++epoch_;
         const auto snapshots = snapshots_.clear();
         paged_bindings_.clear();
-        return snapshots + (paged_cache_ ? paged_cache_->clear() : 0);
+        if (!paged_cache_ || clearing()) return snapshots;
+        const auto blocks = paged_cache_->metrics().disk_blocks;
+        std::packaged_task<size_t()> task([cache = paged_cache_] { return cache->clear(); });
+        clearing_ = task.get_future();
+        std::thread(std::move(task)).detach();
+        return snapshots + blocks;
     }
 
     uint64_t trim_hot(uint64_t target_bytes) {
-        if (!paged_cache_)
+        if (!paged_cache_ || clearing())
             return 0;
         const auto released = paged_cache_->trim_hot(target_bytes);
         if (released > 0)
@@ -200,78 +244,125 @@ template <class Backend> class SessionCache {
     }
 
   private:
-    template <typename Model>
-    size_t restore_paged(Model &model, const std::string &requested_session,
-        const std::vector<int64_t> &prompt, size_t maximum_prefix_tokens) {
-        if (snapshots_.max_sessions() == 0 || !model.supports_paged_text_session_state() ||
-            prompt.size() < 2) {
-            return 0;
-        }
-        const auto limit = std::min(maximum_prefix_tokens, prompt.size() - 1);
-        std::vector<int64_t> candidate(
-            prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(limit));
-        auto match = paged_cache_->match(candidate, {}, false);
-        if (match.matched_tokens == 0) {
-            paged_cache_->record_match(0);
-            return 0;
-        }
-
-        auto payloads = paged_cache_->load_prefix(match.blocks);
-        if (payloads.empty()) {
-            paged_cache_->record_match(0);
-            return 0;
-        }
-        if (payloads.size() != match.blocks.size()) {
-            match.blocks.resize(payloads.size());
-            match.matched_tokens = payloads.size() * paged_cache_->block_size_tokens();
-        }
-        std::vector<int64_t> matched_tokens(
-            prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(match.matched_tokens));
-        const auto fail = [&](const char *action, const std::exception &error, bool invalidate) {
-            if (invalidate && !match.blocks.empty()) {
-                paged_cache_->invalidate(match.blocks.back());
-            }
-            paged_cache_->record_match(0);
-            model.reset(1);
-            std::cerr << "runtime_session_cache action=" << action
-                      << " session=" << requested_session << " error=" << error.what() << std::endl;
-            return size_t{0};
-        };
-        const char *invalid_action = "paged_codec_invalidate";
-        const char *failure_action = "paged_codec_failed";
-        try {
-            auto state =
-                Backend::decode(payloads, matched_tokens, paged_cache_->block_size_tokens());
-            invalid_action = "paged_restore_invalidate";
-            failure_action = "paged_restore_failed";
-            model.restore_text_session_state(state);
-            if (!requested_session.empty()) {
-                paged_bindings_.bind(requested_session, match.blocks, match.matched_tokens);
-            }
-            paged_cache_->record_match(match.matched_tokens);
-            if (trace_) {
-                std::cerr << "runtime_session_cache action=paged_hit "
-                          << "session=" << requested_session
-                          << " reused_tokens=" << match.matched_tokens
-                          << " prefill_tokens=" << prompt.size() - match.matched_tokens
-                          << std::endl;
-            }
-            return match.matched_tokens;
-        } catch (const StateError &error) {
-            return fail(invalid_action, error, true);
-        } catch (const std::exception &error) {
-            return fail(failure_action, error, false);
-        }
+    bool clearing() const {
+        return clearing_.valid() && clearing_.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
+    }
+    template <class Model>
+    static mfq::StepSequence<std::monostate> restore_model(Model &model, const Snapshot &state) {
+        if constexpr (requires { model.restore_text_session_steps(state); }) {
+            auto sequence = model.restore_text_session_steps(state);
+            while (auto step = sequence.next()) co_yield std::move(step);
+        } else model.restore_text_session_state(state);
+        co_yield std::monostate{};
     }
 
-    void store_paged(const std::string &session_id, const Snapshot &state) {
-        if (snapshots_.max_sessions() == 0 || state.tokens.empty()) {
-            return;
+    template <typename Model>
+    mfq::StepSequence<Restore> restore_paged(Model &model, const std::string &requested_session,
+        const std::vector<int64_t> &prompt, size_t maximum_prefix_tokens) {
+        if (snapshots_.max_sessions() == 0 || !model.supports_paged_text_session_state() || prompt.size() < 2) {
+            co_yield Restore{}; co_return;
         }
+        const auto epoch = epoch_;
+        const auto limit = std::min(maximum_prefix_tokens, prompt.size() - 1);
+        std::vector<int64_t> candidate(prompt.begin(), prompt.begin() + limit);
+        auto match = paged_cache_->match(candidate, {}, false);
+        std::vector<mfq::cache::PagedPrefixPayload> payloads;
+        for (const auto &block : match.blocks) {
+            // One owned disk task per cache. Destroying a cancelled coroutine never joins it.
+            while (read_.valid() && read_.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                co_yield mfq::StepState::waiting;
+            std::packaged_task<std::vector<mfq::cache::PagedPrefixPayload>()> task(
+                [cache = paged_cache_, block] { return cache->load_prefix({block}); });
+            read_ = task.get_future();
+            std::thread(std::move(task)).detach();
+            while (read_.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                co_yield mfq::StepState::waiting;
+            auto part = read_.get();
+            if (part.empty() || epoch != epoch_) break;
+            payloads.push_back(std::move(part.front()));
+            co_yield mfq::StepState::advanced;
+        }
+        if (payloads.empty() || epoch != epoch_) {
+            paged_cache_->record_match(0); co_yield Restore{}; co_return;
+        }
+        match.blocks.resize(payloads.size());
+        match.matched_tokens = payloads.size() * paged_cache_->block_size_tokens();
+        candidate.resize(match.matched_tokens);
+        auto decode = decode_steps(payloads, candidate, paged_cache_->block_size_tokens());
+        std::optional<Snapshot> state;
+        bool failed = false, invalid = false;
+        while (true) {
+            mfq::StepResult<Snapshot> step;
+            try { step = decode.next(); }
+            catch (const StateError &error) { failed = invalid = true; }
+            catch (const std::exception &error) {
+                failed = true;
+                std::cerr << "runtime_session_cache action=paged_codec_failed error=" << error.what() << '\n';
+            }
+            if (failed || !step) break;
+            if (step.value) state = std::move(*step.value);
+            co_yield step.state;
+        }
+        if (state && !failed) {
+            auto restore = restore_model(model, *state);
+            while (true) {
+                mfq::StepResult<std::monostate> step;
+                try { step = restore.next(); }
+                catch (const StateError &error) { failed = invalid = true; }
+                catch (const std::exception &error) {
+                    failed = true;
+                    model.reset(1);
+                    std::cerr << "runtime_session_cache action=paged_restore_failed error=" << error.what() << '\n';
+                }
+                if (failed || !step) break;
+                co_yield step.state;
+            }
+        }
+        if (invalid && epoch == epoch_) {
+            std::packaged_task<std::vector<mfq::cache::PagedPrefixPayload>()> task(
+                [cache = paged_cache_, block = match.blocks.back()] {
+                    cache->invalidate(block);
+                    return std::vector<mfq::cache::PagedPrefixPayload>{};
+                });
+            read_ = task.get_future();
+            std::thread(std::move(task)).detach();
+        }
+        if (failed || !state || epoch != epoch_) {
+            model.reset(1); paged_cache_->record_match(0); co_yield Restore{}; co_return;
+        }
+        if (!requested_session.empty()) paged_bindings_.bind(requested_session, match.blocks, match.matched_tokens);
+        paged_cache_->record_match(match.matched_tokens);
+        if (trace_) std::cerr << "runtime_session_cache action=paged_hit session=" << requested_session
+            << " reused_tokens=" << match.matched_tokens << '\n';
+        co_yield Restore{match.matched_tokens, {}};
+    }
+
+    static mfq::StepSequence<Snapshot> decode_steps(
+        const std::vector<mfq::cache::PagedPrefixPayload> &payloads,
+        const std::vector<int64_t> &tokens, size_t block_size) {
+        if constexpr (requires { Backend::decode_steps(payloads, tokens, block_size); }) {
+            auto sequence = Backend::decode_steps(payloads, tokens, block_size);
+            while (auto step = sequence.next()) co_yield std::move(step);
+        } else co_yield Backend::decode(payloads, tokens, block_size);
+    }
+
+    static mfq::StepSequence<mfq::cache::PagedPrefixPayload> encode_steps(
+        const Snapshot &state, size_t block_size, size_t index) {
+        if constexpr (requires { Backend::encode_steps(state, block_size, index); }) {
+            auto sequence = Backend::encode_steps(state, block_size, index);
+            while (auto step = sequence.next()) co_yield std::move(step);
+        } else co_yield Backend::encode(state, block_size, index);
+    }
+
+    mfq::StepSequence<std::monostate> store_paged(const std::string &session_id, const Snapshot &state) {
+        if (snapshots_.max_sessions() == 0 || state.tokens.empty()) {
+            co_return;
+        }
+        const auto epoch = epoch_;
         const auto block_size = paged_cache_->block_size_tokens();
         const auto full_blocks = state.tokens.size() / block_size;
         if (full_blocks == 0)
-            return;
+            co_return;
 
         auto existing = paged_cache_->match(state.tokens, {}, false);
         if (existing.blocks.size() > full_blocks) {
@@ -283,11 +374,20 @@ template <class Backend> class SessionCache {
             parent = blocks.back();
         for (size_t index = blocks.size(); index < full_blocks; ++index) {
             const auto token_offset = index * block_size;
-            auto payload = Backend::encode(state, block_size, index);
+            auto encode = encode_steps(state, block_size, index);
+            mfq::cache::PagedPrefixPayload payload;
+            while (auto step = encode.next()) {
+                if (step.value) payload = std::move(*step.value);
+                co_yield step.state;
+            }
+            if (epoch != epoch_) co_return;
+            if (!payload) throw std::runtime_error("paged encoder returned no payload");
             parent = paged_cache_->store(
                 parent, state.tokens.data() + token_offset, block_size, std::move(payload));
             blocks.push_back(parent);
+            co_yield mfq::StepState::advanced;
         }
+        if (epoch != epoch_) co_return;
         if (!session_id.empty()) {
             paged_bindings_.bind(session_id, std::move(blocks), full_blocks * block_size);
         }
@@ -303,6 +403,9 @@ template <class Backend> class SessionCache {
     mfq::engine::PagedSessionBindings paged_bindings_;
     uint64_t paged_disk_budget_ = 0;
     uint64_t paged_hot_budget_ = 0;
+    std::future<std::vector<mfq::cache::PagedPrefixPayload>> read_;
+    std::future<size_t> clearing_;
+    std::uint64_t epoch_ = 0;
     bool trace_ = false;
     bool supported_ = true;
     int disabled_reason_ = 0;

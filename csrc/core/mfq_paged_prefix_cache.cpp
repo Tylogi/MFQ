@@ -371,9 +371,6 @@ public:
                 static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
             throw std::invalid_argument("invalid paged prefix block size");
         }
-        if (config_.max_pending_writes == 0) {
-            config_.max_pending_writes = 1;
-        }
         if (config_.max_parallel_reads == 0) {
             config_.max_parallel_reads = 1;
         }
@@ -506,16 +503,15 @@ public:
         }
         const auto hash = block_hash(
             parent, token_ids, token_count, extra_key);
-        bool write_inline = false;
         std::uint64_t write_epoch = 0;
         const auto payload_bytes = static_cast<std::uint64_t>(
             payload->size());
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            writes_finished_.wait(lock, [this, &hash, replace_existing] {
-                return !clearing_ &&
-                    (!replace_existing || pending_.count(hash) == 0);
-            });
+            if (clearing_ || (replace_existing && pending_.count(hash))) {
+                ++metrics_.skipped_writes;
+                return hash;
+            }
             if (!replace_existing &&
                 (disk_.count(hash) != 0 || pending_.count(hash) != 0)) {
                 ++metrics_.deduplicated_writes;
@@ -544,7 +540,6 @@ public:
                     std::numeric_limits<std::uint64_t>::max() - pending_headers
                 ? std::numeric_limits<std::uint64_t>::max()
                 : pending_payloads + pending_headers;
-            enforce_disk_budget_locked(reserved_bytes);
             put_hot_locked(hash, payload);
             write_epoch = cache_epoch_;
             const bool pending_bytes_full =
@@ -554,9 +549,11 @@ public:
                     config_.max_pending_bytes - payload_bytes;
             if (writes_.size() >= config_.max_pending_writes ||
                 pending_bytes_full) {
-                write_inline = true;
-                pending_[hash] = payload;
+                ++metrics_.skipped_writes;
+                sync_metrics_locked();
+                return hash;
             } else {
+                enforce_disk_budget_locked(reserved_bytes);
                 writes_.push_back(WriteRequest{
                     hash,
                     parent,
@@ -568,33 +565,9 @@ public:
                 pending_[hash] = writes_.back().payload;
             }
             pending_write_bytes_ += payload_bytes;
-            if (write_inline) ++active_writes_;
             sync_metrics_locked();
         }
-        if (write_inline) {
-            const WriteRequest request{
-                hash,
-                parent,
-                static_cast<std::uint32_t>(token_count),
-                std::move(payload),
-                write_epoch,
-                replace_existing,
-            };
-            bool success = false;
-            try {
-                success = write_file(request);
-            } catch (...) {
-                success = false;
-            }
-            finish_write(request, success);
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                --active_writes_;
-                writes_finished_.notify_all();
-            }
-        } else {
-            work_available_.notify_one();
-        }
+        work_available_.notify_one();
         return hash;
     }
 

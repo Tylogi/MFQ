@@ -1,5 +1,7 @@
 #pragma once
 
+#include "step_sequence.h"
+
 #include "../native/tensor_backend.h"
 
 #include <cstddef>
@@ -111,8 +113,10 @@ template <typename Model> struct FullAttentionSessionCodec {
     using CausalModel = typename Model::template CausalModel<CudaCausalOps<Model>>;
     static TextSessionStateKind kind(const CausalModel &model);
     static bool supports_paged(const CausalModel &model);
-    static TextSessionState capture(const CausalModel &model, const std::vector<int64_t> &tokens);
-    static void restore(CausalModel &model, const TextSessionState &state);
+    static mfq::StepSequence<TextSessionState> capture_steps(const CausalModel &model, const std::vector<int64_t> &tokens);
+    static TextSessionState capture(const CausalModel &model, const std::vector<int64_t> &tokens) { return mfq::finish_steps(capture_steps(model, tokens)); }
+    static mfq::StepSequence<std::monostate> restore_steps(CausalModel &model, const TextSessionState &state);
+    static void restore(CausalModel &model, const TextSessionState &state) { (void)mfq::finish_steps(restore_steps(model, state)); }
 };
 } // namespace mfq::cuda
 
@@ -235,3 +239,8 @@ Dsv4PoolSessionState capture_dsv4_pool_session_state(
 void restore_dsv4_pool_session_state(
     Dsv4PoolState& target,
     const Dsv4PoolSessionState& state);
+
+mfq::StepSequence<TextSessionState> decode_cuda_paged_session_steps(
+    const std::vector<CudaPagedPayload>& payloads, const std::vector<int64_t>& tokens, size_t block_size);
+mfq::StepSequence<CudaPagedPayload> encode_cuda_paged_block_steps(
+    const TextSessionState& state, size_t block_size, size_t block_index);

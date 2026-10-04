@@ -177,64 +177,76 @@ bool supports_text_session_state(const std::vector<std::unique_ptr<::Block>> &bl
            });
 }
 
-TextSessionState capture_text_session_state(const std::vector<std::unique_ptr<::Block>> &blocks,
-                                            const std::vector<std::int64_t> &tokens,
-                                            std::int64_t cache_position) {
-    if (!supports_text_session_state(blocks) || cache_position <= 0 ||
-        static_cast<std::size_t>(cache_position) != tokens.size()) {
-        throw std::runtime_error("Qwen hybrid session token count does not match the cache");
-    }
-    TextSessionState state;
-    state.tokens = tokens;
-    state.cache_pos = cache_position;
-    state.payload = std::vector<HybridBlockSessionState>{};
-    auto &layers = std::get<std::vector<HybridBlockSessionState>>(state.payload);
-    layers.reserve(blocks.size());
-    for (const auto &block : blocks) {
-        MfqCudaGuard guard(block->cuda_device);
-        HybridBlockSessionState saved;
-        if (const auto *full = dynamic_cast<const FullBlock *>(block.get())) {
-            saved.kind = HybridBlockSessionStateKind::FullAttention;
-            saved.full_attention =
-                capture_full_attention_session_state(*full, cache_position, state.bytes);
-        } else if (const auto *linear = dynamic_cast<const LinearAttentionBlock *>(block.get())) {
-            if (linear->state->speculative_pending || !linear->state->conv_state.defined() ||
-                !linear->state->gdn_state.defined()) {
-                throw std::runtime_error("Qwen recurrent session state is unavailable");
-            }
-            saved.kind = HybridBlockSessionStateKind::Recurrent;
-            saved.convolution_state = linear->state->conv_state.clone();
-            saved.recurrent_state = linear->state->gdn_state.clone();
-            state.bytes += session_tensor_bytes(saved.convolution_state);
-            state.bytes += session_tensor_bytes(saved.recurrent_state);
-        } else {
-            throw std::runtime_error("Qwen hybrid session layer type changed");
+mfq::StepSequence<TextSessionState>
+capture_text_session_state(const std::vector<std::unique_ptr<::Block>> &blocks,
+                           const std::vector<std::int64_t> &tokens,
+                           std::int64_t cache_position) {
+  if (!supports_text_session_state(blocks) || cache_position <= 0 ||
+      static_cast<std::size_t>(cache_position) != tokens.size()) {
+    throw std::runtime_error(
+        "Qwen hybrid session token count does not match the cache");
+  }
+  TextSessionState state;
+  state.tokens = tokens;
+  state.cache_pos = cache_position;
+  state.payload = std::vector<HybridBlockSessionState>{};
+  auto &layers = std::get<std::vector<HybridBlockSessionState>>(state.payload);
+  layers.reserve(blocks.size());
+  for (const auto &block : blocks) {
+    {
+      MfqCudaGuard guard(block->cuda_device);
+      HybridBlockSessionState saved;
+      if (const auto *full = dynamic_cast<const FullBlock *>(block.get())) {
+        saved.kind = HybridBlockSessionStateKind::FullAttention;
+        saved.full_attention = capture_full_attention_session_state(
+            *full, cache_position, state.bytes);
+      } else if (const auto *linear =
+                     dynamic_cast<const LinearAttentionBlock *>(block.get())) {
+        if (linear->state->speculative_pending ||
+            !linear->state->conv_state.defined() ||
+            !linear->state->gdn_state.defined()) {
+          throw std::runtime_error(
+              "Qwen recurrent session state is unavailable");
         }
-        layers.push_back(std::move(saved));
+        saved.kind = HybridBlockSessionStateKind::Recurrent;
+        saved.convolution_state = linear->state->conv_state.clone();
+        saved.recurrent_state = linear->state->gdn_state.clone();
+        state.bytes += session_tensor_bytes(saved.convolution_state);
+        state.bytes += session_tensor_bytes(saved.recurrent_state);
+      } else {
+        throw std::runtime_error("Qwen hybrid session layer type changed");
+      }
+      layers.push_back(std::move(saved));
     }
-    return state;
+    co_yield mfq::StepState::advanced;
+  }
+  co_yield std::move(state);
 }
 
-void restore_text_session_state(std::vector<std::unique_ptr<::Block>> &blocks,
-                                const TextSessionState &state) {
-    const auto *layers = std::get_if<std::vector<HybridBlockSessionState>>(&state.payload);
-    if (state.kind() != TextSessionStateKind::HybridAttention || state.cache_pos <= 0 ||
-        state.tokens.size() != static_cast<std::size_t>(state.cache_pos) || layers == nullptr ||
-        layers->size() != blocks.size()) {
-        throw CudaSessionStateError("Qwen hybrid session state is incompatible");
-    }
-    for (std::size_t index = 0; index < blocks.size(); ++index) {
-        auto &block = blocks[index];
-        const auto &saved = (*layers)[index];
-        MfqCudaGuard guard(block->cuda_device);
-        if (saved.kind == HybridBlockSessionStateKind::FullAttention) {
-            auto *full = dynamic_cast<FullBlock *>(block.get());
-            if (full == nullptr) {
-                throw CudaSessionStateError("Qwen hybrid full-attention layer changed");
-            }
-            restore_full_attention_session_state(*full, saved.full_attention);
-            continue;
+mfq::StepSequence<std::monostate>
+restore_text_session_state(std::vector<std::unique_ptr<::Block>> &blocks,
+                           const TextSessionState &state) {
+  const auto *layers =
+      std::get_if<std::vector<HybridBlockSessionState>>(&state.payload);
+  if (state.kind() != TextSessionStateKind::HybridAttention ||
+      state.cache_pos <= 0 ||
+      state.tokens.size() != static_cast<std::size_t>(state.cache_pos) ||
+      layers == nullptr || layers->size() != blocks.size()) {
+    throw CudaSessionStateError("Qwen hybrid session state is incompatible");
+  }
+  for (std::size_t index = 0; index < blocks.size(); ++index) {
+    {
+      auto &block = blocks[index];
+      const auto &saved = (*layers)[index];
+      MfqCudaGuard guard(block->cuda_device);
+      if (saved.kind == HybridBlockSessionStateKind::FullAttention) {
+        auto *full = dynamic_cast<FullBlock *>(block.get());
+        if (full == nullptr) {
+          throw CudaSessionStateError(
+              "Qwen hybrid full-attention layer changed");
         }
+        restore_full_attention_session_state(*full, saved.full_attention);
+      } else {
         auto *linear = dynamic_cast<LinearAttentionBlock *>(block.get());
         const auto convolution_width = linear != nullptr ? 2 * linear->qwen_config.linear_k_size() +
                                                                linear->qwen_config.linear_v_size()
@@ -260,7 +272,11 @@ void restore_text_session_state(std::vector<std::unique_ptr<::Block>> &blocks,
         linear->state->speculative_conv = mfq_tensor_backend::Tensor();
         linear->state->speculative_gdn = mfq_tensor_backend::Tensor();
         linear->clear_speculative();
+      }
     }
+    co_yield mfq::StepState::advanced;
+    }
+    co_yield std::monostate{};
 }
 
 } // namespace mfq::cuda::qwen35
@@ -300,25 +316,43 @@ bool CudaSessionCodec<Qwen35Model>::supports_paged(const Model &model) {
     return FullAttentionSessionCodec<Qwen35Model>::supports_paged(model);
 }
 
-TextSessionState CudaSessionCodec<Qwen35Model>::capture(const Model &model,
-                                                        const std::vector<int64_t> &tokens) {
-    if (kind(model) == TextSessionStateKind::HybridAttention) {
-        if (model.cache_pos <= 0 || static_cast<size_t>(model.cache_pos) != tokens.size()) {
-            throw std::runtime_error("text session token count does not match the model cache");
-        }
-        return qwen35::capture_text_session_state(model.blocks, tokens, model.cache_pos);
+mfq::StepSequence<TextSessionState>
+CudaSessionCodec<Qwen35Model>::capture_steps(
+    const Model &model, const std::vector<int64_t> &tokens) {
+  if (kind(model) == TextSessionStateKind::HybridAttention) {
+    if (model.cache_pos <= 0 ||
+        static_cast<size_t>(model.cache_pos) != tokens.size()) {
+      throw std::runtime_error(
+          "text session token count does not match the model cache");
     }
-    return FullAttentionSessionCodec<Qwen35Model>::capture(model, tokens);
+    auto sequence = qwen35::capture_text_session_state(model.blocks, tokens,
+                                                       model.cache_pos);
+    while (auto step = sequence.next())
+      co_yield std::move(step);
+    co_return;
+  }
+  auto sequence =
+      FullAttentionSessionCodec<Qwen35Model>::capture_steps(model, tokens);
+  while (auto step = sequence.next())
+    co_yield std::move(step);
 }
 
-void CudaSessionCodec<Qwen35Model>::restore(Model &model, const TextSessionState &state) {
-    if (kind(model) == TextSessionStateKind::HybridAttention &&
-        state.kind() == TextSessionStateKind::HybridAttention) {
-        qwen35::restore_text_session_state(model.blocks, state);
-        model.cache_pos = state.cache_pos;
-        return;
-    }
-    FullAttentionSessionCodec<Qwen35Model>::restore(model, state);
+mfq::StepSequence<std::monostate>
+CudaSessionCodec<Qwen35Model>::restore_steps(Model &model,
+                                             const TextSessionState &state) {
+  if (kind(model) == TextSessionStateKind::HybridAttention &&
+      state.kind() == TextSessionStateKind::HybridAttention) {
+    auto sequence = qwen35::restore_text_session_state(model.blocks, state);
+    while (auto step = sequence.next())
+      co_yield std::move(step);
+    model.cache_pos = state.cache_pos;
+    co_return;
+  }
+  auto sequence =
+      FullAttentionSessionCodec<Qwen35Model>::restore_steps(model, state);
+  while (auto step = sequence.next())
+    co_yield std::move(step);
+  co_yield std::monostate{};
 }
 
 mfq_tensor_backend::Tensor Qwen35Model::adapter_embed(mfq_tensor_backend::Tensor output) const {

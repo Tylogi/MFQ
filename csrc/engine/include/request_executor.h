@@ -169,6 +169,8 @@ class RequestExecutor {
                     auto step = current.done ? mfq::StepResult<EventData>{} : current.generation.next();
                     if (step.state == StepState::advanced)
                         result.advanced.push_back(it->first);
+                    else if (step.state == StepState::waiting)
+                        result.wake_at = Clock::now() + std::chrono::milliseconds(1);
                     if (step.value) {
                         if (auto* progress = std::get_if<PrefillProgress>(&*step.value))
                             current.output.metrics.mark_prefill(progress->timing);

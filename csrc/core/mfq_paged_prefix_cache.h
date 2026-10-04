@@ -27,8 +27,8 @@ struct PagedPrefixCacheConfig {
     std::uint64_t max_disk_bytes = 100ULL * 1024ULL * 1024ULL * 1024ULL;
     std::uint64_t max_hot_bytes = 0;
     std::size_t max_pending_writes = 64;
-    // Zero forces writes onto the caller instead of retaining raw KV payloads
-    // in the asynchronous queue.  The count limit remains a second guard.
+    // A full or disabled queue skips optional disk persistence. The hot tier
+    // may still retain the payload; inference never writes on the caller.
     std::uint64_t max_pending_bytes = 512ULL * 1024ULL * 1024ULL;
     // Cold blocks are independent content-addressed files. Reading and
     // checksumming a matched chain in parallel substantially reduces restore
@@ -50,6 +50,7 @@ struct PagedPrefixCacheMetrics {
     std::uint64_t writes = 0;
     std::uint64_t deduplicated_writes = 0;
     std::uint64_t failed_writes = 0;
+    std::uint64_t skipped_writes = 0;
     std::uint64_t corrupt_blocks = 0;
     std::uint64_t evictions = 0;
     std::uint64_t disk_blocks = 0;

@@ -124,7 +124,7 @@ def test_glm_dsa_session_state_preserves_mla_and_index_caches() -> None:
     assert "TextSessionStateKind::GlmDsa" in DECODE
     assert "struct GlmDsaBlockSessionState" in DECODE
     assert "saved.kv_cache = glm->kv_cache.narrow(" in DECODE
-    assert "saved.index_cache = glm->index_cache.narrow(" in DECODE
+    assert "saved.index_cache = glm->index_cache.narrow(" in " ".join(DECODE.split())
     assert "glm->shared_state->reset()" in DECODE
     assert 'option == "--check-text-session-state"' in DECODE
     assert '"text_session_state_check dsv4=1 glm_dsa=1\\n"' in DECODE
@@ -151,10 +151,10 @@ def test_qwen_hybrid_and_mtp_session_state_are_restored_together() -> None:
     ):
         assert obsolete not in CUDA_SESSION_STATE_HEADER
     assert "TextSessionStateKind::HybridAttention" in DECODE
-    assert "saved.convolution_state = linear->conv_state.clone()" in DECODE
-    assert "saved.recurrent_state = linear->gdn_state.clone()" in DECODE
+    assert "saved.convolution_state = linear->state->conv_state.clone()" in DECODE
+    assert "saved.recurrent_state = linear->state->gdn_state.clone()" in DECODE
     assert "std::optional<MtpSessionState> mtp" in DECODE
-    assert "mtp->restore_session_state(*match->state->mtp)" in DECODE
+    assert "mtp->restore_session_state(*state.mtp)" in DECODE
     assert "prompt.size() - reused_tokens" in DECODE
 
 
@@ -307,14 +307,13 @@ def test_metal_paged_codec_preserves_raw_kv_tensor_storage() -> None:
 def test_cuda_paged_restore_invalidates_only_deterministic_state_errors() -> None:
     assert "class CudaSessionStateError" in CUDA_SESSION_STATE_HEADER
     assert "throw CudaSessionStateError(" in CUDA_SESSION_CACHE
-    restore = CUDA_SESSION_CACHE.split("size_t restore_paged(", 1)[1].split(
-        "void store_paged(", 1
-    )[0]
-    corrupt, transient = restore.split(
-        "catch (const StateError &error)", 1
-    )[1].split("catch (const std::exception &error)", 1)
-    assert "return fail(invalid_action, error, true);" in corrupt
-    assert "return fail(failure_action, error, false);" in transient
+    cache = (ROOT / "csrc/engine/include/session_cache.h").read_text()
+    assert "catch (const StateError &error) { failed = invalid = true; }" in cache
+    assert "if (invalid && epoch == epoch_)" in cache
+    assert "cache->invalidate(block)" in cache
+    assert "std::packaged_task" in cache
+    assert "cache->load_prefix({block})" in cache
+    assert "write_inline" not in PAGED_SOURCE
 
 
 def test_cuda_paged_cache_only_accepts_linear_full_attention_kv() -> None:
@@ -329,4 +328,4 @@ def test_cuda_paged_cache_only_accepts_linear_full_attention_kv() -> None:
     assert "prefix_cache_disk_blocks" in DECODE
     assert "MFQ_RUNTIME_PREFIX_CACHE_PENDING_BYTES" in DECODE
     assert "prefix_cache_pending_max_bytes" in DECODE
-    assert "paged_cache_->load_prefix(match.blocks)" in DECODE
+    assert "cache->load_prefix({block})" in DECODE

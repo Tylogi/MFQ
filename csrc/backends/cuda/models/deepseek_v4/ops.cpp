@@ -307,59 +307,75 @@ TextSessionStateKind CudaSessionCodec<DeepseekV4Model>::kind(const Model &model)
 
 bool CudaSessionCodec<DeepseekV4Model>::supports_paged(const Model &) { return false; }
 
-TextSessionState CudaSessionCodec<DeepseekV4Model>::capture(const Model &model,
-                                                            const std::vector<int64_t> &tokens) {
-    if (kind(model) != TextSessionStateKind::DeepseekV4 || model.cache_pos <= 0 ||
-        static_cast<size_t>(model.cache_pos) != tokens.size()) {
-        throw std::runtime_error("DeepSeek-V4 text session state is unavailable");
+mfq::StepSequence<TextSessionState>
+CudaSessionCodec<DeepseekV4Model>::capture_steps(
+    const Model &model, const std::vector<int64_t> &tokens) {
+  if (kind(model) != TextSessionStateKind::DeepseekV4 || model.cache_pos <= 0 ||
+      static_cast<size_t>(model.cache_pos) != tokens.size()) {
+    throw std::runtime_error("DeepSeek-V4 text session state is unavailable");
+  }
+  TextSessionState state;
+  state.tokens = tokens;
+  state.cache_pos = model.cache_pos;
+  state.payload = std::vector<Dsv4BlockSessionState>{};
+  auto &layers = std::get<std::vector<Dsv4BlockSessionState>>(state.payload);
+  layers.reserve(model.blocks.size());
+  for (const auto &block : model.blocks) {
+    {
+      MfqCudaGuard guard(block->cuda_device);
+      const auto *dsv4 = dynamic_cast<const Dsv4Block *>(block.get());
+      if (dsv4 == nullptr || !dsv4->local_cache.defined()) {
+        throw std::runtime_error(
+            "DeepSeek V4 local session cache is unavailable");
+      }
+      Dsv4BlockSessionState saved;
+      saved.local_cache = dsv4->local_cache.clone();
+      state.bytes += session_tensor_bytes(saved.local_cache);
+      saved.compressor = capture_dsv4_pool_session_state(
+          dsv4->compressor, model.cache_pos, state.bytes);
+      saved.indexer_compressor = capture_dsv4_pool_session_state(
+          dsv4->indexer_compressor, model.cache_pos, state.bytes);
+      layers.push_back(std::move(saved));
     }
-    TextSessionState state;
-    state.tokens = tokens;
-    state.cache_pos = model.cache_pos;
-    state.payload = std::vector<Dsv4BlockSessionState>{};
-    auto &layers = std::get<std::vector<Dsv4BlockSessionState>>(state.payload);
-    layers.reserve(model.blocks.size());
-    for (const auto &block : model.blocks) {
-        MfqCudaGuard guard(block->cuda_device);
-        const auto *dsv4 = dynamic_cast<const Dsv4Block *>(block.get());
-        if (dsv4 == nullptr || !dsv4->local_cache.defined()) {
-            throw std::runtime_error("DeepSeek V4 local session cache is unavailable");
-        }
-        Dsv4BlockSessionState saved;
-        saved.local_cache = dsv4->local_cache.clone();
-        state.bytes += session_tensor_bytes(saved.local_cache);
-        saved.compressor =
-            capture_dsv4_pool_session_state(dsv4->compressor, model.cache_pos, state.bytes);
-        saved.indexer_compressor =
-            capture_dsv4_pool_session_state(dsv4->indexer_compressor, model.cache_pos, state.bytes);
-        layers.push_back(std::move(saved));
-    }
-    return state;
+    co_yield mfq::StepState::advanced;
+  }
+  co_yield std::move(state);
 }
 
-void CudaSessionCodec<DeepseekV4Model>::restore(Model &model, const TextSessionState &state) {
-    const auto *layers = std::get_if<std::vector<Dsv4BlockSessionState>>(&state.payload);
-    if (kind(model) != TextSessionStateKind::DeepseekV4 ||
-        state.kind() != TextSessionStateKind::DeepseekV4 || state.cache_pos <= 0 ||
-        static_cast<size_t>(state.cache_pos) != state.tokens.size() || layers == nullptr ||
-        layers->size() != model.blocks.size()) {
-        throw CudaSessionStateError("DeepSeek V4 text session state is incompatible");
+mfq::StepSequence<std::monostate>
+CudaSessionCodec<DeepseekV4Model>::restore_steps(
+    Model &model, const TextSessionState &state) {
+  const auto *layers =
+      std::get_if<std::vector<Dsv4BlockSessionState>>(&state.payload);
+  if (kind(model) != TextSessionStateKind::DeepseekV4 ||
+      state.kind() != TextSessionStateKind::DeepseekV4 ||
+      state.cache_pos <= 0 ||
+      static_cast<size_t>(state.cache_pos) != state.tokens.size() ||
+      layers == nullptr || layers->size() != model.blocks.size()) {
+    throw CudaSessionStateError(
+        "DeepSeek V4 text session state is incompatible");
+  }
+  for (size_t index = 0; index < model.blocks.size(); ++index) {
+    {
+      auto &block = model.blocks[index];
+      MfqCudaGuard guard(block->cuda_device);
+      auto *dsv4 = dynamic_cast<Dsv4Block *>(block.get());
+      const auto &saved = (*layers)[index];
+      if (dsv4 == nullptr || !saved.local_cache.defined() ||
+          saved.local_cache.dim() != 3 || saved.local_cache.size(0) != 1 ||
+          saved.local_cache.size(1) != 128) {
+        throw CudaSessionStateError("DeepSeek V4 saved local cache is invalid");
+      }
+      restore_session_tensor(dsv4->local_cache, saved.local_cache);
+      restore_dsv4_pool_session_state(dsv4->compressor, saved.compressor);
+      restore_dsv4_pool_session_state(dsv4->indexer_compressor,
+                                      saved.indexer_compressor);
+      dsv4->shared_state->ensure();
     }
-    for (size_t index = 0; index < model.blocks.size(); ++index) {
-        auto &block = model.blocks[index];
-        MfqCudaGuard guard(block->cuda_device);
-        auto *dsv4 = dynamic_cast<Dsv4Block *>(block.get());
-        const auto &saved = (*layers)[index];
-        if (dsv4 == nullptr || !saved.local_cache.defined() || saved.local_cache.dim() != 3 ||
-            saved.local_cache.size(0) != 1 || saved.local_cache.size(1) != 128) {
-            throw CudaSessionStateError("DeepSeek V4 saved local cache is invalid");
-        }
-        restore_session_tensor(dsv4->local_cache, saved.local_cache);
-        restore_dsv4_pool_session_state(dsv4->compressor, saved.compressor);
-        restore_dsv4_pool_session_state(dsv4->indexer_compressor, saved.indexer_compressor);
-        dsv4->shared_state->ensure();
-    }
-    model.cache_pos = state.cache_pos;
+    co_yield mfq::StepState::advanced;
+  }
+  model.cache_pos = state.cache_pos;
+  co_yield std::monostate{};
 }
 
 mfq_tensor_backend::Tensor DeepseekV4Model::collapse_hidden(mfq_tensor_backend::Tensor hidden,

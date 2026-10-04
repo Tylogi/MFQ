@@ -1,4 +1,7 @@
 #pragma once
+
+#include <variant>
+#include "step_sequence.h"
 #include "causal_forward.h"
 #include "causal_metadata.h"
 #include <algorithm>
@@ -259,14 +262,32 @@ template <class Backend, class Derived> struct CausalModelBase : Backend, Causal
         return text_session_state_kind() != SessionStateKind::Unsupported;
     }
     bool supports_paged_text_session_state() const { return SessionCodec::supports_paged(model()); }
+    mfq::StepSequence<SessionState> capture_text_session_steps(const std::vector<int64_t> &tokens) const {
+        if constexpr (requires { SessionCodec::capture_steps(model(), tokens); }) {
+            auto sequence = SessionCodec::capture_steps(model(), tokens);
+            while (auto step = sequence.next()) {
+                if (step.value) step.value->decode_position_delta = decode_position_delta;
+                co_yield std::move(step);
+            }
+        } else {
+            auto state = SessionCodec::capture(model(), tokens);
+            state.decode_position_delta = decode_position_delta;
+            co_yield std::move(state);
+        }
+    }
     SessionState capture_text_session_state(const std::vector<int64_t> &tokens) const {
-        auto state = SessionCodec::capture(model(), tokens);
-        state.decode_position_delta = decode_position_delta;
-        return state;
+        return mfq::finish_steps(capture_text_session_steps(tokens));
+    }
+    mfq::StepSequence<std::monostate> restore_text_session_steps(const SessionState &state) {
+        if constexpr (requires { SessionCodec::restore_steps(model(), state); }) {
+            auto sequence = SessionCodec::restore_steps(model(), state);
+            while (auto step = sequence.next()) co_yield std::move(step);
+        } else SessionCodec::restore(model(), state);
+        decode_position_delta = state.decode_position_delta;
+        co_yield std::monostate{};
     }
     void restore_text_session_state(const SessionState &state) {
-        SessionCodec::restore(model(), state);
-        decode_position_delta = state.decode_position_delta;
+        (void)mfq::finish_steps(restore_text_session_steps(state));
     }
 
   private:

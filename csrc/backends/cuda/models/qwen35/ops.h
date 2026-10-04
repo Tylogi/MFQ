@@ -1,5 +1,7 @@
 #pragma once
 
+#include "step_sequence.h"
+
 #include "models/common/causal_model_ops.h"
 #include "storage/session_state.h"
 #include "models/qwen35/causal_lm.h"
@@ -26,11 +28,11 @@ std::unique_ptr<::Block> load_block(CudaExecutionContext &execution, const mfq::
 
 bool supports_text_session_state(const std::vector<std::unique_ptr<::Block>> &blocks);
 
-TextSessionState capture_text_session_state(const std::vector<std::unique_ptr<::Block>> &blocks,
+mfq::StepSequence<TextSessionState> capture_text_session_state(const std::vector<std::unique_ptr<::Block>> &blocks,
                                             const std::vector<std::int64_t> &tokens,
                                             std::int64_t cache_position);
 
-void restore_text_session_state(std::vector<std::unique_ptr<::Block>> &blocks,
+mfq::StepSequence<std::monostate> restore_text_session_state(std::vector<std::unique_ptr<::Block>> &blocks,
                                 const TextSessionState &state);
 
 } // namespace mfq::cuda::qwen35
@@ -57,8 +59,10 @@ template <> struct CudaSessionCodec<Qwen35Model> {
     using Model = CausalLm<Qwen35Model>;
     static TextSessionStateKind kind(const Model &model);
     static bool supports_paged(const Model &model);
-    static TextSessionState capture(const Model &model, const std::vector<int64_t> &tokens);
-    static void restore(Model &model, const TextSessionState &state);
+    static mfq::StepSequence<TextSessionState> capture_steps(const Model &model, const std::vector<int64_t> &tokens);
+    static TextSessionState capture(const Model &model, const std::vector<int64_t> &tokens) { return mfq::finish_steps(capture_steps(model, tokens)); }
+    static mfq::StepSequence<std::monostate> restore_steps(Model &model, const TextSessionState &state);
+    static void restore(Model &model, const TextSessionState &state) { (void)mfq::finish_steps(restore_steps(model, state)); }
 };
 
 extern template struct FullAttentionSessionCodec<Qwen35Model>;

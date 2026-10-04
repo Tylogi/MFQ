@@ -649,59 +649,35 @@ int main() try {
         (void)cache.store(
             parent, tokens.data(), 4, payload({1, 2, 3, 4}));
         const auto stats = cache.metrics();
-        require(stats.writes == 1,
-                "oversized pending payload did not write inline");
+        require(stats.writes == 0 && stats.skipped_writes == 1,
+                "oversized pending payload was not skipped");
         require(stats.pending_writes == 0 && stats.pending_bytes == 0,
-                "inline write retained pending payload memory");
+                "skipped write retained pending payload memory");
         require(stats.pending_max_bytes == 3,
                 "pending payload byte budget was not reported");
     }
 
     {
-        const auto clear_root = root / "concurrent-clear-test";
-        constexpr std::size_t payload_size = 16ULL * 1024ULL * 1024ULL;
-        PagedPrefixCache cache(PagedPrefixCacheConfig{
-            clear_root,
-            "concurrent-clear",
-            4,
-            64ULL * 1024ULL * 1024ULL,
-            0,
-            1,
-            1,
-            1,
-        });
-        const auto mutable_payload =
-            std::make_shared<std::vector<std::uint8_t>>(payload_size, 0x5a);
-        const std::shared_ptr<const std::vector<std::uint8_t>> large_payload =
-            mutable_payload;
-        std::atomic<bool> store_finished{false};
-        std::thread writer([&] {
-            BlockHash parent{};
-            (void)cache.store(
-                parent, tokens.data(), 4, large_payload);
-            store_finished = true;
-        });
-        const auto deadline = std::chrono::steady_clock::now() +
-            std::chrono::seconds(2);
-        bool observed_inline_write = false;
-        while (!store_finished && std::chrono::steady_clock::now() < deadline) {
-            if (cache.metrics().pending_writes == 1) {
-                observed_inline_write = true;
-                break;
-            }
-            std::this_thread::yield();
-        }
-        if (!observed_inline_write) writer.join();
-        require(observed_inline_write,
-                "concurrent clear fixture did not overlap an inline write");
-        (void)cache.clear();
-        writer.join();
+        const auto clear_root = root / "disabled-write-queue";
+        PagedPrefixCacheConfig config;
+        config.cache_dir = clear_root;
+        config.compatibility_key = "disabled-write-queue";
+        config.block_size_tokens = 4;
+        config.max_pending_writes = 0;
+        config.max_hot_bytes = 32;
+        PagedPrefixCache cache(config);
+        const auto start = std::chrono::steady_clock::now();
+        const auto block = cache.store({}, tokens.data(), 4, payload({1, 2, 3, 4}));
+        require(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(100),
+                "disabled writer blocked the caller");
+        require(cache.load(block) == std::vector<std::uint8_t>({1, 2, 3, 4}),
+                "skipped persistence discarded the hot entry");
+        cache.flush();
         const auto stats = cache.metrics();
-        require(stats.pending_writes == 0 && stats.disk_blocks == 0 &&
-                    stats.hot_blocks == 0,
-                "clear returned before an overlapping inline write drained");
-        require(cache.match(tokens).matched_tokens == 0,
-                "overlapping inline write survived clear");
+        require(stats.skipped_writes == 1 && stats.writes == 0 && stats.pending_bytes == 0,
+                "disabled writer retained pending work");
+        cache.clear();
+        require(cache.match(tokens).matched_tokens == 0, "skipped write survived clear");
     }
 
     {

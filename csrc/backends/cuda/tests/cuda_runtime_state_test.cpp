@@ -528,6 +528,12 @@ static void check_snapshots(CudaExecutionContext& execution, bool hybrid) {
         model.blocks.push_back(std::move(linear));
     }
     model.cache_pos = 2;
+    const std::vector<int64_t> prefix{1, 2};
+    auto capture = model.capture_text_session_steps(prefix);
+    auto first = capture.next();
+    check(first.state == mfq::StepState::advanced && !first.value, "snapshot did not yield after one layer");
+    capture = {}; // Cancelling capture must leave the live request state untouched.
+    check(model.cache_pos == 2, "cancelled snapshot changed cache position");
     const auto text = model.capture_text_session_state({1, 2});
     check(text.kind() == (hybrid ? TextSessionStateKind::HybridAttention
                                 : TextSessionStateKind::FullAttention),
@@ -546,6 +552,13 @@ static void check_snapshots(CudaExecutionContext& execution, bool hybrid) {
     check(memory.restore_best(model, nullptr, "image", {1, 2, 3}, 2, "image").tokens == 2,
           "image snapshot missed");
     check(model.decode_position_delta == -1, "image position not restored");
+    const std::vector<int64_t> prompt{1, 2, 3};
+    const std::string session = "text", key;
+    auto restore = memory.restore_steps(model, nullptr, session, prompt, 2, key);
+    check(!restore.next().value, "restore did not yield after one layer");
+    memory.close_session("text"); // The suspended restore owns its buffers.
+    auto restored = mfq::finish_steps(std::move(restore));
+    check(restored.tokens == 2, "closing the cache invalidated an active restore");
     if (hybrid) return;
 
     bool rejected = false;
@@ -570,6 +583,22 @@ static void check_snapshots(CudaExecutionContext& execution, bool hybrid) {
         config.block_size_tokens = 2;
         auto paged = std::make_shared<mfq::cache::PagedPrefixCache>(config);
         TextSessionCache mixed({}, {}, paged);
+        mixed.store("cold", text);
+        paged->flush();
+        paged->trim_hot(0);
+        {
+            auto cold = mixed.restore_steps(model, nullptr, session, prompt, 2, key);
+            auto step = cold.next();
+            check(step.state != mfq::StepState::complete && !step.value,
+                  "cold restore completed synchronously");
+            const auto cancel_start = std::chrono::steady_clock::now();
+            cold = {};
+            check(std::chrono::steady_clock::now() - cancel_start < std::chrono::milliseconds(100),
+                  "cold restore cancellation joined a disk task");
+        }
+        check(mixed.restore_best(model, nullptr, "cold", prompt, 2).tokens == 2,
+              "cold restore after cancellation missed");
+        mixed.close_session("cold");
         mixed.store("source", text);
         mixed.store("source", image);
         check(mixed.fork_session("source", "fork") == 2,
@@ -594,6 +623,8 @@ static void check_snapshots(CudaExecutionContext& execution, bool hybrid) {
               "clear retained memory snapshot");
         check(mixed.restore_best(model, nullptr, "source", {1, 2, 3}, 2).tokens == 0,
               "clear retained paged snapshot");
+        // Offline fixture cleanup waits for durable removal explicitly.
+        paged->clear();
     }
     std::filesystem::remove_all(directory);
 }
@@ -627,7 +658,7 @@ static void check_media_steps(mfq::engine::Engine& engine, const char* model_pat
         std::vector<int64_t> tokens;
         int terminals = 0, preparation_steps = 0;
         bool preparing = true;
-        for (int tick = 0; tick < 128 && !terminals; ++tick) {
+        for (int tick = 0; tick < 1000 && !terminals; ++tick) {
             auto result = engine.step({image.id});
             if (preparing && result.events.empty() && !result.advanced.empty()) ++preparation_steps;
             for (const auto& event : result.events) {
@@ -637,6 +668,7 @@ static void check_media_steps(mfq::engine::Engine& engine, const char* model_pat
                     tokens.insert(tokens.end(), delta->token_ids.begin(), delta->token_ids.end());
                 terminals += terminal(event.data);
             }
+            if (result.wake_at) std::this_thread::sleep_until(*result.wake_at);
         }
         check(terminals == 1 && !tokens.empty(), "image request did not finish");
         return std::pair{tokens, preparation_steps};
@@ -647,9 +679,12 @@ static void check_media_steps(mfq::engine::Engine& engine, const char* model_pat
         auto interrupted = image;
         interrupted.input.media->pixel_values[0] += static_cast<float>(stop + 1); // Bypass the image cache.
         check(engine.admit(std::move(interrupted)) == Admission::accepted, "image cancellation admission");
-        for (int tick = 0; tick < stop; ++tick) {
+        for (int tick = 0, advanced = 0; advanced < stop; ++tick) {
+            check(tick < 1000, "image preparation stalled");
             auto result = engine.step({image.id});
-            check(result.events.empty() && result.advanced.size() == 1, "image preparation crossed its quantum");
+            check(result.events.empty(), "image preparation crossed its quantum");
+            advanced += result.advanced.size();
+            if (result.wake_at) std::this_thread::sleep_until(*result.wake_at);
         }
         engine.cancel(image.id);
         auto result = engine.step({});
@@ -702,6 +737,52 @@ static void check_batching(const char* model_path, const char* tokenizer) {
           "cancel during prefill did not release");
     check(mfq::cuda::diagnostics::check_engine_steps(*engine, {101, 202, 303}, sampling) == reference,
           "cancel changed subsequent output");
+    EngineRequest session_request;
+    session_request.id = "session";
+    session_request.token_ids.assign(65, 101);
+    session_request.input.sampling = sampling;
+    session_request.input.sampling.max_tokens = 8;
+    session_request.input.cache_plan.session_id = "session";
+    session_request.input.cache_plan.stable_prefix_tokens = 64;
+    const auto session_run = [&](int cancel_tick) {
+        check(engine->admit(EngineRequest(session_request)) == Admission::accepted, "session admission");
+        std::vector<int64_t> tokens;
+        unsigned terminals = 0;
+        for (int tick = 0; tick < 1000 && !terminals; ++tick) {
+            if (tick == cancel_tick) engine->cancel("session");
+            const auto start = Clock::now();
+            auto step = engine->step({"session"});
+            if (tick == cancel_tick) check(Clock::now() - start < std::chrono::milliseconds(100),
+                "session cancellation blocked on cache work");
+            (void)engine->control(RuntimeMetrics{});
+            for (const auto& event : step.events) {
+                if (const auto* failure = std::get_if<Failed>(&event.data)) throw std::runtime_error(failure->message);
+                if (const auto* delta = std::get_if<OutputDelta>(&event.data))
+                    tokens.insert(tokens.end(), delta->token_ids.begin(), delta->token_ids.end());
+                if (terminal(event.data)) {
+                    ++terminals;
+                    check(std::holds_alternative<Cancelled>(event.data) == (cancel_tick >= 0),
+                          "session returned the wrong terminal");
+                }
+            }
+            if (step.wake_at) std::this_thread::sleep_until(*step.wake_at);
+        }
+        check(terminals == 1 && !engine->step({}).has_work, "session terminal ownership");
+        return tokens;
+    };
+    const auto session_reference = session_run(-1);
+    const auto previous_prompt = session_request.token_ids;
+    session_request.token_ids.insert(session_request.token_ids.end(), session_reference.begin(), session_reference.end());
+    session_request.input.cache_plan.stable_prefix_tokens = session_request.token_ids.size() - 1;
+    session_run(3); // Cancel inside a layered snapshot restore.
+    const auto restored_tokens = session_run(-1);
+    engine->session({SessionCommand::Kind::clear});
+    check(session_run(-1) == restored_tokens, "restored session changed greedy tokens");
+    session_request.token_ids = previous_prompt;
+    session_request.input.cache_plan.stable_prefix_tokens = 64;
+    engine->session({SessionCommand::Kind::clear});
+    session_run(12); // Eight prefill chunks followed by layered capture.
+    check(session_run(-1) == session_reference, "cancelled capture changed greedy tokens");
     check_media_steps(*engine, model_path);
 }
 
