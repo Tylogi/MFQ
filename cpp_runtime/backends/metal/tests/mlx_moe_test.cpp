@@ -4942,6 +4942,50 @@ void test_nvq3jl_half_chunk(int output) {
     }
 }
 
+void test_nint_decode_shape_profiles() {
+    const std::vector<std::string> profiles{"NINTv2", "NINT4", "NINT5", "NINT6"};
+    for (const int group_size : {1, 7, 23, 24, 28, 32, 48}) {
+        for (const auto [output, input] : {
+                 std::pair{41, 113}, std::pair{97, 65},
+                 std::pair{41, 96}, std::pair{17, 11}}) {
+            const auto fixture = make_moe_fixture(
+                profiles, output, input, 19, group_size);
+            const auto weight = mfq::metal::MlxMfeWeight::from_blob(fixture.blob);
+            const auto second = make_moe_fixture(
+                profiles, output, input, 37, group_size);
+            const auto pair = mfq::metal::MlxMfeWeight::from_projection_blobs(
+                std::array<std::span<const std::uint8_t>, 2>{fixture.blob, second.blob});
+            const std::vector<std::int32_t> ids{3, 0, 2, 1};
+            const auto routes = mlx::core::array(ids.begin(), mlx::core::Shape{1, 4});
+            for (const bool shared : {false, true}) {
+                std::vector<float> values((shared ? 1 : 4) * input);
+                for (std::size_t i = 0; i < values.size(); ++i)
+                    values[i] = static_cast<float>(static_cast<int>((i * 17 + 3) % 31) - 15) / 1024.0f;
+                const auto x = mlx::core::astype(mlx::core::array(
+                    values.begin(), shared ? mlx::core::Shape{1, input}
+                                          : mlx::core::Shape{1, 4, input}),
+                    mlx::core::float16);
+                const auto plain = evaluated_floats(weight.routed_matmul(x, routes));
+                const auto fused = evaluated_floats(pair.routed_swiglu(x, routes));
+                for (int route = 0; route < 4; ++route) {
+                    for (int row = 0; row < output; ++row) {
+                        float gate = 0.0f, up = 0.0f;
+                        for (int column = 0; column < input; ++column) {
+                            const auto index = (ids[route] * output + row) * input + column;
+                            const auto activation = values[(shared ? 0 : route * input) + column];
+                            gate += activation * fixture.dense[index];
+                            up += activation * second.dense[index];
+                        }
+                        require_close(plain[route * output + row], gate, 2e-3f);
+                        require_close(fused[route * output + row],
+                            gate / (1.0f + std::exp(-gate)) * up, 2e-3f);
+                    }
+                }
+            }
+        }
+    }
+}
+
 void test_grouped_nint_mmq_prefill(
     int tokens = 513,
     int group_size = 24,
@@ -5482,9 +5526,8 @@ void test_mixed_mfe_native_and_grouped_dispatch() {
     exercise(49);
 }
 
-void test_multiple_nint_pools_share_cpp_dispatch() {
+void test_multiple_nint_pools_share_cpp_dispatch(int tokens = 3) {
     constexpr int experts = 4;
-    constexpr int tokens = 3;
     constexpr int routes = 2;
     constexpr int output = 9;
     constexpr int input = 48;
@@ -5498,7 +5541,7 @@ void test_multiple_nint_pools_share_cpp_dispatch() {
     pools.push_back({
         {3, 1},
         "NINT",
-        make_nint_tensor(6, 2 * output, input, 29, 24),
+        make_nint_tensor(6, 2 * output, input, 29, 28),
         {},
     });
     auto blob = make_raw_nim2(experts, output, input, pools);
@@ -5510,7 +5553,8 @@ void test_multiple_nint_pools_share_cpp_dispatch() {
         source[index] = static_cast<float>(
             static_cast<int>((index * 7 + 3) % 29) - 14) / 256.0f;
     }
-    const std::vector<std::int32_t> ids{0, 3, 2, 1, 1, 2};
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(tokens) * routes);
+    for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = (i * 3) % experts;
     const auto input_array = mlx::core::astype(
         mlx::core::array(source.begin(), mlx::core::Shape{tokens, input}),
         mlx::core::float16);
@@ -6668,6 +6712,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error(
                 std::string("grouped VQ tail: ") + error.what());
         }
+        test_nint_decode_shape_profiles();
         test_grouped_nint_mmq_prefill();
         test_nvq3jl_record_dispatch();
         test_nvq3jl_half_chunk(16);
@@ -6683,6 +6728,7 @@ int main(int argc, char** argv) {
         test_grouped_dense_quad_tail_prefill();
         test_mixed_mfe_native_and_grouped_dispatch();
         test_multiple_nint_pools_share_cpp_dispatch();
+        test_multiple_nint_pools_share_cpp_dispatch(1);
         test_grouped_mxfp4_vq_mmq_prefill();
         test_concatenate_resident_mfe_experts();
         test_streamed_mixed_mfe_residency();

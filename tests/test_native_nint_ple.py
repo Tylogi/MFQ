@@ -1,10 +1,10 @@
 """Matched native model-graph gate; requires the locally built Metal test."""
 
-import json
 import asyncio
-from contextlib import suppress
+import json
 import os
 import subprocess
+from contextlib import suppress
 from pathlib import Path
 
 import numpy as np
@@ -385,6 +385,38 @@ def test_native_qwen_nint_mhc_matches_dense_graph(tmp_path, adaptive, projection
                             capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "batch logits passed" in result.stdout
+
+
+@pytest.mark.parametrize("adaptive", [False, True])
+@pytest.mark.parametrize("group_sizes", [(48, 24, 7), (28, 7, 24)])
+def test_native_qwen_packed_mhc_real_geometry(tmp_path, adaptive, group_sizes):
+    executable = Path(__file__).resolve().parents[1] / "build/cpp_runtime/metal/mfq-metal-qwen-gated-hc-test"
+    if not executable.is_file():
+        pytest.skip("build mfq-metal-qwen-gated-hc-test to exercise packed MHC kernels")
+    tensors = {"test.mhc.pre.norm.weight": np.zeros(10240, dtype=np.float32)}
+    for suffix, rows, width, gs in [("pre.down", 320, 10240, group_sizes[0]),
+                                    ("pre.up", 10240, 320, group_sizes[1]),
+                                    ("post.inject", 4, 10240, group_sizes[2])]:
+        groups = (width + gs - 1) // gs
+        qbits = np.arange(rows, dtype=np.uint8) % 8 + 1 if adaptive else np.full(rows, 8, dtype=np.uint8)
+        kbits = np.arange(rows, dtype=np.uint8) % 3 + 6 if adaptive else np.full(rows, 7, dtype=np.uint8)
+        codes = np.empty((rows, groups, gs), dtype=np.uint8)
+        for row in range(rows):
+            codes[row].reshape(-1)[:] = (np.arange(groups * gs) * 3 + row) % min(8, 1 << int(qbits[row]))
+        tensors[f"test.mhc.{suffix}.weight"] = NintTensor(
+            spec=NintSpec(8, gs, 7), shape=(rows, width), axis=0, q=codes,
+            neuron_scale=np.full(rows, 1 / 8192, dtype=np.float32),
+            neuron_min=np.full(rows, 1 / 4096, dtype=np.float32),
+            sub_scale=np.broadcast_to(np.arange(groups, dtype=np.uint8) % 7 + 1, (rows, groups)).copy(),
+            sub_min=np.ones((rows, groups), dtype=np.uint8), neuron_len=width,
+            row_q_bits=qbits if adaptive else None, row_sub_bits=kbits if adaptive else None,
+        )
+    path = tmp_path / "packed_mhc.mfq"
+    io.save(path, FileHeader(model_arch="qwen4_exp", num_tensors=len(tensors)), tensors)
+    result = subprocess.run([str(executable), "--packed-mhc", str(path)],
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2048-row prefill passed" in result.stdout
 
 
 @pytest.mark.parametrize("name", [

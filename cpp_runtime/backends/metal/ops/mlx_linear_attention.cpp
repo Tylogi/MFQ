@@ -1,6 +1,7 @@
 #include "mlx_linear_attention.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
@@ -10,6 +11,11 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+
+#include <mlx/allocator.h>
+#include <mlx/backend/metal/device.h>
+#include <mlx/backend/metal/utils.h>
+#include <mlx/primitives.h>
 
 namespace mfq::metal {
 namespace {
@@ -216,36 +222,111 @@ constexpr const char* kGatedDeltaDecodeStepSource = R"METAL(
     }
 )METAL";
 
-const mlx::core::fast::CustomKernelFunction&
-gdn_decode_step_kernel() {
-    static const auto kernel = [] {
+struct GdnStepConfig {
+    std::array<Dtype, 5> projection_types;
+    int key_heads;
+    int value_heads;
+    bool silu;
+    std::array<float, 2> eps;
+};
+
+std::string gdn_step_source(
+    const GdnStepConfig& config,
+    const std::string& kernel_name) {
+    const auto metal_type = [](Dtype dtype) {
+        if (dtype == mlx::core::float16) return "half";
+        if (dtype == mlx::core::bfloat16) return "bfloat";
+        if (dtype == mlx::core::float32) return "float";
+        throw std::invalid_argument("GDN requires floating projections");
+    };
+    std::string source = "#include <metal_stdlib>\nusing namespace metal;\n";
+    source += "#define HK " + std::to_string(config.key_heads) + "\n";
+    source += "#define HV " + std::to_string(config.value_heads) + "\n";
+    source += "#define D 128\n#define C " +
+        std::to_string((2 * config.key_heads + config.value_heads) * 128) + "\n";
+    source += "#define OUTPUT_GATE_SILU " +
+        std::to_string(static_cast<int>(config.silu)) + "\n";
+    source += "kernel void " + kernel_name + "(";
+    const std::array<const char*, 5> projection_names{
+        "qk", "value", "output_gate", "alpha", "beta"};
+    for (int index = 0; index < 5; ++index) {
+        source += "device const " +
+            std::string(metal_type(config.projection_types[index])) + "* " +
+            projection_names[index] + " [[buffer(" +
+            std::to_string(index) + ")]], ";
+    }
+    const std::array<const char*, 6> state_names{
+        "convolution_state", "recurrent_state", "convolution_weight",
+        "dt_bias", "decay_scale", "norm_weight"};
+    for (int index = 0; index < 6; ++index) {
+        source += "device const float* " + std::string(state_names[index]) +
+            " [[buffer(" + std::to_string(index + 5) + ")]], ";
+    }
+    source +=
+        "constant float* params [[buffer(11)]], "
+        "device float* output [[buffer(12)]], "
+        "device float* convolution_out [[buffer(13)]], "
+        "device float* recurrent_out [[buffer(14)]], "
+        "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]], "
+        "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]], "
+        "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]) {\n";
+    source += kGatedDeltaDecodeStepSource;
+    source += "}\n";
+    return source;
+}
+
+class GdnStepPrimitive final : public mlx::core::Primitive {
+public:
+    GdnStepPrimitive(mlx::core::Stream stream, GdnStepConfig config)
+        : Primitive(stream), config_(config),
+          kernel_name_("mfq_gated_delta_decode_step") {
+        for (auto dtype : config_.projection_types) {
+            kernel_name_ += "_" + mlx::core::type_to_name(dtype);
+        }
+        kernel_name_ += "_" + std::to_string(config_.key_heads) +
+            "_" + std::to_string(config_.value_heads) +
+            "_" + std::to_string(static_cast<int>(config_.silu));
+    }
+
+    void eval_cpu(
+        const std::vector<array>&,
+        std::vector<array>&) override {
+        throw std::runtime_error("GDN decode step requires Metal");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        for (auto& output : outputs) {
+            output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        }
+        auto& device = mlx::core::metal::device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
-        return mlx::core::fast::metal_kernel(
-            "mfq_cpp_gated_delta_decode_step",
-            {
-                "qk",
-                "value",
-                "output_gate",
-                "alpha",
-                "beta",
-                "convolution_state",
-                "recurrent_state",
-                "convolution_weight",
-                "dt_bias",
-                "decay_scale",
-                "norm_weight",
-                "params",
-            },
-            {"output", "convolution_out", "recurrent_out"},
-            kGatedDeltaDecodeStepSource,
-            "",
-            true,
-            false,
-            options);
-    }();
-    return kernel;
-}
+        auto* library = device.get_library(
+            kernel_name_, options,
+            [this] { return gdn_step_source(config_, kernel_name_); });
+        auto& encoder = mlx::core::metal::get_command_encoder(stream());
+        encoder.set_compute_pipeline_state(
+            device.get_kernel(kernel_name_, library));
+        for (int index = 0; index < static_cast<int>(inputs.size()); ++index) {
+            encoder.set_input_array(inputs[index], index);
+        }
+        encoder.set_bytes(config_.eps, 11);
+        for (int index = 0; index < static_cast<int>(outputs.size()); ++index) {
+            encoder.set_output_array(outputs[index], index + 12);
+        }
+        encoder.dispatch_threadgroups(
+            MTL::Size(1, 1, config_.value_heads),
+            MTL::Size(32, 16, 1));
+    }
+
+    const char* name() const override { return "GatedDeltaDecodeStep"; }
+
+private:
+    GdnStepConfig config_;
+    std::string kernel_name_;
+};
 
 constexpr const char* kCachedDepthwiseConvHeader = R"METAL(
 template <
@@ -1136,10 +1217,19 @@ MlxGatedDeltaDecodeResult gated_delta_decode_step(
             "Gated DeltaNet decode-step requires four convolution taps");
     }
 
-    const array parameters(
-        {convolution_eps, norm_eps},
-        Shape{2});
-    auto outputs = gdn_decode_step_kernel()(
+    const GdnStepConfig config{
+        {qk_values.dtype(), value_values.dtype(), output_gate_values.dtype(),
+         alpha_values.dtype(), beta_values.dtype()},
+        key_heads, value_heads, output_gate_silu, {convolution_eps, norm_eps}};
+    auto outputs = array::make_arrays(
+        {
+            Shape{1, 1, value_width},
+            convolution_state_values.shape(),
+            recurrent_state_values.shape(),
+        },
+        {mlx::core::float32, mlx::core::float32, mlx::core::float32},
+        std::make_shared<GdnStepPrimitive>(
+            mlx::core::default_stream(mlx::core::default_device()), config),
         {
             qk_values,
             value_values,
@@ -1152,30 +1242,7 @@ MlxGatedDeltaDecodeResult gated_delta_decode_step(
             bias_values,
             decay_values,
             norm_values,
-            parameters,
-        },
-        {
-            Shape{1, 1, value_width},
-            convolution_state_values.shape(),
-            recurrent_state_values.shape(),
-        },
-        {
-            mlx::core::float32,
-            mlx::core::float32,
-            mlx::core::float32,
-        },
-        {32, dimension / 8, value_heads},
-        {32, dimension / 8, 1},
-        {
-            {"HK", key_heads},
-            {"HV", value_heads},
-            {"D", dimension},
-            {"C", channels},
-            {"OUTPUT_GATE_SILU", static_cast<int>(output_gate_silu)},
-        },
-        std::nullopt,
-        false,
-        {});
+        });
     return {
         std::move(outputs.at(0)),
         std::move(outputs.at(1)),

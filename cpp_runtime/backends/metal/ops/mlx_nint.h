@@ -25,6 +25,7 @@ public:
         std::span<const std::uint8_t> blob);
 
     mlx::core::array matmul(const mlx::core::array& input) const;
+    mlx::core::array matmul_packed(const mlx::core::array& input) const;
     mlx::core::array matmul_add(
         const mlx::core::array& input,
         const mlx::core::array& residual) const;
@@ -122,7 +123,8 @@ private:
         const mlx::core::array* residual,
         const mlx::core::array* routed_pairs = nullptr,
         const mlx::core::array* route_weights = nullptr,
-        const mlx::core::array* gate_logits = nullptr) const;
+        const mlx::core::array* gate_logits = nullptr,
+        bool allow_dequantize = true) const;
 
     MlxNintWeight(
         mlx::core::array q_packed,

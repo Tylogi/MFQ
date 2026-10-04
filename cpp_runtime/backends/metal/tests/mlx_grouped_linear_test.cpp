@@ -998,11 +998,54 @@ void require_rows_match(
     }
 }
 
+void test_vq_projection_plan_variants() {
+    using namespace mlx::core;
+    const auto fixtures = make_vq_fixtures();
+    std::vector<mfq::metal::MlxVqWeight> weights;
+    weights.reserve(fixtures.size());
+    for (const auto& fixture : fixtures) {
+        weights.push_back(mfq::metal::MlxVqWeight::from_blob(
+            fixture.dtype, fixture.fixture.blob));
+    }
+    std::vector<mfq::metal::MlxGroupedLinear> groups;
+    for (std::size_t index = 0; index < weights.size(); ++index) {
+        groups.emplace_back(std::vector<mfq::metal::MlxGroupedLinearWeightRef>{
+            &weights[index], &weights[(index + 1) % weights.size()],
+            &weights[(index + 2) % weights.size()]});
+    }
+    for (const int rows : {1, 3, 6, 16}) {
+        std::vector<float> source(rows * kInputSize);
+        for (std::size_t index = 0; index < source.size(); ++index) {
+            source[index] = static_cast<float>(
+                static_cast<int>(index % 13) - 6) / 64.0f;
+        }
+        for (const auto dtype : {float16, float32}) {
+            const auto input = astype(
+                array(source.begin(), Shape{rows, kInputSize}), dtype);
+            for (int pass = 0; pass < 2; ++pass) {
+                for (std::size_t position = 0;
+                     position < groups.size(); ++position) {
+                    const std::size_t index = pass == 0
+                        ? position : groups.size() - position - 1;
+                    require_rows_match(
+                        groups[index], input, source, rows,
+                        {&fixtures[index].fixture,
+                         &fixtures[(index + 1) % fixtures.size()].fixture,
+                         &fixtures[(index + 2) % fixtures.size()].fixture},
+                        8e-4f);
+                }
+            }
+        }
+    }
+}
+
 } // namespace
 
 int main() {
     try {
         using namespace mlx::core;
+
+        test_vq_projection_plan_variants();
 
         const auto test_dense_projection_batch = [](Dtype dtype) {
             // DeepSeek-V4 ratio-4 Attention's two compressor pairs and

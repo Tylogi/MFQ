@@ -134,15 +134,10 @@ array dense(
     return mlx::core::contiguous(result);
 }
 
-// MHC projections are small resident matrices consumed by the existing fused
-// gated-residual operators. Decode only these weights once; keep dense() strict
-// for norms/integer metadata and leave large PLE tables on their row reader.
-array mhc_projection(const MfqContainer& model, const std::string& name) {
-    if (!is_nint_dtype(model.record(name).dtype)) return dense(model, name);
+MlxLinear mhc_projection(const MfqContainer& model, const std::string& name) {
+    if (!is_nint_dtype(model.record(name).dtype)) return MlxLinear(dense(model, name));
     const auto mapped = model.map_record(name);
-    auto result = MlxNintWeight::from_blob(mapped.view()).dequantize();
-    result.eval();
-    return result;
+    return MlxLinear(MlxNintWeight::from_blob(mapped.view()));
 }
 
 array dense_vector(
@@ -409,7 +404,7 @@ public:
         const Qwen4Config& config,
         const std::string& prefix,
         bool combine = true) {
-        std::optional<array> injection;
+        std::optional<MlxLinear> injection;
         if (combine) {
             auto root = prefix;
             if (root.size() < 4 || root.substr(root.size() - 4) != ".pre") {
@@ -475,9 +470,9 @@ private:
     GatedResidual(
         Qwen4Config config,
         array norm,
-        array down,
-        array up,
-        std::optional<array> injection)
+        MlxLinear down,
+        MlxLinear up,
+        std::optional<MlxLinear> injection)
         : config_(std::move(config)),
           norm_(std::move(norm)),
           down_(std::move(down)),
@@ -486,9 +481,9 @@ private:
 
     Qwen4Config config_;
     array norm_;
-    array down_;
-    array up_;
-    std::optional<array> injection_;
+    MlxLinear down_;
+    MlxLinear up_;
+    std::optional<MlxLinear> injection_;
 };
 
 class DenseFfn {
