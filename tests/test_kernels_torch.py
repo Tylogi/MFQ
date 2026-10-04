@@ -118,13 +118,17 @@ def test_linear_forward_m9_uses_prefill_path():
 
 
 
-def test_linear_group_matches_separate_linears():
+@pytest.mark.parametrize("mixed_q_bits", [False, True])
+def test_linear_group_matches_separate_linears(mixed_q_bits):
     din = 96
-    specs = [NintSpec(4, 24, 6)] * 3
+    spec = NintSpec(6, 22, 6) if mixed_q_bits else NintSpec(4, 24, 6)
     tensors = [
-        nint_quant.quantize(_W(21, (32, din)), specs[0]),
-        nint_quant.quantize(_W(22, (16, din)), specs[1]),
-        nint_quant.quantize(_W(23, (8, din)), specs[2]),
+        nint_quant.quantize(
+            _W(21 + index, (rows, din)), spec,
+            row_q_bits=(np.arange(rows, dtype=np.uint8) % 8 + 1)
+            if mixed_q_bits else None,
+        )
+        for index, rows in enumerate((32, 16, 8))
     ]
     group = TorchNintLinearGroup(tensors, DEV)
     linears = [TorchNintLinear(t, DEV) for t in tensors]
