@@ -1621,9 +1621,10 @@ void launch_nint_matmul_routed_cuda(
     const dim3 grid = use_compact
         ? dim3(compact_blocks)
         : dim3(row_blocks, routes, token_blocks);
+    // Single-token decode needs one independent warp; keep batched launches intact.
     nint_matmul_kernel<<<
         grid,
-        dim3(32, warps_per_block), 0, stream>>>(
+        dim3(32, tokens == 1 ? 1 : warps_per_block), 0, stream>>>(
             bitstream.data_ptr<uint8_t>(),
             row_q_bits.data_ptr<uint8_t>(),
             row_q_bit_offsets.data_ptr<int64_t>(),

@@ -3,13 +3,20 @@
 #include "moe.h"
 
 #include <cstring>
+#include <fstream>
 #include <iostream>
 
 // Accepts an ordinary MFQ projection, including one extracted from a real model.
 // Compare every output with the per-pool kernel's original two-row reduction.
 int main(int argc, char** argv) try {
     using namespace mfq::cuda;
-    if (argc != 3) throw std::runtime_error("usage: mfq-mfe-decode-test MODEL TENSOR");
+    if (argc != 3 && argc != 4)
+        throw std::runtime_error("usage: mfq-mfe-decode-test MODEL TENSOR [OUTPUT_F16]");
+    std::ofstream dump;
+    if (argc == 4) {
+        dump.open(argv[3], std::ios::binary);
+        MFQ_RUNTIME_CHECK(bool(dump), "cannot open output dump");
+    }
     auto source = mfq::open_model_source(argv[1]);
     CudaExecutionContext execution;
     auto resident = load_mfe_gpu(execution, *source, argv[2]);
@@ -22,7 +29,7 @@ int main(int argc, char** argv) try {
     const Device gpu{DeviceType::cuda, 0};
     const int routes = std::min(10, resident.n_experts);
     int cases = 0;
-    for (int tokens : {1, 4, 8}) for (bool routed : {false, true}) {
+    for (int tokens : {1, 2, 3, 4, 8}) for (bool routed : {false, true}) {
         const int rows = tokens * (routed ? routes : 1);
         std::vector<float> values(rows * resident.neuron_len);
         for (std::size_t i = 0; i < values.size(); ++i)
@@ -47,9 +54,17 @@ int main(int argc, char** argv) try {
                     std::memcmp(actual.data_ptr(), expected.data_ptr(), actual.nbytes()) == 0,
                     "MFE decode differs from per-pool output: tokens=", tokens,
                     " routed=", routed, " first_expert=", first);
+                if (dump.is_open()) {
+                    dump.write(static_cast<const char*>(actual.data_ptr()), actual.nbytes());
+                    MFQ_RUNTIME_CHECK(bool(dump), "cannot write output dump");
+                }
                 ++cases;
             }
         }
+    }
+    if (dump.is_open()) {
+        dump.flush();
+        MFQ_RUNTIME_CHECK(bool(dump), "cannot flush output dump");
     }
     std::cout << "MFE decode full-output bit equality cases=" << cases
               << " experts=" << resident.n_experts << '\n';

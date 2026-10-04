@@ -92,8 +92,9 @@ pages are reclaimable OS cache and may still appear in process RSS.
 `mfq-moe-host-store-test` checks exact bytes, offsets, empty fields, view
 lifetime and invalid layouts. `mfq-mfe-decode-test MODEL TENSOR` compares every
 FP16 output against the separate pool kernels for all experts, using both
-shared and routed inputs at 1, 4 and 8 tokens. Setting `MFQ_MOE_SSD_CACHE_DIR`
-also checks the SSD path with a 512MiB GPU cache. For example:
+shared and routed inputs at 1, 2, 3, 4 and 8 tokens. An optional third argument
+writes all outputs as raw FP16 for byte comparison between builds. Setting
+`MFQ_MOE_SSD_CACHE_DIR` also checks the SSD path with a 512MiB GPU cache. For example:
 
 ```shell
 MFQ_MOE_SSD_CACHE_DIR=/path/on/ssd build/cpp_runtime/cuda/mfq-mfe-decode-test \
