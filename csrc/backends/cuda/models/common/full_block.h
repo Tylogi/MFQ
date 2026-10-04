@@ -5,6 +5,18 @@
 #include "storage/kv_cache.h"
 
 #include <cstdint>
+#include <memory>
+
+struct FullAttentionState {
+    KVCache cache;
+    mfq_tensor_backend::Tensor decode_partial_o;
+    mfq_tensor_backend::Tensor decode_partial_m;
+    mfq_tensor_backend::Tensor decode_partial_l;
+    mfq_tensor_backend::Tensor decode_mma_mask;
+    mfq_tensor_backend::Tensor decode_mma_kv_max;
+    mfq_tensor_backend::Tensor decode_mma_meta;
+
+};
 
 struct FullBlock : Block {
     int layer = -1;
@@ -35,13 +47,7 @@ struct FullBlock : Block {
     QuantLinear v_projection;
     QuantLinear o;
     FFN ffn;
-    KVCache cache;
-    mfq_tensor_backend::Tensor decode_partial_o;
-    mfq_tensor_backend::Tensor decode_partial_m;
-    mfq_tensor_backend::Tensor decode_partial_l;
-    mfq_tensor_backend::Tensor decode_mma_mask;
-    mfq_tensor_backend::Tensor decode_mma_kv_max;
-    mfq_tensor_backend::Tensor decode_mma_meta;
+    std::shared_ptr<FullAttentionState> state = std::make_shared<FullAttentionState>();
 
     static constexpr int64_t kDecodeAttentionMaxParts = 16;
 

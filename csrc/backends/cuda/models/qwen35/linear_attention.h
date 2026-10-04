@@ -21,6 +21,17 @@ struct LinearRecurrentInputs {
   bool split = false;
 };
 
+struct LinearAttentionState {
+  mfq_tensor_backend::Tensor conv_state, gdn_state;
+  mfq_tensor_backend::Tensor speculative_conv, speculative_gdn;
+  bool speculative_pending = false;
+  LinearRecurrentInputs speculative_recurrent;
+  int64_t speculative_start = -1;
+  int64_t speculative_confirmed = 0;
+  int64_t speculative_tokens = 0;
+
+};
+
 struct LinearAttentionBlock final : ::Block {
   mfq::models::qwen35::Config qwen_config;
   mfq_tensor_backend::Tensor attn_norm, ffn_norm, conv_weight, conv_bias,
@@ -41,22 +52,16 @@ struct LinearAttentionBlock final : ::Block {
   QuantLinear out_proj;
   mfq_tensor_backend::Tensor out_proj_dense;
   FFN ffn;
-  mfq_tensor_backend::Tensor conv_state, gdn_state;
-  mfq_tensor_backend::Tensor speculative_conv, speculative_gdn;
-  bool speculative_pending = false;
+  std::shared_ptr<LinearAttentionState> state = std::make_shared<LinearAttentionState>();
   bool transposed_gdn_state = true;
   int64_t speculative_ffn_batches = 0;
   int64_t speculative_projection_batches = 0;
-  LinearRecurrentInputs speculative_recurrent;
-  int64_t speculative_start = -1;
-  int64_t speculative_confirmed = 0;
-  int64_t speculative_tokens = 0;
 
   bool supports_speculation() const noexcept override { return true; }
   std::vector<mfq_tensor_backend::Tensor*> graph_warmup_state() override {
-    MFQ_RUNTIME_CHECK(!speculative_pending && conv_state.defined() && gdn_state.defined(),
+    MFQ_RUNTIME_CHECK(!state->speculative_pending && state->conv_state.defined() && state->gdn_state.defined(),
                       "decode warmup requires confirmed recurrent state");
-    return {&conv_state, &gdn_state};
+    return {&state->conv_state, &state->gdn_state};
   }
   mfq_tensor_backend::Tensor forward_context(CudaExecutionContext &execution,
                                              mfq_tensor_backend::Tensor input,
@@ -67,14 +72,14 @@ struct LinearAttentionBlock final : ::Block {
 
   void reset(int64_t B) override {
     clear_speculative();
-    if (conv_state.defined() && gdn_state.defined() &&
-        conv_state.size(0) == B && gdn_state.size(0) == B) {
-      conv_state.zero_();
-      gdn_state.zero_();
+    if (state->conv_state.defined() && state->gdn_state.defined() &&
+        state->conv_state.size(0) == B && state->gdn_state.size(0) == B) {
+      state->conv_state.zero_();
+      state->gdn_state.zero_();
       return;
     }
-    conv_state = mfq_tensor_backend::Tensor();
-    gdn_state = mfq_tensor_backend::Tensor();
+    state->conv_state = mfq_tensor_backend::Tensor();
+    state->gdn_state = mfq_tensor_backend::Tensor();
   }
 
   void clear_speculative() noexcept;
@@ -89,13 +94,13 @@ struct LinearAttentionBlock final : ::Block {
     const int64_t ksz = qwen_config.linear_k_size();
     const int64_t vsz = qwen_config.linear_v_size();
     const int64_t conv_dim = 2 * ksz + vsz;
-    if (!conv_state.defined()) {
+    if (!state->conv_state.defined()) {
       auto f32 = mfq_tensor_backend::TensorOptions()
                      .device(mfq_tensor_backend::kCPU)
                      .dtype(mfq_tensor_backend::kFloat32);
-      conv_state = mfq_tensor_backend::zeros(
+      state->conv_state = mfq_tensor_backend::zeros(
           {B, qwen_config.linear_conv_kernel_dim - 1, conv_dim}, f32);
-      gdn_state = mfq_tensor_backend::zeros({B, nv, dv, dv}, f32);
+      state->gdn_state = mfq_tensor_backend::zeros({B, nv, dv, dv}, f32);
     }
 
     return mfq::models::attention_layer(
@@ -179,8 +184,8 @@ struct LinearAttentionBlock final : ::Block {
               [&](const mfq::models::qwen35::LinearProjections<
                   mfq_tensor_backend::Tensor> &p) {
                 auto qkv = p.qkv, qk_part = p.qk, v_part = p.value;
-                auto conv_input = mfq_tensor_backend::cat({conv_state, qkv}, 1);
-                conv_state.copy_(conv_input.narrow(
+                auto conv_input = mfq_tensor_backend::cat({state->conv_state, qkv}, 1);
+                state->conv_state.copy_(conv_input.narrow(
                     1,
                     conv_input.size(1) -
                         (qwen_config.linear_conv_kernel_dim - 1),
@@ -247,7 +252,7 @@ struct LinearAttentionBlock final : ::Block {
                   std::array<mfq_tensor_backend::Tensor, 2> gates) {
                 auto q = qkv[0], k = qkv[1], v = qkv[2];
                 auto gate_t = gates[0], beta_t = gates[1];
-                auto state = gdn_state;
+                auto recurrent = state->gdn_state;
                 std::vector<mfq_tensor_backend::Tensor> outputs;
                 outputs.reserve(static_cast<size_t>(T));
                 const double retrieve_scale =
@@ -256,22 +261,22 @@ struct LinearAttentionBlock final : ::Block {
                   auto qt = q.select(2, token);
                   auto kt = k.select(2, token);
                   auto vt = v.select(2, token);
-                  state =
-                      state * mfq_tensor_backend::exp(gate_t.select(2, token))
+                  recurrent =
+                      recurrent * mfq_tensor_backend::exp(gate_t.select(2, token))
                                   .reshape({B, nv, 1, 1});
                   auto state_k = mfq_tensor_backend::matmul(
-                                     state.transpose(-1, -2), kt.unsqueeze(-1))
+                                     recurrent.transpose(-1, -2), kt.unsqueeze(-1))
                                      .squeeze(-1);
                   auto delta =
                       (vt - state_k) * beta_t.select(2, token).unsqueeze(-1);
-                  state = state + kt.unsqueeze(-1) * delta.unsqueeze(-2);
+                  recurrent = recurrent + kt.unsqueeze(-1) * delta.unsqueeze(-2);
                   outputs.push_back(
-                      mfq_tensor_backend::matmul(state.transpose(-1, -2),
+                      mfq_tensor_backend::matmul(recurrent.transpose(-1, -2),
                                                  qt.unsqueeze(-1))
                           .squeeze(-1) *
                       retrieve_scale);
                 }
-                gdn_state = state.contiguous();
+                state->gdn_state = recurrent.contiguous();
                 auto y = mfq_tensor_backend::stack(outputs, 2);
 
                 return y;
@@ -363,13 +368,13 @@ struct LinearAttentionBlock final : ::Block {
     int64_t ksz = qwen_config.linear_k_size(),
             vsz = qwen_config.linear_v_size();
     int64_t conv_dim = 2 * ksz + vsz;
-    if (!conv_state.defined()) {
-      conv_state = mfq_tensor_backend::zeros(
+    if (!state->conv_state.defined()) {
+      state->conv_state = mfq_tensor_backend::zeros(
           {B, qwen_config.linear_conv_kernel_dim - 1, conv_dim},
           mfq_tensor_backend::TensorOptions()
               .device(mfq_tensor_backend::kCUDA)
               .dtype(mfq_tensor_backend::kFloat32));
-      gdn_state = mfq_tensor_backend::zeros(
+      state->gdn_state = mfq_tensor_backend::zeros(
           {B, nv, dv, dv}, mfq_tensor_backend::TensorOptions()
                                .device(mfq_tensor_backend::kCUDA)
                                .dtype(mfq_tensor_backend::kFloat32));
@@ -537,7 +542,7 @@ struct LinearAttentionBlock final : ::Block {
                   auto qkv_fast =
                       profiler.measure("linear.conv_qkv_prefill", [&]() {
                         return linear_conv_qkv_prefill_cuda(
-                            conv_state, qk_part.contiguous(),
+                            state->conv_state, qk_part.contiguous(),
                             v_part.contiguous(), conv_weight, bias, nk, nv, dk,
                             dv, qwen_config.rms_norm_eps);
                       });
@@ -546,12 +551,12 @@ struct LinearAttentionBlock final : ::Block {
                   v = qkv_fast[2];
                   // Runtime CUDA graphs retain this state storage address
                   // across requests.
-                  conv_state.copy_(qkv_fast[3]);
+                  state->conv_state.copy_(qkv_fast[3]);
                 } else if (T == 1 && split_in_proj) {
                   auto qkv_fast =
                       profiler.measure("linear.conv_qkv_decode", [&]() {
                         return linear_conv_qkv_decode_cuda(
-                            conv_state, qk_part.contiguous(),
+                            state->conv_state, qk_part.contiguous(),
                             v_part.contiguous(), conv_weight, bias, nk, nv, dk,
                             dv, qwen_config.rms_norm_eps);
                       });
@@ -570,12 +575,12 @@ struct LinearAttentionBlock final : ::Block {
                   mfq_tensor_backend::Tensor conv;
                   if (T == 1) {
                     conv = profiler.measure("linear.conv_silu_decode", [&]() {
-                      return ssm_conv_silu_decode_cuda(conv_state, qkv,
+                      return ssm_conv_silu_decode_cuda(state->conv_state, qkv,
                                                        conv_weight, bias);
                     });
                   } else {
                     auto conv_in = profiler.measure("linear.conv_input", [&]() {
-                      return mfq_tensor_backend::cat({conv_state, qkv}, 1);
+                      return mfq_tensor_backend::cat({state->conv_state, qkv}, 1);
                     });
                     auto next_conv_state =
                         profiler.measure("linear.conv_state_update", [&]() {
@@ -588,7 +593,7 @@ struct LinearAttentionBlock final : ::Block {
                                    Slice()})
                               .contiguous();
                         });
-                    conv_state.copy_(next_conv_state);
+                    state->conv_state.copy_(next_conv_state);
                     conv = profiler.measure("linear.conv_silu", [&]() {
                       return ssm_conv_silu_cuda(conv_in, conv_weight, bias, T);
                     });
@@ -638,23 +643,23 @@ struct LinearAttentionBlock final : ::Block {
                     if (tiled_v_heads)
                       return gdn_inplace_transposed_tiled_cuda(
                           rq.contiguous(), rk.contiguous(), rv.contiguous(), rg,
-                          rb, gdn_state);
+                          rb, state->gdn_state);
                     return gdn_inplace_transposed_cuda(
                         rq.contiguous(), rk.contiguous(), rv.contiguous(), rg,
-                        rb, gdn_state);
+                        rb, state->gdn_state);
                   }
                   if (tiled_v_heads)
                     return gdn_inplace_tiled_cuda(
                         rq.contiguous(), rk.contiguous(), rv.contiguous(), rg,
-                        rb, gdn_state);
+                        rb, state->gdn_state);
                   return gdn_inplace_cuda(rq.contiguous(), rk.contiguous(),
-                                          rv.contiguous(), rg, rb, gdn_state);
+                                          rv.contiguous(), rg, rb, state->gdn_state);
                 };
                 auto gd = profiler.measure("linear.gdn", [&]() {
                   return recurrent_step(q, k, v, gate_t, beta_t);
                 });
                 auto y = gd[0];
-                gdn_state = gd[1];
+                state->gdn_state = gd[1];
 
                 return y;
               },
@@ -755,8 +760,8 @@ struct LinearAttentionBlock final : ::Block {
                        mfq_tensor_backend::kFloat32)},
                   -1)
             : inputs.qkv.narrow(1, 0, T);
-    auto conv_input = mfq_tensor_backend::cat({conv_state, qkv}, 1);
-    conv_state.copy_(conv_input.narrow(
+    auto conv_input = mfq_tensor_backend::cat({state->conv_state, qkv}, 1);
+    state->conv_state.copy_(conv_input.narrow(
         1, conv_input.size(1) - (qwen_config.linear_conv_kernel_dim - 1),
         qwen_config.linear_conv_kernel_dim - 1));
     auto conv = ssm_conv_silu_cuda(conv_input, conv_weight, bias, T);
@@ -776,19 +781,19 @@ struct LinearAttentionBlock final : ::Block {
       output = tiled_v_heads
                    ? gdn_inplace_transposed_tiled_cuda(
                          q.contiguous(), k.contiguous(), v.contiguous(), gate,
-                         beta, gdn_state)
+                         beta, state->gdn_state)
                    : gdn_inplace_transposed_cuda(q.contiguous(), k.contiguous(),
                                                  v.contiguous(), gate, beta,
-                                                 gdn_state);
+                                                 state->gdn_state);
     } else {
       output =
           tiled_v_heads
               ? gdn_inplace_tiled_cuda(q.contiguous(), k.contiguous(),
-                                       v.contiguous(), gate, beta, gdn_state)
+                                       v.contiguous(), gate, beta, state->gdn_state)
               : gdn_inplace_cuda(q.contiguous(), k.contiguous(), v.contiguous(),
-                                 gate, beta, gdn_state);
+                                 gate, beta, state->gdn_state);
     }
-    gdn_state = output[1];
+    state->gdn_state = output[1];
   }
 
   mfq_tensor_backend::Tensor

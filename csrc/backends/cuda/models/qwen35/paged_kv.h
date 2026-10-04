@@ -153,7 +153,7 @@ public:
         }
         const int64_t batch = static_cast<int64_t>(rows);
         for (auto & layer : layers_) {
-            layer.block->cache = KVCache::paged_view(
+            layer.block->state->cache = KVCache::paged_view(
                 layer.k_chunk_ptrs, layer.v_chunk_ptrs,
                 device_page_tables_.at(layer.device), batch,
                 layer.heads, layer.head_dim, kPageSize,
@@ -163,7 +163,7 @@ public:
     }
 
     void detach() {
-        for (auto & layer : layers_) layer.block->cache = KVCache();
+        for (auto & layer : layers_) layer.block->state->cache = KVCache();
     }
 
     int64_t page_size() const noexcept { return kPageSize; }

@@ -195,15 +195,6 @@ void Qwen35BatchStateAdapter::bind_paged_slots() {
     page_table_dirty_ = false;
 }
 
-static void clear_full_attention_decode_workspaces(FullBlock &block) {
-    block.decode_partial_o = Tensor();
-    block.decode_partial_m = Tensor();
-    block.decode_partial_l = Tensor();
-    block.decode_mma_mask = Tensor();
-    block.decode_mma_kv_max = Tensor();
-    block.decode_mma_meta = Tensor();
-}
-
 bool Qwen35BatchStateAdapter::has_moe() const {
     for (const auto &block : model_.blocks) {
         if (const auto *full = dynamic_cast<const FullBlock *>(block.get())) {
@@ -266,135 +257,86 @@ std::string Qwen35BatchStateAdapter::incompatibility(const CudaExecutionContext 
 }
 
 QwenBatchState Qwen35BatchStateAdapter::take(int64_t batch) {
-    auto *paged_kv = paged_kv_.get();
-    MFQ_RUNTIME_CHECK(model_.speculative_start < 0,
-                      "continuous batching cannot detach speculative state");
-    QwenBatchState state;
-    state.batch = batch;
-    state.layers.reserve(model_.blocks.size());
-    for (auto &block : model_.blocks) {
-        MfqCudaGuard guard(block->cuda_device);
+    MFQ_RUNTIME_CHECK(model_.speculative_start < 0, "cannot unbind speculative state");
+    QwenBatchState result;
+    result.batch = batch;
+    result.layers.reserve(model_.blocks.size());
+    for (auto& block : model_.blocks) {
         QwenBatchLayerState layer;
-        if (auto *full = dynamic_cast<FullBlock *>(block.get())) {
-            layer.kind = QwenBatchLayerState::Kind::FullAttention;
-            layer.paged = paged_kv != nullptr;
-            if (layer.paged) {
-                MFQ_RUNTIME_CHECK(full->cache.is_paged() && full->cache.batch_size() == batch,
-                                  "continuous batching paged KV state is unavailable");
-            } else {
-                MFQ_RUNTIME_CHECK(full->cache.k.defined() && full->cache.v.defined() &&
-                                      full->cache.k.dim() == 4 && full->cache.k.size(0) == batch &&
-                                      full->cache.v.sizes() == full->cache.k.sizes(),
-                                  "continuous batching full-attention state is unavailable");
-                layer.first = full->cache.k;
-                layer.second = full->cache.v;
-                layer.ring = full->cache.ring;
-            }
-            full->cache = KVCache();
-            clear_full_attention_decode_workspaces(*full);
-        } else if (auto *linear = dynamic_cast<LinearBlock *>(block.get())) {
-            MFQ_RUNTIME_CHECK(linear->conv_state.defined() && linear->gdn_state.defined() &&
-                                  linear->conv_state.size(0) == batch &&
-                                  linear->gdn_state.size(0) == batch &&
-                                  !linear->speculative_pending,
-                              "continuous batching recurrent state is unavailable");
-            layer.kind = QwenBatchLayerState::Kind::Recurrent;
-            layer.first = linear->conv_state;
-            layer.second = linear->gdn_state;
-            linear->conv_state = Tensor();
-            linear->gdn_state = Tensor();
-            linear->speculative_conv = Tensor();
-            linear->speculative_gdn = Tensor();
-            linear->speculative_pending = false;
-        } else {
-            throw std::runtime_error("continuous batching encountered an unsupported block state");
-        }
-        state.layers.push_back(std::move(layer));
+        if (auto* full = dynamic_cast<FullBlock*>(block.get())) {
+            layer.full = std::exchange(full->state, std::make_shared<FullAttentionState>());
+        } else if (auto* linear = dynamic_cast<LinearBlock*>(block.get())) {
+            MFQ_RUNTIME_CHECK(!linear->state->speculative_pending, "cannot unbind speculative state");
+            layer.recurrent = std::exchange(linear->state, std::make_shared<LinearAttentionState>());
+        } else throw std::runtime_error("unsupported Qwen block state");
+        result.layers.push_back(std::move(layer));
     }
     model_.cache_pos = 0;
-    return state;
+    return result;
 }
 
-void Qwen35BatchStateAdapter::restore(const QwenBatchState &state, int64_t cache_position) {
+void Qwen35BatchStateAdapter::restore(const QwenBatchState& state, int64_t cache_position) {
     MFQ_RUNTIME_CHECK(state.batch > 0 && state.layers.size() == model_.blocks.size(),
-                      "continuous batching state layout changed");
+        "Qwen state layout changed");
     for (size_t i = 0; i < model_.blocks.size(); ++i) {
-        auto &block = model_.blocks[i];
-        const auto &saved = state.layers[i];
-        MfqCudaGuard guard(block->cuda_device);
-        if (auto *full = dynamic_cast<FullBlock *>(block.get())) {
-            MFQ_RUNTIME_CHECK(saved.kind == QwenBatchLayerState::Kind::FullAttention &&
-                                  saved.paged == bool(paged_kv_),
-                              "continuous batching full-attention state changed");
-            full->cache = KVCache();
-            if (!saved.paged) {
-                MFQ_RUNTIME_CHECK(!saved.ring && saved.first.dim() == 4 &&
-                                      saved.first.size(0) == state.batch &&
-                                      saved.second.sizes() == saved.first.sizes(),
-                                  "continuous batching KV cache geometry changed");
-                full->cache.k = saved.first;
-                full->cache.v = saved.second;
-            }
-            clear_full_attention_decode_workspaces(*full);
-        } else if (auto *linear = dynamic_cast<LinearBlock *>(block.get())) {
-            MFQ_RUNTIME_CHECK(saved.kind == QwenBatchLayerState::Kind::Recurrent &&
-                                  saved.first.size(0) == state.batch &&
-                                  saved.second.size(0) == state.batch,
-                              "continuous batching recurrent state changed");
-            linear->conv_state = saved.first;
-            linear->gdn_state = saved.second;
-            linear->speculative_conv = Tensor();
-            linear->speculative_gdn = Tensor();
-            linear->speculative_pending = false;
-        } else {
-            throw std::runtime_error(
-                "continuous batching restore encountered an unsupported block");
-        }
+        auto& block = model_.blocks[i];
+        const auto& saved = state.layers[i];
+        if (auto* full = dynamic_cast<FullBlock*>(block.get())) {
+            MFQ_RUNTIME_CHECK(saved.full && !saved.recurrent, "full attention state changed");
+            full->state = saved.full;
+        } else if (auto* linear = dynamic_cast<LinearBlock*>(block.get())) {
+            MFQ_RUNTIME_CHECK(saved.recurrent && !saved.full, "recurrent state changed");
+            linear->state = saved.recurrent;
+        } else throw std::runtime_error("unsupported Qwen block state");
     }
     model_.cache_pos = cache_position;
     model_.speculative_start = -1;
     model_.speculative_confirmed = 0;
 }
 
-QwenBatchState Qwen35BatchStateAdapter::make_slot_state(const QwenBatchState &source,
-                                                        int64_t slots) const {
-    MFQ_RUNTIME_CHECK(source.batch == 1 && slots > 0,
-                      "continuous batching slot state requires one source row");
+static std::pair<Tensor, Tensor> tensors(const QwenBatchLayerState& layer) {
+    if (layer.full) return {layer.full->cache.k, layer.full->cache.v};
+    if (layer.recurrent) return {layer.recurrent->conv_state, layer.recurrent->gdn_state};
+    return {};
+}
+
+QwenBatchState Qwen35BatchStateAdapter::make_slot_state(const QwenBatchState& source,
+                                                       int64_t slots) const {
+    MFQ_RUNTIME_CHECK(source.batch == 1 && slots > 0, "slot state requires one source row");
     QwenBatchState result;
     result.batch = slots;
-    result.layers.reserve(source.layers.size());
-    for (const auto &saved : source.layers) {
+    for (const auto& saved : source.layers) {
         QwenBatchLayerState layer;
-        layer.kind = saved.kind;
-        layer.ring = saved.ring;
-        layer.paged = saved.paged;
-        if (saved.first.defined()) {
-            auto first_shape = saved.first.sizes().vec();
-            auto second_shape = saved.second.sizes().vec();
-            first_shape[0] = slots;
-            second_shape[0] = slots;
-            layer.first = mfq_tensor_backend::zeros(first_shape, saved.first.options());
-            layer.second = mfq_tensor_backend::zeros(second_shape, saved.second.options());
+        const auto expand = [slots](const Tensor& tensor) {
+            if (!tensor.defined()) return Tensor{};
+            auto shape = tensor.sizes().vec(); shape[0] = slots;
+            return mfq_tensor_backend::zeros(shape, tensor.options());
+        };
+        if (saved.full) {
+            layer.full = std::make_shared<FullAttentionState>();
+            layer.full->cache.k = expand(saved.full->cache.k);
+            layer.full->cache.v = expand(saved.full->cache.v);
+        } else {
+            layer.recurrent = std::make_shared<LinearAttentionState>();
+            layer.recurrent->conv_state = expand(saved.recurrent->conv_state);
+            layer.recurrent->gdn_state = expand(saved.recurrent->gdn_state);
         }
         result.layers.push_back(std::move(layer));
     }
     return result;
 }
 
-void Qwen35BatchStateAdapter::copy_to_slot(QwenBatchState &slots, const QwenBatchState &source,
-                                           int64_t slot) const {
+void Qwen35BatchStateAdapter::copy_to_slot(QwenBatchState& slots, const QwenBatchState& source,
+                                          int64_t slot) const {
     MFQ_RUNTIME_CHECK(source.batch == 1 && slot >= 0 && slot < slots.batch &&
-                          slots.layers.size() == source.layers.size(),
-                      "continuous batching received an invalid stable slot");
-    for (size_t layer = 0; layer < slots.layers.size(); ++layer) {
-        auto &target = slots.layers[layer];
-        const auto &saved = source.layers[layer];
-        MFQ_RUNTIME_CHECK(target.kind == saved.kind && target.paged == saved.paged,
-                          "continuous batching stable slot layout changed");
-        if (!target.first.defined())
-            continue;
-        target.first.narrow(0, slot, 1).copy_(saved.first);
-        target.second.narrow(0, slot, 1).copy_(saved.second);
+        slots.layers.size() == source.layers.size(), "invalid stable slot");
+    for (size_t i = 0; i < slots.layers.size(); ++i) {
+        MFQ_RUNTIME_CHECK(bool(slots.layers[i].full) == bool(source.layers[i].full), "slot layout changed");
+        auto [first, second] = tensors(slots.layers[i]);
+        auto [saved_first, saved_second] = tensors(source.layers[i]);
+        if (!first.defined()) continue;
+        first.narrow(0, slot, 1).copy_(saved_first);
+        second.narrow(0, slot, 1).copy_(saved_second);
     }
 }
 
@@ -408,17 +350,17 @@ std::vector<const void *> Qwen35BatchStateAdapter::decode_state_addresses() {
     addresses.reserve(2 * model_.blocks.size());
     for (auto &block : model_.blocks) {
         if (auto *full = dynamic_cast<FullBlock *>(block.get())) {
-            if (full->cache.is_paged()) {
-                addresses.push_back(full->cache.k_chunk_ptrs.data_ptr());
-                addresses.push_back(full->cache.v_chunk_ptrs.data_ptr());
-                addresses.push_back(full->cache.page_table.data_ptr());
+            if (full->state->cache.is_paged()) {
+                addresses.push_back(full->state->cache.k_chunk_ptrs.data_ptr());
+                addresses.push_back(full->state->cache.v_chunk_ptrs.data_ptr());
+                addresses.push_back(full->state->cache.page_table.data_ptr());
             } else {
-                addresses.push_back(full->cache.k.data_ptr());
-                addresses.push_back(full->cache.v.data_ptr());
+                addresses.push_back(full->state->cache.k.data_ptr());
+                addresses.push_back(full->state->cache.v.data_ptr());
             }
         } else if (auto *linear = dynamic_cast<LinearBlock *>(block.get())) {
-            addresses.push_back(linear->conv_state.data_ptr());
-            addresses.push_back(linear->gdn_state.data_ptr());
+            addresses.push_back(linear->state->conv_state.data_ptr());
+            addresses.push_back(linear->state->gdn_state.data_ptr());
         }
     }
     return addresses;
@@ -437,11 +379,12 @@ Qwen35BatchStateAdapter::capture_recurrent_slots(const std::vector<std::int32_t>
         MfqCudaGuard guard(linear->cuda_device);
         std::vector<Tensor> conv, gdn;
         for (auto slot : slots) {
-            conv.push_back(linear->conv_state.narrow(0, slot, 1));
-            gdn.push_back(linear->gdn_state.narrow(0, slot, 1));
+            conv.push_back(linear->state->conv_state.narrow(0, slot, 1));
+            gdn.push_back(linear->state->gdn_state.narrow(0, slot, 1));
         }
-        state.layers[i].first = mfq_tensor_backend::cat(conv, 0).clone();
-        state.layers[i].second = mfq_tensor_backend::cat(gdn, 0).clone();
+        state.layers[i].recurrent = std::make_shared<LinearAttentionState>();
+        state.layers[i].recurrent->conv_state = mfq_tensor_backend::cat(conv, 0).clone();
+        state.layers[i].recurrent->gdn_state = mfq_tensor_backend::cat(gdn, 0).clone();
     }
     return state;
 }
@@ -456,10 +399,10 @@ void Qwen35BatchStateAdapter::restore_recurrent_slots(const std::vector<std::int
             continue;
         MfqCudaGuard guard(linear->cuda_device);
         for (std::size_t row = 0; row < slots.size(); ++row) {
-            linear->conv_state.narrow(0, slots[row], 1)
-                .copy_(state.layers[i].first.narrow(0, row, 1));
-            linear->gdn_state.narrow(0, slots[row], 1)
-                .copy_(state.layers[i].second.narrow(0, row, 1));
+            linear->state->conv_state.narrow(0, slots[row], 1)
+                .copy_(state.layers[i].recurrent->conv_state.narrow(0, row, 1));
+            linear->state->gdn_state.narrow(0, slots[row], 1)
+                .copy_(state.layers[i].recurrent->gdn_state.narrow(0, row, 1));
         }
     }
 }

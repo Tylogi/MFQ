@@ -27,15 +27,15 @@ mfq_tensor_backend::Tensor Block::forward_context(CudaExecutionContext &executio
 }
 
 void FullBlock::reset(int64_t B) {
-    if (cache.defined() && cache.batch_size() == B)
+    if (state->cache.defined() && state->cache.batch_size() == B)
         return;
-    cache = KVCache();
-    decode_partial_o = mfq_tensor_backend::Tensor();
-    decode_partial_m = mfq_tensor_backend::Tensor();
-    decode_partial_l = mfq_tensor_backend::Tensor();
-    decode_mma_mask = mfq_tensor_backend::Tensor();
-    decode_mma_kv_max = mfq_tensor_backend::Tensor();
-    decode_mma_meta = mfq_tensor_backend::Tensor();
+    state->cache = KVCache();
+    state->decode_partial_o = mfq_tensor_backend::Tensor();
+    state->decode_partial_m = mfq_tensor_backend::Tensor();
+    state->decode_partial_l = mfq_tensor_backend::Tensor();
+    state->decode_mma_mask = mfq_tensor_backend::Tensor();
+    state->decode_mma_kv_max = mfq_tensor_backend::Tensor();
+    state->decode_mma_meta = mfq_tensor_backend::Tensor();
 }
 
 mfq_tensor_backend::Tensor
@@ -89,23 +89,23 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                 : (kl_capacity > 0 ? std::max<int64_t>(cache_pos + T, kl_capacity)
                                    : max_position_embeddings);
     const RopeCache &active_rope = attention_rope.cos.defined() ? attention_rope : rope;
-    if (!cache.defined()) {
-        cache =
+    if (!state->cache.defined()) {
+        state->cache =
             KVCache(B, nkh, cache_capacity, hd, sliding, x.device(),
                     official_bf16 ? mfq_tensor_backend::kBFloat16 : mfq_tensor_backend::kFloat16);
     }
     if (x.is_cuda()) {
         const int64_t total = B * nh;
-        if (!decode_partial_o.defined() || decode_partial_o.size(0) < total ||
-            decode_partial_o.size(1) != kDecodeAttentionMaxParts ||
-            decode_partial_o.size(2) != hd) {
+        if (!state->decode_partial_o.defined() || state->decode_partial_o.size(0) < total ||
+            state->decode_partial_o.size(1) != kDecodeAttentionMaxParts ||
+            state->decode_partial_o.size(2) != hd) {
             auto opts = mfq_tensor_backend::TensorOptions()
                             .device(x.device())
                             .dtype(mfq_tensor_backend::kFloat32);
-            decode_partial_o =
+            state->decode_partial_o =
                 mfq_tensor_backend::empty({total, kDecodeAttentionMaxParts, hd}, opts);
-            decode_partial_m = mfq_tensor_backend::empty({total, kDecodeAttentionMaxParts}, opts);
-            decode_partial_l = mfq_tensor_backend::empty({total, kDecodeAttentionMaxParts}, opts);
+            state->decode_partial_m = mfq_tensor_backend::empty({total, kDecodeAttentionMaxParts}, opts);
+            state->decode_partial_l = mfq_tensor_backend::empty({total, kDecodeAttentionMaxParts}, opts);
         }
     }
     return mfq::models::attention_layer(
@@ -140,10 +140,10 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                 B == 1 && cache_positions.has_value() && pos.dim() == 2 && pos.size(0) == 3;
             const bool fused_qk_rope_kv =
                 official_bf16 && x.is_cuda() && write_positions.dim() == 1 && pos.dim() == 1 &&
-                T == 1 && !cache.is_paged() && !cache.ring && !v_norm.defined() &&
+                T == 1 && !state->cache.is_paged() && !state->cache.ring && !v_norm.defined() &&
                 q_norm.defined() && k_norm.defined() && active_rope.rotary_dim == 128 &&
                 active_rope.sections.numel() == 0 && nh == 32 && nkh == 8 && hd == 128 &&
-                cache.scalar_type() == mfq_tensor_backend::kBFloat16 &&
+                state->cache.scalar_type() == mfq_tensor_backend::kBFloat16 &&
                 execution.config.minicpm_fused_qk_norm_rope_kv;
             std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> kv;
             bool attention_token_major = false;
@@ -212,11 +212,11 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                         return minicpm_qk_norm_rope_cache_write_bf16_cuda(
                             q.contiguous(), k.contiguous(), v.contiguous(), q_norm, k_norm,
                             pos.contiguous().to(x.device(), mfq_tensor_backend::kInt64),
-                            write_positions, active_rope.cos, active_rope.sin, cache.k, cache.v,
+                            write_positions, active_rope.cos, active_rope.sin, state->cache.k, state->cache.v,
                             rms_norm_eps, norm_weight_offset);
                     });
-                    kv = {cache.k.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()}),
-                          cache.v.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()})};
+                    kv = {state->cache.k.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()}),
+                          state->cache.v.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()})};
                     return true;
                 },
                 [&](auto &heads) {
@@ -289,10 +289,10 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                     auto &v = heads.value;
                     const bool fused_rope_kv =
                         official_bf16 && x.is_cuda() && write_positions.dim() == 1 &&
-                        pos.dim() == 1 && T == 1 && !cache.is_paged() && !cache.ring &&
+                        pos.dim() == 1 && T == 1 && !state->cache.is_paged() && !state->cache.ring &&
                         active_rope.rotary_dim == 128 && active_rope.sections.numel() == 0 &&
                         nh == 32 && nkh == 8 && hd == 128 &&
-                        cache.scalar_type() == mfq_tensor_backend::kBFloat16 &&
+                        state->cache.scalar_type() == mfq_tensor_backend::kBFloat16 &&
                         execution.config.minicpm_fused_rope_kv;
                     if (!fused_rope_kv)
                         return false;
@@ -301,11 +301,11 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                         return minicpm_bf16_rope_cache_write_cuda(
                             q.contiguous(), k.contiguous(), v.contiguous(),
                             pos.contiguous().to(x.device(), mfq_tensor_backend::kInt64),
-                            write_positions, active_rope.cos, active_rope.sin, cache.k, cache.v,
+                            write_positions, active_rope.cos, active_rope.sin, state->cache.k, state->cache.v,
                             active_rope.rotary_dim);
                     });
-                    kv = {cache.k.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()}),
-                          cache.v.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()})};
+                    kv = {state->cache.k.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()}),
+                          state->cache.v.index({Slice(), Slice(), Slice(0, cache_pos + T), Slice()})};
                     return true;
                 },
                 [&](auto &heads) {
@@ -325,7 +325,7 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                     auto &k = heads.key;
                     auto &v = heads.value;
                     kv = profiler.measure("full.kv_write", [&]() {
-                        return cache.append(execution.config, k, v, write_positions, cache_pos,
+                        return state->cache.append(execution.config, k, v, write_positions, cache_pos,
                                             cache_pos + T, !seq_len.has_value());
                     });
                 },
@@ -547,23 +547,23 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                                 const int64_t meta_float2 = max_blocks * 8 * (2 + hd / 2);
                                 auto cuda = mfq_tensor_backend::TensorOptions().device(
                                     mfq_tensor_backend::kCUDA);
-                                if (!decode_mma_mask.defined() || decode_mma_mask.size(0) != B ||
-                                    decode_mma_mask.size(1) < mask_stride) {
-                                    decode_mma_mask = mfq_tensor_backend::empty(
+                                if (!state->decode_mma_mask.defined() || state->decode_mma_mask.size(0) != B ||
+                                    state->decode_mma_mask.size(1) < mask_stride) {
+                                    state->decode_mma_mask = mfq_tensor_backend::empty(
                                         {B, mask_stride}, cuda.dtype(mfq_tensor_backend::kFloat16));
                                 }
-                                if (!decode_mma_kv_max.defined() || decode_mma_kv_max.numel() < B) {
-                                    decode_mma_kv_max = mfq_tensor_backend::empty(
+                                if (!state->decode_mma_kv_max.defined() || state->decode_mma_kv_max.numel() < B) {
+                                    state->decode_mma_kv_max = mfq_tensor_backend::empty(
                                         {B}, cuda.dtype(mfq_tensor_backend::kInt32));
                                 }
-                                if (!decode_mma_meta.defined() ||
-                                    decode_mma_meta.numel() < 2 * meta_float2) {
-                                    decode_mma_meta = mfq_tensor_backend::empty(
+                                if (!state->decode_mma_meta.defined() ||
+                                    state->decode_mma_meta.numel() < 2 * meta_float2) {
+                                    state->decode_mma_meta = mfq_tensor_backend::empty(
                                         {2 * meta_float2},
                                         cuda.dtype(mfq_tensor_backend::kFloat32));
                                 }
                             };
-                            if (cache.is_paged()) {
+                            if (state->cache.is_paged()) {
                                 const bool split_enabled =
                                     execution.config.attention_decode_split_k;
                                 int64_t parts =
@@ -574,20 +574,20 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                                     parts = decode_attention_parts;
                                 parts = std::min<int64_t>(parts, kDecodeAttentionMaxParts);
                                 a = attention_paged_cache_decode_cuda(
-                                    qh, cache.k_chunk_ptrs, cache.v_chunk_ptrs, cache.page_table,
-                                    seq_len.value(), attn_scale, cache.page_size,
-                                    cache.pages_per_chunk, cache.paged_heads, decode_partial_o,
-                                    decode_partial_m, decode_partial_l, parts, dynamic_parts);
+                                    qh, state->cache.k_chunk_ptrs, state->cache.v_chunk_ptrs, state->cache.page_table,
+                                    seq_len.value(), attn_scale, state->cache.page_size,
+                                    state->cache.pages_per_chunk, state->cache.paged_heads, state->decode_partial_o,
+                                    state->decode_partial_m, state->decode_partial_l, parts, dynamic_parts);
                             } else if (aten_decode_enabled) {
                                 const int64_t visible_len =
                                     sliding ? std::min<int64_t>(attention_window, cache_pos + T)
                                             : cache_pos + T;
                                 auto cached_k =
-                                    cache.k
+                                    state->cache.k
                                         .index({Slice(), Slice(), Slice(0, visible_len), Slice()})
                                         .contiguous();
                                 auto cached_v =
-                                    cache.v
+                                    state->cache.v
                                         .index({Slice(), Slice(), Slice(0, visible_len), Slice()})
                                         .contiguous();
                                 auto mask =
@@ -609,9 +609,9 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                                     std::min<int64_t>(attention_window, planned_len);
                                 prepare_mma_decode_workspace(visible_len, 64);
                                 a = mfq_attention_mma256_swa_decode_cuda(
-                                    q.to(mfq_tensor_backend::kFloat32).contiguous(), cache.k,
-                                    cache.v, seq_len.value(), attn_scale, visible_len,
-                                    decode_mma_mask, decode_mma_kv_max, decode_mma_meta);
+                                    q.to(mfq_tensor_backend::kFloat32).contiguous(), state->cache.k,
+                                    state->cache.v, seq_len.value(), attn_scale, visible_len,
+                                    state->decode_mma_mask, state->decode_mma_kv_max, state->decode_mma_meta);
                                 attention_token_major = true;
                             } else if (!sliding && T == 1 && mma_decode_enabled && nh == 8 * nkh &&
                                        (hd == 256 || hd == 512)) {
@@ -619,17 +619,17 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                                 prepare_mma_decode_workspace(planned_len, kv_tile);
                                 a = hd == 512 ? mfq_attention_mma512_decode_cuda(
                                                     q.to(mfq_tensor_backend::kFloat32).contiguous(),
-                                                    cache.k, cache.v, seq_len.value(), attn_scale,
-                                                    planned_len, decode_mma_mask, decode_mma_kv_max,
-                                                    decode_mma_meta)
+                                                    state->cache.k, state->cache.v, seq_len.value(), attn_scale,
+                                                    planned_len, state->decode_mma_mask, state->decode_mma_kv_max,
+                                                    state->decode_mma_meta)
                                               : mfq_attention_mma256_decode_cuda(
                                                     q.to(mfq_tensor_backend::kFloat32).contiguous(),
-                                                    cache.k, cache.v, seq_len.value(), attn_scale,
-                                                    planned_len, decode_mma_mask, decode_mma_kv_max,
-                                                    decode_mma_meta);
+                                                    state->cache.k, state->cache.v, seq_len.value(), attn_scale,
+                                                    planned_len, state->decode_mma_mask, state->decode_mma_kv_max,
+                                                    state->decode_mma_meta);
                                 attention_token_major = true;
                             } else if (sliding) {
-                                a = attention_cache_swa_planned_cuda(qh, cache.k, cache.v,
+                                a = attention_cache_swa_planned_cuda(qh, state->cache.k, state->cache.v,
                                                                      seq_len.value(), attn_scale,
                                                                      attention_window, planned_len);
                             } else {
@@ -643,15 +643,15 @@ mfq_tensor_backend::Tensor FullBlock::forward_impl(
                                 parts = std::min<int64_t>(parts, kDecodeAttentionMaxParts);
                                 a = decode_attention_parts > 1
                                         ? attention_cache_decode_dynamic_cuda(
-                                              qh, cache.k, cache.v, seq_len.value(), attn_scale,
-                                              decode_partial_o, decode_partial_m, decode_partial_l,
+                                              qh, state->cache.k, state->cache.v, seq_len.value(), attn_scale,
+                                              state->decode_partial_o, state->decode_partial_m, state->decode_partial_l,
                                               parts)
                                     : parts > 1
                                         ? attention_cache_decode_split_cuda(
-                                              qh, cache.k, cache.v, seq_len.value(), attn_scale,
-                                              decode_partial_o, decode_partial_m, decode_partial_l,
+                                              qh, state->cache.k, state->cache.v, seq_len.value(), attn_scale,
+                                              state->decode_partial_o, state->decode_partial_m, state->decode_partial_l,
                                               parts)
-                                        : attention_cache_decode_cuda(qh, cache.k, cache.v,
+                                        : attention_cache_decode_cuda(qh, state->cache.k, state->cache.v,
                                                                       seq_len.value(), attn_scale);
                             }
                         } else {

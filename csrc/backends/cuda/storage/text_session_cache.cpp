@@ -445,17 +445,17 @@ void restore_session_prefix_tensor(mfq_tensor_backend::Tensor &target,
 
 FullBlockSessionState capture_full_attention_session_state(const FullBlock &block,
                                                            int64_t cache_pos, size_t &bytes) {
-    if (!block.cache.k.defined() || !block.cache.v.defined() || block.cache.k.dim() != 4 ||
-        block.cache.v.sizes() != block.cache.k.sizes() || block.cache.k.size(0) != 1) {
+    if (!block.state->cache.k.defined() || !block.state->cache.v.defined() || block.state->cache.k.dim() != 4 ||
+        block.state->cache.v.sizes() != block.state->cache.k.sizes() || block.state->cache.k.size(0) != 1) {
         throw std::runtime_error("full-attention KV cache is unavailable");
     }
     FullBlockSessionState state;
-    state.capacity = block.cache.k.size(2);
-    state.ring = block.cache.ring;
+    state.capacity = block.state->cache.k.size(2);
+    state.ring = block.state->cache.ring;
     const int64_t saved_tokens =
         state.ring ? state.capacity : std::min<int64_t>(cache_pos, state.capacity);
-    state.k = block.cache.k.narrow(2, 0, saved_tokens).clone();
-    state.v = block.cache.v.narrow(2, 0, saved_tokens).clone();
+    state.k = block.state->cache.k.narrow(2, 0, saved_tokens).clone();
+    state.v = block.state->cache.v.narrow(2, 0, saved_tokens).clone();
     bytes += session_tensor_bytes(state.k);
     bytes += session_tensor_bytes(state.v);
     return state;
@@ -467,7 +467,7 @@ void restore_full_attention_session_state(FullBlock &block, const FullBlockSessi
         state.k.size(2) > state.capacity) {
         throw CudaSessionStateError("full-attention session KV layout is invalid");
     }
-    restore_session_prefix_tensor(block.cache.k, state.k, 2, state.capacity);
-    restore_session_prefix_tensor(block.cache.v, state.v, 2, state.capacity);
-    block.cache.ring = state.ring;
+    restore_session_prefix_tensor(block.state->cache.k, state.k, 2, state.capacity);
+    restore_session_prefix_tensor(block.state->cache.v, state.v, 2, state.capacity);
+    block.state->cache.ring = state.ring;
 }

@@ -523,7 +523,7 @@ static int run_qwen35_mtp_check(
         for (auto& block : model.blocks) {
             if (auto* linear = dynamic_cast<
                     mfq::cuda::qwen35::LinearAttentionBlock*>(block.get()))
-                states.emplace_back(linear->conv_state.clone(), linear->gdn_state.clone());
+                states.emplace_back(linear->state->conv_state.clone(), linear->state->gdn_state.clone());
         }
         model.reset(1);
         (void)model.hidden_forward(ids(prompt));
@@ -560,8 +560,8 @@ static int run_qwen35_mtp_check(
                     mfq::cuda::qwen35::LinearAttentionBlock*>(block.get())) {
                 const auto conv_label = "conv_continuation_" + std::to_string(state);
                 const auto gdn_label = "gdn_continuation_" + std::to_string(state);
-                compare(states[state].first, linear->conv_state, .002, conv_label.c_str());
-                compare(states[state].second, linear->gdn_state, .002, gdn_label.c_str());
+                compare(states[state].first, linear->state->conv_state, .002, conv_label.c_str());
+                compare(states[state].second, linear->state->gdn_state, .002, gdn_label.c_str());
                 ++state;
             }
         }

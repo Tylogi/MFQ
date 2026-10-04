@@ -98,11 +98,11 @@ std::unique_ptr<::Block> load_block(CudaExecutionContext &execution, const mfq::
 }
 
 void LinearAttentionBlock::clear_speculative() noexcept {
-    speculative_recurrent = LinearRecurrentInputs();
-    speculative_start = -1;
-    speculative_confirmed = 0;
-    speculative_tokens = 0;
-    speculative_pending = false;
+    state->speculative_recurrent = LinearRecurrentInputs();
+    state->speculative_start = -1;
+    state->speculative_confirmed = 0;
+    state->speculative_tokens = 0;
+    state->speculative_pending = false;
 }
 
 mfq_tensor_backend::Tensor LinearAttentionBlock::forward_context(CudaExecutionContext &execution,
@@ -112,37 +112,37 @@ mfq_tensor_backend::Tensor LinearAttentionBlock::forward_context(CudaExecutionCo
     if (context.confirmed_prefix == 0) {
         return Block::forward_context(execution, std::move(input), context, rope);
     }
-    MFQ_RUNTIME_CHECK(input.is_cuda() && !speculative_pending && context.confirmed_prefix > 0 &&
-                          context.confirmed_prefix < input.size(1) && conv_state.defined() &&
-                          gdn_state.defined(),
+    MFQ_RUNTIME_CHECK(input.is_cuda() && !state->speculative_pending && context.confirmed_prefix > 0 &&
+                          context.confirmed_prefix < input.size(1) && state->conv_state.defined() &&
+                          state->gdn_state.defined(),
                       "invalid Qwen3.5 speculative linear-attention transaction");
 
-    if (!speculative_conv.defined() || speculative_conv.sizes() != conv_state.sizes() ||
-        !speculative_gdn.defined() || speculative_gdn.sizes() != gdn_state.sizes()) {
-        speculative_conv = conv_state.clone();
-        speculative_gdn = gdn_state.clone();
+    if (!state->speculative_conv.defined() || state->speculative_conv.sizes() != state->conv_state.sizes() ||
+        !state->speculative_gdn.defined() || state->speculative_gdn.sizes() != state->gdn_state.sizes()) {
+        state->speculative_conv = state->conv_state.clone();
+        state->speculative_gdn = state->gdn_state.clone();
     } else {
-        speculative_conv.copy_(conv_state);
-        speculative_gdn.copy_(gdn_state);
+        state->speculative_conv.copy_(state->conv_state);
+        state->speculative_gdn.copy_(state->gdn_state);
     }
-    speculative_start = context.cache_position;
-    speculative_confirmed = context.confirmed_prefix;
-    speculative_tokens = input.size(1);
-    speculative_pending = true;
+    state->speculative_start = context.cache_position;
+    state->speculative_confirmed = context.confirmed_prefix;
+    state->speculative_tokens = input.size(1);
+    state->speculative_pending = true;
 
     try {
         // Match Metal: evaluate the complete [confirmed, drafts...] window
         // once so projections and FFN stay batched. Rollback replays only the
         // recurrent state prefix from this layer's retained projections.
         auto attention =
-            forward_attention_cuda(execution, std::move(input), &speculative_recurrent);
+            forward_attention_cuda(execution, std::move(input), &state->speculative_recurrent);
         auto result = forward_ffn_cuda(execution, std::move(attention[0]), std::move(attention[1]));
         ++speculative_projection_batches;
         ++speculative_ffn_batches;
         return result;
     } catch (...) {
-        conv_state.copy_(speculative_conv);
-        gdn_state.copy_(speculative_gdn);
+        state->conv_state.copy_(state->speculative_conv);
+        state->gdn_state.copy_(state->speculative_gdn);
         clear_speculative();
         throw;
     }
@@ -151,17 +151,17 @@ mfq_tensor_backend::Tensor LinearAttentionBlock::forward_context(CudaExecutionCo
 void LinearAttentionBlock::commit_speculative() noexcept { clear_speculative(); }
 
 void LinearAttentionBlock::rollback_speculative(int64_t keep_position) {
-    MFQ_RUNTIME_CHECK(speculative_pending &&
-                          keep_position >= speculative_start + speculative_confirmed &&
-                          keep_position < speculative_start + speculative_tokens,
+    MFQ_RUNTIME_CHECK(state->speculative_pending &&
+                          keep_position >= state->speculative_start + state->speculative_confirmed &&
+                          keep_position < state->speculative_start + state->speculative_tokens,
                       "invalid Qwen3.5 speculative rollback position");
-    const int64_t retained = keep_position - speculative_start;
-    conv_state.copy_(speculative_conv);
-    gdn_state.copy_(speculative_gdn);
+    const int64_t retained = keep_position - state->speculative_start;
+    state->conv_state.copy_(state->speculative_conv);
+    state->gdn_state.copy_(state->speculative_gdn);
     try {
         // Restore only convolution/GDN state from the retained projected
         // rows; target projections, output projection and FFN are not rerun.
-        replay_recurrent_cuda(speculative_recurrent, retained);
+        replay_recurrent_cuda(state->speculative_recurrent, retained);
         clear_speculative();
     } catch (...) {
         clear_speculative();
@@ -198,13 +198,13 @@ TextSessionState capture_text_session_state(const std::vector<std::unique_ptr<::
             saved.full_attention =
                 capture_full_attention_session_state(*full, cache_position, state.bytes);
         } else if (const auto *linear = dynamic_cast<const LinearAttentionBlock *>(block.get())) {
-            if (linear->speculative_pending || !linear->conv_state.defined() ||
-                !linear->gdn_state.defined()) {
+            if (linear->state->speculative_pending || !linear->state->conv_state.defined() ||
+                !linear->state->gdn_state.defined()) {
                 throw std::runtime_error("Qwen recurrent session state is unavailable");
             }
             saved.kind = HybridBlockSessionStateKind::Recurrent;
-            saved.convolution_state = linear->conv_state.clone();
-            saved.recurrent_state = linear->gdn_state.clone();
+            saved.convolution_state = linear->state->conv_state.clone();
+            saved.recurrent_state = linear->state->gdn_state.clone();
             state.bytes += session_tensor_bytes(saved.convolution_state);
             state.bytes += session_tensor_bytes(saved.recurrent_state);
         } else {
@@ -255,10 +255,10 @@ void restore_text_session_state(std::vector<std::unique_ptr<::Block>> &blocks,
             saved.recurrent_state.get_device() != block->cuda_device) {
             throw CudaSessionStateError("Qwen recurrent session topology changed");
         }
-        restore_session_tensor(linear->conv_state, saved.convolution_state);
-        restore_session_tensor(linear->gdn_state, saved.recurrent_state);
-        linear->speculative_conv = mfq_tensor_backend::Tensor();
-        linear->speculative_gdn = mfq_tensor_backend::Tensor();
+        restore_session_tensor(linear->state->conv_state, saved.convolution_state);
+        restore_session_tensor(linear->state->gdn_state, saved.recurrent_state);
+        linear->state->speculative_conv = mfq_tensor_backend::Tensor();
+        linear->state->speculative_gdn = mfq_tensor_backend::Tensor();
         linear->clear_speculative();
     }
 }

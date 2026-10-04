@@ -9,6 +9,7 @@
 #include <vector>
 
 struct CudaExecutionContext;
+struct FullAttentionState;
 
 namespace mfq::models::qwen35 {
 template <class Backend> struct CausalLm;
@@ -29,13 +30,10 @@ struct QwenPagedKvSequence {
 
 namespace mfq::cuda::qwen35 {
 
+struct LinearAttentionState;
 struct QwenBatchLayerState {
-    enum class Kind { FullAttention, Recurrent };
-    Kind kind = Kind::FullAttention;
-    mfq_tensor_backend::Tensor first;
-    mfq_tensor_backend::Tensor second;
-    bool ring = false;
-    bool paged = false;
+    std::shared_ptr<FullAttentionState> full;
+    std::shared_ptr<LinearAttentionState> recurrent;
 };
 
 struct QwenBatchState {

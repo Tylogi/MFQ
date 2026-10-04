@@ -10,6 +10,7 @@
 #include "models/minicpmo45/tts.h"
 #include "models/qwen35/linear_attention.h"
 #include "models/qwen35/ops.h"
+#include "models/qwen35/batch_state.h"
 #include "storage/session_state.h"
 #include "../ops/moe.h"
 #include "storage/mfe_expert_store.h"
@@ -66,10 +67,10 @@ static void check_graph_warmup_state() {
     auto block = std::make_unique<qwen35::LinearAttentionBlock>();
     auto* recurrent = block.get();
     const auto options = TensorOptions().device(kCUDA).dtype(kFloat32);
-    recurrent->conv_state = ones({2}, options);
-    recurrent->gdn_state = ones({3}, options);
-    const auto* conv_address = recurrent->conv_state.data_ptr();
-    const auto* gdn_address = recurrent->gdn_state.data_ptr();
+    recurrent->state->conv_state = ones({2}, options);
+    recurrent->state->gdn_state = ones({3}, options);
+    const auto* conv_address = recurrent->state->conv_state.data_ptr();
+    const auto* gdn_address = recurrent->state->gdn_state.data_ptr();
     model.blocks.push_back(std::move(block));
     model.cache_pos = 5;
     for (bool fail : {false, true}) {
@@ -79,20 +80,20 @@ static void check_graph_warmup_state() {
         try {
             prepare_decode_graph_memory(model, graph, [&] {
                 ++calls;
-                recurrent->conv_state.zero_();
-                recurrent->gdn_state.zero_();
+                recurrent->state->conv_state.zero_();
+                recurrent->state->gdn_state.zero_();
                 if (fail) throw std::runtime_error("warmup failed");
             });
         } catch (const std::runtime_error&) { threw = true; }
         check(threw == fail && calls == (fail ? 1 : 2), "graph warmup execution changed");
-        check(model.cache_pos == 5 && recurrent->conv_state.data_ptr() == conv_address &&
-                  recurrent->gdn_state.data_ptr() == gdn_address,
+        check(model.cache_pos == 5 && recurrent->state->conv_state.data_ptr() == conv_address &&
+                  recurrent->state->gdn_state.data_ptr() == gdn_address,
               "graph warmup changed persistent state addresses");
-        check(recurrent->conv_state.sum().item<float>() == 2 &&
-                  recurrent->gdn_state.sum().item<float>() == 3,
+        check(recurrent->state->conv_state.sum().item<float>() == 2 &&
+                  recurrent->state->gdn_state.sum().item<float>() == 3,
               "graph warmup did not restore recurrent state");
     }
-    recurrent->speculative_pending = true;
+    recurrent->state->speculative_pending = true;
     bool rejected = false;
     try { (void)recurrent->graph_warmup_state(); }
     catch (const std::exception&) { rejected = true; }
@@ -481,11 +482,38 @@ static void check_linear_execution() {
     }
 }
 
+static void check_batch_state_ownership() {
+    CudaExecutionContext execution;
+    CudaExecutionScope scope(execution);
+    Qwen35CausalLm model; model.execution = &execution;
+    auto block = std::make_unique<FullBlock>();
+    auto* full = block.get(); model.blocks.push_back(std::move(block));
+    qwen35::Qwen35BatchStateAdapter adapter(model, 2, false);
+    qwen35::QwenBatchRequestState first, second;
+    adapter.prepare_prefill(first, 0, 2);
+    full->state->cache = KVCache(1, 1, 8, 4);
+    adapter.activate(first); adapter.resume_decode(2);
+    auto decode = full->state;
+    decode->decode_partial_o = mfq_tensor_backend::ones({4}, decode->cache.k.options());
+    const auto* workspace = decode->decode_partial_o.data_ptr();
+    adapter.suspend_decode(); adapter.prepare_prefill(second, 0, 2);
+    full->state->cache = KVCache(1, 1, 8, 4);
+    check(full->state != decode, "prefill reused live decode state");
+    adapter.pause_prefill(second); adapter.resume_decode(2);
+    check(full->state == decode && full->state->decode_partial_o.data_ptr() == workspace,
+          "state binding discarded decode workspace");
+    adapter.suspend_decode(); adapter.discard_prefill(second); adapter.resume_decode(2);
+    check(full->state == decode && decode->decode_partial_o.sum().item<float>() == 4,
+          "cancelled prefill corrupted decode state");
+    adapter.release(first); adapter.finish_retire(0);
+    check(first.slot() == -1 && second.slot() == -1, "request retained a retired slot");
+}
+
 static void check_snapshots(CudaExecutionContext& execution, bool hybrid) {
     Qwen35CausalLm model;
     model.execution = &execution;
     auto full = std::make_unique<FullBlock>();
-    full->cache = KVCache(1, 1, 8, 4);
+    full->state->cache = KVCache(1, 1, 8, 4);
     model.blocks.push_back(std::move(full));
     if (hybrid) {
         auto linear = std::make_unique<qwen35::LinearAttentionBlock>();
@@ -495,8 +523,8 @@ static void check_snapshots(CudaExecutionContext& execution, bool hybrid) {
         config.linear_key_head_dim = config.linear_value_head_dim = 2;
         const auto options = mfq_tensor_backend::TensorOptions()
             .device(mfq_tensor_backend::kCUDA).dtype(mfq_tensor_backend::kFloat32);
-        linear->conv_state = mfq_tensor_backend::zeros({1, 1, 6}, options);
-        linear->gdn_state = mfq_tensor_backend::zeros({1, 1, 2, 2}, options);
+        linear->state->conv_state = mfq_tensor_backend::zeros({1, 1, 6}, options);
+        linear->state->gdn_state = mfq_tensor_backend::zeros({1, 1, 2, 2}, options);
         model.blocks.push_back(std::move(linear));
     }
     model.cache_pos = 2;
@@ -681,6 +709,7 @@ int main(int argc, char** argv) try {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     check_sampling_storage();
+    check_batch_state_ownership();
     check_linear_execution();
     check_graph_warmup_state();
     check_dense_loading();
