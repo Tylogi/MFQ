@@ -642,8 +642,6 @@ template <
     uint VECTOR_SIZE,
     uint MATRIX_ROWS,
     uint EXECUTION_LAYOUT,
-    uint PACKED_LAYOUT = 0u,
-    bool WORD_RECORDS = false,
     typename XStream,
     typename IndexStream,
     typename StateStream,
@@ -680,9 +678,6 @@ inline void mfq_moe_jsc_profile(
     uint k_size,
     uint execution_layout
 ) {
-    if constexpr (PACKED_LAYOUT != 0u) {
-        execution_layout = PACKED_LAYOUT;
-    }
     constexpr uint VECTOR_SHIFT =
         VECTOR_SIZE == 4u ? 2u : 3u;
     constexpr uint BYTES_PER_SIGN =
@@ -720,9 +715,8 @@ inline void mfq_moe_jsc_profile(
                     state_byte >> ((state_index & 1u) * 4u)
                 ) & 15u;
             }
-            selected_code_banks[row] = PACKED_LAYOUT == 6u
-                ? 0u
-                : uint(state_bank_stream[state_bank_offset + state]);
+            selected_code_banks[row] = uint(
+                state_bank_stream[state_bank_offset + state]);
             weight_scales[row] =
                 row_anchors[row]
                 * scale_stream[scale_offset + state];
@@ -752,22 +746,7 @@ inline void mfq_moe_jsc_profile(
                 uint index0;
                 uint index1 = 0u;
                 uint sign_value;
-                if constexpr (PACKED_LAYOUT == 6u) {
-                    uint execution_offset = indices_offset + (
-                        outputs[row] * signs + column_base / 8u) * 4u;
-                    uint record;
-                    if constexpr (WORD_RECORDS) {
-                        record = mfq_moe_load_record4(indices_stream, execution_offset);
-                    } else {
-                        record = uint(indices_stream[execution_offset])
-                            | (uint(indices_stream[execution_offset + 1u]) << 8u)
-                            | (uint(indices_stream[execution_offset + 2u]) << 16u)
-                            | (uint(indices_stream[execution_offset + 3u]) << 24u);
-                    }
-                    index0 = record & 4095u;
-                    index1 = (record >> 12u) & 4095u;
-                    sign_value = record >> 24u;
-                } else if (EXECUTION_LAYOUT != 0u && execution_layout == 2u) {
+                if (EXECUTION_LAYOUT != 0u && execution_layout == 2u) {
                     uint2 record = group_records[row];
                     uint segment = sign_block == 0u
                         ? record.x & 0xfffffu
@@ -867,6 +846,78 @@ inline void mfq_moe_jsc_profile(
                     accumulators[row]);
             }
         }
+    }
+}
+
+template <uint MATRIX_ROWS, uint K, uint K_LANES, bool EXPANSION,
+          typename XStream, typename IndexStream, typename StateStream,
+          typename ScaleStream, typename CodebookStream>
+inline void mfq_moe_nvq3jl_profile(
+    XStream x,
+    IndexStream indices,
+    StateStream states,
+    ScaleStream scales,
+    CodebookStream codebooks,
+    thread const uint* outputs,
+    thread const float* anchors,
+    thread float* accumulators,
+    uint x_offset,
+    uint indices_offset,
+    uint state_offset,
+    uint scale_offset,
+    uint codebook_offset,
+    uint k_lane
+) {
+    constexpr uint GROUPS = (K + 23u) / 24u;
+    constexpr uint SIGNS = (K + 7u) / 8u;
+    constexpr bool FLAT_RECORDS = EXPANSION;
+    constexpr uint WORK = FLAT_RECORDS ? SIGNS : GROUPS;
+    uint state_rows[MATRIX_ROWS];
+    uint state_shifts[MATRIX_ROWS];
+    for (uint row = 0u; row < MATRIX_ROWS; ++row) {
+        state_rows[row] = outputs[row] * GROUPS;
+        state_shifts[row] = ((state_rows[row] + k_lane) & 1u) * 4u;
+    }
+    #pragma clang loop unroll_count(2)
+    for (uint work = k_lane; work < WORK; work += K_LANES) {
+        uint group = FLAT_RECORDS ? work / 3u : work;
+        float weight_scales[MATRIX_ROWS];
+        for (uint row = 0u; row < MATRIX_ROWS; ++row) {
+            uint state_index = state_rows[row] + group;
+            uint shift = FLAT_RECORDS ? (state_index & 1u) * 4u : state_shifts[row];
+            uint state = (uint(states[state_offset + (state_index >> 1u)])
+                >> shift) & 15u;
+            weight_scales[row] = scales[scale_offset + state];
+        }
+        for (uint block = 0u; block < (FLAT_RECORDS ? 1u : 3u); ++block) {
+            uint record_index = FLAT_RECORDS ? work : group * 3u + block;
+            uint column = record_index * 8u;
+            if (column >= K) break;
+            uint input = x_offset + column;
+            float4 activation0 = float4(float(x[input]), float(x[input + 1u]),
+                float(x[input + 2u]), float(x[input + 3u]));
+            float4 activation1 = column + 4u >= K ? float4(0.0f) : float4(
+                float(x[input + 4u]), float(x[input + 5u]),
+                float(x[input + 6u]), float(x[input + 7u]));
+            for (uint row = 0u; row < MATRIX_ROWS; ++row) {
+                uint offset = indices_offset + (outputs[row] * SIGNS + record_index) * 4u;
+                uint record = mfq_moe_load_record4(indices, offset);
+                uint index0 = record & 4095u;
+                uint index1 = (record >> 12u) & 4095u;
+                uint sign = record >> 24u;
+                float4 code0 = mfq_moe_load_code4(codebooks, codebook_offset + index0 * 4u);
+                float4 code1 = mfq_moe_load_code4(codebooks, codebook_offset + index1 * 4u);
+                code0 = select(code0, -code0, bool4((sign & 1u) != 0u,
+                    (sign & 2u) != 0u, (sign & 4u) != 0u, (sign & 8u) != 0u));
+                code1 = select(code1, -code1, bool4((sign & 16u) != 0u,
+                    (sign & 32u) != 0u, (sign & 64u) != 0u, (sign & 128u) != 0u));
+                float value = dot(activation0, code0) + dot(activation1, code1);
+                accumulators[row] = fma(weight_scales[row], value, accumulators[row]);
+            }
+        }
+    }
+    for (uint row = 0u; row < MATRIX_ROWS; ++row) {
+        accumulators[row] *= anchors[row];
     }
 }
 )METAL";
@@ -1421,15 +1472,11 @@ constexpr const char* kMoeSource = R"METAL(
             // vectorized 24-column decoder instead of falling through to the
             // scalar, fully generic VQ loop.
             if (cohort_execution_layout == 6u) {
-                mfq_moe_jsc_profile<4u, MATRIX_ROWS, VQ_EXECUTION_LAYOUT, 6u,
-                    SHARED_INPUT != 0 && K_LANES == 16>(
-                    x, vq_indices, vq_state, vq_aux, vq_scales,
-                    vq_state_to_codebank, vq_codebooks, x_offset,
-                    outputs, row_anchors, accumulators, groups, vectors,
-                    index_bits, entries, indices_offset, state_offset,
-                    aux_offset, codebook_offset, scale_offset,
-                    state_bank_offset, signs, k_lane, K_LANES, uint(K),
-                    cohort_execution_layout);
+                mfq_moe_nvq3jl_profile<MATRIX_ROWS, uint(K), K_LANES,
+                    (OUT > K)>(
+                    x, vq_indices, vq_state, vq_scales, vq_codebooks,
+                    outputs, row_anchors, accumulators, x_offset,
+                    indices_offset, state_offset, scale_offset, codebook_offset, k_lane);
             } else {
                 mfq_moe_jsc_profile<4u, MATRIX_ROWS, VQ_EXECUTION_LAYOUT>(
                     x, vq_indices, vq_state, vq_aux, vq_scales,
@@ -3509,7 +3556,7 @@ struct MfeNintDecodeConfig {
     int shared_gate_groups = 0;
     int shared_down_group_size = 0;
     int shared_down_groups = 0;
-    int k_lanes = 8;
+    int k_lanes = 16;
     int down_rows_per_simd = 1;
     int stage_one_workgroups = 0;
     int stage_two_workgroups = 0;
@@ -4029,7 +4076,7 @@ std::string make_mxfp4_decode_reduce_source(
         << "constexpr uint ROWS_PER_LANE_GROUP = "
         << config.rows_per_lane_group << "u;\n"
         << R"METAL(
-    constexpr uint K_LANES = 8u;
+    constexpr uint K_LANES = 16u;
     constexpr uint LANE_GROUPS = 32u / K_LANES;
     constexpr uint OUTPUTS_PER_TG = LANE_GROUPS * ROWS_PER_LANE_GROUP;
     threadgroup float route_outputs[ROUTES * OUTPUTS_PER_TG];
@@ -4317,7 +4364,7 @@ std::string make_mxfp4_pair_swiglu_source(
         << "constexpr uint DESCRIPTOR_SIZE = "
         << config.descriptor_size << "u;\n"
         << R"METAL(
-    constexpr uint K_LANES = 8u;
+    constexpr uint K_LANES = 16u;
     constexpr uint LANE_GROUPS = 32u / K_LANES;
     constexpr uint SIMD_GROUPS = 2u;
     constexpr uint OUTPUTS_PER_TG = LANE_GROUPS * SIMD_GROUPS;
@@ -4360,36 +4407,30 @@ std::string make_mxfp4_pair_swiglu_source(
             + ulong(bounded_output);
 
         for (uint group = 0u; group < groups; ++group) {
-            const uint column = group * 32u + k_lane * 4u;
-            const vec<T, 4> raw_activations = *reinterpret_cast<
-                device const vec<T, 4>*>(x + token * K + column);
-            const float4 activations = float4(raw_activations);
+            const uint column = group * 32u + k_lane * 2u;
+            const vec<T, 2> raw_activations = *reinterpret_cast<
+                device const vec<T, 2>*>(x + token * K + column);
+            const float2 activations = float2(raw_activations);
             const ulong gate_packed_offset = ulong(gate_value_offset)
                 + gate_pool_output * (ulong(K) >> 1u)
                 + (ulong(column) >> 1u);
             const ulong up_packed_offset = ulong(up_value_offset)
                 + up_pool_output * (ulong(K) >> 1u)
                 + (ulong(column) >> 1u);
-            const uchar2 gate_codes = *reinterpret_cast<
-                device const uchar2*>(gate_values + gate_packed_offset);
-            const uchar2 up_codes = *reinterpret_cast<
-                device const uchar2*>(up_values + up_packed_offset);
+            const uchar gate_codes = gate_values[gate_packed_offset];
+            const uchar up_codes = up_values[up_packed_offset];
             const float gate_scale = decode_e8m0(gate_scales[
                 ulong(gate_scale_offset)
                     + gate_pool_output * ulong(groups) + ulong(group)]);
             const float up_scale = decode_e8m0(up_scales[
                 ulong(up_scale_offset)
                     + up_pool_output * ulong(groups) + ulong(group)]);
-            const float4 gate_weights = gate_scale * float4(
-                MXFP4_LUT[uint(gate_codes.x & 15u)],
-                MXFP4_LUT[uint(gate_codes.x >> 4u)],
-                MXFP4_LUT[uint(gate_codes.y & 15u)],
-                MXFP4_LUT[uint(gate_codes.y >> 4u)]);
-            const float4 up_weights = up_scale * float4(
-                MXFP4_LUT[uint(up_codes.x & 15u)],
-                MXFP4_LUT[uint(up_codes.x >> 4u)],
-                MXFP4_LUT[uint(up_codes.y & 15u)],
-                MXFP4_LUT[uint(up_codes.y >> 4u)]);
+            const float2 gate_weights = gate_scale * float2(
+                MXFP4_LUT[uint(gate_codes & 15u)],
+                MXFP4_LUT[uint(gate_codes >> 4u)]);
+            const float2 up_weights = up_scale * float2(
+                MXFP4_LUT[uint(up_codes & 15u)],
+                MXFP4_LUT[uint(up_codes >> 4u)]);
             gate_accumulator += dot(activations, gate_weights);
             up_accumulator += dot(activations, up_weights);
         }
@@ -8575,9 +8616,7 @@ struct MlxMfeWeight::Impl {
             "MFQ_METAL_MFE_K_LANES");
         if (k_lanes_env != nullptr) {
             const auto value = std::string_view(k_lanes_env);
-            if (value == "8") {
-                k_lanes_override = 8;
-            } else if (value == "16") {
+            if (value == "16") {
                 k_lanes_override = 16;
             } else if (value == "32") {
                 k_lanes_override = 32;
@@ -10301,9 +10340,9 @@ array MlxMfeWeight::routed_swiglu_pair(
         && impl_->rotations.empty()
         && up.impl_->rotations.empty()
         && (impl_->k_lanes_override == 0
-            || impl_->k_lanes_override == 8)
+            || impl_->k_lanes_override == 16)
         && (up.impl_->k_lanes_override == 0
-            || up.impl_->k_lanes_override == 8)
+            || up.impl_->k_lanes_override == 16)
         && input.ndim() == 2
         && expert_ids.ndim() == 2
         && input.shape(0) >= 1
@@ -10338,7 +10377,7 @@ array MlxMfeWeight::routed_swiglu_pair(
         mlx::core::astype(expert_ids, mlx::core::int32));
     const int tokens = ids.shape(0);
     const int routes = ids.shape(1);
-    constexpr int kOutputsPerWorkgroup = 8;
+    constexpr int kOutputsPerWorkgroup = 4;
     const auto output_tiles =
         (static_cast<std::size_t>(impl_->out_per_expert)
              + kOutputsPerWorkgroup - 1u)
@@ -10458,7 +10497,7 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
 
     const int decode_k_lanes = impl_->k_lanes_override != 0
         ? impl_->k_lanes_override
-        : apple_m5_family() ? 16 : 8;
+        : 16;
     constexpr int kGateRowsPerSimd = 1;
     const int gate_rows_per_workgroup =
         (32 / decode_k_lanes) * kGateRowsPerSimd;
@@ -10548,7 +10587,7 @@ bool MlxMfeWeight::supports_fused_routed_reduce() const noexcept {
         && impl_->family_mask == (std::uint32_t{1} << kFamilyMxfp4)
         && impl_->projections == 1
         && impl_->rotations.empty()
-        && (impl_->k_lanes_override == 0 || impl_->k_lanes_override == 8)
+        && (impl_->k_lanes_override == 0 || impl_->k_lanes_override == 16)
         && impl_->out_per_expert > 0
         && impl_->neuron_len > 0
         && impl_->neuron_len % 32 == 0
@@ -10599,7 +10638,7 @@ array MlxMfeWeight::routed_matmul_reduce(
     const int rows_per_lane_group =
         mxfp4_decode_down_reduce_rows();
     const int outputs_per_workgroup =
-        4 * rows_per_lane_group;
+        2 * rows_per_lane_group;
     const int workgroups = checked_int(
         checked_product(
             static_cast<std::size_t>(tokens),
@@ -11680,12 +11719,7 @@ array MlxMfeWeight::routed_matmul_impl(
         fused_swiglu && impl_->projections == 2;
     const int k_lanes = impl_->k_lanes_override != 0
         ? impl_->k_lanes_override
-        : (fused_swiglu
-            && !split_fused_swiglu
-            && impl_->family_mask !=
-                (std::uint32_t{1} << kFamilyMxfp4)
-            ? 16
-            : 8);
+        : 16;
     // Two rows reuse activation loads on the measured M5 mixed NINT/VQ
     // 640 -> 2560 decode geometry. Do not apply this to the inverse gate/up
     // projection: its larger K/register footprint regresses some cohorts.
@@ -11702,7 +11736,6 @@ array MlxMfeWeight::routed_matmul_impl(
         ? 1
         : tokens == 1
             && impl_->rotations.empty()
-            && k_lanes == 8
         ? mfe_decode_rows_per_simd(automatic_rows)
         : 1;
     const auto rows_per_workgroup = static_cast<std::size_t>(
