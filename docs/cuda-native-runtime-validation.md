@@ -73,6 +73,26 @@ Execution policy environment variables are parsed when a
 reconfigure an existing Engine. Diagnostic A/B paths must override the target
 Engine's config directly or construct a fresh Engine.
 
+### SSD-backed mixed experts on Linux
+
+With `--moe-gpu-cache-gb`, `MFQ_MOE_SSD_CACHE_DIR=/path/on/ssd` puts
+NINT/NVQ and other cacheable packed expert fields in temporary file mappings.
+This avoids retaining the whole expert model in anonymous RAM. MXFP4 keeps
+its existing direct MFQ range reader. Choose an SSD directory, not a RAM disk;
+allow space for another copy of the packed runtime expert fields. Files are
+unlinked immediately and released with their last tensor view.
+
+Loading still converts one projection at a time. Cache misses copy selected
+experts through bounded pinned staging; `MFQ_MOE_MAPPED_GATHER` is disabled for
+these mappings so CUDA cannot pin the whole model. Prefill uses the cache when
+its selected experts fit, otherwise it stages one full projection. Statistics
+report `file_backed_bytes` separately from retained `host_bytes`; resident file
+pages are reclaimable OS cache and may still appear in process RSS.
+
+`mfq-moe-host-store-test` checks exact bytes, offsets, empty fields, view
+lifetime and invalid layouts. Validate a real model's generation and peak RAM
+separately; an individual projection check does not prove full-model parity.
+
 Run the model-backed scheduler and execution-isolation gates on a machine with
 enough device memory. The second command loads and generates with two complete
 engines concurrently and compares each result with its serial oracle:

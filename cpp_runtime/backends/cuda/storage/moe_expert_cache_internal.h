@@ -29,7 +29,9 @@ public:
             MFQ_CUDA_CHECK(cudaEventCreateWithFlags(
                 &stage.done, cudaEventDisableTiming));
         }
-        mapped_gather_enabled_ = config.moe_mapped_gather;
+        ssd_cache_dir_ = config.moe_ssd_cache_dir;
+        // File-backed pages must stay reclaimable, never pin the whole model.
+        mapped_gather_enabled_ = config.moe_mapped_gather && ssd_cache_dir_.empty();
         mapped_copy_blocks_ = config.moe_mapped_copy_blocks;
         range_read_pool_ =
             std::make_unique<mfq::cuda::MfeMxfp4ReadPool>(
@@ -185,6 +187,10 @@ public:
 
     int64_t allocated_bytes() const noexcept {
         return allocated_bytes_;
+    }
+
+    bool file_backed_sources() const noexcept {
+        return !ssd_cache_dir_.empty();
     }
 
     const uint8_t * register_mapped_field(
@@ -363,6 +369,7 @@ public:
                << " budget_bytes=" << budget_bytes_
                << " allocated_bytes=" << allocated_bytes_
                << " host_bytes=" << host_bytes_
+               << " file_backed_bytes=" << file_backed_bytes_
                << " demand_hits=" << stats_.demand_hits
                << " demand_misses=" << stats_.demand_misses
                << " prefetch_hits=" << stats_.prefetch_hits
@@ -742,6 +749,8 @@ private:
     int64_t budget_bytes_ = 0;
     int64_t allocated_bytes_ = 0;
     int64_t host_bytes_ = 0;
+    int64_t file_backed_bytes_ = 0;
+    std::string ssd_cache_dir_;
     bool finalized_ = false;
     bool prewarming_ = false;
     cudaStream_t weight_stream_ = nullptr;

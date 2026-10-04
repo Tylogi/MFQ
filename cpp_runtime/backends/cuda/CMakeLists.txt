@@ -177,6 +177,9 @@ if(BUILD_TESTING)
 
     mfq_add_cuda_test(mfq-cuda-context-test
         ${MFQ_CUDA_ROOT}/tests/mfq_cuda_context_test.cu)
+    mfq_add_cuda_test(mfq-moe-host-store-test
+        ${MFQ_CUDA_ROOT}/tests/mfq_moe_host_store_test.cpp)
+    target_compile_definitions(mfq-moe-host-store-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     mfq_add_cuda_test(mfq-cuda-activation-test
         ${MFQ_CUDA_ROOT}/tests/mfq_cuda_activation_test.cu
         mfq-cuda-native-kernels)

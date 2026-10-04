@@ -1,4 +1,5 @@
 #include "moe_cached_source_internal.h"
+#include "moe_host_store.h"
 
 std::shared_ptr<MoeCachedSource> MoeExpertCache::register_source(
         const std::string & name,
@@ -7,10 +8,24 @@ std::shared_ptr<MoeCachedSource> MoeExpertCache::register_source(
         int layer_id,
         std::string projection_role) {
     const int id = static_cast<int>(sources_.size());
+    int64_t spilled_bytes = 0;
+    if (!ssd_cache_dir_.empty()) {
+        std::vector<mfq_tensor_backend::Tensor*> fields;
+        for (auto& pool : cpu->pools) {
+            for (auto* field : moe_cache_field_refs(pool)) {
+                fields.push_back(field);
+                spilled_bytes += tensor_nbytes(*field);
+            }
+        }
+        // ponytail: repack once per load into a temporary SSD file; direct
+        // canonical ranges can replace this when startup I/O is the bottleneck.
+        mmap_moe_host_fields(fields, ssd_cache_dir_);
+    }
     auto source = std::make_shared<MoeCachedSource>(
         this, id, name, std::move(cpu), minimum_slots,
         layer_id, std::move(projection_role), nullptr);
-    host_bytes_ += source->host_bytes();
+    host_bytes_ += source->host_bytes() - spilled_bytes;
+    file_backed_bytes_ += spilled_bytes;
     sources_.push_back(source);
     return source;
 }
@@ -283,6 +298,7 @@ void MoeExpertCache::finalize() {
         << "moe_cache_ready"
         << " sources=" << sources_.size()
         << " host_bytes=" << host_bytes_
+        << " file_backed_bytes=" << file_backed_bytes_
         << " budget_bytes=" << budget_bytes_
         << " allocated_bytes=" << allocated_bytes_
         << " mapped_gather=" << (mapped_gather_enabled_ ? 1 : 0)

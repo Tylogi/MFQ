@@ -59,47 +59,54 @@ static int64_t tensor_nbytes(const mfq_tensor_backend::Tensor & value) {
         : 0;
 }
 
-static std::vector<mfq_tensor_backend::Tensor> moe_cache_fields(
-        const MixedMoePool & pool) {
+static auto moe_cache_field_refs(auto& pool) {
+    using Field = decltype(&pool.nint.q_packed);
     if (pool.family == MixedMoeFamily::Nint) {
-        return {
-            pool.nint.q_packed,
-            pool.nint.row_q_bits,
-            pool.nint.row_q_bit_offsets,
-            pool.nint.sub_scale,
-            pool.nint.sub_min,
-            pool.nint.neuron_scale,
-            pool.nint.neuron_min,
+        return std::vector<Field>{
+            &pool.nint.q_packed,
+            &pool.nint.row_q_bits,
+            &pool.nint.row_q_bit_offsets,
+            &pool.nint.sub_scale,
+            &pool.nint.sub_min,
+            &pool.nint.neuron_scale,
+            &pool.nint.neuron_min,
         };
     }
     if (pool.family == MixedMoeFamily::Nint8Zero) {
-        return {
-            pool.q8_zero.q_packed,
-            pool.q8_zero.q8_zero_scale,
+        return std::vector<Field>{
+            &pool.q8_zero.q_packed,
+            &pool.q8_zero.q8_zero_scale,
         };
     }
     if (pool.family == MixedMoeFamily::Mxfp4) {
-        return {pool.mxfp4.values, pool.mxfp4.scales};
+        return std::vector<Field>{&pool.mxfp4.values, &pool.mxfp4.scales};
     }
     if (pool.family == MixedMoeFamily::Nvq) {
-        return {
-            pool.nvq.indices_packed,
-            pool.nvq.aux_packed,
-            pool.nvq.sub_scale_packed,
-            pool.nvq.neuron_scale,
+        return std::vector<Field>{
+            &pool.nvq.indices_packed,
+            &pool.nvq.aux_packed,
+            &pool.nvq.sub_scale_packed,
+            &pool.nvq.neuron_scale,
         };
     }
-    std::vector<mfq_tensor_backend::Tensor> fields{
-        pool.nepq.indices_packed,
-        pool.nepq.aux_packed,
-        pool.nepq.state_packed,
-        pool.nepq.neuron_scale,
-        pool.nepq.bank_ids,
+    std::vector<Field> fields{
+        &pool.nepq.indices_packed,
+        &pool.nepq.aux_packed,
+        &pool.nepq.state_packed,
+        &pool.nepq.neuron_scale,
+        &pool.nepq.bank_ids,
     };
     if (pool.nepq.residual) {
-        fields.push_back(pool.nepq.residual_first);
-        fields.push_back(pool.nepq.residual_second);
+        fields.push_back(&pool.nepq.residual_first);
+        fields.push_back(&pool.nepq.residual_second);
     }
+    return fields;
+}
+
+static std::vector<mfq_tensor_backend::Tensor> moe_cache_fields(
+        const MixedMoePool& pool) {
+    std::vector<mfq_tensor_backend::Tensor> fields;
+    for (const auto* field : moe_cache_field_refs(pool)) fields.push_back(*field);
     return fields;
 }
 

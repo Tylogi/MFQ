@@ -208,6 +208,7 @@ CudaExecutionConfig load_cuda_execution_config() {
         "MFQ_DISABLE_MOE_SSD_OVERLAP");
     result.moe_ssd_ranges = enabled_unless_disabled(
         "MFQ_DISABLE_MOE_SSD_RANGES");
+    result.moe_ssd_cache_dir = environment("MFQ_MOE_SSD_CACHE_DIR").value_or("");
     return result;
 }
 

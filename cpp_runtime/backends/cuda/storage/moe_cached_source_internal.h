@@ -347,7 +347,7 @@ public:
     }
 
     bool use_full_projection(const MoeRoutePlan & route) const {
-        return !range_store_ && route.ids.size(0) > 8;
+        return !range_store_ && !cache_->file_backed_sources() && route.ids.size(0) > 8;
     }
 
     mfq_tensor_backend::Tensor forward(
