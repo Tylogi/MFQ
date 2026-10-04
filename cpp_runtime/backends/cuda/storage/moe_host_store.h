@@ -53,7 +53,7 @@ inline std::size_t mmap_moe_host_fields(
         close(fd);
         throw std::runtime_error("cannot unlink SSD MoE staging file");
     }
-    std::unique_ptr<FILE, decltype(&std::fclose)> file(fdopen(fd, "w+b"), std::fclose);
+    std::unique_ptr<FILE, int (*)(FILE*)> file(fdopen(fd, "w+b"), std::fclose);
     if (!file) {
         close(fd);
         throw std::runtime_error("cannot open SSD MoE staging stream");
@@ -77,7 +77,7 @@ inline std::size_t mmap_moe_host_fields(
     void* base = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
     MFQ_RUNTIME_CHECK(base != MAP_FAILED, "cannot map SSD MoE staging file");
     auto owner = std::shared_ptr<void>(base, [size](void* data) { munmap(data, size); });
-    (void)madvise(base, size, MADV_RANDOM);
+    // Keep normal read-ahead for each expert's contiguous packed fields.
     (void)posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
     for (std::size_t i = 0; i < fields.size(); ++i) {
         auto& field = *fields[i];
