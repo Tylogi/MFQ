@@ -2643,16 +2643,36 @@ void test_swiglu_ffn() {
 void test_two_stage_nint_shared_decode(
     int shared_group_size = 24,
     int hidden = 32,
-    int intermediate = 24) {
+    int intermediate = 24,
+    bool nvq3jl = false) {
     constexpr int experts = 32;
     constexpr int routes = 10;
     const std::vector<std::string> profiles(experts, "NINTv2");
-    const auto gate_fixture = make_moe_fixture(
-        profiles, intermediate, hidden, 7);
-    const auto up_fixture = make_moe_fixture(
-        profiles, intermediate, hidden, 19);
-    const auto down_fixture = make_moe_fixture(
-        profiles, hidden, intermediate, 31);
+    const auto make_fixture = [&](int output, int input, int salt) {
+        if (!nvq3jl) return make_moe_fixture(profiles, output, input, salt);
+        std::vector<PoolFixture> pools;
+        std::vector<float> dense(experts * output * input);
+        for (int expert = experts - 1; expert >= 0; --expert) {
+            TensorFixture tensor;
+            std::string profile;
+            if ((expert + salt) % 3 != 0) {
+                auto vq = make_jsc_nvq(output, input, "NVQ3J-L", 6, 4, 10, false, 4, -1);
+                profile = vq.dtype;
+                tensor = {std::move(vq.blob), std::move(vq.dense), output, input};
+            } else {
+                profile = "NINT";
+                tensor = make_nint_v2_tensor(output, input, salt + expert, 28, true);
+            }
+            std::copy(tensor.dense.begin(), tensor.dense.end(),
+                dense.begin() + expert * output * input);
+            pools.push_back({{expert}, profile, std::move(tensor), {}});
+        }
+        return MoeFixture{make_raw_nim2(experts, output, input, pools),
+            std::move(dense), experts, output, input};
+    };
+    const auto gate_fixture = make_fixture(intermediate, hidden, 7);
+    const auto up_fixture = make_fixture(intermediate, hidden, nvq3jl ? 20 : 19);
+    const auto down_fixture = make_fixture(hidden, intermediate, nvq3jl ? 33 : 31);
     const std::array<std::span<const std::uint8_t>, 2> gate_up_blobs{
         gate_fixture.blob, up_fixture.blob};
     const auto gate_up = mfq::metal::MlxMfeWeight::from_projection_blobs(gate_up_blobs);
@@ -2681,7 +2701,7 @@ void test_two_stage_nint_shared_decode(
     std::vector<float> shared_gate_values(hidden);
     for (int column = 0; column < hidden; ++column) {
         input_values[column] = static_cast<float>(
-            (column * 7) % 23 - 11) / 64.0f;
+            (column * 7) % 23 - 11) / (nvq3jl ? 1024.0f : 64.0f);
         shared_gate_values[column] = static_cast<float>(
             (column * 5) % 17 - 8) / 128.0f;
     }
@@ -2733,6 +2753,23 @@ void test_two_stage_nint_shared_decode(
                     mlx::core::Shape{fixture.rows, fixture.columns}))),
             mlx::core::float16);
     };
+    if (nvq3jl) {
+        const auto dense_routed = [&](const MoeFixture& fixture,
+                                      const mlx::core::array& activation) {
+            auto weights = mlx::core::take(mlx::core::array(fixture.dense.begin(),
+                mlx::core::Shape{experts, fixture.output, fixture.input}), expert_ids, 0);
+            auto source = activation.ndim() == 2 ? mlx::core::expand_dims(activation, 1) : activation;
+            return mlx::core::astype(mlx::core::sum(weights *
+                mlx::core::expand_dims(mlx::core::astype(source, mlx::core::float32), 2), -1),
+                mlx::core::float16);
+        };
+        auto gate = dense_routed(gate_fixture, input);
+        auto up = dense_routed(up_fixture, input);
+        auto gate_fp32 = mlx::core::astype(gate, mlx::core::float32);
+        routed_intermediate = mlx::core::astype(gate_fp32 * mlx::core::sigmoid(gate_fp32)
+            * mlx::core::astype(up, mlx::core::float32), mlx::core::float16);
+        routed_output = dense_routed(down_fixture, routed_intermediate);
+    }
     auto shared_gate_output = dense_shared_matmul(shared_gate_fixture, input);
     auto shared_intermediate =
         shared_gate_output * mlx::core::sigmoid(shared_gate_output) *
@@ -6606,6 +6643,8 @@ int main(int argc, char** argv) {
         test_two_stage_nint_shared_decode();
         test_two_stage_nint_shared_decode(28, 65, 41);
         test_two_stage_nint_shared_decode(23, 65, 41);
+        test_two_stage_nint_shared_decode(28, 256, 68, true);
+        test_two_stage_nint_shared_decode(28, 68, 256, true);
         test_mxfp4_mfe_and_projection_offsets();
         test_mxfp4_multi_pool_native_slots();
         test_mxfp4_pair_blocks_matches_native_projections();
@@ -6633,6 +6672,7 @@ int main(int argc, char** argv) {
         test_nvq3jl_record_dispatch();
         test_nvq3jl_half_chunk(16);
         test_nvq3jl_half_chunk(17);
+        test_nvq3jl_half_chunk(37);
         test_grouped_nint_mmq_prefill(1, 24, 65);
         test_grouped_nint_mmq_prefill(1, 28, 57);
         test_grouped_split_nint_swiglu_prefill();
