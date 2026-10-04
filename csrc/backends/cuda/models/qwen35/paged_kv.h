@@ -216,12 +216,14 @@ private:
                 static_cast<uint64_t>(maximum_sequences) >
                     static_cast<uint64_t>(
                         std::numeric_limits<int32_t>::max()) /
-                    static_cast<uint64_t>(pages_per_sequence)) {
+                    (static_cast<uint64_t>(pages_per_sequence) + 1)) {
             throw std::invalid_argument(
                 "Paged KV maximum physical page count exceeds int32");
         }
+        // Each padded physical row needs a private scratch page; it must never
+        // overwrite a paused request's committed prefix.
         return static_cast<size_t>(maximum_sequences) *
-            static_cast<size_t>(pages_per_sequence);
+            (static_cast<size_t>(pages_per_sequence) + 1);
     }
 
     void publish_allocator_metrics() noexcept {

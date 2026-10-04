@@ -46,6 +46,18 @@ class MoeContinuousBatchCacheScope {
     bool previous_ = false;
 };
 
+static void wait_for_stream(const MfqCudaStream& destination, const MfqCudaStream& source) {
+    if (destination.stream() == source.stream()) return;
+    MfqCudaGuard guard(source.device_index());
+    cudaEvent_t ready = nullptr;
+    MFQ_CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
+    try {
+        MFQ_CUDA_CHECK(cudaEventRecord(ready, source.stream()));
+        MFQ_CUDA_CHECK(cudaStreamWaitEvent(destination.stream(), ready, 0));
+    } catch (...) { cudaEventDestroy(ready); throw; }
+    MFQ_CUDA_CHECK(cudaEventDestroy(ready));
+}
+
 struct QwenContinuousDecodeGraph {
     decltype(mfq_get_stream_from_pool(false)) stream;
     std::vector<MfqCudaStream> compute_streams;
@@ -112,6 +124,7 @@ std::vector<std::pair<std::string, double>> QwenBatchOperations::metrics() const
     mfq::engine::Metrics result{
         {"continuous_batching_decode_batches", static_cast<double>(decode_batches_)},
         {"continuous_batching_decode_tokens", static_cast<double>(decode_tokens_)},
+        {"continuous_batching_physical_decode_rows", static_cast<double>(physical_decode_rows_)},
 
         {"continuous_batching_compactions", 0.0},
         {"continuous_batching_sampling_readbacks", static_cast<double>(sampling_readbacks_)},
@@ -263,22 +276,31 @@ void QwenBatchOperations::invalidate_decode_graph() {
 QwenBatchOperations::Decoded QwenBatchOperations::decode(State &state) {
     const int primary = execution_.layer_placement.primary_device();
     MfqCudaGuard primary_guard(primary);
-    for (const auto &request : state.active)
-        state_adapter_.ensure_decode_tokens(request->cache, request->cache_length + 1);
+    std::vector<std::shared_ptr<Request>> eligible;
+    std::vector<int32_t> slots;
     int64_t max_position = 0;
-    for (const auto &request : state.active)
+    for (const auto& request : state.active) if (request->eligible) {
+        request->decode_row = eligible.size();
+        eligible.push_back(request);
+        slots.push_back(request->cache.slot());
+        state_adapter_.ensure_decode_tokens(request->cache, request->cache_length + 1);
         max_position = std::max(max_position, request->cache_length);
-    state_adapter_.prepare_decode(max_position);
-    const int64_t batch = max_sequences_;
+    }
+    MFQ_RUNTIME_CHECK(!eligible.empty(), "decode requires eligible requests");
+    // Power-of-two buckets bound both padding work and retained recurrent storage.
+    int64_t batch = 1;
+    while (batch < eligible.size()) batch *= 2;
+    batch = std::min<int64_t>(batch, max_sequences_);
+    state_adapter_.prepare_decode(slots, batch, max_position);
     const bool batch_greedy = std::all_of(
-        state.active.begin(), state.active.end(), [](const std::shared_ptr<Request> &request) {
+        eligible.begin(), eligible.end(), [](const std::shared_ptr<Request> &request) {
             return request->sampler->greedy() && !request->sampler->has_penalties() &&
                    !request->token_constraint;
         });
     int64_t requested_len = 0;
     int64_t minimum_remaining =
-        state.active.front()->generation_limit - state.active.front()->produced;
-    for (const auto &request : state.active) {
+        eligible.front()->generation_limit - eligible.front()->produced;
+    for (const auto &request : eligible) {
         const int64_t remaining = request->generation_limit - request->produced;
         minimum_remaining = std::min(minimum_remaining, remaining);
         requested_len = std::max(requested_len, request->cache_length + remaining);
@@ -290,7 +312,7 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode(State &state) {
     std::vector<const void *> graph_state_addresses;
     bool graph_cache_hit = false;
     bool graph_decode = false;
-    if (batch >= 2 && batch_greedy && config_.greedy &&
+    if (batch_greedy && config_.greedy &&
         qwen_continuous_batch_cuda_graph_enabled(model_, config_)) {
         graph_state_addresses = state_adapter_.decode_state_addresses();
         const auto found =
@@ -313,14 +335,17 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode(State &state) {
         decode_graphs_.push_back(std::make_unique<QwenContinuousDecodeGraph>());
         decode_graph = decode_graphs_.back().get();
     }
-    std::unique_ptr<MfqCudaStreamGuard> graph_stream_guard;
+    std::vector<MfqCudaStream> previous_streams;
     std::vector<std::unique_ptr<MfqCudaStreamGuard>> graph_compute_stream_guards;
     if (graph_decode) {
         const auto &parallel = execution_.tensor_parallel.enabled()
                                    ? execution_.tensor_parallel
                                    : execution_.expert_parallel;
         decode_graph->ensure_compute_streams(parallel);
-        graph_stream_guard = std::make_unique<MfqCudaStreamGuard>(decode_graph->stream);
+        for (const auto& stream : decode_graph->compute_streams) {
+            previous_streams.push_back(mfq_get_current_cuda_stream(stream.device_index()));
+            wait_for_stream(stream, previous_streams.back());
+        }
         graph_compute_stream_guards =
             activate_cuda_graph_compute_streams(decode_graph->compute_streams);
     }
@@ -330,8 +355,8 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode(State &state) {
     std::fill_n(packed_metadata_data + batch, batch, int64_t{0});
     std::fill_n(packed_metadata_data + 2 * batch, batch, int64_t{1});
     int64_t max_sequence_length = 0;
-    for (const auto &request : state.active) {
-        const auto slot = static_cast<int64_t>(request->cache.slot());
+    for (const auto &request : eligible) {
+        const auto slot = static_cast<int64_t>(request->decode_row);
         MFQ_RUNTIME_CHECK(slot >= 0 && slot < batch,
                           "continuous batching request lost its stable slot");
         packed_metadata_data[slot] = request->pending_token;
@@ -348,13 +373,6 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode(State &state) {
     Tensor pos = matrix.narrow(0, 1, 1).reshape({batch, 1});
     Tensor lengths = matrix.narrow(0, 2, 1).reshape({batch});
     ++packed_metadata_batches_;
-    std::vector<int32_t> paused_slots;
-    for (const auto &request : state.active)
-        if (!request->eligible)
-            paused_slots.push_back(request->cache.slot());
-    // ponytail: masked slots still occupy GPU rows; restore recurrent state
-    // and overwrite the uncommitted KV position when they become eligible.
-    const auto paused_state = state_adapter_.capture_recurrent_slots(paused_slots);
     Tensor logits;
     Tensor graph_tokens;
     MoeContinuousBatchCacheScope moe_cache_scope(execution_, cached_moe_enabled_ && batch > 1);
@@ -403,9 +421,9 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode(State &state) {
         invalidate_decode_graph();
         throw;
     }
-    state_adapter_.restore_recurrent_slots(paused_slots, paused_state);
     ++decode_batches_;
-    decode_tokens_ += std::count_if(state.active.begin(), state.active.end(),
+    physical_decode_rows_ += batch;
+    decode_tokens_ += std::count_if(eligible.begin(), eligible.end(),
                                     [](const auto &request) { return request->eligible; });
     Tensor sampled;
     if (graph_tokens.defined()) {
@@ -416,8 +434,8 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode(State &state) {
         ++batched_greedy_batches_;
     } else {
         sampled = mfq_tensor_backend::empty({batch}, ids.options());
-        for (const auto& request : state.active) if (request->eligible) {
-            const auto slot = request->cache.slot();
+        for (const auto& request : eligible) if (request->eligible) {
+            const auto slot = request->decode_row;
             auto row = logits.narrow(0, slot, 1);
             if (request->sampler->has_penalties())
                 row = request->sampler->apply_penalties(std::move(row), request->counts);
@@ -429,15 +447,15 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode(State &state) {
     auto host = sampled.to(mfq_tensor_backend::kCPU).contiguous();
     ++sampling_readbacks_;
     std::vector<std::shared_ptr<Request>> rejected;
-    for (const auto& request : state.active)
+    for (const auto& request : eligible)
         if (request->eligible && request->token_constraint &&
-            !request->token_constraint->allows(host.data_ptr<int64_t>()[request->cache.slot()]))
+            !request->token_constraint->allows(host.data_ptr<int64_t>()[request->decode_row]))
             rejected.push_back(request);
     if (!rejected.empty()) {
         // CPU grammars require logits only when their speculative candidate fails.
         // Transfer all rejected rows together, then gather replacement IDs once.
         std::vector<Tensor> rows;
-        for (const auto& request : rejected) rows.push_back(logits.narrow(0, request->cache.slot(), 1));
+        for (const auto& request : rejected) rows.push_back(logits.narrow(0, request->decode_row, 1));
         auto masked = mfq_tensor_backend::cat(rows, 0).to(mfq_tensor_backend::kCPU,
             mfq_tensor_backend::kFloat32).contiguous();
         ++sampling_readbacks_;
@@ -446,24 +464,27 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode(State &state) {
         auto device = masked.to(logits.device());
         for (size_t row = 0; row < rejected.size(); ++row) {
             auto& request = *rejected[row];
-            sampled.narrow(0, request.cache.slot(), 1).copy_(
+            sampled.narrow(0, request.decode_row, 1).copy_(
                 request.sampler->sample(device.narrow(0, row, 1)));
         }
         host = sampled.to(mfq_tensor_backend::kCPU).contiguous();
         ++sampling_readbacks_;
     }
-    for (const auto& request : state.active) if (request->eligible && request->token_constraint) {
-        const auto token = host.data_ptr<int64_t>()[request->cache.slot()];
+    for (const auto& request : eligible) if (request->eligible && request->token_constraint) {
+        const auto token = host.data_ptr<int64_t>()[request->decode_row];
         MFQ_RUNTIME_CHECK(request->token_constraint->allows(token),
             "CUDA constrained sampler returned an invalid token");
         request->token_constraint->accept(token);
     }
+    if (graph_decode)
+        for (size_t i = 0; i < previous_streams.size(); ++i)
+            wait_for_stream(previous_streams[i], decode_graph->compute_streams[i]);
     return {std::move(sampled), std::move(host)};
 }
 
 QwenBatchOperations::Sample QwenBatchOperations::sample(
     const std::shared_ptr<Request> &request, const Decoded &decoded) {
-    const auto slot = static_cast<int64_t>(request->cache.slot());
+    const auto slot = static_cast<int64_t>(request->decode_row);
     return {decoded.tokens.narrow(0, slot, 1), decoded.host_tokens.data_ptr<int64_t>()[slot], {}};
 }
 

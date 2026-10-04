@@ -140,6 +140,7 @@ void Qwen35BatchStateAdapter::clear_model() {
 
 void Qwen35BatchStateAdapter::finish_retire(int64_t cache_position) {
     if (std::none_of(slots_.begin(), slots_.end(), [](auto *owner) { return owner != nullptr; })) {
+        decode_buckets_.clear();
         clear_model();
         if (paged_kv_)
             for (auto &sequence : paged_slots_)
@@ -161,13 +162,65 @@ void Qwen35BatchStateAdapter::ensure_decode_tokens(const QwenBatchRequestState &
             paged_kv_->ensure_tokens(paged_slots_[request.slot_], tokens) || page_table_dirty_;
 }
 
-void Qwen35BatchStateAdapter::prepare_decode(int64_t cache_position) {
-    if (page_table_dirty_)
-        bind_paged_slots();
-    model_.cache_pos = cache_position;
+static std::pair<Tensor, Tensor> tensors(const QwenBatchLayerState& layer);
+
+void Qwen35BatchStateAdapter::prepare_decode(const std::vector<int32_t>& slots, int64_t batch,
+                                             int64_t cache_position) {
+    MFQ_RUNTIME_CHECK(!slots.empty() && slots.size() <= batch && batch <= slots_.size() && !unpacked_,
+        "invalid physical decode rows");
+    bool direct = slots.size() == slots_.size();
+    for (size_t row = 0; row < slots.size(); ++row) direct &= slots[row] == row;
+    if (direct) {
+        if (page_table_dirty_) bind_paged_slots();
+        model_.cache_pos = cache_position;
+        return;
+    }
+    unpacked_ = take(slots_.size());
+    decode_batch_ = batch;
+    decode_slots_ = slots;
+    auto [found, inserted] = decode_buckets_.try_emplace(batch);
+    if (inserted) found->second = make_slot_state(*unpacked_, batch);
+    auto& packed = found->second;
+    for (size_t layer = 0; layer < packed.layers.size(); ++layer) {
+        auto [source1, source2] = tensors(unpacked_->layers[layer]);
+        auto [target1, target2] = tensors(packed.layers[layer]);
+        if (!target1.defined()) continue;
+        for (size_t row = 0; row < slots.size(); ++row) {
+            target1.narrow(0, row, 1).copy_(source1.narrow(0, slots[row], 1));
+            target2.narrow(0, row, 1).copy_(source2.narrow(0, slots[row], 1));
+        }
+    }
+    restore(packed, cache_position);
+    if (paged_kv_) {
+        std::vector<const QwenPagedKvSequence*> pages;
+        for (auto slot : slots) pages.push_back(&paged_slots_[slot]);
+        padding_pages_.resize(batch - slots.size());
+        for (auto& padding : padding_pages_) {
+            paged_kv_->ensure_tokens(padding, 1);
+            pages.push_back(&padding);
+        }
+        paged_kv_->bind(pages);
+        page_table_dirty_ = true;
+    }
 }
 
 void Qwen35BatchStateAdapter::finish_decode(int64_t cache_position) {
+    if (unpacked_) {
+        const auto& packed = decode_buckets_.at(decode_batch_);
+        for (size_t layer = 0; layer < packed.layers.size(); ++layer) {
+            auto [source1, source2] = tensors(packed.layers[layer]);
+            auto [target1, target2] = tensors(unpacked_->layers[layer]);
+            if (!target1.defined()) continue;
+            for (size_t row = 0; row < decode_slots_.size(); ++row) {
+                target1.narrow(0, decode_slots_[row], 1).copy_(source1.narrow(0, row, 1));
+                target2.narrow(0, decode_slots_[row], 1).copy_(source2.narrow(0, row, 1));
+            }
+        }
+        restore(*unpacked_, cache_position);
+        unpacked_.reset();
+        decode_slots_.clear();
+        if (paged_kv_) for (auto& padding : padding_pages_) paged_kv_->release(padding);
+    }
     model_.cache_pos = cache_position;
 }
 
@@ -179,6 +232,10 @@ void Qwen35BatchStateAdapter::recover(const std::vector<QwenBatchRequestState *>
     for (auto *request : requests)
         release(*request);
     suspended_.reset();
+    unpacked_.reset();
+    decode_buckets_.clear();
+    decode_slots_.clear();
+    if (paged_kv_) for (auto& padding : padding_pages_) paged_kv_->release(padding);
     finish_retire(0);
 }
 
@@ -302,7 +359,7 @@ static std::pair<Tensor, Tensor> tensors(const QwenBatchLayerState& layer) {
 
 QwenBatchState Qwen35BatchStateAdapter::make_slot_state(const QwenBatchState& source,
                                                        int64_t slots) const {
-    MFQ_RUNTIME_CHECK(source.batch == 1 && slots > 0, "slot state requires one source row");
+    MFQ_RUNTIME_CHECK(source.batch > 0 && slots > 0, "slot state requires source rows");
     QwenBatchState result;
     result.batch = slots;
     for (const auto& saved : source.layers) {
@@ -368,47 +425,6 @@ std::vector<const void *> Qwen35BatchStateAdapter::decode_state_addresses() {
         }
     }
     return addresses;
-}
-
-QwenBatchState
-Qwen35BatchStateAdapter::capture_recurrent_slots(const std::vector<std::int32_t> &slots) const {
-    QwenBatchState state;
-    if (slots.empty())
-        return state;
-    state.layers.resize(model_.blocks.size());
-    for (std::size_t i = 0; i < model_.blocks.size(); ++i) {
-        auto *linear = dynamic_cast<LinearBlock *>(model_.blocks[i].get());
-        if (!linear)
-            continue;
-        MfqCudaGuard guard(linear->cuda_device);
-        std::vector<Tensor> conv, gdn;
-        for (auto slot : slots) {
-            conv.push_back(linear->state->conv_state.narrow(0, slot, 1));
-            gdn.push_back(linear->state->gdn_state.narrow(0, slot, 1));
-        }
-        state.layers[i].recurrent = std::make_shared<LinearAttentionState>();
-        state.layers[i].recurrent->conv_state = mfq_tensor_backend::cat(conv, 0).clone();
-        state.layers[i].recurrent->gdn_state = mfq_tensor_backend::cat(gdn, 0).clone();
-    }
-    return state;
-}
-
-void Qwen35BatchStateAdapter::restore_recurrent_slots(const std::vector<std::int32_t> &slots,
-                                                      const QwenBatchState &state) {
-    if (slots.empty())
-        return;
-    for (std::size_t i = 0; i < model_.blocks.size(); ++i) {
-        auto *linear = dynamic_cast<LinearBlock *>(model_.blocks[i].get());
-        if (!linear)
-            continue;
-        MfqCudaGuard guard(linear->cuda_device);
-        for (std::size_t row = 0; row < slots.size(); ++row) {
-            linear->state->conv_state.narrow(0, slots[row], 1)
-                .copy_(state.layers[i].recurrent->conv_state.narrow(0, row, 1));
-            linear->state->gdn_state.narrow(0, slots[row], 1)
-                .copy_(state.layers[i].recurrent->gdn_state.narrow(0, row, 1));
-        }
-    }
 }
 
 } // namespace mfq::cuda::qwen35

@@ -16,6 +16,7 @@ struct QwenContinuousDecodeGraph;
 struct QwenBatchRequest : mfq::engine::BatchRequest {
     using BatchRequest::BatchRequest;
     std::optional<Sampler> sampler;
+    int32_t decode_row = -1;
     mfq_tensor_backend::Tensor counts;
     mfq_tensor_backend::Tensor prefill_ids;
     std::vector<std::unique_ptr<internal::PrefillCudaTimer>> prefill_timers;
@@ -69,6 +70,7 @@ class QwenBatchOperations {
     bool cached_moe_enabled_ = false;
     int64_t decode_batches_{0};
     int64_t decode_tokens_{0};
+    int64_t physical_decode_rows_{0};
     int64_t batched_greedy_batches_{0};
     int64_t packed_metadata_batches_{0};
     int64_t sampling_readbacks_{0};

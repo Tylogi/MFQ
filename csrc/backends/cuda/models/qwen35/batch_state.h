@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -93,15 +94,13 @@ class Qwen35BatchStateAdapter {
     void release(QwenBatchRequestState &request);
     void finish_retire(std::int64_t cache_position);
     void ensure_decode_tokens(const QwenBatchRequestState &request, std::int64_t tokens);
-    void prepare_decode(std::int64_t cache_position);
+    void prepare_decode(const std::vector<std::int32_t>& slots, std::int64_t batch,
+                        std::int64_t cache_position);
     void finish_decode(std::int64_t cache_position);
     void recover(const std::vector<QwenBatchRequestState *> &requests);
 
     mfq_tensor_backend::Tensor logits_from_last_hidden(mfq_tensor_backend::Tensor hidden);
     std::vector<const void *> decode_state_addresses();
-    QwenBatchState capture_recurrent_slots(const std::vector<std::int32_t> &slots) const;
-    void restore_recurrent_slots(const std::vector<std::int32_t> &slots,
-                                 const QwenBatchState &state);
 
   private:
     QwenBatchState take(std::int64_t batch);
@@ -113,7 +112,11 @@ class Qwen35BatchStateAdapter {
 
     Qwen35CausalLm &model_;
     std::vector<QwenBatchRequestState *> slots_;
-    std::optional<QwenBatchState> suspended_;
+    std::optional<QwenBatchState> suspended_, unpacked_;
+    std::map<std::int64_t, QwenBatchState> decode_buckets_;
+    std::int64_t decode_batch_ = 0;
+    std::vector<std::int32_t> decode_slots_;
+    std::vector<continuous::QwenPagedKvSequence> padding_pages_;
     std::int64_t slot_releases_ = 0;
     bool page_table_dirty_ = false;
     std::unique_ptr<continuous::QwenPagedKvArena> paged_kv_;

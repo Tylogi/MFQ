@@ -239,8 +239,17 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
             tokens["joined"] == second_reference, "prefill join changed decode output");
         if (config.continuous_batch.greedy &&
             qwen_continuous_batch_cuda_graph_enabled(model, config.continuous_batch))
-            MFQ_RUNTIME_CHECK(metric("continuous_batching_cuda_graph_captures") == captures_before_join,
-                "joining prefill recaptured a valid decode graph");
+            MFQ_RUNTIME_CHECK(metric("continuous_batching_cuda_graph_captures") <= captures_before_join + 1,
+                "joining prefill repeatedly recaptured decode graphs");
+        admit("padded-0", second_prompt); admit("padded-1", second_prompt); admit("padded-2", second_prompt);
+        for (int ticks = 0; ticks < 500 && !executor.empty(); ++ticks) {
+            const bool pause = tokens["padded-0"].size() >= 3 && tokens["padded-1"].size() < 8;
+            tick(pause ? std::vector<RequestId>{"padded-1", "padded-2"} :
+                std::vector<RequestId>{"padded-0", "padded-1", "padded-2"});
+        }
+        for (int row = 0; row < 3; ++row)
+            MFQ_RUNTIME_CHECK(tokens["padded-" + std::to_string(row)] == second_reference &&
+                terminals["padded-" + std::to_string(row)] == 1, "padded batch or paused state differs");
         const auto reads_before = metric("continuous_batching_sampling_readbacks");
         const auto batches_before = metric("continuous_batching_decode_batches");
         const auto started = std::chrono::steady_clock::now();
@@ -256,6 +265,8 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
                 tokens[greedy_id] == first_reference && terminals[random_id] == 1 && terminals[greedy_id] == 1,
                 "mixed batch sampling or fixed-seed replay failed");
         }
+        MFQ_RUNTIME_CHECK(metric("continuous_batching_physical_decode_rows") <=
+            2 * metric("continuous_batching_decode_tokens"), "physical batch exceeded its eligible bucket");
         const auto reads = metric("continuous_batching_sampling_readbacks") - reads_before;
         const auto batches = metric("continuous_batching_decode_batches") - batches_before;
         MFQ_RUNTIME_CHECK(reads == batches, "sampling synchronized more than once per unconstrained batch");

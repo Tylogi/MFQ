@@ -118,8 +118,8 @@ def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
     assert "execution.append(token)" not in BATCHING
     assert "output.finish(" not in BATCHING
     assert "request->eligible" in BATCHING
-    assert "capture_recurrent_slots" in BATCHING
-    assert "restore_recurrent_slots" in BATCHING
+    assert "state_adapter_.prepare_decode(slots, batch" in BATCHING
+    assert "const int64_t batch = max_sequences_" not in BATCHING
     assert "retire_cancelled" not in BATCHING
     assert "ops.generate(it->first, current)" in SHARED_ENGINE
     assert "step_batch(" not in SHARED_ENGINE
