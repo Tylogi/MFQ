@@ -100,6 +100,8 @@ mfq_tensor_backend::Tensor nepq_sparse_residual_grouped_cuda(
     int64_t out_per_expert, int64_t position_bits, int64_t block_vectors,
     mfq_tensor_backend::Tensor output);
 mfq_tensor_backend::Tensor moe_weighted_reduce_cuda(mfq_tensor_backend::Tensor pair_output, mfq_tensor_backend::Tensor weights);
+mfq_tensor_backend::Tensor moe_weighted_reduce_cuda(
+    mfq_tensor_backend::Tensor pair_output, mfq_tensor_backend::Tensor weights, bool round_product);
 mfq_tensor_backend::Tensor moe_swiglu_split_cuda(mfq_tensor_backend::Tensor gate_up);
 mfq_tensor_backend::Tensor moe_geglu_split_cuda(mfq_tensor_backend::Tensor gate_up);
 mfq_tensor_backend::Tensor moe_apply_expert_scale_cuda(

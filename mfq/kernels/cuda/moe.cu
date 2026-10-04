@@ -1196,6 +1196,7 @@ __global__ void __launch_bounds__(256, 1) nint8_zero_moe_mma_kernel(
     }
 }
 
+template <bool ROUND_PRODUCT>
 __global__ void moe_weighted_reduce_kernel(
         const __half * __restrict__ pair_output,
         const float * __restrict__ weights,
@@ -1212,7 +1213,13 @@ __global__ void moe_weighted_reduce_kernel(
         float value = 0.0f;
         for (int route = 0; route < routes; ++route) {
             const size_t pair = static_cast<size_t>(token) * routes + route;
-            value += weights[pair] * __half2float(pair_output[pair * width + column]);
+            const float expert_value = __half2float(pair_output[pair * width + column]);
+            if constexpr (ROUND_PRODUCT) {
+                // Preserve separate FP32 tensor multiply/add rounding.
+                value = __fadd_rn(value, __fmul_rn(weights[pair], expert_value));
+            } else {
+                value += weights[pair] * expert_value;
+            }
         }
         output[index] = __float2half(value);
     }
@@ -2202,7 +2209,9 @@ mfq_tensor_backend::Tensor nint8_zero_moe_grouped_matmul_pool_ws_cuda(
     return out;
 }
 
-mfq_tensor_backend::Tensor moe_weighted_reduce_cuda(mfq_tensor_backend::Tensor pair_output, mfq_tensor_backend::Tensor weights) {
+mfq_tensor_backend::Tensor moe_weighted_reduce_cuda(
+        mfq_tensor_backend::Tensor pair_output, mfq_tensor_backend::Tensor weights,
+        bool round_product) {
     MFQ_RUNTIME_CHECK(pair_output.is_cuda() && pair_output.is_contiguous() &&
         pair_output.scalar_type() == mfq_tensor_backend::kFloat16 && pair_output.dim() == 3,
         "pair_output must be contiguous CUDA float16 [tokens, routes, width]");
@@ -2220,12 +2229,24 @@ mfq_tensor_backend::Tensor moe_weighted_reduce_cuda(mfq_tensor_backend::Tensor p
     const int64_t total = static_cast<int64_t>(tokens) * width;
     const int grid = static_cast<int>((total + block - 1) / block);
     const cudaStream_t stream = mfq_current_cuda_stream();
-    moe_weighted_reduce_kernel<<<grid, block, 0, stream>>>(
-        reinterpret_cast<const __half *>(pair_output.data_ptr<mfq_half>()),
-        weights.data_ptr<float>(), reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
-        tokens, routes, width);
+    if (round_product) {
+        moe_weighted_reduce_kernel<true><<<grid, block, 0, stream>>>(
+            reinterpret_cast<const __half *>(pair_output.data_ptr<mfq_half>()),
+            weights.data_ptr<float>(), reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
+            tokens, routes, width);
+    } else {
+        moe_weighted_reduce_kernel<false><<<grid, block, 0, stream>>>(
+            reinterpret_cast<const __half *>(pair_output.data_ptr<mfq_half>()),
+            weights.data_ptr<float>(), reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
+            tokens, routes, width);
+    }
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
+}
+
+mfq_tensor_backend::Tensor moe_weighted_reduce_cuda(
+        mfq_tensor_backend::Tensor pair_output, mfq_tensor_backend::Tensor weights) {
+    return moe_weighted_reduce_cuda(pair_output, weights, false);
 }
 
 mfq_tensor_backend::Tensor moe_swiglu_split_cuda(mfq_tensor_backend::Tensor gate_up) {

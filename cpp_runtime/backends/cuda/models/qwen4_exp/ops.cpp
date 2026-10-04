@@ -65,6 +65,8 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
                     },
                     [&](Tensor hidden) { return down(execution, hidden, selected[0]); },
                     [&](Tensor pairs) {
+                        if (pairs.scalar_type() == tb::kFloat16)
+                            return moe_weighted_reduce_cuda(pairs, selected[1], /*round_product=*/true);
                         auto reduced = tb::zeros({source.size(0), c.hidden},
                                                  source.options().dtype(tb::kFloat32));
                         for (int64_t r = 0; r < c.topk; ++r)

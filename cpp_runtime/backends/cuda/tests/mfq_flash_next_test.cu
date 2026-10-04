@@ -1,6 +1,7 @@
 // Native ABI numerical-test bridge: tests/test_cuda_flash_next.py supplies the
 // same NumPy oracle cases to this executable and the production Torch module.
 #include "mfq_cuda_attention_ops.h"
+#include "mfq_cuda_moe_ops.h"
 #include "mfq/kernels/cuda/glm5_next.h"
 #include "mfq/kernels/cuda/qwen4_exp.h"
 #include "glm5_next/model.h"
@@ -10,6 +11,7 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -27,6 +29,39 @@ mfq_tensor_backend::Tensor attention_dsv4_sparse_cuda(
 namespace {
 using namespace mfq::cuda;
 using Json = nlohmann::json;
+
+Tensor unfused_moe_reduce(const Tensor& pairs, const Tensor& weights) {
+    auto result = zeros({pairs.size(0), pairs.size(2)}, weights.options());
+    for (int64_t route = 0; route < pairs.size(1); ++route)
+        result = result + pairs.select(1, route).to(kFloat32) *
+            weights.select(1, route).unsqueeze(-1);
+    return result.to(pairs.scalar_type());
+}
+
+void check_moe_reduce() {
+    const Device gpu{DeviceType::cuda, 0};
+    for (int tokens : {1, 4, 33}) for (int width : {7, 2560}) {
+        constexpr int routes = 10;
+        std::vector<float> values(tokens * routes * width), scales(tokens * routes);
+        for (size_t i = 0; i < values.size(); ++i)
+            values[i] = (static_cast<int>((i * 17) % 257) - 128) / 11.0f;
+        for (size_t i = 0; i < scales.size(); ++i)
+            scales[i] = static_cast<float>(i % 9 + 1) / 45.0f;
+        auto pairs = tensor(values).to(gpu, kFloat16).reshape({tokens, routes, width});
+        auto weights = tensor(scales).to(gpu).reshape({tokens, routes});
+        auto expected = unfused_moe_reduce(pairs, weights).cpu();
+        auto actual = moe_weighted_reduce_cuda(pairs, weights, true).cpu();
+        MFQ_RUNTIME_CHECK(std::memcmp(actual.data_ptr(), expected.data_ptr(), actual.nbytes()) == 0,
+            "Qwen MoE reduction changed FP16 output bits");
+    }
+    // Separate products cancel exactly; an FMA retains one FP16 subnormal.
+    auto pairs = tensor<float>({-1025.f, 1025.f}).to(gpu, kFloat16).reshape({1, 2, 1});
+    auto weights = tensor<float>({0.500000059604644775390625f, 0.500000059604644775390625f})
+        .to(gpu).reshape({1, 2});
+    MFQ_RUNTIME_CHECK(moe_weighted_reduce_cuda(pairs, weights, true).to(kFloat32).item<float>() == 0.f &&
+        moe_weighted_reduce_cuda(pairs, weights).to(kFloat32).item<float>() != 0.f,
+        "Qwen MoE product rounding regressed or legacy FMA behavior changed");
+}
 
 void require_constant(
     const Tensor& value, float expected, float tolerance, const char * name) {
@@ -155,6 +190,8 @@ Tensor input(const Json& j) {
 }
 
 std::vector<Tensor> run(const std::string& op, const std::vector<Tensor>& a, const Json& p) {
+    if (op == "moe_reduce") return {moe_weighted_reduce_cuda(a.at(0), a.at(1), true)};
+    if (op == "moe_reduce_reference") return {unfused_moe_reduce(a.at(0), a.at(1))};
     CudaExecutionContext execution;
     const auto optional = [&](size_t i) -> std::optional<Tensor> {
         return a.at(i).defined() ? std::optional<Tensor>(a.at(i)) : std::nullopt;
@@ -339,6 +376,7 @@ int main(int argc, char** argv) {
             for (int i = 0; i < 3; ++i)
                 if (got.data_ptr<float>()[i] != 4.f) throw std::runtime_error("QSA smoke mismatch");
             check_shared_sparse_attention();
+            check_moe_reduce();
             std::cout << "Flash-Next and shared sparse-attention native smoke passed\n";
             return 0;
         }
