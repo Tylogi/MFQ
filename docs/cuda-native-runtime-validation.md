@@ -104,6 +104,107 @@ MFQ_MOE_SSD_CACHE_DIR=/path/on/ssd build/cpp_runtime/cuda/mfq-mfe-decode-test \
 Validate a real model's generation and peak RAM separately; an individual
 projection check does not prove full-model parity.
 
+### Qwen3.8 Flash Next V4-XS measurement (2026-10-05)
+
+Measured the complete five-shard `Qwen3.8-Flash-Next-EWQ-MFQ-V4-XS` model
+on Linux with 32 GB system RAM, an RTX 4090 with 48 GiB VRAM, PCIe 4 x16,
+and a Samsung 9100 PRO NVMe SSD. The native Release build used CUDA 13.2
+and CUDA architecture 86. No Metal implementation was changed.
+
+Both builds used a 30 GiB expert GPU cache and the same SSD mappings,
+normal read-ahead, packed-parameter loading and shared-arena validation fixes.
+The compute baseline used four NVQ warps for K=640, four routed NINT warps,
+the original Qwen expert-reduction loop and one scatter block per transfer.
+The candidate also splits large cache transfers across CUDA blocks.
+
+The downloaded artifact marks MTP as removed and sets
+`text_config.mtp_num_hidden_layers=0`, but its embedded
+`text_config.mtp.num_hidden_layers` is still 1. For both builds an external
+`--config` copy sets that nested count to 0 and `text_config.mtp.layer_types`
+to `[]`. Weight files were not edited. The loader's predictor consistency
+check remains enabled.
+
+The prompt is “Explain why the sky is blue in one sentence.”, rendered with
+the bundled chat template and thinking disabled: 23 input tokens, 33 greedy
+output tokens, context capacity 128. Decode timing covers the 32 steps after
+prefill and excludes model loading. Each process starts with an empty expert
+cache. Run with the first shard path, not the containing directory:
+
+```shell
+MFQ_MOE_SSD_CACHE_DIR=/path/on/ssd MFQ_REPORT_CUDA_MEMORY=1 \
+  build/cpp_runtime/mfq-diagnostics \
+  --model /models/Qwen3.8-Flash-Next-EWQ-MFQ-V4-XS-00001-of-00005.mfq \
+  --config corrected-config.json --ids-file prompt.i32 \
+  --gen 33 --ctx-size 128 --moe-gpu-cache-gb 30
+```
+
+The two unprofiled runs per variant produced:
+
+| Variant | Decode tokens/s |
+| --- | ---: |
+| Baseline | 3.750, 3.828 |
+| NVQ/NINT/reduction changes, before parallel scatter | 3.955, 3.977 |
+| Final candidate, including parallel scatter | 4.508, 4.529 |
+
+The final mean is about 19% above the baseline mean. Loading took about
+134–138 seconds and prefill about 9.5–9.8 seconds. These are short-prompt SSD
+measurements, not resident kernel timing or a long-context throughput claim.
+
+The final candidate matches the baseline byte for byte across all 51 dumped
+stages: embedding, 48 blocks, final norm and complete logits, totaling
+17,310,720 FP32 values. All 33 generated token IDs also match. Separate real
+projection checks compare every FP16 output across all 512 experts for
+1, 2, 3, 4 and 8 tokens with shared and routed inputs, including SSD cache
+misses. Scatter tests cover mixed transfer sizes, zero-length copies,
+unaligned pointers, vector boundaries and guard bytes up to 5 MiB per field.
+
+The expert mappings occupy 52.59 GiB of temporary SSD space, with about
+31.3 MiB of persistent host metadata. Non-profiled generation stayed below
+22 GiB peak process RSS and about 2.1 GiB peak anonymous RAM. File-backed RSS
+is reclaimable page cache. GPU use after prefill was about 38.33 GiB. A test
+runner monitored memory every 0.5 seconds and would stop below 2 GiB available
+RAM or above 22 GiB anonymous RAM; no run reached either threshold.
+
+The resident single-token down-projection microbenchmarks improved from
+51.08 to 42.89 microseconds and from 51.75 to 41.58 microseconds (medians of
+five 3,000-iteration runs). The SSD cache currently uses per-pool NVQ dispatch,
+so its end-to-end improvement does not include the heterogeneous NVQ speedup.
+The exact Qwen reduction preserves separate FP32 product/add rounding before
+the final FP16 cast; it does not silently replace those operations with FMA.
+
+Nsight Systems captured only the 32 decode steps, with CUDA tracing and CPU
+sampling disabled. Comparing the candidate before and after parallel scatter:
+
+| Decode measurement | One scatter block | Parallel scatter |
+| --- | ---: | ---: |
+| Scatter kernel time, 3,381 calls | 1.1929 s | 0.0479 s |
+| All kernel time, 318,389 calls | 2.5700 s | 1.5093 s |
+| H2D copy time, 6.962 GB | 0.2825 s | 0.2829 s |
+| CPU time inside `cudaEventSynchronize`, 4,608 calls | 1.7519 s | 0.7112 s |
+| First-to-last GPU activity span | 8.3990 s | 7.2918 s |
+
+Use the unprofiled runs for throughput: the diagnostic timer also includes
+profiler start/stop overhead when capture is enabled. After the scatter fix,
+the union of GPU kernels, copies and memsets is 1.8036 seconds, or 24.7% of
+the captured activity span. The remaining gaps include host preparation,
+dispatch and I/O; a CUDA trace alone cannot assign all of them to SSD faults.
+Useful next targets are:
+
+- Fuse Qwen gated-residual normalization and elementwise chains while
+  preserving their rounding. Decode still launches about 9,950 kernels and
+  issues about 7,470 `cudaMallocAsync` calls per token.
+- Reuse route information across gate/up/down and overlap NINT/NVQ SSD reads
+  and pinned staging with useful GPU work. The existing deferred range-read
+  path currently applies to MXFP4; mapped mixed-expert fields use synchronous
+  host copies.
+- Connect the heterogeneous NVQ dispatcher to changing cache slot maps.
+  Its resident optimization currently does not reach this SSD path.
+
+Local raw binaries, memory samples, full output comparisons and Nsight
+reports are retained under `/tmp/mfq-qwen38-perf`. The complete native build
+and the host-store, NINT q8, packed NINT rows, storage-offset/scatter and
+Flash Next CTests passed.
+
 Run the model-backed scheduler and execution-isolation gates on a machine with
 enough device memory. The second command loads and generates with two complete
 engines concurrently and compares each result with its serial oracle:
