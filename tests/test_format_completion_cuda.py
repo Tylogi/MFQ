@@ -234,7 +234,7 @@ def test_mxfp8_native_fp32_output_matches_packed_reference(activation_rows: int)
     torch.testing.assert_close(actual, expected, rtol=0.006, atol=0.03)
 
 
-@pytest.mark.parametrize("activation_rows", [1, 16, 65])
+@pytest.mark.parametrize("activation_rows", [1, 8, 9, 16, 64, 65])
 def test_nint8_zero_native_matmul_matches_packed_reference(
     activation_rows: int,
 ):
@@ -252,7 +252,7 @@ def test_nint8_zero_native_matmul_matches_packed_reference(
     source = torch.randn(activation_rows, width, device="cuda", dtype=torch.float16)
     dense = nint8_zero_dequantize(weight)
     actual = nint8_zero_matmul(weight, source).float()
-    if activation_rows <= 64:
+    if activation_rows <= 8:
         grouped = source.float().reshape(activation_rows, width // 32, 32)
         activation_scale = grouped.abs().amax(dim=-1) / 127.0
         activation_scale = torch.where(
