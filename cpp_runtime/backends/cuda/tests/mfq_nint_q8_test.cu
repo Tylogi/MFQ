@@ -1,4 +1,5 @@
 #include "mfq_cuda_quant_ops.h"
+#include "mfq_cuda_moe_ops.h"
 
 #include <cuda_runtime_api.h>
 #include <cstdint>
@@ -83,6 +84,20 @@ void check_case(int gs, int ng, int m, int width_tail, int storage_offset,
     MFQ_NATIVE_CUDA_CHECK(cudaDeviceSynchronize());
     exact_half(actual, expected);
     ++cases;
+
+    // Shared cache arenas can contain more slots than this layer has experts.
+    if (mode == 0 && gs == 32 && ng == 3 && width_tail == 0 && storage_offset == 0) {
+        auto map = tensor<std::int32_t>({4, 1}).to(gpu);
+        std::vector<std::int32_t> route_ids(m * 2);
+        for (int i = 0; i < m * 2; ++i) route_ids[i] = i % 2;
+        auto ids = tensor(route_ids).reshape({m, 2}).to(gpu);
+        auto out = empty({m, 2, 1}, options.dtype(kFloat16));
+        auto routed = mfe_nint_matmul_ws_cuda(q, bits, off, s, mn, ns, nm,
+            x, ids, map, 2, n, 1, gs, 0, false, false, out, qx, xs,
+            Tensor(), Tensor(), Tensor(), Tensor(), 8, 0);
+        exact_half(routed, expected.index_select(1, map.to(kInt64)).unsqueeze(-1));
+        ++cases;
+    }
 
     // Compare both specialization branches during capture/replay. Odd group
     // widths and offset storage also exercise the existing generic fallback.

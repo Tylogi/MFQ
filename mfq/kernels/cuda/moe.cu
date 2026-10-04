@@ -1873,8 +1873,8 @@ mfq_tensor_backend::Tensor mfe_nint_matmul_ws_cuda(
         n_experts > 0 && n_experts <= 4096,
         "n_experts must be in [1, 4096]");
     MFQ_RUNTIME_CHECK(
-        n_local_experts > 0 && n_local_experts <= n_experts,
-        "n_local_experts must be in [1, n_experts]");
+        n_local_experts > 0 && n_local_experts <= INT_MAX,
+        "NINT pool capacity must be in [1, INT_MAX]");
     MFQ_RUNTIME_CHECK(
         out_per_expert > 0 && out_per_expert <= INT_MAX,
         "out_per_expert must be positive");
@@ -2092,14 +2092,16 @@ mfq_tensor_backend::Tensor nint8_zero_moe_grouped_matmul_pool_ws_cuda(
         n_experts > 0 && n_experts <= 4096,
         "n_experts must be in [1, 4096]");
     MFQ_RUNTIME_CHECK(
-        n_local_experts > 0 && n_local_experts <= n_experts,
-        "n_local_experts must be in [1, n_experts]");
+        n_local_experts > 0 && n_local_experts <= INT_MAX,
+        "NINT8-0 pool capacity must be in [1, INT_MAX]");
     MFQ_RUNTIME_CHECK(
         out_per_expert > 0 && out_per_expert <= INT_MAX,
         "out_per_expert must be positive");
     const int experts = static_cast<int>(n_experts);
     const int local_experts = static_cast<int>(n_local_experts);
     const int output_width = static_cast<int>(out_per_expert);
+    MFQ_RUNTIME_CHECK(local_experts <= INT_MAX / output_width,
+        "NINT8-0 row count exceeds the CUDA index range");
     MFQ_RUNTIME_CHECK(
         q.is_cuda() && q.is_contiguous() &&
         q.scalar_type() == mfq_tensor_backend::kUInt8 && q.dim() == 3 &&

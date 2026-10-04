@@ -23,6 +23,7 @@ int main(int argc, char** argv) try {
     MfeWeight cached;
     if (!execution.config.moe_ssd_cache_dir.empty()) {
         execution.moe_expert_cache = make_moe_expert_cache(512 * 1024 * 1024, execution.config);
+        weight_loader::validate_load_options(execution);
         cached = load_mfe_gpu(execution, *source, argv[2], true, 0, "diagnostic");
         finalize_moe_expert_cache(execution.moe_expert_cache);
     }

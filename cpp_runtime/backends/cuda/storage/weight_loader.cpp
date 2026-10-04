@@ -132,8 +132,8 @@ Linear linear(CudaExecutionContext& execution, const mfq::ModelSource& file, con
 
 Tensor dense(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name) {
     const auto& dtype=require_tensor(file, name).dtype;
-    MFQ_RUNTIME_CHECK(dtype=="F32" || dtype=="F16" || dtype=="BF16",
-        "expected a dense parameter: ",name);
+    MFQ_RUNTIME_CHECK(dtype=="F32" || dtype=="F16" || dtype=="BF16" ||
+        dtype=="NINT" || dtype=="NINT8-0", "unsupported materialized parameter: ",name);
     auto value=load_dense_gpu(execution, file,name);
     return value.to(dtype=="F16" ? tb::kFloat16 : dtype=="BF16" ? tb::kBFloat16 : tb::kFloat32);
 }
@@ -181,10 +181,10 @@ void validate_load_options(
         const CudaExecutionContext& execution) {
     if (execution.tensor_parallel.enabled() ||
             execution.layer_placement.enabled() ||
-            execution.n_gpu_layers >= 0 || execution.moe_expert_cache) {
+            execution.n_gpu_layers >= 0) {
         throw std::runtime_error(
             "native attention adapter supports expert parallelism, but "
-            "tensor/layer parallelism and offload require a different placement path");
+            "tensor/layer parallelism and dense layer offload require a different placement path");
     }
 }
 
