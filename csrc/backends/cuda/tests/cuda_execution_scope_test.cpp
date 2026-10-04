@@ -119,6 +119,32 @@ static void check_engines(const char* model, const char* tokenizer) {
     for (auto& worker : workers) worker.join();
     for (auto error : errors) if (error) std::rethrow_exception(error);
     if (tokens[0] != reference || tokens[1] != reference) throw std::runtime_error("concurrent Engines changed tokens");
+    {
+        using namespace mfq::engine;
+        const auto await_control = [&](Engine& engine) {
+            const auto deadline = Clock::now() + std::chrono::seconds(2);
+            while (Clock::now() < deadline) {
+                auto result = engine.step({});
+                if (result.control) return std::move(*result.control);
+                if (result.wake_at) std::this_thread::sleep_until(*result.wake_at);
+            }
+            throw std::runtime_error("text control did not complete");
+        };
+        if (!std::holds_alternative<ControlPending>(first->control(DecodeTokens{reference, {}})))
+            throw std::runtime_error("decode control ran synchronously");
+        auto decoded = await_control(*first);
+        if (!std::holds_alternative<std::string>(decoded) || std::get<std::string>(decoded).empty())
+            throw std::runtime_error("decode control did not retain its tokenizer");
+        PrepareDuplexStep large;
+        large.text.assign(2 * 1024 * 1024, 'a');
+        first->control(std::move(large));
+        const auto start = Clock::now();
+        first->control(StopDuplex{});
+        if (!std::holds_alternative<Cancelled>(await_control(*first)) ||
+            Clock::now() - start > std::chrono::milliseconds(100))
+            throw std::runtime_error("long control tokenization delayed cancellation");
+        if (first->step({}).control) throw std::runtime_error("duplicate control completion");
+    }
     first->reload(256);
     if (generate(*first) != reference) throw std::runtime_error("reload changed tokens");
     first->shutdown();

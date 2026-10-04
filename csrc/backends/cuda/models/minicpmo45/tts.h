@@ -283,7 +283,7 @@ struct MiniCPMO45TtsDecoder {
         bool finished = false;
     };
 
-    ChunkResult generate_duplex_chunk(
+    mfq::StepSequence<ChunkResult> generate_duplex_chunk_steps(
             mfq_tensor_backend::Tensor condition_embeddings,
             int64_t max_new_tokens,
             int64_t minimum_new_tokens,
@@ -334,6 +334,7 @@ struct MiniCPMO45TtsDecoder {
                 .reshape({1}).to(mfq_tensor_backend::kInt64);
             sampled.push_back(token);
             finished = token.eq(eos_token).all().item<bool>();
+            co_yield mfq::StepState::advanced;
             if (finished) break;
             current = minicpmo45_embedding(
                 code_embedding, token.unsqueeze(1));
@@ -351,7 +352,13 @@ struct MiniCPMO45TtsDecoder {
                 mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCUDA)
                     .dtype(mfq_tensor_backend::kInt64));
         }
-        return {codes, finished};
+        co_yield ChunkResult{codes, finished};
+    }
+
+    ChunkResult generate_duplex_chunk(mfq_tensor_backend::Tensor condition, int64_t maximum,
+        int64_t minimum, int64_t eos, double temperature, double penalty) {
+        return mfq::finish_steps(generate_duplex_chunk_steps(std::move(condition), maximum, minimum, eos,
+            temperature, penalty));
     }
 
     mfq_tensor_backend::Tensor generate_official(

@@ -165,3 +165,96 @@ def test_diagnostic_engine_generation() -> None:
         assert "decode_steady_tok_per_s" not in fields
         outputs.append(tokens)
     assert outputs[0] == outputs[1]
+
+
+def test_stdio_duplex_close_interrupts_pending_control() -> None:
+    """The real stdio reader must accept close while a fake device is generating."""
+    executable = ROOT / "build/csrc/tests/mfq-runtime-transport-test"
+    if not executable.exists():
+        pytest.skip("native transport test binary not built")
+
+    async def run() -> None:
+        process = await asyncio.create_subprocess_exec(
+            str(executable), "--stdio", stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        async def send(id: str, op: str, params: dict | None = None) -> None:
+            process.stdin.write(json.dumps({"v": 1, "id": id, "op": op, "params": params or {}}).encode() + b"\n")
+            await process.stdin.drain()
+
+        async def until(id: str, kind: str) -> dict:
+            while True:
+                line = await asyncio.wait_for(process.stdout.readline(), 2)
+                assert line
+                frame = json.loads(line)
+                if frame.get("id") == id and frame["type"] == kind:
+                    return frame
+                assert frame["type"] != "error", frame
+
+        try:
+            assert json.loads(await asyncio.wait_for(process.stdout.readline(), 2))["type"] == "ready"
+            await send("channel", "realtime.open")
+            await until("channel", "result")
+            await send("init", "realtime.send", {"target_id": "channel", "data": json.dumps({"type": "session.init"})})
+            await until("init", "result")
+            await send("step", "realtime.send", {"target_id": "channel", "data": json.dumps({
+                "type": "input.append", "input": {"text": "hello", "max_new_speak_tokens": 1000},
+            })})
+            await asyncio.sleep(0.03)
+            await send("close", "realtime.close", {"target_id": "channel"})
+            frames = []
+            async def closed() -> None:
+                while not any(frame.get("id") == "close" and frame["type"] == "result" for frame in frames):
+                    frames.append(json.loads(await process.stdout.readline()))
+            await asyncio.wait_for(closed(), 0.2)
+            await send("shutdown", "shutdown")
+            await asyncio.wait_for(process.wait(), 2)
+            assert process.returncode == 0, (await process.stderr.read()).decode()
+            remaining = [json.loads(line) for line in (await process.stdout.read()).splitlines()]
+            assert sum(frame.get("id") == "step" and frame["type"] == "error" for frame in frames + remaining) == 1
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+    asyncio.run(run())
+
+
+def test_websocket_duplex_disconnect_interrupts_pending_control() -> None:
+    import socket
+    import websockets
+
+    executable = ROOT / "build/csrc/tests/mfq-runtime-transport-test"
+    if not executable.exists():
+        pytest.skip("native transport test binary not built")
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+
+    async def run() -> None:
+        process = await asyncio.create_subprocess_exec(
+            str(executable), "--http", str(port), stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        connection = None
+        try:
+            for _ in range(100):
+                try:
+                    connection = await websockets.connect(f"ws://127.0.0.1:{port}/runtime/realtime")
+                    break
+                except OSError:
+                    await asyncio.sleep(0.01)
+            assert connection is not None
+            await connection.send(json.dumps({"type": "session.init"}))
+            created = json.loads(await asyncio.wait_for(connection.recv(), 2))
+            assert created["type"] == "session.created", created
+            await connection.send(json.dumps({"type": "input.append", "input": {
+                "text": "hello", "max_new_speak_tokens": 1000,
+            }}))
+            await asyncio.sleep(0.03)
+            await asyncio.wait_for(connection.close(), 0.2)
+        finally:
+            if connection is not None:
+                await connection.close()
+            process.terminate()
+            await asyncio.wait_for(process.wait(), 2)
+    asyncio.run(run())

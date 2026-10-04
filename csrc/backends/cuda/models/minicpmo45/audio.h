@@ -173,7 +173,7 @@ struct MiniCPMO45AudioEncoder {
         return layers.front().key_cache.size(2);
     }
 
-    mfq_tensor_backend::Tensor forward_streaming(CudaExecutionContext &execution,
+    mfq::StepSequence<mfq_tensor_backend::Tensor> forward_streaming_steps(CudaExecutionContext &execution,
                                                  mfq_tensor_backend::Tensor features,
                                                  int64_t prefix_extra_frames,
                                                  int64_t suffix_extra_frames) {
@@ -188,7 +188,7 @@ struct MiniCPMO45AudioEncoder {
         }
 
         using Tensor = mfq_tensor_backend::Tensor;
-        return mfq::finish_steps(mfq::models::minicpmo45::audio_encoder(
+        auto sequence = mfq::models::minicpmo45::audio_encoder(
             features, layers,
             [&](Tensor features) {
                 return mfq_tensor_backend::conv1d(
@@ -247,7 +247,13 @@ struct MiniCPMO45AudioEncoder {
                            hidden.transpose(1, 2), std::vector<int64_t>{5}, std::vector<int64_t>{5})
                     .transpose(1, 2)
                     .contiguous();
-            }));
+            });
+        while (auto step = sequence.next()) co_yield std::move(step);
+    }
+
+    mfq_tensor_backend::Tensor forward_streaming(CudaExecutionContext &execution,
+        mfq_tensor_backend::Tensor features, int64_t prefix, int64_t suffix) {
+        return mfq::finish_steps(forward_streaming_steps(execution, std::move(features), prefix, suffix));
     }
 
     static std::vector<int64_t> pooled_lengths(mfq_tensor_backend::Tensor raw_lengths) {

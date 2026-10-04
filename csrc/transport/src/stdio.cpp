@@ -109,7 +109,7 @@ public:
             std::string channel_id;
             std::string session_id;
             std::unordered_set<int64_t> control_tokens;
-            bool backend_started = false;
+            bool backend_started = false, pending = false;
         };
         std::mutex realtime_gate;
         RealtimeState realtime;
@@ -253,6 +253,7 @@ public:
             std::string channel_id;
             {
                 std::lock_guard<std::mutex> lock(realtime_gate);
+                if (event.contains("session_id") && event["session_id"] != realtime.session_id) return false;
                 channel_id = realtime.channel_id;
             }
             if (channel_id.empty()) return false;
@@ -265,6 +266,59 @@ public:
 
         send({{"type", "ready"}});
         bool running = true;
+        const auto realtime_work = [&](mfq::engine::ControlRequest request, const std::string& id,
+                                       const std::string& session, auto complete) {
+            {
+                std::lock_guard lock(realtime_gate);
+                if (realtime.pending) throw ApiError(409, "conflict", "realtime operation is already pending");
+                realtime.pending = true;
+                realtime.backend_started = true;
+            }
+            const bool prepare = std::holds_alternative<mfq::engine::PrepareDuplex>(request) ||
+                std::holds_alternative<mfq::engine::PrepareDuplexStep>(request);
+            auto result = scheduler.control_async(std::move(request));
+            auto done = std::make_shared<std::atomic<bool>>(false);
+            tasks.push_back({std::thread([&, id, session, done, prepare, result = std::move(result),
+                                          complete = std::move(complete)]() mutable {
+                bool released = false;
+                try {
+                    auto value = result.get();
+                    if (prepare) {
+                        std::future<mfq::engine::ControlResult> execution;
+                        {
+                            std::lock_guard lock(realtime_gate);
+                            if (realtime.session_id != session) throw std::runtime_error("realtime session closed");
+                            if (auto* parameters = std::get_if<MfqDuplexSessionParams>(&value)) {
+                                realtime.control_tokens = {parameters->special_ids.begin(), parameters->special_ids.end()};
+                                execution = scheduler.control_async(std::move(*parameters));
+                            } else execution = scheduler.control_async(std::move(std::get<MfqDuplexStepInput>(value)));
+                        }
+                        value = execution.get();
+                    }
+                    {
+                        std::lock_guard lock(realtime_gate);
+                        if (realtime.session_id != session) throw std::runtime_error("realtime session closed");
+                        realtime.pending = false;
+                        released = true;
+                    }
+                    complete(std::move(value));
+                    send_result(id, {{"status", "ok"}});
+                } catch (const std::exception& error) {
+                    send_error(id, 500, "server_error", error.what());
+                }
+                {
+                    std::lock_guard lock(realtime_gate);
+                    if (!released && realtime.session_id == session) {
+                        realtime.pending = false;
+                        realtime.session_id.clear();
+                        realtime.control_tokens.clear();
+                        realtime.backend_started = false;
+                    }
+                }
+                done->store(true, std::memory_order_release);
+            }), done});
+        };
+
         std::string line;
         while (running && std::getline(std::cin, line)) {
             reap_tasks(false);
@@ -532,6 +586,10 @@ public:
                             "realtime message requires a string type");
                     }
                     const std::string type = body["type"].get<std::string>();
+                    {
+                        std::lock_guard lock(realtime_gate);
+                        if (realtime.pending) throw ApiError(409, "conflict", "realtime operation is already pending");
+                    }
                     if (type == "session.init") {
                         {
                             std::lock_guard<std::mutex> lock(realtime_gate);
@@ -560,8 +618,7 @@ public:
                             "system_prompt",
                             config_.runtime_profile.duplex.system_prompt.value_or(
                                 "Streaming Omni Conversation."));
-                        scheduler.prepare_duplex_session(
-                            system_prompt, parameters);
+
                         if (payload.contains("reference_audio_features")) {
                             if (!payload["reference_audio_features"].is_string()) {
                                 throw ApiError(
@@ -636,26 +693,19 @@ public:
                                     parameters.special_ids.begin(),
                                     parameters.special_ids.end());
                         }
-                        try {
-                            (void)scheduler.control(parameters);
-                            std::lock_guard<std::mutex> lock(realtime_gate);
-                            realtime.backend_started = true;
-                        } catch (...) {
-                            std::lock_guard<std::mutex> lock(realtime_gate);
-                            realtime.session_id.clear();
-                            realtime.control_tokens.clear();
-                            throw;
-                        }
-                        emit_realtime({
-                            {"type", "session.created"},
-                            {"session_id", session_id},
-                            {"mode", "full_duplex"},
-                            {"metrics", {{
-                                "backend",
-                                "cuda"
-                            }}},
+                        realtime_work(mfq::engine::PrepareDuplex{system_prompt, std::move(parameters)}, id, session_id,
+                            [&, session_id](mfq::engine::ControlResult) {
+                            emit_realtime({
+                                {"type", "session.created"},
+                                {"session_id", session_id},
+                                {"mode", "full_duplex"},
+                                {"metrics", {{
+                                    "backend",
+                                    "cuda"
+                                }}},
                         });
-                        send_result(id, {{"status", "ok"}});
+
+                        });
                         continue;
                     }
                     if (type != "input.append") {
@@ -689,6 +739,7 @@ public:
                             "input requires audio_features or text");
                     }
                     MfqDuplexStepInput step;
+                    std::string step_text;
                     if (has_audio) {
                         if (!input["audio_features"].is_string()) {
                             throw ApiError(
@@ -712,8 +763,7 @@ public:
                                 400, "invalid_request_error",
                                 "input.text must be a non-empty string");
                         }
-                        scheduler.prepare_duplex_step(
-                            input["text"].get<std::string>(), step);
+                        step_text = input["text"].get<std::string>();
                     }
                     step.max_new_speak_tokens = static_cast<int32_t>(
                         integer_field(
@@ -727,27 +777,32 @@ public:
                             400, "invalid_request_error",
                             "force_listen and force_speak are mutually exclusive");
                     }
-                    const auto result = std::get<MfqDuplexStepResult>(scheduler.control(step));
-                    const std::string response_id = request_id("resp-");
-                    json metrics = {
-                        {"backend", "cuda"},
-                        {"wall_clock_ms", result.inference_ms},
-                        {"kv_cache_length", result.language_cache_position},
-                        {"audio_cache_length", result.audio_cache_position},
-                        {"tts_cache_length", result.tts_cache_position},
-                        {"audio_chunk_index", result.audio_chunk_index},
-                    };
-                    const std::string text_delta = scheduler.decode_tokens(
-                        result.generated_tokens, controls);
-                    if (!text_delta.empty()) {
-                        emit_realtime({
-                            {"type", "response.output.delta"},
-                            {"kind", "text"},
-                            {"text", text_delta},
-                            {"session_id", session_id},
-                            {"response_id", response_id},
-                            {"end_of_turn", result.end_of_turn},
-                            {"metrics", metrics},
+                    mfq::engine::ControlRequest work = step_text.empty()
+                        ? mfq::engine::ControlRequest{std::move(step)}
+                        : mfq::engine::ControlRequest{mfq::engine::PrepareDuplexStep{std::move(step_text), std::move(step)}};
+                    realtime_work(std::move(work), id, session_id,
+                        [&, session_id, controls](mfq::engine::ControlResult value) {
+                        const auto result = std::get<MfqDuplexStepResult>(std::move(value));
+                        const std::string response_id = request_id("resp-");
+                        json metrics = {
+                            {"backend", "cuda"},
+                            {"wall_clock_ms", result.inference_ms},
+                            {"kv_cache_length", result.language_cache_position},
+                            {"audio_cache_length", result.audio_cache_position},
+                            {"tts_cache_length", result.tts_cache_position},
+                            {"audio_chunk_index", result.audio_chunk_index},
+                        };
+                        const std::string text_delta = scheduler.decode_tokens(
+                            result.generated_tokens, controls);
+                        if (!text_delta.empty()) {
+                            emit_realtime({
+                                {"type", "response.output.delta"},
+                                {"kind", "text"},
+                                {"text", text_delta},
+                                {"session_id", session_id},
+                                {"response_id", response_id},
+                                {"end_of_turn", result.end_of_turn},
+                                {"metrics", metrics},
                         });
                     }
                     if (!result.audio_tokens.empty() ||
@@ -779,7 +834,8 @@ public:
                         {"end_of_turn", result.end_of_turn},
                         {"metrics", metrics},
                     });
-                    send_result(id, {{"status", "ok"}});
+
+                    });
                     continue;
                 }
                 if (op != "generate") {

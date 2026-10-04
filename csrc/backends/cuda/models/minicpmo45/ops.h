@@ -76,9 +76,10 @@ class Components {
 
     mfq::cuda::MiniCPMO45CausalLm &language() noexcept;
     mfq::StepSequence<CudaPreparedPrompt> prepare(const std::vector<int64_t> &prompt, const MfqMultimodalInput &media);
-    void start(const MfqDuplexSessionParams &parameters);
-    MfqDuplexStepResult step(const MfqDuplexStepInput &input);
+    mfq::StepSequence<std::monostate> start(MfqDuplexSessionParams parameters);
+    mfq::StepSequence<MfqDuplexStepResult> step(MfqDuplexStepInput input);
     void stop();
+    std::size_t state_memory_bytes() const;
 
   private:
     struct State;

@@ -551,6 +551,7 @@ std::string TextProcessor::decode_tokens(
         const std::unordered_set<std::int64_t>& excluded) const {
     std::string result;
     for (const auto token : tokens) {
+        mfq::text::check_cancelled();
         if (excluded.count(token) == 0) {
             result += impl_->tokenizer->piece(token, false);
         }

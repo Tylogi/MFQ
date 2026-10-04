@@ -302,7 +302,7 @@ def test_minicpmo45_cuda_server_binds_the_realtime_backend():
     assert "minicpmo" not in CUDA_OPTIONS.lower()
     assert "MiniCPMO45Runtime" not in CUDA_COMPONENTS
     assert "components.minicpmo" not in CUDA_COMPONENTS
-    assert "state_->duplex_session->prepare(" in MINICPM_ENGINE
+    assert "state_->duplex_session->prepare_steps(" in MINICPM_ENGINE
     assert "parameters.reference_audio_features" in DECODE
     assert "input.force_speak" in DECODE
     assert "result.tts_force_flush" in DECODE

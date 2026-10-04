@@ -1,4 +1,5 @@
 #include "scheduler.h"
+#include "transport.h"
 #include <array>
 #include <atomic>
 #include <cassert>
@@ -12,12 +13,14 @@ struct FakeEngine final : Engine {
     struct Work { EngineRequest request; int steps = 0; bool cancelled = false; };
     std::map<std::string, Work> active;
     std::array<std::atomic<int>, 16> advances{};
-    std::atomic<int> released{0}, reloads{0};
+    std::atomic<int> released{0}, reloads{0}, control_steps{0}, control_terminals{0};
+    bool duplex_active = false, control_pending = false, control_stop = false, initializing = false;
+    int control_limit = 0;
     std::thread::id owner;
-    bool fail = false;
+    bool fail = false, supports_duplex = false;
     std::atomic<bool> defer{false};
     std::atomic<const float*> media{nullptr};
-    EngineInfo info() const override { return {2, 128, 64, false, false, true, {}}; }
+    EngineInfo info() const override { return {2, 128, 64, false, supports_duplex, true, {}}; }
     void check_thread() {
         if (owner == std::thread::id{}) owner = std::this_thread::get_id();
         assert(owner == std::this_thread::get_id());
@@ -74,7 +77,21 @@ struct FakeEngine final : Engine {
             }
             ++it;
         }
-        result.status = status(); result.has_work = !active.empty(); return result;
+        if (control_stop) {
+            if (control_pending) { result.control = Cancelled{}; ++control_terminals; }
+            control_pending = duplex_active = control_stop = false;
+        } else if (control_pending) {
+            ++control_steps;
+            result.control_advanced = true;
+            if (control_steps >= control_limit) {
+                result.control = initializing ? ControlCompletion{std::monostate{}} : ControlCompletion{MfqDuplexStepResult{}};
+                control_pending = false;
+                ++control_terminals;
+            }
+            std::this_thread::sleep_for(1ms); // One finite device quantum in the fake backend.
+        }
+        result.has_control_work = control_pending || control_stop;
+        result.status = status(); result.has_work = !active.empty() || result.has_control_work; return result;
     }
     SessionResult session(const SessionCommand&) override { check_thread(); return {7, {}}; }
     int64_t reload(int64_t context) override {
@@ -83,7 +100,26 @@ struct FakeEngine final : Engine {
         ++reloads; return context;
     }
     void shutdown() override { check_thread(); assert(active.empty()); }
-    ControlResult control(ControlRequest) override { check_thread(); return Metrics{}; }
+    ControlResult control(ControlRequest request) override {
+        check_thread();
+        if (std::holds_alternative<RuntimeMetrics>(request)) return Metrics{};
+        if (auto* prepare = std::get_if<PrepareDuplex>(&request)) {
+            prepare->parameters.special_ids.assign(15, 1);
+            return std::move(prepare->parameters);
+        }
+        if (auto* prepare = std::get_if<PrepareDuplexStep>(&request)) {
+            prepare->input.text_tokens = {1};
+            return std::move(prepare->input);
+        }
+        if (std::holds_alternative<DecodeTokens>(request)) return std::string{};
+        if (std::holds_alternative<StopDuplex>(request)) { control_stop = true; return std::monostate{}; }
+        assert(!control_pending);
+        initializing = std::holds_alternative<MfqDuplexSessionParams>(request);
+        control_limit = initializing ? 3 : std::get<MfqDuplexStepInput>(request).max_new_speak_tokens;
+        control_steps = 0;
+        control_pending = duplex_active = true;
+        return ControlPending{};
+    }
 };
 EngineRequest request(int id, int tokens = 12) {
     EngineRequest result;
@@ -145,7 +181,72 @@ static void check_input_ownership_and_budget() {
     assert(rejected); // Account reserved capacity, even when the vector is empty.
 }
 
-int main() {
+static void check_duplex_preemption() {
+    FakeEngine engine;
+    MfqScheduler scheduler(engine);
+    scheduler.control(MfqDuplexSessionParams{});
+    const auto wait_phase = [&](int phase) {
+        const auto deadline = Clock::now() + 2s;
+        while (engine.control_steps < phase) {
+            assert(Clock::now() < deadline);
+            std::this_thread::sleep_for(1ms);
+        }
+    };
+    for (int phase : {3, 20}) {
+        MfqDuplexStepInput input; input.max_new_speak_tokens = 1000;
+        engine.control_steps = 0;
+        auto result = scheduler.control_async(input);
+        wait_phase(phase);
+        const auto start = Clock::now();
+        (void)scheduler.control(RuntimeMetrics{});
+        scheduler.control(StopDuplex{});
+        assert(result.wait_for(100ms) == std::future_status::ready);
+        bool cancelled = false;
+        try { (void)result.get(); } catch (const std::runtime_error&) { cancelled = true; }
+        assert(cancelled && Clock::now() - start < 100ms);
+        scheduler.control(MfqDuplexSessionParams{});
+    }
+    MfqDuplexStepInput input; input.max_new_speak_tokens = 4;
+    (void)scheduler.control(input);
+    assert(engine.control_terminals == 6); // Three starts, two cancels, one completed chunk.
+    input.max_new_speak_tokens = 1000;
+    engine.control_steps = 0;
+    auto reloaded = scheduler.control_async(input);
+    wait_phase(3);
+    scheduler.reload(64);
+    assert(reloaded.wait_for(100ms) == std::future_status::ready);
+    bool cancelled = false;
+    try { reloaded.get(); } catch (...) { cancelled = true; }
+    assert(cancelled);
+    scheduler.control(MfqDuplexSessionParams{});
+    engine.control_steps = 0;
+    auto stopped = scheduler.control_async(input);
+    wait_phase(20);
+    const auto start = Clock::now();
+    scheduler.shutdown();
+    assert(Clock::now() - start < 100ms && stopped.wait_for(0ms) == std::future_status::ready);
+    cancelled = false;
+    try { stopped.get(); } catch (...) { cancelled = true; }
+    assert(cancelled && engine.control_terminals == 9);
+}
+
+int main(int argc, char** argv) {
+    if (argc >= 2) {
+        const bool stdio = std::string(argv[1]) == "--stdio";
+        if (stdio) prepare_mfq_stdio_transport();
+        FakeEngine engine;
+        engine.supports_duplex = true;
+        MfqScheduler scheduler(engine);
+        MfqHttpRuntimeTransportConfig config;
+        config.model_type = "minicpmo45";
+        config.max_context = 128;
+        config.vocab_size = 64;
+        if (stdio) return make_mfq_stdio_transport(config)->run(scheduler);
+        assert(argc == 3 && std::string(argv[1]) == "--http");
+        config.port = std::stoi(argv[2]);
+        return make_mfq_http_transport(config)->run(scheduler);
+    }
+    check_duplex_preemption();
     check_input_ownership_and_budget();
     {
         FakeEngine engine;

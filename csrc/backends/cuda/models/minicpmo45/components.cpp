@@ -102,7 +102,7 @@ mfq::StepSequence<CudaPreparedPrompt> Components::prepare(
     co_yield std::move(prepared);
 }
 
-void Components::start(const MfqDuplexSessionParams& parameters) {
+mfq::StepSequence<std::monostate> Components::start(MfqDuplexSessionParams parameters) {
         if (parameters.special_ids.size() != 15) {
             throw std::invalid_argument(
                 "MiniCPM-o duplex requires 15 special token IDs");
@@ -161,8 +161,6 @@ void Components::start(const MfqDuplexSessionParams& parameters) {
                 "MiniCPM-o reference Mel geometry is invalid");
         }
 
-        MfqCudaGuard guard(
-            state_->runtime.language.execution->layer_placement.primary_device());
         mfq_tensor_backend::manual_seed(static_cast<int64_t>(parameters.seed));
         mfq_cuda_manual_seed_all(parameters.seed);
         auto special_ids = MiniCPMO45DuplexSpecialIds::from_tensor(
@@ -199,14 +197,15 @@ void Components::start(const MfqDuplexSessionParams& parameters) {
                 mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kFloat32))
                 .reshape({1, 80, parameters.reference_audio_frames});
         }
-        state_->duplex_session->prepare(
+        auto prepare = state_->duplex_session->prepare_steps(
             ids_tensor(parameters.system_prefix),
             reference_features,
             ids_tensor(parameters.system_suffix));
-        mfq_cuda_synchronize();
+        while (auto step = prepare.next()) co_yield step.state;
+        co_yield std::monostate{};
 }
 
-MfqDuplexStepResult Components::step(const MfqDuplexStepInput& input) {
+mfq::StepSequence<MfqDuplexStepResult> Components::step(MfqDuplexStepInput input) {
         const bool has_audio = input.audio_frames > 0;
         const bool has_text = !input.text_tokens.empty();
         if (has_audio && input.audio_features.size() !=
@@ -223,8 +222,6 @@ MfqDuplexStepResult Components::step(const MfqDuplexStepInput& input) {
                 "MiniCPM-o duplex generation requires at least two token slots");
         }
 
-        MfqCudaGuard guard(
-            state_->runtime.language.execution->layer_placement.primary_device());
         if (!state_->duplex_session) {
             throw std::runtime_error(
                 "MiniCPM-o duplex session is not prepared");
@@ -244,7 +241,7 @@ MfqDuplexStepResult Components::step(const MfqDuplexStepInput& input) {
                 .reshape({1, static_cast<int64_t>(input.text_tokens.size())});
         }
         const auto started = std::chrono::steady_clock::now();
-        auto result = state_->duplex_session->run_step(
+        auto generation = state_->duplex_session->run_step_steps(
             {}, {}, {}, {}, audio_features,
             input.audio_prefix_extra_frames,
             input.audio_suffix_extra_frames,
@@ -253,6 +250,11 @@ MfqDuplexStepResult Components::step(const MfqDuplexStepInput& input) {
             input.force_listen,
             input.force_speak);
 
+        MiniCPMO45DuplexStepResult result;
+        while (auto step = generation.next()) {
+            if (step.value) result = std::move(*step.value);
+            co_yield step.state;
+        }
         MfqDuplexStepResult response;
         auto generated = result.generated_ids
             .to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous().reshape({-1});
@@ -274,7 +276,30 @@ MfqDuplexStepResult Components::step(const MfqDuplexStepInput& input) {
         response.inference_ms =
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - started).count();
-        return response;
+        co_yield std::move(response);
+}
+
+std::size_t Components::state_memory_bytes() const {
+    std::size_t bytes = 0;
+    const auto reserve = [&](std::initializer_list<std::size_t> dimensions) {
+        std::size_t size = 1;
+        for (auto dimension : dimensions) {
+            if (dimension && size > std::size_t(-1) / dimension)
+                throw std::overflow_error("duplex state geometry overflows size_t");
+            size *= dimension;
+        }
+        if (bytes > std::size_t(-1) - size) throw std::overflow_error("duplex state budget overflows size_t");
+        bytes += size;
+    };
+    for (const auto& block : state_->runtime.tts.blocks) {
+        const auto& full = dynamic_cast<const FullBlock&>(*block);
+        reserve({2, 2, 2, std::size_t(full.max_position_embeddings),
+                 std::size_t(full.kv_heads), std::size_t(full.attention_head_dim)});
+    }
+    // Whisper concatenates live KV while encoding the next audio chunk.
+    reserve({2, 2, 4, state_->runtime.audio.layers.size(),
+             std::size_t(state_->runtime.audio.position_embedding.size(0)), 1024});
+    return bytes;
 }
 
 void Components::stop() {

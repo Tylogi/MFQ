@@ -150,9 +150,12 @@ void MfqScheduler::cancel_all() const {
     Cancel command{{}, false, true, {}};
     auto result = command.reply.get_future(); enqueue(std::move(command)); result.get();
 }
-ControlResult MfqScheduler::control(ControlRequest request) const {
+std::future<ControlResult> MfqScheduler::control_async(ControlRequest request) const {
     Control command{std::move(request), {}};
-    auto result = command.reply.get_future(); enqueue(std::move(command)); return result.get();
+    auto result = command.reply.get_future(); enqueue(std::move(command)); return result;
+}
+ControlResult MfqScheduler::control(ControlRequest request) const {
+    return control_async(std::move(request)).get();
 }
 SessionResult MfqScheduler::session(SessionCommand request) const {
     Session command{std::move(request), {}};
@@ -163,10 +166,10 @@ std::int64_t MfqScheduler::reload(std::int64_t context) const {
     auto result = command.reply.get_future(); enqueue(std::move(command)); return result.get();
 }
 void MfqScheduler::prepare_duplex_session(const std::string& prompt, MfqDuplexSessionParams& params) const {
-    params = std::get<MfqDuplexSessionParams>(control(PrepareDuplex{prompt, params}));
+    params = std::get<MfqDuplexSessionParams>(control(PrepareDuplex{prompt, std::move(params)}));
 }
 void MfqScheduler::prepare_duplex_step(const std::string& text, MfqDuplexStepInput& input) const {
-    input = std::get<MfqDuplexStepInput>(control(PrepareDuplexStep{text, input}));
+    input = std::get<MfqDuplexStepInput>(control(PrepareDuplexStep{text, std::move(input)}));
 }
 std::string MfqScheduler::decode_tokens(const std::vector<std::int64_t>& tokens,
         const std::unordered_set<std::int64_t>& excluded) const {
@@ -248,6 +251,8 @@ void MfqScheduler::release_input_budget(const Request& request) {
 
 void MfqScheduler::loop() noexcept {
     std::optional<Reload> reload;
+    std::optional<Control> pending_control;
+    bool control_work = false;
     bool healthy = true;
     bool duplex_active = false;
     for (;;) {
@@ -276,11 +281,22 @@ void MfqScheduler::loop() noexcept {
                             cancel(request); found = true;
                         }
                     }
+                    if (value.all && (duplex_active || pending_control)) {
+                        (void)engine_.control(StopDuplex{});
+                        duplex_active = false;
+                        control_work = true;
+                        found = true;
+                    }
                     value.reply.set_value(found);
                 } else if constexpr (std::is_same_v<T, Control>) {
                     const bool start_duplex = std::holds_alternative<MfqDuplexSessionParams>(value.request);
                     const bool stop_duplex = std::holds_alternative<StopDuplex>(value.request);
                     if (reload) throw std::runtime_error("reload is pending");
+                    const bool duplex_work = start_duplex || std::holds_alternative<MfqDuplexStepInput>(value.request);
+                    const bool text_work = std::holds_alternative<DecodeTokens>(value.request) ||
+                        std::holds_alternative<PrepareDuplex>(value.request) || std::holds_alternative<PrepareDuplexStep>(value.request);
+                    if ((duplex_work || text_work) && (pending_control || control_work))
+                        throw std::runtime_error("duplex operation is already pending");
                     if ((std::holds_alternative<MfqDuplexSessionParams>(value.request) ||
                          std::holds_alternative<MfqDuplexStepInput>(value.request) ||
                          std::holds_alternative<StopDuplex>(value.request)) && !requests_.empty())
@@ -288,7 +304,9 @@ void MfqScheduler::loop() noexcept {
                     auto result = engine_.control(std::move(value.request));
                     if (start_duplex) duplex_active = true;
                     if (stop_duplex) duplex_active = false;
-                    value.reply.set_value(std::move(result));
+                    control_work |= stop_duplex || std::holds_alternative<ControlPending>(result);
+                    if (std::holds_alternative<ControlPending>(result)) pending_control.emplace(std::move(value));
+                    else value.reply.set_value(std::move(result));
                 } else if constexpr (std::is_same_v<T, Session>) {
                     if (value.request.kind != SessionCommand::Kind::metrics) {
                         if (duplex_active || reload) throw std::runtime_error("session operation conflicts with runtime control");
@@ -308,9 +326,10 @@ void MfqScheduler::loop() noexcept {
                     value.reply.set_value(status);
                 } else {
                     if (reload) throw std::runtime_error("reload already pending");
-                    if (duplex_active) {
+                    if (duplex_active || pending_control) {
                         (void)engine_.control(StopDuplex{});
                         duplex_active = false;
+                        control_work = true;
                     }
                     for (auto& [id, request] : requests_) cancel(request);
                     reload.emplace(std::move(value));
@@ -323,6 +342,11 @@ void MfqScheduler::loop() noexcept {
         bool executable = false;
         auto wake_at = Clock::time_point::max();
         try {
+            if (stopping && (duplex_active || pending_control)) {
+                (void)engine_.control(StopDuplex{});
+                duplex_active = false;
+                control_work = true;
+            }
             std::vector<RequestId> eligible;
             std::vector<RequestId> ordered(order_.begin(), order_.end());
             std::stable_sort(ordered.begin(), ordered.end(), [&](const auto& a, const auto& b) {
@@ -361,18 +385,43 @@ void MfqScheduler::loop() noexcept {
                         box.bytes_ < (limits_.bytes - terminal_reserve) / 2)
                     eligible.push_back(id);
             }
-            executable |= !eligible.empty();
+            executable |= !eligible.empty() || control_work;
             if (executable) {
                 auto result = engine_.step(eligible);
                 for (auto& event : result.events) {
                     auto found = requests_.find(event.id);
                     if (found != requests_.end()) publish(found->second, std::move(event));
                 }
+                control_work = result.has_control_work;
+                if (result.control) {
+                    if (!pending_control) throw std::logic_error("unsolicited control completion");
+                    std::visit([&](auto&& completion) {
+                        using C = std::decay_t<decltype(completion)>;
+                        if constexpr (std::is_same_v<C, Failed> || std::is_same_v<C, Cancelled>) {
+                            if (std::holds_alternative<Cancelled>(*result.control) ||
+                                std::holds_alternative<MfqDuplexSessionParams>(pending_control->request) ||
+                                std::holds_alternative<MfqDuplexStepInput>(pending_control->request)) duplex_active = false;
+                            const auto message = [&] {
+                                if constexpr (std::is_same_v<C, Failed>) return completion.message;
+                                else return std::string("duplex operation cancelled");
+                            }();
+                            if constexpr (std::is_same_v<C, Failed>) {
+                                if (completion.code == "invalid_request")
+                                    pending_control->reply.set_exception(std::make_exception_ptr(
+                                        InferenceInputError(InferenceInputErrorCode::Invalid, message)));
+                                else pending_control->reply.set_exception(std::make_exception_ptr(std::runtime_error(message)));
+                            } else pending_control->reply.set_exception(std::make_exception_ptr(std::runtime_error(message)));
+                        } else pending_control->reply.set_value(std::move(completion));
+                    }, std::move(*result.control));
+                    pending_control.reset();
+                }
                 if (!result.status.healthy) throw std::runtime_error("engine is unhealthy");
-                executable = !result.advanced.empty() || !result.events.empty();
+                executable = !result.advanced.empty() || !result.events.empty() || result.control_advanced;
                 if (result.wake_at) wake_at = std::min(wake_at, *result.wake_at);
             }
         } catch (const std::exception& error) {
+            if (pending_control) { pending_control->reply.set_exception(std::current_exception()); pending_control.reset(); }
+            control_work = duplex_active = false;
             healthy = false;
             for (auto& [id, request] : requests_) {
                 try { if (request.admitted) engine_.cancel(id); } catch (...) {}
@@ -382,6 +431,8 @@ void MfqScheduler::loop() noexcept {
                 if (!request.finished)
                     try { publish(request, {id, Failed{"backend_failure", error.what()}}); } catch (...) {}
         } catch (...) {
+            if (pending_control) { pending_control->reply.set_exception(std::current_exception()); pending_control.reset(); }
+            control_work = duplex_active = false;
             healthy = false;
             for (auto& [id, request] : requests_)
                 try { engine_.cancel(id); } catch (...) {}
@@ -399,7 +450,7 @@ void MfqScheduler::loop() noexcept {
             }
             else ++it;
         }
-        if (reload && requests_.empty()) {
+        if (reload && requests_.empty() && !control_work && !pending_control) {
             try {
                 const auto context = engine_.reload(reload->context);
                 { std::lock_guard lock(mutex_); info_ = engine_.info(); }
@@ -408,7 +459,7 @@ void MfqScheduler::loop() noexcept {
             reload.reset();
         }
         if (!order_.empty()) { order_.push_back(order_.front()); order_.pop_front(); }
-        if (stopping && requests_.empty()) {
+        if (stopping && requests_.empty() && !control_work && !pending_control) {
             try { engine_.shutdown(); } catch (...) {}
             return;
         }

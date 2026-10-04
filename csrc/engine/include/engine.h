@@ -64,12 +64,18 @@ struct EngineStatus {
     std::size_t available = 0;
     bool healthy = true;
 };
+using ControlCompletion = std::variant<std::monostate, MfqDuplexStepResult, MfqDuplexSessionParams,
+    MfqDuplexStepInput, std::string, Cancelled, Failed>;
+// A pending control publishes exactly one completion from step(). Metrics stay synchronous.
+struct ControlPending {};
 struct EngineStepResult {
     std::vector<RequestId> advanced;
     std::vector<EngineEvent> events;
     EngineStatus status;
     bool has_work = false;
     std::optional<Clock::time_point> wake_at;
+    std::optional<ControlCompletion> control;
+    bool control_advanced = false, has_control_work = false;
 };
 enum class Admission { accepted, deferred };
 struct SessionCommand {
@@ -89,7 +95,7 @@ struct RuntimeMetrics {};
 using ControlRequest = std::variant<DecodeTokens, PrepareDuplex,
     PrepareDuplexStep, MfqDuplexSessionParams, MfqDuplexStepInput, StopDuplex,
     RuntimeMetrics>;
-using ControlResult = std::variant<std::monostate,
+using ControlResult = std::variant<std::monostate, ControlPending,
     std::string, MfqDuplexSessionParams, MfqDuplexStepInput, MfqDuplexStepResult,
     Metrics>;
 

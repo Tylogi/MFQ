@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <exception>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -133,12 +134,11 @@ int run_mfq_http_transport(
             duplex_session_id.clear();
             duplex_socket = nullptr;
             duplex_backend_started = false;
+            // The handler cannot finish and destroy its socket while this gate is held.
+            if (close_socket && socket != nullptr && socket->is_open())
+                socket->close(httplib::ws::CloseStatus::Normal, "session closed");
         }
         if (stop_backend) (void)scheduler.control(mfq::engine::StopDuplex{});
-        if (close_socket && socket != nullptr && socket->is_open()) {
-            socket->close(
-                httplib::ws::CloseStatus::Normal, "session closed");
-        }
         return true;
     };
     server.set_payload_max_length(
@@ -179,6 +179,44 @@ int run_mfq_http_transport(
                             .time_since_epoch()).count();
                 return ws.send(event.dump());
             };
+            std::future<void> pending;
+            const auto launch = [&](mfq::engine::ControlRequest request, auto complete) {
+                if (pending.valid()) {
+                    if (pending.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                        throw ApiError(409, "conflict", "duplex operation is already pending");
+                    pending.get();
+                }
+                const bool prepare = std::holds_alternative<mfq::engine::PrepareDuplex>(request) ||
+                    std::holds_alternative<mfq::engine::PrepareDuplexStep>(request);
+                auto result = scheduler.control_async(std::move(request));
+                {
+                    std::lock_guard lock(duplex_gate);
+                    if (duplex_session_id == owned_session) duplex_backend_started = true;
+                }
+                pending = std::async(std::launch::async,
+                    [&, session = owned_session, prepare, result = std::move(result), complete = std::move(complete)]() mutable {
+                        try {
+                            auto value = result.get();
+                            if (prepare) {
+                                std::future<mfq::engine::ControlResult> execution;
+                                {
+                                    std::lock_guard lock(duplex_gate);
+                                    if (duplex_session_id != session) throw std::runtime_error("duplex session closed");
+                                    if (auto* parameters = std::get_if<MfqDuplexSessionParams>(&value)) {
+                                        session_controls = {parameters->special_ids.begin(), parameters->special_ids.end()};
+                                        execution = scheduler.control_async(std::move(*parameters));
+                                    } else execution = scheduler.control_async(std::move(std::get<MfqDuplexStepInput>(value)));
+                                }
+                                value = execution.get();
+                            }
+                            if (ws.is_open()) complete(std::move(value));
+                        } catch (const std::exception& error) {
+                            send_event({{"type", "session.closed"}, {"session_id", session},
+                                {"reason", "backend_error"}, {"diagnostic", {{"message", error.what()}}}});
+                            ws.close(httplib::ws::CloseStatus::InternalError, "duplex operation failed");
+                        }
+                    });
+            };
             try {
                 std::string message;
                 while (ws.is_open()) {
@@ -205,6 +243,11 @@ int run_mfq_http_transport(
                             "duplex message requires a string type");
                     }
                     const std::string type = body["type"].get<std::string>();
+                    if (pending.valid()) {
+                        if (pending.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                            throw ApiError(409, "conflict", "duplex operation is already pending");
+                        pending.get();
+                    }
 
                     if (type == "session.init") {
                         if (!owned_session.empty()) {
@@ -247,8 +290,7 @@ int run_mfq_http_transport(
                             "system_prompt",
                             config.runtime_profile.duplex.system_prompt.value_or(
                                 "Streaming Omni Conversation."));
-                        scheduler.prepare_duplex_session(
-                            system_prompt, parameters);
+
                         if (payload.contains("reference_audio_features")) {
                             if (!payload["reference_audio_features"].is_string()) {
                                 throw ApiError(
@@ -311,26 +353,13 @@ int run_mfq_http_transport(
                                 static_cast<uint64_t>(random());
                         }
 
-                        try {
-                            (void)scheduler.control(parameters);
-                            std::lock_guard<std::mutex> lock(duplex_gate);
-                            if (duplex_session_id == owned_session) {
-                                duplex_backend_started = true;
-                            }
-                        } catch (...) {
-                            std::lock_guard<std::mutex> lock(duplex_gate);
-                            if (duplex_session_id == owned_session) {
-                                duplex_session_id.clear();
-                                duplex_socket = nullptr;
-                            }
-                            owned_session.clear();
-                            throw;
-                        }
-                        send_event({
-                            {"type", "session.created"},
-                            {"session_id", owned_session},
-                            {"mode", "full_duplex"},
-                            {"metrics", {{"backend", duplex_backend_name}}},
+                        launch(mfq::engine::PrepareDuplex{system_prompt, std::move(parameters)}, [&, session = owned_session](mfq::engine::ControlResult) {
+                            send_event({
+                                {"type", "session.created"},
+                                {"session_id", session},
+                                {"mode", "full_duplex"},
+                                {"metrics", {{"backend", duplex_backend_name}}},
+                        });
                         });
                         continue;
                     }
@@ -359,6 +388,7 @@ int run_mfq_http_transport(
                             "input requires audio_features or text", "input");
                     }
                     MfqDuplexStepInput step;
+                    std::string step_text;
                     if (has_audio) {
                         if (!input["audio_features"].is_string()) {
                             throw ApiError(
@@ -383,8 +413,7 @@ int run_mfq_http_transport(
                                 400, "invalid_request_error",
                                 "input.text must be a non-empty string", "text");
                         }
-                        scheduler.prepare_duplex_step(
-                            input["text"].get<std::string>(), step);
+                        step_text = input["text"].get<std::string>();
                     }
                     step.max_new_speak_tokens = static_cast<int32_t>(
                         integer_field(
@@ -413,28 +442,32 @@ int run_mfq_http_transport(
                             "force_listen and force_speak are mutually exclusive");
                     }
 
-                    const auto result = std::get<MfqDuplexStepResult>(scheduler.control(step));
-                    const std::string response_id = request_id("resp-");
-                    json metrics = {
-                        {"backend", duplex_backend_name},
-                        {"wall_clock_ms", result.inference_ms},
-                        {"kv_cache_length", result.language_cache_position},
-                        {"audio_cache_length", result.audio_cache_position},
-                        {"tts_cache_length", result.tts_cache_position},
-                        {"audio_chunk_index", result.audio_chunk_index},
-                    };
+                    mfq::engine::ControlRequest work = step_text.empty()
+                        ? mfq::engine::ControlRequest{std::move(step)}
+                        : mfq::engine::ControlRequest{mfq::engine::PrepareDuplexStep{std::move(step_text), std::move(step)}};
+                    launch(std::move(work), [&, session = owned_session, session_controls](mfq::engine::ControlResult value) {
+                        const auto result = std::get<MfqDuplexStepResult>(std::move(value));
+                        const std::string response_id = request_id("resp-");
+                        json metrics = {
+                            {"backend", duplex_backend_name},
+                            {"wall_clock_ms", result.inference_ms},
+                            {"kv_cache_length", result.language_cache_position},
+                            {"audio_cache_length", result.audio_cache_position},
+                            {"tts_cache_length", result.tts_cache_position},
+                            {"audio_chunk_index", result.audio_chunk_index},
+                        };
 
-                    const std::string text_delta = scheduler.decode_tokens(
-                        result.generated_tokens, session_controls);
-                    if (!text_delta.empty()) {
-                        send_event({
-                            {"type", "response.output.delta"},
-                            {"kind", "text"},
-                            {"text", text_delta},
-                            {"session_id", owned_session},
-                            {"response_id", response_id},
-                            {"end_of_turn", result.end_of_turn},
-                            {"metrics", metrics},
+                        const std::string text_delta = scheduler.decode_tokens(
+                            result.generated_tokens, session_controls);
+                        if (!text_delta.empty()) {
+                            send_event({
+                                {"type", "response.output.delta"},
+                                {"kind", "text"},
+                                {"text", text_delta},
+                                {"session_id", session},
+                                {"response_id", response_id},
+                                {"end_of_turn", result.end_of_turn},
+                                {"metrics", metrics},
                         });
                     }
                     if (!result.audio_tokens.empty() ||
@@ -443,7 +476,7 @@ int run_mfq_http_transport(
                             {"type", "response.output.delta"},
                             {"kind", "audio_tokens"},
                             {"audio_tokens", result.audio_tokens},
-                            {"session_id", owned_session},
+                            {"session_id", session},
                             {"response_id", response_id},
                             {"end_of_turn", result.end_of_turn},
                             {"force_flush", result.tts_force_flush},
@@ -454,17 +487,18 @@ int run_mfq_http_transport(
                         send_event({
                             {"type", "response.output.delta"},
                             {"kind", "listen"},
-                            {"session_id", owned_session},
+                            {"session_id", session},
                             {"response_id", response_id},
                             {"metrics", metrics},
                         });
                     }
                     send_event({
                         {"type", "response.step.done"},
-                        {"session_id", owned_session},
+                        {"session_id", session},
                         {"response_id", response_id},
                         {"end_of_turn", result.end_of_turn},
                         {"metrics", metrics},
+                    });
                     });
                 }
             } catch (const mfq::engine::InferenceInputError & error) {
@@ -495,6 +529,7 @@ int run_mfq_http_transport(
             if (!owned_session.empty()) {
                 stop_duplex_session(owned_session, false);
             }
+            if (pending.valid()) pending.get();
         });
 
         server.Post(R"(/runtime/realtime/sessions/([A-Za-z0-9_-]+)/close)",

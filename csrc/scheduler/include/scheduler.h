@@ -50,6 +50,7 @@ public:
     void shutdown();
     mfq::engine::EngineInfo info() const;
     mfq::engine::EngineStatus status() const;
+    std::future<mfq::engine::ControlResult> control_async(mfq::engine::ControlRequest request) const;
     mfq::engine::ControlResult control(mfq::engine::ControlRequest request) const;
     mfq::engine::SessionResult session(mfq::engine::SessionCommand command) const;
     std::int64_t reload(std::int64_t context) const;

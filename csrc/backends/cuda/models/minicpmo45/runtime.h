@@ -222,7 +222,7 @@ struct MiniCPMO45DuplexSession {
         }
     }
 
-    void prepare(
+    mfq::StepSequence<std::monostate> prepare_steps(
             mfq_tensor_backend::Tensor system_prefix_ids,
             mfq_tensor_backend::Tensor reference_audio_features = mfq_tensor_backend::Tensor(),
             mfq_tensor_backend::Tensor system_suffix_ids = mfq_tensor_backend::Tensor()) {
@@ -235,7 +235,8 @@ struct MiniCPMO45DuplexSession {
         current_turn_ended = true;
         if (system_prefix_ids.defined() &&
                 system_prefix_ids.numel() > 0) {
-            feed_ids(system_prefix_ids);
+            auto sequence = feed_ids_steps(system_prefix_ids);
+            while (auto step = sequence.next()) co_yield step.state;
         }
         if (reference_audio_features.defined()) {
             if (reference_audio_features.dim() != 3 ||
@@ -248,17 +249,49 @@ struct MiniCPMO45DuplexSession {
             auto raw_lengths = mfq_tensor_backend::tensor(
                 std::vector<int64_t>{reference_audio_features.size(2)},
                 mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64));
-            auto embeddings = runtime.audio.forward(
+            auto encode = runtime.audio.forward_steps(
                 *runtime.language.execution,
                 reference_audio_features.to(mfq_tensor_backend::kCUDA),
                 raw_lengths, false);
-            feed_embeddings(embeddings);
+            mfq_tensor_backend::Tensor embeddings;
+            while (auto step = encode.next()) {
+                if (step.value) embeddings = std::move(*step.value);
+                co_yield step.state;
+            }
+            auto feed = feed_embeddings_steps(embeddings);
+            while (auto step = feed.next()) co_yield step.state;
             runtime.audio.reset();
         }
         if (system_suffix_ids.defined() &&
                 system_suffix_ids.numel() > 0) {
-            feed_ids(system_suffix_ids);
+            auto sequence = feed_ids_steps(system_suffix_ids);
+            while (auto step = sequence.next()) co_yield step.state;
         }
+        co_yield std::monostate{};
+    }
+    void prepare(mfq_tensor_backend::Tensor prefix, mfq_tensor_backend::Tensor audio = {},
+                 mfq_tensor_backend::Tensor suffix = {}) {
+        (void)mfq::finish_steps(prepare_steps(std::move(prefix), std::move(audio), std::move(suffix)));
+    }
+
+    using FeedResult = std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor>;
+    mfq::StepSequence<FeedResult> feed_ids_steps(mfq_tensor_backend::Tensor ids) {
+        ids = ids.reshape({1, -1});
+        FeedResult result;
+        for (int64_t offset = 0; offset < ids.size(1); offset += 64) {
+            result = feed_ids(ids.narrow(1, offset, std::min<int64_t>(64, ids.size(1) - offset)));
+            co_yield mfq::StepState::advanced;
+        }
+        co_yield std::move(result);
+    }
+    mfq::StepSequence<FeedResult> feed_embeddings_steps(mfq_tensor_backend::Tensor embeddings) {
+        if (embeddings.dim() == 2) embeddings = embeddings.unsqueeze(0);
+        FeedResult result;
+        for (int64_t offset = 0; offset < embeddings.size(1); offset += 64) {
+            result = feed_embeddings(embeddings.narrow(1, offset, std::min<int64_t>(64, embeddings.size(1) - offset)));
+            co_yield mfq::StepState::advanced;
+        }
+        co_yield std::move(result);
     }
 
     std::pair<mfq_tensor_backend::Tensor, mfq_tensor_backend::Tensor> feed_embeddings(
@@ -399,7 +432,7 @@ struct MiniCPMO45DuplexSession {
         return sampled.item<int64_t>();
     }
 
-    MiniCPMO45DuplexStepResult run_step(
+    mfq::StepSequence<MiniCPMO45DuplexStepResult> run_step_steps(
             mfq_tensor_backend::Tensor pixels,
             mfq_tensor_backend::Tensor patch_mask,
             mfq_tensor_backend::Tensor target_sizes,
@@ -416,6 +449,7 @@ struct MiniCPMO45DuplexSession {
                 "MiniCPM-o duplex generation requires at least two token slots");
         }
         auto pending = feed_id(ids.unit_start);
+        co_yield mfq::StepState::advanced;
         mfq_tensor_backend::Tensor generation_logits;
         bool has_content = false;
         mfq_tensor_backend::Tensor audio_embeddings;
@@ -425,9 +459,14 @@ struct MiniCPMO45DuplexSession {
                 throw std::runtime_error(
                     "MiniCPM-o duplex image pixels require patch mask and target sizes");
             }
-            auto vision_states = runtime.vision.forward(
+            auto vision = runtime.vision.forward_steps(
                 *runtime.language.execution,
                 pixels.to(mfq_tensor_backend::kCUDA), patch_mask, target_sizes);
+            mfq_tensor_backend::Tensor vision_states;
+            while (auto step = vision.next()) {
+                if (step.value) vision_states = std::move(*step.value);
+                co_yield step.state;
+            }
             auto image_embeddings = runtime.resampler.forward(
                 *runtime.language.execution, vision_states, target_sizes);
             std::vector<int64_t> counts;
@@ -447,12 +486,20 @@ struct MiniCPMO45DuplexSession {
                         "MiniCPM-o duplex image slice counts are invalid");
                 }
                 pending = feed_id(ids.image_start);
-                pending = feed_embeddings(image_embeddings.index({offset}));
+                auto feed = feed_embeddings_steps(image_embeddings.index({offset}));
+                while (auto step = feed.next()) {
+                    if (step.value) pending = std::move(*step.value);
+                    co_yield step.state;
+                }
                 pending = feed_id(ids.image_end);
                 ++offset;
                 for (int64_t slice = 1; slice < count; ++slice) {
                     pending = feed_id(ids.slice_start);
-                    pending = feed_embeddings(image_embeddings.index({offset}));
+                    auto feed = feed_embeddings_steps(image_embeddings.index({offset}));
+                while (auto step = feed.next()) {
+                    if (step.value) pending = std::move(*step.value);
+                    co_yield step.state;
+                }
                     pending = feed_id(ids.slice_end);
                     ++offset;
                 }
@@ -466,19 +513,31 @@ struct MiniCPMO45DuplexSession {
         }
 
         if (audio_features.defined()) {
-            audio_embeddings = runtime.audio.forward_streaming(
+            auto audio = runtime.audio.forward_streaming_steps(
                 *runtime.language.execution,
                 audio_features.to(mfq_tensor_backend::kCUDA),
                 audio_prefix_extra_frames,
                 audio_suffix_extra_frames);
-            pending = feed_embeddings(audio_embeddings);
+            while (auto step = audio.next()) {
+                if (step.value) audio_embeddings = std::move(*step.value);
+                co_yield step.state;
+            }
+            auto feed = feed_embeddings_steps(audio_embeddings);
+            while (auto step = feed.next()) {
+                if (step.value) pending = std::move(*step.value);
+                co_yield step.state;
+            }
             generation_logits = pending.first;
             ++audio_chunk_index;
             has_content = true;
         }
 
         if (text_ids.defined() && text_ids.numel() > 0) {
-            pending = feed_ids(text_ids);
+            auto feed = feed_ids_steps(text_ids);
+            while (auto step = feed.next()) {
+                if (step.value) pending = std::move(*step.value);
+                co_yield step.state;
+            }
             if (!generation_logits.defined()) {
                 generation_logits = pending.first;
             }
@@ -504,6 +563,7 @@ struct MiniCPMO45DuplexSession {
             if (index == max_new_speak_tokens - 1) {
                 feed_id(ids.chunk_eos);
                 generated.push_back(ids.chunk_eos);
+                co_yield mfq::StepState::advanced;
                 break;
             }
             const bool forced_decision = force_current;
@@ -520,6 +580,7 @@ struct MiniCPMO45DuplexSession {
             result.is_listen = token == ids.listen;
             if (ids.is_chunk_terminator(token)) {
                 pending = feed_id(token);
+                co_yield mfq::StepState::advanced;
                 break;
             }
 
@@ -533,8 +594,10 @@ struct MiniCPMO45DuplexSession {
                 spoken_hidden.push_back(
                     pending.second.index({Slice(), -1, Slice()}));
             }
+            co_yield mfq::StepState::advanced;
         }
         feed_id(ids.unit_end);
+        co_yield mfq::StepState::advanced;
 
         result.generated_ids = mfq_tensor_backend::tensor(
             generated,
@@ -572,10 +635,13 @@ struct MiniCPMO45DuplexSession {
             }
             const int64_t minimum_codes =
                 result.end_of_turn || first_tts_chunk ? 0 : 26;
-            auto tts_result = runtime.tts.generate_duplex_chunk(
+            auto speech = runtime.tts.generate_duplex_chunk_steps(
                 condition, 26, minimum_codes, 6561,
                 tts_temperature, tts_repetition_penalty);
-            result.tts_codes = tts_result.codes;
+            while (auto step = speech.next()) {
+                if (step.value) result.tts_codes = std::move(step.value->codes);
+                co_yield step.state;
+            }
             if (result.end_of_turn) {
                 runtime.tts.reset(1);
                 tts_text_start_position = 0;
@@ -593,6 +659,13 @@ struct MiniCPMO45DuplexSession {
                 mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64)
                     .device(mfq_tensor_backend::kCUDA));
         }
-        return result;
+        co_yield std::move(result);
+    }
+    MiniCPMO45DuplexStepResult run_step(mfq_tensor_backend::Tensor pixels,
+        mfq_tensor_backend::Tensor mask, mfq_tensor_backend::Tensor sizes, mfq_tensor_backend::Tensor slices,
+        mfq_tensor_backend::Tensor audio, int64_t prefix, int64_t suffix, mfq_tensor_backend::Tensor text,
+        int64_t maximum, bool listen, bool speak = false) {
+        return mfq::finish_steps(run_step_steps(std::move(pixels), std::move(mask), std::move(sizes),
+            std::move(slices), std::move(audio), prefix, suffix, std::move(text), maximum, listen, speak));
     }
 };

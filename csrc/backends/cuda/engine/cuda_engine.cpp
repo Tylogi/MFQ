@@ -31,7 +31,9 @@ struct CudaEngineState {
     DecodeGraphCache graph;
     TextSessionCache cache;
     std::unique_ptr<ContinuousBatch<QwenBatchOperations>> batching;
-    bool duplex_active = false;
+    bool duplex_active = false, duplex_pending = false, duplex_stop = false;
+    mfq::StepSequence<ControlCompletion> duplex_sequence;
+    std::optional<AdmissionBudget::Lease> duplex_memory;
     AdmissionBudget memory;
     std::vector<std::size_t> request_bytes;
 
@@ -93,6 +95,7 @@ struct CudaEngineState {
         cache.limit_snapshot_bytes(snapshot_budget == std::size_t(-1) ? 0 : snapshot_budget);
         const auto primary = execution->layer_placement.primary_device();
         add(primary, product({8, std::size_t(language.vocab_size())}));
+        if (components.composite) add(primary, components.composite->state_memory_bytes());
         for (const auto* devices : {&execution->tensor_parallel.devices,
                                    &execution->expert_parallel.devices,
                                    &execution->layer_placement.devices})
@@ -172,6 +175,48 @@ struct CudaEngineState {
         if (request.batched) graph.invalidate();
         return generate_prepared(*this, request.input, request.output, id, request.batched);
     }
+    mfq::StepSequence<ControlCompletion> start_duplex(MfqDuplexSessionParams parameters) {
+        auto start = components.composite->start(std::move(parameters));
+        while (auto step = start.next()) co_yield step.state;
+        co_yield ControlCompletion{std::monostate{}};
+    }
+    mfq::StepSequence<ControlCompletion> step_duplex(MfqDuplexStepInput input) {
+        auto generation = components.composite->step(std::move(input));
+        while (auto step = generation.next()) {
+            if (step.value) co_yield ControlCompletion{std::move(*step.value)};
+            else co_yield step.state;
+        }
+    }
+    void advance_control(EngineStepResult& result) {
+        if (!duplex_pending && !duplex_stop) return;
+        try {
+            if (duplex_stop) {
+                duplex_sequence = {};
+                components.composite->stop();
+                if (duplex_pending) result.control = Cancelled{};
+                duplex_pending = duplex_active = duplex_stop = false;
+                duplex_memory.reset();
+            } else {
+                auto step = duplex_sequence.next();
+                result.control_advanced = step.state == mfq::StepState::advanced;
+                if (step.value) {
+                    result.control = std::move(*step.value);
+                    duplex_pending = false;
+                    duplex_sequence = {};
+                } else if (!step) throw std::runtime_error("duplex completed without a result");
+                else if (step.state == mfq::StepState::waiting)
+                    result.wake_at = Clock::now() + std::chrono::milliseconds(1);
+            }
+        } catch (const std::exception& error) {
+            result.control = Failed{"duplex_failed", error.what(), false};
+            duplex_sequence = {};
+            duplex_pending = duplex_active = duplex_stop = false;
+            components.composite->stop();
+            duplex_memory.reset();
+        }
+        result.has_control_work = duplex_pending || duplex_stop;
+    }
+
     template <class T> ControlResult control(T value) {
         if constexpr (std::is_same_v<T, RuntimeMetrics>) {
             size_t free = 0, total = 0;
@@ -196,11 +241,25 @@ struct CudaEngineState {
             return metrics;
         } else {
             if (!components.composite) throw std::invalid_argument("model has no duplex component");
-            if constexpr (std::is_same_v<T, MfqDuplexSessionParams>) {
-                components.composite->start(value); duplex_active = true;
-            } else if constexpr (std::is_same_v<T, MfqDuplexStepInput>) {
-                return components.composite->step(value);
-            } else { components.composite->stop(); duplex_active = false; }
+            if constexpr (std::is_same_v<T, StopDuplex>) {
+                duplex_stop = true;
+            } else {
+                if (duplex_pending || duplex_stop) throw std::runtime_error("duplex operation is already pending");
+                if constexpr (std::is_same_v<T, MfqDuplexSessionParams>) {
+                    if (!duplex_memory) {
+                        auto reservation = memory.reserve(request_bytes);
+                        if (!reservation) throw ResourceExhausted("duplex has no execution memory budget");
+                        duplex_memory.emplace(std::move(*reservation));
+                    }
+                    duplex_active = true;
+                    duplex_sequence = start_duplex(std::move(value));
+                } else {
+                    if (!duplex_active) throw std::invalid_argument("duplex session is not prepared");
+                    duplex_sequence = step_duplex(std::move(value));
+                }
+                duplex_pending = true;
+                return ControlPending{};
+            }
             return std::monostate{};
         }
     }
