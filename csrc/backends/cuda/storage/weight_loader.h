@@ -1,8 +1,23 @@
 #pragma once
 
 #include "quant_linear.h"
-#include "mfe_weight.h"
+#include "moe.h"
 #include "model_source.h"
+
+namespace mfq::cuda {
+class MfeMxfp4ExpertStore;
+}
+
+const mfq::TensorMetadata& require_tensor(
+    const mfq::ModelSource& source, std::string_view name);
+std::vector<std::uint8_t> read_tensor(
+    const mfq::ModelSource& source, std::string_view name);
+bool is_quant_dtype(const std::string& dtype);
+
+MfeCpu load_mfe_cpu(
+    const mfq::ModelSource& source, const std::string& name);
+std::shared_ptr<MixedMoeRuntime> make_mxfp4_range_runtime(
+    const mfq::cuda::MfeMxfp4ExpertStore& store);
 
 struct MfqDropFileCacheGuard {
     bool& setting;
@@ -81,19 +96,6 @@ QuantLinearGroup load_paired_gate_up(
     const QuantLinear& down,
     size_t required_compatible_prefix = 2,
     bool preserve_projection_boundaries = false);
-
-mfq_tensor_backend::Tensor mfe_dense_reference(
-    const mfq::ModelSource& source,
-    const std::string& name,
-    mfq_tensor_backend::Tensor input,
-    const std::vector<std::int32_t>& expert_ids,
-    int tokens,
-    int routes,
-    bool routed_input);
-
-mfq_tensor_backend::Tensor materialize_mfe_dense(
-    const mfq::ModelSource& source,
-    const std::string& name);
 
 namespace mfq::cuda::weight_loader {
 using Tensor = mfq_tensor_backend::Tensor;

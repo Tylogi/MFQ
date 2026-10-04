@@ -294,7 +294,7 @@ int run_mfe_tensor_check(
     double dense_reference_max_abs = -1.0;
     if (split_width == 0) {
         auto reference = mfe_dense_reference(
-            mfq, tensor_name, x, host_ids,
+            load_mfe_cpu(mfq, tensor_name), x, host_ids,
             tokens, routes, routed_input);
         mfq_cuda_synchronize();
         auto actual_f32 =
@@ -570,9 +570,9 @@ static int run_gemma_moe_check(
     mfq_tensor_backend::Tensor dense_down;
     if (dense_reference_enabled) {
         dense_gate_up = materialize_mfe_dense(
-            mfq, prefix + "gate_up.weight");
+            load_mfe_cpu(mfq, prefix + "gate_up.weight"));
         dense_down = materialize_mfe_dense(
-            mfq, prefix + "down.weight");
+            load_mfe_cpu(mfq, prefix + "down.weight"));
     }
     std::cout << "gemma_moe_bench_config"
               << " layer=" << layer

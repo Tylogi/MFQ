@@ -235,7 +235,7 @@ mfq_tensor_backend::Tensor nint_matmul_groupwise_u8(
     mfq_tensor_backend::Tensor input,
     std::int64_t groups);
 
-bool is_quant_dtype(const std::string& dtype);
+mfq_tensor_backend::Tensor dequant_nint_dense_f32(const NintWeight& weight);
 
 QuantLinearGroup make_quant_group(
     CudaExecutionContext& execution,

@@ -99,30 +99,32 @@ static void check_graph_warmup_state() {
     check(rejected, "graph warmup accepted unconfirmed recurrent state");
 }
 
+struct WeightSource final : mfq::ModelSource {
+    std::vector<uint8_t> bytes;
+    std::vector<mfq::TensorMetadata> records{{"weight", "F32", "F32", std::nullopt, 0}};
+    std::vector<std::filesystem::path> paths;
+    std::unordered_map<std::string, std::string> meta;
+    std::vector<std::string> asset_names;
+    const std::vector<std::filesystem::path>& source_paths() const noexcept override { return paths; }
+    std::string_view architecture() const noexcept override { return {}; }
+    const std::unordered_map<std::string, std::string>& metadata() const noexcept override { return meta; }
+    const std::vector<mfq::TensorMetadata>& tensors() const noexcept override { return records; }
+    const mfq::TensorMetadata* find_tensor(std::string_view name) const noexcept override {
+        return name == records[0].name ? &records[0] : nullptr;
+    }
+    void read_range_into(std::string_view, uint64_t offset, std::byte* output, size_t size) const override {
+        check(offset <= bytes.size() && size <= bytes.size() - offset, "dense fixture range");
+        if (size) std::memcpy(output, bytes.data() + offset, size);
+    }
+    const std::vector<std::string>& assets() const noexcept override { return asset_names; }
+    bool has_asset(std::string_view) const noexcept override { return false; }
+    std::vector<std::byte> read_asset(std::string_view) const override { throw std::runtime_error("no assets"); }
+    std::optional<mfq::ModelGraph> model_graph() const override { return std::nullopt; }
+};
+
 static void check_dense_loading() {
     using namespace mfq_tensor_backend;
-    struct Source final : mfq::ModelSource {
-        std::vector<uint8_t> bytes;
-        std::vector<mfq::TensorMetadata> records{{"weight", "F32", "F32", std::nullopt, 0}};
-        std::vector<std::filesystem::path> paths;
-        std::unordered_map<std::string, std::string> meta;
-        std::vector<std::string> asset_names;
-        const std::vector<std::filesystem::path>& source_paths() const noexcept override { return paths; }
-        std::string_view architecture() const noexcept override { return {}; }
-        const std::unordered_map<std::string, std::string>& metadata() const noexcept override { return meta; }
-        const std::vector<mfq::TensorMetadata>& tensors() const noexcept override { return records; }
-        const mfq::TensorMetadata* find_tensor(std::string_view name) const noexcept override {
-            return name == "weight" ? &records[0] : nullptr;
-        }
-        void read_range_into(std::string_view, uint64_t offset, std::byte* output, size_t size) const override {
-            check(offset <= bytes.size() && size <= bytes.size() - offset, "dense fixture range");
-            if (size) std::memcpy(output, bytes.data() + offset, size);
-        }
-        const std::vector<std::string>& assets() const noexcept override { return asset_names; }
-        bool has_asset(std::string_view) const noexcept override { return false; }
-        std::vector<std::byte> read_asset(std::string_view) const override { throw std::runtime_error("no assets"); }
-        std::optional<mfq::ModelGraph> model_graph() const override { return std::nullopt; }
-    } source;
+    WeightSource source;
     CudaExecutionContext execution;
     const uint32_t rank = 2;
     const int64_t shape[] = {2, 2};
@@ -149,6 +151,22 @@ static void check_dense_loading() {
             auto value = load_dense_gpu(execution, source, "weight");
             check(value.is_cuda() != cpu_layer && value.scalar_type() == promoted &&
                       same(value, expected.to(promoted)), "dense load placement/promotion changed");
+            if (name == "BF16" || name == "F16" || name == "F32") {
+                auto linear = load_quant_linear(execution, source, "weight");
+                check(linear.is_dense() && linear.dense.is_cuda() != cpu_layer &&
+                          same(linear.dense, expected), "linear load changed stored weights");
+                auto group = load_paired_gate_up(execution, source, {"weight", "weight"}, linear);
+                check(group.layers.size() == 2 && same(group.layers[0].dense, expected) &&
+                          same(group.layers[1].dense, expected), "loaded group weights changed");
+                if (!cpu_layer) {
+                    auto input = tensor(std::vector<float>{1, 2}).reshape({1, 2}).to(kCUDA, dtype);
+                    auto output = tensor(std::vector<float>{-3.25, 15.125}).reshape({1, 2}).to(dtype);
+                    check(same(linear.forward(execution, input), output), "loaded linear output changed");
+                    auto outputs = group.forward(execution, input);
+                    check(outputs.size() == 2 && same(outputs[0], output) && same(outputs[1], output),
+                          "loaded projection group output changed");
+                }
+            }
         }
     }
     const auto valid = source.bytes;
@@ -210,6 +228,12 @@ static void check_cached_moe_binding() {
         }});
     CudaExecutionContext execution;
     const auto resident = to_gpu_mixed_moe(cpu, execution.config);
+    WeightSource source;
+    source.bytes = blob;
+    source.records = {{"experts", "MFE", "MFE", std::nullopt, blob.size()}};
+    auto loaded_cpu = load_mfe_cpu(source, "experts");
+    auto loaded = load_mfe_gpu(execution, source, "experts");
+    auto dense = materialize_mfe_dense(loaded_cpu);
     auto options = TensorOptions().device(kCUDA);
     auto input = (arange(32, options.dtype(kFloat32)) * 0.01 - 0.1)
                      .to(kFloat16).reshape({1, 32});
@@ -233,6 +257,13 @@ static void check_cached_moe_binding() {
             auto ids = tensor(std::vector<int32_t>{expert}, options.dtype(kInt32)).reshape({1, 1});
             auto route = build_moe_route_plan(ids, 2);
             auto expected = resident.forward(execution, input, route).to(kFloat32);
+            auto loaded_output = loaded.forward(execution, input, route).to(kFloat32);
+            check((loaded_output - expected).abs().max().item<float>() == 0,
+                  "MFE loading changed expert output");
+            auto reference = mfe_dense_reference(loaded_cpu, input, {expert}, 1, 1, false);
+            auto dense_output = matmul(input, dense.index({expert}).transpose(0, 1));
+            check((reference - dense_output).abs().max().item<float>() == 0,
+                  "loaded MFE reference differs from materialized weights");
             auto actual = weight.forward(execution, input, route).to(kFloat32);
             check((actual - expected).abs().max().item<float>() == 0,
                   "cache registration changed expert output");

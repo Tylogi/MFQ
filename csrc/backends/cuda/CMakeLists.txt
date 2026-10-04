@@ -247,10 +247,8 @@ find_package(OpenMP QUIET)
 function(mfq_configure_cuda_backend_target target)
     target_include_directories(${target} PRIVATE
         ${MFQ_REPOSITORY_ROOT}
-        ${MFQ_CUDA_ROOT}
         ${MFQ_CUDA_ROOT}/include
         ${MFQ_CUDA_ROOT}/ops/include
-        ${MFQ_CUDA_ROOT}/storage
         ${MFQ_CUDA_KERNEL_ROOT}
         ${CUDAToolkit_INCLUDE_DIRS}
     )
@@ -271,10 +269,12 @@ function(mfq_configure_cuda_backend_target target)
 endfunction()
 
 # Shared Engine/model templates are instantiated only by backend runtime/loading
-# units. Kernel/quant ops have no Engine, model-family, scheduler or transport link.
+# units. Kernel/quant ops consume loaded weights without storage or Engine links.
 function(mfq_configure_cuda_runtime_target target)
     mfq_configure_cuda_backend_target(${target})
     target_include_directories(${target} PRIVATE
+        ${MFQ_CUDA_ROOT}
+        ${MFQ_CUDA_ROOT}/storage
         ${MFQ_CUDA_ROOT}/models
         ${MFQ_CUDA_ROOT}/commands
         ${MFQ_CUDA_ROOT}/engine

@@ -4,6 +4,20 @@
 #include <cstring>
 #include <limits>
 
+int64_t read_i64_from(const std::vector<uint8_t> & b, size_t & off) {
+    int64_t v = 0;
+    std::memcpy(&v, b.data() + off, sizeof(v));
+    off += sizeof(v);
+    return v;
+}
+
+uint32_t read_u32_from(const std::vector<uint8_t> & b, size_t & off) {
+    uint32_t v = 0;
+    std::memcpy(&v, b.data() + off, sizeof(v));
+    off += sizeof(v);
+    return v;
+}
+
 namespace mfq::cuda::quant_format {
 
 uint32_t read_u32(std::istream & is) {

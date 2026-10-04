@@ -1,12 +1,10 @@
 #include "mfq_cuda_moe_ops.h"
 #include "mfq_cuda_quant_ops.h"
-#include "storage/weight_loader.h"
 #include "moe.h"
 
 #include "quant_linear.h"
 #include "format.h"
 #include "mfq_format_compat.h"
-#include "mfe_expert_store.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -1099,45 +1097,13 @@ MfeWeight cpu_mixed_moe_metadata(
     return result;
 }
 
-MfeCpu load_mfe_cpu(
-        const mfq::ModelSource & mfq, const std::string & name) {
-    if (require_tensor(mfq, name).dtype != "MFE") {
-        throw std::runtime_error("expert tensor must use MFE: " + name);
-    }
-    return unpack_mfe(read_tensor(mfq, name));
-}
-
-std::shared_ptr<MixedMoeRuntime> make_mxfp4_range_runtime(
-        const mfq::cuda::MfeMxfp4ExpertStore & store) {
-    auto runtime = std::make_shared<MixedMoeRuntime>();
-    runtime->n_experts = store.num_experts();
-    runtime->out_per_expert = store.out_per_expert();
-    runtime->neuron_len = store.neuron_len();
-    MixedMoePool pool;
-    pool.family = MixedMoeFamily::Mxfp4;
-    pool.local_experts = store.num_experts();
-    pool.mxfp4.out =
-        static_cast<int64_t>(store.num_experts()) * store.out_per_expert();
-    pool.mxfp4.neuron_len = store.neuron_len();
-    std::vector<int32_t> local(static_cast<size_t>(store.num_experts()));
-    std::iota(local.begin(), local.end(), int32_t{0});
-    pool.expert_local = mfq_tensor_backend::from_blob(
-        local.data(),
-        {static_cast<int64_t>(local.size())},
-        mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt32))
-        .clone();
-    runtime->pools.push_back(std::move(pool));
-    return runtime;
-}
 mfq_tensor_backend::Tensor mfe_dense_reference(
-        const mfq::ModelSource& source,
-        const std::string& name,
+        const MfeCpu& cpu,
         mfq_tensor_backend::Tensor input,
         const std::vector<std::int32_t>& expert_ids,
         int tokens,
         int routes,
         bool routed_input) {
-    auto cpu = unpack_mfe(read_tensor(source, name));
     auto reference = mfq_tensor_backend::empty(
         {tokens * routes, cpu.out_per_expert},
         input.options().dtype(mfq_tensor_backend::kFloat16));
@@ -1232,9 +1198,7 @@ mfq_tensor_backend::Tensor mfe_dense_reference(
 }
 
 mfq_tensor_backend::Tensor materialize_mfe_dense(
-        const mfq::ModelSource& source,
-        const std::string& name) {
-    auto cpu = unpack_mfe(read_tensor(source, name));
+        const MfeCpu& cpu) {
     auto dense = mfq_tensor_backend::empty(
         {cpu.n_experts, cpu.out_per_expert, cpu.neuron_len},
         mfq_tensor_backend::TensorOptions()

@@ -1,7 +1,6 @@
 #pragma once
 
 #include "mfq_tensor_backend.h"
-#include "mfq/model_source.h"
 #include "mfq/nint_rows.h"
 
 #include <cstdint>

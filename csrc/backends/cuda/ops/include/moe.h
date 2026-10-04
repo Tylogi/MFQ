@@ -165,8 +165,6 @@ struct MixedMoeRuntime {
 };
 
 MfeCpu unpack_mfe(const std::vector<uint8_t>& blob);
-MfeCpu load_mfe_cpu(
-    const mfq::ModelSource& source, const std::string& name);
 MfeWeight to_gpu_mfe(const MfeCpu& source);
 std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
     const MfeCpu& source,
@@ -184,9 +182,14 @@ MfeWeight to_cuda_device_moe_expert_slice(
     int64_t expert_end,
     int device,
     const CudaExecutionConfig& config = {});
-std::shared_ptr<MixedMoeRuntime> make_mxfp4_range_runtime(
-    const mfq::cuda::MfeMxfp4ExpertStore& store);
-std::vector<mfq::TensorParallelSlice> plan_moe_expert_parallel_slices(
-    const ParallelConfig& parallel,
-    int64_t extent,
-    const std::string& name);
+
+mfq_tensor_backend::Tensor mfe_dense_reference(
+    const MfeCpu& cpu,
+    mfq_tensor_backend::Tensor input,
+    const std::vector<std::int32_t>& expert_ids,
+    int tokens,
+    int routes,
+    bool routed_input);
+
+mfq_tensor_backend::Tensor materialize_mfe_dense(
+    const MfeCpu& cpu);

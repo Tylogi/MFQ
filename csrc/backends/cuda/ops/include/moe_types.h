@@ -17,10 +17,6 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::cuda {
-class MfeMxfp4ExpertStore;
-}
-
 class MoeCachedSource;
 struct MixedMoeRuntime;
 struct MoeRoutePlan;

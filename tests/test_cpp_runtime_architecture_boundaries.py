@@ -182,6 +182,21 @@ def test_cuda_ops_and_core_do_not_depend_on_engine_or_parse_environment() -> Non
             assert "getenv(" not in source
 
 
+def test_cuda_ops_consume_loaded_weights_without_model_sources() -> None:
+    storage = CUDA_OPS.parent / "storage"
+    storage_headers = {path.name for path in storage.glob("*.h")}
+    for path in CUDA_OPS.rglob("*"):
+        if path.suffix not in {".h", ".cpp", ".cu"}:
+            continue
+        source = path.read_text(encoding="utf-8")
+        for header in re.findall(r'#include\s*[<"]([^">]+)[">]', source):
+            assert "storage" not in Path(header).parts, path
+            assert Path(header).name not in storage_headers | {"model_source.h"}, path
+        for dependency in ("ModelSource", "TensorMetadata", "MfeMxfp4ExpertStore",
+                           "require_tensor(", "read_tensor(", "read_asset("):
+            assert dependency not in source, (path, dependency)
+
+
 def test_cuda_models_and_storage_do_not_parse_execution_environment() -> None:
     for directory in (CUDA_MODELS, CUDA_RUNTIME.parent / "storage"):
         for path in directory.rglob("*"):
@@ -1355,7 +1370,10 @@ def test_cuda_build_dependencies_separate_ops_from_shared_execution() -> None:
     backend = cmake.split("function(mfq_configure_cuda_backend_target target)", 1)[1].split("endfunction()", 1)[0]
     for dependency in ("mfq-engine", "mfq-models", "mfq-runtime-communication"):
         assert dependency not in backend
+    assert "${MFQ_CUDA_ROOT}/storage" not in backend
+    assert not re.search(r"^\s*\$\{MFQ_CUDA_ROOT\}\s*$", backend, re.MULTILINE)
     runtime = cmake.split("function(mfq_configure_cuda_runtime_target target)", 1)[1].split("endfunction()", 1)[0]
+    assert "${MFQ_CUDA_ROOT}/storage" in runtime
     assert "PRIVATE mfq-models mfq-engine" in runtime
     assert "mfq-runtime-communication" not in runtime
     assert "mfq_configure_cuda_backend_target(mfq-cuda-ops)" in cmake
