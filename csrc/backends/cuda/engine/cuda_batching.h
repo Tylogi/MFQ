@@ -33,7 +33,7 @@ class QwenBatchOperations {
         MfqPrefillTiming timing;
     };
     struct Decoded {
-        Tensor logits, greedy_tokens;
+        Tensor tokens, host_tokens;
     };
 
     QwenBatchOperations(Qwen35CausalLm &, CudaExecutionContext &, CudaContinuousBatchConfig);
@@ -70,6 +70,7 @@ class QwenBatchOperations {
     int64_t decode_tokens_{0};
     int64_t batched_greedy_batches_{0};
     int64_t packed_metadata_batches_{0};
+    int64_t sampling_readbacks_{0};
     int64_t cuda_graph_captures_{0};
     int64_t cuda_graph_replays_{0};
     Tensor decode_metadata_host_;

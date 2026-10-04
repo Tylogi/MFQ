@@ -141,6 +141,13 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
         return collect_generation(generate(model, graph, cache, config, request, output)).tokens;
     };
     const auto first_reference = serial(first_prompt), second_reference = serial(second_prompt);
+    const auto greedy_sampling = sampling;
+    sampling.temperature = .8; sampling.top_k = 32; sampling.top_p = .95;
+    sampling.presence_penalty = .2; sampling.frequency_penalty = .1;
+    sampling.repetition_penalty = 1.05; sampling.seed = 20261004;
+    const auto stochastic_sampling = sampling;
+    const auto stochastic_reference = serial(second_prompt);
+    sampling = greedy_sampling;
     graph.invalidate(); // Physical batch slots replace the serial graph's storage.
     {
         struct Execution {
@@ -171,9 +178,10 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
         info.max_context = model.max_position_embeddings();
         std::map<std::string, std::vector<int64_t>> tokens;
         std::map<std::string, int> terminals, cancellations, prefills;
-        const auto admit = [&](const std::string& id, const std::vector<int64_t>& prompt) {
+        const auto admit = [&](const std::string& id, const std::vector<int64_t>& prompt,
+                               const MfqSamplingParams* params = nullptr) {
             EngineRequest request;
-            request.id = id; request.token_ids = prompt; request.input.sampling = sampling;
+            request.id = id; request.token_ids = prompt; request.input.sampling = params ? *params : sampling;
             MFQ_RUNTIME_CHECK(executor.admit(std::move(request), nullptr, info, execution) == Admission::accepted,
                               "diagnostic request was not admitted");
         };
@@ -218,6 +226,31 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
         MFQ_RUNTIME_CHECK(executor.empty() && cancellations["partial"] == 1 && terminals["partial"] == 1 &&
             tokens["partial"].empty() && terminals["survivor"] == 1 && tokens["survivor"] == second_reference,
             "prefill cancellation corrupted a live slot");
+        const auto metric = [&](const char* name) {
+            for (const auto& [key, value] : batcher.metrics()) if (key == name) return value;
+            throw std::runtime_error("missing batching metric");
+        };
+        const auto reads_before = metric("continuous_batching_sampling_readbacks");
+        const auto batches_before = metric("continuous_batching_decode_batches");
+        const auto started = std::chrono::steady_clock::now();
+        for (int run = 0; run < 2; ++run) {
+            const auto random_id = "random-" + std::to_string(run);
+            const auto greedy_id = "greedy-" + std::to_string(run);
+            admit(random_id, second_prompt, &stochastic_sampling);
+            admit(greedy_id, first_prompt);
+            for (int ticks = 0; ticks < 500 && !executor.empty(); ++ticks)
+                tick({random_id, greedy_id});
+            MFQ_RUNTIME_CHECK(executor.empty() && tokens[random_id].size() == stochastic_reference.size() &&
+                (!run || tokens[random_id] == tokens["random-0"]) &&
+                tokens[greedy_id] == first_reference && terminals[random_id] == 1 && terminals[greedy_id] == 1,
+                "mixed batch sampling or fixed-seed replay failed");
+        }
+        const auto reads = metric("continuous_batching_sampling_readbacks") - reads_before;
+        const auto batches = metric("continuous_batching_decode_batches") - batches_before;
+        MFQ_RUNTIME_CHECK(reads == batches, "sampling synchronized more than once per unconstrained batch");
+        std::cout << "continuous_batching_sampling_check readbacks=" << reads << " batches=" << batches
+            << " mixed_seed_replay=1 tokens_per_sec=" << 4 * sampling.max_tokens /
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() << '\n';
         double captures = 0, replays = 0;
         for (const auto& [key, value] : batcher.metrics()) {
             if (key == "paged_kv_live_pages") MFQ_RUNTIME_CHECK(value == 0, "paged KV leaked");

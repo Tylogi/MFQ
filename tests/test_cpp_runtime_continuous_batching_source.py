@@ -66,7 +66,7 @@ def test_continuous_batching_is_an_explicit_server_mode():
     assert "QwenBatchExecutor" not in BATCHING
     assert "ContinuousBatchingController" not in BATCHING
     assert "ContinuousBatchQueue" not in BATCHING
-    assert "std::thread" not in BATCHING
+    assert "std::thread" not in (CUDA_ROOT / "engine/cuda_batching.cpp").read_text()
     assert "engine_.step(eligible)" in SCHEDULER
     assert "worker_" not in BATCHING
     assert "queue_" not in BATCHING

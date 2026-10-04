@@ -114,6 +114,7 @@ std::vector<std::pair<std::string, double>> QwenBatchOperations::metrics() const
         {"continuous_batching_decode_tokens", static_cast<double>(decode_tokens_)},
 
         {"continuous_batching_compactions", 0.0},
+        {"continuous_batching_sampling_readbacks", static_cast<double>(sampling_readbacks_)},
         {"continuous_batching_stable_slot_releases",
          static_cast<double>(state_adapter_.slot_releases())},
         {"continuous_batching_batched_greedy_batches",
@@ -398,34 +399,64 @@ QwenBatchOperations::Decoded QwenBatchOperations::decode(State &state) {
     ++decode_batches_;
     decode_tokens_ += std::count_if(state.active.begin(), state.active.end(),
                                     [](const auto &request) { return request->eligible; });
-    Tensor batched_greedy_tokens;
+    Tensor sampled;
     if (graph_tokens.defined()) {
-        batched_greedy_tokens = graph_tokens.to(mfq_tensor_backend::kCPU).contiguous();
-        MFQ_RUNTIME_CHECK(batched_greedy_tokens.scalar_type() == mfq_tensor_backend::kInt64 &&
-                              batched_greedy_tokens.numel() == batch,
-                          "continuous batching CUDA Graph sampler returned the wrong shape");
+        sampled = std::move(graph_tokens);
         ++batched_greedy_batches_;
     } else if (config_.greedy && batch_greedy) {
-        batched_greedy_tokens = sample_greedy_cuda(logits.contiguous().view({batch, -1}))
-                                    .to(mfq_tensor_backend::kCPU)
-                                    .contiguous();
-        MFQ_RUNTIME_CHECK(batched_greedy_tokens.scalar_type() == mfq_tensor_backend::kInt64 &&
-                              batched_greedy_tokens.numel() == batch,
-                          "continuous batching greedy sampler returned the wrong shape");
+        sampled = sample_greedy_cuda(logits.contiguous().view({batch, -1}));
         ++batched_greedy_batches_;
+    } else {
+        sampled = mfq_tensor_backend::empty({batch}, ids.options());
+        for (const auto& request : state.active) if (request->eligible) {
+            const auto slot = request->cache.slot();
+            auto row = logits.narrow(0, slot, 1);
+            if (request->sampler->has_penalties())
+                row = request->sampler->apply_penalties(std::move(row), request->counts);
+            // Preserve penalized scores for the constraint fallback below.
+            logits.narrow(0, slot, 1).copy_(row);
+            sampled.narrow(0, slot, 1).copy_(request->sampler->sample(row));
+        }
     }
-    return {std::move(logits), std::move(batched_greedy_tokens)};
+    auto host = sampled.to(mfq_tensor_backend::kCPU).contiguous();
+    ++sampling_readbacks_;
+    std::vector<std::shared_ptr<Request>> rejected;
+    for (const auto& request : state.active)
+        if (request->eligible && request->token_constraint &&
+            !request->token_constraint->allows(host.data_ptr<int64_t>()[request->cache.slot()]))
+            rejected.push_back(request);
+    if (!rejected.empty()) {
+        // CPU grammars require logits only when their speculative candidate fails.
+        // Transfer all rejected rows together, then gather replacement IDs once.
+        std::vector<Tensor> rows;
+        for (const auto& request : rejected) rows.push_back(logits.narrow(0, request->cache.slot(), 1));
+        auto masked = mfq_tensor_backend::cat(rows, 0).to(mfq_tensor_backend::kCPU,
+            mfq_tensor_backend::kFloat32).contiguous();
+        ++sampling_readbacks_;
+        for (size_t row = 0; row < rejected.size(); ++row)
+            rejected[row]->token_constraint->apply(masked.data_ptr<float>() + row * vocab_size(), vocab_size());
+        auto device = masked.to(logits.device());
+        for (size_t row = 0; row < rejected.size(); ++row) {
+            auto& request = *rejected[row];
+            sampled.narrow(0, request.cache.slot(), 1).copy_(
+                request.sampler->sample(device.narrow(0, row, 1)));
+        }
+        host = sampled.to(mfq_tensor_backend::kCPU).contiguous();
+        ++sampling_readbacks_;
+    }
+    for (const auto& request : state.active) if (request->eligible && request->token_constraint) {
+        const auto token = host.data_ptr<int64_t>()[request->cache.slot()];
+        MFQ_RUNTIME_CHECK(request->token_constraint->allows(token),
+            "CUDA constrained sampler returned an invalid token");
+        request->token_constraint->accept(token);
+    }
+    return {std::move(sampled), std::move(host)};
 }
 
 QwenBatchOperations::Sample QwenBatchOperations::sample(
     const std::shared_ptr<Request> &request, const Decoded &decoded) {
     const auto slot = static_cast<int64_t>(request->cache.slot());
-    if (decoded.greedy_tokens.defined())
-        return {{}, decoded.greedy_tokens.data_ptr<int64_t>()[slot], {}};
-    auto next = mfq::cuda::sample_logits(*request->sampler, decoded.logits.narrow(0, slot, 1),
-                                         request->counts, request->token_constraint);
-    const auto token = next.item<int64_t>();
-    return {std::move(next), token, {}};
+    return {decoded.tokens.narrow(0, slot, 1), decoded.host_tokens.data_ptr<int64_t>()[slot], {}};
 }
 
 void QwenBatchOperations::accept(const std::shared_ptr<Request> &request, const Sample &sample) {
