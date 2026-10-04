@@ -90,8 +90,18 @@ report `file_backed_bytes` separately from retained `host_bytes`; resident file
 pages are reclaimable OS cache and may still appear in process RSS.
 
 `mfq-moe-host-store-test` checks exact bytes, offsets, empty fields, view
-lifetime and invalid layouts. Validate a real model's generation and peak RAM
-separately; an individual projection check does not prove full-model parity.
+lifetime and invalid layouts. `mfq-mfe-decode-test MODEL TENSOR` compares every
+FP16 output against the separate pool kernels for all experts, using both
+shared and routed inputs at 1, 4 and 8 tokens. Setting `MFQ_MOE_SSD_CACHE_DIR`
+also checks the SSD path with a 512MiB GPU cache. For example:
+
+```shell
+MFQ_MOE_SSD_CACHE_DIR=/path/on/ssd build/cpp_runtime/cuda/mfq-mfe-decode-test \
+  model.mfq model.block.1.mlp.experts.down.weight
+```
+
+Validate a real model's generation and peak RAM separately; an individual
+projection check does not prove full-model parity.
 
 Run the model-backed scheduler and execution-isolation gates on a machine with
 enough device memory. The second command loads and generates with two complete

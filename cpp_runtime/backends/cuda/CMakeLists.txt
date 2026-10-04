@@ -367,6 +367,13 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-sq-linear-test PRIVATE
         MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-sq-linear-test PRIVATE mfq-cuda-runtime)
+
+    add_executable(mfq-mfe-decode-test
+        ${MFQ_CUDA_ROOT}/tests/mfq_mfe_decode_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-mfe-decode-test)
+    target_compile_definitions(mfq-mfe-decode-test PRIVATE
+        MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-mfe-decode-test PRIVATE mfq-cuda-runtime)
 endif()
 target_link_libraries(mfq-cuda-runtime PRIVATE
     CUDA::cuda_driver

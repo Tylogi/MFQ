@@ -1,0 +1,60 @@
+#include "storage/weight_loader.h"
+#include "storage/moe_expert_cache.h"
+#include "moe.h"
+
+#include <cstring>
+#include <iostream>
+
+// Accepts an ordinary MFQ projection, including one extracted from a real model.
+// Compare every output with the per-pool kernel's original two-row reduction.
+int main(int argc, char** argv) try {
+    using namespace mfq::cuda;
+    if (argc != 3) throw std::runtime_error("usage: mfq-mfe-decode-test MODEL TENSOR");
+    auto source = mfq::open_model_source(argv[1]);
+    CudaExecutionContext execution;
+    auto resident = load_mfe_gpu(execution, *source, argv[2]);
+    MfeWeight cached;
+    if (!execution.config.moe_ssd_cache_dir.empty()) {
+        execution.moe_expert_cache = make_moe_expert_cache(512 * 1024 * 1024, execution.config);
+        cached = load_mfe_gpu(execution, *source, argv[2], true, 0, "diagnostic");
+        finalize_moe_expert_cache(execution.moe_expert_cache);
+    }
+    const Device gpu{DeviceType::cuda, 0};
+    const int routes = std::min(10, resident.n_experts);
+    int cases = 0;
+    for (int tokens : {1, 4, 8}) for (bool routed : {false, true}) {
+        const int rows = tokens * (routed ? routes : 1);
+        std::vector<float> values(rows * resident.neuron_len);
+        for (std::size_t i = 0; i < values.size(); ++i)
+            values[i] = (static_cast<int>((i * 17) % 257) - 128) / 127.0f;
+        auto x = tensor(values).to(gpu, kFloat16);
+        x = routed ? x.reshape({tokens, routes, resident.neuron_len})
+                   : x.reshape({tokens, resident.neuron_len});
+        for (int first = 0; first < resident.n_experts; first += tokens * routes) {
+            std::vector<std::int32_t> ids(tokens * routes);
+            for (int i = 0; i < tokens * routes; ++i) ids[i] = (first + i) % resident.n_experts;
+            auto route = build_moe_route_plan(tensor(ids).reshape({tokens, routes}).to(gpu),
+                resident.n_experts);
+            execution.force_moe_pool_path = true;
+            auto expected = resident.forward(execution, x, route).cpu();
+            execution.force_moe_pool_path = false;
+            for (const auto* weight : {&resident, &cached}) {
+                if (weight->n_experts == 0) continue;
+                auto result = weight->forward(execution, x, route);
+                MFQ_RUNTIME_CHECK(isfinite(result).all().item<bool>(), "non-finite MFE output");
+                auto actual = result.cpu();
+                MFQ_RUNTIME_CHECK(actual.sizes() == expected.sizes() &&
+                    std::memcmp(actual.data_ptr(), expected.data_ptr(), actual.nbytes()) == 0,
+                    "MFE decode differs from per-pool output: tokens=", tokens,
+                    " routed=", routed, " first_expert=", first);
+                ++cases;
+            }
+        }
+    }
+    std::cout << "MFE decode full-output bit equality cases=" << cases
+              << " experts=" << resident.n_experts << '\n';
+    return 0;
+} catch (const std::exception& error) {
+    std::cerr << error.what() << '\n';
+    return 1;
+}

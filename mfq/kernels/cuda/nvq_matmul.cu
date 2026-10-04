@@ -6808,6 +6808,8 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_ws_cuda(
         static_cast<int>(n_experts), pools, static_cast<int>(out_per_expert),  \
         routed_input)
     if (K >= 4096) NVQ_MOE_HETERO_MMVQ_LAUNCH(8);
+    // At most 96 vec8 segments: the fourth warp only contributes zeros.
+    else if (K > 512 && K <= 768) NVQ_MOE_HETERO_MMVQ_LAUNCH(3);
     else NVQ_MOE_HETERO_MMVQ_LAUNCH(4);
 #undef NVQ_MOE_HETERO_MMVQ_LAUNCH
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
