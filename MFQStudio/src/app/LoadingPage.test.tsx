@@ -1,16 +1,16 @@
-/** 验证全屏加载页以统一文案呈现等待状态。 */
+/** Verify that the full-screen loading page presents a waiting state with consistent copy. */
 import { render, screen } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
 import { LoadingPage } from './LoadingPage';
 
 vi.mock('../features/settings/SettingsProvider', () => ({
-  useSettings: () => ({ tr: (chinese: string) => chinese }),
+  useSettings: () => ({ tr: (_chinese: string, english: string) => english }),
 }));
 
-it('显示统一的加载文案和无障碍状态', () => {
+it('verifies LoadingPage test behavior 1', () => {
   render(<LoadingPage />);
-  expect(screen.getByRole('status')).toHaveTextContent('正在加载中');
-  expect(screen.getByRole('heading', { name: '正在加载中' })).toBeTruthy();
+  expect(screen.getByRole('status')).toHaveTextContent('Loading…');
+  expect(screen.getByRole('heading', { name: 'Loading…' })).toBeTruthy();
   expect(screen.getByRole('status').querySelector('.loading-page-symbol')).toBeTruthy();
   expect(screen.queryByText('CONNECTION / 01')).toBeNull();
 });

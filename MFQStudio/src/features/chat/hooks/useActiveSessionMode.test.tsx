@@ -1,4 +1,4 @@
-/** 验证跨领域读取聊天模式时的默认值和活动会话切换。 */
+/** Verify defaults when reading chat mode across domains and when switching active sessions. */
 import { act, renderHook } from '@testing-library/react';
 import { beforeEach, expect, it } from 'vitest';
 import type { Session } from '../../../shared/api/types';
@@ -7,7 +7,7 @@ import { useActiveSessionMode } from './useActiveSessionMode';
 
 beforeEach(() => useConversationStore.getState().reset());
 
-it('未加载会话时使用文本模式，加载及切换后读取实际模式', () => {
+it('verifies useActiveSessionMode test behavior 1', () => {
   const { result } = renderHook(useActiveSessionMode);
   expect(result.current).toBe('text');
 

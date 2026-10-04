@@ -1,8 +1,8 @@
-"""校验 Tauri Rust、发布脚本与 TypeScript 桥接的跨语言契约。
+"""Validate cross-language contracts for Tauri Rust, release scripts, and TypeScript bridges.
 
-纯前端迁移映射：MFQStudio/tests/studioContracts.test.ts、
-studioBehavior.test.tsx、studioMedia.test.tsx 与 voiceContracts.test.ts。
-Vitest 中保留旧测试名；源码契约明确标注为过渡，媒体等行为单独验证。
+Frontend migration mapping: MFQStudio/tests/studioContracts.test.ts,
+studioBehavior.test.tsx, studioMedia.test.tsx, and voiceContracts.test.ts.
+Legacy test names are retained in Vitest; source contracts are marked as transitional, with media and other behavior verified separately.
 """
 
 import json

@@ -1,4 +1,4 @@
-/* 保持既有级联顺序的模型工作台和会话布局覆盖规则。 */
+/* Model-workbench and session-layout overrides, preserving the existing cascade order. */
 /* Model workbench hierarchy */
 .model-load-policy { margin-top: 16px; }
 .model-policy-panel { margin-top: 16px; }

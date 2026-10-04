@@ -1,8 +1,8 @@
-/** 定义实时语音会话、输入输出轮次及业务回调契约。 */
-/** 实时语音连接与录音处理阶段，供页面呈现当前状态。 */
+/** Define real-time voice session, input/output turn, and business callback contracts. */
+/** Real-time voice connection and recording phases used to display the current page state. */
 export type VoiceState = "idle" | "connecting" | "listening" | "processing" | "error";
 
-/** 建立实时会话时传给服务端的生成配置。 */
+/** Generation configuration sent to the server when establishing a real-time session. */
 export interface RealtimeSessionConfig {
   sessionId: string;
   systemPrompt: string;
@@ -12,7 +12,7 @@ export interface RealtimeSessionConfig {
   repetitionPenalty: number;
 }
 
-/** 已完成或由迟到数据更新的助手语音轮次。 */
+/** An assistant voice turn that is complete or updated by late-arriving data. */
 export interface VoiceTurn {
   id: string;
   sessionId: string;
@@ -20,14 +20,14 @@ export interface VoiceTurn {
   audio: Blob | null;
 }
 
-/** 用户录音轮次；开始时尚无音频，结束时返回 WAV。 */
+/** A user recording turn; it has no audio at start and returns WAV when complete. */
 export interface VoiceInputTurn {
   id: string;
   sessionId: string;
   audio?: Blob | null;
 }
 
-/** 控制器内部维护的文本和 PCM 音频累积结果。 */
+/** Accumulated text and PCM audio maintained internally by the controller. */
 export interface BufferedVoiceTurn {
   id: string;
   sessionId: string;
@@ -37,20 +37,20 @@ export interface BufferedVoiceTurn {
   audioRate: number;
 }
 
-/** 控制器向业务层发布会话、音频和错误事件的回调契约。 */
+/** Callback contract for publishing session, audio, and error events from the controller to the business layer. */
 export interface RealtimeCallbacks {
-  /** 连接、录音或处理状态改变时同步界面状态。 */
+  /** Synchronize interface state when connection, recording, or processing status changes. */
   onState(state: VoiceState): void;
-  /** 采集音频时提供归一化音量，停止时归零。 */
+  /** Provide normalized volume during capture and reset it to zero when stopped. */
   onLevel(level: number): void;
-  /** 增量更新指定会话的助手文本，轮次发布后清空。 */
+  /** Incrementally update assistant text for the specified session and clear it after publishing the turn. */
   onText(sessionId: string, text: string): void;
-  /** 检测到用户新轮次时建立录音消息占位。 */
+  /** Create a recording-message placeholder when a new user turn is detected. */
   onInputStart(turn: VoiceInputTurn): void;
-  /** 结束用户轮次并提供可保存的 WAV 音频。 */
+  /** End a user turn and provide WAV audio that can be saved. */
   onInputEnd(turn: VoiceInputTurn): void;
-  /** 发布助手轮次或更新迟到片段，由业务层持久化。 */
+  /** Publish an assistant turn or update a late fragment for persistence by the business layer. */
   onTurn(turn: VoiceTurn): void;
-  /** 连接或处理失败时通知业务层展示错误。 */
+  /** Notify the business layer to display an error when connection or processing fails. */
   onError(message: string): void;
 }

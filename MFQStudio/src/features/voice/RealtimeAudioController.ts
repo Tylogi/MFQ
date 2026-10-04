@@ -1,4 +1,4 @@
-/** 管理实时语音传输、采集、轮次调度和播放资源。 */
+/** Manage real-time voice transport, capture, turn scheduling, and playback resources. */
 import { runtimeRealtimeUrl } from '../../shared/api/client';
 import { base64ToFloat32, float32ToBase64, wavBlob } from './audioCodec';
 import { AudioDevices } from './AudioDevices';
@@ -14,7 +14,7 @@ const SPEECH_START_SAMPLES = Math.round(INPUT_RATE * 0.08);
 const SPEECH_END_SAMPLES = Math.round(INPUT_RATE * 0.7);
 const SPEECH_PREROLL_SAMPLES = Math.round(INPUT_RATE * 0.25);
 const MIN_USER_TURN_SAMPLES = Math.round(INPUT_RATE * 0.12);
-/** 管理实时语音 WebSocket、麦克风采集、轮次归属及音频播放生命周期。 */
+/** Manage the real-time voice WebSocket, microphone capture, turn ownership, and audio playback lifecycle. */
 export class RealtimeAudioController {
   private socket: WebSocket | null = null;
   private readonly audio = new AudioDevices();
@@ -59,40 +59,40 @@ export class RealtimeAudioController {
     private fullDuplexEnabled: boolean,
   ) {}
 
-  /** 是否仍持有录音、连接或等待中的半双工响应。 */
+  /** Whether recording, a connection, or a pending half-duplex response is still active. */
   get active(): boolean {
     return Boolean(this.audio.capturing || this.awaitingHalfDuplexResponse || this.socket);
   }
 
-  /** 是否正在采集麦克风输入。 */
+  /** Whether microphone input is currently being captured. */
   get capturing(): boolean {
     return Boolean(this.audio.capturing);
   }
 
-  /** 返回当前启用的全双工模式。 */
+  /** Return whether full-duplex mode is currently enabled. */
   get fullDuplex(): boolean {
     return this.fullDuplexEnabled;
   }
 
-  /** 即时设置是否播放助手音频，关闭时停止已排队播放。 */
+  /** Immediately set whether to play assistant audio, stopping queued playback when disabled. */
   setPlayback(enabled: boolean): void {
     this.playbackEnabled = enabled;
     if (!enabled) this.stopPlayback();
   }
 
-  /** 空闲时切换双工模式，必要时先关闭旧会话。 */
+  /** Switch duplex mode while idle, closing the previous session first if necessary. */
   async setFullDuplex(enabled: boolean): Promise<void> {
     if (this.audio.capturing || this.awaitingHalfDuplexResponse) return;
     if (this.socket) await this.stop();
     this.fullDuplexEnabled = enabled;
   }
 
-  /** 建立指定会话的语音连接并请求麦克风采集。 */
+  /** Connect the specified voice session and request microphone capture. */
   async start(config: RealtimeSessionConfig): Promise<void> {
     await this.connect(config, true);
   }
 
-  /** 连接实时会话后提交非空文本，不启动麦克风。 */
+  /** Submit non-empty text after connecting a real-time session without starting the microphone. */
   async submitText(value: string, config: RealtimeSessionConfig): Promise<void> {
     const text = value.trim();
     if (!text || this.awaitingHalfDuplexResponse) return;
@@ -139,7 +139,7 @@ export class RealtimeAudioController {
     }
   }
 
-  /** 按双工模式开始录音、提交半双工录音或停止当前会话。 */
+  /** Start recording, submit a half-duplex recording, or stop the current session according to duplex mode. */
   async toggleCapture(config: RealtimeSessionConfig): Promise<void> {
     if (this.audio.capturing && !this.fullDuplexEnabled) {
       await this.finishHalfDuplexInput();
@@ -150,7 +150,7 @@ export class RealtimeAudioController {
     }
   }
 
-  /** 提交文本并登记响应轮次，连接未就绪时先排队。 */
+  /** Submit text and register its response turn, queueing it if the connection is not ready. */
   sendText(value: string, turnId: string = crypto.randomUUID()): void {
     const text = value.trim();
     if (!text) return;
@@ -176,7 +176,7 @@ export class RealtimeAudioController {
     );
   }
 
-  /** 幂等关闭连接并释放录音和播放资源，同时发布已累积的轮次。 */
+  /** Idempotently close the connection and release recording and playback resources while publishing accumulated turns. */
   async stop(sendClose = true): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
     const pending = this.performStop(sendClose);

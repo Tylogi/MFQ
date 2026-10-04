@@ -1,4 +1,4 @@
-/** 单独订阅流式快照，避免 token 更新触发应用外壳和历史消息重渲染。 */
+/** Subscribe to streaming snapshots separately so token updates do not rerender the shell or saved messages. */
 import { lazy, Suspense, useSyncExternalStore } from 'react';
 import type { GenerationController } from '../state/generationController';
 
@@ -11,8 +11,7 @@ interface StreamingMessageProps {
   sessionId: string | null;
   tr: (zh: string, en: string) => string;
 }
-
-/** 显示当前会话增量、失败时保留的回答以及只读历史恢复入口。 */
+/** Display current-session deltas, preserve the answer on failure, and provide a read-only history recovery entry point. */
 export function StreamingMessage({ controller, sessionId, tr }: StreamingMessageProps) {
   const snapshot = useSyncExternalStore(controller.subscribe, controller.getSnapshot);
   if (snapshot.sessionId !== sessionId) return null;

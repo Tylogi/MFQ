@@ -1,4 +1,4 @@
-/** 应用外壳组织导航、路由出口及连接状态，不持有业务表单。 */
+/** Organize navigation, route outlets, and connection state without owning business forms. */
 import { Component, Suspense, useEffect, type ReactNode } from 'react';
 import { useLocation, Outlet } from 'react-router';
 import * as TooltipPrimitive from '@radix-ui/react-tooltip';
@@ -10,8 +10,7 @@ import { LoadingPage } from './LoadingPage';
 import { StudioSidebar } from './StudioSidebar';
 import { RuntimeAlerts } from './RuntimeAlerts';
 import { resolveStudioLocation, isStudioPath } from '../navigation';
-
-/** 隔离单个业务路由的渲染错误，切换路径后恢复其他页面。 */
+/** Isolate rendering errors to an individual business route and restore other pages after navigation. */
 class PageErrorBoundary extends Component<{ children: ReactNode }, { detail: string | null }> {
   state = { detail: null as string | null };
   static getDerivedStateFromError(error: unknown) {
@@ -26,8 +25,7 @@ class PageErrorBoundary extends Component<{ children: ReactNode }, { detail: str
     return this.props.children;
   }
 }
-
-/** 渲染固定导航及嵌套路由，保留未就绪时的直达页和 404 行为。 */
+/** Render fixed navigation and nested routes, retaining direct-page access before readiness and 404 behavior. */
 export function StudioShell() {
   const location = useLocation();
   const { tr } = useSettings();

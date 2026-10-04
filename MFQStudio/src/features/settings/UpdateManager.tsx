@@ -166,7 +166,7 @@ const unavailableStudioUpdates: StudioUpdates = {
 
 const StudioUpdatesContext = createContext<StudioUpdates>(unavailableStudioUpdates);
 
-/** 在应用生命周期内只维护一份更新检查、下载进度和版本缓存状态。 */
+/** Maintain a single shared state for update checks, download progress, and cached versions throughout the app lifecycle. */
 export function StudioUpdateProvider({ children }: { children: ReactNode }) {
   const reportError = useCallback((message: string) => {
     toast.error(message);
@@ -179,7 +179,7 @@ export function StudioUpdateProvider({ children }: { children: ReactNode }) {
   );
 }
 
-/** 读取全局 Studio 更新状态；调用方必须位于 StudioUpdateProvider 内。 */
+/** Read shared Studio update state; callers must be within StudioUpdateProvider. */
 export function useStudioUpdateContext(): StudioUpdates {
   return useContext(StudioUpdatesContext);
 }

@@ -1,4 +1,4 @@
-/** 量化页面组合任务表单、产物、历史操作与日志订阅。 */
+/** Combine the job form, artifacts, history actions, and log subscription for the quantization page. */
 import { useEffect, useState } from 'react';
 import { useLocation } from 'react-router';
 import { useSettings } from '../settings/SettingsProvider';
@@ -8,8 +8,7 @@ import { useJobForm } from './useJobForm';
 import { useJobEventLog } from './useJobEventLog';
 import { useJobArtifacts } from './useJobArtifacts';
 import { useJobRecordActions } from './useJobRecordActions';
-
-/** 按需组装量化资源，后台任务生命周期由共享运行时维持。 */
+/** Assemble quantization resources on demand; shared runtime state maintains background job lifecycles. */
 export function useQuantizationWorkspace() {
   const { tr } = useSettings();
   const jobs = useJobStore((state) => state.jobs);

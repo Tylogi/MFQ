@@ -1,4 +1,4 @@
-/** 管理待发送附件和预览资源，并把浏览器文件转换为服务端消息片段。 */
+/** Manage pending attachments and previews, converting browser files into server message parts. */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { mediaApi } from '../../../shared/api/resources/media';
 import type { ContentPart } from '../../../shared/api/types';
@@ -9,8 +9,7 @@ import {
   mediaMetadata,
   type PendingAttachment,
 } from '../attachments';
-
-/** 按会话隔离附件选择；切换或卸载时释放预览 URL。 */
+/** Isolate attachment selections by session and release preview URLs on session changes or unmount. */
 export function useChatAttachments(
   sessionId: string | null,
   connectionRevision: number,
@@ -30,8 +29,7 @@ export function useChatAttachments(
     clearAttachments();
     return clearAttachments;
   }, [sessionId, connectionRevision, clearAttachments]);
-
-  /** 校验文档体积与附件类型，每个会话最多保留八个待发送文件。 */
+/** Validate document size and attachment type, allowing up to eight pending files per session. */
   const selectAttachments = useCallback(
     (files: FileList | null) => {
       if (!files) return;
@@ -65,15 +63,13 @@ export function useChatAttachments(
     },
     [onError],
   );
-
-  /** 移除一个附件并释放对应的对象 URL。 */
+/** Remove an attachment and release its object URL. */
   const removeAttachment = useCallback((id: string) => {
     const removed = latest.current.find((item) => item.id === id);
     if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
     setAttachments((current) => current.filter((item) => item.id !== id));
   }, []);
-
-  /** 上传当前附件快照，成功后返回可用于生成的类型化输入；失败时保留选择。 */
+/** Upload the current attachment snapshot and return typed generation input; retain selections on failure. */
   const uploadAttachments = useCallback(
     () =>
       Promise.all(

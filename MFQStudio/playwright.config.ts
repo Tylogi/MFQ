@@ -1,4 +1,4 @@
-/** 使用生产构建产物运行模拟 API 的浏览器回归，覆盖桌面与移动端视口。 */
+/** Run browser regression tests against the production build with a mock API across desktop and mobile viewports. */
 import { defineConfig } from '@playwright/test';
 
 export default defineConfig({

@@ -1,4 +1,4 @@
-/** 归一化推理性能指标，处理各后端上报字段的优先级和缺失值。 */
+/** Normalize inference performance metrics, handling field priority and missing values across backends. */
 
 
 export interface PrefillMetricLike {
@@ -12,7 +12,7 @@ export interface PrefillMetricLike {
   complete_prefill_tps?: number;
 }
 
-/** 按服务指标优先级计算预填充耗时及吞吐量。 */
+/** Calculate prefill latency and throughput according to server metric priority. */
 export function displayPrefillMetric(metrics?: PrefillMetricLike | null): {
   milliseconds: number | undefined;
   tokensPerSecond: number | undefined;
@@ -40,7 +40,7 @@ export function displayPrefillMetric(metrics?: PrefillMetricLike | null): {
   };
 }
 
-/** 优先选取主指标，缺失时回退到有效的正数指标。 */
+/** Prefer the primary metric and fall back to a valid positive metric when it is unavailable. */
 export function preferPositiveMetric(primary: unknown, fallback: unknown): number | undefined {
   const preferred = Number(primary);
   if (Number.isFinite(preferred) && preferred > 0) return preferred;

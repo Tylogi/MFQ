@@ -1,4 +1,4 @@
-/** 历史消息列表：展示附件、工具调用、推理指标及编辑操作。 */
+/** Saved-message list displaying attachments, tool calls, inference metrics, and editing actions. */
 import { memo, useLayoutEffect, useMemo, useRef, type Dispatch, type SetStateAction } from 'react';
 import type { McpToolResource, Message, ResponseResource } from '../../shared/api/types';
 import { Icon } from '../../app/display';
@@ -11,13 +11,13 @@ import { Tooltip } from '../../shared/ui/Tooltip';
 
 export interface EditDraft { messageId: string; text: string; }
 export interface MessageActions {
-  /** 保存已编辑消息，并从该消息继续生成。 */
+/** Save the edited message and continue generation from it. */
   saveEdit: (message: Message) => Promise<void>;
-  /** 复制消息正文到剪贴板。 */
+/** Copy the message text to the clipboard. */
   copyMessage: (message: Message) => Promise<void>;
-  /** 从选定助手消息回退并重新生成回答。 */
+/** Rewind from the selected assistant message and regenerate the response. */
   regenerate: (message: Message) => Promise<void>;
-  /** 执行用户确认的 MCP 工具调用。 */
+/** Execute an MCP tool call confirmed by the user. */
   executeToolCalls: (message: Message) => Promise<void>;
 }
 interface SavedMessageListProps {
@@ -31,8 +31,7 @@ interface SavedMessageListProps {
   actions: MessageActions;
 }
 type MessageRowsProps = Omit<SavedMessageListProps, 'actions'> & MessageActions;
-
-/** 仅在历史数据、编辑状态或工具能力改变时重新渲染历史正文。 */
+/** Rerender saved message content only when history, editing state, or tool capabilities change. */
 const MessageRows = memo(function MessageRows({ messages, responses, mcpTools, busy, tr, editDraft, setEditDraft, saveEdit, copyMessage, regenerate, executeToolCalls }: MessageRowsProps) {
   return <>{messages.map((message) => {
                   const parts = textParts(message);
@@ -55,8 +54,7 @@ const MessageRows = memo(function MessageRows({ messages, responses, mcpTools, b
                   </article>;
                 })}</>;
 });
-
-/** 将最新业务回调绑定为稳定事件入口，避免输入草稿及流式更新使历史正文失去缓存。 */
+/** Bind current business callbacks to stable event handlers so draft and streaming updates do not invalidate saved-message memoization. */
 export function SavedMessageList({ actions, ...props }: SavedMessageListProps) {
   const latest = useRef(actions);
   useLayoutEffect(() => { latest.current = actions; }, [actions]);

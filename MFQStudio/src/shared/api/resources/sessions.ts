@@ -1,4 +1,4 @@
-/** 封装 sessions 领域资源请求，不保存组件状态。 */
+/** Wrap resource requests for the sessions domain without storing component state. */
 import type {
   SessionMode,
   MessageRole,
@@ -11,12 +11,12 @@ import type {
 import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client';
 
 export const sessionsApi = {
-  /** 获取最近的会话列表，供侧栏与会话选择使用。 */
+  /** Get recent sessions for the sidebar and session selector. */
   async listSessions(): Promise<Session[]> {
     return (await request<{ data: Session[] }>('/api/v1/sessions?limit=200')).data;
   },
 
-  /** 按模型和交互模式创建会话，返回服务端分配的标识与版本。 */
+  /** Create a session for a model and interaction mode, returning the server-assigned ID and revision. */
   createSession(
     model: string,
     mode: SessionMode,
@@ -29,12 +29,12 @@ export const sessionsApi = {
     });
   },
 
-  /** 读取会话的权威状态和版本号，可随页面或请求取消。 */
+  /** Read the authoritative session state and revision, cancellable with the page or request. */
   getSession(id: string, signal?: AbortSignal): Promise<Session> {
     return request(`/api/v1/sessions/${id}`, { signal });
   },
 
-  /** 更新会话标题、模式或元数据，不修改历史消息。 */
+  /** Update session title, mode, or metadata without changing message history. */
   updateSession(
     id: string,
     update: { title?: string | null; mode?: SessionMode; metadata?: Record<string, unknown> },
@@ -45,12 +45,12 @@ export const sessionsApi = {
     });
   },
 
-  /** 获取持久化消息，供首次加载及生成完成后的最终同步使用。 */
+  /** Get persisted messages for initial loading and final synchronization after generation. */
   async listMessages(id: string, signal?: AbortSignal): Promise<Message[]> {
     return (await request<{ data: Message[] }>(`/api/v1/sessions/${id}/messages`, { signal })).data;
   },
 
-  /** 获取响应状态与性能记录，用于核对请求标识和最终消息。 */
+  /** Get response status and performance records to verify request IDs and final messages. */
   async listResponses(id: string, signal?: AbortSignal): Promise<ResponseResource[]> {
     return (
       await request<{ data: ResponseResource[] }>(`/api/v1/sessions/${id}/responses?limit=1000`, {
@@ -59,12 +59,12 @@ export const sessionsApi = {
     ).data;
   },
 
-  /** 请求服务端取消该会话正在运行的生成，调用方负责确认最终状态。 */
+  /** Ask the server to cancel generation for this session; the caller verifies the final state. */
   cancelResponse(id: string, signal?: AbortSignal): Promise<ResponseResource> {
     return request(`/api/v1/sessions/${id}/responses/cancel`, { method: 'POST', signal });
   },
 
-  /** 使用预期版本追加消息，版本冲突由服务端返回错误。 */
+  /** Append messages using the expected revision; the server reports revision conflicts as errors. */
   appendMessage(
     id: string,
     expectedRevision: number,
@@ -77,7 +77,7 @@ export const sessionsApi = {
     });
   },
 
-  /** 从指定历史位置派生会话，可同时指定新的模型。 */
+  /** Fork a session from a specified history position, optionally selecting a new model. */
   forkSession(
     id: string,
     atMessageId: string | null,
@@ -96,7 +96,7 @@ export const sessionsApi = {
     });
   },
 
-  /** 按版本回退会话历史，供编辑和重新生成操作使用。 */
+  /** Rewind session history to a specified revision for editing and regeneration. */
   rewindSession(
     id: string,
     expectedRevision: number,
@@ -113,7 +113,7 @@ export const sessionsApi = {
     });
   },
 
-  /** 删除指定服务端会话，成功后由调用方清理界面状态。 */
+  /** Delete a server-side session; the caller clears interface state on success. */
   async deleteSession(id: string): Promise<void> {
     const response = await fetch(apiUrl(`/api/v1/sessions/${id}`), {
       method: 'DELETE',
@@ -122,12 +122,12 @@ export const sessionsApi = {
     if (!response.ok) throw await errorFromResponse(response);
   },
 
-  /** 导出会话及媒体归档，供用户下载或备份。 */
+  /** Export a session and media archive for user download or backup. */
   exportSession(id: string): Promise<SessionArchive> {
     return request(`/api/v1/sessions/${id}/export`);
   },
 
-  /** 导入会话归档并返回新会话及媒体导入数量。 */
+  /** Import a session archive and return the new sessions and media import count. */
   importSession(archive: SessionArchive): Promise<{
     session: Session;
     messages_imported: number;

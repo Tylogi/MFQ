@@ -1,4 +1,4 @@
-/** 验证深链接、路由生成与回退行为在页面拆分后保持一致。 */
+/** Verify deep links, route generation, and fallback behavior remain consistent after splitting pages. */
 import { describe, expect, it } from 'vitest';
 import {
   dashboardPath,
@@ -8,7 +8,7 @@ import {
   resolveStudioLocation,
 } from '../src/navigation';
 
-describe('Studio 页面路由', () => {
+describe('describes navigation test behavior 1', () => {
   it.each([
     ['/', 'dashboard', 'overview'],
     ['/models', 'dashboard', 'models'],
@@ -20,13 +20,13 @@ describe('Studio 页面路由', () => {
     ['/evaluations', 'lab', 'evaluations'],
     ['/quantization', 'lab', 'quantization'],
     ['/chat', 'chat', 'overview'],
-  ])('解析深链接 %s', (path, view, page) => {
+  ])('verifies parameterized behavior %s', (path, view, page) => {
     const location = resolveStudioLocation(path);
     expect(location.view).toBe(view);
     expect(view === 'lab' ? location.labPage : location.dashboardPage).toBe(page);
   });
 
-  it('生成的业务路径可回读，兼容尾部斜杠', () => {
+  it('verifies navigation test behavior 2', () => {
     expect(resolveStudioLocation(`${dashboardPath('connections')}/`).dashboardPage).toBe(
       'connections',
     );
@@ -34,7 +34,7 @@ describe('Studio 页面路由', () => {
     expect(normalizeStudioPath('/')).toBe('/');
   });
 
-  it('未知地址不会被视为业务页面', () => {
+  it('verifies navigation test behavior 3', () => {
     expect(isStudioPath('/chat')).toBe(true);
     expect(isStudioPath('/chat/')).toBe(true);
     expect(isStudioPath('/missing')).toBe(false);

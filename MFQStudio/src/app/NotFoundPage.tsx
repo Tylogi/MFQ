@@ -1,9 +1,8 @@
-/** 未注册地址的 404 页面，保留工作区导航并提供明确的返回入口。 */
+/** 404 page for unregistered routes, retaining workspace navigation and providing a clear way back. */
 import { ArrowLeftIcon, HouseIcon } from '@phosphor-icons/react';
 import { useNavigate } from 'react-router';
 import { useSettings } from '../features/settings/SettingsProvider';
-
-/** 在未知路由展示独立页面，不重定向或改写用户输入的地址。 */
+/** Display a standalone page for unknown routes without redirecting or rewriting the user-entered address. */
 export function NotFoundPage() {
   const navigate = useNavigate();
   const { tr } = useSettings();

@@ -1,4 +1,4 @@
-/** 验证音频设备资源独立后的播放调度与录音失败清理。 */
+/** Verify playback scheduling and recording-failure cleanup after separating audio device resources. */
 import { beforeEach, expect, it, vi } from 'vitest';
 import { AudioDevices } from './AudioDevices';
 
@@ -73,7 +73,7 @@ beforeEach(() => {
   });
 });
 
-it('连续音频块按样本时长串行排队，停止会释放所有源和输出上下文', async () => {
+it('verifies AudioDevices test behavior 1', async () => {
   const audio = new AudioDevices();
   await audio.ensureOutput();
   audio.play(new Float32Array(2400), 24000);
@@ -86,7 +86,7 @@ it('连续音频块按样本时长串行排队，停止会释放所有源和输�
   expect(contexts[0].close).toHaveBeenCalledOnce();
 });
 
-it('录音工作线程加载失败时立即释放麦克风以及输入输出上下文', async () => {
+it('verifies AudioDevices test behavior 2', async () => {
   failWorklet = true;
   const audio = new AudioDevices();
   await expect(audio.startCapture(vi.fn())).rejects.toThrow('worklet unavailable');
@@ -96,7 +96,7 @@ it('录音工作线程加载失败时立即释放麦克风以及输入输出上�
   expect(contexts.every((context) => context.close.mock.calls.length === 1)).toBe(true);
 });
 
-it('半双工结束采集只关闭输入设备，仍可播放服务返回的音频', async () => {
+it('verifies AudioDevices test behavior 3', async () => {
   const audio = new AudioDevices();
   await audio.startCapture(vi.fn());
   expect(audio.capturing).toBe(true);

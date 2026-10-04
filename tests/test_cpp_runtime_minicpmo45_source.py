@@ -1,4 +1,4 @@
-"""检查 MiniCPM C++ 原生执行与 Python 实时网关契约。"""
+"""Check MiniCPM C++ native execution and Python real-time gateway contracts."""
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]

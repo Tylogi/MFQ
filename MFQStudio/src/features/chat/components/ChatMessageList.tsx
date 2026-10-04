@@ -1,4 +1,4 @@
-/** 聊天消息区组合欢迎状态、历史、语音和流式回复。 */
+/** Compose the welcome state, history, voice, and streaming response in the chat message area. */
 import { lazy, Suspense } from 'react';
 import { useSettings } from '../../settings/SettingsProvider';
 import { useChatTools } from '../ChatToolsProvider';
@@ -12,8 +12,7 @@ import type { ChatPageState } from '../hooks/useChatPageState';
 const SavedMessageList = lazy(() =>
   import('../SavedMessageList').then((module) => ({ default: module.SavedMessageList })),
 );
-
-/** 展示当前会话消息并维持历史消息组件的按需加载。 */
+/** Display current-session messages while preserving lazy loading of saved-message components. */
 export function ChatMessageList({ page }: { page: ChatPageState }) {
   const { tr } = useSettings();
   const { mcpTools } = useChatTools();

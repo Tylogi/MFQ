@@ -1,4 +1,4 @@
-/** 验证侧栏删除入口只转发目标会话，不触发会话切换。 */
+/** Verify that the sidebar delete action forwards only the target session and does not switch sessions. */
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { expect, it, vi } from 'vitest';
@@ -17,7 +17,7 @@ vi.mock('../state/conversationStore', () => ({
   }),
 }));
 
-it('删除按钮独立于选中按钮，并在忙碌时禁用', async () => {
+it('verifies ChatSessionSidebar test behavior 1', async () => {
   const deleteConversation = vi.fn().mockResolvedValue(undefined);
   const selectSession = vi.fn();
   const page = {

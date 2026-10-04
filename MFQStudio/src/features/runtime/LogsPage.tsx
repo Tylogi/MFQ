@@ -1,4 +1,4 @@
-/** 日志页按需轮询请求与事件，并管理任务历史清理。 */
+/** Poll requests and events on demand and manage job history cleanup on the logs page. */
 import { useEffect, useState } from 'react';
 import { runtimeApi } from '../../shared/api/resources/runtime';
 import { jobsApi } from '../../shared/api/resources/jobs';
@@ -11,7 +11,7 @@ import { isTerminalJob } from '../jobs/jobSchema';
 import { toast } from '../../stores/toastStore';
 import { useJobStore } from '../../stores/jobStore';
 
-/** 打开日志页才读取指标历史；每次请求结束后再安排下一轮，避免请求重叠。 */
+/** Read metric history only while the logs page is open; schedule each poll after the previous request completes to avoid overlap. */
 export function LogsPage() {
   const jobs = useJobStore((state) => state.jobs);
   const { ready, refreshRuntime } = useRuntime();
@@ -25,7 +25,7 @@ export function LogsPage() {
     if (!ready) return;
     let active = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    /** 读取日志和指标，在卸载时停止调度并忽略迟到结果。 */
+    /** Read logs and metrics, stopping polling and ignoring late results on unmount. */
     async function refresh() {
       try {
         const [logs, metrics] = await Promise.all([runtimeApi.runtimeLogs(100), runtimeApi.runtimeMetrics(200)]);
@@ -38,7 +38,7 @@ export function LogsPage() {
         }
         setRequestHistory([...unique.values()].slice(-24).reverse());
       } catch {
-        // 轮询失败静默跳过，等待下一轮重试
+        // Skip polling failures silently and retry on the next cycle.
       } finally {
         if (active) timer = setTimeout(() => void refresh(), 4000);
       }
@@ -49,7 +49,7 @@ export function LogsPage() {
       clearTimeout(timer);
     };
   }, [ready]);
-  /** 删除单条或已完成任务记录，并重新读取共享任务列表。 */
+  /** Delete one or all completed job records, then reload the shared job list. */
   async function cleanup(id?: string) {
     if (jobCleanupBusy) return;
     setJobCleanupBusy(true);

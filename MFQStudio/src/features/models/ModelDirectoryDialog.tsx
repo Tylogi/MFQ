@@ -1,10 +1,9 @@
-/** 展示模型目录浏览和注册弹窗，复用目录控制器的操作状态。 */
+/** Display the model-directory browser and registration dialog, reusing the directory controller’s operation state. */
 import { Dialog } from '../../shared/ui/Dialog';
 import { Icon } from '../../app/display';
 import { useSettings } from '../settings/SettingsProvider';
 import type { useModelCatalog } from './useModelCatalog';
-
-/** 渲染服务器文件夹选择器，并在关闭时恢复触发器焦点。 */
+/** Render the server folder picker and restore focus to its trigger when closed. */
 export function ModelDirectoryDialog({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
   const { tr } = useSettings();
   const {

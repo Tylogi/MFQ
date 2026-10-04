@@ -1,4 +1,4 @@
-/** 兼容统一类型导入路径，实际契约按资源领域维护。 */
+/** Preserve the unified type import path for compatibility; actual contracts are maintained by resource domain. */
 export type * from './contracts/sessions';
 export type * from './contracts/media';
 export type * from './contracts/runtime';

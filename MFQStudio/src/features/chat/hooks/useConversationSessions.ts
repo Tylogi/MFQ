@@ -1,12 +1,11 @@
-/** 管理会话列表、选中会话与消息历史，所有异步回写绑定当前连接和会话。 */
+/** Manage the session list, selected session, and message history, binding async updates to the current connection and session. */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { sessionsApi } from '../../../shared/api/resources/sessions';
 import type { SessionMode } from '../../../shared/api/types';
 import { useRuntime } from '../../../app/RuntimeProvider';
 import { errorMessage } from '../../../app/formatters';
 import { useConversationStore } from '../state/conversationStore';
-
-/** 首次打开聊天才加载会话，切换时取消旧历史请求，跨页面保留已加载状态。 */
+/** Load sessions on first chat entry, cancel old history requests on switches, and preserve loaded state across pages. */
 export function useConversationSessions(enabled: boolean, generationBusy: boolean) {
   const { ready, connectionRevision, selectedModel, setSelectedModel, models, instances } =
     useRuntime();
@@ -107,8 +106,7 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
       setTransitioning(false);
     };
   }, [active?.id, active?.model, active?.title, selectedModel, modelAvailable, generationBusy]);
-
-  /** 切换会话及其绑定模型，历史请求在 effect 中按会话重建。 */
+/** Switch sessions and their associated models; rebuild history requests per session in the effect. */
   const selectSession = useCallback(
     (id: string) => {
       const session = useConversationStore.getState().sessions.find((candidate) => candidate.id === id);
@@ -118,8 +116,7 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     },
     [transitioning, setSelectedModel, setActiveId],
   );
-
-  /** 创建新的空会话，版本戳防止服务切换后的返回污染当前列表。 */
+/** Create a new empty session; a revision token prevents responses from a previous server polluting the current list. */
   const createSession = useCallback(
     async (mode: SessionMode = 'text') => {
       if (!selectedModel || transitioning) return;
@@ -139,8 +136,7 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     },
     [selectedModel, transitioning, setSessions, setActiveId],
   );
-
-  /** 删除指定会话；仅在当前连接仍有效时更新列表和当前历史。 */
+/** Delete the specified session; update the list and current history only while the connection remains current. */
   const deleteSession = useCallback(
     async (id: string): Promise<boolean> => {
       if (generationBusy || transitioning || !useConversationStore.getState().sessions.some((session) => session.id === id)) return false;

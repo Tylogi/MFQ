@@ -1,4 +1,4 @@
-/** 管理单次聊天生成的生命周期、批量输出与历史同步，隔离过期异步回写。 */
+/** Manage one chat generation lifecycle, batched output, and history synchronization, isolating stale asynchronous writes. */
 import { sessionsApi } from '../../../shared/api/resources/sessions';
 import { ApiError } from '../../../shared/api/client';
 import { streamResponse } from '../../../shared/api/responses';
@@ -26,7 +26,7 @@ export interface GenerationSnapshot {
   sessionId: string | null;
   live: LiveOutput | null;
   error: string | null;
-  /** 历史未确认时只允许重新同步，禁止自动重发生成 POST。 */
+/** When history is unconfirmed, allow only resynchronization; never automatically resend the generation POST. */
   recoveryNeeded: boolean;
 }
 
@@ -49,9 +49,9 @@ interface GenerationServices {
 }
 
 export interface GenerationCallbacks {
-  /** 仅当前请求可发布已持久化快照，调用方仍需检查当前选中的会话。 */
+/** Only the current request may publish a persisted snapshot; callers must still verify the selected session. */
   onSynchronized: (snapshot: ConversationSnapshot) => void;
-  /** 更新当前生成会话的版本号，不影响其他会话的选中状态。 */
+/** Update the revision of the generating session without affecting other session selections. */
   onSessionState: (sessionId: string, state: Session['state'], revision: number) => void;
 }
 
@@ -86,15 +86,13 @@ const services: GenerationServices = {
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
-
-/** 判断生命周期是否仍占用发送通道，包含停止与历史同步阶段。 */
+/** Determine whether the lifecycle still occupies the send channel, including stopping and history synchronization. */
 export function isGenerationBusy(phase: GenerationPhase): boolean {
   return (
     phase === 'submitting' || phase === 'streaming' || phase === 'stopping' || phase === 'syncing'
   );
 }
-
-/** 创建可单独订阅的生成控制器，UI 只需订阅自身关心的快照。 */
+/** Create a separately subscribable generation controller so the UI observes only snapshots it needs. */
 export class GenerationController {
   private snapshot: GenerationSnapshot = {
     phase: 'idle',
@@ -111,19 +109,16 @@ export class GenerationController {
     private callbacks: GenerationCallbacks,
     private dependencies: GenerationServices = services,
   ) {}
-
-  /** 订阅快照变化；返回值用于 React 卸载时取消订阅。 */
+/** Subscribe to snapshot changes; use the returned function to unsubscribe on React unmount. */
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
     return () => {
       this.listeners.delete(listener);
     };
   };
-
-  /** 返回缓存快照；同一版本保持引用稳定，适配 useSyncExternalStore。 */
+/** Return the cached snapshot, preserving reference identity for the same revision for useSyncExternalStore. */
   getSnapshot = (): GenerationSnapshot => this.snapshot;
-
-  /** 应用外壳仅订阅阶段，文本增量不会触发整个应用重新渲染。 */
+/** The app shell subscribes only to phases, so text deltas do not rerender the entire application. */
   getPhase = (): GenerationPhase => this.snapshot.phase;
 
   private publish(update: Partial<GenerationSnapshot>): void {
@@ -163,8 +158,7 @@ export class GenerationController {
     run.accepted = true;
     run.onAccepted?.();
   }
-
-  /** 发起一次生成；直到同步结束才释放发送通道，不自动重试非幂等请求。 */
+/** Start one generation; keep the send channel occupied until synchronization completes and never retry non-idempotent requests automatically. */
   async start(sessionId: string, request: StreamRequest, onAccepted?: () => void): Promise<void> {
     if (isGenerationBusy(this.snapshot.phase) || this.snapshot.recoveryNeeded) {
       throw new Error('Wait for the current response to synchronize before sending again');
@@ -209,8 +203,7 @@ export class GenerationController {
       }
     }
   }
-
-  /** 停止当前生成；取消接口最多等待五秒，随后中断读取并同步服务端状态。 */
+/** Stop the current generation; wait up to five seconds for cancellation, then abort reading and synchronize server state. */
   stop = async (): Promise<void> => {
     const run = this.active;
     if (
@@ -296,15 +289,13 @@ export class GenerationController {
       controller.abort();
     }
   }
-
-  /** 仅重读历史和响应状态，保留原请求标识，绝不重新发起生成。 */
+/** Reread only history and response status, retaining the original request ID and never restarting generation. */
   retrySynchronization = async (): Promise<void> => {
     if (this.active && this.snapshot.recoveryNeeded && !isGenerationBusy(this.snapshot.phase)) {
       await this.synchronize(this.active);
     }
   };
-
-  /** 会话变更或组件卸载时失效所有回调并释放读取、取消请求和批处理定时器。 */
+/** Invalidate callbacks and release readers, cancellation requests, and batch timers when the session changes or the component unmounts. */
   reset = (): void => {
     const previous = this.active;
     this.active = null;

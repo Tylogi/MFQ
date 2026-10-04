@@ -1,4 +1,4 @@
-/** 还原模型回复中完全转义的 Markdown 结构性换行，保留代码和数据文本。 */
+/** Restore fully escaped structural Markdown newlines in model replies while preserving code and data text. */
 const escapedLineBreak = String.raw`\n`;
 const escapedWindowsLineBreak = String.raw`\r\n`;
 

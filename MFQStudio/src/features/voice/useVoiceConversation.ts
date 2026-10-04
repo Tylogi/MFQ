@@ -1,4 +1,4 @@
-/** 将语音采集、片段持久化与会话归属绑定，供聊天业务独立使用。 */
+/** Bind voice capture, clip persistence, and session ownership for independent use by chat business logic. */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { RealtimeAudioController, type VoiceState, saveVoiceClip } from '../../realtimeAudio';
 import {
@@ -11,7 +11,7 @@ import { useSettings } from '../settings/SettingsProvider';
 import { errorMessage } from '../../app/formatters';
 import { resetVoiceLevel, setVoiceLevel } from './voiceLevelStore';
 
-/** 保留跨路由语音状态，按会话切换和连接重置停止旧控制器。 */
+/** Preserve voice state across routes and stop the old controller when the session changes or the connection resets. */
 export function useVoiceConversation(
   activeId: string | null,
   connectionRevision: number,
@@ -31,7 +31,7 @@ export function useVoiceConversation(
     try {
       localStorage.setItem(VOICE_HISTORY_KEY, JSON.stringify(stable.slice(-200)));
     } catch {
-      /* 存储额度不足不影响当前语音会话。 */
+      /* Insufficient storage quota does not affect the current voice session. */
     }
   }, [voiceMessages]);
   useEffect(() => {

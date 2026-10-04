@@ -1,5 +1,5 @@
 /**
- * ChatProvider 领域状态缓存与 Context 重渲染拦截测试。
+* Tests for ChatProvider domain-state caching and prevention of unnecessary Context rerenders.
  */
 
 import { act, render, renderHook, screen } from '@testing-library/react';
@@ -89,7 +89,7 @@ vi.mock('../../studio', () => ({
   studioConfirm: vi.fn().mockResolvedValue(true),
 }));
 
-describe('ChatProvider Context 重渲染拦截与缓存', () => {
+describe('describes ChatProvider test behavior 1', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     useConversationStore.getState().reset();
@@ -98,7 +98,7 @@ describe('ChatProvider Context 重渲染拦截与缓存', () => {
     useJobStore.getState().setJobs([]);
   });
 
-  it('Profiler 计数表明草稿与音量更新不会提交无关历史列表', async () => {
+  it('verifies ChatProvider test behavior 2', async () => {
     const commits = { toolbar: 0, history: 0 };
     const onRender: ProfilerOnRenderCallback = (id, phase) => {
       if (phase !== 'mount' && (id === 'toolbar' || id === 'history')) commits[id] += 1;
@@ -172,7 +172,7 @@ describe('ChatProvider Context 重渲染拦截与缓存', () => {
     expect(commits).toEqual(afterVoice);
   });
 
-  it('消息写入 store 时不会更新只订阅聊天命令的 Context 消费者', async () => {
+  it('verifies ChatProvider test behavior 3', async () => {
     let renders = 0;
     function Commands() {
       useChat();
@@ -192,7 +192,7 @@ describe('ChatProvider Context 重渲染拦截与缓存', () => {
     expect(renders).toBe(before);
   });
 
-  it('ChatProvider 提供 useChat 上下文且导出的业务动作引用保持稳定', () => {
+  it('verifies ChatProvider test behavior 4', () => {
     const wrapper = ({ children }: { children: ReactNode }) => (
       <MemoryRouter initialEntries={['/chat']}>
         <ChatProvider>{children}</ChatProvider>
@@ -206,11 +206,9 @@ describe('ChatProvider Context 重渲染拦截与缓存', () => {
     const initialClear = result.current.clearActiveConversation;
     const initialSelectMode = result.current.selectInteractionMode;
     const initialToggleVoice = result.current.toggleVoice;
-
-    // 重新渲染 Provider 外层
+// Rerender the outer Provider.
     rerender();
-
-    // 动作方法引用应当保持一致，避免子组件非必要重渲染
+// Action method references should remain stable to avoid unnecessary child-component rerenders.
     expect(result.current.send).toBe(initialSend);
     expect(result.current.clearActiveConversation).toBe(initialClear);
     expect(result.current.selectInteractionMode).toBe(initialSelectMode);

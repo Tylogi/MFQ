@@ -1,10 +1,9 @@
-/** 加载和展示聊天媒体与文档，管理下载状态、视频首帧和资源释放。 */
+/** Load and display chat media and documents, managing download state, video posters, and resource cleanup. */
 import { useEffect, useState } from 'react';
 import { mediaApi } from '../../shared/api/resources/media';
 import type { ContentPart } from '../../shared/api/types';
 import { formatNumber } from '../../app/formatters';
-
-/** 展示视频并提取首帧海报，卸载时释放解码器和对象 URL。 */
+/** Display video and extract its first-frame poster, releasing the decoder and object URL on unmount. */
 export function VideoWithFirstFrame({
   className,
   controls = false,
@@ -54,8 +53,7 @@ export function VideoWithFirstFrame({
 
   return <video className={className} controls={controls} muted={muted} playsInline poster={poster ?? undefined} preload="metadata" src={src} />;
 }
-
-/** 按消息媒体标识加载附件，支持取消请求及失败状态。 */
+/** Load an attachment by message-media ID, supporting request cancellation and failure state. */
 export function MediaPartView({ part }: { part: Extract<ContentPart, { media: unknown }> }) {
   const [src, setSrc] = useState<string | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
@@ -93,8 +91,7 @@ export function MediaPartView({ part }: { part: Extract<ContentPart, { media: un
   }
   return <audio className="message-audio" controls preload="metadata" src={src} />;
 }
-
-/** 展示文档附件并提供下载、进度及失败重试交互。 */
+/** Display document attachments with download, progress, and retry interactions. */
 export function DocumentPartView({ part }: { part: Extract<ContentPart, { type: "document" }> }) {
   const [downloadState, setDownloadState] = useState<"idle" | "loading" | "failed">("idle");
 

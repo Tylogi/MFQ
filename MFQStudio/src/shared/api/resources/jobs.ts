@@ -1,4 +1,4 @@
-/** 封装 jobs 领域资源请求，不保存组件状态。 */
+/** Wrap resource requests for the jobs domain without storing component state. */
 import type { RuntimeLogEntry, JobResource, JobEventResource, JobKindResource } from '../types';
 import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client';
 import { readEventStream } from '../eventStream';
@@ -7,17 +7,17 @@ export const jobsApi = {
   getJob(id: string): Promise<JobResource> {
     return request(`/api/v1/jobs/${id}`);
   },
-  /** 获取最近的后台任务。 */
+  /** Get recent background jobs. */
   async jobs(limit = 100): Promise<JobResource[]> {
     return (await request<{ data: JobResource[] }>(`/api/v1/jobs?limit=${limit}`)).data;
   },
 
-  /** 获取任务类型和动态表单字段定义。 */
+  /** Get job types and dynamic form field definitions. */
   async jobKinds(): Promise<JobKindResource[]> {
     return (await request<{ data: JobKindResource[] }>('/api/v1/jobs/kinds')).data;
   },
 
-  /** 提交后台任务并返回初始任务记录。 */
+  /** Submit a background job and return its initial record. */
   createJob(kind: string, payload: Record<string, unknown>): Promise<JobResource> {
     return request('/api/v1/jobs', {
       method: 'POST',
@@ -25,17 +25,17 @@ export const jobsApi = {
     });
   },
 
-  /** 请求取消指定后台任务。 */
+  /** Request cancellation of the specified background job. */
   cancelJob(id: string): Promise<JobResource> {
     return request(`/api/v1/jobs/${id}/cancel`, { method: 'POST' });
   },
 
-  /** 根据已有任务重新创建执行尝试。 */
+  /** Create a new execution attempt from an existing job. */
   retryJob(id: string): Promise<JobResource> {
     return request(`/api/v1/jobs/${id}/retry`, { method: 'POST' });
   },
 
-  /** 移除指定任务历史记录。 */
+  /** Remove the specified job history record. */
   async deleteJob(id: string): Promise<void> {
     const response = await fetch(apiUrl(`/api/v1/jobs/${id}`), {
       method: 'DELETE',
@@ -44,7 +44,7 @@ export const jobsApi = {
     if (!response.ok) throw await errorFromResponse(response);
   },
 
-  /** 清理已经完成的任务记录，不删除对应模型产物。 */
+  /** Clear completed job records without deleting their associated model artifacts. */
   async clearCompletedJobs(): Promise<void> {
     const response = await fetch(apiUrl('/api/v1/jobs/completed'), {
       method: 'DELETE',
@@ -53,7 +53,7 @@ export const jobsApi = {
     if (!response.ok) throw await errorFromResponse(response);
   },
 
-  /** 读取任务历史事件并转换为日志展示条目。 */
+  /** Read job history events and convert them into log entries for display. */
   async jobEvents(id: string): Promise<RuntimeLogEntry[]> {
     const response = await request<{
       data: Array<{
@@ -75,7 +75,7 @@ export const jobsApi = {
       }));
   },
 
-  /** 持续消费任务 SSE；终止订阅时由调用方取消信号。 */
+  /** Consume job SSE events continuously; the caller cancels the signal to end the subscription. */
   async streamJobEvents(
     id: string,
     onEvent: (event: JobEventResource) => void,

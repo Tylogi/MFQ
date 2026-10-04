@@ -1,4 +1,4 @@
-/** 动态任务参数表单的模式加载、默认值及提交。 */
+/** Load modes and defaults and submit the dynamic job-parameter form. */
 import { useEffect, useState, type FormEvent, type Dispatch, type SetStateAction } from 'react';
 import type { JobKindResource, JsonSchemaProperty } from '../../shared/api/types';
 import { jobsApi } from '../../shared/api/resources/jobs';
@@ -6,8 +6,7 @@ import { schemaDefault, schemaType } from './jobSchema';
 import { errorMessage } from '../../app/formatters';
 import { toast } from '../../stores/toastStore';
 import { useJobStore } from '../../stores/jobStore';
-
-/** 维护任务类型与 payload，并在提交成功后选中创建的任务。 */
+/** Maintain the job type and payload, selecting the created job after successful submission. */
 export function useJobForm(setSelectedJobId: Dispatch<SetStateAction<string | null>>) {
   const addJob = useJobStore((state) => state.addJob);
   const [busy, setBusy] = useState(false);
@@ -36,8 +35,7 @@ export function useJobForm(setSelectedJobId: Dispatch<SetStateAction<string | nu
         : schemaDefault(property),
     ])));
   }, [jobKinds, selectedJobKind, pendingImatrix]);
-
-  /** 根据任务参数模式转换表单值。 */
+/** Convert form values according to the job-parameter mode. */
   function updateJobPayload(name: string, property: JsonSchemaProperty, value: string | boolean) {
     const type = schemaType(property);
     let parsed: unknown = value;
@@ -49,8 +47,7 @@ export function useJobForm(setSelectedJobId: Dispatch<SetStateAction<string | nu
     }
     setJobPayload((current) => ({ ...current, [name]: parsed }));
   }
-
-  /** 提交当前参数并选择新任务。 */
+/** Submit the current parameters and select the new job. */
   async function submitJob(event: FormEvent) {
     event.preventDefault();
     if (!selectedJobKind) return;

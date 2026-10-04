@@ -1,4 +1,4 @@
-/** 按模型能力提供聊天模式、语音播放和即时推理开关。 */
+/** Provide chat-mode, voice-playback, and immediate-inference switches based on model capabilities. */
 import type { CSSProperties } from 'react';
 import type { SessionMode } from '../../../shared/api/types';
 import { useChat } from '../ChatProvider';
@@ -12,7 +12,7 @@ const MODE_LABELS: Record<SessionMode, [string, string]> = {
   voice: ['语音', 'Voice'],
   full_duplex: ['全双工', 'Full duplex'],
 };
-/** 展示当前会话允许的输入与推理选项，所有操作写入所属领域。 */
+/** Display input and inference options allowed by the active session, routing each action to its owning domain. */
 export function ChatToolbar() {
   const { settings, updateSettings, tr, english } = useSettings();
   const active = useConversationSelector(

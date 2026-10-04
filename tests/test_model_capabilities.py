@@ -1,4 +1,4 @@
-"""检查 Python 能力注册与 C++ 架构声明；前端能力交互由 Vitest 覆盖。"""
+"""Check Python capability registration and C++ architecture declarations; frontend capability interactions are covered by Vitest."""
 from pathlib import Path
 
 from mfq.server.protocol.output_protocols import output_protocol_for_architecture

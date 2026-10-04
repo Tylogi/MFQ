@@ -1,20 +1,20 @@
 /**
- * MFQ Studio 跨页面界面状态，集中管理应用外壳与临时导航交互。
+ * MFQ Studio cross-page interface state, centralizing app-shell and temporary navigation interactions.
  */
 
 import { create } from 'zustand';
 
 interface UiState {
   sidebarOpen: boolean;
-  /** 路由跳转或遮罩点击时关闭移动端导航。 */
+  /** Close mobile navigation on route changes or backdrop clicks. */
   closeSidebar: () => void;
-  /** 用户点击菜单按钮时显示移动端导航。 */
+  /** Show mobile navigation when the user clicks the menu button. */
   openSidebar: () => void;
-  /** 在当前侧栏状态基础上切换显示。 */
+  /** Toggle visibility based on the current sidebar state. */
   toggleSidebar: () => void;
 }
 
-/** 提供应用外壳共享状态，避免页面组件层层传递侧栏控制函数。 */
+/** Provide shared app-shell state and avoid passing sidebar controls through page components. */
 export const useUiStore = create<UiState>()((set) => ({
   sidebarOpen: false,
   closeSidebar: () => set({ sidebarOpen: false }),

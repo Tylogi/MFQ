@@ -1,4 +1,4 @@
-/* 运行日志列表、筛选和级别标签样式。 */
+/* Runtime log list, filters, and level-badge styles. */
 /* ---------- Logs page ---------- */
 
 .runtime-log-list { display: grid; margin-top: 12px; }

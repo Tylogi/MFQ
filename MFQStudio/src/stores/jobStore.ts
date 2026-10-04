@@ -1,5 +1,5 @@
 /**
- * MFQ Studio 后台任务状态管理，隔离高频任务事件与进度更新，避免根级上下文频繁重渲染。
+ * MFQ Studio background job state management, isolating high-frequency job events and progress updates to avoid frequent root-context rerenders.
  */
 
 import { create } from 'zustand';
@@ -19,12 +19,12 @@ const TERMINAL_STATUSES: ReadonlySet<JobResource['status']> = new Set([
   'interrupted',
 ]);
 
-/** 过滤活跃状态的任务标识。 */
+/** Filter IDs for jobs in active states. */
 function extractActiveJobIds(jobs: JobResource[]): string[] {
   return jobs.filter((job) => ACTIVE_STATUSES.has(job.status)).map((job) => job.id);
 }
 
-/** 比较两个字符串数组元素是否完全一致。 */
+/** Check whether two string arrays contain exactly the same elements. */
 function haveSameElements(a: string[], b: string[]): boolean {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) {
@@ -34,84 +34,84 @@ function haveSameElements(a: string[], b: string[]): boolean {
 }
 
 export interface WatchActiveJobsOptions {
-  /** 当任务转入终态时触发，通常用于通知全局运行时刷新模型与实例。 */
+  /** Called when a job reaches a terminal state, typically to refresh global runtime models and instances. */
   onTerminal?: (jobId: string, status: JobResource['status']) => void;
-  /** 当 SSE 事件流发生异常且未主动中断时触发。 */
+  /** Called when an SSE stream fails without being explicitly aborted. */
   onError?: (jobId: string, cause: unknown) => void;
-  /** 某个任务收到事件时触发，用于确认失败的订阅已恢复。 */
+  /** Called when a job receives an event, confirming that a failed subscription has recovered. */
   onEvent?: (jobId: string) => void;
-  /** 外部生命周期取消信号。 */
+  /** External lifecycle cancellation signal. */
   signal?: AbortSignal;
 }
 
 export interface StreamJobEventsOptions {
-  /** 任务进入终态后的回调。 */
+  /** Callback after a job reaches a terminal state. */
   onTerminal?: (job: JobResource) => void;
-  /** 流监听异常回调。 */
+  /** Callback for stream-listening errors. */
   onError?: (cause: unknown) => void;
-  /** 事件到达后的回调。 */
+  /** Callback invoked when an event arrives. */
   onEvent?: () => void;
-  /** 取消信号。 */
+  /** Cancellation signal. */
   signal?: AbortSignal;
 }
 
 export interface JobState {
-  /** 当前所有后台任务记录。 */
+  /** All current background job records. */
   jobs: JobResource[];
-  /** 处于就绪、运行中或取消中的活跃任务标识列表。 */
+  /** IDs of jobs that are queued, running, or cancelling. */
   activeJobIds: string[];
   /**
-   * 批量重置或更新任务列表，并同步刷新活跃任务标识。
+   * Reset or update the job list in bulk and refresh active job IDs.
    *
-   * @param jobs 新的任务列表数据
+   * @param jobs The new job list.
    */
   setJobs: (jobs: JobResource[]) => void;
   /**
-   * 将新建任务合并到任务列表头部，若已存在相同标识则更新，并同步活跃任务标识。
+   * Merge a new job at the start of the list, updating an existing entry with the same ID and synchronizing active job IDs.
    *
-   * @param job 新建或待并入的任务对象
+   * @param job The new job or job to merge.
    */
   addJob: (job: JobResource) => void;
   /**
-   * 局部更新单个任务字段，例如进度或状态变更；若活跃任务列表未变则保留原数组引用。
+   * Partially update one job field, such as progress or status; preserve the active-list array reference if it is unchanged.
    *
-   * @param id 任务唯一标识
-   * @param patch 待合并的任务局部属性
+   * @param id Unique job identifier.
+   * @param patch Partial job properties to merge.
    */
   updateJob: (id: string, patch: Partial<JobResource>) => void;
   /**
-   * 启动单个任务的 SSE 事件流监听，进度和状态直接更新到 store，隔离高频重渲染。
+   * Start an SSE event stream for one job, updating progress and status directly in the store to isolate high-frequency rerenders.
    *
-   * @param id 任务唯一标识
-   * @param options 监听参数，包含终态通知与异常回调
-   * @returns 停止当前任务事件流的清理函数
+   * @param id Unique job identifier.
+   * @param options Listener options, including terminal-state and error callbacks.
+   * @returns A cleanup function that stops this job's event stream.
    */
   streamJobEvents: (id: string, options?: StreamJobEventsOptions) => () => void;
   /**
-   * 监听当前所有活跃状态的任务事件流，已建立连接的任务不重复建立。
+   * Listen to event streams for all currently active jobs without reconnecting jobs that already have a stream.
    *
-   * @param options 监听参数与生命周期信号
-   * @returns 停止本次批量监听的清理函数
+   * @param options Listener options and lifecycle signal.
+   * @returns A cleanup function that stops this batch of listeners.
    */
   watchActiveJobs: (options?: WatchActiveJobsOptions) => () => void;
   /**
-   * 中断并清空所有进行中的任务 SSE 连接。
+   * Abort and clear all ongoing job SSE connections.
    */
   clearJobStreams: () => void;
 }
 
-/** 模块内部持久保存的任务 SSE 控制器映射，按任务 ID 隔离。 */
+/** Persistent module-level map of job SSE controllers, keyed by job ID. */
 const activeStreams = new Map<string, AbortController>();
 const eventSequences = new Map<string, number>();
 
-/** 仅结束仍由当前控制器持有的任务流，避免旧清理函数影响重订阅。 */
+/** End only streams still owned by the current controller so stale cleanup cannot affect resubscriptions. */
 function stopOwnedStream(id: string, controller: AbortController): void {
   if (activeStreams.get(id) !== controller) return;
   activeStreams.delete(id);
   controller.abort();
 }
 
-/** 后台任务全局状态 Store，提供细粒度的任务订阅与事件隔离。 */
+/** Global background-job store providing fine-grained job subscriptions and event isolation. */
 export const useJobStore = create<JobState>()((set, get) => ({
   jobs: [],
   activeJobIds: [],
@@ -218,7 +218,7 @@ export const useJobStore = create<JobState>()((set, get) => ({
     const currentActive = get().activeJobIds;
     for (const id of eventSequences.keys()) if (!currentActive.includes(id)) eventSequences.delete(id);
     const ownedStreams = new Map<string, AbortController>();
-    // 启动新增活跃任务的监听
+    // Start listeners for newly active jobs.
     for (const id of currentActive) {
       if (activeStreams.has(id)) continue;
       get().streamJobEvents(id, {
@@ -231,7 +231,7 @@ export const useJobStore = create<JobState>()((set, get) => ({
       if (controller) ownedStreams.set(id, controller);
     }
 
-    // 停止已不再活跃的任务连接
+    // Stop connections for jobs that are no longer active.
     for (const [id, controller] of activeStreams.entries()) {
       if (!currentActive.includes(id)) {
         stopOwnedStream(id, controller);

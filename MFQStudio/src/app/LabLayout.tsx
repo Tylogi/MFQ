@@ -1,4 +1,4 @@
-/** 模型工具复用页面标题，导航由侧栏统一提供。 */
+/** Share page headers across model tools while centralizing navigation in the sidebar. */
 import { Outlet, useLocation } from 'react-router';
 import { useSettings } from '../features/settings/SettingsProvider';
 import { ScreenHeader } from './display';
@@ -12,7 +12,7 @@ const tools = [
     detail: ['从校准到导出，管理模型量化任务。', 'Manage model quantization, from calibration to export.'] },
 ];
 
-/** 为模型来源、评测和量化页面提供一致的可导航容器。 */
+/** Provide a consistent navigable container for model sources, evaluations, and quantization pages. */
 export function LabLayout() {
   const { tr } = useSettings();
   const { pathname } = useLocation();

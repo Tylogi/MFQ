@@ -1,11 +1,11 @@
-/** 迁移 Studio 纯前端源码与样式契约；全部属于过渡源码检查，不冒充行为验证。旧 Python 测试名逐项保留用于核对映射。 */
+/** Migrate Studio frontend source and style contracts; these are transitional source checks, not behavior tests. Legacy Python test names are retained to verify the mapping. */
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const sourceRoot = resolve(process.cwd(), 'src');
 
-/** 只读取产品实现，排除测试和类型声明，防止测试自身满足契约。 */
+/** Read product implementation only, excluding tests and type declarations so tests cannot satisfy their own contracts. */
 function readSources(...paths: string[]): string {
   function collect(location: string): string[] {
     if (statSync(location).isDirectory()) {
@@ -18,7 +18,7 @@ function readSources(...paths: string[]): string {
   return paths.flatMap((path) => collect(join(sourceRoot, path))).join('\n');
 }
 
-/** 按真实导入顺序展开 CSS，供静态样式契约使用。 */
+/** Expand CSS in actual import order for static style contracts. */
 function readStyles(path = join(sourceRoot, 'styles.css')): string {
   return readFileSync(path, 'utf8').replace(/@import\s+['"]([^'"]+)['"];/g, (_match, target: string) =>
     readStyles(resolve(dirname(path), target)),
@@ -31,7 +31,7 @@ const API = readSources('shared/api');
 const MAIN = readSources('main.tsx');
 const STYLES = readStyles();
 
-describe('Studio 过渡源码与静态样式契约（非行为测试）', () => {
+describe('describes studioContracts test behavior 1', () => {
   it('test_studio_supports_local_and_remote_server_connections_with_voice_controls', () => {
     const models = readSources('features/models');
     const chat = readSources('features/chat', 'features/voice');
@@ -73,8 +73,7 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
     expect(API).toContain('model?: string');
   });
 
-  // test_studio_uses_selected_runtime_mtp_availability 已由 runtimeContracts.test.tsx
-  // 的实例优先级、模型匹配、请求参数及 UI 禁用行为覆盖；字段类型见 shared/api/contracts/runtime.ts。
+  // test_studio_uses_selected_runtime_mtp_availability is covered by instance priority, model matching, request parameters, and UI disabled behavior in runtimeContracts.test.tsx; field types are in shared/api/contracts/runtime.ts.
 
   it('test_model_lifecycle_actions_stay_on_the_models_page', () => {
     const load_body = APP.slice(APP.indexOf('async function loadArtifact('), APP.indexOf('async function finishModelRegistration('));

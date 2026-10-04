@@ -1,4 +1,4 @@
-# 分别验证 Studio 行为、生产产物浏览器交互及原生跨语言契约。
+# Validate Studio behavior, browser interactions with production builds, and native cross-language contracts separately.
 name: Studio frontend
 
 on:

@@ -1,4 +1,4 @@
-/** 定义 media 领域的服务契约，仅包含类型，不依赖运行时代码。 */
+/** Define service contracts for the media domain using types only, with no runtime dependencies. */
 
 export interface MediaRef {
   id: string;

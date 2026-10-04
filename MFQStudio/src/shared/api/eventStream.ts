@@ -1,6 +1,6 @@
-/** 解析分块 SSE 字节流，统一处理换行、取消和读取器资源释放。 */
+/** Parse chunked SSE byte streams, handling line endings, cancellation, and reader cleanup consistently. */
 
-/** 消费 JSON SSE 事件；缺失结束符、非法 JSON 或读取取消时向调用方抛错。 */
+/** Consume JSON SSE events and throw to the caller for missing terminators, invalid JSON, or cancelled reads. */
 export async function readEventStream<T>(
   response: Response,
   onEvent: (event: T) => void,

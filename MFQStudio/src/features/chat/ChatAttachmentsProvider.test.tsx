@@ -1,4 +1,4 @@
-/** 验证附件仅通知输入区，并在切换会话或服务时释放预览资源。 */
+/** Verify that attachment updates notify only the input area and previews are released on session or service changes. */
 import { act, render, screen } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { mediaApi } from '../../shared/api/resources/media';
@@ -21,7 +21,7 @@ beforeEach(() => {
   URL.revokeObjectURL = vi.fn();
 });
 
-it('上传失败时保留原附件，供下一次发送重试', async () => {
+it('verifies ChatAttachmentsProvider test behavior 1', async () => {
   vi.spyOn(mediaApi, 'uploadMedia').mockRejectedValueOnce(new Error('upload failed'));
   let actions!: ReturnType<typeof useChatAttachmentActions>;
   function Consumer() {
@@ -43,7 +43,7 @@ it('上传失败时保留原附件，供下一次发送重试', async () => {
   expect(screen.getByText('1')).toBeInTheDocument();
 });
 
-it('选择附件时只更新附件订阅者，切会话和切服务释放预览 URL', () => {
+it('verifies ChatAttachmentsProvider test behavior 2', () => {
   let actionRenders = 0;
   let actions!: ReturnType<typeof useChatAttachmentActions>;
   function Actions() {

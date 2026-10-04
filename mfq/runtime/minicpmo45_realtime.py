@@ -1,4 +1,4 @@
-"""提供 MiniCPM-o 实时音频网关、后端代理与前端页面服务。"""
+"""Provide the MiniCPM-o real-time audio gateway, backend proxy, and frontend page service."""
 
 from __future__ import annotations
 

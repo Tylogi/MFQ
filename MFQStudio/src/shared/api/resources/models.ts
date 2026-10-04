@@ -1,4 +1,4 @@
-/** 封装 models 领域资源请求，不保存组件状态。 */
+/** Wrap resource requests for the models domain without storing component state. */
 import type {
   ModelArtifact,
   ModelDirectoryList,
@@ -10,14 +10,14 @@ import type {
 import { request } from '../client';
 
 export const modelsApi = {
-  /** 列出模型资产；refresh 为真时要求服务重新扫描。 */
+  /** List model artifacts; when refresh is true, request a fresh server scan. */
   async modelArtifacts(refresh = false): Promise<ModelArtifact[]> {
     return (
       await request<{ data: ModelArtifact[] }>(`/api/v1/models${refresh ? '?refresh=true' : ''}`)
     ).data;
   },
 
-  /** 浏览服务端模型目录，优先使用目录标识，其次使用完整路径。 */
+  /** Browse server-side model directories, preferring a directory ID over a full path. */
   modelDirectories(directoryId?: string | null, path?: string | null): Promise<ModelDirectoryList> {
     const query = new URLSearchParams();
     if (directoryId) query.set('directory_id', directoryId);
@@ -26,7 +26,7 @@ export const modelsApi = {
     return request(`/api/v1/models/directories${suffix}`);
   },
 
-  /** 注册目录内的模型资产，返回新增或更新的模型记录。 */
+  /** Register model artifacts in a directory and return newly created or updated records. */
   async registerModelDirectory(directoryId: string): Promise<ModelArtifact[]> {
     return (
       await request<{ data: ModelArtifact[] }>('/api/v1/models/directories/register', {
@@ -36,7 +36,7 @@ export const modelsApi = {
     ).data;
   },
 
-  /** 提交模型加载任务，配置上下文和空闲卸载策略。 */
+  /** Submit a model-loading job with context and idle-unload settings. */
   loadModel(
     model: string,
     contextSize: number,
@@ -55,7 +55,7 @@ export const modelsApi = {
     });
   },
 
-  /** 提交实例卸载任务；强制卸载需调用方先确认用户意图。 */
+  /** Submit an instance-unload job; the caller must confirm user intent before forcing unload. */
   unloadModel(
     instanceId: string,
     force = false,
@@ -66,7 +66,7 @@ export const modelsApi = {
     });
   },
 
-  /** 在指定模型仓库搜索远程模型条目。 */
+  /** Search for remote model entries in the specified model repository. */
   async searchHubModels(
     provider: HubModelSummary['provider'],
     query: string,
@@ -75,12 +75,12 @@ export const modelsApi = {
     return (await request<{ data: HubModelSummary[] }>(`/api/v1/hub/models?${params}`)).data;
   },
 
-  /** 读取内置官方目录以及服务端评估的设备适配建议。 */
+  /** Fetch the built-in official catalog and server-evaluated device compatibility recommendations. */
   officialHubModels(refresh = false, signal?: AbortSignal): Promise<OfficialModelList> {
     return request(`/api/v1/hub/official${refresh ? '?refresh=true' : ''}`, { signal });
   },
 
-  /** 解析 owner/repo 或受信任的 Hugging Face、ModelScope 仓库链接。 */
+  /** Resolve an owner/repo reference or a trusted Hugging Face or ModelScope repository URL. */
   resolveHubModel(
     reference: string,
     fallbackProvider: HubModelSummary['provider'],
@@ -94,7 +94,7 @@ export const modelsApi = {
     });
   },
 
-  /** 读取远程模型的版本、文件列表与容量信息。 */
+  /** Read version, file list, and size information for a remote model. */
   hubModelInfo(
     provider: HubModelSummary['provider'],
     repoId: string,
@@ -107,7 +107,7 @@ export const modelsApi = {
     );
   },
 
-  /** 删除服务工作区内的指定产物，调用方应先确认。 */
+  /** Delete the specified artifact from the server workspace; the caller should confirm first. */
   removeWorkspaceArtifact(uri: string): Promise<Record<string, unknown>> {
     return request('/api/v1/artifacts/remove', {
       method: 'POST',
@@ -115,7 +115,7 @@ export const modelsApi = {
     });
   },
 
-  /** 获取任务产物及其来源关系，供量化和数据集选择使用。 */
+  /** Get job artifacts and their lineage for quantization and dataset selection. */
   async artifactLineage(limit = 200): Promise<ArtifactLineage[]> {
     return (await request<{ data: ArtifactLineage[] }>(`/api/v1/artifacts/lineage?limit=${limit}`))
       .data;

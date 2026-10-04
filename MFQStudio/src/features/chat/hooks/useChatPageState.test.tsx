@@ -1,4 +1,4 @@
-/** 验证聊天页局部状态不影响共享会话及生成控制器。 */
+/** Verify that chat-page-local state does not affect shared sessions or the generation controller. */
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router';
@@ -36,7 +36,7 @@ beforeEach(() => {
   } as unknown as ReturnType<typeof useChat>);
 });
 
-it('移动端切换会话收起侧栏并清空旧编辑草稿', async () => {
+it('verifies useChatPageState test behavior 1', async () => {
   const { result, rerender } = renderHook(useChatPageState, {
     wrapper: ({ children }) => <MemoryRouter>{children}</MemoryRouter>,
   });
@@ -52,7 +52,7 @@ it('移动端切换会话收起侧栏并清空旧编辑草稿', async () => {
   await waitFor(() => expect(result.current.editDraft).toBeNull());
 });
 
-it('生成期间允许选择另一个已载入模型，不选择未载入的资产', () => {
+it('verifies useChatPageState test behavior 2', () => {
   const chat = vi.mocked(useChat)();
   vi.mocked(useChat).mockReturnValue({ ...chat, busy: true });
   const { result } = renderHook(useChatPageState, {

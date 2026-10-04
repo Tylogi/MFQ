@@ -1,4 +1,4 @@
-/** 验证真实浏览器中的发送、恢复、取消、输入法与弹窗交互，并检查响应式布局。 */
+/** Verify sending, recovery, cancellation, IME input, dialogs, and responsive layouts in a real browser. */
 import { expect, test, type Page } from '@playwright/test';
 import { mockStudioServer, officialCatalog } from './mockServer';
 
@@ -38,7 +38,7 @@ declare global {
   }
 }
 
-/** 在浏览器路由内切页，保持根 Provider 与进行中的请求不被整页刷新卸载。 */
+/** Navigate client-side without a full page reload to preserve root providers and in-flight requests. */
 async function navigateClient(page: Page, path: string) {
   await page.evaluate((next) => {
     window.history.pushState(null, '', next);
@@ -46,7 +46,7 @@ async function navigateClient(page: Page, path: string) {
   }, path);
 }
 
-test('服务器移除对话和可执行文件，设置迁入对话页，模型宽框包含生成参数', async ({ page }, testInfo) => {
+test('verifies studio spec behavior 1', async ({ page }, testInfo) => {
   await mockStudioServer(page);
   await page.route('**/api/v1/runtime/models', (route) => route.fulfill({ json: { data: [{ id: 'Test Model' }, { id: 'Another Model' }] } }));
   await page.goto('/runtime');
@@ -69,7 +69,7 @@ test('服务器移除对话和可执行文件，设置迁入对话页，模型�
   await page.screenshot({ path: testInfo.outputPath('chat-settings-and-selector.png'), animations: 'disabled' });
 });
 
-test('每个模型独立修改 ctx，点击立即发送重载且不丢失另一个模型', async ({ page }, testInfo) => {
+test('verifies studio spec behavior 2', async ({ page }, testInfo) => {
   await mockStudioServer(page);
   const instances = [
     { id: 'flash', model: 'Qwen3.8-Flash-S4-L', state: 'ready', devices: ['metal'], active_sessions: 0,
@@ -129,7 +129,7 @@ test('每个模型独立修改 ctx，点击立即发送重载且不丢失另一�
   expect(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth)).toBe(false);
 });
 
-test('网页运行服务允许编辑端口，无效端口不发送更改', async ({ page }) => {
+test('verifies studio spec behavior 3', async ({ page }) => {
   await mockStudioServer(page);
   const updates: number[] = [];
   await page.route('**/api/v1/runtime/listener', (route) => {
@@ -146,7 +146,7 @@ test('网页运行服务允许编辑端口，无效端口不发送更改', async
   expect(updates).toEqual([]);
 });
 
-test('三家架构标识贯穿模型页面，保持描线、无边框和靠右布局', async ({ page }, testInfo) => {
+test('verifies studio spec behavior 4', async ({ page }, testInfo) => {
   const state = await mockStudioServer(page);
   const models = [
     { name: 'Qwen3.8-Flash-Next-S4-L', architecture: 'qwen4_exp', vendor: 'qwen' },
@@ -220,7 +220,7 @@ test('三家架构标识贯穿模型页面，保持描线、无边框和靠右�
   expect(state.unexpected).toEqual([]);
 });
 
-test('推理预算按内存架构分列容量，带宽用小号灰字放在下方', async ({ page }, testInfo) => {
+test('verifies studio spec behavior 5', async ({ page }, testInfo) => {
   await mockStudioServer(page);
   await page.goto('/model-hub');
   await expect(page.locator('.detected-hardware-summary strong')).toContainText('128 GiB URAM');
@@ -262,7 +262,7 @@ test('推理预算按内存架构分列容量，带宽用小号灰字放在下�
   expect(errors).toEqual([]);
 });
 
-test('注册资产显示文件总大小，已载入模型可在生成期间切换且无需登记资产', async ({ page }) => {
+test('verifies studio spec behavior 6', async ({ page }) => {
   const state = await mockStudioServer(page, { holdResponse: true });
   const nextModel = 'Loaded without registration';
   const assets = [32, 8].map((size, index) => ({ id: `asset-${index}`, name: `Registered checkpoint ${index}`,
@@ -308,7 +308,7 @@ test('注册资产显示文件总大小，已载入模型可在生成期间切�
   expect(state.unexpected).toEqual([]);
 });
 
-test('下载来源与九宫格保留统一字体，仅降低文字对比度', async ({ page }) => {
+test('verifies studio spec behavior 7', async ({ page }) => {
   await mockStudioServer(page);
   await page.goto('/model-hub');
   await expect(page.locator('.model-source-picker select')).toBeVisible();
@@ -339,7 +339,7 @@ test('下载来源与九宫格保留统一字体，仅降低文字对比度', as
   }
 });
 
-test('运行资源按模型分段，四个槽共享颜色，端点包含 v1', async ({ page }, testInfo) => {
+test('verifies studio spec behavior 8', async ({ page }, testInfo) => {
   await mockStudioServer(page);
   const instances = [1, 2, 3, 4].map((index) => ({
     id: `resource-${index}`, model: `Resource Model ${index}`, state: 'ready', devices: ['metal'],
@@ -377,7 +377,7 @@ test('运行资源按模型分段，四个槽共享颜色，端点包含 v1', as
   await page.locator('.overview-memory-panel').screenshot({ path: testInfo.outputPath('resource-hierarchy.png') });
 });
 
-test('加载条显示实际任务进度，部分缺失的资源明细保留已知数值', async ({ page }, testInfo) => {
+test('verifies studio spec behavior 9', async ({ page }, testInfo) => {
   await mockStudioServer(page);
   const job = { id: 'loading-job', kind: 'model.load', payload: { model: 'Loading Model' },
     progress: 0.25, status: 'running', cancel_requested: false,
@@ -431,7 +431,7 @@ test('加载条显示实际任务进度，部分缺失的资源明细保留已�
 });
 
 for (const kind of ['model.load', 'download.modelscope']) {
-  test(`${kind} 事件流中断后切页返回仍同步进度`, async ({ page }) => {
+  test(`resynchronizes ${kind} progress after an interrupted event stream and navigation`, async ({ page }) => {
     await mockStudioServer(page);
     const loading = kind === 'model.load';
     const job = { id: 'resume-job', kind, payload: loading ? { model: 'Loading Model' } : { repo_id: 'Tylogi/test-MFQ' },
@@ -464,7 +464,7 @@ for (const kind of ['model.load', 'download.modelscope']) {
   });
 }
 
-test('页面按需请求自己的资源，概览不预载其他业务列表', async ({ page }) => {
+test('verifies studio spec behavior 10', async ({ page }) => {
   const state = await mockStudioServer(page);
   const errors: string[] = [];
   page.on('pageerror', (error) => errors.push(error.message));
@@ -491,7 +491,7 @@ test('页面按需请求自己的资源，概览不预载其他业务列表', as
   expect(state.unexpected).toEqual([]);
 });
 
-test('模型下载留在本页，飞入圆圈后打开第三个队列标签，量化工作台为空', async ({ page }, testInfo) => {
+test('verifies studio spec behavior 11', async ({ page }, testInfo) => {
   const state = await mockStudioServer(page);
   const jobs: unknown[] = [{ id: 'load', kind: 'model.load', status: 'succeeded', progress: 1,
     payload: { repo_id: 'Not a download' }, cancel_requested: false, created_at: '2026-01-01', updated_at: '2026-01-01' }];
@@ -535,7 +535,7 @@ test('模型下载留在本页，飞入圆圈后打开第三个队列标签，�
   await page.screenshot({ path: testInfo.outputPath('empty-quantization.png'), animations: 'disabled' });
 });
 
-test('生成期间离开聊天页后返回仍完成同一次请求，草稿按会话保留', async ({ page }) => {
+test('verifies studio spec behavior 12', async ({ page }) => {
   const state = await mockStudioServer(page, { holdResponse: true });
   await page.goto('/chat');
   const input = page.getByRole('textbox', { name: 'Message', exact: true });
@@ -558,7 +558,7 @@ test('生成期间离开聊天页后返回仍完成同一次请求，草稿按�
   await expect(input).toHaveValue('Draft survives navigation');
 });
 
-test('待发送附件切页保留，移除时释放预览 URL', async ({ page }) => {
+test('verifies studio spec behavior 13', async ({ page }) => {
   await mockStudioServer(page);
   await page.goto('/chat');
   await expect(page.getByRole('textbox', { name: 'Message', exact: true })).toBeEnabled();
@@ -590,7 +590,7 @@ test('待发送附件切页保留，移除时释放预览 URL', async ({ page })
   expect(await page.evaluate(() => window.revokedPreviews)).toContain(preview);
 });
 
-test('生成 POST 被拒绝时保留草稿与附件，重试成功后清空输入', async ({ page }) => {
+test('verifies studio spec behavior 14', async ({ page }) => {
   const state = await mockStudioServer(page, { rejectFirstSubmission: true });
   await page.goto('/chat');
   const input = page.getByRole('textbox', { name: 'Message', exact: true });
@@ -612,7 +612,7 @@ test('生成 POST 被拒绝时保留草稿与附件，重试成功后清空输�
   expect(state.unexpected).toEqual([]);
 });
 
-test('发送流式回答并完成历史同步', async ({ page }, testInfo) => {
+test('verifies studio spec behavior 15', async ({ page }, testInfo) => {
   const state = await mockStudioServer(page);
   const errors: string[] = [];
   page.on('pageerror', (error) => errors.push(error.message));
@@ -633,12 +633,12 @@ test('发送流式回答并完成历史同步', async ({ page }, testInfo) => {
   await page.screenshot({ path: testInfo.outputPath('chat.png'), fullPage: true });
 });
 
-test('输入法确认不会误发，Shift Enter 保留换行', async ({ page }) => {
+test('verifies studio spec behavior 16', async ({ page }) => {
   const state = await mockStudioServer(page);
   await page.goto('/chat');
   const input = page.getByRole('textbox', { name: 'Message', exact: true });
   await expect(input).toBeEnabled();
-  await input.fill('中文候选');
+  await input.fill('IME candidate');
   await input.dispatchEvent('compositionstart');
   await input.dispatchEvent('keydown', {
     key: 'Enter',
@@ -647,14 +647,14 @@ test('输入法确认不会误发，Shift Enter 保留换行', async ({ page }) 
     keyCode: 229,
   });
   await input.dispatchEvent('compositionend');
-  await expect(input).toHaveValue('中文候选');
+  await expect(input).toHaveValue('IME candidate');
   expect(state.submissions).toBe(0);
   await input.press('Shift+Enter');
-  await expect(input).toHaveValue('中文候选\n');
+  await expect(input).toHaveValue('IME candidate\n');
   expect(state.submissions).toBe(0);
 });
 
-test('历史同步失败保留回答且恢复时不重复生成', async ({ page }) => {
+test('verifies studio spec behavior 17', async ({ page }) => {
   const state = await mockStudioServer(page, { failFirstSync: true });
   await page.goto('/chat');
   await page.getByRole('textbox', { name: 'Message', exact: true }).fill('Keep this response');
@@ -668,7 +668,7 @@ test('历史同步失败保留回答且恢复时不重复生成', async ({ page 
   expect(state.submissions).toBe(1);
 });
 
-test('停止挂起生成后恢复输入', async ({ page }) => {
+test('verifies studio spec behavior 18', async ({ page }) => {
   const state = await mockStudioServer(page, { waitForCancel: true });
   await page.goto('/chat');
   const input = page.getByRole('textbox', { name: 'Message', exact: true });
@@ -681,7 +681,7 @@ test('停止挂起生成后恢复输入', async ({ page }) => {
   expect(state.submissions).toBe(1);
 });
 
-test('路由导航及模型目录弹窗键盘焦点', async ({ page }, testInfo) => {
+test('verifies studio spec behavior 19', async ({ page }, testInfo) => {
   const state = await mockStudioServer(page);
   await page.goto('/models');
   const addModel = page.getByRole('button', { name: 'Add model', exact: true }).first();
@@ -709,7 +709,7 @@ test('路由导航及模型目录弹窗键盘焦点', async ({ page }, testInfo)
   await page.screenshot({ path: testInfo.outputPath('overview.png'), fullPage: true, animations: 'disabled' });
 });
 
-test('明暗主题的页面内容保持在工作区内且可滚动访问', async ({ page }, testInfo) => {
+test('verifies studio spec behavior 20', async ({ page }, testInfo) => {
   const state = await mockStudioServer(page);
   const routes = [['/', 'Overview'], ['/models', 'Models'], ['/settings', 'Settings'],
     ['/model-hub', 'Model downloads']] as const;

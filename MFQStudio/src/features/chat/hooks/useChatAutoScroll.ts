@@ -1,13 +1,11 @@
-/** 跟随聊天内容高度变化，用户向上阅读时暂停跟随，避免抢夺滚动位置。 */
+/** Follow chat content height changes, pausing when the user scrolls up to read so their position is not overridden. */
 import { useCallback, useEffect, useRef, useState } from 'react';
-
-/** 管理聊天滚动容器；ResizeObserver 同时覆盖流式渲染、公式和媒体加载。 */
+/** Manage the chat scroll container; ResizeObserver covers streaming renders, formulas, and media loading. */
 export function useChatAutoScroll(sessionId: string | null, enabled: boolean) {
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const followingRef = useRef(true);
   const [following, setFollowing] = useState(true);
-
-  /** 用户滚动后根据与底部的距离切换跟随状态，保留历史阅读位置。 */
+/** Update follow state based on distance from the bottom after user scrolling, preserving history reading position. */
   const handleScroll = useCallback(() => {
     const scroller = scrollerRef.current;
     if (!scroller) return;
@@ -15,8 +13,7 @@ export function useChatAutoScroll(sessionId: string | null, enabled: boolean) {
     followingRef.current = next;
     setFollowing(next);
   }, []);
-
-  /** 响应回到底部操作并重新开启后续输出跟随。 */
+/** Handle the return-to-bottom action and re-enable following for subsequent output. */
   const scrollToBottom = useCallback(() => {
     followingRef.current = true;
     setFollowing(true);

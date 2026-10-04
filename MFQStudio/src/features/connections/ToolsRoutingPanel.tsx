@@ -1,4 +1,4 @@
-/** 独立加载和维护 MCP 工具服务器及远程节点，供资源和连接页面复用。 */
+/** Independently load and manage MCP tool servers and remote nodes for reuse by resources and connections pages. */
 import { useEffect, useState, type FormEvent } from 'react';
 import { connectionsApi } from '../../shared/api/resources/connections';
 import type { McpServerResource, McpToolResource, RemoteNode } from '../../shared/api/types';
@@ -7,8 +7,7 @@ import { errorMessage, formatNumber } from '../../app/formatters';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useSettings } from '../settings/SettingsProvider';
 import { toast } from '../../stores/toastStore';
-
-/** 页面挂载后读取连接资源，所有写入错误仅影响当前连接面板。 */
+/** Load connection resources on mount; write errors affect only the current connections panel. */
 export function ToolsRoutingPanel() {
   const { tr } = useSettings();
   const { ready, connectionRevision } = useRuntime();
@@ -42,8 +41,7 @@ export function ToolsRoutingPanel() {
       disposed = true;
     };
   }, [ready, connectionRevision]);
-
-  /** 执行连接写操作并重新获取工具清单，供聊天页下次进入时读取。 */
+/** Perform a connection write and reload the tool catalog for the next chat-page visit. */
   async function mutate(operation: () => Promise<unknown>) {
     if (busy) return;
     setBusy(true);
@@ -64,7 +62,7 @@ export function ToolsRoutingPanel() {
       setBusy(false);
     }
   }
-  /** 校验并注册用户填写的 MCP 服务。 */
+/** Validate and register the MCP service entered by the user. */
   function createMcpServer(event: FormEvent) {
     event.preventDefault();
     if (!mcpDraft.name.trim() || !mcpDraft.endpoint.trim()) return;
@@ -79,7 +77,7 @@ export function ToolsRoutingPanel() {
       setMcpDraft({ name: '', transport: 'streamable_http', endpoint: '' });
     });
   }
-  /** 校验远程服务地址并注册节点。 */
+/** Validate the remote service URL and register the node. */
   function registerRemoteNode(event: FormEvent) {
     event.preventDefault();
     if (!nodeDraft.name.trim() || !nodeDraft.url.trim()) return;

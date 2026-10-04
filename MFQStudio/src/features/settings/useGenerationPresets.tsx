@@ -1,4 +1,4 @@
-/** 管理设置页的服务端生成预设、本地缓存和预设编辑状态。 */
+/** Manage server generation presets, local cache, and preset editing state for the settings page. */
 import { useEffect, useState, type Dispatch, type SetStateAction } from 'react';
 import { presetsApi } from '../../shared/api/resources/presets';
 import type { SessionMode } from '../../shared/api/types';
@@ -16,7 +16,7 @@ import {
 } from './presets';
 import { useSettings } from './SettingsProvider';
 
-/** 在设置页加载预设，并将选择、保存和删除操作限定在该页面生命周期内。 */
+/** Load presets on the settings page and scope selection, save, and delete operations to its lifecycle. */
 export function useGenerationPresets(
   draft: GenerationSettings,
   setDraft: Dispatch<SetStateAction<GenerationSettings>>,
@@ -49,13 +49,13 @@ export function useGenerationPresets(
     };
   }, [ready]);
 
-  /** 清除预设选择，供内置预设和模型默认值切换使用。 */
+  /** Clear the selected preset for built-in preset and model-default changes. */
   function clearSelection() {
     setSelected('');
     setName('');
     setStatus(null);
   }
-  /** 将保存的推理快照和上下文容量载入待应用草稿。 */
+  /** Load a saved inference snapshot and context capacity into the unapplied draft. */
   function load(name: string) {
     setSelected(name);
     setName(name);
@@ -71,7 +71,7 @@ export function useGenerationPresets(
     setContextSize(preset.contextSize);
     setStatus({ error: false, text: tr('预设已载入。', 'Preset loaded.') });
   }
-  /** 创建或覆盖当前预设，成功后更新本地缓存。 */
+  /** Create or overwrite the current preset and update the local cache on success. */
   async function save() {
     const normalized = name.replace(/\s+/g, ' ').trim().slice(0, 64);
     if (!normalized) {
@@ -111,7 +111,7 @@ export function useGenerationPresets(
       setBusy(false);
     }
   }
-  /** 经确认删除选中的服务端预设及本地副本。 */
+  /** Delete the selected server preset and local copy after confirmation. */
   async function remove() {
     if (
       busy ||

@@ -1,31 +1,31 @@
-/** 验证顶层故障视图可脱离路由和设置上下文独立渲染。 */
+/** Verify that the top-level failure view renders independently of router and settings context. */
 import { fireEvent, render, screen } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
 import { FailureView } from './FailurePage';
 
-it('显示完整故障信息并执行恢复操作', () => {
+it('verifies FailurePage test behavior 1', () => {
   const onRetry = vi.fn();
   const onLeave = vi.fn();
   render(
     <FailureView
       code="APP / 03"
-      description="应用暂时无法显示"
+      description="The application is temporarily unavailable"
       detail="render failed"
-      detailLabel="查看错误详情"
+      detailLabel="View error details"
       kind="render"
-      leaveLabel="返回概览"
+      leaveLabel="Back to overview"
       onLeave={onLeave}
       onRetry={onRetry}
-      retryLabel="重新载入"
-      title="界面遇到错误"
+      retryLabel="Reload"
+      title="The interface encountered an error"
     />,
   );
 
-  expect(screen.getByRole('heading', { name: '界面遇到错误' })).toBeTruthy();
-  fireEvent.click(screen.getByText('查看错误详情'));
+  expect(screen.getByRole('heading', { name: 'The interface encountered an error' })).toBeTruthy();
+  fireEvent.click(screen.getByText('View error details'));
   expect(screen.getByText('render failed')).toBeTruthy();
-  fireEvent.click(screen.getByRole('button', { name: '重新载入' }));
-  fireEvent.click(screen.getByRole('button', { name: '返回概览' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Reload' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Back to overview' }));
   expect(onRetry).toHaveBeenCalledOnce();
   expect(onLeave).toHaveBeenCalledOnce();
 });

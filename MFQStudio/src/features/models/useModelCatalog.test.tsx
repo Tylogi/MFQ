@@ -1,4 +1,4 @@
-/** 验证模型目录的按需加载、策略传递及注册失败恢复。 */
+/** Verify on-demand catalog loading, policy propagation, and recovery from registration failures. */
 import { act, renderHook, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import type { ReactNode } from 'react';
@@ -46,7 +46,7 @@ const artifact: ModelArtifact = {
   modified_at: '2026-09-23T00:00:00Z',
 };
 
-/** 提供真实路由上下文，避免把页面导航行为替换成无条件成功的桩。 */
+/** Provide real router context rather than replacing page navigation with an unconditional-success stub. */
 function Wrapper({ children }: { children: ReactNode }) {
   return (
     <MemoryRouter>
@@ -122,7 +122,7 @@ describe('useModelCatalog', () => {
     expect(state.setSelectedModel).not.toHaveBeenCalled();
   });
 
-  it('进入模型页时不重播历史失败任务，包括稍后载入的任务记录', () => {
+  it('verifies useModelCatalog test behavior 1', () => {
     const failedJob: JobResource = {
       id: 'old-load',
       kind: 'model.load',
@@ -146,7 +146,7 @@ describe('useModelCatalog', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
-  it('只提示本页观察到的加载任务失败，重新进入也不重播', () => {
+  it('verifies useModelCatalog test behavior 2', () => {
     const runningJob: JobResource = {
       id: 'new-load',
       kind: 'model.load',

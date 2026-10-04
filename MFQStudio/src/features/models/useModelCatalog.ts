@@ -1,4 +1,4 @@
-/** 模型目录控制器负责资产刷新、加载策略和目录注册生命周期。 */
+/** Manage artifact refresh, load policies, and directory registration lifecycle for the model catalog. */
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { modelsApi } from '../../shared/api/resources/models';
@@ -12,7 +12,7 @@ import { STUDIO_PATHS, labPath } from '../../navigation';
 import { toast } from '../../stores/toastStore';
 import { useJobStore } from '../../stores/jobStore';
 
-/** 为模型页封装模型目录工作流；状态随页面卸载释放。 */
+/** Encapsulate model-catalog workflows for the models page; state is released when the page unmounts. */
 export function useModelCatalog() {
   const {
     runtime,
@@ -88,7 +88,7 @@ export function useModelCatalog() {
       ),
     [artifacts, modelFilter],
   );
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
+  /** Run a model catalog operation and display any error on the current page. */
   async function loadArtifact(name: string) {
     if (busy) return;
     setBusy(true);
@@ -108,7 +108,7 @@ export function useModelCatalog() {
     }
   }
 
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
+  /** Run a model catalog operation and display any error on the current page. */
   async function finishModelRegistration(names: string[]) {
     const nextArtifacts = await modelsApi.modelArtifacts(true);
     setArtifacts(nextArtifacts);
@@ -148,7 +148,7 @@ export function useModelCatalog() {
     if (registered.length === 1) setSelectedModel(registered[0].name);
   }
 
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
+  /** Run a model catalog operation and display any error on the current page. */
   async function openModelDirectory(directoryId?: string | null, path?: string | null) {
     if (busy) return;
     setBusy(true);
@@ -164,7 +164,7 @@ export function useModelCatalog() {
     }
   }
 
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
+  /** Run a model catalog operation and display any error on the current page. */
   async function jumpToModelDirectory(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const path = modelDirectoryPath.trim();
@@ -172,7 +172,7 @@ export function useModelCatalog() {
     await openModelDirectory(null, path);
   }
 
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
+  /** Run a model catalog operation and display any error on the current page. */
   async function chooseModelDirectory() {
     if (busy) return;
     modelBrowserTriggerRef.current =
@@ -192,7 +192,7 @@ export function useModelCatalog() {
     }
   }
 
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
+  /** Run a model catalog operation and display any error on the current page. */
   async function registerCurrentModelDirectory() {
     if (busy || !modelBrowser?.current_id) return;
     setBusy(true);
@@ -206,7 +206,7 @@ export function useModelCatalog() {
     }
   }
 
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
+  /** Run a model catalog operation and display any error on the current page. */
   async function unloadInstance(id: string) {
     if (busy) return;
     setBusy(true);

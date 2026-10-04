@@ -1,4 +1,4 @@
-/** 封装 runtime 领域资源请求，不保存组件状态。 */
+/** Wrap resource requests for the runtime domain without storing component state. */
 import type {
   RuntimeCapabilities,
   RuntimeStatus,
@@ -46,34 +46,34 @@ export const runtimeApi = {
       method: 'PUT', body: JSON.stringify({ port }),
     });
   },
-  /** 读取指定实例或默认实例支持的推理能力。 */
+  /** Read inference capabilities supported by the specified or default instance. */
   runtimeCapabilities(instanceId?: string | null): Promise<RuntimeCapabilities> {
     const suffix = instanceId ? `?instance_id=${encodeURIComponent(instanceId)}` : '';
     return request(`/api/v1/runtime/capabilities${suffix}`);
   },
 
-  /** 读取运行状态、缓存和性能指标。 */
+  /** Read runtime status, cache state, and performance metrics. */
   runtimeStatus(instanceId?: string | null): Promise<RuntimeStatus> {
     const suffix = instanceId ? `?instance_id=${encodeURIComponent(instanceId)}` : '';
     return request(`/api/v1/runtime/status${suffix}`);
   },
 
-  /** 列出当前服务提供的模型名称。 */
+  /** List model names provided by the current server. */
   async runtimeModels(): Promise<RuntimeModel[]> {
     return (await request<{ data: RuntimeModel[] }>('/api/v1/runtime/models')).data;
   },
 
-  /** 获取所有加载中或已加载的运行实例。 */
+  /** Get all loading or loaded runtime instances. */
   async runtimeInstances(): Promise<RuntimeInstance[]> {
     return (await request<{ data: RuntimeInstance[] }>('/api/v1/runtime/instances')).data;
   },
 
-  /** 获取模型加载配置档案列表。 */
+  /** Get the list of model-loading profiles. */
   async runtimeProfiles(): Promise<RuntimeProfile[]> {
     return (await request<{ data: RuntimeProfile[] }>('/api/v1/runtime/profiles')).data;
   },
 
-  /** 保存模型加载参数为可复用配置档案。 */
+  /** Save model-loading parameters as a reusable profile. */
   createRuntimeProfile(body: {
     name: string;
     load: RuntimeProfile['load'];
@@ -84,7 +84,7 @@ export const runtimeApi = {
     });
   },
 
-  /** 删除加载配置档案，不卸载现有实例。 */
+  /** Delete a loading profile without unloading existing instances. */
   async deleteRuntimeProfile(id: string): Promise<void> {
     const response = await fetch(apiUrl(`/api/v1/runtime/profiles/${id}`), {
       method: 'DELETE',
@@ -93,7 +93,7 @@ export const runtimeApi = {
     if (!response.ok) throw await errorFromResponse(response);
   },
 
-  /** 按配置档案提交加载任务，可显式接受资产版本漂移。 */
+  /** Submit a loading job from a profile, optionally accepting artifact version drift. */
   loadRuntimeProfile(
     id: string,
     allowDrift = false,
@@ -104,39 +104,39 @@ export const runtimeApi = {
     });
   },
 
-  /** 获取运行指标快照历史，供概览趋势展示。 */
+  /** Get runtime metric snapshot history for overview trends. */
   async runtimeMetrics(limit = 200): Promise<RuntimeMetricSnapshot[]> {
     return (
       await request<{ data: RuntimeMetricSnapshot[] }>(`/api/v1/runtime/metrics?limit=${limit}`)
     ).data;
   },
 
-  /** 获取最近的服务日志。 */
+  /** Get recent server logs. */
   async runtimeLogs(limit = 100): Promise<RuntimeLogEntry[]> {
     return (await request<{ data: RuntimeLogEntry[] }>(`/api/v1/runtime/logs?limit=${limit}`)).data;
   },
 
-  /** 读取语音通道可用性与默认音频参数。 */
+  /** Read voice channel availability and default audio parameters. */
   realtimeCapabilities(): Promise<RealtimeCapabilities> {
     return request('/api/v1/runtime/realtime/capabilities');
   },
 
-  /** 查询语音输出组件的下载和激活状态。 */
+  /** Check download and activation status for the voice-output component. */
   voiceOutputComponent(): Promise<VoiceOutputComponentStatus> {
     return request('/api/v1/components/voice-output');
   },
 
-  /** 提交语音输出组件安装任务，不自动触发下载之外的页面操作。 */
+  /** Submit a voice-output component installation job without triggering other page actions. */
   installVoiceOutputComponent(): Promise<{ operation_id: string; status: 'accepted' }> {
     return request('/api/v1/components/voice-output/install', { method: 'POST' });
   },
 
-  /** 激活已经安装的语音输出组件。 */
+  /** Activate an installed voice-output component. */
   activateVoiceOutputComponent(): Promise<{ active: boolean; reason?: string; error?: string }> {
     return request('/api/v1/components/voice-output/activate', { method: 'POST' });
   },
 
-  /** 使用新的上下文容量重载运行实例。 */
+  /** Reload a runtime instance with a new context capacity. */
   reloadRuntime(contextSize: number, instanceId?: string): Promise<RuntimeStatus> {
     return request('/api/v1/runtime/reload', {
       method: 'POST',
@@ -144,7 +144,7 @@ export const runtimeApi = {
     });
   },
 
-  /** 清理实例前缀缓存并返回释放后的运行状态。 */
+  /** Clear an instance's prefix cache and return its updated runtime status. */
   clearRuntimeCache(instanceId?: string): Promise<RuntimeStatus & { released_snapshots: number }> {
     return request('/api/v1/runtime/cache/clear', {
       method: 'POST',
@@ -152,7 +152,7 @@ export const runtimeApi = {
     });
   },
 
-  /** 将缓存回收到目标容量，返回实际释放的字节数。 */
+  /** Reclaim cache to the target capacity and return the number of bytes actually released. */
   trimRuntimeCache(
     targetBytes = 0,
     instanceId?: string,

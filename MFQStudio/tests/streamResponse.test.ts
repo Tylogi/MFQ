@@ -1,4 +1,4 @@
-/** 验证生成请求的会话隔离、事件顺序、业务终态及服务端错误传播。 */
+/** Verify generation request session isolation, event ordering, business terminal states, and server error propagation. */
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../src/shared/api/client';
 import { streamResponse } from '../src/shared/api/responses';
@@ -50,8 +50,8 @@ function respondWith(events: unknown[]) {
 const delta = { type: 'response.text.delta', response_id: 'response-1', delta: 'answer' };
 const completed = { type: 'response.completed', response_id: 'response-1', finish_reason: 'stop' };
 
-describe('生成流协议', () => {
-  it('成功流允许终态后的会话状态事件，且只提交一次生成请求', async () => {
+describe('describes streamResponse test behavior 1', () => {
+  it('verifies streamResponse test behavior 2', async () => {
     const events = [
       frame(delta),
       frame(completed, 1),
@@ -73,7 +73,7 @@ describe('生成流协议', () => {
     );
   });
 
-  it('服务端 interrupted 是有效业务终态', async () => {
+  it('verifies streamResponse test behavior 3', async () => {
     respondWith([
       frame({ type: 'response.interrupted', response_id: 'response-1', reason: 'cancelled' }),
     ]);
@@ -82,7 +82,7 @@ describe('生成流协议', () => {
     ).resolves.toBeUndefined();
   });
 
-  it('HTTP 拒绝不会把输入标记为已接受', async () => {
+  it('verifies streamResponse test behavior 4', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
       error: { code: 'REJECTED', message: 'request rejected', retryable: true, details: {} },
     }), { status: 503, headers: { 'content-type': 'application/json' } })));
@@ -93,7 +93,7 @@ describe('生成流协议', () => {
     expect(onAccepted).not.toHaveBeenCalled();
   });
 
-  it('连接正常 EOF 但没有业务终态时报告截断', async () => {
+  it('verifies streamResponse test behavior 5', async () => {
     respondWith([frame(delta)]);
     await expect(
       streamResponse('session-1', request, vi.fn(), new AbortController().signal),
@@ -102,18 +102,18 @@ describe('生成流协议', () => {
   });
 
   it.each([
-    ['会话不匹配', [frame(completed, 0, 'other-session')], 'invalid response frame'],
-    ['序号缺失', [frame(delta), frame(completed, 2)], 'out-of-order'],
-    ['序号重复', [frame(delta), frame(completed)], 'out-of-order'],
+    ['session mismatch', [frame(completed, 0, 'other-session')], 'invalid response frame'],
+    ['missing sequence', [frame(delta), frame(completed, 2)], 'out-of-order'],
+    ['duplicate sequence', [frame(delta), frame(completed)], 'out-of-order'],
     [
-      '混合响应',
+      'mixed response',
       [frame(delta), frame({ ...completed, response_id: 'other-response' }, 1)],
       'mixed response identifiers',
     ],
-    ['终态后增量', [frame(completed), frame(delta, 1)], 'after completion'],
-    ['非法增量', [frame({ ...delta, delta: 123 })], 'invalid response payload'],
+    ['delta after terminal state', [frame(completed), frame(delta, 1)], 'after completion'],
+    ['invalid delta', [frame({ ...delta, delta: 123 })], 'invalid response payload'],
     [
-      '非法工具序号',
+      'invalid tool sequence',
       [
         frame({
           type: 'response.tool_call.delta',
@@ -124,14 +124,14 @@ describe('生成流协议', () => {
       ],
       'invalid response payload',
     ],
-  ])('拒绝%s', async (_name, events, message) => {
+  ])('verifies parameterized behavior %s', async (_name, events, message) => {
     respondWith(events as unknown[]);
     await expect(
       streamResponse('session-1', request, vi.fn(), new AbortController().signal),
     ).rejects.toThrow(message as string);
   });
 
-  it('业务错误保留 ApiError 信息且不自动重试', async () => {
+  it('verifies streamResponse test behavior 6', async () => {
     respondWith([
       frame({
         type: 'error',

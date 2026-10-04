@@ -1,6 +1,6 @@
-/** 展示量化工作台的产物来源与验证记录。 */
+/** Display artifact lineage and verification records for the quantization workspace. */
 import { useQuantization } from './QuantizationContext';
-/** 从页面状态读取本面板所需数据与业务操作。 */
+/** Read the data and business actions required by this panel from page state. */
 export function LineagePanel() {
   const { tr, lineage } = useQuantization();
   return (

@@ -1,7 +1,7 @@
-/** 展示量化工作台的校准导入与产物选择。 */
+/** Display calibration import and artifact selection for the quantization workspace. */
 import { useQuantization } from './QuantizationContext';
 import { Icon } from '../../app/display';
-/** 从页面状态读取本面板所需数据与业务操作。 */
+/** Read the data and business actions required by this panel from page state. */
 export function ImatrixPanel() {
   const {
     tr,

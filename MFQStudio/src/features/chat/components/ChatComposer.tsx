@@ -1,4 +1,4 @@
-/** 管理输入草稿、输入法提交、附件入口与生成按钮，隔离高频键入状态。 */
+/** Manage the input draft, IME submission, attachment entry point, and generate button, isolating high-frequency typing state. */
 import { useRef, type FormEvent, type ReactNode } from 'react';
 import { Icon } from '../../../app/display';
 import { formatNumber } from '../../../app/formatters';
@@ -17,15 +17,14 @@ interface ChatComposerProps {
   attachmentAccept: string;
   toolbar: ReactNode;
   tr: (zh: string, en: string) => string;
-  /** 执行发送；准备成功后调用 accepted 清理该会话的草稿。 */
+/** Send the input and call accepted to clear the session draft after preparation succeeds. */
   onSend: (text: string, accepted: () => void) => Promise<void>;
-  /** 取消当前生成，包含后端取消与历史同步。 */
+/** Cancel the current generation, including backend cancellation and history synchronization. */
   onStop: () => Promise<void>;
-  /** 将准备输入或平台调用异常交给页面错误区域展示，保留尚未接受的草稿。 */
+/** Forward input-preparation or platform-call errors to the page error area, preserving drafts not yet accepted. */
   onError: (error: unknown) => void;
 }
-
-/** 渲染聊天输入区域；草稿变更只更新当前输入组件，生成状态由外部控制器提供。 */
+/** Render the chat input area; draft changes update only this component while generation state comes from the external controller. */
 export function ChatComposer({
   sessionId,
   ready,
@@ -48,8 +47,7 @@ export function ChatComposer({
   const submitting = useRef(false);
   const generating = isGenerationBusy(phase);
   const stopping = phase === 'stopping' || phase === 'syncing';
-
-  /** 防止连续提交；只有业务接受当前输入后才清除对应会话草稿。 */
+/** Prevent duplicate submissions; clear the session draft only after the business action accepts the input. */
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (

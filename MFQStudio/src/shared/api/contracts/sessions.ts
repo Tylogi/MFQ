@@ -1,4 +1,4 @@
-/** 定义 sessions 领域的服务契约，仅包含类型，不依赖运行时代码。 */
+/** Define service contracts for the sessions domain using types only, with no runtime dependencies. */
 import type { MediaRef } from './media';
 
 export type SessionMode = 'text' | 'voice' | 'full_duplex';

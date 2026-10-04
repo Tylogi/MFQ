@@ -1,5 +1,5 @@
 /**
- * MFQ Studio 页面导航定义，统一维护桌面端与浏览器端共用的路由路径。
+ * Define MFQ Studio navigation and maintain shared route paths for desktop and browser clients.
  */
 
 export type ViewName = 'chat' | 'dashboard' | 'lab';
@@ -40,17 +40,17 @@ const LAB_PATHS: Record<LabPage, string> = {
   quantization: STUDIO_PATHS.quantization,
 };
 
-/** 规范化 Studio 路径，兼容浏览器或 Tauri 传入的尾部斜杠。 */
+/** Normalize Studio paths, handling trailing slashes supplied by browsers or Tauri. */
 export function normalizeStudioPath(pathname: string): string {
   return pathname.length > 1 ? pathname.replace(/\/+$/, '') : pathname;
 }
 
-/** 判断路径是否为已注册的业务页面；未知路径由 404 路由接管。 */
+/** Determine whether a path is a registered product page; unknown paths are handled by the 404 route. */
 export function isStudioPath(pathname: string): boolean {
   return Object.values(STUDIO_PATHS).some((path) => path === normalizeStudioPath(pathname));
 }
 
-/** 根据当前 URL 解析 Studio 应展示的业务页面。 */
+/** Resolve which Studio product page to display from the current URL. */
 export function resolveStudioLocation(pathname: string): StudioLocation {
   const normalizedPath = normalizeStudioPath(pathname);
   if (normalizedPath === STUDIO_PATHS.chat) {
@@ -66,12 +66,12 @@ export function resolveStudioLocation(pathname: string): StudioLocation {
     : { view: 'dashboard', dashboardPage, labPage: 'models' };
 }
 
-/** 返回指定 Dashboard 页面对应的稳定路由。 */
+/** Return the stable route for the specified Dashboard page. */
 export function dashboardPath(page: DashboardPage): string {
   return DASHBOARD_PATHS[page];
 }
 
-/** 返回指定模型工具页面对应的稳定路由。 */
+/** Return the stable route for the specified model-tools page. */
 export function labPath(page: LabPage): string {
   return LAB_PATHS[page];
 }

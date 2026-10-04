@@ -25,7 +25,7 @@ beforeEach(() => {
 });
 afterEach(() => { vi.restoreAllMocks(); localStorage.clear(); setApiBaseUrl(''); });
 
-it('网页端可编辑端口，保存实际更改监听并持久化连接地址', async () => {
+it('verifies ConnectionsPage test behavior 1', async () => {
   const change = vi.spyOn(runtimeApi, 'configureRuntimeListener').mockResolvedValue({ host: '127.0.0.1', port: 8091, configurable: true });
   render(<MemoryRouter><ConnectionsPage /></MemoryRouter>);
   expect(screen.getByRole('heading', { name: /^Service$/ })).toBeInTheDocument();
@@ -39,7 +39,7 @@ it('网页端可编辑端口，保存实际更改监听并持久化连接地址'
   expect(reloadService).toHaveBeenCalledOnce();
 });
 
-it('端口占用时保留原连接，不假报保存成功', async () => {
+it('verifies ConnectionsPage test behavior 2', async () => {
   vi.spyOn(runtimeApi, 'configureRuntimeListener').mockRejectedValue(new Error('port in use'));
   render(<MemoryRouter><ConnectionsPage /></MemoryRouter>);
   await waitFor(() => expect(runtimeApi.runtimeListener).toHaveBeenCalled());

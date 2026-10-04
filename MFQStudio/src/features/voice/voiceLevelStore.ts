@@ -1,4 +1,4 @@
-/** 隔离高频语音音量更新，仅通知直接订阅音量的组件。 */
+/** Isolate high-frequency voice-level updates and notify only components subscribed to the level. */
 import { useSyncExternalStore } from 'react';
 
 let level = 0;
@@ -9,24 +9,24 @@ function subscribe(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
-/** 获取当前音量快照，供不订阅的兼容调用方读取。 */
+/** Get the current volume snapshot for compatible callers that do not subscribe. */
 export function getVoiceLevel(): number {
   return level;
 }
 
-/** 仅在音量变化时通知订阅者，不更新语音会话的 React 状态。 */
+/** Notify subscribers only when the volume changes, without updating React voice-session state. */
 export function setVoiceLevel(nextLevel: number): void {
   if (Object.is(level, nextLevel)) return;
   level = nextLevel;
   listeners.forEach((listener) => listener());
 }
 
-/** 清除当前控制器留下的音量读数。 */
+/** Clear the volume reading left by the current controller. */
 export function resetVoiceLevel(): void {
   setVoiceLevel(0);
 }
 
-/** 精准订阅语音音量；ChatToolbar 可直接调用以更新音量指示器。 */
+/** Subscribe specifically to voice volume; ChatToolbar can call this directly to update its volume indicator. */
 export function useVoiceLevel(): number {
   return useSyncExternalStore(subscribe, getVoiceLevel, () => 0);
 }

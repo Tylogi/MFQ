@@ -1,7 +1,7 @@
-/** 展示量化工作台的活动任务与终态记录。 */
+/** Display active jobs and terminal records for the quantization workspace. */
 import { useQuantization } from './QuantizationContext';
 import { formatNumber } from '../../app/formatters';
-/** 从页面状态读取本面板所需数据与业务操作。 */
+/** Read the data and business actions required by this panel from page state. */
 export function JobHistory() {
   const {
     tr,

@@ -1,7 +1,6 @@
-/** 为应用启动、路由切换和服务连接提供一致的工作区加载页面。 */
+/** Provide a consistent workspace loading page for app startup, route changes, and service connections. */
 import { useSettings } from '../features/settings/SettingsProvider';
-
-/** 显示统一的加载状态，动效不表示实际完成比例。 */
+/** Display a consistent loading state; the animation does not indicate actual completion percentage. */
 export function LoadingPage() {
   const { tr } = useSettings();
 

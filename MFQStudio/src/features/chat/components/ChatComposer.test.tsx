@@ -1,4 +1,4 @@
-/** 验证输入草稿隔离、父级渲染边界以及业务未接受时保留输入。 */
+/** Verify input-draft isolation, parent render boundaries, and input preservation when the business action does not accept it. */
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, expect, it, vi } from 'vitest';
@@ -30,7 +30,7 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
-it('每次键入只更新输入组件，草稿按会话保存并在返回时恢复', async () => {
+it('verifies ChatComposer test behavior 1', async () => {
   const user = userEvent.setup();
   let renders = 0;
   function Host({ sessionId }: { sessionId: string }) {
@@ -47,7 +47,7 @@ it('每次键入只更新输入组件，草稿按会话保存并在返回时恢�
   expect(screen.getByRole('textbox')).toHaveValue('first draft');
 });
 
-it('提交失败不会丢失输入；业务接受后才清空草稿', async () => {
+it('verifies ChatComposer test behavior 2', async () => {
   const user = userEvent.setup();
   const failure = new Error('upload failed');
   const send = vi

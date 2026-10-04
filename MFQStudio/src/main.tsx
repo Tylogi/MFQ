@@ -1,5 +1,5 @@
 /**
- * MFQ Studio Web 与 Tauri 共用的 React 启动入口，负责路由和顶层错误隔离。
+ * Shared React entry point for MFQ Studio Web and Tauri, responsible for routing and top-level error isolation.
  */
 
 import { Component, StrictMode, type ErrorInfo, type ReactNode } from 'react';
@@ -50,7 +50,7 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, AppErrorBounda
   }
 }
 
-// 浏览器清理旧版根路径哈希链接；桌面打包资源仍使用哈希路由。
+// Clean up legacy root-path hash links in browsers; packaged desktop assets still use hash routing.
 if (!isStudio() && window.location.pathname === '/' && window.location.hash.startsWith('#/')) {
   window.history.replaceState(window.history.state, '', window.location.hash.slice(1));
 }

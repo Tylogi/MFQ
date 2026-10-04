@@ -1,8 +1,8 @@
-/** 展示量化工作台的任务结果、操作和事件日志。 */
+/** Display job results, actions, and event logs for the quantization workspace. */
 import { useQuantization } from './QuantizationContext';
 import { formatNumber } from '../../app/formatters';
 import { isTerminalJob } from './jobSchema';
-/** 从页面状态读取本面板所需数据与业务操作。 */
+/** Read the data and business actions required by this panel from page state. */
 export function JobDetail() {
   const {
     tr,

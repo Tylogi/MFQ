@@ -1,4 +1,4 @@
-/* Studio Release 检查、下载、切换与回退界面。 */
+/* Style Studio release checks, downloads, version switching, and rollback controls. */
 .settings-update-panel { padding-block: 15px; }
 .update-manager { display: grid; gap: 14px; }
 .update-manager-heading { display: flex; align-items: start; justify-content: space-between; gap: 16px; }

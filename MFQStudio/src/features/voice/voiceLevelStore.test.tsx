@@ -1,4 +1,4 @@
-/** 验证语音音量独立订阅与控制器切换时的复位行为。 */
+/** Verify independent voice-level subscriptions and reset behavior when switching controllers. */
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { RealtimeCallbacks } from './realtimeTypes';
@@ -34,7 +34,7 @@ vi.mock('../settings/SettingsProvider', () => ({
   useSettings: () => ({ settings: { playbackEnabled: true, fullDuplex: false } }),
 }));
 
-describe('语音音量独立订阅', () => {
+describe('describes voiceLevelStore test behavior 1', () => {
   beforeEach(() => {
     mockControllers.length = 0;
     resetVoiceLevel();
@@ -42,7 +42,7 @@ describe('语音音量独立订阅', () => {
 
   afterEach(() => resetVoiceLevel());
 
-  it('仅在音量改变时更新订阅者，不触发会话 hook 重渲染', () => {
+  it('verifies voiceLevelStore test behavior 2', () => {
     let conversationRenders = 0;
     let levelRenders = 0;
     const conversation = renderHook(() => {
@@ -67,7 +67,7 @@ describe('语音音量独立订阅', () => {
     level.unmount();
   });
 
-  it('会话与连接切换立即复位，并忽略旧控制器的迟到音量', async () => {
+  it('verifies voiceLevelStore test behavior 3', async () => {
     const level = renderHook(useVoiceLevel);
     const conversation = renderHook(
       ({ sessionId, revision }) => useVoiceConversation(sessionId, revision, vi.fn()),
@@ -106,7 +106,7 @@ describe('语音音量独立订阅', () => {
     level.unmount();
   });
 
-  it('控制器停止发布零音量，卸载后旧回调无法重新写入', async () => {
+  it('verifies voiceLevelStore test behavior 4', async () => {
     const level = renderHook(useVoiceLevel);
     const conversation = renderHook(() => useVoiceConversation('session-a', 1, vi.fn()));
     act(() => mockControllers[0].callbacks.onLevel(0.7));
@@ -125,7 +125,7 @@ describe('语音音量独立订阅', () => {
     level.unmount();
   });
 
-  it('未挂载订阅者时仍可更新快照并跳过重复写入', () => {
+  it('verifies voiceLevelStore test behavior 5', () => {
     setVoiceLevel(0.2);
     expect(getVoiceLevel()).toBe(0.2);
     resetVoiceLevel();

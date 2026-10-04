@@ -1,4 +1,4 @@
-"""保留原生预填充计时契约；富文本与指标展示已迁入 Vitest。"""
+"""Retain the native prefill timing contract; rich text and metric display have moved to Vitest."""
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]

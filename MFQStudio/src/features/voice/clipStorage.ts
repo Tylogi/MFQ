@@ -1,8 +1,8 @@
-/** 负责通过 IndexedDB 保存和读取会话语音片段。 */
+/** Save and retrieve session voice clips through IndexedDB. */
 const AUDIO_DATABASE = "mfq.studio.audio.v1";
 const AUDIO_STORE = "clips";
 
-/** 打开音频缓存库，首次使用时创建按片段 ID 索引的存储。 */
+/** Open the audio cache database, creating a clip-ID-indexed object store on first use. */
 function audioDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(AUDIO_DATABASE, 1);
@@ -16,7 +16,7 @@ function audioDatabase(): Promise<IDBDatabase> {
   });
 }
 
-/** 将语音片段保存到 IndexedDB，事务完成后才返回。 */
+/** Save a voice clip to IndexedDB and return only after the transaction completes. */
 export async function saveVoiceClip(id: string, blob: Blob): Promise<void> {
   const database = await audioDatabase();
   await new Promise<void>((resolve, reject) => {
@@ -27,7 +27,7 @@ export async function saveVoiceClip(id: string, blob: Blob): Promise<void> {
   });
 }
 
-/** 按片段 ID 读取缓存音频；不存在时返回 null。 */
+/** Read cached audio by clip ID, returning null when it does not exist. */
 export async function loadVoiceClip(id: string): Promise<Blob | null> {
   const database = await audioDatabase();
   return new Promise((resolve, reject) => {

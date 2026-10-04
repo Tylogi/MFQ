@@ -1,4 +1,4 @@
-/** 解析 Hugging Face 与 ModelScope 模型仓库引用及版本。 */
+/** Parse Hugging Face and ModelScope model repository references and revisions. */
 import { HubModelSummary } from '../../shared/api/types';
 
 export interface HubReference {
@@ -7,7 +7,7 @@ export interface HubReference {
   revision?: string;
 }
 
-/** 解析模型仓库名称或链接，返回提供方、仓库及可选版本。 */
+/** Parse a model repository name or URL and return its provider, repository, and optional revision. */
 export function parseHubReference(
   value: string,
   fallbackProvider: HubModelSummary["provider"],

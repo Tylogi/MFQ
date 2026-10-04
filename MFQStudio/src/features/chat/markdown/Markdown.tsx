@@ -1,6 +1,6 @@
 /**
- * Markdown 富文本渲染组件。
- * 负责模型生成文本的流式限频解析、Prism.js 语法高亮、代码块复制与 KaTeX 数学公式渲染。
+* Markdown rich-text rendering component.
+* Parse generated model text with streaming throttling, Prism.js highlighting, code-block copying, and KaTeX math rendering.
  */
 import DOMPurify from 'dompurify';
 import renderMathInElement from 'katex/contrib/auto-render';
@@ -22,18 +22,16 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { normalizeEscapedMarkdownLineBreaks } from './markdownText';
 import 'katex/dist/katex.min.css';
 import './markdown.css';
-
-/** Markdown 组件入参属性定义。 */
+/** Markdown component props. */
 export interface MarkdownProps {
-  /** 待渲染的 Markdown 源码文本。 */
+/** Markdown source text to render. */
   text: string;
-  /** 是否处于流式生成状态，流式阶段启用限频且推迟高开销公式与 DOM 交互。 */
+/** Whether generation is streaming; throttle updates and defer expensive math and DOM interactions while streaming. */
   live?: boolean;
-  /** 是否需要还原完全转义的结构性换行。 */
+/** Whether fully escaped structural newlines should be restored. */
   normalizeEscapedLineBreaks?: boolean;
 }
-
-/** HTML 字符转义映射表。 */
+/** HTML character-escaping map. */
 const ESCAPE_HTML_MAP: Record<string, string> = {
   '&': '&amp;',
   '<': '&lt;',
@@ -43,16 +41,15 @@ const ESCAPE_HTML_MAP: Record<string, string> = {
 };
 
 /**
- * 安全转义 HTML 特殊字符，防止未知语言或未高亮文本被直接注入解析。
+* Escape HTML special characters to prevent direct injection of unknown-language or unhighlighted text.
  *
- * @param text 需要转义的纯文本
- * @returns 经过 HTML 实体转义的安全字符串
+* @param text Plain text to escape
+* @returns A safe string with HTML entities escaped
  */
 function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (char) => ESCAPE_HTML_MAP[char] || char);
 }
-
-/** 常用代码语言别名映射。 */
+/** Common code-language aliases. */
 const LANGUAGE_ALIASES: Record<string, string> = {
   js: 'javascript',
   ts: 'typescript',
@@ -70,10 +67,10 @@ const LANGUAGE_ALIASES: Record<string, string> = {
 };
 
 /**
- * 解析并匹配 Prism 支持的语法定义与规范化语言名称。
+* Resolve a Prism-supported grammar and normalize its language name.
  *
- * @param lang 原始语言标记字符串
- * @returns 规范化的语言名、别名和对应的 Prism 语法定义
+* @param lang The original language identifier
+* @returns The normalized language name, aliases, and corresponding Prism grammar
  */
 function resolveLanguage(lang?: string): {
   rawLang: string;
@@ -92,8 +89,7 @@ function resolveLanguage(lang?: string): {
     grammar,
   };
 }
-
-/** 配置了 Prism 语法高亮和标准代码块结构的 Marked 解析器实例。 */
+/** Marked parser configured with Prism syntax highlighting and standard code-block structure. */
 const customMarked = new Marked({
   breaks: true,
   gfm: true,
@@ -115,8 +111,7 @@ const customMarked = new Marked({
     },
   },
 });
-
-/** 限制长回答的全量 Markdown 解析频率，并在结束生成时立即展示最终文本。 */
+/** Throttle full Markdown parsing for long answers and show the final text immediately when generation ends. */
 function useStreamingText(text: string, live: boolean): string {
   const [displayed, setDisplayed] = useState(text);
   const latest = useRef(text);
@@ -144,10 +139,10 @@ function useStreamingText(text: string, live: boolean): string {
 }
 
 /**
- * 将模型文本安全渲染为富文本；支持流式限频、Prism.js 代码语法高亮与 KaTeX 数学公式增强。
+* Safely render model text as rich content, with streaming throttling, Prism.js highlighting, and KaTeX math enhancement.
  *
- * @param props 组件入参
- * @returns 渲染后的富文本 DOM 结构
+* @param props Component properties
+* @returns The rendered rich-text DOM structure
  */
 export const Markdown = memo(function Markdown({
   text,
@@ -167,7 +162,7 @@ export const Markdown = memo(function Markdown({
     () => DOMPurify.sanitize(customMarked.parse(markdown) as string),
     [markdown],
   );
-  // 保持相同 HTML 的对象引用，避免限频状态更新覆盖公式和复制按钮的 DOM 增强。
+// Preserve the object reference for identical HTML so throttled updates do not overwrite math and copy-button DOM enhancements.
   const markup = useMemo(() => ({ __html: html }), [html]);
 
   useEffect(() => {
@@ -187,7 +182,7 @@ export const Markdown = memo(function Markdown({
         trust: false,
       });
     } catch {
-      // 容错处理：不破坏 React DOM 挂载生命周期
+// Recover gracefully without disrupting React DOM lifecycle
     }
     const buttons: HTMLButtonElement[] = [];
     const timers = new Set<ReturnType<typeof setTimeout>>();

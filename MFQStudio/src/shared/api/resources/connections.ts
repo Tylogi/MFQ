@@ -1,9 +1,9 @@
-/** 封装 connections 领域资源请求，不保存组件状态。 */
+/** Wrap resource requests for the connections domain without storing component state. */
 import type { RemoteNode, McpServerResource, McpToolResource, McpToolCallResult } from '../types';
 import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client';
 
 export const connectionsApi = {
-  /** 获取远程节点状态，可要求服务刷新健康信息。 */
+  /** Get remote node status, optionally asking the server to refresh health information. */
   async remoteNodes(refresh = false): Promise<RemoteNode[]> {
     return (
       await request<{ data: RemoteNode[] }>(
@@ -12,7 +12,7 @@ export const connectionsApi = {
     ).data;
   },
 
-  /** 注册远程服务节点及其凭据环境变量名称。 */
+  /** Register a remote service node and the name of its credential environment variable. */
   createRemoteNode(body: {
     name: string;
     url: string;
@@ -25,7 +25,7 @@ export const connectionsApi = {
     });
   },
 
-  /** 移除远程节点注册。 */
+  /** Remove a remote node registration. */
   async deleteRemoteNode(id: string): Promise<void> {
     const response = await fetch(apiUrl(`/api/v1/cluster/nodes/${id}`), {
       method: 'DELETE',
@@ -34,17 +34,17 @@ export const connectionsApi = {
     if (!response.ok) throw await errorFromResponse(response);
   },
 
-  /** 获取 MCP 服务配置列表。 */
+  /** Get the list of MCP service configurations. */
   async mcpServers(): Promise<McpServerResource[]> {
     return (await request<{ data: McpServerResource[] }>('/api/v1/mcp/servers')).data;
   },
 
-  /** 聚合 MCP 工具及各服务的发现错误。 */
+  /** Aggregate MCP tools and discovery errors from each service. */
   async mcpTools(): Promise<{ data: McpToolResource[]; errors: Record<string, string> }> {
     return request('/api/v1/mcp/tools');
   },
 
-  /** 注册 HTTP 或 stdio MCP 服务。 */
+  /** Register an HTTP or stdio MCP service. */
   createMcpServer(body: {
     name: string;
     transport: 'stdio' | 'streamable_http';
@@ -57,7 +57,7 @@ export const connectionsApi = {
     return request('/api/v1/mcp/servers', { method: 'POST', body: JSON.stringify(body) });
   },
 
-  /** 启用或禁用已注册的 MCP 服务。 */
+  /** Enable or disable a registered MCP service. */
   updateMcpServer(id: string, enabled: boolean): Promise<McpServerResource> {
     return request(`/api/v1/mcp/servers/${id}`, {
       method: 'PATCH',
@@ -65,7 +65,7 @@ export const connectionsApi = {
     });
   },
 
-  /** 删除 MCP 服务配置。 */
+  /** Delete an MCP service configuration. */
   async deleteMcpServer(id: string): Promise<void> {
     const response = await fetch(apiUrl(`/api/v1/mcp/servers/${id}`), {
       method: 'DELETE',
@@ -74,7 +74,7 @@ export const connectionsApi = {
     if (!response.ok) throw await errorFromResponse(response);
   },
 
-  /** 执行已获用户确认的工具调用，返回工具输出。 */
+  /** Execute a tool call confirmed by the user and return its output. */
   callMcpTool(name: string, arguments_: Record<string, unknown>): Promise<McpToolCallResult> {
     return request('/api/v1/mcp/tools/call', {
       method: 'POST',

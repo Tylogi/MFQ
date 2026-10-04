@@ -1,9 +1,8 @@
-/** 应用外壳中的连接、刷新与任务流告警。 */
+/** Connection, refresh, and job-stream alerts in the application shell. */
 import { useRuntime } from './RuntimeProvider';
 import { useSettings } from '../features/settings/SettingsProvider';
 import { Icon } from './display';
-
-/** 展示当前运行时异常及各自独立的重试操作。 */
+/** Display current runtime failures with independent retry actions. */
 export function RuntimeAlerts({ connectionProblem }: { connectionProblem: string | null }) {
   const { tr } = useSettings();
   const { ready, refreshError, jobStreamErrors, loading: selectedModelLoading,

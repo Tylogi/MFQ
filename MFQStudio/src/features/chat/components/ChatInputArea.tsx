@@ -1,4 +1,4 @@
-/** 聊天输入区组合已有编辑器、滚动入口及语音组件安装提示。 */
+/** Compose the existing editor, scroll controls, and voice-component installation prompt in the chat input area. */
 import { ArrowDownIcon } from '@phosphor-icons/react';
 import { useSettings } from '../../settings/SettingsProvider';
 import { useJobStore } from '../../../stores/jobStore';
@@ -6,8 +6,7 @@ import { formatNumber, errorMessage } from '../../../app/formatters';
 import { ChatComposer } from './ChatComposer';
 import { ChatToolbar } from './ChatToolbar';
 import type { ChatPageState } from '../hooks/useChatPageState';
-
-/** 展示输入和安装状态，发送操作仍交由聊天领域处理。 */
+/** Display input and installation state while leaving send actions to the chat domain. */
 export function ChatInputArea({ page }: { page: ChatPageState }) {
   const { tr } = useSettings();
   const { chat, active, activeId, scroll } = page;

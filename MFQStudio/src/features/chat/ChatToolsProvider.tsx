@@ -1,4 +1,4 @@
-/** 按连接隔离聊天工具目录与选择，切路由时保留当前聊天工具偏好。 */
+/** Isolate chat-tool catalogs and selections by connection, preserving chat-tool preferences across route changes. */
 import {
   createContext,
   useEffect,
@@ -23,8 +23,7 @@ interface ChatToolsContextValue {
 }
 
 const ChatToolsContext = createContext<ChatToolsContextValue | null>(null);
-
-/** 在首次访问聊天后加载工具，并在服务切换时丢弃旧服务的工具与选择。 */
+/** Load tools on first chat access and discard tools and selections from the old service after a switch. */
 export function ChatToolsProvider({ children }: { children: ReactNode }) {
   const location = useLocation();
   const { ready, connectionRevision } = useRuntime();
@@ -67,8 +66,7 @@ export function ChatToolsProvider({ children }: { children: ReactNode }) {
   );
   return <ChatToolsContext.Provider value={value}>{children}</ChatToolsContext.Provider>;
 }
-
-/** 读取跨路由保留的聊天工具目录与选择。 */
+/** Read the chat-tool catalog and selection preserved across routes. */
 export function useChatTools(): ChatToolsContextValue {
   const value = useContext(ChatToolsContext);
   if (!value) throw new Error('ChatToolsProvider is missing');
