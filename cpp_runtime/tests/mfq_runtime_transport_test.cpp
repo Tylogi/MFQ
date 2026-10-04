@@ -1,8 +1,10 @@
 #include "scheduler.h"
+#include "common.h"
 #include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <map>
 #include <thread>
 using namespace mfq::engine;
@@ -106,7 +108,34 @@ int drain(const std::shared_ptr<MfqScheduledRequest>& handle, bool cancelled = f
     assert(handle->wait().empty());
     return terminals;
 }
+void test_decode_timing() {
+    const auto now = InferenceMetrics::Clock::now();
+    InferenceMetrics metrics;
+    metrics.started = now - 80ms;
+    metrics.first_token = now - 70ms;
+    metrics.last_token = now - 20ms;
+    metrics.saw_token = true;
+    InferenceResult result;
+    result.completion_tokens = 6;
+    const auto values = mfq::transport_detail::request_metric_values(result, metrics);
+    assert(std::abs(values.ttft_ms - 10.0) < 1e-12);
+    assert(std::abs(values.decode_ms - 50.0) < 1e-12);
+    assert(std::abs(values.decode_tps - 100.0) < 1e-12);
+    assert(values.generation_ms >= 80.0);
+    assert(values.generation_ms - values.ttft_ms - values.decode_ms >= 20.0);
+    result.cancelled = true;
+    assert(mfq::transport_detail::request_metric_values(result, metrics).decode_ms == values.decode_ms);
+    InferenceMetrics single;
+    single.mark_token();
+    result.completion_tokens = 1;
+    const auto one = mfq::transport_detail::request_metric_values(result, single);
+    assert(one.decode_ms == 0.0 && one.decode_tps == 0.0);
+    result.completion_tokens = 0;
+    const auto empty = mfq::transport_detail::request_metric_values(result, InferenceMetrics{});
+    assert(empty.decode_ms == 0.0 && empty.decode_tps == 0.0);
+}
 int main() {
+    test_decode_timing();
     {
         FakeEngine engine;
         MfqScheduler scheduler(engine, {8, 4096});

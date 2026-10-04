@@ -123,6 +123,58 @@ inline uint4 mfq_grouped_nint_read_row_value4(
         (packed >> (2u * bits)) & mask,
         (packed >> (3u * bits)) & mask);
 }
+
+struct MfqGroupedNintValue8 {
+    uint4 low;
+    uint4 high;
+};
+
+template <typename Stream>
+inline MfqGroupedNintValue8 mfq_grouped_nint_read_row_value8(
+    Stream stream,
+    uint row_byte_offset,
+    uint row_bit_shift,
+    uint value_index,
+    uint bits
+) {
+    const uint row_relative_bits = row_bit_shift + value_index * bits;
+    const uint byte_index = row_byte_offset + (row_relative_bits >> 3u);
+    const uint shift = row_relative_bits & 7u;
+    const uint word0 = as_type<uint>(
+        *reinterpret_cast<device const packed_uchar4*>(stream + byte_index));
+    const uint word1 = shift + 8u * bits > 32u
+        ? as_type<uint>(*reinterpret_cast<device const packed_uchar4*>(
+            stream + byte_index + 4u))
+        : 0u;
+    const uint word2 = shift + 8u * bits > 64u
+        ? as_type<uint>(*reinterpret_cast<device const packed_uchar4*>(
+            stream + byte_index + 8u))
+        : 0u;
+    const uint packed0 = shift == 0u
+        ? word0
+        : (word0 >> shift) | (word1 << (32u - shift));
+    const uint second_offset = shift + 4u * bits;
+    const uint second_shift = second_offset & 31u;
+    const uint second_low = second_offset >= 32u ? word1 : word0;
+    const uint second_high = second_offset >= 32u ? word2 : word1;
+    const uint packed1 = second_shift == 0u
+        ? second_low
+        : (second_low >> second_shift)
+            | (second_high << (32u - second_shift));
+    const uint mask = (1u << bits) - 1u;
+    return {
+        uint4(
+            packed0 & mask,
+            (packed0 >> bits) & mask,
+            (packed0 >> (2u * bits)) & mask,
+            (packed0 >> (3u * bits)) & mask),
+        uint4(
+            packed1 & mask,
+            (packed1 >> bits) & mask,
+            (packed1 >> (2u * bits)) & mask,
+            (packed1 >> (3u * bits)) & mask),
+    };
+}
 )METAL";
 
 constexpr const char* kGroupedHeader = R"METAL(
@@ -611,7 +663,8 @@ std::string make_nint_projection_group_source(
     constexpr uint SIMD_GROUPS = 8u;
     constexpr uint OUTPUTS_PER_SIMD = 2u;
     constexpr uint OUTPUTS_PER_TG = SIMD_GROUPS * OUTPUTS_PER_SIMD;
-    constexpr uint CHUNKS = (uint(GS) + 3u) / 4u;
+    constexpr uint CHUNK_VALUES = M == 1 && GS % 8 == 0 ? 8u : 4u;
+    constexpr uint CHUNKS = (uint(GS) + CHUNK_VALUES - 1u) / CHUNK_VALUES;
 
     uint lane = thread_index_in_simdgroup;
     uint simd_group = simdgroup_index_in_threadgroup;
@@ -711,7 +764,7 @@ std::string make_nint_projection_group_source(
 
     source += R"METAL(
         for (uint chunk = 0u; chunk < CHUNKS; ++chunk) {
-            uint group_element = chunk * 4u;
+            uint group_element = chunk * CHUNK_VALUES;
             uint column = group * uint(GS) + group_element;
 )METAL";
 
@@ -722,11 +775,26 @@ std::string make_nint_projection_group_source(
         source +=
             "            uint4 codes_" + suffix
             + "[OUTPUTS_PER_SIMD];\n"
+            "            uint4 codes_high_" + suffix
+            + "[OUTPUTS_PER_SIMD];\n"
             "            if (active_" + suffix + ") {\n"
             "                for (uint output_row = 0u;\n"
             "                     output_row < OUTPUTS_PER_SIMD;\n"
             "                     ++output_row) {\n"
-            "                    codes_" + suffix
+            "                    if constexpr (CHUNK_VALUES == 8u) {\n"
+            "                        const auto values = mfq_grouped_nint_read_row_value8(\n"
+            "                            q_packed_" + suffix + ",\n"
+            "                            q_byte_offsets_" + suffix
+            + "[output_row],\n"
+            "                            q_bit_shifts_" + suffix
+            + "[output_row],\n"
+            "                            column,\n"
+            "                            q_widths_" + suffix
+            + "[output_row]);\n"
+            "                        codes_" + suffix + "[output_row] = values.low;\n"
+            "                        codes_high_" + suffix + "[output_row] = values.high;\n"
+            "                    } else {\n"
+            "                        codes_" + suffix
             + "[output_row] = mfq_grouped_nint_read_row_value4(\n"
             "                        q_packed_" + suffix + ",\n"
             "                        q_byte_offsets_" + suffix
@@ -736,6 +804,7 @@ std::string make_nint_projection_group_source(
             "                        column,\n"
             "                        q_widths_" + suffix
             + "[output_row]);\n"
+            "                    }\n"
             "                }\n"
             "            }\n";
     }
@@ -746,6 +815,7 @@ std::string make_nint_projection_group_source(
                  ++local_row) {
                 uint row = first_row + local_row;
                 float4 activation = float4(0.0f);
+                float4 activation_high = float4(0.0f);
                 if (row < uint(M)) {
                     uint input_base = row * uint(K) + column;
                     if (group_element + 3u < uint(GS) &&
@@ -767,10 +837,31 @@ std::string make_nint_projection_group_source(
                                 column + 3u < uint(K)
                             ? float(x[input_base + 3u]) : 0.0f;
                     }
+                    if constexpr (CHUNK_VALUES == 8u) {
+                        if (column + 7u < uint(K)) {
+                            activation_high = float4(
+                                *reinterpret_cast<device const vec<T, 4>*>(
+                                    x + input_base + 4u));
+                        } else {
+                            activation_high.x = column + 4u < uint(K)
+                                ? float(x[input_base + 4u]) : 0.0f;
+                            activation_high.y = column + 5u < uint(K)
+                                ? float(x[input_base + 5u]) : 0.0f;
+                            activation_high.z = column + 6u < uint(K)
+                                ? float(x[input_base + 6u]) : 0.0f;
+                            activation_high.w = column + 7u < uint(K)
+                                ? float(x[input_base + 7u]) : 0.0f;
+                        }
+                    }
                 }
                 activation_sums[local_row] +=
                     activation.x + activation.y
                     + activation.z + activation.w;
+                if constexpr (CHUNK_VALUES == 8u) {
+                    activation_sums[local_row] +=
+                        activation_high.x + activation_high.y
+                        + activation_high.z + activation_high.w;
+                }
 )METAL";
 
     for (std::size_t projection = 0;
@@ -787,6 +878,13 @@ std::string make_nint_projection_group_source(
             "                            activation,\n"
             "                            float4(codes_" + suffix
             + "[output_row]));\n"
+            "                        if constexpr (CHUNK_VALUES == 8u) {\n"
+            "                            quantized_dots_" + suffix
+            + "[output_row][local_row] += dot(\n"
+            "                                activation_high,\n"
+            "                                float4(codes_high_" + suffix
+            + "[output_row]));\n"
+            "                        }\n"
             "                    }\n"
             "                }\n";
     }

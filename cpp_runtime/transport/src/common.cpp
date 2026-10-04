@@ -1082,7 +1082,7 @@ RequestMetricValues request_metric_values(
         : 0.0;
     values.decode_ms = metrics.saw_token
         ? std::chrono::duration<double, std::milli>(
-              finished - metrics.first_token).count()
+              metrics.last_token - metrics.first_token).count()
         : 0.0;
     values.generation_tps = values.generation_ms > 0.0
         ? 1000.0 * result.completion_tokens / values.generation_ms
