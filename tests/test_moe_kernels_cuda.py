@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-import shutil
-
 import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
 if not torch.cuda.is_available():
     pytest.skip("CUDA unavailable", allow_module_level=True)
-if shutil.which("cl") is None and shutil.which("cl.exe") is None:
-    pytest.skip("MSVC cl unavailable", allow_module_level=True)
 
 from mfq.formats.nint import NintSpec  # noqa: E402
 from mfq.kernels.cuda._ext import ext  # noqa: E402

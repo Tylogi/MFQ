@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -11,9 +10,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 requires_cuda_runtime = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or (shutil.which("cl") is None and shutil.which("cl.exe") is None),
-    reason="CUDA runtime tests require a CUDA device and MSVC cl",
+    not torch.cuda.is_available(),
+    reason="CUDA runtime tests require a CUDA device",
 )
 
 from mfq.formats import io  # noqa: E402
