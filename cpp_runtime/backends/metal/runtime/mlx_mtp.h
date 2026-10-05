@@ -18,6 +18,25 @@ namespace mfq::metal {
 // Storage/statistics capacity of the common engine, not a model capability.
 // Each predictor adapter supplies its own maximum depth in the request.
 inline constexpr int kMlxMtpEngineMaximumDraftDepth = 5;
+inline constexpr int kMlxMtpHistoryChunkSize = 512;
+
+struct MlxMtpHistoryBatch {
+    mlx::core::array hidden;
+    mlx::core::array token_ids;
+};
+
+class MlxMtpHistoryBuffer {
+public:
+    void append(const mlx::core::array& hidden,
+        std::span<const std::int32_t> token_ids);
+    bool empty() const noexcept { return token_ids_.empty(); }
+    std::size_t size() const noexcept { return token_ids_.size(); }
+    MlxMtpHistoryBatch drain();
+
+private:
+    std::vector<mlx::core::array> hidden_;
+    std::vector<std::int32_t> token_ids_;
+};
 
 // Predictor adapters describe only the maximum supported draft depth. The
 // common engine owns one reversible, throughput-adaptive scheduling and
@@ -94,7 +113,7 @@ std::size_t mlx_prime_mtp_history(
     const mlx::core::array& target_hidden,
     const mlx::core::array& prompt_ids,
     const MlxMtpHistoryFold& fold,
-    int chunk_size = 512);
+    int chunk_size = kMlxMtpHistoryChunkSize);
 
 void mlx_prime_mtp_chunk(const mlx::core::array& hidden,
     const mlx::core::array& ids, std::optional<mlx::core::array>& previous_hidden,

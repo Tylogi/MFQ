@@ -8003,6 +8003,7 @@ def convert(args: argparse.Namespace) -> None:
                 for item in plan
                 if item.name in mtp_plan_names
                 and (item.source_name or item.name) in _MTP_PROTECTED_TENSORS
+                and item.target_dtype in {"BF16", "F16", "F32"}
             ),
         }
         if base_store is not None:

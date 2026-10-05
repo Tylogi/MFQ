@@ -14,6 +14,7 @@
 #include "mlx_transformer.h"
 
 #include "nlohmann/json.hpp"
+#include <mlx/compile.h>
 
 #include <algorithm>
 #include <array>
@@ -23,6 +24,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -78,7 +80,7 @@ bool qsa_decode_prologue_enabled() noexcept {
 
 // Adapted from oMLX's Qwen4 eager-dispatch policy (Apache-2.0), revision
 // 87460f4d50de79aef9b67e99e215c31f0a89b445, language.py. MFQ adaptation:
-// ordinary single-token forward only, with synchronized profiling excluded.
+// single-sequence forwards up to six tokens, with synchronized profiling excluded.
 // Copyright 2025 oMLX contributors. See NOTICE for upstream attribution.
 int decode_async_interval() noexcept {
     static const int interval = [] {
@@ -625,7 +627,8 @@ public:
                 "qwen4.moe.topk",
                 std::vector<array>{routes.ids, routes.weights});
         }
-        if (source.shape(0) == 1 && config_.norm_topk_prob &&
+        std::optional<array> shared_gate_logits;
+        if (source.shape(0) >= 1 && source.shape(0) <= 6 && config_.norm_topk_prob &&
             gate_up_ && down_) {
             const auto* gate_up = gate_up_->packed_weight_ref();
             const auto* down = down_->packed_weight_ref();
@@ -634,16 +637,19 @@ public:
             const auto* shared_gate_weight =
                 shared_gate_.dense_weight_ref();
             if (gate_up != nullptr && down != nullptr &&
-                shared_gate_up != nullptr && shared_down != nullptr &&
-                shared_gate_weight != nullptr) {
+                shared_gate_up != nullptr && shared_down != nullptr) {
+                auto shared_gate_input = shared_gate_weight != nullptr
+                    ? *shared_gate_weight
+                    : shared_gate_logits.emplace(shared_gate_(source));
                 if (auto fused = gate_up->decode_nint_shared(
                         *down,
                         *shared_gate_up,
                         *shared_down,
-                        *shared_gate_weight,
+                        shared_gate_input,
                         source,
                         routes.ids,
-                        routes.weights)) {
+                        routes.weights,
+                        shared_gate_weight == nullptr)) {
                     if (detail::component_profile_active()) {
                         detail::profile_eval(
                             "qwen4.moe.two_stage", *fused);
@@ -653,7 +659,8 @@ public:
                 }
             }
         }
-        auto shared_gate = shared_gate_(source);
+        auto shared_gate = shared_gate_logits
+            ? std::move(*shared_gate_logits) : shared_gate_(source);
         std::optional<array> inverse_route_order;
         bool pairs_are_sorted = false;
         bool routed_is_reduced = false;
@@ -1551,6 +1558,12 @@ public:
         const array& positions_full,
         bool use_cache,
         int speculative_confirmed = 0) = 0;
+    virtual array append_history(
+        const array& hidden,
+        const array& positions_current,
+        const array& positions_full) {
+        return forward(hidden, positions_current, positions_full, true);
+    }
     virtual void reset(int batch) = 0;
     virtual void clear() noexcept = 0;
     virtual std::size_t cache_bytes() const noexcept = 0;
@@ -1708,23 +1721,6 @@ public:
             }
         }
         if (use_cache && (batch_ != batch || !convolution_state_)) reset(batch);
-        auto input_projections = input_projections_(hidden);
-        if (input_projections.size() != 4) {
-            throw std::logic_error(
-                "Qwen4 GDN projection group output mismatch");
-        }
-        auto projected = std::move(input_projections[0]);
-        detail::profile_eval("qwen4.gdn.qkv", projected);
-        auto qkv_parts = mlx::core::split(
-            projected, Shape{2 * key_width()}, -1);
-        auto qk = std::move(qkv_parts.at(0));
-        auto value = std::move(qkv_parts.at(1));
-        auto z = std::move(input_projections[1]);
-        detail::profile_eval("qwen4.gdn.gate", z);
-        const Shape gate_shape{
-            batch, tokens, static_cast<int>(config_.linear_num_value_heads)};
-        auto alpha = mlx::core::reshape(input_projections[2], gate_shape);
-        auto beta = mlx::core::reshape(input_projections[3], gate_shape);
         const bool fused_decode =
             gdn_decode_step_enabled() && use_cache && !rollback_ &&
             batch == 1 && tokens == 1 &&
@@ -1732,124 +1728,41 @@ public:
             config_.linear_value_head_dim == 128 &&
             config_.linear_conv_kernel_dim == 4;
         if (fused_decode) {
-            auto decoded = gated_delta_decode_step(
-                qk,
-                value,
-                z,
-                alpha,
-                beta,
-                *convolution_state_,
-                *recurrent_state_,
-                convolution_weight_,
-                dt_bias_,
-                decay_scale_,
-                output_norm_.weight(),
-                static_cast<int>(config_.linear_num_key_heads),
-                static_cast<int>(config_.linear_num_value_heads),
-                static_cast<int>(config_.linear_value_head_dim),
-                1e-6f,
-                output_norm_.eps(),
-                config_.output_gate_silu);
-            detail::profile_eval(
-                "qwen4.gdn.decode_step",
-                {
-                    decoded.output,
-                    decoded.convolution_state,
-                    decoded.recurrent_state,
-                });
-            convolution_state_ = std::move(decoded.convolution_state);
-            recurrent_state_ = std::move(decoded.recurrent_state);
+            const std::vector<array> inputs{
+                hidden, *convolution_state_, *recurrent_state_};
+            auto decoded = detail::component_profile_active()
+                ? decode_step(inputs) : compiled_decode_(inputs);
+            convolution_state_ = std::move(decoded[1]);
+            recurrent_state_ = std::move(decoded[2]);
             ++position_;
-            auto output = output_(
-                mlx::core::astype(decoded.output, hidden.dtype()));
-            detail::profile_eval("qwen4.gdn.output", output);
-            return output;
+            return std::move(decoded[0]);
         }
-        auto gates = gated_delta_gates(
-            alpha,
-            beta,
-            dt_bias_,
-            decay_scale_);
-        auto recurrent_gate = std::move(gates.gate);
-        auto recurrent_beta = std::move(gates.beta);
-        detail::profile_eval(
-            "qwen4.gdn.gates", {recurrent_gate, recurrent_beta});
-        if (use_cache && rollback_ &&
-            rollback_->position == position_ &&
+        const std::vector<array> inputs{
+            hidden,
+            use_cache ? *convolution_state_ : mlx::core::zeros(
+                Shape{batch, static_cast<int>(config_.linear_conv_kernel_dim - 1),
+                    2 * key_width() + value_width()}, mlx::core::float32),
+            use_cache ? *recurrent_state_ : mlx::core::zeros(
+                Shape{batch, static_cast<int>(config_.linear_num_value_heads),
+                    static_cast<int>(config_.linear_value_head_dim),
+                    static_cast<int>(config_.linear_value_head_dim)}, mlx::core::float32),
+        };
+        auto decoded = use_cache && batch == 1 && tokens >= 2 && tokens <= 6 &&
+                !detail::component_profile_active()
+            ? compiled_batch_step_(inputs) : batch_step(inputs);
+        if (use_cache && rollback_ && rollback_->position == position_ &&
             rollback_->total_tokens == tokens) {
-            rollback_->qk = qk;
-            rollback_->value = value;
-            rollback_->gate = recurrent_gate;
-            rollback_->beta = recurrent_beta;
+            rollback_->qk = decoded[3];
+            rollback_->value = decoded[4];
+            rollback_->gate = decoded[5];
+            rollback_->beta = decoded[6];
         }
-        auto convolved = linear_conv_qkv(
-            use_cache
-                ? *convolution_state_
-                : mlx::core::zeros(
-                      Shape{
-                          batch,
-                          static_cast<int>(
-                              config_.linear_conv_kernel_dim - 1),
-                          2 * key_width() + value_width(),
-                      },
-                      mlx::core::float32),
-            qk,
-            value,
-            convolution_weight_,
-            static_cast<int>(config_.linear_num_key_heads),
-            static_cast<int>(config_.linear_num_value_heads),
-            static_cast<int>(config_.linear_key_head_dim),
-            static_cast<int>(config_.linear_value_head_dim),
-            std::nullopt,
-            1e-6f);
-        detail::profile_eval(
-            "qwen4.gdn.conv",
-            {
-                convolved.query,
-                convolved.key,
-                convolved.value,
-                convolved.state,
-            });
-        auto recurrent = gated_delta_net(
-            convolved.query,
-            convolved.key,
-            convolved.value,
-            recurrent_gate,
-            recurrent_beta,
-            use_cache ? recurrent_state_ : std::nullopt,
-            true);
-        detail::profile_eval(
-            "qwen4.gdn.recurrent",
-            {recurrent.output, recurrent.state});
         if (use_cache) {
-            convolution_state_ = convolved.state;
-            recurrent_state_ = recurrent.state;
+            convolution_state_ = std::move(decoded[1]);
+            recurrent_state_ = std::move(decoded[2]);
             position_ += tokens;
         }
-        auto normalized = output_norm_(recurrent.output);
-        auto output_gate = mlx::core::astype(
-            mlx::core::transpose(
-                mlx::core::reshape(
-                    z,
-                    Shape{
-                        batch,
-                        tokens,
-                        static_cast<int>(config_.linear_num_value_heads),
-                        static_cast<int>(config_.linear_value_head_dim),
-                    }),
-                {0, 2, 1, 3}),
-            mlx::core::float32);
-        output_gate = config_.output_gate_silu
-            ? output_gate * mlx::core::sigmoid(output_gate)
-            : mlx::core::sigmoid(output_gate);
-        normalized = normalized * output_gate;
-        normalized = mlx::core::reshape(
-            mlx::core::transpose(normalized, {0, 2, 1, 3}),
-            Shape{batch, tokens, value_width()});
-        detail::profile_eval("qwen4.gdn.output_gate", normalized);
-        auto output = output_(mlx::core::astype(normalized, hidden.dtype()));
-        detail::profile_eval("qwen4.gdn.output", output);
-        return output;
+        return std::move(decoded[0]);
     }
 
     void commit_speculative() noexcept override {
@@ -1861,7 +1774,9 @@ public:
             throw std::runtime_error(
                 "Qwen4 GDN has no speculative rollback state");
         }
-        auto restored = replay_gated_delta_speculative_prefix(
+        auto restored = !detail::component_profile_active()
+            ? compiled_replay_(*rollback_, accepted_tokens)
+            : replay_gated_delta_speculative_prefix(
             *rollback_,
             accepted_tokens,
             convolution_weight_,
@@ -1906,7 +1821,135 @@ private:
           dt_bias_(std::move(dt_bias)),
           decay_scale_(-mlx::core::exp(a_log) * array(1.0f)),
           output_norm_(std::move(output_norm)),
-          output_(std::move(output)) {}
+          output_(std::move(output)) {
+        compiled_decode_ = mlx::core::compile(
+            [this](const std::vector<array>& inputs) {
+                return decode_step(inputs);
+            });
+        compiled_batch_step_ = mlx::core::compile(
+            [this](const std::vector<array>& inputs) {
+                return batch_step(inputs);
+            });
+        compiled_replay_ = compile_gated_delta_speculative_replay(
+            convolution_weight_,
+            static_cast<int>(config_.linear_num_key_heads),
+            static_cast<int>(config_.linear_num_value_heads),
+            static_cast<int>(config_.linear_key_head_dim),
+            static_cast<int>(config_.linear_value_head_dim),
+            std::nullopt, 1e-6f, true);
+    }
+
+    std::vector<array> decode_step(const std::vector<array>& inputs) {
+        auto projections = input_projections_(inputs[0]);
+        auto qkv = mlx::core::split(
+            projections.at(0), Shape{2 * key_width()}, -1);
+        detail::profile_eval("qwen4.gdn.qkv", projections[0]);
+        detail::profile_eval("qwen4.gdn.gate", projections[1]);
+        const Shape gates{1, 1, static_cast<int>(config_.linear_num_value_heads)};
+        auto decoded = gated_delta_decode_step(
+            qkv[0], qkv[1], projections[1],
+            mlx::core::reshape(projections[2], gates),
+            mlx::core::reshape(projections[3], gates),
+            inputs[1], inputs[2], convolution_weight_, dt_bias_, decay_scale_,
+            output_norm_.weight(),
+            static_cast<int>(config_.linear_num_key_heads),
+            static_cast<int>(config_.linear_num_value_heads),
+            static_cast<int>(config_.linear_value_head_dim),
+            1e-6f, output_norm_.eps(), config_.output_gate_silu);
+        detail::profile_eval("qwen4.gdn.decode_step",
+            {decoded.output, decoded.convolution_state, decoded.recurrent_state});
+        auto output = output_(mlx::core::astype(decoded.output, inputs[0].dtype()));
+        detail::profile_eval("qwen4.gdn.output", output);
+        return {std::move(output), std::move(decoded.convolution_state),
+            std::move(decoded.recurrent_state)};
+    }
+
+    std::vector<array> batch_step(const std::vector<array>& inputs) {
+        const auto& hidden = inputs[0];
+        const int batch = hidden.shape(0);
+        const int tokens = hidden.shape(1);
+        auto input_projections = input_projections_(hidden);
+        if (input_projections.size() != 4) {
+            throw std::logic_error(
+                "Qwen4 GDN projection group output mismatch");
+        }
+        auto projected = std::move(input_projections[0]);
+        detail::profile_eval("qwen4.gdn.qkv", projected);
+        auto qkv_parts = mlx::core::split(
+            projected, Shape{2 * key_width()}, -1);
+        auto qk = std::move(qkv_parts.at(0));
+        auto value = std::move(qkv_parts.at(1));
+        auto z = std::move(input_projections[1]);
+        detail::profile_eval("qwen4.gdn.gate", z);
+        const Shape gate_shape{
+            batch, tokens, static_cast<int>(config_.linear_num_value_heads)};
+        auto alpha = mlx::core::reshape(input_projections[2], gate_shape);
+        auto beta = mlx::core::reshape(input_projections[3], gate_shape);
+        auto gates = gated_delta_gates(
+            alpha,
+            beta,
+            dt_bias_,
+            decay_scale_);
+        auto recurrent_gate = std::move(gates.gate);
+        auto recurrent_beta = std::move(gates.beta);
+        detail::profile_eval(
+            "qwen4.gdn.gates", {recurrent_gate, recurrent_beta});
+        auto convolved = linear_conv_qkv(
+            inputs[1],
+            qk,
+            value,
+            convolution_weight_,
+            static_cast<int>(config_.linear_num_key_heads),
+            static_cast<int>(config_.linear_num_value_heads),
+            static_cast<int>(config_.linear_key_head_dim),
+            static_cast<int>(config_.linear_value_head_dim),
+            std::nullopt,
+            1e-6f);
+        detail::profile_eval(
+            "qwen4.gdn.conv",
+            {
+                convolved.query,
+                convolved.key,
+                convolved.value,
+                convolved.state,
+            });
+        auto recurrent = gated_delta_net(
+            convolved.query,
+            convolved.key,
+            convolved.value,
+            recurrent_gate,
+            recurrent_beta,
+            inputs[2],
+            true);
+        detail::profile_eval(
+            "qwen4.gdn.recurrent",
+            {recurrent.output, recurrent.state});
+        auto normalized = output_norm_(recurrent.output);
+        auto output_gate = mlx::core::astype(
+            mlx::core::transpose(
+                mlx::core::reshape(
+                    z,
+                    Shape{
+                        batch,
+                        tokens,
+                        static_cast<int>(config_.linear_num_value_heads),
+                        static_cast<int>(config_.linear_value_head_dim),
+                    }),
+                {0, 2, 1, 3}),
+            mlx::core::float32);
+        output_gate = config_.output_gate_silu
+            ? output_gate * mlx::core::sigmoid(output_gate)
+            : mlx::core::sigmoid(output_gate);
+        normalized = normalized * output_gate;
+        normalized = mlx::core::reshape(
+            mlx::core::transpose(normalized, {0, 2, 1, 3}),
+            Shape{batch, tokens, value_width()});
+        detail::profile_eval("qwen4.gdn.output_gate", normalized);
+        auto output = output_(mlx::core::astype(normalized, hidden.dtype()));
+        detail::profile_eval("qwen4.gdn.output", output);
+        return {std::move(output), std::move(convolved.state), std::move(recurrent.state),
+            std::move(qk), std::move(value), std::move(recurrent_gate), std::move(recurrent_beta)};
+    }
 
     int key_width() const {
         return static_cast<int>(
@@ -1928,6 +1971,9 @@ private:
     array decay_scale_;
     MlxRmsNorm output_norm_;
     MlxLinear output_;
+    std::function<std::vector<array>(const std::vector<array>&)> compiled_decode_;
+    std::function<std::vector<array>(const std::vector<array>&)> compiled_batch_step_;
+    MlxGatedDeltaReplay compiled_replay_;
     std::optional<array> convolution_state_;
     std::optional<array> recurrent_state_;
     MlxResourceTelemetry resources_;
@@ -1938,6 +1984,40 @@ private:
 
 class Qwen4Qsa final : public Qwen4Attention {
 public:
+    array append_history(
+        const array& hidden,
+        const array& positions_current,
+        const array&) override {
+        const int batch = hidden.shape(0);
+        const int tokens = hidden.shape(1);
+        if (speculative_trim_ != 0)
+            throw std::runtime_error("QSA history append requires committed cache");
+        if (!cache_ || batch_ != batch) reset(batch);
+        auto projected = cache_projections_(hidden);
+        auto key = mlx::core::transpose(
+            key_norm_(mlx::core::reshape(projected.at(0),
+                Shape{batch, tokens, static_cast<int>(config_.num_key_value_heads),
+                    static_cast<int>(config_.head_dim)})), {0, 2, 1, 3});
+        key = apply_rope(key, positions_current,
+            static_cast<int>(config_.rotary_dim),
+            static_cast<float>(config_.rope_theta),
+            config_.rope_sections, config_.mrope_interleaved);
+        auto value = mlx::core::transpose(
+            mlx::core::reshape(projected.at(1),
+                Shape{batch, tokens, static_cast<int>(config_.num_key_value_heads),
+                    static_cast<int>(config_.head_dim)}), {0, 2, 1, 3});
+        const int index_begin = static_cast<int>(config_.indexer_n_heads * config_.indexer_head_dim);
+        auto raw_key = mlx::core::slice(projected.at(2),
+            Shape{0, 0, index_begin},
+            Shape{batch, tokens, index_begin + static_cast<int>(config_.indexer_head_dim)});
+        const int position = cache_->position();
+        auto cache = cache_->append(key, value);
+        auto index = index_cache_.append(raw_key);
+        if (index.second != position)
+            throw std::runtime_error("QSA history caches diverged");
+        return mlx::core::depends({cache.first}, {cache.second, index.first}).at(0);
+    }
+
     MlxQwen4LayerCacheSnapshot snapshot(bool detached) const override {
         if (!cache_ || speculative_trim_ || index_cache_.position() != cache_->position())
             throw std::runtime_error("QSA checkpoint is not committed");
@@ -2055,9 +2135,9 @@ public:
             -1);
         auto prologue = [&]() -> MlxQwen4QsaDecodePrologue {
             if (qsa_decode_prologue_enabled() &&
-                batch == 1 && tokens == 1 &&
+                batch == 1 && tokens >= 1 && tokens <= 6 &&
                 positions_current.dtype() == mlx::core::int32 &&
-                positions_current.shape() == Shape{1} &&
+                positions_current.shape() == Shape{tokens} &&
                 query_norm_.eps() == key_norm_.eps() &&
                 query_norm_.eps() == index_query_norm_.eps()) {
                 return qwen4_qsa_decode_prologue(
@@ -2285,6 +2365,9 @@ private:
               &value_,
               &index_query_key_,
           }),
+          cache_projections_(std::vector<const MlxLinear*>{
+              &key_, &value_, &index_query_key_,
+          }),
           index_query_norm_(std::move(index_query_norm)),
           index_key_norm_(std::move(index_key_norm)),
           index_cache_(maximum, static_cast<int>(config_.indexer_head_dim)),
@@ -2292,7 +2375,7 @@ private:
               (maximum +
                static_cast<int>(config_.indexer_compress_ratio) - 1) /
                   static_cast<int>(config_.indexer_compress_ratio),
-              static_cast<int>(config_.indexer_head_dim)) {}
+              static_cast<int>(config_.indexer_head_dim), mlx::core::float32) {}
 
     array pool_index_keys(
         const array& raw_keys,
@@ -2350,6 +2433,10 @@ private:
         const int complete = pooled_keys.shape(1);
         const int block_budget =
             static_cast<int>(config_.indexer_budget) / ratio;
+        if (tokens <= 6 && block_budget == 512 && complete > 512 &&
+            complete <= 32768) {
+            return qwen4_qsa_select_blocks(query, pooled_keys, query_offset, ratio);
+        }
         const int select_count = std::min(
             block_budget,
             complete);
@@ -2432,6 +2519,7 @@ private:
     MlxLinear output_;
     MlxLinear index_query_key_;
     MlxProjectionBatch input_projections_;
+    MlxProjectionBatch cache_projections_;
     MlxRmsNorm index_query_norm_;
     MlxRmsNorm index_key_norm_;
     std::unique_ptr<MlxKvCache> cache_;
@@ -2558,6 +2646,17 @@ public:
     std::optional<MlxSsdPrefetchedExpertLayer> prefetch_routed(
         std::size_t rows) const {
         return moe_.prefetch_routed(rows);
+    }
+
+    array append_history(
+        array hidden_streams,
+        const array& token_ids,
+        const array& positions_current,
+        const array& positions_full) {
+        if (ple_)
+            hidden_streams = hidden_streams + ple_->forward(hidden_streams, token_ids, true);
+        auto attention_values = attention_gr_.pre(hidden_streams);
+        return attention_->append_history(attention_values.branch, positions_current, positions_full);
     }
 
     array forward(
@@ -2741,6 +2840,71 @@ public:
         const array& token_ids,
         const MlxEmbedding& embedding,
         bool use_cache) {
+        auto input = fuse_inputs(previous_hidden, token_ids, embedding, use_cache);
+        const int batch = token_ids.shape(0);
+        const int tokens = token_ids.shape(1);
+        const int start = use_cache ? position_ : 0;
+        auto current_positions = mlx::core::arange(
+            start, start + tokens, 1, mlx::core::int32);
+        auto full_positions = mlx::core::arange(
+            0, start + tokens, 1, mlx::core::int32);
+        auto streams = layers_.at(0).forward(
+            std::move(input.streams), input.ids,
+            current_positions, full_positions, use_cache);
+        auto sample_hidden = final_mixer_.mix(streams);
+        if (use_cache) {
+            batch_ = batch;
+            position_ = start + tokens;
+        }
+        return {std::move(sample_hidden), std::move(streams)};
+    }
+
+    array append_history(
+        const array& previous_hidden,
+        const array& token_ids,
+        const MlxEmbedding& embedding) {
+        auto input = fuse_inputs(previous_hidden, token_ids, embedding, true);
+        const int tokens = token_ids.shape(1);
+        auto current_positions = mlx::core::arange(
+            position_, position_ + tokens, 1, mlx::core::int32);
+        auto full_positions = mlx::core::arange(
+            0, position_ + tokens, 1, mlx::core::int32);
+        auto anchor = layers_.at(0).append_history(
+            std::move(input.streams), input.ids, current_positions, full_positions);
+        position_ += tokens;
+        return anchor;
+    }
+
+    int cache_position() const noexcept {
+        return position_;
+    }
+
+    std::size_t cache_bytes() const noexcept {
+        std::size_t bytes = 0;
+        for (const auto& layer : layers_) bytes += layer.cache_bytes();
+        return bytes;
+    }
+
+    void trim_cache_to(int position) {
+        if (position < 0 || position > position_) {
+            throw std::runtime_error(
+                "Qwen4 predictor cache trim position is invalid");
+        }
+        for (auto& layer : layers_) layer.trim_cache_to(position);
+        position_ = position;
+    }
+
+private:
+    struct FusedInput {
+        array streams;
+        array ids;
+    };
+
+    FusedInput fuse_inputs(
+        const array& previous_hidden,
+        const array& token_ids,
+        const MlxEmbedding& embedding,
+        bool use_cache) {
         if (token_ids.ndim() != 2 || token_ids.shape(0) <= 0 ||
             token_ids.shape(1) <= 0) {
             throw std::runtime_error(
@@ -2770,7 +2934,6 @@ public:
         const int batch = token_ids.shape(0);
         const int tokens = token_ids.shape(1);
         if (use_cache && (batch_ == 0 || batch_ != batch)) reset(batch);
-        const int start = use_cache ? position_ : 0;
         auto ids = token_ids.dtype() == mlx::core::int32
             ? token_ids
             : mlx::core::astype(token_ids, mlx::core::int32);
@@ -2793,48 +2956,9 @@ public:
                 static_cast<int>(
                     config_.hc_count * config_.hidden_size),
             });
-        auto current_positions = mlx::core::arange(
-            start, start + tokens, 1, mlx::core::int32);
-        auto full_positions = mlx::core::arange(
-            0, start + tokens, 1, mlx::core::int32);
-        // Flash-Next currently ships one predictor block. Keep the depth
-        // selection explicit so additional checkpoint blocks remain a model
-        // property rather than an architecture-name switch.
-        auto& layer = layers_.at(0);
-        streams = layer.forward(
-            std::move(streams),
-            ids,
-            current_positions,
-            full_positions,
-            use_cache);
-        auto sample_hidden = final_mixer_.mix(streams);
-        if (use_cache) {
-            batch_ = batch;
-            position_ = start + tokens;
-        }
-        return {std::move(sample_hidden), std::move(streams)};
+        return {std::move(streams), std::move(ids)};
     }
 
-    int cache_position() const noexcept {
-        return position_;
-    }
-
-    std::size_t cache_bytes() const noexcept {
-        std::size_t bytes = 0;
-        for (const auto& layer : layers_) bytes += layer.cache_bytes();
-        return bytes;
-    }
-
-    void trim_cache_to(int position) {
-        if (position < 0 || position > position_) {
-            throw std::runtime_error(
-                "Qwen4 predictor cache trim position is invalid");
-        }
-        for (auto& layer : layers_) layer.trim_cache_to(position);
-        position_ = position;
-    }
-
-private:
     Qwen4Mtp(
         Qwen4Config config,
         MlxRmsNorm embedding_norm,
@@ -3200,7 +3324,7 @@ struct MlxQwen4CausalLm::Impl {
         auto full_positions = mlx::core::arange(
             0, start + tokens, 1, mlx::core::int32);
         const bool bounded_prefill = tokens > 1;
-        const bool dispatch_decode = tokens == 1 && decode_async_enabled() &&
+        const bool dispatch_decode = batch == 1 && tokens <= 6 && decode_async_enabled() &&
             !detail::component_profile_active();
         const auto dispatch_interval = static_cast<std::size_t>(decode_async_interval());
         const auto rows = static_cast<std::size_t>(batch) *
@@ -3501,7 +3625,7 @@ std::int32_t MlxQwen4CausalLm::generate(
                 if (mtp_active) {
                     mlx_prime_mtp_chunk(prefill.second, ids, impl_->last_cache_hidden,
                         [&](const array& rows, const array& shifted, int) {
-                            return impl_->mtp->forward(rows, shifted, impl_->embedding, true).sample_hidden;
+                            return impl_->mtp->append_history(rows, shifted, impl_->embedding);
                         }, static_cast<int>(offset));
                     impl_->stable_mtp_ready = true;
                 } else {
@@ -3572,11 +3696,10 @@ std::int32_t MlxQwen4CausalLm::generate(
                     [&](const array& hidden_rows,
                         const array& shifted_ids,
                         int) {
-                        return impl_->mtp->forward(
+                        return impl_->mtp->append_history(
                             hidden_rows,
                             shifted_ids,
-                            impl_->embedding,
-                            true).sample_hidden;
+                            impl_->embedding);
                     });
             }
             // The common engine owns the first sampled token as well as every
@@ -3600,18 +3723,26 @@ std::int32_t MlxQwen4CausalLm::generate(
             std::optional<array> terminal_hidden;
             std::vector<std::int32_t> terminal_ids;
             const int hidden_width = static_cast<int>(impl_->config.hc_count * impl_->config.hidden_size);
+            MlxMtpHistoryBuffer pending_history;
+            const auto fold_pending_history = [&] {
+                if (pending_history.empty()) return;
+                auto batch = pending_history.drain();
+                (void)impl_->mtp->append_history(batch.hidden, batch.token_ids, impl_->embedding);
+                predictor_history_position += batch.token_ids.shape(1);
+            };
             const auto commit_checkpoint = [&](const MlxMtpDraftContext& context, bool terminal) {
                 const int accepted = context.accepted_drafts;
                 impl_->last_cache_hidden = mlx::core::slice(*context.verified_hidden,
                     Shape{0, accepted, 0}, Shape{1, accepted + 1, hidden_width});
                 if (!prefix_cache.wants(impl_->cache_position, terminal)) return;
                 impl_->mtp->trim_cache_to(predictor_history_position);
+                fold_pending_history();
                 if (accepted > 0) {
                     auto rows = mlx::core::slice(*context.verified_hidden, Shape{0, 0, 0},
                         Shape{1, accepted, hidden_width});
                     array shifted(context.next_token_ids.begin(), Shape{1, accepted}, mlx::core::int32);
-                    auto value = impl_->mtp->forward(rows, shifted, impl_->embedding, true);
-                    value.sample_hidden.eval();
+                    auto anchor = impl_->mtp->append_history(rows, shifted, impl_->embedding);
+                    anchor.eval();
                     predictor_history_position += accepted;
                     folded_history = accepted;
                 }
@@ -3674,34 +3805,36 @@ std::int32_t MlxQwen4CausalLm::generate(
                         folded_history = 0;
                     }
                     const int committed = static_cast<int>(next_ids.size());
+                    if (context.requested_depth == 0 &&
+                        !impl_->ssd_expert_cache && !impl_->mfe_offload_cache) {
+                        pending_history.append(hidden_rows, next_ids);
+                        if (pending_history.size() >= kMlxMtpHistoryChunkSize)
+                            fold_pending_history();
+                        return;
+                    }
+                    fold_pending_history();
                     const array committed_ids(
                         next_ids.begin(),
                         Shape{1, committed},
                         mlx::core::int32);
+                    if (committed > 1) {
+                        (void)impl_->mtp->append_history(
+                            mlx::core::slice(hidden_rows, Shape{0, 0, 0},
+                                Shape{1, committed - 1, hidden_width}),
+                            mlx::core::slice(committed_ids, Shape{0, 0},
+                                Shape{1, committed - 1}),
+                            impl_->embedding);
+                    }
                     auto predictor = impl_->mtp->forward(
-                        hidden_rows,
-                        committed_ids,
+                        mlx::core::slice(hidden_rows, Shape{0, committed - 1, 0},
+                            Shape{1, committed, hidden_width}),
+                        mlx::core::slice(committed_ids, Shape{0, committed - 1},
+                            Shape{1, committed}),
                         impl_->embedding,
                         true);
                     predictor_history_position += committed;
-                    auto head_hidden = mlx::core::slice(
-                        predictor.sample_hidden,
-                        Shape{0, committed - 1, 0},
-                        Shape{
-                            1,
-                            committed,
-                            static_cast<int>(impl_->config.hidden_size),
-                        });
-                    auto chain_streams = mlx::core::slice(
-                        predictor.hidden_streams,
-                        Shape{0, committed - 1, 0},
-                        Shape{
-                            1,
-                            committed,
-                            static_cast<int>(
-                                impl_->config.hc_count *
-                                impl_->config.hidden_size),
-                        });
+                    auto head_hidden = std::move(predictor.sample_hidden);
+                    auto chain_streams = std::move(predictor.hidden_streams);
                     for (int position = 0;
                          position < context.requested_depth;
                          ++position) {

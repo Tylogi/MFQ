@@ -364,6 +364,30 @@ void test_qwen_prefix_graph(const char* fp8_path, const char* nint_path) {
             throw std::runtime_error("Flash restored checkpoint changed target tokens");
         }
     }
+    if (model.last_mtp_stats().available) {
+        const std::vector<std::int64_t> prompt{1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12};
+        auto target = MlxQwen4CausalLm::load(baseline_container, 64);
+        auto target_sampling = sampling;
+        target_sampling.enable_mtp = false;
+        std::vector<std::int64_t> expected;
+        target.generate(prompt, target_sampling, 16, [&](std::int64_t token) {
+            expected.push_back(token);
+            return true;
+        });
+        for (int depth = 1; depth <= 5; ++depth) {
+            auto draft_sampling = sampling;
+            draft_sampling.mtp_max_draft_tokens = depth;
+            std::vector<std::int64_t> actual;
+            model.generate(prompt, draft_sampling, 16, [&](std::int64_t token) {
+                actual.push_back(token);
+                return true;
+            }, {}, {}, {}, 3);
+            require(model.last_mtp_stats().used,
+                "Flash teacher-forced history test did not use MTP");
+            require(actual == expected,
+                "Flash teacher-forced MTP history changed target tokens");
+        }
+    }
     std::cout << "Flash-Next GDN/QSA/PLE/MTP prefix checkpoints passed\n";
 }
 

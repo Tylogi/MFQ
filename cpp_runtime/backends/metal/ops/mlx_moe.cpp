@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -3521,8 +3522,11 @@ array native_moe_dispatch(
 struct MfeNintDecodeConfig {
     Dtype dtype;
     Dtype shared_gate_dtype;
+    bool shared_gate_is_logits = false;
+    bool packed_gate_up = false;
     Shape stage_one_shape;
     Shape output_shape;
+    int tokens = 1;
     int routes = 0;
     int experts = 0;
     int hidden = 0;
@@ -3560,28 +3564,41 @@ std::string metal_activation_type(Dtype dtype) {
 std::string mfe_decode_kernel_name(
     const MfeNintDecodeConfig& config,
     int stage) {
-    std::ostringstream name;
-    name << "mfq_mfe_nint_decode_stage" << stage
-         << "_r" << config.routes
-         << "_e" << config.experts
-         << "_h" << config.hidden
-         << "_i" << config.intermediate
-         << "_gf" << config.gate_family_mask
-         << "_gv" << config.gate_vq_profile_mask
-         << "_df" << config.down_family_mask
-         << "_dv" << config.down_vq_profile_mask
-         << "_ggs" << config.shared_gate_group_size
-         << "_gg" << config.shared_gate_groups
-         << "_dgs" << config.shared_down_group_size
-         << "_dg" << config.shared_down_groups
-         << "_kl" << config.k_lanes
-         << "_dr" << config.down_rows_per_simd
-         << "_gt" << static_cast<int>(config.shared_gate_dtype.val());
-    name << "_gng";
-    append_nint_group_key(name, config.gate_nint_group_sizes);
-    name << "_dng";
-    append_nint_group_key(name, config.down_nint_group_sizes);
-    return name.str();
+    std::string name;
+    name.reserve(256);
+    name.append("mfq_mfe_nint_decode_stage");
+    const auto integer = [&](int value) {
+        char buffer[12];
+        const auto result = std::to_chars(buffer, buffer + sizeof(buffer), value);
+        name.append(buffer, result.ptr);
+    };
+    integer(stage);
+    for (const auto& field : std::array<std::pair<const char*, int>, 15>{{
+             {"_r", config.routes}, {"_e", config.experts},
+             {"_h", config.hidden}, {"_i", config.intermediate},
+             {"_gf", config.gate_family_mask}, {"_gv", config.gate_vq_profile_mask},
+             {"_df", config.down_family_mask}, {"_dv", config.down_vq_profile_mask},
+             {"_ggs", config.shared_gate_group_size}, {"_gg", config.shared_gate_groups},
+             {"_dgs", config.shared_down_group_size}, {"_dg", config.shared_down_groups},
+             {"_kl", config.k_lanes}, {"_dr", config.down_rows_per_simd},
+             {"_gt", static_cast<int>(config.shared_gate_dtype.val())}}}) {
+        name.append(field.first);
+        integer(field.second);
+    }
+    name.append("_gng");
+    if (config.gate_nint_group_sizes)
+        for (const auto value : *config.gate_nint_group_sizes) {
+            name.push_back('_'); integer(value);
+        }
+    name.append("_dng");
+    if (config.down_nint_group_sizes)
+        for (const auto value : *config.down_nint_group_sizes) {
+            name.push_back('_'); integer(value);
+        }
+    if (config.tokens > 1) name.append("_batch");
+    if (config.shared_gate_is_logits) name.append("_gate_logits");
+    if (config.packed_gate_up) name.append("_packed_gu");
+    return name;
 }
 
 void append_mfe_pool_arguments(std::ostringstream& source) {
@@ -3649,8 +3666,8 @@ void append_mfe_decode_constants(
         << "constexpr int EXPERTS = " << config.experts << ";\n"
         << "constexpr int OUT = "
         << (gate_up ? config.intermediate : config.hidden) << ";\n"
-        << "constexpr int MATRIX_OUT = OUT;\n"
-        << "constexpr int PROJECTIONS = " << (gate_up ? 2 : 1) << ";\n"
+        << "constexpr int MATRIX_OUT = OUT" << (gate_up && config.packed_gate_up ? " * 2" : "") << ";\n"
+        << "constexpr int PROJECTIONS = " << (gate_up && !config.packed_gate_up ? 2 : 1) << ";\n"
         << "constexpr int FUSED_SWIGLU = " << (gate_up ? 1 : 0) << ";\n"
         << "constexpr int K = "
         << (gate_up ? config.hidden : config.intermediate) << ";\n"
@@ -3681,6 +3698,37 @@ void append_mfe_decode_constants(
         << "constexpr int PACKED_EXPERT_IDS = 0;\n";
 }
 
+void append_mfe_shared_nint_decoder(
+    std::ostringstream& source,
+    const MfeNintDecodeConfig& config,
+    bool gate_up) {
+    const int group_size = gate_up
+        ? config.shared_gate_group_size : config.shared_down_group_size;
+    const int groups = gate_up
+        ? config.shared_gate_groups : config.shared_down_groups;
+    source
+        << "  uint outputs[ROWS_PER_SIMD], q_widths[ROWS_PER_SIMD];\n"
+        << "  uint q_row_byte_offsets[ROWS_PER_SIMD], q_row_bit_shifts[ROWS_PER_SIMD];\n"
+        << "  float neuron_scales[ROWS_PER_SIMD], neuron_minimums[ROWS_PER_SIMD];\n"
+        << "  for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {\n"
+        << "    uint output = min(output_base + row, uint(OUT) - 1u);\n"
+        << "    uint physical = " << (gate_up ? "projection * uint(OUT) + output" : "output") << ";\n"
+        << "    uint metadata_base = physical * 4u;\n"
+        << "    uint layout = shared_row_metadata[metadata_base];\n"
+        << "    outputs[row] = physical; q_widths[row] = layout & 15u;\n"
+        << "    q_row_byte_offsets[row] = shared_row_metadata[metadata_base + 1u];\n"
+        << "    q_row_bit_shifts[row] = layout >> 4u;\n"
+        << "    neuron_scales[row] = as_type<float>(shared_row_metadata[metadata_base + 2u]);\n"
+        << "    neuron_minimums[row] = as_type<float>(shared_row_metadata[metadata_base + 3u]);\n"
+        << "  }\n"
+        << "  device const uchar* nint_q = shared_q;\n"
+        << "  device const uchar* nint_sub_scale = shared_sub_scale;\n"
+        << "  device const uchar* nint_sub_min = shared_sub_min;\n"
+        << "  uint x_offset = " << (gate_up ? "0u" : "SHARED_OFFSET") << ";\n"
+        << "  uint q_offset = 0u, sub_offset = 0u, groups = " << groups << "u;\n"
+        << "  MFQ_MFE_NINT_CALL(" << group_size << "u);\n";
+}
+
 std::string make_mfe_nint_gate_up_source(
     const MfeNintDecodeConfig& config,
     const std::string& kernel_name) {
@@ -3707,6 +3755,13 @@ std::string make_mfe_nint_gate_up_source(
         << "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],\n"
         << "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]) {\n";
     append_mfe_decode_constants(source, config, true);
+    if (config.tokens > 1) {
+        source
+            << "uint token_row = threadgroup_position_in_grid.x;\n"
+            << "x += token_row * uint(" << config.hidden << ");\n"
+            << "expert_ids += token_row * uint(" << config.routes << ");\n"
+            << "y += token_row * uint(" << (config.routes + 1) * config.intermediate + 1 << ");\n";
+    }
     source
         << "constexpr float SWIGLU_LIMIT = 0.0f;\n"
         << "constexpr uint SIMD_GROUPS = 2u;\n"
@@ -3726,14 +3781,22 @@ std::string make_mfe_nint_gate_up_source(
         << "uint k_lane = lane & (K_LANES - 1u);\n"
         << "uint lane_group = lane / K_LANES;\n"
         << "uint simd_group = simdgroup_index_in_threadgroup;\n"
-        << "uint workgroup = threadgroup_position_in_grid.x;\n"
+        << "uint workgroup = threadgroup_position_in_grid."
+        << (config.tokens > 1 ? "y" : "x") << ";\n"
         << "if (workgroup == 0u) {\n"
-        << "  if (simd_group == 0u) {\n"
-        << "    float gate = 0.0f;\n"
-        << "    for (uint column = lane; column < uint(K); column += 32u)\n"
-        << "      gate = fma(float(x[column]), float(shared_gate_weight[column]), gate);\n"
-        << "    gate = simd_sum(gate);\n"
-        << "    if (lane == 0u) y[GATE_OFFSET] = T(gate);\n"
+        << "  if (simd_group == 0u) {\n";
+    if (config.shared_gate_is_logits) {
+        source << "    if (lane == 0u) y[GATE_OFFSET] = T(shared_gate_weight["
+               << (config.tokens > 1 ? "token_row" : "0u") << "]);\n";
+    } else {
+        source
+            << "    float gate = 0.0f;\n"
+            << "    for (uint column = lane; column < uint(K); column += 32u)\n"
+            << "      gate = fma(float(x[column]), float(shared_gate_weight[column]), gate);\n"
+            << "    gate = simd_sum(gate);\n"
+            << "    if (lane == 0u) y[GATE_OFFSET] = T(gate);\n";
+    }
+    source
         << "  }\n"
         << "  return;\n"
         << "}\n"
@@ -3741,36 +3804,9 @@ std::string make_mfe_nint_gate_up_source(
         << "  uint output_tile = workgroup - 1u;\n"
         << "  uint output_base = output_tile * ROWS_PER_TG + lane_group * ROWS_PER_SIMD;\n"
         << "  float accumulators[ROWS_PER_SIMD] = {0.0f};\n"
-        << "  uint projection = simd_group;\n"
-        << "  for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {\n"
-        << "    uint output = min(output_base + row, uint(OUT) - 1u);\n"
-        << "    uint physical = projection * uint(OUT) + output;\n"
-        << "    uint metadata_base = physical * 4u;\n"
-        << "    uint layout = shared_row_metadata[metadata_base];\n"
-        << "    uint q_width = layout & 15u;\n"
-        << "    uint q_byte_offset = shared_row_metadata[metadata_base + 1u];\n"
-        << "    uint q_bit_shift = layout >> 4u;\n"
-        << "    float neuron_scale = as_type<float>(shared_row_metadata[metadata_base + 2u]);\n"
-        << "    float neuron_minimum = as_type<float>(shared_row_metadata[metadata_base + 3u]);\n"
-        << "    for (uint group = k_lane; group < uint(" << config.shared_gate_groups
-        << "); group += K_LANES) {\n"
-        << "      uint metadata = physical * uint(" << config.shared_gate_groups << ") + group;\n"
-        << "      float scale = neuron_scale * float(shared_sub_scale[metadata]);\n"
-        << "      float minimum = neuron_minimum * float(shared_sub_min[metadata]);\n"
-        << "      uint column_base = group * uint(" << config.shared_gate_group_size << ");\n"
-        << "      for (uint element = 0u; element < uint(" << config.shared_gate_group_size
-        << "); element += 4u) {\n"
-        << "        uint column = column_base + element;\n"
-        << "        float4 activation = float4(0.0f);\n"
-        << "        for (uint item = 0u; item < 4u; ++item)\n"
-        << "          if (element + item < uint(" << config.shared_gate_group_size
-        << ") && column + item < uint(K)) activation[item] = float(x[column + item]);\n"
-        << "        ushort4 quantized = mfq_moe_read_nint_row_quad(\n"
-        << "          shared_q, q_byte_offset, q_bit_shift, column, q_width);\n"
-        << "        accumulators[row] += dot(activation, scale * float4(quantized) - minimum);\n"
-        << "      }\n"
-        << "    }\n"
-        << "  }\n"
+        << "  uint projection = simd_group;\n";
+    append_mfe_shared_nint_decoder(source, config, true);
+    source
         << "  threadgroup T values[2u * ROWS_PER_PHYSICAL_SIMD];\n"
         << "  for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {\n"
         << "    float total = accumulators[row];\n"
@@ -3802,7 +3838,13 @@ std::string make_mfe_nint_gate_up_source(
         << "uint output_base = output_tile * ROWS_PER_TG + lane_group * ROWS_PER_SIMD;\n"
         << "int logical_expert = expert_ids[route];\n"
         << "int expert = logical_expert;\n";
+    if (config.packed_gate_up) {
+        source
+            << "output_base += projection * uint(OUT);\n"
+            << "projection = 0u;\n";
+    }
     source << mfe_decode_body();
+    if (config.packed_gate_up) source << "projection = simd_group;\n";
     source << mfe_swiglu_tail();
     source << "\n}\n";
     return source.str();
@@ -3832,6 +3874,14 @@ std::string make_mfe_nint_down_source(
         << "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],\n"
         << "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]) {\n";
     append_mfe_decode_constants(source, config, false);
+    if (config.tokens > 1) {
+        source
+            << "uint token_row = threadgroup_position_in_grid.x;\n"
+            << "x += token_row * uint(" << (config.routes + 1) * config.intermediate + 1 << ");\n"
+            << "expert_ids += token_row * uint(" << config.routes << ");\n"
+            << "route_weights += token_row * uint(" << config.routes << ");\n"
+            << "y += token_row * uint(" << config.hidden << ");\n";
+    }
     source
         << "constexpr uint K_LANES = uint(K_LANES_VALUE);\n"
         << "constexpr uint LANE_GROUPS = 32u / K_LANES;\n"
@@ -3848,7 +3898,8 @@ std::string make_mfe_nint_down_source(
         << "uint k_lane = lane & (K_LANES - 1u);\n"
         << "uint lane_group = lane / K_LANES;\n"
         << "uint route = simdgroup_index_in_threadgroup;\n"
-        << "uint output_tile = threadgroup_position_in_grid.x;\n"
+        << "uint output_tile = threadgroup_position_in_grid."
+        << (config.tokens > 1 ? "y" : "x") << ";\n"
         << "uint output_base = output_tile * ROWS_PER_PHYSICAL_SIMD + lane_group * ROWS_PER_SIMD;\n"
         << "threadgroup T partials[(ROUTES + 1) * ROWS_PER_PHYSICAL_SIMD];\n"
         << "if (route < uint(ROUTES)) {\n"
@@ -3866,31 +3917,9 @@ std::string make_mfe_nint_down_source(
         << "    for (uint row = 0u; row < ROWS_PER_SIMD; ++row) partials[route * ROWS_PER_PHYSICAL_SIMD + lane_group * ROWS_PER_SIMD + row] = T(0.0f);\n"
         << "  }\n"
         << "} else {\n"
-        << "  float accumulators[ROWS_PER_SIMD] = {0.0f};\n"
-        << "  for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {\n"
-        << "    uint output = min(output_base + row, uint(OUT) - 1u);\n"
-        << "    uint metadata_base = output * 4u;\n"
-        << "    uint layout = shared_row_metadata[metadata_base];\n"
-        << "    uint q_width = layout & 15u; uint q_byte_offset = shared_row_metadata[metadata_base + 1u];\n"
-        << "    uint q_bit_shift = layout >> 4u;\n"
-        << "    float neuron_scale = as_type<float>(shared_row_metadata[metadata_base + 2u]);\n"
-        << "    float neuron_minimum = as_type<float>(shared_row_metadata[metadata_base + 3u]);\n"
-        << "    for (uint group = k_lane; group < uint(" << config.shared_down_groups
-        << "); group += K_LANES) {\n"
-        << "      uint metadata = output * uint(" << config.shared_down_groups << ") + group;\n"
-        << "      float scale = neuron_scale * float(shared_sub_scale[metadata]);\n"
-        << "      float minimum = neuron_minimum * float(shared_sub_min[metadata]);\n"
-        << "      uint column_base = group * uint(" << config.shared_down_group_size << ");\n"
-        << "      for (uint element = 0u; element < uint(" << config.shared_down_group_size
-        << "); element += 4u) {\n"
-        << "        uint column = column_base + element; float4 activation = float4(0.0f);\n"
-        << "        for (uint item = 0u; item < 4u; ++item) if (element + item < uint("
-        << config.shared_down_group_size << ") && column + item < uint(K)) activation[item] = float(x[SHARED_OFFSET + column + item]);\n"
-        << "        ushort4 quantized = mfq_moe_read_nint_row_quad(shared_q, q_byte_offset, q_bit_shift, column, q_width);\n"
-        << "        accumulators[row] += dot(activation, scale * float4(quantized) - minimum);\n"
-        << "      }\n"
-        << "    }\n"
-        << "  }\n"
+        << "  float accumulators[ROWS_PER_SIMD] = {0.0f};\n";
+    append_mfe_shared_nint_decoder(source, config, false);
+    source
         << "  for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {\n"
         << "    float total = accumulators[row];\n"
         << "    for (uint offset = K_LANES >> 1; offset > 0u; offset >>= 1u) total += simd_shuffle_down(total, offset);\n"
@@ -3960,12 +3989,12 @@ public:
                 inputs[static_cast<std::size_t>(index)], index);
         }
         encoder.set_output_array(output, input_count);
+        const int workgroups = stage_ == 1
+            ? config_.stage_one_workgroups : config_.stage_two_workgroups;
         encoder.dispatch_threadgroups(
             MTL::Size(
-                stage_ == 1
-                    ? config_.stage_one_workgroups
-                    : config_.stage_two_workgroups,
-                1,
+                config_.tokens > 1 ? config_.tokens : workgroups,
+                config_.tokens > 1 ? workgroups : 1,
                 1),
             MTL::Size(
                 stage_ == 1
@@ -3983,7 +4012,8 @@ public:
         const auto* primitive =
             dynamic_cast<const MfeNintDecodePrimitive*>(&other);
         return primitive != nullptr &&
-            primitive->kernel_name_ == kernel_name_;
+            primitive->kernel_name_ == kernel_name_ &&
+            primitive->config_.tokens == config_.tokens;
     }
 
     std::vector<Shape> output_shapes(
@@ -10414,7 +10444,8 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
     const array& shared_gate_weight,
     const array& input,
     const array& expert_ids,
-    const array& route_weights) const {
+    const array& route_weights,
+    bool shared_gate_is_logits) const {
     const auto supported_impl = [](const Impl& impl, int projections) {
         return impl.native_primitive &&
             impl.projections == projections &&
@@ -10433,37 +10464,44 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
     const bool activation16 =
         input.dtype() == mlx::core::float16 ||
         input.dtype() == mlx::core::bfloat16;
-    const bool shared_gate16 =
+    const bool shared_gate_dtype_supported =
         shared_gate_weight.dtype() == mlx::core::float16 ||
-        shared_gate_weight.dtype() == mlx::core::bfloat16;
+        shared_gate_weight.dtype() == mlx::core::bfloat16 ||
+        (shared_gate_is_logits && shared_gate_weight.dtype() == mlx::core::float32);
     const int routes = expert_ids.ndim() == 2
         ? expert_ids.shape(1) : 0;
+    const int tokens = input.ndim() == 2 ? input.shape(0) : 0;
+    const bool shared_gate_shape_supported = shared_gate_is_logits
+        ? shared_gate_weight.size() == static_cast<std::size_t>(tokens)
+        : shared_gate_weight.ndim() == 2 && shared_gate_weight.shape(0) == 1 &&
+            shared_gate_weight.shape(1) == impl_->neuron_len;
+    const bool packed_gate_up = impl_->projections == 1;
+    const int intermediate = down.impl_->neuron_len;
     const bool supported = !mlx_reference_enabled() &&
         routes > 0 && routes <= 16 &&
         (routes + 1) * 32 <= 1024 &&
         impl_->experts > 0 && impl_->experts % 32 == 0 &&
         routes <= impl_->experts &&
-        supported_impl(*impl_, 2) &&
+        supported_impl(*impl_, packed_gate_up ? 1 : 2) &&
         supported_impl(*down.impl_, 1) &&
         impl_->experts == down.impl_->experts &&
         impl_->out_per_expert > 0 &&
         impl_->neuron_len > 0 &&
         down.impl_->out_per_expert == impl_->neuron_len &&
-        down.impl_->neuron_len == impl_->out_per_expert &&
-        input.ndim() == 2 && input.shape(0) == 1 &&
+        intermediate > 0 &&
+        impl_->out_per_expert == intermediate * (packed_gate_up ? 2 : 1) &&
+        tokens > 0 && tokens <= 6 &&
         input.shape(1) == impl_->neuron_len && activation16 &&
         expert_ids.dtype() == mlx::core::int32 &&
-        expert_ids.shape() == Shape{1, routes} &&
+        expert_ids.shape() == Shape{tokens, routes} &&
         route_weights.dtype() == mlx::core::float32 &&
-        route_weights.shape() == Shape{1, routes} &&
+        route_weights.shape() == Shape{tokens, routes} &&
         shared_gate_up.input_size() == impl_->neuron_len &&
-        shared_gate_up.output_size() == impl_->out_per_expert &&
-        shared_down.input_size() == impl_->out_per_expert &&
+        shared_gate_up.output_size() == intermediate &&
+        shared_down.input_size() == intermediate &&
         shared_down.output_size() == impl_->neuron_len &&
-        shared_gate_weight.ndim() == 2 &&
-        shared_gate_weight.shape(0) == 1 &&
-        shared_gate_weight.shape(1) == impl_->neuron_len &&
-        shared_gate_weight.flags().row_contiguous && shared_gate16;
+        shared_gate_shape_supported &&
+        shared_gate_weight.flags().row_contiguous && shared_gate_dtype_supported;
     if (!supported) {
         return std::nullopt;
     }
@@ -10472,11 +10510,11 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
         input.dtype() == mlx::core::float16
             ? input
             : mlx::core::astype(input, mlx::core::float16),
-        Shape{1, impl_->neuron_len}));
+        Shape{tokens, impl_->neuron_len}));
     auto ids = mlx::core::contiguous(mlx::core::reshape(
-        expert_ids, Shape{routes}));
+        expert_ids, Shape{tokens * routes}));
     auto weights = mlx::core::contiguous(mlx::core::reshape(
-        route_weights, Shape{routes}));
+        route_weights, Shape{tokens * routes}));
     auto shared_gate = mlx::core::contiguous(shared_gate_weight);
 
     const int decode_k_lanes = impl_->k_lanes_override != 0
@@ -10486,7 +10524,7 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
     const int gate_rows_per_workgroup =
         (32 / decode_k_lanes) * kGateRowsPerSimd;
     const int gate_tiles =
-        (impl_->out_per_expert + gate_rows_per_workgroup - 1) /
+        (intermediate + gate_rows_per_workgroup - 1) /
         gate_rows_per_workgroup;
     const bool mixed_decode_two_rows = apple_m5_family() &&
         down.impl_->family_mask ==
@@ -10499,17 +10537,20 @@ std::optional<array> MlxMfeWeight::decode_nint_shared(
         (down.impl_->out_per_expert + down_rows_per_workgroup - 1) /
         down_rows_per_workgroup;
     const int stage_one_width =
-        (routes + 1) * impl_->out_per_expert + 1;
+        (routes + 1) * intermediate + 1;
 
     MfeNintDecodeConfig config{
         .dtype = mlx::core::float16,
         .shared_gate_dtype = shared_gate.dtype(),
-        .stage_one_shape = Shape{stage_one_width},
-        .output_shape = Shape{1, impl_->neuron_len},
+        .shared_gate_is_logits = shared_gate_is_logits,
+        .packed_gate_up = packed_gate_up,
+        .stage_one_shape = Shape{tokens, stage_one_width},
+        .output_shape = Shape{tokens, impl_->neuron_len},
+        .tokens = tokens,
         .routes = routes,
         .experts = impl_->experts,
         .hidden = impl_->neuron_len,
-        .intermediate = impl_->out_per_expert,
+        .intermediate = intermediate,
         .descriptor_size = kDescriptorSize,
         .gate_family_mask = static_cast<int>(impl_->family_mask),
         .gate_vq_profile_mask = static_cast<int>(impl_->vq_profile_mask),

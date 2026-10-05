@@ -2644,24 +2644,29 @@ void test_two_stage_nint_shared_decode(
     int shared_group_size = 24,
     int hidden = 32,
     int intermediate = 24,
-    bool nvq3jl = false) {
+    bool nvq3jl = false,
+    int tokens = 1,
+    bool precomputed_gate = false,
+    bool packed_gate_up = false,
+    int routed_group_size = kGroupSize) {
     constexpr int experts = 32;
     constexpr int routes = 10;
     const std::vector<std::string> profiles(experts, "NINTv2");
     const auto make_fixture = [&](int output, int input, int salt) {
-        if (!nvq3jl) return make_moe_fixture(profiles, output, input, salt);
+        if (!nvq3jl && routed_group_size != 48)
+            return make_moe_fixture(profiles, output, input, salt, routed_group_size);
         std::vector<PoolFixture> pools;
         std::vector<float> dense(experts * output * input);
         for (int expert = experts - 1; expert >= 0; --expert) {
             TensorFixture tensor;
             std::string profile;
-            if ((expert + salt) % 3 != 0) {
+            if (nvq3jl && (expert + salt) % 3 != 0) {
                 auto vq = make_jsc_nvq(output, input, "NVQ3J-L", 6, 4, 10, false, 4, -1);
                 profile = vq.dtype;
                 tensor = {std::move(vq.blob), std::move(vq.dense), output, input};
             } else {
                 profile = "NINT";
-                tensor = make_nint_v2_tensor(output, input, salt + expert, 28, true);
+                tensor = make_nint_v2_tensor(output, input, salt + expert, nvq3jl ? 28 : routed_group_size, true);
             }
             std::copy(tensor.dense.begin(), tensor.dense.end(),
                 dense.begin() + expert * output * input);
@@ -2675,7 +2680,12 @@ void test_two_stage_nint_shared_decode(
     const auto down_fixture = make_fixture(hidden, intermediate, nvq3jl ? 33 : 31);
     const std::array<std::span<const std::uint8_t>, 2> gate_up_blobs{
         gate_fixture.blob, up_fixture.blob};
-    const auto gate_up = mfq::metal::MlxMfeWeight::from_projection_blobs(gate_up_blobs);
+    const auto packed_fixture = packed_gate_up
+        ? std::optional<MoeFixture>(make_fixture(intermediate * 2, hidden, 7))
+        : std::nullopt;
+    const auto gate_up = packed_fixture
+        ? mfq::metal::MlxMfeWeight::from_blob(packed_fixture->blob)
+        : mfq::metal::MlxMfeWeight::from_projection_blobs(gate_up_blobs);
     const auto down = mfq::metal::MlxMfeWeight::from_blob(
         down_fixture.blob);
 
@@ -2697,46 +2707,78 @@ void test_two_stage_nint_shared_decode(
     require(shared_gate_up.has_value(),
             "shared NINT Gate/Up pair was not fuseable");
 
-    std::vector<float> input_values(hidden);
+    std::vector<float> input_values(tokens * hidden);
     std::vector<float> shared_gate_values(hidden);
+    for (int token = 0; token < tokens; ++token) {
+        for (int column = 0; column < hidden; ++column)
+            input_values[token * hidden + column] = static_cast<float>(
+                (column * 7 + token * 11) % 23 - 11) / (nvq3jl || routed_group_size == 48 ? 1024.0f : 64.0f);
+    }
     for (int column = 0; column < hidden; ++column) {
-        input_values[column] = static_cast<float>(
-            (column * 7) % 23 - 11) / (nvq3jl ? 1024.0f : 64.0f);
         shared_gate_values[column] = static_cast<float>(
             (column * 5) % 17 - 8) / 128.0f;
     }
-    std::vector<std::int32_t> ids(routes);
-    std::iota(ids.begin(), ids.end(), 0);
-    std::vector<float> route_values(routes);
-    float route_total = 0.0f;
-    for (int route = 0; route < routes; ++route) {
-        route_values[route] = static_cast<float>(route + 1);
-        route_total += route_values[route];
+    std::vector<std::int32_t> ids(tokens * routes);
+    std::vector<float> route_values(tokens * routes);
+    for (int token = 0; token < tokens; ++token) {
+        float route_total = 0.0f;
+        for (int route = 0; route < routes; ++route) {
+            ids[token * routes + route] = (token * 7 + route) % experts;
+            route_values[token * routes + route] = static_cast<float>(route + token + 1);
+            route_total += route_values[token * routes + route];
+        }
+        for (int route = 0; route < routes; ++route)
+            route_values[token * routes + route] /= route_total;
     }
-    for (auto& value : route_values) value /= route_total;
 
     const auto input = mlx::core::astype(
-        mlx::core::array(input_values.begin(), mlx::core::Shape{1, hidden}),
+        mlx::core::array(input_values.begin(), mlx::core::Shape{tokens, hidden}),
         mlx::core::float16);
     const auto expert_ids = mlx::core::array(
-        ids.begin(), mlx::core::Shape{1, routes});
+        ids.begin(), mlx::core::Shape{tokens, routes});
     const auto route_weights = mlx::core::array(
-        route_values.begin(), mlx::core::Shape{1, routes});
+        route_values.begin(), mlx::core::Shape{tokens, routes});
     const auto shared_gate_weight = mlx::core::astype(
         mlx::core::array(
             shared_gate_values.begin(), mlx::core::Shape{1, hidden}),
         mlx::core::bfloat16);
+    auto gate_logits = mlx::core::matmul(
+        mlx::core::astype(input, mlx::core::bfloat16),
+        mlx::core::transpose(shared_gate_weight));
+    if (precomputed_gate) {
+        const auto gate_fixture = make_nint_v2_tensor(1, hidden, 67, shared_group_size, true);
+        gate_logits = mfq::metal::MlxNintWeight::from_blob(gate_fixture.blob).matmul(input);
+    }
+    const auto gate_input = precomputed_gate ? gate_logits : shared_gate_weight;
 
     auto fused = gate_up.decode_nint_shared(
         down,
         *shared_gate_up,
         shared_down,
-        shared_gate_weight,
+        gate_input,
         input,
         expert_ids,
-        route_weights);
+        route_weights,
+        precomputed_gate);
     require(fused.has_value(),
             "two-stage NINT/shared decode path was not selected");
+    if (tokens > 1) {
+        std::vector<mlx::core::array> row_outputs;
+        for (int row = 0; row < tokens; ++row) {
+            auto row_output = gate_up.decode_nint_shared(
+                down, *shared_gate_up, shared_down,
+                precomputed_gate ? mlx::core::slice(gate_logits, {row, 0}, {row + 1, 1}) : shared_gate_weight,
+                mlx::core::slice(input, {row, 0}, {row + 1, hidden}),
+                mlx::core::slice(expert_ids, {row, 0}, {row + 1, routes}),
+                mlx::core::slice(route_weights, {row, 0}, {row + 1, routes}), precomputed_gate);
+            require(row_output.has_value(), "row-wise NINT/shared decode was not selected");
+            row_outputs.push_back(*row_output);
+        }
+        const auto batched_values = evaluated_floats(*fused);
+        const auto row_values = evaluated_floats(mlx::core::concatenate(row_outputs, 0));
+        require(batched_values == row_values,
+                "batched NINT/shared decode differs from identical row-wise routes");
+    }
 
     auto routed_intermediate = gate_up.routed_swiglu(input, expert_ids);
     auto routed_output = down.routed_matmul(
@@ -2753,7 +2795,7 @@ void test_two_stage_nint_shared_decode(
                     mlx::core::Shape{fixture.rows, fixture.columns}))),
             mlx::core::float16);
     };
-    if (nvq3jl) {
+    if (nvq3jl || packed_gate_up) {
         const auto dense_routed = [&](const MoeFixture& fixture,
                                       const mlx::core::array& activation) {
             auto weights = mlx::core::take(mlx::core::array(fixture.dense.begin(),
@@ -2765,6 +2807,11 @@ void test_two_stage_nint_shared_decode(
         };
         auto gate = dense_routed(gate_fixture, input);
         auto up = dense_routed(up_fixture, input);
+        if (packed_fixture) {
+            const auto combined = dense_routed(*packed_fixture, input);
+            gate = mlx::core::slice(combined, {0, 0, 0}, {tokens, routes, intermediate});
+            up = mlx::core::slice(combined, {0, 0, intermediate}, {tokens, routes, intermediate * 2});
+        }
         auto gate_fp32 = mlx::core::astype(gate, mlx::core::float32);
         routed_intermediate = mlx::core::astype(gate_fp32 * mlx::core::sigmoid(gate_fp32)
             * mlx::core::astype(up, mlx::core::float32), mlx::core::float16);
@@ -2776,9 +2823,6 @@ void test_two_stage_nint_shared_decode(
         dense_shared_matmul(shared_up_fixture, input);
     auto shared_output = dense_shared_matmul(
         shared_down_fixture, shared_intermediate);
-    auto gate_logits = mlx::core::matmul(
-        mlx::core::astype(input, mlx::core::bfloat16),
-        mlx::core::transpose(shared_gate_weight));
     auto reference = mfq::metal::moe_weighted_reduce_shared_gate(
         routed_output,
         route_weights,
@@ -2800,6 +2844,19 @@ void test_two_stage_nint_shared_decode(
                 + " K=" + std::to_string(hidden)
                 + " intermediate=" + std::to_string(intermediate)
                 + " output=" + std::to_string(index) + ": " + error.what());
+        }
+    }
+    if (precomputed_gate) {
+        require(!gate_up.decode_nint_shared(down, *shared_gate_up, shared_down,
+            mlx::core::zeros({tokens + 1}), input, expert_ids, route_weights, true),
+            "two-stage decode accepted the wrong precomputed gate count");
+        for (const auto dtype : {mlx::core::float32, mlx::core::bfloat16}) {
+            auto output = gate_up.decode_nint_shared(down, *shared_gate_up, shared_down,
+                mlx::core::astype(gate_logits, dtype), input, expert_ids, route_weights, true);
+            require(output.has_value(), "two-stage decode rejected floating-point gate logits");
+            const auto values = evaluated_floats(*output);
+            for (std::size_t index = 0; index < values.size(); ++index)
+                require_close(values[index], reference_values[index], 3e-2f);
         }
     }
 }
@@ -6689,6 +6746,21 @@ int main(int argc, char** argv) {
         test_two_stage_nint_shared_decode(23, 65, 41);
         test_two_stage_nint_shared_decode(28, 256, 68, true);
         test_two_stage_nint_shared_decode(28, 68, 256, true);
+        for (int tokens = 2; tokens <= 6; ++tokens) {
+            test_two_stage_nint_shared_decode(23, 65, 41, false, tokens);
+            test_two_stage_nint_shared_decode(28, 256, 68, true, tokens);
+            test_two_stage_nint_shared_decode(28, 68, 256, true, tokens);
+        }
+        for (int tokens = 1; tokens <= 6; ++tokens) {
+            test_two_stage_nint_shared_decode(23, 65, 41, false, tokens, true);
+            test_two_stage_nint_shared_decode(28, 256, 68, true, tokens, true);
+            test_two_stage_nint_shared_decode(28, 68, 256, true, tokens, true);
+            test_two_stage_nint_shared_decode(23, 65, 41, false, tokens, false, true);
+            test_two_stage_nint_shared_decode(23, 65, 41, false, tokens, true, true);
+            test_two_stage_nint_shared_decode(28, 256, 68, true, tokens, true, true);
+            test_two_stage_nint_shared_decode(28, 68, 256, true, tokens, true, true);
+            test_two_stage_nint_shared_decode(48, 256, 64, false, tokens, true, true, 48);
+        }
         test_mxfp4_mfe_and_projection_offsets();
         test_mxfp4_multi_pool_native_slots();
         test_mxfp4_pair_blocks_matches_native_projections();

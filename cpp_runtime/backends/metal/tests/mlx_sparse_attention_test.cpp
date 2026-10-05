@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -34,7 +35,7 @@ mlx::core::array patterned_half(
         mlx::core::float16);
 }
 
-void test_block_gqa_matches_expanded_reference() {
+void test_block_gqa_matches_expanded_reference(float query_scale, float key_scale) {
     using namespace mlx::core;
     constexpr int batch = 1;
     constexpr int heads = 24;
@@ -50,12 +51,12 @@ void test_block_gqa_matches_expanded_reference() {
         batch * heads * queries * dimension,
         Shape{batch, heads, queries, dimension},
         37,
-        1.0f / 511.0f);
+        query_scale);
     auto key = patterned_half(
         batch * kv_heads * keys * dimension,
         Shape{batch, kv_heads, keys, dimension},
         53,
-        1.0f / 487.0f);
+        key_scale);
     auto value = patterned_half(
         batch * kv_heads * keys * dimension,
         Shape{batch, kv_heads, keys, dimension},
@@ -234,6 +235,75 @@ void test_block_gqa_decode(int block_size) {
     unsetenv("MFQ_METAL_SPARSE_GQA_DECODE_GATHER");
 }
 
+void test_block_gqa_small_m(int block_size, int inner_stride) {
+    using namespace mlx::core;
+    for (const auto dtype : {float16, bfloat16}) {
+        for (const int batch : {1, 2}) {
+            for (int rows = 1; rows <= 6; ++rows) {
+                for (const int keys : {3, 4, 17, 18, 19, 2048, 2051, 4096}) {
+                    if (rows > keys) continue;
+                    for (const int offset : {0, keys - rows}) {
+                        const int count = keys < 2048 ? 3 : 512;
+                        auto query = astype(patterned_half(
+                            batch * 24 * rows * 256, Shape{batch, 24, rows, 256},
+                            37, 1.0f / 511.0f), dtype);
+                        auto key = slice(astype(patterned_half(
+                            batch * 2 * (keys + 3) * 256 * inner_stride,
+                            Shape{batch, 2, keys + 3, 256 * inner_stride},
+                            53, 1.0f / 487.0f), dtype),
+                            Shape{0, 0, 0, 0}, Shape{batch, 2, keys, 256 * inner_stride},
+                            Shape{1, 1, 1, inner_stride});
+                        auto value = slice(transpose(astype(patterned_half(
+                            batch * (keys + 5) * 2 * 256,
+                            Shape{batch, keys + 5, 2, 256},
+                            71, 1.0f / 463.0f), dtype), {0, 2, 1, 3}),
+                            Shape{0, 0, 0, 0}, Shape{batch, 2, keys, 256});
+                        eval(key, value);
+                        std::vector<std::int32_t> ids(batch * rows * count);
+                        for (int row = 0; row < batch * rows; ++row) {
+                            for (int i = 0; i < count; ++i) {
+                                ids[row * count + i] =
+                                    ((i + row) % count) * (keys / block_size) / count;
+                            }
+                            ids[row * count] = 0;
+                            ids[row * count + count / 2] = -1;
+                            ids[(row + 1) * count - 1] = keys / block_size + 1;
+                        }
+                        array blocks(ids.begin(), Shape{batch, rows, count});
+                        setenv("MFQ_METAL_SPARSE_GQA_DECODE_GATHER", "0", 1);
+                        auto expected = mfq::metal::mlx_sparse_block_gqa_attention(
+                            query, key, value, blocks, offset, block_size);
+                        setenv("MFQ_METAL_SPARSE_GQA_DECODE_GATHER", "1", 1);
+                        auto actual = mfq::metal::mlx_sparse_block_gqa_attention(
+                            query, key, value, blocks, offset, block_size);
+                        if (actual.shape() != Shape{batch, rows, 24, 256} ||
+                            actual.dtype() != dtype) {
+                            throw std::runtime_error("sparse GQA small-M shape/dtype mismatch");
+                        }
+                        actual = astype(contiguous(actual), float32);
+                        expected = astype(contiguous(expected), float32);
+                        eval(actual, expected);
+                        float maximum = 0.0f;
+                        for (std::size_t i = 0; i < actual.size(); ++i) {
+                            const float error = std::fabs(
+                                actual.data<float>()[i] - expected.data<float>()[i]);
+                            maximum = std::max(maximum, error);
+                            if (!std::isfinite(actual.data<float>()[i]) ||
+                                !std::isfinite(expected.data<float>()[i]) || maximum > 2e-3f) {
+                                throw std::runtime_error("sparse GQA small-M mismatch: "
+                                    + std::to_string(batch) + "/" + std::to_string(rows)
+                                    + "/" + std::to_string(keys) + "/" + std::to_string(offset)
+                                    + " max=" + std::to_string(maximum));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    unsetenv("MFQ_METAL_SPARSE_GQA_DECODE_GATHER");
+}
+
 void benchmark_block_gqa_decode() {
     using namespace mlx::core;
     for (const int keys : {2051, 4096, 16387}) {
@@ -274,13 +344,92 @@ void benchmark_block_gqa_decode() {
     unsetenv("MFQ_METAL_SPARSE_GQA_DECODE_GATHER");
 }
 
+void test_indexer_topk(int width, int rows, int heads, int batch, int offset, bool tied) {
+    using namespace mlx::core;
+    std::vector<float> values(batch * rows * heads * width);
+    std::uint32_t seed = 123456789;
+    for (auto& value : values) {
+        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+        value = tied ? 0.0f : float(int(seed & 65535u) - 32768) / 32768.0f;
+    }
+    auto input = array(values.begin(), Shape{batch, rows, heads, width});
+    if (batch == 2) {
+        input = contiguous(transpose(input, {0, 2, 1, 3}));
+        input = transpose(input, {0, 2, 1, 3});
+    }
+    auto actual = mfq::metal::mlx_sparse_indexer_topk512(input, offset, 4);
+    eval(actual);
+    const auto* indices = actual.data<std::int32_t>();
+    for (int row = 0; row < batch * rows; ++row) {
+        const int active = std::min(width, (offset + row % rows + 1) / 4);
+        std::vector<int> expected(512);
+        if (active <= 512) {
+            std::iota(expected.begin(), expected.end(), 0);
+        } else {
+            std::vector<float> scores(active, 0.0f);
+            for (int index = 0; index < active; ++index)
+                for (int head = 0; head < heads; ++head)
+                    scores[index] += std::max(values[(row * heads + head) * width + index], 0.0f);
+            std::vector<int> ranked(active);
+            std::iota(ranked.begin(), ranked.end(), 0);
+            std::partial_sort(ranked.begin(), ranked.begin() + 512, ranked.end(),
+                [&](int left, int right) {
+                    return scores[left] == scores[right]
+                        ? left > right : scores[left] > scores[right];
+                });
+            std::copy_n(ranked.begin(), 512, expected.begin());
+            std::sort(expected.begin(), expected.end());
+        }
+        for (int index = 0; index < 512; ++index) {
+            if (indices[row * 512 + index] != expected[index])
+                throw std::runtime_error("sparse indexer top512 disagrees with CPU oracle");
+        }
+    }
+}
+
+void test_indexer_topk_rejects_invalid_geometry() {
+    using namespace mlx::core;
+    for (const Shape& shape : {Shape{1, 7, 4, 750}, Shape{1, 1, 4, 511},
+            Shape{1, 1, 4, 32769}, Shape{1, 4, 750}}) {
+        bool rejected = false;
+        try {
+            mfq::metal::mlx_sparse_indexer_topk512(zeros(shape), 2998, 4);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) throw std::runtime_error("sparse indexer accepted invalid shape");
+    }
+    for (auto params : {std::pair{-1, 4}, std::pair{2998, 0},
+            std::pair{std::numeric_limits<int>::max(), 4}}) {
+        bool rejected = false;
+        try {
+            mfq::metal::mlx_sparse_indexer_topk512(
+                zeros(Shape{1, 2, 4, 750}), params.first, params.second);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) throw std::runtime_error("sparse indexer accepted invalid visibility");
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         mlx::core::set_default_device(mlx::core::Device::gpu);
-        test_block_gqa_matches_expanded_reference();
-        for (int block_size : {2, 4, 8}) test_block_gqa_decode(block_size);
+        for (int rows = 1; rows <= 6; ++rows) {
+            for (int width : {513, 750, 2048, 8192, 16384, 32768}) {
+                test_indexer_topk(width, rows, 4, 1, width * 4 - rows, false);
+            }
+            test_indexer_topk(750, rows, 7, 2, 750 * 4 - rows, false);
+            test_indexer_topk(750, rows, 16, 1, 2998, true);
+            test_indexer_topk(513, rows, 4, 1, 511 * 4 - 1, false);
+        }
+        test_indexer_topk_rejects_invalid_geometry();
+        test_block_gqa_matches_expanded_reference(1.0f / 511.0f, 1.0f / 487.0f);
+        test_block_gqa_matches_expanded_reference(1.0f / 64.0f, 1.0f / 64.0f);
+        test_block_gqa_matches_expanded_reference(1.0f / 128.0f, 1.0f / 256.0f);
+        for (int block_size : {2, 4, 8}) {
+            test_block_gqa_decode(block_size);
+            test_block_gqa_small_m(block_size, 1);
+            test_block_gqa_small_m(block_size, 2);
+        }
         if (argc == 2 && std::string(argv[1]) == "--benchmark-decode") {
             benchmark_block_gqa_decode();
         }

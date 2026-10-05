@@ -189,7 +189,7 @@ public:
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
         float limit = 0.0f) const;
-    // One-row heterogeneous MoE decode in two expert Metal launches after
+    // One through six rows of heterogeneous MoE in two Metal launches after
     // routing. The first runs routed and shared Gate/Up; the second runs
     // routed and shared Down in parallel and combines them in-threadgroup.
     // Unsupported geometry returns nullopt.
@@ -200,7 +200,8 @@ public:
         const mlx::core::array& shared_gate_weight,
         const mlx::core::array& input,
         const mlx::core::array& expert_ids,
-        const mlx::core::array& route_weights) const;
+        const mlx::core::array& route_weights,
+        bool shared_gate_is_logits = false) const;
     // Decode/small-M MXFP4 fast path. For one through six tokens, project
     // every selected expert and apply its routing weight in one Metal
     // dispatch, avoiding the transient [M,routes,hidden] down-projection

@@ -1097,6 +1097,100 @@ constexpr const char* kTopkSource = R"MFQ_METAL(
     }
 )MFQ_METAL";
 
+constexpr const char* kSparseIndexerTopkSource = R"MFQ_METAL(
+    const uint tid = thread_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint row = threadgroup_position_in_grid.x;
+    const uint width = uint(params[2]), rows = uint(params[3]);
+    const uint query = row % rows;
+    const uint active = min(width, uint((params[0] + int(query) + 1) / params[1]));
+    if (active <= 512u) {
+        out[row * 512u + tid] = int(tid);
+        out[row * 512u + tid + 256u] = int(tid + 256u);
+        return;
+    }
+    threadgroup atomic_uint hist[256];
+    threadgroup uint mins[8], maxs[8], counts[8], ties[8], state[3];
+    uint values[ITEMS];
+    for (uint item = 0; item < uint(ITEMS); ++item) {
+        const uint index = tid * uint(ITEMS) + item;
+        float score = 0.0f;
+        if (index < active) {
+            for (uint head = 0; head < uint(HEADS); ++head)
+                score += max(scores[(ulong(row) * uint(HEADS) + head) * width + index], 0.0f);
+        }
+        values[item] = index < active ? as_type<uint>(score) : 0xffffffffu;
+    }
+    if (tid == 0) { state[0] = 0; state[1] = 0x7f800000u; state[2] = 512; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (;;) {
+        uint lo = 0xffffffffu, hi = 0;
+        for (uint item = 0; item < uint(ITEMS); ++item) {
+            uint key = values[item];
+            if (key >= state[0] && key <= state[1]) { lo = min(lo, key); hi = max(hi, key); }
+        }
+        lo = simd_min(lo); hi = simd_max(hi);
+        if (lane == 0) { mins[sg] = lo; maxs[sg] = hi; }
+        atomic_store_explicit(&hist[tid], 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+            uint a = lane < 8 ? mins[lane] : 0xffffffffu;
+            uint b = lane < 8 ? maxs[lane] : 0;
+            a = simd_min(a); b = simd_max(b);
+            if (lane == 0) { state[0] = a; state[1] = b; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (state[0] == state[1]) break;
+        const uint shift = uint(max(0, 24 - int(clz(state[0] ^ state[1]))));
+        for (uint item = 0; item < uint(ITEMS); ++item) {
+            uint key = values[item];
+            if (key >= state[0] && key <= state[1])
+                atomic_fetch_add_explicit(&hist[(key >> shift) & 255u], 1u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint count = atomic_load_explicit(&hist[255u - tid], memory_order_relaxed);
+        uint prefix = simd_prefix_inclusive_sum(count);
+        if (lane == 31) counts[sg] = prefix;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint group = 0; group < sg; ++group) prefix += counts[group];
+        uint rank = state[2];
+        uint base = shift == 24 ? 0u : state[0] & (0xffffffffu << (shift + 8));
+        uint next_lo = base | ((255u - tid) << shift);
+        uint next_hi = next_lo | ((1u << shift) - 1u);
+        bool selected = rank > prefix - count && rank <= prefix;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (selected) { state[0] = next_lo; state[1] = next_hi; state[2] = rank - (prefix - count); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const uint threshold = state[0];
+    const uint wanted_ties = state[2];
+    uint n_ties = 0;
+    for (uint item = 0; item < uint(ITEMS); ++item) n_ties += uint(values[item] == threshold);
+    uint tie_prefix = simd_prefix_exclusive_sum(n_ties);
+    if (lane == 31) ties[sg] = tie_prefix + n_ties;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint group = 0; group < sg; ++group) tie_prefix += ties[group];
+    uint discarded_ties = 0;
+    for (uint group = 0; group < 8; ++group) discarded_ties += ties[group];
+    discarded_ties -= wanted_ties;
+    bool selected[ITEMS];
+    uint selected_count = 0;
+    for (uint item = 0; item < uint(ITEMS); ++item) {
+        bool equal = values[item] == threshold;
+        selected[item] = values[item] != 0xffffffffu &&
+            (values[item] > threshold || (equal && tie_prefix >= discarded_ties));
+        tie_prefix += uint(equal);
+        selected_count += uint(selected[item]);
+    }
+    uint output = simd_prefix_exclusive_sum(selected_count);
+    if (lane == 31) counts[sg] = output + selected_count;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint group = 0; group < sg; ++group) output += counts[group];
+    for (uint item = 0; item < uint(ITEMS); ++item) if (selected[item])
+        out[row * 512u + output++] = int(tid * uint(ITEMS) + item);
+)MFQ_METAL";
+
 // DeepSelect-inspired exact top-512 for FP32 score tensors.
 //
 // The CUDA DeepSelect implementation keeps a moving threshold and only

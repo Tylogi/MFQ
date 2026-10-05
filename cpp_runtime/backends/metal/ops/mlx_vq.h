@@ -11,6 +11,11 @@
 
 namespace mfq::metal {
 
+namespace detail {
+std::string_view vq_gemv_metal_header() noexcept;
+std::string_view vq_gemv_metal_body() noexcept;
+}
+
 bool is_vq_dtype(std::string_view dtype) noexcept;
 
 struct VqTensorMetadata {

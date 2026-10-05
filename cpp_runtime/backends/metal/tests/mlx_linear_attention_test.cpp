@@ -8,6 +8,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <mlx/mlx.h>
@@ -495,6 +496,54 @@ void test_blocked_gdn_prefill(bool tiled_heads) {
         tiled_heads ? "blocked tiled GDN state" : "blocked GDN state");
 }
 
+void test_gdn_state_only() {
+    using namespace mlx::core;
+    const auto input = [](const Shape& shape, int multiplier, float scale) {
+        std::size_t count = 1;
+        for (int size : shape) count *= size;
+        std::vector<float> values(count);
+        for (std::size_t index = 0; index < count; ++index)
+            values[index] = static_cast<float>(static_cast<int>((index * multiplier) % 257) - 128) * scale;
+        return array(values.begin(), shape, float32);
+    };
+    for (const int dimension : {32, 64, 128}) {
+        for (const int tokens : {0, 1, 2, 3, 4, 5, 6, 67}) {
+            const Shape key_shape{2, 2, tokens, dimension};
+            const Shape value_shape{2, 4, tokens, dimension};
+            auto query = input(key_shape, 13, 0.0015f);
+            auto key = input(key_shape, 17, 0.0012f);
+            auto value = input(value_shape, 19, 0.002f);
+            if (dimension == 64) { key = astype(key, float16); value = astype(value, float16); }
+            auto state = input({2, 4, dimension, dimension}, 23, 0.0003f);
+            auto beta = sigmoid(input({2, 4, tokens}, 29, 0.002f));
+            for (const bool kda : {false, true}) {
+                auto gate = -abs(input(kda ? value_shape : Shape{2, 4, tokens}, 31, 0.003f));
+                for (const bool transposed : {false, true}) for (const bool tiled : {false, true}) {
+                    auto expected = mfq::metal::gated_delta_net(query, key, value, gate, beta, state, transposed, tiled);
+                    auto actual = mfq::metal::gated_delta_net_state(key, value, gate, beta, state, transposed, tiled);
+                    auto matches = all(equal(actual, expected.state));
+                    eval(matches);
+                    if (!matches.item<bool>()) throw std::runtime_error("state-only GDN changed recurrent state");
+                    auto second = mfq::metal::gated_delta_net_state(key, value, gate, beta, actual, transposed, tiled);
+                    auto repeated = mfq::metal::gated_delta_net(query, key, value, gate, beta, expected.state, transposed, tiled);
+                    matches = all(equal(second, repeated.state));
+                    eval(matches);
+                    if (!matches.item<bool>()) throw std::runtime_error("state-only GDN feedback changed recurrent state");
+                }
+            }
+        }
+    }
+    const auto key = input({1, 1, 3, 32}, 13, 0.0015f);
+    const auto value = input({1, 2, 3, 32}, 19, 0.002f);
+    const auto gate = full({1, 2, 3}, -0.125f, float32);
+    const auto beta = full({1, 2, 3}, 0.625f, float32);
+    auto expected = mfq::metal::gated_delta_net(key, key, value, gate, beta);
+    auto actual = mfq::metal::gated_delta_net_state(key, value, gate, beta);
+    auto matches = all(equal(actual, expected.state));
+    eval(matches);
+    if (!matches.item<bool>()) throw std::runtime_error("state-only GDN zero-initialized state differs");
+}
+
 void test_cached_depthwise_dilated_decode() {
     using namespace mlx::core;
     constexpr int batch = 1;
@@ -578,6 +627,7 @@ int main(int argc, char** argv) {
         test_cached_depthwise_dilated_decode();
         test_blocked_gdn_prefill(false);
         test_blocked_gdn_prefill(true);
+        test_gdn_state_only();
 
         const array conv_input(
             {
@@ -765,6 +815,29 @@ int main(int argc, char** argv) {
                     prefix_recurrent.state.size()),
             2e-4f,
             "speculative recurrent replay");
+
+        auto compiled_replay = mfq::metal::compile_gated_delta_speculative_replay(
+            weights, 1, 1, dimension, dimension);
+        for (int accepted = 0; accepted <= 1; ++accepted) {
+            auto expected = mfq::metal::replay_gated_delta_speculative_prefix(
+                transaction, accepted, weights, 1, 1, dimension, dimension);
+            auto actual = compiled_replay(transaction, accepted);
+            eval(expected.convolution_state, expected.recurrent_state,
+                actual.convolution_state, actual.recurrent_state);
+            if (actual.position != expected.position)
+                throw std::runtime_error("compiled recurrent replay position mismatch");
+            for (const auto& pair : {std::pair{expected.convolution_state, actual.convolution_state},
+                    std::pair{expected.recurrent_state, actual.recurrent_state}}) {
+                require_vector_close(pair.second.data<float>(),
+                    std::vector<float>(pair.first.data<float>(),
+                        pair.first.data<float>() + pair.first.size()),
+                    0.0f, "compiled recurrent replay state");
+            }
+        }
+        bool rejected_replay = false;
+        try { (void)compiled_replay(transaction, 2); }
+        catch (const std::runtime_error&) { rejected_replay = true; }
+        if (!rejected_replay) throw std::runtime_error("compiled replay accepted an invalid prefix");
 
         std::cout
             << "MFQ C++ Gated DeltaNet Metal tests passed\n";
