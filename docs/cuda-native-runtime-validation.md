@@ -167,8 +167,8 @@ RAM or above 22 GiB anonymous RAM; no run reached either threshold.
 
 The resident single-token down-projection microbenchmarks improved from
 51.08 to 42.89 microseconds and from 51.75 to 41.58 microseconds (medians of
-five 3,000-iteration runs). The SSD cache currently uses per-pool NVQ dispatch,
-so its end-to-end improvement does not include the heterogeneous NVQ speedup.
+five 3,000-iteration runs). At this stage the SSD cache used per-pool NVQ
+dispatch, so these results exclude the heterogeneous NVQ speedup.
 The exact Qwen reduction preserves separate FP32 product/add rounding before
 the final FP16 cast; it does not silently replace those operations with FMA.
 
@@ -188,17 +188,80 @@ profiler start/stop overhead when capture is enabled. After the scatter fix,
 the union of GPU kernels, copies and memsets is 1.8036 seconds, or 24.7% of
 the captured activity span. The remaining gaps include host preparation,
 dispatch and I/O; a CUDA trace alone cannot assign all of them to SSD faults.
-Useful next targets are:
+The follow-up below addresses repeated routing, grouped normalization and
+NVQ dispatch for cached weights.
 
-- Fuse Qwen gated-residual normalization and elementwise chains while
-  preserving their rounding. Decode still launches about 9,950 kernels and
-  issues about 7,470 `cudaMallocAsync` calls per token.
-- Reuse route information across gate/up/down and overlap NINT/NVQ SSD reads
-  and pinned staging with useful GPU work. The existing deferred range-read
-  path currently applies to MXFP4; mapped mixed-expert fields use synchronous
-  host copies.
-- Connect the heterogeneous NVQ dispatcher to changing cache slot maps.
-  Its resident optimization currently does not reach this SSD path.
+#### Follow-up: route reuse, grouped RMSNorm and cached NVQ dispatch
+
+Commits `db384ed8`, `8e07a077` and `7a711f87` share one route plan across
+gate/up/down, fuse native Qwen grouped RMSNorm, and initialize the existing
+heterogeneous NVQ dispatcher against GPU cache arenas. Fixed expert-to-pool
+ownership is separate from changing expert-to-slot indices; slot updates and
+invalidations travel in the same transfer batch as expert data.
+
+With the same model, prompt and 30 GiB cache, interleaved unprofiled runs
+of the previous implementation and this follow-up produced:
+
+| Variant | Decode tokens/s | Mean |
+| --- | ---: | ---: |
+| Previous implementation rerun (`85e29053`) | 4.592, 4.671 | 4.632 |
+| Follow-up (`7a711f87`) | 4.920, 4.944 | 4.932 |
+
+The follow-up is **6.5% faster than the rerun baseline mean**. Comparing with
+the older recorded 4.518 mean gives 9.2%, but the fresh comparison accounts
+for the higher baseline in this session. Candidate loading took 132.5–136.6
+seconds and prefill 8.98–9.24 seconds. Route reuse alone measured 4.687
+tokens/s in one run; this ablation was not a repeated speed estimate.
+
+Both generation runs reproduce all 33 token IDs. All 51 full-model trace
+stages remain byte-identical to the original compute baseline. Norm checks
+cover 360 dtype/shape/layout/magnitude combinations, an epsilon regression,
+and 24 graph replay cases. The fused kernel preserves the mean reduction
+tree, separate FP32 products, FP64 epsilon addition and final cast. Keeping
+epsilon in FP64 matters for small activations. The corrected F32 decode norm
+median is 5.26 microseconds versus 18.42 for the tensor chain (five 1,000-call
+runs, width 10,240 and group size 2,560).
+
+Three real gate/down projection checks use a 192 MiB cache. All 1,392 output
+comparisons pass, with 4,729–4,807 evictions per projection and no full-weight
+fallback. Disabling heterogeneous dispatch also preserves the baseline bytes.
+Ten resident fixtures cover eleven NVQ/NPQ families and widths 96–4,096.
+Their seven-row packed layout fails the SSD cache's expert-major field guard
+in both builds, so SSD validation uses the real model projections instead.
+
+The new 32-step Nsight decode capture gives:
+
+| Measurement | After parallel scatter | Follow-up |
+| --- | ---: | ---: |
+| All kernel launches | 318,389 | 268,565 |
+| NVQ kernel launches | 35,232 | 4,608 |
+| NVQ kernel time | 0.2175 s | 0.0976 s |
+| All kernel time | 1.5093 s | 1.3797 s |
+| `cudaMallocAsync` calls | 239,050 | 219,850 |
+| `cudaEventSynchronize` calls | 4,608 | 1,536 |
+| Time inside `cudaEventSynchronize` | 0.7112 s | 0.3923 s |
+| H2D bytes during decode | 6,962,423,360 | 6,968,106,992 |
+| First-to-last GPU activity span | 7.2918 s | 7.5630 s |
+
+The extra H2D bytes carry NVQ slot maps. Expert payload traffic, cache
+hits/misses and evictions are unchanged. Route readback over prefill and
+generation drops from 316,800 to 105,600 bytes. The profiled activity span
+does not reproduce the unprofiled throughput ordering; use the unprofiled
+A/B runs for speed, not the profiler timer or a single captured span.
+
+GPU activity covers 1.6751 seconds, 22.1% of the new captured span. Host
+preparation, dispatch and I/O remain the main area to investigate; this trace
+cannot separate their contributions to the gaps. Next targets are the
+remaining gated-residual elementwise chains and overlap of NINT/NVQ SSD reads
+with compute. Mixed-expert mmap fields still use synchronous host copies;
+the existing deferred read pool serves MXFP4 ranges. Strata's
+`FileExpertSource::prefetch` and POSIX `DirectFile` batch reads into bounded
+staging buffers and are useful references for extending that path.
+
+Candidate generation peaked at 21.67 GiB RSS and 2.02 GiB anonymous RAM,
+with at least 23.56 GiB system RAM available; neither guard fired. GPU use
+after prefill was 38.33 GiB. Profiling adds instrumentation memory and peaked
+at 2.95 GiB anonymous RAM.
 
 Local raw binaries, memory samples, full output comparisons and Nsight
 reports are retained under `/tmp/mfq-qwen38-perf`. The complete native build
