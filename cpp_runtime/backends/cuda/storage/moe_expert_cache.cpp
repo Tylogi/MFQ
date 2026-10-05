@@ -31,6 +31,18 @@ std::shared_ptr<MoeCachedSource> MoeExpertCache::register_range_source(
     return source;
 }
 
+std::shared_ptr<MoeCachedSource> MoeExpertCache::register_quant_range_source(
+        const std::string& name,std::shared_ptr<MoeQuantRangeSource> range,
+        int minimum_slots,int layer_id,std::string projection_role) {
+    const int id=static_cast<int>(sources_.size());
+    auto runtime=range->metadata();
+    auto source=std::make_shared<MoeCachedSource>(this,id,name,std::move(runtime),minimum_slots,
+        layer_id,std::move(projection_role),nullptr,std::move(range));
+    host_bytes_+=source->host_bytes();
+    sources_.push_back(source);
+    return source;
+}
+
 void MoeExpertCache::finalize() {
     if (finalized_) return;
     if (sources_.empty()) {
@@ -436,6 +448,8 @@ void MoeExpertCache::append_source_transfers(
                 replaced_occupied = true;
                 invalidate(*lease.replaced, lease.slot);
             }
+            std::vector<mfq_tensor_backend::Tensor> quant_fields;
+            if (source.quant_source_) quant_fields=moe_cache_fields(source.quant_source_->read_expert(expert));
             for (size_t field = 0;
                  field < cohort.bytes_per_expert.size();
                  ++field) {
@@ -444,6 +458,15 @@ void MoeExpertCache::append_source_transfers(
                 if (nbytes == 0) continue;
                 auto & gpu_field =
                     arena.fields[field];
+                if (source.quant_source_) {
+                    const auto& owned=quant_fields.at(field);
+                    if (tensor_nbytes(owned)!=nbytes || !owned.is_cpu() || !owned.is_contiguous())
+                        throw std::runtime_error("quantized expert fields exceed registered cache layout");
+                    transfers.push_back({reinterpret_cast<const std::uint8_t*>(owned.data_ptr()),
+                        reinterpret_cast<std::uint8_t*>(gpu_field.data_ptr())+static_cast<std::int64_t>(lease.slot)*nbytes,
+                        nbytes,true,nullptr,nullptr,nullptr,owned});
+                    continue;
+                }
                 if (cohort.range_store) {
                     const auto & part =
                         cohort.range_store->part(expert, field);
@@ -924,6 +947,14 @@ std::shared_ptr<MoeExpertCache> make_moe_expert_cache(
         std::int64_t bytes,
         const CudaExecutionConfig& config) {
     return std::make_shared<MoeExpertCache>(bytes, config);
+}
+
+MfeWeight cache_quant_moe_weight(const std::shared_ptr<MoeExpertCache>& cache,
+        const std::string& name,std::shared_ptr<MoeQuantRangeSource> range,
+        int minimum_slots,int layer_id,const std::string& role) {
+    auto runtime=range->metadata();
+    auto source=cache->register_quant_range_source(name,std::move(range),minimum_slots,layer_id,role);
+    return wrap_cached_moe_source(std::shared_ptr<MoeCachedSource>(cache,source.get()),runtime);
 }
 
 bool moe_expert_cache_has_sources(

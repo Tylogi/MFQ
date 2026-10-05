@@ -8,6 +8,7 @@
 #include <string>
 
 class MoeExpertCache;
+class MoeQuantRangeSource;
 struct CudaExecutionConfig;
 
 // One cache per Engine load, shared by its target and optional predictor weights.
@@ -41,3 +42,7 @@ MfeWeight cache_moe_weight(
     int layer_id,
     const std::string& projection_role,
     std::shared_ptr<mfq::cuda::MfeMxfp4ExpertStore> range_store = {});
+
+MfeWeight cache_quant_moe_weight(const std::shared_ptr<MoeExpertCache>& cache,
+    const std::string& name,std::shared_ptr<MoeQuantRangeSource> source,
+    int minimum_slots,int layer_id,const std::string& projection_role);

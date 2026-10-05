@@ -4,10 +4,14 @@
 #include "mfq/nvq_rows.h"
 
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace mfq {
+class MfeQuantRangeUnsupported : public std::runtime_error {
+public: using std::runtime_error::runtime_error;
+};
 struct MfeQuantExpert {
     std::string dtype;
     std::vector<std::uint8_t> payload;
@@ -22,6 +26,10 @@ public:
     int num_experts() const noexcept { return experts_; }
     int out_per_expert() const noexcept { return output_; }
     int neuron_len() const noexcept { return width_; }
+    std::size_t pool_count() const noexcept { return pools_.size(); }
+    const std::vector<std::int32_t>& pool_expert_ids(std::size_t pool) const { return pools_.at(pool).ids; }
+    int expert_pool(int expert) const;
+    std::uint64_t expert_values_bits(int expert) const;
     std::size_t index_nbytes() const noexcept;
     const std::string& expert_dtype(int expert) const;
     std::size_t expert_payload_nbytes(int expert) const;

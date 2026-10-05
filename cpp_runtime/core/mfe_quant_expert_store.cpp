@@ -40,8 +40,9 @@ MfeQuantExpertStore::MfeQuantExpertStore(std::size_t bytes,Read reader):read_(st
         const auto count=value<std::uint32_t>(pool_header,0),dtype_bytes=value<std::uint32_t>(pool_header,4);
         const auto bytes=value<std::uint64_t>(pool_header,8),runtime_bytes=value<std::uint64_t>(pool_header,16);
         if (!count || count>experts || count>std::numeric_limits<int>::max()/output ||
-            !dtype_bytes || dtype_bytes>32 || runtime_bytes)
+            !dtype_bytes || dtype_bytes>32)
             throw std::runtime_error("invalid mixed expert pool metadata");
+        if (runtime_bytes) throw MfeQuantRangeUnsupported("mixed expert embedded runtime fields require the full codec");
         const auto metadata=read(cursor,std::size_t(count)*4+dtype_bytes);
         cursor+=metadata.size();
         if (bytes>std::numeric_limits<std::size_t>::max() || cursor>bytes_ || bytes>bytes_-cursor)
@@ -71,7 +72,7 @@ MfeQuantExpertStore::MfeQuantExpertStore(std::size_t bytes,Read reader):read_(st
         } else if (pool.dtype=="NVQ" || pool.dtype=="NPQ") {
             pool.nvq=std::make_shared<mfq::NvqRows>(static_cast<std::size_t>(bytes),body);
             rows=pool.nvq->rows(); columns=pool.nvq->width();
-        } else throw std::runtime_error("unsupported mixed expert range dtype: "+pool.dtype);
+        } else throw MfeQuantRangeUnsupported("unsupported mixed expert range dtype: "+pool.dtype);
         if (rows!=static_cast<int>(count*output) || columns!=width_)
             throw std::runtime_error("mixed expert pool shape mismatch");
         pools_.push_back(std::move(pool)); cursor+=bytes;
@@ -106,5 +107,18 @@ std::size_t MfeQuantExpertStore::expert_payload_nbytes(int expert) const {
     const auto& owner=owners_[expert]; const auto& pool=pools_[owner.pool];
     const auto begin=std::int64_t(owner.local)*output_,end=begin+output_;
     return pool.nint ? pool.nint->row_range_nbytes(begin,end) : pool.nvq->row_range_nbytes(begin,end);
+}
+
+int MfeQuantExpertStore::expert_pool(int expert) const {
+    if (expert<0 || expert>=experts_) throw std::out_of_range("mixed expert ID");
+    return owners_[expert].pool;
+}
+
+std::uint64_t MfeQuantExpertStore::expert_values_bits(int expert) const {
+    const auto& owner=owners_.at(static_cast<std::size_t>(expert));
+    const auto& pool=pools_[owner.pool];
+    if (!pool.nint) return 0;
+    const auto begin=std::int64_t(owner.local)*output_;
+    return pool.nint->row_values_bits(begin,begin+output_);
 }
 } // namespace mfq

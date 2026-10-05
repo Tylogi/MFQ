@@ -81,6 +81,10 @@ public:
         int layer_id,
         std::string projection_role);
 
+    std::shared_ptr<MoeCachedSource> register_quant_range_source(
+        const std::string& name,std::shared_ptr<MoeQuantRangeSource> source,
+        int minimum_slots,int layer_id,std::string projection_role);
+
     MoeGpuArena * register_cohort(
             const MixedMoePool & pool,
             int out_per_expert,

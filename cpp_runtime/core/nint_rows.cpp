@@ -255,6 +255,21 @@ std::size_t NintRows::row_range_nbytes(std::int64_t begin,std::int64_t end) cons
     return bytes;
 }
 
+std::uint64_t NintRows::row_values_bits(std::int64_t begin,std::int64_t end) const {
+    if (begin<0 || end<=begin || end>rows_) throw std::out_of_range("NINT contiguous row range");
+    const auto prefix=[&](std::int64_t row) {
+        if (!adaptive_) return std::uint64_t(row)*bits_;
+        const auto& counts=row==rows_ ? q_counts_ : q_ranks_[static_cast<std::size_t>(row)/kRankStride];
+        std::uint64_t sum=0;
+        for (int cohort=0; cohort<8; ++cohort) sum+=std::uint64_t(counts[cohort])*(cohort+1);
+        if (row!=rows_)
+            for (auto index=static_cast<std::size_t>(row)-row%kRankStride; index<static_cast<std::size_t>(row); ++index)
+                sum+=selector(q_selectors_,index,3)+1;
+        return sum;
+    };
+    return (prefix(end)-prefix(begin))*groups_*group_size_;
+}
+
 void NintRows::append_row(std::int64_t row, NintRowBatch& batch) const {
     if (row < 0 || row >= rows_) throw std::out_of_range("mapped NINT row ID");
     if (batch.width_ && batch.width_ != width_) {

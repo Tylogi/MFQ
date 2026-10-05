@@ -5,6 +5,7 @@
 #include "cuda_execution.h"
 #include "moe.h"
 #include "mfe_expert_store.h"
+#include "moe_quant_range_source.h"
 #include "moe_cache_policy.h"
 #include "moe_cache_transfer.h"
 
@@ -33,6 +34,7 @@ struct MoeCacheTransfer {
     const uint8_t * mapped_source = nullptr;
     const mfq::cuda::MfeMxfp4ExpertStore * range_store = nullptr;
     const mfq::cuda::MfeMxfp4ExpertPart * range_part = nullptr;
+    mfq_tensor_backend::Tensor source_owner;
 };
 
 struct MoeCacheNewLease {

@@ -27,7 +27,8 @@ public:
             int minimum_slots,
             int layer_id,
             std::string projection_role,
-            std::shared_ptr<mfq::cuda::MfeMxfp4ExpertStore> range_store)
+            std::shared_ptr<mfq::cuda::MfeMxfp4ExpertStore> range_store,
+            std::shared_ptr<MoeQuantRangeSource> quant_source = {})
         : cache_(cache),
           id_(id),
           name_(std::move(name)),
@@ -35,6 +36,7 @@ public:
           projection_role_(std::move(projection_role)),
           cpu_(std::move(cpu)),
           range_store_(std::move(range_store)),
+          quant_source_(std::move(quant_source)),
           expert_to_cohort_(
               static_cast<size_t>(cpu_->n_experts), -1),
           expert_to_local_(
@@ -44,7 +46,41 @@ public:
                 "MoE cache source minimum slots must be positive");
         }
         cohorts_.reserve(cpu_->pools.size());
-        if (range_store_) {
+        if (quant_source_) {
+            const auto& store=quant_source_->store();
+            if (cpu_->pools.size()!=store.pool_count() || cpu_->n_experts!=store.num_experts() ||
+                cpu_->out_per_expert!=store.out_per_expert() || cpu_->neuron_len!=store.neuron_len())
+                throw std::runtime_error("quantized range cache geometry mismatch");
+            for (std::size_t index=0; index<cpu_->pools.size(); ++index) {
+                auto& pool=cpu_->pools[index];
+                auto prototype=pool;
+                prototype.local_experts=1;
+                auto layouts=moe_cache_field_layouts(prototype);
+                MoeCachedCohort cohort;
+                cohort.index=static_cast<int>(index); cohort.cpu=&pool;
+                cohort.arena=cache_->register_cohort_layout(prototype,cpu_->out_per_expert,cpu_->neuron_len,
+                    minimum_slots,pool.local_experts,std::move(layouts));
+                for (const auto& layout:cohort.arena->layouts) cohort.bytes_per_expert.push_back(layout.elements*layout.element_size);
+                cohort.mapped_fields.assign(cohort.bytes_per_expert.size(),nullptr);
+                cohort.host_map.assign(cpu_->n_experts,-1);
+                cohort.expert_to_local.assign(cpu_->n_experts,-1);
+                const auto& ids=store.pool_expert_ids(index);
+                for (std::size_t local=0; local<ids.size(); ++local) {
+                    expert_to_cohort_[ids[local]]=static_cast<int>(index);
+                    expert_to_local_[ids[local]]=static_cast<int>(local);
+                    cohort.expert_to_local[ids[local]]=static_cast<int>(local);
+                }
+                // Retain only the shared table and geometry after registration.
+                // Cache misses materialize one expert's fields through the source.
+                if (pool.family==MixedMoeFamily::Nint) {
+                    pool.nint.q_packed={}; pool.nint.row_q_bits={}; pool.nint.row_q_bit_offsets={};
+                    pool.nint.sub_scale={}; pool.nint.sub_min={}; pool.nint.neuron_scale={}; pool.nint.neuron_min={};
+                } else {
+                    pool.nvq.indices_packed={}; pool.nvq.aux_packed={}; pool.nvq.sub_scale_packed={}; pool.nvq.neuron_scale={};
+                }
+                cohorts_.push_back(std::move(cohort));
+            }
+        } else if (range_store_) {
             if (cpu_->pools.size() != 1 ||
                     cpu_->pools.front().family != MixedMoeFamily::Mxfp4 ||
                     cpu_->n_experts != range_store_->num_experts() ||
@@ -206,10 +242,11 @@ public:
     }
 
     int64_t host_bytes() const {
-        return mixed_moe_storage_bytes(*cpu_);
+        return mixed_moe_storage_bytes(*cpu_)+(quant_source_ ? quant_source_->store().index_nbytes() : 0);
     }
 
     int64_t logical_weight_bytes() const {
+        if (quant_source_) return static_cast<int64_t>(quant_source_->store().payload_nbytes());
         if (!range_store_) return host_bytes();
         return range_store_->record().nbytes >
                 static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
@@ -347,7 +384,7 @@ public:
     }
 
     bool use_full_projection(const MoeRoutePlan & route) const {
-        return !range_store_ && route.ids.size(0) > 8;
+        return !range_store_ && !quant_source_ && route.ids.size(0) > 8;
     }
 
     mfq_tensor_backend::Tensor forward(
@@ -361,6 +398,7 @@ public:
         }
         if (!cache_->prepare(
                 *this, route_experts(route), false)) {
+            if (quant_source_) return quant_source_->forward_cpu(execution,x,route);
             cache_->count_full_projection_fallback();
             auto staged = stage_fallback_runtime(execution.config);
             return staged.forward(execution, x, route);
@@ -383,6 +421,11 @@ public:
         }
         if (!cache_->prepare(
                 *this, route_experts(route), false)) {
+            if (quant_source_) {
+                if (x.scalar_type()!=mfq_tensor_backend::kFloat16)
+                    throw std::runtime_error("CPU cold route requires original f16 activation");
+                return quant_source_->forward_cpu(execution,x,route);
+            }
             cache_->count_full_projection_fallback();
             auto staged = stage_fallback_runtime(execution.config);
             return staged.forward(execution, x, route);
@@ -413,6 +456,10 @@ public:
         }
         if (!cache_->prepare(
                 *this, route_experts(route), false)) {
+            if (quant_source_) {
+                auto projected=quant_source_->forward_cpu(execution,x,route);
+                return gelu ? moe_geglu_split_cuda(projected) : moe_swiglu_split_cuda(projected);
+            }
             cache_->count_full_projection_fallback();
             auto staged = stage_fallback_runtime(execution.config);
             return staged.forward_glu_output(execution, x, route, gelu);
@@ -441,6 +488,12 @@ public:
             mfq_tensor_backend::Tensor gate_up,
             const MoeRoutePlan & route,
             double limit) {
+        if (quant_source_) {
+            auto parts=gate_up.split_with_sizes({cpu_->neuron_len,cpu_->neuron_len},-1);
+            auto gate=mfq_tensor_backend::clamp_max(parts[0],limit);
+            auto up=mfq_tensor_backend::clamp(parts[1],-limit,limit);
+            return forward(execution,(mfq_tensor_backend::silu(gate)*up).contiguous(),route);
+        }
         if (use_full_projection(route)) {
             cache_->count_full_projection_fallback();
             auto staged = stage_cpu_mixed_moe(cpu_, execution.config);
@@ -511,6 +564,7 @@ private:
     friend class MoeExpertCache;
 
     std::shared_ptr<MixedMoeRuntime> fallback_runtime() {
+        if (quant_source_) throw std::runtime_error("quantized range cache cannot stage a full projection");
         if (!range_store_) return cpu_;
         std::lock_guard<std::mutex> guard(fallback_mutex_);
         if (!fallback_cpu_) {
@@ -533,6 +587,7 @@ private:
     std::string projection_role_;
     std::shared_ptr<MixedMoeRuntime> cpu_;
     std::shared_ptr<mfq::cuda::MfeMxfp4ExpertStore> range_store_;
+    std::shared_ptr<MoeQuantRangeSource> quant_source_;
     std::mutex fallback_mutex_;
     std::shared_ptr<MixedMoeRuntime> fallback_cpu_;
     std::vector<MoeCachedCohort> cohorts_;

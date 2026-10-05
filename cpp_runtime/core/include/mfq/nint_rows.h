@@ -49,6 +49,7 @@ public:
     // Adaptive selectors and the original quantization profile are preserved.
     std::vector<std::uint8_t> slice_rows_blob(std::int64_t begin,std::int64_t end) const;
     std::size_t row_range_nbytes(std::int64_t begin,std::int64_t end) const;
+    std::uint64_t row_values_bits(std::int64_t begin,std::int64_t end) const;
 private:
     void initialize();
     const std::uint8_t* selectors(std::size_t offset, std::size_t size,

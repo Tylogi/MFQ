@@ -5,6 +5,7 @@
 #include "moe.h"
 #include "moe_expert_cache.h"
 #include "mfe_expert_store.h"
+#include "moe_quant_range_source.h"
 
 std::shared_ptr<mfq::NintRows> load_nint_row_table(
         const mfq::ModelSource& source, const std::string& name) {
@@ -30,36 +31,53 @@ MfeWeight load_mfe_gpu(
             !moe_parallel_config(execution).enabled() &&
             execution.config.moe_ssd_ranges) {
         const auto & record = require_tensor(mfq, name);
+        mfq::ModelSource::TensorReader reader;
         try {
-            auto store =
-                std::make_shared<mfq::cuda::MfeMxfp4ExpertStore>(
-                    mfq::cuda::MfqRecordRange{
-                        name,
-                        record.dtype,
-                        {},
-                        0,
-                        record.nbytes,
-                        [&mfq, name](
-                                std::uint64_t offset,
-                                std::span<std::uint8_t> destination) {
-                            mfq.read_range_into(
-                                name,
-                                offset,
-                                reinterpret_cast<std::byte*>(destination.data()),
-                                destination.size());
-                        },
-                    });
-            auto runtime = make_mxfp4_range_runtime(*store);
-            return cache_moe_weight(
-                cache,
-                name,
-                runtime,
-                std::min(
-                    execution.moe_cache_registration_min_slots,
-                    runtime->n_experts),
-                layer_id,
-                projection_role, std::move(store));
-        } catch (const mfq::cuda::MfeMxfp4Unsupported &) {
+            reader=mfq.tensor_reader(name);
+        } catch (const mfq::TensorReaderUnsupported&) {
+            // Sources without retained readers keep the existing CPU loader.
+        }
+        if (reader) {
+            try {
+                auto store =
+                    std::make_shared<mfq::cuda::MfeMxfp4ExpertStore>(
+                        mfq::cuda::MfqRecordRange{
+                            name,
+                            record.dtype,
+                            {},
+                            0,
+                            record.nbytes,
+                            [reader](
+                                    std::uint64_t offset,
+                                    std::span<std::uint8_t> destination) {
+                                reader(offset,
+                                    reinterpret_cast<std::byte*>(destination.data()),
+                                    destination.size());
+                            },
+                        });
+                auto runtime = make_mxfp4_range_runtime(*store);
+                return cache_moe_weight(
+                    cache,
+                    name,
+                    runtime,
+                    std::min(
+                        execution.moe_cache_registration_min_slots,
+                        runtime->n_experts),
+                    layer_id,
+                    projection_role, std::move(store));
+            } catch (const mfq::cuda::MfeMxfp4Unsupported &) {
+                try {
+                    auto store=std::make_shared<mfq::MfeQuantExpertStore>(record.nbytes,
+                        [reader](std::size_t offset,std::uint8_t* output,std::size_t bytes) {
+                            reader(offset,reinterpret_cast<std::byte*>(output),bytes);
+                        });
+                    const int minimum=std::min(execution.moe_cache_registration_min_slots,store->num_experts());
+                    return cache_quant_moe_weight(cache,name,std::make_shared<MoeQuantRangeSource>(std::move(store)),
+                        minimum,layer_id,projection_role);
+                } catch (const mfq::MfeQuantRangeUnsupported&) {
+                    // Other canonical pool families retain the existing CPU path.
+                }
+            }
         }
     }
     auto cpu = load_mfe_cpu(mfq, name);
@@ -181,7 +199,7 @@ void validate_load_options(
         const CudaExecutionContext& execution) {
     if (execution.tensor_parallel.enabled() ||
             execution.layer_placement.enabled() ||
-            execution.n_gpu_layers >= 0 || execution.moe_expert_cache) {
+            execution.n_gpu_layers >= 0) {
         throw std::runtime_error(
             "native attention adapter supports expert parallelism, but "
             "tensor/layer parallelism and offload require a different placement path");

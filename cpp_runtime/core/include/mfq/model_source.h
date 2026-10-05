@@ -31,6 +31,12 @@ struct TensorMetadata {
     std::uint64_t nbytes = 0;
 };
 
+// A capability refusal, distinct from invalid metadata or a failed read.
+class TensorReaderUnsupported : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 // Backend-neutral, read-only model input. Implementations normalize storage
 // names before tensors cross this boundary; CUDA and Metal only consume the
 // canonical names exposed here.
@@ -63,7 +69,7 @@ public:
     // An independently owned, bounded range reader that survives this source.
     // Packed row consumers must not fall back to reading the complete tensor.
     virtual TensorReader tensor_reader(std::string_view) const {
-        throw std::runtime_error("model source has no retained tensor range reader");
+        throw TensorReaderUnsupported("model source has no retained tensor range reader");
     }
 
     virtual const std::vector<std::string>& assets() const noexcept = 0;
