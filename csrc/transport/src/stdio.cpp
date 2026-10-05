@@ -70,8 +70,8 @@ static bool write_stdio_protocol(const json & frame) {
 
 class MfqStdioTransport final : public MfqTransport {
 public:
-    explicit MfqStdioTransport(MfqRuntimeTransportConfig config)
-        : config_(std::move(config)) {}
+    explicit MfqStdioTransport(MfqRuntimeTransportConfig value)
+        : config(std::move(value)) {}
 
     int run(const MfqScheduler & scheduler) override {
         const bool duplex = scheduler.info().duplex;
@@ -80,15 +80,15 @@ public:
                 "prepare_mfq_stdio_transport must be called before model loading");
         }
         const MfqSamplingParams sampling_defaults =
-            default_sampling_params(config_);
+            default_sampling_params(config);
         const json duplex_sampling_defaults =
-            duplex_profile_json(config_.runtime_profile.duplex);
+            duplex_profile_json(config.runtime_profile.duplex);
         const json tts_sampling_defaults =
-            tts_profile_json(config_.runtime_profile.tts);
+            tts_profile_json(config.runtime_profile.tts);
         const json chat_template_capabilities =
             chat_template_capabilities_json(
                 scheduler.chat_template_capabilities());
-        const auto& capabilities = config_.model_capabilities;
+        const auto& capabilities = config.model_capabilities;
         const json model_capabilities =
             model_capability_profile_json(capabilities);
         const bool vision_supported =
@@ -101,7 +101,7 @@ public:
             capabilities.video_input;
 
         RuntimeRequestMetrics request_metrics_store;
-        std::atomic<int64_t> active_context{config_.max_context};
+        std::atomic<int64_t> active_context{config.max_context};
         std::atomic<bool> reloading{false};
         struct RealtimeState {
             std::string channel_id;
@@ -174,8 +174,8 @@ public:
         const auto health = [&] {
             json value = {
                 {"status", reloading.load() ? "loading" : (scheduler.status().healthy ? "ok" : "unhealthy")},
-                {"model", config_.model_name},
-                {"model_type", config_.model_type},
+                {"model", config.model_name},
+                {"model_type", config.model_type},
                 {"model_capabilities", model_capabilities},
                 {"vision_supported", vision_supported},
                 {"vision_available", vision_available},
@@ -190,7 +190,7 @@ public:
                 {"sampling_defaults", sampling_params_json(sampling_defaults)},
                 {"duplex_sampling_defaults", duplex_sampling_defaults},
                 {"tts_sampling_defaults", tts_sampling_defaults},
-                {"runtime_profile_source", config_.runtime_profile.source},
+                {"runtime_profile_source", config.runtime_profile.source},
                 {"chat_template_capabilities", chat_template_capabilities},
             };
             add_runtime_metrics(value);
@@ -199,12 +199,12 @@ public:
         };
         const auto status = [&] {
             json value = request_metrics_store.snapshot(
-                config_, active_context.load(), reloading.load());
+                config, active_context.load(), reloading.load());
             value["sampling_defaults"] =
                 sampling_params_json(sampling_defaults);
             value["duplex_sampling_defaults"] = duplex_sampling_defaults;
             value["tts_sampling_defaults"] = tts_sampling_defaults;
-            value["runtime_profile_source"] = config_.runtime_profile.source;
+            value["runtime_profile_source"] = config.runtime_profile.source;
             value["chat_template_capabilities"] =
                 chat_template_capabilities;
             value["model_capabilities"] = model_capabilities;
@@ -387,8 +387,8 @@ public:
                 if (op == "models") {
                     send_result(id, {
                         {"models", json::array({{
-                            {"name", config_.model_name},
-                            {"type", config_.model_type},
+                            {"name", config.model_name},
+                            {"type", config.model_type},
                             {"capabilities", model_capabilities},
                         }})},
                     });
@@ -490,9 +490,9 @@ public:
                     try {
                         const int64_t requested = integer_field(
                             params, "context_size", active_context.load());
-                        const int64_t capacity = config_.context_capacity > 0
-                            ? config_.context_capacity
-                            : config_.max_context;
+                        const int64_t capacity = config.context_capacity > 0
+                            ? config.context_capacity
+                            : config.max_context;
                         if (requested < 1 ||
                             (capacity > 0 && requested > capacity)) {
                             throw ApiError(
@@ -510,7 +510,7 @@ public:
                         reloading.store(false);
                         send_result(id, {
                             {"status", "ok"},
-                            {"model", config_.model_name},
+                            {"model", config.model_name},
                             {"max_context", loaded},
                             {"context_capacity", capacity},
                         });
@@ -614,7 +614,7 @@ public:
                         MfqDuplexSessionParams parameters;
                         const std::string system_prompt = payload.value(
                             "system_prompt",
-                            config_.runtime_profile.duplex.system_prompt.value_or(
+                            config.runtime_profile.duplex.system_prompt.value_or(
                                 "Streaming Omni Conversation."));
 
                         if (payload.contains("reference_audio_features")) {
@@ -639,7 +639,7 @@ public:
                                 400, "invalid_request_error",
                                 "session config must be an object");
                         }
-                        const auto & defaults = config_.runtime_profile.duplex;
+                        const auto & defaults = config.runtime_profile.duplex;
                         parameters.greedy = generation_config.value(
                             "decode_mode",
                             defaults.decode_mode.value_or("sampling")) ==
@@ -669,10 +669,10 @@ public:
                             defaults.length_penalty.value_or(1.0));
                         parameters.tts_temperature = number_field(
                             generation_config, "tts_temperature",
-                            config_.runtime_profile.tts.temperature.value_or(0.8));
+                            config.runtime_profile.tts.temperature.value_or(0.8));
                         parameters.tts_repetition_penalty = number_field(
                             generation_config, "tts_repetition_penalty",
-                            config_.runtime_profile.tts.repetition_penalty.value_or(1.05));
+                            config.runtime_profile.tts.repetition_penalty.value_or(1.05));
                         if (generation_config.contains("seed")) {
                             parameters.seed = static_cast<uint64_t>(
                                 integer_field(generation_config, "seed", 0));
@@ -766,7 +766,7 @@ public:
                     step.max_new_speak_tokens = static_cast<int32_t>(
                         integer_field(
                             input, "max_new_speak_tokens",
-                            config_.runtime_profile.duplex
+                            config.runtime_profile.duplex
                                 .max_new_speak_tokens_per_chunk.value_or(20)));
                     step.force_listen = input.value("force_listen", false);
                     step.force_speak = input.value("force_speak", false);
@@ -876,7 +876,7 @@ public:
                                 for (const auto& diff : *diffs) {
                                     json delta = chat_diff_json(diff);
                                     if (delta.empty()) continue;
-                                    auto event = runtime_generation_event("delta", response_id, created, config_.model_name);
+                                    auto event = runtime_generation_event("delta", response_id, created, config.model_name);
                                     event["delta"] = std::move(delta);
                                     if (!send_event(id, std::move(event))) { completion->cancel(); break; }
                                 }
@@ -898,14 +898,14 @@ public:
                             if (stream) {
                                 auto complete = runtime_generation_event(
                                     "complete", response_id, created,
-                                    config_.model_name);
+                                    config.model_name);
                                 complete["finish_reason"] = result.finish_reason;
                                 complete["metrics"] = std::move(performance);
                                 send_event(id, std::move(complete));
                                 if (include_usage) {
                                     auto usage = runtime_generation_event(
                                         "usage", response_id, created,
-                                        config_.model_name);
+                                        config.model_name);
                                     usage["usage"] = usage_json(
                                         completion->prompt_tokens,
                                         result.completion_tokens);
@@ -913,7 +913,7 @@ public:
                                 }
                             } else {
                                 send_event(id, runtime_generation_result(
-                                    response_id, created, config_.model_name,
+                                    response_id, created, config.model_name,
                                     result,
                                     usage_json(
                                         completion->prompt_tokens,
@@ -955,7 +955,7 @@ public:
     }
 
 private:
-    MfqRuntimeTransportConfig config_;
+    MfqRuntimeTransportConfig config;
 };
 
 } // namespace

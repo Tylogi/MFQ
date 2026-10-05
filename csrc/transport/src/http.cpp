@@ -72,9 +72,18 @@ static ApiError api_error(const mfq::engine::InferenceInputError & error) {
     return ApiError(400, type, error.what(), error.field);
 }
 
-int run_mfq_http_transport(
-        const MfqHttpRuntimeTransportConfig & config,
-        const MfqScheduler & scheduler) {
+class MfqHttpTransport final : public MfqTransport {
+public:
+    explicit MfqHttpTransport(MfqHttpRuntimeTransportConfig value)
+        : config(std::move(value)) {}
+
+    int run(const MfqScheduler& scheduler) override;
+
+private:
+    MfqHttpRuntimeTransportConfig config;
+};
+
+int MfqHttpTransport::run(const MfqScheduler& scheduler) {
     const bool duplex = scheduler.info().duplex;
     if (config.port < 1 || config.port > 65535) {
         throw std::runtime_error("runtime transport port must be in [1, 65535]");
@@ -884,7 +893,7 @@ int run_mfq_http_transport(
             res.set_chunked_content_provider(
                 "text/event-stream; charset=utf-8",
                 [sampling, stream, include_usage, id, created, &scheduler,
-                 &config, active_request, completion]
+                 this, active_request, completion]
                 (size_t offset, httplib::DataSink & sink) mutable -> bool {
                     if (offset != 0) {
                         sink.done();
@@ -973,19 +982,6 @@ int run_mfq_http_transport(
     }
     return 0;
 }
-
-class MfqHttpTransport final : public MfqTransport {
-public:
-    explicit MfqHttpTransport(MfqHttpRuntimeTransportConfig config)
-        : config_(std::move(config)) {}
-
-    int run(const MfqScheduler & scheduler) override {
-        return run_mfq_http_transport(config_, scheduler);
-    }
-
-private:
-    MfqHttpRuntimeTransportConfig config_;
-};
 
 } // namespace
 
