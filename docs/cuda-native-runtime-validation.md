@@ -280,6 +280,90 @@ mfq-diagnostics --model model.mfq --check-engine-isolation
 The continuous-batching gate covers stable slot retirement, paged-KV reuse and
 release, CUDA Graph capture/replay, callback cancellation, and prefix reuse.
 
+#### Follow-up: sustained decode bottleneck and speed ceiling
+
+The 32-step measurements above include a cold expert cache, so they understate
+sustained decode throughput. A longer run used the same model, prompt, corrected
+MTP-disabled config and binary, with context capacity 256 and 99 timed decode
+steps. Its generated prefix matches the 32-step runs. Physical read traffic was
+sampled from `/proc/<pid>/io` every 0.5 seconds; phase totals below interpolate
+the samples at the runtime's load, prefill and decode boundaries.
+
+| Expert cache | Timed window | Decode tokens/s | Time/token |
+| --- | --- | ---: | ---: |
+| 30 GiB | First 32 steps, mean of two cold runs | 4.932 | 202.8 ms |
+| 30 GiB | Complete 99-step run | 6.199 | 161.3 ms |
+| 30 GiB | Last 67 steps, inferred from the matching prefix | 7.067 | 141.5 ms |
+| 36 GiB | Complete 99-step run | 6.347 | 157.6 ms |
+
+The last-67-step value subtracts the mean 32-step decode time from the 99-step
+time. It is a sustained-window estimate rather than per-token instrumentation.
+For this prompt, the unchanged 30 GiB path therefore settles near 7 tokens/s;
+the 4.932 tokens/s result describes its cold-cache window.
+Increasing the cache budget by 20% improved the complete run by only 2.4%.
+It reduced recorded evictions from 1,236 to 27, but misses only fell from
+30,590 to 30,296 and H2D traffic from 25.885 GB to 25.534 GB. The 36 GiB run
+left 3.04 GiB free after prefill, so further cache growth also leaves little
+room for larger contexts. Cache size is not the primary limiter for this
+workload, although other prompts can have different expert locality.
+
+The two cold 32-step runs physically read 8.593 GB and 8.541 GB during decode,
+or about 267.7 MB/token. Subtracting their mean from the matching 99-step run
+gives 9.725 GB for the additional 67 steps, or 145.2 MB/token. Over the same
+window the expert cache submitted 117.5 MB/token to the GPU, recorded 1,296.8
+demand hits/token and still recorded 143.2 demand misses/token. The incremental
+window took 141.5 ms/token and delivered only 1.03 GB/s of physical reads.
+
+The SSD preparation path is the bottleneck. PCIe H2D copied 217.8 MB/token in
+8.97 ms/token in the 32-step CUDA trace, an effective 24.3 GB/s. The cache's
+`submit_transfers` loop instead copies
+each mixed MFE field synchronously from its file mapping into pinned staging.
+Missing pages therefore block the caller on storage. The eight-worker deferred
+range reader only serves range-backed MXFP4 fields; all runs reported zero
+range-read calls for these mixed experts.
+
+The same trace contains 5.888 seconds of gaps between GPU activities. Gaps whose
+next activity is a memcpy account for 5.557 seconds, or 94.4%. It also records
+48 `cudaEventSynchronize` calls/token for route readback. Qwen builds its route
+inside the routed-expert branch, after shared-expert computation, so neither
+route readback nor expert preparation overlaps that shared branch. The generic
+CUDA FFN already contains the required early-route and projection-bundle
+prefetch pattern.
+
+The measured CUDA work provides two useful, workload-specific ceilings:
+
+| Work retained per token | Measured time | No-idle estimate |
+| --- | ---: | ---: |
+| Kernels, copies and memsets | 52.35 ms | 19.1 tokens/s |
+| Kernels only | 43.12 ms | 23.2 tokens/s |
+
+These are no-idle estimates for the current operations, not theoretical GPU
+limits. Reaching 19.1 tokens/s with the warm-cache traffic requires roughly
+2.8 GB/s of effective expert reads and enough overlap to hide them. At 2 GB/s,
+145.2 MB/token alone imposes a 72.6 ms I/O floor, or 13.8 tokens/s before other
+unhidden work. A practical first target for parallel, overlapped reads is
+therefore 10–14 tokens/s. Approximately 20 tokens/s is the next ceiling without
+changing the current GPU work, and exceeding 23 tokens/s requires reducing that
+work as well.
+
+Within the traced GPU work, NINT is the largest named MFE family at
+13.24 ms/token; NVQ uses 3.05 ms/token and cache scatter 1.54 ms/token. Other
+kernels total 25.19 ms/token. The runtime launches about 8,393 kernels and
+performs about 6,870 `cudaMallocAsync` plus 6,829 `cudaFreeAsync` calls per
+token. CUDA Graph replay currently excludes both Flash-Next models and engines
+with an expert cache. Kernel fusion, allocator churn and NINT tuning become the
+next limits after the storage stalls are removed; optimizing them first cannot
+recover the roughly 90 ms/token currently lost above the measured GPU work.
+
+The shortest path to the next throughput tier is:
+
+1. Batch mixed-field reads through the existing bounded read pool instead of
+   faulting file mappings serially in `submit_transfers`.
+2. Build the Qwen route immediately after TopK and start route readback and
+   projection-bundle preparation before shared-expert computation.
+3. Re-profile after I/O overlap, then address NINT and the remaining launch and
+   allocation fragmentation shown by the new trace.
+
 ## Tensor and expert parallel execution
 
 The native runtime accepts either a rank count or an ordered CUDA device list.
