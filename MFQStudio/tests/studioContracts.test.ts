@@ -49,7 +49,7 @@ describe('describes studioContracts test behavior 1', () => {
   it('test_studio_handles_a_running_server_without_a_loaded_model', () => {
     const sessions = readSources('features/chat/hooks/useConversationSessions.ts');
     const runtime = readSources('app/RuntimeProvider.tsx');
-    expect(sessions).toContain('if (!selectedModel || transitioning) return');
+    expect(sessions).toContain('if (!selectedModel || generationBusy || transitioning) return');
     expect(sessions).toContain('modelAvailable');
     expect(sessions).toContain('historyLoadedId === activeId');
     expect(runtime).toContain('isRuntimeReady(status.runtime_state)');
@@ -68,7 +68,7 @@ describe('describes studioContracts test behavior 1', () => {
     expect(sessions).toContain('active.model === selectedModel');
     expect(sessions).toContain('generationBusy');
     expect(sessions).toContain('controller.abort()');
-    expect(readSources('features/chat/components/ChatPageHeader.tsx')).toContain('disabled={conversation.transitioning}');
+    expect(readSources('features/chat/components/ChatPageHeader.tsx')).toContain('disabled={busy || recoveryNeeded}');
     expect(readSources('features/chat/hooks/useChatPageState.ts')).toContain('availableModelNames.includes(value)');
     expect(API).toContain('model?: string');
   });

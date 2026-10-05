@@ -1,14 +1,16 @@
+/** Render chat sessions and guard navigation while generation recovery is pending. */
 import { useSettings } from '../../settings/SettingsProvider';
 import { Icon } from '../../../app/display';
 import { useConversationSelector } from '../state/conversationStore';
 import type { ChatPageState } from '../hooks/useChatPageState';
 import { ModelVendorMark } from '../../../app/ModelVendorMark';
 
+/** Display session selection, creation, and deletion controls. */
 export function ChatSessionSidebar({ page }: { page: ChatPageState }) {
   const { tr } = useSettings();
   const sessions = useConversationSelector((state) => state.sessions);
   const { activeId, chatSessionsOpen, selectSession, createSession, chat } = page;
-  const { busy, conversation, deleteConversation } = chat;
+  const { busy, recoveryNeeded, conversation, deleteConversation } = chat;
   return (
     <aside
       className={'chat-session-sidebar' + (chatSessionsOpen ? ' open' : '')}
@@ -19,7 +21,7 @@ export function ChatSessionSidebar({ page }: { page: ChatPageState }) {
         <button
           aria-label={tr('新建会话', 'New chat')}
           className="chat-icon-button"
-          disabled={busy || conversation.transitioning || !conversation.modelAvailable}
+          disabled={busy || recoveryNeeded || !conversation.modelAvailable}
           onClick={() => void createSession()}
           title={tr('新建会话', 'New chat')}
           type="button"
@@ -34,7 +36,7 @@ export function ChatSessionSidebar({ page }: { page: ChatPageState }) {
               <button
                 aria-current={session.id === activeId ? 'page' : undefined}
                 className="chat-session-select-button"
-                disabled={busy || conversation.transitioning}
+                disabled={busy || recoveryNeeded}
                 onClick={() => selectSession(session.id)}
                 title={session.title || tr('未命名会话', 'Untitled chat')}
                 type="button"
@@ -46,7 +48,7 @@ export function ChatSessionSidebar({ page }: { page: ChatPageState }) {
               <button
                 aria-label={tr(`删除对话：${session.title || '未命名会话'}`, `Delete chat: ${session.title || 'Untitled chat'}`)}
                 className="chat-session-delete-button"
-                disabled={busy || conversation.transitioning}
+                disabled={busy || recoveryNeeded}
                 onClick={() => void deleteConversation(session.id)}
                 title={tr('删除对话', 'Delete chat')}
                 type="button"

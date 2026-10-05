@@ -43,13 +43,14 @@ export function useChatPageState() {
 
   /** Switch historical sessions and collapse the sidebar on mobile. */
   function selectSession(id: string) {
-    if (chat.busy) return;
+    if (chat.busy || chat.recoveryNeeded) return;
     chat.conversation.selectSession(id);
     if (window.matchMedia('(max-width: 680px)').matches) setChatSessionsOpen(false);
   }
 
   /** Create a session and collapse the sidebar on mobile. */
   async function createSession() {
+    if (chat.busy || chat.recoveryNeeded) return;
     await chat.conversation.createSession(active?.mode);
     if (window.matchMedia('(max-width: 680px)').matches) setChatSessionsOpen(false);
   }
@@ -60,6 +61,7 @@ export function useChatPageState() {
   }
 
   function selectModel(value: string) {
+    if (chat.busy || chat.recoveryNeeded) return;
     if (chat.inference.availableModelNames.includes(value)) chat.inference.setSelectedModel(value);
   }
 

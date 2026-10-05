@@ -97,6 +97,17 @@ it('verifies useConversationSessions test behavior 4', async () => {
   expect(result.current.messages[0]?.id).toBe('b-message');
 });
 
+it('keeps the active session and its recovery state when navigation is blocked', async () => {
+  const create = vi.spyOn(sessionsApi, 'createSession');
+  create.mockClear();
+  const { result } = renderHook(() => useConversationSessions(true, true));
+  await waitFor(() => expect(result.current.activeId).toBe('a'));
+  act(() => result.current.selectSession('b'));
+  await act(async () => result.current.createSession());
+  expect(result.current.activeId).toBe('a');
+  expect(create).not.toHaveBeenCalled();
+});
+
 it('verifies useConversationSessions test behavior 5', async () => {
   const { result, rerender } = renderHook(({ busy }) => useConversationSessions(true, busy), {
     initialProps: { busy: true },

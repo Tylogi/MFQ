@@ -1,3 +1,4 @@
+/** Display registered datasets and evaluation results, refreshing when evaluation jobs finish. */
 import { FormEvent, useEffect, useState } from 'react';
 import { evaluationsApi } from '../../shared/api/resources/evaluations';
 import { Icon } from '../../app/display';
@@ -7,6 +8,9 @@ import { useSettings } from '../settings/SettingsProvider';
 import type { DatasetResource, EvaluationResult, EvaluationComparison } from '../../shared/api/types';
 import { toast } from '../../stores/toastStore';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
+import { useJobStore } from '../../stores/jobStore';
+
+/** Render evaluation results and reload them when a relevant background job reaches a terminal state. */
 export function EvaluationsPage() {
   const { tr } = useSettings();
   const [busy, setBusy] = useState(false);
@@ -16,6 +20,13 @@ export function EvaluationsPage() {
   };
   const [datasets, setDatasets] = useState<DatasetResource[]>([]);
   const [evaluations, setEvaluations] = useState<EvaluationResult[]>([]);
+  const finishedEvaluationJobs = useJobStore((state) => state.jobs
+    .filter((job) =>
+      (job.kind === 'evaluate.perplexity' || job.kind === 'benchmark.kernel') &&
+      ['succeeded', 'failed', 'cancelled', 'interrupted'].includes(job.status))
+    .map((job) => `${job.id}:${job.status}`)
+    .sort()
+    .join(','));
   const [selectedEvaluations, setSelectedEvaluations] = useState<string[]>([]);
   const [evaluationComparison, setEvaluationComparison] = useState<EvaluationComparison | null>(
     null,
@@ -42,7 +53,8 @@ export function EvaluationsPage() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [finishedEvaluationJobs]);
+  /** Register a dataset and reload the dataset list after the server accepts it. */
   async function registerDataset(event: FormEvent) {
     event.preventDefault();
     if (busy || !datasetDraft.name.trim() || !datasetDraft.artifact_uri.trim()) return;
@@ -62,6 +74,7 @@ export function EvaluationsPage() {
       setBusy(false);
     }
   }
+  /** Compare the selected evaluation records using the server's comparison contract. */
   async function compareSelectedEvaluations() {
     if (selectedEvaluations.length < 2 || busy) return;
     setBusy(true);

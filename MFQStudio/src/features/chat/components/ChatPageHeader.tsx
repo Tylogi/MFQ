@@ -1,3 +1,4 @@
+/** Render the active chat title, model selector, and conversation controls. */
 import { useSettings } from '../../settings/SettingsProvider';
 import { useConversationSelector } from '../state/conversationStore';
 import { Icon } from '../../../app/display';
@@ -8,13 +9,14 @@ import { useRef, useState } from 'react';
 import { Dialog } from '../../../shared/ui/Dialog';
 import { InferenceDefaultsPanel } from '../../connections/InferenceDefaultsPanel';
 
+/** Display active-session controls and prevent model changes during recovery. */
 export function ChatPageHeader({ page }: { page: ChatPageState }) {
   const { tr } = useSettings();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const settingsTrigger = useRef<HTMLButtonElement>(null);
   const messages = useConversationSelector((state) => state.messages);
   const { active, activeId, chat, chatSessionsOpen, setChatSessionsOpen, selectModel } = page;
-  const { conversation, inference, voice, busy, clearActiveConversation } = chat;
+  const { conversation, inference, voice, busy, recoveryNeeded, clearActiveConversation } = chat;
   const currentVoiceMessages = voice.voiceMessages.filter((message) => message.sessionId === activeId);
   return (
     <header className="chat-screen-header">
@@ -40,7 +42,7 @@ export function ChatPageHeader({ page }: { page: ChatPageState }) {
           {inference.availableModelNames.length > 1 ? (
             <select
               aria-label={tr('对话模型', 'Chat model')}
-              disabled={conversation.transitioning}
+              disabled={busy || recoveryNeeded}
               onChange={(event) => selectModel(event.target.value)}
               value={inference.selectedModel}
             >
@@ -80,7 +82,7 @@ export function ChatPageHeader({ page }: { page: ChatPageState }) {
         <button
           aria-label={tr('清空对话', 'Clear conversation')}
           className="chat-icon-button"
-          disabled={!conversation.conversationReady || busy || (!messages.length && !currentVoiceMessages.length)}
+          disabled={!conversation.conversationReady || busy || recoveryNeeded || (!messages.length && !currentVoiceMessages.length)}
           onClick={() => void clearActiveConversation()}
           title={tr('清空对话', 'Clear conversation')}
           type="button"

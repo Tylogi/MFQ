@@ -28,6 +28,8 @@ vi.mock('../../realtimeAudio', () => ({
     setPlayback() {}
   },
   saveVoiceClip: vi.fn(),
+  deleteVoiceClip: vi.fn().mockResolvedValue(undefined),
+  pruneVoiceClips: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../settings/SettingsProvider', () => ({

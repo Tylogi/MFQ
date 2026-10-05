@@ -66,6 +66,18 @@ export function ChatInputArea({ page }: { page: ChatPageState }) {
           </button>
         </div>
       )}
+      {conversation.error && (
+        <div className="error-banner" role="alert">
+          <span>{conversation.error}</span>
+          <button
+            aria-label={tr('关闭错误提示', 'Dismiss error')}
+            onClick={() => conversation.setError(null)}
+            type="button"
+          >
+            ×
+          </button>
+        </div>
+      )}
       <ChatComposer
         sessionId={activeId ?? 'new'}
         ready={conversation.conversationReady}

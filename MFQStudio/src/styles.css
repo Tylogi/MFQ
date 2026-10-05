@@ -1,4 +1,4 @@
-/* Load theme, shared layout, and business styles in the original cascade order without duplicate page imports.
+/* Load theme, shared layout, and business styles in the original cascade order without duplicate page imports. */
 @import './shared/styles/tokens.css';
 @import './shared/styles/base.css';
 @import './shared/styles/shell.css';

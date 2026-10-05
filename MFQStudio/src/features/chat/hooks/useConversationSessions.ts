@@ -110,16 +110,16 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
   const selectSession = useCallback(
     (id: string) => {
       const session = useConversationStore.getState().sessions.find((candidate) => candidate.id === id);
-      if (!session || transitioning) return;
+      if (!session || generationBusy || transitioning) return;
       setSelectedModel(session.model);
       setActiveId(id);
     },
-    [transitioning, setSelectedModel, setActiveId],
+    [generationBusy, transitioning, setSelectedModel, setActiveId],
   );
 /** Create a new empty session; a revision token prevents responses from a previous server polluting the current list. */
   const createSession = useCallback(
     async (mode: SessionMode = 'text') => {
-      if (!selectedModel || transitioning) return;
+      if (!selectedModel || generationBusy || transitioning) return;
       const request = version.current;
       const epoch = useConversationStore.getState().epoch;
       setTransitioning(true);
@@ -134,7 +134,7 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
         if (request === version.current) setTransitioning(false);
       }
     },
-    [selectedModel, transitioning, setSessions, setActiveId],
+    [selectedModel, generationBusy, transitioning, setSessions, setActiveId],
   );
 /** Delete the specified session; update the list and current history only while the connection remains current. */
   const deleteSession = useCallback(

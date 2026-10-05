@@ -24,6 +24,7 @@ export function ChatToolbar() {
     inference,
     voice,
     busy,
+    recoveryNeeded,
     selectInteractionMode,
     toggleVoice,
   } = useChat();
@@ -48,7 +49,7 @@ export function ChatToolbar() {
           capabilities.model_capabilities.features.full_duplex) && (
           <select
             aria-label={tr('交互模式', 'Interaction mode')}
-            disabled={!conversationReady || busy || voiceState !== 'idle'}
+            disabled={!conversationReady || busy || recoveryNeeded || voiceState !== 'idle'}
             onChange={(event) => void selectInteractionMode(event.target.value as SessionMode)}
             value={active?.mode ?? mode}
           >
@@ -73,7 +74,7 @@ export function ChatToolbar() {
           aria-label={tr('语音输入', 'Voice input')}
           aria-pressed={voiceState !== 'idle' && voiceState !== 'error'}
           className="voice-button"
-          disabled={!conversationReady || active?.mode === 'text' || busy}
+          disabled={!conversationReady || active?.mode === 'text' || busy || recoveryNeeded}
           onClick={() => void toggleVoice()}
           style={{ '--voice-level': voiceLevel } as CSSProperties}
           title={

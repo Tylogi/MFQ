@@ -46,9 +46,10 @@ function useChatDomain() {
     onSynchronized: ({ session, messages, responses }) =>
       conversationActions.applySynchronized(session, messages, responses),
   });
+  const recoveryNeeded = generation.getSnapshot().recoveryNeeded;
   const conversation = useConversationSessions(
     visited || location.pathname === '/chat',
-    isGenerationBusy(generationPhase),
+    isGenerationBusy(generationPhase) || recoveryNeeded,
   );
   const {
     active,
@@ -77,8 +78,7 @@ function useChatDomain() {
   const { mcpTools, selectedTools, error: toolsError } = useChatTools();
   const revisionRef = useRef(connectionRevision);
   revisionRef.current = connectionRevision;
-  const busy = operationBusy || isGenerationBusy(generationPhase);
-  const recoveryNeeded = generation.getSnapshot().recoveryNeeded;
+  const busy = operationBusy || conversation.transitioning || isGenerationBusy(generationPhase);
   useEffect(() => {
     generation.reset();
     setBusy(false);
@@ -98,6 +98,7 @@ function useChatDomain() {
   inferenceRef.current = inference;
   const voiceRef = voice.voiceRef;
   const setVoiceMessages = voice.setVoiceMessages;
+  const removeSessionVoiceHistory = voice.removeSessionVoiceHistory;
   const trRef = useRef(tr);
   trRef.current = tr;
 /** Build real-time configuration for the current voice connection using resolved model defaults. */
@@ -281,16 +282,16 @@ function useChatDomain() {
 /** Confirm sidebar-session deletion and remove local voice history after server-side success. */
   const deleteConversation = useCallback(async (id: string) => {
     const session = conversation.sessions.find((item) => item.id === id);
-    if (!session || busy || conversation.transitioning) return;
+    if (!session || busy || recoveryNeeded) return;
     const title = session.title || trRef.current('未命名会话', 'Untitled chat');
     if (!(await studioConfirm(trRef.current(
       `删除对话“${title}”？此操作无法撤销。`,
       `Delete "${title}"? This cannot be undone.`,
     )))) return;
     if (await conversation.deleteSession(id)) {
-      setVoiceMessages((current) => current.filter((message) => message.sessionId !== id));
+      await removeSessionVoiceHistory(id).catch((cause) => setError(errorMessage(cause)));
     }
-  }, [conversation.sessions, conversation.transitioning, conversation.deleteSession, busy, setVoiceMessages]);
+  }, [conversation.sessions, conversation.deleteSession, busy, recoveryNeeded, removeSessionVoiceHistory, setError]);
 /** Replace the old session with a new one after confirmation, also removing the associated voice history. */
   const clearActiveConversation = useCallback(async () => {
     if (
@@ -309,10 +310,9 @@ function useChatDomain() {
         replacement,
         ...current.filter((session) => session.id !== active.id),
       ]);
-      setVoiceMessages((current) =>
-        current.filter((message) => message.sessionId !== active.id),
-      );
+      const clipCleanup = removeSessionVoiceHistory(active.id);
       setActiveId(replacement.id);
+      await clipCleanup;
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -324,14 +324,14 @@ function useChatDomain() {
     recoveryNeeded,
     activeIdRef,
     setSessions,
-    setVoiceMessages,
+    removeSessionVoiceHistory,
     setActiveId,
     setError,
   ]);
 /** Stop audio before changing a session’s interaction mode, then update the session revision returned by the server. */
   const selectInteractionMode = useCallback(
     async (mode: SessionMode) => {
-      if (!active || busy || active.mode === mode) return;
+      if (!active || busy || recoveryNeeded || active.mode === mode) return;
       setBusy(true);
       try {
         await voiceRef.current?.stop();
@@ -345,15 +345,15 @@ function useChatDomain() {
         setBusy(false);
       }
     },
-    [active, busy, voiceRef, setSessions, setError],
+    [active, busy, recoveryNeeded, voiceRef, setSessions, setError],
   );
 /** Toggle microphone capture for the current session, leaving errors to the chat error area. */
   const toggleVoice = useCallback(async () => {
-    if (!active || active.mode === 'text' || !inferenceRef.current.realtimeAvailable || busy) return;
+    if (!active || active.mode === 'text' || !inferenceRef.current.realtimeAvailable || busy || recoveryNeeded) return;
     await voiceRef.current
       ?.toggleCapture(realtimeSessionConfig(active.id))
       .catch((cause) => setError(errorMessage(cause)));
-  }, [active, busy, voiceRef, realtimeSessionConfig, setError]);
+  }, [active, busy, recoveryNeeded, voiceRef, realtimeSessionConfig, setError]);
 /** Explicitly download or enable the voice component and refresh shared job state after submission. */
   const installOrEnableVoiceOutput = useCallback(async () => {
     if (voiceComponentBusy) return;

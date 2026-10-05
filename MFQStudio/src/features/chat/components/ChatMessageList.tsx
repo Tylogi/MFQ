@@ -22,7 +22,7 @@ export function ChatMessageList({ page }: { page: ChatPageState }) {
     active, activeId, chat, editDraft, setEditDraft, saveCurrentEdit,
     createSession, chooseModelDirectory, scroll,
   } = page;
-  const { voice, generation, inference, messageActions, busy } = chat;
+  const { voice, generation, inference, messageActions, busy, recoveryNeeded } = chat;
   const currentVoiceMessages = voice.voiceMessages.filter((message) => message.sessionId === activeId);
   const live = generation.getSnapshot().live;
   return (
@@ -49,7 +49,7 @@ export function ChatMessageList({ page }: { page: ChatPageState }) {
               <>
                 <h1>{tr('开始对话', 'Start a conversation')}</h1>
                 <p>{tr('连接到当前配置的 MFQ 服务。', 'Connected to your configured MFQ service.')}</p>
-                <button className="open-model-primary" disabled={busy} onClick={() => void createSession()} type="button">
+                <button className="open-model-primary" disabled={busy || recoveryNeeded} onClick={() => void createSession()} type="button">
                   {tr('开始对话', 'Start chat')}
                 </button>
               </>

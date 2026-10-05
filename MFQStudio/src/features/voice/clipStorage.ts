@@ -36,3 +36,31 @@ export async function loadVoiceClip(id: string): Promise<Blob | null> {
     request.onerror = () => reject(request.error);
   });
 }
+
+/** Delete a cached clip after the IndexedDB transaction commits. */
+export async function deleteVoiceClip(id: string): Promise<void> {
+  const database = await audioDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(AUDIO_STORE, 'readwrite');
+    transaction.objectStore(AUDIO_STORE).delete(id);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+}
+
+/** Remove clips absent from retained voice history, including orphans left by earlier versions. */
+export async function pruneVoiceClips(retainedIds: ReadonlySet<string>): Promise<void> {
+  const database = await audioDatabase();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = database.transaction(AUDIO_STORE, 'readwrite');
+    const store = transaction.objectStore(AUDIO_STORE);
+    const request = store.getAllKeys();
+    request.onsuccess = () => {
+      for (const key of request.result) {
+        if (!retainedIds.has(String(key))) store.delete(key);
+      }
+    };
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+}

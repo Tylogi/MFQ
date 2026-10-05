@@ -14,6 +14,7 @@ const SPEECH_START_SAMPLES = Math.round(INPUT_RATE * 0.08);
 const SPEECH_END_SAMPLES = Math.round(INPUT_RATE * 0.7);
 const SPEECH_PREROLL_SAMPLES = Math.round(INPUT_RATE * 0.25);
 const MIN_USER_TURN_SAMPLES = Math.round(INPUT_RATE * 0.12);
+const SESSION_READY_TIMEOUT_MS = 10_000;
 /** Manage the real-time voice WebSocket, microphone capture, turn ownership, and audio playback lifecycle. */
 export class RealtimeAudioController {
   private socket: WebSocket | null = null;
@@ -38,6 +39,7 @@ export class RealtimeAudioController {
   private responseDrainSteps = 0;
   private currentStepWasListen = false;
   private sessionReady = false;
+  private readyWaiters = new Set<{ resolve: () => void; reject: (error: Error) => void }>();
   private clientSessionId: string | null = null;
   private stopping = false;
   private stopPromise: Promise<void> | null = null;
@@ -95,9 +97,42 @@ export class RealtimeAudioController {
   /** Submit non-empty text after connecting a real-time session without starting the microphone. */
   async submitText(value: string, config: RealtimeSessionConfig): Promise<void> {
     const text = value.trim();
-    if (!text || this.awaitingHalfDuplexResponse) return;
+    if (!text) return;
+    if (this.awaitingHalfDuplexResponse)
+      throw new Error('Wait for the current voice response before sending text');
     await this.connect(config, false);
+    await this.waitForSessionReady();
     this.sendText(text);
+  }
+
+  /** Wait for the server's session.created event and reject when the connection cannot accept text. */
+  private waitForSessionReady(): Promise<void> {
+    if (this.socket?.readyState === WebSocket.OPEN && this.sessionReady) return Promise.resolve();
+    if (!this.socket) return Promise.reject(new Error('Voice connection failed'));
+    return new Promise<void>((resolve, reject) => {
+      const waiter = {
+        resolve: () => {
+          clearTimeout(timer);
+          this.readyWaiters.delete(waiter);
+          resolve();
+        },
+        reject: (error: Error) => {
+          clearTimeout(timer);
+          this.readyWaiters.delete(waiter);
+          reject(error);
+        },
+      };
+      const timer = setTimeout(() => {
+        waiter.reject(new Error('Voice connection timed out'));
+        void this.stop(false);
+      }, SESSION_READY_TIMEOUT_MS);
+      this.readyWaiters.add(waiter);
+    });
+  }
+
+  /** Reject every text submission waiting for a session handshake. */
+  private rejectReadyWaiters(error: Error): void {
+    for (const waiter of [...this.readyWaiters]) waiter.reject(error);
   }
 
   private async connect(config: RealtimeSessionConfig, capture: boolean): Promise<void> {
@@ -130,12 +165,13 @@ export class RealtimeAudioController {
           this.fail(error);
         }
       };
-      socket.onerror = () => this.callbacks.onError("Voice connection failed");
+      socket.onerror = () => this.fail(new Error('Voice connection failed'));
       socket.onclose = () => {
         if (!this.stopping) void this.stop(false);
       };
     } catch (error) {
       this.fail(error);
+      throw error;
     }
   }
 
@@ -154,8 +190,19 @@ export class RealtimeAudioController {
   sendText(value: string, turnId: string = crypto.randomUUID()): void {
     const text = value.trim();
     if (!text) return;
+    if (this.socket?.readyState !== WebSocket.OPEN || !this.sessionReady) {
+      this.pendingText.push({ text, turnId });
+      return;
+    }
+    this.socket.send(
+      JSON.stringify({
+        type: "input.append",
+        input: { text, max_new_speak_tokens: SPEAK_TOKENS },
+      }),
+    );
     this.finishTurn();
     this.currentInputTurnId = turnId;
+    this.pendingResponseTurns.push(turnId);
     if (!this.audio.capturing) {
       this.halfDuplexPendingSteps += 1;
       this.awaitingHalfDuplexResponse = true;
@@ -163,17 +210,6 @@ export class RealtimeAudioController {
       this.currentStepWasListen = false;
       this.callbacks.onState("processing");
     }
-    if (this.socket?.readyState !== WebSocket.OPEN || !this.sessionReady) {
-      this.pendingText.push({ text, turnId });
-      return;
-    }
-    this.pendingResponseTurns.push(turnId);
-    this.socket.send(
-      JSON.stringify({
-        type: "input.append",
-        input: { text, max_new_speak_tokens: SPEAK_TOKENS },
-      }),
-    );
   }
 
   /** Idempotently close the connection and release recording and playback resources while publishing accumulated turns. */
@@ -190,6 +226,7 @@ export class RealtimeAudioController {
 
   private async performStop(sendClose: boolean): Promise<void> {
     this.stopping = true;
+    this.rejectReadyWaiters(new Error('Voice connection closed'));
     if (sendClose && this.socket?.readyState === WebSocket.OPEN) {
       this.socket.send(JSON.stringify({ type: "session.close", reason: "user_stop" }));
     }
@@ -437,6 +474,7 @@ export class RealtimeAudioController {
         this.sendInput(item.samples, item, item.turnId);
       }
       for (const item of this.pendingText.splice(0)) this.sendText(item.text, item.turnId);
+      for (const waiter of [...this.readyWaiters]) waiter.resolve();
     } else if (event.kind === "text") {
       const target = this.bufferForResponse(event);
       if (!target) return;
@@ -606,6 +644,7 @@ export class RealtimeAudioController {
 
   private fail(error: unknown): void {
     const message = error instanceof Error ? error.message : "Voice connection failed";
+    this.rejectReadyWaiters(new Error(message));
     this.callbacks.onError(message);
     this.callbacks.onState("error");
     void this.stop(false);

@@ -55,11 +55,19 @@ it('verifies useChatPageState test behavior 1', async () => {
 it('verifies useChatPageState test behavior 2', () => {
   const chat = vi.mocked(useChat)();
   vi.mocked(useChat).mockReturnValue({ ...chat, busy: true });
-  const { result } = renderHook(useChatPageState, {
+  const { result, rerender } = renderHook(useChatPageState, {
     wrapper: ({ children }) => <MemoryRouter>{children}</MemoryRouter>,
   });
   act(() => result.current.selectModel('model-b'));
+  expect(chat.inference.setSelectedModel).not.toHaveBeenCalled();
+  vi.mocked(useChat).mockReturnValue({ ...chat, busy: false });
+  rerender();
+  act(() => result.current.selectModel('model-b'));
   expect(chat.inference.setSelectedModel).toHaveBeenCalledWith('model-b');
   act(() => result.current.selectModel('unloaded-asset'));
+  expect(chat.inference.setSelectedModel).toHaveBeenCalledOnce();
+  vi.mocked(useChat).mockReturnValue({ ...chat, busy: false, recoveryNeeded: true });
+  rerender();
+  act(() => result.current.selectModel('model-b'));
   expect(chat.inference.setSelectedModel).toHaveBeenCalledOnce();
 });
