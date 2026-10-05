@@ -193,8 +193,8 @@ int run_transport_runtime(RuntimeOptions& options) {
     auto transport = options.stdio_mode
         ? make_mfq_stdio_transport(transport_config)
         : make_mfq_http_transport(transport_config);
-    MfqRuntime runtime(std::move(engine), std::move(transport));
-    return runtime.run();
+    MfqScheduler scheduler(*engine);
+    return transport->run(scheduler);
 }
 
 int execute_runtime(RuntimeCommandOptions options) {

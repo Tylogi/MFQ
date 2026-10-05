@@ -2506,8 +2506,8 @@ int run_loaded_runtime(
     auto transport = arguments.stdio
         ? make_mfq_stdio_transport(transport_config)
         : make_mfq_http_transport(std::move(transport_config));
-    MfqRuntime runtime(std::move(inference_engine), std::move(transport));
-    return runtime.run();
+    MfqScheduler scheduler(*inference_engine);
+    return transport->run(scheduler);
 }
 
 int run_native_runtime(

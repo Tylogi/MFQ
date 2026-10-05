@@ -673,7 +673,6 @@ def test_cuda_runtime_composes_transport_scheduler_and_engine() -> None:
     assert "make_mfq_http_transport" not in CUDA_ENGINE_SOURCE
     assert "make_mfq_stdio_transport" not in CUDA_ENGINE_SOURCE
     assert "load_cuda_engine" in CUDA_RUNTIME_COMMAND
-    assert "MfqRuntime runtime(" in CUDA_RUNTIME_COMMAND
     assert "make_mfq_http_transport" in CUDA_RUNTIME_COMMAND
     assert "make_mfq_stdio_transport" in CUDA_RUNTIME_COMMAND
 

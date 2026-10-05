@@ -6,9 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
 struct MfqChatSamplingProfile {
@@ -72,39 +70,6 @@ class MfqTransport {
 public:
     virtual ~MfqTransport() = default;
     virtual int run(const MfqScheduler & scheduler) = 0;
-};
-
-class MfqRuntime {
-public:
-    MfqRuntime(
-            std::unique_ptr<mfq::engine::Engine> engine,
-            std::unique_ptr<MfqTransport> transport)
-        : engine_(require_engine(std::move(engine))),
-          transport_(require_transport(std::move(transport))),
-          scheduler_(*engine_) {}
-
-    int run() {
-        return transport_->run(scheduler_);
-    }
-
-private:
-    static std::unique_ptr<mfq::engine::Engine> require_engine(
-            std::unique_ptr<mfq::engine::Engine> engine) {
-        if (!engine) {
-            throw std::invalid_argument("MFQ runtime requires an engine");
-        }
-        return engine;
-    }
-    static std::unique_ptr<MfqTransport> require_transport(
-            std::unique_ptr<MfqTransport> transport) {
-        if (!transport) {
-            throw std::invalid_argument("MFQ runtime requires a transport");
-        }
-        return transport;
-    }
-    std::unique_ptr<mfq::engine::Engine> engine_;
-    std::unique_ptr<MfqTransport> transport_;
-    MfqScheduler scheduler_;
 };
 
 std::unique_ptr<MfqTransport> make_mfq_http_transport(
