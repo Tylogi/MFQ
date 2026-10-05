@@ -8,6 +8,19 @@
 
 namespace tb=mfq_tensor_backend;
 
+namespace {
+std::size_t expert_fields_bytes(const MixedMoePool& pool) {
+    std::vector<tb::Tensor> fields;
+    if (pool.family==MixedMoeFamily::Nint)
+        fields={pool.nint.q_packed,pool.nint.row_q_bits,pool.nint.row_q_bit_offsets,
+            pool.nint.sub_scale,pool.nint.sub_min,pool.nint.neuron_scale,pool.nint.neuron_min};
+    else fields={pool.nvq.indices_packed,pool.nvq.aux_packed,pool.nvq.sub_scale_packed,pool.nvq.neuron_scale};
+    std::size_t bytes=0;
+    for (const auto& field:fields) bytes+=field.numel()*field.element_size();
+    return bytes;
+}
+}
+
 MoeQuantRangeSource::MoeQuantRangeSource(std::shared_ptr<mfq::MfeQuantExpertStore> store)
     :store_(std::move(store)),metadata_(std::make_shared<MixedMoeRuntime>()) {
     if (!store_) throw std::invalid_argument("missing quantized expert range source");
@@ -15,6 +28,9 @@ MoeQuantRangeSource::MoeQuantRangeSource(std::shared_ptr<mfq::MfeQuantExpertStor
     metadata_->out_per_expert=store_->out_per_expert();
     metadata_->neuron_len=store_->neuron_len();
     q_strides_.assign(store_->pool_count(),0);
+    field_bytes_.assign(store_->pool_count(),0);
+    gpu_resident_=std::make_unique<std::atomic_bool[]>(store_->num_experts());
+    for (int expert=0; expert<store_->num_experts(); ++expert) gpu_resident_[expert].store(false);
     for (std::size_t index=0; index<store_->pool_count(); ++index) {
         const auto& ids=store_->pool_expert_ids(index);
         if (store_->expert_dtype(ids.front())=="NINT") {
@@ -25,6 +41,7 @@ MoeQuantRangeSource::MoeQuantRangeSource(std::shared_ptr<mfq::MfeQuantExpertStor
             q_strides_[index]=static_cast<std::int64_t>(bytes);
         }
         auto pool=read_expert(ids.front());
+        field_bytes_[index]=expert_fields_bytes(pool);
         pool.local_experts=static_cast<int>(ids.size());
         std::vector<std::int32_t> local(store_->num_experts(),-1);
         for (std::size_t j=0; j<ids.size(); ++j) local[ids[j]]=static_cast<std::int32_t>(j);
@@ -55,7 +72,57 @@ MixedMoePool MoeQuantRangeSource::read_expert(int expert) const {
         if (static_cast<std::size_t>(index)<metadata_->pools.size())
             pool.nvq.codebook=metadata_->pools[index].nvq.codebook;
     }
+    ++materializations_;
     return pool;
+}
+
+void MoeQuantRangeSource::bind_host_cache(std::shared_ptr<MoeHostExpertCache> cache,int source_id) {
+    if (!cache || source_id<0 || host_cache_) throw std::logic_error("invalid or repeated expert host cache binding");
+    host_cache_=std::move(cache);
+    source_id_=source_id;
+}
+
+mfq::MoeCacheKey MoeQuantRangeSource::host_key(int expert) const {
+    return {source_id_,store_->expert_pool(expert),expert};
+}
+
+std::size_t MoeQuantRangeSource::expert_field_bytes(int expert) const {
+    return field_bytes_.at(store_->expert_pool(expert));
+}
+
+bool MoeQuantRangeSource::gpu_resident(int expert) const {
+    (void)store_->expert_pool(expert);
+    return gpu_resident_[expert].load();
+}
+
+MoeHostExpertCache::Lease MoeQuantRangeSource::acquire_expert(int expert) const {
+    const auto bytes=expert_field_bytes(expert);
+    if (host_cache_) return host_cache_->acquire(host_key(expert),bytes,[this,expert] {
+        auto pool=read_expert(expert);
+        if (expert_fields_bytes(pool)!=expert_field_bytes(expert))
+            throw std::runtime_error("decoded expert exceeded registered RAM layout");
+        return pool;
+    },!gpu_resident(expert));
+    auto value=std::make_shared<MoeHostExpert>();
+    value->weights=read_expert(expert);
+    value->bytes=bytes;
+    return value;
+}
+
+bool MoeQuantRangeSource::demote_expert(int expert,const MoeHostExpertCache::Load& copy) {
+    mark_gpu_resident(expert,false);
+    return host_cache_ && host_cache_->demote(host_key(expert),expert_field_bytes(expert),[&] {
+        auto pool=copy();
+        if (expert_fields_bytes(pool)!=expert_field_bytes(expert))
+            throw std::runtime_error("GPU eviction exceeded registered RAM layout");
+        return pool;
+    });
+}
+
+void MoeQuantRangeSource::mark_gpu_resident(int expert,bool resident) {
+    (void)store_->expert_pool(expert);
+    gpu_resident_[expert].store(resident);
+    if (resident && host_cache_) host_cache_->promote(host_key(expert));
 }
 
 tb::Tensor MoeQuantRangeSource::forward_cpu(CudaExecutionContext& execution,tb::Tensor input,
@@ -78,7 +145,8 @@ tb::Tensor MoeQuantRangeSource::forward_cpu(CudaExecutionContext& execution,tb::
     for (int expert=0; expert<store_->num_experts(); ++expert) {
         const auto& positions=selected[expert];
         if (positions.empty()) continue;
-        const auto pool=read_expert(expert);
+        const auto lease=acquire_expert(expert);
+        const auto& pool=lease->weights;
         auto batch=tb::empty({static_cast<std::int64_t>(positions.size()),width},tb::TensorOptions().dtype(tb::kFloat32));
         for (std::size_t row=0; row<positions.size(); ++row) {
             const int source=input.dim()==2 ? positions[row]/routes : positions[row];

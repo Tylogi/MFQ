@@ -25,6 +25,7 @@ public:
         MFQ_CUDA_CHECK(cudaEventCreateWithFlags(
             &route_done_, cudaEventDisableTiming));
         stages_.resize(4);
+        host_experts_=std::make_shared<MoeHostExpertCache>(config.moe_host_cache_bytes);
         for (auto & stage : stages_) {
             MFQ_CUDA_CHECK(cudaEventCreateWithFlags(
                 &stage.done, cudaEventDisableTiming));
@@ -363,9 +364,21 @@ public:
     }
 
     void print_stats(std::ostream & stream) const {
+        const auto host=host_experts_->stats();
         stream << "moe_cache_stats"
                << " budget_bytes=" << budget_bytes_
                << " allocated_bytes=" << allocated_bytes_
+               << " host_cache_budget_bytes=" << host.budget_bytes
+               << " host_cache_resident_bytes=" << host.resident_bytes
+               << " host_cache_managed_bytes=" << host.managed_bytes
+               << " host_cache_managed_peak_bytes=" << host.managed_peak_bytes
+               << " host_cache_transient_peak_bytes=" << host.transient_peak_bytes
+               << " host_cache_hits=" << host.hits
+               << " host_cache_misses=" << host.misses
+               << " host_cache_evictions=" << host.evictions
+               << " host_cache_promotions=" << host.promotions
+               << " host_cache_demotions=" << host.gpu_demotions
+               << " gpu_demote_bytes=" << stats_.gpu_demote_bytes
                << " host_bytes=" << host_bytes_
                << " demand_hits=" << stats_.demand_hits
                << " demand_misses=" << stats_.demand_misses
@@ -741,7 +754,8 @@ private:
         }
     }
 
-    void invalidate(const mfq::MoeCacheKey & key, int slot);
+    void invalidate(const mfq::MoeCacheKey & key, int slot,bool retain_cold=true);
+    void publish_quant_promotions(const std::vector<MoeCacheNewLease>& leases);
 
     int64_t budget_bytes_ = 0;
     int64_t allocated_bytes_ = 0;
@@ -768,6 +782,7 @@ private:
     std::optional<mfq::MoeCacheProfile> profile_;
     std::vector<mfq::MoeProfileCandidate> prewarm_selected_;
     MoeCacheStats stats_;
+    std::shared_ptr<MoeHostExpertCache> host_experts_;
     struct RegisteredHostField {
         void * host = nullptr;
         int64_t bytes = 0;

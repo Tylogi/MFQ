@@ -4,6 +4,7 @@
 #include "cuda_execution.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -96,7 +97,14 @@ void verify_gpu(const tb::Tensor& cached,const tb::Tensor& original) {
 // GPU results must equal the existing canonical GPU dispatch bit-for-bit;
 // CPU results are checked against an independent Python codec + FP64 oracle.
 int main(int argc,char** argv) try {
-    if (argc!=2) throw std::runtime_error("expected quantized range cache fixture directory");
+    if (argc<2 || argc>4) throw std::runtime_error("expected fixture directory [--host-cache] [--benchmark]");
+    bool host_cache=false,benchmark=false;
+    for (int argument=2; argument<argc; ++argument) {
+        const std::string option=argv[argument];
+        if (option=="--host-cache") host_cache=true;
+        else if (option=="--benchmark") benchmark=true;
+        else throw std::runtime_error("unknown range cache test option");
+    }
     const std::filesystem::path root(argv[1]);
     std::ifstream manifest(root/"cases.txt");
     if (!manifest) throw std::runtime_error("missing range cache fixture manifest");
@@ -121,6 +129,7 @@ int main(int argc,char** argv) try {
             throw std::runtime_error("range cache registration materialized the entire expert pool");
         std::int64_t bytes=0;
         for (const auto& pool:source->metadata()->pools) bytes+=slot_bytes(pool);
+        execution.config.moe_host_cache_bytes=host_cache ? 3*bytes : 0;
         auto cache=make_moe_expert_cache(bytes,execution.config);
         auto cached=cache_quant_moe_weight(cache,"linear.weight",source,1,0,"gate");
         finalize_moe_expert_cache(cache);
@@ -135,28 +144,48 @@ int main(int argc,char** argv) try {
         const auto cold_route=route(all,tokens,3);
         verify_cpu(cached.forward(execution,x,cold_route),reference,all,tokens,3,output);
         if (source->cpu_projections()!=3) throw std::runtime_error("cold route did not use selected CPU projections");
+        const auto cold_read_bytes=bytes_read;
+        const auto cold_materializations=source->materializations();
         // Routed inputs use their own route-major row instead of token-major.
         auto routed=x.unsqueeze(1).expand({tokens,3,width}).contiguous();
         verify_cpu(cached.forward(execution,routed,cold_route),reference,all,tokens,3,output);
         if (source->cpu_projections()!=6) throw std::runtime_error("routed CPU input did not use selected experts");
+        if (host_cache && (cold_read_bytes!=bytes_read || cold_materializations!=source->materializations()))
+            throw std::runtime_error("CPU cold cache hit reread or decoded expert weights");
         for (int expert:{2,0,1,2}) {
             const auto selected=route(std::vector<std::int32_t>(tokens,expert),tokens,1);
             const auto before=bytes_read;
             auto original=baseline.forward(execution,x,selected);
             verify_gpu(cached.forward(execution,x,selected),original);
-            if (bytes_read==before) throw std::runtime_error("GPU cache miss did not read the selected expert");
+            if (!host_cache && bytes_read==before) throw std::runtime_error("GPU cache miss did not read the selected expert");
+            if (host_cache && bytes_read!=before) throw std::runtime_error("RAM to GPU promotion reread SSD weights");
             const auto after=bytes_read;
             verify_gpu(cached.forward(execution,x,selected),original);
             if (bytes_read!=after) throw std::runtime_error("GPU cache hit reread expert weights");
+            if (host_cache) for (int id=0; id<3; ++id) {
+                const bool retained=source->host_cache()->contains(source->host_key(id));
+                if (retained==source->gpu_resident(id))
+                    throw std::runtime_error("RAM cold and GPU hot cache residency is inconsistent");
+            }
         }
         const auto selected=route(std::vector<std::int32_t>(tokens,0),tokens,1);
+        const auto projected_cpu=source->cpu_projections();
+        if (host_cache) {
+            const auto before=bytes_read;
+            const std::vector<std::int32_t> cold_ids(tokens,0);
+            verify_cpu(source->forward_cpu(execution,x,selected),reference,cold_ids,tokens,1,output);
+            if (bytes_read!=before) throw std::runtime_error("GPU-evicted expert did not execute directly from RAM");
+            // Force the existing I/O failure gate to exercise a true SSD miss.
+            source->host_cache()->erase(source->host_key(0));
+        }
         fail_next=true;
         bool failed=false;
         try { cached.forward(execution,x,selected); }
         catch (const std::runtime_error& error) { failed=std::string(error.what())=="injected expert read failure"; }
         if (!failed || fail_next) throw std::runtime_error("expert read failure was hidden or not exercised");
         verify_gpu(cached.forward(execution,x,selected),baseline.forward(execution,x,selected));
-        if (source->cpu_projections()!=6) throw std::runtime_error("GPU hot routes unexpectedly used CPU projections");
+        if (source->cpu_projections()!=projected_cpu+(host_cache ? 1 : 0))
+            throw std::runtime_error("GPU hot routes unexpectedly used CPU projections");
         // Exercise the public loader used by the native attention adapters,
         // including its owning ModelSource range callback after model release.
         auto loaded_model=mfq::open_model_source((root/(name+".mfq")).string());
@@ -178,8 +207,34 @@ int main(int argc,char** argv) try {
             verify_gpu(compatible.forward(execution,x,selected),baseline.forward(execution,x,selected));
         }
         MFQ_CUDA_CHECK(cudaDeviceSynchronize());
+        const auto stats=source->host_cache()->stats();
+        if (stats.managed_peak_bytes>stats.budget_bytes || stats.managed_bytes>stats.budget_bytes || stats.transient_bytes)
+            throw std::runtime_error("retained host expert budget or transient lifetime violated");
+        if (host_cache && (!stats.gpu_demotions || !stats.promotions || !stats.hits))
+            throw std::runtime_error("tiered expert migration was not exercised");
         std::cout<<name<<" shape="<<output<<'x'<<width<<" cache_slots=1 slot_bytes="<<bytes
-            <<" cpu_projections="<<source->cpu_projections()<<" read_bytes="<<bytes_read<<std::endl;
+            <<" cpu_projections="<<source->cpu_projections()<<" read_bytes="<<bytes_read
+            <<" host_managed_peak="<<stats.managed_peak_bytes<<" host_budget="<<stats.budget_bytes
+            <<" host_hits="<<stats.hits<<" host_demotions="<<stats.gpu_demotions<<std::endl;
+        if (benchmark) {
+            // Include activation/ID readback, expert materialization on misses,
+            // original-FP32 CPU math and result upload. This is a component
+            // measurement with a warmed filesystem, not model tokens/second.
+            const auto cpu_route=route(std::vector<std::int32_t>(tokens,2),tokens,1);
+            if (source->gpu_resident(2)) throw std::runtime_error("benchmark expert must be cold");
+            const auto before_read=bytes_read,before_decode=source->materializations();
+            tb::Tensor result;
+            const auto started=std::chrono::steady_clock::now();
+            for (int repeat=0; repeat<3; ++repeat) {
+                result=source->forward_cpu(execution,x,cpu_route);
+                MFQ_CUDA_CHECK(cudaDeviceSynchronize());
+            }
+            const auto elapsed=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-started).count()/3;
+            verify_cpu(result,reference,std::vector<std::int32_t>(tokens,2),tokens,1,output);
+            std::cout<<"cpu_source_benchmark "<<name<<" host_cache="<<host_cache<<" samples="<<tokens
+                <<" repeats=3 us_per_projection="<<elapsed<<" read_bytes="<<bytes_read-before_read
+                <<" materializations="<<source->materializations()-before_decode<<std::endl;
+        }
         ++cases;
     }
     if (!manifest.eof() || !cases) throw std::runtime_error("invalid range cache manifest");

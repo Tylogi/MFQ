@@ -35,6 +35,7 @@ std::shared_ptr<MoeCachedSource> MoeExpertCache::register_quant_range_source(
         const std::string& name,std::shared_ptr<MoeQuantRangeSource> range,
         int minimum_slots,int layer_id,std::string projection_role) {
     const int id=static_cast<int>(sources_.size());
+    range->bind_host_cache(host_experts_,id);
     auto runtime=range->metadata();
     auto source=std::make_shared<MoeCachedSource>(this,id,name,std::move(runtime),minimum_slots,
         layer_id,std::move(projection_role),nullptr,std::move(range));
@@ -386,14 +387,53 @@ void MoeExpertCache::prewarm() {
 
 void MoeExpertCache::invalidate(
         const mfq::MoeCacheKey & key,
-        int slot) {
+        int slot,bool retain_cold) {
     if (key.source < 0 ||
         key.source >= static_cast<int>(sources_.size())) {
         throw std::runtime_error(
             "MoE cache eviction references an invalid source");
     }
-    sources_.at(static_cast<size_t>(key.source))
-        ->invalidate(key.cohort, key.expert, slot);
+    auto& source=*sources_.at(static_cast<size_t>(key.source));
+    source.invalidate(key.cohort,key.expert,slot);
+    if (!source.quant_source_) return;
+    source.quant_source_->mark_gpu_resident(key.expert,false);
+    if (!retain_cold) return; // A rolled-back slot may contain incomplete fields.
+    auto& cohort=source.cohorts_.at(key.cohort);
+    auto& arena=*cohort.arena;
+    bool copied=false;
+    (void)source.quant_source_->demote_expert(key.expert,[&] {
+        // An unprotected lease can still have DMA or GPU kernels in flight.
+        // Copy the victim only after both producer streams have finished.
+        const auto stream=mfq_get_current_cuda_stream().stream();
+        if (transfer_ready_recorded_) MFQ_CUDA_CHECK(cudaStreamWaitEvent(stream,transfer_ready_,0));
+        if (compute_done_recorded_) MFQ_CUDA_CHECK(cudaStreamWaitEvent(stream,compute_done_,0));
+        auto pool=*cohort.cpu;
+        pool.local_experts=1;
+        pool.expert_local={};
+        std::vector<mfq_tensor_backend::Tensor> fields;
+        for (std::size_t i=0; i<arena.fields.size(); ++i) {
+            const auto rows=arena.layouts[i].slot_shape[0];
+            fields.push_back(arena.fields[i].narrow(0,slot*rows,rows).to(mfq_tensor_backend::kCPU).contiguous());
+        }
+        if (pool.family==MixedMoeFamily::Nint) {
+            pool.nint.q_packed=fields[0]; pool.nint.row_q_bits=fields[1]; pool.nint.row_q_bit_offsets=fields[2];
+            pool.nint.sub_scale=fields[3]; pool.nint.sub_min=fields[4];
+            pool.nint.neuron_scale=fields[5]; pool.nint.neuron_min=fields[6];
+        } else {
+            pool.nvq.indices_packed=fields[0]; pool.nvq.aux_packed=fields[1];
+            pool.nvq.sub_scale_packed=fields[2]; pool.nvq.neuron_scale=fields[3];
+        }
+        copied=true;
+        return pool;
+    });
+    if (copied) stats_.gpu_demote_bytes+=arena.slot_bytes;
+}
+
+void MoeExpertCache::publish_quant_promotions(const std::vector<MoeCacheNewLease>& leases) {
+    for (const auto& lease:leases) {
+        auto& source=*sources_.at(lease.key.source);
+        if (source.quant_source_) source.quant_source_->mark_gpu_resident(lease.key.expert,true);
+    }
 }
 
 void MoeExpertCache::append_source_transfers(
@@ -449,7 +489,11 @@ void MoeExpertCache::append_source_transfers(
                 invalidate(*lease.replaced, lease.slot);
             }
             std::vector<mfq_tensor_backend::Tensor> quant_fields;
-            if (source.quant_source_) quant_fields=moe_cache_fields(source.quant_source_->read_expert(expert));
+            MoeHostExpertCache::Lease quant_owner;
+            if (source.quant_source_) {
+                quant_owner=source.quant_source_->acquire_expert(expert);
+                quant_fields=moe_cache_fields(quant_owner->weights);
+            }
             for (size_t field = 0;
                  field < cohort.bytes_per_expert.size();
                  ++field) {
@@ -464,7 +508,7 @@ void MoeExpertCache::append_source_transfers(
                         throw std::runtime_error("quantized expert fields exceed registered cache layout");
                     transfers.push_back({reinterpret_cast<const std::uint8_t*>(owned.data_ptr()),
                         reinterpret_cast<std::uint8_t*>(gpu_field.data_ptr())+static_cast<std::int64_t>(lease.slot)*nbytes,
-                        nbytes,true,nullptr,nullptr,nullptr,owned});
+                        nbytes,true,nullptr,nullptr,nullptr,quant_owner});
                     continue;
                 }
                 if (cohort.range_store) {
@@ -539,7 +583,7 @@ void MoeExpertCache::rollback_preparation(
          lease != new_leases.rend();
          ++lease) {
         try {
-            invalidate(lease->key, lease->slot);
+            invalidate(lease->key, lease->slot,false);
             (void)lease->book->discard(
                 lease->key, lease->slot, lease->generation);
         } catch (...) {
@@ -751,6 +795,7 @@ bool MoeExpertCache::prepare(
             transfers,
             replaced_occupied,
             !prefetch);
+        publish_quant_promotions(new_leases);
     } catch (...) {
         rollback_preparation(new_leases, held_slots);
         throw;
@@ -820,6 +865,7 @@ bool MoeExpertCache::prepare_bundle(
         }
         submit_transfers(
             transfers, replaced_occupied, false);
+        publish_quant_promotions(new_leases);
     } catch (...) {
         rollback_preparation(new_leases, held_slots);
         throw;

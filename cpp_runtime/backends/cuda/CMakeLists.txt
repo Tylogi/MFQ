@@ -328,6 +328,7 @@ set(MFQ_CUDA_LOADING_SOURCES
     ${MFQ_CUDA_ROOT}/storage/model_loader.cpp
     ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp
     ${MFQ_CUDA_ROOT}/storage/moe_quant_range_source.cpp
+    ${MFQ_CUDA_ROOT}/runtime/moe_host_expert_cache.cpp
     ${MFQ_CUDA_ROOT}/storage/weight_loader.cpp
     ${MFQ_CUDA_ROOT}/storage/transformer_loader.cpp
 )
@@ -380,6 +381,14 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-quant-range-cache-test PRIVATE
         MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-quant-range-cache-test PRIVATE mfq-cuda-runtime)
+
+    add_executable(mfq-host-expert-cache-test
+        ${MFQ_CUDA_ROOT}/tests/moe_host_expert_cache_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-host-expert-cache-test)
+    target_compile_definitions(mfq-host-expert-cache-test PRIVATE
+        MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-host-expert-cache-test PRIVATE mfq-cuda-runtime)
+    add_test(NAME mfq-host-expert-cache-test COMMAND mfq-host-expert-cache-test)
 endif()
 target_link_libraries(mfq-cuda-runtime PRIVATE
     CUDA::cuda_driver

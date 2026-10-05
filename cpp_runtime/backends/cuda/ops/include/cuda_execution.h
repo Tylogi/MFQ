@@ -268,6 +268,7 @@ struct CudaExecutionConfig {
     int moe_ssd_io_workers = 8;
     bool moe_ssd_overlap = true;
     bool moe_ssd_ranges = true;
+    std::size_t moe_host_cache_bytes = 0;
 };
 
 CudaExecutionConfig load_cuda_execution_config();

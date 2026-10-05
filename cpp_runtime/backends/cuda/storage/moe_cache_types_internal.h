@@ -34,7 +34,7 @@ struct MoeCacheTransfer {
     const uint8_t * mapped_source = nullptr;
     const mfq::cuda::MfeMxfp4ExpertStore * range_store = nullptr;
     const mfq::cuda::MfeMxfp4ExpertPart * range_part = nullptr;
-    mfq_tensor_backend::Tensor source_owner;
+    std::shared_ptr<const void> source_owner;
 };
 
 struct MoeCacheNewLease {
@@ -283,4 +283,5 @@ struct MoeCacheStats {
     int64_t range_read_nanoseconds = 0;
     int64_t range_overlap_batches = 0;
     int64_t range_overlap_wait_nanoseconds = 0;
+    int64_t gpu_demote_bytes = 0;
 };
