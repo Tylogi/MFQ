@@ -60,9 +60,6 @@ CUDA_APP = (
 CUDA_RUNTIME_COMMAND = (
     ROOT / "csrc" / "backends" / "cuda" / "commands" / "runtime.cpp"
 ).read_text(encoding="utf-8")
-CUDA_CLI = (
-    ROOT / "csrc" / "backends" / "cuda" / "commands" / "cli.h"
-).read_text(encoding="utf-8")
 CUDA_MODELS = ROOT / "csrc" / "backends" / "cuda" / "models"
 CUDA_OPS = ROOT / "csrc" / "backends" / "cuda" / "ops"
 CUDA_COMMON = CUDA_MODELS / "common"
@@ -410,9 +407,8 @@ def test_model_sources_are_backend_neutral_and_shared() -> None:
     assert "record_.read_range(offset, destination)" in CUDA_MFE_STORE
 
 
-def test_native_cli_uses_backend_neutral_model_and_tokenizer_options() -> None:
+def test_metal_cli_uses_backend_neutral_model_and_tokenizer_options() -> None:
     sources = (
-        CUDA_APP + "\n" + CUDA_RUNTIME_COMMAND + "\n" + CUDA_CLI,
         DECODE_APP,
         (METAL / "apps" / "mfq_perplexity_mlx.cpp").read_text(encoding="utf-8"),
     )

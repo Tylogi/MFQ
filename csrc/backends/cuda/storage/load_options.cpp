@@ -4,18 +4,12 @@
 #include "storage/moe_expert_cache.h"
 #include "moe_cache_profile.h"
 #include "../native/tensor_backend.h"
-#include "../ops/quant_linear.h"
-#include "tensor_parallel.h"
 
 #include <cuda_runtime_api.h>
 #include <algorithm>
-#include <charconv>
-#include <cctype>
 #include <cmath>
 #include <iostream>
 #include <limits>
-#include <numeric>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -25,29 +19,6 @@ namespace mfq::cuda::internal {
 using mfq::engine::environment_uint64;
 using mfq::engine::environment_enabled;
 namespace {
-
-int strict_int(const std::string& text, const char* option) {
-    int result = 0;
-    const auto [end, error] = std::from_chars(
-        text.data(), text.data() + text.size(), result);
-    if (error != std::errc{} || end != text.data() + text.size()) {
-        throw std::runtime_error(std::string(option) + " requires integers");
-    }
-    return result;
-}
-
-double strict_double(const std::string& text, const char* option) {
-    double result = 0.0;
-    const auto [end, error] = std::from_chars(
-        text.data(), text.data() + text.size(), result,
-        std::chars_format::general);
-    if (error != std::errc{} || end != text.data() + text.size() ||
-            !std::isfinite(result)) {
-        throw std::runtime_error(
-            std::string(option) + " requires finite numbers");
-    }
-    return result;
-}
 
 std::int32_t graph_minimum(const char* name) {
     const auto value = std::max<std::uint64_t>(
@@ -87,72 +58,27 @@ CudaRuntimeConfig resolve_cuda_runtime_config(
     return config;
 }
 
-static std::vector<std::string> split_csv_values(
-        const std::string & value,
-        const char * option) {
-    std::vector<std::string> result;
-    std::stringstream stream(value);
-    std::string item;
-    while (std::getline(stream, item, ',')) {
-        const auto first = item.find_first_not_of(" \t\r\n");
-        const auto last = item.find_last_not_of(" \t\r\n");
-        if (first == std::string::npos) {
-            throw std::runtime_error(
-                std::string(option) + " contains an empty item");
-        }
-        result.push_back(item.substr(first, last - first + 1));
-    }
-    if (result.empty()) {
-        throw std::runtime_error(
-            std::string(option) +
-            " requires at least one value");
-    }
-    if (value.ends_with(',')) {
-        throw std::runtime_error(
-            std::string(option) + " contains an empty item");
-    }
-    return result;
-}
-
-static ParallelConfig parse_parallel_config(
-        const std::string & devices_arg,
-        const std::string & split_arg,
-        const char * devices_option,
-        const char * split_option,
+static ParallelConfig validated_parallel_config(
+        const CudaParallelOptions& options,
+        const char* devices_option,
+        const char* split_option,
         int available_devices,
         bool allow_duplicate_devices) {
     ParallelConfig config;
-    if (devices_arg.empty()) {
-        if (!split_arg.empty()) {
+    config.devices = options.devices;
+    config.split = options.split;
+    config.allow_duplicate_devices = allow_duplicate_devices;
+    if (config.devices.empty()) {
+        if (!config.split.empty()) {
             throw std::runtime_error(
                 std::string(split_option) + " requires " + devices_option);
         }
         return config;
     }
-
-    const auto values = split_csv_values(
-        devices_arg, devices_option);
-    if (values.size() == 1 &&
-            devices_arg.find(',') == std::string::npos) {
-        const int count = strict_int(values.front(), devices_option);
-        if (count < 2) {
-            throw std::runtime_error(
-                std::string(devices_option) +
-                " device count must be at least two");
-        }
-        config.devices.resize(static_cast<size_t>(count));
-        std::iota(config.devices.begin(), config.devices.end(), 0);
-    } else {
-        for (const auto & item : values) {
-            config.devices.push_back(strict_int(item, devices_option));
-        }
-        if (config.devices.size() < 2) {
-            throw std::runtime_error(
-                std::string(devices_option) +
-                " requires at least two devices");
-        }
+    if (config.devices.size() < 2) {
+        throw std::runtime_error(
+            std::string(devices_option) + " requires at least two devices");
     }
-    config.allow_duplicate_devices = allow_duplicate_devices;
 
     std::unordered_set<int> unique_devices;
     for (const int device : config.devices) {
@@ -169,23 +95,18 @@ static ParallelConfig parse_parallel_config(
                 " CUDA devices must be unique");
         }
     }
-
-    if (!split_arg.empty()) {
-        for (const auto & item :
-             split_csv_values(split_arg, split_option)) {
-            const double weight = strict_double(item, split_option);
-            if (!std::isfinite(weight) || weight <= 0.0) {
-                throw std::runtime_error(
-                    std::string(split_option) +
-                    " values must be finite and positive");
-            }
-            config.split.push_back(weight);
-        }
-        if (config.split.size() != config.devices.size()) {
+    for (const double weight : config.split) {
+        if (!std::isfinite(weight) || weight <= 0.0) {
             throw std::runtime_error(
-                std::string(split_option) + " count must match " +
-                devices_option + " devices");
+                std::string(split_option) +
+                " values must be finite and positive");
         }
+    }
+    if (!config.split.empty() &&
+            config.split.size() != config.devices.size()) {
+        throw std::runtime_error(
+            std::string(split_option) + " count must match " +
+            devices_option + " devices");
     }
     return config;
 }
@@ -211,10 +132,8 @@ static void print_parallel_config(
 
 static void configure_model_parallel(
         CudaExecutionContext& execution,
-        const std::string & tensor_devices_arg,
-        const std::string & tensor_split_arg,
-        const std::string & expert_devices_arg,
-        const std::string & expert_split_arg,
+        const CudaParallelOptions& tensor_options,
+        const CudaParallelOptions& expert_options,
         bool allow_duplicate_devices = false) {
     execution.model_parallel_collectives.reset();
     execution.tensor_parallel = {};
@@ -222,13 +141,11 @@ static void configure_model_parallel(
 
     int available = 0;
     MFQ_CUDA_CHECK(cudaGetDeviceCount(&available));
-    execution.tensor_parallel = parse_parallel_config(
-        tensor_devices_arg, tensor_split_arg,
-        "--tensor-parallel", "--tensor-split",
+    execution.tensor_parallel = validated_parallel_config(
+        tensor_options, "--tensor-parallel", "--tensor-split",
         available, allow_duplicate_devices);
-    execution.expert_parallel = parse_parallel_config(
-        expert_devices_arg, expert_split_arg,
-        "--expert-parallel", "--expert-split",
+    execution.expert_parallel = validated_parallel_config(
+        expert_options, "--expert-parallel", "--expert-split",
         available, allow_duplicate_devices);
 
     if (execution.tensor_parallel.enabled() &&
@@ -288,12 +205,11 @@ static void configure_model_parallel(
 
 static void configure_layer_placement(
         CudaExecutionContext& execution,
-        const std::string & devices_arg,
-        const std::string & split_arg) {
+        const CudaParallelOptions& options) {
     auto& placement = execution.layer_placement;
     placement = {};
-    if (devices_arg.empty()) {
-        if (!split_arg.empty()) {
+    if (options.devices.empty()) {
+        if (!options.split.empty()) {
             throw std::runtime_error(
                 "--layer-split requires --layer-parallel");
         }
@@ -309,7 +225,7 @@ static void configure_layer_placement(
 
     int available = 0;
     MFQ_CUDA_CHECK(cudaGetDeviceCount(&available));
-    auto parsed = parse_parallel_config(devices_arg, split_arg,
+    auto parsed = validated_parallel_config(options,
         "--layer-parallel", "--layer-split", available, false);
     MFQ_CUDA_CHECK(cudaSetDevice(parsed.primary_device()));
     print_parallel_config("layer_parallel", parsed);
@@ -317,72 +233,30 @@ static void configure_layer_placement(
     placement.split = std::move(parsed.split);
 }
 
-static std::unordered_set<int> parse_layer_ranges(
-        const std::string & value) {
-    std::unordered_set<int> result;
-    std::stringstream stream(value);
-    std::string item;
-    while (std::getline(stream, item, ',')) {
-        item.erase(
-            std::remove_if(
-                item.begin(), item.end(),
-                [](unsigned char ch) { return std::isspace(ch) != 0; }),
-            item.end());
-        if (item.empty()) {
-            throw std::runtime_error(
-                "--cpu-offload-layers contains an empty item");
-        }
-        const size_t dash = item.find('-');
-        int first = 0;
-        int last = 0;
-        if (dash == std::string::npos) {
-            first = last = strict_int(item, "--cpu-offload-layers");
-        } else {
-            if (dash == 0 || dash + 1 >= item.size() ||
-                item.find('-', dash + 1) != std::string::npos) {
-                throw std::runtime_error(
-                    "invalid --cpu-offload-layers range: " + item);
-            }
-            first = strict_int(
-                item.substr(0, dash), "--cpu-offload-layers");
-            last = strict_int(
-                item.substr(dash + 1), "--cpu-offload-layers");
-        }
-        if (first < 0 || last < first) {
-            throw std::runtime_error(
-                "invalid --cpu-offload-layers range: " + item);
-        }
-        for (int layer = first; layer <= last; ++layer) {
-            result.insert(layer);
-        }
-    }
-    if (result.empty()) {
-        throw std::runtime_error(
-            "--cpu-offload-layers requires at least one layer");
-    }
-    return result;
-}
-
 void setup_cuda_load(
         const mfq::cuda::CudaLoadOptions& options,
         CudaExecutionContext& execution) {
     execution.reset();
-    if (options.n_gpu_layers_set) execution.n_gpu_layers = options.n_gpu_layers;
-    if (options.cpu_threads_set && options.cpu_threads <= 0) {
+    if (options.n_gpu_layers) execution.n_gpu_layers = *options.n_gpu_layers;
+    if (options.cpu_threads && *options.cpu_threads <= 0) {
         throw std::runtime_error("--threads must be positive");
     }
-    if (options.cpu_threads > 0) {
-        mfq_set_num_threads(options.cpu_threads);
-    }
+    if (options.cpu_threads) mfq_set_num_threads(*options.cpu_threads);
     configure_model_parallel(
-        execution, options.tensor_parallel_arg, options.tensor_split_arg,
-        options.expert_parallel_arg, options.expert_split_arg,
+        execution, options.tensor_parallel, options.expert_parallel,
         options.parallel_test_duplicates);
-    configure_layer_placement(
-        execution, options.layer_parallel_arg, options.layer_split_arg);
-    if (!options.cpu_offload_layers_arg.empty()) {
-        execution.dsv4_cpu_offload_layers =
-            parse_layer_ranges(options.cpu_offload_layers_arg);
+    configure_layer_placement(execution, options.layer_parallel);
+    if (!options.cpu_offload_layers.empty()) {
+        if (std::any_of(
+                options.cpu_offload_layers.begin(),
+                options.cpu_offload_layers.end(),
+                [](int layer) { return layer < 0; })) {
+            throw std::runtime_error(
+                "--cpu-offload-layers must be non-negative");
+        }
+        execution.dsv4_cpu_offload_layers = {
+            options.cpu_offload_layers.begin(),
+            options.cpu_offload_layers.end()};
         std::vector<int> ordered(
             execution.dsv4_cpu_offload_layers.begin(),
             execution.dsv4_cpu_offload_layers.end());
@@ -394,10 +268,10 @@ void setup_cuda_load(
         }
         std::cerr << std::endl;
     }
-    if (options.n_gpu_layers_set && execution.n_gpu_layers < 0) {
+    if (options.n_gpu_layers && *options.n_gpu_layers < 0) {
         throw std::runtime_error("--n-gpu-layers must be non-negative");
     }
-    if (options.n_gpu_layers_set && !options.cpu_offload_layers_arg.empty()) {
+    if (options.n_gpu_layers && !options.cpu_offload_layers.empty()) {
         throw std::runtime_error(
             "--n-gpu-layers cannot be combined with --cpu-offload-layers");
     }
@@ -407,7 +281,7 @@ void setup_cuda_load(
             "--moe-gpu-cache-gb must be finite and non-negative");
     }
     if (options.moe_gpu_cache_gb > 0.0 &&
-            !options.cpu_offload_layers_arg.empty()) {
+            !options.cpu_offload_layers.empty()) {
         throw std::runtime_error(
             "--moe-gpu-cache-gb cannot be combined with "
             "--cpu-offload-layers");

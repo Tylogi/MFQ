@@ -2,25 +2,32 @@
 
 #include <engine.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace mfq::cuda {
 
+struct CudaParallelOptions {
+    std::vector<int> devices;
+    std::vector<double> split;
+};
+
 struct CudaLoadOptions {
     std::string model_path, config_path, tokenizer_model;
-    std::string cpu_offload_layers_arg, moe_cache_profile_path;
-    std::string tensor_parallel_arg, tensor_split_arg;
-    std::string expert_parallel_arg, expert_split_arg;
-    std::string layer_parallel_arg, layer_split_arg;
+    std::string moe_cache_profile_path;
+    CudaParallelOptions tensor_parallel;
+    CudaParallelOptions expert_parallel;
+    CudaParallelOptions layer_parallel;
+    std::vector<int> cpu_offload_layers;
+    std::optional<int> cpu_threads;
+    std::optional<int> n_gpu_layers;
     double moe_gpu_cache_gb = 0.0;
-    int cpu_threads = 0;
     int64_t context_size = 0;
     bool parallel_test_duplicates = false;
-    bool n_gpu_layers_set = false;
-    bool cpu_threads_set = false;
-    int n_gpu_layers = -1;
 };
 
 struct CudaEngineOptions : CudaLoadOptions {

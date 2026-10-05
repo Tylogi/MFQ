@@ -486,7 +486,11 @@ if(BUILD_TESTING)
     add_test(NAME mfq-diagnostics-cli-options COMMAND mfq-diagnostics --ids 1,2 --gen 3 --help)
     add_test(NAME mfq-eval-cli-options COMMAND mfq-eval kl --kl-base x --kl-evaluator optimized --help)
     if(TARGET mfq-runtime)
-        add_test(NAME mfq-runtime-cli-options COMMAND mfq-runtime --transport stdio --continuous-batching 2 --help)
+        add_test(NAME mfq-runtime-cli-options COMMAND mfq-runtime
+            --model model.mfq --tokenizer tokenizer.gguf
+            --tensor-parallel 0,1 --tensor-split 1,2
+            --cpu-offload-layers 1-3,5
+            --transport stdio --continuous-batching 2 --help)
         add_test(NAME mfq-runtime-rejects-check
             COMMAND mfq-runtime --check-mfq-container)
         add_test(NAME mfq-runtime-rejects-kl
