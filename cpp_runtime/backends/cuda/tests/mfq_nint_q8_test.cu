@@ -85,6 +85,22 @@ void check_case(int gs, int ng, int m, int width_tail, int storage_offset,
     exact_half(actual, expected);
     ++cases;
 
+    // Compare the one-row generic specialization with its unchanged eight-row
+    // reduction for every q, including group and packed-storage tails.
+    if (mode == 0 && m == 1 && ng == 3) {
+        auto repeated = x.repeat({8, 1});
+        auto repeated_qx = empty({8, k}, options.dtype(kInt8));
+        auto repeated_xs = empty({8, ng}, options.dtype(kFloat32));
+        for (std::uint8_t q_bits = 1; q_bits <= 8; ++q_bits) {
+            auto qb = tensor(std::vector<std::uint8_t>(n, q_bits)).to(gpu);
+            auto one = nint_matmul_ws_cuda(q, qb, off, s, mn, ns, nm, x, gs, qx, xs);
+            auto eight = nint_matmul_ws_cuda(q, qb, off, s, mn, ns, nm,
+                repeated, gs, repeated_qx, repeated_xs);
+            exact_half(one, eight.narrow(0, 0, 1));
+            ++cases;
+        }
+    }
+
     // Shared cache arenas can contain more slots than this layer has experts.
     if (mode == 0 && gs == 32 && ng == 3 && width_tail == 0 && storage_offset == 0) {
         auto map = tensor<std::int32_t>({4, 1}).to(gpu);

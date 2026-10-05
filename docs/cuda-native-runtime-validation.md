@@ -889,6 +889,54 @@ current GPU residents from evicted experts and account for actual occupancy,
 as Strata's cache complement does. Broad page hints cannot provide that
 ownership contract.
 
+## Specialize dense NINT decode accumulators and indexing (2026-10-05)
+
+Following Metal's compile-time `TILE_M` and `ROUTED` choices, the existing
+CUDA NINT body now selects one accumulator for a single dense activation row
+and removes routed indexing from dense launches. Routed MFE still uses the
+eight-row specialization with its existing one-warp decode launch. Packed
+layouts, activation quantization and each row's reduction order are unchanged;
+no q-specific kernel or device-specific dispatch was added.
+
+The compiled single-row dense kernel uses 35 registers instead of 64. The
+eight-row dense and routed versions use 61 and 64 registers, with no spills.
+The existing numerical test now also compares single-row and repeated
+8-row dense execution for q=1 through 8, group widths 4 through 64, input
+tails and unaligned packed storage. All 55 CTest checks and 19 source checks
+pass. All 512 natural generated IDs match the original executable.
+
+An alternating microbenchmark uses mixed q=2/3/4 rows, FP16 activations and
+1,000 eager calls per sample, with two processes and ten samples per
+executable. Output hashes match for every shape. Median CUDA-event intervals
+in microseconds per call include activation quantization and host launch gaps:
+
+| Group size | Output/input width | Original | Specialized |
+| ---: | ---: | ---: | ---: |
+| 24 | 2560 / 2560 | 15.55 | 14.11 |
+| 24 | 10240 / 2560 | 35.19 | 27.74 |
+| 24 | 6144 / 10240 | 87.54 | 63.16 |
+| 32 | 2560 / 2560 | 14.34 | 12.56 |
+| 32 | 10240 / 2560 | 32.11 | 25.51 |
+| 32 | 6144 / 10240 | 80.60 | 58.22 |
+
+The same late 32-step Nsight range shows four dense generic-NINT grids
+falling from 168.53 to 134.55 ms (-20.2%). Routed NINT is unchanged at
+139.83/139.84 ms. Total NINT time falls from 374.96 to 341.02 ms and all
+kernel time from 1.09038 to 1.05617 s. Kernel counts, allocation counts,
+expert residency and H2D bytes are identical. H2D duration is 60.04/60.94 ms.
+
+This establishes a kernel improvement, not a stable end-to-end gain. The
+unprofiled final executable takes 30.992 s for 511 decode steps
+(16.488 tokens/s), versus the earlier control's 30.327 s (16.850 tokens/s).
+The last windows are 18.894/18.994 tokens/s. Load/prefill take 135.021/6.043 s;
+peak RSS is 24.84 GiB, anonymous RSS 2.02 GiB, and pinned host/device staging
+remain 1 GiB each. In the profile, launch API time grows from 467.15 to
+546.80 ms and allocation/free time from 162.31 to 202.28 ms, while event wait
+falls from 282.40 to 189.60 ms. Those overlapping single-run measurements
+cannot be added as independent savings. The next scheduling work must
+address host gaps and actual SSD reads rather than claiming the microbenchmark
+percentage as generation throughput.
+
 ## Tensor and expert parallel execution
 
 The native runtime accepts either a rank count or an ordered CUDA device list.

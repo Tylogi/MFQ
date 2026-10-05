@@ -917,6 +917,7 @@ __device__ __forceinline__ void nint_matmul_routed_pair(
 // projection. q is row metadata; k has already been baked into the subgroup
 // metadata values. Routed execution changes only the indexing contract, not
 // the packed-weight compute kernel.
+template<int maximum_activation_rows, bool Routed = false>
 __global__ void __launch_bounds__(128) nint_matmul_kernel(
         const uint8_t * __restrict__ bitstream,
         const uint8_t * __restrict__ row_q_bits,
@@ -946,13 +947,12 @@ __global__ void __launch_bounds__(128) nint_matmul_kernel(
         int epilogue_mode,
         bool routed_input) {
     constexpr int warps_per_block = 4;
-    constexpr int maximum_activation_rows = 8;
     constexpr int routed_rows_per_warp = 2;
     const int chunks = (group_size + 3) / 4;
     const int groups_per_warp = 32 / chunks;
     const int lane = static_cast<int>(threadIdx.x);
 
-    if (ids_dst != nullptr) {
+    if (Routed && ids_dst != nullptr) {
         constexpr int route_tile = 8;
         const int rows_per_task = epilogue_mode == 0
             ? routed_rows_per_warp
@@ -1007,7 +1007,7 @@ __global__ void __launch_bounds__(128) nint_matmul_kernel(
         return;
     }
 
-    if (route_ids != nullptr) {
+    if (Routed && route_ids != nullptr) {
         const int token = static_cast<int>(blockIdx.z) * warps_per_block +
             static_cast<int>(threadIdx.y);
         const int route = static_cast<int>(blockIdx.y);
@@ -1622,7 +1622,7 @@ void launch_nint_matmul_routed_cuda(
         ? dim3(compact_blocks)
         : dim3(row_blocks, routes, token_blocks);
     // Single-token decode needs one independent warp; keep batched launches intact.
-    nint_matmul_kernel<<<
+    nint_matmul_kernel<8, true><<<
         grid,
         dim3(32, tokens == 1 ? 1 : warps_per_block), 0, stream>>>(
             bitstream.data_ptr<uint8_t>(),
@@ -2018,35 +2018,39 @@ static mfq_tensor_backend::Tensor nint_matmul_ws_impl(
                 static_cast<int>(group_size));
         }
     } else {
-    nint_matmul_kernel<<<
-        dim3((output_rows + 3) / 4), dim3(32, 4), 0, stream>>>(
-            bitstream.data_ptr<uint8_t>(),
-            row_q_bits.data_ptr<uint8_t>(),
-            row_q_bit_offsets.data_ptr<int64_t>(),
-            subgroup_scale.data_ptr<uint8_t>(),
-            subgroup_minimum.data_ptr<uint8_t>(),
-            neuron_scale.data_ptr<float>(),
-            neuron_minimum.data_ptr<float>(),
-            quantized_input.data_ptr<int8_t>(),
-            input_scale.data_ptr<float>(),
-            reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
-            activation_rows,
-            output_rows,
-            groups,
-            padded_width,
-            static_cast<int>(group_size),
-            nullptr,
-            nullptr,
-            nullptr,
-            nullptr,
-            nullptr,
-            nullptr,
-            0,
-            0,
-            0,
-            0,
-            0,
-            false);
+        const auto launch = [&]<int Rows>() {
+            nint_matmul_kernel<Rows><<<
+                dim3((output_rows + 3) / 4), dim3(32, 4), 0, stream>>>(
+                    bitstream.data_ptr<uint8_t>(),
+                    row_q_bits.data_ptr<uint8_t>(),
+                    row_q_bit_offsets.data_ptr<int64_t>(),
+                    subgroup_scale.data_ptr<uint8_t>(),
+                    subgroup_minimum.data_ptr<uint8_t>(),
+                    neuron_scale.data_ptr<float>(),
+                    neuron_minimum.data_ptr<float>(),
+                    quantized_input.data_ptr<int8_t>(),
+                    input_scale.data_ptr<float>(),
+                    reinterpret_cast<__half *>(output.data_ptr<mfq_half>()),
+                    activation_rows,
+                    output_rows,
+                    groups,
+                    padded_width,
+                    static_cast<int>(group_size),
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    false);
+        };
+        if (activation_rows == 1) launch.template operator()<1>();
+        else launch.template operator()<8>();
     }
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
