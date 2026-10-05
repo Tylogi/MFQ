@@ -102,6 +102,40 @@ void check_gated_residual_post() {
     }
 }
 
+void check_prepared_residual_weights() {
+    const Device gpu{DeviceType::cuda, 0};
+    auto pattern = [gpu](std::vector<int64_t> shape, ScalarType dtype) {
+        int64_t count = 1;
+        for (auto extent : shape) count *= extent;
+        std::vector<float> values(count);
+        for (size_t i = 0; i < values.size(); ++i)
+            values[i] = (int(i * 17 % 257) - 128) / 127.0f;
+        return tensor(values).to(gpu, dtype).reshape(shape);
+    };
+    for (auto dtype : {kFloat16, kFloat32})
+    for (int hidden : {7, 2560}) for (int tokens : {1, 23}) {
+        constexpr int streams = 4, rank = 320;
+        auto input = pattern({1, tokens, streams * hidden}, dtype);
+        auto norm = pattern({streams * hidden}, kFloat32);
+        auto down = pattern({rank, streams * hidden}, kBFloat16);
+        auto up = pattern({streams * hidden, rank}, kBFloat16);
+        auto injection = pattern({streams, streams * hidden}, kBFloat16);
+        auto prepare = [](const Tensor& value) {
+            return value.transpose(-1, -2).to(kFloat32).transpose(-1, -2);
+        };
+        auto expected = mfq_qwen4_exp::gated_residual_pre(
+            input, norm, down, up, injection, hidden, streams, 1e-6);
+        auto actual = mfq_qwen4_exp::gated_residual_pre(
+            input, norm, prepare(down), prepare(up), prepare(injection), hidden, streams, 1e-6);
+        for (size_t i = 0; i < expected.size(); ++i) {
+            auto a = actual[i].cpu(), b = expected[i].cpu();
+            MFQ_RUNTIME_CHECK(a.scalar_type() == b.scalar_type() && a.nbytes() == b.nbytes() &&
+                std::memcmp(a.data_ptr(), b.data_ptr(), a.nbytes()) == 0,
+                "prepared Qwen residual weights changed projection output bits");
+        }
+    }
+}
+
 Tensor unfused_moe_reduce(const Tensor& pairs, const Tensor& weights) {
     auto result = zeros({pairs.size(0), pairs.size(2)}, weights.options());
     for (int64_t route = 0; route < pairs.size(1); ++route)
@@ -473,6 +507,7 @@ int main(int argc, char** argv) {
             check_qwen_moe_topk();
             check_grouped_rms_norm();
             check_gated_residual_post();
+            check_prepared_residual_weights();
             std::cout << "Flash-Next and shared sparse-attention native smoke passed\n";
             return 0;
         }

@@ -159,6 +159,13 @@ struct Qwen4Block final : Block {
                const Config &c, int layer, bool predictor = false) {
         BlockLoader loader{{execution, file, "qwen4_exp"}};
         mfq::models::qwen4_exp::load_block(*this, loader, c, layer, predictor);
+        // Main residuals start in F16 and promote to F32. Prepare BF16
+        // projections once, preserving promoted_matmul's transposed layout.
+        if (!predictor)
+            for (auto* mix : {&attention_gr, &ffn_gr})
+                for (auto* weight : {&mix->down, &mix->up, &mix->injection})
+                    if (weight->defined() && weight->scalar_type() == tb::kBFloat16)
+                        *weight = weight->transpose(-1, -2).to(tb::kFloat32).transpose(-1, -2);
     }
     void reset(int64_t) override {
         if (gdn)

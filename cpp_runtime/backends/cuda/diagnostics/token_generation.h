@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <sstream>
 
 namespace mfq::cuda::internal {
 
@@ -64,6 +65,28 @@ int generate_diagnostic_tokens(
         const char * cuda_profiler_env = std::getenv("MFQ_CUDA_PROFILER_RANGE");
         const bool cuda_profiler_range = cuda_profiler_env != nullptr &&
             std::atoi(cuda_profiler_env) != 0;
+        const char* progress_env = std::getenv("MFQ_DECODE_PROGRESS");
+        const bool progress = progress_env != nullptr && std::atoi(progress_env) != 0;
+        int progress_token = 0;
+        auto progress_time = t2;
+        const auto report_progress = [&](int token) {
+            if (!progress || (token % 128 != 0 && token != gen - 1)) return;
+            mfq_cuda_synchronize();
+            const auto now = std::chrono::steady_clock::now();
+            const double seconds = std::chrono::duration<double>(now - progress_time).count();
+            std::cout << "decode_progress tokens=" << token
+                      << " window_tokens=" << token - progress_token
+                      << " window_sec=" << seconds
+                      << " window_tok_per_s=" << (token - progress_token) / seconds << '\n';
+            if (execution.moe_expert_cache) {
+                std::ostringstream stats;
+                print_moe_expert_cache_stats(execution.moe_expert_cache, stats);
+                std::cout << "decode_progress " << stats.str();
+            }
+            std::cout << std::flush;
+            progress_token = token;
+            progress_time = now;
+        };
         auto decode_replay_t0 = t2;
         if (cuda_profiler_range) MFQ_CUDA_CHECK(cudaProfilerStart());
         if (use_cuda_graph) {
@@ -134,6 +157,7 @@ int generate_diagnostic_tokens(
             decode_replay_t0 = std::chrono::steady_clock::now();
             for (int i = 1; i < gen; ++i) {
                 graph.replay();
+                report_progress(i);
             }
             MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
         } else {
@@ -148,6 +172,7 @@ int generate_diagnostic_tokens(
                         cudaMemcpyDeviceToDevice, stream));
                     return 0;
                 });
+                report_progress(i);
             }
         }
         mfq_cuda_synchronize();

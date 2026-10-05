@@ -691,6 +691,73 @@ prefill it leaves 2,603 MiB device memory free. At the end it occupies only
 guard fires. Capacity growth alone does not fill the primary cache or provide
 a bounded RAM complement.
 
+## Prepare constant Qwen residual projections (2026-10-05)
+
+The remaining large BF16-to-F32 conversions belong to constant gated-residual
+projection weights. Main-model residuals start in F16 and then become F32;
+mixed-dtype matmul therefore promotes these BF16 weights to F32 on every call.
+Prepare the 153 affected weights once during block loading, using the same
+transpose/convert/transpose layout as the original matmul. Predictor blocks
+retain their existing dtype behavior. This adds 363.75 MiB of logical device
+weight storage, without changing the expert cache or host staging budget.
+
+The numerical check compares all three gated-pre outputs byte for byte for
+F16/F32 inputs, hidden sizes 7/2560 and token counts 1/23. The real-model trace
+matches all 51 stages and 17,310,720 F32 values byte for byte. The 100 generated
+IDs also match the previous executable. All 55 CTest checks and 19 CUDA graph
+source checks pass.
+
+In the same first-32-step Nsight workload, conversion calls fall from 42,816
+to 37,920 and conversion time from 130.08 to 45.44 ms. The remaining strided
+BF16-to-F32 path takes 2.65 ms in 64 calls, versus 87.21 ms in 4,960 calls.
+FP32 GEMV still has 9,280 calls, but increases from 141.55 to 186.30 ms;
+loss of the conversion's immediate cache warming is a possible explanation,
+not a measured hardware-counter result. Whole-kernel time falls from 1.173
+to 1.124 s. GPU activity covers 40.88% of the 3.678 s trace span.
+
+The natural 100-token workload gives 7.366 s for 99 decode steps
+(13.440 tokens/s), versus 7.660 s (12.924 tokens/s) before preparation.
+Prefill takes 6.140 s and load takes 132.752 s. Peak RSS is 23.28 GiB,
+anonymous RSS 2.14 GiB, pinned staging 1 GiB and device staging 1 GiB.
+The 30 GiB expert allocation occupies 24.17 GiB at the end. Decode H2D stays
+8,350,022,544 bytes. These are single-run observations; the change removes
+repeated work but does not establish a stable 4% throughput gain.
+
+## Distinguish warm-cache decode from initial decode (2026-10-05)
+
+`MFQ_DECODE_PROGRESS=1` reports completed decode steps, elapsed time and cache
+statistics every 128 steps and at the final step. It is disabled by default.
+The diagnostic still generates a fixed token count, so EOS must be checked
+separately before interpreting a run as natural generation.
+
+With the same 80-token long-answer prompt, 512 generated tokens and context
+1024, every generated ID precedes EOS. The first 100 IDs match the shorter
+run. Load takes 134.15 s, prefill 5.738 s, and 511 decode steps take 31.956 s
+(15.991 tokens/s). The cache warms throughout the answer:
+
+| Decode steps | Tokens/s | H2D MB/step | Staging ms/step | Route wait ms/step | Occupied expert GiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1–128 | 13.990 | 74.84 | 20.86 | 18.62 | 24.93 |
+| 129–256 | 15.793 | 36.03 | 13.70 | 17.83 | 26.51 |
+| 257–384 | 16.800 | 22.57 | 9.55 | 18.76 | 27.12 |
+| 385–511 | 17.931 | 18.67 | 6.69 | 18.84 | 27.41 |
+
+MB uses decimal bytes; GiB uses binary bytes. Route wait includes unfinished
+GPU dependencies and must not be interpreted as pure CPU work. Peak RSS is
+24.91 GiB and anonymous RSS 2.11 GiB. No memory guard fires. The host currently
+uses file-backed page cache plus bounded 1 GiB pinned staging; it does not
+reserve a fully pinned RAM complement as Strata does.
+
+Strata's `pin_cache_complement` first requires a fully filled GPU primary and
+clamps the RAM complement to available memory minus headroom. Here the actual
+occupied cache is smaller than its allocation, even after 511 steps. Computing
+the RAM requirement as model size minus allocated GPU bytes would therefore
+underestimate it. A later-window profile is needed to separate GPU work,
+host submission and I/O after staging falls to 6.69 ms/step. The first-32-step
+trace's 47.0 ms GPU activity per step implies about 21.3 tokens/s if its work
+and transfers could be scheduled without gaps; this is a bound for that
+specific trace, not a hardware-wide speed limit or a warm-cache prediction.
+
 ## Tensor and expert parallel execution
 
 The native runtime accepts either a rank count or an ordered CUDA device list.
