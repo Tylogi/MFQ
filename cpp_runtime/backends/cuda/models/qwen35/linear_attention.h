@@ -502,7 +502,7 @@ struct LinearAttentionBlock final : ::Block {
                 auto gates = profiler.measure("linear.gates_fused", [&]() {
                   return linear_gate_beta_cuda(alpha_raw.reshape({B, T, nv}),
                                                beta_raw.reshape({B, T, nv}),
-                                               dt_bias, a_log);
+                                               dt_bias, a_log, false);
                 });
                 auto gate_t = gates[0];
                 auto beta_t = gates[1];

@@ -205,7 +205,8 @@ __global__ void linear_gate_beta_kernel(
     float* __restrict__ beta_t,
     int64_t B, int64_t T, int64_t V,
     int64_t as0, int64_t as1, int64_t as2,
-    int64_t bs0, int64_t bs1, int64_t bs2)
+    int64_t bs0, int64_t bs1, int64_t bs2,
+    bool stable_softplus)
 {
     size_t n = (size_t)B * (size_t)T * (size_t)V;
     for (size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -215,7 +216,15 @@ __global__ void linear_gate_beta_kernel(
         int64_t t = (int64_t)((idx / (size_t)V) % (size_t)T);
         int64_t b = (int64_t)(idx / ((size_t)T * (size_t)V));
         float a = activation_as_float(alpha[b * as0 + t * as1 + v * as2]) + dt_bias[v];
-        float sp = a > 20.0f ? a : log1pf(expf(a));
+        float sp;
+        if (stable_softplus) {
+            const float magnitude = fabsf(a);
+            const float exponential = expf(__fmul_rn(-1.0f, magnitude));
+            sp = __fadd_rn(fmaxf(a, 0.0f),
+                           static_cast<float>(log1p(static_cast<double>(exponential))));
+        } else {
+            sp = a > 20.0f ? a : log1pf(expf(a));
+        }
         float g = sp * -expf(a_log[v]);
         float bv = activation_as_float(beta[b * bs0 + t * bs1 + v * bs2]);
         float sig = 1.0f / (1.0f + expf(-bv));
@@ -226,7 +235,9 @@ __global__ void linear_gate_beta_kernel(
 }
 
 std::vector<mfq_tensor_backend::Tensor> linear_gate_beta_cuda(
-    mfq_tensor_backend::Tensor alpha, mfq_tensor_backend::Tensor beta, mfq_tensor_backend::Tensor dt_bias, mfq_tensor_backend::Tensor a_log)
+    mfq_tensor_backend::Tensor alpha, mfq_tensor_backend::Tensor beta,
+    mfq_tensor_backend::Tensor dt_bias, mfq_tensor_backend::Tensor a_log,
+    bool stable_softplus)
 {
     MFQ_RUNTIME_CHECK(alpha.is_cuda() && beta.is_cuda(), "linear_gate_beta: alpha/beta must be cuda tensors");
     MFQ_RUNTIME_CHECK(dt_bias.is_cuda() && a_log.is_cuda(), "linear_gate_beta: dt_bias/a_log must be cuda tensors");
@@ -276,6 +287,7 @@ std::vector<mfq_tensor_backend::Tensor> linear_gate_beta_cuda(
             gate_t.data_ptr(), output_shape, mfq::cuda::ScalarType::float32, device),
         mfq::cuda::make_contiguous_view(
             beta_t.data_ptr(), output_shape, mfq::cuda::ScalarType::float32, device),
+        stable_softplus,
         mfq_current_cuda_stream());
     return {gate_t, beta_t};
 }
@@ -365,6 +377,7 @@ void linear_gate_beta(
     const TensorView& a_log,
     const TensorView& gate_t,
     const TensorView& beta_t,
+    bool stable_softplus,
     cudaStream_t stream) {
     if (alpha.rank != 3 || beta.rank != 3 || alpha.scalar_type != beta.scalar_type ||
         alpha.sizes != beta.sizes || dt_bias.scalar_type != ScalarType::float32 ||
@@ -391,7 +404,7 @@ void linear_gate_beta(
             gate_t.data_as<float>(), beta_t.data_as<float>(),
             batch, tokens, width,
             alpha.strides[0], alpha.strides[1], alpha.strides[2],
-            beta.strides[0], beta.strides[1], beta.strides[2]);
+            beta.strides[0], beta.strides[1], beta.strides[2], stable_softplus);
     } else if (alpha.scalar_type == ScalarType::float16) {
         linear_gate_beta_kernel<half><<<grid, block, 0, stream>>>(
             alpha.data_as<half>(), beta.data_as<half>(),
@@ -399,7 +412,7 @@ void linear_gate_beta(
             gate_t.data_as<float>(), beta_t.data_as<float>(),
             batch, tokens, width,
             alpha.strides[0], alpha.strides[1], alpha.strides[2],
-            beta.strides[0], beta.strides[1], beta.strides[2]);
+            beta.strides[0], beta.strides[1], beta.strides[2], stable_softplus);
     } else {
         throw std::invalid_argument("native linear_gate_beta dtype must be f32 or f16");
     }

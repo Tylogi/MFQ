@@ -364,6 +364,43 @@ The shortest path to the next throughput tier is:
 3. Re-profile after I/O overlap, then address NINT and the remaining launch and
    allocation fragmentation shown by the new trace.
 
+#### Follow-up: Qwen gate and router fusion
+
+Two decode-shaped CUDA paths were still paying avoidable per-token work. The
+36 Qwen linear-attention blocks built the GDN decay and beta tensors through a
+chain of scalar, unary, binary and transpose kernels. They now use the existing
+fused gate/beta kernel with the Qwen stable-softplus evaluation preserved. The
+48 MoE blocks also recomputed every expert's softmax weight during each of the
+ten selection ranks. A one-warp `512 -> Top10` path computes those weights once
+and keeps the existing score ordering and selected-weight normalization.
+
+The same 32-step Nsight capture used above gives the following comparison. The
+route, cache statistics, H2D bytes and generated token sequence are unchanged.
+
+| Decode capture metric | Before | Fused operators | Change |
+| --- | ---: | ---: | ---: |
+| CUDA kernels | 268,565 | 257,045 | -11,520 (-4.29%) |
+| `cudaMallocAsync` calls | 219,850 | 209,482 | -10,368 (-4.72%) |
+| `cudaFreeAsync` calls | 218,532 | 208,164 | -10,368 (-4.74%) |
+| Qwen `512 -> Top10` kernel time | 47.691 ms | 6.970 ms | -85.4% |
+| Sum of kernel time | 1.3797 s | 1.3048 s | -5.43% |
+| Kernels, copies and memsets | 1.6751 s | 1.6001 s | -4.48% |
+
+The gate fusion replaces 12,672 generic launches with 1,152 fused launches,
+one per linear-attention block and decode step. The specialized TopK keeps one
+launch per MoE block but lowers its mean time from 31.05 to 4.54 microseconds.
+Measured GPU work falls by 2.35 ms/token. This moves the no-idle estimate from
+19.1 to 20.0 tokens/s for all GPU activity and from 23.2 to 24.5 tokens/s for
+kernels alone.
+
+Two unprofiled runs averaged 4.937 tokens/s versus the preceding 4.932-token/s
+baseline, a 0.09% difference inside the cold SSD variation. The optimization is
+visible in GPU work rather than end-to-end wall time while storage stalls remain
+dominant. The GDN prefill path is bit-identical across 51 trace stages and
+17,310,720 FP32 values. Both decode runs generated the same 33-token sequence;
+the CUDA TopK smoke check also preserves expert IDs and bounds weight error at
+2e-6. The activation and Flash-Next native CUDA tests pass.
+
 ## Tensor and expert parallel execution
 
 The native runtime accepts either a rank count or an ordered CUDA device list.

@@ -104,17 +104,11 @@ class Gdn {
                 return std::array<Tensor, 4>{q, k, v, next_conv};
             },
             [&] {
-                auto gate_input = w_.alpha(execution, x).to(tb::kFloat32).reshape({b, t, nv_}) +
-                                  w_.dt_bias.to(tb::kFloat32).reshape({1, 1, nv_});
-                auto softplus =
-                    tb::clamp_min(gate_input, 0) + tb::log1p(tb::exp(-gate_input.abs()));
-                auto decay = (-w_.a_log.to(tb::kFloat32).exp().reshape({1, 1, nv_}) * softplus)
-                                 .transpose(1, 2)
-                                 .contiguous();
-                auto beta = tb::sigmoid(w_.beta(execution, x).to(tb::kFloat32).reshape({b, t, nv_}))
-                                .transpose(1, 2)
-                                .contiguous();
-                return std::array<Tensor, 2>{decay, beta};
+                auto gates = linear_gate_beta_cuda(
+                    w_.alpha(execution, x).to(tb::kFloat32).reshape({b, t, nv_}),
+                    w_.beta(execution, x).to(tb::kFloat32).reshape({b, t, nv_}),
+                    w_.dt_bias, w_.a_log, true);
+                return std::array<Tensor, 2>{gates[0], gates[1]};
             },
             [&](const auto &convolution, const auto &gates) {
                 auto q = convolution[0], k = convolution[1], v = convolution[2];

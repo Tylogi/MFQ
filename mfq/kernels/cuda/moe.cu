@@ -320,6 +320,93 @@ __device__ __forceinline__ bool moe_score_before(
         (lhs_score == rhs_score && lhs_expert < rhs_expert);
 }
 
+__global__ void __launch_bounds__(32) moe_topk_1x512_10_softmax_kernel(
+        const float * __restrict__ logits,
+        int32_t * __restrict__ ids,
+        float * __restrict__ weights,
+        float norm_floor,
+        float scale) {
+    const int lane = threadIdx.x;
+    __shared__ float transformed[512];
+
+    float maximum = -INFINITY;
+#pragma unroll
+    for (int item = 0; item < 16; ++item) {
+        float value = logits[lane + item * 32];
+        value = isnan(value) ? -FLT_MAX : value;
+        maximum = fmaxf(maximum, value);
+    }
+    maximum = warp_max(maximum);
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int item = 0; item < 16; ++item) {
+        const int expert = lane + item * 32;
+        float value = logits[expert];
+        value = isnan(value) ? -FLT_MAX : value;
+        const float exponential = expf(value - maximum);
+        transformed[expert] = exponential;
+        sum += exponential;
+    }
+    sum = warp_sum(sum);
+#pragma unroll
+    for (int item = 0; item < 16; ++item) {
+        const int expert = lane + item * 32;
+        transformed[expert] /= sum;
+    }
+    __syncwarp();
+
+    int selected[10];
+#pragma unroll
+    for (int rank = 0; rank < 10; ++rank) {
+        float best_score = -INFINITY;
+        int best_expert = INT_MAX;
+#pragma unroll
+        for (int item = 0; item < 16; ++item) {
+            const int expert = lane + item * 32;
+            bool already_selected = false;
+#pragma unroll
+            for (int previous = 0; previous < 10; ++previous) {
+                if (previous < rank && selected[previous] == expert) {
+                    already_selected = true;
+                }
+            }
+            if (!already_selected &&
+                    moe_score_before(
+                        transformed[expert], expert,
+                        best_score, best_expert)) {
+                best_score = transformed[expert];
+                best_expert = expert;
+            }
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float other_score =
+                __shfl_down_sync(0xffffffffu, best_score, offset);
+            const int other_expert =
+                __shfl_down_sync(0xffffffffu, best_expert, offset);
+            if (moe_score_before(
+                    other_score, other_expert,
+                    best_score, best_expert)) {
+                best_score = other_score;
+                best_expert = other_expert;
+            }
+        }
+        best_score = __shfl_sync(0xffffffffu, best_score, 0);
+        best_expert = __shfl_sync(0xffffffffu, best_expert, 0);
+        selected[rank] = best_expert;
+        if (lane == 0) {
+            ids[rank] = best_expert;
+            weights[rank] = best_score;
+        }
+    }
+
+    __syncwarp();
+    float value = lane < 10 ? weights[lane] : 0.0f;
+    float denominator = fmaxf(warp_sum(value), norm_floor);
+    if (lane < 10) weights[lane] = value / denominator * scale;
+}
+
 __global__ void __launch_bounds__(32) moe_topk_1x128_8_kernel(
         const float * __restrict__ logits,
         int32_t * __restrict__ ids,
@@ -1713,6 +1800,15 @@ std::vector<mfq_tensor_backend::Tensor> moe_topk_cuda(
             !use_sigmoid && use_sqrt_softplus && normalize && !delayed_softmax) {
         moe_topk_1x256_6_sqrtsoftplus_kernel<<<1, 256, 0, stream>>>(
             logits.data_ptr<float>(), bias_ptr, ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
+            static_cast<float>(norm_floor), static_cast<float>(scale));
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return {ids, weights};
+    }
+    if (!disable_topk_sort && rows == 1 && experts == 512 && top_k == 10 &&
+            logits.scalar_type() == mfq_tensor_backend::kFloat32 && bias_ptr == nullptr &&
+            !use_sigmoid && !use_sqrt_softplus && normalize && !delayed_softmax) {
+        moe_topk_1x512_10_softmax_kernel<<<1, 32, 0, stream>>>(
+            logits.data_ptr<float>(), ids.data_ptr<int32_t>(), weights.data_ptr<float>(),
             static_cast<float>(norm_floor), static_cast<float>(scale));
         MFQ_CUDA_KERNEL_LAUNCH_CHECK();
         return {ids, weights};

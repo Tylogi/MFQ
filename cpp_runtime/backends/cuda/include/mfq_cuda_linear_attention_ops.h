@@ -6,7 +6,9 @@
 #include <vector>
 
 std::vector<mfq_tensor_backend::Tensor> linear_gate_beta_cuda(
-    mfq_tensor_backend::Tensor alpha, mfq_tensor_backend::Tensor beta, mfq_tensor_backend::Tensor dt_bias, mfq_tensor_backend::Tensor a_log);
+    mfq_tensor_backend::Tensor alpha, mfq_tensor_backend::Tensor beta,
+    mfq_tensor_backend::Tensor dt_bias, mfq_tensor_backend::Tensor a_log,
+    bool stable_softplus);
 std::vector<mfq_tensor_backend::Tensor> gdn_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
                                     mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, MfqOptional<mfq_tensor_backend::Tensor> state);
 std::vector<mfq_tensor_backend::Tensor> gdn_inplace_cuda(mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,

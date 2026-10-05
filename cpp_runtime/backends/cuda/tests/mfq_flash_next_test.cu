@@ -104,6 +104,27 @@ void check_moe_reduce() {
         "Qwen MoE product rounding regressed or legacy FMA behavior changed");
 }
 
+void check_qwen_moe_topk() {
+    const Device gpu{DeviceType::cuda, 0};
+    std::vector<float> values(512);
+    for (int index = 0; index < 512; ++index)
+        values[index] = static_cast<float>((index * 97) % 509 - 254) / 37.0f;
+    auto logits = tensor(values).reshape({1, 512}).to(gpu);
+    auto actual = moe_topk_cuda(
+        logits, 10, false, false, true, false, mfq_nullopt, 1e-20, 1.0);
+    auto expected = topk(softmax(logits, -1), 10, -1, true, true);
+    auto expected_weights = std::get<0>(expected);
+    expected_weights = expected_weights / expected_weights.sum(-1, true);
+    MFQ_RUNTIME_CHECK(
+        actual[0].equal(std::get<1>(expected).to(kInt32)),
+        "Qwen 512x10 MoE TopK indices changed");
+    const float maximum_error =
+        (actual[1] - expected_weights).abs().max().item<float>();
+    MFQ_RUNTIME_CHECK(
+        maximum_error <= 2e-6f,
+        "Qwen 512x10 MoE TopK weights differ: ", maximum_error);
+}
+
 void require_constant(
     const Tensor& value, float expected, float tolerance, const char * name) {
     const auto host = value.to(kFloat32).contiguous().cpu();
@@ -418,6 +439,7 @@ int main(int argc, char** argv) {
                 if (got.data_ptr<float>()[i] != 4.f) throw std::runtime_error("QSA smoke mismatch");
             check_shared_sparse_attention();
             check_moe_reduce();
+            check_qwen_moe_topk();
             check_grouped_rms_norm();
             std::cout << "Flash-Next and shared sparse-attention native smoke passed\n";
             return 0;
