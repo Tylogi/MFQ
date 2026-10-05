@@ -1,6 +1,7 @@
 #pragma once
 
 #include "generation_step.h"
+#include "text_processor.h"
 #include "admission_budget.h"
 #include "text_cancel.h"
 

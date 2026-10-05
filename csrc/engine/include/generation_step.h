@@ -2,6 +2,7 @@
 
 #include "mfq/engine.h"
 #include "generation_policy.h"
+#include "inference.h"
 #include "step_sequence.h"
 
 #include <exception>

@@ -1,10 +1,16 @@
 #pragma once
 
-#include "text_processor.h"
+#include "mfq/engine_types.h"
 
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <optional>
+#include <string>
+#include <unordered_set>
+#include <utility>
 #include <variant>
+#include <vector>
 
 namespace mfq::engine {
 
@@ -34,7 +40,6 @@ struct EngineRequest {
 };
 
 struct PrefillProgress { MfqPrefillTiming timing; };
-using OutputDelta = TokenOutput;
 struct UsageUpdate { std::size_t prompt_tokens = 0, completion_tokens = 0; };
 // Text/tool output travels only in deltas, so terminals have a bounded size.
 struct Completed { std::string finish_reason; UsageUpdate usage; InferenceMetrics metrics; };

@@ -1,14 +1,9 @@
 #pragma once
 
-#include "chat.h"
-#include "mfq/runtime.h"
-#include "mtp_policy.h"
+#include "mfq/engine_types.h"
 #include "tokenizer.h"
 #include "text_emitter.h"
 
-#include <algorithm>
-#include <chrono>
-#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <optional>
@@ -32,24 +27,6 @@ struct InferenceRequest {
     std::optional<MfqMultimodalInput> vision;
 };
 
-struct InferenceMetrics {
-    using Clock = std::chrono::steady_clock;
-
-    Clock::time_point started = Clock::now();
-    Clock::time_point first_token;
-    Clock::time_point last_token;
-    std::size_t prefill_tokens = 0;
-    double prefill_ms = 0.0;
-    double multimodal_ms = 0.0;
-    double model_prefill_ms = 0.0;
-    bool saw_token = false;
-    bool saw_prefill = false;
-    mtp::GenerationStats mtp;
-
-    void mark_prefill(const MfqPrefillTiming& timing);
-    void mark_token();
-};
-
 struct InferenceResult {
     std::string text;
     std::string reasoning_text;
@@ -60,10 +37,7 @@ struct InferenceResult {
     bool cancelled = false;
 };
 
-struct TokenOutput {
-    std::vector<std::int64_t> token_ids;
-    std::vector<common_chat_msg_diff> diffs;
-};
+using TokenOutput = OutputDelta;
 
 // Engine-owned parser state. append/finish only return values.
 class InferenceOutput {
