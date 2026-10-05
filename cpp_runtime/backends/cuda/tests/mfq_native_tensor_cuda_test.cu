@@ -7,6 +7,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <cstdint>
 #include <stdexcept>
@@ -353,16 +354,20 @@ int main() try {
     const auto conversion_input = tensor<float>({
         -65504.0f, -3.1415927f, -0.0f, 0.0f,
         0.00006103515625f, 0.33333334f, 1.0f, 65504.0f})
-        .to(cuda_device).to(kBFloat16).contiguous();
-    set_test_environment("MFQ_DISABLE_NATIVE_CONTIGUOUS_BF16_TO_F16", "1");
-    const auto conversion_reference = host_values(
-        conversion_input.to(kFloat16));
-    set_test_environment("MFQ_DISABLE_NATIVE_CONTIGUOUS_BF16_TO_F16", "0");
-    const auto conversion_candidate = host_values(
-        conversion_input.to(kFloat16));
-    require(
-        conversion_candidate == conversion_reference,
-        "contiguous BF16 to F16 conversion exactness");
+        .reshape({2, 4}).to(cuda_device);
+    for (auto source_dtype : {kFloat32, kFloat16, kBFloat16, kFloat64})
+    for (auto destination_dtype : {kFloat32, kFloat16, kBFloat16, kFloat64})
+    for (bool strided : {false, true}) {
+        auto source = conversion_input.to(source_dtype);
+        if (strided) source = source.transpose(0, 1);
+        set_test_environment("MFQ_DISABLE_NATIVE_CONTIGUOUS_CAST", "1");
+        const auto reference = source.to(destination_dtype).contiguous().cpu();
+        set_test_environment("MFQ_DISABLE_NATIVE_CONTIGUOUS_CAST", "0");
+        const auto candidate = source.to(destination_dtype).contiguous().cpu();
+        require(candidate.nbytes() == reference.nbytes() &&
+            std::memcmp(candidate.data_ptr(), reference.data_ptr(), candidate.nbytes()) == 0,
+            "contiguous conversion changed rounding or strided fallback");
+    }
 
     set_test_environment("MFQ_DISABLE_NATIVE_EXACT_BF16_SOFTMAX", "1");
     const auto softmax_reference = host_values(

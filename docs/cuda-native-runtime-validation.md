@@ -650,6 +650,47 @@ Kernel time totals are 1.212 versus 1.206 s; the profiled activity span is
 longer (4.438 versus 3.750 s), with longer H2D and host API times, so it is
 not evidence of an end-to-end speedup.
 
+#### Follow-up: contiguous dtype conversion and cache occupancy
+
+The existing contiguous BF16-to-F16 conversion kernel now serves all native
+dtype conversions, reusing the original element-conversion function. Compact
+inputs and outputs avoid generic per-element stride decoding; other layouts
+retain the strided kernel. `MFQ_DISABLE_NATIVE_CONTIGUOUS_CAST=1` selects the
+generic path for comparison. The native check compares output bytes for every
+F32/F16/BF16/F64 pair with compact and transposed inputs, including signed zero,
+small values and reduced-precision overflow. It replaces the earlier source
+text assertion with executable numerical coverage. All 55 CTest checks and
+19 remaining CUDA graph source checks pass.
+
+In the same 32-step profile, 42,816 conversion calls consume 130.08 ms versus
+156.93 ms before this change (-17.1%); the number of kernels is unchanged.
+BF16-to-F32 is the dominant conversion direction. Its remaining 4,960 strided
+calls consume 87.21 ms, of which 1,888 large-grid calls consume 81.25 ms.
+Whole-kernel time falls from 1.206 to 1.173 s. GPU activity still covers only
+40.29% of the 3.815 s span, so host/I/O gaps remain the larger target.
+
+The natural long-answer run generates the same 100 IDs and gives 7.660 s
+decode (12.924 tokens/s), versus 7.797 s (12.697 tokens/s) with post fusion
+alone. Prefill is 5.974 s; peak RSS is 24.80 GiB and anonymous RSS 2.09 GiB.
+Pinned and device staging remain 1 GiB each. These single unprofiled runs
+do not isolate a stable wall-time percentage.
+
+Cache statistics now also report `occupied_bytes`, counting the bytes assigned
+to live projection leases. The short prompt's 32-step run occupies
+18,002,746,360 bytes (16.77 GiB) of a 30 GiB allocation. Therefore subtracting
+the configured GPU budget from the model size understates the current host
+complement. Strata's requirement for a fully filled primary cache matters here.
+
+A 36 GiB cache capacity experiment on the same natural workload reduces total
+evictions from 3,097 to 123 and decode H2D from 8,350,022,544 to
+6,924,172,056 bytes. Yet its single-run decode is 7.975 s (12.414 tokens/s),
+with 6.274 s prefill; it does not establish a throughput improvement. After
+prefill it leaves 2,603 MiB device memory free. At the end it occupies only
+27,927,963,936 bytes (26.01 GiB) despite allocating 36 GiB. Peak RSS is
+22.73 GiB and anonymous RSS 2.06 GiB; output IDs are unchanged and no memory
+guard fires. Capacity growth alone does not fill the primary cache or provide
+a bounded RAM complement.
+
 ## Tensor and expert parallel execution
 
 The native runtime accepts either a rank count or an ordered CUDA device list.

@@ -126,15 +126,16 @@ __global__ void convert_strided_kernel(
     }
 }
 
-__global__ void convert_contiguous_bf16_to_f16_kernel(
-    const __nv_bfloat16* __restrict__ input,
-    __half* __restrict__ output,
+template <typename Destination, typename Source>
+__global__ void convert_contiguous_kernel(
+    const Source* __restrict__ input,
+    Destination* __restrict__ output,
     std::int64_t elements) {
     for (std::int64_t linear =
              static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          linear < elements;
          linear += static_cast<std::int64_t>(blockDim.x) * gridDim.x) {
-        output[linear] = __float2half_rn(__bfloat162float(input[linear]));
+        output[linear] = convert_value<Destination>(input[linear]);
     }
 }
 
@@ -237,21 +238,13 @@ void launch_convert(
     constexpr int threads = 256;
     const auto blocks = static_cast<int>(std::min<std::int64_t>(
         4096, (source.numel() + threads - 1) / threads));
-    if constexpr (
-            std::is_same_v<Destination, __half> &&
-            std::is_same_v<Source, __nv_bfloat16>) {
-        const char* disabled =
-            std::getenv("MFQ_DISABLE_NATIVE_CONTIGUOUS_BF16_TO_F16");
-        if (source.is_contiguous() && destination.is_contiguous() &&
-                (disabled == nullptr || disabled[0] != '1')) {
-            convert_contiguous_bf16_to_f16_kernel<<<
-                blocks, threads, 0, stream>>>(
-                reinterpret_cast<const __nv_bfloat16*>(source.data_ptr()),
-                reinterpret_cast<__half*>(destination.data_ptr()),
-                source.numel());
-            MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
-            return;
-        }
+    const char* disabled = std::getenv("MFQ_DISABLE_NATIVE_CONTIGUOUS_CAST");
+    if (source.is_contiguous() && destination.is_contiguous() &&
+            (disabled == nullptr || disabled[0] != '1')) {
+        convert_contiguous_kernel<Destination, Source><<<blocks, threads, 0, stream>>>(
+            source.data_ptr<Source>(), destination.data_ptr<Destination>(), source.numel());
+        MFQ_NATIVE_CUDA_CHECK(cudaGetLastError());
+        return;
     }
     if constexpr (
             std::is_same_v<Destination, __nv_bfloat16> &&

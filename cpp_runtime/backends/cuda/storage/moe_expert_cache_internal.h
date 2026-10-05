@@ -371,6 +371,10 @@ public:
 
     void print_stats(std::ostream & stream) const {
         int64_t pinned_stage_bytes = 0, device_stage_bytes = 0;
+        int64_t occupied_bytes = 0;
+        for (const auto& item : arenas_)
+            if (item.second->book)
+                occupied_bytes += int64_t(item.second->book->size()) * item.second->slot_bytes;
         for (const auto & stage : stages_) {
             if (stage.host.defined()) pinned_stage_bytes += tensor_nbytes(stage.host);
             if (stage.device.defined()) device_stage_bytes += tensor_nbytes(stage.device);
@@ -378,6 +382,7 @@ public:
         stream << "moe_cache_stats"
                << " budget_bytes=" << budget_bytes_
                << " allocated_bytes=" << allocated_bytes_
+               << " occupied_bytes=" << occupied_bytes
                << " host_bytes=" << host_bytes_
                << " file_backed_bytes=" << file_backed_bytes_
                << " pinned_stage_bytes=" << pinned_stage_bytes
