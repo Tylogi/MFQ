@@ -187,7 +187,7 @@ void test_block_gqa_matches_expanded_reference() {
               << " rms=" << rms << "\n";
 }
 
-void test_block_gqa_decode() {
+void test_block_gqa_decode(int block_size) {
     using namespace mlx::core;
     for (const auto dtype : {float16, bfloat16}) {
         for (const int keys : {1, 2, 3, 4, 16, 17, 18, 19, 2048, 2051, 4096}) {
@@ -200,18 +200,18 @@ void test_block_gqa_decode() {
                 auto value = astype(patterned_half(
                     2 * keys * 256, Shape{1, 2, keys, 256}, 71, 1.0f / 463.0f), dtype);
                 std::vector<std::int32_t> ids(count);
-                for (int i = 0; i < count; ++i) ids[i] = i * (keys / 4) / count;
+                for (int i = 0; i < count; ++i) ids[i] = i * (keys / block_size) / count;
                 if (invalid_blocks) {
                     ids[0] = -1;
-                    ids[count - 1] = keys / 4 + 1;
+                    ids[count - 1] = keys / block_size + 1;
                 }
                 array blocks(ids.begin(), Shape{1, 1, count});
                 setenv("MFQ_METAL_SPARSE_GQA_DECODE_GATHER", "0", 1);
                 auto expected = mfq::metal::mlx_sparse_block_gqa_attention(
-                    query, key, value, blocks, keys - 1, 4);
+                    query, key, value, blocks, keys - 1, block_size);
                 setenv("MFQ_METAL_SPARSE_GQA_DECODE_GATHER", "1", 1);
                 auto actual = mfq::metal::mlx_sparse_block_gqa_attention(
-                    query, key, value, blocks, keys - 1, 4);
+                    query, key, value, blocks, keys - 1, block_size);
                 if (actual.shape() != expected.shape() || actual.dtype() != dtype) {
                     throw std::runtime_error("sparse GQA decode shape/dtype mismatch");
                 }
@@ -280,7 +280,7 @@ int main(int argc, char** argv) {
     try {
         mlx::core::set_default_device(mlx::core::Device::gpu);
         test_block_gqa_matches_expanded_reference();
-        test_block_gqa_decode();
+        for (int block_size : {2, 4, 8}) test_block_gqa_decode(block_size);
         if (argc == 2 && std::string(argv[1]) == "--benchmark-decode") {
             benchmark_block_gqa_decode();
         }

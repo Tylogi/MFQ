@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include <mlx/mlx.h>
+#include <mlx/primitives.h>
 
 namespace {
 
@@ -99,7 +101,8 @@ void require_close(
     }
 }
 
-void test_qsa_decode_prologue_matches_reference() {
+void test_qsa_decode_prologue_matches_reference(
+    mlx::core::Dtype dtype, int position, float theta, float eps) {
     using namespace mlx::core;
     constexpr int query_heads = 24;
     constexpr int key_heads = 2;
@@ -107,25 +110,23 @@ void test_qsa_decode_prologue_matches_reference() {
     constexpr int head_dimension = 256;
     constexpr int index_dimension = 128;
     constexpr int rotary_dimension = 64;
-    constexpr float theta = 1.0e7f;
-    constexpr float eps = 1.0e-6f;
     const std::vector<std::int64_t> sections{11, 11, 10};
 
     const auto query_gate = astype(patterned_bfloat(
         static_cast<std::size_t>(query_heads) * 2 * head_dimension,
         Shape{1, 1, query_heads * 2 * head_dimension},
         37,
-        1.0f / 257.0f), float16);
+        1.0f / 257.0f), dtype);
     const auto key_input = astype(patterned_bfloat(
         static_cast<std::size_t>(key_heads) * head_dimension,
         Shape{1, 1, key_heads * head_dimension},
         29,
-        1.0f / 193.0f), float16);
+        1.0f / 193.0f), dtype);
     const auto index_input = astype(patterned_bfloat(
         static_cast<std::size_t>(index_heads + 1) * index_dimension,
         Shape{1, 1, (index_heads + 1) * index_dimension},
         43,
-        1.0f / 211.0f), float16);
+        1.0f / 211.0f), dtype);
     const auto query_weight = astype(patterned_bfloat(
         head_dimension, Shape{head_dimension}, 17, 1.0f / 4096.0f),
         float32);
@@ -138,7 +139,7 @@ void test_qsa_decode_prologue_matches_reference() {
     const mfq::metal::MlxRmsNorm query_norm(query_weight, eps, 1.0f);
     const mfq::metal::MlxRmsNorm key_norm(key_weight, eps, 1.0f);
     const mfq::metal::MlxRmsNorm index_norm(index_weight, eps, 1.0f);
-    const array positions({17}, Shape{1}, int32);
+    const array positions({position}, Shape{1}, int32);
 
     auto query_parts = split(reshape(
         query_gate,
@@ -191,19 +192,26 @@ void test_qsa_decode_prologue_matches_reference() {
         rotary_dimension,
         theta,
         eps);
-    require_bit_exact(
+    const auto check = [dtype](array a, array b, const char* name) {
+        if (dtype == float32) {
+            require_close(std::move(a), std::move(b), 1e-6f, name);
+        } else {
+            require_bit_exact(std::move(a), std::move(b), name);
+        }
+    };
+    check(
         std::move(actual.query),
         std::move(reference_query),
         "Qwen QSA fused query");
-    require_bit_exact(
+    check(
         std::move(actual.output_gate),
         reshape(query_parts.at(1), Shape{1, 1, query_heads * head_dimension}),
         "Qwen QSA fused output gate");
-    require_bit_exact(
+    check(
         std::move(actual.key),
         std::move(reference_key),
         "Qwen QSA fused key");
-    require_bit_exact(
+    check(
         std::move(actual.index_query),
         std::move(reference_index),
         "Qwen QSA fused index query");
@@ -786,12 +794,179 @@ void test_residual_write_norm_matches_composition() {
         "Qwen fused write/RMS injection");
 }
 
+void test_packed_mhc(const char* path) {
+    using namespace mlx::core;
+    using mfq::metal::MlxLinear;
+    const mfq::metal::MfqContainer model(path);
+    const std::string root = model.contains("test.mhc.pre.down.weight")
+        ? "test.mhc" : "model.block.0.attention.mhc";
+    const auto down = MlxLinear::load(model, root + ".pre.down.weight");
+    const auto up = MlxLinear::load(model, root + ".pre.up.weight");
+    const std::optional<MlxLinear> injection = MlxLinear::load(model, root + ".post.inject.weight");
+    const auto mapped_norm = model.map_record(root + ".pre.norm.weight");
+    const auto norm = mfq::metal::load_dense_array(
+        model.record(root + ".pre.norm.weight").dtype, mapped_norm.view());
+    const auto reference = [](const MlxLinear& weight) {
+        if (const auto* nint = weight.nint_weight_ref()) return nint->dequantize();
+        return *weight.dense_weight_ref();
+    };
+    const auto dense_down = reference(down);
+    const auto dense_up = reference(up);
+    const std::optional<array> dense_injection = reference(*injection);
+    std::size_t packed_bytes = 0, expanded_bytes = 0;
+    for (const auto* weight : {&down, &up, &*injection}) {
+        if (const auto* nint = weight->nint_weight_ref()) {
+            if (weight->dense_weight_ref()) throw std::runtime_error("MHC retained a dense weight copy");
+            packed_bytes += nint->packed_nbytes() + nint->row_metadata().nbytes();
+            expanded_bytes += static_cast<std::size_t>(weight->input_size()) * weight->output_size() * 2;
+        }
+    }
+    if (packed_bytes == 0 || packed_bytes >= expanded_bytes)
+        throw std::runtime_error("MHC packed storage did not reduce resident bytes");
+    constexpr int hidden = 2560, streams = 4, width = hidden * streams;
+    const auto compare = [&](Dtype dtype, int rows) {
+        auto input = astype(patterned_bfloat(
+            static_cast<std::size_t>(rows) * width, Shape{1, rows, width},
+            37, 1.0f / 257.0f), dtype);
+        auto expected = mfq::metal::qwen4_gated_residual_pre(
+            input, norm, dense_down, dense_up, dense_injection, hidden, streams);
+        auto actual = mfq::metal::qwen4_gated_residual_pre(
+            input, norm, down, up, injection, hidden, streams);
+        if (rows == 1 && down.nint_weight_ref() && up.nint_weight_ref()
+            && injection->nint_weight_ref() && std::getenv("MFQ_METAL_QWEN_GATED_HC_FAST") == nullptr
+            && std::string(actual.branch.primitive().name()) != "PackedHcPrimitive")
+            throw std::runtime_error("packed MHC did not dispatch its native two-stage primitive");
+        require_close(actual.branch, expected.branch, 5e-3f, "packed MHC branch");
+        require_close(*actual.injection, *expected.injection, 5e-3f, "packed MHC injection");
+        if (rows == 1) {
+            auto expected_after = mfq::metal::qwen4_gated_residual_pre_after(
+                expected.branch, input, *expected.injection, norm,
+                dense_down, dense_up, dense_injection, hidden, streams);
+            auto actual_after = mfq::metal::qwen4_gated_residual_pre_after(
+                expected.branch, input, *expected.injection, norm,
+                down, up, injection, hidden, streams);
+            require_close(actual_after.residual, expected_after.residual, 0.0f, "packed MHC residual");
+            require_close(actual_after.branch, expected_after.branch, 5e-3f, "packed MHC chained branch");
+            require_close(*actual_after.injection, *expected_after.injection, 5e-3f, "packed MHC chained injection");
+            auto rounded_branch = astype(expected.branch, dtype);
+            auto rounded_gate = astype(*expected.injection, dtype);
+            auto rounded_expected = mfq::metal::qwen4_gated_residual_pre_after(
+                rounded_branch, input, rounded_gate, norm,
+                dense_down, dense_up, dense_injection, hidden, streams);
+            auto rounded_actual = mfq::metal::qwen4_gated_residual_pre_after(
+                rounded_branch, input, rounded_gate, norm,
+                down, up, injection, hidden, streams);
+            require_close(rounded_actual.residual, rounded_expected.residual, 0.0f,
+                          "packed MHC low-precision residual");
+            require_close(rounded_actual.branch, rounded_expected.branch, 5e-3f,
+                          "packed MHC low-precision chained branch");
+            auto expected_mix = mfq::metal::qwen4_gated_residual_pre(
+                input, norm, dense_down, dense_up, std::nullopt, hidden, streams);
+            auto actual_mix = mfq::metal::qwen4_gated_residual_pre(
+                input, norm, down, up, std::nullopt, hidden, streams);
+            if (actual_mix.injection) throw std::runtime_error("packed final MHC mixer added injection");
+            require_close(actual_mix.branch, expected_mix.branch, 5e-3f, "packed final MHC mixer");
+        }
+    };
+    for (auto dtype : {float16, bfloat16, float32}) {
+        for (int rows : {1, 3, 64, 2048}) compare(dtype, rows);
+    }
+    std::cout << "packed MHC decode, chained residual, final mixer and 2048-row prefill passed: "
+              << packed_bytes << " packed bytes / " << expanded_bytes << " expanded bytes\n";
+}
+
+void benchmark_packed_mhc(const char* path) {
+    using namespace mlx::core;
+    using mfq::metal::MlxLinear;
+    const mfq::metal::MfqContainer model(path);
+    struct Weights {
+        array norm;
+        MlxLinear down;
+        MlxLinear up;
+        std::optional<MlxLinear> injection;
+        array dense_down;
+        array dense_up;
+        std::optional<array> dense_injection;
+    };
+    std::vector<std::string> names;
+    for (const auto& [name, record] : model.records()) {
+        if (name.find(".mhc.") != std::string::npos &&
+            name.ends_with(".pre.down.weight") && mfq::metal::is_nint_dtype(record.dtype))
+            names.push_back(name);
+    }
+    std::sort(names.begin(), names.end());
+    std::vector<Weights> weights;
+    for (const auto& name : names) {
+        const auto root = name.substr(0, name.size() - std::string(".pre.down.weight").size());
+        auto down = MlxLinear::load(model, name);
+        auto up = MlxLinear::load(model, root + ".pre.up.weight");
+        const auto mapped_norm = model.map_record(root + ".pre.norm.weight");
+        auto norm = mfq::metal::load_dense_array(
+            model.record(root + ".pre.norm.weight").dtype, mapped_norm.view());
+        std::optional<MlxLinear> injection;
+        if (model.contains(root + ".post.inject.weight"))
+            injection = MlxLinear::load(model, root + ".post.inject.weight");
+        const auto reference = [](const MlxLinear& weight) {
+            if (const auto* nint = weight.nint_weight_ref()) return nint->dequantize();
+            return *weight.dense_weight_ref();
+        };
+        auto dense_down = reference(down), dense_up = reference(up);
+        std::optional<array> dense_injection;
+        if (injection) dense_injection = reference(*injection);
+        weights.push_back({std::move(norm), std::move(down), std::move(up), std::move(injection),
+            std::move(dense_down), std::move(dense_up), std::move(dense_injection)});
+    }
+    if (weights.empty()) throw std::runtime_error("no quantized MHC projections to benchmark");
+    const auto input = astype(patterned_bfloat(10240, Shape{1, 1, 10240}, 37, 1.0f / 257.0f), float32);
+    const auto execute = [&](const Weights& w, bool packed) {
+        auto result = packed
+            ? mfq::metal::qwen4_gated_residual_pre(input, w.norm, w.down, w.up, w.injection, 2560, 4)
+            : mfq::metal::qwen4_gated_residual_pre(input, w.norm, w.dense_down, w.dense_up, w.dense_injection, 2560, 4);
+        std::vector<array> outputs{result.branch};
+        if (result.injection) outputs.push_back(*result.injection);
+        eval(outputs);
+        return result;
+    };
+    for (const auto& w : weights) {
+        auto packed = execute(w, true), dense = execute(w, false);
+        require_close(packed.branch, dense.branch, 5e-3f, "rotating real MHC branch");
+        if (packed.injection) require_close(*packed.injection, *dense.injection, 5e-3f, "rotating real MHC injection");
+    }
+    for (int round = 0; round < 3; ++round) {
+        for (int order = 0; order < 2; ++order) {
+            const bool packed = (round + order) % 2 == 0;
+            const auto start = std::chrono::steady_clock::now();
+            for (int repetition = 0; repetition < 4; ++repetition) {
+                for (const auto& w : weights) execute(w, packed);
+            }
+            const auto milliseconds = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+            std::cout << "{\"round\":" << round << ",\"packed\":" << (packed ? "true" : "false")
+                      << ",\"weight_sets\":" << weights.size() << ",\"normal_eval_ms_per_mhc\":"
+                      << milliseconds / (4 * weights.size()) << "}\n";
+        }
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 3 && std::string(argv[1]) == "--packed-mhc") {
+            test_packed_mhc(argv[2]);
+            return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--benchmark-packed-mhc") {
+            benchmark_packed_mhc(argv[2]);
+            return 0;
+        }
         test_decode_fast_path_matches_reference();
-        test_qsa_decode_prologue_matches_reference();
+        for (auto dtype : {mlx::core::float16, mlx::core::bfloat16,
+                           mlx::core::float32}) {
+            test_qsa_decode_prologue_matches_reference(dtype, 17, 1e7f, 1e-6f);
+            test_qsa_decode_prologue_matches_reference(dtype, 4099, 1e5f, 3e-5f);
+            test_qsa_decode_prologue_matches_reference(dtype, 0, 1e7f, 1e-6f);
+        }
         test_mixed_storage_decode_matches_promoted_reference();
         test_residual_post_preserves_rounding();
         test_residual_write_norm_matches_composition();
