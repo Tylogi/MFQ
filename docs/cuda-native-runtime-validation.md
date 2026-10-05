@@ -573,6 +573,57 @@ separate staging sequence; no prefill speedup is claimed. Its retained pinned
 and device staging are each 1 GiB. The longer prompt warms more experts, so
 its absolute decode speed cannot be compared directly with the 23-token prompt.
 
+#### Follow-up: measured limit of deferred mixed-field Down reads
+
+Metal publishes Gate/Up readiness before its workers continue with Down reads.
+A CUDA experiment extended the existing exact-range deferred reader to mapped
+mixed fields, using the same eight workers and one reusable pinned read buffer
+bounded to 16 MiB. It then copied completed Down bytes into the existing transfer
+stage. This experiment was tested and **reverted** because it did not improve
+the natural 80-token prompt, 100 generated tokens and 30 GiB expert-cache case:
+
+| Same-binary measurement | Joint staging, overlap disabled | Deferred Down | Deferred Down repeat |
+| --- | ---: | ---: | ---: |
+| Decode tokens/s | 12.438 | 11.983 | 12.075 |
+| Prefill s | 5.878 | 5.926 | 6.047 |
+| Decode s | 7.959 | 8.262 | 8.199 |
+| Staging ms/token | 23.58 | 21.12 | 20.77 |
+| Additional deferred-reader wait ms/token | 0 | 11.07 | 11.08 |
+| Route wait ms/token | 19.22 | 13.68 | 13.99 |
+| Decode transfer submissions | 2,121 | 4,021 | 4,021 |
+
+The generated 100 IDs and 8,350,022,544 decode H2D bytes are identical across
+all three runs; all timed steps precede EOS. Reduced synchronous staging and
+route wait therefore do not establish an improvement: the separate Down read
+adds a CPU copy, another wait and almost twice as many transfer submissions.
+The previously recorded 11.650 tokens/s joint run also demonstrates meaningful
+run variation. No speedup is attributed to this rejected schedule.
+
+The joint run retains 1 GiB pinned and 1 GiB device staging, with peak RSS
+23.14 GiB and anonymous RSS 2.13 GiB. Its sampled RSS peak contains 20.92 GiB
+file RSS, 1.01 GiB shared RSS and 1.16 GiB anonymous RSS. Deferred runs retained
+an extra 8,576,112-byte read buffer and reached 23.23–24.71 GiB peak RSS; no
+memory guard fired. These measurements still use reclaimable file pages rather
+than a pinned RAM cache of the GPU-cache complement.
+
+One correctness fix from this experiment remains: exact-range deferred bundles
+that share a GPU arena must admit Gate/Up/Down together. Otherwise Down can
+evict Gate/Up before their forward calls when the arena fits only the ready
+projections. The existing binding check now exercises a two-slot arena with
+both host and exact-range sources, accepts the two-source bundle, rejects the
+three-source bundle and checks normal forward fallback. All 55 CTest checks pass.
+
+An Nsight capture of the preceding bounded-bundle implementation's first 32
+decode steps spans 3.750 s, with GPU activities covering 1.570 s (41.87%). It
+contains 254,792 kernels, 209,482 `cudaMallocAsync` calls and 208,164 frees.
+NINT kernels consume 12.48 ms/token, NVQ 2.80 ms/token, other kernels
+21.75 ms/token and scatter 0.76 ms/token; H2D copies consume 11.00 ms/token.
+This leaves both host/I/O gaps and eager tensor operations as measured targets.
+Keeping the same serialized GPU activity would require about 49.08 ms/token
+(20.37 tokens/s); this is a scheduling bound for that trace, not a hardware
+limit. Capture/report processing affects profiled `decode_sec`, so throughput
+claims use separate unprofiled runs.
+
 ## Tensor and expert parallel execution
 
 The native runtime accepts either a rank count or an ordered CUDA device list.

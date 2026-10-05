@@ -213,8 +213,9 @@ static void check_cached_moe_binding() {
     auto options = TensorOptions().device(kCUDA);
     auto input = (arange(32, options.dtype(kFloat32)) * 0.01 - 0.1)
                      .to(kFloat16).reshape({1, 32});
-    for (bool ranges : {false, true}) {
-        execution.moe_expert_cache = make_moe_expert_cache(1 << 20, execution.config);
+    // Two shared slots fit Gate/Down but cannot admit split Gate/Up/Down.
+    for (bool ranges : {false, true}) for (int budget : {136, 1 << 20}) {
+        execution.moe_expert_cache = make_moe_expert_cache(budget, execution.config);
         auto& cache = execution.moe_expert_cache;
         std::weak_ptr<MoeExpertCache> lifetime = cache;
         auto runtime = ranges ? make_mxfp4_range_runtime(*store)
@@ -247,7 +248,8 @@ static void check_cached_moe_binding() {
             auto ids = tensor(std::vector<int32_t>{expert}, options.dtype(kInt32)).reshape({1, 1});
             auto route = build_moe_route_plan(ids, 2);
             projection.prefetch_begin(route);
-            check(projection.prefetch_bundle(down, route), "routed bundle did not prefetch");
+            check(projection.prefetch_bundle(down, route) == (!split || budget > 136),
+                  "routed bundle ignored shared-arena capacity");
             check(bool(route.host_unique_experts), "routed prefetch did not consume its route");
             auto expected = resident.forward(execution, input, route).to(kFloat32);
             auto actual = projection(execution, input, route).to(kFloat32);

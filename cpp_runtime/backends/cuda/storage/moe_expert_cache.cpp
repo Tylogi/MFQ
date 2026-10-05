@@ -846,6 +846,16 @@ bool MoeExpertCache::prepare_bundle_deferred(
         sources.push_back(&deferred_source);
         return prepare_bundle(sources, experts);
     }
+    // Down must not evict Gate/Up before their forward calls. Shared arenas
+    // need admission for the complete bundle, including the deferred source.
+    for (const auto* ready : ready_sources)
+        for (const auto& first : ready->cohorts_)
+            for (const auto& second : deferred_source.cohorts_)
+                if (first.arena == second.arena) {
+                    auto sources = ready_sources;
+                    sources.push_back(&deferred_source);
+                    return prepare_bundle(sources, experts);
+                }
     if (!prepare_bundle(ready_sources, experts)) return false;
     return begin_deferred_range_read(deferred_source, experts);
 }
