@@ -758,6 +758,61 @@ trace's 47.0 ms GPU activity per step implies about 21.3 tokens/s if its work
 and transfers could be scheduled without gaps; this is a bound for that
 specific trace, not a hardware-wide speed limit or a warm-cache prediction.
 
+## Profile the warmed expert cache (2026-10-05)
+
+Set `MFQ_CUDA_PROFILER_RANGE=1 MFQ_CUDA_PROFILER_SKIP_TOKENS=479` and use
+512 generated tokens to capture only decode steps 480–511. The skip value
+counts completed decode steps; it excludes the first token produced by
+prefill. Both eager and graph replay drain pending GPU work at the capture
+boundary. The profiler is stopped only if its start boundary was reached.
+The default skip is zero, preserving the original full-decode capture.
+
+The captured 32-step window has 248,170 kernels and exactly 1,536 weighted
+expert reductions (48 layers per step). All 512 generated IDs match the
+unprofiled run, with no EOS. GPU activity occupies 1.206 s of the 1.981 s span
+(60.88%), versus 40.88% in the initial short-prompt trace. Work in this window:
+
+| Item | Time over 32 steps | Per step |
+| --- | ---: | ---: |
+| NINT kernels, 22,208 calls | 391.64 ms | 12.24 ms |
+| NVQ kernels, 4,608 calls | 87.32 ms | 2.73 ms |
+| Other kernels | 641.12 ms | 20.04 ms |
+| H2D, 785,480,256 bytes | 73.19 ms | 2.29 ms |
+| CUDA launch API, 243,146 calls | 508.52 ms | 15.89 ms |
+| CUDA allocation/free APIs | 173.81 ms | 5.43 ms |
+| CPU wait for route events, 1,536 calls | 269.12 ms | 8.41 ms |
+
+API durations overlap GPU activity and must not be added to kernel/copy time.
+The trace still has 775 ms with no GPU activity. Its observed GPU work and
+transfers imply about 26.5 tokens/s if scheduling gaps could be removed;
+this remains a bound for these routes and this context, not a hardware limit.
+Nsight report processing is included in the diagnostic's final decode timer,
+so use the separate unprofiled run for end-to-end throughput.
+
+The mixed-runtime loop submits every pool even when none of that pool's
+experts was selected. Cache admission already has the unique CPU route IDs.
+Retain the existing expert-to-cohort ownership map in the active runtime and
+use those IDs to skip unselected pools. This introduces no new route readback
+or memory tier, and leaves GPU-only routes on the original path. The real
+512-expert MFE projection passes all 464 bit-equality cases, including 4,729
+evictions; all 55 CTest checks pass.
+
+The single unprofiled 512-token run gives 31.556 s for 511 decode steps
+(16.193 tokens/s), versus 31.956 s (15.991 tokens/s). Its four windows give
+13.504, 16.117, 17.583 and 18.524 tokens/s. The first window is slower while
+later windows improve; this does not establish a stable whole-run percentage.
+All 512 IDs match. Load takes 133.491 s, prefill 6.095 s, peak RSS 24.82 GiB
+and anonymous RSS 2.08 GiB. Staging and cache budgets are unchanged.
+
+In the same late-32-step profile, pool filtering removes 4,154 kernels:
+248,170 becomes 244,016. NINT calls fall from 22,208 to 18,442 and their time
+from 391.64 to 374.17 ms. Whole-kernel time falls from 1.1269 to 1.1091 s,
+and CUDA launch API time from 508.52 to 487.94 ms. H2D bytes, descriptors,
+residency, route IDs and eviction counts are unchanged. H2D time itself
+varies from 73.19 to 59.20 ms despite identical bytes, so the trace's
+1.981-to-1.941 s span change cannot all be attributed to pool filtering.
+The profiled run also produces the same 512 IDs.
+
 ## Tensor and expert parallel execution
 
 The native runtime accepts either a rank count or an ordered CUDA device list.

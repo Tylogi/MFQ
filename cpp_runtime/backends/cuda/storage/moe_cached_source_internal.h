@@ -223,6 +223,7 @@ public:
         active_->n_experts = cpu_->n_experts;
         active_->out_per_expert = cpu_->out_per_expert;
         active_->neuron_len = cpu_->neuron_len;
+        active_->host_expert_pool = expert_to_cohort_;
         active_->pools.reserve(cohorts_.size());
         for (auto & cohort : cohorts_) {
             auto & source = *cohort.cpu;

@@ -121,6 +121,7 @@ struct MixedMoeRuntime {
     int neuron_len = 0;
     bool partial_experts = false;
     std::vector<MixedMoePool> pools;
+    std::vector<int> host_expert_pool;
     std::shared_ptr<MixedNvqDispatch> nvq_dispatch;
     mutable std::unordered_map<
         MixedMoeActivationKey, MoeActivationWorkspace,

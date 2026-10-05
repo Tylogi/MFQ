@@ -65,6 +65,15 @@ int generate_diagnostic_tokens(
         const char * cuda_profiler_env = std::getenv("MFQ_CUDA_PROFILER_RANGE");
         const bool cuda_profiler_range = cuda_profiler_env != nullptr &&
             std::atoi(cuda_profiler_env) != 0;
+        const char* profiler_skip_env = std::getenv("MFQ_CUDA_PROFILER_SKIP_TOKENS");
+        const int profiler_skip = profiler_skip_env ? std::max(0, std::atoi(profiler_skip_env)) : 0;
+        bool profiler_started = false;
+        const auto start_profiler = [&](int completed_tokens) {
+            if (!cuda_profiler_range || completed_tokens != profiler_skip || profiler_started) return;
+            mfq_cuda_synchronize();
+            MFQ_CUDA_CHECK(cudaProfilerStart());
+            profiler_started = true;
+        };
         const char* progress_env = std::getenv("MFQ_DECODE_PROGRESS");
         const bool progress = progress_env != nullptr && std::atoi(progress_env) != 0;
         int progress_token = 0;
@@ -88,7 +97,7 @@ int generate_diagnostic_tokens(
             progress_time = now;
         };
         auto decode_replay_t0 = t2;
-        if (cuda_profiler_range) MFQ_CUDA_CHECK(cudaProfilerStart());
+        start_profiler(0);
         if (use_cuda_graph) {
             auto static_input = mfq_tensor_backend::empty({1, 1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
             auto static_pos = mfq_tensor_backend::empty({1}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
@@ -156,12 +165,14 @@ int generate_diagnostic_tokens(
 
             decode_replay_t0 = std::chrono::steady_clock::now();
             for (int i = 1; i < gen; ++i) {
+                start_profiler(i - 1);
                 graph.replay();
                 report_progress(i);
             }
             MFQ_CUDA_CHECK(cudaStreamSynchronize(graph_raw_stream));
         } else {
             for (int i = 1; i < gen; ++i) {
+                start_profiler(i - 1);
                 next = profiler.measure("decode.eager_model", [&]() {
                     return model.next_token(next.view({1, 1}));
                 });
@@ -176,7 +187,7 @@ int generate_diagnostic_tokens(
             }
         }
         mfq_cuda_synchronize();
-        if (cuda_profiler_range) MFQ_CUDA_CHECK(cudaProfilerStop());
+        if (profiler_started) MFQ_CUDA_CHECK(cudaProfilerStop());
         auto t3 = std::chrono::steady_clock::now();
         profiler.report("decode");
         auto generated_tensor = generated_cuda.to(mfq_tensor_backend::kCPU).contiguous();

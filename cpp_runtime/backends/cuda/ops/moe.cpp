@@ -1462,7 +1462,13 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
         quantized.insert(activation_key);
     }
 
-    for (const auto & pool : pools) {
+    for (size_t pool_index = 0; pool_index < pools.size(); ++pool_index) {
+        const auto& pool = pools[pool_index];
+        // Cache admission already read these routes; don't launch unselected pools.
+        if (!host_expert_pool.empty() && route.host_unique_experts &&
+            std::none_of(route.host_unique_experts->begin(), route.host_unique_experts->end(),
+                [&](int expert) { return host_expert_pool.at(expert) == int(pool_index); }))
+            continue;
         if (pool.family == MixedMoeFamily::Nvq &&
                 (use_nvq_prefill || use_nvq_decode)) {
             continue;
