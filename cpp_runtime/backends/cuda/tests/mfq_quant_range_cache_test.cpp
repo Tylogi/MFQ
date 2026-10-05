@@ -97,12 +97,13 @@ void verify_gpu(const tb::Tensor& cached,const tb::Tensor& original) {
 // GPU results must equal the existing canonical GPU dispatch bit-for-bit;
 // CPU results are checked against an independent Python codec + FP64 oracle.
 int main(int argc,char** argv) try {
-    if (argc<2 || argc>4) throw std::runtime_error("expected fixture directory [--host-cache] [--benchmark]");
-    bool host_cache=false,benchmark=false;
+    if (argc<2 || argc>5) throw std::runtime_error("expected fixture directory [--host-cache] [--benchmark] [--shared-arena]");
+    bool host_cache=false,benchmark=false,shared_arena=false;
     for (int argument=2; argument<argc; ++argument) {
         const std::string option=argv[argument];
         if (option=="--host-cache") host_cache=true;
         else if (option=="--benchmark") benchmark=true;
+        else if (option=="--shared-arena") shared_arena=true;
         else throw std::runtime_error("unknown range cache test option");
     }
     const std::filesystem::path root(argv[1]);
@@ -142,6 +143,32 @@ int main(int argc,char** argv) try {
         auto x=tb::tensor(inputs).reshape({tokens,width}).to(tb::kFloat16).to(tb::kCUDA);
         const std::vector<std::int32_t> all={2,0,1,0,1,2,1,2,0};
         const auto cold_route=route(all,tokens,3);
+        if (shared_arena) {
+            // Four physical slots serve two independent three-ID sources.
+            // The source ID map remains length three and can map into slot 3.
+            auto shared=make_moe_expert_cache(4*bytes,execution.config);
+            auto first=std::make_shared<MoeQuantRangeSource>(store);
+            auto second=std::make_shared<MoeQuantRangeSource>(store);
+            auto a=cache_quant_moe_weight(shared,"first.weight",first,1,0,"gate");
+            auto b=cache_quant_moe_weight(shared,"second.weight",second,1,1,"gate");
+            finalize_moe_expert_cache(shared);
+            auto routed=x.unsqueeze(1).expand({tokens,3,width}).contiguous();
+            auto prefill=tb::cat({x,x,x,x},0).contiguous();
+            std::vector<std::int32_t> prefill_ids;
+            for (int repeat=0; repeat<4; ++repeat) prefill_ids.insert(prefill_ids.end(),all.begin(),all.end());
+            auto prefill_route=route(prefill_ids,tokens*4,3);
+            for (int round=0; round<4; ++round) {
+                auto& weight=round%2 ? b : a;
+                verify_gpu(weight.forward(execution,x,cold_route),baseline.forward(execution,x,cold_route));
+                verify_gpu(weight.forward(execution,routed,cold_route),baseline.forward(execution,routed,cold_route));
+                verify_gpu(weight.forward(execution,prefill,prefill_route),baseline.forward(execution,prefill,prefill_route));
+            }
+            if (first->cpu_projections() || second->cpu_projections())
+                throw std::runtime_error("shared physical slots fell back to CPU");
+            std::cout<<"shared_arena "<<name<<" source_ids=3 physical_budget_slots=4 GPU bitexact PASS"<<std::endl;
+            ++cases;
+            continue;
+        }
         verify_cpu(cached.forward(execution,x,cold_route),reference,all,tokens,3,output);
         if (source->cpu_projections()!=3) throw std::runtime_error("cold route did not use selected CPU projections");
         const auto cold_read_bytes=bytes_read;

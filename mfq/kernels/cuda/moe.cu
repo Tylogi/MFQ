@@ -1866,8 +1866,8 @@ mfq_tensor_backend::Tensor mfe_nint_matmul_ws_cuda(
         n_experts > 0 && n_experts <= 4096,
         "n_experts must be in [1, 4096]");
     MFQ_RUNTIME_CHECK(
-        n_local_experts > 0 && n_local_experts <= n_experts,
-        "n_local_experts must be in [1, n_experts]");
+        n_local_experts > 0 && n_local_experts <= INT_MAX,
+        "n_local_experts must be a positive CUDA slot count");
     MFQ_RUNTIME_CHECK(
         out_per_expert > 0 && out_per_expert <= INT_MAX,
         "out_per_expert must be positive");
@@ -2054,7 +2054,8 @@ mfq_tensor_backend::Tensor mfe_nint_matmul_ws_cuda(
         use_compact, ids_dst, expert_bounds, tile_bounds, tile_experts, out,
         tokens, routes, experts, output_width, groups, k_pad, source_width,
         static_cast<int>(gs), q_expert_stride, static_cast<int>(route_tile_m),
-        static_cast<int>(pool_phase), local_experts < experts,
+        // A shared arena can contain more slots than this source has IDs.
+        static_cast<int>(pool_phase), local_experts != experts,
         static_cast<int>(epilogue_mode), routed_input, stream);
     return out;
 }
@@ -2085,14 +2086,16 @@ mfq_tensor_backend::Tensor nint8_zero_moe_grouped_matmul_pool_ws_cuda(
         n_experts > 0 && n_experts <= 4096,
         "n_experts must be in [1, 4096]");
     MFQ_RUNTIME_CHECK(
-        n_local_experts > 0 && n_local_experts <= n_experts,
-        "n_local_experts must be in [1, n_experts]");
+        n_local_experts > 0 && n_local_experts <= INT_MAX,
+        "n_local_experts must be a positive CUDA slot count");
     MFQ_RUNTIME_CHECK(
         out_per_expert > 0 && out_per_expert <= INT_MAX,
         "out_per_expert must be positive");
     const int experts = static_cast<int>(n_experts);
     const int local_experts = static_cast<int>(n_local_experts);
     const int output_width = static_cast<int>(out_per_expert);
+    MFQ_RUNTIME_CHECK(local_experts <= INT_MAX / output_width,
+        "NINT8-0 MoE row count exceeds the CUDA index range");
     MFQ_RUNTIME_CHECK(
         q.is_cuda() && q.is_contiguous() &&
         q.scalar_type() == mfq_tensor_backend::kUInt8 && q.dim() == 3 &&
