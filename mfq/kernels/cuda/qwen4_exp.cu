@@ -2,6 +2,7 @@
 
 #include "selected_attention.h"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
@@ -11,6 +12,20 @@ using tb::Tensor;
 
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
 namespace {
+template <typename Branch>
+__global__ void gated_residual_post_kernel(const Branch* branch, const float* residual,
+    const float* injection, float* output, int64_t count, int64_t hidden, int64_t streams) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < count; i += int64_t(gridDim.x) * blockDim.x) {
+        const int64_t row = i / (hidden * streams);
+        const int64_t stream = (i / hidden) % streams;
+        // Match Metal's separate multiply/add rounding; FMA changes residual bits.
+        const float update = __fmul_rn(float(branch[row * hidden + i % hidden]),
+            injection[row * streams + stream]);
+        output[i] = __fadd_rn(residual[i], update);
+    }
+}
+
 template <int Threads>
 __global__ void grouped_rms_norm_kernel(const float* input, const float* weight,
     float* output, int64_t group, int64_t width, double eps) {
@@ -119,6 +134,25 @@ Tensor gated_residual_post(const Tensor& branch, const Tensor& residual,
     shape.back() = streams;
     MFQ_RUNTIME_CHECK(injection.sizes().vec() == shape, "Qwen4 injection shape disagrees");
     MfqCudaGuard guard(branch.device());
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    if (residual.scalar_type() == tb::kFloat32 && injection.scalar_type() == tb::kFloat32) {
+        auto b = branch.contiguous(), r = residual.contiguous(), g = injection.contiguous();
+        auto output = tb::empty(residual.sizes(), residual.options());
+        if (output.numel()) {
+            const auto blocks = unsigned(std::min<int64_t>((output.numel() + 255) / 256, 65535));
+            const auto launch = [&]<typename Branch>() {
+                gated_residual_post_kernel<Branch><<<blocks, 256, 0, mfq_current_cuda_stream()>>>(
+                    b.data_ptr<Branch>(), r.data_ptr<float>(), g.data_ptr<float>(), output.data_ptr<float>(),
+                    output.numel(), branch.size(-1), streams);
+            };
+            if (branch.scalar_type() == tb::kFloat32) launch.template operator()<float>();
+            else if (branch.scalar_type() == tb::kFloat16) launch.template operator()<__half>();
+            else launch.template operator()<__nv_bfloat16>();
+            MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+        return output;
+    }
+#endif
     return residual + (branch.unsqueeze(-2) * injection.unsqueeze(-1)).reshape(residual.sizes());
 }
 

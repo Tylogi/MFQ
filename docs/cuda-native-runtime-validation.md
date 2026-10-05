@@ -624,6 +624,32 @@ Keeping the same serialized GPU activity would require about 49.08 ms/token
 limit. Capture/report processing affects profiled `decode_sec`, so throughput
 claims use separate unprofiled runs.
 
+#### Follow-up: Qwen gated-residual post fusion
+
+CUDA now follows Metal's gated-residual post kernel: each thread reads the
+branch value and its stream's injection gate, rounds their product, then adds
+the residual with a separate rounding step. Explicit multiply/add instructions
+preserve the eager tensor path's bits. The native fast path handles FP32
+residuals and gates with F32/F16/BF16 branches, including contiguous
+materialization of strided inputs. Other dtype combinations retain the existing
+expression.
+
+The native check compares output bytes for all three branch types, one and 23
+tokens, widths 7 and 2560, contiguous and strided layouts, and a value where
+FMA would change the result. All 55 CTest checks pass. The real model produces
+the same 100 generated IDs for the natural long-answer workload. Its unprofiled
+decode is 7.797 s (12.697 tokens/s), compared with 7.959 s (12.438 tokens/s) for
+the joint-staging control; these single runs do not establish a stable 2.1%
+wall-time gain.
+
+The same 32-step Nsight workload confirms the structural reduction: 3,040 fused
+post calls replace 6,080 binary kernels and 1,504 F16-to-F32 conversions.
+Total kernels fall from 254,792 to 250,248, and `cudaMallocAsync` calls from
+209,482 to 204,938. Expert H2D payload and submission count are unchanged.
+Kernel time totals are 1.212 versus 1.206 s; the profiled activity span is
+longer (4.438 versus 3.750 s), with longer H2D and host API times, so it is
+not evidence of an end-to-end speedup.
+
 ## Tensor and expert parallel execution
 
 The native runtime accepts either a rank count or an ordered CUDA device list.

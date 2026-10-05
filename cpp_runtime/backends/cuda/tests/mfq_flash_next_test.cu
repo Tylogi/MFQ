@@ -71,6 +71,37 @@ void check_grouped_rms_norm() {
     }
 }
 
+void check_gated_residual_post() {
+    const Device gpu{DeviceType::cuda, 0};
+    for (auto dtype : {kFloat32, kFloat16, kBFloat16})
+    for (int hidden : {7, 2560}) for (int tokens : {1, 23}) {
+        constexpr int streams = 4;
+        std::vector<float> values(tokens * hidden), residuals(tokens * hidden * streams), gates(tokens * streams);
+        for (size_t i = 0; i < values.size(); ++i)
+            values[i] = (int(i * 17 % 257) - 128) / 11.0f;
+        for (size_t i = 0; i < residuals.size(); ++i)
+            residuals[i] = (int(i * 13 % 193) - 96) / 7.0f;
+        for (size_t i = 0; i < gates.size(); ++i)
+            gates[i] = (int(i % 19) - 9) / 17.0f;
+        // The separately rounded product differs from FMA at this element.
+        values[0] = 0x1.000002p+0f; gates[0] = 0x1.fffffep-1f; residuals[0] = -1.0f;
+        auto branch = tensor(values).to(gpu, dtype).reshape({1, tokens, hidden});
+        auto residual = tensor(residuals).to(gpu).reshape({1, tokens, hidden * streams});
+        auto injection = tensor(gates).to(gpu).reshape({1, tokens, streams});
+        for (bool strided : {false, true}) {
+            auto layout = [strided](const Tensor& value) {
+                return strided ? value.transpose(-1, -2).contiguous().transpose(-1, -2) : value;
+            };
+            auto b = layout(branch), r = layout(residual), g = layout(injection);
+            auto expected = (r + (b.unsqueeze(-2) * g.unsqueeze(-1)).reshape(r.sizes())).cpu();
+            auto actual = mfq_qwen4_exp::gated_residual_post(b, r, g, streams).cpu();
+            MFQ_RUNTIME_CHECK(actual.scalar_type() == expected.scalar_type() &&
+                std::memcmp(actual.data_ptr(), expected.data_ptr(), actual.nbytes()) == 0,
+                "Qwen gated residual post output bits changed");
+        }
+    }
+}
+
 Tensor unfused_moe_reduce(const Tensor& pairs, const Tensor& weights) {
     auto result = zeros({pairs.size(0), pairs.size(2)}, weights.options());
     for (int64_t route = 0; route < pairs.size(1); ++route)
@@ -441,6 +472,7 @@ int main(int argc, char** argv) {
             check_moe_reduce();
             check_qwen_moe_topk();
             check_grouped_rms_norm();
+            check_gated_residual_post();
             std::cout << "Flash-Next and shared sparse-attention native smoke passed\n";
             return 0;
         }
