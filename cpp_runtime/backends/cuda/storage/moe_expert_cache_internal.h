@@ -37,6 +37,7 @@ public:
             std::make_unique<mfq::cuda::MfeMxfp4ReadPool>(
                 config.moe_ssd_io_workers);
         range_overlap_enabled_ = config.moe_ssd_overlap;
+        nvq_heterogeneous_enabled_ = config.moe_nvq_heterogeneous;
     }
 
     ~MoeExpertCache() {
@@ -787,4 +788,5 @@ private:
     std::unordered_map<int, std::unique_ptr<MoePendingRangeRead>>
         pending_range_reads_;
     bool range_overlap_enabled_ = true;
+    bool nvq_heterogeneous_enabled_ = true;
 };

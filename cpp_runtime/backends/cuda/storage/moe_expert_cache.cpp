@@ -501,6 +501,10 @@ void MoeExpertCache::append_source_transfers(
             cohort.host_map[
                 static_cast<size_t>(expert)] = lease.slot;
             cohort.map_dirty = true;
+            if (source.active_->nvq_dispatch && cohort.cpu->family == MixedMoeFamily::Nvq) {
+                source.nvq_host_map_[static_cast<size_t>(expert)] = lease.slot;
+                source.nvq_map_dirty_ = true;
+            }
         }
     }
 
@@ -520,6 +524,15 @@ void MoeExpertCache::append_source_transfers(
             false,
         });
         cohort.map_dirty = false;
+    }
+    if (source.nvq_map_dirty_) {
+        transfers.push_back({
+            reinterpret_cast<const uint8_t *>(source.nvq_host_map_.data()),
+            reinterpret_cast<uint8_t *>(source.active_->nvq_dispatch->expert_local.data_ptr<int32_t>()),
+            static_cast<int64_t>(source.nvq_host_map_.size() * sizeof(int32_t)),
+            false,
+        });
+        source.nvq_map_dirty_ = false;
     }
 }
 

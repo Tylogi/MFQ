@@ -313,6 +313,10 @@ public:
             cohort.active = std::move(pool);
             active_->pools.push_back(cohort.active);
         }
+        if (cache_->nvq_heterogeneous_enabled_)
+            initialize_mixed_nvq_dispatch(*active_, *cpu_);
+        if (active_->nvq_dispatch)
+            nvq_host_map_.assign(static_cast<size_t>(cpu_->n_experts), -1);
     }
 
     void invalidate(int cohort_index, int expert, int slot) {
@@ -327,6 +331,10 @@ public:
         if (cohort.host_map[static_cast<size_t>(expert)] == slot) {
             cohort.host_map[static_cast<size_t>(expert)] = -1;
             cohort.map_dirty = true;
+            if (active_->nvq_dispatch && cohort.cpu->family == MixedMoeFamily::Nvq) {
+                nvq_host_map_[static_cast<size_t>(expert)] = -1;
+                nvq_map_dirty_ = true;
+            }
         }
     }
 
@@ -539,4 +547,6 @@ private:
     std::vector<int> expert_to_cohort_;
     std::vector<int> expert_to_local_;
     std::shared_ptr<MixedMoeRuntime> active_;
+    std::vector<int32_t> nvq_host_map_;
+    bool nvq_map_dirty_ = false;
 };

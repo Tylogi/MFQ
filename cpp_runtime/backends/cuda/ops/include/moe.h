@@ -165,6 +165,8 @@ struct MixedMoeRuntime {
 };
 
 MfeCpu unpack_mfe(const std::vector<uint8_t>& blob);
+void initialize_mixed_nvq_dispatch(
+    MixedMoeRuntime& runtime, const MixedMoeRuntime& ownership);
 MfeCpu load_mfe_cpu(
     const mfq::ModelSource& source, const std::string& name);
 MfeWeight to_gpu_mfe(const MfeCpu& source);

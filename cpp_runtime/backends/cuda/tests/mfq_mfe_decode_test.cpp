@@ -22,7 +22,8 @@ int main(int argc, char** argv) try {
     auto resident = load_mfe_gpu(execution, *source, argv[2]);
     weight_loader::Routed cached;
     if (!execution.config.moe_ssd_cache_dir.empty()) {
-        execution.moe_expert_cache = make_moe_expert_cache(512 * 1024 * 1024, execution.config);
+        // Real projections exceed this budget: revisit experts after slot eviction.
+        execution.moe_expert_cache = make_moe_expert_cache(192 * 1024 * 1024, execution.config);
         weight_loader::validate_load_options(execution);
         cached = weight_loader::routed(execution, *source, argv[2], 0,
             resident.n_experts, resident.out_per_expert, resident.neuron_len, "diagnostic");
@@ -74,6 +75,7 @@ int main(int argc, char** argv) try {
     }
     std::cout << "MFE decode full-output bit equality cases=" << cases
               << " experts=" << resident.n_experts << '\n';
+    if (cached) print_moe_expert_cache_stats(execution.moe_expert_cache, std::cout);
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

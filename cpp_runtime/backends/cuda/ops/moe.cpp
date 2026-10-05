@@ -464,11 +464,12 @@ MixedNvqF16FormatGroup mixed_nvq_f16_format_group(int format) {
     }
 }
 
-static void initialize_mixed_nvq_dispatch(
+void initialize_mixed_nvq_dispatch(
         MixedMoeRuntime & runtime,
-        const CudaExecutionConfig& config) {
+        const MixedMoeRuntime & ownership) {
     runtime.nvq_dispatch.reset();
-    if (!config.moe_nvq_heterogeneous) return;
+    MFQ_RUNTIME_CHECK(runtime.n_experts == ownership.n_experts &&
+        runtime.pools.size() == ownership.pools.size(), "NVQ dispatch ownership shape mismatch");
 
     int nvq_pools = 0;
     for (const auto & pool : runtime.pools) {
@@ -494,7 +495,8 @@ static void initialize_mixed_nvq_dispatch(
     MixedNvqF16FormatGroup f16_format_group =
         MixedNvqF16FormatGroup::All;
     bool first_nvq_format = true;
-    for (const auto & pool : runtime.pools) {
+    for (size_t index = 0; index < runtime.pools.size(); ++index) {
+        const auto & pool = runtime.pools[index];
         if (pool.family != MixedMoeFamily::Nvq) continue;
         const auto & weight = pool.nvq;
         if (weight.gs != 24 || weight.ng <= 0 ||
@@ -552,19 +554,23 @@ static void initialize_mixed_nvq_dispatch(
         pool_params.push_back(static_cast<int32_t>(weight.sign_mode));
         pool_params.push_back(format);
 
-        auto local_host = pool.expert_local
+        const auto & source = ownership.pools[index];
+        auto local_host = source.expert_local
             .to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt32)
             .contiguous();
         const int32_t * local = local_host.data_ptr<int32_t>();
         for (int expert = 0; expert < runtime.n_experts; ++expert) {
             if (local[expert] < 0) continue;
-            if (local[expert] >= pool.local_experts ||
+            if (local[expert] >= source.local_experts ||
                     expert_pool[static_cast<size_t>(expert)] >= 0) {
                 throw std::runtime_error(
                     "mixed NVQ prefill has invalid expert ownership");
             }
             expert_pool[static_cast<size_t>(expert)] = dispatch_pool;
-            expert_local[static_cast<size_t>(expert)] = local[expert];
+            // Cached arenas retain fixed pool ownership, but fill slot indices
+            // with each transfer batch. Resident weights keep their row indices.
+            expert_local[static_cast<size_t>(expert)] =
+                &runtime == &ownership ? local[expert] : -1;
             ++owned_experts;
         }
         ++dispatch_pool;
@@ -759,8 +765,8 @@ std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
         }
         runtime->pools.push_back(std::move(pool));
     }
-    if (cuda) {
-        initialize_mixed_nvq_dispatch(*runtime, config);
+    if (cuda && config.moe_nvq_heterogeneous) {
+        initialize_mixed_nvq_dispatch(*runtime, *runtime);
     }
     return runtime;
 }
@@ -950,7 +956,8 @@ MfeWeight to_cuda_device_moe_expert_slice(
         throw std::runtime_error(
             "expert-parallel MoE shard has no owned experts");
     }
-    initialize_mixed_nvq_dispatch(*runtime, config);
+    if (config.moe_nvq_heterogeneous)
+        initialize_mixed_nvq_dispatch(*runtime, *runtime);
     return wrap_mixed_moe_runtime(runtime);
 }
 
@@ -1082,7 +1089,8 @@ MfeWeight stage_cpu_mixed_moe(
         }
         runtime->pools.push_back(std::move(pool));
     }
-    initialize_mixed_nvq_dispatch(*runtime, config);
+    if (config.moe_nvq_heterogeneous)
+        initialize_mixed_nvq_dispatch(*runtime, *runtime);
     return wrap_mixed_moe_runtime(runtime);
 }
 
