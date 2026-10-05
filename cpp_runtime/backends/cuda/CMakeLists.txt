@@ -95,6 +95,7 @@ set(MFQ_CUDA_KERNEL_SOURCES
 
 add_library(mfq-cuda-native-kernels STATIC
     ${MFQ_CUDA_KERNEL_SOURCES}
+    ${MFQ_CUDA_ROOT}/kernels/float_projection.cu
     ${MFQ_CUDA_ROOT}/apps/ggml_cuda_compat.cu
 )
 add_library(mfq::cuda-native-kernels ALIAS mfq-cuda-native-kernels)
@@ -308,6 +309,7 @@ set(MFQ_CUDA_TRANSFORMER_SOURCES
 set(MFQ_CUDA_RUNTIME_OP_SOURCES
     ${MFQ_CUDA_ROOT}/ops/cuda_execution.cpp
     ${MFQ_CUDA_ROOT}/ops/format.cpp
+    ${MFQ_CUDA_ROOT}/ops/gated_residual.cpp
     ${MFQ_CUDA_ROOT}/ops/fp8_sq.cpp
     ${MFQ_CUDA_ROOT}/ops/mx.cpp
     ${MFQ_CUDA_ROOT}/ops/mxfp4_sq.cpp
@@ -389,6 +391,12 @@ if(BUILD_TESTING)
         MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-host-expert-cache-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-host-expert-cache-test COMMAND mfq-host-expert-cache-test)
+
+    add_executable(mfq-float-projection-test ${MFQ_CUDA_ROOT}/tests/float_projection_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-float-projection-test)
+    target_compile_definitions(mfq-float-projection-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-float-projection-test PRIVATE mfq-cuda-runtime)
+    add_test(NAME mfq-float-projection-test COMMAND mfq-float-projection-test)
 endif()
 target_link_libraries(mfq-cuda-runtime PRIVATE
     CUDA::cuda_driver

@@ -853,9 +853,18 @@ def test_qwen_native_rejects_inconsistent_config(tmp_path,error):
     elif error=="pool":c["indexer_budget"]=3
     elif error=="norm":c["rms_norm_eps"]=0
     elif error=="topk":c["num_experts_per_tok"]=4
-    elif error=="mtp":c["mtp"]={"num_hidden_layers":1}
+    elif error=="mtp":c.update(mtp_num_hidden_layers=2,mtp={"num_hidden_layers":1})
     path=tmp_path/"invalid-qwen.mfq";write_qwen_fixture(path,config,w)
     result=run_glm_fixture(path);assert result.returncode!=0 and "flash_next_check " not in result.stdout
+
+
+def test_qwen_native_disabled_predictor_retains_source_config(tmp_path):
+    config,w=qwen_model_fixture()
+    config["text_config"].update(mtp_num_hidden_layers=0,mtp={"num_hidden_layers":1})
+    path=tmp_path/"text-only-qwen.mfq"
+    write_qwen_fixture(path,config,w)
+    result=run_glm_fixture(path)
+    assert result.returncode==0 and "flash_next_check " in result.stdout
 
 
 def mtp_fixture(family,layers=2):

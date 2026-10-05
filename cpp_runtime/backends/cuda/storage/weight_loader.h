@@ -102,6 +102,9 @@ using Routed = std::function<Tensor(CudaExecutionContext&, const Tensor&, const 
 
 Linear linear(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name);
 
+// GR projections use floating activation math for both dense and packed NINT.
+Linear residual_linear(CudaExecutionContext&, const mfq::ModelSource&, const std::string& name);
+
 Tensor dense(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name);
 
 Routed routed(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name, int layer,

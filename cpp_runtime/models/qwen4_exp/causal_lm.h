@@ -10,10 +10,10 @@ namespace mfq::models::qwen4_exp {
 template <class Loader>
 auto load_residual(Loader &ops, const Config &c, const std::string &p, bool combine) {
     auto norm = ops.fp32(ops.dense(p + ".norm.weight"));
-    auto down = ops.dense(p + ".down.weight"), up = ops.dense(p + ".up.weight");
-    typename Loader::Tensor injection;
+    auto down = ops.residual_linear(p + ".down.weight"), up = ops.residual_linear(p + ".up.weight");
+    decltype(down) injection{};
     if (combine)
-        injection = ops.dense(p.substr(0, p.size() - 4) + ".post.inject.weight");
+        injection = ops.residual_linear(p.substr(0, p.size() - 4) + ".post.inject.weight");
     return ops.residual(std::move(norm), std::move(down), std::move(up), std::move(injection), c);
 }
 

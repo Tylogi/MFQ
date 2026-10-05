@@ -134,8 +134,10 @@ struct Config {
         c.normalize_routes = text.value("norm_topk_prob", true);
         c.tied_embeddings = text.value("tie_word_embeddings", false);
         c.predictor_layers = text.value("mtp_num_hidden_layers", int64_t(0));
+        // Packed text-only releases set the active count to zero while retaining
+        // the original optional-head configuration. Validate it only if active.
         if (c.predictor_layers < 0 ||
-            (text.contains("mtp") && text.at("mtp").is_object() &&
+            (c.predictor_layers > 0 && text.contains("mtp") && text.at("mtp").is_object() &&
              text.at("mtp").value("num_hidden_layers", c.predictor_layers) != c.predictor_layers))
             throw std::runtime_error("Qwen4 predictor layer counts disagree");
         c.dedicated_predictor_embeddings = text.value("mtp_use_dedicated_embeddings", false);

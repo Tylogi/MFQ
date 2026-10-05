@@ -592,7 +592,7 @@ def test_cuda_model_finalizers_live_with_their_models() -> None:
         assert f"{namespace}::finalize_hidden" not in CUDA_CAUSAL_LM_SOURCE
         if name == "qwen4_exp":
             assert "Qwen4Model::adapter_finalize_hidden(" in source
-            assert "return final_mixer->pre(hidden)[0];" in source
+            assert "return final_mixer->pre(*execution, hidden)[0];" in source
         else:
             shared = (ROOT / "cpp_runtime/models" / name / "causal_lm.h").read_text(encoding="utf-8")
             assert shared.index("this->collapse_hidden(") < shared.index("this->normalize_hidden(")

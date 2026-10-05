@@ -1371,6 +1371,7 @@ struct ParameterLoader {
     std::vector<std::string> names;
     Tensor dense(const std::string &name) { names.push_back(name); return name; }
     Tensor linear(const std::string &name) { return dense(name); }
+    Tensor residual_linear(const std::string &name) { return linear(name); }
     static Tensor fp32(Tensor value) { return value; }
     bool has(const std::string &) const { return present; }
     bool has_prefix(const std::string &) const { return present || partial; }

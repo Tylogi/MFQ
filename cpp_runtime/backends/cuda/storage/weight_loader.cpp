@@ -1,4 +1,6 @@
 #include "weight_loader.h"
+#include "float_projection.h"
+#include "selected_attention.h"
 #include <limits>
 #include <fstream>
 #include <iterator>
@@ -145,6 +147,21 @@ Linear linear(CudaExecutionContext& execution, const mfq::ModelSource& file, con
     auto weight=std::make_shared<QuantLinear>(load_quant_linear(execution, file,name));
     return [weight](CudaExecutionContext& execution, const Tensor& x) {
         return weight->forward(execution, x);
+    };
+}
+
+Linear residual_linear(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name) {
+    auto weight = std::make_shared<QuantLinear>(load_quant_linear(execution, file, name));
+    MFQ_RUNTIME_CHECK(weight->is_dense() || weight->is_nint(),
+        "floating residual projection requires dense or NINT weights: ", name);
+    return [weight](CudaExecutionContext& execution, const Tensor& input) {
+        if (weight->is_dense())
+            return mfq_selected_attention::promoted_matmul(input, weight->dense.transpose(-1, -2));
+        auto output = execution.profiler.measure("nint.float_projection", [&] {
+            return nint_float_projection_cuda(weight->nint, input);
+        });
+        // Match Metal's promotion of NINT's logical F16 weight dtype.
+        return input.scalar_type() == tb::kFloat16 ? output.to(tb::kFloat16) : output;
     };
 }
 

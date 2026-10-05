@@ -7,19 +7,19 @@
 #include "models/common/moe.h"
 #include "models/common/transformer_layer.h"
 #include "storage/session_codec.h"
+#include "gated_residual.h"
 
 namespace mfq::cuda::qwen4_exp {
 using Config = mfq::models::qwen4_exp::Config;
 
 struct Gr {
-    Tensor norm, down, up, injection;
+    Tensor norm;
+    Linear down, up, injection;
     int64_t hidden, streams;
     double eps;
-    std::vector<Tensor> pre(const Tensor &x) const {
-        return mfq_qwen4_exp::gated_residual_pre(
-            x, norm, down, up,
-            injection.defined() ? std::optional<Tensor>(injection) : std::nullopt, hidden, streams,
-            eps);
+    std::vector<Tensor> pre(CudaExecutionContext &execution, const Tensor &x) const {
+        return gated_residual_pre_projected(execution, x, norm, down, up, injection,
+            hidden, streams, eps);
     }
     Tensor post(const Tensor &branch, const std::vector<Tensor> &inputs) const {
         return mfq_qwen4_exp::gated_residual_post(branch, inputs[1], inputs[2], streams);
@@ -85,7 +85,10 @@ struct BlockLoader : weight_loader::Loader {
     using PleWeights = qwen4_exp::PleWeights;
     using Embedding = attention_ops::Embedding;
 
-    static Gr residual(Tensor norm, Tensor down, Tensor up, Tensor injection, const Config &c) {
+    auto residual_linear(const std::string &name) const {
+        return weight_loader::residual_linear(execution, source, name);
+    }
+    static Gr residual(Tensor norm, Linear down, Linear up, Linear injection, const Config &c) {
         return {std::move(norm), std::move(down), std::move(up), std::move(injection),
                 c.hidden, c.streams, c.eps};
     }
@@ -180,13 +183,13 @@ struct Qwen4Block final : Block {
                 return ple->forward(execution, hidden, ids, true, confirmed);
             },
             [](Tensor hidden, Tensor positional) { return hidden + positional; },
-            [&](const Tensor &hidden) { return attention_gr.pre(hidden); },
+            [&](const Tensor &hidden) { return attention_gr.pre(execution, hidden); },
             [&](Tensor branch) { return gdn->forward(execution, branch, true, confirmed); },
             [&](Tensor branch) {
                 return qsa->forward(execution, branch, positions, full_positions, true);
             },
             [&](Tensor branch, const auto &mix) { return attention_gr.post(branch, mix); },
-            [&](const Tensor &hidden) { return ffn_gr.pre(hidden); },
+            [&](const Tensor &hidden) { return ffn_gr.pre(execution, hidden); },
             [&](Tensor branch) { return ffn(execution, branch); },
             [&](Tensor branch, const auto &mix) { return ffn_gr.post(branch, mix); });
     }
@@ -292,7 +295,7 @@ std::pair<Tensor, Tensor> Qwen4ExpMtp::evaluate(const MtpTarget &target, const T
             return mfq::models::qwen4_exp::decoder_layer(
                 std::move(x), false, false, [](const Tensor &) { return Tensor{}; },
                 [](Tensor value, Tensor) { return value; },
-                [&](const Tensor &value) { return block.attention_gr.pre(value); },
+                [&](const Tensor &value) { return block.attention_gr.pre(*execution, value); },
                 [](Tensor) -> Tensor { throw std::logic_error("Qwen4 MTP requires QSA"); },
                 [&](Tensor branch) {
                     return block.qsa->forward(*execution, branch, pos[0], pos[1], cache);
@@ -300,11 +303,11 @@ std::pair<Tensor, Tensor> Qwen4ExpMtp::evaluate(const MtpTarget &target, const T
                 [&](Tensor branch, const auto &mix) {
                     return block.attention_gr.post(branch, mix);
                 },
-                [&](const Tensor &value) { return block.ffn_gr.pre(value); },
+                [&](const Tensor &value) { return block.ffn_gr.pre(*execution, value); },
                 [&](Tensor branch) { return block.ffn(*execution, branch); },
                 [&](Tensor branch, const auto &mix) { return block.ffn_gr.post(branch, mix); });
         },
-        [&](const Tensor &multi) { return final_mixer->pre(multi)[0]; },
+        [&](const Tensor &multi) { return final_mixer->pre(*execution, multi)[0]; },
         [&](int64_t layer, const auto &pos) { positions[layer] = pos[1]; });
 }
 
@@ -384,7 +387,7 @@ void Qwen4Model::adapter_finish_forward(const mfq_tensor_backend::Tensor &full_p
 mfq_tensor_backend::Tensor Qwen4Model::adapter_finalize_hidden(mfq_tensor_backend::Tensor hidden,
                                                                const mfq_tensor_backend::Tensor &,
                                                                int64_t, int64_t) const {
-    return final_mixer->pre(hidden)[0];
+    return final_mixer->pre(*execution, hidden)[0];
 }
 
 mfq_tensor_backend::Tensor
