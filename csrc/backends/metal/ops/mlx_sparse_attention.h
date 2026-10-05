@@ -15,6 +15,11 @@ mlx::core::array mlx_deepselect_topk512(
 
 bool mlx_deepselect_topk512_preferred(int width, int rows) noexcept;
 
+mlx::core::array mlx_sparse_indexer_topk512(
+    const mlx::core::array& head_scores,
+    int query_offset,
+    int block_size);
+
 // Common selected-block sparse-attention seam for Metal runtimes. Model
 // adapters own index construction and cache semantics; this operator owns the
 // direct indexed GQA execution. Blocks identify fixed-width, chronological

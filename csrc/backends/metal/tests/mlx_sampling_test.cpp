@@ -446,6 +446,82 @@ void test_sorted_top_k_and_global_top_p() {
         "global top-p");
 }
 
+void test_batched_hierarchical_top_k_distribution() {
+    for (int rows = 1; rows <= 6; ++rows) {
+        for (const int vocab : {1025, 8193, 32769}) {
+            std::vector<float> values(rows * vocab), uniforms(rows);
+            for (int row = 0; row < rows; ++row) {
+                uniforms[row] = 0.11f + row * 0.13f;
+                for (int token = 0; token < vocab; ++token)
+                    values[row * vocab + token] = static_cast<float>((token * 31 + row * 17) % 257) / 32.0f;
+                values[row * vocab + vocab - 1] = 12.0f + row;
+            }
+            auto logits = floats(values, Shape{rows, vocab});
+            if (rows == 6) logits = mlx::core::reshape(logits, {2, 3, vocab});
+            for (const int top_k : {65, 100, 128}) {
+                auto result = mfq::metal::sample_top_k_distribution(logits,
+                    floats(uniforms, Shape{rows}), 0.85, top_k, 0.82);
+                std::vector<std::int32_t> expected;
+                for (int row = 0; row < rows; ++row)
+                    expected.push_back(cpu_sample(values.data() + row * vocab, vocab,
+                        uniforms[row], 0.85f, top_k, 0.82f));
+                require_ids(result.sampled, expected, "batched hierarchical top-k CPU oracle");
+                const auto prefix = rows == 6 ? Shape{2, 3} : Shape{rows};
+                require(result.sampled.shape() == prefix, "batched top-k sample prefix shape mismatch");
+                auto distribution_shape = prefix;
+                distribution_shape.push_back(top_k);
+                require(result.indices.shape() == distribution_shape &&
+                    result.probabilities.shape() == distribution_shape,
+                    "batched top-k distribution prefix shape mismatch");
+                auto indices = mlx::core::reshape(result.indices, {rows, top_k});
+                auto probabilities = mlx::core::reshape(result.probabilities, {rows, top_k});
+                for (int row = 0; row < rows; ++row) {
+                    auto single = mfq::metal::sample_top_k_distribution(
+                        floats(std::vector<float>(values.begin() + row * vocab, values.begin() + (row + 1) * vocab), {1, vocab}),
+                        floats({uniforms[row]}, {1}), 0.85, top_k, 0.82);
+                    require(evaluated_ids(mlx::core::slice(indices, {row, 0}, {row + 1, top_k})) == evaluated_ids(single.indices),
+                        "batched top-k indices differ from an isolated row");
+                    require(evaluated_floats(mlx::core::slice(probabilities, {row, 0}, {row + 1, top_k})) == evaluated_floats(single.probabilities),
+                        "batched top-k probabilities differ from an isolated row");
+                }
+            }
+        }
+    }
+}
+
+void test_hierarchical_top_k_dtype_and_layout() {
+    constexpr int rows = 6, vocab = 8193;
+    std::vector<float> values(rows * vocab), transposed(rows * vocab), uniforms(rows);
+    for (int row = 0; row < rows; ++row) {
+        uniforms[row] = 0.07f + row * 0.16f;
+        for (int token = 0; token < vocab; ++token)
+            values[row * vocab + token] = static_cast<float>((token * 31 + row * 17) % 257) / 8.0f;
+        values[row * vocab + vocab - 1] = 33.0f + row;
+        values[row * vocab] = std::numeric_limits<float>::quiet_NaN();
+        values[row * vocab + 1] = -std::numeric_limits<float>::infinity();
+        for (int token = 0; token < vocab; ++token)
+            transposed[token * rows + row] = values[row * vocab + token];
+    }
+    for (const auto dtype : {mlx::core::float32, mlx::core::float16, mlx::core::bfloat16}) {
+        auto logits = mlx::core::transpose(floats(transposed, {vocab, rows}, dtype));
+        auto result = mfq::metal::sample_top_k_distribution(logits,
+            floats(uniforms, {rows}), 0.85, 100, 0.82);
+        std::vector<std::int32_t> expected;
+        for (int row = 0; row < rows; ++row) {
+            expected.push_back(cpu_sample(values.data() + row * vocab, vocab,
+                uniforms[row], 0.85f, 100, 0.82f));
+            auto single = mfq::metal::sample_top_k_distribution(
+                floats(std::vector<float>(values.begin() + row * vocab, values.begin() + (row + 1) * vocab), {1, vocab}, dtype),
+                floats({uniforms[row]}, {1}), 0.85, 100, 0.82);
+            require(evaluated_ids(mlx::core::slice(result.indices, {row, 0}, {row + 1, 100})) == evaluated_ids(single.indices),
+                "strided top-k indices differ from an isolated row");
+            require(evaluated_floats(mlx::core::slice(result.probabilities, {row, 0}, {row + 1, 100})) == evaluated_floats(single.probabilities),
+                "strided top-k probabilities differ from an isolated row");
+        }
+        require_ids(result.sampled, expected, "strided hierarchical top-k CPU oracle");
+    }
+}
+
 void test_host_sampling_distribution() {
     const std::vector<float> values{0.0f, 1.0f, 2.0f};
     const mlx::core::array logits(
@@ -864,6 +940,8 @@ int main() {
         test_sorted_top_k_and_global_top_p();
         test_host_sampling_distribution();
         test_compact_top_k_distribution();
+        test_batched_hierarchical_top_k_distribution();
+        test_hierarchical_top_k_dtype_and_layout();
         test_seeded_sampler();
         test_counts_and_penalties();
         test_validation_and_greedy_precedence();

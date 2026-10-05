@@ -13,6 +13,11 @@ namespace mfq::metal {
 
 bool is_nint_dtype(std::string_view dtype) noexcept;
 
+namespace detail {
+std::string_view nint_matmul_metal_header() noexcept;
+std::string_view nint_matmul_metal_body() noexcept;
+}
+
 struct NintDescriptor {
     int format_version = 2;
     double aggregate_bpw = 0.0;
@@ -25,6 +30,7 @@ public:
         std::span<const std::uint8_t> blob);
 
     mlx::core::array matmul(const mlx::core::array& input) const;
+    mlx::core::array matmul_packed(const mlx::core::array& input) const;
     mlx::core::array matmul_add(
         const mlx::core::array& input,
         const mlx::core::array& residual) const;
@@ -122,7 +128,8 @@ private:
         const mlx::core::array* residual,
         const mlx::core::array* routed_pairs = nullptr,
         const mlx::core::array* route_weights = nullptr,
-        const mlx::core::array* gate_logits = nullptr) const;
+        const mlx::core::array* gate_logits = nullptr,
+        bool allow_dequantize = true) const;
 
     MlxNintWeight(
         mlx::core::array q_packed,

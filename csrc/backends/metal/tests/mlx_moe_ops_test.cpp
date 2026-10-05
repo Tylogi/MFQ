@@ -318,6 +318,85 @@ void test_single_row_softmax_topk() {
     }
 }
 
+void test_small_m_softmax_topk() {
+    for (const auto dtype : {
+             mlx::core::float16, mlx::core::bfloat16, mlx::core::float32}) {
+        for (const int experts : {32, 512, 4096}) {
+            for (int rows = 2; rows <= 6; ++rows) {
+                constexpr int top_k = 10;
+                std::vector<float> logits(rows * experts);
+                for (int row = 0; row < rows; ++row) {
+                    for (int expert = 0; expert < experts; ++expert) {
+                        logits[row * experts + expert] = row == rows - 1
+                            ? 0.0f
+                            : static_cast<float>((expert * 13 + row * 7) % 61 - 30) / 16.0f;
+                    }
+                }
+                auto source = mlx::core::astype(
+                    array(logits.begin(), Shape{rows, experts}), dtype);
+                auto result = mfq::metal::moe_topk(
+                    source, top_k, false, false, true);
+                const auto ids = integers(result.ids);
+                const auto weights = floats(result.weights);
+                for (int row = 0; row < rows; ++row) {
+                    const std::vector<float> values(
+                        logits.begin() + row * experts,
+                        logits.begin() + (row + 1) * experts);
+                    const auto expected = stable_top_k(values, top_k);
+                    float denominator = 0.0f;
+                    for (const int expert : expected) {
+                        denominator += std::exp(values[expert] - values[expected.front()]);
+                    }
+                    auto single = mfq::metal::moe_topk(
+                        mlx::core::slice(source, Shape{row, 0}, Shape{row + 1, experts}),
+                        top_k, false, false, true);
+                    const auto single_ids = integers(single.ids);
+                    const auto single_weights = floats(single.weights);
+                    for (int rank = 0; rank < top_k; ++rank) {
+                        const int index = row * top_k + rank;
+                        require(ids[index] == expected[rank],
+                                "small-M Top-K selected wrong expert or tie order");
+                        require_close(weights[index],
+                            std::exp(values[expected[rank]] - values[expected.front()]) / denominator);
+                        require(ids[index] == single_ids[rank] && weights[index] == single_weights[rank],
+                                "small-M Top-K differs from single-row execution");
+                    }
+                }
+            }
+        }
+    }
+}
+
+void test_softmax_topk_normalization_parameters() {
+    constexpr int experts = 32;
+    std::vector<float> logits(experts);
+    for (int expert = 0; expert < experts; ++expert) {
+        logits[expert] = static_cast<float>(expert - experts + 1) / 16.0f;
+    }
+    float total = 0.0f;
+    for (const float value : logits) total += std::exp(value);
+    for (const int rows : {1, 6}) {
+        auto source = mlx::core::broadcast_to(
+            array(logits.begin(), Shape{1, experts}), Shape{rows, experts});
+        for (const int top_k : {1, 16}) {
+            auto result = mfq::metal::moe_topk(
+                source, top_k, false, false, true, false,
+                std::nullopt, std::nullopt, 2.0f, 1.5f);
+            const auto ids = integers(result.ids);
+            const auto weights = floats(result.weights);
+            for (int row = 0; row < rows; ++row) {
+                for (int rank = 0; rank < top_k; ++rank) {
+                    const int index = row * top_k + rank;
+                    require(ids[index] == experts - rank - 1,
+                            "parameterized Top-K selected wrong expert");
+                    require_close(weights[index],
+                        std::exp(logits[ids[index]]) / total / 2.0f * 1.5f);
+                }
+            }
+        }
+    }
+}
+
 void test_fused_dense_router_topk() {
     constexpr int experts = 256;
     constexpr int width = 4096;
@@ -1201,6 +1280,8 @@ int main() {
         test_router_modes();
         test_dense_router_logits();
         test_single_row_softmax_topk();
+        test_small_m_softmax_topk();
+        test_softmax_topk_normalization_parameters();
         test_fused_dense_router_topk();
         test_fused_dense_hash_router();
         test_sqrtsoftplus_weights();

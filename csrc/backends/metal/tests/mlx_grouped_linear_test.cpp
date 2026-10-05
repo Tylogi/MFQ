@@ -998,11 +998,54 @@ void require_rows_match(
     }
 }
 
+void test_vq_projection_plan_variants() {
+    using namespace mlx::core;
+    const auto fixtures = make_vq_fixtures();
+    std::vector<mfq::metal::MlxVqWeight> weights;
+    weights.reserve(fixtures.size());
+    for (const auto& fixture : fixtures) {
+        weights.push_back(mfq::metal::MlxVqWeight::from_blob(
+            fixture.dtype, fixture.fixture.blob));
+    }
+    std::vector<mfq::metal::MlxGroupedLinear> groups;
+    for (std::size_t index = 0; index < weights.size(); ++index) {
+        groups.emplace_back(std::vector<mfq::metal::MlxGroupedLinearWeightRef>{
+            &weights[index], &weights[(index + 1) % weights.size()],
+            &weights[(index + 2) % weights.size()]});
+    }
+    for (const int rows : {1, 3, 6, 16}) {
+        std::vector<float> source(rows * kInputSize);
+        for (std::size_t index = 0; index < source.size(); ++index) {
+            source[index] = static_cast<float>(
+                static_cast<int>(index % 13) - 6) / 64.0f;
+        }
+        for (const auto dtype : {float16, float32}) {
+            const auto input = astype(
+                array(source.begin(), Shape{rows, kInputSize}), dtype);
+            for (int pass = 0; pass < 2; ++pass) {
+                for (std::size_t position = 0;
+                     position < groups.size(); ++position) {
+                    const std::size_t index = pass == 0
+                        ? position : groups.size() - position - 1;
+                    require_rows_match(
+                        groups[index], input, source, rows,
+                        {&fixtures[index].fixture,
+                         &fixtures[(index + 1) % fixtures.size()].fixture,
+                         &fixtures[(index + 2) % fixtures.size()].fixture},
+                        8e-4f);
+                }
+            }
+        }
+    }
+}
+
 } // namespace
 
 int main() {
     try {
         using namespace mlx::core;
+
+        test_vq_projection_plan_variants();
 
         const auto test_dense_projection_batch = [](Dtype dtype) {
             // DeepSeek-V4 ratio-4 Attention's two compressor pairs and
@@ -1078,6 +1121,45 @@ int main() {
         };
         test_dense_projection_batch(float16);
         test_dense_projection_batch(bfloat16);
+
+        for (auto dtype : {float16, bfloat16, float32}) {
+            constexpr int inputs = 65;
+            const std::array<int, 3> widths{97, 9, 65};
+            std::vector<mfq::metal::MlxLinear> linears;
+            linears.reserve(widths.size());
+            for (int width : widths) {
+                std::vector<float> values(width * inputs);
+                for (std::size_t index = 0; index < values.size(); ++index) {
+                    values[index] = float(int((index * 13 + width) % 47) - 23) / 128.0f;
+                }
+                linears.emplace_back(contiguous(astype(
+                    array(values.begin(), Shape{width, inputs}), dtype)));
+            }
+            const mfq::metal::MlxProjectionBatch batch(
+                std::vector<const mfq::metal::MlxLinear*>{
+                    &linears[0], &linears[1], &linears[2]});
+            for (int rows : {1, 2, 3, 4, 5, 6, 8, 16}) {
+                constexpr int backing_width = inputs + 5;
+                std::vector<float> values(rows * backing_width);
+                for (std::size_t index = 0; index < values.size(); ++index) {
+                    values[index] = float(int((index * 11 + rows) % 37) - 18) / 64.0f;
+                }
+                auto input = slice(astype(
+                    array(values.begin(), Shape{rows, backing_width}), dtype),
+                    Shape{0, 0}, Shape{rows, inputs});
+                auto actual = batch(input);
+                for (std::size_t projection = 0;
+                     projection < linears.size(); ++projection) {
+                    auto difference = max(abs(
+                        astype(actual[projection], float32) -
+                        astype(linears[projection](input), float32)));
+                    difference.eval();
+                    require(difference.item<float>() <=
+                        (dtype == bfloat16 ? 0.02f : dtype == float16 ? 0.002f : 1e-6f),
+                        "dense grouped vector load changed strided odd-width projection");
+                }
+            }
+        }
 
         std::vector<Fixture> fixtures;
         fixtures.reserve(9);
@@ -1369,6 +1451,46 @@ int main() {
             1,
             {&adaptive_q, &adaptive_k, &adaptive_v},
             0.3f);
+
+        {
+            const auto expanded = make_adaptive_nint_fixture(97, 2);
+            const auto contracted = make_adaptive_nint_fixture(9, 5);
+            const auto equal = make_adaptive_nint_fixture(kInputSize, 7);
+            const auto expanded_weight =
+                mfq::metal::MlxNintWeight::from_blob(expanded.blob);
+            const auto contracted_weight =
+                mfq::metal::MlxNintWeight::from_blob(contracted.blob);
+            const auto equal_weight =
+                mfq::metal::MlxNintWeight::from_blob(equal.blob);
+            const mfq::metal::MlxGroupedLinear mixed_geometry({
+                &expanded_weight, &contracted_weight, &equal_weight});
+            for (int rows = 1; rows <= 6; ++rows) {
+                constexpr int backing_width = kInputSize + 9;
+                std::vector<float> values(rows * backing_width);
+                for (std::size_t index = 0; index < values.size(); ++index) {
+                    values[index] = float(int((index * 19 + rows * 7) % 127) - 63) / 256.0f;
+                }
+                for (auto dtype : {float16, float32}) {
+                    auto input = slice(astype(
+                        array(values.begin(), Shape{rows, backing_width}), dtype),
+                        Shape{0, 0}, Shape{rows, kInputSize});
+                    auto actual = mixed_geometry(input);
+                    std::vector<array> expected{
+                        expanded_weight.matmul(input),
+                        contracted_weight.matmul(input),
+                        equal_weight.matmul(input)};
+                    for (std::size_t projection = 0;
+                         projection < expected.size(); ++projection) {
+                        auto difference = max(abs(
+                            astype(actual[projection], float32) -
+                            astype(expected[projection], float32)));
+                        difference.eval();
+                        require(difference.item<float>() == 0.0f,
+                            "grouped adaptive NINT expansion/contraction differs from common kernel");
+                    }
+                }
+            }
+        }
 
         // MiniCPM uses K=4096 with GS24, so the final packed group has eight
         // padded weights. Keep non-zero values immediately after the logical

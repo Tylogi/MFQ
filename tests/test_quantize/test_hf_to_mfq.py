@@ -1246,7 +1246,8 @@ def test_qwen35_mtp_plan_preserves_complete_head_and_protected_weights(tmp_path)
     assert by_source[prefix + "self_attn.q_proj.weight"].gguf_name == "blk.64.attn_q.weight"
 
 
-def test_qwen35_mtp_augmentation_copies_base_and_mirrors_backbone_policy(tmp_path):
+@pytest.mark.parametrize("fusion_precision", ["BF16", "NINT8"])
+def test_qwen35_mtp_augmentation_copies_base_and_mirrors_backbone_policy(tmp_path, monkeypatch, fusion_precision):
     root = tmp_path / "hf"
     root.mkdir()
     config = {
@@ -1306,6 +1307,16 @@ def test_qwen35_mtp_augmentation_copies_base_and_mirrors_backbone_policy(tmp_pat
         base_tensors,
     )
     output = tmp_path / "augmented.mfq"
+    if fusion_precision == "NINT8":
+        original_plan = hf_to_mfq._mtp_plan_from_base
+
+        def quantized_fusion_plan(*args, **kwargs):
+            plan = original_plan(*args, **kwargs)
+            return hf_to_mfq._apply_tensor_precision_overrides(
+                plan, {"predictor.fusion.weight": "NINT8"}
+            )
+
+        monkeypatch.setattr(hf_to_mfq, "_mtp_plan_from_base", quantized_fusion_plan)
     convert(
         hf_to_mfq.build_parser().parse_args(
             [
@@ -1333,7 +1344,11 @@ def test_qwen35_mtp_augmentation_copies_base_and_mirrors_backbone_policy(tmp_pat
         assert after.read_blob("sentinel.weight") == before.read_blob("sentinel.weight")
         mtp_names = {name for name in after if name.startswith("predictor.")}
         assert len(mtp_names) == 15
-        assert after.records["predictor.fusion.weight"].dtype == "BF16"
+        assert after.records["predictor.fusion.weight"].dtype == ("BF16" if fusion_precision == "BF16" else "NINT")
+        protected = after.header.extra["mtp"]["protected_full_precision"]
+        assert ("predictor.fusion.weight" in protected) == (fusion_precision == "BF16")
+        assert "predictor.embedding_norm.weight" in protected
+        assert "predictor.hidden_norm.weight" in protected
         assert after.records["predictor.output_norm.weight"].dtype == "BF16"
         assert after.records["predictor.block.0.attention.query.weight"].dtype == "F16"
         assert after.records["predictor.block.0.attention.norm.weight"].dtype == "F32"

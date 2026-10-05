@@ -1,6 +1,7 @@
 #include "mlx_linear_attention.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
@@ -10,6 +11,12 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+
+#include <mlx/allocator.h>
+#include <mlx/backend/metal/device.h>
+#include <mlx/backend/metal/utils.h>
+#include <mlx/compile.h>
+#include <mlx/primitives.h>
 
 namespace mfq::metal {
 namespace {
@@ -216,36 +223,111 @@ constexpr const char* kGatedDeltaDecodeStepSource = R"METAL(
     }
 )METAL";
 
-const mlx::core::fast::CustomKernelFunction&
-gdn_decode_step_kernel() {
-    static const auto kernel = [] {
+struct GdnStepConfig {
+    std::array<Dtype, 5> projection_types;
+    int key_heads;
+    int value_heads;
+    bool silu;
+    std::array<float, 2> eps;
+};
+
+std::string gdn_step_source(
+    const GdnStepConfig& config,
+    const std::string& kernel_name) {
+    const auto metal_type = [](Dtype dtype) {
+        if (dtype == mlx::core::float16) return "half";
+        if (dtype == mlx::core::bfloat16) return "bfloat";
+        if (dtype == mlx::core::float32) return "float";
+        throw std::invalid_argument("GDN requires floating projections");
+    };
+    std::string source = "#include <metal_stdlib>\nusing namespace metal;\n";
+    source += "#define HK " + std::to_string(config.key_heads) + "\n";
+    source += "#define HV " + std::to_string(config.value_heads) + "\n";
+    source += "#define D 128\n#define C " +
+        std::to_string((2 * config.key_heads + config.value_heads) * 128) + "\n";
+    source += "#define OUTPUT_GATE_SILU " +
+        std::to_string(static_cast<int>(config.silu)) + "\n";
+    source += "kernel void " + kernel_name + "(";
+    const std::array<const char*, 5> projection_names{
+        "qk", "value", "output_gate", "alpha", "beta"};
+    for (int index = 0; index < 5; ++index) {
+        source += "device const " +
+            std::string(metal_type(config.projection_types[index])) + "* " +
+            projection_names[index] + " [[buffer(" +
+            std::to_string(index) + ")]], ";
+    }
+    const std::array<const char*, 6> state_names{
+        "convolution_state", "recurrent_state", "convolution_weight",
+        "dt_bias", "decay_scale", "norm_weight"};
+    for (int index = 0; index < 6; ++index) {
+        source += "device const float* " + std::string(state_names[index]) +
+            " [[buffer(" + std::to_string(index + 5) + ")]], ";
+    }
+    source +=
+        "constant float* params [[buffer(11)]], "
+        "device float* output [[buffer(12)]], "
+        "device float* convolution_out [[buffer(13)]], "
+        "device float* recurrent_out [[buffer(14)]], "
+        "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]], "
+        "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]], "
+        "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]) {\n";
+    source += kGatedDeltaDecodeStepSource;
+    source += "}\n";
+    return source;
+}
+
+class GdnStepPrimitive final : public mlx::core::Primitive {
+public:
+    GdnStepPrimitive(mlx::core::Stream stream, GdnStepConfig config)
+        : Primitive(stream), config_(config),
+          kernel_name_("mfq_gated_delta_decode_step") {
+        for (auto dtype : config_.projection_types) {
+            kernel_name_ += "_" + mlx::core::type_to_name(dtype);
+        }
+        kernel_name_ += "_" + std::to_string(config_.key_heads) +
+            "_" + std::to_string(config_.value_heads) +
+            "_" + std::to_string(static_cast<int>(config_.silu));
+    }
+
+    void eval_cpu(
+        const std::vector<array>&,
+        std::vector<array>&) override {
+        throw std::runtime_error("GDN decode step requires Metal");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        for (auto& output : outputs) {
+            output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        }
+        auto& device = mlx::core::metal::device(stream().device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
-        return mlx::core::fast::metal_kernel(
-            "mfq_cpp_gated_delta_decode_step",
-            {
-                "qk",
-                "value",
-                "output_gate",
-                "alpha",
-                "beta",
-                "convolution_state",
-                "recurrent_state",
-                "convolution_weight",
-                "dt_bias",
-                "decay_scale",
-                "norm_weight",
-                "params",
-            },
-            {"output", "convolution_out", "recurrent_out"},
-            kGatedDeltaDecodeStepSource,
-            "",
-            true,
-            false,
-            options);
-    }();
-    return kernel;
-}
+        auto* library = device.get_library(
+            kernel_name_, options,
+            [this] { return gdn_step_source(config_, kernel_name_); });
+        auto& encoder = mlx::core::metal::get_command_encoder(stream());
+        encoder.set_compute_pipeline_state(
+            device.get_kernel(kernel_name_, library));
+        for (int index = 0; index < static_cast<int>(inputs.size()); ++index) {
+            encoder.set_input_array(inputs[index], index);
+        }
+        encoder.set_bytes(config_.eps, 11);
+        for (int index = 0; index < static_cast<int>(outputs.size()); ++index) {
+            encoder.set_output_array(outputs[index], index + 12);
+        }
+        encoder.dispatch_threadgroups(
+            MTL::Size(1, 1, config_.value_heads),
+            MTL::Size(32, 16, 1));
+    }
+
+    const char* name() const override { return "GatedDeltaDecodeStep"; }
+
+private:
+    GdnStepConfig config_;
+    std::string kernel_name_;
+};
 
 constexpr const char* kCachedDepthwiseConvHeader = R"METAL(
 template <
@@ -363,15 +445,19 @@ constexpr const char* kGatedDeltaNetSource = R"METAL(
         uint query_offset = (query_sequence + token) * uint(D);
         uint value_offset = (value_sequence + token) * uint(D);
         float key_values[ROWS];
+#if !MFQ_GDN_STATE_ONLY
         float query_values[ROWS];
+#endif
         for (uint row = 0u; row < ROWS; ++row) {
             uint state_row = row * SIMD_WIDTH + lane;
             key_values[row] = state_row < uint(D)
                 ? k[query_offset + state_row]
                 : 0.0f;
+#if !MFQ_GDN_STATE_ONLY
             query_values[row] = state_row < uint(D)
                 ? q[query_offset + state_row]
                 : 0.0f;
+#endif
         }
 
         float projected_key = 0.0f;
@@ -403,7 +489,9 @@ constexpr const char* kGatedDeltaNetSource = R"METAL(
                 beta_value;
         }
 
+#if !MFQ_GDN_STATE_ONLY
         float result = 0.0f;
+#endif
         if (KDA != 0) {
             for (uint row = 0u; row < ROWS; ++row) {
                 uint state_row = row * SIMD_WIDTH + lane;
@@ -412,20 +500,26 @@ constexpr const char* kGatedDeltaNetSource = R"METAL(
                     : 0.0f;
                 state_values[row] =
                     decay * state_values[row] + key_values[row] * delta;
+#if !MFQ_GDN_STATE_ONLY
                 result += state_values[row] * query_values[row];
+#endif
             }
         } else {
             float decay = exp(g[value_sequence + token]);
             for (uint row = 0u; row < ROWS; ++row) {
                 state_values[row] =
                     decay * state_values[row] + key_values[row] * delta;
+#if !MFQ_GDN_STATE_ONLY
                 result += state_values[row] * query_values[row];
+#endif
             }
         }
+#if !MFQ_GDN_STATE_ONLY
         result = simd_sum(result);
         if (lane == 0u) {
             out[value_offset + column] = result * scale;
         }
+#endif
     }
 
     for (uint row = 0u; row < ROWS; ++row) {
@@ -766,14 +860,20 @@ constexpr const char* kLinearConvQkvSource = R"METAL(
     }
 )METAL";
 
-mlx::core::fast::CustomKernelFunction make_gdn_kernel() {
+mlx::core::fast::CustomKernelFunction make_gdn_kernel(bool state_only = false) {
     CompileOptions options;
     options.math_mode = MathMode::Fast;
+    std::string source = state_only
+        ? "#define MFQ_GDN_STATE_ONLY 1\n"
+        : "#define MFQ_GDN_STATE_ONLY 0\n";
+    source += kGatedDeltaNetSource;
     return mlx::core::fast::metal_kernel(
-        "mfq_cpp_gated_delta_net",
-        {"q", "k", "v", "g", "beta", "state_in"},
-        {"out", "state_out"},
-        kGatedDeltaNetSource,
+        state_only ? "mfq_cpp_gated_delta_net_state" : "mfq_cpp_gated_delta_net",
+        state_only ? std::vector<std::string>{"k", "v", "g", "beta", "state_in"}
+            : std::vector<std::string>{"q", "k", "v", "g", "beta", "state_in"},
+        state_only ? std::vector<std::string>{"state_out"}
+            : std::vector<std::string>{"out", "state_out"},
+        source,
         "",
         true,
         false,
@@ -782,6 +882,11 @@ mlx::core::fast::CustomKernelFunction make_gdn_kernel() {
 
 const mlx::core::fast::CustomKernelFunction& gdn_kernel() {
     static const auto kernel = make_gdn_kernel();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction& gdn_state_kernel() {
+    static const auto kernel = make_gdn_kernel(true);
     return kernel;
 }
 
@@ -1136,10 +1241,19 @@ MlxGatedDeltaDecodeResult gated_delta_decode_step(
             "Gated DeltaNet decode-step requires four convolution taps");
     }
 
-    const array parameters(
-        {convolution_eps, norm_eps},
-        Shape{2});
-    auto outputs = gdn_decode_step_kernel()(
+    const GdnStepConfig config{
+        {qk_values.dtype(), value_values.dtype(), output_gate_values.dtype(),
+         alpha_values.dtype(), beta_values.dtype()},
+        key_heads, value_heads, output_gate_silu, {convolution_eps, norm_eps}};
+    auto outputs = array::make_arrays(
+        {
+            Shape{1, 1, value_width},
+            convolution_state_values.shape(),
+            recurrent_state_values.shape(),
+        },
+        {mlx::core::float32, mlx::core::float32, mlx::core::float32},
+        std::make_shared<GdnStepPrimitive>(
+            mlx::core::default_stream(mlx::core::default_device()), config),
         {
             qk_values,
             value_values,
@@ -1152,30 +1266,7 @@ MlxGatedDeltaDecodeResult gated_delta_decode_step(
             bias_values,
             decay_values,
             norm_values,
-            parameters,
-        },
-        {
-            Shape{1, 1, value_width},
-            convolution_state_values.shape(),
-            recurrent_state_values.shape(),
-        },
-        {
-            mlx::core::float32,
-            mlx::core::float32,
-            mlx::core::float32,
-        },
-        {32, dimension / 8, value_heads},
-        {32, dimension / 8, 1},
-        {
-            {"HK", key_heads},
-            {"HV", value_heads},
-            {"D", dimension},
-            {"C", channels},
-            {"OUTPUT_GATE_SILU", static_cast<int>(output_gate_silu)},
-        },
-        std::nullopt,
-        false,
-        {});
+        });
     return {
         std::move(outputs.at(0)),
         std::move(outputs.at(1)),
@@ -1183,7 +1274,9 @@ MlxGatedDeltaDecodeResult gated_delta_decode_step(
     };
 }
 
-MlxGatedDeltaNetResult gated_delta_net(
+namespace {
+
+MlxGatedDeltaNetResult gated_delta_net_impl(
     const array& query,
     const array& key,
     const array& value,
@@ -1191,7 +1284,8 @@ MlxGatedDeltaNetResult gated_delta_net(
     const array& beta,
     const std::optional<array>& state,
     bool transposed_state,
-    bool tiled_heads) {
+    bool tiled_heads,
+    bool state_only) {
     auto q = float32_contiguous(query);
     auto k = float32_contiguous(key);
     auto v = float32_contiguous(value);
@@ -1313,10 +1407,14 @@ MlxGatedDeltaNetResult gated_delta_net(
         static_cast<std::int64_t>(batch) *
         value_heads *
         column_tiles;
-    auto outputs = gdn_kernel()(
-        {q, k, v, g, beta_values, state_values},
-        {v.shape(), state_shape},
-        {mlx::core::float32, mlx::core::float32},
+    const auto& kernel = state_only ? gdn_state_kernel() : gdn_kernel();
+    auto outputs = kernel(
+        state_only ? std::vector<array>{k, v, g, beta_values, state_values}
+            : std::vector<array>{q, k, v, g, beta_values, state_values},
+        state_only ? std::vector<Shape>{state_shape}
+            : std::vector<Shape>{v.shape(), state_shape},
+        state_only ? std::vector<Dtype>{mlx::core::float32}
+            : std::vector<Dtype>{mlx::core::float32, mlx::core::float32},
         {checked_int(workgroups * 128, "GDN grid"), 1, 1},
         {128, 1, 1},
         gdn_templates(
@@ -1332,9 +1430,37 @@ MlxGatedDeltaNetResult gated_delta_net(
         false,
         {});
     return {
-        std::move(outputs.at(0)),
-        std::move(outputs.at(1)),
+        state_only ? mlx::core::zeros(Shape{0}, mlx::core::float32)
+            : std::move(outputs.at(0)),
+        std::move(outputs.at(state_only ? 0 : 1)),
     };
+}
+
+} // namespace
+
+MlxGatedDeltaNetResult gated_delta_net(
+    const array& query,
+    const array& key,
+    const array& value,
+    const array& gate,
+    const array& beta,
+    const std::optional<array>& state,
+    bool transposed_state,
+    bool tiled_heads) {
+    return gated_delta_net_impl(query, key, value, gate, beta, state,
+        transposed_state, tiled_heads, false);
+}
+
+array gated_delta_net_state(
+    const array& key,
+    const array& value,
+    const array& gate,
+    const array& beta,
+    const std::optional<array>& state,
+    bool transposed_state,
+    bool tiled_heads) {
+    return gated_delta_net_impl(key, key, value, gate, beta, state,
+        transposed_state, tiled_heads, true).state;
 }
 
 array ssm_conv_silu(
@@ -1649,7 +1775,32 @@ MlxLinearConvQkvResult linear_conv_qkv(
     };
 }
 
-MlxGatedDeltaCacheState replay_gated_delta_speculative_prefix(
+namespace {
+
+using GatedDeltaCacheStep = std::function<std::vector<array>(const std::vector<array>&)>;
+
+std::vector<array> gated_delta_cache_step(
+    const std::vector<array>& inputs,
+    const array& convolution_weight,
+    int key_heads,
+    int value_heads,
+    int key_head_dimension,
+    int value_head_dimension,
+    const std::optional<array>& convolution_bias,
+    float eps,
+    bool transposed_state,
+    bool tiled_heads) {
+    auto convolved = linear_conv_qkv(
+        inputs[0], inputs[2], inputs[3], convolution_weight,
+        key_heads, value_heads, key_head_dimension, value_head_dimension,
+        convolution_bias, eps);
+    auto recurrent = gated_delta_net_state(
+        convolved.key, convolved.value, inputs[4], inputs[5],
+        inputs[1], transposed_state, tiled_heads);
+    return {std::move(convolved.state), std::move(recurrent)};
+}
+
+MlxGatedDeltaCacheState replay_gated_delta_speculative_prefix_impl(
     const MlxGatedDeltaSpeculativeState& transaction,
     int accepted_tokens,
     const array& convolution_weight,
@@ -1660,7 +1811,8 @@ MlxGatedDeltaCacheState replay_gated_delta_speculative_prefix(
     const std::optional<array>& convolution_bias,
     float eps,
     bool transposed_state,
-    bool tiled_heads) {
+    bool tiled_heads,
+    const GatedDeltaCacheStep* cached_step) {
     const int speculative_tokens =
         transaction.total_tokens - transaction.confirmed_tokens;
     if (transaction.batch <= 0 || transaction.position < 0 ||
@@ -1716,30 +1868,59 @@ MlxGatedDeltaCacheState replay_gated_delta_speculative_prefix(
         beta_source,
         Shape{0, 0, 0},
         Shape{transaction.batch, beta_source.shape(1), keep});
-    auto convolved = linear_conv_qkv(
-        transaction.convolution_state,
-        qk,
-        value,
-        convolution_weight,
-        key_heads,
-        value_heads,
-        key_head_dimension,
-        value_head_dimension,
-        convolution_bias,
-        eps);
-    auto recurrent = gated_delta_net(
-        convolved.query,
-        convolved.key,
-        convolved.value,
-        gate,
-        beta,
-        transaction.recurrent_state,
-        transposed_state,
-        tiled_heads);
+    const std::vector<array> inputs{
+        transaction.convolution_state, transaction.recurrent_state,
+        std::move(qk), std::move(value), std::move(gate), std::move(beta)};
+    auto output = cached_step ? (*cached_step)(inputs)
+        : gated_delta_cache_step(inputs, convolution_weight, key_heads, value_heads,
+            key_head_dimension, value_head_dimension, convolution_bias, eps,
+            transposed_state, tiled_heads);
     return {
-        std::move(convolved.state),
-        std::move(recurrent.state),
+        std::move(output[0]),
+        std::move(output[1]),
         transaction.position + keep,
+    };
+}
+
+} // namespace
+
+MlxGatedDeltaCacheState replay_gated_delta_speculative_prefix(
+    const MlxGatedDeltaSpeculativeState& transaction,
+    int accepted_tokens,
+    const array& convolution_weight,
+    int key_heads,
+    int value_heads,
+    int key_head_dimension,
+    int value_head_dimension,
+    const std::optional<array>& convolution_bias,
+    float eps,
+    bool transposed_state,
+    bool tiled_heads) {
+    return replay_gated_delta_speculative_prefix_impl(transaction, accepted_tokens,
+        convolution_weight, key_heads, value_heads, key_head_dimension,
+        value_head_dimension, convolution_bias, eps, transposed_state, tiled_heads, nullptr);
+}
+
+MlxGatedDeltaReplay compile_gated_delta_speculative_replay(
+    const array& convolution_weight,
+    int key_heads,
+    int value_heads,
+    int key_head_dimension,
+    int value_head_dimension,
+    const std::optional<array>& convolution_bias,
+    float eps,
+    bool transposed_state,
+    bool tiled_heads) {
+    auto step = mlx::core::compile([=](const std::vector<array>& inputs) {
+        return gated_delta_cache_step(inputs, convolution_weight, key_heads, value_heads,
+            key_head_dimension, value_head_dimension, convolution_bias, eps,
+            transposed_state, tiled_heads);
+    });
+    return [=, step = std::move(step)](const MlxGatedDeltaSpeculativeState& transaction,
+        int accepted_tokens) {
+        return replay_gated_delta_speculative_prefix_impl(transaction, accepted_tokens,
+            convolution_weight, key_heads, value_heads, key_head_dimension,
+            value_head_dimension, convolution_bias, eps, transposed_state, tiled_heads, &step);
     };
 }
 
