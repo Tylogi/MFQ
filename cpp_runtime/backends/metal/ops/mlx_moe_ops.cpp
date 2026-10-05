@@ -184,12 +184,13 @@ constexpr const char* kSoftmaxTopKRowSource = R"METAL(
     constexpr uint PER_LANE =
         (uint(EXPERTS) + 31u) / 32u;
     uint lane = thread_index_in_simdgroup;
+    uint row = threadgroup_position_in_grid.y;
     float values[PER_LANE];
     bool taken[PER_LANE];
     for (uint local = 0u; local < PER_LANE; ++local) {
         uint expert = lane + local * 32u;
         float value = expert < uint(EXPERTS)
-            ? float(logits[expert])
+            ? float(logits[row * uint(EXPERTS) + expert])
             : -INFINITY;
         values[local] = isnan(value) ? -FLT_MAX : value;
         taken[local] = false;
@@ -232,8 +233,8 @@ constexpr const char* kSoftmaxTopKRowSource = R"METAL(
             denominator += selected[rank];
         }
         for (uint rank = 0u; rank < uint(TOP_K); ++rank) {
-            ids[rank] = int(selected_ids[rank]);
-            weights[rank] = selected[rank] / denominator;
+            ids[row * uint(TOP_K) + rank] = int(selected_ids[rank]);
+            weights[row * uint(TOP_K) + rank] = selected[rank] / denominator;
         }
     }
 )METAL";
@@ -1136,21 +1137,22 @@ MlxMoeTopKResult moe_topk(
                ? 2
                : (delayed_softmax ? 3 : 0));
 
-    if (rows == 1 && mode == 0 && normalize &&
+    if (rows <= 6 && mode == 0 && normalize &&
+        norm_floor == 1e-20f && scale == 1.0f &&
         !bias.has_value() && !available.has_value() &&
         experts >= 32 && experts <= 4096 && experts % 32 == 0) {
-        values = mlx::core::reshape(values, Shape{experts});
+        values = mlx::core::reshape(values, Shape{rows, experts});
         auto outputs = softmax_top_k_row_kernel(values.dtype())(
             {std::move(values)},
             {
-                Shape{1, top_k},
-                Shape{1, top_k},
+                Shape{rows, top_k},
+                Shape{rows, top_k},
             },
             {
                 mlx::core::int32,
                 mlx::core::float32,
             },
-            {32, 1, 1},
+            {32, rows, 1},
             {32, 1, 1},
             {
                 {"EXPERTS", experts},

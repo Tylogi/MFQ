@@ -54,6 +54,72 @@ Kernel make_sparse_kernel(
         options);
 }
 
+class SparseIndexerTopkPrimitive final : public mlx::core::Primitive {
+public:
+    SparseIndexerTopkPrimitive(
+        mlx::core::Stream stream, int heads, int items,
+        std::array<int, 4> params)
+        : Primitive(stream), heads_(heads), items_(items), params_(params),
+          kernel_name_("mfq_sparse_indexer_topk512_" +
+              std::to_string(heads) + "_" + std::to_string(items)) {}
+
+    void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("sparse indexer selection requires Metal");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& output = outputs.front();
+        output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        auto& device = mlx::core::metal::device(stream().device);
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(
+            kernel_name_, options, [this] { return source(); });
+        auto& encoder = mlx::core::metal::get_command_encoder(stream());
+        encoder.set_compute_pipeline_state(
+            device.get_kernel(kernel_name_, library));
+        encoder.set_input_array(inputs.front(), 0);
+        encoder.set_bytes(params_, 1);
+        encoder.set_output_array(output, 2);
+        encoder.dispatch_threadgroups(
+            MTL::Size(output.shape(0) * output.shape(1), 1, 1),
+            MTL::Size(256, 1, 1));
+    }
+
+    const char* name() const override { return "SparseIndexerTopk512"; }
+
+    bool is_equivalent(const mlx::core::Primitive& other) const override {
+        const auto* primitive = dynamic_cast<const SparseIndexerTopkPrimitive*>(&other);
+        return primitive && primitive->heads_ == heads_ &&
+            primitive->items_ == items_ && primitive->params_ == params_;
+    }
+
+private:
+    std::string source() const {
+        std::string code = "#include <metal_stdlib>\nusing namespace metal;\n";
+        code += "#define HEADS " + std::to_string(heads_) +
+            "\n#define ITEMS " + std::to_string(items_) + "\n";
+        code += "kernel void " + kernel_name_ + "("
+            "device const float* scores [[buffer(0)]], "
+            "constant int* params [[buffer(1)]], "
+            "device int* out [[buffer(2)]], "
+            "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], "
+            "uint thread_index_in_threadgroup [[thread_index_in_threadgroup]], "
+            "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]], "
+            "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]]) {\n";
+        code += kSparseIndexerTopkSource;
+        code += "}\n";
+        return code;
+    }
+
+    int heads_;
+    int items_;
+    std::array<int, 4> params_;
+    std::string kernel_name_;
+};
+
 const Kernel& deepselect_topk512_kernel() {
     static const auto kernel = make_sparse_kernel(
         "mfq_cpp_deepselect_topk512",
@@ -87,29 +153,43 @@ constexpr const char* kSparseBlockGatherSource = R"METAL(
             uint key_count = uint(params[0]);
             uint selected = uint(params[1]);
             uint valid_blocks = uint(params[2]);
-            uint complete = key_count / uint(BLOCK_SIZE);
+            uint queries = uint(params[3]);
+            uint row = thread_position_in_grid.y;
+            uint batch = row / queries;
+            uint visible = uint(params[4]) + row % queries + 1;
+            uint complete = visible / uint(BLOCK_SIZE);
+            uint row_blocks = min(uint(params[5]), complete);
             if (index >= uint(KV_HEADS) * selected * uint(DIM)) return;
             uint dim = index % uint(DIM);
             uint token = (index / uint(DIM)) % selected;
             uint head = index / (selected * uint(DIM));
             long source = token < valid_blocks * uint(BLOCK_SIZE)
-                ? long(blocks[token / uint(BLOCK_SIZE)]) * long(BLOCK_SIZE) +
-                    long(token % uint(BLOCK_SIZE))
+                ? (token < row_blocks * uint(BLOCK_SIZE)
+                    ? long(blocks[ulong(row) * uint(params[5]) + token / uint(BLOCK_SIZE)]) * long(BLOCK_SIZE) +
+                        long(token % uint(BLOCK_SIZE))
+                    : -1)
                 : long(complete * uint(BLOCK_SIZE)) +
                     long(token - valid_blocks * uint(BLOCK_SIZE));
-            bool present = source >= 0 && source < long(key_count);
-            uint offset = uint(head * key_count * uint(DIM) +
-                uint(present ? source : 0) * uint(DIM) + dim);
-            selected_keys[index] = present ? keys[offset] : 0;
-            selected_values[index] = present ? values[offset] : 0;
-            if (head == 0 && dim == 0) valid[token] = present;
+            bool present = source >= 0 && source < long(key_count) && source < long(visible);
+            ulong key_offset = ulong(batch) * ulong(kv_strides[0]) +
+                ulong(head) * ulong(kv_strides[1]) +
+                ulong(present ? source : 0) * ulong(kv_strides[2]) +
+                ulong(dim) * ulong(kv_strides[3]);
+            ulong value_offset = ulong(batch) * ulong(kv_strides[4]) +
+                ulong(head) * ulong(kv_strides[5]) +
+                ulong(present ? source : 0) * ulong(kv_strides[6]) +
+                ulong(dim) * ulong(kv_strides[7]);
+            ulong output = ulong(row) * uint(KV_HEADS) * selected * uint(DIM) + index;
+            selected_keys[output] = present ? keys[key_offset] : 0;
+            selected_values[output] = present ? values[value_offset] : 0;
+            if (head == 0 && dim == 0) valid[row * selected + token] = present;
         )METAL";
 
 class SparseBlockGatherPrimitive final : public mlx::core::Primitive {
 public:
     SparseBlockGatherPrimitive(
         mlx::core::Stream stream, Dtype dtype,
-        int kv_heads, int block_size, std::array<int, 3> params)
+        int kv_heads, int block_size, std::array<int, 6> params)
         : Primitive(stream), dtype_(dtype), kv_heads_(kv_heads),
           block_size_(block_size), params_(params),
           kernel_name_("mfq_sparse_block_gqa_gather") {
@@ -140,11 +220,18 @@ public:
             encoder.set_input_array(inputs[index], index);
         }
         encoder.set_bytes(params_, 3);
+        std::array<std::int64_t, 8> kv_strides{};
+        for (int input = 0; input < 2; ++input) {
+            for (int axis = 0; axis < 4; ++axis) {
+                kv_strides[input * 4 + axis] = inputs[input].strides(axis);
+            }
+        }
+        encoder.set_bytes(kv_strides, 7);
         for (int index = 0; index < 3; ++index) {
             encoder.set_output_array(outputs[index], index + 4);
         }
         encoder.dispatch_threads(
-            MTL::Size(kv_heads_ * params_[1] * 256, 1, 1),
+            MTL::Size(kv_heads_ * params_[1] * 256, inputs[2].shape(0) * params_[3], 1),
             MTL::Size(256, 1, 1));
     }
 
@@ -167,6 +254,7 @@ private:
             "device T* selected_keys [[buffer(4)]], "
             "device T* selected_values [[buffer(5)]], "
             "device bool* valid [[buffer(6)]], "
+            "constant long* kv_strides [[buffer(7)]], "
             "uint3 thread_position_in_grid [[thread_position_in_grid]]) {\n";
         code += kSparseBlockGatherSource;
         code += "}\n";
@@ -176,7 +264,7 @@ private:
     Dtype dtype_;
     int kv_heads_;
     int block_size_;
-    std::array<int, 3> params_;
+    std::array<int, 6> params_;
     std::string kernel_name_;
 };
 
@@ -315,10 +403,11 @@ public:
     SparseBlockGqaPrimitive(
         mlx::core::Stream stream,
         SparseBlockGqaParams params,
-        mlx::core::Dtype dtype)
+        mlx::core::Dtype dtype,
+        bool vector_decode = false)
         : UnaryPrimitive(stream),
           params_(params),
-          dtype_(dtype) {}
+          dtype_(dtype), vector_decode_(vector_decode) {}
 
     void eval_cpu(const std::vector<array>&, array&) override {
         throw std::runtime_error(
@@ -360,14 +449,54 @@ public:
         const char* kernel_name = dtype_ == mlx::core::float16
             ? "mfq_sparse_block_gqa_f16_bk64_dc64_gqa12_d256_wm2"
             : "mfq_sparse_block_gqa_bf16_bk64_dc64_gqa12_d256_wm2";
+        if (vector_decode_) {
+            kernel_name = dtype_ == mlx::core::float16
+                ? "mfq_sparse_block_gqa_vector_f16"
+                : "mfq_sparse_block_gqa_vector_bf16";
+        }
         auto* kernel = device.get_kernel(kernel_name, library);
         auto& encoder = mlx::core::metal::get_command_encoder(selected_stream);
         encoder.set_compute_pipeline_state(kernel);
         for (int index = 0; index < 4; ++index) {
             encoder.set_input_array(inputs[static_cast<std::size_t>(index)], index);
         }
+        auto params = params_;
+        for (int axis = 0; axis < 3; ++axis) {
+            params.query_strides[axis] = inputs[0].strides(axis);
+            params.key_strides[axis] = inputs[1].strides(axis);
+            params.value_strides[axis] = inputs[2].strides(axis);
+            params.block_strides[axis] = inputs[3].strides(axis);
+        }
+        encoder.set_bytes(params, 5);
+        if (vector_decode_) {
+            constexpr int partitions = 128;
+            const int rows = params.batch * params.queries * params.query_heads;
+            array partial(Shape{rows, partitions, 256}, dtype_, nullptr, {});
+            array maximum(Shape{rows, partitions}, mlx::core::float32, nullptr, {});
+            array denominator(Shape{rows, partitions}, mlx::core::float32, nullptr, {});
+            for (auto* temporary : {&partial, &maximum, &denominator}) {
+                temporary->set_data(mlx::core::allocator::malloc(temporary->nbytes()));
+                encoder.add_temporary(*temporary);
+            }
+            encoder.set_output_array(partial, 4);
+            encoder.set_output_array(maximum, 6);
+            encoder.set_output_array(denominator, 7);
+            encoder.dispatch_threadgroups(
+                MTL::Size(params.queries * partitions, params.kv_heads, params.batch),
+                MTL::Size(32, 12, 1));
+            const char* reduce_name = dtype_ == mlx::core::float16
+                ? "sdpa_vector_2pass_2_float16_t_256"
+                : "sdpa_vector_2pass_2_bfloat16_t_256";
+            encoder.set_compute_pipeline_state(device.get_kernel(reduce_name));
+            encoder.set_input_array(partial, 0);
+            encoder.set_input_array(denominator, 1);
+            encoder.set_input_array(maximum, 2);
+            encoder.set_output_array(output, 3);
+            encoder.set_bytes(partitions, 4);
+            encoder.dispatch_threadgroups(MTL::Size(rows, 1, 1), MTL::Size(1024, 1, 1));
+            return;
+        }
         encoder.set_output_array(output, 4);
-        encoder.set_bytes(params_, 5);
         encoder.dispatch_threadgroups(
             MTL::Size(params_.queries, params_.kv_heads, params_.batch),
             MTL::Size(32, 2, 1));
@@ -383,6 +512,7 @@ public:
             dynamic_cast<const SparseBlockGqaPrimitive*>(&other);
         return primitive != nullptr
             && primitive->dtype_ == dtype_
+            && primitive->vector_decode_ == vector_decode_
             && primitive->params_.batch == params_.batch
             && primitive->params_.query_heads == params_.query_heads
             && primitive->params_.kv_heads == params_.kv_heads
@@ -407,6 +537,7 @@ public:
 private:
     SparseBlockGqaParams params_;
     mlx::core::Dtype dtype_;
+    bool vector_decode_;
 };
 
 class SparseSelectedMlaPrimitive final
@@ -624,6 +755,35 @@ bool mlx_deepselect_topk512_preferred(int width, int rows) noexcept {
     return mlx_apple_chip_is("Apple M3 Ultra");
 }
 
+array mlx_sparse_indexer_topk512(
+    const array& head_scores,
+    int query_offset,
+    int block_size) {
+    if (head_scores.ndim() != 4 ||
+        head_scores.dtype() != mlx::core::float32 ||
+        head_scores.shape(0) <= 0 || head_scores.shape(1) <= 0 ||
+        head_scores.shape(1) > 6 || head_scores.shape(2) <= 0 ||
+        head_scores.shape(3) < 512 || head_scores.shape(3) > 32768 ||
+        query_offset < 0 || block_size <= 0 ||
+        query_offset > std::numeric_limits<int>::max() - head_scores.shape(1)) {
+        throw std::invalid_argument("sparse indexer expects f32 [B,M<=6,H,512<=K<=32768]");
+    }
+    const int width = head_scores.shape(3);
+    int items = 4;
+    while (items * 256 < width) items *= 2;
+    const std::array<int, 4> params{
+        query_offset, block_size, width, head_scores.shape(1)};
+    checked_grid_product({head_scores.shape(0), head_scores.shape(1)},
+        "sparse indexer row count");
+    return array(
+        Shape{head_scores.shape(0), head_scores.shape(1), 512},
+        mlx::core::int32,
+        std::make_shared<SparseIndexerTopkPrimitive>(
+            mlx::core::default_stream(mlx::core::default_device()),
+            head_scores.shape(2), items, params),
+        {mlx::core::contiguous(head_scores)});
+}
+
 array mlx_deepselect_topk512(
     const array& scores,
     const std::optional<array>& valid_keys) {
@@ -677,8 +837,10 @@ array mlx_sparse_block_gqa_attention(
             ? mlx::core::bfloat16
             : mlx::core::float16;
     auto selected_query = typed_contiguous(query, attention_dtype);
-    auto selected_key = typed_contiguous(key, attention_dtype);
-    auto selected_value = typed_contiguous(value, attention_dtype);
+    auto selected_key = key.dtype() == attention_dtype
+        ? key : mlx::core::astype(key, attention_dtype);
+    auto selected_value = value.dtype() == attention_dtype
+        ? value : mlx::core::astype(value, attention_dtype);
     auto blocks = typed_contiguous(selected_blocks, mlx::core::int32);
     if (selected_query.ndim() != 4 || selected_key.ndim() != 4 ||
         selected_value.shape() != selected_key.shape() || blocks.ndim() != 3 ||
@@ -698,33 +860,6 @@ array mlx_sparse_block_gqa_attention(
         throw std::invalid_argument(
             "selected-block sparse GQA scale must be finite");
     }
-
-    const char* gather_setting = std::getenv("MFQ_METAL_SPARSE_GQA_DECODE_GATHER");
-    if (selected_query.shape(0) == 1 && selected_query.shape(2) == 1 &&
-        query_offset + 1 == selected_key.shape(2) &&
-        (gather_setting == nullptr || std::string(gather_setting) != "0")) {
-        const int complete = selected_key.shape(2) / block_size;
-        const int valid_blocks = std::min(blocks.shape(2), complete);
-        const int selected = valid_blocks * block_size +
-            selected_key.shape(2) % block_size;
-        if (selected > 0) {
-            const Shape gathered_shape{1, selected_key.shape(1), selected, 256};
-            auto gathered = array::make_arrays(
-                {gathered_shape, gathered_shape, Shape{1, 1, 1, selected}},
-                {attention_dtype, attention_dtype, mlx::core::bool_},
-                std::make_shared<SparseBlockGatherPrimitive>(
-                    mlx::core::default_stream(mlx::core::default_device()),
-                    attention_dtype, selected_key.shape(1), block_size,
-                    std::array<int, 3>{
-                        selected_key.shape(2), selected, valid_blocks}),
-                {selected_key, selected_value, blocks});
-            auto output = mlx::core::fast::scaled_dot_product_attention(
-                selected_query, gathered[0], gathered[1], selected_scale,
-                "", gathered[2]);
-            return mlx::core::transpose(output, {0, 2, 1, 3});
-        }
-    }
-
     SparseBlockGqaParams params{
         .batch = selected_query.shape(0),
         .query_heads = selected_query.shape(1),
@@ -736,28 +871,53 @@ array mlx_sparse_block_gqa_attention(
         .query_offset = query_offset,
         .block_size = block_size,
         .scale = selected_scale,
-        .query_strides = {
-            selected_query.strides(0),
-            selected_query.strides(1),
-            selected_query.strides(2)},
-        .key_strides = {
-            selected_key.strides(0),
-            selected_key.strides(1),
-            selected_key.strides(2)},
-        .value_strides = {
-            selected_value.strides(0),
-            selected_value.strides(1),
-            selected_value.strides(2)},
-        .block_strides = {
-            blocks.strides(0),
-            blocks.strides(1),
-            blocks.strides(2)},
     };
     auto stream = mlx::core::default_stream(mlx::core::default_device());
     if (stream.device != mlx::core::Device::gpu) {
         throw std::invalid_argument(
             "selected-block sparse GQA requires Metal");
     }
+
+    const char* gather_setting = std::getenv("MFQ_METAL_SPARSE_GQA_DECODE_GATHER");
+    if (selected_query.shape(0) > 0 && selected_query.shape(2) > 0 && selected_query.shape(2) <= 6 &&
+        (gather_setting == nullptr || std::string(gather_setting) != "0")) {
+        const int queries = selected_query.shape(2);
+        const int rows = selected_query.shape(0) * queries;
+        const int visible = query_offset + queries;
+        const int complete = visible / block_size;
+        const int valid_blocks = std::min(blocks.shape(2), complete);
+        const int selected = valid_blocks * block_size +
+            (queries == 1 ? visible % block_size : block_size - 1);
+        if (selected >= 1024 && selected_key.strides(3) == 1 && selected_value.strides(3) == 1) {
+            return array(Shape{params.batch, queries, params.query_heads, 256}, attention_dtype,
+                std::make_shared<SparseBlockGqaPrimitive>(stream, params, attention_dtype, true),
+                {selected_query, selected_key, selected_value, blocks});
+        }
+        if (selected > 0) {
+            const Shape gathered_shape{rows, selected_key.shape(1), selected, 256};
+            auto gathered = array::make_arrays(
+                {gathered_shape, gathered_shape, Shape{rows, 1, 1, selected}},
+                {attention_dtype, attention_dtype, mlx::core::bool_},
+                std::make_shared<SparseBlockGatherPrimitive>(
+                    mlx::core::default_stream(mlx::core::default_device()),
+                    attention_dtype, selected_key.shape(1), block_size,
+                    std::array<int, 6>{
+                        selected_key.shape(2), selected, valid_blocks,
+                        queries, query_offset, blocks.shape(2)}),
+                {selected_key, selected_value, blocks});
+            auto query_rows = queries == 1 ? selected_query : mlx::core::reshape(
+                mlx::core::transpose(selected_query, {0, 2, 1, 3}),
+                Shape{rows, selected_query.shape(1), 1, 256});
+            auto output = mlx::core::fast::scaled_dot_product_attention(
+                query_rows, gathered[0], gathered[1], selected_scale,
+                "", gathered[2]);
+            return mlx::core::reshape(output,
+                Shape{selected_query.shape(0), queries, selected_query.shape(1), 256});
+        }
+    }
+
+    selected_key = mlx::core::contiguous(selected_key);
+    selected_value = mlx::core::contiguous(selected_value);
     return array(
         Shape{
             params.batch,

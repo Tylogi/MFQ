@@ -7,6 +7,7 @@
 
 #include <mlx/allocator.h>
 #include <mlx/backend/metal/device.h>
+#include <mlx/backend/metal/utils.h>
 #include <mlx/primitives.h>
 
 #include <algorithm>
@@ -187,7 +188,9 @@ array dense_nint_mmq(
 constexpr const char* kNintHeader = R"METAL(
 template <typename InputScalar>
 inline float4 mfq_nint_load_input4(device const InputScalar* input, uint offset) {
-    return float4(*reinterpret_cast<device const vec<InputScalar, 4>*>(input + offset));
+    if ((offset & 3u) == 0u)
+        return float4(*reinterpret_cast<device const vec<InputScalar, 4>*>(input + offset));
+    return float4(input[offset], input[offset + 1u], input[offset + 2u], input[offset + 3u]);
 }
 
 template <typename InputScalar>
@@ -385,7 +388,7 @@ constexpr const char* kNintMatmul = R"METAL(
     constexpr uint SIMD_GROUPS = 8u;
     constexpr uint OUTPUTS_PER_SIMD = uint(OPS_PER_SIMD);
     constexpr uint OUTPUTS_PER_TG = SIMD_GROUPS * OUTPUTS_PER_SIMD;
-    constexpr uint BLOCKS8 = uint(M) == 1u ? uint(GS) / 8u : 0u;
+    constexpr uint BLOCKS8 = uint(M) <= 5u ? uint(GS) / 8u : 0u;
     constexpr uint TAIL_START = BLOCKS8 * 8u;
     constexpr uint TAIL_CHUNKS =
         (uint(GS) - TAIL_START + 3u) / 4u;
@@ -1111,6 +1114,8 @@ struct NintMatmulKernelConfig {
     int local_experts = 0;
     int out_per_expert = 0;
     int logical_output = 0;
+    std::array<Dtype, 3> epilogue_types{
+        mlx::core::float16, mlx::core::float32, mlx::core::float16};
 
     bool operator==(const NintMatmulKernelConfig&) const = default;
 };
@@ -1164,67 +1169,142 @@ std::string nint_matmul_kernel_header(
         + std::to_string(config.moe_routes) + "\n";
 }
 
-const mlx::core::fast::CustomKernelFunction& compiled_nint_matmul_kernel(
+std::string nint_epilogue_metal_type(Dtype dtype) {
+    if (dtype == mlx::core::float16) return "half";
+    if (dtype == mlx::core::float32) return "float";
+    if (dtype == mlx::core::bfloat16) return "bfloat";
+    if (dtype == mlx::core::bool_) return "bool";
+    if (dtype == mlx::core::int8) return "char";
+    if (dtype == mlx::core::uint8) return "uchar";
+    if (dtype == mlx::core::int16) return "short";
+    if (dtype == mlx::core::uint16) return "ushort";
+    if (dtype == mlx::core::int32) return "int";
+    if (dtype == mlx::core::uint32) return "uint";
+    if (dtype == mlx::core::int64) return "long";
+    if (dtype == mlx::core::uint64) return "ulong";
+    throw std::invalid_argument("unsupported NINT epilogue dtype");
+}
+
+struct NintMatmulPlan {
+    NintMatmulKernelConfig config;
+    std::string kernel_name;
+
+    std::string source() const {
+        std::string result = "#include <metal_stdlib>\nusing namespace metal;\n"
+            + nint_matmul_kernel_header(config) + kNintHeader
+            + (config.add_residual ? kNintStoreOutputAdd
+                : config.moe_shared ? kNintStoreOutputMoeShared : kNintStoreOutput);
+        result += "\nkernel void " + kernel_name + "(\n";
+        const std::array<const char*, 10> names{
+            "q_packed", "row_metadata", "sub_scale", "sub_min", "x",
+            "expert_ids", "expert_map", "residual", "route_weights", "gate_logits"};
+        const std::array<const char*, 7> types{
+            "uchar", "uint", "uchar", "uchar", "T", "int", "int"};
+        const int count = config.add_residual ? 8 : config.moe_shared ? 10 : 7;
+        for (int index = 0; index < count; ++index) {
+            const std::string type = index < 7 ? types[index]
+                : nint_epilogue_metal_type(config.epilogue_types[index - 7]);
+            const char* name = config.moe_shared && index == 7
+                ? "pair_output" : names[index];
+            result += "device const " + type + "* " + name + " [[buffer("
+                + std::to_string(index) + ")]],\n";
+        }
+        result += "device T* y [[buffer(" + std::to_string(count) + ")]],\n"
+            "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]],\n"
+            "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],\n"
+            "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]) {\n";
+        result += kNintMatmul;
+        result += "\n}\n";
+        return result;
+    }
+};
+
+const std::shared_ptr<const NintMatmulPlan>& compiled_nint_matmul_plan(
     const NintMatmulKernelConfig& config) {
-    using Kernel = mlx::core::fast::CustomKernelFunction;
     struct LocalEntry {
         NintMatmulKernelConfig config;
-        const Kernel* kernel = nullptr;
+        std::shared_ptr<const NintMatmulPlan> plan;
     };
     thread_local std::vector<LocalEntry> local_cache;
     for (const auto& entry : local_cache) {
-        if (entry.config == config) {
-            return *entry.kernel;
-        }
+        if (entry.config == config) return entry.plan;
     }
-
-    const auto key = nint_matmul_kernel_key(config);
+    auto key = "mfq_native_nint_matmul_" + nint_matmul_kernel_key(config);
+    for (const auto dtype : config.epilogue_types)
+        key += "_" + mlx::core::type_to_name(dtype);
     static std::mutex mutex;
-    static std::unordered_map<std::string, Kernel> kernels;
+    static std::unordered_map<std::string, std::shared_ptr<const NintMatmulPlan>> plans;
     std::lock_guard<std::mutex> lock(mutex);
-    if (const auto found = kernels.find(key); found != kernels.end()) {
-        local_cache.push_back({config, &found->second});
-        return found->second;
+    const auto [entry, inserted] = plans.try_emplace(key);
+    if (inserted) entry->second = std::make_shared<NintMatmulPlan>(NintMatmulPlan{config, key});
+    local_cache.push_back({config, entry->second});
+    return local_cache.back().plan;
+}
+
+class NintMatmulPrimitive final : public mlx::core::UnaryPrimitive {
+public:
+    NintMatmulPrimitive(
+        mlx::core::Stream stream, std::shared_ptr<const NintMatmulPlan> plan)
+        : UnaryPrimitive(stream), plan_(std::move(plan)) {}
+
+    void eval_cpu(const std::vector<array>&, array&) override {
+        throw std::runtime_error("packed NINT matmul has no CPU path");
     }
 
-    std::vector<std::string> inputs{
-        "q_packed",
-        "row_metadata",
-        "sub_scale",
-        "sub_min",
-        "x",
-        "expert_ids",
-        "expert_map",
-    };
-    if (config.add_residual) {
-        inputs.emplace_back("residual");
-    } else if (config.moe_shared) {
-        inputs.emplace_back("pair_output");
-        inputs.emplace_back("route_weights");
-        inputs.emplace_back("gate_logits");
+    void eval_gpu(const std::vector<array>& inputs, array& output) override {
+        const auto& config = plan_->config;
+        const int count = config.add_residual ? 8 : config.moe_shared ? 10 : 7;
+        if (inputs.size() != static_cast<std::size_t>(count))
+            throw std::logic_error("packed NINT matmul input count mismatch");
+        output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        auto& selected_stream = stream();
+        auto& device = mlx::core::metal::device(selected_stream.device);
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(plan_->kernel_name, options,
+            [plan = plan_] { return plan->source(); });
+        auto* kernel = device.get_kernel(plan_->kernel_name, library);
+        auto& encoder = mlx::core::metal::get_command_encoder(selected_stream);
+        encoder.set_compute_pipeline_state(kernel);
+        for (int index = 0; index < count; ++index)
+            encoder.set_input_array(inputs[index], index);
+        encoder.set_output_array(output, count);
+        const int output_groups = (config.logical_output + 8 * config.outputs_per_simd - 1)
+            / (8 * config.outputs_per_simd);
+        const int row_groups = (config.rows + config.tile_rows - 1) / config.tile_rows;
+        encoder.dispatch_threadgroups(
+            MTL::Size(output_groups, row_groups, 1), MTL::Size(256, 1, 1));
     }
-    CompileOptions options;
-    options.math_mode = MathMode::Fast;
-    auto header = nint_matmul_kernel_header(config)
-        + kNintHeader
-        + (config.add_residual
-               ? kNintStoreOutputAdd
-               : (config.moe_shared
-                      ? kNintStoreOutputMoeShared
-                      : kNintStoreOutput));
-    auto kernel = mlx::core::fast::metal_kernel(
-        "mfq_cpp_nint_runtime_" + key,
-        std::move(inputs),
-        {"y"},
-        kNintMatmul,
-        std::move(header),
-        true,
-        false,
-        options);
-    const auto [inserted, unused] = kernels.emplace(key, std::move(kernel));
-    (void)unused;
-    local_cache.push_back({config, &inserted->second});
-    return inserted->second;
+
+    const char* name() const override { return "NintMatmulPrimitive"; }
+
+    bool is_equivalent(const mlx::core::Primitive& other) const override {
+        const auto* primitive = dynamic_cast<const NintMatmulPrimitive*>(&other);
+        return primitive && primitive->plan_ == plan_;
+    }
+
+    std::vector<Shape> output_shapes(const std::vector<array>&) override {
+        return {Shape{plan_->config.rows, plan_->config.logical_output}};
+    }
+
+private:
+    std::shared_ptr<const NintMatmulPlan> plan_;
+};
+
+array native_nint_matmul(
+    std::vector<array> inputs, NintMatmulKernelConfig config) {
+    for (auto& input : inputs)
+        if (input.status() == array::Status::unscheduled || !input.flags().row_contiguous)
+            input = mlx::core::contiguous(input);
+    for (std::size_t index = 7; index < inputs.size(); ++index)
+        config.epilogue_types[index - 7] = inputs[index].dtype();
+    const auto& plan = compiled_nint_matmul_plan(config);
+    const auto stream = mlx::core::default_stream(mlx::core::default_device());
+    if (stream.device != mlx::core::Device::gpu)
+        throw std::invalid_argument("packed NINT matmul requires the Metal device");
+    return array(Shape{config.rows, config.logical_output},
+        config.float32 ? mlx::core::float32 : mlx::core::float16,
+        std::make_shared<NintMatmulPrimitive>(stream, plan), std::move(inputs));
 }
 
 mlx::core::fast::CustomKernelFunction make_nint_swiglu_kernel() {
@@ -1392,16 +1472,24 @@ const mlx::core::fast::CustomKernelFunction& nint_embedding_kernel() {
     return kernel;
 }
 
-int nint_decode_outputs_per_simd() noexcept {
+int nint_decode_outputs_per_simd(int input_size, int output_size) noexcept {
     const char* setting = std::getenv("MFQ_METAL_NINT_OUTPUTS_PER_SIMD");
     if (setting != nullptr && setting[1] == '\0' &&
         (setting[0] == '1' || setting[0] == '2' || setting[0] == '4')) {
         return setting[0] - '0';
     }
-    return 2;
+    return input_size > output_size ? 1 : 2;
 }
 
 } // namespace
+
+std::string_view detail::nint_matmul_metal_header() noexcept {
+    return kNintHeader;
+}
+
+std::string_view detail::nint_matmul_metal_body() noexcept {
+    return kNintMatmul;
+}
 
 bool is_nint_dtype(std::string_view dtype) noexcept {
     return dtype == "NINT";
@@ -1838,9 +1926,8 @@ array MlxNintWeight::matmul_impl(
     const int tile_rows = rows == 1
         ? 1
         : (rows <= 16 ? static_cast<int>(rows) : 8);
-    const auto row_tiles = (rows + tile_rows - 1) / tile_rows;
     const std::int64_t outputs_per_simd =
-        rows == 1 ? nint_decode_outputs_per_simd() : 2;
+        rows == 1 ? nint_decode_outputs_per_simd(input_size_, output_size_) : 2;
     const std::int64_t outputs_per_threadgroup = 8 * outputs_per_simd;
     constexpr std::int64_t threads_per_threadgroup = 256;
     const auto output_threadgroups =
@@ -1875,7 +1962,7 @@ array MlxNintWeight::matmul_impl(
             *gate_logits,
             Shape{static_cast<std::int32_t>(rows)})));
     }
-    const auto& kernel = compiled_nint_matmul_kernel({
+    auto result = native_nint_matmul(std::move(inputs), {
         .float32 = source.dtype() == mlx::core::float32,
         .add_residual = residual != nullptr,
         .moe_shared = has_moe_shared,
@@ -1895,18 +1982,7 @@ array MlxNintWeight::matmul_impl(
         .out_per_expert = output_size_,
         .logical_output = output_size_,
     });
-    auto outputs = kernel(
-        std::move(inputs),
-        {Shape{static_cast<std::int32_t>(rows), output_size_}},
-        {source.dtype()},
-        {static_cast<int>(grid_x), static_cast<int>(row_tiles), 1},
-        {static_cast<int>(threads_per_threadgroup), 1, 1},
-        {},
-        std::nullopt,
-        false,
-        {});
-    auto result = mlx::core::reshape(outputs.front(), std::move(output_shape));
-    return result;
+    return mlx::core::reshape(std::move(result), std::move(output_shape));
 }
 
 array MlxNintWeight::routed_matmul(
@@ -1966,7 +2042,8 @@ array MlxNintWeight::routed_matmul(
     if (grid_x > std::numeric_limits<int>::max()) {
         throw std::runtime_error("NINT routed Metal grid exceeds MLX limits");
     }
-    const auto& kernel = compiled_nint_matmul_kernel({
+    auto result = native_nint_matmul(
+        {q_packed_, row_metadata_, sub_scale_, sub_min_, source, ids, map}, {
         .float32 = source.dtype() == mlx::core::float32,
         .add_residual = false,
         .group_size = group_size_,
@@ -1984,30 +2061,8 @@ array MlxNintWeight::routed_matmul(
         .out_per_expert = out_per_expert,
         .logical_output = out_per_expert,
     });
-    auto outputs = kernel(
-        {
-            q_packed_,
-            row_metadata_,
-            sub_scale_,
-            sub_min_,
-            source,
-            ids,
-            map,
-        },
-        {Shape{static_cast<int>(route_count), out_per_expert}},
-        {source.dtype()},
-        {
-            static_cast<int>(grid_x),
-            static_cast<int>(route_count),
-            1,
-        },
-        {threads_per_threadgroup, 1, 1},
-        {},
-        std::nullopt,
-        false,
-        {});
     return mlx::core::reshape(
-        std::move(outputs.front()),
+        std::move(result),
         output_shape);
 }
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <optional>
 
 #include <mlx/mlx.h>
@@ -87,8 +88,31 @@ struct MlxGatedDeltaCacheState {
     int position = 0;
 };
 
+using MlxGatedDeltaReplay = std::function<MlxGatedDeltaCacheState(
+    const MlxGatedDeltaSpeculativeState&, int)>;
+
+MlxGatedDeltaReplay compile_gated_delta_speculative_replay(
+    const mlx::core::array& convolution_weight,
+    int key_heads,
+    int value_heads,
+    int key_head_dimension,
+    int value_head_dimension,
+    const std::optional<mlx::core::array>& convolution_bias = std::nullopt,
+    float eps = 1e-5f,
+    bool transposed_state = false,
+    bool tiled_heads = false);
+
 MlxGatedDeltaNetResult gated_delta_net(
     const mlx::core::array& query,
+    const mlx::core::array& key,
+    const mlx::core::array& value,
+    const mlx::core::array& gate,
+    const mlx::core::array& beta,
+    const std::optional<mlx::core::array>& state = std::nullopt,
+    bool transposed_state = false,
+    bool tiled_heads = false);
+
+mlx::core::array gated_delta_net_state(
     const mlx::core::array& key,
     const mlx::core::array& value,
     const mlx::core::array& gate,

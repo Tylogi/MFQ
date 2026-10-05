@@ -359,7 +359,7 @@ constexpr const char* kGemvSource = R"METAL(
             }
             const uint output = base + row * 2u;
             if (k_lane == 0u && output < uint(OUT)) {
-                y[output] = T(values[row]);
+                MFQ_VQ_STORE_OUTPUT(output, values[row]);
             }
         }
         return;
@@ -373,6 +373,7 @@ constexpr const char* kGemvSource = R"METAL(
         uint table_banks[ROWS_PER_SIMD];
         uint code_banks[ROWS_PER_SIMD];
         uint delta_values[ROWS_PER_SIMD];
+        uint2 group_records[ROWS_PER_SIMD];
         float weight_scales[ROWS_PER_SIMD];
 
         for (uint row = 0u;
@@ -382,10 +383,13 @@ constexpr const char* kGemvSource = R"METAL(
                 min(output_base + row, uint(OUT) - 1u);
             uint state_index =
                 output * uint(NG) + group;
-            uint state = mfq_vq_read_bits(
-                state_packed,
-                state_index,
-                uint(STATE_BITS));
+            uint state;
+            if constexpr (EXECUTION_LAYOUT == 1) {
+                group_records[row] = mfq_vq_read_group64(indices_packed, state_index);
+                state = group_records[row].y >> 28u;
+            } else {
+                state = mfq_vq_read_bits(state_packed, state_index, uint(STATE_BITS));
+            }
             uint table_bank = 0u;
             if (HAS_TABLE_BANKS != 0) {
                 table_bank = uint(bank_ids[
@@ -443,17 +447,19 @@ constexpr const char* kGemvSource = R"METAL(
                  row < ROWS_PER_SIMD;
                  ++row) {
                 uint output = outputs[row];
-                uint index = mfq_vq_read_bits(
-                    indices_packed,
-                    output * uint(NVEC) + vector,
-                    uint(INDEX_BITS));
+                uint index;
                 uint sign_value = 0u;
-                if (AUX_MODE == 1 || AUX_MODE == 2) {
-                    sign_value = mfq_vq_read_bits(
-                        aux_packed,
-                        output * uint(NSIGN)
-                            + column_base / 8u,
-                        7u);
+                if constexpr (EXECUTION_LAYOUT == 1) {
+                    uint segment = mfq_vq_group64_segment(group_records[row], local_vector);
+                    index = segment & 4095u;
+                    sign_value = segment >> 12u;
+                } else {
+                    index = mfq_vq_read_bits(indices_packed,
+                        output * uint(NVEC) + vector, uint(INDEX_BITS));
+                    if (AUX_MODE == 1 || AUX_MODE == 2) {
+                        sign_value = mfq_vq_read_bits(aux_packed,
+                            output * uint(NSIGN) + column_base / 8u, 7u);
+                    }
                 }
                 for (uint component = 0u;
                      component < uint(VECTOR_SIZE);
@@ -480,14 +486,15 @@ constexpr const char* kGemvSource = R"METAL(
                         AUX_MODE == 2) {
                         uint sign_position =
                             column & 7u;
-                        uint negative =
-                            sign_position < 7u
+                        uint negative = EXECUTION_LAYOUT == 1
+                            ? ((sign_value >> sign_position) & 1u)
+                            : (sign_position < 7u
                             ? (
                                 (sign_value
                                     >> sign_position)
                                 & 1u
                             )
-                            : (popcount(sign_value) & 1u);
+                            : (popcount(sign_value) & 1u));
                         if (
                             AUX_MODE == 2
                             && sign_position == 7u
@@ -519,7 +526,7 @@ constexpr const char* kGemvSource = R"METAL(
         float total = simd_sum(accumulators[row]);
         uint output = output_base + row;
         if (lane == 0u && output < uint(OUT)) {
-            y[output] = T(total);
+            MFQ_VQ_STORE_OUTPUT(output, total);
         }
     }
 )METAL";
@@ -3071,7 +3078,8 @@ mlx::core::fast::CustomKernelFunction make_vq_gemv_kernel() {
         },
         {"y"},
         kGemvSource,
-        std::string(kBitstreamHeader) + kNvq3jlHeader,
+        std::string(kBitstreamHeader) + kNvq3jlHeader +
+            "\n#define MFQ_VQ_STORE_OUTPUT(index, value) y[index] = T(value)\n",
         true,
         false,
         options);
@@ -3355,6 +3363,14 @@ common_templates(
 }
 
 } // namespace
+
+std::string_view detail::vq_gemv_metal_header() noexcept {
+    return kBitstreamHeader;
+}
+
+std::string_view detail::vq_gemv_metal_body() noexcept {
+    return kGemvSource;
+}
 
 VqTensorMetadata inspect_vq_blob(
     std::string_view dtype,
@@ -3889,8 +3905,7 @@ array MlxVqWeight::packed_matmul(
             "invalid VQ packed row tile");
     }
     const bool fast_gemv =
-        rows == 1 && tile_rows == 1
-        && execution_layout_ == kExecutionStreams;
+        rows == 1 && tile_rows == 1;
     const bool wide_mmq =
         rows >= 2 && rows <= 16
         && tile_rows == rows

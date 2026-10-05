@@ -1,6 +1,7 @@
 #include "qwen4_ops.h"
 
 #include "mlx_transformer.h"
+#include "mlx_sparse_attention.h"
 
 #include <mlx/allocator.h>
 #include <mlx/backend/metal/device.h>
@@ -193,6 +194,8 @@ constexpr const char* kQsaDecodePrologueSource = R"METAL(
         uint(QUERY_HEADS + KEY_HEADS + INDEX_HEADS);
 
     uint head_group = threadgroup_position_in_grid.x;
+    uint token = threadgroup_position_in_grid.y;
+    uint rows = uint(token_count[0]);
     uint local_thread = thread_position_in_threadgroup.x;
     uint lane = thread_index_in_simdgroup;
     uint simd_group = simdgroup_index_in_threadgroup;
@@ -208,10 +211,10 @@ constexpr const char* kQsaDecodePrologueSource = R"METAL(
         ? uint(HEAD_DIM)
         : uint(INDEX_DIM);
     uint source_base = is_query
-        ? head * uint(2 * HEAD_DIM)
+        ? (token * uint(QUERY_HEADS) + head) * uint(2 * HEAD_DIM)
         : (is_key
-            ? head * uint(HEAD_DIM)
-            : head * uint(INDEX_DIM));
+            ? (token * uint(KEY_HEADS) + head) * uint(HEAD_DIM)
+            : (token * uint(INDEX_HEADS + 1) + head) * uint(INDEX_DIM));
     device const T* source = is_query
         ? query_gate_input
         : (is_key ? key_input : index_query_key_input);
@@ -245,7 +248,7 @@ constexpr const char* kQsaDecodePrologueSource = R"METAL(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     constexpr uint ROTARY_HALF = uint(ROTARY_DIM / 2);
-    int position = positions[0];
+    int position = positions[token];
     for (uint item = 0u; item < VALUES_PER_THREAD; ++item) {
         uint column = column_base + item;
         if (column >= width) continue;
@@ -276,15 +279,15 @@ constexpr const char* kQsaDecodePrologueSource = R"METAL(
                 float(source[source_base + column])
                 * inverse_rms[0] * norm_weight[column]));
         }
-        uint output_index = head * width + column;
+        uint output_index = (head * rows + token) * width + column;
         if (is_query) {
             query_output[output_index] = T(normalized);
-            output_gate[output_index] = query_gate_input[
+            output_gate[(token * uint(QUERY_HEADS) + head) * width + column] = query_gate_input[
                 source_base + uint(HEAD_DIM) + column];
         } else if (is_key) {
             key_output[output_index] = T(normalized);
         } else {
-            index_query_output[output_index] = T(normalized);
+            index_query_output[(token * uint(INDEX_HEADS) + head) * width + column] = T(normalized);
         }
     }
 )METAL";
@@ -694,6 +697,7 @@ constexpr const char* kGatedHcWriteNormDownSource = R"METAL(
         float value = 0.0f;
         float scale = 0.0f;
         if (feature < uint(HIDDEN)) {
+            #pragma clang fp contract(off)
             U update = U(U(previous_branch[feature]) * U(gate_value));
             written = O(O(previous_residual[input_base + feature]) + O(update));
             value = float(written);
@@ -931,24 +935,38 @@ std::string packed_hc_source(const PackedHcConfig& config, const std::string& ke
         ", uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]) {\n";
     source += "kernel void " + key + "_down(";
     source += config.after
-        ? "device const R* previous_residual [[buffer(0)]], device const B* previous_branch [[buffer(1)]], device const G* previous_injection [[buffer(2)]], "
-        : "device const R* input [[buffer(0)]], ";
+        ? "device const R* residual_storage [[buffer(0)]], device const B* branch_storage [[buffer(1)]], device const G* gate_storage [[buffer(2)]], "
+        : "device const R* input_storage [[buffer(0)]], ";
     source +=
         "device const W* norm_weight [[buffer(3)]], "
         "device const uchar* down_weight [[buffer(4)]], device const uint* down_rows [[buffer(5)]], "
         "device const uchar* down_scales [[buffer(6)]], device const uchar* down_minima [[buffer(7)]], "
         "device const uchar* injection_weight [[buffer(12)]], device const uint* injection_rows [[buffer(13)]], "
         "device const uchar* injection_scales [[buffer(14)]], device const uchar* injection_minima [[buffer(15)]], "
-        "device O* normalized [[buffer(16)]], device float* parts [[buffer(17)]], "
-        "device O* residual [[buffer(18)]], constant float* epsilon [[buffer(19)]]";
+        "device O* normalized_storage [[buffer(16)]], device float* parts_storage [[buffer(17)]], "
+        "device O* output_storage [[buffer(18)]], constant float* epsilon [[buffer(19)]]";
     source += builtins;
+    source += "const uint token = threadgroup_position_in_grid.y;\n"
+        "device O* normalized = normalized_storage + token * 10240u;\n"
+        "device float* parts = parts_storage + token * 1296u;\n";
+    source += config.after
+        ? "device const R* previous_residual = residual_storage + token * 10240u;\n"
+          "device const B* previous_branch = branch_storage + token * 2560u;\n"
+          "device const G* previous_injection = gate_storage + token * 4u;\n"
+          "device O* residual = output_storage + token * 10240u;\n"
+        : "device const R* input = input_storage + token * 10240u;\n";
     source += config.after ? kGatedHcWriteNormDownSource : kGatedHcNormDownSource;
     source += "}\nkernel void " + key + "_up("
         "device const uchar* up_weight [[buffer(8)]], device const uint* up_rows [[buffer(9)]], "
         "device const uchar* up_scales [[buffer(10)]], device const uchar* up_minima [[buffer(11)]], "
-        "device const O* normalized [[buffer(16)]], device const float* parts [[buffer(17)]], "
-        "device T* branch [[buffer(20)]], device I* injection [[buffer(21)]]";
+        "device const O* normalized_storage [[buffer(16)]], device const float* parts_storage [[buffer(17)]], "
+        "device T* branch_storage [[buffer(20)]], device I* injection_storage [[buffer(21)]]";
     source += builtins;
+    source += "const uint token = threadgroup_position_in_grid.y;\n"
+        "device const O* normalized = normalized_storage + token * 10240u;\n"
+        "device const float* parts = parts_storage + token * 1296u;\n"
+        "device T* branch = branch_storage + token * 2560u;\n"
+        "device I* injection = injection_storage + token * 4u;\n";
     source += kGatedHcPartsUpSource;
     source += "}\n";
     return source;
@@ -958,7 +976,7 @@ class PackedHcPrimitive final : public mlx::core::Primitive {
 public:
     PackedHcPrimitive(mlx::core::Stream stream, PackedHcConfig config)
         : Primitive(stream), config_(config) {
-        key_ = "mfq_packed_hc_v1";
+        key_ = "mfq_packed_hc_v2";
         for (auto dtype : {config.residual_type, config.branch_type, config.gate_type,
                 config.norm_type, config.update_type, config.output_type, config.low_type,
                 config.result_type, config.injection_type})
@@ -975,8 +993,9 @@ public:
     void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
         for (auto& output : outputs)
             output.set_data(mlx::core::allocator::malloc(output.nbytes()));
-        array normalized(Shape{10240}, config_.output_type, nullptr, {});
-        array parts(Shape{4, 324}, mlx::core::float32, nullptr, {});
+        const int rows = static_cast<int>(inputs[0].size() / 10240);
+        array normalized(Shape{rows, 10240}, config_.output_type, nullptr, {});
+        array parts(Shape{rows, 4, 324}, mlx::core::float32, nullptr, {});
         normalized.set_data(mlx::core::allocator::malloc(normalized.nbytes()));
         parts.set_data(mlx::core::allocator::malloc(parts.nbytes()));
         auto& device = mlx::core::metal::device(stream().device);
@@ -991,7 +1010,7 @@ public:
         if (config_.after) encoder.set_output_array(outputs[2], 18);
         encoder.set_bytes(config_.eps, 19);
         encoder.set_compute_pipeline_state(device.get_kernel(key_ + "_down", library));
-        encoder.dispatch_threadgroups(MTL::Size((20 + int(config_.has_injection)) * 4, 1, 1),
+        encoder.dispatch_threadgroups(MTL::Size((20 + int(config_.has_injection)) * 4, rows, 1),
                                       MTL::Size(256, 1, 1));
         encoder.set_input_array(normalized, 16);
         encoder.set_input_array(parts, 17);
@@ -1000,7 +1019,7 @@ public:
         const int chunk = config_.up_gs * ((32 + config_.up_gs - 1) / config_.up_gs);
         const int threads = 32 * ((320 + chunk - 1) / chunk);
         encoder.set_compute_pipeline_state(device.get_kernel(key_ + "_up", library));
-        encoder.dispatch_threadgroups(MTL::Size(320, 1, 1), MTL::Size(threads, 1, 1));
+        encoder.dispatch_threadgroups(MTL::Size(320, rows, 1), MTL::Size(threads, 1, 1));
         encoder.add_temporary(std::move(normalized));
         encoder.add_temporary(std::move(parts));
     }
@@ -1044,9 +1063,13 @@ MlxQwen4GatedResidualPre packed_gated_hc(
         low_type, result_type, injection_type,
         down.group_size, down.groups, up.group_size, up.groups, injection.group_size, injection.groups,
         after, injection_weight.has_value(), eps};
+    auto branch_shape = input.shape();
+    branch_shape.back() = 2560;
+    auto injection_shape = input.shape();
+    injection_shape.back() = 4;
     auto outputs = array::make_arrays(
-        after ? std::vector<Shape>{Shape{1, 1, 2560}, Shape{1, 1, 4}, input.shape()}
-              : std::vector<Shape>{Shape{1, 1, 2560}, Shape{1, 1, 4}},
+        after ? std::vector<Shape>{branch_shape, injection_shape, input.shape()}
+              : std::vector<Shape>{branch_shape, injection_shape},
         after ? std::vector<mlx::core::Dtype>{result_type, injection_type, output_type}
               : std::vector<mlx::core::Dtype>{result_type, injection_type},
         std::make_shared<PackedHcPrimitive>(
@@ -1109,7 +1132,7 @@ class QsaProloguePrimitive final : public mlx::core::Primitive {
 public:
     QsaProloguePrimitive(mlx::core::Stream stream, QsaPrologueConfig config)
         : Primitive(stream), config_(config),
-          kernel_name_("mfq_qsa_decode_prologue") {
+          kernel_name_("mfq_qsa_decode_prologue_v2") {
         kernel_name_ += "_" + mlx::core::type_to_name(config_.dtype);
         for (int value : config_.geometry) {
             kernel_name_ += "_" + std::to_string(value);
@@ -1138,12 +1161,14 @@ public:
             encoder.set_input_array(inputs[index], index);
         }
         encoder.set_bytes(config_.params, 7);
+        const int rows = inputs[0].shape(1);
+        encoder.set_bytes(rows, 12);
         for (int index = 0; index < 4; ++index) {
             encoder.set_output_array(outputs[index], index + 8);
         }
         encoder.dispatch_threadgroups(
             MTL::Size(config_.geometry[0] + config_.geometry[1] +
-                config_.geometry[2], 1, 1),
+                config_.geometry[2], rows, 1),
             MTL::Size(64, 1, 1));
     }
 
@@ -1176,6 +1201,7 @@ private:
             "device T* output_gate [[buffer(9)]], "
             "device T* key_output [[buffer(10)]], "
             "device T* index_query_output [[buffer(11)]], "
+            "constant int* token_count [[buffer(12)]], "
             "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]], "
             "uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]], "
             "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]], "
@@ -1600,7 +1626,8 @@ bool can_fuse_gated_hc_two_stage(
     int hc_count) {
     if (!gated_hc_fast_path_enabled() ||
         hidden_size != 2560 || hc_count != 4 ||
-        input.ndim() != 3 || input.shape() != Shape{1, 1, 10240} ||
+        input.ndim() != 3 || input.shape(0) != 1 ||
+        input.shape(1) < 1 || input.shape(1) > 6 || input.shape(2) != 10240 ||
         norm_weight.shape() != Shape{10240} ||
         (down_weight.output_size() != 320 || down_weight.input_size() != 10240) ||
         (up_weight.output_size() != 10240 || up_weight.input_size() != 320) ||
@@ -1610,6 +1637,9 @@ bool can_fuse_gated_hc_two_stage(
         !gated_hc_float_dtype(hc_weight_dtype(up_weight))) {
         return false;
     }
+    if (input.shape(1) > 1 &&
+        !can_use_packed_hc(input, norm_weight, down_weight, up_weight, injection_weight))
+        return false;
     return !injection_weight ||
         (injection_weight->output_size() == 4 && injection_weight->input_size() == 10240 &&
          gated_hc_float_dtype(hc_weight_dtype(*injection_weight)));
@@ -1932,6 +1962,22 @@ void require_rank(const array& value, int rank, const char* name) {
     }
 }
 
+array qsa_head_scores(const array& query, const array& pooled_keys) {
+    require_rank(query, 4, "Qwen4 index query");
+    require_rank(pooled_keys, 3, "Qwen4 pooled key");
+    if (query.shape(0) != pooled_keys.shape(0) ||
+        query.shape(3) != pooled_keys.shape(2)) {
+        throw std::invalid_argument("Qwen4 QSA score dimensions disagree");
+    }
+    auto keys = mlx::core::transpose(
+        mlx::core::astype(pooled_keys, mlx::core::float32), {0, 2, 1});
+    return mlx::core::reshape(
+        mlx::core::matmul(
+            mlx::core::reshape(mlx::core::astype(query, mlx::core::float32),
+                Shape{query.shape(0), query.shape(1) * query.shape(2), query.shape(3)}), keys),
+        Shape{query.shape(0), query.shape(1), query.shape(2), pooled_keys.shape(1)});
+}
+
 } // namespace
 
 array qwen4_grouped_rms_norm(
@@ -2079,8 +2125,10 @@ MlxQwen4GatedResidualPre qwen4_gated_residual_pre_after(
             inject_weight,
             hidden_size,
             hc_count) &&
-        previous_branch.shape() == Shape{1, 1, hidden_size} &&
-        previous_injection.shape() == Shape{1, 1, hc_count} &&
+        previous_branch.shape() == Shape{1, previous_residual.shape(1), hidden_size} &&
+        previous_injection.shape() == Shape{1, previous_residual.shape(1), hc_count} &&
+        (previous_residual.shape(1) == 1 ||
+         (previous_branch.flags().row_contiguous && previous_injection.flags().row_contiguous)) &&
         gated_hc_float_dtype(previous_branch.dtype()) &&
         gated_hc_float_dtype(previous_injection.dtype())) {
         return fused_gated_hc_two_stage_after(
@@ -2199,6 +2247,7 @@ MlxQwen4QsaDecodePrologue qwen4_qsa_decode_prologue(
     float rope_theta,
     float eps) {
     const auto dtype = query_gate.dtype();
+    const int rows = query_gate.ndim() == 3 ? query_gate.shape(1) : 0;
     if ((dtype != mlx::core::float16 &&
          dtype != mlx::core::bfloat16 &&
          dtype != mlx::core::float32) ||
@@ -2210,10 +2259,11 @@ MlxQwen4QsaDecodePrologue qwen4_qsa_decode_prologue(
         rotary_dimension > std::min(head_dimension, index_dimension) ||
         !std::isfinite(rope_theta) || rope_theta <= 0.0f ||
         !std::isfinite(eps) || eps <= 0.0f ||
-        query_gate.shape() != Shape{1, 1, query_heads * 2 * head_dimension} ||
-        key.shape() != Shape{1, 1, key_heads * head_dimension} ||
+        rows < 1 || rows > 6 ||
+        query_gate.shape() != Shape{1, rows, query_heads * 2 * head_dimension} ||
+        key.shape() != Shape{1, rows, key_heads * head_dimension} ||
         index_query_key.shape() !=
-            Shape{1, 1, (index_heads + 1) * index_dimension} ||
+            Shape{1, rows, (index_heads + 1) * index_dimension} ||
         query_norm_weight.dtype() != mlx::core::float32 ||
         query_norm_weight.shape() != Shape{head_dimension} ||
         key_norm_weight.dtype() != mlx::core::float32 ||
@@ -2221,7 +2271,7 @@ MlxQwen4QsaDecodePrologue qwen4_qsa_decode_prologue(
         index_query_norm_weight.dtype() != mlx::core::float32 ||
         index_query_norm_weight.shape() != Shape{index_dimension} ||
         positions.dtype() != mlx::core::int32 ||
-        positions.shape() != Shape{1}) {
+        positions.shape() != Shape{rows}) {
         throw std::invalid_argument(
             "Qwen4 QSA decode prologue geometry disagrees");
     }
@@ -2232,10 +2282,10 @@ MlxQwen4QsaDecodePrologue qwen4_qsa_decode_prologue(
         {eps, rope_theta}};
     auto outputs = array::make_arrays(
         {
-            Shape{1, query_heads, 1, head_dimension},
-            Shape{1, 1, query_heads * head_dimension},
-            Shape{1, key_heads, 1, head_dimension},
-            Shape{1, 1, index_heads, index_dimension},
+            Shape{1, query_heads, rows, head_dimension},
+            Shape{1, rows, query_heads * head_dimension},
+            Shape{1, key_heads, rows, head_dimension},
+            Shape{1, rows, index_heads, index_dimension},
         },
         {dtype, dtype, dtype, dtype},
         std::make_shared<QsaProloguePrimitive>(
@@ -2247,7 +2297,7 @@ MlxQwen4QsaDecodePrologue qwen4_qsa_decode_prologue(
             query_norm_weight,
             key_norm_weight,
             index_query_norm_weight,
-            positions,
+            mlx::core::contiguous(positions),
         });
     return {
         std::move(outputs.at(0)),
@@ -2260,21 +2310,19 @@ MlxQwen4QsaDecodePrologue qwen4_qsa_decode_prologue(
 array qwen4_qsa_block_scores(
     const array& query,
     const array& pooled_keys) {
-    require_rank(query, 4, "Qwen4 index query");
-    require_rank(pooled_keys, 3, "Qwen4 pooled key");
-    if (query.shape(0) != pooled_keys.shape(0) ||
-        query.shape(3) != pooled_keys.shape(2)) {
-        throw std::invalid_argument("Qwen4 QSA score dimensions disagree");
-    }
-    auto keys = mlx::core::expand_dims(
-        mlx::core::transpose(
-            mlx::core::astype(pooled_keys, mlx::core::float32), {0, 2, 1}),
-        1);
-    auto scores = mlx::core::matmul(
-        mlx::core::astype(query, mlx::core::float32), keys);
+    auto scores = qsa_head_scores(query, pooled_keys);
     scores = mlx::core::maximum(scores, array(0.0f));
     return mlx::core::sum(scores, -2) /
         std::sqrt(static_cast<float>(query.shape(3)));
+}
+
+array qwen4_qsa_select_blocks(
+    const array& query,
+    const array& pooled_keys,
+    int query_offset,
+    int block_size) {
+    return mlx_sparse_indexer_topk512(
+        qsa_head_scores(query, pooled_keys), query_offset, block_size);
 }
 
 array qwen4_dense_gqa_attention(

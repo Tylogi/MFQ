@@ -13,6 +13,11 @@ namespace mfq::metal {
 
 bool is_nint_dtype(std::string_view dtype) noexcept;
 
+namespace detail {
+std::string_view nint_matmul_metal_header() noexcept;
+std::string_view nint_matmul_metal_body() noexcept;
+}
+
 struct NintDescriptor {
     int format_version = 2;
     double aggregate_bpw = 0.0;

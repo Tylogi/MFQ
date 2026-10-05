@@ -1228,12 +1228,52 @@ void test_nint4_swiglu() {
     }
 }
 
+void check_matmul_epilogue_dtypes() {
+    using namespace mlx::core;
+    const auto fixture = make_nint_blob(4);
+    const auto weight = mfq::metal::MlxNintWeight::from_blob(fixture.blob);
+    for (const int rows : {1, 6}) {
+        std::vector<float> source_values(9 * rows);
+        std::vector<float> residual_values(2 * rows);
+        for (std::size_t index = 0; index < source_values.size(); ++index)
+            source_values[index] = float(int(index % 17) - 8) / 64.0f;
+        for (std::size_t index = 0; index < residual_values.size(); ++index)
+            residual_values[index] = float(int(index % 7) - 3) / 8.0f;
+        for (const auto dtype : {float16, float32}) {
+            const auto source = transpose(astype(
+                array(source_values.begin(), Shape{9, rows}), dtype));
+            for (const auto residual_dtype : {float32, bfloat16, float16, bfloat16}) {
+                const auto residual = transpose(astype(
+                    array(residual_values.begin(), Shape{2, rows}), residual_dtype));
+                auto expected = astype(
+                    weight.matmul(astype(source, float32)) + astype(residual, float32), dtype);
+                auto actual = weight.matmul_add(source, residual);
+                if (actual.dtype() != dtype || actual.shape() != Shape{rows, 2})
+                    throw std::runtime_error("NINT residual output metadata mismatch");
+                expected = contiguous(astype(expected, float32));
+                actual = contiguous(astype(actual, float32));
+                eval(expected, actual);
+                for (std::size_t index = 0; index < actual.size(); ++index) {
+                    if (std::abs(actual.data<float>()[index] - expected.data<float>()[index]) > 1e-4f)
+                        throw std::runtime_error("NINT mixed residual mismatch: M=" +
+                            std::to_string(rows) + " input=" + (dtype == float16 ? "f16" : "f32") +
+                            " residual=" + (residual_dtype == float16 ? "f16" :
+                                residual_dtype == bfloat16 ? "bf16" : "f32") + " index=" +
+                            std::to_string(index) + " actual=" + std::to_string(actual.data<float>()[index]) +
+                            " expected=" + std::to_string(expected.data<float>()[index]));
+                }
+            }
+        }
+    }
+}
+
 } // namespace
 
 
 int main() {
     try {
         using namespace mlx::core;
+        check_matmul_epilogue_dtypes();
         if (!mfq::metal::is_nint_dtype("NINT")) {
             throw std::runtime_error("canonical NINT dtype was rejected");
         }

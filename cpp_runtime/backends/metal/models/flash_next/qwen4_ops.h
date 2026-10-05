@@ -86,6 +86,12 @@ mlx::core::array qwen4_qsa_block_scores(
     const mlx::core::array& query,
     const mlx::core::array& pooled_keys);
 
+mlx::core::array qwen4_qsa_select_blocks(
+    const mlx::core::array& query,
+    const mlx::core::array& pooled_keys,
+    int query_offset,
+    int block_size);
+
 // Decode-only QSA normalization/layout/RoPE prologue. Query, key, and index
 // query share one multi-output dispatch; the strided query gate is copied to
 // its final contiguous layout in the same pass.

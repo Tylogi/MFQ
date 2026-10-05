@@ -647,7 +647,8 @@ const mlx::core::fast::CustomKernelFunction& grouped_kernel() {
 }
 
 std::vector<std::string> nint_projection_group_input_names(
-    std::size_t projections) {
+    std::size_t projections,
+    bool swiglu = true) {
     std::vector<std::string> names;
     names.reserve(projections * 7 + 1);
     for (std::size_t projection = 0;
@@ -655,12 +656,18 @@ std::vector<std::string> nint_projection_group_input_names(
          ++projection) {
         const auto suffix = std::to_string(projection);
         names.push_back("q_packed_" + suffix);
-        names.push_back("row_q_layout_" + suffix);
-        names.push_back("row_q_byte_offsets_" + suffix);
+        if (swiglu) {
+            names.push_back("row_q_layout_" + suffix);
+            names.push_back("row_q_byte_offsets_" + suffix);
+        } else {
+            names.push_back("row_metadata_" + suffix);
+        }
         names.push_back("sub_scale_" + suffix);
         names.push_back("sub_min_" + suffix);
-        names.push_back("neuron_scale_" + suffix);
-        names.push_back("neuron_min_" + suffix);
+        if (swiglu) {
+            names.push_back("neuron_scale_" + suffix);
+            names.push_back("neuron_min_" + suffix);
+        }
     }
     names.emplace_back("x");
     names.emplace_back("params");
@@ -1025,7 +1032,8 @@ public:
         mlx::core::Stream stream,
         NintProjectionConfig config)
         : UnaryPrimitive(stream), config_(std::move(config)),
-          kernel_name_("mfq_nint_projection") {
+          kernel_name_(config_.swiglu
+              ? "mfq_nint_projection" : "mfq_nint_projection_common") {
         kernel_name_ += config_.dtype == mlx::core::float32 ? "_f32" : "_f16";
         for (int value : {
                  config_.rows, config_.group_size, config_.groups,
@@ -1059,10 +1067,16 @@ public:
         }
         encoder.set_bytes(config_.limit, input_count);
         encoder.set_output_array(output, input_count + 1);
-        const int maximum = *std::max_element(
-            config_.output_widths.begin(), config_.output_widths.end());
+        int output_groups = 0;
+        for (int width : config_.output_widths) {
+            const int outputs_per_group =
+                !config_.swiglu && config_.input_width > width ? 8 : 16;
+            const int groups = (width + outputs_per_group - 1) / outputs_per_group;
+            output_groups = config_.swiglu
+                ? std::max(output_groups, groups) : output_groups + groups;
+        }
         encoder.dispatch_threadgroups(
-            MTL::Size((maximum + 15) / 16, 1, 1),
+            MTL::Size(output_groups, 1, 1),
             MTL::Size(256, 1, 1));
     }
 
@@ -1070,6 +1084,7 @@ public:
 
 private:
     std::string source() const {
+        if (!config_.swiglu) return common_source();
         const std::string type =
             config_.dtype == mlx::core::float32 ? "float" : "half";
         std::string source =
@@ -1127,6 +1142,73 @@ private:
         return source;
     }
 
+    std::string common_source() const {
+        std::string source =
+            "#include <metal_stdlib>\nusing namespace metal;\n#define T "
+            + std::string(config_.dtype == mlx::core::float32 ? "float\n" : "half\n");
+        int total = 0;
+        for (int width : config_.output_widths) total += width;
+        for (const auto& [name, value] :
+             std::vector<std::pair<std::string, int>>{
+                 {"GS", config_.group_size}, {"NG", config_.groups},
+                 {"K", config_.input_width}, {"M", config_.rows},
+                 {"TILE_M", config_.rows}, {"TOTAL_OUT", total},
+                 {"ROUTED", 0}, {"ROUTES", 1}, {"SHARED_INPUT", 0},
+                 {"EXPERT_MAP_SIZE", 1}, {"LOCAL_EXPERTS", 1},
+                 {"OUT_PER_EXPERT", 1}}) {
+            source += "#define " + name + " " + std::to_string(value) + "\n";
+        }
+        source += detail::nint_matmul_metal_header();
+        source += "kernel void " + kernel_name_ + "(";
+        const auto names = nint_projection_group_input_names(
+            config_.output_widths.size(), false);
+        for (std::size_t index = 0; index + 2 < names.size(); ++index) {
+            const auto type = index % 4 == 1 ? "uint" : "uchar";
+            source += "device const " + std::string(type) + "* " +
+                names[index] + " [[buffer(" + std::to_string(index) + ")]], ";
+        }
+        const auto input_index = config_.output_widths.size() * 4;
+        source +=
+            "device const T* x [[buffer(" + std::to_string(input_index) + ")]], "
+            "constant float* params [[buffer(" + std::to_string(input_index + 1) + ")]], "
+            "device T* y [[buffer(" + std::to_string(input_index + 2) + ")]], "
+            "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]], "
+            "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]], "
+            "uint3 dispatch_position [[threadgroup_position_in_grid]]) {\n";
+        int offset = 0;
+        int tile_offset = 0;
+        for (std::size_t projection = 0;
+             projection < config_.output_widths.size(); ++projection) {
+            const auto suffix = std::to_string(projection);
+            const int width = config_.output_widths[projection];
+            const int outputs_per_group = config_.input_width > width ? 8 : 16;
+            const int tiles = (width + outputs_per_group - 1) / outputs_per_group;
+            source += "if (dispatch_position.x >= " + std::to_string(tile_offset)
+                + "u && dispatch_position.x < " + std::to_string(tile_offset + tiles) + "u) {\n"
+                "const uint3 threadgroup_position_in_grid = uint3(dispatch_position.x - "
+                + std::to_string(tile_offset) + "u, 0u, 0u);\n";
+            for (const auto* name : {"q_packed", "row_metadata", "sub_scale", "sub_min"}) {
+                source += "const auto " + std::string(name) + " = " + name + "_" + suffix + ";\n";
+            }
+            source +=
+                "const auto expert_ids = reinterpret_cast<device const int*>(row_metadata);\n"
+                "const auto expert_map = expert_ids;\n"
+                "#define OUT " + std::to_string(width) + "\n"
+                "#define LOGICAL_OUT OUT\n"
+                "#define OPS_PER_SIMD " + std::to_string(config_.input_width > width ? 1 : 2) + "\n"
+                "#define MFQ_NINT_STORE_OUTPUT(index, value) "
+                "y[row * uint(TOTAL_OUT) + " + std::to_string(offset) + "u + output] = T(value)\n";
+            source += detail::nint_matmul_metal_body();
+            source +=
+                "#undef MFQ_NINT_STORE_OUTPUT\n#undef OPS_PER_SIMD\n"
+                "#undef LOGICAL_OUT\n#undef OUT\n}\n";
+            offset += width;
+            tile_offset += tiles;
+        }
+        source += "}\n";
+        return source;
+    }
+
     NintProjectionConfig config_;
     std::string kernel_name_;
 };
@@ -1143,6 +1225,34 @@ std::vector<std::string> dense_projection_group_input_names(
     names.push_back("x");
     return names;
 }
+
+constexpr const char* kDenseProjectionHeader = R"METAL(
+template <typename Scalar, uint WIDTH>
+inline float4 mfq_dense_projection_read4(
+    device const Scalar* values, uint row, uint column) {
+    const uint base = row * WIDTH + column;
+    if constexpr (WIDTH % 4u == 0u) {
+        return float4(*reinterpret_cast<device const vec<Scalar, 4>*>(values + base));
+    } else {
+        return float4(
+            float(values[base]),
+            column + 1u < WIDTH ? float(values[base + 1u]) : 0.0f,
+            column + 2u < WIDTH ? float(values[base + 2u]) : 0.0f,
+            column + 3u < WIDTH ? float(values[base + 3u]) : 0.0f);
+    }
+}
+
+template <typename Scalar, uint WIDTH>
+inline float4 mfq_dense_projection_read4(
+    constant const Scalar* values, uint row, uint column) {
+    const uint base = row * WIDTH + column;
+    return float4(
+        float(values[base]),
+        column + 1u < WIDTH ? float(values[base + 1u]) : 0.0f,
+        column + 2u < WIDTH ? float(values[base + 2u]) : 0.0f,
+        column + 3u < WIDTH ? float(values[base + 3u]) : 0.0f);
+}
+)METAL";
 
 std::string make_dense_projection_group_source(
     std::size_t projections) {
@@ -1165,15 +1275,13 @@ std::string make_dense_projection_group_source(
             "        for (uint row = 0u; row < uint(M); ++row) {\n"
             "            accumulators[row] = 0.0f;\n"
             "        }\n"
-            "        for (uint column = lane; column < uint(K); "
-            "column += 32u) {\n"
-            "            float weight = float(w_" + suffix
-            + "[output * uint(K) + column]);\n"
+            "        for (uint column = lane * 4u; column < uint(K); "
+            "column += 128u) {\n"
+            "            float4 weight = mfq_dense_projection_read4<T, uint(K)>(w_" + suffix
+            + ", output, column);\n"
             "            for (uint row = 0u; row < uint(M); ++row) {\n"
-            "                accumulators[row] = fma(\n"
-            "                    float(x[row * uint(K) + column]),\n"
-            "                    weight,\n"
-            "                    accumulators[row]);\n"
+            "                float4 activation = mfq_dense_projection_read4<T, uint(K)>(x, row, column);\n"
+            "                accumulators[row] += dot(activation, weight);\n"
             "            }\n"
             "        }\n"
             "        for (uint row = 0u; row < uint(M); ++row) {\n"
@@ -1208,7 +1316,7 @@ mlx::core::fast::CustomKernelFunction dense_projection_group_kernel(
         dense_projection_group_input_names(projections),
         {"y"},
         make_dense_projection_group_source(projections),
-        "",
+        kDenseProjectionHeader,
         true,
         false,
         options);
@@ -1511,7 +1619,8 @@ std::string make_direct_small_m_source(
 
 std::string make_direct_source(
     const std::vector<DirectProjectionLayout>& layouts,
-    bool batch_rows) {
+    bool batch_rows,
+    int rows) {
     const bool supports_small_m_specialization =
         batch_rows && std::all_of(
             layouts.begin(),
@@ -1592,42 +1701,47 @@ std::string make_direct_source(
         source += "    }";
     }
 
-    if (!batch_rows) {
+    if (!batch_rows && rows == 1) {
         for (std::size_t projection = 0; projection < layouts.size(); ++projection) {
-            if (!layouts[projection].nvq3jl_execution) continue;
+            if (layouts[projection].family != kFamilyVq) continue;
             const auto suffix = std::to_string(projection);
             source +=
-                "    if constexpr (ROWS == 1) {\n"
-                "        if (projection == " + suffix + "u) {\n"
-                "            constexpr uint K_LANES = 16u;\n"
-                "            const uint k_lane = lane & (K_LANES - 1u);\n"
-                "            const uint base = local_tile * ROWS_PER_TG"
-                " + simd_group * ROWS_PER_SIMD + lane / K_LANES;\n"
-                "            uint outputs[2] = {min(base, output_width - 1u),"
-                " min(base + 2u, output_width - 1u)};\n"
-                "            float row_anchors[2] = {vq_anchors_" + suffix
-                + "[outputs[0]], vq_anchors_" + suffix + "[outputs[1]]};\n"
-                "            float values[2] = {0.0f};\n"
-                "            mfq_nvq3jl_profile<2u, uint(K), K_LANES,"
-                " (P" + suffix + "_OUT > K)>(\n"
-                "                x, vq_indices_" + suffix + ", vq_state_" + suffix
-                + ", vq_scales_" + suffix + ", vq_codebooks_" + suffix + ",\n"
-                "                outputs, row_anchors, values,"
-                " 0u, 0u, 0u, 0u, 0u, k_lane);\n"
-                "            for (uint row = 0u; row < 2u; ++row) {\n"
-                "                for (uint offset = K_LANES / 2u;"
-                " offset > 0u; offset >>= 1u) {\n"
-                "                    values[row] +="
-                " simd_shuffle_down(values[row], offset);\n"
-                "                }\n"
-                "                const uint output = base + row * 2u;\n"
-                "                if (k_lane == 0u && output < output_width) {\n"
-                "                    y[output_offset + output] = T(values[row]);\n"
-                "                }\n"
-                "            }\n"
-                "            return;\n"
-                "        }\n"
-                "    }\n";
+                "    if (projection == " + suffix + "u) {\n"
+                "        const uint3 local_position = uint3(local_tile, 0u, 0u);\n"
+                "#define threadgroup_position_in_grid local_position\n"
+                "#define USE_NVQ3JL " + std::to_string(layouts[projection].nvq3jl_execution) + "\n"
+                "#define NSIGN ((K + 7) / 8)\n"
+                "#define MFQ_VQ_STORE_OUTPUT(index, value) y[uint(P" + suffix
+                + "_OUT_OFFSET) + index] = T(value)\n";
+            for (const auto* name : {
+                     "OUT", "NG", "GS", "VECTOR_SIZE", "NVEC", "INDEX_BITS",
+                     "STATE_BITS", "STATES", "ENTRIES", "CODE_BANKS", "AUX_MODE",
+                     "CODE_BANK_MODE", "EXECUTION_LAYOUT", "HAS_TABLE_BANKS",
+                     "GROUPS_PER_SUPER", "NSUPER"}) {
+                source += "#define " + std::string(name) + " P" + suffix + "_" + name + "\n";
+            }
+            for (const auto& [name, buffer] : std::vector<std::pair<std::string, std::string>>{
+                     {"indices_packed", "indices"}, {"state_packed", "state"},
+                     {"aux_packed", "aux"}, {"anchors", "anchors"},
+                     {"codebooks", "codebooks"}, {"scale_lut", "scales"},
+                     {"state_to_codebank", "state_banks"}, {"bank_ids", "bank_ids"},
+                     {"parameters", "parameters"}}) {
+                source += "        const auto " + name + " = vq_" + buffer + "_" + suffix + ";\n";
+            }
+            source += detail::vq_gemv_metal_body();
+            for (const auto* name : {
+                     "OUT", "NG", "GS", "VECTOR_SIZE", "NVEC", "INDEX_BITS",
+                     "STATE_BITS", "STATES", "ENTRIES", "CODE_BANKS", "AUX_MODE",
+                     "CODE_BANK_MODE", "EXECUTION_LAYOUT", "HAS_TABLE_BANKS",
+                     "GROUPS_PER_SUPER", "NSUPER", "NSIGN", "USE_NVQ3JL",
+                     "MFQ_VQ_STORE_OUTPUT", "threadgroup_position_in_grid"}) {
+                source += "#undef " + std::string(name) + "\n";
+            }
+            source += "        return;\n    }\n";
+        }
+        if (std::all_of(layouts.begin(), layouts.end(),
+                [](const DirectProjectionLayout& layout) { return layout.family == kFamilyVq; })) {
+            return source;
         }
     }
 
@@ -2796,6 +2910,10 @@ std::shared_ptr<const DirectProjectionPlan> make_direct_projection_plan(
         "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]], "
         "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]], "
         "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]) {\n";
+    if (rows == 1 && std::any_of(layouts.begin(), layouts.end(),
+            [](const DirectProjectionLayout& layout) { return layout.family == kFamilyVq; })) {
+        header += detail::vq_gemv_metal_header();
+    }
     plan->source = header + kGroupedHeader + kNvq3jlHeader + constants +
         "kernel void " + plan->kernel_name + "(" + arguments +
         (outputs_per_simd > 0
@@ -2804,7 +2922,7 @@ std::shared_ptr<const DirectProjectionPlan> make_direct_projection_plan(
              : (blockwise
                     ? make_direct_small_m_blockwise_source(
                           layouts, vectorized_fp16)
-                    : make_direct_source(layouts, batch_rows))) + "}\n";
+                    : make_direct_source(layouts, batch_rows, rows))) + "}\n";
     return plan;
 }
 
@@ -3585,7 +3703,7 @@ struct MlxGroupedLinear::Impl {
             [](const DirectProjectionLayout& layout) {
                 return layout.family == kFamilyMx ||
                     layout.family == kFamilyNint8Zero ||
-                    layout.nvq3jl_execution;
+                    layout.family == kFamilyVq;
             });
     }
 };
@@ -4383,12 +4501,18 @@ array MlxGroupedLinear::run_nint_projection_group(
     inputs.reserve(projection_count * 7 + 1);
     for (const auto& weight : impl_->nint_projection_weights) {
         inputs.push_back(weight.packed_values());
-        inputs.push_back(weight.row_q_layout());
-        inputs.push_back(weight.row_q_byte_offsets());
+        if (swiglu) {
+            inputs.push_back(weight.row_q_layout());
+            inputs.push_back(weight.row_q_byte_offsets());
+        } else {
+            inputs.push_back(weight.row_metadata());
+        }
         inputs.push_back(weight.sub_scales());
         inputs.push_back(weight.sub_mins());
-        inputs.push_back(weight.neuron_scales());
-        inputs.push_back(weight.neuron_mins());
+        if (swiglu) {
+            inputs.push_back(weight.neuron_scales());
+            inputs.push_back(weight.neuron_mins());
+        }
     }
     inputs.push_back(source);
     const NintProjectionConfig config{
@@ -5106,6 +5230,9 @@ bool MlxGroupedLinear::supports_single_row_projection_fusion()
         impl_->has_mxfp8_block32_projection_group() ||
         impl_->has_sq_projection_group() ||
         impl_->has_single_row_mxfp8_fast_path() ||
+        (!impl_->direct_layouts.empty() && std::all_of(
+            impl_->direct_layouts.begin(), impl_->direct_layouts.end(),
+            [](const DirectProjectionLayout& layout) { return layout.family == kFamilyVq; })) ||
         impl_->supports_bf16_matmul();
 }
 

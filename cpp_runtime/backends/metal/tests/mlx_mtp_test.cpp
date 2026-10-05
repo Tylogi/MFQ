@@ -2,11 +2,13 @@
 #include "grammar_fixture.h"
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -70,6 +72,16 @@ int main() {
                 !controller.measured_cycle_ms(0)) {
                 throw std::runtime_error(
                     "depth-one MTP controller skipped plain warmup");
+            }
+            bool reprobed = false;
+            for (int cycle = 0; cycle < 500; ++cycle) {
+                const int depth = controller.depth();
+                reprobed = reprobed || depth > 0;
+                controller.observe(depth, depth, depth > 0 ? 20.0 : 40.0);
+            }
+            if (!reprobed || controller.depth() != 1) {
+                throw std::runtime_error(
+                    "depth-one MTP controller did not recover from plain decode");
             }
         }
         {
@@ -171,6 +183,17 @@ int main() {
                 throw std::runtime_error(
                     "adaptive MTP discouraged a profitable warmed depth");
             }
+        }
+        {
+            mfq::metal::MlxMtpDepthController controller(1);
+            for (int cycle = 0; cycle < 3; ++cycle) controller.observe(1, 0, 70.0);
+            for (int cycle = 0; cycle < 3; ++cycle) controller.observe(0, 0, 40.0);
+            int cycles = 0;
+            while (controller.depth() == 0 && cycles++ < 200) controller.observe(0, 0, 40.0);
+            if (controller.depth() != 1) throw std::runtime_error("MTP never reprobed a stale depth");
+            controller.observe(1, 1, 20.0);
+            if (!controller.measured_cycle_ms(1) || *controller.measured_cycle_ms(1) > 21.0)
+                throw std::runtime_error("MTP retained an obsolete depth cost after a long observation gap");
         }
         const std::array<std::int32_t, 4> drafts{11, 12, 13, 14};
         {
@@ -376,8 +399,34 @@ int main() {
             }
         }
         {
+            mfq::metal::MlxMtpHistoryBuffer history;
+            const std::array<std::int32_t, 2> first{10, 11};
+            const std::array<std::int32_t, 3> second{12, 13, 14};
+            history.append(mlx::core::array({1.0f, 2.0f}, mlx::core::Shape{1, 2, 1}), first);
+            history.append(mlx::core::array({3.0f, 4.0f, 5.0f}, mlx::core::Shape{1, 3, 1}), second);
+            if (history.size() != 5) throw std::runtime_error("MTP history count mismatch");
+            auto batch = history.drain();
+            mlx::core::eval(batch.hidden, batch.token_ids);
+            if (!history.empty() || batch.hidden.shape() != mlx::core::Shape{1, 5, 1} ||
+                batch.token_ids.shape() != mlx::core::Shape{1, 5})
+                throw std::runtime_error("MTP history batch shape mismatch");
+            for (int row = 0; row < 5; ++row) {
+                if (batch.hidden.data<float>()[row] != row + 1 ||
+                    batch.token_ids.data<std::int32_t>()[row] != row + 10)
+                    throw std::runtime_error("MTP history pairing mismatch");
+            }
+            bool rejected_empty = false, rejected_shape = false;
+            try { (void)history.drain(); }
+            catch (const std::logic_error&) { rejected_empty = true; }
+            try { history.append(mlx::core::zeros(mlx::core::Shape{1, 1, 1}), first); }
+            catch (const std::invalid_argument&) { rejected_shape = true; }
+            if (!rejected_empty || !rejected_shape || !history.empty())
+                throw std::runtime_error("MTP history invalid batch accepted");
+        }
+        {
             int target_position = 0;
             int resolved_cycles = 0;
+            bool delayed_preparation = false;
             std::vector<std::int64_t> emitted;
             mfq::metal::MlxMtpEngineCallbacks callbacks;
             callbacks.predictor =
@@ -385,9 +434,11 @@ int main() {
             callbacks.target_cache_position = [&] {
                 return target_position;
             };
-            callbacks.prepare_draft = [](
+            callbacks.prepare_draft = [&](
                 const mfq::metal::MlxMtpDraftContext& context,
                 const mfq::metal::MlxMtpTokenSelector& select_token) {
+                if (delayed_preparation)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 for (int position = 0;
                      position < context.requested_depth;
                      ++position) {
@@ -445,6 +496,29 @@ int main() {
                 stats.drafted_tokens != 2 || stats.accepted_tokens != 2) {
                 throw std::runtime_error(
                     "architecture-independent MTP engine lifecycle mismatch");
+            }
+            target_position = 0;
+            resolved_cycles = 0;
+            emitted.clear();
+            delayed_preparation = true;
+            const auto timed_generated = mfq::metal::run_mlx_mtp_generation(
+                mfq::metal::MlxMtpEngineRequest{
+                    3, 32, 64,
+                    mlx::core::array({10.0f, 0.0f, 0.0f}, mlx::core::Shape{1, 3}),
+                    sampling, std::nullopt, {},
+                    [&](std::int64_t token) {
+                        emitted.push_back(token);
+                        return true;
+                    },
+                },
+                callbacks,
+                stats);
+            if (timed_generated != 32 || target_position != 31 ||
+                emitted != std::vector<std::int64_t>(32, 0) ||
+                stats.measured_depth_ms[0] < 5.0 ||
+                stats.measured_depth_ms[2] < 5.0) {
+                throw std::runtime_error(
+                    "MTP cycle timing omitted draft preparation");
             }
         }
         {
