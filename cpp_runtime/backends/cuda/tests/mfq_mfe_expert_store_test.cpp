@@ -294,6 +294,30 @@ void test_concurrent_read_batches() {
     require(second_scales.front() == 128, "second concurrent scales are wrong");
 }
 
+void test_mapped_staging() {
+    std::vector<std::uint8_t> source(4138), actual(source.size());
+    for (std::size_t i = 0; i < source.size(); ++i)
+        source[i] = static_cast<std::uint8_t>(i * 97);
+    const std::array<mfq::cuda::MfeMxfp4ReadRequest, 4> requests{{
+        {nullptr, nullptr, std::span(actual).first(11), source.data()},
+        {nullptr, nullptr, std::span(actual).subspan(11, 4096), source.data() + 11},
+        {nullptr, nullptr, std::span(actual).subspan(4107), source.data() + 4107},
+        {nullptr, nullptr, {}, source.data()},
+    }};
+    mfq::cuda::MfeMxfp4ReadPool pool(3);
+    const auto stats = pool.read(requests);
+    require(actual == source, "parallel mapped staging changed packed bytes");
+    require(stats.bytes == source.size() && stats.calls == 4 && stats.file_opens == 0,
+            "parallel mapped staging accounting is wrong");
+    auto invalid = requests.front();
+    mfq::cuda::MfeMxfp4ExpertPart part{};
+    invalid.part = &part;
+    bool rejected = false;
+    try { (void)pool.read(std::span(&invalid, 1)); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "ambiguous mapped/range request was accepted");
+}
+
 } // namespace
 
 int main() {
@@ -303,7 +327,8 @@ int main() {
         test_unsupported_cohort();
         test_parallel_read_batch();
         test_concurrent_read_batches();
-        std::cout << "cuda_mfe_expert_store_tests=5 passed=5\n";
+        test_mapped_staging();
+        std::cout << "cuda_mfe_expert_store_tests=6 passed=6\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "cuda_mfe_expert_store_test failure="

@@ -331,7 +331,11 @@ public:
             throw std::runtime_error(
                 "cached MoE route readback state does not match the route");
         }
+        const auto route_wait_start = std::chrono::steady_clock::now();
         MFQ_CUDA_CHECK(cudaEventSynchronize(route_done_));
+        stats_.route_wait_nanoseconds +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - route_wait_start).count();
         const int64_t count = pending_route_count_;
         route_readback_pending_ = false;
         pending_route_generation_ = 0;
@@ -409,6 +413,9 @@ public:
                << " range_overlap_wait_ms="
                << static_cast<double>(
                     stats_.range_overlap_wait_nanoseconds) / 1.0e6
+               << " staging_ms=" << static_cast<double>(stats_.staging_nanoseconds) / 1.0e6
+               << " stage_acquire_ms=" << static_cast<double>(stats_.stage_acquire_nanoseconds) / 1.0e6
+               << " route_wait_ms=" << static_cast<double>(stats_.route_wait_nanoseconds) / 1.0e6
                << "\n";
     }
 
@@ -516,7 +523,7 @@ private:
             bool waits_for_compute,
             bool wait_on_compute_stream) {
         std::vector<mfq::cuda::MfeMxfp4ReadRequest> range_requests;
-        auto materialize_source = [&range_requests](
+        auto materialize_source = [this, &range_requests](
                 const MoeCacheTransfer & transfer,
                 uint8_t * destination) {
             if (transfer.range_store != nullptr) {
@@ -526,6 +533,13 @@ private:
                     std::span<uint8_t>(
                         destination,
                         static_cast<size_t>(transfer.nbytes)),
+                });
+            } else if (!prewarming_ && transfer.file_backed &&
+                    transfer.packed_weight && range_read_pool_->workers() > 1) {
+                range_requests.push_back({
+                    nullptr, nullptr,
+                    std::span<uint8_t>(destination, static_cast<size_t>(transfer.nbytes)),
+                    transfer.source,
                 });
             } else {
                 std::memcpy(
@@ -657,7 +671,11 @@ private:
         }
         const int64_t total_bytes =
             mapped_descriptor_offset + mapped_descriptor_bytes;
+        const auto stage_acquire_start = std::chrono::steady_clock::now();
         auto & stage = acquire_stage(total_bytes, true);
+        stats_.stage_acquire_nanoseconds +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - stage_acquire_start).count();
         auto * staging = stage.host.data_ptr<uint8_t>();
         auto * scatter_descriptors =
             reinterpret_cast<mfq::MoeCacheScatterDescriptor *>(
@@ -668,6 +686,7 @@ private:
         int64_t offset = 0;
         int scatter_descriptor = 0;
         int mapped_descriptor = 0;
+        const auto staging_start = std::chrono::steady_clock::now();
         for (const auto & transfer : transfers) {
             if (transfer.nbytes == 0) continue;
             if (transfer.mapped_source != nullptr) {
@@ -698,6 +717,9 @@ private:
             }
         }
         finish_range_reads();
+        stats_.staging_nanoseconds +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - staging_start).count();
         if (scatter_descriptor != staged_count ||
                 mapped_descriptor != mapped_count) {
             throw std::runtime_error(

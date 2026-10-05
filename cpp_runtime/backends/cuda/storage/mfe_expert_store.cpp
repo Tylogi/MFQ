@@ -433,6 +433,12 @@ struct MfeMxfp4ReadPool::Impl {
         const MfeMxfp4ReadRequest& request,
         StreamCache& streams,
         bool& opened) {
+        if (request.source != nullptr) {
+            if (!request.destination.empty()) {
+                std::memcpy(request.destination.data(), request.source, request.destination.size());
+            }
+            return;
+        }
         if (request.store == nullptr || request.part == nullptr ||
             request.destination.size() != request.part->nbytes) {
             throw std::invalid_argument("invalid exact-range read request");
@@ -548,13 +554,15 @@ MfeMxfp4ReadTicket MfeMxfp4ReadPool::submit(
     auto batch = std::make_shared<MfeMxfp4ReadState>();
     batch->started = std::chrono::steady_clock::now();
     for (const auto& request : requests) {
-        if (request.store == nullptr || request.part == nullptr ||
-            request.destination.size() != request.part->nbytes ||
-            request.part->nbytes >
+        const bool valid_source = request.source != nullptr
+            ? request.store == nullptr && request.part == nullptr
+            : request.store != nullptr && request.part != nullptr &&
+                request.destination.size() == request.part->nbytes;
+        if (!valid_source || request.destination.size() >
                 std::numeric_limits<std::uint64_t>::max() - batch->bytes) {
             throw std::invalid_argument("invalid exact-range read batch");
         }
-        batch->bytes += request.part->nbytes;
+        batch->bytes += request.destination.size();
     }
     batch->calls = requests.size();
     batch->remaining = requests.size();

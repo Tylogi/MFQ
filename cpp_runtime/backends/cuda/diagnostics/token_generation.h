@@ -39,6 +39,10 @@ int generate_diagnostic_tokens(
         }
         profiler.report("prefill");
         profiler.reset();
+        if (execution.moe_expert_cache) {
+            std::cout << "moe_cache_phase=prefill\n";
+            print_moe_expert_cache_stats(execution.moe_expert_cache, std::cout);
+        }
         if (gen == 0) return 0;
         auto generated_cuda = mfq_tensor_backend::empty({gen}, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA));
         cudaStream_t stream = mfq_get_current_cuda_stream().stream();

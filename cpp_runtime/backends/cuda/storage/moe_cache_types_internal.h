@@ -33,6 +33,7 @@ struct MoeCacheTransfer {
     const uint8_t * mapped_source = nullptr;
     const mfq::cuda::MfeMxfp4ExpertStore * range_store = nullptr;
     const mfq::cuda::MfeMxfp4ExpertPart * range_part = nullptr;
+    bool file_backed = false;
 };
 
 struct MoeCacheNewLease {
@@ -288,4 +289,7 @@ struct MoeCacheStats {
     int64_t range_read_nanoseconds = 0;
     int64_t range_overlap_batches = 0;
     int64_t range_overlap_wait_nanoseconds = 0;
+    int64_t staging_nanoseconds = 0;
+    int64_t stage_acquire_nanoseconds = 0;
+    int64_t route_wait_nanoseconds = 0;
 };

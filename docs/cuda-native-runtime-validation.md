@@ -401,6 +401,96 @@ dominant. The GDN prefill path is bit-identical across 51 trace stages and
 the CUDA TopK smoke check also preserves expert IDs and bounds weight error at
 2e-6. The activation and Flash-Next native CUDA tests pass.
 
+#### Follow-up: parallel mixed-expert SSD staging (2026-10-05)
+
+Host timers now distinguish route-event waits, staging-slot acquisition, and
+source materialization into pinned staging. Generation prints cache counters
+after prefill and after decode; subtract them to measure decode alone. These
+are caller wall times, including page faults and worker completion, and must
+not be added to GPU activity times because the work can overlap.
+
+With the preceding fused-operator binary, a fresh 32-step run spent 4.827 s of
+its 6.560 s decode window in staging (73.6%). Route waits took another 0.667 s;
+slot acquisition took only 1.77 ms across all 32 steps. The bottleneck is
+materializing SSD-backed fields, rather than waiting for a free staging slot.
+
+Strata's `FileExpertSource::fill_many` in
+`references/Strata/src/core/expert_source.cpp` uses parallel mapped reads to keep
+multiple page-fault reads outstanding. The Metal expert cache also uses bounded
+workers and staging ownership. CUDA now sends immutable packed fields from
+mixed-expert mappings through its existing eight-worker range-read pool, sharing
+the existing four pinned staging slots. Mutable expert-to-slot maps stay on the
+caller; already materialized deferred MXFP4 buffers use the existing copy path.
+The batch completes before H2D submission, preserving the existing slot/event
+ordering. `MFQ_MOE_SSD_IO_WORKERS=1` selects serial mixed-field staging for A/B
+checks; the default remains eight workers.
+
+The model, 92-token prompt, MTP-disabled config, greedy sampling and 30 GiB GPU
+expert-cache budget match the preceding measurements. Each run starts a fresh
+process and creates fresh SSD backing files on ext4/NVMe. The short run times
+32 decode steps; the long run times 99 steps with context capacity 256.
+
+| Measurement | Serial staging | Parallel staging | Change |
+| --- | ---: | ---: | ---: |
+| Cold 32-step decode | 4.878 tokens/s | 6.837 / 6.811 tokens/s | +39.9% vs two-run mean |
+| Complete 99-step decode | 6.197 tokens/s | 8.518 tokens/s | +37.5% |
+| Cold prefill | 8.924 s | 3.273 / 3.261 s | -63.4% vs two-run mean |
+| Cold staging time/token | 150.85 ms | 87.72 / 88.50 ms | -41.6% |
+| 99-step staging time/token | 107.06 ms | 64.23 ms | -40.0% |
+| 99-step route wait/token | 20.01 ms | 17.90 ms | -10.5% |
+| 99-step stage acquisition, total | 4.55 ms | 4.22 ms | Negligible |
+
+The long measurement has one run per variant, so it is an observed improvement,
+not a distribution or steady-state limit. The two short candidate runs are
+within 0.4%. Model loading is unchanged: 132.7–135.3 s for the serial runs and
+135.1–136.0 s for the parallel runs. Decode still spends 54.7% of its long-run
+wall time staging experts. Early Qwen route readback and overlapping shared
+computation remain the next scheduling work; the preceding approximately
+20-token/s GPU no-idle estimate is still a ceiling, not achieved throughput.
+
+There is no additional resident RAM expert cache. The mappings cover 52.59 GiB
+on SSD; `host_bytes=32,774,144` accounts for 31.26 MiB of retained expert
+metadata, not the process's full RAM use. Existing pinned staging, model-load
+temporaries and runtime allocations are also present. Sampled process memory
+is as follows; anonymous and RSS peaks can occur at different times.
+
+| Process memory | Serial 32 steps | Parallel 32 steps | Serial 99 steps | Parallel 99 steps |
+| --- | ---: | ---: | ---: | ---: |
+| Peak RSS | 21.06 GiB | 21.55 / 21.54 GiB | 21.63 GiB | 22.83 GiB |
+| Peak anonymous RSS | 2.19 GiB | 2.05 / 2.03 GiB | 2.00 GiB | 1.90 GiB |
+| File RSS at sampled RSS peak | 19.74 GiB | 19.79 / 20.15 GiB | 20.48 GiB | 21.60 GiB |
+
+File RSS is reclaimable page-cache residency; the mapped expert files are not
+registered or locked with CUDA. The parallel long run therefore used about
+1.2 GiB more peak RSS, mainly file pages, without growing anonymous RAM.
+Strata's `pin_cache_complement` requires a fully filled GPU cache before building
+its RAM complement. This CUDA cache is populated on demand and evicts experts,
+so that resident-cache policy cannot be copied directly into this path.
+
+Physical reads, estimated from 0.5-second `/proc/<pid>/io` samples, were
+8.49 GB for serial cold decode and 8.98 / 9.20 GB for parallel decode. Effective
+read throughput rose from 1.29 to 1.92 / 1.96 GB/s, with modest additional
+readahead traffic. Long-run reads were 18.10 versus 18.87 GB, or 1.13 versus
+1.62 GB/s. Logical expert H2D bytes are identical: 6,949,218,824 for 32 steps
+and 14,818,792,272 for 99 steps. Routes, demand hits/misses and evictions also
+match, and the complete generated token sequences match in both windows.
+`range_read_bytes/calls/ms` now include mapped worker copies as well as explicit
+MXFP4 ranges; they describe logical source materialization, not physical SSD
+traffic. Mapped copies open no additional files.
+
+Validation: the full native build and all 55 CTest tests pass. The new worker
+check covers disjoint unaligned mapped slices, an empty destination, accounting
+and rejection of ambiguous mapped/range sources. A real 512-expert projection
+with a 192 MiB GPU cache passes 464 full-output bit-equality cases, including
+4,729 evictions. Full-model prefill is bit-identical to the preceding binary
+across 51 trace stages and 17,310,720 FP32 values.
+
+The remote-master check also found `c738ac9b`, merged as `41f779e5` (Metal
+hybrid decode and long-context QSA). Its changes concern native dispatch,
+small-batch fusion and attention, and do not change the SSD expert reader.
+The staging optimization above follows the measured host bottleneck; the newer
+Metal operator changes remain references for subsequent GPU profiling.
+
 ## Tensor and expert parallel execution
 
 The native runtime accepts either a rank count or an ordered CUDA device list.

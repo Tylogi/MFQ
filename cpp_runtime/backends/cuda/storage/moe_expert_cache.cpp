@@ -493,6 +493,7 @@ void MoeExpertCache::append_source_transfers(
                         ? nullptr
                         : cohort.mapped_fields.at(field) +
                             static_cast<int64_t>(local_index) * nbytes,
+                    nullptr, nullptr, file_backed_sources(),
                 });
             }
         }

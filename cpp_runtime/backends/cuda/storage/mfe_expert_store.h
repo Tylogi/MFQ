@@ -82,6 +82,9 @@ struct MfeMxfp4ReadRequest {
     const MfeMxfp4ExpertStore* store = nullptr;
     const MfeMxfp4ExpertPart* part = nullptr;
     std::span<std::uint8_t> destination;
+    // A reclaimable mixed-expert mapping uses the same bounded worker pool.
+    // Keep the mapping and destination alive until the ticket completes.
+    const std::uint8_t* source = nullptr;
 };
 
 struct MfeMxfp4ReadBatchStats {
