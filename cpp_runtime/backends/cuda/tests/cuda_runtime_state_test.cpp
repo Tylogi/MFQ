@@ -221,6 +221,19 @@ static void check_cached_moe_binding() {
                               : make_mixed_moe_runtime(cpu, false);
         auto weight = cache_moe_weight(cache, "experts", runtime, 1, 0, "gate",
                                        ranges ? store : nullptr);
+        auto wrap = [](MfeWeight value) {
+            auto packed = std::make_shared<MfeWeight>(std::move(value));
+            return weight_loader::Routed{
+                [packed](CudaExecutionContext& execution, const Tensor& input,
+                         const MoeRoutePlan& route) {
+                    return packed->forward(execution, input, route);
+                }, packed};
+        };
+        auto projection = wrap(weight);
+        auto up = wrap(cache_moe_weight(cache, "up", runtime, 1, 0, "up",
+                                        ranges ? store : nullptr));
+        auto down = wrap(cache_moe_weight(cache, "down", runtime, 1, 0, "down",
+                                          ranges ? store : nullptr));
         check(moe_expert_cache_has_sources(cache), "MoE source was not registered");
         finalize_moe_expert_cache(cache);
         CudaExecutionContext other;
@@ -229,14 +242,23 @@ static void check_cached_moe_binding() {
         check(!lifetime.expired(), "execution reset destroyed a live model cache");
         check(!moe_expert_cache_has_sources(other.moe_expert_cache),
               "Engine instances share registered MoE sources");
-        for (int32_t expert : {0, 1, 0}) {
+        for (bool split : {false, true}) for (int32_t expert : {0, 1, 0}) {
+            projection.up = split ? up.weight : nullptr;
             auto ids = tensor(std::vector<int32_t>{expert}, options.dtype(kInt32)).reshape({1, 1});
             auto route = build_moe_route_plan(ids, 2);
+            projection.prefetch_begin(route);
+            check(projection.prefetch_bundle(down, route), "routed bundle did not prefetch");
+            check(bool(route.host_unique_experts), "routed prefetch did not consume its route");
             auto expected = resident.forward(execution, input, route).to(kFloat32);
-            auto actual = weight.forward(execution, input, route).to(kFloat32);
+            auto actual = projection(execution, input, route).to(kFloat32);
             check((actual - expected).abs().max().item<float>() == 0,
                   "cache registration changed expert output");
+            check((down(execution, input, route).to(kFloat32) - expected).abs().max().item<float>() == 0,
+                  "routed bundle changed down output");
         }
+        check(!weight_loader::Routed{}.prefetch_bundle(down, MoeRoutePlan{}),
+              "empty routed projection accepted a bundle");
+        projection = {}; up = {}; down = {};
         auto retained_forward = weight.mixed_forward;
         weight = {};
         check(!lifetime.expired(), "copied projection lost its cache");

@@ -147,34 +147,36 @@ Routed routed(CudaExecutionContext& execution, const mfq::ModelSource& file, con
         auto w=dense(execution,file,name);
         MFQ_RUNTIME_CHECK(w.sizes().vec()==std::vector<int64_t>({experts,output,input}),
             "dense expert tensor shape mismatch: ",name);
-        return [w,output,input](CudaExecutionContext&, const Tensor& x,const MoeRoutePlan& route) {
+        return {[w,output,input](CudaExecutionContext&, const Tensor& x,const MoeRoutePlan& route) {
             const auto& ids=route.ids;
             const auto rows=ids.size(0), routes=ids.size(1);
             auto selected=w.index_select(0,ids.reshape({-1}).to(tb::kInt64)).reshape({rows,routes,output,input});
             auto source=x.dim()==2 ? x.unsqueeze(1).expand({rows,routes,input}) : x;
             return tb::matmul(selected,source.to(w.scalar_type()).unsqueeze(-1)).squeeze(-1);
-        };
+        }};
     }
-    auto w=std::make_shared<MfeWeight>(load_mfe_gpu(execution, file,name,true,layer,role));
+    const auto projection_role=name.ends_with(".experts.down.weight") ? "down" : role;
+    auto w=std::make_shared<MfeWeight>(load_mfe_gpu(execution, file,name,true,layer,projection_role));
     MFQ_RUNTIME_CHECK(w->n_experts==experts && w->out_per_expert==output && w->neuron_len==input,
         "routed tensor shape mismatch: ",name);
-    return [w](CudaExecutionContext& execution, const Tensor& x,const MoeRoutePlan& route) {
+    return {[w](CudaExecutionContext& execution, const Tensor& x,const MoeRoutePlan& route) {
         return w->forward(execution,x.contiguous(),route);
-    };
+    }, w};
 }
 
 Routed routed_gate_up(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& mlp_prefix,
-    int layer, int64_t experts, int64_t width, int64_t input, const std::string& role) {
+    int layer, int64_t experts, int64_t width, int64_t input) {
     const auto base=mlp_prefix+".experts";
     const auto gate_name=base+".gate.weight",up_name=base+".up.weight";
     const bool has_gate=has_tensor(file, gate_name),has_up=has_tensor(file, up_name);
     MFQ_RUNTIME_CHECK(has_gate==has_up,"incomplete routed Gate/Up pair under ",base);
-    if (!has_gate) return routed(execution,file,base+".gate_up.weight",layer,experts,2*width,input,role);
-    auto gate=routed(execution,file,gate_name,layer,experts,width,input,role);
-    auto up=routed(execution,file,up_name,layer,experts,width,input,role);
-    return [gate=std::move(gate),up=std::move(up)](CudaExecutionContext& execution, const Tensor& x,const MoeRoutePlan& route) {
+    if (!has_gate) return routed(execution,file,base+".gate_up.weight",layer,experts,2*width,input,"gate_up");
+    auto gate=routed(execution,file,gate_name,layer,experts,width,input,"gate");
+    auto up=routed(execution,file,up_name,layer,experts,width,input,"up");
+    auto gate_weight=gate.weight,up_weight=up.weight;
+    return {[gate=std::move(gate),up=std::move(up)](CudaExecutionContext& execution, const Tensor& x,const MoeRoutePlan& route) {
         return tb::cat({gate(execution,x,route),up(execution,x,route)},-1);
-    };
+    }, std::move(gate_weight), std::move(up_weight)};
 }
 
 void validate_load_options(

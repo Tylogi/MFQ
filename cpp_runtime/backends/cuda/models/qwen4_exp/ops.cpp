@@ -33,13 +33,18 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
                                                                const Tensor &x) {
         auto source = x.reshape({-1, c.hidden}).to(tb::kFloat16);
         const auto routing = c.routing();
+        MoeRoutePlan route;
         return mfq::models::mixture_of_experts(
             [&] { return router(execution, source).to(tb::kFloat32).contiguous(); },
             [&](Tensor logits) {
-                return moe_topk_cuda(
+                auto selected = moe_topk_cuda(
                     logits, c.topk, routing.activation == mfq::models::RouterActivation::sigmoid,
                     routing.activation == mfq::models::RouterActivation::sqrt_softplus,
                     routing.normalize, routing.delayed_softmax, mfq_nullopt, 1e-20, routing.scale);
+                route = build_moe_route_plan(selected[0], int(c.experts));
+                if (execution.config.moe_delayed_route_readback)
+                    gate_up.prefetch_begin(route);
+                return selected;
             },
             [&](const auto &) {
                 auto unfused = [](const auto &...) { return std::optional<Tensor>{}; };
@@ -52,11 +57,14 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
                         return (g * tb::sigmoid(g)) * u;
                     },
                     [&](Tensor hidden) { return sd(execution, hidden); }, unfused);
-                return tb::sigmoid(shared_gate(execution, source)) *
-                       shared_output;
+                auto output = tb::sigmoid(shared_gate(execution, source)) * shared_output;
+                // ponytail: bound bundles to eight rows; chunk larger prefill unions to overlap them.
+                if (source.size(0) <= 8 && execution.config.moe_projection_bundle_prefetch &&
+                        !execution.continuous_batch_cache_serial)
+                    (void)gate_up.prefetch_bundle(down, route);
+                return output;
             },
             [&](const auto &selected) {
-                const auto route = build_moe_route_plan(selected[0], int(c.experts));
                 return mfq::models::routed_experts(
                     [&] { return gate_up(execution, source, route); },
                     [&](Tensor gu) {

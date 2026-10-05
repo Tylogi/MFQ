@@ -370,11 +370,18 @@ public:
     }
 
     void print_stats(std::ostream & stream) const {
+        int64_t pinned_stage_bytes = 0, device_stage_bytes = 0;
+        for (const auto & stage : stages_) {
+            if (stage.host.defined()) pinned_stage_bytes += tensor_nbytes(stage.host);
+            if (stage.device.defined()) device_stage_bytes += tensor_nbytes(stage.device);
+        }
         stream << "moe_cache_stats"
                << " budget_bytes=" << budget_bytes_
                << " allocated_bytes=" << allocated_bytes_
                << " host_bytes=" << host_bytes_
                << " file_backed_bytes=" << file_backed_bytes_
+               << " pinned_stage_bytes=" << pinned_stage_bytes
+               << " device_stage_bytes=" << device_stage_bytes
                << " demand_hits=" << stats_.demand_hits
                << " demand_misses=" << stats_.demand_misses
                << " prefetch_hits=" << stats_.prefetch_hits

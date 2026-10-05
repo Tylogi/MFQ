@@ -289,6 +289,10 @@ steps. Its generated prefix matches the 32-step runs. Physical read traffic was
 sampled from `/proc/<pid>/io` every 0.5 seconds; phase totals below interpolate
 the samples at the runtime's load, prefill and decode boundaries.
 
+This fixed-step diagnostic continues after EOS. The one-sentence answer ends
+at generated token 38; subsequent steps produce additional chat turns. The
+99-step results below describe that fixed trace, not a natural 99-token answer.
+
 | Expert cache | Timed window | Decode tokens/s | Time/token |
 | --- | --- | ---: | ---: |
 | 30 GiB | First 32 steps, mean of two cold runs | 4.932 | 202.8 ms |
@@ -298,8 +302,8 @@ the samples at the runtime's load, prefill and decode boundaries.
 
 The last-67-step value subtracts the mean 32-step decode time from the 99-step
 time. It is a sustained-window estimate rather than per-token instrumentation.
-For this prompt, the unchanged 30 GiB path therefore settles near 7 tokens/s;
-the 4.932 tokens/s result describes its cold-cache window.
+The post-answer diagnostic continuation reaches about 7 tokens/s in this
+estimated window; 4.932 tokens/s describes the cold 32-step window before EOS.
 Increasing the cache budget by 20% improved the complete run by only 2.4%.
 It reduced recorded evictions from 1,236 to 27, but misses only fell from
 30,590 to 30,296 and H2D traffic from 25.885 GB to 25.534 GB. The 36 GiB run
@@ -425,7 +429,7 @@ The batch completes before H2D submission, preserving the existing slot/event
 ordering. `MFQ_MOE_SSD_IO_WORKERS=1` selects serial mixed-field staging for A/B
 checks; the default remains eight workers.
 
-The model, 92-token prompt, MTP-disabled config, greedy sampling and 30 GiB GPU
+The model, 23-token prompt, MTP-disabled config, greedy sampling and 30 GiB GPU
 expert-cache budget match the preceding measurements. Each run starts a fresh
 process and creates fresh SSD backing files on ext4/NVMe. The short run times
 32 decode steps; the long run times 99 steps with context capacity 256.
@@ -458,11 +462,13 @@ is as follows; anonymous and RSS peaks can occur at different times.
 | --- | ---: | ---: | ---: | ---: |
 | Peak RSS | 21.06 GiB | 21.55 / 21.54 GiB | 21.63 GiB | 22.83 GiB |
 | Peak anonymous RSS | 2.19 GiB | 2.05 / 2.03 GiB | 2.00 GiB | 1.90 GiB |
-| File RSS at sampled RSS peak | 19.74 GiB | 19.79 / 20.15 GiB | 20.48 GiB | 21.60 GiB |
+| RSS minus anonymous at sampled peak | 19.74 GiB | 19.79 / 20.15 GiB | 20.48 GiB | 21.60 GiB |
 
-File RSS is reclaimable page-cache residency; the mapped expert files are not
-registered or locked with CUDA. The parallel long run therefore used about
-1.2 GiB more peak RSS, mainly file pages, without growing anonymous RAM.
+The last row is an estimate that also includes shared/pinned mappings, not
+just file pages. The expert-file mappings remain reclaimable and are not
+registered or locked with CUDA. The parallel long run used about 1.2 GiB more
+peak RSS without growing anonymous RAM; the following measurement reports
+file/shared RSS and pinned-stage allocation separately.
 Strata's `pin_cache_complement` requires a fully filled GPU cache before building
 its RAM complement. This CUDA cache is populated on demand and evicts experts,
 so that resident-cache policy cannot be copied directly into this path.
@@ -490,6 +496,82 @@ hybrid decode and long-context QSA). Its changes concern native dispatch,
 small-batch fusion and attention, and do not change the SSD expert reader.
 The staging optimization above follows the measured host bottleneck; the newer
 Metal operator changes remain references for subsequent GPU profiling.
+
+#### Follow-up: early Qwen route readback and bounded projection bundles
+
+The routed loader now retains its packed weight handles alongside the callable.
+Qwen can therefore use the existing cache-prefetch operations: it builds the
+route after TopK, begins its small D2H copy before shared computation, and
+prepares Gate/Up/Down together after enqueuing the shared branch. Packed split
+Gate/Up and fused Gate/Up both use the existing bundle helper; ordinary dense
+projections retain their original forward path. Cached forward still checks
+admission and waits for transfer completion. Gate, Up and Down retain their
+projection roles so the existing exact-range MXFP4 overlap path can identify
+them.
+
+Bundles are bounded to at most eight rows. An initial all-size implementation
+improved the fixed 99-step decode from 8.518 to 10.080 tokens/s, but increased
+23-token prefill from 3.242 to 3.816 s and device use after prefill from
+39,250.8 to 40,820.8 MiB. Bounding bundles retains the decode gain and lets larger
+prefill use the existing separate staging sequence. The current final run gives:
+
+| Fixed short-prompt measurement | Parallel staging only | Early readback + bounded bundles |
+| --- | ---: | ---: |
+| First 32 decode steps, all before EOS | 6.837 / 6.811 tokens/s | 9.120 tokens/s (+33.6% vs mean) |
+| Complete fixed 99-step trace, including post-EOS steps | 8.518 tokens/s | 10.302 tokens/s (+20.9%) |
+| Prefill | 3.242 s | 3.188 s |
+| 32-step staging time/token | 87.72 / 88.50 ms | 47.79 ms |
+| 99-step staging time/token | 64.23 ms | 38.76 ms |
+| 99-step route wait/token | 17.90 ms | 21.33 ms |
+| 99-step H2D submissions | 8,580 | 2,979 |
+
+The gain is primarily from larger source batches and fewer transfer submissions.
+Route-event wait increases in this trace, so the measurement does not establish
+that early route readback alone improves wall time. The cold 32-step H2D payload
+is identical at 6,949,218,824 bytes. The fixed 99-step payload falls by one cache
+miss (1,380,488 bytes) to 14,817,411,784 bytes, with 1,235 versus 1,236 evictions.
+Demand misses become zero because the same reads are now counted as prefetch
+misses: 8,058 for 32 steps and 17,650 for 99 steps. This does not mean zero SSD
+reads. Both generated sequences match their preceding baselines.
+
+Cache statistics now report retained `pinned_stage_bytes` and
+`device_stage_bytes`. Both are 805,306,368 bytes (768 MiB) in the bounded run.
+Its peak process RSS is 22.70 GiB and peak anonymous RSS is 2.01 GiB. At the
+sampled RSS peak, `/proc/<pid>/status` reports 20.78 GiB file RSS, 0.76 GiB shared
+RSS and 1.16 GiB anonymous RSS; these peaks need not coincide. Pinned staging
+remains separate from the 31.26 MiB retained expert metadata. Device use after
+prefill is 39,346.8 MiB, leaving 9,163.25 MiB free with the same 30 GiB expert
+cache budget.
+
+Full-model prefill still matches across 51 trace stages and 17,310,720 FP32
+values. The native cache-binding regression now exercises early readback and
+both bundle layouts with host-backed and exact-range sources, retained cache
+lifetime and empty-bundle rejection. The full native build and all 55 CTest
+tests pass.
+
+A second workload asks for eight numbered sections on autoregressive inference,
+with at least 100 words each, covering tokenization, attention, KV cache, expert
+routing, GPU kernels, CPU memory, SSD offload and bottlenecks. It uses the bundled
+tokenizer and chat format with thinking disabled, 80 input tokens, context
+capacity 512 and the same 30 GiB expert cache. Both variants generate the same
+100 tokens; none is EOS, so all 99 timed steps precede answer termination.
+
+| Natural long-answer measurement | Parallel staging only | Bounded bundles |
+| --- | ---: | ---: |
+| Decode | 10.625 tokens/s | 11.650 tokens/s (+9.65%) |
+| Prefill | 5.937 s | 6.313 s |
+| Prefill + timed decode | 15.255 s | 14.811 s (-2.91%) |
+| Decode staging time/token | 40.15 ms | 23.72 ms |
+| Decode route wait/token | 16.12 ms | 18.60 ms |
+| Decode expert H2D bytes | 8,360,180,688 | 8,350,022,544 |
+| Peak RSS | 23.04 GiB | 23.04 GiB |
+| Peak anonymous RSS | 1.88 GiB | 1.92 GiB |
+
+These are single-run A/B measurements. The candidate's longer prefill corresponds
+to 4.697 versus 4.342 s of source staging with the same prefill H2D payload and
+separate staging sequence; no prefill speedup is claimed. Its retained pinned
+and device staging are each 1 GiB. The longer prompt warms more experts, so
+its absolute decode speed cannot be compared directly with the 23-token prompt.
 
 ## Tensor and expert parallel execution
 

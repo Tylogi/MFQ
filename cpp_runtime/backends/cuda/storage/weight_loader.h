@@ -98,7 +98,27 @@ mfq_tensor_backend::Tensor materialize_mfe_dense(
 namespace mfq::cuda::weight_loader {
 using Tensor = mfq_tensor_backend::Tensor;
 using Linear = std::function<Tensor(CudaExecutionContext&, const Tensor&)>;
-using Routed = std::function<Tensor(CudaExecutionContext&, const Tensor&, const MoeRoutePlan&)>;
+struct Routed {
+    std::function<Tensor(CudaExecutionContext&, const Tensor&, const MoeRoutePlan&)> forward;
+    std::shared_ptr<MfeWeight> weight, up;
+
+    explicit operator bool() const { return bool(forward); }
+    Tensor operator()(CudaExecutionContext& execution, const Tensor& x,
+                      const MoeRoutePlan& route) const {
+        return forward(execution, x, route);
+    }
+    void prefetch_begin(const MoeRoutePlan& route) const {
+        const auto& first = weight ? weight : up;
+        if (first) first->prefetch_begin(route);
+    }
+    bool prefetch_bundle(const Routed& down, const MoeRoutePlan& route) const {
+        if (!down.weight) return false;
+        if (weight && up)
+            return prefetch_cached_moe_projection_bundle(*weight, *up, *down.weight, route);
+        const auto& first = weight ? weight : up;
+        return first && prefetch_cached_moe_projection_bundle(*first, *down.weight, route);
+    }
+};
 
 Linear linear(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name);
 
@@ -108,7 +128,7 @@ Routed routed(CudaExecutionContext& execution, const mfq::ModelSource& file, con
     int64_t experts, int64_t output, int64_t input, const std::string& role);
 
 Routed routed_gate_up(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& mlp_prefix,
-    int layer, int64_t experts, int64_t width, int64_t input, const std::string& role);
+    int layer, int64_t experts, int64_t width, int64_t input);
 
 void validate_load_options(
         const CudaExecutionContext& execution);
@@ -129,7 +149,7 @@ struct Loader {
     }
     Routed routed_gate_up(const std::string &prefix, int layer, int64_t experts, int64_t width,
                          int64_t input) const {
-        return weight_loader::routed_gate_up(execution, source, prefix, layer, experts, width, input, role);
+        return weight_loader::routed_gate_up(execution, source, prefix, layer, experts, width, input);
     }
     static Tensor fp32(const Tensor &value) { return value.to(mfq_tensor_backend::kFloat32).contiguous(); }
     static auto shape(const Tensor &value) { return value.sizes().vec(); }
