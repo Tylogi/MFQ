@@ -58,7 +58,7 @@ struct MfqRuntimeTransportConfig {
     int64_t max_context = 0;
     int64_t context_capacity = 0;
     int64_t vocab_size = 0;
-    std::optional<MfqModelCapabilities> model_capabilities;
+    MfqModelCapabilities model_capabilities;
     MfqRuntimeProfile runtime_profile;
 };
 
@@ -119,9 +119,5 @@ std::unique_ptr<MfqTransport> make_mfq_stdio_transport(
 
 MfqRuntimeProfile resolve_mfq_runtime_profile(
     const std::string & mfq_path,
-    const std::string & model_architecture,
-    const std::string & model_type,
-    const std::string & model_name,
     const std::string & embedded_profile_json = {},
-    const std::string & model_config_json = {},
     const std::string & explicit_profile_path = {});

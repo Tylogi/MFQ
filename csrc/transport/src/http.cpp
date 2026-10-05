@@ -91,20 +91,17 @@ int run_mfq_http_transport(
     const json chat_template_capabilities =
         chat_template_capabilities_json(
             scheduler.chat_template_capabilities());
-    const auto model_capability_profile = config.model_capabilities
-        ? *config.model_capabilities
-        : architecture_capability_profile(config.model_type);
+    const auto& capabilities = config.model_capabilities;
     const json model_capabilities =
-        model_capability_profile_json(model_capability_profile);
+        model_capability_profile_json(capabilities);
     const bool vision_supported =
-        model_capability_profile.image_input ||
-        model_capability_profile.video_input;
+        capabilities.image_input || capabilities.video_input;
     const bool vision_available =
         scheduler.supports_multimodal_generation() &&
-        model_capability_profile.image_input;
+        capabilities.image_input;
     const bool video_available =
         scheduler.supports_multimodal_generation() &&
-        model_capability_profile.video_input;
+        capabilities.video_input;
 
     httplib::Server server;
     RuntimeRequestMetrics request_metrics_store;
@@ -589,7 +586,7 @@ int run_mfq_http_transport(
             {"vision_supported", vision_supported},
             {"vision_available", vision_available},
             {"video_available", video_available},
-            {"mtp_supported", model_capability_profile.mtp},
+            {"mtp_supported", capabilities.mtp},
             {"mtp_available", false},
             {"vision_enabled_default", sampling_defaults.enable_vision},
             {"mtp_enabled_default", sampling_defaults.enable_mtp},
@@ -631,7 +628,7 @@ int run_mfq_http_transport(
         status["vision_supported"] = vision_supported;
         status["vision_available"] = vision_available;
         status["video_available"] = video_available;
-        status["mtp_supported"] = model_capability_profile.mtp;
+        status["mtp_supported"] = capabilities.mtp;
         status["mtp_available"] = false;
         status["vision_enabled_default"] = sampling_defaults.enable_vision;
         status["mtp_enabled_default"] = sampling_defaults.enable_mtp;

@@ -119,8 +119,6 @@ double number_field(
 MfqSamplingParams default_sampling_params(
     const MfqRuntimeTransportConfig & config);
 json sampling_params_json(const MfqSamplingParams & sampling);
-MfqModelCapabilityProfile architecture_capability_profile(
-    const std::string & model_type);
 json model_capability_profile_json(
     const MfqModelCapabilityProfile & profile);
 json duplex_profile_json(const MfqDuplexSamplingProfile & value);

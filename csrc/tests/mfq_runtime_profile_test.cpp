@@ -28,35 +28,11 @@ int main() {
         static_cast<bool>(make_mfq_stdio_transport({})),
         "stdio transport factory failed");
 
-    const auto registry = resolve_mfq_runtime_profile(
-        "", "minicpmo-hf-mfq", "minicpmo", "test");
-    require(registry.chat.temperature.has_value(), "registry temperature missing");
-    require(std::abs(*registry.chat.temperature - 0.7) < 1e-12,
-            "registry temperature mismatch");
-    require(registry.chat.enable_thinking.has_value() &&
-                !*registry.chat.enable_thinking,
-            "registry thinking default mismatch");
-    require(registry.duplex.force_listen_count.value_or(-1) == 0,
-            "registry duplex defaults missing");
-    require(registry.duplex.system_prompt.value_or("") ==
-                "Streaming Omni Conversation.",
-            "registry duplex system prompt missing");
-
-    const auto deepseek_registry = resolve_mfq_runtime_profile(
-        "", "deepseek-v4-flash", "deepseek_v4", "test");
-    require(deepseek_registry.chat.mtp_max_draft_tokens.value_or(-1) == 5,
-            "DeepSeek-V4 registry MTP depth mismatch");
-
-    const auto deepseek_v41_registry = resolve_mfq_runtime_profile(
-        "", "deepseek-v4.1-flash", "deepseek_v41_vision", "test");
-    require(
-        deepseek_v41_registry.source ==
-            "architecture-registry:deepseek_v41",
-        "DeepSeek-V4.1 was folded into the V4 registry");
-    require(
-        std::abs(deepseek_v41_registry.chat.top_p.value_or(-1.0) - 0.95) <
-            1e-12,
-        "DeepSeek-V4.1 registry sampling mismatch");
+    const auto defaults = resolve_mfq_runtime_profile("");
+    require(defaults.source == "generic-defaults",
+            "generic profile source mismatch");
+    require(!defaults.chat.temperature,
+            "generic profile must not guess model defaults");
 
     const auto root = std::filesystem::temp_directory_path() /
         "mfq-runtime-profile-test";
@@ -76,11 +52,7 @@ int main() {
 
     const auto resolved = resolve_mfq_runtime_profile(
         model.string(),
-        "minicpmo-hf-mfq",
-        "minicpmo",
-        "test",
         R"({"version":1,"chat":{"temperature":0.5,"top_k":77}})",
-        "{}",
         explicit_profile.string());
     require(std::abs(resolved.chat.temperature.value_or(-1.0) - 0.2) < 1e-12,
             "server profile did not win");

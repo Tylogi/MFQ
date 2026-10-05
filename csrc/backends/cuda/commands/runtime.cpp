@@ -151,15 +151,6 @@ RuntimeCommandOptions parse_runtime(ArgCursor& args) {
     return result;
 }
 
-std::string read_runtime_asset_text(
-        const mfq::ModelSource& source,
-        std::string_view name) {
-    const auto bytes = source.read_asset(name);
-    if (bytes.empty()) return {};
-    return std::string(
-        reinterpret_cast<const char*>(bytes.data()), bytes.size());
-}
-
 int run_transport_runtime(RuntimeOptions& options) {
     auto source = mfq::open_model_source(options.model_path);
     if (!options.config_path.empty()) {
@@ -194,13 +185,9 @@ int run_transport_runtime(RuntimeOptions& options) {
         "runtime.sampling.v1");
     transport_config.runtime_profile = resolve_mfq_runtime_profile(
         options.model_path,
-        info.capabilities.family,
-        transport_config.model_type,
-        transport_config.model_name,
         embedded_profile == runtime_assets.metadata().end()
             ? std::string()
             : embedded_profile->second,
-        read_runtime_asset_text(runtime_assets, mfq::kModelConfigAsset),
         options.runtime_sampling_profile);
 
     auto transport = options.stdio_mode

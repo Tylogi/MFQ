@@ -88,19 +88,17 @@ public:
         const json chat_template_capabilities =
             chat_template_capabilities_json(
                 scheduler.chat_template_capabilities());
-        const auto capability_profile = config_.model_capabilities
-            ? *config_.model_capabilities
-            : architecture_capability_profile(config_.model_type);
+        const auto& capabilities = config_.model_capabilities;
         const json model_capabilities =
-            model_capability_profile_json(capability_profile);
-        const bool vision_supported = capability_profile.image_input ||
-            capability_profile.video_input;
+            model_capability_profile_json(capabilities);
+        const bool vision_supported =
+            capabilities.image_input || capabilities.video_input;
         const bool vision_available =
             scheduler.supports_multimodal_generation() &&
-            capability_profile.image_input;
+            capabilities.image_input;
         const bool video_available =
             scheduler.supports_multimodal_generation() &&
-            capability_profile.video_input;
+            capabilities.video_input;
 
         RuntimeRequestMetrics request_metrics_store;
         std::atomic<int64_t> active_context{config_.max_context};
@@ -182,7 +180,7 @@ public:
                 {"vision_supported", vision_supported},
                 {"vision_available", vision_available},
                 {"video_available", video_available},
-                {"mtp_supported", capability_profile.mtp},
+                {"mtp_supported", capabilities.mtp},
                 {"mtp_available", false},
                 {"vision_enabled_default", sampling_defaults.enable_vision},
                 {"mtp_enabled_default", sampling_defaults.enable_mtp},
@@ -213,7 +211,7 @@ public:
             value["vision_supported"] = vision_supported;
             value["vision_available"] = vision_available;
             value["video_available"] = video_available;
-            value["mtp_supported"] = capability_profile.mtp;
+            value["mtp_supported"] = capabilities.mtp;
             value["mtp_available"] = false;
             value["vision_enabled_default"] =
                 sampling_defaults.enable_vision;

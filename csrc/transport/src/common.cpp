@@ -407,106 +407,6 @@ static void merge_runtime_profile(MfqRuntimeProfile & target,
     if (source.source != "generic-defaults") target.source = source.source;
 }
 
-static std::string normalized_identity(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return std::isalnum(c) ? static_cast<char>(std::tolower(c)) : '_';
-    });
-    return value;
-}
-
-static bool identity_matches(const std::vector<std::string> & identities,
-                             const std::string & needle) {
-    return std::any_of(identities.begin(), identities.end(), [&](const auto & value) {
-        return normalized_identity(value).find(needle) != std::string::npos;
-    });
-}
-
-static MfqRuntimeProfile architecture_runtime_profile(
-        const std::vector<std::string> & identities) {
-    MfqRuntimeProfile result;
-    if (identity_matches(identities, "minicpmo")) {
-        result.chat.temperature = 0.7;
-        result.chat.top_k = 100;
-        result.chat.top_p = 0.8;
-        result.chat.repetition_penalty = 1.02;
-        result.chat.enable_thinking = false;
-        result.duplex.system_prompt = "Streaming Omni Conversation.";
-        result.duplex.decode_mode = "sampling";
-        result.duplex.temperature = 0.7;
-        result.duplex.top_k = 100;
-        result.duplex.top_p = 0.8;
-        result.duplex.text_repetition_penalty = 1.05;
-        result.duplex.text_repetition_window_size = 512;
-        result.duplex.length_penalty = 1.0;
-        result.duplex.listen_prob_scale = 1.0;
-        result.duplex.force_listen_count = 0;
-        result.duplex.max_new_speak_tokens_per_chunk = 20;
-        result.tts.temperature = 0.8;
-        result.tts.repetition_penalty = 1.05;
-        result.tts.token2wav_steps = 10;
-        result.source = "architecture-registry:minicpmo";
-    } else if (identity_matches(identities, "deepseek_v41")) {
-        result.chat.temperature = 1.0;
-        result.chat.top_p = 0.95;
-        result.chat.mtp_max_draft_tokens = 5;
-        result.source = "architecture-registry:deepseek_v41";
-    } else if (identity_matches(identities, "deepseek_v4")) {
-        result.chat.temperature = 1.0;
-        result.chat.top_p = 0.8;
-        result.chat.repetition_penalty = 1.05;
-        result.chat.presence_penalty = 0.0;
-        result.chat.mtp_max_draft_tokens = 5;
-        result.source = "architecture-registry:deepseek_v4";
-    }
-    return result;
-}
-
-struct MfqModelCapabilityRegistration {
-    std::array<const char *, 3> aliases{};
-    MfqModelCapabilityProfile profile;
-};
-
-static const std::array<MfqModelCapabilityRegistration, 12>
-    kModelCapabilityRegistry{{
-        {{{"minicpmo", nullptr, nullptr}},
-         {"minicpmo", true, true, true, true, true, true, false}},
-        {{{"minicpmtts", nullptr, nullptr}},
-         {"minicpmo_tts", false, false, false, false, true, false, false}},
-        {{{"deepseek_v41", "deepseek_v41_text", nullptr}},
-         {"deepseek_v41", true, false, false, false, false, false, true}},
-        {{{"deepseek_v41_vision", nullptr, nullptr}},
-         {"deepseek_v41", true, true, false, false, false, false, true}},
-        {{{"deepseek_v4", nullptr, nullptr}},
-         {"deepseek_v4", true, false, false, false, false, false, true}},
-        {{{"deepseek_v4_vision", nullptr, nullptr}},
-         {"deepseek_v4", true, true, false, false, false, false, true}},
-        {{{"glm_moe_dsa", nullptr, nullptr}}, {"glm_dsa"}},
-        {{{"gemma4", "gemma4_text", nullptr}}, {"gemma4"}},
-        {{{"qwen3_5", "qwen35", nullptr}},
-         {"qwen3_5", true, true, true, false, false, false, true}},
-        {{{"qwen3_5_text", nullptr, nullptr}},
-         {"qwen3_5", true, false, false, false, false, false, true}},
-        {{{"qwen4_exp", "qwen4_exp_text", nullptr}},
-         {"qwen4_exp", true, true, true, false, false, false, true}},
-        {{{"glm5_next", "glm5_next_text", nullptr}},
-         {"glm5_next", true, true, true, false, false, false, true}},
-    }};
-
-MfqModelCapabilityProfile architecture_capability_profile(
-        const std::string & model_type) {
-    const std::string identity = normalized_identity(model_type);
-    for (const auto & registration : kModelCapabilityRegistry) {
-        for (const char * alias : registration.aliases) {
-            if (alias != nullptr && identity == alias) {
-                return registration.profile;
-            }
-        }
-    }
-    MfqModelCapabilityProfile result;
-    if (!identity.empty()) result.family = identity;
-    return result;
-}
-
 json model_capability_profile_json(
         const MfqModelCapabilityProfile & profile) {
     return {
@@ -524,19 +424,6 @@ json model_capability_profile_json(
             {"mtp", profile.mtp},
         }},
     };
-}
-
-static MfqRuntimeProfile exact_model_runtime_profile(
-        const std::vector<std::string> & identities) {
-    MfqRuntimeProfile result;
-    if (identity_matches(identities, "minicpm_o_4_5")) {
-        result = architecture_runtime_profile({"minicpmo"});
-        result.source = "model-registry:minicpm-o-4_5";
-    } else if (identity_matches(identities, "deepseek_v4_flash_0731")) {
-        result = architecture_runtime_profile({"deepseek_v4"});
-        result.source = "model-registry:deepseek-v4-flash-0731";
-    }
-    return result;
 }
 
 static double profile_number(const json & section, const char * name) {
@@ -2125,36 +2012,10 @@ std::vector<float> decode_audio_features(
 
 MfqRuntimeProfile resolve_mfq_runtime_profile(
         const std::string & mfq_path,
-        const std::string & model_architecture,
-        const std::string & model_type,
-        const std::string & model_name,
         const std::string & embedded_profile_json,
-        const std::string & model_config_json,
         const std::string & explicit_profile_path) {
     using namespace mfq::transport_detail;
-    std::vector<std::string> identities{
-        model_architecture, model_type, model_name,
-    };
-    if (!model_config_json.empty()) {
-        const json config = json::parse(model_config_json);
-        if (!config.is_object()) {
-            throw std::runtime_error("embedded model config must be a JSON object");
-        }
-        for (const char * key : {"model_type", "_name_or_path", "name_or_path"}) {
-            if (config.contains(key) && config[key].is_string()) {
-                identities.push_back(config[key].get<std::string>());
-            }
-        }
-        if (config.contains("architectures") && config["architectures"].is_array()) {
-            for (const auto & value : config["architectures"]) {
-                if (value.is_string()) identities.push_back(value.get<std::string>());
-            }
-        }
-    }
-
-    // Low to high priority. Every merge is field-wise.
-    MfqRuntimeProfile result = architecture_runtime_profile(identities);
-    merge_runtime_profile(result, exact_model_runtime_profile(identities));
+    MfqRuntimeProfile result;
     if (!embedded_profile_json.empty()) {
         merge_runtime_profile(result, parse_runtime_profile(
             embedded_profile_json, "embedded-mfq"));

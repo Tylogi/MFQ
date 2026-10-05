@@ -2430,8 +2430,6 @@ int run_loaded_runtime(
         maximum_context);
     transport_config.context_capacity = maximum_context;
     transport_config.vocab_size = vocabulary_size;
-    constexpr const char* model_config_asset =
-        "__mfq_asset__/model_config.json";
     const auto embedded = [&] {
         const auto found = container.header().extra_json.find(
             "runtime.sampling.v1");
@@ -2439,16 +2437,9 @@ int run_loaded_runtime(
             ? std::string()
             : found->second;
     }();
-    const auto model_config = container.contains(model_config_asset)
-        ? container.read_text(model_config_asset)
-        : std::string();
     transport_config.runtime_profile = resolve_mfq_runtime_profile(
         arguments.mfq.string(),
-        model_graph.architecture,
-        transport_config.model_type,
-        transport_config.model_name,
         embedded,
-        model_config,
         arguments.sampling_profile.string());
 
     auto runtime_mutex = std::make_shared<std::mutex>();
