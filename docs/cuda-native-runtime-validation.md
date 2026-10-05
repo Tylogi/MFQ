@@ -846,6 +846,49 @@ throughput percentage. Load takes 132.416 s, prefill 6.242 s, peak RSS
 24.80 GiB and anonymous RSS 2.03 GiB. Cache counters, expert residency,
 H2D traffic and staging budgets are unchanged.
 
+## Measure physical SSD reads; reject broad cold-page hints (2026-10-05)
+
+On Linux, `MFQ_DECODE_PROGRESS=1` now also reports cumulative
+`io_read_bytes` from `/proc/self/io`. Differences between checkpoints count
+disk bytes attributed to this process, separately from logical expert H2D
+bytes. The first checkpoint includes model load and prefill; subtract
+successive checkpoints when measuring decode windows.
+
+A temporary Strata-inspired experiment uses `MADV_COLD` after a GPU-admitted
+weight has been copied into pinned staging. Only complete interior pages of
+immutable mapped fields receive the hint. It allocates no extra RAM and
+does not establish a pinned RAM complement. The host-store boundary check,
+all 55 CTest checks and all 464 real MFE bit-equality cases pass with the
+experiment enabled. All generated IDs and cache/transfer counters match.
+
+The same executable's off/on 512-token runs give 30.327/29.794 s for 511
+decode steps (16.850/17.151 tokens/s). Load takes 133.897/135.140 s and
+prefill 5.939/5.879 s. The latter windows show why the whole-run improvement
+does not establish a steady-state gain:
+
+| Decode steps | SSD MiB/step off/on | Staging ms/step off/on | Hint ms/step | Tokens/s off/on |
+| --- | ---: | ---: | ---: | ---: |
+| 129–256 | 30.40 / 27.33 | 10.98 / 10.27 | 1.84 | 17.282 / 17.165 |
+| 257–384 | 18.04 / 15.40 | 8.06 / 7.56 | 1.31 | 18.373 / 18.347 |
+| 385–511 | 13.06 / 12.29 | 6.06 / 6.06 | 0.95 | 18.994 / 19.001 |
+
+The hint processes 37.04 GiB cumulatively and takes 1.228 s. Disk reads fall
+6–15% in these windows, but the hint costs more CPU time than it saves in
+staging. Event wait also shrinks as CPU work moves into the hint; those
+overlapping timers must not be counted as independent gains. Peak RSS is
+23.22/20.96 GiB and anonymous RSS 1.98/1.90 GiB, with no memory guard stop.
+Lower file-backed RSS does not imply an equally large reduction in reserved
+or pinned RAM.
+
+A reverse-order 100-token pair gives 7.277/7.118 s for 99 decode steps
+(13.605/13.908 tokens/s), with 5.911/6.103 s prefill and identical IDs.
+These single pairs do not isolate a stable throughput improvement. The
+prototype, switch, counters and its dedicated boundary test were reverted;
+only physical-I/O diagnostics remain. A real RAM tier needs to distinguish
+current GPU residents from evicted experts and account for actual occupancy,
+as Strata's cache complement does. Broad page hints cannot provide that
+ownership contract.
+
 ## Tensor and expert parallel execution
 
 The native runtime accepts either a rank count or an ordered CUDA device list.

@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 
@@ -86,7 +87,15 @@ int generate_diagnostic_tokens(
             std::cout << "decode_progress tokens=" << token
                       << " window_tokens=" << token - progress_token
                       << " window_sec=" << seconds
-                      << " window_tok_per_s=" << (token - progress_token) / seconds << '\n';
+                      << " window_tok_per_s=" << (token - progress_token) / seconds;
+#ifdef __linux__
+            std::ifstream io("/proc/self/io");
+            std::string key;
+            uint64_t bytes;
+            while (io >> key >> bytes)
+                if (key == "read_bytes:") std::cout << " io_read_bytes=" << bytes;
+#endif
+            std::cout << '\n';
             if (execution.moe_expert_cache) {
                 std::ostringstream stats;
                 print_moe_expert_cache_stats(execution.moe_expert_cache, stats);
