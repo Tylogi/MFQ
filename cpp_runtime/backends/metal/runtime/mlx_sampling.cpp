@@ -295,60 +295,100 @@ constexpr const char* kTopKSource = R"METAL(
     }
 )METAL";
 
-// Exact single-row top-k selection for the common 65..128 range. Each pass
+// Exact row-wise top-k selection for the common 65..128 range. Each pass
 // sorts independent 1024-value tiles and retains 128 candidates. Repeating
 // the pass cannot discard a member of the global top-k, while avoiding the
 // full-vocabulary argpartition/argsort graph used by the generic fallback.
-constexpr const char* kHierarchicalTopKFirstSource = R"METAL(
-    constexpr uint BLOCK = 1024u;
-    constexpr uint KEEP = 128u;
-    uint group = threadgroup_position_in_grid.x;
-    uint tid = thread_index_in_threadgroup;
-    threadgroup float tile_values[BLOCK];
-    threadgroup int tile_indices[BLOCK];
-
-    uint begin = group * BLOCK;
-    for (uint offset = tid; offset < BLOCK; offset += 256u) {
-        uint index = begin + offset;
-        float value = index < uint(COUNT)
-            ? float(logits[index])
-            : -INFINITY;
-        tile_values[offset] = isnan(value) ? -INFINITY : value;
-        tile_indices[offset] = index < uint(COUNT)
-            ? int(index)
-            : INT_MAX;
-    }
-
-    for (uint width = 2u; width <= BLOCK; width <<= 1u) {
-        for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) {
+constexpr const char* kHierarchicalTopKHeader = R"METAL(
+inline void mfq_prune_sorted_candidates(threadgroup float* values,
+    threadgroup int* indices, uint tid) {
+    for (uint chunk = 128u; chunk <= 512u; chunk <<= 1u) {
+        uint pairs = 1024u / (2u * chunk);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint item = tid; item < pairs * 64u; item += 256u) {
+            uint pair = item / 64u;
+            uint offset = item % 64u;
+            uint left = pair * 2u * chunk + chunk + offset;
+            uint right = pair * 2u * chunk + chunk + 127u - offset;
+            float value = values[left];
+            int index = indices[left];
+            values[left] = values[right];
+            indices[left] = indices[right];
+            values[right] = value;
+            indices[right] = index;
+        }
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint left = tid; left < BLOCK; left += 256u) {
-                uint right = left ^ stride;
-                if (right <= left) continue;
-                float left_value = tile_values[left];
-                float right_value = tile_values[right];
-                int left_index = tile_indices[left];
-                int right_index = tile_indices[right];
-                bool right_before_left =
-                    right_value > left_value ||
-                    (right_value == left_value && right_index < left_index);
-                bool left_before_right =
-                    left_value > right_value ||
-                    (left_value == right_value && left_index < right_index);
-                bool descending = (left & width) == 0u;
-                if ((descending && right_before_left) ||
-                    (!descending && left_before_right)) {
-                    tile_values[left] = right_value;
-                    tile_values[right] = left_value;
-                    tile_indices[left] = right_index;
-                    tile_indices[right] = left_index;
+            for (uint logical = tid; logical < pairs * 256u; logical += 256u) {
+                uint other = logical ^ stride;
+                if (other <= logical) continue;
+                uint pair = logical / 256u;
+                uint offset = logical % 256u;
+                uint other_offset = other % 256u;
+                uint left = pair * 2u * chunk + (offset & 127u) + (offset >= 128u ? chunk : 0u);
+                uint right = pair * 2u * chunk + (other_offset & 127u) + (other_offset >= 128u ? chunk : 0u);
+                float lv = values[left], rv = values[right];
+                int li = indices[left], ri = indices[right];
+                if (rv > lv || (rv == lv && ri < li)) {
+                    values[left] = rv; values[right] = lv;
+                    indices[left] = ri; indices[right] = li;
                 }
             }
         }
     }
+}
+)METAL";
+
+constexpr const char* kHierarchicalTopKFirstSource = R"METAL(
+    constexpr uint BLOCK = 1024u;
+    constexpr uint KEEP = 128u;
+    uint group = threadgroup_position_in_grid.x;
+    uint row = threadgroup_position_in_grid.y;
+    uint tid = thread_index_in_threadgroup;
+    threadgroup float tile_values[BLOCK];
+    threadgroup int tile_indices[BLOCK];
+
+    uint lane = thread_index_in_simdgroup;
+    uint warp = simdgroup_index_in_threadgroup;
+    float4 values;
+    int4 indices;
+    for (uint item = 0u; item < 4u; ++item) {
+        uint index = group * BLOCK + warp * KEEP + lane * 4u + item;
+        float value = index < uint(COUNT) ? float(logits[ulong(row) * uint(COUNT) + index]) : -INFINITY;
+        values[item] = isnan(value) ? -INFINITY : value;
+        indices[item] = index < uint(COUNT) ? int(index) : INT_MAX;
+    }
+    for (uint width = 2u; width <= KEEP; width <<= 1u) {
+        for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) {
+            float4 partners;
+            int4 partner_indices;
+            for (uint item = 0u; item < 4u; ++item) {
+                partners[item] = stride >= 4u ? simd_shuffle_xor(values[item], stride >> 2u) : values[item ^ stride];
+                partner_indices[item] = stride >= 4u ? simd_shuffle_xor(indices[item], stride >> 2u) : indices[item ^ stride];
+            }
+            for (uint item = 0u; item < 4u; ++item) {
+                uint logical = lane * 4u + item;
+                bool better = ((logical & width) == 0u) == ((logical & stride) == 0u);
+                bool partner_before = partners[item] > values[item] ||
+                    (partners[item] == values[item] && partner_indices[item] < indices[item]);
+                bool own_before = values[item] > partners[item] ||
+                    (values[item] == partners[item] && indices[item] < partner_indices[item]);
+                if ((better && partner_before) || (!better && own_before)) {
+                    values[item] = partners[item];
+                    indices[item] = partner_indices[item];
+                }
+            }
+        }
+    }
+    for (uint item = 0u; item < 4u; ++item) {
+        uint destination = warp * KEEP + lane * 4u + item;
+        tile_values[destination] = values[item];
+        tile_indices[destination] = indices[item];
+    }
+    mfq_prune_sorted_candidates(tile_values, tile_indices, tid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid < KEEP) {
-        uint output = group * KEEP + tid;
+        ulong output = ulong(row) * ((uint(COUNT) + BLOCK - 1u) / BLOCK) * KEEP + group * KEEP + tid;
         scores_out[output] = tile_values[tid];
         indices_out[output] = tile_indices[tid];
     }
@@ -358,6 +398,7 @@ constexpr const char* kHierarchicalTopKMergeSource = R"METAL(
     constexpr uint BLOCK = 1024u;
     constexpr uint KEEP = 128u;
     uint group = threadgroup_position_in_grid.x;
+    uint row = threadgroup_position_in_grid.y;
     uint tid = thread_index_in_threadgroup;
     threadgroup float tile_values[BLOCK];
     threadgroup int tile_indices[BLOCK];
@@ -366,43 +407,17 @@ constexpr const char* kHierarchicalTopKMergeSource = R"METAL(
     for (uint offset = tid; offset < BLOCK; offset += 256u) {
         uint index = begin + offset;
         tile_values[offset] = index < uint(COUNT)
-            ? scores_in[index]
+            ? scores_in[ulong(row) * uint(COUNT) + index]
             : -INFINITY;
         tile_indices[offset] = index < uint(COUNT)
-            ? indices_in[index]
+            ? indices_in[ulong(row) * uint(COUNT) + index]
             : INT_MAX;
     }
 
-    for (uint width = 2u; width <= BLOCK; width <<= 1u) {
-        for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint left = tid; left < BLOCK; left += 256u) {
-                uint right = left ^ stride;
-                if (right <= left) continue;
-                float left_value = tile_values[left];
-                float right_value = tile_values[right];
-                int left_index = tile_indices[left];
-                int right_index = tile_indices[right];
-                bool right_before_left =
-                    right_value > left_value ||
-                    (right_value == left_value && right_index < left_index);
-                bool left_before_right =
-                    left_value > right_value ||
-                    (left_value == right_value && left_index < right_index);
-                bool descending = (left & width) == 0u;
-                if ((descending && right_before_left) ||
-                    (!descending && left_before_right)) {
-                    tile_values[left] = right_value;
-                    tile_values[right] = left_value;
-                    tile_indices[left] = right_index;
-                    tile_indices[right] = left_index;
-                }
-            }
-        }
-    }
+    mfq_prune_sorted_candidates(tile_values, tile_indices, tid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid < KEEP) {
-        uint output = group * KEEP + tid;
+        ulong output = ulong(row) * ((uint(COUNT) + BLOCK - 1u) / BLOCK) * KEEP + group * KEEP + tid;
         scores_out[output] = tile_values[tid];
         indices_out[output] = tile_indices[tid];
     }
@@ -410,45 +425,20 @@ constexpr const char* kHierarchicalTopKMergeSource = R"METAL(
 
 constexpr const char* kHierarchicalTopKFinalSource = R"METAL(
     constexpr uint BLOCK = 1024u;
+    uint row = threadgroup_position_in_grid.x;
     uint tid = thread_index_in_threadgroup;
     threadgroup float tile_values[BLOCK];
     threadgroup int tile_indices[BLOCK];
 
     for (uint index = tid; index < BLOCK; index += 256u) {
         tile_values[index] = index < uint(COUNT)
-            ? scores[index]
+            ? scores[ulong(row) * uint(COUNT) + index]
             : -INFINITY;
         tile_indices[index] = index < uint(COUNT)
-            ? indices[index]
+            ? indices[ulong(row) * uint(COUNT) + index]
             : INT_MAX;
     }
-    for (uint width = 2u; width <= BLOCK; width <<= 1u) {
-        for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint left = tid; left < BLOCK; left += 256u) {
-                uint right = left ^ stride;
-                if (right <= left) continue;
-                float left_value = tile_values[left];
-                float right_value = tile_values[right];
-                int left_index = tile_indices[left];
-                int right_index = tile_indices[right];
-                bool right_before_left =
-                    right_value > left_value ||
-                    (right_value == left_value && right_index < left_index);
-                bool left_before_right =
-                    left_value > right_value ||
-                    (left_value == right_value && left_index < right_index);
-                bool descending = (left & width) == 0u;
-                if ((descending && right_before_left) ||
-                    (!descending && left_before_right)) {
-                    tile_values[left] = right_value;
-                    tile_values[right] = left_value;
-                    tile_indices[left] = right_index;
-                    tile_indices[right] = left_index;
-                }
-            }
-        }
-    }
+    mfq_prune_sorted_candidates(tile_values, tile_indices, tid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) {
         float inverse_temperature = 1.0f / params[0];
@@ -475,7 +465,7 @@ constexpr const char* kHierarchicalTopKFinalSource = R"METAL(
                 }
             }
         }
-        float uniform = clamp(random[0], 0.0f, 0.99999994f);
+        float uniform = clamp(random[row], 0.0f, 0.99999994f);
         float target = uniform * keep_sum;
         float cumulative = 0.0f;
         int chosen = tile_indices[keep - 1u];
@@ -486,10 +476,10 @@ constexpr const char* kHierarchicalTopKFinalSource = R"METAL(
                 break;
             }
         }
-        output[0] = chosen;
+        output[row] = chosen;
         for (uint rank = 0u; rank < uint(TOP_K); ++rank) {
-            indices_out[rank] = tile_indices[rank];
-            probabilities_out[rank] = rank < keep
+            indices_out[ulong(row) * uint(TOP_K) + rank] = tile_indices[rank];
+            probabilities_out[ulong(row) * uint(TOP_K) + rank] = rank < keep
                 ? probabilities[rank] / keep_sum
                 : 0.0f;
         }
@@ -640,7 +630,7 @@ hierarchical_top_k_first_kernel() {
             {"logits"},
             {"scores_out", "indices_out"},
             kHierarchicalTopKFirstSource,
-            "",
+            kHierarchicalTopKHeader,
             true,
             false,
             options);
@@ -658,7 +648,7 @@ hierarchical_top_k_merge_kernel() {
             {"scores_in", "indices_in"},
             {"scores_out", "indices_out"},
             kHierarchicalTopKMergeSource,
-            "",
+            kHierarchicalTopKHeader,
             true,
             false,
             options);
@@ -676,7 +666,7 @@ hierarchical_top_k_final_kernel() {
             {"scores", "indices", "random", "params"},
             {"output", "indices_out", "probabilities_out"},
             kHierarchicalTopKFinalSource,
-            "",
+            kHierarchicalTopKHeader,
             true,
             false,
             options);
@@ -907,27 +897,27 @@ array run_sorted(
     return mlx::core::reshape(outputs.front(), view.prefix);
 }
 
-MlxTopKDistribution run_hierarchical_top_k_single(
+MlxTopKDistribution run_hierarchical_top_k_distribution(
     const LogitsView& view,
     const array& random,
     double temperature,
     int top_k,
     double top_p) {
-    if (view.rows != 1 || top_k < 1 ||
+    if (top_k < 1 ||
         top_k > kHierarchicalTopK) {
         throw std::invalid_argument(
-            "hierarchical top-k requires one row and top_k <= 128");
+            "hierarchical top-k requires top_k <= 128");
     }
     int count = view.vocab;
     int groups = (count + kTopKBlock - 1) / kTopKBlock;
     auto selected = hierarchical_top_k_first_kernel()(
         {view.values},
         {
-            Shape{groups * kHierarchicalTopK},
-            Shape{groups * kHierarchicalTopK},
+            Shape{view.rows, groups * kHierarchicalTopK},
+            Shape{view.rows, groups * kHierarchicalTopK},
         },
         {mlx::core::float32, mlx::core::int32},
-        {groups * kThreads, 1, 1},
+        {groups * kThreads, view.rows, 1},
         {kThreads, 1, 1},
         {{"COUNT", count}},
         std::nullopt,
@@ -942,11 +932,11 @@ MlxTopKDistribution run_hierarchical_top_k_single(
         selected = hierarchical_top_k_merge_kernel()(
             {scores, indices},
             {
-                Shape{groups * kHierarchicalTopK},
-                Shape{groups * kHierarchicalTopK},
+                Shape{view.rows, groups * kHierarchicalTopK},
+                Shape{view.rows, groups * kHierarchicalTopK},
             },
             {mlx::core::float32, mlx::core::int32},
-            {groups * kThreads, 1, 1},
+            {groups * kThreads, view.rows, 1},
             {kThreads, 1, 1},
             {{"COUNT", count}},
             std::nullopt,
@@ -966,16 +956,16 @@ MlxTopKDistribution run_hierarchical_top_k_single(
     auto outputs = hierarchical_top_k_final_kernel()(
         {scores, indices, random, params},
         {
-            Shape{1},
-            Shape{1, top_k},
-            Shape{1, top_k},
+            Shape{view.rows},
+            Shape{view.rows, top_k},
+            Shape{view.rows, top_k},
         },
         {
             mlx::core::int32,
             mlx::core::int32,
             mlx::core::float32,
         },
-        {kThreads, 1, 1},
+        {view.rows * kThreads, 1, 1},
         {kThreads, 1, 1},
         {
             {"COUNT", count},
@@ -984,57 +974,18 @@ MlxTopKDistribution run_hierarchical_top_k_single(
         std::nullopt,
         false,
         {});
-    return {
-        std::move(outputs.at(0)),
-        std::move(outputs.at(1)),
-        std::move(outputs.at(2)),
-    };
-}
-
-MlxTopKDistribution run_hierarchical_top_k_distribution(
-    const LogitsView& view,
-    const array& random,
-    double temperature,
-    int top_k,
-    double top_p) {
-    std::vector<array> sampled;
-    std::vector<array> indices;
-    std::vector<array> probabilities;
-    sampled.reserve(static_cast<std::size_t>(view.rows));
-    indices.reserve(static_cast<std::size_t>(view.rows));
-    probabilities.reserve(static_cast<std::size_t>(view.rows));
-    for (int row = 0; row < view.rows; ++row) {
-        LogitsView single{
-            mlx::core::contiguous(mlx::core::slice(
-                view.values,
-                Shape{row, 0},
-                Shape{row + 1, view.vocab})),
-            Shape{1},
-            1,
-            view.vocab,
-        };
-        auto result = run_hierarchical_top_k_single(
-            single,
-            mlx::core::slice(random, Shape{row}, Shape{row + 1}),
-            temperature,
-            top_k,
-            top_p);
-        sampled.push_back(std::move(result.sampled));
-        indices.push_back(std::move(result.indices));
-        probabilities.push_back(std::move(result.probabilities));
-    }
     auto sample_shape = view.prefix;
     auto distribution_shape = view.prefix;
     distribution_shape.push_back(top_k);
     return {
         mlx::core::reshape(
-            mlx::core::concatenate(std::move(sampled), 0),
+            std::move(outputs.at(0)),
             std::move(sample_shape)),
         mlx::core::reshape(
-            mlx::core::concatenate(std::move(indices), 0),
+            std::move(outputs.at(1)),
             distribution_shape),
         mlx::core::reshape(
-            mlx::core::concatenate(std::move(probabilities), 0),
+            std::move(outputs.at(2)),
             std::move(distribution_shape)),
     };
 }

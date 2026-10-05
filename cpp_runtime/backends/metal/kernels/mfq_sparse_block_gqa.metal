@@ -380,3 +380,80 @@ template [[host_name("mfq_sparse_block_gqa_f16_bk64_dc64_gqa12_d256_wm2")]]
 template [[host_name("mfq_sparse_block_gqa_bf16_bk64_dc64_gqa12_d256_wm2")]]
 [[kernel]] decltype(mfq_sparse_block_gqa<bfloat, 64, 64, 12, 16, 256, 2>)
     mfq_sparse_block_gqa<bfloat, 64, 64, 12, 16, 256, 2>;
+
+template <typename T>
+[[kernel, max_total_threads_per_threadgroup(384)]]
+void mfq_sparse_block_gqa_vector(
+    const device T* query [[buffer(0)]],
+    const device T* key [[buffer(1)]],
+    const device T* value [[buffer(2)]],
+    const device int* blocks [[buffer(3)]],
+    device T* partial [[buffer(4)]],
+    constant MfqSparseBlockGqaParams& params [[buffer(5)]],
+    device float* maximum [[buffer(6)]],
+    device float* denominator [[buffer(7)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint head [[simdgroup_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]) {
+    constexpr int partitions = 128;
+    const int position = int(group.x) / partitions;
+    const int partition = int(group.x) % partitions;
+    const int query_head = int(group.y) * 12 + int(head);
+    const size_t query_base = size_t(group.z) * params.query_strides[0]
+        + size_t(query_head) * params.query_strides[1]
+        + size_t(position) * params.query_strides[2] + lane * 8;
+    const size_t key_base = size_t(group.z) * params.key_strides[0]
+        + size_t(group.y) * params.key_strides[1] + lane * 8;
+    const size_t value_base = size_t(group.z) * params.value_strides[0]
+        + size_t(group.y) * params.value_strides[1] + lane * 8;
+    const device int* ids = blocks + size_t(group.z) * params.block_strides[0]
+        + size_t(position) * params.block_strides[1];
+    const int visible = params.query_offset + position + 1;
+    const int complete = visible / params.block_size;
+    const int valid = min(params.selected_blocks, complete);
+    const int block_tokens = params.selected_blocks * params.block_size;
+    const int selected = block_tokens + params.block_size - 1;
+    float q[8], result[8] = {0};
+    for (int item = 0; item < 8; ++item) q[item] = float(query[query_base + item]) * params.scale;
+    float peak = -INFINITY;
+    float total = 0;
+    for (int slot = partition; slot < selected; slot += partitions) {
+        long token = -1;
+        if (slot < block_tokens) {
+            const int index = slot / params.block_size;
+            if (index < valid) token = long(ids[size_t(index) * params.block_strides[2]])
+                * params.block_size + slot % params.block_size;
+        } else {
+            token = long(complete) * params.block_size + slot - block_tokens;
+        }
+        if (token < 0 || token >= params.keys || token >= visible) continue;
+        float score = 0;
+        for (int item = 0; item < 8; ++item) {
+            score += q[item] * float(key[key_base + size_t(token) * params.key_strides[2] + item]);
+        }
+        score = simd_sum(score);
+        float next = max(peak, score);
+        float previous_weight = fast::exp(peak - next);
+        float weight = fast::exp(score - next);
+        for (int item = 0; item < 8; ++item) {
+            result[item] = result[item] * previous_weight
+                + weight * float(value[value_base + size_t(token) * params.value_strides[2] + item]);
+        }
+        total = total * previous_weight + weight;
+        peak = next;
+    }
+    const size_t row = (size_t(group.z) * params.queries + position) * params.query_heads + query_head;
+    if (lane == 0) {
+        maximum[row * partitions + partition] = total > 0 ? peak : -3.402823466e+38f;
+        denominator[row * partitions + partition] = total;
+    }
+    for (int item = 0; item < 8; ++item) {
+        partial[(row * partitions + partition) * 256 + lane * 8 + item] = T(result[item]);
+    }
+}
+
+template [[host_name("mfq_sparse_block_gqa_vector_f16")]]
+[[kernel]] decltype(mfq_sparse_block_gqa_vector<half>) mfq_sparse_block_gqa_vector<half>;
+
+template [[host_name("mfq_sparse_block_gqa_vector_bf16")]]
+[[kernel]] decltype(mfq_sparse_block_gqa_vector<bfloat>) mfq_sparse_block_gqa_vector<bfloat>;

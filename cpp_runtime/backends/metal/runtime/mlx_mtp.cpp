@@ -165,6 +165,34 @@ array compact_values(
 
 namespace mfq::metal {
 
+void MlxMtpHistoryBuffer::append(
+    const array& hidden, std::span<const std::int32_t> token_ids) {
+    if (hidden.ndim() != 3 || hidden.shape(0) != 1 ||
+        hidden.shape(1) <= 0 || hidden.shape(2) <= 0 ||
+        (hidden.dtype() != mlx::core::float16 && hidden.dtype() != mlx::core::bfloat16 &&
+            hidden.dtype() != mlx::core::float32) ||
+        token_ids.size() != static_cast<std::size_t>(hidden.shape(1)) ||
+        token_ids_.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) - token_ids.size() ||
+        (!hidden_.empty() && (hidden.shape(2) != hidden_.front().shape(2) ||
+            hidden.dtype() != hidden_.front().dtype())) ||
+        std::any_of(token_ids.begin(), token_ids.end(), [](auto id) { return id < 0; })) {
+        throw std::invalid_argument("MTP committed history shape or token IDs disagree");
+    }
+    token_ids_.reserve(token_ids_.size() + token_ids.size());
+    hidden_.push_back(hidden);
+    token_ids_.insert(token_ids_.end(), token_ids.begin(), token_ids.end());
+}
+
+MlxMtpHistoryBatch MlxMtpHistoryBuffer::drain() {
+    if (empty()) throw std::logic_error("MTP committed history is empty");
+    auto hidden = hidden_.size() == 1 ? hidden_.front()
+        : mlx::core::concatenate(hidden_, 1);
+    array ids(token_ids_.begin(), Shape{1, static_cast<int>(token_ids_.size())}, mlx::core::int32);
+    hidden_.clear();
+    token_ids_.clear();
+    return {std::move(hidden), std::move(ids)};
+}
+
 namespace {
 
 constexpr double kDepthAcceptanceAlpha = 0.08;
@@ -293,9 +321,6 @@ void MlxMtpDepthController::observe(
     }
 
     current_depth_ = best_depth();
-    if (maximum_depth_ <= 1) {
-        return;
-    }
     const double period = std::max(
         kDepthProbePeriodMs,
         static_cast<double>(kDepthProbeLength) * cycle_ms /
@@ -354,7 +379,8 @@ void MlxMtpDepthController::update_time(
         estimate = cycle_ms;
         return;
     }
-    double alpha = 1.0 - std::exp(-cycle_ms / kDepthTimeTauMs);
+    const double elapsed_ms = cycle_ms + cycle_age_ms_[index].value_or(0.0);
+    double alpha = 1.0 - std::exp(-elapsed_ms / kDepthTimeTauMs);
     if (cycle_ms > kDepthSpikeRatio * *estimate) {
         alpha *= kDepthSpikeDamp;
     }
@@ -886,6 +912,7 @@ std::int32_t run_mlx_mtp_generation(
     };
     const bool profile_phases = mtp_phase_profile_requested();
     const auto initial_draft_started = std::chrono::steady_clock::now();
+    auto cycle_started = initial_draft_started;
     auto draft = prepare_mtp_draft(
         initial_context,
         request,
@@ -906,7 +933,6 @@ std::int32_t run_mlx_mtp_generation(
     }
 
     while (generated < request.generation_limit) {
-        const auto cycle_started = std::chrono::steady_clock::now();
         const int cycle_cache_start = callbacks.target_cache_position();
         const int draft_count = draft.depth;
         const auto target_started = std::chrono::steady_clock::now();
@@ -1172,6 +1198,7 @@ std::int32_t run_mlx_mtp_generation(
             std::span<const std::int32_t>(next_ids),
         };
         const auto draft_started = std::chrono::steady_clock::now();
+        cycle_started = draft_started;
         draft = prepare_mtp_draft(
             next_context,
             request,

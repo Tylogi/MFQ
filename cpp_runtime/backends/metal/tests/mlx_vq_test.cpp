@@ -1,10 +1,12 @@
 #include "mlx_vq.h"
 #include "mlx_tensor.h"
+#include "mlx_grouped_linear.h"
 
 #include "nvq_codebooks.generated.h"
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -355,6 +357,76 @@ Fixture make_jsc(
         kMatrixOutput,
         kInputSize,
     };
+}
+
+Fixture make_nvq3jl_shape(int output_size, int input_size) {
+    constexpr int banks = 4;
+    constexpr int entries = 1024;
+    constexpr std::array<std::uint16_t, 4> scale_bits{
+        0x3400, 0x3800, 0x3c00, 0x4000,
+    };
+    constexpr std::array<float, 4> scales{0.25f, 0.5f, 1.0f, 2.0f};
+    const int groups = (input_size + 23) / 24;
+    const int vectors = (input_size + 3) / 4;
+    const int signs = (input_size + 7) / 8;
+    std::vector<std::uint8_t> blob;
+    append_matrix_header(blob, "NVQ1", 0x26, 4, 24, output_size, input_size);
+    append<std::uint8_t>(blob, 1);
+    append<std::uint8_t>(blob, banks);
+    append<std::uint8_t>(blob, 16);
+    append<std::uint8_t>(blob, 0);
+    for (int state = 0; state < 16; ++state) {
+        append<std::uint16_t>(blob, scale_bits[state % 4]);
+    }
+    for (int state = 0; state < 16; ++state) {
+        append<std::uint8_t>(blob, state % banks);
+    }
+    append<std::uint8_t>(blob, 0);
+    blob.insert(blob.end(), 11, 0);
+    const auto code = [](int bank, int index, int component) {
+        return (bank * 3 + index * 5 + component * 7) % 17 - 8;
+    };
+    for (int bank = 0; bank < banks; ++bank) {
+        for (int index = 0; index < entries; ++index) {
+            for (int component = 0; component < 4; ++component) {
+                append<std::int8_t>(blob, code(bank, index, component));
+            }
+        }
+    }
+    std::vector<std::uint16_t> states(output_size * groups);
+    std::vector<std::uint16_t> indices(output_size * vectors);
+    std::vector<std::uint16_t> sign_values(output_size * signs);
+    for (int output = 0; output < output_size; ++output) {
+        append<std::uint16_t>(blob, scale_bits[output % 2]);
+        for (int group = 0; group < groups; ++group) {
+            states[output * groups + group] = (output * 5 + group * 3) % 16;
+        }
+        for (int vector = 0; vector < vectors; ++vector) {
+            indices[output * vectors + vector] = (output * 37 + vector * 13) % entries;
+        }
+        for (int sign = 0; sign < signs; ++sign) {
+            sign_values[output * signs + sign] = (output * 11 + sign * 19) % 128;
+        }
+    }
+    append_bytes(blob, pack_values(states, 4));
+    append_bytes(blob, pack_values(indices, 10));
+    append_bytes(blob, pack_values(sign_values, 7));
+    std::vector<float> dense(output_size * input_size);
+    for (int output = 0; output < output_size; ++output) {
+        for (int column = 0; column < input_size; ++column) {
+            const auto state = states[output * groups + column / 24];
+            const auto index = indices[output * vectors + column / 4];
+            const auto sign = sign_values[output * signs + column / 8];
+            const auto bit = column % 8;
+            const auto negative = bit < 7 ? ((sign >> bit) & 1u)
+                : (std::popcount(sign) & 1u);
+            const float value = code(state % banks, index, column % 4);
+            dense[output * input_size + column] = scales[output % 2]
+                * scales[state % 4] * (negative ? -value : value);
+        }
+    }
+    return {"NVQ3J-L", std::move(blob), {}, std::move(dense),
+        {output_size}, {}, 0, output_size, input_size};
 }
 
 std::vector<float> decode_ternary_word(
@@ -841,6 +913,118 @@ std::vector<Fixture> fixtures() {
     return result;
 }
 
+Fixture varied_projection_fixture(const Fixture& seed, int outputs, int width, int group_size = 0) {
+    using namespace mlx::core;
+    const auto metadata = mfq::metal::MlxVqWeight::from_blob(seed.dtype, seed.blob);
+    const int gs = group_size == 0 ? metadata.group_size() : group_size;
+    const int vs = metadata.vector_size();
+    const int groups = (width + gs - 1) / gs;
+    const int vectors = (width + vs - 1) / vs;
+    const int signs = (width + 7) / 8;
+    const bool signed_codes = metadata.aux_mode() == 1 || metadata.aux_mode() == 2;
+    const bool group64 = metadata.execution_layout() == 1;
+    const auto packed_size = [](int count, int bits) { return (std::size_t(count) * bits + 7) / 8; };
+    const auto old_tail = std::size_t(seed.output_size) * 2 + (group64
+        ? std::size_t(seed.output_size) * metadata.groups() * 8
+        : packed_size(seed.output_size * metadata.groups(), metadata.state_bits())
+            + packed_size(seed.output_size * metadata.vectors(), metadata.index_bits())
+            + packed_size(seed.output_size * (signed_codes ? (seed.input_size + 7) / 8 : metadata.groups()),
+                signed_codes ? 7 : (metadata.aux_mode() == 3 ? 1 : 0)));
+    auto blob = std::vector<std::uint8_t>(seed.blob.begin(), seed.blob.end() - old_tail);
+    const auto output64 = std::int64_t(outputs);
+    const auto width64 = std::int64_t(width);
+    const auto output32 = std::uint32_t(outputs);
+    const auto group16 = std::uint16_t(gs);
+    std::memcpy(blob.data() + 6, &group16, 2);
+    std::memcpy(blob.data() + 12, &width, 4);
+    std::memcpy(blob.data() + 20, &output64, 8);
+    std::memcpy(blob.data() + 28, &width64, 8);
+    std::memcpy(blob.data() + 36, &output32, 4);
+    constexpr std::array<std::uint16_t, 4> anchor_bits{0x3400, 0x3800, 0x3c00, 0x4000};
+    constexpr std::array<float, 4> anchors{0.25f, 0.5f, 1.0f, 2.0f};
+    std::vector<std::uint16_t> states(outputs * groups), indices(outputs * vectors);
+    std::vector<std::uint16_t> auxiliary(outputs * (signed_codes ? signs : groups));
+    for (int output = 0; output < outputs; ++output) {
+        append<std::uint16_t>(blob, anchor_bits[output % anchors.size()]);
+        for (int group = 0; group < groups; ++group) {
+            states[output * groups + group] = (output * 5 + group * 3) % metadata.states();
+        }
+        for (int vector = 0; vector < vectors; ++vector) {
+            indices[output * vectors + vector] = (output * 37 + vector * 13) % metadata.entries();
+        }
+        for (int index = 0; index < (signed_codes ? signs : groups); ++index) {
+            auxiliary[output * (signed_codes ? signs : groups) + index] =
+                (output * 11 + index * 19) % (signed_codes ? 128 : 2);
+        }
+    }
+    if (group64) {
+        for (int output = 0; output < outputs; ++output) {
+            for (int group = 0; group < groups; ++group) {
+                std::uint64_t record = std::uint64_t(states[output * groups + group]) << 60;
+                for (int local = 0; local < 3 && group * 3 + local < vectors; ++local) {
+                    const int vector = group * 3 + local;
+                    const auto sign = auxiliary[output * signs + vector];
+                    const auto full_sign = sign | ((std::popcount(sign) & 1u) << 7);
+                    record |= (std::uint64_t(indices[output * vectors + vector])
+                        | (std::uint64_t(full_sign) << 12)) << (local * 20);
+                }
+                append<std::uint64_t>(blob, record);
+            }
+        }
+    } else {
+        append_bytes(blob, pack_values(states, metadata.state_bits()));
+        append_bytes(blob, pack_values(indices, metadata.index_bits()));
+        if (signed_codes || metadata.aux_mode() == 3) {
+            append_bytes(blob, pack_values(auxiliary, signed_codes ? 7 : 1));
+        }
+    }
+    auto books = contiguous(metadata.codebooks());
+    auto scales = contiguous(metadata.scale_lut());
+    auto banks = contiguous(metadata.state_to_codebank());
+    auto parameters = metadata.parameters();
+    eval(books, scales, banks, parameters);
+    std::vector<std::int8_t> codes(books.data<std::int8_t>(),
+        books.data<std::int8_t>() + books.size());
+    if (std::memcmp(blob.data(), "NVQ1", 4) == 0 && (blob[4] & 0x20) != 0) {
+        for (std::size_t index = 0; index < codes.size(); ++index) {
+            codes[index] = int((index * 7 + index / vs * 3) % 15) - 7;
+        }
+        std::memcpy(blob.data() + 104, codes.data(), codes.size());
+    } else if (seed.dtype == "NVQ1-S") {
+        for (int entry = 0; entry < 512; ++entry) {
+            const auto word = mfq::nvq_codebooks::kNvq1LCodebookPacked[(511 - entry) * 4];
+            std::memcpy(blob.data() + 40 + 1024 + entry * 2, &word, 2);
+            for (int component = 0; component < 8; ++component) {
+                codes[(512 + entry) * 8 + component] = int((word >> (2 * component)) & 3u) - 1;
+            }
+        }
+    }
+    std::vector<float> dense(outputs * width);
+    for (int output = 0; output < outputs; ++output) {
+        for (int column = 0; column < width; ++column) {
+            const auto state = states[output * groups + column / gs];
+            const auto index = indices[output * vectors + column / vs];
+            const auto aux = auxiliary[output * (signed_codes ? signs : groups)
+                + column / (signed_codes ? 8 : gs)];
+            const int bank = metadata.code_bank_mode() == 1 ? banks.data<std::uint8_t>()[state]
+                : (metadata.code_bank_mode() == 2 ? aux : 0);
+            float code = codes[
+                (bank * metadata.entries() + index) * vs + column % vs];
+            if (signed_codes) {
+                const int bit = column % 8;
+                auto negative = bit < 7 ? ((aux >> bit) & 1u) : (std::popcount(aux) & 1u);
+                if (metadata.aux_mode() == 2 && bit == 7) negative ^= (index >> 7) & 1u;
+                if (negative) code = -code;
+            } else if (metadata.aux_mode() == 3) {
+                code += (aux ? -1.0f : 1.0f) * parameters.data<float>()[0];
+            }
+            dense[output * width + column] = anchors[output % anchors.size()]
+                * scales.data<float>()[state] * code;
+        }
+    }
+    return {seed.dtype, std::move(blob), {}, std::move(dense), {outputs}, {}, 0, outputs, width};
+}
+
 void require_close(
     float actual,
     float expected,
@@ -879,6 +1063,7 @@ std::vector<float> evaluated_float(
     if (value.dtype() != float32) {
         value = astype(value, float32);
     }
+    value = contiguous(value);
     value.eval();
     const auto* data = value.data<float>();
     return std::vector<float>(
@@ -1053,7 +1238,7 @@ void check_values(
             actual[index],
             expected[index],
             tolerance,
-            context);
+            std::string(context) + " index=" + std::to_string(index));
     }
 }
 
@@ -1272,6 +1457,147 @@ void test_fixture(const Fixture& fixture) {
     }
 }
 
+void test_nvq3jl_projection_shapes() {
+    using namespace mlx::core;
+    test_fixture(make_nvq3jl_shape(24, 24));
+    for (const auto [width, narrow, wide] : {
+             std::array<int, 3>{24, 3, 35},
+             std::array<int, 3>{28, 13, 37},
+             std::array<int, 3>{80, 13, 97},
+             std::array<int, 3>{88, 13, 105},
+             std::array<int, 3>{96, 13, 113},
+         }) {
+        auto contraction = make_nvq3jl_shape(narrow, width);
+        auto expansion = make_nvq3jl_shape(wide, width);
+        test_fixture(contraction);
+        test_fixture(expansion);
+        auto a = mfq::metal::MlxVqWeight::from_blob(contraction.dtype, contraction.blob);
+        auto b = mfq::metal::MlxVqWeight::from_blob(expansion.dtype, expansion.blob);
+        if (!a.nvq3jl_execution_records() || !b.nvq3jl_execution_records()) {
+            throw std::runtime_error("NVQ3J-L execution records were not prepared at load");
+        }
+        const mfq::metal::MlxGroupedLinear group({&a, &b});
+        const mfq::metal::MlxGroupedLinear triple({&a, &b, &a});
+        const mfq::metal::MlxLinear linear_a(a);
+        const mfq::metal::MlxLinear linear_b(b);
+        const mfq::metal::MlxProjectionBatch batch({&linear_a, &linear_b, &linear_a});
+        if (!triple.supports_single_row_projection_fusion()
+            || batch.grouped_projection_count() != 3
+            || !batch.projections_share_group(0, 3)) {
+            throw std::runtime_error("NVQ3J-L production projection fusion was not selected");
+        }
+        for (const int rows : {1, 2, 6, 16}) {
+            const auto values = input_values(rows, width);
+            for (const auto dtype : {float32, float16, bfloat16}) {
+                const auto context = " K=" + std::to_string(width) + " M="
+                    + std::to_string(rows) + (dtype == float32 ? " f32" : dtype == float16 ? " f16" : " bf16");
+                auto input = astype(array(values.begin(), Shape{rows, width}), dtype);
+                const auto outputs = group.matmul(input);
+                if (outputs.size() != 2) {
+                    throw std::runtime_error("NVQ3J-L grouped projection count");
+                }
+                check_values(evaluated_float(outputs[0]),
+                    expected_matmul(contraction, values, rows), dtype == bfloat16 ? 0.13f : 0.02f,
+                    "NVQ3J-L grouped contraction" + context);
+                check_values(evaluated_float(outputs[1]),
+                    expected_matmul(expansion, values, rows), dtype == bfloat16 ? 0.13f : 0.02f,
+                    "NVQ3J-L grouped expansion" + context);
+                check_values(evaluated_float(a.matmul(input)),
+                    expected_matmul(contraction, values, rows), dtype == bfloat16 ? 0.13f : 0.02f,
+                    "NVQ3J-L ordinary contraction");
+                check_values(evaluated_float(b.matmul(input)),
+                    expected_matmul(expansion, values, rows), dtype == bfloat16 ? 0.13f : 0.02f,
+                    "NVQ3J-L ordinary expansion");
+                if (rows == 1) {
+                    for (const auto& fused : {triple.matmul(input), batch(input)}) {
+                        if (fused.size() != 3) {
+                            throw std::runtime_error("NVQ3J-L three-projection output count");
+                        }
+                        for (std::size_t projection = 0; projection < fused.size(); ++projection) {
+                            check_values(evaluated_float(fused[projection]),
+                                expected_matmul(projection == 1 ? expansion : contraction, values, rows),
+                                dtype == bfloat16 ? 0.13f : 0.02f, "NVQ3J-L three-projection fusion");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+void test_nvq_projection_batches() {
+    using namespace mlx::core;
+    auto seeds = fixtures();
+    seeds.resize(12);
+    seeds.push_back(make_jsc("NVQ2J-XL", 5, 8, 12, true));
+    auto parity = make_plain_nvq("NVQ2", 1, 8);
+    parity.blob[4] |= 0x80;
+    seeds.push_back(std::move(parity));
+    for (std::size_t index = 0; index < seeds.size(); ++index) {
+        for (const int width : {24, 88}) {
+            const auto shape = [&](const Fixture& seed, int output) {
+                const bool variable_gs = seed.dtype == "NVQ2" || seed.dtype == "NVQ3" || seed.dtype == "NVQ1-L";
+                return varied_projection_fixture(seed, output, width, variable_gs && width == 88 ? 32 : 0);
+            };
+            const std::array<Fixture, 3> shapes{
+                shape(seeds[index], 13),
+                shape(seeds[(index + 1) % seeds.size()], width + 17),
+                shape(seeds[(index + 2) % seeds.size()], 7)};
+            const auto a = mfq::metal::MlxVqWeight::from_blob(shapes[0].dtype, shapes[0].blob);
+            const auto b = mfq::metal::MlxVqWeight::from_blob(shapes[1].dtype, shapes[1].blob);
+            const auto c = mfq::metal::MlxVqWeight::from_blob(shapes[2].dtype, shapes[2].blob);
+            const mfq::metal::MlxGroupedLinear qkv({&a, &b, &c});
+            const mfq::metal::MlxLinear la(a), lb(b), lc(c);
+            const mfq::metal::MlxProjectionBatch batch({&la, &lb, &lc, &lb});
+            const mfq::metal::MlxProjectionBatch gate_up({&lb, &lb});
+            if (!qkv.supports_single_row_projection_fusion() ||
+                batch.grouped_projection_count() != 4 ||
+                !batch.projections_share_group(0, 2) || !batch.projections_share_group(2, 2)) {
+                throw std::runtime_error("NVQ QKV/gate did not select real fused groups");
+            }
+            for (int rows = 1; rows <= 6; ++rows) {
+                const auto values = input_values(rows, width);
+                std::vector<float> backing(rows * (width + 5), 17.0f);
+                for (int row = 0; row < rows; ++row) {
+                    std::copy_n(values.begin() + row * width, width, backing.begin() + row * (width + 5));
+                }
+                for (const auto dtype : {float16, bfloat16, float32}) {
+                    auto input = slice(astype(array(backing.begin(), Shape{1, rows, width + 5}), dtype),
+                        Shape{0, 0, 0}, Shape{1, rows, width});
+                    const auto check = [&](const std::vector<array>& outputs, const std::vector<int>& mapping) {
+                        if (outputs.size() != mapping.size()) throw std::runtime_error("NVQ projection count");
+                        for (std::size_t projection = 0; projection < outputs.size(); ++projection) {
+                            const auto& fixture = shapes[mapping[projection]];
+                            if (outputs[projection].shape() != Shape{1, rows, fixture.output_size} ||
+                                outputs[projection].dtype() != dtype) {
+                                throw std::runtime_error("NVQ projection shape/dtype");
+                            }
+                            const auto actual = evaluated_float(outputs[projection]);
+                            auto expected = expected_matmul(fixture, values, rows);
+                            if (dtype == bfloat16) {
+                                expected = evaluated_float(astype(astype(
+                                    array(expected.begin(), outputs[projection].shape()), float16), bfloat16));
+                            }
+                            for (std::size_t element = 0; element < actual.size(); ++element) {
+                                const float tolerance = dtype == bfloat16
+                                    ? 0.004f + 0.004f * std::fabs(expected[element])
+                                    : (dtype == float16 ? 0.001f + 0.0006f * std::fabs(expected[element])
+                                        : 0.0001f + 0.00001f * std::fabs(expected[element]));
+                                require_close(actual[element], expected[element], tolerance,
+                                    fixture.dtype + " K=" + std::to_string(width) + " M=" + std::to_string(rows)
+                                        + (dtype == bfloat16 ? " bf16" : dtype == float16 ? " f16" : " f32"));
+                            }
+                        }
+                    };
+                    check(qkv.matmul(input), {0, 1, 2});
+                    check(batch(input), {0, 1, 2, 1});
+                    check(gate_up(input), {1, 1});
+                }
+            }
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1330,6 +1656,8 @@ int main() {
             test_fixture(fixture);
         }
         test_fixture(make_jsc("NVQ2J-XL", 5, 8, 12, true));
+        test_nvq3jl_projection_shapes();
+        test_nvq_projection_batches();
 
         auto rotated = make_nepq(0, true);
         test_fixture(rotated);
