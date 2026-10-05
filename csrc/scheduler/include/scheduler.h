@@ -22,10 +22,6 @@ public:
 
 private:
     friend class MfqScheduler;
-class MfqSchedulerOverloaded : public std::runtime_error {
-public:
-    using std::runtime_error::runtime_error;
-};
     mutable std::mutex mutex_;
     std::condition_variable ready_;
     std::deque<mfq::engine::EngineEvent> events_;
