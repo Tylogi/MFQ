@@ -31,8 +31,13 @@ set_target_properties(mfq-model-graph PROPERTIES
 )
 
 add_library(mfq-model-source STATIC
+    mfe_quant_expert_store.cpp
+    include/mfq/mfe_quant_expert_store.h
     nint_rows.cpp
     include/mfq/nint_rows.h
+    nvq_rows.cpp
+    include/mfq/nvq_rows.h
+    include/mfq/packed_row_range.h
     hf_model_source.cpp
     hf_safetensors_source.cpp
     include/mfq/hf_model_source.h

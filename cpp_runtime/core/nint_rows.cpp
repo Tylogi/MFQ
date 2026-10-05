@@ -1,6 +1,7 @@
 #include "mfq/nint_rows.h"
 
 #include "mfq/nint_blob.h"
+#include "mfq/packed_row_range.h"
 
 #include <algorithm>
 #include <cstring>
@@ -21,7 +22,10 @@ std::size_t packed_size(std::uint64_t count, int bits) {
 
 class Cursor {
 public:
-    Cursor(std::size_t size, const NintRows::Read& read) : size_(size), read_(read) {}
+    Cursor(std::size_t size, const NintRows::Read& read) : size_(size) {
+        if (size<sizeof(header_)) throw std::runtime_error("truncated mapped NINT row header");
+        read(0,header_,sizeof(header_));
+    }
     std::size_t skip(std::size_t count) {
         if (offset_ > size_ || count > size_ - offset_) {
             throw std::runtime_error("truncated mapped NINT row tensor");
@@ -33,13 +37,15 @@ public:
     template <typename T> T scalar() {
         const auto start = skip(sizeof(T));
         T value;
-        read_(start, reinterpret_cast<std::uint8_t*>(&value), sizeof(T));
+        if (start>sizeof(header_) || sizeof(T)>sizeof(header_)-start)
+            throw std::runtime_error("invalid mapped NINT row header offset");
+        std::memcpy(&value,header_+start,sizeof(T));
         return value;
     }
     bool finished() const noexcept { return offset_ == size_; }
 private:
     std::size_t size_;
-    const NintRows::Read& read_;
+    std::uint8_t header_[42];
     std::size_t offset_ = 0;
 };
 
@@ -133,6 +139,7 @@ void NintRows::initialize() {
         const auto size = packed_size(rows, 2);
         k_selectors_ = selectors(cursor.skip(size), size, owned_k_);
         const auto counts = build_ranks(k_selectors_, rows_, 2, k_ranks_);
+        k_counts_=counts;
         for (int cohort = 0; cohort < 4; ++cohort) {
             const int width = sub_bits_ - 1 + cohort;
             if (counts[cohort] && (width < 1 || width > 8)) {
@@ -146,6 +153,7 @@ void NintRows::initialize() {
         const auto qsize = packed_size(rows, 3);
         q_selectors_ = selectors(cursor.skip(qsize), qsize, owned_q_);
         const auto qcounts = build_ranks(q_selectors_, rows_, 3, q_ranks_);
+        q_counts_=qcounts;
         for (int cohort = 0; cohort < 8; ++cohort) {
             q_offsets_[cohort] = cursor.skip(packed_size(
                 std::uint64_t(qcounts[cohort]) * values_per_row, cohort + 1));
@@ -162,6 +170,89 @@ void NintRows::initialize() {
 std::size_t NintRows::index_nbytes() const noexcept {
     return k_ranks_.size() * sizeof(k_ranks_[0]) + q_ranks_.size() * sizeof(q_ranks_[0]) +
         owned_k_.size() + owned_q_.size();
+}
+
+std::vector<std::uint8_t> NintRows::slice_rows_blob(std::int64_t begin,std::int64_t end) const {
+    if (begin<0 || end<=begin || end>rows_)
+        throw std::out_of_range("NINT contiguous row range");
+    const auto count=static_cast<std::uint32_t>(end-begin);
+    std::vector<std::uint8_t> result;
+    result.reserve(row_range_nbytes(begin,end));
+    const auto scalar=[&](auto value) {
+        const auto* bytes=reinterpret_cast<const std::uint8_t*>(&value);
+        result.insert(result.end(),bytes,bytes+sizeof(value));
+    };
+    scalar(static_cast<std::uint8_t>(bits_|(adaptive_ ? kNintAdaptiveStorageFlag : 0)));
+    scalar(static_cast<std::uint8_t>(sub_bits_));
+    scalar(static_cast<std::int32_t>(group_size_)); scalar(std::int32_t(0));
+    scalar(static_cast<std::int32_t>(width_)); scalar(std::uint32_t(2));
+    scalar(static_cast<std::int64_t>(count)); scalar(static_cast<std::int64_t>(width_));
+    scalar(count); scalar(static_cast<std::uint32_t>(groups_));
+    for (auto base: {neuron_scale_offset_,neuron_min_offset_}) {
+        const auto start=result.size(); result.resize(start+std::size_t(count)*2);
+        read_(base+static_cast<std::size_t>(begin)*2,result.data()+start,std::size_t(count)*2);
+    }
+    const auto selected_bits=[&](const std::uint8_t* selectors,int bits) {
+        detail::append_packed_range(result,[&](std::size_t offset,std::uint8_t* out,std::size_t size) {
+            std::memcpy(out,selectors+offset,size);
+        },0,static_cast<std::uint64_t>(begin)*bits,static_cast<std::uint64_t>(count)*bits);
+    };
+    if (adaptive_) selected_bits(k_selectors_,2);
+    for (int cohort=0; cohort<(adaptive_ ? 4 : 1); ++cohort) {
+        const auto rank=[&](std::int64_t row) -> std::uint32_t {
+            if (!adaptive_) return static_cast<std::uint32_t>(row);
+            return row==rows_ ? k_counts_[cohort] : cohort_rank(k_selectors_,
+                static_cast<std::size_t>(row),2,cohort,k_ranks_);
+        };
+        const auto first=rank(begin), last=rank(end);
+        if (first==last) continue;
+        const int bits=adaptive_ ? sub_bits_-1+cohort : sub_bits_;
+        const auto first_bit=std::uint64_t(first)*groups_*bits;
+        const auto total_bits=std::uint64_t(last-first)*groups_*bits;
+        detail::append_packed_range(result,read_,scale_offsets_[cohort],first_bit,total_bits);
+        detail::append_packed_range(result,read_,min_offsets_[cohort],first_bit,total_bits);
+    }
+    if (adaptive_) selected_bits(q_selectors_,3);
+    for (int cohort=0; cohort<(adaptive_ ? 8 : 1); ++cohort) {
+        const auto rank=[&](std::int64_t row) -> std::uint32_t {
+            if (!adaptive_) return static_cast<std::uint32_t>(row);
+            return row==rows_ ? q_counts_[cohort] : cohort_rank(q_selectors_,
+                static_cast<std::size_t>(row),3,cohort,q_ranks_);
+        };
+        const auto first=rank(begin), last=rank(end);
+        const auto values=std::uint64_t(groups_)*group_size_;
+        const int bits=adaptive_ ? cohort+1 : bits_;
+        detail::append_packed_range(result,read_,q_offsets_[cohort],
+            std::uint64_t(first)*values*bits,std::uint64_t(last-first)*values*bits);
+    }
+    return result;
+}
+
+std::size_t NintRows::row_range_nbytes(std::int64_t begin,std::int64_t end) const {
+    if (begin<0 || end<=begin || end>rows_) throw std::out_of_range("NINT contiguous row range");
+    const auto count=static_cast<std::uint64_t>(end-begin);
+    std::size_t bytes=42+static_cast<std::size_t>(count)*4;
+    if (adaptive_) bytes+=packed_size(count,2)+packed_size(count,3);
+    for (int cohort=0; cohort<(adaptive_ ? 4 : 1); ++cohort) {
+        const auto rank=[&](std::int64_t row) -> std::uint32_t {
+            if (!adaptive_) return static_cast<std::uint32_t>(row);
+            return row==rows_ ? k_counts_[cohort] : cohort_rank(k_selectors_,
+                static_cast<std::size_t>(row),2,cohort,k_ranks_);
+        };
+        const auto rows=static_cast<std::uint64_t>(rank(end)-rank(begin));
+        const int bits=adaptive_ ? sub_bits_-1+cohort : sub_bits_;
+        if (rows) bytes+=2*packed_size(rows*groups_,bits);
+    }
+    for (int cohort=0; cohort<(adaptive_ ? 8 : 1); ++cohort) {
+        const auto rank=[&](std::int64_t row) -> std::uint32_t {
+            if (!adaptive_) return static_cast<std::uint32_t>(row);
+            return row==rows_ ? q_counts_[cohort] : cohort_rank(q_selectors_,
+                static_cast<std::size_t>(row),3,cohort,q_ranks_);
+        };
+        const auto rows=static_cast<std::uint64_t>(rank(end)-rank(begin));
+        bytes+=packed_size(rows*groups_*group_size_,adaptive_ ? cohort+1 : bits_);
+    }
+    return bytes;
 }
 
 void NintRows::append_row(std::int64_t row, NintRowBatch& batch) const {

@@ -52,6 +52,26 @@ void check(int width, int gs, int nominal_k, bool adaptive) {
             require(mfq::test::row_value(b, row, col) == f.reference[ids[row] * width + col], "range oracle differs");
     rejected([&] { ranges.append_row(-1, b); });
     rejected([&] { ranges.append_row(529, b); });
+    for (const auto interval: {std::pair<int,int>{0,529},{1,20},{255,513},{528,529}}) {
+        bytes=0;
+        const auto blob=ranges.slice_rows_blob(interval.first,interval.second);
+        require(blob.size()==ranges.row_range_nbytes(interval.first,interval.second),"NINT range byte budget differs");
+        mfq::NintRows sliced(blob.data(),blob.size());
+        require(sliced.rows()==interval.second-interval.first && sliced.width()==width,
+            "contiguous slice shape differs");
+        if (interval.first==0 && interval.second==529)
+            require(blob==f.blob,"whole NINT slice changed canonical bytes");
+        require(bytes<f.blob.size(),"contiguous slice unnecessarily read full source");
+        mfq::NintRowBatch batch;
+        for (int row=0; row<sliced.rows(); ++row) sliced.append_row(row,batch);
+        for (int row=0; row<sliced.rows(); ++row)
+            for (int column=0; column<width; ++column)
+                require(mfq::test::row_value(batch,row,column)==f.reference[(row+interval.first)*width+column],
+                    "contiguous slice changed encoded NINT values");
+    }
+    rejected([&] { ranges.slice_rows_blob(-1,1); });
+    rejected([&] { ranges.slice_rows_blob(2,2); });
+    rejected([&] { ranges.slice_rows_blob(0,530); });
 }
 void production_ranges() {
     constexpr int rows = 2500012, width = 160, groups = 7, gs = 24;

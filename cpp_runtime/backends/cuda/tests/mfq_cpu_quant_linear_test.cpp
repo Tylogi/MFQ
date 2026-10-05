@@ -1,6 +1,8 @@
 #include "storage/weight_loader.h"
 #include "quant_linear.h"
 #include "cuda_execution.h"
+#include "mfq/nint_rows.h"
+#include "mfq/nvq_rows.h"
 
 #include <cmath>
 #include <algorithm>
@@ -20,6 +22,47 @@ std::vector<float> read(const std::filesystem::path& path, std::size_t count) {
     if (!stream || stream.peek()!=std::char_traits<char>::eof())
         throw std::runtime_error("invalid FP32 fixture: "+path.string());
     return values;
+}
+
+void verify_slices(CudaExecutionContext& execution,const mfq::ModelSource& source,
+        const std::string& name,const mfq_tensor_backend::Tensor& input,
+        const std::vector<float>& expected,int outputs,int batch) {
+    const auto& record=require_tensor(source,"linear.weight");
+    const auto reader=source.tensor_reader("linear.weight");
+    std::size_t reads=0;
+    const auto read=[&](std::size_t offset,std::uint8_t* data,std::size_t bytes) {
+        reads+=bytes; reader(offset,reinterpret_cast<std::byte*>(data),bytes);
+    };
+    std::unique_ptr<mfq::NintRows> nint;
+    std::unique_ptr<mfq::NvqRows> nvq;
+    if (record.dtype=="NINT") nint=std::make_unique<mfq::NintRows>(record.nbytes,read);
+    else nvq=std::make_unique<mfq::NvqRows>(record.nbytes,read);
+    if (reads>=record.nbytes) throw std::runtime_error("range index read entire weight payload");
+    for (const auto interval: {std::pair<int,int>{1,17},{outputs/2,outputs/2+9},{outputs-11,outputs},{0,outputs}}) {
+        const int begin=interval.first,end=interval.second,count=end-begin;
+        const auto blob=nint ? nint->slice_rows_blob(begin,end) : nvq->slice_rows_blob(begin,end);
+        if (blob.size()!=(nint ? nint->row_range_nbytes(begin,end) : nvq->row_range_nbytes(begin,end)))
+            throw std::runtime_error("canonical row range byte budget mismatch");
+        if (!begin && end==outputs) {
+            std::vector<std::uint8_t> original(record.nbytes);
+            reader(0,reinterpret_cast<std::byte*>(original.data()),original.size());
+            if (blob!=original) throw std::runtime_error("range slice changed canonical whole-weight bytes");
+        }
+        QuantLinear sliced;
+        sliced.logical_out=count; sliced.logical_neuron_len=input.size(1);
+        if (nint) { sliced.kind=QuantLinearKind::Nint; sliced.nint=to_cpu_nint(unpack_nint(blob)); }
+        else { sliced.kind=QuantLinearKind::Nvq; sliced.nvq=to_cpu_nvq(unpack_nvq(blob,record.dtype)); }
+        const auto y=sliced.forward(execution,input).to(mfq_tensor_backend::kFloat32).contiguous();
+        if (y.is_cuda() || y.size(0)!=batch || y.size(1)!=count)
+            throw std::runtime_error("range slice output placement/shape mismatch");
+        for (int sample=0; sample<batch; ++sample)
+            for (int row=0; row<count; ++row) {
+                const double reference=expected[sample*outputs+begin+row];
+                const double actual=y.data_ptr<float>()[sample*count+row];
+                if (!std::isfinite(actual) || std::abs(actual-reference)>1e-5+1e-3*std::abs(reference))
+                    throw std::runtime_error(name+" range slice differs from canonical FP64 oracle");
+            }
+    }
 }
 }
 
@@ -64,6 +107,7 @@ int main(int argc, char** argv) try {
         std::cout << name << " shape=" << outputs << 'x' << width << " batch=" << batch
             << " max_abs=" << maximum << " relative="
             << std::sqrt(square_error/std::max(square_reference,1e-30)) << '\n';
+        verify_slices(execution,*source,name,x,expected,outputs,batch);
         if (benchmark) {
             // Separate compressed allocations rotate through 48 layer-shaped
             // weights. This avoids reporting a single L3-resident GEMV.

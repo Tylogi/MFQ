@@ -44,6 +44,11 @@ public:
     int width() const noexcept { return width_; }
     std::size_t index_nbytes() const noexcept;
     void append_row(std::int64_t row, NintRowBatch& batch) const;
+    // Canonical compact tensor containing [begin,end). Reads each selected
+    // q/k cohort as a contiguous range, rather than issuing I/O per neuron.
+    // Adaptive selectors and the original quantization profile are preserved.
+    std::vector<std::uint8_t> slice_rows_blob(std::int64_t begin,std::int64_t end) const;
+    std::size_t row_range_nbytes(std::int64_t begin,std::int64_t end) const;
 private:
     void initialize();
     const std::uint8_t* selectors(std::size_t offset, std::size_t size,
@@ -56,6 +61,8 @@ private:
     std::vector<std::uint8_t> owned_k_, owned_q_;
     std::vector<std::array<std::uint32_t, 4>> k_ranks_;
     std::vector<std::array<std::uint32_t, 8>> q_ranks_;
+    std::array<std::uint32_t, 4> k_counts_{};
+    std::array<std::uint32_t, 8> q_counts_{};
     std::array<std::size_t, 4> scale_offsets_{};
     std::array<std::size_t, 4> min_offsets_{};
     std::array<std::size_t, 8> q_offsets_{};

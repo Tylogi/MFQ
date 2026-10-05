@@ -1,0 +1,44 @@
+#pragma once
+
+#include "mfq/nint_rows.h"
+#include "mfq/nvq_rows.h"
+
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace mfq {
+struct MfeQuantExpert {
+    std::string dtype;
+    std::vector<std::uint8_t> payload;
+};
+
+// Canonical mixed NINT/NVQ range source. Its index owns only selectors,
+// codebooks and expert ownership; no expert payload is retained implicitly.
+class MfeQuantExpertStore {
+public:
+    using Read=NintRows::Read;
+    MfeQuantExpertStore(std::size_t bytes,Read read);
+    int num_experts() const noexcept { return experts_; }
+    int out_per_expert() const noexcept { return output_; }
+    int neuron_len() const noexcept { return width_; }
+    std::size_t index_nbytes() const noexcept;
+    const std::string& expert_dtype(int expert) const;
+    std::size_t expert_payload_nbytes(int expert) const;
+    MfeQuantExpert read_expert(int expert) const;
+    std::size_t payload_nbytes() const noexcept { return bytes_; }
+private:
+    struct Pool {
+        std::string dtype;
+        std::vector<std::int32_t> ids;
+        std::shared_ptr<mfq::NintRows> nint;
+        std::shared_ptr<mfq::NvqRows> nvq;
+    };
+    struct Expert { int pool=-1,local=-1; };
+    Read read_;
+    std::size_t bytes_=0;
+    int experts_=0,output_=0,width_=0;
+    std::vector<Pool> pools_;
+    std::vector<Expert> owners_;
+};
+} // namespace mfq
