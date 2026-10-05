@@ -9,6 +9,39 @@ namespace mfq_qwen4_exp {
 namespace tb = mfq_tensor_backend;
 using tb::Tensor;
 
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+namespace {
+template <int Threads>
+__global__ void grouped_rms_norm_kernel(const float* input, const float* weight,
+    float* output, int64_t group, int64_t width, double eps) {
+    const int64_t base = int64_t(blockIdx.x) * group;
+    float sum = 0.0f;
+    for (int64_t i = threadIdx.x; i < group; i += Threads) {
+        const float value = input[base + i];
+        sum = __fadd_rn(sum, __fmul_rn(value, value));
+    }
+    // Match native mean's tree and each materialized FP32 rounding step.
+    // Warp reductions, FMA and rsqrtf can change the final output bits.
+    __shared__ float partial[Threads];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (int offset = Threads / 2; offset > 0; offset /= 2) {
+        if (threadIdx.x < offset)
+            partial[threadIdx.x] += partial[threadIdx.x + offset];
+        __syncthreads();
+    }
+    // Native scalar arithmetic keeps non-FP32 scalars (including eps) in FP64.
+    const float variance = float(double(partial[0] / float(group)) + eps);
+    const float inverse = 1.0f / sqrtf(variance);
+    for (int64_t i = threadIdx.x; i < group; i += Threads) {
+        const float normalized = __fmul_rn(input[base + i], inverse);
+        output[base + i] = __fmul_rn(normalized,
+            __fadd_rn(1.0f, weight[(base + i) % width]));
+    }
+}
+} // namespace
+#endif
+
 Tensor grouped_rms_norm(const Tensor& value, const Tensor& weight,
                         int64_t group, double eps) {
     mfq_selected_attention::values({&value, &weight});
@@ -20,6 +53,27 @@ Tensor grouped_rms_norm(const Tensor& value, const Tensor& weight,
     shape.back() /= group;
     shape.push_back(group);
     auto source = value.to(tb::kFloat32).reshape(shape);
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    const auto rows = source.numel() / group;
+    const char* disable_mean = std::getenv("MFQ_DISABLE_NATIVE_PARALLEL_F32_MEAN");
+    if (rows > 0 && rows <= std::numeric_limits<unsigned int>::max() &&
+        (!disable_mean || disable_mean[0] != '1')) {
+        source = source.contiguous();
+        auto scale = weight.to(tb::kFloat32).contiguous();
+        auto output = tb::empty(value.sizes(), source.options());
+        const auto launch = [&]<int Threads>() {
+            grouped_rms_norm_kernel<Threads><<<unsigned(rows), Threads, 0,
+                mfq_current_cuda_stream()>>>(source.data_ptr<float>(), scale.data_ptr<float>(),
+                    output.data_ptr<float>(), group, value.size(-1), eps);
+        };
+        if (group <= 32) launch.template operator()<32>();
+        else if (group <= 64) launch.template operator()<64>();
+        else if (group <= 128) launch.template operator()<128>();
+        else launch.template operator()<256>();
+        MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        return output.to(value.scalar_type());
+    }
+#endif
     auto normalized = source * tb::rsqrt((source * source).mean(-1, true) + eps);
     return (normalized.reshape(value.sizes()) * (1.0 + weight.to(tb::kFloat32)))
         .to(value.scalar_type());

@@ -30,6 +30,47 @@ namespace {
 using namespace mfq::cuda;
 using Json = nlohmann::json;
 
+Tensor unfused_grouped_rms_norm(const Tensor& value, const Tensor& weight,
+    int64_t group, double eps) {
+    auto shape = value.sizes().vec();
+    shape.back() /= group;
+    shape.push_back(group);
+    auto source = value.to(kFloat32).reshape(shape);
+    auto normalized = source * rsqrt((source * source).mean(-1, true) + eps);
+    return (normalized.reshape(value.sizes()) * (1.0 + weight.to(kFloat32)))
+        .to(value.scalar_type());
+}
+
+void check_grouped_rms_norm() {
+    const Device gpu{DeviceType::cuda, 0};
+    // Rounding eps to float first changes this small activation by one ULP.
+    auto tiny = tensor<float>({1.0980109436786734e-05f}).to(gpu);
+    auto zero = zeros({1}, tiny.options());
+    auto expected_tiny = unfused_grouped_rms_norm(tiny, zero, 1, 1e-6);
+    MFQ_RUNTIME_CHECK(expected_tiny.equal(mfq_qwen4_exp::grouped_rms_norm(tiny, zero, 1, 1e-6)) &&
+        !expected_tiny.equal(unfused_grouped_rms_norm(tiny, zero, 1, double(float(1e-6)))),
+        "Qwen grouped RMSNorm lost FP64 epsilon rounding");
+    for (auto dtype : {kFloat32, kFloat16, kBFloat16})
+    for (int group : {1, 7, 32, 33, 64, 65, 128, 129, 640, 2560})
+    for (int tokens : {1, 23}) for (float magnitude : {1.f, 0.001f, 0.00001f}) {
+        const int width = group * 4;
+        std::vector<float> values(tokens * width), scales(width);
+        for (size_t i = 0; i < values.size(); ++i)
+            values[i] = magnitude * (int((i * 17) % 257) - 128) / 11.0f;
+        for (size_t i = 0; i < scales.size(); ++i)
+            scales[i] = (int(i % 19) - 9) / 17.0f;
+        auto input = tensor(values).to(gpu, dtype).reshape({1, tokens, width});
+        auto weight = tensor(scales).to(gpu, dtype);
+        for (bool strided : {false, true}) {
+            auto x = strided ? input.transpose(-1, -2).contiguous().transpose(-1, -2) : input;
+            auto expected = unfused_grouped_rms_norm(x, weight, group, 1e-6).cpu();
+            auto actual = mfq_qwen4_exp::grouped_rms_norm(x, weight, group, 1e-6).cpu();
+            MFQ_RUNTIME_CHECK(std::memcmp(actual.data_ptr(), expected.data_ptr(), actual.nbytes()) == 0,
+                "Qwen grouped RMSNorm output bits changed: group=", group, ", tokens=", tokens);
+        }
+    }
+}
+
 Tensor unfused_moe_reduce(const Tensor& pairs, const Tensor& weights) {
     auto result = zeros({pairs.size(0), pairs.size(2)}, weights.options());
     for (int64_t route = 0; route < pairs.size(1); ++route)
@@ -377,6 +418,7 @@ int main(int argc, char** argv) {
                 if (got.data_ptr<float>()[i] != 4.f) throw std::runtime_error("QSA smoke mismatch");
             check_shared_sparse_attention();
             check_moe_reduce();
+            check_grouped_rms_norm();
             std::cout << "Flash-Next and shared sparse-attention native smoke passed\n";
             return 0;
         }
