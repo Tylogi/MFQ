@@ -348,12 +348,8 @@ void MfqScheduler::loop() noexcept {
                 control_work = true;
             }
             std::vector<RequestId> eligible;
-            std::vector<RequestId> ordered(order_.begin(), order_.end());
-            std::stable_sort(ordered.begin(), ordered.end(), [&](const auto& a, const auto& b) {
-                return requests_.at(a).priority > requests_.at(b).priority;
-            });
             bool admission_blocked = false;
-            for (const auto& id : ordered) {
+            for (const auto& id : order_) {
                 auto& request = requests_.at(id);
                 flush(request);
                 if (stopping || (request.deadline && *request.deadline <= Clock::now())) cancel(request);

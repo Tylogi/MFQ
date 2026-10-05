@@ -66,11 +66,10 @@ private:
         std::shared_ptr<MfqScheduledRequest> outbox;
         std::string id, session;
         std::optional<mfq::engine::Clock::time_point> deadline;
-        int priority = 0;
         std::size_t reserved_bytes = 0;
         Request(mfq::engine::EngineRequest value, std::shared_ptr<MfqScheduledRequest> box)
             : input(std::move(value)), outbox(std::move(box)), id(input.id),
-              session(input.input.cache_plan.session_id), deadline(input.deadline), priority(input.priority) {}
+              session(input.input.cache_plan.session_id), deadline(input.deadline) {}
         bool admitted = false, cancelling = false;
         bool finished = false;
         std::optional<mfq::engine::Failed> failure;
