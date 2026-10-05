@@ -3,6 +3,7 @@
 #include "nint.h"
 #include "cuda_execution.h"
 #include "format.h"
+#include "packed_nint.h"
 
 #include <cstring>
 #include <limits>
@@ -243,6 +244,30 @@ static mfq_tensor_backend::Tensor nint_matmul_cpu(
         mfq_tensor_backend::Tensor x) {
     MFQ_RUNTIME_CHECK(!x.is_cuda(), "CPU NINT GEMV requires CPU activations");
     MFQ_RUNTIME_CHECK(!w.q_packed.is_cuda(), "CPU NINT GEMV requires CPU-resident weights");
+    if (!w.q8_zero) {
+        MFQ_RUNTIME_CHECK(!w.row_q_bits.is_cuda() && !w.row_q_bit_offsets.is_cuda() &&
+            !w.sub_scale.is_cuda() && !w.sub_min.is_cuda() &&
+            !w.neuron_scale.is_cuda() && !w.neuron_min.is_cuda(),
+            "CPU NINT GEMV requires CPU-resident metadata");
+        x = pad_last(x.contiguous().to(mfq_tensor_backend::kFloat32), w.neuron_len).contiguous();
+        auto result = mfq_tensor_backend::empty({x.size(0), w.out},
+            x.options().dtype(mfq_tensor_backend::kFloat32));
+        mfq::cpu::PackedNintView view;
+        view.packed = w.q_packed.data_ptr<uint8_t>();
+        view.packed_bytes = static_cast<size_t>(w.q_packed.numel());
+        view.row_bits = w.row_q_bits.data_ptr<uint8_t>();
+        view.row_bit_offsets = w.row_q_bit_offsets.data_ptr<int64_t>();
+        view.group_scale = w.sub_scale.data_ptr<uint8_t>();
+        view.group_min = w.sub_min.data_ptr<uint8_t>();
+        view.row_scale = w.neuron_scale.data_ptr<float>();
+        view.row_min = w.neuron_min.data_ptr<float>();
+        view.outputs = w.out;
+        view.width = w.neuron_len;
+        view.group_size = w.gs;
+        mfq::cpu::packed_nint_matmul(view, x.data_ptr<float>(), x.size(0),
+            w.neuron_len, result.data_ptr<float>(), w.out, mfq_get_num_threads());
+        return result.to(mfq_tensor_backend::kFloat16);
+    }
     auto activation = cpu_quantize_activation(
         std::move(x), w.neuron_len, w.gs, true);
     const int64_t rows = activation.rows;

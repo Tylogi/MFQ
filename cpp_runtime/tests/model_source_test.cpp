@@ -165,6 +165,7 @@ int main() {
         write_hf_fp8_128(root / "hf-fp8-128");
         write_hf_fp8_128(root / "hf-fp8-128-explicit", true);
 
+        {
         mfq::MfqModelSource mfq_source(mfq_path);
         mfq::MfqModelSource legacy_mfq_source(legacy_mfq_path);
         mfq::MfqModelSource legacy_gguf_source(legacy_gguf_path);
@@ -337,6 +338,7 @@ int main() {
             rejected = true;
         }
         require(rejected, "out-of-range tensor read was accepted");
+        } // Close all source file handles before Windows fixture cleanup.
 
         std::filesystem::remove_all(root);
         std::cout << "model source parity passed\n";

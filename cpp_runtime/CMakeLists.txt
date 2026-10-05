@@ -34,6 +34,7 @@ endif()
 # canonical model graph and several public policy headers consume it.
 add_subdirectory(components/json)
 add_subdirectory(core)
+add_subdirectory(backends/cpu)
 add_subdirectory(models)
 
 if(MFQ_BUILD_RUNTIME_COMMUNICATION OR MFQ_BUILD_METAL_RUNTIME)

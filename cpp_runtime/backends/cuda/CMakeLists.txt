@@ -50,7 +50,7 @@ target_include_directories(mfq-cuda-core PUBLIC
     ${MFQ_CUDA_ROOT}/include
     ${CUDAToolkit_INCLUDE_DIRS}
 )
-target_link_libraries(mfq-cuda-core PUBLIC CUDA::cudart CUDA::cublas)
+target_link_libraries(mfq-cuda-core PUBLIC CUDA::cudart CUDA::cublas mfq-host-parallel)
 target_compile_features(mfq-cuda-core PUBLIC cxx_std_20)
 target_compile_options(mfq-cuda-core PRIVATE
     "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>"
@@ -256,6 +256,7 @@ function(mfq_configure_cuda_backend_target target)
     )
     target_link_libraries(${target} PRIVATE
         mfq-core
+        mfq-cpu-ops
         mfq-json
         mfq-ggml-internal-headers
     )
@@ -364,6 +365,13 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-sq-linear-test PRIVATE
         MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-sq-linear-test PRIVATE mfq-cuda-runtime)
+
+    add_executable(mfq-cpu-quant-linear-test
+        ${MFQ_CUDA_ROOT}/tests/mfq_cpu_quant_linear_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cpu-quant-linear-test)
+    target_compile_definitions(mfq-cpu-quant-linear-test PRIVATE
+        MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cpu-quant-linear-test PRIVATE mfq-cuda-runtime)
 endif()
 target_link_libraries(mfq-cuda-runtime PRIVATE
     CUDA::cuda_driver

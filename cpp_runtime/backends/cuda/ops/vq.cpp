@@ -4,6 +4,8 @@
 #include "cuda_execution.h"
 #include "format.h"
 #include "nvq_codebooks.generated.h"
+#include "quant_dot.h"
+#include "nvq_group.h"
 
 using mfq_tensor_backend::indexing::Slice;
 using namespace mfq::cuda::quant_format;
@@ -92,22 +94,6 @@ static NvqMatmulPath select_nvq_matmul_path(const NvqWeight & w, int M) {
     }
     return NvqMatmulPath::DequantGemm;
 }
-static int cpu_nvq_index_bits(int format) {
-    switch (format) {
-        case 1: return 11;
-        case 7: return 7;
-        case 8: case 12: return 9;
-        case 9: return 6;
-        case 13: case 15: return 10;
-        case 14: return 12;
-        case 2: case 3: case 5: case 10: case 11: return 8;
-        default:
-            throw std::runtime_error(
-                "CPU dense offload does not support NVQ kernel format " +
-                std::to_string(format));
-    }
-}
-
 static bool cpu_nvq_d4(int format) {
     return format == 3 || format == 10 || format == 11 ||
         format == 12 || format == 15;
@@ -165,100 +151,87 @@ static int cpu_nvq_parity7(uint32_t value) {
     return static_cast<int>(value & 1u);
 }
 
-static void cpu_decode_nvq_group(
-        const NvqWeight & w,
-        int row,
-        int group,
-        uint32_t state,
-        int8_t values[64]) {
-    std::fill(values, values + 64, static_cast<int8_t>(0));
-    const int format = static_cast<int>(w.kernel_format);
-    const bool d4 = cpu_nvq_d4(format);
-    const int vector_size = d4 ? 4 : 8;
-    const int nvec = static_cast<int>(
-        (w.neuron_len + vector_size - 1) / vector_size);
-    const int nsign = static_cast<int>((w.neuron_len + 7) / 8);
-    const auto * indices = w.indices_packed.data_ptr<uint8_t>();
-    const auto * aux = w.aux_packed.data_ptr<uint8_t>();
-    const int bits = cpu_nvq_index_bits(format);
-    const int8_t * metadata = w.codebook.data_ptr<int8_t>();
-    const int8_t * bank = (format == 7 || format == 9)
-        ? nullptr
-        : cpu_nvq_codebook(metadata, format, state);
-    for (int chunk = 0; chunk < 6; ++chunk) {
-        const int vector8 = group * 3 + (chunk >> 1);
-        const int vector = d4 ? group * 6 + chunk : vector8;
-        if (vector >= nvec) continue;
-        const int64_t index_linear =
-            static_cast<int64_t>(row) * nvec + vector;
-        const uint32_t code = bits == 8
-            ? indices[index_linear]
-            : cpu_load_packed_bits(
-                indices, w.indices_packed.numel(), index_linear * bits, bits);
-        int decoded[4] = {0, 0, 0, 0};
-        if (format == 7) {
-            constexpr int64_t header = 64;
-            constexpr int64_t first_state_bytes = 8 * 4;
-            constexpr int64_t second_offset = header + 8 * first_state_bytes;
-            constexpr int64_t second_state_bytes = 16 * 4;
-            const int8_t * source = (chunk & 1) == 0
-                ? metadata + header + state * first_state_bytes +
-                    (code & 7u) * 4
-                : metadata + second_offset + state * second_state_bytes +
-                    (code >> 3) * 4;
-            for (int index = 0; index < 4; ++index) decoded[index] = source[index];
-        } else if (format == 9) {
-            constexpr int64_t header = 64;
-            const int8_t * source = metadata + header +
-                (static_cast<int64_t>(state) * 64 + code) * 8 +
-                (chunk & 1) * 4;
-            for (int index = 0; index < 4; ++index) decoded[index] = source[index];
-        } else {
-            const int8_t * source = bank +
-                static_cast<int64_t>(code) * vector_size +
-                (d4 ? 0 : (chunk & 1) * 4);
-            for (int index = 0; index < 4; ++index) decoded[index] = source[index];
-            if (format == 1 || format == 8) {
-                const int64_t delta_linear =
-                    static_cast<int64_t>(row) * w.ng + group;
-                const bool negative = cpu_load_packed_bits(
-                    aux, w.aux_packed.numel(), delta_linear, 1) != 0;
-                const int delta = negative ? -1 : 1;
-                if (format == 8) {
-                    source = metadata +
-                        static_cast<int64_t>(negative) * 512 * 8 +
-                        static_cast<int64_t>(code) * 8 + (chunk & 1) * 4;
-                    for (int index = 0; index < 4; ++index) {
-                        decoded[index] = 32 * source[index] + 5 * delta;
-                    }
-                } else {
-                    for (int index = 0; index < 4; ++index) {
-                        decoded[index] = 8 * decoded[index] + delta;
-                    }
-                }
-            } else {
-                if (vector8 >= nsign) continue;
-                const int64_t sign_linear =
-                    static_cast<int64_t>(row) * nsign + vector8;
-                const uint32_t mask7 = cpu_load_packed_bits(
-                    aux, w.aux_packed.numel(), sign_linear * 7, 7);
-                const uint32_t last =
-                    static_cast<uint32_t>(cpu_nvq_parity7(mask7)) ^
-                    ((format == 2 && w.sign_mode != 0)
-                        ? ((code >> 7) & 1u) : 0u);
-                const uint32_t mask8 = mask7 | (last << 7);
-                const int sign_base = (chunk & 1) * 4;
-                for (int index = 0; index < 4; ++index) {
-                    if (((mask8 >> (sign_base + index)) & 1u) != 0) {
-                        decoded[index] = -decoded[index];
-                    }
-                }
-            }
+using CpuNvqDecodeView=mfq::cpu::NvqDecodeView;
+
+static inline uint32_t cpu_nvq_bits(const uint8_t* data, int64_t bytes,
+        int64_t bit, int bits) {
+    const int64_t offset=bit>>3;
+    uint32_t word=0;
+    // Native canonical payloads have no mandatory tail padding.
+    if (bytes-offset>=4) std::memcpy(&word,data+offset,4);
+    else std::memcpy(&word,data+offset,static_cast<size_t>(bytes-offset));
+    return (word>>(bit&7))&((1u<<bits)-1u);
+}
+
+// Geometry, storage pointers and state tables are prepared once per GEMV.
+// E8 indices/signs are consumed once per eight values, D4 once per four.
+template<int Format>
+static void cpu_decode_nvq_group(const CpuNvqDecodeView& w,
+        int64_t row, int group, uint32_t state, int8_t values[24]) {
+    constexpr bool d4 = Format==3 || Format==10 || Format==11 || Format==12 || Format==15;
+    constexpr bool delta_format = Format==1 || Format==8;
+    constexpr int bits = Format==1 ? 11 : Format==7 ? 7 :
+        (Format==8 || Format==12) ? 9 : Format==9 ? 6 :
+        (Format==13 || Format==15) ? 10 : Format==14 ? 12 : 8;
+    const int8_t* bank=w.banks[state];
+    int delta=1;
+    if constexpr (delta_format) {
+        const bool negative=cpu_nvq_bits(w.aux,w.aux_bytes,row*w.groups+group,1)!=0;
+        delta=negative ? -1 : 1;
+        if constexpr (Format==8) bank+=int(negative)*512*8;
+    }
+    for (int chunk=0; chunk<3; ++chunk) {
+        const int vector8=group*3+chunk;
+        const int vector=d4 ? vector8*2 : vector8;
+        if (vector>=w.nvec) {
+            std::fill(values+chunk*8,values+chunk*8+8,int8_t(0));
+            continue;
         }
-        const int destination = chunk * 4;
-        for (int index = 0; index < 4; ++index) {
-            values[destination + index] = static_cast<int8_t>(decoded[index]);
+        const int64_t linear=row*w.nvec+vector;
+        const uint32_t code=bits==8 ? w.indices[linear] :
+            cpu_nvq_bits(w.indices,w.index_bytes,linear*bits,bits);
+        int8_t decoded[8];
+        if constexpr (Format==7) {
+            std::memcpy(decoded,bank+(code&7u)*4,4);
+            // The second codebook begins after all eight first-half banks.
+            std::memcpy(decoded+4,bank+256+state*32+(code>>3)*4,4);
+        } else if constexpr (d4) {
+            std::memcpy(decoded,bank+int64_t(code)*4,4);
+            if (vector+1<w.nvec) {
+                const uint32_t second=bits==8 ? w.indices[linear+1] :
+                    cpu_nvq_bits(w.indices,w.index_bytes,(linear+1)*bits,bits);
+                std::memcpy(decoded+4,bank+int64_t(second)*4,4);
+            } else std::fill(decoded+4,decoded+8,int8_t(0));
+        } else std::memcpy(decoded,bank+int64_t(code)*8,8);
+        uint32_t mask8=0;
+        if constexpr (!delta_format && Format!=7 && Format!=9) {
+            const uint32_t mask7=cpu_nvq_bits(w.aux,w.aux_bytes,
+                (row*w.nsign+vector8)*7,7);
+            const uint32_t parity=cpu_nvq_parity7(mask7) ^
+                ((Format==2 && w.sign_mode!=0) ? ((code>>7)&1u) : 0u);
+            mask8=mask7|(parity<<7);
         }
+        for (int i=0; i<8; ++i) {
+            int value=decoded[i];
+            if constexpr (Format==1) value=8*value+delta;
+            else if constexpr (Format==8) value=32*value+5*delta;
+            else value*=1-2*int((mask8>>i)&1u);
+            values[chunk*8+i]=static_cast<int8_t>(value);
+        }
+    }
+}
+
+using CpuNvqDecoder=void(*)(const CpuNvqDecodeView&,int64_t,int,uint32_t,int8_t*);
+static CpuNvqDecoder cpu_nvq_decoder(int format) {
+    switch (format) {
+#define MFQ_NVQ_CPU_CASE(F) case F: return cpu_decode_nvq_group<F>;
+        MFQ_NVQ_CPU_CASE(1) MFQ_NVQ_CPU_CASE(2) MFQ_NVQ_CPU_CASE(3)
+        MFQ_NVQ_CPU_CASE(5) MFQ_NVQ_CPU_CASE(7) MFQ_NVQ_CPU_CASE(8)
+        MFQ_NVQ_CPU_CASE(9) MFQ_NVQ_CPU_CASE(10) MFQ_NVQ_CPU_CASE(11)
+        MFQ_NVQ_CPU_CASE(12) MFQ_NVQ_CPU_CASE(13) MFQ_NVQ_CPU_CASE(14)
+        MFQ_NVQ_CPU_CASE(15)
+#undef MFQ_NVQ_CPU_CASE
+        default: throw std::runtime_error("unsupported CPU NVQ format");
     }
 }
 
@@ -268,51 +241,67 @@ static mfq_tensor_backend::Tensor nvq_matmul_cpu(
     MFQ_RUNTIME_CHECK(!x.is_cuda(), "CPU NVQ GEMV requires CPU activations");
     MFQ_RUNTIME_CHECK(
         !w.indices_packed.is_cuda() && !w.sub_scale_packed.is_cuda() &&
-        !w.neuron_scale.is_cuda() && !w.codebook.is_cuda(),
+        !w.neuron_scale.is_cuda() && !w.codebook.is_cuda() && !w.aux_packed.is_cuda(),
         "CPU NVQ GEMV requires CPU-resident weights");
     MFQ_RUNTIME_CHECK(w.gs == 24,
         "CPU NVQ GEMV currently requires 24-value groups");
-    auto activation = cpu_quantize_activation(
-        std::move(x), w.neuron_len, w.gs, true);
-    const int64_t rows = activation.rows;
+    x = pad_last(x.contiguous().to(mfq_tensor_backend::kFloat32), w.neuron_len).contiguous();
+    const int64_t rows = x.size(0);
+    const float* input = x.data_ptr<float>();
+    const auto dot = mfq::cpu::scaled_i8_dot_kernel();
     const int64_t outputs = w.out;
-    auto result = mfq_tensor_backend::empty(
-        {rows, outputs},
-        mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kFloat16));
-    mfq_half * output = result.data_ptr<mfq_half>();
     const uint8_t * scales = w.sub_scale_packed.data_ptr<uint8_t>();
     const float * anchors = w.neuron_scale.data_ptr<float>();
     const int8_t * metadata = w.codebook.data_ptr<int8_t>();
     const int64_t scale_bytes = w.sub_scale_packed.numel();
+    const int format=static_cast<int>(w.kernel_format);
+    const auto decoder=cpu_nvq_decoder(format);
+    const auto fused_rows=mfq::cpu::nvq_rows_dot_kernel(format);
+    const int vector_size=cpu_nvq_d4(format) ? 4 : 8;
+    MFQ_RUNTIME_CHECK(w.sub_bits>0 && w.sub_bits<=4,"CPU NVQ state width must be 1..4");
+    CpuNvqDecodeView view{w.indices_packed.data_ptr<uint8_t>(),
+        w.aux_packed.data_ptr<uint8_t>(), w.indices_packed.numel(),w.aux_packed.numel(),
+        static_cast<int>((w.neuron_len+vector_size-1)/vector_size),
+        static_cast<int>((w.neuron_len+7)/8),static_cast<int>(w.ng),static_cast<int>(w.sign_mode)};
+    for (uint32_t state=0; state<(1u<<w.sub_bits); ++state) {
+        view.multipliers[state]=cpu_nvq_scale(metadata,format,1.0f,state);
+        view.banks[state]=format==7 ? metadata+64+state*32 :
+            format==9 ? metadata+64+state*64*8 : cpu_nvq_codebook(metadata,format,state);
+    }
+    if (fused_rows) {
+        view.states=scales; view.state_bytes=scale_bytes;
+        view.anchors=anchors; view.width=w.neuron_len;
+        view.state_bits=static_cast<int>(w.sub_bits);
+        auto result=mfq_tensor_backend::empty({rows,outputs},
+            mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kFloat32));
+        auto* output=result.data_ptr<float>();
+        mfq_parallel_for(0,outputs,1,[&](int64_t begin,int64_t end) {
+            fused_rows(view,input,rows,w.neuron_len,output,outputs,begin,end);
+        });
+        return result.to(mfq_tensor_backend::kFloat16);
+    }
+    auto result=mfq_tensor_backend::empty({rows,outputs},
+        mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kFloat16));
+    auto* output=result.data_ptr<mfq_half>();
     mfq_parallel_for(0, outputs, 1, [&](int64_t begin, int64_t end) {
         std::vector<float> accumulators(static_cast<size_t>(rows));
         for (int64_t neuron = begin; neuron < end; ++neuron) {
             std::fill(accumulators.begin(), accumulators.end(), 0.0f);
             for (int group = 0; group < w.ng; ++group) {
                 const int64_t scale_linear = neuron * w.ng + group;
-                const uint32_t state = cpu_load_packed_bits(
+                const uint32_t state = cpu_nvq_bits(
                     scales, scale_bytes,
                     scale_linear * w.sub_bits,
                     static_cast<int>(w.sub_bits));
-                const float scale = cpu_nvq_scale(
-                    metadata, static_cast<int>(w.kernel_format),
-                    anchors[neuron], state);
-                alignas(64) int8_t weights[64];
-                cpu_decode_nvq_group(
-                    w, static_cast<int>(neuron), group, state, weights);
+                const float scale = anchors[neuron]*view.multipliers[state];
+                const int valid = static_cast<int>(std::min<int64_t>(
+                    w.gs, w.neuron_len - static_cast<int64_t>(group) * w.gs));
+                alignas(32) int8_t weights[24];
+                decoder(view,neuron,group,state,weights);
                 for (int64_t row = 0; row < rows; ++row) {
-                    const int8_t * quantized = activation.values.data() +
-                        (row * activation.groups + group) * 64;
-                    const int32_t dot = cpu_dot_s8_s8_64(
-                        weights, quantized,
-                        activation.sums[static_cast<size_t>(
-                            row * activation.groups + group)]);
-                    const float activation_scale = activation.scales[
-                        static_cast<size_t>(row * activation.groups + group)];
-                    accumulators[static_cast<size_t>(row)] = std::fma(
-                        scale * activation_scale,
-                        static_cast<float>(dot),
-                        accumulators[static_cast<size_t>(row)]);
+                    accumulators[static_cast<size_t>(row)] += dot(weights,
+                        input + row*w.neuron_len + static_cast<int64_t>(group)*w.gs,
+                        valid, scale);
                 }
             }
             for (int64_t row = 0; row < rows; ++row) {

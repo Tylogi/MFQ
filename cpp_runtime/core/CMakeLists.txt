@@ -1,5 +1,13 @@
 # Backend-neutral graph, policies, interfaces, and generated tables.
 
+find_package(Threads REQUIRED)
+add_library(mfq-host-parallel STATIC host_parallel.cpp include/mfq/host_parallel.h)
+target_include_directories(mfq-host-parallel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(mfq-host-parallel PUBLIC cxx_std_17)
+target_link_libraries(mfq-host-parallel PUBLIC Threads::Threads)
+set_target_properties(mfq-host-parallel PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_library(mfq::host-parallel ALIAS mfq-host-parallel)
+
 add_library(mfq-model-graph STATIC
     grid_vision.cpp
     grid_vision.h
@@ -57,6 +65,7 @@ target_include_directories(mfq-core INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/generated
 )
 target_link_libraries(mfq-core INTERFACE
+    mfq-host-parallel
     mfq-model-graph
     mfq-model-source
     mfq-json
