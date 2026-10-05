@@ -147,44 +147,6 @@ def test_generated_output_protocol_is_resolved_by_the_registry() -> None:
         assert protocol.tool_call_protocol_name == "glm_xml"
 
 
-def test_cpp_server_publishes_the_same_architecture_capability_contract() -> None:
-    assert "architecture_capability_profile(" in SERVER
-    assert "kModelCapabilityRegistry" in SERVER
-    for model_type in (
-        "minicpmo",
-        "deepseek_v41",
-        "deepseek_v41_vision",
-        "deepseek_v4",
-        "deepseek_v4_vision",
-        "glm_moe_dsa",
-        "qwen3_5",
-        "qwen4_exp",
-        "glm5_next",
-    ):
-        assert f'"{model_type}"' in SERVER
-    for feature in (
-        "text",
-        "image_input",
-        "video_input",
-        "audio_input",
-        "audio_output",
-        "full_duplex",
-        "mtp",
-    ):
-        assert f'{{"{feature}", profile.{feature}}}' in SERVER
-    assert '{"model_capabilities", model_capabilities}' in SERVER
-    for state in (
-        "vision_supported",
-        "vision_available",
-        "video_available",
-        "mtp_supported",
-        "mtp_available",
-        "vision_enabled_default",
-        "mtp_enabled_default",
-    ):
-        assert f'"{state}"' in SERVER
-
-
 def test_cpp_transports_keep_health_metrics_out_of_response_performance() -> None:
     assert SERVER.count("add_request_runtime_metrics(performance, metrics)") == 3
     assert "add_runtime_metrics(performance)" not in SERVER

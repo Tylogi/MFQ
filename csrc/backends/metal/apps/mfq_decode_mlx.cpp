@@ -2463,7 +2463,7 @@ int run_loaded_runtime(
         runtime_holder,
         runtime_stream);
     {
-        MfqModelCapabilities capabilities;
+        mfq::engine::ModelCapabilities capabilities;
         capabilities.family = model_graph.architecture;
         capabilities.source = "model-graph";
         capabilities.text = model_graph.has_component("text");

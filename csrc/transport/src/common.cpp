@@ -408,20 +408,18 @@ static void merge_runtime_profile(MfqRuntimeProfile & target,
 }
 
 json model_capability_profile_json(
-        const MfqModelCapabilityProfile & profile) {
+        const mfq::engine::ModelCapabilities& capabilities) {
     return {
-        {"architecture_family", profile.family},
-        {"source", profile.source.empty()
-            ? "architecture-registry:" + profile.family
-            : profile.source},
+        {"architecture_family", capabilities.family},
+        {"source", capabilities.source},
         {"features", {
-            {"text", profile.text},
-            {"image_input", profile.image_input},
-            {"video_input", profile.video_input},
-            {"audio_input", profile.audio_input},
-            {"audio_output", profile.audio_output},
-            {"full_duplex", profile.full_duplex},
-            {"mtp", profile.mtp},
+            {"text", capabilities.text},
+            {"image_input", capabilities.image_input},
+            {"video_input", capabilities.video_input},
+            {"audio_input", capabilities.audio_input},
+            {"audio_output", capabilities.audio_output},
+            {"full_duplex", capabilities.full_duplex},
+            {"mtp", capabilities.mtp},
         }},
     };
 }

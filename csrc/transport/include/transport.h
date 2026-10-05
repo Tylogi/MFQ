@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine.h"
+#include "mfq/engine.h"
 #include "scheduler.h"
 
 #include <cstdint>
@@ -56,7 +56,7 @@ struct MfqRuntimeTransportConfig {
     int64_t max_context = 0;
     int64_t context_capacity = 0;
     int64_t vocab_size = 0;
-    MfqModelCapabilities model_capabilities;
+    mfq::engine::ModelCapabilities model_capabilities;
     MfqRuntimeProfile runtime_profile;
 };
 

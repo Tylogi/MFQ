@@ -147,6 +147,24 @@ int drain(const std::shared_ptr<MfqScheduledRequest>& handle, bool cancelled = f
     assert(handle->wait().empty());
     return terminals;
 }
+void test_model_capabilities() {
+    ModelCapabilities capabilities;
+    capabilities.family = "test-family";
+    capabilities.image_input = true;
+    capabilities.audio_output = true;
+    capabilities.mtp = true;
+    capabilities.source = "engine-test";
+    const auto value =
+        mfq::transport_detail::model_capability_profile_json(capabilities);
+    assert(value["architecture_family"] == "test-family");
+    assert(value["source"] == "engine-test");
+    assert(value["features"]["text"] == true);
+    assert(value["features"]["image_input"] == true);
+    assert(value["features"]["audio_output"] == true);
+    assert(value["features"]["mtp"] == true);
+    assert(value["features"]["video_input"] == false);
+}
+
 void test_decode_timing() {
     const auto now = InferenceMetrics::Clock::now();
     InferenceMetrics metrics;
@@ -276,6 +294,7 @@ int main(int argc, char** argv) {
     }
     check_duplex_preemption();
     check_input_ownership_and_budget();
+    test_model_capabilities();
     test_decode_timing();
     {
         FakeEngine engine;

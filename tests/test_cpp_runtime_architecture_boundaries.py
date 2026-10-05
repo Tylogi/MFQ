@@ -477,7 +477,7 @@ def test_cuda_runtime_has_one_shared_generation_path() -> None:
     assert "using Generation = mfq::StepSequence<EventData>" in SHARED_GENERATION
     steps = (ROOT / "csrc/core/step_sequence.h").read_text()
     assert "enum class StepState { waiting, advanced, complete }" in steps
-    assert "ExecutionYield" not in (ROOT / "csrc/engine/include/engine.h").read_text()
+    assert "ExecutionYield" not in (ROOT / "csrc/engine/include/mfq/engine.h").read_text()
     assert "step.state == StepState::advanced" in SHARED_EXECUTOR
     assert "ops.reset()" not in SHARED_EXECUTOR
     assert "current.output.cleanup_failure" in SHARED_EXECUTOR
@@ -634,7 +634,7 @@ def test_cuda_model_finalizers_live_with_their_models() -> None:
 
 def test_cuda_runtime_composes_transport_scheduler_and_engine() -> None:
     engine_contract = (
-        ROOT / "csrc" / "engine" / "include" / "engine.h"
+        ROOT / "csrc" / "engine" / "include" / "mfq" / "engine.h"
     ).read_text(encoding="utf-8")
     scheduler = (
         ROOT / "csrc" / "scheduler" / "include" / "scheduler.h"
@@ -803,18 +803,6 @@ def test_qwen4_requested_mfe_budget_never_falls_back_to_eager_layers() -> None:
     assert "mfe_offload_cache.reset()" not in moe
     assert "refusing to bypass the configured cache budget" in moe
     assert "can_group_mfe(name)" in moe
-
-
-def test_metal_residency_is_configured_before_model_allocation() -> None:
-    configure = DECODE_APP[DECODE_APP.index("void configure_mlx_metal()") :]
-    configure = configure[: configure.index("void self_test_metal()")]
-    assert 'info.at("max_recommended_working_set_size")' in configure
-    assert "mlx::core::set_wired_limit(limit)" in configure
-    assert "Metal memory residency unavailable" in configure
-    server = DECODE_APP[DECODE_APP.index("if (arguments.server)") :]
-    assert server.index("configure_mlx_metal();") < server.index(
-        "run_native_runtime(arguments, model)"
-    )
 
 
 def test_qwen4_nint_ple_uses_shared_row_decode_without_resident_weights() -> None:

@@ -6,7 +6,9 @@
 #include <optional>
 #include <variant>
 
-struct MfqModelCapabilities {
+namespace mfq::engine {
+
+struct ModelCapabilities {
     std::string family = "unknown";
     bool text = true;
     bool image_input = false;
@@ -17,8 +19,6 @@ struct MfqModelCapabilities {
     bool mtp = false;
     std::string source;
 };
-
-namespace mfq::engine {
 
 using RequestId = std::string;
 using Clock = std::chrono::steady_clock;
@@ -57,7 +57,7 @@ struct EngineInfo {
     bool multimodal = false, duplex = false, reload = false;
     ChatTemplateCapabilities chat;
     std::string model_type;
-    MfqModelCapabilities capabilities;
+    ModelCapabilities capabilities;
 };
 struct EngineStatus {
     std::size_t available = 0;

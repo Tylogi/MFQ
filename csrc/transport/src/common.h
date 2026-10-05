@@ -44,7 +44,6 @@ using RequestInput = mfq::engine::InferenceInput;
 using RequestMetrics = mfq::engine::InferenceMetrics;
 using CompletionResult = mfq::engine::InferenceResult;
 
-using MfqModelCapabilityProfile = MfqModelCapabilities;
 
 struct RequestMetricValues {
     size_t prefill_tokens = 0;
@@ -120,7 +119,7 @@ MfqSamplingParams default_sampling_params(
     const MfqRuntimeTransportConfig & config);
 json sampling_params_json(const MfqSamplingParams & sampling);
 json model_capability_profile_json(
-    const MfqModelCapabilityProfile & profile);
+    const mfq::engine::ModelCapabilities& capabilities);
 json duplex_profile_json(const MfqDuplexSamplingProfile & value);
 json tts_profile_json(const MfqTtsSamplingProfile & value);
 json chat_template_capabilities_json(
