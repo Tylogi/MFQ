@@ -813,6 +813,39 @@ varies from 73.19 to 59.20 ms despite identical bytes, so the trace's
 1.981-to-1.941 s span change cannot all be attributed to pool filtering.
 The profiled run also produces the same 512 IDs.
 
+## Fuse gated-residual activation and stream collapse (2026-10-05)
+
+Metal's gated-residual implementation combines projection activation and
+stream collapse. CUDA now similarly combines F32 down-projection division,
+sigmoid and multiply; injection division, sigmoid and scaling; and mixing
+sigmoid, normalized-input multiplication and the stream mean. Matmul is
+unchanged. The mean preserves the original stream order and separately
+rounded products. F16/BF16 projection outputs retain the original operations.
+
+The native regression compares all three outputs against the unfused
+expression for F16/BF16/F32 inputs, prepared/unprepared weights, hidden
+7/2560, streams 1/3/4, and compact single-token/strided 23-token inputs.
+All 72 cases are byte equal. The real-model trace also matches all 51 stages
+and 17,310,720 F32 values byte for byte. All 512 generated IDs match, without
+EOS; all 55 CTest checks and 19 CUDA graph source checks pass.
+
+In the same late-32-step profile, kernels fall from 244,016 to 225,424
+(-18,592), and allocations/frees each fall from 198,688 to 180,096.
+The new fused kernels take 12.41 ms in 9,280 calls. Whole-kernel time falls
+from 1.1091 to 1.0904 s, launch API time from 487.94 to 467.15 ms, and
+allocation/free API time from 175.87 to 162.31 ms. The captured span changes
+from 1.941 to 1.925 s, with identical 785,480,256 H2D bytes. Event wait time
+increases from 261.92 to 282.40 ms; changes in these overlapping timers do
+not individually establish a speed gain. The profiled run's 512 IDs match.
+
+The unprofiled 512-token run takes 31.217 s for 511 decode steps
+(16.370 tokens/s), with four windows at 14.151, 15.962, 17.651 and
+18.405 tokens/s. The previous run gives 16.193 overall and 18.524 in its
+last window, so the wall-time evidence does not establish a stable
+throughput percentage. Load takes 132.416 s, prefill 6.242 s, peak RSS
+24.80 GiB and anonymous RSS 2.03 GiB. Cache counters, expert residency,
+H2D traffic and staging budgets are unchanged.
+
 ## Tensor and expert parallel execution
 
 The native runtime accepts either a rank count or an ordered CUDA device list.

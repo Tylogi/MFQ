@@ -10,8 +10,35 @@ namespace mfq_qwen4_exp {
 namespace tb = mfq_tensor_backend;
 using tb::Tensor;
 
-#ifdef MFQ_NATIVE_CUDA_RUNTIME
 namespace {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+template <bool Injection>
+__global__ void gated_projection_activation_kernel(const float* projection, float* output,
+    int64_t count, float streams) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < count; i += int64_t(gridDim.x) * blockDim.x) {
+        const float value = projection[i] / streams;
+        const float gate = 1.0f / (1.0f + expf(-value));
+        output[i] = __fmul_rn(Injection ? 2.0f : value, gate);
+    }
+}
+
+template <typename Normalized>
+__global__ void gated_stream_mean_kernel(const float* projection, const Normalized* normalized,
+    float* output, int64_t count, int64_t hidden, int64_t streams) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < count; i += int64_t(gridDim.x) * blockDim.x) {
+        float sum = 0.0f;
+        for (int64_t stream = 0; stream < streams; ++stream) {
+            const int64_t index = (i / hidden * streams + stream) * hidden + i % hidden;
+            const float gate = 1.0f / (1.0f + expf(-projection[index]));
+            // Keep native mean's serial order and separately rounded product.
+            sum = __fadd_rn(sum, __fmul_rn(gate, float(normalized[index])));
+        }
+        output[i] = sum / float(streams);
+    }
+}
+
 template <typename Branch>
 __global__ void gated_residual_post_kernel(const Branch* branch, const float* residual,
     const float* injection, float* output, int64_t count, int64_t hidden, int64_t streams) {
@@ -54,8 +81,55 @@ __global__ void grouped_rms_norm_kernel(const float* input, const float* weight,
             __fadd_rn(1.0f, weight[(base + i) % width]));
     }
 }
-} // namespace
 #endif
+
+template <bool Injection>
+Tensor gated_projection_activation(const Tensor& projection, int64_t streams) {
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    if (projection.scalar_type() == tb::kFloat32 && double(float(streams)) == double(streams)) {
+        auto source = projection.contiguous();
+        auto output = tb::empty(source.sizes(), source.options());
+        if (output.numel()) {
+            const auto blocks = unsigned(std::min<int64_t>((output.numel() + 255) / 256, 65535));
+            gated_projection_activation_kernel<Injection><<<blocks, 256, 0, mfq_current_cuda_stream()>>>(
+                source.data_ptr<float>(), output.data_ptr<float>(), output.numel(), float(streams));
+            MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+        return output;
+    }
+#endif
+    auto scaled = projection / streams;
+    return Injection ? 2.0 * tb::sigmoid(scaled) : scaled * tb::sigmoid(scaled);
+}
+
+Tensor gated_stream_mean(const Tensor& projection, const Tensor& normalized,
+    int64_t hidden, int64_t streams) {
+    auto shape = normalized.sizes().vec();
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    if (projection.scalar_type() == tb::kFloat32) {
+        auto source = projection.contiguous(), value = normalized.contiguous();
+        shape.back() = hidden;
+        auto output = tb::empty(shape, source.options());
+        if (output.numel()) {
+            const auto blocks = unsigned(std::min<int64_t>((output.numel() + 255) / 256, 65535));
+            const auto launch = [&]<typename Normalized>() {
+                gated_stream_mean_kernel<Normalized><<<blocks, 256, 0, mfq_current_cuda_stream()>>>(
+                    source.data_ptr<float>(), value.data_ptr<Normalized>(), output.data_ptr<float>(),
+                    output.numel(), hidden, streams);
+            };
+            if (normalized.scalar_type() == tb::kFloat32) launch.template operator()<float>();
+            else if (normalized.scalar_type() == tb::kFloat16) launch.template operator()<__half>();
+            else launch.template operator()<__nv_bfloat16>();
+            MFQ_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+        return output;
+    }
+#endif
+    shape.back() = streams;
+    shape.push_back(hidden);
+    return (tb::sigmoid(projection).reshape(shape) * normalized.reshape(shape)).mean(-2);
+}
+} // namespace
 
 Tensor grouped_rms_norm(const Tensor& value, const Tensor& weight,
                         int64_t group, double eps) {
@@ -110,15 +184,13 @@ std::vector<Tensor> gated_residual_pre(
     }
     MfqCudaGuard guard(input.device());
     auto normalized = grouped_rms_norm(input, norm, hidden, eps);
-    auto low = mfq_selected_attention::promoted_matmul(normalized, down.transpose(-1, -2)) / streams;
-    low = low * tb::sigmoid(low);
-    auto mixing = tb::sigmoid(mfq_selected_attention::promoted_matmul(low, up.transpose(-1, -2)));
-    auto shape = input.sizes().vec();
-    shape.back() = streams;
-    shape.push_back(hidden);
-    auto mixed = (mixing.reshape(shape) * normalized.reshape(shape)).mean(-2);
+    auto low = gated_projection_activation<false>(
+        mfq_selected_attention::promoted_matmul(normalized, down.transpose(-1, -2)), streams);
+    auto mixed = gated_stream_mean(
+        mfq_selected_attention::promoted_matmul(low, up.transpose(-1, -2)), normalized, hidden, streams);
     auto injection = inject
-        ? 2.0 * tb::sigmoid(mfq_selected_attention::promoted_matmul(normalized, inject->transpose(-1, -2)) / streams)
+        ? gated_projection_activation<true>(
+            mfq_selected_attention::promoted_matmul(normalized, inject->transpose(-1, -2)), streams)
         : Tensor{};
     return {mixed, input, injection};
 }

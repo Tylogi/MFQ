@@ -102,7 +102,23 @@ void check_gated_residual_post() {
     }
 }
 
-void check_prepared_residual_weights() {
+std::vector<Tensor> unfused_gated_residual_pre(const Tensor& input, const Tensor& norm,
+    const Tensor& down, const Tensor& up, const Tensor& injection, int hidden, int streams) {
+    auto project = [](const Tensor& value, const Tensor& weight) {
+        auto dtype = value.scalar_type() == weight.scalar_type() ? value.scalar_type() : kFloat32;
+        return matmul(value.to(dtype), weight.transpose(-1, -2).to(dtype));
+    };
+    auto normalized = mfq_qwen4_exp::grouped_rms_norm(input, norm, hidden, 1e-6);
+    auto low = project(normalized, down) / streams;
+    low = low * sigmoid(low);
+    auto shape = input.sizes().vec();
+    shape.back() = streams;
+    shape.push_back(hidden);
+    auto mixed = (sigmoid(project(low, up)).reshape(shape) * normalized.reshape(shape)).mean(-2);
+    return {mixed, input, 2.0 * sigmoid(project(normalized, injection) / streams)};
+}
+
+void check_gated_residual_pre() {
     const Device gpu{DeviceType::cuda, 0};
     auto pattern = [gpu](std::vector<int64_t> shape, ScalarType dtype) {
         int64_t count = 1;
@@ -112,10 +128,12 @@ void check_prepared_residual_weights() {
             values[i] = (int(i * 17 % 257) - 128) / 127.0f;
         return tensor(values).to(gpu, dtype).reshape(shape);
     };
-    for (auto dtype : {kFloat16, kFloat32})
-    for (int hidden : {7, 2560}) for (int tokens : {1, 23}) {
-        constexpr int streams = 4, rank = 320;
+    for (auto dtype : {kFloat16, kBFloat16, kFloat32})
+    for (int hidden : {7, 2560}) for (int tokens : {1, 23})
+    for (int streams : {1, 3, 4}) for (bool prepared : {false, true}) {
+        constexpr int rank = 320;
         auto input = pattern({1, tokens, streams * hidden}, dtype);
+        if (tokens > 1) input = input.transpose(-1, -2).contiguous().transpose(-1, -2);
         auto norm = pattern({streams * hidden}, kFloat32);
         auto down = pattern({rank, streams * hidden}, kBFloat16);
         auto up = pattern({streams * hidden, rank}, kBFloat16);
@@ -123,15 +141,20 @@ void check_prepared_residual_weights() {
         auto prepare = [](const Tensor& value) {
             return value.transpose(-1, -2).to(kFloat32).transpose(-1, -2);
         };
-        auto expected = mfq_qwen4_exp::gated_residual_pre(
-            input, norm, down, up, injection, hidden, streams, 1e-6);
+        // Main F16/F32 inputs must also preserve the unprepared weight result.
+        auto expected = unfused_gated_residual_pre(
+            input, norm, prepared && dtype == kBFloat16 ? prepare(down) : down,
+            prepared && dtype == kBFloat16 ? prepare(up) : up,
+            prepared && dtype == kBFloat16 ? prepare(injection) : injection, hidden, streams);
         auto actual = mfq_qwen4_exp::gated_residual_pre(
-            input, norm, prepare(down), prepare(up), prepare(injection), hidden, streams, 1e-6);
+            input, norm, prepared ? prepare(down) : down, prepared ? prepare(up) : up,
+            prepared ? prepare(injection) : injection, hidden, streams, 1e-6);
         for (size_t i = 0; i < expected.size(); ++i) {
-            auto a = actual[i].cpu(), b = expected[i].cpu();
+            auto a = actual[i].contiguous().cpu(), b = expected[i].contiguous().cpu();
             MFQ_RUNTIME_CHECK(a.scalar_type() == b.scalar_type() && a.nbytes() == b.nbytes() &&
                 std::memcmp(a.data_ptr(), b.data_ptr(), a.nbytes()) == 0,
-                "prepared Qwen residual weights changed projection output bits");
+                "Qwen residual pre output bits changed: dtype=", int(dtype),
+                " streams=", streams, " tokens=", tokens, " output=", i);
         }
     }
 }
@@ -507,7 +530,7 @@ int main(int argc, char** argv) {
             check_qwen_moe_topk();
             check_grouped_rms_norm();
             check_gated_residual_post();
-            check_prepared_residual_weights();
+            check_gated_residual_pre();
             std::cout << "Flash-Next and shared sparse-attention native smoke passed\n";
             return 0;
         }
