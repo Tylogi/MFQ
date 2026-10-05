@@ -20,11 +20,12 @@ int main(int argc, char** argv) try {
     auto source = mfq::open_model_source(argv[1]);
     CudaExecutionContext execution;
     auto resident = load_mfe_gpu(execution, *source, argv[2]);
-    MfeWeight cached;
+    weight_loader::Routed cached;
     if (!execution.config.moe_ssd_cache_dir.empty()) {
         execution.moe_expert_cache = make_moe_expert_cache(512 * 1024 * 1024, execution.config);
         weight_loader::validate_load_options(execution);
-        cached = load_mfe_gpu(execution, *source, argv[2], true, 0, "diagnostic");
+        cached = weight_loader::routed(execution, *source, argv[2], 0,
+            resident.n_experts, resident.out_per_expert, resident.neuron_len, "diagnostic");
         finalize_moe_expert_cache(execution.moe_expert_cache);
     }
     const Device gpu{DeviceType::cuda, 0};
@@ -46,9 +47,13 @@ int main(int argc, char** argv) try {
             execution.force_moe_pool_path = true;
             auto expected = resident.forward(execution, x, route).cpu();
             execution.force_moe_pool_path = false;
-            for (const auto* weight : {&resident, &cached}) {
-                if (weight->n_experts == 0) continue;
-                auto result = weight->forward(execution, x, route);
+            for (bool use_cache : {false, true}) {
+                if (use_cache && !cached) continue;
+                auto result = use_cache ? cached(execution, x, route)
+                                        : resident.forward(execution, x, route);
+                if (use_cache)
+                    MFQ_RUNTIME_CHECK(route.host_unique_experts,
+                        "cached projection did not reuse its caller's route plan");
                 MFQ_RUNTIME_CHECK(isfinite(result).all().item<bool>(), "non-finite MFE output");
                 auto actual = result.cpu();
                 MFQ_RUNTIME_CHECK(actual.sizes() == expected.sizes() &&

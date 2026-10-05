@@ -147,7 +147,8 @@ Routed routed(CudaExecutionContext& execution, const mfq::ModelSource& file, con
         auto w=dense(execution,file,name);
         MFQ_RUNTIME_CHECK(w.sizes().vec()==std::vector<int64_t>({experts,output,input}),
             "dense expert tensor shape mismatch: ",name);
-        return [w,output,input](CudaExecutionContext&, const Tensor& x,const Tensor& ids) {
+        return [w,output,input](CudaExecutionContext&, const Tensor& x,const MoeRoutePlan& route) {
+            const auto& ids=route.ids;
             const auto rows=ids.size(0), routes=ids.size(1);
             auto selected=w.index_select(0,ids.reshape({-1}).to(tb::kInt64)).reshape({rows,routes,output,input});
             auto source=x.dim()==2 ? x.unsqueeze(1).expand({rows,routes,input}) : x;
@@ -157,8 +158,7 @@ Routed routed(CudaExecutionContext& execution, const mfq::ModelSource& file, con
     auto w=std::make_shared<MfeWeight>(load_mfe_gpu(execution, file,name,true,layer,role));
     MFQ_RUNTIME_CHECK(w->n_experts==experts && w->out_per_expert==output && w->neuron_len==input,
         "routed tensor shape mismatch: ",name);
-    return [w,experts](CudaExecutionContext& execution, const Tensor& x,const Tensor& ids) {
-        auto route=build_moe_route_plan(ids.to(tb::kInt32).contiguous(),int(experts));
+    return [w](CudaExecutionContext& execution, const Tensor& x,const MoeRoutePlan& route) {
         return w->forward(execution,x.contiguous(),route);
     };
 }
@@ -172,8 +172,8 @@ Routed routed_gate_up(CudaExecutionContext& execution, const mfq::ModelSource& f
     if (!has_gate) return routed(execution,file,base+".gate_up.weight",layer,experts,2*width,input,role);
     auto gate=routed(execution,file,gate_name,layer,experts,width,input,role);
     auto up=routed(execution,file,up_name,layer,experts,width,input,role);
-    return [gate=std::move(gate),up=std::move(up)](CudaExecutionContext& execution, const Tensor& x,const Tensor& ids) {
-        return tb::cat({gate(execution,x,ids),up(execution,x,ids)},-1);
+    return [gate=std::move(gate),up=std::move(up)](CudaExecutionContext& execution, const Tensor& x,const MoeRoutePlan& route) {
+        return tb::cat({gate(execution,x,route),up(execution,x,route)},-1);
     };
 }
 

@@ -98,7 +98,7 @@ mfq_tensor_backend::Tensor materialize_mfe_dense(
 namespace mfq::cuda::weight_loader {
 using Tensor = mfq_tensor_backend::Tensor;
 using Linear = std::function<Tensor(CudaExecutionContext&, const Tensor&)>;
-using Routed = std::function<Tensor(CudaExecutionContext&, const Tensor&, const Tensor&)>;
+using Routed = std::function<Tensor(CudaExecutionContext&, const Tensor&, const MoeRoutePlan&)>;
 
 Linear linear(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name);
 

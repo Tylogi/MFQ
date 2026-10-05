@@ -56,14 +56,15 @@ static Linear qwen_moe(weight_loader::Routed gate_up, weight_loader::Routed down
                        shared_output;
             },
             [&](const auto &selected) {
+                const auto route = build_moe_route_plan(selected[0], int(c.experts));
                 return mfq::models::routed_experts(
-                    [&] { return gate_up(execution, source, selected[0]); },
+                    [&] { return gate_up(execution, source, route); },
                     [&](Tensor gu) {
                         auto gate = gu.narrow(-1, 0, c.moe_width),
                              up = gu.narrow(-1, c.moe_width, c.moe_width);
                         return (gate * tb::sigmoid(gate)) * up;
                     },
-                    [&](Tensor hidden) { return down(execution, hidden, selected[0]); },
+                    [&](Tensor hidden) { return down(execution, hidden, route); },
                     [&](Tensor pairs) {
                         if (pairs.scalar_type() == tb::kFloat16)
                             return moe_weighted_reduce_cuda(pairs, selected[1], /*round_product=*/true);

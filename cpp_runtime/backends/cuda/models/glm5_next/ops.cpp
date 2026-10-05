@@ -17,7 +17,8 @@ static Linear headwise(weight_loader::Routed projection,int64_t heads,int64_t ou
         MFQ_RUNTIME_CHECK(x.dim()==4 && x.size(2)==heads,"GLM head-wise projection shape mismatch");
         const auto b=x.size(0),t=x.size(1),rows=b*t*heads;
         auto ids=tb::arange(rows,x.options().dtype(tb::kInt32)).remainder(heads).reshape({rows,1});
-        return projection(execution,x.reshape({rows,x.size(-1)}),ids).reshape({b,t,heads,output});
+        const auto route=build_moe_route_plan(ids,int(heads));
+        return projection(execution,x.reshape({rows,x.size(-1)}),route).reshape({b,t,heads,output});
     };
 }
 
@@ -56,8 +57,9 @@ static Linear glm_moe(weight_loader::Routed gate_up, weight_loader::Routed down,
             },
             [&](const auto &) { return shared(execution, source); },
             [&](const auto &selected) {
+                const auto route = build_moe_route_plan(selected[0], int(c.experts));
                 return mfq::models::routed_experts(
-                    [&] { return gate_up(execution, source, selected[0]); },
+                    [&] { return gate_up(execution, source, route); },
                     [&](Tensor gu) {
                         auto gate =
                             tb::clamp_max(gu.narrow(-1, 0, c.moe_intermediate), c.swiglu_limit);
@@ -65,7 +67,7 @@ static Linear glm_moe(weight_loader::Routed gate_up, weight_loader::Routed down,
                                             -c.swiglu_limit, c.swiglu_limit);
                         return (gate * tb::sigmoid(gate)) * up;
                     },
-                    [&](Tensor hidden) { return down(execution, hidden, selected[0]); },
+                    [&](Tensor hidden) { return down(execution, hidden, route); },
                     [&](Tensor pairs) {
                         auto reduced = tb::zeros({source.size(0), c.hidden},
                                                  source.options().dtype(tb::kFloat32));
