@@ -8,8 +8,8 @@ DECODE = "\n".join(
     if path.suffix in {".h", ".cpp"}
 )
 BATCHING = "\n".join(
-    (CUDA_ROOT / "engine" / name).read_text(encoding="utf-8")
-    for name in ("cuda_batching.h", "cuda_batching.cpp")
+    (CUDA_ROOT / "models/qwen35" / name).read_text(encoding="utf-8")
+    for name in ("batching.h", "batching.cpp")
 )
 BATCH_STATE = "\n".join(
     (CUDA_ROOT / "models" / "qwen35" / name).read_text(encoding="utf-8")
@@ -66,7 +66,7 @@ def test_continuous_batching_is_an_explicit_server_mode():
     assert "QwenBatchExecutor" not in BATCHING
     assert "ContinuousBatchingController" not in BATCHING
     assert "ContinuousBatchQueue" not in BATCHING
-    assert "std::thread" not in (CUDA_ROOT / "engine/cuda_batching.cpp").read_text()
+    assert "std::thread" not in (CUDA_ROOT / "models/qwen35/batching.cpp").read_text()
     assert "engine_.step(eligible)" in SCHEDULER
     assert "worker_" not in BATCHING
     assert "queue_" not in BATCHING
@@ -85,7 +85,7 @@ def test_cuda_server_prefill_is_bounded_for_serial_mtp_and_batched_paths():
     assert "operations.prefill(request, chunk)" in BATCHING
     assert "schedule_prefill(PrefillChunk chunk)" in BATCHING
     assert "request->prefill_offset = chunk.offset + chunk.count" in SHARED_ENGINE
-    assert "request->prefill_offset =" not in (CUDA_ROOT / "engine/cuda_batching.cpp").read_text()
+    assert "request->prefill_offset =" not in (CUDA_ROOT / "models/qwen35/batching.cpp").read_text()
     assert "next_prefill_chunk(" in BATCHING
     assert "work.prefill" in BATCHING
     assert "continuous_batching_prefill_chunks" in BATCHING
@@ -100,7 +100,7 @@ def test_scheduler_supports_dynamic_join_retire_and_per_request_sampling():
     assert "state_adapter_.activate(" in BATCHING
     assert "state_adapter_.resume_decode(" in BATCHING
     assert "model_.cache_pos =" not in BATCHING
-    assert "slots_" not in (CUDA_ROOT / "engine/cuda_batching.cpp").read_text()
+    assert "slots_" not in (CUDA_ROOT / "models/qwen35/batching.cpp").read_text()
     for operation in (
         "Qwen35BatchStateAdapter::take(",
         "Qwen35BatchStateAdapter::restore(",

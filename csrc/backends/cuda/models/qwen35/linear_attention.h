@@ -57,6 +57,8 @@ struct LinearAttentionBlock final : ::Block {
   int64_t speculative_ffn_batches = 0;
   int64_t speculative_projection_batches = 0;
 
+  void plan_resources(mfq::cuda::CudaResourcePlan&,
+      const mfq::models::CausalLmMetadata&, bool batch) const override;
   bool supports_speculation() const noexcept override { return true; }
   std::vector<mfq_tensor_backend::Tensor*> graph_warmup_state() override {
     MFQ_RUNTIME_CHECK(!state->speculative_pending && state->conv_state.defined() && state->gdn_state.defined(),

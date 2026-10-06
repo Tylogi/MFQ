@@ -6,6 +6,8 @@
 #include <vector>
 
 struct CudaExecutionContext;
+namespace mfq::cuda { struct CudaResourcePlan; }
+namespace mfq::models { struct CausalLmMetadata; }
 
 mfq_tensor_backend::Tensor qwen_rms_norm(
     mfq_tensor_backend::Tensor x,
@@ -38,6 +40,8 @@ struct Block {
     bool cpu_offloaded = false;
 
     virtual ~Block() = default;
+    virtual void plan_resources(mfq::cuda::CudaResourcePlan&,
+        const mfq::models::CausalLmMetadata&, bool batch) const;
     virtual void reset(int64_t batch) = 0;
     virtual void set_token_ids(const mfq_tensor_backend::Tensor&) {}
     virtual bool supports_speculation() const noexcept { return false; }

@@ -483,6 +483,58 @@ static void check_linear_execution() {
     }
 }
 
+static void check_resource_plans() {
+    CudaExecutionContext execution;
+    Qwen35CausalLm model; model.execution = &execution;
+    model.metadata.max_position_embeddings = 64;
+    model.metadata.hidden_size = 16;
+    model.metadata.vocab_size = 128;
+    auto full = std::make_unique<FullBlock>();
+    full->cuda_device = 1; full->attention_heads = 4;
+    full->kv_heads = 2; full->attention_head_dim = 8;
+    model.blocks.push_back(std::move(full));
+    auto linear = std::make_unique<qwen35::LinearAttentionBlock>();
+    linear->cuda_device = 1;
+    auto& c = linear->qwen_config;
+    c.linear_conv_kernel_dim = 3; c.linear_num_key_heads = 1;
+    c.linear_key_head_dim = 2; c.linear_num_value_heads = 2; c.linear_value_head_dim = 3;
+    model.blocks.push_back(std::move(linear));
+    auto offloaded = std::make_unique<FullBlock>();
+    offloaded->cpu_offloaded = true;
+    model.blocks.push_back(std::move(offloaded));
+    const auto serial = model.adapter_resource_plan(model.blocks, false, 2, nullptr);
+    const auto batch = model.adapter_resource_plan(model.blocks, true, 2, nullptr);
+    check(serial.request_bytes == std::vector<std::size_t>{1024, 212680} &&
+          serial.snapshot_bytes == 212680 / 3, "serial family resource plan changed");
+    check(batch.request_bytes == std::vector<std::size_t>{1024, 305760} &&
+          batch.snapshot_bytes == 305760 / 4, "batch family resource plan changed");
+    Qwen35Mtp predictor;
+    auto draft = std::make_unique<FullBlock>();
+    draft->cuda_device = 1; draft->kv_heads = 2; draft->attention_head_dim = 8;
+    predictor.blocks.push_back(std::move(draft));
+    const auto speculative = model.adapter_resource_plan(model.blocks, false, 2, &predictor);
+    check(speculative.request_bytes[1] == serial.request_bytes[1] + 208896 &&
+          speculative.snapshot_bytes == serial.snapshot_bytes, "predictor plan lost its state budget");
+    CudaResourcePlan overflow(1);
+    overflow.add(0, {std::size_t(-1)});
+    for (bool multiply : {false, true}) {
+        bool rejected = false;
+        try { overflow.add(0, multiply ? std::initializer_list<std::size_t>{std::size_t(-1), 2}
+                                      : std::initializer_list<std::size_t>{1}); }
+        catch (const mfq::engine::ResourceExhausted&) { rejected = true; }
+        check(rejected && overflow.request_bytes[0] == std::size_t(-1), "resource overflow mutated the plan");
+    }
+    TextSessionCache cache({}, {});
+    mfq::engine::InferenceRequest request;
+    request.sampling.enable_mtp = false;
+    check(!model.adapter_owns_generation(request, cache, true), "ordinary text bypassed physical batching");
+    request.sampling.enable_mtp = true;
+    check(model.adapter_owns_generation(request, cache, true) &&
+          !model.adapter_owns_generation(request, cache, false), "MTP compatibility ignored predictor availability");
+    request.cache_plan.session_id = "session";
+    check(model.adapter_owns_generation(request, cache, false), "session state entered an ordinary batch");
+}
+
 static void check_batch_state_ownership() {
     CudaExecutionContext execution;
     CudaExecutionScope scope(execution);
@@ -511,35 +563,37 @@ static void check_batch_state_ownership() {
     auto linear = std::make_unique<qwen35::LinearAttentionBlock>();
     auto *recurrent = linear.get();
     model.blocks.push_back(std::move(linear));
-    auto owned = qwen35::QwenBatchState::empty(model);
-    const auto original = full->state;
-    owned.swap(model);
-    model.cache_pos = 7; model.decode_position_delta = 11; model.speculative_start = 6;
-    recurrent->state->speculative_pending = true;
-    const auto speculative = recurrent->state;
-    owned.swap(model);
-    check(full->state == original && model.cache_pos == 0 && model.speculative_start == -1 &&
-        !recurrent->state->speculative_pending, "suspended request leaked speculative metadata");
-    owned.swap(model);
-    check(model.cache_pos == 7 && model.decode_position_delta == 11 && model.speculative_start == 6 &&
-        recurrent->state == speculative && recurrent->state->speculative_pending,
-        "request binding lost speculative state");
-    owned.swap(model);
     Qwen35Mtp predictor;
     predictor.blocks.push_back(std::make_unique<FullBlock>());
-    Qwen35Mtp::RequestState predictor_state(predictor);
-    auto *predictor_block = static_cast<FullBlock *>(predictor.blocks[0].get());
-    const auto original_predictor = predictor_block->state;
-    predictor_state.swap(predictor);
-    predictor.cache_pos = 9; predictor.last_accepted = 3;
-    predictor_block->state->cache = KVCache(1, 1, 16, 4);
-    const auto request_predictor = predictor_block->state;
-    predictor_state.swap(predictor);
-    check(predictor.cache_pos == 0 && predictor.last_accepted == 0 &&
-        predictor_block->state == original_predictor, "predictor request state leaked");
-    predictor_state.swap(predictor);
-    check(predictor.cache_pos == 9 && predictor.last_accepted == 3 &&
-        predictor_block->state == request_predictor, "predictor request state was lost");
+    auto* predictor_block = static_cast<FullBlock*>(predictor.blocks[0].get());
+    const auto original = full->state, original_predictor = predictor_block->state;
+    auto owned = model.adapter_request_state(model, &predictor);
+    std::shared_ptr<qwen35::LinearAttentionState> speculative;
+    std::shared_ptr<FullAttentionState> request_predictor;
+    {
+        auto binding = owned.bind();
+        model.cache_pos = 7; model.decode_position_delta = 11; model.speculative_start = 6;
+        recurrent->state->speculative_pending = true;
+        speculative = recurrent->state;
+        predictor.cache_pos = 9; predictor.last_accepted = 3;
+        predictor_block->state->cache = KVCache(1, 1, 16, 4);
+        request_predictor = predictor_block->state;
+    }
+    check(full->state == original && model.cache_pos == 0 && model.speculative_start == -1 &&
+        !recurrent->state->speculative_pending && predictor.cache_pos == 0 &&
+        predictor.last_accepted == 0 && predictor_block->state == original_predictor,
+        "suspended family request leaked native state");
+    struct Abort {};
+    try {
+        auto binding = owned.bind();
+        check(model.cache_pos == 7 && model.decode_position_delta == 11 && model.speculative_start == 6 &&
+            recurrent->state == speculative && recurrent->state->speculative_pending &&
+            predictor.cache_pos == 9 && predictor.last_accepted == 3 && predictor_block->state == request_predictor,
+            "family request binding lost speculative/predictor state");
+        throw Abort{};
+    } catch (const Abort&) {}
+    check(full->state == original && model.cache_pos == 0 && predictor.cache_pos == 0 &&
+        predictor_block->state == original_predictor, "failed request left native state bound");
 }
 
 static void check_snapshots(CudaExecutionContext& execution, bool hybrid) {
@@ -886,6 +940,7 @@ static void check_batching(const char* model_path, const char* tokenizer) {
 int main(int argc, char** argv) try {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
+    check_resource_plans();
     check_sampling_storage();
     check_batch_state_ownership();
     check_linear_execution();

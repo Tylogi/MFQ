@@ -5,6 +5,8 @@
 #include "models/common/runtime_components.h"
 #include "mtp.h"
 #include "linear_attention.h"
+#include "batching.h"
+#include "storage/text_session_cache.h"
 
 #include "models/common/transformer_loader.h"
 
@@ -98,6 +100,16 @@ std::unique_ptr<::Block> load_block(CudaExecutionContext &execution, const mfq::
                                     std::string_view tensor_root) {
     BlockLoader loader{{execution, source}};
     return mfq::models::qwen35::load_block(loader, config, layer, type, tensor_root);
+}
+
+void LinearAttentionBlock::plan_resources(CudaResourcePlan& plan,
+        const mfq::models::CausalLmMetadata&, bool batch) const {
+    const auto& c = qwen_config;
+    const std::size_t copies = batch ? 4 : 3;
+    plan.add(cuda_device, {copies, 4, std::size_t(c.linear_conv_kernel_dim - 1),
+        std::size_t(2 * c.linear_k_size() + c.linear_v_size())});
+    plan.add(cuda_device, {copies, 4, std::size_t(c.linear_num_value_heads),
+        std::size_t(c.linear_value_head_dim), std::size_t(c.linear_value_head_dim)});
 }
 
 void LinearAttentionBlock::clear_speculative() noexcept {
@@ -284,7 +296,35 @@ restore_text_session_state(std::vector<std::unique_ptr<::Block>> &blocks,
 
 } // namespace mfq::cuda::qwen35
 
+void Qwen35Mtp::plan_resources(mfq::cuda::CudaResourcePlan& plan,
+        const mfq::models::CausalLmMetadata& metadata) const {
+    for (const auto& block : blocks) {
+        const auto* full = dynamic_cast<const FullBlock*>(block.get());
+        MFQ_RUNTIME_CHECK(full, "Qwen predictor requires full attention state");
+        plan.add(block->cuda_device, {3, 2, 2,
+            std::size_t(metadata.max_position_embeddings) + 1024,
+            std::size_t(full->kv_heads), std::size_t(full->attention_head_dim)});
+    }
+}
+
 namespace mfq::cuda {
+
+std::unique_ptr<mfq::engine::ContinuousBatch<QwenBatchOperations>> Qwen35Model::adapter_create_batch(
+        Qwen35CausalLm& model, CudaExecutionContext& execution, std::size_t chunk,
+        const CudaContinuousBatchConfig& config) {
+    return std::make_unique<mfq::engine::ContinuousBatch<QwenBatchOperations>>(
+        chunk, config.prefill_token_budget, model, execution, config);
+}
+bool Qwen35Model::adapter_owns_generation(const mfq::engine::InferenceRequest& input,
+        const internal::TextSessionCache& cache, bool predictor) {
+    return input.vision || !input.cache_plan.session_id.empty() ||
+        (cache.persistent_prefix_enabled() && input.cache_plan.stable_prefix_tokens) ||
+        (input.sampling.enable_mtp && predictor);
+}
+qwen35::Qwen35GenerationState Qwen35Model::adapter_request_state(Qwen35CausalLm& model,
+        MtpModule* predictor) {
+    return qwen35::Qwen35GenerationState(model, predictor);
+}
 
 void Qwen35Model::adapter_validate_components(const mfq::ModelGraph &graph) const {
     if (graph.component("vision") != nullptr &&

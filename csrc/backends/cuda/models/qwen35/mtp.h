@@ -76,6 +76,9 @@ struct Qwen35Mtp final : MtpModule {
         return result;
     }
 
+    void plan_resources(mfq::cuda::CudaResourcePlan&,
+        const mfq::models::CausalLmMetadata&) const override;
+
     void reset(int64_t batch = 1) override {
         cache_pos = 0;
         for (auto &block : blocks)

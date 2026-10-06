@@ -3,6 +3,7 @@
 #include "../../ops/cuda_execution.h"
 #include "linear_attention.h"
 #include "ops.h"
+#include "mtp.h"
 #include "paged_kv.h"
 
 #include <limits>
@@ -15,6 +16,26 @@ using Tensor = mfq_tensor_backend::Tensor;
 using LinearBlock = LinearAttentionBlock;
 using mfq::cuda::continuous::QwenPagedKvArena;
 using mfq::cuda::continuous::QwenPagedKvSequence;
+
+struct Qwen35GenerationState::Impl {
+    Qwen35CausalLm& model;
+    QwenBatchState native;
+    Qwen35Mtp* predictor;
+    std::optional<Qwen35Mtp::RequestState> predictor_state;
+    Impl(Qwen35CausalLm& model, MtpModule* mtp)
+        : model(model), native(QwenBatchState::empty(model)),
+          predictor(dynamic_cast<Qwen35Mtp*>(mtp)) {
+        if (mtp && !predictor) throw std::invalid_argument("Qwen generation requires a Qwen predictor");
+        if (predictor) predictor_state.emplace(*predictor);
+    }
+};
+Qwen35GenerationState::Qwen35GenerationState(Qwen35CausalLm& model, MtpModule* mtp)
+    : state_(std::make_unique<Impl>(model, mtp)) {}
+Qwen35GenerationState::~Qwen35GenerationState() = default;
+void Qwen35GenerationState::swap() noexcept {
+    state_->native.swap(state_->model);
+    if (state_->predictor) state_->predictor_state->swap(*state_->predictor);
+}
 
 QwenBatchState QwenBatchState::empty(const Qwen35CausalLm &model) {
     QwenBatchState result;

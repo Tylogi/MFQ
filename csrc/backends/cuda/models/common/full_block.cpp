@@ -1,4 +1,6 @@
 #include "full_block.h"
+#include "resource_plan.h"
+#include "common/causal_metadata.h"
 #include "storage/session_state.h"
 #include "common/attention.h"
 #include "common/gated_mlp.h"
@@ -25,6 +27,21 @@ mfq_tensor_backend::Tensor Block::forward_context(CudaExecutionContext &executio
                       "block does not support speculative verification");
     return forward(execution, std::move(x), context.positions, context.cache_position,
                    context.sequence_lengths, rope, context.cache_positions, context.attention_mask);
+}
+
+void FullBlock::plan_resources(mfq::cuda::CudaResourcePlan& plan,
+        const mfq::models::CausalLmMetadata& metadata, bool batch) const {
+    const auto context = std::size_t(metadata.max_position_embeddings);
+    const auto capacity = sliding ? std::size_t(attention_window) : context;
+    const std::size_t graph_copies = batch ? 8 : 1;
+    // Dense/paged KV, snapshot/rollback, and packed batch state.
+    plan.add(cuda_device, {batch ? 4ULL : 3ULL, 2, 2, capacity + 1024,
+        std::size_t(kv_heads), std::size_t(attention_head_dim)});
+    // Split attention output and MMA metadata retained by graph buckets.
+    plan.add(cuda_device, {graph_copies, std::size_t(attention_heads), 16,
+        std::size_t(attention_head_dim + 2), 4});
+    plan.add(cuda_device, {graph_copies, std::size_t(kv_heads), (context + 63) / 64,
+        8, std::size_t(2 + attention_head_dim / 2), 8});
 }
 
 void FullBlock::reset(int64_t B) {

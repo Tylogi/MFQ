@@ -4,10 +4,12 @@
 
 #include "../cuda_model_plan.h"
 #include "models/common/block.h"
+#include "resource_plan.h"
 #include "mfq/model_source.h"
 #include "common/causal_model.h"
 #include "../../ops/quant_linear.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -18,6 +20,7 @@
 
 enum class TextSessionStateKind : int;
 struct TextSessionState;
+struct MtpModule;
 
 namespace mfq::models::qwen35 {
 template <class Backend> struct CausalLm;
@@ -56,6 +59,10 @@ Model load_causal_lm(CudaExecutionContext& execution, const std::string& model_p
     std::shared_ptr<const mfq::ModelSource> source = {});
 
 struct CausalResources {
+    static constexpr bool adapter_supports_batching = false;
+    using Batch = std::nullptr_t;
+    CudaResourcePlan adapter_resource_plan(const std::vector<std::unique_ptr<Block>>&,
+        bool batch, std::size_t devices, const MtpModule*) const;
     mfq::models::CausalLmMetadata metadata;
     CudaExecutionContext *execution = nullptr;
 

@@ -12,6 +12,7 @@
 
 struct CudaExecutionContext;
 struct FullAttentionState;
+struct MtpModule;
 
 namespace mfq::models::qwen35 {
 template <class Backend> struct CausalLm;
@@ -31,6 +32,26 @@ struct QwenPagedKvSequence {
 } // namespace mfq::cuda::continuous
 
 namespace mfq::cuda::qwen35 {
+
+class Qwen35GenerationState {
+  public:
+    Qwen35GenerationState(Qwen35CausalLm&, MtpModule*);
+    ~Qwen35GenerationState();
+    class Binding {
+      public:
+        explicit Binding(Qwen35GenerationState& owner) noexcept : owner_(owner) { owner_.swap(); }
+        ~Binding() { owner_.swap(); }
+        Binding(const Binding&) = delete;
+        Binding& operator=(const Binding&) = delete;
+      private:
+        Qwen35GenerationState& owner_;
+    };
+    Binding bind() noexcept { return Binding(*this); }
+  private:
+    void swap() noexcept;
+    struct Impl;
+    std::unique_ptr<Impl> state_;
+};
 
 struct LinearAttentionState;
 struct QwenBatchLayerState {

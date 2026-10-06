@@ -5,7 +5,7 @@
 #include "../engine/cuda_runtime_config.h"
 #include "engine/generation.h"
 #include "storage/text_session_cache.h"
-#include "engine/cuda_batching.h"
+#include "models/qwen35/batching.h"
 
 #include <cuda_profiler_api.h>
 

@@ -88,8 +88,12 @@ loading/placement flow and load their optional heads; `engine/model_registry.h`
 selects a family from the resolved model graph. `EngineInstance<Backend>` directly implements `Engine` and owns
 request execution, text controls and ordered reload/shutdown. CUDA's construction
 entry returns `std::unique_ptr<Engine>`; model metadata and capabilities use
-`EngineInfo`. There is no public `CudaEngine` facade or PImpl. Native batch operations
-feed `ContinuousBatch<QwenBatchOperations>` directly, without a batch executor wrapper. Session/prefix settings and batch budgets use shared config;
+`EngineInfo`. There is no public `CudaEngine` facade or PImpl. Family Adapters
+supply resource plans, associated physical batch types and scoped request-state
+binding; Engine does not inspect concrete blocks or predictors. Qwen native
+batch operations live in `models/qwen35/batching.*` and feed shared
+`ContinuousBatch` directly, without a batch executor wrapper.
+Session/prefix settings and batch budgets use shared config;
 CUDA load settings stay in `engine/load_options.cpp`. Ordinary, speculative
 and batch generation share CUDA sampling buffer/count initialization. Model
 users include their actual family headers directly; there is no include-only

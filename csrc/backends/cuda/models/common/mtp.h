@@ -31,6 +31,10 @@ struct MtpStep {
 // Architecture-specific predictors implement device math and cache state only.
 struct MtpModule {
     virtual ~MtpModule() = default;
+    // ponytail: serial predictors share the language-state envelope;
+    // add explicit predictor geometry before enabling their physical batching.
+    virtual void plan_resources(mfq::cuda::CudaResourcePlan&,
+        const mfq::models::CausalLmMetadata&) const {}
     virtual void reset(int64_t batch = 1) = 0;
     virtual mfq_tensor_backend::Tensor forward(
         const MtpTarget& target,

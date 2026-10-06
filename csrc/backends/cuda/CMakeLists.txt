@@ -269,6 +269,7 @@ endfunction()
 
 set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/common/causal_model_ops.cpp
+    ${MFQ_CUDA_ROOT}/models/common/resource_plan.cpp
     ${MFQ_CUDA_ROOT}/models/common/ffn.cpp
     ${MFQ_CUDA_ROOT}/models/common/full_block.cpp
     ${MFQ_CUDA_ROOT}/models/common/transformer_loader.cpp
@@ -282,6 +283,7 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/minicpmo45/ops.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/ops.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/batch_state.cpp
+    ${MFQ_CUDA_ROOT}/models/qwen35/batching.cpp
 )
 
 set(MFQ_CUDA_RUNTIME_OP_SOURCES
@@ -325,7 +327,6 @@ set(MFQ_CUDA_INSTANTIATION_SOURCES
     ${MFQ_CUDA_ROOT}/storage/kv_cache.cpp
     ${MFQ_CUDA_ROOT}/storage/text_session_cache.cpp
     ${MFQ_CUDA_ROOT}/engine/mtp.cpp
-    ${MFQ_CUDA_ROOT}/engine/cuda_batching.cpp
     ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
     ${MFQ_CUDA_MODEL_SOURCES}
 )

@@ -56,6 +56,8 @@ struct FullBlock : Block {
 
     static constexpr int64_t kDecodeAttentionMaxParts = 16;
 
+    void plan_resources(mfq::cuda::CudaResourcePlan&,
+        const mfq::models::CausalLmMetadata&, bool batch) const override;
     bool supports_speculation() const noexcept override { return !sliding; }
     void reset(int64_t batch) override;
     mfq_tensor_backend::Tensor forward(

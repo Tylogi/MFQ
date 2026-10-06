@@ -4,18 +4,15 @@
 #include "generation.h"
 #include "model_registry.h"
 #include "storage/weight_loader.h"
-#include "cuda_batching.h"
 #include "storage/text_session_cache.h"
 #include "mtp_metrics.h"
 #include "request_executor.h"
 #include "generation_flow.h"
-#include "models/qwen35/linear_attention.h"
-#include "models/qwen35/mtp.h"
-#include "models/common/full_block.h"
 
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <variant>
+#include <type_traits>
 
 namespace mfq::cuda {
 using namespace mfq::engine;
@@ -31,7 +28,8 @@ struct CudaEngineState {
     Model& language;
     DecodeGraphCache graph;
     TextSessionCache cache;
-    std::unique_ptr<ContinuousBatch<QwenBatchOperations>> batching;
+    std::conditional_t<Model::adapter_supports_batching,
+        std::unique_ptr<typename Model::Batch>, std::nullptr_t> batching = nullptr;
     bool duplex_active = false, duplex_pending = false, duplex_stop = false;
     mfq::StepSequence<ControlCompletion> duplex_sequence;
     std::optional<AdmissionBudget::Lease> duplex_memory;
@@ -41,93 +39,39 @@ struct CudaEngineState {
     void prepare_memory(std::size_t limit) {
         int device_count = 0;
         MFQ_CUDA_CHECK(cudaGetDeviceCount(&device_count));
-        request_bytes.assign(device_count, 0);
-        const auto product = [](std::initializer_list<std::size_t> factors) {
-            std::size_t result = 1;
-            for (auto factor : factors) {
-                if (factor && result > std::size_t(-1) / factor)
-                    throw ResourceExhausted("model memory geometry overflows size_t");
-                result *= factor;
-            }
-            return result;
-        };
-        const auto add = [&](int device, std::size_t bytes) {
-            if (request_bytes.at(device) > std::size_t(-1) - bytes)
-                throw ResourceExhausted("model memory geometry overflows size_t");
-            request_bytes[device] += bytes;
-        };
-        const auto context = std::size_t(language.max_position_embeddings());
-        const auto chunk = std::min<std::size_t>(context, config.generation.prefill_chunk_size);
-        const auto hidden = std::size_t(language.hidden_size());
-        const bool batch = config.continuous_batch.max_sequences != 0;
-        const std::size_t kv_copies = batch ? 4 : 3;
-        const std::size_t recurrent_copies = batch ? 4 : 3;
-        const std::size_t graph_copies = batch ? 8 : 1;
-        for (const auto& block : language.blocks) {
-            if (block->cpu_offloaded) continue;
-            const int device = block->cuda_device;
-            if (const auto* full = dynamic_cast<const FullBlock*>(block.get())) {
-                const auto capacity = full->sliding ? std::size_t(full->attention_window) : context;
-                // Dense/paged KV, snapshot/rollback, and packed batch state.
-                add(device, product({kv_copies, 2, 2, capacity + 1024, std::size_t(full->kv_heads),
-                    std::size_t(full->attention_head_dim)}));
-                // Split attention output plus MMA mask/metadata, retained in graph buckets.
-                add(device, product({graph_copies, std::size_t(full->attention_heads), 16,
-                    std::size_t(full->attention_head_dim + 2), 4}));
-                add(device, product({graph_copies, std::size_t(full->kv_heads), (context + 63) / 64, 8,
-                    std::size_t(2 + full->attention_head_dim / 2), 8}));
-            } else if (const auto* linear = dynamic_cast<const qwen35::LinearAttentionBlock*>(block.get())) {
-                const auto& c = linear->qwen_config;
-                add(device, product({recurrent_copies, 4, std::size_t(c.linear_conv_kernel_dim - 1),
-                    std::size_t(2 * c.linear_k_size() + c.linear_v_size())}));
-                add(device, product({recurrent_copies, 4, std::size_t(c.linear_num_value_heads),
-                    std::size_t(c.linear_value_head_dim), std::size_t(c.linear_value_head_dim)}));
-            } else {
-                // Other native families are serial; reserve a dense upper envelope
-                // for their compressed, recurrent or speculative cache layouts.
-                add(device, product({8, context, hidden}));
-            }
-        }
-        // At most one full request state may remain in the snapshot cache.
-        // The per-request copy factors cover active state, capture and cached state.
-        std::size_t snapshot_budget = std::size_t(-1);
-        for (auto bytes : request_bytes) if (bytes)
-            snapshot_budget = std::min(snapshot_budget, bytes / std::max(kv_copies, recurrent_copies));
-        cache.limit_snapshot_bytes(snapshot_budget == std::size_t(-1) ? 0 : snapshot_budget);
-        const auto primary = execution->layer_placement.primary_device();
-        add(primary, product({8, std::size_t(language.vocab_size())}));
-        if (auto *predictor = dynamic_cast<Qwen35Mtp *>(components.mtp.get()))
-            for (const auto &block : predictor->blocks) {
-                const auto &full = dynamic_cast<const FullBlock &>(*block);
-                add(block->cuda_device, product({3, 2, 2, context + 1024,
-                    std::size_t(full.kv_heads), std::size_t(full.attention_head_dim)}));
-            }
-        if (components.composite) add(primary, components.composite->state_memory_bytes());
+        auto plan = language.adapter_resource_plan(language.blocks,
+            config.continuous_batch.max_sequences != 0, device_count, components.mtp.get());
+        cache.limit_snapshot_bytes(plan.snapshot_bytes);
+        if (components.composite) plan.add(execution->layer_placement.primary_device(),
+            {components.composite->state_memory_bytes()});
         for (const auto* devices : {&execution->tensor_parallel.devices,
                                    &execution->expert_parallel.devices,
                                    &execution->layer_placement.devices})
-            for (int device : *devices) if (!request_bytes.at(device)) add(device, 1);
+            for (int device : *devices) if (!plan.request_bytes.at(device)) plan.add(device, {1});
+        const auto chunk = std::min<std::size_t>(language.max_position_embeddings(),
+            config.generation.prefill_chunk_size);
         std::size_t capacity = std::max<std::size_t>(1, config.continuous_batch.max_sequences);
-        for (int device = 0; device < device_count; ++device) if (request_bytes[device]) {
+        for (int device = 0; device < device_count; ++device) if (plan.request_bytes[device]) {
             // Prefill activations and graph temporaries share this execution envelope.
-            add(device, 256ULL * 1024 * 1024);
-            add(device, product({64, chunk, hidden}));
+            plan.add(device, {256ULL * 1024 * 1024});
+            plan.add(device, {64, chunk, std::size_t(language.hidden_size())});
             MfqCudaGuard guard(device);
             std::size_t free = 0, total = 0;
             MFQ_CUDA_CHECK(cudaMemGetInfo(&free, &total));
             const auto available = limit ? std::min(limit, free - free / 10) : free - free / 10;
-            capacity = std::min(capacity, available / request_bytes[device]);
+            capacity = std::min(capacity, available / plan.request_bytes[device]);
         }
         if (!capacity) throw ResourceExhausted("model context and workspace exceed the available execution memory budget");
-        std::vector<std::size_t> budgets(device_count);
-        for (int device = 0; device < device_count; ++device) if (request_bytes[device]) {
-            budgets[device] = product({capacity, request_bytes[device]});
+        CudaResourcePlan budgets(device_count);
+        for (int device = 0; device < device_count; ++device) if (plan.request_bytes[device]) {
+            budgets.add(device, {capacity, plan.request_bytes[device]});
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
             MfqCudaGuard guard(device);
-            mfq::cuda::default_context(device)->reserve_execution_memory(budgets[device]);
+            mfq::cuda::default_context(device)->reserve_execution_memory(budgets.request_bytes[device]);
 #endif
         }
-        memory = AdmissionBudget(std::move(budgets));
+        request_bytes = std::move(plan.request_bytes);
+        memory = AdmissionBudget(std::move(budgets.request_bytes));
         if (config.continuous_batch.max_sequences) config.continuous_batch.max_sequences = capacity;
     }
     auto reserve(const EngineRequest&) { return memory.reserve(request_bytes); }
@@ -145,10 +89,9 @@ struct CudaEngineState {
                 language.supports_text_session_state(), language.supports_text_session_state() ? 0 : 1) {
         prepare_memory(memory_limit);
         if (config.continuous_batch.max_sequences) {
-            if constexpr (std::is_same_v<Model, Qwen35CausalLm>)
-                batching = std::make_unique<ContinuousBatch<QwenBatchOperations>>(
-                    config.generation.prefill_chunk_size, config.continuous_batch.prefill_token_budget,
-                    language, *execution, config.continuous_batch);
+            if constexpr (Model::adapter_supports_batching)
+                batching = language.adapter_create_batch(language, *execution,
+                    config.generation.prefill_chunk_size, config.continuous_batch);
             else throw std::invalid_argument("continuous batching is unavailable for this model");
         }
     }
@@ -158,7 +101,8 @@ struct CudaEngineState {
     bool exclusive() const { return duplex_active; }
     bool mtp_available() const { return bool(components.mtp); }
     void execute(const std::vector<RequestId>& eligible) {
-        if (batching) batching->step(eligible);
+        if constexpr (Model::adapter_supports_batching)
+            if (batching) batching->step(eligible);
     }
     using Prepared = CudaPreparedPrompt;
     mfq::StepSequence<Prepared> prepare(InferenceRequest& input) {
@@ -174,26 +118,23 @@ struct CudaEngineState {
     }
     Generation generate_text(InferenceRequest& input, InferenceOutput& output, std::optional<Prepared> prepared,
                              const RequestId& id, bool batched) {
+        typename Model::Batch* batch = nullptr;
+        if constexpr (Model::adapter_supports_batching)
+            if (batched) batch = batching.get();
         return internal::generate(language, graph, cache, config,
                                   input, output, batched ? nullptr : components.mtp.get(), std::move(prepared),
-                                  batched ? batching.get() : nullptr, id);
+                                  batch, id);
     }
     Generation generate(const RequestId& id, ExecutionRequest& request) {
-        if constexpr (std::is_same_v<Model, Qwen35CausalLm>) {
-            if (request.batched && (request.input.vision ||
-                    !request.input.cache_plan.session_id.empty() ||
-                    (cache.persistent_prefix_enabled() && request.input.cache_plan.stable_prefix_tokens) ||
-                    (request.input.sampling.enable_mtp && components.mtp)))
+        if constexpr (Model::adapter_supports_batching) {
+            if (request.batched && language.adapter_owns_generation(request.input, cache, bool(components.mtp)))
                 return generate_owned(id, request);
         }
         return generate_prepared(*this, request.input, request.output, id, request.batched);
     }
     Generation generate_owned(const RequestId& id, ExecutionRequest& request)
-        requires std::is_same_v<Model, Qwen35CausalLm> {
-        auto native = qwen35::QwenBatchState::empty(language);
-        auto *predictor = dynamic_cast<Qwen35Mtp *>(components.mtp.get());
-        std::optional<Qwen35Mtp::RequestState> predictor_state;
-        if (predictor) predictor_state.emplace(*predictor);
+        requires Model::adapter_supports_batching {
+        auto native = language.adapter_request_state(language, components.mtp.get());
         DecodeGraphCache request_graph(language.max_position_embeddings());
         struct Ops {
             using Prepared = CudaPreparedPrompt;
@@ -209,31 +150,17 @@ struct CudaEngineState {
                     input, output, owner.components.mtp.get(), std::move(prepared), nullptr, id);
             }
         } ops{*this, request_graph};
-        struct Binding {
-            Model &model;
-            qwen35::QwenBatchState &native;
-            Qwen35Mtp *predictor;
-            std::optional<Qwen35Mtp::RequestState> &predictor_state;
-            Binding(Model &m, qwen35::QwenBatchState &n, Qwen35Mtp *p,
-                    std::optional<Qwen35Mtp::RequestState> &s)
-                : model(m), native(n), predictor(p), predictor_state(s) { swap(); }
-            void swap() noexcept {
-                native.swap(model);
-                if (predictor) predictor_state->swap(*predictor);
-            }
-            ~Binding() { swap(); }
-        };
         // A suspended coroutine never leaves its state attached to shared weights.
         // MTP verification remains a per-request quantum; ordinary rows still batch.
         auto sequence = generate_prepared(ops, request.input, request.output, id, false);
         ExecutionCleanup cleanup{request.output.cleanup_failure, [&] {
-            Binding binding(language, native, predictor, predictor_state);
+            auto binding = native.bind();
             sequence = {};
         }};
         while (true) {
             decltype(sequence.next()) step;
             {
-                Binding binding(language, native, predictor, predictor_state);
+                auto binding = native.bind();
                 step = sequence.next();
             }
             if (!step) break;
@@ -301,8 +228,10 @@ struct CudaEngineState {
                 metrics.emplace_back(prefix + "_request_bytes", request_bytes[device]);
             }
             if (components.mtp) mtp::append_generation_metrics(metrics, components.mtp->last_stats);
-            if (batching) {
-                auto batch = batching->metrics(); metrics.insert(metrics.end(), batch.begin(), batch.end());
+            if constexpr (Model::adapter_supports_batching) {
+                if (batching) {
+                    auto batch = batching->metrics(); metrics.insert(metrics.end(), batch.begin(), batch.end());
+                }
             }
             return metrics;
         } else {

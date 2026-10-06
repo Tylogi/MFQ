@@ -1,7 +1,7 @@
-#include "../kernels/mfq_cuda_sampling_ops.h"
-#include "cuda_batching.h"
+#include "../../kernels/mfq_cuda_sampling_ops.h"
+#include "batching.h"
 
-#include "../ops/cuda_execution.h"
+#include "../../ops/cuda_execution.h"
 #include "engine/decode_graph.h"
 #include "models/common/full_block.h"
 #include "models/qwen35/ops.h"
