@@ -27,6 +27,21 @@ UPDATER = (TAURI / "src" / "updater.rs").read_text(encoding="utf-8")
 RELEASE_SCRIPT = (ROOT / "packaging" / "build_release_mac.sh").read_text(encoding="utf-8")
 
 
+def assert_translated(source: str, key: str):
+    """Require a translation call and a nonempty value in every supported catalog."""
+    assert f"t('{key}')" in source
+    namespace, path = key.split(":", 1)
+    for language in ("en", "zh-CN"):
+        value = json.loads(
+            (STUDIO / "src" / "i18n" / "locales" / language / f"{namespace}.json")
+            .read_text(encoding="utf-8")
+        )
+        for segment in path.split("."):
+            value = value[segment]
+        assert isinstance(value, str) and value.strip(), (language, key)
+        assert value != key, (language, key)
+
+
 def test_studio_uses_one_package_for_web_and_desktop_clients():
     config = json.loads((TAURI / "tauri.conf.json").read_text(encoding="utf-8"))
     release_config = json.loads(
@@ -93,13 +108,15 @@ def test_model_hub_resolves_links_and_downloads_selected_variants():
     )
     assert "downloadPatterns(variant)" in MODEL_BROWSER
     assert "jobsApi.createJob" in MODEL_BROWSER
-    assert 'tr("官方模型", "Official")' in MODEL_BROWSER
-    assert 'tr("第三方模型", "Community")' in MODEL_BROWSER
-    assert 'tr("内存压力", "Memory pressure")' in MODEL_BROWSER
-    assert "Based on resident weight baselines" in MODEL_BROWSER
-    assert "KV cache and runtime overhead need additional memory." in MODEL_BROWSER
-    assert "三星推荐" not in MODEL_BROWSER
-    assert "3-star recommendation" not in MODEL_BROWSER
+    for key in (
+        "official", "community", "memoryPressure",
+        "basedOnResidentWeightBaselinesKvCacheAndRuntimeOverheadNeedAdditional",
+    ):
+        assert_translated(MODEL_BROWSER, f"models:modelBrowser.{key}")
+    for language in ("en", "zh-CN"):
+        catalog = (STUDIO / "src" / "i18n" / "locales" / language / "models.json").read_text(encoding="utf-8")
+        assert "三星推荐" not in catalog
+        assert "3-star recommendation" not in catalog
     for symbol in ('"★★★"', '"★★"', '"★"', '"▲"', '"✕"'):
         assert symbol in MODEL_BROWSER
 
@@ -116,4 +133,4 @@ def test_studio_checks_releases_and_keeps_verified_versions_for_rollback():
     assert "replace_macos_bundle" in UPDATER
     assert "com.tylogi.mfq-studio" in UPDATER
     assert "studioUpdateStatus(false)" in UPDATE_MANAGER
-    assert 'tr("自动检查并提醒", "Automatically check and notify")' in UPDATE_MANAGER
+    assert_translated(UPDATE_MANAGER, "settings:updateManager.automaticallyCheckAndNotify")
