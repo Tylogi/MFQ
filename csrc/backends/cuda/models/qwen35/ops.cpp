@@ -1,12 +1,8 @@
 #include "storage/weight_loader.h"
 #include "ops.h"
 #include "models/common/session_codec.h"
-#include "models/common/model_loading.tpp"
-#include "models/common/runtime_components.h"
 #include "mtp.h"
 #include "linear_attention.h"
-#include "batching.h"
-#include "storage/text_session_cache.h"
 
 #include "models/common/transformer_loader.h"
 
@@ -309,23 +305,6 @@ void Qwen35Mtp::plan_resources(mfq::cuda::CudaResourcePlan& plan,
 
 namespace mfq::cuda {
 
-std::unique_ptr<mfq::engine::ContinuousBatch<QwenBatchOperations>> Qwen35Model::adapter_create_batch(
-        Qwen35CausalLm& model, CudaExecutionContext& execution, std::size_t chunk,
-        const CudaContinuousBatchConfig& config) {
-    return std::make_unique<mfq::engine::ContinuousBatch<QwenBatchOperations>>(
-        chunk, config.prefill_token_budget, model, execution, config);
-}
-bool Qwen35Model::adapter_owns_generation(const mfq::engine::InferenceRequest& input,
-        const internal::TextSessionCache& cache, bool predictor) {
-    return input.vision || !input.cache_plan.session_id.empty() ||
-        (cache.persistent_prefix_enabled() && input.cache_plan.stable_prefix_tokens) ||
-        (input.sampling.enable_mtp && predictor);
-}
-qwen35::Qwen35GenerationState Qwen35Model::adapter_request_state(Qwen35CausalLm& model,
-        MtpModule* predictor) {
-    return qwen35::Qwen35GenerationState(model, predictor);
-}
-
 void Qwen35Model::adapter_validate_components(const mfq::ModelGraph &graph) const {
     if (graph.component("vision") != nullptr &&
         cuda_model_plan(graph).vision != CudaVisionAdapter::grid_vit) {
@@ -408,34 +387,6 @@ bool Qwen35Model::adapter_supports_prepared_prompt() const noexcept { return tru
 
 namespace mfq::cuda {
 
-template<> RuntimeComponents<Qwen35CausalLm> load_runtime_components(Qwen35CausalLm& model, bool optional) {
-    RuntimeComponents<Qwen35CausalLm> result{model.graph, model.plan};
-    if (!optional) return result;
-    if (result.plan.vision == CudaVisionAdapter::grid_vit) {
-        const auto* component = result.graph.component("vision");
-        const auto& config = model.config;
-        if (!component || !config.grid_vision || !config.image_token_id || !config.video_token_id)
-            throw std::runtime_error("CUDA grid-Vision configuration is incomplete");
-        result.grid_vision.emplace(grid_vision_runtime::CudaGridVisionPromptComponent::load(
-            *model.execution, *model.source, *config.grid_vision, *config.image_token_id, *config.video_token_id,
-            component->input_contract, component->position_policy));
-        result.vision_available = true;
-    } else if (result.plan.vision != CudaVisionAdapter::none)
-        throw std::runtime_error("CUDA vision adapter is unsupported for Qwen");
-    if (result.plan.predictor == CudaPredictorAdapter::qwen35) {
-        const auto& execution = *model.execution;
-        if (!execution.layer_placement.enabled() && execution.dense_cpu_layer_count == 0 &&
-                execution.dsv4_cpu_offload_layers.empty() && !execution.moe_expert_cache &&
-                model.num_experts() == 0 && model.supports_speculation()) {
-            if (auto predictor = Qwen35Mtp::load_if_present(*model.source, model.config, *model.execution))
-                result.mtp = std::make_unique<Qwen35Mtp>(std::move(*predictor));
-            result.mtp_available = bool(result.mtp);
-        } else std::cerr << "qwen_mtp unavailable: CUDA adapter requires dense GPU-resident Qwen blocks\n";
-    } else if (result.plan.predictor != CudaPredictorAdapter::none)
-        throw std::runtime_error("CUDA predictor adapter is unsupported for Qwen");
-    return result;
-}
-
 template struct FullAttentionSessionCodec<Qwen35Model>;
 
 } // namespace mfq::cuda
@@ -443,5 +394,3 @@ template struct FullAttentionSessionCodec<Qwen35Model>;
 namespace mfq::models {
 template struct qwen35::CausalLm<cuda::CudaCausalOps<cuda::Qwen35Model>>;
 } // namespace mfq::models
-
-MFQ_INSTANTIATE_CUDA_MODEL(mfq::cuda::Qwen35CausalLm)

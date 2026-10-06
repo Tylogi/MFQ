@@ -3,8 +3,6 @@
 #include "causal_model_ops.h"
 #include "storage/weight_loader.h"
 #include "storage/moe_expert_cache.h"
-#include "models/common/mtp.h"
-#include "storage/text_session_cache_impl.h"
 
 #include <algorithm>
 #include <iostream>
@@ -100,9 +98,3 @@ Model load_causal_lm(CudaExecutionContext& execution, const std::string& model_p
     return model;
 }
 } // namespace mfq::cuda
-
-// Each family owns its loading and session bindings; storage knows no families.
-#define MFQ_INSTANTIATE_CUDA_MODEL(TYPE) \
-    template TYPE mfq::cuda::load_causal_lm<TYPE>(CudaExecutionContext&, const std::string&, const std::string&, int64_t, bool, bool, std::shared_ptr<const mfq::ModelSource>); \
-    template mfq::StepSequence<mfq::cuda::internal::TextSessionRestore> mfq::cuda::internal::TextSessionCache::restore_steps(TYPE&, MtpModule*, const std::string&, const std::vector<int64_t>&, size_t, const std::string&); \
-    template mfq::cuda::internal::TextSessionRestore mfq::cuda::internal::TextSessionCache::restore_best(TYPE&, MtpModule*, const std::string&, const std::vector<int64_t>&, size_t, const std::string&);

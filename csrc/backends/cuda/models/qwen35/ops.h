@@ -4,7 +4,6 @@
 
 #include "models/common/causal_model_ops.h"
 #include "storage/session_state.h"
-#include "batch_state.h"
 #include "qwen35/causal_lm.h"
 #include "qwen35/config.h"
 
@@ -38,25 +37,11 @@ mfq::StepSequence<std::monostate> restore_text_session_state(std::vector<std::un
 
 } // namespace mfq::cuda::qwen35
 
-namespace mfq::engine {
-template<class Ops> class ContinuousBatch;
-struct InferenceRequest;
-}
 namespace mfq::cuda {
-class QwenBatchOperations;
-namespace internal { class TextSessionCache; }
-struct CudaContinuousBatchConfig;
 
 struct Qwen35Model : CausalResources {
     template <class Backend> using CausalModel = mfq::models::qwen35::CausalLm<Backend>;
     mfq::models::qwen35::Config config;
-    static constexpr bool adapter_supports_batching = true;
-    using Batch = mfq::engine::ContinuousBatch<QwenBatchOperations>;
-    static std::unique_ptr<Batch> adapter_create_batch(
-        Qwen35CausalLm&, CudaExecutionContext&, std::size_t chunk, const CudaContinuousBatchConfig&);
-    static bool adapter_owns_generation(const mfq::engine::InferenceRequest&,
-        const internal::TextSessionCache&, bool predictor);
-    static qwen35::Qwen35GenerationState adapter_request_state(Qwen35CausalLm&, MtpModule*);
 
     void adapter_validate_components(const mfq::ModelGraph &graph) const;
     void adapter_configure_rope(RopeCache &rope, mfq_tensor_backend::Device device) const;

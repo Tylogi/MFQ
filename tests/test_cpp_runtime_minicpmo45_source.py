@@ -10,7 +10,7 @@ DECODE = "\n".join(
 )
 CUDA_COMPONENTS = "\n".join(
     (CUDA_ROOT / name).read_text(encoding="utf-8")
-    for name in ("models/common/runtime_components.h", "models/minicpmo45/ops.cpp")
+    for name in ("engine/model_components.h", "engine/model_components.cpp")
 )
 CUDA_ENGINE = (CUDA_ROOT / "engine" / "cuda_engine.cpp").read_text(
     encoding="utf-8"
@@ -19,7 +19,7 @@ CUDA_OPTIONS = (CUDA_ROOT / "include/cuda_engine.h").read_text(
     encoding="utf-8"
 )
 MINICPM_ENGINE = (
-    CUDA_ROOT / "models" / "minicpmo45" / "components.cpp"
+    CUDA_ROOT / "engine" / "minicpmo_components.cpp"
 ).read_text(encoding="utf-8")
 ROPE = (ROOT / "csrc" / "backends" / "cuda" / "kernels" / "rope.cu").read_text(
     encoding="utf-8"
@@ -32,7 +32,11 @@ NORM = (ROOT / "csrc" / "backends" / "cuda" / "kernels" / "norm.cu").read_text(
 )
 GRAPH = "\n".join(
     path.read_text(encoding="utf-8")
-    for path in (CUDA_ROOT / "models" / "minicpmo45").glob("*")
+    for path in [
+        *(CUDA_ROOT / "models" / "minicpmo45").glob("*"),
+        CUDA_ROOT / "engine" / "minicpmo_components.h",
+        CUDA_ROOT / "engine" / "minicpmo_components.cpp",
+    ]
     if path.suffix in {".h", ".cpp"}
 )
 COMMAND = (CUDA_ROOT / "commands/minicpmo45.cpp").read_text(encoding="utf-8")

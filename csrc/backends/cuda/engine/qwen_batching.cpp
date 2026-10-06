@@ -1,10 +1,11 @@
-#include "../../kernels/mfq_cuda_sampling_ops.h"
-#include "batching.h"
+#include "../kernels/mfq_cuda_sampling_ops.h"
+#include "qwen_batching.h"
 
-#include "../../ops/cuda_execution.h"
-#include "engine/decode_graph.h"
+#include "../ops/cuda_execution.h"
+#include "decode_graph.h"
 #include "models/common/full_block.h"
 #include "models/qwen35/ops.h"
+#include "storage/text_session_cache.h"
 
 #include <algorithm>
 #include <exception>
@@ -21,6 +22,13 @@ using internal::PrefillCudaTimer;
 using Tensor = mfq_tensor_backend::Tensor;
 using qwen35::Qwen35BatchStateAdapter;
 using qwen35::QwenBatchRequestState;
+
+bool qwen_batch_requires_owned_generation(const mfq::engine::InferenceRequest& input,
+        const internal::TextSessionCache& cache, bool predictor) {
+    return input.vision || !input.cache_plan.session_id.empty() ||
+        (cache.persistent_prefix_enabled() && input.cache_plan.stable_prefix_tokens) ||
+        (input.sampling.enable_mtp && predictor);
+}
 
 bool qwen_continuous_batch_cuda_graph_enabled(const Qwen35CausalLm &model,
                                               const CudaContinuousBatchConfig &config) {

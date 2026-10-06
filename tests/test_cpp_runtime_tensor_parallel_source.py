@@ -16,7 +16,7 @@ CMAKE = (ROOT / "csrc" / "tests" / "CMakeLists.txt").read_text(
 COMPONENTS = "\n".join(
     path.read_text(encoding="utf-8")
     for path in (
-        CUDA_ROOT / "models/common/runtime_components.h",
+        CUDA_ROOT / "engine/model_components.cpp",
         CUDA_ROOT / "models/common/model_loading.tpp",
         CUDA_ROOT / "models" / "qwen35" / "ops.cpp",
     )

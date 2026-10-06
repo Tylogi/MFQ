@@ -1,7 +1,7 @@
 #pragma once
 
 #include "generation_step.h"
-#include "models/qwen35/batching.h"
+#include "qwen_batching.h"
 #include "../ops/cuda_execution.h"
 #include "engine/decode_graph.h"
 #include "models/common/mtp.h"
@@ -19,7 +19,7 @@ mfq::engine::Generation generate(
     const CudaRuntimeConfig& config, mfq::engine::InferenceRequest& request,
     mfq::engine::InferenceOutput& output, MtpModule* mtp = nullptr,
     std::optional<CudaPreparedPrompt> prepared = {},
-    typename Model::Batch* batching = nullptr,
+    mfq::engine::ContinuousBatch<QwenBatchOperations>* batching = nullptr,
     std::string request_id = {});
 } // namespace mfq::cuda::internal
 

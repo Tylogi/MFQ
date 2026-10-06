@@ -1,9 +1,9 @@
 #pragma once
 
-#include "causal_model_ops.h"
-#include "mtp.h"
-#include "grid_vision_component.h"
-#include "models/minicpmo45/ops.h"
+#include "models/common/causal_model_ops.h"
+#include "models/common/mtp.h"
+#include "models/common/grid_vision_component.h"
+#include "minicpmo_components.h"
 
 #include <memory>
 #include <optional>

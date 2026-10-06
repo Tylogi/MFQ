@@ -252,7 +252,7 @@ function(mfq_configure_cuda_backend_target target)
     endif()
 endfunction()
 
-# Shared Engine/model templates are instantiated by family/runtime units.
+# Model implementations compile separately from the CUDA Engine composition root.
 # Loading primitives and kernel/quant ops have no Engine/tokenizer dependency.
 function(mfq_configure_cuda_runtime_target target)
     mfq_configure_cuda_backend_target(${target})
@@ -265,6 +265,17 @@ function(mfq_configure_cuda_runtime_target target)
         ${MFQ_CUDA_ROOT}/engine
     )
     target_link_libraries(${target} PRIVATE mfq-models mfq-engine mfq-tokenizer)
+endfunction()
+
+function(mfq_configure_cuda_model_target target)
+    mfq_configure_cuda_backend_target(${target})
+    target_include_directories(${target} PRIVATE
+        ${PROJECT_SOURCE_DIR}/engine/internal
+        ${MFQ_CUDA_ROOT}
+        ${MFQ_CUDA_ROOT}/storage
+        ${MFQ_CUDA_ROOT}/models
+    )
+    target_link_libraries(${target} PRIVATE mfq-models mfq-engine)
 endfunction()
 
 set(MFQ_CUDA_MODEL_SOURCES
@@ -283,8 +294,13 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/minicpmo45/ops.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/ops.cpp
     ${MFQ_CUDA_ROOT}/models/qwen35/batch_state.cpp
-    ${MFQ_CUDA_ROOT}/models/qwen35/batching.cpp
 )
+
+add_library(mfq-cuda-models OBJECT ${MFQ_CUDA_MODEL_SOURCES})
+mfq_configure_cuda_model_target(mfq-cuda-models)
+target_compile_definitions(mfq-cuda-models PRIVATE
+    MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+set_target_properties(mfq-cuda-models PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set(MFQ_CUDA_RUNTIME_OP_SOURCES
     ${MFQ_CUDA_ROOT}/ops/cuda_execution.cpp
@@ -317,22 +333,25 @@ target_compile_definitions(mfq-cuda-loading PRIVATE
     MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
 set_target_properties(mfq-cuda-loading PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# Concrete Engine/model bindings stay in this source group for both native and
-# optional Torch builds. Extra targets do not reduce their header dependencies.
+# Cross-family composition and explicit template bindings stay in this source
+# group for both native and optional Torch builds.
 set(MFQ_CUDA_INSTANTIATION_SOURCES
     ${MFQ_CUDA_ROOT}/engine/cuda_engine.cpp
     ${MFQ_CUDA_ROOT}/engine/load_options.cpp
     ${MFQ_CUDA_ROOT}/engine/decode_graph.cpp
     ${MFQ_CUDA_ROOT}/engine/generation.cpp
+    ${MFQ_CUDA_ROOT}/engine/model_bindings.cpp
+    ${MFQ_CUDA_ROOT}/engine/model_components.cpp
+    ${MFQ_CUDA_ROOT}/engine/minicpmo_components.cpp
+    ${MFQ_CUDA_ROOT}/engine/qwen_batching.cpp
     ${MFQ_CUDA_ROOT}/storage/kv_cache.cpp
     ${MFQ_CUDA_ROOT}/storage/text_session_cache.cpp
     ${MFQ_CUDA_ROOT}/engine/mtp.cpp
-    ${MFQ_CUDA_ROOT}/models/minicpmo45/components.cpp
-    ${MFQ_CUDA_MODEL_SOURCES}
 )
 add_library(mfq-cuda-runtime STATIC
     $<TARGET_OBJECTS:mfq-cuda-ops>
     $<TARGET_OBJECTS:mfq-cuda-loading>
+    $<TARGET_OBJECTS:mfq-cuda-models>
     ${MFQ_CUDA_INSTANTIATION_SOURCES}
 )
 add_library(mfq::cuda-runtime ALIAS mfq-cuda-runtime)
@@ -361,7 +380,7 @@ target_compile_definitions(mfq-cuda-runtime PRIVATE
     NOMINMAX
 )
 if(MSVC)
-    foreach(target mfq-cuda-ops mfq-cuda-loading mfq-cuda-runtime)
+    foreach(target mfq-cuda-ops mfq-cuda-loading mfq-cuda-models mfq-cuda-runtime)
         target_compile_options(${target} PRIVATE
             "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>"
             "$<$<COMPILE_LANGUAGE:CXX>:/EHsc>"

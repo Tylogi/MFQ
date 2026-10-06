@@ -43,8 +43,38 @@ def test_cuda_ops_do_not_link_shared_execution_or_serving() -> None:
     runtime = source.split("function(mfq_configure_cuda_runtime_target target)", 1)[1].split("endfunction()", 1)[0]
     assert "mfq-runtime-communication" not in runtime
     assert "mfq_configure_cuda_backend_target(mfq-cuda-ops)" in source
-    loading = source.split("add_library(mfq-cuda-loading OBJECT", 1)[1].split("# Concrete Engine/model bindings", 1)[0]
+    loading = source.split("add_library(mfq-cuda-loading OBJECT", 1)[1].split("set(MFQ_CUDA_INSTANTIATION_SOURCES", 1)[0]
     assert "mfq_configure_cuda_backend_target(mfq-cuda-loading)" in loading
     for dependency in ("mfq-engine", "mfq-tokenizer", "mfq_configure_cuda_runtime_target"):
         assert dependency not in loading
+    model_config = source.split("function(mfq_configure_cuda_model_target target)", 1)[1].split("endfunction()", 1)[0]
+    assert "${MFQ_CUDA_ROOT}/engine" not in model_config
+    assert "mfq-tokenizer" not in model_config
+    assert "add_library(mfq-cuda-models OBJECT ${MFQ_CUDA_MODEL_SOURCES})" in source
+    assert "$<TARGET_OBJECTS:mfq-cuda-models>" in source
     assert "MFQ_BUILD_RUNTIME_COMMUNICATION" not in cmake("core")
+
+
+def test_cuda_engine_is_the_only_cross_family_composition_root() -> None:
+    cuda = ROOT / "backends" / "cuda"
+    models = cuda / "models"
+    common = models / "common"
+    model_sources = [
+        path for path in models.rglob("*") if path.suffix in {".h", ".cpp", ".tpp"}
+    ]
+    for path in model_sources:
+        source = path.read_text(encoding="utf-8")
+        assert not re.search(r'#include\s+["<](?:\.\./)*engine/', source), path
+        assert "load_runtime_components(" not in source, path
+        assert "MFQ_BIND_CUDA_MODEL" not in source, path
+        assert "MFQ_INSTANTIATE_CUDA_MODEL" not in source, path
+    family_include = re.compile(
+        r'#include\s+["<](?:models/)?(?:deepseek|gemma|glm|minicpm|qwen)[^">]*[">]'
+    )
+    for path in common.rglob("*"):
+        if path.suffix in {".h", ".cpp", ".tpp"}:
+            assert not family_include.search(path.read_text(encoding="utf-8")), path
+    assert not (models / "qwen35" / "batching.cpp").exists()
+    assert (cuda / "engine" / "qwen_batching.cpp").is_file()
+    assert (cuda / "engine" / "model_components.cpp").is_file()
+    assert (cuda / "engine" / "model_bindings.cpp").is_file()

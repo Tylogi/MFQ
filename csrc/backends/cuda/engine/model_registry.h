@@ -8,7 +8,7 @@
 #include "models/minicpmo45/ops.h"
 #include "models/qwen35/ops.h"
 #include "models/qwen4_exp/ops.h"
-#include "models/common/runtime_components.h"
+#include "model_components.h"
 #include "load_options.h"
 #include "storage/moe_expert_cache.h"
 

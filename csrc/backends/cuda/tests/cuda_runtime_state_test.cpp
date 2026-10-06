@@ -1,6 +1,7 @@
 #include "../kernels/mfq_cuda_norm_ops.h"
 #include "../ops/cuda_execution.h"
 #include "../engine/cuda_runtime_config.h"
+#include "../engine/qwen_batching.h"
 #include "../ops/cuda_sampling.h"
 #include "diagnostics/generation_result.h"
 #include "storage/text_session_cache.h"
@@ -521,18 +522,21 @@ static void check_resource_plans() {
         bool rejected = false;
         try { overflow.add(0, multiply ? std::initializer_list<std::size_t>{std::size_t(-1), 2}
                                       : std::initializer_list<std::size_t>{1}); }
-        catch (const mfq::engine::ResourceExhausted&) { rejected = true; }
+        catch (const std::overflow_error&) { rejected = true; }
         check(rejected && overflow.request_bytes[0] == std::size_t(-1), "resource overflow mutated the plan");
     }
     TextSessionCache cache({}, {});
     mfq::engine::InferenceRequest request;
     request.sampling.enable_mtp = false;
-    check(!model.adapter_owns_generation(request, cache, true), "ordinary text bypassed physical batching");
+    check(!qwen_batch_requires_owned_generation(request, cache, true),
+          "ordinary text bypassed physical batching");
     request.sampling.enable_mtp = true;
-    check(model.adapter_owns_generation(request, cache, true) &&
-          !model.adapter_owns_generation(request, cache, false), "MTP compatibility ignored predictor availability");
+    check(qwen_batch_requires_owned_generation(request, cache, true) &&
+          !qwen_batch_requires_owned_generation(request, cache, false),
+          "MTP compatibility ignored predictor availability");
     request.cache_plan.session_id = "session";
-    check(model.adapter_owns_generation(request, cache, false), "session state entered an ordinary batch");
+    check(qwen_batch_requires_owned_generation(request, cache, false),
+          "session state entered an ordinary batch");
 }
 
 static void check_batch_state_ownership() {
@@ -567,7 +571,7 @@ static void check_batch_state_ownership() {
     predictor.blocks.push_back(std::make_unique<FullBlock>());
     auto* predictor_block = static_cast<FullBlock*>(predictor.blocks[0].get());
     const auto original = full->state, original_predictor = predictor_block->state;
-    auto owned = model.adapter_request_state(model, &predictor);
+    qwen35::Qwen35GenerationState owned(model, &predictor);
     std::shared_ptr<qwen35::LinearAttentionState> speculative;
     std::shared_ptr<FullAttentionState> request_predictor;
     {

@@ -1,9 +1,9 @@
 #include "resource_plan.h"
 #include "causal_model_ops.h"
 #include "mtp.h"
-#include "engine.h"
 
 #include <algorithm>
+#include <stdexcept>
 
 namespace mfq::cuda {
 
@@ -11,12 +11,12 @@ void CudaResourcePlan::add(int device, std::initializer_list<std::size_t> factor
     std::size_t bytes = 1;
     for (auto factor : factors) {
         if (factor && bytes > std::size_t(-1) / factor)
-            throw mfq::engine::ResourceExhausted("model memory geometry overflows size_t");
+            throw std::overflow_error("model memory geometry overflows size_t");
         bytes *= factor;
     }
     auto& total = request_bytes.at(device);
     if (bytes > std::size_t(-1) - total)
-        throw mfq::engine::ResourceExhausted("model memory geometry overflows size_t");
+        throw std::overflow_error("model memory geometry overflows size_t");
     total += bytes;
 }
 

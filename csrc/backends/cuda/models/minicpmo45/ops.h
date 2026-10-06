@@ -3,7 +3,6 @@
 
 #include "models/common/causal_model_ops.h"
 #include "storage/session_state.h"
-#include "inference.h"
 #include "models/common/block.h"
 #include "minicpmo45/causal_lm.h"
 #include "minicpmo45/config.h"
@@ -66,27 +65,6 @@ namespace mfq::models {
 extern template struct minicpmo45::CausalLm<cuda::CudaCausalOps<cuda::MiniCPMO45Model>>;
 extern template struct minicpmo45::TtsCausalLm<cuda::CudaCausalOps<cuda::MiniCPMOTtsModel>>;
 } // namespace mfq::models
-
-namespace mfq::cuda::minicpmo45 {
-
-class Components {
-  public:
-    explicit Components(mfq::cuda::MiniCPMO45CausalLm language);
-    ~Components();
-
-    mfq::cuda::MiniCPMO45CausalLm &language() noexcept;
-    mfq::StepSequence<CudaPreparedPrompt> prepare(const std::vector<int64_t> &prompt, const MfqMultimodalInput &media);
-    mfq::StepSequence<std::monostate> start(MfqDuplexSessionParams parameters);
-    mfq::StepSequence<MfqDuplexStepResult> step(MfqDuplexStepInput input);
-    void stop();
-    std::size_t state_memory_bytes() const;
-
-  private:
-    struct State;
-    std::unique_ptr<State> state_;
-};
-
-} // namespace mfq::cuda::minicpmo45
 
 namespace mfq::cuda::minicpmo45 {
 std::unique_ptr<Block> load_language_block(CudaExecutionContext& execution,

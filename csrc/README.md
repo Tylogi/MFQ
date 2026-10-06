@@ -23,13 +23,14 @@ by model family:
   Tensor/context primitives in the `mfq-cuda-native` target. `ops/` contains
   device operators, including RoPE; operators consume loaded weights.
   `storage/` owns weight/source primitives, KV storage, paged payload I/O and
-  cache storage; it does not select or instantiate model families.
-  `models/common/` supplies common native loading/session bindings, Transformer
+  cache storage; it does not select model families.
+  `models/common/` supplies common native loading/session mechanics, Transformer
   blocks, predictor interfaces and grid-Vision; `models/<family>/` binds each
-  shared family graph and owns its loading and session template instantiations. The common `causal_model_ops.h` and `attention_ops.h` names
-  distinguish CUDA bindings from shared model headers.
-  `engine/` contains Engine, generation, batching, MTP execution and decode
-  Graph bindings;
+  shared family graph to CUDA operations and native state. The common
+  `causal_model_ops.h` and `attention_ops.h` names distinguish CUDA bindings
+  from shared model headers. `engine/` is the composition root: it owns family
+  selection, template bindings, optional runtime components, generation,
+  batching, MTP execution and decode Graph bindings;
 - `backends/metal/` — Metal/MLX storage, runtime utilities, operators, model
   implementations, kernels, applications, tests, benchmarks, and diagnostics;
 - `tests/` — backend-independent native tests;
@@ -82,17 +83,15 @@ synchronous token loop, with TTS sampling order in its shared model.
 HC input expansion choices, Gemma FFN finishing, position/mask rules, and
 MiniCPM/Grid-Vision multimodal composition are shared. Model definition,
 output-weight tying and layer traversal live in `CausalModelBase`; Gemma also
-owns its layer geometry and parameter-role assembly. CUDA's `CausalResources`
-supplies native bindings. Family `ops.cpp` files instantiate the shared native
-loading/placement flow and load their optional heads; `engine/model_registry.h`
-selects a family from the resolved model graph. `EngineInstance<Backend>` directly implements `Engine` and owns
-request execution, text controls and ordered reload/shutdown. CUDA's construction
-entry returns `std::unique_ptr<Engine>`; model metadata and capabilities use
-`EngineInfo`. There is no public `CudaEngine` facade or PImpl. Family Adapters
-supply resource plans, associated physical batch types and scoped request-state
-binding; Engine does not inspect concrete blocks or predictors. Qwen native
-batch operations live in `models/qwen35/batching.*` and feed shared
-`ContinuousBatch` directly, without a batch executor wrapper.
+owns its layer geometry and parameter-role assembly. CUDA's `CausalResources` supplies native bindings and model-specific resource
+geometry. Cross-family composition is confined to `engine/`; model loading and
+optional components are wired by `model_bindings.cpp` and `model_components.cpp`.
+`EngineInstance<Backend>` directly implements `Engine` and owns request
+execution, text controls and ordered reload/shutdown. CUDA's construction entry
+returns `std::unique_ptr<Engine>`; model metadata and capabilities use
+`EngineInfo`. There is no public `CudaEngine` facade or PImpl. Qwen native batch
+operations live in `engine/qwen_batching.*` and feed shared `ContinuousBatch`
+directly, without a batch executor wrapper.
 Session/prefix settings and batch budgets use shared config;
 CUDA load settings stay in `engine/load_options.cpp`. Ordinary, speculative
 and batch generation share CUDA sampling buffer/count initialization. Model

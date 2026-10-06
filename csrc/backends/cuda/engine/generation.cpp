@@ -247,7 +247,7 @@ template <class Model> struct CudaGenerationContext {
     const CudaRuntimeConfig &config;
     MtpModule *mtp;
     std::optional<CudaPreparedPrompt> prepared;
-    typename Model::Batch* batching;
+    mfq::engine::ContinuousBatch<QwenBatchOperations>* batching;
     std::string request_id;
 
     bool batched() const { return batching != nullptr; }
@@ -267,8 +267,7 @@ template <class Model> struct CudaGenerationContext {
     }
     Generation plain(mfq::engine::InferenceRequest& input, mfq::engine::InferenceOutput& output,
                      size_t reused, size_t stable) {
-        if constexpr (Model::adapter_supports_batching)
-            if (batching) return batching->generate(request_id, input, output);
+        if (batching) return batching->generate(request_id, input, output);
         return mfq::engine::generate_sequence(
             CudaGenerationOps<Model>(model, graph, input, prepared ? &*prepared : nullptr, config.decode_graph),
             output, input.prompt.size(), reused, stable, config.generation.prefill_chunk_size);
@@ -292,7 +291,7 @@ Generation generate(Model &model, DecodeGraphCache &graph, TextSessionCache &cac
     const CudaRuntimeConfig &config, mfq::engine::InferenceRequest &request,
     mfq::engine::InferenceOutput &output, MtpModule *mtp,
     std::optional<CudaPreparedPrompt> prepared,
-    typename Model::Batch* batching, std::string request_id) {
+    mfq::engine::ContinuousBatch<QwenBatchOperations>* batching, std::string request_id) {
     return mfq::engine::generate_request(
         CudaGenerationContext<Model>{model, graph, cache, config, mtp, std::move(prepared), batching,
                                      std::move(request_id)},
@@ -309,7 +308,7 @@ Generation generate(Model &model, DecodeGraphCache &graph, TextSessionCache &cac
         mfq::engine::InferenceOutput &,                                                            \
         MtpModule *,                                                                               \
         std::optional<CudaPreparedPrompt>,                                                         \
-        MODEL::Batch*, std::string);
+        mfq::engine::ContinuousBatch<QwenBatchOperations>*, std::string);
 MFQ_INSTANTIATE_FLOW(mfq::cuda::Qwen35CausalLm)
 MFQ_INSTANTIATE_FLOW(mfq::cuda::MiniCPMO45CausalLm)
 MFQ_INSTANTIATE_FLOW(mfq::cuda::MiniCPMOTtsCausalLm)

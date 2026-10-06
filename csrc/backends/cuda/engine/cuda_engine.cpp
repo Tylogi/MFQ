@@ -3,6 +3,7 @@
 #include "../ops/cuda_execution.h"
 #include "generation.h"
 #include "model_registry.h"
+#include "qwen_batching.h"
 #include "storage/weight_loader.h"
 #include "storage/text_session_cache.h"
 #include "mtp_metrics.h"
@@ -28,8 +29,7 @@ struct CudaEngineState {
     Model& language;
     DecodeGraphCache graph;
     TextSessionCache cache;
-    std::conditional_t<Model::adapter_supports_batching,
-        std::unique_ptr<typename Model::Batch>, std::nullptr_t> batching = nullptr;
+    std::unique_ptr<ContinuousBatch<QwenBatchOperations>> batching;
     bool duplex_active = false, duplex_pending = false, duplex_stop = false;
     mfq::StepSequence<ControlCompletion> duplex_sequence;
     std::optional<AdmissionBudget::Lease> duplex_memory;
@@ -89,9 +89,10 @@ struct CudaEngineState {
                 language.supports_text_session_state(), language.supports_text_session_state() ? 0 : 1) {
         prepare_memory(memory_limit);
         if (config.continuous_batch.max_sequences) {
-            if constexpr (Model::adapter_supports_batching)
-                batching = language.adapter_create_batch(language, *execution,
-                    config.generation.prefill_chunk_size, config.continuous_batch);
+            if constexpr (std::is_same_v<Model, Qwen35CausalLm>)
+                batching = std::make_unique<ContinuousBatch<QwenBatchOperations>>(
+                    config.generation.prefill_chunk_size, config.continuous_batch.prefill_token_budget,
+                    language, *execution, config.continuous_batch);
             else throw std::invalid_argument("continuous batching is unavailable for this model");
         }
     }
@@ -101,8 +102,7 @@ struct CudaEngineState {
     bool exclusive() const { return duplex_active; }
     bool mtp_available() const { return bool(components.mtp); }
     void execute(const std::vector<RequestId>& eligible) {
-        if constexpr (Model::adapter_supports_batching)
-            if (batching) batching->step(eligible);
+        if (batching) batching->step(eligible);
     }
     using Prepared = CudaPreparedPrompt;
     mfq::StepSequence<Prepared> prepare(InferenceRequest& input) {
@@ -118,23 +118,21 @@ struct CudaEngineState {
     }
     Generation generate_text(InferenceRequest& input, InferenceOutput& output, std::optional<Prepared> prepared,
                              const RequestId& id, bool batched) {
-        typename Model::Batch* batch = nullptr;
-        if constexpr (Model::adapter_supports_batching)
-            if (batched) batch = batching.get();
         return internal::generate(language, graph, cache, config,
                                   input, output, batched ? nullptr : components.mtp.get(), std::move(prepared),
-                                  batch, id);
+                                  batched ? batching.get() : nullptr, id);
     }
     Generation generate(const RequestId& id, ExecutionRequest& request) {
-        if constexpr (Model::adapter_supports_batching) {
-            if (request.batched && language.adapter_owns_generation(request.input, cache, bool(components.mtp)))
+        if constexpr (std::is_same_v<Model, Qwen35CausalLm>) {
+            if (request.batched && qwen_batch_requires_owned_generation(
+                    request.input, cache, bool(components.mtp)))
                 return generate_owned(id, request);
         }
         return generate_prepared(*this, request.input, request.output, id, request.batched);
     }
     Generation generate_owned(const RequestId& id, ExecutionRequest& request)
-        requires Model::adapter_supports_batching {
-        auto native = language.adapter_request_state(language, components.mtp.get());
+        requires std::is_same_v<Model, Qwen35CausalLm> {
+        qwen35::Qwen35GenerationState native(language, components.mtp.get());
         DecodeGraphCache request_graph(language.max_position_embeddings());
         struct Ops {
             using Prepared = CudaPreparedPrompt;
@@ -228,10 +226,8 @@ struct CudaEngineState {
                 metrics.emplace_back(prefix + "_request_bytes", request_bytes[device]);
             }
             if (components.mtp) mtp::append_generation_metrics(metrics, components.mtp->last_stats);
-            if constexpr (Model::adapter_supports_batching) {
-                if (batching) {
-                    auto batch = batching->metrics(); metrics.insert(metrics.end(), batch.begin(), batch.end());
-                }
+            if (batching) {
+                auto batch = batching->metrics(); metrics.insert(metrics.end(), batch.begin(), batch.end());
             }
             return metrics;
         } else {

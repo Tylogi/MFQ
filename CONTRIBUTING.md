@@ -33,10 +33,12 @@ architecture-named entry point.
   Shared CUDA kernel implementations still reside in `mfq/kernels/cuda/`
   pending the source/package move recorded in TODO.
 - CUDA `native/` owns tensors and contexts, `storage/` owns weight materialization
-  and physical cache storage, and `engine/` binds shared execution to device
-  state and CUDA Graphs. `models/<family>/` supplies native operator/state
-  bindings, with reusable bindings in `models/common/`. These directories are
-  relative to `csrc/backends/cuda/`.
+  and physical cache storage, and `engine/` is the sole composition root for
+  family selection, runtime components, batching and CUDA Graphs.
+  `models/<family>/` supplies native operator/state bindings, with reusable
+  bindings in `models/common/`. CUDA model code must not include CUDA `engine/`,
+  and `models/common/` must not include a concrete family. These directories
+  are relative to `csrc/backends/cuda/`.
 - CLI parsing and application composition belong in backend `commands/` and
   `apps/`, compiled into the corresponding executable.
 

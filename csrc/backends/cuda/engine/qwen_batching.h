@@ -2,13 +2,16 @@
 
 #include "continuous_batch.h"
 #include <map>
-#include "../../ops/cuda_execution.h"
-#include "../../engine/cuda_runtime_config.h"
-#include "../../ops/cuda_sampling.h"
+#include "../ops/cuda_execution.h"
+#include "cuda_runtime_config.h"
+#include "../ops/cuda_sampling.h"
 #include "models/qwen35/batch_state.h"
 
 namespace mfq::cuda {
 
+namespace internal { class TextSessionCache; }
+bool qwen_batch_requires_owned_generation(const mfq::engine::InferenceRequest&,
+    const internal::TextSessionCache&, bool predictor);
 bool qwen_continuous_batch_cuda_graph_enabled(const Qwen35CausalLm &,
                                               const CudaContinuousBatchConfig &);
 struct QwenContinuousDecodeGraph;

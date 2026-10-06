@@ -7,8 +7,6 @@
 #include "common/moe.h"
 #include "common/transformer_layer.h"
 #include "models/common/session_codec.h"
-#include "models/common/model_loading.tpp"
-#include "models/common/runtime_components.h"
 
 namespace mfq::cuda::qwen4_exp {
 using Config = mfq::models::qwen4_exp::Config;
@@ -410,20 +408,6 @@ void Qwen4Model::adapter_rollback_speculative(int64_t keep) {
 
 namespace mfq::cuda {
 
-template<> RuntimeComponents<Qwen4CausalLm> load_runtime_components(Qwen4CausalLm& model, bool optional) {
-    RuntimeComponents<Qwen4CausalLm> result{model.graph, model.plan};
-    if (!optional) return result;
-    if (result.plan.vision != CudaVisionAdapter::none ||
-            (result.plan.predictor != CudaPredictorAdapter::none && result.plan.predictor != CudaPredictorAdapter::flash_next))
-        throw std::runtime_error("unsupported Qwen4 CUDA component adapter");
-    if (result.plan.predictor == CudaPredictorAdapter::none) return result;
-    MFQ_RUNTIME_CHECK(model.supports_speculation(), "invalid Flash-Next predictor model");
-    if (auto predictor = qwen4_exp::Qwen4ExpMtp::load_if_present(*model.execution, *model.source, model.config))
-        result.mtp = std::make_unique<qwen4_exp::Qwen4ExpMtp>(std::move(*predictor));
-    result.mtp_available = bool(result.mtp);
-    return result;
-}
-
 template struct CudaSessionCodec<Qwen4Model>;
 
 } // namespace mfq::cuda
@@ -431,5 +415,3 @@ template struct CudaSessionCodec<Qwen4Model>;
 namespace mfq::models {
 template struct qwen4_exp::CausalLm<cuda::CudaCausalOps<cuda::Qwen4Model>>;
 } // namespace mfq::models
-
-MFQ_INSTANTIATE_CUDA_MODEL(mfq::cuda::Qwen4CausalLm)

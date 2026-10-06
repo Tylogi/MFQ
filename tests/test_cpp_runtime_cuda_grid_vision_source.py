@@ -24,8 +24,8 @@ PREPARED = (ROOT / "csrc/backends/cuda/ops/cuda_execution.h").read_text()
 CUDA_COMPONENTS = "\n".join(
     path.read_text()
     for path in (
-        CUDA_ROOT / "models/common/runtime_components.h",
-        CUDA_ROOT / "models/qwen35/ops.cpp",
+        CUDA_ROOT / "engine/model_components.h",
+        CUDA_ROOT / "engine/model_components.cpp",
     )
 )
 
