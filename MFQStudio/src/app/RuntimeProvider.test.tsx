@@ -7,6 +7,7 @@ import type { JobEventResource, JobResource, RuntimeStatus } from '../shared/api
 import { studioStatus } from '../studio';
 import { useJobStore } from '../stores/jobStore';
 import { RuntimeProvider, useRuntime } from './RuntimeProvider';
+import { ApiError } from '../shared/api/client';
 
 vi.mock('../studio', () => ({
   studioStatus: vi.fn(),
@@ -22,6 +23,8 @@ function RuntimeFixture() {
   return (
     <>
       <span data-testid="ready">{String(runtime.ready)}</span>
+      <span data-testid="instances">{runtime.instances.map((instance) => instance.id).join(',')}</span>
+      <button onClick={() => runtime.setSelectedModel('model-a')} type="button">Select model</button>
       <span data-testid="connection-error">{runtime.connectionError}</span>
       <span data-testid="refresh-error">{runtime.refreshError}</span>
       <span data-testid="stream-error">{Object.values(runtime.jobStreamErrors).join('; ')}</span>
@@ -74,6 +77,23 @@ describe('describes RuntimeProvider test behavior 1', () => {
     expect(screen.getByTestId('reloading')).toHaveTextContent('"instance-a":8192');
     await act(async () => { finish({ max_context: 8192 }); });
     await waitFor(() => expect(screen.getByTestId('reloading')).toHaveTextContent('{}'));
+  });
+
+  it('recovers when an instance disappears between listing and status lookup', async () => {
+    render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
+    await waitFor(() => expect(screen.getByTestId('ready')).toHaveTextContent('true'));
+    vi.mocked(runtimeApi.runtimeInstances).mockResolvedValueOnce([
+      { id: 'instance-a', model: 'model-a', state: 'ready' } as Awaited<ReturnType<typeof runtimeApi.runtimeInstances>>[number],
+    ]);
+    vi.mocked(runtimeApi.runtimeStatus).mockRejectedValueOnce(new ApiError(404, {
+      error: { code: 'runtime_instance_not_found', message: 'Instance removed', retryable: false, details: {} },
+    }));
+    fireEvent.click(screen.getByRole('button', { name: 'Select model' }));
+    await waitFor(() => expect(runtimeApi.runtimeStatus).toHaveBeenCalledWith('instance-a'));
+    await waitFor(() => expect(runtimeApi.runtimeInstances).toHaveBeenCalledTimes(3));
+    expect(screen.getByTestId('instances').textContent).toBe('');
+    expect(screen.getByTestId('refresh-error').textContent).toBe('');
+    expect(runtimeApi.runtimeStatus).toHaveBeenLastCalledWith();
   });
 
   it('verifies RuntimeProvider test behavior 4', async () => {

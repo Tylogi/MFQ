@@ -108,27 +108,38 @@ it('keeps the active session and its recovery state when navigation is blocked',
   expect(create).not.toHaveBeenCalled();
 });
 
-it('verifies useConversationSessions test behavior 5', async () => {
-  const { result, rerender } = renderHook(({ busy }) => useConversationSessions(true, busy), {
-    initialProps: { busy: true },
-  });
-  await waitFor(() => expect(result.current.activeId).toBe('a'));
+it('does not fork history when runtime reconciliation selects another available model', async () => {
+  const { result, rerender } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.conversationReady).toBe(true));
   runtime.selectedModel = 'model-b';
-  rerender({ busy: true });
+  rerender();
   expect(sessionsApi.forkSession).not.toHaveBeenCalled();
-  rerender({ busy: false });
-  await waitFor(() => expect(result.current.activeId).toBe('fork'));
-  expect(sessionsApi.forkSession).toHaveBeenCalledOnce();
+  expect(result.current.sessions).toEqual([first, second]);
+  expect(result.current.activeId).toBe('a');
 });
 
-it('verifies useConversationSessions test behavior 6', async () => {
-  runtime.models = [];
-  runtime.instances = [{ id: 'loaded-b', model: 'model-b', state: 'ready' }] as RuntimeInstance[];
-  runtime.selectedModel = 'model-b';
-  const { result } = renderHook(() => useConversationSessions(true, false));
+it('forks once when the user explicitly changes the chat model', async () => {
+  const { result, rerender } = renderHook(() => useConversationSessions(true, false));
   await waitFor(() => expect(result.current.conversationReady).toBe(true));
-  expect(result.current.active?.model).toBe('model-b');
-  expect(sessionsApi.forkSession).toHaveBeenCalledWith('a', null, true, 'A', 'model-b');
+  act(() => result.current.changeSessionModel('model-b'));
+  runtime.selectedModel = 'model-b';
+  rerender();
+  await waitFor(() => expect(result.current.activeId).toBe('fork'));
+  expect(sessionsApi.forkSession).toHaveBeenCalledExactlyOnceWith('a', null, true, 'A', 'model-b');
+});
+
+it('opens history for an unloaded model without duplicating the conversation', async () => {
+  const historical = { ...second, model: 'unloaded-model' };
+  vi.mocked(sessionsApi.listSessions).mockResolvedValue([first, historical]);
+  const { result, rerender } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.conversationReady).toBe(true));
+  act(() => result.current.selectSession('b'));
+  runtime.selectedModel = 'model-b';
+  rerender();
+  await waitFor(() => expect(useConversationStore.getState().historyLoadedId).toBe('b'));
+  expect(result.current.sessions).toEqual([first, historical]);
+  expect(result.current.activeId).toBe('b');
+  expect(sessionsApi.forkSession).not.toHaveBeenCalled();
 });
 
 it('verifies useConversationSessions test behavior 7', async () => {

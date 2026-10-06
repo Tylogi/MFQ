@@ -21,6 +21,7 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
   const [transitioning, setTransitioning] = useState(false);
   const [importRevision, setImportRevision] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [modelChange, setModelChange] = useState<{ sessionId: string; model: string } | null>(null);
   const version = useRef(0);
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
@@ -40,6 +41,7 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     const request = ++version.current;
     const store = useConversationStore.getState();
     store.reset();
+    setModelChange(null);
     const epoch = useConversationStore.getState().epoch;
     setError(null);
     if (!ready || !enabled) return;
@@ -84,7 +86,8 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
   }, [activeId, connectionRevision]);
 
   useEffect(() => {
-    if (!active || generationBusy || !modelAvailable || active.model === selectedModel) return;
+    if (!active || generationBusy || !modelAvailable || active.model === selectedModel ||
+      modelChange?.sessionId !== active.id || modelChange.model !== selectedModel) return;
     let current = true;
     setTransitioning(true);
     const epoch = useConversationStore.getState().epoch;
@@ -94,6 +97,7 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
         if (!current || epoch !== useConversationStore.getState().epoch || useConversationStore.getState().activeId !== active.id) return;
         setSessions((existing) => [replacement, ...existing]);
         setActiveId(replacement.id);
+        setModelChange(null);
       })
       .catch((cause) => {
         if (current && epoch === useConversationStore.getState().epoch) setError(errorMessage(cause));
@@ -105,12 +109,20 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
       current = false;
       setTransitioning(false);
     };
-  }, [active?.id, active?.model, active?.title, selectedModel, modelAvailable, generationBusy]);
+  }, [active?.id, active?.model, active?.title, selectedModel, modelAvailable, generationBusy, modelChange]);
+  /** Fork history only after an explicit model selection, never after runtime reconciliation. */
+  const changeSessionModel = useCallback((model: string) => {
+    if (generationBusy || transitioning) return;
+    const id = useConversationStore.getState().activeId;
+    setModelChange(id ? { sessionId: id, model } : null);
+    setSelectedModel(model);
+  }, [generationBusy, transitioning, setSelectedModel]);
 /** Switch sessions and their associated models; rebuild history requests per session in the effect. */
   const selectSession = useCallback(
     (id: string) => {
       const session = useConversationStore.getState().sessions.find((candidate) => candidate.id === id);
       if (!session || generationBusy || transitioning) return;
+      setModelChange(null);
       setSelectedModel(session.model);
       setActiveId(id);
     },
@@ -181,6 +193,7 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     error,
     setError,
     selectSession,
+    changeSessionModel,
     createSession,
     deleteSession,
     conversationReady: Boolean(

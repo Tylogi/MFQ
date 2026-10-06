@@ -28,6 +28,9 @@ export interface RuntimeCapabilities {
 }
 
 export interface RuntimeRequestMetrics {
+  /** Terminal outcome captured independently of status snapshots. */
+  status?: 'completed' | 'failed' | 'cancelled';
+  error?: string;
   id?: string;
   endpoint?: string;
   stream?: boolean;

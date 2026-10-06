@@ -1,8 +1,7 @@
-/** Poll requests and events on demand and manage job history cleanup on the logs page. */
-import { useEffect, useState } from 'react';
+/** Stream requests and events on demand and manage job history cleanup on the logs page. */
+import { useState } from 'react';
 import { runtimeApi } from '../../shared/api/resources/runtime';
 import { jobsApi } from '../../shared/api/resources/jobs';
-import type { RuntimeLogEntry, RuntimeRequestMetrics } from '../../shared/api/types';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useSettings } from '../settings/SettingsProvider';
 import { Icon, ScreenHeader, SectionLabel, TMPanel } from '../../app/display';
@@ -10,45 +9,31 @@ import { errorMessage, formatNumber } from '../../app/formatters';
 import { isTerminalJob } from '../jobs/jobSchema';
 import { toast } from '../../stores/toastStore';
 import { useJobStore } from '../../stores/jobStore';
+import { useRuntimeHistory } from './useRuntimeHistory';
+import { RuntimeHistoryList } from './RuntimeHistoryList';
+import type { RuntimeMetricSnapshot } from '../../shared/api/types';
 
-/** Read metric history only while the logs page is open; schedule each poll after the previous request completes to avoid overlap. */
+/** Use the durable row identity so different instances may reuse backend request IDs. */
+function requestKey(entry: RuntimeMetricSnapshot): string {
+  return String(entry.sequence);
+}
+
+/** Read initial history and subscribe to both SSE channels while the logs page is open. */
 export function LogsPage() {
   const jobs = useJobStore((state) => state.jobs);
-  const { ready, refreshRuntime } = useRuntime();
+  const { ready, connectionRevision, refreshRuntime } = useRuntime();
   const { tr } = useSettings();
-  const [runtimeLogs, setRuntimeLogs] = useState<RuntimeLogEntry[]>([]);
-  const [requestHistory, setRequestHistory] = useState<RuntimeRequestMetrics[]>([]);
+  const logHistory = useRuntimeHistory(ready, connectionRevision, runtimeApi.runtimeLogPage, runtimeApi.streamRuntimeLogs);
+  const requestHistory = useRuntimeHistory(
+    ready,
+    connectionRevision,
+    runtimeApi.runtimeRequestPage,
+    runtimeApi.streamRuntimeRequests,
+    requestKey,
+  );
   const [jobCleanupBusy, setJobCleanupBusy] = useState(false);
   const activeJobs = jobs.filter((job) => ['queued', 'running', 'cancelling'].includes(job.status));
   const completedJobs = jobs.filter(isTerminalJob);
-  useEffect(() => {
-    if (!ready) return;
-    let active = true;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    /** Read logs and metrics, stopping polling and ignoring late results on unmount. */
-    async function refresh() {
-      try {
-        const [logs, metrics] = await Promise.all([runtimeApi.runtimeLogs(100), runtimeApi.runtimeMetrics(200)]);
-        if (!active) return;
-        setRuntimeLogs(logs);
-        const unique = new Map<string, RuntimeRequestMetrics>();
-        for (const snapshot of metrics) {
-          const request = snapshot.values.last_request;
-          if (request?.id) unique.set(request.id, request);
-        }
-        setRequestHistory([...unique.values()].slice(-24).reverse());
-      } catch {
-        // Skip polling failures silently and retry on the next cycle.
-      } finally {
-        if (active) timer = setTimeout(() => void refresh(), 4000);
-      }
-    }
-    void refresh();
-    return () => {
-      active = false;
-      clearTimeout(timer);
-    };
-  }, [ready]);
   /** Delete one or all completed job records, then reload the shared job list. */
   async function cleanup(id?: string) {
     if (jobCleanupBusy) return;
@@ -83,16 +68,25 @@ export function LogsPage() {
             <div>
               <h2>{tr('最近请求', 'Recent requests')}</h2>
             </div>
+            <b>{requestHistory.items.length}</b>
           </div>
-          {requestHistory.length > 0 ? (
-            <div className="request-table">
-              {requestHistory.slice(0, 8).map((request) => (
-                <div className="request-row" key={request.id}>
+          <RuntimeHistoryList
+            history={requestHistory}
+            label={tr('最近请求', 'Recent requests')}
+            empty={tr('暂无请求记录。', 'No requests recorded yet.')}
+            tr={tr}
+            renderEntry={(snapshot) => {
+              const request = snapshot.values.last_request;
+              if (!request) return null;
+              return (
+                <div className="request-row">
                   <div>
                     <strong>{request.id}</strong>
                     <small>
+                      {request.status === 'failed' ? tr('失败 · ', 'Failed · ')
+                        : request.status === 'cancelled' ? tr('已取消 · ', 'Cancelled · ') : ''}
                       {request.completed_at
-                        ? new Date(request.completed_at * 1000).toLocaleTimeString()
+                        ? new Date(request.completed_at * 1000).toLocaleString()
                         : request.endpoint || 'completion'}
                     </small>
                   </div>
@@ -102,13 +96,9 @@ export function LogsPage() {
                   </span>
                   <b>{formatNumber(request.decode_tps, 1)} tok/s</b>
                 </div>
-              ))}
-            </div>
-          ) : (
-            <div className="inline-empty">
-              {tr('还没有完成的请求。', 'No completed requests yet.')}
-            </div>
-          )}
+              );
+            }}
+          />
         </TMPanel>
         <TMPanel>
           <div className="panel-heading">
@@ -180,25 +170,22 @@ export function LogsPage() {
             <div>
               <h2>{tr('Runtime 日志', 'Runtime logs')}</h2>
             </div>
-            <b>{runtimeLogs.length}</b>
+            <b>{logHistory.items.length}</b>
           </div>
-          {runtimeLogs.length > 0 ? (
-            <div className="runtime-log-list">
-              {runtimeLogs
-                .slice(-8)
-                .reverse()
-                .map((entry) => (
-                  <div className={`runtime-log ${entry.level}`} key={entry.sequence}>
-                    <span>{new Date(entry.created_at).toLocaleTimeString()}</span>
-                    <p>{entry.message}</p>
-                  </div>
-                ))}
-            </div>
-          ) : (
-            <div className="inline-empty">
-              {tr('暂无 Runtime 事件。', 'No runtime events yet.')}
-            </div>
-          )}
+          <RuntimeHistoryList
+            history={logHistory}
+            label={tr('Runtime 日志', 'Runtime logs')}
+            empty={tr('暂无 Runtime 事件。', 'No runtime events yet.')}
+            tr={tr}
+            renderEntry={(entry) => (
+              <div className={`runtime-log ${entry.level}`}>
+                <span title={new Date(entry.created_at).toLocaleString()}>
+                  {new Date(entry.created_at).toLocaleTimeString()}
+                </span>
+                <p>{entry.message}</p>
+              </div>
+            )}
+          />
         </TMPanel>
       </div>
     </section>

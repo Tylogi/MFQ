@@ -1,3 +1,4 @@
+/** Render model availability and keep unload progress visible until the operation completes. */
 import { useSettings } from '../settings/SettingsProvider';
 import { Icon, SectionLabel, TMPanel, EmptyPanel } from '../../app/display';
 import { formatNumber } from '../../app/formatters';
@@ -5,10 +6,11 @@ import type { useModelCatalog } from './useModelCatalog';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
 import { ModelLoadProgress } from './ModelLoadProgress';
 
+/** Display model actions with instance-specific unload feedback and duplicate-action protection. */
 export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
   const { tr } = useSettings();
   const { runtime, artifacts, busy, instances, modelFilter,
-    filteredArtifacts, unloadInstance, loadArtifact, chooseModelDirectory } = catalog;
+    filteredArtifacts, unloadInstance, unloadingInstanceIds, loadArtifact, chooseModelDirectory } = catalog;
   return (
     <>
       <SectionLabel
@@ -22,6 +24,7 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
               const instance = instances.find(
                 (candidate) => candidate.model === item.name && candidate.state !== 'failed',
               );
+              const unloading = instance && (instance.state === 'unloading' || unloadingInstanceIds.has(instance.id));
               const loaded = Boolean(instance) || item.name === runtime?.model;
               const policy = instance?.pinned
                 ? tr('固定', 'Pinned')
@@ -40,9 +43,9 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                     <ModelLoadProgress model={item.name} />
                   </div>
                   <div className="model-row-actions"><ModelVendorMark name={item.name} architecture={item.architecture} />{instance ? (
-                    <button disabled={busy || instance.state !== 'ready'}
+                    <button disabled={busy || unloading || instance.state !== 'ready'}
                       onClick={() => void unloadInstance(instance.id)} type="button">
-                      {tr('卸载', 'Unload')}
+                      {unloading ? tr('正在卸载…', 'Unloading…') : tr('卸载', 'Unload')}
                     </button>
                   ) : loaded ? (
                     <em>{tr('已加载', 'Loaded')}</em>

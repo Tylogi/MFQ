@@ -2,6 +2,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { modelsApi } from '../../shared/api/resources/models';
+import { jobsApi } from '../../shared/api/resources/jobs';
 import type { ModelArtifact, ModelDirectoryList } from '../../shared/api/types';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useSettings } from '../settings/SettingsProvider';
@@ -28,8 +29,17 @@ export function useModelCatalog() {
   const navigate = useNavigate();
   const [artifacts, setArtifacts] = useState<ModelArtifact[]>([]);
   const [busy, setBusy] = useState(false);
-  const observedActiveLoadJobIds = useRef(new Set<string>());
-  const reportedFailedJobIds = useRef(new Set<string>());
+  const observedModelJobIds = useRef(new Set<string>());
+  const submittingUnloads = useRef(new Set<string>());
+  const [pendingUnloads, setPendingUnloads] = useState<Record<string, string | null>>({});
+  const unloadingInstanceIds = useMemo(() => new Set([
+    ...Object.keys(pendingUnloads),
+    ...instances.filter((instance) => instance.state === 'unloading').map((instance) => instance.id),
+    ...jobs.filter((job) => job.kind === 'model.unload'
+      && ['queued', 'running', 'cancelling'].includes(job.status))
+      .map((job) => String(job.payload.instance_id)),
+  ]), [pendingUnloads, instances, jobs]);
+  const reportedModelJobIds = useRef(new Set<string>());
   const reportError = (cause: unknown) => {
     toast.error(errorMessage(cause));
   };
@@ -62,18 +72,44 @@ export function useModelCatalog() {
   }, [ready, artifactRevision]);
   useEffect(() => {
     for (const job of jobs) {
-      if (job.kind !== 'model.load') continue;
-      if (job.status === 'queued' || job.status === 'running' || job.status === 'cancelling') {
-        observedActiveLoadJobIds.current.add(job.id);
+      if (!['model.load', 'model.unload'].includes(job.kind)) continue;
+      if (['queued', 'running', 'cancelling'].includes(job.status)) {
+        observedModelJobIds.current.add(job.id);
         continue;
       }
-      const wasActive = observedActiveLoadJobIds.current.delete(job.id);
-      if (wasActive && job.status === 'failed' && job.error?.message && !reportedFailedJobIds.current.has(job.id)) {
-        reportedFailedJobIds.current.add(job.id);
-        toast.error(`${job.error.code}: ${job.error.message}`);
+      const wasActive = observedModelJobIds.current.delete(job.id);
+      if (!wasActive || reportedModelJobIds.current.has(job.id)) continue;
+      reportedModelJobIds.current.add(job.id);
+      if (job.kind === 'model.unload') {
+        const id = String(job.payload.instance_id);
+        submittingUnloads.current.delete(id);
+        setPendingUnloads((current) => {
+          if (!(id in current)) return current;
+          const next = { ...current };
+          delete next[id];
+          return next;
+        });
+        void refreshRuntime(false);
+        if (job.status === 'succeeded') toast.success(tr('模型已卸载', 'Model unloaded'));
+      }
+      if (job.kind === 'model.load' && job.status === 'succeeded') {
+        toast.success(tr('模型已加载', 'Model loaded'));
+      }
+      if (job.status === 'failed') {
+        if (job.error?.message) {
+          toast.error(`${job.error.code}: ${job.error.message}`);
+        } else {
+          // State events may arrive before the full job error is fetched.
+          void jobsApi.getJob(job.id).then((finished) => {
+            if (finished.error) toast.error(`${finished.error.code}: ${finished.error.message}`);
+            else toast.error(tr('模型操作失败，请查看任务记录', 'Model operation failed; check the task record'));
+          }).catch(() => toast.error(tr('模型操作失败，暂时无法获取详情', 'Model operation failed; details are unavailable')));
+        }
+      } else if (job.kind === 'model.unload' && job.status !== 'succeeded') {
+        toast.error(tr('模型卸载已取消或中断', 'Model unload was cancelled or interrupted'));
       }
     }
-  }, [jobs]);
+  }, [jobs, refreshRuntime, tr]);
   const filteredInstances = useMemo(
     () =>
       instances.filter((item) =>
@@ -93,10 +129,11 @@ export function useModelCatalog() {
     if (busy) return;
     setBusy(true);
     try {
-      await modelsApi.loadModel(name, contextSize, 2048, {
+      const operation = await modelsApi.loadModel(name, contextSize, 2048, {
         pin: loadPinned,
         idle_ttl_seconds: loadIdleTtl,
       });
+      observedModelJobIds.current.add(operation.operation_id);
 
       navigate(STUDIO_PATHS.models);
       await refreshRuntime(false);
@@ -206,16 +243,35 @@ export function useModelCatalog() {
     }
   }
 
-  /** Run a model catalog operation and display any error on the current page. */
+  /** Track an unload from submission through its terminal job state and suppress duplicate clicks. */
   async function unloadInstance(id: string) {
-    if (busy) return;
+    if (busy || submittingUnloads.current.has(id) || unloadingInstanceIds.has(id)) return;
+    submittingUnloads.current.add(id);
+    setPendingUnloads((current) => ({ ...current, [id]: null }));
     setBusy(true);
+    let accepted = false;
     try {
-      await modelsApi.unloadModel(id);
-
+      const operation = await modelsApi.unloadModel(id);
+      accepted = true;
+      observedModelJobIds.current.add(operation.operation_id);
+      setPendingUnloads((current) => ({ ...current, [id]: operation.operation_id }));
       navigate(STUDIO_PATHS.models);
+      // Fetch even an already-finished job so fast failures cannot escape the active-job watcher.
+      try {
+        useJobStore.getState().addJob(await jobsApi.getJob(operation.operation_id));
+      } catch {
+        // The shared job refresh will recover this accepted operation after transient read failures.
+      }
       await refreshRuntime(false);
     } catch (cause) {
+      if (!accepted) {
+        submittingUnloads.current.delete(id);
+        setPendingUnloads((current) => {
+          const next = { ...current };
+          delete next[id];
+          return next;
+        });
+      }
       reportError(cause);
     } finally {
       setBusy(false);
@@ -249,6 +305,7 @@ export function useModelCatalog() {
     openModelDirectory,
     registerCurrentModelDirectory,
     unloadInstance,
+    unloadingInstanceIds,
     loadArtifact,
   };
 }

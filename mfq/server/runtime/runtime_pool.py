@@ -11,6 +11,7 @@ import tempfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -95,6 +96,8 @@ class _MemoryPlanContext:
 _AUTOMATIC_MEMORY_SOFT_RATIO = 0.90
 _AUTOMATIC_MEMORY_HARD_RATIO = 0.95
 _AUTOMATIC_MEMORY_TARGET_RATIO = 0.85
+_RUNTIME_READ_TIMEOUT_SECONDS = 10.0
+_RUNTIME_READ_DRAIN_TIMEOUT_SECONDS = 15.0
 
 
 def _job_error(code: str, message: str, *, retryable: bool = False) -> JobExecutionError:
@@ -119,6 +122,9 @@ class _Runtime(BaseModel):
     active_requests: int = 0
     queued_requests: int = 0
     control_leases: int = 0
+    # Read leases remain part of control_leases for automatic eviction safety.
+    read_leases: int = 0
+    reads_drained: asyncio.Event = Field(default_factory=asyncio.Event)
     request_slots: asyncio.Semaphore | None = None
     request_capacity: int = 1
     mtp_supported: bool = False
@@ -1035,14 +1041,14 @@ class RuntimePool:
             if (
                 instance.active_requests
                 or instance.queued_requests
-                or instance.control_leases
+                or instance.control_leases > instance.read_leases
             ) and not request.force:
                 raise _job_error(
                     "runtime_busy",
                     "runtime has active requests, queued requests, or control operations",
                     retryable=True,
                 )
-            instance.state = RuntimeInstanceState.UNLOADING
+            self._mark_instance_unloading_locked(instance)
 
         released = False
 
@@ -1052,7 +1058,7 @@ class RuntimePool:
             await self._retire_instance(instance)
 
         context.add_cleanup(cleanup_incomplete_unload)
-        await context.progress(0.2, message="Stopping runtime")
+        await context.progress(0.2, message="Waiting for status reads and stopping runtime")
         await self._retire_instance(instance)
         await context.progress(0.9, message="Releasing runtime")
         async with self._lock:
@@ -1322,7 +1328,7 @@ class RuntimePool:
                 )
             ) as backend_stream:
                 async for delta in backend_stream:
-                    yield delta
+                    yield replace(delta, runtime_instance_id=instance.id)
         finally:
             async with self._lock:
                 instance.active_requests = max(0, instance.active_requests - 1)
@@ -1428,10 +1434,10 @@ class RuntimePool:
         self,
         instance_id: UUID | None = None,
     ) -> RuntimeCapabilitiesResource:
-        async with self._runtime_control_lease(instance_id) as (_instance, backend):
+        async with self._runtime_control_lease(instance_id, read_only=True) as (_instance, backend):
             if backend is None:
                 raise BackendError("model_not_loaded", "no runtime is available")
-            return await backend.capabilities()
+            return await asyncio.wait_for(backend.capabilities(), timeout=_RUNTIME_READ_TIMEOUT_SECONDS)
 
     async def runtime_status(
         self,
@@ -1476,6 +1482,7 @@ class RuntimePool:
         async with self._runtime_control_lease(
             instance_id,
             allow_unready=True,
+            read_only=True,
         ) as (instance, backend):
             if instance is not None and instance.state not in {
                 RuntimeInstanceState.READY,
@@ -1507,7 +1514,7 @@ class RuntimePool:
                     "total_completion_tokens": 0,
                     "reloading": False,
                 }
-            status = dict(await backend.runtime_status())
+            status = dict(await asyncio.wait_for(backend.runtime_status(), timeout=_RUNTIME_READ_TIMEOUT_SECONDS))
             status.update(memory_status)
             if instance is not None:
                 status["instance_id"] = str(instance.id)
@@ -1571,13 +1578,15 @@ class RuntimePool:
             gateway = instance.realtime_gateway if instance is not None else None
             if gateway is not None:
                 instance.control_leases += 1
+                instance.read_leases += 1
+                instance.reads_drained.clear()
         if instance is not None:
             if gateway is None:
                 return {"available": False, "modes": []}
             try:
-                return await gateway.capabilities()
+                return await asyncio.wait_for(gateway.capabilities(), timeout=_RUNTIME_READ_TIMEOUT_SECONDS)
             finally:
-                await self._release_control_lease(instance)
+                await self._release_control_lease(instance, read_only=True)
         if self.fallback is None:
             return {"available": False, "modes": []}
         return await self.fallback.realtime_capabilities()
@@ -2026,6 +2035,7 @@ class RuntimePool:
         instance_id: UUID | None,
         *,
         allow_unready: bool = False,
+        read_only: bool = False,
     ) -> AsyncIterator[tuple[_Runtime | None, ChatBackend | None]]:
         async with self._lock:
             if instance_id is None:
@@ -2055,26 +2065,33 @@ class RuntimePool:
             }
             if leased:
                 instance.control_leases += 1
+                if read_only:
+                    instance.read_leases += 1
+                    instance.reads_drained.clear()
         try:
             yield instance, backend
         finally:
             if leased and instance is not None:
-                await self._release_control_lease(instance)
+                await self._release_control_lease(instance, read_only=read_only)
 
-    async def _decrement_control_lease(self, instance: _Runtime) -> None:
+    async def _decrement_control_lease(self, instance: _Runtime, *, read_only: bool = False) -> None:
         async with self._lock:
             instance.control_leases = max(0, instance.control_leases - 1)
+            if read_only:
+                instance.read_leases = max(0, instance.read_leases - 1)
+                if instance.read_leases == 0:
+                    instance.reads_drained.set()
 
     def _finish_control_lease_release(self, task: asyncio.Task[None]) -> None:
         self._lease_release_tasks.discard(task)
         with suppress(asyncio.CancelledError):
             task.result()
 
-    async def _release_control_lease(self, instance: _Runtime) -> None:
+    async def _release_control_lease(self, instance: _Runtime, *, read_only: bool = False) -> None:
         """Release a lease even if its caller is cancelled during cleanup."""
 
         task = asyncio.create_task(
-            self._decrement_control_lease(instance),
+            self._decrement_control_lease(instance, read_only=read_only),
             name=f"mfq-server-runtime-lease-release-{instance.id}",
         )
         self._lease_release_tasks.add(task)
@@ -2751,6 +2768,9 @@ class RuntimePool:
 
     async def _stop_and_detach_instance(self, instance: _Runtime) -> None:
         try:
+            # UNLOADING prevents new readers; finish existing reads before closing their transport.
+            if instance.read_leases:
+                await asyncio.wait_for(instance.reads_drained.wait(), timeout=_RUNTIME_READ_DRAIN_TIMEOUT_SECONDS)
             await self._stop_process(instance)
         except BaseException as error:
             async with self._lock:

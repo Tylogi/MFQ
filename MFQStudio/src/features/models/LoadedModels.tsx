@@ -1,3 +1,4 @@
+/** Render model availability and keep unload progress visible until the operation completes. */
 import { useSettings } from '../settings/SettingsProvider';
 import { Icon, SectionLabel, TMPanel, EmptyPanel } from '../../app/display';
 import { formatNumber } from '../../app/formatters';
@@ -5,10 +6,11 @@ import type { useModelCatalog } from './useModelCatalog';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
 import { ModelLoadProgress } from './ModelLoadProgress';
 
+/** Display model actions with instance-specific unload feedback and duplicate-action protection. */
 export function LoadedModels({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
   const { tr } = useSettings();
   const { busy, artifacts, availableModelNames, modelFilter, filteredInstances,
-    unloadInstance, chooseModelDirectory } = catalog;
+    unloadInstance, unloadingInstanceIds, chooseModelDirectory } = catalog;
   return (
     <>
       <SectionLabel
@@ -20,11 +22,12 @@ export function LoadedModels({ catalog }: { catalog: ReturnType<typeof useModelC
         <TMPanel className="model-catalog-panel loaded-model-panel">
           <div className="model-list">
             {filteredInstances.map((instance) => {
-              const ready = instance.state === 'ready' || instance.state === 'busy';
-              const stateLabel = instance.state === 'loading'
-                ? tr('加载中', 'Loading')
-                : instance.state === 'unloading'
-                  ? tr('卸载中', 'Unloading')
+              const unloading = instance.state === 'unloading' || unloadingInstanceIds.has(instance.id);
+              const ready = !unloading && (instance.state === 'ready' || instance.state === 'busy');
+              const stateLabel = unloading
+                ? tr('正在卸载', 'Unloading')
+                : instance.state === 'loading'
+                  ? tr('加载中', 'Loading')
                   : instance.state === 'failed'
                     ? tr('失败', 'Failed')
                     : instance.state === 'busy'
@@ -48,11 +51,11 @@ export function LoadedModels({ catalog }: { catalog: ReturnType<typeof useModelC
                   <div className="model-row-actions">
                     <ModelVendorMark name={instance.model} architecture={artifacts.find((item) => item.name === instance.model)?.architecture} />
                     <button
-                      disabled={busy || instance.state !== 'ready'}
+                      disabled={busy || unloading || instance.state !== 'ready'}
                       onClick={() => void unloadInstance(instance.id)}
                       type="button"
                     >
-                      {tr('卸载', 'Unload')}
+                      {unloading ? tr('正在卸载…', 'Unloading…') : tr('卸载', 'Unload')}
                     </button>
                   </div>
                 </div>

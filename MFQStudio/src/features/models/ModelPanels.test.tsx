@@ -16,6 +16,7 @@ function catalog() {
   return {
     runtime: null,
     busy: false,
+    unloadingInstanceIds: new Set<string>(),
     artifacts: [],
     instances: [],
     availableModelNames: [],
@@ -95,4 +96,21 @@ it('verifies ModelPanels test behavior 5', () => {
   fireEvent.click(buttons[0]);
   expect(state.unloadInstance).toHaveBeenCalledWith('instance-0');
   expect(container.querySelector('.model-row-actions')?.firstElementChild).toHaveClass('model-vendor-mark');
+});
+
+
+it.each(['pending', 'unloading'])('shows %s unload feedback in both model panels', (phase) => {
+  const state = catalog();
+  const instance = { id: 'instance-1', model: 'Local Model', state: phase === 'pending' ? 'ready' : 'unloading' } as typeof state.instances[number];
+  state.instances = state.filteredInstances = [instance];
+  state.artifacts = state.filteredArtifacts = [{ id: 'asset-1', name: instance.model, loadable: true }] as typeof state.artifacts;
+  if (phase === 'pending') state.unloadingInstanceIds.add(instance.id);
+  render(<><LoadedModels catalog={state} /><LocalCheckpoints catalog={state} /></>);
+  const buttons = screen.getAllByRole('button', { name: 'Unloading…' });
+  expect(buttons).toHaveLength(2);
+  buttons.forEach((button) => {
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+  });
+  expect(state.unloadInstance).not.toHaveBeenCalled();
 });

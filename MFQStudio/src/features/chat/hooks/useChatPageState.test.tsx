@@ -30,7 +30,7 @@ beforeEach(() => {
   vi.mocked(useConversationSelector).mockImplementation((selector) => selector(state as never));
   vi.mocked(useChat).mockReturnValue({
     busy: false,
-    conversation: { selectSession, createSession },
+    conversation: { selectSession, createSession, changeSessionModel: vi.fn() },
     inference: { setSelectedModel: vi.fn(), availableModelNames: ['model-a', 'model-b'] },
     messageActions: { saveEdit },
   } as unknown as ReturnType<typeof useChat>);
@@ -59,15 +59,15 @@ it('verifies useChatPageState test behavior 2', () => {
     wrapper: ({ children }) => <MemoryRouter>{children}</MemoryRouter>,
   });
   act(() => result.current.selectModel('model-b'));
-  expect(chat.inference.setSelectedModel).not.toHaveBeenCalled();
+  expect(chat.conversation.changeSessionModel).not.toHaveBeenCalled();
   vi.mocked(useChat).mockReturnValue({ ...chat, busy: false });
   rerender();
   act(() => result.current.selectModel('model-b'));
-  expect(chat.inference.setSelectedModel).toHaveBeenCalledWith('model-b');
+  expect(chat.conversation.changeSessionModel).toHaveBeenCalledWith('model-b');
   act(() => result.current.selectModel('unloaded-asset'));
-  expect(chat.inference.setSelectedModel).toHaveBeenCalledOnce();
+  expect(chat.conversation.changeSessionModel).toHaveBeenCalledOnce();
   vi.mocked(useChat).mockReturnValue({ ...chat, busy: false, recoveryNeeded: true });
   rerender();
   act(() => result.current.selectModel('model-b'));
-  expect(chat.inference.setSelectedModel).toHaveBeenCalledOnce();
+  expect(chat.conversation.changeSessionModel).toHaveBeenCalledOnce();
 });

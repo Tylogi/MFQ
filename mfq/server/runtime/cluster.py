@@ -10,7 +10,7 @@ import os
 import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
@@ -374,7 +374,7 @@ class ClusterBackend:
                 ) as remote_stream:
                     async for delta in remote_stream:
                         emitted = True
-                        yield delta
+                        yield replace(delta, runtime_source=str(node.resource.id))
                 return
             except BackendError as error:
                 if emitted or not error.retryable:

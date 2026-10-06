@@ -2,6 +2,19 @@
 /* ---------- Logs page ---------- */
 
 .runtime-log-list { display: grid; margin-top: 12px; }
+.runtime-history {
+  max-height: 440px;
+  overflow-y: auto;
+  overflow-anchor: none;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding-inline-end: 16px;
+  margin-top: 12px;
+}
+.runtime-history:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.runtime-history-footer { display: flex; justify-content: center; align-items: center; gap: 8px; min-height: 40px; color: var(--muted-light); font-size: 11px; }
+.runtime-history-footer button { border: 1px solid var(--panel-line); border-radius: 6px; padding: 5px 9px; color: var(--muted); background: var(--panel-control); cursor: pointer; }
+.runtime-history-footer button:hover { color: var(--ink); background: var(--surface-hover); }
 .runtime-log { display: grid; grid-template-columns: 66px minmax(0, 1fr); gap: 8px; border-top: 1px solid var(--panel-line); padding: 7px 1px; }
 .runtime-log span { color: var(--muted-light); font-size: 10px; }
 .runtime-log p { min-width: 0; overflow-wrap: anywhere; margin: 0; color: var(--ink-soft); font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }

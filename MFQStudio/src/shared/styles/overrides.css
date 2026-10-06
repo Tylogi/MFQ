@@ -51,6 +51,7 @@ button:active, a:active { transform: translateY(1px); }
 .chat-session-row:hover, .chat-session-row.active { background: var(--surface-subtle); }
 .chat-session-row.active { box-shadow: inset 2px 0 0 var(--accent); }
 .chat-session-row .chat-session-select-button { width: 100%; }
+.chat-session-row .chat-session-select-button:hover { background: transparent; }
 .chat-session-row .chat-session-delete-button { width: 28px; height: 28px; place-items: center; padding: 0; color: var(--muted); }
 .chat-session-row .chat-session-delete-button:hover, .chat-session-row .chat-session-delete-button:focus-visible { color: var(--danger); background: var(--danger-soft); }
 .chat-session-row button:disabled { cursor: not-allowed; opacity: 0.5; }

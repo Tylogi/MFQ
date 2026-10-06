@@ -13,6 +13,7 @@ import type {
   VoiceOutputComponentStatus,
 } from '../types';
 import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client';
+import { readEventStream } from '../eventStream';
 
 export interface RuntimeMemoryPolicy {
   model_limit_bytes: number | null;
@@ -21,7 +22,41 @@ export interface RuntimeMemoryPolicy {
   actual_prefix_directory: string;
 }
 
+/** Bound a history page by sequence; ascending pages are used to catch up live events. */
+export interface RuntimeHistoryQuery {
+  before?: number;
+  after?: number;
+  order?: 'asc' | 'desc';
+}
+
+/** Encode optional cursors without treating an absent cursor as the end of history. */
+function historyQuery(limit: number, query: RuntimeHistoryQuery): string {
+  const params = new URLSearchParams({ limit: String(limit), order: query.order ?? 'desc' });
+  if (query.before !== undefined) params.set('before', String(query.before));
+  if (query.after !== undefined) params.set('after', String(query.after));
+  return params.toString();
+}
+
+/** Read either durable runtime SSE channel using the existing authenticated stream parser. */
+async function streamHistory<T>(
+  channel: 'logs' | 'requests', after: number, onEvent: (entry: T) => void, signal: AbortSignal,
+): Promise<void> {
+  const response = await fetch(apiUrl(`/api/v1/runtime/${channel}/stream?after=${after}`), {
+    headers: authorizedHeaders({ Accept: 'text/event-stream' }), signal,
+  });
+  if (!response.ok) throw await errorFromResponse(response);
+  await readEventStream(response, onEvent, signal);
+}
+
 export const runtimeApi = {
+  /** Subscribe to committed logs; the history hook owns cursor retries and cancellation. */
+  streamRuntimeLogs(after: number, onEvent: (entry: RuntimeLogEntry) => void, signal: AbortSignal): Promise<void> {
+    return streamHistory('logs', after, onEvent, signal);
+  },
+  /** Subscribe to terminal request metrics using the same transport as runtime logs. */
+  streamRuntimeRequests(after: number, onEvent: (entry: RuntimeMetricSnapshot) => void, signal: AbortSignal): Promise<void> {
+    return streamHistory('requests', after, onEvent, signal);
+  },
   runtimeResources(): Promise<RuntimeResources> {
     return request('/api/v1/runtime/resources');
   },
@@ -111,9 +146,23 @@ export const runtimeApi = {
     ).data;
   },
 
-  /** Get recent server logs. */
-  async runtimeLogs(limit = 100): Promise<RuntimeLogEntry[]> {
-    return (await request<{ data: RuntimeLogEntry[] }>(`/api/v1/runtime/logs?limit=${limit}`)).data;
+  /** Read server logs in ascending sequence order, continuing after the supplied cursor. */
+  async runtimeLogs(limit = 100, after = 0): Promise<RuntimeLogEntry[]> {
+    return (await request<{ data: RuntimeLogEntry[] }>(`/api/v1/runtime/logs?limit=${limit}&after=${after}`)).data;
+  },
+
+  /** Read one cursor page of runtime logs, cancelling when the page connection changes. */
+  async runtimeLogPage(limit: number, query: RuntimeHistoryQuery, signal?: AbortSignal): Promise<RuntimeLogEntry[]> {
+    return (await request<{ data: RuntimeLogEntry[] }>(
+      `/api/v1/runtime/logs?${historyQuery(limit, query)}`, { signal },
+    )).data;
+  },
+
+  /** Read durable terminal requests with stable pagination cursors. */
+  async runtimeRequestPage(limit: number, query: RuntimeHistoryQuery, signal?: AbortSignal): Promise<RuntimeMetricSnapshot[]> {
+    return (await request<{ data: RuntimeMetricSnapshot[] }>(
+      `/api/v1/runtime/requests?${historyQuery(limit, query)}`, { signal },
+    )).data;
   },
 
   /** Read voice channel availability and default audio parameters. */

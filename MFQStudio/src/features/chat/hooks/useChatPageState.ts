@@ -60,9 +60,10 @@ export function useChatPageState() {
     navigate('/models');
   }
 
+  /** Apply an explicit chat model change through the session lifecycle. */
   function selectModel(value: string) {
     if (chat.busy || chat.recoveryNeeded) return;
-    if (chat.inference.availableModelNames.includes(value)) chat.inference.setSelectedModel(value);
+    if (chat.inference.availableModelNames.includes(value)) chat.conversation.changeSessionModel(value);
   }
 
   return {
