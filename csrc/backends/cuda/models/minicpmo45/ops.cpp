@@ -1,6 +1,8 @@
 #include "ops.h"
-#include "storage/transformer_loader.h"
-#include "storage/session_codec.h"
+#include "models/common/transformer_loader.h"
+#include "models/common/session_codec.h"
+#include "models/common/model_loading.tpp"
+#include "models/common/runtime_components.h"
 #include "models/common/full_block.h"
 
 namespace mfq::cuda {
@@ -91,6 +93,21 @@ MiniCPMO45Model::adapter_next_token(const QuantLinear &lm_head,
 
 namespace mfq::cuda {
 
+template<> RuntimeComponents<MiniCPMO45CausalLm> load_runtime_components(MiniCPMO45CausalLm& model, bool optional) {
+    RuntimeComponents<MiniCPMO45CausalLm> result{model.graph, model.plan};
+    if (!optional || result.plan.vision == CudaVisionAdapter::none) return result;
+    if (result.plan.vision != CudaVisionAdapter::minicpmo45)
+        throw std::runtime_error("unsupported MiniCPM-o CUDA vision adapter");
+    result.composite = std::make_unique<minicpmo45::Components>(std::move(model));
+    result.language_override = &result.composite->language();
+    result.vision_available = true;
+    return result;
+}
+
+template<> RuntimeComponents<MiniCPMOTtsCausalLm> load_runtime_components(MiniCPMOTtsCausalLm& model, bool) {
+    return {model.graph, model.plan};
+}
+
 template struct FullAttentionSessionCodec<MiniCPMO45Model>;
 template struct FullAttentionSessionCodec<MiniCPMOTtsModel>;
 
@@ -100,3 +117,6 @@ namespace mfq::models {
 template struct minicpmo45::CausalLm<cuda::CudaCausalOps<cuda::MiniCPMO45Model>>;
 template struct minicpmo45::TtsCausalLm<cuda::CudaCausalOps<cuda::MiniCPMOTtsModel>>;
 } // namespace mfq::models
+
+MFQ_INSTANTIATE_CUDA_MODEL(mfq::cuda::MiniCPMO45CausalLm)
+MFQ_INSTANTIATE_CUDA_MODEL(mfq::cuda::MiniCPMOTtsCausalLm)

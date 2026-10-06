@@ -7,6 +7,11 @@
 #include <cstdint>
 #include <memory>
 
+struct FullBlockSessionState;
+struct FullBlock;
+FullBlockSessionState capture_full_attention_session_state(const FullBlock&, int64_t cache_pos, size_t& bytes);
+void restore_full_attention_session_state(FullBlock&, const FullBlockSessionState&);
+
 struct FullAttentionState {
     KVCache cache;
     mfq_tensor_backend::Tensor decode_partial_o;

@@ -39,10 +39,10 @@ QWEN_CONFIG = (
 ).read_text(encoding="utf-8")
 CAUSAL_LM = "\n".join(
     (CUDA_ROOT / name).read_text(encoding="utf-8")
-    for name in ("models/common/causal_model_ops.h", "models/common/causal_model_ops.cpp", "storage/session_codec.h")
+    for name in ("models/common/causal_model_ops.h", "models/common/causal_model_ops.cpp", "models/common/session_codec.h")
 )
 RUNTIME_OPTIONS = (
-    CUDA_ROOT / "storage" / "load_options.cpp"
+    CUDA_ROOT / "engine" / "load_options.cpp"
 ).read_text(encoding="utf-8")
 
 

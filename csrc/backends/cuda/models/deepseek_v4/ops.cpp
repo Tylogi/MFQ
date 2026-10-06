@@ -1,7 +1,8 @@
-#include "storage/transformer_loader.h"
+#include "models/common/transformer_loader.h"
 #include "storage/weight_loader.h"
 #include "ops.h"
-#include "storage/session_codec.h"
+#include "models/common/session_codec.h"
+#include "models/common/model_loading.tpp"
 
 namespace mfq::cuda::deepseek_v4 {
 
@@ -461,3 +462,5 @@ namespace mfq::cuda {} // namespace mfq::cuda
 namespace mfq::models {
 template struct deepseek_v4::CausalLm<cuda::CudaCausalOps<cuda::DeepseekV4Model>>;
 } // namespace mfq::models
+
+MFQ_INSTANTIATE_CUDA_MODEL(mfq::cuda::DeepseekV4CausalLm)

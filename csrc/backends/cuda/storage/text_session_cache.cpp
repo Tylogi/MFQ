@@ -1,22 +1,11 @@
-#include "storage/text_session_cache.h"
-#include "models/common/full_block.h"
+#include "text_session_cache_impl.h"
+#include "runtime_config.h"
+#include "mfq/model_source.h"
+#include "mfq_paged_prefix_cache.h"
+#include "../ops/cuda_execution.h"
+
 #include <array>
 #include <cstring>
-
-#include "../engine/cuda_runtime_config.h"
-#include "models/deepseek_v4/ops.h"
-#include "models/deepseek_v41/ops.h"
-#include "models/gemma4/ops.h"
-#include "models/glm5_next/ops.h"
-#include "models/glm_dsa/ops.h"
-#include "models/minicpmo45/ops.h"
-#include "models/qwen35/ops.h"
-#include "models/qwen4_exp/ops.h"
-#include "storage/session_state.h"
-#include "models/common/mtp.h"
-#include "mfq_paged_prefix_cache.h"
-#include "paged_session_bindings.h"
-#include "session_cache.h"
 
 #include <algorithm>
 #include <chrono>
@@ -79,34 +68,21 @@ std::shared_ptr<mfq::cache::PagedPrefixCache> make_cuda_paged_prefix_cache(
     return std::make_shared<mfq::cache::PagedPrefixCache>(std::move(cache));
 }
 
-struct CudaSessionOps {
-    using Snapshot = TextSessionState;
-    using Restore = TextSessionRestore;
-    using Predictor = MtpModule;
-    using StateError = CudaSessionStateError;
-    template <class Payloads>
-    static auto decode(
-        const Payloads &payloads, const std::vector<int64_t> &tokens, size_t block_size) {
-        return decode_cuda_paged_session(payloads, tokens, block_size);
-    }
-    static auto encode(const Snapshot &state, size_t block_size, size_t index) {
-        return encode_cuda_paged_block(state, block_size, index);
-    }
-    static auto decode_steps(const std::vector<CudaPagedPayload> &payloads,
-                             const std::vector<int64_t> &tokens,
-                             size_t block_size) {
-      return decode_cuda_paged_session_steps(payloads, tokens, block_size);
-    }
-    static auto encode_steps(const Snapshot &state, size_t block_size,
-                             size_t index) {
-      return encode_cuda_paged_block_steps(state, block_size, index);
-    }
-    static void release_host_cache() { mfq_release_host_allocator_cache(); }
-};
-
-struct TextSessionCache::Impl : mfq::engine::SessionCache<CudaSessionOps> {
-    using SessionCache::SessionCache;
-};
+TextSessionState CudaSessionOps::decode(const std::vector<CudaPagedPayload>& payloads,
+        const std::vector<int64_t>& tokens, size_t block_size) {
+    return decode_cuda_paged_session(payloads, tokens, block_size);
+}
+CudaPagedPayload CudaSessionOps::encode(const Snapshot& state, size_t block_size, size_t index) {
+    return encode_cuda_paged_block(state, block_size, index);
+}
+mfq::StepSequence<TextSessionState> CudaSessionOps::decode_steps(const std::vector<CudaPagedPayload>& payloads,
+        const std::vector<int64_t>& tokens, size_t block_size) {
+    return decode_cuda_paged_session_steps(payloads, tokens, block_size);
+}
+mfq::StepSequence<CudaPagedPayload> CudaSessionOps::encode_steps(const Snapshot& state, size_t block_size, size_t index) {
+    return encode_cuda_paged_block_steps(state, block_size, index);
+}
+void CudaSessionOps::release_host_cache() { mfq_release_host_allocator_cache(); }
 
 TextSessionCache::TextSessionCache(const mfq::engine::SessionCacheConfig &session_config,
     const mfq::engine::PrefixCacheConfig &prefix_config,
@@ -122,20 +98,6 @@ bool TextSessionCache::persistent_prefix_enabled() const noexcept {
     return impl_->persistent_prefix_enabled();
 }
 
-template <typename Model>
-TextSessionRestore TextSessionCache::restore_best(Model &model, MtpModule *mtp,
-    const std::string &requested_session, const std::vector<int64_t> &prompt,
-    size_t maximum_prefix_tokens, const std::string &input_key) {
-    return impl_->restore_best(
-        model, mtp, requested_session, prompt, maximum_prefix_tokens, input_key);
-}
-
-template <typename Model>
-mfq::StepSequence<TextSessionRestore> TextSessionCache::restore_steps(
-    Model &model, MtpModule *mtp, const std::string &session,
-    const std::vector<int64_t> &prompt, size_t limit, const std::string &key) {
-  return impl_->restore_steps(model, mtp, session, prompt, limit, key);
-}
 mfq::StepSequence<std::monostate>
 TextSessionCache::store_steps(const std::string &session,
                               TextSessionState state) {
@@ -164,28 +126,6 @@ size_t TextSessionCache::clear_live_sessions() noexcept { return impl_->clear_li
 size_t TextSessionCache::clear() { return impl_->clear(); }
 
 uint64_t TextSessionCache::trim_hot(uint64_t target_bytes) { return impl_->trim_hot(target_bytes); }
-
-#define MFQ_INSTANTIATE_SESSION_CACHE(MODEL)                                   \
-  template mfq::StepSequence<TextSessionRestore>                               \
-  TextSessionCache::restore_steps(MODEL &, MtpModule *, const std::string &,   \
-                                  const std::vector<int64_t> &, size_t,        \
-                                  const std::string &);                        \
-                                                                               \
-  template TextSessionRestore TextSessionCache::restore_best(                  \
-      MODEL &, MtpModule *, const std::string &, const std::vector<int64_t> &, \
-      size_t, const std::string &);
-
-MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::Qwen35CausalLm)
-MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::MiniCPMO45CausalLm)
-MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::MiniCPMOTtsCausalLm)
-MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::Gemma4CausalLm)
-MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::GlmDsaCausalLm)
-MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::Glm5CausalLm)
-MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::Qwen4CausalLm)
-MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::DeepseekV4CausalLm)
-MFQ_INSTANTIATE_SESSION_CACHE(mfq::cuda::DeepseekV41CausalLm)
-
-#undef MFQ_INSTANTIATE_SESSION_CACHE
 
 } // namespace mfq::cuda::internal
 
@@ -482,33 +422,4 @@ void restore_session_prefix_tensor(mfq_tensor_backend::Tensor &target,
     if (source.size(dimension) > 0) {
         target.narrow(dimension, 0, source.size(dimension)).copy_(source);
     }
-}
-
-FullBlockSessionState capture_full_attention_session_state(const FullBlock &block,
-                                                           int64_t cache_pos, size_t &bytes) {
-    if (!block.state->cache.k.defined() || !block.state->cache.v.defined() || block.state->cache.k.dim() != 4 ||
-        block.state->cache.v.sizes() != block.state->cache.k.sizes() || block.state->cache.k.size(0) != 1) {
-        throw std::runtime_error("full-attention KV cache is unavailable");
-    }
-    FullBlockSessionState state;
-    state.capacity = block.state->cache.k.size(2);
-    state.ring = block.state->cache.ring;
-    const int64_t saved_tokens =
-        state.ring ? state.capacity : std::min<int64_t>(cache_pos, state.capacity);
-    state.k = block.state->cache.k.narrow(2, 0, saved_tokens).clone();
-    state.v = block.state->cache.v.narrow(2, 0, saved_tokens).clone();
-    bytes += session_tensor_bytes(state.k);
-    bytes += session_tensor_bytes(state.v);
-    return state;
-}
-
-void restore_full_attention_session_state(FullBlock &block, const FullBlockSessionState &state) {
-    if (!state.k.defined() || !state.v.defined() || state.capacity <= 0 || state.k.dim() != 4 ||
-        state.v.sizes() != state.k.sizes() || state.k.size(0) != 1 ||
-        state.k.size(2) > state.capacity) {
-        throw CudaSessionStateError("full-attention session KV layout is invalid");
-    }
-    restore_session_prefix_tensor(block.state->cache.k, state.k, 2, state.capacity);
-    restore_session_prefix_tensor(block.state->cache.v, state.v, 2, state.capacity);
-    block.state->cache.ring = state.ring;
 }

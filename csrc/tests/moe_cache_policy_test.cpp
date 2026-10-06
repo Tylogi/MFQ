@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -131,6 +132,18 @@ void test_budget_planner_caps_registered_experts() {
     require(plan.at("large") == 4, "planner exceeded large registered count");
 }
 
+void test_invalid_capacity_and_budget_overflow() {
+    bool rejected = false;
+    try { mfq::MoeCacheSlotBook book(-1); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "negative capacity reached allocation");
+    rejected = false;
+    const auto maximum = std::numeric_limits<int64_t>::max();
+    try { mfq::plan_moe_arena_slots(maximum, {{"first", maximum, 1, 1}, {"second", 1, 1, 1}}); }
+    catch (const std::overflow_error&) { rejected = true; }
+    require(rejected, "combined arena minimums overflowed the byte budget");
+}
+
 }  // namespace
 
 int main() {
@@ -142,7 +155,8 @@ int main() {
         test_budget_planner_honors_minimums_and_hard_limit();
         test_budget_planner_rejects_insufficient_budget();
         test_budget_planner_caps_registered_experts();
-        std::cout << "moe_cache_policy_tests=7 passed=7\n";
+        test_invalid_capacity_and_budget_overflow();
+        std::cout << "moe_cache_policy_tests=8 passed=8\n";
         return 0;
     } catch (const std::exception & error) {
         std::cerr << "moe_cache_policy_test failure=" << error.what() << "\n";

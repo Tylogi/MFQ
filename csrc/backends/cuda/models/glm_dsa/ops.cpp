@@ -1,7 +1,8 @@
-#include "storage/transformer_loader.h"
+#include "models/common/transformer_loader.h"
 #include "storage/weight_loader.h"
 #include "ops.h"
-#include "storage/session_codec.h"
+#include "models/common/session_codec.h"
+#include "models/common/model_loading.tpp"
 
 namespace mfq::cuda::glm_dsa {
 
@@ -162,3 +163,5 @@ namespace mfq::cuda {} // namespace mfq::cuda
 namespace mfq::models {
 template struct glm_dsa::CausalLm<cuda::CudaCausalOps<cuda::GlmDsaModel>>;
 } // namespace mfq::models
+
+MFQ_INSTANTIATE_CUDA_MODEL(mfq::cuda::GlmDsaCausalLm)

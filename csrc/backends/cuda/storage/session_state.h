@@ -17,7 +17,6 @@
 #include <vector>
 
 struct Dsv4PoolState;
-struct FullBlock;
 
 struct FullBlockSessionState {
     mfq_tensor_backend::Tensor k;
@@ -221,15 +220,6 @@ void restore_session_prefix_tensor(
     const mfq_tensor_backend::Tensor& source,
     int64_t dimension,
     int64_t capacity);
-
-FullBlockSessionState capture_full_attention_session_state(
-    const FullBlock& block,
-    int64_t cache_pos,
-    size_t& bytes);
-
-void restore_full_attention_session_state(
-    FullBlock& block,
-    const FullBlockSessionState& state);
 
 Dsv4PoolSessionState capture_dsv4_pool_session_state(
     const Dsv4PoolState& source,

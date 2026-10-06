@@ -66,7 +66,7 @@ target_link_libraries(mfq-sampling-test PRIVATE mfq-engine)
 target_compile_features(mfq-sampling-test PRIVATE cxx_std_17)
 add_test(NAME mfq-sampling-test COMMAND mfq-sampling-test)
 add_executable(mfq-moe-cache-policy-test moe_cache_policy_test.cpp)
-target_link_libraries(mfq-moe-cache-policy-test PRIVATE mfq-engine)
+target_link_libraries(mfq-moe-cache-policy-test PRIVATE mfq-core)
 target_compile_features(mfq-moe-cache-policy-test PRIVATE cxx_std_17)
 add_test(NAME mfq-moe-cache-policy-test COMMAND mfq-moe-cache-policy-test)
 mfq_add_core_test(mfq-tensor-parallel-test tensor_parallel_test.cpp)
@@ -98,7 +98,7 @@ add_test(NAME mfq-mtp-policy-test COMMAND mfq-mtp-policy-test)
 # Internal tests opt in explicitly; clients inherit only the public contract.
 foreach(target IN ITEMS
         mfq-paged-kv-allocator-test mfq-session-snapshot-cache-test
-        mfq-text-emitter-test mfq-sampling-test mfq-moe-cache-policy-test
+        mfq-text-emitter-test mfq-sampling-test
         mfq-inference-test mfq-request-executor-test mfq-shared-execution-test
         mfq-mtp-policy-test)
     target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/engine/internal)

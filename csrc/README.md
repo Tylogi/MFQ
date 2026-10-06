@@ -22,10 +22,11 @@ by model family:
   operators, applications, build definition, and tests. `native/` implements
   Tensor/context primitives in the `mfq-cuda-native` target. `ops/` contains
   device operators, including RoPE; operators consume loaded weights.
-  `storage/` owns weight loading, KV storage and session codecs/cache storage.
-  `models/common/` supplies common native model bindings, Transformer blocks,
-  predictor interfaces and grid-Vision; `models/<family>/` binds each shared
-  family graph. The common `causal_model_ops.h` and `attention_ops.h` names
+  `storage/` owns weight/source primitives, KV storage, paged payload I/O and
+  cache storage; it does not select or instantiate model families.
+  `models/common/` supplies common native loading/session bindings, Transformer
+  blocks, predictor interfaces and grid-Vision; `models/<family>/` binds each
+  shared family graph and owns its loading and session template instantiations. The common `causal_model_ops.h` and `attention_ops.h` names
   distinguish CUDA bindings from shared model headers.
   `engine/` contains Engine, generation, batching, MTP execution and decode
   Graph bindings;
@@ -82,13 +83,14 @@ HC input expansion choices, Gemma FFN finishing, position/mask rules, and
 MiniCPM/Grid-Vision multimodal composition are shared. Model definition,
 output-weight tying and layer traversal live in `CausalModelBase`; Gemma also
 owns its layer geometry and parameter-role assembly. CUDA's `CausalResources`
-supplies native bindings, and `storage/model_loader.cpp` handles device loading
-and placement. `EngineInstance<Backend>` directly implements `Engine` and owns
+supplies native bindings. Family `ops.cpp` files instantiate the shared native
+loading/placement flow and load their optional heads; `engine/model_registry.h`
+selects a family from the resolved model graph. `EngineInstance<Backend>` directly implements `Engine` and owns
 request execution, text controls and ordered reload/shutdown. CUDA's construction
 entry returns `std::unique_ptr<Engine>`; model metadata and capabilities use
 `EngineInfo`. There is no public `CudaEngine` facade or PImpl. Native batch operations
 feed `ContinuousBatch<QwenBatchOperations>` directly, without a batch executor wrapper. Session/prefix settings and batch budgets use shared config;
-CUDA load settings stay in `storage/load_options.cpp`. Ordinary, speculative
+CUDA load settings stay in `engine/load_options.cpp`. Ordinary, speculative
 and batch generation share CUDA sampling buffer/count initialization. Model
 users include their actual family headers directly; there is no include-only
 model registry or CUDA MXFP4 blob forwarding header.

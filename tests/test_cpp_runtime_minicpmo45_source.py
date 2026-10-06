@@ -6,11 +6,11 @@ CUDA_ROOT = ROOT / "csrc" / "backends" / "cuda"
 DECODE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in sorted(CUDA_ROOT.rglob("*"))
-    if path.suffix in {".h", ".cpp"}
+    if path.suffix in {".h", ".cpp", ".tpp"}
 )
 CUDA_COMPONENTS = "\n".join(
-    (CUDA_ROOT / "storage" / name).read_text(encoding="utf-8")
-    for name in ("model_loader.h", "model_loader.cpp")
+    (CUDA_ROOT / name).read_text(encoding="utf-8")
+    for name in ("models/common/runtime_components.h", "models/minicpmo45/ops.cpp")
 )
 CUDA_ENGINE = (CUDA_ROOT / "engine" / "cuda_engine.cpp").read_text(
     encoding="utf-8"
@@ -191,7 +191,7 @@ def test_minicpmo45_preserves_qkv_projection_boundaries():
     assert "bool preserve_projection_boundaries = false" in DECODE
     assert "std::move(layers), preserve_projection_boundaries" in DECODE
     assert "loader.preserve_projection_boundaries = block->official_bf16" in DECODE
-    loader = (CUDA_ROOT / "storage/transformer_loader.cpp").read_text()
+    loader = (CUDA_ROOT / "models/common/transformer_loader.cpp").read_text()
     assert "names, 2, nullptr," in loader
     assert "down, shared_gate_up_compatible_prefix," in loader
     assert loader.count("preserve_projection_boundaries);") == 2

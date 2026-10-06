@@ -10,16 +10,16 @@ DECODE = "\n".join(
     for path in sorted(CUDA_ROOT.rglob("*"))
     if path.suffix in {".h", ".cpp"}
 )
-MODEL_LOADER = (CUDA_ROOT / "storage" / "model_loader.cpp").read_text(
+MODEL_LOADER = (CUDA_ROOT / "models/common/model_loading.tpp").read_text(
     encoding="utf-8"
 )
 CUDA_RUNTIME = "\n".join(
     path.read_text(encoding="utf-8")
     for path in (
         CUDA_ROOT / "commands" / "runtime.cpp",
-        CUDA_ROOT / "storage" / "model_loader.h",
+        CUDA_ROOT / "engine/model_registry.h",
         CUDA_ROOT / "commands" / "cli.cpp",
-        CUDA_ROOT / "storage" / "load_options.cpp",
+        CUDA_ROOT / "engine/load_options.cpp",
         CUDA_ROOT / "commands" / "diagnostics.cpp",
     )
 )
@@ -93,7 +93,7 @@ def test_moe_cache_capacity_failure_uses_full_projection_path() -> None:
 def test_optional_predictor_experts_join_the_shared_moe_cache() -> None:
     assert "bool defer_moe_cache_finalize = false" in DECODE
     assert "!defer_moe_cache_finalize" in MODEL_LOADER
-    assert "bool load_optional_components" in CUDA_RUNTIME
+    assert "bool optional" in CUDA_RUNTIME
     assert CUDA_RUNTIME.index("load_runtime_components(") < CUDA_RUNTIME.index(
         "finalize_moe_expert_cache(execution.moe_expert_cache);"
     )
@@ -113,7 +113,7 @@ def test_stdio_transport_owns_stdin_and_isolates_stdout() -> None:
     assert "DuplicateHandle(" in TRANSPORT
     assert "FALSE, DUPLICATE_SAME_ACCESS" in TRANSPORT
     assert CUDA_RUNTIME.index("prepare_mfq_stdio_transport();") < CUDA_RUNTIME.index(
-        "Model model ="
+        "auto model = load_causal_lm<Model>"
     )
     assert METAL_RUNTIME.index("prepare_mfq_stdio_transport();") < METAL_RUNTIME.index(
         "const mfq::metal::MfqContainer model(arguments.mfq);"

@@ -1,9 +1,12 @@
 #include "storage/weight_loader.h"
 #include "ops.h"
-#include "storage/session_codec.h"
+#include "models/common/session_codec.h"
+#include "models/common/model_loading.tpp"
+#include "models/common/runtime_components.h"
+#include "mtp.h"
 #include "linear_attention.h"
 
-#include "storage/transformer_loader.h"
+#include "models/common/transformer_loader.h"
 
 namespace mfq::cuda::qwen35 {
 struct BlockLoader : TransformerWeightLoader {
@@ -365,6 +368,34 @@ bool Qwen35Model::adapter_supports_prepared_prompt() const noexcept { return tru
 
 namespace mfq::cuda {
 
+template<> RuntimeComponents<Qwen35CausalLm> load_runtime_components(Qwen35CausalLm& model, bool optional) {
+    RuntimeComponents<Qwen35CausalLm> result{model.graph, model.plan};
+    if (!optional) return result;
+    if (result.plan.vision == CudaVisionAdapter::grid_vit) {
+        const auto* component = result.graph.component("vision");
+        const auto& config = model.config;
+        if (!component || !config.grid_vision || !config.image_token_id || !config.video_token_id)
+            throw std::runtime_error("CUDA grid-Vision configuration is incomplete");
+        result.grid_vision.emplace(grid_vision_runtime::CudaGridVisionPromptComponent::load(
+            *model.execution, *model.source, *config.grid_vision, *config.image_token_id, *config.video_token_id,
+            component->input_contract, component->position_policy));
+        result.vision_available = true;
+    } else if (result.plan.vision != CudaVisionAdapter::none)
+        throw std::runtime_error("CUDA vision adapter is unsupported for Qwen");
+    if (result.plan.predictor == CudaPredictorAdapter::qwen35) {
+        const auto& execution = *model.execution;
+        if (!execution.layer_placement.enabled() && execution.dense_cpu_layer_count == 0 &&
+                execution.dsv4_cpu_offload_layers.empty() && !execution.moe_expert_cache &&
+                model.num_experts() == 0 && model.supports_speculation()) {
+            if (auto predictor = Qwen35Mtp::load_if_present(*model.source, model.config, *model.execution))
+                result.mtp = std::make_unique<Qwen35Mtp>(std::move(*predictor));
+            result.mtp_available = bool(result.mtp);
+        } else std::cerr << "qwen_mtp unavailable: CUDA adapter requires dense GPU-resident Qwen blocks\n";
+    } else if (result.plan.predictor != CudaPredictorAdapter::none)
+        throw std::runtime_error("CUDA predictor adapter is unsupported for Qwen");
+    return result;
+}
+
 template struct FullAttentionSessionCodec<Qwen35Model>;
 
 } // namespace mfq::cuda
@@ -372,3 +403,5 @@ template struct FullAttentionSessionCodec<Qwen35Model>;
 namespace mfq::models {
 template struct qwen35::CausalLm<cuda::CudaCausalOps<cuda::Qwen35Model>>;
 } // namespace mfq::models
+
+MFQ_INSTANTIATE_CUDA_MODEL(mfq::cuda::Qwen35CausalLm)

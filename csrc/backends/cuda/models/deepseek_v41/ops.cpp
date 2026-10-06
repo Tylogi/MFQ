@@ -1,7 +1,10 @@
-#include "storage/transformer_loader.h"
+#include "models/common/transformer_loader.h"
 #include "storage/weight_loader.h"
 #include "ops.h"
-#include "storage/session_codec.h"
+#include "models/common/session_codec.h"
+#include "models/common/model_loading.tpp"
+#include "models/common/runtime_components.h"
+#include "dspark.h"
 
 namespace mfq::cuda::deepseek_v41_runtime {
 
@@ -241,6 +244,19 @@ void DeepseekV41Model::adapter_rollback_speculative(int64_t) {
 
 namespace mfq::cuda {
 
+template<> RuntimeComponents<DeepseekV41CausalLm> load_runtime_components(DeepseekV41CausalLm& model, bool optional) {
+    RuntimeComponents<DeepseekV41CausalLm> result{model.graph, model.plan};
+    if (!optional) return result;
+    if (result.plan.vision != CudaVisionAdapter::none ||
+            (result.plan.predictor != CudaPredictorAdapter::none && result.plan.predictor != CudaPredictorAdapter::deepseek_v41_dspark))
+        throw std::runtime_error("unsupported DeepSeek-V4.1 CUDA component adapter");
+    if (result.plan.predictor == CudaPredictorAdapter::none) return result;
+    MFQ_RUNTIME_CHECK(model.supports_suffix_speculation() && model.shared, "invalid DeepSeek-V4.1 DSpark model");
+    result.mtp = deepseek_v41_runtime::load_dspark_if_present(*model.execution, *model.source, model.shared->config);
+    result.mtp_available = bool(result.mtp);
+    return result;
+}
+
 template struct CudaSessionCodec<DeepseekV41Model>;
 
 } // namespace mfq::cuda
@@ -248,3 +264,5 @@ template struct CudaSessionCodec<DeepseekV41Model>;
 namespace mfq::models {
 template struct deepseek_v41::CausalLm<cuda::CudaCausalOps<cuda::DeepseekV41Model>>;
 } // namespace mfq::models
+
+MFQ_INSTANTIATE_CUDA_MODEL(mfq::cuda::DeepseekV41CausalLm)

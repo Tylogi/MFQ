@@ -6,7 +6,9 @@
 #include "common/gated_mlp.h"
 #include "common/moe.h"
 #include "common/transformer_layer.h"
-#include "storage/session_codec.h"
+#include "models/common/session_codec.h"
+#include "models/common/model_loading.tpp"
+#include "models/common/runtime_components.h"
 
 namespace mfq::cuda::glm5_next {
 using Config = mfq::models::glm5_next::Config;
@@ -340,6 +342,20 @@ mfq_tensor_backend::Tensor Glm5Model::adapter_next_token(const QuantLinear &lm_h
 
 namespace mfq::cuda {
 
+template<> RuntimeComponents<Glm5CausalLm> load_runtime_components(Glm5CausalLm& model, bool optional) {
+    RuntimeComponents<Glm5CausalLm> result{model.graph, model.plan};
+    if (!optional) return result;
+    if (result.plan.vision != CudaVisionAdapter::none ||
+            (result.plan.predictor != CudaPredictorAdapter::none && result.plan.predictor != CudaPredictorAdapter::flash_next))
+        throw std::runtime_error("unsupported GLM5 CUDA component adapter");
+    if (result.plan.predictor == CudaPredictorAdapter::none) return result;
+    MFQ_RUNTIME_CHECK(model.supports_speculation(), "invalid Flash-Next predictor model");
+    if (auto predictor = glm5_next::Glm5NextMtp::load_if_present(*model.execution, *model.source, model.config))
+        result.mtp = std::make_unique<glm5_next::Glm5NextMtp>(std::move(*predictor));
+    result.mtp_available = bool(result.mtp);
+    return result;
+}
+
 template struct CudaSessionCodec<Glm5Model>;
 
 } // namespace mfq::cuda
@@ -347,3 +363,5 @@ template struct CudaSessionCodec<Glm5Model>;
 namespace mfq::models {
 template struct glm5_next::CausalLm<cuda::CudaCausalOps<cuda::Glm5Model>>;
 } // namespace mfq::models
+
+MFQ_INSTANTIATE_CUDA_MODEL(mfq::cuda::Glm5CausalLm)

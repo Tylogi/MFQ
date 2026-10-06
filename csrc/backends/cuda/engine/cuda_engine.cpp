@@ -1,8 +1,8 @@
-#include "../storage/load_options.h"
+#include "load_options.h"
 #include "cuda_runtime_config.h"
 #include "../ops/cuda_execution.h"
 #include "generation.h"
-#include "storage/model_loader.h"
+#include "model_registry.h"
 #include "storage/weight_loader.h"
 #include "cuda_batching.h"
 #include "storage/text_session_cache.h"
@@ -334,16 +334,7 @@ struct CudaEngineState {
 } // namespace internal
 
 namespace {
-using State = std::variant<
-    std::unique_ptr<CudaEngineState<Qwen35CausalLm>>,
-    std::unique_ptr<CudaEngineState<MiniCPMO45CausalLm>>,
-    std::unique_ptr<CudaEngineState<MiniCPMOTtsCausalLm>>,
-    std::unique_ptr<CudaEngineState<Gemma4CausalLm>>,
-    std::unique_ptr<CudaEngineState<GlmDsaCausalLm>>,
-    std::unique_ptr<CudaEngineState<Glm5CausalLm>>,
-    std::unique_ptr<CudaEngineState<Qwen4CausalLm>>,
-    std::unique_ptr<CudaEngineState<DeepseekV4CausalLm>>,
-    std::unique_ptr<CudaEngineState<DeepseekV41CausalLm>>>;
+using State = CudaModelStates<CudaEngineState>;
 
 struct CudaBackend {
     using Options = CudaEngineOptions;
@@ -397,7 +388,7 @@ struct CudaBackend {
         return std::visit([](const auto& state) { return state ? state->available() : 0; }, state);
     }
     void unload() {
-        state = std::unique_ptr<CudaEngineState<Qwen35CausalLm>>{};
+        state = State{};
     }
 };
 } // namespace

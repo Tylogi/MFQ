@@ -1,4 +1,5 @@
 #include "full_block.h"
+#include "storage/session_state.h"
 #include "common/attention.h"
 #include "common/gated_mlp.h"
 #include "common/transformer_layer.h"
@@ -913,4 +914,27 @@ mfq_tensor_backend::Tensor qwen_rms_norm_bf16(const CudaExecutionConfig &config,
     if (weight_offset != 0.0)
         scale = scale + weight_offset;
     return (scale * normalized).contiguous();
+}
+
+FullBlockSessionState capture_full_attention_session_state(const FullBlock& block, int64_t cache_pos, size_t& bytes) {
+    const auto& cache = block.state->cache;
+    if (!cache.k.defined() || !cache.v.defined() || cache.k.dim() != 4 || cache.v.sizes() != cache.k.sizes() || cache.k.size(0) != 1)
+        throw std::runtime_error("full-attention KV cache is unavailable");
+    FullBlockSessionState state;
+    state.capacity = cache.k.size(2);
+    state.ring = cache.ring;
+    const auto tokens = state.ring ? state.capacity : std::min<int64_t>(cache_pos, state.capacity);
+    state.k = cache.k.narrow(2, 0, tokens).clone();
+    state.v = cache.v.narrow(2, 0, tokens).clone();
+    bytes += session_tensor_bytes(state.k) + session_tensor_bytes(state.v);
+    return state;
+}
+
+void restore_full_attention_session_state(FullBlock& block, const FullBlockSessionState& state) {
+    if (!state.k.defined() || !state.v.defined() || state.capacity <= 0 || state.k.dim() != 4 ||
+            state.v.sizes() != state.k.sizes() || state.k.size(0) != 1 || state.k.size(2) > state.capacity)
+        throw CudaSessionStateError("full-attention session KV layout is invalid");
+    restore_session_prefix_tensor(block.state->cache.k, state.k, 2, state.capacity);
+    restore_session_prefix_tensor(block.state->cache.v, state.v, 2, state.capacity);
+    block.state->cache.ring = state.ring;
 }

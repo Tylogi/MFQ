@@ -25,9 +25,9 @@ SOURCE = "\n".join(
     for path in (
         CUDA_ROOT / "models/common/causal_model_ops.h",
         CUDA_ROOT / "models/common/causal_model_ops.cpp",
-        CUDA_ROOT / "storage" / "session_codec.h",
-        CUDA_ROOT / "storage" / "transformer_loader.h",
-        CUDA_ROOT / "storage" / "transformer_loader.cpp",
+        CUDA_ROOT / "models/common/session_codec.h",
+        CUDA_ROOT / "models/common/transformer_loader.h",
+        CUDA_ROOT / "models/common/transformer_loader.cpp",
         CUDA_ROOT / "models/common/full_block.h",
         CUDA_ROOT / "models/common/full_block.cpp",
         CUDA_ROOT / "storage/kv_cache.h",

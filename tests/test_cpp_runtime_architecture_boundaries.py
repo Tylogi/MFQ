@@ -43,4 +43,8 @@ def test_cuda_ops_do_not_link_shared_execution_or_serving() -> None:
     runtime = source.split("function(mfq_configure_cuda_runtime_target target)", 1)[1].split("endfunction()", 1)[0]
     assert "mfq-runtime-communication" not in runtime
     assert "mfq_configure_cuda_backend_target(mfq-cuda-ops)" in source
+    loading = source.split("add_library(mfq-cuda-loading OBJECT", 1)[1].split("# Concrete Engine/model bindings", 1)[0]
+    assert "mfq_configure_cuda_backend_target(mfq-cuda-loading)" in loading
+    for dependency in ("mfq-engine", "mfq-tokenizer", "mfq_configure_cuda_runtime_target"):
+        assert dependency not in loading
     assert "MFQ_BUILD_RUNTIME_COMMUNICATION" not in cmake("core")

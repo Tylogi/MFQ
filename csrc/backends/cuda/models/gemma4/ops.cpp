@@ -2,7 +2,8 @@
 #include "../../kernels/mfq_cuda_norm_ops.h"
 #include "storage/weight_loader.h"
 #include "ops.h"
-#include "storage/session_codec.h"
+#include "models/common/session_codec.h"
+#include "models/common/model_loading.tpp"
 #include "common/transformer_layer.h"
 #include "gemma4/causal_lm.h"
 
@@ -306,3 +307,5 @@ template struct CudaSessionCodec<Gemma4Model>;
 namespace mfq::models {
 template struct gemma4::CausalLm<cuda::CudaCausalOps<cuda::Gemma4Model>>;
 } // namespace mfq::models
+
+MFQ_INSTANTIATE_CUDA_MODEL(mfq::cuda::Gemma4CausalLm)

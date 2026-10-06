@@ -252,8 +252,8 @@ function(mfq_configure_cuda_backend_target target)
     endif()
 endfunction()
 
-# Shared Engine/model templates are instantiated only by backend runtime/loading
-# units. Kernel/quant ops consume loaded weights without storage or Engine links.
+# Shared Engine/model templates are instantiated by family/runtime units.
+# Loading primitives and kernel/quant ops have no Engine/tokenizer dependency.
 function(mfq_configure_cuda_runtime_target target)
     mfq_configure_cuda_backend_target(${target})
     target_include_directories(${target} PRIVATE
@@ -271,6 +271,7 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/common/causal_model_ops.cpp
     ${MFQ_CUDA_ROOT}/models/common/ffn.cpp
     ${MFQ_CUDA_ROOT}/models/common/full_block.cpp
+    ${MFQ_CUDA_ROOT}/models/common/transformer_loader.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v4/ops.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/ops.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/dspark.cpp
@@ -303,14 +304,13 @@ target_compile_definitions(mfq-cuda-ops PRIVATE
 set_target_properties(mfq-cuda-ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set(MFQ_CUDA_LOADING_SOURCES
-    ${MFQ_CUDA_ROOT}/storage/load_options.cpp
-    ${MFQ_CUDA_ROOT}/storage/model_loader.cpp
     ${MFQ_CUDA_ROOT}/storage/moe_expert_cache.cpp
     ${MFQ_CUDA_ROOT}/storage/weight_loader.cpp
-    ${MFQ_CUDA_ROOT}/storage/transformer_loader.cpp
 )
 add_library(mfq-cuda-loading OBJECT ${MFQ_CUDA_LOADING_SOURCES})
-mfq_configure_cuda_runtime_target(mfq-cuda-loading)
+mfq_configure_cuda_backend_target(mfq-cuda-loading)
+target_include_directories(mfq-cuda-loading PRIVATE ${MFQ_CUDA_ROOT} ${MFQ_CUDA_ROOT}/storage)
+target_link_libraries(mfq-cuda-loading PRIVATE mfq-models)
 target_compile_definitions(mfq-cuda-loading PRIVATE
     MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
 set_target_properties(mfq-cuda-loading PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -319,6 +319,7 @@ set_target_properties(mfq-cuda-loading PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # optional Torch builds. Extra targets do not reduce their header dependencies.
 set(MFQ_CUDA_INSTANTIATION_SOURCES
     ${MFQ_CUDA_ROOT}/engine/cuda_engine.cpp
+    ${MFQ_CUDA_ROOT}/engine/load_options.cpp
     ${MFQ_CUDA_ROOT}/engine/decode_graph.cpp
     ${MFQ_CUDA_ROOT}/engine/generation.cpp
     ${MFQ_CUDA_ROOT}/storage/kv_cache.cpp

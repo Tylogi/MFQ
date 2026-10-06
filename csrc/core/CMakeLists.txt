@@ -48,6 +48,11 @@ set_target_properties(mfq-model-source PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
+add_library(mfq-cache-policy STATIC moe_cache_policy.cpp)
+target_include_directories(mfq-cache-policy PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(mfq-cache-policy PUBLIC cxx_std_17)
+set_target_properties(mfq-cache-policy PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(mfq-core INTERFACE)
 add_library(mfq::core ALIAS mfq-core)
 target_include_directories(mfq-core INTERFACE
@@ -57,6 +62,7 @@ target_include_directories(mfq-core INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/generated
 )
 target_link_libraries(mfq-core INTERFACE
+    mfq-cache-policy
     mfq-model-graph
     mfq-model-source
     mfq-json
