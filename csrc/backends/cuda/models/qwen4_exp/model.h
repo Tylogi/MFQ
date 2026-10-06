@@ -1,7 +1,7 @@
 #pragma once
 #include "../../kernels/mfq_cuda_linear_attention_ops.h"
-#include "models/qwen4_exp/causal_lm.h"
-#include "models/qwen4_exp/ngram.h"
+#include "qwen4_exp/causal_lm.h"
+#include "qwen4_exp/ngram.h"
 #include "models/common/attention_ops.h"
 #include "../../ops/rope.h"
 #include "csrc/backends/cuda/kernels/qwen4_exp.h"

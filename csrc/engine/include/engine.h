@@ -36,6 +36,8 @@ struct GenerationStats {
 
 namespace mfq::engine {
 
+struct ResourceExhausted : std::runtime_error { using std::runtime_error::runtime_error; };
+
 enum class InferenceInputErrorCode {
     Invalid,
     Unsupported,
@@ -166,13 +168,15 @@ using RequestId = std::string;
 using Clock = std::chrono::steady_clock;
 using Metrics = std::vector<std::pair<std::string, double>>;
 
+// Direct Engine diagnostics may bypass tokenization, but never mix tokens
+// with text/chat/media input. An engaged value must contain a nonempty prompt.
+struct DiagnosticTokenInput { std::vector<std::int64_t> tokens; };
+
 struct EngineRequest {
     RequestId id;
     InferenceInput input;
     std::optional<Clock::time_point> deadline;
-    // Diagnostics only. Production submits owned text/media and is tokenized
-    // after admission, using the tokenizer retained by that Engine request.
-    std::vector<std::int64_t> token_ids;
+    std::optional<DiagnosticTokenInput> diagnostic_input;
 };
 
 struct PrefillProgress { MfqPrefillTiming timing; };

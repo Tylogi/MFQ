@@ -1,22 +1,22 @@
 #include "continuous_batch.h"
 #include "request_executor.h"
 #include "generation_policy.h"
-#include "models/common/attention.h"
-#include "models/common/causal_forward.h"
-#include "models/common/causal_model.h"
-#include "models/common/gated_mlp.h"
-#include "models/common/grid_vision_model.h"
-#include "models/common/moe.h"
-#include "models/common/transformer_layer.h"
-#include "models/deepseek_v4/causal_lm.h"
-#include "models/deepseek_v41/causal_lm.h"
-#include "models/deepseek_v41/engram.h"
-#include "models/gemma4/causal_lm.h"
-#include "models/glm5_next/causal_lm.h"
-#include "models/glm_dsa/causal_lm.h"
-#include "models/minicpmo45/causal_lm.h"
-#include "models/qwen35/causal_lm.h"
-#include "models/qwen4_exp/causal_lm.h"
+#include "common/attention.h"
+#include "common/causal_forward.h"
+#include "common/causal_model.h"
+#include "common/gated_mlp.h"
+#include "common/grid_vision_model.h"
+#include "common/moe.h"
+#include "common/transformer_layer.h"
+#include "deepseek_v4/causal_lm.h"
+#include "deepseek_v41/causal_lm.h"
+#include "deepseek_v41/engram.h"
+#include "gemma4/causal_lm.h"
+#include "glm5_next/causal_lm.h"
+#include "glm_dsa/causal_lm.h"
+#include "minicpmo45/causal_lm.h"
+#include "qwen35/causal_lm.h"
+#include "qwen4_exp/causal_lm.h"
 #include "sampling.h"
 #include <array>
 #include <cassert>
@@ -72,7 +72,7 @@ template <class Physical> struct BatchExecution {
 static EngineRequest batch_request(std::string id, int prompt = 5, int tokens = 3) {
     EngineRequest result;
     result.id = std::move(id);
-    result.token_ids.assign(prompt, 1);
+    result.diagnostic_input = DiagnosticTokenInput{std::vector<int64_t>(prompt, 1)};
     result.input.sampling.max_tokens = tokens;
     return result;
 }

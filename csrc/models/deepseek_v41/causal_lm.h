@@ -1,8 +1,8 @@
 #pragma once
 #include "config.h"
-#include "models/common/causal_forward.h"
-#include "models/common/causal_model.h"
-#include "models/common/transformer_layer.h"
+#include "common/causal_forward.h"
+#include "common/causal_model.h"
+#include "common/transformer_layer.h"
 #include <optional>
 #include <vector>
 

@@ -1,10 +1,10 @@
-#include "models/deepseek_v4/config.h"
-#include "models/glm5_next/config.h"
-#include "models/qwen4_exp/config.h"
-#include "models/gemma4/config.h"
-#include "models/glm_dsa/config.h"
-#include "models/minicpmo45/config.h"
-#include "models/qwen35/config.h"
+#include "deepseek_v4/config.h"
+#include "glm5_next/config.h"
+#include "qwen4_exp/config.h"
+#include "gemma4/config.h"
+#include "glm_dsa/config.h"
+#include "minicpmo45/config.h"
+#include "qwen35/config.h"
 
 #include <iostream>
 #include <stdexcept>

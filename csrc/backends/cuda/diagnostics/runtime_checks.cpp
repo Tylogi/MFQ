@@ -181,7 +181,7 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
         const auto admit = [&](const std::string& id, const std::vector<int64_t>& prompt,
                                const MfqSamplingParams* params = nullptr) {
             EngineRequest request;
-            request.id = id; request.token_ids = prompt; request.input.sampling = params ? *params : sampling;
+            request.id = id; request.diagnostic_input = DiagnosticTokenInput{prompt}; request.input.sampling = params ? *params : sampling;
             MFQ_RUNTIME_CHECK(executor.admit(std::move(request), nullptr, info, execution) == Admission::accepted,
                               "diagnostic request was not admitted");
         };

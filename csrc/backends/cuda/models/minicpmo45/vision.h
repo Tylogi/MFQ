@@ -1,8 +1,8 @@
 #pragma once
 
 #include "storage/weight_loader.h"
-#include "models/common/transformer_layer.h"
-#include "models/minicpmo45/causal_lm.h"
+#include "common/transformer_layer.h"
+#include "minicpmo45/causal_lm.h"
 
 #include "ops.h"
 #include "../../native/tensor_backend.h"

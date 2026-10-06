@@ -1,7 +1,7 @@
 #pragma once
 #include "../../kernels/mfq_cuda_norm_ops.h"
-#include "models/common/transformer_layer.h"
-#include "models/deepseek_v41/causal_lm.h"
+#include "common/transformer_layer.h"
+#include "deepseek_v41/causal_lm.h"
 
 #include "models/common/causal_model_ops.h"
 #include "../deepseek_v4/ops.h"
@@ -10,7 +10,7 @@
 #include "csrc/backends/cuda/kernels/deepseek_v41.h"
 #include "csrc/backends/cuda/kernels/deepseek_v4_attention.h"
 #include "csrc/backends/cuda/kernels/deepseek_v4_hc.h"
-#include "models/deepseek_v41/config.h"
+#include "deepseek_v41/config.h"
 #include "models/common/ffn.h"
 
 #include <algorithm>

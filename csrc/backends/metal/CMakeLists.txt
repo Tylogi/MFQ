@@ -271,6 +271,7 @@ target_include_directories(mfq-metal-runtime PUBLIC
 )
 target_include_directories(mfq-metal-runtime PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}
+    ${PROJECT_SOURCE_DIR}/engine/internal
 )
 target_link_libraries(mfq-metal-runtime PUBLIC
     mfq-core
@@ -296,6 +297,7 @@ add_library(mfq-metal-engine STATIC
     runtime/mlx_generation_job.cpp
     runtime/mlx_server_components.cpp
 )
+target_include_directories(mfq-metal-engine PRIVATE ${PROJECT_SOURCE_DIR}/engine/internal)
 target_link_libraries(mfq-metal-engine PUBLIC mfq-metal-runtime mfq-engine)
 target_compile_features(mfq-metal-engine PUBLIC cxx_std_20)
 

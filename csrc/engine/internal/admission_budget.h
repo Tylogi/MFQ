@@ -1,5 +1,7 @@
 #pragma once
 
+#include "engine.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <memory>
@@ -8,8 +10,6 @@
 #include <vector>
 
 namespace mfq::engine {
-
-struct ResourceExhausted : std::runtime_error { using std::runtime_error::runtime_error; };
 
 // A lease follows the physical request, including preparation and cleanup.
 // The Engine thread owns all mutations; leases may outlive the budget owner.

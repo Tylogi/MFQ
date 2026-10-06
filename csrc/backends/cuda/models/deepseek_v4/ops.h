@@ -6,14 +6,14 @@
 #include "../../kernels/mfq_cuda_cache_ops.h"
 #include "../../kernels/mfq_cuda_norm_ops.h"
 #include "../../kernels/mfq_cuda_quant_ops.h"
-#include "models/common/transformer_layer.h"
-#include "models/deepseek_v4/causal_lm.h"
+#include "common/transformer_layer.h"
+#include "deepseek_v4/causal_lm.h"
 
 #include "models/common/causal_model_ops.h"
 #include "csrc/backends/cuda/kernels/deepseek_v4_attention.h"
 #include "csrc/backends/cuda/kernels/deepseek_v4_hc.h"
 #include "models/common/block.h"
-#include "models/deepseek_v4/config.h"
+#include "deepseek_v4/config.h"
 #include "models/common/ffn.h"
 
 #include <iomanip>

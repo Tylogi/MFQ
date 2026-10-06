@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../../native/tensor_backend.h"
-#include "models/common/causal_metadata.h"
+#include "common/causal_metadata.h"
 
 #include <cstdint>
 #include <memory>

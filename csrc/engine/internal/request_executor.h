@@ -89,11 +89,15 @@ class RequestExecutor {
             if (!reservation) return Admission::deferred;
             memory.emplace(std::move(*reservation));
         }
-        const bool raw = !request.token_ids.empty();
+        const bool raw = request.diagnostic_input.has_value();
+        if (raw && (request.diagnostic_input->tokens.empty() || !request.input.prompt.empty() ||
+                request.input.chat_input || request.input.media))
+            throw InferenceInputError(InferenceInputErrorCode::Invalid,
+                "diagnostic tokens require a nonempty prompt and cannot be mixed with text or media");
         const MfqTokenizer *tokenizer = nullptr;
         InferenceRequest input;
         if (raw) {
-            input.prompt = std::move(request.token_ids);
+            input.prompt = std::move(request.diagnostic_input->tokens);
             input.sampling = request.input.sampling;
             input.cache_plan = request.input.cache_plan;
         } else {

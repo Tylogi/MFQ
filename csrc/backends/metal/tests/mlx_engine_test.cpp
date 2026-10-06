@@ -46,7 +46,7 @@ struct FakeModel final : MlxEngineModel {
 static EngineRequest request(int tokens = 12) {
     EngineRequest result;
     result.id = "test";
-    result.token_ids = {0, 1, 2};
+    result.diagnostic_input = DiagnosticTokenInput{{0, 1, 2}};
     result.input.sampling.max_tokens = tokens;
     return result;
 }

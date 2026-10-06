@@ -2,7 +2,7 @@
 
 #include "models/common/mtp.h"
 #include "models/common/attention_ops.h"
-#include "models/glm5_next/config.h"
+#include "glm5_next/config.h"
 
 namespace mfq::cuda::glm5_next {
 using attention_ops::Linear;

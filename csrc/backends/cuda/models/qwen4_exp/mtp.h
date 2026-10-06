@@ -2,7 +2,7 @@
 
 #include "models/common/mtp.h"
 #include "models/common/attention_ops.h"
-#include "models/qwen4_exp/config.h"
+#include "qwen4_exp/config.h"
 
 namespace mfq::cuda::qwen4_exp {
 using attention_ops::Linear;

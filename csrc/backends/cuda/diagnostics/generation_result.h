@@ -56,7 +56,7 @@ inline GenerationResult collect_engine_steps(mfq::engine::Engine& engine,
         std::vector<int64_t> prompt, MfqSamplingParams sampling) {
     mfq::engine::EngineRequest request;
     request.id = "check";
-    request.token_ids = std::move(prompt); request.input.sampling = sampling;
+    request.diagnostic_input = mfq::engine::DiagnosticTokenInput{std::move(prompt)}; request.input.sampling = sampling;
     if (engine.admit(std::move(request)) != mfq::engine::Admission::accepted)
         throw std::runtime_error("diagnostic request was not admitted");
     GenerationResult result;

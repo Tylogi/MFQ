@@ -91,7 +91,7 @@ static void check_engines(const char* model, const char* tokenizer) {
     const auto generate = [](mfq::engine::Engine& engine) {
         using namespace mfq::engine;
         EngineRequest request;
-        request.id = "isolation"; request.token_ids = {101, 202, 303};
+        request.id = "isolation"; request.diagnostic_input = DiagnosticTokenInput{{101, 202, 303}};
         request.input.sampling.max_tokens = 32;
         request.input.sampling.temperature = 0;
         request.input.sampling.enable_mtp = false;
@@ -164,12 +164,12 @@ static void check_engines(const char* model, const char* tokenizer) {
     for (int run = 0; run < 4; ++run) {
         using namespace mfq::engine;
         EngineRequest long_request;
-        long_request.id = "long"; long_request.token_ids.assign(96, 101);
+        long_request.id = "long"; long_request.diagnostic_input = DiagnosticTokenInput{std::vector<int64_t>(96, 101)};
         long_request.input.sampling.max_tokens = 16; long_request.input.sampling.enable_mtp = false;
-        EngineRequest short_request = long_request; short_request.id = "short"; short_request.token_ids = {101, 202, 303};
+        EngineRequest short_request = long_request; short_request.id = "short"; short_request.diagnostic_input = DiagnosticTokenInput{{101, 202, 303}};
         limited->admit(std::move(long_request)); limited->admit(std::move(short_request));
-        EngineRequest deferred; deferred.id = "deferred"; deferred.token_ids = {101};
-        if (limited->status().available || limited->admit(std::move(deferred)) != Admission::deferred || deferred.token_ids.empty())
+        EngineRequest deferred; deferred.id = "deferred"; deferred.diagnostic_input = DiagnosticTokenInput{{101}};
+        if (limited->status().available || limited->admit(std::move(deferred)) != Admission::deferred || deferred.diagnostic_input->tokens.empty())
             throw std::runtime_error("memory admission did not defer without consuming input");
         if (metric(*limited, "admission_device_0_reserved_bytes") != 2 * cost)
             throw std::runtime_error("request memory reservation was not retained");

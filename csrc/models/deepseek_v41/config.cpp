@@ -1,4 +1,4 @@
-#include "models/deepseek_v41/config.h"
+#include "config.h"
 
 #include "nlohmann/json.hpp"
 

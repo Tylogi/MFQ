@@ -60,7 +60,7 @@ struct TestOps {
 static EngineRequest request(std::string id = "one") {
     EngineRequest result;
     result.id = std::move(id);
-    result.token_ids = {1, 2, 3, 4, 5};
+    result.diagnostic_input = DiagnosticTokenInput{{1, 2, 3, 4, 5}};
     result.input.sampling.max_tokens = 2;
     return result;
 }
@@ -381,9 +381,9 @@ static void check_admission_memory() {
     RequestExecutor executor(4);
     assert(executor.admit(request("one"), nullptr, info(), ops) == Admission::accepted);
     auto second = request("two");
-    const auto* data = second.token_ids.data();
+    const auto* data = second.diagnostic_input->tokens.data();
     assert(executor.admit(std::move(second), nullptr, info(), ops) == Admission::deferred);
-    assert(second.token_ids.data() == data && ops.budget.used() == std::vector<std::size_t>({60, 20}));
+    assert(second.diagnostic_input->tokens.data() == data && ops.budget.used() == std::vector<std::size_t>({60, 20}));
     executor.cancel("one"); executor.step({}, ops);
     assert(ops.budget.used() == std::vector<std::size_t>({0, 0}));
     assert(executor.admit(std::move(second), nullptr, info(), ops) == Admission::accepted);
@@ -403,6 +403,21 @@ static void check_admission_memory() {
 }
 
 int main() {
+    for (int invalid = 0; invalid < 4; ++invalid) {
+        TestOps ops;
+        RequestExecutor executor;
+        auto mixed = request();
+        if (invalid == 0) mixed.diagnostic_input->tokens.clear();
+        if (invalid == 1) mixed.input.prompt = "text";
+        if (invalid == 2) mixed.input.chat_input.emplace();
+        if (invalid == 3) mixed.input.media.emplace();
+        bool rejected = false;
+        try { executor.admit(std::move(mixed), nullptr, info(), ops); }
+        catch (const InferenceInputError& error) {
+            rejected = error.code == InferenceInputErrorCode::Invalid;
+        }
+        assert(rejected && executor.empty());
+    }
     check_admission_memory();
     check_async_text_preparation();
     check_waiting_and_cleanup();

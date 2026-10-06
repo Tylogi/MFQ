@@ -1,4 +1,4 @@
-#include "models/qwen4_exp/config.h"
+#include "config.h"
 
 namespace mfq::models::qwen4_exp {
 

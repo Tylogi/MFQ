@@ -51,7 +51,7 @@ struct FakeEngine final : Engine {
             }
             if (std::find(eligible.begin(), eligible.end(), id) == eligible.end()) { ++it; continue; }
             ++work.steps;
-            if (work.request.token_ids.empty()) {
+            if (!work.request.diagnostic_input) {
                 const auto& content = work.request.input.chat_input->messages.front().content;
                 if (content != "hello") {
                     result.events.push_back({id, Failed{content, "fake request failure"}});
@@ -77,27 +77,28 @@ struct FakeEngine final : Engine {
                 ++released;
                 continue;
             }
-            if (work.request.token_ids == std::vector<int64_t>{63}) throw std::runtime_error("device failure");
+            const auto& tokens = work.request.diagnostic_input->tokens;
+            if (tokens == std::vector<int64_t>{63}) throw std::runtime_error("device failure");
             ++advances.at(std::stoi(id));
             result.advanced.push_back(id);
-            if (work.steps <= int(work.request.token_ids.size()))
+            if (work.steps <= int(tokens.size()))
                 result.events.push_back({id, PrefillProgress{{std::size_t(work.steps), 1, 0, 1}}});
-            else if (work.steps <= int(work.request.token_ids.size()) + work.request.input.sampling.max_tokens) {
+            else if (work.steps <= int(tokens.size()) + work.request.input.sampling.max_tokens) {
                 OutputDelta delta{{1, 2, 3}, {}};
-                if (work.request.token_ids == std::vector<int64_t>{60} ||
-                        work.request.token_ids == std::vector<int64_t>{61} ||
-                        work.request.token_ids == std::vector<int64_t>{62}) {
+                if (tokens == std::vector<int64_t>{60} ||
+                        tokens == std::vector<int64_t>{61} ||
+                        tokens == std::vector<int64_t>{62}) {
                     OutputDiff diff;
-                    const auto marker = work.request.token_ids.front();
+                    const auto marker = tokens.front();
                     diff.content_delta.assign(marker == 60 ? (work.steps == 2 ? 2000 : 6000)
                         : (marker == 61 ? 1024 : 8192), 'x');
                     delta.diffs.push_back(std::move(diff));
                 }
                 result.events.push_back({id, std::move(delta)});
             }
-            if (work.steps > int(work.request.token_ids.size()) + work.request.input.sampling.max_tokens ||
-                    (work.request.token_ids == std::vector<int64_t>{60} &&
-                     work.steps == int(work.request.token_ids.size()) + work.request.input.sampling.max_tokens)) {
+            if (work.steps > int(tokens.size()) + work.request.input.sampling.max_tokens ||
+                    (tokens == std::vector<int64_t>{60} &&
+                     work.steps == int(tokens.size()) + work.request.input.sampling.max_tokens)) {
                 it = active.erase(it); ++released;
                 InferenceMetrics metrics;
                 metrics.mtp.available = true;
@@ -152,7 +153,7 @@ struct FakeEngine final : Engine {
 };
 EngineRequest request(int id, int tokens = 12) {
     EngineRequest result;
-    result.id = std::to_string(id); result.token_ids = {1, 2};
+    result.id = std::to_string(id); result.diagnostic_input = DiagnosticTokenInput{{1, 2}};
     result.input.sampling.max_tokens = tokens; return result;
 }
 int drain(const std::shared_ptr<MfqScheduledRequest>& handle, bool cancelled = false, bool failed = false) {
@@ -509,7 +510,7 @@ int main(int argc, char** argv) {
         FakeEngine engine;
         MfqScheduler scheduler(engine);
         auto first = scheduler.submit(request(0, 100));
-        auto bad = request(1); bad.token_ids = {63};
+        auto bad = request(1); bad.diagnostic_input = DiagnosticTokenInput{{63}};
         auto second = scheduler.submit(bad);
         drain(first, false, true); drain(second, false, true);
         assert(!scheduler.status().healthy);
@@ -518,7 +519,7 @@ int main(int argc, char** argv) {
     {
         FakeEngine engine;
         MfqScheduler scheduler(engine, {64, 4096}); // bytes, not event count, limits progress
-        auto large = request(0, 100); large.token_ids = {61};
+        auto large = request(0, 100); large.diagnostic_input = DiagnosticTokenInput{{61}};
         auto slow = scheduler.submit(large);
         drain(scheduler.submit(request(1, 4)));
         const auto paused = engine.advances[0].load();
@@ -527,7 +528,7 @@ int main(int argc, char** argv) {
         assert(engine.advances[0] == paused);
         scheduler.cancel_request("0");
         drain(slow, true); // reserved terminal space remains available
-        auto oversized = request(3); oversized.token_ids = {62};
+        auto oversized = request(3); oversized.diagnostic_input = DiagnosticTokenInput{{62}};
         auto bad = scheduler.submit(oversized);
         drain(scheduler.submit(request(4, 4)));
         drain(bad, false, true);
@@ -545,7 +546,7 @@ int main(int argc, char** argv) {
     {
         FakeEngine engine;
         MfqScheduler scheduler(engine, {64, 8192});
-        auto variable = request(0, 4); variable.token_ids = {60};
+        auto variable = request(0, 4); variable.diagnostic_input = DiagnosticTokenInput{{60}};
         auto slow = scheduler.submit(variable);
         drain(scheduler.submit(request(1, 4)));
         // Both deltas fit individually. Their sum pauses the producer instead
@@ -563,7 +564,7 @@ int main(int argc, char** argv) {
     {
         FakeEngine engine;
         MfqScheduler scheduler(engine, {64, 8192});
-        auto variable = request(0, 2); variable.token_ids = {60};
+        auto variable = request(0, 2); variable.diagnostic_input = DiagnosticTokenInput{{60}};
         auto slow = scheduler.submit(variable);
         // The final delta and terminal arrive together, with the delta blocked.
         while (engine.released == 0) std::this_thread::yield();

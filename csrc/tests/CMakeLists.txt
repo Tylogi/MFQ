@@ -44,6 +44,10 @@ function(mfq_add_core_test target source)
     add_test(NAME ${target} COMMAND ${target})
 endfunction()
 
+add_executable(mfq-engine-contract-test engine_contract_test.cpp)
+target_link_libraries(mfq-engine-contract-test PRIVATE mfq-engine)
+add_test(NAME mfq-engine-contract-test COMMAND mfq-engine-contract-test)
+
 add_executable(mfq-text-emitter-test mfq_text_emitter_test.cpp)
 target_link_libraries(mfq-text-emitter-test PRIVATE mfq-engine)
 target_compile_features(mfq-text-emitter-test PRIVATE cxx_std_17)
@@ -91,6 +95,15 @@ target_link_libraries(mfq-mtp-policy-test PRIVATE mfq-engine)
 target_compile_features(mfq-mtp-policy-test PRIVATE cxx_std_20)
 add_test(NAME mfq-mtp-policy-test COMMAND mfq-mtp-policy-test)
 
+# Internal tests opt in explicitly; clients inherit only the public contract.
+foreach(target IN ITEMS
+        mfq-paged-kv-allocator-test mfq-session-snapshot-cache-test
+        mfq-text-emitter-test mfq-sampling-test mfq-moe-cache-policy-test
+        mfq-inference-test mfq-request-executor-test mfq-shared-execution-test
+        mfq-mtp-policy-test)
+    target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/engine/internal)
+endforeach()
+
 add_executable(mfq-moe-cache-profile-test moe_cache_profile_test.cpp)
 target_link_libraries(mfq-moe-cache-profile-test PRIVATE mfq-core mfq-json)
 target_compile_features(mfq-moe-cache-profile-test PRIVATE cxx_std_17)
@@ -103,6 +116,7 @@ if(TARGET mfq-paged-prefix-cache)
     add_executable(mfq-paged-prefix-cache-test
         mfq_paged_prefix_cache_test.cpp
     )
+    target_include_directories(mfq-paged-prefix-cache-test PRIVATE ${PROJECT_SOURCE_DIR}/engine/internal)
     target_link_libraries(mfq-paged-prefix-cache-test PRIVATE
         mfq-engine
         mfq-paged-prefix-cache

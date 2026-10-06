@@ -1,7 +1,7 @@
 #include "full_block.h"
-#include "models/common/attention.h"
-#include "models/common/gated_mlp.h"
-#include "models/common/transformer_layer.h"
+#include "common/attention.h"
+#include "common/gated_mlp.h"
+#include "common/transformer_layer.h"
 #include <array>
 
 #include "../../kernels/mfq_cuda_activation_ops.h"

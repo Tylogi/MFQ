@@ -50,10 +50,10 @@ PAGED_SOURCE = (ROOT / "csrc" / "core" / "mfq_paged_prefix_cache.cpp").read_text
 )
 ENGINE_FLOW = "\n".join(
     (ROOT / "csrc" / "engine" / part).read_text(encoding="utf-8")
-    for part in ("include/inference.h", "src/text_processor.cpp")
+    for part in ("internal/inference.h", "src/text_processor.cpp")
 )
 SESSION_CACHE = (
-    ROOT / "csrc" / "engine" / "include" /
+    ROOT / "csrc" / "engine" / "internal" /
     "session_snapshot_cache.h"
 ).read_text(encoding="utf-8")
 METAL_PAGED_CODEC = (
@@ -72,7 +72,7 @@ METAL_STREAM_SYNC = (
 
 SHARED_ENGINE = "\n".join(
     path.read_text(encoding="utf-8")
-    for path in (ROOT / "csrc" / "engine" / "include").glob("*.h")
+    for path in (ROOT / "csrc" / "engine" / "internal").glob("*.h")
 )
 SHARED_MODELS = "\n".join(
     path.read_text(encoding="utf-8")
@@ -308,7 +308,7 @@ def test_metal_paged_codec_preserves_raw_kv_tensor_storage() -> None:
 def test_cuda_paged_restore_invalidates_only_deterministic_state_errors() -> None:
     assert "class CudaSessionStateError" in CUDA_SESSION_STATE_HEADER
     assert "throw CudaSessionStateError(" in CUDA_SESSION_CACHE
-    cache = (ROOT / "csrc/engine/include/session_cache.h").read_text()
+    cache = (ROOT / "csrc/engine/internal/session_cache.h").read_text()
     assert "catch (const StateError &error) { failed = invalid = true; }" in cache
     assert "if (invalid && epoch == epoch_)" in cache
     assert "cache->invalidate(block)" in cache

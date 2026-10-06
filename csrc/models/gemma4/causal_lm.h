@@ -1,6 +1,6 @@
 #pragma once
 #include "config.h"
-#include "models/common/causal_model.h"
+#include "common/causal_model.h"
 #include <array>
 #include <bit>
 #include <cmath>

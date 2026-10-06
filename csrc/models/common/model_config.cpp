@@ -1,4 +1,4 @@
-#include "models/common/model_config.h"
+#include "model_config.h"
 
 #include "nlohmann/json.hpp"
 

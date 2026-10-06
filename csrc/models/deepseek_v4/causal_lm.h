@@ -1,7 +1,7 @@
 #pragma once
 #include "config.h"
-#include "models/common/causal_forward.h"
-#include "models/common/causal_model.h"
+#include "common/causal_forward.h"
+#include "common/causal_model.h"
 #include <vector>
 
 namespace mfq::models::deepseek_v4 {

@@ -5,8 +5,8 @@
 #include "storage/session_state.h"
 #include "inference.h"
 #include "models/common/block.h"
-#include "models/minicpmo45/causal_lm.h"
-#include "models/minicpmo45/config.h"
+#include "minicpmo45/causal_lm.h"
+#include "minicpmo45/config.h"
 #include "../../ops/quant_linear.h"
 
 #include <memory>

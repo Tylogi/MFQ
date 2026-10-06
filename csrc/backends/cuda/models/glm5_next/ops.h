@@ -2,8 +2,8 @@
 
 #include "models/common/causal_model_ops.h"
 #include "models/common/block.h"
-#include "models/glm5_next/causal_lm.h"
-#include "models/glm5_next/config.h"
+#include "glm5_next/causal_lm.h"
+#include "glm5_next/config.h"
 #include "../../ops/quant_linear.h"
 
 #include <memory>

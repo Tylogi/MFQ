@@ -3,9 +3,9 @@
 #include "storage/weight_loader.h"
 
 #include "mfe_expert_store.h"
-#include "models/deepseek_v41/config.h"
+#include "deepseek_v41/config.h"
 #include "csrc/models/deepseek_v41/engram.h"
-#include "models/deepseek_v41/causal_lm.h"
+#include "deepseek_v41/causal_lm.h"
 #include "../../ops/quant_linear.h"
 
 #include <algorithm>

@@ -1,11 +1,11 @@
 #pragma once
 #include "config.h"
 #include "step_sequence.h"
-#include "models/common/weight_loading.h"
-#include "models/common/causal_forward.h"
-#include "models/common/causal_model.h"
-#include "models/common/gated_mlp.h"
-#include "models/common/transformer_layer.h"
+#include "common/weight_loading.h"
+#include "common/causal_forward.h"
+#include "common/causal_model.h"
+#include "common/gated_mlp.h"
+#include "common/transformer_layer.h"
 #include <algorithm>
 #include <array>
 #include <cmath>

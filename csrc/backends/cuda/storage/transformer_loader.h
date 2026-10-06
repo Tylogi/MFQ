@@ -2,7 +2,7 @@
 
 #include "models/common/block.h"
 #include "models/common/ffn.h"
-#include "models/common/weight_loading.h"
+#include "common/weight_loading.h"
 
 #include <memory>
 #include <string>

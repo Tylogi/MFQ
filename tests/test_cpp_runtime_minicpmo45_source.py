@@ -71,7 +71,6 @@ REALTIME_GATEWAY = (
 
 def test_minicpmo45_uses_native_composite_graph_and_canonical_names():
     common = (ROOT / "csrc/models/common/causal_model.h").read_text()
-    assert "models/minicpmo45/causal_lm.h" in DECODE
     assert 'constexpr auto embedding = "model.token_embedding.weight"' in common
     assert 'source, "model.output_norm.weight"' in DECODE
     assert 'constexpr auto output = "model.output.weight"' in common
@@ -371,7 +370,7 @@ def test_minicpmo45_cuda_duplex_uses_runtime_profile_tts_sampling():
 
 def test_minicpmo45_eval_batch_matches_pr_tts_sampler_and_optional_media():
     assert "std::mt19937*evaluator_rng=nullptr" in "".join(GRAPH.split())
-    assert "std::uniform_real_distribution<float> distribution" in (ROOT / "csrc/engine/include/sampling.h").read_text(encoding="utf-8")
+    assert "std::uniform_real_distribution<float> distribution" in (ROOT / "csrc/engine/internal/sampling.h").read_text(encoding="utf-8")
     assert "mfq::engine::sample_top_k_top_p(" in GRAPH
     assert 'request.value("tts_temperature", 0.8)' in COMMAND
     assert 'request.value("tts_top_p", 0.85)' in COMMAND

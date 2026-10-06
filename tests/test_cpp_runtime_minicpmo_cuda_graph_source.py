@@ -78,7 +78,7 @@ ACC_SOURCE = (
 
 SHARED_ENGINE = "\n".join(
     path.read_text(encoding="utf-8")
-    for path in (ROOT / "csrc" / "engine" / "include").glob("*.h")
+    for path in (ROOT / "csrc" / "engine" / "internal").glob("*.h")
 )
 SHARED_MODELS = "\n".join(
     path.read_text(encoding="utf-8")

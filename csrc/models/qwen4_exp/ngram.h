@@ -1,5 +1,5 @@
 #pragma once
-#include "models/common/causal_forward.h"
+#include "common/causal_forward.h"
 #include <algorithm>
 #include <cstring>
 #include <vector>

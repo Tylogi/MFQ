@@ -202,11 +202,10 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-cuda-storage-offset-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     mfq_add_cuda_test(mfq-flash-next-test
         ${MFQ_CUDA_ROOT}/tests/mfq_flash_next_test.cpp
-        mfq-cuda-native-kernels mfq-json)
+        mfq-cuda-native-kernels mfq-json mfq-models)
     target_compile_definitions(mfq-flash-next-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1)
     target_include_directories(mfq-flash-next-test PRIVATE
         ${MFQ_CUDA_ROOT}
-        ${PROJECT_SOURCE_DIR}
         ${MFQ_REPOSITORY_ROOT}
         ${MFQ_CUDA_ROOT}/models
         ${MFQ_CUDA_ROOT}/../../core)
@@ -258,6 +257,7 @@ endfunction()
 function(mfq_configure_cuda_runtime_target target)
     mfq_configure_cuda_backend_target(${target})
     target_include_directories(${target} PRIVATE
+        ${PROJECT_SOURCE_DIR}/engine/internal
         ${MFQ_CUDA_ROOT}/include
         ${MFQ_CUDA_ROOT}
         ${MFQ_CUDA_ROOT}/storage

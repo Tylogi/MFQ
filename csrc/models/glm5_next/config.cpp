@@ -1,4 +1,4 @@
-#include "models/glm5_next/config.h"
+#include "config.h"
 
 namespace mfq::models::glm5_next {
 

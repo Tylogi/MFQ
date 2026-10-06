@@ -1,8 +1,8 @@
 #pragma once
 
 #include "models/common/causal_model_ops.h"
-#include "models/gemma4/causal_lm.h"
-#include "models/gemma4/config.h"
+#include "gemma4/causal_lm.h"
+#include "gemma4/config.h"
 
 #include <memory>
 #include <string>

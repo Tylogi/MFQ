@@ -1,4 +1,3 @@
-#include "admission_budget.h"
 #include "scheduler.h"
 
 #include <algorithm>
@@ -23,7 +22,8 @@ std::size_t input_bytes(const EngineRequest& request) {
     };
     const auto& input = request.input;
     strings(request.id, input.prompt, input.cache_plan.session_id);
-    vectors(request.token_ids, input.stops);
+    vectors(input.stops);
+    if (request.diagnostic_input) vectors(request.diagnostic_input->tokens);
     for (const auto& stop : input.stops) strings(stop);
     if (input.chat_input) {
         const auto& chat = *input.chat_input;

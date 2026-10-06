@@ -5,7 +5,7 @@
 #include "diagnostics/generation_result.h"
 #include "storage/text_session_cache.h"
 #include "mfq_paged_prefix_cache.h"
-#include "models/gemma4/causal_lm.h"
+#include "gemma4/causal_lm.h"
 #include "models/minicpmo45/ops.h"
 #include "models/minicpmo45/tts.h"
 #include "models/qwen35/linear_attention.h"
@@ -666,11 +666,11 @@ static void check_interleaved_request(mfq::engine::Engine& engine,
         const mfq::engine::EngineRequest& feature, const std::vector<int64_t>& reference) {
     using namespace mfq::engine;
     EngineRequest text;
-    text.id = "peer"; text.token_ids = {101, 202, 303};
+    text.id = "peer"; text.diagnostic_input = mfq::engine::DiagnosticTokenInput{{101, 202, 303}};
     text.input.sampling.temperature = 0; text.input.sampling.max_tokens = 32;
     text.input.sampling.enable_mtp = feature.input.sampling.enable_mtp;
     const auto text_reference = mfq::cuda::diagnostics::check_engine_steps(
-        engine, text.token_ids, text.input.sampling);
+        engine, text.diagnostic_input->tokens, text.input.sampling);
     for (bool cancel : {false, true, false}) {
         check(engine.admit(EngineRequest(feature)) == Admission::accepted &&
             engine.admit(EngineRequest(text)) == Admission::accepted,
@@ -801,7 +801,7 @@ static void check_batching(const char* model_path, const char* tokenizer) {
     check(mfq::cuda::diagnostics::check_engine_steps(*engine, {101, 202, 303}, sampling) == reference,
           "batched repeat changed output");
     EngineRequest cancelled; cancelled.id = "cancel";
-    cancelled.token_ids = {101, 202, 303}; cancelled.input.sampling = sampling;
+    cancelled.diagnostic_input = mfq::engine::DiagnosticTokenInput{{101, 202, 303}}; cancelled.input.sampling = sampling;
     check(engine->admit(EngineRequest(cancelled)) == Admission::accepted, "cancel admission");
     engine->cancel("cancel");
     auto result = engine->step({});
@@ -809,7 +809,7 @@ static void check_batching(const char* model_path, const char* tokenizer) {
               return terminal(event.data);
           }) == 1 && std::holds_alternative<Cancelled>(result.events.back().data),
           "cancel before prefill did not release");
-    cancelled.token_ids.assign(32, 101);
+    cancelled.diagnostic_input->tokens.assign(32, 101);
     check(engine->admit(EngineRequest(cancelled)) == Admission::accepted, "prefill cancel admission");
     for (int tick = 0; tick < 8; ++tick) {
         result = engine->step({"cancel"});
@@ -827,7 +827,7 @@ static void check_batching(const char* model_path, const char* tokenizer) {
           "cancel changed subsequent output");
     EngineRequest session_request;
     session_request.id = "session";
-    session_request.token_ids.assign(65, 101);
+    session_request.diagnostic_input = mfq::engine::DiagnosticTokenInput{std::vector<int64_t>(65, 101)};
     session_request.input.sampling = sampling;
     session_request.input.sampling.max_tokens = 8;
     session_request.input.cache_plan.session_id = "session";
@@ -859,15 +859,15 @@ static void check_batching(const char* model_path, const char* tokenizer) {
         return tokens;
     };
     const auto session_reference = session_run(-1);
-    const auto previous_prompt = session_request.token_ids;
-    session_request.token_ids.insert(session_request.token_ids.end(), session_reference.begin(), session_reference.end());
-    session_request.input.cache_plan.stable_prefix_tokens = session_request.token_ids.size() - 1;
+    const auto previous_prompt = session_request.diagnostic_input->tokens;
+    session_request.diagnostic_input->tokens.insert(session_request.diagnostic_input->tokens.end(), session_reference.begin(), session_reference.end());
+    session_request.input.cache_plan.stable_prefix_tokens = session_request.diagnostic_input->tokens.size() - 1;
     session_run(3); // Cancel inside a layered snapshot restore.
     const auto restored_tokens = session_run(-1);
     check_interleaved_request(*engine, session_request, restored_tokens);
     engine->session({SessionCommand::Kind::clear});
     check(session_run(-1) == restored_tokens, "restored session changed greedy tokens");
-    session_request.token_ids = previous_prompt;
+    session_request.diagnostic_input->tokens = previous_prompt;
     session_request.input.cache_plan.stable_prefix_tokens = 64;
     engine->session({SessionCommand::Kind::clear});
     session_run(12); // Eight prefill chunks followed by layered capture.

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "models/common/moe.h"
+#include "common/moe.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>

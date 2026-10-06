@@ -1,8 +1,8 @@
 #pragma once
 #include "config.h"
-#include "models/common/weight_loading.h"
-#include "models/common/causal_forward.h"
-#include "models/common/causal_model.h"
+#include "common/weight_loading.h"
+#include "common/causal_forward.h"
+#include "common/causal_model.h"
 #include <optional>
 #include <utility>
 
