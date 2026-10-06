@@ -36,7 +36,7 @@
 #include <unistd.h>
 #endif
 
-namespace mfq::transport_detail {
+namespace mfq::transport {
 
 
 int64_t unix_time_seconds() {
@@ -2095,13 +2095,13 @@ std::vector<float> decode_audio_features(
     return features;
 }
 
-} // namespace mfq::transport_detail
+} // namespace mfq::transport
 
 MfqRuntimeProfile resolve_mfq_runtime_profile(
         const std::string & mfq_path,
         const std::string & embedded_profile_json,
         const std::string & explicit_profile_path) {
-    using namespace mfq::transport_detail;
+    using namespace mfq::transport;
     MfqRuntimeProfile result;
     if (!embedded_profile_json.empty()) {
         merge_runtime_profile(result, parse_runtime_profile(
@@ -2124,7 +2124,7 @@ MfqRuntimeProfile resolve_mfq_runtime_profile(
     return result;
 }
 
-namespace mfq::transport_detail {
+namespace mfq::transport {
 
 CompletionStream::CompletionStream(const MfqScheduler& scheduler,
         const MfqRuntimeTransportConfig& config, RuntimeRequestMetrics& metrics,
@@ -2259,4 +2259,4 @@ std::optional<std::vector<json>> CompletionStream::next() {
     return {};
 }
 
-} // namespace mfq::transport_detail
+} // namespace mfq::transport

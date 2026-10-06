@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-namespace mfq::transport_detail {
+namespace mfq::transport {
 
 using json = nlohmann::ordered_json;
 
@@ -154,4 +154,4 @@ private:
     bool terminal_ = false, accounted_ = false;
 };
 
-} // namespace mfq::transport_detail
+} // namespace mfq::transport

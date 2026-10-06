@@ -28,7 +28,7 @@
 
 namespace {
 
-using namespace mfq::transport_detail;
+using namespace mfq::transport;
 
 std::mutex stdio_protocol_mutex;
 int stdio_protocol_fd = -1;

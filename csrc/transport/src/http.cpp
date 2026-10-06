@@ -17,7 +17,7 @@
 
 namespace {
 
-using namespace mfq::transport_detail;
+using namespace mfq::transport;
 
 static json error_body(const std::string & message, const std::string & type, const std::string & param = {}) {
     return {

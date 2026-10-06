@@ -183,7 +183,7 @@ void test_model_capabilities() {
     capabilities.mtp = true;
     capabilities.source = "engine-test";
     const auto value =
-        mfq::transport_detail::model_capability_profile_json(capabilities);
+        mfq::transport::model_capability_profile_json(capabilities);
     assert(value["architecture_family"] == "test-family");
     assert(value["source"] == "engine-test");
     assert(value["features"]["text"] == true);
@@ -200,28 +200,28 @@ void test_decode_timing() {
     metrics.first_token = now - 70ms;
     metrics.last_token = now - 20ms;
     metrics.saw_token = true;
-    mfq::transport_detail::CompletionResult result;
+    mfq::transport::CompletionResult result;
     result.completion_tokens = 6;
-    const auto values = mfq::transport_detail::request_metric_values(result, metrics);
+    const auto values = mfq::transport::request_metric_values(result, metrics);
     assert(std::abs(values.ttft_ms - 10.0) < 1e-12);
     assert(std::abs(values.decode_ms - 50.0) < 1e-12);
     assert(std::abs(values.decode_tps - 100.0) < 1e-12);
     assert(values.generation_ms >= 80.0);
     assert(values.generation_ms - values.ttft_ms - values.decode_ms >= 20.0);
     result.cancelled = true;
-    assert(mfq::transport_detail::request_metric_values(result, metrics).decode_ms == values.decode_ms);
+    assert(mfq::transport::request_metric_values(result, metrics).decode_ms == values.decode_ms);
     InferenceMetrics single;
     single.mark_token();
     result.completion_tokens = 1;
-    const auto one = mfq::transport_detail::request_metric_values(result, single);
+    const auto one = mfq::transport::request_metric_values(result, single);
     assert(one.decode_ms == 0.0 && one.decode_tps == 0.0);
     result.completion_tokens = 0;
-    const auto empty = mfq::transport_detail::request_metric_values(result, InferenceMetrics{});
+    const auto empty = mfq::transport::request_metric_values(result, InferenceMetrics{});
     assert(empty.decode_ms == 0.0 && empty.decode_tps == 0.0);
 }
 void test_chat_input_contract() {
-    using mfq::transport_detail::ApiError;
-    using mfq::transport_detail::json;
+    using mfq::transport::ApiError;
+    using mfq::transport::json;
     json body = {
         {"messages", json::array({{{"role", "user"}, {"content", "hello"}}})},
         {"tools", json::array({
@@ -233,7 +233,7 @@ void test_chat_input_contract() {
         {"reasoning_format", "deepseek"},
         {"chat_template_kwargs", {{"mode", "strict"}}},
     };
-    auto input = mfq::transport_detail::parse_input(
+    auto input = mfq::transport::parse_input(
         body, true, MfqSamplingParams{});
     assert(input.chat_input);
     const auto& chat = *input.chat_input;
@@ -250,7 +250,7 @@ void test_chat_input_contract() {
     body["tool_choice"]["function"]["name"] = "missing";
     bool rejected = false;
     try {
-        (void) mfq::transport_detail::parse_input(
+        (void) mfq::transport::parse_input(
             body, true, MfqSamplingParams{});
     } catch (const ApiError& error) {
         rejected = error.status == 400 && error.param == "tool_choice";
@@ -259,7 +259,7 @@ void test_chat_input_contract() {
 }
 
 static void check_generation_protocol() {
-    using namespace mfq::transport_detail;
+    using namespace mfq::transport;
     FakeEngine engine;
     MfqScheduler scheduler(engine);
     MfqRuntimeTransportConfig config;
