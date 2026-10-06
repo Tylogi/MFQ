@@ -5,12 +5,6 @@ from mfq.server.protocol.output_protocols import output_protocol_for_architectur
 from mfq.server.runtime.capabilities import capabilities_for_architecture
 
 ROOT = Path(__file__).resolve().parents[1]
-TRANSPORT_SRC = ROOT / "csrc" / "transport"
-SERVER = "\n".join(
-    path.read_text(encoding="utf-8")
-    for path in sorted(TRANSPORT_SRC.rglob("*"))
-    if path.suffix in {".cpp", ".h"}
-)
 CUDA_PLAN = (
     ROOT / "csrc" / "backends" / "cuda" / "models" / "cuda_model_plan.h"
 ).read_text(encoding="utf-8")
@@ -145,22 +139,6 @@ def test_generated_output_protocol_is_resolved_by_the_registry() -> None:
         assert protocol.create_reasoning_parser() is not None
         assert protocol.create_tool_call_parser({}) is not None
         assert protocol.tool_call_protocol_name == "glm_xml"
-
-
-def test_cpp_transports_keep_health_metrics_out_of_response_performance() -> None:
-    assert SERVER.count("add_request_runtime_metrics(performance, metrics)") == 3
-    assert "add_runtime_metrics(performance)" not in SERVER
-    assert "append_generation_metrics(values, metrics.mtp)" in SERVER
-    mtp_metrics = (ROOT / "csrc/engine/src/mtp_metrics.cpp").read_text()
-    for metric in (
-        "mtp_available",
-        "mtp_used",
-        "mtp_cycles",
-        "mtp_drafted_tokens",
-        "mtp_accepted_tokens",
-        "mtp_acceptance_rate",
-    ):
-        assert f'"{metric}"' in SERVER + mtp_metrics
 
 
 def test_cuda_uses_one_architecture_and_optional_component_registry() -> None:

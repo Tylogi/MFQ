@@ -8,6 +8,7 @@
 #include <cmath>
 #include <map>
 #include <thread>
+#include <tuple>
 using namespace mfq::engine;
 using namespace std::chrono_literals;
 
@@ -49,9 +50,35 @@ struct FakeEngine final : Engine {
                 result.events.push_back({id, Cancelled{}}); continue;
             }
             if (std::find(eligible.begin(), eligible.end(), id) == eligible.end()) { ++it; continue; }
+            ++work.steps;
+            if (work.request.token_ids.empty()) {
+                const auto& content = work.request.input.chat_input->messages.front().content;
+                if (content != "hello") {
+                    result.events.push_back({id, Failed{content, "fake request failure"}});
+                } else if (work.steps <= 2) {
+                    OutputDiff diff;
+                    diff.content_delta = work.steps == 1 ? "hel" : "lo";
+                    diff.reasoning_content_delta = work.steps == 1 ? "think" : "ing";
+                    diff.tool_call_index = 0;
+                    diff.tool_call_delta = work.steps == 1
+                        ? ToolCall{"lookup", "{\"ok\":", "call_test"}
+                        : ToolCall{"", "true}", ""};
+                    result.events.push_back({id, OutputDelta{{}, {std::move(diff)}}});
+                    result.advanced.push_back(id);
+                    ++it;
+                    continue;
+                } else {
+                    InferenceMetrics metrics;
+                    metrics.mtp.available = true;
+                    metrics.mtp.cycles = 2;
+                    result.events.push_back({id, Completed{"tool_calls", {5, 2}, metrics}});
+                }
+                it = active.erase(it);
+                ++released;
+                continue;
+            }
             if (work.request.token_ids == std::vector<int64_t>{63}) throw std::runtime_error("device failure");
             ++advances.at(std::stoi(id));
-            ++work.steps;
             result.advanced.push_back(id);
             if (work.steps <= int(work.request.token_ids.size()))
                 result.events.push_back({id, PrefillProgress{{std::size_t(work.steps), 1, 0, 1}}});
@@ -95,7 +122,7 @@ struct FakeEngine final : Engine {
         result.has_control_work = control_pending || control_stop;
         result.status = status(); result.has_work = !active.empty() || result.has_control_work; return result;
     }
-    SessionResult session(const SessionCommand&) override { check_thread(); return {7, {}}; }
+    SessionResult session(const SessionCommand&) override { check_thread(); return {7, {{"test_session_only", 99}}}; }
     int64_t reload(int64_t context) override {
         check_thread(); assert(active.empty());
         if (context == 13) throw std::runtime_error("load failed");
@@ -104,7 +131,7 @@ struct FakeEngine final : Engine {
     void shutdown() override { check_thread(); assert(active.empty()); }
     ControlResult control(ControlRequest request) override {
         check_thread();
-        if (std::holds_alternative<RuntimeMetrics>(request)) return Metrics{};
+        if (std::holds_alternative<RuntimeMetrics>(request)) return Metrics{{"test_health_only", 99}};
         if (auto* prepare = std::get_if<PrepareDuplex>(&request)) {
             prepare->parameters.special_ids.assign(15, 1);
             return std::move(prepare->parameters);
@@ -230,6 +257,103 @@ void test_chat_input_contract() {
     assert(rejected);
 }
 
+static void check_generation_protocol() {
+    using namespace mfq::transport_detail;
+    FakeEngine engine;
+    MfqScheduler scheduler(engine);
+    MfqRuntimeTransportConfig config;
+    RuntimeRequestMetrics metrics;
+    json params = {
+        {"input", {{"messages", json::array({{{"role", "user"}, {"content", "hello"}}})}}},
+        {"sampling", {{"max_new_tokens", 2}, {"seed", 1}}},
+        {"stream", false}, {"include_usage", true},
+    };
+    {
+        CompletionStream plain(scheduler, config, metrics, params, "plain");
+        assert(metrics.active_requests() == 1);
+        const auto frames = plain.next();
+        assert(!plain.streaming() && frames && frames->size() == 1);
+        const auto& result = frames->front();
+        assert(result["output"]["text"] == "hello");
+        assert(result["output"]["reasoning"] == "thinking");
+        const auto& call = result["output"]["tool_calls"][0];
+        assert(call["id"] == "call_test");
+        assert(call["function"]["name"] == "lookup");
+        assert(call["function"]["arguments"] == "{\"ok\":true}");
+        assert(result["usage"]["prompt_tokens"] == 5);
+        assert(result["usage"]["completion_tokens"] == 2);
+        assert(result["finish_reason"] == "tool_calls");
+        assert(result["metrics"]["mtp_cycles"] == 2);
+        assert(!plain.next() && !plain.next());
+    }
+    params["stream"] = true;
+    for (bool include_usage : {true, false}) {
+        params["include_usage"] = include_usage;
+        CompletionStream stream(scheduler, config, metrics, params, "stream");
+        assert(stream.streaming());
+        std::vector<json> frames;
+        while (auto batch = stream.next())
+            for (auto& frame : *batch) frames.push_back(std::move(frame));
+        assert(frames.size() == (include_usage ? 4 : 3));
+        assert(frames[0]["event"] == "delta" && frames[1]["event"] == "delta");
+        assert(frames[0]["delta"]["content"].get<std::string>() +
+               frames[1]["delta"]["content"].get<std::string>() == "hello");
+        assert(frames[2]["event"] == "complete");
+        assert(frames[2]["finish_reason"] == "tool_calls");
+        assert(frames[2]["metrics"]["mtp_cycles"] == 2);
+        if (include_usage) assert(frames[3]["usage"]["total_tokens"] == 7);
+        for (const auto& frame : frames) {
+            assert(frame["request_id"] == frames[0]["request_id"]);
+            assert(frame["created"] == frames[0]["created"]);
+        }
+        assert(!stream.next());
+    }
+    for (const auto& [code, status, type] : {
+            std::tuple{"invalid_request", 400, "invalid_request_error"},
+            std::tuple{"unsupported_input", 501, "unsupported_parameter"},
+            std::tuple{"resource_exhausted", 503, "resource_exhausted"},
+            std::tuple{"backend_failure", 500, "server_error"}}) {
+        params["input"]["messages"][0]["content"] = code;
+        CompletionStream stream(scheduler, config, metrics, params, "error");
+        bool failed = false;
+        try { (void)stream.next(); }
+        catch (const ApiError& error) {
+            failed = error.status == status && error.type == type;
+        }
+        assert(failed && !stream.next());
+        assert(metrics.active_requests() == 0);
+    }
+    params["input"]["messages"][0]["content"] = "hello";
+    engine.defer = true;
+    {
+        CompletionStream disconnected(scheduler, config, metrics, params, "disconnected");
+        disconnected.cancel();
+        disconnected.cancel();
+        assert(!disconnected.next());
+    }
+    { CompletionStream abandoned(scheduler, config, metrics, params, "abandoned"); }
+    auto counts = metrics.snapshot(config, 128, false);
+    assert(counts["active_requests"] == 0);
+    assert(counts["total_requests"] == 9 && counts["failed_requests"] == 6);
+    assert(counts["total_prompt_tokens"] == 15 && counts["total_completion_tokens"] == 6);
+    (void)scheduler.status();
+
+    FakeEngine limited_engine;
+    limited_engine.defer = true;
+    MfqScheduler limited(limited_engine, {64, 4096, 1, 65536});
+    RuntimeRequestMetrics rejected_metrics;
+    {
+        CompletionStream pending(limited, config, rejected_metrics, params, "pending");
+        bool rejected = false;
+        try { CompletionStream rejected_request(limited, config, rejected_metrics, params, "full"); }
+        catch (const ApiError& error) { rejected = error.status == 429; }
+        assert(rejected && rejected_metrics.active_requests() == 1);
+    }
+    counts = rejected_metrics.snapshot(config, 128, false);
+    assert(counts["active_requests"] == 0);
+    assert(counts["total_requests"] == 2 && counts["failed_requests"] == 2);
+}
+
 static void check_input_ownership_and_budget() {
     FakeEngine engine;
     engine.defer = true;
@@ -336,6 +460,7 @@ int main(int argc, char** argv) {
     test_model_capabilities();
     test_decode_timing();
     test_chat_input_contract();
+    check_generation_protocol();
     {
         FakeEngine engine;
         MfqScheduler scheduler(engine, {8, 4096});

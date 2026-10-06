@@ -1,6 +1,7 @@
 #include "common.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
@@ -841,96 +842,26 @@ public:
                         404, "unsupported_operation",
                         "unsupported stdio operation: " + op);
                 }
-                const json body = runtime_generate_body(params);
-                auto input = parse_input(
-                    body, true, sampling_defaults);
-                if (body.contains("mfq_multimodal")) {
-                    if (!input.sampling.enable_vision) {
-                        throw ApiError(
-                            400, "invalid_request_error",
-                            "vision is disabled for this request");
-                    }
-                    if (!scheduler.supports_multimodal_generation()) {
-                        throw ApiError(
-                            501, "unsupported_parameter",
-                            "the loaded model has no native vision runtime");
-                    }
-                    input.media = parse_mfq_vision(
-                        body["mfq_multimodal"]);
-                }
-                const auto sampling = input.sampling;
-                const bool stream = input.stream, include_usage = input.include_usage;
-                auto completion = std::make_shared<CompletionStream>(scheduler, std::move(input), id);
+                auto completion = std::make_shared<CompletionStream>(
+                    scheduler, config, request_metrics_store, params, id);
                 auto done = std::make_shared<std::atomic<bool>>(false);
                 tasks.push_back({
-                    std::thread([
-                        &, id, sampling, stream, include_usage, completion, done
-                    ]() mutable {
+                    std::thread([&, id, completion, done] {
                         try {
-                            const std::string response_id =
-                                request_id("run-");
-                            const int64_t created = unix_time_seconds();
-                            ActiveRequest active_request(request_metrics_store);
-                            while (auto diffs = completion->next()) {
-                                if (!stream) continue;
-                                for (const auto& diff : *diffs) {
-                                    json delta = chat_diff_json(diff);
-                                    if (delta.empty()) continue;
-                                    auto event = runtime_generation_event("delta", response_id, created, config.model_name);
-                                    event["delta"] = std::move(delta);
-                                    if (!send_event(id, std::move(event))) { completion->cancel(); break; }
+                            while (auto frames = completion->next()) {
+                                for (auto& frame : *frames) {
+                                    if (!send_event(id, std::move(frame))) {
+                                        completion->cancel();
+                                        done->store(true, std::memory_order_release);
+                                        return;
+                                    }
                                 }
-                            }
-                            auto result = std::move(completion->result);
-                            auto metrics = completion->metrics;
-                            const RequestMetricValues metric_values =
-                                request_metric_values(result, metrics);
-                            log_request_metrics(
-                                response_id, true, stream,
-                                completion->prompt_tokens, sampling,
-                                result, metric_values);
-                            active_request.complete(
-                                response_id, true, stream,
-                                completion->prompt_tokens, result, metric_values);
-                            auto performance = request_metric_values_json(
-                                metric_values, sampling);
-                            add_request_runtime_metrics(performance, metrics);
-                            if (stream) {
-                                auto complete = runtime_generation_event(
-                                    "complete", response_id, created,
-                                    config.model_name);
-                                complete["finish_reason"] = result.finish_reason;
-                                complete["metrics"] = std::move(performance);
-                                send_event(id, std::move(complete));
-                                if (include_usage) {
-                                    auto usage = runtime_generation_event(
-                                        "usage", response_id, created,
-                                        config.model_name);
-                                    usage["usage"] = usage_json(
-                                        completion->prompt_tokens,
-                                        result.completion_tokens);
-                                    send_event(id, std::move(usage));
-                                }
-                            } else {
-                                send_event(id, runtime_generation_result(
-                                    response_id, created, config.model_name,
-                                    result,
-                                    usage_json(
-                                        completion->prompt_tokens,
-                                        result.completion_tokens),
-                                    std::move(performance)));
                             }
                             send_done(id);
                         } catch (const ApiError & error) {
-                            send_error(
-                                id, error.status, error.type, error.what());
-                        } catch (const mfq::engine::InferenceInputError & error) {
-                            send_error(
-                                id, 400, input_error_type(error.code),
-                                error.what());
+                            send_error(id, error.status, error.type, error.what());
                         } catch (const std::exception & error) {
-                            send_error(
-                                id, 500, "server_error", error.what());
+                            send_error(id, 500, "server_error", error.what());
                         }
                         done->store(true, std::memory_order_release);
                     }),

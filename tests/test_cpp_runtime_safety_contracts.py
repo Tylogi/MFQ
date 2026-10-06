@@ -99,14 +99,6 @@ def test_optional_predictor_experts_join_the_shared_moe_cache() -> None:
     )
 
 
-def test_reload_and_request_registration_use_scheduler_mailbox() -> None:
-    assert "reload_gate" not in SERVER
-    assert "scheduler.reload(" in SERVER
-    assert "scheduler_.submit(" in SERVER
-    assert "std::make_shared<ActiveRequest>(request_metrics_store)" in SERVER
-    assert "active_request->complete(" in SERVER
-
-
 def test_http_and_stdio_are_separate_transport_implementations() -> None:
     assert "class MfqTransport" in TRANSPORT_BASE
     assert "class MfqHttpTransport final : public MfqTransport" in HTTP_TRANSPORT

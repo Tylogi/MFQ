@@ -4,16 +4,13 @@
 
 #include "nlohmann/json.hpp"
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -38,7 +35,6 @@ public:
     std::string param;
 };
 
-using RequestWork = mfq::engine::InferenceInput;
 using RequestInput = mfq::engine::InferenceInput;
 using RequestMetrics = mfq::engine::InferenceMetrics;
 
@@ -95,23 +91,6 @@ private:
     json last_request_ = nullptr;
 };
 
-class ActiveRequest {
-public:
-    explicit ActiveRequest(RuntimeRequestMetrics & metrics);
-    ~ActiveRequest();
-    void complete(
-        const std::string & id,
-        bool chat,
-        bool stream,
-        size_t prompt_tokens,
-        const CompletionResult & result,
-        const RequestMetricValues & values);
-
-private:
-    RuntimeRequestMetrics & metrics_;
-    bool completed_ = false;
-};
-
 int64_t unix_time_seconds();
 std::string request_id(const char * prefix);
 int64_t integer_field(
@@ -140,54 +119,39 @@ RequestInput parse_input(
 RequestMetricValues request_metric_values(
     const CompletionResult & result,
     const RequestMetrics & metrics);
-void add_request_runtime_metrics(json& value, const RequestMetrics& metrics);
-json request_metric_values_json(
-    const RequestMetricValues & values,
-    const MfqSamplingParams & sampling);
-void log_request_metrics(
-    const std::string & id,
-    bool chat,
-    bool stream,
-    size_t prompt_tokens,
-    const MfqSamplingParams & sampling,
-    const CompletionResult & result,
-    const RequestMetricValues & values);
-json usage_json(size_t prompt_tokens, int32_t completion_tokens);
-json runtime_generation_event(
-    const std::string & event,
-    const std::string & request_id,
-    int64_t created,
-    const std::string & model);
-json runtime_generation_result(
-    const std::string & request_id,
-    int64_t created,
-    const std::string & model,
-    const CompletionResult & result,
-    json usage,
-    json metrics);
-json chat_diff_json(const mfq::engine::OutputDiff & diff);
 MfqMultimodalInput parse_mfq_vision(const json & value);
 std::vector<float> decode_audio_features(
     const std::string & encoded,
     int32_t frames);
 
-} // namespace mfq::transport_detail
-
-namespace mfq::transport_detail {
+// Shared generation protocol. Adapters only frame these values and signal a
+// failed write with cancel(). Destruction cancels unfinished work and accounts
+// failures; streaming never retains the generated text or tool arguments.
 class CompletionStream {
 public:
-    CompletionStream(const MfqScheduler& scheduler, RequestWork&& work, std::string id);
+    CompletionStream(const MfqScheduler& scheduler,
+        const MfqRuntimeTransportConfig& config, RuntimeRequestMetrics& metrics,
+        const json& params, std::string id = {});
     ~CompletionStream();
-    std::optional<std::vector<mfq::engine::OutputDiff>> next();
+    CompletionStream(const CompletionStream&) = delete;
+    CompletionStream& operator=(const CompletionStream&) = delete;
+    bool streaming() const { return stream_; }
+    // Waits for deltas/complete/optional usage, or one non-streaming result.
+    // Returns nullopt after terminal delivery or disconnect.
+    std::optional<std::vector<json>> next();
     void cancel();
-    CompletionResult result;
-    RequestMetrics metrics;
-    std::size_t prompt_tokens = 0;
 private:
+    void fail();
+    json event(const char* name) const;
     const MfqScheduler& scheduler_;
-    std::string id_;
+    RuntimeRequestMetrics& metrics_store_;
+    std::string id_, response_id_, model_;
+    std::int64_t created_;
+    MfqSamplingParams sampling_;
+    CompletionResult result_;
     std::shared_ptr<MfqScheduledRequest> request_;
-    bool terminal_ = false;
+    bool stream_ = false, include_usage_ = false;
+    bool terminal_ = false, accounted_ = false;
 };
 
 } // namespace mfq::transport_detail

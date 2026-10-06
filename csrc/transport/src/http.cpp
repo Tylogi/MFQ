@@ -842,49 +842,11 @@ int MfqHttpTransport::run(const MfqScheduler& scheduler) {
     auto runtime_generate_handler = [&](const httplib::Request & req, httplib::Response & res) {
         if (!authorized(req, res, config.api_key)) return;
         try {
-            const json body = runtime_generate_body(parse_body(req));
-            auto input = parse_input(body, true, sampling_defaults);
-            if (body.contains("mfq_multimodal")) {
-                if (!input.sampling.enable_vision) {
-                    throw ApiError(
-                        400, "invalid_request_error",
-                        "vision is disabled for this request; set enable_vision=true",
-                        "enable_vision");
-                }
-                if (!scheduler.supports_multimodal_generation()) {
-                    throw ApiError(
-                        501, "unsupported_parameter",
-                        "the loaded model has no native vision runtime",
-                        "mfq_multimodal");
-                }
-                input.media = parse_mfq_vision(body["mfq_multimodal"]);
-            }
-            const auto sampling = input.sampling;
-                const bool stream = input.stream, include_usage = input.include_usage;
-            const std::string id = request_id("run-");
-            const int64_t created = unix_time_seconds();
-            std::shared_ptr<ActiveRequest> active_request;
-            active_request = std::make_shared<ActiveRequest>(request_metrics_store);
-            auto completion = std::make_shared<CompletionStream>(scheduler, std::move(input), id);
-
-            if (!stream) {
-                while (completion->next()) {}
-                auto result = std::move(completion->result);
-                auto metrics = completion->metrics;
-                const RequestMetricValues metric_values =
-                    request_metric_values(result, metrics);
-                log_request_metrics(
-                    id, true, false, completion->prompt_tokens, sampling,
-                    result, metric_values);
-                active_request->complete(
-                    id, true, false, completion->prompt_tokens, result, metric_values);
-                auto performance =
-                    request_metric_values_json(metric_values, sampling);
-                add_request_runtime_metrics(performance, metrics);
-                set_json(res, runtime_generation_result(
-                    id, created, config.model_name, result,
-                    usage_json(completion->prompt_tokens, result.completion_tokens),
-                    std::move(performance)));
+            auto completion = std::make_shared<CompletionStream>(
+                scheduler, config, request_metrics_store, parse_body(req));
+            if (!completion->streaming()) {
+                const auto frames = completion->next();
+                set_json(res, frames->front());
                 return;
             }
 
@@ -892,51 +854,24 @@ int MfqHttpTransport::run(const MfqScheduler& scheduler) {
             res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider(
                 "text/event-stream; charset=utf-8",
-                [sampling, stream, include_usage, id, created, &scheduler,
-                 this, active_request, completion]
-                (size_t offset, httplib::DataSink & sink) mutable -> bool {
+                [completion](size_t offset, httplib::DataSink & sink) -> bool {
                     if (offset != 0) {
                         sink.done();
                         return false;
                     }
                     try {
-                        while (auto diffs = completion->next()) {
-                            for (const auto& diff : *diffs) {
-                                json delta = chat_diff_json(diff);
-                                if (delta.empty()) continue;
-                                auto event = runtime_generation_event("delta", id, created, config.model_name);
-                                event["delta"] = std::move(delta);
-                                if (!write_sse(sink, event)) { completion->cancel(); return false; }
+                        while (auto frames = completion->next()) {
+                            for (const auto& frame : *frames) {
+                                if (!write_sse(sink, frame)) {
+                                    completion->cancel();
+                                    return false;
+                                }
                             }
-                        }
-                        auto result = std::move(completion->result);
-                        auto metrics = completion->metrics;
-                        const RequestMetricValues metric_values =
-                            request_metric_values(result, metrics);
-                        log_request_metrics(
-                            id, true, true, completion->prompt_tokens, sampling,
-                            result, metric_values);
-                        active_request->complete(
-                            id, true, true, completion->prompt_tokens, result,
-                            metric_values);
-                        if (!result.client_connected) return false;
-                        auto complete = runtime_generation_event(
-                            "complete", id, created, config.model_name);
-                        complete["finish_reason"] = result.finish_reason;
-                        auto performance = request_metric_values_json(
-                            metric_values, sampling);
-                        add_request_runtime_metrics(performance, metrics);
-                        complete["metrics"] = std::move(performance);
-                        if (!write_sse(sink, complete)) return false;
-                        if (include_usage) {
-                            auto usage = runtime_generation_event(
-                                "usage", id, created, config.model_name);
-                            usage["usage"] = usage_json(
-                                completion->prompt_tokens, result.completion_tokens);
-                            if (!write_sse(sink, usage)) return false;
                         }
                         static constexpr char done[] = "data: [DONE]\n\n";
                         if (!sink.write(done, sizeof(done) - 1)) return false;
+                    } catch (const ApiError & error) {
+                        write_sse(sink, error_body(error.what(), error.type, error.param));
                     } catch (const std::exception & error) {
                         write_sse(sink, error_body(error.what(), "runtime_error"));
                     }

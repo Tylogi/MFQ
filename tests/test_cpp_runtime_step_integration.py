@@ -167,6 +167,116 @@ def test_diagnostic_engine_generation() -> None:
     assert outputs[0] == outputs[1]
 
 
+@pytest.mark.parametrize("transport", ["http", "stdio"])
+def test_generation_protocol_through_framing_adapters(transport: str) -> None:
+    import socket
+    from urllib.error import HTTPError, URLError
+    from urllib.request import Request, urlopen
+
+    executable = ROOT / "build/csrc/tests/mfq-runtime-transport-test"
+    if not executable.exists():
+        pytest.skip("native transport test binary not built")
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+
+    async def run() -> None:
+        command = [str(executable), "--stdio"] if transport == "stdio" else [
+            str(executable), "--http", str(port),
+        ]
+        process = await asyncio.create_subprocess_exec(
+            *command, stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE if transport == "stdio" else asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        def http(op: str, params: dict) -> list[dict]:
+            data = json.dumps(params).encode() if op == "generate" else None
+            request = Request(f"http://127.0.0.1:{port}/runtime/{op}", data=data,
+                              headers={"Content-Type": "application/json"})
+            try:
+                with urlopen(request, timeout=2) as response:
+                    if response.headers.get_content_type() != "text/event-stream":
+                        return [json.load(response)]
+                    frames = []
+                    for line in response:
+                        if not line.startswith(b"data: "):
+                            continue
+                        if line.strip() == b"data: [DONE]":
+                            break
+                        frames.append(json.loads(line[6:]))
+                    return frames
+            except HTTPError as error:
+                return [{"error": {**json.load(error)["error"], "status_code": error.code}}]
+
+        async def invoke(id: str, op: str, params: dict | None = None) -> list[dict]:
+            if transport == "http":
+                return await asyncio.to_thread(http, op, params or {})
+            process.stdin.write(json.dumps({"v": 1, "id": id, "op": op, "params": params or {}}).encode() + b"\n")
+            await process.stdin.drain()
+            frames = []
+            while True:
+                line = await asyncio.wait_for(process.stdout.readline(), 2)
+                assert line
+                frame = json.loads(line)
+                assert frame["id"] == id
+                if frame["type"] == "error":
+                    return [{"error": {**frame["error"], "type": frame["error"]["code"]}}]
+                if frame["type"] == "done":
+                    return frames
+                frames.append(frame["data"])
+                if frame["type"] == "result":
+                    return frames
+
+        params = {
+            "input": {"messages": [{"role": "user", "content": "hello"}]},
+            "sampling": {"max_new_tokens": 2, "seed": 1},
+            "stream": False, "include_usage": True,
+        }
+        try:
+            if transport == "stdio":
+                assert json.loads(await asyncio.wait_for(process.stdout.readline(), 2))["type"] == "ready"
+            else:
+                for _ in range(100):
+                    try:
+                        await invoke("ready", "health")
+                        break
+                    except URLError:
+                        await asyncio.sleep(0.01)
+                else:
+                    pytest.fail("fake HTTP transport did not start")
+            plain, = await invoke("plain", "generate", params)
+            assert plain["output"]["text"] == "hello"
+            assert plain["output"]["reasoning"] == "thinking"
+            assert plain["output"]["tool_calls"][0]["function"]["arguments"] == '{"ok":true}'
+            assert plain["usage"] == {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+            params["stream"] = True
+            streamed = await invoke("stream", "generate", params)
+            assert [frame["event"] for frame in streamed] == ["delta", "delta", "complete", "usage"]
+            assert "".join(frame.get("delta", {}).get("content", "") for frame in streamed) == plain["output"]["text"]
+            assert "".join(frame.get("delta", {}).get("reasoning_content", "") for frame in streamed) == plain["output"]["reasoning"]
+            assert streamed[-1]["usage"] == plain["usage"]
+            assert streamed[-2]["finish_reason"] == plain["finish_reason"]
+            assert all(frame["request_id"] == streamed[0]["request_id"] for frame in streamed)
+            for performance in (plain["metrics"], streamed[-2]["metrics"]):
+                assert performance["mtp_available"] and performance["mtp_cycles"] == 2
+                assert "test_health_only" not in performance and "test_session_only" not in performance
+            params["stream"] = False
+            params["input"]["messages"][0]["content"] = "invalid_request"
+            failed, = await invoke("failed", "generate", params)
+            assert failed["error"]["status_code"] == 400
+            assert failed["error"]["type"] == "invalid_request_error"
+            status, = await invoke("status", "status")
+            assert status["active_requests"] == 0
+            assert status["total_requests"] == 3 and status["failed_requests"] == 1
+            assert status["test_health_only"] == 99 and status["test_session_only"] == 99
+        finally:
+            if process.returncode is None:
+                process.terminate()
+            await asyncio.wait_for(process.wait(), 2)
+
+    asyncio.run(run())
+
+
 def test_stdio_duplex_close_interrupts_pending_control() -> None:
     """The real stdio reader must accept close while a fake device is generating."""
     executable = ROOT / "build/csrc/tests/mfq-runtime-transport-test"

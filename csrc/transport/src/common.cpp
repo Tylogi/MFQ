@@ -1013,7 +1013,7 @@ RequestInput parse_input(
 }
 
 
-json request_metric_values_json(
+static json request_metric_values_json(
         const RequestMetricValues & values,
         const MfqSamplingParams & sampling) {
     return {
@@ -1043,7 +1043,7 @@ json request_metric_values_json(
     };
 }
 
-void add_request_runtime_metrics(json& value, const RequestMetrics& metrics) {
+static void add_request_runtime_metrics(json& value, const RequestMetrics& metrics) {
     value["mtp_available"] = metrics.mtp.available ? 1.0 : 0.0;
     if (!metrics.mtp.available) return;
     mfq::engine::Metrics values;
@@ -1088,7 +1088,7 @@ RequestMetricValues request_metric_values(
     return values;
 }
 
-void log_request_metrics(const std::string & id, bool chat, bool stream,
+static void log_request_metrics(const std::string & id, bool chat, bool stream,
                                 size_t prompt_tokens, const MfqSamplingParams & sampling,
                                 const CompletionResult & result,
                                 const RequestMetricValues & values) {
@@ -1216,27 +1216,7 @@ json RuntimeRequestMetrics::snapshot(
     };
 }
 
-ActiveRequest::ActiveRequest(RuntimeRequestMetrics & metrics)
-    : metrics_(metrics) {
-    metrics_.begin();
-}
-
-ActiveRequest::~ActiveRequest() {
-    if (!completed_) metrics_.fail();
-}
-
-void ActiveRequest::complete(
-        const std::string & id,
-        bool chat,
-        bool stream,
-        size_t prompt_tokens,
-        const CompletionResult & result,
-        const RequestMetricValues & values) {
-    metrics_.complete(id, chat, stream, prompt_tokens, result, values);
-    completed_ = true;
-}
-
-json usage_json(size_t prompt_tokens, int32_t completion_tokens) {
+static json usage_json(size_t prompt_tokens, int32_t completion_tokens) {
     return {
         {"prompt_tokens", prompt_tokens},
         {"completion_tokens", completion_tokens},
@@ -1247,7 +1227,7 @@ json usage_json(size_t prompt_tokens, int32_t completion_tokens) {
 static json chat_tool_calls_json(
     const std::vector<mfq::engine::ToolCall> & tool_calls);
 
-json runtime_generation_event(
+static json runtime_generation_event(
         const std::string & event,
         const std::string & request_id,
         int64_t created,
@@ -1260,7 +1240,7 @@ json runtime_generation_event(
     };
 }
 
-json runtime_generation_result(
+static json runtime_generation_result(
         const std::string & request_id,
         int64_t created,
         const std::string & model,
@@ -1285,7 +1265,7 @@ json runtime_generation_result(
     };
 }
 
-json chat_diff_json(const mfq::engine::OutputDiff & diff) {
+static json chat_diff_json(const mfq::engine::OutputDiff & diff) {
     json delta = json::object();
     if (!diff.reasoning_content_delta.empty()) {
         delta["reasoning_content"] = diff.reasoning_content_delta;
@@ -2145,55 +2125,138 @@ MfqRuntimeProfile resolve_mfq_runtime_profile(
 }
 
 namespace mfq::transport_detail {
-CompletionStream::CompletionStream(const MfqScheduler& scheduler, RequestWork&& work, std::string id) try
-    : scheduler_(scheduler), id_(std::move(id)),
-      request_(scheduler_.submit(mfq::engine::EngineRequest{id_, std::move(work)})) {}
-catch (const MfqSchedulerOverloaded& error) { throw ApiError(429, "request_queue_full", error.what()); }
+
+CompletionStream::CompletionStream(const MfqScheduler& scheduler,
+        const MfqRuntimeTransportConfig& config, RuntimeRequestMetrics& metrics,
+        const json& params, std::string id)
+    : scheduler_(scheduler), metrics_store_(metrics),
+      response_id_(request_id("run-")), model_(config.model_name),
+      created_(unix_time_seconds()) {
+    id_ = id.empty() ? response_id_ : std::move(id);
+    const auto body = runtime_generate_body(params);
+    auto input = parse_input(body, true, default_sampling_params(config));
+    if (body.contains("mfq_multimodal")) {
+        if (!input.sampling.enable_vision) {
+            throw ApiError(400, "invalid_request_error",
+                "vision is disabled for this request; set enable_vision=true",
+                "enable_vision");
+        }
+        if (!scheduler.supports_multimodal_generation()) {
+            throw ApiError(501, "unsupported_parameter",
+                "the loaded model has no native vision runtime", "mfq_multimodal");
+        }
+        input.media = parse_mfq_vision(body["mfq_multimodal"]);
+    }
+    sampling_ = input.sampling;
+    stream_ = input.stream;
+    include_usage_ = input.include_usage;
+    metrics_store_.begin();
+    try {
+        request_ = scheduler_.submit(mfq::engine::EngineRequest{id_, std::move(input)});
+    } catch (const MfqSchedulerOverloaded& error) {
+        fail();
+        throw ApiError(429, "request_queue_full", error.what());
+    } catch (...) {
+        fail();
+        throw;
+    }
+}
+
 CompletionStream::~CompletionStream() {
     if (!terminal_) try { cancel(); } catch (...) {}
+    fail();
 }
+
+void CompletionStream::fail() {
+    if (accounted_) return;
+    metrics_store_.fail();
+    accounted_ = true;
+}
+
 void CompletionStream::cancel() {
-    scheduler_.cancel_request(id_);
-    result.client_connected = false;
+    if (!result_.client_connected) return;
+    if (!terminal_) scheduler_.cancel_request(id_);
+    result_.client_connected = false;
+    fail();
 }
-std::optional<std::vector<mfq::engine::OutputDiff>> CompletionStream::next() {
-    if (terminal_) return {};
-    std::vector<mfq::engine::OutputDiff> diffs;
-    for (auto& event : request_->wait()) {
-        std::visit([&](auto& data) {
-            using T = std::decay_t<decltype(data)>;
-            if constexpr (std::is_same_v<T, mfq::engine::OutputDelta>) {
-                for (const auto& diff : data.diffs) {
-                    result.text += diff.content_delta;
-                    result.reasoning_text += diff.reasoning_content_delta;
-                    if (diff.tool_call_index == std::string::npos) continue;
-                    if (result.tool_calls.size() <= diff.tool_call_index)
-                        result.tool_calls.resize(diff.tool_call_index + 1);
-                    auto& call = result.tool_calls[diff.tool_call_index];
-                    call.id += diff.tool_call_delta.id;
-                    call.name += diff.tool_call_delta.name;
-                    call.arguments += diff.tool_call_delta.arguments;
+
+json CompletionStream::event(const char* name) const {
+    return runtime_generation_event(name, response_id_, created_, model_);
+}
+
+std::optional<std::vector<json>> CompletionStream::next() {
+    std::vector<json> frames;
+    while (!terminal_ && result_.client_connected) {
+        for (auto& item : request_->wait()) {
+            std::visit([&](auto& data) {
+                using T = std::decay_t<decltype(data)>;
+                if constexpr (std::is_same_v<T, mfq::engine::OutputDelta>) {
+                    for (const auto& diff : data.diffs) {
+                        if (stream_) {
+                            auto delta = chat_diff_json(diff);
+                            if (delta.empty()) continue;
+                            auto frame = event("delta");
+                            frame["delta"] = std::move(delta);
+                            frames.push_back(std::move(frame));
+                        } else {
+                            result_.text += diff.content_delta;
+                            result_.reasoning_text += diff.reasoning_content_delta;
+                            if (diff.tool_call_index == std::string::npos) continue;
+                            if (result_.tool_calls.size() <= diff.tool_call_index)
+                                result_.tool_calls.resize(diff.tool_call_index + 1);
+                            auto& call = result_.tool_calls[diff.tool_call_index];
+                            call.id += diff.tool_call_delta.id;
+                            call.name += diff.tool_call_delta.name;
+                            call.arguments += diff.tool_call_delta.arguments;
+                        }
+                    }
+                } else if constexpr (std::is_same_v<T, mfq::engine::Completed> ||
+                                     std::is_same_v<T, mfq::engine::Cancelled>) {
+                    terminal_ = true;
+                    result_.completion_tokens = static_cast<std::int32_t>(data.usage.completion_tokens);
+                    result_.cancelled = std::is_same_v<T, mfq::engine::Cancelled>;
+                    if constexpr (std::is_same_v<T, mfq::engine::Completed>)
+                        result_.finish_reason = std::move(data.finish_reason);
+                    else result_.finish_reason = "cancelled";
+                    const auto values = request_metric_values(result_, data.metrics);
+                    auto performance = request_metric_values_json(values, sampling_);
+                    add_request_runtime_metrics(performance, data.metrics);
+                    const auto usage = usage_json(data.usage.prompt_tokens, result_.completion_tokens);
+                    log_request_metrics(response_id_, true, stream_,
+                        data.usage.prompt_tokens, sampling_, result_, values);
+                    metrics_store_.complete(response_id_, true, stream_,
+                        data.usage.prompt_tokens, result_, values);
+                    accounted_ = true;
+                    if (stream_) {
+                        auto complete = event("complete");
+                        complete["finish_reason"] = result_.finish_reason;
+                        complete["metrics"] = std::move(performance);
+                        frames.push_back(std::move(complete));
+                        if (include_usage_) {
+                            auto frame = event("usage");
+                            frame["usage"] = usage;
+                            frames.push_back(std::move(frame));
+                        }
+                    } else {
+                        frames.push_back(runtime_generation_result(response_id_, created_,
+                            model_, result_, usage, std::move(performance)));
+                    }
+                } else if constexpr (std::is_same_v<T, mfq::engine::Failed>) {
+                    terminal_ = true;
+                    fail();
+                    if (data.code == "invalid_request")
+                        throw ApiError(400, "invalid_request_error", data.message);
+                    if (data.code == "unsupported_input")
+                        throw ApiError(501, "unsupported_parameter", data.message);
+                    if (data.code == "resource_exhausted")
+                        throw ApiError(503, "resource_exhausted", data.message);
+                    throw ApiError(500, "server_error", data.message);
                 }
-                diffs.insert(diffs.end(), std::make_move_iterator(data.diffs.begin()),
-                             std::make_move_iterator(data.diffs.end()));
-            } else if constexpr (std::is_same_v<T, mfq::engine::Completed> ||
-                                 std::is_same_v<T, mfq::engine::Cancelled>) {
-                result.completion_tokens = static_cast<std::int32_t>(data.usage.completion_tokens);
-                prompt_tokens = data.usage.prompt_tokens;
-                result.cancelled = std::is_same_v<T, mfq::engine::Cancelled>;
-                if constexpr (std::is_same_v<T, mfq::engine::Completed>) result.finish_reason = std::move(data.finish_reason);
-                else result.finish_reason = "cancelled";
-                metrics = data.metrics; terminal_ = true;
-            } else if constexpr (std::is_same_v<T, mfq::engine::Failed>) {
-                terminal_ = true;
-                if (data.code == "invalid_request") throw ApiError(400, "invalid_request_error", data.message);
-                if (data.code == "unsupported_input") throw ApiError(501, "unsupported_parameter", data.message);
-                if (data.code == "resource_exhausted") throw ApiError(503, "resource_exhausted", data.message);
-                throw std::runtime_error(data.message);
-            }
-        }, event.data);
+            }, item.data);
+        }
+        if (!frames.empty()) return frames;
     }
-    return diffs;
+    return {};
 }
 
 } // namespace mfq::transport_detail
