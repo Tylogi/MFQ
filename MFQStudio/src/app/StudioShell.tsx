@@ -1,9 +1,9 @@
 /** Organize navigation, route outlets, and connection state without owning business forms. */
+import { useTranslation } from 'react-i18next';
 import { Component, Suspense, useEffect, type ReactNode } from 'react';
 import { useLocation, Outlet } from 'react-router';
 import * as TooltipPrimitive from '@radix-ui/react-tooltip';
 import { useRuntime } from './RuntimeProvider';
-import { useSettings } from '../features/settings/SettingsProvider';
 import { ToastContainer } from '../shared/ui/Toast';
 import { FailurePage } from './FailurePage';
 import { LoadingPage } from './LoadingPage';
@@ -28,7 +28,7 @@ class PageErrorBoundary extends Component<{ children: ReactNode }, { detail: str
 /** Render fixed navigation and nested routes, retaining direct-page access before readiness and 404 behavior. */
 export function StudioShell() {
   const location = useLocation();
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const { connectionError, refreshError, jobStreamErrors, ready, reloadService } = useRuntime();
   const currentLocation = resolveStudioLocation(location.pathname);
   const view = isStudioPath(location.pathname) ? currentLocation.view : 'not-found';
@@ -49,7 +49,7 @@ export function StudioShell() {
       <div className="app-shell">
         <ToastContainer />
         <a className="skip-link" href="#studio-main">
-          {tr('跳到主要内容', 'Skip to main content')}
+          {t('app:studioShell.skipToMainContent')}
         </a>
         <StudioSidebar />
         <main className={`${view === 'chat' ? 'workspace chat-workspace' : 'workspace'}${hasAlerts ? ' has-runtime-alerts' : ''}`}

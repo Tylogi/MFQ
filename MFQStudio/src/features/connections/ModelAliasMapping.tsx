@@ -1,12 +1,15 @@
+/** Provide ModelAliasMapping interface behavior. */
+import { localized } from '../../i18n/messages';
+import { useTranslation } from 'react-i18next';
 import { useEffect, useRef, useState } from 'react';
 import { Dialog } from '../../shared/ui/Dialog';
 import { runtimeApi } from '../../shared/api/resources/runtime';
-import { useSettings } from '../settings/SettingsProvider';
 import { errorMessage } from '../../app/formatters';
 import { toast } from '../../stores/toastStore';
 
+/** Edit model aliases exposed by the server and persist the validated mapping. */
 export function ModelAliasMapping({ models, selectedModel }: { models: string[]; selectedModel: string }) {
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const [aliases, setAliases] = useState<Record<string, string>>({});
   const [ready, setReady] = useState(false);
@@ -25,22 +28,22 @@ export function ModelAliasMapping({ models, selectedModel }: { models: string[];
       const result = await runtimeApi.configureModelAliases(aliases);
       setAliases(result.aliases);
       setOpen(false);
-      toast.success(tr('别名映射已保存', 'Alias mapping saved'));
+      toast.success(localized('connections:modelAliasMapping.aliasMappingSaved'));
     } catch (cause) { toast.error(errorMessage(cause)); }
     finally { setSaving(false); }
   }
   const names = [...new Set([...models, ...Object.keys(aliases)])];
   return <>
-    <strong title={selectedModel}>{aliases[selectedModel] || selectedModel || tr('尚未加载', 'Not loaded')}</strong>
-    <button ref={trigger} disabled={!ready} onClick={() => setOpen(true)} type="button">{tr('别名映射', 'Alias mapping')}</button>
-    <Dialog open={open} onOpenChange={setOpen} title={tr('别名映射', 'Alias mapping')} closeLabel={tr('关闭', 'Close')}
-      description={tr('为 OpenAI 兼容端点设置模型 ID，留空使用原模型名。', 'Set model IDs for OpenAI-compatible endpoints. Leave blank to use the original name.')}
+    <strong title={selectedModel}>{aliases[selectedModel] || selectedModel || t('connections:modelAliasMapping.notLoaded')}</strong>
+    <button ref={trigger} disabled={!ready} onClick={() => setOpen(true)} type="button">{t('connections:modelAliasMapping.aliasMapping')}</button>
+    <Dialog open={open} onOpenChange={setOpen} title={t('connections:modelAliasMapping.aliasMapping')} closeLabel={t('common:close')}
+      description={t('connections:modelAliasMapping.setModelIdsForOpenaiCompatibleEndpointsLeaveBlankToUseThe')}
       className="model-alias-dialog" returnFocusRef={trigger}>
       <div className="model-alias-list">{names.map((name) => <label key={name}>
-        <span title={name}>{name}</span><input aria-label={`${name} ${tr('别名', 'alias')}`} placeholder={name}
+        <span title={name}>{name}</span><input aria-label={`${name} ${t('connections:modelAliasMapping.alias')}`} placeholder={name}
           disabled={saving} maxLength={255} value={aliases[name] || ''} onChange={(event) => setAliases((current) => ({ ...current, [name]: event.target.value }))} />
       </label>)}</div>
-      <footer><button disabled={saving || !names.length} onClick={() => void save()} type="button">{saving ? tr('保存中…', 'Saving…') : tr('保存', 'Save')}</button></footer>
+      <footer><button disabled={saving || !names.length} onClick={() => void save()} type="button">{saving ? t('connections:modelAliasMapping.saving') : t('common:save')}</button></footer>
     </Dialog>
   </>;
 }

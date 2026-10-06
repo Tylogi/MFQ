@@ -1,0 +1,44 @@
+{
+  "imatrixPanel": {
+    "calibrateSeparatelyImportOneOrCollectItBeforeQuantization": "单独校准、导入，或在量化任务中先校准再使用",
+    "newCalibration": "新建校准",
+    "importFile": "导入文件",
+    "importing": "正在导入",
+    "use": "用于量化"
+  },
+  "jobBuilder": {
+    "newJob": "新任务",
+    "jobType": "任务类型",
+    "none": "不使用",
+    "run": "运行"
+  },
+  "jobDetail": {
+    "progress": "进度",
+    "updated": "更新时间",
+    "cancelJob": "取消任务",
+    "removeFromHistory": "移出任务历史",
+    "deleteLocalArtifact": "删除本地产物",
+    "eventsAndLogs": "事件与日志"
+  },
+  "jobHistory": {
+    "jobHistory": "任务历史",
+    "completed": "已完成",
+    "clearCompleted": "清理已完成"
+  },
+  "lineagePanel": {
+    "artifactLineage": "产物谱系",
+    "sourcesProducingJobsResolvedParametersAndValidations": "源产物、生成任务、默认后参数和验证记录",
+    "sources": "源",
+    "noArtifactLineageYetRunAQuantizationOrImportJobToPopulate": "暂无产物谱系记录。运行量化或导入任务后会显示在这里。"
+  },
+  "quantizationPage": {
+    "quantizationWorkspace": "量化工作台"
+  },
+  "useJobRecordActions": {
+    "deleteThisLocalArtifact": "删除这个本地产物？"
+  },
+  "useQuantizationWorkspace": {
+    "collapsePanel": "折叠面板",
+    "expandPanel": "展开面板"
+  }
+}

@@ -1,5 +1,5 @@
 /** Render model availability and keep unload progress visible until the operation completes. */
-import { useSettings } from '../settings/SettingsProvider';
+import { useTranslation } from 'react-i18next';
 import { Icon, SectionLabel, TMPanel, EmptyPanel } from '../../app/display';
 import { formatNumber } from '../../app/formatters';
 import type { useModelCatalog } from './useModelCatalog';
@@ -8,15 +8,14 @@ import { ModelLoadProgress } from './ModelLoadProgress';
 
 /** Display model actions with instance-specific unload feedback and duplicate-action protection. */
 export function LoadedModels({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const { busy, artifacts, availableModelNames, modelFilter, filteredInstances,
     unloadInstance, unloadingInstanceIds, chooseModelDirectory } = catalog;
   return (
     <>
       <SectionLabel
-        title={tr('已加载模型', 'Loaded models')}
-        subtitle={tr(`${availableModelNames.length} 个可用于推理`,
-          `${availableModelNames.length} available for inference`)}
+        title={t('models:loadedModels.loadedModels')}
+        subtitle={t('models:loadedModels.availableForInference', { count: availableModelNames.length })}
       />
       {filteredInstances.length > 0 ? (
         <TMPanel className="model-catalog-panel loaded-model-panel">
@@ -25,14 +24,14 @@ export function LoadedModels({ catalog }: { catalog: ReturnType<typeof useModelC
               const unloading = instance.state === 'unloading' || unloadingInstanceIds.has(instance.id);
               const ready = !unloading && (instance.state === 'ready' || instance.state === 'busy');
               const stateLabel = unloading
-                ? tr('正在卸载', 'Unloading')
+                ? t('models:loadedModels.unloading')
                 : instance.state === 'loading'
-                  ? tr('加载中', 'Loading')
+                  ? t('models:loadedModels.loading')
                   : instance.state === 'failed'
-                    ? tr('失败', 'Failed')
+                    ? t('models:loadedModels.failed')
                     : instance.state === 'busy'
-                      ? tr('使用中', 'Busy')
-                      : tr('就绪', 'Ready');
+                      ? t('models:loadedModels.busy')
+                      : t('models:loadedModels.ready');
               return (
                 <div className="model-row" key={instance.id}>
                   <span className={instance.state === 'failed'
@@ -42,7 +41,7 @@ export function LoadedModels({ catalog }: { catalog: ReturnType<typeof useModelC
                     <small>
                       {stateLabel} · {formatNumber(instance.context_size)} ctx
                       {instance.pinned
-                        ? ` · ${tr('固定', 'Pinned')}`
+                        ? ` · ${t('models:loadedModels.pinned')}`
                         : instance.idle_ttl_seconds != null
                           ? ` · TTL ${instance.idle_ttl_seconds}s` : ''}
                     </small>
@@ -55,7 +54,7 @@ export function LoadedModels({ catalog }: { catalog: ReturnType<typeof useModelC
                       onClick={() => void unloadInstance(instance.id)}
                       type="button"
                     >
-                      {unloading ? tr('正在卸载…', 'Unloading…') : tr('卸载', 'Unload')}
+                      {unloading ? t('models:loadedModels.unloading2') : t('models:loadedModels.unload')}
                     </button>
                   </div>
                 </div>
@@ -66,14 +65,12 @@ export function LoadedModels({ catalog }: { catalog: ReturnType<typeof useModelC
       ) : (
         <EmptyPanel
           icon="memory"
-          title={tr(modelFilter ? '没有匹配的已加载模型' : '当前没有已加载模型',
-            modelFilter ? 'No loaded model matches' : 'No models loaded')}
-          message={tr('从本地检查点加载一个模型后即可开始对话。',
-            'Load a local checkpoint to start chatting.')}
+          title={(modelFilter ? t('models:loadedModels.noLoadedModelMatches') : t('models:loadedModels.noModelsLoaded'))}
+          message={t('models:loadedModels.loadALocalCheckpointToStartChatting')}
           action={
             <button className="primary screen-header-action" disabled={busy}
               onClick={() => void chooseModelDirectory()} type="button">
-              <Icon name="folder" size={14} />{tr('添加模型', 'Add model')}
+              <Icon name="folder" size={14} />{t('models:loadedModels.addModel')}
             </button>
           }
         />

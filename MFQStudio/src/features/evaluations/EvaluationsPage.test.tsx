@@ -1,4 +1,5 @@
 /** Verify evaluation results refresh after a relevant background task finishes. */
+import { i18n } from '../../i18n';
 import { act, render, screen, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { beforeEach, expect, it, vi } from 'vitest';
@@ -11,7 +12,7 @@ vi.mock('../../shared/api/resources/evaluations', () => ({
   evaluationsApi: { datasets: vi.fn(), evaluations: vi.fn() },
 }));
 vi.mock('../settings/SettingsProvider', () => ({
-  useSettings: () => ({ tr: (_zh: string, en: string) => en }),
+  useSettings: () => ({ t: i18n.getFixedT('en') }),
 }));
 vi.mock('../../app/PanelDeck', () => ({
   PanelDeck: ({ children }: { children: ReactNode }) => <>{children}</>,

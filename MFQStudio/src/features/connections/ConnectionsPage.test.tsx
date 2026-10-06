@@ -1,4 +1,5 @@
 /** Verify browser service settings preserve the actual service origin and report listener failures. */
+import { i18n } from '../../i18n';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
@@ -11,7 +12,7 @@ vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => ({
   runtime: { model: 'model' }, models: [], instances: [], studio: null,
   selectedModel: '', setSelectedModel: vi.fn(), reloadService,
 }) }));
-vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh: string, en: string) => en }) }));
+vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ t: i18n.getFixedT('en') }) }));
 vi.mock('./MemorySettingsPanel', () => ({ MemorySettingsPanel: () => null }));
 vi.mock('./InferenceDefaultsPanel', () => ({ InferenceDefaultsPanel: () => null }));
 vi.mock('./ToolsRoutingPanel', () => ({ ToolsRoutingPanel: () => null }));

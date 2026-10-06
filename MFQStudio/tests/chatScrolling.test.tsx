@@ -1,4 +1,5 @@
 /** Verify scroll following, lifecycle cleanup, and inference display; CSS is checked only for layout boundaries. */
+import { i18n } from '../src/i18n';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { act, fireEvent, render, screen } from '@testing-library/react';
@@ -108,7 +109,7 @@ it('verifies chatScrolling test behavior 4', () => {
   const assistant = { ...user, id: 'assistant', role: 'assistant' } as Message;
   const setEditDraft = vi.fn();
   const actions = { saveEdit: vi.fn(), copyMessage: vi.fn(), regenerate: vi.fn(), executeToolCalls: vi.fn() };
-  const props = { messages: [user, assistant], responses: {}, mcpTools: [], busy: false, tr: (_zh: string, en: string) => en, setEditDraft, actions };
+  const props = { messages: [user, assistant], responses: {}, mcpTools: [], busy: false, t: i18n.getFixedT('en'), setEditDraft, actions };
   const view = render(<TooltipProvider><SavedMessageList {...props} editDraft={null} /></TooltipProvider>);
   expect(screen.getAllByRole('button', { name: 'Edit' })).toHaveLength(1);
   expect(screen.getAllByRole('button', { name: 'Regenerate' })).toHaveLength(1);
@@ -127,19 +128,19 @@ it('verifies chatScrolling test behavior 5', () => {
   const controller = new GenerationController({ onSynchronized: vi.fn(), onSessionState: vi.fn() });
   vi.spyOn(controller, 'getSnapshot').mockReturnValue({ phase: 'streaming', sessionId: 'a', live: { reasoning: 'live reasoning', text: '', tools: [] }, error: null, recoveryNeeded: false });
   const message = { id: 'answer', role: 'assistant', parts: [{ type: 'reasoning', text: 'saved reasoning' }], created_at: '' } as Message;
-  const tr = (_zh: string, en: string) => en;
+  const t = i18n.getFixedT('en');
   const view = render(<TooltipProvider>
-    <SavedMessageList messages={[message]} responses={{}} mcpTools={[]} busy={false} tr={tr} editDraft={null} setEditDraft={vi.fn()} actions={{ saveEdit: vi.fn(), copyMessage: vi.fn(), regenerate: vi.fn(), executeToolCalls: vi.fn() }} />
-    <StreamingMessage controller={controller} sessionId="a" tr={tr} />
+    <SavedMessageList messages={[message]} responses={{}} mcpTools={[]} busy={false} t={t} editDraft={null} setEditDraft={vi.fn()} actions={{ saveEdit: vi.fn(), copyMessage: vi.fn(), regenerate: vi.fn(), executeToolCalls: vi.fn() }} />
+    <StreamingMessage controller={controller} sessionId="a" t={t} />
   </TooltipProvider>);
   expect(screen.getByText('Reasoning').closest('details')).not.toHaveAttribute('open');
   expect(screen.getByText('Thinking').closest('details')).toHaveAttribute('open');
-  view.rerender(<StreamingMessage controller={controller} sessionId="b" tr={tr} />);
+  view.rerender(<StreamingMessage controller={controller} sessionId="b" t={t} />);
   expect(screen.queryByText('Thinking')).not.toBeInTheDocument();
 });
 
 it('verifies chatScrolling test behavior 6', () => {
-  render(<SettingsPage tr={(_zh, en) => en} settingsDraft={{ ...DEFAULT_SETTINGS, inheritModelDefaults: false }} setSettingsDraft={vi.fn()} mtpAvailable={false} presetManager={null} busy={false} hasStudio={false} actions={{ setModelDefaultInheritance: vi.fn(), applyPreset: vi.fn(), exportStudioData: vi.fn(), importStudioData: vi.fn(), openServerPage: vi.fn(), resetSettingsDraft: vi.fn(), saveSettings: vi.fn() }} />);
+  render(<SettingsPage t={i18n.getFixedT('en')} settingsDraft={{ ...DEFAULT_SETTINGS, inheritModelDefaults: false }} setSettingsDraft={vi.fn()} mtpAvailable={false} presetManager={null} busy={false} hasStudio={false} actions={{ setModelDefaultInheritance: vi.fn(), applyPreset: vi.fn(), exportStudioData: vi.fn(), importStudioData: vi.fn(), openServerPage: vi.fn(), resetSettingsDraft: vi.fn(), saveSettings: vi.fn() }} />);
   const limit = screen.getByRole('spinbutton', { name: 'Maximum output tokens' });
   expect(limit).toHaveValue(4096);
   expect(limit).toHaveAttribute('min', '1');

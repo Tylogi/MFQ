@@ -1,0 +1,125 @@
+{
+  "chatProvider": {
+    "maximumOutputTokensMustBeAPositiveInteger": "Maximum output tokens must be a positive integer.",
+    "deleteThisCannotBeUndone": "Delete \"{{title}}\"? This cannot be undone.",
+    "clearThisConversation": "Clear this conversation?"
+  },
+  "chatComposer": {
+    "removeAttachment": "Remove attachment",
+    "message": "Message",
+    "addAttachment": "Add attachment",
+    "addDocumentOrMedia": "Add document or media",
+    "send": "Send",
+    "stopGeneration": "Stop generation",
+    "stoppingGeneration": "Stopping generation",
+    "synchronizingResponse": "Synchronizing response"
+  },
+  "chatInputArea": {
+    "scrollToBottom": "Scroll to bottom",
+    "thisModelNeedsTheVoiceOutputComponent": "This model needs the voice output component",
+    "voiceComponentDownloaded": "Voice component downloaded",
+    "token2wavIsInstalledOnceAndSharedByAllCompatibleModels": "Token2Wav is installed once and shared by all compatible models.",
+    "downloadingAndVerifying": "Downloading and verifying · {{progress}}%",
+    "downloadGb": "Download · {{size}} GB",
+    "enableVoiceOutput": "Enable voice output",
+    "downloading": "Downloading…",
+    "dismissError": "Dismiss error",
+    "loadAModelFirst": "Load a model first",
+    "loadingConversation": "Loading conversation",
+    "messageMfq": "Message MFQ",
+    "modelOutputMayBeInaccurateVerifyImportantInformation": "Model output may be inaccurate. Verify important information."
+  },
+  "chatMessageList": {
+    "startAConversation": "Start a conversation",
+    "connectedToYourConfiguredMfqService": "Connected to your configured MFQ service.",
+    "startChat": "Start chat",
+    "noModelLoaded": "No model loaded",
+    "modelLoading": "Model loading",
+    "chooseALocalCheckpointToUseTheInferencePlayground": "Choose a local checkpoint to use the inference playground.",
+    "chatBecomesAvailableAsSoonAsLoadingCompletes": "Chat becomes available as soon as loading completes.",
+    "chooseModel": "Choose model",
+    "loadingMessages": "Loading messages…"
+  },
+  "chatPageHeader": {
+    "expandConversations": "Expand conversations",
+    "collapseConversations": "Collapse conversations",
+    "chat": "Chat",
+    "noModelLoaded": "No model loaded",
+    "chatModel": "Chat model",
+    "maxTokens": "{{tokens}} max tokens",
+    "temperature": "temperature",
+    "streaming": "streaming",
+    "idle": "Idle",
+    "loading": "Loading",
+    "ready": "Ready",
+    "chatSettings": "Chat settings",
+    "clearConversation": "Clear conversation"
+  },
+  "chatSessionSidebar": {
+    "chats": "Chats",
+    "newChat": "New chat",
+    "noConversationsYet": "No conversations yet",
+    "deleteChat": "Delete chat: {{title}}",
+    "deleteChat2": "Delete chat",
+    "noOlderConversations": "No older conversations",
+    "conversationHistory": "Conversation history",
+    "conversations": "Conversations"
+  },
+  "chatToolbar": {
+    "interactionMode": "Interaction mode",
+    "voiceInput": "Voice input",
+    "processingVoice": "Processing voice",
+    "selectVoiceOrFullDuplexModeFirst": "Select voice or full duplex mode first",
+    "voicePlayback": "Voice playback",
+    "vision": "Vision",
+    "visionInput": "Vision input",
+    "theCurrentModelArtifactHasNoVisionWeights": "The current model artifact has no vision weights",
+    "theCurrentModelArtifactHasNoCompleteMtpHead": "The current model artifact has no complete MTP head",
+    "thinking": "Thinking",
+    "standard": "Standard",
+    "reasoningEffort": "Reasoning effort",
+    "enterToSendShiftEnterForNewline": "Enter to send · Shift+Enter for newline"
+  },
+  "streamingMessage": {
+    "reasoning": "Reasoning",
+    "thinking": "Thinking",
+    "waitingForResponse": "Waiting for response",
+    "synchronizingResponse": "Synchronizing response…",
+    "stoppedPartialResponseRetained": "Stopped; partial response retained",
+    "incompleteResponseReceivedContentRetained": "Incomplete response; received content retained",
+    "synchronizeResponse": "Synchronize response"
+  },
+  "useChatAttachments": {
+    "upToAttachmentsPerMessageFilesWereNotAdded": "Up to {{maxAttachments}} attachments per message; {{omitted}} files were not added.",
+    "unsupportedAttachment": "Unsupported attachment: {{name}}",
+    "oversizedDocument": "Document exceeds {{limit}} MiB: {{name}}"
+  },
+  "savedMessageList": {
+    "reasoning": "Reasoning",
+    "confirmAndRunAllTools": "Confirm and run all tools",
+    "message": "Message",
+    "mediaPreparation": "Media preparation",
+    "multimodalEncoding": "Multimodal encoding",
+    "copy": "Copy",
+    "edit": "Edit",
+    "regenerate": "Regenerate"
+  },
+  "modes": {
+    "text": "Text",
+    "voice": "Voice",
+    "fullDuplex": "Full duplex"
+  },
+  "media": {
+    "unableToLoadAttachment": "Unable to load attachment",
+    "loadingMedia": "Loading media",
+    "loadingAttachment": "Loading attachment…",
+    "attachedImage": "Attached image",
+    "downloading": "Downloading…",
+    "downloadFailed": "Download failed — click to retry"
+  },
+  "markdown": {
+    "copy": "Copy",
+    "copied": "Copied",
+    "copyFailed": "Copy failed"
+  }
+}

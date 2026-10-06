@@ -1,4 +1,5 @@
 /** Verify persistent failures and correct retry actions on ready and directly accessible pages. */
+import { i18n } from '../i18n';
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -8,7 +9,7 @@ import { NotFoundPage } from './NotFoundPage';
 
 vi.mock('./RuntimeProvider', () => ({ useRuntime: vi.fn() }));
 vi.mock('../features/settings/SettingsProvider', () => ({
-  useSettings: () => ({ tr: (_chinese: string, english: string) => english }),
+  useSettings: () => ({ t: i18n.getFixedT('en') }),
 }));
 /** Mount directly accessible routes and mock shared runtime states. */
 function renderShell(overrides: Partial<ReturnType<typeof useRuntime>>, path = '/settings') {

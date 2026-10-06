@@ -150,7 +150,7 @@ describe('Toast', () => {
     expect(screen.getByText('Error')).toBeInTheDocument();
     expect(screen.getByRole('status')).toHaveTextContent('Configuration saved');
 
-    const closeButtons = screen.getAllByRole('button', { name: '关闭通知' });
+    const closeButtons = screen.getAllByRole('button', { name: 'Dismiss notification' });
     expect(closeButtons).toHaveLength(2);
 
     await user.click(closeButtons[0]);

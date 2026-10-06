@@ -1,7 +1,7 @@
 /**
 * Tests for ChatProvider domain-state caching and prevention of unnecessary Context rerenders.
  */
-
+import { i18n } from '../../i18n';
 import { act, render, renderHook, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { Profiler, type ProfilerOnRenderCallback, type ReactNode } from 'react';
@@ -52,13 +52,13 @@ const mockSettings = {
   maxTokens: 2048,
 };
 const mockUpdateSettings = vi.fn();
-const mockTr = (_zh: string, en: string) => en;
+const mockTr = i18n.getFixedT('en');
 
 vi.mock('../settings/SettingsProvider', () => ({
   useSettings: () => ({
     settings: mockSettings,
     updateSettings: mockUpdateSettings,
-    tr: mockTr,
+    t: mockTr,
   }),
 }));
 
@@ -112,7 +112,7 @@ describe('describes ChatProvider test behavior 1', () => {
           responses={{}}
           mcpTools={[]}
           busy={busy}
-          tr={mockTr}
+          t={mockTr}
           editDraft={null}
           setEditDraft={vi.fn()}
           actions={{ saveEdit: vi.fn(), copyMessage: vi.fn(), regenerate: vi.fn(), executeToolCalls: vi.fn() }}
@@ -132,7 +132,7 @@ describe('describes ChatProvider test behavior 1', () => {
             phase={generationPhase}
             placeholder=""
             attachmentAccept=""
-            tr={mockTr}
+            t={mockTr}
             onSend={vi.fn()}
             onStop={vi.fn()}
             onError={vi.fn()}

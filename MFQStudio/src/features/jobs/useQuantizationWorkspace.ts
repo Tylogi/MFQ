@@ -1,7 +1,7 @@
 /** Combine the job form, artifacts, history actions, and log subscription for the quantization page. */
+import { useTranslation } from 'react-i18next';
 import { useEffect, useState } from 'react';
 import { useLocation } from 'react-router';
-import { useSettings } from '../settings/SettingsProvider';
 import { useJobStore } from '../../stores/jobStore';
 import { isTerminalJob } from './jobSchema';
 import { useJobForm } from './useJobForm';
@@ -10,7 +10,7 @@ import { useJobArtifacts } from './useJobArtifacts';
 import { useJobRecordActions } from './useJobRecordActions';
 /** Assemble quantization resources on demand; shared runtime state maintains background job lifecycles. */
 export function useQuantizationWorkspace() {
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const jobs = useJobStore((state) => state.jobs);
   const location = useLocation();
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
@@ -30,12 +30,12 @@ export function useQuantizationWorkspace() {
   }, [location.state]);
 
   return {
-    tr,
+    t,
     busy: form.busy,
     error: null,
     panelLabels: {
-      collapse: tr('折叠面板', 'Collapse panel'),
-      expand: tr('展开面板', 'Expand panel'),
+      collapse: t('jobs:useQuantizationWorkspace.collapsePanel'),
+      expand: t('jobs:useQuantizationWorkspace.expandPanel'),
     },
     lineage: artifacts.lineage,
     jobKinds: form.jobKinds,

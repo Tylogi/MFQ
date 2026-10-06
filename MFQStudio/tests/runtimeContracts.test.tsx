@@ -1,4 +1,5 @@
 /** Verify real interactions for instance inference capabilities, attachment types, and the chat toolbar. */
+import { i18n } from '../src/i18n';
 import { act, render, renderHook, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -69,7 +70,7 @@ beforeEach(() => {
   vi.mocked(useRuntime).mockImplementation(() => runtime);
   updateSettings.mockImplementation((patch) => { settings = { ...settings, ...patch }; });
   vi.mocked(useSettings).mockImplementation(() => ({
-    settings, updateSettings, english: true, tr: (_zh: string, en: string) => en,
+    settings, updateSettings, english: true, t: i18n.getFixedT('en'),
     replaceSettings: vi.fn(), contextSize: 32768, setContextSize: vi.fn(),
   }));
   vi.mocked(useConversationSelector).mockImplementation((selector) => selector({

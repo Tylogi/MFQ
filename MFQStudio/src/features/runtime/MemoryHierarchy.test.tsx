@@ -1,10 +1,12 @@
+/** Verify MemoryHierarchy behavior and integration contracts. */
+import { i18n } from '../../i18n';
 import { render, screen } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
 import { MemoryHierarchy } from './MemoryHierarchy';
 import type { RuntimeInstance } from '../../shared/api/types';
 
 vi.mock('../settings/SettingsProvider', () => ({
-  useSettings: () => ({ tr: (_zh: string, en: string) => en }),
+  useSettings: () => ({ t: i18n.getFixedT('en') }),
 }));
 
 function model(id: string, bytes: number): RuntimeInstance {

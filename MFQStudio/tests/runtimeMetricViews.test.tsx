@@ -1,4 +1,5 @@
 /** Verify that the overview and message history display the same native prefill metrics. */
+import { i18n } from '../src/i18n';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { expect, it, vi } from 'vitest';
@@ -27,7 +28,7 @@ vi.mock('../src/app/RuntimeProvider', () => ({
   }),
 }));
 vi.mock('../src/features/settings/SettingsProvider', () => ({
-  useSettings: () => ({ tr: (_chinese: string, english: string) => english }),
+  useSettings: () => ({ t: i18n.getFixedT('en') }),
 }));
 
 it('verifies runtimeMetricViews test behavior 1', () => {
@@ -59,7 +60,7 @@ it('verifies runtimeMetricViews test behavior 2', () => {
   };
   render(<TooltipProvider><SavedMessageList
     messages={[message]} responses={{ answer: response }} mcpTools={[]} busy={false}
-    tr={(_chinese, english) => english} editDraft={null} setEditDraft={vi.fn()}
+    t={i18n.getFixedT('en')} editDraft={null} setEditDraft={vi.fn()}
     actions={{ saveEdit: vi.fn(), copyMessage: vi.fn(), regenerate: vi.fn(), executeToolCalls: vi.fn() }}
   /></TooltipProvider>);
   expect(screen.getByText('999 pp')).toBeInTheDocument();

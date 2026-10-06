@@ -1,4 +1,5 @@
 /** Verify independent SSE subscriptions and cursor-based log and request history. */
+import { i18n } from '../../i18n';
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { runtimeApi } from '../../shared/api/resources/runtime';
@@ -13,7 +14,7 @@ const runtime = vi.hoisted(() => ({
 }));
 vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => runtime }));
 vi.mock('../settings/SettingsProvider', () => ({
-  useSettings: () => ({ tr: (_zh: string, en: string) => en }),
+  useSettings: () => ({ t: i18n.getFixedT('en') }),
 }));
 
 /** Build log rows with stable sequence identities for pagination tests. */

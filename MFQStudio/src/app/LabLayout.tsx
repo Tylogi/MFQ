@@ -1,26 +1,27 @@
 /** Share page headers across model tools while centralizing navigation in the sidebar. */
+import { useTranslation } from 'react-i18next';
 import { Outlet, useLocation } from 'react-router';
-import { useSettings } from '../features/settings/SettingsProvider';
 import { ScreenHeader } from './display';
 
-const tools = [
-  { path: '/model-hub', zh: '模型下载', en: 'Model downloads',
-    detail: ['浏览模型，选择适合设备的精度版本。', 'Find models and precision tiers for your device.'] },
-  { path: '/evaluations', zh: '评测与数据集', en: 'Evaluations',
-    detail: ['管理评测任务与校准数据集。', 'Manage evaluations and calibration datasets.'] },
-  { path: '/quantization', zh: '量化工作台', en: 'Quantization',
-    detail: ['从校准到导出，管理模型量化任务。', 'Manage model quantization, from calibration to export.'] },
-];
+
 
 /** Provide a consistent navigable container for model sources, evaluations, and quantization pages. */
 export function LabLayout() {
-  const { tr } = useSettings();
+  const { t } = useTranslation();
+const tools = [
+  { path: '/model-hub', title: t('app:labLayout.modelDownloads'),
+    detail: t('app:labLayout.findModelsAndPrecisionTiersForYourDevice') },
+  { path: '/evaluations', title: t('app:labLayout.evaluations'),
+    detail: t('app:labLayout.manageEvaluationsAndCalibrationDatasets') },
+  { path: '/quantization', title: t('app:labLayout.quantization'),
+    detail: t('app:labLayout.manageModelQuantizationFromCalibrationToExport') },
+];
   const { pathname } = useLocation();
   const current = tools.find((item) => item.path === pathname) ?? tools[0];
   return (
     <section className="dashboard-view lab-view">
-      <ScreenHeader title={tr(current.zh, current.en)}
-        subtitle={tr(current.detail[0], current.detail[1])} />
+      <ScreenHeader title={current.title}
+        subtitle={current.detail} />
       <Outlet />
     </section>
   );

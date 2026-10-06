@@ -1,4 +1,6 @@
 /** Manage artifact refresh, load policies, and directory registration lifecycle for the model catalog. */
+import { localized } from '../../i18n/messages';
+import { useTranslation } from 'react-i18next';
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { modelsApi } from '../../shared/api/resources/models';
@@ -25,7 +27,8 @@ export function useModelCatalog() {
     ready,
   } = useRuntime();
   const jobs = useJobStore((state) => state.jobs);
-  const { tr, contextSize } = useSettings();
+  const { contextSize } = useSettings();
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const [artifacts, setArtifacts] = useState<ModelArtifact[]>([]);
   const [busy, setBusy] = useState(false);
@@ -90,10 +93,10 @@ export function useModelCatalog() {
           return next;
         });
         void refreshRuntime(false);
-        if (job.status === 'succeeded') toast.success(tr('模型已卸载', 'Model unloaded'));
+        if (job.status === 'succeeded') toast.success(localized('models:useModelCatalog.modelUnloaded'));
       }
       if (job.kind === 'model.load' && job.status === 'succeeded') {
-        toast.success(tr('模型已加载', 'Model loaded'));
+        toast.success(localized('models:useModelCatalog.modelLoaded'));
       }
       if (job.status === 'failed') {
         if (job.error?.message) {
@@ -102,14 +105,14 @@ export function useModelCatalog() {
           // State events may arrive before the full job error is fetched.
           void jobsApi.getJob(job.id).then((finished) => {
             if (finished.error) toast.error(`${finished.error.code}: ${finished.error.message}`);
-            else toast.error(tr('模型操作失败，请查看任务记录', 'Model operation failed; check the task record'));
-          }).catch(() => toast.error(tr('模型操作失败，暂时无法获取详情', 'Model operation failed; details are unavailable')));
+            else toast.error(localized('models:useModelCatalog.modelOperationFailedCheckTheTaskRecord'));
+          }).catch(() => toast.error(localized('models:useModelCatalog.modelOperationFailedDetailsAreUnavailable')));
         }
       } else if (job.kind === 'model.unload' && job.status !== 'succeeded') {
-        toast.error(tr('模型卸载已取消或中断', 'Model unload was cancelled or interrupted'));
+        toast.error(localized('models:useModelCatalog.modelUnloadWasCancelledOrInterrupted'));
       }
     }
-  }, [jobs, refreshRuntime, tr]);
+  }, [jobs, refreshRuntime, t]);
   const filteredInstances = useMemo(
     () =>
       instances.filter((item) =>
@@ -152,10 +155,7 @@ export function useModelCatalog() {
     const registered = nextArtifacts.filter((item) => names.includes(item.name));
     if (!registered.length) {
       throw new Error(
-        tr(
-          '所选目录中的模型没有出现在模型目录中。',
-          'Models from the selected folder were not registered in the catalog.',
-        ),
+        t('models:useModelCatalog.modelsFromTheSelectedFolderWereNotRegisteredInTheCatalog'),
       );
     }
     if (registered.length === 1) {
@@ -163,10 +163,7 @@ export function useModelCatalog() {
       if (!artifact.loadable) {
         throw new Error(
           artifact.error ||
-            tr(
-              '所选模型不完整或无法加载。',
-              'The selected model is incomplete or cannot be loaded.',
-            ),
+            t('models:useModelCatalog.theSelectedModelIsIncompleteOrCannotBeLoaded'),
         );
       }
       const loaded =

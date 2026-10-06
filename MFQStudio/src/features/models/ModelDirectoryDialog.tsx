@@ -1,11 +1,11 @@
 /** Display the model-directory browser and registration dialog, reusing the directory controller’s operation state. */
+import { useTranslation } from 'react-i18next';
 import { Dialog } from '../../shared/ui/Dialog';
 import { Icon } from '../../app/display';
-import { useSettings } from '../settings/SettingsProvider';
 import type { useModelCatalog } from './useModelCatalog';
 /** Render the server folder picker and restore focus to its trigger when closed. */
 export function ModelDirectoryDialog({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const {
     modelBrowser,
     modelBrowserOpen,
@@ -23,12 +23,9 @@ export function ModelDirectoryDialog({ catalog }: { catalog: ReturnType<typeof u
     <Dialog
       open={modelBrowserOpen}
       onOpenChange={setModelBrowserOpen}
-      title={tr('选择模型文件夹', 'Choose model folder')}
-      description={tr(
-        '浏览 MFQ Server 所在设备上的文件夹。',
-        'Browse folders on the MFQ Server host.',
-      )}
-      closeLabel={tr('关闭', 'Close')}
+      title={t('models:modelDirectoryDialog.chooseModelFolder')}
+      description={t('models:modelDirectoryDialog.browseFoldersOnTheMfqServerHost')}
+      closeLabel={t('common:close')}
       className="model-browser-dialog"
       returnFocusRef={modelBrowserTriggerRef}
     >
@@ -38,17 +35,17 @@ export function ModelDirectoryDialog({ catalog }: { catalog: ReturnType<typeof u
           onClick={() => void openModelDirectory(modelBrowser.parent_id)}
           type="button"
         >
-          {tr('上一级', 'Up')}
+          {t('models:modelDirectoryDialog.up')}
         </button>
         <input
-          aria-label={tr('当前目录', 'Current directory')}
+          aria-label={t('models:modelDirectoryDialog.currentDirectory')}
           onChange={(event) => setModelDirectoryPath(event.target.value)}
-          placeholder={tr('输入服务器上的完整目录', 'Enter a full directory on the server')}
+          placeholder={t('models:modelDirectoryDialog.enterAFullDirectoryOnTheServer')}
           spellCheck={false}
           value={modelDirectoryPath}
         />
         <button disabled={busy || !modelDirectoryPath.trim()} type="submit">
-          {tr('前往', 'Go')}
+          {t('models:modelDirectoryDialog.go')}
         </button>
         {modelBrowser.current_id && <span>{modelBrowser.model_file_count} MFQ</span>}
       </form>
@@ -66,12 +63,12 @@ export function ModelDirectoryDialog({ catalog }: { catalog: ReturnType<typeof u
           </button>
         ))}
         {modelBrowser.data.length === 0 && (
-          <p>{tr('这个文件夹中没有子文件夹。', 'This folder has no subfolders.')}</p>
+          <p>{t('models:modelDirectoryDialog.thisFolderHasNoSubfolders')}</p>
         )}
       </div>
       <footer>
         <button onClick={() => setModelBrowserOpen(false)} type="button">
-          {tr('取消', 'Cancel')}
+          {t('common:cancel')}
         </button>
         <button
           className="primary"
@@ -79,7 +76,7 @@ export function ModelDirectoryDialog({ catalog }: { catalog: ReturnType<typeof u
           onClick={() => void registerCurrentModelDirectory()}
           type="button"
         >
-          {tr('使用此文件夹', 'Use this folder')}
+          {t('models:modelDirectoryDialog.useThisFolder')}
         </button>
       </footer>
     </Dialog>

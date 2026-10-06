@@ -1,4 +1,5 @@
 /** Verify input-draft isolation, parent render boundaries, and input preservation when the business action does not accept it. */
+import { i18n } from '../../../i18n';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, expect, it, vi } from 'vitest';
@@ -19,7 +20,7 @@ const props = {
   placeholder: '',
   attachmentAccept: '',
   toolbar: null,
-  tr: (_zh: string, en: string) => en,
+  t: i18n.getFixedT('en'),
   onSend: vi.fn(async (_text: string, _accepted: () => void) => undefined),
   onStop: vi.fn(async () => undefined),
   onError: vi.fn(),

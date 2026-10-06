@@ -1,4 +1,5 @@
 /** Verify that the sidebar delete action forwards only the target session and does not switch sessions. */
+import { i18n } from '../../../i18n';
 import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { expect, it, vi } from 'vitest';
@@ -6,7 +7,7 @@ import type { ChatPageState } from '../hooks/useChatPageState';
 import { ChatSessionSidebar } from './ChatSessionSidebar';
 
 vi.mock('../../settings/SettingsProvider', () => ({
-  useSettings: () => ({ tr: (_zh: string, en: string) => en }),
+  useSettings: () => ({ t: i18n.getFixedT('en') }),
 }));
 vi.mock('../state/conversationStore', () => ({
   useConversationSelector: (selector: (state: unknown) => unknown) => selector({

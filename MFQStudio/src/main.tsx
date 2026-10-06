@@ -1,7 +1,7 @@
 /**
  * Shared React entry point for MFQ Studio Web and Tauri, responsible for routing and top-level error isolation.
  */
-
+import { i18n } from './i18n';
 import { Component, StrictMode, type ErrorInfo, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createBrowserRouter, createHashRouter, RouterProvider } from 'react-router';
@@ -28,22 +28,20 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, AppErrorBounda
 
   render() {
     if (!this.state.error) return this.props.children;
-    const chinese = navigator.language.toLowerCase().startsWith("zh");
+    const t = i18n.t.bind(i18n);
     return (
       <main className="fatal-workspace">
         <FailureView
           code="APP / 03"
-          description={chinese
-            ? '应用界面遇到了意外问题。服务可能仍在运行，可以重新载入界面后继续。'
-            : 'The interface encountered an unexpected problem. The service may still be running; reload to continue.'}
+          description={t('app:main.theInterfaceEncounteredAnUnexpectedProblemTheServiceMayStillBeRunning')}
           detail={this.state.error.message || this.state.error.name}
-          detailLabel={chinese ? '查看错误详情' : 'View error details'}
+          detailLabel={t('app:main.viewErrorDetails')}
           kind="render"
-          leaveLabel={chinese ? '返回概览' : 'Back to overview'}
+          leaveLabel={t('app:main.backToOverview')}
           onLeave={() => window.location.assign(isStudio() ? '#/' : '/')}
           onRetry={() => window.location.reload()}
-          retryLabel={chinese ? '重新载入' : 'Reload'}
-          title={chinese ? '界面暂时无法显示' : 'Interface unavailable'}
+          retryLabel={t('app:main.reload')}
+          title={t('app:main.interfaceUnavailable')}
         />
       </main>
     );

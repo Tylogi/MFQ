@@ -1,4 +1,5 @@
 /** Migrate the original Python session checks to behavior tests using the real Provider, attachment conversion, and generation controller. */
+import { i18n } from '../src/i18n';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { MemoryRouter } from 'react-router';
@@ -19,7 +20,7 @@ const mocks = vi.hoisted(() => ({
 }));
 vi.mock('../src/app/RuntimeProvider', () => ({ useRuntime: () => mocks.runtime }));
 vi.mock('../src/features/settings/SettingsProvider', () => ({
-  useSettings: () => ({ settings: { ...DEFAULT_SETTINGS, inheritModelDefaults: false, systemPrompt: mocks.prompt, excludeReasoning: mocks.excludeReasoning }, tr: (_zh: string, en: string) => en }),
+  useSettings: () => ({ settings: { ...DEFAULT_SETTINGS, inheritModelDefaults: false, systemPrompt: mocks.prompt, excludeReasoning: mocks.excludeReasoning }, t: i18n.getFixedT('en') }),
 }));
 vi.mock('../src/features/chat/hooks/useChatGeneration', () => {
   const controller = { start: mocks.start, reset: mocks.reset, getPhase: () => 'idle', getSnapshot: () => ({ recoveryNeeded: false }) };

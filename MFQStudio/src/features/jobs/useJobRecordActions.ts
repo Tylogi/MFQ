@@ -1,11 +1,11 @@
 /** Cancel and retry quantization jobs, clear records, and delete artifacts. */
+import { useTranslation } from 'react-i18next';
 import { useState, type Dispatch, type SetStateAction } from 'react';
 import type { JobResource, RuntimeLogEntry } from '../../shared/api/types';
 import { jobsApi } from '../../shared/api/resources/jobs';
 import { modelsApi } from '../../shared/api/resources/models';
 import { studioConfirm } from '../../studio';
 import { errorMessage } from '../../app/formatters';
-import { useSettings } from '../settings/SettingsProvider';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useJobStore } from '../../stores/jobStore';
 import { toast } from '../../stores/toastStore';
@@ -19,7 +19,7 @@ export function useJobRecordActions(
   setBusy: Dispatch<SetStateAction<boolean>>,
   setJobLogs: Dispatch<SetStateAction<RuntimeLogEntry[]>>,
 ) {
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const { refreshRuntime } = useRuntime();
   const addJob = useJobStore((state) => state.addJob);
   const [jobCleanupBusy, setJobCleanupBusy] = useState(false);
@@ -84,7 +84,7 @@ export function useJobRecordActions(
   async function removeSelectedArtifact() {
     const uri = String(selectedJob?.result?.artifact || '');
     if (!uri.startsWith('workspace://') || busy) return;
-    if (!(await studioConfirm(tr('删除这个本地产物？', 'Delete this local artifact?')))) return;
+    if (!(await studioConfirm(t('jobs:useJobRecordActions.deleteThisLocalArtifact')))) return;
     setBusy(true);
     try {
       await modelsApi.removeWorkspaceArtifact(uri);

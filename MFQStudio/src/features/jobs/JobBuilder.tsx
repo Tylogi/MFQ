@@ -5,7 +5,7 @@ import { schemaType } from './jobSchema';
 /** Read the data and business actions required by this panel from page state. */
 export function JobBuilder() {
   const {
-    tr,
+    t,
     busy,
     selectedJobKind,
     setSelectedJobKind,
@@ -21,11 +21,11 @@ export function JobBuilder() {
       <form className="dashboard-panel job-builder" key="builder" onSubmit={submitJob}>
         <div className="panel-heading">
           <div>
-            <h2>{tr('新任务', 'New job')}</h2>
+            <h2>{t('jobs:jobBuilder.newJob')}</h2>
           </div>
         </div>
         <label>
-          <span>{tr('任务类型', 'Job type')}</span>
+          <span>{t('jobs:jobBuilder.jobType')}</span>
           <select
             onChange={(event) => setSelectedJobKind(event.target.value)}
             value={selectedJobKind}
@@ -66,7 +66,7 @@ export function JobBuilder() {
                   onChange={(event) => updateJobPayload(name, property, event.target.value)}
                   value={String(value ?? '')}
                 >
-                  <option value="">{tr('不使用', 'None')}</option>
+                  <option value="">{t('jobs:jobBuilder.none')}</option>
                   {imatrixArtifacts.map((item) => (
                     <option key={item.id} value={item.artifact_uri.replace(/^workspace:\/\//, '')}>
                       {item.artifact_name}
@@ -109,7 +109,7 @@ export function JobBuilder() {
         <div className="job-submit">
           <button className="job-run" disabled={busy || !selectedJobKind} type="submit">
             <Icon name="play" size={12} />
-            {tr('运行', 'Run')}
+            {t('jobs:jobBuilder.run')}
           </button>
         </div>
       </form>

@@ -2,6 +2,8 @@
  * Individual notification item supporting accessible semantics, status icons, countdown, and pause-on-hover.
  */
 import { useEffect, useRef } from 'react';
+import { useTranslation } from 'react-i18next';
+import { displayMessage } from '../../i18n/messages';
 import {
   CheckCircleIcon,
   InfoIcon,
@@ -24,6 +26,7 @@ export interface ToastItemProps {
  * @param props Component properties
  */
 export function ToastItem({ toast, onDismiss }: ToastItemProps) {
+  const { t } = useTranslation();
   const { id, revision, type, message, title, duration } = toast;
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const remainingTimeRef = useRef<number>(duration ?? 0);
@@ -86,14 +89,14 @@ export function ToastItem({ toast, onDismiss }: ToastItemProps) {
         {type === 'info' && <InfoIcon size={18} weight="fill" />}
       </div>
       <div className="studio-toast-content">
-        {title && <div className="studio-toast-title">{title}</div>}
-        <div className="studio-toast-message">{message}</div>
+        {title && <div className="studio-toast-title">{displayMessage(title, t)}</div>}
+        <div className="studio-toast-message">{displayMessage(message, t)}</div>
       </div>
       <button
         type="button"
         className="studio-toast-close"
         onClick={() => onDismiss(id, revision)}
-        aria-label="关闭通知"
+        aria-label={t('common:dismissNotification')}
       >
         <XIcon size={14} aria-hidden="true" />
       </button>

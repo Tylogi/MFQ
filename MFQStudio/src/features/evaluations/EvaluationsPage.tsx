@@ -1,10 +1,12 @@
 /** Display registered datasets and evaluation results, refreshing when evaluation jobs finish. */
+import { i18n } from '../../i18n';
+import { localized } from '../../i18n/messages';
+import { useTranslation } from 'react-i18next';
 import { FormEvent, useEffect, useState } from 'react';
 import { evaluationsApi } from '../../shared/api/resources/evaluations';
 import { Icon } from '../../app/display';
 import { PanelDeck } from '../../app/PanelDeck';
 import { errorMessage, formatNumber } from '../../app/formatters';
-import { useSettings } from '../settings/SettingsProvider';
 import type { DatasetResource, EvaluationResult, EvaluationComparison } from '../../shared/api/types';
 import { toast } from '../../stores/toastStore';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
@@ -12,11 +14,11 @@ import { useJobStore } from '../../stores/jobStore';
 
 /** Render evaluation results and reload them when a relevant background job reaches a terminal state. */
 export function EvaluationsPage() {
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const [busy, setBusy] = useState(false);
   const panelLabels = {
-    collapse: tr('折叠面板', 'Collapse panel'),
-    expand: tr('展开面板', 'Expand panel'),
+    collapse: t('evaluations:evaluationsPage.collapsePanel'),
+    expand: t('evaluations:evaluationsPage.expandPanel'),
   };
   const [datasets, setDatasets] = useState<DatasetResource[]>([]);
   const [evaluations, setEvaluations] = useState<EvaluationResult[]>([]);
@@ -67,7 +69,7 @@ export function EvaluationsPage() {
       });
       setDatasetDraft({ name: '', artifact_uri: '', kind: 'custom' });
       setDatasets(await evaluationsApi.datasets());
-      toast.success(tr('数据集已注册', 'Dataset registered'));
+      toast.success(localized('evaluations:evaluationsPage.datasetRegistered'));
     } catch (cause) {
       toast.error(errorMessage(cause));
     } finally {
@@ -92,12 +94,9 @@ export function EvaluationsPage() {
         <section className="dashboard-panel evaluation-panel" key="results">
           <div className="panel-heading">
             <div>
-              <h2>{tr('评测结果', 'Evaluation results')}</h2>
+              <h2>{t('evaluations:evaluationsPage.evaluationResults')}</h2>
               <p>
-                {tr(
-                  '只允许数据集与运行参数一致的结果对比',
-                  'Comparison requires matching datasets and execution parameters',
-                )}
+                {t('evaluations:evaluationsPage.comparisonRequiresMatchingDatasetsAndExecutionParameters')}
               </p>
             </div>
             <b>{evaluations.length}</b>
@@ -105,10 +104,7 @@ export function EvaluationsPage() {
           <div className="evaluation-list">
             {evaluations.length === 0 ? (
               <div className="inline-empty">
-                {tr(
-                  '还没有评测结果。先注册数据集并运行评测任务。',
-                  'No evaluation results yet. Register a dataset and run an evaluation job first.',
-                )}
+                {t('evaluations:evaluationsPage.noEvaluationResultsYetRegisterADatasetAndRunAnEvaluationJob')}
               </div>
             ) : (
               evaluations.map((item) => (
@@ -127,7 +123,7 @@ export function EvaluationsPage() {
                   <div>
                     <strong>{item.model_id}</strong>
                     <small>
-                      {item.kind} · {new Date(item.created_at).toLocaleString()}
+                      {item.kind} · {new Date(item.created_at).toLocaleString(i18n.resolvedLanguage)}
                     </small>
                   </div>
                   <span className="model-identity-trailing">
@@ -148,12 +144,12 @@ export function EvaluationsPage() {
             onClick={() => void compareSelectedEvaluations()}
             type="button"
           >
-            {tr('对比所选结果', 'Compare selected')}
+            {t('evaluations:evaluationsPage.compareSelected')}
           </button>
           {evaluationComparison && (
             <div className="comparison-table">
               <header>
-                <span>{tr('模型', 'Model')}</span>
+                <span>{t('evaluations:evaluationsPage.model')}</span>
                 {evaluationComparison.metrics.map((metric) => (
                   <b key={metric}>{metric}</b>
                 ))}
@@ -179,9 +175,9 @@ export function EvaluationsPage() {
         <section className="dashboard-panel dataset-panel" key="datasets">
           <div className="panel-heading">
             <div>
-              <h2>{tr('数据集', 'Datasets')}</h2>
+              <h2>{t('evaluations:evaluationsPage.datasets')}</h2>
               <p>
-                {tr('可复现的文件哈希与来源清单', 'Reproducible file hashes and source manifests')}
+                {t('evaluations:evaluationsPage.reproducibleFileHashesAndSourceManifests')}
               </p>
             </div>
             <b>{datasets.length}</b>
@@ -191,7 +187,7 @@ export function EvaluationsPage() {
               onChange={(event) =>
                 setDatasetDraft((current) => ({ ...current, name: event.target.value }))
               }
-              placeholder={tr('名称', 'Name')}
+              placeholder={t('evaluations:evaluationsPage.name')}
               value={datasetDraft.name}
             />
             <select
@@ -214,16 +210,13 @@ export function EvaluationsPage() {
               value={datasetDraft.artifact_uri}
             />
             <button disabled={busy} type="submit">
-              {tr('注册', 'Register')}
+              {t('evaluations:evaluationsPage.register')}
             </button>
           </form>
           <div className="dataset-list">
             {datasets.length === 0 ? (
               <div className="inline-empty">
-                {tr(
-                  '还没有数据集。注册一个文件或工作区资源后即可开始评测。',
-                  'No datasets yet. Register a file or workspace resource to start evaluating.',
-                )}
+                {t('evaluations:evaluationsPage.noDatasetsYetRegisterAFileOrWorkspaceResourceToStartEvaluating')}
               </div>
             ) : (
               datasets.map((item) => (
@@ -236,7 +229,7 @@ export function EvaluationsPage() {
                     </small>
                   </div>
                   <button
-                    aria-label={tr('删除数据集', 'Delete dataset')}
+                    aria-label={t('evaluations:evaluationsPage.deleteDataset')}
                     onClick={() =>
                       void evaluationsApi
                         .deleteDataset(item.id)

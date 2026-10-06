@@ -1,5 +1,5 @@
 /** Render the active chat title, model selector, and conversation controls. */
-import { useSettings } from '../../settings/SettingsProvider';
+import { useTranslation } from 'react-i18next';
 import { useConversationSelector } from '../state/conversationStore';
 import { Icon } from '../../../app/display';
 import { formatNumber } from '../../../app/formatters';
@@ -11,7 +11,7 @@ import { InferenceDefaultsPanel } from '../../connections/InferenceDefaultsPanel
 
 /** Display active-session controls and prevent model changes during recovery. */
 export function ChatPageHeader({ page }: { page: ChatPageState }) {
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const settingsTrigger = useRef<HTMLButtonElement>(null);
   const messages = useConversationSelector((state) => state.messages);
@@ -24,24 +24,24 @@ export function ChatPageHeader({ page }: { page: ChatPageState }) {
         <button
           aria-expanded={chatSessionsOpen}
           aria-label={chatSessionsOpen
-            ? tr('收起会话列表', 'Collapse conversations')
-            : tr('展开会话列表', 'Expand conversations')}
+            ? t('chat:chatPageHeader.collapseConversations')
+            : t('chat:chatPageHeader.expandConversations')}
           className="chat-sidebar-toggle"
           onClick={() => setChatSessionsOpen((open) => !open)}
           title={chatSessionsOpen
-            ? tr('收起会话列表', 'Collapse conversations')
-            : tr('展开会话列表', 'Expand conversations')}
+            ? t('chat:chatPageHeader.collapseConversations')
+            : t('chat:chatPageHeader.expandConversations')}
           type="button"
         >
           <span aria-hidden="true">{chatSessionsOpen ? '‹' : '›'}</span>
         </button>
-        <h1>{active?.title || tr('对话', 'Chat')}</h1>
+        <h1>{active?.title || t('chat:chatPageHeader.chat')}</h1>
       </div>
       <div className="chat-screen-actions">
         <div className="chat-model-summary">
           {inference.availableModelNames.length > 1 ? (
             <select
-              aria-label={tr('对话模型', 'Chat model')}
+              aria-label={t('chat:chatPageHeader.chatModel')}
               disabled={busy || recoveryNeeded}
               onChange={(event) => selectModel(event.target.value)}
               value={inference.selectedModel}
@@ -51,15 +51,12 @@ export function ChatPageHeader({ page }: { page: ChatPageState }) {
               ))}
             </select>
           ) : (
-            <strong>{inference.selectedModel || tr('尚未加载模型', 'No model loaded')}</strong>
+            <strong>{inference.selectedModel || t('chat:chatPageHeader.noModelLoaded')}</strong>
           )}
           <small>
-            {tr(
-              '最多 ' + formatNumber(inference.effectiveSettings.maxTokens) + ' tokens',
-              formatNumber(inference.effectiveSettings.maxTokens) + ' max tokens',
-            )}{' '}
-            · {tr('温度', 'temperature')} {formatNumber(inference.effectiveSettings.temperature, 2)} ·{' '}
-            {tr('流式', 'streaming')}
+            {t('chat:chatPageHeader.maxTokens', { tokens: formatNumber(inference.effectiveSettings.maxTokens) })}{' '}
+            · {t('chat:chatPageHeader.temperature')} {formatNumber(inference.effectiveSettings.temperature, 2)} ·{' '}
+            {t('chat:chatPageHeader.streaming')}
           </small>
         </div>
         <ModelVendorMark name={inference.selectedModel}
@@ -67,24 +64,24 @@ export function ChatPageHeader({ page }: { page: ChatPageState }) {
         <span className={'runtime-status-pill ' + (conversation.conversationReady ? 'running' : 'stopped')}>
           <i />
           {conversation.conversationReady
-            ? tr('就绪', 'Ready')
+            ? t('chat:chatPageHeader.ready')
             : inference.selectedModelLoading
-              ? tr('加载中', 'Loading')
-              : tr('空闲', 'Idle')}
+              ? t('chat:chatPageHeader.loading')
+              : t('chat:chatPageHeader.idle')}
         </span>
         <button
-          ref={settingsTrigger} aria-label={tr('对话设置', 'Chat settings')} className="chat-icon-button"
+          ref={settingsTrigger} aria-label={t('chat:chatPageHeader.chatSettings')} className="chat-icon-button"
           onClick={() => setSettingsOpen(true)} type="button"><Icon name="settings" size={16} /></button>
-        <Dialog open={settingsOpen} onOpenChange={setSettingsOpen} title={tr('对话设置', 'Chat settings')}
-          closeLabel={tr('关闭', 'Close')} className="chat-settings-dialog" returnFocusRef={settingsTrigger}>
+        <Dialog open={settingsOpen} onOpenChange={setSettingsOpen} title={t('chat:chatPageHeader.chatSettings')}
+          closeLabel={t('common:close')} className="chat-settings-dialog" returnFocusRef={settingsTrigger}>
           <div className="server-page"><InferenceDefaultsPanel /></div>
         </Dialog>
         <button
-          aria-label={tr('清空对话', 'Clear conversation')}
+          aria-label={t('chat:chatPageHeader.clearConversation')}
           className="chat-icon-button"
           disabled={!conversation.conversationReady || busy || recoveryNeeded || (!messages.length && !currentVoiceMessages.length)}
           onClick={() => void clearActiveConversation()}
-          title={tr('清空对话', 'Clear conversation')}
+          title={t('chat:chatPageHeader.clearConversation')}
           type="button"
         >
           <Icon name="trash" size={14} />

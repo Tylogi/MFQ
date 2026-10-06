@@ -1,0 +1,70 @@
+{
+  "failurePage": {
+    "somethingWentWrongOnThisPageTryAgainOrReturnToThe": "当前页面遇到了意外问题。可以重试，或先返回概览继续使用。",
+    "workspaceDataIsUnavailableCheckTheServiceOrConnectionSettingsThenTry": "无法获取工作区数据。请检查服务状态或连接配置，然后重新连接。",
+    "viewErrorDetails": "查看错误详情",
+    "backToOverview": "返回概览",
+    "connectionSettings": "连接设置",
+    "retryPage": "重试页面",
+    "reconnect": "重新连接",
+    "pageUnavailable": "页面暂时无法显示",
+    "serviceUnavailable": "服务暂时无法连接"
+  },
+  "labLayout": {
+    "modelDownloads": "模型下载",
+    "findModelsAndPrecisionTiersForYourDevice": "浏览模型，选择适合设备的精度版本。",
+    "evaluations": "评测与数据集",
+    "manageEvaluationsAndCalibrationDatasets": "管理评测任务与校准数据集。",
+    "quantization": "量化工作台",
+    "manageModelQuantizationFromCalibrationToExport": "从校准到导出，管理模型量化任务。"
+  },
+  "loadingPage": {
+    "loading": "正在加载中"
+  },
+  "notFoundPage": {
+    "pageNotFound": "页面不存在",
+    "thereIsNoPageAtThisAddressCheckTheUrlOrReturn": "这个地址没有对应的页面。请检查网址，或返回概览继续使用。",
+    "backToOverview": "返回概览",
+    "goBack": "返回上一页"
+  },
+  "runtimeAlerts": {
+    "unableToConnectToTheService": "无法连接服务",
+    "retryConnection": "重试连接",
+    "runtimeStatusCouldNotBeUpdatedDataMayBeStale": "运行状态更新失败，数据可能不是最新的",
+    "refreshAgain": "重新刷新",
+    "taskProgressIsNotUpdating": "任务进度暂时无法更新",
+    "reconnectTaskStreams": "重新连接任务流"
+  },
+  "studioShell": {
+    "skipToMainContent": "跳到主要内容"
+  },
+  "studioSidebar": {
+    "inference": "推理",
+    "overview": "概览",
+    "models": "模型",
+    "service": "服务",
+    "resources": "资源",
+    "playground": "交互",
+    "chat": "对话",
+    "modelTools": "模型工具",
+    "modelDownloads": "模型下载",
+    "evaluations": "评测与数据集",
+    "quantization": "量化工作台",
+    "system": "系统",
+    "logs": "日志",
+    "serverIdle": "服务空闲",
+    "chooseAModelToBegin": "选择模型以开始",
+    "modelLoading": "模型加载中",
+    "activeRequests": "个活动请求",
+    "openSidebar": "打开侧栏",
+    "closeSidebar": "关闭侧栏",
+    "modelsLoaded_other": "{{count}} 个模型已加载"
+  },
+  "main": {
+    "theInterfaceEncounteredAnUnexpectedProblemTheServiceMayStillBeRunning": "应用界面遇到了意外问题。服务可能仍在运行，可以重新载入界面后继续。",
+    "viewErrorDetails": "查看错误详情",
+    "backToOverview": "返回概览",
+    "reload": "重新载入",
+    "interfaceUnavailable": "界面暂时无法显示"
+  }
+}

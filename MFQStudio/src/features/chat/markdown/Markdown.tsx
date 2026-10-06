@@ -3,6 +3,7 @@
 * Parse generated model text with streaming throttling, Prism.js highlighting, code-block copying, and KaTeX math rendering.
  */
 import DOMPurify from 'dompurify';
+import { useTranslation } from 'react-i18next';
 import renderMathInElement from 'katex/contrib/auto-render';
 import { Marked } from 'marked';
 import Prism from 'prismjs';
@@ -149,6 +150,7 @@ export const Markdown = memo(function Markdown({
   live = false,
   normalizeEscapedLineBreaks = false,
 }: MarkdownProps) {
+  const { t } = useTranslation();
   const rootRef = useRef<HTMLDivElement>(null);
   const displayedText = useStreamingText(text, live);
   const markdown = useMemo(
@@ -192,23 +194,23 @@ export const Markdown = memo(function Markdown({
       const button = document.createElement('button');
       button.className = 'code-copy';
       button.type = 'button';
-      button.textContent = 'Copy';
+      button.textContent = t('chat:markdown.copy');
       button.addEventListener('click', () => {
         void Promise.resolve()
           .then(() => navigator.clipboard.writeText(source))
           .then(() => {
             if (disposed) return;
-            button.textContent = 'Copied';
+            button.textContent = t('chat:markdown.copied');
             button.classList.add('copied');
             const timer = setTimeout(() => {
-              button.textContent = 'Copy';
+              button.textContent = t('chat:markdown.copy');
               button.classList.remove('copied');
               timers.delete(timer);
             }, 1200);
             timers.add(timer);
           })
           .catch(() => {
-            if (!disposed) button.textContent = 'Copy failed';
+            if (!disposed) button.textContent = t('chat:markdown.copyFailed');
           });
       });
       const header = block.querySelector('.code-header');
@@ -224,7 +226,7 @@ export const Markdown = memo(function Markdown({
       timers.forEach(clearTimeout);
       buttons.forEach((button) => button.remove());
     };
-  }, [html, live]);
+  }, [html, live, t]);
 
   return <div className="rich-text" dangerouslySetInnerHTML={markup} ref={rootRef} />;
 });

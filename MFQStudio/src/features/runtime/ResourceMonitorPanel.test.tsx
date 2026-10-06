@@ -1,3 +1,5 @@
+/** Verify ResourceMonitorPanel behavior and integration contracts. */
+import { i18n } from '../../i18n';
 import { act, render, screen } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
 import { ResourceMonitorPanel } from './ResourceMonitorPanel';
@@ -5,7 +7,7 @@ import { runtimeApi } from '../../shared/api/resources/runtime';
 import type { RuntimeResources } from '../../shared/api/types';
 
 vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => ({ ready: true, connectionRevision: 0 }) }));
-vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh: string, en: string) => en }) }));
+vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ t: i18n.getFixedT('en') }) }));
 
 const snapshot: RuntimeResources = { sampled_at: 100, interval_seconds: 2,
   cpu_name: 'Apple M5 Max', cpu_cores: 18, cpu_utilization_percent: 36,

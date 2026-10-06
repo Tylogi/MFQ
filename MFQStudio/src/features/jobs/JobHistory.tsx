@@ -1,10 +1,11 @@
 /** Display active jobs and terminal records for the quantization workspace. */
+import { i18n } from '../../i18n';
 import { useQuantization } from './QuantizationContext';
 import { formatNumber } from '../../app/formatters';
 /** Read the data and business actions required by this panel from page state. */
 export function JobHistory() {
   const {
-    tr,
+    t,
     selectedJobId,
     setSelectedJobId,
     jobCleanupBusy,
@@ -17,7 +18,7 @@ export function JobHistory() {
       <section className="dashboard-panel job-history" key="history">
         <div className="panel-heading">
           <div>
-            <h2>{tr('任务历史', 'Job history')}</h2>
+            <h2>{t('jobs:jobHistory.jobHistory')}</h2>
           </div>
           <b>{activeJobs.length}</b>
         </div>
@@ -34,7 +35,7 @@ export function JobHistory() {
                 <div>
                   <strong>{job.kind}</strong>
                   <small>
-                    {job.status} · {new Date(job.updated_at).toLocaleString()}
+                    {job.status} · {new Date(job.updated_at).toLocaleString(i18n.resolvedLanguage)}
                   </small>
                 </div>
                 <b>{formatNumber(job.progress * 100)}%</b>
@@ -46,7 +47,7 @@ export function JobHistory() {
           <details className="completed-jobs">
             <summary>
               <span>
-                {tr('已完成', 'Completed')} <b>{completedJobs.length}</b>
+                {t('jobs:jobHistory.completed')} <b>{completedJobs.length}</b>
               </span>
               <button
                 disabled={jobCleanupBusy}
@@ -56,7 +57,7 @@ export function JobHistory() {
                 }}
                 type="button"
               >
-                {tr('清理已完成', 'Clear completed')}
+                {t('jobs:jobHistory.clearCompleted')}
               </button>
             </summary>
             <div className="job-list">
@@ -71,7 +72,7 @@ export function JobHistory() {
                   <div>
                     <strong>{job.kind}</strong>
                     <small>
-                      {job.status} · {new Date(job.updated_at).toLocaleString()}
+                      {job.status} · {new Date(job.updated_at).toLocaleString(i18n.resolvedLanguage)}
                     </small>
                   </div>
                   <b>{formatNumber(job.progress * 100)}%</b>

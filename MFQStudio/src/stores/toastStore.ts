@@ -2,6 +2,7 @@
  * Global lightweight notification (Toast) state management for maintaining the notification queue and auto-dismissal.
  */
 import { create } from 'zustand';
+import type { DisplayMessage } from '../i18n/messages';
 
 /** Notification type. */
 export type ToastType = 'error' | 'success' | 'info' | 'warning';
@@ -15,9 +16,9 @@ export interface ToastItemData {
   /** Notification type. */
   type: ToastType;
   /** Main notification content. */
-  message: string;
+  message: DisplayMessage;
   /** Optional notification title. */
-  title?: string;
+  title?: DisplayMessage;
   /** Display duration in milliseconds; values at or below zero keep it visible until manually closed. */
   duration?: number;
 }
@@ -29,9 +30,9 @@ export interface ShowToastOptions {
   /** Notification type; defaults to 'info'. */
   type?: ToastType;
   /** Notification message text. */
-  message: string;
+  message: DisplayMessage;
   /** Optional title. */
-  title?: string;
+  title?: DisplayMessage;
   /** Duration in milliseconds; defaults by type when omitted (5000 ms for errors, 3500 ms otherwise). */
   duration?: number;
 }
@@ -98,7 +99,7 @@ export const toast = {
    * @param message Error message.
    * @param options Optional title or display duration.
    */
-  error: (message: string, options?: { title?: string; duration?: number; id?: string }) =>
+  error: (message: DisplayMessage, options?: { title?: DisplayMessage; duration?: number; id?: string }) =>
     useToastStore.getState().showToast({ ...options, type: 'error', message }),
 
   /**
@@ -107,7 +108,7 @@ export const toast = {
    * @param message Success message.
    * @param options Optional title or display duration.
    */
-  success: (message: string, options?: { title?: string; duration?: number; id?: string }) =>
+  success: (message: DisplayMessage, options?: { title?: DisplayMessage; duration?: number; id?: string }) =>
     useToastStore.getState().showToast({ ...options, type: 'success', message }),
 
   /**
@@ -116,7 +117,7 @@ export const toast = {
    * @param message Notification message.
    * @param options Optional title or display duration.
    */
-  info: (message: string, options?: { title?: string; duration?: number; id?: string }) =>
+  info: (message: DisplayMessage, options?: { title?: DisplayMessage; duration?: number; id?: string }) =>
     useToastStore.getState().showToast({ ...options, type: 'info', message }),
 
   /**
@@ -125,7 +126,7 @@ export const toast = {
    * @param message Warning message.
    * @param options Optional title or display duration.
    */
-  warning: (message: string, options?: { title?: string; duration?: number; id?: string }) =>
+  warning: (message: DisplayMessage, options?: { title?: DisplayMessage; duration?: number; id?: string }) =>
     useToastStore.getState().showToast({ ...options, type: 'warning', message }),
 
   /**

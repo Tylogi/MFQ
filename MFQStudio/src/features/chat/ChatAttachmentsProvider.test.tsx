@@ -1,4 +1,5 @@
 /** Verify that attachment updates notify only the input area and previews are released on session or service changes. */
+import { i18n } from '../../i18n';
 import { act, render, screen } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { mediaApi } from '../../shared/api/resources/media';
@@ -13,7 +14,7 @@ import { useConversationStore } from './state/conversationStore';
 const runtime = vi.hoisted(() => ({ connectionRevision: 1 }));
 vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => runtime }));
 vi.mock('../settings/SettingsProvider', () => ({
-  useSettings: () => ({ tr: (_zh: string, en: string) => en }),
+  useSettings: () => ({ t: i18n.getFixedT('en') }),
 }));
 
 beforeEach(() => {

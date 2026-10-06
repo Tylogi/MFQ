@@ -1,6 +1,8 @@
+/** Provide OverviewPage interface behavior. */
+import { localized } from '../../i18n/messages';
+import { useTranslation } from 'react-i18next';
 import { useEffect, useRef, useState } from 'react';
 import { useRuntime } from '../../app/RuntimeProvider';
-import { useSettings } from '../settings/SettingsProvider';
 import {
   Icon,
   ScreenHeader,
@@ -20,6 +22,7 @@ import { getApiBaseUrl } from '../../shared/api/client';
 import { toast } from '../../stores/toastStore';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
 
+/** Summarize model availability, runtime memory, request metrics, and endpoint access. */
 export function OverviewPage() {
   const {
     runtime,
@@ -32,7 +35,7 @@ export function OverviewPage() {
     loading: busy,
     connectionRevision,
   } = useRuntime();
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const [endpointCopied, setEndpointCopied] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(
@@ -50,7 +53,7 @@ export function OverviewPage() {
     try {
       await navigator.clipboard.writeText(endpoint);
       setEndpointCopied(true);
-      toast.success(tr('服务地址已复制到剪贴板', 'Endpoint URL copied to clipboard'));
+      toast.success(localized('runtime:overviewPage.endpointUrlCopiedToClipboard'));
       if (timer.current) clearTimeout(timer.current);
       timer.current = setTimeout(() => setEndpointCopied(false), 1600);
     } catch (cause) {
@@ -73,24 +76,18 @@ export function OverviewPage() {
     ? Number(runtime.prefix_cache_supported) > 0
     : prefixCachePersistent || prefixCacheHotOnly;
   const prefixCacheUnavailableReason = Number(runtime?.prefix_cache_disabled_reason) === 2
-    ? tr(
-        '连续批处理模式暂不支持 Session KV 缓存',
-        'Session KV cache is unavailable with continuous batching',
-      )
-    : tr(
-        '当前模型不支持 Session KV 缓存',
-        'The current model does not support Session KV cache',
-      );
+    ? t('runtime:overviewPage.sessionKvCacheIsUnavailableWithContinuousBatching')
+    : t('runtime:overviewPage.theCurrentModelDoesNotSupportSessionKvCache');
 
   return (
     <section className="dashboard-view" id="dashboard-overview">
       <ScreenHeader
-        title={tr('概览', 'Overview')}
-        subtitle={tr('本机推理状态与性能。', 'Local inference status and performance.')}
+        title={t('runtime:overviewPage.overview')}
+        subtitle={t('runtime:overviewPage.localInferenceStatusAndPerformance')}
         trailing={
           <button disabled={busy} onClick={() => void refreshRuntime()} type="button">
             <Icon name="refresh" size={14} />
-            {tr('刷新', 'Refresh')}
+            {t('common:refresh')}
           </button>
         }
       />
@@ -98,11 +95,8 @@ export function OverviewPage() {
       {availableModelNames.length > 1 && (
         <>
           <SectionLabel
-            title={tr('已加载模型', 'Loaded models')}
-            subtitle={tr(
-              `${availableModelNames.length} 个可用于推理`,
-              `${availableModelNames.length} available for inference`,
-            )}
+            title={t('runtime:overviewPage.loadedModels')}
+            subtitle={t('runtime:overviewPage.availableForInference', { count: availableModelNames.length })}
           />
           <TMPanel className="overview-models-panel">
             <div className="overview-model-grid">
@@ -112,15 +106,12 @@ export function OverviewPage() {
                 );
                 const selected = name === model;
                 const stateLabel =
-                  instance?.state === 'busy' ? tr('使用中', 'Busy') : tr('就绪', 'Ready');
+                  instance?.state === 'busy' ? t('runtime:overviewPage.busy') : t('runtime:overviewPage.ready');
                 const details = [
                   instance?.devices.join(' + '),
                   instance?.context_size ? `${formatNumber(instance.context_size)} ctx` : null,
                   instance
-                    ? tr(
-                        `${instance.active_sessions} 个会话`,
-                        `${instance.active_sessions} sessions`,
-                      )
+                    ? t('runtime:overviewPage.sessions', { count: instance.active_sessions })
                     : null,
                 ]
                   .filter(Boolean)
@@ -143,7 +134,7 @@ export function OverviewPage() {
                       <ModelVendorMark name={name} architecture={name === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined} />
                       <span className="runtime-status-pill ready">
                         <i />
-                        {selected ? tr('当前', 'Current') : stateLabel}
+                        {selected ? t('runtime:overviewPage.current') : stateLabel}
                       </span>
                     </span>
                   </button>
@@ -154,39 +145,36 @@ export function OverviewPage() {
         </>
       )}
       <SectionLabel
-        title={tr('实时性能', 'Live performance')}
-        subtitle={tr(
-          '最近请求吞吐与累计缓存复用',
-          'Latest request throughput · cumulative cache reuse',
-        )}
+        title={t('runtime:overviewPage.livePerformance')}
+        subtitle={t('runtime:overviewPage.latestRequestThroughputCumulativeCacheReuse')}
       />
       <div className="metric-grid">
         <MetricTile
-          label={tr('预填充', 'Prefill')}
+          label={t('runtime:overviewPage.prefill')}
           value={formatNumber(lastPrefill.tokensPerSecond, 1)}
           unit="tok/s"
-          detail={`${formatNumber(lastPrefill.milliseconds, 1)} ms · ${tr('输入处理', 'Prompt processing')}`}
+          detail={`${formatNumber(lastPrefill.milliseconds, 1)} ms · ${t('runtime:overviewPage.promptProcessing')}`}
           icon="text-forward"
         />
         <MetricTile
-          label={tr('解码', 'Decode')}
+          label={t('runtime:overviewPage.decode')}
           value={formatNumber(last?.decode_tps, 1)}
           unit="tok/s"
-          detail={tr('输出生成', 'Token generation')}
+          detail={t('runtime:overviewPage.tokenGeneration')}
           icon="waveform"
         />
         <MetricTile
-          label={tr('首字延迟', 'TTFT')}
+          label={t('runtime:overviewPage.ttft')}
           value={formatNumber(lastTtftMs, 1)}
           unit="ms"
-          detail={tr('首次输出耗时', 'Time to first token')}
+          detail={t('runtime:overviewPage.timeToFirstToken')}
           icon="clock"
         />
         <MetricTile
-          label={tr('前缀复用', 'Prefix reuse')}
+          label={t('runtime:overviewPage.prefixReuse')}
           value={
             !prefixCacheSupported
-              ? tr('不支持', 'Unavailable')
+              ? t('runtime:overviewPage.unavailable')
               : prefixCacheQueries > 0
                 ? `${formatNumber(prefixCacheHitRate, 1)}%`
                 : '--'
@@ -194,44 +182,38 @@ export function OverviewPage() {
           detail={
             !prefixCacheSupported
               ? prefixCacheUnavailableReason
-              : tr(
-                  `已恢复 ${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens`,
-                  `${formatNumber(runtime?.prefix_cache_hit_tokens || 0)} tokens restored`,
-                )
+              : t('runtime:overviewPage.tokensRestored', { tokens: formatNumber(runtime?.prefix_cache_hit_tokens || 0) })
           }
           icon="reuse"
         />
         <MetricTile
-          label={tr('内存', 'Memory')}
+          label={t('runtime:overviewPage.memory')}
           value={formatBytes(runtimeMemory)}
-          detail={tr('当前模型活动内存', 'Current model active memory')}
+          detail={t('runtime:overviewPage.currentModelActiveMemory')}
           icon="memory"
         />
       </div>
-      <SectionLabel title={tr('资源概览', 'Resource overview')} />
+      <SectionLabel title={t('runtime:overviewPage.resourceOverview')} />
       {runtime ? (
         <MemoryHierarchy instances={instances} connectionRevision={connectionRevision}
           memoryCapacityBytes={runtime.runtime_memory_effective_budget_bytes ?? runtime.runtime_memory_budget_bytes} />
       ) : (
         <EmptyPanel
           icon="memory"
-          title={tr('推理内存尚未上报', 'Runtime memory is unavailable')}
-          message={tr(
-            '服务器就绪后会显示模型驻留与缓存状态。',
-            'Memory residency and cache state appear when the server is ready.',
-          )}
+          title={t('runtime:overviewPage.runtimeMemoryIsUnavailable')}
+          message={t('runtime:overviewPage.memoryResidencyAndCacheStateAppearWhenTheServerIsReady')}
         />
       )}
       <div className="overview-footer-grid">
         <TMPanel className="overview-endpoint-panel">
           <div className="overview-panel-title">
             <Icon name="link" size={15} />
-            <h2>{tr('OpenAI 兼容端点', 'OpenAI-compatible endpoint')}</h2>
+            <h2>{t('runtime:overviewPage.openaiCompatibleEndpoint')}</h2>
             <button
-              aria-label={endpointCopied ? tr('已复制', 'Copied') : tr('复制端点', 'Copy endpoint')}
+              aria-label={endpointCopied ? t('runtime:overviewPage.copied') : t('runtime:overviewPage.copyEndpoint')}
               className={endpointCopied ? 'copied' : ''}
               onClick={() => void copyEndpoint()}
-              title={endpointCopied ? tr('已复制', 'Copied') : tr('复制端点', 'Copy endpoint')}
+              title={endpointCopied ? t('runtime:overviewPage.copied') : t('runtime:overviewPage.copyEndpoint')}
               type="button"
             >
               <Icon name={endpointCopied ? 'check' : 'copy'} size={14} />
@@ -239,35 +221,32 @@ export function OverviewPage() {
           </div>
           <code>{endpoint}</code>
           <p>
-            {tr(
-              '可直接用于 OpenAI SDK；默认回环地址不经过云端。',
-              'Use this base URL with OpenAI SDKs. The default loopback address sends no traffic to the cloud.',
-            )}
+            {t('runtime:overviewPage.useThisBaseUrlWithOpenaiSdksTheDefaultLoopbackAddressSends')}
           </p>
         </TMPanel>
         <TMPanel className="overview-session-panel">
           <div className="overview-panel-title">
             <Icon name="chart" size={15} />
-            <h2>{tr('会话统计', 'Session')}</h2>
+            <h2>{t('runtime:overviewPage.session')}</h2>
             <span>{formatDuration(runtime?.uptime_seconds)}</span>
           </div>
           <div className="overview-session-stats">
             <div>
               <strong>{formatNumber(runtime?.total_requests || 0)}</strong>
-              <small>{tr('已完成', 'Completed')}</small>
+              <small>{t('runtime:overviewPage.completed')}</small>
             </div>
             <div>
               <strong>{formatNumber(runtime?.total_prompt_tokens || 0)}</strong>
-              <small>{tr('提示词', 'Prompt')}</small>
+              <small>{t('runtime:overviewPage.prompt')}</small>
             </div>
             <div>
               <strong>{formatNumber(runtime?.total_completion_tokens || 0)}</strong>
-              <small>{tr('已生成', 'Generated')}</small>
+              <small>{t('runtime:overviewPage.generated')}</small>
             </div>
           </div>
           <p>
-            {formatNumber(runtime?.failed_requests || 0)} {tr('个失败请求', 'failed requests')} ·{' '}
-            {formatNumber(runtime?.active_requests || 0)} {tr('个活动请求', 'active')}
+            {formatNumber(runtime?.failed_requests || 0)} {t('runtime:overviewPage.failedRequests')} ·{' '}
+            {formatNumber(runtime?.active_requests || 0)} {t('runtime:overviewPage.active')}
           </p>
         </TMPanel>
       </div>

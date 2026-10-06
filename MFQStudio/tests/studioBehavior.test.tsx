@@ -1,4 +1,5 @@
 /** Verify Markdown fixes, model-link downloads, and panel persistence from legacy Studio contracts; limited wiring checks are separately marked as transitional source checks. */
+import { i18n } from '../src/i18n';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
@@ -15,7 +16,7 @@ import { PanelDeck, PANEL_COLLAPSED_KEY } from '../src/app/PanelDeck';
 const { addJob } = vi.hoisted(() => ({ addJob: vi.fn() }));
 vi.mock('../src/app/RuntimeProvider', () => ({ useRuntime: () => ({ addJob }) }));
 vi.mock('../src/features/settings/SettingsProvider', () => ({
-  useSettings: () => ({ tr: (_zh: string, en: string) => en }),
+  useSettings: () => ({ t: i18n.getFixedT('en') }),
 }));
 
 beforeEach(() => {
@@ -186,7 +187,7 @@ describe('describes studioBehavior test behavior 6', () => {
           jobKinds={[]}
           onError={vi.fn()}
           onJobCreated={vi.fn()}
-          tr={(_zh, en) => en}
+          t={i18n.getFixedT('en')}
         />
       </MemoryRouter>,
     );

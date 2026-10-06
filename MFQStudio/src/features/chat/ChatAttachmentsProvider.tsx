@@ -1,7 +1,7 @@
 /** Preserve pending attachments across routes, isolating preview-list updates from chat-generation lifecycle. */
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useRuntime } from '../../app/RuntimeProvider';
-import { useSettings } from '../settings/SettingsProvider';
+import { useTranslation } from 'react-i18next';
 import type { PendingAttachment } from './attachments';
 import { useChatAttachments } from './hooks/useChatAttachments';
 import { useConversationSelector } from './state/conversationStore';
@@ -26,7 +26,7 @@ const ErrorContext = createContext<AttachmentError | null>(null);
 export function ChatAttachmentsProvider({ children }: { children: ReactNode }) {
   const activeId = useConversationSelector((state) => state.activeId);
   const { connectionRevision } = useRuntime();
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const [error, setError] = useState<AttachmentError | null>(null);
   const reportError = useCallback((message: string | null) => {
     setError(message ? { message } : null);
@@ -38,7 +38,7 @@ export function ChatAttachmentsProvider({ children }: { children: ReactNode }) {
     removeAttachment,
     clearAttachments,
     uploadAttachments,
-  } = useChatAttachments(activeId, connectionRevision, reportError, tr);
+  } = useChatAttachments(activeId, connectionRevision, reportError, t);
   useEffect(() => setError(null), [activeId, connectionRevision]);
   const actions = useMemo(
     () => ({

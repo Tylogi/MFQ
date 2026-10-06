@@ -1,4 +1,6 @@
 /** Manage pending attachments and previews, converting browser files into server message parts. */
+import { i18n } from '../../../i18n';
+import type { TFunction } from 'i18next';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { mediaApi } from '../../../shared/api/resources/media';
 import type { ContentPart } from '../../../shared/api/types';
@@ -15,13 +17,13 @@ export function useChatAttachments(
   sessionId: string | null,
   connectionRevision: number,
   onError: (message: string | null) => void,
-  tr: (zh: string, en: string) => string = (_zh, en) => en,
+  t: TFunction = i18n.t.bind(i18n),
 ) {
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const latest = useRef(attachments);
   latest.current = attachments;
-  const translate = useRef(tr);
-  translate.current = tr;
+  const translate = useRef(t);
+  translate.current = t;
   const clearAttachments = useCallback(() => {
     latest.current.forEach((item) => {
       if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
@@ -55,11 +57,11 @@ export function useChatAttachments(
                 ? 'document'
                 : null;
         if (!kind) {
-          onError(`Unsupported attachment: ${file.name}`);
+          onError(translate.current('chat:useChatAttachments.unsupportedAttachment', { name: file.name }));
           continue;
         }
         if (kind === 'document' && file.size > MAX_DOCUMENT_BYTES) {
-          onError(`Document exceeds ${MAX_DOCUMENT_BYTES / (1024 * 1024)} MiB: ${file.name}`);
+          onError(translate.current('chat:useChatAttachments.oversizedDocument', { limit: MAX_DOCUMENT_BYTES / (1024 * 1024), name: file.name }));
           continue;
         }
         next.push({
@@ -71,10 +73,7 @@ export function useChatAttachments(
       }
       latest.current = [...latest.current, ...next];
       setAttachments(latest.current);
-      if (omitted) onError(translate.current(
-        `每条消息最多添加 ${MAX_ATTACHMENTS} 个附件，${omitted} 个文件未添加。`,
-        `Up to ${MAX_ATTACHMENTS} attachments per message; ${omitted} files were not added.`,
-      ));
+      if (omitted) onError(translate.current('chat:useChatAttachments.upToAttachmentsPerMessageFilesWereNotAdded', { maxAttachments: MAX_ATTACHMENTS, omitted: omitted }));
     },
     [onError],
   );

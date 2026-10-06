@@ -1,5 +1,6 @@
 /** Load and display chat media and documents, managing download state, video posters, and resource cleanup. */
 import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { mediaApi } from '../../shared/api/resources/media';
 import type { ContentPart } from '../../shared/api/types';
 import { formatNumber } from '../../app/formatters';
@@ -55,6 +56,7 @@ export function VideoWithFirstFrame({
 }
 /** Load an attachment by message-media ID, supporting request cancellation and failure state. */
 export function MediaPartView({ part }: { part: Extract<ContentPart, { media: unknown }> }) {
+  const { t } = useTranslation();
   const [src, setSrc] = useState<string | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
 
@@ -80,11 +82,11 @@ export function MediaPartView({ part }: { part: Extract<ContentPart, { media: un
   }, [part.media.id]);
 
   if (loadFailed) {
-    return <span className="message-media-status" role="alert">Unable to load attachment</span>;
+    return <span className="message-media-status" role="alert">{t('chat:media.unableToLoadAttachment')}</span>;
   }
-  if (!src) return <span className="message-media-status" aria-label="Loading media">Loading attachment…</span>;
+  if (!src) return <span className="message-media-status" aria-label={t('chat:media.loadingMedia')}>{t('chat:media.loadingAttachment')}</span>;
   if (part.type === "image") {
-    return <img alt="Attached image" className="message-media media-image" loading="lazy" src={src} />;
+    return <img alt={t('chat:media.attachedImage')} className="message-media media-image" loading="lazy" src={src} />;
   }
   if (part.type === "video") {
     return <VideoWithFirstFrame className="message-media media-video" controls src={src} />;
@@ -93,6 +95,7 @@ export function MediaPartView({ part }: { part: Extract<ContentPart, { media: un
 }
 /** Display document attachments with download, progress, and retry interactions. */
 export function DocumentPartView({ part }: { part: Extract<ContentPart, { type: "document" }> }) {
+  const { t } = useTranslation();
   const [downloadState, setDownloadState] = useState<"idle" | "loading" | "failed">("idle");
 
   async function downloadDocument() {
@@ -117,9 +120,9 @@ export function DocumentPartView({ part }: { part: Extract<ContentPart, { type: 
   }
 
   const detail = downloadState === "loading"
-    ? "Downloading…"
+    ? t('chat:media.downloading')
     : downloadState === "failed"
-      ? "Download failed — click to retry"
+      ? t('chat:media.downloadFailed')
       : `${formatNumber(part.media.byte_size)} B`;
   return <button className="message-document" disabled={downloadState === "loading"} onClick={() => void downloadDocument()} type="button"><span>DOC</span><div><strong>{part.name}</strong><small>{detail}</small></div></button>;
 }

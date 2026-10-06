@@ -1,4 +1,5 @@
 /** Manage the input draft, IME submission, attachment entry point, and generate button, isolating high-frequency typing state. */
+import type { TFunction } from 'i18next';
 import { useRef, type FormEvent, type ReactNode } from 'react';
 import { Icon } from '../../../app/display';
 import { formatNumber } from '../../../app/formatters';
@@ -16,7 +17,7 @@ interface ChatComposerProps {
   placeholder: string;
   attachmentAccept: string;
   toolbar: ReactNode;
-  tr: (zh: string, en: string) => string;
+  t: TFunction;
 /** Send the input and call accepted to clear the session draft after preparation succeeds. */
   onSend: (text: string, accepted: () => void) => Promise<void>;
 /** Cancel the current generation, including backend cancellation and history synchronization. */
@@ -34,7 +35,7 @@ export function ChatComposer({
   placeholder,
   attachmentAccept,
   toolbar,
-  tr,
+  t,
   onSend,
   onStop,
   onError,
@@ -88,7 +89,7 @@ export function ChatComposer({
                 </small>
               </div>
               <button
-                aria-label={tr('移除附件', 'Remove attachment')}
+                aria-label={t('chat:chatComposer.removeAttachment')}
                 disabled={busy}
                 onClick={() => removeAttachment(attachment.id)}
                 type="button"
@@ -100,7 +101,7 @@ export function ChatComposer({
         </div>
       )}
       <textarea
-        aria-label={tr('消息', 'Message')}
+        aria-label={t('chat:chatComposer.message')}
         disabled={!ready || busy}
         onChange={(event) => setDraft(sessionId, event.target.value)}
         onKeyDown={(event) => {
@@ -131,10 +132,10 @@ export function ChatComposer({
           type="file"
         />
         <button
-          aria-label={tr('添加附件', 'Add attachment')}
+          aria-label={t('chat:chatComposer.addAttachment')}
           disabled={!ready || busy}
           onClick={() => fileInput.current?.click()}
-          title={tr('添加文档或媒体', 'Add document or media')}
+          title={t('chat:chatComposer.addDocumentOrMedia')}
           type="button"
         >
           <Icon name="paperclip" />
@@ -144,10 +145,10 @@ export function ChatComposer({
           <button
             aria-label={
               phase === 'syncing'
-                ? tr('正在同步回答', 'Synchronizing response')
+                ? t('chat:chatComposer.synchronizingResponse')
                 : stopping
-                  ? tr('正在停止生成', 'Stopping generation')
-                  : tr('停止生成', 'Stop generation')
+                  ? t('chat:chatComposer.stoppingGeneration')
+                  : t('chat:chatComposer.stopGeneration')
             }
             className="send-button stop"
             disabled={stopping}
@@ -158,7 +159,7 @@ export function ChatComposer({
           </button>
         ) : (
           <button
-            aria-label={tr('发送', 'Send')}
+            aria-label={t('chat:chatComposer.send')}
             className="send-button"
             disabled={busy || recoveryNeeded || !ready || (!draft.trim() && !attachments.length)}
             type="submit"

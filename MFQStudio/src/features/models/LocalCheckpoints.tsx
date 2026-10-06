@@ -1,5 +1,5 @@
 /** Render model availability and keep unload progress visible until the operation completes. */
-import { useSettings } from '../settings/SettingsProvider';
+import { useTranslation } from 'react-i18next';
 import { Icon, SectionLabel, TMPanel, EmptyPanel } from '../../app/display';
 import { formatNumber } from '../../app/formatters';
 import type { useModelCatalog } from './useModelCatalog';
@@ -8,14 +8,14 @@ import { ModelLoadProgress } from './ModelLoadProgress';
 
 /** Display model actions with instance-specific unload feedback and duplicate-action protection. */
 export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const { runtime, artifacts, busy, instances, modelFilter,
     filteredArtifacts, unloadInstance, unloadingInstanceIds, loadArtifact, chooseModelDirectory } = catalog;
   return (
     <>
       <SectionLabel
-        title={tr('本地检查点', 'Local checkpoints')}
-        subtitle={`${artifacts.length} ${tr('个本地模型', 'local models')}`}
+        title={t('models:localCheckpoints.localCheckpoints')}
+        subtitle={`${artifacts.length} ${t('models:localCheckpoints.localModels')}`}
       />
       {filteredArtifacts.length > 0 ? (
         <TMPanel className="model-catalog-panel model-library-panel">
@@ -27,7 +27,7 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
               const unloading = instance && (instance.state === 'unloading' || unloadingInstanceIds.has(instance.id));
               const loaded = Boolean(instance) || item.name === runtime?.model;
               const policy = instance?.pinned
-                ? tr('固定', 'Pinned')
+                ? t('models:localCheckpoints.pinned')
                 : instance?.idle_ttl_seconds != null
                   ? `TTL ${instance.idle_ttl_seconds}s` : null;
               return (
@@ -37,7 +37,7 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                   <div>
                     <strong>{item.name}</strong>
                     <small>
-                      {item.architecture} · {item.missing_shards ? tr(`分片不全，缺 ${item.missing_shards} 片`, `${item.missing_shards} shards missing`) : item.complete ? `${item.shard_count} ${tr('个分片', 'shards')}` : tr('文件无效', 'Invalid file')} ·{' '}
+                      {item.architecture} · {item.missing_shards ? t('models:localCheckpoints.shardsMissing', { count: item.missing_shards }) : item.complete ? `${item.shard_count} ${t('models:localCheckpoints.shards')}` : t('models:localCheckpoints.invalidFile')} ·{' '}
                       {formatNumber(item.total_bytes / 2 ** 30, 1)} GB{policy ? ` · ${policy}` : ''}
                     </small>
                     <ModelLoadProgress model={item.name} />
@@ -45,19 +45,19 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                   <div className="model-row-actions"><ModelVendorMark name={item.name} architecture={item.architecture} />{instance ? (
                     <button disabled={busy || unloading || instance.state !== 'ready'}
                       onClick={() => void unloadInstance(instance.id)} type="button">
-                      {unloading ? tr('正在卸载…', 'Unloading…') : tr('卸载', 'Unload')}
+                      {unloading ? t('models:localCheckpoints.unloading') : t('models:localCheckpoints.unload')}
                     </button>
                   ) : loaded ? (
-                    <em>{tr('已加载', 'Loaded')}</em>
+                    <em>{t('models:localCheckpoints.loaded')}</em>
                   ) : !item.loadable ? (
                     <em className="failed" title={item.error || undefined}>
                       {item.complete && item.format === 'hf'
-                        ? tr('需先转换', 'Convert first') : item.missing_shards
-                          ? tr('分片不全', 'Incomplete shards') : tr('不可用', 'Invalid')}
+                        ? t('models:localCheckpoints.convertFirst') : item.missing_shards
+                          ? t('models:localCheckpoints.incompleteShards') : t('models:localCheckpoints.invalid')}
                     </em>
                   ) : (
                     <button disabled={busy} onClick={() => void loadArtifact(item.name)} type="button">
-                      {tr('加载', 'Load')}
+                      {t('models:localCheckpoints.load')}
                     </button>
                   )}</div>
                 </div>
@@ -68,13 +68,12 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
       ) : (
         <EmptyPanel
           icon="folder"
-          title={tr(modelFilter ? '没有匹配的本地模型' : '还没有本地模型',
-            modelFilter ? 'No local model matches' : 'No local models yet')}
-          message={tr('添加一个模型文件夹即可开始。', 'Add a model folder to get started.')}
+          title={(modelFilter ? t('models:localCheckpoints.noLocalModelMatches') : t('models:localCheckpoints.noLocalModelsYet'))}
+          message={t('models:localCheckpoints.addAModelFolderToGetStarted')}
           action={
             <button className="primary screen-header-action" disabled={busy}
               onClick={() => void chooseModelDirectory()} type="button">
-              <Icon name="folder" size={14} />{tr('选择模型文件夹', 'Choose model folder')}
+              <Icon name="folder" size={14} />{t('models:localCheckpoints.chooseModelFolder')}
             </button>
           }
         />

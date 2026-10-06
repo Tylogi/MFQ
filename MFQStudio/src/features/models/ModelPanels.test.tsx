@@ -1,4 +1,5 @@
 /** Verify model panel actions and status rendering with English interface labels. */
+import { i18n } from '../../i18n';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
 import { useModelCatalog } from './useModelCatalog';
@@ -8,7 +9,7 @@ import { LocalCheckpoints } from './LocalCheckpoints';
 import { ModelLoadPolicy } from './ModelLoadPolicy';
 
 vi.mock('../settings/SettingsProvider', () => ({
-  useSettings: () => ({ tr: (_zh: string, en: string) => en }),
+  useSettings: () => ({ t: i18n.getFixedT('en') }),
 }));
 vi.mock('./useModelCatalog', () => ({ useModelCatalog: vi.fn() }));
 

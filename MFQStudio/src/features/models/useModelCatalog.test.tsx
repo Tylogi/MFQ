@@ -1,4 +1,5 @@
 /** Verify on-demand catalog loading, policy propagation, and recovery from registration failures. */
+import { i18n } from '../../i18n';
 import { act, renderHook, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import type { ReactNode } from 'react';
@@ -28,7 +29,7 @@ vi.mock('../../app/RuntimeProvider', () => ({
   }),
 }));
 vi.mock('../settings/SettingsProvider', () => ({
-  useSettings: () => ({ tr: (_zh: string, en: string) => en, contextSize: 8192 }),
+  useSettings: () => ({ t: i18n.getFixedT('en'), contextSize: 8192 }),
 }));
 vi.mock('../../studio', () => ({ isStudio: () => false, selectLocalModelDirectory: vi.fn() }));
 

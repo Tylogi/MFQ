@@ -1,4 +1,5 @@
-import { useSettings } from '../settings/SettingsProvider';
+/** Compose loaded models, local checkpoints, and their lifecycle controls. */
+import { useTranslation } from 'react-i18next';
 import { Icon, ScreenHeader } from '../../app/display';
 import { useModelCatalog } from './useModelCatalog';
 import { ModelDirectoryDialog } from './ModelDirectoryDialog';
@@ -7,56 +8,57 @@ import { ModelLoadPolicy } from './ModelLoadPolicy';
 import { LocalCheckpoints } from './LocalCheckpoints';
 import { formatBytes } from '../../app/formatters';
 
+/** Compose loaded models, local checkpoints, and their lifecycle controls. */
 export function ModelsPage() {
   const catalog = useModelCatalog();
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const { artifacts, busy, availableModelNames, modelFilter, setModelFilter,
     openStudioPage, chooseModelDirectory } = catalog;
   const totalBytes = artifacts.reduce((sum, artifact) => sum + artifact.total_bytes, 0);
   return (
     <section className="dashboard-view">
       <ScreenHeader
-        title={tr('模型', 'Models')}
-        subtitle={tr('管理本地模型与运行实例。', 'Manage local models and runtime instances.')}
+        title={t('models:modelsPage.models')}
+        subtitle={t('models:modelsPage.manageLocalModelsAndRuntimeInstances')}
         trailing={
           <>
             <button onClick={() => openStudioPage('lab', 'models')} type="button">
-              <Icon name="download" size={14} />{tr('模型下载', 'Model downloads')}
+              <Icon name="download" size={14} />{t('models:modelsPage.modelDownloads')}
             </button>
             <button className="primary" disabled={busy}
               onClick={() => void chooseModelDirectory()} type="button">
-              <Icon name="folder" size={14} />{tr('添加模型', 'Add model')}
+              <Icon name="folder" size={14} />{t('models:modelsPage.addModel')}
             </button>
           </>
         }
       />
       <div className="model-workbench-summary">
         <div>
-          <span>{tr('运行中的模型', 'Loaded models')}</span>
+          <span>{t('models:modelsPage.loadedModels')}</span>
           <strong>{availableModelNames.length}</strong>
-          <small>{tr('可直接用于服务', 'Ready for serving')}</small>
+          <small>{t('models:modelsPage.readyForServing')}</small>
         </div>
         <div>
-          <span>{tr('本地检查点', 'Local checkpoints')}</span>
+          <span>{t('models:modelsPage.localCheckpoints')}</span>
           <strong>{artifacts.length}</strong>
-          <small>{tr('已登记到 MFQ', 'Registered in MFQ')}</small>
+          <small>{t('models:modelsPage.registeredInMfq')}</small>
         </div>
         <div>
-          <span>{tr('注册模型资产总大小', 'Registered model assets size')}</span>
+          <span>{t('models:modelsPage.registeredModelAssetsSize')}</span>
           <strong>{totalBytes === 0 ? '0 B' : formatBytes(totalBytes).replace(/\b(KB|MB|GB|TB)\b/g, (unit) => `${unit[0]}iB`)}</strong>
-          <small>{tr('已登记模型的文件总大小', 'Total file size of registered models')}</small>
+          <small>{t('models:modelsPage.totalFileSizeOfRegisteredModels')}</small>
         </div>
       </div>
       <div className="model-catalog-toolbar">
         <div>
-          <h2>{tr('模型资产', 'Model assets')}</h2>
-          <span>{tr('管理本地资产与已载入模型', 'Manage local assets and loaded models')}</span>
+          <h2>{t('models:modelsPage.modelAssets')}</h2>
+          <span>{t('models:modelsPage.manageLocalAssetsAndLoadedModels')}</span>
         </div>
         <label>
           <span aria-hidden="true">/</span>
-          <input aria-label={tr('筛选模型', 'Filter models')}
+          <input aria-label={t('models:modelsPage.filterModels')}
             onChange={(event) => setModelFilter(event.target.value)}
-            placeholder={tr('按名称筛选', 'Filter by name')}
+            placeholder={t('models:modelsPage.filterByName')}
             value={modelFilter} />
         </label>
       </div>
@@ -64,9 +66,9 @@ export function ModelsPage() {
       <ModelLoadPolicy catalog={catalog} />
       <LocalCheckpoints catalog={catalog} />
       <div className="model-workbench-links">
-        <span>{tr('自定义模型精度', 'Custom model precision')}</span>
+        <span>{t('models:modelsPage.customModelPrecision')}</span>
         <button onClick={() => openStudioPage('lab', 'quantization')} type="button">
-          {tr('打开量化工作台', 'Open quantization workspace')}
+          {t('models:modelsPage.openQuantizationWorkspace')}
           <Icon name="text-forward" size={14} />
         </button>
       </div>

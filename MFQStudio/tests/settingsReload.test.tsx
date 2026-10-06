@@ -1,3 +1,5 @@
+/** Verify settingsReload behavior and integration contracts. */
+import { i18n } from '../src/i18n';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, expect, it, vi } from 'vitest';
@@ -8,7 +10,7 @@ import type { RuntimeInstance, RuntimeStatus } from '../src/shared/api/types';
 
 vi.mock('../src/app/RuntimeProvider', () => ({ useRuntime: vi.fn() }));
 vi.mock('../src/features/settings/SettingsProvider', () => ({ useSettings: () => ({
-  contextSize: 32768, setContextSize: vi.fn(), tr: (_zh: string, en: string) => en,
+  contextSize: 32768, setContextSize: vi.fn(), t: i18n.getFixedT('en'),
 }) }));
 
 const reloadModelContext = vi.fn();

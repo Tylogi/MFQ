@@ -1,16 +1,17 @@
 /** Centralize display formatting for errors, numbers, capacity, and duration. */
+import { i18n } from '../i18n';
 import { ApiError } from '../shared/api/client';
 /** Convert server or generic errors into user-visible messages. */
 export function errorMessage(error: unknown): string {
   if (error instanceof ApiError) return `${error.code}: ${error.message}`;
   if (error instanceof Error) return error.message;
-  return "Unknown error";
+  return i18n.t('common:unknownError');
 }
 /** Format a finite number, returning a placeholder when missing or invalid. */
 export function formatNumber(value: unknown, digits = 0): string {
   const number = Number(value);
   return Number.isFinite(number)
-    ? new Intl.NumberFormat(undefined, { maximumFractionDigits: digits }).format(number)
+    ? new Intl.NumberFormat(i18n.resolvedLanguage, { maximumFractionDigits: digits }).format(number)
     : "--";
 }
 /** Convert bytes into a readable binary capacity unit. */

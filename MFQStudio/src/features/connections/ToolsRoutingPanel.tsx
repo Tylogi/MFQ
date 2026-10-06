@@ -1,15 +1,15 @@
 /** Independently load and manage MCP tool servers and remote nodes for reuse by resources and connections pages. */
+import { useTranslation } from 'react-i18next';
 import { useEffect, useState, type FormEvent } from 'react';
 import { connectionsApi } from '../../shared/api/resources/connections';
 import type { McpServerResource, McpToolResource, RemoteNode } from '../../shared/api/types';
 import { SectionLabel, TMPanel } from '../../app/display';
 import { errorMessage, formatNumber } from '../../app/formatters';
 import { useRuntime } from '../../app/RuntimeProvider';
-import { useSettings } from '../settings/SettingsProvider';
 import { toast } from '../../stores/toastStore';
 /** Load connection resources on mount; write errors affect only the current connections panel. */
 export function ToolsRoutingPanel() {
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const { ready, connectionRevision } = useRuntime();
   const [servers, setServers] = useState<McpServerResource[]>([]);
   const [tools, setTools] = useState<McpToolResource[]>([]);
@@ -94,29 +94,29 @@ export function ToolsRoutingPanel() {
   return (
     <>
       <SectionLabel
-        title={tr('工具与路由', 'Tools and routing')}
-        subtitle={tr('可选的 MCP 与远程节点', 'Optional MCP and remote nodes')}
+        title={t('connections:toolsRoutingPanel.toolsAndRouting')}
+        subtitle={t('connections:toolsRoutingPanel.optionalMcpAndRemoteNodes')}
       />
       <div className="dashboard-grid server-tools-grid">
         <TMPanel className="mcp-panel">
           <div className="panel-heading">
             <div>
               <h2>MCP</h2>
-              <p>{tr('工具服务器与模型可见工具', 'Tool servers and model-visible tools')}</p>
+              <p>{t('connections:toolsRoutingPanel.toolServersAndModelVisibleTools')}</p>
             </div>
-            <b>{tr(`${tools.length} 个工具`, `${tools.length} tools`)}</b>
+            <b>{t('connections:toolsRoutingPanel.tools', { count: tools.length })}</b>
           </div>
           <form className="mcp-form" onSubmit={createMcpServer}>
             <input
-              aria-label={tr('服务器名称', 'Server name')}
+              aria-label={t('connections:toolsRoutingPanel.serverName')}
               onChange={(event) =>
                 setMcpDraft((current) => ({ ...current, name: event.target.value }))
               }
-              placeholder={tr('名称', 'Name')}
+              placeholder={t('connections:toolsRoutingPanel.name')}
               value={mcpDraft.name}
             />
             <select
-              aria-label={tr('传输方式', 'Transport')}
+              aria-label={t('connections:toolsRoutingPanel.transport')}
               onChange={(event) =>
                 setMcpDraft((current) => ({
                   ...current,
@@ -132,7 +132,7 @@ export function ToolsRoutingPanel() {
               aria-label={
                 mcpDraft.transport === 'streamable_http'
                   ? 'Streamable HTTP URL'
-                  : tr('可执行文件', 'Executable')
+                  : t('connections:toolsRoutingPanel.executable')
               }
               onChange={(event) =>
                 setMcpDraft((current) => ({ ...current, endpoint: event.target.value }))
@@ -140,7 +140,7 @@ export function ToolsRoutingPanel() {
               placeholder={
                 mcpDraft.transport === 'streamable_http'
                   ? 'https://host/mcp'
-                  : tr('可执行文件路径', 'Executable path')
+                  : t('connections:toolsRoutingPanel.executablePath')
               }
               type={mcpDraft.transport === 'streamable_http' ? 'url' : 'text'}
               value={mcpDraft.endpoint}
@@ -150,7 +150,7 @@ export function ToolsRoutingPanel() {
               disabled={!ready || busy || !mcpDraft.name.trim() || !mcpDraft.endpoint.trim()}
               type="submit"
             >
-              {tr('添加', 'Add')}
+              {t('connections:toolsRoutingPanel.add')}
             </button>
           </form>
           <div className="mcp-server-list">
@@ -168,14 +168,14 @@ export function ToolsRoutingPanel() {
                   onClick={() => void mutate(() => connectionsApi.updateMcpServer(server.id, !server.enabled))}
                   type="button"
                 >
-                  {server.enabled ? tr('停用', 'Disable') : tr('启用', 'Enable')}
+                  {server.enabled ? t('connections:toolsRoutingPanel.disable') : t('connections:toolsRoutingPanel.enable')}
                 </button>
                 <button
                   disabled={busy}
                   onClick={() => void mutate(() => connectionsApi.deleteMcpServer(server.id))}
                   type="button"
                 >
-                  {tr('删除', 'Delete')}
+                  {t('common:delete')}
                 </button>
               </div>
             ))}
@@ -184,12 +184,9 @@ export function ToolsRoutingPanel() {
         <TMPanel className="cluster-panel">
           <div className="panel-heading">
             <div>
-              <h2>{tr('远程节点', 'Remote nodes')}</h2>
+              <h2>{t('connections:toolsRoutingPanel.remoteNodes')}</h2>
               <p>
-                {tr(
-                  '按模型和负载路由到健康的 MFQ Server',
-                  'Route by model and load across healthy MFQ Server nodes',
-                )}
+                {t('connections:toolsRoutingPanel.routeByModelAndLoadAcrossHealthyMfqServerNodes')}
               </p>
             </div>
             <b>
@@ -198,15 +195,15 @@ export function ToolsRoutingPanel() {
           </div>
           <form className="node-form" onSubmit={registerRemoteNode}>
             <input
-              aria-label={tr('节点名称', 'Node name')}
+              aria-label={t('connections:toolsRoutingPanel.nodeName')}
               onChange={(event) =>
                 setNodeDraft((current) => ({ ...current, name: event.target.value }))
               }
-              placeholder={tr('节点名称', 'Node name')}
+              placeholder={t('connections:toolsRoutingPanel.nodeName')}
               value={nodeDraft.name}
             />
             <input
-              aria-label={tr('节点地址', 'Node URL')}
+              aria-label={t('connections:toolsRoutingPanel.nodeUrl')}
               onChange={(event) =>
                 setNodeDraft((current) => ({ ...current, url: event.target.value }))
               }
@@ -215,15 +212,15 @@ export function ToolsRoutingPanel() {
               value={nodeDraft.url}
             />
             <input
-              aria-label={tr('密钥环境变量', 'Credential environment variable')}
+              aria-label={t('connections:toolsRoutingPanel.credentialEnvironmentVariable')}
               onChange={(event) =>
                 setNodeDraft((current) => ({ ...current, api_key_env: event.target.value }))
               }
-              placeholder={tr('密钥环境变量（可选）', 'Credential environment variable (optional)')}
+              placeholder={t('connections:toolsRoutingPanel.credentialEnvironmentVariableOptional')}
               value={nodeDraft.api_key_env}
             />
             <button disabled={!ready || busy} type="submit">
-              {tr('添加', 'Add')}
+              {t('connections:toolsRoutingPanel.add')}
             </button>
           </form>
           <div className="node-list">
@@ -234,13 +231,10 @@ export function ToolsRoutingPanel() {
                   <strong>{node.name}</strong>
                   <small>
                     {node.url} ·{' '}
-                    {tr(`${node.models.length} 个模型`, `${node.models.length} models`)} ·{' '}
-                    {tr(`${node.active_requests} 个活动请求`, `${node.active_requests} active`)}
+                    {t('connections:toolsRoutingPanel.models', { count: node.models.length })} ·{' '}
+                    {t('connections:toolsRoutingPanel.active', { activeRequests: node.active_requests })}
                     {typeof node.metrics.total_requests === 'number'
-                      ? tr(
-                          ` · ${formatNumber(node.metrics.total_requests)} 个请求`,
-                          ` · ${formatNumber(node.metrics.total_requests)} requests`,
-                        )
+                      ? t('connections:toolsRoutingPanel.requests', { requests: formatNumber(node.metrics.total_requests) })
                       : ''}
                     {node.error ? ` · ${node.error}` : ''}
                   </small>
@@ -250,7 +244,7 @@ export function ToolsRoutingPanel() {
                   onClick={() => void mutate(() => connectionsApi.deleteRemoteNode(node.id))}
                   type="button"
                 >
-                  {tr('删除', 'Delete')}
+                  {t('common:delete')}
                 </button>
               </div>
             ))}

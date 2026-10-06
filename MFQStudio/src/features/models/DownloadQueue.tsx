@@ -1,3 +1,5 @@
+/** Provide DownloadQueue interface behavior. */
+import { useTranslation } from 'react-i18next';
 import { useState } from 'react';
 import type { JobResource } from '../../shared/api/types';
 import { jobsApi } from '../../shared/api/resources/jobs';
@@ -5,7 +7,6 @@ import { Icon } from '../../app/display';
 import { errorMessage, formatBytes, formatNumber } from '../../app/formatters';
 import { useJobStore } from '../../stores/jobStore';
 import { toast } from '../../stores/toastStore';
-import { useSettings } from '../settings/SettingsProvider';
 import type { DownloadOrigin } from './ModelBrowser';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
 
@@ -13,18 +14,19 @@ export const isModelDownload = (job: JobResource) => job.kind === 'download.hugg
 export const isActiveDownload = (job: JobResource) => ['queued', 'running', 'cancelling'].includes(job.status);
 export const downloadProgress = (job: JobResource) => Number.isFinite(job.progress) ? Math.max(0, Math.min(1, job.progress)) : 0;
 
+/** Display download progress and expose retry and cancellation actions. */
 export function DownloadQueue({ jobs, onJobCreated }: {
   jobs: JobResource[];
   onJobCreated(job: JobResource, origin: DownloadOrigin): void;
 }) {
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const addJob = useJobStore((state) => state.addJob);
   const [busyId, setBusyId] = useState<string | null>(null);
   const statusLabels: Record<JobResource['status'], string> = {
-    queued: tr('等待下载', 'Queued'), running: tr('下载中', 'Downloading'),
-    cancelling: tr('正在取消', 'Cancelling'), succeeded: tr('下载完成', 'Completed'),
-    failed: tr('下载失败', 'Failed'), cancelled: tr('已取消', 'Cancelled'),
-    interrupted: tr('下载中断', 'Interrupted'),
+    queued: t('models:downloadQueue.queued'), running: t('models:downloadQueue.downloading'),
+    cancelling: t('models:downloadQueue.cancelling'), succeeded: t('models:downloadQueue.completed'),
+    failed: t('models:downloadQueue.failed'), cancelled: t('models:downloadQueue.cancelled'),
+    interrupted: t('models:downloadQueue.interrupted'),
   };
 
   async function act(job: JobResource, retry: boolean, origin: DownloadOrigin) {
@@ -50,13 +52,13 @@ export function DownloadQueue({ jobs, onJobCreated }: {
   }
 
   return (
-    <section className="download-queue" aria-label={tr('下载队列', 'Download queue')}>
+    <section className="download-queue" aria-label={t('models:downloadQueue.downloadQueue')}>
       <div className="download-queue-heading">
-        <h3>{tr('下载队列', 'Download queue')}</h3>
-        <span>{tr(`${jobs.filter(isActiveDownload).length} 个下载中`, `${jobs.filter(isActiveDownload).length} active`)}</span>
+        <h3>{t('models:downloadQueue.downloadQueue')}</h3>
+        <span>{t('models:downloadQueue.active', { count: jobs.filter(isActiveDownload).length })}</span>
       </div>
       {!jobs.length && <div className="download-queue-empty"><Icon name="download" size={28} />
-        <strong>{tr('暂无下载', 'No downloads yet')}</strong>
+        <strong>{t('models:downloadQueue.noDownloadsYet')}</strong>
       </div>}
       {jobs.map((job) => {
         const progress = downloadProgress(job);
@@ -67,20 +69,20 @@ export function DownloadQueue({ jobs, onJobCreated }: {
             <div className="download-item-body">
               <div className="download-item-heading"><strong>{String(job.payload.repo_id || job.kind)}</strong><span className="model-identity-trailing">{statusLabels[job.status]}<ModelVendorMark name={String(job.payload.repo_id || '')} /></span></div>
               <small>{job.kind === 'download.huggingface' ? 'Hugging Face' : 'ModelScope'} · {String(job.payload.destination || '')}</small>
-              <div className="download-item-progress"><progress aria-label={tr('下载进度', 'Download progress')} max={1} value={progress} /><span>{formatNumber(progress * 100, 1)}%</span></div>
+              <div className="download-item-progress"><progress aria-label={t('models:downloadQueue.downloadProgress')} max={1} value={progress} /><span>{formatNumber(progress * 100, 1)}%</span></div>
               {isActiveDownload(job) && job.progress_data?.downloaded_bytes != null && <small className="download-transfer-stats">
                 {(job.progress_data.bytes_per_second ? formatBytes(job.progress_data.bytes_per_second).replace(/\b(KB|MB|GB|TB)\b/g, (unit) => `${unit[0]}iB`) : '0 B')}/s
                 {' · '}{formatBytes(job.progress_data.downloaded_bytes)}{job.progress_data.total_bytes ? ` / ${formatBytes(job.progress_data.total_bytes)}` : ''}
-                {' · '}{job.progress_data.files_completed ?? 0} {tr('个文件完成', 'files completed')}
+                {' · '}{job.progress_data.files_completed ?? 0} {t('models:downloadQueue.filesCompleted')}
               </small>}
               {job.error && <p className="download-item-error">{job.error.message}</p>}
             </div>
             {(isActiveDownload(job) || retry) && <button disabled={busyId !== null || job.status === 'cancelling'} onClick={(event) => {
               const rect = event.currentTarget.getBoundingClientRect();
               void act(job, retry, { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
-            }} type="button">{retry ? tr('重试', 'Retry') : tr('取消', 'Cancel')}</button>}
-            {!isActiveDownload(job) && <button disabled={busyId !== null} aria-label={tr('删除下载记录', 'Delete download record')}
-              title={tr('仅删除任务记录，保留下载文件', 'Remove task history; keep downloaded files')}
+            }} type="button">{retry ? t('common:retry') : t('common:cancel')}</button>}
+            {!isActiveDownload(job) && <button disabled={busyId !== null} aria-label={t('models:downloadQueue.deleteDownloadRecord')}
+              title={t('models:downloadQueue.removeTaskHistoryKeepDownloadedFiles')}
               onClick={() => void remove(job)} type="button"><Icon name="trash" size={16} /></button>}
           </article>
         );

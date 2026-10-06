@@ -1,3 +1,5 @@
+/** Verify ModelHubPage behavior and integration contracts. */
+import { i18n } from '../../i18n';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import type { JobResource, OfficialModelList } from '../../shared/api/types';
@@ -9,7 +11,7 @@ import { ModelHubPage } from './ModelHubPage';
 vi.mock('../../shared/api/resources/models', () => ({ modelsApi: { officialHubModels: vi.fn() } }));
 vi.mock('../../shared/api/resources/jobs', () => ({ jobsApi: { jobKinds: vi.fn(), createJob: vi.fn(), cancelJob: vi.fn(), retryJob: vi.fn(), deleteJob: vi.fn() } }));
 vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => ({ addJob: (job: JobResource) => useJobStore.getState().addJob(job) }) }));
-vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh: string, en: string) => en }) }));
+vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ t: i18n.getFixedT('en') }) }));
 
 const configuration = { status: 'unknown' as const, recommendation: 'unknown' as const, reasons: [] };
 const source = { provider: 'modelscope' as const, repo_id: 'example/model', url: 'https://modelscope.cn/models/example/model', available: true };

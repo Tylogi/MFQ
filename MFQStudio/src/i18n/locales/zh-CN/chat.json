@@ -1,0 +1,125 @@
+{
+  "chatProvider": {
+    "maximumOutputTokensMustBeAPositiveInteger": "最大输出 token 数必须是正整数。",
+    "deleteThisCannotBeUndone": "删除对话“{{title}}”？此操作无法撤销。",
+    "clearThisConversation": "清空当前对话？"
+  },
+  "chatComposer": {
+    "removeAttachment": "移除附件",
+    "message": "消息",
+    "addAttachment": "添加附件",
+    "addDocumentOrMedia": "添加文档或媒体",
+    "send": "发送",
+    "stopGeneration": "停止生成",
+    "stoppingGeneration": "正在停止生成",
+    "synchronizingResponse": "正在同步回答"
+  },
+  "chatInputArea": {
+    "scrollToBottom": "回到底部",
+    "thisModelNeedsTheVoiceOutputComponent": "此模型还缺少语音输出组件",
+    "voiceComponentDownloaded": "语音组件已下载",
+    "token2wavIsInstalledOnceAndSharedByAllCompatibleModels": "Token2Wav 独立安装，不会重复占用每个模型的空间。",
+    "downloadingAndVerifying": "正在下载并校验 · {{progress}}%",
+    "downloadGb": "下载组件 · {{size}} GB",
+    "enableVoiceOutput": "启用语音输出",
+    "downloading": "正在下载…",
+    "dismissError": "关闭错误提示",
+    "loadAModelFirst": "请先加载模型",
+    "loadingConversation": "正在加载会话",
+    "messageMfq": "向模型发送消息",
+    "modelOutputMayBeInaccurateVerifyImportantInformation": "模型输出可能存在错误，请核对重要信息。"
+  },
+  "chatMessageList": {
+    "startAConversation": "开始对话",
+    "connectedToYourConfiguredMfqService": "连接到当前配置的 MFQ 服务。",
+    "startChat": "开始对话",
+    "noModelLoaded": "尚未加载模型",
+    "modelLoading": "模型加载中",
+    "chooseALocalCheckpointToUseTheInferencePlayground": "选择本地检查点后即可开始对话。",
+    "chatBecomesAvailableAsSoonAsLoadingCompletes": "加载完成后即可开始对话。",
+    "chooseModel": "选择模型",
+    "loadingMessages": "正在加载消息…"
+  },
+  "chatPageHeader": {
+    "expandConversations": "展开会话列表",
+    "collapseConversations": "收起会话列表",
+    "chat": "对话",
+    "noModelLoaded": "尚未加载模型",
+    "chatModel": "对话模型",
+    "maxTokens": "最多 {{tokens}} tokens",
+    "temperature": "温度",
+    "streaming": "流式",
+    "idle": "空闲",
+    "loading": "加载中",
+    "ready": "就绪",
+    "chatSettings": "对话设置",
+    "clearConversation": "清空对话"
+  },
+  "chatSessionSidebar": {
+    "chats": "对话",
+    "newChat": "新建会话",
+    "noConversationsYet": "暂无会话",
+    "deleteChat": "删除对话：{{title}}",
+    "deleteChat2": "删除对话",
+    "noOlderConversations": "没有更早的会话了",
+    "conversationHistory": "会话历史",
+    "conversations": "会话列表"
+  },
+  "chatToolbar": {
+    "interactionMode": "交互模式",
+    "voiceInput": "语音输入",
+    "processingVoice": "语音处理中",
+    "selectVoiceOrFullDuplexModeFirst": "请先选择语音或全双工模式",
+    "voicePlayback": "语音播放",
+    "vision": "视觉",
+    "visionInput": "视觉输入",
+    "theCurrentModelArtifactHasNoVisionWeights": "当前模型文件没有视觉权重",
+    "theCurrentModelArtifactHasNoCompleteMtpHead": "当前模型文件没有完整 MTP 权重",
+    "thinking": "思考",
+    "standard": "标准",
+    "reasoningEffort": "思考档位",
+    "enterToSendShiftEnterForNewline": "Enter 发送 · Shift+Enter 换行"
+  },
+  "streamingMessage": {
+    "reasoning": "思考过程",
+    "thinking": "正在思考",
+    "waitingForResponse": "等待回答",
+    "synchronizingResponse": "正在同步回答…",
+    "stoppedPartialResponseRetained": "已停止，保留部分回答",
+    "incompleteResponseReceivedContentRetained": "回答未完成，已保留收到的内容",
+    "synchronizeResponse": "重新同步回答"
+  },
+  "useChatAttachments": {
+    "upToAttachmentsPerMessageFilesWereNotAdded": "每条消息最多添加 {{maxAttachments}} 个附件，{{omitted}} 个文件未添加。",
+    "unsupportedAttachment": "不支持的附件：{{name}}",
+    "oversizedDocument": "文档超过 {{limit}} MiB：{{name}}"
+  },
+  "savedMessageList": {
+    "reasoning": "思考过程",
+    "confirmAndRunAllTools": "确认并执行所有工具",
+    "message": "消息",
+    "mediaPreparation": "媒体准备",
+    "multimodalEncoding": "多模态编码",
+    "copy": "复制",
+    "edit": "编辑",
+    "regenerate": "重新生成"
+  },
+  "modes": {
+    "text": "文本",
+    "voice": "语音",
+    "fullDuplex": "全双工"
+  },
+  "media": {
+    "unableToLoadAttachment": "无法加载附件",
+    "loadingMedia": "正在加载媒体",
+    "loadingAttachment": "正在加载附件…",
+    "attachedImage": "附加图片",
+    "downloading": "正在下载…",
+    "downloadFailed": "下载失败，点击重试"
+  },
+  "markdown": {
+    "copy": "复制",
+    "copied": "已复制",
+    "copyFailed": "复制失败"
+  }
+}

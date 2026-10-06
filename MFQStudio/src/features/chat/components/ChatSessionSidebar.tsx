@@ -1,6 +1,6 @@
 /** Render chat sessions and guard navigation while generation recovery is pending. */
+import { useTranslation } from 'react-i18next';
 import type { UIEvent } from 'react';
-import { useSettings } from '../../settings/SettingsProvider';
 import { Icon } from '../../../app/display';
 import { useConversationSelector } from '../state/conversationStore';
 import type { ChatPageState } from '../hooks/useChatPageState';
@@ -8,7 +8,7 @@ import { ModelVendorMark } from '../../../app/ModelVendorMark';
 
 /** Display session selection, creation, and deletion controls. */
 export function ChatSessionSidebar({ page }: { page: ChatPageState }) {
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const sessions = useConversationSelector((state) => state.sessions);
   const { activeId, chatSessionsOpen, selectSession, createSession, chat } = page;
   const { busy, recoveryNeeded, conversation, deleteConversation } = chat;
@@ -23,23 +23,23 @@ export function ChatSessionSidebar({ page }: { page: ChatPageState }) {
   return (
     <aside
       className={'chat-session-sidebar' + (chatSessionsOpen ? ' open' : '')}
-      aria-label={tr('会话列表', 'Conversations')}
+      aria-label={t('chat:chatSessionSidebar.conversations')}
     >
       <div className="chat-session-sidebar-header">
-        <strong>{tr('对话', 'Chats')}</strong>
+        <strong>{t('chat:chatSessionSidebar.chats')}</strong>
         <button
-          aria-label={tr('新建会话', 'New chat')}
+          aria-label={t('chat:chatSessionSidebar.newChat')}
           className="chat-icon-button"
           disabled={busy || recoveryNeeded || !conversation.modelAvailable}
           onClick={() => void createSession()}
-          title={tr('新建会话', 'New chat')}
+          title={t('chat:chatSessionSidebar.newChat')}
           type="button"
         >
           <Icon name="plus" size={15} />
         </button>
       </div>
       <div className="chat-session-list" onScroll={onScroll} role="region"
-        aria-label={tr('会话历史', 'Conversation history')} tabIndex={0}>
+        aria-label={t('chat:chatSessionSidebar.conversationHistory')} tabIndex={0}>
         {sessions.length ? (
           sessions.map((session) => (
             <div className={'chat-session-row' + (session.id === activeId ? ' active' : '')} key={session.id}>
@@ -48,19 +48,19 @@ export function ChatSessionSidebar({ page }: { page: ChatPageState }) {
                 className="chat-session-select-button"
                 disabled={busy || recoveryNeeded}
                 onClick={() => selectSession(session.id)}
-                title={session.title || tr('未命名会话', 'Untitled chat')}
+                title={session.title || t('common:untitledChat')}
                 type="button"
               >
-                <strong>{session.title || tr('未命名会话', 'Untitled chat')}</strong>
+                <strong>{session.title || t('common:untitledChat')}</strong>
                 <small>{session.model}</small>
                 <ModelVendorMark name={session.model} size={18} />
               </button>
               <button
-                aria-label={tr(`删除对话：${session.title || '未命名会话'}`, `Delete chat: ${session.title || 'Untitled chat'}`)}
+                aria-label={t('chat:chatSessionSidebar.deleteChat', { title: (session.title || t('common:untitledChat')) })}
                 className="chat-session-delete-button"
                 disabled={busy || recoveryNeeded}
                 onClick={() => void deleteConversation(session.id)}
-                title={tr('删除对话', 'Delete chat')}
+                title={t('chat:chatSessionSidebar.deleteChat2')}
                 type="button"
               >
                 <Icon name="trash" size={14} />
@@ -68,13 +68,13 @@ export function ChatSessionSidebar({ page }: { page: ChatPageState }) {
             </div>
           ))
         ) : (
-          <p>{conversation.loadingSessions ? tr('正在加载…', 'Loading…') : tr('暂无会话', 'No conversations yet')}</p>
+          <p>{conversation.loadingSessions ? t('common:loading') : t('chat:chatSessionSidebar.noConversationsYet')}</p>
         )}
         {sessions.length > 0 && conversation.loadingSessions && (
-          <p role="status">{tr('正在加载…', 'Loading…')}</p>
+          <p role="status">{t('common:loading')}</p>
         )}
         {sessions.length > 0 && !conversation.loadingSessions && !conversation.hasMoreSessions && (
-          <p>{tr('没有更早的会话了', 'No older conversations')}</p>
+          <p>{t('chat:chatSessionSidebar.noOlderConversations')}</p>
         )}
       </div>
     </aside>

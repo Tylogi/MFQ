@@ -1,8 +1,9 @@
+/** Provide RuntimeHero interface behavior. */
+import { useTranslation } from 'react-i18next';
 import { useMemo } from 'react';
 import { useNavigate } from 'react-router';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useJobStore } from '../../stores/jobStore';
-import { useSettings } from '../settings/SettingsProvider';
 import { Icon, TMPanel, ModelMonogram } from '../../app/display';
 import { formatNumber, formatDuration } from '../../app/formatters';
 import { STUDIO_PATHS } from '../../navigation';
@@ -11,10 +12,11 @@ import { getApiBaseUrl } from '../../shared/api/client';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
 import { ModelLoadProgress } from '../models/ModelLoadProgress';
 
+/** Show the selected model's lifecycle state and its runtime summary. */
 export function RuntimeHero() {
   const { runtime, instances, studio } = useRuntime();
   const jobs = useJobStore((state) => state.jobs);
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const openStudioPage = () => navigate(STUDIO_PATHS.models);
   const openChatPage = () => navigate(STUDIO_PATHS.chat);
@@ -83,12 +85,12 @@ export function RuntimeHero() {
   }, [instances, jobs, runtime, runtimeModelName]);
   const modelHeroStatus =
     modelHero.state === 'loading'
-      ? tr('加载中', 'Loading')
+      ? t('runtime:runtimeHero.loading')
       : modelHero.state === 'ready'
-        ? tr('运行中', 'Running')
+        ? t('runtime:runtimeHero.running')
         : modelHero.state === 'failed'
-          ? tr('加载失败', 'Failed')
-          : tr('空闲', 'Idle');
+          ? t('runtime:runtimeHero.failed')
+          : t('runtime:runtimeHero.idle');
   return (
     <TMPanel className="runtime-hero">
       <ModelMonogram name={modelHero.name} state={modelHero.state} />
@@ -103,8 +105,8 @@ export function RuntimeHero() {
         <p className="runtime-endpoint">{openAIEndpoint(studio?.service_url || getApiBaseUrl())}</p>
         <small>
           {runtime?.model
-            ? `${runtime?.model_type || 'MFQ'} · ${formatNumber(runtime?.max_context)} ${tr('上下文', 'context')} · ${formatDuration(runtime?.uptime_seconds)}`
-            : tr('加载本地模型后即可开始推理。', 'Load a local model to begin inference.')}
+            ? `${runtime?.model_type || 'MFQ'} · ${formatNumber(runtime?.max_context)} ${t('runtime:runtimeHero.context')} · ${formatDuration(runtime?.uptime_seconds)}`
+            : t('runtime:runtimeHero.loadALocalModelToBeginInference')}
         </small>
         {modelHero.state === 'loading' && <ModelLoadProgress model={modelHero.name} />}
       </div>
@@ -113,11 +115,11 @@ export function RuntimeHero() {
           architecture={modelHero.name === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined} />
         <button className={modelHero.state === 'ready' ? undefined : 'primary'} onClick={() => openStudioPage()} type="button">
           <Icon name="folder" size={15} />
-          {tr('模型', 'Models')}
+          {t('runtime:runtimeHero.models')}
         </button>
         <button className={modelHero.state === 'ready' ? 'primary' : undefined} onClick={openChatPage} type="button">
           <Icon name="chat" size={15} />
-          {tr('对话', 'Chat')}
+          {t('runtime:runtimeHero.chat')}
         </button>
       </div>
     </TMPanel>

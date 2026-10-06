@@ -1,7 +1,7 @@
 /** Display blocking workspace failures consistently, with retry and leave-page actions. */
+import { useTranslation } from 'react-i18next';
 import { ArrowLeftIcon, ArrowClockwiseIcon, PlugsIcon, WarningCircleIcon } from '@phosphor-icons/react';
 import { useNavigate } from 'react-router';
-import { useSettings } from '../features/settings/SettingsProvider';
 
 interface FailurePageProps {
   kind: 'connection' | 'render';
@@ -64,7 +64,7 @@ export function FailureView({ kind, code, title, description, retryLabel, leaveL
 }
 /** Show a recoverable failure page in the main workspace, allowing connection failures to navigate to server settings. */
 export function FailurePage({ kind, detail, onRetry }: FailurePageProps) {
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const connection = kind === 'connection';
 
@@ -72,16 +72,16 @@ export function FailurePage({ kind, detail, onRetry }: FailurePageProps) {
     <FailureView
       code={connection ? 'CONNECTION / 01' : 'PAGE / 02'}
       description={connection
-        ? tr('无法获取工作区数据。请检查服务状态或连接配置，然后重新连接。', 'Workspace data is unavailable. Check the service or connection settings, then try again.')
-        : tr('当前页面遇到了意外问题。可以重试，或先返回概览继续使用。', 'Something went wrong on this page. Try again, or return to the overview.')}
+        ? t('app:failurePage.workspaceDataIsUnavailableCheckTheServiceOrConnectionSettingsThenTry')
+        : t('app:failurePage.somethingWentWrongOnThisPageTryAgainOrReturnToThe')}
       detail={detail}
-      detailLabel={tr('查看错误详情', 'View error details')}
+      detailLabel={t('app:failurePage.viewErrorDetails')}
       kind={kind}
-      leaveLabel={connection ? tr('连接设置', 'Connection settings') : tr('返回概览', 'Back to overview')}
+      leaveLabel={connection ? t('app:failurePage.connectionSettings') : t('app:failurePage.backToOverview')}
       onLeave={() => navigate(connection ? '/runtime' : '/')}
       onRetry={onRetry}
-      retryLabel={connection ? tr('重新连接', 'Reconnect') : tr('重试页面', 'Retry page')}
-      title={connection ? tr('服务暂时无法连接', 'Service unavailable') : tr('页面暂时无法显示', 'Page unavailable')}
+      retryLabel={connection ? t('app:failurePage.reconnect') : t('app:failurePage.retryPage')}
+      title={connection ? t('app:failurePage.serviceUnavailable') : t('app:failurePage.pageUnavailable')}
     />
   );
 }

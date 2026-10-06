@@ -1,0 +1,16 @@
+{
+  "settings": "Settings",
+  "untitledChat": "Untitled chat",
+  "close": "Close",
+  "loading": "Loading…",
+  "cancel": "Cancel",
+  "save": "Save",
+  "apply": "Apply",
+  "delete": "Delete",
+  "retry": "Retry",
+  "reload": "Reload",
+  "refresh": "Refresh",
+  "notifications": "Notifications",
+  "dismissNotification": "Dismiss notification",
+  "unknownError": "Unknown error"
+}

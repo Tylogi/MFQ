@@ -1,0 +1,18 @@
+{
+  "evaluationsPage": {
+    "collapsePanel": "折叠面板",
+    "expandPanel": "展开面板",
+    "datasetRegistered": "数据集已注册",
+    "evaluationResults": "评测结果",
+    "comparisonRequiresMatchingDatasetsAndExecutionParameters": "只允许数据集与运行参数一致的结果对比",
+    "noEvaluationResultsYetRegisterADatasetAndRunAnEvaluationJob": "还没有评测结果。先注册数据集并运行评测任务。",
+    "compareSelected": "对比所选结果",
+    "model": "模型",
+    "datasets": "数据集",
+    "reproducibleFileHashesAndSourceManifests": "可复现的文件哈希与来源清单",
+    "name": "名称",
+    "register": "注册",
+    "deleteDataset": "删除数据集",
+    "noDatasetsYetRegisterAFileOrWorkspaceResourceToStartEvaluating": "还没有数据集。注册一个文件或工作区资源后即可开始评测。"
+  }
+}

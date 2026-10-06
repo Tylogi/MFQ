@@ -1,4 +1,5 @@
 /** Compose chat sessions, message actions, attachments, and voice lifecycle, preserving generation across pages. */
+import { useTranslation } from 'react-i18next';
 import { useChatAttachments } from './hooks/useChatAttachments';
 import {
   createContext,
@@ -62,7 +63,8 @@ function useChatDomain() {
     setError,
     setActiveId,
   } = conversation;
-  const { settings, tr } = useSettings();
+  const { settings } = useSettings();
+  const { t } = useTranslation();
   const runtimeContext = useRuntime();
   const { connectionRevision, ready, refreshRuntime, voiceComponent } = runtimeContext;
   const inference = useChatInference(active?.mode ?? 'text');
@@ -100,8 +102,8 @@ function useChatDomain() {
   const voiceRef = voice.voiceRef;
   const setVoiceMessages = voice.setVoiceMessages;
   const removeSessionVoiceHistory = voice.removeSessionVoiceHistory;
-  const trRef = useRef(tr);
-  trRef.current = tr;
+  const tRef = useRef(t);
+  tRef.current = t;
 /** Build real-time configuration for the current voice connection using resolved model defaults. */
   const realtimeSessionConfig = useCallback(
     (sessionId: string) => {
@@ -135,7 +137,7 @@ function useChatDomain() {
         return;
       setError(null);
       if (!isValidMaxTokens(inferenceRef.current.sampling.max_tokens)) {
-        throw new Error(trRef.current('最大输出 token 数必须是正整数。', 'Maximum output tokens must be a positive integer.'));
+        throw new Error(tRef.current('chat:chatProvider.maximumOutputTokensMustBeAPositiveInteger'));
       }
       if (optimistic)
         setMessages((current) => [
@@ -296,11 +298,8 @@ function useChatDomain() {
   const deleteConversation = useCallback(async (id: string) => {
     const session = conversation.sessions.find((item) => item.id === id);
     if (!session || busy || recoveryNeeded) return;
-    const title = session.title || trRef.current('未命名会话', 'Untitled chat');
-    if (!(await studioConfirm(trRef.current(
-      `删除对话“${title}”？此操作无法撤销。`,
-      `Delete "${title}"? This cannot be undone.`,
-    )))) return;
+    const title = session.title || tRef.current('common:untitledChat');
+    if (!(await studioConfirm(tRef.current('chat:chatProvider.deleteThisCannotBeUndone', { title: title })))) return;
     if (await conversation.deleteSession(id)) {
       await removeSessionVoiceHistory(id).catch((cause) => setError(errorMessage(cause)));
     }
@@ -311,7 +310,7 @@ function useChatDomain() {
       !active ||
       busy ||
       recoveryNeeded ||
-      !(await studioConfirm(trRef.current('清空当前对话？', 'Clear this conversation?')))
+      !(await studioConfirm(tRef.current('chat:chatProvider.clearThisConversation')))
     )
       return;
     setBusy(true);

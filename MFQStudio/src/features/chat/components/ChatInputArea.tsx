@@ -1,6 +1,6 @@
 /** Compose the existing editor, scroll controls, and voice-component installation prompt in the chat input area. */
+import { useTranslation } from 'react-i18next';
 import { ArrowDownIcon } from '@phosphor-icons/react';
-import { useSettings } from '../../settings/SettingsProvider';
 import { useJobStore } from '../../../stores/jobStore';
 import { formatNumber, errorMessage } from '../../../app/formatters';
 import { ChatComposer } from './ChatComposer';
@@ -8,7 +8,7 @@ import { ChatToolbar } from './ChatToolbar';
 import type { ChatPageState } from '../hooks/useChatPageState';
 /** Display input and installation state while leaving send actions to the chat domain. */
 export function ChatInputArea({ page }: { page: ChatPageState }) {
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const { chat, active, activeId, scroll } = page;
   const {
     conversation, inference, generation, generationPhase, busy, recoveryNeeded,
@@ -30,8 +30,8 @@ export function ChatInputArea({ page }: { page: ChatPageState }) {
         <button
           className="chat-scroll-bottom"
           onClick={scroll.scrollToBottom}
-          aria-label={tr('回到底部', 'Scroll to bottom')}
-          title={tr('回到底部', 'Scroll to bottom')}
+          aria-label={t('chat:chatInputArea.scrollToBottom')}
+          title={t('chat:chatInputArea.scrollToBottom')}
           type="button"
         >
           <ArrowDownIcon size={16} aria-hidden="true" />
@@ -41,15 +41,13 @@ export function ChatInputArea({ page }: { page: ChatPageState }) {
         <div className="voice-component-banner">
           <div>
             <strong>{voiceComponent.ready
-              ? tr('语音组件已下载', 'Voice component downloaded')
-              : tr('此模型还缺少语音输出组件', 'This model needs the voice output component')}</strong>
+              ? t('chat:chatInputArea.voiceComponentDownloaded')
+              : t('chat:chatInputArea.thisModelNeedsTheVoiceOutputComponent')}</strong>
             <span>{voiceComponentJob
-              ? tr(`正在下载并校验 · ${formatNumber(voiceComponentJob.progress * 100)}%`,
-                `Downloading and verifying · ${formatNumber(voiceComponentJob.progress * 100)}%`)
+              ? t('chat:chatInputArea.downloadingAndVerifying', { progress: formatNumber(voiceComponentJob.progress * 100) })
               : voiceComponent.error
                 ? voiceComponent.error
-                : tr('Token2Wav 独立安装，不会重复占用每个模型的空间。',
-                  'Token2Wav is installed once and shared by all compatible models.')}</span>
+                : t('chat:chatInputArea.token2wavIsInstalledOnceAndSharedByAllCompatibleModels')}</span>
           </div>
           {voiceComponentJob && <progress max={1} value={voiceComponentJob.progress} />}
           <button
@@ -58,11 +56,10 @@ export function ChatInputArea({ page }: { page: ChatPageState }) {
             type="button"
           >
             {voiceComponentJob
-              ? tr('正在下载…', 'Downloading…')
+              ? t('chat:chatInputArea.downloading')
               : voiceComponent.ready
-                ? tr('启用语音输出', 'Enable voice output')
-                : tr(`下载组件 · ${formatNumber(voiceComponent.total_bytes / 1e9, 2)} GB`,
-                  `Download · ${formatNumber(voiceComponent.total_bytes / 1e9, 2)} GB`)}
+                ? t('chat:chatInputArea.enableVoiceOutput')
+                : t('chat:chatInputArea.downloadGb', { size: formatNumber(voiceComponent.total_bytes / 1e9, 2) })}
           </button>
         </div>
       )}
@@ -70,7 +67,7 @@ export function ChatInputArea({ page }: { page: ChatPageState }) {
         <div className="error-banner" role="alert">
           <span>{conversation.error}</span>
           <button
-            aria-label={tr('关闭错误提示', 'Dismiss error')}
+            aria-label={t('chat:chatInputArea.dismissError')}
             onClick={() => conversation.setError(null)}
             type="button"
           >
@@ -85,19 +82,18 @@ export function ChatInputArea({ page }: { page: ChatPageState }) {
         recoveryNeeded={recoveryNeeded}
         phase={generationPhase}
         placeholder={conversation.conversationReady
-          ? tr('向模型发送消息', 'Message MFQ')
+          ? t('chat:chatInputArea.messageMfq')
           : conversation.modelAvailable
-            ? tr('正在加载会话', 'Loading conversation')
-            : tr('请先加载模型', 'Load a model first')}
+            ? t('chat:chatInputArea.loadingConversation')
+            : t('chat:chatInputArea.loadAModelFirst')}
         attachmentAccept={inference.attachmentAccept}
-        tr={tr}
+        t={t}
         onSend={send}
         onStop={generation.stop}
         onError={(cause) => conversation.setError(errorMessage(cause))}
         toolbar={<ChatToolbar />}
       />
-      <p>{tr('模型输出可能存在错误，请核对重要信息。',
-        'Model output may be inaccurate. Verify important information.')}</p>
+      <p>{t('chat:chatInputArea.modelOutputMayBeInaccurateVerifyImportantInformation')}</p>
     </div>
   );
 }

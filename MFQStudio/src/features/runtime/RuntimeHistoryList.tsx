@@ -1,4 +1,5 @@
 /** Render accessible scrolling history with incremental loading, retry, and end-of-history feedback. */
+import type { TFunction } from 'i18next';
 import type { ReactNode } from 'react';
 import type { useRuntimeHistory } from './useRuntimeHistory';
 
@@ -8,13 +9,13 @@ export function RuntimeHistoryList<T extends { sequence: number }>({
   label,
   empty,
   renderEntry,
-  tr,
+  t,
 }: {
   history: ReturnType<typeof useRuntimeHistory<T>>;
   label: string;
   empty: string;
   renderEntry: (entry: T) => ReactNode;
-  tr: (zh: string, en: string) => string;
+  t: TFunction;
 }) {
   const { items, scrollerRef, onScroll, loading, error, liveError, hasMore, loadMore, keyOf } = history;
   return (
@@ -26,7 +27,7 @@ export function RuntimeHistoryList<T extends { sequence: number }>({
       aria-label={label}
       tabIndex={0}
     >
-      {liveError && <div role="status">{tr('实时连接已断开，正在重连…', 'Live connection lost. Reconnecting…')}</div>}
+      {liveError && <div role="status">{t('runtime:runtimeHistoryList.liveConnectionLostReconnecting')}</div>}
       {items.map((entry) => (
         <div key={keyOf(entry)} data-history-id={keyOf(entry)}>
           {renderEntry(entry)}
@@ -36,19 +37,19 @@ export function RuntimeHistoryList<T extends { sequence: number }>({
       <div className="runtime-history-footer">
         {error ? (
           <>
-            <span role="alert">{tr('历史记录加载失败', 'History could not be loaded')}</span>
+            <span role="alert">{t('runtime:runtimeHistoryList.historyCouldNotBeLoaded')}</span>
             <button type="button" onClick={() => void loadMore()}>
-              {tr('重试', 'Retry')}
+              {t('common:retry')}
             </button>
           </>
         ) : loading ? (
-          <span role="status">{tr('加载中…', 'Loading…')}</span>
+          <span role="status">{t('runtime:runtimeHistoryList.loading')}</span>
         ) : hasMore ? (
           <button type="button" onClick={() => void loadMore()}>
-            {tr('加载更早记录', 'Load older records')}
+            {t('runtime:runtimeHistoryList.loadOlderRecords')}
           </button>
         ) : items.length > 0 ? (
-          <span>{tr('没有更早记录了', 'No older records')}</span>
+          <span>{t('runtime:runtimeHistoryList.noOlderRecords')}</span>
         ) : null}
       </div>
     </div>

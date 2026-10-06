@@ -1,3 +1,5 @@
+/** Verify ModelLoadProgress behavior and integration contracts. */
+import { i18n } from '../../i18n';
 import { act, render, screen } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { ModelLoadProgress } from './ModelLoadProgress';
@@ -5,7 +7,7 @@ import { useJobStore } from '../../stores/jobStore';
 import type { JobResource } from '../../shared/api/types';
 
 vi.mock('../settings/SettingsProvider', () => ({
-  useSettings: () => ({ tr: (_zh: string, en: string) => en }),
+  useSettings: () => ({ t: i18n.getFixedT('en') }),
 }));
 
 beforeEach(() => useJobStore.setState({ jobs: [] }));

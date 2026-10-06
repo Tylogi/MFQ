@@ -4,13 +4,19 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useState,
   type Dispatch,
   type ReactNode,
   type SetStateAction,
 } from 'react';
-import { loadSettings, SETTINGS_KEY, type GenerationSettings } from './configuration';
+import {
+  loadSettings,
+  SETTINGS_KEY,
+  type GenerationSettings,
+} from './configuration';
+import { applyLanguage } from '../../i18n';
 
 interface SettingsContextValue {
   settings: GenerationSettings;
@@ -18,8 +24,6 @@ interface SettingsContextValue {
   updateSettings: (patch: Partial<GenerationSettings>) => void;
   /** Replace applied preferences with a complete settings object. */
   replaceSettings: Dispatch<SetStateAction<GenerationSettings>>;
-  tr: (zh: string, en: string) => string;
-  english: boolean;
   contextSize: number;
   /** Update the context capacity shared by model loading and reloads. */
   setContextSize: Dispatch<SetStateAction<number>>;
@@ -31,15 +35,18 @@ const SettingsContext = createContext<SettingsContextValue | null>(null);
 export function SettingsProvider({ children }: { children: ReactNode }) {
   const [settings, replaceSettings] = useState(loadSettings);
   const [contextSize, setContextSize] = useState(32768);
-  const english =
-    settings.language === 'en' ||
-    (settings.language === 'system' && !navigator.language.toLowerCase().startsWith('zh'));
-  const tr = useCallback((zh: string, en: string) => (english ? en : zh), [english]);
   const updateSettings = useCallback(
     (patch: Partial<GenerationSettings>) =>
       replaceSettings((current) => ({ ...current, ...patch })),
     [],
   );
+
+  useLayoutEffect(() => {
+    const synchronize = () => applyLanguage(settings.language);
+    synchronize();
+    window.addEventListener('languagechange', synchronize);
+    return () => window.removeEventListener('languagechange', synchronize);
+  }, [settings.language]);
 
   useEffect(() => {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
@@ -47,10 +54,20 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   }, [settings]);
 
   const value = useMemo(
-    () => ({ settings, replaceSettings, updateSettings, english, tr, contextSize, setContextSize }),
-    [settings, updateSettings, english, tr, contextSize],
+    () => ({
+      settings,
+      replaceSettings,
+      updateSettings,
+      contextSize,
+      setContextSize,
+    }),
+    [settings, updateSettings, contextSize],
   );
-  return <SettingsContext.Provider value={value}>{children}</SettingsContext.Provider>;
+  return (
+    <SettingsContext.Provider value={value}>
+      {children}
+    </SettingsContext.Provider>
+  );
 }
 
 /** Read shared application settings; must be called within SettingsProvider. */

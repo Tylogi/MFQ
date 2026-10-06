@@ -1,0 +1,71 @@
+{
+  "failurePage": {
+    "somethingWentWrongOnThisPageTryAgainOrReturnToThe": "Something went wrong on this page. Try again, or return to the overview.",
+    "workspaceDataIsUnavailableCheckTheServiceOrConnectionSettingsThenTry": "Workspace data is unavailable. Check the service or connection settings, then try again.",
+    "viewErrorDetails": "View error details",
+    "backToOverview": "Back to overview",
+    "connectionSettings": "Connection settings",
+    "retryPage": "Retry page",
+    "reconnect": "Reconnect",
+    "pageUnavailable": "Page unavailable",
+    "serviceUnavailable": "Service unavailable"
+  },
+  "labLayout": {
+    "modelDownloads": "Model downloads",
+    "findModelsAndPrecisionTiersForYourDevice": "Find models and precision tiers for your device.",
+    "evaluations": "Evaluations",
+    "manageEvaluationsAndCalibrationDatasets": "Manage evaluations and calibration datasets.",
+    "quantization": "Quantization",
+    "manageModelQuantizationFromCalibrationToExport": "Manage model quantization, from calibration to export."
+  },
+  "loadingPage": {
+    "loading": "Loading…"
+  },
+  "notFoundPage": {
+    "pageNotFound": "Page not found",
+    "thereIsNoPageAtThisAddressCheckTheUrlOrReturn": "There is no page at this address. Check the URL or return to the overview.",
+    "backToOverview": "Back to overview",
+    "goBack": "Go back"
+  },
+  "runtimeAlerts": {
+    "unableToConnectToTheService": "Unable to connect to the service",
+    "retryConnection": "Retry connection",
+    "runtimeStatusCouldNotBeUpdatedDataMayBeStale": "Runtime status could not be updated; data may be stale",
+    "refreshAgain": "Refresh again",
+    "taskProgressIsNotUpdating": "Task progress is not updating",
+    "reconnectTaskStreams": "Reconnect task streams"
+  },
+  "studioShell": {
+    "skipToMainContent": "Skip to main content"
+  },
+  "studioSidebar": {
+    "inference": "Inference",
+    "overview": "Overview",
+    "models": "Models",
+    "service": "Service",
+    "resources": "Resources",
+    "playground": "Playground",
+    "chat": "Chat",
+    "modelTools": "Model tools",
+    "modelDownloads": "Model downloads",
+    "evaluations": "Evaluations",
+    "quantization": "Quantization",
+    "system": "System",
+    "logs": "Logs",
+    "serverIdle": "Server idle",
+    "chooseAModelToBegin": "Choose a model to begin",
+    "modelLoading": "Model loading",
+    "activeRequests": "active requests",
+    "openSidebar": "Open sidebar",
+    "closeSidebar": "Close sidebar",
+    "modelsLoaded_one": "{{count}} model loaded",
+    "modelsLoaded_other": "{{count}} models loaded"
+  },
+  "main": {
+    "theInterfaceEncounteredAnUnexpectedProblemTheServiceMayStillBeRunning": "The interface encountered an unexpected problem. The service may still be running; reload to continue.",
+    "viewErrorDetails": "View error details",
+    "backToOverview": "Back to overview",
+    "reload": "Reload",
+    "interfaceUnavailable": "Interface unavailable"
+  }
+}

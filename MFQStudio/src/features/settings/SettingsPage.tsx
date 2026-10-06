@@ -1,4 +1,5 @@
 /** Render editable generation preferences, appearance controls, and archive actions. */
+import type { TFunction } from 'i18next';
 import type { Dispatch, ReactNode, SetStateAction } from 'react';
 import { SectionLabel, SettingRow, TMPanel } from '../../app/display';
 import { Switch } from '../../shared/ui/Switch';
@@ -14,7 +15,7 @@ export interface SettingsActions {
   saveSettings: () => void;
 }
 interface SettingsPageProps {
-  tr: (zh: string, en: string) => string;
+  t: TFunction;
   settingsDraft: GenerationSettings;
   setSettingsDraft: Dispatch<SetStateAction<GenerationSettings>>;
   mtpAvailable: boolean;
@@ -27,30 +28,27 @@ interface SettingsPageProps {
 }
 
 /** Display settings drafts; the route validates and applies changes. */
-export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable, presetManager, contextControls, busy, hasStudio, updateManager, actions }: SettingsPageProps) {
+export function SettingsPage({ t, settingsDraft, setSettingsDraft, mtpAvailable, presetManager, contextControls, busy, hasStudio, updateManager, actions }: SettingsPageProps) {
   const { setModelDefaultInheritance, applyPreset, exportStudioData, importStudioData, openServerPage, resetSettingsDraft, saveSettings } = actions;
   return (
     <div className="settings-page">
-      <SectionLabel title={tr("推理默认值", "Generation defaults")} />
+      <SectionLabel title={t('settings:settingsPage.generationDefaults')} />
       <TMPanel className="settings-page-panel settings-defaults-panel">
         <SettingRow
-          title={tr("使用模型或架构默认值", "Use model or architecture defaults")}
-          detail={tr(
-            "优先读取模型元数据，缺失参数由模型型号或架构默认值补齐。",
-            "Read model metadata first, then fill missing values from model or architecture defaults.",
-          )}
-          trailing={<Switch label={tr("使用模型或架构默认值", "Use model or architecture defaults")} checked={settingsDraft.inheritModelDefaults} onCheckedChange={setModelDefaultInheritance} />}
+          title={t('settings:settingsPage.useModelOrArchitectureDefaults')}
+          detail={t('settings:settingsPage.readModelMetadataFirstThenFillMissingValuesFromModelOrArchitecture')}
+          trailing={<Switch label={t('settings:settingsPage.useModelOrArchitectureDefaults')} checked={settingsDraft.inheritModelDefaults} onCheckedChange={setModelDefaultInheritance} />}
         />
         <SettingRow
-          title={tr("视觉输入", "Vision input")}
-          detail={tr("默认启用；关闭后图片和视频请求会被明确拒绝。", "On by default; when off, image and video requests are rejected explicitly.")}
-          trailing={<Switch label={tr("视觉输入", "Vision input")} checked={settingsDraft.enableVision} onCheckedChange={(checked) => setSettingsDraft((current) => ({ ...current, enableVision: checked, inheritModelDefaults: false }))} />}
+          title={t('settings:settingsPage.visionInput')}
+          detail={t('settings:settingsPage.onByDefaultWhenOffImageAndVideoRequestsAreRejectedExplicitly')}
+          trailing={<Switch label={t('settings:settingsPage.visionInput')} checked={settingsDraft.enableVision} onCheckedChange={(checked) => setSettingsDraft((current) => ({ ...current, enableVision: checked, inheritModelDefaults: false }))} />}
         />
         <SettingRow
           title="MTP"
           detail={mtpAvailable
-            ? tr("当前模型支持 MTP 投机解码。", "The current model supports MTP speculative decoding.")
-            : tr("当前模型无法使用 MTP，将使用普通 Decode。", "MTP is unavailable for the current model; ordinary Decode will be used.")}
+            ? t('settings:settingsPage.theCurrentModelSupportsMtpSpeculativeDecoding')
+            : t('settings:settingsPage.mtpIsUnavailableForTheCurrentModelOrdinaryDecodeWillBeUsed')}
           trailing={<Switch label="MTP" checked={mtpAvailable && settingsDraft.enableMtp} disabled={!mtpAvailable} onCheckedChange={(checked) => setSettingsDraft((current) => ({ ...current, enableMtp: checked, inheritModelDefaults: false }))} />}
         />
       </TMPanel>
@@ -58,45 +56,45 @@ export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable
       <fieldset className="settings-page-inherited" disabled={settingsDraft.inheritModelDefaults}>
         <div className="settings-page-grid">
           <div className="settings-page-section">
-            <SectionLabel title={tr("预设与提示词", "Presets and prompt")} />
+            <SectionLabel title={t('settings:settingsPage.presetsAndPrompt')} />
             <TMPanel className="settings-page-panel settings-form-panel">
               <div className="settings-control-block">
-                <label>{tr("生成预设", "Generation preset")}</label>
+                <label>{t('settings:settingsPage.generationPreset')}</label>
                 <div className="segmented">
                   {(["precise", "balanced", "creative"] as const).map((name) => (
                     <button aria-pressed={settingsDraft.preset === name} key={name} onClick={() => applyPreset(name)} type="button">
-                      {name === "precise" ? tr("精确", "Precise") : name === "balanced" ? tr("均衡", "Balanced") : tr("创意", "Creative")}
+                      {name === "precise" ? t('settings:settingsPage.precise') : name === "balanced" ? t('settings:settingsPage.balanced') : t('settings:settingsPage.creative')}
                     </button>
                   ))}
                 </div>
               </div>
               {presetManager}
               <div className="settings-control-block">
-                <label htmlFor="settings-system-prompt">{tr("系统提示词", "System prompt")}</label>
+                <label htmlFor="settings-system-prompt">{t('settings:settingsPage.systemPrompt')}</label>
                 <textarea id="settings-system-prompt" onChange={(event) => setSettingsDraft((current) => ({ ...current, systemPrompt: event.target.value }))} rows={5} value={settingsDraft.systemPrompt} />
               </div>
               <SettingRow
-                title={tr("排除历史思考", "Exclude reasoning history")}
-                detail={tr("后续请求不再发送已保存的思考内容。", "Do not send saved reasoning in later requests.")}
-                trailing={<Switch label={tr("排除历史思考", "Exclude reasoning history")} checked={settingsDraft.excludeReasoning} onCheckedChange={(checked) => setSettingsDraft((current) => ({ ...current, excludeReasoning: checked }))} />}
+                title={t('settings:settingsPage.excludeReasoningHistory')}
+                detail={t('settings:settingsPage.doNotSendSavedReasoningInLaterRequests')}
+                trailing={<Switch label={t('settings:settingsPage.excludeReasoningHistory')} checked={settingsDraft.excludeReasoning} onCheckedChange={(checked) => setSettingsDraft((current) => ({ ...current, excludeReasoning: checked }))} />}
               />
               <SettingRow
-                title={tr("最大生成 token 数", "Maximum output tokens")}
-                detail={tr("限制单次回答可生成的 token 数。", "Limit the number of tokens generated in one response.")}
-                trailing={<input aria-label={tr('最大生成 token 数', 'Maximum output tokens')} className="settings-number-input" min={1} step={1} onChange={(event) => setSettingsDraft((current) => ({ ...current, maxTokens: Number(event.target.value) }))} type="number" value={settingsDraft.maxTokens} />}
+                title={t('settings:settingsPage.maximumOutputTokens')}
+                detail={t('settings:settingsPage.limitTheNumberOfTokensGeneratedInOneResponse')}
+                trailing={<input aria-label={t('settings:settingsPage.maximumOutputTokens')} className="settings-number-input" min={1} step={1} onChange={(event) => setSettingsDraft((current) => ({ ...current, maxTokens: Number(event.target.value) }))} type="number" value={settingsDraft.maxTokens} />}
               />
             </TMPanel>
           </div>
 
           <div className="settings-page-section">
-            <SectionLabel title={tr("采样", "Sampling")} />
+            <SectionLabel title={t('settings:settingsPage.sampling')} />
             <TMPanel className="settings-page-panel settings-form-panel settings-sampling-panel">
               {([
-                [tr("温度", "Temperature"), "temperature", 0, 2, 0.05],
-                [tr("核采样概率", "Top P"), "topP", 0.05, 1, 0.05],
-                [tr("重复惩罚", "Repetition penalty"), "repetitionPenalty", 0.5, 2, 0.01],
-                [tr("存在惩罚", "Presence penalty"), "presencePenalty", -2, 2, 0.05],
-                [tr("频率惩罚", "Frequency penalty"), "frequencyPenalty", -2, 2, 0.05],
+                [t('settings:settingsPage.temperature'), "temperature", 0, 2, 0.05],
+                [t('settings:settingsPage.topP'), "topP", 0.05, 1, 0.05],
+                [t('settings:settingsPage.repetitionPenalty'), "repetitionPenalty", 0.5, 2, 0.01],
+                [t('settings:settingsPage.presencePenalty'), "presencePenalty", -2, 2, 0.05],
+                [t('settings:settingsPage.frequencyPenalty'), "frequencyPenalty", -2, 2, 0.05],
               ] as const).map(([label, key, min, max, step]) => (
                 <label className="settings-range" key={key}>
                   <span>{label}<output>{settingsDraft[key].toFixed(2)}</output></span>
@@ -104,8 +102,8 @@ export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable
                 </label>
               ))}
               <div className="settings-inline-fields">
-                <label><span>{tr("候选词数", "Top K")}</span><input max={1024} min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, topK: Number(event.target.value), preset: "custom" }))} type="number" value={settingsDraft.topK} /></label>
-                <label><span>{tr("随机种子", "Seed")}</span><input min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, seed: event.target.value ? Number(event.target.value) : null }))} placeholder={tr("随机", "Random")} type="number" value={settingsDraft.seed ?? ""} /></label>
+                <label><span>{t('settings:settingsPage.topK')}</span><input max={1024} min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, topK: Number(event.target.value), preset: "custom" }))} type="number" value={settingsDraft.topK} /></label>
+                <label><span>{t('settings:settingsPage.seed')}</span><input min={0} onChange={(event) => setSettingsDraft((current) => ({ ...current, seed: event.target.value ? Number(event.target.value) : null }))} placeholder={t('settings:settingsPage.random')} type="number" value={settingsDraft.seed ?? ""} /></label>
               </div>
             </TMPanel>
           </div>
@@ -114,42 +112,42 @@ export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable
 
       <div className="settings-page-grid">
         <div className="settings-page-section">
-          <SectionLabel title={tr("上下文", "Context")} />
+          <SectionLabel title={t('settings:settingsPage.context')} />
           <TMPanel className="settings-page-panel">
             {contextControls}
           </TMPanel>
         </div>
 
         <div className="settings-page-section">
-          <SectionLabel title={tr("外观", "Appearance")} />
+          <SectionLabel title={t('settings:settingsPage.appearance')} />
           <TMPanel className="settings-page-panel">
             <SettingRow
-              title={tr("界面语言", "Interface language")}
-              detail={tr("选择 MFQ Studio 的显示语言。", "Choose the display language for MFQ Studio.")}
-              trailing={<select aria-label={tr("界面语言", "Interface language")} onChange={(event) => setSettingsDraft((current) => ({ ...current, language: event.target.value as UiLanguage }))} value={settingsDraft.language}><option value="system">{tr("跟随系统", "System")}</option><option value="zh-CN">简体中文</option><option value="en">English</option></select>}
+              title={t('settings:settingsPage.interfaceLanguage')}
+              detail={t('settings:settingsPage.chooseTheDisplayLanguageForMfqStudio')}
+              trailing={<select aria-label={t('settings:settingsPage.interfaceLanguage')} onChange={(event) => setSettingsDraft((current) => ({ ...current, language: event.target.value as UiLanguage }))} value={settingsDraft.language}><option value="system">{t('settings:settingsPage.system')}</option><option value="zh-CN">简体中文</option><option value="en">English</option></select>}
             />
             <SettingRow
-              title={tr("主题", "Theme")}
-              detail={tr("跟随系统，或固定使用浅色或深色外观。", "Follow the system or use a fixed light or dark appearance.")}
-              trailing={<select aria-label={tr("主题", "Theme")} onChange={(event) => setSettingsDraft((current) => ({ ...current, theme: event.target.value as UiTheme }))} value={settingsDraft.theme}><option value="system">{tr("跟随系统", "System")}</option><option value="light">{tr("浅色", "Light")}</option><option value="dark">{tr("深色", "Dark")}</option></select>}
+              title={t('settings:settingsPage.theme')}
+              detail={t('settings:settingsPage.followTheSystemOrUseAFixedLightOrDarkAppearance')}
+              trailing={<select aria-label={t('settings:settingsPage.theme')} onChange={(event) => setSettingsDraft((current) => ({ ...current, theme: event.target.value as UiTheme }))} value={settingsDraft.theme}><option value="system">{t('settings:settingsPage.system')}</option><option value="light">{t('settings:settingsPage.light')}</option><option value="dark">{t('settings:settingsPage.dark')}</option></select>}
             />
           </TMPanel>
         </div>
       </div>
 
-      <SectionLabel title={tr("数据与连接", "Data and connection")} />
+      <SectionLabel title={t('settings:settingsPage.dataAndConnection')} />
       <TMPanel className="settings-page-panel settings-data-panel">
         <SettingRow
-          title={tr("本地设置数据", "Local settings data")}
-          detail={tr("导出或导入界面设置、生成预设和对话数据。", "Export or import interface settings, generation presets, and conversation data.")}
-          trailing={<div className="portable-actions"><button onClick={exportStudioData} type="button">{tr("导出", "Export")}</button><label>{tr("导入", "Import")}<input accept="application/json,.json" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importStudioData(file); event.target.value = ""; }} type="file" /></label></div>}
+          title={t('settings:settingsPage.localSettingsData')}
+          detail={t('settings:settingsPage.exportOrImportInterfaceSettingsGenerationPresetsAndConversationData')}
+          trailing={<div className="portable-actions"><button onClick={exportStudioData} type="button">{t('settings:settingsPage.export')}</button><label>{t('settings:settingsPage.import')}<input accept="application/json,.json" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importStudioData(file); event.target.value = ""; }} type="file" /></label></div>}
         />
-        {hasStudio && <SettingRow title={tr("服务器连接", "Server connection")} detail={tr("配置本地或远程 MFQ Server。", "Configure a local or remote MFQ Server.")} trailing={<button className="secondary" onClick={openServerPage} type="button">{tr("打开服务器设置", "Open server settings")}</button>} />}
+        {hasStudio && <SettingRow title={t('settings:settingsPage.serverConnection')} detail={t('settings:settingsPage.configureALocalOrRemoteMfqServer')} trailing={<button className="secondary" onClick={openServerPage} type="button">{t('settings:settingsPage.openServerSettings')}</button>} />}
       </TMPanel>
 
       {updateManager && (
         <>
-          <SectionLabel title={tr('版本', 'Version')} />
+          <SectionLabel title={t('settings:settingsPage.version')} />
           <TMPanel className="settings-page-panel settings-update-panel">
             {updateManager}
           </TMPanel>
@@ -157,8 +155,8 @@ export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable
       )}
 
       <div className="settings-page-actions">
-        <button onClick={resetSettingsDraft} type="button">{tr("恢复默认", "Reset")}</button>
-        <button className="primary" onClick={saveSettings} type="button">{tr("应用设置", "Apply settings")}</button>
+        <button onClick={resetSettingsDraft} type="button">{t('settings:settingsPage.reset')}</button>
+        <button className="primary" onClick={saveSettings} type="button">{t('settings:settingsPage.applySettings')}</button>
       </div>
     </div>
   );

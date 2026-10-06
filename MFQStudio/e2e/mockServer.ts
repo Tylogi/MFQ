@@ -81,6 +81,8 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
   let failedSync = false;
   let releasePending: (() => void) | undefined;
   await page.addInitScript(() => {
+    // Seed a fresh browser context without overwriting preferences on reload.
+    if (localStorage.getItem('mfq.studio.generation.v1')) return;
     localStorage.setItem(
       'mfq.studio.generation.v1',
       JSON.stringify({ language: 'en', theme: 'light' }),
