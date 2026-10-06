@@ -1,4 +1,4 @@
-/** 管理生成预设的本地校验、设置快照及服务资源转换。 */
+/** Manage local validation, settings snapshots, and server resource conversion for generation presets. */
 import { GenerationPresetResource, SessionMode } from '../../shared/api/types';
 import { GenerationSettings, DEFAULT_SETTINGS } from './configuration';
 
@@ -34,7 +34,7 @@ export interface StoredPreset {
 
 export const STORED_PRESETS_KEY = "mfq.studio.presets.v1";
 
-/** 截取可持久化的推理参数，不包含界面偏好。 */
+/** Extract persistable inference parameters, excluding interface preferences. */
 export function presetSnapshot(settings: GenerationSettings): StoredPresetSettings {
   return {
     systemPrompt: settings.systemPrompt,
@@ -54,7 +54,7 @@ export function presetSnapshot(settings: GenerationSettings): StoredPresetSettin
   };
 }
 
-/** 读取并校验本地生成预设，丢弃无效条目并限制历史数量。 */
+/** Read and validate local generation presets, discarding invalid entries and limiting history size. */
 export function loadStoredPresets(): StoredPreset[] {
   try {
     const decoded = JSON.parse(localStorage.getItem(STORED_PRESETS_KEY) || "[]");
@@ -133,7 +133,7 @@ export function loadStoredPresets(): StoredPreset[] {
   }
 }
 
-/** 将服务端生成预设转换为界面使用的设置模型。 */
+/** Convert a server generation preset to the settings model used by the interface. */
 export function storedPresetFromResource(preset: GenerationPresetResource): StoredPreset {
   const sampling = preset.settings.sampling;
   return {
@@ -167,7 +167,7 @@ export function storedPresetFromResource(preset: GenerationPresetResource): Stor
   };
 }
 
-/** 将本地预设转换为创建或更新服务端资源的请求体。 */
+/** Convert a local preset into a request body for creating or updating a server resource. */
 export function presetResourceBody(
   preset: StoredPreset,
   fallbackModel: string,

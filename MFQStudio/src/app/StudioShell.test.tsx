@@ -1,4 +1,5 @@
-/** 验证外壳在已就绪和可直达页面展示持续故障与正确重试入口。 */
+/** Verify persistent failures and correct retry actions on ready and directly accessible pages. */
+import { i18n } from '../i18n';
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -8,10 +9,9 @@ import { NotFoundPage } from './NotFoundPage';
 
 vi.mock('./RuntimeProvider', () => ({ useRuntime: vi.fn() }));
 vi.mock('../features/settings/SettingsProvider', () => ({
-  useSettings: () => ({ tr: (chinese: string) => chinese }),
+  useSettings: () => ({ t: i18n.getFixedT('en') }),
 }));
-
-/** 挂载可直达路由，模拟各类共享运行时状态。 */
+/** Mount directly accessible routes and mock shared runtime states. */
 function renderShell(overrides: Partial<ReturnType<typeof useRuntime>>, path = '/settings') {
   const runtime = {
     runtime: null,
@@ -45,18 +45,18 @@ function renderShell(overrides: Partial<ReturnType<typeof useRuntime>>, path = '
   return runtime;
 }
 
-describe('StudioShell 持久运行时告警', () => {
+describe('describes StudioShell test behavior 1', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('未就绪时设置页仍可打开，显示连接故障和重试', () => {
+  it('verifies StudioShell test behavior 2', () => {
     const runtime = renderShell({ ready: false, connectionError: 'server offline' });
     expect(screen.getByText('Settings content')).toBeTruthy();
     expect(within(screen.getByRole('alert')).getByText('server offline')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: '重试连接' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Retry connection' }));
     expect(runtime.reloadService).toHaveBeenCalledOnce();
   });
 
-  it('运行时刷新与任务流错误分开展示，并分别重试', () => {
+  it('verifies StudioShell test behavior 3', () => {
     const runtime = renderShell({
       refreshError: 'refresh offline',
       jobStreamErrors: { 'job-1': 'stream offline' },
@@ -64,40 +64,40 @@ describe('StudioShell 持久运行时告警', () => {
     expect(screen.getAllByRole('alert')).toHaveLength(2);
     expect(screen.getByText('refresh offline')).toBeTruthy();
     expect(screen.getByText('job-1: stream offline')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: '重新刷新' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh again' }));
     expect(runtime.refreshRuntime).toHaveBeenCalledWith(false);
-    fireEvent.click(screen.getByRole('button', { name: '重新连接任务流' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Reconnect task streams' }));
     expect(runtime.retryJobStreams).toHaveBeenCalledOnce();
   });
 
-  it('未就绪的业务页面显示独立断连页，允许重试或打开连接设置', () => {
+  it('verifies StudioShell test behavior 4', () => {
     const runtime = renderShell({ ready: false, connectionError: 'server offline' }, '/chat');
-    expect(screen.getByRole('heading', { name: '服务暂时无法连接' })).toBeTruthy();
+    expect(screen.getByRole('heading', { name: 'Service unavailable' })).toBeTruthy();
     expect(screen.queryByText('Chat content')).toBeNull();
-    fireEvent.click(screen.getByText('查看错误详情'));
+    fireEvent.click(screen.getByText('View error details'));
     expect(screen.getByText('server offline')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: '重新连接' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }));
     expect(runtime.reloadService).toHaveBeenCalledOnce();
-    fireEvent.click(screen.getByRole('button', { name: '连接设置' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Connection settings' }));
     expect(screen.getByText('Connection settings content')).toBeTruthy();
   });
 
-  it('首次连接中只显示等待状态，不误报失败', () => {
+  it('verifies StudioShell test behavior 5', () => {
     renderShell({ ready: false }, '/chat');
-    expect(screen.getByRole('status')).toHaveTextContent('正在加载中');
-    expect(screen.getByRole('heading', { name: '正在加载中' })).toBeTruthy();
-    expect(screen.queryByRole('heading', { name: '服务暂时无法连接' })).toBeNull();
+    expect(screen.getByRole('status')).toHaveTextContent('Loading…');
+    expect(screen.getByRole('heading', { name: 'Loading…' })).toBeTruthy();
+    expect(screen.queryByRole('heading', { name: 'Service unavailable' })).toBeNull();
   });
 
-  it('未知地址即使服务未就绪也显示 404，返回概览后显示连接状态', () => {
+  it('verifies StudioShell test behavior 6', () => {
     renderShell({ ready: false, connectionError: 'server offline' }, '/missing');
-    expect(screen.getByRole('heading', { name: '页面不存在' })).toBeTruthy();
-    expect(screen.queryByRole('heading', { name: '服务暂时无法连接' })).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: '返回概览' }));
-    expect(screen.getByRole('heading', { name: '服务暂时无法连接' })).toBeTruthy();
+    expect(screen.getByRole('heading', { name: 'Page not found' })).toBeTruthy();
+    expect(screen.queryByRole('heading', { name: 'Service unavailable' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Back to overview' }));
+    expect(screen.getByRole('heading', { name: 'Service unavailable' })).toBeTruthy();
   });
 
-  it('页面渲染异常显示独立故障页并允许返回概览', () => {
+  it('verifies StudioShell test behavior 7', () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
     function CrashingPage(): never {
       throw new Error('page render failed');
@@ -117,11 +117,11 @@ describe('StudioShell 持久运行时告警', () => {
         </Routes>
       </MemoryRouter>,
     );
-    expect(screen.getByRole('heading', { name: '页面暂时无法显示' })).toBeTruthy();
-    fireEvent.click(screen.getByText('查看错误详情'));
+    expect(screen.getByRole('heading', { name: 'Page unavailable' })).toBeTruthy();
+    fireEvent.click(screen.getByText('View error details'));
     expect(screen.getByText('page render failed')).toBeTruthy();
-    expect(screen.getByRole('button', { name: '重试页面' })).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: '返回概览' }));
+    expect(screen.getByRole('button', { name: 'Retry page' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Back to overview' }));
     expect(screen.getByText('Overview content')).toBeTruthy();
     vi.restoreAllMocks();
   });

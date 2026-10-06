@@ -1,7 +1,9 @@
 /**
- * 单条通知项组件，支持无障碍语义、不同状态图标、倒计时及悬停暂停。
+ * Individual notification item supporting accessible semantics, status icons, countdown, and pause-on-hover.
  */
 import { useEffect, useRef } from 'react';
+import { useTranslation } from 'react-i18next';
+import { displayMessage } from '../../i18n/messages';
 import {
   CheckCircleIcon,
   InfoIcon,
@@ -12,25 +14,26 @@ import {
 import type { ToastItemData } from '../../stores/toastStore';
 
 export interface ToastItemProps {
-  /** 当前展示的通知数据。 */
+  /** Notification data currently being displayed. */
   toast: ToastItemData;
-  /** 关闭该条通知的回调。 */
+  /** Callback to close this notification. */
   onDismiss: (id: string, revision?: number) => void;
 }
 
 /**
- * 渲染单个 Toast 通知浮层，带进入动效与无障碍属性。
+ * Render a single Toast notification with an entrance animation and accessibility attributes.
  *
- * @param props 组件属性
+ * @param props Component properties
  */
 export function ToastItem({ toast, onDismiss }: ToastItemProps) {
+  const { t } = useTranslation();
   const { id, revision, type, message, title, duration } = toast;
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const remainingTimeRef = useRef<number>(duration ?? 0);
   const startTimeRef = useRef<number>(Date.now());
   const hoveredRef = useRef(false);
 
-  /** 启动自动销毁定时器。 */
+  /** Start the auto-dismiss timer. */
   const startTimer = () => {
     if (!duration || duration <= 0) return;
     startTimeRef.current = Date.now();
@@ -39,7 +42,7 @@ export function ToastItem({ toast, onDismiss }: ToastItemProps) {
     }, remainingTimeRef.current);
   };
 
-  /** 清理定时器。 */
+  /** Clear the timer. */
   const clearTimer = () => {
     if (timerRef.current) {
       clearTimeout(timerRef.current);
@@ -53,7 +56,7 @@ export function ToastItem({ toast, onDismiss }: ToastItemProps) {
     return () => clearTimer();
   }, [id, revision, duration, onDismiss]);
 
-  /** 鼠标移入时暂停倒计时。 */
+  /** Pause the countdown when the pointer enters. */
   const handleMouseEnter = () => {
     if (hoveredRef.current) return;
     hoveredRef.current = true;
@@ -63,7 +66,7 @@ export function ToastItem({ toast, onDismiss }: ToastItemProps) {
     remainingTimeRef.current = Math.max(remainingTimeRef.current - elapsed, 1000);
   };
 
-  /** 鼠标移出时恢复倒计时。 */
+  /** Resume the countdown when the pointer leaves. */
   const handleMouseLeave = () => {
     hoveredRef.current = false;
     if (!duration || duration <= 0) return;
@@ -86,14 +89,14 @@ export function ToastItem({ toast, onDismiss }: ToastItemProps) {
         {type === 'info' && <InfoIcon size={18} weight="fill" />}
       </div>
       <div className="studio-toast-content">
-        {title && <div className="studio-toast-title">{title}</div>}
-        <div className="studio-toast-message">{message}</div>
+        {title && <div className="studio-toast-title">{displayMessage(title, t)}</div>}
+        <div className="studio-toast-message">{displayMessage(message, t)}</div>
       </div>
       <button
         type="button"
         className="studio-toast-close"
         onClick={() => onDismiss(id, revision)}
-        aria-label="关闭通知"
+        aria-label={t('common:dismissNotification')}
       >
         <XIcon size={14} aria-hidden="true" />
       </button>

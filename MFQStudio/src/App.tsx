@@ -1,4 +1,4 @@
-/** 组合应用级 Provider 与业务路由，页面状态和请求由对应领域拥有。 */
+/** Compose application-level providers and business routes; each domain owns its page state and requests. */
 import { lazy, Suspense } from 'react';
 import { Route, Routes } from 'react-router';
 import { SettingsProvider } from './features/settings/SettingsProvider';
@@ -9,6 +9,7 @@ import { StudioShell } from './app/StudioShell';
 import { LabLayout } from './app/LabLayout';
 import { LoadingPage } from './app/LoadingPage';
 import { NotFoundPage } from './app/NotFoundPage';
+import { ComingSoonPage } from './app/ComingSoonPage';
 import './shared/ui/primitives.css';
 
 const ChatPage = lazy(() =>
@@ -47,8 +48,7 @@ const QuantizationPage = lazy(() =>
     default: module.QuantizationPage,
   })),
 );
-
-/** 挂载共享服务与独立业务页面，未知地址显示 404。 */
+/** Mount shared services and independent business pages, showing 404 for unknown paths. */
 export default function App() {
   return (
     <SettingsProvider>
@@ -65,6 +65,7 @@ export default function App() {
                   <Route path="resources" element={<CachePage />} />
                   <Route path="logs" element={<LogsPage />} />
                   <Route path="settings" element={<SettingsRoute />} />
+                  <Route path="quantization/coming-soon" element={<ComingSoonPage />} />
                   <Route element={<LabLayout />}>
                     <Route path="model-hub" element={<ModelHubPage />} />
                     <Route path="evaluations" element={<EvaluationsPage />} />

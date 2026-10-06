@@ -1,22 +1,22 @@
-/** 提供沿用 Studio 样式的受控模态弹窗和外部触发器焦点恢复。 */
+/** Provide a controlled modal using Studio styles and restore focus to its external trigger. */
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import { XIcon } from '@phosphor-icons/react';
 import { useRef, type ReactNode, type RefObject } from 'react';
 
 interface DialogProps {
   open: boolean;
-  /** 用户按 Esc、点击遮罩或关闭按钮时通知父级更新受控状态。 */
+  /** Notify the parent to update controlled state when the user presses Esc or clicks the backdrop or close button. */
   onOpenChange: (open: boolean) => void;
   title: string;
   description?: string;
   closeLabel: string;
   className?: string;
   children: ReactNode;
-  /** 异步打开弹窗时可显式记录触发按钮，关闭后恢复键盘焦点。 */
+  /** Optionally record the trigger when opening asynchronously to restore keyboard focus on close. */
   returnFocusRef?: RefObject<HTMLElement | null>;
 }
 
-/** 渲染带标题关联、焦点约束和关闭恢复的弹窗；内容沿用现有布局类。 */
+/** Render a dialog with title association, focus trapping, and focus restoration; content reuses existing layout classes. */
 export function Dialog({
   open,
   onOpenChange,

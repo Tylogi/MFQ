@@ -1,3 +1,6 @@
+/** Manage desktop update checks, cached versions, and installation actions. */
+import { i18n } from '../../i18n';
+import type { TFunction } from 'i18next';
 import {
   createContext,
   useCallback,
@@ -25,7 +28,7 @@ import {
   studioUpdateStatus,
 } from '../../shared/platform/studio';
 
-type Translate = (chinese: string, english: string) => string;
+type Translate = TFunction;
 
 function formatBytes(value: number): string {
   if (!value) return "—";
@@ -43,19 +46,20 @@ function olderThan(left: string, right: string): boolean {
   return false;
 }
 
-function progressLabel(progress: StudioUpdateProgress, tr: Translate): string {
-  if (progress.stage === "preparing") return tr("校验并准备中…", "Verifying & preparing…");
-  if (progress.total_bytes <= 0) return tr("下载中…", "Downloading…");
+function progressLabel(progress: StudioUpdateProgress, t: Translate): string {
+  if (progress.stage === "preparing") return t('settings:updateManager.verifyingPreparing');
+  if (progress.total_bytes <= 0) return t('settings:updateManager.downloading');
   const percent = Math.min(100, Math.round((progress.received_bytes / progress.total_bytes) * 100));
   return `${percent}% · ${formatBytes(progress.received_bytes)} / ${formatBytes(progress.total_bytes)}`;
 }
 
-function progressButtonLabel(progress: StudioUpdateProgress | null, tr: Translate): string {
-  if (!progress || progress.total_bytes <= 0) return tr("下载中…", "Downloading…");
-  if (progress.stage === "preparing") return tr("准备中…", "Preparing…");
+function progressButtonLabel(progress: StudioUpdateProgress | null, t: Translate): string {
+  if (!progress || progress.total_bytes <= 0) return t('settings:updateManager.downloading');
+  if (progress.stage === "preparing") return t('settings:updateManager.preparing');
   return `${Math.min(100, Math.round((progress.received_bytes / progress.total_bytes) * 100))}%`;
 }
 
+/** Track desktop update status and expose download, installation, and removal actions. */
 export function useStudioUpdates(onError: (message: string) => void) {
   const [status, setStatus] = useState<StudioUpdateStatus | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -117,11 +121,8 @@ export function useStudioUpdates(onError: (message: string) => void) {
     }
   }
 
-  async function install(version: string, tr: Translate) {
-    const confirmed = await studioConfirm(tr(
-      `切换到 MFQ Studio ${version}？应用会保留当前版本并重启，本地 MFQ Server 也会随之重启。`,
-      `Switch to MFQ Studio ${version}? The current version will be retained, and the app and managed local MFQ Server will restart.`,
-    ));
+  async function install(version: string, t: Translate) {
+    const confirmed = await studioConfirm(t('settings:updateManager.switchToMfqStudioTheCurrentVersionWillBeRetainedAndThe', { version: version }));
     if (!confirmed) return;
     setBusy(`install:${version}`);
     try {
@@ -132,11 +133,8 @@ export function useStudioUpdates(onError: (message: string) => void) {
     }
   }
 
-  async function remove(version: string, tr: Translate) {
-    const confirmed = await studioConfirm(tr(
-      `移除已缓存的 MFQ Studio ${version}？`,
-      `Remove the cached MFQ Studio ${version}?`,
-    ));
+  async function remove(version: string, t: Translate) {
+    const confirmed = await studioConfirm(t('settings:updateManager.removeTheCachedMfqStudio', { version: version }));
     if (!confirmed) return;
     setBusy(`delete:${version}`);
     try {
@@ -166,7 +164,7 @@ const unavailableStudioUpdates: StudioUpdates = {
 
 const StudioUpdatesContext = createContext<StudioUpdates>(unavailableStudioUpdates);
 
-/** 在应用生命周期内只维护一份更新检查、下载进度和版本缓存状态。 */
+/** Maintain a single shared state for update checks, download progress, and cached versions throughout the app lifecycle. */
 export function StudioUpdateProvider({ children }: { children: ReactNode }) {
   const reportError = useCallback((message: string) => {
     toast.error(message);
@@ -179,25 +177,27 @@ export function StudioUpdateProvider({ children }: { children: ReactNode }) {
   );
 }
 
-/** 读取全局 Studio 更新状态；调用方必须位于 StudioUpdateProvider 内。 */
+/** Read shared Studio update state; callers must be within StudioUpdateProvider. */
 export function useStudioUpdateContext(): StudioUpdates {
   return useContext(StudioUpdatesContext);
 }
 
-export function UpdateAvailableBanner({ onOpen, status, tr }: {
+/** Open update settings when a newer desktop release is available. */
+export function UpdateAvailableBanner({ onOpen, status, t }: {
   onOpen(): void;
   status: StudioUpdateStatus | null;
-  tr: Translate;
+  t: Translate;
 }) {
   if (!status?.update_available || !status.latest) return null;
   return (
     <button className="update-available-banner" onClick={onOpen} type="button">
       <span>↑</span>
-      <div><strong>{tr(`MFQ Studio ${status.latest.version} 可用`, `MFQ Studio ${status.latest.version} is available`)}</strong><small>{tr("查看更新与版本管理", "View update and version options")}</small></div>
+      <div><strong>{t('settings:updateManager.mfqStudioIsAvailable', { version: status.latest.version })}</strong><small>{t('settings:updateManager.viewUpdateAndVersionOptions')}</small></div>
     </button>
   );
 }
 
+/** Manage desktop update checks, cached versions, and installation actions. */
 export function UpdateManager({
   busy,
   download,
@@ -207,8 +207,8 @@ export function UpdateManager({
   remove,
   setAutomatic,
   status,
-  tr,
-}: ReturnType<typeof useStudioUpdates> & { tr: Translate }) {
+  t,
+}: ReturnType<typeof useStudioUpdates> & { t: Translate }) {
   const installed = useMemo(
     () => new Set(status?.installed_versions.filter((item) => item.ready).map((item) => item.version) ?? []),
     [status],
@@ -217,41 +217,41 @@ export function UpdateManager({
   return (
     <section className="update-manager">
       <div className="update-manager-heading">
-        <div><h3>{tr("应用更新", "Application updates")}</h3><p>{tr("自动检查 GitHub Release；安装前校验摘要并保留当前版本。", "Check GitHub Releases automatically; verify downloads and retain the current version before installation.")}</p></div>
-        <button disabled={busy !== null} onClick={() => void refresh()} type="button">{busy === "check" ? tr("检查中", "Checking") : tr("检查更新", "Check now")}</button>
+        <div><h3>{t('settings:updateManager.applicationUpdates')}</h3><p>{t('settings:updateManager.checkGithubReleasesAutomaticallyVerifyDownloadsAndRetainTheCurrentVersionBefore')}</p></div>
+        <button disabled={busy !== null} onClick={() => void refresh()} type="button">{busy === "check" ? t('settings:updateManager.checking') : t('settings:updateManager.checkNow')}</button>
       </div>
       {status ? (
         <>
           <div className="update-current-row">
-            <div><span>{tr("当前版本", "Current version")}</span><strong>MFQ Studio {status.current_version}</strong><small>{status.checked_at_epoch_seconds ? tr(`上次检查 ${new Date(status.checked_at_epoch_seconds * 1000).toLocaleString()}`, `Last checked ${new Date(status.checked_at_epoch_seconds * 1000).toLocaleString()}`) : tr("尚未检查", "Not checked yet")}</small></div>
-            <label><span>{tr("自动检查并提醒", "Automatically check and notify")}</span><input checked={status.automatic_check} disabled={busy !== null} onChange={(event) => void setAutomatic(event.target.checked)} type="checkbox" /></label>
+            <div><span>{t('settings:updateManager.currentVersion')}</span><strong>MFQ Studio {status.current_version}</strong><small>{status.checked_at_epoch_seconds ? t('settings:updateManager.lastChecked', { date: new Date(status.checked_at_epoch_seconds * 1000).toLocaleString(i18n.resolvedLanguage) }) : t('settings:updateManager.notCheckedYet')}</small></div>
+            <label><span>{t('settings:updateManager.automaticallyCheckAndNotify')}</span><input checked={status.automatic_check} disabled={busy !== null} onChange={(event) => void setAutomatic(event.target.checked)} type="checkbox" /></label>
           </div>
           {status.error && <p className="update-error">{status.error}</p>}
-          {!status.platform_supported && <p className="update-error">{tr("当前平台只能查看 Release，暂不支持应用内安装。", "This platform can browse releases but does not support in-app installation yet.")}</p>}
+          {!status.platform_supported && <p className="update-error">{t('settings:updateManager.thisPlatformCanBrowseReleasesButDoesNotSupportInAppInstallation')}</p>}
           <div className="update-manager-grid">
             <div>
-              <h4>{tr("可用版本", "Available releases")}</h4>
+              <h4>{t('settings:updateManager.availableReleases')}</h4>
               <div className="release-version-list">
                 {status.releases.map((release) => {
                   const ready = installed.has(release.version);
                   const current = release.version === status.current_version;
                   const active = busy === `download:${release.tag}` || busy === `install:${release.version}`;
                   const releaseProgress = progress?.tag === release.tag ? progress : null;
-                  return <div className={status.latest?.tag === release.tag ? "latest" : ""} key={release.tag}><div><strong>{release.version}{status.latest?.tag === release.tag ? ` · ${tr("最新", "Latest")}` : ""}</strong><small>{releaseProgress ? progressLabel(releaseProgress, tr) : `${release.name} · ${formatBytes(release.asset.byte_size)}`}</small>{releaseProgress && <progress aria-label={tr("更新下载进度", "Update download progress")} max={Math.max(1, releaseProgress.total_bytes)} value={releaseProgress.received_bytes} />}</div>{current ? <span>{tr("当前", "Current")}</span> : ready ? <button disabled={busy !== null || !status.platform_supported} onClick={() => void install(release.version, tr)} type="button">{active ? tr("准备中", "Preparing") : olderThan(release.version, status.current_version) ? tr("回退", "Roll back") : tr("安装并重启", "Install & restart")}</button> : <button disabled={busy !== null || !status.platform_supported} onClick={() => void download(release.tag)} type="button">{active ? progressButtonLabel(releaseProgress, tr) : tr("下载", "Download")}</button>}</div>;
+                  return <div className={status.latest?.tag === release.tag ? "latest" : ""} key={release.tag}><div><strong>{release.version}{status.latest?.tag === release.tag ? ` · ${t('settings:updateManager.latest')}` : ""}</strong><small>{releaseProgress ? progressLabel(releaseProgress, t) : `${release.name} · ${formatBytes(release.asset.byte_size)}`}</small>{releaseProgress && <progress aria-label={t('settings:updateManager.updateDownloadProgress')} max={Math.max(1, releaseProgress.total_bytes)} value={releaseProgress.received_bytes} />}</div>{current ? <span>{t('settings:updateManager.current')}</span> : ready ? <button disabled={busy !== null || !status.platform_supported} onClick={() => void install(release.version, t)} type="button">{active ? t('settings:updateManager.preparing2') : olderThan(release.version, status.current_version) ? t('settings:updateManager.rollBack') : t('settings:updateManager.installRestart')}</button> : <button disabled={busy !== null || !status.platform_supported} onClick={() => void download(release.tag)} type="button">{active ? progressButtonLabel(releaseProgress, t) : t('settings:updateManager.download')}</button>}</div>;
                 })}
-                {!status.releases.length && <div className="update-empty">{tr("没有缓存的 Release 信息。", "No release metadata is cached.")}</div>}
+                {!status.releases.length && <div className="update-empty">{t('settings:updateManager.noReleaseMetadataIsCached')}</div>}
               </div>
             </div>
             <div>
-              <h4>{tr("本地版本", "Local versions")}</h4>
+              <h4>{t('settings:updateManager.localVersions')}</h4>
               <div className="installed-version-list">
-                {status.installed_versions.map((version) => <div key={`${version.version}:${version.current}`}><div><strong>{version.version}</strong><small>{version.current ? tr("正在运行", "Running") : version.ready ? tr(`已校验 · ${formatBytes(version.byte_size)}`, `Verified · ${formatBytes(version.byte_size)}`) : tr("缓存不完整", "Incomplete cache")}</small></div>{version.current ? <span>{tr("当前", "Current")}</span> : <><button disabled={busy !== null || !version.ready} onClick={() => void install(version.version, tr)} type="button">{olderThan(version.version, status.current_version) ? tr("回退", "Roll back") : tr("切换", "Switch")}</button><button aria-label={tr("移除缓存", "Remove cached version")} className="version-remove" disabled={busy !== null} onClick={() => void remove(version.version, tr)} type="button">×</button></>}</div>)}
+                {status.installed_versions.map((version) => <div key={`${version.version}:${version.current}`}><div><strong>{version.version}</strong><small>{version.current ? t('settings:updateManager.running') : version.ready ? t('settings:updateManager.verified', { size: formatBytes(version.byte_size) }) : t('settings:updateManager.incompleteCache')}</small></div>{version.current ? <span>{t('settings:updateManager.current')}</span> : <><button disabled={busy !== null || !version.ready} onClick={() => void install(version.version, t)} type="button">{olderThan(version.version, status.current_version) ? t('settings:updateManager.rollBack') : t('settings:updateManager.switch')}</button><button aria-label={t('settings:updateManager.removeCachedVersion')} className="version-remove" disabled={busy !== null} onClick={() => void remove(version.version, t)} type="button">×</button></>}</div>)}
               </div>
             </div>
           </div>
-          <button className="release-page-link" onClick={() => void openStudioExternal(status.releases_page).catch(() => undefined)} type="button">{tr("在 GitHub 查看全部 Release", "View all releases on GitHub")}</button>
+          <button className="release-page-link" onClick={() => void openStudioExternal(status.releases_page).catch(() => undefined)} type="button">{t('settings:updateManager.viewAllReleasesOnGithub')}</button>
         </>
-      ) : <div className="update-empty">{tr("正在读取版本状态…", "Loading version status…")}</div>}
+      ) : <div className="update-empty">{t('settings:updateManager.loadingVersionStatus')}</div>}
     </section>
   );
 }

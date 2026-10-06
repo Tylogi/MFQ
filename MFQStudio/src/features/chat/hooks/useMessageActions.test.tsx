@@ -1,4 +1,4 @@
-/** 验证消息编辑的提交时机、重新生成的回退目标及失败后的历史保护。 */
+/** Verify message-edit commit timing, regeneration rewind targets, and history preservation after failures. */
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
 import { sessionsApi } from '../../../shared/api/resources/sessions';
@@ -15,7 +15,7 @@ const message = {
 
 afterEach(() => vi.restoreAllMocks());
 
-it('编辑保留媒体和文档，截断后续历史并使用回退版本继续生成', async () => {
+it('verifies useMessageActions test behavior 1', async () => {
   const media = { type: 'image', media: { id: 'image-1' } };
   const document = { type: 'document', media: { id: 'document-1' }, name: 'notes.txt' };
   const edited = { ...message, parts: [...message.parts, media, document] } as Message;
@@ -38,7 +38,7 @@ it('编辑保留媒体和文档，截断后续历史并使用回退版本继续�
   expect(generate).toHaveBeenCalledExactlyOnceWith(rewound, parts, false);
 });
 
-it('重新生成回退到目标回答前的用户消息，保留附件并使用新会话版本', async () => {
+it('verifies useMessageActions test behavior 2', async () => {
   const user = {
     ...message,
     parts: [...message.parts, { type: 'image', media: { id: 'image-1' } }],
@@ -69,7 +69,7 @@ it('重新生成回退到目标回答前的用户消息，保留附件并使用�
   expect(generate).toHaveBeenCalledExactlyOnceWith(rewound, user.parts, false);
 });
 
-it('重新生成回退失败时不修改历史也不发起生成', async () => {
+it('verifies useMessageActions test behavior 3', async () => {
   vi.spyOn(sessionsApi, 'rewindSession').mockRejectedValue(new Error('revision conflict'));
   const assistant = { ...message, id: 'assistant-1', role: 'assistant' } as Message;
   const setMessages = vi.fn();
@@ -93,7 +93,7 @@ it('重新生成回退失败时不修改历史也不发起生成', async () => {
   expect(setError).toHaveBeenCalledWith('revision conflict');
 });
 
-it('回退成功时立即结束编辑，不等待生成流完成', async () => {
+it('verifies useMessageActions test behavior 4', async () => {
   vi.spyOn(sessionsApi, 'rewindSession').mockResolvedValue({ ...session, revision: 2 });
   const onCommitted = vi.fn();
   let finishGeneration!: () => void;
@@ -133,7 +133,7 @@ it('回退成功时立即结束编辑，不等待生成流完成', async () => {
   });
 });
 
-it('回退失败时不清除编辑草稿', async () => {
+it('verifies useMessageActions test behavior 5', async () => {
   vi.spyOn(sessionsApi, 'rewindSession').mockRejectedValue(new Error('rewind failed'));
   const onCommitted = vi.fn();
   const setError = vi.fn();

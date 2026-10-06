@@ -1,4 +1,4 @@
-"""组装 MFQ 公共 API、鉴权中间件与前端静态服务。"""
+"""Assemble the MFQ public API, authentication middleware, and frontend static service."""
 
 from __future__ import annotations
 

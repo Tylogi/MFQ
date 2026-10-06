@@ -1,4 +1,4 @@
-/** 验证聊天工具选择跨路由保留，并在切换服务时拒绝旧工具请求回写。 */
+/** Verify that chat-tool selections persist across routes and stale tool requests cannot write back after a service switch. */
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { beforeEach, expect, it, vi } from 'vitest';
@@ -16,7 +16,7 @@ beforeEach(() => {
   vi.restoreAllMocks();
 });
 
-it('服务切换时清空工具选择，丢弃旧连接迟到的工具列表', async () => {
+it('verifies ChatToolsProvider test behavior 1', async () => {
   let resolveOld!: (value: { data: McpToolResource[] }) => void;
   const oldTools = new Promise<{ data: McpToolResource[] }>((resolve) => {
     resolveOld = resolve;

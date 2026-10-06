@@ -1,4 +1,5 @@
-/** 将原 Python 会话检查迁为真实 Provider、附件转换和生成控制器的行为测试。 */
+/** Migrate the original Python session checks to behavior tests using the real Provider, attachment conversion, and generation controller. */
+import { i18n } from '../src/i18n';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { MemoryRouter } from 'react-router';
@@ -19,7 +20,7 @@ const mocks = vi.hoisted(() => ({
 }));
 vi.mock('../src/app/RuntimeProvider', () => ({ useRuntime: () => mocks.runtime }));
 vi.mock('../src/features/settings/SettingsProvider', () => ({
-  useSettings: () => ({ settings: { ...DEFAULT_SETTINGS, inheritModelDefaults: false, systemPrompt: mocks.prompt, excludeReasoning: mocks.excludeReasoning }, tr: (_zh: string, en: string) => en }),
+  useSettings: () => ({ settings: { ...DEFAULT_SETTINGS, inheritModelDefaults: false, systemPrompt: mocks.prompt, excludeReasoning: mocks.excludeReasoning }, t: i18n.getFixedT('en') }),
 }));
 vi.mock('../src/features/chat/hooks/useChatGeneration', () => {
   const controller = { start: mocks.start, reset: mocks.reset, getPhase: () => 'idle', getSnapshot: () => ({ recoveryNeeded: false }) };
@@ -30,14 +31,14 @@ vi.mock('../src/studio', () => ({ studioConfirm: vi.fn().mockResolvedValue(true)
 const session = { id: 'session-a', model: 'model-a', mode: 'text', revision: 7 } as Session;
 const previous = { id: 'previous', role: 'assistant', parts: [{ type: 'text', text: 'old answer' }], parent_id: null, created_at: '' } as Message;
 
-/** 控制异步边界，验证完成前的状态与调用顺序。 */
+/** Control asynchronous boundaries to verify state and call order before completion. */
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((done) => { resolve = done; });
   return { promise, resolve };
 }
 
-/** 挂载真实聊天领域并等待历史就绪。 */
+/** Mount the real chat domain and wait for history to be ready. */
 async function mountChat() {
   const wrapper = ({ children }: { children: ReactNode }) => <MemoryRouter initialEntries={['/chat']}><ChatProvider>{children}</ChatProvider></MemoryRouter>;
   const hook = renderHook(() => ({ chat: useChat(), attachments: useChatAttachmentActions() }), { wrapper });
@@ -58,7 +59,7 @@ beforeEach(() => {
   vi.spyOn(connectionsApi, 'mcpTools').mockResolvedValue({ data: [], errors: {} });
 });
 
-it('运行时未就绪时不加载会话或发送，就绪并加载历史后才开放输入', async () => {
+it('verifies chatContracts test behavior 1', async () => {
   mocks.runtime.ready = false;
   const wrapper = ({ children }: { children: ReactNode }) => <MemoryRouter initialEntries={['/chat']}><ChatProvider>{children}</ChatProvider></MemoryRouter>;
   const { result, rerender } = renderHook(() => useChat(), { wrapper });
@@ -72,7 +73,7 @@ it('运行时未就绪时不加载会话或发送，就绪并加载历史后才�
   expect(sessionsApi.listSessions).toHaveBeenCalledOnce();
 });
 
-it('清空先创建再删除，成功后才切换并清空历史', async () => {
+it('verifies chatContracts test behavior 2', async () => {
   const created = deferred<Session>();
   const deleted = deferred<void>();
   const replacement = { ...session, id: 'replacement' };
@@ -93,8 +94,8 @@ it('清空先创建再删除，成功后才切换并清空历史', async () => {
 
 it.each([
   { prompt: '', excludeReasoning: false },
-  { prompt: '  用户自定义提示  ', excludeReasoning: true },
-])('发送仅使用显式提示 $prompt，排除思考=$excludeReasoning，响应前追加乐观消息并采用默认 token 限制', async ({ prompt, excludeReasoning }) => {
+  { prompt: '  user custom prompt  ', excludeReasoning: true },
+])('sends with explicit prompt $prompt and excludeReasoning=$excludeReasoning while appending the optimistic message and using default token limits', async ({ prompt, excludeReasoning }) => {
   mocks.prompt = prompt;
   mocks.excludeReasoning = excludeReasoning;
   const pending = deferred<void>();
@@ -112,7 +113,7 @@ it.each([
   expect(accepted).toHaveBeenCalledOnce();
 });
 
-it('图片预览上传后以带尺寸的类型化片段发送，接受后释放预览', async () => {
+it('verifies chatContracts test behavior 3', async () => {
   const close = vi.fn();
   vi.stubGlobal('createImageBitmap', vi.fn().mockResolvedValue({ width: 32, height: 24, close }));
   const revoke = vi.fn();
@@ -134,7 +135,7 @@ it('图片预览上传后以带尺寸的类型化片段发送，接受后释放�
   expect(revoke).toHaveBeenCalledWith('blob:preview');
 });
 
-it('取消请求完成之前保持流连接，完成之后才中止读取', async () => {
+it('verifies chatContracts test behavior 4', async () => {
   const cancellation = deferred<void>();
   let streamSignal!: AbortSignal;
   const cancel = vi.fn(() => cancellation.promise);
@@ -158,7 +159,7 @@ it('取消请求完成之前保持流连接，完成之后才中止读取', asyn
   expect(controller.getPhase()).toBe('cancelled');
 });
 
-it('同步按请求和输出消息双重定位，不能误认其他回答', async () => {
+it('verifies chatContracts test behavior 5', async () => {
   const history = {
     session: { ...session, state: 'idle' } as Session,
     messages: [previous],

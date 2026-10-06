@@ -1,4 +1,4 @@
-/** 验证传输层保留标准 HeadersInit 并仅在内存中注入当前服务凭据。 */
+/** Verify the transport preserves standard HeadersInit and injects the current service credential only in memory. */
 import { afterEach, expect, it, vi } from 'vitest';
 import { request, setApiBaseUrl, setApiToken } from '../src/shared/api/client';
 
@@ -7,7 +7,7 @@ afterEach(() => {
   setApiToken('');
 });
 
-it('支持 Headers 实例和 AbortSignal，保留业务头并添加鉴权', async () => {
+it('verifies apiClient test behavior 1', async () => {
   const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
   vi.stubGlobal('fetch', fetchMock);
   setApiBaseUrl('https://test.invalid/');

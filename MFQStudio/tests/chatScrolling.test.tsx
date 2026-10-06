@@ -1,4 +1,5 @@
-/** 验证滚动跟随、生命周期清理及推理展示，CSS 仅保留布局边界检查。 */
+/** Verify scroll following, lifecycle cleanup, and inference display; CSS is checked only for layout boundaries. */
+import { i18n } from '../src/i18n';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { act, fireEvent, render, screen } from '@testing-library/react';
@@ -17,13 +18,13 @@ const frames = new Map<number, FrameRequestCallback>();
 let nextFrame = 0;
 let scroll: ReturnType<typeof useChatAutoScroll>;
 
-/** 提供真实 DOM ref 和滚动事件，由测试控制浏览器布局尺寸。 */
+/** Provide a real DOM ref and scroll events while letting the test control browser layout dimensions. */
 function ScrollSurface({ sessionId = 'a', enabled = true }) {
   scroll = useChatAutoScroll(sessionId, enabled);
   return <div data-testid="scroller" ref={scroll.scrollerRef} onScroll={scroll.handleScroll}><div>messages</div></div>;
 }
 
-/** 执行单帧回调，验证合帧与用户操作之间的竞态。 */
+/** Execute a single-frame callback to verify races between frame batching and user actions. */
 function flushFrames() {
   act(() => {
     const pending = [...frames.values()];
@@ -45,7 +46,7 @@ beforeEach(() => {
   });
 });
 
-it('仅距尾部 80px 内跟随，内容增长合帧，向上阅读时不抢滚动位置', () => {
+it('verifies chatScrolling test behavior 1', () => {
   render(<ScrollSurface />);
   const scroller = screen.getByTestId('scroller');
   Object.defineProperties(scroller, { scrollHeight: { configurable: true, value: 1000 }, clientHeight: { value: 200 } });
@@ -67,7 +68,7 @@ it('仅距尾部 80px 内跟随，内容增长合帧，向上阅读时不抢滚�
   expect(scroller.scrollTop).toBe(1000);
 });
 
-it('待执行帧尊重用户暂停，回到底部恢复后续跟随', () => {
+it('verifies chatScrolling test behavior 2', () => {
   render(<ScrollSurface />);
   const scroller = screen.getByTestId('scroller');
   Object.defineProperties(scroller, { scrollHeight: { configurable: true, value: 1000 }, clientHeight: { value: 200 } });
@@ -84,7 +85,7 @@ it('待执行帧尊重用户暂停，回到底部恢复后续跟随', () => {
   expect(scroller.scrollTop).toBe(1200);
 });
 
-it('切会话、禁用和卸载断开观察并取消待执行帧，重新启用恢复跟随', () => {
+it('verifies chatScrolling test behavior 3', () => {
   const view = render(<ScrollSurface enabled={false} />);
   expect(observers).toHaveLength(0);
   view.rerender(<ScrollSurface />);
@@ -103,12 +104,12 @@ it('切会话、禁用和卸载断开观察并取消待执行帧，重新启用�
   expect(frames.size).toBe(0);
 });
 
-it('历史消息编辑展示草稿与保存入口，助手消息提供重新生成', () => {
+it('verifies chatScrolling test behavior 4', () => {
   const user = { id: 'user', role: 'user', parts: [{ type: 'text', text: 'original' }], created_at: '' } as Message;
   const assistant = { ...user, id: 'assistant', role: 'assistant' } as Message;
   const setEditDraft = vi.fn();
   const actions = { saveEdit: vi.fn(), copyMessage: vi.fn(), regenerate: vi.fn(), executeToolCalls: vi.fn() };
-  const props = { messages: [user, assistant], responses: {}, mcpTools: [], busy: false, tr: (_zh: string, en: string) => en, setEditDraft, actions };
+  const props = { messages: [user, assistant], responses: {}, mcpTools: [], busy: false, t: i18n.getFixedT('en'), setEditDraft, actions };
   const view = render(<TooltipProvider><SavedMessageList {...props} editDraft={null} /></TooltipProvider>);
   expect(screen.getAllByRole('button', { name: 'Edit' })).toHaveLength(1);
   expect(screen.getAllByRole('button', { name: 'Regenerate' })).toHaveLength(1);
@@ -123,29 +124,30 @@ it('历史消息编辑展示草稿与保存入口，助手消息提供重新生�
   expect(actions.saveEdit).toHaveBeenCalledWith(user);
 });
 
-it('历史推理默认折叠，流式推理默认展开且只显示当前会话', () => {
+it('verifies chatScrolling test behavior 5', () => {
   const controller = new GenerationController({ onSynchronized: vi.fn(), onSessionState: vi.fn() });
   vi.spyOn(controller, 'getSnapshot').mockReturnValue({ phase: 'streaming', sessionId: 'a', live: { reasoning: 'live reasoning', text: '', tools: [] }, error: null, recoveryNeeded: false });
   const message = { id: 'answer', role: 'assistant', parts: [{ type: 'reasoning', text: 'saved reasoning' }], created_at: '' } as Message;
-  const tr = (_zh: string, en: string) => en;
+  const t = i18n.getFixedT('en');
   const view = render(<TooltipProvider>
-    <SavedMessageList messages={[message]} responses={{}} mcpTools={[]} busy={false} tr={tr} editDraft={null} setEditDraft={vi.fn()} actions={{ saveEdit: vi.fn(), copyMessage: vi.fn(), regenerate: vi.fn(), executeToolCalls: vi.fn() }} />
-    <StreamingMessage controller={controller} sessionId="a" tr={tr} />
+    <SavedMessageList messages={[message]} responses={{}} mcpTools={[]} busy={false} t={t} editDraft={null} setEditDraft={vi.fn()} actions={{ saveEdit: vi.fn(), copyMessage: vi.fn(), regenerate: vi.fn(), executeToolCalls: vi.fn() }} />
+    <StreamingMessage controller={controller} sessionId="a" t={t} />
   </TooltipProvider>);
   expect(screen.getByText('Reasoning').closest('details')).not.toHaveAttribute('open');
   expect(screen.getByText('Thinking').closest('details')).toHaveAttribute('open');
-  view.rerender(<StreamingMessage controller={controller} sessionId="b" tr={tr} />);
+  view.rerender(<StreamingMessage controller={controller} sessionId="b" t={t} />);
   expect(screen.queryByText('Thinking')).not.toBeInTheDocument();
 });
 
-it('默认生成限制为 4096，设置界面允许最高 65536', () => {
-  render(<SettingsPage tr={(_zh, en) => en} settingsDraft={{ ...DEFAULT_SETTINGS, inheritModelDefaults: false }} setSettingsDraft={vi.fn()} mtpAvailable={false} presetManager={null} busy={false} hasStudio={false} actions={{ setModelDefaultInheritance: vi.fn(), applyPreset: vi.fn(), exportStudioData: vi.fn(), importStudioData: vi.fn(), openServerPage: vi.fn(), resetSettingsDraft: vi.fn(), saveSettings: vi.fn() }} />);
-  const limit = screen.getAllByRole('spinbutton').find((input) => input.getAttribute('max') === '65536');
+it('verifies chatScrolling test behavior 6', () => {
+  render(<SettingsPage t={i18n.getFixedT('en')} settingsDraft={{ ...DEFAULT_SETTINGS, inheritModelDefaults: false }} setSettingsDraft={vi.fn()} mtpAvailable={false} presetManager={null} busy={false} hasStudio={false} actions={{ setModelDefaultInheritance: vi.fn(), applyPreset: vi.fn(), exportStudioData: vi.fn(), importStudioData: vi.fn(), openServerPage: vi.fn(), resetSettingsDraft: vi.fn(), saveSettings: vi.fn() }} />);
+  const limit = screen.getByRole('spinbutton', { name: 'Maximum output tokens' });
   expect(limit).toHaveValue(4096);
   expect(limit).toHaveAttribute('min', '1');
+  expect(limit).not.toHaveAttribute('max');
 });
 
-it('聊天容器拥有垂直滚动，推理正文不引入独立限高滚动区', () => {
+it('verifies chatScrolling test behavior 7', () => {
   const style = document.createElement('style');
   style.textContent = readFileSync(resolve('src/features/chat/chat.css'), 'utf8');
   document.head.append(style);

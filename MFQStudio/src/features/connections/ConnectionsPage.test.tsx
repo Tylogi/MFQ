@@ -1,3 +1,5 @@
+/** Verify browser service settings preserve the actual service origin and report listener failures. */
+import { i18n } from '../../i18n';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
@@ -10,7 +12,7 @@ vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => ({
   runtime: { model: 'model' }, models: [], instances: [], studio: null,
   selectedModel: '', setSelectedModel: vi.fn(), reloadService,
 }) }));
-vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh: string, en: string) => en }) }));
+vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ t: i18n.getFixedT('en') }) }));
 vi.mock('./MemorySettingsPanel', () => ({ MemorySettingsPanel: () => null }));
 vi.mock('./InferenceDefaultsPanel', () => ({ InferenceDefaultsPanel: () => null }));
 vi.mock('./ToolsRoutingPanel', () => ({ ToolsRoutingPanel: () => null }));
@@ -25,7 +27,7 @@ beforeEach(() => {
 });
 afterEach(() => { vi.restoreAllMocks(); localStorage.clear(); setApiBaseUrl(''); });
 
-it('网页端可编辑端口，保存实际更改监听并持久化连接地址', async () => {
+it('verifies ConnectionsPage test behavior 1', async () => {
   const change = vi.spyOn(runtimeApi, 'configureRuntimeListener').mockResolvedValue({ host: '127.0.0.1', port: 8091, configurable: true });
   render(<MemoryRouter><ConnectionsPage /></MemoryRouter>);
   expect(screen.getByRole('heading', { name: /^Service$/ })).toBeInTheDocument();
@@ -35,11 +37,11 @@ it('网页端可编辑端口，保存实际更改监听并持久化连接地址'
   fireEvent.change(port, { target: { value: '8091' } });
   fireEvent.click(screen.getByRole('button', { name: 'Save server settings' }));
   await waitFor(() => expect(change).toHaveBeenCalledExactlyOnceWith(8091));
-  expect(browserServiceUrl()).toBe('http://127.0.0.1:8091');
+  expect(browserServiceUrl()).toBe('http://localhost:8091');
   expect(reloadService).toHaveBeenCalledOnce();
 });
 
-it('端口占用时保留原连接，不假报保存成功', async () => {
+it('verifies ConnectionsPage test behavior 2', async () => {
   vi.spyOn(runtimeApi, 'configureRuntimeListener').mockRejectedValue(new Error('port in use'));
   render(<MemoryRouter><ConnectionsPage /></MemoryRouter>);
   await waitFor(() => expect(runtimeApi.runtimeListener).toHaveBeenCalled());
@@ -48,4 +50,26 @@ it('端口占用时保留原连接，不假报保存成功', async () => {
   await waitFor(() => expect(runtimeApi.configureRuntimeListener).toHaveBeenCalled());
   expect(browserServiceUrl()).toBe('');
   expect(reloadService).not.toHaveBeenCalled();
+});
+
+it('keeps a same-origin remote service in remote mode when saving', async () => {
+  vi.stubGlobal('window', new Proxy(window, {
+    get(target, key) {
+      if (key === 'location') return new URL('https://studio.example:9443/chat');
+      const value = Reflect.get(target, key);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  }));
+  try {
+    const change = vi.spyOn(runtimeApi, 'configureRuntimeListener');
+    render(<MemoryRouter><ConnectionsPage /></MemoryRouter>);
+    await waitFor(() => expect(screen.getByRole('combobox', { name: 'Bind address' })).toHaveValue('remote'));
+    expect(screen.getByRole('textbox', { name: 'Remote endpoint' })).toHaveValue('https://studio.example:9443');
+    fireEvent.click(screen.getByRole('button', { name: 'Save server settings' }));
+    await waitFor(() => expect(reloadService).toHaveBeenCalledOnce());
+    expect(browserServiceUrl()).toBe('https://studio.example:9443');
+    expect(change).not.toHaveBeenCalled();
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });

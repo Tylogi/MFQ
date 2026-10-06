@@ -1,11 +1,12 @@
-/** 迁移 Studio 纯前端源码与样式契约；全部属于过渡源码检查，不冒充行为验证。旧 Python 测试名逐项保留用于核对映射。 */
+/** Migrate Studio frontend source and style contracts; these are transitional source checks, not behavior tests. Legacy Python test names are retained to verify the mapping. */
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { resources } from '../src/i18n/resources';
 
 const sourceRoot = resolve(process.cwd(), 'src');
 
-/** 只读取产品实现，排除测试和类型声明，防止测试自身满足契约。 */
+/** Read product implementation only, excluding tests and type declarations so tests cannot satisfy their own contracts. */
 function readSources(...paths: string[]): string {
   function collect(location: string): string[] {
     if (statSync(location).isDirectory()) {
@@ -18,7 +19,7 @@ function readSources(...paths: string[]): string {
   return paths.flatMap((path) => collect(join(sourceRoot, path))).join('\n');
 }
 
-/** 按真实导入顺序展开 CSS，供静态样式契约使用。 */
+/** Expand CSS in actual import order for static style contracts. */
 function readStyles(path = join(sourceRoot, 'styles.css')): string {
   return readFileSync(path, 'utf8').replace(/@import\s+['"]([^'"]+)['"];/g, (_match, target: string) =>
     readStyles(resolve(dirname(path), target)),
@@ -31,7 +32,23 @@ const API = readSources('shared/api');
 const MAIN = readSources('main.tsx');
 const STYLES = readStyles();
 
-describe('Studio 过渡源码与静态样式契约（非行为测试）', () => {
+/** Match visible English copy through the catalog key actually referenced by the implementation. */
+function expectLocalizedText(source: string, expected: string): void {
+  const matches: string[] = [];
+  function collect(value: unknown, key: string): void {
+    if (typeof value === 'string') {
+      if (value.includes(expected) && source.includes(key)) matches.push(key);
+      return;
+    }
+    for (const [name, entry] of Object.entries(value as Record<string, unknown>)) {
+      collect(entry, key + name + (typeof entry === 'string' ? '' : '.'));
+    }
+  }
+  for (const [namespace, catalog] of Object.entries(resources.en)) collect(catalog, namespace + ':');
+  expect(matches, `The implementation should reference a translation containing "${expected}"`).not.toEqual([]);
+}
+
+describe('describes studioContracts test behavior 1', () => {
   it('test_studio_supports_local_and_remote_server_connections_with_voice_controls', () => {
     const models = readSources('features/models');
     const chat = readSources('features/chat', 'features/voice');
@@ -43,18 +60,18 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
     expect(models).toContain('listing.current_path');
     expect(chat).toContain('RealtimeAudioController');
     expect(chat).toContain('selectInteractionMode');
-    expect(models).toContain('Browse folders on the MFQ Server host.');
+    expectLocalizedText(models, 'Browse folders on the MFQ Server host.');
   });
 
   it('test_studio_handles_a_running_server_without_a_loaded_model', () => {
     const sessions = readSources('features/chat/hooks/useConversationSessions.ts');
     const runtime = readSources('app/RuntimeProvider.tsx');
-    expect(sessions).toContain('if (!selectedModel || transitioning) return');
+    expect(sessions).toContain('if (!selectedModel || generationBusy || transitioning) return');
     expect(sessions).toContain('modelAvailable');
     expect(sessions).toContain('historyLoadedId === activeId');
     expect(runtime).toContain('isRuntimeReady(status.runtime_state)');
     expect(runtime).toContain('Promise.resolve<RuntimeModel[]>([])');
-    expect(APP).toContain('No model loaded');
+    expectLocalizedText(APP, 'No model loaded');
   });
 
   it('test_studio_exposes_every_loaded_model_and_switches_chat_sessions_safely', () => {
@@ -68,13 +85,12 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
     expect(sessions).toContain('active.model === selectedModel');
     expect(sessions).toContain('generationBusy');
     expect(sessions).toContain('controller.abort()');
-    expect(readSources('features/chat/components/ChatPageHeader.tsx')).toContain('disabled={conversation.transitioning}');
+    expect(readSources('features/chat/components/ChatPageHeader.tsx')).toContain('disabled={busy || recoveryNeeded}');
     expect(readSources('features/chat/hooks/useChatPageState.ts')).toContain('availableModelNames.includes(value)');
     expect(API).toContain('model?: string');
   });
 
-  // test_studio_uses_selected_runtime_mtp_availability 已由 runtimeContracts.test.tsx
-  // 的实例优先级、模型匹配、请求参数及 UI 禁用行为覆盖；字段类型见 shared/api/contracts/runtime.ts。
+  // test_studio_uses_selected_runtime_mtp_availability is covered by instance priority, model matching, request parameters, and UI disabled behavior in runtimeContracts.test.tsx; field types are in shared/api/contracts/runtime.ts.
 
   it('test_model_lifecycle_actions_stay_on_the_models_page', () => {
     const load_body = APP.slice(APP.indexOf('async function loadArtifact('), APP.indexOf('async function finishModelRegistration('));
@@ -89,7 +105,7 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
     const models = readSources('features/models');
     expect(models).toContain('selectLocalModelDirectory()');
     expect(models).toContain('finishModelRegistration(names)');
-    expect(models).toContain('Choose model folder');
+    expectLocalizedText(models, 'Choose model folder');
     expect(models).toContain('modelsApi.loadModel(');
   });
 
@@ -135,9 +151,9 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
 
   it('test_studio_exposes_theme_selection_without_using_sidebar_status_space', () => {
     expect(APP).toContain('settingsDraft.theme');
-    expect(APP).toContain('<option value="system">{tr("跟随系统", "System")}</option>');
-    expect(APP).toContain('<option value="light">{tr("浅色", "Light")}</option>');
-    expect(APP).toContain('<option value="dark">{tr("深色", "Dark")}</option>');
+    expect(APP).toContain('<option value="system">{t(\'settings:settingsPage.system\')}</option>');
+    expect(APP).toContain('<option value="light">{t(\'settings:settingsPage.light\')}</option>');
+    expect(APP).toContain('<option value="dark">{t(\'settings:settingsPage.dark\')}</option>');
     expect(APP).not.toContain('className="theme-switcher"');
     expect(APP).not.toContain('connection-card');
     expect(STYLES).not.toContain('.connection-card');
@@ -146,8 +162,8 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
   it('test_studio_exposes_omlx_style_runtime_lifecycle_controls', () => {
     const models = readSources('features/models');
     expect(APP).toContain('className="runtime-hero"');
-    expect(models).toContain('Pin in memory');
-    expect(models).toContain('Idle unload');
+    expectLocalizedText(models, 'Pin in memory');
+    expectLocalizedText(models, 'Idle unload');
     expect(models).toContain('pin: loadPinned');
     expect(models).toContain('idle_ttl_seconds: loadIdleTtl');
     expect(API).toContain('idle_ttl_seconds?: number | null');
@@ -185,9 +201,9 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
     expect(cache).toContain('runtime?.prefix_cache_supported !== undefined');
     expect(cache).toContain('prefixCachePersistent || prefixCacheHotOnly');
     expect(cache).toContain('single_device_hot_prefix');
-    expect(cache).toContain('Device-hot prefix');
-    expect(cache).toContain('Process lifetime');
-    expect(cache).toContain('Session KV cache is unavailable with continuous batching');
+    expectLocalizedText(cache, 'Device-hot prefix');
+    expectLocalizedText(cache, 'Process lifetime');
+    expectLocalizedText(cache, 'Session KV cache is unavailable with continuous batching');
     expect(cache).toContain('runtimeApi.clearRuntimeCache');
   });
 
@@ -246,7 +262,7 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
   it('test_server_page_matches_hivellm_information_architecture', () => {
     const connection = readSources('features/connections/ConnectionsPage.tsx', 'features/connections/MemorySettingsPanel.tsx', 'features/connections/InferenceDefaultsPanel.tsx');
     for (const label of ['Runtime', 'Memory plan', 'Persistent Prefix cache', 'Chat', 'Automation', 'Model ID', 'Bind address', 'Maximum output']) {
-      expect(connection).toContain(label);
+      expectLocalizedText(connection, label);
     }
     expect(connection).toContain('<ToolsRoutingPanel />');
     expect(connection).toContain('className="server-active-notice"');

@@ -1,9 +1,11 @@
-/** 验证模型目录的按需加载、策略传递及注册失败恢复。 */
+/** Verify on-demand catalog loading, policy propagation, and recovery from registration failures. */
+import { i18n } from '../../i18n';
 import { act, renderHook, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import type { ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { modelsApi } from '../../shared/api/resources/models';
+import { jobsApi } from '../../shared/api/resources/jobs';
 import type { JobResource, ModelArtifact } from '../../shared/api/types';
 import { ToastContainer } from '../../shared/ui/Toast';
 import { useJobStore } from '../../stores/jobStore';
@@ -27,7 +29,7 @@ vi.mock('../../app/RuntimeProvider', () => ({
   }),
 }));
 vi.mock('../settings/SettingsProvider', () => ({
-  useSettings: () => ({ tr: (_zh: string, en: string) => en, contextSize: 8192 }),
+  useSettings: () => ({ t: i18n.getFixedT('en'), contextSize: 8192 }),
 }));
 vi.mock('../../studio', () => ({ isStudio: () => false, selectLocalModelDirectory: vi.fn() }));
 
@@ -46,7 +48,7 @@ const artifact: ModelArtifact = {
   modified_at: '2026-09-23T00:00:00Z',
 };
 
-/** 提供真实路由上下文，避免把页面导航行为替换成无条件成功的桩。 */
+/** Provide real router context rather than replacing page navigation with an unconditional-success stub. */
 function Wrapper({ children }: { children: ReactNode }) {
   return (
     <MemoryRouter>
@@ -122,7 +124,7 @@ describe('useModelCatalog', () => {
     expect(state.setSelectedModel).not.toHaveBeenCalled();
   });
 
-  it('进入模型页时不重播历史失败任务，包括稍后载入的任务记录', () => {
+  it('verifies useModelCatalog test behavior 1', () => {
     const failedJob: JobResource = {
       id: 'old-load',
       kind: 'model.load',
@@ -146,7 +148,7 @@ describe('useModelCatalog', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
-  it('只提示本页观察到的加载任务失败，重新进入也不重播', () => {
+  it('verifies useModelCatalog test behavior 2', () => {
     const runningJob: JobResource = {
       id: 'new-load',
       kind: 'model.load',
@@ -176,4 +178,83 @@ describe('useModelCatalog', () => {
     renderHook(useModelCatalog, { wrapper: Wrapper });
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
+});
+
+
+/** Create unload jobs that may finish before the initial status refresh. */
+function unloadJob(status: JobResource['status'] = 'running'): JobResource {
+  return {
+    id: 'unload-1', kind: 'model.unload', status, payload: { instance_id: 'instance-1' },
+    progress: 0, cancel_requested: false,
+    created_at: '2026-10-06T00:00:00Z', updated_at: '2026-10-06T00:00:01Z',
+  };
+}
+
+it('shows pending unload immediately, prevents double clicks, and waits for the terminal job', async () => {
+  let accept!: (value: { operation_id: string; status: 'accepted' }) => void;
+  const unload = vi.spyOn(modelsApi, 'unloadModel').mockImplementation(() => new Promise((resolve) => { accept = resolve; }));
+  vi.spyOn(jobsApi, 'getJob').mockResolvedValue(unloadJob());
+  const { result } = renderHook(useModelCatalog, { wrapper: Wrapper });
+  let submitting!: Promise<void>;
+  act(() => {
+    submitting = result.current.unloadInstance('instance-1');
+    void result.current.unloadInstance('instance-1');
+  });
+  expect(unload).toHaveBeenCalledTimes(1);
+  expect(result.current.unloadingInstanceIds.has('instance-1')).toBe(true);
+  await act(async () => {
+    accept({ operation_id: 'unload-1', status: 'accepted' });
+    await submitting;
+  });
+  expect(result.current.busy).toBe(false);
+  expect(result.current.unloadingInstanceIds.has('instance-1')).toBe(true);
+  await act(async () => result.current.unloadInstance('instance-1'));
+  expect(unload).toHaveBeenCalledTimes(1);
+  act(() => useJobStore.getState().updateJob('unload-1', { status: 'succeeded' }));
+  expect(result.current.unloadingInstanceIds.has('instance-1')).toBe(false);
+  expect(screen.getByRole('status')).toHaveTextContent('Model unloaded');
+});
+
+it('reports a fast unload failure even if no active job state was observed', async () => {
+  vi.spyOn(modelsApi, 'unloadModel').mockResolvedValue({ operation_id: 'unload-1', status: 'accepted' });
+  vi.spyOn(jobsApi, 'getJob').mockResolvedValue({ ...unloadJob('failed'),
+    error: { code: 'runtime_busy', message: 'Runtime is processing a request', retryable: true, details: {} },
+  });
+  const { result } = renderHook(useModelCatalog, { wrapper: Wrapper });
+  await act(async () => result.current.unloadInstance('instance-1'));
+  expect(screen.getByRole('alert')).toHaveTextContent('runtime_busy: Runtime is processing a request');
+  expect(result.current.unloadingInstanceIds.has('instance-1')).toBe(false);
+});
+
+it('fetches the failure reason when an SSE state event has no error details', async () => {
+  vi.spyOn(modelsApi, 'unloadModel').mockResolvedValue({ operation_id: 'unload-1', status: 'accepted' });
+  vi.spyOn(jobsApi, 'getJob').mockResolvedValueOnce(unloadJob()).mockResolvedValueOnce({
+    ...unloadJob('failed'), error: { code: 'stop_failed', message: 'Could not stop process', retryable: true, details: {} },
+  });
+  const { result } = renderHook(useModelCatalog, { wrapper: Wrapper });
+  await act(async () => result.current.unloadInstance('instance-1'));
+  await act(async () => useJobStore.getState().updateJob('unload-1', { status: 'failed' }));
+  expect(screen.getByRole('alert')).toHaveTextContent('stop_failed: Could not stop process');
+  act(() => useJobStore.getState().setJobs([...useJobStore.getState().jobs]));
+  expect(screen.getAllByRole('alert')).toHaveLength(1);
+});
+
+it('restores the unload action when submission fails', async () => {
+  vi.spyOn(modelsApi, 'unloadModel').mockRejectedValue(new Error('connection lost'));
+  const { result } = renderHook(useModelCatalog, { wrapper: Wrapper });
+  await act(async () => result.current.unloadInstance('instance-1'));
+  expect(result.current.unloadingInstanceIds.has('instance-1')).toBe(false);
+  expect(result.current.busy).toBe(false);
+  expect(screen.getByRole('alert')).toHaveTextContent('connection lost');
+});
+
+it('recovers accepted unload tracking when the first job read fails', async () => {
+  vi.spyOn(modelsApi, 'unloadModel').mockResolvedValue({ operation_id: 'unload-1', status: 'accepted' });
+  vi.spyOn(jobsApi, 'getJob').mockRejectedValue(new Error('temporary read failure'));
+  const { result } = renderHook(useModelCatalog, { wrapper: Wrapper });
+  await act(async () => result.current.unloadInstance('instance-1'));
+  expect(result.current.unloadingInstanceIds.has('instance-1')).toBe(true);
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  act(() => useJobStore.getState().setJobs([unloadJob('succeeded')]));
+  expect(result.current.unloadingInstanceIds.has('instance-1')).toBe(false);
 });

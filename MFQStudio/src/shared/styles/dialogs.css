@@ -1,4 +1,4 @@
-/* 全局弹窗和不可恢复错误页面样式。 */
+/* Global dialog and unrecoverable error-page styles. */
 /* ---------- Dialogs ---------- */
 
 .dialog-backdrop { position: fixed; inset: 0; z-index: 30; display: grid; place-items: center; padding: 20px; background: rgb(21 23 23 / 34%); backdrop-filter: blur(3px); }

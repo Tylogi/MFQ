@@ -1,12 +1,11 @@
-/** 管理会话列表、选中会话与消息历史，所有异步回写绑定当前连接和会话。 */
+/** Manage the session list, selected session, and message history, binding async updates to the current connection and session. */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { sessionsApi } from '../../../shared/api/resources/sessions';
+import { SESSION_PAGE_SIZE, sessionsApi } from '../../../shared/api/resources/sessions';
 import type { SessionMode } from '../../../shared/api/types';
 import { useRuntime } from '../../../app/RuntimeProvider';
 import { errorMessage } from '../../../app/formatters';
 import { useConversationStore } from '../state/conversationStore';
-
-/** 首次打开聊天才加载会话，切换时取消旧历史请求，跨页面保留已加载状态。 */
+/** Load sessions on first chat entry, cancel old history requests on switches, and preserve loaded state across pages. */
 export function useConversationSessions(enabled: boolean, generationBusy: boolean) {
   const { ready, connectionRevision, selectedModel, setSelectedModel, models, instances } =
     useRuntime();
@@ -22,6 +21,10 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
   const [transitioning, setTransitioning] = useState(false);
   const [importRevision, setImportRevision] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [hasMoreSessions, setHasMoreSessions] = useState(false);
+  const [loadingSessions, setLoadingSessions] = useState(false);
+  const loadingPage = useRef(false);
+  const [modelChange, setModelChange] = useState<{ sessionId: string; model: string } | null>(null);
   const version = useRef(0);
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
@@ -41,23 +44,62 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     const request = ++version.current;
     const store = useConversationStore.getState();
     store.reset();
+    setModelChange(null);
     const epoch = useConversationStore.getState().epoch;
     setError(null);
+    setHasMoreSessions(false);
+    setLoadingSessions(false);
+    loadingPage.current = false;
     if (!ready || !enabled) return;
+    loadingPage.current = true;
+    setLoadingSessions(true);
   void sessionsApi
       .listSessions()
       .then((next) => {
         if (request !== version.current || !useConversationStore.getState().loadSessions(epoch, next)) return;
+        setHasMoreSessions(next.length === SESSION_PAGE_SIZE);
         const selected = next[0];
         if (selected) setSelectedModel(selected.model);
       })
       .catch((cause) => {
         if (request === version.current) setError(errorMessage(cause));
+      })
+      .finally(() => {
+        if (request === version.current) {
+          loadingPage.current = false;
+          setLoadingSessions(false);
+        }
       });
     return () => {
       ++version.current;
     };
   }, [ready, enabled, connectionRevision, importRevision, setSelectedModel]);
+
+  /** Append older sessions without changing the active chat; discard pages from an obsolete connection. */
+  const loadMoreSessions = useCallback(async () => {
+    if (!ready || !enabled || !hasMoreSessions || loadingPage.current) return;
+    const request = version.current;
+    const state = useConversationStore.getState();
+    const epoch = state.epoch;
+    loadingPage.current = true;
+    setLoadingSessions(true);
+    try {
+      const page = await sessionsApi.listSessions(state.sessions.length);
+      if (request !== version.current || epoch !== useConversationStore.getState().epoch) return;
+      setSessions((current) => {
+        const ids = new Set(current.map((session) => session.id));
+        return [...current, ...page.filter((session) => !ids.has(session.id))];
+      });
+      setHasMoreSessions(page.length === SESSION_PAGE_SIZE);
+    } catch (cause) {
+      if (request === version.current) setError(errorMessage(cause));
+    } finally {
+      if (request === version.current) {
+        loadingPage.current = false;
+        setLoadingSessions(false);
+      }
+    }
+  }, [ready, enabled, hasMoreSessions, setSessions]);
 
   useEffect(() => {
     if (!activeId) return;
@@ -85,7 +127,8 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
   }, [activeId, connectionRevision]);
 
   useEffect(() => {
-    if (!active || generationBusy || !modelAvailable || active.model === selectedModel) return;
+    if (!active || generationBusy || !modelAvailable || active.model === selectedModel ||
+      modelChange?.sessionId !== active.id || modelChange.model !== selectedModel) return;
     let current = true;
     setTransitioning(true);
     const epoch = useConversationStore.getState().epoch;
@@ -95,6 +138,7 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
         if (!current || epoch !== useConversationStore.getState().epoch || useConversationStore.getState().activeId !== active.id) return;
         setSessions((existing) => [replacement, ...existing]);
         setActiveId(replacement.id);
+        setModelChange(null);
       })
       .catch((cause) => {
         if (current && epoch === useConversationStore.getState().epoch) setError(errorMessage(cause));
@@ -106,23 +150,29 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
       current = false;
       setTransitioning(false);
     };
-  }, [active?.id, active?.model, active?.title, selectedModel, modelAvailable, generationBusy]);
-
-  /** 切换会话及其绑定模型，历史请求在 effect 中按会话重建。 */
+  }, [active?.id, active?.model, active?.title, selectedModel, modelAvailable, generationBusy, modelChange]);
+  /** Fork history only after an explicit model selection, never after runtime reconciliation. */
+  const changeSessionModel = useCallback((model: string) => {
+    if (generationBusy || transitioning) return;
+    const id = useConversationStore.getState().activeId;
+    setModelChange(id ? { sessionId: id, model } : null);
+    setSelectedModel(model);
+  }, [generationBusy, transitioning, setSelectedModel]);
+/** Switch sessions and their associated models; rebuild history requests per session in the effect. */
   const selectSession = useCallback(
     (id: string) => {
       const session = useConversationStore.getState().sessions.find((candidate) => candidate.id === id);
-      if (!session || transitioning) return;
+      if (!session || generationBusy || transitioning) return;
+      setModelChange(null);
       setSelectedModel(session.model);
       setActiveId(id);
     },
-    [transitioning, setSelectedModel, setActiveId],
+    [generationBusy, transitioning, setSelectedModel, setActiveId],
   );
-
-  /** 创建新的空会话，版本戳防止服务切换后的返回污染当前列表。 */
+/** Create a new empty session; a revision token prevents responses from a previous server polluting the current list. */
   const createSession = useCallback(
     async (mode: SessionMode = 'text') => {
-      if (!selectedModel || transitioning) return;
+      if (!selectedModel || generationBusy || transitioning) return;
       const request = version.current;
       const epoch = useConversationStore.getState().epoch;
       setTransitioning(true);
@@ -137,10 +187,9 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
         if (request === version.current) setTransitioning(false);
       }
     },
-    [selectedModel, transitioning, setSessions, setActiveId],
+    [selectedModel, generationBusy, transitioning, setSessions, setActiveId],
   );
-
-  /** 删除指定会话；仅在当前连接仍有效时更新列表和当前历史。 */
+/** Delete the specified session; update the list and current history only while the connection remains current. */
   const deleteSession = useCallback(
     async (id: string): Promise<boolean> => {
       if (generationBusy || transitioning || !useConversationStore.getState().sessions.some((session) => session.id === id)) return false;
@@ -182,9 +231,13 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     responses,
     setResponses,
     transitioning,
+    hasMoreSessions,
+    loadingSessions,
+    loadMoreSessions,
     error,
     setError,
     selectSession,
+    changeSessionModel,
     createSession,
     deleteSession,
     conversationReady: Boolean(

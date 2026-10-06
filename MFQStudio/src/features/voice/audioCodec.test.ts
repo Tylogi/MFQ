@@ -1,8 +1,8 @@
-/** 验证实时语音编码、WAV 格式和跨块重采样的数值边界。 */
+/** Verify numeric boundaries for real-time voice encoding, WAV format, and cross-chunk resampling. */
 import { describe, expect, it } from 'vitest';
 import { base64ToFloat32, float32ToBase64, StreamingLinearResampler, wavBlob } from './audioCodec';
 
-/** 使用浏览器文件读取接口读取 WAV，兼容 jsdom 的 Blob 实现。 */
+/** Read WAV data with the browser file API, compatible with jsdom's Blob implementation. */
 function readBlob(blob: Blob): Promise<ArrayBuffer> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -13,7 +13,7 @@ function readBlob(blob: Blob): Promise<ArrayBuffer> {
 }
 
 describe('PCM Base64', () => {
-  it('保留浮点样本的原始字节，包括带偏移视图和大于编码分片的数据', () => {
+  it('verifies audioCodec test behavior 1', () => {
     const storage = Float32Array.from({ length: 25_000 }, (_, index) => Math.sin(index / 20));
     storage[12] = -0;
     storage[13] = Number.POSITIVE_INFINITY;
@@ -25,14 +25,14 @@ describe('PCM Base64', () => {
     expect(decoded.length).toBe(view.length);
   });
 
-  it('支持空音频，拒绝不能表示完整 Float32 的字节序列', () => {
+  it('verifies audioCodec test behavior 2', () => {
     expect(base64ToFloat32(float32ToBase64(new Float32Array(0)))).toHaveLength(0);
     expect(() => base64ToFloat32(btoa('abc'))).toThrow('multiple of 4');
   });
 });
 
 describe('StreamingLinearResampler', () => {
-  it.each([[48_000, 16_000], [44_100, 16_000], [16_000, 24_000]])('从 %i Hz 到 %i Hz 时分块结果与整块一致', (sourceRate, targetRate) => {
+  it.each([[48_000, 16_000], [44_100, 16_000], [16_000, 24_000]])('verifies audioCodec test behavior 3', (sourceRate, targetRate) => {
     const input = Float32Array.from({ length: 1201 }, (_, index) => Math.sin(index / 13));
     const expected = new StreamingLinearResampler(sourceRate, targetRate).push(input);
     const resampler = new StreamingLinearResampler(sourceRate, targetRate);
@@ -51,14 +51,14 @@ describe('StreamingLinearResampler', () => {
     actual.forEach((sample, index) => expect(sample).toBeCloseTo(expected[index], 5));
   });
 
-  it('插值会保留块尾样本，等待下一块到达后继续输出', () => {
+  it('verifies audioCodec test behavior 4', () => {
     const resampler = new StreamingLinearResampler(2, 4);
     expect(resampler.push(new Float32Array([0]))).toHaveLength(0);
     expect(Array.from(resampler.push(new Float32Array([1])))).toEqual([0, 0.5]);
     expect(Array.from(resampler.push(new Float32Array([0])))).toEqual([1, 0.5]);
   });
 
-  it('同采样率时复制输入，避免采集缓冲复用改写已排队的音频', () => {
+  it('verifies audioCodec test behavior 5', () => {
     const input = new Float32Array([0.2, 0.8]);
     const output = new StreamingLinearResampler(16_000, 16_000).push(input);
     expect(output).toEqual(input);
@@ -69,7 +69,7 @@ describe('StreamingLinearResampler', () => {
 });
 
 describe('WAV', () => {
-  it('写入单声道 PCM 头、合并块并把超出范围的样本裁到 16 位边界', async () => {
+  it('verifies audioCodec test behavior 6', async () => {
     const blob = wavBlob([new Float32Array([-2, -1, -0.5]), new Float32Array([0, 0.5, 1, 2])], 24_000);
     expect(blob.type).toBe('audio/wav');
     const buffer = await readBlob(blob);
@@ -91,7 +91,7 @@ describe('WAV', () => {
       .toEqual([-32768, -32768, -16384, 0, 16383, 32767, 32767]);
   });
 
-  it('没有样本时仍返回结构完整的空 WAV', async () => {
+  it('verifies audioCodec test behavior 7', async () => {
     const buffer = await readBlob(wavBlob([], 16_000));
     expect(buffer.byteLength).toBe(44);
     expect(new DataView(buffer).getUint32(40, true)).toBe(0);

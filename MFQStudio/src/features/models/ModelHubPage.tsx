@@ -1,17 +1,20 @@
+/** Provide ModelHubPage interface behavior. */
+import { localized } from '../../i18n/messages';
+import { useTranslation } from 'react-i18next';
 import { type CSSProperties, useEffect, useRef, useState } from 'react';
 import { jobsApi } from '../../shared/api/resources/jobs';
 import type { JobKindResource, JobResource } from '../../shared/api/types';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { errorMessage } from '../../app/formatters';
 import { toast } from '../../stores/toastStore';
-import { useSettings } from '../settings/SettingsProvider';
 import { Icon } from '../../app/display';
 import { useJobStore } from '../../stores/jobStore';
 import { ModelBrowser, type DownloadOrigin, type ModelBrowserTab } from './ModelBrowser';
 import { DownloadQueue, downloadProgress, isActiveDownload, isModelDownload } from './DownloadQueue';
 
+/** Coordinate catalog tabs, download submission, and the shared download queue. */
 export function ModelHubPage() {
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const { addJob } = useRuntime();
   const jobs = useJobStore((state) => state.jobs);
   const downloads = jobs.filter(isModelDownload);
@@ -46,7 +49,7 @@ export function ModelHubPage() {
 
   function trackDownload(job: JobResource, origin: DownloadOrigin) {
     addJob(job);
-    toast.success(tr('下载任务已提交', 'Download job submitted'));
+    toast.success(localized('models:modelHubPage.downloadJobSubmitted'));
     const rect = circle.current?.getBoundingClientRect();
     if (rect) setFlight({ id: job.id, origin, dx: rect.left + rect.width / 2 - origin.x, dy: rect.top + rect.height / 2 - origin.y });
   }
@@ -60,10 +63,10 @@ export function ModelHubPage() {
         tab={tab}
         onTabChange={setTab}
         downloadQueue={<DownloadQueue jobs={downloads} onJobCreated={trackDownload} />}
-        tr={tr}
+        t={t}
       />
       <button ref={circle} className={`download-circle${flight ? ' receiving' : ''}`} type="button"
-        aria-label={tr('下载队列', 'Download queue')} title={tr('下载队列', 'Download queue')}
+        aria-label={t('models:modelHubPage.downloadQueue')} title={t('models:modelHubPage.downloadQueue')}
         onClick={() => {
           setTab('downloads');
           page.current?.scrollIntoView({ block: 'start', behavior: 'smooth' });

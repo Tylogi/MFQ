@@ -576,3 +576,43 @@ WebSockets are not represented as OpenAPI path operations. The
 `x-mfq-websocket` extension records the legacy frame model; current handshake
 and native realtime proxy behavior are documented in
 [the WebSocket API](websocket.md).
+
+
+### Paginated runtime history
+
+`GET /api/v1/runtime/logs` accepts exclusive `before` and `after` sequence cursors,
+`limit` (1–2000), and `order=asc|desc`. Its default ascending order remains compatible
+with incremental log consumers. Use `order=desc&limit=50` for the newest page, then
+`before=<oldest-sequence>` for older pages. Use `after=<newest-sequence>&order=asc`
+to catch up new events without skipping a burst larger than one page.
+
+`GET /api/v1/runtime/requests` accepts the same cursors, defaults to descending order
+and a limit of 50, and returns a `RuntimeMetricList`. Each row contains one terminal
+request in `values.last_request`, including `status` (`completed`, `failed`, or
+`cancelled`) and available usage/performance fields. Missing metrics remain absent.
+Requests are committed at stream termination, independently of status reads and
+metric snapshot retention. Idempotency is scoped by backend source, instance,
+model, and request ID. Existing sampled requests are migrated once; previously
+unsampled requests cannot be recovered.
+
+### Live runtime history (SSE)
+
+`GET /api/v1/runtime/logs/stream` and `GET /api/v1/runtime/requests/stream` return
+`text/event-stream` using the same authorization as their history endpoints.
+Use `after=<sequence>` or `Last-Event-ID` (the greater cursor wins) to resume.
+Each event has its durable row sequence as `id`, `logs` or `requests` as its
+`event`, and the corresponding history row as JSON `data`. Cursors belong to
+individual channels and must not be shared between them. Log streams also accept
+`instance_id` and `level` filters.
+
+Load the newest history page first, then subscribe after its greatest sequence
+(or zero for an empty page). The server replays all subsequent records before
+waiting for new commits. Comment heartbeats are sent every 15 seconds; reconnect
+with the last applied cursor after disconnection and ignore duplicate sequences.
+Commit notifications wake local subscribers immediately without per-client row
+queues. Writes through another process/store are discovered on the heartbeat.
+Older history remains available through paginated GET requests.
+
+`GET /api/v1/runtime/status` is read-only. The server samples overview metrics in
+its background lifecycle; neither opening a page nor polling status creates
+request history records.

@@ -1,7 +1,8 @@
+/** Render grouped navigation and the current runtime summary. */
+import { useTranslation } from 'react-i18next';
 import { useEffect, type ComponentProps } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { useRuntime } from './RuntimeProvider';
-import { useSettings } from '../features/settings/SettingsProvider';
 import {
   UpdateAvailableBanner,
   useStudioUpdateContext,
@@ -11,11 +12,11 @@ import { Icon } from './display';
 import { ModelVendorMark, modelVendor } from './ModelVendorMark';
 import { formatNumber } from './formatters';
 import { runtimeModelNames } from '../features/runtime/modelSelection';
-import { dashboardPath, labPath, resolveStudioLocation, isStudioPath,
+import { dashboardPath, labPath, resolveStudioLocation, isStudioPath, STUDIO_PATHS,
   type DashboardPage, type LabPage } from '../navigation';
 
 type NavItem = {
-  label: [string, string];
+  label: string;
   icon: ComponentProps<typeof Icon>['name'];
   path: string;
   active: boolean;
@@ -23,10 +24,11 @@ type NavItem = {
   count?: number;
 };
 
+/** Render grouped navigation and the current runtime summary. */
 export function StudioSidebar() {
   const location = useLocation();
   const navigate = useNavigate();
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const studioUpdates = useStudioUpdateContext();
   const { runtime, selectedModel: model, models, instances, loading: selectedModelLoading } = useRuntime();
   const sidebarOpen = useUiStore((state) => state.sidebarOpen);
@@ -54,33 +56,33 @@ export function StudioSidebar() {
 
   const dashboard = (page: DashboardPage) => dashboardPath(page);
   const lab = (page: LabPage) => labPath(page);
-  const groups: { label: [string, string]; items: NavItem[] }[] = [
-    { label: ['推理', 'Inference'], items: [
-      { label: ['概览', 'Overview'], icon: 'gauge', path: dashboard('overview'),
+  const groups: { label: string; items: NavItem[] }[] = [
+    { label: t('app:studioSidebar.inference'), items: [
+      { label: t('app:studioSidebar.overview'), icon: 'gauge', path: dashboard('overview'),
         active: view === 'dashboard' && dashboardPage === 'overview', current: true,
         count: activeRequests > 0 ? activeRequests : undefined },
-      { label: ['模型', 'Models'], icon: 'folder', path: dashboard('models'),
+      { label: t('app:studioSidebar.models'), icon: 'folder', path: dashboard('models'),
         active: view === 'dashboard' && dashboardPage === 'models', current: true },
-      { label: ['服务', 'Service'], icon: 'server-rack', path: '/runtime',
+      { label: t('app:studioSidebar.service'), icon: 'server-rack', path: '/runtime',
         active: view === 'dashboard' && dashboardPage === 'connections', current: true },
-      { label: ['资源', 'Resources'], icon: 'memory', path: dashboard('cache'),
+      { label: t('app:studioSidebar.resources'), icon: 'memory', path: dashboard('cache'),
         active: view === 'dashboard' && dashboardPage === 'cache', current: true },
     ] },
-    { label: ['交互', 'Playground'], items: [
-      { label: ['对话', 'Chat'], icon: 'chat', path: '/chat', active: view === 'chat', current: true },
+    { label: t('app:studioSidebar.playground'), items: [
+      { label: t('app:studioSidebar.chat'), icon: 'chat', path: '/chat', active: view === 'chat', current: true },
     ] },
-    { label: ['模型工具', 'Model tools'], items: [
-      { label: ['模型下载', 'Model downloads'], icon: 'download', path: lab('models'),
+    { label: t('app:studioSidebar.modelTools'), items: [
+      { label: t('app:studioSidebar.modelDownloads'), icon: 'download', path: lab('models'),
         active: view === 'lab' && labPage === 'models' },
-      { label: ['评测与数据集', 'Evaluations'], icon: 'activity', path: lab('evaluations'),
+      { label: t('app:studioSidebar.evaluations'), icon: 'activity', path: lab('evaluations'),
         active: view === 'lab' && labPage === 'evaluations' },
-      { label: ['量化工作台', 'Quantization'], icon: 'memory', path: lab('quantization'),
+      { label: t('app:studioSidebar.quantization'), icon: 'memory', path: STUDIO_PATHS.quantizationComingSoon,
         active: view === 'lab' && labPage === 'quantization' },
     ] },
-    { label: ['系统', 'System'], items: [
-      { label: ['日志', 'Logs'], icon: 'activity', path: dashboard('logs'),
+    { label: t('app:studioSidebar.system'), items: [
+      { label: t('app:studioSidebar.logs'), icon: 'activity', path: dashboard('logs'),
         active: view === 'dashboard' && dashboardPage === 'logs', current: true },
-      { label: ['设置', 'Settings'], icon: 'settings', path: '/settings',
+      { label: t('common:settings'), icon: 'settings', path: '/settings',
         active: view === 'dashboard' && dashboardPage === 'settings', current: true },
     ] },
   ];
@@ -98,10 +100,10 @@ export function StudioSidebar() {
           <div><strong>MFQ</strong><span>Studio</span></div>
         </div>
         <div className="sidebar-scroll">
-          <nav className="sectioned-nav" aria-label={tr('推理', 'Inference')}>
+          <nav className="sectioned-nav" aria-label={t('app:studioSidebar.inference')}>
             {groups.map((group) => (
-              <section key={group.label[1]}>
-                <div className="sidebar-group-label">{tr(...group.label)}</div>
+              <section key={group.items[0].path}>
+                <div className="sidebar-group-label">{group.label}</div>
                 {group.items.map((item) => (
                   <button
                     aria-current={item.active ? 'page' : undefined}
@@ -111,7 +113,7 @@ export function StudioSidebar() {
                     type="button"
                   >
                     <Icon name={item.icon} />
-                    {tr(...item.label)}
+                    {item.label}
                     {item.count != null && <span>{formatNumber(item.count)}</span>}
                   </button>
                 ))}
@@ -122,21 +124,20 @@ export function StudioSidebar() {
         <UpdateAvailableBanner
           onOpen={() => open('/settings')}
           status={studioUpdates.status}
-          tr={tr}
+          t={t}
         />
         <button className="sidebar-runtime-card" onClick={() => open(dashboard('overview'))} type="button">
           <span className={`runtime-dot ${activeRequests > 0 ? 'busy' : selectedModelAvailable
             ? 'ready' : selectedModelLoading ? 'busy' : 'idle'}`} />
           <span>
-            <strong>{model || tr('服务空闲', 'Server idle')}</strong>
+            <strong>{model || t('app:studioSidebar.serverIdle')}</strong>
             <small>{availableModelNames.length > 1
-              ? tr(`${availableModelNames.length} 个模型已加载`,
-                `${availableModelNames.length} models loaded`)
+              ? t('app:studioSidebar.modelsLoaded', { count: availableModelNames.length })
               : selectedModelAvailable
-                ? `${formatNumber(activeRequests)} ${tr('个活动请求', 'active requests')}`
+                ? `${formatNumber(activeRequests)} ${t('app:studioSidebar.activeRequests')}`
                 : selectedModelLoading
-                  ? tr('模型加载中', 'Model loading')
-                  : tr('选择模型以开始', 'Choose a model to begin')}</small>
+                  ? t('app:studioSidebar.modelLoading')
+                  : t('app:studioSidebar.chooseAModelToBegin')}</small>
           </span>
           {modelVendor(model, model === runtime?.model ? runtime.model_capabilities?.architecture_family || runtime.model_type : undefined)
             ? <ModelVendorMark name={model} size={20}
@@ -145,11 +146,11 @@ export function StudioSidebar() {
         </button>
       </aside>
       <button aria-controls="studio-sidebar" aria-expanded={sidebarOpen}
-        aria-label={tr('打开侧栏', 'Open sidebar')} className="mobile-menu-trigger"
+        aria-label={t('app:studioSidebar.openSidebar')} className="mobile-menu-trigger"
         onClick={openSidebar} type="button">
         <Icon name="menu" size={17} />
       </button>
-      <button aria-label={tr('关闭侧栏', 'Close sidebar')}
+      <button aria-label={t('app:studioSidebar.closeSidebar')}
         className={`mobile-scrim ${sidebarOpen ? 'open' : ''}`}
         onClick={closeSidebar} type="button" />
     </>

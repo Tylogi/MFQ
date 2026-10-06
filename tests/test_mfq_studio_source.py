@@ -1,8 +1,8 @@
-"""校验 Tauri Rust、发布脚本与 TypeScript 桥接的跨语言契约。
+"""Validate cross-language contracts for Tauri Rust, release scripts, and TypeScript bridges.
 
-纯前端迁移映射：MFQStudio/tests/studioContracts.test.ts、
-studioBehavior.test.tsx、studioMedia.test.tsx 与 voiceContracts.test.ts。
-Vitest 中保留旧测试名；源码契约明确标注为过渡，媒体等行为单独验证。
+Frontend migration mapping: MFQStudio/tests/studioContracts.test.ts,
+studioBehavior.test.tsx, studioMedia.test.tsx, and voiceContracts.test.ts.
+Legacy test names are retained in Vitest; source contracts are marked as transitional, with media and other behavior verified separately.
 """
 
 import json
@@ -25,6 +25,21 @@ UPDATE_MANAGER = (
 ).read_text(encoding="utf-8")
 UPDATER = (TAURI / "src" / "updater.rs").read_text(encoding="utf-8")
 RELEASE_SCRIPT = (ROOT / "packaging" / "build_release_mac.sh").read_text(encoding="utf-8")
+
+
+def assert_translated(source: str, key: str):
+    """Require a translation call and a nonempty value in every supported catalog."""
+    assert f"t('{key}')" in source
+    namespace, path = key.split(":", 1)
+    for language in ("en", "zh-CN"):
+        value = json.loads(
+            (STUDIO / "src" / "i18n" / "locales" / language / f"{namespace}.json")
+            .read_text(encoding="utf-8")
+        )
+        for segment in path.split("."):
+            value = value[segment]
+        assert isinstance(value, str) and value.strip(), (language, key)
+        assert value != key, (language, key)
 
 
 def test_studio_uses_one_package_for_web_and_desktop_clients():
@@ -93,13 +108,15 @@ def test_model_hub_resolves_links_and_downloads_selected_variants():
     )
     assert "downloadPatterns(variant)" in MODEL_BROWSER
     assert "jobsApi.createJob" in MODEL_BROWSER
-    assert 'tr("官方模型", "Official")' in MODEL_BROWSER
-    assert 'tr("第三方模型", "Community")' in MODEL_BROWSER
-    assert 'tr("内存压力", "Memory pressure")' in MODEL_BROWSER
-    assert "Based on resident weight baselines" in MODEL_BROWSER
-    assert "KV cache and runtime overhead need additional memory." in MODEL_BROWSER
-    assert "三星推荐" not in MODEL_BROWSER
-    assert "3-star recommendation" not in MODEL_BROWSER
+    for key in (
+        "official", "community", "memoryPressure",
+        "basedOnResidentWeightBaselinesKvCacheAndRuntimeOverheadNeedAdditional",
+    ):
+        assert_translated(MODEL_BROWSER, f"models:modelBrowser.{key}")
+    for language in ("en", "zh-CN"):
+        catalog = (STUDIO / "src" / "i18n" / "locales" / language / "models.json").read_text(encoding="utf-8")
+        assert "三星推荐" not in catalog
+        assert "3-star recommendation" not in catalog
     for symbol in ('"★★★"', '"★★"', '"★"', '"▲"', '"✕"'):
         assert symbol in MODEL_BROWSER
 
@@ -116,4 +133,4 @@ def test_studio_checks_releases_and_keeps_verified_versions_for_rollback():
     assert "replace_macos_bundle" in UPDATER
     assert "com.tylogi.mfq-studio" in UPDATER
     assert "studioUpdateStatus(false)" in UPDATE_MANAGER
-    assert 'tr("自动检查并提醒", "Automatically check and notify")' in UPDATE_MANAGER
+    assert_translated(UPDATE_MANAGER, "settings:updateManager.automaticallyCheckAndNotify")

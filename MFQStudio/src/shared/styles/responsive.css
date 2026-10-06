@@ -1,4 +1,4 @@
-/* 跨业务页面的容器和视口响应式规则。 */
+/* Container and viewport-responsive rules shared across business pages. */
 /* ---------- Responsive ---------- */
 
 @container (max-width: 620px) {

@@ -1,4 +1,4 @@
-"""提供前端静态文件，并为浏览器 History 路由统一回退到应用入口。"""
+"""Serve frontend static files and fall back to the application entry for browser History routes."""
 
 from pathlib import PurePosixPath
 
@@ -10,12 +10,12 @@ from starlette.types import Scope
 
 
 class SPAStaticFiles(StaticFiles):
-  """在静态文件未命中时处理页面导航，保留接口及资源的错误响应。"""
+  """Handle page navigation on static-file misses while preserving API and resource error responses."""
 
   async def get_response(self, path: str, scope: Scope) -> Response:
-    """优先返回实际文件，仅将符合页面导航约定的 404 回退到 index.html。"""
+    """Prefer actual files and fall back to index.html only for 404s that meet page-navigation criteria."""
     headers = Headers(scope=scope)
-    # StaticFiles 在 Windows 上传入反斜杠路径，先统一后再判断前缀。
+    # StaticFiles may pass backslash paths on Windows; normalize them before checking prefixes.
     normalized = path.replace('\\', '/').strip('/')
     reserved = {'api', 'v1', 'realtime', 'health', 'docs', 'redoc', 'assets', 'static'}
     is_navigation = (
@@ -35,9 +35,9 @@ class SPAStaticFiles(StaticFiles):
       if error.status_code != 404 or not is_navigation:
         raise
     else:
-      # HTML 模式可能返回 404.html 响应，而不是抛出异常。
+      # HTML mode may return a 404.html response instead of raising an exception.
       if response.status_code != 404 or not is_navigation:
         return response
 
-    # 仍通过 StaticFiles 读取入口，保留路径校验、缓存和 HEAD 处理。
+    # Continue using StaticFiles to read the entry, preserving path validation, caching, and HEAD handling.
     return await super().get_response('index.html', scope)

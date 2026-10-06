@@ -1,4 +1,4 @@
-/** 模拟 Studio 使用的 HTTP 服务，提供可控的生成、同步失败和取消场景。 */
+/** Mock Studio's HTTP service with controllable generation, sync failure, and cancellation scenarios. */
 import type { Page } from '@playwright/test';
 import type { Message, OfficialModelList, ResponseResource, Session, StreamRequest } from '../src/shared/api/types';
 
@@ -63,17 +63,17 @@ export const officialCatalog: OfficialModelList = {
 };
 
 interface MockOptions {
-  /** 首次生成后的历史查询返回失败，供验证手动恢复且不重复提交。 */
+  /** Fail the first history query after generation to verify manual recovery without duplicate submissions. */
   failFirstSync?: boolean;
-  /** 挂起生成请求直到用户调用取消接口。 */
+  /** Suspend the generation request until the user calls the cancellation endpoint. */
   waitForCancel?: boolean;
-  /** 挂起生成直到测试显式释放，验证跨路由生成不会被卸载取消。 */
+  /** Hold generation until explicitly released by the test to verify route changes do not cancel it on unmount. */
   holdResponse?: boolean;
-  /** 首次生成明确返回 HTTP 拒绝，验证草稿与附件可重试。 */
+  /** Explicitly reject the first generation request over HTTP to verify drafts and attachments can be retried. */
   rejectFirstSubmission?: boolean;
 }
 
-/** 为页面注册隔离的模拟 API，返回请求计数供验证生成幂等边界。 */
+/** Register an isolated mock API for the page and return request counts to verify generation idempotency boundaries. */
 export async function mockStudioServer(page: Page, options: MockOptions = {}) {
   const state = { submissions: 0, cancellations: 0, unexpected: [] as string[], requests: [] as string[], releaseResponse: () => {} };
   let messages: Message[] = [];
@@ -81,6 +81,8 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
   let failedSync = false;
   let releasePending: (() => void) | undefined;
   await page.addInitScript(() => {
+    // Seed a fresh browser context without overwriting preferences on reload.
+    if (localStorage.getItem('mfq.studio.generation.v1')) return;
     localStorage.setItem(
       'mfq.studio.generation.v1',
       JSON.stringify({ language: 'en', theme: 'light' }),

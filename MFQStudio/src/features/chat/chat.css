@@ -1,4 +1,4 @@
-/* 会话消息、输入区域及语音展示基础样式。 */
+/* Base styles for session messages, the input area, and voice display. */
 /* ---------- Chat ---------- */
 
 .chat-view {
@@ -32,9 +32,10 @@
   white-space: nowrap;
 }
 .chat-screen-actions { display: flex; min-width: 0; align-items: center; gap: 10px; }
-.chat-model-summary { display: grid; width: min(42vw, 540px); min-width: 0; gap: 4px; border: 1px solid var(--line); border-radius: 10px; padding: 8px 11px; background: var(--panel-control); text-align: left; }
-.chat-model-summary:focus-within { border-color: var(--line-strong); box-shadow: 0 0 0 3px var(--accent-soft); }
+.chat-model-summary { display: grid; width: min(42vw, 540px); min-width: 0; gap: 4px; padding: 8px 11px; background: transparent; text-align: left; }
 .chat-session-select-button { grid-template-columns: minmax(0, 1fr) auto; }
+.chat-session-select-button > strong { grid-column: 1; grid-row: 1; line-height: 18px; }
+.chat-session-select-button > small { grid-column: 1; grid-row: 2; line-height: 16px; }
 .chat-session-select-button > .model-vendor-mark { grid-column: 2; grid-row: 1 / span 2; align-self: center; }
 .chat-model-summary strong {
   overflow: hidden;

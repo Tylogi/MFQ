@@ -1,7 +1,7 @@
-/** 验证会话模块的惰性加载、历史竞态隔离及生成期间模型切换保护。 */
+/** Verify lazy session loading, history race isolation, and protection against model changes during generation. */
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
-import { sessionsApi } from '../../../shared/api/resources/sessions';
+import { SESSION_PAGE_SIZE, sessionsApi } from '../../../shared/api/resources/sessions';
 import type { Session, Message, RuntimeInstance } from '../../../shared/api/types';
 import { useConversationStore } from '../state/conversationStore';
 import { useConversationSessions } from './useConversationSessions';
@@ -33,7 +33,39 @@ beforeEach(() => {
   vi.spyOn(sessionsApi, 'deleteSession').mockResolvedValue(undefined);
 });
 
-it('连接版本变化后丢弃旧列表请求并加载新连接的会话', async () => {
+it('loads older sessions without switching the active chat and ignores duplicate records', async () => {
+  const page = Array.from({ length: SESSION_PAGE_SIZE }, (_, index) => ({ ...first, id: `session-${index}` }));
+  vi.mocked(sessionsApi.listSessions).mockResolvedValueOnce(page).mockResolvedValueOnce([page[0], second]);
+  const { result } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.hasMoreSessions).toBe(true));
+  await act(async () => result.current.loadMoreSessions());
+  expect(sessionsApi.listSessions).toHaveBeenLastCalledWith(SESSION_PAGE_SIZE);
+  expect(result.current.sessions).toHaveLength(SESSION_PAGE_SIZE + 1);
+  expect(result.current.activeId).toBe('session-0');
+  expect(result.current.hasMoreSessions).toBe(false);
+});
+
+it('discards pending older pages after switching servers and prevents duplicate loads', async () => {
+  const page = Array.from({ length: SESSION_PAGE_SIZE }, (_, index) => ({ ...first, id: `session-${index}` }));
+  let resolvePage!: (sessions: Session[]) => void;
+  vi.mocked(sessionsApi.listSessions)
+    .mockResolvedValueOnce(page)
+    .mockImplementationOnce(() => new Promise((resolve) => { resolvePage = resolve; }))
+    .mockResolvedValueOnce([second]);
+  const { result, rerender } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.hasMoreSessions).toBe(true));
+  let loading!: Promise<void>;
+  act(() => { loading = result.current.loadMoreSessions(); void result.current.loadMoreSessions(); });
+  expect(sessionsApi.listSessions).toHaveBeenCalledTimes(2);
+  runtime.connectionRevision += 1;
+  rerender();
+  await waitFor(() => expect(result.current.sessions).toEqual([second]));
+  await act(async () => { resolvePage([{ ...first, id: 'stale' }]); await loading; });
+  expect(result.current.sessions).toEqual([second]);
+  expect(result.current.loadingSessions).toBe(false);
+});
+
+it('verifies useConversationSessions test behavior 1', async () => {
   let resolveOld!: (sessions: Session[]) => void;
   vi.mocked(sessionsApi.listSessions)
     .mockImplementationOnce(() => new Promise((resolve) => { resolveOld = resolve; }))
@@ -47,7 +79,7 @@ it('连接版本变化后丢弃旧列表请求并加载新连接的会话', asyn
   expect(result.current.sessions).toEqual([second]);
 });
 
-it('创建会话期间连接重置不会将旧创建结果写入新列表', async () => {
+it('verifies useConversationSessions test behavior 2', async () => {
   let resolveCreate!: (session: Session) => void;
   vi.spyOn(sessionsApi, 'createSession').mockImplementationOnce(() =>
     new Promise((resolve) => { resolveCreate = resolve; }),
@@ -63,7 +95,7 @@ it('创建会话期间连接重置不会将旧创建结果写入新列表', asyn
   expect(result.current.sessions.some((session) => session.id === 'obsolete')).toBe(false);
 });
 
-it('未访问聊天不请求会话，访问后等待历史就绪才启用输入', async () => {
+it('verifies useConversationSessions test behavior 3', async () => {
   const { result, rerender } = renderHook(
     ({ enabled }) => useConversationSessions(enabled, false),
     { initialProps: { enabled: false } },
@@ -75,7 +107,7 @@ it('未访问聊天不请求会话，访问后等待历史就绪才启用输入'
   expect(sessionsApi.listSessions).toHaveBeenCalledOnce();
 });
 
-it('切换会话后迟到的旧历史不能覆盖当前消息', async () => {
+it('verifies useConversationSessions test behavior 4', async () => {
   let resolveOld!: (messages: Message[]) => void;
   vi.mocked(sessionsApi.listMessages).mockImplementation((id) =>
     id === 'a'
@@ -97,30 +129,52 @@ it('切换会话后迟到的旧历史不能覆盖当前消息', async () => {
   expect(result.current.messages[0]?.id).toBe('b-message');
 });
 
-it('后台生成期间不派生新模型会话，完成后再执行模型切换', async () => {
-  const { result, rerender } = renderHook(({ busy }) => useConversationSessions(true, busy), {
-    initialProps: { busy: true },
-  });
+it('keeps the active session and its recovery state when navigation is blocked', async () => {
+  const create = vi.spyOn(sessionsApi, 'createSession');
+  create.mockClear();
+  const { result } = renderHook(() => useConversationSessions(true, true));
   await waitFor(() => expect(result.current.activeId).toBe('a'));
-  runtime.selectedModel = 'model-b';
-  rerender({ busy: true });
-  expect(sessionsApi.forkSession).not.toHaveBeenCalled();
-  rerender({ busy: false });
-  await waitFor(() => expect(result.current.activeId).toBe('fork'));
-  expect(sessionsApi.forkSession).toHaveBeenCalledOnce();
+  act(() => result.current.selectSession('b'));
+  await act(async () => result.current.createSession());
+  expect(result.current.activeId).toBe('a');
+  expect(create).not.toHaveBeenCalled();
 });
 
-it('模型只在已载入实例里，也能切换并用于会话，无需资产注册', async () => {
-  runtime.models = [];
-  runtime.instances = [{ id: 'loaded-b', model: 'model-b', state: 'ready' }] as RuntimeInstance[];
-  runtime.selectedModel = 'model-b';
-  const { result } = renderHook(() => useConversationSessions(true, false));
+it('does not fork history when runtime reconciliation selects another available model', async () => {
+  const { result, rerender } = renderHook(() => useConversationSessions(true, false));
   await waitFor(() => expect(result.current.conversationReady).toBe(true));
-  expect(result.current.active?.model).toBe('model-b');
-  expect(sessionsApi.forkSession).toHaveBeenCalledWith('a', null, true, 'A', 'model-b');
+  runtime.selectedModel = 'model-b';
+  rerender();
+  expect(sessionsApi.forkSession).not.toHaveBeenCalled();
+  expect(result.current.sessions).toEqual([first, second]);
+  expect(result.current.activeId).toBe('a');
 });
 
-it('删除当前会话后切换到剩余会话并清除旧历史', async () => {
+it('forks once when the user explicitly changes the chat model', async () => {
+  const { result, rerender } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.conversationReady).toBe(true));
+  act(() => result.current.changeSessionModel('model-b'));
+  runtime.selectedModel = 'model-b';
+  rerender();
+  await waitFor(() => expect(result.current.activeId).toBe('fork'));
+  expect(sessionsApi.forkSession).toHaveBeenCalledExactlyOnceWith('a', null, true, 'A', 'model-b');
+});
+
+it('opens history for an unloaded model without duplicating the conversation', async () => {
+  const historical = { ...second, model: 'unloaded-model' };
+  vi.mocked(sessionsApi.listSessions).mockResolvedValue([first, historical]);
+  const { result, rerender } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.conversationReady).toBe(true));
+  act(() => result.current.selectSession('b'));
+  runtime.selectedModel = 'model-b';
+  rerender();
+  await waitFor(() => expect(useConversationStore.getState().historyLoadedId).toBe('b'));
+  expect(result.current.sessions).toEqual([first, historical]);
+  expect(result.current.activeId).toBe('b');
+  expect(sessionsApi.forkSession).not.toHaveBeenCalled();
+});
+
+it('verifies useConversationSessions test behavior 7', async () => {
   const { result } = renderHook(() => useConversationSessions(true, false));
   await waitFor(() => expect(result.current.conversationReady).toBe(true));
   await act(async () => expect(await result.current.deleteSession('a')).toBe(true));
@@ -131,7 +185,7 @@ it('删除当前会话后切换到剩余会话并清除旧历史', async () => {
   await waitFor(() => expect(result.current.conversationReady).toBe(true));
 });
 
-it('删除非当前会话不改变选中项，删除最后一条后进入空状态', async () => {
+it('verifies useConversationSessions test behavior 8', async () => {
   const { result } = renderHook(() => useConversationSessions(true, false));
   await waitFor(() => expect(result.current.conversationReady).toBe(true));
   runtime.setSelectedModel.mockClear();
@@ -144,7 +198,7 @@ it('删除非当前会话不改变选中项，删除最后一条后进入空状�
   expect(result.current.messages).toEqual([]);
 });
 
-it('删除失败保留原会话并展示错误', async () => {
+it('verifies useConversationSessions test behavior 9', async () => {
   vi.mocked(sessionsApi.deleteSession).mockRejectedValueOnce(new Error('delete failed'));
   const { result } = renderHook(() => useConversationSessions(true, false));
   await waitFor(() => expect(result.current.conversationReady).toBe(true));
@@ -154,7 +208,7 @@ it('删除失败保留原会话并展示错误', async () => {
   expect(result.current.error).toContain('delete failed');
 });
 
-it('删除期间连接切换不回写旧连接的结果', async () => {
+it('verifies useConversationSessions test behavior 10', async () => {
   let resolveDelete!: () => void;
   vi.mocked(sessionsApi.deleteSession).mockImplementationOnce(() =>
     new Promise((resolve) => { resolveDelete = resolve; }),

@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from functools import partial
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Query, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Header, Query, Request, Response, WebSocket, WebSocketDisconnect
+
+from fastapi.responses import StreamingResponse
+from mfq.server.services.telemetry_stream import stream_history
 
 from mfq.server.api.dependencies import (
     ServiceDependency,
@@ -242,6 +246,25 @@ async def runtime_metrics(
 
 
 @router.get(
+    "/api/v1/runtime/requests",
+    response_model=RuntimeMetricList,
+    responses=ERROR_RESPONSES,
+    tags=["runtime"],
+)
+async def runtime_requests(
+    service: ServiceDependency,
+    before: Annotated[int | None, Query(ge=1)] = None,
+    after: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=2000)] = 50,
+    order: Literal["asc", "desc"] = "desc",
+) -> RuntimeMetricList:
+    """Page independently persisted terminal request history."""
+    return await service.runtime_requests(
+        before=before, after=after, limit=limit, descending=order == "desc"
+    )
+
+
+@router.get(
     "/api/v1/runtime/logs",
     response_model=RuntimeLogList,
     responses=ERROR_RESPONSES,
@@ -253,9 +276,47 @@ async def runtime_logs(
     level: RuntimeLogLevel | None = None,
     after: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=2000)] = 200,
+    before: Annotated[int | None, Query(ge=1)] = None,
+    order: Literal["asc", "desc"] = "asc",
 ) -> RuntimeLogList:
+    """Read incremental logs or page backwards from the newest retained events."""
     return await service.runtime_logs(
-        instance_id=instance_id, level=level, after=after, limit=limit
+        instance_id=instance_id, level=level, after=after, limit=limit,
+        before=before, descending=order == "desc",
+    )
+
+
+@router.get('/api/v1/runtime/logs/stream', response_class=StreamingResponse,
+            responses={**ERROR_RESPONSES, 200: {'content': {'text/event-stream': {'schema': {'type': 'string'}}}}}, tags=['runtime'])
+async def stream_runtime_logs(
+    service: ServiceDependency,
+    after: Annotated[int, Query(ge=0)] = 0,
+    last_event_id: Annotated[int | None, Header(alias='Last-Event-ID', ge=0)] = None,
+    instance_id: UUID | None = None,
+    level: RuntimeLogLevel | None = None,
+) -> StreamingResponse:
+    """Replay and push committed logs, preserving filters across reconnections."""
+    read = partial(service.store.list_runtime_logs, instance_id=instance_id, level=level)
+    return StreamingResponse(
+        stream_history(service.store, 'logs', read, max(after, last_event_id or 0)),
+        media_type='text/event-stream',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+    )
+
+
+@router.get('/api/v1/runtime/requests/stream', response_class=StreamingResponse,
+            responses={**ERROR_RESPONSES, 200: {'content': {'text/event-stream': {'schema': {'type': 'string'}}}}}, tags=['runtime'])
+async def stream_runtime_requests(
+    service: ServiceDependency,
+    after: Annotated[int, Query(ge=0)] = 0,
+    last_event_id: Annotated[int | None, Header(alias='Last-Event-ID', ge=0)] = None,
+) -> StreamingResponse:
+    """Replay and push terminal requests independently of runtime status queries."""
+    return StreamingResponse(
+        stream_history(service.store, 'requests', service.store.list_runtime_requests,
+                       max(after, last_event_id or 0)),
+        media_type='text/event-stream',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
     )
 
 

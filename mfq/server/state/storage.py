@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 import hashlib
 import json
 import os
@@ -68,7 +70,7 @@ from mfq.server.protocol.models import (
     UpdateSessionRequest,
 )
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 _CONTENT_PARTS = TypeAdapter(list[ContentPart])
 _MAX_RUNTIME_METRICS = 20_000
 
@@ -167,6 +169,8 @@ class SessionStore:
     """Own short SQLite transactions; never hold a transaction during inference."""
 
     def __init__(self, path: str | Path, *, media_root: str | Path | None = None) -> None:
+        self._telemetry_lock = threading.Lock()
+        self._telemetry_subscribers: dict[str, dict[asyncio.Event, asyncio.AbstractEventLoop]] = {}
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.media_root = (
@@ -431,6 +435,15 @@ class SessionStore:
                 CREATE INDEX IF NOT EXISTS runtime_metrics_captured
                     ON runtime_metrics(captured_at DESC);
 
+                CREATE TABLE IF NOT EXISTS runtime_requests (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    identity TEXT NOT NULL UNIQUE,
+                    instance_id TEXT,
+                    model TEXT,
+                    values_json TEXT NOT NULL,
+                    captured_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS runtime_logs (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     instance_id TEXT,
@@ -453,7 +466,7 @@ class SessionStore:
                     (str(SCHEMA_VERSION),),
                 )
             elif int(existing["value"]) in {
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
             }:
                 columns = {
                     row["name"] for row in connection.execute("PRAGMA table_info(responses)")
@@ -484,6 +497,16 @@ class SessionStore:
                     connection.execute("ALTER TABLE jobs ADD COLUMN archived_at TEXT")
                 if "progress_data_json" not in job_columns:
                     connection.execute("ALTER TABLE jobs ADD COLUMN progress_data_json TEXT NOT NULL DEFAULT '{}'")
+                # Preserve only known historical requests; missing samples cannot be recovered.
+                connection.execute("""
+                    INSERT OR IGNORE INTO runtime_requests(identity, instance_id, model, values_json, captured_at)
+                    SELECT json_array('default', COALESCE(instance_id, ''), model, json_extract(values_json, '$.last_request.id')),
+                           instance_id, model, values_json, captured_at
+                    FROM runtime_metrics
+                    WHERE json_type(values_json, '$.last_request.id') = 'text'
+                      AND json_extract(values_json, '$.last_request.id') != ''
+                    ORDER BY sequence
+                """)
                 connection.execute(
                     "UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
                     (str(SCHEMA_VERSION),),
@@ -2500,6 +2523,49 @@ class SessionStore:
                 )
         return [UUID(row["id"]) for row in rows]
 
+    @contextmanager
+    def subscribe_telemetry(self, channel: str):
+        """Register before reading history so commits cannot fall into a subscribe gap."""
+        event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        with self._telemetry_lock:
+            self._telemetry_subscribers.setdefault(channel, {})[event] = loop
+        try:
+            yield event
+        finally:
+            with self._telemetry_lock:
+                self._telemetry_subscribers[channel].pop(event, None)
+
+    def _notify_telemetry(self, channel: str) -> None:
+        """Wake subscribers after commit without buffering rows or blocking writers."""
+        with self._telemetry_lock:
+            subscribers = tuple(self._telemetry_subscribers.get(channel, {}).items())
+        for event, loop in subscribers:
+            try:
+                loop.call_soon_threadsafe(event.set)
+            except RuntimeError:
+                pass  # A disconnected subscriber may already have closed its loop.
+
+    def append_runtime_request(
+        self, values: dict[str, Any], *, instance_id: UUID | None = None,
+        model: str | None = None, source: str = 'default', now: datetime | None = None,
+    ) -> RuntimeMetricSnapshot:
+        """Commit one terminal request; retries return the existing immutable record."""
+        request_id = values['last_request']['id']
+        identity = json.dumps([source, str(instance_id or ''), model, request_id], separators=(',', ':'), ensure_ascii=False)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """INSERT INTO runtime_requests(identity, instance_id, model, values_json, captured_at)
+                   VALUES (?, ?, ?, ?, ?) ON CONFLICT(identity) DO NOTHING""",
+                (identity, str(instance_id) if instance_id else None, model,
+                 json.dumps(values), _timestamp(now or _utcnow())),
+            )
+            inserted = cursor.rowcount > 0
+            row = connection.execute('SELECT * FROM runtime_requests WHERE identity = ?', (identity,)).fetchone()
+        if inserted:
+            self._notify_telemetry('requests')
+        return self._runtime_metric_from_row(row)
+
     def append_runtime_metric(
         self,
         values: dict[str, Any],
@@ -2591,6 +2657,7 @@ class SessionStore:
                 ),
             )
             sequence = int(cursor.lastrowid)
+        self._notify_telemetry("logs")
         return RuntimeLogEntry(
             sequence=sequence,
             instance_id=instance_id,
@@ -2600,6 +2667,36 @@ class SessionStore:
             created_at=created_at,
         )
 
+    def list_runtime_requests(
+        self,
+        *,
+        before: int | None = None,
+        after: int = 0,
+        limit: int = 50,
+        descending: bool = True,
+    ) -> list[RuntimeMetricSnapshot]:
+        """Page durable terminal requests using stable, independent sequence cursors."""
+        if after < 0 or (before is not None and before < 1):
+            raise ValueError("invalid request cursor")
+        if limit < 1 or limit > 2000:
+            raise ValueError("limit must be between 1 and 2000")
+        clauses = ["sequence > ?"]
+        values: list[object] = [after]
+        if before is not None:
+            clauses.append("sequence < ?")
+            values.append(before)
+        direction = "DESC" if descending else "ASC"
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM runtime_requests
+                WHERE {" AND ".join(clauses)}
+                ORDER BY sequence {direction} LIMIT ?
+                """,
+                (*values, limit),
+            ).fetchall()
+        return [self._runtime_metric_from_row(row) for row in rows]
+
     def list_runtime_logs(
         self,
         *,
@@ -2607,25 +2704,34 @@ class SessionStore:
         level: RuntimeLogLevel | None = None,
         after: int = 0,
         limit: int = 200,
+        before: int | None = None,
+        descending: bool = False,
     ) -> list[RuntimeLogEntry]:
+        """Read an exclusive cursor page, keeping ascending incremental reads compatible."""
         if after < 0:
             raise ValueError("after must be non-negative")
+        if before is not None and before < 1:
+            raise ValueError("before must be positive")
         if limit < 1 or limit > 2000:
             raise ValueError("limit must be between 1 and 2000")
         clauses = ["sequence > ?"]
         values: list[object] = [after]
+        if before is not None:
+            clauses.append("sequence < ?")
+            values.append(before)
         if instance_id is not None:
             clauses.append("instance_id = ?")
             values.append(str(instance_id))
         if level is not None:
             clauses.append("level = ?")
             values.append(level.value)
+        direction = "DESC" if descending else "ASC"
         with self._connection() as connection:
             rows = connection.execute(
                 f"""
                 SELECT * FROM runtime_logs
                 WHERE {" AND ".join(clauses)}
-                ORDER BY sequence ASC LIMIT ?
+                ORDER BY sequence {direction} LIMIT ?
                 """,
                 (*values, limit),
             ).fetchall()

@@ -1,4 +1,5 @@
-/** 验证实例推理能力、附件类型和聊天工具栏的真实交互。 */
+/** Verify real interactions for instance inference capabilities, attachment types, and the chat toolbar. */
+import { i18n } from '../src/i18n';
 import { act, render, renderHook, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -26,7 +27,7 @@ let settings: ReturnType<typeof useSettings>['settings'];
 const updateSettings = vi.fn();
 const selectInteractionMode = vi.fn();
 
-/** 创建默认仅支持文本的能力响应，按场景覆盖能力位。 */
+/** Create a text-only capability response by default, overriding capability flags as needed per scenario. */
 function capabilities(features: Partial<RuntimeCapabilities['model_capabilities']['features']> = {}): RuntimeCapabilities {
   return {
     model: 'selected', model_type: 'test', vision_available: false,
@@ -41,7 +42,7 @@ function capabilities(features: Partial<RuntimeCapabilities['model_capabilities'
   };
 }
 
-/** 创建实例记录，区分选中模型、失败实例和其他模型。 */
+/** Create instance records distinguishing the selected model, failed instances, and other models. */
 function instance(overrides: Partial<RuntimeInstance> = {}): RuntimeInstance {
   return {
     id: 'selected-instance', model: 'selected', state: 'ready', devices: [],
@@ -49,7 +50,7 @@ function instance(overrides: Partial<RuntimeInstance> = {}): RuntimeInstance {
   };
 }
 
-/** 将真实推理 hook 接入工具栏，验证更新设置后的界面行为。 */
+/** Connect the real inference hook to the toolbar and verify interface behavior after settings changes. */
 function ToolbarHarness() {
   const inference = useChatInference('text');
   vi.mocked(useChat).mockReturnValue({
@@ -69,7 +70,7 @@ beforeEach(() => {
   vi.mocked(useRuntime).mockImplementation(() => runtime);
   updateSettings.mockImplementation((patch) => { settings = { ...settings, ...patch }; });
   vi.mocked(useSettings).mockImplementation(() => ({
-    settings, updateSettings, english: true, tr: (_zh: string, en: string) => en,
+    settings, updateSettings, english: true, t: i18n.getFixedT('en'),
     replaceSettings: vi.fn(), contextSize: 32768, setContextSize: vi.fn(),
   }));
   vi.mocked(useConversationSelector).mockImplementation((selector) => selector({
@@ -78,7 +79,7 @@ beforeEach(() => {
 });
 
 describe('useChatInference', () => {
-  it('思考能力随运行时变化，只有支持且启用时发送 enable_thinking', () => {
+  it('verifies runtimeContracts test behavior 1', () => {
     const { result, rerender } = renderHook(() => useChatInference('text'));
     expect(result.current.thinkingSupported).toBe(false);
     expect(result.current.sampling.enable_thinking).toBe(false);
@@ -91,7 +92,7 @@ describe('useChatInference', () => {
     expect(result.current.sampling.enable_thinking).toBe(false);
   });
 
-  it('返回 reasoning 档位并将所选档位或空值写入采样参数', () => {
+  it('verifies runtimeContracts test behavior 2', () => {
     runtime.runtime = { chat_template_capabilities: {
       thinking: { supported: true }, reasoning_effort: { values: ['low', 'high'] },
     } };
@@ -109,7 +110,7 @@ describe('useChatInference', () => {
   it.each([
     [true, true, true, true], [false, true, true, false],
     [true, false, true, false], [true, true, false, false],
-  ])('选中实例 MTP supported=%s available=%s enabled=%s 时请求为 %s', (supported, available, enabled, expected) => {
+  ])('verifies parameterized behavior %s', (supported, available, enabled, expected) => {
     runtime.capabilities = { ...capabilities({ mtp: !supported }), mtp_available: !available };
     runtime.instances = [
       instance({ model: 'other', mtp_supported: true, mtp_available: true }),
@@ -123,7 +124,7 @@ describe('useChatInference', () => {
     expect(result.current.sampling.enable_mtp).toBe(expected);
   });
 
-  it('MTP 字段缺失时回退到选中模型能力，切换后不借用其他模型能力', () => {
+  it('verifies runtimeContracts test behavior 3', () => {
     runtime.instances = [instance()];
     runtime.capabilities = { ...capabilities({ mtp: true }), mtp_available: true };
     const { result, rerender } = renderHook(() => useChatInference('text'));
@@ -141,14 +142,14 @@ describe('useChatInference', () => {
     [false, true, false, true, ['video/*']],
     [true, true, true, false, ['audio/*']],
     [false, false, false, true, []],
-  ] as const)('附件过滤 image=%s video=%s audio=%s visionEnabled=%s', (image, video, audio, enabled, media) => {
+  ] as const)('verifies parameterized behavior %s', (image, video, audio, enabled, media) => {
     runtime.capabilities = capabilities({ image_input: image, video_input: video, audio_input: audio });
     settings = { ...settings, enableVision: enabled };
     const { result } = renderHook(() => useChatInference('text'));
     expect(result.current.attachmentAccept.split(',')).toEqual([...media, ...DOCUMENT_ACCEPT.split(',')]);
   });
 
-  it('更新推理设置保留有效参数并退出模型默认值继承', () => {
+  it('verifies runtimeContracts test behavior 4', () => {
     settings = { ...settings, inheritModelDefaults: true };
     runtime.runtime = { sampling_defaults: { temperature: 0.25 } };
     const { result } = renderHook(() => useChatInference('text'));
@@ -160,12 +161,12 @@ describe('useChatInference', () => {
 });
 
 describe('ChatToolbar', () => {
-  it('无音频能力时不显示交互模式', () => {
+  it('verifies runtimeContracts test behavior 5', () => {
     render(<ToolbarHarness />);
     expect(screen.queryByRole('combobox', { name: 'Interaction mode' })).not.toBeInTheDocument();
   });
 
-  it('有 audio 无 duplex 时禁用 full_duplex，选择 voice 更新模式', async () => {
+  it('verifies runtimeContracts test behavior 6', async () => {
     runtime.capabilities = capabilities({ audio_input: true });
     const user = userEvent.setup();
     render(<ToolbarHarness />);
@@ -175,7 +176,7 @@ describe('ChatToolbar', () => {
     expect(selectInteractionMode).toHaveBeenCalledWith('voice');
   });
 
-  it('点击视觉和 MTP 更新设置并反映开关状态', async () => {
+  it('verifies runtimeContracts test behavior 7', async () => {
     runtime.capabilities = capabilities({ image_input: true });
     runtime.instances = [instance({ mtp_supported: true, mtp_available: true })];
     const user = userEvent.setup();
@@ -193,7 +194,7 @@ describe('ChatToolbar', () => {
     }
   });
 
-  it('MTP 缺少可用权重时禁用按钮且点击不更新设置', async () => {
+  it('verifies runtimeContracts test behavior 8', async () => {
     runtime.instances = [instance({ mtp_supported: true, mtp_available: false })];
     const user = userEvent.setup();
     render(<ToolbarHarness />);
@@ -207,7 +208,7 @@ describe('ChatToolbar', () => {
     { supported: true, enabled: false, values: ['low'], visible: false },
     { supported: true, enabled: true, values: [], visible: false },
     { supported: true, enabled: true, values: ['low', 'high'], visible: true },
-  ])('reasoning 档位支持=$supported 启用=$enabled values=$values 时可见=$visible', ({ supported, enabled, values, visible }) => {
+  ])('shows reasoning effort for supported=$supported enabled=$enabled values=$values visible=$visible', ({ supported, enabled, values, visible }) => {
     runtime.runtime = { chat_template_capabilities: {
       thinking: { supported }, reasoning_effort: { values },
     } };
@@ -218,7 +219,7 @@ describe('ChatToolbar', () => {
     else expect(select).not.toBeInTheDocument();
   });
 
-  it('选择 reasoning 档位更新设置，关闭思考后隐藏档位', async () => {
+  it('verifies runtimeContracts test behavior 9', async () => {
     runtime.runtime = { chat_template_capabilities: {
       thinking: { supported: true }, reasoning_effort: { values: ['low', 'high'] },
     } };

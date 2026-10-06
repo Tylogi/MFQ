@@ -1,11 +1,10 @@
-/** 选中任务的历史事件与实时事件订阅。 */
+/** Historical events and live-event subscription for the selected job. */
 import { useEffect, useState } from 'react';
 import type { RuntimeLogEntry } from '../../shared/api/types';
 import { jobsApi } from '../../shared/api/resources/jobs';
 import { errorMessage } from '../../app/formatters';
 import { toast } from '../../stores/toastStore';
-
-/** 订阅当前任务日志，切换任务时取消旧订阅并清空旧内容。 */
+/** Subscribe to the current job log, cancelling the old subscription and clearing old entries when switching jobs. */
 export function useJobEventLog(selectedJobId: string | null) {
   const [jobLogs, setJobLogs] = useState<RuntimeLogEntry[]>([]);
   useEffect(() => {

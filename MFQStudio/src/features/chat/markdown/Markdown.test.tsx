@@ -1,5 +1,5 @@
 /**
- * 验证流式 Markdown 限频、Prism 语法高亮与类名生成、代码块复制交互和不可信 HTML 净化。
+* Verify streaming Markdown throttling, Prism highlighting and class names, code-block copy interactions, and sanitization of untrusted HTML.
  */
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -8,7 +8,7 @@ import { Markdown } from './Markdown';
 afterEach(() => vi.useRealTimers());
 
 describe('Markdown', () => {
-  it('持续输入时按时间窗解析最新文本，结束时无需等待窗口', async () => {
+  it('verifies Markdown test behavior 1', async () => {
     vi.useFakeTimers();
     const view = render(<Markdown text="first" live />);
     view.rerender(<Markdown text="second" live />);
@@ -22,7 +22,7 @@ describe('Markdown', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('完整和流式输出都净化事件属性、脚本与危险链接', async () => {
+  it('verifies Markdown test behavior 2', async () => {
     const text =
       '<img src="x" onerror="alert(1)"><script>alert(1)</script>[link](javascript:alert(1))';
     const view = render(<Markdown text={text} live />);
@@ -33,7 +33,7 @@ describe('Markdown', () => {
     expect(view.container.querySelector('[onerror]')).toBeNull();
   });
 
-  it('未闭合代码块完成后有一个复制按钮，卸载时清理限频任务', async () => {
+  it('verifies Markdown test behavior 3', async () => {
     vi.useFakeTimers();
     const view = render(<Markdown text={'```js\nconst a = 1;'} live />);
     expect(screen.queryByRole('button')).not.toBeInTheDocument();
@@ -44,7 +44,7 @@ describe('Markdown', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('为常见语言生成标准代码块结构、语言标识与 Prism 语法高亮类名', () => {
+  it('verifies Markdown test behavior 4', () => {
     const sample = [
       '```typescript',
       'const count: number = 42;',
@@ -77,8 +77,7 @@ describe('Markdown', () => {
     ].join('\n');
 
     const view = render(<Markdown text={sample} />);
-
-    // 检查 TypeScript 代码块结构与高亮
+// Check TypeScript code-block structure and highlighting
     const tsPre = view.container.querySelector('pre[data-language="typescript"]');
     expect(tsPre).not.toBeNull();
     expect(tsPre?.className).toContain('code-block');
@@ -87,39 +86,34 @@ describe('Markdown', () => {
     expect(tsPre?.querySelector('.token.keyword')?.textContent).toBe('const');
     expect(tsPre?.querySelector('.token.builtin')?.textContent).toBe('number');
     expect(tsPre?.querySelector('.token.number')?.textContent).toBe('42');
-
-    // 检查 Python 代码块结构与高亮
+// Check Python code-block structure and highlighting
     const pyPre = view.container.querySelector('pre[data-language="python"]');
     expect(pyPre).not.toBeNull();
     expect(pyPre?.querySelector('.code-lang')?.textContent).toBe('python');
     expect(pyPre?.querySelector('.token.keyword')?.textContent).toBe('def');
     expect(pyPre?.querySelector('.token.function')?.textContent).toBe('greet');
-
-    // 检查 Bash 代码块
+// Check Bash code block
     const bashPre = view.container.querySelector('pre[data-language="bash"]');
     expect(bashPre).not.toBeNull();
     expect(bashPre?.querySelector('.code-lang')?.textContent).toBe('bash');
     expect(bashPre?.querySelector('.token.string')?.textContent).toBe('"status ok"');
-
-    // 检查 JSON 代码块结构与高亮
+// Check JSON code-block structure and highlighting
     const jsonPre = view.container.querySelector('pre[data-language="json"]');
     expect(jsonPre).not.toBeNull();
     expect(jsonPre?.querySelector('.code-lang')?.textContent).toBe('json');
     expect(jsonPre?.querySelector('.token.property')?.textContent).toBe('"status"');
     expect(jsonPre?.querySelector('.token.number')?.textContent).toBe('200');
-
-    // 检查 Rust 代码块
+// Check Rust code block
     const rustPre = view.container.querySelector('pre[data-language="rust"]');
     expect(rustPre).not.toBeNull();
     expect(rustPre?.querySelector('.token.keyword')?.textContent).toBe('fn');
-
-    // 检查 C++ 代码块
+// Check C++ code block
     const cppPre = view.container.querySelector('pre[data-language="cpp"]');
     expect(cppPre).not.toBeNull();
     expect(cppPre?.querySelector('.token.keyword')?.textContent).toBe('int');
   });
 
-  it('未提供语言或未知语言时优雅降级并安全转义 HTML', () => {
+  it('verifies Markdown test behavior 5', () => {
     const rawMarkdown = [
       '```',
       'const plain = "text";',
@@ -132,15 +126,13 @@ describe('Markdown', () => {
     ].join('\n');
 
     const view = render(<Markdown text={rawMarkdown} />);
-
-    // 未提供语言时降级为 text 标签并安全转义
+// Fall back to a text label and escape safely when no language is provided
     const textPre = view.container.querySelector('pre[data-language="text"]');
     expect(textPre).not.toBeNull();
     expect(textPre?.querySelector('.code-lang')?.textContent).toBe('text');
     expect(textPre?.querySelector('script')).toBeNull();
     expect(textPre?.textContent).toContain('<script>alert(1)</script>');
-
-    // 未知语言时保留原始语言名且安全转义内部 HTML
+// Preserve the original language name and safely escape embedded HTML for unknown languages
     const unknownPre = view.container.querySelector('pre[data-language="unknownlang"]');
     expect(unknownPre).not.toBeNull();
     expect(unknownPre?.className).toContain('language-unknownlang');
@@ -149,7 +141,7 @@ describe('Markdown', () => {
     expect(unknownPre?.textContent).toContain('raw <b>bold</b> text');
   });
 
-  it('点击代码复制按钮调用剪贴板并提供临时状态反馈', async () => {
+  it('verifies Markdown test behavior 6', async () => {
     vi.useFakeTimers();
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.assign(navigator, {
@@ -176,13 +168,13 @@ describe('Markdown', () => {
     expect(copyButton.className).not.toContain('copied');
   });
 
-  it('完成渲染后 KaTeX 公式渲染正常工作且不破坏 DOM', () => {
+  it('verifies Markdown test behavior 7', () => {
     const mathText = [
-      '# 公式测试',
+      '# Formula test',
       '',
-      '行内公式：$E = mc^2$',
+      'Inline formula：$E = mc^2$',
       '',
-      '块级公式：',
+      'Block formula：',
       '$$\\int_0^1 x^2 dx = \\frac{1}{3}$$',
     ].join('\n');
 

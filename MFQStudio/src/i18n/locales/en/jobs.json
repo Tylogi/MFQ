@@ -1,0 +1,44 @@
+{
+  "imatrixPanel": {
+    "calibrateSeparatelyImportOneOrCollectItBeforeQuantization": "Calibrate separately, import one, or collect it before quantization",
+    "newCalibration": "New calibration",
+    "importFile": "Import file",
+    "importing": "Importing",
+    "use": "Use"
+  },
+  "jobBuilder": {
+    "newJob": "New job",
+    "jobType": "Job type",
+    "none": "None",
+    "run": "Run"
+  },
+  "jobDetail": {
+    "progress": "Progress",
+    "updated": "Updated",
+    "cancelJob": "Cancel job",
+    "removeFromHistory": "Remove from history",
+    "deleteLocalArtifact": "Delete local artifact",
+    "eventsAndLogs": "Events and logs"
+  },
+  "jobHistory": {
+    "jobHistory": "Job history",
+    "completed": "Completed",
+    "clearCompleted": "Clear completed"
+  },
+  "lineagePanel": {
+    "artifactLineage": "Artifact lineage",
+    "sourcesProducingJobsResolvedParametersAndValidations": "Sources, producing jobs, resolved parameters, and validations",
+    "sources": "Sources",
+    "noArtifactLineageYetRunAQuantizationOrImportJobToPopulate": "No artifact lineage yet. Run a quantization or import job to populate this view."
+  },
+  "quantizationPage": {
+    "quantizationWorkspace": "Quantization workspace"
+  },
+  "useJobRecordActions": {
+    "deleteThisLocalArtifact": "Delete this local artifact?"
+  },
+  "useQuantizationWorkspace": {
+    "collapsePanel": "Collapse panel",
+    "expandPanel": "Expand panel"
+  }
+}

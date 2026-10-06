@@ -1,3 +1,6 @@
+/** Apply generation preferences and import or export complete Studio session archives. */
+import { localized } from '../../i18n/messages';
+import { useTranslation } from 'react-i18next';
 import { useState } from 'react';
 import { useNavigate } from 'react-router';
 import { sessionsApi } from '../../shared/api/resources/sessions';
@@ -9,7 +12,7 @@ import { STUDIO_PATHS } from '../../navigation';
 import { ModelContextSettings } from '../runtime/ModelContextSettings';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useActiveSessionMode } from '../chat/hooks/useActiveSessionMode';
-import { DEFAULT_SETTINGS, PRESETS, modeTemplateSettings, type PresetName } from './configuration';
+import { DEFAULT_SETTINGS, PRESETS, modeTemplateSettings, isValidMaxTokens, type PresetName } from './configuration';
 import { presetResourceBody, storedPresetFromResource, type StoredPreset } from './presets';
 import { SettingsPage } from './SettingsPage';
 import { useSettings } from './SettingsProvider';
@@ -17,8 +20,10 @@ import { useGenerationPresets } from './useGenerationPresets';
 import { UpdateManager, useStudioUpdateContext } from './UpdateManager';
 import { toast } from '../../stores/toastStore';
 
+/** Coordinate settings drafts, validation, presets, and archive operations. */
 export function SettingsRoute() {
-  const { settings, replaceSettings, tr } = useSettings();
+  const { settings, replaceSettings } = useSettings();
+  const { t } = useTranslation();
   const studioUpdates = useStudioUpdateContext();
   const {
     runtime,
@@ -70,7 +75,7 @@ export function SettingsRoute() {
   async function exportStudioData() {
     setBusy(true);
     try {
-      const sessions = await sessionsApi.listSessions();
+      const sessions = await sessionsApi.listAllSessions();
       const archives = await Promise.all(sessions.map((session) => sessionsApi.exportSession(session.id)));
       const payload = {
         format: 'mfq-studio-export-v2',
@@ -108,7 +113,7 @@ export function SettingsRoute() {
         !Array.isArray(payload.presets) ||
         !Array.isArray(payload.sessions)
       )
-        throw new Error(tr('不是有效的 MFQ Studio 导出文件。', 'Not a valid MFQ Studio export.'));
+        throw new Error(t('settings:settingsRoute.notAValidMfqStudioExport'));
       for (const preset of payload.presets) {
         if (!preset?.name || !preset.settings || !Number.isFinite(preset.contextSize)) continue;
         const existing = presets.find((item) => item.name === preset.name);
@@ -127,7 +132,7 @@ export function SettingsRoute() {
       for (const archive of payload.sessions) await sessionsApi.importSession(archive);
       setPresets((await presetsApi.generationPresets()).map(storedPresetFromResource));
       window.dispatchEvent(new Event('mfq:sessions-imported'));
-      toast.success(tr('设置与会话导入成功', 'Settings and sessions imported successfully'));
+      toast.success(localized('settings:settingsRoute.settingsAndSessionsImportedSuccessfully'));
     } catch (cause) {
       toast.error(errorMessage(cause));
     } finally {
@@ -151,22 +156,26 @@ export function SettingsRoute() {
     });
   }
   function saveSettings() {
+    if (!isValidMaxTokens(draft.maxTokens)) {
+      toast.error(localized('settings:settingsRoute.maximumOutputTokensMustBeAPositiveInteger'));
+      return;
+    }
     replaceSettings(draft);
-    toast.success(tr('设置已应用', 'Settings applied successfully'));
+    toast.success(localized('settings:settingsRoute.settingsAppliedSuccessfully'));
   }
   return (
     <section className="dashboard-view">
       <ScreenHeader
-        title={tr('设置', 'Settings')}
-        subtitle={tr('推理默认值、外观与数据。', 'Generation defaults, appearance, and data.')}
+        title={t('common:settings')}
+        subtitle={t('settings:settingsRoute.generationDefaultsAppearanceAndData')}
         trailing={
           <button className="primary" onClick={saveSettings} type="button">
-            {tr('应用设置', 'Apply settings')}
+            {t('settings:settingsRoute.applySettings')}
           </button>
         }
       />
       <SettingsPage
-        tr={tr}
+        t={t}
         settingsDraft={draft}
         setSettingsDraft={setDraft}
         mtpAvailable={mtpAvailable}
@@ -175,7 +184,7 @@ export function SettingsRoute() {
         busy={busy}
         hasStudio={Boolean(studio)}
         updateManager={
-          studio ? <UpdateManager {...studioUpdates} tr={tr} /> : undefined
+          studio ? <UpdateManager {...studioUpdates} t={t} /> : undefined
         }
         actions={{
           setModelDefaultInheritance,

@@ -1,4 +1,4 @@
-/* Radix 工具提示与开关复用应用主题变量，不改变页面布局。 */
+/* Radix tooltips and switches reuse application theme variables without changing page layout. */
 .studio-tooltip {
   z-index: 50;
   max-width: min(280px, calc(100vw - 24px));
@@ -54,8 +54,7 @@ button.studio-switch:disabled {
     transition: none;
   }
 }
-
-/* 全局 Toast 通知容器与消息项动效 */
+/* Global Toast notification container and item animations. */
 .studio-toast-container {
   position: fixed;
   bottom: max(24px, env(safe-area-inset-bottom));

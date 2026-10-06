@@ -1,7 +1,10 @@
-/** 模型目录控制器负责资产刷新、加载策略和目录注册生命周期。 */
+/** Manage artifact refresh, load policies, and directory registration lifecycle for the model catalog. */
+import { localized } from '../../i18n/messages';
+import { useTranslation } from 'react-i18next';
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { modelsApi } from '../../shared/api/resources/models';
+import { jobsApi } from '../../shared/api/resources/jobs';
 import type { ModelArtifact, ModelDirectoryList } from '../../shared/api/types';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useSettings } from '../settings/SettingsProvider';
@@ -12,7 +15,7 @@ import { STUDIO_PATHS, labPath } from '../../navigation';
 import { toast } from '../../stores/toastStore';
 import { useJobStore } from '../../stores/jobStore';
 
-/** 为模型页封装模型目录工作流；状态随页面卸载释放。 */
+/** Encapsulate model-catalog workflows for the models page; state is released when the page unmounts. */
 export function useModelCatalog() {
   const {
     runtime,
@@ -24,12 +27,22 @@ export function useModelCatalog() {
     ready,
   } = useRuntime();
   const jobs = useJobStore((state) => state.jobs);
-  const { tr, contextSize } = useSettings();
+  const { contextSize } = useSettings();
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const [artifacts, setArtifacts] = useState<ModelArtifact[]>([]);
   const [busy, setBusy] = useState(false);
-  const observedActiveLoadJobIds = useRef(new Set<string>());
-  const reportedFailedJobIds = useRef(new Set<string>());
+  const observedModelJobIds = useRef(new Set<string>());
+  const submittingUnloads = useRef(new Set<string>());
+  const [pendingUnloads, setPendingUnloads] = useState<Record<string, string | null>>({});
+  const unloadingInstanceIds = useMemo(() => new Set([
+    ...Object.keys(pendingUnloads),
+    ...instances.filter((instance) => instance.state === 'unloading').map((instance) => instance.id),
+    ...jobs.filter((job) => job.kind === 'model.unload'
+      && ['queued', 'running', 'cancelling'].includes(job.status))
+      .map((job) => String(job.payload.instance_id)),
+  ]), [pendingUnloads, instances, jobs]);
+  const reportedModelJobIds = useRef(new Set<string>());
   const reportError = (cause: unknown) => {
     toast.error(errorMessage(cause));
   };
@@ -62,18 +75,44 @@ export function useModelCatalog() {
   }, [ready, artifactRevision]);
   useEffect(() => {
     for (const job of jobs) {
-      if (job.kind !== 'model.load') continue;
-      if (job.status === 'queued' || job.status === 'running' || job.status === 'cancelling') {
-        observedActiveLoadJobIds.current.add(job.id);
+      if (!['model.load', 'model.unload'].includes(job.kind)) continue;
+      if (['queued', 'running', 'cancelling'].includes(job.status)) {
+        observedModelJobIds.current.add(job.id);
         continue;
       }
-      const wasActive = observedActiveLoadJobIds.current.delete(job.id);
-      if (wasActive && job.status === 'failed' && job.error?.message && !reportedFailedJobIds.current.has(job.id)) {
-        reportedFailedJobIds.current.add(job.id);
-        toast.error(`${job.error.code}: ${job.error.message}`);
+      const wasActive = observedModelJobIds.current.delete(job.id);
+      if (!wasActive || reportedModelJobIds.current.has(job.id)) continue;
+      reportedModelJobIds.current.add(job.id);
+      if (job.kind === 'model.unload') {
+        const id = String(job.payload.instance_id);
+        submittingUnloads.current.delete(id);
+        setPendingUnloads((current) => {
+          if (!(id in current)) return current;
+          const next = { ...current };
+          delete next[id];
+          return next;
+        });
+        void refreshRuntime(false);
+        if (job.status === 'succeeded') toast.success(localized('models:useModelCatalog.modelUnloaded'));
+      }
+      if (job.kind === 'model.load' && job.status === 'succeeded') {
+        toast.success(localized('models:useModelCatalog.modelLoaded'));
+      }
+      if (job.status === 'failed') {
+        if (job.error?.message) {
+          toast.error(`${job.error.code}: ${job.error.message}`);
+        } else {
+          // State events may arrive before the full job error is fetched.
+          void jobsApi.getJob(job.id).then((finished) => {
+            if (finished.error) toast.error(`${finished.error.code}: ${finished.error.message}`);
+            else toast.error(localized('models:useModelCatalog.modelOperationFailedCheckTheTaskRecord'));
+          }).catch(() => toast.error(localized('models:useModelCatalog.modelOperationFailedDetailsAreUnavailable')));
+        }
+      } else if (job.kind === 'model.unload' && job.status !== 'succeeded') {
+        toast.error(localized('models:useModelCatalog.modelUnloadWasCancelledOrInterrupted'));
       }
     }
-  }, [jobs]);
+  }, [jobs, refreshRuntime, t]);
   const filteredInstances = useMemo(
     () =>
       instances.filter((item) =>
@@ -88,15 +127,16 @@ export function useModelCatalog() {
       ),
     [artifacts, modelFilter],
   );
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
+  /** Run a model catalog operation and display any error on the current page. */
   async function loadArtifact(name: string) {
     if (busy) return;
     setBusy(true);
     try {
-      await modelsApi.loadModel(name, contextSize, 2048, {
+      const operation = await modelsApi.loadModel(name, contextSize, 2048, {
         pin: loadPinned,
         idle_ttl_seconds: loadIdleTtl,
       });
+      observedModelJobIds.current.add(operation.operation_id);
 
       navigate(STUDIO_PATHS.models);
       await refreshRuntime(false);
@@ -108,17 +148,14 @@ export function useModelCatalog() {
     }
   }
 
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
+  /** Run a model catalog operation and display any error on the current page. */
   async function finishModelRegistration(names: string[]) {
     const nextArtifacts = await modelsApi.modelArtifacts(true);
     setArtifacts(nextArtifacts);
     const registered = nextArtifacts.filter((item) => names.includes(item.name));
     if (!registered.length) {
       throw new Error(
-        tr(
-          '所选目录中的模型没有出现在模型目录中。',
-          'Models from the selected folder were not registered in the catalog.',
-        ),
+        t('models:useModelCatalog.modelsFromTheSelectedFolderWereNotRegisteredInTheCatalog'),
       );
     }
     if (registered.length === 1) {
@@ -126,10 +163,7 @@ export function useModelCatalog() {
       if (!artifact.loadable) {
         throw new Error(
           artifact.error ||
-            tr(
-              '所选模型不完整或无法加载。',
-              'The selected model is incomplete or cannot be loaded.',
-            ),
+            t('models:useModelCatalog.theSelectedModelIsIncompleteOrCannotBeLoaded'),
         );
       }
       const loaded =
@@ -148,7 +182,7 @@ export function useModelCatalog() {
     if (registered.length === 1) setSelectedModel(registered[0].name);
   }
 
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
+  /** Run a model catalog operation and display any error on the current page. */
   async function openModelDirectory(directoryId?: string | null, path?: string | null) {
     if (busy) return;
     setBusy(true);
@@ -164,7 +198,7 @@ export function useModelCatalog() {
     }
   }
 
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
+  /** Run a model catalog operation and display any error on the current page. */
   async function jumpToModelDirectory(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const path = modelDirectoryPath.trim();
@@ -172,7 +206,7 @@ export function useModelCatalog() {
     await openModelDirectory(null, path);
   }
 
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
+  /** Run a model catalog operation and display any error on the current page. */
   async function chooseModelDirectory() {
     if (busy) return;
     modelBrowserTriggerRef.current =
@@ -192,7 +226,7 @@ export function useModelCatalog() {
     }
   }
 
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
+  /** Run a model catalog operation and display any error on the current page. */
   async function registerCurrentModelDirectory() {
     if (busy || !modelBrowser?.current_id) return;
     setBusy(true);
@@ -206,16 +240,35 @@ export function useModelCatalog() {
     }
   }
 
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
+  /** Track an unload from submission through its terminal job state and suppress duplicate clicks. */
   async function unloadInstance(id: string) {
-    if (busy) return;
+    if (busy || submittingUnloads.current.has(id) || unloadingInstanceIds.has(id)) return;
+    submittingUnloads.current.add(id);
+    setPendingUnloads((current) => ({ ...current, [id]: null }));
     setBusy(true);
+    let accepted = false;
     try {
-      await modelsApi.unloadModel(id);
-
+      const operation = await modelsApi.unloadModel(id);
+      accepted = true;
+      observedModelJobIds.current.add(operation.operation_id);
+      setPendingUnloads((current) => ({ ...current, [id]: operation.operation_id }));
       navigate(STUDIO_PATHS.models);
+      // Fetch even an already-finished job so fast failures cannot escape the active-job watcher.
+      try {
+        useJobStore.getState().addJob(await jobsApi.getJob(operation.operation_id));
+      } catch {
+        // The shared job refresh will recover this accepted operation after transient read failures.
+      }
       await refreshRuntime(false);
     } catch (cause) {
+      if (!accepted) {
+        submittingUnloads.current.delete(id);
+        setPendingUnloads((current) => {
+          const next = { ...current };
+          delete next[id];
+          return next;
+        });
+      }
       reportError(cause);
     } finally {
       setBusy(false);
@@ -249,6 +302,7 @@ export function useModelCatalog() {
     openModelDirectory,
     registerCurrentModelDirectory,
     unloadInstance,
+    unloadingInstanceIds,
     loadArtifact,
   };
 }

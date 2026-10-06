@@ -1,0 +1,175 @@
+/* Give every single-value select a shared theme, with native behavior on older engines. */
+:root select:not([multiple]):not([size]) {
+  appearance: none;
+  -webkit-appearance: none;
+  box-sizing: border-box;
+  max-width: 100%;
+  min-height: 36px;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  padding: 8px 34px 8px 12px;
+  color: var(--ink-soft);
+  background-color: var(--surface-control);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='m5 6 3 3 3-3' stroke='%237b8189' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 16px;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 3%);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  transition: border-color 140ms ease, background-color 140ms ease, box-shadow 140ms ease;
+}
+
+:root select:not([multiple]):not([size]):not(:disabled):hover {
+  border-color: var(--accent-border);
+  background-color: var(--surface);
+}
+
+:root select:not([multiple]):not([size]):focus-visible {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent-soft);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+:root select:not([multiple]):not([size]):disabled {
+  opacity: 0.5;
+  color: var(--muted);
+  background-color: var(--surface-subtle);
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
+:root .composer-toolbar select:not([multiple]):not([size]),
+:root .download-concurrency select:not([multiple]):not([size]) {
+  min-height: 30px;
+  height: 30px;
+  padding-block: 4px;
+  border-radius: 7px;
+  font-size: 11px;
+}
+
+:root .chat-model-summary select:not([multiple]):not([size]) {
+  min-height: 30px;
+  padding-block: 4px;
+  font-weight: 600;
+}
+
+/* Supported engines render the menu in the top layer, beyond scrolling panels and dialogs. */
+@supports (appearance: base-select) {
+  :root select:not([multiple]):not([size]),
+  :root select:not([multiple]):not([size])::picker(select) {
+    appearance: base-select;
+  }
+
+  :root select:not([multiple]):not([size]) {
+    gap: 12px;
+    padding-inline: 12px;
+    background-image: none;
+  }
+
+  :root select:not([multiple]):not([size])::picker-icon {
+    flex: 0 0 auto;
+    margin-inline-start: auto;
+    color: var(--muted);
+    transition: rotate 140ms ease;
+  }
+
+  :root select:not([multiple]):not([size]):open {
+    border-color: var(--accent-border);
+    background-color: var(--surface);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+
+  :root select:not([multiple]):not([size]):open::picker-icon {
+    rotate: 180deg;
+    color: var(--accent);
+  }
+
+  :root select:not([multiple]):not([size])::picker(select) {
+    min-inline-size: anchor-size(self-inline);
+    max-inline-size: min(440px, calc(100vw - 24px));
+    max-block-size: min(320px, 50dvh);
+    margin-block: 6px;
+    border: 1px solid var(--line-strong);
+    border-radius: 11px;
+    padding: 5px;
+    color: var(--ink-soft);
+    background: var(--surface);
+    box-shadow: var(--shadow-sm), 0 12px 32px rgb(0 0 0 / 12%);
+    overflow: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar) transparent;
+  }
+
+  :root select:not([multiple]):not([size]) option {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-block-size: 34px;
+    border: 0;
+    border-radius: 6px;
+    padding: 8px 10px;
+    color: var(--ink-soft);
+    background: transparent;
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+    white-space: normal;
+    cursor: pointer;
+  }
+
+  :root select:not([multiple]):not([size]) option:checked {
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+    font-weight: 600;
+  }
+
+  :root select:not([multiple]):not([size]) option:not(:disabled):hover,
+  :root select:not([multiple]):not([size]) option:focus-visible {
+    outline: none;
+    color: var(--ink);
+    background: var(--surface-hover);
+  }
+
+  :root select:not([multiple]):not([size]) option:checked:focus-visible {
+    outline: 1px solid var(--accent-border);
+    outline-offset: -1px;
+    background: var(--accent-soft);
+  }
+
+  :root select:not([multiple]):not([size]) option::checkmark {
+    order: 1;
+    flex: 0 0 auto;
+    margin-inline-start: auto;
+    color: var(--accent-ink);
+    font-size: 12px;
+  }
+
+  :root select:not([multiple]):not([size]) option:disabled {
+    color: var(--muted-light);
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root select:not([multiple]):not([size]),
+  :root select:not([multiple]):not([size])::picker-icon {
+    transition: none;
+  }
+}
+
+@media (forced-colors: active) {
+  :root select:not([multiple]):not([size]) {
+    appearance: auto;
+    -webkit-appearance: auto;
+    background-image: none;
+    box-shadow: none;
+  }
+}

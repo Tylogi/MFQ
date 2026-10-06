@@ -1,25 +1,25 @@
 /**
- * 为原生按钮提供同时支持鼠标悬停和键盘聚焦的工具提示组件。
+ * Provide native buttons with tooltips that respond to both pointer hover and keyboard focus.
  */
 import * as TooltipPrimitive from '@radix-ui/react-tooltip';
 import type { ReactElement } from 'react';
 import './primitives.css';
 
-/** 工具提示组件属性。 */
+/** Tooltip component properties. */
 export interface TooltipProps {
-  /** 悬停或聚焦时显示的提示文字。 */
+  /** Tooltip text shown on hover or focus. */
   content: string;
-  /** 子元素必须接受 DOM 属性和 ref，原生按钮可直接使用。 */
+  /** The child must accept DOM properties and a ref; native buttons work directly. */
   children: ReactElement;
 }
 
-/** 全局工具提示上下文 Provider，统一由应用外壳挂载配置全局延迟。 */
+/** Global tooltip context provider, mounted by the app shell to configure a shared delay. */
 export const TooltipProvider = TooltipPrimitive.Provider;
 
 /**
- * 在不新增按钮或布局包装元素的情况下为操作按钮显示提示。
+ * Show a tooltip for an action button without adding button or layout wrapper elements.
  *
- * @param props 工具提示属性
+ * @param props Tooltip properties
  */
 export function Tooltip({ content, children }: TooltipProps) {
   return (

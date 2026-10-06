@@ -901,9 +901,9 @@ int32_t mfq_text_chat_apply_template(
             ss << "Assistant:";
         }
     }else if (tmpl == MFQ_TEXT_CHAT_TEMPLATE_PANGU_EMBED) {
-        // [unused9]系统：xxx[unused10]
-        // [unused9]用户：xxx[unused10]
-        // [unused9]助手：xxx[unused10]
+        // System messages wrap the localized role label and content in [unused9]...[unused10].
+        // User messages use the same delimiters with the localized user label.
+        // Assistant messages use the same delimiters with the localized assistant label.
         // ...
         for (size_t i = 0; i < chat.size(); ++i) {
             const auto & msg = chat[i];

@@ -1,4 +1,4 @@
-/** 定义 runtime 领域的服务契约，仅包含类型，不依赖运行时代码。 */
+/** Define service contracts for the runtime domain using types only, with no runtime dependencies. */
 import type { SamplingParams } from './sessions';
 import type { ApiErrorBody } from './protocol';
 
@@ -28,6 +28,9 @@ export interface RuntimeCapabilities {
 }
 
 export interface RuntimeRequestMetrics {
+  /** Terminal outcome captured independently of status snapshots. */
+  status?: 'completed' | 'failed' | 'cancelled';
+  error?: string;
   id?: string;
   endpoint?: string;
   stream?: boolean;

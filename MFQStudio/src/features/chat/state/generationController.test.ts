@@ -1,4 +1,4 @@
-/** 覆盖流式批处理、同步锁、取消和过期请求隔离等用户可见行为。 */
+/** Cover user-visible behavior including stream batching, synchronization locks, cancellation, and stale-request isolation. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ResponseResource, Session, StreamRequest } from '../../../shared/api/types';
 import { GenerationController, type ConversationSnapshot } from './generationController';
@@ -88,7 +88,7 @@ function setup() {
 afterEach(() => vi.useRealTimers());
 
 describe('GenerationController', () => {
-  it('批量提交增量且保持已发布快照不可变，终态前刷新最后的文本', async () => {
+  it('verifies generationController test behavior 1', async () => {
     vi.useFakeTimers();
     const ctx = setup();
     const running = ctx.controller.start('session-a', request);
@@ -111,7 +111,7 @@ describe('GenerationController', () => {
     expect(ctx.controller.getPhase()).toBe('completed');
   });
 
-  it('历史同步完成前保留回答且禁止再次发送', async () => {
+  it('verifies generationController test behavior 2', async () => {
     const ctx = setup();
     const running = ctx.controller.start('session-a', request);
     ctx.receive(delta('Hello'));
@@ -125,7 +125,7 @@ describe('GenerationController', () => {
     expect(ctx.onSynchronized).toHaveBeenCalledOnce();
   });
 
-  it('同步失败保留回答，恢复操作只读历史且不重复生成', async () => {
+  it('verifies generationController test behavior 3', async () => {
     const ctx = setup();
     const running = ctx.controller.start('session-a', request);
     ctx.receive(delta('Hello'));
@@ -148,7 +148,7 @@ describe('GenerationController', () => {
     });
   });
 
-  it('生成 POST 被明确拒绝且历史无对应响应时不确认输入', async () => {
+  it('verifies generationController test behavior 4', async () => {
     const ctx = setup();
     const onAccepted = vi.fn();
     const running = ctx.controller.start('session-a', request, onAccepted);
@@ -159,7 +159,7 @@ describe('GenerationController', () => {
     expect(ctx.controller.getSnapshot()).toMatchObject({ phase: 'failed', recoveryNeeded: false });
   });
 
-  it('成功响应头和历史确认只会通知一次接受', async () => {
+  it('verifies generationController test behavior 5', async () => {
     const ctx = setup();
     const onAccepted = vi.fn();
     ctx.stream.mockImplementationOnce((_id, _body, _onFrame, _signal, accepted) => {
@@ -174,7 +174,7 @@ describe('GenerationController', () => {
     expect(onAccepted).toHaveBeenCalledOnce();
   });
 
-  it('响应已存在但初次同步失败时，重试同步确认后清理输入且不重发 POST', async () => {
+  it('verifies generationController test behavior 6', async () => {
     const ctx = setup();
     const onAccepted = vi.fn();
     const running = ctx.controller.start('session-a', request, onAccepted);
@@ -190,7 +190,7 @@ describe('GenerationController', () => {
     expect(ctx.stream).toHaveBeenCalledOnce();
   });
 
-  it('重置后旧同步结果不得回写，新请求控制器保持有效', async () => {
+  it('verifies generationController test behavior 7', async () => {
     const ctx = setup();
     const old = ctx.controller.start('session-a', request);
     ctx.transport.resolve();
@@ -211,7 +211,7 @@ describe('GenerationController', () => {
     await next;
   });
 
-  it('取消接口失败也会终止读取，同步后保留未持久化的部分回答', async () => {
+  it('verifies generationController test behavior 8', async () => {
     const ctx = setup();
     ctx.cancel.mockRejectedValueOnce(new Error('cancel failed'));
     const running = ctx.controller.start('session-a', request);
@@ -228,7 +228,7 @@ describe('GenerationController', () => {
     });
   });
 
-  it('服务端仍运行时阻止再次发送，防止超时取消造成并发请求', async () => {
+  it('verifies generationController test behavior 9', async () => {
     const ctx = setup();
     const running = ctx.controller.start('session-a', request);
     ctx.transport.reject(new Error('disconnected'));
@@ -238,7 +238,7 @@ describe('GenerationController', () => {
     await expect(ctx.controller.start('session-a', request)).rejects.toThrow('synchronize');
   });
 
-  it('无终态断流时保留可恢复文本并标识失败', async () => {
+  it('verifies generationController test behavior 10', async () => {
     const ctx = setup();
     const running = ctx.controller.start('session-a', request);
     ctx.receive(delta('partial'));

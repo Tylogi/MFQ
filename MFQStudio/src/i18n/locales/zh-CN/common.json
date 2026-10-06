@@ -1,0 +1,16 @@
+{
+  "settings": "设置",
+  "untitledChat": "未命名会话",
+  "close": "关闭",
+  "loading": "正在加载…",
+  "cancel": "取消",
+  "save": "保存",
+  "apply": "应用",
+  "delete": "删除",
+  "retry": "重试",
+  "reload": "重载",
+  "refresh": "刷新",
+  "notifications": "通知提示",
+  "dismissNotification": "关闭通知",
+  "unknownError": "未知错误"
+}

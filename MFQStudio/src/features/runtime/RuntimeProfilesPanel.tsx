@@ -1,3 +1,7 @@
+/** Provide RuntimeProfilesPanel interface behavior. */
+import { i18n } from '../../i18n';
+import { localized } from '../../i18n/messages';
+import { useTranslation } from 'react-i18next';
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { runtimeApi } from '../../shared/api/resources/runtime';
@@ -13,9 +17,11 @@ import { STUDIO_PATHS } from '../../navigation';
 import { toast } from '../../stores/toastStore';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
 
+/** Manage saved model loading profiles and apply them to the current runtime. */
 export function RuntimeProfilesPanel() {
   const { runtime, instances, realtime, ready, setSelectedModel, refreshRuntime } = useRuntime();
-  const { settings, tr, contextSize } = useSettings();
+  const { settings, contextSize } = useSettings();
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const [artifacts, setArtifacts] = useState<ModelArtifact[]>([]);
   const [runtimeProfiles, setRuntimeProfiles] = useState<RuntimeProfile[]>([]);
@@ -81,7 +87,7 @@ export function RuntimeProfilesPanel() {
       setProfileName('');
       setRuntimeProfiles(await runtimeApi.runtimeProfiles());
       await refreshRuntime(false);
-      toast.success(tr('运行配置已保存', 'Runtime profile saved'));
+      toast.success(localized('runtime:runtimeProfilesPanel.runtimeProfileSaved'));
     } catch (cause) {
       toast.error(errorMessage(cause));
     } finally {
@@ -94,10 +100,7 @@ export function RuntimeProfilesPanel() {
     if (
       profile.drifted &&
       !(await studioConfirm(
-        tr(
-          '模型产物已变化。仍使用这个配置档案加载？',
-          'The model artifact changed. Load this profile anyway?',
-        ),
+        t('runtime:runtimeProfilesPanel.theModelArtifactChangedLoadThisProfileAnyway'),
       ))
     )
       return;
@@ -121,7 +124,7 @@ export function RuntimeProfilesPanel() {
     try {
       await runtimeApi.deleteRuntimeProfile(id);
       setRuntimeProfiles((current) => current.filter((item) => item.id !== id));
-      toast.success(tr('运行配置已删除', 'Runtime profile deleted'));
+      toast.success(localized('runtime:runtimeProfilesPanel.runtimeProfileDeleted'));
     } catch (cause) {
       toast.error(errorMessage(cause));
     } finally {
@@ -131,16 +134,13 @@ export function RuntimeProfilesPanel() {
 
   return (
     <>
-      <SectionLabel title={tr('运行配置', 'Runtime profiles')} />
+      <SectionLabel title={t('runtime:runtimeProfilesPanel.runtimeProfiles')} />
       <TMPanel className="profile-panel">
         <div className="panel-heading">
           <div>
-            <h2>{tr('已保存配置', 'Saved profiles')}</h2>
+            <h2>{t('runtime:runtimeProfilesPanel.savedProfiles')}</h2>
             <p>
-              {tr(
-                '将加载参数和采样默认值绑定到模型产物',
-                'Bind load and sampling defaults to a model artifact',
-              )}
+              {t('runtime:runtimeProfilesPanel.bindLoadAndSamplingDefaultsToAModelArtifact')}
             </p>
           </div>
           <b>{runtimeProfiles.length}</b>
@@ -149,7 +149,7 @@ export function RuntimeProfilesPanel() {
           <input
             maxLength={64}
             onChange={(event) => setProfileName(event.target.value)}
-            placeholder={tr('当前配置名称', 'Current configuration name')}
+            placeholder={t('runtime:runtimeProfilesPanel.currentConfigurationName')}
             value={profileName}
           />
           <button
@@ -159,7 +159,7 @@ export function RuntimeProfilesPanel() {
             onClick={() => void saveRuntimeProfile()}
             type="button"
           >
-            {tr('保存当前配置', 'Save current')}
+            {t('runtime:runtimeProfilesPanel.saveCurrent')}
           </button>
         </div>
         {runtimeProfiles.length > 0 ? (
@@ -169,9 +169,9 @@ export function RuntimeProfilesPanel() {
                 <div>
                   <strong className="model-identity-label">{profile.name}<ModelVendorMark name={profile.load.model} architecture={artifacts.find((item) => item.id === profile.artifact_id)?.architecture} size={20} /></strong>
                   <small>
-                    {profile.load.context_size.toLocaleString()} ctx ·{' '}
-                    {profile.load.prefill_chunk_size.toLocaleString()} chunk
-                    {profile.drifted ? ` · ${tr('模型已变化', 'artifact changed')}` : ''}
+                    {profile.load.context_size.toLocaleString(i18n.resolvedLanguage)} ctx ·{' '}
+                    {profile.load.prefill_chunk_size.toLocaleString(i18n.resolvedLanguage)} chunk
+                    {profile.drifted ? ` · ${t('runtime:runtimeProfilesPanel.artifactChanged')}` : ''}
                   </small>
                 </div>
                 <button
@@ -179,10 +179,10 @@ export function RuntimeProfilesPanel() {
                   onClick={() => void loadRuntimeProfile(profile)}
                   type="button"
                 >
-                  {tr('加载', 'Load')}
+                  {t('runtime:runtimeProfilesPanel.load')}
                 </button>
                 <button
-                  aria-label={tr('删除配置档案', 'Delete profile')}
+                  aria-label={t('runtime:runtimeProfilesPanel.deleteProfile')}
                   disabled={busy}
                   onClick={() => void deleteRuntimeProfile(profile.id)}
                   type="button"
@@ -194,7 +194,7 @@ export function RuntimeProfilesPanel() {
           </div>
         ) : (
           <div className="inline-empty">
-            {tr('尚未保存运行配置。', 'No runtime profiles saved yet.')}
+            {t('runtime:runtimeProfilesPanel.noRuntimeProfilesSavedYet')}
           </div>
         )}
       </TMPanel>

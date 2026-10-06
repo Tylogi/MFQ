@@ -1,4 +1,5 @@
-/** 验证附件仅通知输入区，并在切换会话或服务时释放预览资源。 */
+/** Verify that attachment updates notify only the input area and previews are released on session or service changes. */
+import { i18n } from '../../i18n';
 import { act, render, screen } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { mediaApi } from '../../shared/api/resources/media';
@@ -6,11 +7,15 @@ import {
   ChatAttachmentsProvider,
   useChatAttachmentActions,
   useChatAttachmentList,
+  useChatAttachmentError,
 } from './ChatAttachmentsProvider';
 import { useConversationStore } from './state/conversationStore';
 
 const runtime = vi.hoisted(() => ({ connectionRevision: 1 }));
 vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => runtime }));
+vi.mock('../settings/SettingsProvider', () => ({
+  useSettings: () => ({ t: i18n.getFixedT('en') }),
+}));
 
 beforeEach(() => {
   vi.restoreAllMocks();
@@ -21,7 +26,24 @@ beforeEach(() => {
   URL.revokeObjectURL = vi.fn();
 });
 
-it('上传失败时保留原附件，供下一次发送重试', async () => {
+it('keeps eight attachments and reports overflow, including consecutive selections before rendering', () => {
+  let actions!: ReturnType<typeof useChatAttachmentActions>;
+  function Consumer() {
+    actions = useChatAttachmentActions();
+    const error = useChatAttachmentError();
+    return <span>{error?.message}</span>;
+  }
+  render(<ChatAttachmentsProvider><Consumer /></ChatAttachmentsProvider>);
+  const files = Array.from({ length: 10 }, (_, index) => new File(['text'], `${index}.txt`, { type: 'text/plain' }));
+  act(() => {
+    actions.selectAttachments(files.slice(0, 6) as unknown as FileList);
+    actions.selectAttachments(files.slice(6) as unknown as FileList);
+  });
+  expect(actions.getAttachments().map((item) => item.file)).toEqual(files.slice(0, 8));
+  expect(screen.getByText('Up to 8 attachments per message; 2 files were not added.')).toBeInTheDocument();
+});
+
+it('verifies ChatAttachmentsProvider test behavior 1', async () => {
   vi.spyOn(mediaApi, 'uploadMedia').mockRejectedValueOnce(new Error('upload failed'));
   let actions!: ReturnType<typeof useChatAttachmentActions>;
   function Consumer() {
@@ -43,7 +65,7 @@ it('上传失败时保留原附件，供下一次发送重试', async () => {
   expect(screen.getByText('1')).toBeInTheDocument();
 });
 
-it('选择附件时只更新附件订阅者，切会话和切服务释放预览 URL', () => {
+it('verifies ChatAttachmentsProvider test behavior 2', () => {
   let actionRenders = 0;
   let actions!: ReturnType<typeof useChatAttachmentActions>;
   function Actions() {

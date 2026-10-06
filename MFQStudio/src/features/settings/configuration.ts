@@ -1,4 +1,4 @@
-/** 管理界面与推理设置的默认值、本地读取及模型模式继承规则。 */
+/** Manage interface and inference defaults, local loading, and model-mode inheritance rules. */
 import { RealtimeCapabilities, RuntimeStatus, SessionMode } from '../../shared/api/types';
 
 export type UiLanguage = "system" | "zh-CN" | "en";
@@ -32,6 +32,11 @@ export interface GenerationSettings {
 
 export const SETTINGS_KEY = "mfq.studio.generation.v1";
 
+/** Validate the output budget without imposing a model-independent upper bound. */
+export function isValidMaxTokens(value: number): boolean {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
 export const DEFAULT_SETTINGS: GenerationSettings = {
   language: "system",
   theme: "system",
@@ -61,7 +66,7 @@ export const PRESETS: Record<Exclude<PresetName, "custom">, Partial<GenerationSe
   creative: { temperature: 1, topP: 0.95, topK: 50, repetitionPenalty: 1 },
 };
 
-/** 根据会话模式和服务默认值生成推理设置，不修改输入对象。 */
+/** Resolve inference settings from the session mode and server defaults without mutating the input object. */
 export function modeTemplateSettings(
   current: GenerationSettings,
   mode: SessionMode,
@@ -108,7 +113,7 @@ export function modeTemplateSettings(
   };
 }
 
-/** 读取本地界面及推理设置，损坏或缺失时使用默认值。 */
+/** Read local interface and inference settings, using defaults when data is missing or invalid. */
 export function loadSettings(): GenerationSettings {
   try {
     return { ...DEFAULT_SETTINGS, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") };

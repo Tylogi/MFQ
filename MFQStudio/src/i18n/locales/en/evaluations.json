@@ -1,0 +1,18 @@
+{
+  "evaluationsPage": {
+    "collapsePanel": "Collapse panel",
+    "expandPanel": "Expand panel",
+    "datasetRegistered": "Dataset registered",
+    "evaluationResults": "Evaluation results",
+    "comparisonRequiresMatchingDatasetsAndExecutionParameters": "Comparison requires matching datasets and execution parameters",
+    "noEvaluationResultsYetRegisterADatasetAndRunAnEvaluationJob": "No evaluation results yet. Register a dataset and run an evaluation job first.",
+    "compareSelected": "Compare selected",
+    "model": "Model",
+    "datasets": "Datasets",
+    "reproducibleFileHashesAndSourceManifests": "Reproducible file hashes and source manifests",
+    "name": "Name",
+    "register": "Register",
+    "deleteDataset": "Delete dataset",
+    "noDatasetsYetRegisterAFileOrWorkspaceResourceToStartEvaluating": "No datasets yet. Register a file or workspace resource to start evaluating."
+  }
+}

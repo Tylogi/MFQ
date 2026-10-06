@@ -1,11 +1,12 @@
-/** 展示量化工作台的任务结果、操作和事件日志。 */
+/** Display job results, actions, and event logs for the quantization workspace. */
+import { i18n } from '../../i18n';
 import { useQuantization } from './QuantizationContext';
 import { formatNumber } from '../../app/formatters';
 import { isTerminalJob } from './jobSchema';
-/** 从页面状态读取本面板所需数据与业务操作。 */
+/** Read the data and business actions required by this panel from page state. */
 export function JobDetail() {
   const {
-    tr,
+    t,
     busy,
     error,
     jobLogs,
@@ -30,12 +31,12 @@ export function JobDetail() {
           <progress max={1} value={selectedJob.progress} />
           <div className="job-result-grid">
             <div>
-              <span>{tr('进度', 'Progress')}</span>
+              <span>{t('jobs:jobDetail.progress')}</span>
               <strong>{formatNumber(selectedJob.progress * 100)}%</strong>
             </div>
             <div>
-              <span>{tr('更新时间', 'Updated')}</span>
-              <strong>{new Date(selectedJob.updated_at).toLocaleTimeString()}</strong>
+              <span>{t('jobs:jobDetail.updated')}</span>
+              <strong>{new Date(selectedJob.updated_at).toLocaleTimeString(i18n.resolvedLanguage)}</strong>
             </div>
           </div>
           <div className="job-actions">
@@ -46,7 +47,7 @@ export function JobDetail() {
                 onClick={() => void cancelSelectedJob()}
                 type="button"
               >
-                {tr('取消任务', 'Cancel job')}
+                {t('jobs:jobDetail.cancelJob')}
               </button>
             )}
             {['failed', 'cancelled', 'interrupted'].includes(selectedJob.status) && (
@@ -56,7 +57,7 @@ export function JobDetail() {
                 onClick={() => void retrySelectedJob()}
                 type="button"
               >
-                {tr('重试', 'Retry')}
+                {t('common:retry')}
               </button>
             )}
             {isTerminalJob(selectedJob) && (
@@ -66,7 +67,7 @@ export function JobDetail() {
                 onClick={() => void deleteJobRecord(selectedJob.id)}
                 type="button"
               >
-                {tr('移出任务历史', 'Remove from history')}
+                {t('jobs:jobDetail.removeFromHistory')}
               </button>
             )}
             {String(selectedJob.result?.artifact || '').startsWith('workspace://') && (
@@ -76,7 +77,7 @@ export function JobDetail() {
                 onClick={() => void removeSelectedArtifact()}
                 type="button"
               >
-                {tr('删除本地产物', 'Delete local artifact')}
+                {t('jobs:jobDetail.deleteLocalArtifact')}
               </button>
             )}
           </div>
@@ -84,11 +85,11 @@ export function JobDetail() {
           {selectedJob.result && <pre>{JSON.stringify(selectedJob.result, null, 2)}</pre>}
           <div className="job-log">
             <header>
-              <span>{tr('事件与日志', 'Events and logs')}</span>
+              <span>{t('jobs:jobDetail.eventsAndLogs')}</span>
             </header>
             {jobLogs.map((entry) => (
               <div className={entry.level} key={entry.sequence}>
-                <time>{new Date(entry.created_at).toLocaleTimeString()}</time>
+                <time>{new Date(entry.created_at).toLocaleTimeString(i18n.resolvedLanguage)}</time>
                 <code>{entry.message}</code>
               </div>
             ))}

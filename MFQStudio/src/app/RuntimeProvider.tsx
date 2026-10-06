@@ -1,3 +1,4 @@
+/** Coordinate runtime snapshots, model selection, and background job recovery. */
 import {
   createContext,
   useCallback,
@@ -10,7 +11,7 @@ import {
 } from 'react';
 import { runtimeApi } from '../shared/api/resources/runtime';
 import { jobsApi } from '../shared/api/resources/jobs';
-import { browserServiceUrl, getApiToken, setApiBaseUrl, setApiToken } from '../shared/api/client';
+import { ApiError, browserServiceUrl, getApiToken, setApiBaseUrl, setApiToken } from '../shared/api/client';
 import type {
   JobResource,
   RuntimeStatus,
@@ -51,6 +52,7 @@ interface RuntimeContextValue {
 
 const RuntimeContext = createContext<RuntimeContextValue | null>(null);
 
+/** Keep shared runtime state synchronized with the connected server. */
 export function RuntimeProvider({ children }: { children: ReactNode }) {
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [models, setModels] = useState<RuntimeModel[]>([]);
@@ -78,12 +80,18 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     const version = ++requestVersion.current;
     if (!quiet) setLoading(true);
     try {
-      const [nextInstances, nextJobs] = await Promise.all([runtimeApi.runtimeInstances(), jobsApi.jobs(100)]);
-      const instance = nextInstances.find(
-        (item) => item.model === selectedRef.current && item.state !== 'failed',
+      let [nextInstances, nextJobs] = await Promise.all([runtimeApi.runtimeInstances(), jobsApi.jobs(100)]);
+      let instance = nextInstances.find(
+        (item) => item.model === selectedRef.current && !['failed', 'unloading'].includes(item.state),
       );
       const [statusResult, voiceResult] = await Promise.allSettled([
-        runtimeApi.runtimeStatus(instance?.id),
+        runtimeApi.runtimeStatus(instance?.id).catch(async (cause: unknown) => {
+          if (!instance || !(cause instanceof ApiError) || cause.code !== 'runtime_instance_not_found') throw cause;
+          // An unload can finish between listing instances and reading their status.
+          nextInstances = await runtimeApi.runtimeInstances();
+          instance = undefined;
+          return runtimeApi.runtimeStatus();
+        }),
         runtimeApi.voiceOutputComponent(),
       ]);
       if (statusResult.status !== 'fulfilled') throw statusResult.reason;
@@ -334,6 +342,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;
 }
 
+/** Access the shared runtime connection and model state. */
 export function useRuntime(): RuntimeContextValue {
   const value = useContext(RuntimeContext);
   if (!value) throw new Error('RuntimeProvider is missing');

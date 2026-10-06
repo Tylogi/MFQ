@@ -1,3 +1,6 @@
+# Local agent instructions
+/AGENTS.md
+
 # ---- 外部参考仓库（仅本地查阅，不入库）----
 references/
 
@@ -24,6 +27,8 @@ ENV/
 
 # ---- 测试 / 类型 / 覆盖率 ----
 .pytest_cache/
+.pytest-deps/
+.pip-cache/
 .mypy_cache/
 .ruff_cache/
 .coverage

@@ -1,4 +1,4 @@
-# 分别验证 Studio 行为、生产产物浏览器交互及原生跨语言契约。
+# Validate Studio behavior, browser interactions with production builds, and native cross-language contracts separately.
 name: Studio frontend
 
 on:
@@ -65,3 +65,17 @@ jobs:
           python -m pytest tests/test_mfq_studio_source.py
           tests/test_webui_markdown_prefill.py tests/test_cpp_runtime_chat_template_source.py
           tests/test_cpp_runtime_minicpmo45_source.py tests/test_model_capabilities.py -q
+
+  server-static:
+    name: Server SPA behavior
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install server test dependencies
+        run: python -m pip install -e '.[dev]'
+      - name: Check SPA fallback and API isolation
+        run: python -m pytest tests/test_server_static.py -q

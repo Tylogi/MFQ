@@ -1,8 +1,8 @@
-/** 加载本地语音记录中的录音，管理播放器对象 URL 的生命周期。 */
+/** Load recordings from local voice history and manage the player's object URL lifecycle. */
 import { useEffect, useState } from 'react';
 import { loadVoiceClip } from '../../realtimeAudio';
 
-/** 从本地语音存储加载录音并播放，卸载后释放对象 URL。 */
+/** Load and play a recording from local voice storage, releasing its object URL on unmount. */
 export function AudioClip({ audioId }: { audioId: string }) {
   const [url, setUrl] = useState("");
   useEffect(() => {

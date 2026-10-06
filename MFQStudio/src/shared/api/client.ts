@@ -1,6 +1,6 @@
-/** 统一 HTTP 请求、服务地址与内存鉴权，供各资源 API 复用。 */
+/** Centralize HTTP requests, service URLs, and in-memory authentication for reuse by resource APIs. */
 import type { ApiErrorBody } from './types';
-/** 保留 HTTP 状态与服务错误码，供业务决定展示和恢复策略。 */
+/** Preserve HTTP status and server error codes so business logic can choose display and recovery strategies. */
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
@@ -28,41 +28,46 @@ export function setBrowserServiceUrl(value: string): void {
   else localStorage.removeItem(BROWSER_SERVICE_KEY);
 }
 
-/** 读取当前内存中的凭据，仅供请求层构造鉴权头。 */
+/** Read the current in-memory credential for constructing authentication headers in the request layer. */
 export function getApiToken(): string {
   return apiToken;
 }
 
-/** 切换服务地址，移除末尾斜杠；凭据由单独入口设置。 */
+/** Change the service URL and remove trailing slashes; credentials are set through a separate entry point. */
 export function setApiBaseUrl(value: string): void {
   apiBaseUrl = value.trim().replace(/\/+$/, '');
 }
 
-/** 更新内存凭据，后续 HTTP 与实时连接使用新值，不写入浏览器存储。 */
+/** Update the in-memory credential for subsequent HTTP and real-time connections without writing it to browser storage. */
 export function setApiToken(value: string): void {
   apiToken = value.trim();
 }
 
-/** 读取规范化的服务地址，空值表示当前页面同源服务。 */
+/** Read the normalized service URL; an empty value means the current page's same-origin service. */
 export function getApiBaseUrl(): string {
   return apiBaseUrl;
 }
 
-/** 将资源路径拼接到当前服务地址。 */
+/** Resolve the actual service origin for same-origin browser connections and explicit service URLs. */
+export function resolveServiceUrl(value: string = apiBaseUrl): string {
+  return value || window.location.origin;
+}
+
+/** Append a resource path to the current service URL. */
 export function apiUrl(path: string): string {
   return `${apiBaseUrl}${path}`;
 }
 
-/** 构造浏览器 WebSocket 音频入口，并附带服务要求的连接凭据。 */
+/** Build the browser WebSocket audio endpoint and include the connection credential required by the service. */
 export function runtimeRealtimeUrl(): string {
-  const base = apiBaseUrl || window.location.origin;
+  const base = resolveServiceUrl();
   const url = new URL('/api/v1/runtime/realtime?mode=audio', base);
   if (apiToken) url.searchParams.set('access_token', apiToken);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   return url.toString();
 }
 
-/** 读取服务错误体；非 JSON 或格式无效时回退为 HTTP 状态错误。 */
+/** Read the server error body, falling back to an HTTP status error when it is not valid JSON. */
 export async function errorFromResponse(response: Response): Promise<ApiError> {
   try {
     return new ApiError(response.status, (await response.json()) as ApiErrorBody);
@@ -78,7 +83,7 @@ export async function errorFromResponse(response: Response): Promise<ApiError> {
   }
 }
 
-/** 发起可取消的 JSON 请求，保留调用方 Headers 语义并统一处理失败状态。 */
+/** Make a cancellable JSON request, preserve caller-supplied Headers semantics, and handle failure statuses consistently. */
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = authorizedHeaders(init?.headers);
   if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
@@ -90,7 +95,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
-/** 基于任意合法 HeadersInit 创建请求头，并注入当前服务凭据。 */
+/** Create request headers from any valid HeadersInit and inject the current service credential. */
 export function authorizedHeaders(headers?: HeadersInit): Headers {
   const result = new Headers(headers);
   if (apiToken) result.set('Authorization', `Bearer ${apiToken}`);

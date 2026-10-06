@@ -1,3 +1,5 @@
+"""Verify public protocol validation, route coverage, and generated API contracts."""
+
 from __future__ import annotations
 
 import json
@@ -170,7 +172,10 @@ def test_openapi_contract_has_all_native_routes_and_realtime_extension() -> None
         "/api/v1/runtime/instances",
         "/api/v1/runtime/instances/{instance_id}",
         "/api/v1/runtime/logs",
+        "/api/v1/runtime/logs/stream",
+        "/api/v1/runtime/requests/stream",
         "/api/v1/runtime/metrics",
+        "/api/v1/runtime/requests",
         "/api/v1/runtime/capabilities",
         "/api/v1/runtime/status",
         "/api/v1/runtime/resources",

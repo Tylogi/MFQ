@@ -1,5 +1,5 @@
 /**
- * 后台任务状态管理 (jobStore) 单元测试。
+ * Unit tests for background job state management (jobStore).
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -29,20 +29,20 @@ const mockJob2: JobResource = {
   updated_at: '2026-09-23T09:30:00Z',
 };
 
-describe('jobStore 后台任务状态管理', () => {
+describe('describes jobStore test behavior 1', () => {
   beforeEach(() => {
     useJobStore.getState().clearJobStreams();
     useJobStore.getState().setJobs([]);
     vi.restoreAllMocks();
   });
 
-  it('初始状态为空列表与空活跃标识', () => {
+  it('verifies jobStore test behavior 2', () => {
     const state = useJobStore.getState();
     expect(state.jobs).toEqual([]);
     expect(state.activeJobIds).toEqual([]);
   });
 
-  it('历史事件和延迟快照不能倒退当前进度，重连从已消费序号继续', () => {
+  it('verifies jobStore test behavior 3', () => {
     useJobStore.getState().setJobs([{ ...mockJob1, progress: 0.7, updated_at: '2026-09-23T10:10:00Z' }]);
     let receive!: (event: JobEventResource) => void;
     const stream = vi.spyOn(jobsApi, 'streamJobEvents').mockImplementation((_id, onEvent) => {
@@ -60,14 +60,14 @@ describe('jobStore 后台任务状态管理', () => {
     expect(useJobStore.getState().jobs[0].progress).toBe(0.8);
   });
 
-  it('setJobs 设置任务列表并正确提取活跃任务标识', () => {
+  it('verifies jobStore test behavior 4', () => {
     useJobStore.getState().setJobs([mockJob1, mockJob2]);
     const state = useJobStore.getState();
     expect(state.jobs).toHaveLength(2);
     expect(state.activeJobIds).toEqual(['job-1']);
   });
 
-  it('setJobs 保存独立数组及任务快照，updateJob 不修改旧快照或调用方对象', () => {
+  it('verifies jobStore test behavior 5', () => {
     const input = [{ ...mockJob1 }];
     useJobStore.getState().setJobs(input);
     const previous = useJobStore.getState();
@@ -88,7 +88,7 @@ describe('jobStore 后台任务状态管理', () => {
     expect(patch.progress).toBe(50);
   });
 
-  it('addJob 新增任务并插入列表前列', () => {
+  it('verifies jobStore test behavior 6', () => {
     useJobStore.getState().setJobs([mockJob2]);
     useJobStore.getState().addJob(mockJob1);
     const state = useJobStore.getState();
@@ -96,7 +96,7 @@ describe('jobStore 后台任务状态管理', () => {
     expect(state.activeJobIds).toEqual(['job-1']);
   });
 
-  it('addJob 遇到已有标识时进行替换更新', () => {
+  it('verifies jobStore test behavior 7', () => {
     useJobStore.getState().setJobs([mockJob1]);
     const updatedJob: JobResource = { ...mockJob1, status: 'succeeded', progress: 100 };
     useJobStore.getState().addJob(updatedJob);
@@ -106,7 +106,7 @@ describe('jobStore 后台任务状态管理', () => {
     expect(state.activeJobIds).toEqual([]);
   });
 
-  it('updateJob 仅更新指定属性且保持活跃数组引用稳定性', () => {
+  it('verifies jobStore test behavior 8', () => {
     useJobStore.getState().setJobs([mockJob1]);
     const prevActive = useJobStore.getState().activeJobIds;
 
@@ -116,11 +116,11 @@ describe('jobStore 后台任务状态管理', () => {
     const state = useJobStore.getState();
     expect(state.jobs[0].progress).toBe(45.5);
     expect(state.jobs[0].updated_at).toBe('2026-09-23T10:05:00Z');
-    // 活跃列表元素未变化时引用保持一致
+    // Preserve the reference when active-list elements are unchanged.
     expect(state.activeJobIds).toBe(prevActive);
   });
 
-  it('updateJob 变更状态为终态时同步剔除活跃列表', () => {
+  it('verifies jobStore test behavior 9', () => {
     useJobStore.getState().setJobs([mockJob1]);
     expect(useJobStore.getState().activeJobIds).toEqual(['job-1']);
 
@@ -128,7 +128,7 @@ describe('jobStore 后台任务状态管理', () => {
     expect(useJobStore.getState().activeJobIds).toEqual([]);
   });
 
-  it('streamJobEvents 处理高频 SSE 事件与终态回调', async () => {
+  it('verifies jobStore test behavior 10', async () => {
     useJobStore.getState().setJobs([mockJob1]);
 
     let eventCallback: ((event: JobEventResource) => void) | undefined;
@@ -148,7 +148,7 @@ describe('jobStore 后台任务状态管理', () => {
     );
     expect(eventCallback).toBeDefined();
 
-    // 触发进度事件
+    // Emit a progress event.
     eventCallback!({
       job_id: 'job-1',
       sequence: 1,
@@ -162,7 +162,7 @@ describe('jobStore 后台任务状态管理', () => {
     expect(useJobStore.getState().jobs[0].progress).toBe(60);
     expect(onTerminal).not.toHaveBeenCalled();
 
-    // 触发终态事件
+    // Emit a terminal-state event.
     eventCallback!({
       job_id: 'job-1',
       sequence: 2,
@@ -181,7 +181,7 @@ describe('jobStore 后台任务状态管理', () => {
     cleanup();
   });
 
-  it('重复订阅的 cleanup 不拥有连接，也不能取消随后建立的新连接', () => {
+  it('verifies jobStore test behavior 11', () => {
     useJobStore.getState().setJobs([mockJob1]);
     const signals: AbortSignal[] = [];
     vi.spyOn(jobsApi, 'streamJobEvents').mockImplementation((_id, _onEvent, signal) => {
@@ -203,7 +203,7 @@ describe('jobStore 后台任务状态管理', () => {
     expect(signals[1].aborted).toBe(false);
   });
 
-  it('取消后的旧事件及异步结束不能覆盖新订阅', async () => {
+  it('verifies jobStore test behavior 12', async () => {
     useJobStore.getState().setJobs([mockJob1]);
     const callbacks: Array<(event: JobEventResource) => void> = [];
     const rejectors: Array<(cause: Error) => void> = [];
@@ -238,7 +238,7 @@ describe('jobStore 后台任务状态管理', () => {
     expect(jobsApi.streamJobEvents).toHaveBeenCalledTimes(2);
   });
 
-  it('事件回调同步取消并重订阅时，旧事件不得更新新流的任务', () => {
+  it('verifies jobStore test behavior 13', () => {
     useJobStore.getState().setJobs([mockJob1]);
     let oldEvent: ((event: JobEventResource) => void) | undefined;
     const signals: AbortSignal[] = [];
@@ -267,7 +267,7 @@ describe('jobStore 后台任务状态管理', () => {
     expect(signals[1].aborted).toBe(false);
   });
 
-  it('旧流正常结束后只反馈自身故障，不干扰重新订阅', async () => {
+  it('verifies jobStore test behavior 14', async () => {
     useJobStore.getState().setJobs([mockJob1]);
     let resolveOld: (() => void) | undefined;
     const signals: AbortSignal[] = [];
@@ -292,7 +292,7 @@ describe('jobStore 后台任务状态管理', () => {
     expect(signals[1].aborted).toBe(false);
   });
 
-  it('终态回调重订阅时旧 cleanup 不会关掉新流', () => {
+  it('verifies jobStore test behavior 15', () => {
     useJobStore.getState().setJobs([mockJob1]);
     const callbacks: Array<(event: JobEventResource) => void> = [];
     const signals: AbortSignal[] = [];
@@ -321,7 +321,7 @@ describe('jobStore 后台任务状态管理', () => {
     expect(signals[1].aborted).toBe(false);
   });
 
-  it('取消信号仅关闭所属连接，旧信号不影响重新订阅', () => {
+  it('verifies jobStore test behavior 16', () => {
     useJobStore.getState().setJobs([mockJob1]);
     const signals: AbortSignal[] = [];
     vi.spyOn(jobsApi, 'streamJobEvents').mockImplementation((_id, _onEvent, signal) => {
@@ -342,7 +342,7 @@ describe('jobStore 后台任务状态管理', () => {
     expect(signals[1].aborted).toBe(false);
   });
 
-  it('批量监听只清理本次创建的流，旧 cleanup 不影响替代连接', () => {
+  it('verifies jobStore test behavior 17', () => {
     useJobStore.getState().setJobs([mockJob1, { ...mockJob1, id: 'job-3' }]);
     const signals = new Map<string, AbortSignal[]>();
     vi.spyOn(jobsApi, 'streamJobEvents').mockImplementation((id, _onEvent, signal) => {
@@ -364,21 +364,21 @@ describe('jobStore 后台任务状态管理', () => {
     direct();
   });
 
-  it('watchActiveJobs 自动为活跃任务开启监听并可在清除时取消', () => {
+  it('verifies jobStore test behavior 18', () => {
     useJobStore.getState().setJobs([mockJob1]);
     const streamSpy = vi.spyOn(jobsApi, 'streamJobEvents').mockResolvedValue(undefined);
 
     useJobStore.getState().watchActiveJobs();
     expect(streamSpy).toHaveBeenCalledTimes(1);
 
-    // 重复调用不重复开启
+    // Repeated calls do not start duplicate streams.
     useJobStore.getState().watchActiveJobs();
     expect(streamSpy).toHaveBeenCalledTimes(1);
 
     useJobStore.getState().clearJobStreams();
   });
 
-  it('任务流断开后可重新订阅，并按任务标识确认恢复', async () => {
+  it('verifies jobStore test behavior 19', async () => {
     useJobStore.getState().setJobs([mockJob1]);
     const callbacks: Array<(event: JobEventResource) => void> = [];
     const streamSpy = vi.spyOn(jobsApi, 'streamJobEvents');
@@ -408,7 +408,7 @@ describe('jobStore 后台任务状态管理', () => {
     expect(onEvent).toHaveBeenCalledWith('job-1');
   });
 
-  it('流意外正常关闭也会释放订阅并反馈故障', async () => {
+  it('verifies jobStore test behavior 20', async () => {
     useJobStore.getState().setJobs([mockJob1]);
     const streamSpy = vi.spyOn(jobsApi, 'streamJobEvents').mockResolvedValue(undefined);
     const onError = vi.fn();

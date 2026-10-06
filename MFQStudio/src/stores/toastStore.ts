@@ -1,66 +1,67 @@
 /**
- * 全局轻量通知（Toast）状态管理，负责维护提示队列与自动销毁。
+ * Global lightweight notification (Toast) state management for maintaining the notification queue and auto-dismissal.
  */
 import { create } from 'zustand';
+import type { DisplayMessage } from '../i18n/messages';
 
-/** 通知提示类型。 */
+/** Notification type. */
 export type ToastType = 'error' | 'success' | 'info' | 'warning';
 
-/** 单条通知数据结构。 */
+/** Data structure for a single notification. */
 export interface ToastItemData {
-  /** 唯一标识符。 */
+  /** Unique identifier. */
   id: string;
-  /** 每次展示时递增，用于重置计时并识别过期的关闭回调。 */
+  /** Incremented on each display to reset timing and identify stale close callbacks. */
   revision: number;
-  /** 通知类型。 */
+  /** Notification type. */
   type: ToastType;
-  /** 通知主要内容。 */
-  message: string;
-  /** 可选的通知标题。 */
-  title?: string;
-  /** 停留时间（毫秒），小于等于 0 表示常驻直至手动关闭。 */
+  /** Main notification content. */
+  message: DisplayMessage;
+  /** Optional notification title. */
+  title?: DisplayMessage;
+  /** Display duration in milliseconds; values at or below zero keep it visible until manually closed. */
   duration?: number;
 }
 
-/** 触发通知时的输入参数。 */
+/** Input options for triggering a notification. */
 export interface ShowToastOptions {
-  /** 可选指定 ID；若相同则替换已有通知。 */
+  /** Optional ID; an existing notification with the same ID is replaced. */
   id?: string;
-  /** 通知类型，默认为 'info'。 */
+  /** Notification type; defaults to 'info'. */
   type?: ToastType;
-  /** 提示消息文本。 */
-  message: string;
-  /** 可选标题。 */
-  title?: string;
-  /** 持续时间（毫秒）；未指定时按类型默认（错误 5000ms，其他 3500ms）。 */
+  /** Notification message text. */
+  message: DisplayMessage;
+  /** Optional title. */
+  title?: DisplayMessage;
+  /** Duration in milliseconds; defaults by type when omitted (5000 ms for errors, 3500 ms otherwise). */
   duration?: number;
 }
 
 interface ToastState {
-  /** 当前待展示的通知列表。 */
+  /** Notifications currently queued for display. */
   toasts: ToastItemData[];
   /**
-   * 推送新通知，返回通知唯一 ID。
+   * Push a new notification and return its unique ID.
    *
-   * @param options 通知配置项
-   * @returns 分配的通知 ID
+   * @param options Notification options.
+   * @returns The assigned notification ID.
    */
   showToast: (options: ShowToastOptions) => string;
   /**
-   * 关闭并移除指定 ID 的通知。
+   * Close and remove the notification with the specified ID.
    *
-   * @param id 要关闭的通知 ID
-   * @param revision 可选的展示版本，避免旧定时器关闭同 ID 的新通知
+   * @param id ID of the notification to close.
+   * @param revision Optional display revision to prevent an old timer from closing a newer notification with the same ID.
    */
   dismissToast: (id: string, revision?: number) => void;
-  /** 清空所有当前显示的通知。 */
+  /** Clear all currently displayed notifications. */
   clearToasts: () => void;
 }
 
 let toastIdCounter = 0;
 let toastRevisionCounter = 0;
 
-/** Zustand 全局通知 Store。 */
+/** Global Zustand notification store. */
 export const useToastStore = create<ToastState>()((set) => ({
   toasts: [],
   showToast: (options) => {
@@ -89,59 +90,59 @@ export const useToastStore = create<ToastState>()((set) => ({
 }));
 
 /**
- * 快捷命令式 Toast 调用工具，支持在任意组件或普通函数中直接调用。
+ * Shortcut for imperative Toast calls, usable directly from any component or regular function.
  */
 export const toast = {
   /**
-   * 触发错误类型通知。
+   * Trigger an error notification.
    *
-   * @param message 错误信息
-   * @param options 可选标题或显示时长
+   * @param message Error message.
+   * @param options Optional title or display duration.
    */
-  error: (message: string, options?: { title?: string; duration?: number; id?: string }) =>
+  error: (message: DisplayMessage, options?: { title?: DisplayMessage; duration?: number; id?: string }) =>
     useToastStore.getState().showToast({ ...options, type: 'error', message }),
 
   /**
-   * 触发成功类型通知。
+   * Trigger a success notification.
    *
-   * @param message 成功提示信息
-   * @param options 可选标题或显示时长
+   * @param message Success message.
+   * @param options Optional title or display duration.
    */
-  success: (message: string, options?: { title?: string; duration?: number; id?: string }) =>
+  success: (message: DisplayMessage, options?: { title?: DisplayMessage; duration?: number; id?: string }) =>
     useToastStore.getState().showToast({ ...options, type: 'success', message }),
 
   /**
-   * 触发普通信息类型通知。
+   * Trigger an informational notification.
    *
-   * @param message 提示信息
-   * @param options 可选标题或显示时长
+   * @param message Notification message.
+   * @param options Optional title or display duration.
    */
-  info: (message: string, options?: { title?: string; duration?: number; id?: string }) =>
+  info: (message: DisplayMessage, options?: { title?: DisplayMessage; duration?: number; id?: string }) =>
     useToastStore.getState().showToast({ ...options, type: 'info', message }),
 
   /**
-   * 触发警告类型通知。
+   * Trigger a warning notification.
    *
-   * @param message 警告信息
-   * @param options 可选标题或显示时长
+   * @param message Warning message.
+   * @param options Optional title or display duration.
    */
-  warning: (message: string, options?: { title?: string; duration?: number; id?: string }) =>
+  warning: (message: DisplayMessage, options?: { title?: DisplayMessage; duration?: number; id?: string }) =>
     useToastStore.getState().showToast({ ...options, type: 'warning', message }),
 
   /**
-   * 通用自定义通知。
+   * Trigger a custom notification.
    *
-   * @param options 完整通知配置项
+   * @param options Complete notification options.
    */
   show: (options: ShowToastOptions) => useToastStore.getState().showToast(options),
 
   /**
-   * 手动关闭指定通知。
+   * Manually close the specified notification.
    *
-   * @param id 通知 ID
+   * @param id Notification ID.
    */
   dismiss: (id: string) => useToastStore.getState().dismissToast(id),
 
-  /** 清空所有通知。 */
+  /** Clear all notifications. */
   clear: () => useToastStore.getState().clearToasts(),
 };

@@ -1,4 +1,4 @@
-/** 根据选中实例、会话模式与用户设置解析聊天推理能力和请求参数。 */
+/** Resolve chat inference capabilities and request parameters from the selected instance, session mode, and user settings. */
 import { useCallback, useMemo } from 'react';
 import { useRuntime } from '../../../app/RuntimeProvider';
 import { useSettings } from '../../settings/SettingsProvider';
@@ -9,8 +9,7 @@ import type { SessionMode, SamplingParams } from '../../../shared/api/types';
 import { useJobStore } from '../../../stores/jobStore';
 
 const EMPTY_REASONING_VALUES: string[] = [];
-
-/** 返回仅属于聊天的派生能力，实例变化时自动重新解析模型默认设置。 */
+/** Return chat-specific derived capabilities, recalculating model defaults when the instance changes. */
 export function useChatInference(mode: SessionMode) {
   const runtimeContext = useRuntime();
   const {
@@ -81,7 +80,7 @@ export function useChatInference(mode: SessionMode) {
     }),
     [effectiveSettings, thinkingSupported, mtpSupported, mtpAvailable],
   );
-  /** 即时切换当前推理设置，同时退出默认值继承。 */
+/** Immediately update the current inference setting and disable default inheritance. */
   const updateGlobalInference = useCallback(
     (patch: Partial<GenerationSettings>) => {
       updateSettings({

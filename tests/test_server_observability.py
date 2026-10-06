@@ -1,3 +1,5 @@
+"""Verify runtime telemetry persistence, retention, and cursor-based history access."""
+
 from __future__ import annotations
 
 import asyncio
@@ -53,9 +55,8 @@ def test_runtime_metrics_and_logs_persist_and_filter(tmp_path: Path) -> None:
                     "/api/v1/runtime/metrics", params={"instance_id": str(INSTANCE_ID)}
                 )
                 assert metrics.status_code == 200
-                assert len(metrics.json()["data"]) == 1
-                assert metrics.json()["data"][0]["values"]["total_requests"] == 3
-                assert metrics.json()["data"][0]["model"] == "model-a"
+                assert metrics.json()["data"] == []
+                assert store.list_runtime_requests() == []
 
                 logs = await client.get(
                     "/api/v1/runtime/logs",
@@ -67,7 +68,7 @@ def test_runtime_metrics_and_logs_persist_and_filter(tmp_path: Path) -> None:
             await service.aclose()
 
         reopened = SessionStore(tmp_path / "mfq.server.sqlite3")
-        assert reopened.list_runtime_metrics()[0].values["last_request"]["id"] == "request-a"
+        assert reopened.list_runtime_metrics() == []
         assert len(reopened.list_runtime_logs()) == 2
 
     asyncio.run(run())
@@ -82,3 +83,53 @@ def test_runtime_metric_history_has_a_bounded_retention_window(
         store.append_runtime_metric({"value": value})
 
     assert [entry.values["value"] for entry in store.list_runtime_metrics()] == [2, 3, 4]
+
+
+def test_runtime_history_pages_latest_older_and_live_without_duplicate_requests(tmp_path: Path) -> None:
+    """Page distinct requests and logs without gaps while new records arrive."""
+    async def run() -> None:
+        store = SessionStore(tmp_path / 'history.sqlite3')
+        service = ServerService(store, StatusBackend())  # type: ignore[arg-type]
+        for number in range(1, 126):
+            store.append_runtime_log(RuntimeLogLevel.INFO, f'event-{number}', now=NOW)
+            for _ in range(3):
+                store.append_runtime_request({'last_request': {'id': f'request-{number}'}}, now=NOW)
+        store.append_runtime_metric({'runtime_state': 'idle'}, now=NOW)
+        transport = httpx.ASGITransport(app=create_app(service))
+        try:
+            async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+                for path in ['/api/v1/runtime/logs', '/api/v1/runtime/requests']:
+                    first = (await client.get(path, params={'limit': 50, 'order': 'desc'})).json()['data']
+                    assert len(first) == 50
+                    assert first[0]['sequence'] > first[-1]['sequence']
+                    second = (await client.get(path, params={
+                        'limit': 50, 'order': 'desc', 'before': first[-1]['sequence'],
+                    })).json()['data']
+                    third = (await client.get(path, params={
+                        'limit': 50, 'order': 'desc', 'before': second[-1]['sequence'],
+                    })).json()['data']
+                    assert len(second) == 50
+                    assert len(third) == 25
+                    combined = first + second + third
+                    assert len({row['sequence'] for row in combined}) == 125
+                    if path.endswith('requests'):
+                        assert [row['values']['last_request']['id'] for row in combined] == [
+                            f'request-{number}' for number in range(125, 0, -1)
+                        ]
+                    for params in [{'before': 0}, {'after': -1}, {'order': 'invalid'}]:
+                        assert (await client.get(path, params=params)).status_code == 422
+
+                latest = store.list_runtime_requests(limit=1)[0].sequence
+                store.append_runtime_request({'last_request': {'id': 'request-125'}}, now=NOW)
+                store.append_runtime_request({'last_request': {'id': 'request-126'}}, now=NOW)
+                live = (await client.get('/api/v1/runtime/requests', params={
+                    'after': latest, 'order': 'asc', 'limit': 50,
+                })).json()['data']
+                assert [row['values']['last_request']['id'] for row in live] == ['request-126']
+                store.append_runtime_log(RuntimeLogLevel.INFO, 'event-126', now=NOW)
+                live_logs = (await client.get('/api/v1/runtime/logs', params={'after': 125})).json()['data']
+                assert [row['message'] for row in live_logs] == ['event-126']
+                assert [row.sequence for row in store.list_runtime_logs(limit=3)] == [1, 2, 3]
+        finally:
+            await service.aclose()
+    asyncio.run(run())

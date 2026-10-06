@@ -1,4 +1,4 @@
-/* 保持既有级联顺序的模型工作台和会话布局覆盖规则。 */
+/* Model-workbench and session-layout overrides, preserving the existing cascade order. */
 /* Model workbench hierarchy */
 .model-load-policy { margin-top: 16px; }
 .model-policy-panel { margin-top: 16px; }
@@ -36,10 +36,10 @@ button:active, a:active { transform: translateY(1px); }
 
 /* ChatGPT-style conversation layout */
 .chat-view { grid-template-columns: 246px minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr) auto; }
-.chat-session-sidebar { grid-column: 1; grid-row: 1 / -1; min-width: 0; overflow: hidden; border-right: 1px solid var(--line-soft); background: var(--surface-overlay); }
-.chat-session-sidebar-header { display: flex; height: 70px; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--line-soft); padding: 14px 14px 14px 18px; color: var(--ink-strong); }
+.chat-session-sidebar { display: flex; flex-direction: column; grid-column: 1; grid-row: 1 / -1; min-width: 0; min-height: 0; overflow: hidden; border-right: 1px solid var(--line-soft); background: var(--surface-overlay); }
+.chat-session-sidebar-header { display: flex; flex-shrink: 0; height: 70px; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--line-soft); padding: 14px 14px 14px 18px; color: var(--ink-strong); }
 .chat-session-sidebar-header strong { font-size: 13px; font-weight: 650; }
-.chat-session-list { display: grid; gap: 2px; overflow-y: auto; padding: 9px; }
+.chat-session-list { display: grid; flex: 1; min-height: 0; align-content: start; gap: 2px; overflow-y: auto; padding: 9px; }
 .chat-session-list button { display: grid; min-width: 0; gap: 3px; border: 0; border-radius: 8px; padding: 9px 10px; color: var(--ink-soft); background: transparent; text-align: left; }
 .chat-session-list button:hover, .chat-session-list button.active { background: var(--surface-subtle); }
 .chat-session-list button.active { color: var(--ink-strong); box-shadow: inset 2px 0 0 var(--accent); }
@@ -51,6 +51,7 @@ button:active, a:active { transform: translateY(1px); }
 .chat-session-row:hover, .chat-session-row.active { background: var(--surface-subtle); }
 .chat-session-row.active { box-shadow: inset 2px 0 0 var(--accent); }
 .chat-session-row .chat-session-select-button { width: 100%; }
+.chat-session-row .chat-session-select-button:hover { background: transparent; }
 .chat-session-row .chat-session-delete-button { width: 28px; height: 28px; place-items: center; padding: 0; color: var(--muted); }
 .chat-session-row .chat-session-delete-button:hover, .chat-session-row .chat-session-delete-button:focus-visible { color: var(--danger); background: var(--danger-soft); }
 .chat-session-row button:disabled { cursor: not-allowed; opacity: 0.5; }

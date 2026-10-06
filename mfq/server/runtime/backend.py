@@ -57,6 +57,8 @@ class BackendDelta:
     usage: TokenUsage | None = None
     performance: ResponsePerformance | None = None
     backend_request_id: str | None = None
+    runtime_instance_id: UUID | None = None
+    runtime_source: str | None = None
 
 
 class ChatBackend(Protocol):

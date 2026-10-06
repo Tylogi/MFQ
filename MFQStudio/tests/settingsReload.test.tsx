@@ -1,3 +1,5 @@
+/** Verify settingsReload behavior and integration contracts. */
+import { i18n } from '../src/i18n';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, expect, it, vi } from 'vitest';
@@ -8,7 +10,7 @@ import type { RuntimeInstance, RuntimeStatus } from '../src/shared/api/types';
 
 vi.mock('../src/app/RuntimeProvider', () => ({ useRuntime: vi.fn() }));
 vi.mock('../src/features/settings/SettingsProvider', () => ({ useSettings: () => ({
-  contextSize: 32768, setContextSize: vi.fn(), tr: (_zh: string, en: string) => en,
+  contextSize: 32768, setContextSize: vi.fn(), t: i18n.getFixedT('en'),
 }) }));
 
 const reloadModelContext = vi.fn();
@@ -29,7 +31,7 @@ beforeEach(() => {
   vi.mocked(useRuntime).mockReturnValue(state());
 });
 
-it('同时展示每个模型的独立 ctx 和架构上限', () => {
+it('verifies settingsReload test behavior 1', () => {
   render(<ModelContextSettings />);
   expect(screen.getByRole('spinbutton', { name: 'Qwen3.8-Flash-S4-L maximum context' })).toHaveValue(32768);
   expect(screen.getByRole('spinbutton', { name: 'Qwen3.8-27B-S4-M maximum context' })).toHaveValue(16384);
@@ -37,7 +39,7 @@ it('同时展示每个模型的独立 ctx 和架构上限', () => {
   expect(screen.getByRole('spinbutton', { name: 'Qwen3.8-27B-S4-M maximum context' })).toHaveAttribute('max', '262144');
 });
 
-it('点击直接重载指定模型，刷新和模型选择变化不覆盖另一个 ctx 草稿', async () => {
+it('verifies settingsReload test behavior 2', async () => {
   const user = userEvent.setup();
   const view = render(<ModelContextSettings />);
   const flash = screen.getByRole('spinbutton', { name: 'Qwen3.8-Flash-S4-L maximum context' });
@@ -50,7 +52,7 @@ it('点击直接重载指定模型，刷新和模型选择变化不覆盖另一�
   expect(screen.getByRole('spinbutton', { name: 'Qwen3.8-27B-S4-M maximum context' })).toHaveValue(65536);
 });
 
-it('重载中立即显示状态，只禁用对应模型，完成后显示实际 ctx', async () => {
+it('verifies settingsReload test behavior 3', async () => {
   let complete!: (result: RuntimeStatus) => void;
   reloadModelContext.mockReturnValue(new Promise((resolve) => { complete = resolve; }));
   const view = render(<ModelContextSettings />);
@@ -64,14 +66,14 @@ it('重载中立即显示状态，只禁用对应模型，完成后显示实际 
   await waitFor(() => expect(screen.getByRole('spinbutton', { name: 'Qwen3.8-Flash-S4-L maximum context' })).toHaveValue(16384));
 });
 
-it.each(['', '0', '512.5', '131073'])('无效 ctx %s 不发送重载请求', (value) => {
+it.each(['', '0', '512.5', '131073'])('verifies settingsReload test behavior 4', (value) => {
   render(<ModelContextSettings />);
   fireEvent.change(screen.getByRole('spinbutton', { name: 'Qwen3.8-Flash-S4-L maximum context' }), { target: { value } });
   expect(screen.getByRole('button', { name: 'Reload Qwen3.8-Flash-S4-L' })).toBeDisabled();
   expect(reloadModelContext).not.toHaveBeenCalled();
 });
 
-it('模型总驻留汇总两个实例，不随当前模型变成单个模型大小', () => {
+it('verifies settingsReload test behavior 5', () => {
   render(<MemorySettingsPanel />);
   const row = screen.getByText(/Current weight residency/).closest('.memory-budget-actions')!;
   expect(row).toHaveTextContent('96.3');

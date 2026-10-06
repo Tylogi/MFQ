@@ -1,4 +1,5 @@
-/** 验证概览与历史消息实际展示相同的原生预填充指标。 */
+/** Verify that the overview and message history display the same native prefill metrics. */
+import { i18n } from '../src/i18n';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { expect, it, vi } from 'vitest';
@@ -27,10 +28,10 @@ vi.mock('../src/app/RuntimeProvider', () => ({
   }),
 }));
 vi.mock('../src/features/settings/SettingsProvider', () => ({
-  useSettings: () => ({ tr: (_chinese: string, english: string) => english }),
+  useSettings: () => ({ t: i18n.getFixedT('en') }),
 }));
 
-it('概览预填充卡片展示运行时速度与耗时，而非 TTFT 或媒体准备总时间', () => {
+it('verifies runtimeMetricViews test behavior 1', () => {
   render(<MemoryRouter><OverviewPage /></MemoryRouter>);
   const prefill = screen.getByText('Prefill').closest('.metric-tile');
   expect(prefill?.querySelector('strong')).toHaveTextContent(/^999 tok\/s$/);
@@ -43,14 +44,14 @@ it('displays and copies the same OpenAI SDK URL with /v1', async () => {
   Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
   render(<MemoryRouter><OverviewPage /></MemoryRouter>);
   expect(screen.getByText('OpenAI-compatible endpoint').closest('.tm-panel')?.querySelector('code'))
-    .toHaveTextContent('http://127.0.0.1:8090/v1');
+    .toHaveTextContent(`${window.location.origin}/v1`);
   fireEvent.click(screen.getByRole('button', { name: 'Copy endpoint' }));
-  await waitFor(() => expect(writeText).toHaveBeenCalledWith('http://127.0.0.1:8090/v1'));
+  await waitFor(() => expect(writeText).toHaveBeenCalledWith(`${window.location.origin}/v1`));
   expect(screen.getByText('Resource overview')).toBeInTheDocument();
   expect(screen.getByText('Runtime resources')).toBeInTheDocument();
 });
 
-it('历史响应使用同一预填充速度，并单独显示媒体准备耗时', () => {
+it('verifies runtimeMetricViews test behavior 2', () => {
   const message: Message = { id: 'answer', role: 'assistant', parts: [], parent_id: null, created_at: '2026-09-24T00:00:00Z' };
   const response: ResponseResource = {
     id: 'response-a', request_id: 'request-a', session_id: 'session-a', status: 'completed',
@@ -59,7 +60,7 @@ it('历史响应使用同一预填充速度，并单独显示媒体准备耗时'
   };
   render(<TooltipProvider><SavedMessageList
     messages={[message]} responses={{ answer: response }} mcpTools={[]} busy={false}
-    tr={(_chinese, english) => english} editDraft={null} setEditDraft={vi.fn()}
+    t={i18n.getFixedT('en')} editDraft={null} setEditDraft={vi.fn()}
     actions={{ saveEdit: vi.fn(), copyMessage: vi.fn(), regenerate: vi.fn(), executeToolCalls: vi.fn() }}
   /></TooltipProvider>);
   expect(screen.getByText('999 pp')).toBeInTheDocument();

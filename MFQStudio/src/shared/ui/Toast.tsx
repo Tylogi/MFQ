@@ -1,7 +1,8 @@
 /**
- * 全局浮层通知容器组件，监听 Toast 队列并挂载于应用顶层。
+ * Global floating notification container that observes the Toast queue and mounts at the application root.
  */
 import { useToastStore } from '../../stores/toastStore';
+import { useTranslation } from 'react-i18next';
 import { ToastItem } from './ToastItem';
 import './primitives.css';
 
@@ -9,9 +10,10 @@ export { ToastItem } from './ToastItem';
 export type { ToastItemProps } from './ToastItem';
 
 /**
- * 渲染全应用共享的 Toast 浮动容器，挂载于应用外壳根层级。
+ * Render the application-wide shared Toast container at the root of the app shell.
  */
 export function ToastContainer() {
+  const { t } = useTranslation();
   const toasts = useToastStore((state) => state.toasts);
   const dismissToast = useToastStore((state) => state.dismissToast);
 
@@ -21,7 +23,7 @@ export function ToastContainer() {
     <div
       className="studio-toast-container"
       role="region"
-      aria-label="通知提示"
+      aria-label={t('common:notifications')}
       tabIndex={-1}
     >
       {toasts.map((item) => (

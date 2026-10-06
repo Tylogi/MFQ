@@ -1,10 +1,10 @@
-/** 展示量化工作台的校准导入与产物选择。 */
+/** Display calibration import and artifact selection for the quantization workspace. */
 import { useQuantization } from './QuantizationContext';
 import { Icon } from '../../app/display';
-/** 从页面状态读取本面板所需数据与业务操作。 */
+/** Read the data and business actions required by this panel from page state. */
 export function ImatrixPanel() {
   const {
-    tr,
+    t,
     busy,
     jobKinds,
     setSelectedJobKind,
@@ -21,10 +21,7 @@ export function ImatrixPanel() {
           <div>
             <h2>Imatrix</h2>
             <p>
-              {tr(
-                '单独校准、导入，或在量化任务中先校准再使用',
-                'Calibrate separately, import one, or collect it before quantization',
-              )}
+              {t('jobs:imatrixPanel.calibrateSeparatelyImportOneOrCollectItBeforeQuantization')}
             </p>
           </div>
           <b>{imatrixArtifacts.length}</b>
@@ -36,7 +33,7 @@ export function ImatrixPanel() {
             type="button"
           >
             <Icon name="plus" size={11} />
-            {tr('新建校准', 'New calibration')}
+            {t('jobs:imatrixPanel.newCalibration')}
           </button>
           <button
             disabled={
@@ -46,7 +43,7 @@ export function ImatrixPanel() {
             type="button"
           >
             <Icon name="upload" size={11} />
-            {imatrixImporting ? tr('正在导入', 'Importing') : tr('导入文件', 'Import file')}
+            {imatrixImporting ? t('jobs:imatrixPanel.importing') : t('jobs:imatrixPanel.importFile')}
           </button>
           <input
             accept=".imatrix,.gguf,.dat,application/x-mfq-imatrix,application/octet-stream"
@@ -71,7 +68,7 @@ export function ImatrixPanel() {
                   <strong>{item.artifact_name}</strong>
                   <small>{item.artifact_uri}</small>
                 </div>
-                <span>{tr('用于量化', 'Use')}</span>
+                <span>{t('jobs:imatrixPanel.use')}</span>
               </button>
             ))}
           </div>

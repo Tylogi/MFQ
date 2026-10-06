@@ -1,11 +1,10 @@
-/** 应用外壳中的连接、刷新与任务流告警。 */
+/** Connection, refresh, and job-stream alerts in the application shell. */
+import { useTranslation } from 'react-i18next';
 import { useRuntime } from './RuntimeProvider';
-import { useSettings } from '../features/settings/SettingsProvider';
 import { Icon } from './display';
-
-/** 展示当前运行时异常及各自独立的重试操作。 */
+/** Display current runtime failures with independent retry actions. */
 export function RuntimeAlerts({ connectionProblem }: { connectionProblem: string | null }) {
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const { ready, refreshError, jobStreamErrors, loading: selectedModelLoading,
     reloadService, refreshRuntime, retryJobStreams } = useRuntime();
   const streamFailures = Object.entries(jobStreamErrors);
@@ -14,35 +13,34 @@ export function RuntimeAlerts({ connectionProblem }: { connectionProblem: string
       {connectionProblem && (
         <div className="runtime-alert" role="alert">
           <div>
-            <strong>{tr('无法连接服务', 'Unable to connect to the service')}</strong>
+            <strong>{t('app:runtimeAlerts.unableToConnectToTheService')}</strong>
             <span>{connectionProblem}</span>
           </div>
           <button disabled={selectedModelLoading} onClick={() => void reloadService()} type="button">
-            <Icon name="refresh" size={14} />{tr('重试连接', 'Retry connection')}
+            <Icon name="refresh" size={14} />{t('app:runtimeAlerts.retryConnection')}
           </button>
         </div>
       )}
       {ready && refreshError && (
         <div className="runtime-alert" role="alert">
           <div>
-            <strong>{tr('运行状态更新失败，数据可能不是最新的',
-              'Runtime status could not be updated; data may be stale')}</strong>
+            <strong>{t('app:runtimeAlerts.runtimeStatusCouldNotBeUpdatedDataMayBeStale')}</strong>
             <span>{refreshError}</span>
           </div>
           <button disabled={selectedModelLoading}
             onClick={() => void refreshRuntime(false)} type="button">
-            <Icon name="refresh" size={14} />{tr('重新刷新', 'Refresh again')}
+            <Icon name="refresh" size={14} />{t('app:runtimeAlerts.refreshAgain')}
           </button>
         </div>
       )}
       {ready && streamFailures.length > 0 && (
         <div className="runtime-alert" role="alert">
           <div>
-            <strong>{tr('任务进度暂时无法更新', 'Task progress is not updating')}</strong>
+            <strong>{t('app:runtimeAlerts.taskProgressIsNotUpdating')}</strong>
             <span>{streamFailures.map(([id, message]) => `${id}: ${message}`).join('; ')}</span>
           </div>
           <button onClick={retryJobStreams} type="button">
-            <Icon name="refresh" size={14} />{tr('重新连接任务流', 'Reconnect task streams')}
+            <Icon name="refresh" size={14} />{t('app:runtimeAlerts.reconnectTaskStreams')}
           </button>
         </div>
       )}

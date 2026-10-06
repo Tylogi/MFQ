@@ -1,4 +1,4 @@
-"""校验原生对话模板、推理能力发布及上下文重载契约。"""
+"""Validate native chat templates, inference capability publication, and context reload contracts."""
 import re
 from pathlib import Path
 

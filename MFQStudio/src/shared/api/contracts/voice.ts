@@ -1,4 +1,4 @@
-/** 定义 voice 领域的服务契约，仅包含类型，不依赖运行时代码。 */
+/** Define service contracts for the voice domain using types only, with no runtime dependencies. */
 import type { ModelCapabilities } from './runtime';
 
 export interface RealtimeCapabilities {

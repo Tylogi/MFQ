@@ -1,4 +1,4 @@
-/** 定义语音消息与实时输出结构，并读取本地语音历史。 */
+/** Define voice message and real-time output structures, and read local voice history. */
 
 
 export interface VoiceMessage {
@@ -18,7 +18,7 @@ export interface LiveVoiceOutput {
 
 export const VOICE_HISTORY_KEY = "mfq.studio.voice-history.v1";
 
-/** 读取最多两百条本地语音记录，解析失败时返回空列表。 */
+/** Read up to 200 local voice records, returning an empty list if parsing fails. */
 export function loadVoiceHistory(): VoiceMessage[] {
   try {
     const value = JSON.parse(localStorage.getItem(VOICE_HISTORY_KEY) || "[]");

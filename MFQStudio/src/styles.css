@@ -1,4 +1,4 @@
-/* 按原始级联顺序加载主题、共享布局与业务样式，页面组件不重复导入。 */
+/* Load theme, shared layout, and business styles in the original cascade order without duplicate page imports. */
 @import './shared/styles/tokens.css';
 @import './shared/styles/base.css';
 @import './shared/styles/shell.css';
@@ -15,3 +15,4 @@
 @import './shared/styles/dialogs.css';
 @import './shared/styles/responsive.css';
 @import './shared/styles/overrides.css';
+@import './shared/styles/select.css';

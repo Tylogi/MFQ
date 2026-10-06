@@ -1,11 +1,11 @@
-/** 保留实时语音状态机、回合归属与默认参数的过渡源码契约；本文件不是行为测试，audioCodec/AudioDevices 行为覆盖不能替代它。 */
+/** Retain transitional source contracts for the real-time voice state machine, turn ownership, and defaults; this is not a behavior test, and audioCodec/AudioDevices behavior coverage does not replace it. */
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const sourceRoot = resolve(process.cwd(), 'src');
 
-/** 只读取产品实现，排除测试和类型声明，防止测试自身满足契约。 */
+/** Read product implementation only, excluding tests and type declarations so tests cannot satisfy their own contracts. */
 function readSources(...paths: string[]): string {
   function collect(location: string): string[] {
     if (statSync(location).isDirectory()) {
@@ -21,7 +21,7 @@ function readSources(...paths: string[]): string {
 const REALTIME_AUDIO = readSources('realtimeAudio.ts', 'features/voice');
 const APP = readSources('features/chat/ChatProvider.tsx', 'features/chat/hooks', 'features/settings', 'features/voice/useVoiceConversation.ts');
 
-describe('语音过渡源码契约（非行为测试）', () => {
+describe('describes voiceContracts test behavior 1', () => {
   it('test_voice_component_prompt_requires_an_explicit_full_duplex_selection', () => {
     const chat = readSources('features/chat/components/ChatInputArea.tsx');
     const toolbar = readSources('features/chat/components/ChatToolbar.tsx');
@@ -41,10 +41,11 @@ describe('语音过渡源码契约（非行为测试）', () => {
   });
 
   it('test_studio_preserves_resampling_phase_across_audio_worklet_blocks', () => {
-    // 分块相位由 features/voice/audioCodec.test.ts 的多采样率分块/整块等价行为覆盖。
-    // 此处仅保留设备采样率接线；不检查重采样器私有变量，也不代表语音回合归属验证。
+    // Chunk phase is covered by multi-rate chunked/whole-buffer equivalence tests in features/voice/audioCodec.test.ts.
+    // Keep only device sample-rate wiring here; this neither checks resampler internals nor verifies voice-turn ownership.
     const devices = readSources('features/voice/AudioDevices.ts');
-    expect(devices).toContain('const INPUT_RATE = 16_000;');
+    expect(readSources('features/voice/audioProtocol.ts')).toContain('const INPUT_RATE = 16_000;');
+    expect(devices).toContain("import { INPUT_RATE, OUTPUT_RATE } from './audioProtocol';");
     expect(devices).toContain('new AudioContext({ sampleRate: INPUT_RATE })');
   });
 
@@ -96,14 +97,14 @@ describe('语音过渡源码契约（非行为测试）', () => {
     expect(REALTIME_AUDIO).toContain('this.stopPlayback();');
   });
 
-  it('test_model_capabilities：半双工保留块、听说强制标记与完成事件（前端部分）', () => {
+  it('verifies voiceContracts test behavior 2', () => {
     const controller = readSources('features/voice/RealtimeAudioController.ts');
     for (const marker of ['heldHalfDuplexChunk', 'forceListen: true', 'forceSpeak: true', 'event.type === "response.step.done"']) {
       expect(controller).toContain(marker);
     }
   });
 
-  it('test_realtime_uses_official_demo_defaults：官方默认参数与去固定提示词（前端部分）', () => {
+  it('verifies voiceContracts test behavior 3', () => {
     expect(readSources('features/voice/RealtimeAudioController.ts')).toContain('const SPEAK_TOKENS = 20;');
     expect(readSources('features/voice/AudioDevices.ts')).toContain('const PLAYBACK_DELAY_SECONDS = 0.2;');
     const provider = readSources('features/chat/ChatProvider.tsx');

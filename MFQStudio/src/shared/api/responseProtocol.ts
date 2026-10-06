@@ -1,4 +1,4 @@
-/** 校验文本生成协议边界，防止外部事件污染会话或写入无效状态。 */
+/** Validate text-generation protocol boundaries to prevent external events from corrupting sessions or creating invalid state. */
 import type { ApiErrorBody, RealtimeFrame, SessionState } from './types';
 
 type ResponsePayload =
@@ -31,7 +31,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/** 将服务端未知 JSON 校验为可消费事件；会话不匹配或字段错误时立即失败。 */
+/** Validate unknown server JSON as a consumable event, failing immediately on session mismatches or invalid fields. */
 export function validateResponseFrame(value: unknown, sessionId: string): ResponseFrame {
   if (
     !isRecord(value) ||

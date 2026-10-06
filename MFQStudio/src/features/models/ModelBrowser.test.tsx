@@ -1,3 +1,5 @@
+/** Verify ModelBrowser behavior and integration contracts. */
+import { i18n } from '../../i18n';
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { HubModelInfo, HubSystemProfile, OfficialModelList } from '../../shared/api/types';
@@ -44,7 +46,7 @@ it('renders immediately and preserves the chosen card while metadata arrives', a
   vi.mocked(modelsApi.officialHubModels)
     .mockResolvedValueOnce(catalog(true, false))
     .mockResolvedValueOnce(catalog(false, true));
-  const view = render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
+  const view = render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} t={i18n.getFixedT('en')} />);
   await act(async () => {});
   expect(screen.getByRole('button', { name: 'Refreshing' })).toBeDisabled();
   fireEvent.click(screen.getByRole('button', { name: /secondTest/ }));
@@ -61,7 +63,7 @@ it('cancels catalog requests and polling on unmount', async () => {
   vi.useFakeTimers();
   vi.mocked(modelsApi.officialHubModels).mockResolvedValue(catalog(true, false));
   const onError = vi.fn();
-  const view = render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={onError} onJobCreated={vi.fn()} tr={(_, en) => en} />);
+  const view = render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={onError} onJobCreated={vi.fn()} t={i18n.getFixedT('en')} />);
   await act(async () => {});
   const signal = vi.mocked(modelsApi.officialHubModels).mock.calls[0][1]!;
   view.unmount();
@@ -83,7 +85,7 @@ it('does not discard a source detail request when the catalog is updated', async
   vi.mocked(modelsApi.officialHubModels).mockResolvedValueOnce(initial).mockResolvedValueOnce(completed);
   let finish!: (info: HubModelInfo) => void;
   vi.mocked(modelsApi.hubModelInfo).mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
-  const view = render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
+  const view = render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} t={i18n.getFixedT('en')} />);
   await act(async () => {});
   fireEvent.change(screen.getByRole('combobox', { name: 'Download source' }), { target: { value: '1' } });
   await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
@@ -108,7 +110,7 @@ it.each([
   const data = catalog(false, false);
   data.system = { ...data.system, ...hardware };
   vi.mocked(modelsApi.officialHubModels).mockResolvedValue(data);
-  render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
+  render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} t={i18n.getFixedT('en')} />);
   expect(await screen.findByText(summary)).toBeInTheDocument();
   expect(screen.getByRole('img', { name: badge }).querySelector('svg')).toHaveAttribute('fill', 'none');
   expect(screen.queryByText(/test · test/)).not.toBeInTheDocument();
@@ -123,7 +125,7 @@ it.each([
   const data = catalog(false, false);
   data.system = { ...data.system, memory_pools: pools, runtime_memory_budget_bytes: 96 * 2 ** 30 };
   vi.mocked(modelsApi.officialHubModels).mockResolvedValue(data);
-  render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
+  render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} t={i18n.getFixedT('en')} />);
   await screen.findByText(capacities[0]);
   const rows = document.querySelectorAll('.detected-memory-pool');
   expect(rows).toHaveLength(capacities.length);

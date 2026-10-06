@@ -1,4 +1,5 @@
-/** 管理设置页的服务端生成预设、本地缓存和预设编辑状态。 */
+/** Manage server generation presets, local cache, and preset editing state for the settings page. */
+import { useTranslation } from 'react-i18next';
 import { useEffect, useState, type Dispatch, type SetStateAction } from 'react';
 import { presetsApi } from '../../shared/api/resources/presets';
 import type { SessionMode } from '../../shared/api/types';
@@ -16,7 +17,7 @@ import {
 } from './presets';
 import { useSettings } from './SettingsProvider';
 
-/** 在设置页加载预设，并将选择、保存和删除操作限定在该页面生命周期内。 */
+/** Load presets on the settings page and scope selection, save, and delete operations to its lifecycle. */
 export function useGenerationPresets(
   draft: GenerationSettings,
   setDraft: Dispatch<SetStateAction<GenerationSettings>>,
@@ -24,7 +25,8 @@ export function useGenerationPresets(
   mode: SessionMode,
   ready: boolean,
 ) {
-  const { tr, contextSize, setContextSize } = useSettings();
+  const { contextSize, setContextSize } = useSettings();
+  const { t } = useTranslation();
   const [presets, setPresets] = useState(loadStoredPresets);
   const [selected, setSelected] = useState('');
   const [name, setName] = useState('');
@@ -49,13 +51,13 @@ export function useGenerationPresets(
     };
   }, [ready]);
 
-  /** 清除预设选择，供内置预设和模型默认值切换使用。 */
+  /** Clear the selected preset for built-in preset and model-default changes. */
   function clearSelection() {
     setSelected('');
     setName('');
     setStatus(null);
   }
-  /** 将保存的推理快照和上下文容量载入待应用草稿。 */
+  /** Load a saved inference snapshot and context capacity into the unapplied draft. */
   function load(name: string) {
     setSelected(name);
     setName(name);
@@ -69,13 +71,13 @@ export function useGenerationPresets(
       preset: 'custom',
     }));
     setContextSize(preset.contextSize);
-    setStatus({ error: false, text: tr('预设已载入。', 'Preset loaded.') });
+    setStatus({ error: false, text: t('settings:useGenerationPresets.presetLoaded') });
   }
-  /** 创建或覆盖当前预设，成功后更新本地缓存。 */
+  /** Create or overwrite the current preset and update the local cache on success. */
   async function save() {
     const normalized = name.replace(/\s+/g, ' ').trim().slice(0, 64);
     if (!normalized) {
-      setStatus({ error: true, text: tr('请输入预设名称。', 'Enter a preset name.') });
+      setStatus({ error: true, text: t('settings:useGenerationPresets.enterAPresetName') });
       return;
     }
     if (busy) return;
@@ -104,19 +106,19 @@ export function useGenerationPresets(
       );
       setSelected(saved.name);
       setName(saved.name);
-      setStatus({ error: false, text: tr('预设已保存。', 'Preset saved.') });
+      setStatus({ error: false, text: t('settings:useGenerationPresets.presetSaved') });
     } catch (cause) {
       setStatus({ error: true, text: errorMessage(cause) });
     } finally {
       setBusy(false);
     }
   }
-  /** 经确认删除选中的服务端预设及本地副本。 */
+  /** Delete the selected server preset and local copy after confirmation. */
   async function remove() {
     if (
       busy ||
       !selected ||
-      !(await studioConfirm(tr(`删除预设“${selected}”？`, `Delete preset “${selected}”?`)))
+      !(await studioConfirm(t('settings:useGenerationPresets.deletePreset', { selected: selected })))
     )
       return;
     setBusy(true);
@@ -125,7 +127,7 @@ export function useGenerationPresets(
       if (preset?.id) await presetsApi.deleteGenerationPreset(preset.id);
       setPresets((current) => current.filter((item) => item.name !== selected));
       clearSelection();
-      setStatus({ error: false, text: tr('预设已删除。', 'Preset deleted.') });
+      setStatus({ error: false, text: t('settings:useGenerationPresets.presetDeleted') });
     } catch (cause) {
       setStatus({ error: true, text: errorMessage(cause) });
     } finally {
@@ -136,12 +138,12 @@ export function useGenerationPresets(
   const manager = (
     <div className="saved-presets">
       <label>
-        <span>{tr('已保存预设', 'Saved presets')}</span>
+        <span>{t('settings:useGenerationPresets.savedPresets')}</span>
         <select disabled={disabled} onChange={(event) => load(event.target.value)} value={selected}>
           <option value="">
             {presets.length
-              ? tr('选择预设…', 'Select a preset…')
-              : tr('还没有保存的预设', 'No saved presets')}
+              ? t('settings:useGenerationPresets.selectAPreset')
+              : t('settings:useGenerationPresets.noSavedPresets')}
           </option>
           {presets.map((item) => (
             <option key={item.id ?? item.name} value={item.name}>
@@ -152,7 +154,7 @@ export function useGenerationPresets(
       </label>
       <div className="preset-save-row">
         <input
-          aria-label={tr('预设名称', 'Preset name')}
+          aria-label={t('settings:useGenerationPresets.presetName')}
           disabled={disabled}
           maxLength={64}
           onChange={(event) => {
@@ -165,18 +167,18 @@ export function useGenerationPresets(
               void save();
             }
           }}
-          placeholder={tr('预设名称', 'Preset name')}
+          placeholder={t('settings:useGenerationPresets.presetName')}
           value={name}
         />
         <button disabled={disabled} onClick={() => void save()} type="button">
-          {selected && name.trim() === selected ? tr('覆盖', 'Update') : tr('保存', 'Save')}
+          {selected && name.trim() === selected ? t('settings:useGenerationPresets.update') : t('common:save')}
         </button>
         <button
-          aria-label={tr('删除预设', 'Delete preset')}
+          aria-label={t('settings:useGenerationPresets.deletePreset2')}
           className="preset-delete"
           disabled={disabled || !selected}
           onClick={() => void remove()}
-          title={tr('删除预设', 'Delete preset')}
+          title={t('settings:useGenerationPresets.deletePreset2')}
           type="button"
         >
           <Icon name="trash" size={14} />
@@ -186,10 +188,7 @@ export function useGenerationPresets(
         <p className={status.error ? 'preset-status error' : 'preset-status'}>{status.text}</p>
       )}
       <small>
-        {tr(
-          '保存系统提示词、上下文和生成参数；不包含界面语言与播放开关。',
-          'Stores the system prompt, context, and generation parameters; interface and playback preferences stay separate.',
-        )}
+        {t('settings:useGenerationPresets.storesTheSystemPromptContextAndGenerationParametersInterfaceAndPlaybackPreferences')}
       </small>
     </div>
   );

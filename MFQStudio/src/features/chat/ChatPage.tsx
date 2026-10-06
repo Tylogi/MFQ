@@ -1,11 +1,10 @@
-/** 聊天路由入口仅组合页面局部状态与各展示区域。 */
+/** The chat route entry point composes only page-local state and presentation areas. */
 import { useChatPageState } from './hooks/useChatPageState';
 import { ChatSessionSidebar } from './components/ChatSessionSidebar';
 import { ChatPageHeader } from './components/ChatPageHeader';
 import { ChatMessageList } from './components/ChatMessageList';
 import { ChatInputArea } from './components/ChatInputArea';
-
-/** 渲染聊天页；跨路由生成生命周期由外层 ChatProvider 保留。 */
+/** Render the chat page; the outer ChatProvider preserves generation across route changes. */
 export function ChatPage() {
   const page = useChatPageState();
   return (

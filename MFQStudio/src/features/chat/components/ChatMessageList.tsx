@@ -1,6 +1,6 @@
-/** 聊天消息区组合欢迎状态、历史、语音和流式回复。 */
+/** Compose the welcome state, history, voice, and streaming response in the chat message area. */
+import { useTranslation } from 'react-i18next';
 import { lazy, Suspense } from 'react';
-import { useSettings } from '../../settings/SettingsProvider';
 import { useChatTools } from '../ChatToolsProvider';
 import { useConversationSelector } from '../state/conversationStore';
 import { Icon } from '../../../app/display';
@@ -12,10 +12,9 @@ import type { ChatPageState } from '../hooks/useChatPageState';
 const SavedMessageList = lazy(() =>
   import('../SavedMessageList').then((module) => ({ default: module.SavedMessageList })),
 );
-
-/** 展示当前会话消息并维持历史消息组件的按需加载。 */
+/** Display current-session messages while preserving lazy loading of saved-message components. */
 export function ChatMessageList({ page }: { page: ChatPageState }) {
-  const { tr } = useSettings();
+  const { t } = useTranslation();
   const { mcpTools } = useChatTools();
   const messages = useConversationSelector((state) => state.messages);
   const responses = useConversationSelector((state) => state.responses);
@@ -23,7 +22,7 @@ export function ChatMessageList({ page }: { page: ChatPageState }) {
     active, activeId, chat, editDraft, setEditDraft, saveCurrentEdit,
     createSession, chooseModelDirectory, scroll,
   } = page;
-  const { voice, generation, inference, messageActions, busy } = chat;
+  const { voice, generation, inference, messageActions, busy, recoveryNeeded } = chat;
   const currentVoiceMessages = voice.voiceMessages.filter((message) => message.sessionId === activeId);
   const live = generation.getSnapshot().live;
   return (
@@ -35,40 +34,40 @@ export function ChatMessageList({ page }: { page: ChatPageState }) {
             {!chat.conversation.modelAvailable ? (
               <>
                 <h1>{inference.selectedModelLoading
-                  ? tr('模型加载中', 'Model loading')
-                  : tr('尚未加载模型', 'No model loaded')}</h1>
+                  ? t('chat:chatMessageList.modelLoading')
+                  : t('chat:chatMessageList.noModelLoaded')}</h1>
                 <p>{inference.selectedModelLoading
-                  ? tr('加载完成后即可开始对话。', 'Chat becomes available as soon as loading completes.')
-                  : tr('选择本地检查点后即可开始对话。', 'Choose a local checkpoint to use the inference playground.')}</p>
+                  ? t('chat:chatMessageList.chatBecomesAvailableAsSoonAsLoadingCompletes')
+                  : t('chat:chatMessageList.chooseALocalCheckpointToUseTheInferencePlayground')}</p>
                 {!inference.selectedModelLoading && (
                   <button className="open-model-primary" disabled={busy} onClick={chooseModelDirectory} type="button">
-                    <Icon name="folder" />{tr('选择模型', 'Choose model')}
+                    <Icon name="folder" />{t('chat:chatMessageList.chooseModel')}
                   </button>
                 )}
               </>
             ) : !active ? (
               <>
-                <h1>{tr('开始对话', 'Start a conversation')}</h1>
-                <p>{tr('连接到当前配置的 MFQ 服务。', 'Connected to your configured MFQ service.')}</p>
-                <button className="open-model-primary" disabled={busy} onClick={() => void createSession()} type="button">
-                  {tr('开始对话', 'Start chat')}
+                <h1>{t('chat:chatMessageList.startAConversation')}</h1>
+                <p>{t('chat:chatMessageList.connectedToYourConfiguredMfqService')}</p>
+                <button className="open-model-primary" disabled={busy || recoveryNeeded} onClick={() => void createSession()} type="button">
+                  {t('chat:chatMessageList.startChat')}
                 </button>
               </>
             ) : (
               <>
-                <h1>{tr('开始对话', 'Start a conversation')}</h1>
-                <p>{tr('连接到当前配置的 MFQ 服务。', 'Connected to your configured MFQ service.')}</p>
+                <h1>{t('chat:chatMessageList.startAConversation')}</h1>
+                <p>{t('chat:chatMessageList.connectedToYourConfiguredMfqService')}</p>
               </>
             )}
           </div>
         )}
-        <Suspense fallback={<p role="status">{tr('正在加载消息…', 'Loading messages…')}</p>}>
+        <Suspense fallback={<p role="status">{t('chat:chatMessageList.loadingMessages')}</p>}>
           <SavedMessageList
             messages={messages}
             responses={responses}
             mcpTools={mcpTools}
             busy={busy}
-            tr={tr}
+            t={t}
             editDraft={editDraft}
             setEditDraft={setEditDraft}
             actions={{ saveEdit: saveCurrentEdit, copyMessage: messageActions.copyMessage,
@@ -88,7 +87,7 @@ export function ChatMessageList({ page }: { page: ChatPageState }) {
             <div className="message-body">{renderMarkdown(voice.liveVoice.text, true, true)}</div>
           </article>
         )}
-        <StreamingMessage controller={generation} sessionId={activeId} tr={tr} />
+        <StreamingMessage controller={generation} sessionId={activeId} t={t} />
       </div>
     </div>
   );

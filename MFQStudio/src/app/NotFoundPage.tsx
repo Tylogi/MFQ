@@ -1,12 +1,11 @@
-/** 未注册地址的 404 页面，保留工作区导航并提供明确的返回入口。 */
+/** 404 page for unregistered routes, retaining workspace navigation and providing a clear way back. */
+import { useTranslation } from 'react-i18next';
 import { ArrowLeftIcon, HouseIcon } from '@phosphor-icons/react';
 import { useNavigate } from 'react-router';
-import { useSettings } from '../features/settings/SettingsProvider';
-
-/** 在未知路由展示独立页面，不重定向或改写用户输入的地址。 */
+/** Display a standalone page for unknown routes without redirecting or rewriting the user-entered address. */
 export function NotFoundPage() {
   const navigate = useNavigate();
-  const { tr } = useSettings();
+  const { t } = useTranslation();
 
   return (
     <section aria-labelledby="not-found-title" className="failure-page not-found-page">
@@ -14,14 +13,14 @@ export function NotFoundPage() {
         <div className="failure-page-heading">
           <span className="failure-page-code">404 / NOT FOUND</span>
         </div>
-        <h1 id="not-found-title">{tr('页面不存在', 'Page not found')}</h1>
+        <h1 id="not-found-title">{t('app:notFoundPage.pageNotFound')}</h1>
         <p className="failure-page-description">
-          {tr('这个地址没有对应的页面。请检查网址，或返回概览继续使用。', 'There is no page at this address. Check the URL or return to the overview.')}
+          {t('app:notFoundPage.thereIsNoPageAtThisAddressCheckTheUrlOrReturn')}
         </p>
         <div className="failure-page-actions">
           <button className="failure-page-primary" onClick={() => navigate('/')} type="button">
             <HouseIcon size={16} />
-            {tr('返回概览', 'Back to overview')}
+            {t('app:notFoundPage.backToOverview')}
           </button>
           <button
             className="failure-page-secondary"
@@ -32,7 +31,7 @@ export function NotFoundPage() {
             type="button"
           >
             <ArrowLeftIcon size={16} />
-            {tr('返回上一页', 'Go back')}
+            {t('app:notFoundPage.goBack')}
           </button>
         </div>
       </div>

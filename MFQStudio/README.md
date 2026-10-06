@@ -66,6 +66,17 @@ submitting -> streaming -> syncing -> completed
 - 取消请求最多等待 5 秒，历史同步最多等待 10 秒。无法确认服务端停止时保持恢复状态，防止产生重复生成。
 - 滚动跟随由内容尺寸变化驱动，用户向上阅读后暂停。输入组件处理中文输入法组合状态，移动端会话侧栏默认关闭。
 
+## 界面国际化
+
+界面使用 `i18next` 和 `react-i18next`，中英文资源在 `src/i18n/locales/en` 和 `src/i18n/locales/zh-CN` 中按功能模块维护。所有资源随 Web 和 Tauri 应用打包，切换语言无需联网。
+
+- 设置中的语言偏好仍保存在原有设置对象中，支持中文、英文和跟随系统；系统语言不是中文时使用英文。启动、刷新及系统语言变化都会同步界面和 HTML `lang`。
+- 组件通过 `useTranslation()` 获取 `t`，使用明确的命名空间和语义键，例如 `t('common:save')`。词条键由 TypeScript 校验，不在组件中编写成对的中英文字符串。
+- 动态文案使用插值，例如 `t('models:repositoryFiles.downloadSelectedFiles', { count: selected.length })`；英语复数使用 `_one` / `_other`，中文使用 `_other`。数量应传入原始数字，完整句子留在资源中维护。
+- 应用通知使用 `toast.success(localized('settings:settingsRoute.settingsAppliedSuccessfully'))`，让已经显示的通知也能随语言更新。`localized` 从 `src/i18n/messages` 导入。后端错误、用户文本和原始日志仍作为原文显示。
+- 添加文案时同时补齐两种语言，并保持占位符名称一致。测试会检查词条完整性、插值、复数、回退、语言持久化和通知切换。
+- 新增语言时添加对应资源，更新 `resources.ts`、支持语言列表及设置选项，再补充相应语言规则和测试。
+
 ## 验证
 
 ```sh

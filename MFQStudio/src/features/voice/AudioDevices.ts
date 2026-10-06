@@ -1,11 +1,10 @@
-/** 独立管理浏览器麦克风、AudioWorklet 与音频播放资源，不参与响应轮次协议。 */
+/** Manage browser microphone, AudioWorklet, and playback resources independently of the response-turn protocol. */
 import { StreamingLinearResampler } from './audioCodec';
+import { INPUT_RATE, OUTPUT_RATE } from './audioProtocol';
 
-const INPUT_RATE = 16_000;
-const OUTPUT_RATE = 24_000;
 const PLAYBACK_DELAY_SECONDS = 0.2;
 
-/** 拥有采集与播放设备资源，控制器仅接收原始输入并提交播放样本。 */
+/** Own capture and playback resources; the controller only receives raw input and submits playback samples. */
 export class AudioDevices {
   private stream: MediaStream | null = null;
   private inputContext: AudioContext | null = null;
@@ -16,18 +15,18 @@ export class AudioDevices {
   private playAt = 0;
   private playing = new Set<AudioBufferSourceNode>();
 
-  /** 当前是否持有麦克风采集上下文。 */
+  /** Whether a microphone capture context is currently held. */
   get capturing(): boolean {
     return this.inputContext !== null;
   }
 
-  /** 初始化或恢复播放上下文，必须在用户触发的音频操作中调用。 */
+  /** Initialize or resume the playback context; must be called from a user-initiated audio action. */
   async ensureOutput(): Promise<void> {
     this.outputContext ??= new AudioContext({ sampleRate: OUTPUT_RATE });
     await this.outputContext.resume();
   }
 
-  /** 请求麦克风并接入工作线程；失败时释放已分配的设备资源。 */
+  /** Request microphone access and connect the worklet, releasing allocated device resources on failure. */
   async startCapture(onSamples: (samples: Float32Array) => void): Promise<void> {
     try {
       this.stream = await navigator.mediaDevices.getUserMedia({
@@ -58,12 +57,12 @@ export class AudioDevices {
     }
   }
 
-  /** 保持输入分块相位，把设备样本转换为协议要求的 16kHz 数据。 */
+  /** Preserve phase across input chunks while converting device samples to the protocol's required 16 kHz format. */
   convert(samples: Float32Array): Float32Array {
     return this.resampler?.push(samples) ?? new Float32Array(samples);
   }
 
-  /** 释放麦克风、节点和输入上下文；半双工结束输入时保留输出设备。 */
+  /** Release the microphone, nodes, and input context; retain the output device when ending half-duplex input. */
   async stopCapture(): Promise<void> {
     this.stream?.getTracks().forEach((track) => track.stop());
     this.stream = null;
@@ -77,7 +76,7 @@ export class AudioDevices {
     this.capture = null;
   }
 
-  /** 将音频块串行排入播放队列，并在播放结束后释放节点引用。 */
+  /** Queue audio chunks serially and release node references after playback completes. */
   play(samples: Float32Array, sampleRate: number): void {
     const context = this.outputContext;
     if (!samples.length || !context) return;
@@ -96,13 +95,13 @@ export class AudioDevices {
     };
   }
 
-  /** 停止所有待播放样本，但允许后续继续使用输出设备。 */
+  /** Stop all queued samples while keeping the output device available for later use. */
   stopPlayback(): void {
     for (const source of this.playing) {
       try {
         source.stop();
       } catch {
-        /* 音频可能已经自然结束。 */
+        /* The audio may have already ended naturally. */
       }
       source.disconnect();
     }
@@ -110,7 +109,7 @@ export class AudioDevices {
     this.playAt = this.outputContext?.currentTime ?? 0;
   }
 
-  /** 完整关闭输入与输出资源，多次调用可安全复用。 */
+  /** Fully close input and output resources; safe to call multiple times. */
   async close(): Promise<void> {
     await this.stopCapture();
     this.stopPlayback();

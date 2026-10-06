@@ -1,4 +1,4 @@
-/** 验证应用级故障分流、初次连接重试和后台任务流恢复。 */
+/** Verify application-level failure routing, initial connection retry, and background job-stream recovery. */
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { runtimeApi } from '../shared/api/resources/runtime';
@@ -7,6 +7,7 @@ import type { JobEventResource, JobResource, RuntimeStatus } from '../shared/api
 import { studioStatus } from '../studio';
 import { useJobStore } from '../stores/jobStore';
 import { RuntimeProvider, useRuntime } from './RuntimeProvider';
+import { ApiError } from '../shared/api/client';
 
 vi.mock('../studio', () => ({
   studioStatus: vi.fn(),
@@ -16,13 +17,14 @@ vi.mock('../studio', () => ({
 vi.mock('../features/settings/SettingsProvider', () => ({
   useSettings: () => ({ setContextSize: vi.fn() }),
 }));
-
-/** 以可操作的状态快照验证 Provider 的各类故障互不覆盖。 */
+/** Verify with an interactive state snapshot that Provider failures do not overwrite one another. */
 function RuntimeFixture() {
   const runtime = useRuntime();
   return (
     <>
       <span data-testid="ready">{String(runtime.ready)}</span>
+      <span data-testid="instances">{runtime.instances.map((instance) => instance.id).join(',')}</span>
+      <button onClick={() => runtime.setSelectedModel('model-a')} type="button">Select model</button>
       <span data-testid="connection-error">{runtime.connectionError}</span>
       <span data-testid="refresh-error">{runtime.refreshError}</span>
       <span data-testid="stream-error">{Object.values(runtime.jobStreamErrors).join('; ')}</span>
@@ -42,7 +44,7 @@ const activeJob = {
   payload: {},
 } as JobResource;
 
-describe('RuntimeProvider 故障状态', () => {
+describe('describes RuntimeProvider test behavior 1', () => {
   beforeEach(() => {
     useJobStore.getState().clearJobStreams();
     useJobStore.getState().setJobs([]);
@@ -54,7 +56,7 @@ describe('RuntimeProvider 故障状态', () => {
     vi.spyOn(runtimeApi, 'voiceOutputComponent').mockResolvedValue({} as Awaited<ReturnType<typeof runtimeApi.voiceOutputComponent>>);
   });
 
-  it('首次刷新失败保持未就绪，重连成功后清除错误', async () => {
+  it('verifies RuntimeProvider test behavior 2', async () => {
     vi.mocked(runtimeApi.runtimeInstances).mockRejectedValueOnce(new Error('server offline'));
     render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
     await waitFor(() => expect(screen.getByTestId('refresh-error').textContent).toBe('server offline'));
@@ -65,7 +67,7 @@ describe('RuntimeProvider 故障状态', () => {
     expect(screen.getByTestId('refresh-error').textContent).toBe('');
   });
 
-  it('点击立即请求 ctx 重载并持有状态直到服务完成', async () => {
+  it('verifies RuntimeProvider test behavior 3', async () => {
     let finish!: (status: RuntimeStatus) => void;
     const reload = vi.spyOn(runtimeApi, 'reloadRuntime').mockReturnValue(new Promise((resolve) => { finish = resolve; }));
     render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
@@ -77,7 +79,24 @@ describe('RuntimeProvider 故障状态', () => {
     await waitFor(() => expect(screen.getByTestId('reloading')).toHaveTextContent('{}'));
   });
 
-  it('刷新恢复不会清除任务流故障，任务收到事件后才恢复', async () => {
+  it('recovers when an instance disappears between listing and status lookup', async () => {
+    render(<RuntimeProvider><RuntimeFixture /></RuntimeProvider>);
+    await waitFor(() => expect(screen.getByTestId('ready')).toHaveTextContent('true'));
+    vi.mocked(runtimeApi.runtimeInstances).mockResolvedValueOnce([
+      { id: 'instance-a', model: 'model-a', state: 'ready' } as Awaited<ReturnType<typeof runtimeApi.runtimeInstances>>[number],
+    ]);
+    vi.mocked(runtimeApi.runtimeStatus).mockRejectedValueOnce(new ApiError(404, {
+      error: { code: 'runtime_instance_not_found', message: 'Instance removed', retryable: false, details: {} },
+    }));
+    fireEvent.click(screen.getByRole('button', { name: 'Select model' }));
+    await waitFor(() => expect(runtimeApi.runtimeStatus).toHaveBeenCalledWith('instance-a'));
+    await waitFor(() => expect(runtimeApi.runtimeInstances).toHaveBeenCalledTimes(3));
+    expect(screen.getByTestId('instances').textContent).toBe('');
+    expect(screen.getByTestId('refresh-error').textContent).toBe('');
+    expect(runtimeApi.runtimeStatus).toHaveBeenLastCalledWith();
+  });
+
+  it('verifies RuntimeProvider test behavior 4', async () => {
     vi.mocked(jobsApi.jobs).mockResolvedValue([activeJob]);
     let rejectStream: ((cause: Error) => void) | undefined;
     let resumedEvent: ((event: JobEventResource) => void) | undefined;
@@ -114,7 +133,7 @@ describe('RuntimeProvider 故障状态', () => {
     await waitFor(() => expect(screen.getByTestId('stream-error').textContent).toBe(''));
   });
 
-  it.each(['model.load', 'download.modelscope'])('返回窗口后重新同步 %s 的进度并恢复断开的事件流', async (kind) => {
+  it.each(['model.load', 'download.modelscope'])('verifies RuntimeProvider test behavior 5', async (kind) => {
     const job = { ...activeJob, kind, progress: 0.1, updated_at: '2026-10-03T00:00:00Z' } as JobResource;
     vi.mocked(jobsApi.jobs).mockResolvedValue([job]);
     const stream = vi.spyOn(jobsApi, 'streamJobEvents').mockImplementation(() => new Promise<void>(() => {}));

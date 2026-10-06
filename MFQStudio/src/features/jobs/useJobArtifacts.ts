@@ -1,4 +1,4 @@
-/** 量化任务关联的产物谱系与 Imatrix 导入流程。 */
+/** Artifact lineage associated with quantization jobs and the Imatrix import flow. */
 import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import type { ArtifactLineage } from '../../shared/api/types';
 import { modelsApi } from '../../shared/api/resources/models';
@@ -7,8 +7,7 @@ import { mediaApi } from '../../shared/api/resources/media';
 import { errorMessage } from '../../app/formatters';
 import { toast } from '../../stores/toastStore';
 import { useJobStore } from '../../stores/jobStore';
-
-/** 随终态任务版本刷新谱系，并为上传文件创建 Imatrix 导入任务。 */
+/** Refresh lineage when terminal job versions change and create an Imatrix import job for uploaded files. */
 export function useJobArtifacts(
   completedVersion: string,
   busy: boolean,
@@ -33,8 +32,7 @@ export function useJobArtifacts(
     item.metadata?.media_type === 'application/x-mfq-imatrix' ||
     item.artifact_name.endsWith('.imatrix'),
   );
-
-  /** 上传并创建 Imatrix 导入任务。 */
+/** Upload a file and create an Imatrix import job. */
   async function importImatrix(files: FileList | null) {
     const file = files?.[0];
     if (!file || imatrixImporting || busy) return;

@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
+from mfq.server.runtime.telemetry import ObservedBackend
 from mfq.server.runtime.backend import (
     BackendDelta,
     BackendError,
@@ -297,7 +298,7 @@ class ServerService:
     ) -> None:
         self.store = store
         self.model_aliases = store.runtime_model_aliases()
-        self.backend = backend
+        self.backend = ObservedBackend(backend, store)
         self.jobs = jobs or JobManager(store)
         self.catalog = catalog
         self.runtime_manager = runtime_manager
@@ -309,7 +310,7 @@ class ServerService:
         self.voice_component = voice_component
         self.stream_keepalive_seconds = max(0.01, stream_keepalive_seconds)
         self._active_responses: dict[UUID, tuple[UUID, asyncio.Task[Any]]] = {}
-        self._runtime_metric_state: dict[str, tuple[float, tuple[Any, ...]]] = {}
+        self._metric_sampler: asyncio.Task[None] | None = None
         self._close_lock = asyncio.Lock()
         self._closed = False
         if runtime_manager is not None:
@@ -328,12 +329,18 @@ class ServerService:
         if self.runtime_manager is not None:
             await self.runtime_manager.start()
         await self.jobs.start()
+        if self._metric_sampler is None:
+            self._metric_sampler = asyncio.create_task(self._sample_runtime_metrics())
 
     async def aclose(self) -> None:
         async with self._close_lock:
             if self._closed:
                 return
             self._closed = True
+            if self._metric_sampler is not None:
+                self._metric_sampler.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._metric_sampler
             if isinstance(self.hub_catalog, HubCatalog):
                 await self.hub_catalog.aclose()
             await self.jobs.close()
@@ -1283,38 +1290,28 @@ class ServerService:
                     str(error),
                     retryable=error.retryable,
                 ) from error
-        instance_id = status.get("instance_id")
-        parsed_instance_id = None
-        if isinstance(instance_id, str):
-            try:
-                parsed_instance_id = UUID(instance_id)
-            except ValueError:
-                parsed_instance_id = None
-        metric_key = str(parsed_instance_id or status.get("model") or "runtime")
-        last_request = status.get("last_request")
-        last_request_id = (
-            last_request.get("id") if isinstance(last_request, dict) else None
-        )
-        signature = (
-            status.get("runtime_state"),
-            status.get("active_requests"),
-            status.get("total_requests"),
-            status.get("failed_requests"),
-            status.get("duplex_active"),
-            status.get("reloading"),
-            last_request_id,
-        )
-        now = time.monotonic()
-        previous = self._runtime_metric_state.get(metric_key)
-        if previous is None or previous[1] != signature or now - previous[0] >= 60.0:
-            self._runtime_metric_state[metric_key] = (now, signature)
-            await asyncio.to_thread(
-                self.store.append_runtime_metric,
-                status,
-                instance_id=parsed_instance_id,
-                model=str(status.get("model")) if status.get("model") is not None else None,
-            )
         return status
+
+    async def _sample_runtime_metrics(self) -> None:
+        """Maintain overview snapshots independently of browser status queries."""
+        while True:
+            try:
+                instances = (await self.runtime_instances()).data
+                ids = [item.id for item in instances if item.state.value in {'ready', 'busy'}]
+            except Exception:
+                ids = []
+            for instance_id in ids or [None]:
+                try:
+                    status = await asyncio.wait_for(self.runtime_status(instance_id), timeout=10)
+                    raw_id = status.get('instance_id')
+                    await asyncio.to_thread(
+                        self.store.append_runtime_metric, status,
+                        instance_id=UUID(raw_id) if raw_id else None,
+                        model=status.get('model'),
+                    )
+                except Exception:
+                    pass  # Unavailable runtimes are retried on the next sampling tick.
+            await asyncio.sleep(5)
 
     async def runtime_metrics(
         self,
@@ -1331,6 +1328,16 @@ class ServerService:
         )
         return RuntimeMetricList(data=data)
 
+    async def runtime_requests(
+        self, *, before: int | None, after: int, limit: int, descending: bool
+    ) -> RuntimeMetricList:
+        """Read durable terminal requests without triggering status sampling."""
+        data = await asyncio.to_thread(
+            self.store.list_runtime_requests,
+            before=before, after=after, limit=limit, descending=descending,
+        )
+        return RuntimeMetricList(data=data)
+
     async def runtime_logs(
         self,
         *,
@@ -1338,6 +1345,8 @@ class ServerService:
         level: RuntimeLogLevel | None,
         after: int,
         limit: int,
+        before: int | None = None,
+        descending: bool = False,
     ) -> RuntimeLogList:
         data = await asyncio.to_thread(
             self.store.list_runtime_logs,
@@ -1345,6 +1354,8 @@ class ServerService:
             level=level,
             after=after,
             limit=limit,
+            before=before,
+            descending=descending,
         )
         return RuntimeLogList(data=data)
 

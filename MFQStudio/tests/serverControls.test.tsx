@@ -1,3 +1,5 @@
+/** Verify serverControls behavior and integration contracts. */
+import { i18n } from '../src/i18n';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { ModelAliasMapping } from '../src/features/connections/ModelAliasMapping';
@@ -8,7 +10,7 @@ import { runtimeApi } from '../src/shared/api/resources/runtime';
 import { jobsApi } from '../src/shared/api/resources/jobs';
 import { useJobStore } from '../src/stores/jobStore';
 
-vi.mock('../src/features/settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh: string, en: string) => en }) }));
+vi.mock('../src/features/settings/SettingsProvider', () => ({ useSettings: () => ({ t: i18n.getFixedT('en') }) }));
 vi.mock('../src/app/RuntimeProvider', () => ({ useRuntime: () => ({ addJob: vi.fn() }) }));
 vi.mock('../src/shared/api/resources/runtime', () => ({ runtimeApi: {
   modelAliases: vi.fn(), configureModelAliases: vi.fn(), memoryPolicy: vi.fn(), configureMemoryPolicy: vi.fn(),
@@ -60,7 +62,7 @@ it('defaults to automatic budgets and submits explicit aggregate limits', async 
 it('downloads a shard folder as one request and allows multiple file selections', () => {
   const files = Array.from({ length: 6 }, (_, index) => ({ name: `S4-L/model-${index + 1}.mfq`, byte_size: 1024 }));
   const onDownload = vi.fn();
-  render(<RepositoryFiles files={files} disabled={false} onDownload={onDownload} tr={(_zh, en) => en} />);
+  render(<RepositoryFiles files={files} disabled={false} onDownload={onDownload} t={i18n.getFixedT('en')} />);
   fireEvent.click(screen.getByText(/Files and folders/));
   fireEvent.click(screen.getByRole('button', { name: /S4-L/ }));
   fireEvent.click(screen.getByRole('button', { name: 'Download folder' }));
