@@ -15,10 +15,14 @@
 .runtime-history-footer { display: flex; justify-content: center; align-items: center; gap: 8px; min-height: 40px; color: var(--muted-light); font-size: 11px; }
 .runtime-history-footer button { border: 1px solid var(--panel-line); border-radius: 6px; padding: 5px 9px; color: var(--muted); background: var(--panel-control); cursor: pointer; }
 .runtime-history-footer button:hover { color: var(--ink); background: var(--surface-hover); }
-.runtime-log { display: grid; grid-template-columns: 66px minmax(0, 1fr); gap: 8px; border-top: 1px solid var(--panel-line); padding: 7px 1px; }
-.runtime-log span { color: var(--muted-light); font-size: 10px; }
-.runtime-log p { min-width: 0; overflow-wrap: anywhere; margin: 0; color: var(--ink-soft); font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
+.runtime-log { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 12px; border-top: 1px solid var(--panel-line); padding: 8px 1px; }
+.runtime-log time { color: var(--muted-light); font-size: 10px; line-height: 1.45; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.runtime-log p { min-width: 0; overflow-wrap: anywhere; margin: 0; color: var(--ink-soft); font-size: 10px; line-height: 1.45; white-space: pre-wrap; }
 .runtime-log.error p { color: var(--danger); }
+
+@media (max-width: 600px) {
+  .runtime-log { grid-template-columns: minmax(0, 1fr); gap: 3px; }
+}
 
 .job-list { display: grid; max-height: 500px; margin-top: 10px; overflow-y: auto; }
 .job-list > button { display: grid; grid-template-columns: 8px minmax(0, 1fr) 38px; gap: 9px; align-items: center; border: 0; border-top: 1px solid var(--panel-line); padding: 9px 4px; color: inherit; background: transparent; text-align: left; }

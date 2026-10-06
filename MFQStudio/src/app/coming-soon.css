@@ -1,0 +1,14 @@
+/* Keep the upcoming-tool page quiet and consistent with both Studio themes. */
+.coming-soon-page {
+  display: grid;
+  min-height: 65dvh;
+  place-items: center;
+  padding: 48px 24px;
+}
+.coming-soon-content { width: min(100%, 520px); text-align: center; }
+.coming-soon-label { color: var(--accent-ink); font-size: 12px; font-weight: 600; }
+.coming-soon-content h1 { margin: 18px 0; color: var(--ink); font-size: clamp(32px, 5vw, 52px); font-weight: 600; letter-spacing: -0.035em; line-height: 1.15; }
+.coming-soon-content p { margin: 0 auto 28px; color: var(--muted); font-size: 14px; line-height: 1.8; }
+.coming-soon-content button { border: 1px solid var(--line); border-radius: 8px; padding: 9px 16px; color: var(--ink-soft); background: transparent; font: inherit; font-size: 12px; cursor: pointer; }
+.coming-soon-content button:hover { border-color: var(--line-strong); background: var(--surface-hover); }
+.coming-soon-content button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }

@@ -64,6 +64,8 @@ test('scrolls through both histories and keeps the reading position when logs ar
   const logPanel = page.getByRole('region', { name: 'Runtime logs' });
   const requestPanel = page.getByRole('region', { name: 'Recent requests' });
   await expect(logPanel.locator('[data-history-id]')).toHaveCount(50);
+  await expect(logPanel.locator('time').first()).toHaveAttribute('datetime', logs[0].created_at);
+  await expect(logPanel.locator('time').first()).toContainText('2026');
   await expect(requestPanel.locator('[data-history-id]')).toHaveCount(50);
   expect(await logPanel.evaluate((node) => node.scrollHeight > node.clientHeight)).toBe(true);
 

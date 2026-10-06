@@ -1,4 +1,8 @@
 {
+  "comingSoon": {
+    "title": "Coming soon",
+    "description": "The quantization workbench is still in development. Stay tuned."
+  },
   "failurePage": {
     "somethingWentWrongOnThisPageTryAgainOrReturnToThe": "Something went wrong on this page. Try again, or return to the overview.",
     "workspaceDataIsUnavailableCheckTheServiceOrConnectionSettingsThenTry": "Workspace data is unavailable. Check the service or connection settings, then try again.",

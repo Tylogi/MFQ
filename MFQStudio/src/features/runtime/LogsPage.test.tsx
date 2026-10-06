@@ -59,6 +59,23 @@ beforeEach(() => {
 });
 afterEach(() => vi.useRealTimers());
 
+it('shows calendar dates and seconds so events from different days remain distinguishable', async () => {
+  const yesterday = new Date(2026, 9, 5, 14, 5, 9).toISOString();
+  const today = new Date(2026, 9, 6, 14, 5, 9).toISOString();
+  vi.mocked(runtimeApi.runtimeLogPage).mockResolvedValue([
+    { ...logs(1, 1)[0], created_at: yesterday },
+    { ...logs(2, 1)[0], created_at: today },
+  ]);
+  render(<LogsPage />);
+  await act(async () => {});
+  const times = screen.getByRole('region', { name: 'Runtime logs' }).querySelectorAll('time');
+  expect(Array.from(times, (time) => time.textContent)).toEqual([
+    '10/06/2026, 14:05:09',
+    '10/05/2026, 14:05:09',
+  ]);
+  expect(times[0]).toHaveAttribute('datetime', today);
+});
+
 it('loads fifty latest rows per panel and appends older history on bottom scroll', async () => {
   vi.mocked(runtimeApi.runtimeLogPage)
     .mockResolvedValueOnce(logs(51, 50))

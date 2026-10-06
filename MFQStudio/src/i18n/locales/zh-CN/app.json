@@ -1,4 +1,8 @@
 {
+  "comingSoon": {
+    "title": "敬请期待",
+    "description": "量化工作台正在开发中，准备好后将在这里与你见面。"
+  },
   "failurePage": {
     "somethingWentWrongOnThisPageTryAgainOrReturnToThe": "当前页面遇到了意外问题。可以重试，或先返回概览继续使用。",
     "workspaceDataIsUnavailableCheckTheServiceOrConnectionSettingsThenTry": "无法获取工作区数据。请检查服务状态或连接配置，然后重新连接。",

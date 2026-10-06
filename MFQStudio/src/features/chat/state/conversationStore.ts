@@ -4,6 +4,22 @@ import type { Dispatch, SetStateAction } from 'react';
 import type { Message, ResponseResource, Session } from '../../../shared/api/types';
 
 type Responses = Record<string, ResponseResource>;
+/** Reposition one synchronized session within the server-ordered, already loaded list. */
+function synchronizeSession(sessions: Session[], session: Session): Session[] {
+  const previous = sessions.find((item) => item.id === session.id);
+  if (!previous) return sessions;
+  const updated = Date.parse(session.updated_at);
+  if (!Number.isFinite(updated) || previous.updated_at === session.updated_at) {
+    return sessions.map((item) => item.id === session.id ? session : item);
+  }
+  const remaining = sessions.filter((item) => item.id !== session.id);
+  const position = remaining.findIndex((item) => {
+    const time = Date.parse(item.updated_at);
+    return updated > time || (updated === time && session.id > item.id);
+  });
+  remaining.splice(position < 0 ? remaining.length : position, 0, session);
+  return remaining;
+}
 /** Session business state and semantic actions for the chat domain. */
 export interface ConversationState {
   sessions: Session[];
@@ -108,7 +124,7 @@ export const useConversationStore = create<ConversationState>()((set) => ({
     ),
   applySynchronized: (session, messages, responses) =>
     set((state) => ({
-      sessions: state.sessions.map((item) => (item.id === session.id ? session : item)),
+      sessions: synchronizeSession(state.sessions, session),
       ...(state.activeId === session.id ? { messages, responses: indexResponses(responses) } : {}),
     })),
 }));

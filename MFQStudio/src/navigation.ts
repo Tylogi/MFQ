@@ -21,6 +21,7 @@ export const STUDIO_PATHS = {
   modelHub: '/model-hub',
   evaluations: '/evaluations',
   quantization: '/quantization',
+  quantizationComingSoon: '/quantization/coming-soon',
   logs: '/logs',
   settings: '/settings',
 } as const;
@@ -53,6 +54,9 @@ export function isStudioPath(pathname: string): boolean {
 /** Resolve which Studio product page to display from the current URL. */
 export function resolveStudioLocation(pathname: string): StudioLocation {
   const normalizedPath = normalizeStudioPath(pathname);
+  if (normalizedPath === STUDIO_PATHS.quantizationComingSoon) {
+    return { view: 'lab', dashboardPage: 'overview', labPage: 'quantization' };
+  }
   if (normalizedPath === STUDIO_PATHS.chat) {
     return { view: 'chat', dashboardPage: 'overview', labPage: 'models' };
   }

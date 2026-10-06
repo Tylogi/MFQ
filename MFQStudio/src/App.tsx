@@ -9,6 +9,7 @@ import { StudioShell } from './app/StudioShell';
 import { LabLayout } from './app/LabLayout';
 import { LoadingPage } from './app/LoadingPage';
 import { NotFoundPage } from './app/NotFoundPage';
+import { ComingSoonPage } from './app/ComingSoonPage';
 import './shared/ui/primitives.css';
 
 const ChatPage = lazy(() =>
@@ -64,6 +65,7 @@ export default function App() {
                   <Route path="resources" element={<CachePage />} />
                   <Route path="logs" element={<LogsPage />} />
                   <Route path="settings" element={<SettingsRoute />} />
+                  <Route path="quantization/coming-soon" element={<ComingSoonPage />} />
                   <Route element={<LabLayout />}>
                     <Route path="model-hub" element={<ModelHubPage />} />
                     <Route path="evaluations" element={<EvaluationsPage />} />

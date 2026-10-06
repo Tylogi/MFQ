@@ -1,5 +1,4 @@
 /** Stream requests and events on demand and manage job history cleanup on the logs page. */
-import { i18n } from '../../i18n';
 import { localized } from '../../i18n/messages';
 import { useTranslation } from 'react-i18next';
 import { useState } from 'react';
@@ -7,7 +6,7 @@ import { runtimeApi } from '../../shared/api/resources/runtime';
 import { jobsApi } from '../../shared/api/resources/jobs';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { Icon, ScreenHeader, SectionLabel, TMPanel } from '../../app/display';
-import { errorMessage, formatNumber } from '../../app/formatters';
+import { errorMessage, formatDateTime, formatNumber } from '../../app/formatters';
 import { isTerminalJob } from '../jobs/jobSchema';
 import { toast } from '../../stores/toastStore';
 import { useJobStore } from '../../stores/jobStore';
@@ -88,7 +87,7 @@ export function LogsPage() {
                       {request.status === 'failed' ? t('runtime:logsPage.failed')
                         : request.status === 'cancelled' ? t('runtime:logsPage.cancelled') : ''}
                       {request.completed_at
-                        ? new Date(request.completed_at * 1000).toLocaleString(i18n.resolvedLanguage)
+                        ? formatDateTime(request.completed_at * 1000)
                         : request.endpoint || 'completion'}
                     </small>
                   </div>
@@ -116,7 +115,7 @@ export function LogsPage() {
                   <div>
                     <strong>{job.kind}</strong>
                     <small>
-                      {new Date(job.updated_at).toLocaleTimeString(i18n.resolvedLanguage)} · {job.status}
+                      {formatDateTime(job.updated_at)} · {job.status}
                     </small>
                   </div>
                   <progress max={1} value={job.progress} />
@@ -148,7 +147,7 @@ export function LogsPage() {
                     <div>
                       <strong>{job.kind}</strong>
                       <small>
-                        {new Date(job.updated_at).toLocaleTimeString(i18n.resolvedLanguage)} · {job.status}
+                        {formatDateTime(job.updated_at)} · {job.status}
                       </small>
                     </div>
                     <progress max={1} value={job.progress} />
@@ -181,9 +180,9 @@ export function LogsPage() {
             t={t}
             renderEntry={(entry) => (
               <div className={`runtime-log ${entry.level}`}>
-                <span title={new Date(entry.created_at).toLocaleString(i18n.resolvedLanguage)}>
-                  {new Date(entry.created_at).toLocaleTimeString(i18n.resolvedLanguage)}
-                </span>
+                <time dateTime={entry.created_at}>
+                  {formatDateTime(entry.created_at)}
+                </time>
                 <p>{entry.message}</p>
               </div>
             )}

@@ -12,7 +12,7 @@ import { Icon } from './display';
 import { ModelVendorMark, modelVendor } from './ModelVendorMark';
 import { formatNumber } from './formatters';
 import { runtimeModelNames } from '../features/runtime/modelSelection';
-import { dashboardPath, labPath, resolveStudioLocation, isStudioPath,
+import { dashboardPath, labPath, resolveStudioLocation, isStudioPath, STUDIO_PATHS,
   type DashboardPage, type LabPage } from '../navigation';
 
 type NavItem = {
@@ -76,7 +76,7 @@ export function StudioSidebar() {
         active: view === 'lab' && labPage === 'models' },
       { label: t('app:studioSidebar.evaluations'), icon: 'activity', path: lab('evaluations'),
         active: view === 'lab' && labPage === 'evaluations' },
-      { label: t('app:studioSidebar.quantization'), icon: 'memory', path: lab('quantization'),
+      { label: t('app:studioSidebar.quantization'), icon: 'memory', path: STUDIO_PATHS.quantizationComingSoon,
         active: view === 'lab' && labPage === 'quantization' },
     ] },
     { label: t('app:studioSidebar.system'), items: [

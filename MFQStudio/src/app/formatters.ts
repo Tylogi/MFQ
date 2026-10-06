@@ -14,6 +14,20 @@ export function formatNumber(value: unknown, digits = 0): string {
     ? new Intl.NumberFormat(i18n.resolvedLanguage, { maximumFractionDigits: digits }).format(number)
     : "--";
 }
+/** Format a local timestamp with a full calendar date and 24-hour time, preserving seconds. */
+export function formatDateTime(value: string | number | Date): string {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return '--';
+  return new Intl.DateTimeFormat(i18n.resolvedLanguage, {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).format(date);
+}
 /** Convert bytes into a readable binary capacity unit. */
 export function formatBytes(value: unknown): string {
   const bytes = Number(value);

@@ -16,6 +16,44 @@ const response = { output_message_id: 'reply', id: 'response' } as ResponseResou
 
 beforeEach(() => useConversationStore.getState().reset());
 
+it('moves an older conversation ahead after activity is synchronized without changing the active chat', () => {
+  const store = useConversationStore.getState();
+  const recent = { ...first, updated_at: '2026-10-06T10:00:00Z' };
+  const older = { ...second, updated_at: '2026-10-05T10:00:00Z' };
+  store.loadSessions(store.epoch, [recent, older]);
+  store.setActiveId(older.id);
+  store.applySynchronized({ ...older, updated_at: '2026-10-06T11:00:00Z' }, [message], [response]);
+  expect(useConversationStore.getState().sessions.map((session) => session.id)).toEqual(['b', 'a']);
+  expect(useConversationStore.getState().activeId).toBe('b');
+  expect(useConversationStore.getState().messages).toEqual([message]);
+});
+
+it('preserves server page order without mutating input or promoting read-only selection', () => {
+  const store = useConversationStore.getState();
+  const older = { ...first, updated_at: '2026-10-05T10:00:00Z' };
+  const recent = { ...second, updated_at: '2026-10-06T10:00:00Z' };
+  const input = [recent, older];
+  store.setSessions(input);
+  expect(input).toEqual([recent, older]);
+  store.setActiveId(older.id);
+  expect(useConversationStore.getState().sessions).toEqual([recent, older]);
+  store.setSessions((sessions) => [...sessions, { ...older, id: 'c', updated_at: '2026-10-04T10:00:00Z' }]);
+  expect(useConversationStore.getState().sessions.map((session) => session.id)).toEqual(['b', 'a', 'c']);
+});
+
+it('uses the server ID tie-breaker and keeps unloaded sessions out of the loaded page', () => {
+  const store = useConversationStore.getState();
+  const recent = { ...first, updated_at: '2026-10-06T10:00:00Z' };
+  const older = { ...second, updated_at: '2026-10-05T10:00:00Z' };
+  const input = [recent, older];
+  store.setSessions(input);
+  store.applySynchronized({ ...older, updated_at: recent.updated_at }, [], []);
+  expect(useConversationStore.getState().sessions.map((session) => session.id)).toEqual(['b', 'a']);
+  expect(input).toEqual([recent, older]);
+  store.applySynchronized({ ...recent, id: 'unloaded' }, [], []);
+  expect(useConversationStore.getState().sessions).toHaveLength(2);
+});
+
 it('verifies conversationStore test behavior 1', () => {
   const store = useConversationStore.getState();
   store.loadSessions(store.epoch, [first, second]);
