@@ -1,3 +1,4 @@
+/** Apply generation preferences and import or export complete Studio session archives. */
 import { useState } from 'react';
 import { useNavigate } from 'react-router';
 import { sessionsApi } from '../../shared/api/resources/sessions';
@@ -9,7 +10,7 @@ import { STUDIO_PATHS } from '../../navigation';
 import { ModelContextSettings } from '../runtime/ModelContextSettings';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useActiveSessionMode } from '../chat/hooks/useActiveSessionMode';
-import { DEFAULT_SETTINGS, PRESETS, modeTemplateSettings, type PresetName } from './configuration';
+import { DEFAULT_SETTINGS, PRESETS, modeTemplateSettings, isValidMaxTokens, type PresetName } from './configuration';
 import { presetResourceBody, storedPresetFromResource, type StoredPreset } from './presets';
 import { SettingsPage } from './SettingsPage';
 import { useSettings } from './SettingsProvider';
@@ -17,6 +18,7 @@ import { useGenerationPresets } from './useGenerationPresets';
 import { UpdateManager, useStudioUpdateContext } from './UpdateManager';
 import { toast } from '../../stores/toastStore';
 
+/** Coordinate settings drafts, validation, presets, and archive operations. */
 export function SettingsRoute() {
   const { settings, replaceSettings, tr } = useSettings();
   const studioUpdates = useStudioUpdateContext();
@@ -70,7 +72,7 @@ export function SettingsRoute() {
   async function exportStudioData() {
     setBusy(true);
     try {
-      const sessions = await sessionsApi.listSessions();
+      const sessions = await sessionsApi.listAllSessions();
       const archives = await Promise.all(sessions.map((session) => sessionsApi.exportSession(session.id)));
       const payload = {
         format: 'mfq-studio-export-v2',
@@ -151,6 +153,10 @@ export function SettingsRoute() {
     });
   }
   function saveSettings() {
+    if (!isValidMaxTokens(draft.maxTokens)) {
+      toast.error(tr('最大输出 token 数必须是正整数。', 'Maximum output tokens must be a positive integer.'));
+      return;
+    }
     replaceSettings(draft);
     toast.success(tr('设置已应用', 'Settings applied successfully'));
   }

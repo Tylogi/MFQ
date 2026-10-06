@@ -1,7 +1,7 @@
 /** Verify lazy session loading, history race isolation, and protection against model changes during generation. */
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
-import { sessionsApi } from '../../../shared/api/resources/sessions';
+import { SESSION_PAGE_SIZE, sessionsApi } from '../../../shared/api/resources/sessions';
 import type { Session, Message, RuntimeInstance } from '../../../shared/api/types';
 import { useConversationStore } from '../state/conversationStore';
 import { useConversationSessions } from './useConversationSessions';
@@ -31,6 +31,38 @@ beforeEach(() => {
   vi.spyOn(sessionsApi, 'listResponses').mockResolvedValue([]);
   vi.spyOn(sessionsApi, 'forkSession').mockResolvedValue({ ...first, id: 'fork', model: 'model-b' });
   vi.spyOn(sessionsApi, 'deleteSession').mockResolvedValue(undefined);
+});
+
+it('loads older sessions without switching the active chat and ignores duplicate records', async () => {
+  const page = Array.from({ length: SESSION_PAGE_SIZE }, (_, index) => ({ ...first, id: `session-${index}` }));
+  vi.mocked(sessionsApi.listSessions).mockResolvedValueOnce(page).mockResolvedValueOnce([page[0], second]);
+  const { result } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.hasMoreSessions).toBe(true));
+  await act(async () => result.current.loadMoreSessions());
+  expect(sessionsApi.listSessions).toHaveBeenLastCalledWith(SESSION_PAGE_SIZE);
+  expect(result.current.sessions).toHaveLength(SESSION_PAGE_SIZE + 1);
+  expect(result.current.activeId).toBe('session-0');
+  expect(result.current.hasMoreSessions).toBe(false);
+});
+
+it('discards pending older pages after switching servers and prevents duplicate loads', async () => {
+  const page = Array.from({ length: SESSION_PAGE_SIZE }, (_, index) => ({ ...first, id: `session-${index}` }));
+  let resolvePage!: (sessions: Session[]) => void;
+  vi.mocked(sessionsApi.listSessions)
+    .mockResolvedValueOnce(page)
+    .mockImplementationOnce(() => new Promise((resolve) => { resolvePage = resolve; }))
+    .mockResolvedValueOnce([second]);
+  const { result, rerender } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.hasMoreSessions).toBe(true));
+  let loading!: Promise<void>;
+  act(() => { loading = result.current.loadMoreSessions(); void result.current.loadMoreSessions(); });
+  expect(sessionsApi.listSessions).toHaveBeenCalledTimes(2);
+  runtime.connectionRevision += 1;
+  rerender();
+  await waitFor(() => expect(result.current.sessions).toEqual([second]));
+  await act(async () => { resolvePage([{ ...first, id: 'stale' }]); await loading; });
+  expect(result.current.sessions).toEqual([second]);
+  expect(result.current.loadingSessions).toBe(false);
 });
 
 it('verifies useConversationSessions test behavior 1', async () => {

@@ -1,12 +1,19 @@
+/** Edit immediate inference defaults without imposing arbitrary model output limits. */
 import { useRuntime } from '../../app/RuntimeProvider';
 import { useSettings } from '../settings/SettingsProvider';
-import { modeTemplateSettings, type GenerationSettings } from '../settings/configuration';
+import { isValidMaxTokens, modeTemplateSettings, type GenerationSettings } from '../settings/configuration';
+import { toast } from '../../stores/toastStore';
 import { SectionLabel, SettingRow, TMPanel } from '../../app/display';
 import { formatNumber } from '../../app/formatters';
+/** Apply validated inference defaults to subsequent chat requests. */
 export function InferenceDefaultsPanel() {
   const { settings, replaceSettings, tr } = useSettings();
   const { runtime, realtime } = useRuntime();
   function updateInference(patch: Partial<GenerationSettings>) {
+    if (patch.maxTokens !== undefined && !isValidMaxTokens(patch.maxTokens)) {
+      toast.error(tr('最大输出 token 数必须是正整数。', 'Maximum output tokens must be a positive integer.'));
+      return;
+    }
     replaceSettings((current) => ({
       ...(current.inheritModelDefaults
         ? modeTemplateSettings(current, 'text', runtime, realtime)
@@ -45,7 +52,7 @@ export function InferenceDefaultsPanel() {
                   <input
                     aria-label={tr('最大输出', 'Maximum output')}
                     className="server-number-input"
-                    max={65536}
+                    step={1}
                     min={1}
                     onChange={(event) => updateInference({ maxTokens: Number(event.target.value) })}
                     type="number"

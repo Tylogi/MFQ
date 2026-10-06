@@ -43,9 +43,9 @@ it('displays and copies the same OpenAI SDK URL with /v1', async () => {
   Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
   render(<MemoryRouter><OverviewPage /></MemoryRouter>);
   expect(screen.getByText('OpenAI-compatible endpoint').closest('.tm-panel')?.querySelector('code'))
-    .toHaveTextContent('http://127.0.0.1:8090/v1');
+    .toHaveTextContent(`${window.location.origin}/v1`);
   fireEvent.click(screen.getByRole('button', { name: 'Copy endpoint' }));
-  await waitFor(() => expect(writeText).toHaveBeenCalledWith('http://127.0.0.1:8090/v1'));
+  await waitFor(() => expect(writeText).toHaveBeenCalledWith(`${window.location.origin}/v1`));
   expect(screen.getByText('Resource overview')).toBeInTheDocument();
   expect(screen.getByText('Runtime resources')).toBeInTheDocument();
 });

@@ -1,3 +1,4 @@
+/** Configure desktop and browser service connections using the actual connected service address. */
 import { useEffect, useState } from 'react';
 import { Icon, ScreenHeader, SectionLabel, SettingRow, TMPanel } from '../../app/display';
 import { errorMessage } from '../../app/formatters';
@@ -11,7 +12,7 @@ import {
 import { useRuntime } from '../../app/RuntimeProvider';
 import { runtimeModelNames } from '../runtime/modelSelection';
 import { runtimeApi } from '../../shared/api/resources/runtime';
-import { getApiBaseUrl, setApiToken, setBrowserServiceUrl } from '../../shared/api/client';
+import { resolveServiceUrl, setApiToken, setBrowserServiceUrl } from '../../shared/api/client';
 import { useSettings } from '../settings/SettingsProvider';
 import { ToolsRoutingPanel } from './ToolsRoutingPanel';
 import { MemorySettingsPanel } from './MemorySettingsPanel';
@@ -20,14 +21,15 @@ import { ModelAliasMapping } from './ModelAliasMapping';
 import { toast } from '../../stores/toastStore';
 
 function browserConfig(): StudioConfig {
-  const address = getApiBaseUrl() || 'http://127.0.0.1:8090';
+  const address = resolveServiceUrl();
   const url = new URL(address);
   return {
     mode: ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) ? 'local' : 'remote',
-    remote_url: address, local_service_port: Number(url.port) || 8090,
+    remote_url: address, local_service_port: Number(url.port) || (url.protocol === 'https:' ? 443 : 80),
   };
 }
 
+/** Display and save service connection settings, reconnecting only after a successful update. */
 export function ConnectionsPage() {
   const { tr } = useSettings();
   const {
@@ -92,8 +94,11 @@ export function ConnectionsPage() {
       } else {
         let address = draft.remote_url.trim().replace(/\/+$/, '').replace(/\/v1$/, '');
         if (draft.mode === 'local') {
-          if (browserConfig().mode === 'local') await runtimeApi.configureRuntimeListener(draft.local_service_port);
-          address = `http://127.0.0.1:${draft.local_service_port}`;
+          const current = browserConfig();
+          if (current.mode === 'local') await runtimeApi.configureRuntimeListener(draft.local_service_port);
+          const local = new URL(current.mode === 'local' ? current.remote_url : 'http://127.0.0.1');
+          local.port = String(draft.local_service_port);
+          address = local.toString().replace(/\/+$/, '');
         } else {
           const parsed = new URL(address);
           if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {

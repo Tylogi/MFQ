@@ -44,7 +44,8 @@ describe('describes voiceContracts test behavior 1', () => {
     // Chunk phase is covered by multi-rate chunked/whole-buffer equivalence tests in features/voice/audioCodec.test.ts.
     // Keep only device sample-rate wiring here; this neither checks resampler internals nor verifies voice-turn ownership.
     const devices = readSources('features/voice/AudioDevices.ts');
-    expect(devices).toContain('const INPUT_RATE = 16_000;');
+    expect(readSources('features/voice/audioProtocol.ts')).toContain('const INPUT_RATE = 16_000;');
+    expect(devices).toContain("import { INPUT_RATE, OUTPUT_RATE } from './audioProtocol';");
     expect(devices).toContain('new AudioContext({ sampleRate: INPUT_RATE })');
   });
 

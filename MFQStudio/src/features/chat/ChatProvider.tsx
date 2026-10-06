@@ -18,6 +18,7 @@ import { studioConfirm } from '../../studio';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { errorMessage } from '../../app/formatters';
 import { useSettings } from '../settings/SettingsProvider';
+import { isValidMaxTokens } from '../settings/configuration';
 import { useConversationSessions } from './hooks/useConversationSessions';
 import { useChatGeneration } from './hooks/useChatGeneration';
 import {
@@ -87,7 +88,7 @@ function useChatDomain() {
     if (toolsError) setError(toolsError);
   }, [toolsError, setError]);
   useEffect(() => {
-    if (attachmentError) setError(attachmentError);
+    if (attachmentError) setError(attachmentError.message);
   }, [attachmentError, setError]);
 
   const selectedToolsRef = useRef(selectedTools);
@@ -107,6 +108,7 @@ function useChatDomain() {
       const value = inferenceRef.current.effectiveSettings;
       return {
         sessionId,
+        capabilities: inferenceRef.current.realtime,
         systemPrompt: value.systemPrompt.trim(),
         temperature: value.temperature,
         topP: value.topP,
@@ -132,6 +134,9 @@ function useChatDomain() {
       )
         return;
       setError(null);
+      if (!isValidMaxTokens(inferenceRef.current.sampling.max_tokens)) {
+        throw new Error(trRef.current('最大输出 token 数必须是正整数。', 'Maximum output tokens must be a positive integer.'));
+      }
       if (optimistic)
         setMessages((current) => [
           ...current,
@@ -260,6 +265,9 @@ function useChatDomain() {
   const conversationView = useMemo(
     () => ({
       transitioning: conversation.transitioning,
+      hasMoreSessions: conversation.hasMoreSessions,
+      loadingSessions: conversation.loadingSessions,
+      loadMoreSessions: conversation.loadMoreSessions,
       error: conversation.error,
       setError: conversation.setError,
       selectSession: conversation.selectSession,
@@ -271,6 +279,9 @@ function useChatDomain() {
     }),
     [
       conversation.transitioning,
+      conversation.hasMoreSessions,
+      conversation.loadingSessions,
+      conversation.loadMoreSessions,
       conversation.error,
       conversation.setError,
       conversation.selectSession,

@@ -32,6 +32,11 @@ export interface GenerationSettings {
 
 export const SETTINGS_KEY = "mfq.studio.generation.v1";
 
+/** Validate the output budget without imposing a model-independent upper bound. */
+export function isValidMaxTokens(value: number): boolean {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
 export const DEFAULT_SETTINGS: GenerationSettings = {
   language: "system",
   theme: "system",

@@ -1,5 +1,5 @@
 /** Verify that the sidebar delete action forwards only the target session and does not switch sessions. */
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { expect, it, vi } from 'vitest';
 import type { ChatPageState } from '../hooks/useChatPageState';
@@ -38,4 +38,37 @@ it('verifies ChatSessionSidebar test behavior 1', async () => {
   page.chat.busy = true;
   rerender(<ChatSessionSidebar page={page} />);
   expect(screen.getByRole('button', { name: 'Delete chat: Second' })).toBeDisabled();
+});
+
+it('loads older conversations near the bottom without a load-more button and stops when loading or exhausted', () => {
+  const loadMoreSessions = vi.fn();
+  const page = {
+    activeId: 'a', chatSessionsOpen: true, selectSession: vi.fn(), createSession: vi.fn(),
+    chat: {
+      busy: false, recoveryNeeded: false, deleteConversation: vi.fn(),
+      conversation: { modelAvailable: true, hasMoreSessions: true, loadingSessions: false, loadMoreSessions },
+    },
+  } as unknown as ChatPageState;
+  const { rerender } = render(<ChatSessionSidebar page={page} />);
+  const list = screen.getByRole('region', { name: 'Conversation history' });
+  Object.defineProperties(list, {
+    scrollHeight: { configurable: true, value: 1500 },
+    clientHeight: { configurable: true, value: 500 },
+  });
+  expect(screen.queryByRole('button', { name: 'Load more' })).not.toBeInTheDocument();
+  fireEvent.scroll(list, { target: { scrollTop: 400 } });
+  expect(loadMoreSessions).not.toHaveBeenCalled();
+  fireEvent.scroll(list, { target: { scrollTop: 950 } });
+  expect(loadMoreSessions).toHaveBeenCalledOnce();
+  page.chat.conversation.loadingSessions = true;
+  rerender(<ChatSessionSidebar page={page} />);
+  expect(screen.getByRole('status')).toHaveTextContent('Loading…');
+  fireEvent.scroll(list);
+  expect(loadMoreSessions).toHaveBeenCalledOnce();
+  page.chat.conversation.loadingSessions = false;
+  page.chat.conversation.hasMoreSessions = false;
+  rerender(<ChatSessionSidebar page={page} />);
+  fireEvent.scroll(list);
+  expect(loadMoreSessions).toHaveBeenCalledOnce();
+  expect(screen.getByText('No older conversations')).toBeInTheDocument();
 });

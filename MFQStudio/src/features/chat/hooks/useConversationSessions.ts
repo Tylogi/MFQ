@@ -1,6 +1,6 @@
 /** Manage the session list, selected session, and message history, binding async updates to the current connection and session. */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { sessionsApi } from '../../../shared/api/resources/sessions';
+import { SESSION_PAGE_SIZE, sessionsApi } from '../../../shared/api/resources/sessions';
 import type { SessionMode } from '../../../shared/api/types';
 import { useRuntime } from '../../../app/RuntimeProvider';
 import { errorMessage } from '../../../app/formatters';
@@ -21,6 +21,9 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
   const [transitioning, setTransitioning] = useState(false);
   const [importRevision, setImportRevision] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [hasMoreSessions, setHasMoreSessions] = useState(false);
+  const [loadingSessions, setLoadingSessions] = useState(false);
+  const loadingPage = useRef(false);
   const [modelChange, setModelChange] = useState<{ sessionId: string; model: string } | null>(null);
   const version = useRef(0);
   const activeIdRef = useRef(activeId);
@@ -44,21 +47,59 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     setModelChange(null);
     const epoch = useConversationStore.getState().epoch;
     setError(null);
+    setHasMoreSessions(false);
+    setLoadingSessions(false);
+    loadingPage.current = false;
     if (!ready || !enabled) return;
+    loadingPage.current = true;
+    setLoadingSessions(true);
   void sessionsApi
       .listSessions()
       .then((next) => {
         if (request !== version.current || !useConversationStore.getState().loadSessions(epoch, next)) return;
+        setHasMoreSessions(next.length === SESSION_PAGE_SIZE);
         const selected = next[0];
         if (selected) setSelectedModel(selected.model);
       })
       .catch((cause) => {
         if (request === version.current) setError(errorMessage(cause));
+      })
+      .finally(() => {
+        if (request === version.current) {
+          loadingPage.current = false;
+          setLoadingSessions(false);
+        }
       });
     return () => {
       ++version.current;
     };
   }, [ready, enabled, connectionRevision, importRevision, setSelectedModel]);
+
+  /** Append older sessions without changing the active chat; discard pages from an obsolete connection. */
+  const loadMoreSessions = useCallback(async () => {
+    if (!ready || !enabled || !hasMoreSessions || loadingPage.current) return;
+    const request = version.current;
+    const state = useConversationStore.getState();
+    const epoch = state.epoch;
+    loadingPage.current = true;
+    setLoadingSessions(true);
+    try {
+      const page = await sessionsApi.listSessions(state.sessions.length);
+      if (request !== version.current || epoch !== useConversationStore.getState().epoch) return;
+      setSessions((current) => {
+        const ids = new Set(current.map((session) => session.id));
+        return [...current, ...page.filter((session) => !ids.has(session.id))];
+      });
+      setHasMoreSessions(page.length === SESSION_PAGE_SIZE);
+    } catch (cause) {
+      if (request === version.current) setError(errorMessage(cause));
+    } finally {
+      if (request === version.current) {
+        loadingPage.current = false;
+        setLoadingSessions(false);
+      }
+    }
+  }, [ready, enabled, hasMoreSessions, setSessions]);
 
   useEffect(() => {
     if (!activeId) return;
@@ -190,6 +231,9 @@ export function useConversationSessions(enabled: boolean, generationBusy: boolea
     responses,
     setResponses,
     transitioning,
+    hasMoreSessions,
+    loadingSessions,
+    loadMoreSessions,
     error,
     setError,
     selectSession,

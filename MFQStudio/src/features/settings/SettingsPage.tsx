@@ -1,3 +1,4 @@
+/** Render editable generation preferences, appearance controls, and archive actions. */
 import type { Dispatch, ReactNode, SetStateAction } from 'react';
 import { SectionLabel, SettingRow, TMPanel } from '../../app/display';
 import { Switch } from '../../shared/ui/Switch';
@@ -25,6 +26,7 @@ interface SettingsPageProps {
   actions: SettingsActions;
 }
 
+/** Display settings drafts; the route validates and applies changes. */
 export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable, presetManager, contextControls, busy, hasStudio, updateManager, actions }: SettingsPageProps) {
   const { setModelDefaultInheritance, applyPreset, exportStudioData, importStudioData, openServerPage, resetSettingsDraft, saveSettings } = actions;
   return (
@@ -81,7 +83,7 @@ export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable
               <SettingRow
                 title={tr("最大生成 token 数", "Maximum output tokens")}
                 detail={tr("限制单次回答可生成的 token 数。", "Limit the number of tokens generated in one response.")}
-                trailing={<input className="settings-number-input" max={65536} min={1} onChange={(event) => setSettingsDraft((current) => ({ ...current, maxTokens: Number(event.target.value) }))} type="number" value={settingsDraft.maxTokens} />}
+                trailing={<input aria-label={tr('最大生成 token 数', 'Maximum output tokens')} className="settings-number-input" min={1} step={1} onChange={(event) => setSettingsDraft((current) => ({ ...current, maxTokens: Number(event.target.value) }))} type="number" value={settingsDraft.maxTokens} />}
               />
             </TMPanel>
           </div>

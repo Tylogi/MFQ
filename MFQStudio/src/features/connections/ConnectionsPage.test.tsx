@@ -1,3 +1,4 @@
+/** Verify browser service settings preserve the actual service origin and report listener failures. */
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
@@ -35,7 +36,7 @@ it('verifies ConnectionsPage test behavior 1', async () => {
   fireEvent.change(port, { target: { value: '8091' } });
   fireEvent.click(screen.getByRole('button', { name: 'Save server settings' }));
   await waitFor(() => expect(change).toHaveBeenCalledExactlyOnceWith(8091));
-  expect(browserServiceUrl()).toBe('http://127.0.0.1:8091');
+  expect(browserServiceUrl()).toBe('http://localhost:8091');
   expect(reloadService).toHaveBeenCalledOnce();
 });
 
@@ -48,4 +49,26 @@ it('verifies ConnectionsPage test behavior 2', async () => {
   await waitFor(() => expect(runtimeApi.configureRuntimeListener).toHaveBeenCalled());
   expect(browserServiceUrl()).toBe('');
   expect(reloadService).not.toHaveBeenCalled();
+});
+
+it('keeps a same-origin remote service in remote mode when saving', async () => {
+  vi.stubGlobal('window', new Proxy(window, {
+    get(target, key) {
+      if (key === 'location') return new URL('https://studio.example:9443/chat');
+      const value = Reflect.get(target, key);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  }));
+  try {
+    const change = vi.spyOn(runtimeApi, 'configureRuntimeListener');
+    render(<MemoryRouter><ConnectionsPage /></MemoryRouter>);
+    await waitFor(() => expect(screen.getByRole('combobox', { name: 'Bind address' })).toHaveValue('remote'));
+    expect(screen.getByRole('textbox', { name: 'Remote endpoint' })).toHaveValue('https://studio.example:9443');
+    fireEvent.click(screen.getByRole('button', { name: 'Save server settings' }));
+    await waitFor(() => expect(reloadService).toHaveBeenCalledOnce());
+    expect(browserServiceUrl()).toBe('https://studio.example:9443');
+    expect(change).not.toHaveBeenCalled();
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });

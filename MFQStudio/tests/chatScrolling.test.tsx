@@ -140,9 +140,10 @@ it('verifies chatScrolling test behavior 5', () => {
 
 it('verifies chatScrolling test behavior 6', () => {
   render(<SettingsPage tr={(_zh, en) => en} settingsDraft={{ ...DEFAULT_SETTINGS, inheritModelDefaults: false }} setSettingsDraft={vi.fn()} mtpAvailable={false} presetManager={null} busy={false} hasStudio={false} actions={{ setModelDefaultInheritance: vi.fn(), applyPreset: vi.fn(), exportStudioData: vi.fn(), importStudioData: vi.fn(), openServerPage: vi.fn(), resetSettingsDraft: vi.fn(), saveSettings: vi.fn() }} />);
-  const limit = screen.getAllByRole('spinbutton').find((input) => input.getAttribute('max') === '65536');
+  const limit = screen.getByRole('spinbutton', { name: 'Maximum output tokens' });
   expect(limit).toHaveValue(4096);
   expect(limit).toHaveAttribute('min', '1');
+  expect(limit).not.toHaveAttribute('max');
 });
 
 it('verifies chatScrolling test behavior 7', () => {

@@ -1,9 +1,12 @@
 /** Define real-time voice session, input/output turn, and business callback contracts. */
+import type { RealtimeCapabilities } from '../../shared/api/types';
 /** Real-time voice connection and recording phases used to display the current page state. */
 export type VoiceState = "idle" | "connecting" | "listening" | "processing" | "error";
 
 /** Generation configuration sent to the server when establishing a real-time session. */
 export interface RealtimeSessionConfig {
+  /** Advertised protocol capabilities, checked before opening audio resources. */
+  capabilities?: RealtimeCapabilities | null;
   sessionId: string;
   systemPrompt: string;
   temperature: number;

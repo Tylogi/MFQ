@@ -5,6 +5,7 @@ import type { ContentPart } from '../../../shared/api/types';
 import {
   isTextDocument,
   MAX_DOCUMENT_BYTES,
+  MAX_ATTACHMENTS,
   documentMimeType,
   mediaMetadata,
   type PendingAttachment,
@@ -13,11 +14,14 @@ import {
 export function useChatAttachments(
   sessionId: string | null,
   connectionRevision: number,
-  onError: (message: string) => void,
+  onError: (message: string | null) => void,
+  tr: (zh: string, en: string) => string = (_zh, en) => en,
 ) {
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const latest = useRef(attachments);
   latest.current = attachments;
+  const translate = useRef(tr);
+  translate.current = tr;
   const clearAttachments = useCallback(() => {
     latest.current.forEach((item) => {
       if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
@@ -33,8 +37,14 @@ export function useChatAttachments(
   const selectAttachments = useCallback(
     (files: FileList | null) => {
       if (!files) return;
+      onError(null);
       const next: PendingAttachment[] = [];
-      for (const file of Array.from(files).slice(0, Math.max(0, 8 - latest.current.length))) {
+      let omitted = 0;
+      for (const file of Array.from(files)) {
+        if (latest.current.length + next.length >= MAX_ATTACHMENTS) {
+          omitted += 1;
+          continue;
+        }
         const kind = file.type.startsWith('image/')
           ? 'image'
           : file.type.startsWith('video/')
@@ -49,7 +59,7 @@ export function useChatAttachments(
           continue;
         }
         if (kind === 'document' && file.size > MAX_DOCUMENT_BYTES) {
-          onError(`Document exceeds 64 MiB: ${file.name}`);
+          onError(`Document exceeds ${MAX_DOCUMENT_BYTES / (1024 * 1024)} MiB: ${file.name}`);
           continue;
         }
         next.push({
@@ -59,7 +69,12 @@ export function useChatAttachments(
           previewUrl: kind === 'document' ? '' : URL.createObjectURL(file),
         });
       }
-      setAttachments((current) => [...current, ...next]);
+      latest.current = [...latest.current, ...next];
+      setAttachments(latest.current);
+      if (omitted) onError(translate.current(
+        `每条消息最多添加 ${MAX_ATTACHMENTS} 个附件，${omitted} 个文件未添加。`,
+        `Up to ${MAX_ATTACHMENTS} attachments per message; ${omitted} files were not added.`,
+      ));
     },
     [onError],
   );
@@ -67,7 +82,8 @@ export function useChatAttachments(
   const removeAttachment = useCallback((id: string) => {
     const removed = latest.current.find((item) => item.id === id);
     if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
-    setAttachments((current) => current.filter((item) => item.id !== id));
+    latest.current = latest.current.filter((item) => item.id !== id);
+    setAttachments(latest.current);
   }, []);
 /** Upload the current attachment snapshot and return typed generation input; retain selections on failure. */
   const uploadAttachments = useCallback(

@@ -2,10 +2,9 @@
 import { runtimeRealtimeUrl } from '../../shared/api/client';
 import { base64ToFloat32, float32ToBase64, wavBlob } from './audioCodec';
 import { AudioDevices } from './AudioDevices';
+import { INPUT_RATE, OUTPUT_RATE, validateAudioProtocol } from './audioProtocol';
 import type { BufferedVoiceTurn, RealtimeCallbacks, RealtimeSessionConfig } from './realtimeTypes';
 
-const INPUT_RATE = 16_000;
-const OUTPUT_RATE = 24_000;
 const CHUNK_SAMPLES = INPUT_RATE;
 const SPEAK_TOKENS = 20;
 const MAX_RESPONSE_DRAIN_STEPS = 120;
@@ -136,6 +135,7 @@ export class RealtimeAudioController {
   }
 
   private async connect(config: RealtimeSessionConfig, capture: boolean): Promise<void> {
+    validateAudioProtocol(config.capabilities);
     if (this.clientSessionId && this.clientSessionId !== config.sessionId) {
       await this.stop();
     }

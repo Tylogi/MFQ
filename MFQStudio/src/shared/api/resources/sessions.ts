@@ -10,10 +10,23 @@ import type {
 } from '../types';
 import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client';
 
+/** Batch size within the server's session-list page limit; not a total history limit. */
+export const SESSION_PAGE_SIZE = 30;
+
 export const sessionsApi = {
   /** Get recent sessions for the sidebar and session selector. */
-  async listSessions(): Promise<Session[]> {
-    return (await request<{ data: Session[] }>('/api/v1/sessions?limit=200')).data;
+  async listSessions(offset = 0): Promise<Session[]> {
+    return (await request<{ data: Session[] }>(`/api/v1/sessions?limit=${SESSION_PAGE_SIZE}&offset=${offset}`)).data;
+  },
+
+  /** Read every session page for exports, deduplicating records if their ordering changes while loading. */
+  async listAllSessions(): Promise<Session[]> {
+    const sessions = new Map<string, Session>();
+    for (let offset = 0; ; offset += SESSION_PAGE_SIZE) {
+      const page = await sessionsApi.listSessions(offset);
+      for (const session of page) sessions.set(session.id, session);
+      if (page.length < SESSION_PAGE_SIZE) return [...sessions.values()];
+    }
   },
 
   /** Create a session for a model and interaction mode, returning the server-assigned ID and revision. */

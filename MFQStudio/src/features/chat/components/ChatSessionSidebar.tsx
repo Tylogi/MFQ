@@ -1,4 +1,5 @@
 /** Render chat sessions and guard navigation while generation recovery is pending. */
+import type { UIEvent } from 'react';
 import { useSettings } from '../../settings/SettingsProvider';
 import { Icon } from '../../../app/display';
 import { useConversationSelector } from '../state/conversationStore';
@@ -11,6 +12,14 @@ export function ChatSessionSidebar({ page }: { page: ChatPageState }) {
   const sessions = useConversationSelector((state) => state.sessions);
   const { activeId, chatSessionsOpen, selectSession, createSession, chat } = page;
   const { busy, recoveryNeeded, conversation, deleteConversation } = chat;
+  /** Prefetch older chats near the bottom, matching runtime history's scroll threshold. */
+  function onScroll(event: UIEvent<HTMLDivElement>) {
+    const node = event.currentTarget;
+    if (conversation.hasMoreSessions && !conversation.loadingSessions && !busy && !recoveryNeeded
+      && node.scrollHeight - node.scrollTop - node.clientHeight < 100) {
+      void conversation.loadMoreSessions();
+    }
+  }
   return (
     <aside
       className={'chat-session-sidebar' + (chatSessionsOpen ? ' open' : '')}
@@ -29,7 +38,8 @@ export function ChatSessionSidebar({ page }: { page: ChatPageState }) {
           <Icon name="plus" size={15} />
         </button>
       </div>
-      <div className="chat-session-list">
+      <div className="chat-session-list" onScroll={onScroll} role="region"
+        aria-label={tr('会话历史', 'Conversation history')} tabIndex={0}>
         {sessions.length ? (
           sessions.map((session) => (
             <div className={'chat-session-row' + (session.id === activeId ? ' active' : '')} key={session.id}>
@@ -58,7 +68,13 @@ export function ChatSessionSidebar({ page }: { page: ChatPageState }) {
             </div>
           ))
         ) : (
-          <p>{tr('暂无会话', 'No conversations yet')}</p>
+          <p>{conversation.loadingSessions ? tr('正在加载…', 'Loading…') : tr('暂无会话', 'No conversations yet')}</p>
+        )}
+        {sessions.length > 0 && conversation.loadingSessions && (
+          <p role="status">{tr('正在加载…', 'Loading…')}</p>
+        )}
+        {sessions.length > 0 && !conversation.loadingSessions && !conversation.hasMoreSessions && (
+          <p>{tr('没有更早的会话了', 'No older conversations')}</p>
         )}
       </div>
     </aside>

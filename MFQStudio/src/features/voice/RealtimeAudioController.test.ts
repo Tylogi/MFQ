@@ -88,3 +88,14 @@ it('rejects text submission when the socket closes before session creation', asy
   await expect(submitted).rejects.toThrow('Voice connection closed');
   expect(sockets[0].send).not.toHaveBeenCalled();
 });
+
+it.each([
+  { input_sample_rate: 48000 },
+  { output_sample_rate: 44100 },
+])('rejects incompatible advertised audio rates before opening transport: %j', async (rates) => {
+  const controller = new RealtimeAudioController(callbacks, false, false);
+  await expect(controller.submitText('hello', {
+    ...config, capabilities: { available: true, ...rates },
+  })).rejects.toThrow('Unsupported voice');
+  expect(sockets).toHaveLength(0);
+});

@@ -1,3 +1,4 @@
+/** Configure model context sizes using reported capacities and server-side validation. */
 import { useEffect, useState } from 'react';
 import { useRuntime } from '../../app/RuntimeProvider';
 import { SettingRow } from '../../app/display';
@@ -6,6 +7,7 @@ import { useSettings } from '../settings/SettingsProvider';
 import { toast } from '../../stores/toastStore';
 import { runtimeApi } from '../../shared/api/resources/runtime';
 
+/** Edit default and loaded-model context budgets; reload explicitly after validation. */
 export function ModelContextSettings() {
   const { instances, runtime, reloadingInstances, reloadModelContext } = useRuntime();
   const { tr, contextSize, setContextSize } = useSettings();
@@ -40,7 +42,7 @@ export function ModelContextSettings() {
     detail={tr('下一次加载模型的默认上下文。', 'Default context for the next model load.')}
     trailing={<div className="server-input-unit">
       <input aria-label={tr('默认最大上下文', 'Default maximum context')}
-        className="server-number-input" min={512} max={1048576} type="number"
+        className="server-number-input" min={512} step={1} type="number"
         value={contextSize} onChange={(event) => setContextSize(Number(event.target.value))} />
       <span>tokens</span>
     </div>} />;
@@ -51,7 +53,7 @@ export function ModelContextSettings() {
       const capacity = item.context_capacity ?? capacities[item.id] ?? (runtime?.instance_id === item.id ? runtime.context_capacity : undefined);
       const value = drafts[item.id] ?? String(item.context_size ?? contextSize);
       const size = Number(value);
-      const valid = Number.isSafeInteger(size) && size >= 512 && size <= (capacity ?? 1048576);
+      const valid = Number.isSafeInteger(size) && size >= 512 && (capacity == null || size <= capacity);
       const busy = reloadingInstances?.[item.id] != null;
       return <SettingRow key={item.id} title={item.model}
         detail={tr(`当前 ${formatNumber(item.context_size ?? contextSize)} tokens${capacity ? ` · 上限 ${formatNumber(capacity)}` : ''}`,
@@ -59,7 +61,7 @@ export function ModelContextSettings() {
         trailing={<div className="server-row-actions">
           <div className="server-input-unit">
             <input aria-label={tr(`${item.model} 最大上下文`, `${item.model} maximum context`)}
-              className="server-number-input" min={512} max={capacity ?? 1048576} type="number"
+              className="server-number-input" min={512} max={capacity} step={1} type="number"
               value={value} disabled={busy}
               onChange={(event) => setDrafts((current) => ({ ...current, [item.id]: event.target.value }))} />
             <span>tokens</span>

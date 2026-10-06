@@ -6,11 +6,15 @@ import {
   ChatAttachmentsProvider,
   useChatAttachmentActions,
   useChatAttachmentList,
+  useChatAttachmentError,
 } from './ChatAttachmentsProvider';
 import { useConversationStore } from './state/conversationStore';
 
 const runtime = vi.hoisted(() => ({ connectionRevision: 1 }));
 vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => runtime }));
+vi.mock('../settings/SettingsProvider', () => ({
+  useSettings: () => ({ tr: (_zh: string, en: string) => en }),
+}));
 
 beforeEach(() => {
   vi.restoreAllMocks();
@@ -19,6 +23,23 @@ beforeEach(() => {
   runtime.connectionRevision = 1;
   URL.createObjectURL = vi.fn(() => 'blob:preview');
   URL.revokeObjectURL = vi.fn();
+});
+
+it('keeps eight attachments and reports overflow, including consecutive selections before rendering', () => {
+  let actions!: ReturnType<typeof useChatAttachmentActions>;
+  function Consumer() {
+    actions = useChatAttachmentActions();
+    const error = useChatAttachmentError();
+    return <span>{error?.message}</span>;
+  }
+  render(<ChatAttachmentsProvider><Consumer /></ChatAttachmentsProvider>);
+  const files = Array.from({ length: 10 }, (_, index) => new File(['text'], `${index}.txt`, { type: 'text/plain' }));
+  act(() => {
+    actions.selectAttachments(files.slice(0, 6) as unknown as FileList);
+    actions.selectAttachments(files.slice(6) as unknown as FileList);
+  });
+  expect(actions.getAttachments().map((item) => item.file)).toEqual(files.slice(0, 8));
+  expect(screen.getByText('Up to 8 attachments per message; 2 files were not added.')).toBeInTheDocument();
 });
 
 it('verifies ChatAttachmentsProvider test behavior 1', async () => {

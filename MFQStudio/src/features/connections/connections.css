@@ -35,6 +35,7 @@
 .server-page .setting-row-trailing input[type="checkbox"] { accent-color: var(--accent); }
 .server-row-actions { display: flex; min-width: 0; align-items: center; justify-content: flex-end; gap: 9px; }
 .server-row-actions > button,
+.memory-budget-actions > button,
 .server-page-footer > button {
   min-height: 32px;
   flex: 0 0 auto;
@@ -46,7 +47,8 @@
   font-size: 11px;
   font-weight: 610;
 }
-.server-row-actions > button:hover { border-color: var(--line-strong); background: var(--surface-hover); }
+.server-row-actions > button:hover,
+.memory-budget-actions > button:hover { border-color: var(--line-strong); background: var(--surface-hover); }
 .server-model-control > strong {
   overflow: hidden;
   max-width: min(28vw, 300px);

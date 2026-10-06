@@ -43,6 +43,8 @@ export const DOCUMENT_ACCEPT = [
 ].join(",");
 
 export const MAX_DOCUMENT_BYTES = 64 * 1024 * 1024;
+/** Product limit for pending attachments in one message. */
+export const MAX_ATTACHMENTS = 8;
 /** Determine whether an attachment can be read as text from its MIME type and extension. */
 export function isTextDocument(file: File): boolean {
   const extension = file.name.toLowerCase().match(/\.[^.]+$/)?.[0] ?? "";

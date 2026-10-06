@@ -1,8 +1,7 @@
 /** Manage browser microphone, AudioWorklet, and playback resources independently of the response-turn protocol. */
 import { StreamingLinearResampler } from './audioCodec';
+import { INPUT_RATE, OUTPUT_RATE } from './audioProtocol';
 
-const INPUT_RATE = 16_000;
-const OUTPUT_RATE = 24_000;
 const PLAYBACK_DELAY_SECONDS = 0.2;
 
 /** Own capture and playback resources; the controller only receives raw input and submits playback samples. */

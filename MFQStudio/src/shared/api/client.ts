@@ -48,6 +48,11 @@ export function getApiBaseUrl(): string {
   return apiBaseUrl;
 }
 
+/** Resolve the actual service origin for same-origin browser connections and explicit service URLs. */
+export function resolveServiceUrl(value: string = apiBaseUrl): string {
+  return value || window.location.origin;
+}
+
 /** Append a resource path to the current service URL. */
 export function apiUrl(path: string): string {
   return `${apiBaseUrl}${path}`;
@@ -55,7 +60,7 @@ export function apiUrl(path: string): string {
 
 /** Build the browser WebSocket audio endpoint and include the connection credential required by the service. */
 export function runtimeRealtimeUrl(): string {
-  const base = apiBaseUrl || window.location.origin;
+  const base = resolveServiceUrl();
   const url = new URL('/api/v1/runtime/realtime?mode=audio', base);
   if (apiToken) url.searchParams.set('access_token', apiToken);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';

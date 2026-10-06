@@ -102,7 +102,6 @@ export function ChatComposer({
       <textarea
         aria-label={tr('消息', 'Message')}
         disabled={!ready || busy}
-        maxLength={32768}
         onChange={(event) => setDraft(sessionId, event.target.value)}
         onKeyDown={(event) => {
           if (
