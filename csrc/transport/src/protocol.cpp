@@ -18,6 +18,10 @@ int32_t int32_field(const json& body, const char* name, int32_t fallback) {
 RuntimeProtocol::RuntimeProtocol(const MfqScheduler& scheduler, MfqRuntimeTransportConfig config)
     : scheduler_(scheduler), config_(std::move(config)), context_(config_.max_context) {}
 
+RuntimeProtocol::~RuntimeProtocol() {
+    try { close_realtime(); } catch (...) {}
+}
+
 void RuntimeProtocol::add_session_metrics(json& value) const {
     for (const auto& [name, number] : scheduler_.session({SessionCommand::Kind::metrics}).metrics)
         value[name] = number;

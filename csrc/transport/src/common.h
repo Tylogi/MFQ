@@ -131,6 +131,7 @@ std::vector<float> decode_audio_features(
 class RuntimeProtocol {
 public:
     RuntimeProtocol(const MfqScheduler& scheduler, MfqRuntimeTransportConfig config);
+    ~RuntimeProtocol();
     json call(const std::string& operation, const json& params = json::object());
     RuntimeRequestMetrics& request_metrics() { return metrics_; }
     void open_realtime(std::string channel, const std::string& mode = "audio");

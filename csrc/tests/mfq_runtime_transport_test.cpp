@@ -22,7 +22,7 @@ struct FakeEngine final : Engine {
     struct Work { EngineRequest request; int steps = 0; bool cancelled = false; };
     std::map<std::string, Work> active;
     std::array<std::atomic<int>, 16> advances{};
-    std::atomic<int> released{0}, reloads{0}, control_steps{0}, control_terminals{0};
+    std::atomic<int> released{0}, reloads{0}, control_steps{0}, control_terminals{0}, stops{0};
     bool duplex_active = false, control_pending = false, control_stop = false, initializing = false;
     int control_limit = 0;
     std::thread::id owner;
@@ -161,7 +161,7 @@ struct FakeEngine final : Engine {
         }
         if (auto* decode = std::get_if<DecodeTokens>(&request))
             return decode->tokens.empty() ? std::string{} : std::string{"hello"};
-        if (std::holds_alternative<StopDuplex>(request)) { control_stop = true; return std::monostate{}; }
+        if (std::holds_alternative<StopDuplex>(request)) { ++stops; control_stop = true; return std::monostate{}; }
         assert(!control_pending);
         initializing = std::holds_alternative<MfqDuplexSessionParams>(request);
         control_limit = initializing ? 3 : std::get<MfqDuplexStepInput>(request).max_new_speak_tokens;
@@ -501,6 +501,13 @@ static void check_control_protocol() {
     assert(engine.last_parameters.tts_temperature == 0.5 && engine.last_parameters.tts_repetition_penalty == 1.2);
     assert(engine.last_parameters.seed == uint64_t(-1));
     assert(profiled.close_realtime("profiled"));
+    const auto stops = engine.stops.load();
+    {
+        RuntimeProtocol abandoned(scheduler, config);
+        abandoned.open_realtime("abandoned");
+        abandoned.realtime_message("abandoned", {{"type", "session.init"}});
+    }
+    assert(engine.stops == stops + 1);
 }
 
 static void check_input_ownership_and_budget() {
