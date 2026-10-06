@@ -476,6 +476,7 @@ InferenceRequest TextProcessor::prepare(
     work.cache_plan = std::move(input.cache_plan);
     work.stops = std::move(input.stops);
 
+    if (input.media) validate_media(*input.media);
     std::string prompt = std::move(input.prompt);
     bool parse_special = false;
     if (input.chat) {

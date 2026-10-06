@@ -6,6 +6,7 @@
 
 #include <cassert>
 #include <cstdlib>
+#include <limits>
 #include <map>
 
 using namespace mfq::engine;
@@ -321,9 +322,69 @@ static void check_runtime_config() {
     rejects([] { environment_enabled("MFQ_RUNTIME_TRACE_SESSION_CACHE"); });
 }
 
+static void check_media_preparation(const std::shared_ptr<TextProcessor>& text) {
+    const auto prepare = [&](const MfqMultimodalInput& media, const std::string& prompt = "text") {
+        InferenceInput input;
+        input.media = media;
+        input.chat_input.emplace();
+        input.chat_input->messages.push_back({"user", prompt});
+        input.sampling.max_tokens = 1;
+        return text->prepare(std::move(input), 4096);
+    };
+    const auto invalid = [&](const MfqMultimodalInput& media) {
+        bool rejected = false;
+        try { prepare(media); }
+        catch (const InferenceInputError& error) { rejected = error.code == InferenceInputErrorCode::Invalid; }
+        assert(rejected);
+    };
+    MfqMultimodalInput image;
+    image.pixel_shape = {1, 3, 14, 14}; image.pixel_values.resize(588);
+    image.patch_mask_shape = {1, 1}; image.patch_mask = {1};
+    image.target_sizes_shape = {1, 2}; image.target_sizes = {1, 1};
+    const auto prepared_image = prepare(image, "<image>" + std::string(64, 'a') + "</image>");
+    const auto& bounds = prepared_image.vision->image_bounds;
+    assert(bounds.size() == 4 && bounds[3] - bounds[2] == 64);
+    auto bad = image; bad.patch_mask[0] = 2; invalid(bad);
+    bad = image; bad.target_sizes[0] = 2; invalid(bad);
+    bad = image; bad.pixel_values.pop_back(); invalid(bad);
+    bad = image; bad.pixel_values[0] = std::numeric_limits<float>::infinity(); invalid(bad);
+    bad = image; bad.pixel_shape = {INT64_MAX, 3, 14, 14}; invalid(bad);
+    MfqMultimodalInput audio;
+    audio.audio_features_shape = {1, 80, 9}; audio.audio_features.resize(720); audio.audio_lengths = {9};
+    const auto prepared_audio = prepare(audio, "<|audio_start|>a<|audio_end|>");
+    assert(prepared_audio.vision->audio_bounds.size() == 4);
+    bad = audio; bad.audio_lengths[0] = 8; invalid(bad);
+    bad = audio; bad.audio_features_shape[1] = 79; bad.audio_features.resize(711); invalid(bad);
+    MfqMultimodalInput deepseek;
+    deepseek.pixel_shape = {1, 1, 588}; deepseek.pixel_values.resize(588);
+    deepseek.patch_mask_shape = {1, 1}; deepseek.patch_mask = {1};
+    deepseek.vision_grid_shape = {1, 4}; deepseek.vision_grid = {1, 1, 1, 1};
+    for (const auto processor : {MfqMultimodalProcessor::deepseek_v4, MfqMultimodalProcessor::deepseek_v41}) {
+        deepseek.processor = processor;
+        const auto prepared = prepare(deepseek, "<｜deepseek_image｜>");
+        assert(prepared.vision->image_bounds.size() == 4);
+        assert(prepared.vision->image_permutation == (processor == MfqMultimodalProcessor::deepseek_v4 ? std::vector<int64_t>{0} : std::vector<int64_t>{}));
+        bad = deepseek; bad.vision_grid[2] = 2; invalid(bad);
+        bad = deepseek; bad.patch_mask[0] = 0; invalid(bad);
+    }
+    MfqMultimodalInput grid;
+    grid.processor = MfqMultimodalProcessor::grid_vision;
+    grid.pixel_shape = {1, 12}; grid.pixel_values.resize(12);
+    grid.vision_grid_shape = {1, 3}; grid.vision_grid = {1, 1, 1}; grid.vision_types = {1};
+    grid.image_grid_shape = {1, 3}; grid.image_grid = grid.vision_grid;
+    assert(prepare(grid).vision->pixel_shape == grid.pixel_shape);
+    bad = grid; bad.vision_types[0] = 2; invalid(bad);
+    bad = grid; bad.vision_grid[0] = INT32_MAX; invalid(bad);
+    bad = grid; bad.image_grid.clear(); invalid(bad);
+    invalid(MfqMultimodalInput{});
+}
+
 static void check_async_text_preparation() {
     std::vector<std::string> values{"<unk>", "<s>", "</s>"};
     std::vector<int32_t> types{2, 3, 3};
+    for (const char* marker : {"<image>", "</image>", "<slice>", "</slice>", "<|audio_start|>", "<|audio_end|>", "<｜deepseek_image｜>"}) {
+        values.emplace_back(marker); types.push_back(3);
+    }
     for (int value = 0; value < 256; ++value) {
         char token[7]; std::snprintf(token, sizeof(token), "<0x%02X>", value);
         values.emplace_back(token); types.push_back(6);
@@ -337,9 +398,11 @@ static void check_async_text_preparation() {
     gguf_set_arr_data(metadata, "tokenizer.ggml.scores", GGUF_TYPE_FLOAT32, scores.data(), scores.size());
     gguf_set_arr_data(metadata, "tokenizer.ggml.token_type", GGUF_TYPE_INT32, types.data(), types.size());
     gguf_set_val_bool(metadata, "tokenizer.ggml.add_space_prefix", false);
+    gguf_set_val_str(metadata, "tokenizer.chat_template", "{{ messages[0]['content'] }}");
     std::vector<uint8_t> bytes(gguf_get_meta_size(metadata));
     gguf_get_meta_data(metadata, bytes.data()); gguf_free(metadata);
     auto text = std::make_shared<TextProcessor>(bytes, tokens.size(), "test");
+    check_media_preparation(text);
     auto metadata_info = info(); metadata_info.vocab_size = tokens.size();
     TestOps ops; ops.batch = true;
     RequestExecutor executor(2);

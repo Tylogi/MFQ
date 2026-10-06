@@ -1,14 +1,20 @@
 #include "scheduler.h"
 #include "transport.h"
 #include "common.h"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
 #include <map>
 #include <thread>
 #include <tuple>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 using namespace mfq::engine;
 using namespace std::chrono_literals;
 
@@ -368,6 +374,61 @@ static void check_generation_protocol() {
     assert(counts["total_requests"] == 2 && counts["failed_requests"] == 2);
 }
 
+static void check_media_file_codec() {
+#ifndef _WIN32
+    using namespace mfq::transport;
+    auto path = (std::filesystem::temp_directory_path() / "mfq-multimodal-XXXXXX.bin").string();
+    const int descriptor = mkstemps(path.data(), 4);
+    assert(descriptor >= 0);
+    struct Cleanup {
+        std::string path;
+        ~Cleanup() { std::filesystem::remove(path); }
+    } cleanup{path};
+    std::array<uint8_t, 68> contents{};
+    const std::string magic = "MFQMM01";
+    std::copy(magic.begin(), magic.end(), contents.begin());
+    assert(::write(descriptor, contents.data(), contents.size()) == ssize_t(contents.size()));
+    assert(::close(descriptor) == 0);
+    json payload{{"version", 1}, {"binary_file", {{"path", path}, {"token", std::string(64, '0')}, {"size", 68}}},
+        {"pixel_values", {{"dtype", "float32"}, {"shape", {1}}, {"data_offset", 64}, {"data_length", 4}}}};
+    assert(parse_mfq_vision(payload).pixel_values == std::vector<float>{0});
+    for (int invalid = 0; invalid < 4; ++invalid) {
+        auto bad = payload;
+        if (invalid == 0) { bad["pixel_values"]["shape"] = {1000000000}; bad["pixel_values"]["data_length"] = 4000000000LL; }
+        if (invalid == 1) bad["pixel_values"]["data_offset"] = 65;
+        if (invalid == 2) bad["binary_file"]["token"] = std::string(64, '1');
+        if (invalid == 3) bad["binary_file"]["size"] = 69;
+        bool rejected = false;
+        try { parse_mfq_vision(bad); }
+        catch (const ApiError& error) { rejected = error.status == 400; }
+        assert(rejected);
+    }
+#endif
+}
+
+static void check_media_codec() {
+    using namespace mfq::transport;
+    json payload{{"version", 1}, {"pixel_values", {{"dtype", "float32"}, {"shape", {1}}, {"data_base64", "AAAAAA=="}}}};
+    for (const auto processor : {"minicpmo", "deepseek_v4", "deepseek_v41", "qwen3_vision"}) {
+        payload["version"] = processor == std::string("minicpmo") ? 1 : processor == std::string("qwen3_vision") ? 3 : 2;
+        payload["processor"] = processor;
+        const auto media = mfq::transport::parse_mfq_vision(payload);
+        assert(media.pixel_shape == std::vector<int64_t>{1} && media.pixel_values == std::vector<float>{0});
+    }
+    for (int invalid = 0; invalid < 5; ++invalid) {
+        auto bad = payload;
+        if (invalid == 0) bad["pixel_values"]["shape"] = {1000000000}; // Must reject bytes before allocating declared tensor size.
+        if (invalid == 1) bad["pixel_values"]["dtype"] = "uint8";
+        if (invalid == 2) bad["version"] = (uint64_t(1) << 32) | 1;
+        if (invalid == 3) bad["processor"] = "invalid/processor";
+        if (invalid == 4) bad["vision_types"] = {{"dtype", "int32"}, {"shape", {1, 1}}, {"data_base64", "AQAAAA=="}};
+        bool rejected = false;
+        try { mfq::transport::parse_mfq_vision(bad); }
+        catch (const mfq::transport::ApiError& error) { rejected = error.status == 400; }
+        assert(rejected);
+    }
+}
+
 static void check_control_protocol() {
     using namespace mfq::transport;
     FakeEngine engine;
@@ -544,6 +605,8 @@ int main(int argc, char** argv) {
         return make_mfq_http_transport(config)->run(scheduler);
     }
     check_duplex_preemption();
+    check_media_file_codec();
+    check_media_codec();
     check_control_protocol();
     check_input_ownership_and_budget();
     test_model_capabilities();

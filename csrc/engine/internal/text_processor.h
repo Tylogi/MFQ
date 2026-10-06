@@ -50,6 +50,7 @@ public:
         const std::unordered_set<std::int64_t>& excluded = {}) const;
 
 private:
+    static void validate_media(const MfqMultimodalInput& media);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

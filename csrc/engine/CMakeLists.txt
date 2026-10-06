@@ -21,6 +21,7 @@ endif()
 if(TARGET mfq-tokenizer)
     target_sources(mfq-engine PRIVATE
         src/inference.cpp
+        src/media_input.cpp
         src/request_executor.cpp
         src/token_constraint.cpp
         src/tokenizer.cpp

@@ -26,6 +26,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -1524,18 +1525,18 @@ public:
     TensorFileReader(const TensorFileReader &) = delete;
     TensorFileReader & operator=(const TensorFileReader &) = delete;
 
-    void read(
-            size_t offset,
-            void * destination,
-            size_t length,
-            const std::string & parameter) const {
+    template<class Value>
+    std::vector<Value> read(size_t offset, size_t count, const std::string& parameter) const {
+        const size_t length = count * sizeof(Value);
         if (offset < 64 || offset % 64 != 0 ||
             length > size_ || offset > size_ - length) {
             throw ApiError(
                 400, "invalid_request_error",
                 parameter + " byte range is outside the tensor file", parameter);
         }
-        read_exact(offset, destination, length, parameter);
+        std::vector<Value> values(count);
+        read_exact(offset, values.data(), length, parameter);
+        return values;
     }
 
 private:
@@ -1626,7 +1627,7 @@ static std::pair<std::vector<Value>, std::vector<int64_t>> decode_tensor(
             parameter + " byte length does not match its shape", parameter);
     }
     const size_t expected_bytes = count * sizeof(Value);
-    std::vector<Value> values(count);
+    std::vector<Value> values;
     if (tensor.contains("data_base64") &&
         tensor["data_base64"].is_string()) {
         const auto bytes = decode_base64(
@@ -1636,6 +1637,7 @@ static std::pair<std::vector<Value>, std::vector<int64_t>> decode_tensor(
                 400, "invalid_request_error",
                 parameter + " byte length does not match its shape", parameter);
         }
+        values.resize(count);
         std::memcpy(values.data(), bytes.data(), bytes.size());
     } else {
         if (file_reader == nullptr ||
@@ -1656,415 +1658,58 @@ static std::pair<std::vector<Value>, std::vector<int64_t>> decode_tensor(
                 400, "invalid_request_error",
                 parameter + " byte length does not match its shape", parameter);
         }
-        file_reader->read(
-            static_cast<size_t>(raw_offset), values.data(), expected_bytes,
-            parameter);
+        values = file_reader->read<Value>(static_cast<size_t>(raw_offset), count, parameter);
     }
     return {std::move(values), std::move(shape)};
 }
 
-static MfqMultimodalInput parse_deepseek_multimodal(
-        const json & value,
-        TensorFileReader * file_reader,
-        bool v41) {
-    const std::string label = v41 ? "DeepSeek-V4.1" : "DeepSeek-V4";
-    for (const char * name : {"pixel_values", "patch_mask", "vision_grid"}) {
-        if (!value.contains(name)) {
-            throw ApiError(
-                400, "invalid_request_error",
-                label + " multimodal payload is missing " + name,
-                "mfq_multimodal");
-        }
-    }
+MfqMultimodalInput parse_mfq_vision(const json& value) {
+    if (!value.is_object()) throw ApiError(400, "invalid_request_error", "mfq_multimodal must be an object", "mfq_multimodal");
+    if (!value.contains("version") || !value["version"].is_number_integer())
+        throw ApiError(400, "invalid_request_error", "mfq_multimodal.version must be an integer", "mfq_multimodal.version");
+    const auto version = integer_field(value, "version", 0);
+    if (version < 1 || version > 3)
+        throw ApiError(400, "invalid_request_error", "unsupported mfq_multimodal.version", "mfq_multimodal.version");
     MfqMultimodalInput result;
-    result.processor = v41
-        ? MfqMultimodalProcessor::deepseek_v41
-        : MfqMultimodalProcessor::deepseek_v4;
-    result.processor_name = v41 ? "deepseek_v41" : "deepseek_v4";
-    auto pixels = decode_tensor<float>(
-        value, "pixel_values", "float32", file_reader);
-    result.pixel_values = std::move(pixels.first);
-    result.pixel_shape = std::move(pixels.second);
-    auto mask = decode_tensor<uint8_t>(
-        value, "patch_mask", "uint8", file_reader);
-    result.patch_mask = std::move(mask.first);
-    result.patch_mask_shape = std::move(mask.second);
-    auto grid = decode_tensor<int32_t>(
-        value, "vision_grid", "int32", file_reader);
-    result.vision_grid = std::move(grid.first);
-    result.vision_grid_shape = std::move(grid.second);
-
-    if (result.pixel_shape.size() != 3 ||
-        result.pixel_shape[0] <= 0 || result.pixel_shape[0] > 128 ||
-        result.pixel_shape[2] != 3 * 14 * 14 ||
-        result.patch_mask_shape.size() != 2 ||
-        result.vision_grid_shape.size() != 2 ||
-        result.vision_grid_shape[1] != 4 ||
-        result.pixel_shape[0] != result.patch_mask_shape[0] ||
-        result.pixel_shape[0] != result.vision_grid_shape[0] ||
-        result.pixel_shape[1] != result.patch_mask_shape[1]) {
-        throw ApiError(
-            400, "invalid_request_error",
-            label + " multimodal tensor geometry is invalid",
-            "mfq_multimodal");
-    }
-    if (!std::all_of(
-            result.pixel_values.begin(), result.pixel_values.end(),
-            [](float item) { return std::isfinite(item); })) {
-        throw ApiError(
-            400, "invalid_request_error",
-            "mfq_multimodal pixel_values contains a non-finite value",
-            "mfq_multimodal.pixel_values");
-    }
-    const int64_t images = result.pixel_shape[0];
-    const int64_t padded_patches = result.pixel_shape[1];
-    for (int64_t image = 0; image < images; ++image) {
-        const int64_t vit_h = result.vision_grid[4 * image];
-        const int64_t vit_w = result.vision_grid[4 * image + 1];
-        const int64_t llm_h = result.vision_grid[4 * image + 2];
-        const int64_t llm_w = result.vision_grid[4 * image + 3];
-        if (vit_h <= 0 || vit_w <= 0 ||
-            vit_h > std::numeric_limits<int64_t>::max() / vit_w ||
-            vit_h * vit_w > padded_patches ||
-            llm_h != (vit_h + 2) / 3 ||
-            llm_w != (vit_w + 2) / 3) {
-            throw ApiError(
-                400, "invalid_request_error",
-                label + " vision grid disagrees with patch geometry",
-                "mfq_multimodal.vision_grid");
-        }
-        const int64_t active = vit_h * vit_w;
-        for (int64_t patch = 0; patch < padded_patches; ++patch) {
-            const uint8_t actual = result.patch_mask[
-                static_cast<size_t>(image * padded_patches + patch)];
-            if (actual > 1 || static_cast<bool>(actual) != (patch < active)) {
-                throw ApiError(
-                    400, "invalid_request_error",
-                    label + " patch mask is not a contiguous active prefix",
-                    "mfq_multimodal.patch_mask");
-            }
-        }
-    }
-
-    return result;
-}
-
-static bool valid_processor_identity(const std::string & value) {
-    if (value.empty() || value.size() > 64) return false;
-    return std::all_of(
-        value.begin(), value.end(), [](unsigned char item) {
-            return std::isalnum(item) || item == '_' || item == '-' || item == '.';
-        });
-}
-
-static MfqMultimodalInput parse_grid_vision_multimodal(
-        const json & value,
-        TensorFileReader * file_reader) {
-    if (!value.contains("processor") || !value["processor"].is_string()) {
-        throw ApiError(
-            400, "invalid_request_error",
-            "grid-vision payload requires a processor identity",
-            "mfq_multimodal.processor");
-    }
-    const auto processor = value["processor"].get<std::string>();
-    if (!valid_processor_identity(processor)) {
-        throw ApiError(
-            400, "invalid_request_error",
-            "grid-vision processor identity is invalid",
-            "mfq_multimodal.processor");
-    }
-
-    auto pixels = decode_tensor<float>(
-        value, "pixel_values", "float32", file_reader);
-    auto grid = decode_tensor<int32_t>(
-        value, "vision_grid_thw", "int32", file_reader);
-    auto types = decode_tensor<int32_t>(
-        value, "vision_types", "int32", file_reader);
-    if (pixels.second.size() != 2 || pixels.second[0] <= 0 ||
-        pixels.second[1] <= 0 || grid.second.size() != 2 ||
-        grid.second[0] <= 0 || grid.second[1] != 3 ||
-        types.second != std::vector<int64_t>{grid.second[0]}) {
-        throw ApiError(
-            400, "invalid_request_error",
-            "grid-vision tensor geometry is invalid",
-            "mfq_multimodal");
-    }
-    if (!std::all_of(
-            pixels.first.begin(), pixels.first.end(),
-            [](float item) { return std::isfinite(item); })) {
-        throw ApiError(
-            400, "invalid_request_error",
-            "grid-vision pixels contain a non-finite value",
-            "mfq_multimodal.pixel_values");
-    }
-
-    std::uint64_t patches = 0;
-    std::vector<int32_t> derived_images;
-    std::vector<int32_t> derived_videos;
-    for (int64_t item = 0; item < grid.second[0]; ++item) {
-        const auto offset = static_cast<size_t>(3 * item);
-        const int32_t temporal = grid.first[offset];
-        const int32_t height = grid.first[offset + 1];
-        const int32_t width = grid.first[offset + 2];
-        const int32_t type = types.first[static_cast<size_t>(item)];
-        if (temporal <= 0 || height <= 0 || width <= 0 ||
-            (type != 1 && type != 2)) {
-            throw ApiError(
-                400, "invalid_request_error",
-                "grid-vision dimensions or modality type are invalid",
-                "mfq_multimodal.vision_grid_thw");
-        }
-        const auto frame = static_cast<std::uint64_t>(temporal);
-        const auto rows = static_cast<std::uint64_t>(height);
-        const auto columns = static_cast<std::uint64_t>(width);
-        if (rows > std::numeric_limits<std::uint64_t>::max() / columns ||
-            frame > std::numeric_limits<std::uint64_t>::max() / (rows * columns) ||
-            patches > std::numeric_limits<std::uint64_t>::max() -
-                frame * rows * columns) {
-            throw ApiError(
-                400, "invalid_request_error",
-                "grid-vision patch count overflows",
-                "mfq_multimodal.vision_grid_thw");
-        }
-        patches += frame * rows * columns;
-        auto & destination = type == 1 ? derived_images : derived_videos;
-        destination.insert(
-            destination.end(),
-            grid.first.begin() + static_cast<std::ptrdiff_t>(offset),
-            grid.first.begin() + static_cast<std::ptrdiff_t>(offset + 3));
-        if (type == 1 && temporal != 1) {
-            throw ApiError(
-                400, "invalid_request_error",
-                "grid-vision images must have temporal size one",
-                "mfq_multimodal.vision_grid_thw");
-        }
-    }
-    if (patches != static_cast<std::uint64_t>(pixels.second[0])) {
-        throw ApiError(
-            400, "invalid_request_error",
-            "grid-vision patch count disagrees with pixel_values",
-            "mfq_multimodal.pixel_values");
-    }
-
-    const auto optional_grid = [&](const char * name) {
-        if (!value.contains(name)) {
-            return std::pair<std::vector<int32_t>, std::vector<int64_t>>{
-                {}, {0, 3}};
-        }
-        auto result = decode_tensor<int32_t>(
-            value, name, "int32", file_reader);
-        if (result.second.size() != 2 || result.second[1] != 3) {
-            throw ApiError(
-                400, "invalid_request_error",
-                std::string(name) + " must have [items,3] shape",
-                std::string("mfq_multimodal.") + name);
-        }
-        return result;
-    };
-    auto images = optional_grid("image_grid_thw");
-    auto videos = optional_grid("video_grid_thw");
-    if (images.first != derived_images || videos.first != derived_videos) {
-        throw ApiError(
-            400, "invalid_request_error",
-            "grid-vision split grids disagree with combined media order",
-            "mfq_multimodal");
-    }
-
-    MfqMultimodalInput result;
-    result.processor = MfqMultimodalProcessor::grid_vision;
-    result.processor_name = processor;
-    result.pixel_values = std::move(pixels.first);
-    result.pixel_shape = std::move(pixels.second);
-    result.vision_grid = std::move(grid.first);
-    result.vision_grid_shape = std::move(grid.second);
-    result.vision_types = std::move(types.first);
-    result.image_grid = std::move(images.first);
-    result.image_grid_shape = std::move(images.second);
-    result.video_grid = std::move(videos.first);
-    result.video_grid_shape = std::move(videos.second);
-    return result;
-}
-
-MfqMultimodalInput parse_mfq_vision(const json & value) {
-    if (!value.is_object()) {
-        throw ApiError(
-            400, "invalid_request_error",
-            "mfq_multimodal must be an object", "mfq_multimodal");
-    }
-    if (!value.contains("version") || !value["version"].is_number_integer()) {
-        throw ApiError(
-            400, "invalid_request_error",
-            "mfq_multimodal.version must be an integer", "mfq_multimodal.version");
-    }
-
-    std::unique_ptr<TensorFileReader> file_reader;
-    if (value.contains("binary_file")) {
-        file_reader = std::make_unique<TensorFileReader>(value);
-    }
-    const int version = value["version"].get<int>();
-    if (version == 3) {
-        return parse_grid_vision_multimodal(value, file_reader.get());
-    }
-    if (version == 2) {
-        if (!value.contains("processor") ||
-            !value["processor"].is_string()) {
-            throw ApiError(
-                400, "invalid_request_error",
-                "mfq_multimodal version 2 requires a DeepSeek processor",
-                "mfq_multimodal.processor");
-        }
-        const auto processor = value["processor"].get<std::string>();
-        if (processor != "deepseek_v4" && processor != "deepseek_v41") {
-            throw ApiError(
-                400, "invalid_request_error",
-                "unsupported DeepSeek multimodal processor",
-                "mfq_multimodal.processor");
-        }
-        return parse_deepseek_multimodal(
-            value, file_reader.get(), processor == "deepseek_v41");
-    }
     if (version != 1) {
-        throw ApiError(
-            400, "invalid_request_error",
-            "unsupported mfq_multimodal.version", "mfq_multimodal.version");
+        if (!value.contains("processor") || !value["processor"].is_string())
+            throw ApiError(400, "invalid_request_error", "media processor identity must be a string", "mfq_multimodal.processor");
+        result.processor_name = value["processor"].get<std::string>();
+        if (result.processor_name.empty() || result.processor_name.size() > 64 ||
+                !std::all_of(result.processor_name.begin(), result.processor_name.end(), [](unsigned char item) {
+                    return std::isalnum(item) || item == '_' || item == '-' || item == '.';
+                })) throw ApiError(400, "invalid_request_error", "invalid media processor identity", "mfq_multimodal.processor");
+        if (version == 3) result.processor = MfqMultimodalProcessor::grid_vision;
+        else if (result.processor_name == "deepseek_v4") result.processor = MfqMultimodalProcessor::deepseek_v4;
+        else if (result.processor_name == "deepseek_v41") result.processor = MfqMultimodalProcessor::deepseek_v41;
+        else throw ApiError(400, "invalid_request_error", "unsupported media processor", "mfq_multimodal.processor");
     }
-
-    MfqMultimodalInput result;
-    result.processor = MfqMultimodalProcessor::minicpmo;
-    const bool has_any_image_tensor =
-        value.contains("pixel_values") || value.contains("patch_mask") ||
-        value.contains("target_sizes");
-    const bool has_all_image_tensors =
-        value.contains("pixel_values") && value.contains("patch_mask") &&
-        value.contains("target_sizes");
-    if (has_any_image_tensor != has_all_image_tensors) {
-        throw ApiError(
-            400, "invalid_request_error",
-            "mfq_multimodal image tensors must be provided together",
-            "mfq_multimodal");
-    }
-    const bool has_any_audio_tensor =
-        value.contains("audio_features") || value.contains("audio_lengths");
-    const bool has_all_audio_tensors =
-        value.contains("audio_features") && value.contains("audio_lengths");
-    if (has_any_audio_tensor != has_all_audio_tensors) {
-        throw ApiError(
-            400, "invalid_request_error",
-            "mfq_multimodal audio tensors must be provided together",
-            "mfq_multimodal");
-    }
-    if (!has_all_image_tensors && !has_all_audio_tensors) {
-        throw ApiError(
-            400, "invalid_request_error",
-            "mfq_multimodal contains no media tensors", "mfq_multimodal");
-    }
-
-    if (has_all_image_tensors) {
-        auto pixels = decode_tensor<float>(
-            value, "pixel_values", "float32", file_reader.get());
-        result.pixel_values = std::move(pixels.first);
-        result.pixel_shape = std::move(pixels.second);
-        auto mask = decode_tensor<uint8_t>(
-            value, "patch_mask", "uint8", file_reader.get());
-        result.patch_mask = std::move(mask.first);
-        result.patch_mask_shape = std::move(mask.second);
-        auto sizes = decode_tensor<int32_t>(
-            value, "target_sizes", "int32", file_reader.get());
-        result.target_sizes = std::move(sizes.first);
-        result.target_sizes_shape = std::move(sizes.second);
-
-        if (result.pixel_shape.size() != 4 || result.pixel_shape[1] != 3 ||
-            result.pixel_shape[2] != 14 ||
-            result.patch_mask_shape.size() != 2 ||
-            result.target_sizes_shape.size() != 2 ||
-            result.target_sizes_shape[1] != 2 ||
-            result.pixel_shape[0] != result.patch_mask_shape[0] ||
-            result.pixel_shape[0] != result.target_sizes_shape[0] ||
-            result.pixel_shape[3] % 14 != 0 ||
-            result.patch_mask_shape[1] != result.pixel_shape[3] / 14) {
-            throw ApiError(
-                400, "invalid_request_error",
-                "mfq_multimodal image tensor geometry is invalid",
-                "mfq_multimodal");
-        }
-        const int64_t source_count = result.pixel_shape[0];
-        if (source_count <= 0 || source_count > 576) {
-            throw ApiError(
-                400, "invalid_request_error",
-                "mfq_multimodal contains an invalid number of image slices",
-                "mfq_multimodal.pixel_values");
-        }
-        for (int64_t source = 0; source < source_count; ++source) {
-            const int64_t rows = result.target_sizes[2 * source];
-            const int64_t columns = result.target_sizes[2 * source + 1];
-            if (rows <= 0 || columns <= 0 ||
-                rows * columns > result.patch_mask_shape[1]) {
-                throw ApiError(
-                    400, "invalid_request_error",
-                    "mfq_multimodal target size disagrees with pixel geometry",
-                    "mfq_multimodal.target_sizes");
-            }
-            for (int64_t patch = 0; patch < result.patch_mask_shape[1]; ++patch) {
-                const bool expected = patch < rows * columns;
-                const uint8_t actual = result.patch_mask[
-                    static_cast<size_t>(source * result.patch_mask_shape[1] + patch)];
-                if (actual > 1 || static_cast<bool>(actual) != expected) {
-                    throw ApiError(
-                        400, "invalid_request_error",
-                        "mfq_multimodal patch mask is not a contiguous active prefix",
-                        "mfq_multimodal.patch_mask");
-                }
-            }
-        }
-        if (!std::all_of(
-                result.pixel_values.begin(), result.pixel_values.end(),
-                [](float item) { return std::isfinite(item); })) {
-            throw ApiError(
-                400, "invalid_request_error",
-                "mfq_multimodal pixel_values contains a non-finite value",
-                "mfq_multimodal.pixel_values");
-        }
-    }
-
-    if (has_all_audio_tensors) {
-        auto features = decode_tensor<float>(
-            value, "audio_features", "float32", file_reader.get());
-        result.audio_features = std::move(features.first);
-        result.audio_features_shape = std::move(features.second);
-        auto lengths = decode_tensor<int64_t>(
-            value, "audio_lengths", "int64", file_reader.get());
-        result.audio_lengths = std::move(lengths.first);
-        const auto & length_shape = lengths.second;
-        if (result.audio_features_shape.size() != 3 ||
-            result.audio_features_shape[0] <= 0 ||
-            result.audio_features_shape[0] > 128 ||
-            result.audio_features_shape[1] != 80 ||
-            result.audio_features_shape[2] < 9 ||
-            result.audio_features_shape[2] > 3000 ||
-            length_shape.size() != 1 ||
-            length_shape[0] != result.audio_features_shape[0]) {
-            throw ApiError(
-                400, "invalid_request_error",
-                "mfq_multimodal audio tensor geometry is invalid",
-                "mfq_multimodal");
-        }
-        if (!std::all_of(
-                result.audio_features.begin(), result.audio_features.end(),
-                [](float item) { return std::isfinite(item); })) {
-            throw ApiError(
-                400, "invalid_request_error",
-                "mfq_multimodal audio_features contains a non-finite value",
-                "mfq_multimodal.audio_features");
-        }
-        for (const int64_t length : result.audio_lengths) {
-            if (length < 9 || length > result.audio_features_shape[2]) {
-                throw ApiError(
-                    400, "invalid_request_error",
-                    "mfq_multimodal audio length is out of range",
-                    "mfq_multimodal.audio_lengths");
-            }
-        }
-    }
+    std::unique_ptr<TensorFileReader> file_reader;
+    if (value.contains("binary_file")) file_reader = std::make_unique<TensorFileReader>(value);
+    const auto tensor = [&]<class T>(const char* name, const char* dtype, std::vector<T>& data, std::vector<int64_t>& shape) {
+        if (!value.contains(name)) return;
+        auto decoded = decode_tensor<T>(value, name, dtype, file_reader.get());
+        if constexpr (std::is_floating_point_v<T>)
+            if (!std::all_of(decoded.first.begin(), decoded.first.end(), [](T item) { return std::isfinite(item); }))
+                throw ApiError(400, "invalid_request_error", std::string(name) + " contains a non-finite value", std::string("mfq_multimodal.") + name);
+        data = std::move(decoded.first);
+        shape = std::move(decoded.second);
+    };
+    tensor("pixel_values", "float32", result.pixel_values, result.pixel_shape);
+    tensor("patch_mask", "uint8", result.patch_mask, result.patch_mask_shape);
+    tensor("target_sizes", "int32", result.target_sizes, result.target_sizes_shape);
+    tensor(version == 3 ? "vision_grid_thw" : "vision_grid", "int32", result.vision_grid, result.vision_grid_shape);
+    tensor("image_grid_thw", "int32", result.image_grid, result.image_grid_shape);
+    tensor("video_grid_thw", "int32", result.video_grid, result.video_grid_shape);
+    tensor("audio_features", "float32", result.audio_features, result.audio_features_shape);
+    const auto vector = [&]<class T>(const char* name, const char* dtype, std::vector<T>& data) {
+        std::vector<int64_t> shape;
+        tensor(name, dtype, data, shape);
+        if (!shape.empty() && shape.size() != 1)
+            throw ApiError(400, "invalid_request_error", std::string(name) + " must be a vector", std::string("mfq_multimodal.") + name);
+    };
+    vector("vision_types", "int32", result.vision_types);
+    vector("audio_lengths", "int64", result.audio_lengths);
     return result;
 }
 
