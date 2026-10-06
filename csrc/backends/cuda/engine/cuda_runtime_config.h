@@ -1,7 +1,7 @@
 #pragma once
 
 #include "runtime_config.h"
-#include "mfq/cuda/engine.h"
+#include "cuda_engine.h"
 
 #include <cstdint>
 

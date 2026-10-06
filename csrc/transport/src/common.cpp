@@ -1,7 +1,6 @@
 #include "common.h"
 
 #include "nlohmann/json.hpp"
-#include "chat.h"
 #include "mtp_metrics.h"
 
 #include <algorithm>
@@ -74,22 +73,24 @@ static bool request_enable_thinking(const json & body, bool fallback) {
     return fallback;
 }
 
-static common_reasoning_format request_reasoning_format(const json & body) {
+static mfq::engine::ReasoningFormat request_reasoning_format(const json & body) {
+    using enum mfq::engine::ReasoningFormat;
     if (!body.contains("reasoning_format") || body["reasoning_format"].is_null()) {
-        return COMMON_REASONING_FORMAT_AUTO;
+        return automatic;
     }
     if (!body["reasoning_format"].is_string()) {
         throw ApiError(
             400, "invalid_request_error",
             "reasoning_format must be a string", "reasoning_format");
     }
-    try {
-        return common_reasoning_format_from_name(
-            body["reasoning_format"].get<std::string>());
-    } catch (const std::exception & error) {
-        throw ApiError(
-            400, "invalid_request_error", error.what(), "reasoning_format");
-    }
+    const std::string value = body["reasoning_format"];
+    if (value == "none") return none;
+    if (value == "auto") return automatic;
+    if (value == "deepseek-legacy") return deepseek_legacy;
+    if (value == "deepseek") return deepseek;
+    throw ApiError(
+        400, "invalid_request_error",
+        "Unknown reasoning format: " + value, "reasoning_format");
 }
 
 static bool boolean_field(
@@ -177,6 +178,110 @@ static std::string request_json_schema(const json & body) {
 static std::optional<std::string> request_preformatted_prompt(
     const json & body);
 
+static std::vector<mfq::engine::ChatMessage> parse_chat_messages(
+        const json& messages) {
+    try {
+        std::vector<mfq::engine::ChatMessage> result;
+        for (const auto& value : messages) {
+            if (!value.is_object()) {
+                throw std::invalid_argument("message must be an object");
+            }
+            mfq::engine::ChatMessage message;
+            message.role = value.at("role").get<std::string>();
+            const bool has_content = value.contains("content");
+            const bool has_tool_calls = value.contains("tool_calls");
+            if (has_content) {
+                const auto& content = value["content"];
+                if (content.is_string()) {
+                    message.content = content.get<std::string>();
+                } else if (content.is_array()) {
+                    for (const auto& part : content) {
+                        const std::string type = part.at("type");
+                        if (type != "text" && type != "media_marker") {
+                            throw std::invalid_argument(
+                                "unsupported content part type: " + type);
+                        }
+                        message.content_parts.push_back(
+                            {type, part.at("text").get<std::string>()});
+                    }
+                } else if (!content.is_null()) {
+                    throw std::invalid_argument(
+                        "message content must be a string, array, or null");
+                }
+            }
+            if (has_tool_calls) {
+                if (!value["tool_calls"].is_array()) {
+                    throw std::invalid_argument("tool_calls must be an array");
+                }
+                for (const auto& call : value["tool_calls"]) {
+                    if (call.at("type") != "function") {
+                        throw std::invalid_argument(
+                            "only function tool calls are supported");
+                    }
+                    const auto& function = call.at("function");
+                    const auto& arguments = function.at("arguments");
+                    message.tool_calls.push_back({
+                        function.at("name").get<std::string>(),
+                        arguments.is_string()
+                            ? arguments.get<std::string>() : arguments.dump(),
+                        call.value("id", ""),
+                    });
+                }
+            }
+            if (!has_content && !has_tool_calls) {
+                throw std::invalid_argument(
+                    "message must contain content or tool_calls");
+            }
+            if (value.contains("reasoning_content")) {
+                message.reasoning_content =
+                    value["reasoning_content"].get<std::string>();
+            }
+            if (value.contains("name")) {
+                message.tool_name = value["name"].get<std::string>();
+            }
+            if (value.contains("tool_call_id")) {
+                message.tool_call_id =
+                    value["tool_call_id"].get<std::string>();
+            }
+            for (const char* key : {"task", "tools", "response_format"}) {
+                if (value.contains(key)) {
+                    message.extra_fields[key] = value[key].dump();
+                }
+            }
+            result.push_back(std::move(message));
+        }
+        return result;
+    } catch (const std::exception& error) {
+        throw ApiError(
+            400, "invalid_request_error",
+            std::string("Failed to parse messages: ") + error.what(),
+            "messages");
+    }
+}
+
+static std::vector<mfq::engine::ChatTool> parse_chat_tools(const json& tools) {
+    try {
+        std::vector<mfq::engine::ChatTool> result;
+        for (const auto& tool : tools) {
+            if (!tool.is_object() || tool.at("type") != "function") {
+                throw std::invalid_argument(
+                    "only function tools are supported");
+            }
+            const auto& function = tool.at("function");
+            result.push_back({
+                function.at("name").get<std::string>(),
+                function.value("description", ""),
+                function.value("parameters", json::object()).dump(),
+            });
+        }
+        return result;
+    } catch (const std::exception& error) {
+        throw ApiError(
+            400, "invalid_request_error",
+            std::string("Failed to parse tools: ") + error.what(), "tools");
+    }
+}
+
 static mfq::engine::ChatInput parse_chat_input(
         const json & body,
         bool enable_thinking_default) {
@@ -188,104 +293,108 @@ static mfq::engine::ChatInput parse_chat_input(
     }
 
     mfq::engine::ChatInput result;
-    auto & inputs = result.template_inputs;
     result.preformatted_prompt = request_preformatted_prompt(body);
     result.reasoning_format = request_reasoning_format(body);
-    inputs.json_schema = request_json_schema(body);
-    inputs.reasoning_format = result.reasoning_format;
-    inputs.enable_thinking = request_enable_thinking(
+    result.json_schema = request_json_schema(body);
+    result.enable_thinking = request_enable_thinking(
         body, enable_thinking_default);
-    inputs.use_jinja = true;
-    inputs.add_generation_prompt =
+    result.add_generation_prompt =
         boolean_field(body, "add_generation_prompt", true);
     if (result.preformatted_prompt) return result;
 
-    try {
-        inputs.messages = common_chat_msgs_parse_oaicompat(body["messages"]);
-        if (body.contains("continue_final_message") &&
-            !body["continue_final_message"].is_null()) {
-            inputs.continue_final_message = common_chat_continuation_parse(
-                body["continue_final_message"]);
+    result.messages = parse_chat_messages(body["messages"]);
+    if (body.contains("continue_final_message") &&
+        !body["continue_final_message"].is_null()) {
+        const auto& value = body["continue_final_message"];
+        if (value.is_boolean() && value.get<bool>()) {
+            result.continuation = mfq::engine::ChatContinuation::automatic;
+        } else if (value == "reasoning_content") {
+            result.continuation = mfq::engine::ChatContinuation::reasoning;
+        } else if (value == "content") {
+            result.continuation = mfq::engine::ChatContinuation::content;
         }
-        if (inputs.continue_final_message != COMMON_CHAT_CONTINUATION_NONE &&
-            inputs.add_generation_prompt) {
+        if (result.continuation != mfq::engine::ChatContinuation::none &&
+            result.add_generation_prompt) {
             throw ApiError(
                 400, "invalid_request_error",
                 "add_generation_prompt and continue_final_message "
                 "cannot both be enabled",
                 "continue_final_message");
         }
-        if (body.contains("parallel_tool_calls") &&
-            !body["parallel_tool_calls"].is_null()) {
-            result.parallel_tool_calls = boolean_field(
-                body, "parallel_tool_calls", false);
+    }
+    if (body.contains("parallel_tool_calls") &&
+        !body["parallel_tool_calls"].is_null()) {
+        result.parallel_tool_calls = boolean_field(
+            body, "parallel_tool_calls", false);
+    }
+
+    if (body.contains("tools") && !body["tools"].is_null()) {
+        if (!body["tools"].is_array()) {
+            throw ApiError(
+                400, "invalid_request_error", "tools must be an array", "tools");
         }
-        if (body.contains("tools") && !body["tools"].is_null()) {
-            inputs.tools = common_chat_tools_parse_oaicompat(body["tools"]);
-        }
-        const json tool_choice =
-            body.contains("tool_choice") && !body["tool_choice"].is_null()
-                ? body["tool_choice"] : json("auto");
-        if (tool_choice.is_string()) {
-            inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(
-                tool_choice.get<std::string>());
-        } else if (tool_choice.is_object()) {
-            if (!tool_choice.contains("type") ||
-                tool_choice["type"] != "function" ||
-                !tool_choice.contains("function") ||
-                !tool_choice["function"].is_object() ||
-                !tool_choice["function"].contains("name") ||
-                !tool_choice["function"]["name"].is_string()) {
-                throw ApiError(
-                    400, "invalid_request_error",
-                    "named tool_choice must select a function name",
-                    "tool_choice");
-            }
-            const std::string selected_name =
-                tool_choice["function"]["name"];
-            const auto selected = std::find_if(
-                inputs.tools.begin(), inputs.tools.end(),
-                [&](const common_chat_tool & tool) {
-                    return tool.name == selected_name;
-                });
-            if (selected == inputs.tools.end()) {
-                throw ApiError(
-                    400, "invalid_request_error",
-                    "named tool_choice does not match any supplied tool",
-                    "tool_choice");
-            }
-            inputs.tools = {*selected};
-            inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
-        } else {
+        result.tools = parse_chat_tools(body["tools"]);
+    }
+    const json tool_choice =
+        body.contains("tool_choice") && !body["tool_choice"].is_null()
+            ? body["tool_choice"] : json("auto");
+    if (tool_choice.is_string()) {
+        const std::string choice = tool_choice;
+        if (choice == "required") {
+            result.tool_choice = mfq::engine::ChatToolChoice::required;
+        } else if (choice == "none") {
+            result.tool_choice = mfq::engine::ChatToolChoice::none;
+        } else if (choice != "auto") {
             throw ApiError(
                 400, "invalid_request_error",
-                "tool_choice must be a string or function selector object",
-                "tool_choice");
+                "Invalid tool_choice: " + choice, "tool_choice");
         }
-        if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED &&
-            inputs.tools.empty()) {
+    } else if (tool_choice.is_object()) {
+        if (!tool_choice.contains("type") ||
+            tool_choice["type"] != "function" ||
+            !tool_choice.contains("function") ||
+            !tool_choice["function"].is_object() ||
+            !tool_choice["function"].contains("name") ||
+            !tool_choice["function"]["name"].is_string()) {
             throw ApiError(
                 400, "invalid_request_error",
-                "tool_choice required needs at least one tool",
-                "tool_choice");
+                "named tool_choice must select a function name", "tool_choice");
         }
-        if (body.contains("chat_template_kwargs") &&
-            !body["chat_template_kwargs"].is_null()) {
-            if (!body["chat_template_kwargs"].is_object()) {
-                throw ApiError(
-                    400, "invalid_request_error",
-                    "chat_template_kwargs must be an object",
-                    "chat_template_kwargs");
-            }
-            for (const auto & item : body["chat_template_kwargs"].items()) {
-                inputs.chat_template_kwargs[item.key()] = item.value().dump();
-            }
+        const std::string selected_name = tool_choice["function"]["name"];
+        const auto selected = std::find_if(
+            result.tools.begin(), result.tools.end(),
+            [&](const mfq::engine::ChatTool& tool) {
+                return tool.name == selected_name;
+            });
+        if (selected == result.tools.end()) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "named tool_choice does not match any supplied tool", "tool_choice");
         }
-    } catch (const ApiError &) {
-        throw;
-    } catch (const std::exception & error) {
+        result.tools = {*selected};
+        result.tool_choice = mfq::engine::ChatToolChoice::required;
+    } else {
         throw ApiError(
-            400, "invalid_request_error", error.what(), "messages");
+            400, "invalid_request_error",
+            "tool_choice must be a string or function selector object", "tool_choice");
+    }
+    if (result.tool_choice == mfq::engine::ChatToolChoice::required &&
+        result.tools.empty()) {
+        throw ApiError(
+            400, "invalid_request_error",
+            "tool_choice required needs at least one tool", "tool_choice");
+    }
+
+    if (body.contains("chat_template_kwargs") &&
+        !body["chat_template_kwargs"].is_null()) {
+        if (!body["chat_template_kwargs"].is_object()) {
+            throw ApiError(
+                400, "invalid_request_error",
+                "chat_template_kwargs must be an object", "chat_template_kwargs");
+        }
+        for (const auto & item : body["chat_template_kwargs"].items()) {
+            result.template_kwargs[item.key()] = item.value().dump();
+        }
     }
     return result;
 }
@@ -1136,7 +1245,7 @@ json usage_json(size_t prompt_tokens, int32_t completion_tokens) {
 }
 
 static json chat_tool_calls_json(
-    const std::vector<common_chat_tool_call> & tool_calls);
+    const std::vector<mfq::engine::ToolCall> & tool_calls);
 
 json runtime_generation_event(
         const std::string & event,
@@ -1176,7 +1285,7 @@ json runtime_generation_result(
     };
 }
 
-json chat_diff_json(const common_chat_msg_diff & diff) {
+json chat_diff_json(const mfq::engine::OutputDiff & diff) {
     json delta = json::object();
     if (!diff.reasoning_content_delta.empty()) {
         delta["reasoning_content"] = diff.reasoning_content_delta;
@@ -1209,7 +1318,7 @@ json chat_diff_json(const common_chat_msg_diff & diff) {
 }
 
 static json chat_tool_calls_json(
-        const std::vector<common_chat_tool_call> & tool_calls) {
+        const std::vector<mfq::engine::ToolCall> & tool_calls) {
     json out = json::array();
     for (const auto & tool_call : tool_calls) {
         out.push_back({
@@ -2047,9 +2156,9 @@ void CompletionStream::cancel() {
     scheduler_.cancel_request(id_);
     result.client_connected = false;
 }
-std::optional<std::vector<common_chat_msg_diff>> CompletionStream::next() {
+std::optional<std::vector<mfq::engine::OutputDiff>> CompletionStream::next() {
     if (terminal_) return {};
-    std::vector<common_chat_msg_diff> diffs;
+    std::vector<mfq::engine::OutputDiff> diffs;
     for (auto& event : request_->wait()) {
         std::visit([&](auto& data) {
             using T = std::decay_t<decltype(data)>;

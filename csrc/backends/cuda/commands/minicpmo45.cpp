@@ -3,7 +3,7 @@
 
 #include "models/minicpmo45/runtime.h"
 #include "cli.h"
-#include "mfq/cuda/engine.h"
+#include "cuda_engine.h"
 
 #include <nlohmann/json.hpp>
 #include <chrono>

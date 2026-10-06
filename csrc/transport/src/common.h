@@ -2,9 +2,6 @@
 
 #include "transport.h"
 
-#include "inference.h"
-#include "text_processor.h"
-#include "chat.h"
 #include "nlohmann/json.hpp"
 
 #include <atomic>
@@ -21,6 +18,8 @@
 #include <vector>
 
 namespace mfq::transport_detail {
+
+using json = nlohmann::ordered_json;
 
 class ApiError final : public std::runtime_error {
 public:
@@ -42,8 +41,16 @@ public:
 using RequestWork = mfq::engine::InferenceInput;
 using RequestInput = mfq::engine::InferenceInput;
 using RequestMetrics = mfq::engine::InferenceMetrics;
-using CompletionResult = mfq::engine::InferenceResult;
 
+struct CompletionResult {
+    std::string text;
+    std::string reasoning_text;
+    std::vector<mfq::engine::ToolCall> tool_calls;
+    std::string finish_reason = "length";
+    std::int32_t completion_tokens = 0;
+    bool client_connected = true;
+    bool cancelled = false;
+};
 
 struct RequestMetricValues {
     size_t prefill_tokens = 0;
@@ -158,7 +165,7 @@ json runtime_generation_result(
     const CompletionResult & result,
     json usage,
     json metrics);
-json chat_diff_json(const common_chat_msg_diff & diff);
+json chat_diff_json(const mfq::engine::OutputDiff & diff);
 MfqMultimodalInput parse_mfq_vision(const json & value);
 std::vector<float> decode_audio_features(
     const std::string & encoded,
@@ -171,7 +178,7 @@ class CompletionStream {
 public:
     CompletionStream(const MfqScheduler& scheduler, RequestWork&& work, std::string id);
     ~CompletionStream();
-    std::optional<std::vector<common_chat_msg_diff>> next();
+    std::optional<std::vector<mfq::engine::OutputDiff>> next();
     void cancel();
     CompletionResult result;
     RequestMetrics metrics;

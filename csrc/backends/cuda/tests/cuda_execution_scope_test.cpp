@@ -1,5 +1,5 @@
 #include "../ops/cuda_execution.h"
-#include "mfq/cuda/engine.h"
+#include "cuda_engine.h"
 
 #include <atomic>
 #include <barrier>

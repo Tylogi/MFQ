@@ -264,7 +264,7 @@ function(mfq_configure_cuda_runtime_target target)
         ${MFQ_CUDA_ROOT}/models
         ${MFQ_CUDA_ROOT}/engine
     )
-    target_link_libraries(${target} PRIVATE mfq-models mfq-engine)
+    target_link_libraries(${target} PRIVATE mfq-models mfq-engine mfq-tokenizer)
 endfunction()
 
 set(MFQ_CUDA_MODEL_SOURCES

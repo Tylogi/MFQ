@@ -277,6 +277,71 @@ void prepare_media(
     }
 }
 
+common_reasoning_format tokenizer_reasoning_format(ReasoningFormat value) {
+    switch (value) {
+        case ReasoningFormat::none: return COMMON_REASONING_FORMAT_NONE;
+        case ReasoningFormat::automatic: return COMMON_REASONING_FORMAT_AUTO;
+        case ReasoningFormat::deepseek_legacy:
+            return COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY;
+        case ReasoningFormat::deepseek: return COMMON_REASONING_FORMAT_DEEPSEEK;
+    }
+    throw std::invalid_argument("unknown reasoning format");
+}
+
+common_chat_templates_inputs tokenizer_chat_input(const ChatInput& chat) {
+    common_chat_templates_inputs inputs;
+    for (const auto& message : chat.messages) {
+        common_chat_msg value;
+        value.role = message.role;
+        value.content = message.content;
+        value.reasoning_content = message.reasoning_content;
+        value.tool_name = message.tool_name;
+        value.tool_call_id = message.tool_call_id;
+        value.extra_fields = message.extra_fields;
+        for (const auto& part : message.content_parts) {
+            value.content_parts.push_back({part.type, part.text});
+        }
+        for (const auto& call : message.tool_calls) {
+            value.tool_calls.push_back({call.name, call.arguments, call.id});
+        }
+        inputs.messages.push_back(std::move(value));
+    }
+    for (const auto& tool : chat.tools) {
+        inputs.tools.push_back({tool.name, tool.description, tool.parameters});
+    }
+    switch (chat.tool_choice) {
+        case ChatToolChoice::automatic:
+            inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
+            break;
+        case ChatToolChoice::required:
+            inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+            break;
+        case ChatToolChoice::none:
+            inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;
+            break;
+    }
+    switch (chat.continuation) {
+        case ChatContinuation::none:
+            inputs.continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
+            break;
+        case ChatContinuation::automatic:
+            inputs.continue_final_message = COMMON_CHAT_CONTINUATION_AUTO;
+            break;
+        case ChatContinuation::reasoning:
+            inputs.continue_final_message = COMMON_CHAT_CONTINUATION_REASONING;
+            break;
+        case ChatContinuation::content:
+            inputs.continue_final_message = COMMON_CHAT_CONTINUATION_CONTENT;
+            break;
+    }
+    inputs.json_schema = chat.json_schema;
+    inputs.chat_template_kwargs = chat.template_kwargs;
+    inputs.reasoning_format = tokenizer_reasoning_format(chat.reasoning_format);
+    inputs.enable_thinking = chat.enable_thinking;
+    inputs.add_generation_prompt = chat.add_generation_prompt;
+    return inputs;
+}
+
 } // namespace
 
 InferenceInputError::InferenceInputError(
@@ -420,18 +485,20 @@ InferenceRequest TextProcessor::prepare(
                 "chat input is missing", "messages");
         }
         auto& chat = *input.chat_input;
-        work.chat_parser.reasoning_format = chat.reasoning_format;
+        const auto reasoning_format =
+            tokenizer_reasoning_format(chat.reasoning_format);
+        work.chat_parser.reasoning_format = reasoning_format;
         work.chat_parser.reasoning_in_content =
-            input.stream && chat.reasoning_format ==
+            input.stream && reasoning_format ==
                 COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY;
         if (chat.preformatted_prompt) {
             prompt = *chat.preformatted_prompt;
             work.cache_plan.cache_output_tokens = true;
             work.chat_parser.parse_tool_calls = false;
-            if (!chat.template_inputs.json_schema.empty()) {
+            if (!chat.json_schema.empty()) {
                 common_chat_params constraint;
                 constraint.grammar = json_schema_to_grammar(
-                    json::parse(chat.template_inputs.json_schema));
+                    json::parse(chat.json_schema));
                 work.token_constraint = make_chat_token_constraint(
                     *impl_->tokenizer, constraint);
             }
@@ -442,7 +509,15 @@ InferenceRequest TextProcessor::prepare(
                     "the tokenizer has no chat template; provide input.preformatted_prompt",
                     "messages");
             }
-            auto inputs = std::move(chat.template_inputs);
+            common_chat_templates_inputs inputs;
+            try {
+                inputs = tokenizer_chat_input(chat);
+            } catch (const std::exception& error) {
+                throw InferenceInputError(
+                    InferenceInputErrorCode::Invalid,
+                    std::string("chat input parsing failed: ") + error.what(),
+                    "messages");
+            }
             if (chat.parallel_tool_calls) {
                 inputs.parallel_tool_calls = *chat.parallel_tool_calls;
             } else {
@@ -507,7 +582,7 @@ InferenceRequest TextProcessor::prepare(
     if (input.chat && input.chat_input &&
             normalized_identity(impl_->model_type).rfind(
                 "deepseek_v4", 0) == 0 &&
-            input.chat_input->template_inputs.add_generation_prompt) {
+            input.chat_input->add_generation_prompt) {
         const std::string marker = work.sampling.enable_thinking
             ? "<think>" : "</think>";
         const auto tokens = impl_->tokenizer->tokenize(marker, true);

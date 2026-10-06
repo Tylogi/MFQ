@@ -63,7 +63,7 @@ operations; do not add a universal type-erased tensor/KV layer, callback Engine,
 or per-backend generation loop. Backend operations must not publish request
 events or receive token emitters, cancellation callbacks or transport objects.
 
-CUDA exposes `include/mfq/cuda/engine.h` for Engine options and construction.
+CUDA exposes `include/cuda_engine.h` for Engine options and construction.
 Other headers live beside their owning implementation or in `kernels/` for
 kernel declarations. Internal consumers include those headers explicitly;
 internal include paths stay PRIVATE in CMake. Do not add forwarding headers

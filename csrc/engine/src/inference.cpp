@@ -7,6 +7,22 @@
 #include <utility>
 
 namespace mfq::engine {
+namespace {
+
+ToolCall public_tool_call(const common_chat_tool_call& value) {
+    return {value.name, value.arguments, value.id};
+}
+
+OutputDiff public_diff(common_chat_msg_diff value) {
+    return {
+        std::move(value.reasoning_content_delta),
+        std::move(value.content_delta),
+        value.tool_call_index,
+        public_tool_call(value.tool_call_delta),
+    };
+}
+
+} // namespace
 
 void InferenceMetrics::mark_prefill(const MfqPrefillTiming& timing) {
     prefill_tokens = timing.prompt_tokens;
@@ -50,7 +66,7 @@ void InferenceOutput::parse(std::string piece, bool partial, TokenOutput& output
     if (!request_.chat) {
         result.text += piece;
         if (!piece.empty()) {
-            common_chat_msg_diff diff;
+            OutputDiff diff;
             diff.content_delta = std::move(piece);
             output.diffs.push_back(std::move(diff));
         }
@@ -63,9 +79,9 @@ void InferenceOutput::parse(std::string piece, bool partial, TokenOutput& output
     parsed.set_tool_call_ids(tool_ids_, [&] {
         return "call_" + id_ + "_" + std::to_string(tool_ids_.size());
     });
-    auto diffs = common_chat_msg_diff::compute_diffs(message_, parsed);
-    output.diffs.insert(output.diffs.end(),
-        std::make_move_iterator(diffs.begin()), std::make_move_iterator(diffs.end()));
+    for (auto& diff : common_chat_msg_diff::compute_diffs(message_, parsed)) {
+        output.diffs.push_back(public_diff(std::move(diff)));
+    }
     message_ = std::move(parsed);
     result.text = message_.content;
     result.reasoning_text = message_.reasoning_content;

@@ -1,9 +1,10 @@
 #pragma once
 
+#include "engine.h"
+
 // Host-side MTP depth selection and chain verification shared by engines.
 // Inputs to distribution() have already received the sampler's penalties.
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -16,25 +17,10 @@
 
 namespace mfq::engine::mtp {
 
-inline constexpr int kMaximumDraftDepth = 5;
-
 struct ChainVerification {
     std::size_t accepted_drafts = 0;
     int32_t next_token = -1;
     bool bonus = false;
-};
-
-struct GenerationStats {
-    bool available = false;
-    bool used = false;
-    uint64_t cycles = 0;
-    uint64_t drafted_tokens = 0;
-    uint64_t accepted_tokens = 0;
-    std::array<uint64_t, kMaximumDraftDepth + 1> depth_cycles{};
-    std::array<uint64_t, kMaximumDraftDepth> position_drafted{};
-    std::array<uint64_t, kMaximumDraftDepth> position_accepted{};
-    std::array<double, kMaximumDraftDepth + 1> measured_depth_ms{};
-    int selected_depth = 0;
 };
 
 inline ChainVerification verify_greedy(

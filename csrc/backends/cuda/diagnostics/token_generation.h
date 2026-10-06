@@ -1,7 +1,7 @@
 #pragma once
 
 #include "generation_result.h"
-#include "mfq/cuda/engine.h"
+#include "cuda_engine.h"
 
 #include <cuda_profiler_api.h>
 #include <iostream>

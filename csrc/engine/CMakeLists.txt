@@ -27,6 +27,6 @@ if(TARGET mfq-tokenizer)
         ${PROJECT_SOURCE_DIR}/components/tokenizer
         ${PROJECT_SOURCE_DIR}/components/tokenizer/src
     )
-    target_link_libraries(mfq-engine PUBLIC mfq-tokenizer)
-    target_compile_definitions(mfq-engine PUBLIC MFQ_ENGINE_TEXT=1)
+    target_link_libraries(mfq-engine PRIVATE mfq-tokenizer)
+    target_compile_definitions(mfq-engine PRIVATE MFQ_ENGINE_TEXT=1)
 endif()

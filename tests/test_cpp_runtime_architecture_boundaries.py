@@ -477,7 +477,8 @@ def test_cuda_runtime_has_one_shared_generation_path() -> None:
     assert "using Generation = mfq::StepSequence<EventData>" in SHARED_GENERATION
     steps = (ROOT / "csrc/core/step_sequence.h").read_text()
     assert "enum class StepState { waiting, advanced, complete }" in steps
-    assert "ExecutionYield" not in (ROOT / "csrc/engine/include/mfq/engine.h").read_text()
+    assert not (ROOT / "csrc/engine/include/mfq").exists()
+    assert "ExecutionYield" not in (ROOT / "csrc/engine/include/engine.h").read_text()
     assert "step.state == StepState::advanced" in SHARED_EXECUTOR
     assert "ops.reset()" not in SHARED_EXECUTOR
     assert "current.output.cleanup_failure" in SHARED_EXECUTOR
@@ -634,7 +635,7 @@ def test_cuda_model_finalizers_live_with_their_models() -> None:
 
 def test_cuda_runtime_composes_transport_scheduler_and_engine() -> None:
     engine_contract = (
-        ROOT / "csrc" / "engine" / "include" / "mfq" / "engine.h"
+        ROOT / "csrc" / "engine" / "include" / "engine.h"
     ).read_text(encoding="utf-8")
     scheduler = (
         ROOT / "csrc" / "scheduler" / "include" / "scheduler.h"
@@ -1381,9 +1382,9 @@ def test_cuda_directories_and_native_target_have_explicit_owners() -> None:
 
     public = cuda / "include"
     assert {str(path.relative_to(public)) for path in public.rglob("*.h")} == {
-        "mfq/cuda/engine.h"
+        "cuda_engine.h"
     }
-    api = (public / "mfq/cuda/engine.h").read_text()
+    api = (public / "cuda_engine.h").read_text()
     assert "load_cuda_engine(CudaEngineOptions options)" in api
     for private in ("CudaExecutionContext", "CudaRuntimeConfig", "setup_cuda_load",
                     "native/", "kernels/", "storage/", "models/"):

@@ -27,19 +27,22 @@ std::size_t input_bytes(const EngineRequest& request) {
     for (const auto& stop : input.stops) strings(stop);
     if (input.chat_input) {
         const auto& chat = *input.chat_input;
-        const auto& value = chat.template_inputs;
         if (chat.preformatted_prompt) strings(*chat.preformatted_prompt);
-        strings(value.grammar, value.json_schema);
-        vectors(value.messages, value.tools);
-        fields(value.chat_template_kwargs);
-        for (const auto& message : value.messages) {
-            strings(message.role, message.content, message.reasoning_content, message.tool_name, message.tool_call_id);
+        strings(chat.json_schema);
+        vectors(chat.messages, chat.tools);
+        fields(chat.template_kwargs);
+        for (const auto& message : chat.messages) {
+            strings(message.role, message.content, message.reasoning_content,
+                    message.tool_name, message.tool_call_id);
             vectors(message.content_parts, message.tool_calls);
             fields(message.extra_fields);
-            for (const auto& part : message.content_parts) strings(part.type, part.text);
-            for (const auto& call : message.tool_calls) strings(call.name, call.arguments, call.id);
+            for (const auto& part : message.content_parts)
+                strings(part.type, part.text);
+            for (const auto& call : message.tool_calls)
+                strings(call.name, call.arguments, call.id);
         }
-        for (const auto& tool : value.tools) strings(tool.name, tool.description, tool.parameters);
+        for (const auto& tool : chat.tools)
+            strings(tool.name, tool.description, tool.parameters);
     }
     if (input.media) {
         const auto& m = *input.media;
@@ -58,7 +61,7 @@ std::size_t event_bytes(const EventData& data) {
         using T = std::decay_t<decltype(value)>;
         std::size_t bytes = sizeof(EngineEvent);
         if constexpr (std::is_same_v<T, OutputDelta>) {
-            bytes += value.token_ids.size() * sizeof(std::int64_t) + value.diffs.size() * sizeof(common_chat_msg_diff);
+            bytes += value.token_ids.size() * sizeof(std::int64_t) + value.diffs.size() * sizeof(mfq::engine::OutputDiff);
             for (const auto& diff : value.diffs) {
                 bytes += diff.content_delta.size() + diff.reasoning_content_delta.size();
                 bytes += diff.tool_call_delta.name.size() + diff.tool_call_delta.arguments.size() + diff.tool_call_delta.id.size();

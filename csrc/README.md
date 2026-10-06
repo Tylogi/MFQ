@@ -52,7 +52,7 @@ lifecycle. Backend operations own numerical execution and native resources;
 they do not receive output/cancellation callbacks or transport objects. Shared
 model and Engine code must not depend on concrete backend headers.
 
-CUDA's public header is `backends/cuda/include/mfq/cuda/engine.h`, containing
+CUDA's public header is `backends/cuda/include/cuda_engine.h`, containing
 load options and `load_cuda_engine()`. Tensor/context headers stay in `native/`,
 operator headers beside their sources in `ops/`, model plans in `models/`,
 and execution configuration in `engine/`. `kernels/` owns the shared CUDA

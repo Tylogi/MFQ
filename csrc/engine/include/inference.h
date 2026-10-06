@@ -1,6 +1,7 @@
 #pragma once
 
-#include "mfq/engine_types.h"
+#include "engine.h"
+#include "chat.h"
 #include "tokenizer.h"
 #include "text_emitter.h"
 

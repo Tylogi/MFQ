@@ -106,7 +106,8 @@ def test_cpp_runtime_dependencies_are_integrated() -> None:
 def test_engine_owns_native_gguf_jinja_template_and_common_parser() -> None:
     assert "common_chat_templates_apply" in ENGINE
     assert "common_chat_templates_apply" not in SERVER
-    assert "common_chat_msgs_parse_oaicompat" in SERVER
+    assert "common_chat_msgs_parse_oaicompat" not in ENGINE
+    assert "common_chat_msgs_parse_oaicompat" not in SERVER
     assert "common_chat_parse" in ENGINE
     assert "common_chat_msg_diff::compute_diffs" in ENGINE
     assert "common_chat_parse" not in SERVER
@@ -218,19 +219,6 @@ def test_dsv4_server_uses_exact_stable_prefix_kv_reuse() -> None:
 def test_server_validates_context_on_model_reload() -> None:
     assert 'server.Post("/runtime/reload"' in SERVER
     assert "context_size must be within the model context capacity" in SERVER
-
-
-def test_server_supports_structured_output_and_named_tool_choice() -> None:
-    assert "static std::string request_json_schema(const json & body)" in SERVER
-    assert 'body.contains("response_format")' in SERVER
-    assert 'type == "json_object"' in SERVER
-    assert 'type == "json_schema"' in SERVER
-    assert "inputs.json_schema = request_json_schema(body);" in SERVER
-    assert "tool_choice.is_object()" in SERVER
-    assert "named tool_choice must select a function name" in SERVER
-    assert "named tool_choice does not match any supplied tool" in SERVER
-    assert "inputs.tools = {*selected};" in SERVER
-    assert "inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED;" in SERVER
 
 
 def test_dsv4_template_preserves_message_extensions() -> None:

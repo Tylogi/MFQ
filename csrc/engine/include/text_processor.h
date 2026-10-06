@@ -1,7 +1,7 @@
 #pragma once
 
 #include "inference.h"
-#include "mfq/engine_types.h"
+#include "engine.h"
 
 #include <cstdint>
 #include <memory>

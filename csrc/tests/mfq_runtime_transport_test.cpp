@@ -60,7 +60,7 @@ struct FakeEngine final : Engine {
                 if (work.request.token_ids == std::vector<int64_t>{60} ||
                         work.request.token_ids == std::vector<int64_t>{61} ||
                         work.request.token_ids == std::vector<int64_t>{62}) {
-                    common_chat_msg_diff diff;
+                    OutputDiff diff;
                     const auto marker = work.request.token_ids.front();
                     diff.content_delta.assign(marker == 60 ? (work.steps == 2 ? 2000 : 6000)
                         : (marker == 61 ? 1024 : 8192), 'x');
@@ -172,7 +172,7 @@ void test_decode_timing() {
     metrics.first_token = now - 70ms;
     metrics.last_token = now - 20ms;
     metrics.saw_token = true;
-    InferenceResult result;
+    mfq::transport_detail::CompletionResult result;
     result.completion_tokens = 6;
     const auto values = mfq::transport_detail::request_metric_values(result, metrics);
     assert(std::abs(values.ttft_ms - 10.0) < 1e-12);
@@ -191,6 +191,45 @@ void test_decode_timing() {
     const auto empty = mfq::transport_detail::request_metric_values(result, InferenceMetrics{});
     assert(empty.decode_ms == 0.0 && empty.decode_tps == 0.0);
 }
+void test_chat_input_contract() {
+    using mfq::transport_detail::ApiError;
+    using mfq::transport_detail::json;
+    json body = {
+        {"messages", json::array({{{"role", "user"}, {"content", "hello"}}})},
+        {"tools", json::array({
+            {{"type", "function"}, {"function", {{"name", "lookup"}, {"description", "lookup"}, {"parameters", {{"type", "object"}}}}}},
+            {{"type", "function"}, {"function", {{"name", "other"}, {"parameters", {{"type", "object"}}}}}},
+        })},
+        {"tool_choice", {{"type", "function"}, {"function", {{"name", "lookup"}}}}},
+        {"response_format", {{"type", "json_schema"}, {"json_schema", {{"schema", {{"type", "object"}}}}}}},
+        {"reasoning_format", "deepseek"},
+        {"chat_template_kwargs", {{"mode", "strict"}}},
+    };
+    auto input = mfq::transport_detail::parse_input(
+        body, true, MfqSamplingParams{});
+    assert(input.chat_input);
+    const auto& chat = *input.chat_input;
+    assert(chat.messages.size() == 1);
+    assert(chat.messages[0].role == "user");
+    assert(chat.messages[0].content == "hello");
+    assert(chat.tools.size() == 1);
+    assert(chat.tools[0].name == "lookup");
+    assert(chat.tool_choice == ChatToolChoice::required);
+    assert(json::parse(chat.json_schema)["type"] == "object");
+    assert(chat.reasoning_format == ReasoningFormat::deepseek);
+    assert(chat.template_kwargs.at("mode") == "\"strict\"");
+
+    body["tool_choice"]["function"]["name"] = "missing";
+    bool rejected = false;
+    try {
+        (void) mfq::transport_detail::parse_input(
+            body, true, MfqSamplingParams{});
+    } catch (const ApiError& error) {
+        rejected = error.status == 400 && error.param == "tool_choice";
+    }
+    assert(rejected);
+}
+
 static void check_input_ownership_and_budget() {
     FakeEngine engine;
     engine.defer = true;
@@ -296,6 +335,7 @@ int main(int argc, char** argv) {
     check_input_ownership_and_budget();
     test_model_capabilities();
     test_decode_timing();
+    test_chat_input_contract();
     {
         FakeEngine engine;
         MfqScheduler scheduler(engine, {8, 4096});

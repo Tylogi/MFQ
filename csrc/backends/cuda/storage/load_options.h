@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mfq/cuda/engine.h"
+#include "cuda_engine.h"
 
 #include <functional>
 
