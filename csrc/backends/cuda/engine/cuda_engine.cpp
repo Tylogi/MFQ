@@ -372,6 +372,7 @@ struct CudaBackend {
             });
         return visit([&](auto& state) {
             EngineInfo info;
+            info.backend = "cuda";
             info.max_requests = state.available();
             info.max_context = state.language.max_position_embeddings();
             info.vocab_size = static_cast<int32_t>(state.language.vocab_size());

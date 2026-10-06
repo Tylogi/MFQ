@@ -190,8 +190,14 @@ def test_generation_protocol_through_framing_adapters(transport: str) -> None:
             stderr=asyncio.subprocess.DEVNULL,
         )
         def http(op: str, params: dict) -> list[dict]:
-            data = json.dumps(params).encode() if op == "generate" else None
-            request = Request(f"http://127.0.0.1:{port}/runtime/{op}", data=data,
+            path = {"session.fork": "sessions/fork", "cache.clear": "cache/clear",
+                    "cache.trim": "cache/trim", "realtime.capabilities": "realtime/capabilities"}.get(op, op)
+            method = "GET" if op in {"health", "status", "models", "realtime.capabilities"} else "POST"
+            if op in {"session.close", "session.cancel"}:
+                path = f"sessions/{params['session_id']}" + ("/cancel" if op == "session.cancel" else "")
+                method = "DELETE" if op == "session.close" else "POST"
+            data = json.dumps(params).encode() if method == "POST" else None
+            request = Request(f"http://127.0.0.1:{port}/runtime/{path}", data=data, method=method,
                               headers={"Content-Type": "application/json"})
             try:
                 with urlopen(request, timeout=2) as response:
@@ -269,6 +275,29 @@ def test_generation_protocol_through_framing_adapters(transport: str) -> None:
             assert status["active_requests"] == 0
             assert status["total_requests"] == 3 and status["failed_requests"] == 1
             assert status["test_health_only"] == 99 and status["test_session_only"] == 99
+            forked, = await invoke("fork", "session.fork", {"source_session_id": "a", "target_session_id": "b"})
+            assert forked["copied_snapshots"] == 7
+            closed, = await invoke("close-session", "session.close", {"session_id": "a"})
+            assert closed["released_snapshots"] == 7
+            for op, invalid in [("session.fork", {"source_session_id": "a", "target_session_id": "a"}),
+                                ("session.fork", {"source_session_id": "../bad", "target_session_id": "b"}),
+                                ("cache.trim", {"target_bytes": -1}),
+                                ("reload", {"context_size": (1 << 64) - 1}),
+                                ("reload", {"context_size": 129})]:
+                rejected, = await invoke("rejected-control", op, invalid)
+                assert rejected["error"]["status_code"] == 400 and rejected["error"]["type"] == "invalid_request_error"
+            cleared, = await invoke("clear", "cache.clear")
+            assert cleared["released_snapshots"] == 7 and cleared["test_session_only"] == 99
+            trimmed, = await invoke("trim", "cache.trim", {"target_bytes": (1 << 64) - 1})
+            assert trimmed["released_bytes"] == 7 and trimmed["target_bytes"] == (1 << 64) - 1
+            loaded, = await invoke("reload", "reload", {"context_size": 64})
+            assert loaded["max_context"] == 64
+            health, = await invoke("health", "health")
+            assert health["max_context"] == 64 and health["status"] == "ok"
+            failed, = await invoke("reload-failed", "reload", {"context_size": 13})
+            assert failed["error"]["status_code"] == 500
+            health, = await invoke("after-failed-reload", "health")
+            assert health["status"] != "loading" and health["max_context"] == 64
         finally:
             if process.returncode is None:
                 process.terminate()
@@ -357,6 +386,14 @@ def test_websocket_duplex_disconnect_interrupts_pending_control() -> None:
             await connection.send(json.dumps({"type": "session.init"}))
             created = json.loads(await asyncio.wait_for(connection.recv(), 2))
             assert created["type"] == "session.created", created
+            await connection.send(json.dumps({"type": "input.append", "input": {
+                "text": "hello", "max_new_speak_tokens": 2,
+            }}))
+            outputs = [json.loads(await asyncio.wait_for(connection.recv(), 2)) for _ in range(3)]
+            assert [frame.get("kind", frame["type"]) for frame in outputs] == ["text", "audio_tokens", "response.step.done"]
+            assert outputs[0]["text"] == "hello" and outputs[1]["audio_tokens"] == [4, 5]
+            assert outputs[1]["force_flush"]
+            assert all(frame["session_id"] == created["session_id"] for frame in outputs)
             await connection.send(json.dumps({"type": "input.append", "input": {
                 "text": "hello", "max_new_speak_tokens": 1000,
             }}))

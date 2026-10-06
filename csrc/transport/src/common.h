@@ -4,6 +4,7 @@
 
 #include "nlohmann/json.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -11,6 +12,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -123,6 +125,32 @@ MfqMultimodalInput parse_mfq_vision(const json & value);
 std::vector<float> decode_audio_features(
     const std::string & encoded,
     int32_t frames);
+
+// Shared control and realtime protocol. Connection identity/framing belongs to
+// the Adapter; session state, validation and Scheduler commands live here.
+class RuntimeProtocol {
+public:
+    RuntimeProtocol(const MfqScheduler& scheduler, MfqRuntimeTransportConfig config);
+    json call(const std::string& operation, const json& params = json::object());
+    RuntimeRequestMetrics& request_metrics() { return metrics_; }
+    void open_realtime(std::string channel, const std::string& mode = "audio");
+    bool close_realtime(const std::string& channel = {}, const std::string& session = {});
+    std::vector<json> realtime_message(const std::string& channel, const json& body);
+    json realtime_closed(const std::string& channel, const std::string& reason,
+                         const std::string& message) const;
+private:
+    json snapshot(bool health) const;
+    void add_session_metrics(json& value) const;
+    const MfqScheduler& scheduler_;
+    MfqRuntimeTransportConfig config_;
+    RuntimeRequestMetrics metrics_;
+    std::atomic<int64_t> context_;
+    std::atomic<bool> reloading_{false};
+    mutable std::mutex realtime_gate_;
+    std::string channel_, session_;
+    std::unordered_set<int64_t> control_tokens_;
+    bool backend_started_ = false, pending_ = false;
+};
 
 // Shared generation protocol. Adapters only frame these values and signal a
 // failed write with cancel(). Destruction cancels unfinished work and accounts

@@ -6,6 +6,7 @@ add_library(mfq-runtime-communication STATIC
     include/transport.h
     src/common.cpp
     src/common.h
+    src/protocol.cpp
     src/http.cpp
     src/stdio.cpp
 )

@@ -21,9 +21,15 @@ struct FakeEngine final : Engine {
     int control_limit = 0;
     std::thread::id owner;
     bool fail = false, supports_duplex = false;
+    MfqDuplexSessionParams last_parameters;
     std::atomic<bool> defer{false};
     std::atomic<const float*> media{nullptr};
-    EngineInfo info() const override { return {2, 128, 64, false, supports_duplex, true, {}}; }
+    EngineInfo info() const override {
+        EngineInfo info{2, 128, 64, false, supports_duplex, true, {}};
+        info.backend = "fake";
+        info.chat = {true, {"low", "high"}};
+        return info;
+    }
     void check_thread() {
         if (owner == std::thread::id{}) owner = std::this_thread::get_id();
         assert(owner == std::this_thread::get_id());
@@ -114,7 +120,11 @@ struct FakeEngine final : Engine {
             ++control_steps;
             result.control_advanced = true;
             if (control_steps >= control_limit) {
-                result.control = initializing ? ControlCompletion{std::monostate{}} : ControlCompletion{MfqDuplexStepResult{}};
+                MfqDuplexStepResult output;
+                output.generated_tokens = {1, 2, 3};
+                output.audio_tokens = {4, 5};
+                output.end_of_turn = output.tts_force_flush = true;
+                result.control = initializing ? ControlCompletion{std::monostate{}} : ControlCompletion{std::move(output)};
                 control_pending = false;
                 ++control_terminals;
             }
@@ -134,14 +144,17 @@ struct FakeEngine final : Engine {
         check_thread();
         if (std::holds_alternative<RuntimeMetrics>(request)) return Metrics{{"test_health_only", 99}};
         if (auto* prepare = std::get_if<PrepareDuplex>(&request)) {
+            last_parameters = prepare->parameters;
             prepare->parameters.special_ids.assign(15, 1);
             return std::move(prepare->parameters);
         }
         if (auto* prepare = std::get_if<PrepareDuplexStep>(&request)) {
+            if (prepare->text == "invalid") throw InferenceInputError(InferenceInputErrorCode::Invalid, "invalid text");
             prepare->input.text_tokens = {1};
             return std::move(prepare->input);
         }
-        if (std::holds_alternative<DecodeTokens>(request)) return std::string{};
+        if (auto* decode = std::get_if<DecodeTokens>(&request))
+            return decode->tokens.empty() ? std::string{} : std::string{"hello"};
         if (std::holds_alternative<StopDuplex>(request)) { control_stop = true; return std::monostate{}; }
         assert(!control_pending);
         initializing = std::holds_alternative<MfqDuplexSessionParams>(request);
@@ -355,6 +368,80 @@ static void check_generation_protocol() {
     assert(counts["total_requests"] == 2 && counts["failed_requests"] == 2);
 }
 
+static void check_control_protocol() {
+    using namespace mfq::transport;
+    FakeEngine engine;
+    engine.supports_duplex = true;
+    MfqScheduler scheduler(engine);
+    MfqRuntimeTransportConfig config;
+    config.max_context = 128;
+    RuntimeProtocol protocol(scheduler, config);
+    const auto health = protocol.call("health");
+    assert(health["status"] == "ok");
+    assert(health["chat_template_capabilities"]["thinking"]["supported"] == true);
+    assert(health["chat_template_capabilities"]["reasoning_effort"]["values"] == json::array({"low", "high"}));
+    assert(protocol.call("status")["test_session_only"] == 99);
+    assert(protocol.call("health")["test_health_only"] == 99);
+    assert(protocol.call("session.fork", {{"source_session_id", "a"}, {"target_session_id", "b"}})["copied_snapshots"] == 7);
+    assert(protocol.call("session.close", {{"session_id", "a"}})["released_snapshots"] == 7);
+    assert(protocol.call("cache.clear")["released_snapshots"] == 7);
+    assert(protocol.call("cache.trim", {{"target_bytes", uint64_t(-1)}})["target_bytes"] == uint64_t(-1));
+    assert(protocol.call("reload", {{"context_size", 64}})["max_context"] == 64);
+    assert(protocol.call("status")["max_context"] == 64);
+    const auto invalid = [&](auto work, int status = 400) {
+        bool rejected = false;
+        try { work(); }
+        catch (const ApiError& error) { rejected = error.status == status; }
+        assert(rejected);
+    };
+    invalid([&] { protocol.call("cache.trim", {{"target_bytes", -1}}); });
+    invalid([&] { protocol.call("session.fork", {{"source_session_id", "a"}, {"target_session_id", "a"}}); });
+    invalid([&] { protocol.call("session.close", {{"session_id", "../unsafe"}}); });
+    invalid([&] { protocol.call("reload", {{"context_size", uint64_t(-1)}}); });
+    invalid([&] { protocol.call("reload", {{"context_size", 129}}); });
+    protocol.open_realtime("channel");
+    invalid([&] { protocol.open_realtime("peer"); }, 409);
+    invalid([&] { protocol.realtime_message("channel", {{"type", "input.append"}, {"input", {{"text", "hello"}}}}); }, 409);
+    invalid([&] { protocol.realtime_message("channel", {{"type", "session.init"}, {"payload", {{"config", {{"top_k", int64_t(1) << 32}}}}}}); });
+    auto events = protocol.realtime_message("channel", {{"type", "session.init"}});
+    assert(events.size() == 1 && events[0]["type"] == "session.created");
+    const auto session = events[0]["session_id"].get<std::string>();
+    assert(events[0]["metrics"]["backend"] == "fake");
+    assert(engine.last_parameters.top_k == 100 && engine.last_parameters.length_penalty == 1.0);
+    assert(engine.last_parameters.tts_temperature == 0.8 && engine.last_parameters.tts_repetition_penalty == 1.05);
+    assert(protocol.call("health")["duplex_active"] == true);
+    invalid([&] { protocol.realtime_message("channel", {{"type", "input.append"}, {"input", {{"text", "hello"}, {"force_listen", 1}}}}); });
+    events = protocol.realtime_message("channel", {{"type", "input.append"}, {"input", {{"text", "hello"}, {"max_new_speak_tokens", 2}}}});
+    assert(events.size() == 3);
+    assert(events[0]["kind"] == "text" && events[0]["text"] == "hello");
+    assert(events[1]["kind"] == "audio_tokens" && events[1]["force_flush"] == true);
+    assert(events[2]["type"] == "response.step.done");
+    for (const auto& event : events) {
+        assert(event["session_id"] == session && event.contains("server_send_ts"));
+        assert(event["response_id"] == events[0]["response_id"]);
+    }
+    assert(!protocol.close_realtime({}, "not-this-session"));
+    assert(protocol.close_realtime({}, session) && !protocol.close_realtime("channel"));
+    protocol.open_realtime("channel");
+    protocol.realtime_message("channel", {{"type", "session.init"}});
+    bool failed = false;
+    try { protocol.realtime_message("channel", {{"type", "input.append"}, {"input", {{"text", "invalid"}}}}); }
+    catch (const InferenceInputError&) { failed = true; }
+    assert(failed && protocol.call("health")["duplex_active"] == false);
+    protocol.open_realtime("after-error");
+    assert(protocol.close_realtime("after-error"));
+    config.runtime_profile.duplex.top_k = 17;
+    config.runtime_profile.duplex.length_penalty = 1.25;
+    config.runtime_profile.tts.temperature = 0.5;
+    RuntimeProtocol profiled(scheduler, config);
+    profiled.open_realtime("profiled");
+    profiled.realtime_message("profiled", {{"type", "session.init"}, {"payload", {{"config", {{"tts_repetition_penalty", 1.2}, {"seed", uint64_t(-1)}}}}}});
+    assert(engine.last_parameters.top_k == 17 && engine.last_parameters.length_penalty == 1.25);
+    assert(engine.last_parameters.tts_temperature == 0.5 && engine.last_parameters.tts_repetition_penalty == 1.2);
+    assert(engine.last_parameters.seed == uint64_t(-1));
+    assert(profiled.close_realtime("profiled"));
+}
+
 static void check_input_ownership_and_budget() {
     FakeEngine engine;
     engine.defer = true;
@@ -457,6 +544,7 @@ int main(int argc, char** argv) {
         return make_mfq_http_transport(config)->run(scheduler);
     }
     check_duplex_preemption();
+    check_control_protocol();
     check_input_ownership_and_budget();
     test_model_capabilities();
     test_decode_timing();

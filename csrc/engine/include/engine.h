@@ -203,6 +203,7 @@ struct EngineInfo {
     ChatTemplateCapabilities chat;
     std::string model_type;
     ModelCapabilities capabilities;
+    std::string backend;
 };
 struct EngineStatus {
     std::size_t available = 0;

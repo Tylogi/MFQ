@@ -364,8 +364,6 @@ def test_minicpmo45_cuda_duplex_uses_runtime_profile_tts_sampling():
     assert "double tts_temperature = 0.8" in GRAPH
     assert "double tts_repetition_penalty = 1.05" in GRAPH
     assert "tts_temperature, tts_repetition_penalty" in GRAPH
-    assert 'number_field(\n                            generation, "tts_temperature"' in SERVER_SOURCE
-    assert 'number_field(\n                            generation, "tts_repetition_penalty"' in SERVER_SOURCE
 
 
 def test_minicpmo45_eval_batch_matches_pr_tts_sampler_and_optional_media():
@@ -481,9 +479,6 @@ def test_minicpmo45_metal_duplex_tracks_all_cache_lifetimes():
 def test_minicpmo45_realtime_uses_official_demo_defaults():
     assert "int32_t top_k = 100" in SERVER_HEADER
     assert "double length_penalty = 1.0" in SERVER_HEADER
-    assert "duplex_defaults.top_k.value_or(100)" in SERVER_SOURCE
-    assert "duplex_defaults.length_penalty.value_or(1.0)" in SERVER_SOURCE
-    assert "std::random_device random" in SERVER_SOURCE
     assert "std::int32_t top_k = 100" in METAL_HEADER
     assert "double length_penalty = 1.0" in METAL_HEADER
     assert "config.length_penalty" in METAL_GRAPH
@@ -498,6 +493,4 @@ def test_minicpmo45_realtime_preserves_official_first_tts_flush():
     assert "tts_force_flush" in METAL_HEADER
     assert "first_tts_chunk" in METAL_GRAPH
     assert "end_of_turn || first_tts_chunk ? 0 : 26" in METAL_GRAPH
-    assert '{"force_flush", result.tts_force_flush}' in SERVER_SOURCE
-    assert "result.end_of_turn && !result.is_listen" in SERVER_SOURCE
     assert "force_flush=bool(event.get(\"force_flush\", False))" in REALTIME_GATEWAY

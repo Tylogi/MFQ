@@ -7,6 +7,7 @@ MlxEngine::MlxEngine(std::unique_ptr<MlxEngineModel> model,
     std::unique_ptr<TextProcessor> text, EngineInfo info)
     : model_(std::move(model)), text_(std::move(text)), info_(std::move(info)) {
     if (!model_ || !text_) throw std::invalid_argument("Metal engine requires model and tokenizer");
+    info_.backend = "metal";
     info_.max_requests = 1;
     info_.chat = text_->chat_template_capabilities();
 }

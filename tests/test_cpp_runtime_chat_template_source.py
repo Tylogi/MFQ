@@ -158,18 +158,6 @@ def test_server_enforces_complete_chat_template_tool_calls() -> None:
     assert "constraint_cursor->accept(result.next_token);" in DECODE
 
 
-def test_native_server_cancels_active_session_between_steps() -> None:
-    assert 'R"(/runtime/sessions/([A-Za-z0-9._:-]{1,128})/cancel)"' in SERVER
-    assert "scheduler.cancel_session(session_id)" in SERVER
-    assert "if (request.admitted) engine_.cancel(request.id);" in SCHEDULER
-    assert 'result.finish_reason = "cancelled"' in ENGINE
-    assert "else if (!result.tool_calls.empty())" in ENGINE
-    assert "cancel_requested" not in SERVER
-    assert "work.cache_plan.stable_prefix_tokens = 0;" not in SERVER
-    assert "engine_.step(eligible)" in SCHEDULER
-    assert "request.cache_plan = {};" not in SCHEDULER
-
-
 def test_server_links_integrated_text_runtime() -> None:
     assert "add_subdirectory(components/tokenizer)" in CMAKE
     assert "add_library(mfq-tokenizer STATIC" in TOKENIZER_CMAKE
@@ -192,13 +180,6 @@ def test_cuda_runtime_accepts_an_external_tokenizer_only() -> None:
     assert "transport_config.tokenizer_model" not in DECODE
 
 
-def test_server_publishes_template_gated_reasoning_effort() -> None:
-    assert "chat_template_capabilities_json" in SERVER
-    assert '{"chat_template_capabilities", chat_template_capabilities}' in SERVER
-    assert 'source.find("enable_thinking")' in ENGINE
-    assert 'chat_template.find("enable_thinking")' not in SERVER
-
-
 def test_native_server_does_not_bundle_or_mount_a_webui() -> None:
     assert "mfq-web-assets" not in CMAKE
     assert "Copying MFQ WebUI assets" not in METAL_CMAKE
@@ -214,11 +195,6 @@ def test_dsv4_server_uses_exact_stable_prefix_kv_reuse() -> None:
     assert 'work.sampling.enable_thinking\n            ? "<think>" : "</think>"' in ENGINE
     assert "stable_prefix_tokens" in ENGINE
     assert '{"prefill_tokens", values.prefill_tokens}' in SERVER
-
-
-def test_server_validates_context_on_model_reload() -> None:
-    assert 'server.Post("/runtime/reload"' in SERVER
-    assert "context_size must be within the model context capacity" in SERVER
 
 
 def test_dsv4_template_preserves_message_extensions() -> None:

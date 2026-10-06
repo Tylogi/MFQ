@@ -419,8 +419,10 @@ static std::optional<std::string> request_preformatted_prompt(
 
 int64_t integer_field(const json & body, const char * name, int64_t fallback) {
     if (!body.contains(name) || body[name].is_null()) return fallback;
-    if (!body[name].is_number_integer()) {
-        throw ApiError(400, "invalid_request_error", std::string(name) + " must be an integer", name);
+    if (!body[name].is_number_integer() ||
+            (body[name].is_number_unsigned() &&
+             body[name].get<uint64_t>() > uint64_t(std::numeric_limits<int64_t>::max()))) {
+        throw ApiError(400, "invalid_request_error", std::string(name) + " must be a signed 64-bit integer", name);
     }
     return body[name].get<int64_t>();
 }
