@@ -3,7 +3,8 @@
 #include "../ops/cuda_execution.h"
 #include "generation.h"
 #include "model_registry.h"
-#include "qwen_batching.h"
+#include "batch_execution.h"
+#include "models/qwen35/batch_state.h"
 #include "storage/weight_loader.h"
 #include "storage/text_session_cache.h"
 #include "mtp_metrics.h"
@@ -20,8 +21,9 @@ using namespace mfq::engine;
 using namespace mfq::cuda::internal;
 
 namespace internal {
-template <typename Model>
+template <typename Model, class Batch = std::monostate, class RequestState = std::monostate>
 struct CudaEngineState {
+    static constexpr bool supports_batch = !std::is_same_v<Batch, std::monostate>;
     std::shared_ptr<CudaExecutionContext> execution;
     CudaRuntimeConfig config;
     Model model;
@@ -29,7 +31,7 @@ struct CudaEngineState {
     Model& language;
     DecodeGraphCache graph;
     TextSessionCache cache;
-    std::unique_ptr<ContinuousBatch<QwenBatchOperations>> batching;
+    std::unique_ptr<Batch> batching;
     bool duplex_active = false, duplex_pending = false, duplex_stop = false;
     mfq::StepSequence<ControlCompletion> duplex_sequence;
     std::optional<AdmissionBudget::Lease> duplex_memory;
@@ -87,22 +89,22 @@ struct CudaEngineState {
               make_cuda_paged_prefix_cache(*language.source, language.max_position_embeddings(),
                   language.supports_paged_text_session_state(), config.prefix_cache),
                 language.supports_text_session_state(), language.supports_text_session_state() ? 0 : 1) {
+        if (config.continuous_batch.max_sequences && !supports_batch)
+            throw std::invalid_argument("continuous batching is unavailable for this model");
         prepare_memory(memory_limit);
-        if (config.continuous_batch.max_sequences) {
-            if constexpr (std::is_same_v<Model, Qwen35CausalLm>)
-                batching = std::make_unique<ContinuousBatch<QwenBatchOperations>>(
-                    config.generation.prefill_chunk_size, config.continuous_batch.prefill_token_budget,
-                    language, *execution, config.continuous_batch);
-            else throw std::invalid_argument("continuous batching is unavailable for this model");
+        if constexpr (supports_batch) {
+            if (config.continuous_batch.max_sequences)
+                batching = std::make_unique<Batch>(config.generation.prefill_chunk_size,
+                    config.continuous_batch.prefill_token_budget, language, *execution, config.continuous_batch);
         }
     }
-    bool can_batch(const EngineRequest&) const {
+    bool can_overlap(const EngineRequest&) const {
         return bool(batching);
     }
     bool exclusive() const { return duplex_active; }
     bool mtp_available() const { return bool(components.mtp); }
     void execute(const std::vector<RequestId>& eligible) {
-        if (batching) batching->step(eligible);
+        if constexpr (supports_batch) if (batching) batching->step(eligible);
     }
     using Prepared = CudaPreparedPrompt;
     mfq::StepSequence<Prepared> prepare(InferenceRequest& input) {
@@ -118,21 +120,22 @@ struct CudaEngineState {
     }
     Generation generate_text(InferenceRequest& input, InferenceOutput& output, std::optional<Prepared> prepared,
                              const RequestId& id, bool batched) {
-        return internal::generate(language, graph, cache, config,
-                                  input, output, batched ? nullptr : components.mtp.get(), std::move(prepared),
-                                  batched ? batching.get() : nullptr, id);
+        std::optional<Generation> physical;
+        if constexpr (supports_batch) if (batched) physical.emplace(batching->generate(id, input, output));
+        return internal::generate(language, graph, cache, config, input, output,
+                                  components.mtp.get(), std::move(prepared), std::move(physical));
     }
     Generation generate(const RequestId& id, ExecutionRequest& request) {
-        if constexpr (std::is_same_v<Model, Qwen35CausalLm>) {
-            if (request.batched && qwen_batch_requires_owned_generation(
-                    request.input, cache, bool(components.mtp)))
-                return generate_owned(id, request);
+        if (request.concurrent && batch_requires_owned_generation(request.input, cache, bool(components.mtp))) {
+            if constexpr (!std::is_same_v<RequestState, std::monostate>) return generate_owned(id, request);
+            else throw InferenceInputError(InferenceInputErrorCode::Unsupported,
+                "this request requires independent native state for concurrent execution");
         }
-        return generate_prepared(*this, request.input, request.output, id, request.batched);
+        return generate_prepared(*this, request.input, request.output, id, request.concurrent);
     }
     Generation generate_owned(const RequestId& id, ExecutionRequest& request)
-        requires std::is_same_v<Model, Qwen35CausalLm> {
-        qwen35::Qwen35GenerationState native(language, components.mtp.get());
+        requires (!std::is_same_v<RequestState, std::monostate>) {
+        RequestState native(language, components.mtp.get());
         DecodeGraphCache request_graph(language.max_position_embeddings());
         struct Ops {
             using Prepared = CudaPreparedPrompt;
@@ -143,9 +146,9 @@ struct CudaEngineState {
                 return owner.advance_preparation(sequence);
             }
             Generation generate_text(InferenceRequest &input, InferenceOutput &output,
-                    std::optional<Prepared> prepared, const RequestId &id, bool) {
+                    std::optional<Prepared> prepared, const RequestId&, bool) {
                 return internal::generate(owner.language, graph, owner.cache, owner.config,
-                    input, output, owner.components.mtp.get(), std::move(prepared), nullptr, id);
+                    input, output, owner.components.mtp.get(), std::move(prepared));
             }
         } ops{*this, request_graph};
         // A suspended coroutine never leaves its state attached to shared weights.
@@ -226,7 +229,7 @@ struct CudaEngineState {
                 metrics.emplace_back(prefix + "_request_bytes", request_bytes[device]);
             }
             if (components.mtp) mtp::append_generation_metrics(metrics, components.mtp->last_stats);
-            if (batching) {
+            if constexpr (supports_batch) if (batching) {
                 auto batch = batching->metrics(); metrics.insert(metrics.end(), batch.begin(), batch.end());
             }
             return metrics;
@@ -259,7 +262,14 @@ struct CudaEngineState {
 } // namespace internal
 
 namespace {
-using State = CudaModelStates<CudaEngineState>;
+// Concrete execution types are selected only here, at composition. Neither
+// the generation interface nor the shared batch policy knows a model family.
+template <class Model> using BoundState = std::conditional_t<
+    std::is_same_v<Model, Qwen35CausalLm>,
+    CudaEngineState<Model, ContinuousBatch<CudaBatchExecution<Model>>,
+                    qwen35::Qwen35GenerationState>,
+    CudaEngineState<Model>>;
+using State = CudaModelStates<BoundState>;
 
 struct CudaBackend {
     using Options = CudaEngineOptions;
@@ -284,7 +294,7 @@ struct CudaBackend {
         state = with_loaded_cuda_model(*execution, options, true,
             [&](auto& model, auto& components, auto, auto) -> State {
                 using Model = std::decay_t<decltype(model)>;
-                return std::make_unique<CudaEngineState<Model>>(execution, std::move(model), std::move(components), config, options.memory_budget_bytes);
+                return std::make_unique<BoundState<Model>>(execution, std::move(model), std::move(components), config, options.memory_budget_bytes);
             });
         return visit([&](auto& state) {
             EngineInfo info;

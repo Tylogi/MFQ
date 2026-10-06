@@ -247,27 +247,26 @@ template <class Model> struct CudaGenerationContext {
     const CudaRuntimeConfig &config;
     MtpModule *mtp;
     std::optional<CudaPreparedPrompt> prepared;
-    mfq::engine::ContinuousBatch<QwenBatchOperations>* batching;
-    std::string request_id;
+    std::optional<Generation> execution;
 
-    bool batched() const { return batching != nullptr; }
+    bool batched() const { return execution.has_value(); }
     void invalidate_plan() { graph.invalidate(); }
     bool has_hidden(const Hidden &value) const { return value.defined(); }
     void reset() {
-        if (batching) return;
+        if (execution) return;
         model.reset(1);
         if (mtp)
             mtp->reset(1);
     }
     void release() {
-        if (batching) return; // Each row owns its slot cleanup.
+        if (execution) return; // The supplied sequence owns its native cleanup.
         try { reset(); }
         catch (...) { graph.invalidate(); throw; }
         if (std::uncaught_exceptions()) graph.invalidate();
     }
     Generation plain(mfq::engine::InferenceRequest& input, mfq::engine::InferenceOutput& output,
                      size_t reused, size_t stable) {
-        if (batching) return batching->generate(request_id, input, output);
+        if (execution) return std::move(*execution);
         return mfq::engine::generate_sequence(
             CudaGenerationOps<Model>(model, graph, input, prepared ? &*prepared : nullptr, config.decode_graph),
             output, input.prompt.size(), reused, stable, config.generation.prefill_chunk_size);
@@ -291,10 +290,10 @@ Generation generate(Model &model, DecodeGraphCache &graph, TextSessionCache &cac
     const CudaRuntimeConfig &config, mfq::engine::InferenceRequest &request,
     mfq::engine::InferenceOutput &output, MtpModule *mtp,
     std::optional<CudaPreparedPrompt> prepared,
-    mfq::engine::ContinuousBatch<QwenBatchOperations>* batching, std::string request_id) {
+    std::optional<Generation> execution) {
     return mfq::engine::generate_request(
-        CudaGenerationContext<Model>{model, graph, cache, config, mtp, std::move(prepared), batching,
-                                     std::move(request_id)},
+        CudaGenerationContext<Model>{model, graph, cache, config, execution ? nullptr : mtp,
+                                     std::move(prepared), std::move(execution)},
         request,
         output);
 }
@@ -308,7 +307,7 @@ Generation generate(Model &model, DecodeGraphCache &graph, TextSessionCache &cac
         mfq::engine::InferenceOutput &,                                                            \
         MtpModule *,                                                                               \
         std::optional<CudaPreparedPrompt>,                                                         \
-        mfq::engine::ContinuousBatch<QwenBatchOperations>*, std::string);
+        std::optional<Generation>);
 MFQ_INSTANTIATE_FLOW(mfq::cuda::Qwen35CausalLm)
 MFQ_INSTANTIATE_FLOW(mfq::cuda::MiniCPMO45CausalLm)
 MFQ_INSTANTIATE_FLOW(mfq::cuda::MiniCPMOTtsCausalLm)

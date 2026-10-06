@@ -29,7 +29,8 @@ template <class Cache> SessionResult control_session(Cache &cache, const Session
     throw std::invalid_argument("unknown session command");
 }
 
-// Serial and batched execution write into the same request state. Only the
+// Serial, independent-state and physically batched execution share request
+// state. Concurrent admission does not imply physical batching. Only the
 // executor drains events and finishes the request after device cleanup.
 struct ExecutionRequest {
     std::optional<AdmissionBudget::Lease> memory;
@@ -42,7 +43,7 @@ struct ExecutionRequest {
     std::shared_ptr<std::atomic<bool>> stop = std::make_shared<std::atomic<bool>>(false);
     EngineInfo limits;
     std::exception_ptr failure;
-    bool started = false, batched = false, done = false;
+    bool started = false, concurrent = false, done = false;
 
     ExecutionRequest(InferenceRequest prepared, const MfqTokenizer *tokenizer, const RequestId &id)
         : input(std::move(prepared)), output(input, tokenizer, id) {}
@@ -70,7 +71,7 @@ class RequestExecutor {
         if (exclusive)
             return {0, true};
         for (const auto &[id, request] : requests_)
-            if (!request->batched)
+            if (!request->concurrent)
                 return {0, true};
         return {capacity_ - requests_.size(), true};
     }
@@ -80,8 +81,12 @@ class RequestExecutor {
         EngineRequest&& request, std::shared_ptr<const TextProcessor> text, const EngineInfo &info, Ops &ops) {
         if (requests_.contains(request.id))
             throw std::invalid_argument("duplicate request ID");
-        const bool batched = ops.can_batch(request);
-        if (!status(ops.exclusive()).available || (!batched && !empty()))
+        // Concurrent admission is opt-in; backends without this capability
+        // remain serial without changing their native interfaces.
+        bool concurrent = false;
+        if constexpr (requires { ops.can_overlap(request); })
+            concurrent = ops.can_overlap(request);
+        if (!status(ops.exclusive()).available || (!concurrent && !empty()))
             return Admission::deferred;
         std::optional<AdmissionBudget::Lease> memory;
         if constexpr (requires { ops.reserve(request); }) {
@@ -111,7 +116,7 @@ class RequestExecutor {
             std::move(input), tokenizer, request.id);
         if (memory) current->memory.emplace(std::move(*memory));
         current->output.metrics.mtp.available = ops.mtp_available();
-        current->batched = batched;
+        current->concurrent = concurrent;
         if (!raw) {
             current->unprepared = std::move(request.input);
             current->text = std::move(text);

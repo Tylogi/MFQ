@@ -75,6 +75,7 @@ def test_cuda_engine_is_the_only_cross_family_composition_root() -> None:
         if path.suffix in {".h", ".cpp", ".tpp"}:
             assert not family_include.search(path.read_text(encoding="utf-8")), path
     assert not (models / "qwen35" / "batching.cpp").exists()
-    assert (cuda / "engine" / "qwen_batching.cpp").is_file()
+    assert not (cuda / "engine" / "qwen_batching.cpp").exists()
+    assert not (cuda / "engine" / "qwen_batching.h").exists()
     assert (cuda / "engine" / "model_components.cpp").is_file()
     assert (cuda / "engine" / "model_bindings.cpp").is_file()

@@ -89,9 +89,20 @@ optional components are wired by `model_bindings.cpp` and `model_components.cpp`
 `EngineInstance<Backend>` directly implements `Engine` and owns request
 execution, text controls and ordered reload/shutdown. CUDA's construction entry
 returns `std::unique_ptr<Engine>`; model metadata and capabilities use
-`EngineInfo`. There is no public `CudaEngine` facade or PImpl. Qwen native batch
-operations live in `engine/qwen_batching.*` and feed shared `ContinuousBatch`
-directly, without a batch executor wrapper.
+`EngineInfo`. There is no public `CudaEngine` facade or PImpl. Reusable CUDA batch
+execution lives in `engine/batch_execution.*` and feeds shared `ContinuousBatch`
+with complete prefill/decode quanta and ordered token results. This includes
+sampling state, metadata, Graph planning/storage and execution metrics. Family
+native state stays in `models/<family>/`; scoped Qwen35 bindings own KV/recurrent
+packing and global cache-position restoration, not a shared StateAdapter protocol.
+Paged allocation, chunks and page tables live in `storage/batch_paged_kv.h`,
+which accepts native geometry rather than a model. Model Ops associate native
+request/storage types; only Engine composition enables supported batch execution.
+Production batching is currently bound only to Qwen35. A synthetic dense CUDA
+model with independent request histories tests runner reuse, not other-family support.
+Concrete model, batch and request-state types are selected only at Engine composition;
+generation accepts an owned sequence, never a concrete batching pointer.
+Concurrent admission and physical batching are distinct.
 Session/prefix settings and batch budgets use shared config;
 CUDA load settings stay in `engine/load_options.cpp`. Ordinary, speculative
 and batch generation share CUDA sampling buffer/count initialization. Model

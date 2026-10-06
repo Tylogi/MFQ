@@ -343,7 +343,7 @@ set(MFQ_CUDA_INSTANTIATION_SOURCES
     ${MFQ_CUDA_ROOT}/engine/model_bindings.cpp
     ${MFQ_CUDA_ROOT}/engine/model_components.cpp
     ${MFQ_CUDA_ROOT}/engine/minicpmo_components.cpp
-    ${MFQ_CUDA_ROOT}/engine/qwen_batching.cpp
+    ${MFQ_CUDA_ROOT}/engine/batch_execution.cpp
     ${MFQ_CUDA_ROOT}/storage/kv_cache.cpp
     ${MFQ_CUDA_ROOT}/storage/text_session_cache.cpp
     ${MFQ_CUDA_ROOT}/engine/mtp.cpp
@@ -416,6 +416,12 @@ if(BUILD_TESTING)
     target_link_libraries(mfq-cuda-runtime-state-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-cuda-runtime-state-test COMMAND mfq-cuda-runtime-state-test)
     set_tests_properties(mfq-cuda-runtime-state-test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(mfq-cuda-batch-execution-test ${MFQ_CUDA_ROOT}/tests/cuda_batch_execution_test.cpp)
+    mfq_configure_cuda_runtime_target(mfq-cuda-batch-execution-test)
+    target_compile_definitions(mfq-cuda-batch-execution-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
+    target_link_libraries(mfq-cuda-batch-execution-test PRIVATE mfq-cuda-runtime)
+    add_test(NAME mfq-cuda-batch-execution-test COMMAND mfq-cuda-batch-execution-test)
+    set_tests_properties(mfq-cuda-batch-execution-test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 add_library(mfq-cuda-eval STATIC ${MFQ_CUDA_ROOT}/eval/kl.cpp)

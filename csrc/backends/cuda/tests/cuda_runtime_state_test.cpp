@@ -1,7 +1,7 @@
 #include "../kernels/mfq_cuda_norm_ops.h"
 #include "../ops/cuda_execution.h"
 #include "../engine/cuda_runtime_config.h"
-#include "../engine/qwen_batching.h"
+#include "../engine/batch_execution.h"
 #include "../ops/cuda_sampling.h"
 #include "diagnostics/generation_result.h"
 #include "storage/text_session_cache.h"
@@ -61,6 +61,49 @@ static void check_sampling_storage() {
               "owned/reused sampling storage changed seeded output");
     (void)SamplingOps::token_counts(ids, 6, storage);
     check(owned.sum().item<int64_t>() == 3, "resetting one sampler changed another");
+}
+
+static void check_batch_buffers_and_sampling() {
+    using namespace mfq_tensor_backend;
+    BatchDecodeMetadata metadata(4);
+    const std::array<BatchDecodeRow, 2> rows{{{14, 3}, {37, 19}}};
+    auto packed = metadata.pack(rows, 4, mfq_current_cuda_device());
+    check(packed.max_length == 20, "batch metadata lost independent positions");
+    for (const auto& [value, expected] : {
+            std::pair{packed.ids, std::vector<int64_t>{14, 37, 0, 0}},
+            std::pair{packed.positions, std::vector<int64_t>{3, 19, 0, 0}},
+            std::pair{packed.lengths, std::vector<int64_t>{4, 20, 1, 1}}}) {
+        auto host = value.cpu().contiguous();
+        check(std::equal(expected.begin(), expected.end(), host.data_ptr<int64_t>()), "batch metadata padding changed");
+    }
+    const auto* address = packed.ids.data_ptr();
+    check(metadata.pack(rows, 4, mfq_current_cuda_device()).ids.data_ptr() == address,
+          "batch metadata replaced captured storage");
+    bool rejected = false;
+    try { metadata.pack(rows, -1, mfq_current_cuda_device()); }
+    catch (const std::exception&) { rejected = true; }
+    check(rejected, "negative physical batch was accepted");
+
+    MfqSamplingParams params;
+    params.temperature = .8; params.top_k = 4; params.seed = 73; params.repetition_penalty = 1.2;
+    Sampler first(params), first_reference(params);
+    params.seed = 91;
+    Sampler second(params), second_reference(params);
+    auto ids = tensor(std::vector<int64_t>{1, 2, 1}, TensorOptions().device(kCUDA).dtype(kInt64));
+    auto counts = SamplingOps::token_counts(ids, 6);
+    auto logits = tensor(std::vector<float>{1, 2, 3, 4, 5, 6},
+                         TensorOptions().device(kCUDA).dtype(kFloat32)).reshape({1, 6});
+    MfqTokenConstraintPtr constraint;
+    const std::array<BatchSamplingRow, 2> sampling{{{first, counts, constraint}, {second, counts, constraint}}};
+    check(!batch_sampling_is_greedy(sampling), "penalized stochastic rows entered greedy execution");
+    int64_t readbacks = 0;
+    for (int tick = 0; tick < 8; ++tick) {
+        auto result = sample_cuda_batch(cat({logits.clone(), logits.clone()}, 0), {}, sampling, false, readbacks);
+        check(result.host.data_ptr<int64_t>()[0] == sample_logits(first_reference, logits.clone(), counts).item<int64_t>() &&
+              result.host.data_ptr<int64_t>()[1] == sample_logits(second_reference, logits.clone(), counts).item<int64_t>(),
+              "batched sampling changed per-request seeded output");
+    }
+    check(readbacks == 8, "unconstrained sampling transferred more than one token batch");
 }
 
 static void check_graph_warmup_state() {
@@ -528,14 +571,14 @@ static void check_resource_plans() {
     TextSessionCache cache({}, {});
     mfq::engine::InferenceRequest request;
     request.sampling.enable_mtp = false;
-    check(!qwen_batch_requires_owned_generation(request, cache, true),
+    check(!batch_requires_owned_generation(request, cache, true),
           "ordinary text bypassed physical batching");
     request.sampling.enable_mtp = true;
-    check(qwen_batch_requires_owned_generation(request, cache, true) &&
-          !qwen_batch_requires_owned_generation(request, cache, false),
+    check(batch_requires_owned_generation(request, cache, true) &&
+          !batch_requires_owned_generation(request, cache, false),
           "MTP compatibility ignored predictor availability");
     request.cache_plan.session_id = "session";
-    check(qwen_batch_requires_owned_generation(request, cache, false),
+    check(batch_requires_owned_generation(request, cache, false),
           "session state entered an ordinary batch");
 }
 
@@ -545,25 +588,59 @@ static void check_batch_state_ownership() {
     Qwen35CausalLm model; model.execution = &execution;
     auto block = std::make_unique<FullBlock>();
     auto* full = block.get(); model.blocks.push_back(std::move(block));
-    qwen35::Qwen35BatchStateAdapter adapter(model, 2, false);
+    qwen35::Qwen35BatchStorage storage(model, 2, false);
     qwen35::QwenBatchRequestState first, second;
-    adapter.prepare_prefill(first, 0, 2);
-    full->state->cache = KVCache(1, 1, 8, 4);
-    adapter.activate(first); adapter.resume_decode(2);
+    {
+        auto binding = storage.prefill(first, 0, 3, 3);
+        full->state->cache = KVCache(1, 1, 8, 4);
+        binding.commit();
+    }
     auto decode = full->state;
     decode->decode_partial_o = mfq_tensor_backend::ones({4}, decode->cache.k.options());
     const auto* workspace = decode->decode_partial_o.data_ptr();
-    adapter.suspend_decode(); adapter.prepare_prefill(second, 0, 2);
-    full->state->cache = KVCache(1, 1, 8, 4);
-    check(full->state != decode, "prefill reused live decode state");
-    adapter.pause_prefill(second); adapter.resume_decode(2);
+    {
+        auto binding = storage.prefill(second, 0, 1, 2);
+        full->state->cache = KVCache(1, 1, 8, 4);
+        check(full->state != decode, "prefill reused live decode state");
+        binding.commit();
+    }
     check(full->state == decode && full->state->decode_partial_o.data_ptr() == workspace,
           "state binding discarded decode workspace");
-    adapter.suspend_decode(); adapter.discard_prefill(second); adapter.resume_decode(2);
-    check(full->state == decode && decode->decode_partial_o.sum().item<float>() == 4,
+    storage.release(second);
+    check(full->state == decode && model.cache_pos == 3 && decode->decode_partial_o.sum().item<float>() == 4,
           "cancelled prefill corrupted decode state");
-    adapter.release(first); adapter.finish_retire(0);
-    check(first.slot() == -1 && second.slot() == -1, "request retained a retired slot");
+    struct PrefillAbort {};
+    try {
+        auto binding = storage.prefill(second, 0, 1, 2);
+        full->state->cache = KVCache(1, 1, 8, 4);
+        throw PrefillAbort{};
+    } catch (const PrefillAbort&) {}
+    check(full->state == decode && model.cache_pos == 3 && storage.stats().active_rows == 1,
+          "aborted prefill did not restore native ownership");
+    {
+        auto binding = storage.prefill(second, 0, 1, 1);
+        full->state->cache = KVCache(1, 1, 8, 4);
+        binding.commit();
+    }
+    decode->cache.k.narrow(0, 0, 1).fill_(3);
+    const std::array<qwen35::Qwen35BatchStorage::DecodeRow, 1> selected{{{&second, 1}}};
+    {
+        auto binding = storage.decode(selected, 1);
+        check(model.cache_pos == 1, "native binding used a paused peer's position");
+        binding.abort();
+    }
+    check(model.cache_pos == 3, "preparation changed native cache position");
+    {
+        auto binding = storage.decode(selected, 1); // Abort must not have advanced the selected row.
+        full->state->cache.k.fill_(7);
+        binding.commit();
+    }
+    check(model.cache_pos == 3 && decode->cache.k.narrow(0, 0, 1).sum().item<float>() == 96,
+          "selected decode corrupted a longer paused peer");
+    storage.release(first);
+    check(model.cache_pos == 2, "retirement did not restore the remaining native position");
+    storage.release(second);
+    check(storage.stats().active_rows == 0 && model.cache_pos == 0, "request retained native storage");
     auto linear = std::make_unique<qwen35::LinearAttentionBlock>();
     auto *recurrent = linear.get();
     model.blocks.push_back(std::move(linear));
@@ -946,6 +1023,7 @@ int main(int argc, char** argv) try {
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     check_resource_plans();
     check_sampling_storage();
+    check_batch_buffers_and_sampling();
     check_batch_state_ownership();
     check_linear_execution();
     check_graph_warmup_state();

@@ -1,35 +1,28 @@
 #pragma once
 
 #include "../../native/tensor_backend.h"
+#include "../../storage/batch_paged_kv.h"
 #include "common/causal_metadata.h"
 
-#include <cstdint>
-#include <memory>
+#include <exception>
 #include <map>
+#include <memory>
 #include <optional>
-#include <string>
+#include <span>
 #include <vector>
 
-struct CudaExecutionContext;
 struct FullAttentionState;
+struct FullBlock;
 struct MtpModule;
 
 namespace mfq::models::qwen35 {
 template <class Backend> struct CausalLm;
 }
-
 namespace mfq::cuda {
 struct Qwen35Model;
 template <typename Model> struct CudaCausalOps;
 using Qwen35CausalLm = mfq::models::qwen35::CausalLm<CudaCausalOps<Qwen35Model>>;
-} // namespace mfq::cuda
-
-namespace mfq::cuda::continuous {
-class QwenPagedKvArena;
-struct QwenPagedKvSequence {
-    std::vector<std::int32_t> physical_pages;
-};
-} // namespace mfq::cuda::continuous
+}
 
 namespace mfq::cuda::qwen35 {
 
@@ -58,95 +51,108 @@ struct QwenBatchLayerState {
     std::shared_ptr<FullAttentionState> full;
     std::shared_ptr<LinearAttentionState> recurrent;
 };
-
 struct QwenBatchState {
-    std::int64_t batch = 0;
+    int64_t batch = 0;
     std::vector<QwenBatchLayerState> layers;
     mfq::models::CausalState causal;
-
-    static QwenBatchState empty(const Qwen35CausalLm &model);
-    void swap(Qwen35CausalLm &model) noexcept;
+    static QwenBatchState empty(const Qwen35CausalLm& model);
+    void swap(Qwen35CausalLm& model) noexcept;
 };
 
-struct QwenPagedKvStats {
-    std::int64_t page_size = 0;
-    std::int64_t live_pages = 0;
-    std::int64_t peak_live_pages = 0;
-    std::int64_t capacity_pages = 0;
-    std::int64_t reserved_bytes = 0;
-    std::int64_t allocations = 0;
-    std::int64_t reuses = 0;
-    std::int64_t releases = 0;
-    std::int64_t table_updates = 0;
-};
-
-// A request owns its native cache state; the adapter alone binds it to slots.
-// Requests have stable addresses while admitted and release before retirement.
 class QwenBatchRequestState {
   public:
     QwenBatchRequestState() = default;
-    QwenBatchRequestState(const QwenBatchRequestState &) = delete;
-    QwenBatchRequestState &operator=(const QwenBatchRequestState &) = delete;
-    std::int32_t slot() const noexcept { return slot_; }
-
+    QwenBatchRequestState(const QwenBatchRequestState&) = delete;
+    QwenBatchRequestState& operator=(const QwenBatchRequestState&) = delete;
   private:
-    friend class Qwen35BatchStateAdapter;
+    friend class Qwen35BatchStorage;
     std::optional<QwenBatchState> prefill_;
-    continuous::QwenPagedKvSequence pages_;
-    std::int32_t slot_ = -1;
+    PagedKvSequence pages_;
+    int32_t slot_ = -1;
+    int64_t position_ = 0;
 };
 
-class Qwen35BatchStateAdapter {
+// Native Qwen ownership only. Scoped bindings hide suspend/restore, packing and
+// global cache-position bookkeeping. No sampler, logits, Graph policy or events.
+class Qwen35BatchStorage {
   public:
-    Qwen35BatchStateAdapter(Qwen35CausalLm &model, std::size_t slots, bool paged);
-    Qwen35BatchStateAdapter(const Qwen35BatchStateAdapter &) = delete;
-    Qwen35BatchStateAdapter &operator=(const Qwen35BatchStateAdapter &) = delete;
-    ~Qwen35BatchStateAdapter();
+    using DecodeRow = std::pair<QwenBatchRequestState*, int64_t>;
+    Qwen35BatchStorage(Qwen35CausalLm& model, size_t slots, bool paged);
+    Qwen35BatchStorage(const Qwen35BatchStorage&) = delete;
+    Qwen35BatchStorage& operator=(const Qwen35BatchStorage&) = delete;
+    ~Qwen35BatchStorage();
 
-    bool has_moe() const;
-    bool has_cached_moe() const;
-    static bool has_cached_moe(const Qwen35CausalLm &model);
-    std::string incompatibility(const CudaExecutionContext &execution) const;
-    bool paged_kv_enabled() const noexcept;
-    QwenPagedKvStats paged_kv_stats() const noexcept;
-    std::int64_t slot_releases() const noexcept { return slot_releases_; }
-
-    void suspend_decode();
-    void prepare_prefill(QwenBatchRequestState &request, std::int64_t offset, std::int64_t tokens);
-    void pause_prefill(QwenBatchRequestState &request);
-    void activate(QwenBatchRequestState &request);
-    void resume_decode(std::int64_t cache_position);
-    void discard_prefill(QwenBatchRequestState &request);
-    void release(QwenBatchRequestState &request);
-    void finish_retire(std::int64_t cache_position);
-    void ensure_decode_tokens(const QwenBatchRequestState &request, std::int64_t tokens);
-    void prepare_decode(const std::vector<std::int32_t>& slots, std::int64_t batch,
-                        std::int64_t cache_position);
-    void finish_decode(std::int64_t cache_position);
-    void recover(const std::vector<QwenBatchRequestState *> &requests);
-
-    mfq_tensor_backend::Tensor logits_from_last_hidden(mfq_tensor_backend::Tensor hidden);
-    std::vector<const void *> decode_state_addresses();
+    class PrefillBinding {
+      public:
+        PrefillBinding(Qwen35BatchStorage&, QwenBatchRequestState&, int64_t offset,
+                       int64_t count, int64_t tokens);
+        ~PrefillBinding();
+        PrefillBinding(const PrefillBinding&) = delete;
+        PrefillBinding& operator=(const PrefillBinding&) = delete;
+        void commit();
+      private:
+        Qwen35BatchStorage& owner_;
+        QwenBatchRequestState& request_;
+        int64_t end_, tokens_;
+        bool finished_ = false;
+    };
+    class DecodeBinding {
+      public:
+        DecodeBinding(Qwen35BatchStorage&, std::span<const DecodeRow>, int64_t batch);
+        ~DecodeBinding();
+        DecodeBinding(const DecodeBinding&) = delete;
+        DecodeBinding& operator=(const DecodeBinding&) = delete;
+        void commit();
+        void abort(); // Preparation-only: restore binding without advancing rows.
+      private:
+        Qwen35BatchStorage& owner_;
+        std::span<const DecodeRow> rows_;
+        bool finished_ = false;
+    };
+    PrefillBinding prefill(QwenBatchRequestState& request, int64_t offset, int64_t count, int64_t tokens) {
+        return PrefillBinding(*this, request, offset, count, tokens);
+    }
+    DecodeBinding decode(std::span<const DecodeRow> rows, int64_t batch) {
+        return DecodeBinding(*this, rows, batch);
+    }
+    void release(QwenBatchRequestState&);
+    void recover(std::span<QwenBatchRequestState* const>);
+    BatchStorageStats stats() const noexcept;
 
   private:
-    QwenBatchState take(std::int64_t batch);
-    void restore(const QwenBatchState &state, std::int64_t cache_position);
-    QwenBatchState make_slot_state(const QwenBatchState &source, std::int64_t slots) const;
-    void copy_to_slot(QwenBatchState &slots, const QwenBatchState &source, std::int64_t slot) const;
+    void check_binding_failure() const;
+    int64_t cache_position() const;
+    void suspend_decode();
+    void prepare_prefill(QwenBatchRequestState&, int64_t offset, int64_t tokens);
+    void pause_prefill(QwenBatchRequestState&);
+    void activate(QwenBatchRequestState&);
+    void resume_decode();
+    void discard_prefill(QwenBatchRequestState&);
+    void release_state(QwenBatchRequestState&);
+    void finish_retire();
+    void ensure_decode_tokens(const QwenBatchRequestState&, int64_t tokens);
+    void prepare_decode(const std::vector<int32_t>& slots, int64_t batch, int64_t position);
+    void finish_decode();
+    QwenBatchState take(int64_t batch);
+    void restore(const QwenBatchState&, int64_t position);
+    QwenBatchState make_slot_state(const QwenBatchState&, int64_t slots) const;
+    void copy_to_slot(QwenBatchState& slots, const QwenBatchState& source, int64_t slot) const;
+    void bind_pages(std::span<const PagedKvSequence* const>);
     void bind_paged_slots();
     void clear_model();
 
-    Qwen35CausalLm &model_;
-    std::vector<QwenBatchRequestState *> slots_;
+    Qwen35CausalLm& model_;
+    std::vector<QwenBatchRequestState*> slots_;
     std::optional<QwenBatchState> suspended_, unpacked_;
-    std::map<std::int64_t, QwenBatchState> decode_buckets_;
-    std::int64_t decode_batch_ = 0;
-    std::vector<std::int32_t> decode_slots_;
-    std::vector<continuous::QwenPagedKvSequence> padding_pages_;
-    std::int64_t slot_releases_ = 0;
+    std::map<int64_t, QwenBatchState> decode_buckets_;
+    int64_t decode_batch_ = 0;
+    std::vector<int32_t> decode_slots_;
+    std::vector<PagedKvSequence> padding_pages_;
+    int64_t slot_releases_ = 0;
     bool page_table_dirty_ = false;
-    std::unique_ptr<continuous::QwenPagedKvArena> paged_kv_;
-    std::vector<continuous::QwenPagedKvSequence> paged_slots_;
+    std::unique_ptr<BatchPagedKvPool> paged_kv_;
+    std::vector<PagedKvSequence> paged_slots_;
+    std::vector<FullBlock*> paged_layers_;
+    std::exception_ptr binding_failure_;
 };
-
 } // namespace mfq::cuda::qwen35

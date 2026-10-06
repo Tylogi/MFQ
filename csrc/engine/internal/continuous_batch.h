@@ -1,12 +1,13 @@
 #pragma once
 #include "generation_step.h"
-#include <deque>
 #include <memory>
+#include <span>
 #include <unordered_map>
 
 namespace mfq::engine {
 
-// Physical row metadata only. Request lifecycle and output belong to the executor.
+// Logical row metadata. Native request storage is associated with the execution
+// implementation; no slot, tensor, KV or recurrent layout is prescribed here.
 struct BatchRequest {
     BatchRequest(std::string id, const InferenceRequest& input)
         : id(std::move(id)), prompt(input.prompt), sampling(input.sampling),
@@ -17,63 +18,59 @@ struct BatchRequest {
     MfqTokenConstraintPtr token_constraint;
     int32_t generation_limit = 0, produced = 0;
     int64_t pending_token = 0;
-    bool eligible = false;
     int64_t prefill_offset = 0, cache_length = 0;
 };
 
-template <class Request> struct BatchState {
-    std::deque<std::shared_ptr<Request>> prefilling;
-    std::vector<std::shared_ptr<Request>> active;
+struct BatchSample {
+    int64_t token = 0;
+    MfqPrefillTiming timing;
 };
 
-// Groups pending numerical operations. All rows run generate_sequence(), also
-// used by B=1 execution; this component never accepts tokens or publishes events.
-template <class Ops> class ContinuousBatch {
-    using Request = typename Ops::Request;
-    using Sample = typename Ops::Sample;
-    using State = BatchState<Request>;
+template <class Request> struct PrefillWork {
+    const std::shared_ptr<Request>& request;
+    PrefillChunk chunk;
+};
+template <class Request> struct DecodeWork {
+    std::span<const std::shared_ptr<Request>> requests;
+};
+
+// One seam: execute a selected numerical quantum and return its results.
+// execute(PrefillWork) completes that chunk, including native state switching.
+// execute(DecodeWork) returns ordered samples, or nullopt for preparation with
+// no committed rows. accept(), release() and recover() own native state only;
+// output, cancellation and publication remain in the shared request lifecycle.
+template <class Execution> class ContinuousBatch {
+    using Request = typename Execution::Request;
     struct Work {
         std::shared_ptr<Request> request;
         std::optional<PrefillChunk> prefill;
-        std::optional<Sample> result;
+        std::optional<BatchSample> result;
         std::exception_ptr failure;
-        bool decode = false, active = false;
+        bool decode = false;
     };
     int64_t prefill_chunk_size;
-    Ops operations;
-    State state;
+    Execution execution;
+    std::vector<std::shared_ptr<Request>> active;
     std::unordered_map<std::string, std::shared_ptr<Work>> requests;
     bool decode_next = true;
     int64_t admissions = 0, prefill_chunks = 0, prefill_yields = 0;
 
-    int64_t cache_position() const {
-        int64_t position = 0;
-        for (const auto& request : state.active)
-            position = std::max(position, request->cache_length);
-        return position;
-    }
     void recover(std::exception_ptr error) {
-        State failed;
+        std::vector<std::shared_ptr<Request>> failed;
         for (const auto& [id, work] : requests) {
             work->failure = error;
             work->prefill.reset();
-            work->decode = work->active = false;
-            failed.prefilling.push_back(work->request);
+            work->decode = false;
+            failed.push_back(work->request);
         }
-        state = {};
-        operations.recover(failed);
+        active.clear();
+        execution.recover(failed);
     }
     void release(Work& work) {
         if (!requests.contains(work.request->id)) return;
         try {
-            if (work.active) {
-                std::erase(state.active, work.request);
-                operations.retire({work.request}, cache_position());
-            } else if (!work.failure) {
-                operations.suspend_decode();
-                operations.discard_prefill(work.request);
-                operations.resume_decode(cache_position());
-            }
+            std::erase(active, work.request);
+            if (!work.failure) execution.release(work.request);
         } catch (...) {
             auto error = std::current_exception();
             try { recover(error); } catch (...) { error = std::current_exception(); }
@@ -88,7 +85,7 @@ template <class Ops> class ContinuousBatch {
         void schedule_prefill(PrefillChunk chunk) { work.result.reset(); work.prefill = chunk; }
         void schedule_decode() { work.result.reset(); work.decode = true; }
         bool ready() const { return work.result.has_value() || work.failure; }
-        const Sample& sample() const {
+        const BatchSample& sample() const {
             if (work.failure) std::rethrow_exception(work.failure);
             return work.result.value();
         }
@@ -97,8 +94,7 @@ template <class Ops> class ContinuousBatch {
         int64_t advance() { return sample().token; }
         void accept(int64_t token) {
             auto& request = *work.request;
-            // activate() initializes counts for the first sample.
-            if (request.produced) batch.operations.accept(work.request, sample());
+            batch.execution.accept(work.request, sample());
             request.pending_token = token;
             ++request.produced;
         }
@@ -108,7 +104,7 @@ template <class Ops> class ContinuousBatch {
     template <class... Args>
     explicit ContinuousBatch(int64_t chunk_size, int64_t token_budget, Args&&... args)
         : prefill_chunk_size(std::min(chunk_size, token_budget)),
-          operations(std::forward<Args>(args)...) {
+          execution(std::forward<Args>(args)...) {
         if (prefill_chunk_size <= 0)
             throw std::invalid_argument("continuous batching requires a positive prefill chunk");
     }
@@ -127,26 +123,27 @@ template <class Ops> class ContinuousBatch {
     }
 
     void step(const std::vector<std::string>& eligible) {
-        for (const auto& request : state.active) {
+        std::vector<std::shared_ptr<Request>> decoding;
+        for (const auto& request : active) {
             const auto& work = *requests.at(request->id);
-            request->eligible = work.decode &&
-                std::find(eligible.begin(), eligible.end(), request->id) != eligible.end();
+            if (work.decode && std::find(eligible.begin(), eligible.end(), request->id) != eligible.end())
+                decoding.push_back(request);
         }
         auto prefill = requests.end();
         for (const auto& id : eligible) {
             auto it = requests.find(id);
             if (it != requests.end() && it->second->prefill) { prefill = it; break; }
         }
-        const bool has_decode = std::any_of(state.active.begin(), state.active.end(),
-            [](const auto& request) { return request->eligible; });
         try {
-            if (has_decode && (prefill == requests.end() || decode_next)) {
-                auto decoded = operations.decode(state);
-                if constexpr (requires { decoded.ready(); })
-                    if (!decoded.ready()) return; // A graph preparation quantum committed no row.
-                for (const auto& request : state.active) if (request->eligible) {
+            if (!decoding.empty() && (prefill == requests.end() || decode_next)) {
+                auto decoded = execution.execute(DecodeWork<Request>{decoding});
+                if (!decoded) return; // Preparation committed no row.
+                if (decoded->size() != decoding.size())
+                    throw std::logic_error("batch decode result count disagrees with selected rows");
+                for (size_t row = 0; row < decoding.size(); ++row) {
+                    auto& request = decoding[row];
                     auto& work = *requests.at(request->id);
-                    work.result = operations.sample(request, decoded);
+                    work.result = std::move((*decoded)[row]);
                     ++request->cache_length;
                     work.decode = false;
                 }
@@ -154,18 +151,14 @@ template <class Ops> class ContinuousBatch {
                 auto& work = *prefill->second;
                 auto& request = work.request;
                 const auto chunk = *work.prefill;
-                operations.suspend_decode();
-                auto sample = operations.prefill(request, chunk);
+                auto sample = execution.execute(PrefillWork<Request>{request, chunk});
                 request->prefill_offset = chunk.offset + chunk.count;
                 ++prefill_chunks;
                 if (request->prefill_offset == static_cast<int64_t>(request->prompt.size())) {
                     request->cache_length = request->prompt.size();
-                    operations.activate(request, sample);
-                    state.active.push_back(request);
-                    work.active = true;
+                    active.push_back(request);
                     ++admissions;
                 } else ++prefill_yields;
-                operations.resume_decode(cache_position());
                 work.result = std::move(sample);
                 work.prefill.reset();
             }
@@ -177,9 +170,9 @@ template <class Ops> class ContinuousBatch {
     }
 
     Metrics metrics() const {
-        auto result = operations.metrics();
-        result.emplace_back("continuous_batching_active", state.active.size());
-        result.emplace_back("continuous_batching_prefilling", requests.size() - state.active.size());
+        auto result = execution.metrics();
+        result.emplace_back("continuous_batching_active", active.size());
+        result.emplace_back("continuous_batching_prefilling", requests.size() - active.size());
         result.emplace_back("continuous_batching_requests", admissions);
         result.emplace_back("continuous_batching_admissions", admissions);
         result.emplace_back("continuous_batching_prefill_chunks", prefill_chunks);

@@ -4,6 +4,7 @@
 
 #include "models/common/causal_model_ops.h"
 #include "storage/session_state.h"
+#include "batch_state.h"
 #include "qwen35/causal_lm.h"
 #include "qwen35/config.h"
 
@@ -40,7 +41,10 @@ mfq::StepSequence<std::monostate> restore_text_session_state(std::vector<std::un
 namespace mfq::cuda {
 
 struct Qwen35Model : CausalResources {
+    using BatchRequestState = qwen35::QwenBatchRequestState;
+    using BatchStorage = qwen35::Qwen35BatchStorage;
     template <class Backend> using CausalModel = mfq::models::qwen35::CausalLm<Backend>;
+    std::vector<const void*> adapter_batch_state_addresses(const std::vector<std::unique_ptr<Block>>&) const;
     mfq::models::qwen35::Config config;
 
     void adapter_validate_components(const mfq::ModelGraph &graph) const;

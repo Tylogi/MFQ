@@ -16,7 +16,7 @@ struct TestOps {
     int failure = 0, live = 0, resets = 0, advances = 0, accepted = 0;
     std::vector<PrefillChunk> chunks;
     std::map<RequestId, ExecutionRequest *> batched;
-    bool can_batch(const EngineRequest &) const { return batch; }
+    bool can_overlap(const EngineRequest &) const { return batch; }
     bool exclusive() const { return false; }
     bool mtp_available() const { return false; }
     void execute(const std::vector<RequestId>&) {}
@@ -466,6 +466,20 @@ static void check_admission_memory() {
 }
 
 int main() {
+    // A serial backend keeps its existing interface; concurrent admission is optional.
+    {
+        struct SerialOps : TestOps {
+            bool can_overlap(const EngineRequest&) const = delete;
+            bool can_batch(const EngineRequest&) const { return false; }
+        } ops;
+        RequestExecutor executor(2);
+        assert(executor.admit(request("a"), nullptr, info(), ops) == Admission::accepted);
+        assert(executor.admit(request("b"), nullptr, info(), ops) == Admission::deferred);
+        executor.cancel("a");
+        assert(std::holds_alternative<Cancelled>(terminal_event(executor.step({}, ops))));
+        assert(executor.admit(request("b"), nullptr, info(), ops) == Admission::accepted);
+        while (!executor.empty()) executor.step({"b"}, ops);
+    }
     for (int invalid = 0; invalid < 4; ++invalid) {
         TestOps ops;
         RequestExecutor executor;

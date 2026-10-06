@@ -5,7 +5,8 @@
 #include "../engine/cuda_runtime_config.h"
 #include "engine/generation.h"
 #include "storage/text_session_cache.h"
-#include "engine/qwen_batching.h"
+#include "engine/batch_execution.h"
+#include "models/qwen35/batch_state.h"
 
 #include <cuda_profiler_api.h>
 
@@ -155,19 +156,19 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
             DecodeGraphCache& graph;
             TextSessionCache& cache;
             const CudaRuntimeConfig& config;
-            ContinuousBatch<QwenBatchOperations> batcher;
+            ContinuousBatch<CudaBatchExecution<Qwen35CausalLm>> batcher;
             Execution(Qwen35CausalLm& model, DecodeGraphCache& graph, TextSessionCache& cache,
                       const CudaRuntimeConfig& config)
                 : model(model), graph(graph), cache(cache), config(config),
                   batcher(64, config.continuous_batch.prefill_token_budget,
                           model, *model.execution, config.continuous_batch) {}
-            bool can_batch(const EngineRequest&) const { return true; }
+            bool can_overlap(const EngineRequest&) const { return true; }
             bool exclusive() const { return false; }
             bool mtp_available() const { return false; }
             void execute(const std::vector<RequestId>& eligible) { batcher.step(eligible); }
             Generation generate(const RequestId& id, ExecutionRequest& request) {
                 return internal::generate(model, graph, cache, config, request.input,
-                                          request.output, nullptr, {}, &batcher, id);
+                                          request.output, nullptr, {}, batcher.generate(id, request.input, request.output));
             }
         } execution(model, graph, cache, config);
         auto& batcher = execution.batcher;
@@ -237,8 +238,7 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
         for (int ticks = 0; ticks < 500 && !executor.empty(); ++ticks) tick({"anchor", "joined"});
         MFQ_RUNTIME_CHECK(executor.empty() && tokens["anchor"] == second_reference &&
             tokens["joined"] == second_reference, "prefill join changed decode output");
-        if (config.continuous_batch.greedy &&
-            qwen_continuous_batch_cuda_graph_enabled(model, config.continuous_batch))
+        if (config.continuous_batch.greedy && metric("continuous_batching_cuda_graph_enabled"))
             MFQ_RUNTIME_CHECK(metric("continuous_batching_cuda_graph_captures") <= captures_before_join + 1,
                 "joining prefill repeatedly recaptured decode graphs");
         admit("padded-0", second_prompt); admit("padded-1", second_prompt); admit("padded-2", second_prompt);
@@ -284,8 +284,7 @@ int run_qwen_continuous_batching_check(Qwen35CausalLm& model, const CudaRuntimeC
             if (key == "continuous_batching_cuda_graph_replays") replays = value;
             if (key == "continuous_batching_cuda_graph_prewarms") prewarms = value;
         }
-        if (config.continuous_batch.greedy &&
-            qwen_continuous_batch_cuda_graph_enabled(model, config.continuous_batch))
+        if (config.continuous_batch.greedy && metric("continuous_batching_cuda_graph_enabled"))
             MFQ_RUNTIME_CHECK(captures > 0 && prewarms == captures && replays > captures,
                 "batch graph was not prepared separately and replayed");
         std::cout << "continuous_batching_state_check paged=" << config.continuous_batch.paged_kv

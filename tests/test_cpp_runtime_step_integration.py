@@ -151,7 +151,7 @@ def test_diagnostic_engine_generation() -> None:
     model = os.environ.get("MFQ_STEP_TEST_MODEL")
     if not model:
         pytest.skip("real-weight model not configured")
-    command = [str(ROOT / "build/csrc/mfq-diagnostics"), "--model", model,
+    command = [os.environ.get("MFQ_STEP_TEST_DIAGNOSTICS", str(ROOT / "build/csrc/mfq-diagnostics")), "--model", model,
                "--ctx-size", "64", "--ids", "1,2,3", "--gen", "16"]
     outputs = []
     for graph in ("0", "1"):

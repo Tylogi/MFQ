@@ -98,7 +98,6 @@ def test_prepared_prompt_supports_mtp_and_safe_session_reuse() -> None:
     assert "(!prepared || !prepared->transformed()) && !constraint" in CUDA_APP
     assert "components.grid_vision->prepare(" in CUDA_APP
     assert "components.mtp.get()" in CUDA_APP
-    assert "return batching->generate(request_id, input, output)" in CUDA_APP
     assert "advance_preparation" in CUDA_APP
 
 

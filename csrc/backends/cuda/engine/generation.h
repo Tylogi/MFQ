@@ -1,7 +1,6 @@
 #pragma once
 
 #include "generation_step.h"
-#include "qwen_batching.h"
 #include "../ops/cuda_execution.h"
 #include "engine/decode_graph.h"
 #include "models/common/mtp.h"
@@ -13,14 +12,15 @@
 namespace mfq::cuda::internal {
 class TextSessionCache;
 
+// A supplied sequence owns its native cleanup. Session reuse and speculative
+// generation use the default execution path, not an injected batch implementation.
 template <typename Model>
 mfq::engine::Generation generate(
     Model& model, DecodeGraphCache& graph, TextSessionCache& cache,
     const CudaRuntimeConfig& config, mfq::engine::InferenceRequest& request,
     mfq::engine::InferenceOutput& output, MtpModule* mtp = nullptr,
     std::optional<CudaPreparedPrompt> prepared = {},
-    mfq::engine::ContinuousBatch<QwenBatchOperations>* batching = nullptr,
-    std::string request_id = {});
+    std::optional<mfq::engine::Generation> execution = {});
 } // namespace mfq::cuda::internal
 
 template <typename Model>

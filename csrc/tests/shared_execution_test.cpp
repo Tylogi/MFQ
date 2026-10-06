@@ -27,32 +27,55 @@ using namespace mfq::engine;
 
 struct BatchOps {
     using Request = BatchRequest;
-    using State = BatchState<Request>;
-    struct Model {
-        int vocab_size() const { return 100; }
-        int max_position_embeddings() const { return 100; }
-    } model_;
-    int64_t vocab_size() const { return model_.vocab_size(); }
-    int64_t max_context() const { return model_.max_position_embeddings(); }
-    struct Sample {
-        int64_t token;
-        MfqPrefillTiming timing;
-    };
-    void suspend_decode() {}
-    Sample prefill(const std::shared_ptr<Request> &request, PrefillChunk chunk) {
-        assert(chunk.offset == request->prefill_offset && chunk.count <= 2);
-        return {10, {request->prompt.size(), 1, 0, 1}};
+    BatchSample execute(PrefillWork<Request> work) {
+        assert(work.chunk.offset == work.request->prefill_offset && work.chunk.count <= 2);
+        return {10, {work.request->prompt.size(), 1, 0, 1}};
     }
-    void activate(const std::shared_ptr<Request> &, const Sample &) {}
-    void resume_decode(int64_t) {}
-    void discard_prefill(const std::shared_ptr<Request> &) {}
-    void retire(const std::vector<std::shared_ptr<Request>> &, int64_t) {}
-    int decode(State &) { return 0; }
-    Sample sample(const std::shared_ptr<Request> &request, int) {
-        return {request->pending_token + 1, {}};
+    std::optional<std::vector<BatchSample>> execute(DecodeWork<Request> work) {
+        std::vector<BatchSample> result;
+        for (const auto& request : work.requests) result.push_back({request->pending_token + 1, {}});
+        return result;
     }
-    void accept(const std::shared_ptr<Request> &, const Sample &) {}
-    void recover(State &) {}
+    void accept(const std::shared_ptr<Request>&, const BatchSample&) {}
+    void release(const std::shared_ptr<Request>&) {}
+    void recover(std::span<const std::shared_ptr<Request>>) {}
+    Metrics metrics() const { return {}; }
+};
+
+// Same Interface, different Request and native storage, including a quantum
+// that prepares execution without committing rows. No Qwen slot protocol.
+struct StoredBatchOps {
+    struct Request : BatchRequest { using BatchRequest::BatchRequest; };
+    struct Native { int64_t pending = 10, accepted = 0; bool prepared = false; };
+    std::map<std::string, Native> native;
+    ~StoredBatchOps() { assert(native.empty()); }
+    BatchSample execute(PrefillWork<Request> work) {
+        assert(work.chunk.offset == work.request->prefill_offset && work.chunk.count <= 2);
+        if (!work.chunk.offset) assert(native.try_emplace(work.request->id).second);
+        return {native.at(work.request->id).pending, {work.request->prompt.size(), 1, 0, 1}};
+    }
+    std::optional<std::vector<BatchSample>> execute(DecodeWork<Request> work) {
+        bool preparation = false;
+        for (const auto& request : work.requests) {
+            auto& state = native.at(request->id);
+            assert(state.accepted == request->produced && state.pending == request->pending_token);
+            preparation |= !std::exchange(state.prepared, true);
+        }
+        if (preparation) return std::nullopt;
+        std::vector<BatchSample> result;
+        for (const auto& request : work.requests) result.push_back({++native.at(request->id).pending, {}});
+        return result;
+    }
+    void accept(const std::shared_ptr<Request>& request, const BatchSample& sample) {
+        auto& state = native.at(request->id);
+        assert(sample.token == state.pending && state.accepted == request->produced);
+        ++state.accepted;
+    }
+    void release(const std::shared_ptr<Request>& request) {
+        // Cancellation can release a registered request before its first prefill.
+        native.erase(request->id);
+    }
+    void recover(std::span<const std::shared_ptr<Request>>) { native.clear(); }
     Metrics metrics() const { return {}; }
 };
 
@@ -60,7 +83,7 @@ template <class Physical> struct BatchExecution {
     ContinuousBatch<Physical> batch;
     template <class... Args> explicit BatchExecution(Args&&... args)
         : batch(8, 2, std::forward<Args>(args)...) {}
-    bool can_batch(const EngineRequest&) const { return true; }
+    bool can_overlap(const EngineRequest&) const { return true; }
     bool exclusive() const { return false; }
     bool mtp_available() const { return false; }
     void execute(const std::vector<RequestId>& eligible) { batch.step(eligible); }
@@ -78,8 +101,8 @@ static EngineRequest batch_request(std::string id, int prompt = 5, int tokens = 
 }
 static EngineInfo batch_info() { return {2, 100, 100}; }
 
-void batch_test() {
-    BatchExecution<BatchOps> ops;
+template <class Physical> void batch_execution_test() {
+    BatchExecution<Physical> ops;
     RequestExecutor executor(2);
     executor.admit(batch_request("a"), nullptr, batch_info(), ops);
     executor.admit(batch_request("b"), nullptr, batch_info(), ops);
@@ -114,8 +137,13 @@ void batch_test() {
         if (key == "continuous_batching_active" || key == "continuous_batching_prefilling") assert(value == 0);
 }
 
+void batch_test() {
+    batch_execution_test<BatchOps>();
+    batch_execution_test<StoredBatchOps>();
+}
+
 void batch_failure_test() {
-    enum Stage { suspend, prefill, activate, resume };
+    enum Stage { prefill, decode };
     struct Fault { Stage stage; bool armed = false; size_t recovered = 0; };
     struct FailingOps : BatchOps {
         Fault& fault;
@@ -123,24 +151,35 @@ void batch_failure_test() {
         void check(Stage stage) {
             if (fault.armed && fault.stage == stage) throw std::runtime_error("device failure");
         }
-        void suspend_decode() { check(suspend); }
-        Sample prefill(const std::shared_ptr<Request>& request, PrefillChunk chunk) {
-            check(Stage::prefill); return BatchOps::prefill(request, chunk);
+        BatchSample execute(PrefillWork<Request> work) {
+            check(Stage::prefill); return BatchOps::execute(work);
         }
-        void activate(const std::shared_ptr<Request>&, const Sample&) { check(Stage::activate); }
-        void resume_decode(int64_t) { check(resume); }
-        void recover(State& state) { fault.recovered = state.prefilling.size(); }
+        std::optional<std::vector<BatchSample>> execute(DecodeWork<Request> work) {
+            check(Stage::decode); return BatchOps::execute(work);
+        }
+        void recover(std::span<const std::shared_ptr<Request>> requests) { fault.recovered = requests.size(); }
     };
-    for (auto stage : {suspend, prefill, activate, resume}) {
+    for (auto stage : {prefill, decode}) {
         Fault fault{stage};
         BatchExecution<FailingOps> ops(fault);
         RequestExecutor executor(2);
         executor.admit(batch_request("a", 2, 20), nullptr, batch_info(), ops);
         executor.admit(batch_request("b", 2, 20), nullptr, batch_info(), ops);
-        // Register both physical rows before the device fault.
+        // Register both rows before the device fault; decode needs completed prefill.
         executor.step({"a", "b"}, ops);
+        if (stage == decode) {
+            for (int tick = 0; tick < 20; ++tick) {
+                executor.step({"a", "b"}, ops);
+                bool ready = false;
+                for (const auto& [key, value] : ops.batch.metrics())
+                    if (key == "continuous_batching_active") ready = value == 2;
+                if (ready) break;
+            }
+        }
         fault.armed = true;
-        const auto result = executor.step({"a"}, ops); // Paused peers must also fail and release.
+        EngineStepResult result;
+        for (int tick = 0; tick < 20 && result.status.healthy; ++tick)
+            result = executor.step({"a"}, ops); // Paused peers must also fail and release.
         assert(!result.status.healthy && executor.empty() && fault.recovered == 2);
         assert(result.events.size() == 2);
         for (const auto& event : result.events) assert(std::holds_alternative<Failed>(event.data));
@@ -154,11 +193,10 @@ void batch_failure_test() {
         CleanupFault& fault;
         explicit ReleaseOps(CleanupFault& value) : fault(value) {}
         void fail() { ++fault.releases; throw std::invalid_argument("slot release failed"); }
-        void retire(const std::vector<std::shared_ptr<Request>>&, int64_t) { fail(); }
-        void discard_prefill(const std::shared_ptr<Request>&) { fail(); }
-        void recover(State& state) {
+        void release(const std::shared_ptr<Request>&) { fail(); }
+        void recover(std::span<const std::shared_ptr<Request>> requests) {
             ++fault.recoveries;
-            assert(state.prefilling.size() == 1);
+            assert(requests.size() == 1);
             if (fault.recovery_fails) throw std::runtime_error("recovery failed");
         }
     };
@@ -180,6 +218,28 @@ void batch_failure_test() {
         assert(std::get<Failed>(result.events.back().data).code == "backend_failure");
         for (const auto& [key, value] : ops.batch.metrics())
             if (key == "continuous_batching_active" || key == "continuous_batching_prefilling") assert(value == 0);
+    }
+    // A malformed numerical result fails all owned rows before any cache
+    // length is advanced, including a peer omitted by output backpressure.
+    struct WrongResultOps : BatchOps {
+        using BatchOps::execute;
+        std::optional<std::vector<BatchSample>> execute(DecodeWork<Request>) { return std::vector<BatchSample>{}; }
+        void recover(std::span<const std::shared_ptr<Request>> requests) {
+            assert(requests.size() == 2);
+            for (const auto& request : requests)
+                if (request->produced) assert(request->cache_length == static_cast<int64_t>(request->prompt.size()));
+        }
+    };
+    {
+        BatchExecution<WrongResultOps> ops;
+        RequestExecutor executor(2);
+        executor.admit(batch_request("a", 2, 20), nullptr, batch_info(), ops);
+        executor.admit(batch_request("b", 2, 20), nullptr, batch_info(), ops);
+        executor.step({"a", "b"}, ops);
+        EngineStepResult result;
+        for (int tick = 0; tick < 20 && result.status.healthy; ++tick) result = executor.step({"a"}, ops);
+        assert(!result.status.healthy && executor.empty() && result.events.size() == 2);
+        for (const auto& event : result.events) assert(std::holds_alternative<Failed>(event.data));
     }
     for (const auto limits : {std::pair{0, 2}, std::pair{2, 0}}) {
         try { ContinuousBatch<BatchOps> batch(limits.first, limits.second); assert(false); }

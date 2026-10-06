@@ -305,6 +305,31 @@ void Qwen35Mtp::plan_resources(mfq::cuda::CudaResourcePlan& plan,
 
 namespace mfq::cuda {
 
+std::vector<const void*> Qwen35Model::adapter_batch_state_addresses(
+        const std::vector<std::unique_ptr<Block>>& blocks) const {
+    std::vector<const void*> addresses;
+    for (const auto& block : blocks) {
+        if (auto* full = dynamic_cast<FullBlock*>(block.get())) {
+            if (full->state->cache.is_paged()) {
+                addresses.push_back(full->state->cache.k_chunk_ptrs.data_ptr());
+                addresses.push_back(full->state->cache.v_chunk_ptrs.data_ptr());
+                addresses.push_back(full->state->cache.page_table.data_ptr());
+            } else {
+                addresses.push_back(full->state->cache.k.data_ptr());
+                addresses.push_back(full->state->cache.v.data_ptr());
+            }
+            for (const auto* workspace : {&full->state->decode_partial_o, &full->state->decode_partial_m,
+                    &full->state->decode_partial_l, &full->state->decode_mma_mask,
+                    &full->state->decode_mma_kv_max, &full->state->decode_mma_meta})
+                addresses.push_back(workspace->defined() ? workspace->data_ptr() : nullptr);
+        } else if (auto* linear = dynamic_cast<qwen35::LinearAttentionBlock*>(block.get())) {
+            addresses.push_back(linear->state->conv_state.data_ptr());
+            addresses.push_back(linear->state->gdn_state.data_ptr());
+        }
+    }
+    return addresses;
+}
+
 void Qwen35Model::adapter_validate_components(const mfq::ModelGraph &graph) const {
     if (graph.component("vision") != nullptr &&
         cuda_model_plan(graph).vision != CudaVisionAdapter::grid_vit) {
