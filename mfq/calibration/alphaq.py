@@ -195,10 +195,12 @@ def alphaq_candidates(candidates: EwCandidateTable) -> EwCandidateTable:
     scored = []
     for candidate in candidates.candidates:
         spec = candidate.precision.nint_spec
-        bits = float(spec.bits) if spec is not None else candidate.effective_bpw
+        sq = candidate.precision.family in {'MXFP4-SQ', 'MXFP8-SQ', 'FP8-128SQ'}
+        bits = float(candidate.precision.option('q', 4)) if sq else float(spec.bits) if spec is not None else candidate.effective_bpw
         if not math.isfinite(bits) or bits <= 0:
             raise ValueError(f"invalid AlphaQ bit width: {candidate.key}/{candidate.profile}")
-        loss = math.exp2(-2 * bits) if hasattr(math, "exp2") else 2.0 ** (-2 * bits)
+        exact = sq and bits == (4 if candidate.precision.family == 'MXFP4-SQ' else 8)
+        loss = 0.0 if exact else math.exp2(-2 * bits) if hasattr(math, "exp2") else 2.0 ** (-2 * bits)
         scored.append(replace(candidate, distortion=loss, validation_distortion=loss))
     return replace(candidates, candidates=tuple(scored), metadata={**candidates.metadata, **METHOD})
 

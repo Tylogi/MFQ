@@ -110,15 +110,12 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
   font-weight: 550;
 }
 .metric-grid > .metric-tile > strong {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 5px;
+  display: block;
   margin: 14px 0 6px;
   color: var(--ink-strong);
   font-size: 27px;
   font-weight: 580;
-  letter-spacing: -0.03em;
+  letter-spacing: 0;
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }

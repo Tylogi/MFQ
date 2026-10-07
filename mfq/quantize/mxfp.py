@@ -219,20 +219,24 @@ def decode_mxfp8(
     total_rows: int,
     device: str | torch.device,
     dtype: torch.dtype = torch.float32,
+    block_shape: tuple[int, int] = (128, 128),
 ) -> torch.Tensor:
-    """Decode E4M3 values with one E8M0 scale per 128x128 block."""
+    """Decode native E4M3 values with their E8M0 block geometry."""
 
+    block_rows, block_columns = block_shape
+    if block_shape not in {(128, 128), (32, 32), (1, 32)}:
+        raise ValueError('unsupported native MXFP8 block geometry')
     raw = _u8_tensor(encoded, device)
-    if raw.ndim != 2 or raw.shape[1] % 128:
-        raise ValueError("MXFP8 encoded values must have shape [rows,K], K%128=0")
+    if raw.ndim != 2 or raw.shape[1] % block_columns:
+        raise ValueError('MXFP8 encoded width must be divisible by its block width')
     rows, width = raw.shape
     if row_start < 0 or row_start + rows > total_rows:
         raise IndexError("MXFP8 row range is outside the tensor")
-    first_block = row_start // 128
-    last_block = (row_start + rows - 1) // 128 if rows else first_block - 1
+    first_block = row_start // block_rows
+    last_block = (row_start + rows - 1) // block_rows if rows else first_block - 1
     expected_scale_rows = max(0, last_block - first_block + 1)
     scale_raw = _u8_tensor(block_scale, device)
-    if tuple(scale_raw.shape) != (expected_scale_rows, width // 128):
+    if tuple(scale_raw.shape) != (expected_scale_rows, width // block_columns):
         raise ValueError(
             f"MXFP8 scale shape {tuple(scale_raw.shape)} does not match "
             f"rows={row_start}:{row_start + rows}, width={width}"
@@ -241,11 +245,11 @@ def decode_mxfp8(
         return torch.empty((0, width), device=device, dtype=dtype)
     local_block = (
         torch.arange(row_start, row_start + rows, device=device, dtype=torch.int64)
-        // 128
+        // block_rows
         - first_block
     )
     row_scale = decode_e8m0(scale_raw, device=device)[local_block]
-    row_scale = row_scale.repeat_interleave(128, dim=1)
+    row_scale = row_scale.repeat_interleave(block_columns, dim=1)
     result = _e4m3_table(device)[raw.to(torch.int64)] * row_scale
     return result.to(dtype=dtype)
 

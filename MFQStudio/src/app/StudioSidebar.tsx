@@ -69,12 +69,14 @@ export function StudioSidebar() {
     { label: ['交互', 'Playground'], items: [
       { label: ['对话', 'Chat'], icon: 'chat', path: '/chat', active: view === 'chat', current: true },
     ] },
-    { label: ['模型工具', 'Model tools'], items: [
-      { label: ['模型下载', 'Model downloads'], icon: 'download', path: lab('models'),
+    { label: ['工具', 'Tools'], items: [
+      { label: ['分析', 'Analysis'], icon: 'search', path: lab('analysis'),
+        active: view === 'lab' && labPage === 'analysis' },
+      { label: ['下载', 'Downloads'], icon: 'download', path: lab('models'),
         active: view === 'lab' && labPage === 'models' },
-      { label: ['评测与数据集', 'Evaluations'], icon: 'activity', path: lab('evaluations'),
+      { label: ['测评', 'Evaluations'], icon: 'activity', path: lab('evaluations'),
         active: view === 'lab' && labPage === 'evaluations' },
-      { label: ['量化工作台', 'Quantization'], icon: 'tools', path: lab('quantization'),
+      { label: ['量化', 'Quantization'], icon: 'tools', path: lab('quantization'),
         active: view === 'lab' && labPage === 'quantization' },
     ] },
     { label: ['系统', 'System'], items: [

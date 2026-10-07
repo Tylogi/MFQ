@@ -19,6 +19,7 @@ describe('Studio 页面路由', () => {
     ['/model-hub', 'lab', 'models'],
     ['/evaluations', 'lab', 'evaluations'],
     ['/quantization', 'lab', 'quantization'],
+    ['/analysis', 'lab', 'analysis'],
     ['/chat', 'chat', 'overview'],
   ])('解析深链接 %s', (path, view, page) => {
     const location = resolveStudioLocation(path);

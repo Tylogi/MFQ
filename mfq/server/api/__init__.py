@@ -23,6 +23,7 @@ from mfq.server.api.routes.mcp import router as mcp_router
 from mfq.server.api.routes.media import router as media_router
 from mfq.server.api.routes.models import hub_router
 from mfq.server.api.routes.models import router as model_router
+from mfq.server.api.routes.quantization import router as quantization_router
 from mfq.server.api.routes.openai import router as openai_router
 from mfq.server.api.routes.runtime import profile_router
 from mfq.server.api.routes.runtime import router as runtime_router
@@ -148,6 +149,7 @@ def create_app(
     app.include_router(media_router)
     app.include_router(mcp_router)
     app.include_router(model_router)
+    app.include_router(quantization_router)
     app.include_router(runtime_router)
 
     if web_root is not None:

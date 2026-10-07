@@ -1,6 +1,7 @@
 /** 封装 models 领域资源请求，不保存组件状态。 */
 import type {
   ModelArtifact,
+  CheckpointAnalysis,
   ModelDirectoryList,
   HubModelSummary,
   HubModelInfo,
@@ -28,6 +29,10 @@ export const modelsApi = {
 
   modelArtifactDirectory(modelId: string): Promise<ModelDirectoryList> {
     return request(`/api/v1/models/${encodeURIComponent(modelId)}/directory`);
+  },
+
+  checkpointAnalysis(modelId: string, signal?: AbortSignal): Promise<CheckpointAnalysis> {
+    return request(`/api/v1/models/${encodeURIComponent(modelId)}/analysis`, { signal });
   },
 
   openModelDirectoryInFinder(directoryId: string): Promise<{ opened: boolean }> {

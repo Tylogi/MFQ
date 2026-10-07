@@ -15,9 +15,10 @@ import { ThroughputTable, AnswerDetails, exportEvaluation, resultObjects } from 
 import { OfficialDatasets } from './OfficialDatasets';
 import { taskBenchmarks, taskBenchmarkGroups, type TaskBenchmark } from './benchmarkTasks';
 import { BenchmarkMark, BenchmarkGroupMark } from './BenchmarkMarks';
+import type { GeneratedWt2Reference } from './Wt2ReferenceGenerator';
 
 const activeJob = (job: JobResource) => ['queued', 'running', 'cancelling'].includes(job.status);
-const evaluationJob = (job: JobResource) => ['evaluate.wikitext2', 'benchmark.inference', 'evaluate.accuracy', 'dataset.download'].includes(job.kind);
+const evaluationJob = (job: JobResource) => ['evaluate.wikitext2', 'reference.wikitext2', 'benchmark.inference', 'evaluate.accuracy', 'dataset.download'].includes(job.kind);
 const metricKeys = ['kld', 'top1_agreement', 'decode_prefill_tps', 'decode_decode_tps', 'mtp_prefill_tps', 'mtp_decode_tps', 'mtp_acceptance_rate', 'accuracy', 'correct', 'sample_count', 'question_count'] as const;
 
 export function EvaluationsPage() {
@@ -36,6 +37,7 @@ export function EvaluationsPage() {
   const [selected, setSelected] = useState<string[]>([]);
   const [comparison, setComparison] = useState<EvaluationComparison | null>(null);
   const [resultKind, setResultKind] = useState('all');
+  const [generatedReference, setGeneratedReference] = useState<GeneratedWt2Reference | null>(null);
   const metricLabels: Record<string, string> = {
     kld: 'KLD', top1_agreement: tr('Top1 一致率', 'Top1 agreement'),
     decode_prefill_tps: tr('普通 prefill', 'Ordinary prefill'), decode_decode_tps: tr('普通 decode', 'Ordinary decode'),
@@ -150,7 +152,7 @@ export function EvaluationsPage() {
           }))}</section>)}</div>
       </div>
       <div className="evaluation-configuration"><div className="evaluation-config-heading"><span>{task?.name || tr('测试条件', 'Test conditions')}</span><small>{task ? tr('官方评分', 'Official scoring') : tab === 'quality' ? 'WT2 · reference logits' : 'MFQ · native timing'}</small></div>
-      {tab === 'quality' && <QualityForm models={models} datasets={datasets} instances={instances} available={!!tools?.quality_available} busy={busy} submit={submit} tr={tr} />}
+      {tab === 'quality' && <QualityForm models={models} datasets={datasets} instances={instances} available={!!tools?.quality_available} referenceAvailable={!!tools?.reference_available} outputRoot={tools?.workspace_root || ''} generatedReference={generatedReference} busy={busy} submit={submit} tr={tr} />}
       {tab === 'performance' && <PerformanceForm instances={instances} available={!!tools?.benchmark_available} busy={busy} submit={submit} tr={tr} />}
       {task && <AccuracyForm key={task.id} task={task} instances={instances} datasets={datasets} available={!!tools?.task_benchmarks?.[task.dataset]?.available} readiness={tools?.task_benchmarks?.[task.dataset]} busy={busy} submit={submit} tr={tr} />}
       </div>
@@ -159,10 +161,19 @@ export function EvaluationsPage() {
     <div className="evaluation-results-view" hidden={view !== 'results'}>
     {jobs.length > 0 && <section className="tm-panel"><details open={hasActiveJobs}><summary className="evaluation-job-heading">{tr('评测任务', 'Evaluation jobs')}<small>{tr(`${jobs.filter(activeJob).length} 个正在运行`, `${jobs.filter(activeJob).length} active`)}</small></summary>
       <div className="evaluation-job-list">{jobs.slice(0, 8).map((job) => <div key={job.id}>
-        <div><strong>{job.kind === 'benchmark.inference' ? tr('推理测速', 'Inference benchmark') : job.kind === 'evaluate.accuracy' ? String(datasets.find((item) => item.id === job.payload.dataset_id)?.metadata.task || tr('任务 benchmark', 'Task benchmark')) : job.kind === 'dataset.download' ? tr('官方集合下载', 'Official collection download') : 'WT2 KLD / Top1'}</strong><small>{statusLabels[job.status]} · {(job.progress * 100).toFixed(0)}%</small></div>
+        <div><strong>{job.kind === 'benchmark.inference' ? tr('推理测速', 'Inference benchmark') : job.kind === 'evaluate.accuracy' ? String(datasets.find((item) => item.id === job.payload.dataset_id)?.metadata.task || tr('任务 benchmark', 'Task benchmark')) : job.kind === 'dataset.download' ? tr('官方集合下载', 'Official collection download') : job.kind === 'reference.wikitext2' ? tr('WT2 logits 生成', 'WT2 logits generation') : 'WT2 KLD / Top1'}</strong><small>{statusLabels[job.status]} · {(job.progress * 100).toFixed(0)}%</small></div>
         <progress aria-label={tr('评测进度', 'Evaluation progress')} max={1} value={job.progress} />
+        {activeJob(job) && job.progress_data?.source_loading?.fallback_reason === 'insufficient_memory' && <p role="status">{tr('空余内存不足，正在逐层生成。', 'Insufficient free memory; generating layerwise.')}</p>}
         {activeJob(job) && <button type="button" disabled={job.status === 'cancelling'} onClick={() => void cancel(job.id)}>{tr('取消', 'Cancel')}</button>}
         {job.error && <p role="status">{job.error.message}</p>}
+        {job.kind === 'reference.wikitext2' && job.status === 'succeeded' && typeof job.result?.output === 'string' && typeof job.result.manifest === 'string' && <div className="evaluation-reference-result">
+          <p>{job.result.output}</p><p>{job.result.manifest}</p>
+          {!!job.result.loading && typeof job.result.loading === 'object' && 'fallback_reason' in job.result.loading && job.result.loading.fallback_reason === 'insufficient_memory' && <p role="status">{tr('启动时空余内存不足，已自动改为逐层生成。', 'Free memory was insufficient at startup; generation automatically used layerwise loading.')}</p>}
+          <button type="button" onClick={() => {
+            setGeneratedReference({ id: job.id, output: String(job.result!.output), manifest: String(job.result!.manifest), context_size: Number(job.result!.context_size), chunks: Number(job.result!.chunks), parallel: 1, dataset_id: String(job.result!.dataset_id) });
+            setTab('quality'); setView('configure');
+          }}>{tr('用于 WT2 评测', 'Use for WT2 evaluation')}</button>
+        </div>}
       </div>)}</div></details>
     </section>}
     <section className="tm-panel evaluation-history"><div className="panel-heading"><div><h2>{tr('历史结果', 'Result history')}</h2><p>{tr('保存测试条件、实际 token 数与每轮原始数据；仅对比相同条件的结果', 'Conditions, actual token counts and raw rounds are saved; compare only matching conditions')}</p></div><b>{evaluations.length}</b></div>

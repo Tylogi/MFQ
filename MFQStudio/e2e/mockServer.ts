@@ -63,6 +63,7 @@ export const officialCatalog: OfficialModelList = {
 };
 
 interface MockOptions {
+  language?: 'zh-CN' | 'en';
   /** 首次生成后的历史查询返回失败，供验证手动恢复且不重复提交。 */
   failFirstSync?: boolean;
   /** 挂起生成请求直到用户调用取消接口。 */
@@ -80,18 +81,22 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
   let responses: ResponseResource[] = [];
   let failedSync = false;
   let releasePending: (() => void) | undefined;
-  await page.addInitScript(() => {
+  await page.addInitScript((language) => {
     localStorage.setItem(
       'mfq.studio.generation.v1',
-      JSON.stringify({ language: 'en', theme: 'light' }),
+      JSON.stringify({ language, theme: 'light' }),
     );
-  });
+  }, options.language ?? 'en');
   await page.route('**/api/v1/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
     const method = route.request().method();
     state.requests.push(`${method} ${path}`);
     const json = async (value: unknown) => route.fulfill({ json: value });
     if (path === '/api/v1/hub/official') return json(officialCatalog);
+    if (path === '/api/v1/quantization/workspace' && method === 'GET')
+      return json({ import_directory: '/models', export_directory: '/outputs',
+        candidates: ['NVQ3J-L', 'NINT4', 'NINT8'],
+        candidate_groups: { NVQ: ['NVQ3J-L'], NINT: ['NINT4', 'NINT8'] }, official_imatrix_url: null });
     if (path === '/api/v1/runtime/status')
       return json({
         runtime_state: 'ready',

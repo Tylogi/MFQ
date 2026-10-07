@@ -30,6 +30,7 @@ from mfq.server.state.catalog import (
     ModelDirectoryNotFoundError,
     ModelRegistrationError,
 )
+from mfq.server.services.checkpoint_analysis import analyze_checkpoint
 from mfq.server.services.documents import DocumentExtractionError, extract_document
 from mfq.server.services.evaluation_datasets import official_for_digest
 from mfq.server.services.hub import (
@@ -46,6 +47,7 @@ from mfq.server.services.jobs import (
     TypedJobHandler,
 )
 from mfq.server.services.mcp import McpClient, McpError
+from mfq.server.protocol.analysis import CheckpointAnalysis
 from mfq.server.protocol.models import (
     AppendMessageRequest,
     AppendMessageResult,
@@ -1086,6 +1088,18 @@ class ServerService:
             raise ServiceError(404, "model_artifact_not_found", "model artifact is unavailable") from error
         directory = artifact.path if artifact.resource.format == "hf" else artifact.path.parent
         return await self.model_directories(path=str(directory))
+
+    async def checkpoint_analysis(self, model_id: str) -> CheckpointAnalysis:
+        if self.catalog is None:
+            raise ServiceError(501, "model_catalog_unavailable", "model catalog is unavailable")
+        try:
+            artifact = await self.catalog.get(model_id)
+        except ModelArtifactNotFoundError as error:
+            raise ServiceError(404, "model_artifact_not_found", "model artifact is unavailable") from error
+        try:
+            return await asyncio.to_thread(analyze_checkpoint, artifact)
+        except (ValueError, OSError) as error:
+            raise ServiceError(422, "checkpoint_analysis_unavailable", "checkpoint is incomplete or its metadata cannot be read") from error
 
     async def open_model_directory(self, request: OpenModelDirectoryRequest) -> OpenModelDirectoryResult:
         if self.catalog is None:

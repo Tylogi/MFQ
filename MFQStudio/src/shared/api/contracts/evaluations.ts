@@ -54,6 +54,7 @@ export interface EvaluationTools {
   workspace_root: string | null;
   api_base: string;
   quality_available: boolean;
+  reference_available?: boolean;
   benchmark_available: boolean;
   accuracy_available: boolean;
   task_benchmarks?: Record<string, OfficialBenchmarkReadiness>;

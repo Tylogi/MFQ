@@ -4,6 +4,7 @@ import { EvaluationsPage } from './EvaluationsPage';
 import { evaluationsApi } from '../../shared/api/resources/evaluations';
 import { modelsApi } from '../../shared/api/resources/models';
 import { jobsApi } from '../../shared/api/resources/jobs';
+import { quantizationApi } from '../../shared/api/resources/quantization';
 import { toast } from '../../stores/toastStore';
 import type { DatasetResource, EvaluationResult, JobResource, ModelArtifact, RuntimeInstance, OfficialDataset } from '../../shared/api/types';
 
@@ -13,6 +14,7 @@ vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => state }));
 vi.mock('../../shared/api/resources/evaluations', () => ({ evaluationsApi: { datasets: vi.fn(), evaluations: vi.fn(), tools: vi.fn(), catalog: vi.fn(), createDataset: vi.fn(), deleteDataset: vi.fn(), compareEvaluations: vi.fn() } }));
 vi.mock('../../shared/api/resources/models', () => ({ modelsApi: { modelArtifacts: vi.fn() } }));
 vi.mock('../../shared/api/resources/jobs', () => ({ jobsApi: { jobs: vi.fn(), createJob: vi.fn(), cancelJob: vi.fn() } }));
+vi.mock('../../shared/api/resources/quantization', () => ({ quantizationApi: { source: vi.fn(), workspace: vi.fn(), loadingPlan: vi.fn() } }));
 
 const job = { id: 'job', kind: 'benchmark.inference', status: 'queued', progress: 0, payload: {}, cancel_requested: false } as JobResource;
 beforeEach(() => {
@@ -20,7 +22,7 @@ beforeEach(() => {
   vi.mocked(evaluationsApi.datasets).mockResolvedValue([{ id: 'wt2', kind: 'wikitext2', name: 'WT2', sha256: 'a'.repeat(64) }] as DatasetResource[]);
   vi.mocked(evaluationsApi.evaluations).mockResolvedValue([]);
   vi.mocked(evaluationsApi.catalog).mockResolvedValue([{ id: 'wt2-raw-test', name: 'WikiText-2 raw · test', kind: 'wikitext2', sha256: 'a'.repeat(64), byte_size: 732610, rows: 4358, repository: 'Salesforce/wikitext', revision: 'b'.repeat(40), filename: 'test.parquet', license: 'CC BY-SA 3.0 / GFDL' }] as OfficialDataset[]);
-  vi.mocked(evaluationsApi.tools).mockResolvedValue({ workspace_root: '/workspace', api_base: 'http://127.0.0.1:8090/v1', quality_available: true, benchmark_available: true, accuracy_available: true, task_benchmarks: {
+  vi.mocked(evaluationsApi.tools).mockResolvedValue({ workspace_root: '/workspace', api_base: 'http://127.0.0.1:8090/v1', quality_available: true, reference_available: true, benchmark_available: true, accuracy_available: true, task_benchmarks: {
     'mmlu-pro-test': { available: true, repository: 'TIGER-AI-Lab/MMLU-Pro', revision: 'a'.repeat(40), protocol: 'official-api-cot', scoring_files: {}, defaults: { available: true, source: 'evaluate_from_api.py', parameters: { protocol: 'mcq', sample_count: 0, max_tokens: 4000, seed: null, temperature: 0, top_p: 1, top_k: 0, num_generations: 1, enable_thinking: false, enable_mtp: false } } },
   } });
   vi.mocked(modelsApi.modelArtifacts).mockResolvedValue([{ id: 'model', name: 'Qwen model', format: 'mfq', complete: true }] as ModelArtifact[]);
@@ -28,6 +30,36 @@ beforeEach(() => {
   vi.mocked(jobsApi.createJob).mockResolvedValue(job);
 });
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.clearAllMocks(); });
+
+it('generates official WT2 references from source weights with layerwise loading by default', async () => {
+  vi.mocked(quantizationApi.source).mockResolvedValue({ path: '/source', architecture: 'qwen3_5', tensors: 10, parameters: 800000000, format: 'hf', full_precision: true, imatrix_supported: true, source_precisions: ['BF16'] });
+  render(<EvaluationsPage />);
+  await screen.findByRole('option', { name: 'Qwen model' });
+  fireEvent.click(screen.getByText('Generate WT2 logits from original model'));
+  fireEvent.change(screen.getByLabelText('Original model directory'), { target: { value: '/source' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Inspect model' }));
+  await screen.findByText(/qwen3_5 · BF16/);
+  expect(screen.getByRole('checkbox', { name: 'Layerwise' })).toBeChecked();
+  fireEvent.change(screen.getByLabelText('Reference logits output path'), { target: { value: '/outputs/wt2.logits' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Generate WT2 logits' }));
+  await waitFor(() => expect(jobsApi.createJob).toHaveBeenCalledWith('reference.wikitext2', {
+    model: '/source', dataset_id: 'wt2', output: '/outputs/wt2.logits', context_size: 512, chunks: 8, layerwise: true,
+  }));
+});
+
+it('uses generated paths and geometry for WT2 evaluation without duplicating scoring results', async () => {
+  vi.mocked(jobsApi.jobs).mockResolvedValue([{ ...job, id: 'ref', kind: 'reference.wikitext2', status: 'succeeded', progress: 1,
+    result: { output: '/outputs/ref.logits', manifest: '/outputs/ref.manifest.json', context_size: 1024, chunks: 4, dataset_id: 'wt2' } }]);
+  render(<EvaluationsPage />);
+  await screen.findByRole('option', { name: 'Qwen model' });
+  fireEvent.click(screen.getByRole('button', { name: 'Jobs & results' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Use for WT2 evaluation' }));
+  expect(screen.getByLabelText('Reference logits file')).toHaveValue('/outputs/ref.logits');
+  expect(screen.getByLabelText('Reference manifest')).toHaveValue('/outputs/ref.manifest.json');
+  expect(screen.getByLabelText('ctx')).toHaveValue(1024);
+  expect(screen.getByLabelText('Context windows')).toHaveValue(4);
+  expect(screen.getByLabelText('Parallel sequences')).toHaveValue(1);
+});
 
 it('ignores a submitted job that finishes after leaving the evaluation page', async () => {
   let finish!: (value: JobResource) => void;

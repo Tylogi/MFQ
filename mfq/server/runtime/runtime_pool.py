@@ -1337,6 +1337,13 @@ class RuntimePool:
         await context.progress(1.0, message="Model unloaded")
         return {"instance_id": str(instance.id), "unloaded": True}
 
+    async def quantization_pressure(self) -> dict[str, bool]:
+        async with self._lock:
+            return {'busy': self._memory_configuration_job is not None or any(
+                item.active_requests or item.queued_requests or item.control_leases > item.read_control_leases
+                or item.state not in {RuntimeInstanceState.READY, RuntimeInstanceState.FAILED}
+                for item in self._instances.values())}
+
     async def instances(self) -> RuntimeInstanceList:
         async with self._lock:
             values = list(self._instances.values())

@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
 import type { ModelCacheProfile } from '../../shared/api/types';
 import { cacheUsageBytes, estimateCacheBytes, KvCachePlanner } from './KvCachePlanner';
+import { analysisFixture } from '../../../tests/fixtures/checkpointAnalysis';
 
 const profile: ModelCacheProfile = {
   max_context: 10000, fixed_bytes: 1024,
@@ -92,4 +93,20 @@ it('allows clearing an applied plan and explains unavailable model metadata', ()
   view.rerender(<KvCachePlanner onApply={onApply} tr={(_, en) => en} />);
   expect(screen.getByText('Insufficient cache structure metadata for a reliable estimate.')).toBeInTheDocument();
   expect(screen.queryByRole('spinbutton')).not.toBeInTheDocument();
+});
+
+it('calculates QSA raw KV, indexer and total caches without runtime state or an Apply action', () => {
+  const profile = analysisFixture().cache_profile!;
+  const { container } = render(<KvCachePlanner profile={profile} tr={(_, en) => en} />);
+  fireEvent.click(screen.getByText('KV Cache curve & calculator'));
+  expect(screen.queryByRole('button', { name: 'Apply' })).not.toBeInTheDocument();
+  expect(screen.getByRole('row', { name: /QSA total cache/ })).toHaveTextContent('28.5 MiB');
+  expect(screen.getByRole('row', { name: /^Raw KV cache/ })).toHaveTextContent('24.0 MiB');
+  expect(screen.getByRole('row', { name: /^Indexer cache/ })).toHaveTextContent('4.5 MiB');
+  expect(screen.getByRole('row', { name: /^Indexer key cache/ })).toHaveTextContent('3.0 MiB');
+  expect(screen.getByRole('row', { name: /^Indexer pooled cache/ })).toHaveTextContent('1.5 MiB');
+  expect(container.querySelectorAll('[data-cache-curve]')).toHaveLength(3);
+  fireEvent.click(screen.getByRole('button', { name: 'ctx 8192' }));
+  expect(screen.getByRole('row', { name: /QSA total cache/ })).toHaveTextContent('57.0 MiB');
+  expect(screen.queryByRole('row', { name: /GDN|PLE/ })).not.toBeInTheDocument();
 });

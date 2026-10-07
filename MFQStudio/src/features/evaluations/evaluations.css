@@ -55,6 +55,9 @@
 .evaluation-note code { font-size: 11px; }
 .evaluation-run, .evaluation-actions button, .evaluation-job-list button { min-height: 38px; border: 1px solid var(--line); border-radius: 8px; padding: 9px 16px; color: var(--ink-soft); background: var(--surface-control); font: inherit; font-size: 12px; cursor: pointer; }
 .evaluation-run { border-color: var(--accent-border); color: var(--accent); background: var(--accent-soft); }
+.wt2-reference-generator .qw-path-row > button { display: inline-flex; align-items: center; justify-content: center; min-height: 40px; border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; color: var(--ink-soft); background: var(--surface-control); font: inherit; font-size: 11.5px; cursor: pointer; }
+.wt2-reference-generator > .evaluation-run { margin-bottom: 18px; }
+.evaluation-reference-result p { color: var(--muted); font-size: 11px; line-height: 1.7; overflow-wrap: anywhere; }
 .evaluation-run-footer { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-top: 24px; padding-top: 22px; border-top: 1px solid var(--line-soft); }
 .evaluation-run-footer > span { color: var(--muted); font-size: 12px; }
 .evaluation-run-footer > button { flex: 0 0 auto; }

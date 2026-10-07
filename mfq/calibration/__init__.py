@@ -34,6 +34,7 @@ _MODULE_EXPORTS: dict[str, tuple[str, ...]] = {
         "scheme_expert_specs",
     ),
     "collector": ("HiddenTrace", "validate_layerwise"),
+    "chat": ("CalibrationChatRenderer", "prepare_calibration_corpus"),
     "dataset": (
         "CalibrationBatch",
         "CalibrationCorpus",
@@ -106,6 +107,7 @@ __all__ = [
     "AllocationResult",
     "CalibrationBatch",
     "CalibrationCorpus",
+    "CalibrationChatRenderer",
     "CalibrationScheme",
     "CalibrationStatistics",
     "ExpertPrecision",
@@ -149,6 +151,7 @@ __all__ = [
     "load_candidate_document",
     "load_candidate_table",
     "load_corpus",
+    "prepare_calibration_corpus",
     "load_importance_document",
     "load_importance_table",
     "load_inint_selector",
