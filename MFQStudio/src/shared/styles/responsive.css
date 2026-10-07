@@ -21,11 +21,11 @@
 }
 
 @media (max-width: 980px) {
-  .app-shell { grid-template-columns: 220px minmax(0, 1fr); }
+  .app-shell { grid-template-columns: 200px minmax(0, 1fr); }
 }
 
 @media (max-width: 860px) {
-  .app-shell { grid-template-columns: 220px minmax(0, 1fr); }
+  .app-shell { grid-template-columns: 200px minmax(0, 1fr); }
   .tm-panel.runtime-hero { grid-template-columns: 46px minmax(0, 1fr); }
   .model-monogram { width: 46px; height: 46px; font-size: 24px; }
   .runtime-hero-actions { grid-column: 1 / -1; }
@@ -79,7 +79,7 @@
     position: fixed;
     inset: 0 auto 0 0;
     z-index: 31;
-    width: min(300px, 88vw);
+    width: min(200px, 88vw);
     border-right: 1px solid var(--sidebar-line);
     box-shadow: 18px 0 48px rgb(0 0 0 / 22%);
     transform: translateX(-104%);
