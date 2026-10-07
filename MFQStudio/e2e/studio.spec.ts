@@ -184,9 +184,14 @@ test('三家架构标识贯穿模型页面，保持描线、无边框和靠右�
   const row = page.locator('.model-library-panel .model-row').first();
   const nameBox = await row.getByText(models[0].name, { exact: true }).boundingBox();
   const markBox = await row.locator('.model-vendor-mark').boundingBox();
-  expect(markBox!.x).toBeGreaterThan(nameBox!.x + nameBox!.width);
+  if (testInfo.project.name === 'mobile') {
+    expect(markBox!.y).toBeGreaterThan(nameBox!.y + nameBox!.height);
+  } else {
+    expect(markBox!.x).toBeGreaterThan(nameBox!.x + nameBox!.width);
+  }
   const rowButton = await row.locator('button').first().boundingBox();
   expect(markBox!.x + markBox!.width).toBeLessThan(rowButton!.x);
+  expect(Math.abs(markBox!.y + markBox!.height / 2 - rowButton!.y - rowButton!.height / 2)).toBeLessThanOrEqual(1);
   await navigateClient(page, '/runtime');
   await expect(page.locator('.server-model-control')).toBeVisible();
   await expect(page.locator('.server-model-control .model-vendor-mark')).toHaveCount(0);
