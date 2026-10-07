@@ -1284,8 +1284,8 @@ void test_fixture(const Fixture& fixture) {
         1e-5f,
         fixture.dtype + " dequantize");
 
-    constexpr std::array<int, 3> packed_rows{
-        1, 4, 17,
+    constexpr std::array<int, 8> packed_rows{
+        1, 4, 7, 13, 17, 21, 29, 47,
     };
     for (const int rows : packed_rows) {
         auto input = input_values(

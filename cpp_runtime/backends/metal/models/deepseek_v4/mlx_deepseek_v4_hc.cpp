@@ -24,6 +24,8 @@ constexpr int kThreads = 256;
 constexpr int kSinkhornIterations = 20;
 
 constexpr const char* kHcPreSource = R"METAL(
+    const int ROWS = residual_shape[0] * residual_shape[1];
+    const int REDUCED_BYTES = ROWS * HIDDEN * 2;
     constexpr uint CONNECTIONS = 4u;
     constexpr uint MIX_WIDTH = 24u;
     uint row = threadgroup_position_in_grid.x;
@@ -224,6 +226,7 @@ constexpr const char* kHcPreSource = R"METAL(
 )METAL";
 
 constexpr const char* kHcPostSource = R"METAL(
+    const int SIZE = residual_shape[0] * residual_shape[1] * 4 * HIDDEN;
     uint index = thread_position_in_grid.x;
     if (index >= uint(SIZE)) {
         return;
@@ -453,7 +456,6 @@ array hc_post_impl(
         {size, 1, 1},
         {std::min(kThreads, size), 1, 1},
         {
-            {"SIZE", size},
             {"HIDDEN", hidden},
             {"ADD_BRANCH", static_cast<int>(add_branch)},
             {"PACKED_META", packed_metadata.has_value() ? 1 : 0},
@@ -533,9 +535,7 @@ MlxDeepseekV4HcPreResult deepseek_v4_hc_pre(
         {rows * kThreads, 1, 1},
         {kThreads, 1, 1},
         {
-            {"ROWS", rows},
             {"HIDDEN", hidden},
-            {"REDUCED_BYTES", reduced_bytes},
             {"NORMALIZE", 0},
             {"SCALE_MIXES", 0},
         },
@@ -655,9 +655,7 @@ MlxDeepseekV4HcPreResult deepseek_v4_hc_pre_norm(
         {rows * kThreads, 1, 1},
         {kThreads, 1, 1},
         {
-            {"ROWS", rows},
             {"HIDDEN", hidden},
-            {"REDUCED_BYTES", reduced_bytes},
             {"NORMALIZE", 1},
             {
                 "SCALE_MIXES",

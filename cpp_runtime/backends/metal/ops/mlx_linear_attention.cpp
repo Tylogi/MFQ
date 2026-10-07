@@ -1,4 +1,5 @@
 #include "mlx_linear_attention.h"
+#include "mlx_kernel_prepare.h"
 
 #include <algorithm>
 #include <array>
@@ -27,6 +28,52 @@ using mlx::core::MathMode;
 using mlx::core::Shape;
 using mlx::core::array;
 
+const mlx::core::fast::CustomKernelFunction& gdn_output_norm_kernel() {
+    static const auto kernel = [] {
+        CompileOptions options;
+        options.math_mode = MathMode::Safe;
+        return mlx::core::fast::metal_kernel(
+            "mfq_cpp_gated_delta_output_norm",
+            {"recurrent", "gate", "weight", "epsilon"},
+            {"output"},
+            R"METAL(
+                const uint TOKENS = uint(recurrent_shape[2]);
+                uint task = threadgroup_position_in_grid.x * 4u +
+                    simdgroup_index_in_threadgroup;
+                if (task >= uint(B * TOKENS * HEADS)) return;
+                uint lane = thread_index_in_simdgroup;
+                uint head = task % uint(HEADS);
+                uint row = task / uint(HEADS);
+                uint token = row % uint(TOKENS);
+                uint batch = row / uint(TOKENS);
+                uint source = ((batch * uint(HEADS) + head) *
+                    uint(TOKENS) + token) * uint(D);
+                float values[uint(D) / 32u];
+                float squares = 0.0f;
+                for (uint item = 0u; item < uint(D) / 32u; ++item) {
+                    float value = float(recurrent[source + item * 32u + lane]);
+                    values[item] = value;
+                    squares += value * value;
+                }
+                float inverse = rsqrt(simd_sum(squares) / float(D) + epsilon[0]);
+                for (uint item = 0u; item < uint(D) / 32u; ++item) {
+                    uint feature = item * 32u + lane;
+                    uint destination = task * uint(D) + feature;
+                    float z = float(gate[destination]);
+                    float activation = 1.0f / (1.0f + metal::precise::exp(-z));
+                    if (SILU_GATE != 0) activation = z * activation;
+                    float normalized = values[item] * inverse * weight[feature];
+                    output[destination] = T(normalized * activation);
+                }
+            )METAL",
+            "",
+            true,
+            false,
+            options);
+    }();
+    return kernel;
+}
+
 const mlx::core::fast::CustomKernelFunction& gdn_gates_kernel() {
     static const auto kernel = [] {
         CompileOptions options;
@@ -36,6 +83,7 @@ const mlx::core::fast::CustomKernelFunction& gdn_gates_kernel() {
             {"alpha", "beta", "bias", "decay"},
             {"gate_out", "beta_out"},
             R"METAL(
+                const uint TOKENS = uint(alpha_shape[1]);
                 uint index = thread_position_in_grid.x;
                 if (index >= uint(BATCH * TOKENS * HEADS)) return;
                 uint head = index % uint(HEADS);
@@ -276,7 +324,7 @@ std::string gdn_step_source(
     return source;
 }
 
-class GdnStepPrimitive final : public mlx::core::Primitive {
+class GdnStepPrimitive final : public mlx::core::Primitive, public MlxPreparableKernel {
 public:
     GdnStepPrimitive(mlx::core::Stream stream, GdnStepConfig config)
         : Primitive(stream), config_(config),
@@ -287,6 +335,19 @@ public:
         kernel_name_ += "_" + std::to_string(config_.key_heads) +
             "_" + std::to_string(config_.value_heads) +
             "_" + std::to_string(static_cast<int>(config_.silu));
+    }
+
+    std::string preparation_key() const override { return kernel_name_; }
+    void prepare_gpu() override { (void)prepared_kernel(); }
+
+    MTL::ComputePipelineState* prepared_kernel() {
+        auto& device = mlx::core::metal::device(stream().device);
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(
+            kernel_name_, options,
+            [this] { return gdn_step_source(config_, kernel_name_); });
+        return device.get_kernel(kernel_name_, library);
     }
 
     void eval_cpu(
@@ -301,15 +362,10 @@ public:
         for (auto& output : outputs) {
             output.set_data(mlx::core::allocator::malloc(output.nbytes()));
         }
-        auto& device = mlx::core::metal::device(stream().device);
-        CompileOptions options;
-        options.math_mode = MathMode::Fast;
-        auto* library = device.get_library(
-            kernel_name_, options,
-            [this] { return gdn_step_source(config_, kernel_name_); });
+        auto* kernel = prepared_kernel();
         auto& encoder = mlx::core::metal::get_command_encoder(stream());
         encoder.set_compute_pipeline_state(
-            device.get_kernel(kernel_name_, library));
+            kernel);
         for (int index = 0; index < static_cast<int>(inputs.size()); ++index) {
             encoder.set_input_array(inputs[index], index);
         }
@@ -330,6 +386,22 @@ private:
 };
 
 constexpr const char* kCachedDepthwiseConvHeader = R"METAL(
+template <typename T>
+inline float mfq_cached_depthwise_input_value(
+    const device T* input,
+    uint batch,
+    uint token,
+    uint channel,
+    uint tokens,
+    uint channels,
+    const constant int64_t* strides) {
+    int64_t offset = strides != nullptr
+        ? int64_t(batch) * strides[0] + int64_t(token) * strides[1] +
+            int64_t(channel) * strides[2]
+        : int64_t(batch * tokens + token) * channels + channel;
+    return float(input[offset]);
+}
+
 template <
     typename StateT,
     typename FirstT,
@@ -351,7 +423,9 @@ inline float mfq_cached_depthwise_conv_value(
     uint kernel_size,
     uint dilation,
     uint state_length,
-    bool has_bias) {
+    bool has_bias,
+    const constant int64_t* first_strides = nullptr,
+    const constant int64_t* second_strides = nullptr) {
     float value = has_bias ? float(bias[channel]) : 0.0f;
     for (uint tap = 0u; tap < kernel_size; ++tap) {
         int source_token = int(token) + int(tap * dilation) -
@@ -362,14 +436,14 @@ inline float mfq_cached_depthwise_conv_value(
             source = float(state[
                 (batch * state_length + state_row) * channels + channel]);
         } else if (channel < first_channels) {
-            source = float(first[
-                (batch * tokens + uint(source_token)) * first_channels +
-                channel]);
+            source = mfq_cached_depthwise_input_value(
+                first, batch, uint(source_token), channel, tokens,
+                first_channels, first_strides);
         } else {
             uint second_channels = channels - first_channels;
-            source = float(second[
-                (batch * tokens + uint(source_token)) * second_channels +
-                channel - first_channels]);
+            source = mfq_cached_depthwise_input_value(
+                second, batch, uint(source_token), channel - first_channels,
+                tokens, second_channels, second_strides);
         }
         value += source * float(weight[channel * kernel_size + tap]);
     }
@@ -387,7 +461,9 @@ inline float mfq_cached_depthwise_state_value(
     uint tokens,
     uint channels,
     uint first_channels,
-    uint state_length) {
+    uint state_length,
+    const constant int64_t* first_strides = nullptr,
+    const constant int64_t* second_strides = nullptr) {
     uint combined = tokens + state_row;
     if (combined < state_length) {
         return float(state[
@@ -395,17 +471,19 @@ inline float mfq_cached_depthwise_state_value(
     }
     uint source_token = combined - state_length;
     if (channel < first_channels) {
-        return float(first[
-            (batch * tokens + source_token) * first_channels + channel]);
+        return mfq_cached_depthwise_input_value(
+            first, batch, source_token, channel, tokens,
+            first_channels, first_strides);
     }
     uint second_channels = channels - first_channels;
-    return float(second[
-        (batch * tokens + source_token) * second_channels +
-        channel - first_channels]);
+    return mfq_cached_depthwise_input_value(
+        second, batch, source_token, channel - first_channels,
+        tokens, second_channels, second_strides);
 }
 )METAL";
 
 constexpr const char* kGatedDeltaNetSource = R"METAL(
+    const uint TOKENS = uint(v_shape[2]);
     constexpr uint SIMD_WIDTH = 32u;
     constexpr uint SIMD_GROUPS = 4u;
     constexpr uint ROWS = (uint(D) + SIMD_WIDTH - 1u) / SIMD_WIDTH;
@@ -533,141 +611,10 @@ constexpr const char* kGatedDeltaNetSource = R"METAL(
     }
 )METAL";
 
-// Blocked-sequential layout adapted from oMLX's Apache-2.0 GDN prefill
-// kernel.  MFQ keeps the operation architecture-neutral here and adapts the
-// input layout, logarithmic decay convention, output scaling, grouped-head
-// mapping, and state orientation to the generic gated_delta_net contract.
-constexpr const char* kGatedDeltaNetBlockedSource = R"METAL(
-    constexpr uint TB = 16u;
-    constexpr uint DB = 32u;
-    constexpr uint SEGMENT = 16u;
-    constexpr uint SEGMENTS = uint(D) / SEGMENT;
-
-    uint tid = thread_index_in_threadgroup;
-    uint block = threadgroup_position_in_grid.x;
-    uint value_head = threadgroup_position_in_grid.y;
-    uint batch = threadgroup_position_in_grid.z;
-    uint value_row = tid / SEGMENTS;
-    uint segment = tid - value_row * SEGMENTS;
-    uint value_dimension = block * DB + value_row;
-    uint key_start = segment * SEGMENT;
-
-    uint query_head = TILED_HEADS != 0
-        ? value_head % uint(HQ)
-        : value_head / uint(HV / HQ);
-
-    threadgroup float key_tile[TB][uint(D) + 8u];
-    threadgroup float query_tile[TB][uint(D) + 8u];
-    threadgroup float value_tile[TB][DB + 8u];
-    threadgroup float decay_tile[TB];
-    threadgroup float beta_tile[TB];
-
-    uint query_base =
-        ((batch * uint(HQ) + query_head) * uint(TOKENS)) * uint(D);
-    uint value_base =
-        ((batch * uint(HV) + value_head) * uint(TOKENS)) * uint(D) +
-        block * DB;
-    uint gate_base =
-        (batch * uint(HV) + value_head) * uint(TOKENS);
-    uint state_base =
-        (batch * uint(HV) + value_head) * uint(D * D);
-
-    float4 state_fragment[4];
-    {
-        const device float4* source =
-            reinterpret_cast<const device float4*>(
-                state_in + state_base + value_dimension * uint(D) +
-                key_start);
-        for (uint item = 0u; item < 4u; ++item) {
-            state_fragment[item] = source[item];
-        }
-    }
-
-    const float output_scale = rsqrt(float(D));
-    for (uint token_start = 0u;
-         token_start < uint(TOKENS);
-         token_start += TB) {
-        uint tile_tokens = min(TB, uint(TOKENS) - token_start);
-
-        for (uint item = tid;
-             item < tile_tokens * uint(D);
-             item += 256u) {
-            uint row = item / uint(D);
-            uint dimension = item - row * uint(D);
-            uint source =
-                query_base + (token_start + row) * uint(D) + dimension;
-            key_tile[row][dimension] = k[source];
-            query_tile[row][dimension] = q[source];
-        }
-        for (uint item = tid;
-             item < tile_tokens * DB;
-             item += 256u) {
-            uint row = item / DB;
-            uint dimension = item - row * DB;
-            value_tile[row][dimension] =
-                v[value_base + (token_start + row) * uint(D) + dimension];
-        }
-        for (uint item = tid; item < tile_tokens; item += 256u) {
-            decay_tile[item] = exp(g[gate_base + token_start + item]);
-            beta_tile[item] = beta[gate_base + token_start + item];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint token = 0u; token < tile_tokens; ++token) {
-            const threadgroup float4* key_values =
-                reinterpret_cast<const threadgroup float4*>(
-                    &key_tile[token][key_start]);
-            const threadgroup float4* query_values =
-                reinterpret_cast<const threadgroup float4*>(
-                    &query_tile[token][key_start]);
-            float decay = decay_tile[token];
-
-            float4 projected = 0.0f;
-            float4 key_fragment[4];
-            for (uint item = 0u; item < 4u; ++item) {
-                key_fragment[item] = key_values[item];
-                state_fragment[item] *= decay;
-                projected += state_fragment[item] * key_fragment[item];
-            }
-            float projected_key =
-                projected.x + projected.y + projected.z + projected.w;
-            projected_key += simd_shuffle_down(projected_key, 4u);
-            projected_key += simd_shuffle_down(projected_key, 2u);
-            projected_key += simd_shuffle_down(projected_key, 1u);
-            uint row_first_lane = (tid & 31u) / SEGMENTS * SEGMENTS;
-            projected_key = simd_shuffle(projected_key, row_first_lane);
-
-            float delta =
-                (value_tile[token][value_row] - projected_key) *
-                beta_tile[token];
-            float4 result = 0.0f;
-            for (uint item = 0u; item < 4u; ++item) {
-                state_fragment[item] += key_fragment[item] * delta;
-                result += state_fragment[item] * query_values[item];
-            }
-            float output = result.x + result.y + result.z + result.w;
-            output += simd_shuffle_down(output, 4u);
-            output += simd_shuffle_down(output, 2u);
-            output += simd_shuffle_down(output, 1u);
-            if (segment == 0u) {
-                out[value_base +
-                    (token_start + token) * uint(D) + value_row] =
-                    output * output_scale;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    {
-        device float4* destination = reinterpret_cast<device float4*>(
-            state_out + state_base + value_dimension * uint(D) + key_start);
-        for (uint item = 0u; item < 4u; ++item) {
-            destination[item] = state_fragment[item];
-        }
-    }
-)METAL";
+#include "../kernels/mfq_gdn_prefill_pipelined.inc"
 
 constexpr const char* kSsmConvSiluSource = R"METAL(
+    const uint TOKENS = uint(x_shape[1]) - uint(K - 1);
     uint index = thread_position_in_grid.x;
     if (index >= uint(B * TOKENS * C)) {
         return;
@@ -736,14 +683,16 @@ constexpr const char* kCachedDepthwiseConvDecodeSource = R"METAL(
 )METAL";
 
 constexpr const char* kLinearConvQkvSource = R"METAL(
-    constexpr uint QK_TASKS = uint(B * TOKENS * 2 * NK);
+    const uint TOKENS = uint(qk_shape[1]);
+    const uint QK_TASKS = uint(B * TOKENS * 2 * NK);
     constexpr uint V_GROUPS = (uint(NV * DV) + 31u) / 32u;
-    constexpr uint V_TASKS = uint(B * TOKENS) * V_GROUPS;
+    const uint V_TASKS = uint(B * TOKENS) * V_GROUPS;
     constexpr uint STATE_SIZE = uint(B * (K - 1) * C);
     constexpr uint STATE_TASKS = (STATE_SIZE + 31u) / 32u;
 
     uint lane = thread_index_in_simdgroup;
-    uint task = threadgroup_position_in_grid.x;
+    uint task = threadgroup_position_in_grid.x * uint(SIMD_GROUPS) +
+        simdgroup_index_in_threadgroup;
 
     if (task < QK_TASKS) {
         uint head = task % uint(NK);
@@ -776,7 +725,8 @@ constexpr const char* kLinearConvQkvSource = R"METAL(
                 uint(K),
                 1u,
                 uint(K - 1),
-                HAS_BIAS != 0);
+                HAS_BIAS != 0,
+                qk_strides, v_in_strides);
             value = value / (1.0f + exp(-value));
             values[local++] = value;
             square_sum += value * value;
@@ -824,7 +774,8 @@ constexpr const char* kLinearConvQkvSource = R"METAL(
                 uint(K),
                 1u,
                 uint(K - 1),
-                HAS_BIAS != 0);
+                HAS_BIAS != 0,
+                qk_strides, v_in_strides);
             value = value / (1.0f + exp(-value));
             uint head = value_index / uint(DV);
             uint dimension = value_index - head * uint(DV);
@@ -855,7 +806,8 @@ constexpr const char* kLinearConvQkvSource = R"METAL(
                 uint(TOKENS),
                 uint(C),
                 uint(QKC),
-                uint(K - 1));
+                uint(K - 1),
+                qk_strides, v_in_strides);
         }
     }
 )METAL";
@@ -895,10 +847,10 @@ const mlx::core::fast::CustomKernelFunction& gdn_blocked_kernel() {
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         return mlx::core::fast::metal_kernel(
-            "mfq_cpp_gated_delta_net_blocked_v1",
+            "mfq_cpp_gated_delta_net_pipelined_v1",
             {"q", "k", "v", "g", "beta", "state_in"},
             {"out", "state_out"},
-            kGatedDeltaNetBlockedSource,
+            gdn_pipeline_source(),
             "",
             true,
             false,
@@ -953,7 +905,7 @@ mlx::core::fast::CustomKernelFunction make_linear_conv_kernel() {
         {"q_out", "k_out", "v_out", "state_out"},
         kLinearConvQkvSource,
         kCachedDepthwiseConvHeader,
-        true,
+        false,
         false,
         options);
 }
@@ -978,6 +930,15 @@ array floating_contiguous(const array& value) {
         result = mlx::core::astype(result, mlx::core::float16);
     }
     return mlx::core::contiguous(result);
+}
+
+array floating_strided(const array& value) {
+    auto result = value;
+    if (result.dtype() != mlx::core::float16 &&
+        result.dtype() != mlx::core::float32) {
+        result = mlx::core::astype(result, mlx::core::float16);
+    }
+    return result;
 }
 
 array real_contiguous(const array& value) {
@@ -1111,7 +1072,6 @@ gdn_templates(
     int batch,
     int query_heads,
     int value_heads,
-    int tokens,
     int dimension,
     bool key_decay_attention,
     bool transposed_state,
@@ -1120,7 +1080,6 @@ gdn_templates(
         {"B", batch},
         {"HQ", query_heads},
         {"HV", value_heads},
-        {"TOKENS", tokens},
         {"D", dimension},
         {"KDA", static_cast<int>(key_decay_attention)},
         {"TRANSPOSED_STATE", static_cast<int>(transposed_state)},
@@ -1172,13 +1131,51 @@ MlxGatedDeltaGates gated_delta_gates(
         {256, 1, 1},
         {
             {"BATCH", alpha.shape(0)},
-            {"TOKENS", alpha.shape(1)},
             {"HEADS", alpha.shape(2)},
         },
         std::nullopt,
         false,
         {});
     return {std::move(outputs.at(0)), std::move(outputs.at(1))};
+}
+
+array gated_delta_output_norm(
+    const array& recurrent,
+    const array& gate,
+    const array& norm_weight,
+    float eps,
+    bool silu_gate,
+    Dtype output_dtype) {
+    const auto floating = [](Dtype dtype) {
+        return dtype == mlx::core::float16 || dtype == mlx::core::bfloat16 ||
+            dtype == mlx::core::float32;
+    };
+    if (recurrent.ndim() != 4 || recurrent.shape(0) <= 0 ||
+        recurrent.shape(1) <= 0 || recurrent.shape(2) <= 0 ||
+        (recurrent.shape(3) != 32 && recurrent.shape(3) != 64 && recurrent.shape(3) != 128) ||
+        gate.shape() != Shape{recurrent.shape(0), recurrent.shape(2),
+            recurrent.shape(1) * recurrent.shape(3)} ||
+        norm_weight.shape() != Shape{recurrent.shape(3)} ||
+        !floating(recurrent.dtype()) || !floating(gate.dtype()) ||
+        !floating(norm_weight.dtype()) || !floating(output_dtype) ||
+        !std::isfinite(eps) || eps <= 0.0f) {
+        throw std::invalid_argument("Gated DeltaNet output norm geometry/dtype mismatch");
+    }
+    const std::int64_t rows = static_cast<std::int64_t>(recurrent.shape(0)) *
+        recurrent.shape(1) * recurrent.shape(2);
+    return gdn_output_norm_kernel()(
+        {mlx::core::contiguous(recurrent), mlx::core::contiguous(gate),
+         float32_contiguous(norm_weight), array({eps}, Shape{1})},
+        {gate.shape()},
+        {output_dtype},
+        {checked_int(((rows + 3) / 4) * 128, "GDN output norm grid"), 1, 1},
+        {128, 1, 1},
+        {{"T", output_dtype}, {"B", recurrent.shape(0)},
+         {"HEADS", recurrent.shape(1)},
+         {"D", recurrent.shape(3)}, {"SILU_GATE", static_cast<int>(silu_gate)}},
+        std::nullopt,
+        false,
+        {}).front();
 }
 
 MlxGatedDeltaDecodeResult gated_delta_decode_step(
@@ -1370,22 +1367,21 @@ MlxGatedDeltaNetResult gated_delta_net_impl(
             ? state_values
             : mlx::core::contiguous(mlx::core::transpose(
                   state_values, {0, 1, 3, 2}));
-        const int value_blocks = dimension / 32;
+        const int value_blocks = dimension / 16;
         auto outputs = gdn_blocked_kernel()(
             {q, k, v, g, beta_values, blocked_state},
             {v.shape(), state_shape},
             {mlx::core::float32, mlx::core::float32},
             {checked_int(
-                 static_cast<std::int64_t>(value_blocks) * 256,
+                 static_cast<std::int64_t>(value_blocks) * 128,
                  "blocked GDN grid"),
              value_heads,
              batch},
-            {256, 1, 1},
+            {128, 1, 1},
             {
                 {"B", batch},
                 {"HQ", query_heads},
                 {"HV", value_heads},
-                {"TOKENS", tokens},
                 {"D", dimension},
                 {"TILED_HEADS", static_cast<int>(tiled_heads)},
             },
@@ -1421,7 +1417,6 @@ MlxGatedDeltaNetResult gated_delta_net_impl(
             batch,
             query_heads,
             value_heads,
-            tokens,
             dimension,
             key_decay_attention,
             transposed_state,
@@ -1493,7 +1488,6 @@ array ssm_conv_silu(
         templates{
             {"T", source.dtype()},
             {"B", batch},
-            {"TOKENS", tokens},
             {"C", channels},
             {"K", packed_weight.kernel},
             {"HAS_BIAS", static_cast<int>(bias_values.present)},
@@ -1646,8 +1640,8 @@ MlxLinearConvQkvResult linear_conv_qkv(
     int value_head_dimension,
     const std::optional<array>& bias,
     float eps) {
-    auto qk_values = floating_contiguous(qk);
-    auto value_values = floating_contiguous(value);
+    auto qk_values = floating_strided(qk);
+    auto value_values = floating_strided(value);
     auto state_values = float32_contiguous(state);
     if (qk_values.ndim() != 3 ||
         value_values.ndim() != 3 ||
@@ -1681,10 +1675,8 @@ MlxLinearConvQkvResult linear_conv_qkv(
                     qk_values.dtype() == mlx::core::float32
                 ? mlx::core::float32
                 : mlx::core::float16;
-        qk_values = mlx::core::contiguous(
-            mlx::core::astype(qk_values, dtype));
-        value_values = mlx::core::contiguous(
-            mlx::core::astype(value_values, dtype));
+        qk_values = mlx::core::astype(qk_values, dtype);
+        value_values = mlx::core::astype(value_values, dtype);
     }
 
     const int channels = expected_qk + expected_value;
@@ -1723,14 +1715,15 @@ MlxLinearConvQkvResult linear_conv_qkv(
         value_groups;
     const std::int64_t state_tasks =
         (static_cast<std::int64_t>(state_values.size()) + 31) / 32;
+    const int simd_groups = tokens >= 64 ? 4 : 1;
+    const int threads = simd_groups * 32;
     const std::int64_t workgroups =
-        qk_tasks + value_tasks + state_tasks;
+        (qk_tasks + value_tasks + state_tasks + simd_groups - 1) / simd_groups;
     const array parameters({eps}, Shape{1});
     std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>
         templates{
             {"T", qk_values.dtype()},
             {"B", batch},
-            {"TOKENS", tokens},
             {"NK", key_heads},
             {"NV", value_heads},
             {"DK", key_head_dimension},
@@ -1739,6 +1732,7 @@ MlxLinearConvQkvResult linear_conv_qkv(
             {"C", channels},
             {"K", kernel},
             {"HAS_BIAS", static_cast<int>(bias_values.present)},
+            {"SIMD_GROUPS", simd_groups},
         };
     auto outputs = linear_conv_kernel()(
         {
@@ -1761,8 +1755,8 @@ MlxLinearConvQkvResult linear_conv_qkv(
             mlx::core::float32,
             mlx::core::float32,
         },
-        {checked_int(workgroups * 32, "linear_conv_qkv grid"), 1, 1},
-        {32, 1, 1},
+        {checked_int(workgroups * threads, "linear_conv_qkv grid"), 1, 1},
+        {threads, 1, 1},
         std::move(templates),
         std::nullopt,
         false,

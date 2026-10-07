@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import struct
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,14 +21,17 @@ from mfq.architectures.tensor_schema import (
     map_source_tensor_name,
 )
 from mfq.formats.assets import is_asset_record
+from mfq.formats.compat import canonical_dtype
 from mfq.formats.io import open_mmap
-from mfq.formats.shards import format_shard_path, matching_shard_paths, parse_shard_path
+from mfq.formats.shards import matching_shard_paths, parse_shard_path
 from mfq.server.protocol.models import (
     ModelArtifactList,
     ModelArtifactResource,
     ModelDirectoryEntry,
+    ModelDirectoryFile,
     ModelDirectoryList,
 )
+from mfq.server.state.model_weights import estimated_resident_weight_bytes
 
 MODEL_FILE_INDEX = ".mfq-files.json"
 _ROUTED_EXPERT_RE = re.compile(
@@ -222,6 +226,18 @@ class ModelCatalog:
 
         return await asyncio.to_thread(self._browse_directories, directory_id, path)
 
+    def directory_path(self, directory_id: str) -> Path:
+        path = self._directory_ids.get(directory_id)
+        if path is None:
+            raise ModelDirectoryNotFoundError(directory_id)
+        try:
+            path = path.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ModelDirectoryNotFoundError(directory_id) from error
+        if not path.is_dir():
+            raise ModelDirectoryNotFoundError(directory_id)
+        return path
+
     async def register_directory(
         self,
         *,
@@ -347,12 +363,19 @@ class ModelCatalog:
         if current is None or not current.is_dir():
             raise ModelDirectoryNotFoundError(str(path) if path is not None else directory_id)
         try:
+            entries = list(current.iterdir())
             children = sorted(
-                (item.resolve() for item in current.iterdir() if item.is_dir()),
+                (item.resolve() for item in entries if item.is_dir()),
                 key=lambda item: (item.name.casefold(), item.name),
             )
         except OSError as error:
             raise ModelDirectoryNotFoundError(self._directory_name(current)) from error
+        files = []
+        for item in entries:
+            with contextlib.suppress(OSError):
+                if item.is_file() and item.suffix.casefold() == ".mfq":
+                    files.append(ModelDirectoryFile(name=item.name, byte_size=item.stat().st_size))
+        files.sort(key=lambda item: (item.name.casefold(), item.name))
         parent = current.parent if current.parent != current else None
         return ModelDirectoryList(
             current_id=self._directory_id(current),
@@ -360,6 +383,8 @@ class ModelCatalog:
             current_path=str(current),
             parent_id=self._directory_id(parent) if parent is not None else None,
             model_file_count=self._immediate_model_count(current),
+            files=files,
+            can_open_in_finder=sys.platform == "darwin",
             data=[self._directory_entry(path) for path in children],
         )
 
@@ -367,7 +392,7 @@ class ModelCatalog:
     def _registration_paths(directory: Path) -> list[Path]:
         grouped: dict[Path, list[Path]] = {}
         try:
-            candidates = sorted(directory.rglob("*.mfq"))
+            candidates = sorted(directory.rglob("*.[mM][fF][qQ]"))
         except OSError as error:
             raise ModelRegistrationError("cannot scan selected model directory") from error
         for candidate in candidates:
@@ -547,7 +572,7 @@ class ModelCatalog:
             if not root.is_dir():
                 continue
             grouped: dict[Path, list[Path]] = {}
-            paths = {*root.rglob("*.mfq"), *self._registered_paths(root)}
+            paths = {*root.rglob("*.[mM][fF][qQ]"), *self._registered_paths(root)}
             paths.update(
                 config.parent
                 for config in root.rglob("config.json")
@@ -666,6 +691,13 @@ class ModelCatalog:
                     if not is_asset_record(record.name)
                     and _is_always_streamed_tensor(record.name)
                 )
+                weight_bytes_by_dtype: dict[str, int] = {}
+                for record in store.records.values():
+                    if is_asset_record(record.name) or _is_always_streamed_tensor(record.name):
+                        continue
+                    dtype = canonical_dtype(record.dtype)
+                    weight_bytes_by_dtype[dtype] = weight_bytes_by_dtype.get(dtype, 0) + int(record.nbytes)
+                weight_bytes = sum(weight_bytes_by_dtype.values())
                 fingerprint = "\0".join(
                     [
                         store.header.model_arch,
@@ -683,6 +715,8 @@ class ModelCatalog:
                     architecture=store.header.model_arch or "unknown",
                     shard_count=len(paths),
                     total_bytes=sum(stat.st_size for stat in stats),
+                    estimated_resident_weight_bytes=estimated_resident_weight_bytes(weight_bytes, weight_bytes_by_dtype),
+                    ssd_ple_bytes=always_streamed_bytes,
                     tensor_count=tensor_count,
                     record_count=len(store.records),
                     dtypes=dtypes,
@@ -694,7 +728,8 @@ class ModelCatalog:
                 )
         except Exception as error:
             stat = path.stat()
-            remaining = tuple(candidate for candidate in (format_shard_path(parsed[0], index, parsed[2]) for index in range(1, parsed[2] + 1)) if candidate.is_file()) if parsed is not None else (path,)
+            remaining = tuple(candidate for candidate in matching_shard_paths(parsed[0])
+                if candidate.is_file() and parse_shard_path(candidate)[2] == parsed[2]) if parsed is not None else (path,)
             remaining_stats = tuple(item.stat() for item in remaining) or (stat,)
             identifier = hashlib.sha256(f"{relative}\0{stat.st_size}".encode()).hexdigest()[:32]
             resource = ModelArtifactResource(
@@ -777,6 +812,7 @@ class ModelCatalog:
                 raise ValueError("HF checkpoint is missing Safetensors shards")
             tensors: set[str] = set()
             tensor_sizes: dict[str, int] = {}
+            tensor_dtypes: dict[str, str] = {}
             dtypes: set[str] = set()
             for shard in shard_paths:
                 for tensor_name, entry in ModelCatalog._safetensors_header(shard).items():
@@ -799,6 +835,7 @@ class ModelCatalog:
                         )
                     tensors.add(tensor_name)
                     tensor_sizes[tensor_name] = offsets[1] - offsets[0]
+                    tensor_dtypes[tensor_name] = entry["dtype"]
                     dtypes.add(entry["dtype"])
             if indexed_names is not None and not indexed_names.issubset(tensors):
                 raise ValueError("Safetensors index references missing tensors")
@@ -817,6 +854,7 @@ class ModelCatalog:
             loadable = graph_spec_for_source_names(config, sorted(tensors)) is not None
             routed_expert_bytes = 0
             always_streamed_bytes = 0
+            weight_bytes_by_dtype: dict[str, int] = {}
             for tensor_name, tensor_bytes in tensor_sizes.items():
                 mapped = map_source_tensor_name(tensor_name, config)
                 canonical_name = (
@@ -826,6 +864,9 @@ class ModelCatalog:
                     routed_expert_bytes += tensor_bytes
                 if _is_always_streamed_tensor(canonical_name):
                     always_streamed_bytes += tensor_bytes
+                else:
+                    dtype = canonical_dtype(tensor_dtypes[tensor_name])
+                    weight_bytes_by_dtype[dtype] = weight_bytes_by_dtype.get(dtype, 0) + tensor_bytes
             resource = ModelArtifactResource(
                 id=identifier,
                 name=name,
@@ -833,6 +874,8 @@ class ModelCatalog:
                 format="hf",
                 shard_count=len(shard_paths),
                 total_bytes=sum(stat.st_size for stat in stats),
+                estimated_resident_weight_bytes=estimated_resident_weight_bytes(sum(weight_bytes_by_dtype.values()), weight_bytes_by_dtype),
+                ssd_ple_bytes=always_streamed_bytes,
                 tensor_count=len(indexed_names if indexed_names is not None else tensors),
                 record_count=len(indexed_names if indexed_names is not None else tensors) + 1,
                 dtypes=sorted(dtypes),

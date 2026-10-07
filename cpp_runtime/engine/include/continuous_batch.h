@@ -153,6 +153,7 @@ template <class Ops> class ContinuousBatch {
                 auto& request = work.request;
                 const auto chunk = *work.prefill;
                 operations.suspend_decode();
+                PrefillActivity prefill_activity;
                 auto sample = operations.prefill(request, chunk);
                 request->prefill_offset = chunk.offset + chunk.count;
                 ++prefill_chunks;

@@ -1,4 +1,5 @@
 #include "mlx_paged_session_codec.h"
+#include "mlx_resident_budget.h"
 
 #include <algorithm>
 #include <array>
@@ -36,6 +37,7 @@ class Writer {
 public:
     template <typename T>
     void scalar(T value) {
+        ensure_capacity(bytes_.size() + sizeof(T));
         using Unsigned = std::make_unsigned_t<T>;
         const auto converted = static_cast<Unsigned>(value);
         for (std::size_t index = 0; index < sizeof(T); ++index) {
@@ -45,6 +47,7 @@ public:
     }
 
     void raw(const void* data, std::size_t size) {
+        ensure_capacity(bytes_.size() + size);
         const auto* begin = static_cast<const std::uint8_t*>(data);
         bytes_.insert(bytes_.end(), begin, begin + size);
     }
@@ -75,7 +78,15 @@ public:
     }
 
 private:
+    void ensure_capacity(std::size_t needed) {
+        if (needed <= bytes_.capacity()) return;
+        const auto capacity = std::max(needed, bytes_.capacity() * 2);
+        auto budget = std::make_unique<MlxResidentBudgetHold>(capacity);
+        bytes_.reserve(capacity);
+        budget_ = std::move(budget);
+    }
     std::vector<std::uint8_t> bytes_;
+    std::unique_ptr<MlxResidentBudgetHold> budget_;
 };
 
 struct SerializedTensor {
@@ -500,6 +511,7 @@ MlxKvCacheSnapshot rebuild_kv(
     const auto total_bytes = lanes * target_lane_bytes;
     const auto target_shape = expected_shape(token_count);
     auto rebuild = [&](bool key) {
+        MlxResidentBudgetScope::reserve(total_bytes);
         auto result = array(
             mlx::core::allocator::malloc(total_bytes),
             target_shape,
@@ -546,6 +558,7 @@ MlxKvCacheSnapshot rebuild_kv(
 
 array copy_tensor(const SerializedTensor& source) {
     if (source.data == nullptr || source.bytes == 0) throw std::runtime_error("empty cache tensor");
+    MlxResidentBudgetScope::reserve(source.bytes);
     auto result = array(mlx::core::allocator::malloc(source.bytes), source.shape, source.dtype);
     std::memcpy(result.data<std::uint8_t>(), source.data, source.bytes);
     return result;
@@ -565,6 +578,7 @@ MlxQwen4LayerCacheSnapshot rebuild_flash(const std::vector<DecodedBlock>& blocks
         const auto dtype = final.index->dtype;
         if (count > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(width) / dtype.size())
             throw std::runtime_error("QSA index checkpoint size overflow");
+        MlxResidentBudgetScope::reserve(count * width * dtype.size());
         auto keys = array(mlx::core::allocator::malloc(count * width * dtype.size()),
             Shape{1, static_cast<int>(count), width}, dtype);
         auto* destination = keys.data<std::uint8_t>();
@@ -598,6 +612,7 @@ MlxQwen35LinearAttentionCacheSnapshot rebuild_recurrent(
         throw std::runtime_error("invalid recurrent cache boundary block");
     }
     const auto copy = [](const SerializedTensor& source) {
+        MlxResidentBudgetScope::reserve(source.bytes);
         auto result = array(
             mlx::core::allocator::malloc(source.bytes),
             source.shape,

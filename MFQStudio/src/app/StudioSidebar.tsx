@@ -74,11 +74,11 @@ export function StudioSidebar() {
         active: view === 'lab' && labPage === 'models' },
       { label: ['评测与数据集', 'Evaluations'], icon: 'activity', path: lab('evaluations'),
         active: view === 'lab' && labPage === 'evaluations' },
-      { label: ['量化工作台', 'Quantization'], icon: 'memory', path: lab('quantization'),
+      { label: ['量化工作台', 'Quantization'], icon: 'tools', path: lab('quantization'),
         active: view === 'lab' && labPage === 'quantization' },
     ] },
     { label: ['系统', 'System'], items: [
-      { label: ['日志', 'Logs'], icon: 'activity', path: dashboard('logs'),
+      { label: ['日志', 'Logs'], icon: 'scroll', path: dashboard('logs'),
         active: view === 'dashboard' && dashboardPage === 'logs', current: true },
       { label: ['设置', 'Settings'], icon: 'settings', path: '/settings',
         active: view === 'dashboard' && dashboardPage === 'settings', current: true },

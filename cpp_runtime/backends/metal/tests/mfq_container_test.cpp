@@ -200,6 +200,11 @@ void test_basic_container(
                    mapped.view().begin(),
                    mapped.view().end()) == "data",
         "mapped payload mismatch");
+    const auto random_mapped = model.map_record("weight", true);
+    require(
+        random_mapped.size() == mapped.size()
+            && std::equal(random_mapped.view().begin(), random_mapped.view().end(), mapped.view().begin()),
+        "random mapped payload mismatch");
     const auto middle =
         model.read_range("weight", 1, 2);
     require(
@@ -404,6 +409,25 @@ void test_sharded_ranges_and_source_lifetime(
             second_range.begin(),
             second_range.end()) == "rav",
         "second-shard range mismatch");
+
+    for (const auto& extensions : std::vector<std::pair<std::string, std::string>>{
+             {".MFQ", ".MFQ"}, {".mFq", ".MfQ"}}) {
+        auto upper_first = first;
+        auto upper_second = second;
+        upper_first.replace_extension(extensions.first);
+        upper_second.replace_extension(extensions.second);
+        std::filesystem::rename(first, upper_first);
+        std::filesystem::rename(second, upper_second);
+        {
+            const mfq::metal::MfqContainer upper(upper_second);
+            require(upper.source_paths().size() == 2,
+                    "case-insensitive shard family was not resolved");
+            require(upper.read_text("first") == "alpha" && upper.read_text("second") == "bravo",
+                    "case-insensitive shard records differ");
+        }
+        std::filesystem::rename(upper_first, first);
+        std::filesystem::rename(upper_second, second);
+    }
 
     const auto shortened =
         std::filesystem::file_size(second) - 2;

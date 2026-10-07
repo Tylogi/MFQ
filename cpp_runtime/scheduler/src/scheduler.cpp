@@ -217,6 +217,9 @@ void MfqScheduler::loop() noexcept {
                     }
                     value.reply.set_value(found);
                 } else if constexpr (std::is_same_v<T, Control>) {
+                    if ((std::holds_alternative<ScoreText>(value.request) || std::holds_alternative<ScoreTokens>(value.request)) &&
+                        (duplex_active || !requests_.empty()))
+                        throw std::runtime_error("probability scoring requires an idle runtime");
                     const bool start_duplex = std::holds_alternative<MfqDuplexSessionParams>(value.request);
                     const bool stop_duplex = std::holds_alternative<StopDuplex>(value.request);
                     if (reload) throw std::runtime_error("reload is pending");

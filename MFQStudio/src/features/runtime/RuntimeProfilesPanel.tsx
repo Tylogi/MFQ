@@ -4,6 +4,7 @@ import { runtimeApi } from '../../shared/api/resources/runtime';
 import { modelsApi } from '../../shared/api/resources/models';
 import type { ModelArtifact, RuntimeProfile } from '../../shared/api/types';
 import { useRuntime } from '../../app/RuntimeProvider';
+import { useConnectionScope } from '../../app/useConnectionScope';
 import { useSettings } from '../settings/SettingsProvider';
 import { modeTemplateSettings } from '../settings/configuration';
 import { Icon, SectionLabel, TMPanel } from '../../app/display';
@@ -15,6 +16,7 @@ import { ModelVendorMark } from '../../app/ModelVendorMark';
 
 export function RuntimeProfilesPanel() {
   const { runtime, instances, realtime, ready, setSelectedModel, refreshRuntime } = useRuntime();
+  const connectionScope = useConnectionScope();
   const { settings, tr, contextSize } = useSettings();
   const navigate = useNavigate();
   const [artifacts, setArtifacts] = useState<ModelArtifact[]>([]);
@@ -48,6 +50,7 @@ export function RuntimeProfilesPanel() {
     };
   }, [ready, runtime?.model]);
   async function saveRuntimeProfile() {
+    const current = connectionScope();
     const name = profileName.replace(/\s+/g, ' ').trim();
     const artifact = artifacts.find((item) => item.name === runtime?.model);
     if (busy || !name || !artifact) return;
@@ -60,7 +63,7 @@ export function RuntimeProfilesPanel() {
           device_ids: [],
           idle_ttl_seconds: loadPinned ? null : loadIdleTtl,
           pin: loadPinned,
-          context_size: contextSize,
+          context_size: currentInstance?.context_size ?? contextSize,
           prefill_chunk_size: 2048,
           sampling_defaults: {
             max_tokens: resolvedGlobalSettings.maxTokens,
@@ -78,54 +81,56 @@ export function RuntimeProfilesPanel() {
           },
         },
       });
+      if (!current()) return;
       setProfileName('');
-      setRuntimeProfiles(await runtimeApi.runtimeProfiles());
+      const profiles = await runtimeApi.runtimeProfiles();
+      if (!current()) return;
+      setRuntimeProfiles(profiles);
       await refreshRuntime(false);
+      if (!current()) return;
       toast.success(tr('运行配置已保存', 'Runtime profile saved'));
     } catch (cause) {
-      toast.error(errorMessage(cause));
+      if (current()) toast.error(errorMessage(cause));
     } finally {
-      setBusy(false);
+      if (current()) setBusy(false);
     }
   }
 
   async function loadRuntimeProfile(profile: RuntimeProfile) {
+    const current = connectionScope();
     if (busy) return;
-    if (
-      profile.drifted &&
-      !(await studioConfirm(
-        tr(
-          '模型产物已变化。仍使用这个配置档案加载？',
-          'The model artifact changed. Load this profile anyway?',
-        ),
-      ))
-    )
-      return;
     setBusy(true);
     try {
+      if (profile.drifted && !(await studioConfirm(tr(
+        '模型产物已变化。仍使用这个配置档案加载？',
+        'The model artifact changed. Load this profile anyway?',
+      ))) || !current()) return;
       await runtimeApi.loadRuntimeProfile(profile.id, profile.drifted);
-
-      navigate(STUDIO_PATHS.models);
+      if (!current()) return;
       await refreshRuntime(false);
+      if (!current()) return;
       setSelectedModel(profile.load.model);
+      navigate(STUDIO_PATHS.models);
     } catch (cause) {
-      toast.error(errorMessage(cause));
+      if (current()) toast.error(errorMessage(cause));
     } finally {
-      setBusy(false);
+      if (current()) setBusy(false);
     }
   }
 
   async function deleteRuntimeProfile(id: string) {
+    const current = connectionScope();
     if (busy) return;
     setBusy(true);
     try {
       await runtimeApi.deleteRuntimeProfile(id);
+      if (!current()) return;
       setRuntimeProfiles((current) => current.filter((item) => item.id !== id));
       toast.success(tr('运行配置已删除', 'Runtime profile deleted'));
     } catch (cause) {
-      toast.error(errorMessage(cause));
+      if (current()) toast.error(errorMessage(cause));
     } finally {
-      setBusy(false);
+      if (current()) setBusy(false);
     }
   }
 

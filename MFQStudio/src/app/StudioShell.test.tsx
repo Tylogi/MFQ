@@ -1,6 +1,7 @@
 /** 验证外壳在已就绪和可直达页面展示持续故障与正确重试入口。 */
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router';
+import { useEffect, useState } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useRuntime } from './RuntimeProvider';
 import { StudioShell } from './StudioShell';
@@ -47,6 +48,31 @@ function renderShell(overrides: Partial<ReturnType<typeof useRuntime>>, path = '
 
 describe('StudioShell 持久运行时告警', () => {
   beforeEach(() => vi.clearAllMocks());
+
+  it('resets server-owned forms on connection change but preserves them during ordinary refreshes', () => {
+    const mounted = vi.fn();
+    const disposed = vi.fn();
+    function ServerForm() {
+      const [value, setValue] = useState('new server');
+      useEffect(() => { mounted(); return disposed; }, []);
+      return <input aria-label="Server-owned draft" value={value} onChange={(event) => setValue(event.target.value)} />;
+    }
+    const state = { runtime: null, selectedModel: '', models: [], instances: [], loading: false,
+      connectionError: null, refreshError: null, jobStreamErrors: {}, ready: true, connectionRevision: 1,
+      reloadService: vi.fn(), refreshRuntime: vi.fn(), retryJobStreams: vi.fn() } as unknown as ReturnType<typeof useRuntime>;
+    vi.mocked(useRuntime).mockImplementation(() => state);
+    const tree = () => <MemoryRouter initialEntries={['/runtime']}><Routes><Route element={<StudioShell />}>
+      <Route path="runtime" element={<ServerForm />} /></Route></Routes></MemoryRouter>;
+    const view = render(tree());
+    fireEvent.change(screen.getByLabelText('Server-owned draft'), { target: { value: 'old server' } });
+    view.rerender(tree());
+    expect(screen.getByLabelText('Server-owned draft')).toHaveValue('old server');
+    state.connectionRevision = 2;
+    view.rerender(tree());
+    expect(screen.getByLabelText('Server-owned draft')).toHaveValue('new server');
+    expect(mounted).toHaveBeenCalledTimes(2);
+    expect(disposed).toHaveBeenCalledOnce();
+  });
 
   it('未就绪时设置页仍可打开，显示连接故障和重试', () => {
     const runtime = renderShell({ ready: false, connectionError: 'server offline' });

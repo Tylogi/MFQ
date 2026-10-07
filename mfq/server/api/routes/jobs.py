@@ -141,8 +141,9 @@ async def list_job_events(
     job_id: UUID,
     after: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=1000)] = 200,
+    tail: bool = False,
 ) -> JobEventList:
-    return await service.list_job_events(job_id, after=after, limit=limit)
+    return await service.list_job_events(job_id, after=after, limit=limit, tail=tail)
 
 
 @event_router.get(
@@ -168,6 +169,8 @@ async def stream_job_events(
                 cursor = event.sequence
                 payload = event.model_dump_json()
                 yield f"id: {event.sequence}\nevent: {event.type.value}\ndata: {payload}\n\n"
+            if len(result.data) == 200:
+                continue
             job = await service.get_job(job_id)
             if job.status in {
                 JobStatus.SUCCEEDED,
@@ -175,6 +178,8 @@ async def stream_job_events(
                 JobStatus.CANCELLED,
                 JobStatus.INTERRUPTED,
             }:
+                if result.data:
+                    continue
                 return
             if not result.data:
                 yield ": keep-alive\n\n"

@@ -86,6 +86,10 @@ mlx::core::array qwen4_qsa_block_scores(
     const mlx::core::array& query,
     const mlx::core::array& pooled_keys);
 
+mlx::core::array qwen4_qsa_prefill_output_gate(
+    const mlx::core::array& attended,
+    const mlx::core::array& gate);
+
 mlx::core::array qwen4_qsa_select_blocks(
     const mlx::core::array& query,
     const mlx::core::array& pooled_keys,

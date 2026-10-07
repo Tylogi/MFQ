@@ -15,6 +15,8 @@ import {
   type StoredPreset,
 } from './presets';
 import { useSettings } from './SettingsProvider';
+import { getApiBaseUrl } from '../../shared/api/client';
+import { useConnectionScope } from '../../app/useConnectionScope';
 
 /** 在设置页加载预设，并将选择、保存和删除操作限定在该页面生命周期内。 */
 export function useGenerationPresets(
@@ -25,14 +27,16 @@ export function useGenerationPresets(
   ready: boolean,
 ) {
   const { tr, contextSize, setContextSize } = useSettings();
-  const [presets, setPresets] = useState(loadStoredPresets);
+  const connectionScope = useConnectionScope();
+  const storageKey = `${STORED_PRESETS_KEY}:${getApiBaseUrl() || window.location.origin}`;
+  const [presets, setPresets] = useState(() => loadStoredPresets(storageKey));
   const [selected, setSelected] = useState('');
   const [name, setName] = useState('');
   const [status, setStatus] = useState<{ error: boolean; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
   useEffect(() => {
-    localStorage.setItem(STORED_PRESETS_KEY, JSON.stringify(presets));
-  }, [presets]);
+    try { localStorage.setItem(storageKey, JSON.stringify(presets)); } catch {}
+  }, [presets, storageKey]);
   useEffect(() => {
     if (!ready) return;
     let disposed = false;
@@ -73,6 +77,7 @@ export function useGenerationPresets(
   }
   /** 创建或覆盖当前预设，成功后更新本地缓存。 */
   async function save() {
+    const current = connectionScope();
     const normalized = name.replace(/\s+/g, ' ').trim().slice(0, 64);
     if (!normalized) {
       setStatus({ error: true, text: tr('请输入预设名称。', 'Enter a preset name.') });
@@ -96,6 +101,7 @@ export function useGenerationPresets(
       const resource = existing?.id
         ? await presetsApi.updateGenerationPreset(existing.id, body)
         : await presetsApi.createGenerationPreset(body);
+      if (!current()) return;
       const saved = storedPresetFromResource(resource);
       setPresets((current) =>
         [...current.filter((item) => item.id !== saved.id && item.name !== selected), saved].slice(
@@ -106,30 +112,33 @@ export function useGenerationPresets(
       setName(saved.name);
       setStatus({ error: false, text: tr('预设已保存。', 'Preset saved.') });
     } catch (cause) {
-      setStatus({ error: true, text: errorMessage(cause) });
+      if (current()) setStatus({ error: true, text: errorMessage(cause) });
     } finally {
-      setBusy(false);
+      if (current()) setBusy(false);
     }
   }
   /** 经确认删除选中的服务端预设及本地副本。 */
   async function remove() {
+    const current = connectionScope();
     if (
       busy ||
       !selected ||
       !(await studioConfirm(tr(`删除预设“${selected}”？`, `Delete preset “${selected}”?`)))
     )
       return;
+    if (!current()) return;
     setBusy(true);
     try {
       const preset = presets.find((item) => item.name === selected);
       if (preset?.id) await presetsApi.deleteGenerationPreset(preset.id);
+      if (!current()) return;
       setPresets((current) => current.filter((item) => item.name !== selected));
       clearSelection();
       setStatus({ error: false, text: tr('预设已删除。', 'Preset deleted.') });
     } catch (cause) {
-      setStatus({ error: true, text: errorMessage(cause) });
+      if (current()) setStatus({ error: true, text: errorMessage(cause) });
     } finally {
-      setBusy(false);
+      if (current()) setBusy(false);
     }
   }
   const disabled = draft.inheritModelDefaults || busy;

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Dialog } from '../../shared/ui/Dialog';
+import { useConnectionScope } from '../../app/useConnectionScope';
 import { runtimeApi } from '../../shared/api/resources/runtime';
 import { useSettings } from '../settings/SettingsProvider';
 import { errorMessage } from '../../app/formatters';
@@ -7,6 +8,7 @@ import { toast } from '../../stores/toastStore';
 
 export function ModelAliasMapping({ models, selectedModel }: { models: string[]; selectedModel: string }) {
   const { tr } = useSettings();
+  const connectionScope = useConnectionScope();
   const [open, setOpen] = useState(false);
   const [aliases, setAliases] = useState<Record<string, string>>({});
   const [ready, setReady] = useState(false);
@@ -20,14 +22,16 @@ export function ModelAliasMapping({ models, selectedModel }: { models: string[];
     return () => { disposed = true; };
   }, []);
   async function save() {
+    const current = connectionScope();
     setSaving(true);
     try {
       const result = await runtimeApi.configureModelAliases(aliases);
+      if (!current()) return;
       setAliases(result.aliases);
       setOpen(false);
       toast.success(tr('别名映射已保存', 'Alias mapping saved'));
-    } catch (cause) { toast.error(errorMessage(cause)); }
-    finally { setSaving(false); }
+    } catch (cause) { if (current()) toast.error(errorMessage(cause)); }
+    finally { if (current()) setSaving(false); }
   }
   const names = [...new Set([...models, ...Object.keys(aliases)])];
   return <>

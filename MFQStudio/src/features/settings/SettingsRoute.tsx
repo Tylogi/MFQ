@@ -8,6 +8,7 @@ import { errorMessage } from '../../app/formatters';
 import { STUDIO_PATHS } from '../../navigation';
 import { ModelContextSettings } from '../runtime/ModelContextSettings';
 import { useRuntime } from '../../app/RuntimeProvider';
+import { useConnectionScope } from '../../app/useConnectionScope';
 import { useActiveSessionMode } from '../chat/hooks/useActiveSessionMode';
 import { DEFAULT_SETTINGS, PRESETS, modeTemplateSettings, type PresetName } from './configuration';
 import { presetResourceBody, storedPresetFromResource, type StoredPreset } from './presets';
@@ -19,6 +20,7 @@ import { toast } from '../../stores/toastStore';
 
 export function SettingsRoute() {
   const { settings, replaceSettings, tr } = useSettings();
+  const connectionScope = useConnectionScope();
   const studioUpdates = useStudioUpdateContext();
   const {
     runtime,
@@ -68,10 +70,13 @@ export function SettingsRoute() {
     clearSelection();
   }
   async function exportStudioData() {
+    const current = connectionScope();
     setBusy(true);
     try {
       const sessions = await sessionsApi.listSessions();
+      if (!current()) return;
       const archives = await Promise.all(sessions.map((session) => sessionsApi.exportSession(session.id)));
+      if (!current()) return;
       const payload = {
         format: 'mfq-studio-export-v2',
         exported_at: new Date().toISOString(),
@@ -90,12 +95,13 @@ export function SettingsRoute() {
         URL.revokeObjectURL(url);
       }
     } catch (cause) {
-      toast.error(errorMessage(cause));
+      if (current()) toast.error(errorMessage(cause));
     } finally {
-      setBusy(false);
+      if (current()) setBusy(false);
     }
   }
   async function importStudioData(file: File) {
+    const current = connectionScope();
     setBusy(true);
     try {
       const payload = JSON.parse(await file.text()) as {
@@ -103,6 +109,7 @@ export function SettingsRoute() {
         presets?: StoredPreset[];
         sessions?: SessionArchive[];
       };
+      if (!current()) return;
       if (
         payload.format !== 'mfq-studio-export-v2' ||
         !Array.isArray(payload.presets) ||
@@ -110,6 +117,7 @@ export function SettingsRoute() {
       )
         throw new Error(tr('不是有效的 MFQ Studio 导出文件。', 'Not a valid MFQ Studio export.'));
       for (const preset of payload.presets) {
+        if (!current()) return;
         if (!preset?.name || !preset.settings || !Number.isFinite(preset.contextSize)) continue;
         const existing = presets.find((item) => item.name === preset.name);
         const body = presetResourceBody(
@@ -124,14 +132,20 @@ export function SettingsRoute() {
         if (existing?.id) await presetsApi.updateGenerationPreset(existing.id, body);
         else await presetsApi.createGenerationPreset(body);
       }
-      for (const archive of payload.sessions) await sessionsApi.importSession(archive);
-      setPresets((await presetsApi.generationPresets()).map(storedPresetFromResource));
+      for (const archive of payload.sessions) {
+        if (!current()) return;
+        await sessionsApi.importSession(archive);
+      }
+      if (!current()) return;
+      const resources = await presetsApi.generationPresets();
+      if (!current()) return;
+      setPresets(resources.map(storedPresetFromResource));
       window.dispatchEvent(new Event('mfq:sessions-imported'));
       toast.success(tr('设置与会话导入成功', 'Settings and sessions imported successfully'));
     } catch (cause) {
-      toast.error(errorMessage(cause));
+      if (current()) toast.error(errorMessage(cause));
     } finally {
-      setBusy(false);
+      if (current()) setBusy(false);
     }
   }
   function resetSettingsDraft() {

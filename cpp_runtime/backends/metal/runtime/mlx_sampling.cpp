@@ -544,7 +544,7 @@ constexpr const char* kTokenCountsSource = R"METAL(
         return;
     }
     int value = counts[token];
-    for (uint index = 0u; index < uint(TOKENS); ++index) {
+    for (uint index = 0u; index < uint(token_ids_shape[0]); ++index) {
         value += int(token_ids[index] == int(token));
     }
     output[token] = value;
@@ -552,7 +552,7 @@ constexpr const char* kTokenCountsSource = R"METAL(
 
 constexpr const char* kPenaltiesSource = R"METAL(
     uint index = thread_position_in_grid.x;
-    if (index >= uint(SIZE)) {
+    if (index >= uint(logits_shape[0]) * uint(VOCAB)) {
         return;
     }
     uint token = index % uint(VOCAB);
@@ -1216,9 +1216,6 @@ array sample_token_counts_add(
             mlx::core::astype(tokens, mlx::core::int32),
             Shape{checked_int(tokens.size(), "token id count")}));
     const int vocab = checked_int(current.size(), "vocabulary size");
-    const int token_count = checked_int(
-        token_ids.size(),
-        "token id count");
     auto outputs = token_counts_kernel()(
         {current, token_ids},
         {Shape{vocab}},
@@ -1227,7 +1224,6 @@ array sample_token_counts_add(
         {std::min(kThreads, vocab), 1, 1},
         {
             {"VOCAB", vocab},
-            {"TOKENS", token_count},
         },
         std::nullopt,
         false,
@@ -1285,7 +1281,6 @@ array sample_apply_penalties(
         {std::min(kThreads, size), 1, 1},
         {
             {"T", view.values.dtype()},
-            {"SIZE", size},
             {"VOCAB", view.vocab},
         },
         std::nullopt,

@@ -2160,6 +2160,15 @@ class SessionStore:
             )
         return self.get_job(job_id)
 
+    def runtime_inference_policy(self) -> dict[str, Any]:
+        with self._connection() as connection:
+            row = connection.execute("SELECT value FROM schema_meta WHERE key = 'runtime_inference_policy'").fetchone()
+        return json.loads(row["value"]) if row else {}
+
+    def save_runtime_inference_policy(self, policy: dict[str, Any]) -> None:
+        with self._connection() as connection:
+            connection.execute("INSERT INTO schema_meta(key, value) VALUES ('runtime_inference_policy', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (json.dumps(policy),))
+
     def runtime_memory_policy(self) -> dict[str, Any]:
         with self._connection() as connection:
             row = connection.execute("SELECT value FROM schema_meta WHERE key = 'runtime_memory_policy'").fetchone()
@@ -2263,6 +2272,7 @@ class SessionStore:
         *,
         after: int = 0,
         limit: int = 200,
+        tail: bool = False,
     ) -> list[JobEventResource]:
         if after < 0:
             raise ValueError("after must be non-negative")
@@ -2275,14 +2285,14 @@ class SessionStore:
             ):
                 raise JobNotFoundError(str(job_id))
             rows = connection.execute(
-                """
+                f"""
                 SELECT * FROM job_events
                 WHERE job_id = ? AND sequence > ?
-                ORDER BY sequence LIMIT ?
+                ORDER BY sequence {'DESC' if tail else 'ASC'} LIMIT ?
                 """,
                 (str(job_id), after, limit),
             ).fetchall()
-        return [self._job_event_from_row(row) for row in rows]
+        return [self._job_event_from_row(row) for row in (reversed(rows) if tail else rows)]
 
     def request_job_cancel(
         self,
@@ -2605,15 +2615,15 @@ class SessionStore:
         *,
         instance_id: UUID | None = None,
         level: RuntimeLogLevel | None = None,
-        after: int = 0,
+        after: int | None = None,
         limit: int = 200,
     ) -> list[RuntimeLogEntry]:
-        if after < 0:
+        if after is not None and after < 0:
             raise ValueError("after must be non-negative")
         if limit < 1 or limit > 2000:
             raise ValueError("limit must be between 1 and 2000")
         clauses = ["sequence > ?"]
-        values: list[object] = [after]
+        values: list[object] = [after if after is not None else 0]
         if instance_id is not None:
             clauses.append("instance_id = ?")
             values.append(str(instance_id))
@@ -2625,11 +2635,11 @@ class SessionStore:
                 f"""
                 SELECT * FROM runtime_logs
                 WHERE {" AND ".join(clauses)}
-                ORDER BY sequence ASC LIMIT ?
+                ORDER BY sequence {"DESC" if after is None else "ASC"} LIMIT ?
                 """,
                 (*values, limit),
             ).fetchall()
-        return [self._runtime_log_from_row(row) for row in rows]
+        return [self._runtime_log_from_row(row) for row in (reversed(rows) if after is None else rows)]
 
     def delete_session(self, session_id: UUID) -> None:
         with self._connection() as connection:

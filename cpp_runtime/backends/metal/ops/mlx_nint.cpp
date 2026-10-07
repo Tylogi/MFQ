@@ -1,4 +1,6 @@
 #include "mlx_nint.h"
+#include "mlx_kernel_prepare.h"
+#include "mlx_weight_residency.h"
 
 #include "mfq/nint_blob.h"
 #include "mfq_mfe_prefill_embedded.h"
@@ -61,34 +63,31 @@ bool dense_nint_nax_enabled() noexcept {
     return mlx_apple_chip_starts_with("Apple M5");
 }
 
-class DenseNintMmqPrimitive final : public mlx::core::UnaryPrimitive {
+class DenseNintMmqPrimitive final : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
 public:
     DenseNintMmqPrimitive(
         mlx::core::Stream stream,
         DenseNintMmqConfig config)
         : UnaryPrimitive(stream), config_(std::move(config)) {}
 
-    void eval_cpu(const std::vector<array>&, array&) override {
-        throw std::runtime_error("dense NINT MMQ has no CPU path");
+    std::string preparation_key() const override {
+        return std::string(config_.use_nax ? "dense_nint_nax_" : "dense_nint_mmq_")
+            + std::to_string(config_.group_size);
     }
+    void prepare_gpu() override { (void)prepared_kernel(); }
 
-    void eval_gpu(
-        const std::vector<array>& inputs,
-        array& output) override {
-        if (inputs.size() != 5) {
-            throw std::logic_error("dense NINT MMQ input count mismatch");
-        }
-        output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+    MTL::ComputePipelineState* prepared_kernel() {
         auto& selected_stream = stream();
         auto& device = mlx::core::metal::device(selected_stream.device);
         CompileOptions options;
         options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
-            config_.use_nax
-                ? "mfq_dense_metadata_nint_nax_v2"
-                : "mfq_dense_metadata_nint_mmq_v2",
+            std::string(config_.use_nax
+                ? "mfq_dense_metadata_nint_nax_v3_gs"
+                : "mfq_dense_metadata_nint_mmq_v3_gs")
+                + std::to_string(config_.group_size),
             options,
-            [use_nax = config_.use_nax] {
+            [use_nax = config_.use_nax, group_size = config_.group_size] {
                 std::string source;
                 source.reserve(
                     (use_nax
@@ -99,6 +98,8 @@ public:
                 source += "#include <metal_stdlib>\n";
                 source += "#include <metal_simdgroup>\n";
                 source += "#include <metal_simdgroup_matrix>\n";
+                source += "#define MFQ_NINT_PREFILL_GROUP_SIZE "
+                    + std::to_string(group_size) + "\n";
                 if (use_nax) {
                     source += "#include <MetalPerformancePrimitives/"
                         "MetalPerformancePrimitives.h>\n";
@@ -112,6 +113,26 @@ public:
                 source += detail::kNintPrefillSource;
                 return source;
             });
+        return device.get_kernel(
+            config_.use_nax
+                ? "mfq_nint_prefill_nax_f16_bm128_bn64_bk96"
+                : "mfq_nint_prefill_mmq_f16_bm128_bn64_bk48",
+            library);
+    }
+
+    void eval_cpu(const std::vector<array>&, array&) override {
+        throw std::runtime_error("dense NINT MMQ has no CPU path");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        array& output) override {
+        if (inputs.size() != 5) {
+            throw std::logic_error("dense NINT MMQ input count mismatch");
+        }
+        output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        auto& selected_stream = stream();
+        auto* kernel = prepared_kernel();
         auto& encoder =
             mlx::core::metal::get_command_encoder(selected_stream);
         for (int index = 0; index < 5; ++index) {
@@ -126,11 +147,6 @@ public:
             .groups = config_.groups,
         };
         encoder.set_bytes(parameters, 6);
-        auto* kernel = device.get_kernel(
-            config_.use_nax
-                ? "mfq_nint_prefill_nax_f16_bm128_bn64_bk96"
-                : "mfq_nint_prefill_mmq_f16_bm128_bn64_bk48",
-            library);
         encoder.set_compute_pipeline_state(kernel);
         encoder.dispatch_threadgroups(
             MTL::Size(
@@ -385,10 +401,13 @@ constexpr const char* kNintStoreOutputMoeShared = R"METAL(
 )METAL";
 
 constexpr const char* kNintMatmul = R"METAL(
+#ifndef SMALL_M
+#define SMALL_M (M <= 5)
+#endif
     constexpr uint SIMD_GROUPS = 8u;
     constexpr uint OUTPUTS_PER_SIMD = uint(OPS_PER_SIMD);
     constexpr uint OUTPUTS_PER_TG = SIMD_GROUPS * OUTPUTS_PER_SIMD;
-    constexpr uint BLOCKS8 = uint(M) <= 5u ? uint(GS) / 8u : 0u;
+    constexpr uint BLOCKS8 = SMALL_M != 0 ? uint(GS) / 8u : 0u;
     constexpr uint TAIL_START = BLOCKS8 * 8u;
     constexpr uint TAIL_CHUNKS =
         (uint(GS) - TAIL_START + 3u) / 4u;
@@ -873,27 +892,38 @@ constexpr const char* kNintSwiGlu = R"METAL(
 )METAL";
 
 constexpr const char* kNintDequantize = R"METAL(
-    uint output_index = thread_position_in_grid.x;
-    if (output_index >= uint(OUT) * uint(K)) {
+    constexpr uint ITEMS_PER_ROW = (uint(K) + uint(VEC) - 1u) / uint(VEC);
+    uint item = thread_position_in_grid.x;
+    if (item >= uint(OUT) * ITEMS_PER_ROW) {
         return;
     }
-    uint output = output_index / uint(K);
-    uint input_index = output_index - output * uint(K);
+    uint output = item / ITEMS_PER_ROW;
+    uint input_index = (item - output * ITEMS_PER_ROW) * uint(VEC);
     uint group = input_index / uint(GS);
-    uint element = input_index - group * uint(GS);
     uint metadata_index = output * uint(NG) + group;
-    uint quantized = mfq_nint_read_row_value(
-        q_packed,
-        row_q_byte_offsets[output],
-        uint(row_q_layout[output]) >> 4u,
-        group * uint(GS) + element,
-        uint(row_q_layout[output]) & 15u);
     float scale = neuron_scale[output] * float(sub_scale[metadata_index]);
     float minimum = neuron_min[output] * float(sub_min[metadata_index]);
-    y[output_index] = T(scale * float(quantized) - minimum);
+    uint layout = uint(row_q_layout[output]);
+    if constexpr (VEC == 4) {
+        uint4 quantized = mfq_nint_read_row_value4(
+            q_packed, row_q_byte_offsets[output], layout >> 4u,
+            input_index, layout & 15u);
+        float4 decoded = scale * float4(quantized) - minimum;
+#pragma clang loop unroll(full)
+        for (uint value = 0u; value < 4u; ++value) {
+            if (input_index + value < uint(K))
+                y[output * uint(K) + input_index + value] = T(decoded[value]);
+        }
+    } else {
+        uint quantized = mfq_nint_read_row_value(
+            q_packed, row_q_byte_offsets[output], layout >> 4u,
+            input_index, layout & 15u);
+        y[output * uint(K) + input_index] = T(scale * float(quantized) - minimum);
+    }
 )METAL";
 
 constexpr const char* kNintEmbedding = R"METAL(
+    const uint COUNT = uint(token_ids_shape[0]);
     uint output_index = thread_position_in_grid.x;
     if (output_index >= uint(COUNT) * uint(K)) {
         return;
@@ -1084,7 +1114,9 @@ template <typename T, typename Allocator>
 array make_array(
     const std::vector<T, Allocator>& values,
     Shape shape) {
-    return array(values.begin(), std::move(shape));
+    auto result = array(values.begin(), std::move(shape));
+    MlxWeightResidency::track(result);
+    return result;
 }
 
 std::int32_t checked_shape(std::int64_t value, const char* name) {
@@ -1150,7 +1182,8 @@ std::string nint_matmul_kernel_header(
         + "#define NG " + std::to_string(config.groups) + "\n"
         + "#define K " + std::to_string(config.input_size) + "\n"
         + "#define OUT " + std::to_string(config.output_size) + "\n"
-        + "#define M " + std::to_string(config.rows) + "\n"
+        + "#define M " + (config.rows == 0 ? "row_count" : std::to_string(config.rows)) + "\n"
+        + "#define SMALL_M " + std::to_string(config.rows > 0 && config.rows <= 5) + "\n"
         + "#define TILE_M " + std::to_string(config.tile_rows) + "\n"
         + "#define OPS_PER_SIMD "
         + std::to_string(config.outputs_per_simd) + "\n"
@@ -1210,6 +1243,7 @@ struct NintMatmulPlan {
                 + std::to_string(index) + ")]],\n";
         }
         result += "device T* y [[buffer(" + std::to_string(count) + ")]],\n"
+            "constant int& row_count [[buffer(" + std::to_string(count + 1) + ")]],\n"
             "uint thread_index_in_simdgroup [[thread_index_in_simdgroup]],\n"
             "uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],\n"
             "uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]) {\n";
@@ -1220,7 +1254,8 @@ struct NintMatmulPlan {
 };
 
 const std::shared_ptr<const NintMatmulPlan>& compiled_nint_matmul_plan(
-    const NintMatmulKernelConfig& config) {
+    NintMatmulKernelConfig config) {
+    if (config.rows > 6) config.rows = 0;
     struct LocalEntry {
         NintMatmulKernelConfig config;
         std::shared_ptr<const NintMatmulPlan> plan;
@@ -1229,7 +1264,7 @@ const std::shared_ptr<const NintMatmulPlan>& compiled_nint_matmul_plan(
     for (const auto& entry : local_cache) {
         if (entry.config == config) return entry.plan;
     }
-    auto key = "mfq_native_nint_matmul_" + nint_matmul_kernel_key(config);
+    auto key = "mfq_native_nint_matmul_v2_" + nint_matmul_kernel_key(config);
     for (const auto dtype : config.epilogue_types)
         key += "_" + mlx::core::type_to_name(dtype);
     static std::mutex mutex;
@@ -1241,11 +1276,24 @@ const std::shared_ptr<const NintMatmulPlan>& compiled_nint_matmul_plan(
     return local_cache.back().plan;
 }
 
-class NintMatmulPrimitive final : public mlx::core::UnaryPrimitive {
+class NintMatmulPrimitive final : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
 public:
     NintMatmulPrimitive(
-        mlx::core::Stream stream, std::shared_ptr<const NintMatmulPlan> plan)
-        : UnaryPrimitive(stream), plan_(std::move(plan)) {}
+        mlx::core::Stream stream, std::shared_ptr<const NintMatmulPlan> plan, int rows)
+        : UnaryPrimitive(stream), plan_(std::move(plan)), rows_(rows) {}
+
+    std::string preparation_key() const override { return plan_->kernel_name; }
+    void prepare_gpu() override { (void)prepared_kernel(); }
+
+    MTL::ComputePipelineState* prepared_kernel() {
+        auto& selected_stream = stream();
+        auto& device = mlx::core::metal::device(selected_stream.device);
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(plan_->kernel_name, options,
+            [plan = plan_] { return plan->source(); });
+        return device.get_kernel(plan_->kernel_name, library);
+    }
 
     void eval_cpu(const std::vector<array>&, array&) override {
         throw std::runtime_error("packed NINT matmul has no CPU path");
@@ -1258,20 +1306,16 @@ public:
             throw std::logic_error("packed NINT matmul input count mismatch");
         output.set_data(mlx::core::allocator::malloc(output.nbytes()));
         auto& selected_stream = stream();
-        auto& device = mlx::core::metal::device(selected_stream.device);
-        CompileOptions options;
-        options.math_mode = MathMode::Fast;
-        auto* library = device.get_library(plan_->kernel_name, options,
-            [plan = plan_] { return plan->source(); });
-        auto* kernel = device.get_kernel(plan_->kernel_name, library);
+        auto* kernel = prepared_kernel();
         auto& encoder = mlx::core::metal::get_command_encoder(selected_stream);
         encoder.set_compute_pipeline_state(kernel);
         for (int index = 0; index < count; ++index)
             encoder.set_input_array(inputs[index], index);
         encoder.set_output_array(output, count);
+        encoder.set_bytes(rows_, count + 1);
         const int output_groups = (config.logical_output + 8 * config.outputs_per_simd - 1)
             / (8 * config.outputs_per_simd);
-        const int row_groups = (config.rows + config.tile_rows - 1) / config.tile_rows;
+        const int row_groups = (rows_ + config.tile_rows - 1) / config.tile_rows;
         encoder.dispatch_threadgroups(
             MTL::Size(output_groups, row_groups, 1), MTL::Size(256, 1, 1));
     }
@@ -1280,15 +1324,16 @@ public:
 
     bool is_equivalent(const mlx::core::Primitive& other) const override {
         const auto* primitive = dynamic_cast<const NintMatmulPrimitive*>(&other);
-        return primitive && primitive->plan_ == plan_;
+        return primitive && primitive->plan_ == plan_ && primitive->rows_ == rows_;
     }
 
     std::vector<Shape> output_shapes(const std::vector<array>&) override {
-        return {Shape{plan_->config.rows, plan_->config.logical_output}};
+        return {Shape{rows_, plan_->config.logical_output}};
     }
 
 private:
     std::shared_ptr<const NintMatmulPlan> plan_;
+    int rows_;
 };
 
 array native_nint_matmul(
@@ -1304,7 +1349,7 @@ array native_nint_matmul(
         throw std::invalid_argument("packed NINT matmul requires the Metal device");
     return array(Shape{config.rows, config.logical_output},
         config.float32 ? mlx::core::float32 : mlx::core::float16,
-        std::make_shared<NintMatmulPrimitive>(stream, plan), std::move(inputs));
+        std::make_shared<NintMatmulPrimitive>(stream, plan, config.rows), std::move(inputs));
 }
 
 mlx::core::fast::CustomKernelFunction make_nint_swiglu_kernel() {
@@ -1925,7 +1970,7 @@ array MlxNintWeight::matmul_impl(
 
     const int tile_rows = rows == 1
         ? 1
-        : (rows <= 16 ? static_cast<int>(rows) : 8);
+        : (rows <= 6 ? static_cast<int>(rows) : 8);
     const std::int64_t outputs_per_simd =
         rows == 1 ? nint_decode_outputs_per_simd(input_size_, output_size_) : 2;
     const std::int64_t outputs_per_threadgroup = 8 * outputs_per_simd;
@@ -2322,7 +2367,9 @@ array MlxNintWeight::dequantize(Dtype dtype) const {
                             std::numeric_limits<int>::max())) {
         throw std::runtime_error("NINT dequantization grid exceeds MLX limits");
     }
-    const int grid = static_cast<int>(element_count);
+    const int values_per_thread = group_size_ % 4 == 0 ? 4 : 1;
+    const int grid = static_cast<int>(static_cast<std::uint64_t>(output_size_) *
+        ((static_cast<std::uint64_t>(input_size_) + values_per_thread - 1) / values_per_thread));
     auto outputs = nint_dequantize_kernel()(
         {
             q_packed_,
@@ -2343,6 +2390,7 @@ array MlxNintWeight::dequantize(Dtype dtype) const {
             {"NG", groups_},
             {"K", input_size_},
             {"OUT", output_size_},
+            {"VEC", values_per_thread},
         },
         std::nullopt,
         false,
@@ -2394,7 +2442,6 @@ array MlxNintWeight::embedding(
             {"GS", group_size_},
             {"NG", groups_},
             {"K", input_size_},
-            {"COUNT", static_cast<int>(count)},
         },
         std::nullopt,
         false,

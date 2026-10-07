@@ -521,6 +521,12 @@ void MlxQwen35CausalLm::validate_components() const {
     }
 }
 
+array MlxQwen35CausalLm::score_forward(const array& token_ids, bool last_token_only) {
+    if (token_ids.ndim() != 2 || token_ids.shape(0) != 1 || token_ids.shape(1) <= 0)
+        throw std::invalid_argument("score token IDs must have [1,tokens] shape");
+    return forward_embeddings_impl(embed_tokens(token_ids), nullptr, false, 0, !last_token_only).first;
+}
+
 array MlxQwen35CausalLm::forward(
     const array& token_ids,
     bool use_cache) {
@@ -885,6 +891,12 @@ void MlxQwen35CausalLm::clear_cache() noexcept {
     }
 }
 
+void MlxQwen35CausalLm::reset_generation_state() noexcept {
+    clear_cache();
+    last_mtp_stats_ = {mtp_.has_value(), false, 0, 0, 0};
+    mtp_policy_state_ = {};
+}
+
 MlxQwen35TextSessionState
 MlxQwen35CausalLm::capture_text_session_state(
     const std::vector<std::int64_t>& tokens, bool detached) const {
@@ -1164,6 +1176,7 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
     detail::ComponentProfile component_profile;
     const auto profile_started = std::chrono::steady_clock::now();
     auto logits = [&]() {
+        mfq::engine::PrefillActivity prefill_activity;
         detail::ScopedComponentProfile component_scope(
             profile_prefill ? &component_profile : nullptr);
         detail::ScopedMlxEvaluationTiming timing(
@@ -1477,6 +1490,17 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
             });
         int predictor_history_position = mtp_->cache_position();
         int folded_history = 0;
+        MlxMtpHistoryBuffer pending_history;
+        const auto fold_pending_history = [&] {
+            if (pending_history.empty()) return;
+            auto batch = pending_history.drain();
+            const auto positions = make_positions(predictor_history_position + 1, batch.token_ids.shape(1));
+            auto anchor = positions
+                ? mtp_->forward(batch.hidden, batch.token_ids, *positions, embedding_, true)
+                : mtp_->forward(batch.hidden, batch.token_ids, embedding_, true);
+            anchor.eval();
+            predictor_history_position += batch.token_ids.shape(1);
+        };
         std::optional<MlxMtpDraftContext> terminal_context;
         std::optional<array> terminal_hidden;
         std::vector<std::int32_t> terminal_ids;
@@ -1487,6 +1511,7 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
                 Shape{0, accepted, 0}, Shape{1, accepted + 1, static_cast<int>(config_.hidden_size)});
             if (!prefix_cache.wants(cache_position_, terminal)) return;
             mtp_->trim_cache_to(predictor_history_position);
+            fold_pending_history();
             if (accepted > 0) {
                 auto rows = mlx::core::slice(*context.verified_hidden, Shape{0, 0, 0},
                     Shape{1, accepted, static_cast<int>(config_.hidden_size)});
@@ -1501,6 +1526,13 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
 
         MlxMtpEngineCallbacks mtp_callbacks;
         mtp_callbacks.predictor = mtp_->mtp_descriptor();
+        mtp_callbacks.policy_state = &mtp_policy_state_;
+        mtp_callbacks.decode_target = [&](std::int32_t token) {
+            const array ids({token}, Shape{1, 1}, mlx::core::int32);
+            auto step = forward_decode_with_hidden(ids, 0);
+            return MlxMtpTargetBatch{
+                mlx::core::reshape(step.first, Shape{1, vocab}), std::move(step.second)};
+        };
         mtp_callbacks.target_cache_position = [this] {
             return cache_position_;
         };
@@ -1561,6 +1593,16 @@ std::int32_t MlxQwen35CausalLm::generate_prepared_impl(
                     folded_history = 0;
                 }
                 const int committed = static_cast<int>(next_ids.size());
+                if (context.requested_depth == 0) {
+                    pending_history.append(hidden_rows, next_ids);
+                    if (pending_history.size() >= kMlxMtpHistoryChunkSize) {
+                        if (context.time_sample) *context.time_sample = false;
+                        fold_pending_history();
+                    }
+                    return;
+                }
+                if (!pending_history.empty() && context.time_sample) *context.time_sample = false;
+                fold_pending_history();
                 const array committed_ids(
                     next_ids.begin(),
                     Shape{1, committed},

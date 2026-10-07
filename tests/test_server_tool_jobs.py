@@ -571,7 +571,8 @@ def test_perplexity_job_parses_result_and_publishes_logits(tmp_path: Path) -> No
             ),
         )
         store = SessionStore(tmp_path / "jobs.sqlite3")
-        manager = JobManager(store, handlers.handlers())
+        assert "evaluate.perplexity" not in handlers.handlers()
+        manager = JobManager(store, {"evaluate.perplexity": handlers.perplexity})
         artifact = (await catalog.list()).data[0]
         submitted = await manager.submit(
             CreateJobRequest(

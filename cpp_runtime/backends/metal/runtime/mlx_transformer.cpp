@@ -1,4 +1,5 @@
 #include "mlx_transformer.h"
+#include "mlx_resident_budget.h"
 
 #include "mlx_detached_copy.h"
 
@@ -86,6 +87,8 @@ fused_fp16_rms_norm_kernel() {
 }
 
 constexpr const char* kMropeSource = R"METAL(
+    const uint TOKENS = uint(positions_shape[1]);
+    const uint SIZE = uint(x_shape[0]) * uint(DIM);
     uint index = thread_position_in_grid.x;
     if (index >= uint(SIZE)) {
         return;
@@ -158,6 +161,8 @@ const mlx::core::fast::CustomKernelFunction& mrope_kernel() {
 }
 
 constexpr const char* kAdjacentRopeSource = R"METAL(
+    const uint TOKENS = uint(cos_values_shape[0]);
+    const uint SIZE = uint(x_shape[0]) * uint(DIM);
     uint index = thread_position_in_grid.x;
     if (index >= uint(SIZE)) {
         return;
@@ -328,18 +333,20 @@ array mlx_rope_adjacent(
     }
     const int grid = static_cast<int>(source.size());
     auto outputs = adjacent_rope_kernel()(
-        {source, cos_values, sin_values},
+        {
+            mlx::core::reshape(source, Shape{grid / dimension, dimension}),
+            mlx::core::reshape(cos_values, Shape{tokens, pairs}),
+            mlx::core::reshape(sin_values, Shape{tokens, pairs}),
+        },
         {source.shape()},
         {source.dtype()},
         {grid, 1, 1},
         {std::min(256, grid), 1, 1},
         {
             {"T", source.dtype()},
-            {"SIZE", grid},
             {"DIM", dimension},
             {"ROTARY", rotary_dimension},
             {"PAIRS", pairs},
-            {"TOKENS", tokens},
             {"HEADS", heads},
             {"INVERSE", inverse ? 1 : 0},
         },
@@ -546,10 +553,8 @@ array apply_rope(
         std::string,
         mlx::core::fast::TemplateArg>> templates{
         {"T", source.dtype()},
-        {"SIZE", size},
-        {"TOKENS", tokens},
         {"DIM", source.shape(-1)},
-        {"HEADS", source.shape(-3)},
+        {"HEADS", source.ndim() >= 3 ? source.shape(-3) : 1},
         {"ROTARY_DIM", rotary_dimension},
         {"POS_AXES", position_axes},
         {"POSITION_BATCH", static_cast<int>(position_batch)},
@@ -559,7 +564,12 @@ array apply_rope(
         {"INTERLEAVED", static_cast<int>(interleaved)},
     };
     auto outputs = mrope_kernel()(
-        {source, position_values, parameters},
+        {
+            mlx::core::reshape(source, Shape{size / source.shape(-1), source.shape(-1)}),
+            mlx::core::reshape(position_values,
+                Shape{static_cast<int>(position_values.size() / tokens), tokens}),
+            parameters,
+        },
         {source.shape()},
         {source.dtype()},
         {size, 1, 1},
@@ -666,6 +676,7 @@ MlxKvCache::MlxKvCache(
          dtype_ != mlx::core::float32)) {
         throw std::runtime_error("invalid KV cache dimensions or dtype");
     }
+    MlxResidentBudgetScope::reserve(key_.nbytes() + value_.nbytes());
     resources_.set({key_.nbytes() + value_.nbytes(), static_cast<std::size_t>(batch_)});
 }
 
@@ -694,6 +705,8 @@ void MlxKvCache::ensure_capacity(int required) {
         next_capacity,
         head_dimension_,
     };
+    MlxResidentBudgetScope::reserve(std::size_t(batch_) * heads_ * next_capacity * head_dimension_ *
+        mlx::core::size_of(dtype_) * 2);
     auto next_key = mlx::core::zeros(next_shape, dtype_);
     auto next_value = mlx::core::zeros(next_shape, dtype_);
     if (capacity() > 0) {
@@ -826,6 +839,8 @@ void MlxKvCache::restore_snapshot(
     }
     const Shape allocation_shape{
         batch_, heads_, snapshot.capacity, head_dimension_};
+    MlxResidentBudgetScope::reserve(static_cast<std::size_t>(batch_) * heads_ * snapshot.capacity * head_dimension_ * dtype_.size() * 2
+        + snapshot.key.nbytes() + snapshot.value.nbytes());
     auto key = mlx::core::zeros(allocation_shape, dtype_);
     auto value = mlx::core::zeros(allocation_shape, dtype_);
     key = mlx::core::slice_update(
@@ -885,10 +900,11 @@ void MlxSequenceCache::reset(
     if (batch <= 0 || initial_capacity <= 0) {
         throw std::invalid_argument("invalid MLX sequence cache allocation");
     }
-    batch_ = batch;
-    position_ = 0;
     const int capacity = std::min(
         maximum_sequence_, initial_capacity);
+    MlxResidentBudgetScope::reserve(std::size_t(batch) * capacity * width_ * mlx::core::size_of(dtype_));
+    batch_ = batch;
+    position_ = 0;
     values_ = mlx::core::zeros(
         Shape{batch_, capacity, width_}, dtype_);
     resources_.set({values_->nbytes(), static_cast<std::size_t>(batch_)});
@@ -961,6 +977,7 @@ void MlxSequenceCache::ensure_capacity(int required) {
     while (capacity < required) {
         capacity = std::min(maximum_sequence_, capacity * 2);
     }
+    MlxResidentBudgetScope::reserve(std::size_t(batch_) * capacity * width_ * mlx::core::size_of(dtype_));
     auto expanded = mlx::core::zeros(
         Shape{batch_, capacity, width_}, dtype_);
     expanded = mlx::core::slice_update(

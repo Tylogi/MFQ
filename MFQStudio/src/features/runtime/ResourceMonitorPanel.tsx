@@ -19,21 +19,35 @@ export function ResourceMonitorPanel() {
   const [error, setError] = useState('');
   useEffect(() => {
     let disposed = false;
-    let timer: ReturnType<typeof setTimeout>;
+    let polling = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const controller = new AbortController();
     setResources(null);
     setError('');
     async function poll() {
+      if (disposed || polling) return;
+      clearTimeout(timer);
+      if (document.hidden) {
+        timer = setTimeout(() => void poll(), 2000);
+        return;
+      }
+      polling = true;
       try {
-        const next = await runtimeApi.runtimeResources();
+        const next = await runtimeApi.runtimeResources(controller.signal);
         if (!disposed) { setResources(next); setError(''); }
       } catch (cause) {
         if (!disposed) { setResources(null); setError(errorMessage(cause)); }
       } finally {
+        polling = false;
         if (!disposed) timer = setTimeout(() => void poll(), 2000);
       }
     }
-    if (ready) void poll();
-    return () => { disposed = true; clearTimeout(timer); };
+    function visible() { if (!document.hidden) void poll(); }
+    if (ready) {
+      document.addEventListener('visibilitychange', visible);
+      void poll();
+    }
+    return () => { disposed = true; controller.abort(); clearTimeout(timer); document.removeEventListener('visibilitychange', visible); };
   }, [ready, connectionRevision]);
   const unavailable = tr('未上报', 'Not reported');
   function utilization(value: number | null | undefined) {

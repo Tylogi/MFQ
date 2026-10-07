@@ -49,6 +49,8 @@ struct InferenceInput {
     MfqSamplingParams sampling;
     MfqPromptCachePlan cache_plan;
     std::optional<MfqMultimodalInput> media;
+    bool prefix_cache_enabled = true;
+    std::optional<std::size_t> benchmark_prompt_tokens;
 };
 
 struct ChatTemplateCapabilities {

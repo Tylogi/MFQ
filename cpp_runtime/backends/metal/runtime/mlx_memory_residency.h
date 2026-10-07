@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mlx_weight_residency.h"
 #include <mlx/backend/metal/device.h>
 #include <mlx/memory.h>
 
@@ -17,6 +18,7 @@ public:
         }
         mlx::core::set_wired_limit(limit);
         limit_bytes().store(limit, std::memory_order_relaxed);
+        MlxWeightResidency::begin_load();
     }
 
     static void refresh() {

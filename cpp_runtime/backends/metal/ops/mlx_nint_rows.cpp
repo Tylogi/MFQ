@@ -19,7 +19,7 @@ inline uint mfq_nint_row_bits(
 constexpr const char* kRowDecode = R"METAL(
     uint column = thread_position_in_grid.x;
     uint row = thread_position_in_grid.y;
-    if (column >= uint(WIDTH) || row >= uint(ROWS)) return;
+    if (column >= uint(WIDTH) || row >= uint(descriptors_shape[0])) return;
     uint base = row * 6u;
     uint layout = descriptors[base + 3u];
     uint qbits = layout & 15u;
@@ -60,7 +60,7 @@ mlx::core::array MlxNintRowBatch::decode(mlx::core::Dtype dtype) const {
     return row_decode_kernel()(
         {packed, descriptors}, {mlx::core::Shape{static_cast<int>(rows()), width()}}, {dtype},
         {width(), static_cast<int>(rows()), 1}, {128, 1, 1},
-        {{"T", dtype}, {"WIDTH", width()}, {"ROWS", static_cast<int>(rows())}},
+        {{"T", dtype}, {"WIDTH", width()}},
         std::nullopt, false, {}).front();
 }
 

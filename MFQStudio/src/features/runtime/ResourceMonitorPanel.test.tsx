@@ -1,10 +1,11 @@
-import { act, render, screen } from '@testing-library/react';
-import { afterEach, expect, it, vi } from 'vitest';
+import { act, fireEvent, render, screen } from '@testing-library/react';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { ResourceMonitorPanel } from './ResourceMonitorPanel';
 import { runtimeApi } from '../../shared/api/resources/runtime';
 import type { RuntimeResources } from '../../shared/api/types';
 
-vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => ({ ready: true, connectionRevision: 0 }) }));
+const state = vi.hoisted(() => ({ ready: true, connectionRevision: 0 }));
+vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => state }));
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (_zh: string, en: string) => en }) }));
 
 const snapshot: RuntimeResources = { sampled_at: 100, interval_seconds: 2,
@@ -15,6 +16,7 @@ const snapshot: RuntimeResources = { sampled_at: 100, interval_seconds: 2,
   memory_bandwidth_utilization_percent: null, weights: [{ instance_id: '1', model: 'Qwen3.8',
     expert_read_bytes_per_second: 0, ple_read_bytes_per_second: 2 ** 20, engram_read_bytes_per_second: null }] };
 
+beforeEach(() => { state.ready = true; state.connectionRevision = 0; });
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
 it('shows measured system and weight traffic without inventing bandwidth utilization', async () => {
@@ -76,4 +78,55 @@ it('clears stale measurements on failure instead of presenting them as live', as
   await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
   expect(screen.queryByText('36%')).not.toBeInTheDocument();
   expect(screen.getByRole('status')).toHaveTextContent('offline');
+});
+
+it('does not poll hidden pages and immediately refreshes on returning', async () => {
+  vi.useFakeTimers();
+  const visibility = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+  const query = vi.spyOn(runtimeApi, 'runtimeResources').mockResolvedValue(snapshot);
+  const view = render(<ResourceMonitorPanel />);
+  await act(async () => { await vi.advanceTimersByTimeAsync(6000); });
+  expect(query).not.toHaveBeenCalled();
+  visibility.mockReturnValue(false);
+  fireEvent(document, new Event('visibilitychange'));
+  await act(async () => {});
+  expect(query).toHaveBeenCalledOnce();
+  expect(screen.getByText('36%')).toBeInTheDocument();
+  const signal = query.mock.calls[0][0];
+  view.unmount();
+  expect(signal?.aborted).toBe(true);
+  fireEvent(document, new Event('visibilitychange'));
+  await act(async () => { await vi.advanceTimersByTimeAsync(6000); });
+  expect(query).toHaveBeenCalledOnce();
+});
+
+it('keeps sampling serial even when visibility changes during a pending request', async () => {
+  vi.useFakeTimers();
+  let resolve!: (value: RuntimeResources) => void;
+  const query = vi.spyOn(runtimeApi, 'runtimeResources').mockImplementationOnce(() => new Promise((done) => { resolve = done; }))
+    .mockResolvedValue(snapshot);
+  render(<ResourceMonitorPanel />);
+  fireEvent(document, new Event('visibilitychange'));
+  fireEvent(document, new Event('visibilitychange'));
+  await act(async () => { await vi.advanceTimersByTimeAsync(6000); });
+  expect(query).toHaveBeenCalledOnce();
+  await act(async () => { resolve(snapshot); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+  expect(query).toHaveBeenCalledTimes(2);
+});
+
+it('aborts and ignores a previous server’s late resource response', async () => {
+  let resolve!: (value: RuntimeResources) => void;
+  const query = vi.spyOn(runtimeApi, 'runtimeResources').mockImplementationOnce(() => new Promise((done) => { resolve = done; }))
+    .mockResolvedValue({ ...snapshot, cpu_utilization_percent: 12 });
+  const view = render(<ResourceMonitorPanel />);
+  const previousSignal = query.mock.calls[0][0];
+  state.connectionRevision = 1;
+  view.rerender(<ResourceMonitorPanel />);
+  await act(async () => {});
+  expect(previousSignal?.aborted).toBe(true);
+  expect(screen.getByText('12%')).toBeInTheDocument();
+  await act(async () => { resolve(snapshot); });
+  expect(screen.queryByText('36%')).not.toBeInTheDocument();
+  expect(screen.getByText('12%')).toBeInTheDocument();
 });

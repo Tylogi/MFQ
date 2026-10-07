@@ -1,9 +1,9 @@
-/** 模型目录控制器负责资产刷新、加载策略和目录注册生命周期。 */
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { modelsApi } from '../../shared/api/resources/models';
 import type { ModelArtifact, ModelDirectoryList } from '../../shared/api/types';
 import { useRuntime } from '../../app/RuntimeProvider';
+import { useConnectionScope } from '../../app/useConnectionScope';
 import { useSettings } from '../settings/SettingsProvider';
 import { errorMessage, formatNumber } from '../../app/formatters';
 import { isStudio, selectLocalModelDirectory } from '../../studio';
@@ -11,8 +11,8 @@ import { runtimeModelNames } from '../runtime/modelSelection';
 import { STUDIO_PATHS, labPath } from '../../navigation';
 import { toast } from '../../stores/toastStore';
 import { useJobStore } from '../../stores/jobStore';
+import { readModelDirectory, saveModelDirectory } from './modelDirectoryPreference';
 
-/** 为模型页封装模型目录工作流；状态随页面卸载释放。 */
 export function useModelCatalog() {
   const {
     runtime,
@@ -22,7 +22,9 @@ export function useModelCatalog() {
     setSelectedModel,
     refreshRuntime,
     ready,
+    connectionRevision,
   } = useRuntime();
+  const connectionScope = useConnectionScope();
   const jobs = useJobStore((state) => state.jobs);
   const { tr, contextSize } = useSettings();
   const navigate = useNavigate();
@@ -37,14 +39,63 @@ export function useModelCatalog() {
   const [loadPinned, setLoadPinned] = useState(false);
   const [loadIdleTtl, setLoadIdleTtl] = useState<number | null>(null);
   const [modelBrowser, setModelBrowser] = useState<ModelDirectoryList | null>(null);
-  const [modelBrowserOpen, setModelBrowserOpen] = useState(false);
-  const [modelDirectoryPath, setModelDirectoryPath] = useState('');
+  const [modelBrowserOpen, updateModelBrowserOpen] = useState(false);
+  const [modelFolderPath, setModelFolderPath] = useState(readModelDirectory);
+  const [modelBrowserError, setModelBrowserError] = useState('');
+  const [modelBrowserLoading, setModelBrowserLoading] = useState(false);
+  const directoryRequest = useRef(0);
+  const [modelFilesMode, setModelFilesMode] = useState(false);
+  const [modelDirectoryPath, setModelDirectoryPath] = useState(readModelDirectory);
   const modelBrowserTriggerRef = useRef<HTMLElement | null>(null);
   const canUseNativeModelPicker = isStudio() && studio?.config.mode !== 'remote';
   const availableModelNames = runtimeModelNames(models, instances);
   const openStudioPage = (_view: string, page: 'models' | 'quantization') =>
     navigate(labPath(page));
   const artifactRevision = jobs.map((job) => job.id + ':' + job.status).join(',');
+  function setModelBrowserOpen(open: boolean) {
+    if (!open) {
+      directoryRequest.current += 1;
+      if (modelBrowserLoading) { setBusy(false); setModelBrowserLoading(false); }
+    }
+    updateModelBrowserOpen(open);
+  }
+  function rememberModelDirectory(path: string) {
+    saveModelDirectory(path);
+    setModelFolderPath(path);
+  }
+  useEffect(() => {
+    directoryRequest.current += 1;
+    const path = readModelDirectory();
+    setModelFolderPath(path);
+    setModelDirectoryPath(path);
+    setModelBrowser(null);
+    setModelBrowserError('');
+    setModelBrowserLoading(false);
+    setArtifacts([]);
+    updateModelBrowserOpen(false);
+    setBusy(false);
+  }, [connectionRevision]);
+  useEffect(() => {
+    if (!ready) return;
+    let disposed = false;
+    let polling = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    async function update() {
+      if (disposed || polling) return;
+      clearTimeout(timer);
+      polling = true;
+      try {
+        if (!document.hidden) await refreshRuntime(true);
+      } finally {
+        polling = false;
+        if (!disposed) timer = setTimeout(() => void update(), 5000);
+      }
+    }
+    function visible() { if (!document.hidden) void update(); }
+    document.addEventListener('visibilitychange', visible);
+    void update();
+    return () => { disposed = true; clearTimeout(timer); document.removeEventListener('visibilitychange', visible); };
+  }, [ready, connectionRevision, refreshRuntime]);
   useEffect(() => {
     if (!ready) return;
     let active = true;
@@ -59,7 +110,7 @@ export function useModelCatalog() {
     return () => {
       active = false;
     };
-  }, [ready, artifactRevision]);
+  }, [ready, connectionRevision, artifactRevision]);
   useEffect(() => {
     for (const job of jobs) {
       if (job.kind !== 'model.load') continue;
@@ -88,8 +139,8 @@ export function useModelCatalog() {
       ),
     [artifacts, modelFilter],
   );
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
   async function loadArtifact(name: string) {
+    const current = connectionScope();
     if (busy) return;
     setBusy(true);
     try {
@@ -97,20 +148,22 @@ export function useModelCatalog() {
         pin: loadPinned,
         idle_ttl_seconds: loadIdleTtl,
       });
-
+      if (!current()) return;
       navigate(STUDIO_PATHS.models);
       await refreshRuntime(false);
+      if (!current()) return;
       setSelectedModel(name);
     } catch (cause) {
-      reportError(cause);
+      if (current()) reportError(cause);
     } finally {
-      setBusy(false);
+      if (current()) setBusy(false);
     }
   }
 
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
-  async function finishModelRegistration(names: string[]) {
+  async function finishModelRegistration(names: string[], current: () => boolean) {
+    if (!current()) return;
     const nextArtifacts = await modelsApi.modelArtifacts(true);
+    if (!current()) return;
     setArtifacts(nextArtifacts);
     const registered = nextArtifacts.filter((item) => names.includes(item.name));
     if (!registered.length) {
@@ -140,31 +193,38 @@ export function useModelCatalog() {
           pin: loadPinned,
           idle_ttl_seconds: loadIdleTtl,
         });
+        if (!current()) return;
       }
     }
     setModelBrowserOpen(false);
     navigate(STUDIO_PATHS.models);
     await refreshRuntime(false);
+    if (!current()) return;
     if (registered.length === 1) setSelectedModel(registered[0].name);
   }
 
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
   async function openModelDirectory(directoryId?: string | null, path?: string | null) {
+    const current = connectionScope();
     if (busy) return;
+    const request = ++directoryRequest.current;
+    setModelBrowserError('');
+    setModelBrowser(null);
+    if (path != null) setModelDirectoryPath(path);
+    setModelBrowserOpen(true);
+    setModelBrowserLoading(true);
     setBusy(true);
     try {
       const listing = await modelsApi.modelDirectories(directoryId, path);
+      if (!current() || request !== directoryRequest.current) return;
       setModelBrowser(listing);
       setModelDirectoryPath(listing.current_path ?? '');
-      setModelBrowserOpen(true);
     } catch (cause) {
-      reportError(cause);
+      if (current() && request === directoryRequest.current) setModelBrowserError(errorMessage(cause));
     } finally {
-      setBusy(false);
+      if (current() && request === directoryRequest.current) { setBusy(false); setModelBrowserLoading(false); }
     }
   }
 
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
   async function jumpToModelDirectory(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const path = modelDirectoryPath.trim();
@@ -172,53 +232,94 @@ export function useModelCatalog() {
     await openModelDirectory(null, path);
   }
 
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
   async function chooseModelDirectory() {
+    const current = connectionScope();
     if (busy) return;
+    setModelFilesMode(false);
     modelBrowserTriggerRef.current =
       document.activeElement instanceof HTMLElement ? document.activeElement : null;
     if (!canUseNativeModelPicker) {
-      await openModelDirectory();
+      await openModelDirectory(null, modelFolderPath);
       return;
     }
     setBusy(true);
     try {
-      const names = await selectLocalModelDirectory();
-      if (names) await finishModelRegistration(names);
+      const selected = await selectLocalModelDirectory(modelFolderPath);
+      if (!current()) return;
+      if (selected) {
+        rememberModelDirectory(selected.path);
+        await finishModelRegistration(selected.names, current);
+      }
     } catch (cause) {
-      reportError(cause);
+      if (current()) reportError(cause);
     } finally {
-      setBusy(false);
+      if (current()) setBusy(false);
     }
   }
 
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
+  async function openModelFiles(modelId: string) {
+    const current = connectionScope();
+    if (busy) return;
+    modelBrowserTriggerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const request = ++directoryRequest.current;
+    setBusy(true);
+    try {
+      const listing = await modelsApi.modelArtifactDirectory(modelId);
+      if (!current() || request !== directoryRequest.current) return;
+      setModelBrowser(listing);
+      setModelBrowserError('');
+      setModelDirectoryPath(listing.current_path ?? '');
+      setModelFilesMode(true);
+      setModelBrowserOpen(true);
+    } catch (cause) {
+      if (current() && request === directoryRequest.current) reportError(cause);
+    } finally {
+      if (current() && request === directoryRequest.current) setBusy(false);
+    }
+  }
+
   async function registerCurrentModelDirectory() {
+    const current = connectionScope();
     if (busy || !modelBrowser?.current_id) return;
     setBusy(true);
     try {
       const registered = await modelsApi.registerModelDirectory(modelBrowser.current_id);
-      await finishModelRegistration(registered.map((item) => item.name));
+      if (!current()) return;
+      if (modelBrowser.current_path) rememberModelDirectory(modelBrowser.current_path);
+      await finishModelRegistration(registered.map((item) => item.name), current);
     } catch (cause) {
-      reportError(cause);
+      if (current()) reportError(cause);
     } finally {
-      setBusy(false);
+      if (current()) setBusy(false);
     }
   }
 
-  /** 执行模型资源操作，并将错误展示在当前页面。 */
+  async function openCurrentDirectoryInFinder() {
+    const current = connectionScope();
+    if (busy || !modelBrowser?.current_id || !modelBrowser.can_open_in_finder) return;
+    setBusy(true);
+    try {
+      await modelsApi.openModelDirectoryInFinder(modelBrowser.current_id);
+    } catch (cause) {
+      if (current()) reportError(cause);
+    } finally {
+      if (current()) setBusy(false);
+    }
+  }
+
   async function unloadInstance(id: string) {
+    const current = connectionScope();
     if (busy) return;
     setBusy(true);
     try {
       await modelsApi.unloadModel(id);
-
+      if (!current()) return;
       navigate(STUDIO_PATHS.models);
       await refreshRuntime(false);
     } catch (cause) {
-      reportError(cause);
+      if (current()) reportError(cause);
     } finally {
-      setBusy(false);
+      if (current()) setBusy(false);
     }
   }
 
@@ -239,6 +340,10 @@ export function useModelCatalog() {
     setLoadIdleTtl,
     modelBrowser,
     modelBrowserOpen,
+    modelFolderPath,
+    modelBrowserError,
+    modelBrowserLoading,
+    modelFilesMode,
     setModelBrowserOpen,
     modelDirectoryPath,
     setModelDirectoryPath,
@@ -247,6 +352,8 @@ export function useModelCatalog() {
     chooseModelDirectory,
     jumpToModelDirectory,
     openModelDirectory,
+    openModelFiles,
+    openCurrentDirectoryInFinder,
     registerCurrentModelDirectory,
     unloadInstance,
     loadArtifact,

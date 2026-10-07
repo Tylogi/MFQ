@@ -70,15 +70,18 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   const reloads = useRef(new Set<string>());
   const mounted = useRef(false);
   const requestVersion = useRef(0);
+  const jobRequestVersion = useRef(0);
   const initializationVersion = useRef(0);
   const selectedRef = useRef(selectedModel);
   selectedRef.current = selectedModel;
 
   const refreshRuntime = useCallback(async (quiet = true): Promise<boolean> => {
     const version = ++requestVersion.current;
+    const jobVersion = ++jobRequestVersion.current;
     if (!quiet) setLoading(true);
     try {
       const [nextInstances, nextJobs] = await Promise.all([runtimeApi.runtimeInstances(), jobsApi.jobs(100)]);
+      if (!mounted.current || version !== requestVersion.current) return false;
       const instance = nextInstances.find(
         (item) => item.model === selectedRef.current && item.state !== 'failed',
       );
@@ -88,6 +91,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       ]);
       if (statusResult.status !== 'fulfilled') throw statusResult.reason;
       const status = statusResult.value;
+      if (!mounted.current || version !== requestVersion.current) return false;
       const [modelResult, capabilityResult, realtimeResult] = await Promise.allSettled([
         isRuntimeReady(status.runtime_state)
           ? runtimeApi.runtimeModels()
@@ -100,13 +104,13 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       if (!mounted.current || version !== requestVersion.current) return false;
       const nextModels = modelResult.status === 'fulfilled' ? modelResult.value : [];
       setInstances(nextInstances);
-      useJobStore.getState().setJobs(nextJobs);
+      if (jobVersion === jobRequestVersion.current) useJobStore.getState().setJobs(nextJobs);
       setRuntime(status);
       setModels(nextModels);
       setCapabilities(capabilityResult.status === 'fulfilled' ? capabilityResult.value : null);
       setRealtime(realtimeResult.status === 'fulfilled' ? realtimeResult.value : null);
       if (voiceResult.status === 'fulfilled') setVoiceComponent(voiceResult.value);
-      const names = runtimeSelectionNames(nextModels, nextInstances, nextJobs);
+      const names = runtimeSelectionNames(nextModels, nextInstances, useJobStore.getState().jobs);
       setSelectedModel((current) =>
         names.includes(current)
           ? current
@@ -125,36 +129,44 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const reloadModelContext = useCallback(async (instanceId: string, contextSize: number) => {
+    const version = initializationVersion.current;
     if (reloads.current.has(instanceId)) throw new Error('Model reload is already in progress');
     reloads.current.add(instanceId);
     setReloadingInstances((current) => ({ ...current, [instanceId]: contextSize }));
     try {
       const result = await runtimeApi.reloadRuntime(contextSize, instanceId);
-      if (mounted.current) {
+      if (mounted.current && version === initializationVersion.current) {
         setInstances((current) => current.map((item) => item.id === instanceId
           ? { ...item, context_size: result.max_context ?? contextSize }
           : item));
       }
       return result;
     } finally {
-      await refreshRuntime(true);
-      reloads.current.delete(instanceId);
-      if (mounted.current) setReloadingInstances((current) => {
-        const next = { ...current };
-        delete next[instanceId];
-        return next;
-      });
+      if (version === initializationVersion.current) {
+        await refreshRuntime(true);
+        if (version === initializationVersion.current) {
+          reloads.current.delete(instanceId);
+          if (mounted.current) setReloadingInstances((current) => {
+            const next = { ...current };
+            delete next[instanceId];
+            return next;
+          });
+        }
+      }
     }
   }, [refreshRuntime]);
 
   const reloadService = useCallback(async () => {
     const version = ++initializationVersion.current;
     ++requestVersion.current;
+    ++jobRequestVersion.current;
     setReady(false);
     setLoading(true);
     setConnectionError(null);
     setRefreshError(null);
     setJobStreamErrors({});
+    reloads.current.clear();
+    setReloadingInstances({});
     useJobStore.getState().clearJobStreams();
     try {
       let status = await studioStatus();
@@ -176,6 +188,8 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       setModels([]);
       setRuntime(null);
       setCapabilities(null);
+      setRealtime(null);
+      setVoiceComponent(null);
       setConnectionRevision((current) => current + 1);
       const refreshed = await refreshRuntime();
       if (mounted.current && version === initializationVersion.current && refreshed) setReady(true);
@@ -247,9 +261,10 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
       if (running || disposed) return;
       running = true;
       clearTimeout(timer);
+      const version = ++jobRequestVersion.current;
       try {
         const jobs = await jobsApi.jobs(100);
-        if (disposed) return;
+        if (disposed || version !== jobRequestVersion.current) return;
         const previous = useJobStore.getState().activeJobIds;
         useJobStore.getState().setJobs(jobs);
         retryJobStreams();
@@ -279,10 +294,15 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
     };
   }, [ready, connectionRevision, refreshRuntime, retryJobStreams]);
 
-  const addJob = useCallback(
-    (job: JobResource) => useJobStore.getState().addJob(job),
-    [],
-  );
+  const addJob = useMemo(() => {
+    const version = initializationVersion.current;
+    return (job: JobResource) => {
+      if (mounted.current && version === initializationVersion.current) {
+        ++jobRequestVersion.current;
+        useJobStore.getState().addJob(job);
+      }
+    };
+  }, [connectionRevision]);
   const value = useMemo(
     () => ({
       runtime,

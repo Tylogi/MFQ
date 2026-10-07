@@ -54,6 +54,35 @@ def test_job_storage_lifecycle_and_restart_recovery(tmp_path: Path) -> None:
     assert [event.sequence for event in reopened.list_job_events(JOB_ID)] == [1, 2, 3, 4, 5]
 
 
+def test_job_event_tail_keeps_latest_output_and_preserves_forward_replay(tmp_path: Path) -> None:
+    async def run() -> None:
+        store = make_store(tmp_path)
+        original = store.create_job("test.work", {}, job_id=JOB_ID, now=NOW)
+        last = None
+        for index in range(1005):
+            last = store.append_job_event(JOB_ID, JobEventType.LOG, message=f"output-{index}")
+        assert store.get_job(JOB_ID).updated_at == original.updated_at
+        service = ServerService(store, IdleBackend())
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(service)), base_url="http://test") as client:
+                head = await client.get(f"/api/v1/jobs/{JOB_ID}/events?limit=1000")
+                assert head.status_code == 200 and head.json()["data"][0]["sequence"] == 1
+                tail = await client.get(f"/api/v1/jobs/{JOB_ID}/events?limit=1000&tail=true")
+                assert tail.status_code == 200
+                entries = tail.json()["data"]
+                assert len(entries) == 1000 and entries[-1]["message"] == "output-1004"
+                assert [item["sequence"] for item in entries] == list(range(last.sequence - 999, last.sequence + 1))
+                following = await client.get(f"/api/v1/jobs/{JOB_ID}/events?after={last.sequence - 1}&tail=true")
+                assert [item["sequence"] for item in following.json()["data"]] == [last.sequence]
+                assert (await client.get(f"/api/v1/jobs/{JOB_ID}/events?after={last.sequence}&tail=true")).json()["data"] == []
+                assert (await client.get(f"/api/v1/jobs/{JOB_ID}/events?tail=invalid")).status_code == 422
+                assert (await client.get(f"/api/v1/jobs/{JOB_ID}/events?after=-1&tail=true")).status_code == 422
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())
+
+
 def test_only_terminal_job_records_can_be_deleted(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     active = store.create_job("test.active", {}, now=NOW)
@@ -75,6 +104,72 @@ def test_only_terminal_job_records_can_be_deleted(tmp_path: Path) -> None:
     assert store.list_job_events(completed.id)
     assert store.list_artifact_lineage()[0].artifact_uri == "workspace://kept.bin"
     assert store.get_job(active.id).status == JobStatus.QUEUED
+
+
+@pytest.mark.parametrize("status", [JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.INTERRUPTED])
+def test_terminal_job_event_stream_replays_all_pages_and_resumes_without_gaps(tmp_path: Path, status: JobStatus) -> None:
+    async def run() -> None:
+        store = make_store(tmp_path)
+        store.create_job("test.replay", {}, job_id=JOB_ID, now=NOW)
+        store.claim_job(JOB_ID, now=NOW)
+        for index in range(405):
+            store.append_job_event(JOB_ID, JobEventType.LOG, message=f"output-{index}")
+        if status == JobStatus.SUCCEEDED:
+            store.complete_job(JOB_ID, {})
+        elif status == JobStatus.FAILED:
+            store.fail_job(JOB_ID, ErrorDetail(code="test_failure", message="last error", retryable=False))
+        elif status == JobStatus.CANCELLED:
+            store.cancel_job(JOB_ID)
+        else:
+            store.interrupt_job(JOB_ID)
+        expected = store.list_job_events(JOB_ID, limit=1000)
+        service = ServerService(store, IdleBackend())
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(service)), base_url="http://test") as client:
+                for after, header in [(0, 0), (200, 300), (expected[-1].sequence, 0)]:
+                    response = await client.get(f"/api/v1/jobs/{JOB_ID}/events/stream?after={after}",
+                        headers={"Last-Event-ID": str(header)})
+                    assert response.status_code == 200
+                    payloads = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+                    assert [item["sequence"] for item in payloads] == [item.sequence for item in expected if item.sequence > max(after, header)]
+                    if payloads:
+                        assert payloads[-1]["data"]["status"] == status.value
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())
+
+
+def test_job_event_stream_keeps_a_terminal_event_created_after_the_last_page_read(tmp_path: Path) -> None:
+    async def run() -> None:
+        store = make_store(tmp_path)
+        store.create_job("test.replay", {}, job_id=JOB_ID, now=NOW)
+        store.claim_job(JOB_ID, now=NOW)
+        store.append_job_event(JOB_ID, JobEventType.LOG, message="last output")
+        service = ServerService(store, IdleBackend())
+        original = service.list_job_events
+        completed = False
+
+        async def complete_after_read(*args, **kwargs):
+            nonlocal completed
+            result = await original(*args, **kwargs)
+            if not completed:
+                completed = True
+                store.complete_job(JOB_ID, {})
+            return result
+
+        service.list_job_events = complete_after_read
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(service)), base_url="http://test") as client:
+                response = await client.get(f"/api/v1/jobs/{JOB_ID}/events/stream")
+                assert response.status_code == 200
+                payloads = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+                assert [item["sequence"] for item in payloads] == [1, 2, 3, 4]
+                assert payloads[-1]["data"]["status"] == "succeeded"
+        finally:
+            await service.aclose()
+
+    asyncio.run(run())
 
 
 def test_clear_completed_jobs_preserves_active_jobs(tmp_path: Path) -> None:

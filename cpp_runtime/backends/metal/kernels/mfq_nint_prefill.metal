@@ -3,6 +3,10 @@
 
 using namespace metal;
 
+#ifndef MFQ_NINT_PREFILL_GROUP_SIZE
+#define MFQ_NINT_PREFILL_GROUP_SIZE 0
+#endif
+
 struct MfqNintPrefillParams {
     int rows;
     int output_width;
@@ -19,6 +23,10 @@ inline ushort4 nint_prefill_read_row_quad(
     uint row_bit_shift,
     uint value_index,
     uint bits) {
+    if (simd_all(bits == 8u && row_bit_shift == 0u)) {
+        return ushort4(*reinterpret_cast<device const packed_uchar4*>(
+            stream + row_byte_offset + value_index));
+    }
     const uint row_relative_bits = row_bit_shift + value_index * bits;
     const uint byte_index = row_byte_offset + (row_relative_bits >> 3u);
     const uint shift = row_relative_bits & 7u;
@@ -59,10 +67,15 @@ inline half4 nint_prefill_decode_row_quad(
         row_bit_shift,
         column,
         bits);
+#if MFQ_NINT_PREFILL_GROUP_SIZE > 0
+    constexpr uint group_size = MFQ_NINT_PREFILL_GROUP_SIZE;
+#else
     const uint group_size = uint(params.group_size);
+#endif
     const uint first_group = column / group_size;
     if (column + 3u < uint(params.input_width) &&
-        first_group == (column + 3u) / group_size) {
+        (group_size % 4u == 0u ||
+         first_group == (column + 3u) / group_size)) {
         const uint metadata = row * uint(params.groups) + first_group;
         const float scale = anchor_scale * float(sub_scales[metadata]);
         const float minimum = anchor_minimum * float(sub_mins[metadata]);

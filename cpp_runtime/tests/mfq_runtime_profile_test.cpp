@@ -1,6 +1,7 @@
 #include "transport.h"
 
 #include <cmath>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -58,9 +59,9 @@ int main() {
             1e-12,
         "DeepSeek-V4.1 registry sampling mismatch");
 
+    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto root = std::filesystem::temp_directory_path() /
-        "mfq-runtime-profile-test";
-    std::filesystem::remove_all(root);
+        ("mfq-runtime-profile-test-" + std::to_string(nonce));
     std::filesystem::create_directories(root);
     const auto model = root / "model-00002-of-00003.mfq";
     const auto family_sidecar = root / "model.runtime.json";
@@ -90,6 +91,15 @@ int main() {
             "embedded field was lost");
     require(resolved.source.find("runtime-explicit:") == 0,
             "profile source mismatch");
+
+    for (const char* extension : {".MFQ", ".mFq"}) {
+        auto uppercase = model;
+        uppercase.replace_extension(extension);
+        const auto profile = resolve_mfq_runtime_profile(
+            uppercase.string(), "minicpmo-hf-mfq", "minicpmo", "test");
+        require(std::abs(profile.chat.top_p.value_or(-1.0) - 0.6) < 1e-12,
+                "case-insensitive shard family sidecar was lost");
+    }
 
     std::filesystem::remove_all(root);
     return 0;

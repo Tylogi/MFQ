@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Query, Response
+from fastapi import APIRouter, Query, Request, Response
 
 from mfq.server.api.dependencies import ServiceDependency
 from mfq.server.api.routes import ERROR_RESPONSES
@@ -20,6 +20,7 @@ from mfq.server.protocol.models import (
     EvaluationComparisonResource,
     EvaluationKind,
     EvaluationResultList,
+    EvaluationToolsResource,
     HubModelInfo,
     HubModelSearchResult,
     HubReferenceRequest,
@@ -27,8 +28,14 @@ from mfq.server.protocol.models import (
     ModelDirectoryList,
     ModelLoadRequest,
     ModelUnloadRequest,
+    OfficialDatasetList,
+    OfficialDatasetResource,
     OfficialModelList,
+    OpenModelDirectoryRequest,
+    OpenModelDirectoryResult,
     OperationAccepted,
+    ProbabilityScoreRequest,
+    ProbabilityScoreResult,
     RegisterModelDirectoryRequest,
     RemoteNodeList,
     RemoteNodeResource,
@@ -141,6 +148,16 @@ async def model_directories(
 
 
 @router.post(
+    "/api/v1/models/directories/open",
+    response_model=OpenModelDirectoryResult,
+    responses=ERROR_RESPONSES,
+    tags=["models"],
+)
+async def open_model_directory(service: ServiceDependency, body: OpenModelDirectoryRequest) -> OpenModelDirectoryResult:
+    return await service.open_model_directory(body)
+
+
+@router.post(
     "/api/v1/models/directories/register",
     response_model=ModelArtifactList,
     responses=ERROR_RESPONSES,
@@ -151,6 +168,16 @@ async def register_model_directory(
     body: RegisterModelDirectoryRequest,
 ) -> ModelArtifactList:
     return await service.register_model_directory(body)
+
+
+@router.get(
+    "/api/v1/models/{model_id}/directory",
+    response_model=ModelDirectoryList,
+    responses=ERROR_RESPONSES,
+    tags=["models"],
+)
+async def model_artifact_directory(service: ServiceDependency, model_id: str) -> ModelDirectoryList:
+    return await service.model_artifact_directory(model_id)
 
 
 @router.get(
@@ -206,6 +233,14 @@ async def list_datasets(
     return await service.list_datasets()
 
 
+@router.get("/api/v1/datasets/catalog", response_model=OfficialDatasetList, responses=ERROR_RESPONSES, tags=["evaluation"])
+async def official_dataset_catalog(service: ServiceDependency) -> OfficialDatasetList:
+    from dataclasses import asdict
+
+    from mfq.server.services.evaluation_datasets import OFFICIAL_DATASETS
+    return OfficialDatasetList(data=[OfficialDatasetResource.model_validate(asdict(spec)) for spec in OFFICIAL_DATASETS.values()])
+
+
 @router.delete(
     "/api/v1/datasets/{dataset_id}",
     status_code=204,
@@ -215,6 +250,35 @@ async def list_datasets(
 async def delete_dataset(service: ServiceDependency, dataset_id: UUID) -> Response:
     await service.delete_dataset(dataset_id)
     return Response(status_code=204)
+
+
+@router.get("/api/v1/evaluations/tools", response_model=EvaluationToolsResource, responses=ERROR_RESPONSES, tags=["evaluation"])
+async def evaluation_tools(service: ServiceDependency, request: Request) -> EvaluationToolsResource:
+    from mfq.server.services.official_benchmarks import benchmark_readiness
+    handlers = service.jobs.handlers
+    root = getattr(service.tool_handlers, "root", None)
+    return EvaluationToolsResource(workspace_root=str(root) if root else None,
+        api_base=str(request.base_url).rstrip("/") + "/v1",
+        quality_available="evaluate.wikitext2" in handlers,
+        benchmark_available="benchmark.inference" in handlers,
+        accuracy_available="evaluate.accuracy" in handlers,
+        task_benchmarks=benchmark_readiness(root) if "evaluate.accuracy" in handlers else {})
+
+
+@router.post("/api/v1/evaluations/probabilities", response_model=ProbabilityScoreResult, responses=ERROR_RESPONSES, tags=["evaluation"])
+async def evaluation_probabilities(service: ServiceDependency, body: ProbabilityScoreRequest) -> ProbabilityScoreResult:
+    from mfq.server.runtime.client import BackendError
+    pool = getattr(service.tool_handlers, "runtime_manager", None)
+    if pool is None:
+        raise ServiceError(501, "probability_unavailable", "no managed runtime is configured")
+    try:
+        async with pool.benchmark_runtime(body.instance_id) as (_, backend):
+            if not callable(getattr(backend, "score", None)) or not await backend.probability_available():
+                raise ServiceError(501, "probability_unavailable", "the loaded runtime does not support probability scoring")
+            result = await backend.score(body.model_dump(mode="json", exclude={"instance_id"}))
+            return ProbabilityScoreResult.model_validate(result)
+    except BackendError as error:
+        raise ServiceError(error.status_code or 502, error.code, str(error), retryable=error.retryable) from error
 
 
 @router.get(

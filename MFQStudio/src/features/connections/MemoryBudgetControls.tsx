@@ -3,6 +3,7 @@ import { runtimeApi } from '../../shared/api/resources/runtime';
 import { jobsApi } from '../../shared/api/resources/jobs';
 import { useSettings } from '../settings/SettingsProvider';
 import { useRuntime } from '../../app/RuntimeProvider';
+import { useConnectionScope } from '../../app/useConnectionScope';
 import { useJobStore } from '../../stores/jobStore';
 import { SettingRow } from '../../app/display';
 import { errorMessage } from '../../app/formatters';
@@ -10,8 +11,12 @@ import { toast } from '../../stores/toastStore';
 
 export function MemoryBudgetControls({ residency }: { residency: string }) {
   const { tr } = useSettings();
-  const { addJob } = useRuntime();
+  const { addJob, runtime } = useRuntime();
+  const connectionScope = useConnectionScope();
   const [modelManual, setModelManual] = useState(false);
+  const [totalManual, setTotalManual] = useState(false);
+  const [totalDraft, setTotalDraft] = useState('96');
+  const [totalDetected, setTotalDetected] = useState<number | null>(null);
   const [prefixManual, setPrefixManual] = useState(false);
   const [modelDraft, setModelDraft] = useState('64');
   const [prefixDraft, setPrefixDraft] = useState('4');
@@ -19,11 +24,16 @@ export function MemoryBudgetControls({ residency }: { residency: string }) {
   const [saving, setSaving] = useState(false);
   const jobs = useJobStore((state) => state.jobs);
   const pending = jobs.some((job) => job.kind === 'runtime.memory.configure' && ['queued', 'running', 'cancelling'].includes(job.status));
+  const effectiveTotal = runtime?.runtime_memory_effective_budget_bytes ?? totalDetected;
   useEffect(() => {
     let disposed = false;
     void runtimeApi.memoryPolicy().then((policy) => {
       if (disposed) return;
       setModelManual(policy.model_limit_bytes != null);
+      setTotalManual(policy.total_limit_bytes != null);
+      setTotalDetected(policy.effective_total_limit_bytes ?? null);
+      if (policy.total_limit_bytes != null) setTotalDraft(String(policy.total_limit_bytes / 2 ** 30));
+      else if (policy.effective_total_limit_bytes) setTotalDraft(String(Math.floor(policy.effective_total_limit_bytes / 2 ** 30)));
       setPrefixManual(policy.prefix_limit_bytes != null);
       if (policy.model_limit_bytes != null) setModelDraft(String(policy.model_limit_bytes / 2 ** 30));
       if (policy.prefix_limit_bytes != null) setPrefixDraft(String(policy.prefix_limit_bytes / 2 ** 30));
@@ -31,19 +41,25 @@ export function MemoryBudgetControls({ residency }: { residency: string }) {
     }).catch(() => {});
     return () => { disposed = true; };
   }, []);
-  const valid = (!modelManual || modelDraft.trim() !== '' && Number.isFinite(Number(modelDraft)) && Number(modelDraft) > 0)
+  const valid = (!totalManual || totalDraft.trim() !== '' && Number.isFinite(Number(totalDraft)) && Number(totalDraft) > 0)
+    && (!modelManual || modelDraft.trim() !== '' && Number.isFinite(Number(modelDraft)) && Number(modelDraft) > 0)
     && (!prefixManual || prefixDraft.trim() !== '' && Number.isFinite(Number(prefixDraft)) && Number(prefixDraft) >= 0);
   async function apply() {
+    const current = connectionScope();
     setSaving(true);
     try {
       const accepted = await runtimeApi.configureMemoryPolicy({
+        total_limit_bytes: totalManual ? Math.round(Number(totalDraft) * 2 ** 30) : null,
         model_limit_bytes: modelManual ? Math.round(Number(modelDraft) * 2 ** 30) : null,
         prefix_limit_bytes: prefixManual ? Math.round(Number(prefixDraft) * 2 ** 30) : null,
       });
-      addJob(await jobsApi.getJob(accepted.operation_id));
-      toast.success(tr('内存规划已提交，将重新加载当前模型', 'Memory plan submitted; loaded models will be reloaded'));
-    } catch (cause) { toast.error(errorMessage(cause)); }
-    finally { setSaving(false); }
+      if (!current()) return;
+      const job = await jobsApi.getJob(accepted.operation_id);
+      if (!current()) return;
+      addJob(job);
+      toast.success(tr('内存与缓存规划已提交', 'Memory and cache plan submitted'));
+    } catch (cause) { if (current()) toast.error(errorMessage(cause)); }
+    finally { if (current()) setSaving(false); }
   }
   function control(label: string, manual: boolean, setManual: (value: boolean) => void, draft: string, setDraft: (value: string) => void, min: number) {
     return <div className="server-row-actions">
@@ -57,6 +73,10 @@ export function MemoryBudgetControls({ residency }: { residency: string }) {
     </div>;
   }
   return <>
+    <SettingRow title={tr('总常驻内存预算', 'Total resident memory budget')}
+      detail={tr('权重、活跃 KV 和前缀 RAM 共用此预算；接近上限时，先将前缀缓存移至 SSD，再减少常驻专家。', 'Weights, live KV and prefix RAM share this budget; near the limit, move prefix caches to SSD before reducing resident experts.')}
+      trailing={<>{control(tr('总常驻内存预算', 'Total resident memory budget'), totalManual, setTotalManual, totalDraft, setTotalDraft, 0.1)}
+        {!totalManual && effectiveTotal != null && <small>{(effectiveTotal / 2 ** 30).toFixed(1)} GiB</small>}</>} />
     <SettingRow title={tr('模型总驻留', 'Total model residency')}
       detail={tr('所有模型权重的总上限；放不下的 MoE 专家自动转为 SSD 缓存。', 'Total weight ceiling across models; overflowing MoE experts use SSD-backed caching.')}
       trailing={control(tr('模型总驻留', 'Total model residency'), modelManual, setModelManual, modelDraft, setModelDraft, 0.1)} />
@@ -65,7 +85,7 @@ export function MemoryBudgetControls({ residency }: { residency: string }) {
       trailing={control(tr('前缀 RAM 配额', 'Prefix RAM allowance'), prefixManual, setPrefixManual, prefixDraft, setPrefixDraft, 0)} />
     <div className="memory-budget-actions"><small>{tr('当前模型驻留', 'Current weight residency')}: {residency}</small>
       <button disabled={!available || saving || pending || !valid} onClick={() => void apply()} type="button">
-        {saving || pending ? tr('应用中…', 'Applying…') : tr('应用并重新规划', 'Apply and replan')}
+        {saving || pending ? tr('应用中…', 'Applying…') : tr('应用预算', 'Apply budgets')}
       </button>
     </div>
   </>;

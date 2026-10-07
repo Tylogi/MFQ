@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
-from mfq.server.runtime.capabilities import capabilities_for_architecture
 from mfq.server.protocol.input_protocols import render_preformatted_prompt
 from mfq.server.protocol.models import (
     ModelCapabilities,
@@ -28,6 +27,7 @@ from mfq.server.protocol.output_protocols import (
     ParsedToolCall,
     output_protocol_for_architecture,
 )
+from mfq.server.runtime.capabilities import capabilities_for_architecture
 from mfq.server.runtime.client import (
     BackendError,
     BackendProtocolError,
@@ -173,6 +173,46 @@ class OpenAIChatBackend:
         self._avfoundation_video_library = avfoundation_video_library
         self._local_tensor_files = local_tensor_files and os.name in {"posix", "nt"}
         self._runtime_metric_overrides: dict[str, dict[str, float]] = {}
+
+    async def score(self, payload: dict[str, Any]) -> dict[str, Any]:
+        import math
+        result = await self._runtime.score(payload)
+        scores = result.get("scores")
+        if result.get("log_base") != "e" or not isinstance(result.get("prompt_tokens"), int) or result["prompt_tokens"] < 1 or not isinstance(scores, list) or len(scores) != len(payload["continuations"]):
+            raise BackendProtocolError("invalid native probability response")
+        for score in scores:
+            if not isinstance(score, dict):
+                raise BackendProtocolError("invalid native probability row")
+            tokens, values, total = score.get("token_ids"), score.get("token_logprobs"), score.get("log_likelihood")
+            if not isinstance(tokens, list) or not tokens or any(type(token) is not int or token < 0 for token in tokens) or not isinstance(values, list) or len(tokens) != len(values):
+                raise BackendProtocolError("invalid native probability token alignment")
+            if any(type(value) not in {int, float} or not math.isfinite(value) or value > 1e-5 for value in values) or type(total) not in {int, float} or not math.isfinite(total) or not math.isclose(total, math.fsum(values), rel_tol=1e-7, abs_tol=1e-5):
+                raise BackendProtocolError("invalid native probability values")
+            if payload.get("mode") == "next_token" and len(tokens) != 1:
+                raise BackendProtocolError("next_token requires exactly one scored token")
+        return result
+
+    async def probability_available(self) -> bool:
+        return (await self._runtime.health()).get("probability_available") is True
+
+    async def benchmark(self, payload: dict[str, Any]) -> dict[str, Any]:
+        metrics = None
+        usage = None
+        finish_reason = None
+        async with self._runtime.generate(payload) as events:
+            async for event in events:
+                if event is None:
+                    continue
+                if event.get("mfq_metrics") is not None:
+                    metrics = event["mfq_metrics"]
+                if event.get("usage") is not None:
+                    usage = event["usage"]
+                for choice in event.get("choices", []):
+                    if choice.get("finish_reason"):
+                        finish_reason = choice["finish_reason"]
+        if not isinstance(metrics, dict) or not isinstance(usage, dict):
+            raise BackendProtocolError("benchmark requires native metrics and token usage")
+        return {"metrics": metrics, "usage": usage, "finish_reason": finish_reason}
 
     async def preflight(
         self,
@@ -628,6 +668,21 @@ class OpenAIChatBackend:
         if target_bytes < 0:
             raise ValueError("target_bytes must be non-negative")
         return await self._runtime.trim_cache(target_bytes)
+
+    async def set_prefix_cache_budget(self, target_bytes: int, disk_target_bytes: int | None = None) -> dict[str, Any]:
+        if target_bytes < 0 or disk_target_bytes is not None and disk_target_bytes < 0:
+            raise ValueError("cache budgets must be non-negative")
+        if disk_target_bytes is not None:
+            return await self._runtime.set_cache_budget(target_bytes, disk_target_bytes)
+        return await self._runtime.set_cache_budget(target_bytes)
+
+    async def refresh_prefix_cache_index(self) -> dict[str, Any]:
+        return await self._runtime.refresh_cache_index()
+
+    async def set_resident_memory_budget(self, target_bytes: int) -> dict[str, Any]:
+        if target_bytes < 0:
+            raise ValueError("resident budget must be non-negative")
+        return await self._runtime.set_resident_memory_budget(target_bytes)
 
     def realtime_connect(self, *, mode: str = "audio") -> Any:
         return self._runtime.realtime_connect(mode=mode)

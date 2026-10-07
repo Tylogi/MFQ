@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -24,6 +25,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from mfq.server.api.network import download_environment
 from mfq.server.protocol.models import ErrorDetail
 from mfq.server.services.jobs import JobContext, JobExecutionError, TypedJobHandler
+from mfq.server.services.inference_benchmark import InferenceBenchmarkPayload, WikitextQualityPayload, run_inference_benchmark
+from mfq.server.services.accuracy_benchmark import AccuracyBenchmarkPayload, run_accuracy_benchmark
+from mfq.server.services.evaluation_datasets import OfficialDatasetDownloadPayload, download_official_dataset, materialize_wt2, WT2_TEXT_SHA256
 from mfq.server.state.catalog import ModelArtifactNotFoundError, ModelCatalog
 from mfq.server.state.storage import StorageError
 
@@ -233,6 +237,7 @@ class ToolJobHandlers:
         *,
         voice_component: Any | None = None,
         activate_voice_output: Callable[[], Awaitable[dict[str, Any]]] | None = None,
+        runtime_manager: Any | None = None,
     ) -> None:
         self.catalog = catalog
         self.paths = paths
@@ -240,6 +245,7 @@ class ToolJobHandlers:
         self.model_root = catalog.roots[0] if catalog.roots else self.root / "models"
         self.voice_component = voice_component
         self.activate_voice_output = activate_voice_output
+        self.runtime_manager = runtime_manager
 
     def _mfq_command(self, *arguments: str) -> list[str]:
         command = [str(self.paths.python)]
@@ -250,6 +256,7 @@ class ToolJobHandlers:
 
     def handlers(self) -> dict[str, Any]:
         result: dict[str, Any] = {
+            "dataset.download": TypedJobHandler(self.download_evaluation_dataset, OfficialDatasetDownloadPayload),
             "artifact.import": TypedJobHandler(self.import_artifact, ImportArtifactPayload),
             "calibrate.imatrix": TypedJobHandler(self.calibrate_imatrix, ImatrixCalibrationPayload),
             "model.validate": TypedJobHandler(self.validate_container, ContainerValidationPayload),
@@ -268,7 +275,10 @@ class ToolJobHandlers:
                 self.download_huggingface, HuggingFaceDownloadPayload
             )
         if self.paths.perplexity is not None:
-            result["evaluate.perplexity"] = TypedJobHandler(self.perplexity, PerplexityPayload)
+            result["evaluate.wikitext2"] = TypedJobHandler(self.wikitext_quality, WikitextQualityPayload)
+        if self.runtime_manager is not None:
+            result["benchmark.inference"] = TypedJobHandler(self.inference_benchmark, InferenceBenchmarkPayload)
+            result["evaluate.accuracy"] = TypedJobHandler(self.accuracy_benchmark, AccuracyBenchmarkPayload)
         if self.paths.runtime is not None:
             result["benchmark.kernel"] = TypedJobHandler(
                 self.kernel_benchmark, KernelBenchmarkPayload
@@ -763,6 +773,47 @@ class ToolJobHandlers:
             "summary": output[-1] if output else "ok",
         }
 
+    async def inference_benchmark(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
+        return await run_inference_benchmark(context, payload, self.runtime_manager)
+
+    async def download_evaluation_dataset(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
+        return await download_official_dataset(context, payload, self.root)
+
+    async def accuracy_benchmark(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
+        request = AccuracyBenchmarkPayload.model_validate(payload)
+        dataset = await asyncio.to_thread(context.store.get_dataset, request.dataset_id)
+        path = self._input(dataset.artifact_uri.removeprefix("workspace://"))
+        return await run_accuracy_benchmark(context, payload, self.runtime_manager, path, self.root)
+
+    async def wikitext_quality(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
+        request = WikitextQualityPayload.model_validate(payload)
+        artifact = await self._model(request.model)
+        if self.runtime_manager is not None:
+            instances = await self.runtime_manager.instances()
+            if any(item.model == artifact.resource.name and item.state.value in {"ready", "busy", "loading"} for item in instances.data):
+                raise self._failure("quality_model_loaded", "quality evaluation loads a separate process; unload this model first to avoid duplicating resident weights")
+        dataset = await asyncio.to_thread(context.store.get_dataset, request.dataset_id)
+        if dataset.kind != "wikitext2":
+            raise self._failure("wrong_dataset_kind", "WT2 quality requires a WikiText-2 dataset")
+        source = self._input(dataset.artifact_uri.removeprefix("workspace://"))
+        text_path = await asyncio.to_thread(materialize_wt2, source, dataset)
+        path = self._artifact_uri(text_path).removeprefix("workspace://")
+        manifest_path = self._input(request.reference_manifest.removeprefix("workspace://"))
+        if manifest_path.stat().st_size > 1024 * 1024:
+            raise self._failure("invalid_reference_manifest", "reference manifest exceeds 1 MiB")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("dataset", {}).get("sha256") != WT2_TEXT_SHA256:
+            raise self._failure("reference_dataset_mismatch", "reference logits do not belong to this dataset")
+        geometry = manifest.get("evaluation", {})
+        if geometry.get("n_ctx") != request.context_size or geometry.get("n_seq") != request.parallel:
+            raise self._failure("reference_geometry_mismatch", "ctx and parallel sequences must match the reference logits manifest")
+        return await self.perplexity(context, {"model": request.model, "dataset_file": path,
+            "dataset": "wikitext2", "dataset_id": str(request.dataset_id),
+            "context_size": request.context_size, "chunks": request.chunks, "parallel": request.parallel,
+            "kl_reference": request.reference_logits.removeprefix("workspace://"),
+            "kl_manifest": request.reference_manifest.removeprefix("workspace://"),
+            "moe_gpu_cache_gb": request.moe_gpu_cache_gb})
+
     async def perplexity(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
         request = PerplexityPayload.model_validate(payload)
         artifact = await self._model(request.model)
@@ -772,8 +823,6 @@ class ToolJobHandlers:
             str(executable),
             "--model",
             str(artifact.path),
-            "--file",
-            str(dataset),
             "--dataset",
             request.dataset,
             "--ctx-size",
@@ -787,6 +836,8 @@ class ToolJobHandlers:
             argv.extend(["--ubatch-size", str(request.ubatch_size)])
         if request.kl_reference is not None:
             argv.extend(["--kl-base", str(self._input(request.kl_reference))])
+        else:
+            argv.extend(["--file", str(dataset)])
         if request.kl_manifest is not None:
             argv.extend(["--kl-manifest", str(self._input(request.kl_manifest))])
         if request.score_count is not None:
@@ -828,6 +879,12 @@ class ToolJobHandlers:
                     result[key] = float(value)
                 except ValueError:
                     result[key] = value
+        if request.kl_reference is not None:
+            if not kl or any(not isinstance(result.get(key), (int, float)) or not math.isfinite(result[key]) for key in ("kld", "same_top", "scored_tokens")):
+                raise self._failure("quality_metrics_missing", "runtime did not return valid KLD/Top1 metrics")
+            if not 0 <= result["same_top"] <= 1 or result["scored_tokens"] <= 0:
+                raise self._failure("quality_metrics_invalid", "runtime returned invalid Top1 or scored token count")
+            result["top1_agreement"] = result["same_top"]
         if logits is not None:
             await context.artifact(
                 name=logits.name,
@@ -847,9 +904,15 @@ class ToolJobHandlers:
         }
         manifest = self._file_manifest(dataset)
         manifest.update(name=request.dataset)
+        if request.dataset_id:
+            registered = await asyncio.to_thread(context.store.get_dataset, request.dataset_id)
+            manifest.update(source_sha256=registered.sha256, source_byte_size=registered.byte_size,
+                official_id="wt2-raw-test" if request.dataset == "wikitext2" else None,
+                text_protocol="mfq-wt2-text-v1" if request.dataset == "wikitext2" else None)
         comparison = {
             "kind": "perplexity",
             "dataset_sha256": manifest["sha256"],
+            "source_sha256": manifest.get("source_sha256"),
             "context_size": request.context_size,
             "chunks": request.chunks,
             "parallel": request.parallel,

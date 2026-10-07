@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -34,6 +35,10 @@ struct PagedPrefixCacheConfig {
     // checksumming a matched chain in parallel substantially reduces restore
     // latency without involving a backend device or its command stream.
     std::size_t max_parallel_reads = 4;
+    std::size_t retain_tail_versions = 2;
+    std::uint64_t min_disk_free_bytes = 1ULL << 30;
+    std::filesystem::path model_path;
+    std::function<void(std::size_t)> reserve_memory;
 };
 
 struct PrefixMatch {
@@ -58,7 +63,11 @@ struct PagedPrefixCacheMetrics {
     std::uint64_t hot_bytes = 0;
     std::uint64_t pending_writes = 0;
     std::uint64_t pending_bytes = 0;
+    std::uint64_t resident_bytes = 0;
     std::uint64_t pending_max_bytes = 0;
+    std::uint64_t hot_pressure_bytes = 0;
+    std::uint64_t superseded_blocks = 0;
+    std::uint64_t low_disk_space_skips = 0;
 };
 
 class PagedPrefixCache {
@@ -124,6 +133,9 @@ public:
     // Reclaim the RAM tier without deleting durable SSD blocks or breaking
     // live RAM-only bindings. Returns the number of payload bytes released.
     std::uint64_t trim_hot(std::uint64_t target_bytes = 0);
+    std::uint64_t set_hot_limit(std::uint64_t max_bytes);
+    std::uint64_t set_disk_limit(std::uint64_t max_bytes);
+    std::size_t refresh_disk_index();
     void flush();
     std::size_t clear();
     PagedPrefixCacheMetrics metrics() const;

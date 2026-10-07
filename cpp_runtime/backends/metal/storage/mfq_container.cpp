@@ -267,7 +267,7 @@ std::vector<std::uint8_t> MfqContainer::read(
 }
 
 MfqMappedBytes MfqContainer::map_record(
-    const std::string& name) const {
+    const std::string& name, bool random_access) const {
     const auto& value = record(name);
     if (value.nbytes == 0) {
         record_prepared(name);
@@ -327,6 +327,13 @@ MfqMappedBytes MfqContainer::map_record(
         throw std::runtime_error(
             "cannot mmap MFQ record: " + name
             + ": " + std::strerror(map_error));
+    }
+    if (random_access && ::madvise(mapping, mapped_size, MADV_RANDOM) != 0) {
+        const int advice_error = errno;
+        ::munmap(mapping, mapped_size);
+        throw std::runtime_error(
+            "cannot configure random MFQ mapping: " + name
+            + ": " + std::strerror(advice_error));
     }
     auto owner = std::shared_ptr<void>(
         mapping,

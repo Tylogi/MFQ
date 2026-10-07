@@ -250,6 +250,9 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         media: { id: 'media-1', sha256: 'test', mime_type: 'text/plain', byte_size: 4 },
         name: 'notes.txt', text: 'note', extractor: 'text', created_at: createdAt,
       });
+    if (path === '/api/v1/evaluations/tools')
+      return json({ workspace_root: null, api_base: 'http://127.0.0.1:8090/v1',
+        quality_available: false, benchmark_available: false, accuracy_available: false, task_benchmarks: {} });
     if (path === '/api/v1/models/directories')
       return json({
         current_id: 'models-dir',
@@ -272,6 +275,7 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         '/api/v1/runtime/profiles',
         '/api/v1/artifacts/lineage',
         '/api/v1/datasets',
+        '/api/v1/datasets/catalog',
         '/api/v1/evaluations',
         '/api/v1/cluster/nodes',
       ].includes(path)

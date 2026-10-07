@@ -178,6 +178,7 @@ public:
                 {"status", reloading.load() ? "loading" : (scheduler.status().healthy ? "ok" : "unhealthy")},
                 {"model", config_.model_name},
                 {"model_type", config_.model_type},
+                {"probability_available", scheduler.info().probability},
                 {"model_capabilities", model_capabilities},
                 {"vision_supported", vision_supported},
                 {"vision_available", vision_available},
@@ -410,7 +411,23 @@ public:
                     }
                     continue;
                 }
-                if (op == "cache.trim") {
+                if (op == "memory.budget") {
+                    const auto bytes = integer_field(params, "target_bytes", 0);
+                    if (bytes < 0) throw ApiError(400, "invalid_request_error", "target_bytes must be non-negative");
+                    auto result = json{{"status", "ok"}, {"released_bytes", scheduler.session(
+                        {mfq::engine::SessionCommand::Kind::memory_budget, {}, {}, static_cast<uint64_t>(bytes)}).count}};
+                    add_session_metrics(result);
+                    send_result(id, std::move(result));
+                    continue;
+                }
+                if (op == "cache.refresh") {
+                    json result = {{"status", "ok"},
+                        {"removed_blocks", scheduler.session({mfq::engine::SessionCommand::Kind::refresh}).count}};
+                    add_session_metrics(result);
+                    send_result(id, std::move(result));
+                    continue;
+                }
+                if (op == "cache.trim" || op == "cache.budget") {
 
                     const int64_t target = integer_field(
                         params, "target_bytes", 0);
@@ -419,9 +436,15 @@ public:
                             400, "invalid_request_error",
                             "target_bytes must be non-negative");
                     }
+                    mfq::engine::SessionCommand command{op == "cache.trim" ? mfq::engine::SessionCommand::Kind::trim : mfq::engine::SessionCommand::Kind::budget, {}, {}, static_cast<uint64_t>(target)};
+                    if (op == "cache.budget" && params.contains("disk_target_bytes")) {
+                        const auto disk = integer_field(params, "disk_target_bytes", 0);
+                        if (disk < 0) throw ApiError(400, "invalid_request_error", "disk_target_bytes must be non-negative");
+                        command.disk_bytes = static_cast<uint64_t>(disk);
+                    }
                     json result = {
                         {"status", "ok"},
-                        {"released_bytes", scheduler.session({mfq::engine::SessionCommand::Kind::trim, {}, {}, static_cast<uint64_t>(target)}).count},
+                        {"released_bytes", scheduler.session(command).count},
                         {"target_bytes", target},
                     };
                     add_session_metrics(result);
@@ -782,6 +805,13 @@ public:
                     send_result(id, {{"status", "ok"}});
                     continue;
                 }
+                if (op == "score") {
+                    if (!scheduler.info().probability)
+                        throw ApiError(501, "probability_unavailable", "probability scoring is unavailable for this model");
+                    send_result(id, likelihood_result_json(std::get<mfq::engine::LikelihoodResult>(
+                        scheduler.control(parse_score_request(params)))));
+                    continue;
+                }
                 if (op != "generate") {
                     throw ApiError(
                         404, "unsupported_operation",
@@ -888,6 +918,8 @@ public:
                     id, 400, input_error_type(error.code), error.what());
             } catch (const json::exception & error) {
                 send_error(id, 400, "backend_protocol_error", error.what());
+            } catch (const std::invalid_argument& error) {
+                send_error(id, 400, "invalid_request_error", error.what());
             } catch (const std::exception & error) {
                 send_error(id, 500, "server_error", error.what());
             }

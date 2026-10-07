@@ -25,7 +25,19 @@ def test_load_progress_uses_worker_records_and_never_regresses(tmp_path, transpo
                          b"mfq_load_progress completed=0 total=0\n"
                          b"mfq_load_progress completed=5 total=10\n"
                          b"mfq_load_progress stage=finalizing\n"
-                         b"mfq_load_progress completed=10 total=10\n")
+                         b"mfq_load_progress completed=10 total=10\n"
+                         b"mfq_load_progress stage=compiling completed=0 total=12\n"
+                         b"mfq_load_progress stage=compiling completed=6 total=12\n"
+                         b"mfq_load_progress stage=compiling completed=5 total=12\n"
+                         b"mfq_load_progress stage=compiling completed=13 total=12\n"
+                         b"mfq_load_progress stage=compiling completed=0 total=0\n"
+                         b"mfq_load_progress stage=compiling completed=12 total=12\n"
+                         b"mfq_load_progress stage=warming completed=0 total=13\n"
+                         b"mfq_load_progress stage=warming completed=6 total=13\n"
+                         b"mfq_load_progress stage=warming completed=5 total=13\n"
+                         b"mfq_load_progress stage=warming completed=14 total=13\n"
+                         b"mfq_load_progress stage=warming completed=0 total=0\n"
+                         b"mfq_load_progress stage=warming completed=13 total=13\n")
         reader.feed_eof()
         instance = _Runtime(id=uuid4(), artifact=await catalog.resolve_path(path),
                             process=SimpleNamespace(stdout=reader, stderr=reader),
@@ -41,9 +53,11 @@ def test_load_progress_uses_worker_records_and_never_regresses(tmp_path, transpo
 
         context = SimpleNamespace(progress=progress, log=log)
         await pool._pump_output(instance, context)
-        assert [value for value, _ in values] == pytest.approx([0.20, 0.47, 0.94])
+        assert [value for value, _ in values] == pytest.approx([0.20, 0.47, 0.94, 0.945, 0.95, 0.95 + 0.04 * 6 / 13, 0.99])
         assert values[0][1] == {"phase": "weights", "completed": 2, "total": 10}
-        assert values[-1][1] == {"phase": "finalizing"}
+        assert values[2][1] == {"phase": "finalizing"}
+        assert values[4][1] == {"phase": "compiling", "completed": 12, "total": 12}
+        assert values[-1][1] == {"phase": "warming", "completed": 13, "total": 13}
         assert "ordinary log" in logs
         instance.state = RuntimeInstanceState.READY
         reader = asyncio.StreamReader()
@@ -51,6 +65,6 @@ def test_load_progress_uses_worker_records_and_never_regresses(tmp_path, transpo
         reader.feed_eof()
         instance.process = SimpleNamespace(stdout=reader, stderr=reader)
         await pool._pump_output(instance, context)
-        assert len(values) == 3
+        assert len(values) == 7
 
     asyncio.run(run())

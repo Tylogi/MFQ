@@ -171,7 +171,9 @@ public:
     }
 
     void reset_cache(int batch = 1);
+    mlx::core::array score_forward(const mlx::core::array& token_ids, bool last_token_only);
     void clear_cache() noexcept;
+    void reset_generation_state() noexcept;
 
     // Returns the number of sampled tokens. A token is counted before its
     // callback is invoked, so callback=false still returns a count including
@@ -292,6 +294,7 @@ private:
     std::optional<MlxQwen35MtpModule> mtp_;
     std::optional<MlxGridVisionPromptComponent> vision_;
     MlxMtpGenerationStats last_mtp_stats_;
+    mfq::engine::mtp::PolicyState mtp_policy_state_;
     std::vector<std::size_t> last_prefill_chunk_sizes_;
     int cache_position_ = 0;
     int cache_batch_ = 0;

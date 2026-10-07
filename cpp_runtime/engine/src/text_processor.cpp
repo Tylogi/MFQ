@@ -497,6 +497,18 @@ InferenceRequest TextProcessor::prepare(
             InferenceInputErrorCode::Invalid,
             "prompt tokenized to an empty sequence", "prompt");
     }
+    if (input.benchmark_prompt_tokens) {
+        const auto count = *input.benchmark_prompt_tokens;
+        if (count > static_cast<std::size_t>(max_context) ||
+            count + work.sampling.max_tokens > static_cast<std::size_t>(max_context)) {
+            throw InferenceInputError(InferenceInputErrorCode::Invalid,
+                "benchmark prompt and output exceed the loaded context capacity", "prompt");
+        }
+        const auto source = work.prompt;
+        work.prompt.resize(count);
+        for (std::size_t i = source.size(); i < count; ++i)
+            work.prompt[i] = source[i % source.size()];
+    }
     if (work.cache_plan.stable_prefix_tokens == 0)
         work.cache_plan.stable_prefix_tokens = work.prompt.size();
     if (!input.chat) work.cache_plan.cache_output_tokens = true;
@@ -515,6 +527,10 @@ InferenceRequest TextProcessor::prepare(
         }
     }
 
+    if (!input.prefix_cache_enabled) {
+        work.cache_plan.stable_prefix_tokens = 0;
+        work.cache_plan.cache_output_tokens = false;
+    }
     if (input.media) {
         prepare_media(
             *impl_->tokenizer, impl_->tokenizer->vocab_size(),

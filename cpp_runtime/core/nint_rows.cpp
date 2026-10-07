@@ -211,6 +211,30 @@ void NintRows::append_row(std::int64_t row, NintRowBatch& batch) const {
     batch.width_ = width_;
 }
 
+void NintRowBatch::append_batch(const NintRowBatch& other) {
+    other.validate();
+    if (this == &other || (width_ && width_ != other.width_)) {
+        throw std::invalid_argument("NINT row batch merge disagrees");
+    }
+    if (other.packed_.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        packed_.size() > std::numeric_limits<int>::max() - other.packed_.size() ||
+        rows() + other.rows() > std::numeric_limits<int>::max() / 6 ||
+        (rows() + other.rows()) * static_cast<std::uint64_t>(other.width_) >
+            std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("NINT merged row batch exceeds bounds");
+    }
+    const auto offset = static_cast<std::uint32_t>(packed_.size());
+    packed_.insert(packed_.end(), other.packed_.begin(), other.packed_.end());
+    for (std::size_t row = 0; row < other.rows(); ++row) {
+        const auto* descriptor = other.descriptors_.data() + row * 6;
+        descriptors_.insert(descriptors_.end(), {
+            descriptor[0] + offset, descriptor[1] + offset, descriptor[2] + offset,
+            descriptor[3], descriptor[4], descriptor[5]});
+    }
+    source_bytes_read_ += other.source_bytes_read_;
+    width_ = other.width_;
+}
+
 void NintRowBatch::validate() const {
     if (rows() == 0 || rows() > std::numeric_limits<int>::max() / 6 ||
         rows() * static_cast<std::uint64_t>(width_) > std::numeric_limits<std::uint32_t>::max()) {

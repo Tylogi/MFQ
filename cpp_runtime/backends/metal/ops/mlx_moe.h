@@ -72,6 +72,7 @@ public:
     std::size_t cache_limit_bytes() const noexcept;
     std::size_t resident_packed_bytes() const;
     std::size_t cached_expert_count() const;
+    std::size_t set_cache_limit(std::size_t bytes);
 
     // Atomically forget one parsed projection and all of its resident
     // experts.  Already returned routed weights retain their own Metal

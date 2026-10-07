@@ -182,11 +182,16 @@ test('三家架构标识贯穿模型页面，保持描线、无边框和靠右�
     await expect(page.locator(`.model-library-panel [data-model-vendor="${item.vendor}"]`)).toBeVisible();
   }
   const row = page.locator('.model-library-panel .model-row').first();
-  const nameBox = await row.locator('strong').boundingBox();
+  const nameBox = await row.getByText(models[0].name, { exact: true }).boundingBox();
   const markBox = await row.locator('.model-vendor-mark').boundingBox();
-  expect(markBox!.x).toBeGreaterThan(nameBox!.x + nameBox!.width);
+  if (testInfo.project.name === 'mobile') {
+    expect(markBox!.y).toBeGreaterThan(nameBox!.y + nameBox!.height);
+  } else {
+    expect(markBox!.x).toBeGreaterThan(nameBox!.x + nameBox!.width);
+  }
   const rowButton = await row.locator('button').first().boundingBox();
   expect(markBox!.x + markBox!.width).toBeLessThan(rowButton!.x);
+  expect(Math.abs(markBox!.y + markBox!.height / 2 - rowButton!.y - rowButton!.height / 2)).toBeLessThanOrEqual(1);
   await navigateClient(page, '/runtime');
   await expect(page.locator('.server-model-control')).toBeVisible();
   await expect(page.locator('.server-model-control .model-vendor-mark')).toHaveCount(0);
@@ -470,7 +475,7 @@ test('页面按需请求自己的资源，概览不预载其他业务列表', as
   page.on('pageerror', (error) => errors.push(error.message));
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible();
-  for (const path of ['sessions', 'datasets', 'evaluations', 'models', 'runtime/logs', 'runtime/profiles', 'mcp/servers']) {
+  for (const path of ['sessions', 'datasets', 'datasets/catalog', 'evaluations', 'evaluations/tools', 'models', 'runtime/logs', 'runtime/profiles', 'mcp/servers']) {
     expect(state.requests).not.toContain(`GET /api/v1/${path}`);
   }
   const routes = [

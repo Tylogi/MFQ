@@ -690,6 +690,15 @@ def main(argv: list[str] | None = None) -> int:
         import multiprocessing
 
         multiprocessing.freeze_support()
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments == ["_official-scoring-probe"]:
+        print(4)
+        return 0
+    if arguments == ["_official-scoring-worker"]:
+        from mfq.server.services.official_scoring_worker import main as score_main
+
+        score_main()
+        return 0
     parser = _build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "command", None):
