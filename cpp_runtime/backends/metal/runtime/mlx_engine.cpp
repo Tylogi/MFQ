@@ -1,4 +1,5 @@
 #include "mlx_engine.h"
+#include "tokenizer.h"
 
 namespace mfq::metal {
 using namespace mfq::engine;
@@ -42,7 +43,41 @@ ControlResult MlxEngine::control(ControlRequest request) {
         using T = std::decay_t<decltype(value)>;
         if constexpr (std::is_same_v<T, DecodeTokens>)
             return text_->decode_tokens(value.tokens, value.excluded);
-        else if constexpr (std::is_same_v<T, PrepareDuplex>) {
+        else if constexpr (std::is_same_v<T, ScoreText>) {
+            if (!info_.probability) throw std::invalid_argument("probability scoring is unavailable for this model");
+            if (!requests_.empty() || duplex_active_)
+                throw std::runtime_error("probability scoring requires a quiescent Metal engine");
+            if (value.prompt.empty() || value.prompt.size() > 262144 || value.continuations.empty() || value.continuations.size() > 64)
+                throw std::invalid_argument("score requires a bounded prompt and 1 to 64 continuations");
+            const auto& tokenizer = text_->tokenizer();
+            auto prompt = tokenizer.tokenize(value.prompt, false, false);
+            if (prompt.empty()) throw std::invalid_argument("score prompt tokenized to an empty sequence");
+            ScoreTokens prepared;
+            prepared.prompt_tokens = prompt.size();
+            prepared.next_token = value.next_token;
+            std::size_t total = 0;
+            for (const auto& continuation : value.continuations) {
+                if (continuation.empty() || continuation.size() > 65536)
+                    throw std::invalid_argument("score continuations must be nonempty and bounded");
+                auto sequence = value.next_token ? prompt : tokenizer.tokenize(value.prompt + continuation, false, false);
+                std::vector<std::int64_t> targets;
+                if (value.next_token) {
+                    targets = tokenizer.tokenize(continuation, false, false);
+                    if (targets.size() != 1) throw std::invalid_argument("next_token candidates must encode to exactly one token");
+                } else {
+                    if (sequence.size() <= prompt.size() || !std::equal(prompt.begin(), prompt.end(), sequence.begin()))
+                        throw std::invalid_argument("continuation changes the prompt token boundary; move the trailing whitespace into the continuation");
+                    targets.assign(sequence.begin() + prompt.size(), sequence.end());
+                }
+                if (sequence.size() > 8192 || sequence.size() > static_cast<std::size_t>(info_.max_context))
+                    throw std::invalid_argument("score exceeds the loaded context or 8192-token scoring limit");
+                total += sequence.size();
+                if (total > 131072) throw std::invalid_argument("score exceeds the aggregate token limit");
+                prepared.sequences.push_back(std::move(sequence));
+                prepared.targets.push_back(std::move(targets));
+            }
+            return model_->control(std::move(prepared));
+        } else if constexpr (std::is_same_v<T, PrepareDuplex>) {
             text_->prepare_duplex_session(value.prompt, value.parameters);
             return std::move(value.parameters);
         } else if constexpr (std::is_same_v<T, PrepareDuplexStep>) {

@@ -16,16 +16,18 @@ from mfq.formats.header import FileHeader
 from mfq.formats.nint import NintSpec, NintTensor
 
 
-def _models(tmp_path: Path, *, mtp=False, qsa=False, wide=False) -> tuple[Path, Path]:
+def _models(tmp_path: Path, *, mtp=False, qsa=False, wide=False, ple_layer=1) -> tuple[Path, Path]:
     rng = np.random.default_rng(20261001)
     hidden, streams, experts, intermediate = 128, 2, 2, 32
+    qsa = qsa or ple_layer == 3
     config = dict(
         model_type="qwen4_exp_text", vocab_size=32, hidden_size=hidden,
-        num_hidden_layers=2 if qsa else 1, max_position_embeddings=64,
+        num_hidden_layers=3 if ple_layer == 3 else (2 if qsa else 1), max_position_embeddings=64,
         num_attention_heads=24 if wide else 2, num_key_value_heads=2 if wide else 1,
         head_dim=256 if wide else 64,
         full_attention_interval=2,
-        layer_types=["linear_attention", "full_attention"] if qsa else ["linear_attention"],
+        layer_types=(["linear_attention", "full_attention", "linear_attention"] if ple_layer == 3
+            else (["linear_attention", "full_attention"] if qsa else ["linear_attention"])),
         hc_count=streams, hc_lowrank=4, partial_rotary_factor=0.5,
         linear_num_key_heads=1, linear_num_value_heads=2,
         linear_key_head_dim=128, linear_value_head_dim=128,
@@ -33,7 +35,7 @@ def _models(tmp_path: Path, *, mtp=False, qsa=False, wide=False) -> tuple[Path, 
         moe_intermediate_size=intermediate, shared_expert_intermediate_size=intermediate,
         indexer_n_heads=1, indexer_head_dim=128 if wide else 64, indexer_compress_ratio=2,
         indexer_budget=8 if wide else 32, indexer_kv_heads=1, ple_conv_kernel_size=4,
-        ple_embed_dim=hidden, ple_layer_ids=[1], ngram_size=3,
+        ple_embed_dim=hidden, ple_layer_ids=[ple_layer], ngram_size=3,
         ngram_vocab_size_base=8, heads_per_ngram=4, split_ngram_parts=2,
         hidden_act="silu", output_gate_type="silu", rms_norm_eps=1e-6,
         mtp_num_hidden_layers=int(mtp), eos_token_id=7,
@@ -96,6 +98,10 @@ def _models(tmp_path: Path, *, mtp=False, qsa=False, wide=False) -> tuple[Path, 
             if name.startswith(mlp + ".") or name.startswith(block + ".attention.mhc."):
                 tensors[name.replace(block, "model.block.1", 1)] = value.copy()
         attention("model.block.1.attention")
+    if ple_layer == 3:
+        for name, value in list(tensors.items()):
+            if name.startswith(block + "."):
+                tensors[name.replace(block, "model.block.2", 1)] = value.copy()
     if mtp:
         zero("predictor.embedding_norm.weight", (hidden,))
         zero("predictor.hidden_norm.weight", (streams * hidden,))
@@ -108,7 +114,7 @@ def _models(tmp_path: Path, *, mtp=False, qsa=False, wide=False) -> tuple[Path, 
         for name, value in list(tensors.items()):
             if name.startswith(mlp + ".") and ".mhc." not in name:
                 tensors[name.replace(mlp, "predictor.block.0.mlp", 1)] = value.copy()
-    ple = block + ".position_embedding"
+    ple = f"model.block.{ple_layer - 1}.position_embedding"
     weight(ple + ".key.weight", (streams * hidden, hidden))
     weight(ple + ".value.weight", (hidden, hidden))
     for suffix in ("key_norm", "query_norm", "conv_norm"):
@@ -152,11 +158,12 @@ def _models(tmp_path: Path, *, mtp=False, qsa=False, wide=False) -> tuple[Path, 
     return paths
 
 
-def test_native_qwen_ple_mixed_qk_matches_scaled_fp8_graph(tmp_path):
+@pytest.mark.parametrize("ple_layer", [1, 3])
+def test_native_qwen_ple_mixed_qk_matches_scaled_fp8_graph(tmp_path, ple_layer):
     executable = Path(__file__).resolve().parents[1] / "build/cpp_runtime/metal/mfq-metal-nint-rows-test"
     if not executable.is_file():
         pytest.skip("build mfq-metal-nint-rows-test to exercise the native model graph")
-    fp8, nint = _models(tmp_path)
+    fp8, nint = _models(tmp_path, ple_layer=ple_layer)
     result = subprocess.run([str(executable), "--qwen-ple", str(fp8), str(nint)],
                             capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -416,7 +423,7 @@ def test_native_qwen_packed_mhc_real_geometry(tmp_path, adaptive, group_sizes):
     result = subprocess.run([str(executable), "--packed-mhc", str(path)],
                             capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "2048-row prefill passed" in result.stdout
+    assert "4096-row prefill passed" in result.stdout
 
 
 @pytest.mark.parametrize("name", [

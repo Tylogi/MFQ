@@ -1,5 +1,6 @@
 #include "qwen4_ops.h"
 #include "mlx_transformer.h"
+#include "mlx_sparse_attention.h"
 
 #include <algorithm>
 #include <chrono>
@@ -103,6 +104,77 @@ void require_close(
     }
 }
 
+void test_qsa_prefill_output_gate() {
+    using namespace mlx::core;
+    for (auto dtype : {float16, bfloat16, float32}) {
+        for (int rows : {1, 32, 65}) {
+            for (int layout = 0; layout < 4; ++layout) {
+                constexpr int batch = 2, heads = 3, dimension = 7;
+                auto attended = astype(patterned_bfloat(batch * rows * heads * dimension,
+                    Shape{batch, heads, rows, dimension}, 37, 1.0f / 47.0f), dtype);
+                attended = transpose(attended, {0, 2, 1, 3});
+                auto packed = astype(patterned_bfloat(batch * rows * heads * 2 * dimension,
+                    Shape{batch, rows, heads, 2 * dimension}, 53, 1.0f / 7.0f), dtype);
+                auto gate = split(packed, 2, -1).at(1);
+                if (layout == 1) {
+                    gate = slice(packed, Shape{0, 0, 0, 0}, packed.shape(), Shape{1, 1, 1, 2});
+                } else if (layout == 2) {
+                    gate = broadcast_to(slice(gate, Shape{0, 0, 0, 0},
+                        Shape{1, 1, heads, dimension}), attended.shape());
+                } else if (layout == 3) {
+                    gate = contiguous(gate);
+                    attended = contiguous(attended);
+                    eval(gate, attended);
+                }
+                const Shape shape{batch, rows, heads * dimension};
+                auto expected = astype(reshape(astype(attended, float32), shape) *
+                    sigmoid(reshape(astype(gate, float32), shape)), dtype);
+                auto actual = mfq::metal::qwen4_qsa_prefill_output_gate(attended, gate);
+                if (dtype == float32)
+                    require_close(actual, expected, 1e-7f, "QSA FP32 prefill gate");
+                else
+                    require_bit_exact(actual, expected, "QSA strided prefill gate");
+            }
+        }
+    }
+    for (auto dtype : {float16, bfloat16}) {
+        constexpr int heads = 24, dimension = 256;
+        for (int rows : {4096, 8192}) {
+            auto attended = astype(patterned_bfloat(rows * heads * dimension,
+                Shape{1, rows, heads, dimension}, 37, 1.0f / 47.0f), dtype);
+            auto packed = astype(patterned_bfloat(rows * heads * 2 * dimension,
+                Shape{1, rows, heads, 2 * dimension}, 53, 1.0f / 7.0f), dtype);
+            auto gate = split(packed, 2, -1).at(1);
+            const Shape shape{1, rows, heads * dimension};
+            auto expected = astype(reshape(astype(attended, float32), shape) *
+                sigmoid(reshape(astype(gate, float32), shape)), dtype);
+            require_bit_exact(mfq::metal::qwen4_qsa_prefill_output_gate(attended, gate),
+                expected, "QSA production-width prefill gate");
+        }
+        const std::vector<float> gates{-INFINITY, -100.0f, -20.0f, -0.0f,
+            0.0f, 1e-7f, 20.0f, 100.0f, INFINITY};
+        auto gate = astype(array(gates.begin(), Shape{1, 1, 1, 9}), dtype);
+        auto attended = astype(array({-2.0f, -1.0f, 0.0f, 2.0f, -2.0f,
+            0.125f, 0.0f, 1.0f, -0.0f}, Shape{1, 1, 1, 9}), dtype);
+        auto expected = astype(reshape(astype(attended, float32) *
+            sigmoid(astype(gate, float32)), Shape{1, 1, 9}), dtype);
+        require_bit_exact(mfq::metal::qwen4_qsa_prefill_output_gate(attended, gate),
+            expected, "QSA saturated prefill gate");
+    }
+    auto valid = zeros(Shape{1, 32, 3, 7}, float16);
+    for (const auto& pair : std::vector<std::pair<array, array>>{
+        {valid, zeros(Shape{1, 31, 3, 7}, float16)},
+        {valid, astype(valid, bfloat16)},
+        {astype(valid, int32), astype(valid, int32)},
+        {reshape(valid, Shape{32, 21}), reshape(valid, Shape{32, 21})},
+        {zeros(Shape{1, 0, 3, 7}, float16), zeros(Shape{1, 0, 3, 7}, float16)}}) {
+        bool rejected = false;
+        try { mfq::metal::qwen4_qsa_prefill_output_gate(pair.first, pair.second); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) throw std::runtime_error("QSA prefill gate accepted invalid inputs");
+    }
+}
+
 void test_qsa_block_scores() {
     using namespace mlx::core;
     for (auto dtype : {float16, bfloat16, float32}) {
@@ -171,6 +243,51 @@ void test_qsa_dense_attention_causal_boundaries() {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+void test_qsa_canonical_prefill_prefix() {
+    using namespace mlx::core;
+    constexpr int heads = 24, kv_heads = 2, dimension = 256;
+    constexpr int rows = 65, budget = 64, block_size = 4, selected_count = 16;
+    for (auto dtype : {float16, bfloat16}) {
+        for (int batch : {1, 2}) {
+            for (int offset : {0, 17, 61}) {
+                const int keys = offset + rows;
+                const int dense_rows = budget - offset;
+                auto query = astype(patterned_bfloat(
+                    static_cast<std::size_t>(batch) * heads * rows * dimension,
+                    Shape{batch, heads, rows, dimension}, 37, 1.0f / 257.0f), dtype);
+                auto key = astype(patterned_bfloat(
+                    static_cast<std::size_t>(batch) * kv_heads * keys * dimension,
+                    Shape{batch, kv_heads, keys, dimension}, 43, 1.0f / 257.0f), dtype);
+                auto value = astype(patterned_bfloat(
+                    static_cast<std::size_t>(batch) * kv_heads * keys * dimension,
+                    Shape{batch, kv_heads, keys, dimension}, 53, 1.0f / 257.0f), dtype);
+                std::vector<std::int32_t> selected(batch * rows * selected_count);
+                for (int item = 0; item < batch; ++item) {
+                    for (int row = 0; row < rows; ++row) {
+                        const int begin = std::max(0,
+                            (offset + row + 1) / block_size - selected_count);
+                        for (int block = 0; block < selected_count; ++block)
+                            selected[(item * rows + row) * selected_count + block] = begin + block;
+                    }
+                }
+                array blocks(selected.begin(), Shape{batch, rows, selected_count});
+                auto expected = mfq::metal::mlx_sparse_block_gqa_attention(
+                    query, key, value, blocks, offset, block_size);
+                auto prefix = mfq::metal::qwen4_dense_gqa_attention(
+                    slice(query, Shape{0, 0, 0, 0}, Shape{batch, heads, dense_rows, dimension}),
+                    slice(key, Shape{0, 0, 0, 0}, Shape{batch, kv_heads, budget, dimension}),
+                    slice(value, Shape{0, 0, 0, 0}, Shape{batch, kv_heads, budget, dimension}),
+                    offset);
+                auto tail = mfq::metal::mlx_sparse_block_gqa_attention(
+                    slice(query, Shape{0, 0, dense_rows, 0}, query.shape()), key, value,
+                    slice(blocks, Shape{0, dense_rows, 0}, blocks.shape()), budget, block_size);
+                require_close(concatenate({prefix, tail}, 1), expected,
+                    dtype == float16 ? 1e-3f : 1e-2f, "QSA canonical prefill prefix");
             }
         }
     }
@@ -439,6 +556,37 @@ array reference_grouped_rms_norm(
         (array(1.0f) +
          mlx::core::astype(weight, mlx::core::float32));
     return mlx::core::astype(normalized, value.dtype());
+}
+
+void test_prefill_mixing_epilogue() {
+    using namespace mlx::core;
+    constexpr int batch = 2, tokens = 65, hidden = 137, low_rank = 19;
+    for (int streams : {3, 4}) {
+        const int width = hidden * streams;
+        for (auto input_dtype : {float16, bfloat16, float32}) {
+            for (auto weight_dtype : {float16, bfloat16, float32}) {
+                auto input = astype(patterned_bfloat(batch * tokens * width,
+                    Shape{batch, tokens, width}, 37, 1.0f / 257.0f), input_dtype);
+                auto norm = astype(patterned_bfloat(width, Shape{width}, 17, 1.0f / 1024.0f), float32);
+                auto down = astype(patterned_bfloat(low_rank * width,
+                    Shape{low_rank, width}, 29, 1.0f / 4096.0f), weight_dtype);
+                auto up = astype(patterned_bfloat(width * low_rank,
+                    Shape{width, low_rank}, 43, 1.0f / 4096.0f), weight_dtype);
+                auto normalized = mfq::metal::qwen4_grouped_rms_norm(input, norm, hidden);
+                auto low = matmul(astype(normalized, weight_dtype), transpose(down)) /
+                    array(float(streams), normalized.dtype());
+                low = low * sigmoid(low);
+                auto mixing = sigmoid(matmul(astype(low, weight_dtype), transpose(up)));
+                auto expected = mean(reshape(mixing, Shape{batch, tokens, streams, hidden}) *
+                    reshape(normalized, Shape{batch, tokens, streams, hidden}), -2);
+                auto actual = mfq::metal::qwen4_gated_residual_pre(input, norm, down, up,
+                    std::nullopt, hidden, streams);
+                require_close(actual.branch, expected,
+                    expected.dtype() == bfloat16 ? 1e-2f : expected.dtype() == float16 ? 1e-3f : 2e-5f,
+                    "prefill MHC mixing epilogue");
+            }
+        }
+    }
 }
 
 void test_decode_fast_path_matches_reference() {
@@ -778,7 +926,7 @@ void test_residual_post_preserves_rounding() {
         mlx::core::float16, mlx::core::bfloat16, mlx::core::float32};
     // Include non-aligned hidden sizes and batched prefill, not only decode.
     constexpr int hidden = 137, streams = 4;
-    for (const int tokens : {1, 3}) {
+    for (const int tokens : {1, 3, 30, 54}) {
         for (int combination = 0; combination < 27; ++combination) {
             auto branch = mlx::core::astype(patterned_bfloat(2 * tokens * hidden,
                 Shape{2, tokens, hidden}, 37, 1.0f / 53.0f), dtypes[combination / 9]);
@@ -913,6 +1061,20 @@ void test_packed_mhc(const char* path) {
             throw std::runtime_error("packed MHC did not dispatch its native two-stage primitive");
         require_close(actual.branch, expected.branch, 5e-3f, "packed MHC branch");
         require_close(*actual.injection, *expected.injection, 5e-3f, "packed MHC injection");
+        if (rows >= 64) {
+            auto expected_after = mfq::metal::qwen4_gated_residual_pre_after(
+                expected.branch, input, *expected.injection, norm,
+                dense_down, dense_up, dense_injection, hidden, streams);
+            auto actual_after = mfq::metal::qwen4_gated_residual_pre_after(
+                expected.branch, input, *expected.injection, norm,
+                down, up, injection, hidden, streams);
+            require_close(actual_after.residual, expected_after.residual, 0.0f,
+                          "prefill MHC residual");
+            require_close(actual_after.branch, expected_after.branch, 5e-3f,
+                          "prefill MHC chained branch");
+            require_close(*actual_after.injection, *expected_after.injection, 5e-3f,
+                          "prefill MHC chained injection");
+        }
         if (rows <= 6) {
             std::vector<array> branches, gates;
             for (int row = 0; row < rows; ++row) {
@@ -978,7 +1140,7 @@ void test_packed_mhc(const char* path) {
         }
     };
     for (auto dtype : {float16, bfloat16, float32}) {
-        for (int rows : {1, 2, 3, 4, 5, 6, 7, 64, 2048}) {
+        for (int rows : {1, 2, 3, 4, 5, 6, 7, 64, 2048, 4096}) {
             try { compare(dtype, rows); }
             catch (const std::exception& error) {
                 throw std::runtime_error("dtype=" + std::to_string(static_cast<int>(dtype.val())) + " rows=" +
@@ -986,7 +1148,7 @@ void test_packed_mhc(const char* path) {
             }
         }
     }
-    std::cout << "packed MHC decode, chained residual, final mixer and 2048-row prefill passed: "
+    std::cout << "packed MHC decode, chained residual, final mixer and 4096-row prefill passed: "
               << packed_bytes << " packed bytes / " << expanded_bytes << " expanded bytes\n";
 }
 
@@ -1075,9 +1237,17 @@ int main(int argc, char** argv) {
             benchmark_packed_mhc(argv[2]);
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--prefill-gate-only") {
+            test_qsa_prefill_output_gate();
+            std::cout << "QSA prefill output gate test passed\n";
+            return 0;
+        }
         test_decode_fast_path_matches_reference();
+        test_prefill_mixing_epilogue();
         test_qsa_block_scores();
+        test_qsa_prefill_output_gate();
         test_qsa_dense_attention_causal_boundaries();
+        test_qsa_canonical_prefill_prefix();
         for (auto dtype : {mlx::core::float16, mlx::core::bfloat16,
                            mlx::core::float32}) {
             for (int rows = 1; rows <= 6; ++rows) {

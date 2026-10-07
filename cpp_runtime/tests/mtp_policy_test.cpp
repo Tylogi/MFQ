@@ -15,6 +15,81 @@ int main() {
     using namespace mfq::engine::mtp;
     {
         DepthController controller(3);
+        const std::array<int, 6> sweep{3, 2, 1, 0, 0, 0};
+        for (int depth : sweep) {
+            require(controller.depth() == depth);
+            controller.observe(depth, depth, depth ? 20.0 + depth : 20.0);
+        }
+        require(!controller.warming_up());
+        require(std::fabs(controller.conditional_acceptance(0)-0.6885248) < 1e-12);
+        require(std::fabs(*controller.measured_cycle_ms(3)-23.0) < 1e-12);
+        require(std::fabs(*controller.measured_cycle_ms(0)-20.0) < 1e-12);
+        const double before = *controller.measured_cycle_ms(3);
+        controller.observe(3, 3, 100.0);
+        const double alpha = 0.25 * (1.0-std::exp(-100.0/400.0));
+        require(std::fabs(*controller.measured_cycle_ms(3)-((1-alpha)*before+alpha*100.0)) < 1e-12);
+        DepthController inherited(3, &controller);
+        inherited.observe(3, 0, 90.0);
+        require(*inherited.measured_cycle_ms(3) == 90.0);
+        DepthController fixed(1);
+        fixed.observe(1, 0, 100.0);
+        require(fixed.depth() == 1 && !fixed.warming_up() && !fixed.should_exit());
+        require(!fixed.measured_cycle_ms(0));
+        DepthController maintenance(3);
+        maintenance.observe(3, 0, 9999.0, false);
+        require(maintenance.depth() == 3 && maintenance.warming_up());
+        require(!maintenance.measured_cycle_ms(3));
+        rejects([&] { controller.conditional_acceptance(-1); });
+        rejects([&] { controller.measured_cycle_ms(4); });
+    }
+    {
+        PolicyState state;
+        GenerationPolicy<DsparkDepthController> policy(3, false, &state);
+        for (int cycle = 0; cycle < 64 && !policy.parked(); ++cycle) {
+            const int depth = policy.depth();
+            policy.observe(depth, 0, depth ? 100.0 : 20.0);
+        }
+        require(policy.parked() && policy.parks() == 1 && policy.depth() == 0);
+        for (int token = 0; token < 127; ++token) policy.observe_plain(19.0);
+        require(policy.parked() && policy.reentries() == 0);
+        policy.observe_plain(19.0);
+        require(!policy.parked() && policy.reentries() == 1 && policy.depth() == 3);
+        for (int cycle = 0; cycle < 64 && !policy.parked(); ++cycle) {
+            const int depth = policy.depth();
+            policy.observe(depth, 0, depth ? 100.0 : 20.0);
+        }
+        require(policy.parked() && policy.parks() == 2);
+        for (int token = 0; token < 255; ++token) policy.observe_plain(19.0);
+        require(policy.parked());
+        policy.observe_plain(19.0);
+        require(!policy.parked() && policy.reentries() == 2);
+        for (int cycle = 0; cycle < 500; ++cycle) {
+            if (policy.parked()) policy.observe_plain(20.0);
+            else policy.observe(policy.depth(), policy.depth(), policy.depth() ? 21.0 : 20.0);
+        }
+        require(!policy.parked() && policy.depth() > 0);
+        GenerationPolicy<DsparkDepthController> legacy(3, true, &state);
+        for (int cycle = 0; cycle < 100; ++cycle)
+            legacy.observe(legacy.depth(), 0, legacy.depth() ? 100.0 : 20.0);
+        require(!legacy.parked() && legacy.parks() == 0 && legacy.reentries() == 0);
+    }
+    {
+        PolicyState state;
+        DepthController controller(2);
+        while (controller.warming_up()) controller.observe(controller.depth(), 0, 30.0);
+        ParkState park;
+        {
+            mfq::engine::PrefillActivity activity;
+            require(mfq::engine::PrefillActivity::recent());
+            park.park(controller);
+            require(park.baseline_ms == 0.0);
+            park.tokens_remaining = 0;
+            require(!park.probe_ready());
+        }
+        require(mfq::engine::PrefillActivity::recent() && !park.probe_ready());
+    }
+    {
+        DsparkDepthController controller(3);
         require(controller.depth() == 3);
         controller.observe(3, 3, 30.0);
         controller.observe(3, 3, 29.0);
@@ -26,7 +101,7 @@ int main() {
         require(controller.conditional_acceptance(0) > 0.6);
     }
     {
-        DepthController controller(1);
+        DsparkDepthController controller(1);
         controller.observe(1, 0, 80.0);
         controller.observe(1, 0, 75.0);
         controller.observe(0, 0, 40.0);
@@ -36,7 +111,7 @@ int main() {
         require(controller.measured_cycle_ms(0).has_value());
     }
     {
-        DepthController controller(3);
+        DsparkDepthController controller(3);
         controller.observe(3, 0, 70.0);
         controller.observe(3, 0, 65.0);
         controller.observe(0, 0, 30.0);

@@ -102,6 +102,17 @@ file(TOUCH
     "${_MFQ_STEEL_STUB_DIR}/MetalPerformancePrimitives/MetalPerformancePrimitives.h")
 set(_MFQ_STEEL_ENTRY
     "${CMAKE_CURRENT_BINARY_DIR}/mfq_steel_mma_entry.h")
+set(MFQ_MLX_UTILS_SOURCE "#define MLX_METAL_JIT\n")
+foreach(_MFQ_UTILS_HEADER bf16.h bf16_math.h complex.h defines.h logging.h utils.h)
+    set(_MFQ_UTILS_PATH "${MFQ_MLX_ROOT}/include/mlx/backend/metal/kernels/${_MFQ_UTILS_HEADER}")
+    file(READ "${_MFQ_UTILS_PATH}" _MFQ_UTILS_CONTENT)
+    string(REGEX REPLACE "#[ \t]*include[ \t]+\"[^\"]*\"" "" _MFQ_UTILS_CONTENT "${_MFQ_UTILS_CONTENT}")
+    string(REPLACE "#pragma once" "" _MFQ_UTILS_CONTENT "${_MFQ_UTILS_CONTENT}")
+    string(APPEND MFQ_MLX_UTILS_SOURCE "\n${_MFQ_UTILS_CONTENT}\n")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_MFQ_UTILS_PATH}")
+endforeach()
+configure_file("${MFQ_METAL_ROOT}/kernels/mfq_mlx_utils_embedded.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/mfq_mlx_utils_embedded.h" @ONLY)
 file(WRITE "${_MFQ_STEEL_ENTRY}"
     "#include \"mlx/backend/metal/kernels/utils.h\"\n"
     "#include \"mlx/backend/metal/kernels/steel/gemm/gemm.h\"\n"
@@ -226,6 +237,8 @@ add_library(mfq-metal-runtime STATIC
     runtime/mlx_mtp.cpp
     runtime/mlx_multimodal.cpp
     runtime/mlx_sampling.cpp
+    runtime/mlx_kernel_prepare.cpp
+    runtime/mlx_inference_warmup.cpp
     runtime/mlx_ssd_expert_arena.cpp
     runtime/mlx_ssd_expert_cache.cpp
     runtime/mlx_tensor.cpp
@@ -423,6 +436,18 @@ set_target_properties(mfq-metal-nint-test PROPERTIES
     BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
 )
 add_test(NAME mfq-metal-nint-test COMMAND mfq-metal-nint-test)
+
+add_executable(mfq-metal-kernel-prepare-test tests/mlx_kernel_prepare_test.cpp)
+target_link_libraries(mfq-metal-kernel-prepare-test PRIVATE mfq-metal-runtime)
+target_compile_features(mfq-metal-kernel-prepare-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-kernel-prepare-test PROPERTIES BUILD_RPATH "${MFQ_MLX_ROOT}/lib")
+add_test(NAME mfq-metal-kernel-prepare-test COMMAND mfq-metal-kernel-prepare-test)
+
+add_executable(mfq-metal-inference-warmup-test tests/mlx_inference_warmup_test.cpp)
+target_link_libraries(mfq-metal-inference-warmup-test PRIVATE mfq-metal-runtime)
+target_compile_features(mfq-metal-inference-warmup-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-inference-warmup-test PROPERTIES BUILD_RPATH "${MFQ_MLX_ROOT}/lib")
+add_test(NAME mfq-metal-inference-warmup-test COMMAND mfq-metal-inference-warmup-test)
 
 add_executable(mfq-metal-nint-rows-test tests/mlx_nint_rows_test.cpp)
 target_link_libraries(mfq-metal-nint-rows-test PRIVATE mfq-metal-runtime)
@@ -935,6 +960,9 @@ add_test(
     NAME mfq-metal-moe-test
     COMMAND mfq-metal-moe-test
 )
+add_test(NAME mfq-metal-moe-compat-test COMMAND mfq-metal-moe-test --test-compat)
+add_test(NAME mfq-metal-moe-prepare-test COMMAND mfq-metal-moe-test --test-prepare)
+add_test(NAME mfq-metal-model-prepare-test COMMAND mfq-metal-moe-test --test-model-prepare)
 
 add_executable(mfq-metal-vq-test
     tests/mlx_vq_test.cpp
@@ -963,6 +991,16 @@ set_target_properties(mfq-metal-tensor-test PROPERTIES
     BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
 )
 add_test(NAME mfq-metal-tensor-test COMMAND mfq-metal-tensor-test)
+
+add_executable(mfq-metal-dynamic-geometry-test
+    tests/mlx_dynamic_geometry_test.cpp
+)
+target_link_libraries(mfq-metal-dynamic-geometry-test PRIVATE mfq-metal-runtime)
+target_compile_features(mfq-metal-dynamic-geometry-test PRIVATE cxx_std_20)
+set_target_properties(mfq-metal-dynamic-geometry-test PROPERTIES
+    BUILD_RPATH "${MFQ_MLX_ROOT}/lib"
+)
+add_test(NAME mfq-metal-dynamic-geometry-test COMMAND mfq-metal-dynamic-geometry-test)
 
 add_executable(mfq-metal-transformer-test
     tests/mlx_transformer_test.cpp

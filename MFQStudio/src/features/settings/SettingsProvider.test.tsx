@@ -1,7 +1,7 @@
 /** 验证共享设置更新的合并、持久化和跨页面上下文容量行为。 */
 import { fireEvent, render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
-import { DEFAULT_SETTINGS, SETTINGS_KEY } from './configuration';
+import { describe, expect, it, vi } from 'vitest';
+import { DEFAULT_SETTINGS, SETTINGS_KEY, loadSettings } from './configuration';
 import { SettingsProvider, useSettings } from './SettingsProvider';
 
 /** 暴露两个独立消费者，用于检查跨页面共享状态与修改范围。 */
@@ -19,6 +19,20 @@ function SettingsConsumer() {
 }
 
 describe('SettingsProvider', () => {
+  it.each([null, [], 'invalid', { temperature: 'bad', topP: null, maxTokens: -1, topK: 1.5,
+    theme: 'unknown', language: 'unknown', seed: -1 }])('ignores malformed stored settings: %j', (value) => {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(value));
+    expect(loadSettings()).toEqual(DEFAULT_SETTINGS);
+  });
+  it('keeps settings and the theme usable when storage is full or blocked', () => {
+    const write = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new DOMException('quota', 'QuotaExceededError'); });
+    try {
+      render(<SettingsProvider><SettingsConsumer /></SettingsProvider>);
+      fireEvent.click(screen.getByText('appearance'));
+      expect(screen.getByLabelText('translation')).toHaveTextContent('Settings');
+      expect(document.documentElement.dataset.theme).toBe('dark');
+    } finally { write.mockRestore(); }
+  });
   it('preserves inference fields when appearance changes and persists the applied settings', () => {
     localStorage.setItem(
       SETTINGS_KEY,

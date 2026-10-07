@@ -1,7 +1,9 @@
 #include "mlx_tensor.h"
+#include "mlx_kernel_prepare.h"
 #include "mlx_moe_ops.h"
 #include "mlx_reference.h"
 #include "mlx_transformer.h"
+#include "mlx_weight_residency.h"
 
 #include <mlx/allocator.h>
 
@@ -500,6 +502,7 @@ array load_dense_array(
         result.data<std::uint8_t>(),
         cursor.data(),
         cursor.remaining());
+    MlxWeightResidency::track(result);
     return result;
 }
 
@@ -509,6 +512,19 @@ MlxLinear MlxLinear::load(
     const auto finish = [](MlxLinear result) {
         if (mlx_predequantize_fp16_enabled()) {
             result.materialize_fp16();
+        }
+        if (auto* preparation = MlxKernelPreparation::current(); preparation && result.packed()) {
+            preparation->collect([&] {
+                for (const auto rows : preparation->row_buckets()) {
+                    for (const auto dtype : {mlx::core::float16, mlx::core::float32}) {
+                        const auto input = mlx::core::zeros(Shape{rows, result.input_size()}, dtype);
+                        preparation->add(result(input));
+                        if (rows == 1) {
+                            if (auto greedy = result.greedy_argmax(input)) preparation->add(*greedy);
+                        }
+                    }
+                }
+            });
         }
         return result;
     };
@@ -1030,7 +1046,22 @@ struct MlxProjectionBatch::Impl {
 
 MlxProjectionBatch::MlxProjectionBatch(
     std::vector<const MlxLinear*> linears)
-    : impl_(std::make_shared<Impl>(std::move(linears))) {}
+    : impl_(std::make_shared<Impl>(std::move(linears))) {
+    if (auto* preparation = MlxKernelPreparation::current()) {
+        preparation->collect([&] {
+            for (const auto rows : preparation->row_buckets()) {
+                for (const auto dtype : {mlx::core::float16, mlx::core::float32}) {
+                    const auto input = mlx::core::zeros(
+                        Shape{rows, impl_->linears.front().input_size()}, dtype);
+                    for (const auto& output : (*this)(input)) preparation->add(output);
+                    if (impl_->linears.size() == 2 &&
+                        impl_->linears[0].output_size() == impl_->linears[1].output_size())
+                        preparation->add(swiglu(input));
+                }
+            }
+        });
+    }
+}
 
 std::vector<array> MlxProjectionBatch::operator()(
     const array& input) const {
@@ -1147,6 +1178,15 @@ MlxEmbedding MlxEmbedding::load(
     const auto finish = [](MlxEmbedding result) {
         if (mlx_predequantize_fp16_enabled()) {
             result.materialize_fp16();
+        }
+        if (auto* preparation = MlxKernelPreparation::current()) {
+            preparation->collect([&] {
+                for (const auto rows : preparation->row_buckets()) {
+                    preparation->add(result(mlx::core::zeros(Shape{rows}, mlx::core::int32)));
+                    const std::vector<std::int32_t> ids(rows, 0);
+                    preparation->add(result(array(ids.begin(), Shape{rows})));
+                }
+            });
         }
         return result;
     };

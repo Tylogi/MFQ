@@ -4,9 +4,11 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import { useRuntime } from '../src/app/RuntimeProvider';
 import { ModelContextSettings } from '../src/features/runtime/ModelContextSettings';
 import { MemorySettingsPanel } from '../src/features/connections/MemorySettingsPanel';
+import { toast } from '../src/stores/toastStore';
 import type { RuntimeInstance, RuntimeStatus } from '../src/shared/api/types';
 
 vi.mock('../src/app/RuntimeProvider', () => ({ useRuntime: vi.fn() }));
+vi.mock('../src/stores/toastStore', () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock('../src/features/settings/SettingsProvider', () => ({ useSettings: () => ({
   contextSize: 32768, setContextSize: vi.fn(), tr: (_zh: string, en: string) => en,
 }) }));
@@ -76,4 +78,19 @@ it('模型总驻留汇总两个实例，不随当前模型变成单个模型大�
   const row = screen.getByText(/Current weight residency/).closest('.memory-budget-actions')!;
   expect(row).toHaveTextContent('96.3');
   expect(row).not.toHaveTextContent('17.7');
+});
+
+it.each(['success', 'failure'])('does not show a stale context reload %s after leaving settings', async (result) => {
+  let resolve!: (value: RuntimeStatus) => void;
+  let reject!: (cause: Error) => void;
+  reloadModelContext.mockReturnValueOnce(new Promise((done, fail) => { resolve = done; reject = fail; }));
+  const view = render(<ModelContextSettings />);
+  fireEvent.click(screen.getByRole('button', { name: 'Reload Qwen3.8-Flash-S4-L' }));
+  view.unmount();
+  await act(async () => {
+    if (result === 'success') resolve({ max_context: 8192 });
+    else reject(new Error('Old server failed'));
+  });
+  expect(toast.success).not.toHaveBeenCalled();
+  expect(toast.error).not.toHaveBeenCalled();
 });

@@ -326,7 +326,7 @@ const Kernel& visible_prefill_plan_kernel() {
 const Kernel& decode_plan_kernel() {
     static const auto kernel = make_kernel(
         "mfq_cpp_dsa_decode_plan",
-        {"topk", "seq_len"},
+        {"topk", "seq_len", "plan_params"},
         {"indices", "mask"},
         kDecodePlanSource);
     return kernel;
@@ -1064,10 +1064,6 @@ array mlx_dsa_indexer_scores(
         {grid, 1, 1},
         {256, 1, 1},
         {
-            {"B", batch},
-            {"M", queries},
-            {"K", keys},
-            {"KEY_TILES", key_tiles},
             {"INDEX_HEADS", heads},
         },
         std::nullopt,
@@ -1184,10 +1180,6 @@ std::pair<array, array> mlx_dsa_build_prefill_plan(
         {total, 1, 1},
         {std::min(256, total), 1, 1},
         {
-            {"TOTAL", total},
-            {"M", queries},
-            {"TOPK_COUNT", topk_count},
-            {"SELECTED", selected},
         },
         std::nullopt,
         false,
@@ -1253,10 +1245,6 @@ std::pair<array, array> mlx_dsa_build_prefill_plan_visible(
         {total, 1, 1},
         {std::min(256, total), 1, 1},
         {
-            {"TOTAL", total},
-            {"M", queries},
-            {"TOPK_COUNT", topk_count},
-            {"SELECTED", selected},
         },
         std::nullopt,
         false,
@@ -1300,10 +1288,12 @@ std::pair<array, array> mlx_dsa_build_decode_plan(
     const int total = checked_product(
         {batch, selected},
         "decode plan size");
+    const array plan_params({pool_len}, mlx::core::int32);
     auto outputs = decode_plan_kernel()(
         {
             selected_topk,
             lengths,
+            plan_params,
         },
         {
             Shape{batch, 1, selected},
@@ -1316,10 +1306,6 @@ std::pair<array, array> mlx_dsa_build_decode_plan(
         {total, 1, 1},
         {std::min(256, total), 1, 1},
         {
-            {"TOTAL", total},
-            {"TOPK_COUNT", topk_count},
-            {"SELECTED", selected},
-            {"POOL_LEN", pool_len},
             {"RATIO", ratio},
             {"WINDOW", window},
         },

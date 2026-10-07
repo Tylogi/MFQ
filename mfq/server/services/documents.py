@@ -9,6 +9,7 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 MAX_EXTRACTED_CHARACTERS = 2_000_000
+MAX_EXTRACTION_BYTES = 32 * 1024 * 1024
 
 
 class DocumentExtractionError(ValueError):
@@ -83,7 +84,10 @@ def _bounded(text: str) -> str:
 
 
 def _extract_text(path: Path) -> ExtractedDocument:
-    data = path.read_bytes()
+    with path.open("rb") as file:
+        data = file.read(MAX_EXTRACTION_BYTES + 1)
+    if len(data) > MAX_EXTRACTION_BYTES:
+        raise DocumentExtractionError("text document exceeds the extraction size limit")
     if data.startswith((b"\xff\xfe", b"\xfe\xff")):
         text = data.decode("utf-16")
     else:
@@ -97,8 +101,13 @@ def _extract_text(path: Path) -> ExtractedDocument:
 def _extract_docx(path: Path) -> ExtractedDocument:
     try:
         with zipfile.ZipFile(path) as archive:
-            document = archive.read("word/document.xml")
-    except (KeyError, OSError, zipfile.BadZipFile) as error:
+            if archive.getinfo("word/document.xml").file_size > MAX_EXTRACTION_BYTES:
+                raise DocumentExtractionError("DOCX XML exceeds the extraction size limit")
+            with archive.open("word/document.xml") as file:
+                document = file.read(MAX_EXTRACTION_BYTES + 1)
+            if len(document) > MAX_EXTRACTION_BYTES:
+                raise DocumentExtractionError("DOCX XML exceeds the extraction size limit")
+    except (KeyError, OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile) as error:
         raise DocumentExtractionError("invalid DOCX document") from error
     try:
         root = ElementTree.fromstring(document)
@@ -130,7 +139,18 @@ def _extract_pdf(path: Path) -> ExtractedDocument:
         ) from error
     try:
         reader = PdfReader(path)
-        pages = [page.extract_text() or "" for page in reader.pages]
+        pages = []
+        characters = 0
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            characters += len(text) + (2 if pages else 0)
+            if characters > MAX_EXTRACTED_CHARACTERS:
+                raise DocumentExtractionError(
+                    f"extracted text exceeds {MAX_EXTRACTED_CHARACTERS} characters"
+                )
+            pages.append(text)
+    except DocumentExtractionError:
+        raise
     except Exception as error:
         raise DocumentExtractionError("invalid or unsupported PDF document") from error
     text = re.sub(r"[ \t]+\n", "\n", "\n\n".join(pages))

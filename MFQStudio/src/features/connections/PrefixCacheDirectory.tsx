@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { runtimeApi } from '../../shared/api/resources/runtime';
 import { jobsApi } from '../../shared/api/resources/jobs';
 import { useRuntime } from '../../app/RuntimeProvider';
+import { useConnectionScope } from '../../app/useConnectionScope';
 import { SettingRow } from '../../app/display';
 import { useSettings } from '../settings/SettingsProvider';
 import { useJobStore } from '../../stores/jobStore';
@@ -11,6 +12,7 @@ import { toast } from '../../stores/toastStore';
 export function PrefixCacheDirectory() {
   const { tr } = useSettings();
   const { addJob } = useRuntime();
+  const connectionScope = useConnectionScope();
   const [manual, setManual] = useState(false);
   const [draft, setDraft] = useState('');
   const [actual, setActual] = useState('');
@@ -30,13 +32,17 @@ export function PrefixCacheDirectory() {
     return () => { disposed = true; };
   }, [pending]);
   async function apply() {
+    const current = connectionScope();
     setSaving(true);
     try {
       const accepted = await runtimeApi.configureMemoryPolicy({ prefix_directory: manual ? draft.trim() : null });
-      addJob(await jobsApi.getJob(accepted.operation_id));
+      if (!current()) return;
+      const job = await jobsApi.getJob(accepted.operation_id);
+      if (!current()) return;
+      addJob(job);
       toast.success(tr('缓存目录已提交，将重新加载当前模型', 'Cache directory submitted; loaded models will be reloaded'));
-    } catch (cause) { toast.error(errorMessage(cause)); }
-    finally { setSaving(false); }
+    } catch (cause) { if (current()) toast.error(errorMessage(cause)); }
+    finally { if (current()) setSaving(false); }
   }
   return <SettingRow title={tr('目录', 'Directory')} detail={actual || '--'}
     trailing={<div className="server-row-actions prefix-directory-controls">

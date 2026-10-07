@@ -35,39 +35,40 @@ mlx::core::array patterned_half(
         mlx::core::float16);
 }
 
-void test_block_gqa_matches_expanded_reference(float query_scale, float key_scale) {
+void test_block_gqa_matches_expanded_reference(
+    float query_scale, float key_scale, int batch = 1, int queries = 3,
+    int keys = 20, mlx::core::Dtype dtype = mlx::core::float16) {
     using namespace mlx::core;
-    constexpr int batch = 1;
     constexpr int heads = 24;
     constexpr int kv_heads = 2;
-    constexpr int queries = 3;
-    constexpr int keys = 20;
     constexpr int dimension = 256;
-    constexpr int query_offset = keys - queries;
+    const int query_offset = keys - queries;
     constexpr int block_size = 4;
     constexpr int selected_count = 3;
 
-    auto query = patterned_half(
+    auto query = astype(patterned_half(
         batch * heads * queries * dimension,
         Shape{batch, heads, queries, dimension},
         37,
-        query_scale);
-    auto key = patterned_half(
+        query_scale), dtype);
+    auto key = astype(patterned_half(
         batch * kv_heads * keys * dimension,
         Shape{batch, kv_heads, keys, dimension},
         53,
-        key_scale);
-    auto value = patterned_half(
+        key_scale), dtype);
+    auto value = astype(patterned_half(
         batch * kv_heads * keys * dimension,
         Shape{batch, kv_heads, keys, dimension},
         71,
-        1.0f / 463.0f);
+        1.0f / 463.0f), dtype);
 
-    const std::vector<std::int32_t> block_values{
-        0, 2, 3,
-        0, 2, 3,
-        0, 2, 3,
-    };
+    std::vector<std::int32_t> block_values(batch * queries * selected_count);
+    for (int row = 0; row < batch * queries; ++row) {
+        block_values[row * 3] = 0;
+        block_values[row * 3 + 1] = queries >= 32 && row % 3 == 0 ? 0 : 2;
+        block_values[row * 3 + 2] = queries < 32 ? 3 :
+            (row % 3 == 0 ? -1 : (row % 3 == 1 ? keys : (keys - 1) / 4));
+    }
     const array blocks(
         block_values.begin(),
         Shape{batch, queries, selected_count},
@@ -77,15 +78,17 @@ void test_block_gqa_matches_expanded_reference(float query_scale, float key_scal
     std::vector<std::int32_t> indices(
         batch * queries * expanded,
         -1);
-    for (int token = 0; token < queries; ++token) {
-        const int absolute = query_offset + token;
+    for (int token = 0; token < batch * queries; ++token) {
+        const int absolute = query_offset + token % queries;
         const int complete = (absolute + 1) / block_size;
         const int valid_blocks = std::min(selected_count, complete);
         int output = token * expanded;
         for (int selected = 0; selected < valid_blocks; ++selected) {
             const int block = block_values[token * selected_count + selected];
             for (int offset = 0; offset < block_size; ++offset) {
-                indices[output++] = block * block_size + offset;
+                const int position = block * block_size + offset;
+                indices[output++] = block >= 0 && position < keys && position <= absolute
+                    ? position : -1;
             }
         }
         output = token * expanded + selected_count * block_size;
@@ -125,7 +128,9 @@ void test_block_gqa_matches_expanded_reference(float query_scale, float key_scal
     const auto* q = query32.data<float>();
     const auto* k = key32.data<float>();
     const auto* v = value32.data<float>();
-    for (int token = 0; token < queries; ++token) {
+    for (int token = 0; token < batch * queries; ++token) {
+        const int batch_index = token / queries;
+        const int query_index = token % queries;
         for (int head = 0; head < heads; ++head) {
             const int kv_head = head / (heads / kv_heads);
             std::vector<float> scores(expanded, -INFINITY);
@@ -135,8 +140,8 @@ void test_block_gqa_matches_expanded_reference(float query_scale, float key_scal
                 if (row < 0 || row >= keys) continue;
                 float dot = 0.0f;
                 for (int d = 0; d < dimension; ++d) {
-                    dot += q[(head * queries + token) * dimension + d]
-                        * k[(kv_head * keys + row) * dimension + d];
+                    dot += q[((batch_index * heads + head) * queries + query_index) * dimension + d]
+                        * k[((batch_index * kv_heads + kv_head) * keys + row) * dimension + d];
                 }
                 scores[selected] = dot / std::sqrt(float(dimension));
                 maximum_score = std::max(maximum_score, scores[selected]);
@@ -154,7 +159,7 @@ void test_block_gqa_matches_expanded_reference(float query_scale, float key_scal
                 for (int d = 0; d < dimension; ++d) {
                     expected[(token * heads + head) * dimension + d] +=
                         probability
-                        * v[(kv_head * keys + row) * dimension + d];
+                        * v[((batch_index * kv_heads + kv_head) * keys + row) * dimension + d];
                 }
             }
         }
@@ -164,6 +169,9 @@ void test_block_gqa_matches_expanded_reference(float query_scale, float key_scal
     float normalization_maximum = 0.0f;
     double squared = 0.0;
     for (std::size_t index = 0; index < actual.size(); ++index) {
+        if (!std::isfinite(actual.data<float>()[index])) {
+            throw std::runtime_error("selected-block sparse GQA produced nonfinite output");
+        }
         const float error = std::fabs(
             actual.data<float>()[index] - expected[index]);
         maximum = std::max(maximum, error);
@@ -177,7 +185,7 @@ void test_block_gqa_matches_expanded_reference(float query_scale, float key_scal
     const float rms = static_cast<float>(
         std::sqrt(squared / static_cast<double>(actual.size())));
     if (maximum > 8e-3f || rms > 1e-3f ||
-        normalization_maximum != 0.0f) {
+        (dtype == float16 && normalization_maximum != 0.0f)) {
         throw std::runtime_error(
             "selected-block sparse GQA mismatch: max="
             + std::to_string(maximum)
@@ -389,7 +397,7 @@ void test_indexer_topk(int width, int rows, int heads, int batch, int offset, bo
 
 void test_indexer_topk_rejects_invalid_geometry() {
     using namespace mlx::core;
-    for (const Shape& shape : {Shape{1, 7, 4, 750}, Shape{1, 1, 4, 511},
+    for (const Shape& shape : {Shape{1, 0, 4, 750}, Shape{1, 1, 4, 511},
             Shape{1, 1, 4, 32769}, Shape{1, 4, 750}}) {
         bool rejected = false;
         try {
@@ -408,11 +416,126 @@ void test_indexer_topk_rejects_invalid_geometry() {
     }
 }
 
+void test_qsa_prefill(int tokens, int keys, mlx::core::Dtype dtype, bool tied, int view = 0) {
+    using namespace mlx::core;
+    const int offset = keys - tokens;
+    auto query = astype(patterned_half(24ULL * tokens * 256,
+        Shape{1, 24, tokens, 256}, 37, 1.0f / 511.0f), dtype);
+    if (view == 1) {
+        query = concatenate({zeros(Shape{1, 24, 1, 256}, dtype), query}, 2);
+        query = slice(query, Shape{0, 0, 1, 0}, Shape{1, 24, tokens + 1, 256});
+    }
+    if (view == 2) {
+        query = reshape(stack({query, zeros(query.shape(), dtype)}, -1),
+            Shape{1, 24, tokens, 512});
+        query = slice(query, Shape{0, 0, 0, 0},
+            Shape{1, 24, tokens, 512}, Shape{1, 1, 1, 2});
+    }
+    auto key = astype(patterned_half(2ULL * keys * 256,
+        Shape{1, 2, keys, 256}, 53, 1.0f / 487.0f), dtype);
+    auto value = astype(patterned_half(2ULL * keys * 256,
+        Shape{1, 2, keys, 256}, 71, 1.0f / 463.0f), dtype);
+    auto index = tied ? zeros(Shape{1, tokens, 4, 128}, dtype)
+        : astype(patterned_half(4ULL * tokens * 128,
+            Shape{1, tokens, 4, 128}, 31, 1.0f / 512.0f), dtype);
+    auto pooled = astype(patterned_half((keys / 4ULL) * 128,
+        Shape{1, keys / 4, 128}, 29, 1.0f / 512.0f), dtype);
+    auto actual = mfq::metal::mlx_qsa_prefill_attention(
+        query, key, value, index, astype(pooled, float32), offset);
+    if (view != 0) {
+        auto copied = mfq::metal::mlx_qsa_prefill_attention(
+            contiguous(query), key, value, index, astype(pooled, float32), offset);
+        auto matches = all(equal(actual, copied));
+        auto difference = max(abs(astype(actual, float32) - astype(copied, float32)));
+        eval(matches, difference);
+        if (!matches.item<bool>()) throw std::runtime_error("QSA prefill view/copy differs: view=" +
+            std::to_string(view) + " max=" + std::to_string(difference.item<float>()));
+    }
+    int dense_rows = std::min(tokens, std::max(0, 2051 - offset));
+    if (tokens - dense_rows == 1) --dense_rows;
+    std::vector<array> parts;
+    if (dense_rows > 0) {
+        const int end = offset + dense_rows;
+        parts.push_back(transpose(fast::scaled_dot_product_attention(
+            slice(query, Shape{0, 0, 0, 0}, Shape{1, 24, dense_rows, 256}),
+            slice(key, Shape{0, 0, 0, 0}, Shape{1, 2, end, 256}),
+            slice(value, Shape{0, 0, 0, 0}, Shape{1, 2, end, 256}),
+            1.0f / std::sqrt(256.0f), "causal"), {0, 2, 1, 3}));
+    }
+    if (dense_rows < tokens) {
+        const int rows = tokens - dense_rows;
+        auto iq = slice(index, Shape{0, dense_rows, 0, 0}, index.shape());
+        auto scores = reshape(matmul(reshape(astype(iq, float32),
+            Shape{1, rows * 4, 128}), transpose(astype(pooled, float32), {0, 2, 1})),
+            Shape{1, rows, 4, keys / 4});
+        auto blocks = mfq::metal::mlx_sparse_indexer_topk512(scores, offset + dense_rows, 4);
+        parts.push_back(mfq::metal::mlx_sparse_block_gqa_attention(
+            slice(query, Shape{0, 0, dense_rows, 0}, Shape{1, 24, tokens, 256}),
+            key, value, blocks, offset + dense_rows, 4));
+    }
+    auto reference = parts.size() == 1 ? parts.front() : concatenate(parts, 1);
+    auto error = abs(astype(actual, float32) - astype(reference, float32));
+    auto maximum = max(error);
+    auto rms = sqrt(mean(square(error)));
+    auto finite = all(isfinite(actual));
+    eval(maximum, rms, finite);
+    const float tolerance = dtype == bfloat16 ? 0.002f : 0.00025f;
+    if (actual.shape() != Shape{1, tokens, 24, 256} ||
+        !finite.item<bool>() || maximum.item<float>() > tolerance ||
+        rms.item<float>() > tolerance / 8.0f) {
+        throw std::runtime_error("QSA prefill disagrees with unfused reference: " +
+            std::to_string(tokens) + "/" + std::to_string(keys) +
+            " view=" + std::to_string(view) +
+            " max=" + std::to_string(maximum.item<float>()) +
+            " rms=" + std::to_string(rms.item<float>()));
+    }
+}
+
+void test_qsa_prefill_rejects_invalid_geometry() {
+    using namespace mlx::core;
+    auto query = zeros(Shape{1, 24, 32, 256}, float16);
+    auto key = zeros(Shape{1, 2, 2083, 256}, float16);
+    auto index = zeros(Shape{1, 32, 4, 128}, float16);
+    auto pooled = zeros(Shape{1, 520, 128}, float32);
+    for (int offset : {-1, 2050, std::numeric_limits<int>::max()}) {
+        bool rejected = false;
+        try {
+            mfq::metal::mlx_qsa_prefill_attention(query, key, key, index, pooled, offset);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) throw std::runtime_error("QSA prefill accepted an invalid cache position");
+    }
+    for (const Shape& shape : {Shape{1, 32, 3, 128}, Shape{1, 32, 4, 127}}) {
+        bool rejected = false;
+        try {
+            mfq::metal::mlx_qsa_prefill_attention(
+                query, key, key, zeros(shape, float16), pooled, 2051);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) throw std::runtime_error("QSA prefill accepted invalid index geometry");
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         mlx::core::set_default_device(mlx::core::Device::gpu);
+        for (const auto dtype : {mlx::core::float16, mlx::core::bfloat16}) {
+            test_qsa_prefill(64, 64, dtype, false);
+            test_qsa_prefill(64, 2051, dtype, false);
+            test_qsa_prefill(64, 2052, dtype, false);
+            test_qsa_prefill(64, 2059, dtype, false);
+            test_qsa_prefill(64, 2082, dtype, false);
+            test_qsa_prefill(65, 3073, dtype, false);
+            test_qsa_prefill(65, 3073, dtype, true);
+            test_qsa_prefill(65, 3073, dtype, false, 1);
+            test_qsa_prefill(65, 3073, dtype, false, 2);
+            test_qsa_prefill(4096, 4096, dtype, false);
+            test_qsa_prefill(8192, 8192, dtype, false);
+        }
+        test_qsa_prefill(2049, 32769, mlx::core::float16, false);
+        test_qsa_prefill(1025, 65537, mlx::core::float16, false);
+        test_qsa_prefill_rejects_invalid_geometry();
+        if (argc == 2 && std::string(argv[1]) == "--prefill-only") return 0;
         for (int rows = 1; rows <= 6; ++rows) {
             for (int width : {513, 750, 2048, 8192, 16384, 32768}) {
                 test_indexer_topk(width, rows, 4, 1, width * 4 - rows, false);
@@ -421,10 +544,19 @@ int main(int argc, char** argv) {
             test_indexer_topk(750, rows, 16, 1, 2998, true);
             test_indexer_topk(513, rows, 4, 1, 511 * 4 - 1, false);
         }
+        test_indexer_topk(1024, 2048, 4, 1, 2048, false);
+        test_indexer_topk(2051, 65, 7, 2, 8192 - 65, false);
+        test_indexer_topk(750, 33, 4, 1, 2998, true);
         test_indexer_topk_rejects_invalid_geometry();
         test_block_gqa_matches_expanded_reference(1.0f / 511.0f, 1.0f / 487.0f);
         test_block_gqa_matches_expanded_reference(1.0f / 64.0f, 1.0f / 64.0f);
         test_block_gqa_matches_expanded_reference(1.0f / 128.0f, 1.0f / 256.0f);
+        for (const auto dtype : {mlx::core::float16, mlx::core::bfloat16}) {
+            test_block_gqa_matches_expanded_reference(1.0f / 64.0f, 1.0f / 64.0f,
+                1, 32, 33, dtype);
+            test_block_gqa_matches_expanded_reference(1.0f / 511.0f, 1.0f / 487.0f,
+                2, 65, 67, dtype);
+        }
         for (int block_size : {2, 4, 8}) {
             test_block_gqa_decode(block_size);
             test_block_gqa_small_m(block_size, 1);

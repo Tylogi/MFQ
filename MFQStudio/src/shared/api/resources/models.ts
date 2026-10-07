@@ -26,6 +26,16 @@ export const modelsApi = {
     return request(`/api/v1/models/directories${suffix}`);
   },
 
+  modelArtifactDirectory(modelId: string): Promise<ModelDirectoryList> {
+    return request(`/api/v1/models/${encodeURIComponent(modelId)}/directory`);
+  },
+
+  openModelDirectoryInFinder(directoryId: string): Promise<{ opened: boolean }> {
+    return request('/api/v1/models/directories/open', {
+      method: 'POST', body: JSON.stringify({ directory_id: directoryId }),
+    });
+  },
+
   /** 注册目录内的模型资产，返回新增或更新的模型记录。 */
   async registerModelDirectory(directoryId: string): Promise<ModelArtifact[]> {
     return (

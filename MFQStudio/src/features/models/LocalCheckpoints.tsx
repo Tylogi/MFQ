@@ -1,14 +1,17 @@
 import { useSettings } from '../settings/SettingsProvider';
 import { Icon, SectionLabel, TMPanel, EmptyPanel } from '../../app/display';
-import { formatNumber } from '../../app/formatters';
 import type { useModelCatalog } from './useModelCatalog';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
 import { ModelLoadProgress } from './ModelLoadProgress';
+import { formatNumber } from '../../app/formatters';
+import { ModelMemoryPressure } from './ModelMemoryPressure';
 
 export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
   const { tr } = useSettings();
   const { runtime, artifacts, busy, instances, modelFilter,
-    filteredArtifacts, unloadInstance, loadArtifact, chooseModelDirectory } = catalog;
+    filteredArtifacts, unloadInstance, loadArtifact, chooseModelDirectory, openModelFiles } = catalog;
+  const available = runtime?.runtime_memory_headroom_bytes;
+  const gib = (bytes?: number | null) => bytes == null ? '—' : `${formatNumber(bytes / 2 ** 30, 1)} GiB`;
   return (
     <>
       <SectionLabel
@@ -23,23 +26,26 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                 (candidate) => candidate.model === item.name && candidate.state !== 'failed',
               );
               const loaded = Boolean(instance) || item.name === runtime?.model;
-              const policy = instance?.pinned
-                ? tr('固定', 'Pinned')
-                : instance?.idle_ttl_seconds != null
-                  ? `TTL ${instance.idle_ttl_seconds}s` : null;
               return (
                 <div className="model-row" key={item.id}>
                   <span className={loaded ? 'model-state active'
                     : item.loadable ? 'model-state' : 'model-state failed'} />
                   <div>
                     <strong>{item.name}</strong>
-                    <small>
-                      {item.architecture} · {item.missing_shards ? tr(`分片不全，缺 ${item.missing_shards} 片`, `${item.missing_shards} shards missing`) : item.complete ? `${item.shard_count} ${tr('个分片', 'shards')}` : tr('文件无效', 'Invalid file')} ·{' '}
-                      {formatNumber(item.total_bytes / 2 ** 30, 1)} GB{policy ? ` · ${policy}` : ''}
-                    </small>
+                    <small>{gib(item.total_bytes)} · {item.missing_shards
+                      ? tr(`${item.shard_count} 个分片，缺 ${item.missing_shards} 片`, `${item.shard_count} shards, ${item.missing_shards} missing`)
+                      : tr(`${item.shard_count} 个分片`, `${item.shard_count} shards`)}</small>
+                    <small>{tr('预计常驻内存', 'Estimated resident memory')} {gib(item.estimated_resident_weight_bytes)}
+                      {(item.ssd_ple_bytes ?? 0) > 0 && ` · SSD PLE ${gib(item.ssd_ple_bytes)}`}</small>
                     <ModelLoadProgress model={item.name} />
                   </div>
-                  <div className="model-row-actions"><ModelVendorMark name={item.name} architecture={item.architecture} />{instance ? (
+                  <div className="local-checkpoint-memory">
+                    <small>{tr('剩余可用内存', 'Remaining available memory')} {gib(available)}</small>
+                    <ModelMemoryPressure required={item.estimated_resident_weight_bytes} available={available}
+                      label={tr('预计占剩余可用内存', 'Estimated share of remaining available memory')}
+                      emptyLabel={tr('无可用内存', 'No available memory')} />
+                  </div>
+                  <div className="model-row-actions"><ModelVendorMark name={item.name} architecture={item.architecture} /><button className="model-files-action" disabled={busy} onClick={() => void openModelFiles(item.id)} type="button"><Icon name="folder" size={13} />{tr('模型文件', 'Model files')}</button>{instance ? (
                     <button disabled={busy || instance.state !== 'ready'}
                       onClick={() => void unloadInstance(instance.id)} type="button">
                       {tr('卸载', 'Unload')}

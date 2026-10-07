@@ -42,7 +42,7 @@ int main() {
             }
         }
         {
-            mfq::metal::MlxMtpDepthController controller(3);
+            mfq::metal::MlxDsparkDepthController controller(3);
             if (controller.depth() != 2) {
                 throw std::runtime_error(
                     "adaptive MTP controller did not start at depth two");
@@ -61,7 +61,7 @@ int main() {
             }
         }
         {
-            mfq::metal::MlxMtpDepthController controller(1);
+            mfq::metal::MlxDsparkDepthController controller(1);
             controller.observe(1, 0, 80.0);
             controller.observe(1, 0, 75.0);
             controller.observe(1, 0, 70.0);
@@ -85,7 +85,7 @@ int main() {
             }
         }
         {
-            mfq::metal::MlxMtpDepthController controller(3);
+            mfq::metal::MlxDsparkDepthController controller(3);
             controller.observe(2, 0, 70.0);
             controller.observe(2, 0, 65.0);
             controller.observe(2, 0, 60.0);
@@ -111,7 +111,7 @@ int main() {
             }
         }
         {
-            mfq::metal::MlxMtpDepthController controller(3, 3);
+            mfq::metal::MlxDsparkDepthController controller(3, 3);
             controller.observe(3, 3, 45.0);
             controller.observe(3, 3, 44.0);
             controller.observe(3, 3, 43.0);
@@ -124,7 +124,7 @@ int main() {
             }
         }
         {
-            mfq::metal::MlxMtpDepthController controller(5, 5);
+            mfq::metal::MlxDsparkDepthController controller(5, 5);
             controller.observe(5, 5, 1104.0);
             controller.observe(5, 5, 721.0);
             controller.observe(5, 5, 235.0);
@@ -140,7 +140,7 @@ int main() {
             }
         }
         {
-            mfq::metal::MlxMtpDepthController controller(5);
+            mfq::metal::MlxDsparkDepthController controller(5);
             controller.observe(2, 2, 30.0);
             controller.observe(2, 2, 29.0);
             controller.observe(2, 2, 28.0);
@@ -185,7 +185,7 @@ int main() {
             }
         }
         {
-            mfq::metal::MlxMtpDepthController controller(1);
+            mfq::metal::MlxDsparkDepthController controller(1);
             for (int cycle = 0; cycle < 3; ++cycle) controller.observe(1, 0, 70.0);
             for (int cycle = 0; cycle < 3; ++cycle) controller.observe(0, 0, 40.0);
             int cycles = 0;
@@ -194,6 +194,73 @@ int main() {
             controller.observe(1, 1, 20.0);
             if (!controller.measured_cycle_ms(1) || *controller.measured_cycle_ms(1) > 21.0)
                 throw std::runtime_error("MTP retained an obsolete depth cost after a long observation gap");
+        }
+        {
+            int target_position = 0, verify_calls = 0, decode_calls = 0, resolve_calls = 0;
+            mfq::engine::mtp::PolicyState policy_state;
+            mfq::metal::MlxMtpEngineCallbacks callbacks;
+            callbacks.predictor = mfq::metal::MlxMtpPredictorDescriptor::recurrent(3);
+            callbacks.policy_state = &policy_state;
+            callbacks.target_cache_position = [&] { return target_position; };
+            callbacks.prepare_draft = [&](const mfq::metal::MlxMtpDraftContext& context,
+                const mfq::metal::MlxMtpTokenSelector& select) {
+                for (int position = 0; position < context.requested_depth; ++position)
+                    (void)select(mlx::core::array({0.f, 10.f, 0.f}, mlx::core::Shape{1, 3}));
+            };
+            const auto target_step = [&](int depth) {
+                target_position += depth+1;
+                std::this_thread::sleep_for(std::chrono::milliseconds(depth ? 12 : 1));
+                return mfq::metal::MlxMtpTargetBatch{
+                    mlx::core::broadcast_to(mlx::core::array({10.f, 0.f, 0.f}, mlx::core::Shape{1, 3}),
+                        mlx::core::Shape{depth+1, 3}),
+                    mlx::core::zeros(mlx::core::Shape{1, depth+1, 1})};
+            };
+            callbacks.verify_target = [&](std::int32_t, const mlx::core::array&, int depth) {
+                ++verify_calls;
+                return target_step(depth);
+            };
+            callbacks.decode_target = [&](std::int32_t) {
+                ++decode_calls;
+                return target_step(0);
+            };
+            callbacks.resolve_target = [&](int accepted, int depth) {
+                ++resolve_calls;
+                target_position -= depth-accepted;
+            };
+            mfq::metal::MlxSamplingParams sampling;
+            sampling.temperature = 0;
+            sampling.mtp_max_draft_tokens = 3;
+            mfq::metal::MlxMtpGenerationStats stats;
+            std::vector<std::int64_t> output;
+            const auto generated = mfq::metal::run_mlx_mtp_generation({
+                3, 256, 512, mlx::core::array({10.f, 0.f, 0.f}, mlx::core::Shape{1, 3}),
+                sampling, std::nullopt, {}, [&](std::int64_t token) {
+                    output.push_back(token);
+                    return true;
+                }}, callbacks, stats);
+            if (generated != 256 || output != std::vector<std::int64_t>(256, 0) ||
+                target_position != 255 || stats.park_count < 2 || stats.reentry_probes < 1 ||
+                stats.standard_tokens < 128 || verify_calls != stats.cycles ||
+                resolve_calls != verify_calls || decode_calls != stats.standard_tokens)
+                throw std::runtime_error("MTP standard handoff/reentry/cache contract mismatch");
+            target_position = verify_calls = decode_calls = resolve_calls = 0;
+            output.clear();
+            sampling.temperature = 1.0;
+            sampling.top_k = 3;
+            sampling.repetition_penalty = 1.1;
+            const auto constrained_generated = mfq::metal::run_mlx_mtp_generation({
+                3, 256, 512, mlx::core::array({10.f, 0.f, 0.f}, mlx::core::Shape{1, 3}),
+                sampling, mlx::core::zeros(mlx::core::Shape{3}, mlx::core::int32), {},
+                [&](std::int64_t token) {
+                    output.push_back(token);
+                    return true;
+                }, 0u, alternating_constraint()}, callbacks, stats);
+            if (constrained_generated != 256 || stats.park_count == 0 ||
+                stats.standard_tokens == 0 || target_position != 255)
+                throw std::runtime_error("stochastic MTP standard handoff mismatch");
+            for (std::size_t index = 0; index < output.size(); ++index)
+                if (output[index] != static_cast<std::int64_t>(index%2))
+                    throw std::runtime_error("parked MTP lost its sampling/constraint cursor");
         }
         const std::array<std::int32_t, 4> drafts{11, 12, 13, 14};
         {

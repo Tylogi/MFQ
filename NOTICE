@@ -24,6 +24,17 @@ The single-token Gated DeltaNet step layout follows
 qwen4_decode_step_fused in qwen35_gdn_prework.py at revision
 107e271ad449e2a9a060ec9a76d0c1d42724a2e2; MFQ retains its FP32 recurrent
 state, transposed cache contract, and existing reduction order.
+The Qwen4 QSA prefill pipeline, fused indexer-score and chronological FP32
+top-k kernels follow qsa_fast.py, language.py and the native DSA indexer at
+revision a435a3736071286fdb2b74f486b3505f23f3c194. The sparse main kernels
+adapt its NAX half2 and tiled GQA paths; MFQ retains its quantized projections
+and cache interfaces. MFQ's prefill-only NAX variant packs a single FP16
+probability term and uses a two-barrier score exchange, retaining FP32 scores,
+softmax and accumulation.
+The shared non-Dspark MTP depth controller, performance handoff, retry policy
+and cross-request timing estimates are adapted from batch_generator.py at
+revision a435a3736071286fdb2b74f486b3505f23f3c194, translated to C++ for
+MFQ\'s Metal and CUDA generation engines.
 Copyright 2025 oMLX contributors
 License: Apache License 2.0 (`LICENSE`)
 

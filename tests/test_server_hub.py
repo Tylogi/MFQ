@@ -156,7 +156,8 @@ def test_official_cache_survives_restart_and_failed_refresh(tmp_path, monkeypatc
         async def fetch(provider, repo_id, revision, profile):
             return HubModelInfo(
                 provider=provider, repo_id=repo_id, revision="master",
-                files=[HubModelFile(name="S4.mfq", byte_size=42)],
+                files=[HubModelFile(name="S4.mfq", byte_size=42, weight_bytes=30,
+                    weight_bytes_by_dtype={'NINT': 20, 'BF16': 10}, ssd_ple_bytes=10)],
             )
 
         monkeypatch.setattr(catalog, "_fetch_info", fetch)
@@ -166,6 +167,9 @@ def test_official_cache_survives_restart_and_failed_refresh(tmp_path, monkeypatc
         restored = HubCatalog(cache_path=path)
         assert not (await restored.official()).refreshing
         assert len(restored._official_cache) == 5
+        restored_model = next(iter(restored._official_cache.values()))
+        assert restored_model.files[0].weight_bytes_by_dtype == {'NINT': 20, 'BF16': 10}
+        assert _model_variants(restored_model.files, system_profile())[0].estimated_resident_weight_bytes == 32
         original_times = restored._source_cache_times.copy()
 
         async def offline(*args):
@@ -631,12 +635,12 @@ def test_streamable_official_model_uses_each_tiers_full_residency_size() -> None
     requirements = [
         variant.configuration.required_memory_bytes for variant in model.variants
     ]
-    expected = list(sizes)
+    expected = [size + (size + 9) // 10 for size in sizes]
     assert requirements == expected
     assert len(set(requirements)) == 3
     assert 48 * gib not in requirements
     assert model.configuration.required_memory_bytes == min(expected)
-    assert model.configuration.recommendation == "two_stars"
+    assert model.configuration.recommendation == "one_star"
 
 
 def test_unknown_repository_remains_downloadable_with_a_warning() -> None:

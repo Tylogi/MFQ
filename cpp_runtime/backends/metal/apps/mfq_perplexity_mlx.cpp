@@ -1,6 +1,8 @@
 #include "mfq_container.h"
 #include "mlx_deepseek_v4_causal_lm.h"
 #include "mlx_qwen35_causal_lm.h"
+#include "mlx_qwen4_causal_lm.h"
+#include "mlx_legacy_tensor_compat.h"
 #include "qwen35_model.h"
 
 #include "transport.h"
@@ -1981,7 +1983,15 @@ int run_kl(
     mlx::core::set_default_stream(runtime_stream);
     const auto load_started = Clock::now();
     const auto& architecture = model.header().architecture;
-    if (architecture.rfind("deepseek_v4", 0) == 0) {
+    if (mfq::metal::effective_model_graph(model).backbone == "qwen4_exp") {
+        const auto config = mfq::metal::Qwen4Config::from_mfq(model);
+        if (context > config.max_position_embeddings || parallel != 1)
+            throw std::runtime_error("Flash-Next KLD requires n_seq=1 and a valid context capacity");
+        auto runtime = mfq::metal::MlxQwen4CausalLm::load(
+            model, context, expert_cache_bytes(arguments.expert_cache_gb));
+        (void)evaluate_kl(runtime, arguments, reference, contract,
+            static_cast<int>(config.vocab_size), parallel, score_count);
+    } else if (architecture.rfind("deepseek_v4", 0) == 0) {
         const auto config =
             mfq::metal::DeepseekV4Config::from_mfq(model);
         if (context > config.max_position_embeddings) {
@@ -2207,7 +2217,15 @@ int run(const Arguments& arguments) {
     const auto load_started = Clock::now();
     PerplexityStats stats;
     const auto& architecture = model.header().architecture;
-    if (architecture.rfind("deepseek_v4", 0) == 0) {
+    if (mfq::metal::effective_model_graph(model).backbone == "qwen4_exp") {
+        const auto config = mfq::metal::Qwen4Config::from_mfq(model);
+        if (arguments.context > config.max_position_embeddings || parallel != 1)
+            throw std::runtime_error("Flash-Next perplexity requires n_seq=1 and a valid context capacity");
+        auto runtime = mfq::metal::MlxQwen4CausalLm::load(
+            model, arguments.context, expert_cache_bytes(arguments.expert_cache_gb));
+        stats = run_perplexity(runtime, arguments, model, tokenizer,
+            static_cast<int>(config.vocab_size), chunks, parallel, ubatch_size);
+    } else if (architecture.rfind("deepseek_v4", 0) == 0) {
         const auto config =
             mfq::metal::DeepseekV4Config::from_mfq(model);
         if (arguments.context > config.max_position_embeddings) {

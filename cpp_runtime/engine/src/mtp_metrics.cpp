@@ -17,6 +17,9 @@ void append_generation_metrics(
             ? 0.0
             : static_cast<double>(stats.accepted_tokens) /
                 stats.drafted_tokens);
+    metrics.emplace_back("mtp_standard_tokens", static_cast<double>(stats.standard_tokens));
+    metrics.emplace_back("mtp_park_count", static_cast<double>(stats.park_count));
+    metrics.emplace_back("mtp_reentry_probes", static_cast<double>(stats.reentry_probes));
     metrics.emplace_back(
         "mtp_selected_depth", static_cast<double>(stats.selected_depth));
     for (std::size_t depth = 0; depth < stats.depth_cycles.size(); ++depth) {

@@ -520,10 +520,10 @@ int run_mfq_http_transport(
             {"name", "MFQ C++ HTTP runtime transport"},
             {"model", config.model_name},
             {"endpoints", {
-                "/runtime/generate", "/runtime/models",
+                "/runtime/generate", "/runtime/score", "/runtime/models",
                 "/runtime/health", "/runtime/status", "/runtime/reload",
                 "/runtime/realtime", "/runtime/cache/clear",
-                "/runtime/cache/trim", "/runtime/sessions/fork",
+                "/runtime/cache/trim", "/runtime/cache/budget", "/runtime/cache/refresh", "/runtime/memory/budget", "/runtime/sessions/fork",
                 "/runtime/sessions/{id}",
                 "/runtime/sessions/{id}/cancel",
             }},
@@ -550,6 +550,7 @@ int run_mfq_http_transport(
             {"status", reloading.load() ? "loading" : (scheduler.status().healthy ? "ok" : "unhealthy")},
             {"model", config.model_name},
             {"model_type", config.model_type},
+            {"probability_available", scheduler.info().probability},
             {"model_capabilities", model_capabilities},
             {"vision_supported", vision_supported},
             {"vision_available", vision_available},
@@ -627,7 +628,31 @@ int run_mfq_http_transport(
         }
     });
 
-    server.Post("/runtime/cache/trim", [&] (
+    server.Post("/runtime/cache/refresh", [&](const httplib::Request&, httplib::Response& res) {
+        try {
+            json result = {{"status", "ok"},
+                {"removed_blocks", scheduler.session({mfq::engine::SessionCommand::Kind::refresh}).count}};
+            add_session_metrics(result);
+            set_json(res, result);
+        } catch (const std::exception& error) {
+            set_json(res, error_body(error.what(), "server_error"), 500);
+        }
+    });
+    server.Post("/runtime/memory/budget", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!authorized(req, res, config.api_key)) return;
+        try {
+            const auto body = parse_body(req);
+            const auto bytes = integer_field(body, "target_bytes", 0);
+            if (bytes < 0) throw ApiError(400, "invalid_request_error", "target_bytes must be non-negative");
+            json result = {{"status", "ok"}, {"released_bytes", scheduler.session(
+                {mfq::engine::SessionCommand::Kind::memory_budget, {}, {}, static_cast<uint64_t>(bytes)}).count}};
+            add_session_metrics(result);
+            set_json(res, result);
+        } catch (const ApiError& error) { handle_api_error(res, error); }
+        catch (const std::exception& error) { set_json(res, error_body(error.what(), "server_error"), 500); }
+    });
+
+    server.Post(R"(/runtime/cache/(trim|budget))", [&] (
             const httplib::Request & req, httplib::Response & res) {
         if (!authorized(req, res, config.api_key)) return;
 
@@ -650,7 +675,15 @@ int run_mfq_http_transport(
                 }
                 target_bytes = body["target_bytes"].get<std::uint64_t>();
             }
-            const auto released = scheduler.session({mfq::engine::SessionCommand::Kind::trim, {}, {}, target_bytes}).count;
+            const auto kind = req.path == "/runtime/cache/budget"
+                ? mfq::engine::SessionCommand::Kind::budget : mfq::engine::SessionCommand::Kind::trim;
+            mfq::engine::SessionCommand command{kind, {}, {}, target_bytes};
+            if (kind == mfq::engine::SessionCommand::Kind::budget && body.contains("disk_target_bytes")) {
+                const auto disk = integer_field(body, "disk_target_bytes", 0);
+                if (disk < 0) throw ApiError(400, "invalid_request_error", "disk_target_bytes must be non-negative");
+                command.disk_bytes = static_cast<uint64_t>(disk);
+            }
+            const auto released = scheduler.session(command).count;
             json result = {
                 {"status", "ok"},
                 {"released_bytes", released},
@@ -796,6 +829,18 @@ int run_mfq_http_transport(
                 {"capabilities", model_capabilities},
             }})},
         });
+    });
+
+    server.Post("/runtime/score", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!authorized(req, res, config.api_key)) return;
+        try {
+            if (!scheduler.info().probability)
+                throw ApiError(501, "probability_unavailable", "probability scoring is unavailable for this model");
+            set_json(res, likelihood_result_json(std::get<mfq::engine::LikelihoodResult>(
+                scheduler.control(parse_score_request(parse_body(req))))));
+        } catch (const ApiError& error) { handle_api_error(res, error); }
+        catch (const std::invalid_argument& error) { set_json(res, error_body(error.what(), "invalid_request_error"), 400); }
+        catch (const std::exception& error) { set_json(res, error_body(error.what(), "server_error"), 500); }
     });
 
     auto runtime_generate_handler = [&](const httplib::Request & req, httplib::Response & res) {

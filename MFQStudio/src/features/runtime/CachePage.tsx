@@ -1,32 +1,43 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { runtimeApi } from '../../shared/api/resources/runtime';
 import { useRuntime } from '../../app/RuntimeProvider';
+import { useConnectionScope } from '../../app/useConnectionScope';
 import { useSettings } from '../settings/SettingsProvider';
 import { ScreenHeader, SectionLabel, TMPanel, UsageBar, EmptyPanel } from '../../app/display';
 import { errorMessage, formatNumber } from '../../app/formatters';
 import { studioConfirm } from '../../studio';
 import { ResourceMonitorPanel } from './ResourceMonitorPanel';
+import { ResourceAllocationPanel } from './ResourceAllocationPanel';
+import { PrefixCacheInventoryPanel } from './PrefixCacheInventoryPanel';
 import { toast } from '../../stores/toastStore';
 
 export function CachePage() {
+  const { connectionRevision } = useRuntime();
+  return <ResourcePageContent key={connectionRevision} />;
+}
+
+function ResourcePageContent() {
   const { runtime, refreshRuntime } = useRuntime();
+  const connectionScope = useConnectionScope();
   const { tr } = useSettings();
   const [busy, setBusy] = useState(false);
-  const prefixCacheRamBudget = Number(runtime?.prefix_cache_max_bytes ?? 0);
+  const clearing = useRef(false);
+  const prefixCacheRamBudget = Number(runtime?.prefix_cache_total_hot_max_bytes ?? runtime?.prefix_cache_max_bytes ?? 0);
   const prefixCacheQueries = Number(runtime?.prefix_cache_queries || 0);
   const prefixCacheHits = Number(runtime?.prefix_cache_hits || 0);
   const prefixCacheSnapshots = Number(runtime?.prefix_cache_snapshots || 0);
   const prefixCacheBytes = Number(runtime?.prefix_cache_bytes || 0);
-  const prefixCacheDiskBytes = Number(runtime?.prefix_cache_disk_bytes || 0);
-  const prefixCacheDiskBudget = Number(runtime?.prefix_cache_disk_max_bytes || 0);
-  const prefixCacheHotBytes = Number(runtime?.prefix_cache_hot_bytes ?? prefixCacheBytes);
+  const prefixCacheDiskBytes = Number(runtime?.prefix_cache_total_disk_bytes ?? runtime?.prefix_cache_disk_bytes ?? 0);
+  const prefixCacheDiskBudget = Number(runtime?.prefix_cache_total_disk_max_bytes ?? runtime?.prefix_cache_disk_max_bytes ?? 0);
+  const prefixCacheHotBytes = Number(runtime?.prefix_cache_total_hot_bytes ?? runtime?.prefix_cache_hot_bytes ?? prefixCacheBytes);
   const prefixCacheHitRate =
     prefixCacheQueries > 0 ? (prefixCacheHits / prefixCacheQueries) * 100 : 0;
   const prefixCacheHotOnly = runtime?.prefix_cache_mode === 'single_device_hot_prefix';
-  const prefixCachePersistent = typeof runtime?.prefix_cache_max_bytes === 'number';
-  const prefixCacheSupported = runtime?.prefix_cache_supported !== undefined
+  const prefixCachePoolReported = typeof runtime?.prefix_cache_total_disk_max_bytes === 'number';
+  const prefixCachePersistent = prefixCachePoolReported || typeof runtime?.prefix_cache_max_bytes === 'number';
+  const prefixCacheSupported = prefixCachePoolReported || (runtime?.prefix_cache_supported !== undefined
     ? Number(runtime.prefix_cache_supported) > 0
-    : prefixCachePersistent || prefixCacheHotOnly;
+    : prefixCachePersistent || prefixCacheHotOnly);
   const prefixCacheUnavailableReason = Number(runtime?.prefix_cache_disabled_reason) === 2
     ? tr(
         '连续批处理模式暂不支持 Session KV 缓存',
@@ -37,8 +48,11 @@ export function CachePage() {
         'The current model does not support Session KV cache',
       );
   async function clearRuntimeCache() {
+    const current = connectionScope();
     const snapshots = Number(runtime?.prefix_cache_snapshots || 0);
-    if (busy || snapshots <= 0 || Number(runtime?.active_requests || 0) > 0) return;
+    if (clearing.current || snapshots <= 0 || Number(runtime?.active_requests || 0) > 0) return;
+    clearing.current = true;
+    setBusy(true);
     const hotPrefixOnly = runtime?.prefix_cache_mode === 'single_device_hot_prefix';
     const confirmation = hotPrefixOnly
       ? tr(
@@ -46,19 +60,21 @@ export function CachePage() {
           `Clear ${formatNumber(snapshots)} device-hot prefix? Chat history will be kept.`,
         )
       : tr(
-          `清除 ${formatNumber(snapshots)} 个 Session KV SSD 缓存块？此操作不会删除聊天记录。`,
-          `Clear ${formatNumber(snapshots)} Session KV SSD cache blocks? Chat history will be kept.`,
+          `清除当前模型的前缀缓存（${formatNumber(snapshots)} 个块）？其他模型的缓存和聊天记录不受影响。`,
+          `Clear this model’s ${formatNumber(snapshots)} prefix cache blocks? Other models’ caches and chat history will be kept.`,
         );
-    if (!(await studioConfirm(confirmation))) return;
-    setBusy(true);
     try {
+      if (!(await studioConfirm(confirmation)) || !current()) return;
       await runtimeApi.clearRuntimeCache(runtime?.instance_id);
+      if (!current()) return;
       await refreshRuntime(false);
+      if (!current()) return;
       toast.success(tr('缓存已清除', 'Cache cleared successfully'));
     } catch (cause) {
-      toast.error(errorMessage(cause));
+      if (current()) toast.error(errorMessage(cause));
     } finally {
-      setBusy(false);
+      clearing.current = false;
+      if (current()) setBusy(false);
     }
   }
 
@@ -72,6 +88,7 @@ export function CachePage() {
         )}
       />
 
+      <ResourceAllocationPanel />
       <ResourceMonitorPanel />
       <SectionLabel title={tr('前缀缓存', 'Prefix cache')} />
       {prefixCacheSupported ? (
@@ -139,12 +156,12 @@ export function CachePage() {
             <>
               <div className="cache-usage-bars">
                 <UsageBar
-                  label={tr('SSD 前缀缓存', 'SSD prefix cache')}
+                  label={tr('SSD 前缀缓存总占用', 'Total SSD prefix cache')}
                   used={prefixCacheDiskBytes}
                   total={Math.max(prefixCacheDiskBudget, prefixCacheDiskBytes)}
                 />
                 <UsageBar
-                  label={tr('RAM 热层', 'RAM hot tier')}
+                  label={tr('RAM 热缓存总占用', 'Total RAM hot cache')}
                   used={prefixCacheHotBytes}
                   total={Math.max(prefixCacheHotBytes, prefixCacheRamBudget)}
                 />
@@ -157,7 +174,7 @@ export function CachePage() {
                 <div>
                   <span>{tr('SSD 块', 'SSD blocks')}</span>
                   <strong>
-                    {formatNumber(runtime?.prefix_cache_disk_blocks ?? prefixCacheSnapshots)}
+                    {formatNumber(runtime?.prefix_cache_total_disk_blocks ?? runtime?.prefix_cache_disk_blocks ?? prefixCacheSnapshots)}
                   </strong>
                 </div>
                 <div>
@@ -210,7 +227,7 @@ export function CachePage() {
               onClick={() => void clearRuntimeCache()}
               type="button"
             >
-              {tr('清除 Session KV 缓存', 'Clear Session KV cache')}
+              {tr('清除此模型的前缀缓存', 'Clear this model’s prefix cache')}
             </button>
           )}
         </TMPanel>
@@ -232,6 +249,7 @@ export function CachePage() {
           }
         />
       )}
+      <PrefixCacheInventoryPanel />
     </section>
   );
 }

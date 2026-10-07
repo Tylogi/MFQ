@@ -134,7 +134,48 @@ void test_decode_timing() {
     const auto empty = mfq::transport_detail::request_metric_values(result, InferenceMetrics{});
     assert(empty.decode_ms == 0.0 && empty.decode_tps == 0.0);
 }
+void test_benchmark_input_contract() {
+    using namespace mfq::transport_detail;
+    json params = {{"input", {{"messages", json::array({{{"role", "user"}, {"content", "test input"}}})}, {"preformatted_prompt", "test input"},
+        {"benchmark_prompt_tokens", 32}}}, {"cache", {{"enabled", false}}}};
+    auto body = runtime_generate_body(params);
+    const auto input = parse_input(body, true, {});
+    assert(!input.prefix_cache_enabled && input.benchmark_prompt_tokens == 32);
+    body.erase("mfq_benchmark_prompt_tokens");
+    body.erase("mfq_prefix_cache_enabled");
+    const auto normal = parse_input(body, true, {});
+    assert(normal.prefix_cache_enabled && !normal.benchmark_prompt_tokens);
+    for (const auto& invalid : std::vector<json>{
+            {{"mfq_benchmark_prompt_tokens", 0}, {"mfq_prefix_cache_enabled", false}, {"mfq_preformatted_prompt", "test"}},
+            {{"mfq_benchmark_prompt_tokens", 32}, {"mfq_prefix_cache_enabled", true}, {"mfq_preformatted_prompt", "test"}},
+            {{"mfq_benchmark_prompt_tokens", 32}, {"mfq_prefix_cache_enabled", false}, {"messages", json::array()}}}) {
+        bool rejected = false;
+        try { parse_input(invalid, true, {}); } catch (const ApiError&) { rejected = true; }
+        assert(rejected);
+    }
+}
+void test_probability_contract() {
+    using namespace mfq::transport_detail;
+    const auto request = parse_score_request({{"prompt", "Q:\nA:"}, {"continuations", {"A", "B"}}, {"mode", "next_token"}});
+    assert(request.next_token && request.prompt == "Q:\nA:" && request.continuations.size() == 2);
+    for (const auto& invalid : std::vector<json>{
+            {{"prompt", ""}, {"continuations", {"A"}}},
+            {{"prompt", "x"}, {"continuations", json::array()}},
+            {{"prompt", "x"}, {"continuations", {1}}},
+            {{"prompt", "x"}, {"continuations", {"A"}}, {"mode", 1}},
+            {{"prompt", "x"}, {"continuations", {"A"}}, {"mode", "generate"}},
+            {{"prompt", "x"}, {"continuations", {"A"}}, {"temperature", 1}}}) {
+        bool rejected = false;
+        try { (void)parse_score_request(invalid); } catch (const ApiError& error) { rejected = error.status == 400; }
+        assert(rejected);
+    }
+    const auto result = likelihood_result_json({3, {{{1, 2}, {-1., -2.}, -3.}}});
+    assert(result["log_base"] == "e" && result["scores"][0]["log_likelihood"] == -3);
+}
+
 int main() {
+    test_probability_contract();
+    test_benchmark_input_contract();
     test_decode_timing();
     {
         FakeEngine engine;

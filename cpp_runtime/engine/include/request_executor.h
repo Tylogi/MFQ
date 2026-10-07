@@ -17,8 +17,20 @@ template <class Cache> SessionResult control_session(Cache &cache, const Session
         return {cache.clear(), {}};
     case SessionCommand::Kind::trim:
         return {cache.trim_hot(command.bytes), {}};
+    case SessionCommand::Kind::budget:
+        if constexpr (requires { cache.set_hot_limit(command.bytes); cache.set_disk_limit(command.bytes); }) {
+            const auto released = cache.set_hot_limit(command.bytes);
+            if (command.disk_bytes) cache.set_disk_limit(*command.disk_bytes);
+            return {released, {}};
+        }
+        else throw std::invalid_argument("prefix cache budgets are unavailable");
     case SessionCommand::Kind::metrics:
         return {0, cache.metrics()};
+    case SessionCommand::Kind::refresh:
+        if constexpr (requires { cache.refresh_disk_index(); }) return {cache.refresh_disk_index(), {}};
+        else throw std::invalid_argument("prefix cache refresh is unavailable");
+    case SessionCommand::Kind::memory_budget:
+        throw std::invalid_argument("online resident memory budgets are unavailable for this backend");
     }
     throw std::invalid_argument("unknown session command");
 }

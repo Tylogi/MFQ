@@ -2,7 +2,8 @@
   "bundle": {
     "targets": ["dmg"],
     "externalBin": [
-      "../../packaging/sidecars/mfq-decode-metal"
+      "../../packaging/sidecars/mfq-decode-metal",
+      "../../packaging/sidecars/mfq-perplexity"
     ],
     "resources": {
       "../../packaging/Resources/mlx.metallib": "mlx.metallib",

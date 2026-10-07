@@ -8,6 +8,8 @@ export interface ModelArtifact {
   shard_count: number;
   missing_shards?: number;
   total_bytes: number;
+  estimated_resident_weight_bytes?: number | null;
+  ssd_ple_bytes?: number | null;
   tensor_count: number;
   record_count: number;
   dtypes: string[];
@@ -29,6 +31,8 @@ export interface ModelDirectoryList {
   current_path: string | null;
   parent_id: string | null;
   model_file_count: number;
+  files?: Array<{ name: string; byte_size: number }>;
+  can_open_in_finder?: boolean;
   data: ModelDirectoryEntry[];
 }
 
@@ -60,6 +64,7 @@ export interface HubModelVariant {
   files: string[];
   byte_size: number;
   resident_weight_bytes?: number | null;
+  estimated_resident_weight_bytes?: number | null;
   ssd_ple_bytes?: number | null;
   configuration: ModelConfigurationStatus;
 }
@@ -85,9 +90,28 @@ export interface HubSystemProfile {
   memory_pools?: HubMemoryPool[];
 }
 
+export interface ModelParameterBreakdown {
+  total: number;
+  dense: number;
+  routed_experts: number;
+  ple: number;
+  active?: number | null;
+}
+
+export interface ModelCacheProfile {
+  max_context: number;
+  fixed_bytes: number;
+  components: Array<{
+    bytes_per_row: number;
+    tokens_per_row: number;
+    allocation: 'exact' | 'power_of_two';
+    minimum_rows: number;
+  }>;
+}
+
 export interface HubModelInfo extends HubModelSummary {
   revision: string;
-  files: Array<{ name: string; byte_size: number; sha256?: string | null; weight_bytes?: number | null; ssd_ple_bytes?: number | null }>;
+  files: Array<{ name: string; byte_size: number; sha256?: string | null; weight_bytes?: number | null; weight_bytes_by_dtype?: Record<string, number>; ssd_ple_bytes?: number | null }>;
   tags: string[];
   license?: string | null;
   library?: string | null;
@@ -95,6 +119,9 @@ export interface HubModelInfo extends HubModelSummary {
   architectures: string[];
   modalities: string[];
   parameter_count?: number | null;
+  parameter_breakdown?: ModelParameterBreakdown | null;
+  mtp_supported?: boolean | null;
+  cache_profile?: ModelCacheProfile | null;
   ple_parameter_count?: number | null;
   published_at?: string | null;
   gated: boolean;
@@ -119,6 +146,9 @@ export interface OfficialModelInfo {
   description_zh: string;
   parameter_label?: string | null;
   active_parameter_label?: string | null;
+  parameter_breakdown?: ModelParameterBreakdown | null;
+  mtp_supported?: boolean | null;
+  cache_profile?: ModelCacheProfile | null;
   modalities: string[];
   capabilities: string[];
   precision_options: string[];

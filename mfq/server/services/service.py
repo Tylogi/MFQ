@@ -6,6 +6,8 @@ import asyncio
 import base64
 import hashlib
 import json
+import subprocess
+import sys
 import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import suppress
@@ -29,6 +31,7 @@ from mfq.server.state.catalog import (
     ModelRegistrationError,
 )
 from mfq.server.services.documents import DocumentExtractionError, extract_document
+from mfq.server.services.evaluation_datasets import official_for_digest
 from mfq.server.services.hub import (
     HubCatalog,
     HubError,
@@ -97,8 +100,11 @@ from mfq.server.protocol.models import (
     ModelDirectoryList,
     ModelLoadRequest,
     RuntimeMemoryPolicy,
+    RuntimeInferencePolicy,
     ModelUnloadRequest,
     OfficialModelList,
+    OpenModelDirectoryRequest,
+    OpenModelDirectoryResult,
     OperationAccepted,
     PortableMedia,
     PortableMessage,
@@ -314,6 +320,8 @@ class ServerService:
         self._closed = False
         if runtime_manager is not None:
             runtime_manager.store = store
+            if hasattr(runtime_manager, "inference_policy"):
+                runtime_manager.inference_policy = RuntimeInferencePolicy.model_validate(store.runtime_inference_policy())
             if hasattr(runtime_manager, "configure_memory_policy"):
                 runtime_manager.memory_policy = RuntimeMemoryPolicy.model_validate(store.runtime_memory_policy())
                 self.jobs.register("runtime.memory.configure", TypedJobHandler(runtime_manager.configure_memory_policy, RuntimeMemoryPolicy))
@@ -509,6 +517,7 @@ class ServerService:
         *,
         after: int,
         limit: int,
+        tail: bool = False,
     ) -> JobEventList:
         try:
             events = await asyncio.to_thread(
@@ -516,6 +525,7 @@ class ServerService:
                 job_id,
                 after=after,
                 limit=limit,
+                tail=tail,
             )
         except JobNotFoundError as error:
             raise ServiceError(404, "job_not_found", str(error)) from error
@@ -1067,6 +1077,32 @@ class ServerService:
                 "model directory is unavailable",
             ) from error
 
+    async def model_artifact_directory(self, model_id: str) -> ModelDirectoryList:
+        if self.catalog is None:
+            raise ServiceError(501, "model_catalog_unavailable", "model directory browsing is not available")
+        try:
+            artifact = await self.catalog.get(model_id)
+        except ModelArtifactNotFoundError as error:
+            raise ServiceError(404, "model_artifact_not_found", "model artifact is unavailable") from error
+        directory = artifact.path if artifact.resource.format == "hf" else artifact.path.parent
+        return await self.model_directories(path=str(directory))
+
+    async def open_model_directory(self, request: OpenModelDirectoryRequest) -> OpenModelDirectoryResult:
+        if self.catalog is None:
+            raise ServiceError(501, "model_catalog_unavailable", "model directory browsing is not available")
+        try:
+            directory = await asyncio.to_thread(self.catalog.directory_path, request.directory_id)
+        except ModelDirectoryNotFoundError as error:
+            raise ServiceError(404, "model_directory_not_found", "model directory is unavailable") from error
+        if sys.platform != "darwin":
+            raise ServiceError(501, "finder_unavailable", "Finder is available only on a macOS server")
+        try:
+            await asyncio.to_thread(subprocess.run, ["/usr/bin/open", "-a", "Finder", str(directory)],
+                check=True, timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise ServiceError(503, "model_directory_open_failed", "could not open the model directory in Finder") from error
+        return OpenModelDirectoryResult()
+
     async def register_model_directory(
         self,
         request: RegisterModelDirectoryRequest,
@@ -1111,6 +1147,9 @@ class ServerService:
                 self.tool_handlers.workspace_file_manifest,
                 request.artifact_uri,
             )
+            spec = official_for_digest(request.kind, manifest["sha256"], manifest["byte_size"])
+            request = request.model_copy(update={"name": spec.name, "source_uri": spec.url,
+                "revision": spec.revision, "metadata": spec.metadata()})
             return await asyncio.to_thread(
                 self.store.create_dataset,
                 request,
@@ -1125,7 +1164,21 @@ class ServerService:
             raise ServiceError(409, "dataset_conflict", str(error)) from error
 
     async def list_datasets(self) -> DatasetList:
-        return DatasetList(data=await asyncio.to_thread(self.store.list_datasets))
+        registered = await asyncio.to_thread(self.store.list_datasets)
+        official = []
+        for dataset in registered:
+            try:
+                spec = official_for_digest(dataset.kind, dataset.sha256, dataset.byte_size)
+                if self.tool_handlers is None:
+                    continue
+                manifest = await asyncio.to_thread(self.tool_handlers.workspace_file_manifest, dataset.artifact_uri)
+                if (manifest["sha256"], manifest["byte_size"]) != (spec.sha256, spec.byte_size):
+                    continue
+            except (JobExecutionError, OSError):
+                continue
+            official.append(dataset.model_copy(update={"name": spec.name, "source_uri": spec.url,
+                "revision": spec.revision, "metadata": spec.metadata()}))
+        return DatasetList(data=official)
 
     async def delete_dataset(self, dataset_id: UUID) -> None:
         try:
@@ -1167,6 +1220,14 @@ class ServerService:
                 "evaluations_not_comparable",
                 "evaluations must have matching kind, dataset, and execution parameters",
             )
+        for item in evaluations:
+            if item.kind in {"perplexity", "accuracy_benchmark"}:
+                manifest = item.dataset_manifest
+                try:
+                    official_for_digest("wikitext2" if item.kind == "perplexity" else "custom",
+                        manifest.get("source_sha256", manifest.get("sha256")), manifest.get("source_byte_size", manifest.get("byte_size")))
+                except JobExecutionError as error:
+                    raise ServiceError(409, "unofficial_evaluation", "legacy or custom dataset results cannot be compared as official evaluations") from error
         numeric_names = sorted(
             set.intersection(
                 *[
@@ -1336,7 +1397,7 @@ class ServerService:
         *,
         instance_id: UUID | None,
         level: RuntimeLogLevel | None,
-        after: int,
+        after: int | None,
         limit: int,
     ) -> RuntimeLogList:
         data = await asyncio.to_thread(

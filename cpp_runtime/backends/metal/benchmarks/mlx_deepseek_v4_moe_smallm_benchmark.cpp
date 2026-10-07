@@ -453,6 +453,7 @@ private:
             32,
             4,
             "mxfp4",
+            std::nullopt,
             false);
     }
 

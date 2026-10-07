@@ -332,6 +332,7 @@ private:
         std::shared_ptr<const std::vector<std::uint8_t>> payload;
         std::uint64_t epoch = 0;
         bool replace_existing = false;
+        std::vector<std::int64_t> tokens;
     };
 
     struct ParsedHeader {
@@ -393,6 +394,7 @@ public:
             std::filesystem::perm_options::replace,
             error);
         scan();
+        if (config_.max_disk_bytes > 0) write_identity();
         worker_ = std::thread([this] { writer_loop(); });
     }
 
@@ -546,6 +548,7 @@ public:
                 ++metrics_.deduplicated_writes;
                 return hash;
             }
+            schedule_tail_cleanup_locked(hash, parent, token_ids, token_count, extra_key);
             if (config_.max_disk_bytes == 0) {
                 if (!replace_existing && hot_.count(hash) != 0) {
                     ++metrics_.deduplicated_writes;
@@ -553,6 +556,7 @@ public:
                 }
                 put_hot_locked(hash, std::move(payload));
                 if (hot_.count(hash) != 0) remember_tail_locked(hash, parent, token_count);
+                prune_tail_cleanup_locked();
                 sync_metrics_locked();
                 return hash;
             }
@@ -590,6 +594,7 @@ public:
                     std::move(payload),
                     write_epoch,
                     replace_existing,
+                    std::vector<std::int64_t>(token_ids, token_ids + token_count),
                 });
                 pending_[hash] = writes_.back().payload;
             }
@@ -606,6 +611,7 @@ public:
                 std::move(payload),
                 write_epoch,
                 replace_existing,
+                std::vector<std::int64_t>(token_ids, token_ids + token_count),
             };
             bool success = false;
             try {
@@ -636,6 +642,7 @@ public:
         std::vector<LoadRequest> requests;
         requests.reserve(hashes.size());
         std::uint64_t load_epoch = 0;
+        std::size_t payload_bytes = 0;
         try {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -643,6 +650,7 @@ public:
                 for (const auto& hash : hashes) {
                     const auto hot = hot_.find(hash);
                     if (hot != hot_.end()) {
+                        payload_bytes += hot->second.payload->size();
                         requests.push_back(LoadRequest{
                             hash,
                             LoadSource::Hot,
@@ -653,6 +661,7 @@ public:
                     }
                     const auto queued = pending_.find(hash);
                     if (queued != pending_.end()) {
+                        payload_bytes += queued->second->size();
                         requests.push_back(LoadRequest{
                             hash,
                             LoadSource::Pending,
@@ -663,6 +672,7 @@ public:
                     }
                     const auto found = disk_.find(hash);
                     if (found == disk_.end()) break;
+                    payload_bytes += found->second.payload_bytes;
                     requests.push_back(LoadRequest{
                         hash,
                         LoadSource::Disk,
@@ -675,6 +685,8 @@ public:
                     ++found->second.pins;
                 }
             }
+
+            if (config_.reserve_memory) config_.reserve_memory(payload_bytes);
 
             std::vector<std::optional<std::vector<std::uint8_t>>> cold_payloads(
                 requests.size());
@@ -738,7 +750,16 @@ public:
                 auto& request = requests[index];
                 if (request.source == LoadSource::Disk) {
                     if (!cold_payloads[index]) {
-                        erase_corrupt_locked(request.hash);
+                        std::error_code error;
+                        if (!std::filesystem::exists(request.path, error) && !error) {
+                            const auto stale = disk_.find(request.hash);
+                            if (stale != disk_.end()) {
+                                disk_bytes_ -= stale->second.file_bytes;
+                                disk_.erase(stale);
+                                forget_tail_if_unused_locked(request.hash);
+                                ++metrics_.evictions;
+                            }
+                        } else erase_corrupt_locked(request.hash);
                         break;
                     }
                     request.payload =
@@ -758,6 +779,12 @@ public:
                         }
                     }
                     ++metrics_.hot_hits;
+                }
+                const auto durable = disk_.find(request.hash);
+                if (durable != disk_.end()) {
+                    std::error_code error;
+                    std::filesystem::last_write_time(durable->second.path,
+                        std::filesystem::file_time_type::clock::now(), error);
                 }
                 result.push_back(std::move(request.payload));
             }
@@ -811,11 +838,52 @@ public:
         return released;
     }
 
+    std::uint64_t set_hot_limit(std::uint64_t max_bytes) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        config_.max_hot_bytes = max_bytes;
+        metrics_.hot_pressure_bytes = 0;
+        const auto released = trim_hot_locked(max_bytes);
+        sync_metrics_locked();
+        return released;
+    }
+
     void flush() {
         std::unique_lock<std::mutex> lock(mutex_);
         writes_finished_.wait(lock, [this] {
             return writes_.empty() && active_writes_ == 0;
         });
+    }
+
+    std::uint64_t set_disk_limit(std::uint64_t max_bytes) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        writes_finished_.wait(lock, [this] { return writes_.empty() && active_writes_ == 0; });
+        config_.max_disk_bytes = max_bytes;
+        if (max_bytes > 0) write_identity();
+        const auto before = disk_bytes_;
+        enforce_disk_budget_locked();
+        return before - disk_bytes_;
+    }
+
+    std::size_t refresh_disk_index() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        writes_finished_.wait(lock, [this] { return writes_.empty() && active_writes_ == 0; });
+        std::size_t removed = 0;
+        for (auto entry = disk_.begin(); entry != disk_.end();) {
+            std::error_code error;
+            if (std::filesystem::exists(entry->second.path, error) || error) { ++entry; continue; }
+            const auto hash = entry->first;
+            disk_bytes_ -= entry->second.file_bytes;
+            entry = disk_.erase(entry);
+            const auto hot = hot_.find(hash);
+            if (hot != hot_.end()) {
+                hot_bytes_ -= hot->second.payload->size();
+                hot_.erase(hot);
+            }
+            forget_tail_if_unused_locked(hash);
+            ++removed;
+        }
+        sync_metrics_locked();
+        return removed;
     }
 
     std::size_t clear() {
@@ -831,9 +899,11 @@ public:
             (void)hash;
             std::error_code error;
             if (std::filesystem::remove(entry.path, error) && !error) ++removed;
+            remove_text(entry.path);
         }
         disk_.clear();
         hot_.clear();
+        tail_cleanup_.clear();
         pending_.clear();
         pins_.clear();
         tail_lengths_.clear();
@@ -860,6 +930,12 @@ public:
         result.pending_writes = pending_.size();
         result.pending_bytes = pending_write_bytes_;
         result.pending_max_bytes = config_.max_pending_bytes;
+        result.resident_bytes = hot_bytes_;
+        for (const auto& [hash, entry] : hot_) result.resident_bytes += entry.payload->capacity() - entry.payload->size();
+        for (const auto& [hash, payload] : pending_) {
+            const auto hot = hot_.find(hash);
+            if (hot == hot_.end() || hot->second.payload != payload) result.resident_bytes += payload->capacity();
+        }
         return result;
     }
 
@@ -867,6 +943,37 @@ private:
     std::filesystem::path path_for(const BlockHash& hash) const {
         const auto text = block_hash_hex(hash);
         return namespace_dir_ / text.substr(0, 2) / (text + ".mfqkv");
+    }
+
+    static void remove_text(const std::filesystem::path& block) {
+        std::error_code error;
+        std::filesystem::remove(block.string() + ".tokens", error);
+    }
+
+    void write_text(const WriteRequest& request) {
+        const auto target = path_for(request.hash).string() + ".tokens";
+        const auto temporary = target + ".tmp." + std::to_string(monotonic_tick());
+        std::vector<std::uint8_t> bytes;
+        bytes.reserve(request.tokens.size() * 8);
+        for (const auto token : request.tokens) for (std::size_t i = 0; i < 8; ++i)
+            bytes.push_back(static_cast<std::uint8_t>(static_cast<std::uint64_t>(token) >> (i * 8)));
+        const auto checksum = sha256(bytes.data(), bytes.size());
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output) return;
+        output.write("MFQTXT1\0", 8);
+        output.write(reinterpret_cast<const char*>(compatibility_hash_.data()), 32);
+        output.write(reinterpret_cast<const char*>(request.hash.data()), 32);
+        write_little_endian(output, static_cast<std::uint32_t>(request.tokens.size()));
+        output.write(reinterpret_cast<const char*>(checksum.data()), 32);
+        output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        output.close();
+        std::error_code error;
+        if (output) {
+            std::filesystem::permissions(temporary, std::filesystem::perms::owner_read |
+                std::filesystem::perms::owner_write, std::filesystem::perm_options::replace, error);
+            if (!error) std::filesystem::rename(temporary, target, error);
+        }
+        std::filesystem::remove(temporary, error);
     }
 
     bool read_header(
@@ -947,6 +1054,16 @@ private:
         std::error_code error;
         std::filesystem::create_directories(final_path.parent_path(), error);
         if (error) return false;
+        const auto space = std::filesystem::space(final_path.parent_path(), error);
+        const auto bytes = static_cast<std::uint64_t>(request.payload->size());
+        const auto overhead = kHeaderBytes + 108 + request.tokens.size() * 8;
+        if (error || space.available < config_.min_disk_free_bytes ||
+            space.available - config_.min_disk_free_bytes < overhead ||
+            bytes > space.available - config_.min_disk_free_bytes - overhead) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++metrics_.low_disk_space_skips;
+            return false;
+        }
         const auto temporary = final_path.parent_path() /
             (".mfqkv.tmp." + std::to_string(monotonic_tick()) + "." +
              std::to_string(temp_counter_.fetch_add(1)));
@@ -1030,6 +1147,26 @@ private:
         return true;
     }
 
+    void write_identity() {
+        const auto target = namespace_dir_ / "identity.txt";
+        const auto temporary = namespace_dir_ / (".identity.tmp." + std::to_string(monotonic_tick()));
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output) return;
+        const auto end = config_.compatibility_key.find("\ntensor=");
+        output << "mfq-cache-identity-v1\nnamespace=" << block_hash_hex(compatibility_hash_) << '\n'
+            << config_.compatibility_key.substr(0, std::min<std::size_t>(end, 30000)) << '\n';
+        const auto model = config_.model_path.string();
+        if (model.find_first_of("\r\n") == std::string::npos) output << "model_path=" << model << '\n';
+        output.close();
+        std::error_code error;
+        if (output) {
+            std::filesystem::permissions(temporary, std::filesystem::perms::owner_read |
+                std::filesystem::perms::owner_write, std::filesystem::perm_options::replace, error);
+            if (!error) std::filesystem::rename(temporary, target, error);
+        }
+        std::filesystem::remove(temporary, error);
+    }
+
     void finish_write(const WriteRequest& request, bool success) {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto pending = pending_.find(request.hash);
@@ -1042,6 +1179,7 @@ private:
             pending_.erase(pending);
         }
         if (success && request.epoch == cache_epoch_) {
+            try { write_text(request); } catch (...) {}
             const auto path = path_for(request.hash);
             std::error_code error;
             const auto file_bytes = std::filesystem::file_size(path, error);
@@ -1075,9 +1213,11 @@ private:
             std::error_code error;
             const auto path = path_for(request.hash);
             std::filesystem::remove(path, error);
+            remove_text(path);
             sync_directory_best_effort(path.parent_path());
         }
         forget_tail_if_unused_locked(request.hash);
+        prune_tail_cleanup_locked();
         sync_metrics_locked();
         writes_finished_.notify_all();
     }
@@ -1142,6 +1282,7 @@ private:
             const auto reject = [&] {
                 std::error_code remove_error;
                 std::filesystem::remove(iterator->path(), remove_error);
+                remove_text(iterator->path());
                 ++metrics_.corrupt_blocks;
             };
             std::error_code symlink_error;
@@ -1218,6 +1359,9 @@ private:
             hot_bytes_ -= previous->second.payload->size();
             hot_.erase(previous);
         }
+        const auto needed = hot_bytes_ + payload->size();
+        if (needed > config_.max_hot_bytes)
+            metrics_.hot_pressure_bytes = std::max(metrics_.hot_pressure_bytes, needed);
         if (config_.max_hot_bytes == 0 ||
             payload->size() > config_.max_hot_bytes) {
             sync_metrics_locked();
@@ -1262,6 +1406,7 @@ private:
         if (found != disk_.end()) {
             std::error_code error;
             std::filesystem::remove(found->second.path, error);
+            remove_text(found->second.path);
             disk_bytes_ -= found->second.file_bytes;
             disk_.erase(found);
             removed = true;
@@ -1328,6 +1473,7 @@ private:
             std::error_code error;
             std::filesystem::remove(victim->second.path, error);
             if (error) break;
+            remove_text(victim->second.path);
             disk_bytes_ -= victim->second.file_bytes;
             // Disk and RAM are independent tiers. A hot payload remains a
             // valid content-addressed hit after its durable copy is evicted.
@@ -1337,6 +1483,60 @@ private:
             ++metrics_.evictions;
         }
         sync_metrics_locked();
+    }
+
+    void schedule_tail_cleanup_locked(const BlockHash& hash, const BlockHash& parent,
+        const std::int64_t* tokens, std::size_t count, std::string_view extra_key) {
+        if (config_.retain_tail_versions == 0 || count > config_.block_size_tokens) return;
+        const auto tails = tail_lengths_.find(parent);
+        if (tails == tail_lengths_.end()) return;
+        std::size_t retained = 1;
+        auto& victims = tail_cleanup_[hash];
+        for (auto length = tails->second.rbegin(); length != tails->second.rend(); ++length) {
+            if (length->first >= count) continue;
+            const auto previous = block_hash(parent, tokens, length->first, extra_key);
+            if (tail_metadata_.count(previous) == 0) continue;
+            if (retained++ >= config_.retain_tail_versions) victims.push_back(previous);
+        }
+        if (victims.empty()) tail_cleanup_.erase(hash);
+    }
+
+    void prune_tail_cleanup_locked() {
+        for (auto entry = tail_cleanup_.begin(); entry != tail_cleanup_.end();) {
+            if (config_.max_disk_bytes != 0 && disk_.count(entry->first) == 0) {
+                if (pending_.count(entry->first) != 0) { ++entry; continue; }
+                entry = tail_cleanup_.erase(entry);
+                continue;
+            }
+            if (config_.max_disk_bytes == 0 && hot_.count(entry->first) == 0) {
+                entry = tail_cleanup_.erase(entry);
+                continue;
+            }
+            auto& victims = entry->second;
+            for (auto victim = victims.begin(); victim != victims.end();) {
+                auto disk = disk_.find(*victim);
+                if (pending_.count(*victim) != 0 || pins_.count(*victim) != 0 ||
+                    (disk != disk_.end() && disk->second.pins != 0)) { ++victim; continue; }
+                if (disk != disk_.end()) {
+                    std::error_code error;
+                    std::filesystem::remove(disk->second.path, error);
+                    if (error) { ++victim; continue; }
+                    remove_text(disk->second.path);
+                    disk_bytes_ -= disk->second.file_bytes;
+                    disk_.erase(disk);
+                }
+                auto hot = hot_.find(*victim);
+                if (hot != hot_.end()) {
+                    hot_bytes_ -= hot->second.payload->size();
+                    hot_.erase(hot);
+                }
+                forget_tail_if_unused_locked(*victim);
+                ++metrics_.superseded_blocks;
+                victim = victims.erase(victim);
+            }
+            if (victims.empty()) entry = tail_cleanup_.erase(entry);
+            else ++entry;
+        }
     }
 
     void remember_tail_locked(const BlockHash& hash, const BlockHash& parent,
@@ -1387,6 +1587,7 @@ private:
     std::unordered_map<BlockHash, std::size_t, HashHasher> pins_;
     std::unordered_map<BlockHash, std::map<std::size_t, std::size_t>, HashHasher> tail_lengths_;
     std::unordered_map<BlockHash, std::pair<BlockHash, std::size_t>, HashHasher> tail_metadata_;
+    std::unordered_map<BlockHash, std::vector<BlockHash>, HashHasher> tail_cleanup_;
     std::uint64_t disk_bytes_ = 0;
     std::uint64_t hot_bytes_ = 0;
     std::uint64_t pending_write_bytes_ = 0;
@@ -1483,6 +1684,18 @@ void PagedPrefixCache::pin(const std::vector<BlockHash>& blocks) {
 
 void PagedPrefixCache::unpin(const std::vector<BlockHash>& blocks) {
     implementation_->unpin(blocks);
+}
+
+std::uint64_t PagedPrefixCache::set_hot_limit(std::uint64_t max_bytes) {
+    return implementation_->set_hot_limit(max_bytes);
+}
+
+std::uint64_t PagedPrefixCache::set_disk_limit(std::uint64_t max_bytes) {
+    return implementation_->set_disk_limit(max_bytes);
+}
+
+std::size_t PagedPrefixCache::refresh_disk_index() {
+    return implementation_->refresh_disk_index();
 }
 
 std::uint64_t PagedPrefixCache::trim_hot(std::uint64_t target_bytes) {

@@ -593,6 +593,74 @@ void test_mixed_q_bits_inference() {
     }
 }
 
+void test_dequantize_vector_rows_and_tails() {
+    for (int group_size : {4, 24, 48, 5}) {
+        for (int input_size : {1, group_size * 2 - 3, group_size * 2 + 1}) {
+            const int groups = (input_size + group_size - 1) / group_size;
+            for (int bits = 0; bits <= 8; ++bits) {
+                const auto fixture = bits == 0
+                    ? make_mixed_q_bits_blob(16, group_size, groups, input_size)
+                    : make_nint_blob(bits, 16, group_size, groups, input_size, 17);
+                auto weight = mfq::metal::MlxNintWeight::from_blob(fixture.blob);
+                for (auto dtype : {mlx::core::float16, mlx::core::float32}) {
+                    auto dense = mlx::core::astype(weight.dequantize(dtype), mlx::core::float32);
+                    dense.eval();
+                    for (int row = 0; row < 16; ++row) {
+                        for (int column = 0; column < input_size; ++column) {
+                            require_close(dense.data<float>()[row * input_size + column],
+                                fixture.quantized[row * groups * group_size + column], 0.0f);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+void test_packed_prefill_group_sizes_and_mixed_q() {
+    using namespace mlx::core;
+    for (const int group_size : {4, 24, 28, 48, 5}) {
+        for (const int input_size : {3, 193}) {
+            const int groups = (input_size + group_size - 1) / group_size;
+            for (int bits = 0; bits <= 9; ++bits) {
+                const auto fixture = bits == 0
+                    ? make_mixed_q_bits_blob(65, group_size, groups, input_size)
+                    : bits == 9
+                        ? make_mixed_q_bits_blob(65, group_size, groups, input_size, 7, 2)
+                        : make_nint_blob(bits, 65, group_size, groups, input_size, 17);
+                const auto weight = mfq::metal::MlxNintWeight::from_blob(fixture.blob);
+                const auto dense = weight.dequantize(float16);
+                eval(dense);
+                for (const int rows : {7, 16, 25, 33, 54, 64, 129}) {
+                    std::vector<float> values(rows * input_size);
+                    for (std::size_t i = 0; i < values.size(); ++i)
+                        values[i] = float(int(i % 17) - 8) / 4096.0f;
+                    const auto input = astype(array(values.begin(), Shape{rows, input_size}), float16);
+                    const auto expected = matmul(input, transpose(dense));
+                    const auto actual = weight.matmul_packed(input);
+                    if (actual.shape() != expected.shape() || actual.dtype() != float16)
+                        throw std::runtime_error("packed NINT prefill metadata mismatch");
+                    auto error = max(abs(astype(actual, float32) - astype(expected, float32)));
+                    eval(error);
+                    if (error.item<float>() != 0.0f)
+                        throw std::runtime_error("packed NINT prefill mismatch: GS=" +
+                            std::to_string(group_size) + " q=" + std::to_string(bits) +
+                            " K=" + std::to_string(input_size) + " M=" + std::to_string(rows) +
+                            " error=" + std::to_string(error.item<float>()));
+                    const auto ids = reshape(
+                        remainder(arange(rows, int32), array(65, int32)), Shape{1, rows});
+                    const auto embedded = weight.embedding(ids);
+                    const auto expected_embedding = take(dense, ids, 0);
+                    if (embedded.shape() != expected_embedding.shape() ||
+                        !all(equal(embedded, expected_embedding)).item<bool>()) {
+                        throw std::runtime_error("runtime-length NINT embedding mismatch");
+                    }
+                }
+            }
+        }
+    }
+}
+
 ScaledFixture make_nint_gs24_scaled_blob(
     int bits,
     std::int32_t output_size,
@@ -1427,6 +1495,8 @@ int main() {
         test_nint6_gs24_decode();
         test_mixed_sub_bits_loads_into_existing_kernel();
         test_mixed_q_bits_inference();
+        test_dequantize_vector_rows_and_tails();
+        test_packed_prefill_group_sizes_and_mixed_q();
         test_mixed_q_bits_gs24_small_m();
         test_mixed_q_bits_routed_reuses_matmul_kernel();
         test_nint4_swiglu();

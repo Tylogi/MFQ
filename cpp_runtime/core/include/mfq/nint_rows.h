@@ -19,6 +19,7 @@ public:
     std::size_t packed_nbytes() const noexcept { return packed_.size(); }
     const std::vector<std::uint8_t>& packed() const noexcept { return packed_; }
     const std::vector<std::uint32_t>& descriptors() const noexcept { return descriptors_; }
+    void append_batch(const NintRowBatch& other);
     void validate() const;
 private:
     friend class NintRows;

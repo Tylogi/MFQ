@@ -8,6 +8,7 @@ import { toast } from '../../stores/toastStore';
 import { useSettings } from '../settings/SettingsProvider';
 import type { DownloadOrigin } from './ModelBrowser';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
+import { useConnectionScope } from '../../app/useConnectionScope';
 
 export const isModelDownload = (job: JobResource) => job.kind === 'download.huggingface' || job.kind === 'download.modelscope';
 export const isActiveDownload = (job: JobResource) => ['queued', 'running', 'cancelling'].includes(job.status);
@@ -18,6 +19,7 @@ export function DownloadQueue({ jobs, onJobCreated }: {
   onJobCreated(job: JobResource, origin: DownloadOrigin): void;
 }) {
   const { tr } = useSettings();
+  const connectionScope = useConnectionScope();
   const addJob = useJobStore((state) => state.addJob);
   const [busyId, setBusyId] = useState<string | null>(null);
   const statusLabels: Record<JobResource['status'], string> = {
@@ -28,25 +30,30 @@ export function DownloadQueue({ jobs, onJobCreated }: {
   };
 
   async function act(job: JobResource, retry: boolean, origin: DownloadOrigin) {
+    const current = connectionScope();
     if (busyId) return;
     setBusyId(job.id);
     try {
-      if (retry) onJobCreated(await jobsApi.retryJob(job.id), origin);
-      else addJob(await jobsApi.cancelJob(job.id));
+      const next = retry ? await jobsApi.retryJob(job.id) : await jobsApi.cancelJob(job.id);
+      if (!current()) return;
+      if (retry) onJobCreated(next, origin); else addJob(next);
     } catch (cause) {
-      toast.error(errorMessage(cause));
+      if (current()) toast.error(errorMessage(cause));
     } finally {
-      setBusyId(null);
+      if (current()) setBusyId(null);
     }
   }
 
   async function remove(job: JobResource) {
+    const current = connectionScope();
+    if (busyId) return;
     setBusyId(job.id);
     try {
       await jobsApi.deleteJob(job.id);
+      if (!current()) return;
       useJobStore.getState().setJobs(useJobStore.getState().jobs.filter((item) => item.id !== job.id));
-    } catch (cause) { toast.error(errorMessage(cause)); }
-    finally { setBusyId(null); }
+    } catch (cause) { if (current()) toast.error(errorMessage(cause)); }
+    finally { if (current()) setBusyId(null); }
   }
 
   return (

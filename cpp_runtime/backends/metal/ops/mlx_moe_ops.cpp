@@ -22,6 +22,7 @@ constexpr int kMaximumExperts = 4096;
 constexpr int kMaximumRoutes = 16;
 
 constexpr const char* kTopKSource = R"METAL(
+    const uint ROWS = uint(logits_shape[0]);
     uint row = threadgroup_position_in_grid.x;
     uint tid = thread_index_in_threadgroup;
     if (row >= uint(ROWS)) {
@@ -70,6 +71,7 @@ constexpr const char* kTopKSource = R"METAL(
         transformed[expert] = value;
     }
     if (MODE == 0) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         partial[tid] = local_sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint stride = 128u; stride > 0u; stride >>= 1u) {
@@ -495,6 +497,7 @@ constexpr const char* kDenseHashRouterSource = R"METAL(
 )METAL";
 
 constexpr const char* kSqrtSoftplusSource = R"METAL(
+    const uint ROWS = uint(ids_shape[0]);
     uint lane = thread_index_in_simdgroup;
     uint row = thread_position_in_grid.x >> 5;
     if (row >= uint(ROWS)) {
@@ -517,6 +520,7 @@ constexpr const char* kSqrtSoftplusSource = R"METAL(
 )METAL";
 
 constexpr const char* kRepairHashIdsSource = R"METAL(
+    const uint ROWS = uint(static_ids_shape[0]);
     uint row = thread_position_in_grid.x;
     if (row >= uint(ROWS)) {
         return;
@@ -570,6 +574,7 @@ constexpr const char* kRepairHashIdsSource = R"METAL(
 )METAL";
 
 constexpr const char* kWeightedReduceSource = R"METAL(
+    const uint TOKENS = uint(weights_shape[0]);
     uint index = thread_position_in_grid.x;
     if (index >= uint(TOKENS * WIDTH)) {
         return;
@@ -586,6 +591,7 @@ constexpr const char* kWeightedReduceSource = R"METAL(
 )METAL";
 
 constexpr const char* kWeightedReduceSortedSource = R"METAL(
+    const uint TOKENS = uint(weights_shape[0]);
     uint index = thread_position_in_grid.x;
     if (index >= uint(TOKENS * WIDTH)) {
         return;
@@ -604,6 +610,7 @@ constexpr const char* kWeightedReduceSortedSource = R"METAL(
 )METAL";
 
 constexpr const char* kInversePermutationSource = R"METAL(
+    const int SIZE = order_shape[0];
     uint sorted_row = thread_position_in_grid.x;
     if (sorted_row >= uint(SIZE)) {
         return;
@@ -615,6 +622,7 @@ constexpr const char* kInversePermutationSource = R"METAL(
 )METAL";
 
 constexpr const char* kGluSplitSource = R"METAL(
+    const uint ROWS = uint(gate_up_shape[0]);
     uint index = thread_position_in_grid.x;
     if (index >= uint(ROWS * WIDTH)) {
         return;
@@ -641,17 +649,23 @@ constexpr const char* kGluSplitSource = R"METAL(
 )METAL";
 
 constexpr const char* kGluPairSource = R"METAL(
+    const uint SIZE = uint(gate_shape[0]);
     uint index = thread_position_in_grid.x;
     if (index >= uint(SIZE)) {
         return;
     }
-    float gate_value = min(float(gate[index]), params[0]);
-    float up_value = clamp(float(up[index]), -params[0], params[0]);
+    float gate_value = float(gate[index]);
+    float up_value = float(up[index]);
+    if (HAS_LIMIT != 0) {
+        gate_value = min(gate_value, params[0]);
+        up_value = clamp(up_value, -params[0], params[0]);
+    }
     float activated = gate_value / (1.0f + exp(-gate_value));
     output[index] = T(activated * up_value);
 )METAL";
 
 constexpr const char* kSharedGateSource = R"METAL(
+    const uint TOKENS = uint(routed_shape[0]);
     uint index = thread_position_in_grid.x;
     if (index >= uint(TOKENS * WIDTH)) {
         return;
@@ -663,6 +677,7 @@ constexpr const char* kSharedGateSource = R"METAL(
 )METAL";
 
 constexpr const char* kReduceSharedGateSource = R"METAL(
+    const uint TOKENS = uint(weights_shape[0]);
     uint index = thread_position_in_grid.x;
     if (index >= uint(TOKENS * WIDTH)) {
         return;
@@ -682,6 +697,7 @@ constexpr const char* kReduceSharedGateSource = R"METAL(
 )METAL";
 
 constexpr const char* kReduceSharedGateSortedSource = R"METAL(
+    const uint TOKENS = uint(weights_shape[0]);
     uint index = thread_position_in_grid.x;
     if (index >= uint(TOKENS * WIDTH)) {
         return;
@@ -703,6 +719,7 @@ constexpr const char* kReduceSharedGateSortedSource = R"METAL(
 )METAL";
 
 constexpr const char* kExpertScaleSource = R"METAL(
+    const uint SIZE = uint(weights_shape[0]);
     uint index = thread_position_in_grid.x;
     if (index >= uint(SIZE)) {
         return;
@@ -1057,14 +1074,13 @@ array glu_split(
     output_shape.push_back(width);
     const array params({limit}, mlx::core::float32);
     auto outputs = glu_split_kernel()(
-        {values, params},
+        {mlx::core::reshape(values, Shape{rows, 2 * width}), params},
         {std::move(output_shape)},
         {values.dtype()},
         {size, 1, 1},
         {std::min(kThreads, size), 1, 1},
         {
             {"T", values.dtype()},
-            {"ROWS", rows},
             {"WIDTH", width},
             {"GEGLU", static_cast<int>(geglu)},
             {"HAS_LIMIT", static_cast<int>(limit > 0.0f)},
@@ -1212,7 +1228,6 @@ MlxMoeTopKResult moe_topk(
         {kThreads, 1, 1},
         {
             {"T", values.dtype()},
-            {"ROWS", rows},
             {"EXPERTS", experts},
             {"TOP_K", top_k},
             {"MODE", mode},
@@ -1625,7 +1640,6 @@ array moe_selected_sqrtsoftplus_weights(
         {32, 1, 1},
         {
             {"T", values.dtype()},
-            {"ROWS", rows},
             {"EXPERTS", experts},
             {"TOP_K", top_k},
             {"NORMALIZE", static_cast<int>(normalize)},
@@ -1683,7 +1697,6 @@ array moe_repair_hash_ids(
         {rows, 1, 1},
         {std::min(kThreads, rows), 1, 1},
         {
-            {"ROWS", rows},
             {"TOP_K", top_k},
             {"CANDIDATES", candidate_count},
             {"EXPERTS", experts},
@@ -1722,7 +1735,6 @@ array moe_weighted_reduce(
         {std::min(kThreads, size), 1, 1},
         {
             {"T", pairs.dtype()},
-            {"TOKENS", tokens},
             {"ROUTES", routes},
             {"WIDTH", width},
         },
@@ -1766,7 +1778,6 @@ array moe_weighted_reduce_sorted(
         {std::min(kThreads, size), 1, 1},
         {
             {"T", pairs.dtype()},
-            {"TOKENS", tokens},
             {"ROUTES", routes},
             {"WIDTH", width},
         },
@@ -1791,7 +1802,7 @@ array moe_inverse_permutation(const array& order) {
         {mlx::core::int32},
         {size, 1, 1},
         {std::min(kThreads, size), 1, 1},
-        {{"SIZE", size}},
+        {},
         std::nullopt,
         false,
         {});
@@ -1808,7 +1819,7 @@ array moe_limited_swiglu_split(
     return glu_split(gate_up, false, limit);
 }
 
-array moe_limited_swiglu_pair(
+static array swiglu_pair(
     const array& gate,
     const array& up,
     float limit) {
@@ -1819,9 +1830,9 @@ array moe_limited_swiglu_pair(
         throw std::invalid_argument(
             "Gate and Up must have matching non-empty shapes");
     }
-    if (!std::isfinite(limit) || limit <= 0.0f) {
+    if (!std::isfinite(limit) || limit < 0.0f) {
         throw std::invalid_argument(
-            "limited SwiGLU pair limit must be finite and positive");
+            "SwiGLU pair limit must be finite and non-negative");
     }
     if (up_values.dtype() != gate_values.dtype()) {
         up_values = mlx::core::contiguous(
@@ -1832,16 +1843,35 @@ array moe_limited_swiglu_pair(
         "paired GLU element count");
     const array params({limit}, mlx::core::float32);
     auto outputs = glu_pair_kernel()(
-        {gate_values, up_values, params},
+        {
+            mlx::core::reshape(gate_values, Shape{size}),
+            mlx::core::reshape(up_values, Shape{size}),
+            params,
+        },
         {gate_values.shape()},
         {gate_values.dtype()},
         {size, 1, 1},
         {std::min(kThreads, size), 1, 1},
-        {{"T", gate_values.dtype()}, {"SIZE", size}},
+        {{"T", gate_values.dtype()}, {"HAS_LIMIT", int(limit > 0.0f)}},
         std::nullopt,
         false,
         {});
     return std::move(outputs.front());
+}
+
+array moe_swiglu_pair(const array& gate, const array& up) {
+    return swiglu_pair(gate, up, 0.0f);
+}
+
+array moe_limited_swiglu_pair(
+    const array& gate,
+    const array& up,
+    float limit) {
+    if (!std::isfinite(limit) || limit <= 0.0f) {
+        throw std::invalid_argument(
+            "limited SwiGLU pair limit must be finite and positive");
+    }
+    return swiglu_pair(gate, up, limit);
 }
 
 array moe_geglu_split(const array& gate_up) {
@@ -1884,7 +1914,6 @@ array moe_add_shared_gate(
         {std::min(kThreads, size), 1, 1},
         {
             {"T", routed_values.dtype()},
-            {"TOKENS", tokens},
             {"WIDTH", width},
         },
         std::nullopt,
@@ -1932,7 +1961,6 @@ array moe_weighted_reduce_shared_gate(
         {std::min(kThreads, size), 1, 1},
         {
             {"T", pairs.dtype()},
-            {"TOKENS", tokens},
             {"ROUTES", routes},
             {"WIDTH", width},
         },
@@ -1985,7 +2013,6 @@ array moe_weighted_reduce_shared_gate_sorted(
         {std::min(kThreads, size), 1, 1},
         {
             {"T", pairs.dtype()},
-            {"TOKENS", tokens},
             {"ROUTES", routes},
             {"WIDTH", width},
         },
@@ -2013,12 +2040,16 @@ array moe_apply_expert_scale(
         values.size(),
         "expert scale size");
     auto outputs = expert_scale_kernel()(
-        {values, selected, expert_scales},
+        {
+            mlx::core::reshape(values, Shape{size}),
+            mlx::core::reshape(selected, Shape{size}),
+            expert_scales,
+        },
         {values.shape()},
         {mlx::core::float32},
         {size, 1, 1},
         {std::min(kThreads, size), 1, 1},
-        {{"SIZE", size}},
+        {},
         std::nullopt,
         false,
         {});

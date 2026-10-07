@@ -20,6 +20,14 @@ mlx::core::array mlx_sparse_indexer_topk512(
     int query_offset,
     int block_size);
 
+mlx::core::array mlx_qsa_prefill_attention(
+    const mlx::core::array& query,
+    const mlx::core::array& key,
+    const mlx::core::array& value,
+    const mlx::core::array& index_query,
+    const mlx::core::array& pooled_index_keys,
+    int query_offset);
+
 // Common selected-block sparse-attention seam for Metal runtimes. Model
 // adapters own index construction and cache semantics; this operator owns the
 // direct indexed GQA execution. Blocks identify fixed-width, chronological

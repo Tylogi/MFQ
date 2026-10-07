@@ -1308,7 +1308,9 @@
           "kind": {
             "enum": [
               "perplexity",
-              "kernel_benchmark"
+              "kernel_benchmark",
+              "inference_benchmark",
+              "accuracy_benchmark"
             ],
             "title": "Kind",
             "type": "string"
@@ -1344,6 +1346,54 @@
           "created_at"
         ],
         "title": "EvaluationResultResource",
+        "type": "object"
+      },
+      "EvaluationToolsResource": {
+        "additionalProperties": false,
+        "properties": {
+          "accuracy_available": {
+            "default": false,
+            "title": "Accuracy Available",
+            "type": "boolean"
+          },
+          "api_base": {
+            "title": "Api Base",
+            "type": "string"
+          },
+          "benchmark_available": {
+            "title": "Benchmark Available",
+            "type": "boolean"
+          },
+          "quality_available": {
+            "title": "Quality Available",
+            "type": "boolean"
+          },
+          "task_benchmarks": {
+            "additionalProperties": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Task Benchmarks",
+            "type": "object"
+          },
+          "workspace_root": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace Root"
+          }
+        },
+        "required": [
+          "api_base",
+          "quality_available",
+          "benchmark_available"
+        ],
+        "title": "EvaluationToolsResource",
         "type": "object"
       },
       "ForkSessionRequest": {
@@ -1629,6 +1679,14 @@
               }
             ],
             "title": "Weight Bytes"
+          },
+          "weight_bytes_by_dtype": {
+            "additionalProperties": {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "title": "Weight Bytes By Dtype",
+            "type": "object"
           }
         },
         "required": [
@@ -1658,6 +1716,16 @@
               }
             ],
             "title": "Author"
+          },
+          "cache_profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelCacheProfile"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "description": {
             "anyOf": [
@@ -1725,6 +1793,27 @@
             },
             "title": "Modalities",
             "type": "array"
+          },
+          "mtp_supported": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mtp Supported"
+          },
+          "parameter_breakdown": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelParameterBreakdown"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "parameter_count": {
             "anyOf": [
@@ -1976,6 +2065,18 @@
           },
           "configuration": {
             "$ref": "#/components/schemas/ModelConfigurationStatus"
+          },
+          "estimated_resident_weight_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Resident Weight Bytes"
           },
           "files": {
             "items": {
@@ -3126,6 +3227,18 @@
             ],
             "title": "Error"
           },
+          "estimated_resident_weight_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Resident Weight Bytes"
+          },
           "format": {
             "default": "mfq",
             "enum": [
@@ -3171,6 +3284,18 @@
             "title": "Shard Count",
             "type": "integer"
           },
+          "ssd_ple_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ssd Ple Bytes"
+          },
           "tensor_count": {
             "minimum": 0.0,
             "title": "Tensor Count",
@@ -3195,6 +3320,70 @@
           "modified_at"
         ],
         "title": "ModelArtifactResource",
+        "type": "object"
+      },
+      "ModelCacheComponent": {
+        "additionalProperties": false,
+        "properties": {
+          "allocation": {
+            "default": "exact",
+            "enum": [
+              "exact",
+              "power_of_two"
+            ],
+            "title": "Allocation",
+            "type": "string"
+          },
+          "bytes_per_row": {
+            "exclusiveMinimum": 0.0,
+            "title": "Bytes Per Row",
+            "type": "integer"
+          },
+          "minimum_rows": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Minimum Rows",
+            "type": "integer"
+          },
+          "tokens_per_row": {
+            "default": 1,
+            "minimum": 1.0,
+            "title": "Tokens Per Row",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "bytes_per_row"
+        ],
+        "title": "ModelCacheComponent",
+        "type": "object"
+      },
+      "ModelCacheProfile": {
+        "additionalProperties": false,
+        "properties": {
+          "components": {
+            "items": {
+              "$ref": "#/components/schemas/ModelCacheComponent"
+            },
+            "title": "Components",
+            "type": "array"
+          },
+          "fixed_bytes": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Fixed Bytes",
+            "type": "integer"
+          },
+          "max_context": {
+            "minimum": 1.0,
+            "title": "Max Context",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "max_context"
+        ],
+        "title": "ModelCacheProfile",
         "type": "object"
       },
       "ModelCapabilities": {
@@ -3314,9 +3503,36 @@
         "title": "ModelDirectoryEntry",
         "type": "object"
       },
+      "ModelDirectoryFile": {
+        "additionalProperties": false,
+        "properties": {
+          "byte_size": {
+            "minimum": 0.0,
+            "title": "Byte Size",
+            "type": "integer"
+          },
+          "name": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "byte_size"
+        ],
+        "title": "ModelDirectoryFile",
+        "type": "object"
+      },
       "ModelDirectoryList": {
         "additionalProperties": false,
         "properties": {
+          "can_open_in_finder": {
+            "default": false,
+            "title": "Can Open In Finder",
+            "type": "boolean"
+          },
           "current_id": {
             "anyOf": [
               {
@@ -3359,6 +3575,13 @@
               "$ref": "#/components/schemas/ModelDirectoryEntry"
             },
             "title": "Data",
+            "type": "array"
+          },
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/ModelDirectoryFile"
+            },
+            "title": "Files",
             "type": "array"
           },
           "model_file_count": {
@@ -3604,6 +3827,51 @@
         "title": "ModelLoadRequest",
         "type": "object"
       },
+      "ModelParameterBreakdown": {
+        "additionalProperties": false,
+        "properties": {
+          "active": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active"
+          },
+          "dense": {
+            "minimum": 0.0,
+            "title": "Dense",
+            "type": "integer"
+          },
+          "ple": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Ple",
+            "type": "integer"
+          },
+          "routed_experts": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Routed Experts",
+            "type": "integer"
+          },
+          "total": {
+            "minimum": 0.0,
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "dense"
+        ],
+        "title": "ModelParameterBreakdown",
+        "type": "object"
+      },
       "ModelUnloadRequest": {
         "additionalProperties": false,
         "properties": {
@@ -3658,6 +3926,117 @@
         "title": "NamedToolChoiceFunction",
         "type": "object"
       },
+      "OfficialDatasetList": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/OfficialDatasetResource"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "OfficialDatasetList",
+        "type": "object"
+      },
+      "OfficialDatasetResource": {
+        "additionalProperties": false,
+        "properties": {
+          "byte_size": {
+            "title": "Byte Size",
+            "type": "integer"
+          },
+          "filename": {
+            "title": "Filename",
+            "type": "string"
+          },
+          "format": {
+            "default": "parquet",
+            "title": "Format",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "wikitext2",
+              "custom"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "license": {
+            "title": "License",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "origin": {
+            "default": "huggingface",
+            "enum": [
+              "huggingface",
+              "github"
+            ],
+            "title": "Origin",
+            "type": "string"
+          },
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "rows": {
+            "title": "Rows",
+            "type": "integer"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "split": {
+            "default": "test",
+            "title": "Split",
+            "type": "string"
+          },
+          "task": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "kind",
+          "repository",
+          "revision",
+          "filename",
+          "sha256",
+          "byte_size",
+          "rows",
+          "license"
+        ],
+        "title": "OfficialDatasetResource",
+        "type": "object"
+      },
       "OfficialModelInfo": {
         "additionalProperties": false,
         "properties": {
@@ -3678,6 +4057,16 @@
             "minLength": 1,
             "title": "Architecture",
             "type": "string"
+          },
+          "cache_profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelCacheProfile"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "capabilities": {
             "items": {
@@ -3744,11 +4133,32 @@
             "title": "Modalities",
             "type": "array"
           },
+          "mtp_supported": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mtp Supported"
+          },
           "name": {
             "maxLength": 255,
             "minLength": 1,
             "title": "Name",
             "type": "string"
+          },
+          "parameter_breakdown": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelParameterBreakdown"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "parameter_label": {
             "anyOf": [
@@ -3910,6 +4320,34 @@
         "title": "OfficialModelSource",
         "type": "object"
       },
+      "OpenModelDirectoryRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "directory_id": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Directory Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "directory_id"
+        ],
+        "title": "OpenModelDirectoryRequest",
+        "type": "object"
+      },
+      "OpenModelDirectoryResult": {
+        "additionalProperties": false,
+        "properties": {
+          "opened": {
+            "const": true,
+            "default": true,
+            "title": "Opened",
+            "type": "boolean"
+          }
+        },
+        "title": "OpenModelDirectoryResult",
+        "type": "object"
+      },
       "OperationAccepted": {
         "additionalProperties": false,
         "properties": {
@@ -4044,6 +4482,115 @@
           "created_at"
         ],
         "title": "PortableMessage",
+        "type": "object"
+      },
+      "ProbabilityScore": {
+        "additionalProperties": false,
+        "properties": {
+          "log_likelihood": {
+            "title": "Log Likelihood",
+            "type": "number"
+          },
+          "token_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Token Ids",
+            "type": "array"
+          },
+          "token_logprobs": {
+            "items": {
+              "maximum": 1e-05,
+              "type": "number"
+            },
+            "title": "Token Logprobs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "token_ids",
+          "token_logprobs",
+          "log_likelihood"
+        ],
+        "title": "ProbabilityScore",
+        "type": "object"
+      },
+      "ProbabilityScoreRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "continuations": {
+            "items": {
+              "maxLength": 16384,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "minItems": 1,
+            "title": "Continuations",
+            "type": "array"
+          },
+          "instance_id": {
+            "format": "uuid",
+            "title": "Instance Id",
+            "type": "string"
+          },
+          "mode": {
+            "default": "continuation",
+            "enum": [
+              "continuation",
+              "next_token"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "prompt": {
+            "maxLength": 65536,
+            "minLength": 1,
+            "title": "Prompt",
+            "type": "string"
+          }
+        },
+        "required": [
+          "instance_id",
+          "prompt",
+          "continuations"
+        ],
+        "title": "ProbabilityScoreRequest",
+        "type": "object"
+      },
+      "ProbabilityScoreResult": {
+        "additionalProperties": false,
+        "properties": {
+          "log_base": {
+            "const": "e",
+            "title": "Log Base",
+            "type": "string"
+          },
+          "prompt_tokens": {
+            "minimum": 1.0,
+            "title": "Prompt Tokens",
+            "type": "integer"
+          },
+          "scores": {
+            "items": {
+              "$ref": "#/components/schemas/ProbabilityScore"
+            },
+            "title": "Scores",
+            "type": "array"
+          },
+          "tokenization": {
+            "const": "raw-no-special-tokens",
+            "title": "Tokenization",
+            "type": "string"
+          }
+        },
+        "required": [
+          "prompt_tokens",
+          "scores",
+          "log_base",
+          "tokenization"
+        ],
+        "title": "ProbabilityScoreResult",
         "type": "object"
       },
       "RealtimeFrame": {
@@ -5365,6 +5912,18 @@
         "title": "RuntimeIdentity",
         "type": "object"
       },
+      "RuntimeInferencePolicy": {
+        "additionalProperties": false,
+        "properties": {
+          "mtp_enabled": {
+            "default": true,
+            "title": "Mtp Enabled",
+            "type": "boolean"
+          }
+        },
+        "title": "RuntimeInferencePolicy",
+        "type": "object"
+      },
       "RuntimeInstanceList": {
         "additionalProperties": false,
         "properties": {
@@ -5684,6 +6243,18 @@
             ],
             "title": "Prefix Directory"
           },
+          "prefix_disk_limit_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prefix Disk Limit Bytes"
+          },
           "prefix_limit_bytes": {
             "anyOf": [
               {
@@ -5695,6 +6266,18 @@
               }
             ],
             "title": "Prefix Limit Bytes"
+          },
+          "total_limit_bytes": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Limit Bytes"
           }
         },
         "title": "RuntimeMemoryPolicy",
@@ -6007,6 +6590,25 @@
           }
         },
         "title": "RuntimeModelAliases",
+        "type": "object"
+      },
+      "RuntimePrefixCachePurgeRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "namespace": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Namespace"
+          }
+        },
+        "title": "RuntimePrefixCachePurgeRequest",
         "type": "object"
       },
       "RuntimeProfileList": {
@@ -9210,6 +9812,137 @@
         ]
       }
     },
+    "/api/v1/datasets/catalog": {
+      "get": {
+        "operationId": "official_dataset_catalog_api_v1_datasets_catalog_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfficialDatasetList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Official Dataset Catalog",
+        "tags": [
+          "evaluation"
+        ]
+      }
+    },
     "/api/v1/datasets/{dataset_id}": {
       "delete": {
         "operationId": "delete_dataset_api_v1_datasets__dataset_id__delete",
@@ -9643,7 +10376,9 @@
                 {
                   "enum": [
                     "perplexity",
-                    "kernel_benchmark"
+                    "kernel_benchmark",
+                    "inference_benchmark",
+                    "accuracy_benchmark"
                   ],
                   "type": "string"
                 },
@@ -9948,6 +10683,278 @@
           }
         },
         "summary": "Compare Evaluations",
+        "tags": [
+          "evaluation"
+        ]
+      }
+    },
+    "/api/v1/evaluations/probabilities": {
+      "post": {
+        "operationId": "evaluation_probabilities_api_v1_evaluations_probabilities_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProbabilityScoreRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProbabilityScoreResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Evaluation Probabilities",
+        "tags": [
+          "evaluation"
+        ]
+      }
+    },
+    "/api/v1/evaluations/tools": {
+      "get": {
+        "operationId": "evaluation_tools_api_v1_evaluations_tools_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvaluationToolsResource"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Evaluation Tools",
         "tags": [
           "evaluation"
         ]
@@ -11618,6 +12625,16 @@
               "minimum": 1,
               "title": "Limit",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tail",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Tail",
+              "type": "boolean"
             }
           }
         ],
@@ -13506,6 +14523,147 @@
         ]
       }
     },
+    "/api/v1/models/directories/open": {
+      "post": {
+        "operationId": "open_model_directory_api_v1_models_directories_open_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenModelDirectoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenModelDirectoryResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Open Model Directory",
+        "tags": [
+          "models"
+        ]
+      }
+    },
     "/api/v1/models/directories/register": {
       "post": {
         "operationId": "register_model_directory_api_v1_models_directories_register_post",
@@ -13924,6 +15082,148 @@
           }
         },
         "summary": "Unload Model",
+        "tags": [
+          "models"
+        ]
+      }
+    },
+    "/api/v1/models/{model_id}/directory": {
+      "get": {
+        "operationId": "model_artifact_directory_api_v1_models__model_id__directory_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelDirectoryList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Model Artifact Directory",
         "tags": [
           "models"
         ]
@@ -14636,6 +15936,500 @@
         ]
       }
     },
+    "/api/v1/runtime/cache/entries": {
+      "get": {
+        "operationId": "prefix_cache_entries_api_v1_runtime_cache_entries_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "namespace",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Namespace"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Prefix Cache Entries Api V1 Runtime Cache Entries Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Prefix Cache Entries",
+        "tags": [
+          "runtime"
+        ]
+      }
+    },
+    "/api/v1/runtime/cache/entries/{namespace}/{block}/text": {
+      "get": {
+        "operationId": "prefix_cache_text_api_v1_runtime_cache_entries__namespace___block__text_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "title": "Namespace",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "block",
+            "required": true,
+            "schema": {
+              "title": "Block",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 8192,
+              "maximum": 8192,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Prefix Cache Text Api V1 Runtime Cache Entries  Namespace   Block  Text Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Prefix Cache Text",
+        "tags": [
+          "runtime"
+        ]
+      }
+    },
+    "/api/v1/runtime/cache/purge": {
+      "post": {
+        "operationId": "purge_prefix_cache_api_v1_runtime_cache_purge_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuntimePrefixCachePurgeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Purge Prefix Cache Api V1 Runtime Cache Purge Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Purge Prefix Cache",
+        "tags": [
+          "runtime"
+        ]
+      }
+    },
     "/api/v1/runtime/cache/trim": {
       "post": {
         "operationId": "trim_runtime_cache_api_v1_runtime_cache_trim_post",
@@ -14931,6 +16725,276 @@
           }
         },
         "summary": "Runtime Capabilities",
+        "tags": [
+          "runtime"
+        ]
+      }
+    },
+    "/api/v1/runtime/inference-policy": {
+      "get": {
+        "operationId": "inference_policy_api_v1_runtime_inference_policy_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeInferencePolicy"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Inference Policy",
+        "tags": [
+          "runtime"
+        ]
+      },
+      "put": {
+        "operationId": "configure_inference_policy_api_v1_runtime_inference_policy_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuntimeInferencePolicy"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeInferencePolicy"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request Entity Too Large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "501": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Implemented"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Configure Inference Policy",
         "tags": [
           "runtime"
         ]
@@ -15536,10 +17600,16 @@
             "name": "after",
             "required": false,
             "schema": {
-              "default": 0,
-              "minimum": 0,
-              "title": "After",
-              "type": "integer"
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
             }
           },
           {

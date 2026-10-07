@@ -150,6 +150,8 @@ template <class Backend> class SessionCache {
                 {"prefix_cache_disk_max_bytes", static_cast<double>(paged_disk_budget_)},
                 {"prefix_cache_hot_blocks", static_cast<double>(value.hot_blocks)},
                 {"prefix_cache_hot_bytes", static_cast<double>(value.hot_bytes)},
+                {"prefix_cache_hot_pressure_bytes", static_cast<double>(value.hot_pressure_bytes)},
+                {"prefix_cache_dynamic_budget", 1.0},
                 {"prefix_cache_pending_writes", static_cast<double>(value.pending_writes)},
                 {"prefix_cache_pending_bytes", static_cast<double>(value.pending_bytes)},
                 {"prefix_cache_pending_max_bytes", static_cast<double>(value.pending_max_bytes)},
@@ -160,6 +162,8 @@ template <class Backend> class SessionCache {
                 {"prefix_cache_hot_hits", static_cast<double>(value.hot_hits)},
                 {"prefix_cache_evictions", static_cast<double>(value.evictions)},
                 {"prefix_cache_corrupt_blocks", static_cast<double>(value.corrupt_blocks)},
+                {"prefix_cache_low_disk_space_skips", static_cast<double>(value.low_disk_space_skips)},
+                {"prefix_cache_failed_writes", static_cast<double>(value.failed_writes)},
             };
         }
         const auto value = snapshots_.metrics();
@@ -195,6 +199,27 @@ template <class Backend> class SessionCache {
         if (released > 0)
             Backend::release_host_cache();
         return released;
+    }
+
+    uint64_t set_hot_limit(uint64_t max_bytes) {
+        if (!paged_cache_) return 0;
+        paged_hot_budget_ = max_bytes;
+        const auto released = paged_cache_->set_hot_limit(max_bytes);
+        if (released > 0) Backend::release_host_cache();
+        return released;
+    }
+
+    uint64_t set_disk_limit(uint64_t max_bytes) {
+        if (!paged_cache_) return 0;
+        paged_disk_budget_ = max_bytes;
+        return paged_cache_->set_disk_limit(max_bytes);
+    }
+
+    uint64_t refresh_disk_index() {
+        if (!paged_cache_) return 0;
+        const auto removed = paged_cache_->refresh_disk_index();
+        if (removed > 0) Backend::release_host_cache();
+        return removed;
     }
 
   private:

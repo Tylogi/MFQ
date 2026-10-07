@@ -154,6 +154,57 @@ void run_benchmark() {
 
 int main() try {
     using namespace mfq::cache;
+    const auto inspect_root = temporary_directory();
+    {
+        PagedPrefixCacheConfig config{inspect_root, "text-record-test", 4, 4096, 4096, 8};
+        config.model_path = inspect_root / "sample.mfq";
+        PagedPrefixCache cache(config);
+        const std::vector<std::int64_t> sequence{1, 2, 3, 4};
+        const auto hash = cache.store({}, sequence.data(), 4, payload({1, 2}));
+        cache.flush();
+        const auto name = block_hash_hex(hash);
+        const auto directory = inspect_root / block_hash_hex(cache.compatibility_hash());
+        const auto block = directory / name.substr(0, 2) / (name + ".mfqkv");
+        const auto text = std::filesystem::path(block.string() + ".tokens");
+        require(std::filesystem::file_size(text) == 108 + 4 * 8, "token record has incorrect size");
+        require((std::filesystem::status(text).permissions() & std::filesystem::perms::others_read)
+            == std::filesystem::perms::none, "token record is publicly readable");
+        std::ifstream record(text, std::ios::binary);
+        std::array<char, 8> magic{};
+        record.read(magic.data(), magic.size());
+        require(std::string(magic.data(), 7) == "MFQTXT1", "token record has incorrect header");
+        record.seekg(108);
+        for (const auto token : sequence) {
+            std::array<unsigned char, 8> bytes{};
+            record.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
+            require(record.good() && bytes[0] == token && std::all_of(bytes.begin() + 1, bytes.end(),
+                [](unsigned char value) { return value == 0; }), "token record did not retain original IDs");
+        }
+        require(std::filesystem::exists(directory / "identity.txt"), "model cache identity is missing");
+        std::filesystem::remove(block);
+        std::filesystem::remove(text);
+        require(cache.refresh_disk_index() == 1, "external deletion did not refresh native cache index");
+        require(cache.metrics().hot_blocks == 0 && cache.metrics().disk_blocks == 0,
+            "deleted cache retained stale hot payloads");
+        require(cache.match(sequence).matched_tokens == 0, "deleted cache still matched");
+        cache.store({}, sequence.data(), 4, payload({1, 2}));
+        cache.flush();
+        cache.clear();
+        require(!std::filesystem::exists(text), "clearing left a token sidecar behind");
+    }
+    {
+        PagedPrefixCacheConfig config{inspect_root, "disk-reserve-test", 4, 4096, 4096, 8};
+        config.min_disk_free_bytes = std::numeric_limits<std::uint64_t>::max();
+        PagedPrefixCache cache(config);
+        const std::vector<std::int64_t> sequence{1, 2, 3, 4};
+        cache.store({}, sequence.data(), 4, payload({1, 2}));
+        cache.flush();
+        require(cache.metrics().low_disk_space_skips == 1 && cache.metrics().failed_writes == 1,
+            "disk reserve did not reject the write");
+        require(cache.metrics().disk_blocks == 0 && cache.match(sequence).matched_tokens == 4,
+            "disk-full guard broke the RAM cache");
+    }
+    std::filesystem::remove_all(inspect_root);
     const auto tail_root = temporary_directory();
     for (const bool disk : {false, true}) {
         const PagedPrefixCacheConfig config{tail_root, disk ? "tail-disk" : "tail-ram", 4,
@@ -182,6 +233,69 @@ int main() try {
         }
     }
     std::filesystem::remove_all(tail_root);
+    const auto growing_root = temporary_directory();
+    {
+        PagedPrefixCache cache({growing_root, "growing-tails", 8, 4096, 64, 8});
+        const std::vector<std::int64_t> sequence{1, 2, 3, 4, 5, 6};
+        const std::vector<std::int64_t> branch{1, 2, 99};
+        cache.store({}, branch.data(), branch.size(), payload({9}));
+        for (std::size_t count = 2; count <= sequence.size(); ++count) {
+            cache.store({}, sequence.data(), count, payload({static_cast<std::uint8_t>(count)}));
+            cache.flush();
+        }
+        require(cache.metrics().disk_blocks == 3, "growing tails retained obsolete snapshots");
+        require(cache.match(sequence).matched_tokens == 6, "newest tail was discarded");
+        require(cache.match({1, 2, 3, 4, 5, 99}).matched_tokens == 5, "previous tail fallback was discarded");
+        require(cache.match(branch).matched_tokens == 3, "unrelated branch tail was discarded");
+        require(cache.set_hot_limit(0) > 0 && cache.metrics().hot_bytes == 0, "online hot budget did not trim RAM");
+        require(cache.load_prefix(cache.match(sequence).blocks).size() == 1, "hot budget change deleted durable cache");
+        require(cache.metrics().hot_bytes == 0, "disabled hot tier retained restored payloads");
+        require(cache.set_disk_limit(0) > 0 && cache.metrics().disk_bytes == 0,
+            "online SSD disable retained durable cache");
+        cache.set_disk_limit(4096);
+        cache.store({}, sequence.data(), sequence.size(), payload({6}));
+        cache.store({}, sequence.data(), sequence.size() - 1, payload({5}));
+        cache.store({}, branch.data(), branch.size(), payload({9}));
+        cache.flush();
+        require(cache.metrics().disk_blocks == 3, "online SSD enable did not resume writes");
+    }
+    {
+        PagedPrefixCache cache({growing_root, "growing-tails", 8, 4096, 0, 8});
+        require(cache.match({1, 2, 3, 4, 5, 6}).matched_tokens == 6, "tail cleanup broke restart reuse");
+        require(cache.metrics().disk_blocks == 3, "restart restored discarded tail versions");
+        const std::vector<std::int64_t> full{1, 2, 3, 4, 5, 6, 7, 8};
+        cache.store({}, full.data(), full.size(), payload({8}));
+        cache.flush();
+        require(cache.metrics().disk_blocks == 3, "full block left superseded tail versions");
+        require(cache.match(full).matched_tokens == 8, "full block was not reusable");
+    }
+    std::filesystem::remove_all(growing_root);
+    const auto binding_root = temporary_directory();
+    {
+        auto cache = std::make_shared<PagedPrefixCache>(PagedPrefixCacheConfig{binding_root, "bound-disk", 4, 200, 0, 8});
+        mfq::engine::PagedSessionBindings bindings(cache, 16);
+        const std::vector<std::int64_t> a{1, 2, 3, 4}, b{5, 6, 7, 8};
+        const auto first_block = cache->store({}, a.data(), 4, payload({1}));
+        cache->flush();
+        bindings.bind("idle-a", {first_block}, 4);
+        const auto second_block = cache->store({}, b.data(), 4, payload({2}));
+        cache->flush();
+        bindings.bind("idle-b", {second_block}, 4);
+        require(cache->metrics().disk_bytes <= 200, "idle session pins bypassed the SSD budget");
+        require(cache->match(a).matched_tokens == 0 && cache->match(b).matched_tokens == 4, "SSD LRU did not evict the older idle session");
+        require(bindings.clear() == 2, "stale bindings could not be released safely");
+    }
+    {
+        auto cache = std::make_shared<PagedPrefixCache>(PagedPrefixCacheConfig{binding_root, "bound-ram", 4, 0, 4, 8});
+        mfq::engine::PagedSessionBindings bindings(cache, 16);
+        const std::vector<std::int64_t> sequence{1, 2, 3, 4};
+        const auto block = cache->store({}, sequence.data(), 4, payload({1, 2, 3, 4}));
+        bindings.bind("idle-ram", {block}, 4);
+        require(cache->set_hot_limit(0) == 4, "idle session bypassed the RAM budget");
+        require(cache->match(sequence).matched_tokens == 0, "evicted RAM-only prefix still matched");
+        require(bindings.close("idle-ram") == 1, "evicted RAM-only binding could not be closed");
+    }
+    std::filesystem::remove_all(binding_root);
     require(
         block_hash_hex(sha256("abc")) ==
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",

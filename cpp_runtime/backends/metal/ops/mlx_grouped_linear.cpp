@@ -1,4 +1,5 @@
 #include "mlx_grouped_linear.h"
+#include "mlx_kernel_prepare.h"
 #include "mlx_nvq3jl.h"
 #include "mlx_staging_allocator.h"
 
@@ -1026,7 +1027,7 @@ struct NintProjectionConfig {
     float limit;
 };
 
-class NintProjectionPrimitive final : public mlx::core::UnaryPrimitive {
+class NintProjectionPrimitive final : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
 public:
     NintProjectionPrimitive(
         mlx::core::Stream stream,
@@ -1045,6 +1046,18 @@ public:
         }
     }
 
+    std::string preparation_key() const override { return kernel_name_; }
+    void prepare_gpu() override { (void)prepared_kernel(); }
+
+    MTL::ComputePipelineState* prepared_kernel() {
+        auto& device = mlx::core::metal::device(stream().device);
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(
+            kernel_name_, options, [this] { return source(); });
+        return device.get_kernel(kernel_name_, library);
+    }
+
     void eval_cpu(const std::vector<array>&, array&) override {
         throw std::runtime_error("NINT projection group requires Metal");
     }
@@ -1053,14 +1066,9 @@ public:
         const std::vector<array>& inputs,
         array& output) override {
         output.set_data(mlx::core::allocator::malloc(output.nbytes()));
-        auto& device = mlx::core::metal::device(stream().device);
-        CompileOptions options;
-        options.math_mode = MathMode::Fast;
-        auto* library = device.get_library(
-            kernel_name_, options, [this] { return source(); });
+        auto* kernel = prepared_kernel();
         auto& encoder = mlx::core::metal::get_command_encoder(stream());
-        encoder.set_compute_pipeline_state(
-            device.get_kernel(kernel_name_, library));
+        encoder.set_compute_pipeline_state(kernel);
         const int input_count = static_cast<int>(inputs.size());
         for (int index = 0; index < input_count; ++index) {
             encoder.set_input_array(inputs[index], index);
@@ -2926,12 +2934,24 @@ std::shared_ptr<const DirectProjectionPlan> make_direct_projection_plan(
     return plan;
 }
 
-class DirectProjectionPrimitive final : public mlx::core::UnaryPrimitive {
+class DirectProjectionPrimitive final : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
 public:
     DirectProjectionPrimitive(
         mlx::core::Stream stream,
         std::shared_ptr<const DirectProjectionPlan> plan)
         : UnaryPrimitive(stream), plan_(std::move(plan)) {}
+
+    std::string preparation_key() const override { return plan_->kernel_name; }
+    void prepare_gpu() override { (void)prepared_kernel(); }
+
+    MTL::ComputePipelineState* prepared_kernel() {
+        auto& device = mlx::core::metal::device(stream().device);
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(
+            plan_->kernel_name, options, [this] { return plan_->source; });
+        return device.get_kernel(plan_->kernel_name, library);
+    }
 
     void eval_cpu(const std::vector<array>&, array&) override {
         throw std::runtime_error("direct grouped projection requires Metal");
@@ -2941,14 +2961,9 @@ public:
         const std::vector<array>& inputs,
         array& output) override {
         output.set_data(mlx::core::allocator::malloc(output.nbytes()));
-        auto& device = mlx::core::metal::device(stream().device);
-        CompileOptions options;
-        options.math_mode = MathMode::Fast;
-        auto* library = device.get_library(
-            plan_->kernel_name, options, [this] { return plan_->source; });
+        auto* kernel = prepared_kernel();
         auto& encoder = mlx::core::metal::get_command_encoder(stream());
-        encoder.set_compute_pipeline_state(
-            device.get_kernel(plan_->kernel_name, library));
+        encoder.set_compute_pipeline_state(kernel);
         for (int index = 0; index < static_cast<int>(inputs.size()); ++index) {
             encoder.set_input_array(inputs[index], index);
         }

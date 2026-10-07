@@ -90,3 +90,15 @@ it('shows transfer speed and deletes a completed record without touching files',
   await waitFor(() => expect(useJobStore.getState().jobs).toHaveLength(0));
   expect(jobsApi.deleteJob).toHaveBeenCalledExactlyOnceWith('download-1');
 });
+
+it('does not put an old download into the active connection after leaving its page', async () => {
+  let finish!: (job: JobResource) => void;
+  vi.mocked(jobsApi.createJob).mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+  const view = render(<ModelHubPage />);
+  const button = await screen.findByRole('button', { name: 'Download' });
+  await waitFor(() => expect(button).toBeEnabled());
+  fireEvent.click(button);
+  view.unmount();
+  await act(async () => { finish(download()); });
+  expect(useJobStore.getState().jobs).toEqual([]);
+});

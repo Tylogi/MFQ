@@ -100,6 +100,11 @@ target_link_libraries(mfq-mtp-policy-test PRIVATE mfq-engine)
 target_compile_features(mfq-mtp-policy-test PRIVATE cxx_std_20)
 add_test(NAME mfq-mtp-policy-test COMMAND mfq-mtp-policy-test)
 
+add_executable(mfq-speculative-sequence-test speculative_sequence_test.cpp)
+target_link_libraries(mfq-speculative-sequence-test PRIVATE mfq-engine)
+target_compile_features(mfq-speculative-sequence-test PRIVATE cxx_std_20)
+add_test(NAME mfq-speculative-sequence-test COMMAND mfq-speculative-sequence-test)
+
 add_executable(mfq-moe-cache-profile-test moe_cache_profile_test.cpp)
 target_link_libraries(mfq-moe-cache-profile-test PRIVATE mfq-core mfq-json)
 target_compile_features(mfq-moe-cache-profile-test PRIVATE cxx_std_17)

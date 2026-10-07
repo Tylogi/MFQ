@@ -720,7 +720,7 @@ static std::string read_profile_file(const std::filesystem::path & path) {
 static std::vector<std::filesystem::path> profile_sidecar_paths(
         const std::filesystem::path & mfq_path) {
     std::vector<std::filesystem::path> result;
-    static const std::regex split_pattern(R"(^(.*)-[0-9]{5}-of-[0-9]{5}\.mfq$)");
+    static const std::regex split_pattern(R"(^(.*)-[0-9]{5}-of-[0-9]{5}\.[mM][fF][qQ]$)");
     std::smatch match;
     const auto filename = mfq_path.filename().string();
     if (std::regex_match(filename, match, split_pattern)) {
@@ -810,6 +810,37 @@ bool valid_mfq_session_id(const std::string & session_id) {
             });
 }
 
+mfq::engine::ScoreText parse_score_request(const json& body) {
+    if (!body.is_object() || !body.contains("prompt") || !body["prompt"].is_string() ||
+        body["prompt"].get_ref<const std::string&>().empty() || body["prompt"].get_ref<const std::string&>().size() > 262144 ||
+        !body.contains("continuations") || !body["continuations"].is_array() || body["continuations"].empty() || body["continuations"].size() > 64)
+        throw ApiError(400, "invalid_request_error", "score requires a prompt and 1 to 64 continuations");
+    if (body.contains("mode") && !body["mode"].is_string())
+        throw ApiError(400, "invalid_request_error", "score mode must be a string", "mode");
+    for (const auto& item : body.items())
+        if (item.key() != "prompt" && item.key() != "continuations" && item.key() != "mode")
+            throw ApiError(400, "invalid_request_error", "unknown score parameter", item.key());
+    const auto mode = body.value("mode", std::string("continuation"));
+    if (mode != "continuation" && mode != "next_token")
+        throw ApiError(400, "invalid_request_error", "score mode must be continuation or next_token", "mode");
+    mfq::engine::ScoreText request;
+    request.prompt = body["prompt"].get<std::string>();
+    request.next_token = mode == "next_token";
+    for (const auto& item : body["continuations"]) {
+        if (!item.is_string() || item.get_ref<const std::string&>().empty() || item.get_ref<const std::string&>().size() > 65536)
+            throw ApiError(400, "invalid_request_error", "score continuations must be nonempty bounded strings", "continuations");
+        request.continuations.push_back(item.get<std::string>());
+    }
+    return request;
+}
+
+json likelihood_result_json(const mfq::engine::LikelihoodResult& result) {
+    json scores = json::array();
+    for (const auto& score : result.scores)
+        scores.push_back({{"token_ids", score.token_ids}, {"token_logprobs", score.token_logprobs}, {"log_likelihood", score.log_likelihood}});
+    return {{"prompt_tokens", result.prompt_tokens}, {"scores", scores}, {"log_base", "e"}, {"tokenization", "raw-no-special-tokens"}};
+}
+
 json runtime_generate_body(const json & params) {
     if (!params.is_object()) {
         throw ApiError(
@@ -827,6 +858,16 @@ json runtime_generate_body(const json & params) {
     if (input.contains("messages")) body["messages"] = input["messages"];
     if (input.contains("preformatted_prompt")) {
         body["mfq_preformatted_prompt"] = input["preformatted_prompt"];
+    }
+    if (input.contains("benchmark_prompt_tokens")) {
+        body["mfq_benchmark_prompt_tokens"] = input["benchmark_prompt_tokens"];
+    }
+    if (params.contains("cache")) {
+        if (!params["cache"].is_object()) {
+            throw ApiError(400, "invalid_request_error", "cache must be an object", "cache");
+        }
+        if (params["cache"].contains("enabled"))
+            body["mfq_prefix_cache_enabled"] = params["cache"]["enabled"];
     }
     if (params.contains("sampling")) {
         if (!params["sampling"].is_object()) {
@@ -1015,6 +1056,17 @@ RequestInput parse_input(
         }
     }
     work.stops = parse_stops(body);
+    work.prefix_cache_enabled = boolean_field(body, "mfq_prefix_cache_enabled", true);
+    if (body.contains("mfq_benchmark_prompt_tokens")) {
+        const auto count = integer_field(body, "mfq_benchmark_prompt_tokens", 0);
+        if (count < 1 || count > 1048576) {
+            throw ApiError(400, "invalid_request_error", "benchmark prompt tokens must be in [1, 1048576]", "mfq_benchmark_prompt_tokens");
+        }
+        if (work.prefix_cache_enabled || !work.chat_input || !work.chat_input->preformatted_prompt) {
+            throw ApiError(400, "invalid_request_error", "benchmark token sizing requires a preformatted prompt and disabled prefix cache");
+        }
+        work.benchmark_prompt_tokens = static_cast<std::size_t>(count);
+    }
     return work;
 }
 

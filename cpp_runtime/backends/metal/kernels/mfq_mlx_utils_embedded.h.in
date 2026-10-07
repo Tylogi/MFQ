@@ -1,0 +1,10 @@
+#pragma once
+
+namespace mfq::metal::detail {
+inline constexpr char kMlxUtilsSource[] = R"MFQMLX(
+#include <metal_stdlib>
+#include <metal_math>
+using namespace metal;
+@MFQ_MLX_UTILS_SOURCE@
+)MFQMLX";
+}

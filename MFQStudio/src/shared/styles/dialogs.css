@@ -26,8 +26,15 @@
 .model-browser-location button { min-height: 30px; padding: 6px 10px; }
 .model-browser-location span { color: var(--accent-ink); }
 .model-browser-list { min-height: 0; overflow-y: auto; padding: 7px 10px; }
-.model-browser-list > button { display: grid; width: 100%; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: center; gap: 8px; border: 0; padding: 9px 10px; color: var(--ink-soft); background: transparent; text-align: left; }
+.model-browser-list > button { display: grid; width: 100%; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: center; gap: 8px; border: 0; padding: 9px 10px; color: var(--ink-soft); background: transparent; font-size: 12px; text-align: left; }
 .model-browser-list > button:hover { border-color: transparent; background: var(--surface-subtle); }
 .model-browser-list > button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model-browser-list > button b { color: var(--muted); font-size: 10px; font-weight: 600; }
 .model-browser-list > p { margin: 28px 12px; color: var(--muted); text-align: center; font-size: 10.5px; }
+.model-browser-file { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 9px 10px; color: var(--ink-soft); font-size: 12px; }
+.model-browser-file > .ui-icon { color: var(--muted); }
+.model-browser-file > span { min-width: 0; overflow-wrap: anywhere; line-height: 1.5; }
+.model-browser-file > small { color: var(--muted); font-size: 10.5px; white-space: nowrap; }
+.model-browser-dialog footer .model-browser-open-finder { display: inline-flex; align-items: center; gap: 6px; margin-right: auto; white-space: nowrap; }
+.model-browser-dialog footer > button { min-height: 32px; border: 1px solid var(--line); border-radius: 7px; padding: 6px 10px; color: var(--ink-soft); background: var(--surface); font-size: 11.5px; }
+.model-browser-dialog footer > button.primary { color: var(--on-accent); }

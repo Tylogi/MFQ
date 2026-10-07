@@ -1,4 +1,5 @@
 #include "mlx_transformer.h"
+#include "mlx_resident_budget.h"
 
 #include <cmath>
 #include <cstdint>
@@ -6,9 +7,11 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <mlx/mlx.h>
+#include <mlx/fast_primitives.h>
 
 namespace {
 
@@ -115,11 +118,70 @@ std::vector<float> reference_mrope(
     return output;
 }
 
+void test_runtime_rope_length_reuse() {
+    using namespace mlx::core;
+    std::optional<std::pair<std::string, std::string>> mrope_signature;
+    std::optional<std::pair<std::string, std::string>> adjacent_signature;
+    const auto check = [](const array& value, auto& previous) {
+        const auto& primitive = value.primitive();
+        if (std::string(primitive.name()) != "CustomKernel")
+            throw std::runtime_error("RoPE must use a custom kernel");
+        const auto state = static_cast<const fast::CustomKernel&>(primitive).state();
+        const auto signature = std::pair{std::get<0>(state), std::get<1>(state)};
+        if (previous && *previous != signature)
+            throw std::runtime_error("RoPE recompiles for a different token count");
+        previous = signature;
+    };
+    constexpr int heads = 3, dimension = 16, rotary = 12, pairs = rotary / 2;
+    for (const int tokens : {17, 25, 30, 33, 43, 54, 69, 97}) {
+        std::vector<float> values(tokens * heads * dimension);
+        std::vector<std::int32_t> positions(tokens);
+        for (std::size_t index = 0; index < values.size(); ++index)
+            values[index] = float(int(index % 29) - 14) / 32.0f;
+        for (int token = 0; token < tokens; ++token) positions[token] = 100 + token;
+        const array input(values.begin(), Shape{1, heads, tokens, dimension});
+        const auto rotated = mfq::metal::apply_rope(
+            input, array(positions.begin(), Shape{tokens}), rotary, 10000.0f);
+        check(rotated, mrope_signature);
+        const auto expected = reference_mrope(
+            values, tokens, dimension, positions, 1, rotary, 10000.0f, {}, false);
+        require_array_close(rotated, array(expected.begin(), input.shape()));
+        std::vector<float> cosines(tokens * pairs), sines(tokens * pairs);
+        for (int token = 0; token < tokens; ++token) {
+            for (int pair = 0; pair < pairs; ++pair) {
+                const float angle = float(positions[token]) *
+                    std::pow(10000.0f, -2.0f * float(pair) / float(rotary));
+                cosines[token * pairs + pair] = std::cos(angle);
+                sines[token * pairs + pair] = std::sin(angle);
+            }
+        }
+        const array adjacent_input(values.begin(), Shape{1, tokens, heads, dimension});
+        const array cosine(cosines.begin(), Shape{1, tokens, pairs});
+        const array sine(sines.begin(), Shape{1, tokens, pairs});
+        const auto adjacent = mfq::metal::mlx_rope_adjacent(
+            adjacent_input, rotary, cosine, sine);
+        check(adjacent, adjacent_signature);
+        auto adjacent_expected = values;
+        for (int row = 0; row < tokens * heads; ++row) {
+            const int token = row / heads;
+            for (int pair = 0; pair < pairs; ++pair) {
+                const int offset = row * dimension + dimension - rotary + 2 * pair;
+                const float c = cosines[token * pairs + pair], s = sines[token * pairs + pair];
+                adjacent_expected[offset] = values[offset] * c - values[offset + 1] * s;
+                adjacent_expected[offset + 1] = values[offset] * s + values[offset + 1] * c;
+            }
+        }
+        require_array_close(adjacent,
+            array(adjacent_expected.begin(), adjacent_input.shape()));
+    }
+}
+
 } // namespace
 
 int main() {
     try {
         using namespace mlx::core;
+        test_runtime_rope_length_reuse();
         const auto empty_resources = mfq::metal::MlxResourceTelemetry::snapshot();
         {
             mfq::metal::MlxKvCache first(1, 2, 16, 4, 2, float16);
@@ -460,6 +522,20 @@ int main() {
         require_close(rewritten.first.data<float>()[5], 14.0f);
         require_close(rewritten.second.data<float>()[4], 15.0f);
         require_close(rewritten.second.data<float>()[5], 16.0f);
+        {
+            const auto position = cache.position();
+            const auto capacity = cache.capacity();
+            bool denied = false;
+            mfq::metal::MlxResidentBudgetScope scope([&](std::size_t bytes) {
+                if (bytes == 0) throw std::runtime_error("missing reservation size");
+                throw std::runtime_error("test budget exhausted");
+            });
+            try {
+                cache.append(zeros(Shape{1, 1, 4, 2}, float32), zeros(Shape{1, 1, 4, 2}, float32));
+            } catch (const std::runtime_error&) { denied = true; }
+            if (!denied || cache.position() != position || cache.capacity() != capacity)
+                throw std::runtime_error("rejected KV growth mutated the live cache");
+        }
 
         mfq::metal::MlxSequenceCache sequence_cache(8, 2, float32);
         sequence_cache.reset(1, 1);

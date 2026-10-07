@@ -11,6 +11,7 @@
 @import './features/settings/update-manager.css';
 @import './features/models/model-browser.css';
 @import './features/jobs/jobs.css';
+@import './features/evaluations/evaluations.css';
 @import './features/chat/chat.css';
 @import './shared/styles/dialogs.css';
 @import './shared/styles/responsive.css';

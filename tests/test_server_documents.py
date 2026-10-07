@@ -4,12 +4,15 @@ import asyncio
 import hashlib
 import io
 import zipfile
+import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
 
 from mfq.server.runtime.backend import BackendDelta
 from mfq.server.services.documents import DocumentExtractionError, extract_document
+import mfq.server.services.documents as documents
 from mfq.server.protocol.models import CreateDocumentRequest, CreateSessionRequest
 from mfq.server.services.service import ServerService
 from mfq.server.state.storage import SessionStore
@@ -48,6 +51,49 @@ def test_binary_document_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "notes.txt"
     path.write_bytes(b"\xff\x00\xfe")
     with pytest.raises(DocumentExtractionError):
+        extract_document(path, "text/plain", path.name)
+
+
+def test_compressed_docx_is_bounded_before_xml_is_loaded(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(documents, "MAX_EXTRACTION_BYTES", 1024)
+    path = tmp_path / "large.docx"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", b" " * 4096)
+    assert path.stat().st_size < 1024
+    def unexpected(*args, **kwargs):
+        pytest.fail("oversized compressed XML must be rejected before decompression")
+    monkeypatch.setattr(zipfile.ZipFile, "open", unexpected)
+    with pytest.raises(DocumentExtractionError, match="extraction size limit"):
+        extract_document(path, "application/octet-stream", path.name)
+
+
+@pytest.mark.parametrize("error", [RuntimeError("password required"), NotImplementedError("unsupported compression")])
+def test_unsupported_docx_archive_is_a_document_error(tmp_path: Path, monkeypatch, error) -> None:
+    path = tmp_path / "unsupported.docx"
+    path.write_bytes(_docx_bytes("text"))
+    def fail(*args, **kwargs):
+        raise error
+    monkeypatch.setattr(zipfile.ZipFile, "open", fail)
+    with pytest.raises(DocumentExtractionError, match="invalid DOCX document"):
+        extract_document(path, "application/octet-stream", path.name)
+
+
+def test_pdf_stops_extracting_pages_at_the_text_limit(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(documents, "MAX_EXTRACTED_CHARACTERS", 10)
+    def unexpected():
+        pytest.fail("later PDF pages must not be extracted after the text limit")
+    reader = SimpleNamespace(pages=[SimpleNamespace(extract_text=lambda: "x" * 11),
+        SimpleNamespace(extract_text=unexpected)])
+    monkeypatch.setitem(sys.modules, "pypdf", SimpleNamespace(PdfReader=lambda _: reader))
+    with pytest.raises(DocumentExtractionError, match="extracted text exceeds"):
+        extract_document(tmp_path / "large.pdf", "application/pdf", "large.pdf")
+
+
+def test_text_read_is_bounded_before_decoding(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(documents, "MAX_EXTRACTION_BYTES", 1024)
+    path = tmp_path / "large.txt"
+    path.write_bytes(b"x" * 1025)
+    with pytest.raises(DocumentExtractionError, match="extraction size limit"):
         extract_document(path, "text/plain", path.name)
 
 

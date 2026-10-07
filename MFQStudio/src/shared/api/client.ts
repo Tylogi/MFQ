@@ -18,14 +18,24 @@ export class ApiError extends Error {
 let apiBaseUrl = '';
 let apiToken = '';
 const BROWSER_SERVICE_KEY = 'mfq.studio.service-url';
+let browserUrlOverride: string | undefined;
 
 export function browserServiceUrl(): string {
-  return localStorage.getItem(BROWSER_SERVICE_KEY) ?? '';
+  if (browserUrlOverride !== undefined) return browserUrlOverride;
+  try {
+    const value = localStorage.getItem(BROWSER_SERVICE_KEY) ?? '';
+    if (!value) return '';
+    const url = new URL(value);
+    return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password ? value : '';
+  } catch { return ''; }
 }
 
 export function setBrowserServiceUrl(value: string): void {
-  if (value) localStorage.setItem(BROWSER_SERVICE_KEY, value);
-  else localStorage.removeItem(BROWSER_SERVICE_KEY);
+  try {
+    if (value) localStorage.setItem(BROWSER_SERVICE_KEY, value);
+    else localStorage.removeItem(BROWSER_SERVICE_KEY);
+    browserUrlOverride = undefined;
+  } catch { browserUrlOverride = value; }
 }
 
 /** 读取当前内存中的凭据，仅供请求层构造鉴权头。 */

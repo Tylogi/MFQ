@@ -61,6 +61,7 @@ struct MtpModule {
         return mfq::engine::mtp::kMaximumDraftDepth;
     }
     virtual bool blockwise_drafting() const noexcept { return false; }
+    virtual bool dspark_policy() const noexcept { return false; }
     virtual bool split_target_verification() const noexcept { return false; }
     virtual bool retains_partial_target_prefix() const noexcept {
         return false;
@@ -96,6 +97,7 @@ struct MtpModule {
     }
 
     mfq::engine::mtp::GenerationStats last_stats;
+    mfq::engine::mtp::PolicyState policy_state;
     uint64_t last_cycles = 0;
     uint64_t last_accepted = 0;
     uint64_t last_rejected = 0;

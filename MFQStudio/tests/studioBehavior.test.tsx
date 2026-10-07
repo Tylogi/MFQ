@@ -119,14 +119,14 @@ describe('test_model_hub_accepts_repository_links_and_downloads_into_the_model_c
   });
 });
 
-describe('test_model_hub_renders_device_recommendation_grades（行为）', () => {
-  it('只用图标显示内存压力档位，并明确不代表模型能力或质量', async () => {
+describe('test_model_hub_removes_memory_pressure_grades（行为）', () => {
+  it('删除内存压力说明与推荐星标，保留各版本的实际预算占比', async () => {
     const grades = [
-      ['three_stars', 'recommended', '★★★', 'Low weight pressure: all tier baselines fit the budget', 'three-stars'],
-      ['two_stars', 'recommended', '★★', 'Moderate weight pressure: most tier baselines fit the budget', 'two-stars'],
-      ['one_star', 'recommended', '★', 'High weight pressure: only some tier baselines fit the budget', 'one-star'],
-      ['caution', 'warning', '▲', 'Weight budget near limit: the smallest tier baseline nearly fits', 'caution'],
-      ['not_recommended', 'warning', '✕', 'Insufficient weight budget: the smallest tier baseline exceeds it', 'not-recommended'],
+      ['three_stars', 'recommended', '★★★', 'Low memory pressure: all tier estimates fit the budget', 'three-stars'],
+      ['two_stars', 'recommended', '★★', 'Moderate memory pressure: most tier estimates fit the budget', 'two-stars'],
+      ['one_star', 'recommended', '★', 'High memory pressure: only some tier estimates fit the budget', 'one-star'],
+      ['caution', 'warning', '▲', 'Memory budget near limit: the smallest tier estimate nearly fits', 'caution'],
+      ['not_recommended', 'warning', '✕', 'Insufficient memory budget: the smallest tier estimate exceeds it', 'not-recommended'],
       ['unknown', 'unknown', '?', 'Memory pressure unknown', 'unknown'],
     ] as const;
     const source = {
@@ -191,20 +191,16 @@ describe('test_model_hub_renders_device_recommendation_grades（行为）', () =
       </MemoryRouter>,
     );
 
-    await screen.findAllByLabelText('Low weight pressure: all tier baselines fit the budget');
-    expect(screen.getByText('Memory pressure')).toBeInTheDocument();
-    expect(screen.getByText('Based on resident weight baselines; KV cache and runtime overhead need additional memory.')).toBeInTheDocument();
+    await screen.findByText('tier');
+    expect(screen.queryByText('Memory pressure')).not.toBeInTheDocument();
+    expect(view.container.querySelector('.memory-pressure-guide')).toBeNull();
     expect(screen.queryByText('3-star recommendation')).not.toBeInTheDocument();
     expect(screen.queryByText('2-star recommendation')).not.toBeInTheDocument();
     const tierPressure = screen.getByRole('progressbar', { name: 'Estimated share of runtime budget: 75.0%' });
     expect(tierPressure).toHaveAttribute('aria-valuetext', '75.0%');
     expect(tierPressure.querySelector('span')).toHaveStyle({ width: '75%' });
     expect(screen.getByText('75.0%')).toBeInTheDocument();
-    expect(view.container.querySelector('.model-variant .configuration-badge')).toBeNull();
-    for (const [, , symbol, label, className] of grades) {
-      expect(screen.getAllByLabelText(label).length).toBeGreaterThan(0);
-      expect(view.container.querySelector(`.configuration-badge.${className} b`)).toHaveTextContent(symbol);
-    }
+    expect(view.container.querySelector('.configuration-badge')).toBeNull();
   });
 });
 

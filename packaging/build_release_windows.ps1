@@ -415,12 +415,12 @@ function Build-PythonCli {
     )
     foreach ($package in @(
             "av", "fastapi", "httpx", "PIL", "pydantic", "pypdf",
-            "huggingface_hub", "modelscope_hub", "uvicorn", "websockets")) {
+            "huggingface_hub", "modelscope_hub", "uvicorn", "websockets", "pyarrow")) {
         $arguments += @("--collect-all", $package)
     }
     foreach ($module in @(
             "torch", "transformers", "tokenizers", "safetensors",
-            "scipy", "pyarrow", "tiktoken",
+            "scipy", "tiktoken",
             "mfq.calibration", "mfq.quantize", "mfq.runtime", "mfq.tools",
             "mfq.runtime.minicpmo45", "mfq.runtime.minicpmo45_realtime",
             "minicpmo_utils", "stepaudio2_minicpmo", "torchaudio", "onnxruntime",
