@@ -35,6 +35,7 @@ export type IconName =
   | "reuse"
   | "send"
   | "scroll"
+  | "search"
   | "server-rack"
   | "settings"
   | "stop"
@@ -89,6 +90,7 @@ export function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
       {name === "reuse" && <><path d="M20 7v5h-5M4 17v-5h5" /><path d="M18.3 9A7 7 0 0 0 6 6.5L4 9M5.7 15A7 7 0 0 0 18 17.5l2-2.5" /></>}
       {name === "send" && <><path d="m5 12 7-7 7 7M12 5v14" /></>}
       {name === "scroll" && <><path d="M5 7H3V5a2 2 0 0 1 4 0v12a3 3 0 0 0 3 3h8a3 3 0 0 0 3-3v-2h-4v2a3 3 0 0 1-3 3M5 3h11a2 2 0 0 1 2 2v10M10 7h5M10 11h5" /></>}
+      {name === "search" && <><circle cx="10.5" cy="10.5" r="6.5" /><path d="m15.5 15.5 5 5" /></>}
       {name === "tools" && <g strokeWidth="1.5"><path d="M2 4h6v4H2zM8 4c2.5 0 3.5 1.5 3.5 3.5L9 6.5V8H8M5 8v12h2V8" /><path d="M15 3h6v5h-6zM15 8h6l-1 3-2-1v3l-2-1v3l-2-1v3l-2-1-1 4h-1z" /></g>}
       {name === "server-rack" && <><rect height="7" rx="1.8" width="16" x="4" y="3" /><rect height="7" rx="1.8" width="16" x="4" y="14" /><path d="M8 6.5h.01M8 17.5h.01M12 6.5h5M12 17.5h5" /></>}
       {name === "settings" && <><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1z" /></>}

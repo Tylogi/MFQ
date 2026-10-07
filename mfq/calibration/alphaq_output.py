@@ -64,10 +64,11 @@ def runtime_metadata(root: Path, plans, *, imatrix, imatrix_sha256: str, policy:
         assets.append(q.gguf_metadata_asset(q._gguf_reader(tokenizer)))
     assets = tuple({a.name: a for a in assets}.values())
     extra = dict(source=root.name, source_format='hf', policy='AlphaQ full-file allocation',
-        alphaq=policy, hf_config=config, mtp={'included': mtp},
-        imatrix=dict(file=imatrix.path.name, sha256=imatrix_sha256,
+        alphaq=policy, hf_config=config, mtp={'included': mtp})
+    if imatrix is not None:
+        extra['imatrix'] = dict(file=imatrix.path.name, sha256=imatrix_sha256,
             entries=len(imatrix.entries), datasets=list(imatrix.datasets),
-            chunk_count=imatrix.chunk_count, chunk_size=imatrix.chunk_size, legacy=imatrix.legacy))
+            chunk_count=imatrix.chunk_count, chunk_size=imatrix.chunk_size, legacy=imatrix.legacy)
     extra[ASSET_MANIFEST_KEY] = runtime_asset_manifest(assets)
     profile = q.profile_for_new_mfq(root, config, explicit_profile=sampling_profile)
     if profile is not None:

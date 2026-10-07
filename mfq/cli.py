@@ -208,7 +208,7 @@ def _calibrate_collect(args: argparse.Namespace) -> int:
 
 
 def _calibrate_imatrix(args: argparse.Namespace) -> int:
-    from mfq.calibration.dataset import load_corpus
+    from mfq.calibration.chat import prepare_calibration_corpus
     from mfq.calibration.imatrix import collect_imatrix
 
     device = args.device or ("mps" if args.backend == "metal" else "cuda:0")
@@ -221,7 +221,9 @@ def _calibrate_imatrix(args: argparse.Namespace) -> int:
     accumulation_dtype = args.accumulation_dtype
     if accumulation_dtype == "auto":
         accumulation_dtype = "float32" if args.backend == "metal" else "float64"
-    with load_corpus(args.corpus) as corpus:
+    with prepare_calibration_corpus(args.corpus, args.model,
+        apply_chat_template=getattr(args, "render_mode", "auto") != "plain",
+        window_length=args.window_length, train_tokens=args.train_tokens) as corpus:
         collect_imatrix(
             args.model,
             corpus,
@@ -237,7 +239,19 @@ def _calibrate_imatrix(args: argparse.Namespace) -> int:
             keep_hidden=args.keep_hidden,
             accumulation_dtype=accumulation_dtype,
             objective=getattr(args, "objective", "naq"),
+            layerwise=not getattr(args, "resident", False),
         )
+    return 0
+
+
+def _wt2_reference(args: argparse.Namespace) -> int:
+    from mfq.calibration.wt2 import generate_reference
+    backend = ('metal' if sys.platform == 'darwin' else 'cuda') if args.backend == 'auto' else args.backend
+    device = args.device or ('mps' if backend == 'metal' else 'cuda:0')
+    if device.split(':', 1)[0] != ('mps' if backend == 'metal' else 'cuda'):
+        raise ValueError('WT2 device must match the selected backend')
+    generate_reference(args.model, args.dataset, args.output, context_size=args.context_size,
+        chunks=args.chunks, device=device, layerwise=not args.resident)
     return 0
 
 
@@ -525,7 +539,7 @@ def _add_calibration_parsers(sub: argparse._SubParsersAction) -> None:
     data.add_argument("--validation-tokens", type=int, default=262_144)
     data.add_argument("--sequence-length", type=int, default=2048)
     data.add_argument("--seed", type=int, default=20260718)
-    data.add_argument("--render-mode", choices=("chat", "plain"), default="plain")
+    data.add_argument("--render-mode", choices=("auto", "chat", "plain"), default="auto")
     data.set_defaults(_impl=_calibrate_data)
 
     trace_data = stages.add_parser("trace-data", help="tokenize model-generated HF JSONL traces")
@@ -581,7 +595,9 @@ def _add_calibration_parsers(sub: argparse._SubParsersAction) -> None:
         help="collect a reusable activation importance matrix on CUDA or Metal",
     )
     imatrix.add_argument("--model", required=True, help="local full-precision HF model")
-    imatrix.add_argument("--corpus", required=True, help="prepared MFQ calibration corpus")
+    imatrix.add_argument("--corpus", required=True, help=".txt/.json/.jsonl file or prepared MFQ calibration corpus")
+    imatrix.add_argument("--render-mode", choices=("auto", "plain"), default="auto",
+        help="auto adds the model chat template only to unformatted records; plain disables automatic wrapping")
     imatrix.add_argument("--output", required=True, help="native MFQ imatrix artifact")
     imatrix.add_argument("--backend", choices=("cuda", "metal"), default="cuda")
     imatrix.add_argument(
@@ -614,6 +630,7 @@ def _add_calibration_parsers(sub: argparse._SubParsersAction) -> None:
         help="auto uses FP64 on CUDA and FP32 on Metal",
     )
     imatrix.add_argument("--keep-hidden", action="store_true")
+    imatrix.add_argument("--resident", action="store_true", help="keep source layers resident when current free memory permits; otherwise fall back to layerwise")
     imatrix.set_defaults(_impl=_calibrate_imatrix)
 
     allocate = stages.add_parser("allocate", help="score candidates and allocate tensor precision")
@@ -654,6 +671,16 @@ def _build_parser() -> argparse.ArgumentParser:
     add_quantize_parser(sub)
     add_solve_ew_parser(sub)
     _add_calibration_parsers(sub)
+    reference = sub.add_parser('wt2-reference', help='generate official WT2 reference logits from original HF weights')
+    reference.add_argument('--model', required=True)
+    reference.add_argument('--dataset', required=True)
+    reference.add_argument('--output', required=True)
+    reference.add_argument('--context-size', type=int, default=512)
+    reference.add_argument('--chunks', type=int, default=8)
+    reference.add_argument('--backend', choices=('auto', 'metal', 'cuda'), default='auto')
+    reference.add_argument('--device', default='')
+    reference.add_argument('--resident', action='store_true')
+    reference.set_defaults(_impl=_wt2_reference)
     sub.add_parser(
         "voice-runtime-check",
         help="verify optional MiniCPM-o voice output dependencies",
@@ -691,6 +718,10 @@ def main(argv: list[str] | None = None) -> int:
 
         multiprocessing.freeze_support()
     arguments = sys.argv[1:] if argv is None else argv
+    if arguments and arguments[0] == '_quantization-worker':
+        from mfq.quantize.workbench import main as quantization_main
+        quantization_main(arguments[1:])
+        return 0
     if arguments == ["_official-scoring-probe"]:
         print(4)
         return 0

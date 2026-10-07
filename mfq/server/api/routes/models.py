@@ -9,6 +9,7 @@ from fastapi import APIRouter, Query, Request, Response
 
 from mfq.server.api.dependencies import ServiceDependency
 from mfq.server.api.routes import ERROR_RESPONSES
+from mfq.server.protocol.analysis import CheckpointAnalysis
 from mfq.server.protocol.models import (
     ArtifactLineageList,
     CompareEvaluationsRequest,
@@ -180,6 +181,12 @@ async def model_artifact_directory(service: ServiceDependency, model_id: str) ->
     return await service.model_artifact_directory(model_id)
 
 
+@router.get("/api/v1/models/{model_id}/analysis", response_model=CheckpointAnalysis,
+            responses=ERROR_RESPONSES, tags=["models"])
+async def checkpoint_analysis(service: ServiceDependency, model_id: str) -> CheckpointAnalysis:
+    return await service.checkpoint_analysis(model_id)
+
+
 @router.get(
     "/api/v1/artifacts/lineage",
     response_model=ArtifactLineageList,
@@ -260,6 +267,7 @@ async def evaluation_tools(service: ServiceDependency, request: Request) -> Eval
     return EvaluationToolsResource(workspace_root=str(root) if root else None,
         api_base=str(request.base_url).rstrip("/") + "/v1",
         quality_available="evaluate.wikitext2" in handlers,
+        reference_available="reference.wikitext2" in handlers,
         benchmark_available="benchmark.inference" in handlers,
         accuracy_available="evaluate.accuracy" in handlers,
         task_benchmarks=benchmark_readiness(root) if "evaluate.accuracy" in handlers else {})

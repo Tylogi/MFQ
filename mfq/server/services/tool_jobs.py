@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from mfq.server.api.network import download_environment
 from mfq.server.protocol.models import ErrorDetail
+from mfq.server.protocol.quantization import Wt2ReferencePayload
 from mfq.server.services.jobs import JobContext, JobExecutionError, TypedJobHandler
 from mfq.server.services.inference_benchmark import InferenceBenchmarkPayload, WikitextQualityPayload, run_inference_benchmark
 from mfq.server.services.accuracy_benchmark import AccuracyBenchmarkPayload, run_accuracy_benchmark
@@ -171,6 +172,7 @@ class ImatrixCalibrationPayload(_Payload):
     accumulation_dtype: Literal["auto", "float32", "float64"] = "auto"
     work_dir: str | None = Field(default=None, max_length=1024)
     keep_hidden: bool = False
+    layerwise: bool = True
 
 
 class ImportArtifactPayload(_Payload):
@@ -246,6 +248,8 @@ class ToolJobHandlers:
         self.voice_component = voice_component
         self.activate_voice_output = activate_voice_output
         self.runtime_manager = runtime_manager
+        from mfq.server.services.quantization import QuantizationWorkbench
+        self.quantization_workbench = QuantizationWorkbench(self)
 
     def _mfq_command(self, *arguments: str) -> list[str]:
         command = [str(self.paths.python)]
@@ -257,11 +261,13 @@ class ToolJobHandlers:
     def handlers(self) -> dict[str, Any]:
         result: dict[str, Any] = {
             "dataset.download": TypedJobHandler(self.download_evaluation_dataset, OfficialDatasetDownloadPayload),
+            "reference.wikitext2": TypedJobHandler(self.wikitext_reference, Wt2ReferencePayload),
             "artifact.import": TypedJobHandler(self.import_artifact, ImportArtifactPayload),
             "calibrate.imatrix": TypedJobHandler(self.calibrate_imatrix, ImatrixCalibrationPayload),
             "model.validate": TypedJobHandler(self.validate_container, ContainerValidationPayload),
             "model.quantize": TypedJobHandler(self.quantize, QuantizePayload),
         }
+        result.update(self.quantization_workbench.handlers())
         if self.voice_component is not None:
             result["component.voice_output.install"] = TypedJobHandler(
                 self.install_voice_output, VoiceOutputInstallPayload
@@ -324,6 +330,8 @@ class ToolJobHandlers:
         keep_hidden: bool = False,
         progress_start: float = 0.01,
         progress_end: float = 0.99,
+        apply_chat_template: bool = True,
+        layerwise: bool = True,
     ) -> dict[str, Any]:
         resolved_backend = self._resolve_imatrix_backend(backend)
         resolved_device = device or ("mps" if resolved_backend == "metal" else "cuda:0")
@@ -335,6 +343,8 @@ class ToolJobHandlers:
             str(model),
             "--corpus",
             str(corpus),
+            "--render-mode",
+            "auto" if apply_chat_template else "plain",
             "--output",
             str(output),
             "--backend",
@@ -361,14 +371,20 @@ class ToolJobHandlers:
             argv.extend(["--work-dir", str(work_dir)])
         if keep_hidden:
             argv.append("--keep-hidden")
+        if not layerwise:
+            argv.append("--resident")
 
-        def progress(line: str) -> tuple[float, str] | None:
+        loading_data = {}
+        def progress(line: str):
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 return None
             if not isinstance(event, dict):
                 return None
+            if event.get('event') == 'source_loading':
+                loading_data['source_loading'] = event
+                return progress_start, 'Insufficient free memory; using layerwise loading' if event.get('fallback_reason') else 'Source loading mode selected', loading_data.copy()
             if event.get("event") == "imatrix_layer":
                 layer = int(event.get("layer", 0)) + 1
                 layers = max(1, int(event.get("layers", 1)))
@@ -376,9 +392,10 @@ class ToolJobHandlers:
                 return (
                     progress_start + (progress_end - progress_start) * fraction,
                     f"Imatrix layer {layer}/{layers}",
+                    loading_data.copy(),
                 )
             if event.get("event") == "imatrix_saved":
-                return progress_end, "Imatrix saved"
+                return progress_end, "Imatrix saved", loading_data.copy()
             return None
 
         lines = await self._run(
@@ -391,12 +408,16 @@ class ToolJobHandlers:
         if not output.is_file():
             raise self._failure("imatrix_output_missing", "calibration produced no imatrix")
         saved = self._last_json_event(lines, "imatrix_saved") or {}
+        prepared = self._last_json_event(lines, "calibration_corpus_prepared") or {}
+        loading = self._last_json_event(lines, "source_loading") or {}
         return {
             "backend": resolved_backend,
             "device": resolved_device,
             "entries": int(saved.get("entries", 0)),
             "tokens": int(saved.get("tokens", train_tokens)),
             "total_bytes": output.stat().st_size,
+            "chat_rendering": prepared.get("chat_rendering", {}),
+            "loading": loading,
         }
 
     async def calibrate_imatrix(
@@ -423,6 +444,7 @@ class ToolJobHandlers:
             accumulation_dtype=request.accumulation_dtype,
             work_dir=work_dir,
             keep_hidden=request.keep_hidden,
+            layerwise=request.layerwise,
         )
         uri = self._artifact_uri(output)
         await context.artifact(
@@ -814,6 +836,51 @@ class ToolJobHandlers:
             "kl_manifest": request.reference_manifest.removeprefix("workspace://"),
             "moe_gpu_cache_gb": request.moe_gpu_cache_gb})
 
+    async def wikitext_reference(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
+        request = Wt2ReferencePayload.model_validate(payload)
+        source = await asyncio.to_thread(self.quantization_workbench.source, request.model)
+        if source.format != 'hf' or not source.imatrix_supported:
+            raise self._failure('reference_architecture_unsupported', 'WT2 source generation currently supports original Qwen3.5 and Gemma4 HF architectures, including supported native QAT weights')
+        dataset = await asyncio.to_thread(context.store.get_dataset, request.dataset_id)
+        if dataset.kind != 'wikitext2':
+            raise self._failure('wrong_dataset_kind', 'WT2 generation requires the official WikiText-2 dataset')
+        text = await asyncio.to_thread(materialize_wt2, self._input(dataset.artifact_uri.removeprefix('workspace://')), dataset)
+        output = self.quantization_workbench.resolve(request.output)
+        manifest = output.with_name(output.name + '.manifest.json')
+        if output.exists() or manifest.exists():
+            raise self._failure('output_exists', 'reference output or manifest already exists')
+        backend = self._resolve_imatrix_backend(request.backend)
+        argv = self._mfq_command('wt2-reference', '--model', source.path, '--dataset', str(text),
+            '--output', str(output), '--context-size', str(request.context_size), '--chunks', str(request.chunks),
+            '--backend', backend, '--device', 'mps' if backend == 'metal' else 'cuda:0')
+        if not request.layerwise:
+            argv.append('--resident')
+
+        loading_data = {}
+        def progress(line):
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                return None
+            if event.get('event') == 'wt2_layer':
+                return .05 + .7 * event['layer'] / event['layers'], f"Reference layer {event['layer']}/{event['layers']}", loading_data.copy()
+            if event.get('event') == 'wt2_head':
+                return .75 + .23 * event['chunk'] / event['chunks'], f"Reference head {event['chunk']}/{event['chunks']}", loading_data.copy()
+            if event.get('event') == 'source_loading':
+                loading_data['source_loading'] = event
+                return .02, 'Insufficient free memory; using layerwise loading' if event.get('fallback_reason') else 'Source loading mode selected', loading_data.copy()
+            return None
+
+        async with self.quantization_workbench._lock:
+            lines = await self._run(context, argv, progress_parser=progress, final_progress=.99)
+        result = self._last_json_event(lines, 'wt2_reference_saved')
+        if not result or not output.is_file() or not manifest.is_file():
+            raise self._failure('reference_output_missing', 'reference generator produced no complete logits/manifest pair')
+        for path in (output, manifest):
+            await context.artifact(name=path.name, uri=path.as_uri(), media_type='application/octet-stream' if path == output else 'application/json',
+                metadata={'path': str(path), 'total_bytes': path.stat().st_size})
+        return {**result, 'dataset_id': str(request.dataset_id), 'artifact_kind': 'wt2-reference'}
+
     async def perplexity(self, context: JobContext, payload: dict[str, Any]) -> dict[str, Any]:
         request = PerplexityPayload.model_validate(payload)
         artifact = await self._model(request.model)
@@ -1002,7 +1069,7 @@ class ToolJobHandlers:
         env: dict[str, str] | None = None,
         progress_pattern: re.Pattern[str] | None = None,
         progress_total: int | None = None,
-        progress_parser: Callable[[str], tuple[float, str] | None] | None = None,
+        progress_parser: Callable[[str], tuple[float, str] | tuple[float, str, dict[str, Any]] | None] | None = None,
         final_progress: float = 0.99,
         final_message: str = "Finalizing output",
     ) -> list[str]:
@@ -1049,8 +1116,8 @@ class ToolJobHandlers:
             if progress_parser is not None:
                 parsed = progress_parser(line)
                 if parsed is not None:
-                    progress, message = parsed
-                    await context.progress(min(0.99, max(0.01, progress)), message=message[:200])
+                    progress, message = parsed[:2]
+                    await context.progress(min(0.99, max(0.01, progress)), message=message[:200], data=parsed[2] if len(parsed) == 3 else None)
             if progress_pattern is not None:
                 match = progress_pattern.search(line)
                 if match:

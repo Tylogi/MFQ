@@ -27,14 +27,18 @@ class FittedPayloadCache:
     """
 
     def __init__(self, root, directory, imatrix, imatrix_sha256, backend,
-                 *, row_chunk=0, artifact_root=None):
+                 *, row_chunk=0, artifact_root=None, source_factory=None, identity=None, data_free=False, adaptive_rows=False):
         if row_chunk < 0:
             raise ValueError('row chunk must be non-negative')
         self.root, self.directory = Path(root), Path(directory)/'fitted'
         self.imatrix, self.imatrix_sha256 = imatrix, imatrix_sha256
         self.backend, self.row_chunk = backend, int(row_chunk)
         self.artifact_root = artifact_root
-        self.source = source_identity(self.root)
+        self.source_identity = identity or (lambda: source_identity(self.root))
+        self.source_factory = source_factory or (lambda item: rows_for_plan(self.root, item))
+        self.data_free = data_free
+        self.adaptive_rows = adaptive_rows
+        self.source = self.source_identity()
         self.checked = []
         self.verified = {}
 
@@ -58,7 +62,7 @@ class FittedPayloadCache:
             identities[precision]['experts'].append(index)
         return dict(format='mfq.alphaq-fitted-tensor.v1', source=self.source,
                     imatrix_sha256=self.imatrix_sha256, plan=plan_identity(item),
-                    expert_pools=list(identities.values()))
+                    expert_pools=list(identities.values()), **({'data_free': True} if self.data_free else {}))
 
     def require(self, item):
         from mfq.tools import quantize_hf_to_mfq as q
@@ -85,16 +89,16 @@ class FittedPayloadCache:
         else:
             directory.mkdir(parents=True, exist_ok=True)
             temporary = directory/'tensor.partial'
-            binding = q._bind_hf_imatrix(self.imatrix, [item]).get(item.name)
+            binding = None if self.data_free else q._bind_hf_imatrix(self.imatrix, [item]).get(item.name)
             rows = math.prod(item.shape[:-1]) if len(item.shape) > 1 else item.shape[0]
             chunk = self.row_chunk or max(8, (rows+7)//8*8)
             failures, started = [], time.monotonic()
             while True:
                 try:
-                    with rows_for_plan(self.root, item) as source:
+                    with self.source_factory(item) as source:
                         dtype, size = self._fit(item, source, binding, temporary, chunk)
                 except torch.OutOfMemoryError:
-                    if chunk <= 8 or self.row_chunk:
+                    if chunk <= 8 or (self.row_chunk and not self.adaptive_rows):
                         raise
                     failures.append(chunk)
                 else:
@@ -112,7 +116,7 @@ class FittedPayloadCache:
                           failed_rows=failures[-1], next_rows=chunk)
             if temporary.stat().st_size != size:
                 raise ValueError(f'AlphaQ fitted tensor size differs: {item.name}')
-            if self.signature(item) != signature or source_identity(self.root) != self.source:
+            if self.signature(item) != signature or self.source_identity() != self.source:
                 raise ValueError('AlphaQ source or tables changed during weight fitting')
             os.replace(temporary, payload)
             info = payload.stat()
@@ -130,18 +134,23 @@ class FittedPayloadCache:
         from mfq.tools import quantize_hf_to_mfq as q
 
         name, device = self.backend.name, self.backend.device
+        writer = getattr(source, 'write_native', None)
+        if writer is not None:
+            native = writer(item, path, chunk)
+            if native is not None:
+                return native
         if item.target_dtype == 'MFE':
             size = q._write_mixed_moe_axis0_blob(source, item.shape, item.expert_shape,
                 item.expert_precisions, path, chunk, name, device, self.artifact_root,
                 importance=q._hf_expert_importance(item, binding),
-                neuron_importance=q._hf_neuron_importance(item, binding))
+                neuron_importance=q._hf_neuron_importance(item, binding), nint_data_free=self.data_free)
             dtype = 'MFE'
         elif item.target_dtype.startswith('NINT'):
             size = q._write_nint_axis0_blob(source, item.shape, q._spec_for_plan(item, NintSpec()),
                 path, chunk, name, device,
                 importance_rows=None if binding is None else binding.input_rows or binding.rows,
                 neuron_importance_rows=None if binding is None else binding.neuron_rows,
-                allocation_group_rows=None if binding is None else binding.allocation_group_rows)
+                allocation_group_rows=None if binding is None else binding.allocation_group_rows, nint_data_free=self.data_free)
             dtype = q._nint_blob_public_dtype(path)
         elif item.target_precision is not None and item.target_dtype.startswith('NVQ'):
             size = q._write_flat_family_axis0_blob(source, item.shape, item.target_precision,
@@ -160,7 +169,7 @@ class FittedPayloadCache:
         return dtype, size
 
     def validate(self):
-        if source_identity(self.root) != self.source:
+        if self.source_identity() != self.source:
             raise ValueError('AlphaQ source changed during weight fitting')
         for part in self.checked:
             checked_file(part)

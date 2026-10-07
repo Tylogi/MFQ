@@ -1068,6 +1068,7 @@ def collect_imatrix(
     keep_hidden: bool = False,
     accumulation_dtype: str = "float64",
     objective: str = "naq",
+    layerwise: bool = True,
 ) -> ImportanceMatrix:
     """Collect one frozen train-only BF16 imatrix layer by layer."""
 
@@ -1135,10 +1136,13 @@ def collect_imatrix(
     layout: list[tuple[CalibrationBatch, int, int]] = []
     cursor = 0
     started = time.time()
+    from mfq.calibration.loading import SourceLayers
+    loading = SourceLayers(backend, layerwise=layerwise, context_size=window_length, batch_size=batch_size)
     try:
+        loading.__enter__()
         for batch in batches:
             ids = torch.as_tensor(batch.input_ids, dtype=torch.int64)
-            value = backend.initial_hidden(ids)
+            value = loading.initial_hidden(ids)
             end = cursor + int(ids.numel())
             store.write(cursor, value)
             layout.append((batch, cursor, end))
@@ -1146,7 +1150,7 @@ def collect_imatrix(
         store.flush()
         backend.release_initial_state()
         for layer_index in range(backend.num_layers):
-            with backend.layer(layer_index, quantized=False) as layer:
+            with loading.layer(layer_index) as layer:
                 collector.install_layer(layer, layer_index, targets_by_layer[layer_index])
                 try:
                     for batch, start, end in layout:
@@ -1174,7 +1178,9 @@ def collect_imatrix(
                 finally:
                     collector.set_valid_mask(None)
                     collector.close()
+            del layer, hidden, valid_mask
             store.flush()
+            store.discard_cached_pages()
             _release(target_device)
             print(
                 json.dumps(
@@ -1261,10 +1267,13 @@ def collect_imatrix(
             "corpus": {
                 "name": corpus.root.name,
                 "manifest_sha256": _sha256(corpus.root / "manifest.json"),
+                "tokenizer": corpus.manifest.get("tokenizer", {}),
+                "chat_rendering": corpus.manifest.get("chat_rendering", {}),
             },
             "device": str(target_device),
             "backend": "metal" if target_device.type == "mps" else "cuda",
             "forward_dtype": "bfloat16",
+            "layerwise": loading.layerwise,
             "accumulation_dtype": str(dtype).removeprefix("torch."),
             "attention": attention,
             "seed": int(seed),
@@ -1301,6 +1310,7 @@ def collect_imatrix(
         return result
     finally:
         collector.close()
+        loading.__exit__(None, None, None)
         backend.release_initial_state()
         close = getattr(backend, "close", None)
         if callable(close):

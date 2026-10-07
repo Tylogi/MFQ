@@ -69,7 +69,9 @@ export function StudioSidebar() {
     { label: ['交互', 'Playground'], items: [
       { label: ['对话', 'Chat'], icon: 'chat', path: '/chat', active: view === 'chat', current: true },
     ] },
-    { label: ['模型工具', 'Model tools'], items: [
+    { label: ['工具', 'Model tools'], items: [
+      { label: ['分析', 'Analysis'], icon: 'search', path: lab('analysis'),
+        active: view === 'lab' && labPage === 'analysis' },
       { label: ['模型下载', 'Model downloads'], icon: 'download', path: lab('models'),
         active: view === 'lab' && labPage === 'models' },
       { label: ['评测与数据集', 'Evaluations'], icon: 'activity', path: lab('evaluations'),

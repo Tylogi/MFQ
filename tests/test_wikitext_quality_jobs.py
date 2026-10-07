@@ -2,6 +2,8 @@ import asyncio
 import hashlib
 import json
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import pyarrow as pa
@@ -52,4 +54,47 @@ def test_wt2_reference_contract_and_top1(tmp_path, case, monkeypatch):
             assert result["top1_agreement"] == .98 and result["kld"] == .01
             assert store.list_evaluations()[0].dataset_manifest["sha256"] == text_digest
             assert store.list_evaluations()[0].dataset_manifest["source_sha256"] == digest
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('layerwise', [None, False, True])
+@pytest.mark.parametrize('tampered', [False, True])
+def test_reference_generation_keeps_official_dataset_and_loading_contract(tmp_path, monkeypatch, layerwise, tampered):
+    async def run():
+        corpus = tmp_path / 'wt2.parquet'
+        pq.write_table(pa.Table.from_pylist([{'text': 'official corpus\n'}]), corpus)
+        digest = hashlib.sha256(corpus.read_bytes()).hexdigest()
+        monkeypatch.setattr(evaluation_datasets, 'WT2_TEXT_SHA256', hashlib.sha256(b'official corpus\n').hexdigest())
+        monkeypatch.setitem(evaluation_datasets.OFFICIAL_DATASETS, 'wt2-raw-test', replace(evaluation_datasets.OFFICIAL_DATASETS['wt2-raw-test'], sha256=digest, byte_size=corpus.stat().st_size, rows=1))
+        store = SessionStore(tmp_path / 'db.sqlite3')
+        dataset = store.create_dataset(CreateDatasetRequest(name='WT2', kind='wikitext2', artifact_uri='workspace://wt2.parquet'), sha256=digest, byte_size=corpus.stat().st_size)
+        context = JobContext(store, store.create_job('reference.wikitext2', {}).id, asyncio.Event())
+        tools = ToolJobHandlers(ModelCatalog([tmp_path]), ToolJobPaths(tmp_path, Path(sys.executable), None, None, None, None))
+        monkeypatch.setattr(tools.quantization_workbench, 'source', lambda path: SimpleNamespace(path=str(tmp_path / 'source'), format='hf', imatrix_supported=True))
+        output = tmp_path / 'refs' / 'output.logits'
+        manifest = output.with_name(output.name + '.manifest.json')
+        calls = []
+        async def execute(context, argv, **kwargs):
+            calls.append(argv)
+            assert argv[:4] == [sys.executable, '-m', 'mfq.cli', 'wt2-reference']
+            assert ('--resident' in argv) is (layerwise is False)
+            assert '--render-mode' not in argv
+            output.parent.mkdir()
+            output.write_bytes(b'reference')
+            manifest.write_text('{}')
+            return [json.dumps({'event': 'wt2_reference_saved', 'output': str(output), 'manifest': str(manifest), 'context_size': 512, 'chunks': 8, 'parallel': 1})]
+        monkeypatch.setattr(tools, '_run', execute)
+        payload = {'model': str(tmp_path / 'source'), 'dataset_id': str(dataset.id), 'output': str(output)}
+        if layerwise is not None:
+            payload['layerwise'] = layerwise
+        if tampered:
+            corpus.write_bytes(b'changed')
+            with pytest.raises(JobExecutionError):
+                await tools.wikitext_reference(context, payload)
+            assert not calls
+        else:
+            result = await tools.wikitext_reference(context, payload)
+            assert result['artifact_kind'] == 'wt2-reference'
+            assert result['dataset_id'] == str(dataset.id)
+            assert not store.list_evaluations()
     asyncio.run(run())

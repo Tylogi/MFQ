@@ -161,6 +161,8 @@ def full_file_budget(
     joint_dense: bool = True,
     preserve_missing_imatrix: bool = True,
     artifact_root: str | Path | None = None,
+    dense_dtype_tags: Mapping[str, str] | None = None,
+    check_capacity: bool = True,
 ) -> AlphaQFileBudget:
     """Reserve the real header/table, assets, PLE and native/fixed weights.
 
@@ -190,7 +192,7 @@ def full_file_budget(
         if item.name in variable_experts:
             dtype, size = 'MFE', 0
         elif item.name in variable_dense:
-            dtype, size = 'NINT', 0
+            dtype, size = (dense_dtype_tags or {}).get(item.name, 'NINT'), 0
         else:
             if item.name in native:
                 item = replace(item, target_dtype=native[item.name], target_spec=None,
@@ -202,6 +204,6 @@ def full_file_budget(
     stream = io.BytesIO()
     _write_header_and_table(stream, replace(header, num_tensors=len(records)), records)
     fixed = stream.tell()+fixed_payload
-    if cap <= fixed:
+    if check_capacity and cap <= fixed:
         raise ValueError('full-file cap leaves no space for allocated weights')
     return AlphaQFileBudget(cap, fixed, scope.model_weight_count, native, stream.tell(), fixed_payload)

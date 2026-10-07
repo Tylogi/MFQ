@@ -789,8 +789,10 @@ ReferenceContract load_reference_contract(
         contract.n_ubatch > contract.n_batch ||
         contract.chunks < 1 || contract.target_start < 1 ||
         contract.score_count < 1 ||
-        contract.attention != "native_model_default" ||
-        contract.kv_cache_dtype != "native_model_default" ||
+        !((contract.attention == "native_model_default" &&
+           contract.kv_cache_dtype == "native_model_default") ||
+          (contract.attention == "hf_sdpa" &&
+           contract.kv_cache_dtype == "none")) ||
         contract.scored_tokens !=
             static_cast<std::uint64_t>(contract.chunks) *
                 static_cast<std::uint64_t>(contract.score_count)) {

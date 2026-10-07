@@ -1028,15 +1028,29 @@ class ModelParameterBreakdown(ProtocolModel):
 
 
 class ModelCacheComponent(ProtocolModel):
+    group: str | None = None
+    name: str | None = None
+    subgroup: str | None = None
+    layers: int | None = Field(default=None, ge=1)
     bytes_per_row: int = Field(gt=0)
     tokens_per_row: int = Field(default=1, ge=1)
     allocation: Literal['exact', 'power_of_two'] = 'exact'
     minimum_rows: int = Field(default=0, ge=0)
+    row_rounding: Literal['ceil', 'floor'] = 'ceil'
+    active_after: int = Field(default=0, ge=0)
+
+
+class ModelCacheFixedComponent(ProtocolModel):
+    group: str
+    name: str
+    layers: int | None = Field(default=None, ge=1)
+    bytes: int = Field(ge=0)
 
 
 class ModelCacheProfile(ProtocolModel):
     max_context: int = Field(ge=1)
     fixed_bytes: int = Field(default=0, ge=0)
+    fixed_components: list[ModelCacheFixedComponent] = Field(default_factory=list)
     components: list[ModelCacheComponent] = Field(default_factory=list)
 
 
@@ -1132,6 +1146,7 @@ class EvaluationToolsResource(ProtocolModel):
     workspace_root: str | None = None
     api_base: str
     quality_available: bool
+    reference_available: bool = False
     benchmark_available: bool
     accuracy_available: bool = False
     task_benchmarks: dict[str, dict[str, Any]] = Field(default_factory=dict)

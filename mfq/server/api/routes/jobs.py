@@ -36,6 +36,9 @@ async def create_job(service: ServiceDependency, body: CreateJobRequest) -> JobR
     if body.kind == "runtime.memory.configure":
         from mfq.server.services.service import ServiceError
         raise ServiceError(403, "use_memory_policy_endpoint", "configure memory through /api/v1/runtime/memory-policy")
+    if body.kind == "quantization.recipe":
+        from mfq.server.api.routes.quantization import invoke, workbench
+        await invoke(workbench(service).validate_recipe, body.payload)
     return await service.create_job(body)
 
 
@@ -124,9 +127,13 @@ async def cancel_job(service: ServiceDependency, job_id: UUID) -> JobResource:
     tags=["jobs"],
 )
 async def retry_job(service: ServiceDependency, job_id: UUID) -> JobResource:
-    if (await service.get_job(job_id)).kind == "runtime.memory.configure":
+    job = await service.get_job(job_id)
+    if job.kind == "runtime.memory.configure":
         from mfq.server.services.service import ServiceError
         raise ServiceError(403, "use_memory_policy_endpoint", "configure memory through /api/v1/runtime/memory-policy")
+    if job.kind == "quantization.recipe":
+        from mfq.server.api.routes.quantization import invoke, workbench
+        await invoke(workbench(service).validate_recipe, job.payload)
     return await service.retry_job(job_id)
 
 

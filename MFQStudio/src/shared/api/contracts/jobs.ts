@@ -9,7 +9,7 @@ export interface JobResource {
     'queued' | 'running' | 'cancelling' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
   payload: Record<string, unknown>;
   progress: number;
-  progress_data?: { downloaded_bytes?: number; total_bytes?: number | null; bytes_per_second?: number; files_completed?: number };
+  progress_data?: { downloaded_bytes?: number; total_bytes?: number | null; bytes_per_second?: number; files_completed?: number; phase?: string; tensor?: string; completed?: number; total?: number; reason?: string; source_loading?: { layerwise: boolean; fallback_reason?: string | null } };
   cancel_requested: boolean;
   result?: Record<string, unknown> | null;
   error?: ApiErrorBody['error'] | null;

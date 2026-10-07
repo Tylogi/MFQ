@@ -307,7 +307,7 @@ class TensorPlan:
     target_precision: ExpertPrecision | None = None
 
     def target_option(self, name: str, default=None):
-        return dict(self.target_options).get(name, default)
+        return dict(self.target_options).get(name, self.target_precision.option(name, default) if self.target_precision else default)
 
     @property
     def expert_specs(self) -> tuple[NintSpec, ...] | None:
@@ -523,7 +523,7 @@ class _ScaledFp8TensorSlice:
     ) -> None:
         if weight.dtype_name not in {"F8_E4M3", "F8_E5M2"}:
             raise ValueError(f"scaled float8 source requires float8 weights: {weight.name}")
-        if len(weight.shape) != 2:
+        if len(weight.shape) not in (2, 3):
             raise ValueError(
                 f"scaled float8 source requires a matrix: {weight.name} {weight.shape}"
             )
@@ -549,7 +549,8 @@ class _ScaledFp8TensorSlice:
             column_block = int(block_match.group(2) or row_block)
             self._block_shape = (row_block, column_block)
             expected = (
-                math.ceil(self.rows / row_block),
+                *weight.shape[:-2],
+                math.ceil(weight.shape[-2] / row_block),
                 math.ceil(self.columns / column_block),
             )
             if tuple(self._scale.shape) != expected:
@@ -587,6 +588,11 @@ class _ScaledFp8TensorSlice:
             column_block,
             rounding_mode="floor",
         )
+        if len(self.shape) == 3:
+            rows_per_expert = self.shape[-2]
+            expert_ids = torch.div(row_ids.to(device=device), rows_per_expert, rounding_mode='floor')
+            row_blocks = torch.div(row_ids.to(device=device) % rows_per_expert, row_block, rounding_mode='floor')
+            return output * scale[expert_ids[:, None], row_blocks[:, None], column_blocks[None, :]]
         return output * scale[row_blocks[:, None], column_blocks[None, :]]
 
     def read_rows(
@@ -925,7 +931,7 @@ def _source_quantization(
     metadata = inventory[name]
     if metadata.dtype not in _HF_FP8_DTYPES and metadata.dtype != "I8":
         return None
-    if len(metadata.shape) != 2:
+    if len(metadata.shape) not in (2, 3) or (metadata.dtype == 'I8' and len(metadata.shape) != 2):
         if metadata.dtype in _HF_FP8_DTYPES:
             raise ValueError(f"float8 HF source must be a matrix: {name} {metadata.shape}")
         return None
@@ -1010,8 +1016,9 @@ def _source_quantization(
                 for row_block, column_block in candidates
                 if block_scale.shape
                 == (
-                    math.ceil(metadata.shape[0] / row_block),
-                    math.ceil(metadata.shape[1] / column_block),
+                    *metadata.shape[:-2],
+                    math.ceil(metadata.shape[-2] / row_block),
+                    math.ceil(metadata.shape[-1] / column_block),
                 )
             ),
             None,
@@ -3035,7 +3042,7 @@ def _calibration_target(selection) -> str:
     precision = selection.descriptor
     if precision.nint_spec is not None:
         return f"NINT{precision.nint_spec.bits}"
-    if precision.family.startswith("NVQ") or precision.family in {"NINT8-0", "NPQ0-L"}:
+    if precision.family.startswith("NVQ") or precision.family in {"NINT8-0", "NPQ0-L", *_MATRIX_LOCAL_SQ_FAMILIES}:
         return precision.family
     raise ValueError(f"unsupported dense calibration precision: {precision.family}")
 
@@ -4066,6 +4073,18 @@ def _dense_blob_from_tensor(t: torch.Tensor, blob_path: Path, dtype: str) -> int
     return blob_path.stat().st_size
 
 
+def _stream_row_batches(source, rows: int, requested: int):
+    start = 0
+    gate = getattr(source, 'batch_rows', None)
+    while start < rows:
+        amount = int(gate(requested)) if gate is not None else requested
+        if amount <= 0 or amount > requested:
+            raise ValueError('invalid cooperative row batch size')
+        end = min(rows, start + amount)
+        yield start, end
+        start = end
+
+
 def _write_dense_axis0_blob(
     source,
     shape: tuple[int, ...],
@@ -4083,8 +4102,7 @@ def _write_dense_axis0_blob(
     with blob_path.open("wb") as handle:
         handle.write(struct.pack("<I", len(shape)))
         handle.write(struct.pack(f"<{len(shape)}q", *shape))
-        for start in range(0, rows, chunk_rows):
-            end = min(rows, start + chunk_rows)
+        for start, end in _stream_row_batches(source, rows, chunk_rows):
             value = source.read_rows(start, end, device="cpu")
             if tuple(map(int, value.shape)) != (end - start, columns):
                 raise ValueError(
@@ -4118,8 +4136,7 @@ def _write_float8_e4m3_axis0_blob(
     with blob_path.open("wb") as target:
         target.write(struct.pack("<I", len(shape)))
         target.write(struct.pack(f"<{len(shape)}q", *shape))
-        for start in range(0, rows, row_chunk):
-            end = min(start + row_chunk, rows)
+        for start, end in _stream_row_batches(source, rows, row_chunk):
             chunk = source.read_rows(start, end, device="cpu")
             if chunk.dtype != torch.float8_e4m3fn:
                 raise TypeError("raw E4M3 preservation requires float8_e4m3fn source rows")
@@ -4301,8 +4318,7 @@ def _allocate_nint_v2_rows(
     allocation_groups = (
         None if allocation_group_rows is None else np.empty(out, dtype=np.int32)
     )
-    for start in range(0, out, row_chunk):
-        end = min(start + row_chunk, out)
+    for start, end in _stream_row_batches(source, out, row_chunk):
         importance = None if importance_rows is None else importance_rows(start, end)
         if quant_backend in ACCELERATOR_BACKENDS and hasattr(source, "read_rows"):
             chunk = source.read_rows(start, end, device=device)
@@ -4463,8 +4479,7 @@ def _write_nint_axis0_blob(
         packed_cuda = (quant_backend == 'cuda' and row_chunk % 8 == 0
                        and np.all(row_q_bits == spec.bits)
                        and np.all(row_sub_bits == spec.sub_bits))
-        for start in range(0, out, row_chunk):
-            end = min(start + row_chunk, out)
+        for start, end in _stream_row_batches(sl, out, row_chunk):
             importance = None if importance_rows is None else importance_rows(start, end)
             if quant_backend in ACCELERATOR_BACKENDS and hasattr(sl, "read_rows"):
                 chunk = sl.read_rows(start, end, device=device)
@@ -4565,6 +4580,10 @@ class _ExpertPoolRowSource:
         }:
             raise ValueError(f"unsupported expert row source reshape: {requested}")
         return self
+
+    def batch_rows(self, requested: int) -> int:
+        gate = getattr(self.source, 'batch_rows', None)
+        return gate(requested) if gate is not None else requested
 
     def _read_expert_rows(self, expert: int, start: int, end: int) -> torch.Tensor:
         if hasattr(self.source, "read_expert_rows"):
@@ -5690,8 +5709,7 @@ def _write_flat_family_axis0_blob(
         if synthetic:
             return int(offset)
 
-        for start in range(0, out, row_chunk):
-            end = min(start + row_chunk, out)
+        for start, end in _stream_row_batches(source, out, row_chunk):
             chunk = (
                 source.read_rows(start, end, device=device)
                 if quant_backend in ACCELERATOR_BACKENDS and hasattr(source, "read_rows")
@@ -6667,7 +6685,7 @@ def _estimate_bytes(
             )
         elif item.target_dtype == "MXFP8":
             nint_total += _plan_blob_nbytes(item, spec, artifact_root)
-        elif item.target_dtype in {MXFP8_SQ_DTYPE, FP8_128SQ_DTYPE}:
+        elif item.target_dtype in _MATRIX_LOCAL_SQ_FAMILIES:
             nint_total += _plan_blob_nbytes(item, spec, artifact_root)
         else:
             item_size = {
@@ -6692,6 +6710,11 @@ def _plan_blob_nbytes(
     nvq_jsc_banks: int = 4,
 ) -> int:
     n = int(np.prod(item.shape))
+    if item.target_dtype == 'MXFP4-SQ':
+        return mxfp4_sq_blob_nbytes(int(item.target_option('q', 2)), *item.shape)
+    if item.target_dtype == 'MXFP4':
+        rows, columns = map(int, item.shape)
+        return len(mx_header_bytes('MXFP4', item.shape, (rows, columns // 2), (rows, columns // 32))) + rows * (columns // 2 + columns // 32)
     if item.target_dtype == "MFE":
         if item.expert_shape is None or item.expert_precisions is None:
             raise ValueError(f"MFE plan lacks expert metadata: {item.name}")
@@ -6759,7 +6782,7 @@ def _plan_blob_nbytes(
         rows, columns = (int(value) for value in item.shape)
         scale_rows, scale_columns = _mxfp8_scale_shape(
             item.shape,
-            item.source_quantization,
+            item.source_quantization or ('mxfp8_block128' if item.source_dtype == 'MXFP8' else None),
         )
         return len(
             mx_header_bytes(
@@ -7518,6 +7541,19 @@ def convert(args: argparse.Namespace) -> None:
                             q=int(item.target_option("q", 4)),
                             neuron_importance=dense_neuron_importance,
                         )
+                        source = raw_source
+                    elif item.target_dtype == 'MXFP4-SQ':
+                        start = item.row_start or 0
+                        end = start + item.shape[0]
+                        if isinstance(raw_source, _Mxfp4TensorSlice):
+                            packed = raw_source.weight.read_rows(start, end, device='cpu').view(torch.uint8).numpy()
+                            scales = raw_source.scale_source.read_rows(start, end, device='cpu').view(torch.uint8).numpy()
+                        elif mfq_checkpoint is not None and raw_source.dtype_name == 'MXFP4':
+                            values, scale_values = raw_source._mx_arrays()
+                            packed, scales = np.array(values[start:end], copy=True), np.array(scale_values[start:end], copy=True)
+                        else:
+                            raise TypeError('MXFP4-SQ requires original native MXFP4 codes and scales')
+                        nbytes = write_mxfp4_sq_blob(blob_path, packed, scales, row_q_bits=int(item.target_option('q', 2)))
                         source = raw_source
                     elif item.target_dtype == "NINT8-0":
                         source = _HfPlanRowSource(raw_source, item)

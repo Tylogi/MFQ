@@ -1,12 +1,14 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import type { BenchmarkParameters, DatasetResource, ModelArtifact, OfficialBenchmarkReadiness, RuntimeInstance } from '../../shared/api/types';
 import type { TaskBenchmark } from './benchmarkTasks';
+import { Wt2ReferenceGenerator, type GeneratedWt2Reference } from './Wt2ReferenceGenerator';
 
 type Translate = (zh: string, en: string) => string;
 type Submit = (kind: string, payload: Record<string, unknown>) => Promise<void>;
 
-export function QualityForm({ models, datasets, instances, available, busy, submit, tr }: {
-  models: ModelArtifact[]; datasets: DatasetResource[]; instances: RuntimeInstance[]; available: boolean; busy: boolean; submit: Submit; tr: Translate;
+export function QualityForm({ models, datasets, instances, available, referenceAvailable = false, outputRoot = '', generatedReference, busy, submit, tr }: {
+  models: ModelArtifact[]; datasets: DatasetResource[]; instances: RuntimeInstance[]; available: boolean; referenceAvailable?: boolean;
+  outputRoot?: string; generatedReference?: GeneratedWt2Reference | null; busy: boolean; submit: Submit; tr: Translate;
 }) {
   const [model, setModel] = useState('');
   const [dataset, setDataset] = useState('');
@@ -19,6 +21,12 @@ export function QualityForm({ models, datasets, instances, available, busy, subm
   const alreadyLoaded = instances.some((item) => item.model === model && ['loading', 'ready', 'busy'].includes(item.state));
   useEffect(() => { if (!models.some((item) => item.name === model)) setModel(models[0]?.name || ''); }, [models, model]);
   useEffect(() => { if (!datasets.some((item) => item.id === dataset)) setDataset(datasets.find((item) => item.kind === 'wikitext2')?.id || ''); }, [datasets, dataset]);
+  useEffect(() => {
+    if (!generatedReference) return;
+    setReference(generatedReference.output); setManifest(generatedReference.manifest);
+    setContext(generatedReference.context_size); setChunks(generatedReference.chunks);
+    setParallel(generatedReference.parallel); setDataset(generatedReference.dataset_id);
+  }, [generatedReference]);
   async function run(event: FormEvent) {
     event.preventDefault();
     await submit('evaluate.wikitext2', { model, dataset_id: dataset, reference_logits: reference.trim(),
@@ -39,6 +47,7 @@ export function QualityForm({ models, datasets, instances, available, busy, subm
       <label>{tr('参考 logits 文件', 'Reference logits file')}<input value={reference} onChange={(event) => setReference(event.target.value)} placeholder="datasets/wt2-reference.logits" required /></label>
       <label>{tr('参考 manifest', 'Reference manifest')}<input value={manifest} onChange={(event) => setManifest(event.target.value)} placeholder="datasets/wt2-reference.logits.manifest.json" required /></label>
     </div></fieldset>
+    {referenceAvailable && <Wt2ReferenceGenerator dataset={dataset} contextSize={context} chunks={chunks} available={referenceAvailable} busy={busy} outputRoot={outputRoot} submit={submit} />}
     <fieldset className="evaluation-fieldset"><legend>{tr('测试条件', 'Test conditions')}</legend><div className="evaluation-fields">
       <label>ctx<input type="number" min={32} max={1048576} value={context} onChange={(event) => setContext(Number(event.target.value))} required /></label>
       <label>{tr('测试窗口数', 'Context windows')}<input type="number" min={1} max={10000} value={chunks} onChange={(event) => setChunks(Number(event.target.value))} required /></label>

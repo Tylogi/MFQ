@@ -241,14 +241,16 @@ class FullPrecisionMfqTensorSource:
                 np.array(scales[start:stop], copy=True, order="C"),
                 device=device,
             )
-        first_block = start // 128
-        last_block = (stop - 1) // 128 if stop else first_block - 1
+        block = self._mx_layout.block_shape
+        first_block = start // block[0]
+        last_block = (stop - 1) // block[0] if stop else first_block - 1
         return decode_mxfp8(
             np.array(values[start:stop], copy=True, order="C"),
             np.array(scales[first_block : last_block + 1], copy=True, order="C"),
             row_start=start,
             total_rows=self.rows,
             device=device,
+            block_shape=block,
         )
 
     def read_rows(
