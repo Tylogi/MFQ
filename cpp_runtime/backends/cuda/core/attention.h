@@ -33,6 +33,29 @@ public:
     void reset() { values_ = Tensor(); position_ = 0; }
     int64_t position() const { return position_; }
     const Tensor& storage() const { return values_; }
+    void replace_storage(Tensor values) {
+        MFQ_RUNTIME_CHECK(values.dim()==3 && values.size(1)>=position_ && values.size(1)<=maximum_ &&
+            values.size(2)==width_,"replacement sequence cache geometry mismatch");
+        values_=std::move(values);
+    }
+    void prepare_fixed() {
+        MFQ_RUNTIME_CHECK(values_.defined(), "fixed sequence cache requires a prefilled state");
+        if(values_.size(1)==maximum_)return;
+        auto expanded=tb::zeros({values_.size(0),maximum_,width_},values_.options());
+        if(position_)expanded.narrow(1,0,position_).copy_(values_.narrow(1,0,position_));
+        values_=std::move(expanded);
+    }
+    Tensor append_fixed(const Tensor& value,const Tensor& positions) {
+        MFQ_RUNTIME_CHECK(values_.defined() && values_.size(1)==maximum_ && value.dim()==3 &&
+            value.size(0)==values_.size(0) && value.size(2)==width_ && positions.dim()==1 &&
+            positions.size(0)==value.size(1), "fixed sequence cache append geometry mismatch");
+        values_.index_copy_(1,positions.to(tb::kInt64),value.to(tb::kFloat16));
+        return values_;
+    }
+    void advance_fixed(int64_t tokens) {
+        MFQ_RUNTIME_CHECK(tokens>0 && tokens<=maximum_-position_,"fixed sequence cache exceeds context");
+        position_+=tokens;
+    }
     void truncate(int64_t keep) {
         MFQ_RUNTIME_CHECK(keep >= 0 && keep <= position_, "invalid sequence cache truncation");
         position_ = keep;

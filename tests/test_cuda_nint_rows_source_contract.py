@@ -27,7 +27,10 @@ def test_cuda_ple_nint_uses_retained_selected_row_source():
     ops = (root / "ops/nint.cpp").read_text()
     lookup = ops.split("mfq_tensor_backend::Tensor nint_row_embedding_lookup(", 1)[1].split(
         "mfq_tensor_backend::Tensor pad_last(", 1)[0]
-    assert "table.append_row(" in lookup and "selected.packed()" in lookup
+    assert "table.append_rows(" in lookup and "selected.packed()" in lookup
+    assert "mfq_get_num_threads()" in lookup
+    loader = (root / "storage/weight_loader.cpp").read_text()
+    assert "source.supports_parallel_tensor_reads()" in loader
     assert "nint_selected_rows_cuda(" in lookup
     assert "cudaStreamIsCapturing" in lookup
     assert "sub_scale" not in lookup

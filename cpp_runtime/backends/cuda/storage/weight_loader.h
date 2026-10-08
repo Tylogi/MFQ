@@ -3,6 +3,7 @@
 #include "quant_linear.h"
 #include "mfe_weight.h"
 #include "model_source.h"
+#include "gated_residual.h"
 
 struct MfqDropFileCacheGuard {
     bool& setting;
@@ -98,9 +99,39 @@ mfq_tensor_backend::Tensor materialize_mfe_dense(
 namespace mfq::cuda::weight_loader {
 using Tensor = mfq_tensor_backend::Tensor;
 using Linear = std::function<Tensor(CudaExecutionContext&, const Tensor&)>;
-using Routed = std::function<Tensor(CudaExecutionContext&, const Tensor&, const Tensor&)>;
+struct ResidualLinear {
+    Linear forward;
+    GatedResidualMixProjection mixed;
+    GatedResidualActivationProjection activated;
+    std::shared_ptr<const QuantLinear> weight;
+    // Exact original promoted layout for small BF16 residual injection.
+    Tensor prepared_right;
+    Tensor operator()(CudaExecutionContext& execution,const Tensor& input)const {
+        return forward(execution,input);
+    }
+    explicit operator bool()const{return bool(forward);}
+};
+struct Routed {
+    using Function=std::function<Tensor(CudaExecutionContext&,const Tensor&,const Tensor&)>;
+    Function function;
+    std::vector<std::shared_ptr<MfeWeight>> projections;
+    Routed()=default;
+    template<class Callable, std::enable_if_t<!std::is_same_v<std::decay_t<Callable>,Routed>,int> =0>
+    Routed(Callable&& call):function(std::forward<Callable>(call)) {}
+    Tensor operator()(CudaExecutionContext& execution,const Tensor& input,const Tensor& ids)const {
+        return function(execution,input,ids);
+    }
+    explicit operator bool()const{return bool(function);}
+};
 
 Linear linear(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name);
+std::shared_ptr<const QuantLinear> linear_weight(const Linear& function);
+using LinearGroup = std::function<std::vector<Tensor>(CudaExecutionContext&, const Tensor&)>;
+// Share packed storage while retaining individual projection boundaries for GEMM.
+LinearGroup grouped_linear(CudaExecutionContext&, std::vector<Linear>& functions);
+
+// GR projections use floating activation math for both dense and packed NINT.
+ResidualLinear residual_linear(CudaExecutionContext&, const mfq::ModelSource&, const std::string& name);
 
 Tensor dense(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name);
 

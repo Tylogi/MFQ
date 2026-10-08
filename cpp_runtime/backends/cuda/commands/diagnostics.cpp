@@ -81,6 +81,24 @@ struct DiagnosticsCommandOptions : CudaLoadOptions, TokenInputOptions {
     int compare_mma_decode_steps = 1;
     int compare_mma_decode_planned_len = 0;
     bool profile = false;
+    bool compare_ffn_transfer_phases = false;
+    bool compare_router_lookahead = false;
+    bool compare_rotary_fusion = false;
+    bool compare_attention_grouping = false;
+    bool compare_mhc_fusion = false;
+    bool compare_mhc_shared_norm = false;
+    bool compare_mhc_dense_fusion = false;
+    bool compare_mfe_parallel_gu = false;
+    bool compare_mfe_gpu_bundle = false;
+    bool compare_mfe_shared_first = false;
+    bool compare_mfe_early_gu = false;
+    bool compare_cpu_transfer_budget = false;
+    bool compare_cpu_background_calibration = false;
+    bool compare_router_topk = false;
+    int warmup_prefill = -1;
+    std::string router_lookahead_audit;
+    std::string decode_inputs_file;
+    std::vector<int64_t> decode_inputs;
     bool check_backend_bf16_add = false;
     bool check_backend_argmax = false;
     bool compare_mma_attention = false;
@@ -106,6 +124,28 @@ struct DiagnosticsCommandOptions : CudaLoadOptions, TokenInputOptions {
     bool check_runtime_assets = false;
     bool check_mfq_container = false;
     bool minicpmo_eval_batch = false;
+
+    int runtime_comparison_modes() const {
+        return int(compare_ffn_transfer_phases) + int(compare_router_lookahead) +
+               int(compare_rotary_fusion) + int(compare_attention_grouping) + int(compare_mhc_fusion) + int(compare_mhc_shared_norm) + int(compare_mhc_dense_fusion) + int(compare_mfe_parallel_gu) + int(compare_mfe_gpu_bundle) + int(compare_mfe_shared_first) + int(compare_mfe_early_gu) + int(compare_cpu_transfer_budget) + int(compare_cpu_background_calibration) +
+               int(compare_router_topk);
+    }
+    const char* runtime_comparison_name() const {
+        if (compare_router_topk) return "router_topk_comparison";
+        if (compare_mhc_fusion) return "mhc_fusion_comparison";
+        if (compare_mhc_shared_norm) return "mhc_shared_norm_comparison";
+        if (compare_mhc_dense_fusion) return "mhc_dense_fusion_comparison";
+        if (compare_mfe_parallel_gu) return "mfe_parallel_gu_comparison";
+        if (compare_mfe_gpu_bundle) return "mfe_gpu_bundle_comparison";
+        if (compare_mfe_shared_first) return "mfe_shared_first_comparison";
+        if (compare_mfe_early_gu) return "mfe_early_gate_up_comparison";
+        if (compare_cpu_background_calibration) return "cpu_background_calibration_comparison";
+        if (compare_cpu_transfer_budget) return "cpu_transfer_budget_comparison";
+        if (compare_attention_grouping) return "attention_grouping_comparison";
+        if (compare_rotary_fusion) return "rotary_fusion_comparison";
+        if (compare_router_lookahead) return "router_lookahead_comparison";
+        return "ffn_transfer_comparison";
+    }
 };
 
 } // namespace mfq::cuda
@@ -115,6 +155,35 @@ using namespace mfq::cuda::internal;
 using namespace mfq::cuda::diagnostics;
 
 namespace {
+class ScopedDiagnosticEnvironment {
+    std::string name_;
+    std::string previous_;
+    bool present_;
+public:
+    explicit ScopedDiagnosticEnvironment(const char* name) : name_(name) {
+        const char* previous = std::getenv(name);
+        present_ = previous != nullptr;
+        if (previous) previous_ = previous;
+    }
+    void set(const char* value) {
+#ifdef _WIN32
+        const int result = _putenv_s(name_.c_str(), value);
+#else
+        const int result = setenv(name_.c_str(), value, 1);
+#endif
+        MFQ_RUNTIME_CHECK(result == 0,
+            "cannot set diagnostic runtime option: ", name_);
+    }
+    ~ScopedDiagnosticEnvironment() {
+#ifdef _WIN32
+        (void)_putenv_s(name_.c_str(), present_ ? previous_.c_str() : "");
+#else
+        if (present_) (void)setenv(name_.c_str(), previous_.c_str(), 1);
+        else (void)unsetenv(name_.c_str());
+#endif
+    }
+};
+
 struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
     explicit DiagnosticsCommand(mfq::cuda::DiagnosticsCommandOptions options)
         : mfq::cuda::DiagnosticsCommandOptions(std::move(options)) {}
@@ -129,7 +198,26 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
         // Operator-only checks do not require loading a model.
         if (check_backend_bf16_add) return run_backend_bf16_add_check(4096, 10000);
         if (check_backend_argmax) return run_backend_argmax_check(151748, 2000);
+        if(runtime_comparison_modes()) {
+            MFQ_RUNTIME_CHECK(gen>1 && !decode_inputs.empty() && !profile &&
+                runtime_comparison_modes() == 1 && router_lookahead_audit.empty() &&
+                !execution.config.moe_mapped_gather && execution.config.moe_preload_all &&
+                execution.config.moe_two_stage_ffn && moe_gpu_cache_gb>0,
+                "runtime comparison requires fixed decode inputs, complete expert preload, two-stage FFN and profiling disabled");
+            MFQ_RUNTIME_CHECK(!compare_attention_grouping ||
+                execution.config.diagnostic_nint_group,
+                "attention-grouping comparison requires grouped NINT enabled");
+            MFQ_RUNTIME_CHECK(!compare_mhc_fusion || (execution.config.gr_fused_projections &&
+                execution.config.gr_native_projection_input),
+                "residual fusion comparison requires native packed projections");
+            execution.config.moe_residency_adapt=false;
+            std::cout<<std::unitbuf;
+        }
         setup_cuda_load(*this, execution);
+        if(runtime_comparison_modes()) {
+            std::cout<<runtime_comparison_name()<<"_setup\n";
+            print_moe_expert_cache_stats(execution.moe_expert_cache,std::cout);
+        }
         if (!check_linear_cpu.empty()) {
             if (model_path.empty()) {
                 throw std::runtime_error("--check-linear-cpu requires --model");
@@ -498,6 +586,13 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             }
             return status;
         }
+        if(!router_lookahead_audit.empty()) {
+            MFQ_RUNTIME_CHECK(!compare_ffn_transfer_phases && !profile && gen>1 && !decode_inputs.empty(),
+                "router lookahead audit requires fixed single-token decode inputs and profiling disabled");
+            if constexpr (std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
+                qwen4_begin_router_lookahead_audit(model,gen-1);
+            else throw std::runtime_error("router lookahead audit requires Qwen4 Flash-Next");
+        }
         auto ids_vec = ids_file.empty() ? parse_ids(ids_arg) : load_ids_file(ids_file);
         auto ids = mfq_tensor_backend::tensor(ids_vec, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA)).unsqueeze(0);
         if (compare_dsv4_hc_ops) {
@@ -520,12 +615,107 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
                 model, block_trace_output, ids,
                 block_trace_start, block_trace_count);
         }
-        if (profile) {
+        if(runtime_comparison_modes()) {
+            if constexpr (!std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
+                throw std::runtime_error("runtime comparison requires Qwen4 Flash-Next");
+            const char* comparison_name = runtime_comparison_name();
+            std::cout<<comparison_name<<"_model_load_sec="
+                <<std::chrono::duration<double>(t1-t0).count()<<"\n";
+            const int rounds=warmup_prefill<0?1:warmup_prefill;
+            const bool compare_dense_mhc=execution.config.gr_two_stage_dense_injection;
+            ScopedDiagnosticEnvironment topk_cache("MFQ_MOE_TOPK_CACHE");
+            ScopedDiagnosticEnvironment shared_norm("MFQ_GR_SHARE_NORM");
+            ScopedDiagnosticEnvironment dense_fusion("MFQ_GR_DENSE_FUSION");
+            ScopedDiagnosticEnvironment parallel_gu("MFQ_MFE_PARALLEL_GU");
+            ScopedDiagnosticEnvironment gpu_bundle("MFQ_MFE_GPU_BUNDLE");
+            ScopedDiagnosticEnvironment shared_first("MFQ_MFE_SHARED_FIRST");
+            ScopedDiagnosticEnvironment early_gu("MFQ_MFE_EARLY_GU");
+            ScopedDiagnosticEnvironment cpu_background("MFQ_MOE_CPU_BACKGROUND_CALIBRATION");
+            MFQ_RUNTIME_CHECK(!(compare_mfe_parallel_gu || compare_mfe_gpu_bundle || compare_mfe_shared_first || compare_mfe_early_gu) || execution.config.moe_two_stage_ffn,
+                "MFE parallel Gate/Up comparison requires two-stage FFN");
+            MFQ_RUNTIME_CHECK(!compare_mhc_shared_norm || execution.config.gr_two_stage,
+                "MHC norm comparison requires fused residual projection");
+            MFQ_RUNTIME_CHECK(!compare_mhc_dense_fusion || (execution.config.gr_two_stage && execution.config.gr_two_stage_dense_injection),
+                "MHC dense fusion comparison requires fused residual BF16 injection");
+            for(int pass=0;pass<3;++pass) {
+                const bool phased=pass==1;
+                if (compare_cpu_background_calibration) cpu_background.set(phased ? "1" : "0");
+                if (compare_router_topk) topk_cache.set(phased ? "1" : "0");
+                if (compare_mhc_shared_norm) shared_norm.set(phased ? "1" : "0");
+                if (compare_mhc_dense_fusion) {shared_norm.set("1");dense_fusion.set(phased ? "1" : "0");}
+                if (compare_mfe_parallel_gu) parallel_gu.set(phased ? "1" : "0");
+                if (compare_mfe_gpu_bundle) {
+                    parallel_gu.set("1");gpu_bundle.set(phased ? "1" : "0");
+                }
+                if (compare_mfe_shared_first) {
+                    parallel_gu.set("1");gpu_bundle.set("1");shared_first.set(phased ? "1" : "0");
+                }
+                if (compare_mfe_early_gu) {
+                    parallel_gu.set("1");gpu_bundle.set("1");early_gu.set(phased ? "1" : "0");
+                }
+                // reset destroys the decoder graphs before each branch is captured.
+                model.reset(1);mfq_cuda_synchronize();
+                if(compare_ffn_transfer_phases)execution.config.moe_ffn_transfer_phases=phased;
+                if(compare_mhc_fusion) {
+                    execution.config.gr_two_stage=phased;
+                    execution.config.gr_two_stage_dense_injection=phased && compare_dense_mhc;
+                }
+                if constexpr (std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>) {
+                    if(compare_router_lookahead)model.router_lookahead=phased;
+                    if(compare_rotary_fusion)qwen4_set_rotary_fusion(model,phased);
+                    if(compare_attention_grouping) {
+                        qwen4_set_rotary_fusion(model,true);
+                        qwen4_set_attention_grouping(model,phased);
+                    }
+                    if(compare_mhc_fusion) {
+                        qwen4_set_rotary_fusion(model,true);
+                        qwen4_set_attention_grouping(model,true);
+                    }
+                }
+                if(compare_cpu_background_calibration)
+                    prepare_moe_cpu_calibration_comparison(execution.moe_expert_cache,pass>0);
+                else if(compare_cpu_transfer_budget)
+                    prepare_moe_cpu_budget_comparison(execution.moe_expert_cache,pass>0,phased);
+                else prepare_moe_pipeline_comparison(execution.moe_expert_cache,pass>0);
+                std::cout<<comparison_name<<"_pass="<<pass<<" phase="<<phased<<" begin=1\n";
+                const auto warm_start=std::chrono::steady_clock::now();
+                for(int round=0;round<rounds;++round) {
+                    model.reset(1);(void)model.next_token(ids);mfq_cuda_synchronize();
+                }
+                model.reset(1);mfq_cuda_synchronize();execution.profiler.reset();
+                std::cout<<"warmup_prefill_rounds="<<rounds<<"\n"
+                    <<"warmup_prefill_tokens="<<rounds*ids_vec.size()<<"\n"
+                    <<"warmup_prefill_sec="<<std::chrono::duration<double>(
+                        std::chrono::steady_clock::now()-warm_start).count()<<"\n";
+                const auto pass_start=std::chrono::steady_clock::now();
+                const int status=generate_diagnostic_tokens(execution,model,ids,gen,false,
+                    pass_start,pass_start,decode_inputs);
+                if(status)return status;
+                const auto records=finish_moe_pipeline_comparison(execution.moe_expert_cache);
+                if(compare_cpu_transfer_budget || compare_cpu_background_calibration || compare_mfe_shared_first || compare_mhc_dense_fusion || compare_mfe_early_gu)
+                    print_moe_expert_cache_stats(execution.moe_expert_cache,std::cout);
+                std::cout<<comparison_name<<"_pass="<<pass<<" phase="<<phased
+                    <<" end=1 dispatch_records="<<records<<"\n";
+            }
+            return 0;
+        }
+        const int warmup_rounds = warmup_prefill < 0 ? (profile ? 1 : 0) : warmup_prefill;
+        const auto warmup_start = std::chrono::steady_clock::now();
+        for (int round = 0; round < warmup_rounds; ++round) {
             model.reset(1);
             (void)model.next_token(ids);
             mfq_cuda_synchronize();
+        }
+        if (warmup_rounds) {
             model.reset(1);
             execution.profiler.reset();
+        }
+        std::cout << "warmup_prefill_rounds=" << warmup_rounds << "\n"
+                  << "warmup_prefill_tokens=" << warmup_rounds * ids_vec.size() << "\n"
+                  << "warmup_prefill_sec="
+                  << std::chrono::duration<double>(std::chrono::steady_clock::now() - warmup_start).count()
+                  << "\n";
+        if (profile) {
             execution.profiler.enabled = true;
         }
         if (compare_decode_splitk) {
@@ -748,8 +938,13 @@ struct DiagnosticsCommand : mfq::cuda::DiagnosticsCommandOptions {
             std::cout << "attention_compare_same_top=" << (same_top.template item<bool>() ? 1 : 0) << "\n";
             return 0;
         }
-        return generate_diagnostic_tokens(
-            execution, model, ids, gen, profile, t0, t1);
+        const auto status=generate_diagnostic_tokens(
+            execution, model, ids, gen, profile, t0, t1,decode_inputs);
+        if(!status && !router_lookahead_audit.empty()) {
+            if constexpr (std::is_same_v<Model,mfq::cuda::Qwen4CausalLm>)
+                qwen4_finish_router_lookahead_audit(model,router_lookahead_audit);
+        }
+        return status;
             });
     }); }
 };
@@ -815,7 +1010,24 @@ void print_diagnostics_help() {
         << "  --model PATH                    model or split-model shard\n"
         << "  --config PATH                   external model config\n"
         << "  --ids LIST | --ids-file PATH    diagnostic token input\n"
+        << "  --router-lookahead-audit PREFIX record actual FFN inputs and next-router logits; diagnostic only\n"
+        << "  --compare-ffn-transfer-phases     one load, fixed primary tiers and CPU routes; baseline/phased/baseline\n"
+        << "  --compare-router-lookahead       one load, fixed primary tiers and CPU routes; baseline/prefetch/baseline\n"
+        << "  --compare-rotary-fusion          one load, fixed primary tiers and CPU routes; original/fused/original\n"
+        << "  --compare-attention-grouping     one load, fixed primary tiers and CPU routes; separate/grouped/separate\n"
+        << "  --compare-mhc-fusion             one load, fixed primary tiers and CPU routes; original/fused/original; honors MFQ_GR_TWO_STAGE_DENSE_INJECTION\n"
+        << "  --compare-mhc-shared-norm        one load, fixed primary tiers and CPU routes; fused/shared-norm/fused\n"
+        << "  --compare-mhc-dense-fusion       one load, fixed primary tiers and CPU routes; original/fused/original BF16 injection\n"
+        << "  --compare-mfe-parallel-gu        one load, fixed primary tiers and CPU routes; serial/parallel/serial Gate-Up\n"
+        << "  --compare-mfe-gpu-bundle         one load, fixed primary tiers and CPU routes; current/bundle/current FFN\n"
+        << "  --compare-mfe-shared-first       one load, fixed primary tiers and CPU routes; off/on/off shared expert CTA order\n"
+        << "  --compare-mfe-early-gate-up      one load, fixed primary tiers and CPU routes; off/on/off resident Gate-Up with cold Down\n"
+        << "  --compare-cpu-background-calibration one load; synchronous/background/synchronous, fresh CPU costs\n"
+        << "  --compare-cpu-transfer-budget    one load; original/conservative/original CPU policy; report natural route changes\n"
+        << "  --compare-router-topk            one load, fixed primary tiers and CPU routes; original/cached/original\n"
+        << "  --decode-inputs-file FILE        fixed decode input ids, raw int32, gen-1 entries\n"
         << "  --gen N                         generated tokens\n"
+        << "  --warmup-prefill N              prefill warmups, 0-100; default profile=1, otherwise=0\n"
         << "  --ctx-size N                    context size; 0 selects a default\n"
         << "  -t, --threads N                 positive CPU thread count\n"
         << "  -ngl, --n-gpu-layers N          non-negative GPU layer count\n"
@@ -965,7 +1177,28 @@ DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
         else if (option == "--check-runtime-assets") result.check_runtime_assets = true;
         else if (option == "--check-mfq-container") result.check_mfq_container = true;
         else if (option == "--check-tokenizer-text") result.check_tokenizer_text = args.value(option);
+        else if (option == "--router-lookahead-audit") result.router_lookahead_audit = args.value(option);
+        else if (option == "--compare-ffn-transfer-phases") result.compare_ffn_transfer_phases = true;
+        else if (option == "--compare-router-lookahead") result.compare_router_lookahead = true;
+        else if (option == "--compare-rotary-fusion") result.compare_rotary_fusion = true;
+        else if (option == "--compare-attention-grouping") result.compare_attention_grouping = true;
+        else if (option == "--compare-mhc-fusion") result.compare_mhc_fusion = true;
+        else if (option == "--compare-mhc-shared-norm") result.compare_mhc_shared_norm = true;
+        else if (option == "--compare-mhc-dense-fusion") result.compare_mhc_dense_fusion = true;
+        else if (option == "--compare-mfe-parallel-gu") result.compare_mfe_parallel_gu = true;
+        else if (option == "--compare-mfe-gpu-bundle") result.compare_mfe_gpu_bundle = true;
+        else if (option == "--compare-mfe-shared-first") result.compare_mfe_shared_first = true;
+        else if (option == "--compare-mfe-early-gate-up") result.compare_mfe_early_gu = true;
+        else if (option == "--compare-cpu-background-calibration") result.compare_cpu_background_calibration = true;
+        else if (option == "--compare-cpu-transfer-budget") result.compare_cpu_transfer_budget = true;
+        else if (option == "--compare-router-topk") result.compare_router_topk = true;
+        else if (option == "--decode-inputs-file") result.decode_inputs_file = args.value(option);
         else if (option == "--profile") result.profile = true;
+        else if (option == "--warmup-prefill") {
+            result.warmup_prefill = integer<int>(args.value(option), option);
+            if (result.warmup_prefill < 0 || result.warmup_prefill > 100)
+                usage_error("--warmup-prefill requires a count from 0 to 100");
+        }
         else if (option == "--check-backend-bf16-add") result.check_backend_bf16_add = true;
         else if (option == "--check-backend-argmax") result.check_backend_argmax = true;
         else if (option == "--compare-mma-attention") result.compare_mma_attention = true;
@@ -975,6 +1208,13 @@ DiagnosticsCommandOptions parse_diagnostics(ArgCursor& args) {
         else if (option == "--compare-mma-decode-planned-len") result.compare_mma_decode_planned_len = integer<int>(args.value(option), option);
         else if (option == "--compare-nvq-vec4" || option == "--compare-niq-vec4") result.compare_nvq_vec4 = true;
         else usage_error("unknown option: " + std::string(option));
+    }
+    if (!result.decode_inputs_file.empty()) {
+        result.decode_inputs = load_ids_file(result.decode_inputs_file);
+        if (result.gen <= 1 || result.decode_inputs.size() != size_t(result.gen - 1))
+            usage_error("--decode-inputs-file requires exactly gen-1 entries and gen greater than 1");
+        if (std::any_of(result.decode_inputs.begin(),result.decode_inputs.end(),[](int64_t id){return id<0;}))
+            usage_error("--decode-inputs-file requires nonnegative token ids");
     }
     if (!result.ids_arg.empty() && !result.ids_file.empty()) {
         usage_error("--ids and --ids-file are mutually exclusive");

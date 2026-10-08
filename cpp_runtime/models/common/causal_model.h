@@ -7,6 +7,15 @@
 #include <vector>
 
 namespace mfq::models {
+// Backends may supply a model-window graph. Others retain their existing
+// entry points without a CUDA dependency in common model policy.
+template<class Backend,class Model,class Tensor>
+auto backend_graph_logits(Backend& backend,Model& model,Tensor ids,int kind,int)
+    -> decltype(backend.graph_logits(model,std::move(ids),kind)) {
+    return backend.graph_logits(model,std::move(ids),kind);
+}
+template<class Backend,class Model,class Tensor>
+std::optional<Tensor> backend_graph_logits(Backend&,Model&,Tensor,int,long) {return {};}
 
 template <class Tensor, class Plan> struct CausalForwardInputs {
     Tensor ids, input_embeddings;
@@ -187,19 +196,24 @@ template <class Backend, class Derived> struct CausalModelBase : Backend, Causal
     Tensor logits_from_hidden(Tensor hidden) {
         return apply_final_logit_softcap(model().adapter_logits(this->lm_head, std::move(hidden)));
     }
-    Tensor forward(Tensor ids) { return logits_from_hidden(hidden_forward(std::move(ids))); }
+    Tensor forward(Tensor ids) {
+        if(auto graph=backend_graph_logits(static_cast<Backend&>(*this),model(),ids,0,0))return *graph;
+        return logits_from_hidden(hidden_forward(std::move(ids)));
+    }
     Tensor forward_inputs(Tensor ids, Tensor embeddings, std::optional<Tensor> positions = {},
                           std::optional<Tensor> lengths = {}) {
         return logits_from_hidden(
             hidden_forward_inputs(std::move(ids), std::move(embeddings), positions, lengths));
     }
     Tensor last_logits(Tensor ids) {
+        if(auto graph=backend_graph_logits(static_cast<Backend&>(*this),model(),ids,1,0))return *graph;
         const auto lengths = decode_lengths(ids);
         auto hidden = hidden_forward(std::move(ids), {}, lengths);
         return apply_final_logit_softcap(
             model().adapter_last_logits(this->lm_head, this->last_hidden(std::move(hidden))));
     }
     Tensor next_token(Tensor ids) {
+        if(auto graph=backend_graph_logits(static_cast<Backend&>(*this),model(),ids,2,0))return *graph;
         const auto lengths = decode_lengths(ids);
         return next_token_from_hidden(hidden_forward(std::move(ids), {}, lengths));
     }

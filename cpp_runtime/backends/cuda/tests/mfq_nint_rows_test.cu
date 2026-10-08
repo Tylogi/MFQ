@@ -1,4 +1,4 @@
-#include "mfq_cuda_ops.h"
+#include "mfq_cuda_quant_ops.h"
 #include "../../../tests/nint_row_fixture.h"
 #include <cstring>
 #include <iostream>
@@ -57,6 +57,10 @@ void check(int width, int gs, int k, bool adaptive, int& cases) {
     for (int row : {528, 257, 255, 256, 0, 3, 528}) table.append_row(row, batch);
     for (int row = 0; row < 32; ++row) table.append_row(row, batch);
     check_batch(batch, cases, true);
+    const std::int64_t ids[]{528, 257, 255, 256, 0, 3, 528};
+    mfq::NintRowBatch parallel;
+    table.append_rows(ids, sizeof(ids) / sizeof(ids[0]), parallel, 12);
+    check_batch(parallel, cases, false);
 }
 }
 int main() {

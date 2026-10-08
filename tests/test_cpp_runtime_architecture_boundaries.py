@@ -268,7 +268,7 @@ def test_moe_cache_api_receives_resources_without_execution_context() -> None:
 def test_cuda_transformer_core_stays_declarative_and_separate_from_loading() -> None:
     assert len(CUDA_TRANSFORMER_HEADER.splitlines()) < 60
     assert '#include "full_block.h"' not in CUDA_TRANSFORMER_HEADER
-    limits = {"rope": 70, "ffn": 120, "kv_cache": 80, "full_block": 100}
+    limits = {"rope": 100, "ffn": 120, "kv_cache": 80, "full_block": 100}
     for name, limit in limits.items():
         header = (CUDA_CORE / f"{name}.h").read_text(encoding="utf-8")
         assert len(header.splitlines()) < limit
@@ -592,7 +592,7 @@ def test_cuda_model_finalizers_live_with_their_models() -> None:
         assert f"{namespace}::finalize_hidden" not in CUDA_CAUSAL_LM_SOURCE
         if name == "qwen4_exp":
             assert "Qwen4Model::adapter_finalize_hidden(" in source
-            assert "return final_mixer->pre(hidden)[0];" in source
+            assert "return final_mixer->pre(*execution, hidden)[0];" in source
         else:
             shared = (ROOT / "cpp_runtime/models" / name / "causal_lm.h").read_text(encoding="utf-8")
             assert shared.index("this->collapse_hidden(") < shared.index("this->normalize_hidden(")

@@ -1,4 +1,5 @@
 #pragma once
+#include "cuda_activity_trace.h"
 
 #include "mfq_cuda_sampling_ops.h"
 #include "cuda_execution.h"
@@ -6,6 +7,7 @@
 #include "core/full_block.h"
 #include "storage/moe_expert_cache.h"
 #include "mfq_tensor_backend.h"
+#include "mfq/model_source.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime_api.h>
@@ -14,8 +16,30 @@
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <vector>
 
 namespace mfq::cuda::internal {
+
+inline void report_source_file_io(const mfq::ModelSource* source, const char* phase) noexcept {
+    const char* report = std::getenv("MFQ_REPORT_FILE_IO");
+    if (!source || !report || report[0] != '1') return;
+    const auto stats = source->file_read_stats();
+    try {
+        std::cout << "source_file_io phase=" << phase
+                  << " mode=" << mfq::file_read_mode_name(stats.mode)
+                  << " files=" << stats.files << " calls=" << stats.calls
+                  << " logical_bytes=" << stats.logical_bytes << " physical_bytes=" << stats.physical_bytes
+                  << " errors=" << stats.errors << " staging_bytes=" << stats.staging_bytes
+                  << " staging_peak_sum_bytes=" << stats.staging_peak_bytes
+                  << " read_ms=" << double(stats.read_nanoseconds) / 1e6 << std::endl;
+    } catch (const std::exception&) { } // Optional diagnostics cannot abort generation.
+}
+
+inline mfq_tensor_backend::Tensor diagnostic_decode_input(
+        const mfq_tensor_backend::Tensor& predicted,
+        const mfq_tensor_backend::Tensor& forced,int step) {
+    return forced.defined()?forced.narrow(0,step,1).view({1,1}):predicted.view({1,1});
+}
 
 template <typename Model>
 int generate_diagnostic_tokens(
@@ -25,13 +49,22 @@ int generate_diagnostic_tokens(
         int gen,
         bool profile,
         std::chrono::steady_clock::time_point t0,
-        std::chrono::steady_clock::time_point t1) {
+        std::chrono::steady_clock::time_point t1,
+        const std::vector<int64_t>& decode_inputs = {}) {
+        if(!decode_inputs.empty() && (gen<=1 || decode_inputs.size()!=size_t(gen-1)))
+            throw std::invalid_argument("diagnostic decode input count differs from gen-1");
+        mfq_tensor_backend::Tensor forced_inputs;
+        if(!decode_inputs.empty())
+            forced_inputs=mfq_tensor_backend::tensor(decode_inputs).to(mfq_tensor_backend::kCUDA);
+        std::cout<<"decode_input_mode="<<(forced_inputs.defined()?"forced":"generated")<<"\n";
         auto& profiler = execution.profiler;
+        report_source_file_io(model.source.get(), "prefill_begin");
         profiler.reset();
         auto next = model.next_token(ids);
         mfq_cuda_synchronize();
         auto t2 = std::chrono::steady_clock::now();
         report_cuda_memory(execution.config, "prefill");
+        report_source_file_io(model.source.get(), "prefill");
         const char * empty_cache_env = std::getenv("MFQ_EMPTY_CACHE_BEFORE_GRAPH");
         if (empty_cache_env != nullptr && std::atoi(empty_cache_env) != 0) {
             mfq_cuda_empty_cache();
@@ -49,6 +82,7 @@ int generate_diagnostic_tokens(
         const bool profile_cuda_graph = profile && profile_graph_env != nullptr &&
             std::atoi(profile_graph_env) != 0;
         bool use_cuda_graph =
+            !forced_inputs.defined() &&
             (graph_env == nullptr || graph_env[0] != '0') &&
             !model.metadata.flash_next &&
             mfq_cuda_graph_capture_supported() &&
@@ -135,7 +169,7 @@ int generate_diagnostic_tokens(
         } else {
             for (int i = 1; i < gen; ++i) {
                 next = profiler.measure("decode.eager_model", [&]() {
-                    return model.next_token(next.view({1, 1}));
+                    return model.next_token(diagnostic_decode_input(next,forced_inputs,i-1));
                 });
                 profiler.measure("decode.eager_commit", [&]() {
                     MFQ_CUDA_CHECK(cudaMemcpyAsync(
@@ -170,10 +204,12 @@ int generate_diagnostic_tokens(
             std::cout << generated_ptr[i];
         }
         std::cout << "\n";
+        report_source_file_io(model.source.get(), "decode");
         if (execution.moe_expert_cache) {
             print_moe_expert_cache_stats(
                 execution.moe_expert_cache, std::cout);
         }
+        finish_cuda_activity_trace();
         return 0;
  }
 

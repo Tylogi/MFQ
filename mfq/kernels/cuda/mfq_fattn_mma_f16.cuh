@@ -6,6 +6,16 @@
 
 using namespace ggml_cuda_mma;
 
+struct mfq_fattn_runtime_input {
+    const void* query = nullptr;
+    int64_t query_token_stride = 0;
+    int64_t query_head_stride = 0;
+    int64_t query_column_stride = 0;
+    int causal_query_offset = 0;
+    int causal_row_count = 0;
+    bool half_query = false;
+};
+
 // Config options for the MMA kernel.
 // Should not affect results, only speed/register pressure/shared memory use.
 struct fattn_mma_config {
@@ -367,7 +377,9 @@ template<int stride_tile, bool swizzled, int nwarps, int nbatch_fa,
 static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
         const half2 * const __restrict__ KV, half2 * const __restrict__ tile_KV,
         const int D2, const int stride_KV, const int i_sup,
-        const int * const __restrict__ row_indices = nullptr) {
+        const int * const __restrict__ row_indices = nullptr,
+        const int implicit_row_start = 0,
+        const int implicit_row_count = 0) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     // K/V data is loaded with decreasing granularity for D for better memory bandwidth.
     // The minimum granularity is 16 bytes.
@@ -398,7 +410,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                     break;
                 }
 
-                const int row = use_indirect ? row_indices[i] : i;
+                const int implicit_row = implicit_row_start + i;
+                const int row = use_indirect ? (row_indices ? row_indices[i]
+                    : (implicit_row < implicit_row_count ? implicit_row : 0)) : i;
 
 #pragma unroll
                 for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
@@ -449,7 +463,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                 }
 
                 const bool valid = !oob_check || i < i_sup;
-                const int row = use_indirect && valid ? row_indices[i] : i;
+                const int implicit_row = implicit_row_start + i;
+                const int row = use_indirect && valid ? (row_indices ? row_indices[i]
+                    : (implicit_row < implicit_row_count ? implicit_row : 0)) : i;
 
 #pragma unroll
                 for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
@@ -566,13 +582,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_make_causal_mask(
         half * const __restrict__ tile_mask,
         const int key_start,
         const int query_start,
-        const int query_key_min) {
+        const int query_key_min,
+        const mfq_fattn_runtime_input input = {}) {
     constexpr int threads = nwarps * ggml_cuda_get_physical_warp_size();
     constexpr int elements = ncols1 * nbatch_fa;
     const int thread = threadIdx.y * blockDim.x + threadIdx.x;
 #pragma unroll
     for (int index = thread; index < elements; index += threads) {
-        const int query = query_start + index / nbatch_fa;
+        const int query = query_start + index / nbatch_fa + input.causal_query_offset;
         const int key = key_start + index % nbatch_fa;
         const int key_min = max(0, query_key_min + index / nbatch_fa);
         tile_mask[(index / nbatch_fa) * (nbatch_fa + 8) +
@@ -613,7 +630,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const int jt,
         const int kb0,
         const int k_VKQ_sup,
-        const int query_key_min) {
+        const int query_key_min,
+        const mfq_fattn_runtime_input input = {}) {
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     constexpr int  warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int  ncols           = ncols1 * ncols2;
@@ -666,7 +684,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                                      nwarps, nbatch_fa,
                                      use_cp_async, oob_check, use_indirect>
             (V_tile, tile_V, nbatch_V2, stride_V, k_VKQ_sup,
-             use_indirect ? row_indices + k_VKQ_0 : nullptr);
+             use_indirect && row_indices ? row_indices + k_VKQ_0 : nullptr,
+             k_VKQ_0, input.causal_row_count);
     } else {
         constexpr bool use_cp_async = nstages == 1;
         if (mask_h) {
@@ -674,7 +693,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 (mask_h + k_VKQ_0, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
         } else if (implicit_causal) {
             flash_attn_ext_f16_make_causal_mask<ncols1, nwarps, nbatch_fa>(
-                tile_mask, k_VKQ_0, jt*ncols1, query_key_min);
+                tile_mask, k_VKQ_0, jt*ncols1, query_key_min, input);
         }
     }
 
@@ -694,7 +713,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                                          nwarps, nbatch_fa,
                                          use_cp_async, oob_check, use_indirect>
                 (K_tile, tile_K, k0_diff, stride_K, k_VKQ_sup,
-                 use_indirect ? row_indices + k_VKQ_0 : nullptr);
+                 use_indirect && row_indices ? row_indices + k_VKQ_0 : nullptr,
+                 k_VKQ_0, input.causal_row_count);
             if (use_cp_async) {
                 cp_async_wait_all();
             }
@@ -1035,7 +1055,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             } else if (implicit_causal) {
                 flash_attn_ext_f16_make_causal_mask<ncols1, nwarps, nbatch_fa>(
                     tile_mask, k_VKQ_0 + nbatch_fa, jt*ncols1,
-                    query_key_min);
+                    query_key_min, input);
             }
             const half2 * const K_tile = use_indirect
                 ? K_h2
@@ -1044,7 +1064,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                                          nwarps, nbatch_fa,
                                          use_cp_async, oob_check, use_indirect>
                 (K_tile, tile_K, nbatch_K2, stride_K, k_VKQ_sup,
-                 use_indirect ? row_indices + k_VKQ_0 + nbatch_fa : nullptr);
+                 use_indirect && row_indices ? row_indices + k_VKQ_0 + nbatch_fa : nullptr,
+                 k_VKQ_0 + nbatch_fa, input.causal_row_count);
         }
     }
 
@@ -1066,7 +1087,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                                              nwarps, nbatch_fa,
                                              use_cp_async, oob_check, use_indirect>
                     (V_tile, tile_V, i0_diff/2, stride_V, k_VKQ_sup,
-                     use_indirect ? row_indices + k_VKQ_0 : nullptr);
+                     use_indirect && row_indices ? row_indices + k_VKQ_0 : nullptr,
+                     k_VKQ_0, input.causal_row_count);
                 if (use_cp_async) {
                     cp_async_wait_all();
                 }
@@ -1259,7 +1281,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const int kb0_stop,
         const int * const __restrict__ row_indices = nullptr,
         const bool implicit_causal = false,
-        const int query_key_min = 0) {
+        const int query_key_min = 0,
+        const mfq_fattn_runtime_input input = {}) {
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     //In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
@@ -1356,7 +1379,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
                     const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
 
-                    const float2 tmp = Q_f2[(jt*ncols1 + j)*stride_Q1 + c*stride_Q2 + k];
+                    float2 tmp;
+                    if (input.query) {
+                        const int64_t at = int64_t(jt*ncols1 + j)*input.query_token_stride +
+                            int64_t(c)*input.query_head_stride + int64_t(2*k)*input.query_column_stride;
+                        if (input.half_query) {
+                            const auto* source = static_cast<const half*>(input.query);
+                            tmp = make_float2(__half2float(source[at]),
+                                __half2float(source[at + input.query_column_stride]));
+                        } else {
+                            const auto* source = static_cast<const float*>(input.query);
+                            tmp = make_float2(source[at], source[at + input.query_column_stride]);
+                        }
+                    } else {
+                        tmp = Q_f2[(jt*ncols1 + j)*stride_Q1 + c*stride_Q2 + k];
+                    }
                     tile_Q[jc*stride_tile_Q + k] = scale_h2 * make_half2(tmp.x, tmp.y);
                 }
             } else {
@@ -1396,7 +1433,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 (mask_h + kb0*nbatch_fa, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
         } else if (implicit_causal) {
             flash_attn_ext_f16_make_causal_mask<ncols1, nwarps, nbatch_fa>(
-                tile_mask, kb0*nbatch_fa, jt*ncols1, query_key_min);
+                tile_mask, kb0*nbatch_fa, jt*ncols1, query_key_min, input);
         }
         const half2 * const K_tile = use_indirect
             ? K_h2
@@ -1405,7 +1442,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                                      nwarps, nbatch_fa,
                                      use_cp_async, oob_check, use_indirect>
             (K_tile, tile_K, nbatch_K2, stride_K, k_VKQ_sup,
-             use_indirect ? row_indices + kb0*nbatch_fa : nullptr);
+              use_indirect && row_indices ? row_indices + kb0*nbatch_fa : nullptr,
+              kb0*nbatch_fa, input.causal_row_count);
     }
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
@@ -1422,7 +1460,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup,
-                 query_key_min);
+                  query_key_min, input);
         }
         constexpr bool last_iter = true;
         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
@@ -1434,7 +1472,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup,
-             query_key_min);
+              query_key_min, input);
     } else {
         constexpr bool oob_check = false;
         for (; kb0 < kb0_stop-1; ++kb0) {
@@ -1448,7 +1486,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup,
-                 query_key_min);
+                  query_key_min, input);
         }
         constexpr bool last_iter = true;
         constexpr int  k_VKQ_sup = nbatch_fa;
@@ -1460,7 +1498,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup,
-             query_key_min);
+              query_key_min, input);
     }
 
     // With multi-stage loading there is no __syncthreads at the end of the iter,
@@ -1851,7 +1889,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         sinks_f, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02, gqa_ratio,
         stride_Q1, stride_Q2, stride_K, stride_V, stride_mask,
-        jt, kb0_start, kb0_stop);
+        jt, kb0_start, kb0_stop, input);
     NO_DEVICE_CODE;
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }

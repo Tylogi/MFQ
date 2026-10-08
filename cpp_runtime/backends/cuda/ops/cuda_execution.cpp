@@ -1,9 +1,11 @@
+#include "../runtime/execution_options.h"
 #include "cuda_execution.h"
 
 #include "mfq_cuda_quant_ops.h"
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -72,6 +74,66 @@ bool enabled_unless_disabled(const char* name) {
 
 } // namespace
 
+namespace mfq::cuda::runtime_options {
+namespace {
+bool exact_one(const char* name, bool fallback = false) {
+    const auto* value = std::getenv(name);
+    return value ? std::string_view(value) == "1" : fallback;
+}
+bool first_nonzero(const char* name, bool fallback) {
+    const auto* value = std::getenv(name);
+    return value ? value[0] != '0' : fallback;
+}
+}
+bool resident_plan_overlap() {
+    const auto* value = std::getenv("MFQ_MFE_RESIDENT_PLAN_OVERLAP");
+    return value && std::atoi(value) == 1;
+}
+std::optional<bool> rotary_fusion() {
+    const auto* value = std::getenv("MFQ_ROTARY_FUSED");
+    return value ? std::optional<bool>(std::string_view(value) == "1") : std::nullopt;
+}
+bool mhc_timings() { return exact_one("MFQ_TRACE_MHC_TIMINGS"); }
+bool layer_timings() {
+    const auto* value = std::getenv("MFQ_TRACE_LAYER_TIMINGS");
+    return value && std::string_view(value) != "0";
+}
+bool router_lookahead() { return exact_one("MFQ_MOE_ROUTER_LOOKAHEAD"); }
+std::size_t workspace_reserve_bytes() {
+    std::size_t reserve = std::size_t(4) * 1024 * 1024 * 1024;
+    if (const auto* value = std::getenv("MFQ_CUDA_WORKSPACE_RESERVE_GIB")) {
+        char* end = nullptr;
+        const double gib = std::strtod(value, &end);
+        const long double bytes = static_cast<long double>(gib) * 1024 * 1024 * 1024;
+        if (end == value || *end || !std::isfinite(gib) || gib < 0 ||
+                bytes > std::numeric_limits<std::size_t>::max())
+            throw std::runtime_error("MFQ_CUDA_WORKSPACE_RESERVE_GIB must be finite and non-negative");
+        reserve = static_cast<std::size_t>(bytes);
+    }
+    return reserve;
+}
+bool phased_transfer() { return exact_one("MFQ_MOE_FFN_TRANSFER_PHASES", true); }
+bool mapped_copy_overlap() { return exact_one("MFQ_MOE_MAPPED_COPY_OVERLAP"); }
+bool background_calibration() { return exact_one("MFQ_MOE_CPU_BACKGROUND_CALIBRATION", true); }
+bool early_gate_up() { return first_nonzero("MFQ_MFE_EARLY_GU", true); }
+bool parallel_gate_up() { return first_nonzero("MFQ_MFE_PARALLEL_GU", true); }
+bool cpu_transfer_budget() { return first_nonzero("MFQ_MOE_CPU_TRANSFER_BUDGET", true); }
+bool transfer_cache() { return first_nonzero("MFQ_MOE_TRANSFER_CACHE", false); }
+bool mapped_copy() { return first_nonzero("MFQ_MOE_MAPPED_COPY", false); }
+MoeDiagnostics moe_diagnostics() {
+    MoeDiagnostics result;
+    result.cpu_rows = exact_one("MFQ_TRACE_CPU_ROWS");
+    result.cpu_rows_fail_alloc = exact_one("MFQ_TRACE_CPU_ROWS_FAIL_ALLOC");
+    result.dma = exact_one("MFQ_TRACE_MOE_DMA");
+    result.dma_fail_alloc = exact_one("MFQ_TRACE_MOE_DMA_FAIL_ALLOC");
+    result.shared_cpu_cost = exact_one("MFQ_MOE_SHARED_CPU_COST");
+    if (const auto* path = std::getenv("MFQ_MOE_DISPATCH_RECORD")) result.dispatch_record = path;
+    if (const auto* path = std::getenv("MFQ_MOE_MISS_RECORD")) result.miss_record = path;
+    if (const auto* path = std::getenv("MFQ_MOE_DISPATCH_REPLAY")) result.dispatch_replay = path;
+    return result;
+}
+} // namespace mfq::cuda::runtime_options
+
 CudaExecutionConfig load_cuda_execution_config() {
     CudaExecutionConfig result;
     result.profile_filter = environment("MFQ_PROFILE_CUDA_FILTER").value_or("");
@@ -133,6 +195,7 @@ CudaExecutionConfig load_cuda_execution_config() {
         !environment("MFQ_NVQ_MOE_ROWS_PER_BLOCK") &&
         !environment("MFQ_NVQ_MOE_WARPS") &&
         !environment("MFQ_NVQ_MOE_SHARE_GROUP_STATE");
+    result.moe_nvq_active_decode = environment_flag("MFQ_MOE_NVQ_ACTIVE_DECODE",false);
     result.moe_prefill_mma = enabled_unless_disabled(
         "MFQ_DISABLE_MOE_PREFILL_MMA");
     result.moe_prefill_mma_min_tokens = environment_int(
@@ -146,6 +209,11 @@ CudaExecutionConfig load_cuda_execution_config() {
         "MFQ_DISABLE_MOE_PROJECTION_BUNDLE_PREFETCH");
     result.split_moe_activation_reuse = enabled_unless_disabled(
         "MFQ_DISABLE_SPLIT_MOE_ACTIVATION_REUSE");
+    result.moe_gpu_resident_dispatch = environment_flag(
+        "MFQ_MOE_GPU_RESIDENT_DISPATCH", false);
+    result.moe_ffn_fused_activation = environment_flag(
+        "MFQ_MOE_FFN_FUSED_ACTIVATION", true);
+    result.moe_two_stage_ffn = environment_flag("MFQ_MOE_TWO_STAGE_FFN", false);
     result.moe_swiglu_quant_fusion = enabled_unless_disabled(
         "MFQ_DISABLE_MOE_SWIGLU_QUANT_FUSION");
     result.moe_reduce_gate_fusion = enabled_unless_disabled(
@@ -170,6 +238,7 @@ CudaExecutionConfig load_cuda_execution_config() {
         "MFQ_KV_CACHE_WRITE_ATEN", false);
     result.gdn_transposed_state = environment_flag(
         "MFQ_GDN_TRANSPOSED_STATE", true);
+    result.gdn_fused_output = environment_flag("MFQ_GDN_FUSED_OUTPUT",true);
     result.linear_conv_prefill_fused = environment_flag(
         "MFQ_LINEAR_CONV_PREFILL_FUSED", true);
     result.minicpm_fused_bf16_rope = environment_flag(
@@ -208,6 +277,36 @@ CudaExecutionConfig load_cuda_execution_config() {
         "MFQ_DISABLE_MOE_SSD_OVERLAP");
     result.moe_ssd_ranges = enabled_unless_disabled(
         "MFQ_DISABLE_MOE_SSD_RANGES");
+    result.moe_host_cache_bytes = environment_size("MFQ_MOE_HOST_CACHE_BYTES",0);
+    result.moe_pipeline = environment_flag("MFQ_MOE_PIPELINE",false);
+    result.moe_hybrid_cpu = environment_flag("MFQ_MOE_HYBRID_CPU",false);
+    result.moe_preload_all = environment_flag("MFQ_MOE_PRELOAD_ALL",false);
+    result.moe_assert_resident = environment_flag("MFQ_MOE_ASSERT_RESIDENT",false);
+    result.moe_ram_pcie = environment_flag("MFQ_MOE_RAM_PCIE",false);
+    result.moe_direct_ram = environment_flag("MFQ_MOE_DIRECT_RAM",true);
+    result.moe_residency_adapt = environment_flag("MFQ_MOE_RESIDENCY_ADAPT",true);
+    result.moe_residency_warm = environment_flag("MFQ_MOE_RESIDENCY_WARM",true);
+    result.moe_residency_projection_heat = environment_flag("MFQ_MOE_RESIDENCY_PROJECTION_HEAT",true);
+    result.moe_host_physical_bytes = environment_size("MFQ_MOE_HOST_PHYSICAL_BYTES",0);
+    result.gr_fused_projections = environment_flag("MFQ_GR_FUSED_PROJECTIONS",true);
+    result.gr_fused_projection_activation = environment_flag("MFQ_GR_FUSED_PROJECTION_ACTIVATION",true);
+    result.gr_fused_post_norm = environment_flag("MFQ_GR_FUSED_POST_NORM",true);
+    result.gdn_fused_preparation = environment_flag("MFQ_GDN_FUSED_PREPARATION",true);
+    result.gdn_fused_core = environment_flag("MFQ_GDN_FUSED_CORE",true);
+    result.gr_prepared_dense_projection = environment_flag("MFQ_GR_PREPARED_DENSE_PROJECTION",false);
+    result.gr_native_projection_input = environment_flag("MFQ_GR_NATIVE_PROJECTION_INPUT",true);
+    result.gr_fixed_group_projection = environment_flag("MFQ_GR_FIXED_GROUP_PROJECTION",true);
+    result.gr_compact_mix = environment_flag("MFQ_GR_COMPACT_MIX",true);
+    result.gr_two_stage = environment_flag("MFQ_GR_TWO_STAGE",true);
+    result.gr_two_stage_dense_injection = environment_flag("MFQ_GR_TWO_STAGE_DENSE_INJECTION",true);
+    result.moe_nint_heterogeneous_decode = environment_flag("MFQ_MOE_NINT_HETEROGENEOUS_DECODE",true);
+    if (const auto value = environment("MFQ_MOE_RAM_PCIE_FRACTION")) {
+        std::size_t end = 0;
+        const auto fraction = std::stod(*value,&end);
+        if (end != value->size() || !std::isfinite(fraction) || fraction < 0 || fraction > 1)
+            throw std::invalid_argument("MFQ_MOE_RAM_PCIE_FRACTION must be in [0,1]");
+        result.moe_ram_pcie_fraction = fraction;
+    }
     return result;
 }
 

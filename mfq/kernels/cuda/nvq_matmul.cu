@@ -17,503 +17,18 @@
 #include <cstdlib>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <type_traits>
 
 #include "packed_backward.cuh"
+#include "packed_nvq.cuh"
 #include "async_copy.cuh"
 
 using namespace nvcuda;
 
 namespace {
 
-constexpr int kNvq1L = 1;
-constexpr int kNvq2 = 2;
-constexpr int kNvq3 = 3;
-constexpr int kNvq2Exec = 4;
-constexpr int kNvq2Jsc = 5;
-constexpr int kNvq2JscExec = 6;
-constexpr int kNpq0L = 7;
-constexpr int kNvq1S = 8;
-constexpr int kNpq0S = 9;
-constexpr int kNvq3Jsc = 10;
-constexpr int kNvq3Jsc2 = 11;
-constexpr int kNvq3Jsc512 = 12;
-constexpr int kNvq2JscL = 13;
-constexpr int kNvq2JscXL = 14;
-constexpr int kNvq3JscL = 15;
-constexpr int kNvq2JscXLGroupExec = 16;
-constexpr int kNvq3JscLGroupExec = 17;
-constexpr int kGroupSize = 24;
-constexpr int kChunksPerGroup = 6;  // six dp4a chunks of four values
-constexpr int kJscMetadataBytes = 64;
-constexpr int kJscLutOffset = 4;
-constexpr int kJscBankMapOffset = 36;
-constexpr int kJscE8CodebookBytes = 256 * 8;
-constexpr int kJscE8Codebook1024Bytes = 1024 * 8;
-constexpr int kJscE8Codebook4096Bytes = 4096 * 8;
-constexpr int kJscE8PartialEntries = 384;
-constexpr int kJscE8PartialBytes = kJscE8PartialEntries * 8;
-constexpr int kJscD4CodebookBytes = 256 * 4;
-constexpr int kJscD4Codebook512Bytes = 512 * 4;
-constexpr int kJscD4Codebook1024Bytes = 1024 * 4;
-constexpr int kNpq0LMetadataBytes = 64;
-constexpr int kNpq0LLutOffset = 8;
-constexpr int kNpq0LStates = 8;
-constexpr int kNpq0LFirstEntries = 8;
-constexpr int kNpq0LSecondEntries = 16;
-constexpr int kNpq0LFirstBytesPerState = kNpq0LFirstEntries * 4;
-constexpr int kNpq0LSecondBytesPerState = kNpq0LSecondEntries * 4;
-constexpr int kNpq0LSecondOffset =
-    kNpq0LMetadataBytes + kNpq0LStates * kNpq0LFirstBytesPerState;
-constexpr int kNpq0LTableBytes =
-    kNpq0LSecondOffset + kNpq0LStates * kNpq0LSecondBytesPerState;
-constexpr int kNvq1SBankEntries = 512;
-constexpr int kNvq1SBankBytes = kNvq1SBankEntries * 8;
-constexpr int kNpq0SMetadataBytes = 64;
-constexpr int kNpq0SLutOffset = 8;
-constexpr int kNpq0SStates = 4;
-constexpr int kNpq0SEntries = 64;
-constexpr int kNpq0SCodebookBytes = kNpq0SStates * kNpq0SEntries * 8;
-constexpr int kNpq0STableBytes = kNpq0SMetadataBytes + kNpq0SCodebookBytes;
-constexpr int kNepq0SEntriesPerHalf = 8;
-constexpr int kNepq0SBytesPerStateHalf = kNepq0SEntriesPerHalf * 4;
-constexpr int kNepq0SSecondOffset =
-    kNpq0SMetadataBytes + kNpq0SStates * kNepq0SBytesPerStateHalf;
-constexpr int kNepq0SCompactTableBytes =
-    kNepq0SSecondOffset + kNpq0SStates * kNepq0SBytesPerStateHalf;
-constexpr int kNepqGroupsPerSupergroup = 4;
-
-__device__ __forceinline__ const int8_t * nepq_active_table(
-    const int8_t * table_pool,
-    const uint8_t * bank_ids,
-    int row,
-    int group,
-    int supergroups,
-    int table_stride) {
-    const int selector = group / kNepqGroupsPerSupergroup;
-    const uint32_t bank = bank_ids[static_cast<int64_t>(row) * supergroups + selector];
-    return table_pool + static_cast<int64_t>(bank) * table_stride;
-}
-
-__host__ __device__ constexpr bool is_d4_format(int format) {
-    return format == kNvq3 || format == kNvq3Jsc ||
-           format == kNvq3Jsc2 || format == kNvq3Jsc512 ||
-           format == kNvq3JscL || format == kNvq3JscLGroupExec;
-}
-
-__host__ __device__ constexpr bool is_e8_format(int format) {
-    return format == kNvq2 || format == kNvq2Exec ||
-           format == kNvq2Jsc || format == kNvq2JscExec ||
-           format == kNvq2JscL || format == kNvq2JscXL ||
-           format == kNvq2JscXLGroupExec;
-}
-
-__host__ __device__ constexpr int format_index_bits(int format) {
-    if (format == kNvq1L) return 11;
-    if (format == kNvq1S || format == kNvq3Jsc512) return 9;
-    if (format == kNpq0L) return 7;
-    if (format == kNpq0S) return 6;
-    if (format == kNvq2JscL || format == kNvq3JscL ||
-        format == kNvq3JscLGroupExec) return 10;
-    if (format == kNvq2JscXL || format == kNvq2JscXLGroupExec) return 12;
-    if (format == kNvq2Exec || format == kNvq2JscExec) return 16;
-    return 8;
-}
-
-template <int FORMAT>
-__device__ __forceinline__ const int8_t * active_codebook(
-    const int8_t * metadata,
-    uint32_t state) {
-    if constexpr (FORMAT == kNvq2Jsc || FORMAT == kNvq2JscExec) {
-        const uint8_t * bytes = reinterpret_cast<const uint8_t *>(metadata);
-        const uint32_t bank = bytes[kJscBankMapOffset + state];
-        return metadata + kJscMetadataBytes + bank * kJscE8CodebookBytes;
-    }
-    if constexpr (FORMAT == kNvq2JscL) {
-        const uint8_t * bytes = reinterpret_cast<const uint8_t *>(metadata);
-        const uint32_t bank = bytes[kJscBankMapOffset + state];
-        return metadata + kJscMetadataBytes + bank * kJscE8Codebook1024Bytes;
-    }
-    if constexpr (FORMAT == kNvq2JscXL) {
-        const uint8_t * bytes = reinterpret_cast<const uint8_t *>(metadata);
-        const uint32_t bank = bytes[kJscBankMapOffset + state];
-        return metadata + kJscMetadataBytes + bank * kJscE8Codebook4096Bytes;
-    }
-    if constexpr (FORMAT == kNvq2JscXLGroupExec) {
-        const uint32_t bank = state & 3u;
-        return metadata + kJscMetadataBytes + bank * kJscE8Codebook4096Bytes;
-    }
-    if constexpr (FORMAT == kNvq3Jsc) {
-        const uint8_t * bytes = reinterpret_cast<const uint8_t *>(metadata);
-        const uint32_t bank = bytes[kJscBankMapOffset + state];
-        return metadata + kJscMetadataBytes + bank * kJscD4CodebookBytes;
-    }
-    if constexpr (FORMAT == kNvq3Jsc2) {
-        const uint32_t bank = state & 1u;
-        return metadata + kJscMetadataBytes + bank * kJscD4CodebookBytes;
-    }
-    if constexpr (FORMAT == kNvq3Jsc512) {
-        const uint8_t * bytes = reinterpret_cast<const uint8_t *>(metadata);
-        const uint32_t bank = bytes[kJscBankMapOffset + state];
-        return metadata + kJscMetadataBytes + bank * kJscD4Codebook512Bytes;
-    }
-    if constexpr (FORMAT == kNvq3JscL) {
-        const uint8_t * bytes = reinterpret_cast<const uint8_t *>(metadata);
-        const uint32_t bank = bytes[kJscBankMapOffset + state];
-        return metadata + kJscMetadataBytes + bank * kJscD4Codebook1024Bytes;
-    }
-    if constexpr (FORMAT == kNvq3JscLGroupExec) {
-        const uint8_t * bytes = reinterpret_cast<const uint8_t *>(metadata);
-        const uint32_t bank = bytes[kJscBankMapOffset + state];
-        return metadata + kJscMetadataBytes + bank * kJscD4Codebook1024Bytes;
-    }
-    return metadata;
-}
-
-__device__ __forceinline__ uint32_t load_packed_bits(
-    const uint8_t * data, int64_t bit, int bits, int64_t nbytes) {
-    const int64_t byte = bit >> 3;
-    const int shift = static_cast<int>(bit & 7);
-    uint32_t word = data[byte];
-    if (byte + 1 < nbytes) word |= static_cast<uint32_t>(data[byte + 1]) << 8;
-    if (byte + 2 < nbytes) word |= static_cast<uint32_t>(data[byte + 2]) << 16;
-    return (word >> shift) & ((1u << bits) - 1u);
-}
-
-// One GS24 group contains three 7-bit sign masks.  Load their contiguous
-// 21-bit window once so the three vector decodes can reuse it.  Four byte
-// reads cover the worst seven-bit starting offset while retaining the exact
-// checked tail semantics of load_packed_bits().
-__device__ __forceinline__ uint32_t load_packed_sign_group3(
-    const uint8_t * data, int64_t bit, int64_t nbytes) {
-    const int64_t byte = bit >> 3;
-    const int shift = static_cast<int>(bit & 7);
-    uint32_t word = 0;
-#pragma unroll
-    for (int offset = 0; offset < 4; ++offset) {
-        if (byte + offset < nbytes) {
-            word |= static_cast<uint32_t>(data[byte + offset]) << (8 * offset);
-        }
-    }
-    return (word >> shift) & 0x1fffffu;
-}
-
-__device__ __forceinline__ uint32_t load_packed_4(
-    const uint8_t * data, int64_t linear) {
-    return (data[linear >> 1] >> ((linear & 1) * 4)) & 0x0fu;
-}
-
-__device__ __forceinline__ uint64_t load_group_exec64(
-    const uint8_t * data, int row, int group, int ng) {
-    return reinterpret_cast<const uint64_t *>(data)[
-        static_cast<int64_t>(row) * ng + group];
-}
-
-__device__ __forceinline__ void load_group_exec96_words(
-    const uint8_t * data,
-    int row,
-    int group,
-    int ng,
-    uint32_t (&words)[3]) {
-    const uint32_t * source = reinterpret_cast<const uint32_t *>(data) +
-        (static_cast<int64_t>(row) * ng + group) * 3;
-    words[0] = source[0];
-    words[1] = source[1];
-    words[2] = source[2];
-}
-
-__device__ __forceinline__ uint32_t load_group_exec96_bits(
-    const uint8_t * data, int row, int group, int ng, int bit, int bits) {
-    uint32_t words[3];
-    load_group_exec96_words(data, row, group, ng, words);
-    const int word = bit >> 5;
-    const int shift = bit & 31;
-    uint32_t value = words[word] >> shift;
-    if (shift + bits > 32) value |= words[word + 1] << (32 - shift);
-    return value & ((1u << bits) - 1u);
-}
-
-__device__ __forceinline__ uint32_t extract_group_exec96_bits_ptr(
-    const uint32_t * words, int bit, int bits) {
-    const int word = bit >> 5;
-    const int shift = bit & 31;
-    uint32_t value = words[word] >> shift;
-    if (shift + bits > 32) value |= words[word + 1] << (32 - shift);
-    return value & ((1u << bits) - 1u);
-}
-
-__device__ __forceinline__ int load_i8x4(const int8_t * p) {
-    const uint8_t * u = reinterpret_cast<const uint8_t *>(p);
-    return static_cast<int>(u[0]) |
-           (static_cast<int>(u[1]) << 8) |
-           (static_cast<int>(u[2]) << 16) |
-           (static_cast<int>(u[3]) << 24);
-}
-
-__device__ __forceinline__ int parity7(uint32_t mask) {
-    return __popc(mask & 0x7fu) & 1;
-}
-
-__device__ __forceinline__ int sign_bytes4(uint32_t mask8, int base) {
-    int result = 0;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const int negative = (mask8 >> (base + i)) & 1u;
-        result |= (negative ? 0xff : 0x00) << (8 * i);
-    }
-    return result;
-}
-
-__device__ __forceinline__ int apply_sign4(int values, uint32_t mask8, int base) {
-    const int signs = sign_bytes4(mask8, base);
-    return __vsub4(values ^ signs, signs);
-}
-
-__device__ __forceinline__ int nvq1_l_scale_delta4(int values, int delta) {
-    int result = 0;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const int v = static_cast<int>(static_cast<int8_t>((values >> (8 * i)) & 0xff));
-        const int scaled = 8 * v + delta;
-        result |= (scaled & 0xff) << (8 * i);
-    }
-    return result;
-}
-
-__device__ __forceinline__ int nvq1_s_scale_delta4(int values, int delta) {
-    int result = 0;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const int v = static_cast<int>(static_cast<int8_t>((values >> (8 * i)) & 0xff));
-        const int scaled = 32 * v + 5 * delta;
-        result |= (scaled & 0xff) << (8 * i);
-    }
-    return result;
-}
-
-__device__ __forceinline__ int2 load_npq0_l_vec8(
-    const int8_t * metadata,
-    uint32_t state,
-    uint32_t index) {
-    const int8_t * first = metadata + kNpq0LMetadataBytes
-        + state * kNpq0LFirstBytesPerState + (index & 7u) * 4;
-    const int8_t * second = metadata + kNpq0LSecondOffset
-        + state * kNpq0LSecondBytesPerState + (index >> 3) * 4;
-    return make_int2(load_i8x4(first), load_i8x4(second));
-}
-
-__device__ __forceinline__ int2 load_npq0_s_vec8(
-    const int8_t * metadata,
-    uint32_t state,
-    uint32_t index) {
-    const int8_t * code = metadata + kNpq0SMetadataBytes
-        + (state * kNpq0SEntries + index) * 8;
-    return reinterpret_cast<const int2 *>(code)[0];
-}
-
-__device__ __forceinline__ int2 load_nepq0_s_vec8(
-    const int8_t * metadata,
-    uint32_t state,
-    uint32_t index) {
-    const int8_t * first = metadata + kNpq0SMetadataBytes
-        + state * kNepq0SBytesPerStateHalf + (index & 7u) * 4;
-    const int8_t * second = metadata + kNepq0SSecondOffset
-        + state * kNepq0SBytesPerStateHalf + (index >> 3) * 4;
-    return make_int2(load_i8x4(first), load_i8x4(second));
-}
-
-template <int FORMAT>
-__device__ __forceinline__ int decode_chunk4(
-    const uint8_t * indices,
-    int64_t indices_nbytes,
-    const uint8_t * aux,
-    int64_t aux_nbytes,
-    const int8_t * codebook,
-    int row,
-    int group,
-    int chunk,
-    int nvec,
-    int nsign,
-    int ng,
-    int sign_mode,
-    uint32_t state) {
-    const int vector8 = group * 3 + (chunk >> 1);
-    if constexpr (FORMAT == kNvq2JscXLGroupExec) {
-        if (vector8 >= nvec || vector8 >= nsign) return 0;
-        const int local = vector8 - group * 3;
-        const uint64_t metadata = load_group_exec64(indices, row, group, ng);
-        const uint32_t segment_metadata =
-            (metadata >> (local * 20)) & 0xfffffu;
-        const uint32_t index = segment_metadata & 0xfffu;
-        const uint32_t mask8 = segment_metadata >> 12;
-        const int8_t * bank = active_codebook<FORMAT>(codebook, state);
-        return apply_sign4(
-            load_i8x4(bank + index * 8 + (chunk & 1) * 4),
-            mask8, (chunk & 1) * 4);
-    } else if constexpr (FORMAT == kNvq3JscLGroupExec) {
-        const int vector4 = group * 6 + chunk;
-        if (vector4 >= nvec || vector8 >= nsign) return 0;
-        const uint32_t index = load_group_exec96_bits(
-            indices, row, group, ng, chunk * 10, 10);
-        const int local = vector8 - group * 3;
-        const uint32_t mask8 = load_group_exec96_bits(
-            indices, row, group, ng, 60 + local * 8, 8);
-        const int8_t * bank = active_codebook<FORMAT>(codebook, state);
-        return apply_sign4(
-            load_i8x4(bank + index * 4), mask8, (chunk & 1) * 4);
-    } else if constexpr (
-        FORMAT == kNvq3 || FORMAT == kNvq3Jsc ||
-        FORMAT == kNvq3Jsc2 || FORMAT == kNvq3Jsc512 ||
-        FORMAT == kNvq3JscL) {
-        const int vector4 = group * 6 + chunk;
-        if (vector4 >= nvec || vector8 >= nsign) return 0;
-        const int64_t index_linear = static_cast<int64_t>(row) * nvec + vector4;
-        constexpr int INDEX_BITS = format_index_bits(FORMAT);
-        const uint32_t index = INDEX_BITS == 8
-            ? indices[index_linear]
-            : load_packed_bits(
-                indices, index_linear * INDEX_BITS, INDEX_BITS, indices_nbytes);
-        const int64_t sign_linear = static_cast<int64_t>(row) * nsign + vector8;
-        const uint32_t mask7 = load_packed_bits(aux, sign_linear * 7, 7, aux_nbytes);
-        const uint32_t mask8 = mask7 | (static_cast<uint32_t>(parity7(mask7)) << 7);
-        const int8_t * bank = active_codebook<FORMAT>(codebook, state);
-        return apply_sign4(load_i8x4(bank + index * 4), mask8, (chunk & 1) * 4);
-    } else if constexpr (FORMAT == kNpq0L) {
-        if (vector8 >= nvec) return 0;
-        const int64_t index_linear = static_cast<int64_t>(row) * nvec + vector8;
-        const uint32_t index = load_packed_bits(
-            indices, index_linear * 7, 7, indices_nbytes);
-        const int2 values = load_npq0_l_vec8(codebook, state, index);
-        return chunk & 1 ? values.y : values.x;
-    } else if constexpr (FORMAT == kNpq0S) {
-        if (vector8 >= nvec) return 0;
-        const int64_t index_linear = static_cast<int64_t>(row) * nvec + vector8;
-        const uint32_t index = load_packed_bits(
-            indices, index_linear * 6, 6, indices_nbytes);
-        const int2 values = load_npq0_s_vec8(codebook, state, index);
-        return chunk & 1 ? values.y : values.x;
-    } else if constexpr (
-        FORMAT == kNvq2 || FORMAT == kNvq2Exec ||
-        FORMAT == kNvq2Jsc || FORMAT == kNvq2JscExec ||
-        FORMAT == kNvq2JscL || FORMAT == kNvq2JscXL) {
-        if (vector8 >= nvec || vector8 >= nsign) return 0;
-        const int64_t index_linear = static_cast<int64_t>(row) * nvec + vector8;
-        uint32_t index;
-        uint32_t mask8;
-        if constexpr (FORMAT == kNvq2Exec || FORMAT == kNvq2JscExec) {
-            const uint16_t metadata = reinterpret_cast<const uint16_t *>(indices)[index_linear];
-            index = metadata & 0xffu;
-            mask8 = metadata >> 8;
-        } else {
-            constexpr int INDEX_BITS = format_index_bits(FORMAT);
-            index = INDEX_BITS == 8
-                ? indices[index_linear]
-                : load_packed_bits(
-                    indices, index_linear * INDEX_BITS, INDEX_BITS, indices_nbytes);
-            const int64_t sign_linear = static_cast<int64_t>(row) * nsign + vector8;
-            const uint32_t mask7 = load_packed_bits(aux, sign_linear * 7, 7, aux_nbytes);
-            const int last = parity7(mask7) ^ (sign_mode ? ((index >> 7) & 1u) : 0u);
-            mask8 = mask7 | (static_cast<uint32_t>(last) << 7);
-        }
-        const int8_t * bank = active_codebook<FORMAT>(codebook, state);
-        return apply_sign4(load_i8x4(bank + index * 8 + (chunk & 1) * 4),
-                           mask8, (chunk & 1) * 4);
-    } else if constexpr (FORMAT == kNvq1S) {
-        if (vector8 >= nvec) return 0;
-        const int64_t index_linear = static_cast<int64_t>(row) * nvec + vector8;
-        const uint32_t index = load_packed_bits(indices, index_linear * 9, 9, indices_nbytes);
-        const int64_t delta_linear = static_cast<int64_t>(row) * ng + group;
-        const int negative_delta = static_cast<int>(
-            load_packed_bits(aux, delta_linear, 1, aux_nbytes));
-        const int delta = negative_delta ? -1 : 1;
-        const int8_t * bank = codebook + negative_delta * kNvq1SBankBytes;
-        return nvq1_s_scale_delta4(
-            load_i8x4(bank + index * 8 + (chunk & 1) * 4), delta);
-    } else {
-        if (vector8 >= nvec) return 0;
-        const int64_t index_linear = static_cast<int64_t>(row) * nvec + vector8;
-        const uint32_t index = load_packed_bits(indices, index_linear * 11, 11, indices_nbytes);
-        const int64_t delta_linear = static_cast<int64_t>(row) * ng + group;
-        const int negative_delta = static_cast<int>(
-            load_packed_bits(aux, delta_linear, 1, aux_nbytes));
-        const int delta = negative_delta ? -1 : 1;
-        return nvq1_l_scale_delta4(
-            load_i8x4(codebook + index * 8 + (chunk & 1) * 4), delta);
-    }
-}
-
-template <int FORMAT>
-__device__ __forceinline__ int decode_nepq_chunk4(
-    const uint8_t * indices,
-    int64_t indices_nbytes,
-    const uint8_t * aux,
-    int64_t aux_nbytes,
-    const int8_t * codebook,
-    int row,
-    int group,
-    int chunk,
-    int nvec,
-    int nsign,
-    int ng,
-    int sign_mode,
-    uint32_t state) {
-    if constexpr (FORMAT == kNpq0S) {
-        const int vector8 = group * 3 + (chunk >> 1);
-        if (vector8 >= nvec) return 0;
-        const int64_t index_linear = static_cast<int64_t>(row) * nvec + vector8;
-        const uint32_t index = load_packed_bits(
-            indices, index_linear * 6, 6, indices_nbytes);
-        const uint32_t half_index = chunk & 1 ? index >> 3 : index & 7u;
-        const int8_t * half = chunk & 1
-            ? codebook + kNepq0SSecondOffset
-            : codebook + kNpq0SMetadataBytes;
-        return load_i8x4(
-            half + state * kNepq0SBytesPerStateHalf + half_index * 4);
-    }
-    return decode_chunk4<FORMAT>(
-        indices, indices_nbytes, aux, aux_nbytes, codebook,
-        row, group, chunk, nvec, nsign, ng, sign_mode, state);
-}
-
-template <int FORMAT>
-__device__ __forceinline__ float format_scale(
-    float anchor,
-    uint32_t sub_scale,
-    const int8_t * codebook) {
-    if constexpr (FORMAT == kNvq3Jsc2) {
-        const uint32_t rank = sub_scale >> 1;
-        return anchor * static_cast<float>(rank + 1);
-    }
-    if constexpr (
-        FORMAT == kNvq3Jsc || FORMAT == kNvq3Jsc512 ||
-        FORMAT == kNvq3JscL || FORMAT == kNvq3JscLGroupExec) {
-        const uint8_t * bytes = reinterpret_cast<const uint8_t *>(codebook);
-        const __half * lut = reinterpret_cast<const __half *>(bytes + kJscLutOffset);
-        return anchor * __half2float(lut[sub_scale]);
-    }
-    if constexpr (
-        FORMAT == kNvq2Jsc || FORMAT == kNvq2JscExec ||
-        FORMAT == kNvq2JscL || FORMAT == kNvq2JscXL ||
-        FORMAT == kNvq2JscXLGroupExec) {
-        const uint8_t * bytes = reinterpret_cast<const uint8_t *>(codebook);
-        const __half * lut = reinterpret_cast<const __half *>(bytes + kJscLutOffset);
-        return anchor * __half2float(lut[sub_scale]);
-    }
-    if constexpr (FORMAT == kNpq0L) {
-        const uint8_t * bytes = reinterpret_cast<const uint8_t *>(codebook);
-        const __half * lut = reinterpret_cast<const __half *>(bytes + kNpq0LLutOffset);
-        return anchor * __half2float(lut[sub_scale]);
-    }
-    if constexpr (FORMAT == kNpq0S) {
-        const uint8_t * bytes = reinterpret_cast<const uint8_t *>(codebook);
-        const __half * lut = reinterpret_cast<const __half *>(bytes + kNpq0SLutOffset);
-        return anchor * __half2float(lut[sub_scale]);
-    }
-    const float scale = anchor * static_cast<float>(sub_scale);
-    if constexpr (FORMAT == kNvq1L) return scale * 0.125f;
-    if constexpr (FORMAT == kNvq1S) return scale * 0.03125f;
-    return scale;
-}
+using namespace mfq::cuda::packed_nvq;
 
 template <int FORMAT>
 __global__ void nvq_dequant_kernel(
@@ -637,365 +152,6 @@ __global__ void nvq_quantize_x_gate_gs24_kernel(
         qx[(static_cast<int64_t>(m) * ng + group) * kGroupSize + lane] =
             valid ? static_cast<int8_t>(q) : static_cast<int8_t>(0);
     }
-}
-
-__device__ __forceinline__ int2 apply_sign8(int2 values, uint32_t mask8) {
-    const uint32_t broadcast = mask8 * 0x01010101u;
-    const int signs0 = __vcmpne4(broadcast & 0x08040201u, 0);
-    const int signs1 = __vcmpne4(broadcast & 0x80402010u, 0);
-    return make_int2(
-        __vsub4(values.x ^ signs0, signs0),
-        __vsub4(values.y ^ signs1, signs1));
-}
-
-__device__ uint32_t nvq_sign_expand4[16] = {
-    0x00000000u, 0x000000ffu, 0x0000ff00u, 0x0000ffffu,
-    0x00ff0000u, 0x00ff00ffu, 0x00ffff00u, 0x00ffffffu,
-    0xff000000u, 0xff0000ffu, 0xff00ff00u, 0xff00ffffu,
-    0xffff0000u, 0xffff00ffu, 0xffffff00u, 0xffffffffu,
-};
-
-__device__ __forceinline__ int2 apply_sign8_exec(int2 values, uint32_t mask8) {
-    const int signs0 = static_cast<int>(__ldg(nvq_sign_expand4 + (mask8 & 0x0fu)));
-    const int signs1 = static_cast<int>(__ldg(nvq_sign_expand4 + (mask8 >> 4)));
-    return make_int2(
-        __vsub4(values.x ^ signs0, signs0),
-        __vsub4(values.y ^ signs1, signs1));
-}
-
-template <int FORMAT>
-struct NvqVec8Values {
-    int2 values;
-    int delta;
-    bool valid;
-};
-
-struct NvqDeviceWeight {
-    const uint8_t * indices;
-    int64_t indices_nbytes;
-    const uint8_t * aux;
-    int64_t aux_nbytes;
-    const uint8_t * sub_scale;
-    int64_t sub_scale_nbytes;
-    const float * neuron_scale;
-    const int8_t * codebook;
-    int codebook_nbytes;
-    int N;
-    int ng;
-    int nvec;
-    int nsign;
-    int sub_bits;
-    int sign_mode;
-};
-
-template <int FORMAT>
-__device__ __forceinline__ NvqVec8Values<FORMAT> load_nvq_vec8(
-    const uint8_t * indices,
-    int64_t indices_nbytes,
-    const uint8_t * aux,
-    int64_t aux_nbytes,
-    const int8_t * codebook,
-    int row,
-    int segment,
-    int group,
-    int ng,
-    int nvec,
-    int nsign,
-    int sign_mode,
-    uint32_t state) {
-    if constexpr (FORMAT == kNvq2JscXLGroupExec) {
-        if (segment >= nsign) return {make_int2(0, 0), 0, false};
-        const int local = segment - group * 3;
-        const uint64_t metadata = load_group_exec64(indices, row, group, ng);
-        const uint32_t segment_metadata =
-            (metadata >> (local * 20)) & 0xfffffu;
-        const uint32_t index = segment_metadata & 0xfffu;
-        const uint32_t mask8 = segment_metadata >> 12;
-        const int8_t * bank = active_codebook<FORMAT>(codebook, state);
-        return {apply_sign8(
-            reinterpret_cast<const int2 *>(bank)[index], mask8), 0, true};
-    } else if constexpr (FORMAT == kNvq3JscLGroupExec) {
-        const int vector4 = segment * 2;
-        if (vector4 >= nvec || segment >= nsign) {
-            return {make_int2(0, 0), 0, false};
-        }
-        const int local = segment - group * 3;
-        const uint32_t index0 = load_group_exec96_bits(
-            indices, row, group, ng, local * 20, 10);
-        const uint32_t index1 = vector4 + 1 < nvec
-            ? load_group_exec96_bits(
-                indices, row, group, ng, local * 20 + 10, 10)
-            : 0;
-        const uint32_t mask8 = load_group_exec96_bits(
-            indices, row, group, ng, 60 + local * 8, 8);
-        const int8_t * bank = active_codebook<FORMAT>(codebook, state);
-        return {apply_sign8(
-            make_int2(
-                reinterpret_cast<const int *>(bank)[index0],
-                reinterpret_cast<const int *>(bank)[index1]),
-            mask8), 0, true};
-    } else if constexpr (
-        FORMAT == kNvq3 || FORMAT == kNvq3Jsc ||
-        FORMAT == kNvq3Jsc2 || FORMAT == kNvq3Jsc512 ||
-        FORMAT == kNvq3JscL) {
-        const int vector4 = segment * 2;
-        if (vector4 >= nvec) return {make_int2(0, 0), 0, false};
-        const int64_t index_linear = static_cast<int64_t>(row) * nvec + vector4;
-        constexpr int INDEX_BITS = format_index_bits(FORMAT);
-        const uint32_t index0 = INDEX_BITS == 8
-            ? indices[index_linear]
-            : load_packed_bits(
-                indices, index_linear * INDEX_BITS, INDEX_BITS, indices_nbytes);
-        const uint32_t index1 = vector4 + 1 < nvec
-            ? (INDEX_BITS != 8
-                ? load_packed_bits(
-                    indices, (index_linear + 1) * INDEX_BITS,
-                    INDEX_BITS, indices_nbytes)
-                : indices[index_linear + 1])
-            : 0;
-        const int64_t sign_linear = static_cast<int64_t>(row) * nsign + segment;
-        const uint32_t mask7 = load_packed_bits(aux, sign_linear * 7, 7, aux_nbytes);
-        const uint32_t mask8 = mask7 | (static_cast<uint32_t>(parity7(mask7)) << 7);
-        const int8_t * bank = active_codebook<FORMAT>(codebook, state);
-        return {apply_sign8(
-            make_int2(
-                reinterpret_cast<const int *>(bank)[index0],
-                reinterpret_cast<const int *>(bank)[index1]),
-            mask8), 0, true};
-    } else {
-        if (segment >= nvec) return {make_int2(0, 0), 0, false};
-        const int64_t index_linear = static_cast<int64_t>(row) * nvec + segment;
-        if constexpr (FORMAT == kNpq0L) {
-            const uint32_t index = load_packed_bits(
-                indices, index_linear * 7, 7, indices_nbytes);
-            return {load_npq0_l_vec8(codebook, state, index), 0, true};
-        } else if constexpr (FORMAT == kNpq0S) {
-            const uint32_t index = load_packed_bits(
-                indices, index_linear * 6, 6, indices_nbytes);
-            return {load_npq0_s_vec8(codebook, state, index), 0, true};
-        } else if constexpr (
-            FORMAT == kNvq2 || FORMAT == kNvq2Exec ||
-            FORMAT == kNvq2Jsc || FORMAT == kNvq2JscExec ||
-            FORMAT == kNvq2JscL || FORMAT == kNvq2JscXL) {
-            uint32_t index;
-            uint32_t mask8;
-            if constexpr (FORMAT == kNvq2Exec || FORMAT == kNvq2JscExec) {
-                const uint16_t metadata = reinterpret_cast<const uint16_t *>(indices)[index_linear];
-                index = metadata & 0xffu;
-                mask8 = metadata >> 8;
-            } else {
-                constexpr int INDEX_BITS = format_index_bits(FORMAT);
-                index = INDEX_BITS == 8
-                    ? indices[index_linear]
-                    : load_packed_bits(
-                        indices, index_linear * INDEX_BITS,
-                        INDEX_BITS, indices_nbytes);
-                const int64_t sign_linear = static_cast<int64_t>(row) * nsign + segment;
-                const uint32_t mask7 = load_packed_bits(aux, sign_linear * 7, 7, aux_nbytes);
-                const int last = parity7(mask7) ^ (sign_mode ? ((index >> 7) & 1u) : 0u);
-                mask8 = mask7 | (static_cast<uint32_t>(last) << 7);
-            }
-            const int8_t * bank = active_codebook<FORMAT>(codebook, state);
-            const int2 values = reinterpret_cast<const int2 *>(bank)[index];
-            if constexpr (FORMAT == kNvq2Exec || FORMAT == kNvq2JscExec) {
-                return {apply_sign8_exec(values, mask8), 0, true};
-            }
-            return {apply_sign8(values, mask8), 0, true};
-        } else if constexpr (FORMAT == kNvq1S) {
-            const uint32_t index = load_packed_bits(
-                indices, index_linear * 9, 9, indices_nbytes);
-            const int64_t delta_linear = static_cast<int64_t>(row) * ng + group;
-            const int negative_delta = static_cast<int>(
-                load_packed_bits(aux, delta_linear, 1, aux_nbytes));
-            const int delta = negative_delta ? -1 : 1;
-            const int8_t * bank = codebook + negative_delta * kNvq1SBankBytes;
-            return {reinterpret_cast<const int2 *>(bank)[index], delta, true};
-        } else {
-            const uint32_t index = load_packed_bits(indices, index_linear * 11, 11, indices_nbytes);
-            const int64_t delta_linear = static_cast<int64_t>(row) * ng + group;
-            const int delta = load_packed_bits(aux, delta_linear, 1, aux_nbytes) ? -1 : 1;
-            return {reinterpret_cast<const int2 *>(codebook)[index], delta, true};
-        }
-    }
-}
-
-template <int FORMAT>
-__device__ __forceinline__ NvqVec8Values<FORMAT> load_nepq_vec8(
-    const uint8_t * indices,
-    int64_t indices_nbytes,
-    const uint8_t * aux,
-    int64_t aux_nbytes,
-    const int8_t * codebook,
-    int row,
-    int segment,
-    int group,
-    int ng,
-    int nvec,
-    int nsign,
-    int sign_mode,
-    uint32_t state) {
-    if constexpr (FORMAT == kNpq0S) {
-        if (segment >= nvec) return {make_int2(0, 0), 0, false};
-        const int64_t index_linear = static_cast<int64_t>(row) * nvec + segment;
-        const uint32_t index = load_packed_bits(
-            indices, index_linear * 6, 6, indices_nbytes);
-        return {load_nepq0_s_vec8(codebook, state, index), 0, true};
-    }
-    return load_nvq_vec8<FORMAT>(
-        indices, indices_nbytes, aux, aux_nbytes, codebook,
-        row, segment, group, ng, nvec, nsign, sign_mode, state);
-}
-
-template <int FORMAT>
-__device__ __forceinline__ NvqVec8Values<FORMAT> load_nvq_group_vec8(
-    const uint8_t * indices,
-    int64_t indices_nbytes,
-    const uint8_t * aux,
-    int64_t aux_nbytes,
-    const int8_t * codebook,
-    const int8_t * bank,
-    int row,
-    int group,
-    int segment_local,
-    int ng,
-    int nvec,
-    int nsign,
-    int sign_mode,
-    uint32_t state,
-    uint32_t packed_signs,
-    uint64_t group_exec64,
-    const uint32_t * group_exec96,
-    int group_delta) {
-    const int segment = group * 3 + segment_local;
-    if constexpr (FORMAT == kNvq2JscXLGroupExec) {
-        if (segment >= nsign) return {make_int2(0, 0), 0, false};
-        const uint32_t metadata =
-            (group_exec64 >> (segment_local * 20)) & 0xfffffu;
-        const uint32_t index = metadata & 0xfffu;
-        const uint32_t mask8 = metadata >> 12;
-        return {apply_sign8(
-            reinterpret_cast<const int2 *>(bank)[index], mask8), 0, true};
-    } else if constexpr (FORMAT == kNvq3JscLGroupExec) {
-        const int vector4 = segment * 2;
-        if (vector4 >= nvec || segment >= nsign) {
-            return {make_int2(0, 0), 0, false};
-        }
-        const uint32_t index0 = extract_group_exec96_bits_ptr(
-            group_exec96, segment_local * 20, 10);
-        const uint32_t index1 = vector4 + 1 < nvec
-            ? extract_group_exec96_bits_ptr(
-                group_exec96, segment_local * 20 + 10, 10)
-            : 0;
-        const uint32_t mask8 = extract_group_exec96_bits_ptr(
-            group_exec96, 60 + segment_local * 8, 8);
-        return {apply_sign8(
-            make_int2(
-                reinterpret_cast<const int *>(bank)[index0],
-                reinterpret_cast<const int *>(bank)[index1]),
-            mask8), 0, true};
-    } else if constexpr (
-        FORMAT == kNvq3 || FORMAT == kNvq3Jsc ||
-        FORMAT == kNvq3Jsc2 || FORMAT == kNvq3Jsc512 ||
-        FORMAT == kNvq3JscL) {
-        const int vector4 = segment * 2;
-        if (vector4 >= nvec || segment >= nsign) {
-            return {make_int2(0, 0), 0, false};
-        }
-        const int64_t index_linear =
-            static_cast<int64_t>(row) * nvec + vector4;
-        constexpr int INDEX_BITS = format_index_bits(FORMAT);
-        const uint32_t index0 = INDEX_BITS == 8
-            ? indices[index_linear]
-            : load_packed_bits(
-                indices, index_linear * INDEX_BITS,
-                INDEX_BITS, indices_nbytes);
-        const uint32_t index1 = vector4 + 1 < nvec
-            ? (INDEX_BITS == 8
-                ? indices[index_linear + 1]
-                : load_packed_bits(
-                    indices, (index_linear + 1) * INDEX_BITS,
-                    INDEX_BITS, indices_nbytes))
-            : 0;
-        const uint32_t mask7 =
-            (packed_signs >> (segment_local * 7)) & 0x7fu;
-        const uint32_t mask8 = mask7 |
-            (static_cast<uint32_t>(parity7(mask7)) << 7);
-        return {apply_sign8(
-            make_int2(
-                reinterpret_cast<const int *>(bank)[index0],
-                reinterpret_cast<const int *>(bank)[index1]),
-            mask8), 0, true};
-    } else if constexpr (
-        FORMAT == kNvq2 || FORMAT == kNvq2Exec ||
-        FORMAT == kNvq2Jsc || FORMAT == kNvq2JscExec ||
-        FORMAT == kNvq2JscL || FORMAT == kNvq2JscXL) {
-        if (segment >= nvec || segment >= nsign) {
-            return {make_int2(0, 0), 0, false};
-        }
-        const int64_t index_linear =
-            static_cast<int64_t>(row) * nvec + segment;
-        uint32_t index;
-        uint32_t mask8;
-        if constexpr (FORMAT == kNvq2Exec || FORMAT == kNvq2JscExec) {
-            const uint16_t metadata =
-                reinterpret_cast<const uint16_t *>(indices)[index_linear];
-            index = metadata & 0xffu;
-            mask8 = metadata >> 8;
-        } else {
-            constexpr int INDEX_BITS = format_index_bits(FORMAT);
-            index = INDEX_BITS == 8
-                ? indices[index_linear]
-                : load_packed_bits(
-                    indices, index_linear * INDEX_BITS,
-                    INDEX_BITS, indices_nbytes);
-            const uint32_t mask7 =
-                (packed_signs >> (segment_local * 7)) & 0x7fu;
-            const int last = parity7(mask7) ^
-                (sign_mode ? ((index >> 7) & 1u) : 0u);
-            mask8 = mask7 | (static_cast<uint32_t>(last) << 7);
-        }
-        const int2 values = reinterpret_cast<const int2 *>(bank)[index];
-        if constexpr (FORMAT == kNvq2Exec || FORMAT == kNvq2JscExec) {
-            return {apply_sign8_exec(values, mask8), 0, true};
-        }
-        return {apply_sign8(values, mask8), 0, true};
-    } else if constexpr (FORMAT == kNvq1S) {
-        if (segment >= nvec) return {make_int2(0, 0), 0, false};
-        const int64_t index_linear =
-            static_cast<int64_t>(row) * nvec + segment;
-        const uint32_t index = load_packed_bits(
-            indices, index_linear * 9, 9, indices_nbytes);
-        return {reinterpret_cast<const int2 *>(bank)[index], group_delta, true};
-    } else if constexpr (FORMAT == kNvq1L) {
-        if (segment >= nvec) return {make_int2(0, 0), 0, false};
-        const int64_t index_linear =
-            static_cast<int64_t>(row) * nvec + segment;
-        const uint32_t index = load_packed_bits(
-            indices, index_linear * 11, 11, indices_nbytes);
-        return {
-            reinterpret_cast<const int2 *>(codebook)[index], group_delta, true};
-    }
-    return load_nvq_vec8<FORMAT>(
-        indices, indices_nbytes, aux, aux_nbytes, codebook,
-        row, segment, group, ng, nvec, nsign, sign_mode, state);
-}
-
-template <int FORMAT>
-__device__ __forceinline__ float dot_nvq_vec8(
-    const NvqVec8Values<FORMAT> & weight,
-    const int8_t * activation) {
-    if (!weight.valid) return 0.0f;
-    const int2 x = *reinterpret_cast<const int2 *>(activation);
-    const int dot = __dp4a(weight.values.y, x.y, __dp4a(weight.values.x, x.x, 0));
-    if constexpr (FORMAT == kNvq1L) {
-        const int sum = __dp4a(0x01010101, x.y, __dp4a(0x01010101, x.x, 0));
-        return static_cast<float>(dot) + 0.125f * static_cast<float>(weight.delta * sum);
-    }
-    if constexpr (FORMAT == kNvq1S) {
-        const int sum = __dp4a(0x01010101, x.y, __dp4a(0x01010101, x.x, 0));
-        return static_cast<float>(dot) + 0.15625f * static_cast<float>(weight.delta * sum);
-    }
-    return static_cast<float>(dot);
 }
 
 template <int FORMAT>
@@ -3788,7 +2944,7 @@ __global__ void __launch_bounds__(NWARPS * 32) nvq_moe_mmvq_kernel(
         local_expert, blockIdx.x * ROWS_PER_BLOCK);
 }
 
-template <int NWARPS, int ROWS_PER_BLOCK, bool SHARE_GROUP_STATE>
+template <int NWARPS, int ROWS_PER_BLOCK, bool SHARE_GROUP_STATE,bool ActiveRows=false>
 __global__ void __launch_bounds__(NWARPS * 32)
 nvq_moe_mmvq_hetero_kernel(
     const int64_t * weight_ptrs,
@@ -3805,19 +2961,23 @@ nvq_moe_mmvq_hetero_kernel(
     int global_experts,
     int pool_count,
     int out_per_expert,
-    bool routed_input) {
-    const int pair = blockIdx.y;
-    if (pair >= pairs) return;
+    bool routed_input,const int32_t* active_plan=nullptr) {
+    const int row_tiles=(out_per_expert-1)/ROWS_PER_BLOCK+1;
+    const int64_t total=ActiveRows?int64_t(active_plan[0])*row_tiles:1;
+    for(int64_t task=ActiveRows?blockIdx.x:0;task<total;task+=ActiveRows?gridDim.x:1) {
+    const int pair = ActiveRows?active_plan[1+2*pairs+task/row_tiles]:int(blockIdx.y);
+    const int row0=ActiveRows?int(task%row_tiles)*ROWS_PER_BLOCK:int(blockIdx.x)*ROWS_PER_BLOCK;
+    if (pair >= pairs) continue;
     const int expert = ids[pair];
     if (static_cast<unsigned int>(expert) >=
         static_cast<unsigned int>(global_experts)) {
-        return;
+        continue;
     }
-    const int pool = expert_pool[expert];
-    const int local_expert = expert_local[expert];
+    const int pool = ActiveRows?active_plan[1+pair]:expert_pool[expert];
+    const int local_expert = ActiveRows?active_plan[1+pairs+pair]:expert_local[expert];
     if (static_cast<unsigned int>(pool) >=
             static_cast<unsigned int>(pool_count) || local_expert < 0) {
-        return;
+        continue;
     }
     const int64_t * pointers =
         weight_ptrs + static_cast<size_t>(pool) * 5;
@@ -3825,7 +2985,7 @@ nvq_moe_mmvq_hetero_kernel(
         weight_sizes + static_cast<size_t>(pool) * 3;
     const int32_t * params =
         pool_params + static_cast<size_t>(pool) * 7;
-    if (local_expert >= params[0]) return;
+    if (local_expert >= params[0]) continue;
     const uint8_t * indices = reinterpret_cast<const uint8_t *>(
         static_cast<uintptr_t>(pointers[0]));
     const uint8_t * aux = reinterpret_cast<const uint8_t *>(
@@ -3852,7 +3012,7 @@ nvq_moe_mmvq_hetero_kernel(
             neuron_scale, codebook, qx, xscale, output, &partial[0][0],         \
             pair, routes, out_per_expert, ng, nvec, nsign, sub_bits,           \
             sign_mode, routed_input, routed_input ? pair : pair / routes,       \
-            local_expert, blockIdx.x * ROWS_PER_BLOCK);                         \
+            local_expert, row0);                                              \
         break
     switch (format) {
         NVQ_MOE_HETERO_MMVQ_CASE(kNvq1L);
@@ -3874,6 +3034,24 @@ nvq_moe_mmvq_hetero_kernel(
         NVQ_MOE_HETERO_MMVQ_CASE(kNvq3JscLGroupExec);
     }
 #undef NVQ_MOE_HETERO_MMVQ_CASE
+    if constexpr(ActiveRows)__syncthreads();
+    }
+}
+
+template<int Warps>
+int nvq_active_resident_blocks() {
+    int device=0;
+    MFQ_RUNTIME_CHECK(cudaGetDevice(&device)==cudaSuccess,"NVQ active device query failed");
+    static thread_local std::map<int,int> cached;
+    if(const auto found=cached.find(device);found!=cached.end())return found->second;
+    cudaDeviceProp properties{};int active=0;
+    MFQ_RUNTIME_CHECK(cudaGetDeviceProperties(&properties,device)==cudaSuccess,
+        "NVQ active device properties unavailable");
+    MFQ_RUNTIME_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active,
+        nvq_moe_mmvq_hetero_kernel<Warps,2,false,true>,Warps*32,0)==cudaSuccess && active>0,
+        "NVQ active kernel occupancy unavailable");
+    const int blocks=active*properties.multiProcessorCount;
+    cached.emplace(device,blocks);return blocks;
 }
 
 template <int FORMAT, int PHYSICAL_WARPS, int LOGICAL_WARPS, int ROWS_PER_BLOCK>
@@ -6690,7 +5868,7 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_f16_cuda(
     return out;
 }
 
-mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_ws_cuda(
+static mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_impl(
     mfq_tensor_backend::Tensor weight_ptrs,
     mfq_tensor_backend::Tensor weight_sizes,
     mfq_tensor_backend::Tensor pool_params,
@@ -6704,7 +5882,7 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_ws_cuda(
     bool input_quantized,
     mfq_tensor_backend::Tensor out,
     mfq_tensor_backend::Tensor qx,
-    mfq_tensor_backend::Tensor xscale) {
+    mfq_tensor_backend::Tensor xscale,mfq_tensor_backend::Tensor active_plan) {
     MFQ_RUNTIME_CHECK(
         n_experts > 0 && n_experts <= 4096,
         "NVQ heterogeneous expert count must be in [1,4096]");
@@ -6789,16 +5967,19 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_ws_cuda(
             "NVQ heterogeneous tensors must share one CUDA device");
     }
 
+    if(active_plan.defined())MFQ_RUNTIME_CHECK(active_plan.is_cuda() && active_plan.is_contiguous() &&
+        active_plan.scalar_type()==mfq_tensor_backend::kInt32 && active_plan.device()==x.device() &&
+        active_plan.numel()==1+int64_t(pairs)*3,"NVQ active route plan geometry/device mismatch");
     const cudaStream_t stream = mfq_current_cuda_stream();
     if (!input_quantized) {
         nvq_quantize_x_gs24_kernel<<<dim3(input_rows, ng), 32, 0, stream>>>(
             reinterpret_cast<const __half *>(x.data_ptr<mfq_half>()),
             qx.data_ptr<int8_t>(), xscale.data_ptr<float>(), input_rows, K, ng);
     }
-#define NVQ_MOE_HETERO_MMVQ_LAUNCH(NWARPS_VALUE)                               \
+#define NVQ_MOE_HETERO_MMVQ_LAUNCH(NWARPS_VALUE, ROWS_VALUE)                   \
     nvq_moe_mmvq_hetero_kernel<                                                \
-        NWARPS_VALUE, 2, false><<<                                             \
-        dim3((static_cast<int>(out_per_expert) + 1) / 2, pairs),               \
+        NWARPS_VALUE, ROWS_VALUE, false><<<                                    \
+        dim3((static_cast<int>(out_per_expert) + ROWS_VALUE - 1) / ROWS_VALUE, pairs), \
         dim3(32, NWARPS_VALUE), 0, stream>>>(                                  \
         weight_ptrs.data_ptr<int64_t>(), weight_sizes.data_ptr<int64_t>(),     \
         pool_params.data_ptr<int32_t>(), expert_pool.data_ptr<int32_t>(),      \
@@ -6807,11 +5988,58 @@ mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_ws_cuda(
         reinterpret_cast<__half *>(out.data_ptr<mfq_half>()), pairs, routes,   \
         static_cast<int>(n_experts), pools, static_cast<int>(out_per_expert),  \
         routed_input)
-    if (K >= 4096) NVQ_MOE_HETERO_MMVQ_LAUNCH(8);
-    else NVQ_MOE_HETERO_MMVQ_LAUNCH(4);
+    if(active_plan.defined()) {
+        const auto launch=[&](auto warp_tag) {
+            constexpr int warps=decltype(warp_tag)::value;
+            const int blocks=int(std::min<int64_t>(nvq_active_resident_blocks<warps>(),
+                ((out_per_expert-1)/2+1)*pairs));
+            nvq_moe_mmvq_hetero_kernel<warps,2,false,true><<<blocks,dim3(32,warps),0,stream>>>(
+                weight_ptrs.data_ptr<int64_t>(),weight_sizes.data_ptr<int64_t>(),pool_params.data_ptr<int32_t>(),
+                expert_pool.data_ptr<int32_t>(),expert_local.data_ptr<int32_t>(),qx.data_ptr<int8_t>(),
+                xscale.data_ptr<float>(),ids.data_ptr<int32_t>(),reinterpret_cast<__half*>(out.data_ptr<mfq_half>()),
+                pairs,routes,static_cast<int>(n_experts),pools,static_cast<int>(out_per_expert),routed_input,
+                active_plan.data_ptr<int32_t>());
+        };
+        if(K>=4096)launch(std::integral_constant<int,8>{});else launch(std::integral_constant<int,4>{});
+    } else if (K >= 4096) NVQ_MOE_HETERO_MMVQ_LAUNCH(8,2);
+    else {
+        // Keep each row's four-warp accumulation and reduction unchanged.
+        // The opt-in sweep varies only the number of rows sharing a CTA.
+        const auto* requested=std::getenv("MFQ_NVQ_MOE_ROW_TILE");
+        const int rows=tokens==1 && requested ? std::atoi(requested) : 2;
+        switch(rows) {
+            case 1: NVQ_MOE_HETERO_MMVQ_LAUNCH(4,1);break;
+            case 4: NVQ_MOE_HETERO_MMVQ_LAUNCH(4,4);break;
+            case 8: NVQ_MOE_HETERO_MMVQ_LAUNCH(4,8);break;
+            case 16: NVQ_MOE_HETERO_MMVQ_LAUNCH(4,16);break;
+            case 32: NVQ_MOE_HETERO_MMVQ_LAUNCH(4,32);break;
+            default: NVQ_MOE_HETERO_MMVQ_LAUNCH(4,2);break;
+        }
+    }
 #undef NVQ_MOE_HETERO_MMVQ_LAUNCH
     MFQ_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
+}
+
+mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_hetero_ws_cuda(
+    mfq_tensor_backend::Tensor weight_ptrs,mfq_tensor_backend::Tensor weight_sizes,
+    mfq_tensor_backend::Tensor pool_params,mfq_tensor_backend::Tensor expert_pool,
+    mfq_tensor_backend::Tensor expert_local,mfq_tensor_backend::Tensor x,mfq_tensor_backend::Tensor ids,
+    int64_t n_experts,int64_t out_per_expert,int64_t neuron_len,bool input_quantized,
+    mfq_tensor_backend::Tensor out,mfq_tensor_backend::Tensor qx,mfq_tensor_backend::Tensor xscale) {
+    return nvq_moe_grouped_matmul_hetero_impl(weight_ptrs,weight_sizes,pool_params,expert_pool,expert_local,
+        x,ids,n_experts,out_per_expert,neuron_len,input_quantized,out,qx,xscale,{});
+}
+mfq_tensor_backend::Tensor nvq_moe_grouped_matmul_active_ws_cuda(
+    mfq_tensor_backend::Tensor weight_ptrs,mfq_tensor_backend::Tensor weight_sizes,
+    mfq_tensor_backend::Tensor pool_params,mfq_tensor_backend::Tensor expert_pool,
+    mfq_tensor_backend::Tensor expert_local,mfq_tensor_backend::Tensor x,mfq_tensor_backend::Tensor ids,
+    int64_t n_experts,int64_t out_per_expert,int64_t neuron_len,bool input_quantized,
+    mfq_tensor_backend::Tensor out,mfq_tensor_backend::Tensor qx,mfq_tensor_backend::Tensor xscale,
+    mfq_tensor_backend::Tensor active_plan) {
+    MFQ_RUNTIME_CHECK(active_plan.defined(),"NVQ active route plan required");
+    return nvq_moe_grouped_matmul_hetero_impl(weight_ptrs,weight_sizes,pool_params,expert_pool,expert_local,
+        x,ids,n_experts,out_per_expert,neuron_len,input_quantized,out,qx,xscale,active_plan);
 }
 
 mfq_tensor_backend::Tensor nepq_moe_grouped_matmul_pool_f16_cuda(

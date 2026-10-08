@@ -104,6 +104,7 @@ enum class MixedNvqF16FormatGroup : int {
 MixedNvqF16FormatGroup mixed_nvq_f16_format_group(int format);
 
 struct MixedNvqDispatch {
+    mfq_tensor_backend::Tensor map_ptrs;
     mfq_tensor_backend::Tensor weight_ptrs;
     mfq_tensor_backend::Tensor weight_sizes;
     mfq_tensor_backend::Tensor pool_params;
@@ -115,6 +116,15 @@ struct MixedNvqDispatch {
     bool masked_experts = false;
 };
 
+struct MixedNintDispatch {
+    mfq_tensor_backend::Tensor map_ptrs,expert_pool,expert_local,pool_params;
+    std::vector<int> pools;
+};
+struct MixedNintInputPlan {
+    mfq_tensor_backend::Tensor weight_ptrs,quantize_descriptors;
+    int total_groups=0;
+};
+
 struct MixedMoeRuntime {
     int n_experts = 0;
     int out_per_expert = 0;
@@ -122,6 +132,9 @@ struct MixedMoeRuntime {
     bool partial_experts = false;
     std::vector<MixedMoePool> pools;
     std::shared_ptr<MixedNvqDispatch> nvq_dispatch;
+    std::shared_ptr<MixedNintDispatch> nint_dispatch;
+    mutable std::unordered_map<int,MixedNintInputPlan> nint_input_plans;
+    mutable std::unordered_map<int,mfq_tensor_backend::Tensor> nvq_active_plans;
     mutable std::unordered_map<
         MixedMoeActivationKey, MoeActivationWorkspace,
         MixedMoeActivationKeyHash> activation_workspaces;
@@ -173,6 +186,7 @@ std::shared_ptr<MixedMoeRuntime> make_mixed_moe_runtime(
     bool cuda,
     const CudaExecutionConfig& config = {});
 int64_t mixed_moe_storage_bytes(const MixedMoeRuntime& runtime);
+void initialize_mixed_nvq_dispatch(MixedMoeRuntime& runtime,const CudaExecutionConfig& config);
 mfq_tensor_backend::Tensor copy_cpu_weight_to_cuda(
     const mfq_tensor_backend::Tensor& source);
 MfeWeight to_gpu_mixed_moe(

@@ -5,6 +5,7 @@
 #include "cuda_execution.h"
 #include "moe.h"
 #include "mfe_expert_store.h"
+#include "moe_quant_range_source.h"
 #include "moe_cache_policy.h"
 #include "moe_cache_transfer.h"
 
@@ -33,6 +34,7 @@ struct MoeCacheTransfer {
     const uint8_t * mapped_source = nullptr;
     const mfq::cuda::MfeMxfp4ExpertStore * range_store = nullptr;
     const mfq::cuda::MfeMxfp4ExpertPart * range_part = nullptr;
+    std::shared_ptr<const void> source_owner;
 };
 
 struct MoeCacheNewLease {
@@ -101,6 +103,36 @@ static std::vector<mfq_tensor_backend::Tensor> moe_cache_fields(
         fields.push_back(pool.nepq.residual_second);
     }
     return fields;
+}
+
+static mfq_tensor_backend::Tensor moe_owned_host_view(
+        const std::shared_ptr<mfq_tensor_backend::Tensor>& arena,std::size_t offset,
+        const mfq_tensor_backend::Tensor& field) {
+    namespace tb=mfq_tensor_backend;
+    const auto count=static_cast<std::size_t>(tensor_nbytes(field));
+    if(!arena || !arena->is_cpu() || offset>static_cast<std::size_t>(arena->numel()) ||
+        count>static_cast<std::size_t>(arena->numel())-offset)
+        throw std::out_of_range("RAM complement field exceeds its owned arena");
+    auto* ptr=arena->data_ptr<uint8_t>()+offset;
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+    auto storage=std::make_shared<tb::TensorStorage>();
+    storage->owner=arena;storage->base=ptr;storage->bytes=count;storage->device=field.device();
+    return tb::Tensor(storage,tb::make_contiguous_view(ptr,field.sizes(),field.scalar_type(),field.device()));
+#else
+    return tb::from_blob(ptr,field.sizes(),[arena](void*){},field.options());
+#endif
+}
+
+static MixedMoePool moe_replace_quant_fields(MixedMoePool pool,const std::vector<mfq_tensor_backend::Tensor>& fields) {
+    if(pool.family==MixedMoeFamily::Nint) {
+        if(fields.size()!=7)throw std::invalid_argument("NINT RAM complement layout mismatch");
+        pool.nint.q_packed=fields[0];pool.nint.row_q_bits=fields[1];pool.nint.row_q_bit_offsets=fields[2];
+        pool.nint.sub_scale=fields[3];pool.nint.sub_min=fields[4];pool.nint.neuron_scale=fields[5];pool.nint.neuron_min=fields[6];
+    }else if(pool.family==MixedMoeFamily::Nvq) {
+        if(fields.size()!=4)throw std::invalid_argument("NVQ RAM complement layout mismatch");
+        pool.nvq.indices_packed=fields[0];pool.nvq.aux_packed=fields[1];pool.nvq.sub_scale_packed=fields[2];pool.nvq.neuron_scale=fields[3];
+    }else throw std::invalid_argument("unsupported canonical RAM complement format");
+    return pool;
 }
 
 static std::vector<MoeCacheFieldLayout> moe_cache_field_layouts(
@@ -270,6 +302,23 @@ struct MoeCacheStats {
     int64_t h2d_bytes = 0;
     int64_t route_d2h_bytes = 0;
     int64_t full_projection_fallbacks = 0;
+    int64_t hybrid_calls = 0, hybrid_cpu_experts = 0, hybrid_gpu_experts = 0;
+    int64_t ram_pcie_experts=0,ram_pcie_bytes=0;
+    int64_t pipeline_serves=0,pipeline_route_wait_ns=0,pipeline_plan_ns=0;
+    int64_t pipeline_two_stage_serves=0;
+    int64_t pipeline_transfer_cache_hits=0,pipeline_transfer_cache_misses=0,pipeline_transfer_cache_saved_bytes=0;
+    int64_t pipeline_fetch_ns=0,pipeline_cpu_ns=0;
+    int64_t pipeline_window_serves=0,pipeline_window_route_ns=0,pipeline_window_plan_ns=0;
+    int64_t pipeline_window_fetch_ns=0,pipeline_window_cpu_ns=0,pipeline_window_gpu_ns=0;
+    int64_t pipeline_dma_copies=0,pipeline_window_dma_copies=0,pipeline_window_dma_bytes=0;
+    int64_t pipeline_direct_ram_bytes=0,pipeline_direct_ram_copies=0,pipeline_staged_ram_bytes=0;
+    int64_t pipeline_mapped_copy_serves=0,pipeline_mapped_copy_bytes=0,pipeline_mapped_copy_descriptors=0;
+    int64_t pipeline_mapped_overlap_serves=0;
+    int64_t pipeline_phased_transfer_serves=0,pipeline_gate_up_dma_bytes=0,pipeline_down_dma_bytes=0;
+    int64_t pipeline_gate_up_primary_down_missing_experts=0,pipeline_gate_up_primary_down_missing_positions=0;
+    int64_t pipeline_early_gate_up_positions=0,pipeline_early_gate_up_enabled=0;
+    int64_t pipeline_prefetch_experts=0,pipeline_prefetch_bytes=0,pipeline_prefetch_hit_bytes=0,pipeline_prefetch_busy_skips=0;
+    int64_t pipeline_gpu_ns=0;
     int64_t h2d_submissions = 0;
     int64_t h2d_descriptors = 0;
     int64_t mapped_gather_bytes = 0;
@@ -281,4 +330,16 @@ struct MoeCacheStats {
     int64_t range_read_nanoseconds = 0;
     int64_t range_overlap_batches = 0;
     int64_t range_overlap_wait_nanoseconds = 0;
+    int64_t gpu_demote_bytes = 0;
+};
+
+struct MoePreloadH2DTiming {
+    cudaEvent_t begin=nullptr,end=nullptr;
+    std::int64_t bytes=0;
+    explicit MoePreloadH2DTiming(std::int64_t size):bytes(size) {
+        MFQ_CUDA_CHECK(cudaEventCreate(&begin));
+        const auto result=cudaEventCreate(&end);
+        if (result!=cudaSuccess) { cudaEventDestroy(begin); begin=nullptr; MFQ_CUDA_CHECK(result); }
+    }
+    ~MoePreloadH2DTiming() { if (begin) cudaEventDestroy(begin); if (end) cudaEventDestroy(end); }
 };

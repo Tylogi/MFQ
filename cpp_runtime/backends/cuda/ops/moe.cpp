@@ -7,6 +7,7 @@
 #include "format.h"
 #include "mfq_format_compat.h"
 #include "mfe_expert_store.h"
+#include "runtime/moe_pipeline.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -464,9 +465,46 @@ MixedNvqF16FormatGroup mixed_nvq_f16_format_group(int format) {
     }
 }
 
-static void initialize_mixed_nvq_dispatch(
+static void initialize_mixed_nint_dispatch(MixedMoeRuntime& runtime) {
+    namespace tb=mfq_tensor_backend;
+    runtime.nint_dispatch.reset();runtime.nint_input_plans.clear();
+    if(runtime.n_experts<=0 || runtime.n_experts>4096 || runtime.neuron_len<=0 ||
+        runtime.out_per_expert<=0 || runtime.out_per_expert>INT_MAX)return;
+    auto dispatch=std::make_shared<MixedNintDispatch>();
+    std::vector<int64_t> maps;std::vector<int32_t> params;
+    tb::Device device(tb::kCUDA,mfq_current_cuda_device());
+    for(std::size_t i=0;i<runtime.pools.size();++i) {
+        const auto& pool=runtime.pools[i];if(pool.family!=MixedMoeFamily::Nint)continue;
+        const auto& w=pool.nint;
+        if(!w.q_packed.is_cuda() || pool.local_experts<=0 || w.q8_zero ||
+            w.out!=int64_t(pool.local_experts)*runtime.out_per_expert || w.neuron_len!=runtime.neuron_len ||
+            w.ng<=0 || w.ng>INT_MAX || w.gs<=0 || w.gs>128 || w.ng*w.gs>INT_MAX ||
+            w.ng!=(runtime.neuron_len+w.gs-1)/w.gs ||
+            w.q_packed.numel()%pool.local_experts || w.q_packed.numel()/pool.local_experts>INT_MAX)return;
+        if(dispatch->pools.empty())device=w.q_packed.device();
+        const auto field_ok=[&](const tb::Tensor& field,auto dtype,int64_t count) {
+            return field.defined() && field.is_cuda() && field.device()==device && field.is_contiguous() &&
+                field.scalar_type()==dtype && field.numel()>=count;
+        };
+        if(!field_ok(w.q_packed,tb::kUInt8,1) || !field_ok(pool.expert_local,tb::kInt32,runtime.n_experts) ||
+            !field_ok(w.row_q_bits,tb::kUInt8,w.out) || !field_ok(w.row_q_bit_offsets,tb::kInt64,w.out) ||
+            !field_ok(w.sub_scale,tb::kUInt8,w.out*w.ng) || !field_ok(w.sub_min,tb::kUInt8,w.out*w.ng) ||
+            !field_ok(w.neuron_scale,tb::kFloat32,w.out) || !field_ok(w.neuron_min,tb::kFloat32,w.out))return;
+        dispatch->pools.push_back(int(i));maps.push_back(reinterpret_cast<int64_t>(pool.expert_local.data_ptr<int32_t>()));
+        params.insert(params.end(),{int32_t(w.ng),int32_t(w.gs),int32_t(w.q_packed.numel()/pool.local_experts)});
+    }
+    if(dispatch->pools.empty())return;
+    dispatch->map_ptrs=tb::tensor(maps).to(device);
+    dispatch->pool_params=tb::tensor(params).reshape({int64_t(dispatch->pools.size()),3}).to(device);
+    dispatch->expert_pool=tb::full({runtime.n_experts},-1,dispatch->pool_params.options());
+    dispatch->expert_local=tb::full({runtime.n_experts},-1,dispatch->pool_params.options());
+    runtime.nint_dispatch=std::move(dispatch);
+}
+
+void initialize_mixed_nvq_dispatch(
         MixedMoeRuntime & runtime,
         const CudaExecutionConfig& config) {
+    initialize_mixed_nint_dispatch(runtime);
     runtime.nvq_dispatch.reset();
     if (!config.moe_nvq_heterogeneous) return;
 
@@ -477,6 +515,7 @@ static void initialize_mixed_nvq_dispatch(
     if (nvq_pools == 0) return;
 
     std::vector<int64_t> weight_ptrs;
+    std::vector<int64_t> map_ptrs;
     std::vector<int64_t> weight_sizes;
     std::vector<int32_t> pool_params;
     std::vector<int32_t> expert_pool(
@@ -497,6 +536,7 @@ static void initialize_mixed_nvq_dispatch(
     for (const auto & pool : runtime.pools) {
         if (pool.family != MixedMoeFamily::Nvq) continue;
         const auto & weight = pool.nvq;
+        map_ptrs.push_back(static_cast<int64_t>(reinterpret_cast<uintptr_t>(pool.expert_local.data_ptr<int32_t>())));
         if (weight.gs != 24 || weight.ng <= 0 ||
                 weight.ng > std::numeric_limits<int32_t>::max() ||
                 weight.sub_bits < 1 || weight.sub_bits > 8 ||
@@ -572,6 +612,7 @@ static void initialize_mixed_nvq_dispatch(
 
     auto dispatch = std::make_shared<MixedNvqDispatch>();
     dispatch->pool_count = dispatch_pool;
+    dispatch->map_ptrs=mfq_tensor_backend::tensor(map_ptrs).to(target).contiguous();
     dispatch->f16_format_group = f16_format_group;
     dispatch->masked_experts = owned_experts < runtime.n_experts;
     dispatch->weight_ptrs = mfq_tensor_backend::from_blob(
@@ -605,6 +646,13 @@ static int64_t tensor_storage_bytes(const mfq_tensor_backend::Tensor & value) {
 
 int64_t mixed_moe_storage_bytes(const MixedMoeRuntime & runtime) {
     int64_t bytes = 0;
+    if(runtime.nint_dispatch) {
+        const auto& d=*runtime.nint_dispatch;
+        for(const auto& t:{d.map_ptrs,d.pool_params,d.expert_pool,d.expert_local})bytes+=tensor_storage_bytes(t);
+    }
+    for(const auto& item:runtime.nint_input_plans) {
+        bytes+=tensor_storage_bytes(item.second.weight_ptrs)+tensor_storage_bytes(item.second.quantize_descriptors);
+    }
     if (runtime.nvq_dispatch) {
         bytes += tensor_storage_bytes(runtime.nvq_dispatch->weight_ptrs);
         bytes += tensor_storage_bytes(runtime.nvq_dispatch->weight_sizes);
@@ -1398,6 +1446,30 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
         nvq_dispatch->pool_count > 1 &&
         tokens <= 8 && !force_pool_path &&
         config.moe_nvq_heterogeneous_decode;
+    const bool use_active_nvq=use_nvq_decode && config.moe_nvq_active_decode &&
+        route.ids.numel()>0 && route.ids.numel()<=1024;
+    mfq_tensor_backend::Tensor active_nvq_plan;
+    if(use_active_nvq) {
+        if (!route.ids.is_cuda() || !route.ids.is_contiguous() ||
+            route.ids.scalar_type() != mfq_tensor_backend::kInt32 ||
+            route.ids.get_device() != x.get_device()) {
+            throw std::runtime_error("active NVQ routes require contiguous int32 IDs on the input CUDA device");
+        }
+        const int pairs=int(route.ids.numel());
+        auto found=nvq_active_plans.find(pairs);
+        if(found==nvq_active_plans.end())found=nvq_active_plans.emplace(pairs,
+            mfq_tensor_backend::empty({1+int64_t(pairs)*3},route.ids.options())).first;
+        active_nvq_plan=found->second;
+        mfq::cuda::moe_plan_nvq_routes(reinterpret_cast<const uint64_t*>(nvq_dispatch->map_ptrs.data_ptr<int64_t>()),
+            nvq_dispatch->pool_count,n_experts,route.ids.data_ptr<int32_t>(),pairs,
+            active_nvq_plan.data_ptr<int32_t>(),mfq_current_cuda_stream());
+        MFQ_CUDA_CHECK(cudaGetLastError());
+    } else if(use_nvq_prefill || use_nvq_decode) {
+        mfq::cuda::moe_update_nvq_maps(reinterpret_cast<const uint64_t*>(nvq_dispatch->map_ptrs.data_ptr<int64_t>()),
+            nvq_dispatch->pool_count,n_experts,nvq_dispatch->expert_pool.data_ptr<int32_t>(),
+            nvq_dispatch->expert_local.data_ptr<int32_t>(),mfq_current_cuda_stream());
+        MFQ_CUDA_CHECK(cudaGetLastError());
+    }
     int nint_pool_phase = 0;
     if (input_prequantized && use_kl_mmq) {
         throw std::runtime_error(
@@ -1443,7 +1515,11 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
         auto qx = workspace.qx;
         auto xscale = workspace.xscale;
         bool input_quantized = input_prequantized;
-        nvq_moe_grouped_matmul_hetero_ws_cuda(
+        if(use_active_nvq)nvq_moe_grouped_matmul_active_ws_cuda(
+            nvq_dispatch->weight_ptrs,nvq_dispatch->weight_sizes,nvq_dispatch->pool_params,
+            nvq_dispatch->expert_pool,nvq_dispatch->expert_local,x,route.ids,n_experts,
+            out_per_expert,neuron_len,input_quantized,output,qx,xscale,active_nvq_plan);
+        else nvq_moe_grouped_matmul_hetero_ws_cuda(
             nvq_dispatch->weight_ptrs,
             nvq_dispatch->weight_sizes,
             nvq_dispatch->pool_params,
@@ -1454,7 +1530,51 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
         quantized.insert(activation_key);
     }
 
+    const bool use_nint_decode=config.moe_nint_heterogeneous_decode && nint_dispatch &&
+        !use_f16_mma && !use_kl_mmq && !force_pool_path && tokens<=8 &&
+        int64_t(tokens)*routes<=65535 && epilogue_mode==0;
+    if(use_nint_decode) {
+        auto found=nint_input_plans.find(input_rows);
+        if(found==nint_input_plans.end()) {
+            std::vector<int64_t> pointers,quantize;
+            std::unordered_set<MixedMoeActivationKey,MixedMoeActivationKeyHash> geometries;
+            MixedNintInputPlan plan;
+            for(int index:nint_dispatch->pools) {
+                const auto& w=pools[index].nint;
+                auto& workspace=activation_workspace(x,input_rows,int(w.ng),int(w.gs),identity);
+                pointers.insert(pointers.end(),{reinterpret_cast<int64_t>(w.q_packed.data_ptr()),
+                    reinterpret_cast<int64_t>(w.row_q_bits.data_ptr()),reinterpret_cast<int64_t>(w.row_q_bit_offsets.data_ptr()),
+                    reinterpret_cast<int64_t>(w.sub_scale.data_ptr()),reinterpret_cast<int64_t>(w.sub_min.data_ptr()),
+                    reinterpret_cast<int64_t>(w.neuron_scale.data_ptr()),reinterpret_cast<int64_t>(w.neuron_min.data_ptr()),
+                    reinterpret_cast<int64_t>(workspace.qx.data_ptr()),reinterpret_cast<int64_t>(workspace.xscale.data_ptr())});
+                const MixedMoeActivationKey key{input_rows,int(w.ng),int(w.gs),x.get_device(),identity};
+                if(geometries.insert(key).second) {
+                    quantize.insert(quantize.end(),{reinterpret_cast<int64_t>(workspace.qx.data_ptr()),
+                        reinterpret_cast<int64_t>(workspace.xscale.data_ptr()),w.ng,w.gs});
+                    plan.total_groups+=int(w.ng);
+                }
+            }
+            plan.weight_ptrs=mfq_tensor_backend::tensor(pointers).reshape({int64_t(nint_dispatch->pools.size()),9}).to(x.device());
+            plan.quantize_descriptors=mfq_tensor_backend::tensor(quantize).reshape({int64_t(geometries.size()),4}).to(x.device());
+            found=nint_input_plans.emplace(input_rows,std::move(plan)).first;
+        }
+        const auto& plan=found->second;
+        if(!input_prequantized)moe_quantize_shared_input_cuda(x.reshape({input_rows,neuron_len}),
+            plan.quantize_descriptors,plan.total_groups);
+        for(int index:nint_dispatch->pools) {
+            const auto& w=pools[index].nint;
+            quantized.insert({input_rows,int(w.ng),int(w.gs),x.get_device(),identity});
+        }
+        mfq::cuda::moe_update_nvq_maps(reinterpret_cast<const uint64_t*>(nint_dispatch->map_ptrs.data_ptr<int64_t>()),
+            int(nint_dispatch->pools.size()),n_experts,nint_dispatch->expert_pool.data_ptr<int32_t>(),
+            nint_dispatch->expert_local.data_ptr<int32_t>(),mfq_current_cuda_stream());
+        MFQ_CUDA_CHECK(cudaGetLastError());
+        nint_moe_grouped_matmul_hetero_cuda(plan.weight_ptrs,nint_dispatch->pool_params,
+            nint_dispatch->expert_pool,nint_dispatch->expert_local,route.ids,output,neuron_len,x.dim()==3);
+    }
+
     for (const auto & pool : pools) {
+        if(pool.family==MixedMoeFamily::Nint && use_nint_decode)continue;
         if (pool.family == MixedMoeFamily::Nvq &&
                 (use_nvq_prefill || use_nvq_decode)) {
             continue;

@@ -1,10 +1,12 @@
 #pragma once
 #include "mfq_cuda_linear_attention_ops.h"
+#include "mfq_cuda_norm_ops.h"
 #include "models/qwen4_exp/causal_lm.h"
 #include "models/qwen4_exp/ngram.h"
 #include "core/attention.h"
 #include "core/rope.h"
 #include "mfq/kernels/cuda/qwen4_exp.h"
+#include "runtime/nint_row_pipeline.h"
 #include <array>
 #include <cstring>
 #include <memory>
@@ -19,25 +21,33 @@ using attention_ops::Embedding;
 using attention_ops::rms_norm;
 using attention_ops::SequenceCache;
 using attention_ops::select_pooled_blocks;
+using LinearGroup = std::function<std::vector<Tensor>(CudaExecutionContext&, const Tensor&)>;
 
 
 struct GdnWeights {
     Linear qkv, gate, alpha, beta, output;
     Tensor conv, dt_bias, a_log, norm;
+    LinearGroup input_projection;
 };
 
 class Gdn {
   public:
     Gdn(GdnWeights weights, int64_t key_heads, int64_t value_heads, int64_t width, int64_t kernel,
-        double eps, bool silu_gate)
+        double eps, bool silu_gate, bool fused_decode = true, bool transposed_state = true,
+        bool fused_output = true, bool grouped_projection = true, bool fused_preparation = true,
+        bool fused_core = true)
         : w_(std::move(weights)), nk_(key_heads), nv_(value_heads), d_(width), kernel_(kernel),
-          eps_(eps), silu_gate_(silu_gate) {
+          eps_(eps), silu_gate_(silu_gate), fused_decode_(fused_decode),
+          transposed_state_(fused_decode && transposed_state && (width==32 || width==64 || width==128)),
+          fused_output_(fused_output), grouped_projection_(grouped_projection), fused_preparation_(fused_preparation),
+          fused_core_(fused_core) {
         MFQ_RUNTIME_CHECK(nk_ > 0 && nv_ > 0 && nv_ % nk_ == 0 && d_ > 0 && kernel_ > 1 && eps_ > 0,
                           "invalid Qwen4 GDN head/convolution geometry");
     }
     void reset() {
         conv_ = Tensor();
         state_ = Tensor();
+        core_workspace_ = Tensor();
         commit();
     }
     void commit() {
@@ -46,12 +56,19 @@ class Gdn {
     }
     void rollback() {
         MFQ_RUNTIME_CHECK(saved_conv_.defined(), "Qwen4 GDN has no speculative checkpoint");
-        conv_ = saved_conv_;
-        state_ = saved_state_;
+        if(conv_.defined())conv_.copy_(saved_conv_);else conv_=saved_conv_;
+        if(state_.defined())state_.copy_(saved_state_);else state_=saved_state_;
         commit();
     }
     const Tensor &conv_state() const { return conv_; }
-    const Tensor &recurrent_state() const { return state_; }
+    Tensor recurrent_state() const {
+        return state_.defined() && transposed_state_ ? state_.transpose(-1,-2) : state_;
+    }
+    std::vector<Tensor*> graph_state() { return {&conv_,&state_}; }
+    void set_grouped_projection(bool enabled) {
+        MFQ_RUNTIME_CHECK(!conv_.defined() && !state_.defined(), "reset GDN before switching projection execution");
+        grouped_projection_ = enabled;
+    }
     Tensor forward(CudaExecutionContext &execution, const Tensor &x, bool cache,
                    int64_t confirmed = 0) {
         MFQ_RUNTIME_CHECK(x.is_cuda() && x.dim() == 3 && x.size(0) > 0,
@@ -62,8 +79,8 @@ class Gdn {
                 return forward_chunk(execution, x.narrow(1, start, count), cache);
             },
             [&] {
-                saved_conv_ = conv_;
-                saved_state_ = state_;
+                saved_conv_ = conv_.clone();
+                saved_state_ = state_.clone();
             },
             [&] { rollback(); },
             [](Tensor prefix, Tensor suffix) { return tb::cat({prefix, suffix}, 1); });
@@ -77,16 +94,71 @@ class Gdn {
                           "reset Qwen4 GDN before changing batch/device");
         auto previous =
             cache && conv_.defined() ? conv_ : tb::zeros({b, kernel_ - 1, channels}, options);
+        std::vector<Tensor> projections;
+        std::array<Tensor,2> prepared_gates;
+        if(cache && conv_.defined() && state_.defined() && fused_core_ && fused_decode_ &&
+            fused_preparation_ && fused_output_ && transposed_state_ && t==1 &&
+            (d_==32 || d_==64 || d_==128) &&
+            (x.scalar_type()==tb::kFloat16 || x.scalar_type()==tb::kFloat32)) {
+            if(grouped_projection_ && w_.input_projection)projections=w_.input_projection(execution,x);
+            else projections={w_.qkv(execution,x),w_.gate(execution,x),w_.alpha(execution,x),w_.beta(execution,x)};
+            MFQ_RUNTIME_CHECK(projections.size()==4,"GDN input projection count mismatch");
+            if(projections[0].scalar_type()==tb::kFloat16 &&
+                projections[1].scalar_type()==projections[2].scalar_type() &&
+                projections[2].scalar_type()==projections[3].scalar_type() &&
+                (projections[1].scalar_type()==tb::kFloat16 || projections[1].scalar_type()==tb::kFloat32)) {
+                auto weight=w_.conv.to(tb::kFloat32).contiguous();
+                if(weight.dim()==2 && weight.size(0)==channels && weight.size(1)==kernel_)
+                    weight=weight.reshape({channels,1,kernel_});
+                if(!core_workspace_.defined())core_workspace_=tb::zeros({b,nv_,d_+1},options);
+                auto decoded=gdn_decode_core_cuda(projections[0].contiguous(),projections[1].contiguous(),
+                    projections[2].reshape({b,t,nv_}),projections[3].reshape({b,t,nv_}),previous,state_,
+                    weight,w_.dt_bias.to(tb::kFloat32).contiguous(),w_.a_log.to(tb::kFloat32).contiguous(),
+                    w_.norm.to(tb::kFloat32).contiguous(),nk_,nv_,d_,1e-6,eps_,silu_gate_,
+                    x.scalar_type()==tb::kFloat16,true,core_workspace_);
+                auto output=w_.output(execution,decoded[0]);
+                conv_.copy_(decoded[1]);state_.copy_(decoded[2]);return output;
+            }
+        }
         return mfq::models::gated_delta_attention(
             cache,
             [&] {
-                auto projected = w_.qkv(execution, x).to(tb::kFloat32);
+                Tensor projected;
+                if(!projections.empty())projected=projections[0];
+                else if(grouped_projection_ && w_.input_projection) {
+                    projections=w_.input_projection(execution,x);
+                    MFQ_RUNTIME_CHECK(projections.size()==4,"GDN input projection count mismatch");
+                    projected=projections[0];
+                } else projected=w_.qkv(execution,x);
                 MFQ_RUNTIME_CHECK(projected.sizes().vec() == std::vector<int64_t>({b, t, channels}),
                                   "Qwen4 GDN projection width mismatch");
                 return projected;
             },
             [&](Tensor projected) {
-                auto joined = tb::cat({previous, projected}, 1).contiguous();
+                if (fused_decode_ && t == 1 && d_ <= 256 && projected.scalar_type() == tb::kFloat16) {
+                    auto weight = w_.conv.to(tb::kFloat32).contiguous();
+                    if (weight.dim() == 2 && weight.size(0) == channels && weight.size(1) == kernel_)
+                        weight = weight.reshape({channels, 1, kernel_});
+                    auto next_conv = previous.clone();
+                    auto qk=projected.narrow(-1,0,2*kw).contiguous(),v=projected.narrow(-1,2*kw,vw).contiguous();
+                    std::vector<Tensor> qkv;
+                    if(fused_preparation_) {
+                        auto alpha=projections.empty()?w_.alpha(execution,x):projections[2];
+                        auto beta=projections.empty()?w_.beta(execution,x):projections[3];
+                        if(alpha.scalar_type()!=beta.scalar_type() ||
+                            (alpha.scalar_type()!=tb::kFloat16 && alpha.scalar_type()!=tb::kFloat32)) {
+                            alpha=alpha.to(tb::kFloat32);beta=beta.to(tb::kFloat32);
+                        }
+                        qkv=linear_conv_qkv_gate_decode_cuda(next_conv,qk,v,weight,
+                            alpha.reshape({b,t,nv_}),beta.reshape({b,t,nv_}),
+                            w_.dt_bias.to(tb::kFloat32).contiguous(),w_.a_log.to(tb::kFloat32).contiguous(),
+                            nk_,nv_,d_,d_,1e-6);
+                        prepared_gates={qkv[3],qkv[4]};
+                    } else qkv=linear_conv_qkv_decode_cuda(next_conv,qk,v,weight,
+                        tb::empty({0}, options),nk_,nv_,d_,d_,1e-6);
+                    return std::array<Tensor, 4>{qkv[0], qkv[1], qkv[2], next_conv};
+                }
+                auto joined = tb::cat({previous, projected.to(tb::kFloat32)}, 1).contiguous();
                 auto convolved = ssm_conv_silu_cuda(joined, w_.conv.to(tb::kFloat32).contiguous(),
                                                     tb::empty({0}, options), t);
                 auto next_conv = joined.narrow(1, t, kernel_ - 1).contiguous();
@@ -104,14 +176,25 @@ class Gdn {
                 return std::array<Tensor, 4>{q, k, v, next_conv};
             },
             [&] {
-                auto gate_input = w_.alpha(execution, x).to(tb::kFloat32).reshape({b, t, nv_}) +
+                if(prepared_gates[0].defined())return prepared_gates;
+                auto alpha=projections.empty()?w_.alpha(execution,x):projections[2];
+                auto raw_beta=projections.empty()?w_.beta(execution,x):projections[3];
+                if (fused_decode_ && t == 1) {
+                    auto gates = linear_gate_beta_cuda(
+                        alpha.to(tb::kFloat32).reshape({b, t, nv_}),
+                        raw_beta.to(tb::kFloat32).reshape({b, t, nv_}),
+                        w_.dt_bias.to(tb::kFloat32).contiguous(),
+                        w_.a_log.to(tb::kFloat32).contiguous(), true);
+                    return std::array<Tensor, 2>{gates[0], gates[1]};
+                }
+                auto gate_input = alpha.to(tb::kFloat32).reshape({b, t, nv_}) +
                                   w_.dt_bias.to(tb::kFloat32).reshape({1, 1, nv_});
                 auto softplus =
                     tb::clamp_min(gate_input, 0) + tb::log1p(tb::exp(-gate_input.abs()));
                 auto decay = (-w_.a_log.to(tb::kFloat32).exp().reshape({1, 1, nv_}) * softplus)
                                  .transpose(1, 2)
                                  .contiguous();
-                auto beta = tb::sigmoid(w_.beta(execution, x).to(tb::kFloat32).reshape({b, t, nv_}))
+                auto beta = tb::sigmoid(raw_beta.to(tb::kFloat32).reshape({b, t, nv_}))
                                 .transpose(1, 2)
                                 .contiguous();
                 return std::array<Tensor, 2>{decay, beta};
@@ -122,9 +205,8 @@ class Gdn {
                 auto initial = cache && state_.defined() ? state_ : Tensor{};
                 Tensor attended, next_state;
                 if (d_ == 32 || d_ == 64 || d_ == 128) {
-                    auto result =
-                        gdn_cuda(q, k, v, decay, beta,
-                                 initial.defined() ? MfqOptional<Tensor>(initial) : mfq_nullopt);
+                    auto result = (transposed_state_ ? gdn_transposed_cuda : gdn_cuda)(
+                        q, k, v, decay, beta,initial.defined() ? MfqOptional<Tensor>(initial) : mfq_nullopt);
                     attended = result[0];
                     next_state = result[1];
                 } else {
@@ -149,8 +231,14 @@ class Gdn {
                 return std::array<Tensor, 2>{attended, next_state};
             },
             [&](Tensor attended) {
-                auto z = w_.gate(execution, x)
-                             .reshape({b, t, nv_, d_})
+                auto projected_gate=projections.empty()?w_.gate(execution,x):projections[1].contiguous();
+                if(fused_decode_ && fused_output_ && attended.is_contiguous() &&
+                    attended.scalar_type()==tb::kFloat32 && projected_gate.is_contiguous() &&
+                    (projected_gate.scalar_type()==tb::kFloat16 || projected_gate.scalar_type()==tb::kFloat32) &&
+                    (x.scalar_type()==tb::kFloat16 || x.scalar_type()==tb::kFloat32))
+                    return gdn_rms_norm_gate_cuda(attended,projected_gate,
+                        w_.norm.to(tb::kFloat32).contiguous(),eps_,silu_gate_,x.scalar_type()==tb::kFloat16);
+                auto z = projected_gate.reshape({b, t, nv_, d_})
                              .permute({0, 2, 1, 3})
                              .to(tb::kFloat32);
                 auto gate = tb::sigmoid(z);
@@ -159,14 +247,15 @@ class Gdn {
                 return rms_norm(attended, w_.norm, eps_) * gate;
             },
             [&](Tensor normalized) {
+                if(normalized.dim()==3)return w_.output(execution,normalized);
                 auto result = w_.output(
                     execution,
                     normalized.permute({0, 2, 1, 3}).reshape({b, t, vw}).to(x.scalar_type()));
                 return result;
             },
             [&](const auto &convolution, const Tensor &next) {
-                conv_ = convolution[3];
-                state_ = next;
+                if(conv_.defined())conv_.copy_(convolution[3]);else conv_=convolution[3];
+                if(state_.defined())state_.copy_(next);else state_=next;
             });
     }
 
@@ -174,8 +263,8 @@ class Gdn {
     GdnWeights w_;
     int64_t nk_, nv_, d_, kernel_;
     double eps_;
-    bool silu_gate_;
-    Tensor conv_, state_, saved_conv_, saved_state_;
+    bool silu_gate_, fused_decode_,transposed_state_,fused_output_,grouped_projection_,fused_preparation_,fused_core_;
+    Tensor conv_, state_, saved_conv_, saved_state_,core_workspace_;
 };
 
 // The upstream PLE hash is a CPU uint64 algorithm, including signed remainder
@@ -185,10 +274,10 @@ class NgramEmbedding {
     using Context = mfq::models::qwen4_exp::NgramContext;
     NgramEmbedding(std::vector<Embedding> shards, int64_t rows, int64_t dimension, int64_t ngram,
                    int64_t heads_per_ngram, int64_t eos, std::vector<int64_t> multipliers,
-                   std::vector<int64_t> offsets, std::vector<int64_t> vocab)
+                   std::vector<int64_t> offsets, std::vector<int64_t> vocab,std::shared_ptr<NintRowPipeline> pipeline = {})
         : shards_(std::move(shards)), rows_(rows), dimension_(dimension), ngram_(ngram),
           heads_(heads_per_ngram), eos_(eos), multipliers_(std::move(multipliers)),
-          offsets_(std::move(offsets)), vocab_(std::move(vocab)) {
+          offsets_(std::move(offsets)), vocab_(std::move(vocab)),pipeline_(std::move(pipeline)) {
         MFQ_RUNTIME_CHECK(!shards_.empty() && rows_ > 0 && dimension_ > 0 && ngram_ > 1 &&
                               heads_ > 0 && multipliers_.size() == size_t(ngram_) &&
                               offsets_.size() == size_t((ngram_ - 1) * heads_) &&
@@ -202,15 +291,42 @@ class NgramEmbedding {
     void reset() { context_ = {}; }
     const Context &context() const { return context_; }
     void restore(Context context) { context_ = std::move(context); }
-    Tensor forward(const Tensor &ids, bool cache, Tensor *hashed_ids = nullptr) {
+    void prefetch(const Tensor& host_ids) {
+        if(!pipeline_)return;
+        MFQ_RUNTIME_CHECK(host_ids.is_cpu() && host_ids.dim()==2,"PLE prefetch requires host token IDs");
+        auto host=host_ids.to(tb::kInt64).contiguous();const auto b=host.size(0),t=host.size(1);
+        auto hashes=mfq::models::qwen4_exp::ngram_hashes(host.data_ptr<int64_t>(),b,t,ngram_,heads_,eos_,
+            multipliers_,offsets_,vocab_,context_,true);
+        pipeline_->issue(hashes.ids,{b,t,(ngram_-1)*heads_});
+    }
+    std::shared_ptr<NintRowStage> graph_stage(int64_t b,int64_t t,const tb::Device& device) {
+        MFQ_RUNTIME_CHECK(pipeline_,"PLE graph requires canonical range rows");
+        return pipeline_->make_stage({b,t,(ngram_-1)*heads_},device);
+    }
+    void upload_graph(const Tensor& host_ids,NintRowStage& stage) {
+        MFQ_RUNTIME_CHECK(pipeline_ && host_ids.is_cpu() && host_ids.dim()==2,"PLE graph requires host token IDs");
+        auto host=host_ids.to(tb::kInt64).contiguous();const auto b=host.size(0),t=host.size(1);
+        auto hashes=mfq::models::qwen4_exp::ngram_hashes(host.data_ptr<int64_t>(),b,t,ngram_,heads_,eos_,
+            multipliers_,offsets_,vocab_,context_,true);
+        pipeline_->upload(stage,hashes.ids,{b,t,(ngram_-1)*heads_});
+        context_=std::move(hashes.next);
+    }
+    Tensor forward(const Tensor &ids, bool cache, Tensor *hashed_ids = nullptr,const Tensor& host_ids = {}) {
         MFQ_RUNTIME_CHECK(ids.dim() == 2 && ids.size(0) > 0 && ids.size(1) > 0,
                           "Qwen4 ngram IDs must be [B,T]");
         const auto b = ids.size(0), t = ids.size(1), nh = (ngram_ - 1) * heads_;
-        auto host = ids.to(tb::kInt64).contiguous().cpu();
+        auto host = host_ids.defined() ? host_ids.to(tb::kInt64).contiguous() : ids.to(tb::kInt64).contiguous().cpu();
+        MFQ_RUNTIME_CHECK(host.is_cpu() && host.sizes()==ids.sizes(),"PLE host token mirror differs");
         const auto *source = host.data_ptr<int64_t>();
         auto hashes = mfq::models::qwen4_exp::ngram_hashes(
             source, b, t, ngram_, heads_, eos_, multipliers_, offsets_, vocab_, context_, cache);
         auto &global = hashes.ids;
+        if(pipeline_) {
+            auto result=pipeline_->collect(global,{b,t,nh},ids.device());
+            if(hashed_ids)*hashed_ids=tb::tensor(global).reshape({b,t,nh}).to(ids.device());
+            if(cache)context_=std::move(hashes.next);
+            return result.reshape({b,t,nh*dimension_});
+        }
         auto global_tensor =
             tb::from_blob(global.data(), {b, t, nh}, tb::TensorOptions().dtype(tb::kInt64))
                 .clone()
@@ -241,6 +357,7 @@ class NgramEmbedding {
     int64_t rows_, dimension_, ngram_, heads_, eos_;
     std::vector<int64_t> multipliers_, offsets_, vocab_;
     Context context_;
+    std::shared_ptr<NintRowPipeline> pipeline_;
 };
 
 struct PleWeights {
@@ -265,13 +382,19 @@ class Ple {
     }
     void rollback() {
         MFQ_RUNTIME_CHECK(saved_, "Qwen4 PLE has no speculative checkpoint");
-        conv_ = saved_conv_;
+        if(conv_.defined())conv_.copy_(saved_conv_);else conv_=saved_conv_;
         embedding_.restore(saved_context_);
         commit();
     }
     const Tensor &conv_state() const { return conv_; }
+    std::vector<Tensor*> graph_state() { return {&conv_}; }
+    std::shared_ptr<NintRowStage> graph_stage(int64_t tokens,const tb::Device& device) {
+        return embedding_.graph_stage(1,tokens,device);
+    }
+    void upload_graph(const Tensor& host_ids,NintRowStage& stage) {embedding_.upload_graph(host_ids,stage);}
+    void prefetch_tokens(const Tensor& ids) { embedding_.prefetch(ids); }
     Tensor forward(CudaExecutionContext &execution, const Tensor &x, const Tensor &ids, bool cache,
-                   int64_t confirmed = 0) {
+                   int64_t confirmed = 0,const Tensor& host_ids = {}) {
         MFQ_RUNTIME_CHECK(x.dim() == 3 && ids.dim() == 2 && x.size(0) == ids.size(0) &&
                               x.size(1) == ids.size(1) && x.size(2) == hidden_ * streams_ &&
                               confirmed >= 0 && confirmed <= x.size(1) && (!confirmed || cache),
@@ -280,22 +403,23 @@ class Ple {
             x.size(1), cache, confirmed, saved_,
             [&](int64_t start, int64_t count) {
                 return forward_chunk(execution, x.narrow(1, start, count),
-                                     ids.narrow(1, start, count), cache);
+                                     ids.narrow(1, start, count), cache,
+                                     host_ids.defined() ? host_ids.narrow(1,start,count) : Tensor{});
             },
             [&] {
                 saved_ = true;
-                saved_conv_ = conv_;
+                saved_conv_ = conv_.clone();
                 saved_context_ = embedding_.context();
             },
             [&] { rollback(); },
             [](Tensor first, Tensor second) { return tb::cat({first, second}, 1); });
     }
     Tensor forward_chunk(CudaExecutionContext &execution, const Tensor &x, const Tensor &ids,
-                         bool cache) {
+                         bool cache,const Tensor& host_ids = {},const Tensor& graph_embeddings = {}) {
         auto context = embedding_.context();
         const auto b = x.size(0), t = x.size(1);
         return mfq::models::qwen4_exp::position_embedding(
-            cache, [&] { return embedding_.forward(ids, cache); },
+            cache, [&] { return graph_embeddings.defined() ? graph_embeddings : embedding_.forward(ids, cache,nullptr,host_ids); },
             [&](const Tensor &embeddings) {
                 auto key = mfq_qwen4_exp::grouped_rms_norm(w_.key(execution, embeddings),
                                                            w_.key_norm, hidden_, eps_)
@@ -327,7 +451,7 @@ class Ple {
                     dilation_);
             },
             [&](Tensor gated, Tensor convolved) { return (gated + convolved).to(x.scalar_type()); },
-            [&](Tensor next) { conv_ = std::move(next); },
+            [&](Tensor next) { if(conv_.defined())conv_.copy_(next);else conv_=std::move(next); },
             [&] { embedding_.restore(std::move(context)); });
     }
 
@@ -344,6 +468,7 @@ class Ple {
 struct QsaWeights {
     Linear query, key, value, output, index_query_key;
     Tensor query_norm, key_norm, index_query_norm, index_key_norm;
+    LinearGroup input_projection;
 };
 struct QsaConfig {
     int64_t heads, kv_heads, width, index_heads, index_width, pool, budget, maximum;
@@ -352,8 +477,9 @@ struct QsaConfig {
 
 class Qsa {
   public:
-    Qsa(QsaWeights weights, QsaConfig config, std::shared_ptr<RotaryEmbedding> rotary)
-        : w_(std::move(weights)), c_(config), rotary_(std::move(rotary)),
+    Qsa(QsaWeights weights, QsaConfig config, std::shared_ptr<RotaryEmbedding> rotary,
+        bool fused_projection = true, bool grouped_projection = true)
+        : w_(std::move(weights)), c_(config), rotary_(std::move(rotary)), fused_projection_(fused_projection), grouped_projection_(grouped_projection),
           keys_(config.maximum, config.kv_heads * config.width),
           values_(config.maximum, config.kv_heads * config.width),
           index_(config.maximum, config.index_width) {
@@ -363,11 +489,114 @@ class Qsa {
                           "invalid Qwen4 QSA configuration");
     }
     int64_t position() const { return keys_.position(); }
+    void set_grouped_projection(bool enabled) {
+        MFQ_RUNTIME_CHECK(!graph_keys_.defined() && position()==0,"reset QSA before switching projection execution");
+        grouped_projection_=enabled;
+    }
+    void set_rotary_fused(bool enabled) {
+        MFQ_RUNTIME_CHECK(!graph_keys_.defined() && position() == 0,
+                          "reset QSA before switching rotary execution");
+        rotary_->set_fused(enabled);
+    }
+    void leave_graph() {
+        if(!graph_keys_.defined())return;
+        const auto n=position();
+        keys_.replace_storage(graph_keys_.narrow(2,0,n).permute({0,2,1,3}).contiguous().reshape({1,n,c_.kv_heads*c_.width}));
+        values_.replace_storage(graph_values_.narrow(2,0,n).permute({0,2,1,3}).contiguous().reshape({1,n,c_.kv_heads*c_.width}));
+        graph_keys_={};graph_values_={};graph_pooled_={};
+    }
     void reset() {
         keys_.reset();
         values_.reset();
         index_.reset();
+        graph_keys_={};graph_values_={};graph_pooled_={};
     }
+    void prepare_graph(const Tensor& full_positions) {
+        if(graph_keys_.defined())return;
+        MFQ_RUNTIME_CHECK(position()>0 && keys_.storage().size(0)==1,
+            "QSA graph requires a prefilled single sequence");
+        const auto n=position();
+        graph_keys_=tb::zeros({1,c_.kv_heads,c_.maximum,c_.width},keys_.storage().options());
+        graph_values_=tb::zeros_like(graph_keys_);
+        graph_keys_.narrow(2,0,n).copy_(keys_.storage().narrow(1,0,n).reshape({1,n,c_.kv_heads,c_.width}).permute({0,2,1,3}));
+        graph_values_.narrow(2,0,n).copy_(values_.storage().narrow(1,0,n).reshape({1,n,c_.kv_heads,c_.width}).permute({0,2,1,3}));
+        index_.prepare_fixed();
+        graph_pooled_=tb::zeros({1,(c_.maximum+c_.pool-1)/c_.pool,c_.index_width},index_.storage().options());
+        const auto pools=n/c_.pool;
+        if(pools) {
+            auto pooled=index_.storage().narrow(1,0,pools*c_.pool).reshape({1,pools,c_.pool,c_.index_width}).to(tb::kFloat32).mean(2).to(index_.storage().scalar_type());
+            pooled=rms_norm(pooled,w_.index_key_norm.to(tb::kFloat32)+1,c_.eps);
+            auto starts=tb::arange(pools,full_positions.options().dtype(tb::kInt64))*c_.pool;
+            graph_pooled_.narrow(1,0,pools).copy_(rotary_->forward(pooled.unsqueeze(1),full_positions.index_select(-1,starts)).squeeze(1));
+        }
+    }
+    Tensor forward_graph(CudaExecutionContext& execution,const Tensor& hidden,
+                         const Tensor& positions,const Tensor& cache_positions) {
+        MFQ_RUNTIME_CHECK(graph_keys_.defined() && hidden.size(0)==1 && cache_positions.dim()==1,
+            "QSA graph cache is not prepared");
+        const auto t=hidden.size(1),pools=graph_pooled_.size(1);
+        const bool dense_capacity=c_.maximum<=c_.budget;
+        auto p=project(execution,hidden,positions,!dense_capacity,cache_positions,graph_keys_,graph_values_);
+        if (!p.cache_written) {
+            graph_keys_.index_copy_(2,cache_positions,p.key.permute({0,2,1,3}).to(tb::kFloat16));
+            graph_values_.index_copy_(2,cache_positions,p.value.permute({0,2,1,3}).to(tb::kFloat16));
+        }
+        index_.append_fixed(p.raw,cache_positions);
+        if(dense_capacity) {
+            const auto columns=c_.budget+c_.pool-1;
+            if(fused_projection_ && rotary_->fused() &&
+                (hidden.scalar_type()==tb::kFloat16 || hidden.scalar_type()==tb::kFloat32)) {
+                auto gated=mfq_qwen4_exp::causal_gqa_attention_gate(p.query,graph_keys_,graph_values_,
+                    cache_positions,p.gate,columns,hidden.scalar_type()==tb::kFloat16);
+                return w_.output(execution,gated.reshape({1,t,c_.heads*c_.width}));
+            }
+            auto absolute=cache_positions.reshape({1,t,1});
+            auto indices=tb::arange(columns,cache_positions.options()).reshape({1,1,columns}).expand({1,t,columns});
+            indices=tb::where(indices<=absolute,indices,tb::full_like(indices,-1)).to(tb::kInt32).contiguous();
+            auto attended=mfq_qwen4_exp::sparse_gqa_attention(p.query,graph_keys_,graph_values_,indices);
+            auto gated=attended.to(tb::kFloat32)*tb::sigmoid(p.gate.to(tb::kFloat32));
+            return w_.output(execution,gated.reshape({1,t,c_.heads*c_.width}).to(hidden.scalar_type()));
+        }
+        auto block=(cache_positions/c_.pool).to(tb::kInt64);
+        auto row=(block.unsqueeze(-1)*c_.pool+tb::arange(c_.pool,block.options())).clamp(0,c_.maximum-1);
+        auto pooled=index_.storage().index_select(1,row.reshape({-1})).reshape({1,t,c_.pool,c_.index_width}).to(tb::kFloat32).mean(2).to(index_.storage().scalar_type());
+        pooled=rms_norm(pooled,w_.index_key_norm.to(tb::kFloat32)+1,c_.eps);
+        auto delta=positions-cache_positions;
+        auto block_positions=block*c_.pool+delta;
+        pooled=rotary_->forward(pooled.unsqueeze(1),block_positions).squeeze(1);
+        graph_pooled_.index_copy_(1,block,pooled);
+        auto scores=mfq_qwen4_exp::block_scores(p.iq,graph_pooled_);
+        auto absolute=cache_positions.reshape({1,t,1});
+        auto ends=(tb::arange(pools,cache_positions.options())*c_.pool+c_.pool-1).reshape({1,1,pools});
+        auto visible=ends<=absolute;
+        auto ranked=tb::where(visible,scores.to(tb::kFloat32),tb::full_like(scores,-1e30).to(tb::kFloat32));
+        const auto count=std::min(c_.budget/c_.pool,pools),columns=c_.budget+c_.pool-1;
+        auto indices=std::get<1>(tb::topk(ranked,count,-1,true,false));
+        auto valid=visible.expand({1,t,pools}).gather(-1,indices).unsqueeze(-1).expand({1,t,count,c_.pool});
+        auto expanded=indices.unsqueeze(-1)*c_.pool+tb::arange(c_.pool,indices.options());
+        expanded=tb::where(valid,expanded,tb::full_like(expanded,-1));
+        auto selected=tb::full({1,t,columns},-1,cache_positions.options());
+        selected.narrow(-1,0,count*c_.pool).copy_(expanded.reshape({1,t,count*c_.pool}));
+        if(c_.pool>1) {
+            auto tail_count=(absolute+1).remainder(c_.pool);
+            auto offsets=tb::arange(c_.pool-1,cache_positions.options()).reshape({1,1,c_.pool-1});
+            auto tail=absolute+1-tail_count+offsets;
+            selected.narrow(-1,c_.budget,c_.pool-1).copy_(tb::where(offsets<tail_count,tail,tb::full_like(tail,-1)));
+        }
+        // Dense-budget queries select their complete causal prefix. The same
+        // native selected-attention kernel serves both paths inside one graph.
+        auto dense=tb::arange(columns,cache_positions.options()).reshape({1,1,columns}).expand({1,t,columns});
+        dense=tb::where(dense<=absolute,dense,tb::full_like(dense,-1));
+        selected=tb::where(absolute+1<=c_.budget,dense,selected).to(tb::kInt32).contiguous();
+        auto attended=mfq_qwen4_exp::sparse_gqa_attention(p.query,graph_keys_,graph_values_,selected);
+        Tensor gated;
+        if(fused_projection_ && rotary_->fused() &&
+            (hidden.scalar_type()==tb::kFloat16 || hidden.scalar_type()==tb::kFloat32))
+            gated=mfq_qwen4_exp::attention_gate(attended,p.gate,hidden.scalar_type()==tb::kFloat16);
+        else gated=(attended.to(tb::kFloat32)*tb::sigmoid(p.gate.to(tb::kFloat32))).to(hidden.scalar_type());
+        return w_.output(execution,gated.reshape({1,t,c_.heads*c_.width}));
+    }
+    void advance_graph(int64_t tokens) {keys_.advance_fixed(tokens);values_.advance_fixed(tokens);index_.advance_fixed(tokens);}
     void truncate(int64_t keep) {
         MFQ_RUNTIME_CHECK(keep >= 0 && keep <= keys_.position() && keep <= values_.position() &&
                               keep <= index_.position(),
@@ -387,9 +616,6 @@ class Qsa {
             t <= c_.maximum - offset && full_positions.size(-1) == offset + t &&
                 (!use_cache || (offset == values_.position() && offset == index_.position())),
             "Qwen4 QSA cache/position geometry mismatch");
-        struct Projection {
-            Tensor gate, query, key, value, iq, raw;
-        };
         return mfq::models::qwen4_exp::sparse_attention(
             offset + t, c_.budget, use_cache,
             [&] {
@@ -462,9 +688,64 @@ class Qsa {
     }
 
   private:
+    struct Projection {Tensor gate,query,key,value,iq,raw;bool cache_written=false;};
+    Tensor project_norm(const Tensor& value,const Tensor& weight) {
+        if(value.scalar_type()==tb::kFloat16 || value.scalar_type()==tb::kFloat32)
+            return grouped_rms_norm_cuda(value.contiguous(),weight.to(tb::kFloat32).contiguous(),value.size(-1),c_.eps,1.0);
+        return rms_norm(value,weight.to(tb::kFloat32)+1,c_.eps);
+    }
+    Projection project(CudaExecutionContext& execution,const Tensor& hidden,const Tensor& positions,
+                       bool index_query_needed=true,const Tensor& cache_positions={},
+                       const Tensor& key_cache={},const Tensor& value_cache={}) {
+        const auto b=hidden.size(0),t=hidden.size(1);
+        std::vector<Tensor> projections;
+        if(grouped_projection_ && w_.input_projection) {
+            projections=w_.input_projection(execution,hidden);
+            MFQ_RUNTIME_CHECK(projections.size()==4,"QSA input projection count mismatch");
+        }
+        auto pair=(projections.empty()?w_.query(execution,hidden):projections[0]).reshape({b,t,c_.heads,2*c_.width});
+        auto gate=pair.narrow(-1,c_.width,c_.width);
+        auto key_source=(projections.empty()?w_.key(execution,hidden):projections[1]).reshape({b,t,c_.kv_heads,c_.width});
+        auto value=(projections.empty()?w_.value(execution,hidden):projections[2]).reshape({b,t,c_.kv_heads,c_.width});
+        const auto supported=[](const Tensor& x) { return x.scalar_type()==tb::kFloat16 || x.scalar_type()==tb::kFloat32; };
+        const bool fused=fused_projection_ && rotary_->fused() && supported(pair) && supported(key_source) && supported(value);
+        const bool cache_written=fused && key_cache.defined();
+        auto iqk=projections.empty()?w_.index_query_key(execution,hidden):projections[3];
+        Tensor query,key,iq;
+        if(fused) {
+            std::vector<Tensor> inputs{pair.narrow(-1,0,c_.width),key_source};
+            std::vector<Tensor> weights{w_.query_norm,w_.key_norm};
+            if(index_query_needed) {
+                auto source=iqk.narrow(-1,0,c_.index_heads*c_.index_width).reshape({b,t,c_.index_heads,c_.index_width});
+                if(supported(source)){inputs.push_back(source);weights.push_back(w_.index_query_norm);}
+            }
+            auto normalized=rotary_->forward_normalized_grouped(inputs,weights,positions,c_.eps,1,
+                cache_written?key_cache:Tensor{},cache_written?cache_positions:Tensor{},
+                cache_written?value:Tensor{},cache_written?value_cache:Tensor{});
+            query=normalized[0];key=normalized[1];
+            if(key.defined())key=key.permute({0,2,1,3});
+            if(normalized.size()==3)iq=normalized[2].permute({0,2,1,3});
+        } else {
+            query=project_norm(pair.narrow(-1,0,c_.width),w_.query_norm).permute({0,2,1,3});
+            key=project_norm(key_source,w_.key_norm).permute({0,2,1,3});
+            query=rotary_->forward(query,positions);key=rotary_->forward(key,positions).permute({0,2,1,3});
+        }
+        if(index_query_needed && !iq.defined()) {
+            auto source=iqk.narrow(-1,0,c_.index_heads*c_.index_width).reshape({b,t,c_.index_heads,c_.index_width});
+            if(fused && supported(source))iq=rotary_->forward_normalized(source,w_.index_query_norm,positions,c_.eps).permute({0,2,1,3});
+            else {
+                iq=project_norm(source,w_.index_query_norm).permute({0,2,1,3});
+                iq=rotary_->forward(iq,positions).permute({0,2,1,3});
+            }
+        }
+        return {gate,query,key,value,iq,iqk.narrow(-1,c_.index_heads*c_.index_width,c_.index_width),cache_written};
+    }
     QsaWeights w_;
     QsaConfig c_;
     std::shared_ptr<RotaryEmbedding> rotary_;
+    bool fused_projection_;
+    bool grouped_projection_;
     SequenceCache keys_, values_, index_;
+    Tensor graph_keys_,graph_values_,graph_pooled_;
 };
 } // namespace mfq::cuda::qwen4_exp

@@ -17,6 +17,7 @@
 
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
 
+#include "mfq/host_parallel.h"
 #include "mfq_cuda_context.h"
 #include "mfq_native_tensor.h"
 
@@ -189,29 +190,8 @@ void mfq_parallel_for(
     std::int64_t end,
     std::int64_t grain,
     Function&& function) {
-    const auto count = std::max<std::int64_t>(0, end - begin);
-    const int threads = std::min<int>(
-        mfq_get_num_threads(),
-        static_cast<int>((count + std::max<std::int64_t>(grain, 1) - 1) /
-                         std::max<std::int64_t>(grain, 1)));
-    if (threads <= 1) {
-        function(begin, end);
-        return;
-    }
-    std::atomic<std::int64_t> next{begin};
-    const auto chunk = std::max<std::int64_t>(grain, 1);
-    std::vector<std::thread> workers;
-    workers.reserve(static_cast<std::size_t>(threads));
-    for (int index = 0; index < threads; ++index) {
-        workers.emplace_back([&] {
-            while (true) {
-                const auto first = next.fetch_add(chunk, std::memory_order_relaxed);
-                if (first >= end) break;
-                function(first, std::min(end, first + chunk));
-            }
-        });
-    }
-    for (auto& worker : workers) worker.join();
+    ::mfq::host_parallel_for(begin, end, grain, mfq_get_num_threads(),
+        std::forward<Function>(function));
 }
 
 inline void mfq_disable_tf32_cublas() {

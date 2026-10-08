@@ -13,6 +13,10 @@ struct CudaProfiler;
 
 mfq_tensor_backend::Tensor nint_row_embedding_lookup(
     const mfq::NintRows& table, const mfq_tensor_backend::Tensor& ids);
+mfq_tensor_backend::Tensor nint_sharded_embedding_lookup(
+    const std::vector<std::shared_ptr<mfq::NintRows>>& tables,
+    const std::vector<int64_t>& ids,const std::vector<int64_t>& shape,
+    const mfq_tensor_backend::Device& device);
 
 struct Workspace {
     int M = 0;

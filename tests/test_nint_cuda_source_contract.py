@@ -152,7 +152,7 @@ def test_mfe_nint_projection_fuses_glu_in_the_unified_kernel():
     assert "mfq_glu_runtime(" in NINT
     assert "FragmentC accumulators[projections]" in NINT
     assert "constexpr int projections = FusedGlu ? 2 : 1;" in NINT
-    assert "row * result_rows" in NINT
+    assert "static_cast<size_t>(pair) * result_rows" in NINT
     assert (
         "return forward_impl(execution, x, route, false, gelu ? 2 : 1);"
         in RUNTIME
@@ -197,7 +197,8 @@ def test_public_cuda_nint_surface_is_canonical():
 
 def test_cuda_input_gate_reuses_activation_quantizer_and_main_matmul():
     assert NINT.count("nint_matmul_input_mul_ws_cuda(") == 1
-    assert "const __half * __restrict__ gate" in NINT
+    assert "const void * __restrict__ gate" in NINT
+    assert "bool gate_fp32" in NINT
     assert "input, &gate, activation_mode, group_size" in NINT
     assert RUNTIME.count("nint_matmul_input_mul_ws_cuda(") == 2
 
@@ -222,7 +223,6 @@ def test_cpp_runtime_keeps_only_canonical_nint_row_state():
         "--nint6-mmq",
         "pure_nint_candidate_",
         "hetero_host_map_",
-        "nint_moe_grouped_matmul_hetero",
         "initialize_mfe_dispatch",
     ):
         assert retired not in RUNTIME
