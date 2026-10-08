@@ -17,6 +17,7 @@ bool is_fp8_sq_dtype(std::string_view dtype) noexcept;
 
 struct Fp8SqDescriptor {
     int format_version = 1;
+    unsigned q_mask = 0;
     double aggregate_bpw = 0.0;
     double distribution_entropy = 0.0;
 };
@@ -73,6 +74,8 @@ private:
         mlx::core::array row_q,
         mlx::core::array row_symbol_byte_offsets,
         mlx::core::array palette_values,
+        mlx::core::array palette_quads,
+        mlx::core::array palette_pairs,
         mfq::fp8sq::Layout layout,
         Fp8SqDescriptor descriptor);
 
@@ -81,6 +84,8 @@ private:
     mlx::core::array row_q_;
     mlx::core::array row_symbol_byte_offsets_;
     mlx::core::array palette_values_;
+    mlx::core::array palette_quads_;
+    mlx::core::array palette_pairs_;
     mfq::fp8sq::Layout layout_;
     Fp8SqDescriptor descriptor_;
 };
