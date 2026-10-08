@@ -792,7 +792,8 @@ inline void decode_jsc_group24(
         uint sign_value = 0u;
         if constexpr (PACKED_LAYOUT == 6u) {
             uint3 record = read_jsc_wide_record(
-                indices, indices_offset, sign_index, 4u, 12u);
+                indices, indices_offset, sign_index, JSC_VECTOR,
+                DUAL_INDEX ? 12u : 16u);
             index0 = record.x;
             index1 = record.y;
             sign_value = record.z;
@@ -1196,10 +1197,16 @@ inline void decode_vq_group24(
             state_to_bank, target, row, group, k_size);
         return;
     }
-    if (profile == 8u && execution == 6u) {
-        decode_jsc_group24<4u, 4u, 6u>(
-            d, indices, state_stream, aux, anchors, codebooks, scales,
-            state_to_bank, target, row, group, k_size);
+    if ((profile == 7u || profile == 8u) && execution == 6u) {
+        if (profile == 8u) {
+            decode_jsc_group24<4u, 4u, 6u>(
+                d, indices, state_stream, aux, anchors, codebooks, scales,
+                state_to_bank, target, row, group, k_size);
+        } else {
+            decode_jsc_group24<8u, 3u, 6u>(
+                d, indices, state_stream, aux, anchors, codebooks, scales,
+                state_to_bank, target, row, group, k_size);
+        }
         return;
     }
 #ifdef MFQ_ENABLE_JSC_EXTENDED_VECTOR

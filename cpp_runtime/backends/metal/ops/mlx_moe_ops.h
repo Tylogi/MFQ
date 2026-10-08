@@ -9,6 +9,7 @@ namespace mfq::metal {
 struct MlxMoeTopKResult {
     mlx::core::array ids;
     mlx::core::array weights;
+    std::optional<mlx::core::array> groups;
 };
 
 MlxMoeTopKResult moe_topk(

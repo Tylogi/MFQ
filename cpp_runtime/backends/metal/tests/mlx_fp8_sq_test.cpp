@@ -3,9 +3,11 @@
 #include "mlx_moe.h"
 
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -79,7 +81,8 @@ Fixture make_fixture(
     int mx_block_columns = 128,
     int fp_scale_kind = 4,
     int rows = 8,
-    int columns = 128) {
+    int columns = 128,
+    int uniform_q = 0) {
     const bool mxfp8 = dtype == "MXFP8-SQ";
     const int block_rows = mxfp8 ? mx_block_rows : 128;
     const int block_columns = mxfp8 ? mx_block_columns : 128;
@@ -90,7 +93,7 @@ Fixture make_fixture(
     for (int q = 1; q <= 7; ++q) {
         const auto begin = (1u << q) - 2u;
         for (unsigned index = 0; index < (1u << q); ++index) {
-            palettes[begin + index] = legal[index];
+            palettes[begin + index] = legal[(index * 137 + q * 31) % legal.size()];
         }
     }
 
@@ -98,7 +101,7 @@ Fixture make_fixture(
     std::vector<std::vector<std::uint8_t>> streams;
     std::vector<float> dense(static_cast<std::size_t>(rows) * columns);
     for (int row = 0; row < rows; ++row) {
-        const int bits = row % 8 + 1;
+        const int bits = uniform_q != 0 ? uniform_q : row % 8 + 1;
         q.push_back(static_cast<std::uint8_t>(bits - 1));
         std::vector<std::uint8_t> values(columns);
         for (int column = 0; column < columns; ++column) {
@@ -170,10 +173,11 @@ void test_format(
     const std::string& dtype,
     int mx_block_rows = 128,
     int mx_block_columns = 128,
-    int fp_scale_kind = 4) {
+    int fp_scale_kind = 4,
+    int columns = 128) {
     using namespace mlx::core;
     const auto fixture = make_fixture(
-        dtype, mx_block_rows, mx_block_columns, fp_scale_kind);
+        dtype, mx_block_rows, mx_block_columns, fp_scale_kind, 8, columns);
     const auto weight = mfq::metal::MlxFp8SqWeight::from_blob(
         dtype, fixture.blob);
     require(weight.dtype() == dtype, "FP8-SQ dtype mismatch");
@@ -182,11 +186,16 @@ void test_format(
     require(weight.descriptor().distribution_entropy == 3.0,
             "FP8-SQ mixed-q entropy mismatch");
 
-    auto decoded = contiguous(weight.dequantize(float32));
-    eval(decoded);
-    for (std::size_t index = 0; index < fixture.dense.size(); ++index) {
-        require(decoded.data<float>()[index] == fixture.dense[index],
-                dtype + " Metal dequantization mismatch");
+    for (const auto decoded_dtype : {float16, float32}) {
+        auto decoded = contiguous(astype(weight.dequantize(decoded_dtype), float32));
+        eval(decoded);
+        for (std::size_t index = 0; index < fixture.dense.size(); ++index) {
+            require(decoded.data<float>()[index] == fixture.dense[index],
+                    dtype + " Metal dequantization mismatch K=" + std::to_string(columns)
+                        + " index=" + std::to_string(index) + " actual="
+                        + std::to_string(decoded.data<float>()[index]) + " expected="
+                        + std::to_string(fixture.dense[index]));
+        }
     }
 
     std::vector<float> source(static_cast<std::size_t>(fixture.columns));
@@ -200,23 +209,118 @@ void test_format(
                 fixture.dense[static_cast<std::size_t>(row) * fixture.columns + column];
         }
     }
-    auto input = astype(array(source.begin(), Shape{1, fixture.columns}), float16);
-    auto output = contiguous(astype(weight.matmul(input), float32));
-    eval(output);
-    require(output.shape() == Shape{1, fixture.rows}, "FP8-SQ matmul shape mismatch");
-    for (int row = 0; row < fixture.rows; ++row) {
-        const float tolerance = std::max(0.02f, std::fabs(expected[row]) * 0.002f);
-        require(std::fabs(output.data<float>()[row] - expected[row]) < tolerance,
-                dtype + " Metal packed matmul mismatch");
+    for (int tokens = 1; tokens <= 6; ++tokens) {
+        std::vector<float> values(tokens * fixture.columns);
+        for (int token = 0; token < tokens; ++token) {
+            for (int column = 0; column < fixture.columns; ++column) {
+                values[token * fixture.columns + column] = source[column] * ((token + 1) / 8.0f);
+            }
+        }
+        auto input = astype(array(values.begin(), Shape{tokens, fixture.columns}), float16);
+        auto output = contiguous(astype(weight.matmul(input), float32));
+        eval(output);
+        require(output.shape() == Shape{tokens, fixture.rows}, "FP8-SQ matmul shape mismatch");
+        for (int token = 0; token < tokens; ++token) {
+            for (int row = 0; row < fixture.rows; ++row) {
+                const float reference = expected[row] * ((token + 1) / 8.0f);
+                const float tolerance = std::max(0.02f, std::fabs(reference) * 0.002f);
+                require(std::fabs(output.data<float>()[token * fixture.rows + row] - reference) < tolerance,
+                    dtype + " Metal packed matmul M=" + std::to_string(tokens) + " mismatch");
+            }
+        }
     }
 }
 
-void test_projection_group(const std::string& dtype) {
+void test_varied_scale_dequantize(const std::string& dtype, int kind, int columns) {
+    using namespace mlx::core;
+    auto fixture = make_fixture(dtype, 32, 32, kind, 129, columns);
+    const auto original = mfq::metal::MlxFp8SqWeight::from_blob(dtype, fixture.blob);
+    const auto layout = original.wire_layout();
+    constexpr std::array<std::uint16_t, 6> bf16{0x3ec0, 0x3f81, 0x4001, 0x3881, 0x3f35, 0x4049};
+    constexpr std::array<std::uint16_t, 6> fp16{0x3601, 0x3c01, 0x4001, 0x0401, 0x39a9, 0x4249};
+    constexpr std::array<float, 6> fp32{0.12345679f, 1.000001f, 2.000001f, 0.000061097f, 0.7083333f, 3.1415927f};
+    std::vector<float> scales(layout.scale_rows * layout.scale_columns);
+    for (std::size_t index = 0; index < scales.size(); ++index) {
+        auto* destination = fixture.blob.data() + layout.scales;
+        if (dtype == "MXFP8-SQ") {
+            destination[index] = 123 + index % 7;
+            scales[index] = std::ldexp(1.0f, int(destination[index]) - 127);
+        } else if (kind == 2 || kind == 3) {
+            const auto raw = kind == 2 ? bf16[index % bf16.size()] : fp16[index % fp16.size()];
+            std::memcpy(destination + index * 2, &raw, 2);
+            scales[index] = kind == 2 ? std::bit_cast<float>(std::uint32_t(raw) << 16)
+                : std::ldexp(1.0f + float(raw & 1023u) / 1024.0f, int((raw >> 10) & 31u) - 15);
+        } else {
+            scales[index] = fp32[index % fp32.size()];
+            std::memcpy(destination + index * 4, &scales[index], 4);
+        }
+    }
+    for (int row = 0; row < fixture.rows; ++row) {
+        for (int column = 0; column < columns; ++column) {
+            const auto scale = row / layout.block_rows * layout.scale_columns + column / layout.block_columns;
+            fixture.dense[row * columns + column] = fixture.dense[row * columns + column]
+                / (dtype == "MXFP8-SQ" ? std::ldexp(1.0f, scale % 3) : 1.5f) * scales[scale];
+        }
+    }
+    const auto weight = mfq::metal::MlxFp8SqWeight::from_blob(dtype, fixture.blob);
+    for (const auto dtype_out : {float16, float32}) {
+        auto actual = contiguous(astype(weight.dequantize(dtype_out), float32));
+        auto expected = contiguous(astype(astype(array(fixture.dense.begin(), Shape{fixture.rows, columns}), dtype_out), float32));
+        eval(actual, expected);
+        for (std::size_t index = 0; index < fixture.dense.size(); ++index) {
+            require(actual.data<float>()[index] == expected.data<float>()[index],
+                dtype + " varied scale kind=" + std::to_string(kind) + " K=" + std::to_string(columns)
+                    + " index=" + std::to_string(index));
+        }
+    }
+}
+
+void test_uniform_forward(const std::string& dtype, int bits,
+    int output_rows, int columns) {
+    using namespace mlx::core;
+    const auto fixture = make_fixture(dtype, 32, 32, 4, output_rows, columns, bits);
+    const auto weight = mfq::metal::MlxFp8SqWeight::from_blob(dtype, fixture.blob);
+    require(weight.descriptor().distribution_entropy == 0.0,
+            dtype + " uniform-q entropy mismatch");
+    const mfq::metal::MlxGroupedLinear grouped({&weight, &weight});
+    for (int tokens = 1; tokens <= 6; ++tokens) {
+        std::vector<float> values(static_cast<std::size_t>(tokens) * columns);
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            values[index] = static_cast<float>(
+                static_cast<int>((index * 19 + 11) % 41) - 20) / 2048.0f;
+        }
+        auto input = astype(array(values.begin(), Shape{tokens, columns}), float16);
+        auto results = grouped(input);
+        results.push_back(weight.matmul(input));
+        for (auto& result : results) {
+            result = contiguous(astype(result, float32));
+        }
+        eval(results);
+        for (int token = 0; token < tokens; ++token) {
+            for (int row = 0; row < output_rows; ++row) {
+                float expected = 0.0f;
+                for (int column = 0; column < columns; ++column) {
+                    expected += values[token * columns + column]
+                        * fixture.dense[static_cast<std::size_t>(row) * columns + column];
+                }
+                const float tolerance = std::max(0.002f, std::fabs(expected) * 0.001f);
+                for (const auto& result : results) {
+                    require(std::fabs(result.data<float>()[token * output_rows + row]
+                        - expected) < tolerance, dtype + " uniform q=" + std::to_string(bits)
+                        + " M=" + std::to_string(tokens) + " forward mismatch");
+                }
+            }
+        }
+    }
+}
+
+void test_projection_group(const std::string& dtype,
+    mlx::core::Dtype input_dtype = mlx::core::float16, int columns = 128) {
     using namespace mlx::core;
     const auto first_fixture = make_fixture(
-        dtype, 32, 32, dtype == "MXFP8-SQ" ? 1 : 4, 8, 128);
+        dtype, 32, 32, dtype == "MXFP8-SQ" ? 1 : 4, 8, columns);
     const auto second_fixture = make_fixture(
-        dtype, 32, 32, dtype == "MXFP8-SQ" ? 1 : 4, 6, 128);
+        dtype, 32, 32, dtype == "MXFP8-SQ" ? 1 : 4, 6, columns);
     const auto first = mfq::metal::MlxFp8SqWeight::from_blob(
         dtype, first_fixture.blob);
     const auto second = mfq::metal::MlxFp8SqWeight::from_blob(
@@ -229,13 +333,13 @@ void test_projection_group(const std::string& dtype) {
     require(grouped.supports_single_row_projection_fusion(),
             dtype + " projection group missed decode fusion");
 
-    for (int rows = 1; rows <= 6; ++rows) {
-        std::vector<float> values(static_cast<std::size_t>(rows) * 128);
+    for (const int rows : {1, 2, 3, 4, 5, 6, 7, 9, 16}) {
+        std::vector<float> values(static_cast<std::size_t>(rows) * columns);
         for (std::size_t index = 0; index < values.size(); ++index) {
             values[index] = static_cast<float>(
                 static_cast<int>((index * 13 + 9) % 37) - 18) / 256.0f;
         }
-        auto input = astype(array(values.begin(), Shape{rows, 128}), float16);
+        auto input = astype(array(values.begin(), Shape{rows, columns}), input_dtype);
         auto actual = grouped(input);
         std::array<array, 2> expected{
             first.matmul(input),
@@ -274,6 +378,15 @@ void test_packed_backward(
         dtype, block_rows, block_columns, scale_kind, output_rows, columns);
     const auto weight = mfq::metal::MlxFp8SqWeight::from_blob(
         dtype, fixture.blob);
+    auto decoded = contiguous(astype(weight.dequantize(float16), float32));
+    eval(decoded);
+    for (std::size_t index = 0; index < fixture.dense.size(); ++index) {
+        require(decoded.data<float>()[index] == fixture.dense[index],
+            dtype + " backward reference dequantization mismatch K=" + std::to_string(columns)
+                + " index=" + std::to_string(index) + " actual="
+                + std::to_string(decoded.data<float>()[index]) + " expected="
+                + std::to_string(fixture.dense[index]));
+    }
     for (const int rows : {1, 2, 4, 6, 8}) {
         std::vector<float> values(
             static_cast<std::size_t>(rows) * output_rows);
@@ -315,7 +428,6 @@ void test_mfe_format(const std::string& dtype) {
     constexpr int experts = 2;
     constexpr int output = 4;
     constexpr int columns = 128;
-    constexpr int tokens = 2;
     constexpr int routes = 2;
     const auto fixture = make_fixture(dtype);
     require(fixture.rows == experts * output, "invalid FP8-SQ MFE fixture rows");
@@ -341,44 +453,51 @@ void test_mfe_format(const std::string& dtype) {
     require(weight.out_per_expert() == output, dtype + " MFE output mismatch");
     require(!weight.supports_grouped_mmq(), dtype + " created a duplicate MFE kernel");
 
-    std::vector<float> source(static_cast<std::size_t>(tokens) * columns);
-    for (std::size_t index = 0; index < source.size(); ++index) {
-        source[index] = static_cast<float>(static_cast<int>(index % 19) - 9) / 128.0f;
-    }
-    const std::array<std::int32_t, tokens * routes> ids{0, 1, 1, 0};
-    const auto input = astype(
-        array(source.begin(), Shape{tokens, columns}),
-        float16);
-    const auto expert_ids = array(ids.begin(), Shape{tokens, routes});
-    auto actual = contiguous(astype(weight.routed_matmul(input, expert_ids), float32));
-    eval(actual);
-    require(actual.shape() == Shape{tokens, routes, output}, dtype + " MFE shape mismatch");
     const std::array<std::span<const std::uint8_t>, 2> projection_blobs{blob, blob};
     const auto direct = mfq::metal::MlxMoeWeight::from_projection_blobs(projection_blobs);
     const auto projected = mfq::metal::MlxMoeWeight::concatenate_projections({weight, weight});
     require(!direct.supports_grouped_mmq(), dtype + " direct loader changed SQ dispatch");
-    require(all(equal(direct.routed_matmul(input, expert_ids),
-                      projected.routed_matmul(input, expert_ids))).item<bool>(),
-            dtype + " direct projection matmul mismatch");
-    require(all(equal(direct.routed_swiglu(input, expert_ids),
-                      projected.routed_swiglu(input, expert_ids))).item<bool>(),
-            dtype + " direct projection SwiGLU mismatch");
-    for (int token = 0; token < tokens; ++token) {
-        for (int route = 0; route < routes; ++route) {
-            const int expert = ids[static_cast<std::size_t>(token) * routes + route];
-            const int local = expert == local_to_global[0] ? 0 : 1;
-            for (int row = 0; row < output; ++row) {
-                float expected = 0.0f;
-                for (int column = 0; column < columns; ++column) {
-                    expected += source[static_cast<std::size_t>(token) * columns + column] *
-                        fixture.dense[(static_cast<std::size_t>(local) * output + row) * columns + column];
+    for (int tokens = 1; tokens <= 6; ++tokens) {
+        for (const bool shared_input : {true, false}) {
+            std::vector<float> source(static_cast<std::size_t>(tokens)
+                * (shared_input ? 1 : routes) * columns);
+            for (std::size_t index = 0; index < source.size(); ++index) {
+                source[index] = static_cast<float>(static_cast<int>(index % 19) - 9) / 128.0f;
+            }
+            std::vector<std::int32_t> ids(tokens * routes);
+            for (std::size_t index = 0; index < ids.size(); ++index) {
+                ids[index] = static_cast<std::int32_t>((index + index / routes) % experts);
+            }
+            const auto input = astype(array(source.begin(), shared_input
+                ? Shape{tokens, columns} : Shape{tokens, routes, columns}), float16);
+            const auto expert_ids = array(ids.begin(), Shape{tokens, routes});
+            auto actual = contiguous(astype(weight.routed_matmul(input, expert_ids), float32));
+            eval(actual);
+            require(actual.shape() == Shape{tokens, routes, output}, dtype + " MFE shape mismatch");
+            require(all(equal(direct.routed_matmul(input, expert_ids),
+                              projected.routed_matmul(input, expert_ids))).item<bool>(),
+                    dtype + " direct projection matmul mismatch");
+            require(all(equal(direct.routed_swiglu(input, expert_ids),
+                              projected.routed_swiglu(input, expert_ids))).item<bool>(),
+                    dtype + " direct projection SwiGLU mismatch");
+            for (int token = 0; token < tokens; ++token) {
+                for (int route = 0; route < routes; ++route) {
+                    const int expert = ids[static_cast<std::size_t>(token) * routes + route];
+                    const int local = expert == local_to_global[0] ? 0 : 1;
+                    const auto input_row = shared_input ? token : token * routes + route;
+                    for (int row = 0; row < output; ++row) {
+                        float expected = 0.0f;
+                        for (int column = 0; column < columns; ++column) {
+                            expected += source[static_cast<std::size_t>(input_row) * columns + column] *
+                                fixture.dense[(static_cast<std::size_t>(local) * output + row) * columns + column];
+                        }
+                        const auto index =
+                            (static_cast<std::size_t>(token) * routes + route) * output + row;
+                        const float tolerance = std::max(0.03f, std::fabs(expected) * 0.003f);
+                        require(std::fabs(actual.data<float>()[index] - expected) < tolerance,
+                            dtype + " MFE M=" + std::to_string(tokens) + " routed result mismatch");
+                    }
                 }
-                const auto index =
-                    (static_cast<std::size_t>(token) * routes + route) * output + row;
-                const float tolerance = std::max(0.03f, std::fabs(expected) * 0.003f);
-                require(
-                    std::fabs(actual.data<float>()[index] - expected) < tolerance,
-                    dtype + " MFE routed result mismatch");
             }
         }
     }
@@ -394,8 +513,33 @@ int main() {
         test_format("FP8-128SQ", 128, 128, 2);
         test_format("FP8-128SQ", 128, 128, 3);
         test_format("FP8-128SQ", 128, 128, 4);
+        test_format("FP8-128SQ", 128, 128, 4, 129);
+        test_format("FP8-128SQ", 128, 128, 4, 130);
+        for (const int columns : {4, 8, 12, 131, 132}) {
+            test_format("FP8-128SQ", 128, 128, 4, columns);
+        }
+        for (int bits = 1; bits <= 8; ++bits) {
+            test_uniform_forward("MXFP8-SQ", bits, 129, 64);
+            test_uniform_forward("MXFP8-SQ", bits, 33, 256);
+            test_uniform_forward("FP8-128SQ", bits, 129, 65);
+            test_uniform_forward("FP8-128SQ", bits, 33, 257);
+        }
+        for (const int columns : {640, 2560, 6144}) {
+            for (int bits = 1; bits <= 8; ++bits) {
+                test_uniform_forward("MXFP8-SQ", bits, 33, columns);
+                test_uniform_forward("FP8-128SQ", bits, 33, columns);
+            }
+        }
+        for (const int columns : {256, 257}) {
+            if (columns % 32 == 0) test_varied_scale_dequantize("MXFP8-SQ", 1, columns);
+            for (const int kind : {2, 3, 4}) test_varied_scale_dequantize("FP8-128SQ", kind, columns);
+        }
         test_projection_group("MXFP8-SQ");
         test_projection_group("FP8-128SQ");
+        test_projection_group("MXFP8-SQ", mlx::core::float32);
+        test_projection_group("FP8-128SQ", mlx::core::float32);
+        test_projection_group("FP8-128SQ", mlx::core::float16, 129);
+        test_projection_group("FP8-128SQ", mlx::core::float32, 129);
         test_packed_backward("MXFP8-SQ", 1, 32, 1);
         test_packed_backward("MXFP8-SQ", 32, 32, 1);
         test_packed_backward("MXFP8-SQ", 128, 128, 1);
