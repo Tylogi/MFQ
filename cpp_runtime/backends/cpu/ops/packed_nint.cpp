@@ -108,4 +108,10 @@ void packed_nint_matmul(const PackedNintView& w, const float* input,
         rows(w, input, batch, input_stride, output, output_stride, begin, end);
     });
 }
+PackedNintRows packed_nint_rows_kernel() noexcept {
+#ifdef MFQ_CPU_PACKED_AVX2
+    if (packed_nint_has_avx2()) return detail::packed_nint_avx2_rows;
+#endif
+    return detail::packed_nint_scalar_rows;
+}
 } // namespace mfq::cpu

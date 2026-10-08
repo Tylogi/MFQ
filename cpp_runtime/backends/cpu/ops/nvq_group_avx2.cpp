@@ -47,6 +47,24 @@ MFQ_NVQ_INLINE void decode_group(const NvqDecodeView& w,std::int64_t row,int gro
         delta=negative ? -1 : 1;
         if constexpr (Format==8) bank+=int(negative)*512*8;
     }
+    std::uint32_t group_signs=0;
+    if constexpr(!delta_format && Format!=7 && Format!=9) {
+        group_signs=bits_at(w.aux,w.aux_bytes,(row*w.nsign+group*3)*7,21);
+    }
+    std::uint64_t group_indices=0;
+    if constexpr(bits!=8 && Format!=7) {
+        const auto first=(row*w.nvec+(d4?group*6:group*3))*bits;
+        const auto byte=first>>3;
+        const int shift=static_cast<int>(first&7);
+        const auto available=w.index_bytes-byte;
+        if(available>=8)std::memcpy(&group_indices,w.indices+byte,8);
+        else std::memcpy(&group_indices,w.indices+byte,static_cast<std::size_t>(available));
+        group_indices>>=shift;
+        if constexpr((d4?6:3)*bits>57) {
+            if(shift && (d4?6:3)*bits+shift>64 && available>8)
+                group_indices|=static_cast<std::uint64_t>(w.indices[byte+8])<<(64-shift);
+        }
+    }
     const auto multiplier=_mm256_set1_ps(scale);
     const int chunks=(valid+7)/8;
     for (int chunk=0; chunk<chunks; ++chunk) {
@@ -54,7 +72,8 @@ MFQ_NVQ_INLINE void decode_group(const NvqDecodeView& w,std::int64_t row,int gro
         const int vector=d4 ? vector8*2 : vector8;
         const auto linear=row*w.nvec+vector;
         const std::uint32_t code=bits==8 ? w.indices[linear] :
-            bits_at(w.indices,w.index_bytes,linear*bits,bits);
+            Format==7 ? bits_at(w.indices,w.index_bytes,linear*bits,bits) :
+            static_cast<std::uint32_t>((group_indices>>(bits*chunk*(d4?2:1)))&((1u<<bits)-1u));
         __m128i values;
         if constexpr (Format==7 || d4) {
             std::uint64_t word=0;
@@ -66,7 +85,7 @@ MFQ_NVQ_INLINE void decode_group(const NvqDecodeView& w,std::int64_t row,int gro
                 std::memcpy(&word,bank+std::int64_t(code)*4,4);
                 if (vector+1<w.nvec) {
                     const std::uint32_t second=bits==8 ? w.indices[linear+1] :
-                        bits_at(w.indices,w.index_bytes,(linear+1)*bits,bits);
+                        static_cast<std::uint32_t>((group_indices>>(bits*(chunk*2+1)))&((1u<<bits)-1u));
                     std::memcpy(reinterpret_cast<char*>(&word)+4,bank+std::int64_t(second)*4,4);
                 }
             }
@@ -80,7 +99,7 @@ MFQ_NVQ_INLINE void decode_group(const NvqDecodeView& w,std::int64_t row,int gro
             values=_mm_and_si128(_mm_slli_epi16(values,shift),mask);
             values=_mm_add_epi8(values,_mm_set1_epi8(static_cast<char>(delta*(Format==1 ? 1 : 5))));
         } else if constexpr (Format!=7 && Format!=9) {
-            const auto mask7=bits_at(w.aux,w.aux_bytes,(row*w.nsign+vector8)*7,7);
+            const auto mask7=(group_signs>>(chunk*7))&127u;
             const auto last=parity7(mask7)^((Format==2 && w.sign_mode!=0) ? ((code>>7)&1u) : 0u);
             const auto mask8=mask7|(last<<7);
             const auto selected=_mm_and_si128(_mm_set1_epi8(static_cast<char>(mask8)),
@@ -151,6 +170,49 @@ void rows_dot(const NvqDecodeView& w,const float* input,std::int64_t batch,
         }
     }
 }
+
+template<int Format>
+void rows_dot_single(const NvqDecodeView& w,const float* input,std::int64_t batch,
+        std::int64_t input_stride,float* output,std::int64_t output_stride,
+        std::int64_t begin,std::int64_t end) {
+    if(batch!=1) {
+        rows_dot<Format>(w,input,batch,input_stride,output,output_stride,begin,end);return;
+    }
+    const auto full_groups=static_cast<int>(w.width/24);
+    const int tail=static_cast<int>(w.width%24);
+    for(auto neuron=begin;neuron<end;++neuron) {
+        auto sum=_mm256_setzero_ps();
+        // Keep one accumulator in a register. Full groups have three fixed
+        // vectors; the final partial group retains the original masked reads.
+        for(int group=0;group<full_groups;++group) {
+            const auto state=bits_at(w.states,w.state_bytes,
+                (neuron*w.groups+group)*w.state_bits,w.state_bits);
+            __m256 decoded[3];
+            decode_group<Format>(w,neuron,group,state,24,
+                w.anchors[neuron]*w.multipliers[state],decoded);
+            const auto* x=input+std::int64_t(group)*24;
+            sum=_mm256_add_ps(sum,_mm256_mul_ps(decoded[0],_mm256_loadu_ps(x)));
+            sum=_mm256_add_ps(sum,_mm256_mul_ps(decoded[1],_mm256_loadu_ps(x+8)));
+            sum=_mm256_add_ps(sum,_mm256_mul_ps(decoded[2],_mm256_loadu_ps(x+16)));
+        }
+        if(tail) {
+            const auto state=bits_at(w.states,w.state_bytes,
+                (neuron*w.groups+full_groups)*w.state_bits,w.state_bits);
+            __m256 decoded[3];
+            decode_group<Format>(w,neuron,full_groups,state,tail,
+                w.anchors[neuron]*w.multipliers[state],decoded);
+            for(int chunk=0;chunk<(tail+7)/8;++chunk) {
+                const int remaining=tail-chunk*8;
+                const auto* x=input+std::int64_t(full_groups)*24+chunk*8;
+                const auto mask=_mm256_cmpgt_epi32(_mm256_set1_epi32(remaining),
+                    _mm256_setr_epi32(0,1,2,3,4,5,6,7));
+                const auto values=remaining>=8 ? _mm256_loadu_ps(x) : _mm256_maskload_ps(x,mask);
+                sum=_mm256_add_ps(sum,_mm256_mul_ps(decoded[chunk],values));
+            }
+        }
+        output[neuron]=reduce(sum);
+    }
+}
 } // namespace
 
 NvqGroupDot nvq_group_dot_avx2(int format) noexcept {
@@ -175,6 +237,18 @@ NvqRowsDot nvq_rows_dot_avx2(int format) noexcept {
         MFQ_NVQ_CPU_CASE(15)
 #undef MFQ_NVQ_CPU_CASE
         default: return nullptr;
+    }
+}
+NvqRowsDot nvq_rows_dot_single_avx2(int format) noexcept {
+    switch(format) {
+#define MFQ_NVQ_CPU_SINGLE_CASE(F) case F: return rows_dot_single<F>;
+        MFQ_NVQ_CPU_SINGLE_CASE(1) MFQ_NVQ_CPU_SINGLE_CASE(2) MFQ_NVQ_CPU_SINGLE_CASE(3)
+        MFQ_NVQ_CPU_SINGLE_CASE(5) MFQ_NVQ_CPU_SINGLE_CASE(7) MFQ_NVQ_CPU_SINGLE_CASE(8)
+        MFQ_NVQ_CPU_SINGLE_CASE(9) MFQ_NVQ_CPU_SINGLE_CASE(10) MFQ_NVQ_CPU_SINGLE_CASE(11)
+        MFQ_NVQ_CPU_SINGLE_CASE(12) MFQ_NVQ_CPU_SINGLE_CASE(13) MFQ_NVQ_CPU_SINGLE_CASE(14)
+        MFQ_NVQ_CPU_SINGLE_CASE(15)
+#undef MFQ_NVQ_CPU_SINGLE_CASE
+        default:return nullptr;
     }
 }
 } // namespace mfq::cpu::detail

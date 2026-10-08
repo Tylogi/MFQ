@@ -1,7 +1,8 @@
 # Backend-neutral graph, policies, interfaces, and generated tables.
 
 find_package(Threads REQUIRED)
-add_library(mfq-host-parallel STATIC host_parallel.cpp include/mfq/host_parallel.h)
+add_library(mfq-host-parallel STATIC host_parallel.cpp include/mfq/host_parallel.h
+    cpu_expert_pool.cpp include/mfq/cpu_expert_pool.h)
 target_include_directories(mfq-host-parallel PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(mfq-host-parallel PUBLIC cxx_std_17)
 target_link_libraries(mfq-host-parallel PUBLIC Threads::Threads)
@@ -31,6 +32,9 @@ set_target_properties(mfq-model-graph PROPERTIES
 )
 
 add_library(mfq-model-source STATIC
+    file_range_reader.cpp
+    async_range_reader.cpp
+    include/mfq/file_range_reader.h
     mfe_quant_expert_store.cpp
     include/mfq/mfe_quant_expert_store.h
     nint_rows.cpp
@@ -55,6 +59,7 @@ target_include_directories(mfq-model-source PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/compat
 )
 target_link_libraries(mfq-model-source PUBLIC mfq-model-graph)
+target_link_libraries(mfq-model-source PRIVATE mfq-host-parallel)
 target_link_libraries(mfq-model-source PRIVATE mfq-json)
 target_compile_features(mfq-model-source PUBLIC cxx_std_17)
 set_target_properties(mfq-model-source PROPERTIES

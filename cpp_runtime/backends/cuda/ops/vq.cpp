@@ -6,6 +6,7 @@
 #include "nvq_codebooks.generated.h"
 #include "quant_dot.h"
 #include "nvq_group.h"
+#include "cpu_projection_rows.h"
 
 using mfq_tensor_backend::indexing::Slice;
 using namespace mfq::cuda::quant_format;
@@ -235,6 +236,43 @@ static CpuNvqDecoder cpu_nvq_decoder(int format) {
     }
 }
 
+CpuProjectionRows make_cpu_projection_rows(const NvqWeight& w) {
+    MFQ_RUNTIME_CHECK(w.indices_packed.is_cpu() && w.gs==24 && w.sub_bits>0 && w.sub_bits<=4,
+        "original-FP32 NVQ rows require canonical CPU storage");
+    CpuProjectionRows p; p.width=static_cast<int>(w.neuron_len); p.outputs=static_cast<int>(w.out);
+    const int format=static_cast<int>(w.kernel_format);
+    const int vector=cpu_nvq_d4(format) ? 4 : 8;
+    auto& v=p.nvq;
+    v.indices=w.indices_packed.data_ptr<uint8_t>(); v.aux=w.aux_packed.data_ptr<uint8_t>();
+    v.index_bytes=w.indices_packed.numel(); v.aux_bytes=w.aux_packed.numel();
+    v.nvec=static_cast<int>((w.neuron_len+vector-1)/vector);v.nsign=static_cast<int>((w.neuron_len+7)/8);
+    v.groups=static_cast<int>(w.ng);v.sign_mode=static_cast<int>(w.sign_mode);
+    v.states=w.sub_scale_packed.data_ptr<uint8_t>();v.state_bytes=w.sub_scale_packed.numel();
+    v.anchors=w.neuron_scale.data_ptr<float>();v.width=w.neuron_len;v.state_bits=static_cast<int>(w.sub_bits);
+    const auto* metadata=w.codebook.data_ptr<int8_t>();
+    for(uint32_t state=0;state<(1u<<w.sub_bits);++state) {
+        v.multipliers[state]=cpu_nvq_scale(metadata,format,1.0f,state);
+        v.banks[state]=format==7 ? metadata+64+state*32 : format==9 ? metadata+64+state*64*8 : cpu_nvq_codebook(metadata,format,state);
+    }
+    p.nvq_rows=mfq::cpu::nvq_rows_dot_kernel(format);
+    if(!p.nvq_rows) {
+        const auto decoder=cpu_nvq_decoder(format);
+        const auto dot=mfq::cpu::scaled_i8_dot_kernel();
+        p.scalar_rows=[v,decoder,dot](const float* x,int batch,int stride,float* y,int out,int begin,int end) {
+            for(int row=begin;row<end;++row) {
+                for(int t=0;t<batch;++t) y[t*out+row]=0;
+                for(int group=0;group<v.groups;++group) {
+                    const auto state=cpu_nvq_bits(v.states,v.state_bytes,(int64_t(row)*v.groups+group)*v.state_bits,v.state_bits);
+                    const float scale=v.anchors[row]*v.multipliers[state];
+                    alignas(32) int8_t codes[24];decoder(v,row,group,state,codes);
+                    const int valid=static_cast<int>(std::min<int64_t>(24,v.width-int64_t(group)*24));
+                    for(int t=0;t<batch;++t) y[t*out+row]+=dot(codes,x+int64_t(t)*stride+group*24,valid,scale);
+                }
+            }
+        };
+    }
+    return p;
+}
 static mfq_tensor_backend::Tensor nvq_matmul_cpu(
         const NvqWeight & w,
         mfq_tensor_backend::Tensor x) {

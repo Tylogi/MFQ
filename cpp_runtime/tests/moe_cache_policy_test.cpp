@@ -135,6 +135,33 @@ void test_budget_planner_caps_registered_experts() {
 
 int main() {
     try {
+        {
+            mfq::MoeCacheSlotBook book(1);
+            const mfq::MoeCacheKey old{0,0,0},fresh{0,0,1};
+            const auto lease=book.acquire(old);
+            book.mark_inflight(lease.slot);
+            if(book.replace(lease.slot,{0,0,9},fresh))throw std::runtime_error("stale GPU exchange committed");
+            if(!book.replace(lease.slot,old,fresh) || book.slot_for(old)!=-1 || book.slot_for(fresh)!=0 ||
+                book.inflight(0) || book.discard(old,lease.slot,lease.generation))
+                throw std::runtime_error("GPU exchange ownership or generation is invalid");
+        }
+        {
+            mfq::MoeCacheSlotBook book(2);
+            const mfq::MoeCacheKey a{0,0,0},b{0,0,1},c{1,0,0},d{1,0,1};
+            auto first=book.acquire(a),second=book.acquire(b);
+            auto left=book.prepare_replace(first.slot,a,c),right=book.prepare_replace(second.slot,b,d);
+            book.mark_inflight(first.slot);book.mark_inflight(second.slot);
+            require(book.slot_for(c)<0 && book.slot_for(d)<0,"prepared replacement was published early");
+            require(book.commit_replace(left) && book.commit_replace(right),"prepared replacements failed to commit");
+            book.rollback_replace(right);book.rollback_replace(left);
+            require(book.slot_for(a)==first.slot && book.slot_for(b)==second.slot &&
+                book.slot_for(c)<0 && book.slot_for(d)<0 && !book.inflight(first.slot) &&
+                !book.inflight(second.slot),"batch rollback did not restore original GPU keys");
+            auto stale=book.prepare_replace(first.slot,a,c);
+            require(book.replace(first.slot,a,d) && !book.commit_replace(stale),"stale prepared generation committed");
+            book.mark_inflight(first.slot);book.rollback_replace(stale);
+            require(book.inflight(first.slot) && book.slot_for(d)==first.slot,"stale rollback changed another owner's slot");
+        }
         test_lru_replaces_oldest_non_inflight_slot();
         test_inflight_slot_is_not_replaced();
         test_all_inflight_slots_reject_replacement();
@@ -142,7 +169,7 @@ int main() {
         test_budget_planner_honors_minimums_and_hard_limit();
         test_budget_planner_rejects_insufficient_budget();
         test_budget_planner_caps_registered_experts();
-        std::cout << "moe_cache_policy_tests=7 passed=7\n";
+        std::cout << "moe_cache_policy_tests=9 passed=9\n";
         return 0;
     } catch (const std::exception & error) {
         std::cerr << "moe_cache_policy_test failure=" << error.what() << "\n";

@@ -1,6 +1,7 @@
 #include "mfq/nint_rows.h"
 
 #include "mfq/nint_blob.h"
+#include "mfq/host_parallel.h"
 #include "mfq/packed_row_range.h"
 
 #include <algorithm>
@@ -88,13 +89,13 @@ std::uint32_t cohort_rank(
 NintRows::NintRows(const std::uint8_t* data, std::size_t size)
     : read_([data](std::size_t offset, std::uint8_t* out, std::size_t count) {
         if (count) std::memcpy(out, data + offset, count);
-    }), borrowed_(data), nbytes_(size) {
+    }), borrowed_(data), nbytes_(size), parallel_reads_(true) {
     if (!data && size) throw std::invalid_argument("null NINT row storage");
     initialize();
 }
 
-NintRows::NintRows(std::size_t size, Read read)
-    : read_(std::move(read)), nbytes_(size) {
+NintRows::NintRows(std::size_t size, Read read, bool parallel_reads,ReadBatch batch)
+    : read_(std::move(read)),read_batch_(std::move(batch)), nbytes_(size), parallel_reads_(parallel_reads) {
     if (!read_) throw std::invalid_argument("missing NINT row range reader");
     initialize();
 }
@@ -330,6 +331,8 @@ void NintRowBatch::append_batch(const NintRowBatch& other) {
         throw std::overflow_error("NINT merged row batch exceeds bounds");
     }
     const auto offset = static_cast<std::uint32_t>(packed_.size());
+    packed_.reserve(packed_.size() + other.packed_.size());
+    descriptors_.reserve(descriptors_.size() + other.descriptors_.size());
     packed_.insert(packed_.end(), other.packed_.begin(), other.packed_.end());
     for (std::size_t row = 0; row < other.rows(); ++row) {
         const auto* descriptor = other.descriptors_.data() + row * 6;
@@ -341,10 +344,115 @@ void NintRowBatch::append_batch(const NintRowBatch& other) {
     width_ = other.width_;
 }
 
+void NintRows::append_rows(const std::int64_t* rows, std::size_t count,
+        NintRowBatch& batch, int threads) const {
+    if (!count) return;
+    if (!rows) throw std::invalid_argument("null NINT row IDs");
+    if ((batch.width_ && batch.width_ != width_) ||
+        batch.rows() > std::numeric_limits<int>::max() / 6 ||
+        count > std::numeric_limits<int>::max() / 6 - batch.rows() ||
+        (batch.rows() + count) > std::numeric_limits<std::uint32_t>::max() / width_)
+        throw std::runtime_error("NINT selected row batch exceeds bounds");
+    for (std::size_t i = 0; i < count; ++i)
+        if (rows[i] < 0 || rows[i] >= rows_) throw std::out_of_range("mapped NINT row ID");
+    if(read_batch_) { append_rows_batched(rows,count,batch);return; }
+
+    const auto workers = parallel_reads_ ? std::min<std::size_t>(count, std::max(threads, 1)) : 1;
+    std::vector<NintRowBatch> pieces(workers);
+    host_parallel_for(0, workers, 1, static_cast<int>(workers),
+        [&](std::int64_t first, std::int64_t last) {
+            for (auto part = first; part < last; ++part) {
+                const auto begin = count * static_cast<std::size_t>(part) / workers;
+                const auto end = count * static_cast<std::size_t>(part + 1) / workers;
+                auto& piece = pieces[part];
+                piece.descriptors_.reserve((end - begin) * 6);
+                for (auto i = begin; i < end; ++i) append_row(rows[i], piece);
+            }
+        });
+    // Publish only after all reads complete, including failure propagation.
+    auto total = batch.packed_.size();
+    if (total > std::numeric_limits<int>::max())
+        throw std::runtime_error("NINT selected row stream exceeds bounds");
+    for (const auto& piece : pieces) {
+        if (piece.packed_.size() > std::numeric_limits<int>::max() - total)
+            throw std::runtime_error("NINT selected row stream exceeds bounds");
+        total += piece.packed_.size();
+    }
+    batch.packed_.reserve(total);
+    batch.descriptors_.reserve((batch.rows() + count) * 6);
+    for (const auto& piece : pieces) {
+        const auto base = static_cast<std::uint32_t>(batch.packed_.size());
+        batch.packed_.insert(batch.packed_.end(), piece.packed_.begin(), piece.packed_.end());
+        for (std::size_t i = 0; i < piece.descriptors_.size(); i += 6)
+            for (std::size_t field = 0; field < 6; ++field)
+                batch.descriptors_.push_back(piece.descriptors_[i + field] + (field < 3 ? base : 0));
+        batch.source_bytes_read_ += piece.source_bytes_read_;
+    }
+    batch.width_ = width_;
+}
+
+void NintRows::append_rows_batched(const int64_t* rows,std::size_t count,NintRowBatch& batch) const {
+    NintRowBatch result;result.width_=width_;result.descriptors_.resize(count*6);
+    struct Span {std::size_t source,size,destination;bool anchor;};
+    std::vector<Span> plans;plans.reserve(count*5);
+    for(std::size_t i=0;i<count;++i) {
+        const auto row=static_cast<std::size_t>(rows[i]);
+        const auto kc=adaptive_ ? selector(k_selectors_,row,2) : 0,qc=adaptive_ ? selector(q_selectors_,row,3) : 0;
+        const int k=adaptive_ ? sub_bits_-1+int(kc) : sub_bits_,q=adaptive_ ? int(qc)+1 : bits_;
+        const auto kr=adaptive_ ? cohort_rank(k_selectors_,row,2,kc,k_ranks_) : row;
+        const auto qr=adaptive_ ? cohort_rank(q_selectors_,row,3,qc,q_ranks_) : row;
+        const auto kbit=uint64_t(kr)*groups_*k,qbit=uint64_t(qr)*groups_*group_size_*q;
+        const auto stream=[&](std::size_t start,uint64_t bit,uint64_t values,int bits) {
+            start+=static_cast<std::size_t>(bit/8);
+            const auto n=static_cast<std::size_t>(((bit&7)+values*bits+7)/8),offset=result.packed_.size();
+            if(start>nbytes_ || n>nbytes_-start || n>=std::numeric_limits<int>::max() ||
+                offset>std::numeric_limits<int>::max()-n-1)throw std::out_of_range("NINT batch stream exceeds bounds");
+            plans.push_back({start,n,offset,false});result.packed_.resize(offset+n+1,0);result.source_bytes_read_+=n;
+            return static_cast<uint32_t>(offset);
+        };
+        auto* words=result.descriptors_.data()+i*6;
+        words[0]=stream(q_offsets_[qc],qbit,uint64_t(groups_)*group_size_,q);
+        words[1]=stream(scale_offsets_[kc],kbit,groups_,k);words[2]=stream(min_offsets_[kc],kbit,groups_,k);
+        words[3]=q | (k<<4) | ((qbit&7)<<8) | ((kbit&7)<<12) | ((kbit&7)<<16);
+        words[4]=group_size_;
+        plans.push_back({neuron_scale_offset_+row*2,2,(i*6+5)*sizeof(uint32_t),true});
+        plans.push_back({neuron_min_offset_+row*2,2,(i*6+5)*sizeof(uint32_t)+2,true});result.source_bytes_read_+=4;
+    }
+    std::vector<ReadSpan> spans;spans.reserve(plans.size());
+    for(const auto& p:plans)spans.push_back({p.source,reinterpret_cast<std::byte*>(p.anchor ?
+        reinterpret_cast<uint8_t*>(result.descriptors_.data())+p.destination : result.packed_.data()+p.destination),p.size});
+    read_batch_(spans);
+    for(std::size_t i=0;i<count;++i) {
+        const auto anchors=result.descriptors_[i*6+5];
+        if((anchors&0x7c00u)==0x7c00u || ((anchors>>16)&0x7c00u)==0x7c00u)throw std::runtime_error("NINT row anchors must be finite");
+    }
+    const auto offset=batch.packed_.size();
+    if(result.packed_.size()>std::numeric_limits<int>::max()-offset)throw std::overflow_error("NINT selected batch exceeds bounds");
+    batch.packed_.reserve(offset+result.packed_.size());batch.descriptors_.reserve(batch.descriptors_.size()+count*6);
+    batch.packed_.insert(batch.packed_.end(),result.packed_.begin(),result.packed_.end());
+    for(std::size_t i=0;i<count*6;++i)batch.descriptors_.push_back(result.descriptors_[i]+(i%6<3 ? static_cast<uint32_t>(offset) : 0));
+    batch.source_bytes_read_+=result.source_bytes_read_;batch.width_=width_;
+}
+
 void NintRowBatch::validate() const {
     if (rows() == 0 || rows() > std::numeric_limits<int>::max() / 6 ||
         rows() * static_cast<std::uint64_t>(width_) > std::numeric_limits<std::uint32_t>::max()) {
         throw std::runtime_error("invalid NINT row decode batch size");
     }
+}
+void NintRowBatch::copy_row(std::size_t row,NintRowBatch& output) const {
+    if(row>=rows())throw std::out_of_range("NINT row cache index");
+    NintRowBatch result;result.width_=width_;
+    const auto* d=descriptors_.data()+row*6;
+    const int q=d[3]&15,k=(d[3]>>4)&15,group=d[4];const auto groups=(width_+group-1)/group;
+    const std::size_t sizes[]={static_cast<std::size_t>((((d[3]>>8)&7)+uint64_t(groups)*group*q+7)/8),
+        static_cast<std::size_t>((((d[3]>>12)&7)+uint64_t(groups)*k+7)/8),
+        static_cast<std::size_t>((((d[3]>>16)&7)+uint64_t(groups)*k+7)/8)};
+    for(int f=0;f<3;++f) {
+        if(d[f]>packed_.size() || sizes[f]>packed_.size()-d[f])throw std::out_of_range("NINT cached row wire bounds");
+        result.descriptors_.push_back(static_cast<uint32_t>(result.packed_.size()));
+        result.packed_.insert(result.packed_.end(),packed_.begin()+d[f],packed_.begin()+d[f]+sizes[f]);result.packed_.push_back(0);
+    }
+    result.descriptors_.insert(result.descriptors_.end(),d+3,d+6);output.append_batch(result);
 }
 } // namespace mfq

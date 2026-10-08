@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -133,6 +134,7 @@ CudaExecutionConfig load_cuda_execution_config() {
         !environment("MFQ_NVQ_MOE_ROWS_PER_BLOCK") &&
         !environment("MFQ_NVQ_MOE_WARPS") &&
         !environment("MFQ_NVQ_MOE_SHARE_GROUP_STATE");
+    result.moe_nvq_active_decode = environment_flag("MFQ_MOE_NVQ_ACTIVE_DECODE",false);
     result.moe_prefill_mma = enabled_unless_disabled(
         "MFQ_DISABLE_MOE_PREFILL_MMA");
     result.moe_prefill_mma_min_tokens = environment_int(
@@ -146,6 +148,11 @@ CudaExecutionConfig load_cuda_execution_config() {
         "MFQ_DISABLE_MOE_PROJECTION_BUNDLE_PREFETCH");
     result.split_moe_activation_reuse = enabled_unless_disabled(
         "MFQ_DISABLE_SPLIT_MOE_ACTIVATION_REUSE");
+    result.moe_gpu_resident_dispatch = environment_flag(
+        "MFQ_MOE_GPU_RESIDENT_DISPATCH", false);
+    result.moe_ffn_fused_activation = environment_flag(
+        "MFQ_MOE_FFN_FUSED_ACTIVATION", true);
+    result.moe_two_stage_ffn = environment_flag("MFQ_MOE_TWO_STAGE_FFN", false);
     result.moe_swiglu_quant_fusion = enabled_unless_disabled(
         "MFQ_DISABLE_MOE_SWIGLU_QUANT_FUSION");
     result.moe_reduce_gate_fusion = enabled_unless_disabled(
@@ -170,6 +177,7 @@ CudaExecutionConfig load_cuda_execution_config() {
         "MFQ_KV_CACHE_WRITE_ATEN", false);
     result.gdn_transposed_state = environment_flag(
         "MFQ_GDN_TRANSPOSED_STATE", true);
+    result.gdn_fused_output = environment_flag("MFQ_GDN_FUSED_OUTPUT",true);
     result.linear_conv_prefill_fused = environment_flag(
         "MFQ_LINEAR_CONV_PREFILL_FUSED", true);
     result.minicpm_fused_bf16_rope = environment_flag(
@@ -209,6 +217,35 @@ CudaExecutionConfig load_cuda_execution_config() {
     result.moe_ssd_ranges = enabled_unless_disabled(
         "MFQ_DISABLE_MOE_SSD_RANGES");
     result.moe_host_cache_bytes = environment_size("MFQ_MOE_HOST_CACHE_BYTES",0);
+    result.moe_pipeline = environment_flag("MFQ_MOE_PIPELINE",false);
+    result.moe_hybrid_cpu = environment_flag("MFQ_MOE_HYBRID_CPU",false);
+    result.moe_preload_all = environment_flag("MFQ_MOE_PRELOAD_ALL",false);
+    result.moe_assert_resident = environment_flag("MFQ_MOE_ASSERT_RESIDENT",false);
+    result.moe_ram_pcie = environment_flag("MFQ_MOE_RAM_PCIE",false);
+    result.moe_direct_ram = environment_flag("MFQ_MOE_DIRECT_RAM",true);
+    result.moe_residency_adapt = environment_flag("MFQ_MOE_RESIDENCY_ADAPT",true);
+    result.moe_residency_warm = environment_flag("MFQ_MOE_RESIDENCY_WARM",true);
+    result.moe_residency_projection_heat = environment_flag("MFQ_MOE_RESIDENCY_PROJECTION_HEAT",true);
+    result.moe_host_physical_bytes = environment_size("MFQ_MOE_HOST_PHYSICAL_BYTES",0);
+    result.gr_fused_projections = environment_flag("MFQ_GR_FUSED_PROJECTIONS",true);
+    result.gr_fused_projection_activation = environment_flag("MFQ_GR_FUSED_PROJECTION_ACTIVATION",true);
+    result.gr_fused_post_norm = environment_flag("MFQ_GR_FUSED_POST_NORM",true);
+    result.gdn_fused_preparation = environment_flag("MFQ_GDN_FUSED_PREPARATION",true);
+    result.gdn_fused_core = environment_flag("MFQ_GDN_FUSED_CORE",true);
+    result.gr_prepared_dense_projection = environment_flag("MFQ_GR_PREPARED_DENSE_PROJECTION",false);
+    result.gr_native_projection_input = environment_flag("MFQ_GR_NATIVE_PROJECTION_INPUT",true);
+    result.gr_fixed_group_projection = environment_flag("MFQ_GR_FIXED_GROUP_PROJECTION",true);
+    result.gr_compact_mix = environment_flag("MFQ_GR_COMPACT_MIX",true);
+    result.gr_two_stage = environment_flag("MFQ_GR_TWO_STAGE",true);
+    result.gr_two_stage_dense_injection = environment_flag("MFQ_GR_TWO_STAGE_DENSE_INJECTION",true);
+    result.moe_nint_heterogeneous_decode = environment_flag("MFQ_MOE_NINT_HETEROGENEOUS_DECODE",true);
+    if (const auto value = environment("MFQ_MOE_RAM_PCIE_FRACTION")) {
+        std::size_t end = 0;
+        const auto fraction = std::stod(*value,&end);
+        if (end != value->size() || !std::isfinite(fraction) || fraction < 0 || fraction > 1)
+            throw std::invalid_argument("MFQ_MOE_RAM_PCIE_FRACTION must be in [0,1]");
+        result.moe_ram_pcie_fraction = fraction;
+    }
     return result;
 }
 

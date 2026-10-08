@@ -2,6 +2,7 @@
 
 #include "mfq_cuda_moe_ops.h"
 #include "moe_expert_cache_internal.h"
+#include "mfq/moe_dispatch_plan.h"
 
 struct MoeCachedCohort {
     int index = -1;
@@ -19,6 +20,7 @@ struct MoeCachedCohort {
 
 class MoeCachedSource {
 public:
+    bool pipeline_enabled() const { return cache_->config_.moe_pipeline; }
     MoeCachedSource(
             MoeExpertCache * cache,
             int id,
@@ -379,6 +381,7 @@ public:
     }
 
     void begin_prefetch(const MoeRoutePlan & route) {
+        if (cache_->complete_residency()) return;
         if (use_full_projection(route)) return;
         cache_->begin_route_experts(route, cpu_->n_experts);
     }
@@ -391,6 +394,7 @@ public:
             CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route) {
+        if (auto mixed = forward_hybrid_decode(execution, x, route); mixed.defined()) return mixed;
         if (use_full_projection(route)) {
             cache_->count_full_projection_fallback();
             auto staged = stage_fallback_runtime(execution.config);
@@ -415,6 +419,11 @@ public:
             CudaExecutionContext& execution,
             mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route) {
+        if (cache_->complete_residency()) {
+            if (x.scalar_type()!=mfq_tensor_backend::kFloat16)
+                throw std::runtime_error("resident CPU experts require original f16 activations");
+            if (auto mixed=forward_hybrid_decode(execution,x,route); mixed.defined()) return mixed;
+        }
         if (use_full_projection(route)) {
             throw std::runtime_error(
                 "cached prequantized activation reuse only supports decode-sized routes");
@@ -439,6 +448,7 @@ public:
     }
 
     void prefetch(const MoeRoutePlan & route) {
+        if (cache_->complete_residency()) return;
         if (use_full_projection(route)) return;
         (void)cache_->prepare(
             *this, route_experts(route), true);
@@ -449,6 +459,10 @@ public:
             mfq_tensor_backend::Tensor x,
             const MoeRoutePlan & route,
             bool gelu) {
+        if (cache_->complete_residency()) {
+            auto projected=forward(execution,x,route);
+            return gelu ? moe_geglu_split_cuda(projected) : moe_swiglu_split_cuda(projected);
+        }
         if (use_full_projection(route)) {
             cache_->count_full_projection_fallback();
             auto staged = stage_fallback_runtime(execution.config);
@@ -525,6 +539,7 @@ public:
             const MoeRoutePlan & route) {
         if (sources.empty()) return false;
         auto & first = *sources.front();
+        if (first.cache_->complete_residency()) return false;
         if (first.use_full_projection(route)) return false;
         std::vector<MoeCachedSource *> raw_sources;
         raw_sources.reserve(sources.size());
@@ -562,6 +577,8 @@ public:
 
 private:
     friend class MoeExpertCache;
+    friend class MoeFfnPipeline;
+    friend class MoeResidencyManager;
 
     std::shared_ptr<MixedMoeRuntime> fallback_runtime() {
         if (quant_source_) throw std::runtime_error("quantized range cache cannot stage a full projection");
@@ -578,6 +595,123 @@ private:
             const CudaExecutionConfig& config) {
         auto runtime = fallback_runtime();
         return stage_cpu_mixed_moe(runtime, config);
+    }
+
+    mfq_tensor_backend::Tensor forward_hybrid_decode(CudaExecutionContext& execution,
+            const mfq_tensor_backend::Tensor& x, const MoeRoutePlan& route) {
+        namespace tb = mfq_tensor_backend;
+        // This adapter preserves decode's one-token kernel dispatch. Prefill
+        // keeps its grouped GPU execution until a multi-token adapter is ready.
+        if ((!cache_->complete_residency() && (!cache_->config_.moe_hybrid_cpu)) || !quant_source_ ||
+                !quant_source_->host_cache() || !x.is_cuda()) return {};
+        if (route.ids.size(0)!=1) {
+            if (!cache_->complete_residency()) return {};
+            return forward_resident_batch(execution,x,route);
+        }
+        auto host_ids = route.ids.to(tb::kCPU).to(tb::kInt32).contiguous();
+        const auto count = static_cast<std::size_t>(host_ids.numel());
+        std::vector<std::int32_t> ids(host_ids.data_ptr<std::int32_t>(), host_ids.data_ptr<std::int32_t>() + count);
+        auto plan = mfq::plan_moe_dispatch(ids, cpu_->n_experts, count,
+            [&](int e) { return quant_source_->gpu_resident(e); },
+            [&](int e) { return !quant_source_->host_cache()->contains(quant_source_->host_key(e)); });
+        std::unordered_map<int,MoeHostExpertCache::Lease> held;
+        std::vector<std::int32_t> cpu_ids, gpu_ids, gpu_experts;
+        std::vector<std::int64_t> cpu_pos, gpu_pos;
+        for (const auto& group : plan.groups) {
+            if (group.kind == mfq::MoeDispatchKind::Cpu)
+                held.emplace(group.expert, quant_source_->acquire_expert(group.expert));
+            else gpu_experts.push_back(group.expert);
+        }
+        if (held.empty()) return {};
+        for (std::size_t i = 0; i < count; ++i) {
+            const bool cpu = plan.kinds[i] == mfq::MoeDispatchKind::Cpu;
+            (cpu ? cpu_ids : gpu_ids).push_back(ids[i]);
+            (cpu ? cpu_pos : gpu_pos).push_back(static_cast<std::int64_t>(i));
+        }
+        // Retain every CPU weight lease before GPU promotion/eviction. Stage
+        // the small CPU activation before launching GPU work to avoid waiting
+        // on its completion in a later device-to-host copy.
+        auto cpu_index = tb::tensor(cpu_pos);
+        auto host_x = x.to(tb::kCPU).contiguous();
+        auto cpu_x = host_x;
+        if (x.dim() == 3) {
+            cpu_x = tb::empty({1, static_cast<std::int64_t>(cpu_pos.size()), x.size(-1)}, host_x.options());
+            const auto row_bytes = static_cast<std::size_t>(x.size(-1)) * host_x.element_size();
+            for (std::size_t i = 0; i < cpu_pos.size(); ++i)
+                std::memcpy(static_cast<std::byte*>(cpu_x.data_ptr()) + i * row_bytes,
+                    static_cast<const std::byte*>(host_x.data_ptr()) + cpu_pos[i] * row_bytes, row_bytes);
+        }
+        MoeRoutePlan cpu_route;
+        cpu_route.ids = tb::tensor(cpu_ids).reshape({1, static_cast<std::int64_t>(cpu_ids.size())});
+        cpu_route.n_experts = cpu_->n_experts;
+        tb::Tensor gpu_y, gpu_index;
+        if (!gpu_ids.empty()) {
+            if (!cache_->prepare(*this, gpu_experts, false)) return {};
+            gpu_index = tb::tensor(gpu_pos).to(x.device());
+            auto gpu_x = x.dim() == 3 ? x.index_select(1, gpu_index) : x;
+            auto gpu_route = build_moe_route_plan(tb::tensor(gpu_ids).reshape({1,
+                static_cast<std::int64_t>(gpu_ids.size())}).to(x.device()), cpu_->n_experts);
+            gpu_y = active_->forward(execution.config, execution.kl_mmq,
+                execution.force_moe_prefill_mma_off, execution.force_moe_pool_path, gpu_x, gpu_route);
+            cache_->record_compute_use();
+        }
+        auto cpu_y = quant_source_->forward_cpu(execution, cpu_x, cpu_route, &held);
+        auto result = tb::empty({1, static_cast<std::int64_t>(count), cpu_->out_per_expert},
+            x.options().dtype(tb::kFloat16));
+        if (gpu_y.defined()) result.index_copy_(1, gpu_index, gpu_y);
+        result.index_copy_(1, cpu_index.to(x.device()), cpu_y.to(x.device()));
+        cache_->record_hybrid(static_cast<int>(held.size()), static_cast<int>(gpu_experts.size()));
+        return result;
+    }
+
+    mfq_tensor_backend::Tensor forward_resident_batch(CudaExecutionContext& execution,
+            const mfq_tensor_backend::Tensor& x,const MoeRoutePlan& route) {
+        namespace tb=mfq_tensor_backend;
+        const auto tokens=route.ids.size(0),routes=route.ids.size(1);
+        if ((x.dim()!=2 && x.dim()!=3) || x.size(0)!=tokens || x.size(-1)!=cpu_->neuron_len ||
+            (x.dim()==3 && x.size(1)!=routes)) throw std::runtime_error("resident batch input shape mismatch");
+        auto ids=route.ids.to(tb::kCPU).to(tb::kInt32).contiguous();
+        std::vector<std::int32_t> cpu_ids,gpu_ids,gpu_experts;
+        std::vector<std::int64_t> cpu_positions,gpu_positions,gpu_input_positions;
+        std::unordered_map<int,MoeHostExpertCache::Lease> held;
+        for (std::int64_t position=0; position<ids.numel(); ++position) {
+            const int expert=ids.data_ptr<std::int32_t>()[position];
+            if (quant_source_->gpu_resident(expert)) {
+                gpu_ids.push_back(expert); gpu_positions.push_back(position);
+                gpu_input_positions.push_back(x.dim()==2 ? position/routes : position);
+                if (std::find(gpu_experts.begin(),gpu_experts.end(),expert)==gpu_experts.end()) gpu_experts.push_back(expert);
+            } else {
+                cpu_ids.push_back(expert); cpu_positions.push_back(position);
+                if (!held.contains(expert)) held.emplace(expert,quant_source_->acquire_expert(expert));
+            }
+        }
+        if (held.empty()) return {}; // The original grouped GPU path remains exact.
+        auto host_x=x.to(tb::kCPU).contiguous();
+        auto cpu_x=tb::empty({static_cast<std::int64_t>(cpu_ids.size()),cpu_->neuron_len},host_x.options());
+        const auto row_bytes=std::size_t(cpu_->neuron_len)*host_x.element_size();
+        for (std::size_t row=0; row<cpu_positions.size(); ++row) {
+            const auto from=x.dim()==2 ? cpu_positions[row]/routes : cpu_positions[row];
+            std::memcpy(static_cast<std::byte*>(cpu_x.data_ptr())+row*row_bytes,
+                static_cast<const std::byte*>(host_x.data_ptr())+from*row_bytes,row_bytes);
+        }
+        tb::Tensor gpu_y;
+        if (!gpu_ids.empty()) {
+            if (!cache_->prepare(*this,gpu_experts,false)) throw std::logic_error("resident GPU subset does not fit its arena");
+            auto gpu_x=x.reshape({-1,cpu_->neuron_len}).index_select(0,tb::tensor(gpu_input_positions).to(x.device()));
+            auto gpu_route=build_moe_route_plan(tb::tensor(gpu_ids).reshape({static_cast<std::int64_t>(gpu_ids.size()),1}).to(x.device()),cpu_->n_experts);
+            gpu_y=active_->forward(execution.config,execution.kl_mmq,execution.force_moe_prefill_mma_off,
+                execution.force_moe_pool_path,gpu_x,gpu_route);
+            cache_->record_compute_use();
+        }
+        MoeRoutePlan cpu_route;
+        cpu_route.ids=tb::tensor(cpu_ids).reshape({static_cast<std::int64_t>(cpu_ids.size()),1});
+        cpu_route.n_experts=cpu_->n_experts;
+        auto cpu_y=quant_source_->forward_cpu(execution,cpu_x,cpu_route,&held);
+        auto result=tb::empty({tokens*routes,cpu_->out_per_expert},x.options().dtype(tb::kFloat16));
+        if (gpu_y.defined()) result.index_copy_(0,tb::tensor(gpu_positions).to(x.device()),gpu_y.reshape({-1,cpu_->out_per_expert}));
+        result.index_copy_(0,tb::tensor(cpu_positions).to(x.device()),cpu_y.reshape({-1,cpu_->out_per_expert}));
+        cache_->record_hybrid(static_cast<int>(held.size()),static_cast<int>(gpu_experts.size()));
+        return result.reshape({tokens,routes,cpu_->out_per_expert});
     }
 
     MoeExpertCache * cache_ = nullptr;

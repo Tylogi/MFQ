@@ -23,6 +23,7 @@ mfq_tensor_backend::Tensor qwen_rms_norm_bf16(
 struct Block {
     struct Context {
         mfq_tensor_backend::Tensor token_ids;
+        mfq_tensor_backend::Tensor host_token_ids;
         mfq_tensor_backend::Tensor positions;
         mfq_tensor_backend::Tensor full_positions;
         int64_t cache_position = 0;
@@ -40,6 +41,7 @@ struct Block {
     virtual ~Block() = default;
     virtual void reset(int64_t batch) = 0;
     virtual void set_token_ids(const mfq_tensor_backend::Tensor&) {}
+    virtual void prefetch_token_ids(const mfq_tensor_backend::Tensor&) {}
     virtual bool supports_speculation() const noexcept { return false; }
     virtual std::vector<mfq_tensor_backend::Tensor*> graph_warmup_state() { return {}; }
     virtual void begin_speculative(int64_t) {}

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -19,6 +20,13 @@
 #endif
 
 namespace {
+void set_single_rows(bool enabled) {
+#ifdef _WIN32
+    _putenv_s("MFQ_CPU_NVQ_SINGLE_ROW",enabled ? "1" : "0");
+#else
+    setenv("MFQ_CPU_NVQ_SINGLE_ROW",enabled ? "1" : "0",1);
+#endif
+}
 // Every compressed buffer and activation ends immediately before a guard
 // page, including partial final code words and 1..7 activation tails.
 class Guarded {
@@ -112,7 +120,7 @@ void check(int format,int width,int batch,int sign_mode) {
         view.banks[state]=format==7 ? tables[0].data()+state*32 : tables[state].data();
     Guarded state_guard(packed_states.size());
     std::memcpy(state_guard.data,packed_states.data(),packed_states.size());
-    const float anchors[rows]={1,1,1};
+    const float anchors[rows]={.091738f,.028931f,-.007231f};
     view.states=state_guard.data; view.state_bytes=static_cast<std::int64_t>(packed_states.size());
     view.anchors=anchors; view.width=width; view.state_bits=3;
     for (int state=0; state<states; ++state) view.multipliers[state]=(state+1)/64.0f;
@@ -123,16 +131,33 @@ void check(int format,int width,int batch,int sign_mode) {
         for (int column=0; column<width; ++column)
             x[sample*stride+column]=float(int(random()%65)-32)/16;
     std::vector<float> matrix_output(batch*(rows+2),-13);
+    set_single_rows(false);
     const auto matrix=mfq::cpu::nvq_rows_dot_kernel(format);
     if (!matrix) throw std::runtime_error("missing supported NVQ matrix kernel");
     matrix(view,x,batch,stride,matrix_output.data(),rows+2,0,rows);
+    set_single_rows(true);
+    const auto single=mfq::cpu::nvq_rows_dot_kernel(format);
+    if(!single || (format==7 ? single!=matrix : single==matrix))
+        throw std::runtime_error("single-row NVQ test selected the wrong implementation or fallback");
+    std::vector<float> actual_single(batch*(rows+2),-13);
+    single(view,x,batch,stride,actual_single.data(),rows+2,0,rows);
+    if(std::memcmp(actual_single.data(),matrix_output.data(),matrix_output.size()*sizeof(float)))
+        throw std::runtime_error("single-row NVQ changed original FP32 output bits,format="+std::to_string(format)+" width="+std::to_string(width));
+    std::fill(actual_single.begin(),actual_single.end(),-13);
+    single(view,x,batch,stride,actual_single.data(),rows+2,1,2);
+    for(int sample=0;sample<batch;++sample)for(int row=0;row<rows+2;++row) {
+        const float expected=row==1 ? matrix_output[sample*(rows+2)+row] : -13;
+        if(std::memcmp(&actual_single[sample*(rows+2)+row],&expected,sizeof(float)))
+            throw std::runtime_error("single-row NVQ changed selected row range or output padding");
+    }
+    set_single_rows(false);
     for (int row=0; row<rows; ++row) {
         std::vector<float> actual(batch+2,13.0f);
         std::vector<double> reference(batch,13.0),magnitude(batch);
         for (int group=0; group<groups; ++group) {
             const auto state=selectors[row*groups+group];
             const int start=group*24, valid=std::min(24,width-start);
-            const float scale=(state+1)/64.0f;
+            const float scale=anchors[row]*((state+1)/64.0f);
             kernel(view,row,group,state,x+start,batch,stride,valid,scale,actual.data());
             // Oracle uses the original integer codes and signs supplied to
             // the encoder, with FP64 sums. It never reads packed storage.
@@ -189,11 +214,11 @@ int main() try {
     }
     int cases=0;
     for (int format: {1,2,3,5,7,8,9,10,11,12,13,14,15})
-        for (int width: {1,7,8,9,17,23,24,25,31,49})
+        for (int width: {1,7,8,9,17,23,24,25,31,49,640,641,2560,2561})
             for (int batch: {1,7})
                 for (int sign_mode: {0,1}) { check(format,width,batch,sign_mode); ++cases; }
     if (mfq::cpu::nvq_group_dot_kernel(4)) throw std::runtime_error("unsupported kernel format accepted");
-    std::cout << "NVQ guarded FP64 group cases passed=" << cases << '\n';
+    std::cout << "NVQ guarded FP64 group cases passed=" << cases << " single-row original FP32 bits/ranges/fallback exact=" << cases << '\n';
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

@@ -19,7 +19,7 @@ std::shared_ptr<mfq::NintRows> load_nint_row_table(
     return std::make_shared<mfq::NintRows>(static_cast<std::size_t>(metadata.nbytes),
         [read = std::move(read)](std::size_t offset, std::uint8_t* out, std::size_t count) {
             read(offset, reinterpret_cast<std::byte*>(out), count);
-        });
+        }, source.supports_parallel_tensor_reads(),source.tensor_batch_reader(name));
 }
 
 MfeWeight load_mfe_gpu(
@@ -142,27 +142,122 @@ std::shared_ptr<MixedMoeRuntime> load_mfe_cpu_offloaded(
 
 namespace mfq::cuda::weight_loader {
 namespace tb = mfq_tensor_backend;
+namespace {
+struct LoadedLinear {
+    std::shared_ptr<QuantLinear> weight;
+    Tensor operator()(CudaExecutionContext& execution,const Tensor& x)const{return weight->forward(execution,x);}
+};
+}
 
 Linear linear(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name) {
     auto weight=std::make_shared<QuantLinear>(load_quant_linear(execution, file,name));
-    return [weight](CudaExecutionContext& execution, const Tensor& x) {
-        return weight->forward(execution, x);
+    return LoadedLinear{std::move(weight)};
+}
+std::shared_ptr<const QuantLinear> linear_weight(const Linear& function) {
+    const auto* loaded=function.target<LoadedLinear>();return loaded?loaded->weight:nullptr;
+}
+
+LinearGroup grouped_linear(CudaExecutionContext& execution, std::vector<Linear>& functions) {
+    if (functions.empty() || execution.loading_cpu_layer || !execution.config.diagnostic_nint_group) return {};
+    std::vector<QuantLinear> weights;
+    weights.reserve(functions.size());
+    for (const auto& function : functions) {
+        const auto weight = linear_weight(function);
+        if (!weight || !weight->is_nint() || weight->tensor_parallel() || !weight->nint.q_packed.is_cuda()) return {};
+        if (!weights.empty() && weight->neuron_len() != weights.front().neuron_len()) return {};
+        weights.push_back(*weight);
+    }
+    auto group = std::make_shared<QuantLinearGroup>(make_quant_group(execution, weights));
+    if (!group->nint_grouped) return {};
+    std::vector<Linear> separate;
+    separate.reserve(weights.size());
+    size_t matrix_index = 0;
+    int64_t row = 0, packed_bytes = 0;
+    for (const auto& original : weights) {
+        const auto& matrix = group->nint.split_w.empty() ? group->nint.w : group->nint.split_w.at(matrix_index);
+        MFQ_RUNTIME_CHECK(row + original.out() <= matrix.out && original.nint.ng == matrix.ng &&
+            original.nint.gs == matrix.gs && original.nint.q8_zero == matrix.q8_zero,
+            "grouped projection storage geometry mismatch");
+        auto weight = std::make_shared<QuantLinear>(original);
+        auto& view = weight->nint;
+        view.workspaces.clear();
+        view.q_packed = matrix.q_packed;
+        if (view.q8_zero) {
+            view.q_packed = matrix.q_packed.narrow(0, row, view.out);
+            view.q8_zero_scale = matrix.q8_zero_scale.narrow(0, row, view.out);
+        }
+        else {
+            view.row_q_bits = matrix.row_q_bits.narrow(0, row, view.out);
+            view.row_q_bit_offsets = matrix.row_q_bit_offsets.narrow(0, row, view.out);
+            view.sub_scale = matrix.sub_scale.narrow(0, row, view.out);
+            view.sub_min = matrix.sub_min.narrow(0, row, view.out);
+            view.neuron_scale = matrix.neuron_scale.narrow(0, row, view.out);
+            view.neuron_min = matrix.neuron_min.narrow(0, row, view.out);
+            view.aligned_q8 = original.nint.aligned_q8 && (packed_bytes % 4 == 0);
+        }
+        separate.emplace_back(LoadedLinear{std::move(weight)});
+        row += original.out();
+        packed_bytes += original.nint.q_packed.numel();
+        if (row == matrix.out) {++matrix_index;row = 0;packed_bytes = 0;}
+    }
+    MFQ_RUNTIME_CHECK(row == 0 && matrix_index == (group->nint.split_w.empty() ? 1 : group->nint.split_w.size()),
+        "grouped projection storage is not fully covered");
+    functions = separate;
+    return [group=std::move(group), separate=std::move(separate)](CudaExecutionContext& context, const Tensor& input) {
+        if (input.is_cuda() && context.kl_mmq.mode == KlMmqMode::Default &&
+            input.numel() / input.size(-1) <= 8) return group->forward(context, input);
+        std::vector<Tensor> outputs;
+        outputs.reserve(separate.size());
+        for (const auto& projection : separate) outputs.push_back(projection(context, input));
+        return outputs;
     };
 }
 
-Linear residual_linear(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name) {
+ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name) {
     auto weight = std::make_shared<QuantLinear>(load_quant_linear(execution, file, name));
     MFQ_RUNTIME_CHECK(weight->is_dense() || weight->is_nint(),
         "floating residual projection requires dense or NINT weights: ", name);
-    return [weight](CudaExecutionContext& execution, const Tensor& input) {
-        if (weight->is_dense())
-            return mfq_selected_attention::promoted_matmul(input, weight->dense.transpose(-1, -2));
+    if(weight->is_dense()) {
+        auto right=weight->dense.transpose(-1,-2);
+        auto promoted=execution.config.gr_prepared_dense_projection?right.to(tb::kFloat32):Tensor{};
+        const bool prepare_injection=execution.config.gr_two_stage_dense_injection &&
+            weight->dense.scalar_type()==tb::kBFloat16 && weight->dense.is_contiguous() &&
+            weight->dense.dim()==2 && weight->dense.size(0)>0 && weight->dense.size(0)<=4;
+        auto prepared_right=prepare_injection?(promoted.defined()?promoted:right.to(tb::kFloat32)):Tensor{};
+        Linear forward=[right=std::move(right),promoted=std::move(promoted)](
+                CudaExecutionContext& execution,const Tensor& input) {
+            const auto dtype=input.scalar_type()==right.scalar_type()?input.scalar_type():tb::kFloat32;
+            if(execution.config.gr_prepared_dense_projection && promoted.defined() && dtype==tb::kFloat32)
+                return tb::matmul(input.to(tb::kFloat32),promoted);
+            return mfq_selected_attention::promoted_matmul(input,right);
+        };
+        return {std::move(forward),{}, {},std::move(weight),std::move(prepared_right)};
+    }
+    Linear forward=[weight](CudaExecutionContext& execution, const Tensor& input) {
         auto output = execution.profiler.measure("nint.float_projection", [&] {
-            return nint_float_projection_cuda(weight->nint, input);
+            return nint_float_projection_cuda(weight->nint, input,true,execution.config.gr_native_projection_input,
+                execution.config.gr_fixed_group_projection);
         });
         // Match Metal's promotion of NINT's logical F16 weight dtype.
         return input.scalar_type() == tb::kFloat16 ? output.to(tb::kFloat16) : output;
     };
+    GatedResidualMixProjection mixed;
+    if(weight->is_nint())mixed=[weight](CudaExecutionContext& execution,const Tensor& input,
+        const Tensor& normalized,int64_t streams) {
+        return execution.profiler.measure("nint.float_projection_mix",[&] {
+            return nint_float_projection_mix_cuda(weight->nint,input,normalized,streams,execution.config.gr_native_projection_input,
+                execution.config.gr_fixed_group_projection,execution.config.gr_compact_mix);
+        });
+    };
+    GatedResidualActivationProjection activated;
+    if(weight->is_nint())activated=[weight](CudaExecutionContext& execution,const Tensor& input,
+        int64_t streams,bool injection) {
+        return execution.profiler.measure("nint.float_projection_activation",[&] {
+            return nint_float_projection_activation_cuda(weight->nint,input,streams,injection,true,
+                execution.config.gr_native_projection_input,execution.config.gr_fixed_group_projection);
+        });
+    };
+    return {std::move(forward),std::move(mixed),std::move(activated),std::move(weight)};
 }
 
 Tensor dense(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& name) {
@@ -192,10 +287,12 @@ Routed routed(CudaExecutionContext& execution, const mfq::ModelSource& file, con
     auto w=std::make_shared<MfeWeight>(load_mfe_gpu(execution, file,name,true,layer,role));
     MFQ_RUNTIME_CHECK(w->n_experts==experts && w->out_per_expert==output && w->neuron_len==input,
         "routed tensor shape mismatch: ",name);
-    return [w,experts](CudaExecutionContext& execution, const Tensor& x,const Tensor& ids) {
+    Routed result=[w,experts](CudaExecutionContext& execution, const Tensor& x,const Tensor& ids) {
         auto route=build_moe_route_plan(ids.to(tb::kInt32).contiguous(),int(experts));
         return w->forward(execution,x.contiguous(),route);
     };
+    result.projections.push_back(w);
+    return result;
 }
 
 Routed routed_gate_up(CudaExecutionContext& execution, const mfq::ModelSource& file, const std::string& mlp_prefix,
@@ -207,9 +304,13 @@ Routed routed_gate_up(CudaExecutionContext& execution, const mfq::ModelSource& f
     if (!has_gate) return routed(execution,file,base+".gate_up.weight",layer,experts,2*width,input,role);
     auto gate=routed(execution,file,gate_name,layer,experts,width,input,role);
     auto up=routed(execution,file,up_name,layer,experts,width,input,role);
-    return [gate=std::move(gate),up=std::move(up)](CudaExecutionContext& execution, const Tensor& x,const Tensor& ids) {
+    auto projections=gate.projections;
+    projections.insert(projections.end(),up.projections.begin(),up.projections.end());
+    Routed result=[gate=std::move(gate),up=std::move(up)](CudaExecutionContext& execution, const Tensor& x,const Tensor& ids) {
         return tb::cat({gate(execution,x,ids),up(execution,x,ids)},-1);
     };
+    result.projections=std::move(projections);
+    return result;
 }
 
 void validate_load_options(

@@ -23,6 +23,19 @@ bool moe_expert_cache_finalized(
     const std::shared_ptr<MoeExpertCache>& cache);
 void finalize_moe_expert_cache(
     const std::shared_ptr<MoeExpertCache>& cache);
+double moe_expert_cache_ram_pcie_fraction(const std::shared_ptr<MoeExpertCache>& cache);
+// Finish the adaptive transaction before a session reset or a prefill loan.
+void finish_moe_expert_exchanges(const std::shared_ptr<MoeExpertCache>& cache);
+// Idle diagnostic passes retain primary weights, clear transfer-cache entries,
+// and replay the CPU assignments captured by the first pass.
+void prepare_moe_pipeline_comparison(const std::shared_ptr<MoeExpertCache>& cache, bool replay);
+// The CPU policy pass uses natural routing and measured dispatch. Baseline
+// passes retain their exact CPU assignments; report any policy route changes.
+void prepare_moe_cpu_budget_comparison(const std::shared_ptr<MoeExpertCache>& cache,
+    bool replay,bool transfer_budget);
+// Compare synchronous/background calibration with fresh cost samples each pass.
+void prepare_moe_cpu_calibration_comparison(const std::shared_ptr<MoeExpertCache>& cache,bool replay);
+std::size_t finish_moe_pipeline_comparison(const std::shared_ptr<MoeExpertCache>& cache);
 void print_moe_expert_cache_stats(
     const std::shared_ptr<MoeExpertCache>& cache,
     std::ostream& output);

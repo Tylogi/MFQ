@@ -188,6 +188,28 @@ int main() {
         require(range_rejected, "retained reader accepted out-of-range bytes");
         retained = {}; // Close the independently owned file before cleanup.
 
+        {
+            mfq::MfqModelSource direct(legacy_gguf_path,mfq::FileReadMode::Direct);
+            require(direct.supports_parallel_tensor_reads(), "direct source refused independent reads");
+            mfq::MfqModelSource buffered(legacy_gguf_path,mfq::FileReadMode::Buffered);
+            require(!buffered.supports_parallel_tensor_reads(), "seek-based source advertised parallel reads");
+            require_bytes(direct.read("model.token_embedding.weight"));
+            require(direct.model_config_json()==legacy_gguf_source.model_config_json(),"direct assets differ");
+            const auto stats=direct.file_read_stats();
+            require(stats.mode==mfq::FileReadMode::Direct && stats.files==1 && stats.calls>0 &&
+                    stats.staging_bytes==0 && stats.errors==0,"direct model source accounting differs");
+            auto direct_retained=[&] {
+                mfq::MfqModelSource temporary(legacy_gguf_path,mfq::FileReadMode::Direct);
+                return temporary.tensor_reader("model.token_embedding.weight");
+            }();
+            direct_retained(0,retained_bytes.data(),retained_bytes.size());
+            require_bytes(retained_bytes);
+            range_rejected=false;
+            try { direct_retained(13,retained_bytes.data(),2); }
+            catch (const std::out_of_range&) { range_rejected=true; }
+            require(range_rejected,"direct retained reader accepted out-of-range bytes");
+        }
+
         require(mfq_source.tensors().size() == 1,
                 "MFQ assets leaked into tensor enumeration");
         require(

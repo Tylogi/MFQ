@@ -3,6 +3,9 @@
 #include "mfq_tensor_backend.h"
 
 #include <cstdint>
+#include <mutex>
+#include <optional>
+#include <unordered_map>
 #include <vector>
 
 struct CudaExecutionConfig;
@@ -49,14 +52,38 @@ namespace mfq::cuda {
 class RotaryEmbedding {
 public:
     RotaryEmbedding(int64_t dimension, int64_t maximum, double base,
-                    std::vector<int64_t> sections = {}, bool interleaved = false);
+                    std::vector<int64_t> sections = {}, bool interleaved = false,
+                    std::optional<bool> fused = std::nullopt);
     mfq_tensor_backend::Tensor forward(const mfq_tensor_backend::Tensor& value,
                                        const mfq_tensor_backend::Tensor& positions) const;
+    // Switch only after execution and captured graphs using this module finish.
+    void set_fused(bool enabled) { fused_ = enabled; }
+    bool fused() const { return fused_; }
+    mfq_tensor_backend::Tensor forward_normalized(
+        const mfq_tensor_backend::Tensor& value, const mfq_tensor_backend::Tensor& weight,
+        const mfq_tensor_backend::Tensor& positions, double eps,
+        const mfq_tensor_backend::Tensor& key_cache = {},
+        const mfq_tensor_backend::Tensor& cache_positions = {},
+        const mfq_tensor_backend::Tensor& projected_value = {},
+        const mfq_tensor_backend::Tensor& value_cache = {}) const;
+    std::vector<mfq_tensor_backend::Tensor> forward_normalized_grouped(
+        const std::vector<mfq_tensor_backend::Tensor>& values,
+        const std::vector<mfq_tensor_backend::Tensor>& weights,
+        const mfq_tensor_backend::Tensor& positions,double eps,int cache_entry=1,
+        const mfq_tensor_backend::Tensor& key_cache={},
+        const mfq_tensor_backend::Tensor& cache_positions={},
+        const mfq_tensor_backend::Tensor& projected_value={},
+        const mfq_tensor_backend::Tensor& value_cache={}) const;
 private:
     int64_t dimension_, maximum_;
     double base_;
     std::vector<int64_t> sections_;
     bool interleaved_;
+    bool fused_;
+    struct Prepared { mfq_tensor_backend::Tensor frequencies, axes; };
+    Prepared prepare_parameters(const mfq_tensor_backend::Tensor& value) const;
+    mutable std::mutex prepared_mutex_;
+    mutable std::unordered_map<int,Prepared> prepared_;
 };
 
 } // namespace mfq::cuda

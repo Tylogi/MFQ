@@ -4,6 +4,7 @@
 #include "mfq/nvq_rows.h"
 
 #include <memory>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -34,6 +35,10 @@ public:
     const std::string& expert_dtype(int expert) const;
     std::size_t expert_payload_nbytes(int expert) const;
     MfeQuantExpert read_expert(int expert) const;
+    // Startup-only sequential pool read; the temporary canonical pool is
+    // released before advancing to the next pool. Visitors own each leaf.
+    void visit_pool_experts(std::size_t pool,
+        const std::function<void(int, MfeQuantExpert)>& visitor) const;
     std::size_t payload_nbytes() const noexcept { return bytes_; }
 private:
     struct Pool {
@@ -41,6 +46,7 @@ private:
         std::vector<std::int32_t> ids;
         std::shared_ptr<mfq::NintRows> nint;
         std::shared_ptr<mfq::NvqRows> nvq;
+        std::size_t offset=0, bytes=0;
     };
     struct Expert { int pool=-1,local=-1; };
     Read read_;

@@ -1,4 +1,6 @@
 #include "moe_cached_source_internal.h"
+#include <map>
+#include <cmath>
 
 std::shared_ptr<MoeCachedSource> MoeExpertCache::register_source(
         const std::string & name,
@@ -49,6 +51,28 @@ void MoeExpertCache::finalize() {
     if (sources_.empty()) {
         throw std::runtime_error(
             "MoE cache has no registered expert sources");
+    }
+    const auto cuda_context=mfq::cuda::default_context();
+    if(cuda_context->memory_stats().limit)cuda_context->stream().synchronize();
+    const auto memory=cuda_context->memory_stats();
+    if(memory.limit) {
+        std::size_t reserve=std::size_t(4)*1024*1024*1024;
+        if(const auto* value=std::getenv("MFQ_CUDA_WORKSPACE_RESERVE_GIB")) {
+            char* end=nullptr;const double gib=std::strtod(value,&end);
+            const long double bytes=static_cast<long double>(gib)*1024*1024*1024;
+            if(end==value || *end || !std::isfinite(gib) || gib<0 || bytes>std::numeric_limits<std::size_t>::max())
+                throw std::runtime_error("MFQ_CUDA_WORKSPACE_RESERVE_GIB must be finite and non-negative");
+            reserve=static_cast<std::size_t>(bytes);
+        }
+        const auto model_bytes=std::max(memory.allocated,cuda_context->local_memory_usage());
+        if(model_bytes>=memory.limit || reserve>=memory.limit-model_bytes)
+            throw std::runtime_error("CUDA VRAM limit leaves no room for expert arenas");
+        const auto available=memory.limit-model_bytes-reserve;
+        const auto requested=budget_bytes_;
+        budget_bytes_=static_cast<int64_t>(std::min<std::size_t>(static_cast<std::size_t>(budget_bytes_),available));
+        std::cerr<<"moe_cache_vram_limit limit_bytes="<<memory.limit<<" model_bytes="<<model_bytes
+            <<" workspace_reserve_bytes="<<reserve<<" requested_expert_bytes="<<requested
+            <<" expert_budget_bytes="<<budget_bytes_<<std::endl;
     }
     std::vector<mfq::MoeArenaDemand> demands;
     demands.reserve(arenas_.size());
@@ -302,7 +326,190 @@ void MoeExpertCache::finalize() {
         << " mapped_registered_bytes=" << mapped_registered_bytes_
         << " mapped_copy_blocks=" << mapped_copy_blocks_
         << std::endl;
+    calibrate_pipeline_pcie();
     if (profile_.has_value()) prewarm();
+    if (config_.moe_preload_all) preload_complete_residency();
+}
+
+void MoeExpertCache::preload_complete_residency() {
+    if (!finalized_) throw std::logic_error("expert residency requires finalized GPU arenas");
+    const auto started=std::chrono::steady_clock::now();
+    std::uint64_t total_bytes=0,total_experts=0;
+    for (const auto& source:sources_) {
+        if (!source->quant_source_) throw std::runtime_error("complete preload requires canonical quantized expert sources");
+        for (int expert=0; expert<source->n_experts(); ++expert) {
+            total_bytes+=source->quant_source_->expert_field_bytes(expert);
+            ++total_experts;
+        }
+    }
+    const auto cold_bytes=total_bytes-std::min<std::uint64_t>(total_bytes,allocated_bytes_);
+    const auto host_budget=host_experts_->stats().budget_bytes;
+    std::cerr << "moe_residency_plan experts=" << total_experts << " runtime_bytes=" << total_bytes
+        << " gpu_bytes=" << allocated_bytes_ << " cold_bytes=" << cold_bytes
+        << " host_field_budget_bytes=" << host_budget << std::endl;
+    if (cold_bytes>host_budget) throw std::runtime_error("complete expert residency exceeds RAM field budget");
+    // Fill shared GPU arenas fairly across sources, preserving profile-hot
+    // slots. No initial placement may replace an already valid GPU expert.
+    std::unordered_map<MoeGpuArena*,int> remaining;
+    for (const auto& item:arenas_) remaining[item.second.get()]=item.second->slots-item.second->book->size();
+    std::vector<std::vector<bool>> warm(sources_.size());
+    int maximum=0;
+    for (const auto& source:sources_) {
+        warm[source->id_].resize(source->n_experts());
+        maximum=std::max(maximum,source->n_experts());
+    }
+    for (int expert=0; expert<maximum; ++expert) for (const auto& source:sources_) {
+        if (expert>=source->n_experts() || source->quant_source_->gpu_resident(expert)) continue;
+        auto* arena=source->cohorts_[source->expert_to_cohort_[expert]].arena;
+        if (remaining[arena]>0) { warm[source->id_][expert]=true; --remaining[arena]; }
+    }
+    for (const auto& item:remaining) if (item.second) throw std::logic_error("expert residency left allocatable GPU slots unfilled");
+    std::vector<std::vector<int64_t>> ram_offsets(sources_.size());
+    std::map<int,std::vector<MoeCachedSource*>> layer_sources;
+    for(const auto& source:sources_) {
+        ram_offsets[source->id_].assign(source->n_experts(),-1);
+        layer_sources[source->layer_id_].push_back(source.get());
+    }
+    int64_t ram_allocated=0;
+    // Keep each expert's missing projection fields together. CUDA can transfer
+    // an immutable RAM interval without first copying it to another host arena.
+    for(const auto& layer:layer_sources) {
+        int count=0;for(const auto* source:layer.second)count=std::max(count,source->n_experts());
+        for(int expert=0;expert<count;++expert)for(const auto* source:layer.second) {
+            if(expert>=source->n_experts())continue;
+            if(source->quant_source_->gpu_resident(expert) || warm[source->id_][expert])continue;
+            const auto& cohort=source->cohorts_[source->expert_to_cohort_[expert]];
+            ram_allocated=(ram_allocated+15)&~int64_t(15);ram_offsets[source->id_][expert]=ram_allocated;
+            for(const auto count:cohort.bytes_per_expert) {
+                ram_allocated=(ram_allocated+15)&~int64_t(15);
+                if(count>std::numeric_limits<int64_t>::max()-ram_allocated)throw std::overflow_error("RAM complement size overflow");
+                ram_allocated+=count;
+            }
+        }
+    }
+    pipeline_ram_complement_=std::make_shared<mfq_tensor_backend::Tensor>(mfq_tensor_backend::empty(
+        {ram_allocated},mfq_tensor_backend::TensorOptions().device(mfq_tensor_backend::kCPU).dtype(mfq_tensor_backend::kUInt8)));
+    host_experts_->preserve_resident_experts();
+    measuring_preload_h2d_=true;
+    std::uint64_t completed=0;
+    for (const auto& source:sources_) {
+        auto& quant=*source->quant_source_;
+        for (std::size_t pool=0; pool<quant.store().pool_count(); ++pool) {
+            std::vector<std::int32_t> upload;
+            quant.store().visit_pool_experts(pool,[&](int expert,mfq::MfeQuantExpert encoded) {
+                if (quant.gpu_resident(expert)) { ++completed; return; }
+                const auto key=quant.host_key(expert);
+                auto held=host_experts_->acquire(key,quant.expert_field_bytes(expert),[&] {
+                    auto decoded=quant.decode_expert(expert,encoded);
+                    auto offset=ram_offsets[source->id_][expert];
+                    if(offset<0)return decoded;
+                    auto fields=moe_cache_fields(decoded);
+                    for(auto& field:fields) {
+                        offset=(offset+15)&~int64_t(15);
+                        auto view=moe_owned_host_view(pipeline_ram_complement_,static_cast<std::size_t>(offset),field);
+                        const auto count=tensor_nbytes(field);
+                        std::memcpy(view.data_ptr(),field.data_ptr(),static_cast<std::size_t>(count));
+                        offset+=count;field=std::move(view);
+                    }
+                    return moe_replace_quant_fields(std::move(decoded),fields);
+                });
+                if (!host_experts_->contains(key))
+                    throw std::runtime_error("preloaded expert was not retained in RAM");
+                if (warm[source->id_][expert]) upload.push_back(expert);
+                ++completed;
+            });
+            if (!upload.empty() && !prepare(*source,upload,true))
+                throw std::logic_error("expert preload GPU placement exceeded arena capacity");
+        }
+        const auto seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count();
+        std::cerr << "moe_residency_progress experts=" << completed << '/' << total_experts
+            << " host_bytes=" << host_experts_->stats().resident_bytes
+            << " elapsed_s=" << seconds << " experts_s=" << completed/seconds << std::endl;
+    }
+    if (transfer_ready_recorded_) MFQ_CUDA_CHECK(cudaEventSynchronize(transfer_ready_));
+    std::uint64_t gpu_experts=0,ram_experts=0;
+    for (const auto& source:sources_) {
+        auto& quant=*source->quant_source_;
+        for (int expert=0; expert<source->n_experts(); ++expert) {
+            if (quant.gpu_resident(expert)) ++gpu_experts;
+            else if (host_experts_->contains(quant.host_key(expert))) ++ram_experts;
+            else throw std::logic_error("expert has no RAM or VRAM copy after preload");
+        }
+        quant.mark_preload_complete(config_.moe_assert_resident);
+        initialize_mixed_nvq_dispatch(*source->active_,config_);
+    }
+    measuring_preload_h2d_=false;
+    std::int64_t h2d_bytes=0;
+    double h2d_ms=0;
+    for (const auto& timing:preload_h2d_timings_) {
+        float milliseconds=0;
+        MFQ_CUDA_CHECK(cudaEventElapsedTime(&milliseconds,timing->begin,timing->end));
+        h2d_bytes+=timing->bytes; h2d_ms+=milliseconds;
+    }
+    preload_h2d_timings_.clear();
+    if(config_.moe_pipeline && config_.moe_direct_ram && ram_allocated) {
+        registered_host_fields_.reserve(registered_host_fields_.size()+1);
+        auto* address=pipeline_ram_complement_->data_ptr();
+        MFQ_CUDA_CHECK(cudaHostRegister(address,static_cast<std::size_t>(ram_allocated),cudaHostRegisterMapped));
+        registered_host_fields_.push_back({address,ram_allocated,true});
+        pipeline_ram_registered_bytes_=ram_allocated;
+    }
+    std::cerr << "moe_residency_h2d bytes=" << h2d_bytes << " cuda_ms=" << h2d_ms << std::endl;
+    const auto host=host_experts_->stats();
+    complete_residency_=true;
+    std::cerr << "moe_residency_ready experts=" << total_experts << " gpu_experts=" << gpu_experts
+        << " ram_experts=" << ram_experts << " ram_bytes=" << host.resident_bytes
+        << " ram_arena_bytes=" << ram_allocated
+        << " ram_registered_bytes=" << pipeline_ram_registered_bytes_
+        << " disk_reads_sealed=" << sources_.front()->quant_source_->expert_disk_sealed() << " elapsed_s="
+        << std::chrono::duration<double>(std::chrono::steady_clock::now()-started).count() << std::endl;
+    stats_={};
+}
+
+std::uint64_t MoeExpertCache::expert_disk_reads_after_preload() const {
+    std::uint64_t reads=0;
+    for (const auto& source:sources_) if (source->quant_source_)
+        reads+=source->quant_source_->expert_disk_reads_after_preload();
+    return reads;
+}
+
+void MoeExpertCache::calibrate_pipeline_pcie() {
+    if(!config_.moe_pipeline && !config_.moe_ram_pcie)return;
+    if(config_.moe_ram_pcie_fraction) {
+        const auto fraction=*config_.moe_ram_pcie_fraction;
+        ram_pcie_fraction_=fraction;std::cerr<<"moe_ram_pcie_override fraction="<<fraction<<std::endl;return;
+    }
+    namespace tb=mfq_tensor_backend;
+    tb::Tensor target;
+    for(const auto& [signature,arena]:arenas_)for(const auto& field:arena->fields)
+        if(!target.defined() || tensor_nbytes(field)>tensor_nbytes(target))target=field;
+    const auto bytes=std::min<int64_t>(256ll<<20,tensor_nbytes(target));
+    if(!bytes)throw std::runtime_error("MFQ PCIe calibration has no allocated expert arena");
+    const MfqCudaGuard guard(target.device());
+    auto host=tb::empty({bytes},tb::TensorOptions().device(tb::kCPU).dtype(tb::kUInt8).pinned_memory(true));
+    std::memset(host.data_ptr(),0,static_cast<std::size_t>(bytes));
+    const auto stream=weight_stream_;
+    struct Events {
+        cudaEvent_t values[5]{};
+        ~Events(){for(auto e:values)if(e)cudaEventDestroy(e);}
+    } events;
+    for(auto& e:events.values)MFQ_CUDA_CHECK(cudaEventCreate(&e));
+    MFQ_CUDA_CHECK(cudaMemcpyAsync(target.data_ptr(),host.data_ptr(),static_cast<std::size_t>(bytes),cudaMemcpyHostToDevice,stream));
+    MFQ_CUDA_CHECK(cudaEventRecord(events.values[0],stream));
+    for(int burst=0;burst<4;++burst) {
+        MFQ_CUDA_CHECK(cudaMemcpyAsync(target.data_ptr(),host.data_ptr(),static_cast<std::size_t>(bytes),cudaMemcpyHostToDevice,stream));
+        MFQ_CUDA_CHECK(cudaEventRecord(events.values[burst+1],stream));
+    }
+    MFQ_CUDA_CHECK(cudaEventSynchronize(events.values[4]));
+    std::cerr<<"moe_ram_pcie_calibration burst_bytes="<<bytes<<" gbps_samples=";
+    for(int burst=0;burst<4;++burst) {
+        float milliseconds=0;MFQ_CUDA_CHECK(cudaEventElapsedTime(&milliseconds,events.values[burst],events.values[burst+1]));
+        if(!(milliseconds>0))throw std::runtime_error("MFQ PCIe calibration interval is empty");
+        const auto gbps=bytes/milliseconds/1e6;pipeline_pcie_gbps_=std::max(pipeline_pcie_gbps_,gbps);
+        std::cerr<<(burst ? "," : "")<<gbps;
+    }
+    ram_pcie_fraction_=mfq::measured_pcie_share(pipeline_pcie_gbps_);
+    std::cerr<<" best_gbps="<<pipeline_pcie_gbps_<<" fraction="<<ram_pcie_fraction_<<std::endl;
 }
 
 void MoeExpertCache::prewarm() {
@@ -401,7 +608,7 @@ void MoeExpertCache::invalidate(
     auto& cohort=source.cohorts_.at(key.cohort);
     auto& arena=*cohort.arena;
     bool copied=false;
-    (void)source.quant_source_->demote_expert(key.expert,[&] {
+    const bool retained=source.quant_source_->demote_expert(key.expert,[&] {
         // An unprotected lease can still have DMA or GPU kernels in flight.
         // Copy the victim only after both producer streams have finished.
         const auto stream=mfq_get_current_cuda_stream().stream();
@@ -426,6 +633,7 @@ void MoeExpertCache::invalidate(
         copied=true;
         return pool;
     });
+    if (complete_residency_ && !retained) throw std::runtime_error("GPU eviction would lose a resident expert");
     if (copied) stats_.gpu_demote_bytes+=arena.slot_bytes;
 }
 
@@ -1021,7 +1229,93 @@ void finalize_moe_expert_cache(
 void print_moe_expert_cache_stats(
         const std::shared_ptr<MoeExpertCache>& cache,
         std::ostream& output) {
-    if (cache) cache->print_stats(output);
+    if (cache) {
+        cache->finish_pipeline_exchanges();
+        cache->print_stats(output);
+    }
+}
+double moe_expert_cache_ram_pcie_fraction(const std::shared_ptr<MoeExpertCache>& cache) {
+    return cache ? cache->ram_pcie_fraction() : 0;
+}
+void finish_moe_expert_exchanges(const std::shared_ptr<MoeExpertCache>& cache) {
+    if(cache)cache->finish_pipeline_exchanges();
+}
+
+
+void prepare_moe_pipeline_comparison(const std::shared_ptr<MoeExpertCache>& cache,bool replay) {
+    if(!cache || !cache->complete_residency_ || cache->config_.moe_residency_adapt ||
+        !cache->pipeline_transfer_cache_ || cache->pipeline_mapped_copy_)
+        throw std::logic_error("MFQ pipeline comparison requires complete residency, fixed primary tiers and DMA transfer caching");
+    if(replay && !cache->pipeline_dispatch_capture_required_)
+        throw std::logic_error("MFQ pipeline comparison has no captured baseline");
+    if(!replay && !cache->pipeline_dispatch_replay_.empty())
+        throw std::logic_error("MFQ pipeline comparison cannot combine an external dispatch replay");
+    if(replay) {
+        finish_moe_pipeline_comparison(cache);
+        if(cache->pipeline_comparison_records_.empty())
+            cache->pipeline_comparison_records_=cache->pipeline_dispatch_records_;
+    }
+    cache->finish_pipeline_exchanges();
+    if(cache->compute_done_recorded_)MFQ_CUDA_CHECK(cudaEventSynchronize(cache->compute_done_));
+    MFQ_CUDA_CHECK(cudaStreamSynchronize(cache->weight_stream_));
+    cache->transfer_ready_recorded_=false;
+    cache->pipeline_dma_leases_.clear();
+    for(const auto& held:cache->pipeline_transfer_slots_)
+        if(held.book->slot_for(held.key)==held.slot)held.book->clear_inflight(held.slot);
+    cache->pipeline_transfer_slots_.clear();
+    cache->pipeline_prefetched_keys_.clear();
+    for(auto& [key,arena]:cache->pipeline_stages_)
+        if(arena->book)arena->book=std::make_unique<mfq::MoeCacheSlotBook>(arena->slots);
+    if(cache->pipeline_wire_gpu_.defined()) {
+        MFQ_CUDA_CHECK(cudaMemsetAsync(cache->pipeline_wire_gpu_.data_ptr(),0,32,cache->weight_stream_));
+        MFQ_CUDA_CHECK(cudaStreamSynchronize(cache->weight_stream_));
+    }
+    if(!replay)cache->pipeline_comparison_records_.clear();
+    cache->pipeline_dispatch_replay_=replay?cache->pipeline_comparison_records_:std::vector<MoeExpertCache::DispatchRecord>{};
+    cache->pipeline_dispatch_replay_cursor_=0;
+    cache->pipeline_dispatch_records_.clear();
+    cache->pipeline_dispatch_capture_required_=true;
+    cache->pipeline_comparison_cpu_policy_=false;
+    cache->pipeline_cpu_policy_changed_routes_=0;
+}
+void prepare_moe_cpu_budget_comparison(const std::shared_ptr<MoeExpertCache>& cache,
+        bool replay,bool transfer_budget) {
+    prepare_moe_pipeline_comparison(cache,replay);
+    if(!cache->pipeline_shared_cpu_cost_)
+        throw std::logic_error("CPU budget comparison needs shared measured CPU costs");
+    cache->pipeline_cpu_transfer_budget_=transfer_budget;
+    cache->pipeline_comparison_cpu_policy_=replay && transfer_budget;
+    // Existing CPU/GPU arithmetic can change downstream router IDs. Run the
+    // measured policy naturally and retain the first baseline for final replay.
+    if(cache->pipeline_comparison_cpu_policy_)cache->pipeline_dispatch_replay_.clear();
+}
+void prepare_moe_cpu_calibration_comparison(const std::shared_ptr<MoeExpertCache>& cache,bool replay) {
+    prepare_moe_cpu_budget_comparison(cache,replay,true);
+    cache->pipeline_cpu_calibration_.reset(cache->pipeline_cpu_cost_);
+    cache->pipeline_cpu_cost_={};
+}
+std::size_t finish_moe_pipeline_comparison(const std::shared_ptr<MoeExpertCache>& cache) {
+    if(!cache || !cache->pipeline_dispatch_capture_required_ || cache->pipeline_dispatch_records_.empty())
+        throw std::logic_error("MFQ pipeline comparison did not capture dispatch records");
+    const auto& expected=cache->pipeline_comparison_cpu_policy_
+        ?cache->pipeline_comparison_records_:cache->pipeline_dispatch_replay_;
+    if(!expected.empty()) {
+        const auto& actual=cache->pipeline_dispatch_records_;
+        if(actual.size()!=expected.size() || (!cache->pipeline_comparison_cpu_policy_ &&
+            cache->pipeline_dispatch_replay_cursor_!=expected.size()))
+            throw std::runtime_error("MFQ pipeline comparison dispatch count mismatch");
+        std::uint64_t changed=0;
+        for(std::size_t i=0;i<actual.size();++i) {
+            if(actual[i].layer!=expected[i].layer || actual[i].tokens!=expected[i].tokens ||
+                actual[i].ids.size()!=expected[i].ids.size() ||
+                (!cache->pipeline_comparison_cpu_policy_ &&
+                    (actual[i].ids!=expected[i].ids || actual[i].cpu!=expected[i].cpu)))
+                throw std::runtime_error("MFQ pipeline comparison dispatch mismatch");
+            changed+=actual[i].ids!=expected[i].ids;
+        }
+        cache->pipeline_cpu_policy_changed_routes_=changed;
+    }
+    return cache->pipeline_dispatch_records_.size();
 }
 
 void set_moe_expert_cache_profile(

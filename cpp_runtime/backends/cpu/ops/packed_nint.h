@@ -23,6 +23,10 @@ struct PackedNintView {
 
 enum class PackedNintKernel { automatic, scalar };
 bool packed_nint_has_avx2();
+using PackedNintRows=void(*)(const PackedNintView&,const float*,
+    std::int64_t,std::int64_t,float*,std::int64_t,std::int64_t,std::int64_t);
+// Canonical row storage is validated by its loader; select once per expert job.
+PackedNintRows packed_nint_rows_kernel() noexcept;
 
 // FP32 activation -> FP32 output, without activation quantization or dense
 // weight materialization. Strides are in float elements. Storage is borrowed

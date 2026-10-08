@@ -1,6 +1,8 @@
 #include "runtime/moe_host_expert_cache.h"
 
 #include <chrono>
+#include <array>
+#include <cstring>
 #include <future>
 #include <iostream>
 #include <stdexcept>
@@ -133,6 +135,77 @@ int main() try {
         bytes_equal(retained,4);
     }
     std::cout<<"host expert byte LRU, leases, promotion/demotion, concurrent coalescing and failed-read recovery passed\n";
+    {
+        MoeHostExpertCache cache(128);
+        cache.acquire(key(0),64,[] { return weight(64,1); });
+        cache.acquire(key(1),64,[] { return weight(64,2); });
+        cache.preserve_resident_experts();
+        auto scratch=cache.acquire(key(2),64,[] { return weight(64,3); });
+        check(cache.contains(key(0)) && cache.contains(key(1)) && !cache.contains(key(2)) &&
+            cache.stats().evictions==0,"complete residency evicted the last RAM expert copy");
+        scratch.reset();
+        cache.promote(key(0));
+        check(cache.demote(key(2),64,[] { return weight(64,3); }),"complete residency did not reuse promoted capacity");
+    }
+    {
+        MoeHostExpertCache cache(64);cache.preserve_resident_experts();
+        auto incoming=cache.acquire(key(0),64,[]{return weight(64,1);});
+        auto reader=incoming;int copies=0;
+        auto exchange=[&](const MixedMoePool& source){
+            ++copies;auto value=source;
+            std::memset(value.nint.q_packed.data_ptr(),9,64);return value;
+        };
+        check(!cache.exchange(key(0),key(1),incoming,exchange) && copies==0,"tier exchange overwrote a live CPU lease");
+        reader.reset();const auto* before=incoming->weights.nint.q_packed.data_ptr();
+        bool failed=false;
+        try{cache.exchange(key(0),key(1),incoming,[](const auto&)->MixedMoePool{throw std::runtime_error("copy failed");});}
+        catch(const std::runtime_error&){failed=true;}
+        check(failed && cache.contains(key(0)) && !cache.contains(key(1)),"failed tier exchange changed RAM ownership");
+        check(cache.exchange(key(0),key(1),incoming,exchange),"tier exchange failed without other readers");
+        incoming.reset();auto outgoing=cache.acquire(key(1),64,[]{throw std::runtime_error("exchange reread SSD");return weight(64,0);});
+        bytes_equal(outgoing,9);
+        check(outgoing->weights.nint.q_packed.data_ptr()==before && cache.stats().managed_bytes==64 &&
+            cache.stats().managed_peak_bytes==64 && !cache.contains(key(0)),"tier exchange grew or copied the RAM allocation");
+    }
+    int batch_cases=0;
+    for(bool bulk:{false,true})for(int fail_at:{-2,0,1,2,3,-1}) {
+        if(!bulk && fail_at==-2)continue;
+        MoeHostExpertCache cache(192);cache.preserve_resident_experts();
+        std::array<MoeHostExpertCache::Lease,3> held;
+        for(int i=0;i<3;++i)held[i]=cache.acquire(key(i),64,[i]{return weight(64,i+1);});
+        std::vector<MoeHostExpertCache::Exchange> changes;
+        for(int i=0;i<3;++i)changes.push_back({key(i),key(i+3),&held[i],
+            [i,fail_at,bulk](const MixedMoePool& original) {
+                auto result=original;if(!bulk)std::memset(result.nint.q_packed.data_ptr(),i+7,64);
+                if(fail_at==i)throw std::runtime_error("partial RAM reuse failure");return result;
+            },[i](const MixedMoePool& original){std::memset(original.nint.q_packed.data_ptr(),i+1,64);}});
+        int copied=0;
+        std::function<void()> prepare;
+        if(bulk)prepare=[&] {
+            ++copied;
+            for(int i=0;i<3;++i) {
+                std::memset(held[i]->weights.nint.q_packed.data_ptr(),i+7,64);
+                if(fail_at==-2 && i==1)throw std::runtime_error("partial bulk RAM reuse failure");
+            }
+        };
+        auto reader=held[1];
+        check(!cache.exchange_batch(changes,[&]{++copied;},prepare),"batch reused a CPU reader's fields");
+        check(!copied,"rejected batch published a GPU mapping");reader.reset();
+        bool failed=false;
+        try {check(cache.exchange_batch(changes,[&]{if(fail_at==3)throw std::runtime_error("publication failure");},prepare),"batch was rejected without readers");}
+        catch(const std::runtime_error&){failed=true;}
+        check(failed==(fail_at>=0 || fail_at==-2),"batch failure did not propagate");
+        for(int i=0;i<3;++i) {
+            if(failed){check(cache.contains(key(i)) && !cache.contains(key(i+3)),"batch rollback changed an entry");bytes_equal(held[i],i+1);}
+            else {
+                held[i].reset();auto value=cache.acquire(key(i+3),64,[]{throw std::runtime_error("batch reread SSD");return weight(64,0);});
+                bytes_equal(value,i+7);check(!cache.contains(key(i)),"batch retained the promoted key");
+            }
+        }
+        check(cache.stats().managed_bytes==192 && cache.stats().managed_peak_bytes==192,"batch duplicated RAM payloads");
+        ++batch_cases;
+    }
+    std::cout<<"atomic RAM exchange rollback, reader exclusion and publication checks passed batch_cases="<<batch_cases<<"\n";
     return 0;
 } catch (const std::exception& error) {
     std::cerr<<error.what()<<'\n';

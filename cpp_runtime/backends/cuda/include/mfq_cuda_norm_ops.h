@@ -9,6 +9,11 @@ mfq_tensor_backend::Tensor rms_norm_cuda(mfq_tensor_backend::Tensor x, mfq_tenso
 mfq_tensor_backend::Tensor rms_norm_offset_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, double eps, double weight_offset);
 mfq_tensor_backend::Tensor rms_norm_f16_cuda(mfq_tensor_backend::Tensor x, mfq_tensor_backend::Tensor weight, double eps,
                                 double weight_offset);
+mfq_tensor_backend::Tensor grouped_rms_norm_cuda(mfq_tensor_backend::Tensor x,
+    mfq_tensor_backend::Tensor weight, int64_t group, double eps, double weight_offset);
+mfq_tensor_backend::Tensor gdn_rms_norm_gate_cuda(mfq_tensor_backend::Tensor attended,
+    mfq_tensor_backend::Tensor gate, mfq_tensor_backend::Tensor weight, double eps,
+    bool silu_gate, bool output_half);
 mfq_tensor_backend::Tensor qwen_rms_norm_bf16_cuda(
     mfq_tensor_backend::Tensor input, mfq_tensor_backend::Tensor weight, double eps,
     double weight_offset);

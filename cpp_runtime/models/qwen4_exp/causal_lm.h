@@ -180,6 +180,23 @@ auto decoder_layer(Tensor hidden, bool has_ple, bool linear, PositionEmbedding p
         [](const auto &) {});
 }
 
+template <class Tensor, class PositionEmbedding, class Add, class AttentionPre,
+          class LinearAttention, class SparseAttention, class FfnPreAfter, class Ffn, class FfnPost>
+auto decoder_layer_chained(Tensor hidden, bool has_ple, bool linear,
+    PositionEmbedding position_embedding, Add add, AttentionPre attention_pre,
+    LinearAttention linear_attention, SparseAttention sparse_attention,
+    FfnPreAfter ffn_pre_after, Ffn ffn, FfnPost ffn_post) {
+    if (has_ple) {
+        auto positional = position_embedding(hidden);
+        hidden = add(std::move(hidden), std::move(positional));
+    }
+    auto attention_mix = attention_pre(hidden);
+    auto attention_branch = linear ? linear_attention(attention_mix[0]) : sparse_attention(attention_mix[0]);
+    auto ffn_mix = ffn_pre_after(std::move(attention_branch), attention_mix);
+    auto ffn_branch = ffn(ffn_mix[0]);
+    return ffn_post(std::move(ffn_branch), ffn_mix);
+}
+
 template <class Backend> struct CausalLm : models::CausalModelBase<Backend, CausalLm<Backend>> {
     using Tensor = typename Backend::Tensor;
     static bool accepts_backbone(std::string_view backbone) { return backbone == "qwen4_exp"; }

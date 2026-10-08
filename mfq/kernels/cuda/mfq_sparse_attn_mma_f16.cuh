@@ -11,6 +11,7 @@
 #endif
 
 #include "mfq_tensor_backend.h"
+#include "selected_attention.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -19,6 +20,17 @@
 namespace mfq_sparse_attn_mma {
 
 using Tensor = mfq_tensor_backend::Tensor;
+
+struct RuntimeInput {
+    const void* positions = nullptr;
+    int64_t query_batch_stride = 0;
+    int64_t query_head_stride = 0;
+    int64_t query_token_stride = 0;
+    int64_t query_column_stride = 0;
+    int causal_columns = 0;
+    bool half_query = false;
+    bool wide_positions = false;
+};
 
 inline uint3 sparse_fastdiv_values(uint32_t divisor) {
     uint32_t shift = 0;
@@ -37,7 +49,7 @@ inline uint3 sparse_fastdiv_values(uint32_t divisor) {
 template<int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view,
          bool needs_fixup, bool is_fixup>
 static __device__ __forceinline__ void process_sparse_attention_tile(
-    const float * __restrict__ q,
+    const void * __restrict__ q,
     const half * __restrict__ k,
     const half * __restrict__ v,
     const int * __restrict__ indices,
@@ -58,7 +70,8 @@ static __device__ __forceinline__ void process_sparse_attention_tile(
     int iter_j,
     int iter_z_gqa,
     int kb0_start,
-    int kb0_stop) {
+    int kb0_stop,
+    RuntimeInput input) {
     constexpr int ncols = ncols1 * ncols2;
     constexpr int nthreads =
         ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols);
@@ -81,7 +94,7 @@ static __device__ __forceinline__ void process_sparse_attention_tile(
     const int jt = static_cast<int>(query_work / iter_k);
     const int zt_q = z_kv * gqa_ratio + zt_gqa * ncols2;
 
-    const float2 * q_f2 = reinterpret_cast<const float2 *>(q) +
+    const float2 * q_f2 = input.positions ? nullptr : reinterpret_cast<const float2 *>(q) +
         (static_cast<int64_t>(sequence) * heads * M +
          static_cast<int64_t>(zt_q) * M) * (DKQ / 2);
     const half2 * k_h2 = reinterpret_cast<const half2 *>(k) +
@@ -94,11 +107,28 @@ static __device__ __forceinline__ void process_sparse_attention_tile(
              static_cast<int64_t>(z_kv) * max_seq) * (DV / 2);
     float2 * dst = reinterpret_cast<float2 *>(out) +
         (static_cast<int64_t>(sequence) * M * heads + zt_q) * (DV / 2);
-    const int * row_indices = indices +
-        (static_cast<int64_t>(sequence) * M + jt) * selected;
+    const int * row_indices = indices ? indices +
+        (static_cast<int64_t>(sequence) * M + jt) * selected : nullptr;
     const half * sequence_mask = mask == nullptr ? nullptr :
         mask + static_cast<int64_t>(sequence) * M * selected;
     const float * tile_sinks = sinks == nullptr ? nullptr : sinks + zt_q;
+    mfq_fattn_runtime_input tile_input{};
+    if (input.positions) {
+        const int64_t query_offset = int64_t(sequence)*input.query_batch_stride +
+            int64_t(zt_q)*input.query_head_stride;
+        tile_input.query = static_cast<const char*>(q) + query_offset*(input.half_query ? sizeof(half) : sizeof(float));
+        tile_input.query_token_stride = input.query_token_stride;
+        tile_input.query_head_stride = input.query_head_stride;
+        tile_input.query_column_stride = input.query_column_stride;
+        tile_input.half_query = input.half_query;
+        int64_t end = input.wide_positions ? static_cast<const int64_t*>(input.positions)[jt]
+            : static_cast<const int32_t*>(input.positions)[jt];
+        end = end < -1 ? -1 : end;
+        end = end >= max_seq ? max_seq - 1 : end;
+        end = end >= input.causal_columns ? input.causal_columns - 1 : end;
+        tile_input.causal_query_offset = static_cast<int>(end) - jt;
+        tile_input.causal_row_count = static_cast<int>(end + 1);
+    }
 
     flash_attn_ext_f16_process_tile<
         DKQ, DV, ncols1, ncols2, nwarps,
@@ -109,7 +139,8 @@ static __device__ __forceinline__ void process_sparse_attention_tile(
         DKQ / 2, M * (DKQ / 2), DKQ / 2,
         V_is_K_view ? DKQ / 2 : DV / 2,
         sequence_mask == nullptr ? 0 : selected,
-        jt, zt_gqa, kb0_start, kb0_stop, row_indices);
+        jt, zt_gqa, kb0_start, kb0_stop, row_indices,
+        input.positions != nullptr, 0, tile_input);
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view>
@@ -117,7 +148,7 @@ __launch_bounds__(
     ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1 * ncols2),
     ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1 * ncols2))
 __global__ void sparse_attention_kernel(
-    const float * __restrict__ q,
+    const void * __restrict__ q,
     const half * __restrict__ k,
     const half * __restrict__ v,
     const int * __restrict__ indices,
@@ -132,7 +163,8 @@ __global__ void sparse_attention_kernel(
     int kv_heads,
     int max_seq,
     int selected,
-    uint3 ne01) {
+    uint3 ne01,
+    RuntimeInput input) {
 #if defined(FLASH_ATTN_AVAILABLE) && defined(TURING_MMA_AVAILABLE)
     static_assert(ncols1 == 1,
         "selected-token tiles require one index row per query tile");
@@ -163,14 +195,14 @@ __global__ void sparse_attention_kernel(
                 q, k, v, indices, mask, sinks, out, meta, scale,
                 M, heads, kv_heads, max_seq, selected, ne01, kbc,
                 work_per_sequence, iter_k, iter_j, iter_z_gqa,
-                kb0_start, kb0_stop);
+                kb0_start, kb0_stop, input);
         } else {
             process_sparse_attention_tile<
                 DKQ, DV, ncols1, ncols2, V_is_K_view, true, false>(
                 q, k, v, indices, mask, sinks, out, meta, scale,
                 M, heads, kv_heads, max_seq, selected, ne01, kbc,
                 work_per_sequence, iter_k, iter_j, iter_z_gqa,
-                kb0_start, kb0_stop);
+                kb0_start, kb0_stop, input);
         }
         kbc += iter_k;
         kbc -= kbc % iter_k;
@@ -184,12 +216,12 @@ __global__ void sparse_attention_kernel(
             q, k, v, indices, mask, sinks, out, meta, scale,
             M, heads, kv_heads, max_seq, selected, ne01, kbc,
             work_per_sequence, iter_k, iter_j, iter_z_gqa,
-            kb0_start, kb0_stop);
+            kb0_start, kb0_stop, input);
     }
 #else
     (void)q; (void)k; (void)v; (void)indices; (void)mask; (void)sinks;
     (void)out; (void)meta; (void)scale; (void)B; (void)M; (void)heads;
-    (void)kv_heads; (void)max_seq; (void)selected; (void)ne01;
+    (void)kv_heads; (void)max_seq; (void)selected; (void)ne01; (void)input;
 #endif
 }
 
@@ -203,16 +235,28 @@ Tensor launch(
     const Tensor& sinks,
     Tensor meta,
     double scale,
-    const char * name) {
+    const char * name,
+    const Tensor& gate = Tensor{},
+    bool half_output = false,
+    const Tensor& positions = Tensor{},
+    int64_t causal_columns = 0) {
     static_assert(ncols1 == 1,
         "selected-token tiles require one index row per query tile");
     constexpr int ncols = ncols1 * ncols2;
+    MFQ_RUNTIME_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4 &&
+        q.size(0) <= INT_MAX && q.size(1) <= INT_MAX && q.size(2) <= INT_MAX &&
+        k.size(1) <= INT_MAX && k.size(2) <= INT_MAX,
+        name, ": attention dimensions exceed 32-bit indexing");
     const int B = static_cast<int>(q.size(0));
     const int heads = static_cast<int>(q.size(1));
     const int M = static_cast<int>(q.size(2));
     const int kv_heads = static_cast<int>(k.size(1));
     const int max_seq = static_cast<int>(k.size(2));
-    const int selected = static_cast<int>(indices.size(2));
+    const bool causal = positions.defined();
+    MFQ_RUNTIME_CHECK(!causal || (causal_columns > 0 && causal_columns <= INT_MAX - 32),
+        name, ": causal selection exceeds 32-bit indexing");
+    const int selected = causal ? static_cast<int>(((causal_columns + 31) / 32) * 32)
+        : static_cast<int>(indices.size(2));
 
     MFQ_RUNTIME_CHECK(B > 0 && M > 0 && heads > 0 && kv_heads > 0 &&
         heads % kv_heads == 0 && max_seq > 0 && selected > 0,
@@ -222,20 +266,27 @@ Tensor launch(
         v.dim() == 4 && v.size(0) == B && v.size(1) == kv_heads &&
         v.size(2) == max_seq &&
         v.size(3) == (V_is_K_view ? DKQ : DV) &&
-        indices.dim() == 3 && indices.size(0) == B && indices.size(1) == M,
+        (causal || (indices.dim() == 3 && indices.size(0) == B && indices.size(1) == M)),
         name, ": tensor shapes disagree");
     MFQ_RUNTIME_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() &&
-        indices.is_cuda() && q.device() == k.device() &&
-        q.device() == v.device() && q.device() == indices.device(),
+        (causal || indices.is_cuda()) && q.device() == k.device() &&
+        q.device() == v.device() && (causal || q.device() == indices.device()),
         name, ": tensors must share one CUDA device");
-    MFQ_RUNTIME_CHECK(q.is_contiguous() && k.is_contiguous() &&
-        v.is_contiguous() && indices.is_contiguous(),
+    MFQ_RUNTIME_CHECK((causal || q.is_contiguous()) && k.is_contiguous() &&
+        v.is_contiguous() && (causal || indices.is_contiguous()),
         name, ": tensors must be contiguous");
-    MFQ_RUNTIME_CHECK(q.scalar_type() == mfq_tensor_backend::kFloat32 &&
+    MFQ_RUNTIME_CHECK((q.scalar_type() == mfq_tensor_backend::kFloat32 ||
+        (causal && q.scalar_type() == mfq_tensor_backend::kFloat16)) &&
         k.scalar_type() == mfq_tensor_backend::kFloat16 &&
         v.scalar_type() == mfq_tensor_backend::kFloat16 &&
-        indices.scalar_type() == mfq_tensor_backend::kInt32,
+        (causal || indices.scalar_type() == mfq_tensor_backend::kInt32),
         name, ": expected f32/f16/f16/i32 tensors");
+    if (causal) {
+        MFQ_RUNTIME_CHECK(positions.is_cuda() && positions.device() == q.device() &&
+            positions.is_contiguous() && positions.dim() == 1 && positions.numel() == M &&
+            (positions.scalar_type() == mfq_tensor_backend::kInt32 || positions.scalar_type() == mfq_tensor_backend::kInt64) &&
+            !mask.defined() && !indices.defined(), name, ": invalid implicit causal selection");
+    }
     if (mask.defined()) {
         MFQ_RUNTIME_CHECK(mask.is_cuda() && mask.device() == q.device() &&
             mask.is_contiguous() &&
@@ -344,24 +395,32 @@ Tensor launch(
         name, ": meta workspace too small, need ", required_meta,
         " float elements");
 
-    Tensor out = mfq_tensor_backend::empty({B, M, heads, DV}, q.options());
+    Tensor out = mfq_tensor_backend::empty({B, M, heads, DV}, q.options().dtype(mfq_tensor_backend::kFloat32));
     const auto stream = mfq_current_cuda_stream();
+    const RuntimeInput input{causal ? positions.data_ptr() : nullptr,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3), static_cast<int>(causal_columns),
+        q.scalar_type() == mfq_tensor_backend::kFloat16,
+        causal && positions.scalar_type() == mfq_tensor_backend::kInt64};
     kernel<<<rounded_blocks, dim3(32, nwarps, 1), shmem, stream>>>(
-        q.data_ptr<float>(),
+        q.data_ptr(),
         reinterpret_cast<const half *>(k.data_ptr<mfq_half>()),
         reinterpret_cast<const half *>(v.data_ptr<mfq_half>()),
-        indices.data_ptr<int>(),
+        indices.defined() ? indices.data_ptr<int>() : nullptr,
         mask.defined()
             ? reinterpret_cast<const half *>(mask.data_ptr<mfq_half>())
             : nullptr,
         sinks.defined() ? sinks.data_ptr<float>() : nullptr,
         out.data_ptr<float>(), reinterpret_cast<float2 *>(meta.data_ptr<float>()),
         static_cast<float>(scale), B, M, heads, kv_heads, max_seq, selected,
-        sparse_fastdiv_values(static_cast<uint32_t>(M)));
+        sparse_fastdiv_values(static_cast<uint32_t>(M)), input);
     status = cudaGetLastError();
     MFQ_RUNTIME_CHECK(status == cudaSuccess,
         name, " launch failed: ", cudaGetErrorString(status));
 
+    if (gate.defined()) {
+        return mfq_selected_attention::mma_reduce_gated(out, meta, gate, half_output,
+            kv_heads, rounded_blocks, blocks_per_tile, ncols1, ncols2);
+    }
     if (blocks_per_tile > 1) {
         const uint3 fd0 = sparse_fastdiv_values(
             static_cast<uint32_t>(iter_j * iter_z_gqa * kv_heads));

@@ -49,6 +49,8 @@ namespace mfq::cuda {
 struct CausalResources {
     mfq::models::CausalLmMetadata metadata;
     CudaExecutionContext *execution = nullptr;
+    template<class Model> std::optional<mfq_tensor_backend::Tensor>
+    adapter_graph_logits(Model&,mfq_tensor_backend::Tensor,int) {return {};}
 
     void adapter_validate_load_options() const;
     bool adapter_uses_common_rope() const noexcept;
@@ -138,6 +140,9 @@ template <typename Model> struct CudaCausalOps : Model {
     std::vector<std::unique_ptr<Block>> blocks;
     mfq_tensor_backend::Tensor output_norm;
     QuantLinear lm_head;
+    std::optional<Tensor> graph_logits(CausalModel& model,Tensor ids,int kind) {
+        return static_cast<Model&>(model).adapter_graph_logits(model,std::move(ids),kind);
+    }
 
     auto execution_scope() const {
         return MfqCudaGuard(this->execution->layer_placement.primary_device());
@@ -221,6 +226,10 @@ template <typename Model> struct CudaCausalOps : Model {
             return positions + delta;
         }
         Tensor prepare_hidden(int64_t B, int64_t T) {
+            if(model.execution->config.moe_pipeline) {
+                cpu_ids=ids.to(mfq_tensor_backend::kCPU,mfq_tensor_backend::kInt64).contiguous();
+                for(const auto& block:model.blocks)block->prefetch_token_ids(cpu_ids);
+            }
             if (model.execution->dense_cpu_layer_count > 0) {
                 cpu_ids = ids.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
                 cpu_pos = pos.to(mfq_tensor_backend::kCPU, mfq_tensor_backend::kInt64).contiguous();
@@ -294,6 +303,7 @@ template <typename Model> struct CudaCausalOps : Model {
                                                   : model.device_ropes.at(b->cuda_device));
             Block::Context context;
             context.token_ids = local_ids;
+            context.host_token_ids=cpu_ids;
             context.positions = local_pos;
             context.full_positions =
                 model.adapter_block_positions(full_positions, local_pos, b->cuda_device);

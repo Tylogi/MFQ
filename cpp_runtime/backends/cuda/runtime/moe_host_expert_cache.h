@@ -5,6 +5,7 @@
 
 #include <functional>
 #include <memory>
+#include <vector>
 
 struct MoeHostExpertReservation;
 
@@ -43,6 +44,23 @@ public:
     void erase(mfq::MoeCacheKey key);
     bool contains(mfq::MoeCacheKey key) const;
     MoeHostExpertCacheStats stats() const;
+    // Complete-residency mode cannot evict the last copy of an expert.
+    void preserve_resident_experts();
+    bool exchange(mfq::MoeCacheKey incoming,mfq::MoeCacheKey outgoing,
+        const Lease& expected,const std::function<MixedMoePool(const MixedMoePool&)>& copy);
+    struct Exchange {
+        mfq::MoeCacheKey incoming, outgoing;
+        const Lease* expected = nullptr;
+        std::function<MixedMoePool(const MixedMoePool&)> copy;
+        std::function<void(const MixedMoePool&)> restore;
+    };
+    // Validate all readers and allocate every lookup entry before reusing RAM.
+    // The publication callback must undo its own changes if it throws.
+    // Optional prepare runs under reader exclusion and may modify every reused
+    // payload. Any later failure restores all payloads before releasing the lock.
+    bool exchange_batch(const std::vector<Exchange>& changes,
+                        const std::function<void()>& publish = {},
+                        const std::function<void()>& prepare = {});
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

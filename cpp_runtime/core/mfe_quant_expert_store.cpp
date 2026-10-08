@@ -48,6 +48,8 @@ MfeQuantExpertStore::MfeQuantExpertStore(std::size_t bytes,Read reader):read_(st
         if (bytes>std::numeric_limits<std::size_t>::max() || cursor>bytes_ || bytes>bytes_-cursor)
             throw std::runtime_error("truncated mixed expert pool payload");
         Pool pool;
+        pool.offset=static_cast<std::size_t>(cursor);
+        pool.bytes=static_cast<std::size_t>(bytes);
         pool.dtype=std::string(mfq::canonical_format_dtype(std::string(
             reinterpret_cast<const char*>(metadata.data()+std::size_t(count)*4),dtype_bytes)));
         pool.ids.resize(count);
@@ -100,6 +102,28 @@ MfeQuantExpert MfeQuantExpertStore::read_expert(int expert) const {
     const auto& owner=owners_[expert]; const auto& pool=pools_[owner.pool];
     const auto begin=std::int64_t(owner.local)*output_,end=begin+output_;
     return {pool.dtype,pool.nint ? pool.nint->slice_rows_blob(begin,end) : pool.nvq->slice_rows_blob(begin,end)};
+}
+
+void MfeQuantExpertStore::visit_pool_experts(std::size_t index,
+        const std::function<void(int, MfeQuantExpert)>& visitor) const {
+    if (!visitor) throw std::invalid_argument("missing expert preload visitor");
+    const auto& pool=pools_.at(index);
+    std::vector<std::uint8_t> payload(pool.bytes);
+    read_(pool.offset,payload.data(),payload.size());
+    const Read memory=[&payload](std::size_t offset,std::uint8_t* destination,std::size_t bytes) {
+        if (offset>payload.size() || bytes>payload.size()-offset)
+            throw std::out_of_range("expert preload pool bounds");
+        if (bytes) std::memcpy(destination,payload.data()+offset,bytes);
+    };
+    if (pool.nint) {
+        NintRows rows(payload.size(),memory);
+        for (std::size_t local=0; local<pool.ids.size(); ++local)
+            visitor(pool.ids[local],{pool.dtype,rows.slice_rows_blob(local*output_,(local+1)*output_)});
+    } else {
+        NvqRows rows(payload.size(),memory);
+        for (std::size_t local=0; local<pool.ids.size(); ++local)
+            visitor(pool.ids[local],{pool.dtype,rows.slice_rows_blob(local*output_,(local+1)*output_)});
+    }
 }
 
 std::size_t MfeQuantExpertStore::expert_payload_nbytes(int expert) const {

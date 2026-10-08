@@ -1,6 +1,8 @@
 #pragma once
 
 #include "mfq/model_graph.h"
+#include "mfq/file_range_reader.h"
+#include "mfq/read_span.h"
 #include "mfq_legacy_tensor_names.h"
 
 #include <cstddef>
@@ -42,6 +44,7 @@ public:
 // canonical names exposed here.
 class ModelSource {
 public:
+    using TensorBatchReader=std::function<void(const std::vector<ReadSpan>&)>;
     using TensorReader = std::function<void(
         std::uint64_t, std::byte*, std::size_t)>;
     virtual ~ModelSource() = default;
@@ -65,12 +68,17 @@ public:
         std::byte* destination,
         std::size_t size) const = 0;
     virtual void drop_file_cache() const noexcept {}
+    virtual FileReadStats file_read_stats() const noexcept { return {}; }
+    // True when independent tensor reads can overlap without a shared seek
+    // lock. Unknown callbacks must keep their serial access order.
+    virtual bool supports_parallel_tensor_reads() const noexcept { return false; }
 
     // An independently owned, bounded range reader that survives this source.
     // Packed row consumers must not fall back to reading the complete tensor.
     virtual TensorReader tensor_reader(std::string_view) const {
         throw TensorReaderUnsupported("model source has no retained tensor range reader");
     }
+    virtual TensorBatchReader tensor_batch_reader(std::string_view) const { return {}; }
 
     virtual const std::vector<std::string>& assets() const noexcept = 0;
     virtual bool has_asset(std::string_view name) const noexcept = 0;

@@ -3,6 +3,7 @@
 #include "mfq_cuda_tensor_view.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -21,6 +22,16 @@
 #include <vector>
 
 namespace mfq::cuda {
+
+// Owned CPU tensors and pinned transfer buffers; tensor views share storage
+// and must not double-count it. File/codec buffers and driver memory are
+// observed separately through process physical working-set measurements.
+inline std::atomic<std::size_t> tensor_host_bytes{0},tensor_host_peak_bytes{0};
+inline void charge_tensor_host_bytes(std::size_t bytes) {
+    const auto used=tensor_host_bytes.fetch_add(bytes)+bytes;
+    auto peak=tensor_host_peak_bytes.load();
+    while (peak<used && !tensor_host_peak_bytes.compare_exchange_weak(peak,used)) {}
+}
 
 inline constexpr ScalarType kBool = ScalarType::boolean;
 inline constexpr ScalarType kUInt8 = ScalarType::uint8;

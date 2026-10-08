@@ -79,6 +79,37 @@ void packed_nint_avx2_rows(const PackedNintView& w, const float* input,
     std::int64_t batch, std::int64_t input_stride, float* output,
     std::int64_t output_stride, std::int64_t begin, std::int64_t end) {
     const auto groups = 1 + (w.width-1)/w.group_size;
+    if(batch==1) {
+        for(auto row=begin;row<end;++row) {
+            auto sum=_mm256_setzero_ps();
+            const int bits=w.row_bits[row];
+            auto bit=static_cast<std::uint64_t>(w.row_bit_offsets[row]);
+            for(std::int64_t group=0;group<groups;++group) {
+                const auto meta=row*groups+group;
+                const auto vscale=_mm256_set1_ps(w.row_scale[row]*w.group_scale[meta]);
+                const auto vminimum=_mm256_set1_ps(w.row_min[row]*w.group_min[meta]);
+                auto column=group*w.group_size;
+                const auto stop=column+std::min(w.group_size,w.width-column);
+                for(;column+8<=stop;column+=8,bit+=8*bits) {
+                    const auto decoded=_mm256_sub_ps(_mm256_mul_ps(vscale,
+                        _mm256_cvtepi32_ps(decode8(w,bit,bits))),vminimum);
+                    sum=_mm256_add_ps(sum,_mm256_mul_ps(decoded,_mm256_loadu_ps(input+column)));
+                }
+                if(column<stop) {
+                    const int valid=static_cast<int>(stop-column);
+                    const auto mask=_mm256_cmpgt_epi32(_mm256_set1_epi32(valid),
+                        _mm256_setr_epi32(0,1,2,3,4,5,6,7));
+                    const auto decoded=_mm256_and_ps(_mm256_castsi256_ps(mask),
+                        _mm256_sub_ps(_mm256_mul_ps(vscale,
+                            _mm256_cvtepi32_ps(decode8(w,bit,bits,valid))),vminimum));
+                    sum=_mm256_add_ps(sum,_mm256_mul_ps(decoded,_mm256_maskload_ps(input+column,mask)));
+                    bit+=static_cast<std::uint64_t>(valid)*bits;
+                }
+            }
+            output[row]=reduce(sum);
+        }
+        return;
+    }
     for (auto row=begin; row<end; ++row) {
         const int bits = w.row_bits[row];
         for (std::int64_t sample0=0; sample0<batch; sample0+=4) {

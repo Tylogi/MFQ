@@ -103,6 +103,25 @@ void self_test() {
             "NVQ expert packed fields or padding changed");
     }
     std::vector<std::future<std::vector<std::uint8_t>>> concurrent;
+    for (std::size_t pool=0; pool<store.pool_count(); ++pool) {
+        std::vector<std::pair<int,mfq::MfeQuantExpert>> leaves;
+        bytes->store(0);
+        store.visit_pool_experts(pool,[&](int expert,mfq::MfeQuantExpert encoded) {
+            leaves.emplace_back(expert,std::move(encoded));
+        });
+        require(leaves.size()==store.pool_expert_ids(pool).size(),"startup pool expert coverage changed");
+        const auto pool_read_bytes=bytes->load();
+        require(pool_read_bytes<original.size(),"startup pool read crossed pool bounds");
+        for (std::size_t i=0; i<leaves.size(); ++i) {
+            const auto expected=store.read_expert(leaves[i].first);
+            require(leaves[i].first==store.pool_expert_ids(pool)[i] &&
+                leaves[i].second.dtype==expected.dtype && leaves[i].second.payload==expected.payload,
+                "startup sequential pool differs from canonical independent expert slices");
+        }
+    }
+    rejected([&] { store.visit_pool_experts(store.pool_count(),[](int,mfq::MfeQuantExpert) {}); });
+    rejected([&] { store.visit_pool_experts(0,{}); });
+    rejected([&] { store.visit_pool_experts(0,[](int,mfq::MfeQuantExpert) { throw std::runtime_error("visitor failed"); }); });
     for (int i=0; i<12; ++i) concurrent.push_back(std::async(std::launch::async,[&store,i] {
         return store.read_expert(i%4).payload;
     }));

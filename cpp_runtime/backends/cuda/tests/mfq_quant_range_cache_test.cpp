@@ -97,15 +97,20 @@ void verify_gpu(const tb::Tensor& cached,const tb::Tensor& original) {
 // GPU results must equal the existing canonical GPU dispatch bit-for-bit;
 // CPU results are checked against an independent Python codec + FP64 oracle.
 int main(int argc,char** argv) try {
-    if (argc<2 || argc>5) throw std::runtime_error("expected fixture directory [--host-cache] [--benchmark] [--shared-arena]");
-    bool host_cache=false,benchmark=false,shared_arena=false;
+    if (argc<2 || argc>7) throw std::runtime_error("expected fixture directory [--host-cache] [--benchmark] [--shared-arena] [--hybrid] [--resident]");
+    bool host_cache=false,benchmark=false,shared_arena=false,hybrid=false,resident=false;
     for (int argument=2; argument<argc; ++argument) {
         const std::string option=argv[argument];
         if (option=="--host-cache") host_cache=true;
         else if (option=="--benchmark") benchmark=true;
         else if (option=="--shared-arena") shared_arena=true;
+        else if (option=="--hybrid") hybrid=true;
+        else if (option=="--resident") resident=true;
         else throw std::runtime_error("unknown range cache test option");
     }
+    if (hybrid && (!host_cache || shared_arena)) throw std::runtime_error("hybrid gate requires --host-cache alone");
+    if (resident && (!host_cache || hybrid || shared_arena || !std::getenv("MFQ_MOE_PRELOAD_ALL")))
+        throw std::runtime_error("resident gate requires --host-cache and MFQ_MOE_PRELOAD_ALL=1 alone");
     const std::filesystem::path root(argv[1]);
     std::ifstream manifest(root/"cases.txt");
     if (!manifest) throw std::runtime_error("missing range cache fixture manifest");
@@ -131,7 +136,7 @@ int main(int argc,char** argv) try {
         std::int64_t bytes=0;
         for (const auto& pool:source->metadata()->pools) bytes+=slot_bytes(pool);
         execution.config.moe_host_cache_bytes=host_cache ? 3*bytes : 0;
-        auto cache=make_moe_expert_cache(bytes,execution.config);
+        auto cache=make_moe_expert_cache(hybrid ? 3*bytes : bytes,execution.config);
         auto cached=cache_quant_moe_weight(cache,"linear.weight",source,1,0,"gate");
         finalize_moe_expert_cache(cache);
         // The baseline follows the same canonical field layout and kernels.
@@ -143,6 +148,88 @@ int main(int argc,char** argv) try {
         auto x=tb::tensor(inputs).reshape({tokens,width}).to(tb::kFloat16).to(tb::kCUDA);
         const std::vector<std::int32_t> all={2,0,1,0,1,2,1,2,0};
         const auto cold_route=route(all,tokens,3);
+        if (resident) {
+            const auto before=bytes_read;
+            int cold=0,hot=0;
+            for (int expert=0; expert<3; ++expert) {
+                if (source->gpu_resident(expert)) ++hot;
+                else if (source->host_cache()->contains(source->host_key(expert))) ++cold;
+                else throw std::runtime_error("preload left an expert absent from both memory tiers");
+            }
+            if (!hot || hot+cold!=3 || !source->expert_disk_sealed())
+                throw std::runtime_error("resident fixture needs sealed RAM-cold and VRAM-hot experts");
+            auto actual=cached.forward(execution,x,cold_route);
+            auto gpu=baseline.forward(execution,x,cold_route);
+            auto actual_host=actual.to(tb::kCPU).to(tb::kFloat32).contiguous();
+            auto gpu_host=gpu.to(tb::kCPU).to(tb::kFloat32).contiguous();
+            for (int position=0; position<tokens*3; ++position) for (int row=0; row<output; ++row) {
+                const int expert=all[position],token=position/3;
+                const double expected=source->gpu_resident(expert) ? gpu_host.data_ptr<float>()[position*output+row]
+                    : reference[(token*3+expert)*output+row];
+                const double got=actual_host.data_ptr<float>()[position*output+row];
+                if (!std::isfinite(got) || std::abs(got-expected)>1e-5+1e-3*std::abs(expected))
+                    throw std::runtime_error("resident mixed prefill differs from GPU/independent FP64 oracle");
+            }
+            auto routed=x.unsqueeze(1).expand({tokens,3,width}).contiguous();
+            verify_gpu(cached.forward(execution,routed,cold_route),actual);
+            // Exercise the one-token adapter and duplicates with every tier.
+            auto single=cached.forward(execution,x.narrow(0,0,1).contiguous(),route({2,0,1},1,3));
+            auto single_cpu=single.to(tb::kCPU).to(tb::kFloat32).contiguous();
+            auto single_gpu=baseline.forward(execution,x.narrow(0,0,1).contiguous(),route({2,0,1},1,3))
+                .to(tb::kCPU).to(tb::kFloat32).contiguous();
+            for (int position=0; position<3; ++position) for (int row=0; row<output; ++row) {
+                const double expected=source->gpu_resident(all[position]) ? single_gpu.data_ptr<float>()[position*output+row]
+                    : reference[all[position]*output+row];
+                const double got=single_cpu.data_ptr<float>()[position*output+row];
+                if (!std::isfinite(got) || std::abs(got-expected)>1e-5+1e-3*std::abs(expected))
+                    throw std::runtime_error("resident mixed decode differs from GPU/independent FP64 oracle");
+            }
+            if (bytes_read!=before || source->expert_disk_reads_after_preload()!=0 || source->host_cache()->stats().evictions)
+                throw std::runtime_error("resident forward read disk or evicted RAM expert coverage");
+            bool refused=false;
+            try { source->read_expert(0); } catch (const std::runtime_error&) { refused=true; }
+            if (!refused || bytes_read!=before) throw std::runtime_error("sealed expert loader performed a disk read");
+            ++cases;
+            std::cout<<"resident "<<name<<" all experts preloaded; prefill/decode/route-major oracle PASS; zero expert disk reads"<<std::endl;
+            continue;
+        }
+        if (hybrid) {
+            if (!std::getenv("MFQ_MOE_HYBRID_CPU")) throw std::runtime_error("hybrid gate requires MFQ_MOE_HYBRID_CPU=1");
+            // Populate RAM with independent FP32 CPU work, then move only
+            // expert2 to VRAM. Experts0/1 must execute from their retained RAM
+            // fields without rereading SSD; expert2 must remain on the GPU.
+            verify_cpu(source->forward_cpu(execution,x,cold_route),reference,all,tokens,3,output);
+            source->host_cache()->erase(source->host_key(2));
+            auto one=x.narrow(0,0,1).contiguous();
+            auto hot=route({2},1,1);
+            auto expected_hot=baseline.forward(execution,one,hot);
+            verify_gpu(cached.forward(execution,one,hot),expected_hot);
+            const auto before=bytes_read, projections=source->cpu_projections();
+            auto mixed_route=route({2,0,1,0},1,4);
+            auto mixed=cached.forward(execution,one,mixed_route);
+            verify_gpu(mixed.narrow(1,0,1).contiguous(),expected_hot);
+            auto cpu_reference=source->forward_cpu(execution,one,route({0,1,0},1,3));
+            verify_gpu(mixed.narrow(1,1,3).contiguous(),cpu_reference);
+            auto routed_one=one.unsqueeze(1).expand({1,4,width}).contiguous();
+            auto routed_mixed=cached.forward(execution,routed_one,mixed_route);
+            verify_gpu(routed_mixed,mixed);
+            if (bytes_read!=before || !source->gpu_resident(2) || source->gpu_resident(0) ||
+                    source->gpu_resident(1) || source->cpu_projections()!=projections+6)
+                throw std::runtime_error("hybrid plan reread SSD or changed hot/cold expert ownership");
+            // A real SSD miss joins GPU-hot and RAM-cold work in the same call.
+            source->host_cache()->erase(source->host_key(1));
+            const auto materializations=source->materializations();
+            auto three_tiers=cached.forward(execution,one,mixed_route);
+            verify_gpu(three_tiers.narrow(1,0,1).contiguous(),expected_hot);
+            verify_gpu(three_tiers.narrow(1,2,1).contiguous(),baseline.forward(execution,one,route({1},1,1)));
+            verify_gpu(three_tiers.narrow(1,1,1).contiguous(),cpu_reference.narrow(1,0,1).contiguous());
+            if (source->materializations()!=materializations+1 || !source->gpu_resident(1) ||
+                    !source->gpu_resident(2) || source->gpu_resident(0) || source->cpu_projections()!=projections+7)
+                throw std::runtime_error("hybrid SSD admission reread hot weights or misplaced a cold expert");
+            ++cases;
+            std::cout<<"hybrid "<<name<<" GPU-hot/CPU-cold scalar and route-major output exact PASS"<<std::endl;
+            continue;
+        }
         if (shared_arena) {
             // Four physical slots serve two independent three-ID sources.
             // The source ID map remains length three and can map into slot 3.
