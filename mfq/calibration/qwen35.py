@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import struct
 from collections import defaultdict
@@ -59,6 +60,22 @@ class HfSafetensorIndex:
         self._shapes: dict[str, tuple[int, ...]] = {}
         self.direct_io = os.environ.get("MFQ_SAFETENSORS_DIRECT_IO", "") == "1"
         self._direct_headers: dict[str, tuple[int, dict[str, Any]]] = {}
+        self._native_plans = None
+        self._native_auxiliaries = set()
+
+    def _native_sources(self):
+        if self._native_plans is None:
+            from mfq.tools import quantize_hf_to_mfq as q
+            inventory = q._hf_source_inventory(self.root)
+            self._native_plans = {}
+            if any(item.dtype in q._HF_FP8_DTYPES | {'I8'} for item in inventory.values()):
+                encodings, self._native_auxiliaries = q._source_quantizations(inventory, q.load_hf_model_config(self.root))
+                for name, encoding in encodings.items():
+                    item = inventory[name]
+                    self._native_plans[name] = q.TensorPlan(name, item.shard, encoding.logical_shape or item.shape,
+                        encoding.logical_dtype or item.dtype, 'F32', source_name=name, source_quantization=encoding.scheme,
+                        source_scale_name=encoding.scale_name, source_scale_shard=encoding.scale_shard, source_scale_dtype=encoding.scale_dtype)
+        return self._native_plans
 
     def _direct_header(self, shard: str) -> tuple[int, dict[str, Any]]:
         try:
@@ -155,6 +172,9 @@ class HfSafetensorIndex:
         return tuple(self.weight_map)
 
     def shape(self, name: str) -> tuple[int, ...]:
+        plan = self._native_sources().get(name)
+        if plan is not None:
+            return plan.shape
         try:
             return self._shapes[name]
         except KeyError:
@@ -181,6 +201,16 @@ class HfSafetensorIndex:
         device: str | torch.device = "cpu",
         dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
+        plan = self._native_sources().get(name)
+        if plan is not None:
+            from mfq.tools import quantize_hf_to_mfq as q
+            start, end = row_start or 0, plan.shape[0] if row_end is None else row_end
+            if start < 0 or end < start or end > plan.shape[0]:
+                raise IndexError(f'invalid native rows {start}:{end} for {name}')
+            per_row = math.prod(plan.shape[1:-1])
+            reader = q._raw_source_for_plan(self.root, plan)
+            value = reader.read_rows(start * per_row, end * per_row, device=device).reshape(end - start, *plan.shape[1:])
+            return value.to(dtype=dtype or torch.float32).contiguous()
         try:
             shard = self.weight_map[name]
         except KeyError as exc:
@@ -211,11 +241,16 @@ class HfSafetensorIndex:
     ) -> Iterator[tuple[str, torch.Tensor]]:
         prefix = f"model.language_model.layers.{layer_index}."
         excluded = exclude or set()
+        native = self._native_sources()
         by_shard: dict[str, list[str]] = defaultdict(list)
         for name, shard in self.weight_map.items():
-            if name.startswith(prefix) and name not in excluded:
+            if name.startswith(prefix) and name not in excluded and name not in self._native_auxiliaries:
                 by_shard[shard].append(name)
         for shard, names in sorted(by_shard.items()):
+            if native:
+                for name in sorted(names):
+                    yield name[len(prefix) :], self.tensor(name)
+                continue
             if self.direct_io:
                 for name in sorted(names):
                     yield name[len(prefix) :], self._direct_tensor(name)

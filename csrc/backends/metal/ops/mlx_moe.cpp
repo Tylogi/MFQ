@@ -1,6 +1,9 @@
 #include "mlx_moe.h"
+#include "mlx_kernel_prepare.h"
+#include "mlx_weight_residency.h"
 #include "mlx_nvq3jl.h"
 #include "mlx_resource_telemetry.h"
+#include "mlx_resident_budget.h"
 
 #include "mfq_container.h"
 #include "mfq_mfe_prefill_embedded.h"
@@ -122,7 +125,8 @@ bool mixed_grouped_nax_enabled(int route_count) noexcept {
 
 int grouped_mmq_tile_columns(
     int block_rows,
-    int output_width) noexcept {
+    int output_width,
+    bool fused_swiglu) noexcept {
     const char* value = std::getenv(
         "MFQ_METAL_GROUPED_MMQ_TILE_COLUMNS");
     if (value != nullptr) {
@@ -137,6 +141,9 @@ int grouped_mmq_tile_columns(
         if (std::string_view(value) == "64") {
             return 64;
         }
+    }
+    if (block_rows == 128 && !fused_swiglu) {
+        return 32;
     }
     // Use the largest column tile that remains within the 32-KiB
     // threadgroup-memory budget for this row tile. Wider column tiles reduce
@@ -2469,6 +2476,7 @@ constexpr const char* kMoeSource = R"METAL(
 )METAL";
 
 constexpr const char* kMoeHadamardSource = R"METAL(
+    const uint M = uint(x_shape[0]);
     uint row = thread_position_in_grid.x / 256u;
     uint lane = thread_index_in_threadgroup;
     if (row >= uint(M)) {
@@ -2713,7 +2721,9 @@ array allocate_packed_array(std::size_t bytes, Dtype dtype) {
     const auto layout = detail::packed_storage_layout(bytes / dtype.size());
     const Shape shape = layout.is_matrix()
         ? Shape{layout.rows, layout.columns} : Shape{layout.columns};
-    return array(mlx::core::allocator::malloc(bytes), shape, dtype);
+    auto result = array(mlx::core::allocator::malloc(bytes), shape, dtype);
+    MlxWeightResidency::track(result);
+    return result;
 }
 
 // Keep source ownership, not a second model-sized byte vector. Once all chunks
@@ -2755,6 +2765,7 @@ public:
                 source != nullptr && source->dtype() == dtype) {
                 auto result = mlx::core::reshape(*source, shape);
                 result.eval();
+                MlxWeightResidency::track(result);
                 return result;
             }
         }
@@ -2866,7 +2877,9 @@ void align_packed_stream(
 array make_int32_array(
     const std::vector<std::int32_t>& values,
     Shape shape) {
-    return array(values.begin(), std::move(shape));
+    auto result = array(values.begin(), std::move(shape));
+    MlxWeightResidency::track(result);
+    return result;
 }
 
 struct NativeMoeConfig {
@@ -2943,6 +2956,7 @@ struct GroupedMmqConfig {
     int has_nepq_residual = 0;
     int family_mask = 127;
     int vq_profile_mask = 0;
+    std::shared_ptr<const std::vector<int>> nint_group_sizes;
     bool use_nax = false;
     bool direct_nax = false;
     float swiglu_limit = 0.0f;
@@ -2994,6 +3008,8 @@ grouped_mmq_block_builder(bool cohort_ordered) {
             : "#define MFQ_SCHEDULED_EXPERT(index) int(index)\n";
         source +=
             R"METAL(
+                const int M = indices_shape[0];
+                const int MAX_BLOCKS = (M + BM - 1) / BM + NUM_EXPERTS;
                 const uint schedule_index = thread_index_in_threadgroup;
                 const uint expert = uint(
                     MFQ_SCHEDULED_EXPERT(schedule_index));
@@ -3160,9 +3176,9 @@ MlxGroupedMmqPlan make_grouped_mmq_plan(
     int experts,
     int block_rows = 32) {
     if (block_rows != 32 && block_rows != 48 && block_rows != 64
-        && block_rows != 80 && block_rows != 96) {
+        && block_rows != 80 && block_rows != 96 && block_rows != 128) {
         throw std::invalid_argument(
-            "grouped MMQ block rows must be 32, 48, 64, 80, or 96");
+            "grouped MMQ block rows must be 32, 48, 64, 80, 96, or 128");
     }
     if (experts <= 0 || experts > 1024) {
         throw std::invalid_argument(
@@ -3233,8 +3249,6 @@ MlxGroupedMmqPlan make_grouped_mmq_plan(
         {
             {"NUM_EXPERTS", experts},
             {"BM", block_rows},
-            {"M", route_count},
-            {"MAX_BLOCKS", max_blocks},
             {
                 "BLOCK_CHUNK",
                 // Above 96 mean routes, pair adjacent blocks in deterministic
@@ -3283,9 +3297,9 @@ std::string native_moe_kernel_name(
     const NativeMoeConfig& config) {
     std::ostringstream name;
     name
-        << "mfq_native_mfe_v3_"
+        << "mfq_native_mfe_v4_"
         << (config.dtype == mlx::core::float16 ? "f16" : "f32")
-        << "_t" << config.tokens
+        << (config.tokens == 1 ? "_decode" : "_batch")
         << "_r" << config.routes
         << "_e" << config.experts
         << "_o" << config.output_width
@@ -3295,7 +3309,6 @@ std::string native_moe_kernel_name(
         << "_k" << config.input_width
         << "_kl" << config.k_lanes
         << "_rs" << config.rows_per_simd
-        << "_vs" << config.variant_stride
         << "_si" << config.shared_input
         << "_vl" << config.vq_execution_layout
         << "_fm" << config.family_mask
@@ -3357,13 +3370,18 @@ std::string make_native_moe_source(
         << "device T* y [[buffer("
         << (has_expert_map ? 27 : 26)
         << ")]],\n"
+        << "constant int* geometry [[buffer("
+        << (has_expert_map ? 28 : 27)
+        << ")]],\n"
         << "uint thread_index_in_simdgroup "
            "[[thread_index_in_simdgroup]],\n"
         << "uint simdgroup_index_in_threadgroup "
            "[[simdgroup_index_in_threadgroup]],\n"
         << "uint3 threadgroup_position_in_grid "
            "[[threadgroup_position_in_grid]]) {\n"
-        << "constexpr int TOKENS = " << config.tokens << ";\n"
+        << (config.tokens == 1
+            ? "constexpr int TOKENS = 1;\n"
+            : "const int TOKENS = geometry[0];\n")
         << "constexpr int ROUTES = " << config.routes << ";\n"
         << "constexpr int EXPERTS = " << config.experts << ";\n"
         << "constexpr int OUT = " << config.output_width << ";\n"
@@ -3380,8 +3398,9 @@ std::string make_native_moe_source(
         << config.rows_per_simd << ";\n"
         << "constexpr int DESCRIPTOR_SIZE = "
         << config.descriptor_size << ";\n"
-        << "constexpr int VARIANT_STRIDE = "
-        << config.variant_stride << ";\n"
+        << (config.tokens == 1
+            ? "constexpr int VARIANT_STRIDE = " + std::to_string(config.variant_stride) + ";\n"
+            : "const int VARIANT_STRIDE = geometry[1];\n")
         << "constexpr int SHARED_INPUT = "
         << config.shared_input << ";\n"
         << "constexpr int VQ_EXECUTION_LAYOUT = "
@@ -3410,7 +3429,7 @@ std::string make_native_moe_source(
 }
 
 class NativeMfePrimitive final
-    : public mlx::core::UnaryPrimitive {
+    : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
 public:
     NativeMfePrimitive(
         mlx::core::Stream stream,
@@ -3418,6 +3437,28 @@ public:
         : UnaryPrimitive(stream),
           config_(std::move(config)),
           kernel_name_(native_moe_kernel_name(config_)) {}
+
+    std::string preparation_key() const override { return kernel_name_; }
+    void prepare_gpu() override { (void)prepared_kernel(); }
+
+    MTL::ComputePipelineState* prepared_kernel() {
+        auto& selected_stream = stream();
+        auto& device = mlx::core::metal::device(
+            selected_stream.device);
+        CompileOptions compile_options;
+        compile_options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(
+            kernel_name_,
+            compile_options,
+            [config = config_, name = kernel_name_] {
+                return make_native_moe_source(
+                    config,
+                    name);
+            });
+        return device.get_kernel(
+            kernel_name_,
+            library);
+    }
 
     void eval_cpu(
         const std::vector<array>&,
@@ -3438,21 +3479,7 @@ public:
         output.set_data(
             mlx::core::allocator::malloc(output.nbytes()));
         auto& selected_stream = stream();
-        auto& device = mlx::core::metal::device(
-            selected_stream.device);
-        CompileOptions compile_options;
-        compile_options.math_mode = MathMode::Fast;
-        auto* library = device.get_library(
-            kernel_name_,
-            compile_options,
-            [config = config_, name = kernel_name_] {
-                return make_native_moe_source(
-                    config,
-                    name);
-            });
-        auto* kernel = device.get_kernel(
-            kernel_name_,
-            library);
+        auto* kernel = prepared_kernel();
         auto& encoder =
             mlx::core::metal::get_command_encoder(
                 selected_stream);
@@ -3463,6 +3490,8 @@ public:
                 index);
         }
         encoder.set_output_array(output, input_count);
+        const std::array<int, 2> geometry{config_.tokens, config_.variant_stride};
+        encoder.set_bytes(geometry.data(), sizeof(geometry), input_count + 1);
         encoder.dispatch_threadgroups(
             MTL::Size(config_.workgroups, 1, 1),
             MTL::Size(64, 1, 1));
@@ -3477,7 +3506,10 @@ public:
         const auto* primitive =
             dynamic_cast<const NativeMfePrimitive*>(&other);
         return primitive != nullptr
-            && primitive->kernel_name_ == kernel_name_;
+            && primitive->kernel_name_ == kernel_name_
+            && primitive->config_.tokens == config_.tokens
+            && primitive->config_.variant_stride == config_.variant_stride
+            && primitive->config_.workgroups == config_.workgroups;
     }
 
     std::vector<Shape> output_shapes(
@@ -3943,7 +3975,7 @@ std::string make_mfe_nint_down_source(
     return source.str();
 }
 
-class MfeNintDecodePrimitive final : public mlx::core::UnaryPrimitive {
+class MfeNintDecodePrimitive final : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
 public:
     MfeNintDecodePrimitive(
         mlx::core::Stream stream,
@@ -3953,6 +3985,25 @@ public:
           config_(std::move(config)),
           stage_(stage),
           kernel_name_(mfe_decode_kernel_name(config_, stage_)) {}
+
+    std::string preparation_key() const override { return kernel_name_; }
+    void prepare_gpu() override { (void)prepared_kernel(); }
+
+    MTL::ComputePipelineState* prepared_kernel() {
+        auto& selected_stream = stream();
+        auto& device = mlx::core::metal::device(selected_stream.device);
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(
+            kernel_name_,
+            options,
+            [config = config_, name = kernel_name_, stage = stage_] {
+                return stage == 1
+                    ? make_mfe_nint_gate_up_source(config, name)
+                    : make_mfe_nint_down_source(config, name);
+            });
+        return device.get_kernel(kernel_name_, library);
+    }
 
     void eval_cpu(const std::vector<array>&, array&) override {
         throw std::runtime_error(
@@ -3969,18 +4020,7 @@ public:
         }
         output.set_data(mlx::core::allocator::malloc(output.nbytes()));
         auto& selected_stream = stream();
-        auto& device = mlx::core::metal::device(selected_stream.device);
-        CompileOptions options;
-        options.math_mode = MathMode::Fast;
-        auto* library = device.get_library(
-            kernel_name_,
-            options,
-            [config = config_, name = kernel_name_, stage = stage_] {
-                return stage == 1
-                    ? make_mfe_nint_gate_up_source(config, name)
-                    : make_mfe_nint_down_source(config, name);
-            });
-        auto* kernel = device.get_kernel(kernel_name_, library);
+        auto* kernel = prepared_kernel();
         auto& encoder = mlx::core::metal::get_command_encoder(
             selected_stream);
         encoder.set_compute_pipeline_state(kernel);
@@ -4237,7 +4277,7 @@ std::string make_mxfp4_decode_reduce_source(
 }
 
 class Mxfp4DecodeReducePrimitive final
-    : public mlx::core::UnaryPrimitive {
+    : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
 public:
     Mxfp4DecodeReducePrimitive(
         mlx::core::Stream stream,
@@ -4245,6 +4285,24 @@ public:
         : UnaryPrimitive(stream),
           config_(std::move(config)),
           kernel_name_(mxfp4_decode_reduce_kernel_name(config_)) {}
+
+    std::string preparation_key() const override { return kernel_name_; }
+    void prepare_gpu() override { (void)prepared_kernel(); }
+
+    MTL::ComputePipelineState* prepared_kernel() {
+        auto& selected_stream = stream();
+        auto& device = mlx::core::metal::device(
+            selected_stream.device);
+        CompileOptions compile_options;
+        compile_options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(
+            kernel_name_,
+            compile_options,
+            [config = config_, name = kernel_name_] {
+                return make_mxfp4_decode_reduce_source(config, name);
+            });
+        return device.get_kernel(kernel_name_, library);
+    }
 
     void eval_cpu(
         const std::vector<array>&,
@@ -4263,17 +4321,7 @@ public:
         output.set_data(
             mlx::core::allocator::malloc(output.nbytes()));
         auto& selected_stream = stream();
-        auto& device = mlx::core::metal::device(
-            selected_stream.device);
-        CompileOptions compile_options;
-        compile_options.math_mode = MathMode::Fast;
-        auto* library = device.get_library(
-            kernel_name_,
-            compile_options,
-            [config = config_, name = kernel_name_] {
-                return make_mxfp4_decode_reduce_source(config, name);
-            });
-        auto* kernel = device.get_kernel(kernel_name_, library);
+        auto* kernel = prepared_kernel();
         auto& encoder = mlx::core::metal::get_command_encoder(
             selected_stream);
         encoder.set_compute_pipeline_state(kernel);
@@ -4487,7 +4535,7 @@ std::string make_mxfp4_pair_swiglu_source(
 }
 
 class Mxfp4PairSwiGluPrimitive final
-    : public mlx::core::UnaryPrimitive {
+    : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
 public:
     Mxfp4PairSwiGluPrimitive(
         mlx::core::Stream stream,
@@ -4495,6 +4543,24 @@ public:
         : UnaryPrimitive(stream),
           config_(std::move(config)),
           kernel_name_(mxfp4_pair_swiglu_kernel_name(config_)) {}
+
+    std::string preparation_key() const override { return kernel_name_; }
+    void prepare_gpu() override { (void)prepared_kernel(); }
+
+    MTL::ComputePipelineState* prepared_kernel() {
+        auto& selected_stream = stream();
+        auto& device = mlx::core::metal::device(
+            selected_stream.device);
+        CompileOptions compile_options;
+        compile_options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(
+            kernel_name_,
+            compile_options,
+            [config = config_, name = kernel_name_] {
+                return make_mxfp4_pair_swiglu_source(config, name);
+            });
+        return device.get_kernel(kernel_name_, library);
+    }
 
     void eval_cpu(
         const std::vector<array>&,
@@ -4513,17 +4579,7 @@ public:
         output.set_data(
             mlx::core::allocator::malloc(output.nbytes()));
         auto& selected_stream = stream();
-        auto& device = mlx::core::metal::device(
-            selected_stream.device);
-        CompileOptions compile_options;
-        compile_options.math_mode = MathMode::Fast;
-        auto* library = device.get_library(
-            kernel_name_,
-            compile_options,
-            [config = config_, name = kernel_name_] {
-                return make_mxfp4_pair_swiglu_source(config, name);
-            });
-        auto* kernel = device.get_kernel(kernel_name_, library);
+        auto* kernel = prepared_kernel();
         auto& encoder = mlx::core::metal::get_command_encoder(
             selected_stream);
         encoder.set_compute_pipeline_state(kernel);
@@ -4581,7 +4637,7 @@ array mxfp4_pair_swiglu_dispatch(
 }
 
 class Mxfp4BlocksPrimitive final
-    : public mlx::core::UnaryPrimitive {
+    : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
 public:
     Mxfp4BlocksPrimitive(
         mlx::core::Stream stream,
@@ -4589,25 +4645,11 @@ public:
         : UnaryPrimitive(stream),
           config_(std::move(config)) {}
 
-    void eval_cpu(
-        const std::vector<array>&,
-        array&) override {
-        throw std::runtime_error(
-            "MXFP4 block primitive has no CPU path");
-    }
+    std::string preparation_key() const override { return config_.paired ? "mfq_mxfp4_blocks_pair" : "mfq_mxfp4_blocks_single"; }
+    void prepare_gpu() override { (void)prepared_kernel(); }
 
-    void eval_gpu(
-        const std::vector<array>& inputs,
-        array& output) override {
-        if (inputs.size() != 9) {
-            throw std::logic_error(
-                "MXFP4 block primitive input count mismatch");
-        }
-        output.set_data(
-            mlx::core::allocator::malloc(output.nbytes()));
-        auto& selected_stream = stream();
-        auto& device = mlx::core::metal::device(
-            selected_stream.device);
+    MTL::ComputePipelineState* prepared_kernel() {
+        auto& device = mlx::core::metal::device(stream().device);
         CompileOptions compile_options;
         compile_options.math_mode = MathMode::Fast;
         auto* library = device.get_library(
@@ -4631,9 +4673,29 @@ public:
         const char* kernel_name = config_.paired
             ? "mfq_dsv4_mxfp4_pair_concat_f16_bm32_bn32_bk32"
             : "mfq_dsv4_mxfp4_single_f16_bm32_bn32_bk32";
-        auto* kernel = device.get_kernel(
-            kernel_name,
-            library);
+        return device.get_kernel(kernel_name, library);
+    }
+
+    void eval_cpu(
+        const std::vector<array>&,
+        array&) override {
+        throw std::runtime_error(
+            "MXFP4 block primitive has no CPU path");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        array& output) override {
+        if (inputs.size() != 9) {
+            throw std::logic_error(
+                "MXFP4 block primitive input count mismatch");
+        }
+        output.set_data(
+            mlx::core::allocator::malloc(output.nbytes()));
+        auto& selected_stream = stream();
+        auto& device = mlx::core::metal::device(
+            selected_stream.device);
+        auto* kernel = prepared_kernel();
         auto& encoder =
             mlx::core::metal::get_command_encoder(
                 selected_stream);
@@ -4702,13 +4764,218 @@ array mxfp4_blocks_dispatch(
 }
 
 class GroupedMmqPrimitive final
-    : public mlx::core::UnaryPrimitive {
+    : public mlx::core::UnaryPrimitive, public MlxPreparableKernel {
 public:
     GroupedMmqPrimitive(
         mlx::core::Stream stream,
         GroupedMmqConfig config)
         : UnaryPrimitive(stream),
           config_(std::move(config)) {}
+
+    std::string preparation_key() const override {
+        std::string key = "grouped_mmq";
+        for (const int value : {config_.block_rows, config_.tile_columns, config_.projections,
+                config_.input_width, config_.output_width, config_.matrix_output_width,
+                config_.fused_swiglu, config_.has_nepq_residual, config_.family_mask,
+                config_.vq_profile_mask, static_cast<int>(config_.use_nax), static_cast<int>(config_.direct_nax)})
+            key += "_" + std::to_string(value);
+        if (config_.nint_group_sizes)
+            for (const int group : *config_.nint_group_sizes) key += "_gs" + std::to_string(group);
+        return key;
+    }
+    void prepare_gpu() override { (void)prepared_kernels(); }
+
+    std::vector<std::pair<MTL::ComputePipelineState*, int>> prepared_kernels() {
+        auto& selected_stream = stream();
+        auto& device = mlx::core::metal::device(
+            selected_stream.device);
+        CompileOptions compile_options;
+        compile_options.math_mode = MathMode::Fast;
+        const bool vector_vq =
+            (static_cast<std::uint32_t>(config_.vq_profile_mask)
+                & kGroupedVqVectorProfileMask) != 0;
+        const bool vector_jsc_extended =
+            (static_cast<std::uint32_t>(config_.vq_profile_mask)
+                & kGroupedJscExtendedProfileMask) != 0;
+        const bool aligned_input = config_.tile_columns <= 64
+            && !config_.direct_nax && config_.input_width % 32 == 0;
+        const auto get_library = [&](int family_mask, int group_size, int simd_rows) {
+            const bool uses_vq = !config_.use_nax
+                || (family_mask & (1 << kFamilyVq)) != 0;
+            const bool selected_vector_vq = vector_vq && uses_vq;
+            const bool selected_extended = vector_jsc_extended && uses_vq;
+            std::string library_name;
+            if (config_.use_nax) {
+                library_name = selected_vector_vq
+                    ? (selected_extended
+                        ? "mfq_grouped_mfe_nax_v15_legacy_vq_jsc_extended"
+                        : "mfq_grouped_mfe_nax_v15_legacy_vq_vector")
+                    : (selected_extended
+                        ? "mfq_grouped_mfe_nax_v15_jsc_extended"
+                        : "mfq_grouped_mfe_nax_v15");
+            } else {
+                library_name = vector_vq
+                    ? (vector_jsc_extended
+                        ? "mfq_grouped_mmq_v13_legacy_vq_jsc_extended"
+                        : "mfq_grouped_mmq_v13_legacy_vq_vector")
+                    : (vector_jsc_extended
+                        ? "mfq_grouped_mmq_v13_jsc_extended"
+                        : "mfq_grouped_mmq_v13");
+            }
+            if (config_.use_nax) {
+                library_name += "_fm" + std::to_string(family_mask)
+                    + "_gs" + std::to_string(group_size)
+                    + "_bm" + std::to_string(config_.block_rows)
+                    + "_bn" + std::to_string(config_.tile_columns)
+                    + "_ak" + std::to_string(aligned_input)
+                    + "_sm" + std::to_string(simd_rows)
+                    + "_sw" + std::to_string(config_.fused_swiglu)
+                    + "_di" + std::to_string(config_.direct_nax)
+                    + "_iw" + std::to_string(config_.input_width)
+                    + "_ow" + std::to_string(config_.output_width)
+                    + "_mw" + std::to_string(config_.matrix_output_width);
+            }
+            return device.get_library(
+                library_name,
+                compile_options,
+                [
+                    use_nax = config_.use_nax,
+                    vector_vq = selected_vector_vq,
+                    vector_jsc_extended = selected_extended,
+                    family_mask,
+                    group_size,
+                    block_rows = config_.block_rows,
+                    tile_columns = config_.tile_columns,
+                    aligned_input,
+                    simd_rows,
+                    fused = config_.fused_swiglu,
+                    direct = config_.direct_nax,
+                    input_width = config_.input_width,
+                    output_width = config_.output_width,
+                    matrix_output_width = config_.matrix_output_width
+                ] {
+                    std::string source;
+                    source.reserve(
+                        (use_nax
+                            ? sizeof(detail::kSteelNaxSource)
+                            : sizeof(detail::kSteelMmaSource))
+                        + sizeof(detail::kMfePrefillSource)
+                        + 256);
+                    source += "#include <metal_stdlib>\n";
+                    source += "#include <metal_simdgroup>\n";
+                    source += "#include <metal_simdgroup_matrix>\n";
+                    if (use_nax) {
+                        source += "#include <MetalPerformancePrimitives/"
+                            "MetalPerformancePrimitives.h>\n";
+                        source += "#define MFQ_ENABLE_NAX 1\n";
+                    }
+                    if (vector_vq) {
+                        source +=
+                            "#define MFQ_ENABLE_LEGACY_VQ_VECTOR 1\n";
+                    }
+                    if (vector_jsc_extended) {
+                        source +=
+                            "#define MFQ_ENABLE_JSC_EXTENDED_VECTOR 1\n";
+                    }
+                    if (use_nax) {
+                        source += "#define MFQ_GROUPED_FAMILY_MASK ";
+                        source += std::to_string(family_mask);
+                        source += "\n";
+                        source += "#define MFQ_GROUPED_NINT_GROUP_SIZE ";
+                        source += std::to_string(group_size);
+                        source += "\n";
+                        source += "#define MFQ_GROUPED_NAX_BM "
+                            + std::to_string(block_rows) + "\n";
+                        source += "#define MFQ_GROUPED_NAX_BN "
+                            + std::to_string(tile_columns) + "\n";
+                        source += "#define MFQ_GROUPED_NAX_ALIGNED_INPUT "
+                            + std::to_string(aligned_input) + "\n";
+                        source += "#define MFQ_GROUPED_NAX_SIMD_ROWS "
+                            + std::to_string(simd_rows) + "\n";
+                        source += "#define MFQ_GROUPED_NAX_INPUT_WIDTH "
+                            + std::to_string(input_width) + "\n";
+                        source += "#define MFQ_GROUPED_NAX_OUTPUT_WIDTH "
+                            + std::to_string(output_width) + "\n";
+                        source += "#define MFQ_GROUPED_NAX_MATRIX_OUTPUT_WIDTH "
+                            + std::to_string(matrix_output_width) + "\n";
+                        const bool aligned_nint = family_mask == (1 << kFamilyNint)
+                            && group_size == 28 && tile_columns <= 64
+                            && !fused && !direct;
+                        const bool balanced_loader = tile_columns <= 64
+                            && block_rows == 128 && !fused && !direct
+                            && ((family_mask == (1 << kFamilyNint)
+                                    && group_size == 24 && simd_rows == 16)
+                                || (family_mask == (1 << kFamilyVq)
+                                    && simd_rows == 16));
+                        source += "#define MFQ_GROUPED_NAX_BK "
+                            + std::to_string(aligned_nint ? 224
+                                : balanced_loader ? 192 : 96) + "\n";
+                        const int x_stride = aligned_nint ? 228
+                            : balanced_loader ? 196 : tile_columns == 128
+                            || (tile_columns <= 64 && block_rows != 32
+                                && block_rows != 64) ? 100 : 104;
+                        const int w_stride = tile_columns <= 64 ? x_stride : 100;
+                        source += "#define MFQ_GROUPED_NAX_X_STRIDE "
+                            + std::to_string(x_stride) + "\n";
+                        source += "#define MFQ_GROUPED_NAX_W_STRIDE "
+                            + std::to_string(w_stride) + "\n";
+                        source += "#define MFQ_GROUPED_NAX_FUSED "
+                            + std::to_string(fused != 0) + "\n";
+                        source += "#define MFQ_GROUPED_NAX_DIRECT "
+                            + std::to_string(direct) + "\n";
+                    }
+                    source += "using namespace metal;\n";
+                    source += "using bfloat16_t = bfloat;\n";
+                    source += use_nax
+                        ? detail::kSteelNaxSource
+                        : detail::kSteelMmaSource;
+                    source += detail::kMfePrefillSource;
+                    return source;
+                });
+        };
+        const char* kernel_name = config_.use_nax
+            ? "mfq_grouped_mfe_nax_f16_specialized"
+            : (config_.fused_swiglu != 0
+                ? (config_.has_nepq_residual != 0
+                    ? "mfq_grouped_mmq_swiglu_f16_bm32_bn64_bk96_nr"
+                    : "mfq_grouped_mmq_swiglu_f16_bm32_bn64_bk96")
+                : (config_.has_nepq_residual != 0
+                    ? "mfq_grouped_mmq_f16_bm32_bn64_bk96_nr"
+                    : "mfq_grouped_mmq_f16_bm32_bn64_bk96"));
+        std::vector<std::pair<MTL::ComputePipelineState*, int>> kernels;
+        std::vector<std::pair<int, int>> passes;
+        if (config_.use_nax && !config_.direct_nax
+            && config_.projections == 1 && config_.fused_swiglu == 0) {
+            for (int family = 0; family < 7; ++family) {
+                const int mask = 1 << family;
+                if ((config_.family_mask & mask) == 0) continue;
+                if (family == kFamilyNint && config_.nint_group_sizes
+                    && !config_.nint_group_sizes->empty()) {
+                    for (const auto group_size : *config_.nint_group_sizes) {
+                        passes.emplace_back(mask, group_size);
+                    }
+                } else {
+                    passes.emplace_back(mask, 0);
+                }
+            }
+        } else {
+            passes.emplace_back(config_.use_nax ? config_.family_mask : 127, 0);
+        }
+        for (const auto& [family_mask, group_size] : passes) {
+            const int simd_rows = config_.use_nax
+                    && (family_mask == (1 << kFamilyVq)
+                        || (family_mask == (1 << kFamilyNint) && group_size == 24))
+                    && config_.block_rows == 128 && config_.tile_columns == 32
+                    && config_.output_width > config_.input_width
+                    && aligned_input && !config_.direct_nax
+                    && config_.fused_swiglu == 0
+                ? 32 : 16;
+            auto* library = get_library(family_mask, group_size, simd_rows);
+            auto* kernel = device.get_kernel(kernel_name, library);
+            kernels.emplace_back(kernel, simd_rows);
+        }
+        return kernels;
+    }
 
     void eval_cpu(
         const std::vector<array>&,
@@ -4727,84 +4994,6 @@ public:
         output.set_data(
             mlx::core::allocator::malloc(output.nbytes()));
         auto& selected_stream = stream();
-        auto& device = mlx::core::metal::device(
-            selected_stream.device);
-        CompileOptions compile_options;
-        compile_options.math_mode = MathMode::Fast;
-        const bool vector_vq =
-            (static_cast<std::uint32_t>(config_.vq_profile_mask)
-                & kGroupedVqVectorProfileMask) != 0;
-        const bool vector_jsc_extended =
-            (static_cast<std::uint32_t>(config_.vq_profile_mask)
-                & kGroupedJscExtendedProfileMask) != 0;
-        std::string library_name;
-        if (config_.use_nax) {
-            library_name = vector_vq
-                ? (vector_jsc_extended
-                    ? "mfq_grouped_mfe_nax_v2_legacy_vq_jsc_extended"
-                    : "mfq_grouped_mfe_nax_v2_legacy_vq_vector")
-                : (vector_jsc_extended
-                    ? "mfq_grouped_mfe_nax_v2_jsc_extended"
-                    : "mfq_grouped_mfe_nax_v2");
-        } else {
-            library_name = vector_vq
-                ? (vector_jsc_extended
-                    ? "mfq_grouped_mmq_v13_legacy_vq_jsc_extended"
-                    : "mfq_grouped_mmq_v13_legacy_vq_vector")
-                : (vector_jsc_extended
-                    ? "mfq_grouped_mmq_v13_jsc_extended"
-                    : "mfq_grouped_mmq_v13");
-        }
-        if (config_.use_nax) {
-            library_name += "_fm" + std::to_string(config_.family_mask);
-        }
-        auto* library = device.get_library(
-            library_name,
-            compile_options,
-            [
-                use_nax = config_.use_nax,
-                vector_vq,
-                vector_jsc_extended,
-                family_mask = config_.use_nax
-                    ? config_.family_mask
-                    : 127
-            ] {
-                std::string source;
-                source.reserve(
-                    (use_nax
-                        ? sizeof(detail::kSteelNaxSource)
-                        : sizeof(detail::kSteelMmaSource))
-                    + sizeof(detail::kMfePrefillSource)
-                    + 256);
-                source += "#include <metal_stdlib>\n";
-                source += "#include <metal_simdgroup>\n";
-                source += "#include <metal_simdgroup_matrix>\n";
-                if (use_nax) {
-                    source += "#include <MetalPerformancePrimitives/"
-                        "MetalPerformancePrimitives.h>\n";
-                    source += "#define MFQ_ENABLE_NAX 1\n";
-                }
-                if (vector_vq) {
-                    source +=
-                        "#define MFQ_ENABLE_LEGACY_VQ_VECTOR 1\n";
-                }
-                if (vector_jsc_extended) {
-                    source +=
-                        "#define MFQ_ENABLE_JSC_EXTENDED_VECTOR 1\n";
-                }
-                if (use_nax) {
-                    source += "#define MFQ_GROUPED_FAMILY_MASK ";
-                    source += std::to_string(family_mask);
-                    source += "\n";
-                }
-                source += "using namespace metal;\n";
-                source += "using bfloat16_t = bfloat;\n";
-                source += use_nax
-                    ? detail::kSteelNaxSource
-                    : detail::kSteelMmaSource;
-                source += detail::kMfePrefillSource;
-                return source;
-            });
         auto& encoder =
             mlx::core::metal::get_command_encoder(
                 selected_stream);
@@ -4850,71 +5039,23 @@ public:
         }
         encoder.set_input_array(inputs[6], 27);
         encoder.set_input_array(inputs[7], 28);
-        const bool block48 = config_.block_rows == 48;
-        const bool block64 = config_.block_rows == 64;
-        const bool block80 = config_.block_rows == 80;
-        const bool block96 = config_.block_rows == 96;
-        const bool columns96 = config_.tile_columns == 96;
-        const bool columns128 = config_.tile_columns == 128;
-        const char* kernel_name = config_.use_nax
-            ? (config_.direct_nax
-                ? (config_.fused_swiglu != 0
-                    ? "mfq_grouped_mfe_nax_direct_swiglu_f16_bm32_bn64_bk96"
-                    : "mfq_grouped_mfe_nax_direct_f16_bm32_bn64_bk96")
-                : (config_.fused_swiglu != 0
-                    ? (columns96
-                        ? (block48
-                            ? "mfq_grouped_mfe_nax_swiglu_f16_bm48_bn96_bk96"
-                            : "mfq_grouped_mfe_nax_swiglu_f16_bm64_bn96_bk96")
-                        : columns128
-                        ? "mfq_grouped_mfe_nax_swiglu_f16_bm32_bn128_bk96"
-                        : block96
-                        ? "mfq_grouped_mfe_nax_swiglu_f16_bm96_bn64_bk96"
-                        : block80
-                        ? "mfq_grouped_mfe_nax_swiglu_f16_bm80_bn64_bk96"
-                        : block48
-                        ? "mfq_grouped_mfe_nax_swiglu_f16_bm48_bn64_bk96"
-                        : block64
-                        ? "mfq_grouped_mfe_nax_swiglu_f16_bm64_bn64_bk96"
-                        : "mfq_grouped_mfe_nax_swiglu_f16_bm32_bn64_bk96")
-                    : (columns96
-                        ? (block48
-                            ? "mfq_grouped_mfe_nax_f16_bm48_bn96_bk96"
-                            : "mfq_grouped_mfe_nax_f16_bm64_bn96_bk96")
-                        : columns128
-                        ? "mfq_grouped_mfe_nax_f16_bm32_bn128_bk96"
-                        : block96
-                        ? "mfq_grouped_mfe_nax_f16_bm96_bn64_bk96"
-                        : block80
-                        ? "mfq_grouped_mfe_nax_f16_bm80_bn64_bk96"
-                        : block48
-                        ? "mfq_grouped_mfe_nax_f16_bm48_bn64_bk96"
-                        : block64
-                        ? "mfq_grouped_mfe_nax_f16_bm64_bn64_bk96"
-                        : "mfq_grouped_mfe_nax_f16_bm32_bn64_bk96")))
-            : (config_.fused_swiglu != 0
-                ? (config_.has_nepq_residual != 0
-                    ? "mfq_grouped_mmq_swiglu_f16_bm32_bn64_bk96_nr"
-                    : "mfq_grouped_mmq_swiglu_f16_bm32_bn64_bk96")
-                : (config_.has_nepq_residual != 0
-                    ? "mfq_grouped_mmq_f16_bm32_bn64_bk96_nr"
-                    : "mfq_grouped_mmq_f16_bm32_bn64_bk96"));
-        auto* kernel = device.get_kernel(
-            kernel_name,
-            library);
-        encoder.set_compute_pipeline_state(kernel);
-        encoder.dispatch_threadgroups(
-            MTL::Size(
-                (config_.output_width + config_.tile_columns - 1)
-                    / config_.tile_columns,
-                config_.max_blocks,
-                1),
-            MTL::Size(
-                config_.use_nax
-                    ? config_.block_rows * config_.tile_columns / 16
-                    : 256,
-                1,
-                1));
+        const int columns = (config_.output_width + config_.tile_columns - 1)
+            / config_.tile_columns;
+        const int rows_x = config_.use_nax && config_.block_rows == 128
+            ? 1 : std::min(32, config_.max_blocks);
+        for (const auto& [kernel, simd_rows] : prepared_kernels()) {
+            encoder.set_compute_pipeline_state(kernel);
+            encoder.dispatch_threadgroups(
+                config_.use_nax ? MTL::Size(rows_x,
+                    std::size_t((config_.max_blocks + rows_x - 1) / rows_x) * columns, 1)
+                    : MTL::Size(columns, config_.max_blocks, 1),
+                MTL::Size(
+                    config_.use_nax
+                        ? config_.block_rows * config_.tile_columns / simd_rows
+                        : 256,
+                    1,
+                    1));
+        }
     }
 
     const char* name() const override {
@@ -4942,6 +5083,7 @@ public:
                 == config_.has_nepq_residual
             && primitive->config_.family_mask == config_.family_mask
             && primitive->config_.vq_profile_mask == config_.vq_profile_mask
+            && primitive->config_.nint_group_sizes == config_.nint_group_sizes
             && primitive->config_.use_nax == config_.use_nax
             && primitive->config_.direct_nax == config_.direct_nax
             && primitive->config_.swiglu_limit == config_.swiglu_limit;
@@ -5011,7 +5153,9 @@ make_moe_kernel() {
             "expert_map",
         },
         {"y"},
-        kMoeSource,
+        std::string(
+            "const int TOKENS = expert_ids_shape[0];\n"
+            "const int VARIANT_STRIDE = TOKENS * ROUTES;\n") + kMoeSource,
         kMoeHeader,
         true,
         false,
@@ -6608,7 +6752,6 @@ array apply_rotation(
         {256, 1, 1},
         {
             {"T", source.dtype()},
-            {"M", rows},
             {"K", width},
             {"BLOCK", rotation.block},
         },
@@ -8022,7 +8165,7 @@ struct MlxMfeOffloadCache::Impl {
     // Own the record table and source paths.  Streamed layers frequently
     // outlive the MfqContainer object used by their load call.
     MfqContainer model;
-    const std::size_t cache_limit = 0;
+    std::size_t cache_limit = 0;
     const int experts = 0;
     mutable std::mutex mutex;
     std::unordered_map<
@@ -8105,6 +8248,27 @@ MlxMfeOffloadCache::availability(
 MlxMfeWeight MlxMfeOffloadCache::grouped_mfe(
     const std::string& name,
     const std::vector<std::int32_t>& active_experts) {
+    if (MlxResidentBudgetScope::enabled()) {
+        std::size_t working_bytes = 0;
+        bool missing = false;
+        {
+            std::lock_guard lock(impl_->mutex);
+            const auto projection = impl_->mfe_projection_locked(name);
+            std::unordered_set<std::int32_t> seen;
+            for (const auto expert : active_experts) {
+                if (!seen.insert(expert).second) continue;
+                if (expert < 0 || expert >= projection->experts || !projection->experts_by_id[expert])
+                    throw std::out_of_range("streamed MFE expert is unavailable");
+                missing |= impl_->mfe_cache.find({name, expert}) == impl_->mfe_cache.end();
+                const auto& pool = projection->experts_by_id[expert]->pool;
+                const auto prefix = std::get_if<MfeNvqJscStreamLayout>(&pool->layout);
+                const auto payload = checked_range_product(projection->out_per_expert, projection->neuron_len, "expert working elements") * 2;
+                working_bytes = checked_add(working_bytes, checked_add(payload,
+                    pool->runtime_bytes + (prefix ? prefix->prefix_bytes : 0) + 256, "expert working payload"), "active expert working set");
+            }
+        }
+        if (missing) MlxResidentBudgetScope::reserve(checked_add(working_bytes, working_bytes, "expert CPU and GPU staging"));
+    }
     std::lock_guard lock(impl_->mutex);
     const auto projection = impl_->mfe_projection_locked(name);
     if (active_experts.empty()) {
@@ -8219,15 +8383,7 @@ MlxMfeWeight MlxMfeOffloadCache::grouped_mfe(
         "resident MFE expert bytes");
     while (committed_bytes > impl_->cache_limit
            && !impl_->mfe_lru.empty()) {
-        const auto candidate = std::find_if(
-            impl_->mfe_lru.begin(),
-            impl_->mfe_lru.end(),
-            [&](const auto& item) {
-                return active_keys.find(item.key) == active_keys.end();
-            });
-        if (candidate == impl_->mfe_lru.end()) {
-            break;
-        }
+        const auto candidate = impl_->mfe_lru.begin();
         committed_bytes -= candidate->weight->packed_nbytes;
         impl_->mfe_cache.erase(candidate->key);
         impl_->mfe_lru.erase(candidate);
@@ -8238,6 +8394,7 @@ MlxMfeWeight MlxMfeOffloadCache::grouped_mfe(
 
 std::size_t
 MlxMfeOffloadCache::cache_limit_bytes() const noexcept {
+    std::lock_guard lock(impl_->mutex);
     return impl_->cache_limit;
 }
 
@@ -8251,6 +8408,19 @@ std::size_t
 MlxMfeOffloadCache::cached_expert_count() const {
     std::lock_guard lock(impl_->mutex);
     return impl_->mfe_cache.size();
+}
+
+std::size_t MlxMfeOffloadCache::set_cache_limit(std::size_t bytes) {
+    std::lock_guard lock(impl_->mutex);
+    const auto before = impl_->resident_bytes;
+    impl_->cache_limit = bytes;
+    while (impl_->resident_bytes > bytes && !impl_->mfe_lru.empty()) {
+        const auto victim = impl_->mfe_lru.begin();
+        impl_->resident_bytes -= victim->weight->packed_nbytes;
+        impl_->mfe_cache.erase(victim->key);
+        impl_->mfe_lru.erase(victim);
+    }
+    return before - impl_->resident_bytes;
 }
 
 void MlxMfeOffloadCache::discard_record(
@@ -8731,6 +8901,22 @@ MlxMfeWeight::MlxMfeWeight(
     if (!impl_) {
         throw std::invalid_argument(
             "MFE implementation cannot be null");
+    }
+    if (auto* preparation = MlxKernelPreparation::current(); preparation && preparation->routes() > 0
+        && impl_->reference_cohorts.empty() && !mlx_reference_enabled()) {
+        preparation->collect([&] {
+            const int routes = preparation->routes();
+            for (const auto rows : preparation->row_buckets()) {
+                const auto ids = mlx::core::zeros(Shape{rows, routes}, mlx::core::int32);
+                const auto shared = mlx::core::zeros(Shape{rows, neuron_len()}, mlx::core::float16);
+                const auto routed = mlx::core::zeros(Shape{rows, routes, neuron_len()}, mlx::core::float16);
+                preparation->add(routed_matmul(shared, ids));
+                preparation->add(routed_matmul(routed, ids));
+                if (projections() == 2) preparation->add(routed_swiglu(shared, ids));
+                if (supports_fused_routed_reduce()) preparation->add(routed_matmul_reduce(routed, ids,
+                    mlx::core::zeros(Shape{rows, routes}, mlx::core::float32)));
+            }
+        });
     }
 }
 
@@ -11008,6 +11194,10 @@ int MlxMfeWeight::recommended_grouped_mmq_block_rows(
     }
     const int mean_routes = (route_count + impl_->experts - 1)
         / impl_->experts;
+    if (!fused_swiglu && mean_routes > 64
+        && impl_->out_per_expert >= 64 && impl_->neuron_len >= 192) {
+        return 128;
+    }
     // Up to 96 mean routes, use one 16-row-aligned block per expert to avoid
     // wasting SIMD rows. Once multiple blocks are inevitable, choose between
     // the two high-occupancy plans by their actual padded-row cost. This keeps
@@ -11098,11 +11288,10 @@ array MlxMfeWeight::routed_matmul_sorted(
                     plan,
                     force_mxfp4_nax));
         }
-        auto result = mlx::core::concatenate(std::move(outputs), 1);
-        if (!fused_swiglu) return result;
+        if (!fused_swiglu) return mlx::core::concatenate(std::move(outputs), 1);
         return swiglu_limit > 0.0f
-            ? moe_limited_swiglu_split(result, swiglu_limit)
-            : moe_swiglu_split(result);
+            ? moe_limited_swiglu_pair(outputs.at(0), outputs.at(1), swiglu_limit)
+            : moe_swiglu_pair(outputs.at(0), outputs.at(1));
     }
     const bool direct_mxfp4_nax =
         force_mxfp4_nax &&
@@ -11323,6 +11512,7 @@ array MlxMfeWeight::routed_matmul_sorted(
                 32,
                 4,
                 "mxfp4",
+                std::nullopt,
                 safe_sorted_indices),
             1);
         return fused_swiglu
@@ -11333,7 +11523,7 @@ array MlxMfeWeight::routed_matmul_sorted(
     }
 
     const array params({0.0f}, mlx::core::float32);
-    std::vector<array> kernel_inputs = mfe_narrow_bindings_enabled()
+    std::vector<array> kernel_inputs = mfe_narrow_bindings_enabled() && impl_->native_primitive
         ? impl_->narrow_bindings
         : std::vector<array>{
               impl_->descriptors,
@@ -11392,7 +11582,8 @@ array MlxMfeWeight::routed_matmul_sorted(
             && selected_plan.block_rows != 48
             && selected_plan.block_rows != 64
             && selected_plan.block_rows != 80
-            && selected_plan.block_rows != 96)
+            && selected_plan.block_rows != 96
+            && selected_plan.block_rows != 128)
         || (selected_plan.block_rows != 32
             && (!use_grouped_nax || use_direct_nax))
         || selected_plan.max_blocks <= 0
@@ -11415,7 +11606,8 @@ array MlxMfeWeight::routed_matmul_sorted(
             .tile_columns = use_grouped_nax && !use_direct_nax
                 ? grouped_mmq_tile_columns(
                     selected_plan.block_rows,
-                    output_width)
+                    output_width,
+                    fused_swiglu)
                 : 64,
             .tokens = tokens,
             .routes = routes,
@@ -11434,6 +11626,7 @@ array MlxMfeWeight::routed_matmul_sorted(
             .family_mask = static_cast<int>(impl_->family_mask),
             .vq_profile_mask = static_cast<int>(
                 impl_->vq_profile_mask),
+            .nint_group_sizes = impl_->nint_group_sizes,
             .use_nax = use_grouped_nax,
             .direct_nax = use_direct_nax,
             .swiglu_limit = swiglu_limit,
@@ -11787,7 +11980,7 @@ array MlxMfeWeight::routed_matmul_impl(
     const array params(
         {swiglu_limit},
         mlx::core::float32);
-    std::vector<array> kernel_inputs = mfe_narrow_bindings_enabled()
+    std::vector<array> kernel_inputs = mfe_narrow_bindings_enabled() && impl_->native_primitive
         ? impl_->narrow_bindings
         : std::vector<array>{
               impl_->descriptors,
@@ -11813,6 +12006,18 @@ array MlxMfeWeight::routed_matmul_impl(
               impl_->mx_values,
               impl_->mx_scales,
           };
+    if (!impl_->native_primitive) {
+        constexpr int min_device_elements = 8;
+        for (auto& bank : kernel_inputs) {
+            if (bank.size() < min_device_elements) {
+                const int elements = static_cast<int>(bank.size());
+                bank = mlx::core::concatenate({
+                    mlx::core::reshape(bank, Shape{elements}),
+                    mlx::core::zeros(Shape{min_device_elements - elements}, bank.dtype()),
+                });
+            }
+        }
+    }
     kernel_inputs.push_back(source);
     kernel_inputs.push_back(ids);
     kernel_inputs.push_back(route_order);
@@ -11853,7 +12058,8 @@ array MlxMfeWeight::routed_matmul_impl(
                 .tile_columns = use_grouped_nax && !use_direct_nax
                     ? grouped_mmq_tile_columns(
                         plan.block_rows,
-                        logical_output_width)
+                        logical_output_width,
+                        fused_swiglu)
                     : 64,
                 .tokens = tokens,
                 .routes = routes,
@@ -11871,6 +12077,7 @@ array MlxMfeWeight::routed_matmul_impl(
                 .family_mask = static_cast<int>(impl_->family_mask),
                 .vq_profile_mask = static_cast<int>(
                     impl_->vq_profile_mask),
+                .nint_group_sizes = impl_->nint_group_sizes,
                 .use_nax = use_grouped_nax,
                 .direct_nax = use_direct_nax,
                 .swiglu_limit = swiglu_limit,
@@ -11958,7 +12165,6 @@ array MlxMfeWeight::routed_matmul_impl(
         {64, 1, 1},
         {
             {"T", source.dtype()},
-            {"TOKENS", tokens},
             {"ROUTES", routes},
             {"EXPERTS", impl_->experts},
             {"OUT", logical_output_width},
@@ -11972,7 +12178,6 @@ array MlxMfeWeight::routed_matmul_impl(
             {"K_LANES_VALUE", k_lanes},
             {"ROWS_PER_SIMD_VALUE", rows_per_simd},
             {"DESCRIPTOR_SIZE", kDescriptorSize},
-            {"VARIANT_STRIDE", variant_stride},
             {
                 "SHARED_INPUT",
                 static_cast<int>(shared_input),

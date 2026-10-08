@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine.h"
+#include "mtp_depth_controller.h"
 
 // Host-side MTP depth selection and chain verification shared by engines.
 // Inputs to distribution() have already received the sampler's penalties.
@@ -23,6 +24,7 @@ struct ChainVerification {
     bool bonus = false;
 };
 
+
 inline ChainVerification verify_greedy(
         std::span<const int32_t> drafts,
         std::span<const int32_t> targets) {
@@ -40,12 +42,9 @@ inline ChainVerification verify_greedy(
     };
 }
 
-// Backend-local controller with the same scheduling contract as Metal. It
-// measures target-only and speculative widths, learns conditional acceptance,
-// and selects the width with the highest expected emitted tokens per ms.
-class DepthController {
+class DsparkDepthController {
 public:
-    explicit DepthController(int maximum_depth = 3)
+    explicit DsparkDepthController(int maximum_depth = 3)
         : maximum_depth_(std::clamp(maximum_depth, 1, kMaximumDraftDepth)),
           current_depth_(maximum_depth_),
           acceptance_(static_cast<std::size_t>(maximum_depth_), 0.6),

@@ -4,7 +4,7 @@
 
 export type ViewName = 'chat' | 'dashboard' | 'lab';
 export type DashboardPage = 'overview' | 'models' | 'connections' | 'cache' | 'logs' | 'settings';
-export type LabPage = 'models' | 'evaluations' | 'quantization';
+export type LabPage = 'models' | 'evaluations' | 'quantization' | 'analysis';
 
 export interface StudioLocation {
   view: ViewName;
@@ -21,6 +21,7 @@ export const STUDIO_PATHS = {
   modelHub: '/model-hub',
   evaluations: '/evaluations',
   quantization: '/quantization',
+  analysis: '/analysis',
   logs: '/logs',
   settings: '/settings',
 } as const;
@@ -38,6 +39,7 @@ const LAB_PATHS: Record<LabPage, string> = {
   models: STUDIO_PATHS.modelHub,
   evaluations: STUDIO_PATHS.evaluations,
   quantization: STUDIO_PATHS.quantization,
+  analysis: STUDIO_PATHS.analysis,
 };
 
 /** 规范化 Studio 路径，兼容浏览器或 Tauri 传入的尾部斜杠。 */

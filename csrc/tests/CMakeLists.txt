@@ -95,12 +95,17 @@ target_link_libraries(mfq-mtp-policy-test PRIVATE mfq-engine)
 target_compile_features(mfq-mtp-policy-test PRIVATE cxx_std_20)
 add_test(NAME mfq-mtp-policy-test COMMAND mfq-mtp-policy-test)
 
+add_executable(mfq-speculative-sequence-test speculative_sequence_test.cpp)
+target_link_libraries(mfq-speculative-sequence-test PRIVATE mfq-engine mfq-tokenizer)
+target_compile_features(mfq-speculative-sequence-test PRIVATE cxx_std_20)
+add_test(NAME mfq-speculative-sequence-test COMMAND mfq-speculative-sequence-test)
+
 # Internal tests opt in explicitly; clients inherit only the public contract.
 foreach(target IN ITEMS
         mfq-paged-kv-allocator-test mfq-session-snapshot-cache-test
         mfq-text-emitter-test mfq-sampling-test
         mfq-inference-test mfq-request-executor-test mfq-shared-execution-test
-        mfq-mtp-policy-test)
+        mfq-mtp-policy-test mfq-speculative-sequence-test)
     target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/engine/internal)
 endforeach()
 

@@ -32,6 +32,14 @@ MlxGatedDeltaGates gated_delta_gates(
     const mlx::core::array& dt_bias,
     const mlx::core::array& decay_scale);
 
+mlx::core::array gated_delta_output_norm(
+    const mlx::core::array& recurrent,
+    const mlx::core::array& gate,
+    const mlx::core::array& norm_weight,
+    float eps,
+    bool silu_gate,
+    mlx::core::Dtype output_dtype);
+
 // Single-row decode fast path for scalar-gated DeltaNet layers. The recurrent
 // state uses the transposed [value,key] layout accepted by gated_delta_net.
 MlxGatedDeltaDecodeResult gated_delta_decode_step(

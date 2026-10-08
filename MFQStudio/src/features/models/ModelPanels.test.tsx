@@ -5,6 +5,7 @@ import { ModelsPage } from './ModelsPage';
 import { LoadedModels } from './LoadedModels';
 import { LocalCheckpoints } from './LocalCheckpoints';
 import { ModelLoadPolicy } from './ModelLoadPolicy';
+import { ModelDirectoryDialog } from './ModelDirectoryDialog';
 
 vi.mock('../settings/SettingsProvider', () => ({
   useSettings: () => ({ tr: (zh: string) => zh }),
@@ -19,11 +20,17 @@ function catalog() {
     instances: [],
     availableModelNames: [],
     modelFilter: '',
+    modelFolderPath: '/',
+    modelBrowserOpen: false,
+    modelDirectoryPath: '/',
+    setModelBrowserOpen: vi.fn(),
     filteredInstances: [],
     filteredArtifacts: [],
     loadPinned: false,
     loadIdleTtl: null,
     chooseModelDirectory: vi.fn(),
+    openModelFiles: vi.fn(),
+    openCurrentDirectoryInFinder: vi.fn(),
     unloadInstance: vi.fn(),
     loadArtifact: vi.fn(),
     setLoadPinned: vi.fn(),
@@ -37,6 +44,19 @@ it('空列表操作仍打开模型目录', () => {
   fireEvent.click(screen.getByRole('button', { name: '添加模型' }));
   fireEvent.click(screen.getByRole('button', { name: '选择模型文件夹' }));
   expect(state.chooseModelDirectory).toHaveBeenCalledTimes(2);
+});
+
+it('模型文件夹栏显示实际路径，单独的更改按钮打开目录选择器', () => {
+  const state = catalog();
+  state.modelFolderPath = '/actual/model/folder';
+  vi.mocked(useModelCatalog).mockReturnValue(state);
+  const { container } = render(<ModelsPage />);
+  const row = container.querySelector('.model-folder-location');
+  expect(row).toHaveTextContent('模型文件夹');
+  expect(row?.querySelector('code')).toHaveTextContent('/actual/model/folder');
+  expect(row?.querySelector('code')).toHaveAttribute('title', '/actual/model/folder');
+  fireEvent.click(screen.getByRole('button', { name: '更改' }));
+  expect(state.chooseModelDirectory).toHaveBeenCalledOnce();
 });
 
 it('固定与空闲卸载仍调用对应策略操作', () => {
@@ -64,6 +84,86 @@ it('本地架构标识在模型行右侧，改名的模型仍按架构识别', (
   expect(screen.getAllByRole('img')).toHaveLength(3);
   fireEvent.click(screen.getAllByRole('button', { name: '加载' })[0]);
   expect(state.loadArtifact).toHaveBeenCalledWith('renamed-checkpoint');
+  fireEvent.click(screen.getAllByRole('button', { name: '模型文件' })[0]);
+  expect(state.openModelFiles).toHaveBeenCalledWith('qwen');
+  expect(screen.queryByText(/qwen4_exp|minicpm|deepseek_v4|glm5_next/)).not.toBeInTheDocument();
+});
+
+it('模型文件弹窗显示实际路径且不提供重复注册操作', () => {
+  const state = catalog();
+  Object.assign(state, { modelFilesMode: true, modelBrowserOpen: true, modelDirectoryPath: '/actual/model/S4-L',
+    modelBrowser: { current_id: 'directory', current_path: '/actual/model/S4-L', model_file_count: 1, data: [] },
+    setModelBrowserOpen: vi.fn(), openModelDirectory: vi.fn(), jumpToModelDirectory: vi.fn(), setModelDirectoryPath: vi.fn() });
+  render(<ModelDirectoryDialog catalog={state} />);
+  expect(screen.getByRole('dialog', { name: '模型文件' })).toBeInTheDocument();
+  expect(screen.getByRole('textbox', { name: '当前目录' })).toHaveValue('/actual/model/S4-L');
+  expect(screen.queryByRole('button', { name: '使用此文件夹' })).not.toBeInTheDocument();
+});
+
+it('目录浏览器同时显示子目录和 MFQ 文件大小，访达按钮只打开当前目录', () => {
+  const state = catalog();
+  Object.assign(state, { modelFilesMode: true, modelBrowserOpen: true, modelDirectoryPath: '/model/files',
+    modelBrowser: { current_id: 'directory', current_path: '/model/files', can_open_in_finder: true,
+      model_file_count: 1, data: [{ id: 'child', name: 'nested', model_file_count: 0 }],
+      files: [{ name: 'model-00001-of-00002.mfq', byte_size: 2 ** 30 }, { name: 'model-00002-of-00002.mfq', byte_size: 2 * 2 ** 30 }] },
+    openModelDirectory: vi.fn(), jumpToModelDirectory: vi.fn(), setModelDirectoryPath: vi.fn() });
+  render(<ModelDirectoryDialog catalog={state} />);
+  expect(screen.getByRole('button', { name: 'nested' })).toBeInTheDocument();
+  expect(screen.getByText('model-00001-of-00002.mfq')).toBeInTheDocument();
+  expect(screen.getByText('1 GiB')).toBeInTheDocument();
+  expect(screen.getByText('2 GiB')).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: '在访达中打开' }));
+  expect(state.openCurrentDirectoryInFinder).toHaveBeenCalledOnce();
+  expect(screen.queryByRole('button', { name: '使用此文件夹' })).not.toBeInTheDocument();
+});
+
+it('没有子目录但存在 MFQ 文件时不误报空目录', () => {
+  const state = catalog();
+  Object.assign(state, { modelBrowserOpen: true, modelBrowser: { current_id: 'folder', current_path: '/model',
+    data: [], files: [{ name: 'model.mfq', byte_size: 0 }] } });
+  render(<ModelDirectoryDialog catalog={state} />);
+  expect(screen.getByText('model.mfq')).toBeInTheDocument();
+  expect(screen.getByText('0 B')).toBeInTheDocument();
+  expect(screen.queryByText(/没有子文件夹/)).not.toBeInTheDocument();
+  expect(screen.getByRole('button', { name: '在访达中打开' })).toBeDisabled();
+});
+
+it('本地检查点保留大小和分片数，常驻压力使用实时剩余内存而非总预算', () => {
+  const state = catalog();
+  state.filteredArtifacts = [{ id: 'model', name: 'Checkpoint', architecture: 'internal-recipe',
+    total_bytes: 40 * 2 ** 30, shard_count: 6, complete: true, loadable: true,
+    estimated_resident_weight_bytes: 12 * 2 ** 30, ssd_ple_bytes: 28 * 2 ** 30 }] as typeof state.filteredArtifacts;
+  state.runtime = { runtime_memory_headroom_bytes: 16 * 2 ** 30,
+    runtime_memory_effective_budget_bytes: 100 * 2 ** 30 } as typeof state.runtime;
+  const { rerender } = render(<LocalCheckpoints catalog={state} />);
+  expect(screen.getByText('40 GiB · 6 个分片')).toBeInTheDocument();
+  expect(screen.getByText('预计常驻内存 12 GiB · SSD PLE 28 GiB')).toBeInTheDocument();
+  expect(screen.getByRole('progressbar', { name: '预计占剩余可用内存: 75.0%' })).toHaveAttribute('aria-valuenow', '75');
+  expect(screen.queryByText(/internal-recipe/)).not.toBeInTheDocument();
+  state.runtime = { ...state.runtime, runtime_memory_headroom_bytes: 8 * 2 ** 30 } as typeof state.runtime;
+  rerender(<LocalCheckpoints catalog={state} />);
+  expect(screen.getByText('剩余可用内存 8 GiB')).toBeInTheDocument();
+  expect(screen.getByRole('progressbar', { name: '预计占剩余可用内存: 150.0%' })).toHaveAttribute('aria-valuenow', '100');
+});
+
+it('分片不全保留已下载文件大小及缺片数，不按文件大小伪造常驻估算', () => {
+  const state = catalog();
+  state.filteredArtifacts = [{ id: 'model', name: 'Incomplete', total_bytes: 6 * 2 ** 30,
+    shard_count: 6, missing_shards: 2, complete: false, loadable: false }] as typeof state.filteredArtifacts;
+  render(<LocalCheckpoints catalog={state} />);
+  expect(screen.getByText('6 GiB · 6 个分片，缺 2 片')).toBeInTheDocument();
+  expect(screen.getByText('预计常驻内存 —')).toBeInTheDocument();
+  expect(screen.getByRole('progressbar')).not.toHaveAttribute('aria-valuenow');
+});
+
+it('剩余内存为零时显示耗尽而非未知或无穷百分比', () => {
+  const state = catalog();
+  state.filteredArtifacts = [{ id: 'model', name: 'Checkpoint', total_bytes: 2 ** 30,
+    shard_count: 1, estimated_resident_weight_bytes: 2 ** 30, loadable: true }] as typeof state.filteredArtifacts;
+  state.runtime = { runtime_memory_headroom_bytes: 0 } as typeof state.runtime;
+  render(<LocalCheckpoints catalog={state} />);
+  expect(screen.getByText('剩余可用内存 0 GiB')).toBeInTheDocument();
+  expect(screen.getByRole('progressbar', { name: '预计占剩余可用内存: 无可用内存' })).toHaveAttribute('aria-valuenow', '100');
 });
 
 it.each([[[], '0 B'], [[32 * 2 ** 30, 8 * 2 ** 30], '40 GiB']] as [number[], string][])('资产总大小汇总已登记文件，不使用当前会话模型: %s', (sizes, total) => {

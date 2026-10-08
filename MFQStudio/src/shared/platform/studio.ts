@@ -109,10 +109,10 @@ export async function startLocalStudio(): Promise<StudioStatus> {
 }
 
 /** 打开桌面原生模型目录选择器，取消时返回 null。 */
-export async function selectLocalModelDirectory(): Promise<string[] | null> {
+export async function selectLocalModelDirectory(initialDirectory: string): Promise<{ path: string; names: string[] } | null> {
   const tauri = internals();
   if (!tauri) throw new Error('MFQ Studio runtime is unavailable');
-  return tauri.invoke<string[] | null>('studio_select_model_directory');
+  return tauri.invoke('studio_select_model_directory', { initialDirectory });
 }
 
 /** 使用当前平台的确认对话框，浏览器环境回退到 window.confirm。 */

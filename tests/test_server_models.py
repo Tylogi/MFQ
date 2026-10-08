@@ -101,7 +101,7 @@ def test_metal_runtime_pool_derives_a_safe_default_memory_budget(
         lambda: 128 << 30,
     )
     monkeypatch.setattr(
-        "mfq.server.runtime.runtime_pool.metal_recommended_working_set_size",
+        "mfq.server.runtime.runtime_pool.metal_allocation_limit",
         lambda: 110 << 30,
     )
 
@@ -120,7 +120,7 @@ def test_metal_runtime_pool_derives_a_safe_default_memory_budget(
     )
     cuda = RuntimePool(ModelCatalog([]), "runtime", backend="cuda")
 
-    assert automatic.max_runtime_memory_bytes == 110 << 30
+    assert automatic.max_runtime_memory_bytes == 120 << 30
     assert automatic.automatic_memory_budget is True
     assert disabled.max_runtime_memory_bytes is None
     assert disabled.automatic_memory_budget is False
@@ -139,7 +139,7 @@ def test_automatic_memory_budget_tracks_current_reclaimable_memory(
         lambda: 128 * gib,
     )
     monkeypatch.setattr(
-        "mfq.server.runtime.runtime_pool.metal_recommended_working_set_size",
+        "mfq.server.runtime.runtime_pool.metal_allocation_limit",
         lambda: 110 * gib,
     )
     monkeypatch.setattr(
@@ -155,6 +155,7 @@ def test_automatic_memory_budget_tracks_current_reclaimable_memory(
 
     automatic = RuntimePool(ModelCatalog([]), "runtime", backend="metal")
     automatic._load_bytes["resident"] = 30 * gib
+    automatic._resident_process_usage_locked = lambda: (30 * gib, 0)
     explicit = RuntimePool(
         ModelCatalog([]),
         "runtime",
@@ -162,9 +163,10 @@ def test_automatic_memory_budget_tracks_current_reclaimable_memory(
         max_runtime_memory_bytes=100 * gib,
     )
     explicit._load_bytes["resident"] = 30 * gib
+    explicit._resident_process_usage_locked = lambda: (30 * gib, 0)
 
-    assert automatic._effective_runtime_memory_budget_locked() == 32 * gib
-    assert explicit._effective_runtime_memory_budget_locked() == 32 * gib
+    assert automatic._effective_runtime_memory_budget_locked() == 30 * gib
+    assert explicit._effective_runtime_memory_budget_locked() == 30 * gib
     assert HostMemorySnapshot(0, -1, 10, -1, 0).reclaimable(
         active_ratio=2.0
     ) == 10
@@ -175,7 +177,7 @@ def test_automatic_memory_pressure_uses_soft_and_hard_watermarks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gib = 1 << 30
-    reclaimable_gib = 10
+    reclaimable_gib = 12
     monkeypatch.setattr(
         "mfq.server.runtime.runtime_pool.total_physical_memory",
         lambda: 128 * gib,
@@ -192,6 +194,7 @@ def test_automatic_memory_pressure_uses_soft_and_hard_watermarks(
     )
     pool = RuntimePool(ModelCatalog([]), "runtime", backend="metal")
     pool._load_bytes["resident"] = 40 * gib
+    pool._resident_process_usage_locked = lambda: (40 * gib, 0)
 
     level, ratio, ceiling, committed = pool._runtime_memory_pressure_locked()
     assert level == "soft"
@@ -199,7 +202,7 @@ def test_automatic_memory_pressure_uses_soft_and_hard_watermarks(
     assert ceiling == 44 * gib
     assert committed == 40 * gib
 
-    reclaimable_gib = 8
+    reclaimable_gib = 10
     level, ratio, ceiling, committed = pool._runtime_memory_pressure_locked()
     assert level == "hard"
     assert ratio == pytest.approx(40 / 42)
@@ -245,6 +248,7 @@ def test_load_pressure_reclaims_shared_host_cache_before_model_memory(
             shared_cache_reclaimer=reclaim,
         )
         pool._load_bytes["resident"] = 30 * gib
+        pool._resident_process_usage_locked = lambda: (30 * gib, 0)
 
         assert await pool._reclaim_shared_cache_for_budget(
             additional_bytes=10 * gib,
@@ -555,13 +559,16 @@ async def _wait_for_job(
     return job
 
 
-def test_catalog_validates_complete_and_incomplete_shards(tmp_path: Path) -> None:
+@pytest.mark.parametrize("extensions", [(".mfq", ".mfq"), (".MFQ", ".MFQ"), (".mFq", ".MfQ")])
+def test_catalog_validates_complete_and_incomplete_shards(tmp_path: Path, extensions) -> None:
     async def run() -> None:
         source = tmp_path / "source.mfq"
         _model(source)
         model_dir = tmp_path / "models"
         model_dir.mkdir()
         shards = split_mfq(source, model_dir / "split.mfq", split_max_tensors=1)
+        shards = [shard.rename(shard.with_suffix(extension))
+            for shard, extension in zip(shards, extensions, strict=True)]
 
         catalog = ModelCatalog([model_dir], cache_seconds=0)
         complete = await catalog.list()
@@ -571,6 +578,9 @@ def test_catalog_validates_complete_and_incomplete_shards(tmp_path: Path) -> Non
         assert complete.data[0].shard_count == 2
         assert complete.data[0].tensor_count == 2
         assert complete.data[0].dtypes == ["F16"]
+        with open_mmap(shards[0]) as store:
+            assert complete.data[0].estimated_resident_weight_bytes == sum(record.nbytes for record in store.records.values())
+        assert complete.data[0].ssd_ple_bytes == 0
         assert str(model_dir) not in complete.model_dump_json()
 
         shards[1].unlink()
@@ -579,6 +589,8 @@ def test_catalog_validates_complete_and_incomplete_shards(tmp_path: Path) -> Non
         assert not incomplete.data[0].complete
         assert not incomplete.data[0].loadable
         assert incomplete.data[0].missing_shards == 1
+        assert incomplete.data[0].estimated_resident_weight_bytes is None
+        assert incomplete.data[0].ssd_ple_bytes is None
         assert incomplete.data[0].total_bytes == shards[0].stat().st_size
         assert catalog._immediate_model_count(model_dir) == 1
         assert "missing MFQ shard" in (incomplete.data[0].error or "")
@@ -921,8 +933,28 @@ def test_catalog_excludes_only_ple_table_payloads_from_resident_weights(tmp_path
     with open_mmap(model) as store:
         ple_bytes = sum(store.records[root + f".shard.{i}.weight"].nbytes for i in (0, 12))
         expert_bytes = store.records["model.block.0.mlp.experts.gate.weight"].nbytes
+        weight_bytes = sum(record.nbytes for record in store.records.values()) - ple_bytes
     assert artifact.always_streamed_bytes == ple_bytes
     assert artifact.routed_expert_bytes == expert_bytes
+    assert artifact.resource.ssd_ple_bytes == ple_bytes
+    assert artifact.resource.estimated_resident_weight_bytes == weight_bytes
+
+
+def test_local_and_download_resident_estimates_use_the_same_tensor_metadata(tmp_path: Path) -> None:
+    from mfq.server.services.hub_metadata import estimated_resident_weight_bytes, inspect_mfq_header
+
+    model = tmp_path / "metadata.mfq"
+    tensors = {
+        "model.block.1.position_embedding.ngram.shard.0.weight": np.zeros((8, 16), dtype=np.float16),
+        "model.weight": np.zeros((8, 16), dtype=np.float16),
+        "__mfq_asset__/hf/tokenizer.json": b'{"extra": true}',
+    }
+    save(model, FileHeader(version=2, model_arch="qwen4_exp"), tensors)
+    metadata = inspect_mfq_header(model.read_bytes(), model.stat().st_size)
+    resource = ModelCatalog._inspect(tmp_path, model).resource
+    assert resource.estimated_resident_weight_bytes == estimated_resident_weight_bytes(metadata.weight_bytes, metadata.weight_bytes_by_dtype)
+    assert resource.estimated_resident_weight_bytes == metadata.weight_bytes == 276
+    assert resource.ssd_ple_bytes == metadata.ssd_ple_bytes == 276
 
 
 @pytest.mark.parametrize("format", ["mfq", "hf"])
@@ -1093,6 +1125,148 @@ def test_common_server_browses_and_registers_external_model_directories(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("kind", ["single", "sharded", "incomplete"])
+def test_model_file_directory_resolves_the_logical_asset(tmp_path: Path, kind: str) -> None:
+    async def run() -> None:
+        directory = tmp_path / "library" / "model-files"
+        directory.mkdir(parents=True)
+        source = tmp_path / "source.mfq"
+        if kind == "single":
+            _model(directory / "checkpoint.mfq")
+        else:
+            _model(source)
+            shards = split_mfq(source, directory / "checkpoint.mfq", split_max_tensors=1)
+            if kind == "incomplete":
+                shards[-1].unlink()
+        catalog = ModelCatalog([tmp_path / "library"])
+        service = ServerService(SessionStore(tmp_path / "server.sqlite3"), IdleBackend(), catalog=catalog)
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(service)), base_url="http://test") as client:
+                artifacts = (await client.get("/api/v1/models")).json()["data"]
+                assert len(artifacts) == 1
+                response = await client.get(f'/api/v1/models/{artifacts[0]["id"]}/directory')
+                assert response.status_code == 200
+                assert response.json()["current_path"] == str(directory.resolve())
+                assert response.json()["model_file_count"] == 1
+                assert response.json()["files"] == [
+                    {"name": item.name, "byte_size": item.stat().st_size}
+                    for item in sorted(directory.glob("*.mfq"))
+                ]
+                if kind == "incomplete":
+                    assert artifacts[0]["missing_shards"] == 1
+                missing = await client.get(f'/api/v1/models/{"0" * 32}/directory')
+                assert missing.status_code == 404
+                assert missing.json()["error"]["code"] == "model_artifact_not_found"
+        finally:
+            await service.aclose()
+    asyncio.run(run())
+
+
+def test_hf_model_file_directory_uses_checkpoint_directory_not_its_parent(tmp_path: Path, monkeypatch) -> None:
+    async def run() -> None:
+        directory = tmp_path / "hf-model"
+        directory.mkdir()
+        catalog = ModelCatalog([tmp_path])
+        async def get(_):
+            return SimpleNamespace(path=directory, resource=SimpleNamespace(format="hf"))
+        monkeypatch.setattr(catalog, "get", get)
+        service = ServerService(SessionStore(tmp_path / "server.sqlite3"), IdleBackend(), catalog=catalog)
+        try:
+            listing = await service.model_artifact_directory("asset")
+            assert listing.current_path == str(directory.resolve())
+        finally:
+            await service.aclose()
+    asyncio.run(run())
+
+
+def test_directory_browser_lists_mfq_files_without_decoding_or_registering(tmp_path: Path) -> None:
+    directory = tmp_path / "models"
+    directory.mkdir()
+    (directory / "nested").mkdir()
+    (directory / "b.MFQ").write_bytes(b"not-yet-complete")
+    (directory / "a.mfq").write_bytes(b"partial")
+    (directory / "ignored.txt").write_text("not a model")
+    catalog = ModelCatalog([tmp_path])
+    listing = catalog._browse_directories(None, directory)
+    assert [item.name for item in listing.data] == ["nested"]
+    assert [(item.name, item.byte_size) for item in listing.files] == [("a.mfq", 7), ("b.MFQ", 16)]
+    assert not (tmp_path / MODEL_FILE_INDEX).exists()
+
+
+@pytest.mark.parametrize("suffix", ["MFQ", "mfQ", "mFq"])
+def test_catalog_discovers_and_registers_mfq_files_shown_by_the_browser(tmp_path: Path, suffix: str) -> None:
+    async def run() -> None:
+        directory = tmp_path / "external"
+        directory.mkdir()
+        _model(directory / f"portable.{suffix}", architecture="qwen35")
+        direct = ModelCatalog([directory], cache_seconds=0)
+        listing = direct._browse_directories(None, directory)
+        assert listing.model_file_count == 1 and listing.files[0].name == f"portable.{suffix}"
+        discovered = await direct.list()
+        assert len(discovered.data) == 1 and discovered.data[0].name == "portable"
+        assert discovered.data[0].loadable
+        root = tmp_path / "catalog"
+        root.mkdir()
+        catalog = ModelCatalog([root], cache_seconds=0)
+        registered = await catalog.register_directory(path=directory)
+        assert len(registered.data) == 1 and registered.data[0].name == "portable"
+        assert (await catalog.list()).data[0].loadable
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", [None, OSError("failed"), subprocess.TimeoutExpired("open", 5)])
+def test_finder_opens_only_a_browsed_directory_by_opaque_id(tmp_path: Path, monkeypatch, failure) -> None:
+    async def run() -> None:
+        directory = tmp_path / "models ; spaces"
+        directory.mkdir()
+        catalog = ModelCatalog([tmp_path])
+        service = ServerService(SessionStore(tmp_path / "server.sqlite3"), IdleBackend(), catalog=catalog)
+        calls = []
+        def open_directory(command, **kwargs):
+            calls.append((command, kwargs))
+            if failure is not None:
+                raise failure
+        monkeypatch.setattr("mfq.server.services.service.sys.platform", "darwin")
+        monkeypatch.setattr("mfq.server.services.service.subprocess.run", open_directory)
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(service)), base_url="http://test") as client:
+                listing = (await client.get("/api/v1/models/directories", params={"path": str(directory)})).json()
+                assert listing["can_open_in_finder"] is True
+                invalid = await client.post("/api/v1/models/directories/open", json={"directory_id": "0" * 32})
+                assert invalid.status_code == 404 and not calls
+                arbitrary = await client.post("/api/v1/models/directories/open", json={"path": str(directory)})
+                assert arbitrary.status_code == 422 and not calls
+                response = await client.post("/api/v1/models/directories/open", json={"directory_id": listing["current_id"]})
+                assert response.status_code == (200 if failure is None else 503)
+                if failure is None:
+                    assert response.json() == {"opened": True}
+                assert calls[0][0] == ["/usr/bin/open", "-a", "Finder", str(directory.resolve())]
+                assert calls[0][1]["timeout"] == 5 and calls[0][1]["check"] is True
+                assert not calls[0][1].get("shell", False)
+                assert not (tmp_path / MODEL_FILE_INDEX).exists()
+        finally:
+            await service.aclose()
+    asyncio.run(run())
+
+
+def test_finder_is_disabled_on_non_macos_servers(tmp_path: Path, monkeypatch) -> None:
+    async def run() -> None:
+        catalog = ModelCatalog([tmp_path])
+        service = ServerService(SessionStore(tmp_path / "server.sqlite3"), IdleBackend(), catalog=catalog)
+        monkeypatch.setattr("mfq.server.services.service.sys.platform", "linux")
+        try:
+            listing = await service.model_directories(path=str(tmp_path))
+            assert not listing.can_open_in_finder
+            from mfq.server.protocol.models import OpenModelDirectoryRequest
+            from mfq.server.services.service import ServiceError
+            with pytest.raises(ServiceError) as error:
+                await service.open_model_directory(OpenModelDirectoryRequest(directory_id=listing.current_id))
+            assert error.value.detail.code == "finder_unavailable"
+        finally:
+            await service.aclose()
+    asyncio.run(run())
+
+
 def test_common_server_rejects_directories_without_mfq_models(tmp_path: Path) -> None:
     async def run() -> None:
         model_dir = tmp_path / "catalog"
@@ -1133,8 +1307,17 @@ def test_empty_runtime_pool_reports_idle_state(tmp_path: Path) -> None:
             tmp_path / "runtime",
             automatic_memory_budget=False,
         )
+        pool.store = SessionStore(tmp_path / "state.sqlite3")
 
-        assert await pool.runtime_status() == {
+        status = await pool.runtime_status()
+        assert status.pop("prefix_cache_total_disk_max_bytes") > 0
+        assert status == {
+            "mtp_service_enabled": True,
+            "prefix_cache_total_hot_bytes": 0,
+            "prefix_cache_total_hot_max_bytes": 2 << 30,
+            "prefix_cache_total_disk_bytes": 0,
+            "prefix_cache_total_disk_blocks": 0,
+            "prefix_cache_budget_failures": 0,
             "runtime_memory_budget_bytes": None,
             "runtime_memory_effective_budget_bytes": None,
             "runtime_memory_budget_mode": "disabled",
@@ -1981,8 +2164,10 @@ def test_runtime_control_lease_blocks_lru_eviction(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("read_only", [False, True])
 def test_runtime_control_lease_release_survives_caller_cancellation(
     tmp_path: Path,
+    read_only: bool,
 ) -> None:
     async def run() -> None:
         _model(tmp_path / "model.mfq")
@@ -1997,12 +2182,13 @@ def test_runtime_control_lease_release_survives_caller_cancellation(
             context_size=4096,
             state=RuntimeInstanceState.READY,
             control_leases=1,
+            read_control_leases=int(read_only),
         )
         pool = RuntimePool(catalog, tmp_path / "runtime")
         pool._instances[instance.id] = instance
 
         await pool._lock.acquire()
-        releasing = asyncio.create_task(pool._release_control_lease(instance))
+        releasing = asyncio.create_task(pool._release_control_lease(instance, read_only=read_only))
         while not pool._lease_release_tasks:
             await asyncio.sleep(0)
         releasing.cancel()
@@ -2012,6 +2198,7 @@ def test_runtime_control_lease_release_survives_caller_cancellation(
         await pool._drain_control_lease_releases()
 
         assert instance.control_leases == 0
+        assert instance.read_control_leases == 0
         assert not pool._lease_release_tasks
 
     asyncio.run(run())
@@ -2788,10 +2975,12 @@ def test_runtime_pool_unloads_an_idle_ttl_model(tmp_path: Path) -> None:
                 assert loaded["status"] == "succeeded", loaded
                 for _ in range(80):
                     listed = (await client.get("/api/v1/runtime/instances")).json()["data"]
-                    if not listed:
+                    logs = [item for item in store.list_runtime_logs() if item.fields.get("source") == "runtime.lifecycle"]
+                    if not listed and logs:
                         break
                     await asyncio.sleep(0.025)
                 assert listed == []
+                assert len(logs) == 1 and logs[0].fields["model"] == "ephemeral"
 
     asyncio.run(run())
 
@@ -3257,6 +3446,9 @@ def test_started_runtime_monitor_reports_abnormal_exit(tmp_path: Path) -> None:
             assert instances.data[0].error is not None
             assert instances.data[0].error.code == "runtime_exited"
             assert "137" in instances.data[0].error.message
+            await pool._instances[instance_id].monitor_task
+            logs = store.list_runtime_logs(instance_id=instance_id)
+            assert len(logs) == 1 and logs[0].fields["model"] == "initial"
             assert session_id not in pool._session_routes
             assert await pool._select("initial", session_id=session_id) is None
             assert (await pool.runtime_status())["runtime_state"] == "idle"

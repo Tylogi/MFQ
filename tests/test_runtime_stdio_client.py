@@ -153,6 +153,23 @@ def test_stdio_runtime_client_maps_structured_errors() -> None:
     asyncio.run(run())
 
 
+def test_stdio_cache_budget_supports_independent_disk_limit() -> None:
+    async def run() -> None:
+        requests = []
+        def handler(request):
+            requests.append(request)
+            return [{"v": 1, "id": request["id"], "type": "result", "data": {"status": "ok"}}]
+        client = _client(handler)
+        await client.set_cache_budget(1024)
+        await client.set_cache_budget(1024, 0)
+        assert [(request["op"], request["params"]) for request in requests] == [
+            ("cache.budget", {"target_bytes": 1024}),
+            ("cache.budget", {"target_bytes": 1024, "disk_target_bytes": 0}),
+        ]
+        await client.aclose()
+    asyncio.run(run())
+
+
 def test_stdio_runtime_client_fails_pending_requests_on_eof() -> None:
     async def run() -> None:
         client = _client(lambda _request: [])

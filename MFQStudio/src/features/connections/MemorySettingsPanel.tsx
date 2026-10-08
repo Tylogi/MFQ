@@ -5,6 +5,7 @@ import { formatBytes, formatNumber } from '../../app/formatters';
 import { ModelContextSettings } from '../runtime/ModelContextSettings';
 import { MemoryBudgetControls } from './MemoryBudgetControls';
 import { PrefixCacheDirectory } from './PrefixCacheDirectory';
+import { PrefixDiskBudgetControls } from './PrefixDiskBudgetControls';
 export function MemorySettingsPanel() {
   const { runtime, instances } = useRuntime();
   const { tr } = useSettings();
@@ -13,8 +14,9 @@ export function MemorySettingsPanel() {
   const memory = amounts.reduce<number>((sum, bytes) => sum + (bytes ?? 0), 0);
   const missing = amounts.some((bytes) => bytes == null);
   const residency = formatBytes(memory).replace(/\b(KB|MB|GB|TB)\b/g, (unit) => `${unit[0]}iB`);
-  const diskBudget = Number(runtime?.prefix_cache_disk_max_bytes ?? 0);
-  const persistent = typeof runtime?.prefix_cache_max_bytes === 'number';
+  const diskBudget = Number(runtime?.prefix_cache_total_disk_max_bytes ?? runtime?.prefix_cache_disk_max_bytes ?? 0);
+  const persistent = typeof runtime?.prefix_cache_total_disk_max_bytes === 'number'
+    || typeof runtime?.prefix_cache_max_bytes === 'number';
   const hotOnly = runtime?.prefix_cache_mode === 'single_device_hot_prefix';
   return <>
         <SectionLabel title={tr('内存规划', 'Memory plan')} />
@@ -57,7 +59,7 @@ export function MemorySettingsPanel() {
               trailing={
                 <input
                   aria-label={tr('启用 SSD 层', 'Enable SSD tier')}
-                  checked={persistent && !hotOnly}
+                  checked={persistent && !hotOnly && diskBudget > 0}
                   disabled
                   readOnly
                   type="checkbox"
@@ -65,19 +67,7 @@ export function MemorySettingsPanel() {
               }
             />
             <PrefixCacheDirectory />
-            <SettingRow
-              title={tr('SSD 配额', 'SSD budget')}
-              detail={tr(
-                '基于 LRU 的回收策略会将磁盘占用控制在此上限内。',
-                'Leaf-aware LRU keeps disk usage within this ceiling.',
-              )}
-              trailing={
-                <div className="server-unit-value">
-                  <strong>{diskBudget > 0 ? formatNumber(diskBudget / 2 ** 30, 0) : '--'}</strong>
-                  <span>GiB</span>
-                </div>
-              }
-            />
+            <PrefixDiskBudgetControls budget={diskBudget} />
           </div>
         </TMPanel>
   </>;

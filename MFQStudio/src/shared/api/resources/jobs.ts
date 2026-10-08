@@ -54,7 +54,7 @@ export const jobsApi = {
   },
 
   /** 读取任务历史事件并转换为日志展示条目。 */
-  async jobEvents(id: string): Promise<RuntimeLogEntry[]> {
+  async jobEvents(id: string, signal?: AbortSignal): Promise<RuntimeLogEntry[]> {
     const response = await request<{
       data: Array<{
         sequence: number;
@@ -63,7 +63,7 @@ export const jobsApi = {
         data: Record<string, unknown>;
         created_at: string;
       }>;
-    }>(`/api/v1/jobs/${id}/events?limit=1000`);
+    }>(`/api/v1/jobs/${id}/events?limit=1000&tail=true`, { signal });
     return response.data
       .filter((event) => event.message)
       .map((event) => ({

@@ -1,5 +1,6 @@
 #include "mlx_vq.h"
 #include "mlx_nvq3jl.h"
+#include "mlx_weight_residency.h"
 
 #include "../../../core/compat/mfq_format_compat.h"
 #include "nvq_codebooks.generated.h"
@@ -251,6 +252,7 @@ inline float mfq_vq_decode_weight(
 )METAL";
 
 constexpr const char* kMatmulSource = R"METAL(
+    const int M = x_shape[0];
     uint lane = thread_index_in_simdgroup;
     uint workgroup = thread_position_in_grid.x >> 5;
     uint output = workgroup % uint(OUT);
@@ -532,6 +534,7 @@ constexpr const char* kGemvSource = R"METAL(
 )METAL";
 
 constexpr const char* kMmqSource = R"METAL(
+    const int M = x_shape[0];
     constexpr uint K_LANES_VALUE = uint(K_LANES);
     constexpr uint ROWS_PER_SIMD =
         32u / K_LANES_VALUE;
@@ -916,7 +919,7 @@ constexpr const char* kDequantizeSource = R"METAL(
 
 constexpr const char* kEmbeddingSource = R"METAL(
     uint linear = thread_position_in_grid.x;
-    if (linear >= uint(COUNT) * uint(K)) {
+    if (linear >= uint(token_ids_shape[0]) * uint(K)) {
         return;
     }
     uint token_position = linear / uint(K);
@@ -958,6 +961,7 @@ constexpr const char* kEmbeddingSource = R"METAL(
 )METAL";
 
 constexpr const char* kHadamardSource = R"METAL(
+    const int M = x_shape[0];
     uint row = thread_position_in_grid.x / 256u;
     uint lane = thread_index_in_threadgroup;
     if (row >= uint(M)) {
@@ -1019,6 +1023,7 @@ constexpr const char* kHadamardSource = R"METAL(
 )METAL";
 
 constexpr const char* kResidualMatmulSource = R"METAL(
+    const int M = x_shape[0];
     uint lane = thread_index_in_simdgroup;
     uint simd_group = simdgroup_index_in_threadgroup;
     uint logical = threadgroup_position_in_grid.x * 4u + simd_group;
@@ -2968,7 +2973,9 @@ template <typename T, typename Allocator>
 array make_array(
     const std::vector<T, Allocator>& values,
     Shape shape) {
-    return array(values.begin(), std::move(shape));
+    auto result = array(values.begin(), std::move(shape));
+    MlxWeightResidency::track(result);
+    return result;
 }
 
 array make_nvq3jl_records(const CanonicalVq& weight) {
@@ -3025,6 +3032,7 @@ array make_nvq3jl_records(const CanonicalVq& weight) {
         }
         for (auto& thread : threads) thread.join();
     }
+    MlxWeightResidency::track(records);
     return records;
 }
 
@@ -3767,9 +3775,6 @@ array MlxVqWeight::embedding(
         table_banks_,
         groups_per_supergroup_,
         supergroups_);
-    templates.emplace_back(
-        "COUNT",
-        static_cast<int>(count));
     auto outputs = vq_embedding_kernel()(
         {
             indices_packed_,
@@ -3862,7 +3867,6 @@ array MlxVqWeight::prepare_input(
         {256, 1, 1},
         {
             {"T", source.dtype()},
-            {"M", rows},
             {"K", input_size_},
             {"BLOCK", rotation_block_},
         },
@@ -3993,8 +3997,7 @@ array MlxVqWeight::packed_matmul(
     } else if (wide_mmq) {
         const int mmq_rows_per_simd = 32 / mmq_k_lanes;
         const int row_tiles = rows <= 6 ? 1 : (rows + 4) / 5;
-        effective_tile_rows =
-            (rows + row_tiles - 1) / row_tiles;
+        effective_tile_rows = rows <= 6 ? rows : 5;
         const auto grid_x = checked_product(
             static_cast<std::size_t>(row_tiles),
             static_cast<std::size_t>(mmq_simd_groups * 32),
@@ -4062,7 +4065,6 @@ array MlxVqWeight::packed_matmul(
         table_banks_,
         groups_per_supergroup_,
         supergroups_);
-    templates.emplace_back("M", rows);
     if (fast_gemv) {
         templates.emplace_back("USE_NVQ3JL", nvq3jl_records_.has_value());
     }
@@ -4135,6 +4137,19 @@ array MlxVqWeight::packed_matmul(
         const auto& residual_kernel = residual_small_m
             ? residual_small_m_kernel()
             : residual_matmul_kernel();
+        std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>
+            residual_templates{
+                {"T", source.dtype()},
+                {"OUT", output_size_},
+                {"K", input_size_},
+                {"NVEC", vectors_},
+                {"RESIDUAL_BLOCKS", residual_blocks_per_row_},
+                {"POSITION_BITS", residual_position_bits_},
+                {"BLOCK_VECTORS", residual_block_vectors_},
+            };
+        if (residual_small_m) {
+            residual_templates.emplace_back("M", rows);
+        }
         auto residual_outputs = residual_kernel(
             {
                 result,
@@ -4147,16 +4162,7 @@ array MlxVqWeight::packed_matmul(
             {source.dtype()},
             {static_cast<int>(residual_grid), 1, 1},
             {128, 1, 1},
-            {
-                {"T", source.dtype()},
-                {"M", rows},
-                {"OUT", output_size_},
-                {"K", input_size_},
-                {"NVEC", vectors_},
-                {"RESIDUAL_BLOCKS", residual_blocks_per_row_},
-                {"POSITION_BITS", residual_position_bits_},
-                {"BLOCK_VECTORS", residual_block_vectors_},
-            },
+            std::move(residual_templates),
             std::nullopt,
             false,
             {});

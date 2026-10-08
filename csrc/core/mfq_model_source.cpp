@@ -149,7 +149,7 @@ std::vector<std::filesystem::path> shard_paths(
     std::uint64_t split_no,
     std::uint64_t split_count) {
     static const std::regex pattern(
-        R"(^(.*)-([0-9]{5})-of-([0-9]{5})\.mfq$)");
+        R"(^(.*)-([0-9]{5})-of-([0-9]{5})\.[mM][fF][qQ]$)");
     std::smatch match;
     const auto filename = path.filename().string();
     if (!std::regex_match(filename, match, pattern)) {
@@ -161,13 +161,36 @@ std::vector<std::filesystem::path> shard_paths(
         throw std::runtime_error("MFQ shard filename/metadata mismatch: " +
                                  path.string());
     }
-    std::vector<std::filesystem::path> result;
-    result.reserve(static_cast<std::size_t>(split_count));
+    std::vector<std::filesystem::path> result(static_cast<std::size_t>(split_count));
     for (std::uint64_t index = 1; index <= split_count; ++index) {
         std::ostringstream name;
         name << match[1].str() << '-' << std::setfill('0') << std::setw(5)
              << index << "-of-" << std::setw(5) << split_count << ".mfq";
-        result.push_back(stable_path(path.parent_path() / name.str()));
+        result[index - 1] = path.parent_path() / name.str();
+    }
+    if (path.extension() == ".mfq" && std::all_of(result.begin(), result.end(),
+            [](const auto& candidate) { return std::filesystem::is_regular_file(candidate); })) {
+        for (auto& candidate : result) candidate = stable_path(candidate);
+        return result;
+    }
+    std::vector<bool> found(result.size(), false);
+    for (const auto& entry : std::filesystem::directory_iterator(path.parent_path())) {
+        std::smatch candidate;
+        const auto candidate_name = entry.path().filename().string();
+        if (!entry.is_regular_file() || !std::regex_match(candidate_name, candidate, pattern) ||
+            candidate[1].str() != match[1].str() || std::stoull(candidate[3].str()) != split_count) {
+            continue;
+        }
+        const auto index = std::stoull(candidate[2].str());
+        if (index < 1 || index > split_count) continue;
+        if (found[index - 1]) {
+            throw std::runtime_error("duplicate MFQ shard index " + std::to_string(index) + ": " + path.string());
+        }
+        result[index - 1] = entry.path();
+        found[index - 1] = true;
+    }
+    for (std::uint64_t index = 1; index <= split_count; ++index) {
+        result[index - 1] = stable_path(result[index - 1]);
     }
     return result;
 }

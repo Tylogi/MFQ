@@ -1973,39 +1973,6 @@ void test_streamed_mfe_load_and_forward() {
                 std::nullopt,
                 kTokenExperts,
                 kAvailable);
-            constexpr int stream_rows = 16;
-            const int final_chunk_start =
-                ((rows - 1) / stream_rows)
-                * stream_rows;
-            std::array<bool, kExperts>
-                final_active{};
-            for (
-                int row = final_chunk_start;
-                row < rows;
-                ++row
-            ) {
-                for (
-                    int route = 0;
-                    route < kTopK;
-                    ++route
-                ) {
-                    final_active[
-                        static_cast<std::size_t>(
-                            expected.ids[
-                                static_cast<
-                                    std::size_t>(
-                                    row)
-                                    * kTopK
-                                + route])] =
-                        true;
-                }
-            }
-            const auto final_active_count =
-                static_cast<std::size_t>(
-                    std::count(
-                        final_active.begin(),
-                        final_active.end(),
-                        true));
             auto actual =
                 moe.forward_with_routing(
                     array(
@@ -2028,13 +1995,13 @@ void test_streamed_mfe_load_and_forward() {
                 residency->cache_limit_bytes() == 0
                     && residency
                         ->cached_expert_count()
-                        == final_active_count
+                        == 0
                     && residency
                         ->resident_packed_bytes()
-                        > 0,
+                        == 0,
                 std::string(label) +
-                    " did not retain only the "
-                    "current active experts");
+                    " retained packed experts "
+                    "with a zero-byte cache");
         };
     run_rows(
         16,

@@ -15,7 +15,6 @@ void PagedSessionBindings::bind(
         std::size_t tokens) {
     if (!cache_ || session_id.empty() || max_sessions_ == 0) return;
     close(session_id);
-    cache_->pin(blocks);
     bindings_[session_id] = Binding{
         std::move(blocks), tokens, ++clock_};
     while (bindings_.size() > max_sessions_) {
@@ -53,7 +52,6 @@ std::size_t PagedSessionBindings::close(const std::string& session_id) {
     const auto found = bindings_.find(session_id);
     if (found == bindings_.end()) return 0;
     const auto blocks = found->second.blocks.size();
-    cache_->unpin(found->second.blocks);
     bindings_.erase(found);
     sync_metrics();
     return blocks;
@@ -61,10 +59,6 @@ std::size_t PagedSessionBindings::close(const std::string& session_id) {
 
 std::size_t PagedSessionBindings::clear() noexcept {
     const auto sessions = bindings_.size();
-    for (const auto& [session, binding] : bindings_) {
-        (void)session;
-        cache_->unpin(binding.blocks);
-    }
     bindings_.clear();
     sync_metrics();
     return sessions;

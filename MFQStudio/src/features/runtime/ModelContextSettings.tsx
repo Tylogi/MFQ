@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useRuntime } from '../../app/RuntimeProvider';
+import { useConnectionScope } from '../../app/useConnectionScope';
 import { SettingRow } from '../../app/display';
 import { errorMessage, formatNumber } from '../../app/formatters';
 import { useSettings } from '../settings/SettingsProvider';
@@ -8,6 +9,7 @@ import { runtimeApi } from '../../shared/api/resources/runtime';
 
 export function ModelContextSettings() {
   const { instances, runtime, reloadingInstances, reloadModelContext } = useRuntime();
+  const connectionScope = useConnectionScope();
   const { tr, contextSize, setContextSize } = useSettings();
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [capacities, setCapacities] = useState<Record<string, number>>({});
@@ -24,14 +26,16 @@ export function ModelContextSettings() {
   }, [missingCapacities]);
 
   async function reload(instanceId: string, size: number, model: string) {
+    const current = connectionScope();
     try {
       const result = await reloadModelContext(instanceId, size);
+      if (!current()) return;
       const actual = result.max_context ?? size;
       setDrafts((current) => ({ ...current, [instanceId]: String(actual) }));
       toast.success(tr(`${model} 已重载，上下文 ${formatNumber(actual)} tokens`,
         `${model} reloaded with a ${formatNumber(actual)} token context`));
     } catch (cause) {
-      toast.error(errorMessage(cause));
+      if (current()) toast.error(errorMessage(cause));
     }
   }
 

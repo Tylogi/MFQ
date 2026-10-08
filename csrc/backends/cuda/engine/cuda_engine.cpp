@@ -247,9 +247,11 @@ struct CudaEngineState {
                     }
                     duplex_active = true;
                     duplex_sequence = start_duplex(std::move(value));
-                } else {
+                } else if constexpr (std::is_same_v<T, MfqDuplexStepInput>) {
                     if (!duplex_active) throw std::invalid_argument("duplex session is not prepared");
                     duplex_sequence = step_duplex(std::move(value));
+                } else {
+                    throw std::invalid_argument("probability scoring is unavailable for this model");
                 }
                 duplex_pending = true;
                 return ControlPending{};

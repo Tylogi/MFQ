@@ -127,6 +127,10 @@ mlx::core::array moe_limited_swiglu_split(
     const mlx::core::array& gate_up,
     float limit);
 
+mlx::core::array moe_swiglu_pair(
+    const mlx::core::array& gate,
+    const mlx::core::array& up);
+
 // Apply limited SwiGLU to separate Gate and Up projections without first
 // materializing their concatenation.
 mlx::core::array moe_limited_swiglu_pair(

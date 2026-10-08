@@ -2,6 +2,7 @@ import { type CSSProperties, useEffect, useRef, useState } from 'react';
 import { jobsApi } from '../../shared/api/resources/jobs';
 import type { JobKindResource, JobResource } from '../../shared/api/types';
 import { useRuntime } from '../../app/RuntimeProvider';
+import { useConnectionScope } from '../../app/useConnectionScope';
 import { errorMessage } from '../../app/formatters';
 import { toast } from '../../stores/toastStore';
 import { useSettings } from '../settings/SettingsProvider';
@@ -13,6 +14,7 @@ import { DownloadQueue, downloadProgress, isActiveDownload, isModelDownload } fr
 export function ModelHubPage() {
   const { tr } = useSettings();
   const { addJob } = useRuntime();
+  const connectionScope = useConnectionScope();
   const jobs = useJobStore((state) => state.jobs);
   const downloads = jobs.filter(isModelDownload);
   const active = downloads.filter(isActiveDownload);
@@ -45,6 +47,7 @@ export function ModelHubPage() {
   }, [flight]);
 
   function trackDownload(job: JobResource, origin: DownloadOrigin) {
+    if (!connectionScope()()) return;
     addJob(job);
     toast.success(tr('下载任务已提交', 'Download job submitted'));
     const rect = circle.current?.getBoundingClientRect();

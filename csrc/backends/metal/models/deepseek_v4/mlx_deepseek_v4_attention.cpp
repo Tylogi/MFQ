@@ -26,6 +26,7 @@ using mlx::core::Shape;
 using mlx::core::array;
 
 constexpr const char* kHadamardSource = R"METAL(
+    const int M = x_shape[0];
     uint row = thread_position_in_grid.x / 256u;
     uint lane = thread_index_in_threadgroup;
     if (row >= uint(M)) {
@@ -85,6 +86,8 @@ constexpr const char* kHadamardSource = R"METAL(
 )METAL";
 
 constexpr const char* kRmsPartialAdjacentRopeSource = R"METAL(
+    const int TOKENS = x_shape[1];
+    const int ROWS = x_shape[0] * TOKENS * HEADS;
     uint row = threadgroup_position_in_grid.x;
     uint local_thread = thread_index_in_threadgroup;
     uint lane = thread_index_in_simdgroup;
@@ -401,11 +404,9 @@ array rms_replace_last_rope(
         {256, 1, 1},
         {
             {"T", source.dtype()},
-            {"ROWS", static_cast<int>(rows)},
             {"DIM", dimension},
             {"ROTARY", rotary},
             {"PAIRS", pairs},
-            {"TOKENS", tokens},
             {"HEADS", heads},
             {"WEIGHTED", weighted ? 1 : 0},
         },
@@ -525,7 +526,6 @@ array signed_hadamard(
         {256, 1, 1},
         {
             {"T", source.dtype()},
-            {"M", rows},
             {"K", width},
             {"BLOCK", block},
         },

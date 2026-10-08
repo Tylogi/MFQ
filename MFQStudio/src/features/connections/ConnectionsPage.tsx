@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Icon, ScreenHeader, SectionLabel, SettingRow, TMPanel } from '../../app/display';
 import { errorMessage } from '../../app/formatters';
 import {
@@ -11,12 +11,13 @@ import {
 import { useRuntime } from '../../app/RuntimeProvider';
 import { runtimeModelNames } from '../runtime/modelSelection';
 import { runtimeApi } from '../../shared/api/resources/runtime';
-import { getApiBaseUrl, setApiToken, setBrowserServiceUrl } from '../../shared/api/client';
+import { getApiBaseUrl, getApiToken, setApiToken, setBrowserServiceUrl } from '../../shared/api/client';
 import { useSettings } from '../settings/SettingsProvider';
 import { ToolsRoutingPanel } from './ToolsRoutingPanel';
 import { MemorySettingsPanel } from './MemorySettingsPanel';
 import { RuntimeProfilesPanel } from '../runtime/RuntimeProfilesPanel';
 import { ModelAliasMapping } from './ModelAliasMapping';
+import { InferencePolicyPanel } from './InferencePolicyPanel';
 import { toast } from '../../stores/toastStore';
 
 function browserConfig(): StudioConfig {
@@ -43,6 +44,11 @@ export function ConnectionsPage() {
   const [token, setToken] = useState('');
   const [credentialWritable, setCredentialWritable] = useState(false);
   const [busy, setBusy] = useState(false);
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
   useEffect(() => {
     if (studio) setDraft(studio.config);
     else {
@@ -77,6 +83,9 @@ export function ConnectionsPage() {
 
   async function save() {
     if (!draft || busy) return;
+    const endpoint = getApiBaseUrl();
+    let credential = getApiToken();
+    const current = () => getApiBaseUrl() === endpoint && getApiToken() === credential;
     setBusy(true);
     try {
       if (!Number.isInteger(draft.local_service_port) || draft.local_service_port < 1 || draft.local_service_port > 65535) {
@@ -86,13 +95,19 @@ export function ConnectionsPage() {
         if (studio?.config.mode === 'local' && draft.mode === 'local'
             && studio.config.local_service_port !== draft.local_service_port) {
           await runtimeApi.configureRuntimeListener(draft.local_service_port);
+          if (!current()) return;
         }
         await configureStudio(draft);
-        if (credentialWritable) await saveStudioCredential(token);
+        if (!current()) return;
+        if (credentialWritable) {
+          await saveStudioCredential(token);
+          if (!current()) return;
+        }
       } else {
         let address = draft.remote_url.trim().replace(/\/+$/, '').replace(/\/v1$/, '');
         if (draft.mode === 'local') {
           if (browserConfig().mode === 'local') await runtimeApi.configureRuntimeListener(draft.local_service_port);
+          if (!current()) return;
           address = `http://127.0.0.1:${draft.local_service_port}`;
         } else {
           const parsed = new URL(address);
@@ -101,7 +116,7 @@ export function ConnectionsPage() {
           }
         }
         setBrowserServiceUrl(address);
-        if (credentialWritable) setApiToken(token);
+        if (credentialWritable) { setApiToken(token); credential = token.trim(); }
         if (draft.mode === 'local' && window.location.port === String(listeningPort)
             && listeningPort !== draft.local_service_port) {
           const page = new URL(window.location.href);
@@ -111,12 +126,14 @@ export function ConnectionsPage() {
         }
       }
       const reconnected = await reloadService();
-      setCredentialWritable(false);
-      if (reconnected) toast.success(tr('服务器设置已保存', 'Server settings saved'));
+      if (mounted.current && reconnected) {
+        setCredentialWritable(false);
+        toast.success(tr('服务器设置已保存', 'Server settings saved'));
+      }
     } catch (cause) {
-      toast.error(errorMessage(cause));
+      if (mounted.current && current()) toast.error(errorMessage(cause));
     } finally {
-      setBusy(false);
+      if (mounted.current) setBusy(false);
     }
   }
 
@@ -293,6 +310,7 @@ export function ConnectionsPage() {
           </button>
         </div>
       </div>
+      <InferencePolicyPanel />
       <RuntimeProfilesPanel />
       <ToolsRoutingPanel />
     </section>

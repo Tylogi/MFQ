@@ -334,6 +334,7 @@ def _run(args: argparse.Namespace) -> int:
         ),
         voice_component=voice_component,
         activate_voice_output=runtime_manager.enable_realtime,
+        runtime_manager=runtime_manager,
     )
     jobs = JobManager(store, handlers.handlers())
     service = ServerService(

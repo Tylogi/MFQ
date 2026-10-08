@@ -90,6 +90,7 @@ constexpr const char* kMxfp4E4m3ScaleSimSource = R"METAL(
 )METAL";
 
 constexpr const char* kWeightedRmsRopeMxfp8SimSource = R"METAL(
+    const int TOKENS = cos_values_shape[0];
     uint row = threadgroup_position_in_grid.x;
     uint local_thread = thread_index_in_threadgroup;
     uint lane = thread_index_in_simdgroup;
@@ -302,6 +303,7 @@ inline float mfq_mx_weight(
 )METAL";
 
 constexpr const char* kMxMatmul = R"METAL(
+    const int M = x_shape[0];
     uint lane = thread_index_in_simdgroup;
     uint workgroup = thread_position_in_grid.x >> 5u;
     uint output = workgroup % uint(OUT);
@@ -339,6 +341,7 @@ constexpr const char* kMxMatmul = R"METAL(
 // decoded four-value vector is reused across all activation rows.  Two SIMD
 // groups produce eight output rows per threadgroup.
 constexpr const char* kMxSmallM = R"METAL(
+    const int M = x_shape[0];
     constexpr uint K_LANES_VALUE = uint(K_LANES);
     constexpr uint SIMD_GROUPS_VALUE = uint(SIMD_GROUPS);
     constexpr uint OUTPUTS_PER_SIMD = 32u / K_LANES_VALUE;
@@ -1041,6 +1044,7 @@ constexpr const char* kMxDequantize = R"METAL(
 )METAL";
 
 constexpr const char* kMxEmbedding = R"METAL(
+    const int M = x_shape[0];
     uint index = thread_position_in_grid.x;
     uint count = uint(M) * uint(K);
     if (index < count) {
@@ -1242,7 +1246,7 @@ const mlx::core::fast::CustomKernelFunction& mx_embedding_kernel() {
 
 std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>
 templates(Dtype dtype, int bits, int input_size, int output_size,
-          int scale_row_block, int scale_column_block, int rows = 1,
+          int scale_row_block, int scale_column_block,
           int tile_rows = 1) {
     return {
         {"T", dtype},
@@ -1251,7 +1255,6 @@ templates(Dtype dtype, int bits, int input_size, int output_size,
         {"SCALE_COLUMN_BLOCK", scale_column_block},
         {"K", input_size},
         {"OUT", output_size},
-        {"M", rows},
         {"TILE_M", tile_rows},
     };
 }
@@ -1380,7 +1383,6 @@ array mlx_weighted_rms_rope_mxfp8_sim(
             {"DIM", 512},
             {"ROTARY", rotary_dimension},
             {"PAIRS", rotary_dimension / 2},
-            {"TOKENS", tokens},
         },
         std::nullopt,
         false,
@@ -1777,7 +1779,7 @@ array MlxMxWeight::matmul(const array& input) const {
         small_m_simd_groups * 32 / small_m_k_lanes;
     const bool mxfp8_gemv =
         gemv && bits_ == 8 && source.dtype() == mlx::core::float16;
-    const int tile_rows = gemv ? 1 : (rows <= 16 ? static_cast<int>(rows) : 8);
+    const int tile_rows = rows <= 6 ? static_cast<int>(rows) : 8;
     const auto row_tiles = (rows + static_cast<std::size_t>(tile_rows) - 1) /
         static_cast<std::size_t>(tile_rows);
     const auto grid_x = mxfp8_gemv
@@ -1810,7 +1812,6 @@ array MlxMxWeight::matmul(const array& input) const {
         output_size_,
         mxfp8_scale_row_block_size_,
         mxfp8_scale_column_block_size_,
-        static_cast<int>(rows),
         tile_rows);
     if (small_m) {
         template_arguments.emplace_back("K_LANES", small_m_k_lanes);
@@ -2335,8 +2336,7 @@ array MlxMxWeight::embedding(const array& token_ids, Dtype dtype) const {
             input_size_,
             output_size_,
             mxfp8_scale_row_block_size_,
-            mxfp8_scale_column_block_size_,
-            static_cast<int>(tokens)),
+            mxfp8_scale_column_block_size_),
         std::nullopt,
         false,
         {});

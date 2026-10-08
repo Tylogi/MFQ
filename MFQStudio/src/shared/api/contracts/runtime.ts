@@ -113,7 +113,14 @@ export interface RuntimeStatus {
   prefix_cache_evictions?: number;
   prefix_cache_corrupt_blocks?: number;
   prefix_cache_mode?: string;
+  prefix_cache_total_hot_bytes?: number;
+  prefix_cache_total_hot_max_bytes?: number;
+  prefix_cache_total_disk_bytes?: number;
+  prefix_cache_total_disk_blocks?: number;
+  prefix_cache_total_disk_max_bytes?: number;
+  prefix_cache_budget_failures?: number;
   sampling_defaults?: Partial<SamplingParams>;
+  mtp_service_enabled?: boolean;
   duplex_sampling_defaults?: {
     system_prompt?: string;
     temperature?: number;

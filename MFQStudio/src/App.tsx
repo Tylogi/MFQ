@@ -47,6 +47,9 @@ const QuantizationPage = lazy(() =>
     default: module.QuantizationPage,
   })),
 );
+const AnalysisPage = lazy(() =>
+  import('./features/analysis/AnalysisPage').then((module) => ({ default: module.AnalysisPage })),
+);
 
 /** 挂载共享服务与独立业务页面，未知地址显示 404。 */
 export default function App() {
@@ -66,6 +69,7 @@ export default function App() {
                   <Route path="logs" element={<LogsPage />} />
                   <Route path="settings" element={<SettingsRoute />} />
                   <Route element={<LabLayout />}>
+                    <Route path="analysis" element={<AnalysisPage />} />
                     <Route path="model-hub" element={<ModelHubPage />} />
                     <Route path="evaluations" element={<EvaluationsPage />} />
                     <Route path="quantization" element={<QuantizationPage />} />

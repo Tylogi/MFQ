@@ -475,6 +475,7 @@ fn validate_download_url(value: &str) -> Result<(), String> {
 fn safe_asset_name(value: &str) -> Result<&str, String> {
     let path = Path::new(value);
     if value.is_empty()
+        || value.contains(['/', '\\', ':'])
         || path.components().count() != 1
         || path.file_name().and_then(|item| item.to_str()) != Some(value)
     {
@@ -492,16 +493,25 @@ where
     F: FnMut(u64, u64),
 {
     validate_download_url(&release.asset.download_url)?;
+    let version = safe_version_directory(&release.version)?;
+    let name = safe_asset_name(&release.asset.name)?;
     let expected_sha256 = release
         .asset
         .sha256
         .as_deref()
         .ok_or_else(|| "release asset does not publish a SHA-256 digest".to_string())?;
-    let downloads = root.join("downloads").join(&release.version);
+    if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|value| value.is_ascii_hexdigit()) {
+        return Err("release asset SHA-256 digest is invalid".into());
+    }
+    let downloads = root.join("downloads").join(version);
     fs::create_dir_all(&downloads).map_err(|error| error.to_string())?;
-    let destination = downloads.join(safe_asset_name(&release.asset.name)?);
+    let destination = downloads.join(name);
     if destination.is_file() && verify_sha256(&destination, expected_sha256)? {
-        report_progress(release.asset.byte_size, release.asset.byte_size);
+        let bytes = fs::metadata(&destination).map_err(|error| error.to_string())?.len();
+        if release.asset.byte_size > 0 && bytes != release.asset.byte_size {
+            return Err("cached release download size mismatch".into());
+        }
+        report_progress(bytes, release.asset.byte_size);
         return Ok(destination);
     }
     let temporary = destination.with_extension("download.partial");
@@ -529,11 +539,16 @@ where
         if count == 0 {
             break;
         }
+        total = total.saturating_add(count as u64);
+        if release.asset.byte_size > 0 && total > release.asset.byte_size {
+            drop(output);
+            let _ = fs::remove_file(&temporary);
+            return Err("release download exceeds its published size".into());
+        }
         output
             .write_all(&buffer[..count])
             .map_err(|error| error.to_string())?;
         digest.update(&buffer[..count]);
-        total = total.saturating_add(count as u64);
         report_progress(total, release.asset.byte_size);
     }
     output.sync_all().map_err(|error| error.to_string())?;
@@ -1198,6 +1213,31 @@ pub async fn studio_update_delete(
 mod tests {
     use super::*;
 
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!("mfq-updater-{}-{}",
+                std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+            fs::create_dir(&directory).unwrap();
+            Self(directory)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture_release() -> StudioRelease {
+        StudioRelease { version: "0.3.2".into(), tag: "v0.3.2".into(), name: "MFQ".into(),
+            notes: String::new(), published_at: None, page_url: RELEASES_PAGE.into(), prerelease: false,
+            asset: StudioReleaseAsset { name: "MFQ.dmg".into(), byte_size: 3,
+                sha256: Some(format!("{:x}", Sha256::digest(b"abc"))),
+                download_url: "https://github.com/Tylogi/MFQ/releases/download/v0.3.2/MFQ.dmg".into() } }
+    }
+
     #[test]
     fn extracts_versions_from_current_and_legacy_release_tags() {
         assert_eq!(extract_version("v0.3.2").as_deref(), Some("0.3.2"));
@@ -1232,6 +1272,48 @@ mod tests {
             "MFQ.Studio_0.3.2_aarch64.dmg"
         );
         assert!(safe_asset_name("../MFQ.dmg").is_err());
+        assert!(safe_asset_name("..\\MFQ.dmg").is_err());
+        assert!(safe_asset_name("C:MFQ.dmg").is_err());
+        assert!(safe_asset_name(".").is_err());
+        assert!(safe_asset_name("").is_err());
+    }
+
+    #[test]
+    fn corrupted_release_cache_is_rejected_before_any_download_or_directory_creation() {
+        let root = TestDirectory::new();
+        for version in ["../outside", "../../outside", "/outside", "v0.3.2", "0.3.2/extra"] {
+            let mut release = fixture_release();
+            release.version = version.into();
+            assert!(download_asset(&root.0, &release, |_, _| {}).is_err());
+        }
+        for name in ["../outside", "..\\outside", "C:outside"] {
+            let mut release = fixture_release();
+            release.asset.name = name.into();
+            assert!(download_asset(&root.0, &release, |_, _| {}).is_err());
+        }
+        let mut release = fixture_release();
+        release.asset.sha256 = Some("invalid".into());
+        assert!(download_asset(&root.0, &release, |_, _| {}).is_err());
+        assert_eq!(fs::read_dir(&root.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn verified_cached_download_is_reused_without_network_or_rewriting() {
+        let root = TestDirectory::new();
+        let release = fixture_release();
+        let directory = root.0.join("downloads").join(&release.version);
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(&release.asset.name);
+        fs::write(&path, b"abc").unwrap();
+        let mut progress = Vec::new();
+        assert_eq!(download_asset(&root.0, &release, |bytes, total| progress.push((bytes, total))).unwrap(), path);
+        assert_eq!(progress, vec![(3, 3)]);
+        assert_eq!(fs::read(&path).unwrap(), b"abc");
+        let mut corrupt = release.clone();
+        corrupt.asset.byte_size = 4;
+        assert!(download_asset(&root.0, &corrupt, |_, _| {}).unwrap_err().contains("size mismatch"));
+        assert_eq!(fs::read(&path).unwrap(), b"abc");
+        assert!(!verify_sha256(&path, &"0".repeat(64)).unwrap());
     }
 
     #[test]

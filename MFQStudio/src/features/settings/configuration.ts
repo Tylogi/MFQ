@@ -111,7 +111,29 @@ export function modeTemplateSettings(
 /** 读取本地界面及推理设置，损坏或缺失时使用默认值。 */
 export function loadSettings(): GenerationSettings {
   try {
-    return { ...DEFAULT_SETTINGS, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") };
+    const raw: unknown = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ...DEFAULT_SETTINGS };
+    const source = raw as Record<string, unknown>;
+    const settings = { ...DEFAULT_SETTINGS };
+    for (const key of Object.keys(DEFAULT_SETTINGS) as (keyof GenerationSettings)[]) {
+      const value = source[key];
+      if (typeof value === typeof DEFAULT_SETTINGS[key] &&
+          (typeof value !== 'number' || Number.isFinite(value))) Object.assign(settings, { [key]: value });
+    }
+    if (!['system', 'zh-CN', 'en'].includes(settings.language)) settings.language = DEFAULT_SETTINGS.language;
+    if (!['system', 'light', 'dark'].includes(settings.theme)) settings.theme = DEFAULT_SETTINGS.theme;
+    if (!['precise', 'balanced', 'creative', 'custom'].includes(settings.preset)) settings.preset = DEFAULT_SETTINGS.preset;
+    for (const [key, minimum, maximum, integer] of [
+      ['maxTokens', 1, 65536, true], ['temperature', 0, 2, false], ['topP', 0.05, 1, false],
+      ['topK', 0, 1024, true], ['repetitionPenalty', 0.5, 2, false],
+      ['presencePenalty', -2, 2, false], ['frequencyPenalty', -2, 2, false],
+    ] as const) {
+      if (settings[key] < minimum || settings[key] > maximum || integer && !Number.isInteger(settings[key])) {
+        settings[key] = DEFAULT_SETTINGS[key];
+      }
+    }
+    settings.seed = typeof source.seed === 'number' && Number.isSafeInteger(source.seed) && source.seed >= 0 ? source.seed : null;
+    return settings;
   } catch {
     return { ...DEFAULT_SETTINGS };
   }

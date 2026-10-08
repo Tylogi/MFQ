@@ -74,6 +74,10 @@ int MfqHttpTransport::run(const MfqScheduler& scheduler) {
     server.Get("/runtime/realtime/capabilities", handle("realtime.capabilities"));
     server.Post("/runtime/cache/clear", handle("cache.clear"));
     server.Post("/runtime/cache/trim", handle("cache.trim"));
+    server.Post("/runtime/cache/budget", handle("cache.budget"));
+    server.Post("/runtime/cache/refresh", handle("cache.refresh"));
+    server.Post("/runtime/memory/budget", handle("memory.budget"));
+    server.Post("/runtime/score", handle("score"));
     server.Post("/runtime/sessions/fork", handle("session.fork"));
     server.Post(R"(/runtime/sessions/([A-Za-z0-9._:-]{1,128})/cancel)", handle("session.cancel"));
     server.Delete(R"(/runtime/sessions/([A-Za-z0-9._:-]{1,128}))", handle("session.close"));
@@ -81,8 +85,9 @@ int MfqHttpTransport::run(const MfqScheduler& scheduler) {
     server.Get("/", [&](const httplib::Request& request, httplib::Response& response) {
         if (!authorized(request, response, config.api_key)) return;
         set_json(response, {{"name", "MFQ C++ HTTP runtime transport"}, {"model", config.model_name},
-            {"endpoints", {"/runtime/generate", "/runtime/models", "/runtime/health", "/runtime/status",
+            {"endpoints", {"/runtime/generate", "/runtime/score", "/runtime/models", "/runtime/health", "/runtime/status",
                 "/runtime/reload", "/runtime/realtime", "/runtime/cache/clear", "/runtime/cache/trim",
+                "/runtime/cache/budget", "/runtime/cache/refresh", "/runtime/memory/budget",
                 "/runtime/sessions/fork", "/runtime/sessions/{id}", "/runtime/sessions/{id}/cancel"}}});
     });
 

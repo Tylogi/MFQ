@@ -45,9 +45,9 @@ export function SettingsPage({ tr, settingsDraft, setSettingsDraft, mtpAvailable
           trailing={<Switch label={tr("视觉输入", "Vision input")} checked={settingsDraft.enableVision} onCheckedChange={(checked) => setSettingsDraft((current) => ({ ...current, enableVision: checked, inheritModelDefaults: false }))} />}
         />
         <SettingRow
-          title="MTP"
+          title={tr("对话 MTP", "Chat MTP")}
           detail={mtpAvailable
-            ? tr("当前模型支持 MTP 投机解码。", "The current model supports MTP speculative decoding.")
+            ? tr("内置对话的请求偏好，受服务页 MTP 开关控制。", "Preference for built-in chat, subject to the service MTP switch.")
             : tr("当前模型无法使用 MTP，将使用普通 Decode。", "MTP is unavailable for the current model; ordinary Decode will be used.")}
           trailing={<Switch label="MTP" checked={mtpAvailable && settingsDraft.enableMtp} disabled={!mtpAvailable} onCheckedChange={(checked) => setSettingsDraft((current) => ({ ...current, enableMtp: checked, inheritModelDefaults: false }))} />}
         />

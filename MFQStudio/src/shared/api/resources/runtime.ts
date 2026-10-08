@@ -15,15 +15,82 @@ import type {
 import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client';
 
 export interface RuntimeMemoryPolicy {
+  total_limit_bytes?: number | null;
+  effective_total_limit_bytes?: number | null;
+  total_capacity_limit_bytes?: number | null;
   model_limit_bytes: number | null;
   prefix_limit_bytes: number | null;
+  prefix_disk_limit_bytes?: number | null;
   prefix_directory: string | null;
   actual_prefix_directory: string;
 }
 
+export interface PrefixCacheGroup {
+  id: string;
+  model_name: string | null;
+  architecture: string | null;
+  codec: string | null;
+  context_size: number | null;
+  bytes: number;
+  blocks: number;
+  prefixes: number;
+  block_tokens: number;
+  max_prefix_tokens: number;
+  incomplete_prefixes: number;
+  text_blocks: number;
+  last_used_at: string;
+}
+export interface PrefixCacheBlock {
+  id: string;
+  parent: string;
+  tokens: number;
+  prefix_tokens: number;
+  complete_chain: boolean;
+  text_available: boolean;
+  bytes: number;
+  last_used_at: string;
+}
+export interface PrefixCacheInventory {
+  directory: string;
+  total_bytes: number;
+  total_blocks: number;
+  can_clear: boolean;
+  data: PrefixCacheGroup[];
+  blocks: PrefixCacheBlock[];
+  offset: number;
+  limit: number;
+}
+export interface PrefixCacheText {
+  available: boolean;
+  text?: string;
+  reason?: string;
+  total_tokens?: number;
+  offset?: number;
+  next_offset?: number | null;
+}
+
 export const runtimeApi = {
-  runtimeResources(): Promise<RuntimeResources> {
-    return request('/api/v1/runtime/resources');
+  inferencePolicy(): Promise<{ mtp_enabled: boolean }> {
+    return request('/api/v1/runtime/inference-policy');
+  },
+  configureInferencePolicy(mtpEnabled: boolean): Promise<{ mtp_enabled: boolean }> {
+    return request('/api/v1/runtime/inference-policy', {
+      method: 'PUT', body: JSON.stringify({ mtp_enabled: mtpEnabled }),
+    });
+  },
+  prefixCacheEntries(namespace?: string, offset = 0, signal?: AbortSignal): Promise<PrefixCacheInventory> {
+    const query = new URLSearchParams({ offset: String(offset), limit: '100' });
+    if (namespace) query.set('namespace', namespace);
+    return request(`/api/v1/runtime/cache/entries?${query}`, { signal });
+  },
+  prefixCacheText(namespace: string, block: string, offset = 0): Promise<PrefixCacheText> {
+    return request(`/api/v1/runtime/cache/entries/${encodeURIComponent(namespace)}/${encodeURIComponent(block)}/text?offset=${offset}`);
+  },
+  purgePrefixCache(namespace?: string): Promise<{ released_bytes: number; removed_blocks: number; failed_blocks: number }> {
+    return request('/api/v1/runtime/cache/purge', { method: 'POST', body: JSON.stringify({ namespace: namespace ?? null }) });
+  },
+  runtimeResources(signal?: AbortSignal): Promise<RuntimeResources> {
+    return request('/api/v1/runtime/resources', { signal });
   },
   modelAliases(): Promise<{ aliases: Record<string, string> }> {
     return request('/api/v1/runtime/model-aliases');
@@ -34,7 +101,7 @@ export const runtimeApi = {
   memoryPolicy(): Promise<RuntimeMemoryPolicy> {
     return request('/api/v1/runtime/memory-policy');
   },
-  configureMemoryPolicy(policy: Partial<Omit<RuntimeMemoryPolicy, 'actual_prefix_directory'>>): Promise<{ operation_id: string }> {
+  configureMemoryPolicy(policy: Partial<Pick<RuntimeMemoryPolicy, 'total_limit_bytes' | 'model_limit_bytes' | 'prefix_limit_bytes' | 'prefix_disk_limit_bytes' | 'prefix_directory'>>): Promise<{ operation_id: string }> {
     return request('/api/v1/runtime/memory-policy', { method: 'PUT', body: JSON.stringify(policy) });
   },
   runtimeListener(): Promise<RuntimeListener> {
@@ -105,15 +172,15 @@ export const runtimeApi = {
   },
 
   /** 获取运行指标快照历史，供概览趋势展示。 */
-  async runtimeMetrics(limit = 200): Promise<RuntimeMetricSnapshot[]> {
+  async runtimeMetrics(limit = 200, signal?: AbortSignal, since?: string): Promise<RuntimeMetricSnapshot[]> {
     return (
-      await request<{ data: RuntimeMetricSnapshot[] }>(`/api/v1/runtime/metrics?limit=${limit}`)
+      await request<{ data: RuntimeMetricSnapshot[] }>(`/api/v1/runtime/metrics?limit=${limit}${since ? `&since=${encodeURIComponent(since)}` : ''}`, { signal })
     ).data;
   },
 
   /** 获取最近的服务日志。 */
-  async runtimeLogs(limit = 100): Promise<RuntimeLogEntry[]> {
-    return (await request<{ data: RuntimeLogEntry[] }>(`/api/v1/runtime/logs?limit=${limit}`)).data;
+  async runtimeLogs(limit = 100, signal?: AbortSignal, after?: number): Promise<RuntimeLogEntry[]> {
+    return (await request<{ data: RuntimeLogEntry[] }>(`/api/v1/runtime/logs?limit=${limit}${after != null ? `&after=${after}` : ''}`, { signal })).data;
   },
 
   /** 读取语音通道可用性与默认音频参数。 */

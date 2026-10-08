@@ -57,6 +57,12 @@ struct RegisteredModelList {
     data: Vec<RegisteredModel>,
 }
 
+#[derive(Serialize)]
+struct SelectedModelDirectory {
+    path: String,
+    names: Vec<String>,
+}
+
 #[derive(Default)]
 struct StudioState {
     start_lock: Mutex<()>,
@@ -136,6 +142,11 @@ async fn is_mfq_server(client: &reqwest::Client, base_url: &str) -> bool {
         Err(_) => return false,
     };
     payload.get("service").and_then(|value| value.as_str()) == Some("mfq-server")
+}
+
+fn with_server_credential(request: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
+    let token = token.trim();
+    if token.is_empty() { request } else { request.bearer_auth(token) }
 }
 
 fn open_log(path: &Path) -> Result<File, String> {
@@ -389,12 +400,9 @@ async fn studio_configure(
         let previous_url = local_service_url(&previous);
         if is_mfq_server(&client, &previous_url).await {
             let token = studio_credential_get()?;
-            let mut request = client.put(format!("{previous_url}/api/v1/runtime/listener"))
+            let request = client.put(format!("{previous_url}/api/v1/runtime/listener"))
                 .json(&serde_json::json!({ "port": config.local_service_port }));
-            if !token.is_empty() {
-                request = request.bearer_auth(token);
-            }
-            let response = request.send().await.map_err(|error| error.to_string())?;
+            let response = with_server_credential(request, &token).send().await.map_err(|error| error.to_string())?;
             if !response.status().is_success() {
                 return Err(format!("failed to change server port: {}", response.text().await.unwrap_or_default()));
             }
@@ -421,13 +429,17 @@ async fn studio_start_local(
 }
 
 #[tauri::command]
-async fn studio_select_model_directory(app: AppHandle) -> Result<Option<Vec<String>>, String> {
+async fn studio_select_model_directory(
+    app: AppHandle,
+    initial_directory: String,
+) -> Result<Option<SelectedModelDirectory>, String> {
     let config = load_config(&app)?;
     if !matches!(config.mode, RuntimeMode::Local) {
         return Err("the native directory picker is available only for the local server".into());
     }
     let selected = rfd::AsyncFileDialog::new()
         .set_title("Select a folder containing MFQ models")
+        .set_directory(initial_directory)
         .pick_folder()
         .await;
     let Some(directory) = selected else {
@@ -441,12 +453,14 @@ async fn studio_select_model_directory(app: AppHandle) -> Result<Option<Vec<Stri
         .timeout(Duration::from_secs(300))
         .build()
         .map_err(|error| error.to_string())?;
-    let response = client
+    let token = studio_credential_get()?;
+    let request = client
         .post(format!(
             "{}/api/v1/models/directories/register",
             local_service_url(&config)
         ))
-        .json(&serde_json::json!({"path": path}))
+        .json(&serde_json::json!({"path": path}));
+    let response = with_server_credential(request, &token)
         .send()
         .await
         .map_err(|error| format!("failed to register model directory: {error}"))?;
@@ -461,13 +475,14 @@ async fn studio_select_model_directory(app: AppHandle) -> Result<Option<Vec<Stri
         .json::<RegisteredModelList>()
         .await
         .map_err(|error| format!("invalid model registration response: {error}"))?;
-    Ok(Some(
-        registered
+    Ok(Some(SelectedModelDirectory {
+        path: path.to_string(),
+        names: registered
             .data
             .into_iter()
             .map(|model| model.name)
             .collect(),
-    ))
+    }))
 }
 
 #[tauri::command]
@@ -570,4 +585,31 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("MFQ Studio failed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn desktop_credentials_use_a_native_store_instead_of_the_mock_backend() {
+        let builder = keyring::default::default_credential_builder();
+        assert!(!builder.as_any().is::<keyring::mock::MockCredentialBuilder>());
+    }
+
+    #[test]
+    fn server_requests_use_the_trimmed_credential_without_empty_auth_headers() {
+        let client = reqwest::Client::new();
+        for path in ["/api/v1/runtime/listener", "/api/v1/models/directories/register"] {
+            let url = format!("http://127.0.0.1:8090{path}");
+            let authenticated = with_server_credential(client.post(&url), " test-credential ").build().unwrap();
+            assert_eq!(authenticated.headers()[reqwest::header::AUTHORIZATION], "Bearer test-credential");
+            assert!(authenticated.headers()[reqwest::header::AUTHORIZATION].is_sensitive());
+            for empty in ["", " \n "] {
+                let anonymous = with_server_credential(client.post(&url), empty).build().unwrap();
+                assert!(!anonymous.headers().contains_key(reqwest::header::AUTHORIZATION));
+            }
+        }
+    }
 }

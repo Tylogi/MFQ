@@ -2,6 +2,7 @@
 
 #include "mfq/token_constraint.h"
 #include "mlx_sampling.h"
+#include "mtp_depth_controller.h"
 
 #include <array>
 #include <cstddef>
@@ -38,20 +39,18 @@ private:
     std::vector<std::int32_t> token_ids_;
 };
 
-// Predictor adapters describe only the maximum supported draft depth. The
-// common engine owns one reversible, throughput-adaptive scheduling and
-// proposal policy for every architecture.
 struct MlxMtpPredictorDescriptor {
     int maximum_depth = 0;
+    bool dspark = false;
 
     static constexpr MlxMtpPredictorDescriptor recurrent(
         int maximum_depth) noexcept {
         return {maximum_depth};
     }
 
-    static constexpr MlxMtpPredictorDescriptor block(
+    static constexpr MlxMtpPredictorDescriptor dspark_block(
         int maximum_depth) noexcept {
-        return {maximum_depth};
+        return {maximum_depth, true};
     }
 };
 
@@ -75,6 +74,9 @@ struct MlxMtpGenerationStats {
     std::array<std::uint64_t, 5> position_accepted{};
     std::array<double, 6> measured_depth_ms{};
     int selected_depth = 0;
+    std::uint64_t standard_tokens = 0;
+    std::uint64_t park_count = 0;
+    std::uint64_t reentry_probes = 0;
 };
 
 using MlxGenerationTokenCallback =
@@ -92,6 +94,7 @@ struct MlxMtpDraftContext {
     int accepted_drafts = 0;
     const mlx::core::array* verified_hidden = nullptr;
     std::span<const std::int32_t> next_token_ids;
+    bool* time_sample = nullptr;
 };
 
 // Predictor math remains architecture-specific, but token selection is owned
@@ -166,6 +169,8 @@ struct MlxMtpEngineCallbacks {
 
     std::function<int(int position, int requested)> draft_limit;
     std::function<void(const MlxMtpDraftContext&)> committed_target;
+    mfq::engine::mtp::PolicyState* policy_state = nullptr;
+    std::function<MlxMtpTargetBatch(std::int32_t)> decode_target;
 
 };
 
@@ -200,14 +205,9 @@ std::int32_t run_mlx_mtp_generation(
     const MlxMtpEngineCallbacks& callbacks,
     MlxMtpGenerationStats& stats);
 
-// Runtime draft-depth controller adapted from oMLX's production MTP loop.
-// It learns conditional acceptance by draft position and the measured wall
-// time of every verify width, then maximizes expected emitted tokens / ms.
-// Depth zero is a reversible plain-decode mode; periodic probes can restore
-// speculation when acceptance or runtime conditions improve.
-class MlxMtpDepthController {
+class MlxDsparkDepthController {
 public:
-    explicit MlxMtpDepthController(
+    explicit MlxDsparkDepthController(
         int maximum_depth = 3,
         int initial_depth = 2);
 

@@ -25,6 +25,7 @@ constexpr int kOfficialHidden = 5120;
 constexpr int kCollapseThreads = 1024;
 
 constexpr const char* kV41HcCollapseNormSource = R"METAL(
+    const int ROWS = residual_shape[0] * residual_shape[1];
     constexpr uint CONNECTIONS = 4u;
     constexpr uint READS = 4u;
     constexpr uint THREADS = 1024u;
@@ -104,6 +105,7 @@ constexpr const char* kV41HcCollapseNormSource = R"METAL(
 )METAL";
 
 constexpr const char* kV41HcMetadataExactSource = R"METAL(
+    const int ROWS = logits_shape[0] * logits_shape[1];
     uint row = threadgroup_position_in_grid.x;
     uint local_thread = thread_index_in_threadgroup;
     if (row >= uint(ROWS) || local_thread != 0u) {
@@ -199,6 +201,7 @@ constexpr const char* kV41HcMetadataExactSource = R"METAL(
 )METAL";
 
 constexpr const char* kV41HcPostSource = R"METAL(
+    const int SIZE = residual_shape[0] * residual_shape[1] * 4 * HIDDEN;
     uint index = thread_position_in_grid.x;
     if (index >= uint(SIZE)) {
         return;
@@ -410,7 +413,6 @@ array post_impl(
         {size, 1, 1},
         {std::min(kPostThreads, size), 1, 1},
         {
-            {"SIZE", size},
             {"HIDDEN", hidden},
             {"ADD_BRANCH", static_cast<int>(add_branch)},
         },
@@ -476,7 +478,6 @@ array deepseek_v41_hc_collapse_norm(
         {rows * kCollapseThreads, 1, 1},
         {kCollapseThreads, 1, 1},
         {
-            {"ROWS", rows},
             {"HIDDEN", kOfficialHidden},
         },
         std::nullopt,
@@ -538,7 +539,6 @@ MlxDeepseekV41HcMetadataResult deepseek_v41_hc_metadata_exact(
         {rows * 32, 1, 1},
         {32, 1, 1},
         {
-            {"ROWS", rows},
             {"SINKHORN_ITERATIONS", sinkhorn_iterations},
         },
         std::nullopt,

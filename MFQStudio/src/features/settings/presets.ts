@@ -55,9 +55,9 @@ export function presetSnapshot(settings: GenerationSettings): StoredPresetSettin
 }
 
 /** 读取并校验本地生成预设，丢弃无效条目并限制历史数量。 */
-export function loadStoredPresets(): StoredPreset[] {
+export function loadStoredPresets(key = STORED_PRESETS_KEY): StoredPreset[] {
   try {
-    const decoded = JSON.parse(localStorage.getItem(STORED_PRESETS_KEY) || "[]");
+    const decoded = JSON.parse(localStorage.getItem(key) || "[]");
     if (!Array.isArray(decoded)) return [];
     const fallback = presetSnapshot(DEFAULT_SETTINGS);
     return decoded.flatMap((candidate): StoredPreset[] => {

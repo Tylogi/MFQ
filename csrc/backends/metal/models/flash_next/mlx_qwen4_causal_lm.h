@@ -112,7 +112,9 @@ public:
         bool use_cache = true);
 
     void reset_cache(int batch = 1);
+    mlx::core::array score_forward(const mlx::core::array& token_ids, bool last_token_only);
     void clear_cache() noexcept;
+    void reset_generation_state() noexcept;
 
     std::int32_t generate(
         const std::vector<std::int64_t>& prompt,
@@ -134,6 +136,9 @@ public:
     std::optional<MlxSsdExpertCacheStats> ssd_expert_cache_stats() const;
     void prewarm_ssd_expert_arena();
     void clear_expert_cache();
+    std::size_t set_expert_cache_limit(std::size_t bytes);
+    std::size_t reclaimable_expert_bytes() const noexcept;
+    std::size_t resident_full_expert_bytes() const noexcept;
     // Telemetry reads metadata only: no evaluation, copies, or device sync.
     std::size_t kv_cache_bytes() const noexcept;
     std::size_t kv_cache_contexts() const noexcept;

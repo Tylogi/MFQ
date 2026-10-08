@@ -9,6 +9,7 @@ its scale tensor during sharding or conversion.
 from __future__ import annotations
 
 import struct
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -36,6 +37,15 @@ class MxTensorLayout:
     values_nbytes: int
     scales_offset: int
     scales_nbytes: int
+
+    @property
+    def block_shape(self) -> tuple[int, int]:
+        if self.dtype == MXFP4_DTYPE:
+            return 1, 32
+        for block in ((128, 128), (32, 32), (1, 32)):
+            if self.scale_shape == tuple(math.ceil(size / stride) for size, stride in zip(self.shape, block)):
+                return block
+        raise ValueError('unsupported native MXFP8 scale geometry')
 
 
 @dataclass(frozen=True)

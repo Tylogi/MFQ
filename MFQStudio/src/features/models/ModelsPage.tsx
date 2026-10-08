@@ -11,7 +11,7 @@ export function ModelsPage() {
   const catalog = useModelCatalog();
   const { tr } = useSettings();
   const { artifacts, busy, availableModelNames, modelFilter, setModelFilter,
-    openStudioPage, chooseModelDirectory } = catalog;
+    openStudioPage, chooseModelDirectory, modelFolderPath } = catalog;
   const totalBytes = artifacts.reduce((sum, artifact) => sum + artifact.total_bytes, 0);
   return (
     <section className="dashboard-view">
@@ -30,6 +30,14 @@ export function ModelsPage() {
           </>
         }
       />
+      <div className="model-folder-location">
+        <Icon name="folder" />
+        <span>{tr('模型文件夹', 'Model folder')}</span>
+        <code title={modelFolderPath}>{modelFolderPath}</code>
+        <button disabled={busy} onClick={() => void chooseModelDirectory()} type="button">
+          {tr('更改', 'Change')}
+        </button>
+      </div>
       <div className="model-workbench-summary">
         <div>
           <span>{tr('运行中的模型', 'Loaded models')}</span>

@@ -351,7 +351,13 @@ def _record_token_ids(
     *,
     render_mode: str,
     chat_template_kwargs: Mapping[str, Any],
+    renderer: Any = None,
 ) -> list[int]:
+    if render_mode == "auto":
+        if renderer is None:
+            from mfq.calibration.chat import CalibrationChatRenderer
+            renderer = CalibrationChatRenderer(tokenizer, template_kwargs=chat_template_kwargs)
+        return renderer.encode(text)
     if render_mode == "chat":
         if not hasattr(tokenizer, "apply_chat_template"):
             raise TypeError("chat rendering requires tokenizer.apply_chat_template")
@@ -366,7 +372,7 @@ def _record_token_ids(
     elif render_mode == "plain":
         value = tokenizer.encode(text, add_special_tokens=False)
     else:
-        raise ValueError("render_mode must be 'chat' or 'plain'")
+        raise ValueError("render_mode must be 'auto', 'chat' or 'plain'")
 
     ids = [int(token) for token in value]
     eos = getattr(tokenizer, "eos_token_id", None)
@@ -612,7 +618,7 @@ def build_corpus_from_records(
     sequence_length: int = 2048,
     domain_weights: Mapping[str, float] | None = None,
     seed: int = 20260718,
-    render_mode: str = "plain",
+    render_mode: str = "auto",
     chat_template_kwargs: Mapping[str, Any] | None = None,
     source_metadata: Mapping[str, Any] | None = None,
 ) -> CalibrationCorpus:
@@ -634,6 +640,10 @@ def build_corpus_from_records(
     train_quota = _largest_remainder(train_tokens, domain_weights)
     validation_quota = _largest_remainder(validation_tokens, domain_weights)
     template_kwargs = dict(chat_template_kwargs or {})
+    renderer = None
+    if render_mode == "auto":
+        from mfq.calibration.chat import CalibrationChatRenderer
+        renderer = CalibrationChatRenderer(tokenizer, template_kwargs=template_kwargs)
 
     normalized_records: dict[str, list[str]] = {}
     seen_records: set[str] = set()
@@ -674,6 +684,7 @@ def build_corpus_from_records(
                 text,
                 render_mode=render_mode,
                 chat_template_kwargs=template_kwargs,
+                renderer=renderer,
             )
             if len(ids) < 2:
                 continue
@@ -741,6 +752,8 @@ def build_corpus_from_records(
         "chat_template_kwargs": template_kwargs,
         "sources": dict(source_metadata or {}),
     }
+    if renderer is not None:
+        manifest["chat_rendering"] = renderer.summary()
     if manifest["actual_tokens"] != manifest["target_tokens"]:
         raise RuntimeError(
             f"packed token counts differ from requested counts: {manifest['actual_tokens']}"
@@ -1266,7 +1279,7 @@ def build_eaddario_corpus(
     validation_tokens: int = 262_144,
     sequence_length: int = 2048,
     seed: int = 20260718,
-    render_mode: str = "plain",
+    render_mode: str = "auto",
     chat_template_kwargs: Mapping[str, Any] | None = None,
 ) -> CalibrationCorpus:
     records, metadata = load_eaddario_records(repo_id=repo_id, sources=sources, cache_dir=cache_dir)

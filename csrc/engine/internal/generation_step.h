@@ -4,6 +4,7 @@
 #include "generation_policy.h"
 #include "inference.h"
 #include "step_sequence.h"
+#include "prefill_activity.h"
 
 #include <exception>
 #include <functional>
@@ -49,7 +50,10 @@ Generation generate_sequence(Operations operations, InferenceOutput &output, std
             while (!ops.ready() && !output.stopped()) co_yield StepState::waiting;
             if (output.stopped()) co_return;
         }
-        elapsed += ops.prefill(chunk);
+        {
+            PrefillActivity activity;
+            elapsed += ops.prefill(chunk);
+        }
         offset += chunk.count;
         co_yield PrefillProgress{
             {static_cast<std::size_t>(offset - reused_tokens), elapsed, 0.0, elapsed}};

@@ -30,7 +30,43 @@ class _VmStatistics64(ctypes.Structure):
     ] + [
         (name, ctypes.c_uint64)
         for name in ("decompressions", "compressions", "swapins", "swapouts")
-    ]
+    ] + [(name, ctypes.c_uint32) for name in (
+        "compressor_pages", "throttled_pages", "external_pages", "internal_pages")]
+
+
+class _RusageInfoV0(ctypes.Structure):
+    _fields_ = [("uuid", ctypes.c_uint8 * 16)] + [
+        (name, ctypes.c_uint64) for name in (
+            "user_time", "system_time", "idle_wakeups", "interrupt_wakeups", "pageins",
+            "wired_size", "resident_size", "phys_footprint", "start_time", "exit_time")]
+
+
+def _open_process_usage():
+    if sys.platform != "darwin":
+        return None
+    try:
+        function = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pid_rusage
+        function.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        function.restype = ctypes.c_int
+        return function
+    except (AttributeError, OSError):
+        return None
+
+
+_PROCESS_USAGE = _open_process_usage()
+
+
+def process_physical_footprint(pid: int) -> int | None:
+    if _PROCESS_USAGE is None or pid <= 0:
+        return None
+    value = _RusageInfoV0()
+    if _PROCESS_USAGE(pid, 0, ctypes.byref(value)) != 0:
+        return None
+    return int(value.phys_footprint)
+
+
+def automatic_memory_reserve(total: int) -> int:
+    return min(8 << 30, max(3 << 30, total * 8 // 100))
 
 
 @dataclass(frozen=True)
@@ -44,11 +80,13 @@ class HostMemorySnapshot:
     wired: int
     compression_bytes: int | None = None
     swapout_bytes: int | None = None
+    external: int = 0
 
     def reclaimable(self, *, active_ratio: float = 0.5) -> int:
         ratio = min(1.0, max(0.0, active_ratio))
-        return max(0, self.free) + max(0, self.inactive) + int(
-            max(0, self.active) * ratio
+        file_active = max(0, self.external - max(0, self.inactive))
+        return max(0, self.free) + max(0, self.inactive, self.external) + int(
+            max(0, self.active - file_active) * ratio
         )
 
 
@@ -117,6 +155,18 @@ def _open_mach_host() -> tuple[ctypes.CDLL, int, int] | None:
 _MACH_HOST = _open_mach_host()
 
 
+def metal_allocation_limit() -> int | None:
+    if _MACH_HOST is not None:
+        value, size = ctypes.c_int64(), ctypes.c_size_t(ctypes.sizeof(ctypes.c_int64))
+        try:
+            function = _MACH_HOST[0].sysctlbyname
+            if function(b"iogpu.wired_limit_mb", ctypes.byref(value), ctypes.byref(size), None, 0) == 0 and value.value > 0:
+                return value.value << 20
+        except (AttributeError, ctypes.ArgumentError, OSError):
+            pass
+    return metal_recommended_working_set_size()
+
+
 def host_memory_snapshot() -> HostMemorySnapshot | None:
     """Read macOS VM counters through the sub-microsecond Mach host call."""
 
@@ -139,7 +189,7 @@ def host_memory_snapshot() -> HostMemorySnapshot | None:
             total = sum(max(0, int(stats[index])) for index in range(4)) * page_size
         extended = (
             _VmStatistics64.from_buffer(stats)
-            if count.value * ctypes.sizeof(ctypes.c_uint32) >= ctypes.sizeof(_VmStatistics64)
+            if count.value * ctypes.sizeof(ctypes.c_uint32) >= _VmStatistics64.swapouts.offset + 8
             else None
         )
         return HostMemorySnapshot(
@@ -150,6 +200,8 @@ def host_memory_snapshot() -> HostMemorySnapshot | None:
             wired=max(0, int(stats[3])) * page_size,
             compression_bytes=int(extended.compressions) * page_size if extended is not None else None,
             swapout_bytes=int(extended.swapouts) * page_size if extended is not None else None,
+            external=int(extended.external_pages) * page_size if extended is not None
+                and count.value * ctypes.sizeof(ctypes.c_uint32) >= _VmStatistics64.external_pages.offset + 4 else 0,
         )
     except (
         AttributeError,

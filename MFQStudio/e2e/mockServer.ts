@@ -63,6 +63,7 @@ export const officialCatalog: OfficialModelList = {
 };
 
 interface MockOptions {
+  language?: 'zh-CN' | 'en';
   /** 首次生成后的历史查询返回失败，供验证手动恢复且不重复提交。 */
   failFirstSync?: boolean;
   /** 挂起生成请求直到用户调用取消接口。 */
@@ -80,18 +81,22 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
   let responses: ResponseResource[] = [];
   let failedSync = false;
   let releasePending: (() => void) | undefined;
-  await page.addInitScript(() => {
+  await page.addInitScript((language) => {
     localStorage.setItem(
       'mfq.studio.generation.v1',
-      JSON.stringify({ language: 'en', theme: 'light' }),
+      JSON.stringify({ language, theme: 'light' }),
     );
-  });
+  }, options.language ?? 'en');
   await page.route('**/api/v1/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
     const method = route.request().method();
     state.requests.push(`${method} ${path}`);
     const json = async (value: unknown) => route.fulfill({ json: value });
     if (path === '/api/v1/hub/official') return json(officialCatalog);
+    if (path === '/api/v1/quantization/workspace' && method === 'GET')
+      return json({ import_directory: '/models', export_directory: '/outputs',
+        candidates: ['NVQ3J-L', 'NINT4', 'NINT8'],
+        candidate_groups: { NVQ: ['NVQ3J-L'], NINT: ['NINT4', 'NINT8'] }, official_imatrix_url: null });
     if (path === '/api/v1/runtime/status')
       return json({
         runtime_state: 'ready',
@@ -250,6 +255,9 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         media: { id: 'media-1', sha256: 'test', mime_type: 'text/plain', byte_size: 4 },
         name: 'notes.txt', text: 'note', extractor: 'text', created_at: createdAt,
       });
+    if (path === '/api/v1/evaluations/tools')
+      return json({ workspace_root: null, api_base: 'http://127.0.0.1:8090/v1',
+        quality_available: false, benchmark_available: false, accuracy_available: false, task_benchmarks: {} });
     if (path === '/api/v1/models/directories')
       return json({
         current_id: 'models-dir',
@@ -272,6 +280,7 @@ export async function mockStudioServer(page: Page, options: MockOptions = {}) {
         '/api/v1/runtime/profiles',
         '/api/v1/artifacts/lineage',
         '/api/v1/datasets',
+        '/api/v1/datasets/catalog',
         '/api/v1/evaluations',
         '/api/v1/cluster/nodes',
       ].includes(path)

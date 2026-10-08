@@ -1,5 +1,6 @@
 #pragma once
 #include "generation_step.h"
+#include "prefill_activity.h"
 #include <memory>
 #include <span>
 #include <unordered_map>
@@ -151,6 +152,7 @@ template <class Execution> class ContinuousBatch {
                 auto& work = *prefill->second;
                 auto& request = work.request;
                 const auto chunk = *work.prefill;
+                PrefillActivity prefill_activity;
                 auto sample = execution.execute(PrefillWork<Request>{request, chunk});
                 request->prefill_offset = chunk.offset + chunk.count;
                 ++prefill_chunks;

@@ -20,7 +20,10 @@ export async function readEventStream<T>(
       if (data.length) {
         const payload = data.join('\n');
         data = [];
-        if (payload) onEvent(JSON.parse(payload) as T);
+        if (payload) {
+          onEvent(JSON.parse(payload) as T);
+          signal?.throwIfAborted();
+        }
       }
     } else if (line === 'data' || line.startsWith('data:')) {
       const value = line === 'data' ? '' : line.slice(5);

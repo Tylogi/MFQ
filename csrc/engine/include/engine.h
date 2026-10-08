@@ -30,6 +30,9 @@ struct GenerationStats {
     std::array<std::uint64_t, kMaximumDraftDepth> position_accepted{};
     std::array<double, kMaximumDraftDepth + 1> measured_depth_ms{};
     int selected_depth = 0;
+    std::uint64_t standard_tokens = 0;
+    std::uint64_t park_count = 0;
+    std::uint64_t reentry_probes = 0;
 };
 
 } // namespace mfq::engine::mtp
@@ -113,6 +116,8 @@ struct InferenceInput {
     MfqSamplingParams sampling;
     MfqPromptCachePlan cache_plan;
     std::optional<MfqMultimodalInput> media;
+    bool prefix_cache_enabled = true;
+    std::optional<std::size_t> benchmark_prompt_tokens;
 };
 
 struct ChatTemplateCapabilities {
@@ -204,6 +209,7 @@ struct EngineInfo {
     std::string model_type;
     ModelCapabilities capabilities;
     std::string backend;
+    bool probability = false;
 };
 struct EngineStatus {
     std::size_t available = 0;
@@ -224,9 +230,10 @@ struct EngineStepResult {
 };
 enum class Admission { accepted, deferred };
 struct SessionCommand {
-    enum class Kind { fork, close, clear, trim, metrics } kind;
+    enum class Kind { fork, close, clear, trim, budget, refresh, memory_budget, metrics } kind;
     std::string source, target;
     std::uint64_t bytes = 0;
+    std::optional<std::uint64_t> disk_bytes;
 };
 struct SessionResult { std::uint64_t count = 0; Metrics metrics; };
 struct DecodeTokens {
@@ -237,12 +244,32 @@ struct PrepareDuplex { std::string prompt; MfqDuplexSessionParams parameters; };
 struct PrepareDuplexStep { std::string text; MfqDuplexStepInput input; };
 struct StopDuplex {};
 struct RuntimeMetrics {};
+struct ScoreText {
+    std::string prompt;
+    std::vector<std::string> continuations;
+    bool next_token = false;
+};
+struct ScoreTokens {
+    std::vector<std::vector<std::int64_t>> sequences;
+    std::vector<std::vector<std::int64_t>> targets;
+    std::size_t prompt_tokens = 0;
+    bool next_token = false;
+};
+struct TokenLikelihood {
+    std::vector<std::int64_t> token_ids;
+    std::vector<double> token_logprobs;
+    double log_likelihood = 0;
+};
+struct LikelihoodResult {
+    std::size_t prompt_tokens = 0;
+    std::vector<TokenLikelihood> scores;
+};
 using ControlRequest = std::variant<DecodeTokens, PrepareDuplex,
     PrepareDuplexStep, MfqDuplexSessionParams, MfqDuplexStepInput, StopDuplex,
-    RuntimeMetrics>;
+    RuntimeMetrics, ScoreText, ScoreTokens>;
 using ControlResult = std::variant<std::monostate, ControlPending,
     std::string, MfqDuplexSessionParams, MfqDuplexStepInput, MfqDuplexStepResult,
-    Metrics>;
+    Metrics, LikelihoodResult>;
 
 // Only the scheduler loop calls these methods. Execution returns owned values;
 // no caller code or response writer can run on the device execution stack.

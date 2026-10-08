@@ -162,7 +162,7 @@ public:
 
     int block_size() const noexcept;
     MlxMtpPredictorDescriptor mtp_descriptor() const noexcept {
-        return MlxMtpPredictorDescriptor::block(block_size());
+        return MlxMtpPredictorDescriptor::dspark_block(block_size());
     }
     std::size_t stage_count() const noexcept;
     int context_position(

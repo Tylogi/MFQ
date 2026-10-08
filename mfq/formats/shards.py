@@ -30,7 +30,7 @@ SPLIT_KEYS = frozenset(
     }
 )
 
-_SHARD_RE = re.compile(r"^(?P<stem>.+)-(?P<index>[0-9]{5})-of-(?P<count>[0-9]{5})\.mfq$")
+_SHARD_RE = re.compile(r"^(?P<stem>.+)-(?P<index>[0-9]{5})-of-(?P<count>[0-9]{5})\.[mM][fF][qQ]$")
 
 
 class BlobRecordLike(Protocol):
@@ -80,7 +80,18 @@ def shard_paths_from_any(path: str | Path, count: int) -> list[Path]:
         raise ValueError(
             f"MFQ shard count mismatch in filename/metadata: {filename_count} != {count}: {path}"
         )
-    return [format_shard_path(base, index, count) for index in range(1, count + 1)]
+    expected = [format_shard_path(base, index, count) for index in range(1, count + 1)]
+    if Path(path).suffix == ".mfq" and all(candidate.is_file() for candidate in expected):
+        return expected
+    available: dict[int, Path] = {}
+    for candidate in matching_shard_paths(base):
+        _, index, candidate_count = parse_shard_path(candidate)
+        if candidate_count != count:
+            continue
+        if index in available:
+            raise ValueError(f"duplicate MFQ shard index {index}: {base}")
+        available[index] = candidate
+    return [available.get(index, candidate) for index, candidate in enumerate(expected, 1)]
 
 
 def matching_shard_paths(path: str | Path) -> list[Path]:
@@ -91,7 +102,12 @@ def matching_shard_paths(path: str | Path) -> list[Path]:
     if not base.parent.is_dir():
         return result
     for candidate in base.parent.iterdir():
-        parsed = parse_shard_path(candidate)
+        if not candidate.is_file():
+            continue
+        try:
+            parsed = parse_shard_path(candidate)
+        except ValueError:
+            continue
         if parsed is not None and parsed[0].name == base.name:
             result.append(candidate)
     return sorted(result)

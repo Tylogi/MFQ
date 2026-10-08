@@ -87,10 +87,17 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
 
   it('test_studio_can_select_and_load_an_external_mfq_directory_in_local_mode', () => {
     const models = readSources('features/models');
-    expect(models).toContain('selectLocalModelDirectory()');
-    expect(models).toContain('finishModelRegistration(names)');
+    expect(models).toContain('selectLocalModelDirectory(modelFolderPath)');
+    expect(models).toContain('finishModelRegistration(selected.names, current)');
     expect(models).toContain('Choose model folder');
     expect(models).toContain('modelsApi.loadModel(');
+  });
+
+  it('keeps the visible model folder row and its dedicated control styles together', () => {
+    expect(readSources('features/models/ModelsPage.tsx')).toContain('modelFolderPath');
+    expect(STYLES).toContain('.model-folder-location { display: grid;');
+    expect(STYLES).toContain('.model-folder-location > code');
+    expect(STYLES).toContain('.model-folder-location > button');
   });
 
   it('test_studio_uses_native_confirmation_dialogs_for_destructive_actions', () => {
@@ -196,7 +203,8 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
     expect(STYLES).toContain('border: 1px solid var(--accent-border)');
     expect(STYLES).toContain('.mcp-form button { min-width: 64px;');
     expect(STYLES).toContain('.job-actions .secondary { border: 1px solid var(--panel-line);');
-    expect(STYLES).toContain('.runtime-log p { min-width: 0; overflow-wrap: anywhere;');
+    expect(STYLES).toMatch(/\.log-record-copy > strong \{[^}]*overflow-wrap: anywhere;/);
+    expect(STYLES).toMatch(/\.log-record-detail > pre \{[^}]*white-space: pre-wrap; overflow-wrap: anywhere;/);
     expect(STYLES).toContain('.error-banner span { min-width: 0; overflow-wrap: anywhere;');
   });
 
@@ -205,7 +213,7 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
     for (const component of ['ScreenHeader', 'SectionLabel', 'TMPanel', 'MetricTile', 'SettingRow', 'UsageBar', 'EmptyPanel', 'PanelDeck']) {
       expect(APP).toContain(`function ${component}`);
     }
-    expect(APP).toContain('className="overview-memory-panel"');
+    expect(APP).toContain('overview-memory-panel');
     expect(APP).toContain('className="overview-footer-grid"');
     expect(APP).toContain('PANEL_COLLAPSED_KEY');
     expect(APP).toContain('aria-expanded={!isCollapsed}');
@@ -238,7 +246,8 @@ describe('Studio 过渡源码与静态样式契约（非行为测试）', () => 
     expect(runtime.indexOf('setStudio(status)')).toBeLessThan(runtime.indexOf('await startLocalStudio()'));
     expect(shell).toContain('location.pathname === \'/runtime\'');
     expect(connection).toContain('await configureStudio(draft)');
-    expect(connection).toContain('if (credentialWritable) await saveStudioCredential(token)');
+    expect(connection).toContain('if (credentialWritable) {');
+    expect(connection).toContain('await saveStudioCredential(token)');
     expect(connection).toContain('setCredentialWritable(true)');
     expect(connection).toContain('await reloadService()');
   });

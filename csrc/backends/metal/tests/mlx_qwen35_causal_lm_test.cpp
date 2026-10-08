@@ -1153,6 +1153,29 @@ void test_mtp_prepared_mrope_generation() {
         "MTP did not consume the prepared MRoPE prompt");
 }
 
+void test_stateless_probability_forward() {
+    auto model = make_model();
+    auto reference = make_model();
+    auto prefix = model.forward(token_ids({1, 2}), true);
+    prefix.eval();
+    const auto state = model.capture_text_session_state({1, 2});
+    auto expected = reference.forward(token_ids({3, 4, 5}), false);
+    auto full = model.score_forward(token_ids({3, 4, 5}), false);
+    auto last = model.score_forward(token_ids({3, 4, 5}), true);
+    mlx::core::eval(expected, full, last);
+    require(model.cache_position() == 2, "probability scoring changed the live cache position");
+    auto difference = mlx::core::max(mlx::core::abs(full - expected));
+    require(difference.item<float>() < 1e-5f, "probability full logits do not match a fresh forward");
+    auto last_expected = mlx::core::slice(expected, {0, 2, 0}, {1, 3, expected.shape(-1)});
+    auto last_difference = mlx::core::max(mlx::core::abs(last - last_expected));
+    require(last_difference.item<float>() < 1e-3f, "probability last-position logits are misaligned");
+    auto actual_decode = model.forward(token_ids({6}), true);
+    reference.restore_text_session_state(state);
+    auto expected_decode = reference.forward(token_ids({6}), true);
+    auto state_difference = mlx::core::max(mlx::core::abs(actual_decode - expected_decode));
+    require(state_difference.item<float>() < 1e-5f, "probability scoring mutated live KV or recurrent state");
+}
+
 void test_text_session_snapshot_restore() {
     mfq::metal::MlxSamplingParams sampling;
     sampling.temperature = 0.0;
@@ -1736,6 +1759,7 @@ int main(int argc, char** argv) {
         test_mtp_constrained_identity();
         test_mtp_prepared_mrope_generation();
         test_text_session_snapshot_restore();
+        test_stateless_probability_forward();
         test_output_prefix_checkpoints();
         test_tied_embedding_forward_cache_and_generate();
         test_generation_greedy_seed_and_penalties();

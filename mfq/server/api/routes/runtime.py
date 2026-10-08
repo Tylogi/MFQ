@@ -21,6 +21,7 @@ from mfq.server.protocol.models import (
     OperationAccepted,
     RuntimeCacheClearRequest,
     RuntimeCacheTrimRequest,
+    RuntimePrefixCachePurgeRequest,
     RuntimeCapabilitiesResource,
     RuntimeInstanceList,
     RuntimeInstanceResource,
@@ -34,6 +35,7 @@ from mfq.server.protocol.models import (
     RuntimeResourceSnapshot,
     RuntimeListenerRequest,
     RuntimeMemoryPolicy,
+    RuntimeInferencePolicy,
     RuntimeModelAliases,
     UpdateRuntimeInstanceRequest,
     UpdateRuntimeProfileRequest,
@@ -60,6 +62,22 @@ async def model_aliases(service: ServiceDependency) -> RuntimeModelAliases:
 @router.put("/api/v1/runtime/model-aliases", response_model=RuntimeModelAliases, responses=ERROR_RESPONSES, tags=["runtime"])
 async def configure_model_aliases(service: ServiceDependency, body: RuntimeModelAliases) -> dict[str, Any]:
     return await service.configure_model_aliases(body.aliases)
+
+
+@router.get("/api/v1/runtime/inference-policy", response_model=RuntimeInferencePolicy, responses=ERROR_RESPONSES, tags=["runtime"])
+async def inference_policy(service: ServiceDependency) -> RuntimeInferencePolicy:
+    from mfq.server.services.service import ServiceError
+    if not hasattr(service.runtime_manager, "inference_policy"):
+        raise ServiceError(501, "inference_policy_unavailable", "runtime inference policy is unavailable")
+    return service.runtime_manager.inference_policy
+
+
+@router.put("/api/v1/runtime/inference-policy", response_model=RuntimeInferencePolicy, responses=ERROR_RESPONSES, tags=["runtime"])
+async def configure_inference_policy(service: ServiceDependency, body: RuntimeInferencePolicy) -> dict[str, Any]:
+    from mfq.server.services.service import ServiceError
+    if not hasattr(service.runtime_manager, "configure_inference_policy"):
+        raise ServiceError(501, "inference_policy_unavailable", "runtime inference policy is unavailable")
+    return await service.runtime_manager.configure_inference_policy(body)
 
 
 @router.get("/api/v1/runtime/memory-policy", responses=ERROR_RESPONSES, tags=["runtime"])
@@ -251,7 +269,7 @@ async def runtime_logs(
     service: ServiceDependency,
     instance_id: UUID | None = None,
     level: RuntimeLogLevel | None = None,
-    after: Annotated[int, Query(ge=0)] = 0,
+    after: Annotated[int | None, Query(ge=0)] = None,
     limit: Annotated[int, Query(ge=1, le=2000)] = 200,
 ) -> RuntimeLogList:
     return await service.runtime_logs(
@@ -294,6 +312,41 @@ async def reload_runtime(service: ServiceDependency, body: RuntimeReloadRequest)
         body.context_size,
         instance_id=body.instance_id,
     )
+
+
+@router.get("/api/v1/runtime/cache/entries", responses=ERROR_RESPONSES, tags=["runtime"])
+async def prefix_cache_entries(service: ServiceDependency, namespace: str | None = Query(default=None, pattern=r"^[0-9a-f]{64}$"),
+    offset: int = Query(default=0, ge=0), limit: int = Query(default=100, ge=1, le=200)) -> dict[str, Any]:
+    from mfq.server.services.service import ServiceError
+    manager = service.runtime_manager
+    if not hasattr(manager, "inspect_prefix_cache"):
+        raise ServiceError(501, "cache_management_unavailable", "prefix cache management is unavailable")
+    return await manager.inspect_prefix_cache(namespace, offset=offset, limit=limit)
+
+
+@router.get("/api/v1/runtime/cache/entries/{namespace}/{block}/text", responses=ERROR_RESPONSES, tags=["runtime"])
+async def prefix_cache_text(service: ServiceDependency, namespace: str, block: str,
+    offset: int = Query(default=0, ge=0), limit: int = Query(default=8192, ge=1, le=8192)) -> dict[str, Any]:
+    from mfq.server.services.service import ServiceError
+    manager = service.runtime_manager
+    if not hasattr(manager, "prefix_cache_text"):
+        raise ServiceError(501, "cache_management_unavailable", "prefix cache management is unavailable")
+    return await manager.prefix_cache_text(namespace, block, offset=offset, limit=limit)
+
+
+@router.post("/api/v1/runtime/cache/purge", responses=ERROR_RESPONSES, tags=["runtime"])
+async def purge_prefix_cache(service: ServiceDependency, body: RuntimePrefixCachePurgeRequest) -> dict[str, Any]:
+    from mfq.server.services.service import ServiceError
+    manager = service.runtime_manager
+    if not hasattr(manager, "purge_prefix_cache"):
+        raise ServiceError(501, "cache_management_unavailable", "prefix cache management is unavailable")
+    try:
+        return await manager.purge_prefix_cache(body.namespace)
+    except Exception as error:
+        from mfq.server.runtime.client import BackendError
+        if isinstance(error, BackendError):
+            raise ServiceError(error.status_code or 503, error.code, str(error), retryable=error.retryable) from error
+        raise
 
 
 @router.post(

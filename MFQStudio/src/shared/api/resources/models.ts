@@ -1,6 +1,7 @@
 /** 封装 models 领域资源请求，不保存组件状态。 */
 import type {
   ModelArtifact,
+  CheckpointAnalysis,
   ModelDirectoryList,
   HubModelSummary,
   HubModelInfo,
@@ -24,6 +25,20 @@ export const modelsApi = {
     else if (path?.trim()) query.set('path', path.trim());
     const suffix = query.size ? `?${query.toString()}` : '';
     return request(`/api/v1/models/directories${suffix}`);
+  },
+
+  modelArtifactDirectory(modelId: string): Promise<ModelDirectoryList> {
+    return request(`/api/v1/models/${encodeURIComponent(modelId)}/directory`);
+  },
+
+  checkpointAnalysis(modelId: string, signal?: AbortSignal): Promise<CheckpointAnalysis> {
+    return request(`/api/v1/models/${encodeURIComponent(modelId)}/analysis`, { signal });
+  },
+
+  openModelDirectoryInFinder(directoryId: string): Promise<{ opened: boolean }> {
+    return request('/api/v1/models/directories/open', {
+      method: 'POST', body: JSON.stringify({ directory_id: directoryId }),
+    });
   },
 
   /** 注册目录内的模型资产，返回新增或更新的模型记录。 */

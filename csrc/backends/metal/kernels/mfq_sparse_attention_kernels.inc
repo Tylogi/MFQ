@@ -570,6 +570,10 @@ constexpr const char* kFp4SimSource = R"MFQ_METAL(
 )MFQ_METAL";
 
 constexpr const char* kIndexerScoresSource = R"MFQ_METAL(
+    const int B = q_shape[0];
+    const int M = q_shape[1];
+    const int K = k_shape[1];
+    const int KEY_TILES = (K + 63) / 64;
     constexpr uint HEADS = uint(INDEX_HEADS);
     constexpr uint DIM = 128u;
     constexpr uint KEY_TILE = 64u;
@@ -1494,6 +1498,10 @@ constexpr const char* kDeepSelectTopkSource = R"MFQ_METAL(
 
 
 constexpr const char* kPrefillPlanSource = R"MFQ_METAL(
+    const int M = topk_shape[1];
+    const int TOPK_COUNT = topk_shape[2];
+    const int SELECTED = ((plan_params[2] + TOPK_COUNT + 31) / 32) * 32;
+    const int TOTAL = topk_shape[0] * M * SELECTED;
     uint linear = thread_position_in_grid.x;
     if (linear >= uint(TOTAL)) {
         return;
@@ -1534,6 +1542,10 @@ constexpr const char* kPrefillPlanSource = R"MFQ_METAL(
 )MFQ_METAL";
 
 constexpr const char* kVisiblePrefillPlanSource = R"MFQ_METAL(
+    const int M = topk_shape[1];
+    const int TOPK_COUNT = topk_shape[2];
+    const int SELECTED = ((plan_params[2] + TOPK_COUNT + 31) / 32) * 32;
+    const int TOTAL = topk_shape[0] * M * SELECTED;
     uint linear = thread_position_in_grid.x;
     if (linear >= uint(TOTAL)) {
         return;
@@ -1580,6 +1592,10 @@ constexpr const char* kVisiblePrefillPlanSource = R"MFQ_METAL(
 )MFQ_METAL";
 
 constexpr const char* kDecodePlanSource = R"MFQ_METAL(
+    const int TOPK_COUNT = topk_shape[2];
+    const int POOL_LEN = plan_params[0];
+    const int SELECTED = ((WINDOW + TOPK_COUNT + 31) / 32) * 32;
+    const int TOTAL = topk_shape[0] * SELECTED;
     uint linear = thread_position_in_grid.x;
     if (linear >= uint(TOTAL)) {
         return;
@@ -1611,6 +1627,10 @@ constexpr const char* kDecodePlanSource = R"MFQ_METAL(
 )MFQ_METAL";
 
 constexpr const char* kSparseAttentionSource = R"MFQ_METAL(
+    const int B = q_shape[0];
+    const int M = q_shape[2];
+    const int MAX_SEQ = kv_shape[1];
+    const int SELECTED = indices_shape[2];
     constexpr uint HEADS = 64u;
     constexpr uint DIM = 512u;
     uint lane = thread_index_in_simdgroup;
@@ -1695,6 +1715,10 @@ constexpr const char* kSparseAttentionSource = R"MFQ_METAL(
 )MFQ_METAL";
 
 constexpr const char* kSparseAttentionPrefillMmaSource = R"MFQ_METAL(
+    const int B = q_shape[0];
+    const int M = q_shape[2];
+    const int MAX_SEQ = kv_shape[1];
+    const int SELECTED = indices_shape[2];
     constexpr uint HEADS = 64u;
     constexpr uint DIM = 512u;
     constexpr uint KEY_TILE = 8u;
@@ -1882,6 +1906,10 @@ constexpr const char* kSparseAttentionPrefillMmaSource = R"MFQ_METAL(
 )MFQ_METAL";
 
 constexpr const char* kSparseAttentionDecodeSource = R"MFQ_METAL(
+    const int B = q_shape[0];
+    const int M = q_shape[2];
+    const int MAX_SEQ = kv_shape[1];
+    const int SELECTED = indices_shape[2];
     constexpr uint HEADS = 64u;
     constexpr uint HEADS_PER_GROUP = 4u;
     constexpr uint HEAD_GROUPS = HEADS / HEADS_PER_GROUP;
@@ -1959,6 +1987,8 @@ constexpr const char* kSparseAttentionDecodeSource = R"MFQ_METAL(
 )MFQ_METAL";
 
 constexpr const char* kSparseAttentionDirectDecodeSource = R"MFQ_METAL(
+    const int B = q_shape[0];
+    const int POOL_CAPACITY = pooled_kv_shape[1];
     constexpr uint HEADS = 64u;
     constexpr uint HEADS_PER_GROUP = 4u;
     constexpr uint HEAD_GROUPS = HEADS / HEADS_PER_GROUP;

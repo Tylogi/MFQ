@@ -42,7 +42,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   );
 
   useEffect(() => {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
     document.documentElement.dataset.theme = settings.theme;
   }, [settings]);
 

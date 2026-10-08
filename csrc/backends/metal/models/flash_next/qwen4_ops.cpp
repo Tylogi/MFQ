@@ -1,4 +1,5 @@
 #include "qwen4_ops.h"
+#include "mlx_kernel_prepare.h"
 
 #include "mlx_transformer.h"
 #include "mlx_sparse_attention.h"
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
@@ -28,6 +30,91 @@ using mlx::core::MathMode;
 
 constexpr int kGatedHcProjectionThreads = 256;
 constexpr int kGatedHcUpThreads = 320;
+
+class QsaPrefillOutputGatePrimitive final : public mlx::core::Primitive, public MlxPreparableKernel {
+public:
+    QsaPrefillOutputGatePrimitive(mlx::core::Stream stream, mlx::core::Dtype dtype,
+        int heads, int dimension)
+        : Primitive(stream), dtype_(dtype), heads_(heads), dimension_(dimension) {}
+
+    std::string preparation_key() const override { return "mfq_qsa_prefill_output_gate_" + mlx::core::type_to_name(dtype_) + "_" + std::to_string(heads_) + "_" + std::to_string(dimension_); }
+    void prepare_gpu() override { (void)prepared_kernel(); }
+
+    MTL::ComputePipelineState* prepared_kernel() {
+        auto& device = mlx::core::metal::device(stream().device);
+        const std::string type = dtype_ == mlx::core::float16 ? "half"
+            : dtype_ == mlx::core::bfloat16 ? "bfloat" : "float";
+        const std::string name = "mfq_qsa_prefill_output_gate_" + type + "_" +
+            std::to_string(heads_) + "_" + std::to_string(dimension_);
+        CompileOptions options;
+        options.math_mode = MathMode::Safe;
+        auto* library = device.get_library(name, options, [&] {
+            return "#include <metal_stdlib>\nusing namespace metal;\nusing T = " + type +
+                ";\n#define HEADS " + std::to_string(heads_) +
+                "\n#define DIM " + std::to_string(dimension_) +
+                "\nkernel void " + name + R"METAL((
+                    device const T* attended [[buffer(0)]],
+                    device const T* gate [[buffer(1)]],
+                    device T* output [[buffer(2)]],
+                    constant long* strides [[buffer(3)]],
+                    constant uint2& shape [[buffer(4)]],
+                    uint tid [[thread_position_in_grid]]) {
+                    uint begin = tid * 4u;
+                    #pragma clang loop unroll(full)
+                    for (uint lane = 0u; lane < 4u; ++lane) {
+                        uint index = begin + lane;
+                        if (index >= shape.y) return;
+                        uint row = index / uint(HEADS * DIM);
+                        uint feature = index % uint(HEADS * DIM);
+                        uint batch = row / shape.x, token = row % shape.x;
+                        uint head = feature / uint(DIM), dim = feature % uint(DIM);
+                        long a = long(batch) * strides[0] + long(token) * strides[1] +
+                            long(head) * strides[2] + long(dim) * strides[3];
+                        long g = long(batch) * strides[4] + long(token) * strides[5] +
+                            long(head) * strides[6] + long(dim) * strides[7];
+                        float value = float(gate[g]);
+                        float tail = 1.0f / (1.0f + metal::precise::exp(metal::abs(value)));
+                        float probability = value < 0.0f ? tail : 1.0f - tail;
+                        output[index] = T(float(attended[a]) * probability);
+                    }
+                })METAL";
+        });
+        return device.get_kernel(name, library);
+    }
+
+    void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("QSA prefill output gate requires Metal");
+    }
+
+    void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
+        auto& output = outputs.front();
+        output.set_data(mlx::core::allocator::malloc(output.nbytes()));
+        auto* kernel = prepared_kernel();
+        auto& encoder = mlx::core::metal::get_command_encoder(stream());
+        encoder.set_compute_pipeline_state(kernel);
+        encoder.set_input_array(inputs[0], 0);
+        encoder.set_input_array(inputs[1], 1);
+        encoder.set_output_array(output, 2);
+        std::array<std::int64_t, 8> strides;
+        for (int input = 0; input < 2; ++input)
+            for (int axis = 0; axis < 4; ++axis)
+                strides[input * 4 + axis] = inputs[input].strides(axis);
+        const std::array<std::uint32_t, 2> shape{
+            static_cast<std::uint32_t>(output.shape(1)),
+            static_cast<std::uint32_t>(output.size())};
+        encoder.set_bytes(strides, 3);
+        encoder.set_bytes(shape, 4);
+        encoder.dispatch_threads(MTL::Size((output.size() + 3) / 4, 1, 1),
+            MTL::Size(256, 1, 1));
+    }
+
+    const char* name() const override { return "QsaPrefillOutputGate"; }
+
+private:
+    mlx::core::Dtype dtype_;
+    int heads_;
+    int dimension_;
+};
 
 constexpr const char* kGatedHcWeightHeader = R"METAL(
 inline uint mfq_hc_load_u32(device const uchar* stream, uint byte) {
@@ -179,7 +266,7 @@ HcWeightInputs hc_weight_inputs(const MlxLinear& weight) {
 array hc_project(const MlxLinear& weight, const array& input) {
     if (const auto* nint = weight.nint_weight_ref()) {
         const auto dtype = mlx::core::promote_types(input.dtype(), mlx::core::float16);
-        return mlx::core::astype(nint->matmul_packed(
+        return mlx::core::astype(nint->matmul(
             mlx::core::astype(input, dtype)), dtype);
     }
     return weight(input);
@@ -972,7 +1059,7 @@ std::string packed_hc_source(const PackedHcConfig& config, const std::string& ke
     return source;
 }
 
-class PackedHcPrimitive final : public mlx::core::Primitive {
+class PackedHcPrimitive final : public mlx::core::Primitive, public MlxPreparableKernel {
 public:
     PackedHcPrimitive(mlx::core::Stream stream, PackedHcConfig config)
         : Primitive(stream), config_(config) {
@@ -984,6 +1071,17 @@ public:
         for (int value : {config.down_gs, config.down_ng, config.up_gs, config.up_ng,
                 config.injection_gs, config.injection_ng, int(config.after), int(config.has_injection)})
             key_ += "_" + std::to_string(value);
+    }
+
+    std::string preparation_key() const override { return key_; }
+    void prepare_gpu() override { (void)prepared_kernels(); }
+
+    std::pair<MTL::ComputePipelineState*, MTL::ComputePipelineState*> prepared_kernels() {
+        auto& device = mlx::core::metal::device(stream().device);
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(key_, options, [this] { return packed_hc_source(config_, key_); });
+        return {device.get_kernel(key_ + "_down", library), device.get_kernel(key_ + "_up", library)};
     }
 
     void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
@@ -998,10 +1096,7 @@ public:
         array parts(Shape{rows, 4, 324}, mlx::core::float32, nullptr, {});
         normalized.set_data(mlx::core::allocator::malloc(normalized.nbytes()));
         parts.set_data(mlx::core::allocator::malloc(parts.nbytes()));
-        auto& device = mlx::core::metal::device(stream().device);
-        CompileOptions options;
-        options.math_mode = MathMode::Fast;
-        auto* library = device.get_library(key_, options, [this] { return packed_hc_source(config_, key_); });
+        const auto kernels = prepared_kernels();
         auto& encoder = mlx::core::metal::get_command_encoder(stream());
         for (int index = 0; index < int(inputs.size()); ++index)
             encoder.set_input_array(inputs[index], index);
@@ -1009,7 +1104,7 @@ public:
         encoder.set_output_array(parts, 17);
         if (config_.after) encoder.set_output_array(outputs[2], 18);
         encoder.set_bytes(config_.eps, 19);
-        encoder.set_compute_pipeline_state(device.get_kernel(key_ + "_down", library));
+        encoder.set_compute_pipeline_state(kernels.first);
         encoder.dispatch_threadgroups(MTL::Size((20 + int(config_.has_injection)) * 4, rows, 1),
                                       MTL::Size(256, 1, 1));
         encoder.set_input_array(normalized, 16);
@@ -1018,7 +1113,7 @@ public:
         encoder.set_output_array(outputs[1], 21);
         const int chunk = config_.up_gs * ((32 + config_.up_gs - 1) / config_.up_gs);
         const int threads = 32 * ((320 + chunk - 1) / chunk);
-        encoder.set_compute_pipeline_state(device.get_kernel(key_ + "_up", library));
+        encoder.set_compute_pipeline_state(kernels.second);
         encoder.dispatch_threadgroups(MTL::Size(320, rows, 1), MTL::Size(threads, 1, 1));
         encoder.add_temporary(std::move(normalized));
         encoder.add_temporary(std::move(parts));
@@ -1128,7 +1223,7 @@ struct QsaPrologueConfig {
     std::array<float, 2> params;
 };
 
-class QsaProloguePrimitive final : public mlx::core::Primitive {
+class QsaProloguePrimitive final : public mlx::core::Primitive, public MlxPreparableKernel {
 public:
     QsaProloguePrimitive(mlx::core::Stream stream, QsaPrologueConfig config)
         : Primitive(stream), config_(config),
@@ -1137,6 +1232,18 @@ public:
         for (int value : config_.geometry) {
             kernel_name_ += "_" + std::to_string(value);
         }
+    }
+
+    std::string preparation_key() const override { return kernel_name_; }
+    void prepare_gpu() override { (void)prepared_kernel(); }
+
+    MTL::ComputePipelineState* prepared_kernel() {
+        auto& device = mlx::core::metal::device(stream().device);
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(
+            kernel_name_, options, [this] { return source(); });
+        return device.get_kernel(kernel_name_, library);
     }
 
     void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
@@ -1149,14 +1256,10 @@ public:
         for (auto& output : outputs) {
             output.set_data(mlx::core::allocator::malloc(output.nbytes()));
         }
-        auto& device = mlx::core::metal::device(stream().device);
-        CompileOptions options;
-        options.math_mode = MathMode::Fast;
-        auto* library = device.get_library(
-            kernel_name_, options, [this] { return source(); });
+        auto* kernel = prepared_kernel();
         auto& encoder = mlx::core::metal::get_command_encoder(stream());
         encoder.set_compute_pipeline_state(
-            device.get_kernel(kernel_name_, library));
+            kernel);
         for (int index = 0; index < 7; ++index) {
             encoder.set_input_array(inputs[index], index);
         }
@@ -1225,7 +1328,7 @@ const mlx::core::fast::CustomKernelFunction& gated_hc_post_kernel() {
             {"output"},
             R"METAL(
                 uint index = thread_position_in_grid.x;
-                if (index >= uint(SIZE)) return;
+                if (index >= uint(residual_shape[0])) return;
                 uint row = index / uint(HIDDEN * HC_COUNT);
                 uint stream = (index / uint(HIDDEN)) % uint(HC_COUNT);
                 uint feature = index % uint(HIDDEN);
@@ -1274,6 +1377,30 @@ const mlx::core::fast::CustomKernelFunction& gated_hc_up_collapse_kernel() {
             false,
             options);
     }();
+    return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction& gated_hc_mix_kernel() {
+    static const auto kernel = mlx::core::fast::metal_kernel(
+        "mfq_cpp_qwen_gated_hc_mix",
+        {"logits", "normalized"},
+        {"branch"},
+        R"METAL(
+            uint index = thread_position_in_grid.x;
+            if (index >= uint(normalized_shape[0]) * uint(HIDDEN)) return;
+            uint row = index / uint(HIDDEN), feature = index % uint(HIDDEN);
+            float total = 0.0f;
+#pragma clang loop unroll(full)
+            for (uint group = 0u; group < uint(HC_COUNT); ++group) {
+                uint location = (row * uint(HC_COUNT) + group) * uint(HIDDEN) + feature;
+                P logit = logits[location];
+                auto inverse = 1 / (1 + metal::precise::exp(metal::abs(logit)));
+                P probability = logit < 0 ? inverse : 1 - inverse;
+                T product = T(probability) * T(normalized[location]);
+                total += float(product);
+            }
+            branch[index] = T(total / float(HC_COUNT));
+        )METAL");
     return kernel;
 }
 
@@ -1921,7 +2048,24 @@ MlxQwen4GatedResidualPre gated_hc_from_normalized(
         }
         auto low = down_projection / connection_count;
         low = low * mlx::core::sigmoid(low);
-        auto mixing = mlx::core::sigmoid(hc_project(up_weight, low));
+        auto logits = hc_project(up_weight, low);
+        const auto rows = normalized.size() / static_cast<std::size_t>(width);
+        const auto elements = rows * static_cast<std::size_t>(hidden_size);
+        if (gated_hc_fast_path_enabled() && rows >= 64 &&
+            gated_hc_float_dtype(logits.dtype()) && gated_hc_float_dtype(normalized.dtype()) &&
+            elements <= static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+            auto shape = residual.shape();
+            shape.back() = hidden_size;
+            const auto dtype = mlx::core::promote_types(logits.dtype(), normalized.dtype());
+            return gated_hc_mix_kernel()(
+                {logits, mlx::core::reshape(normalized,
+                    Shape{static_cast<int>(rows), width})}, {shape}, {dtype},
+                {static_cast<int>(elements), 1, 1}, {256, 1, 1},
+                {{"P", logits.dtype()}, {"T", dtype},
+                 {"HIDDEN", hidden_size}, {"HC_COUNT", hc_count}},
+                std::nullopt, false, {}).front();
+        }
+        auto mixing = mlx::core::sigmoid(logits);
         auto stream_shape = residual.shape();
         stream_shape.back() = hc_count;
         stream_shape.push_back(hidden_size);
@@ -2208,7 +2352,8 @@ array qwen4_gated_residual_post(
             branch.dtype(), injection.dtype());
         const auto dtype = mlx::core::promote_types(residual.dtype(), update_dtype);
         auto outputs = gated_hc_post_kernel()(
-            {branch, residual, injection},
+            {branch, mlx::core::reshape(residual,
+                Shape{static_cast<int>(residual.size())}), injection},
             {residual.shape()},
             {dtype},
             {static_cast<int>(residual.size()), 1, 1},
@@ -2216,7 +2361,6 @@ array qwen4_gated_residual_post(
             {
                 {"T", dtype},
                 {"U", update_dtype},
-                {"SIZE", static_cast<int>(residual.size())},
                 {"HIDDEN", branch.shape(-1)},
                 {"HC_COUNT", hc_count},
             },
@@ -2307,6 +2451,23 @@ MlxQwen4QsaDecodePrologue qwen4_qsa_decode_prologue(
     };
 }
 
+array qwen4_qsa_prefill_output_gate(const array& attended, const array& gate) {
+    if (attended.ndim() != 4 || attended.shape() != gate.shape() ||
+        attended.dtype() != gate.dtype() ||
+        (attended.dtype() != mlx::core::float16 &&
+         attended.dtype() != mlx::core::bfloat16 && attended.dtype() != mlx::core::float32) ||
+        attended.size() == 0 || attended.size() > std::numeric_limits<std::uint32_t>::max() ||
+        static_cast<std::int64_t>(attended.shape(2)) * attended.shape(3) >
+            std::numeric_limits<int>::max()) {
+        throw std::invalid_argument("QSA prefill output gate geometry disagrees");
+    }
+    return array(Shape{attended.shape(0), attended.shape(1),
+        attended.shape(2) * attended.shape(3)}, attended.dtype(),
+        std::make_shared<QsaPrefillOutputGatePrimitive>(
+            mlx::core::default_stream(mlx::core::default_device()), attended.dtype(),
+            attended.shape(2), attended.shape(3)), {attended, gate});
+}
+
 array qwen4_qsa_block_scores(
     const array& query,
     const array& pooled_keys) {
@@ -2340,12 +2501,12 @@ array qwen4_dense_gqa_attention(
     }
     const int tokens = query.shape(2);
     const int keys = key.shape(2);
-    if (tokens == 1 && query_offset + 1 == keys) {
+    if (query_offset + tokens == keys) {
         auto output = scaled_dot_product_attention(
             query,
             key,
             value,
-            false,
+            tokens > 1,
             1.0f / std::sqrt(static_cast<float>(query.shape(3))));
         return mlx::core::transpose(output, {0, 2, 1, 3});
     }

@@ -42,7 +42,9 @@ from mfq.server.runtime.host_memory import (
     total_physical_memory,
 )
 from mfq.server.services.hardware import hardware_identity
-from mfq.server.services.hub_metadata import read_mfq_metadata
+from mfq.server.services.hub_metadata import estimated_resident_weight_bytes, read_mfq_metadata
+from mfq.server.services.model_parameters import parameter_breakdown
+from mfq.server.services.model_memory import cache_profile
 
 HubProvider = Literal["huggingface", "modelscope"]
 
@@ -152,17 +154,17 @@ _OFFICIAL_MODELS = (
         family="DeepSeek-V4-Flash Series",
         architecture="deepseek_v4",
         description=(
-            "DeepSeek V4 Flash-series MoE model with approximately 160B total and "
-            "6B active parameters per token. Supports MTP and SSD expert streaming."
+            "DeepSeek V4 Flash-series MoE model with approximately 284B total and "
+            "13B active parameters per token, with enhanced agentic capabilities and MTP."
         ),
         description_zh=(
-            "DeepSeek V4 Flash 系列 MoE 模型，约 160B 总参数、每 token 激活约 6B，"
-            "支持 MTP 与 SSD 专家流式加载。"
+            "DeepSeek V4 Flash 系列 MoE 模型，约 284B 总参数、每 token 激活约 13B，"
+            "增强智能体能力，支持 MTP。"
         ),
-        parameter_label="~160B total",
-        active_parameter_label="~6B active per token",
+        parameter_label="284B",
+        active_parameter_label="13B",
         modalities=("text",),
-        capabilities=("MTP", "MoE", "SSD streaming"),
+        capabilities=("MTP", "MoE"),
         precision_options=("Expert-Wise V2",),
         license=None,
         sources=(
@@ -188,7 +190,7 @@ _OFFICIAL_MODELS = (
             "Qwen3.8 系列的 27B 稠密模型，面向编程、推理与多步骤智能体任务，原生支持图像与视频理解。"
         ),
         parameter_label="27B",
-        active_parameter_label="27B active per token",
+        active_parameter_label="27B",
         modalities=("text", "image", "video"),
         capabilities=("Vision", "MTP"),
         precision_options=("V1–V4", "S4–S6"),
@@ -208,7 +210,7 @@ _OFFICIAL_MODELS = (
             "Qwen3.6 系列的 27B 稠密模型，支持文本推理、图像与视频理解，以及多 token 预测。"
         ),
         parameter_label="27B",
-        active_parameter_label="27B active per token",
+        active_parameter_label="27B",
         modalities=("text", "image", "video"),
         capabilities=("Vision", "MTP"),
         precision_options=("V2–V3", "S2–S6"),
@@ -409,35 +411,35 @@ def _model_configuration_status(
         status: Literal["recommended", "warning", "unknown"] = "recommended"
         recommendation = "three_stars"
         reason = (
-            "All published precision tiers' weight baselines fit within the detected runtime memory "
+            "All published precision tiers' estimated resident weights fit within the detected runtime memory "
             "budget."
         )
     elif fit_count * 2 > total:
         status = "recommended"
         recommendation = "two_stars"
         reason = (
-            "More than half of the published precision tiers' weight baselines fit within the "
+            "More than half of the published precision tiers' estimated resident weights fit within the "
             "detected runtime memory budget."
         )
     elif fit_count > 0:
         status = "recommended"
         recommendation = "one_star"
         reason = (
-            "At most half of the published precision tiers' weight baselines fit within the detected "
+            "At most half of the published precision tiers' estimated resident weights fit within the detected "
             "runtime memory budget."
         )
     elif capacity * 10 >= smallest * 7:
         status = "warning"
         recommendation = "caution"
         reason = (
-            "The detected runtime memory budget covers at least 70% of the weight baseline "
+            "The detected runtime memory budget covers at least 70% of the estimated resident weight "
             "requirement for the smallest published precision tier."
         )
     else:
         status = "warning"
         recommendation = "not_recommended"
         reason = (
-            "The detected runtime memory budget is below 70% of the weight baseline "
+            "The detected runtime memory budget is below 70% of the estimated resident weight "
             "requirement for the smallest published precision tier."
         )
     return ModelConfigurationStatus(
@@ -500,11 +502,14 @@ def _model_variants(
         inspected = all(item.weight_bytes is not None and item.ssd_ple_bytes is not None for item in group)
         weights = sum(item.weight_bytes or 0 for item in group) if inspected else None
         ple = sum(item.ssd_ple_bytes or 0 for item in group) if inspected else None
+        estimated = sum(estimated_resident_weight_bytes(
+            item.weight_bytes or 0, item.weight_bytes_by_dtype,
+        ) for item in group) if inspected else estimated_resident_weight_bytes(size, {})
         configuration = _configuration_status(
-            weights if weights is not None else size, profile, supported=runtime_compatible,
+            estimated, profile, supported=runtime_compatible,
             unsupported_reason="This model architecture is not registered in MFQ.",
         )
-        configuration.reasons.append('Tensor payload baseline; excludes streamed PLE, KV cache and runtime repacking.' if inspected else 'File-size estimate; tensor metadata is unavailable.')
+        configuration.reasons.append('Estimated resident weights include a 10% allowance on packed or unclassified weights; exclude streamed PLE, KV, prefix caches and temporary workspaces.' if inspected else 'File-size estimate with a 10% allowance; tensor metadata is unavailable.')
         variants.append(
             HubModelVariant(
                 id=f"mfq:{label}",
@@ -514,6 +519,7 @@ def _model_variants(
                     files=sorted(item.name for item in group)[:256],
                     byte_size=size,
                     resident_weight_bytes=weights,
+                    estimated_resident_weight_bytes=estimated,
                     ssd_ple_bytes=ple,
                     configuration=configuration,
                 )
@@ -727,6 +733,8 @@ class HubCatalog:
         files = list(info.files)
         configs = []
         architectures = []
+        predictors = []
+        legacy_blocks = []
         semaphore = asyncio.Semaphore(8)
         endpoint = os.environ.get('HF_ENDPOINT', 'https://huggingface.co').rstrip('/') if info.provider == 'huggingface' else 'https://modelscope.cn'
         async with _metadata_client(endpoint) as client:
@@ -736,11 +744,14 @@ class HubCatalog:
                 try:
                     async with semaphore:
                         metadata = await read_mfq_metadata(client, url, params, item.byte_size)
-                    files[index] = item.model_copy(update={'weight_bytes': metadata.weight_bytes, 'ssd_ple_bytes': metadata.ssd_ple_bytes})
+                    files[index] = item.model_copy(update={'weight_bytes': metadata.weight_bytes,
+                        'weight_bytes_by_dtype': metadata.weight_bytes_by_dtype, 'ssd_ple_bytes': metadata.ssd_ple_bytes})
                     if metadata.config:
                         configs.append(metadata.config)
                     if metadata.architecture:
                         architectures.append(metadata.architecture)
+                    predictors.append(metadata.has_mtp_weights)
+                    legacy_blocks.append(metadata.last_legacy_block)
                 except (httpx.HTTPError, ValueError, UnicodeError):
                     pass
             try:
@@ -758,10 +769,22 @@ class HubCatalog:
         declared = config.get('architectures') or architectures or info.architectures
         if isinstance(declared, str):
             declared = [declared]
+        parameters = parameter_breakdown(config)
+        layer_count = text.get('num_hidden_layers') if isinstance(text, dict) else None
+        legacy_predictor = isinstance(layer_count, int) and layer_count > 0 and any(block >= layer_count for block in legacy_blocks)
+        has_predictor = any(predictors) or legacy_predictor
+        modalities = list(info.modalities) or ['text']
+        if config.get('vision_config') and not config.get('language_model_only', False):
+            modalities = list(dict.fromkeys([*modalities, 'image', 'video']))
         return info.model_copy(update={
             'files': files, 'architectures': list(dict.fromkeys(declared)),
             'runtime_compatible': tensor_schema_for_config(config) is not None if config else info.runtime_compatible,
             'ple_parameter_count': ple_parameters,
+            'parameter_breakdown': parameters,
+            'cache_profile': cache_profile(config),
+            'parameter_count': parameters.total if parameters else info.parameter_count,
+            'modalities': modalities,
+            'mtp_supported': has_predictor if len(predictors) == len(candidates) or has_predictor else None,
             'variants': _model_variants(files, profile, runtime_compatible=tensor_schema_for_config(config) is not None if config else info.runtime_compatible),
         })
 
@@ -887,7 +910,7 @@ class HubCatalog:
                 family=display_name, architecture=info.architectures[0] if info and info.architectures else 'unknown',
                 description=(f'High-performance, fast compact MoE model with {ple_label_en}. PLE tables stream row-wise from SSD without full-table memory residency.' if flash_next else info.description if info and info.description else f'{display_name} model published by Tylogi in MFQ format.'),
                 description_zh=f'高性能、快速的中小型 MoE 模型，带有{ple_label}的 PLE 表，可高效卸载至 SSD，按行读取且无需整表常驻内存。' if flash_next else f'{display_name} 模型，提供 MFQ 格式的精度版本。', parameter_label=None, active_parameter_label=None,
-                modalities=tuple(info.modalities) if info and info.modalities else ('text',), capabilities=('MoE', 'PLE', 'SSD PLE streaming') if flash_next else (), precision_options=(),
+                modalities=tuple(info.modalities) if info and info.modalities else ('text',), capabilities=('MoE', 'PLE') if flash_next else (), precision_options=(),
                 license=info.license if info else None, sources=(source,),
             )
         return list(specs.values())
@@ -899,9 +922,14 @@ class HubCatalog:
             self._official_cache.get((source.provider, source.repo_id))
             for source in spec.sources
         ]
-        selected_index = next(
-            (index for index, value in enumerate(source_models) if value is not None), 0
-        )
+        def source_quality(index: int) -> tuple[int, float, int]:
+            info = source_models[index]
+            if info is None:
+                return (-1, 0, -index)
+            weights = [item for item in info.files if item.name.lower().endswith('.mfq')]
+            coverage = sum(item.weight_bytes is not None for item in weights) / len(weights) if weights else 0
+            return (int(info.parameter_breakdown is not None) + int(info.cache_profile is not None), coverage, -index)
+        selected_index = max(range(len(source_models)), key=source_quality)
         source_info = source_models[selected_index]
         sources = [
             OfficialModelSource(
@@ -933,6 +961,9 @@ class HubCatalog:
             description_zh=spec.description_zh,
             parameter_label=spec.parameter_label,
             active_parameter_label=spec.active_parameter_label,
+            parameter_breakdown=source_info.parameter_breakdown if source_info else None,
+            cache_profile=source_info.cache_profile if source_info else None,
+            mtp_supported=source_info.mtp_supported if source_info and source_info.mtp_supported is not None else 'MTP' in spec.capabilities if spec.capabilities else None,
             modalities=list(spec.modalities),
             capabilities=list(spec.capabilities),
             precision_options=list(spec.precision_options),

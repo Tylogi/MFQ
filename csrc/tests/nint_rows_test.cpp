@@ -29,7 +29,22 @@ void check(int width, int gs, int nominal_k, bool adaptive) {
     std::vector<int> ids{528, 257, 255, 256, 0, 3, 528};
     for (int row = 0; row < 32; ++row) ids.push_back(row);
     for (const auto id : ids) { memory.append_row(id, a); ranges.append_row(id, b); }
+    mfq::NintRowBatch merged;
+    for (const auto id : ids) {
+        mfq::NintRowBatch row;
+        memory.append_row(id, row);
+        merged.append_batch(row);
+    }
     a.validate(); b.validate();
+    require(merged.packed() == a.packed() && merged.descriptors() == a.descriptors() &&
+        merged.source_bytes_read() == a.source_bytes_read(), "merged row protocol differs");
+    rejected([&] { merged.append_batch(merged); });
+    rejected([&] { merged.append_batch(mfq::NintRowBatch{}); });
+    const auto other_fixture = mfq::test::fixture(1, width + 1, gs, nominal_k, adaptive);
+    mfq::NintRows other_table(other_fixture.blob.data(), other_fixture.blob.size());
+    mfq::NintRowBatch other_row;
+    other_table.append_row(0, other_row);
+    rejected([&] { merged.append_batch(other_row); });
     require(a.packed() == b.packed() && a.descriptors() == b.descriptors(), "memory/range protocol differs");
     require(bytes == b.source_bytes_read() && bytes < f.blob.size(), "range access copied full payload");
     for (std::size_t row = 0; row < ids.size(); ++row)

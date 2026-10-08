@@ -35,6 +35,7 @@ export function ChatToolbar() {
     effectiveSettings,
     mtpSupported,
     mtpAvailable,
+    mtpServiceEnabled,
     thinkingSupported,
     reasoningValues,
     updateGlobalInference,
@@ -119,7 +120,9 @@ export function ChatToolbar() {
           disabled={!mtpAvailable}
           onClick={() => updateGlobalInference({ enableMtp: !effectiveSettings.enableMtp })}
           title={
-            mtpAvailable
+            !mtpServiceEnabled
+              ? tr('服务已关闭 MTP', 'MTP is disabled by the service')
+              : mtpAvailable
               ? 'MTP'
               : tr(
                   '当前模型文件没有完整 MTP 权重',

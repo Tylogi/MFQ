@@ -506,7 +506,7 @@ def test_naq_uses_gated_norm_activation_energy_for_linear_attention_gate():
 def test_cli_dispatches_same_imatrix_collector_for_cuda_and_metal(
     monkeypatch, backend, device, accumulation_dtype
 ):
-    import mfq.calibration.dataset as dataset_module
+    import mfq.calibration.chat as chat_module
     import mfq.calibration.imatrix as imatrix_module
     from mfq.cli import _calibrate_imatrix
 
@@ -519,7 +519,12 @@ def test_cli_dispatches_same_imatrix_collector_for_cuda_and_metal(
 
     corpus = Corpus()
     received = {}
-    monkeypatch.setattr(dataset_module, "load_corpus", lambda path: corpus)
+    def prepare(path, model, **kwargs):
+        assert kwargs['apply_chat_template'] is True
+        assert kwargs['window_length'] == 2048
+        assert kwargs['train_tokens'] == 4096
+        return corpus
+    monkeypatch.setattr(chat_module, "prepare_calibration_corpus", prepare)
 
     def fake_collect(model, actual_corpus, output, **kwargs):
         received.update(model=model, corpus=actual_corpus, output=output, **kwargs)

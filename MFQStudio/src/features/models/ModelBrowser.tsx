@@ -9,6 +9,7 @@ import type {
   JobKindResource,
   JobResource,
   ModelConfigurationStatus,
+  ModelParameterBreakdown,
   OfficialModelInfo,
   OfficialModelList,
   OfficialModelSource,
@@ -18,7 +19,9 @@ import { modelsApi } from '../../shared/api/resources/models';
 import { openStudioExternal } from '../../shared/platform/studio';
 import { BackendBadge } from './BackendBadge';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
+import { ModelMemoryPressure } from './ModelMemoryPressure';
 import { RepositoryFiles } from './RepositoryFiles';
+import { estimateCacheBytes, KvCachePlanner, plannedConfiguration, withCacheMemory } from './KvCachePlanner';
 
 type Translate = (chinese: string, english: string) => string;
 export type ModelBrowserTab = 'official' | 'community' | 'downloads';
@@ -61,6 +64,34 @@ function formatCount(value: number): string {
   return new Intl.NumberFormat(undefined, { notation: "compact" }).format(value);
 }
 
+function formatParameters(value: number): string {
+  if (value >= 1e9) return `${(value / 1e9).toFixed(1).replace(/\.0$/, '')}B`;
+  if (value >= 1e6) return `${(value / 1e6).toFixed(1).replace(/\.0$/, '')}M`;
+  return new Intl.NumberFormat().format(value);
+}
+
+function modalityLabels(values: string[], tr: Translate): string {
+  const labels: Record<string, string> = {
+    text: tr('文本', 'text'), image: tr('图像', 'image'),
+    video: tr('视频', 'video'), audio: tr('音频', 'audio'),
+  };
+  return values.map((value) => labels[value] || value).join(' · ');
+}
+
+function ParameterValue({ parameters, label, tr }: { parameters?: ModelParameterBreakdown | null; label?: string | null; tr: Translate }) {
+  if (!parameters) return <>{label || '—'}</>;
+  return <>{formatParameters(parameters.total)}{tr('（', ' (')}{formatParameters(parameters.dense)} {tr('稠密', 'dense')}
+    {parameters.routed_experts > 0 && <> + {formatParameters(parameters.routed_experts)} {tr('路由专家', 'routed experts')}</>}
+    {parameters.ple > 0 && <> + {formatParameters(parameters.ple)} PLE</>}{tr('）', ')')}</>;
+}
+
+function MtpSupport({ supported, tr }: { supported?: boolean | null; tr: Translate }) {
+  return <div className="model-mtp-support">
+    <dt>{tr('MTP支持', 'MTP support')}</dt>
+    <dd>{supported == null ? tr('未确认', 'Unknown') : supported ? tr('是', 'Yes') : tr('否', 'No')}</dd>
+  </div>;
+}
+
 function hardwareSummary(system: HubSystemProfile, tr: Translate): string {
   const unified = system.memory_pools?.some((pool) => pool.kind === 'uma') || /^Apple M\d+(?: (?:Pro|Max|Ultra))?$/.test(system.cpu_name || '');
   const ram = system.physical_memory_bytes ? `${formatBytes(system.physical_memory_bytes).replace(/\.0 /, ' ')} ${unified ? 'URAM' : 'RAM'}` : null;
@@ -93,18 +124,6 @@ function formatDate(value?: string | null): string {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString();
 }
 
-function memoryBudgetPercentage(status: ModelConfigurationStatus): number | null {
-  const required = status.required_memory_bytes;
-  const budget = status.available_memory_bytes;
-  if (required == null || budget == null || budget <= 0) return null;
-  return (required / budget) * 100;
-}
-
-function memoryPressureColor(percentage: number): string {
-  const hue = 120 - Math.min(Math.max(percentage, 0), 100) * 1.2;
-  return `hsl(${hue.toFixed(1)} 68% 42%)`;
-}
-
 function configurationReasons(status: ModelConfigurationStatus, tr: Translate): string[] {
   return status.reasons.map((reason) => {
     if (reason === "Configuration requirements could not be determined.") return tr("无法确定此配置的资源需求。", reason);
@@ -130,6 +149,13 @@ function configurationReasons(status: ModelConfigurationStatus, tr: Translate): 
     if (reason === "This model architecture is not registered in MFQ.") return tr("MFQ 尚未注册此模型架构。", reason);
     if (reason === "Runtime compatibility could not be verified from repository metadata.") return tr("无法根据仓库元数据验证 MFQ Runtime 兼容性。", reason);
     if (reason === "Tensor payload baseline; excludes streamed PLE, KV cache and runtime repacking.") return tr("按张量载荷计算权重常驻基线，已扣除流式 PLE；不包含 KV 缓存和运行时重排开销。", reason);
+    if (reason === "Estimated resident weights include a 10% allowance on packed or unclassified weights; exclude streamed PLE, KV, prefix caches and temporary workspaces.") return tr("量化或未知布局权重暂加 10% 存储余量，已扣除流式 PLE；KV、前缀缓存和临时工作区另计。", reason);
+    if (reason === "File-size estimate with a 10% allowance; tensor metadata is unavailable.") return tr("暂按文件大小加 10% 余量估计，尚未取得张量元数据，未扣除 PLE。", reason);
+    if (reason === "All published precision tiers' estimated resident weights fit within the detected runtime memory budget.") return tr("所有已发布精度档的预计权重常驻均在当前推理预算以内。", reason);
+    if (reason === "More than half of the published precision tiers' estimated resident weights fit within the detected runtime memory budget.") return tr("超过一半的已发布精度档预计权重常驻在当前推理预算以内。", reason);
+    if (reason === "At most half of the published precision tiers' estimated resident weights fit within the detected runtime memory budget.") return tr("仅部分已发布精度档的预计权重常驻在当前推理预算以内。", reason);
+    if (reason === "The detected runtime memory budget covers at least 70% of the estimated resident weight requirement for the smallest published precision tier.") return tr("当前推理预算达到最低档预计权重常驻的 70%，处于临界区间。", reason);
+    if (reason === "The detected runtime memory budget is below 70% of the estimated resident weight requirement for the smallest published precision tier.") return tr("当前推理预算不足最低档预计权重常驻的 70%。", reason);
     if (reason === "File-size estimate; tensor metadata is unavailable.") return tr("未读取到张量元数据，暂按文件大小估计权重占用。", reason);
     if (reason === "All published precision tiers' weight baselines fit within the detected runtime memory budget.") return tr("所有已发布精度档的权重基线均在当前推理预算以内。", reason);
     if (reason === "More than half of the published precision tiers' weight baselines fit within the detected runtime memory budget.") return tr("超过一半的已发布精度档权重基线在当前推理预算以内。", reason);
@@ -159,32 +185,11 @@ function downloadPatterns(variant: HubModelVariant | null): string[] {
   return Array.from(new Set([...weights, ...SUPPORT_FILES]));
 }
 
-function ConfigurationBadge({ status, tr }: { status: ModelConfigurationStatus; tr: Translate }) {
-  const reason = configurationReasons(status, tr).join(" ");
-  const presentation = {
-    three_stars: ["★★★", tr("权重压力低：全部精度档的权重基线在预算以内", "Low weight pressure: all tier baselines fit the budget")],
-    two_stars: ["★★", tr("权重压力中等：多数精度档的权重基线在预算以内", "Moderate weight pressure: most tier baselines fit the budget")],
-    one_star: ["★", tr("权重压力较高：仅部分精度档的权重基线在预算以内", "High weight pressure: only some tier baselines fit the budget")],
-    caution: ["▲", tr("权重临界：最低档基线接近预算上限", "Weight budget near limit: the smallest tier baseline nearly fits")],
-    not_recommended: ["✕", tr("权重预算不足：最低档基线超出预算", "Insufficient weight budget: the smallest tier baseline exceeds it")],
-    unknown: ["?", tr("内存压力未知", "Memory pressure unknown")],
-  }[status.recommendation];
-  return (
-    <span
-      aria-label={presentation[1]}
-      className={`configuration-badge ${status.status} ${status.recommendation.replaceAll("_", "-")}`}
-      title={[presentation[1], reason].filter(Boolean).join(" · ")}
-    >
-      <b aria-hidden="true">{presentation[0]}</b>
-    </span>
-  );
-}
-
-function ConfigurationDetails({ status, tr }: { status: ModelConfigurationStatus; tr: Translate }) {
+function ConfigurationDetails({ status, planned = false, tr }: { status: ModelConfigurationStatus; planned?: boolean; tr: Translate }) {
   return (
     <div className={`configuration-details ${status.status} ${status.recommendation.replaceAll("_", "-")}`}>
       <div>
-        <span>{tr("最低档权重基线", "Smallest tier weight baseline")}</span>
+        <span>{planned ? tr('最低档权重 + KV/递推状态', 'Smallest tier weights + KV/recurrent state') : tr("最低档预计权重常驻", "Smallest tier estimated resident weights")}</span>
         <strong>{formatBytes(status.required_memory_bytes)}</strong>
       </div>
       <div>
@@ -201,11 +206,13 @@ function VariantList({
   onDownload,
   tr,
   variants,
+  cacheBytes = 0,
 }: {
   disabled: boolean;
   onDownload(variant: HubModelVariant, origin: DownloadOrigin): void;
   tr: Translate;
   variants: HubModelVariant[];
+  cacheBytes?: number;
 }) {
   if (!variants.length) {
     return <div className="model-browser-empty compact">{tr("仓库暂未返回可下载权重。", "No downloadable weights were returned by this repository.")}</div>;
@@ -213,29 +220,17 @@ function VariantList({
   return (
     <div className="model-variant-list">
       {variants.map((variant) => {
-        const percentage = memoryBudgetPercentage(variant.configuration);
-        const percentageLabel = percentage == null ? "—" : `${percentage.toFixed(1)}%`;
-        const color = percentage == null ? "var(--muted)" : memoryPressureColor(percentage);
         return (
           <div className="model-variant" key={variant.id}>
             <div>
               <strong>{variant.label}</strong>
-              <small>{variant.precision || variant.format.toUpperCase()} · {tr("文件", "file")} {formatBytes(variant.byte_size)} · {variant.resident_weight_bytes != null ? tr("权重常驻基线", "resident weight baseline") : tr("权重占用估计", "est. weight memory")} {formatBytes(variant.configuration.required_memory_bytes)}{(variant.ssd_ple_bytes ?? 0) > 0 && ` · SSD PLE ${formatBytes(variant.ssd_ple_bytes)}`}</small>
+              <small>{variant.precision || variant.format.toUpperCase()} · {tr("文件", "file")} {formatBytes(variant.byte_size)} · {variant.estimated_resident_weight_bytes != null ? tr("预计权重常驻", "est. resident weights") : variant.resident_weight_bytes != null ? tr("权重常驻基线", "resident weight baseline") : tr("权重占用估计", "est. weight memory")} {formatBytes(variant.estimated_resident_weight_bytes ?? variant.resident_weight_bytes ?? (variant.configuration.required_memory_bytes == null ? null : variant.configuration.required_memory_bytes - cacheBytes))}{(variant.ssd_ple_bytes ?? 0) > 0 && ` · SSD PLE ${formatBytes(variant.ssd_ple_bytes)}`}</small>
+              {cacheBytes > 0 && <small>{tr('规划 KV/递推状态', 'Planned KV/recurrent state')} {formatBytes(cacheBytes)} · {tr('预计总常驻', 'Est. total residency')} {formatBytes(variant.configuration.required_memory_bytes)}</small>}
             </div>
-            <div className="variant-memory-pressure">
-              <div
-                aria-label={`${tr("预计占当前推理预算", "Estimated share of runtime budget")}: ${percentageLabel}`}
-                aria-valuemax={100}
-                aria-valuemin={0}
-                aria-valuenow={percentage == null ? undefined : Math.min(percentage, 100)}
-                aria-valuetext={percentageLabel}
-                className="variant-memory-track"
-                role="progressbar"
-              >
-                <span style={{ backgroundColor: color, width: `${Math.min(percentage ?? 0, 100)}%` }} />
-              </div>
-              <strong style={{ color }}>{percentageLabel}</strong>
-            </div>
+            <ModelMemoryPressure required={variant.configuration.required_memory_bytes}
+              available={variant.configuration.available_memory_bytes}
+              label={tr("预计占当前推理预算", "Estimated share of runtime budget")}
+              emptyLabel={tr('无可用内存', 'No available memory')} />
             <button disabled={disabled} onClick={(event) => {
               const rect = event.currentTarget.getBoundingClientRect();
               onDownload(variant, { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
@@ -263,6 +258,7 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
   const [communityLoading, setCommunityLoading] = useState(false);
   const [downloading, setDownloading] = useState<string | null>(null);
   const [maxWorkers, setMaxWorkers] = useState(8);
+  const [plannedContexts, setPlannedContexts] = useState<Record<string, number | undefined>>({});
   const officialRequest = useRef(0);
   const catalogRequest = useRef(0);
   const catalogTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -282,6 +278,22 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
   const officialVariants = sourceInfoMatches ? officialSourceInfo!.variants
     : selectedSource?.provider === selectedOfficial?.selected_source.provider
       ? selectedOfficial?.variants ?? [] : [];
+  const selectedMetadata = sourceInfoMatches ? officialSourceInfo : selectedSource?.provider === selectedOfficial?.selected_source.provider
+    && selectedSource?.repo_id === selectedOfficial?.selected_source.repo_id ? selectedOfficial : null;
+  const parameters = selectedMetadata?.parameter_breakdown;
+  const mtpSupported = selectedMetadata?.mtp_supported;
+  const officialPlanKey = `official:${selectedOfficial?.id}:${selectedSource?.provider}:${selectedSource?.repo_id}`;
+  const officialContext = plannedContexts[officialPlanKey];
+  const officialCacheBytes = selectedMetadata?.cache_profile && officialContext != null
+    ? estimateCacheBytes(selectedMetadata.cache_profile, officialContext) : 0;
+  const plannedOfficialVariants = withCacheMemory(officialVariants, officialCacheBytes);
+  const officialConfiguration = selectedOfficial && officialCacheBytes > 0
+    ? plannedConfiguration(plannedOfficialVariants, selectedOfficial.configuration, tr) : selectedOfficial?.configuration;
+  const communityPlanKey = `community:${communityModel?.provider}:${communityModel?.repo_id}`;
+  const communityContext = plannedContexts[communityPlanKey];
+  const communityCacheBytes = communityModel?.cache_profile && communityContext != null
+    ? estimateCacheBytes(communityModel.cache_profile, communityContext) : 0;
+  const applyPlan = (key: string, context: number | undefined) => setPlannedContexts((current) => ({ ...current, [key]: context }));
   const canDownload = (targetProvider: HubModelSummary["provider"]) =>
     jobKinds.some((item) => item.kind === `download.${targetProvider}`);
 
@@ -452,15 +464,6 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
             <div><span>{tr("推理预算", "Runtime budget")}</span><MemoryBudget system={system || undefined} tr={tr} /></div>
             <button disabled={catalogLoading || official?.refreshing} onClick={() => void loadOfficial(true)} type="button">{catalogLoading || official?.refreshing ? tr("刷新中", "Refreshing") : tr("刷新目录", "Refresh")}</button>
           </div>
-          <div className="memory-pressure-guide">
-            <strong>{tr("内存压力", "Memory pressure")}</strong>
-            <span><b>★★★</b>{tr("低", "Low")}</span>
-            <span><b>★★</b>{tr("中", "Moderate")}</span>
-            <span><b>★</b>{tr("高", "High")}</span>
-            <span><b>▲</b>{tr("临界", "Near limit")}</span>
-            <span><b>✕</b>{tr("不足", "Insufficient")}</span>
-            <small>{tr("按权重常驻基线估算；还需预留 KV 缓存及运行时开销。", "Based on resident weight baselines; KV cache and runtime overhead need additional memory.")}</small>
-          </div>
           <div className="model-browser-layout">
             <div className="official-model-grid">
               {official?.data.map((item) => (
@@ -468,31 +471,30 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
                   <div className="official-model-card-title"><span>{item.name.slice(0, 1).toUpperCase()}</span><div><strong>{item.name}</strong><small>{item.family}</small></div><ModelVendorMark name={item.name} architecture={item.architecture} size={28} /></div>
                   <p>{tr(item.description_zh, item.description)}</p>
                   <div className="model-chip-row">{item.precision_options.map((value) => <span key={value}>{value}</span>)}</div>
-                  <ConfigurationBadge status={item.configuration} tr={tr} />
                 </button>
               ))}
               {!official && <div className="model-browser-empty">{tr("正在读取官方目录…", "Loading the official catalog…")}</div>}
             </div>
             {selectedOfficial && selectedSource && (
               <aside className="model-detail-panel">
-                <div className="model-detail-heading"><div><small>{selectedOfficial.family}</small><h3>{selectedOfficial.name}</h3></div><div className="model-identity-trailing"><ConfigurationBadge status={selectedOfficial.configuration} tr={tr} /><ModelVendorMark name={selectedOfficial.name} architecture={selectedOfficial.architecture} size={30} /></div></div>
+                <div className="model-detail-heading"><div><small>{selectedOfficial.family}</small><h3>{selectedOfficial.name}</h3></div><div className="model-identity-trailing"><ModelVendorMark name={selectedOfficial.name} architecture={selectedOfficial.architecture} size={30} /></div></div>
                 <p>{tr(selectedOfficial.description_zh, selectedOfficial.description)}</p>
-                <ConfigurationDetails status={selectedOfficial.configuration} tr={tr} />
+                <ConfigurationDetails status={officialConfiguration!} planned={officialCacheBytes > 0} tr={tr} />
                 <dl className="model-metadata-grid">
                   <div><dt>{tr("架构", "Architecture")}</dt><dd>{selectedOfficial.architecture}</dd></div>
-                  <div><dt>{tr("参数", "Parameters")}</dt><dd>{selectedOfficial.parameter_label || "—"}</dd></div>
-                  <div><dt>{tr("激活参数", "Active parameters")}</dt><dd>{selectedOfficial.active_parameter_label || "—"}</dd></div>
-                  <div><dt>{tr("模态", "Modalities")}</dt><dd>{selectedOfficial.modalities.join(" · ")}</dd></div>
-                  <div><dt>{tr("功能", "Capabilities")}</dt><dd>{selectedOfficial.capabilities.join(" · ")}</dd></div>
+                  <div className="model-parameter-row"><dt>{tr("参数", "Parameters")}</dt><dd title={tr("主模型逻辑参数，含视觉模块；不含 MTP 辅助权重与量化元数据。", "Main-model logical parameters, including vision; excludes auxiliary MTP weights and quantization metadata.")}><ParameterValue parameters={parameters} label={selectedOfficial.parameter_label} tr={tr} /></dd></div>
+                  <div><dt>{tr("激活参数", "Active parameters")}</dt><dd title={tr("主干每 token 的逻辑激活参数，不含词嵌入、输出词表、视觉编码器与 PLE 查表。", "Logical backbone parameters active per token; excludes vocabulary embeddings/output, vision encoder and PLE lookups.")}>{parameters?.active != null ? formatParameters(parameters.active) : selectedOfficial.active_parameter_label || "—"}</dd></div>
+                  <div><dt>{tr("模态", "Modalities")}</dt><dd>{modalityLabels(selectedMetadata?.modalities?.length ? selectedMetadata.modalities : selectedOfficial.modalities, tr)}</dd></div>
+                  <MtpSupport supported={mtpSupported} tr={tr} />
                   <div><dt>{tr("许可", "License")}</dt><dd>{selectedOfficial.license || tr("查看模型卡", "See model card")}</dd></div>
                   <div><dt>{tr("下载", "Downloads")}</dt><dd>{formatCount(selectedOfficial.downloads)}</dd></div>
                   <div><dt>{tr("收藏", "Likes")}</dt><dd>{formatCount(selectedOfficial.likes)}</dd></div>
                   <div><dt>{tr("发布时间", "Published")}</dt><dd>{formatDate(selectedOfficial.published_at || selectedOfficial.updated_at)}</dd></div>
                 </dl>
+                <KvCachePlanner key={`kv:${officialPlanKey}`} profile={selectedMetadata?.cache_profile} appliedContext={officialContext} onApply={(context) => applyPlan(officialPlanKey, context)} tr={tr} />
                 <label className="model-source-picker"><span>{tr("下载来源", "Download source")}</span><select onChange={(event) => { const source = selectedOfficial.sources[Number(event.target.value)]; if (source) void chooseOfficialSource(source); }} value={String(Math.max(0, selectedOfficial.sources.findIndex((item) => item.provider === selectedSource.provider && item.repo_id === selectedSource.repo_id)))}>{selectedOfficial.sources.map((source, index) => <option disabled={!source.available} key={`${source.provider}:${source.repo_id}`} value={index}>{source.provider === "huggingface" ? "Hugging Face" : "ModelScope"}{source.available ? "" : ` · ${tr("离线", "unavailable")}`}</option>)}</select></label>
                 <div className="repository-line"><button onClick={() => void openStudioExternal(selectedSource.url).catch((cause) => onError(cause instanceof Error ? cause.message : String(cause)))} type="button">{selectedSource.repo_id}</button><span>{officialVariants.length} {tr("个精度版本", "variants")}</span></div>
-                {selectedOfficial.supports_ssd_streaming && <div className="streaming-note">{tr("支持 SSD 专家流式读取；即使无法完整常驻仍可流式运行。上方图标只表示完整常驻时的内存压力。", "SSD expert streaming remains available when the model cannot fit fully in memory. The icon above reflects full-residency memory pressure only.")}</div>}
-                <VariantList disabled={officialLoading || !selectedSource.available || !canDownload(selectedSource.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision || selectedOfficial.revision }, variant, origin)} tr={tr} variants={officialVariants} />
+                <VariantList disabled={officialLoading || !selectedSource.available || !canDownload(selectedSource.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: selectedSource.provider, repo_id: selectedSource.repo_id, revision: selectedSource.revision || selectedOfficial.revision }, variant, origin)} tr={tr} variants={plannedOfficialVariants} cacheBytes={officialCacheBytes} />
                 {sourceInfoMatches && <RepositoryFiles key={`${selectedSource.provider}:${selectedSource.repo_id}:${officialSourceInfo!.revision}`}
                   files={officialSourceInfo!.files} disabled={officialLoading || !canDownload(selectedSource.provider) || downloading !== null} tr={tr}
                   onDownload={(files, label, origin) => void download(officialSourceInfo!, {
@@ -522,18 +524,18 @@ export function ModelBrowser({ jobKinds, onError, onJobCreated, tab, onTabChange
                 {communityModel.description && <p>{communityModel.description}</p>}
                 <dl className="model-metadata-grid">
                   <div><dt>{tr("架构", "Architecture")}</dt><dd>{communityModel.architectures.join(", ") || tr("未声明", "Not declared")}</dd></div>
-                  <div><dt>{tr("参数", "Parameters")}</dt><dd>{communityModel.parameter_count ? formatCount(communityModel.parameter_count) : "—"}</dd></div>
-                  <div><dt>{tr("模态", "Modalities")}</dt><dd>{communityModel.modalities.join(" · ") || "text"}</dd></div>
+                  <div className="model-parameter-row"><dt>{tr("参数", "Parameters")}</dt><dd><ParameterValue parameters={communityModel.parameter_breakdown} label={communityModel.parameter_count ? formatParameters(communityModel.parameter_count) : null} tr={tr} /></dd></div>
+                  <div><dt>{tr('激活参数', 'Active parameters')}</dt><dd>{communityModel.parameter_breakdown?.active != null ? formatParameters(communityModel.parameter_breakdown.active) : '—'}</dd></div>
+                  <div><dt>{tr("模态", "Modalities")}</dt><dd>{modalityLabels(communityModel.modalities.length ? communityModel.modalities : ['text'], tr)}</dd></div>
+                  <MtpSupport supported={communityModel.mtp_supported} tr={tr} />
                   <div><dt>{tr("许可", "License")}</dt><dd>{communityModel.license || tr("未声明", "Not declared")}</dd></div>
-                  <div><dt>{tr("仓库大小", "Repository size")}</dt><dd>{formatBytes(communityModel.total_bytes)}</dd></div>
-                  <div><dt>{tr("版本", "Revision")}</dt><dd title={communityModel.revision}>{communityModel.revision.slice(0, 12)}</dd></div>
-                  <div><dt>{tr("框架", "Library")}</dt><dd>{communityModel.library || "—"}</dd></div>
-                  <div><dt>{tr("任务", "Task")}</dt><dd>{communityModel.pipeline_tag || "—"}</dd></div>
-                  <div><dt>{tr("更新时间", "Updated")}</dt><dd>{formatDate(communityModel.updated_at)}</dd></div>
-                  <div><dt>{tr("MFQ 兼容性", "MFQ compatibility")}</dt><dd>{communityModel.runtime_compatible === true ? tr("已验证", "Verified") : communityModel.runtime_compatible === false ? tr("暂不支持", "Unsupported") : tr("未知", "Unknown")}</dd></div>
+                  <div><dt>{tr("下载", "Downloads")}</dt><dd>{formatCount(communityModel.downloads)}</dd></div>
+                  <div><dt>{tr("收藏", "Likes")}</dt><dd>{formatCount(communityModel.likes)}</dd></div>
+                  <div><dt>{tr("发布时间", "Published")}</dt><dd>{formatDate(communityModel.published_at || communityModel.updated_at)}</dd></div>
                 </dl>
+                <KvCachePlanner key={`kv:${communityPlanKey}`} profile={communityModel.cache_profile} appliedContext={communityContext} onApply={(context) => applyPlan(communityPlanKey, context)} tr={tr} />
                 {communityModel.source_url && <div className="repository-line"><button onClick={() => void openStudioExternal(communityModel.source_url!).catch((cause) => onError(cause instanceof Error ? cause.message : String(cause)))} type="button">{tr("打开模型卡", "Open model card")}</button><span>{formatCount(communityModel.downloads)} downloads · {formatCount(communityModel.likes)} likes · {communityModel.files.length} files</span></div>}
-                <VariantList disabled={communityLoading || !canDownload(communityModel.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: communityModel.provider, repo_id: communityModel.repo_id, revision: communityModel.revision }, variant, origin)} tr={tr} variants={communityModel.variants} />
+                <VariantList disabled={communityLoading || !canDownload(communityModel.provider) || downloading !== null} onDownload={(variant, origin) => void download({ provider: communityModel.provider, repo_id: communityModel.repo_id, revision: communityModel.revision }, variant, origin)} tr={tr} variants={withCacheMemory(communityModel.variants, communityCacheBytes)} cacheBytes={communityCacheBytes} />
                 <RepositoryFiles key={`${communityModel.provider}:${communityModel.repo_id}:${communityModel.revision}`} files={communityModel.files}
                   disabled={communityLoading || !canDownload(communityModel.provider) || downloading !== null} tr={tr}
                   onDownload={(files, label, origin) => void download(communityModel, {

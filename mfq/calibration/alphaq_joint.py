@@ -39,7 +39,7 @@ class DenseChoice:
         if (self.precision is None) == (self.native_dtype is None):
             raise ValueError("dense choice requires either precision or native dtype")
         if self.native_dtype is not None and (
-            self.native_dtype not in {"BF16", "F16", "F32"} or self.distortion != 0
+            self.native_dtype not in {"BF16", "F16", "F32", "F8_E4M3", "MXFP4", "MXFP8"} or self.distortion != 0
         ):
             raise ValueError("native dense choice must preserve source dtype with zero error")
         if self.pool_key or self.pool_storage_bits:
@@ -69,6 +69,7 @@ def dense_choices(
     statistics: Sequence[AlphaQTensorStatistics],
     source_dtypes: Mapping[str, str],
     profiles: Sequence[str] | None = None,
+    *, native_plans: Mapping | None = None,
 ) -> tuple[DenseChoice, ...]:
     """Determine canonical dense byte costs without fitting any weights."""
     from mfq.formats.nint import NintSpec
@@ -81,7 +82,8 @@ def dense_choices(
         if stat.shape[0] != 1:
             raise ValueError("dense statistics must describe one matrix")
         shape = stat.shape[1:]
-        for candidate in alphaq_builtin_candidates([stat], profiles).candidates:
+        builtins = alphaq_builtin_candidates([stat], profiles).candidates if profiles is None or profiles else ()
+        for candidate in builtins:
             precision = _imatrix_precision(candidate.precision)
             dtype = (f"NINT{precision.nint_spec.bits}" if precision.nint_spec
                      else precision.family)
@@ -91,9 +93,15 @@ def dense_choices(
             choices.append(DenseChoice(candidate.key, candidate.profile, bits,
                                        candidate.distortion, precision))
         dtype = source_dtypes[stat.name]
-        if dtype not in {"BF16", "F16", "F32"}:
+        if dtype not in {"BF16", "F16", "F32", "F8_E4M3", "MXFP4", "MXFP8"}:
             raise ValueError(f"unsupported native dense source dtype: {dtype}")
-        bits = 8 * (20 + math.prod(shape) * (4 if dtype == "F32" else 2))
+        if native_plans is not None:
+            native_plan = replace(native_plans[stat.name], target_dtype=dtype, target_precision=None, target_spec=None)
+            bits = 8 * _plan_blob_nbytes(native_plan, NintSpec())
+        else:
+            if dtype not in {"BF16", "F16", "F32"}:
+                raise ValueError('native low-precision candidates require their source-storage plans')
+            bits = 8 * (20 + math.prod(shape) * (4 if dtype == "F32" else 2))
         choices.append(DenseChoice(EwItemKey(stat.name, stat.layer, stat.projection, 0),
                                    "NATIVE", bits, 0.0, native_dtype=dtype))
     return tuple(choices)
@@ -145,8 +153,8 @@ def allocate_joint(
         replace(c, precision=_imatrix_precision(c.precision))
         for c in expert_candidates.candidates
     )))
-    importance = alphaq_importance(expert_statistics)
-    weights = importance.weights_for(scored.items)
+    importance = alphaq_importance(expert_statistics or dense_statistics)
+    weights = importance.weights_for(scored.items) if expert_statistics else {}
     if router_multipliers is None:
         router_multipliers = dict.fromkeys(weights, 1.0)
     if set(router_multipliers) != set(weights) or any(
@@ -157,7 +165,7 @@ def allocate_joint(
     choices = defaultdict(list)
     for candidate in scored.candidates:
         choices[candidate.key].append(candidate)
-    median = float(np.median(np.concatenate([s.alpha for s in expert_statistics])))
+    median = float(np.median(np.concatenate([s.alpha for s in (expert_statistics or dense_statistics)])))
     scale = importance.metadata["importance_scale"]
     for stat in dense_statistics:
         key = EwItemKey(stat.name, stat.layer, stat.projection, 0)

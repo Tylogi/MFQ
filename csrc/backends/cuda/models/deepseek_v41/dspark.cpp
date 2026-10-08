@@ -232,6 +232,7 @@ struct DeepseekV41Dspark final : MtpModule {
     bool target_bootstrap_decode() const noexcept override { return false; }
     bool preserve_output_dtype() const noexcept override { return true; }
     bool blockwise_drafting() const noexcept override { return true; }
+    bool dspark_policy() const noexcept override { return true; }
     bool split_target_verification() const noexcept override { return true; }
 
     int maximum_draft_depth() const noexcept override {

@@ -30,6 +30,7 @@ constexpr std::size_t kBlockElements = 32;
 constexpr std::size_t kBlockBytes = 34;
 
 constexpr const char* kNint8ZeroMatmul = R"METAL(
+    const int M = x_shape[0];
     uint lane = thread_index_in_simdgroup;
     uint workgroup = thread_position_in_grid.x >> 5;
     uint output = workgroup % uint(OUT);
@@ -71,6 +72,7 @@ constexpr const char* kNint8ZeroMatmul = R"METAL(
 // decoded char4 vectors across every activation row.  Two SIMD groups emit
 // eight output rows per threadgroup.
 constexpr const char* kNint8ZeroSmallM = R"METAL(
+    const int M = x_shape[0];
     constexpr uint K_LANES_VALUE = uint(K_LANES);
     constexpr uint SIMD_GROUPS_VALUE = uint(SIMD_GROUPS);
     constexpr uint OUTPUTS_PER_SIMD = 32u / K_LANES_VALUE;
@@ -208,6 +210,7 @@ constexpr const char* kNint8ZeroGemv = R"METAL(
 )METAL";
 
 constexpr const char* kNint8ZeroGroupedRow = R"METAL(
+    const int M = x_shape[0];
     uint lane = thread_index_in_simdgroup;
     uint workgroup = thread_position_in_grid.x >> 5;
     uint output = workgroup % uint(OUT);
@@ -266,6 +269,8 @@ constexpr const char* kNint8ZeroGroupedRow = R"METAL(
 )METAL";
 
 constexpr const char* kNint8ZeroGroupedRowInverseRope = R"METAL(
+    const int M = x_shape[0];
+    const int TOKENS = cos_values_shape[0];
     uint lane = thread_index_in_simdgroup;
     uint workgroup = thread_position_in_grid.x >> 5;
     uint output = workgroup % uint(OUT);
@@ -356,7 +361,7 @@ constexpr const char* kNint8ZeroGroupedRowInverseRope = R"METAL(
 
 constexpr const char* kNint8ZeroEmbedding = R"METAL(
     uint linear = thread_position_in_grid.x;
-    if (linear >= uint(COUNT * K)) {
+    if (linear >= uint(token_ids_shape[0]) * uint(K)) {
         return;
     }
     uint token_position = linear / uint(K);
@@ -729,7 +734,7 @@ array MlxNint8ZeroWeight::matmul(const array& input) const {
     }
 
     const int tile_rows =
-        rows == 1 ? 1 : (rows <= 16 ? static_cast<int>(rows) : 8);
+        rows <= 6 ? static_cast<int>(rows) : 8;
     const auto row_tiles =
         (rows + tile_rows - 1) / tile_rows;
     const auto* small_m_layout =
@@ -761,7 +766,6 @@ array MlxNint8ZeroWeight::matmul(const array& input) const {
     std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>
         templates{
             {"T", source.dtype()},
-            {"M", static_cast<int>(rows)},
             {"TILE_M", tile_rows},
             {"OUT", output_size_},
             {"K", input_size_},
@@ -851,7 +855,7 @@ array MlxNint8ZeroWeight::grouped_row_matmul(
             }));
 
     const int tile_rows =
-        rows == 1 ? 1 : (rows <= 16 ? static_cast<int>(rows) : 8);
+        rows <= 6 ? static_cast<int>(rows) : 8;
     const auto row_tiles =
         (rows + tile_rows - 1) / tile_rows;
     const auto grid_x =
@@ -864,7 +868,6 @@ array MlxNint8ZeroWeight::grouped_row_matmul(
     std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>
         templates{
             {"T", source.dtype()},
-            {"M", static_cast<int>(rows)},
             {"TILE_M", tile_rows},
             {"GROUP_COUNT", group_count},
             {"OUT_PER_GROUP", out_per_group},
@@ -974,7 +977,7 @@ array MlxNint8ZeroWeight::grouped_row_matmul_inverse_rope(
     sin_values = mlx::core::contiguous(sin_values);
 
     const int tile_rows =
-        rows == 1 ? 1 : (rows <= 16 ? static_cast<int>(rows) : 8);
+        rows <= 6 ? static_cast<int>(rows) : 8;
     const auto row_tiles =
         (rows + tile_rows - 1) / tile_rows;
     const auto grid_x =
@@ -987,9 +990,7 @@ array MlxNint8ZeroWeight::grouped_row_matmul_inverse_rope(
     std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>
         templates{
             {"T", source.dtype()},
-            {"M", static_cast<int>(rows)},
             {"TILE_M", tile_rows},
-            {"TOKENS", tokens},
             {"GROUP_COUNT", group_count},
             {"OUT_PER_GROUP", out_per_group},
             {"OUT", output_size_},
@@ -1056,7 +1057,6 @@ array MlxNint8ZeroWeight::embedding(
     std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>
         templates{
             {"T", dtype},
-            {"COUNT", static_cast<int>(count)},
             {"OUT", output_size_},
             {"K", input_size_},
             {"NG", groups_},

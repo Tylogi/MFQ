@@ -2245,6 +2245,7 @@ std::int32_t MlxDeepseekV4CausalLm::generate_impl(
     const auto prefill_component_started =
         std::chrono::steady_clock::now();
     auto logits = [&]() {
+        mfq::engine::PrefillActivity prefill_activity;
         detail::ScopedComponentProfile component_scope(
             profile_prefill
                 ? &prefill_component_profile

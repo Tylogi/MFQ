@@ -59,6 +59,8 @@ def test_scoped_keys_rotate_revoke_and_never_persist_plaintext(tmp_path: Path) -
             assert (
                 await client.get("/api/v1/models/directories", headers=viewer_header)
             ).status_code == 403
+            assert (await client.post("/api/v1/models/directories/open", headers=viewer_header,
+                json={"directory_id": "0" * 32})).status_code == 403
 
             rotated = await client.post(f"/api/v1/auth/keys/{key_id}/rotate", headers=root)
             assert rotated.status_code == 200

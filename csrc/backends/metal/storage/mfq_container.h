@@ -106,7 +106,7 @@ public:
     // Read-only mmap view used by full-resident model loading. The mapping is
     // released as soon as the parser has copied the record into its final MLX
     // buffers, so record staging never enters the process malloc depot.
-    MfqMappedBytes map_record(const std::string& name) const;
+    MfqMappedBytes map_record(const std::string& name, bool random_access = false) const;
     std::string read_text(const std::string& name) const;
     // Best-effort source cache eviction used by storage benchmarks.
     void drop_source_file_cache() const noexcept;

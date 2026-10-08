@@ -73,6 +73,8 @@ def _runtime_generate_params(payload: dict[str, Any]) -> dict[str, Any]:
     input_: dict[str, Any] = {"messages": payload.get("messages", [])}
     if "mfq_preformatted_prompt" in payload:
         input_["preformatted_prompt"] = payload["mfq_preformatted_prompt"]
+    if "mfq_benchmark_prompt_tokens" in payload:
+        input_["benchmark_prompt_tokens"] = payload["mfq_benchmark_prompt_tokens"]
     sampling = {
         field: payload[field]
         for field in _SAMPLING_FIELDS
@@ -102,6 +104,8 @@ def _runtime_generate_params(payload: dict[str, Any]) -> dict[str, Any]:
         params["session_id"] = payload["mfq_session_id"]
     if "mfq_multimodal" in payload:
         params["media"] = payload["mfq_multimodal"]
+    if "mfq_prefix_cache_enabled" in payload:
+        params["cache"] = {"enabled": payload["mfq_prefix_cache_enabled"]}
     return params
 
 
@@ -196,6 +200,7 @@ class RuntimeClient(Protocol):
     ) -> AbstractAsyncContextManager[AsyncIterator[dict[str, Any] | None]]: ...
 
     async def health(self) -> dict[str, Any]: ...
+    async def score(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
     async def status(self) -> dict[str, Any]: ...
 
@@ -214,6 +219,10 @@ class RuntimeClient(Protocol):
     async def clear_cache(self) -> dict[str, Any]: ...
 
     async def trim_cache(self, target_bytes: int) -> dict[str, Any]: ...
+
+    async def set_cache_budget(self, target_bytes: int, disk_target_bytes: int | None = None) -> dict[str, Any]: ...
+    async def refresh_cache_index(self) -> dict[str, Any]: ...
+    async def set_resident_memory_budget(self, target_bytes: int) -> dict[str, Any]: ...
 
     def realtime_connect(self, *, mode: str = "audio") -> Any: ...
 
@@ -289,6 +298,9 @@ class HttpRuntimeClient:
     async def health(self) -> dict[str, Any]:
         return await self._json_request("GET", "/runtime/health")
 
+    async def score(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._json_request("POST", "/runtime/score", json_body=payload, timeout_seconds=self.long_control_timeout_seconds)
+
     async def status(self) -> dict[str, Any]:
         return await self._json_request("GET", "/runtime/status")
 
@@ -343,6 +355,18 @@ class HttpRuntimeClient:
             "/runtime/cache/trim",
             json_body={"target_bytes": target_bytes},
         )
+
+    async def set_cache_budget(self, target_bytes: int, disk_target_bytes: int | None = None) -> dict[str, Any]:
+        body = {"target_bytes": target_bytes}
+        if disk_target_bytes is not None:
+            body["disk_target_bytes"] = disk_target_bytes
+        return await self._json_request("POST", "/runtime/cache/budget", json_body=body)
+
+    async def refresh_cache_index(self) -> dict[str, Any]:
+        return await self._json_request("POST", "/runtime/cache/refresh", json_body={})
+
+    async def set_resident_memory_budget(self, target_bytes: int) -> dict[str, Any]:
+        return await self._json_request("POST", "/runtime/memory/budget", json_body={"target_bytes": target_bytes})
 
     def realtime_connect(self, *, mode: str = "audio") -> Any:
         import websockets
@@ -557,6 +581,9 @@ class StdioRuntimeClient:
     async def health(self) -> dict[str, Any]:
         return await self._unary("health")
 
+    async def score(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._unary("score", payload, timeout_seconds=self.long_control_timeout_seconds)
+
     async def status(self) -> dict[str, Any]:
         return await self._unary("status")
 
@@ -606,6 +633,18 @@ class StdioRuntimeClient:
 
     async def trim_cache(self, target_bytes: int) -> dict[str, Any]:
         return await self._unary("cache.trim", {"target_bytes": target_bytes})
+
+    async def set_cache_budget(self, target_bytes: int, disk_target_bytes: int | None = None) -> dict[str, Any]:
+        body = {"target_bytes": target_bytes}
+        if disk_target_bytes is not None:
+            body["disk_target_bytes"] = disk_target_bytes
+        return await self._unary("cache.budget", body)
+
+    async def refresh_cache_index(self) -> dict[str, Any]:
+        return await self._unary("cache.refresh", {})
+
+    async def set_resident_memory_budget(self, target_bytes: int) -> dict[str, Any]:
+        return await self._unary("memory.budget", {"target_bytes": target_bytes})
 
     def realtime_connect(self, *, mode: str = "audio") -> Any:
         return _StdioRealtimeConnection(self, mode)

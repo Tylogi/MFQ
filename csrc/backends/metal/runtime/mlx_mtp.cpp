@@ -212,7 +212,7 @@ static_assert(kDepthProbeLength >= kDepthTimingWarmupSamples);
 
 } // namespace
 
-MlxMtpDepthController::MlxMtpDepthController(
+MlxDsparkDepthController::MlxDsparkDepthController(
     int maximum_depth,
     int initial_depth)
     : maximum_depth_(std::clamp(maximum_depth, 1, 5)),
@@ -254,7 +254,7 @@ MlxMtpDepthController::MlxMtpDepthController(
     warmup_.insert(warmup_.end(), {0, 0, 0});
 }
 
-void MlxMtpDepthController::observe(
+void MlxDsparkDepthController::observe(
     int used_depth,
     int accepted_drafts,
     double cycle_ms,
@@ -342,7 +342,7 @@ void MlxMtpDepthController::observe(
     }
 }
 
-double MlxMtpDepthController::conditional_acceptance(
+double MlxDsparkDepthController::conditional_acceptance(
     int position) const {
     if (position < 0 || position >= maximum_depth_) {
         throw std::out_of_range("MTP acceptance position is out of range");
@@ -350,7 +350,7 @@ double MlxMtpDepthController::conditional_acceptance(
     return acceptance_[static_cast<std::size_t>(position)];
 }
 
-std::optional<double> MlxMtpDepthController::measured_cycle_ms(
+std::optional<double> MlxDsparkDepthController::measured_cycle_ms(
     int depth) const {
     if (depth < 0 || depth > maximum_depth_) {
         throw std::out_of_range("MTP measured depth is out of range");
@@ -358,7 +358,7 @@ std::optional<double> MlxMtpDepthController::measured_cycle_ms(
     return cycle_ms_[static_cast<std::size_t>(depth)];
 }
 
-void MlxMtpDepthController::update_time(
+void MlxDsparkDepthController::update_time(
     int depth,
     double cycle_ms) {
     const auto index = static_cast<std::size_t>(depth);
@@ -387,7 +387,7 @@ void MlxMtpDepthController::update_time(
     *estimate = (1.0 - alpha) * *estimate + alpha * cycle_ms;
 }
 
-double MlxMtpDepthController::marginal_estimate() const {
+double MlxDsparkDepthController::marginal_estimate() const {
     int low = -1;
     int high = -1;
     for (int depth = 0; depth <= maximum_depth_; ++depth) {
@@ -409,7 +409,7 @@ double MlxMtpDepthController::marginal_estimate() const {
     return kDepthMarginalMs;
 }
 
-double MlxMtpDepthController::time_estimate(int depth) const {
+double MlxDsparkDepthController::time_estimate(int depth) const {
     if (cycle_ms_[static_cast<std::size_t>(depth)]) {
         return *cycle_ms_[static_cast<std::size_t>(depth)];
     }
@@ -439,7 +439,7 @@ double MlxMtpDepthController::time_estimate(int depth) const {
             marginal_estimate() * (depth - reference));
 }
 
-double MlxMtpDepthController::score(int depth) const {
+double MlxDsparkDepthController::score(int depth) const {
     double expected = 1.0;
     double run = 1.0;
     for (int position = 0; position < depth; ++position) {
@@ -449,7 +449,7 @@ double MlxMtpDepthController::score(int depth) const {
     return expected / std::max(1.0e-6, time_estimate(depth));
 }
 
-int MlxMtpDepthController::best_depth() const {
+int MlxDsparkDepthController::best_depth() const {
     int best = current_depth_;
     double best_score = -1.0;
     const int start = cycle_ms_.front() ? 0 : 1;
@@ -467,7 +467,7 @@ int MlxMtpDepthController::best_depth() const {
     return best;
 }
 
-std::optional<int> MlxMtpDepthController::best_rival() const {
+std::optional<int> MlxDsparkDepthController::best_rival() const {
     const double current_score = score(current_depth_);
     std::optional<int> rival;
     double rival_score = 0.0;
@@ -494,7 +494,7 @@ std::optional<int> MlxMtpDepthController::best_rival() const {
         : std::nullopt;
 }
 
-std::optional<int> MlxMtpDepthController::most_stale() const {
+std::optional<int> MlxDsparkDepthController::most_stale() const {
     std::optional<int> result;
     double oldest = -1.0;
     const auto consider = [&](int depth) {
@@ -867,9 +867,7 @@ std::int32_t run_mlx_mtp_generation(
         !request.sampling.greedy() && request.sampling.top_k > 0 &&
         request.sampling.top_k <= 128;
     MlxSamplingParams draft_sampling = request.sampling;
-    if (compact_stochastic) {
-        // The proposal may be sharper than the target distribution because
-        // exact p/q verification preserves the target sampler.
+    if (compact_stochastic && callbacks.predictor.dspark) {
         draft_sampling.temperature = 0.6;
         draft_sampling.top_p = 0.95;
     }
@@ -879,7 +877,8 @@ std::int32_t run_mlx_mtp_generation(
         : std::min(
               callbacks.predictor.maximum_depth,
               std::clamp(request.sampling.mtp_max_draft_tokens, 1, 5));
-    MlxMtpDepthController depth_controller(maximum_depth, 2);
+    mfq::engine::mtp::GenerationPolicy<MlxDsparkDepthController> depth_controller(
+        maximum_depth, callbacks.predictor.dspark, callbacks.policy_state);
 
     auto pending = sample_token(
         request.initial_logits, counts, request.token_constraint);
@@ -901,6 +900,7 @@ std::int32_t run_mlx_mtp_generation(
             ? std::clamp(callbacks.draft_limit(callbacks.target_cache_position(), depth), 0, depth)
             : depth;
     };
+    bool time_sample = true;
     MlxMtpDraftContext initial_context{
         true,
         pending,
@@ -909,6 +909,7 @@ std::int32_t run_mlx_mtp_generation(
         0,
         nullptr,
         {},
+        &time_sample,
     };
     const bool profile_phases = mtp_phase_profile_requested();
     const auto initial_draft_started = std::chrono::steady_clock::now();
@@ -934,6 +935,37 @@ std::int32_t run_mlx_mtp_generation(
 
     while (generated < request.generation_limit) {
         const int cycle_cache_start = callbacks.target_cache_position();
+        if (depth_controller.parked()) {
+            auto target = callbacks.decode_target
+                ? callbacks.decode_target(pending)
+                : callbacks.verify_target(pending, draft.tokens, 0);
+            const auto next = sample_token(target.logits, counts, constraint_cursor);
+            if (constraint_cursor) constraint_cursor->accept(next);
+            if (callbacks.committed_target) {
+                callbacks.committed_target(MlxMtpDraftContext{
+                    false, pending, 0, cycle_cache_start, 0, &target.hidden, {}});
+            }
+            ++stats.standard_tokens;
+            if (!emit(next)) return generated;
+            depth_controller.observe_plain(std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now()-cycle_started).count(), time_sample);
+            stats.selected_depth = depth_controller.depth();
+            stats.reentry_probes = depth_controller.reentries();
+            pending = next;
+            const std::array<std::int32_t, 1> next_ids{pending};
+            MlxMtpDraftContext context{
+                false, pending, bounded_depth(depth_controller.depth()),
+                cycle_cache_start, 0, &target.hidden, next_ids, &time_sample};
+            time_sample = true;
+            cycle_started = std::chrono::steady_clock::now();
+            if (context.requested_depth == 0) {
+                callbacks.prepare_draft(context, {});
+            } else {
+                draft = prepare_mtp_draft(context, request, callbacks, sampler, counts,
+                    compact_stochastic, draft_sampling);
+            }
+            continue;
+        }
         const int draft_count = draft.depth;
         const auto target_started = std::chrono::steady_clock::now();
         detail::ComponentProfile target_profile;
@@ -1172,8 +1204,9 @@ std::int32_t run_mlx_mtp_generation(
                 << " cycle_ms=" << cycle_ms
                 << '\n';
         }
-        depth_controller.observe(draft_count, accepted, cycle_ms);
+        depth_controller.observe(draft_count, accepted, cycle_ms, time_sample);
         stats.selected_depth = depth_controller.depth();
+        stats.park_count = depth_controller.parks();
         for (int depth = 0; depth <= depth_controller.maximum_depth(); ++depth) {
             const auto measured = depth_controller.measured_cycle_ms(depth);
             if (measured) {
@@ -1196,7 +1229,9 @@ std::int32_t run_mlx_mtp_generation(
             accepted,
             &target.hidden,
             std::span<const std::int32_t>(next_ids),
+            &time_sample,
         };
+        time_sample = true;
         const auto draft_started = std::chrono::steady_clock::now();
         cycle_started = draft_started;
         draft = prepare_mtp_draft(

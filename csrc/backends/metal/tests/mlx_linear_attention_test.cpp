@@ -1,5 +1,6 @@
 #include "mlx_linear_attention.h"
 
+#include <algorithm>
 #include <cmath>
 #include <chrono>
 #include <cstddef>
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include <mlx/mlx.h>
+#include <mlx/fast_primitives.h>
 
 namespace {
 
@@ -108,7 +110,7 @@ void test_gdn_gates() {
     for (const auto alpha_type : {float16, bfloat16, float32}) {
         for (const auto beta_type : {float16, bfloat16, float32}) {
             for (const auto weight_type : {float16, bfloat16, float32}) {
-                for (const int tokens : {1, 7}) {
+                for (const int tokens : {1, 7, 30, 54}) {
                     constexpr int batch = 2;
                     constexpr int heads = 17;
                     const Shape shape{batch, tokens, heads};
@@ -189,6 +191,119 @@ void benchmark_gdn_gates() {
         std::cout << "gdn_gates pair=" << pair << " reference_ms=" << times[0]
                   << " fused_ms=" << times[1] << '\n';
     }
+}
+
+void test_linear_conv_prefill(int value_dim = 47, int layout = 0) {
+    using namespace mlx::core;
+    constexpr int key_heads = 3, value_heads = 6, key_dim = 33, taps = 4;
+    constexpr int qk_width = 2 * key_heads * key_dim;
+    const int value_width = value_heads * value_dim;
+    const int channels = qk_width + value_width;
+    for (int batch : {1, 2}) {
+        for (int tokens : {1, 7, 30, 54, 63, 64, 65}) {
+            for (auto dtype : {float16, float32}) {
+                auto qk = astype(patterned_bfloat(batch * tokens * qk_width,
+                    Shape{batch, tokens, qk_width}, 37, 1.0f / 257.0f), dtype);
+                auto value = astype(patterned_bfloat(batch * tokens * value_width,
+                    Shape{batch, tokens, value_width}, 43, 1.0f / 257.0f), dtype);
+                if (layout == 1) {
+                    auto joined = concatenate({zeros(Shape{batch, tokens, 4}, dtype), qk, value}, -1);
+                    joined = concatenate({zeros(Shape{batch, 1, channels + 4}, dtype),
+                        joined, zeros(Shape{batch, 1, channels + 4}, dtype)}, 1);
+                    qk = slice(joined, Shape{0, 1, 4}, Shape{batch, tokens + 1, 4 + qk_width});
+                    value = slice(joined, Shape{0, 1, 4 + qk_width},
+                        Shape{batch, tokens + 1, 4 + channels});
+                } else if (layout == 2) {
+                    qk = transpose(contiguous(transpose(qk, {0, 2, 1})), {0, 2, 1});
+                    value = transpose(contiguous(transpose(value, {0, 2, 1})), {0, 2, 1});
+                } else if (layout == 3) {
+                    qk = broadcast_to(slice(qk, Shape{0, 0, 0}, Shape{1, 1, qk_width}), qk.shape());
+                    value = broadcast_to(slice(value, Shape{0, 0, 0}, Shape{1, 1, value_width}), value.shape());
+                }
+                auto state = astype(patterned_bfloat(batch * (taps - 1) * channels,
+                    Shape{batch, taps - 1, channels}, 17, 1.0f / 511.0f), float32);
+                auto weight = astype(patterned_bfloat(channels * taps,
+                    Shape{channels, taps}, 19, 1.0f / 1021.0f), float32);
+                auto bias = astype(patterned_bfloat(channels,
+                    Shape{channels}, 23, 1.0f / 2047.0f), float32);
+                auto input = concatenate({state, concatenate(
+                    {astype(qk, float32), astype(value, float32)}, -1)}, 1);
+                auto expected = mfq::metal::ssm_conv_silu(input, weight, tokens, bias);
+                const auto normalized = [&](int begin, int end) {
+                    auto rows = reshape(slice(expected, Shape{0, 0, begin},
+                        Shape{batch, tokens, end}), Shape{batch, tokens, key_heads, key_dim});
+                    rows = rows / maximum(sqrt(sum(rows * rows, -1, true)), array(1e-6f));
+                    return contiguous(transpose(rows, {0, 2, 1, 3}));
+                };
+                auto expected_query = normalized(0, qk_width / 2);
+                auto expected_key = normalized(qk_width / 2, qk_width);
+                auto expected_value = contiguous(transpose(reshape(slice(expected,
+                    Shape{0, 0, qk_width}, Shape{batch, tokens, channels}),
+                    Shape{batch, tokens, value_heads, value_dim}), {0, 2, 1, 3}));
+                auto expected_state = contiguous(slice(input, Shape{0, tokens, 0},
+                    Shape{batch, tokens + taps - 1, channels}));
+                auto actual = mfq::metal::linear_conv_qkv(state, qk, value, weight,
+                    key_heads, value_heads, key_dim, value_dim, bias, 1e-6f);
+                const auto compare = [&](array actual_value, array expected_value, const char* name) {
+                    eval(actual_value, expected_value);
+                    require_vector_close(actual_value.data<float>(),
+                        std::vector<float>(expected_value.data<float>(),
+                            expected_value.data<float>() + expected_value.size()), 2e-5f, name);
+                };
+                compare(actual.query, expected_query, "prefill convolution query");
+                compare(actual.key, expected_key, "prefill convolution key");
+                compare(actual.value, expected_value, "prefill convolution value");
+                compare(actual.state, expected_state, "prefill convolution state");
+            }
+        }
+    }
+}
+
+void test_gdn_output_norm() {
+    using namespace mlx::core;
+    for (int dimension : {32, 64, 128}) {
+        for (int tokens : {1, 7, 30, 54, 65}) {
+            constexpr int batch = 2, heads = 3;
+            auto recurrent = astype(patterned_bfloat(
+                batch * heads * tokens * dimension,
+                Shape{batch, heads, tokens, dimension}, 37, 1.0f / 97.0f), float32);
+            auto weight = astype(patterned_bfloat(
+                dimension, Shape{dimension}, 17, 1.0f / 511.0f), float32) + array(1.0f);
+            for (auto dtype : {float16, bfloat16, float32}) {
+                auto gate = astype(patterned_bfloat(batch * heads * tokens * dimension,
+                    Shape{batch, tokens, heads * dimension}, 43, 1.0f / 193.0f), dtype);
+                for (bool silu_gate : {false, true}) {
+                    constexpr float eps = 3e-5f;
+                    auto activation = astype(transpose(
+                        reshape(gate, Shape{batch, tokens, heads, dimension}),
+                        {0, 2, 1, 3}), float32);
+                    activation = silu_gate ? activation * sigmoid(activation) : sigmoid(activation);
+                    auto expected = astype(reshape(transpose(
+                        fast::rms_norm(recurrent, std::optional<array>(weight), eps) * activation,
+                        {0, 2, 1, 3}), gate.shape()), dtype);
+                    auto actual = mfq::metal::gated_delta_output_norm(
+                        recurrent, gate, weight, eps, silu_gate, dtype);
+                    if (actual.dtype() != dtype || actual.shape() != gate.shape())
+                        throw std::runtime_error("GDN output norm shape/dtype mismatch");
+                    actual = astype(actual, float32);
+                    expected = astype(expected, float32);
+                    eval(actual, expected);
+                    require_vector_close(actual.data<float>(),
+                        std::vector<float>(expected.data<float>(), expected.data<float>() + expected.size()),
+                        dtype == bfloat16 ? 8e-3f : dtype == float16 ? 1e-3f : 3e-6f,
+                        "GDN fused output norm");
+                }
+            }
+        }
+    }
+    bool rejected = false;
+    try {
+        mfq::metal::gated_delta_output_norm(zeros(Shape{1, 1, 7, 128}),
+            zeros(Shape{1, 7, 127}), ones(Shape{128}), 1e-6f, true, float16);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    if (!rejected) throw std::runtime_error("GDN output norm accepted mismatched gate");
 }
 
 void test_gdn_decode_step(
@@ -376,12 +491,11 @@ void test_gdn_decode_step(
     }
 }
 
-void test_blocked_gdn_prefill(bool tiled_heads) {
+void test_blocked_gdn_prefill(bool tiled_heads, int tokens) {
     using namespace mlx::core;
     constexpr int batch = 1;
     constexpr int query_heads = 2;
     constexpr int value_heads = 4;
-    constexpr int tokens = 67;
     constexpr int dimension = 128;
     const std::size_t query_size =
         batch * query_heads * tokens * dimension;
@@ -507,7 +621,7 @@ void test_gdn_state_only() {
         return array(values.begin(), shape, float32);
     };
     for (const int dimension : {32, 64, 128}) {
-        for (const int tokens : {0, 1, 2, 3, 4, 5, 6, 67}) {
+        for (const int tokens : {0, 1, 2, 3, 4, 5, 6, 30, 54, 63, 64, 67}) {
             const Shape key_shape{2, 2, tokens, dimension};
             const Shape value_shape{2, 4, tokens, dimension};
             auto query = input(key_shape, 13, 0.0015f);
@@ -542,6 +656,57 @@ void test_gdn_state_only() {
     auto matches = all(equal(actual, expected.state));
     eval(matches);
     if (!matches.item<bool>()) throw std::runtime_error("state-only GDN zero-initialized state differs");
+}
+
+void test_runtime_token_kernel_reuse() {
+    using namespace mlx::core;
+    using Signature = std::optional<std::pair<std::string, std::string>>;
+    Signature gates_signature, norm_signature, ssm_signature;
+    Signature recurrent_signatures[2], conv_signatures[2];
+    const auto check = [](const array& value, Signature& expected, const char* name) {
+        const auto& primitive = value.primitive();
+        if (std::string(primitive.name()) != "CustomKernel")
+            throw std::runtime_error(std::string(name) + " is not a custom kernel");
+        const auto state = static_cast<const fast::CustomKernel&>(primitive).state();
+        const auto actual = std::make_pair(std::get<0>(state), std::get<1>(state));
+        if (expected && actual != *expected) {
+            const auto common = std::mismatch(expected->second.begin(), expected->second.end(),
+                actual.second.begin(), actual.second.end());
+            const auto offset = static_cast<std::size_t>(common.first - expected->second.begin());
+            throw std::runtime_error(std::string(name) + " specializes the token length: " +
+                expected->first + " / " + actual.first + " source=" +
+                expected->second.substr(offset, 180) + " / " + actual.second.substr(offset, 180));
+        }
+        expected = actual;
+    };
+    constexpr int key_heads = 2, value_heads = 4, dimension = 128, channels = 1024;
+    const auto weight = full(Shape{channels, 3}, 0.01f);
+    const auto convolution = zeros(Shape{1, 2, channels});
+    const auto initial = zeros(Shape{1, value_heads, dimension, dimension});
+    const auto bias = zeros(Shape{value_heads});
+    const auto decay = full(Shape{value_heads}, -0.01f);
+    const auto norm_weight = full(Shape{dimension}, 1.0f);
+    for (const int tokens : {7, 30, 31, 53, 54, 63, 64, 65, 97, 129}) {
+        const auto alpha = full(Shape{1, tokens, value_heads}, 0.02f);
+        const auto beta = full(Shape{1, tokens, value_heads}, 0.03f);
+        auto gates = mfq::metal::gated_delta_gates(alpha, beta, bias, decay);
+        check(gates.gate, gates_signature, "GDN gates");
+        const auto qk = full(Shape{1, tokens, 2 * key_heads * dimension}, 0.004f);
+        const auto value = full(Shape{1, tokens, value_heads * dimension}, 0.005f);
+        auto convolved = mfq::metal::linear_conv_qkv(convolution, qk, value, weight,
+            key_heads, value_heads, dimension, dimension);
+        check(convolved.query, conv_signatures[tokens >= 64], "GDN convolution");
+        auto recurrent = mfq::metal::gated_delta_net(convolved.query, convolved.key,
+            convolved.value, gates.gate, gates.beta, initial, true);
+        check(recurrent.output, recurrent_signatures[tokens >= 64], "GDN recurrent");
+        auto normalized = mfq::metal::gated_delta_output_norm(recurrent.output,
+            value, norm_weight, 1e-5f, false, float32);
+        check(normalized, norm_signature, "GDN output norm");
+        const auto input = full(Shape{1, tokens + 2, channels}, 0.01f);
+        auto ssm = mfq::metal::ssm_conv_silu(input, weight, tokens);
+        check(ssm, ssm_signature, "SSM convolution");
+        eval(normalized, recurrent.state, convolved.state, ssm);
+    }
 }
 
 void test_cached_depthwise_dilated_decode() {
@@ -615,6 +780,16 @@ int main(int argc, char** argv) {
         using namespace mlx::core;
 
         test_gdn_gates();
+        test_runtime_token_kernel_reuse();
+        test_gdn_output_norm();
+        test_linear_conv_prefill();
+        test_linear_conv_prefill(48);
+        test_linear_conv_prefill(128);
+        test_linear_conv_prefill(47, 1);
+        test_linear_conv_prefill(48, 1);
+        test_linear_conv_prefill(128, 1);
+        test_linear_conv_prefill(47, 2);
+        test_linear_conv_prefill(47, 3);
         test_gdn_decode_step(1, 2, float16, float16);
         test_gdn_decode_step(16, 48, float16, float32);
         test_gdn_decode_step(16, 48, float16, bfloat16);
@@ -625,8 +800,10 @@ int main(int argc, char** argv) {
             return 0;
         }
         test_cached_depthwise_dilated_decode();
-        test_blocked_gdn_prefill(false);
-        test_blocked_gdn_prefill(true);
+        for (int tokens : {64, 65, 67, 72, 129}) {
+            test_blocked_gdn_prefill(false, tokens);
+            test_blocked_gdn_prefill(true, tokens);
+        }
         test_gdn_state_only();
 
         const array conv_input(

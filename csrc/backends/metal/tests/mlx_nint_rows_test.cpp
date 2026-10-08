@@ -8,7 +8,11 @@
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <string>
+#include <tuple>
 #include <vector>
+
+#include <mlx/fast_primitives.h>
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -121,6 +125,17 @@ void test_mixed_rows(int width, int gs, int nominal_k, bool adaptive) {
     for (int row = 0; row < 32; ++row) ids.push_back(row);
     mfq::metal::MlxNintRowBatch batch;
     for (auto row : ids) table.append_row(row, batch);
+    mfq::metal::MlxNintRowBatch merged;
+    for (auto row : ids) {
+        mfq::metal::MlxNintRowBatch part;
+        table.append_row(row, part);
+        merged.append_batch(part);
+    }
+    require(merged.packed() == batch.packed() && merged.descriptors() == batch.descriptors() &&
+        merged.source_bytes_read() == batch.source_bytes_read() && merged.width() == batch.width(),
+        "independent NINT rows changed when merged");
+    require_rejected([&] { merged.append_batch(merged); });
+    require_rejected([&] { merged.append_batch(mfq::metal::MlxNintRowBatch{}); });
     require(batch.source_bytes_read() < data.blob.size(), "row lookup read a full table");
     for (auto dtype : {mlx::core::float16, mlx::core::float32}) {
         auto actual = mlx::core::astype(batch.decode(dtype), mlx::core::float32);
@@ -164,6 +179,41 @@ void test_cross_table_batch() {
     const auto wrong = fixture(10, 53, 5, 6);
     const mfq::metal::MlxMappedNintRows wrong_width(wrong.blob);
     require_rejected([&] { wrong_width.append_row(0, batch); });
+}
+
+void test_runtime_row_count() {
+    using namespace mlx::core;
+    const auto data = fixture(529, 160, 24, 6);
+    const mfq::metal::MlxMappedNintRows table(data.blob);
+    for (const auto dtype : {float16, float32}) {
+        std::string name, source;
+        for (const int tokens : {1, 2, 7, 21, 25, 27, 30, 33, 36, 43, 47, 54, 69, 85, 129}) {
+            mfq::metal::MlxNintRowBatch batch;
+            const int rows = tokens * 16;
+            for (int row = 0; row < rows; ++row) table.append_row((row * 37) % 529, batch);
+            auto result = batch.decode(dtype);
+            require(std::string(result.primitive().name()) == "CustomKernel",
+                "mapped row decode primitive changed");
+            const auto state = static_cast<const fast::CustomKernel&>(result.primitive()).state();
+            if (name.empty()) {
+                name = std::get<0>(state);
+                source = std::get<1>(state);
+            } else {
+                require(name == std::get<0>(state) && source == std::get<1>(state),
+                    "PLE token count changed mapped-row kernel source or name");
+            }
+            auto actual = astype(result, float32);
+            actual.eval();
+            for (int row = 0; row < rows; ++row) {
+                for (int column = 0; column < 160; ++column) {
+                    float expected = data.reference[((row * 37) % 529) * 160 + column];
+                    if (dtype == float16) expected = static_cast<float>(float16_t(expected));
+                    require(actual.data<float>()[row * 160 + column] == expected,
+                        "runtime row-count decode differs from scalar reference");
+                }
+            }
+        }
+    }
 }
 
 void test_fractional_and_subnormal_anchors() {
@@ -409,6 +459,7 @@ int main(int argc, char** argv) {
         }
         test_mixed_rows(53, 5, 6, false);
         test_cross_table_batch();
+        test_runtime_row_count();
         test_fractional_and_subnormal_anchors();
         test_invalid_blobs();
         test_production_geometry_page_guards();

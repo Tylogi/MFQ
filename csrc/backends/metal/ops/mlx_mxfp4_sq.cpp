@@ -166,6 +166,7 @@ constexpr const char* kSqDequantize = R"METAL(
 // weights are reused across TILE_M input rows; the eight row states are cached
 // once per output rather than reread for every block.
 constexpr const char* kSqMatmul = R"METAL(
+    const int M = ROUTED != 0 ? expert_ids_shape[0] * ROUTES : x_shape[0];
     constexpr uint K_LANES_VALUE = uint(K_LANES);
     constexpr uint SIMD_GROUPS_VALUE = uint(SIMD_GROUPS);
     constexpr uint THREADS = SIMD_GROUPS_VALUE * 32u;
@@ -1010,15 +1011,13 @@ array MlxMxfp4SqWeight::matmul(const array& input) const {
     const int row_tiles = first_bucket
         ? 1
         : (static_cast<int>(rows) + 7) / 8;
-    const int tile_rows =
-        (static_cast<int>(rows) + row_tiles - 1) / row_tiles;
+    const int tile_rows = first_bucket ? static_cast<int>(rows) : 8;
     const int outputs_per_threadgroup =
         simd_groups * 32 / k_lanes;
     const int output_tiles =
         (output_size() + outputs_per_threadgroup - 1) /
         outputs_per_threadgroup;
     auto arguments = templates(*this, source.dtype());
-    arguments.emplace_back("M", static_cast<int>(rows));
     arguments.emplace_back("TILE_M", tile_rows);
     arguments.emplace_back("K_LANES", k_lanes);
     arguments.emplace_back("SIMD_GROUPS", simd_groups);
@@ -1126,8 +1125,7 @@ std::vector<array> MlxMxfp4SqWeight::projection_group_matmul(
     const int row_tiles = first_bucket
         ? 1
         : (static_cast<int>(rows) + 7) / 8;
-    const int tile_rows =
-        (static_cast<int>(rows) + row_tiles - 1) / row_tiles;
+    const int tile_rows = first_bucket ? static_cast<int>(rows) : 8;
     const int outputs_per_threadgroup =
         simd_groups * 32 / k_lanes;
 
@@ -1139,7 +1137,6 @@ std::vector<array> MlxMxfp4SqWeight::projection_group_matmul(
     inputs.reserve(weights.size() * 4 + 4);
     std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> arguments{
         {"T", source.dtype()},
-        {"M", checked_int(rows, "projection-group row count")},
         {"TILE_M", tile_rows},
         {"K", input_size},
         {"K_LANES", k_lanes},
@@ -1278,7 +1275,6 @@ array MlxMxfp4SqWeight::routed_matmul(
         (out_per_expert + kOutputsPerThreadgroup - 1) /
         kOutputsPerThreadgroup;
     auto arguments = templates(*this, source.dtype());
-    arguments.emplace_back("M", static_cast<int>(route_count));
     arguments.emplace_back("TILE_M", 1);
     arguments.emplace_back("K_LANES", kLanes);
     arguments.emplace_back("SIMD_GROUPS", kSimdGroups);

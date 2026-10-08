@@ -78,6 +78,29 @@ describe('SSE 传输', () => {
     expect(response.body?.locked).toBe(false);
   });
 
+  it('stops dispatching the current byte chunk when an event callback cancels the subscription', async () => {
+    const abort = new AbortController();
+    const response = eventResponse('data: {"sequence":1}\n\ndata: {"sequence":2}\n\n');
+    const events: unknown[] = [];
+    await expect(readEventStream(response, (event) => {
+      events.push(event);
+      abort.abort(new Error('subscription ended'));
+    }, abort.signal)).rejects.toThrow('subscription ended');
+    expect(events).toEqual([{ sequence: 1 }]);
+    expect(response.body?.locked).toBe(false);
+  });
+
+  it('cancels the stream and releases its reader when the event callback fails', async () => {
+    const cancel = vi.fn();
+    const response = new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new TextEncoder().encode('data: {"sequence":1}\n\n')); },
+      cancel,
+    }), { headers: { 'content-type': 'text/event-stream' } });
+    await expect(readEventStream(response, () => { throw new Error('callback failed'); })).rejects.toThrow('callback failed');
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(response.body?.locked).toBe(false);
+  });
+
   it('拒绝非 SSE 响应', async () => {
     await expect(readEventStream(new Response('{}'), vi.fn())).rejects.toThrow(
       'invalid streaming response',

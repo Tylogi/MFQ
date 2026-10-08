@@ -8,14 +8,17 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <numbers>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 #include <mlx/mlx.h>
+#include <mlx/fast_primitives.h>
 
 namespace {
 
@@ -57,6 +60,78 @@ std::vector<std::int32_t> integers(array value) {
         value.data<std::int32_t>(),
         value.data<std::int32_t>() + value.size(),
     };
+}
+
+void test_runtime_row_kernel_reuse() {
+    std::map<std::string, std::pair<std::string, std::string>> signatures;
+    const auto check = [&](const std::string& label, array value) {
+        const auto& primitive = value.primitive();
+        require(std::string(primitive.name()) == "CustomKernel",
+            label + " must use a custom kernel");
+        const auto state = static_cast<const mlx::core::fast::CustomKernel&>(
+            primitive).state();
+        const auto signature = std::pair{std::get<0>(state), std::get<1>(state)};
+        const auto [entry, inserted] = signatures.emplace(label, signature);
+        if (!inserted && entry->second != signature) {
+            const auto mismatch = std::mismatch(entry->second.second.begin(),
+                entry->second.second.end(), signature.second.begin(), signature.second.end());
+            const auto offset = static_cast<std::size_t>(
+                mismatch.first - entry->second.second.begin());
+            throw std::runtime_error(label + " recompiles for a different row count: "
+                + entry->second.first + " vs " + signature.first + " source: "
+                + entry->second.second.substr(offset, 100) + " vs "
+                + signature.second.substr(std::min(offset, signature.second.size()), 100));
+        }
+        value.eval();
+    };
+    constexpr int experts = 32;
+    constexpr int routes = 6;
+    constexpr int width = 64;
+    for (const int tokens : {7, 25, 30, 31, 45, 53, 54, 63, 64, 65, 97, 129}) {
+        const auto logits = mlx::core::zeros(Shape{tokens, experts});
+        const auto selected = mfq::metal::moe_topk(logits, routes);
+        check("topk ids", selected.ids);
+        const auto weights = mfq::metal::moe_sqrtsoftplus_weights(
+            logits, selected.ids);
+        check("sqrt-softplus", weights);
+        const auto available = mlx::core::ones(Shape{experts}, mlx::core::bool_);
+        check("repair ids", mfq::metal::moe_repair_hash_ids(
+            selected.ids, selected.ids, available));
+        const auto pairs = mlx::core::full(Shape{tokens, routes, width}, 0.25f);
+        const auto shared = mlx::core::full(Shape{tokens, width}, 0.5f);
+        const auto gates = mlx::core::zeros(Shape{tokens});
+        const std::string gate_binding = tokens <= 16 ? " inline gates" : "";
+        const auto reduced = mfq::metal::moe_weighted_reduce(pairs, weights);
+        check("reduce", reduced);
+        check("shared gate" + gate_binding, mfq::metal::moe_add_shared_gate(
+            reduced, shared, gates));
+        const auto fused = mfq::metal::moe_weighted_reduce_shared_gate(
+            pairs, weights, shared, gates);
+        check("reduce shared gate" + gate_binding, fused);
+        for (const float value : floats(fused)) {
+            require_close(value, 0.5f);
+        }
+        const auto order = mlx::core::arange(tokens * routes, mlx::core::int32);
+        const auto inverse = mfq::metal::moe_inverse_permutation(order);
+        check("inverse permutation", inverse);
+        const auto sorted_pairs = mlx::core::reshape(
+            pairs, Shape{tokens * routes, width});
+        check("sorted reduce", mfq::metal::moe_weighted_reduce_sorted(
+            sorted_pairs, inverse, weights));
+        check("sorted reduce shared gate" + gate_binding,
+            mfq::metal::moe_weighted_reduce_shared_gate_sorted(
+                sorted_pairs, inverse, weights, shared, gates));
+        const auto gate_up = mlx::core::zeros(Shape{tokens, 2, 2 * width});
+        const auto split = mfq::metal::moe_swiglu_split(gate_up);
+        check("split swiglu", split);
+        require(split.shape() == Shape{tokens, 2, width},
+            "runtime GLU must preserve leading dimensions");
+        check("split geglu", mfq::metal::moe_geglu_split(gate_up));
+        const auto gate = mlx::core::zeros(Shape{tokens, 2, width});
+        check("paired swiglu", mfq::metal::moe_swiglu_pair(gate, gate));
+        check("expert scale", mfq::metal::moe_apply_expert_scale(
+            weights, selected.ids, mlx::core::ones(Shape{experts})));
+    }
 }
 
 std::vector<int> stable_top_k(
@@ -391,6 +466,55 @@ void test_softmax_topk_normalization_parameters() {
                             "parameterized Top-K selected wrong expert");
                     require_close(weights[index],
                         std::exp(logits[ids[index]]) / total / 2.0f * 1.5f);
+                }
+            }
+        }
+    }
+}
+
+void test_prefill_softmax_topk_shared_reuse() {
+    constexpr int experts = 512;
+    constexpr int top_k = 10;
+    for (const auto dtype : {
+             mlx::core::float16, mlx::core::bfloat16, mlx::core::float32}) {
+        for (const int rows : {4096, 8192}) {
+            std::vector<float> logits(rows * experts);
+            std::uint32_t random = 123456789;
+            for (auto& value : logits) {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                value = static_cast<float>(int(random & 255u) - 128);
+            }
+            auto source = mlx::core::astype(
+                array(logits.begin(), Shape{rows, experts}), dtype);
+            std::vector<int> expected(rows * top_k);
+            std::vector<float> expected_weights(rows * top_k);
+            for (int row = 0; row < rows; ++row) {
+                const std::vector<float> values(
+                    logits.begin() + row * experts,
+                    logits.begin() + (row + 1) * experts);
+                const auto selected = stable_top_k(values, top_k);
+                float denominator = 0.0f;
+                for (const int expert : selected) {
+                    denominator += std::exp(
+                        values[expert] - values[selected.front()]);
+                }
+                for (int rank = 0; rank < top_k; ++rank) {
+                    expected[row * top_k + rank] = selected[rank];
+                    expected_weights[row * top_k + rank] = std::exp(
+                        values[selected[rank]] - values[selected.front()]) / denominator;
+                }
+            }
+            for (int repeat = 0; repeat < 6; ++repeat) {
+                auto result = mfq::metal::moe_topk(
+                    source, top_k, false, false, true);
+                const auto ids = integers(result.ids);
+                const auto weights = floats(result.weights);
+                for (std::size_t index = 0; index < expected.size(); ++index) {
+                    require(ids[index] == expected[index],
+                            "prefill Top-K shared reduction reuse changed expert selection");
+                    require_close(weights[index], expected_weights[index], 1e-6f);
                 }
             }
         }
@@ -1155,6 +1279,9 @@ void test_glu_and_expert_scale() {
         array(values.begin(), Shape{2, 6}),
         mlx::core::float16);
     auto swiglu = mfq::metal::moe_swiglu_split(input);
+    auto paired_swiglu = mfq::metal::moe_swiglu_pair(
+        mlx::core::slice(input, {0, 0}, {2, 3}),
+        mlx::core::slice(input, {0, 3}, {2, 6}));
     constexpr float swiglu_limit = 0.6f;
     auto limited_swiglu =
         mfq::metal::moe_limited_swiglu_split(
@@ -1187,6 +1314,10 @@ void test_glu_and_expert_scale() {
             geglu.dtype() == mlx::core::float16,
         "GLU split shape or dtype mismatch");
     const auto swiglu_values = floats(swiglu);
+    const auto paired_swiglu_values = floats(paired_swiglu);
+    for (std::size_t index = 0; index < swiglu_values.size(); ++index) {
+        require_close(paired_swiglu_values[index], swiglu_values[index], 1e-6f);
+    }
     const auto limited_swiglu_values =
         floats(limited_swiglu);
     const auto paired_limited_values =
@@ -1282,12 +1413,14 @@ int main() {
         test_single_row_softmax_topk();
         test_small_m_softmax_topk();
         test_softmax_topk_normalization_parameters();
+        test_prefill_softmax_topk_shared_reuse();
         test_fused_dense_router_topk();
         test_fused_dense_hash_router();
         test_sqrtsoftplus_weights();
         test_hash_id_repair();
         test_reduce_and_shared_gate();
         test_glu_and_expert_scale();
+        test_runtime_row_kernel_reuse();
         std::cout
             << "MFQ C++ routed MoE Metal primitive tests passed\n";
         return 0;

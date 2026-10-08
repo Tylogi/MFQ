@@ -1,17 +1,17 @@
-/** 独立加载和维护 MCP 工具服务器及远程节点，供资源和连接页面复用。 */
 import { useEffect, useState, type FormEvent } from 'react';
 import { connectionsApi } from '../../shared/api/resources/connections';
 import type { McpServerResource, McpToolResource, RemoteNode } from '../../shared/api/types';
 import { SectionLabel, TMPanel } from '../../app/display';
 import { errorMessage, formatNumber } from '../../app/formatters';
 import { useRuntime } from '../../app/RuntimeProvider';
+import { useConnectionScope } from '../../app/useConnectionScope';
 import { useSettings } from '../settings/SettingsProvider';
 import { toast } from '../../stores/toastStore';
 
-/** 页面挂载后读取连接资源，所有写入错误仅影响当前连接面板。 */
 export function ToolsRoutingPanel() {
   const { tr } = useSettings();
   const { ready, connectionRevision } = useRuntime();
+  const connectionScope = useConnectionScope();
   const [servers, setServers] = useState<McpServerResource[]>([]);
   const [tools, setTools] = useState<McpToolResource[]>([]);
   const [nodes, setNodes] = useState<RemoteNode[]>([]);
@@ -43,32 +43,33 @@ export function ToolsRoutingPanel() {
     };
   }, [ready, connectionRevision]);
 
-  /** 执行连接写操作并重新获取工具清单，供聊天页下次进入时读取。 */
-  async function mutate(operation: () => Promise<unknown>) {
+  async function mutate(operation: (current: () => boolean) => Promise<unknown>) {
+    const current = connectionScope();
     if (busy) return;
     setBusy(true);
     try {
-      await operation();
+      await operation(current);
+      if (!current()) return;
       const [nextServers, nextTools, nextNodes] = await Promise.all([
         connectionsApi.mcpServers(),
         connectionsApi.mcpTools(),
         connectionsApi.remoteNodes(true),
       ]);
+      if (!current()) return;
       setServers(nextServers);
       setTools(nextTools.data);
       setNodes(nextNodes);
       window.dispatchEvent(new Event('mfq:tools-changed'));
     } catch (cause) {
-      toast.error(errorMessage(cause));
+      if (current()) toast.error(errorMessage(cause));
     } finally {
-      setBusy(false);
+      if (current()) setBusy(false);
     }
   }
-  /** 校验并注册用户填写的 MCP 服务。 */
   function createMcpServer(event: FormEvent) {
     event.preventDefault();
     if (!mcpDraft.name.trim() || !mcpDraft.endpoint.trim()) return;
-    void mutate(async () => {
+    void mutate(async (current) => {
       await connectionsApi.createMcpServer({
         name: mcpDraft.name.trim(),
         transport: mcpDraft.transport,
@@ -76,21 +77,20 @@ export function ToolsRoutingPanel() {
         url: mcpDraft.transport === 'streamable_http' ? mcpDraft.endpoint.trim() : null,
         command: mcpDraft.transport === 'stdio' ? mcpDraft.endpoint.trim() : null,
       });
-      setMcpDraft({ name: '', transport: 'streamable_http', endpoint: '' });
+      if (current()) setMcpDraft({ name: '', transport: 'streamable_http', endpoint: '' });
     });
   }
-  /** 校验远程服务地址并注册节点。 */
   function registerRemoteNode(event: FormEvent) {
     event.preventDefault();
     if (!nodeDraft.name.trim() || !nodeDraft.url.trim()) return;
-    void mutate(async () => {
+    void mutate(async (current) => {
       await connectionsApi.createRemoteNode({
         name: nodeDraft.name.trim(),
         url: nodeDraft.url.trim(),
         api_key_env: nodeDraft.api_key_env.trim() || null,
         enabled: true,
       });
-      setNodeDraft({ name: '', url: '', api_key_env: '' });
+      if (current()) setNodeDraft({ name: '', url: '', api_key_env: '' });
     });
   }
   return (

@@ -49,9 +49,10 @@ export function useChatInference(mode: SessionMode) {
   const mtpSupported =
     instance?.mtp_supported ??
     (capabilities?.model === model && capabilities?.model_capabilities.features.mtp === true);
-  const mtpAvailable =
+  const mtpServiceEnabled = runtime?.mtp_service_enabled !== false;
+  const mtpAvailable = mtpServiceEnabled && (
     instance?.mtp_available ??
-    (capabilities?.model === model && capabilities?.mtp_available === true);
+    (capabilities?.model === model && capabilities?.mtp_available === true));
   const attachmentAccept = [
     effectiveSettings.enableVision && capabilities?.model_capabilities.features.image_input
       ? 'image/*'
@@ -108,6 +109,7 @@ export function useChatInference(mode: SessionMode) {
       visionAvailable,
       mtpSupported,
       mtpAvailable,
+      mtpServiceEnabled,
       attachmentAccept,
       updateGlobalInference,
       availableModelNames,
@@ -124,6 +126,7 @@ export function useChatInference(mode: SessionMode) {
       visionAvailable,
       mtpSupported,
       mtpAvailable,
+      mtpServiceEnabled,
       attachmentAccept,
       updateGlobalInference,
       availableModelNames,

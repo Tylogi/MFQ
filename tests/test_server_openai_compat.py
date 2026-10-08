@@ -82,6 +82,27 @@ def _request(**updates: Any):
     return parse_chat_request(body)
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_missing_model_returns_not_found_for_both_transports(tmp_path, stream) -> None:
+    from mfq.server.runtime.runtime_pool import RuntimePool
+    from mfq.server.state.catalog import ModelCatalog
+
+    async def run() -> None:
+        pool = RuntimePool(ModelCatalog([]), tmp_path / "runtime")
+        try:
+            app = create_app(_Service(pool))
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                response = await client.post("/v1/chat/completions", json={"model": "missing-model",
+                    "messages": [{"role": "user", "content": "hello"}], "stream": stream})
+            assert response.status_code == 404
+            assert response.json()["error"]["type"] == "model_not_loaded"
+            assert not pool._instances
+        finally:
+            await pool.aclose()
+
+    asyncio.run(run())
+
+
 def test_openai_request_defaults_keep_thinking_vision_and_mtp_enabled() -> None:
     request = _request()
 

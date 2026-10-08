@@ -36,6 +36,9 @@ async def create_job(service: ServiceDependency, body: CreateJobRequest) -> JobR
     if body.kind == "runtime.memory.configure":
         from mfq.server.services.service import ServiceError
         raise ServiceError(403, "use_memory_policy_endpoint", "configure memory through /api/v1/runtime/memory-policy")
+    if body.kind == "quantization.recipe":
+        from mfq.server.api.routes.quantization import invoke, workbench
+        await invoke(workbench(service).validate_recipe, body.payload)
     return await service.create_job(body)
 
 
@@ -124,9 +127,13 @@ async def cancel_job(service: ServiceDependency, job_id: UUID) -> JobResource:
     tags=["jobs"],
 )
 async def retry_job(service: ServiceDependency, job_id: UUID) -> JobResource:
-    if (await service.get_job(job_id)).kind == "runtime.memory.configure":
+    job = await service.get_job(job_id)
+    if job.kind == "runtime.memory.configure":
         from mfq.server.services.service import ServiceError
         raise ServiceError(403, "use_memory_policy_endpoint", "configure memory through /api/v1/runtime/memory-policy")
+    if job.kind == "quantization.recipe":
+        from mfq.server.api.routes.quantization import invoke, workbench
+        await invoke(workbench(service).validate_recipe, job.payload)
     return await service.retry_job(job_id)
 
 
@@ -141,8 +148,9 @@ async def list_job_events(
     job_id: UUID,
     after: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=1000)] = 200,
+    tail: bool = False,
 ) -> JobEventList:
-    return await service.list_job_events(job_id, after=after, limit=limit)
+    return await service.list_job_events(job_id, after=after, limit=limit, tail=tail)
 
 
 @event_router.get(
@@ -168,6 +176,8 @@ async def stream_job_events(
                 cursor = event.sequence
                 payload = event.model_dump_json()
                 yield f"id: {event.sequence}\nevent: {event.type.value}\ndata: {payload}\n\n"
+            if len(result.data) == 200:
+                continue
             job = await service.get_job(job_id)
             if job.status in {
                 JobStatus.SUCCEEDED,
@@ -175,6 +185,8 @@ async def stream_job_events(
                 JobStatus.CANCELLED,
                 JobStatus.INTERRUPTED,
             }:
+                if result.data:
+                    continue
                 return
             if not result.data:
                 yield ": keep-alive\n\n"

@@ -4,6 +4,9 @@ import asyncio
 from pathlib import Path
 
 import httpx
+import hashlib
+from dataclasses import replace
+from mfq.server.services.evaluation_datasets import OFFICIAL_DATASETS
 
 from mfq.server.api import create_app
 from mfq.server.services.service import ServerService
@@ -22,10 +25,12 @@ class WorkspaceTools:
         return {"sha256": hashlib.sha256(data).hexdigest(), "byte_size": len(data)}
 
 
-def test_dataset_registry_and_matching_evaluation_comparison(tmp_path: Path) -> None:
+def test_dataset_registry_and_matching_evaluation_comparison(tmp_path: Path, monkeypatch) -> None:
     async def run() -> None:
         corpus = tmp_path / "corpus.txt"
         corpus.write_text("reproducible corpus", encoding="utf-8")
+        spec = replace(OFFICIAL_DATASETS["wt2-raw-test"], sha256=hashlib.sha256(corpus.read_bytes()).hexdigest(), byte_size=19)
+        monkeypatch.setitem(OFFICIAL_DATASETS, spec.id, spec)
         store = SessionStore(tmp_path / "mfq.server.sqlite3")
         service = ServerService(
             store,
@@ -59,7 +64,7 @@ def test_dataset_registry_and_matching_evaluation_comparison(tmp_path: Path) -> 
                     metrics={"perplexity": ppl, "tokens_per_second": 100.0 / ppl},
                     parameters={"context_size": 512},
                     dataset_id=__import__("uuid").UUID(dataset_id),
-                    dataset_manifest={"sha256": created.json()["sha256"]},
+                    dataset_manifest={"sha256": created.json()["sha256"], "byte_size": 19},
                     hardware_identity={"machine": "test"},
                     runtime_identity={"build": "test"},
                     comparison_key=comparison_key,

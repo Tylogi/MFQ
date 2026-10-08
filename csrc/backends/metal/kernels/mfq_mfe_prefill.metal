@@ -7,6 +7,34 @@ using namespace metal;
 #define MFQ_GROUPED_FAMILY_MASK 127
 #endif
 
+#ifndef MFQ_GROUPED_NINT_GROUP_SIZE
+#define MFQ_GROUPED_NINT_GROUP_SIZE 0
+#endif
+
+#ifndef MFQ_GROUPED_NAX_BK
+#define MFQ_GROUPED_NAX_BK 96
+#endif
+
+#ifndef MFQ_GROUPED_NAX_ALIGNED_INPUT
+#define MFQ_GROUPED_NAX_ALIGNED_INPUT 0
+#endif
+
+#ifndef MFQ_GROUPED_NAX_SIMD_ROWS
+#define MFQ_GROUPED_NAX_SIMD_ROWS 16
+#endif
+
+#ifndef MFQ_GROUPED_NAX_INPUT_WIDTH
+#define MFQ_GROUPED_NAX_INPUT_WIDTH 0
+#endif
+
+#ifndef MFQ_GROUPED_NAX_OUTPUT_WIDTH
+#define MFQ_GROUPED_NAX_OUTPUT_WIDTH 0
+#endif
+
+#ifndef MFQ_GROUPED_NAX_MATRIX_OUTPUT_WIDTH
+#define MFQ_GROUPED_NAX_MATRIX_OUTPUT_WIDTH 0
+#endif
+
 #if defined(MFQ_ENABLE_DSV4_MXFP4_BLOCKS)
 // The block geometry and quantized Steel loader below are adapted from the
 // Apache-2.0 oMLX DeepSeek-V4 pair projection kernel (Apple Inc., 2026).
@@ -312,12 +340,14 @@ inline uint read_nint_row_value(
     return (packed >> shift) & ((1u << bits) - 1u);
 }
 
+template <uint FIXED_BITS = 0u>
 inline ushort4 read_nint_row_quad(
     const device uchar* stream,
     uint row_byte_offset,
     uint row_bit_shift,
     uint value_index,
-    uint bits) {
+    uint row_bits) {
+    uint bits = FIXED_BITS != 0u ? FIXED_BITS : row_bits;
     uint row_relative_bits = row_bit_shift + value_index * bits;
     uint byte_index = row_byte_offset + (row_relative_bits >> 3u);
     uint shift = row_relative_bits & 7u;
@@ -500,7 +530,8 @@ inline half4 decode_nint_row_quad_at(
     uint row,
     uint column,
     uint k_size) {
-    uint group_size = uint(d[5]);
+    uint group_size = MFQ_GROUPED_NINT_GROUP_SIZE > 0
+        ? uint(MFQ_GROUPED_NINT_GROUP_SIZE) : uint(d[5]);
     uint groups = uint(d[6]);
     uint q_offset = uint(d[7]);
     uint sub_offset = uint(d[8]);
@@ -546,6 +577,120 @@ inline half4 decode_nint_row_quad_at(
         }
     }
     return decoded;
+}
+
+inline void decode_nint_row_pair_at(
+    const device int* d,
+    const device uchar* values,
+    const device uchar* sub_scales,
+    const device uchar* sub_mins,
+    const device float* anchor_scales,
+    const device float* anchor_mins,
+    threadgroup half* target,
+    uint row,
+    uint column,
+    uint k_size) {
+    uint group_size = MFQ_GROUPED_NINT_GROUP_SIZE > 0
+        ? uint(MFQ_GROUPED_NINT_GROUP_SIZE) : uint(d[5]);
+    uint first_group = column / group_size;
+    if (column + 7u >= k_size
+        || first_group != (column + 7u) / group_size) {
+        *reinterpret_cast<threadgroup half4*>(target) = decode_nint_row_quad_at(
+            d, values, sub_scales, sub_mins, anchor_scales, anchor_mins,
+            row, column, k_size);
+        *reinterpret_cast<threadgroup half4*>(target + 4u) = column + 4u < k_size
+            ? decode_nint_row_quad_at(
+                d, values, sub_scales, sub_mins, anchor_scales, anchor_mins,
+                row, column + 4u, k_size)
+            : half4(0.0h);
+        return;
+    }
+    uint layout = uint(values[uint(d[11]) + row]);
+    const device uint* row_offsets = reinterpret_cast<const device uint*>(
+        values + uint(d[12]));
+    uint offset = row_offsets[row];
+    uint bits = layout & 15u;
+    uint shift = layout >> 4u;
+    const device uchar* stream = values + uint(d[7]);
+    ushort4 first = read_nint_row_quad(stream, offset, shift, column, bits);
+    ushort4 second = read_nint_row_quad(stream, offset, shift, column + 4u, bits);
+    uint metadata = row * uint(d[6]) + first_group;
+    float scale = anchor_scales[uint(d[9]) + row]
+        * float(sub_scales[uint(d[8]) + metadata]);
+    float minimum = anchor_mins[uint(d[9]) + row]
+        * float(sub_mins[uint(d[8]) + metadata]);
+    *reinterpret_cast<threadgroup half4*>(target) = half4(scale * float4(first) - minimum);
+    *reinterpret_cast<threadgroup half4*>(target + 4u) = half4(scale * float4(second) - minimum);
+}
+
+template <uint GROUP_SIZE, uint TILE_K>
+inline void decode_nint_group_tile_at(
+    const device int* d,
+    const device uchar* values,
+    const device uchar* sub_scales,
+    const device uchar* sub_mins,
+    const device float* anchor_scales,
+    const device float* anchor_mins,
+    threadgroup half* target,
+    uint row,
+    uint group,
+    uint k_base,
+    uint k_size) {
+    uint layout = uint(values[uint(d[11]) + row]);
+    const device uint* row_offsets = reinterpret_cast<const device uint*>(
+        values + uint(d[12]));
+    uint offset = row_offsets[row];
+    uint bits = layout & 15u;
+    uint shift = layout >> 4u;
+    const device uchar* stream = values + uint(d[7]);
+    uint metadata = row * uint(d[6]) + group;
+    float scale = anchor_scales[uint(d[9]) + row]
+        * float(sub_scales[uint(d[8]) + metadata]);
+    float minimum = anchor_mins[uint(d[9]) + row]
+        * float(sub_mins[uint(d[8]) + metadata]);
+    if constexpr (TILE_K % GROUP_SIZE == 0u) {
+        if ((group + 1u) * GROUP_SIZE <= k_size) {
+            constexpr uint COMMON_BITS = GROUP_SIZE == 24u ? 6u : 5u;
+            if (simd_all(bits == COMMON_BITS)) {
+#pragma clang loop unroll(full)
+                for (uint inner = 0u; inner < GROUP_SIZE; inner += 4u) {
+                    uint column = group * GROUP_SIZE + inner;
+                    ushort4 quantized = read_nint_row_quad<COMMON_BITS>(
+                        stream, offset, shift, column, bits);
+                    *reinterpret_cast<threadgroup half4*>(target + column - k_base)
+                        = half4(scale * float4(quantized) - minimum);
+                }
+            } else {
+#pragma clang loop unroll(full)
+                for (uint inner = 0u; inner < GROUP_SIZE; inner += 4u) {
+                    uint column = group * GROUP_SIZE + inner;
+                    ushort4 quantized = read_nint_row_quad(
+                        stream, offset, shift, column, bits);
+                    *reinterpret_cast<threadgroup half4*>(target + column - k_base)
+                        = half4(scale * float4(quantized) - minimum);
+                }
+            }
+            return;
+        }
+    }
+#pragma clang loop unroll(full)
+    for (uint inner = 0u; inner < GROUP_SIZE; inner += 4u) {
+        uint column = group * GROUP_SIZE + inner;
+        int local_column = int(column) - int(k_base);
+        if ((TILE_K % GROUP_SIZE == 0u
+                || (local_column >= 0 && local_column + 4 <= int(TILE_K)))
+            && column < k_size) {
+            ushort4 quantized = read_nint_row_quad(stream, offset, shift, column, bits);
+            half4 decoded = half4(scale * float4(quantized) - minimum);
+            if (column + 4u > k_size) {
+#pragma clang loop unroll(full)
+                for (uint lane = 0u; lane < 4u; ++lane) {
+                    if (column + lane >= k_size) decoded[lane] = half(0.0h);
+                }
+            }
+            *reinterpret_cast<threadgroup half4*>(target + local_column) = decoded;
+        }
+    }
 }
 
 inline void decode_nint8_zero_group32(
@@ -716,6 +861,7 @@ inline void decode_jsc_group24(
 }
 
 #ifdef MFQ_ENABLE_JSC_EXTENDED_VECTOR
+template <uint FIXED_EXECUTION = 0xffffffffu>
 inline void decode_jsc_extended_group24(
     const device int* d,
     const device uchar* indices,
@@ -740,7 +886,8 @@ inline void decode_jsc_extended_group24(
     uint codebook_offset = uint(d[22]);
     uint scale_offset = uint(d[23]);
     uint state_bank_offset = uint(d[24]);
-    uint execution = uint(d[29]);
+    uint execution = FIXED_EXECUTION != 0xffffffffu
+        ? FIXED_EXECUTION : uint(d[29]);
     uint state_index = row * groups + group;
     uint signs = (k_size + 7u) / 8u;
     uint state;
@@ -894,7 +1041,8 @@ template <
     uint STATE_WIDTH,
     uint INDEX_WIDTH,
     uint ENTRIES_PER_BANK,
-    bool DUAL_BANK>
+    bool DUAL_BANK,
+    uint FIXED_EXECUTION = 0xffffffffu>
 inline void decode_nvq1_group24(
     const device int* d,
     const device uchar* indices,
@@ -907,6 +1055,8 @@ inline void decode_nvq1_group24(
     threadgroup half* target,
     uint row,
     uint group) {
+    uint execution = FIXED_EXECUTION != 0xffffffffu
+        ? FIXED_EXECUTION : uint(d[29]);
     uint groups = uint(d[5]);
     uint vectors = uint(d[7]);
     uint indices_offset = uint(d[18]);
@@ -921,7 +1071,7 @@ inline void decode_nvq1_group24(
     uint bank;
     uint3 group_indices;
     if constexpr (DUAL_BANK) {
-        if (uint(d[29]) == 4u) {
+        if (execution == 4u) {
             // NVQ1-S execution layout: each row/group is one little-endian
             // record containing three 9-bit indices, the 4-bit state, and
             // the one-bit delta/codebook selector.
@@ -944,7 +1094,7 @@ inline void decode_nvq1_group24(
                 indices + indices_offset, row, group, vectors);
         }
     } else {
-        if (uint(d[29]) == 5u) {
+        if (execution == 5u) {
             uint4 record = read_nvq1_l_group40(
                 indices, indices_offset + state_index * 5u);
             group_indices = record.xyz;
@@ -984,6 +1134,9 @@ inline void decode_nvq1_group24(
 }
 #endif
 
+template <
+    uint FIXED_PROFILE = 0xffffffffu,
+    uint FIXED_EXECUTION = 0xffffffffu>
 inline void decode_vq_group24(
     const device int* d,
     const device uchar* indices,
@@ -1021,20 +1174,24 @@ inline void decode_vq_group24(
     uint state_bank_offset = uint(d[24]);
     uint bank_offset = uint(d[25]);
     uint parameter_offset = uint(d[26]);
-    uint execution = uint(d[29]);
-    uint profile = uint(d[28]);
+    uint execution = FIXED_EXECUTION != 0xffffffffu
+        ? FIXED_EXECUTION : uint(d[29]);
+    uint profile = FIXED_PROFILE != 0xffffffffu
+        ? FIXED_PROFILE : uint(d[28]);
     uint state_index = row * groups + group;
     uint signs = (k_size + 7u) / 8u;
     float anchor = anchors[anchor_offset + row];
 
     if (profile == 1u) {
-        decode_jsc_group24<4u, 3u>(
+        decode_jsc_group24<4u, 3u,
+            FIXED_EXECUTION != 0xffffffffu ? FIXED_EXECUTION : 0u>(
             d, indices, state_stream, aux, anchors, codebooks, scales,
             state_to_bank, target, row, group, k_size);
         return;
     }
     if (profile == 4u) {
-        decode_jsc_group24<8u, 2u>(
+        decode_jsc_group24<8u, 2u,
+            FIXED_EXECUTION != 0xffffffffu ? FIXED_EXECUTION : 0u>(
             d, indices, state_stream, aux, anchors, codebooks, scales,
             state_to_bank, target, row, group, k_size);
         return;
@@ -1047,7 +1204,7 @@ inline void decode_vq_group24(
     }
 #ifdef MFQ_ENABLE_JSC_EXTENDED_VECTOR
     if (profile == 7u) {
-        decode_jsc_extended_group24(
+        decode_jsc_extended_group24<FIXED_EXECUTION>(
             d, indices, state_stream, aux, anchors, codebooks, scales,
             state_to_bank, target, row, group, k_size);
         return;
@@ -1069,13 +1226,13 @@ inline void decode_vq_group24(
     }
 
     if (profile == 3u) {
-        decode_nvq1_group24<3u, 11u, 2048u, false>(
+        decode_nvq1_group24<3u, 11u, 2048u, false, FIXED_EXECUTION>(
             d, indices, state_stream, aux, anchors, codebooks, scales,
             parameters, target, row, group);
         return;
     }
     if (profile == 6u) {
-        decode_nvq1_group24<4u, 9u, 512u, true>(
+        decode_nvq1_group24<4u, 9u, 512u, true, FIXED_EXECUTION>(
             d, indices, state_stream, aux, anchors, codebooks, scales,
             parameters, target, row, group);
         return;
@@ -1425,6 +1582,7 @@ struct MfqGroupedMmqParams {
     float swiglu_limit;
 };
 
+#if !defined(MFQ_ENABLE_NAX) && !defined(MFQ_ENABLE_DSV4_MXFP4_BLOCKS)
 template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
 [[kernel]] void mfq_grouped_mmq_f16_bm32_bn64_bk96(
     const device int* descriptors [[buffer(0)]],
@@ -1820,12 +1978,9 @@ instantiate_mfq_grouped_mmq(
     "mfq_grouped_mmq_swiglu_f16_bm32_bn64_bk96_nr",
     true,
     true)
+#endif
 
 #ifdef MFQ_ENABLE_NAX
-// Homogeneous NINT4/GS24 expert prefill for M5.  Routes have already been
-// sorted into expert-contiguous blocks.  Activations are gathered once into
-// threadgroup memory and both operands are consumed by NAX without ever
-// materializing an expert matrix outside the tile.
 template <
     int BM,
     int BN,
@@ -1833,7 +1988,7 @@ template <
     int W_STRIDE,
     bool FUSED_SWIGLU,
     bool DIRECT_PACKED>
-[[kernel]] void mfq_grouped_mfe_nax_f16_bk96(
+[[kernel]] void mfq_grouped_mfe_nax_f16(
     const device int* descriptors [[buffer(0)]],
     const device uchar* vq_indices [[buffer(1)]],
     const device uchar* vq_state [[buffer(2)]],
@@ -1865,13 +2020,17 @@ template <
     const device half* q8_scales [[buffer(28)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
-    uint thread_id [[thread_index_in_threadgroup]]) {
-    constexpr int BK = 96;
-    // BM64 uses twice as many SIMD groups in the row dimension.  This keeps
-    // every SIMD group's accumulator geometry identical to BM32 (16x32)
-    // instead of doubling TM and spilling the fused gate/up accumulator.
-    static_assert(BM % 16 == 0);
-    constexpr int WM = BM / 16;
+    uint thread_id [[thread_index_in_threadgroup]],
+    uint3 grid_size [[threadgroups_per_grid]]) {
+    constexpr int BK = MFQ_GROUPED_NAX_BK;
+    const int input_width = MFQ_GROUPED_NAX_INPUT_WIDTH > 0
+        ? MFQ_GROUPED_NAX_INPUT_WIDTH : params.input_width;
+    const int output_width = MFQ_GROUPED_NAX_OUTPUT_WIDTH > 0
+        ? MFQ_GROUPED_NAX_OUTPUT_WIDTH : params.output_width;
+    const int matrix_output_width = MFQ_GROUPED_NAX_MATRIX_OUTPUT_WIDTH > 0
+        ? MFQ_GROUPED_NAX_MATRIX_OUTPUT_WIDTH : params.matrix_output_width;
+    static_assert(BM % MFQ_GROUPED_NAX_SIMD_ROWS == 0);
+    constexpr int WM = BM / MFQ_GROUPED_NAX_SIMD_ROWS;
     constexpr int WN = BN / 32;
     constexpr uint TGP_SIZE = uint(WM * WN * 32);
     constexpr short SM = BM / WM;
@@ -1881,10 +2040,11 @@ template <
     constexpr short TN = SN / 16;
     constexpr short TK = SK / 16;
     constexpr int PROJECTIONS = FUSED_SWIGLU ? 2 : 1;
-    int output_base = int(tid.x) * BN;
-    int block_id = int(tid.y);
+    const int columns = (output_width + BN - 1) / BN;
+    int output_base = int(tid.y % uint(columns)) * BN;
+    int block_id = int(tid.x + (tid.y / uint(columns)) * grid_size.x);
     int nblocks = block_count[0];
-    if (output_base >= params.output_width || block_id >= nblocks) {
+    if (output_base >= output_width || block_id >= nblocks) {
         return;
     }
     int row_base = block_meta[block_id * 3 + 0];
@@ -1896,6 +2056,13 @@ template <
 
     const device int* base_descriptor = descriptors
         + expert * params.projections * params.descriptor_size;
+    if ((MFQ_GROUPED_FAMILY_MASK & (1 << uint(base_descriptor[0]))) == 0) {
+        return;
+    }
+    if (MFQ_GROUPED_NINT_GROUP_SIZE > 0
+        && base_descriptor[5] != MFQ_GROUPED_NINT_GROUP_SIZE) {
+        return;
+    }
     constexpr bool HAS_NINT_FAMILY =
         (MFQ_GROUPED_FAMILY_MASK & 1) != 0;
     constexpr bool HAS_Q8_FAMILY =
@@ -1909,17 +2076,18 @@ template <
     constexpr bool HAS_VQ_FAMILY =
         (MFQ_GROUPED_FAMILY_MASK & 2) != 0;
     uint rotation = uint(base_descriptor[27]);
-    short valid_n = short(min(BN, params.output_width - output_base));
+    short valid_n = short(min(BN, output_width - output_base));
     short tm = short(SM * int(simd_group_id / WN));
     short tn = short(SN * int(simd_group_id % WN));
     short simd_m = short(max(0, min(int(SM), row_count - int(tm))));
     short simd_n = short(max(0, min(int(SN), int(valid_n) - int(tn))));
 
-    threadgroup half Xs[BM * X_STRIDE];
-    // The direct path never materializes a decoded FP16 weight tile.  A
-    // one-element declaration keeps the template valid without reserving the
-    // 13 KiB staging allocation used by the compatibility path.
-    threadgroup half Ws[DIRECT_PACKED ? 1 : BN * W_STRIDE];
+    constexpr bool DIRECT_ACTIVATION = BN <= 64 && !DIRECT_PACKED;
+    constexpr bool ALIGNED_INPUT = MFQ_GROUPED_NAX_ALIGNED_INPUT != 0;
+    constexpr bool PING_PONG = DIRECT_ACTIVATION && BK == 96;
+    threadgroup half Xs[DIRECT_ACTIVATION ? 1 : BM * X_STRIDE];
+    threadgroup half weight_storage[
+        DIRECT_PACKED ? 1 : (PING_PONG ? 2 : 1) * BN * W_STRIDE];
     mlx::steel::NAXTile<float, TM, TN> gate_tile;
     mlx::steel::NAXTile<float, TM, TN> up_tile;
     gate_tile.clear();
@@ -1946,9 +2114,60 @@ template <
                 : route_index);
         source_offset =
             (rotation * uint(params.variant_stride) + source_row)
-            * uint(params.input_width);
+            * uint(input_width);
     }
-    for (int k_base = 0; k_base < params.input_width; k_base += BK) {
+    uint fragment_offsets[TM][2];
+    bool fragment_valid[TM][2];
+    if constexpr (DIRECT_ACTIVATION) {
+        short2 coord = mlx::steel::BaseNAXFrag::get_coord();
+#pragma clang loop unroll(full)
+        for (short fragment_m = 0; fragment_m < TM; ++fragment_m) {
+#pragma clang loop unroll(full)
+        for (uint half_row = 0u; half_row < 2u; ++half_row) {
+            uint fragment_row = uint(tm) + uint(fragment_m) * 16u
+                + uint(coord.y) + half_row * 8u;
+            if constexpr (ALIGNED_INPUT) {
+                fragment_row = min(fragment_row, uint(row_count - 1));
+            }
+            fragment_valid[fragment_m][half_row] =
+                ALIGNED_INPUT || fragment_row < uint(row_count);
+            fragment_offsets[fragment_m][half_row] = 0u;
+            if (fragment_valid[fragment_m][half_row]) {
+                uint route_index = uint(route_order[row_base + int(fragment_row)]);
+                uint source_row = params.input_sorted != 0
+                    ? uint(row_base) + fragment_row
+                    : (params.shared_input != 0
+                        ? route_index / uint(params.routes)
+                        : route_index);
+                fragment_offsets[fragment_m][half_row] =
+                    (rotation * uint(params.variant_stride) + source_row)
+                        * uint(input_width) + uint(coord.x);
+            }
+        }
+        }
+    }
+#if (MFQ_GROUPED_FAMILY_MASK & 2) != 0
+    constexpr bool FIXED_VQ_GEOMETRY = !FUSED_SWIGLU && !DIRECT_PACKED
+        && DIRECT_ACTIVATION && BK % 24 == 0
+        && uint(BN * (BK / 24)) == TGP_SIZE;
+    uint vq_output_row = 0u;
+    uint vq_local_group = 0u;
+    uint vq_pool_row = 0u;
+    bool vq_row_valid = false;
+    if constexpr (FIXED_VQ_GEOMETRY) {
+        constexpr uint GROUPS_PER_TILE = uint(BK / 24);
+        vq_output_row = thread_id / GROUPS_PER_TILE;
+        vq_local_group = thread_id % GROUPS_PER_TILE;
+        vq_pool_row = uint(base_descriptor[1]) * uint(matrix_output_width)
+            + uint(output_base) + vq_output_row;
+        vq_row_valid = vq_output_row < uint(valid_n);
+    }
+    auto execute_k = [&](auto profile, auto execution) {
+        constexpr int VQ_PROFILE = decltype(profile)::value;
+        constexpr uint VQ_EXECUTION = decltype(execution)::value;
+#endif
+    for (int k_base = 0; k_base < input_width; k_base += BK) {
+        if constexpr (!DIRECT_ACTIVATION) {
 #pragma clang loop unroll(full)
         for (uint column = 0u;
              column < X_VALUES_PER_LANE;
@@ -1956,16 +2175,16 @@ template <
             uint input_column = uint(k_base) + local_column + column;
             half4 value = half4(0.0h);
             if (valid_row
-                && input_column + 4u <= uint(params.input_width)) {
+                && input_column + 4u <= uint(input_width)) {
                 packed_half4 packed =
                     *reinterpret_cast<device const packed_half4*>(
                         x + source_offset + input_column);
                 value = half4(packed);
             } else if (valid_row
-                && input_column < uint(params.input_width)) {
+                && input_column < uint(input_width)) {
 #pragma clang loop unroll(full)
                 for (uint lane = 0u; lane < 4u; ++lane) {
-                    if (input_column + lane < uint(params.input_width)) {
+                    if (input_column + lane < uint(input_width)) {
                         value[lane] = x[source_offset + input_column + lane];
                     }
                 }
@@ -1974,8 +2193,12 @@ template <
                 Xs + row * uint(X_STRIDE) + local_column + column) = value;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
 
         for (int projection = 0; projection < PROJECTIONS; ++projection) {
+            threadgroup half* Ws = weight_storage + (PING_PONG
+                ? ((k_base / BK * PROJECTIONS + projection) & 1) * BN * W_STRIDE
+                : 0);
             uint descriptor_projection = params.projections == 2
                 ? uint(projection)
                 : 0u;
@@ -2000,13 +2223,51 @@ template <
 #endif
             uint local_expert = uint(descriptor[1]);
             uint projection_row_offset = params.projections == 1
-                ? uint(projection * params.output_width)
+                ? uint(projection * output_width)
                 : 0u;
+#if (MFQ_GROUPED_FAMILY_MASK & 2) != 0
+            if constexpr (VQ_PROFILE != 0) {
+                uint group = uint(k_base / 24) + vq_local_group;
+                threadgroup half* target = Ws + vq_output_row * uint(W_STRIDE)
+                    + vq_local_group * 24u;
+                if (vq_row_valid && group * 24u < uint(input_width)) {
+                    if constexpr (VQ_PROFILE == 8 && VQ_EXECUTION == 6u) {
+                        decode_jsc_group24<4u, 4u, 6u>(
+                            descriptor, vq_indices, vq_state, vq_aux,
+                            vq_anchors, vq_codebooks, vq_scales, vq_state_to_bank,
+                            target, vq_pool_row, group, uint(input_width));
+                    }
+#ifdef MFQ_ENABLE_LEGACY_VQ_VECTOR
+                    if constexpr (VQ_PROFILE == 6) {
+                        decode_nvq1_group24<4u, 9u, 512u, true>(
+                            descriptor, vq_indices, vq_state, vq_aux,
+                            vq_anchors, vq_codebooks, vq_scales, vq_parameters,
+                            target, vq_pool_row, group);
+                    }
+#endif
+                    if constexpr ((VQ_PROFILE != 8 || VQ_EXECUTION != 6u)
+                        && VQ_PROFILE != 6) {
+                        decode_vq_group24<uint(VQ_PROFILE), VQ_EXECUTION>(
+                            descriptor, vq_indices, vq_state, vq_aux,
+                            vq_anchors, vq_codebooks, vq_scales, vq_state_to_bank,
+                            vq_banks, vq_parameters, target, vq_pool_row, group,
+                            uint(input_width));
+                    }
+                } else {
+#pragma clang loop unroll(full)
+                    for (uint inner = 0u; inner < 24u; inner += 4u) {
+                        *reinterpret_cast<threadgroup half4*>(target + inner)
+                            = half4(0.0h);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            } else {
+#endif
             if constexpr (!DIRECT_PACKED) {
                 // Complete tiles overwrite all weight elements. Clear only a
                 // boundary tile, where an absent tail would otherwise leave
                 // undefined threadgroup data multiplied by padded zeros.
-                if (k_base + BK > params.input_width || valid_n < BN) {
+                if (k_base + BK > input_width || valid_n < BN) {
                     for (uint item = thread_id;
                          item < uint(BN * W_STRIDE);
                          item += TGP_SIZE) {
@@ -2016,33 +2277,67 @@ template <
                 }
 
                 if (HAS_NINT_FAMILY && family == 0u) {
-                    constexpr uint VALUES_PER_ITEM = 4u;
-                    constexpr uint ITEMS_PER_ROW = uint(BK) / VALUES_PER_ITEM;
-                    for (uint item = thread_id;
-                         item < uint(BN) * ITEMS_PER_ROW;
-                         item += TGP_SIZE) {
-                        uint output_row = item / ITEMS_PER_ROW;
-                        uint local_item = item - output_row * ITEMS_PER_ROW;
-                        uint local_column = local_item * VALUES_PER_ITEM;
-                        uint input_column = uint(k_base) + local_column;
-                        if (output_row < uint(valid_n)
-                            && input_column < uint(params.input_width)) {
-                            uint pool_row = local_expert
-                                    * uint(params.matrix_output_width)
-                                + uint(output_base) + output_row
-                                + projection_row_offset;
-                            *reinterpret_cast<threadgroup half4*>(
-                                Ws + output_row * uint(W_STRIDE)
-                                    + local_column) = decode_nint_row_quad_at(
-                                descriptor,
-                                nint_q,
-                                nint_sub_scale,
-                                nint_sub_min,
-                                nint_anchor_scale,
-                                nint_anchor_min,
-                                pool_row,
-                                input_column,
-                                uint(params.input_width));
+                    uint group_size = MFQ_GROUPED_NINT_GROUP_SIZE > 0
+                        ? uint(MFQ_GROUPED_NINT_GROUP_SIZE) : uint(descriptor[5]);
+                    if (group_size == 24u || group_size == 28u) {
+                        uint tile_groups = (uint(BK) + group_size - 1u)
+                            / group_size + uint(uint(BK) % group_size != 0u);
+                        uint first_group = uint(k_base) / group_size;
+                        for (uint item = thread_id;
+                             item < uint(BN) * tile_groups;
+                             item += TGP_SIZE) {
+                            uint output_row = item / tile_groups;
+                            uint group = first_group + item % tile_groups;
+                            if (output_row < uint(valid_n)
+                                && group < uint(descriptor[6])
+                                && group * group_size < uint(k_base + BK)) {
+                                uint pool_row = local_expert
+                                        * uint(matrix_output_width)
+                                    + uint(output_base) + output_row
+                                    + projection_row_offset;
+                                threadgroup half* target = Ws + output_row * uint(W_STRIDE);
+                                if (group_size == 24u) {
+                                    decode_nint_group_tile_at<24u, BK>(
+                                        descriptor, nint_q, nint_sub_scale, nint_sub_min,
+                                        nint_anchor_scale, nint_anchor_min, target,
+                                        pool_row, group, uint(k_base), uint(input_width));
+                                } else {
+                                    decode_nint_group_tile_at<28u, BK>(
+                                        descriptor, nint_q, nint_sub_scale, nint_sub_min,
+                                        nint_anchor_scale, nint_anchor_min, target,
+                                        pool_row, group, uint(k_base), uint(input_width));
+                                }
+                            }
+                        }
+                    } else {
+                        constexpr uint VALUES_PER_ITEM = 8u;
+                        constexpr uint ITEMS_PER_ROW = uint(BK) / VALUES_PER_ITEM;
+                        for (uint item = thread_id;
+                             item < uint(BN) * ITEMS_PER_ROW;
+                             item += TGP_SIZE) {
+                            uint output_row = item / ITEMS_PER_ROW;
+                            uint local_item = item - output_row * ITEMS_PER_ROW;
+                            uint local_column = local_item * VALUES_PER_ITEM;
+                            uint input_column = uint(k_base) + local_column;
+                            if (output_row < uint(valid_n)
+                                && input_column < uint(input_width)) {
+                                uint pool_row = local_expert
+                                        * uint(matrix_output_width)
+                                    + uint(output_base) + output_row
+                                    + projection_row_offset;
+                                decode_nint_row_pair_at(
+                                    descriptor,
+                                    nint_q,
+                                    nint_sub_scale,
+                                    nint_sub_min,
+                                    nint_anchor_scale,
+                                    nint_anchor_min,
+                                    Ws + output_row * uint(W_STRIDE)
+                                        + local_column,
+                                    pool_row,
+                                    input_column,
+                                    uint(input_width));
+                            }
                         }
                     }
                 } else if (HAS_MXFP8_FAMILY && family == 4u) {
@@ -2056,9 +2351,9 @@ template <
                         uint local_column = local_item * VALUES_PER_ITEM;
                         uint input_column = uint(k_base) + local_column;
                         if (output_row < uint(valid_n)
-                            && input_column < uint(params.input_width)) {
+                            && input_column < uint(input_width)) {
                             uint pool_row = local_expert
-                                    * uint(params.matrix_output_width)
+                                    * uint(matrix_output_width)
                                 + uint(output_base) + output_row
                                 + projection_row_offset;
                             *reinterpret_cast<threadgroup half4*>(
@@ -2066,7 +2361,7 @@ template <
                                     + local_column) = decode_mxfp8_quad_at(
                                 descriptor, mx_values, mx_scales,
                                 pool_row, input_column,
-                                uint(params.input_width));
+                                uint(input_width));
                         }
                     }
                 } else if (HAS_DENSE_FAMILY
@@ -2081,32 +2376,32 @@ template <
                         uint local_column = local_item * VALUES_PER_ITEM;
                         uint input_column = uint(k_base) + local_column;
                         if (output_row >= uint(valid_n)
-                            || input_column >= uint(params.input_width)) {
+                            || input_column >= uint(input_width)) {
                             continue;
                         }
                         uint pool_row = local_expert
-                                * uint(params.matrix_output_width)
+                                * uint(matrix_output_width)
                             + uint(output_base) + output_row
                             + projection_row_offset;
                         threadgroup half* target =
                             Ws + output_row * uint(W_STRIDE) + local_column;
                         if (input_column + VALUES_PER_ITEM
-                            <= uint(params.input_width)) {
+                            <= uint(input_width)) {
                             *reinterpret_cast<threadgroup half4*>(target) =
                                 decode_dense_quad_at(
                                     descriptor, q8_q, family, pool_row,
-                                    input_column, uint(params.input_width));
+                                    input_column, uint(input_width));
                         } else {
 #pragma clang loop unroll(full)
                             for (uint lane = 0u;
                                  lane < VALUES_PER_ITEM;
                                  ++lane) {
                                 if (input_column + lane
-                                    < uint(params.input_width)) {
+                                    < uint(input_width)) {
                                     target[lane] = decode_dense_value_at(
                                         descriptor, q8_q, family, pool_row,
                                         input_column + lane,
-                                        uint(params.input_width));
+                                        uint(input_width));
                                 }
                             }
                         }
@@ -2123,12 +2418,12 @@ template <
                             && local_group < uint(BK / 32)) {
                             uint input_column =
                                 uint(k_base) + local_group * 32u;
-                            if (input_column >= uint(params.input_width)) {
+                            if (input_column >= uint(input_width)) {
                                 continue;
                             }
                             uint group = input_column / 32u;
                             uint pool_row = local_expert
-                                    * uint(params.matrix_output_width)
+                                    * uint(matrix_output_width)
                                 + uint(output_base) + output_row
                                 + projection_row_offset;
                             decode_nint8_zero_group32(
@@ -2141,12 +2436,12 @@ template <
                             && local_group < uint(BK / 32)) {
                             uint input_column =
                                 uint(k_base) + local_group * 32u;
-                            if (input_column >= uint(params.input_width)) {
+                            if (input_column >= uint(input_width)) {
                                 continue;
                             }
                             uint group = input_column / 32u;
                             uint pool_row = local_expert
-                                    * uint(params.matrix_output_width)
+                                    * uint(matrix_output_width)
                                 + uint(output_base) + output_row
                                 + projection_row_offset;
                             decode_mxfp4_group32(
@@ -2154,17 +2449,17 @@ template <
                                 Ws + output_row * uint(W_STRIDE)
                                     + local_group * 32u,
                                 pool_row, group,
-                                uint(params.input_width));
+                                uint(input_width));
                         } else if (output_row < uint(valid_n)
                             && HAS_VQ_FAMILY && family == 1u) {
                             uint input_column =
                                 uint(k_base) + local_group * 24u;
-                            if (input_column >= uint(params.input_width)) {
+                            if (input_column >= uint(input_width)) {
                                 continue;
                             }
                             uint group = input_column / 24u;
                             uint pool_row = local_expert
-                                    * uint(params.matrix_output_width)
+                                    * uint(matrix_output_width)
                                 + uint(output_base) + output_row
                                 + projection_row_offset;
                             decode_vq_group24(
@@ -2174,18 +2469,62 @@ template <
                                 Ws + output_row * uint(W_STRIDE)
                                     + local_group * 24u,
                                 pool_row, group,
-                                uint(params.input_width));
+                                uint(input_width));
                         }
                     }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
 
-            for (int kk = 0; kk < BK; kk += SK) {
+#if (MFQ_GROUPED_FAMILY_MASK & 2) != 0
+            }
+#endif
+            const int k_limit = BK == 96 && !ALIGNED_INPUT ? BK
+                : min(BK, input_width - k_base);
+            for (int kk = 0; kk < k_limit && simd_m > 0 && simd_n > 0; kk += SK) {
                 mlx::steel::NAXTile<half, TM, TK> input_tile;
                 mlx::steel::NAXTile<half, TN, TK> weight_tile;
-                input_tile.template load<half, X_STRIDE, 1>(
-                    Xs + int(tm) * X_STRIDE + kk);
+                if constexpr (DIRECT_ACTIVATION) {
+                    short2 coord = mlx::steel::BaseNAXFrag::get_coord();
+#pragma clang loop unroll(full)
+                    for (short fragment_m = 0; fragment_m < TM; ++fragment_m) {
+#pragma clang loop unroll(full)
+                    for (short fragment_k = 0; fragment_k < TK; ++fragment_k) {
+#pragma clang loop unroll(full)
+                        for (short half_row = 0; half_row < 2; ++half_row) {
+                            uint column = uint(k_base + kk + fragment_k * 16)
+                                + uint(coord.x);
+                            half4 values = half4(0.0h);
+                            if constexpr (ALIGNED_INPUT) {
+                                values = half4(*reinterpret_cast<device const packed_half4*>(
+                                    x + fragment_offsets[fragment_m][half_row]
+                                        + uint(k_base + kk + fragment_k * 16)));
+                            } else if (fragment_valid[fragment_m][half_row]
+                                && column + 4u <= uint(input_width)) {
+                                values = half4(*reinterpret_cast<device const packed_half4*>(
+                                    x + fragment_offsets[fragment_m][half_row]
+                                        + uint(k_base + kk + fragment_k * 16)));
+                            } else if (fragment_valid[fragment_m][half_row]) {
+#pragma clang loop unroll(full)
+                                for (short lane = 0; lane < 4; ++lane) {
+                                    if (column + uint(lane) < uint(input_width)) {
+                                        values[lane] = x[fragment_offsets[fragment_m][half_row]
+                                            + uint(k_base + kk + fragment_k * 16 + lane)];
+                                    }
+                                }
+                            }
+#pragma clang loop unroll(full)
+                            for (short lane = 0; lane < 4; ++lane) {
+                                input_tile.frag_at(fragment_m, fragment_k)[half_row * 4 + lane]
+                                    = values[lane];
+                            }
+                        }
+                    }
+                    }
+                } else {
+                    input_tile.template load<half, X_STRIDE, 1>(
+                        Xs + int(tm) * X_STRIDE + kk);
+                }
                 if constexpr (DIRECT_PACKED) {
                     // BaseNAXFrag assigns every SIMD lane two rows and four
                     // contiguous columns from each 16x16 fragment.  Decode
@@ -2216,9 +2555,9 @@ template <
                                 + int(fragment_coord.x);
                             half4 decoded = half4(0.0h);
                             if (local_output < int(valid_n)
-                                && input_column < params.input_width) {
+                                && input_column < input_width) {
                                 uint pool_row = local_expert
-                                        * uint(params.matrix_output_width)
+                                        * uint(matrix_output_width)
                                     + uint(output_base + local_output)
                                     + projection_row_offset;
                                 decoded = decode_nint_row_quad_at(
@@ -2230,7 +2569,7 @@ template <
                                     nint_anchor_min,
                                     pool_row,
                                     uint(input_column),
-                                    uint(params.input_width));
+                                    uint(input_width));
                             }
                             weight_fragment[fragment_row * 4] = decoded[0];
                             weight_fragment[fragment_row * 4 + 1] = decoded[1];
@@ -2259,10 +2598,54 @@ template <
                         metal::bool_constant<true>{});
                 }
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if constexpr (!PING_PONG) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
         }
     }
 
+#if (MFQ_GROUPED_FAMILY_MASK & 2) != 0
+    };
+    if constexpr (FIXED_VQ_GEOMETRY) {
+        bool eligible = params.projections == 1 && input_width % 32 == 0
+            && uint(base_descriptor[0]) == 1u;
+        if (eligible && (uint(base_descriptor[28]) & 255u) == 8u
+            && base_descriptor[29] == 6) {
+            execute_k(metal::integral_constant<int, 8>{},
+                metal::integral_constant<uint, 6u>{});
+#ifdef MFQ_ENABLE_LEGACY_VQ_VECTOR
+        } else if (eligible && (uint(base_descriptor[28]) & 255u) == 6u
+            && base_descriptor[29] == 4) {
+            execute_k(metal::integral_constant<int, 6>{},
+                metal::integral_constant<uint, 4u>{});
+#endif
+        } else if (eligible && base_descriptor[28] == 1 && base_descriptor[29] == 1) {
+            execute_k(metal::integral_constant<int, 1>{},
+                metal::integral_constant<uint, 1u>{});
+        } else if (eligible && base_descriptor[28] == 4 && base_descriptor[29] == 1) {
+            execute_k(metal::integral_constant<int, 4>{},
+                metal::integral_constant<uint, 1u>{});
+        } else if (eligible && base_descriptor[28] == 3 && base_descriptor[29] == 5) {
+            execute_k(metal::integral_constant<int, 3>{},
+                metal::integral_constant<uint, 5u>{});
+        } else if (eligible && base_descriptor[28] == 7 && base_descriptor[29] == 2) {
+            execute_k(metal::integral_constant<int, 7>{},
+                metal::integral_constant<uint, 2u>{});
+        } else if (eligible && base_descriptor[28] == 7 && base_descriptor[29] == 3) {
+            execute_k(metal::integral_constant<int, 7>{},
+                metal::integral_constant<uint, 3u>{});
+        } else if (eligible && base_descriptor[28] == 8 && base_descriptor[29] == 3) {
+            execute_k(metal::integral_constant<int, 8>{},
+                metal::integral_constant<uint, 3u>{});
+        } else {
+            execute_k(metal::integral_constant<int, 0>{},
+                metal::integral_constant<uint, 0xffffffffu>{});
+        }
+    } else {
+        execute_k(metal::integral_constant<int, 0>{},
+            metal::integral_constant<uint, 0xffffffffu>{});
+    }
+#endif
     if constexpr (FUSED_SWIGLU) {
         for (short item = 0;
              item < decltype(gate_tile)::kElemsPerTile;
@@ -2279,11 +2662,11 @@ template <
     }
     if (simd_m > 0 && simd_n > 0) {
         device half* destination =
-            y + (row_base + int(tm)) * params.output_width
+            y + (row_base + int(tm)) * output_width
                 + output_base + int(tn);
         gate_tile.store_safe(
             destination,
-            params.output_width,
+            output_width,
             short2(simd_n, simd_m));
     }
 }
@@ -2291,153 +2674,17 @@ template <
 #define instantiate_mfq_grouped_mfe_nax( \
     name, bm, bn, x_stride, w_stride, fused, direct) \
     template [[host_name(name)]] [[kernel]] \
-    decltype(mfq_grouped_mfe_nax_f16_bk96< \
+    decltype(mfq_grouped_mfe_nax_f16< \
         bm, bn, x_stride, w_stride, fused, direct>) \
-    mfq_grouped_mfe_nax_f16_bk96< \
+    mfq_grouped_mfe_nax_f16< \
         bm, bn, x_stride, w_stride, fused, direct>;
 
 instantiate_mfq_grouped_mfe_nax(
-    "mfq_grouped_mfe_nax_f16_bm32_bn64_bk96",
-    32,
-    64,
-    104,
-    104,
-    false,
-    false)
-instantiate_mfq_grouped_mfe_nax(
-    "mfq_grouped_mfe_nax_swiglu_f16_bm32_bn64_bk96",
-    32,
-    64,
-    104,
-    104,
-    true,
-    false)
-instantiate_mfq_grouped_mfe_nax(
-    "mfq_grouped_mfe_nax_f16_bm32_bn128_bk96",
-    32,
-    128,
-    100,
-    100,
-    false,
-    false)
-instantiate_mfq_grouped_mfe_nax(
-    "mfq_grouped_mfe_nax_swiglu_f16_bm32_bn128_bk96",
-    32,
-    128,
-    100,
-    100,
-    true,
-    false)
-instantiate_mfq_grouped_mfe_nax(
-    "mfq_grouped_mfe_nax_direct_f16_bm32_bn64_bk96",
-    32,
-    64,
-    104,
-    104,
-    false,
-    true)
-instantiate_mfq_grouped_mfe_nax(
-    "mfq_grouped_mfe_nax_direct_swiglu_f16_bm32_bn64_bk96",
-    32,
-    64,
-    104,
-    104,
-    true,
-    true)
-instantiate_mfq_grouped_mfe_nax(
-    "mfq_grouped_mfe_nax_f16_bm64_bn64_bk96",
-    64,
-    64,
-    104,
-    104,
-    false,
-    false)
-instantiate_mfq_grouped_mfe_nax(
-    "mfq_grouped_mfe_nax_swiglu_f16_bm64_bn64_bk96",
-    64,
-    64,
-    104,
-    104,
-    true,
-    false)
-instantiate_mfq_grouped_mfe_nax(
-    "mfq_grouped_mfe_nax_f16_bm64_bn96_bk96",
-    64,
-    96,
-    104,
-    100,
-    false,
-    false)
-instantiate_mfq_grouped_mfe_nax(
-    "mfq_grouped_mfe_nax_swiglu_f16_bm64_bn96_bk96",
-    64,
-    96,
-    104,
-    100,
-    true,
-    false)
-instantiate_mfq_grouped_mfe_nax(
-    "mfq_grouped_mfe_nax_f16_bm48_bn64_bk96",
-    48,
-    64,
-    100,
-    100,
-    false,
-    false)
-instantiate_mfq_grouped_mfe_nax(
-    "mfq_grouped_mfe_nax_swiglu_f16_bm48_bn64_bk96",
-    48,
-    64,
-    100,
-    100,
-    true,
-    false)
-instantiate_mfq_grouped_mfe_nax(
-    "mfq_grouped_mfe_nax_f16_bm48_bn96_bk96",
-    48,
-    96,
-    100,
-    100,
-    false,
-    false)
-instantiate_mfq_grouped_mfe_nax(
-    "mfq_grouped_mfe_nax_swiglu_f16_bm48_bn96_bk96",
-    48,
-    96,
-    100,
-    100,
-    true,
-    false)
-instantiate_mfq_grouped_mfe_nax(
-    "mfq_grouped_mfe_nax_f16_bm96_bn64_bk96",
-    96,
-    64,
-    100,
-    100,
-    false,
-    false)
-instantiate_mfq_grouped_mfe_nax(
-    "mfq_grouped_mfe_nax_swiglu_f16_bm96_bn64_bk96",
-    96,
-    64,
-    100,
-    100,
-    true,
-    false)
-instantiate_mfq_grouped_mfe_nax(
-    "mfq_grouped_mfe_nax_f16_bm80_bn64_bk96",
-    80,
-    64,
-    100,
-    100,
-    false,
-    false)
-instantiate_mfq_grouped_mfe_nax(
-    "mfq_grouped_mfe_nax_swiglu_f16_bm80_bn64_bk96",
-    80,
-    64,
-    100,
-    100,
-    true,
-    false)
+    "mfq_grouped_mfe_nax_f16_specialized",
+    MFQ_GROUPED_NAX_BM,
+    MFQ_GROUPED_NAX_BN,
+    MFQ_GROUPED_NAX_X_STRIDE,
+    MFQ_GROUPED_NAX_W_STRIDE,
+    MFQ_GROUPED_NAX_FUSED,
+    MFQ_GROUPED_NAX_DIRECT)
 #endif

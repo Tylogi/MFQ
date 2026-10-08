@@ -149,3 +149,67 @@ it('clamps exhausted KV capacity to zero without changing numeric limits or prod
   expect(screen.getAllByText('0 B / 0 B')).toHaveLength(2);
   expect(container.querySelectorAll('.memory-tier-track > span')).toHaveLength(0);
 });
+
+it('expands the same four tiers into per-model sizes, active KV, hot prefixes and wiring', () => {
+  const first = model('1', 1024), second = model('2', 3072);
+  Object.assign(first.memory!, { prefix_cache_bytes: 256, prefix_cache_limit_bytes: 2048,
+    wired_available: true, wired_bytes: 1024, ssd_experts: false, ssd_ple: false });
+  Object.assign(second.memory!, { prefix_cache_bytes: 768, prefix_cache_limit_bytes: 4096 });
+  const { container } = render(<MemoryHierarchy instances={[first, second]} memoryCapacityBytes={32768} detailed />);
+  expect(screen.getByText('Resource allocation')).toBeInTheDocument();
+  expect(container.querySelectorAll('.resource-tier-model')).toHaveLength(8);
+  expect(container.querySelector('[data-tier="kv"]')).toHaveTextContent('4 KiB / 28 KiB');
+  expect(container.querySelector('[data-tier="kv"] .resource-tier-model')).toHaveTextContent('Active KV 768 B · Prefix RAM 256 B / 2 KiB');
+  expect(container.querySelector('[data-tier="weights"] .resource-tier-model')).toHaveTextContent('METAL · Wired 1 KiB');
+  expect(container.querySelector('[data-tier="experts"] .resource-tier-model')).toHaveTextContent('All experts resident');
+  expect(container.querySelector('[data-tier="ple"] .resource-tier-model')).toHaveTextContent('No SSD PLE table');
+  for (const tier of container.querySelectorAll('.resource-tier-details')) {
+    expect(tier.querySelector('.resource-tier-model-name i')).toHaveStyle({ backgroundColor: 'var(--accent)' });
+  }
+});
+
+it('detailed unknown telemetry never becomes fabricated zero sizes or active KV', () => {
+  const { container } = render(<MemoryHierarchy instances={[{ ...model('1', 0), memory: null }]} detailed />);
+  for (const amount of container.querySelectorAll('.resource-tier-model > strong')) expect(amount).toHaveTextContent('Not reported');
+  expect(container.querySelector('[data-tier="kv"] .resource-tier-model')).toHaveTextContent('Active KV -- · Prefix RAM -- / --');
+});
+
+it('preserves independently reported context and cache-block counts', () => {
+  const first = model('1', 1024), second = model('2', 1024);
+  first.memory!.context_count = null;
+  const { rerender } = render(<MemoryHierarchy instances={[first, second]} detailed />);
+  expect(screen.getByText('-- contexts · 4 cache blocks')).toBeInTheDocument();
+  first.memory!.context_count = 1;
+  second.memory!.prefix_cache_blocks = null;
+  rerender(<MemoryHierarchy instances={[first, second]} detailed />);
+  expect(screen.getByText('2 contexts · -- cache blocks')).toBeInTheDocument();
+});
+
+it('retains unloading model allocations until the backend confirms removal', () => {
+  const first = model('1', 1024), second = model('2', 2048);
+  const { container, rerender } = render(<MemoryHierarchy instances={[first, second]} memoryCapacityBytes={8192} detailed />);
+  const previousColor = (container.querySelector('[data-tier="weights"] [data-model-id="2"]') as HTMLElement).style.backgroundColor;
+  const unloading: RuntimeInstance = { ...second, state: 'unloading',
+    error: { code: 'runtime_unload_failed', message: 'process is still alive', retryable: true, details: {} } };
+  rerender(<MemoryHierarchy instances={[first, unloading]} memoryCapacityBytes={8192} detailed />);
+  expect(container.querySelector('[data-tier="weights"]')).toHaveTextContent('3 KiB / 8 KiB');
+  expect(container.querySelector('[data-tier="kv"]')).toHaveTextContent('3 KiB / 5 KiB');
+  expect(container.querySelectorAll('.resource-tier-model[data-model-id="2"]')).toHaveLength(4);
+  expect(container.querySelector('[data-tier="weights"] [data-model-id="2"]')).toHaveStyle({ backgroundColor: previousColor });
+  expect(screen.getByText('Model 2 · Unloading')).toBeInTheDocument();
+  expect(screen.getByText('Unloading models retain their last reported allocation until release is confirmed.')).toBeInTheDocument();
+  rerender(<MemoryHierarchy instances={[first]} memoryCapacityBytes={8192} detailed />);
+  expect(container.querySelector('[data-tier="weights"]')).toHaveTextContent('1 KiB / 8 KiB');
+  expect(container.querySelector('[data-tier="kv"]')).toHaveTextContent('1 KiB / 7 KiB');
+  expect(container.querySelector('[data-model-id="2"]')).not.toBeInTheDocument();
+  expect(screen.queryByText(/Unloading models retain/)).not.toBeInTheDocument();
+});
+
+it('does not fabricate zero usage for an unloading model without a reported allocation', () => {
+  const item: RuntimeInstance = { ...model('1', 1024), state: 'unloading', memory: null };
+  render(<MemoryHierarchy instances={[item]} memoryCapacityBytes={8192} detailed />);
+  expect(screen.getByText('Model 1 · Unloading')).toBeInTheDocument();
+  expect(screen.getByText('Breakdown not reported / 8 KiB')).toBeInTheDocument();
+  expect(screen.getByText('Breakdown not reported / --')).toBeInTheDocument();
+  expect(screen.queryByText('0 B / 8 KiB')).not.toBeInTheDocument();
+});

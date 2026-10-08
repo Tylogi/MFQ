@@ -158,6 +158,7 @@ constexpr const char* kFp8_128SqDequantize = R"METAL(
 )METAL";
 
 constexpr const char* kMxfp8SqMatmul = R"METAL(
+    const int M = ROUTED != 0 ? expert_ids_shape[0] * ROUTES : x_shape[0];
     uint lane = thread_index_in_simdgroup;
     uint workgroup = thread_position_in_grid.x >> 5u;
     uint logical_output = workgroup % uint(LOGICAL_OUT);
@@ -215,6 +216,7 @@ constexpr const char* kMxfp8SqMatmul = R"METAL(
 )METAL";
 
 constexpr const char* kFp8_128SqMatmul = R"METAL(
+    const int M = ROUTED != 0 ? expert_ids_shape[0] * ROUTES : x_shape[0];
     uint lane = thread_index_in_simdgroup;
     uint workgroup = thread_position_in_grid.x >> 5u;
     uint logical_output = workgroup % uint(LOGICAL_OUT);
@@ -541,6 +543,7 @@ std::vector<std::string> projection_group_input_names(
 
 std::string make_projection_group_source(std::size_t projections) {
     std::string source = R"METAL(
+    const int M = x_shape[0];
     uint lane = thread_index_in_simdgroup;
     uint workgroup = thread_position_in_grid.x >> 5u;
     uint logical_output = workgroup % uint(TOTAL_OUT);
@@ -758,7 +761,6 @@ array MlxFp8SqWeight::matmul(const array& input) const {
     const auto row_tiles = (rows + tile_rows - 1) / tile_rows;
     const auto workgroups = row_tiles * static_cast<std::size_t>(output_size());
     auto arguments = templates(*this, source.dtype());
-    arguments.emplace_back("M", static_cast<int>(rows));
     arguments.emplace_back("TILE_M", tile_rows);
     arguments.emplace_back("ROUTED", 0);
     arguments.emplace_back("ROUTES", 1);
@@ -831,7 +833,6 @@ std::vector<array> MlxFp8SqWeight::projection_group_matmul(
     inputs.reserve(weights.size() * 3 + 1);
     std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> arguments{
         {"T", source.dtype()},
-        {"M", checked_int(rows, "projection-group row count")},
         {"TILE_M", tile_rows},
         {"K", input_size},
         {"TOTAL_OUT", total_output},
@@ -932,7 +933,6 @@ array MlxFp8SqWeight::routed_matmul(
     auto ids = mlx::core::contiguous(expert_ids);
     auto map = mlx::core::contiguous(expert_map);
     auto arguments = templates(*this, source.dtype());
-    arguments.emplace_back("M", checked_int(route_count, "route count"));
     arguments.emplace_back("TILE_M", 1);
     arguments.emplace_back("ROUTED", 1);
     arguments.emplace_back("ROUTES", routes);

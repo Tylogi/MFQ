@@ -31,7 +31,7 @@ class PageErrorBoundary extends Component<{ children: ReactNode }, { detail: str
 export function StudioShell() {
   const location = useLocation();
   const { tr } = useSettings();
-  const { connectionError, refreshError, jobStreamErrors, ready, reloadService } = useRuntime();
+  const { connectionError, refreshError, jobStreamErrors, ready, reloadService, connectionRevision } = useRuntime();
   const currentLocation = resolveStudioLocation(location.pathname);
   const view = isStudioPath(location.pathname) ? currentLocation.view : 'not-found';
   const pageAvailable = ready || view === 'not-found' ||
@@ -58,7 +58,7 @@ export function StudioShell() {
           id="studio-main" tabIndex={-1}>
           {hasAlerts && <RuntimeAlerts connectionProblem={connectionProblem} />}
           {pageAvailable ? (
-            <PageErrorBoundary key={location.pathname}>
+            <PageErrorBoundary key={`${location.pathname}:${connectionRevision}`}>
               <Suspense fallback={<LoadingPage />}>
                 <Outlet />
               </Suspense>

@@ -962,6 +962,7 @@ array MlxDeepseekV41CausalLm::prefill(
     const array& raw_token_ids,
     int chunk_size,
     bool full_logits) {
+    mfq::engine::PrefillActivity prefill_activity;
     auto token_ids = normalized_ids(raw_token_ids);
     if (chunk_size <= 0) {
         throw std::invalid_argument(
@@ -1029,6 +1030,7 @@ array MlxDeepseekV41CausalLm::prefill_multimodal(
         }
         ids.push_back(static_cast<std::int32_t>(token));
     }
+    mfq::engine::PrefillActivity prefill_activity;
     const auto token_array = array(
         ids.begin(), Shape{1, static_cast<int>(ids.size())});
     auto embeddings = vision_->embed_prompt(

@@ -13,6 +13,7 @@ namespace mfq { class ModelSource; }
 
 namespace mfq::engine {
 
+
 // Engine-owned model text semantics: template application, tokenization,
 // grammar constraints, output parsing, stop handling, and media placeholders.
 class TextProcessor {

@@ -33,6 +33,7 @@ json RuntimeProtocol::snapshot(bool health) const {
     json value = health ? json{{"status", reloading_ ? "loading" :
         (scheduler_.status().healthy ? "ok" : "unhealthy")},
         {"model", config_.model_name}, {"model_type", config_.model_type},
+        {"probability_available", scheduler_.info().probability},
         {"max_context", context_.load()}} : metrics_.snapshot(config_, context_, reloading_);
     value["sampling_defaults"] = sampling_params_json(defaults);
     value["duplex_sampling_defaults"] = duplex_profile_json(config_.runtime_profile.duplex);
@@ -86,7 +87,22 @@ json RuntimeProtocol::call(const std::string& operation, const json& params) {
         return {{"status", "ok"}, {"copied_snapshots",
             scheduler_.session({SessionCommand::Kind::fork, source, target}).count}};
     }
-    if (operation == "cache.clear" || operation == "cache.trim") {
+    if (operation == "cache.refresh") {
+        json result{{"status", "ok"}, {"removed_blocks",
+            scheduler_.session({SessionCommand::Kind::refresh}).count}};
+        add_session_metrics(result);
+        return result;
+    }
+    if (operation == "memory.budget") {
+        const auto target = integer_field(params, "target_bytes", 0);
+        if (target < 0) throw ApiError(400, "invalid_request_error",
+            "target_bytes must be non-negative", "target_bytes");
+        json result{{"status", "ok"}, {"released_bytes", scheduler_.session(
+            {SessionCommand::Kind::memory_budget, {}, {}, static_cast<uint64_t>(target)}).count}};
+        add_session_metrics(result);
+        return result;
+    }
+    if (operation == "cache.clear" || operation == "cache.trim" || operation == "cache.budget") {
         uint64_t target = 0;
         if (params.contains("target_bytes")) {
             const auto& number = params["target_bytes"];
@@ -96,12 +112,30 @@ json RuntimeProtocol::call(const std::string& operation, const json& params) {
             target = number.get<uint64_t>();
         }
         const bool clear = operation == "cache.clear";
+        const bool budget = operation == "cache.budget";
+        SessionCommand command{clear ? SessionCommand::Kind::clear :
+            (budget ? SessionCommand::Kind::budget : SessionCommand::Kind::trim), {}, {}, target};
+        if (budget && params.contains("disk_target_bytes")) {
+            const auto disk = integer_field(params, "disk_target_bytes", 0);
+            if (disk < 0) throw ApiError(400, "invalid_request_error",
+                "disk_target_bytes must be non-negative", "disk_target_bytes");
+            command.disk_bytes = static_cast<uint64_t>(disk);
+        }
         json result{{"status", "ok"}, {clear ? "released_snapshots" : "released_bytes",
-            scheduler_.session({clear ? SessionCommand::Kind::clear : SessionCommand::Kind::trim,
-                {}, {}, target}).count}};
+            scheduler_.session(command).count}};
         if (!clear) result["target_bytes"] = target;
         add_session_metrics(result);
         return result;
+    }
+    if (operation == "score") {
+        if (!scheduler_.info().probability)
+            throw ApiError(501, "probability_unavailable", "probability scoring is unavailable for this model");
+        try {
+            return likelihood_result_json(std::get<LikelihoodResult>(
+                scheduler_.control(parse_score_request(params))));
+        } catch (const std::invalid_argument& error) {
+            throw ApiError(400, "invalid_request_error", error.what());
+        }
     }
     if (operation == "reload") {
         if (!scheduler_.supports_reload()) throw ApiError(501, "unsupported_operation", "this runtime does not support model reload");
