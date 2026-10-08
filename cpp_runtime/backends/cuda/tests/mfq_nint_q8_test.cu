@@ -19,6 +19,17 @@ void single_path(bool enabled) {
 #endif
 }
 
+void group_path(bool enabled) {
+#ifdef _WIN32
+    _putenv_s("MFQ_NINT_GROUP_DOT", enabled ? "1" : "0");
+#else
+    setenv("MFQ_NINT_GROUP_DOT", enabled ? "1" : "0", 1);
+#endif
+}
+
+double grouped_max_nrmse = 0.0;
+double grouped_max_absolute = 0.0;
+
 void require(bool condition, const char *message) {
     if (!condition) {
         throw std::runtime_error(message);
@@ -34,6 +45,28 @@ void exact_half(const Tensor &actual, const Tensor &expected) {
     require(std::memcmp(a.data_ptr(), b.data_ptr(),
             static_cast<std::size_t>(a.numel()) * sizeof(std::uint16_t)) == 0,
             "NINT q8 output differs from the original generic path");
+}
+
+void grouped_half(const Tensor &actual, const Tensor &expected) {
+    require(actual.sizes() == expected.sizes() && actual.scalar_type() == kFloat16 &&
+        expected.scalar_type() == kFloat16, "NINT grouped output contract mismatch");
+    auto a = actual.to(kCPU).to(kFloat32).contiguous();
+    auto b = expected.to(kCPU).to(kFloat32).contiguous();
+    const auto* av = a.data_ptr<float>();
+    const auto* bv = b.data_ptr<float>();
+    double error = 0.0, signal = 0.0;
+    for (std::int64_t i = 0; i < a.numel(); ++i) {
+        const double difference = std::abs(double(av[i]) - bv[i]);
+        // Integer group dots reassociate the FP32 reduction before FP16 storage.
+        // Keep a bounded numerical check; exact quantizer/legacy checks remain separate.
+        require(std::isfinite(av[i]) && std::isfinite(bv[i]) &&
+            difference <= 0.002 + 0.002 * std::abs(double(bv[i])),
+            "NINT grouped output exceeds FP16 reduction tolerance");
+        error += difference * difference;
+        signal += double(bv[i]) * bv[i];
+        grouped_max_absolute = std::max(grouped_max_absolute, difference);
+    }
+    grouped_max_nrmse = std::max(grouped_max_nrmse, std::sqrt(error / std::max(signal, 1e-20)));
 }
 
 void check_case(int gs, int ng, int m, int width_tail, int storage_offset,
@@ -114,7 +147,7 @@ void check_case(int gs, int ng, int m, int width_tail, int storage_offset,
         ++graphs;
     }
 }
-void check_single(int gs,int width,int preset,int storage_offset,int padding,int n,int& cases) {
+void check_single(int gs,int width,int preset,int storage_offset,int padding,int n,int& cases,bool grouped=false) {
     const Device gpu{DeviceType::cuda,0};
     const int ng=(width+gs-1)/gs,k=ng*gs;
     std::vector<std::uint8_t> row_bits(n);
@@ -145,8 +178,9 @@ void check_single(int gs,int width,int preset,int storage_offset,int padding,int
     const auto options=TensorOptions().device(gpu);
     auto qx=empty({1,k},options.dtype(kInt8)),xs=empty({1,ng},options.dtype(kFloat32));
     const auto run=[&]{return nint_matmul_ws_cuda(q,bits,off,s,mn,ns,nm,x,gs,qx,xs);};
-    single_path(false);auto expected=run();
-    single_path(true);auto actual=run();exact_half(actual,expected);++cases;
+    single_path(false);group_path(false);auto expected=run();
+    single_path(true);group_path(grouped);auto actual=run();
+    const auto compare=grouped ? grouped_half : exact_half;compare(actual,expected);++cases;
     const auto stream=mfq_get_stream_from_pool(false);MfqCudaStreamGuard guard(stream);
     MfqCudaGraph graph;mfq_prepare_cuda_graph_memory(graph);
     actual=run();MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));actual=Tensor{};
@@ -154,8 +188,8 @@ void check_single(int gs,int width,int preset,int storage_offset,int padding,int
     for(int step=0;step<2;++step) {
         for(int column=0;column<width;++column)input[column]=std::sin(float(column+step*31)*.173f)*.13f;
         x.copy_(tensor(input).reshape({1,width}).to(gpu,kFloat16));
-        single_path(false);expected=run();
-        graph.replay();MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));exact_half(actual,expected);++cases;
+        single_path(false);group_path(false);expected=run();
+        graph.replay();MFQ_NATIVE_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));compare(actual,expected);++cases;
     }
     single_path(false);
 }
@@ -253,6 +287,7 @@ int main() {
         }
         MFQ_NATIVE_CUDA_CHECK(status);
         int cases = 0, graphs = 0;
+        group_path(true);
         int float_ordinary=0,float_changing=0;
         for(int gs:{5,24,28,32,48,64})for(int rows:{1,3,8})
             for(int kind:{0,1})for(int mode:{0,1,2})
@@ -285,6 +320,16 @@ int main() {
         }
         std::cout << "NINT q8 bit-exact FP16 cases=" << cases
                   << " graph_cases=" << graphs << " replays_per_case=3\n";
+        int grouped_cases = 0;
+        struct GroupedCase { int group_size, width, bits; };
+        for (const auto fixture : {GroupedCase{5, 640, 0}, GroupedCase{24, 2560, 4}, GroupedCase{28, 2560, 5},
+                GroupedCase{48, 2560, 8}, GroupedCase{24, 1536, 0}})
+            for (int offset : {0, 1})
+                check_single(fixture.group_size, fixture.width, fixture.bits, offset, 8, 9,
+                    grouped_cases, true);
+        std::cout << "NINT grouped reduction ordinary/changing graphs cases=" << grouped_cases
+                  << " max_nrmse=" << grouped_max_nrmse
+                  << " max_absolute=" << grouped_max_absolute << " PASS\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';

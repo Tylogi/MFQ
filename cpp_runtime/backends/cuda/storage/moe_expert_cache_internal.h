@@ -1,3 +1,4 @@
+#include "../runtime/execution_options.h"
 #pragma once
 
 #include "moe_cache_types_internal.h"
@@ -44,22 +45,17 @@ public:
             std::make_unique<mfq::cuda::MfeMxfp4ReadPool>(
                 config.moe_ssd_io_workers);
         range_overlap_enabled_ = config.moe_ssd_overlap;
-        if(const auto* value=std::getenv("MFQ_TRACE_CPU_ROWS"))
-            pipeline_cpu_profile_enabled_=std::strcmp(value,"1")==0;
-        if(const auto* value=std::getenv("MFQ_TRACE_CPU_ROWS_FAIL_ALLOC"))
-            pipeline_cpu_profile_fail_alloc_=std::strcmp(value,"1")==0;
-        if(const auto* value=std::getenv("MFQ_TRACE_MOE_DMA"))
-            pipeline_dma_profile_enabled_=std::strcmp(value,"1")==0;
-        if(const auto* value=std::getenv("MFQ_TRACE_MOE_DMA_FAIL_ALLOC"))
-            pipeline_dma_profile_fail_alloc_=std::strcmp(value,"1")==0;
-        if(const auto* value=std::getenv("MFQ_MOE_SHARED_CPU_COST"))
-            pipeline_shared_cpu_cost_=std::strcmp(value,"1")==0;
-        if(const auto* path=std::getenv("MFQ_MOE_DISPATCH_RECORD"))pipeline_dispatch_record_path_=path;
-        if(const auto* path=std::getenv("MFQ_MOE_MISS_RECORD")) {
-            pipeline_miss_record_path_=path;pipeline_dispatch_capture_required_=!pipeline_miss_record_path_.empty();
-        }
-        if(const auto* path=std::getenv("MFQ_MOE_DISPATCH_REPLAY")) {
-            std::ifstream input(path);if(!input)throw std::runtime_error("cannot open required MFQ dispatch replay");
+        const auto diagnostics=mfq::cuda::runtime_options::moe_diagnostics();
+        pipeline_cpu_profile_enabled_=diagnostics.cpu_rows;
+        pipeline_cpu_profile_fail_alloc_=diagnostics.cpu_rows_fail_alloc;
+        pipeline_dma_profile_enabled_=diagnostics.dma;
+        pipeline_dma_profile_fail_alloc_=diagnostics.dma_fail_alloc;
+        pipeline_shared_cpu_cost_=diagnostics.shared_cpu_cost;
+        pipeline_dispatch_record_path_=diagnostics.dispatch_record;
+        pipeline_miss_record_path_=diagnostics.miss_record;
+        pipeline_dispatch_capture_required_=!pipeline_miss_record_path_.empty();
+        if(diagnostics.dispatch_replay) {
+            std::ifstream input(*diagnostics.dispatch_replay);if(!input)throw std::runtime_error("cannot open required MFQ dispatch replay");
             std::string line;
             while(std::getline(input,line)) {
                 DispatchRecord row;int64_t routes=0,cpu=0;std::istringstream fields(line);
@@ -702,9 +698,7 @@ private:
     CudaExecutionConfig config_;
     double ram_pcie_fraction_=0;
     double pipeline_pcie_gbps_=0;
-    bool pipeline_cpu_transfer_budget_=[] {
-        const auto* flag=std::getenv("MFQ_MOE_CPU_TRANSFER_BUDGET");return !flag || flag[0]!='0';
-    }();
+    bool pipeline_cpu_transfer_budget_=mfq::cuda::runtime_options::cpu_transfer_budget();
     bool pipeline_comparison_cpu_policy_=false;
     std::uint64_t pipeline_cpu_policy_changed_routes_=0;
     bool pipeline_shared_cpu_cost_=false;
@@ -722,12 +716,8 @@ private:
     std::unique_ptr<MoeResidencyManager> moe_residency_;
     std::vector<std::array<int,3>> pipeline_bundles_;
     std::unordered_map<std::string,std::unique_ptr<MoeGpuArena>> pipeline_stages_;
-    bool pipeline_transfer_cache_=[] {
-        const auto* flag=std::getenv("MFQ_MOE_TRANSFER_CACHE");return flag && flag[0]!='0';
-    }();
-    bool pipeline_mapped_copy_=[] {
-        const auto* flag=std::getenv("MFQ_MOE_MAPPED_COPY");return flag && flag[0]!='0';
-    }();
+    bool pipeline_transfer_cache_=mfq::cuda::runtime_options::transfer_cache();
+    bool pipeline_mapped_copy_=mfq::cuda::runtime_options::mapped_copy();
     std::vector<MoeCacheNewLease> pipeline_transfer_slots_;
     mfq_tensor_backend::Tensor pipeline_host_stage_;
     mfq_tensor_backend::Tensor pipeline_wire_gpu_;

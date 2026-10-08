@@ -1,3 +1,4 @@
+#include "../runtime/execution_options.h"
 #include "moe_ffn_pipeline.h"
 #include "moe_cached_source_internal.h"
 #include "cpu_projection_rows.h"
@@ -276,11 +277,9 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         }
         cell.transfer_cache=cell.two_stage && cache_->pipeline_transfer_cache_ && cache_->pipeline_ram_registered_bytes_>0;
         cell.mapped_copy=cell.transfer_cache && cache_->pipeline_mapped_copy_;
-        const auto* phases=std::getenv("MFQ_MOE_FFN_TRANSFER_PHASES");
         cell.phased_transfer=cell.transfer_cache && !cell.mapped_copy &&
-            execution.config.moe_ffn_transfer_phases.value_or(!phases || std::string(phases)=="1");
-        const auto* overlap=std::getenv("MFQ_MOE_MAPPED_COPY_OVERLAP");
-        cell.mapped_overlap=cell.mapped_copy && overlap && std::string(overlap)=="1";
+            execution.config.moe_ffn_transfer_phases.value_or(mfq::cuda::runtime_options::phased_transfer());
+        cell.mapped_overlap=cell.mapped_copy && mfq::cuda::runtime_options::mapped_copy_overlap();
         if(cell.transfer_cache)for(int p=0;p<3;++p)for(auto& cohort:sources_[p]->cohorts_) {
             auto& arena=stage(p,cohort);
             if(!arena.book)arena.book=std::make_unique<mfq::MoeCacheSlotBook>(arena.slots);
@@ -571,9 +570,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
     void plan(Cell& cell) {
         const bool must_drain=!cell.in_window || !cache_->pipeline_dispatch_replay_.empty();
         const bool calibration_busy=cache_->pipeline_cpu_calibration_.collect(cache_->pipeline_cpu_cost_,must_drain);
-        const auto* shadow_flag=std::getenv("MFQ_MOE_CPU_BACKGROUND_CALIBRATION");
         const bool shadow=cell.in_window && cache_->pipeline_shared_cpu_cost_ &&
-            cache_->pipeline_cpu_transfer_budget_ && (!shadow_flag || std::strcmp(shadow_flag,"1")==0) && cache_->pipeline_dispatch_replay_.empty();
+            cache_->pipeline_cpu_transfer_budget_ && mfq::cuda::runtime_options::background_calibration() && cache_->pipeline_dispatch_replay_.empty();
         cell.calibration_expert=-1;
         std::vector<int32_t> ids(cell.host_ids.h<int32_t>(),cell.host_ids.h<int32_t>()+cell.entries);
         auto resident=[&](int e) {return std::all_of(sources_.begin(),sources_.end(),[&](const auto& s){return s->quant_source_->gpu_resident(e);});};
@@ -677,10 +675,8 @@ class MoeFfnPipeline : public std::enable_shared_from_this<MoeFfnPipeline> {
         if(calibration_busy)for(auto& group:cell.plan.groups)
             if(group.kind==mfq::MoeDispatchKind::Cpu)group.kind=mfq::MoeDispatchKind::GpuTransfer;
         std::memset(cell.kind.host,0,cell.kind.bytes);std::memset(cell.local.host,0xff,cell.local.bytes);
-        const auto* early_gu_option=std::getenv("MFQ_MFE_EARLY_GU");
-        const auto* parallel_gu_option=std::getenv("MFQ_MFE_PARALLEL_GU");
         const bool early_gu=cell.two_stage && cell.fused->batch().resident_plan_overlap &&
-            (!early_gu_option || early_gu_option[0]!='0') && (!parallel_gu_option || parallel_gu_option[0]!='0');
+            mfq::cuda::runtime_options::early_gate_up() && mfq::cuda::runtime_options::parallel_gate_up();
         cache_->stats_.pipeline_early_gate_up_enabled=early_gu;
         for(auto& group:cell.plan.groups) {
             // Mixed formats have projection-granular residency. A partial

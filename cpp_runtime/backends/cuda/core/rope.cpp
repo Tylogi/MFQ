@@ -1,3 +1,4 @@
+#include "../runtime/execution_options.h"
 #include "rope.h"
 
 #include "cuda_execution.h"
@@ -266,13 +267,13 @@ RotaryEmbedding::RotaryEmbedding(int64_t dimension, int64_t maximum, double base
                                std::optional<bool> fused)
     : dimension_(dimension), maximum_(maximum), base_(base), sections_(std::move(sections)),
       interleaved_(interleaved) {
-    const auto* configured = std::getenv("MFQ_ROTARY_FUSED");
+    const auto configured = runtime_options::rotary_fusion();
 #ifdef MFQ_NATIVE_CUDA_RUNTIME
     constexpr bool default_fused = true;
 #else
     constexpr bool default_fused = false;
 #endif
-    fused_ = fused.value_or(configured ? std::strcmp(configured, "1") == 0 : default_fused);
+    fused_ = fused.value_or(configured.value_or(default_fused));
     MFQ_RUNTIME_CHECK(dimension > 0 && dimension % 2 == 0 && maximum > 0 &&
                           std::isfinite(base) && base > 0,
                       "invalid rotary configuration");

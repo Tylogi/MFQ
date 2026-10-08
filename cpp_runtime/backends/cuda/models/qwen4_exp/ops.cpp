@@ -1,3 +1,4 @@
+#include "../../runtime/execution_options.h"
 #include "mfq_cuda_moe_ops.h"
 #include "ops.h"
 #include "model.h"
@@ -285,8 +286,7 @@ struct Qwen4Block final : Block {
     Tensor execute_graph(CudaExecutionContext& execution,Tensor x,const Tensor& ids,
                          const Tensor& positions,const Tensor& cache_positions,const Tensor& ple_rows,int layer) {
         const auto mark=[&](const char* phase){if(auto* window=DecodeWindow::recording())window->mark(layer,phase);};
-        const auto* detail=std::getenv("MFQ_TRACE_MHC_TIMINGS");
-        const bool detailed=detail && detail[0]=='1' && detail[1]=='\0';
+        const bool detailed=mfq::cuda::runtime_options::mhc_timings();
         const auto marker=[&](const char* role)->GatedResidualMarker {
             if(!detailed || !DecodeWindow::recording())return {};
             return [&,role](const char* phase) {
@@ -482,7 +482,7 @@ struct Qwen4DecodeGraph {
         std::vector<std::unique_ptr<PleStage>> ple;
         DecodeWindow window;
         Cell(int tokens,int hidden,const std::vector<std::unique_ptr<Block>>& blocks,cudaStream_t stream)
-            :window(stream,std::getenv("MFQ_TRACE_LAYER_TIMINGS") && std::string(std::getenv("MFQ_TRACE_LAYER_TIMINGS"))!="0") {
+            :window(stream,mfq::cuda::runtime_options::layer_timings()) {
             namespace tb=mfq_tensor_backend;
             const auto options=tb::TensorOptions().device(tb::kCUDA).dtype(tb::kInt64);
             ids=tb::zeros({1,tokens},options);positions=tb::zeros({tokens},options);cache_positions=tb::zeros({tokens},options);
@@ -498,8 +498,7 @@ struct Qwen4DecodeGraph {
     std::vector<qwen4_exp::Qsa*> qsa;
     bool failed=false;
     explicit Qwen4DecodeGraph(Qwen4CausalLm& model):stream(mfq_get_current_cuda_stream()),ple_stream(mfq_get_stream_from_pool()) {
-        const auto* setting=std::getenv("MFQ_MOE_ROUTER_LOOKAHEAD");
-        const bool enabled=model.router_lookahead.value_or(setting && std::strcmp(setting,"1")==0);
+        const bool enabled=model.router_lookahead.value_or(mfq::cuda::runtime_options::router_lookahead());
         for(std::size_t i=0;i<model.blocks.size();++i) {
             auto& current=static_cast<qwen4_exp::Qwen4Block&>(*model.blocks[i]);
             current.next_router={};current.next_prefetch={};

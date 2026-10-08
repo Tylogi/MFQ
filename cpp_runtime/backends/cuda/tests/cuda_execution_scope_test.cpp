@@ -1,4 +1,5 @@
 #include "cuda_execution.h"
+#include "../runtime/execution_options.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -6,7 +7,33 @@
 #include <utility>
 #include <vector>
 
+namespace {
+void set_option(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) setenv(name, value, 1); else unsetenv(name);
+#endif
+}
+}
+
 int main() {
+    using namespace mfq::cuda::runtime_options;
+    // Ablation switches must remain live between calls; ordinary generation
+    // must honor the same explicit residency override as benchmark modes.
+    set_option("MFQ_MFE_RESIDENT_PLAN_OVERLAP", "1");
+    if (!resident_plan_overlap()) return 1;
+    set_option("MFQ_MFE_RESIDENT_PLAN_OVERLAP", "0");
+    if (resident_plan_overlap()) return 1;
+    set_option("MFQ_MFE_RESIDENT_PLAN_OVERLAP", nullptr);
+    set_option("MFQ_MFE_EARLY_GU", "0");
+    if (early_gate_up()) return 1;
+    set_option("MFQ_MFE_EARLY_GU", nullptr);
+    if (!early_gate_up()) return 1;
+    set_option("MFQ_MOE_RESIDENCY_ADAPT", "0");
+    if (load_cuda_execution_config().moe_residency_adapt) return 1;
+    set_option("MFQ_MOE_RESIDENCY_ADAPT", nullptr);
+    if (!load_cuda_execution_config().moe_residency_adapt) return 1;
 #ifdef _WIN32
     _putenv_s("MFQ_DISABLE_NVQ_FUSION", "1");
 #else

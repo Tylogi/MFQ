@@ -1,3 +1,4 @@
+#include "../runtime/execution_options.h"
 #include "cuda_execution.h"
 
 #include "mfq_cuda_quant_ops.h"
@@ -72,6 +73,66 @@ bool enabled_unless_disabled(const char* name) {
 }
 
 } // namespace
+
+namespace mfq::cuda::runtime_options {
+namespace {
+bool exact_one(const char* name, bool fallback = false) {
+    const auto* value = std::getenv(name);
+    return value ? std::string_view(value) == "1" : fallback;
+}
+bool first_nonzero(const char* name, bool fallback) {
+    const auto* value = std::getenv(name);
+    return value ? value[0] != '0' : fallback;
+}
+}
+bool resident_plan_overlap() {
+    const auto* value = std::getenv("MFQ_MFE_RESIDENT_PLAN_OVERLAP");
+    return value && std::atoi(value) == 1;
+}
+std::optional<bool> rotary_fusion() {
+    const auto* value = std::getenv("MFQ_ROTARY_FUSED");
+    return value ? std::optional<bool>(std::string_view(value) == "1") : std::nullopt;
+}
+bool mhc_timings() { return exact_one("MFQ_TRACE_MHC_TIMINGS"); }
+bool layer_timings() {
+    const auto* value = std::getenv("MFQ_TRACE_LAYER_TIMINGS");
+    return value && std::string_view(value) != "0";
+}
+bool router_lookahead() { return exact_one("MFQ_MOE_ROUTER_LOOKAHEAD"); }
+std::size_t workspace_reserve_bytes() {
+    std::size_t reserve = std::size_t(4) * 1024 * 1024 * 1024;
+    if (const auto* value = std::getenv("MFQ_CUDA_WORKSPACE_RESERVE_GIB")) {
+        char* end = nullptr;
+        const double gib = std::strtod(value, &end);
+        const long double bytes = static_cast<long double>(gib) * 1024 * 1024 * 1024;
+        if (end == value || *end || !std::isfinite(gib) || gib < 0 ||
+                bytes > std::numeric_limits<std::size_t>::max())
+            throw std::runtime_error("MFQ_CUDA_WORKSPACE_RESERVE_GIB must be finite and non-negative");
+        reserve = static_cast<std::size_t>(bytes);
+    }
+    return reserve;
+}
+bool phased_transfer() { return exact_one("MFQ_MOE_FFN_TRANSFER_PHASES", true); }
+bool mapped_copy_overlap() { return exact_one("MFQ_MOE_MAPPED_COPY_OVERLAP"); }
+bool background_calibration() { return exact_one("MFQ_MOE_CPU_BACKGROUND_CALIBRATION", true); }
+bool early_gate_up() { return first_nonzero("MFQ_MFE_EARLY_GU", true); }
+bool parallel_gate_up() { return first_nonzero("MFQ_MFE_PARALLEL_GU", true); }
+bool cpu_transfer_budget() { return first_nonzero("MFQ_MOE_CPU_TRANSFER_BUDGET", true); }
+bool transfer_cache() { return first_nonzero("MFQ_MOE_TRANSFER_CACHE", false); }
+bool mapped_copy() { return first_nonzero("MFQ_MOE_MAPPED_COPY", false); }
+MoeDiagnostics moe_diagnostics() {
+    MoeDiagnostics result;
+    result.cpu_rows = exact_one("MFQ_TRACE_CPU_ROWS");
+    result.cpu_rows_fail_alloc = exact_one("MFQ_TRACE_CPU_ROWS_FAIL_ALLOC");
+    result.dma = exact_one("MFQ_TRACE_MOE_DMA");
+    result.dma_fail_alloc = exact_one("MFQ_TRACE_MOE_DMA_FAIL_ALLOC");
+    result.shared_cpu_cost = exact_one("MFQ_MOE_SHARED_CPU_COST");
+    if (const auto* path = std::getenv("MFQ_MOE_DISPATCH_RECORD")) result.dispatch_record = path;
+    if (const auto* path = std::getenv("MFQ_MOE_MISS_RECORD")) result.miss_record = path;
+    if (const auto* path = std::getenv("MFQ_MOE_DISPATCH_REPLAY")) result.dispatch_replay = path;
+    return result;
+}
+} // namespace mfq::cuda::runtime_options
 
 CudaExecutionConfig load_cuda_execution_config() {
     CudaExecutionConfig result;

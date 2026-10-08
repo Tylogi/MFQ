@@ -1,3 +1,4 @@
+#include "../runtime/execution_options.h"
 #include "moe_cached_source_internal.h"
 #include <map>
 #include <cmath>
@@ -56,14 +57,7 @@ void MoeExpertCache::finalize() {
     if(cuda_context->memory_stats().limit)cuda_context->stream().synchronize();
     const auto memory=cuda_context->memory_stats();
     if(memory.limit) {
-        std::size_t reserve=std::size_t(4)*1024*1024*1024;
-        if(const auto* value=std::getenv("MFQ_CUDA_WORKSPACE_RESERVE_GIB")) {
-            char* end=nullptr;const double gib=std::strtod(value,&end);
-            const long double bytes=static_cast<long double>(gib)*1024*1024*1024;
-            if(end==value || *end || !std::isfinite(gib) || gib<0 || bytes>std::numeric_limits<std::size_t>::max())
-                throw std::runtime_error("MFQ_CUDA_WORKSPACE_RESERVE_GIB must be finite and non-negative");
-            reserve=static_cast<std::size_t>(bytes);
-        }
+        const auto reserve=mfq::cuda::runtime_options::workspace_reserve_bytes();
         const auto model_bytes=std::max(memory.allocated,cuda_context->local_memory_usage());
         if(model_bytes>=memory.limit || reserve>=memory.limit-model_bytes)
             throw std::runtime_error("CUDA VRAM limit leaves no room for expert arenas");

@@ -1,3 +1,4 @@
+#include "../runtime/execution_options.h"
 #include "mfe_ffn_runtime.h"
 #include <cstring>
 #include <cstdlib>
@@ -179,8 +180,7 @@ void MfeFfnRuntime::asynchronous(const int32_t* kinds,const uint32_t* plan,const
     batch_.plan_ready=plan;batch_.transfer_ready=transfer;batch_.cpu_ready=cpu_ready;
     batch_.aborted=reinterpret_cast<uint32_t*>(aborted_.data_ptr<int32_t>());batch_.host_aborted=abort;
     batch_.cpu_pairs=reinterpret_cast<const __half*>(cpu_pairs);
-    const auto* overlap=std::getenv("MFQ_MFE_RESIDENT_PLAN_OVERLAP");
-    batch_.resident_plan_overlap=overlap && std::atoi(overlap)==1;
+    batch_.resident_plan_overlap=mfq::cuda::runtime_options::resident_plan_overlap();
 }
 mfq::cuda::MfePackedProjection MfeFfnRuntime::expert_view(int p,int expert,
         const std::vector<int64_t>& bytes,int slot)const {
