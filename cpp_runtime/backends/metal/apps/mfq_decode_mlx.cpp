@@ -1221,6 +1221,7 @@ public:
     }
 
     std::vector<std::pair<std::string, double>> metrics() const {
+        std::lock_guard control_lock(paged_control_mutex_);
         if constexpr (Codec::available) {
             if (paged_cache_) {
                 const auto value = paged_cache_->metrics();
@@ -1244,6 +1245,7 @@ public:
                     {"prefix_cache_resident_bytes", static_cast<double>(value.resident_bytes)},
                     {"prefix_cache_hot_pressure_bytes", static_cast<double>(value.hot_pressure_bytes)},
                     {"prefix_cache_dynamic_budget", 1.0},
+                    {"prefix_cache_concurrent_maintenance", 1.0},
                     {"prefix_cache_low_disk_space_skips", static_cast<double>(value.low_disk_space_skips)},
                     {"prefix_cache_failed_writes", static_cast<double>(value.failed_writes)},
                     {"prefix_cache_pending_writes", static_cast<double>(value.pending_writes)},
@@ -1304,9 +1306,9 @@ public:
     }
 
     std::uint64_t trim_hot(std::uint64_t target_bytes) {
+        std::lock_guard control_lock(paged_control_mutex_);
         if constexpr (Codec::available) {
             if (paged_cache_) {
-                paged_cache_->flush();
                 const auto released = paged_cache_->trim_hot(target_bytes);
                 if (released > 0) release_host_allocator_cache();
                 return released;
@@ -1316,6 +1318,7 @@ public:
     }
 
     std::uint64_t set_hot_limit(std::uint64_t max_bytes) {
+        std::lock_guard control_lock(paged_control_mutex_);
         if (!paged_cache_) return 0;
         paged_hot_budget_ = max_bytes;
         const auto released = paged_cache_->set_hot_limit(max_bytes);
@@ -1324,6 +1327,7 @@ public:
     }
 
     std::uint64_t set_disk_limit(std::uint64_t max_bytes) {
+        std::lock_guard control_lock(paged_control_mutex_);
         if (!paged_cache_) return 0;
         paged_disk_budget_ = max_bytes;
         return paged_cache_->set_disk_limit(max_bytes);
@@ -1341,9 +1345,12 @@ public:
         std::uint64_t disk_budget,
         std::uint64_t hot_budget) {
         clear_live_sessions();
-        paged_cache_ = std::move(cache);
-        paged_disk_budget_ = disk_budget;
-        paged_hot_budget_ = hot_budget;
+        {
+            std::lock_guard control_lock(paged_control_mutex_);
+            paged_cache_.swap(cache);
+            paged_disk_budget_ = disk_budget;
+            paged_hot_budget_ = hot_budget;
+        }
         sync_paged_telemetry();
     }
 
@@ -1713,6 +1720,7 @@ private:
     std::unordered_map<std::string, std::vector<Entry>> states_;
     std::unordered_map<std::string, PagedBinding> paged_bindings_;
     std::shared_ptr<mfq::cache::PagedPrefixCache> paged_cache_;
+    mutable std::mutex paged_control_mutex_;
     std::uint64_t paged_disk_budget_ = 0;
     std::uint64_t paged_hot_budget_ = 0;
     std::size_t max_sessions_ = 4;
@@ -2155,19 +2163,18 @@ public:
     mfq::engine::SessionResult session(const mfq::engine::SessionCommand& command) override {
         using Kind = mfq::engine::SessionCommand::Kind;
         if (command.kind == Kind::metrics) return {0, session_cache->metrics()};
+        if (command.kind == Kind::trim) return {session_cache->trim_hot(command.bytes), {}};
+        if (command.kind == Kind::budget) {
+            const auto released = session_cache->set_hot_limit(command.bytes);
+            if (command.disk_bytes) session_cache->set_disk_limit(*command.disk_bytes);
+            return {released, {}};
+        }
         std::lock_guard lock(*runtime_mutex);
         switch (command.kind) {
         case Kind::fork:
             return {session_cache->fork_session(command.source, command.target), {}};
         case Kind::close:
             return {session_cache->close_session(command.source), {}};
-        case Kind::trim:
-            return {session_cache->trim_hot(command.bytes), {}};
-        case Kind::budget: {
-            const auto released = session_cache->set_hot_limit(command.bytes);
-            if (command.disk_bytes) session_cache->set_disk_limit(*command.disk_bytes);
-            return {released, {}};
-        }
         case Kind::memory_budget: {
             const auto previous = resident_budget.load();
             const auto before = mlx::core::get_active_memory();
@@ -2202,6 +2209,8 @@ public:
             release_allocator_caches();
             return {released, {}};
         }
+        case Kind::trim:
+        case Kind::budget:
         case Kind::metrics: break;
         }
         throw std::invalid_argument("unknown Metal session command");
