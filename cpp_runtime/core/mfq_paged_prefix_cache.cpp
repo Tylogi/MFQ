@@ -850,18 +850,18 @@ public:
     void flush() {
         std::unique_lock<std::mutex> lock(mutex_);
         writes_finished_.wait(lock, [this] {
-            return writes_.empty() && active_writes_ == 0;
+            return writes_.empty() && active_writes_ == 0 && !disk_budget_pending_;
         });
     }
 
     std::uint64_t set_disk_limit(std::uint64_t max_bytes) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        writes_finished_.wait(lock, [this] { return writes_.empty() && active_writes_ == 0; });
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (config_.max_disk_bytes == max_bytes) return 0;
+        disk_identity_pending_ |= config_.max_disk_bytes == 0 && max_bytes > 0;
         config_.max_disk_bytes = max_bytes;
-        if (max_bytes > 0) write_identity();
-        const auto before = disk_bytes_;
-        enforce_disk_budget_locked();
-        return before - disk_bytes_;
+        disk_budget_pending_ = true;
+        work_available_.notify_one();
+        return 0;
     }
 
     std::size_t refresh_disk_index() {
@@ -1228,8 +1228,17 @@ private:
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 work_available_.wait(lock, [this] {
-                    return stopping_ || !writes_.empty();
+                    return stopping_ || !writes_.empty() || disk_budget_pending_;
                 });
+                if (disk_budget_pending_) {
+                    if (disk_identity_pending_) {
+                        write_identity();
+                        disk_identity_pending_ = false;
+                    }
+                    disk_budget_pending_ = enforce_disk_budget_locked(0, 1);
+                    writes_finished_.notify_all();
+                    continue;
+                }
                 if (stopping_ && writes_.empty()) return;
                 request = std::move(writes_.front());
                 writes_.pop_front();
@@ -1453,9 +1462,11 @@ private:
         return std::min(config_.max_disk_bytes, safe_available);
     }
 
-    void enforce_disk_budget_locked(std::uint64_t reserved_bytes = 0) {
+    bool enforce_disk_budget_locked(std::uint64_t reserved_bytes = 0,
+        std::size_t max_evictions = std::numeric_limits<std::size_t>::max()) {
         const auto budget = effective_disk_budget_locked();
         const auto target = reserved_bytes >= budget ? 0 : budget - reserved_bytes;
+        std::size_t evicted = 0;
         while (disk_bytes_ > target && !disk_.empty()) {
             auto victim = disk_.end();
             for (auto iterator = disk_.begin(); iterator != disk_.end();
@@ -1481,8 +1492,10 @@ private:
             disk_.erase(victim);
             forget_tail_if_unused_locked(hash);
             ++metrics_.evictions;
+            if (++evicted >= max_evictions) break;
         }
         sync_metrics_locked();
+        return disk_bytes_ > target && evicted == max_evictions;
     }
 
     void schedule_tail_cleanup_locked(const BlockHash& hash, const BlockHash& parent,
@@ -1595,6 +1608,8 @@ private:
     std::uint64_t cache_epoch_ = 0;
     std::size_t active_writes_ = 0;
     bool stopping_ = false;
+    bool disk_budget_pending_ = false;
+    bool disk_identity_pending_ = false;
     bool clearing_ = false;
     PagedPrefixCacheMetrics metrics_;
     std::atomic<std::uint64_t> temp_counter_{0};

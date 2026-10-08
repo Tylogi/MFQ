@@ -13,6 +13,11 @@ from tests.test_runtime_memory_policy import GIB, artifact
 from tests.test_server_models import _TestJobContext
 
 
+@pytest.fixture(autouse=True)
+def fixed_host_capacity(monkeypatch):
+    monkeypatch.setattr('mfq.server.runtime.runtime_pool.host_memory_snapshot', lambda: None)
+
+
 class BudgetBackend:
     def __init__(self, dense, experts, kv, prefix, limit, events):
         self.dense, self.experts, self.kv, self.prefix, self.limit = dense, experts, kv, prefix, limit

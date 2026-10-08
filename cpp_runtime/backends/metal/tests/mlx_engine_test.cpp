@@ -107,8 +107,13 @@ int main() {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             require(native->produced <= 4, "unbounded output while scheduler is paused");
             require(std::get<Metrics>(loaded->control(RuntimeMetrics{})).size() == 1, "responsive metrics");
+            for (const auto kind : {SessionCommand::Kind::metrics, SessionCommand::Kind::trim,
+                    SessionCommand::Kind::budget})
+                require(loaded->session({kind}).metrics.size() == 1, "concurrent cache maintenance");
             rejects([&] { loaded->reload(128); });
             rejects([&] { loaded->session({SessionCommand::Kind::clear}); });
+            rejects([&] { loaded->session({SessionCommand::Kind::memory_budget}); });
+            rejects([&] { loaded->session({SessionCommand::Kind::refresh}); });
             loaded->cancel("test");
             auto event = finish(*loaded);
             require(cleanup_failure ? std::holds_alternative<Failed>(event) :

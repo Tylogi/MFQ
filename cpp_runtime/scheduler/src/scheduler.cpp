@@ -237,8 +237,11 @@ void MfqScheduler::loop() noexcept {
                         for (const auto& [id, request] : requests_) {
                             const auto& session = request.input.input.cache_plan.session_id;
                             if (value.request.kind == SessionCommand::Kind::clear ||
-                                value.request.kind == SessionCommand::Kind::trim ||
-                                session == value.request.source || session == value.request.target)
+                                value.request.kind == SessionCommand::Kind::memory_budget ||
+                                value.request.kind == SessionCommand::Kind::refresh ||
+                                ((value.request.kind == SessionCommand::Kind::fork ||
+                                  value.request.kind == SessionCommand::Kind::close) &&
+                                 (session == value.request.source || session == value.request.target)))
                                 throw std::runtime_error("session operation conflicts with active generation");
                         }
                     }

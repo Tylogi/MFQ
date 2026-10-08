@@ -33,7 +33,9 @@ Generation MlxEngine::generate(const RequestId&, ExecutionRequest& request) {
 }
 SessionResult MlxEngine::session(const SessionCommand& command) {
     if (!model_) throw std::runtime_error("Metal engine is unloaded");
-    if (command.kind != SessionCommand::Kind::metrics && !requests_.empty())
+    if (command.kind != SessionCommand::Kind::metrics &&
+        command.kind != SessionCommand::Kind::trim &&
+        command.kind != SessionCommand::Kind::budget && !requests_.empty())
         throw std::runtime_error("session operation requires a quiescent Metal engine");
     return model_->session(command);
 }

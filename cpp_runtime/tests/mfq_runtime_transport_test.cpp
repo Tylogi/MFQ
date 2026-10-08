@@ -196,6 +196,14 @@ int main() {
         drain(blocked, true);
         auto session = request(4, 100); session.input.cache_plan.session_id = "session";
         auto handle = scheduler.submit(session);
+        assert(scheduler.session({SessionCommand::Kind::trim}).count == 7);
+        assert(scheduler.session({SessionCommand::Kind::budget}).count == 7);
+        for (const auto kind : {SessionCommand::Kind::clear, SessionCommand::Kind::memory_budget,
+                SessionCommand::Kind::refresh}) {
+            bool rejected = false;
+            try { scheduler.session({kind}); } catch (const std::runtime_error&) { rejected = true; }
+            assert(rejected);
+        }
         session.id = "5";
         bool conflict = false;
         try { scheduler.submit(session); } catch (const std::invalid_argument&) { conflict = true; }
