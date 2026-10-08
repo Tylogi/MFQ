@@ -245,6 +245,9 @@ int main(int argc, char** argv) {
                     if (auto* native = dynamic_cast<mfq::metal::MlxPreparableKernel*>(primitive.get())) {
                         kernel_keys.push_back(native->preparation_key());
                     }
+                    if (std::string_view(primitive->name()) == "CustomKernel")
+                        kernel_keys.push_back(std::get<0>(
+                            static_cast<mlx::core::fast::CustomKernel*>(primitive.get())->state()));
                     for (const auto& dependency : value.inputs()) self(self, dependency);
                 };
                 collect_kernels(collect_kernels, routed(0));

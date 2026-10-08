@@ -82,7 +82,8 @@ Fixture make_fixture(
     int fp_scale_kind = 4,
     int rows = 8,
     int columns = 128,
-    int uniform_q = 0) {
+    int uniform_q = 0,
+    int maximum_q = 8) {
     const bool mxfp8 = dtype == "MXFP8-SQ";
     const int block_rows = mxfp8 ? mx_block_rows : 128;
     const int block_columns = mxfp8 ? mx_block_columns : 128;
@@ -101,17 +102,20 @@ Fixture make_fixture(
     std::vector<std::vector<std::uint8_t>> streams;
     std::vector<float> dense(static_cast<std::size_t>(rows) * columns);
     for (int row = 0; row < rows; ++row) {
-        const int bits = uniform_q != 0 ? uniform_q : row % 8 + 1;
+        const int bits = uniform_q != 0 ? uniform_q : row % maximum_q + 1;
         q.push_back(static_cast<std::uint8_t>(bits - 1));
         std::vector<std::uint8_t> values(columns);
+        std::uint32_t symbol_state = 0x9e3779b9u ^ static_cast<std::uint32_t>(row + 1);
         for (int column = 0; column < columns; ++column) {
+            symbol_state ^= symbol_state << 13;
+            symbol_state ^= symbol_state >> 17;
+            symbol_state ^= symbol_state << 5;
             std::uint8_t code = 0;
             if (bits == 8) {
                 code = legal[static_cast<std::size_t>(column * 13 + 151) % legal.size()];
                 values[column] = code;
             } else {
-                const auto symbol = static_cast<std::uint8_t>(
-                    (row * 11 + column * 5) & ((1 << bits) - 1));
+                const auto symbol = static_cast<std::uint8_t>(symbol_state & ((1u << bits) - 1u));
                 values[column] = symbol;
                 code = palettes[(1u << bits) - 2u + symbol];
             }
@@ -231,9 +235,10 @@ void test_format(
     }
 }
 
-void test_varied_scale_dequantize(const std::string& dtype, int kind, int columns) {
+void test_varied_scale_dequantize(const std::string& dtype, int kind, int columns,
+    int maximum_q = 8) {
     using namespace mlx::core;
-    auto fixture = make_fixture(dtype, 32, 32, kind, 129, columns);
+    auto fixture = make_fixture(dtype, 32, 32, kind, 129, columns, 0, maximum_q);
     const auto original = mfq::metal::MlxFp8SqWeight::from_blob(dtype, fixture.blob);
     const auto layout = original.wire_layout();
     constexpr std::array<std::uint16_t, 6> bf16{0x3ec0, 0x3f81, 0x4001, 0x3881, 0x3f35, 0x4049};
@@ -273,15 +278,35 @@ void test_varied_scale_dequantize(const std::string& dtype, int kind, int column
                     + " index=" + std::to_string(index));
         }
     }
+    if (maximum_q < 8) {
+        std::vector<float> values(columns);
+        for (int column = 0; column < columns; ++column) {
+            values[column] = float(column % 19 - 9) / 128.0f;
+        }
+        auto input = astype(array(values.begin(), Shape{1, columns}), float16);
+        auto actual = astype(weight.matmul(input), float32);
+        eval(actual);
+        for (int row = 0; row < fixture.rows; ++row) {
+            double expected = 0.0;
+            for (int column = 0; column < columns; ++column) {
+                expected += double(values[column]) * fixture.dense[row * columns + column];
+            }
+            require(std::fabs(actual.data<float>()[row] - expected)
+                    < std::max(0.003, std::fabs(expected) * 0.001),
+                dtype + " varied-scale matmul mismatch");
+        }
+    }
 }
 
 void test_uniform_forward(const std::string& dtype, int bits,
-    int output_rows, int columns) {
+    int output_rows, int columns, int maximum_q = 8) {
     using namespace mlx::core;
-    const auto fixture = make_fixture(dtype, 32, 32, 4, output_rows, columns, bits);
+    const auto fixture = make_fixture(dtype, 32, 32, 4, output_rows, columns, bits, maximum_q);
     const auto weight = mfq::metal::MlxFp8SqWeight::from_blob(dtype, fixture.blob);
-    require(weight.descriptor().distribution_entropy == 0.0,
+    require(bits == 0 || weight.descriptor().distribution_entropy == 0.0,
             dtype + " uniform-q entropy mismatch");
+    require(weight.descriptor().q_mask == (bits == 0 ? (1u << maximum_q) - 1u : 1u << (bits - 1)),
+            dtype + " q mask mismatch");
     const mfq::metal::MlxGroupedLinear grouped({&weight, &weight});
     for (int tokens = 1; tokens <= 6; ++tokens) {
         std::vector<float> values(static_cast<std::size_t>(tokens) * columns);
@@ -315,12 +340,13 @@ void test_uniform_forward(const std::string& dtype, int bits,
 }
 
 void test_projection_group(const std::string& dtype,
-    mlx::core::Dtype input_dtype = mlx::core::float16, int columns = 128) {
+    mlx::core::Dtype input_dtype = mlx::core::float16, int columns = 128,
+    int first_maximum_q = 8, int second_maximum_q = 8) {
     using namespace mlx::core;
     const auto first_fixture = make_fixture(
-        dtype, 32, 32, dtype == "MXFP8-SQ" ? 1 : 4, 8, columns);
+        dtype, 32, 32, dtype == "MXFP8-SQ" ? 1 : 4, 8, columns, 0, first_maximum_q);
     const auto second_fixture = make_fixture(
-        dtype, 32, 32, dtype == "MXFP8-SQ" ? 1 : 4, 6, columns);
+        dtype, 32, 32, dtype == "MXFP8-SQ" ? 1 : 4, 6, columns, 0, second_maximum_q);
     const auto first = mfq::metal::MlxFp8SqWeight::from_blob(
         dtype, first_fixture.blob);
     const auto second = mfq::metal::MlxFp8SqWeight::from_blob(
@@ -423,13 +449,13 @@ void test_packed_backward(
     }
 }
 
-void test_mfe_format(const std::string& dtype) {
+void test_mfe_format(const std::string& dtype, int maximum_q = 8,
+    int uniform_q = 0, int output = 4) {
     using namespace mlx::core;
     constexpr int experts = 2;
-    constexpr int output = 4;
     constexpr int columns = 128;
     constexpr int routes = 2;
-    const auto fixture = make_fixture(dtype);
+    const auto fixture = make_fixture(dtype, 128, 128, 4, experts * output, columns, uniform_q, maximum_q);
     require(fixture.rows == experts * output, "invalid FP8-SQ MFE fixture rows");
 
     std::vector<std::uint8_t> blob{'M', 'F', 'E', '1'};
@@ -521,6 +547,7 @@ int main() {
         for (int bits = 1; bits <= 8; ++bits) {
             test_uniform_forward("MXFP8-SQ", bits, 129, 64);
             test_uniform_forward("MXFP8-SQ", bits, 33, 256);
+            test_uniform_forward("FP8-128SQ", bits, 33, 72);
             test_uniform_forward("FP8-128SQ", bits, 129, 65);
             test_uniform_forward("FP8-128SQ", bits, 33, 257);
         }
@@ -549,6 +576,26 @@ int main() {
         test_packed_backward("FP8-128SQ", 128, 128, 4, 160);
         test_mfe_format("MXFP8-SQ");
         test_mfe_format("FP8-128SQ");
+        for (const std::string dtype : {"MXFP8-SQ", "FP8-128SQ"}) {
+            for (const int maximum_q : {2, 3}) {
+                test_uniform_forward(dtype, 0, 33, 640, maximum_q);
+                test_mfe_format(dtype, maximum_q);
+            }
+            test_projection_group(dtype, mlx::core::float16, 128, 1, 2);
+            test_projection_group(dtype, mlx::core::float16, 128, 2, 3);
+            test_projection_group(dtype, mlx::core::float32, 128, 2, 3);
+            test_projection_group(dtype, mlx::core::float16, 128, 3, 8);
+            for (const int bits : {1, 2, 3, 4, 5, 6, 7}) {
+                test_mfe_format(dtype, 8, bits, 5);
+            }
+        }
+        test_uniform_forward("FP8-128SQ", 0, 33, 257, 3);
+        test_varied_scale_dequantize("MXFP8-SQ", 1, 256, 3);
+        test_varied_scale_dequantize("MXFP8-SQ", 1, 256, 7);
+        for (const int kind : {2, 3, 4}) {
+            test_varied_scale_dequantize("FP8-128SQ", kind, 256, 3);
+            test_varied_scale_dequantize("FP8-128SQ", kind, 256, 7);
+        }
         std::cout << "MFQ MXFP8-SQ/FP8-128SQ Metal tests passed\n";
         return 0;
     } catch (const std::exception& error) {

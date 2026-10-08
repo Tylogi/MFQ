@@ -300,16 +300,24 @@ constexpr const char* kSqMatmul = R"METAL(
                 }
             }
         } else if (bits == 2u) {
-            float4 values = *(device const float4*)(palette + 64u + palette_index * 4u) * scale;
+            float4 values;
+            if constexpr (TILE_M > 4) {
+                values = *(device const float4*)(palette + 64u + palette_index * 4u) * scale;
+            }
             for (uint packed_index = 0u;
                  packed_index < 8u;
                  ++packed_index) {
                 uint column = column_base + packed_index * 4u;
                 uint packed = uint(
                     row_symbols[block * 8u + packed_index]);
-                float4 weight = float4(
-                    values[packed & 3u], values[(packed >> 2u) & 3u],
-                    values[(packed >> 4u) & 3u], values[packed >> 6u]);
+                float4 weight;
+                if constexpr (TILE_M > 4) {
+                    weight = float4(values[packed & 3u], values[(packed >> 2u) & 3u],
+                        values[(packed >> 4u) & 3u], values[packed >> 6u]);
+                } else {
+                    weight = float4(*(device const packed_half4*)(palette_vectors
+                        + (palette_index * 256u + packed) * 4u));
+                }
                 for (uint local_row = 0u;
                      local_row < uint(TILE_M);
                      ++local_row) {
@@ -322,36 +330,24 @@ constexpr const char* kSqMatmul = R"METAL(
                         : row;
                     half4 activation = *(device const half4*)(
                         x + input_row * uint(K) + column);
-                    accumulators[local_row] += dot(
-                        float4(activation), weight);
+                    float value = dot(float4(activation), weight);
+                    if constexpr (TILE_M <= 4) value *= scale;
+                    accumulators[local_row] += value;
                 }
             }
         } else if (bits == 3u) {
+            auto pairs = palette_vectors + 32768u + palette_index * 128u;
             for (uint group = 0u; group < 4u; ++group) {
                 uint column = column_base + group * 8u;
                 uint byte_offset = block * 12u + (group == 3u ? 8u : group * 3u);
                 uint packed = as_type<uint>(*(device const packed_uchar4*)(row_symbols + byte_offset))
                     >> (group == 3u ? 8u : 0u);
                 float4 weight0 = float4(
-                    mfq_sq_decode(
-                        palette, palette_index, packed & 7u, 127u, 3u),
-                    mfq_sq_decode(
-                        palette, palette_index, (packed >> 3u) & 7u, 127u, 3u),
-                    mfq_sq_decode(
-                        palette, palette_index, (packed >> 6u) & 7u, 127u, 3u),
-                    mfq_sq_decode(
-                        palette, palette_index, (packed >> 9u) & 7u, 127u, 3u))
-                    * scale;
+                    float2(*(device const packed_half2*)(pairs + (packed & 63u) * 2u)),
+                    float2(*(device const packed_half2*)(pairs + ((packed >> 6u) & 63u) * 2u)));
                 float4 weight1 = float4(
-                    mfq_sq_decode(
-                        palette, palette_index, (packed >> 12u) & 7u, 127u, 3u),
-                    mfq_sq_decode(
-                        palette, palette_index, (packed >> 15u) & 7u, 127u, 3u),
-                    mfq_sq_decode(
-                        palette, palette_index, (packed >> 18u) & 7u, 127u, 3u),
-                    mfq_sq_decode(
-                        palette, palette_index, (packed >> 21u) & 7u, 127u, 3u))
-                    * scale;
+                    float2(*(device const packed_half2*)(pairs + ((packed >> 12u) & 63u) * 2u)),
+                    float2(*(device const packed_half2*)(pairs + ((packed >> 18u) & 63u) * 2u)));
                 for (uint local_row = 0u;
                      local_row < uint(TILE_M);
                      ++local_row) {
@@ -366,9 +362,9 @@ constexpr const char* kSqMatmul = R"METAL(
                         x + input_row * uint(K) + column);
                     half4 activation1 = *(device const half4*)(
                         x + input_row * uint(K) + column + 4u);
-                    accumulators[local_row] +=
+                    accumulators[local_row] += scale * (
                         dot(float4(activation0), weight0)
-                        + dot(float4(activation1), weight1);
+                        + dot(float4(activation1), weight1));
                 }
             }
         } else {
@@ -604,6 +600,30 @@ const array& palette_catalog() {
     return catalog;
 }
 
+const array& palette_vector_catalog() {
+    static const auto catalog = [] {
+        std::vector<mlx::core::float16_t> values;
+        values.reserve(36864);
+        constexpr std::array<float, 8> magnitudes{0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+        const auto append = [&](const auto& nibbles, unsigned bits, unsigned elements) {
+            for (unsigned palette = 0; palette < 32; ++palette) {
+                for (unsigned code = 0; code < (1u << (elements * bits)); ++code) {
+                    for (unsigned element = 0; element < elements; ++element) {
+                        const auto index = (code >> (element * bits)) & ((1u << bits) - 1u);
+                        const auto nibble = nibbles[(palette << bits) + index];
+                        const auto magnitude = magnitudes[nibble & 7u];
+                        values.push_back(mlx::core::float16_t((nibble & 8u) != 0u ? -magnitude : magnitude));
+                    }
+                }
+            }
+        };
+        append(kMxfp4Sq2PaletteNibbles, 2, 4);
+        append(kMxfp4Sq3PaletteNibbles, 3, 2);
+        return array(values.begin(), Shape{static_cast<int>(values.size())});
+    }();
+    return catalog;
+}
+
 const mlx::core::fast::CustomKernelFunction& dequantize_kernel() {
     static const auto kernel = [] {
         CompileOptions options;
@@ -636,6 +656,7 @@ const mlx::core::fast::CustomKernelFunction& matmul_kernel() {
             {
                 "blob",
                 "palette",
+                "palette_vectors",
                 "row_q",
                 "row_symbol_byte_offsets",
                 "row_auxiliary",
@@ -716,7 +737,7 @@ void replace_all(
 std::vector<std::string> projection_group_input_names(
     std::size_t projections) {
     std::vector<std::string> names;
-    names.reserve(projections * 4 + 4);
+    names.reserve(projections * 4 + 5);
     for (std::size_t projection = 0;
          projection < projections;
          ++projection) {
@@ -727,6 +748,7 @@ std::vector<std::string> projection_group_input_names(
         names.push_back("row_auxiliary_" + suffix);
     }
     names.emplace_back("palette");
+    names.emplace_back("palette_vectors");
     names.emplace_back("x");
     names.emplace_back("expert_ids");
     names.emplace_back("expert_map");
@@ -1016,6 +1038,7 @@ array MlxMxfp4SqWeight::matmul(const array& input) const {
         {
             blob_,
             palette_catalog(),
+            palette_vector_catalog(),
             row_q_,
             row_symbol_byte_offsets_,
             row_auxiliary_,
@@ -1117,7 +1140,7 @@ std::vector<array> MlxMxfp4SqWeight::projection_group_matmul(
         input,
         Shape{checked_int(rows, "projection-group row count"), input_size}));
     std::vector<array> inputs;
-    inputs.reserve(weights.size() * 4 + 4);
+    inputs.reserve(weights.size() * 4 + 5);
     std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> arguments{
         {"T", source.dtype()},
         {"TILE_M", tile_rows},
@@ -1174,6 +1197,7 @@ std::vector<array> MlxMxfp4SqWeight::projection_group_matmul(
     }
     const auto unused = mlx::core::zeros(Shape{1}, mlx::core::int32);
     inputs.push_back(palette_catalog());
+    inputs.push_back(palette_vector_catalog());
     inputs.push_back(source);
     inputs.push_back(unused);
     inputs.push_back(unused);
@@ -1271,6 +1295,7 @@ array MlxMxfp4SqWeight::routed_matmul(
         {
             blob_,
             palette_catalog(),
+            palette_vector_catalog(),
             row_q_,
             row_symbol_byte_offsets_,
             row_auxiliary_,
