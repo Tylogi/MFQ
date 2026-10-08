@@ -306,10 +306,15 @@ void test_adaptive_q1234_dequant_and_small_m() {
           "adaptive MXFP4-SQ q entropy mismatch");
 
   auto decoded = contiguous(weight.dequantize(float32));
-  eval(decoded);
+  auto decoded_fp16 = contiguous(astype(weight.dequantize(float16), float32));
+  auto reference_fp16 = contiguous(astype(astype(array(fixture.dense.begin(),
+      Shape{fixture.rows, fixture.columns}), float16), float32));
+  eval(decoded, decoded_fp16, reference_fp16);
   for (std::size_t index = 0; index < fixture.dense.size(); ++index) {
     require(decoded.data<float>()[index] == fixture.dense[index],
             "adaptive MXFP4-SQ dequantization mismatch");
+    require(decoded_fp16.data<float>()[index] == reference_fp16.data<float>()[index],
+            "adaptive MXFP4-SQ FP16 dequantization mismatch");
   }
 
   for (int rows = 1; rows <= 6; ++rows) {
@@ -379,6 +384,26 @@ void test_adaptive_q1234_dequant_and_small_m() {
                   source_row * static_cast<std::size_t>(fixture.columns)
                   + static_cast<std::size_t>(column)],
           "MXFP4-SQ selected-row payload changed decoded values");
+    }
+  }
+}
+
+void test_adaptive_dequantize_shapes() {
+  using namespace mlx::core;
+  for (const auto& shape : {std::array<int, 2>{5, 32}, {7, 96}, {13, 160},
+                           {13, 640}, {13, 2560}, {13, 6144}}) {
+    const auto fixture = make_adaptive_fixture(shape[0], shape[1]);
+    const auto weight = mfq::metal::MlxMxfp4SqWeight::from_blob(fixture.blob);
+    for (const auto dtype : {float16, float32}) {
+      auto actual = contiguous(astype(weight.dequantize(dtype), float32));
+      auto expected = contiguous(astype(astype(array(fixture.dense.begin(),
+          Shape{fixture.rows, fixture.columns}), dtype), float32));
+      eval(actual, expected);
+      for (std::size_t index = 0; index < fixture.dense.size(); ++index) {
+        require(actual.data<float>()[index] == expected.data<float>()[index],
+            "adaptive MXFP4-SQ shape=" + std::to_string(shape[0]) + "x"
+                + std::to_string(shape[1]) + " index=" + std::to_string(index));
+      }
     }
   }
 }
@@ -510,7 +535,8 @@ void test_multirow_buckets() {
   const auto fixture = make_fixture(19, 96);
   const auto weight =
       mfq::metal::MlxMxfp4SqWeight::from_blob(fixture.blob);
-  constexpr std::array<int, 9> row_counts{2, 6, 7, 16, 17, 32, 33, 64, 65};
+  constexpr std::array<int, 13> row_counts{
+      1, 2, 3, 4, 5, 6, 7, 16, 17, 32, 33, 64, 65};
   for (const int rows : row_counts) {
     std::vector<float> input_values(static_cast<std::size_t>(rows) *
                                     fixture.columns);
@@ -837,6 +863,7 @@ int main() {
   try {
     test_dequantize();
     test_adaptive_q1234_dequant_and_small_m();
+    test_adaptive_dequantize_shapes();
     test_projection_group_m1_through_m6();
     test_fused_gemv();
     test_multirow_buckets();

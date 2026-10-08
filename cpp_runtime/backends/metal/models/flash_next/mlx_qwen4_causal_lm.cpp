@@ -248,8 +248,9 @@ public:
 
     array routed_matmul(
         const array& input,
-        const array& expert_ids) const {
-        if (packed_) return packed_->routed_matmul(input, expert_ids);
+        const array& expert_ids,
+        const array* route_groups = nullptr) const {
+        if (packed_) return packed_->routed_matmul(input, expert_ids, route_groups);
         return dense_matmul(input, expert_ids);
     }
 
@@ -267,8 +268,9 @@ public:
 
     array routed_swiglu(
         const array& input,
-        const array& expert_ids) const {
-        if (packed_) return packed_->routed_swiglu(input, expert_ids);
+        const array& expert_ids,
+        const array* route_groups = nullptr) const {
+        if (packed_) return packed_->routed_swiglu(input, expert_ids, 0.0f, route_groups);
         return moe_swiglu_split(dense_matmul(input, expert_ids));
     }
 
@@ -664,6 +666,7 @@ public:
             router_logits,
             static_cast<int>(config_.num_experts_per_tok),
             false, false, config_.norm_topk_prob);
+        const auto* route_groups = routes.groups ? &*routes.groups : nullptr;
         if (detail::component_profile_active()) {
             detail::profile_eval(
                 "qwen4.moe.topk",
@@ -691,7 +694,7 @@ public:
                         source,
                         routes.ids,
                         routes.weights,
-                        shared_gate_weight == nullptr)) {
+                        shared_gate_weight == nullptr, route_groups)) {
                     if (detail::component_profile_active()) {
                         detail::profile_eval(
                             "qwen4.moe.two_stage", *fused);
@@ -894,7 +897,7 @@ public:
             }
             auto intermediate = gate_up_->routed_swiglu(
                 source,
-                routes.ids);
+                routes.ids, route_groups);
             if (detail::component_profile_active()) {
                 detail::profile_eval(
                     "qwen4.moe.routed_gate_up",
@@ -910,7 +913,7 @@ public:
                       intermediate,
                       routes.ids,
                       routes.weights)
-                : down_->routed_matmul(intermediate, routes.ids);
+                : down_->routed_matmul(intermediate, routes.ids, route_groups);
             routed_is_reduced = combine_routes;
             if (detail::component_profile_active()) {
                 detail::profile_eval("qwen4.moe.routed_down", output);

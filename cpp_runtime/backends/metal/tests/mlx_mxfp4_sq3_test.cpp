@@ -223,7 +223,8 @@ void test_multirow_buckets() {
   using namespace mlx::core;
   const auto fixture = make_fixture(19, 96);
   const auto weight = mfq::metal::MlxMxfp4SqWeight::from_blob(fixture.blob);
-  constexpr std::array<int, 9> row_counts{2, 6, 7, 16, 17, 32, 33, 64, 65};
+  constexpr std::array<int, 13> row_counts{
+      1, 2, 3, 4, 5, 6, 7, 16, 17, 32, 33, 64, 65};
   for (const int rows : row_counts) {
     std::vector<float> input_values(static_cast<std::size_t>(rows) *
                                     fixture.columns);

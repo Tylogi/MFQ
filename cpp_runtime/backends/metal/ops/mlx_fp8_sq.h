@@ -72,6 +72,7 @@ private:
         mlx::core::array blob,
         mlx::core::array row_q,
         mlx::core::array row_symbol_byte_offsets,
+        mlx::core::array palette_values,
         mfq::fp8sq::Layout layout,
         Fp8SqDescriptor descriptor);
 
@@ -79,6 +80,7 @@ private:
     mlx::core::array blob_;
     mlx::core::array row_q_;
     mlx::core::array row_symbol_byte_offsets_;
+    mlx::core::array palette_values_;
     mfq::fp8sq::Layout layout_;
     Fp8SqDescriptor descriptor_;
 };

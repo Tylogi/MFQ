@@ -286,7 +286,8 @@ Fixture make_jsc(
     int codebook_id,
     int vector_size,
     int index_bits,
-    bool group64 = false) {
+    bool group64 = false,
+    int banks = 2) {
     constexpr std::uint8_t kJsc = 0x20;
     constexpr int entries_base = 1;
     const int entries = entries_base << index_bits;
@@ -300,7 +301,7 @@ Fixture make_jsc(
         kMatrixOutput,
         kInputSize);
     append<std::uint8_t>(blob, group64 ? 2 : 1);
-    append<std::uint8_t>(blob, 2);
+    append<std::uint8_t>(blob, banks);
     append<std::uint8_t>(blob, 16);
     append<std::uint8_t>(blob, 0);
     for (int state = 0; state < 16; ++state) {
@@ -309,11 +310,11 @@ Fixture make_jsc(
     for (int state = 0; state < 16; ++state) {
         append<std::uint8_t>(
             blob,
-            static_cast<std::uint8_t>(state & 1));
+            static_cast<std::uint8_t>((state ^ (state >> 2)) % banks));
     }
     append<std::uint8_t>(blob, group64 ? 1 : 0);
     blob.insert(blob.end(), 11, 0);
-    for (int bank = 0; bank < 2; ++bank) {
+    for (int bank = 0; bank < banks; ++bank) {
         for (int entry = 0; entry < entries; ++entry) {
             for (int component = 0;
                  component < vector_size;
@@ -1284,6 +1285,16 @@ void test_fixture(const Fixture& fixture) {
         1e-5f,
         fixture.dtype + " dequantize");
 
+    if (fixture.dtype.starts_with("NVQ")) {
+        auto decoded_fp16 = astype(weight.dequantize(float16), float32);
+        auto reference_fp16 = astype(astype(array(fixture.dense.begin(),
+            Shape{fixture.output_size, fixture.input_size}), float16), float32);
+        eval(decoded_fp16, reference_fp16);
+        check_values(evaluated_float(std::move(decoded_fp16)),
+            evaluated_float(std::move(reference_fp16)), 0.0f,
+            fixture.dtype + " FP16 dequantize");
+    }
+
     constexpr std::array<int, 8> packed_rows{
         1, 4, 7, 13, 17, 21, 29, 47,
     };
@@ -1473,7 +1484,7 @@ void test_nvq3jl_projection_shapes() {
         test_fixture(expansion);
         auto a = mfq::metal::MlxVqWeight::from_blob(contraction.dtype, contraction.blob);
         auto b = mfq::metal::MlxVqWeight::from_blob(expansion.dtype, expansion.blob);
-        if (!a.nvq3jl_execution_records() || !b.nvq3jl_execution_records()) {
+        if (!a.banked_execution_records() || !b.banked_execution_records()) {
             throw std::runtime_error("NVQ3J-L execution records were not prepared at load");
         }
         const mfq::metal::MlxGroupedLinear group({&a, &b});
@@ -1525,6 +1536,71 @@ void test_nvq3jl_projection_shapes() {
     }
 }
 
+void test_nvq_dequantize_tails() {
+    using namespace mlx::core;
+    for (const auto& seed : {make_plain_nvq("NVQ2", 1, 8), make_plain_nvq("NVQ3", 2, 4),
+                            make_jsc("NVQ2J-XL", 5, 8, 12, true)}) {
+        for (const int width : {1, 2, 3, 5, 8, 16, 24, 25, 27, 29, 31}) {
+            if (seed.dtype == "NVQ2J-XL" && width % 8 != 0) continue;
+            const auto fixture = varied_projection_fixture(seed, 3, width);
+            const auto weight = mfq::metal::MlxVqWeight::from_blob(fixture.dtype, fixture.blob);
+            for (const auto dtype : {float16, float32}) {
+                auto actual = astype(weight.dequantize(dtype), float32);
+                auto expected = astype(astype(array(fixture.dense.begin(), Shape{3, width}), dtype), float32);
+                eval(actual, expected);
+                check_values(evaluated_float(std::move(actual)), evaluated_float(std::move(expected)),
+                    0.0f, fixture.dtype + " dequantize tail K=" + std::to_string(width));
+            }
+        }
+    }
+}
+
+void test_nvq_group64_large_shapes() {
+    using namespace mlx::core;
+    const auto seed = make_jsc("NVQ2J-XL", 5, 8, 12, true, 4);
+    for (const auto& shape : {std::array<int, 2>{2560, 6144}, std::array<int, 2>{6144, 2560}}) {
+        const auto fixture = varied_projection_fixture(seed, shape[0], shape[1]);
+        const auto weight = mfq::metal::MlxVqWeight::from_blob(fixture.dtype, fixture.blob);
+        if (weight.execution_layout() != 1 || weight.banked_execution_records()
+            || weight.jsc_execution_records() != &weight.packed_indices()) {
+            throw std::runtime_error("NVQ2J-XL compact group64 execution was not preserved");
+        }
+        const mfq::metal::MlxGroupedLinear grouped({&weight, &weight});
+        for (int rows = 1; rows <= 6; ++rows) {
+            std::vector<float> values(rows * fixture.input_size);
+            for (std::size_t index = 0; index < values.size(); ++index) {
+                values[index] = float(int((index * 17 + 7) % 43) - 21) / 256.0f;
+            }
+            const auto expected = expected_matmul(fixture, values, rows);
+            const auto input = astype(array(values.begin(), Shape{rows, fixture.input_size}), float16);
+            auto results = grouped.matmul(input);
+            results.push_back(weight.matmul(input));
+            eval(results);
+            for (const auto& result : results) {
+                const auto actual = evaluated_float(result);
+                if (actual.size() != expected.size()) throw std::runtime_error("NVQ2J-XL wide output size");
+                for (std::size_t index = 0; index < actual.size(); ++index) {
+                    require_close(actual[index], expected[index], 0.001f + 0.001f * std::fabs(expected[index]),
+                        "NVQ2J-XL N=" + std::to_string(shape[0]) + " K=" + std::to_string(shape[1])
+                            + " M=" + std::to_string(rows) + " index=" + std::to_string(index));
+                }
+            }
+        }
+    }
+}
+
+void test_nvq_scale_values() {
+    constexpr std::array<std::uint16_t, 16> scale_bits{
+        0x0000, 0x8000, 0x0001, 0x0002, 0x03ff, 0x03fe, 0x0400, 0x0401,
+        0x1400, 0x1401, 0x3555, 0x3556, 0x3bff, 0x3bfe, 0x4101, 0x4102,
+    };
+    for (auto fixture : {make_jsc("NVQ2J", 1, 8, 8), make_jsc("NVQ3J", 2, 4, 8),
+                         make_jsc("NVQ2J-XL", 5, 8, 12, true)}) {
+        std::memcpy(fixture.blob.data() + 44, scale_bits.data(), sizeof(scale_bits));
+        test_fixture(varied_projection_fixture(fixture, 13, 88));
+    }
+}
+
 void test_nvq_projection_batches() {
     using namespace mlx::core;
     auto seeds = fixtures();
@@ -1534,7 +1610,15 @@ void test_nvq_projection_batches() {
     parity.blob[4] |= 0x80;
     seeds.push_back(std::move(parity));
     for (std::size_t index = 0; index < seeds.size(); ++index) {
-        for (const int width : {24, 88}) {
+        for (const int width : {24, 28, 88}) {
+            if (width % 8 != 0) {
+                bool supported = true;
+                for (std::size_t offset = 0; offset < 3; ++offset) {
+                    const auto& seed = seeds[(index + offset) % seeds.size()];
+                    supported &= mfq::metal::MlxVqWeight::from_blob(seed.dtype, seed.blob).vector_size() == 4;
+                }
+                if (!supported) continue;
+            }
             const auto shape = [&](const Fixture& seed, int output) {
                 const bool variable_gs = seed.dtype == "NVQ2" || seed.dtype == "NVQ3" || seed.dtype == "NVQ1-L";
                 return varied_projection_fixture(seed, output, width, variable_gs && width == 88 ? 32 : 0);
@@ -1657,6 +1741,9 @@ int main() {
         }
         test_fixture(make_jsc("NVQ2J-XL", 5, 8, 12, true));
         test_nvq3jl_projection_shapes();
+        test_nvq_dequantize_tails();
+        test_nvq_group64_large_shapes();
+        test_nvq_scale_values();
         test_nvq_projection_batches();
 
         auto rotated = make_nepq(0, true);

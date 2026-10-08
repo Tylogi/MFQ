@@ -106,22 +106,21 @@ inline float mfq_sq_decode_native(uint nibble, uint exponent) {
 }
 
 inline float mfq_sq_decode(
-    device const uchar* palette_catalog,
+    device const float* palette_catalog,
     uint palette,
     uint symbol,
     uint exponent,
     uint bits
 ) {
     uint catalog_offset = bits == 1u ? 0u : (bits == 2u ? 64u : 192u);
-    uint nibble = uint(palette_catalog[
-        catalog_offset + palette * (1u << bits) + symbol]);
-    return mfq_sq_decode_native(nibble, exponent);
+    return palette_catalog[catalog_offset + palette * (1u << bits) + symbol]
+        * mfq_sq_scale(exponent);
 }
 )METAL";
 
 constexpr const char* kSqDequantize = R"METAL(
-    uint lane = thread_index_in_simdgroup;
-    uint block_index = thread_position_in_grid.x >> 5u;
+    uint lane = thread_index_in_simdgroup & 7u;
+    uint block_index = thread_position_in_grid.x >> 3u;
     if (block_index >= uint(TOTAL_BLOCKS)) {
         return;
     }
@@ -151,14 +150,19 @@ constexpr const char* kSqDequantize = R"METAL(
                     + mfq_sq_read_bits(state_scales, state, 2u));
         }
     }
-    state_value = simd_broadcast_first(state_value);
-    uint symbol = mfq_sq_read_bits(
-        row_symbols, block * 32u + lane, bits);
-    float decoded = bits == 4u
-        ? mfq_sq_decode_native(symbol, state_value)
-        : mfq_sq_decode(
-            palette, state_value >> 8u, symbol, state_value & 255u, bits);
-    y[block_index * 32u + lane] = T(decoded);
+    state_value = simd_shuffle(state_value, thread_index_in_simdgroup & 24u);
+    float4 decoded;
+    for (uint element = 0u; element < 4u; ++element) {
+        uint symbol = mfq_sq_read_bits(row_symbols, block * 32u + lane * 4u + element, bits);
+        decoded[element] = bits == 4u ? mfq_sq_decode_native(symbol, state_value)
+            : mfq_sq_decode(palette, state_value >> 8u, symbol, state_value & 255u, bits);
+    }
+    uint output_index = block_index * 32u + lane * 4u;
+    if constexpr (sizeof(T) == 2u) {
+        *(device packed_half4*)(y + output_index) = packed_half4(half4(decoded));
+    } else {
+        *(device packed_float4*)(y + output_index) = packed_float4(decoded);
+    }
 )METAL";
 
 // One metadata-driven packed matrix kernel for every SQ profile and small M.
@@ -267,31 +271,17 @@ constexpr const char* kSqMatmul = R"METAL(
         uint column_base = block * 32u;
 
         if (bits == 1u) {
+            float low = mfq_sq_decode(palette, palette_index, 0u, 127u, 1u) * scale;
+            float high = mfq_sq_decode(palette, palette_index, 1u, 127u, 1u) * scale;
             for (uint packed_index = 0u;
                  packed_index < 4u;
                  ++packed_index) {
                 uint column = column_base + packed_index * 8u;
                 uint packed = uint(row_symbols[block * 4u + packed_index]);
-                float4 weight0 = float4(
-                    mfq_sq_decode(
-                        palette, palette_index, packed & 1u, 127u, 1u),
-                    mfq_sq_decode(
-                        palette, palette_index, (packed >> 1u) & 1u, 127u, 1u),
-                    mfq_sq_decode(
-                        palette, palette_index, (packed >> 2u) & 1u, 127u, 1u),
-                    mfq_sq_decode(
-                        palette, palette_index, (packed >> 3u) & 1u, 127u, 1u))
-                    * scale;
-                float4 weight1 = float4(
-                    mfq_sq_decode(
-                        palette, palette_index, (packed >> 4u) & 1u, 127u, 1u),
-                    mfq_sq_decode(
-                        palette, palette_index, (packed >> 5u) & 1u, 127u, 1u),
-                    mfq_sq_decode(
-                        palette, palette_index, (packed >> 6u) & 1u, 127u, 1u),
-                    mfq_sq_decode(
-                        palette, palette_index, packed >> 7u, 127u, 1u))
-                    * scale;
+                float4 weight0 = select(float4(low), float4(high),
+                    (uint4(packed) & uint4(1u, 2u, 4u, 8u)) != 0u);
+                float4 weight1 = select(float4(low), float4(high),
+                    (uint4(packed >> 4u) & uint4(1u, 2u, 4u, 8u)) != 0u);
                 for (uint local_row = 0u;
                      local_row < uint(TILE_M);
                      ++local_row) {
@@ -310,6 +300,7 @@ constexpr const char* kSqMatmul = R"METAL(
                 }
             }
         } else if (bits == 2u) {
+            float4 values = *(device const float4*)(palette + 64u + palette_index * 4u) * scale;
             for (uint packed_index = 0u;
                  packed_index < 8u;
                  ++packed_index) {
@@ -317,14 +308,8 @@ constexpr const char* kSqMatmul = R"METAL(
                 uint packed = uint(
                     row_symbols[block * 8u + packed_index]);
                 float4 weight = float4(
-                    mfq_sq_decode(
-                        palette, palette_index, packed & 3u, 127u, 2u),
-                    mfq_sq_decode(
-                        palette, palette_index, (packed >> 2u) & 3u, 127u, 2u),
-                    mfq_sq_decode(
-                        palette, palette_index, (packed >> 4u) & 3u, 127u, 2u),
-                    mfq_sq_decode(
-                        palette, palette_index, packed >> 6u, 127u, 2u)) * scale;
+                    values[packed & 3u], values[(packed >> 2u) & 3u],
+                    values[(packed >> 4u) & 3u], values[packed >> 6u]);
                 for (uint local_row = 0u;
                      local_row < uint(TILE_M);
                      ++local_row) {
@@ -344,10 +329,9 @@ constexpr const char* kSqMatmul = R"METAL(
         } else if (bits == 3u) {
             for (uint group = 0u; group < 4u; ++group) {
                 uint column = column_base + group * 8u;
-                uint byte_offset = block * 12u + group * 3u;
-                uint packed = uint(row_symbols[byte_offset])
-                    | (uint(row_symbols[byte_offset + 1u]) << 8u)
-                    | (uint(row_symbols[byte_offset + 2u]) << 16u);
+                uint byte_offset = block * 12u + (group == 3u ? 8u : group * 3u);
+                uint packed = as_type<uint>(*(device const packed_uchar4*)(row_symbols + byte_offset))
+                    >> (group == 3u ? 8u : 0u);
                 float4 weight0 = float4(
                     mfq_sq_decode(
                         palette, palette_index, packed & 7u, 127u, 3u),
@@ -600,23 +584,21 @@ constexpr const char* kSqBackwardMatrix = R"METAL(
 
 const array& palette_catalog() {
     static const auto catalog = [] {
-        std::vector<std::uint8_t> values;
+        std::vector<float> values;
         values.reserve(
             kMxfp4Sq1PaletteNibbles.size() +
             kMxfp4Sq2PaletteNibbles.size() +
             kMxfp4Sq3PaletteNibbles.size());
-        values.insert(
-            values.end(),
-            kMxfp4Sq1PaletteNibbles.begin(),
-            kMxfp4Sq1PaletteNibbles.end());
-        values.insert(
-            values.end(),
-            kMxfp4Sq2PaletteNibbles.begin(),
-            kMxfp4Sq2PaletteNibbles.end());
-        values.insert(
-            values.end(),
-            kMxfp4Sq3PaletteNibbles.begin(),
-            kMxfp4Sq3PaletteNibbles.end());
+        constexpr std::array<float, 8> magnitudes{0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+        const auto append = [&](const auto& nibbles) {
+            for (const auto nibble : nibbles) {
+                const auto magnitude = magnitudes[nibble & 7u];
+                values.push_back((nibble & 8u) != 0u ? -magnitude : magnitude);
+            }
+        };
+        append(kMxfp4Sq1PaletteNibbles);
+        append(kMxfp4Sq2PaletteNibbles);
+        append(kMxfp4Sq3PaletteNibbles);
         return array(values.begin(), Shape{static_cast<int>(values.size())});
     }();
     return catalog;
@@ -938,7 +920,8 @@ array MlxMxfp4SqWeight::dequantize(Dtype dtype) const {
             "MXFP4-SQ dequantization grid exceeds MLX limits");
     }
     constexpr std::size_t threads = 256;
-    const auto grid = (count + threads - 1) / threads * threads;
+    const auto work = count / 4;
+    const auto grid = (work + threads - 1) / threads * threads;
     auto outputs = dequantize_kernel()(
         {
             blob_,

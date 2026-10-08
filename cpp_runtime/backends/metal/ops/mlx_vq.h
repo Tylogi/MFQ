@@ -130,8 +130,15 @@ public:
     const mlx::core::array& packed_indices() const noexcept {
         return indices_packed_;
     }
-    const mlx::core::array* nvq3jl_execution_records() const noexcept {
-        return nvq3jl_records_ ? &*nvq3jl_records_ : nullptr;
+    const mlx::core::array* banked_execution_records() const noexcept {
+        return banked_records_ ? &*banked_records_ : nullptr;
+    }
+    const mlx::core::array* nvq1_execution_records() const noexcept {
+        return nvq1_records_ ? &*nvq1_records_ : nullptr;
+    }
+    const mlx::core::array* jsc_execution_records() const noexcept {
+        return jsc_records_ ? &*jsc_records_
+            : (execution_layout_ == 1 ? &indices_packed_ : nullptr);
     }
     const mlx::core::array& packed_states() const noexcept {
         return state_packed_;
@@ -245,7 +252,9 @@ private:
     mlx::core::array residual_codebook_;
     mlx::core::array residual_first_;
     mlx::core::array residual_second_;
-    std::optional<mlx::core::array> nvq3jl_records_;
+    std::optional<mlx::core::array> banked_records_;
+    std::optional<mlx::core::array> nvq1_records_;
+    std::optional<mlx::core::array> jsc_records_;
     std::string format_label_;
     std::vector<int> output_shape_;
     int input_size_ = 0;

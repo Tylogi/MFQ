@@ -413,6 +413,21 @@ void test_small_m_softmax_topk() {
                     source, top_k, false, false, true);
                 const auto ids = integers(result.ids);
                 const auto weights = floats(result.weights);
+                require(result.groups.has_value(), "small-M Top-K did not produce route groups");
+                require(result.groups->shape() == Shape{rows, top_k, 8},
+                        "small-M route group shape mismatch");
+                const auto groups = integers(*result.groups);
+                for (int index = 0; index < rows * top_k; ++index) {
+                    std::vector<int> matched;
+                    for (int route = 0; route < rows * top_k; ++route)
+                        if (ids[route] == ids[index]) matched.push_back(route);
+                    require(groups[index * 8 + 1] == static_cast<int>(matched.size()) &&
+                            groups[index * 8] == ids[index], "route group count or expert mismatch");
+                    for (int slot = 0; slot < 6; ++slot)
+                        require(groups[index * 8 + slot + 2] ==
+                            (slot < static_cast<int>(matched.size()) ? matched[slot] : -1),
+                            "route group members or padding mismatch");
+                }
                 for (int row = 0; row < rows; ++row) {
                     const std::vector<float> values(
                         logits.begin() + row * experts,

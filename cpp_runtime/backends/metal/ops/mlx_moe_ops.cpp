@@ -186,12 +186,19 @@ constexpr const char* kSoftmaxTopKRowSource = R"METAL(
     constexpr uint PER_LANE =
         (uint(EXPERTS) + 31u) / 32u;
     uint lane = thread_index_in_simdgroup;
+#if MFQ_TOPK_ROUTE_GROUPS
+    uint row = simdgroup_index_in_threadgroup;
+    bool active = row < uint(logits_shape[0]);
+    threadgroup int selected_routes[6u * uint(TOP_K)];
+#else
     uint row = threadgroup_position_in_grid.y;
+    constexpr bool active = true;
+#endif
     float values[PER_LANE];
     bool taken[PER_LANE];
     for (uint local = 0u; local < PER_LANE; ++local) {
         uint expert = lane + local * 32u;
-        float value = expert < uint(EXPERTS)
+        float value = active && expert < uint(EXPERTS)
             ? float(logits[row * uint(EXPERTS) + expert])
             : -INFINITY;
         values[local] = isnan(value) ? -FLT_MAX : value;
@@ -227,7 +234,7 @@ constexpr const char* kSoftmaxTopKRowSource = R"METAL(
         selected_ids[rank] = global_id;
     }
 
-    if (lane == 0u) {
+    if (lane == 0u && active) {
         float maximum = selected[0];
         float denominator = 0.0f;
         for (uint rank = 0u; rank < uint(TOP_K); ++rank) {
@@ -237,8 +244,27 @@ constexpr const char* kSoftmaxTopKRowSource = R"METAL(
         for (uint rank = 0u; rank < uint(TOP_K); ++rank) {
             ids[row * uint(TOP_K) + rank] = int(selected_ids[rank]);
             weights[row * uint(TOP_K) + rank] = selected[rank] / denominator;
+#if MFQ_TOPK_ROUTE_GROUPS
+            selected_routes[row * uint(TOP_K) + rank] = int(selected_ids[rank]);
+#endif
         }
     }
+#if MFQ_TOPK_ROUTE_GROUPS
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint index = row * 32u + lane;
+    uint route_count = uint(logits_shape[0]) * uint(TOP_K);
+    if (index < route_count) {
+        int expert = selected_routes[index];
+        device int* group = groups + index * 8u;
+        for (uint slot = 0u; slot < 6u; ++slot) group[slot + 2u] = -1;
+        uint matches = 0u;
+        for (uint route = 0u; route < route_count; ++route) {
+            if (selected_routes[route] == expert) group[2u + matches++] = int(route);
+        }
+        group[0] = expert;
+        group[1] = int(matches);
+    }
+#endif
 )METAL";
 
 // Adapted from oMLX's Qwen router GEMV topology (Apache-2.0): spread one
@@ -776,6 +802,21 @@ softmax_top_k_row_kernel(mlx::core::Dtype dtype) {
 }
 
 const mlx::core::fast::CustomKernelFunction&
+softmax_top_k_group_kernel(mlx::core::Dtype dtype) {
+    static const auto fp16_kernel = make_kernel(
+        "mfq_cpp_moe_softmax_topk_groups_f16", {"logits"}, {"ids", "weights", "groups"},
+        std::string("#define MFQ_TOPK_ROUTE_GROUPS 1\nusing T = half;\n") + kSoftmaxTopKRowSource);
+    static const auto bf16_kernel = make_kernel(
+        "mfq_cpp_moe_softmax_topk_groups_bf16", {"logits"}, {"ids", "weights", "groups"},
+        std::string("#define MFQ_TOPK_ROUTE_GROUPS 1\nusing T = bfloat;\n") + kSoftmaxTopKRowSource);
+    static const auto fp32_kernel = make_kernel(
+        "mfq_cpp_moe_softmax_topk_groups_f32", {"logits"}, {"ids", "weights", "groups"},
+        std::string("#define MFQ_TOPK_ROUTE_GROUPS 1\nusing T = float;\n") + kSoftmaxTopKRowSource);
+    if (dtype == mlx::core::float16) return fp16_kernel;
+    return dtype == mlx::core::bfloat16 ? bf16_kernel : fp32_kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
 dense_router_logits_kernel(mlx::core::Dtype dtype) {
     static const auto fp16_kernel = make_kernel(
         "mfq_cpp_moe_dense_router_logits_f16",
@@ -1158,18 +1199,21 @@ MlxMoeTopKResult moe_topk(
         !bias.has_value() && !available.has_value() &&
         experts >= 32 && experts <= 4096 && experts % 32 == 0) {
         values = mlx::core::reshape(values, Shape{rows, experts});
-        auto outputs = softmax_top_k_row_kernel(values.dtype())(
+        const bool grouped = rows > 1;
+        std::vector<Shape> shapes{Shape{rows, top_k}, Shape{rows, top_k}};
+        std::vector<mlx::core::Dtype> dtypes{mlx::core::int32, mlx::core::float32};
+        if (grouped) {
+            shapes.emplace_back(Shape{rows, top_k, 8});
+            dtypes.push_back(mlx::core::int32);
+        }
+        const auto& kernel = grouped ? softmax_top_k_group_kernel(values.dtype())
+            : softmax_top_k_row_kernel(values.dtype());
+        auto outputs = kernel(
             {std::move(values)},
-            {
-                Shape{rows, top_k},
-                Shape{rows, top_k},
-            },
-            {
-                mlx::core::int32,
-                mlx::core::float32,
-            },
-            {32, rows, 1},
-            {32, 1, 1},
+            shapes,
+            dtypes,
+            grouped ? std::tuple{192, 1, 1} : std::tuple{32, rows, 1},
+            grouped ? std::tuple{192, 1, 1} : std::tuple{32, 1, 1},
             {
                 {"EXPERTS", experts},
                 {"TOP_K", top_k},
@@ -1180,6 +1224,7 @@ MlxMoeTopKResult moe_topk(
         return {
             std::move(outputs.at(0)),
             std::move(outputs.at(1)),
+            grouped ? std::optional<array>(std::move(outputs.at(2))) : std::nullopt,
         };
     }
 
