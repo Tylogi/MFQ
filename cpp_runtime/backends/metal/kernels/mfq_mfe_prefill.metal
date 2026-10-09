@@ -758,7 +758,7 @@ inline uint3 read_jsc_wide_record(
         record >> (index_count * index_bits));
 }
 
-template <uint JSC_VECTOR, uint INDEX_BITS>
+template <uint JSC_VECTOR, uint INDEX_BITS, bool CACHED_BANKS = false>
 inline void decode_jsc_group24(
     const device int* d,
     const device uchar* indices,
@@ -771,7 +771,8 @@ inline void decode_jsc_group24(
     threadgroup half* target,
     uint row,
     uint group,
-    uint k_size) {
+    uint k_size,
+    uint4 state_bank_words = uint4(0u)) {
     constexpr bool DUAL_INDEX = JSC_VECTOR == 4u;
     uint groups = uint(d[5]);
     uint vectors = uint(d[7]);
@@ -788,7 +789,12 @@ inline void decode_jsc_group24(
         uint(state_stream[state_offset + (state_index >> 1u)]);
     uint state =
         (packed_state >> ((state_index & 1u) * 4u)) & 15u;
-    uint selected_bank = uint(state_to_bank[state_bank_offset + state]);
+    uint selected_bank;
+    if constexpr (CACHED_BANKS) {
+        selected_bank = (state_bank_words[state >> 2u] >> ((state & 3u) * 8u)) & 255u;
+    } else {
+        selected_bank = uint(state_to_bank[state_bank_offset + state]);
+    }
     float scale = anchors[anchor_offset + row]
         * scales[scale_offset + state];
     uint sign_base = row * signs + group * 3u;
@@ -1100,7 +1106,8 @@ inline void decode_nvq1_group24(
 
 template <
     uint FIXED_PROFILE = 0xffffffffu,
-    uint FIXED_EXECUTION = 0xffffffffu>
+    uint FIXED_EXECUTION = 0xffffffffu,
+    bool CACHED_BANKS = false>
 inline void decode_vq_group24(
     const device int* d,
     const device uchar* indices,
@@ -1115,7 +1122,8 @@ inline void decode_vq_group24(
     threadgroup half* target,
     uint row,
     uint group,
-    uint k_size) {
+    uint k_size,
+    uint4 state_bank_words = uint4(0u)) {
     uint groups = uint(d[5]);
     uint vector_size = uint(d[6]);
     uint vectors = uint(d[7]);
@@ -1147,22 +1155,22 @@ inline void decode_vq_group24(
     float anchor = anchors[anchor_offset + row];
 
     if (profile == 1u) {
-        decode_jsc_group24<4u, 8u>(
+        decode_jsc_group24<4u, 8u, CACHED_BANKS>(
             d, indices, state_stream, aux, anchors, codebooks, scales,
-            state_to_bank, target, row, group, k_size);
+            state_to_bank, target, row, group, k_size, state_bank_words);
         return;
     }
     if (profile == 4u) {
-        decode_jsc_group24<8u, 8u>(
+        decode_jsc_group24<8u, 8u, CACHED_BANKS>(
             d, indices, state_stream, aux, anchors, codebooks, scales,
-            state_to_bank, target, row, group, k_size);
+            state_to_bank, target, row, group, k_size, state_bank_words);
         return;
     }
     if ((profile == 7u || profile == 8u) && execution == 0u) {
         #define MFQ_DECODE_BANKED_GROUP(VECTOR, BITS) \
-            decode_jsc_group24<VECTOR, BITS>( \
+            decode_jsc_group24<VECTOR, BITS, CACHED_BANKS>( \
                 d, indices, state_stream, aux, anchors, codebooks, scales, \
-                state_to_bank, target, row, group, k_size)
+                state_to_bank, target, row, group, k_size, state_bank_words)
         if (profile == 8u) {
             if (index_bits == 9u) { MFQ_DECODE_BANKED_GROUP(4u, 9u); }
             else { MFQ_DECODE_BANKED_GROUP(4u, 10u); }
@@ -2215,9 +2223,22 @@ template <
             + uint(output_base) + vq_output_row;
         vq_row_valid = vq_output_row < uint(valid_n);
     }
-    auto execute_k = [&](auto profile, auto execution) {
+    auto execute_indexed_k = [&](auto profile, auto execution, auto index_bits) {
         constexpr int VQ_PROFILE = decltype(profile)::value;
         constexpr uint VQ_EXECUTION = decltype(execution)::value;
+        constexpr uint VQ_INDEX_BITS = decltype(index_bits)::value;
+        constexpr bool CACHED_BANKS = (VQ_PROFILE == 1 || VQ_PROFILE == 4
+            || VQ_PROFILE == 7 || VQ_PROFILE == 8)
+            && (VQ_EXECUTION == 0u || VQ_EXECUTION == 1u);
+        uint4 state_bank_words(0u);
+        if constexpr (CACHED_BANKS) {
+            const device uchar* banks = vq_state_to_bank + uint(base_descriptor[24]);
+            state_bank_words = uint4(
+                as_type<uint>(*reinterpret_cast<device const packed_uchar4*>(banks)),
+                as_type<uint>(*reinterpret_cast<device const packed_uchar4*>(banks + 4u)),
+                as_type<uint>(*reinterpret_cast<device const packed_uchar4*>(banks + 8u)),
+                as_type<uint>(*reinterpret_cast<device const packed_uchar4*>(banks + 12u)));
+        }
 #endif
     for (int k_base = 0; k_base < input_width; k_base += BK) {
         if constexpr (!DIRECT_ACTIVATION) {
@@ -2292,12 +2313,17 @@ template <
                             target, vq_pool_row, group);
                     }
 #endif
-                    if constexpr (VQ_PROFILE != 6) {
-                        decode_vq_group24<uint(VQ_PROFILE), VQ_EXECUTION>(
+                    if constexpr (VQ_INDEX_BITS != 0u) {
+                        decode_jsc_group24<VQ_PROFILE == 8 ? 4u : 8u, VQ_INDEX_BITS, CACHED_BANKS>(
+                            descriptor, vq_indices, vq_state, vq_aux,
+                            vq_anchors, vq_codebooks, vq_scales, vq_state_to_bank,
+                            target, vq_pool_row, group, uint(input_width), state_bank_words);
+                    } else if constexpr (VQ_PROFILE != 6) {
+                        decode_vq_group24<uint(VQ_PROFILE), VQ_EXECUTION, CACHED_BANKS>(
                             descriptor, vq_indices, vq_state, vq_aux,
                             vq_anchors, vq_codebooks, vq_scales, vq_state_to_bank,
                             vq_banks, vq_parameters, target, vq_pool_row, group,
-                            uint(input_width));
+                            uint(input_width), state_bank_words);
                     }
                 } else {
 #pragma clang loop unroll(full)
@@ -2652,6 +2678,9 @@ template <
 
 #if (MFQ_GROUPED_FAMILY_MASK & 2) != 0
     };
+    auto execute_k = [&](auto profile, auto execution) {
+        execute_indexed_k(profile, execution, metal::integral_constant<uint, 0u>{});
+    };
     if constexpr (FIXED_VQ_GEOMETRY) {
         bool eligible = params.projections == 1 && input_width % 32 == 0
             && uint(base_descriptor[0]) == 1u;
@@ -2665,13 +2694,16 @@ template <
             execute_k(metal::integral_constant<int, 6>{},
                 metal::integral_constant<uint, 4u>{});
 #endif
-        } else if (eligible && base_descriptor[28] == 1 && base_descriptor[29] == 1) {
+        } else if (eligible && base_descriptor[28] == 1
+            && (base_descriptor[29] == 0 || base_descriptor[29] == 1)) {
             execute_k(metal::integral_constant<int, 1>{},
                 metal::integral_constant<uint, 1u>{});
-        } else if (eligible && base_descriptor[28] == 4 && base_descriptor[29] == 1) {
+        } else if (eligible && base_descriptor[28] == 4
+            && (base_descriptor[29] == 0 || base_descriptor[29] == 1)) {
             execute_k(metal::integral_constant<int, 4>{},
                 metal::integral_constant<uint, 1u>{});
-        } else if (eligible && base_descriptor[28] == 3 && base_descriptor[29] == 5) {
+        } else if (eligible && base_descriptor[28] == 3
+            && (base_descriptor[29] == 0 || base_descriptor[29] == 5)) {
             execute_k(metal::integral_constant<int, 3>{},
                 metal::integral_constant<uint, 5u>{});
         } else if (eligible && base_descriptor[28] == 7 && base_descriptor[29] == 2) {
@@ -2683,6 +2715,32 @@ template <
         } else if (eligible && base_descriptor[28] == 8 && base_descriptor[29] == 3) {
             execute_k(metal::integral_constant<int, 8>{},
                 metal::integral_constant<uint, 3u>{});
+        } else if (eligible && base_descriptor[29] == 0) {
+            if (base_descriptor[28] == 7) {
+                if (base_descriptor[8] == 10) {
+                    execute_indexed_k(metal::integral_constant<int, 7>{},
+                        metal::integral_constant<uint, 0u>{}, metal::integral_constant<uint, 10u>{});
+                } else {
+                    execute_indexed_k(metal::integral_constant<int, 7>{},
+                        metal::integral_constant<uint, 0u>{}, metal::integral_constant<uint, 12u>{});
+                }
+            } else if (base_descriptor[28] == 8) {
+                if (base_descriptor[8] == 9) {
+                    execute_indexed_k(metal::integral_constant<int, 8>{},
+                        metal::integral_constant<uint, 0u>{}, metal::integral_constant<uint, 9u>{});
+                } else {
+                    execute_indexed_k(metal::integral_constant<int, 8>{},
+                        metal::integral_constant<uint, 0u>{}, metal::integral_constant<uint, 10u>{});
+                }
+#ifdef MFQ_ENABLE_LEGACY_VQ_VECTOR
+            } else if (base_descriptor[28] == 6) {
+                execute_k(metal::integral_constant<int, 6>{},
+                    metal::integral_constant<uint, 0u>{});
+#endif
+            } else {
+                execute_k(metal::integral_constant<int, 0>{},
+                    metal::integral_constant<uint, 0xffffffffu>{});
+            }
         } else {
             execute_k(metal::integral_constant<int, 0>{},
                 metal::integral_constant<uint, 0xffffffffu>{});

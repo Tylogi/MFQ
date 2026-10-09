@@ -7511,9 +7511,23 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--test-vq-prefill") {
+            test_grouped_vq_decoder_tail_prefill(640, 256);
             test_grouped_vq_decoder_tail_prefill(200, 257);
             test_grouped_vq_decoder_tail_prefill(256, 384);
             std::cout << "MFQ VQ prefill decoder tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--test-nax-prefill") {
+            test_mixed_mfe_native_and_grouped_dispatch(256, true);
+            test_multiple_nint_pools_share_cpp_dispatch(513);
+            test_grouped_dense_quad_tail_prefill(66, 128);
+            test_grouped_vq_decoder_tail_prefill(640, 256);
+            test_grouped_vq_decoder_tail_prefill(256, 384);
+            test_grouped_nint_mmq_prefill(513, 24, 256, 66);
+            test_grouped_nint_mmq_prefill(513, 28, 256, 66);
+            test_grouped_nint_mmq_prefill(513, 24, 192, 256);
+            test_grouped_nint_mmq_prefill(513, 28, 192, 256);
+            std::cout << "MFQ NAX prefill decoder tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--test-shared-rotation") {
