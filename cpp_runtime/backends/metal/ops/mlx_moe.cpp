@@ -4793,8 +4793,8 @@ kernel void mfq_grouped_mfe_partition(
             if (compact_blocks()) {
                 const auto& populations = *config_.cohort_populations;
                 const auto found = std::find_if(populations.begin(), populations.end(),
-                    [&](const auto& population) {
-                        return std::get<0>(population) == family_mask && std::get<1>(population) == group_size;
+                    [family = family_mask, group = group_size](const auto& population) {
+                        return std::get<0>(population) == family && std::get<1>(population) == group;
                     });
                 if (found == populations.end()) throw std::logic_error("grouped MFE cohort is missing");
                 const auto pass = static_cast<std::size_t>(found - populations.begin());
