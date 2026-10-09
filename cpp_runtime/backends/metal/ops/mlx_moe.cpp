@@ -2541,6 +2541,7 @@ struct GroupedMmqConfig {
     int family_mask = 127;
     int vq_profile_mask = 0;
     std::shared_ptr<const std::vector<int>> nint_group_sizes;
+    std::shared_ptr<const std::vector<std::tuple<int, int, int>>> cohort_populations;
     bool use_nax = false;
     bool direct_nax = false;
     float swiglu_limit = 0.0f;
@@ -4403,7 +4404,19 @@ public:
         mlx::core::Stream stream,
         GroupedMmqConfig config)
         : UnaryPrimitive(stream),
-          config_(std::move(config)) {}
+          config_(std::move(config)) {
+        if (config_.use_nax && !config_.direct_nax && config_.projections == 1
+            && config_.fused_swiglu == 0 && config_.cohort_populations
+            && config_.cohort_populations->size() > 1) {
+            int mask = 0;
+            int experts = 0;
+            for (const auto& [family, group, count] : *config_.cohort_populations) {
+                mask |= family;
+                experts += count;
+            }
+            compact_blocks_ = mask == config_.family_mask && experts == config_.experts;
+        }
+    }
 
     std::string preparation_key() const override {
         std::string key = "grouped_mmq";
@@ -4414,11 +4427,66 @@ public:
             key += "_" + std::to_string(value);
         if (config_.nint_group_sizes)
             for (const int group : *config_.nint_group_sizes) key += "_gs" + std::to_string(group);
+        if (compact_blocks()) key += "_compact_blocks";
         return key;
     }
-    void prepare_gpu() override { (void)prepared_kernels(); }
+    void prepare_gpu() override {
+        (void)prepared_kernels();
+        if (compact_blocks()) (void)prepared_partition();
+    }
 
-    std::vector<std::tuple<MTL::ComputePipelineState*, int, int>> prepared_kernels() {
+    bool compact_blocks() const {
+        return compact_blocks_;
+    }
+
+    MTL::ComputePipelineState* prepared_partition() {
+        auto& device = mlx::core::metal::device(stream().device);
+        const int passes = static_cast<int>(config_.cohort_populations->size());
+        const std::string name = "mfq_grouped_mfe_partition_v1_p" + std::to_string(passes);
+        CompileOptions options;
+        options.math_mode = MathMode::Fast;
+        auto* library = device.get_library(name, options, [passes] {
+            return std::string("#include <metal_stdlib>\nusing namespace metal;\n#define PASSES ")
+                + std::to_string(passes) + R"METAL(
+kernel void mfq_grouped_mfe_partition(
+    device const int* descriptors [[buffer(0)]],
+    device const int* source [[buffer(1)]],
+    device const int* count [[buffer(2)]],
+    device int* destination [[buffer(3)]],
+    device int* counts [[buffer(4)]],
+    constant int4& params [[buffer(5)]],
+    constant int2* keys [[buffer(6)]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup atomic_int local_counts[PASSES];
+    for (int pass = int(tid); pass < PASSES; pass += 256)
+        atomic_store_explicit(local_counts + pass, 0, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int block = int(tid); block < count[0]; block += 256) {
+        const int expert = source[block * 3 + 1];
+        if (expert < 0 || expert >= params.y || source[block * 3 + 2] <= 0) continue;
+        device const int* descriptor = descriptors + expert * params.z;
+        const int family = descriptor[0];
+        for (int pass = 0; pass < PASSES; ++pass) {
+            if ((keys[pass].x & (1 << family)) == 0
+                || (keys[pass].y != 0 && descriptor[5] != keys[pass].y)) continue;
+            const int slot = atomic_fetch_add_explicit(local_counts + pass, 1, memory_order_relaxed);
+            const int offset = (pass * params.x + slot) * 3;
+            destination[offset] = source[block * 3];
+            destination[offset + 1] = expert;
+            destination[offset + 2] = source[block * 3 + 2];
+            break;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int pass = int(tid); pass < PASSES; pass += 256)
+        counts[pass] = atomic_load_explicit(local_counts + pass, memory_order_relaxed);
+}
+)METAL";
+        });
+        return device.get_kernel("mfq_grouped_mfe_partition", library);
+    }
+
+    std::vector<std::tuple<MTL::ComputePipelineState*, int, int, int, int>> prepared_kernels() {
         auto& selected_stream = stream();
         auto& device = mlx::core::metal::device(
             selected_stream.device);
@@ -4440,11 +4508,11 @@ public:
             if (config_.use_nax) {
                 library_name = selected_vector_vq
                     ? (selected_extended
-                        ? "mfq_grouped_mfe_nax_v15_legacy_vq_jsc_extended"
-                        : "mfq_grouped_mfe_nax_v15_legacy_vq_vector")
+                        ? "mfq_grouped_mfe_nax_v34_legacy_vq_jsc_extended"
+                        : "mfq_grouped_mfe_nax_v34_legacy_vq_vector")
                     : (selected_extended
-                        ? "mfq_grouped_mfe_nax_v15_jsc_extended"
-                        : "mfq_grouped_mfe_nax_v15");
+                        ? "mfq_grouped_mfe_nax_v34_jsc_extended"
+                        : "mfq_grouped_mfe_nax_v34");
             } else {
                 library_name = selected_vector_vq
                     ? (selected_extended
@@ -4456,6 +4524,7 @@ public:
             }
             library_name += "_fm" + std::to_string(family_mask)
                 + "_gs" + std::to_string(group_size);
+            if (compact_blocks()) library_name += "_compact";
             if (!config_.use_nax)
                 library_name += "_bm" + std::to_string(config_.block_rows);
             if (config_.use_nax) {
@@ -4577,7 +4646,7 @@ public:
                 : (config_.has_nepq_residual != 0
                     ? "mfq_grouped_mmq_f16_specialized_nr"
                     : "mfq_grouped_mmq_f16_specialized"));
-        std::vector<std::tuple<MTL::ComputePipelineState*, int, int>> kernels;
+        std::vector<std::tuple<MTL::ComputePipelineState*, int, int, int, int>> kernels;
         std::vector<std::pair<int, int>> passes;
         if (!config_.direct_nax
             && config_.projections == 1 && config_.fused_swiglu == 0) {
@@ -4614,16 +4683,16 @@ public:
                     && !(family_mask == (1 << kFamilyVq)
                         || (family_mask == (1 << kFamilyNint)
                             && (group_size == 24 || group_size == 28))) ? 32 : 64;
-            kernels.emplace_back(kernel, simd_rows, tile_columns);
+            kernels.emplace_back(kernel, simd_rows, tile_columns, family_mask, group_size);
             if (!config_.use_nax && config_.block_rows >= 64) {
                 const auto mid_name = std::string(kernel_name) + "_mid";
-                kernels.emplace_back(device.get_kernel(mid_name, library), simd_rows, 64);
+                kernels.emplace_back(device.get_kernel(mid_name, library), simd_rows, 64, family_mask, group_size);
                 if (config_.block_rows > 80) {
                     const auto mid80_name = std::string(kernel_name) + "_mid80";
-                    kernels.emplace_back(device.get_kernel(mid80_name, library), simd_rows, tile_columns);
+                    kernels.emplace_back(device.get_kernel(mid80_name, library), simd_rows, tile_columns, family_mask, group_size);
                 }
                 const auto tail_name = std::string(kernel_name) + "_tail";
-                kernels.emplace_back(device.get_kernel(tail_name, library), simd_rows, 64);
+                kernels.emplace_back(device.get_kernel(tail_name, library), simd_rows, 64, family_mask, group_size);
             }
         }
         return kernels;
@@ -4649,6 +4718,31 @@ public:
         auto& encoder =
             mlx::core::metal::get_command_encoder(
                 selected_stream);
+        const auto kernels = prepared_kernels();
+        std::optional<array> compact_meta;
+        std::optional<array> compact_count;
+        if (compact_blocks()) {
+            const int passes = static_cast<int>(config_.cohort_populations->size());
+            compact_meta.emplace(Shape{passes, config_.max_blocks, 3}, mlx::core::int32, nullptr, std::vector<array>{});
+            compact_count.emplace(Shape{passes}, mlx::core::int32, nullptr, std::vector<array>{});
+            for (auto* temporary : {&*compact_meta, &*compact_count}) {
+                temporary->set_data(mlx::core::allocator::malloc(temporary->nbytes()));
+                encoder.add_temporary(*temporary);
+            }
+            std::vector<std::array<int, 2>> keys;
+            for (const auto& [mask, group, population] : *config_.cohort_populations)
+                keys.push_back({mask, group});
+            encoder.set_compute_pipeline_state(prepared_partition());
+            encoder.set_input_array(inputs[0], 0);
+            encoder.set_input_array(inputs[26], 1);
+            encoder.set_input_array(inputs[27], 2);
+            encoder.set_output_array(*compact_meta, 3);
+            encoder.set_output_array(*compact_count, 4);
+            encoder.set_bytes(std::array<int, 4>{config_.max_blocks, config_.experts,
+                config_.descriptor_size, 0}, 5);
+            encoder.set_vector_bytes(keys, 6);
+            encoder.dispatch_threadgroups(MTL::Size(1, 1, 1), MTL::Size(256, 1, 1));
+        }
         encoder.set_input_array(inputs[0], 0);
         for (int source = 8; source <= 16; ++source) {
             encoder.set_input_array(
@@ -4693,12 +4787,27 @@ public:
         encoder.set_input_array(inputs[7], 28);
         const int rows_x = config_.use_nax && config_.block_rows == 128
             ? 1 : std::min(32, config_.max_blocks);
-        for (const auto& [kernel, simd_rows, tile_columns] : prepared_kernels()) {
+        for (const auto& [kernel, simd_rows, tile_columns, family_mask, group_size] : kernels) {
             const int columns = (config_.output_width + tile_columns - 1) / tile_columns;
+            int pass_blocks = config_.max_blocks;
+            if (compact_blocks()) {
+                const auto& populations = *config_.cohort_populations;
+                const auto found = std::find_if(populations.begin(), populations.end(),
+                    [family = family_mask, group = group_size](const auto& population) {
+                        return std::get<0>(population) == family && std::get<1>(population) == group;
+                    });
+                if (found == populations.end()) throw std::logic_error("grouped MFE cohort is missing");
+                const auto pass = static_cast<std::size_t>(found - populations.begin());
+                pass_blocks = std::min(config_.max_blocks,
+                    (config_.route_count + config_.block_rows - 1) / config_.block_rows + std::get<2>(*found));
+                encoder.set_input_array(*compact_meta, 18,
+                    pass * static_cast<std::size_t>(config_.max_blocks) * 3 * sizeof(int));
+                encoder.set_input_array(*compact_count, 19, pass * sizeof(int));
+            }
             encoder.set_compute_pipeline_state(kernel);
             encoder.dispatch_threadgroups(
-                config_.use_nax ? MTL::Size(rows_x,
-                    std::size_t((config_.max_blocks + rows_x - 1) / rows_x) * columns, 1)
+                config_.use_nax ? MTL::Size(compact_blocks() ? 1 : rows_x,
+                    std::size_t(compact_blocks() ? pass_blocks : (config_.max_blocks + rows_x - 1) / rows_x) * columns, 1)
                     : MTL::Size(columns, config_.max_blocks, 1),
                 MTL::Size(
                     config_.use_nax
@@ -4735,6 +4844,7 @@ public:
             && primitive->config_.family_mask == config_.family_mask
             && primitive->config_.vq_profile_mask == config_.vq_profile_mask
             && primitive->config_.nint_group_sizes == config_.nint_group_sizes
+            && primitive->config_.cohort_populations == config_.cohort_populations
             && primitive->config_.use_nax == config_.use_nax
             && primitive->config_.direct_nax == config_.direct_nax
             && primitive->config_.swiglu_limit == config_.swiglu_limit;
@@ -4747,6 +4857,7 @@ public:
 
 private:
     GroupedMmqConfig config_;
+    bool compact_blocks_ = false;
 };
 
 array grouped_mmq_dispatch(
@@ -7842,6 +7953,7 @@ struct MlxMfeWeight::Impl {
     std::uint32_t family_mask = 0;
     std::uint32_t vq_profile_mask = 0;
     std::shared_ptr<const std::vector<int>> nint_group_sizes;
+    std::shared_ptr<const std::vector<std::tuple<int, int, int>>> cohort_populations;
     bool vq_execution_layout = false;
     std::uint64_t vq_layouts = 0;
     bool npq_grouped_indices = true;
@@ -7998,6 +8110,21 @@ struct MlxMfeWeight::Impl {
         }
         std::sort(group_sizes.begin(), group_sizes.end());
         nint_group_sizes = std::make_shared<const std::vector<int>>(std::move(group_sizes));
+        std::vector<std::tuple<int, int, int>> populations;
+        if (projections == 1) {
+            for (int family = 0; family < 7; ++family) {
+                if ((family_mask & (std::uint32_t{1} << family)) == 0) continue;
+                const auto groups = family == kFamilyNint ? *nint_group_sizes : std::vector<int>{0};
+                for (const int group : groups) {
+                    int count = 0;
+                    for (std::size_t base = 0; base + kDescriptorSize <= descriptor_values.size(); base += kDescriptorSize)
+                        if (descriptor_values[base + kFamily] == family
+                            && (group == 0 || descriptor_values[base + kNintGroupSize] == group)) ++count;
+                    populations.emplace_back(1 << family, group, count);
+                }
+            }
+        }
+        cohort_populations = std::make_shared<const std::vector<std::tuple<int, int, int>>>(std::move(populations));
         if (
             descriptor_values.size()
                 == static_cast<std::size_t>(experts) * kDescriptorSize
@@ -10980,6 +11107,7 @@ array MlxMfeWeight::routed_matmul_sorted(
             .vq_profile_mask = static_cast<int>(
                 impl_->vq_profile_mask),
             .nint_group_sizes = impl_->nint_group_sizes,
+            .cohort_populations = impl_->cohort_populations,
             .use_nax = use_grouped_nax,
             .direct_nax = use_direct_nax,
             .swiglu_limit = swiglu_limit,
@@ -11423,6 +11551,7 @@ array MlxMfeWeight::routed_matmul_impl(
                 .vq_profile_mask = static_cast<int>(
                     impl_->vq_profile_mask),
                 .nint_group_sizes = impl_->nint_group_sizes,
+                .cohort_populations = impl_->cohort_populations,
                 .use_nax = use_grouped_nax,
                 .direct_nax = use_direct_nax,
                 .swiglu_limit = swiglu_limit,
