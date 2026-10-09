@@ -11,6 +11,10 @@ using namespace metal;
 #define MFQ_GROUPED_NINT_GROUP_SIZE 0
 #endif
 
+#ifndef MFQ_GROUPED_MMQ_BM
+#define MFQ_GROUPED_MMQ_BM 32
+#endif
+
 #ifndef MFQ_GROUPED_NAX_BK
 #define MFQ_GROUPED_NAX_BK 96
 #endif
@@ -267,6 +271,11 @@ instantiate_mfq_dsv4_mxfp4_blocks(
 
 namespace {
 
+inline uint2 vq_bit_cursor(uint value_index, uint bits) {
+    uint residual = (value_index & 7u) * bits;
+    return uint2((value_index >> 3u) * bits + (residual >> 3u), residual & 7u);
+}
+
 inline uint read_bits(
     const device uchar* stream,
     uint value_index,
@@ -304,9 +313,9 @@ inline uint3 read_vq_group_indices(
                 : 0u,
             0u);
     }
-    uint bit = (row * vectors + first) * BITS;
-    uint byte = bit >> 3u;
-    uint shift = bit & 7u;
+    uint2 cursor = vq_bit_cursor(row * vectors + first, BITS);
+    uint byte = cursor.x;
+    uint shift = cursor.y;
     ulong packed = ulong(stream[byte])
         | (ulong(stream[byte + 1u]) << 8u)
         | (ulong(stream[byte + 2u]) << 16u);
@@ -532,34 +541,29 @@ inline half4 decode_nint_row_quad_at(
     uint k_size) {
     uint group_size = MFQ_GROUPED_NINT_GROUP_SIZE > 0
         ? uint(MFQ_GROUPED_NINT_GROUP_SIZE) : uint(d[5]);
-    uint groups = uint(d[6]);
     uint q_offset = uint(d[7]);
     uint sub_offset = uint(d[8]);
-    uint anchor_offset = uint(d[9]);
-    uint row_layout_offset = uint(d[11]);
-    uint row_byte_offsets_offset = uint(d[12]);
-    uint layout = uint(values[row_layout_offset + row]);
-    uint bits = layout & 15u;
-    uint row_bit_shift = layout >> 4u;
-    const device uint* row_byte_offsets =
+    const device uint* row_metadata =
         reinterpret_cast<const device uint*>(
-            values + row_byte_offsets_offset);
+            values + uint(d[11]));
+    const MfqNintRow metadata = mfq_nint_row(row_metadata, row);
     ushort4 quantized = read_nint_row_quad(
         values + q_offset,
-        row_byte_offsets[row],
-        row_bit_shift,
+        metadata.q_offset,
+        metadata.q_shift,
         column,
-        bits);
-    float anchor_scale = anchor_scales[anchor_offset + row];
-    float anchor_minimum = anchor_mins[anchor_offset + row];
+        metadata.q_bits);
     const uint first_group = column / group_size;
     if (column + 3u < k_size
         && first_group == (column + 3u) / group_size) {
-        const uint metadata = row * groups + first_group;
-        const float scale = anchor_scale
-            * float(sub_scales[sub_offset + metadata]);
-        const float minimum = anchor_minimum
-            * float(sub_mins[sub_offset + metadata]);
+        const float scale = metadata.scale
+            * float(mfq_nint_sub_value(sub_scales,
+                sub_offset + metadata.sub_offset, metadata.sub_shift,
+                metadata.sub_bits, first_group));
+        const float minimum = metadata.minimum
+            * float(mfq_nint_sub_value(sub_mins,
+                sub_offset + metadata.sub_offset, metadata.sub_shift,
+                metadata.sub_bits, first_group));
         return half4(scale * float4(quantized) - minimum);
     }
     half4 decoded = half4(0.0h);
@@ -567,11 +571,15 @@ inline half4 decode_nint_row_quad_at(
     for (uint lane = 0u; lane < 4u; ++lane) {
         uint input_column = column + lane;
         if (input_column < k_size) {
-            uint metadata = row * groups + input_column / group_size;
-            float scale = anchor_scale
-                * float(sub_scales[sub_offset + metadata]);
-            float minimum = anchor_minimum
-                * float(sub_mins[sub_offset + metadata]);
+            const uint group = input_column / group_size;
+            float scale = metadata.scale
+                * float(mfq_nint_sub_value(sub_scales,
+                    sub_offset + metadata.sub_offset, metadata.sub_shift,
+                    metadata.sub_bits, group));
+            float minimum = metadata.minimum
+                * float(mfq_nint_sub_value(sub_mins,
+                    sub_offset + metadata.sub_offset, metadata.sub_shift,
+                    metadata.sub_bits, group));
             decoded[lane] = half(
                 scale * float(quantized[lane]) - minimum);
         }
@@ -605,25 +613,27 @@ inline void decode_nint_row_pair_at(
             : half4(0.0h);
         return;
     }
-    uint layout = uint(values[uint(d[11]) + row]);
-    const device uint* row_offsets = reinterpret_cast<const device uint*>(
-        values + uint(d[12]));
-    uint offset = row_offsets[row];
-    uint bits = layout & 15u;
-    uint shift = layout >> 4u;
+    const MfqNintRow metadata = mfq_nint_row(
+        reinterpret_cast<const device uint*>(values + uint(d[11])), row);
+    uint offset = metadata.q_offset;
+    uint bits = metadata.q_bits;
+    uint shift = metadata.q_shift;
     const device uchar* stream = values + uint(d[7]);
     ushort4 first = read_nint_row_quad(stream, offset, shift, column, bits);
     ushort4 second = read_nint_row_quad(stream, offset, shift, column + 4u, bits);
-    uint metadata = row * uint(d[6]) + first_group;
-    float scale = anchor_scales[uint(d[9]) + row]
-        * float(sub_scales[uint(d[8]) + metadata]);
-    float minimum = anchor_mins[uint(d[9]) + row]
-        * float(sub_mins[uint(d[8]) + metadata]);
+    float scale = metadata.scale
+        * float(mfq_nint_sub_value(sub_scales,
+            uint(d[8]) + metadata.sub_offset, metadata.sub_shift,
+            metadata.sub_bits, first_group));
+    float minimum = metadata.minimum
+        * float(mfq_nint_sub_value(sub_mins,
+            uint(d[8]) + metadata.sub_offset, metadata.sub_shift,
+            metadata.sub_bits, first_group));
     *reinterpret_cast<threadgroup half4*>(target) = half4(scale * float4(first) - minimum);
     *reinterpret_cast<threadgroup half4*>(target + 4u) = half4(scale * float4(second) - minimum);
 }
 
-template <uint GROUP_SIZE, uint TILE_K>
+template <uint GROUP_SIZE, uint TILE_K, uint GROUP_LANES = 1u>
 inline void decode_nint_group_tile_at(
     const device int* d,
     const device uchar* values,
@@ -635,25 +645,31 @@ inline void decode_nint_group_tile_at(
     uint row,
     uint group,
     uint k_base,
-    uint k_size) {
-    uint layout = uint(values[uint(d[11]) + row]);
-    const device uint* row_offsets = reinterpret_cast<const device uint*>(
-        values + uint(d[12]));
-    uint offset = row_offsets[row];
-    uint bits = layout & 15u;
-    uint shift = layout >> 4u;
+    uint k_size,
+    uint group_lane = 0u) {
+    constexpr uint QUADS_PER_LANE = (GROUP_SIZE / 4u + GROUP_LANES - 1u) / GROUP_LANES;
+    const MfqNintRow metadata = mfq_nint_row(
+        reinterpret_cast<const device uint*>(values + uint(d[11])), row);
+    uint offset = metadata.q_offset;
+    uint bits = metadata.q_bits;
+    uint shift = metadata.q_shift;
     const device uchar* stream = values + uint(d[7]);
-    uint metadata = row * uint(d[6]) + group;
-    float scale = anchor_scales[uint(d[9]) + row]
-        * float(sub_scales[uint(d[8]) + metadata]);
-    float minimum = anchor_mins[uint(d[9]) + row]
-        * float(sub_mins[uint(d[8]) + metadata]);
+    float scale = metadata.scale
+        * float(mfq_nint_sub_value(sub_scales,
+            uint(d[8]) + metadata.sub_offset, metadata.sub_shift,
+            metadata.sub_bits, group));
+    float minimum = metadata.minimum
+        * float(mfq_nint_sub_value(sub_mins,
+            uint(d[8]) + metadata.sub_offset, metadata.sub_shift,
+            metadata.sub_bits, group));
     if constexpr (TILE_K % GROUP_SIZE == 0u) {
         if ((group + 1u) * GROUP_SIZE <= k_size) {
             constexpr uint COMMON_BITS = GROUP_SIZE == 24u ? 6u : 5u;
             if (simd_all(bits == COMMON_BITS)) {
 #pragma clang loop unroll(full)
-                for (uint inner = 0u; inner < GROUP_SIZE; inner += 4u) {
+                for (uint quad = 0u; quad < QUADS_PER_LANE; ++quad) {
+                    uint inner = (group_lane * QUADS_PER_LANE + quad) * 4u;
+                    if (inner >= GROUP_SIZE) continue;
                     uint column = group * GROUP_SIZE + inner;
                     ushort4 quantized = read_nint_row_quad<COMMON_BITS>(
                         stream, offset, shift, column, bits);
@@ -662,7 +678,9 @@ inline void decode_nint_group_tile_at(
                 }
             } else {
 #pragma clang loop unroll(full)
-                for (uint inner = 0u; inner < GROUP_SIZE; inner += 4u) {
+                for (uint quad = 0u; quad < QUADS_PER_LANE; ++quad) {
+                    uint inner = (group_lane * QUADS_PER_LANE + quad) * 4u;
+                    if (inner >= GROUP_SIZE) continue;
                     uint column = group * GROUP_SIZE + inner;
                     ushort4 quantized = read_nint_row_quad(
                         stream, offset, shift, column, bits);
@@ -674,7 +692,9 @@ inline void decode_nint_group_tile_at(
         }
     }
 #pragma clang loop unroll(full)
-    for (uint inner = 0u; inner < GROUP_SIZE; inner += 4u) {
+    for (uint quad = 0u; quad < QUADS_PER_LANE; ++quad) {
+        uint inner = (group_lane * QUADS_PER_LANE + quad) * 4u;
+        if (inner >= GROUP_SIZE) continue;
         uint column = group * GROUP_SIZE + inner;
         int local_column = int(column) - int(k_base);
         if ((TILE_K % GROUP_SIZE == 0u
@@ -738,7 +758,7 @@ inline uint3 read_jsc_wide_record(
         record >> (index_count * index_bits));
 }
 
-template <uint JSC_VECTOR, uint BYTES_PER_SIGN, uint PACKED_LAYOUT = 0u>
+template <uint JSC_VECTOR, uint INDEX_BITS>
 inline void decode_jsc_group24(
     const device int* d,
     const device uchar* indices,
@@ -762,74 +782,58 @@ inline void decode_jsc_group24(
     uint codebook_offset = uint(d[22]);
     uint scale_offset = uint(d[23]);
     uint state_bank_offset = uint(d[24]);
-    uint execution = PACKED_LAYOUT != 0u ? PACKED_LAYOUT : uint(d[29]);
     uint state_index = row * groups + group;
     uint signs = (k_size + 7u) / 8u;
     uint packed_state =
         uint(state_stream[state_offset + (state_index >> 1u)]);
     uint state =
         (packed_state >> ((state_index & 1u) * 4u)) & 15u;
-    uint selected_bank = PACKED_LAYOUT == 6u
-        ? 0u : uint(state_to_bank[state_bank_offset + state]);
+    uint selected_bank = uint(state_to_bank[state_bank_offset + state]);
     float scale = anchors[anchor_offset + row]
         * scales[scale_offset + state];
     uint sign_base = row * signs + group * 3u;
     uint vector_base = row * vectors + group * (24u / JSC_VECTOR);
+    uint2 packed_indices;
+    uint packed_signs;
+    uint2 cursor = vq_bit_cursor(vector_base, INDEX_BITS);
+    uint offset = indices_offset + cursor.x;
+    uint low = as_type<uint>(*reinterpret_cast<device const packed_uchar4*>(indices + offset));
+    uint high = 0u;
+    if constexpr ((24u / JSC_VECTOR) * INDEX_BITS + (INDEX_BITS == 8u ? 0u : 7u) > 32u)
+        high = as_type<uint>(*reinterpret_cast<device const packed_uchar4*>(indices + offset + 4u));
+    uint shift = cursor.y;
+    uint upper = 0u;
+    if constexpr (JSC_VECTOR == 4u && INDEX_BITS == 10u)
+        upper = uint(indices[offset + 8u]);
+    packed_indices = uint2((low >> shift) | (shift != 0u ? high << (32u - shift) : 0u),
+        (high >> shift) | (shift != 0u ? upper << (32u - shift) : 0u));
+    uint2 sign_cursor = vq_bit_cursor(sign_base, 7u);
+    packed_signs = as_type<uint>(*reinterpret_cast<device const packed_uchar4*>(
+        aux + aux_offset + sign_cursor.x)) >> sign_cursor.y;
 
 #pragma clang loop unroll(full)
     for (uint chunk = 0u; chunk < 3u; ++chunk) {
-        if constexpr (PACKED_LAYOUT == 6u) {
-            if (group * 24u + chunk * 8u >= k_size) {
-                *reinterpret_cast<threadgroup half4*>(target + chunk * 8u) = half4(0.0h);
-                *reinterpret_cast<threadgroup half4*>(target + chunk * 8u + 4u) = half4(0.0h);
-                continue;
-            }
+        if (group * 24u + chunk * 8u >= k_size) {
+            *reinterpret_cast<threadgroup half4*>(target + chunk * 8u) = half4(0.0h);
+            *reinterpret_cast<threadgroup half4*>(target + chunk * 8u + 4u) = half4(0.0h);
+            continue;
         }
-        uint sign_index = sign_base + chunk;
-        uint first_vector = vector_base + chunk * (8u / JSC_VECTOR);
-        uint index0 = 0u;
-        uint index1 = 0u;
-        uint sign_value = 0u;
-        if constexpr (PACKED_LAYOUT == 6u) {
-            uint3 record = read_jsc_wide_record(
-                indices, indices_offset, sign_index, JSC_VECTOR,
-                DUAL_INDEX ? 12u : 16u);
-            index0 = record.x;
-            index1 = record.y;
-            sign_value = record.z;
-        } else if (execution != 0u) {
-            uint offset = indices_offset
-                + sign_index * BYTES_PER_SIGN;
-            if constexpr (DUAL_INDEX) {
-                index0 = uint(indices[offset]);
-                index1 = uint(indices[offset + 1u]);
-                sign_value = uint(indices[offset + 2u]);
-            } else {
-                uchar2 packed = *reinterpret_cast<device const uchar2*>(
-                    indices + offset);
-                index0 = uint(packed.x);
-                sign_value = uint(packed.y);
-            }
-        } else {
-            index0 = uint(indices[indices_offset + first_vector]);
-            if constexpr (DUAL_INDEX) {
-                index1 = uint(indices[indices_offset + first_vector + 1u]);
-            }
-            sign_value = read_bits(
-                aux + aux_offset,
-                sign_index,
-                7u);
-        }
-        uint sign_bits = sign_value;
-        if (execution == 0u) {
-            sign_bits |= (popcount(sign_value) & 1u) << 7u;
-        }
+        uint index_shift = chunk * (8u / JSC_VECTOR) * INDEX_BITS;
+        uint record = index_shift == 0u ? packed_indices.x : index_shift < 32u
+            ? (packed_indices.x >> index_shift) | (packed_indices.y << (32u - index_shift))
+            : packed_indices.y >> (index_shift - 32u);
+        uint index0 = record & ((1u << INDEX_BITS) - 1u);
+        uint index1 = DUAL_INDEX ? (record >> INDEX_BITS) & ((1u << INDEX_BITS) - 1u) : 0u;
+        uint sign_bits = (packed_signs >> (chunk * 7u)) & 127u;
+        uint parity = (popcount(sign_bits) & 1u)
+            ^ (d[13] == 2 ? (index0 >> 7u) & 1u : 0u);
+        sign_bits |= parity << 7u;
         uint first_code_base = codebook_offset
-            + (selected_bank * 256u + index0) * JSC_VECTOR;
+            + (selected_bank * (1u << INDEX_BITS) + index0) * JSC_VECTOR;
         uint second_code_base = 0u;
         if constexpr (DUAL_INDEX) {
             second_code_base = codebook_offset
-                + (selected_bank * 256u + index1) * JSC_VECTOR;
+                + (selected_bank * (1u << INDEX_BITS) + index1) * JSC_VECTOR;
         } else {
             second_code_base = first_code_base + 4u;
         }
@@ -849,11 +853,7 @@ inline void decode_jsc_group24(
             -second_value,
             (uint4(sign_bits) & uint4(16u, 32u, 64u, 128u))
                 != uint4(0u));
-        if constexpr (PACKED_LAYOUT == 6u) {
-            if (group * 24u + chunk * 8u + 4u >= k_size) {
-                second_value = float4(0.0f);
-            }
-        }
+        if (group * 24u + chunk * 8u + 4u >= k_size) second_value = float4(0.0f);
         *reinterpret_cast<threadgroup half4*>(
             target + chunk * 8u) = half4(scale * first_value);
         *reinterpret_cast<threadgroup half4*>(
@@ -980,18 +980,6 @@ inline void decode_jsc_extended_group24(
 }
 #endif
 
-inline uint4 read_nvq1_l_group40(
-    const device uchar* indices,
-    uint offset) {
-    uint low = uint(indices[offset])
-        | (uint(indices[offset + 1u]) << 8u)
-        | (uint(indices[offset + 2u]) << 16u)
-        | (uint(indices[offset + 3u]) << 24u);
-    uint high = uint(indices[offset + 4u]);
-    return uint4(low & 2047u, (low >> 11u) & 2047u,
-        ((low >> 22u) | (high << 10u)) & 2047u, high >> 1u);
-}
-
 #ifdef MFQ_ENABLE_LEGACY_VQ_VECTOR
 template <uint STATE_WIDTH, uint INDEX_WIDTH, uint TABLE_SIZE>
 inline void decode_npq_group24(
@@ -1042,8 +1030,7 @@ template <
     uint STATE_WIDTH,
     uint INDEX_WIDTH,
     uint ENTRIES_PER_BANK,
-    bool DUAL_BANK,
-    uint FIXED_EXECUTION = 0xffffffffu>
+    bool DUAL_BANK>
 inline void decode_nvq1_group24(
     const device int* d,
     const device uchar* indices,
@@ -1056,8 +1043,6 @@ inline void decode_nvq1_group24(
     threadgroup half* target,
     uint row,
     uint group) {
-    uint execution = FIXED_EXECUTION != 0xffffffffu
-        ? FIXED_EXECUTION : uint(d[29]);
     uint groups = uint(d[5]);
     uint vectors = uint(d[7]);
     uint indices_offset = uint(d[18]);
@@ -1068,51 +1053,25 @@ inline void decode_nvq1_group24(
     uint scale_offset = uint(d[23]);
     uint parameter_offset = uint(d[26]);
     uint state_index = row * groups + group;
-    uint state;
-    uint bank;
-    uint3 group_indices;
-    if constexpr (DUAL_BANK) {
-        if (execution == 4u) {
-            // NVQ1-S execution layout: each row/group is one little-endian
-            // record containing three 9-bit indices, the 4-bit state, and
-            // the one-bit delta/codebook selector.
-            uint record_offset = indices_offset + state_index * 4u;
-            uint record = uint(indices[record_offset])
-                | (uint(indices[record_offset + 1u]) << 8u)
-                | (uint(indices[record_offset + 2u]) << 16u)
-                | (uint(indices[record_offset + 3u]) << 24u);
-            group_indices = uint3(
-                record & 511u,
-                (record >> 9u) & 511u,
-                (record >> 18u) & 511u);
-            state = (record >> 27u) & 15u;
-            bank = record >> 31u;
-        } else {
-            state = read_bits(
-                state_stream + state_offset, state_index, STATE_WIDTH);
-            bank = read_bits(aux + aux_offset, state_index, 1u);
-            group_indices = read_vq_group_indices<INDEX_WIDTH>(
-                indices + indices_offset, row, group, vectors);
-        }
-    } else {
-        if (execution == 5u) {
-            uint4 record = read_nvq1_l_group40(
-                indices, indices_offset + state_index * 5u);
-            group_indices = record.xyz;
-            state = record.w & 7u;
-            bank = (record.w >> 3u) & 1u;
-        } else {
-            state = read_bits(
-                state_stream + state_offset, state_index, STATE_WIDTH);
-            bank = read_bits(aux + aux_offset, state_index, 1u);
-            group_indices = read_vq_group_indices<INDEX_WIDTH>(
-                indices + indices_offset, row, group, vectors);
-        }
-    }
+    uint state = read_bits(state_stream + state_offset, state_index, STATE_WIDTH);
+    uint bank = read_bits(aux + aux_offset, state_index, 1u);
+    uint2 cursor = vq_bit_cursor(row * vectors + group * 3u, INDEX_WIDTH);
+    uint offset = indices_offset + cursor.x;
+    uint low = as_type<uint>(*(device const packed_uchar4*)(indices + offset));
+    uint high = uint(indices[offset + 4u]);
+    uint shift = cursor.y;
+    uint first = (low >> shift) | (shift != 0u ? high << (32u - shift) : 0u);
+    uint second = high >> shift;
+    constexpr uint MASK = (1u << INDEX_WIDTH) - 1u;
+    uint3 group_indices(first & MASK, (first >> INDEX_WIDTH) & MASK,
+        ((first >> (2u * INDEX_WIDTH)) | (second << (32u - 2u * INDEX_WIDTH))) & MASK);
     float delta = parameters[parameter_offset];
     float signed_delta = bank != 0u ? -delta : delta;
     float scale = anchors[anchor_offset + row]
         * scales[scale_offset + state];
+    half negative_value = half(scale * (-1.0f + signed_delta));
+    half zero_value = half(scale * (0.0f + signed_delta));
+    half positive_value = half(scale * (1.0f + signed_delta));
 
 #pragma clang loop unroll(full)
     for (uint chunk = 0u; chunk < 3u; ++chunk) {
@@ -1121,16 +1080,20 @@ inline void decode_nvq1_group24(
             entry += bank * ENTRIES_PER_BANK;
         }
         uint code_base = codebook_offset + entry * 8u;
-        float4 first_code = float4(
+        char4 first_code =
             *reinterpret_cast<device const char4*>(
-                codebooks + code_base)) + signed_delta;
-        float4 second_code = float4(
+                codebooks + code_base);
+        char4 second_code =
             *reinterpret_cast<device const char4*>(
-                codebooks + code_base + 4u)) + signed_delta;
+                codebooks + code_base + 4u);
+        half4 first_value = select(half4(zero_value), half4(positive_value), first_code > char4(0));
+        half4 second_value = select(half4(zero_value), half4(positive_value), second_code > char4(0));
+        first_value = select(first_value, half4(negative_value), first_code < char4(0));
+        second_value = select(second_value, half4(negative_value), second_code < char4(0));
         *reinterpret_cast<threadgroup half4*>(
-            target + chunk * 8u) = half4(scale * first_code);
+            target + chunk * 8u) = first_value;
         *reinterpret_cast<threadgroup half4*>(
-            target + chunk * 8u + 4u) = half4(scale * second_code);
+            target + chunk * 8u + 4u) = second_value;
     }
 }
 #endif
@@ -1184,29 +1147,30 @@ inline void decode_vq_group24(
     float anchor = anchors[anchor_offset + row];
 
     if (profile == 1u) {
-        decode_jsc_group24<4u, 3u,
-            FIXED_EXECUTION != 0xffffffffu ? FIXED_EXECUTION : 0u>(
+        decode_jsc_group24<4u, 8u>(
             d, indices, state_stream, aux, anchors, codebooks, scales,
             state_to_bank, target, row, group, k_size);
         return;
     }
     if (profile == 4u) {
-        decode_jsc_group24<8u, 2u,
-            FIXED_EXECUTION != 0xffffffffu ? FIXED_EXECUTION : 0u>(
+        decode_jsc_group24<8u, 8u>(
             d, indices, state_stream, aux, anchors, codebooks, scales,
             state_to_bank, target, row, group, k_size);
         return;
     }
-    if ((profile == 7u || profile == 8u) && execution == 6u) {
+    if ((profile == 7u || profile == 8u) && execution == 0u) {
+        #define MFQ_DECODE_BANKED_GROUP(VECTOR, BITS) \
+            decode_jsc_group24<VECTOR, BITS>( \
+                d, indices, state_stream, aux, anchors, codebooks, scales, \
+                state_to_bank, target, row, group, k_size)
         if (profile == 8u) {
-            decode_jsc_group24<4u, 4u, 6u>(
-                d, indices, state_stream, aux, anchors, codebooks, scales,
-                state_to_bank, target, row, group, k_size);
+            if (index_bits == 9u) { MFQ_DECODE_BANKED_GROUP(4u, 9u); }
+            else { MFQ_DECODE_BANKED_GROUP(4u, 10u); }
         } else {
-            decode_jsc_group24<8u, 3u, 6u>(
-                d, indices, state_stream, aux, anchors, codebooks, scales,
-                state_to_bank, target, row, group, k_size);
+            if (index_bits == 10u) { MFQ_DECODE_BANKED_GROUP(8u, 10u); }
+            else { MFQ_DECODE_BANKED_GROUP(8u, 12u); }
         }
+        #undef MFQ_DECODE_BANKED_GROUP
         return;
     }
 #ifdef MFQ_ENABLE_JSC_EXTENDED_VECTOR
@@ -1233,13 +1197,13 @@ inline void decode_vq_group24(
     }
 
     if (profile == 3u) {
-        decode_nvq1_group24<3u, 11u, 2048u, false, FIXED_EXECUTION>(
+        decode_nvq1_group24<3u, 11u, 2048u, false>(
             d, indices, state_stream, aux, anchors, codebooks, scales,
             parameters, target, row, group);
         return;
     }
     if (profile == 6u) {
-        decode_nvq1_group24<4u, 9u, 512u, true, FIXED_EXECUTION>(
+        decode_nvq1_group24<4u, 9u, 512u, true>(
             d, indices, state_stream, aux, anchors, codebooks, scales,
             parameters, target, row, group);
         return;
@@ -1270,22 +1234,12 @@ inline void decode_vq_group24(
     }
 
     if (profile == 3u) {
-        uint4 record;
-        uint state;
-        uint sign;
-        if (execution == 5u) {
-            record = read_nvq1_l_group40(indices, indices_offset + state_index * 5u);
-            state = record.w & 7u;
-            sign = (record.w >> 3u) & 1u;
-        } else {
-            state = read_bits(state_stream + state_offset, state_index, state_bits);
-            sign = read_bits(aux + aux_offset, state_index, 1u);
-        }
+        uint state = read_bits(state_stream + state_offset, state_index, state_bits);
+        uint sign = read_bits(aux + aux_offset, state_index, 1u);
         float delta = parameters[parameter_offset];
         float scale = anchor * scales[scale_offset + state];
         for (uint chunk = 0u; chunk < 3u; ++chunk) {
-            uint index = execution == 5u ? record[chunk]
-                : read_bits(indices + indices_offset,
+            uint index = read_bits(indices + indices_offset,
                     row * vectors + group * 3u + chunk, 11u);
             uint code_base = codebook_offset + index * 8u;
             for (uint inner = 0u; inner < 8u; ++inner) {
@@ -1590,8 +1544,8 @@ struct MfqGroupedMmqParams {
 };
 
 #if !defined(MFQ_ENABLE_NAX) && !defined(MFQ_ENABLE_DSV4_MXFP4_BLOCKS)
-template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
-[[kernel]] void mfq_grouped_mmq_f16_bm32_bn64_bk96(
+template <int BM, bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
+[[kernel]] void mfq_grouped_mmq_f16(
     const device int* descriptors [[buffer(0)]],
     const device uchar* vq_indices [[buffer(1)]],
     const device uchar* vq_state [[buffer(2)]],
@@ -1625,11 +1579,19 @@ template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint thread_id [[thread_index_in_threadgroup]]) {
-    constexpr int BM = 32;
-    constexpr int BN = 64;
-    constexpr int BK = 96;
-    constexpr int BK_padded = 104;
+    constexpr bool WIDE_TILE = BM == 80 || BM == 96;
+    constexpr bool WIDE_NINT = WIDE_TILE && MFQ_GROUPED_FAMILY_MASK == 1
+        && (MFQ_GROUPED_NINT_GROUP_SIZE == 24 || MFQ_GROUPED_NINT_GROUP_SIZE == 28);
+    constexpr bool WIDE_VQ = WIDE_TILE && MFQ_GROUPED_FAMILY_MASK == 2;
+    constexpr int BN = WIDE_TILE && !WIDE_NINT && !WIDE_VQ ? 32 : 64;
+    constexpr int BK = WIDE_NINT ? 2 * MFQ_GROUPED_NINT_GROUP_SIZE
+        : WIDE_VQ ? 72
+        : MFQ_GROUPED_FAMILY_MASK == 1 && MFQ_GROUPED_NINT_GROUP_SIZE == 28 ? 112 : 96;
+    constexpr int BK_padded = BK + (BK / 8 % 2 == 0 ? 8 : 0);
+    constexpr int WM = WIDE_NINT || WIDE_VQ ? 2 : BM == 48 || BM == 96 ? 3 : BM == 64 ? 4 : 2;
+    constexpr int WN = WIDE_NINT || WIDE_VQ || BM == 32 || BM == 80 ? 4 : 2;
     constexpr uint TGP_SIZE = 256u;
+    const bool computes_matrix = simd_group_id < uint(WM * WN);
     const int route_count = params.route_count;
     const int tokens = params.tokens;
     const int routes = params.routes;
@@ -1648,8 +1610,8 @@ template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
         BM,
         BN,
         BK,
-        2,
-        4,
+        WM,
+        WN,
         false,
         true,
         BK_padded,
@@ -1668,9 +1630,20 @@ template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
     if (row_count <= 0 || expert < 0 || expert >= experts) {
         return;
     }
+    if constexpr (MFQ_GROUPED_MMQ_BM >= 64) {
+        constexpr int MID_BM = MFQ_GROUPED_MMQ_BM > 64 ? 64 : 48;
+        if ((BM == 32 && row_count > 32)
+            || (BM == MID_BM && (row_count <= 32 || row_count > MID_BM))
+            || (BM == 80 && MFQ_GROUPED_MMQ_BM > 80 && (row_count <= 64 || row_count > 80))
+            || (BM == MFQ_GROUPED_MMQ_BM
+                && row_count <= (MFQ_GROUPED_MMQ_BM > 80 ? 80 : MID_BM))) return;
+    }
 
     const device int* base_descriptor =
         descriptors + expert * params.projections * descriptor_size;
+    if ((MFQ_GROUPED_FAMILY_MASK & (1 << uint(base_descriptor[0]))) == 0) return;
+    if (MFQ_GROUPED_NINT_GROUP_SIZE > 0 && base_descriptor[0] == 0
+        && base_descriptor[5] != MFQ_GROUPED_NINT_GROUP_SIZE) return;
     uint rotation = uint(base_descriptor[27]);
     short valid_n = short(min(BN, output_width - output_base));
     threadgroup half Xs[BM * BK_padded];
@@ -1681,15 +1654,17 @@ template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
     // Give each thread one contiguous fragment of a routed activation row.
     // The route/source lookup is invariant across K tiles, and packed_half4
     // keeps the gather at its natural two-byte alignment.
-    constexpr uint X_LOAD_LANES = TGP_SIZE / uint(BM);
+    constexpr uint X_LOAD_ROWS = WIDE_TILE ? 128u
+        : BM == 48 || (BK == 112 && BM == 32) ? 64u : uint(BM);
+    constexpr uint X_LOAD_LANES = TGP_SIZE / X_LOAD_ROWS;
     constexpr uint X_VALUES_PER_LANE = uint(BK) / X_LOAD_LANES;
-    static_assert(TGP_SIZE % uint(BM) == 0u);
+    static_assert(TGP_SIZE % X_LOAD_ROWS == 0u);
     static_assert(uint(BK) % X_LOAD_LANES == 0u);
     static_assert(X_VALUES_PER_LANE % 4u == 0u);
     uint row = thread_id / X_LOAD_LANES;
     uint load_lane = thread_id - row * X_LOAD_LANES;
     uint local_column = load_lane * X_VALUES_PER_LANE;
-    bool valid_row = int(row) < row_count;
+    bool valid_row = int(row) < row_count && row < uint(BM);
     uint source_offset = 0u;
     if (valid_row) {
         uint route_index = uint(route_order[row_base + int(row)]);
@@ -1705,7 +1680,7 @@ template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
     for (int k_base = 0; k_base < input_width; k_base += BK) {
 #pragma clang loop unroll(full)
         for (uint column = 0u;
-             column < X_VALUES_PER_LANE;
+             row < uint(BM) && column < X_VALUES_PER_LANE;
              column += 4u) {
             uint input_column = uint(k_base) + local_column + column;
             half4 value = half4(0.0h);
@@ -1734,46 +1709,86 @@ template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
                     : 0u;
                 const device int* descriptor = base_descriptor
                     + descriptor_projection * uint(descriptor_size);
-                uint family = uint(descriptor[0]);
+                uint family = MFQ_GROUPED_FAMILY_MASK == 1 ? 0u
+                    : MFQ_GROUPED_FAMILY_MASK == 2 ? 1u
+                    : MFQ_GROUPED_FAMILY_MASK == 4 ? 2u
+                    : MFQ_GROUPED_FAMILY_MASK == 8 ? 3u
+                    : MFQ_GROUPED_FAMILY_MASK == 16 ? 4u
+                    : MFQ_GROUPED_FAMILY_MASK == 32 ? 5u
+                    : MFQ_GROUPED_FAMILY_MASK == 64 ? 6u : uint(descriptor[0]);
                 uint local_expert = uint(descriptor[1]);
                 uint projection_row_offset = params.projections == 1
                     ? uint(projection * output_width)
                     : 0u;
-                for (uint item = thread_id;
-                     item < uint(BN * BK_padded);
-                     item += TGP_SIZE) {
-                    Ws[item] = half(0.0f);
+                if (valid_n != BN || k_base + BK > input_width) {
+                    for (uint item = thread_id;
+                         item < uint(BN * BK_padded);
+                         item += TGP_SIZE) {
+                        Ws[item] = half(0.0f);
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
 
                 if (family == 0u) {
-                    constexpr uint VALUES_PER_ITEM = 4u;
-                    constexpr uint ITEMS_PER_ROW = uint(BK) / VALUES_PER_ITEM;
-                    for (uint item = thread_id;
-                         item < uint(BN) * ITEMS_PER_ROW;
-                         item += TGP_SIZE) {
-                        uint output_row = item / ITEMS_PER_ROW;
-                        uint local_item = item - output_row * ITEMS_PER_ROW;
-                        uint local_column = local_item * VALUES_PER_ITEM;
-                        uint input_column = uint(k_base) + local_column;
-                        if (output_row < uint(valid_n)
-                            && input_column < uint(input_width)) {
-                            uint pool_row =
-                                local_expert * uint(matrix_output_width)
-                                + uint(output_base) + output_row
-                                + projection_row_offset;
-                            *reinterpret_cast<threadgroup half4*>(
-                                Ws + output_row * uint(BK_padded)
-                                    + local_column) = decode_nint_row_quad_at(
-                                descriptor,
-                                nint_q,
-                                nint_sub_scale,
-                                nint_sub_min,
-                                nint_anchor_scale,
-                                nint_anchor_min,
-                                pool_row,
-                                input_column,
-                                uint(input_width));
+                    uint group_size = MFQ_GROUPED_NINT_GROUP_SIZE > 0
+                        ? uint(MFQ_GROUPED_NINT_GROUP_SIZE) : uint(descriptor[5]);
+                    if (group_size == 24u || group_size == 28u) {
+                        constexpr uint GROUP_LANES = WIDE_TILE ? 2u : 1u;
+                        uint tile_groups = (uint(BK) + group_size - 1u) / group_size
+                            + uint(uint(BK) % group_size != 0u);
+                        uint first_group = uint(k_base) / group_size;
+                        for (uint item = thread_id;
+                             item < uint(BN) * tile_groups * GROUP_LANES;
+                             item += TGP_SIZE) {
+                            uint output_row = item / (tile_groups * GROUP_LANES);
+                            uint group = first_group + (item / GROUP_LANES) % tile_groups;
+                            if (output_row < uint(valid_n) && group < uint(descriptor[6])
+                                && group * group_size < uint(k_base + BK)) {
+                                uint pool_row = local_expert * uint(matrix_output_width)
+                                    + uint(output_base) + output_row + projection_row_offset;
+                                threadgroup half* target = Ws + output_row * uint(BK_padded);
+                                if (group_size == 24u) {
+                                    decode_nint_group_tile_at<24u, BK, GROUP_LANES>(
+                                        descriptor, nint_q, nint_sub_scale, nint_sub_min,
+                                        nint_anchor_scale, nint_anchor_min, target, pool_row,
+                                        group, uint(k_base), uint(input_width), item % GROUP_LANES);
+                                } else {
+                                    decode_nint_group_tile_at<28u, BK, GROUP_LANES>(
+                                        descriptor, nint_q, nint_sub_scale, nint_sub_min,
+                                        nint_anchor_scale, nint_anchor_min, target, pool_row,
+                                        group, uint(k_base), uint(input_width), item % GROUP_LANES);
+                                }
+                            }
+                        }
+                    } else {
+                        constexpr uint VALUES_PER_ITEM = 4u;
+                        constexpr uint ITEMS_PER_ROW = uint(BK) / VALUES_PER_ITEM;
+                        for (uint item = thread_id;
+                             item < uint(BN) * ITEMS_PER_ROW;
+                             item += TGP_SIZE) {
+                            uint output_row = item / ITEMS_PER_ROW;
+                            uint local_item = item - output_row * ITEMS_PER_ROW;
+                            uint local_column = local_item * VALUES_PER_ITEM;
+                            uint input_column = uint(k_base) + local_column;
+                            if (output_row < uint(valid_n)
+                                && input_column < uint(input_width)) {
+                                uint pool_row =
+                                    local_expert * uint(matrix_output_width)
+                                    + uint(output_base) + output_row
+                                    + projection_row_offset;
+                                *reinterpret_cast<threadgroup half4*>(
+                                    Ws + output_row * uint(BK_padded)
+                                        + local_column) = decode_nint_row_quad_at(
+                                    descriptor,
+                                    nint_q,
+                                    nint_sub_scale,
+                                    nint_sub_min,
+                                    nint_anchor_scale,
+                                    nint_anchor_min,
+                                    pool_row,
+                                    input_column,
+                                    uint(input_width));
+                            }
                         }
                     }
                 } else if (family == 4u) {
@@ -1932,14 +1947,17 @@ template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
                 }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (projection == 0) {
-                    gate_mma.mma(Xs, Ws);
-                } else {
-                    up_mma.mma(Xs, Ws);
+                if (computes_matrix) {
+                    if (projection == 0) {
+                        gate_mma.mma(Xs, Ws);
+                    } else {
+                        up_mma.mma(Xs, Ws);
+                    }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
         }
+        if (computes_matrix) {
         if constexpr (FUSED_SWIGLU) {
             for (short item = 0;
                  item < decltype(gate_mma.Ctile)::kElemsPerTile;
@@ -1961,30 +1979,58 @@ template <bool FUSED_SWIGLU, bool HAS_NEPQ_RESIDUAL>
             output_width,
             short2(0, 0),
             short2(valid_n, short(row_count)));
+        }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-#define instantiate_mfq_grouped_mmq(name, fused, residual) \
+#define instantiate_mfq_grouped_mmq(name, bm, fused, residual) \
     template [[host_name(name)]] [[kernel]] \
-    decltype(mfq_grouped_mmq_f16_bm32_bn64_bk96<fused, residual>) \
-    mfq_grouped_mmq_f16_bm32_bn64_bk96<fused, residual>;
+    decltype(mfq_grouped_mmq_f16<bm, fused, residual>) \
+    mfq_grouped_mmq_f16<bm, fused, residual>;
 
 instantiate_mfq_grouped_mmq(
-    "mfq_grouped_mmq_f16_bm32_bn64_bk96",
+    "mfq_grouped_mmq_f16_specialized",
+    MFQ_GROUPED_MMQ_BM,
     false,
     false)
 instantiate_mfq_grouped_mmq(
-    "mfq_grouped_mmq_swiglu_f16_bm32_bn64_bk96",
+    "mfq_grouped_mmq_swiglu_f16_specialized",
+    MFQ_GROUPED_MMQ_BM,
     true,
     false)
 instantiate_mfq_grouped_mmq(
-    "mfq_grouped_mmq_f16_bm32_bn64_bk96_nr",
+    "mfq_grouped_mmq_f16_specialized_nr",
+    MFQ_GROUPED_MMQ_BM,
     false,
     true)
 instantiate_mfq_grouped_mmq(
-    "mfq_grouped_mmq_swiglu_f16_bm32_bn64_bk96_nr",
+    "mfq_grouped_mmq_swiglu_f16_specialized_nr",
+    MFQ_GROUPED_MMQ_BM,
     true,
     true)
+#if MFQ_GROUPED_MMQ_BM >= 64
+#if MFQ_GROUPED_MMQ_BM > 64
+instantiate_mfq_grouped_mmq("mfq_grouped_mmq_f16_specialized_mid", 64, false, false)
+instantiate_mfq_grouped_mmq("mfq_grouped_mmq_swiglu_f16_specialized_mid", 64, true, false)
+instantiate_mfq_grouped_mmq("mfq_grouped_mmq_f16_specialized_nr_mid", 64, false, true)
+instantiate_mfq_grouped_mmq("mfq_grouped_mmq_swiglu_f16_specialized_nr_mid", 64, true, true)
+#if MFQ_GROUPED_MMQ_BM > 80
+instantiate_mfq_grouped_mmq("mfq_grouped_mmq_f16_specialized_mid80", 80, false, false)
+instantiate_mfq_grouped_mmq("mfq_grouped_mmq_swiglu_f16_specialized_mid80", 80, true, false)
+instantiate_mfq_grouped_mmq("mfq_grouped_mmq_f16_specialized_nr_mid80", 80, false, true)
+instantiate_mfq_grouped_mmq("mfq_grouped_mmq_swiglu_f16_specialized_nr_mid80", 80, true, true)
+#endif
+#else
+instantiate_mfq_grouped_mmq("mfq_grouped_mmq_f16_specialized_mid", 48, false, false)
+instantiate_mfq_grouped_mmq("mfq_grouped_mmq_swiglu_f16_specialized_mid", 48, true, false)
+instantiate_mfq_grouped_mmq("mfq_grouped_mmq_f16_specialized_nr_mid", 48, false, true)
+instantiate_mfq_grouped_mmq("mfq_grouped_mmq_swiglu_f16_specialized_nr_mid", 48, true, true)
+#endif
+instantiate_mfq_grouped_mmq("mfq_grouped_mmq_f16_specialized_tail", 32, false, false)
+instantiate_mfq_grouped_mmq("mfq_grouped_mmq_swiglu_f16_specialized_tail", 32, true, false)
+instantiate_mfq_grouped_mmq("mfq_grouped_mmq_f16_specialized_nr_tail", 32, false, true)
+instantiate_mfq_grouped_mmq("mfq_grouped_mmq_swiglu_f16_specialized_nr_tail", 32, true, true)
+#endif
 #endif
 
 #ifdef MFQ_ENABLE_NAX
@@ -2238,12 +2284,6 @@ template <
                 threadgroup half* target = Ws + vq_output_row * uint(W_STRIDE)
                     + vq_local_group * 24u;
                 if (vq_row_valid && group * 24u < uint(input_width)) {
-                    if constexpr (VQ_PROFILE == 8 && VQ_EXECUTION == 6u) {
-                        decode_jsc_group24<4u, 4u, 6u>(
-                            descriptor, vq_indices, vq_state, vq_aux,
-                            vq_anchors, vq_codebooks, vq_scales, vq_state_to_bank,
-                            target, vq_pool_row, group, uint(input_width));
-                    }
 #ifdef MFQ_ENABLE_LEGACY_VQ_VECTOR
                     if constexpr (VQ_PROFILE == 6) {
                         decode_nvq1_group24<4u, 9u, 512u, true>(
@@ -2252,8 +2292,7 @@ template <
                             target, vq_pool_row, group);
                     }
 #endif
-                    if constexpr ((VQ_PROFILE != 8 || VQ_EXECUTION != 6u)
-                        && VQ_PROFILE != 6) {
+                    if constexpr (VQ_PROFILE != 6) {
                         decode_vq_group24<uint(VQ_PROFILE), VQ_EXECUTION>(
                             descriptor, vq_indices, vq_state, vq_aux,
                             vq_anchors, vq_codebooks, vq_scales, vq_state_to_bank,
@@ -2306,13 +2345,13 @@ template <
                                 if (group_size == 24u) {
                                     decode_nint_group_tile_at<24u, BK>(
                                         descriptor, nint_q, nint_sub_scale, nint_sub_min,
-                                        nint_anchor_scale, nint_anchor_min, target,
-                                        pool_row, group, uint(k_base), uint(input_width));
+                                        nint_anchor_scale, nint_anchor_min, target, pool_row,
+                                        group, uint(k_base), uint(input_width));
                                 } else {
                                     decode_nint_group_tile_at<28u, BK>(
                                         descriptor, nint_q, nint_sub_scale, nint_sub_min,
-                                        nint_anchor_scale, nint_anchor_min, target,
-                                        pool_row, group, uint(k_base), uint(input_width));
+                                        nint_anchor_scale, nint_anchor_min, target, pool_row,
+                                        group, uint(k_base), uint(input_width));
                                 }
                             }
                         }

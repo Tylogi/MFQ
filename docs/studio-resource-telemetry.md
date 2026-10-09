@@ -20,6 +20,11 @@ breakdown when their nonblocking telemetry lock is unavailable.
 
 The native Metal worker aggregates counters registered by cache and storage
 components, independently of model names or backbone-specific runner methods.
+MFE format/geometry probes do not register SSD backing. A record enters that
+count only when a layer switches to streaming or actually pages its experts;
+only those active records are counted after a partial weight offload. Their
+cached RAM pages remain in dynamic weight residency. SSD backing denotes file
+payloads, not an additional RAM allocation, and cache hits do not duplicate it.
 New backbones reusing these components inherit telemetry; a new storage/cache
 component registers its own resource lifetime once. Refresh does not evaluate
 devices, copy arrays or read files. Static weight residency is sampled

@@ -519,6 +519,13 @@ MlxLinear MlxLinear::load(
                     for (const auto dtype : {mlx::core::float16, mlx::core::float32}) {
                         const auto input = mlx::core::zeros(Shape{rows, result.input_size()}, dtype);
                         preparation->add(result(input));
+                        if (rows >= 64 && dtype == mlx::core::float16) {
+                            if (const auto* nint = result.nint_weight_ref()) {
+                                preparation->add(nint->matmul_packed(input));
+                                if (std::int64_t(nint->input_size()) * nint->output_size() <= std::numeric_limits<int>::max())
+                                    preparation->add(nint->dequantize(mlx::core::float16));
+                            }
+                        }
                         if (rows == 1) {
                             if (auto greedy = result.greedy_argmax(input)) preparation->add(*greedy);
                         }

@@ -2,6 +2,23 @@
 
 namespace mfq::metal {
 
+inline constexpr const char* kNvqVectorInputHeader = R"METAL(
+template <typename T> struct MfqNvqVectorInput {
+    device const T* values;
+    T operator[](uint index) const { return values[index]; }
+};
+template <uint K, typename T>
+inline MfqNvqVectorInput<T> mfq_nvq_input_row(MfqNvqVectorInput<T> x, uint row) {
+    return {x.values + row * K};
+}
+template <uint K, typename T>
+__attribute__((always_inline)) inline float4 mfq_nvq_load_input4(
+    MfqNvqVectorInput<T> x, uint offset, uint column) {
+    static_assert(K % 4u == 0u);
+    return float4(*(device const vec<T, 4>*)(x.values + offset));
+}
+)METAL";
+
 inline constexpr const char* kNvqDecodeHeader = R"METAL(
 inline float4 mfq_nvq_load_code4(device const int8_t* stream, uint offset) {
     return float4(*(device const char4*)(stream + offset));
@@ -35,11 +52,16 @@ inline uint2 mfq_nvq_load_record8(constant const uchar* stream, uint offset) {
     return *(constant const uint2*)(stream + offset);
 }
 
-template <typename Stream>
-inline uint mfq_nvq_read_bits(Stream stream, uint value_index, uint bits) {
+inline uint2 mfq_nvq_bit_cursor(uint value_index, uint bits) {
     uint residual_bits = (value_index & 7u) * bits;
     uint byte_index = (value_index >> 3u) * bits + (residual_bits >> 3u);
-    uint shift = residual_bits & 7u;
+    return uint2(byte_index, residual_bits & 7u);
+}
+
+template <typename Stream>
+inline uint mfq_nvq_read_bits(Stream stream, uint value_index, uint bits) {
+    uint2 cursor = mfq_nvq_bit_cursor(value_index, bits);
+    uint byte_index = cursor.x, shift = cursor.y;
     uint packed = uint(stream[byte_index]);
     if (shift + bits > 8u) packed |= uint(stream[byte_index + 1u]) << 8u;
     if (shift + bits > 16u) packed |= uint(stream[byte_index + 2u]) << 16u;
@@ -278,15 +300,29 @@ __attribute__((always_inline)) inline float4 mfq_nvq_load_input4(XStream x, uint
 
 template <uint MATRIX_ROWS, uint K, uint K_LANES, uint INDEX_BITS,
           uint INPUT_ROWS = 1u, typename XStream, typename IndexStream,
-          typename ScaleStream, typename CodebookStream>
+          typename StateStream, typename AuxStream, typename ScaleStream, typename CodebookStream>
 inline void mfq_nvq1_profile(
-    XStream x, IndexStream indices, ScaleStream scales, CodebookStream codebooks,
+    XStream x, IndexStream indices, StateStream states, AuxStream auxiliary,
+    ScaleStream scales, CodebookStream codebooks,
     thread const uint* outputs, thread const float* anchors,
     thread float* accumulators, float delta, uint x_offset,
-    uint indices_offset, uint scale_offset, uint codebook_offset, uint k_lane
+    uint indices_offset, uint state_offset, uint auxiliary_offset,
+    uint scale_offset, uint codebook_offset, uint k_lane
 ) {
     constexpr uint GROUPS = (K + 23u) / 24u;
-    constexpr uint RECORD_BYTES = INDEX_BITS == 9u ? 4u : 5u;
+    constexpr uint VECTORS = (K + 7u) / 8u;
+    constexpr uint STATE_BITS = INDEX_BITS == 9u ? 4u : 3u;
+    static_assert(K_LANES % 8u == 0u);
+    uint4 cursors[MATRIX_ROWS];
+    for (uint row = 0u; row < MATRIX_ROWS; ++row) {
+        uint2 index_cursor = mfq_nvq_bit_cursor(
+            outputs[row] * VECTORS + k_lane * 3u, INDEX_BITS);
+        uint state_index = outputs[row] * GROUPS + k_lane;
+        uint2 state_cursor = mfq_nvq_bit_cursor(state_index, STATE_BITS);
+        cursors[row] = uint4(indices_offset + index_cursor.x,
+            state_offset + state_cursor.x, auxiliary_offset + (state_index >> 3u),
+            index_cursor.y | (state_cursor.y << 3u) | ((state_index & 7u) << 6u));
+    }
     #pragma clang loop unroll_count(INPUT_ROWS == 1u ? 2 : 1)
     for (uint group = k_lane; group < GROUPS; group += K_LANES) {
         uint2 records[MATRIX_ROWS];
@@ -294,12 +330,22 @@ inline void mfq_nvq1_profile(
         float signed_deltas[MATRIX_ROWS];
         uint banks[MATRIX_ROWS];
         for (uint row = 0u; row < MATRIX_ROWS; ++row) {
-            uint offset = indices_offset + (outputs[row] * GROUPS + group) * RECORD_BYTES;
-            uint low = mfq_nvq_load_record4(indices, offset);
-            uint high = INDEX_BITS == 9u ? 0u : uint(indices[offset + 4u]);
-            uint state = INDEX_BITS == 9u ? (low >> 27u) & 15u : (high >> 1u) & 7u;
-            uint selector = INDEX_BITS == 9u ? low >> 31u : (high >> 4u) & 1u;
-            records[row] = uint2(low, high);
+            uint4 cursor = cursors[row];
+            uint low = mfq_nvq_load_record4(indices, cursor.x);
+            uint high = uint(indices[cursor.x + 4u]);
+            uint shift = cursor.w & 7u;
+            records[row] = uint2((low >> shift)
+                | (shift != 0u ? high << (32u - shift) : 0u), high >> shift);
+            uint state;
+            if constexpr (STATE_BITS == 3u) {
+                state = (mfq_nvq_load_record2(states, cursor.y)
+                    >> ((cursor.w >> 3u) & 7u)) & 7u;
+            } else {
+                state = (uint(states[cursor.y]) >> ((cursor.w >> 3u) & 7u)) & 15u;
+            }
+            uint selector = (uint(auxiliary[cursor.z]) >> (cursor.w >> 6u)) & 1u;
+            cursors[row] += uint4(3u * K_LANES * INDEX_BITS / 8u,
+                K_LANES * STATE_BITS / 8u, K_LANES / 8u, 0u);
             weight_scales[row] = anchors[row] * scales[scale_offset + state];
             signed_deltas[row] = selector != 0u ? -delta : delta;
             banks[row] = INDEX_BITS == 9u ? selector : 0u;
@@ -345,14 +391,16 @@ inline void mfq_nvq1_profile(
     }
 }
 
-template <uint MATRIX_ROWS, uint K, uint K_LANES, bool EXPANSION,
-          uint VECTOR_SIZE = 4u, uint INPUT_ROWS = 1u,
+template <uint INDEX_BITS, uint MATRIX_ROWS, uint K, uint K_LANES, bool EXPANSION,
+          uint VECTOR_SIZE, uint INPUT_ROWS,
           typename XStream, typename IndexStream, typename StateStream,
-          typename ScaleStream, typename CodebookStream>
-inline void mfq_nvq_banked_profile(
+          typename AuxStream, typename StateBankStream, typename ScaleStream, typename CodebookStream>
+inline void mfq_nvq_banked_bits(
     XStream x,
     IndexStream indices,
     StateStream states,
+    AuxStream auxiliary,
+    StateBankStream state_banks,
     ScaleStream scales,
     CodebookStream codebooks,
     thread const uint* outputs,
@@ -361,57 +409,117 @@ inline void mfq_nvq_banked_profile(
     uint x_offset,
     uint indices_offset,
     uint state_offset,
+    uint auxiliary_offset,
+    uint state_bank_offset,
     uint scale_offset,
     uint codebook_offset,
-    uint k_lane
+    uint k_lane,
+    uint auxiliary_mode
 ) {
     constexpr uint GROUPS = (K + 23u) / 24u;
     constexpr uint SIGNS = (K + 7u) / 8u;
-    constexpr uint RECORD_BYTES = VECTOR_SIZE == 4u ? 4u : 3u;
-    constexpr bool FLAT_RECORDS = EXPANSION;
+    constexpr uint VECTORS = (K + VECTOR_SIZE - 1u) / VECTOR_SIZE;
+    constexpr uint index_width = INDEX_BITS;
+    constexpr bool FLAT_RECORDS = EXPANSION && INPUT_ROWS > 1u;
     constexpr uint WORK = FLAT_RECORDS ? SIGNS : GROUPS;
+    constexpr bool STATIC_RECORDS = !FLAT_RECORDS && VECTOR_SIZE == 4u
+        && INDEX_BITS == 9u && INPUT_ROWS > 1u;
     uint state_rows[MATRIX_ROWS];
-    uint state_shifts[MATRIX_ROWS];
+    uint4 cursors[MATRIX_ROWS];
+    static_assert(K_LANES % 8u == 0u);
     for (uint row = 0u; row < MATRIX_ROWS; ++row) {
         state_rows[row] = outputs[row] * GROUPS;
-        state_shifts[row] = ((state_rows[row] + k_lane) & 1u) * 4u;
+        uint2 index = mfq_nvq_bit_cursor(outputs[row] * VECTORS
+            + k_lane * ((FLAT_RECORDS ? 8u : 24u) / VECTOR_SIZE), index_width);
+        uint2 sign = mfq_nvq_bit_cursor(outputs[row] * SIGNS
+            + k_lane * (FLAT_RECORDS ? 1u : 3u), 7u);
+        uint state = state_rows[row] + k_lane;
+        cursors[row] = uint4(indices_offset + index.x, auxiliary_offset + sign.x,
+            state_offset + (state >> 1u), index.y | (sign.y << 3u) | ((state & 1u) << 6u));
     }
     #pragma clang loop unroll_count(2)
     for (uint work = k_lane; work < WORK; work += K_LANES) {
         uint group = FLAT_RECORDS ? work / 3u : work;
         float weight_scales[MATRIX_ROWS];
+        uint banks[MATRIX_ROWS], signs[MATRIX_ROWS];
+        uint2 packed[MATRIX_ROWS];
+        uint3 static_records[MATRIX_ROWS];
         for (uint row = 0u; row < MATRIX_ROWS; ++row) {
-            uint state_index = state_rows[row] + group;
-            uint shift = FLAT_RECORDS ? (state_index & 1u) * 4u : state_shifts[row];
-            uint state = (uint(states[state_offset + (state_index >> 1u)])
-                >> shift) & 15u;
+            uint state;
+            if constexpr (FLAT_RECORDS) {
+                uint state_index = state_rows[row] + group;
+                state = (uint(states[state_offset + (state_index >> 1u)])
+                    >> ((state_index & 1u) * 4u)) & 15u;
+            } else {
+                state = (uint(states[cursors[row].z]) >> ((cursors[row].w >> 6u) * 4u)) & 15u;
+            }
             weight_scales[row] = scales[scale_offset + state];
+            banks[row] = uint(state_banks[state_bank_offset + state]) << index_width;
+            if constexpr (!FLAT_RECORDS) {
+                uint4 cursor = cursors[row];
+                uint offset = cursor.x;
+                uint low = mfq_nvq_load_record4(indices, offset);
+                uint high = mfq_nvq_load_record4(indices, offset + 4u);
+                uint index_shift = cursor.w & 7u;
+                uint upper = 0u;
+                if constexpr (VECTOR_SIZE == 4u && INDEX_BITS == 10u && VECTORS % 2u != 0u)
+                    upper = uint(indices[offset + 8u]);
+                packed[row] = uint2((low >> index_shift)
+                    | (index_shift != 0u ? high << (32u - index_shift) : 0u),
+                    (high >> index_shift) | (index_shift != 0u ? upper << (32u - index_shift) : 0u));
+                if constexpr (STATIC_RECORDS) {
+                    constexpr uint PAIR_BITS = 2u * INDEX_BITS;
+                    static_records[row] = uint3(packed[row].x,
+                        (packed[row].x >> PAIR_BITS) | (packed[row].y << (32u - PAIR_BITS)),
+                        packed[row].y >> (2u * PAIR_BITS - 32u));
+                }
+                signs[row] = mfq_nvq_load_record4(auxiliary, cursor.y) >> ((cursor.w >> 3u) & 7u);
+                cursors[row] += uint4(K_LANES * (24u / VECTOR_SIZE) * index_width / 8u,
+                    K_LANES * 21u / 8u, K_LANES / 2u, 0u);
+            }
         }
+        #pragma clang loop unroll_count(INPUT_ROWS == 1u ? 3 : 1)
         for (uint block = 0u; block < (FLAT_RECORDS ? 1u : 3u); ++block) {
             uint record_index = FLAT_RECORDS ? work : group * 3u + block;
             uint column = record_index * 8u;
             if (column >= K) break;
-            constexpr bool REUSE_INPUTS = INPUT_ROWS == 1u || MATRIX_ROWS <= 2u;
+            constexpr bool REUSE_INPUTS = INPUT_ROWS == 1u;
             float4 activation0[REUSE_INPUTS ? INPUT_ROWS : 1u];
             float4 activation1[REUSE_INPUTS ? INPUT_ROWS : 1u];
             if constexpr (REUSE_INPUTS) {
                 for (uint input_row = 0u; input_row < INPUT_ROWS; ++input_row) {
-                    auto input = mfq_nvq_input_row<K>(x, input_row) + x_offset + column;
-                    activation0[input_row] = float4(float(input[0]), float(input[1]),
-                        float(input[2]), float(input[3]));
+                    auto input = mfq_nvq_input_row<K>(x, input_row);
+                    activation0[input_row] = mfq_nvq_load_input4<K>(input, x_offset + column, column);
                     activation1[input_row] = column + 4u >= K ? float4(0.0f)
-                        : float4(float(input[4]), float(input[5]),
-                            float(input[6]), float(input[7]));
+                        : mfq_nvq_load_input4<K>(input, x_offset + column + 4u, column + 4u);
                 }
             }
             for (uint row = 0u; row < MATRIX_ROWS; ++row) {
-                uint offset = indices_offset + (outputs[row] * SIGNS + record_index) * RECORD_BYTES;
-                uint record = VECTOR_SIZE == 4u ? mfq_nvq_load_record4(indices, offset)
-                    : mfq_nvq_load_record2(indices, offset)
-                        | (uint(indices[offset + 2u]) << 16u);
-                uint index0 = record & (VECTOR_SIZE == 4u ? 4095u : 65535u);
-                uint index1 = VECTOR_SIZE == 4u ? (record >> 12u) & 4095u : index0;
-                uint sign = record >> (VECTOR_SIZE == 4u ? 24u : 16u);
+                uint record, sign;
+                if constexpr (FLAT_RECORDS) {
+                    uint4 cursor = cursors[row];
+                    record = mfq_nvq_load_record4(indices, cursor.x) >> (cursor.w & 7u);
+                    sign = (mfq_nvq_load_record2(auxiliary, cursor.y)
+                        >> ((cursor.w >> 3u) & 7u)) & 127u;
+                    cursors[row] += uint4(K_LANES * (8u / VECTOR_SIZE) * index_width / 8u,
+                        K_LANES * 7u / 8u, 0u, 0u);
+                } else {
+                    if constexpr (STATIC_RECORDS) record = static_records[row][block];
+                    else {
+                        uint shift = block * (8u / VECTOR_SIZE) * index_width;
+                        record = shift == 0u ? packed[row].x : shift < 32u
+                            ? (packed[row].x >> shift) | (packed[row].y << (32u - shift))
+                            : packed[row].y >> (shift - 32u);
+                    }
+                    sign = (signs[row] >> (block * 7u)) & 127u;
+                }
+                uint index0 = (record & ((1u << index_width) - 1u)) + banks[row];
+                uint index1 = VECTOR_SIZE == 4u
+                    ? ((record >> index_width) & ((1u << index_width) - 1u)) + banks[row] : index0;
+                uint parity = popcount(sign) & 1u;
+                if constexpr (INDEX_BITS == 8u)
+                    parity ^= auxiliary_mode == 2u ? (index0 >> 7u) & 1u : 0u;
+                sign |= parity << 7u;
                 uint code_offset = codebook_offset + index0 * VECTOR_SIZE;
                 float4 code0 = mfq_nvq_load_code4(codebooks, code_offset);
                 float4 code1 = mfq_nvq_load_code4(codebooks, VECTOR_SIZE == 4u
@@ -426,10 +534,10 @@ inline void mfq_nvq_banked_profile(
                         input0 = activation0[input_row];
                         input1 = activation1[input_row];
                     } else {
-                        auto input = mfq_nvq_input_row<K>(x, input_row) + x_offset + column;
-                        input0 = float4(float(input[0]), float(input[1]), float(input[2]), float(input[3]));
+                        auto input = mfq_nvq_input_row<K>(x, input_row);
+                        input0 = mfq_nvq_load_input4<K>(input, x_offset + column, column);
                         input1 = column + 4u >= K ? float4(0.0f)
-                            : float4(float(input[4]), float(input[5]), float(input[6]), float(input[7]));
+                            : mfq_nvq_load_input4<K>(input, x_offset + column + 4u, column + 4u);
                     }
                     float value = dot(input0, code0) + dot(input1, code1);
                     uint index = row * INPUT_ROWS + input_row;
@@ -444,6 +552,36 @@ inline void mfq_nvq_banked_profile(
         }
     }
 }
+
+template <uint MATRIX_ROWS, uint K, uint K_LANES, bool EXPANSION,
+          uint VECTOR_SIZE = 4u, uint INPUT_ROWS = 1u, uint INDEX_BITS = 0u,
+          typename XStream, typename IndexStream, typename StateStream,
+          typename AuxStream, typename StateBankStream, typename ScaleStream, typename CodebookStream>
+inline void mfq_nvq_banked_profile(
+    XStream x, IndexStream indices, StateStream states, AuxStream auxiliary,
+    StateBankStream state_banks, ScaleStream scales, CodebookStream codebooks,
+    thread const uint* outputs, thread const float* anchors, thread float* accumulators,
+    uint x_offset, uint indices_offset, uint state_offset, uint auxiliary_offset,
+    uint state_bank_offset, uint scale_offset, uint codebook_offset, uint k_lane, uint index_bits,
+    uint auxiliary_mode = 1u
+) {
+    #define MFQ_NVQ_BANKED_BITS(BITS) \
+        mfq_nvq_banked_bits<BITS, MATRIX_ROWS, K, K_LANES, EXPANSION, VECTOR_SIZE, INPUT_ROWS>( \
+            x, indices, states, auxiliary, state_banks, scales, codebooks, outputs, anchors, accumulators, \
+            x_offset, indices_offset, state_offset, auxiliary_offset, state_bank_offset, \
+            scale_offset, codebook_offset, k_lane, auxiliary_mode)
+    if constexpr (INDEX_BITS != 0u) { MFQ_NVQ_BANKED_BITS(INDEX_BITS); }
+    else if (index_bits == 8u) { MFQ_NVQ_BANKED_BITS(8u); }
+    else if constexpr (VECTOR_SIZE == 4u) {
+        if (index_bits == 9u) { MFQ_NVQ_BANKED_BITS(9u); }
+        else { MFQ_NVQ_BANKED_BITS(10u); }
+    } else {
+        if (index_bits == 10u) { MFQ_NVQ_BANKED_BITS(10u); }
+        else { MFQ_NVQ_BANKED_BITS(12u); }
+    }
+    #undef MFQ_NVQ_BANKED_BITS
+}
+
 )METAL";
 
 }

@@ -584,6 +584,8 @@ public:
         }
     }
     void use_offload(const std::shared_ptr<MlxMfeOffloadCache>& cache) {
+        for (const auto& name : {gate_name_, up_name_.value_or(gate_name_), down_name_})
+            cache->activate_record(name);
         gate_up_.reset();
         down_.reset();
         ssd_expert_cache_.reset();
@@ -1004,6 +1006,10 @@ private:
             down_->neuron_len() != config_.moe_intermediate_size ||
             down_->out_per_expert() != config_.hidden_size)) {
             throw std::runtime_error("Qwen4 routed expert geometry disagrees");
+        }
+        if (mfe_offload_cache_) {
+            for (const auto& name : {gate_name_, up_name_.value_or(gate_name_), down_name_})
+                mfe_offload_cache_->activate_record(name);
         }
         if (auto* preparation = MlxKernelPreparation::current(); preparation && !cached) {
             preparation->collect([&] {
@@ -3898,7 +3904,8 @@ std::size_t MlxQwen4CausalLm::ssd_ple_payload_bytes() const noexcept {
 }
 
 std::size_t MlxQwen4CausalLm::ssd_expert_payload_bytes() const noexcept {
-    return (impl_->ssd_expert_cache || impl_->mfe_offload_cache) ? impl_->expert_payload_bytes : 0;
+    if (impl_->mfe_offload_cache) return impl_->mfe_offload_cache->backing_payload_bytes();
+    return impl_->ssd_expert_cache ? impl_->expert_payload_bytes : 0;
 }
 
 std::int32_t MlxQwen4CausalLm::generate(

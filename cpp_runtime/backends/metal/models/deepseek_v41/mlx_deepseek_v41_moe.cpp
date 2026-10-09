@@ -250,6 +250,9 @@ MlxDeepseekV41Moe::MlxDeepseekV41Moe(
             throw std::runtime_error(
                 "DeepSeek-V4.1 streamed MoE geometry disagrees");
         }
+        mfe_offload_cache_->activate_record(streamed_gate_up_name_);
+        if (streamed_up_name_) mfe_offload_cache_->activate_record(*streamed_up_name_);
+        mfe_offload_cache_->activate_record(streamed_down_name_);
     }
     if (vision_bias_.has_value()) {
         *vision_bias_ = mlx::core::reshape(

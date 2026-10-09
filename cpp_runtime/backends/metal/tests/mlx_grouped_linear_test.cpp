@@ -1262,13 +1262,11 @@ int main() {
             auto q = weight.packed_values();
             auto sub_scale = weight.sub_scales();
             auto sub_min = weight.sub_mins();
-            auto neuron_scale = weight.neuron_scales();
-            auto neuron_min = weight.neuron_mins();
+            auto metadata = weight.row_metadata();
             q.eval();
             sub_scale.eval();
             sub_min.eval();
-            neuron_scale.eval();
-            neuron_min.eval();
+            metadata.eval();
         }
         auto q8_values = q8_weight.quantized_values();
         auto q8_scales = q8_weight.scales();

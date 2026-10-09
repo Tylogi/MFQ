@@ -350,19 +350,23 @@ constexpr const char* kGemvSource = R"METAL(
         threadgroup_position_in_grid.x * ROWS_PER_TG
         + simd_group * ROWS_PER_SIMD;
     if constexpr (USE_BANKED_NVQ || USE_NVQ1 || USE_JSC) {
-        constexpr uint K_LANES = 16u;
+        constexpr bool SINGLE_ROW = USE_BANKED_NVQ
+            || (USE_NVQ1 && (OUT <= K || NG < 2 * 16));
+        constexpr uint K_LANES = SINGLE_ROW ? 8u : 16u;
+        constexpr uint MATRIX_ROWS = SINGLE_ROW ? 1u : 2u;
         const uint k_lane = lane & (K_LANES - 1u);
         const uint base = output_base + lane / K_LANES;
-        uint outputs[2] = {
-            min(base, uint(OUT) - 1u),
-            min(base + 2u, uint(OUT) - 1u),
-        };
-        float row_anchors[2] = {anchors[outputs[0]], anchors[outputs[1]]};
-        float values[2u * uint(INPUT_ROWS)] = {0.0f};
+        uint outputs[MATRIX_ROWS];
+        float row_anchors[MATRIX_ROWS];
+        for (uint row = 0u; row < MATRIX_ROWS; ++row) {
+            outputs[row] = min(base + row * (32u / K_LANES), uint(OUT) - 1u);
+            row_anchors[row] = anchors[outputs[row]];
+        }
+        float values[MATRIX_ROWS * uint(INPUT_ROWS)] = {0.0f};
         if constexpr (USE_NVQ1) {
-            mfq_nvq1_profile<2u, uint(K), K_LANES, uint(INDEX_BITS), uint(INPUT_ROWS)>(
-                x, indices_packed, scale_lut, codebooks, outputs, row_anchors,
-                values, parameters[0], 0u, 0u, 0u, 0u, k_lane);
+            mfq_nvq1_profile<MATRIX_ROWS, uint(K), K_LANES, uint(INDEX_BITS), uint(INPUT_ROWS)>(
+                x, indices_packed, state_packed, aux_packed, scale_lut, codebooks, outputs, row_anchors,
+                values, parameters[0], 0u, 0u, 0u, 0u, 0u, 0u, k_lane);
         } else if constexpr (USE_JSC) {
             mfq_nvq_jsc_profile<uint(VECTOR_SIZE), uint(K), 2u, 1u,
                 (OUT > K && VECTOR_SIZE == 4), EXECUTION_LAYOUT == 1 ? 0u : 8u, uint(INPUT_ROWS)>(
@@ -372,17 +376,18 @@ constexpr const char* kGemvSource = R"METAL(
                 0u, 0u, 0u, 0u, 0u, 0u, k_lane, K_LANES,
                 EXECUTION_LAYOUT == 1 ? 2u : 1u);
         } else {
-            mfq_nvq_banked_profile<2u, uint(K), K_LANES, (OUT > K), uint(VECTOR_SIZE), uint(INPUT_ROWS)>(
-                x, indices_packed, state_packed, scale_lut, codebooks,
-                outputs, row_anchors, values, 0u, 0u, 0u, 0u, 0u, k_lane);
+            mfq_nvq_banked_profile<MATRIX_ROWS, uint(K), K_LANES, (OUT > K),
+                uint(VECTOR_SIZE), uint(INPUT_ROWS), uint(INDEX_BITS)>(
+                x, indices_packed, state_packed, aux_packed, state_to_codebank, scale_lut, codebooks,
+                outputs, row_anchors, values, 0u, 0u, 0u, 0u, 0u, 0u, 0u, k_lane, uint(INDEX_BITS), uint(AUX_MODE));
         }
-        for (uint row = 0u; row < 2u; ++row) {
+        for (uint row = 0u; row < MATRIX_ROWS; ++row) {
             for (uint input_row = 0u; input_row < uint(INPUT_ROWS); ++input_row) {
                 uint index = row * uint(INPUT_ROWS) + input_row;
                 for (uint offset = K_LANES / 2u; offset > 0u; offset >>= 1u) {
                     values[index] += simd_shuffle_down(values[index], offset);
                 }
-                const uint output = base + row * 2u;
+                const uint output = base + row * (32u / K_LANES);
                 if (k_lane == 0u && output < uint(OUT)) {
                     MFQ_VQ_STORE_OUTPUT(input_row * uint(OUT) + output, values[index]);
                 }
@@ -770,8 +775,66 @@ constexpr const char* kMmqSource = R"METAL(
 
 
 constexpr const char* kDequantizeSource = R"METAL(
-    uint linear = thread_position_in_grid.x * 2u;
+    constexpr bool VECTOR_DECODE = K % 8 == 0 && GS % 8 == 0
+        && (VECTOR_SIZE == 4 || VECTOR_SIZE == 8);
+    constexpr uint VALUES_PER_THREAD = VECTOR_DECODE ? 8u : 2u;
+    uint linear = thread_position_in_grid.x * VALUES_PER_THREAD;
     if (linear >= uint(OUT) * uint(K)) {
+        return;
+    }
+    if constexpr (VECTOR_DECODE) {
+        uint output = linear / uint(K);
+        uint column = linear - output * uint(K);
+        uint group = column / uint(GS);
+        uint state_index = output * uint(NG) + group;
+        uint state;
+        uint index0;
+        uint index1 = 0u;
+        uint auxiliary = 0u;
+        if constexpr (EXECUTION_LAYOUT == 1) {
+            uint2 record = mfq_vq_read_group64(indices_packed, state_index);
+            uint segment = mfq_vq_group64_segment(record,
+                (column - group * uint(GS)) / uint(VECTOR_SIZE));
+            state = record.y >> 28u;
+            index0 = segment & 4095u;
+            auxiliary = segment >> 12u;
+        } else {
+            state = mfq_vq_read_bits(state_packed, state_index, uint(STATE_BITS));
+            uint vector = output * uint(NVEC) + column / uint(VECTOR_SIZE);
+            index0 = mfq_vq_read_bits(indices_packed, vector, uint(INDEX_BITS));
+            if constexpr (VECTOR_SIZE == 4)
+                index1 = mfq_vq_read_bits(indices_packed, vector + 1u, uint(INDEX_BITS));
+            if constexpr (AUX_MODE == 1 || AUX_MODE == 2)
+                auxiliary = mfq_vq_read_bits(aux_packed,
+                    output * uint(NSIGN) + column / 8u, 7u);
+            else if constexpr (AUX_MODE == 3)
+                auxiliary = mfq_vq_read_bits(aux_packed, state_index, 1u);
+        }
+        uint table_bank = HAS_TABLE_BANKS != 0
+            ? uint(bank_ids[output * uint(NSUPER) + group / uint(GROUPS_PER_SUPER)]) : 0u;
+        uint code_bank = CODE_BANK_MODE == 1 ? uint(state_to_codebank[state])
+            : CODE_BANK_MODE == 2 ? auxiliary : 0u;
+        uint bank_base = (table_bank * uint(CODE_BANKS) + code_bank) * uint(ENTRIES);
+        uint code0 = (bank_base + index0) * uint(VECTOR_SIZE);
+        uint code1 = VECTOR_SIZE == 4 ? (bank_base + index1) * 4u : code0 + 4u;
+        float4 first = mfq_nvq_load_code4(codebooks, code0);
+        float4 second = mfq_nvq_load_code4(codebooks, code1);
+        if constexpr (AUX_MODE == 1 || AUX_MODE == 2) {
+            uint eighth_sign = EXECUTION_LAYOUT == 1
+                ? (auxiliary >> 7u) & 1u : popcount(auxiliary) & 1u;
+            if constexpr (AUX_MODE == 2)
+                eighth_sign ^= ((VECTOR_SIZE == 4 ? index1 : index0) >> 7u) & 1u;
+            uint signs = (auxiliary & 127u) | (eighth_sign << 7u);
+            first = select(first, -first, (uint4(signs) & uint4(1u, 2u, 4u, 8u)) != uint4(0u));
+            second = select(second, -second, (uint4(signs) & uint4(16u, 32u, 64u, 128u)) != uint4(0u));
+        } else if constexpr (AUX_MODE == 3) {
+            float delta = auxiliary != 0u ? -parameters[0] : parameters[0];
+            first += delta;
+            second += delta;
+        }
+        float scale = anchors[output] * scale_lut[table_bank * uint(STATES) + state];
+        *(device metal::vec<T, 4>*)(y + linear) = metal::vec<T, 4>(scale * first);
+        *(device metal::vec<T, 4>*)(y + linear + 4u) = metal::vec<T, 4>(scale * second);
         return;
     }
     float2 decoded = float2(0.0f);
@@ -1234,9 +1297,9 @@ detail::StagingVector<std::uint8_t> padded_stream(
     const auto size = packed_nbytes(count, bits);
     const auto* source = cursor.view(size, name);
     detail::StagingVector<std::uint8_t> result;
-    result.reserve(std::max(size + 2, std::size_t{3}));
+    result.reserve(size + 8);
     result.insert(result.end(), source, source + size);
-    result.resize(std::max(size + 2, std::size_t{3}), 0);
+    result.resize(size + 8, 0);
     return result;
 }
 
@@ -2878,95 +2941,6 @@ array make_array(
     return result;
 }
 
-array make_nvq_execution_records(const CanonicalVq& weight) {
-    const std::size_t signs = (weight.input_size + 7) / 8;
-    const bool nvq1 = weight.aux_mode == kAuxDelta;
-    const bool byte_jsc = !nvq1 && weight.index_bits == 8;
-    const std::size_t record_count = nvq1 ? weight.groups : signs;
-    const std::size_t record_bytes = nvq1 ? (weight.index_bits == 9 ? 4 : 5)
-        : (weight.vector_size == 4 ? (byte_jsc ? 3 : 4) : (byte_jsc ? 2 : 3));
-    const auto bytes = checked_product(
-        checked_product(
-            static_cast<std::size_t>(weight.output_size),
-            record_count,
-            "NVQ execution record count"),
-        record_bytes,
-        "NVQ execution stream size");
-    const auto layout = detail::packed_storage_layout(bytes);
-    const Shape shape = layout.is_matrix()
-        ? Shape{layout.rows, layout.columns} : Shape{layout.columns};
-    array records(mlx::core::allocator::malloc(bytes), shape, mlx::core::uint8);
-    auto* destination = records.data<std::uint8_t>();
-    const auto read_bits = [](const auto& stream, std::size_t index, int bits) {
-        const auto bit = index * bits;
-        const auto byte = bit >> 3u;
-        std::uint32_t value = stream[byte];
-        if (byte + 1 < stream.size()) value |= std::uint32_t(stream[byte + 1]) << 8u;
-        if (byte + 2 < stream.size()) value |= std::uint32_t(stream[byte + 2]) << 16u;
-        return (value >> (bit & 7u)) & ((1u << bits) - 1u);
-    };
-    const auto pack_rows = [&](std::size_t begin, std::size_t end) {
-        for (auto row = begin; row < end; ++row) {
-            for (std::size_t sign = 0; sign < record_count; ++sign) {
-                if (nvq1) {
-                    std::uint64_t record = 0;
-                    for (std::size_t local = 0; local < 3; ++local) {
-                        const auto vector = sign * 3 + local;
-                        const auto index = vector < std::size_t(weight.vectors)
-                            ? read_bits(weight.indices, row * weight.vectors + vector, weight.index_bits) : 0u;
-                        record |= std::uint64_t(index) << (weight.index_bits * local);
-                    }
-                    const auto state_index = row * weight.groups + sign;
-                    record |= std::uint64_t(read_bits(weight.states_packed, state_index, weight.state_bits))
-                        << (weight.index_bits * 3);
-                    record |= std::uint64_t(read_bits(weight.auxiliary, state_index, 1))
-                        << (weight.index_bits * 3 + weight.state_bits);
-                    std::memcpy(destination + (row * record_count + sign) * record_bytes, &record, record_bytes);
-                    continue;
-                }
-                const auto vector = sign * (weight.vector_size == 4 ? 2 : 1);
-                const auto index0 = read_bits(weight.indices, row * weight.vectors + vector, weight.index_bits);
-                const auto sign7 = read_bits(weight.auxiliary, row * signs + sign, 7);
-                const auto parity = (std::popcount(sign7) & 1u)
-                    ^ (weight.aux_mode == kAuxSignIndexParity ? (index0 >> 7u) & 1u : 0u);
-                const auto sign8 = sign7 | (parity << 7u);
-                const auto index1 = weight.vector_size == 4 && vector + 1 < std::size_t(weight.vectors)
-                    ? read_bits(weight.indices, row * weight.vectors + vector + 1, weight.index_bits) : 0u;
-                if (byte_jsc) {
-                    const auto record = index0 | (weight.vector_size == 4
-                        ? (index1 << 8u) | (sign8 << 16u) : sign8 << 8u);
-                    std::memcpy(destination + (row * signs + sign) * record_bytes, &record, record_bytes);
-                    continue;
-                }
-                const auto state_index = row * weight.groups + sign / 3;
-                const auto state = (weight.states_packed[state_index >> 1u]
-                    >> ((state_index & 1u) * 4u)) & 15u;
-                const auto bank = std::uint32_t(weight.state_to_codebank[state]);
-                const auto record = (index0 | (bank << weight.index_bits))
-                    | (weight.vector_size == 4
-                        ? ((index1 | (bank << weight.index_bits)) << 12u) | (sign8 << 24u)
-                        : sign8 << 16u);
-                std::memcpy(destination + (row * signs + sign) * record_bytes, &record, record_bytes);
-            }
-        }
-    };
-    const std::size_t rows = weight.output_size;
-    const auto workers = bytes >= 8u * 1024u * 1024u
-        ? std::min<std::size_t>(8, rows) : 1;
-    if (workers == 1) {
-        pack_rows(0, rows);
-    } else {
-        std::vector<std::thread> threads;
-        threads.reserve(workers);
-        for (std::size_t worker = 0; worker < workers; ++worker) {
-            threads.emplace_back(pack_rows, rows * worker / workers, rows * (worker + 1) / workers);
-        }
-        for (auto& thread : threads) thread.join();
-    }
-    MlxWeightResidency::track(records);
-    return records;
-}
-
 mlx::core::fast::CustomKernelFunction make_vq_matmul_kernel() {
     CompileOptions options;
     options.math_mode = MathMode::Fast;
@@ -3081,7 +3055,7 @@ make_vq_dequantize_kernel() {
         },
         {"y"},
         kDequantizeSource,
-        kBitstreamHeader,
+        std::string(kBitstreamHeader) + kNvqDecodeHeader,
         true,
         false,
         options);
@@ -3495,24 +3469,6 @@ MlxVqWeight MlxVqWeight::from_blob(
         parsed.residual_position_bits,
         parsed.residual_block_vectors,
         parsed.residual_blocks_per_row);
-    if (result.format_label_ == "NVQ3J-L" || result.format_label_ == "NVQ3J-512"
-        || result.format_label_ == "NVQ2J-L"
-        || (result.format_label_ == "NVQ2J-XL"
-            && parsed.execution_layout != kExecutionGroup64)) {
-        result.banked_records_.emplace(make_nvq_execution_records(parsed));
-    } else if (((result.format_label_ == "NVQ1-S" && result.index_bits_ == 9 && result.state_bits_ == 4)
-            || (result.format_label_ == "NVQ1-L" && result.index_bits_ == 11 && result.state_bits_ == 3))
-        && result.group_size_ == 24 && result.vector_size_ == 8
-        && result.aux_mode_ == kAuxDelta) {
-        result.nvq1_records_.emplace(make_nvq_execution_records(parsed));
-    } else if ((result.format_label_ == "NVQ2J" || result.format_label_ == "NVQ3J"
-            || result.format_label_ == "NVQ2" || result.format_label_ == "NVQ3")
-        && result.group_size_ == 24 && result.state_bits_ == 4
-        && result.index_bits_ == 8 && result.input_size_ % result.vector_size_ == 0
-        && (result.aux_mode_ == kAuxSignEven || result.aux_mode_ == kAuxSignIndexParity)
-        && result.code_bank_mode_ != kCodeBankAux && result.table_banks_ == 1) {
-        result.jsc_records_.emplace(make_nvq_execution_records(parsed));
-    }
     return result;
 }
 
@@ -3529,10 +3485,7 @@ std::size_t MlxVqWeight::packed_nbytes() const noexcept {
         + parameters_.nbytes()
         + residual_codebook_.nbytes()
         + residual_first_.nbytes()
-        + residual_second_.nbytes()
-        + (banked_records_ ? banked_records_->nbytes() : 0)
-        + (nvq1_records_ ? nvq1_records_->nbytes() : 0)
-        + (jsc_records_ ? jsc_records_->nbytes() : 0);
+        + residual_second_.nbytes();
 }
 
 array MlxVqWeight::dequantize(Dtype dtype) const {
@@ -3570,6 +3523,9 @@ array MlxVqWeight::dequantize(Dtype dtype) const {
         table_banks_,
         groups_per_supergroup_,
         supergroups_);
+    const int values_per_thread = input_size_ % 8 == 0 && group_size_ % 8 == 0
+        && (vector_size_ == 4 || vector_size_ == 8) ? 8 : 2;
+    const int work_items = static_cast<int>((size + values_per_thread - 1) / values_per_thread);
     auto outputs = vq_dequantize_kernel()(
         {
             indices_packed_,
@@ -3584,11 +3540,11 @@ array MlxVqWeight::dequantize(Dtype dtype) const {
         },
         {Shape{output_size_, input_size_}},
         {dtype},
-        {static_cast<int>((size + 1) / 2), 1, 1},
+        {work_items, 1, 1},
         {
             std::min(
                 256,
-                std::max(1, static_cast<int>((size + 1) / 2))),
+                std::max(1, work_items)),
             1,
             1,
         },
@@ -3828,7 +3784,7 @@ array MlxVqWeight::packed_matmul(
     }
     const bool fast_gemv =
         (rows == 1 && tile_rows == 1)
-        || ((banked_records_ || nvq1_records_ || jsc_execution_records())
+        || ((uses_native_jsc() || uses_native_nvq1() || jsc_execution_records())
             && rows >= 2 && rows <= 6 && tile_rows == rows);
     const bool wide_mmq =
         rows >= 2 && rows <= 16
@@ -3935,9 +3891,9 @@ array MlxVqWeight::packed_matmul(
         groups_per_supergroup_,
         supergroups_);
     if (fast_gemv) {
-        templates.emplace_back("USE_BANKED_NVQ", banked_records_.has_value());
-        templates.emplace_back("USE_NVQ1", nvq1_records_.has_value());
-        templates.emplace_back("USE_JSC", !banked_records_ && jsc_execution_records() != nullptr);
+        templates.emplace_back("USE_BANKED_NVQ", uses_native_jsc());
+        templates.emplace_back("USE_NVQ1", uses_native_nvq1());
+        templates.emplace_back("USE_JSC", jsc_execution_records() != nullptr);
         templates.emplace_back("INPUT_ROWS", rows);
     }
     templates.emplace_back(
@@ -3963,11 +3919,7 @@ array MlxVqWeight::packed_matmul(
             parameters_,
             source,
     };
-    if (fast_gemv && banked_records_) {
-        inputs.front() = *banked_records_;
-    } else if (fast_gemv && nvq1_records_) {
-        inputs.front() = *nvq1_records_;
-    } else if (fast_gemv && jsc_execution_records()) {
+    if (fast_gemv && jsc_execution_records()) {
         inputs.front() = *jsc_execution_records();
     }
     auto outputs = kernel(

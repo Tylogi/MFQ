@@ -55,6 +55,8 @@ public:
         return can_offload(name);
     }
     bool can_group_mfe(const std::string& name);
+    void activate_record(const std::string& name);
+    std::size_t backing_payload_bytes() const;
 
     MlxMfeProjectionInfo projection_info(
         const std::string& name);
