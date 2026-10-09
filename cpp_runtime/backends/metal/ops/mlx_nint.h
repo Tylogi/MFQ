@@ -104,18 +104,6 @@ public:
     const mlx::core::array& sub_mins() const noexcept {
         return sub_min_;
     }
-    const mlx::core::array& neuron_scales() const noexcept {
-        return neuron_scale_;
-    }
-    const mlx::core::array& neuron_mins() const noexcept {
-        return neuron_min_;
-    }
-    const mlx::core::array& row_q_layout() const noexcept {
-        return row_q_layout_;
-    }
-    const mlx::core::array& row_q_byte_offsets() const noexcept {
-        return row_q_byte_offsets_;
-    }
     const mlx::core::array& row_metadata() const noexcept {
         return row_metadata_;
     }
@@ -135,10 +123,6 @@ private:
         mlx::core::array q_packed,
         mlx::core::array sub_scale,
         mlx::core::array sub_min,
-        mlx::core::array neuron_scale,
-        mlx::core::array neuron_min,
-        mlx::core::array row_q_layout,
-        mlx::core::array row_q_byte_offsets,
         mlx::core::array row_metadata,
         int bits,
         int group_size,
@@ -151,13 +135,6 @@ private:
     mlx::core::array q_packed_;
     mlx::core::array sub_scale_;
     mlx::core::array sub_min_;
-    mlx::core::array neuron_scale_;
-    mlx::core::array neuron_min_;
-    mlx::core::array row_q_layout_;
-    mlx::core::array row_q_byte_offsets_;
-    // Runtime-only packed row descriptor: layout, byte offset, neuron scale,
-    // and neuron minimum. Dense kernels bind this single leaf instead of four
-    // independent MLX arrays; the canonical wire representation is unchanged.
     mlx::core::array row_metadata_;
     int bits_ = 0;
     int group_size_ = 0;

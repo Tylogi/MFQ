@@ -455,6 +455,31 @@ void test_mxfp8_small_m_matches_decode() {
     }
 }
 
+void test_native_mxfp8_scale_storage() {
+    using namespace mlx::core;
+    constexpr int outputs = 2048;
+    constexpr int inputs = 4096;
+    for (const auto [row_block, column_block] : {
+             std::pair{128, 128}, std::pair{32, 32}, std::pair{1, 32}}) {
+        synchronize();
+        clear_cache();
+        const auto before = get_active_memory();
+        const auto weight = mfq::metal::MlxMxWeight::from_blob("MXFP8",
+            make_mxfp8_geometry_blob(outputs, inputs,
+                outputs / row_block, inputs / column_block));
+        const auto source = ones(Shape{1, inputs}, float16);
+        const auto output = weight.matmul(source);
+        eval(output);
+        synchronize();
+        clear_cache();
+        const auto allocated = get_active_memory() - before;
+        const auto expected = weight.packed_nbytes() + source.nbytes() + output.nbytes();
+        require(allocated <= expected + (64u << 10),
+            "native MXFP8 retained expanded scale storage: allocated="
+                + std::to_string(allocated) + " expected=" + std::to_string(expected));
+    }
+}
+
 void test_grouped_mxfp8() {
     using namespace mlx::core;
     constexpr int inputs = 128;
@@ -1318,6 +1343,44 @@ void test_grouped_row_block32_mxfp8_batched_qmm() {
     }
 }
 
+void test_grouped_row_mxfp8_dense_batch() {
+    using namespace mlx::core;
+    constexpr int groups = 3;
+    constexpr int outputs = 40;
+    constexpr int inputs = 256;
+    constexpr int tokens = 67;
+    std::vector<float> values(2 * tokens * groups * inputs);
+    for (std::size_t index = 0; index < values.size(); ++index)
+        values[index] = float(int((index * 13 + 7) % 47) - 23) / 4096.0f;
+    for (const int block : {32, 128}) {
+        const auto weight = block == 32
+            ? make_patterned_block32_mxfp8_weight(groups * outputs, inputs, 41)
+            : mfq::metal::MlxMxWeight::from_blob("MXFP8",
+                make_patterned_mxfp8_blob(groups * outputs, inputs, 41));
+        for (const auto dtype : {float16, float32}) {
+            auto input = astype(array(values.begin(), Shape{2, tokens, groups, inputs}), dtype);
+            auto dense = weight.dequantize(dtype);
+            std::vector<array> pieces;
+            for (int group = 0; group < groups; ++group) {
+                pieces.push_back(matmul(take(input, group, input.ndim() - 2),
+                    transpose(slice(dense, Shape{group * outputs, 0},
+                        Shape{(group + 1) * outputs, inputs}))));
+            }
+            auto reference = contiguous(astype(stack(pieces, input.ndim() - 2), float32));
+            auto actual = contiguous(astype(weight.grouped_row_matmul(input, groups), float32));
+            eval(actual, reference);
+            require(actual.shape() == Shape{2, tokens, groups, outputs},
+                "MXFP8 dense batch grouped-row shape mismatch");
+            for (std::size_t index = 0; index < actual.size(); ++index) {
+                const float expected = reference.data<float>()[index];
+                require(std::fabs(actual.data<float>()[index] - expected)
+                        <= 1e-5f + std::fabs(expected) * 1e-3f,
+                    "MXFP8 dense batch differs from serial GEMM");
+            }
+        }
+    }
+}
+
 void test_grouped_row_mxfp8_verify() {
     using namespace mlx::core;
     constexpr int groups = 2;
@@ -1563,6 +1626,7 @@ int main() {
         test_matmul("MXFP8", 128, 64);
         test_native_mxfp8_scale_expansion();
         test_mxfp8_small_m_matches_decode();
+        test_native_mxfp8_scale_storage();
         test_embedding("MXFP4", 96);
         test_embedding("MXFP8", 128);
         test_grouped_mxfp8();
@@ -1579,6 +1643,7 @@ int main() {
         benchmark_v41_block32_mxfp8_inverse_rope();
         test_grouped_row_mxfp8_prefill();
         test_grouped_row_block32_mxfp8_batched_qmm();
+        test_grouped_row_mxfp8_dense_batch();
         test_grouped_row_mxfp8_verify();
         test_grouped_mxfp8_small_m_matches_decode();
         test_block32_mxfp8_projection_batch();

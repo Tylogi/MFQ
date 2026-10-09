@@ -1,6 +1,8 @@
 #include "mlx_vq.h"
+#include "mlx_nvq_decode.h"
 #include "mlx_tensor.h"
 #include "mlx_grouped_linear.h"
+#include "mlx_kernel_prepare.h"
 
 #include "nvq_codebooks.generated.h"
 
@@ -19,6 +21,7 @@
 #include <vector>
 
 #include <mlx/mlx.h>
+#include <mlx/primitives.h>
 
 namespace {
 
@@ -1273,6 +1276,19 @@ void test_fixture(const Fixture& fixture) {
             fixture.dtype
             + " native metadata mismatch");
     }
+    if (weight.uses_native_jsc() || weight.uses_native_nvq1()) {
+        const bool delta = weight.uses_native_nvq1();
+        const auto packed = [&](std::size_t count, int bits) {
+            return (std::size_t(weight.output_size()) * count * bits + 7) / 8 + 8;
+        };
+        if (weight.packed_indices().nbytes() != packed(weight.vectors(), weight.index_bits())
+            || weight.packed_states().nbytes() != packed(weight.groups(), weight.state_bits())
+            || weight.packed_auxiliary().nbytes() != packed(delta ? weight.groups()
+                : (weight.input_size() + 7) / 8, delta ? 1 : 7)
+            || weight.packed_nbytes() > fixture.blob.size() + 4 * weight.output_size() + 256
+                + weight.codebooks().nbytes())
+            throw std::runtime_error(fixture.dtype + " expanded native packed streams");
+    }
 
     auto dense = weight.dequantize(float32);
     require_shape(
@@ -1468,12 +1484,42 @@ void test_fixture(const Fixture& fixture) {
     }
 }
 
+void test_large_nvq_bit_offsets() {
+    using namespace mlx::core;
+    const std::array<std::uint32_t, 8> positions{
+        (1u << 29u) - 1u, 1u << 29u, (1u << 29u) + 1u,
+        (1u << 30u) - 1u, 1u << 30u, (1u << 30u) + 1u,
+        0x7fffffffu, 0x7fffffffu,
+    };
+    const std::array<std::uint32_t, 8> widths{9u, 10u, 11u, 12u, 3u, 7u, 11u, 12u};
+    auto kernel = fast::metal_kernel("mfq_nvq_large_bit_offsets", {"positions", "widths"}, {"offsets"},
+        R"METAL(
+            uint item = thread_position_in_grid.x;
+            if (item >= uint(positions_shape[0])) return;
+            uint2 cursor = mfq_nvq_bit_cursor(positions[item], widths[item]);
+            offsets[item * 2u] = cursor.x;
+            offsets[item * 2u + 1u] = cursor.y;
+        )METAL", mfq::metal::kNvqDecodeHeader);
+    auto outputs = kernel({array(positions.begin(), Shape{8}), array(widths.begin(), Shape{8})},
+        {Shape{8, 2}}, {uint32}, {32, 1, 1}, {32, 1, 1}, {}, std::nullopt, false,
+        default_stream(Device::gpu));
+    eval(outputs);
+    const auto* offsets = outputs.front().data<std::uint32_t>();
+    for (std::size_t item = 0; item < positions.size(); ++item) {
+        const auto bit = std::uint64_t(positions[item]) * widths[item];
+        if (offsets[item * 2] != bit / 8 || offsets[item * 2 + 1] != bit % 8)
+            throw std::runtime_error("NVQ large bitstream offset overflow");
+    }
+}
+
 void test_nvq3jl_projection_shapes() {
     using namespace mlx::core;
     test_fixture(make_nvq3jl_shape(24, 24));
     for (const auto [width, narrow, wide] : {
              std::array<int, 3>{24, 3, 35},
              std::array<int, 3>{28, 13, 37},
+             std::array<int, 3>{36, 13, 45},
+             std::array<int, 3>{52, 13, 61},
              std::array<int, 3>{80, 13, 97},
              std::array<int, 3>{88, 13, 105},
              std::array<int, 3>{96, 13, 113},
@@ -1484,8 +1530,10 @@ void test_nvq3jl_projection_shapes() {
         test_fixture(expansion);
         auto a = mfq::metal::MlxVqWeight::from_blob(contraction.dtype, contraction.blob);
         auto b = mfq::metal::MlxVqWeight::from_blob(expansion.dtype, expansion.blob);
-        if (!a.banked_execution_records() || !b.banked_execution_records()) {
-            throw std::runtime_error("NVQ3J-L execution records were not prepared at load");
+        if (!a.uses_native_jsc() || !b.uses_native_jsc()
+            || a.packed_nbytes() > contraction.blob.size() + 4 * narrow + 256
+            || b.packed_nbytes() > expansion.blob.size() + 4 * wide + 256) {
+            throw std::runtime_error("NVQ3J-L did not retain compact native streams");
         }
         const mfq::metal::MlxGroupedLinear group({&a, &b});
         const mfq::metal::MlxGroupedLinear triple({&a, &b, &a});
@@ -1539,9 +1587,13 @@ void test_nvq3jl_projection_shapes() {
 void test_nvq_dequantize_tails() {
     using namespace mlx::core;
     for (const auto& seed : {make_plain_nvq("NVQ2", 1, 8), make_plain_nvq("NVQ3", 2, 4),
-                            make_jsc("NVQ2J-XL", 5, 8, 12, true)}) {
-        for (const int width : {1, 2, 3, 5, 8, 16, 24, 25, 27, 29, 31}) {
-            if (seed.dtype == "NVQ2J-XL" && width % 8 != 0) continue;
+                            make_jsc("NVQ2J", 1, 8, 8), make_jsc("NVQ2J-L", 4, 8, 10),
+                            make_jsc("NVQ2J-XL", 5, 8, 12, true), make_jsc("NVQ3J", 2, 4, 8),
+                            make_jsc("NVQ3J-512", 3, 4, 9), make_jsc("NVQ3J-L", 6, 4, 10),
+                            make_nvq1_l(), make_nvq1_s()}) {
+        const int vector_size = mfq::metal::MlxVqWeight::from_blob(seed.dtype, seed.blob).vector_size();
+        for (const int width : {1, 2, 3, 5, 8, 16, 24, 25, 27, 29, 31, 36, 40, 56, 64, 72}) {
+            if (seed.dtype != "NVQ2" && seed.dtype != "NVQ3" && width % vector_size != 0) continue;
             const auto fixture = varied_projection_fixture(seed, 3, width);
             const auto weight = mfq::metal::MlxVqWeight::from_blob(fixture.dtype, fixture.blob);
             for (const auto dtype : {float16, float32}) {
@@ -1555,13 +1607,98 @@ void test_nvq_dequantize_tails() {
     }
 }
 
+void test_nvq1_projection_dispatch() {
+    using namespace mlx::core;
+    const auto l_seed = make_nvq1_l();
+    const auto s_seed = make_nvq1_s();
+    const auto find_variant = [&](auto&& self, const array& value, const std::string& marker) -> bool {
+        if (!value.has_primitive()) return false;
+        const auto primitive = value.primitive_ptr();
+        if (const auto* kernel = dynamic_cast<const mfq::metal::MlxPreparableKernel*>(primitive.get());
+            kernel && kernel->preparation_key().find(marker) != std::string::npos) return true;
+        for (const auto& input : value.inputs()) if (self(self, input, marker)) return true;
+        return false;
+    };
+    for (const int output_size : {13, 104}) {
+        for (const auto& first_seed : {l_seed, s_seed}) {
+            const auto first_fixture = varied_projection_fixture(first_seed, output_size, 88);
+            const auto first = mfq::metal::MlxVqWeight::from_blob(first_fixture.dtype, first_fixture.blob);
+            for (const auto& second_seed : {l_seed, s_seed}) {
+                for (const int second_output : {output_size, output_size + 4}) {
+                    const auto second_fixture = varied_projection_fixture(second_seed, second_output, 88);
+                    const auto second = mfq::metal::MlxVqWeight::from_blob(second_fixture.dtype, second_fixture.blob);
+                    const mfq::metal::MlxGroupedLinear pair({&first, &second});
+                    for (int rows = 1; rows <= 6; ++rows) {
+                        for (const auto dtype : {float16, float32}) {
+                            const auto outputs = pair.matmul(zeros(Shape{rows, 88}, dtype));
+                            const bool expected = rows == 6 && output_size < 88 && output_size == second_output
+                                && first_fixture.dtype == "NVQ1-L" && second_fixture.dtype == "NVQ1-L";
+                            const bool expected_vector = rows > 1 && dtype == float16 && output_size < 88
+                                && output_size == second_output && first_fixture.dtype == second_fixture.dtype
+                                && (first_fixture.dtype == "NVQ1-S" || expected);
+                            for (const auto& output : outputs) {
+                                if (find_variant(find_variant, output, "_shared_nvq1") != expected
+                                    || find_variant(find_variant, output, "_vector_nvq1") != expected_vector)
+                                    throw std::runtime_error("NVQ1 grouped structure dispatch mismatch");
+                            }
+                        }
+                    }
+                    const mfq::metal::MlxGroupedLinear triple({&first, &second, &first});
+                    for (const auto& output : triple.matmul(zeros(Shape{6, 88}, float16))) {
+                        if (find_variant(find_variant, output, "_shared_nvq1")
+                            || find_variant(find_variant, output, "_vector_nvq1"))
+                            throw std::runtime_error("NVQ1 pair structure selected for three projections");
+                    }
+                }
+            }
+        }
+    }
+}
+
+void test_nvq1_unaligned_inputs() {
+    using namespace mlx::core;
+    for (const auto& seed : {make_nvq1_l(), make_nvq1_s()}) {
+        const auto fixture = varied_projection_fixture(seed, 13, 88);
+        const auto weight = mfq::metal::MlxVqWeight::from_blob(fixture.dtype, fixture.blob);
+        const mfq::metal::MlxGroupedLinear grouped({&weight, &weight});
+        for (const int rows : {2, 3, 4, 5, 6}) {
+            const auto values = input_values(rows, fixture.input_size);
+            const auto expected = expected_matmul(fixture, values, rows);
+            for (const int offset : {1, 4}) {
+                std::vector<float> backing(values.size() + offset, 17.0f);
+                std::copy(values.begin(), values.end(), backing.begin() + offset);
+                for (const auto dtype : {float16, float32}) {
+                    auto input = reshape(slice(astype(array(backing.begin(),
+                        Shape{static_cast<int>(backing.size())}), dtype),
+                        Shape{offset}, Shape{static_cast<int>(backing.size())}),
+                        Shape{rows, fixture.input_size});
+                    auto outputs = grouped.matmul(input);
+                    outputs.push_back(weight.matmul(input));
+                    for (const auto& output : outputs) {
+                        const auto actual = evaluated_float(output);
+                        if (actual.size() != expected.size()) throw std::runtime_error("NVQ1 input view output size");
+                        for (std::size_t index = 0; index < actual.size(); ++index) {
+                            const float tolerance = dtype == float16
+                                ? 0.001f + 0.0006f * std::fabs(expected[index])
+                                : 0.0001f + 0.00001f * std::fabs(expected[index]);
+                            require_close(actual[index], expected[index], tolerance,
+                                fixture.dtype + " input view offset=" + std::to_string(offset)
+                                    + " M=" + std::to_string(rows));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 void test_nvq_group64_large_shapes() {
     using namespace mlx::core;
     const auto seed = make_jsc("NVQ2J-XL", 5, 8, 12, true, 4);
     for (const auto& shape : {std::array<int, 2>{2560, 6144}, std::array<int, 2>{6144, 2560}}) {
         const auto fixture = varied_projection_fixture(seed, shape[0], shape[1]);
         const auto weight = mfq::metal::MlxVqWeight::from_blob(fixture.dtype, fixture.blob);
-        if (weight.execution_layout() != 1 || weight.banked_execution_records()
+        if (weight.execution_layout() != 1 || weight.uses_native_jsc()
             || weight.jsc_execution_records() != &weight.packed_indices()) {
             throw std::runtime_error("NVQ2J-XL compact group64 execution was not preserved");
         }
@@ -1740,8 +1877,11 @@ int main() {
             test_fixture(fixture);
         }
         test_fixture(make_jsc("NVQ2J-XL", 5, 8, 12, true));
+        test_large_nvq_bit_offsets();
         test_nvq3jl_projection_shapes();
         test_nvq_dequantize_tails();
+        test_nvq1_projection_dispatch();
+        test_nvq1_unaligned_inputs();
         test_nvq_group64_large_shapes();
         test_nvq_scale_values();
         test_nvq_projection_batches();

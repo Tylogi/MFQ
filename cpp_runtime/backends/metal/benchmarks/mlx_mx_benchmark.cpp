@@ -42,12 +42,17 @@ void append(std::vector<std::uint8_t>& target, T value) {
 std::vector<std::uint8_t> make_synthetic_mx_blob(
     int bits,
     int output_size,
-    int input_size) {
+    int input_size,
+    int scale_row_block = 128,
+    int scale_column_block = 128) {
     require(bits == 4 || bits == 8, "synthetic MX bits must be 4 or 8");
+    require(bits == 4 || (scale_row_block == 128 && scale_column_block == 128)
+        || ((scale_row_block == 1 || scale_row_block == 32) && scale_column_block == 32),
+        "invalid synthetic MX scale geometry");
     require(
         output_size > 0 && input_size > 0 &&
             ((bits == 4 && input_size % 32 == 0) ||
-             (bits == 8 && input_size % 128 == 0)),
+             (bits == 8 && input_size % scale_column_block == 0)),
         "invalid synthetic MX geometry");
     std::vector<std::uint8_t> blob{'M', 'X', 'T', '1'};
     append<std::uint8_t>(blob, 1);
@@ -59,8 +64,8 @@ std::vector<std::uint8_t> make_synthetic_mx_blob(
     append<std::uint64_t>(blob, bits == 4 ? input_size / 2 : input_size);
     append<std::uint64_t>(
         blob,
-        bits == 4 ? output_size : (output_size + 127) / 128);
-    append<std::uint64_t>(blob, bits == 4 ? input_size / 32 : input_size / 128);
+        bits == 4 ? output_size : (output_size + scale_row_block - 1) / scale_row_block);
+    append<std::uint64_t>(blob, bits == 4 ? input_size / 32 : input_size / scale_column_block);
     const auto value_bytes = static_cast<std::size_t>(output_size) *
         static_cast<std::size_t>(bits == 4 ? input_size / 2 : input_size);
     for (std::size_t index = 0; index < value_bytes; ++index) {
@@ -69,8 +74,8 @@ std::vector<std::uint8_t> make_synthetic_mx_blob(
             : static_cast<std::uint8_t>(0x38u + (index & 3u)));
     }
     const auto scale_bytes = static_cast<std::size_t>(
-        bits == 4 ? output_size : (output_size + 127) / 128) *
-        static_cast<std::size_t>(bits == 4 ? input_size / 32 : input_size / 128);
+        bits == 4 ? output_size : (output_size + scale_row_block - 1) / scale_row_block) *
+        static_cast<std::size_t>(bits == 4 ? input_size / 32 : input_size / scale_column_block);
     blob.insert(blob.end(), scale_bytes, 127u);
     return blob;
 }
@@ -240,14 +245,17 @@ void benchmark_grouped_synthetic(
         << std::setprecision(6) << checksum << '\t' << maximum << '\n';
 }
 
+array fallback_grouped(const MlxMxWeight& weight, const array& input, int groups);
+
 void benchmark_diagonal_synthetic(
     int rows,
     int output_per_group,
     int input_size,
     int groups,
-    int repetitions) {
+    int repetitions,
+    bool serial) {
     require(
-        rows >= 2 && rows <= 6 &&
+        rows >= 1 && rows <= 32768 &&
             output_per_group > 0 && output_per_group % 8 == 0 &&
             input_size > 0 && input_size % 256 == 0 &&
             groups > 0,
@@ -263,7 +271,8 @@ void benchmark_diagonal_synthetic(
         std::move(flat),
         Shape{1, rows, groups, input_size});
     const auto execute = [&] {
-        return weight.grouped_row_matmul(source, groups);
+        return serial ? fallback_grouped(weight, source, groups)
+            : weight.grouped_row_matmul(source, groups);
     };
     auto result = execute();
     mlx::core::eval(result);
@@ -290,7 +299,7 @@ void benchmark_diagonal_synthetic(
         checksum += checked.data<float>()[index];
     }
     std::cout
-        << "MXFP8\tsynthetic_diagonal\t"
+        << "MXFP8\t" << (serial ? "synthetic_diagonal_serial" : "synthetic_diagonal") << '\t'
         << rows << 'x' << groups << 'x' << input_size << 'x'
         << output_per_group << '\t' << weight.packed_nbytes() << '\t'
         << std::fixed << std::setprecision(3) << mean_ms << '\t'
@@ -303,21 +312,16 @@ array fallback_grouped(
     const MlxMxWeight& weight,
     const array& input,
     int groups) {
-    auto complete = weight.matmul(input);
+    auto dense = weight.dequantize(input.dtype());
     const int output_per_group = weight.output_size() / groups;
     std::vector<array> pieces;
     pieces.reserve(static_cast<std::size_t>(groups));
     for (int group = 0; group < groups; ++group) {
-        auto selected = mlx::core::take(
-            complete,
-            group,
-            complete.ndim() - 2);
-        Shape starts(selected.ndim(), 0);
-        Shape stops = selected.shape();
-        starts.back() = group * output_per_group;
-        stops.back() = (group + 1) * output_per_group;
-        pieces.push_back(
-            mlx::core::slice(selected, starts, stops));
+        auto selected = mlx::core::take(input, group, input.ndim() - 2);
+        auto group_weight = mlx::core::slice(dense,
+            Shape{group * output_per_group, 0},
+            Shape{(group + 1) * output_per_group, weight.input_size()});
+        pieces.push_back(mlx::core::matmul(selected, mlx::core::transpose(group_weight)));
     }
     return mlx::core::stack(pieces, input.ndim() - 2);
 }
@@ -367,9 +371,9 @@ int main(int argc, char** argv) {
     try {
         if (argc >= 2 && std::string(argv[1]) == "--synthetic-diagonal") {
             require(
-                argc == 7,
+                argc == 7 || (argc == 8 && std::string(argv[7]) == "serial"),
                 "usage: mfq-metal-mx-benchmark --synthetic-diagonal "
-                "REPETITIONS ROWS OUTPUT_PER_GROUP INPUT GROUPS");
+                "REPETITIONS ROWS OUTPUT_PER_GROUP INPUT GROUPS [serial]");
             const int repetitions = std::stoi(argv[2]);
             require(repetitions > 0, "repetitions must be positive");
             std::cout
@@ -380,7 +384,8 @@ int main(int argc, char** argv) {
                 std::stoi(argv[4]),
                 std::stoi(argv[5]),
                 std::stoi(argv[6]),
-                repetitions);
+                repetitions,
+                argc == 8);
             return 0;
         }
         if (argc >= 2 && std::string(argv[1]) == "--synthetic-grouped") {
@@ -410,16 +415,16 @@ int main(int argc, char** argv) {
         }
         if (argc >= 2 && std::string(argv[1]) == "--synthetic") {
             require(
-                argc == 7,
+                argc == 7 || argc == 9,
                 "usage: mfq-metal-mx-benchmark --synthetic "
-                "BITS REPETITIONS ROWS OUTPUT INPUT");
+                "BITS REPETITIONS ROWS OUTPUT INPUT [SCALE_ROWS SCALE_COLUMNS]");
             const int bits = std::stoi(argv[2]);
             const int repetitions = std::stoi(argv[3]);
             const int rows = std::stoi(argv[4]);
             const int output = std::stoi(argv[5]);
             const int input = std::stoi(argv[6]);
             require(repetitions > 0, "repetitions must be positive");
-            require(rows >= 1 && rows <= 16, "rows must be in [1, 16]");
+            require(rows >= 1 && rows <= 32768, "rows must be in [1, 32768]");
             const std::string dtype = bits == 4 ? "MXFP4" : "MXFP8";
             std::cout
                 << "dtype\ttensor\tshape\tpacked_bytes\tms\tGB/s\t"
@@ -429,7 +434,9 @@ int main(int argc, char** argv) {
                 "synthetic_mx",
                 MlxMxWeight::from_blob(
                     dtype,
-                    make_synthetic_mx_blob(bits, output, input)),
+                    make_synthetic_mx_blob(bits, output, input,
+                        argc == 9 ? std::stoi(argv[7]) : 128,
+                        argc == 9 ? std::stoi(argv[8]) : 128)),
                 rows,
                 repetitions);
             return 0;

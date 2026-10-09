@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -49,7 +48,7 @@ public:
     mlx::core::array matmul(const mlx::core::array& input) const;
     // Zero-copy projection group for native row/block-32 MXFP8 weights.
     // This is the storage used by QAT Attention projections: all members keep
-    // their own packed payload and expanded E8M0 sidecar, but share one Metal
+    // their own packed payload and native E8M0 scales, but share one Metal
     // submission over the common activation.
     static std::vector<mlx::core::array> projection_group_matmul(
         std::span<const MlxMxWeight> weights,
@@ -99,7 +98,6 @@ private:
 
     mlx::core::array values_;
     mlx::core::array scales_;
-    std::optional<mlx::core::array> expanded_mxfp8_scales_;
     int mxfp8_scale_row_block_size_ = 0;
     int mxfp8_scale_column_block_size_ = 0;
     int bits_ = 0;

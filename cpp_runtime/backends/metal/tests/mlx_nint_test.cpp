@@ -1,5 +1,7 @@
 #include "mlx_nint.h"
 #include "mlx_moe_ops.h"
+#include "mlx_platform.h"
+#include "mlx_resident_budget.h"
 
 #include <cmath>
 #include <algorithm>
@@ -7,9 +9,11 @@
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 #include <mlx/mlx.h>
+#include <mlx/primitives.h>
 
 namespace {
 
@@ -216,15 +220,15 @@ ScaledFixture make_nint5_gs28_scaled_blob() {
     };
 }
 
-ScaledFixture make_mixed_sub_bits_blob() {
-    constexpr std::int32_t output_size = 4;
+ScaledFixture make_mixed_sub_bits_blob(
+    int nominal_sub_bits = 6,
+    std::int32_t output_size = 4,
+    std::int32_t groups = 2) {
     constexpr std::int32_t group_size = 5;
-    constexpr std::int32_t groups = 2;
-    constexpr std::int32_t input_size = 9;
+    const std::int32_t input_size = groups * group_size - 1;
     constexpr int bits = 4;
-    constexpr int nominal_sub_bits = 6;
-    const std::vector<std::uint8_t> row_sub_bits{5, 6, 7, 8};
-    const std::vector<std::uint8_t> selectors{0, 1, 2, 3};
+    std::vector<std::uint8_t> selectors(output_size);
+    for (int row = 0; row < output_size; ++row) selectors[row] = row % 4;
     std::vector<std::uint8_t> quantized(
         output_size * groups * group_size);
     std::vector<std::uint8_t> sub_scales{
@@ -234,6 +238,18 @@ ScaledFixture make_mixed_sub_bits_blob() {
         128, 192,
     };
     std::vector<std::uint8_t> sub_mins(sub_scales.size(), 0);
+    if (output_size != 4 || groups != 2 || nominal_sub_bits != 6) {
+        sub_scales.resize(output_size * groups);
+        sub_mins.resize(output_size * groups);
+        for (int row = 0; row < output_size; ++row) {
+            const auto mask = (1u << (nominal_sub_bits - 1 + selectors[row])) - 1u;
+            for (int group = 0; group < groups; ++group) {
+                const auto index = row * groups + group;
+                sub_scales[index] = (index * 13 + 5) & mask;
+                sub_mins[index] = (index * 7 + 1) & mask;
+            }
+        }
+    }
     for (std::size_t index = 0; index < quantized.size(); ++index) {
         quantized[index] = static_cast<std::uint8_t>((index * 3 + 1) & 15u);
     }
@@ -253,7 +269,7 @@ ScaledFixture make_mixed_sub_bits_blob() {
         append<std::uint16_t>(blob, 0x3c00);
     }
     for (int output = 0; output < output_size; ++output) {
-        append<std::uint16_t>(blob, 0);
+        append<std::uint16_t>(blob, output_size == 4 ? 0 : 0x3c00);
     }
     const auto packed_selectors = pack_values(selectors, 2);
     blob.insert(blob.end(), packed_selectors.begin(), packed_selectors.end());
@@ -289,6 +305,91 @@ ScaledFixture make_mixed_sub_bits_blob() {
         std::move(sub_scales),
         std::move(sub_mins),
     };
+}
+
+void test_native_sub_bit_streams() {
+    using namespace mlx::core;
+    constexpr int output_size = 12;
+    constexpr int groups = 3;
+    constexpr int input_size = 14;
+    for (const int nominal_bits : {2, 6}) {
+        const auto fixture = make_mixed_sub_bits_blob(nominal_bits, output_size, groups);
+        const auto weight = mfq::metal::MlxNintWeight::from_blob(fixture.blob);
+        std::vector<std::uint8_t> scales;
+        std::vector<std::uint8_t> minima;
+        const auto* rows = weight.row_metadata().data<std::uint32_t>();
+        for (int selector = 0; selector < 4; ++selector) {
+            const int bits = nominal_bits - 1 + selector;
+            std::vector<std::uint8_t> selected_scales;
+            std::vector<std::uint8_t> selected_minima;
+            int local_row = 0;
+            for (int row = selector; row < output_size; row += 4, ++local_row) {
+                const auto bit = local_row * groups * bits;
+                if (((rows[row * 4] >> 8u) & 255u) != (bits | ((bit & 7u) << 4u)) ||
+                    rows[row * 4 + 3] != scales.size() + bit / 8u ||
+                    rows[row * 4 + 2] != 0x3c003c00u)
+                    throw std::runtime_error("adaptive NINT changed native subgroup row mapping");
+                for (int group = 0; group < groups; ++group) {
+                    selected_scales.push_back(fixture.sub_scales[row * groups + group]);
+                    selected_minima.push_back(fixture.sub_mins[row * groups + group]);
+                }
+            }
+            const auto scale_stream = pack_values(selected_scales, bits);
+            const auto min_stream = pack_values(selected_minima, bits);
+            scales.insert(scales.end(), scale_stream.begin(), scale_stream.end());
+            minima.insert(minima.end(), min_stream.begin(), min_stream.end());
+        }
+        scales.insert(scales.end(), 2u, 0u);
+        minima.insert(minima.end(), 2u, 0u);
+        if (weight.sub_scales().nbytes() != scales.size() ||
+            weight.sub_mins().nbytes() != minima.size() ||
+            std::memcmp(weight.sub_scales().data<std::uint8_t>(), scales.data(), scales.size()) != 0 ||
+            std::memcmp(weight.sub_mins().data<std::uint8_t>(), minima.data(), minima.size()) != 0 ||
+            weight.packed_nbytes() != weight.packed_values().nbytes() + scales.size() +
+                minima.size() + weight.row_metadata().nbytes())
+            throw std::runtime_error("adaptive NINT subgroup streams were expanded or miscounted");
+        std::vector<float> reference(output_size * input_size);
+        for (int row = 0; row < output_size; ++row)
+            for (int column = 0; column < input_size; ++column) {
+                const auto group = row * groups + column / 5;
+                reference[row * input_size + column] =
+                    fixture.sub_scales[group] * fixture.quantized[row * groups * 5 + column]
+                    - fixture.sub_mins[group];
+            }
+        const auto dense = array(reference.begin(), Shape{output_size, input_size});
+        if (!all(equal(weight.dequantize(float32), dense)).item<bool>())
+            throw std::runtime_error("native NINT subgroup dequantization mismatch");
+        const auto ids = array({11, 0, 7}, Shape{3}, int32);
+        if (!all(equal(weight.embedding(ids, float32), take(dense, ids, 0))).item<bool>())
+            throw std::runtime_error("native NINT subgroup embedding mismatch");
+        for (const int m : {1, 3, 6, 65}) {
+            std::vector<float> inputs(m * input_size);
+            for (std::size_t i = 0; i < inputs.size(); ++i)
+                inputs[i] = float(int((i * 13 + 3) % 31) - 15) / 4096.0f;
+            const auto x = astype(array(inputs.begin(), Shape{m, input_size}), float16);
+            const auto expected = matmul(astype(x, float32), transpose(dense));
+            const auto actual = astype(weight.matmul_packed(x), float32);
+            const auto error = max(abs(actual - expected));
+            const auto peak = max(abs(expected));
+            eval(error, peak);
+            if (error.item<float>() > std::max(1e-4f, peak.item<float>() * .002f))
+                throw std::runtime_error("native NINT subgroup matmul mismatch");
+        }
+    }
+    auto tiny = make_nint_blob(4);
+    const std::uint16_t anchors[]{0x0001, 0x03ff, 0x8001, 0x03ff};
+    std::memcpy(tiny.blob.data() + 42, anchors, sizeof(anchors));
+    tiny.blob[51] = 0x0f;
+    const auto weight = mfq::metal::MlxNintWeight::from_blob(tiny.blob);
+    std::vector<float> expected(18);
+    for (int row = 0; row < 2; ++row)
+        for (int column = 0; column < 9; ++column) {
+            const float scale = std::ldexp(row == 0 ? 1.0f : 1023.0f, -24);
+            const float minimum = row == 0 ? -scale : scale;
+            expected[row * 9 + column] = scale * tiny.quantized[row * 10 + column] - minimum;
+        }
+    if (!all(equal(weight.dequantize(float32), array(expected.begin(), Shape{2, 9}))).item<bool>())
+        throw std::runtime_error("native NINT half anchors lost subnormal values");
 }
 
 void test_mixed_sub_bits_loads_into_existing_kernel() {
@@ -542,6 +643,23 @@ void test_mixed_q_bits_inference() {
     if (weight.has_uniform_q_bits()) {
         throw std::runtime_error("adaptive NINT q widths were not retained");
     }
+    std::size_t native_q_bytes = 0;
+    const auto& packed_q = weight.packed_values();
+    const auto* metadata = weight.row_metadata().data<std::uint32_t>();
+    for (int bits = 1; bits <= 8; ++bits) {
+        for (int local = 0; local < 2; ++local) {
+            const auto bit_offset = std::size_t(local * packed_row_size * bits);
+            const auto row = bits - 1 + local * 8;
+            if ((metadata[row * 4] & 255u) != (bits | ((bit_offset & 7u) << 4u))
+                || metadata[row * 4 + 1] != native_q_bytes + bit_offset / 8)
+                throw std::runtime_error("adaptive NINT changed the native q row mapping");
+        }
+        native_q_bytes += (2 * packed_row_size * bits + 7) / 8;
+    }
+    if (packed_q.nbytes() != native_q_bytes + 4
+        || std::memcmp(packed_q.data<std::uint8_t>(),
+            fixture.blob.data() + fixture.blob.size() - native_q_bytes, native_q_bytes) != 0)
+        throw std::runtime_error("adaptive NINT q stream was repacked");
 
     auto dense = mlx::core::astype(weight.dequantize(), mlx::core::float32);
     dense.eval();
@@ -594,8 +712,8 @@ void test_mixed_q_bits_inference() {
 }
 
 void test_dequantize_vector_rows_and_tails() {
-    for (int group_size : {4, 24, 48, 5}) {
-        for (int input_size : {1, group_size * 2 - 3, group_size * 2 + 1}) {
+    for (int group_size : {4, 24, 28, 48, 5}) {
+        for (int input_size : {1, 8, 24, 56, 64, group_size * 2 - 3, group_size * 2 + 1}) {
             const int groups = (input_size + group_size - 1) / group_size;
             for (int bits = 0; bits <= 8; ++bits) {
                 const auto fixture = bits == 0
@@ -656,6 +774,128 @@ void test_packed_prefill_group_sizes_and_mixed_q() {
                         throw std::runtime_error("runtime-length NINT embedding mismatch");
                     }
                 }
+            }
+        }
+    }
+}
+
+void test_packed_prefill_narrow_and_tail_shapes() {
+    using namespace mlx::core;
+    for (const int group_size : {5, 24, 28, 48}) {
+        for (const int output_size : {1, 4, 8, 9}) {
+            for (const int input_size : {3, 193, 1025}) {
+                const int groups = (input_size + group_size - 1) / group_size;
+                for (int bits = 0; bits <= 8; ++bits) {
+                    const auto fixture = bits == 0
+                        ? make_mixed_q_bits_blob(output_size, group_size, groups, input_size)
+                        : make_nint_blob(bits, output_size, group_size, groups, input_size, 17);
+                    const auto weight = mfq::metal::MlxNintWeight::from_blob(fixture.blob);
+                    const auto dense = weight.dequantize(float16);
+                    eval(dense);
+                    for (const int rows : {64, 65, 129, 2048}) {
+                        std::vector<float> values(rows * input_size);
+                        const bool stress = input_size == 1025 && rows == 129;
+                        std::uint32_t state = 20261008u;
+                        for (std::size_t i = 0; i < values.size(); ++i) {
+                            state = 1664525u * state + 1013904223u;
+                            values[i] = stress
+                                ? float(int(state >> 8) - 8388608) / 4194304.0f
+                                : float(int((i * 13 + 5) % 47) - 23) / 4096.0f;
+                        }
+                        const auto input = astype(array(values.begin(), Shape{rows, input_size}), float16);
+                        const auto expected = matmul(input, transpose(dense));
+                        for (const auto& actual : {weight.matmul_packed(input), weight.matmul(input)}) {
+                            const auto error = max(abs(astype(actual, float32) - astype(expected, float32)));
+                            eval(error);
+                            const float tolerance = stress
+                                ? std::max(1e-4f, max(abs(astype(expected, float32))).item<float>() * 0.002f)
+                                : 0.0f;
+                            if (actual.shape() != expected.shape() || actual.dtype() != float16 ||
+                                !std::isfinite(error.item<float>()) || error.item<float>() > tolerance)
+                                throw std::runtime_error("NINT narrow/tail prefill mismatch: GS=" +
+                                    std::to_string(group_size) + " q=" + std::to_string(bits) +
+                                    " K=" + std::to_string(input_size) + " N=" + std::to_string(output_size) +
+                                    " M=" + std::to_string(rows) + " error=" + std::to_string(error.item<float>()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+bool uses_dense_matmul(const mlx::core::array& value) {
+    if (!value.has_primitive()) return false;
+    const std::string_view name = value.primitive().name();
+    if (name == "Matmul") return true;
+    if ((name == "Reshape" || name == "AsType") && value.inputs().size() == 1)
+        return uses_dense_matmul(value.inputs().front());
+    return false;
+}
+
+void test_prefill_dispatch_and_budget() {
+    using namespace mlx::core;
+    using mfq::metal::MlxResidentBudgetScope;
+    const bool nax = !mfq::metal::mlx_metal_nax_disabled() &&
+        mfq::metal::mlx_apple_chip_starts_with("Apple M5");
+    for (const int group_size : {24, 28, 48}) {
+        for (const auto [input_size, output_size] : {
+                 std::pair{4096, 256}, std::pair{1024, 1025}, std::pair{256, 256}}) {
+            const auto fixture = make_mixed_q_bits_blob(output_size, group_size,
+                (input_size + group_size - 1) / group_size, input_size);
+            const auto weight = mfq::metal::MlxNintWeight::from_blob(fixture.blob);
+            const auto dense = weight.dequantize(float16);
+            eval(dense);
+            for (const int rows : {6, 63, 64, 65, 128, 511, 512, 513, 2039, 2048}) {
+                std::vector<float> values(static_cast<std::size_t>(rows) * input_size);
+                for (std::size_t i = 0; i < values.size(); ++i)
+                    values[i] = float(int((i * 13 + 5) % 47) - 23) / 4096.0f;
+                const auto input = astype(array(values.begin(), Shape{1, rows, input_size}), float16);
+                const auto expected = matmul(input, transpose(dense));
+                auto actual = weight.matmul(input);
+                const int crossover = nax || input_size * output_size < (1 << 20)
+                    ? 2048 : output_size <= input_size ? 64 : 512;
+                if (uses_dense_matmul(actual) != (rows >= crossover) ||
+                    uses_dense_matmul(weight.matmul_packed(input)))
+                    throw std::runtime_error("NINT prefill dispatch mismatch");
+                const auto check = [&](const array& result) {
+                    const auto error = max(abs(astype(result, float32) - astype(expected, float32)));
+                    const auto peak = max(abs(astype(expected, float32)));
+                    eval(error, peak);
+                    if (result.shape() != Shape{1, rows, output_size} || result.dtype() != float16 ||
+                        !std::isfinite(error.item<float>()) ||
+                        error.item<float>() > std::max(1e-4f, peak.item<float>() * .002f))
+                        throw std::runtime_error("NINT dispatched prefill numerical mismatch");
+                };
+                check(actual);
+                if (rows < crossover) continue;
+                std::size_t queried = 0;
+                {
+                    MlxResidentBudgetScope denied([](std::size_t) {
+                        throw std::runtime_error("optional NINT dequantization requested eviction");
+                    }, [&](std::size_t bytes) { queried = bytes; return false; });
+                    const auto fallback = weight.matmul(input);
+                    const auto required = std::size_t{2} * (std::size_t(input_size) * output_size +
+                        std::size_t(rows) * input_size + std::size_t(rows) * output_size);
+                    if (uses_dense_matmul(fallback) || queried != required)
+                        throw std::runtime_error("NINT ignored optional memory budget");
+                    check(fallback);
+                    {
+                        MlxResidentBudgetScope allowed({}, [](std::size_t) { return true; });
+                        if (!uses_dense_matmul(weight.matmul(input)))
+                            throw std::runtime_error("nested optional budget was not applied");
+                    }
+                    if (uses_dense_matmul(weight.matmul(input)))
+                        throw std::runtime_error("nested optional budget was not restored");
+                }
+                if (!uses_dense_matmul(weight.matmul(input)))
+                    throw std::runtime_error("NINT optional budget leaked outside scope");
+                synchronize();
+                const auto previous_limit = set_memory_limit(get_active_memory());
+                const bool exceeded_limit = uses_dense_matmul(weight.matmul(input));
+                set_memory_limit(previous_limit);
+                if (exceeded_limit)
+                    throw std::runtime_error("NINT ignored allocator headroom");
             }
         }
     }
@@ -1494,9 +1734,12 @@ int main() {
         test_nint_moe_shared_epilogue();
         test_nint6_gs24_decode();
         test_mixed_sub_bits_loads_into_existing_kernel();
+        test_native_sub_bit_streams();
         test_mixed_q_bits_inference();
         test_dequantize_vector_rows_and_tails();
         test_packed_prefill_group_sizes_and_mixed_q();
+        test_packed_prefill_narrow_and_tail_shapes();
+        test_prefill_dispatch_and_budget();
         test_mixed_q_bits_gs24_small_m();
         test_mixed_q_bits_routed_reuses_matmul_kernel();
         test_nint4_swiglu();

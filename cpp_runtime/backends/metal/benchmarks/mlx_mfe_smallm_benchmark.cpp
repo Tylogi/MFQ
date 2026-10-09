@@ -252,7 +252,7 @@ int main(int argc, char** argv) {
                 };
                 collect_kernels(collect_kernels, routed(0));
                 const bool route_reuse = rows > 1 && std::any_of(kernel_keys.begin(), kernel_keys.end(),
-                    [](const auto& key) { return key.starts_with("mfq_native_mfe_v7_"); });
+                    [](const auto& key) { return key.starts_with("mfq_native_mfe_v"); });
                 double decoded_blocks = 0.0;
                 double distinct_experts = 0.0;
                 for (int step = 0; step < repetitions; ++step) {
@@ -318,6 +318,7 @@ int main(int argc, char** argv) {
                         {"requested_projection_bytes", bytes * rows * routes},
                         {"kernel_keys", kernel_keys},
                         {"input", weight.neuron_len()}, {"output", weight.out_per_expert()},
+                        {"payload_bytes", blob.size()}, {"resident_bytes", weight.packed_nbytes()},
                         {"shape", weight.out_per_expert() > weight.neuron_len()
                             ? "expansion" : "contraction"},
                         {"hash", std::to_string(hash)}, {"checksum", checksum},

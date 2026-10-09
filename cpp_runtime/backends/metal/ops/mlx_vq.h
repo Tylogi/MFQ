@@ -130,15 +130,26 @@ public:
     const mlx::core::array& packed_indices() const noexcept {
         return indices_packed_;
     }
-    const mlx::core::array* banked_execution_records() const noexcept {
-        return banked_records_ ? &*banked_records_ : nullptr;
+    bool uses_native_jsc() const noexcept {
+        return execution_layout_ == 0 && group_size_ == 24 && state_bits_ == 4
+            && table_banks_ == 1
+            && ((index_bits_ == 8 && (vector_size_ == 4 || vector_size_ == 8)
+                    && input_size_ % vector_size_ == 0
+                    && (aux_mode_ == 1 || aux_mode_ == 2) && code_bank_mode_ != 2)
+                || (((vector_size_ == 4 && (index_bits_ == 9 || index_bits_ == 10))
+                        || (vector_size_ == 8 && (index_bits_ == 10 || index_bits_ == 12)))
+                    && aux_mode_ == 1 && code_bank_mode_ == 1));
     }
-    const mlx::core::array* nvq1_execution_records() const noexcept {
-        return nvq1_records_ ? &*nvq1_records_ : nullptr;
+    bool uses_native_nvq1() const noexcept {
+        return execution_layout_ == 0 && group_size_ == 24 && vector_size_ == 8
+            && ((format_label_ == "NVQ1-S" && index_bits_ == 9 && state_bits_ == 4
+                    && code_bank_mode_ == 2)
+                || (format_label_ == "NVQ1-L" && index_bits_ == 11 && state_bits_ == 3
+                    && code_bank_mode_ == 0))
+            && aux_mode_ == 3 && table_banks_ == 1;
     }
     const mlx::core::array* jsc_execution_records() const noexcept {
-        return jsc_records_ ? &*jsc_records_
-            : (execution_layout_ == 1 ? &indices_packed_ : nullptr);
+        return execution_layout_ == 1 ? &indices_packed_ : nullptr;
     }
     const mlx::core::array& packed_states() const noexcept {
         return state_packed_;
@@ -252,9 +263,6 @@ private:
     mlx::core::array residual_codebook_;
     mlx::core::array residual_first_;
     mlx::core::array residual_second_;
-    std::optional<mlx::core::array> banked_records_;
-    std::optional<mlx::core::array> nvq1_records_;
-    std::optional<mlx::core::array> jsc_records_;
     std::string format_label_;
     std::vector<int> output_shape_;
     int input_size_ = 0;

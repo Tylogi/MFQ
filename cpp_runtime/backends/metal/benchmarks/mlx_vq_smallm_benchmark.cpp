@@ -60,9 +60,11 @@ int main(int argc, char** argv) {
             mfq::metal::MlxMxfp4SqWeight, mfq::metal::MlxFp8SqWeight>;
         std::vector<Weight> weights;
         weights.reserve(argc - first_tensor);
+        std::uint64_t payload_bytes = 0;
         for (int argument = first_tensor; argument < argc; ++argument) {
             const auto& dtype = model.record(argv[argument]).dtype;
             const auto blob = model.read(argv[argument]);
+            payload_bytes += blob.size();
             if (mfq::metal::is_fp8_sq_dtype(dtype)) {
                 weights.emplace_back(mfq::metal::MlxFp8SqWeight::from_blob(dtype, blob));
             } else if (mfq::metal::is_mxfp4_sq_dtype(dtype)) {
@@ -82,6 +84,9 @@ int main(int argc, char** argv) {
         std::optional<mfq::metal::MlxGroupedLinear> grouped;
         if (weights.size() > 1) grouped.emplace(std::move(refs));
         const int width = std::visit([](const auto& value) { return value.input_size(); }, weights.front());
+        std::uint64_t resident_bytes = 0;
+        for (const auto& weight : weights)
+            resident_bytes += std::visit([](const auto& value) { return value.packed_nbytes(); }, weight);
         const int output_width = std::visit([](const auto& value) { return value.output_size(); }, weights.front());
         const auto dequantized_bytes = static_cast<std::uint64_t>(width) * output_width * 2u;
         const auto retained_outputs = std::max<std::uint64_t>(repetitions + 2u, 5u);
@@ -152,28 +157,12 @@ int main(int argc, char** argv) {
                 using W = std::decay_t<decltype(weight)>;
                 if constexpr (std::is_same_v<W, mfq::metal::MlxVqWeight>) {
                     bytes += output * 4;
-                    if (weight.execution_layout() == 1 && !weight.banked_execution_records()) {
+                    if (weight.execution_layout() == 1) {
                         bytes += output * weight.groups() * 8;
                     } else {
-                        const auto* records = weight.banked_execution_records();
-                        if (!records) records = weight.nvq1_execution_records();
-                        if (!records) records = weight.jsc_execution_records();
-                        if (records) {
-                            const auto records_per_row = weight.nvq1_execution_records()
-                                ? weight.groups() : (width + 7) / 8;
-                            const auto record_bytes = weight.nvq1_execution_records()
-                                ? (weight.index_bits() == 9 ? 4 : 5)
-                                : (weight.vector_size() == 4
-                                    ? (weight.index_bits() == 8 ? 3 : 4)
-                                    : (weight.index_bits() == 8 ? 2 : 3));
-                            bytes += output * records_per_row * record_bytes;
-                        } else {
-                            bytes += packed_bytes(output * weight.vectors(), weight.index_bits());
-                        }
-                        if (!weight.nvq1_execution_records()) {
-                            bytes += packed_bytes(output * weight.groups(), weight.state_bits());
-                        }
-                        if (!records) bytes += weight.aux_mode() == 3
+                        bytes += packed_bytes(output * weight.vectors(), weight.index_bits());
+                        bytes += packed_bytes(output * weight.groups(), weight.state_bits());
+                        bytes += weight.aux_mode() == 3
                             ? packed_bytes(output * weight.groups(), 1)
                             : packed_bytes(output * ((width + 7) / 8), 7);
                     }
@@ -186,17 +175,7 @@ int main(int argc, char** argv) {
                 }
             }, variant);
             if (dequantize) {
-                bytes = std::visit([](const auto& value) {
-                    auto packed = value.packed_nbytes();
-                    using W = std::decay_t<decltype(value)>;
-                    if constexpr (std::is_same_v<W, mfq::metal::MlxVqWeight>) {
-                        for (const auto* records : {value.banked_execution_records(),
-                                value.nvq1_execution_records(), value.jsc_execution_records()}) {
-                            if (records && records != &value.packed_indices()) packed -= records->nbytes();
-                        }
-                    }
-                    return packed;
-                }, weights.front())
+                bytes = std::visit([](const auto& value) { return value.packed_nbytes(); }, weights.front())
                     + static_cast<std::uint64_t>(width) * output_width * 2u;
             }
             std::vector<double> timings(3);
@@ -231,6 +210,7 @@ int main(int argc, char** argv) {
                     {"mode", grouped ? "grouped" : "standalone"}, {"M", rows}, {"round", round},
                     {"ms", ms}, {"logical_bytes", bytes}, {"effective_GB_s", bytes / (ms * 1e6)},
                     {"input", width}, {"output", output_width}, {"projections", weights.size()},
+                    {"payload_bytes", payload_bytes}, {"resident_bytes", resident_bytes},
                     {"kernel_keys", kernel_keys},
                     {"hash", std::to_string(hash)}, {"checksum", checksum}, {"repetitions", repetitions},
                     {"timing", "eval-prebuilt-graphs; host submission and synchronization included"},

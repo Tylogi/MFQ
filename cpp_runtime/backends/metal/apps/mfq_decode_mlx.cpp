@@ -1964,7 +1964,7 @@ public:
                 auto& loaded_runtime = runtime_holder->value();
                 mfq::metal::MlxResidentBudgetScope budget_scope([this](std::size_t bytes) {
                     enforce_memory_budget(bytes);
-                });
+                }, [this](std::size_t bytes) { return optional_memory_fits(bytes); });
                 enforce_memory_budget(0);
                 const auto stable_prefix_tokens =
                     session_cache->normalize_stable_prefix_tokens(std::min(
@@ -2226,7 +2226,9 @@ public:
                     if (!runtime_holder->has_value()) throw std::runtime_error("model runtime is unavailable");
                     mlx::core::set_default_device(mlx::core::Device::gpu);
                     mlx::core::set_default_stream(runtime_stream);
-                    mfq::metal::MlxResidentBudgetScope budget_scope([this](std::size_t bytes) { enforce_memory_budget(bytes); });
+                    mfq::metal::MlxResidentBudgetScope budget_scope(
+                        [this](std::size_t bytes) { enforce_memory_budget(bytes); },
+                        [this](std::size_t bytes) { return optional_memory_fits(bytes); });
                     auto& runtime = runtime_holder->value();
                     mfq::engine::LikelihoodResult result{value.prompt_tokens, {}};
                     std::optional<mlx::core::array> next_logprobs;
@@ -2280,6 +2282,13 @@ public:
     }
 
 private:
+    bool optional_memory_fits(std::size_t allocation) const {
+        const auto budget = resident_budget.load();
+        if (!budget || !runtime_holder->has_value()) return true;
+        const auto used = resident_memory_used() + mfq::metal::MlxResidentBudgetScope::temporary_bytes();
+        const auto reserve = std::min<std::size_t>(std::size_t{256} << 20, budget / 20);
+        return used <= budget && reserve <= budget - used && allocation <= budget - used - reserve;
+    }
     void enforce_memory_budget(std::size_t allocation) {
         const auto budget = resident_budget.load();
         if (!budget || !runtime_holder->has_value()) return;
@@ -2562,7 +2571,7 @@ private:
     void warm_runtime() {
         mfq::metal::MlxResidentBudgetScope budget_scope([this](std::size_t bytes) {
             enforce_memory_budget(bytes);
-        });
+        }, [this](std::size_t bytes) { return optional_memory_fits(bytes); });
         enforce_memory_budget(0);
         auto& runtime = runtime_holder->value();
         const auto generate = [&](const std::vector<std::int64_t>& prompt,
