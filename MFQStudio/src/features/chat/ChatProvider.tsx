@@ -8,6 +8,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type Context,
   type ReactNode,
 } from 'react';
 import { useLocation } from 'react-router';
@@ -248,6 +249,7 @@ function useChatDomain() {
       selectSession: conversation.selectSession,
       createSession: conversation.createSession,
       deleteSession: conversation.deleteSession,
+      renameSession: conversation.renameSession,
       conversationReady: conversation.conversationReady,
       modelAvailable: conversation.modelAvailable,
     }),
@@ -258,6 +260,7 @@ function useChatDomain() {
       conversation.selectSession,
       conversation.createSession,
       conversation.deleteSession,
+      conversation.renameSession,
       conversation.conversationReady,
       conversation.modelAvailable,
     ],
@@ -276,6 +279,17 @@ function useChatDomain() {
       setVoiceMessages((current) => current.filter((message) => message.sessionId !== id));
     }
   }, [conversation.sessions, conversation.transitioning, conversation.deleteSession, busy, setVoiceMessages]);
+
+  const deleteAllConversations = useCallback(async () => {
+    if (busy || conversation.transitioning || !conversation.sessions.length) return;
+    const revision = revisionRef.current;
+    if (!(await studioConfirm(trRef.current(
+      '删除此服务中的全部对话？包括消息与未发送的草稿，此操作无法撤销。',
+      'Delete all conversations on this server, including messages and unsent drafts? This cannot be undone.',
+    ))) || revision !== revisionRef.current) return;
+    const deleted = new Set(await conversation.deleteAllSessions());
+    if (deleted.size) setVoiceMessages((current) => current.filter((message) => !deleted.has(message.sessionId)));
+  }, [busy, conversation.transitioning, conversation.sessions.length, conversation.deleteAllSessions, setVoiceMessages]);
 
   /** 用户确认后用新会话替换旧会话，同时移除对应语音历史。 */
   const clearActiveConversation = useCallback(async () => {
@@ -374,6 +388,7 @@ function useChatDomain() {
       send,
       clearActiveConversation,
       deleteConversation,
+      deleteAllConversations,
       selectInteractionMode,
       toggleVoice,
       voiceComponentBusy,
@@ -391,6 +406,7 @@ function useChatDomain() {
       send,
       clearActiveConversation,
       deleteConversation,
+      deleteAllConversations,
       selectInteractionMode,
       toggleVoice,
       voiceComponentBusy,
@@ -399,7 +415,9 @@ function useChatDomain() {
   );
 }
 
-const ChatContext = createContext<ReturnType<typeof useChatDomain> | null>(null);
+const ChatContext: Context<ReturnType<typeof useChatDomain> | null> =
+  import.meta.hot?.data?.chatContext ?? createContext<ReturnType<typeof useChatDomain> | null>(null);
+if (import.meta.hot?.data) import.meta.hot.data.chatContext = ChatContext;
 
 /**
  * 维持聊天领域实例，页面卸载不会取消正在进行的文本生成。

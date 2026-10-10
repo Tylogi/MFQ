@@ -20,6 +20,25 @@ function bridge(snapshot = status) {
 }
 const actions = () => ({ busy: null, progress: null, download: vi.fn(), install: vi.fn(), refresh: vi.fn(), remove: vi.fn(), setAutomatic: vi.fn(), setAutomaticDownload: vi.fn() });
 
+it.each(['zh-CN', 'en'])('localizes Release labels without changing English (%s)', language => {
+  bridge();
+  const en = language === 'en';
+  const translate = (zh: string, english: string) => en ? english : zh;
+  const snapshot = { ...status, releases: [{ ...release, name: 'MFQ Studio 0.3.3', notes: 'Version notes' }] };
+  const { container, rerender } = render(<UpdateManager {...actions()} status={snapshot} tr={translate} />);
+  expect(screen.getByRole('heading', { name: en ? /^Release$/ : /^正式版$/ })).toBeInTheDocument();
+  expect(container.querySelector('.update-current-row small')).toHaveTextContent(en ? 'Release' : '正式版');
+  expect(container.querySelector('.local-version.current small')).toHaveTextContent(en ? 'Running · Release' : '正在运行 · 正式版');
+  expect(screen.getByRole('switch', { name: en ? 'Automatically download Release updates' : '自动下载正式版更新' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: en ? 'View v0.3.3 Release' : '查看 v0.3.3 正式版' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: en ? 'View all Releases' : '查看全部正式版' })).toBeInTheDocument();
+  if (!en) expect(container.textContent).not.toContain('Release');
+  rerender(<UpdateManager {...actions()} status={{ ...snapshot, current_release: false, releases: [] }} tr={translate} />);
+  expect(screen.getByText(en ? 'Development builds do not auto-download updates; choose a Release manually.' : '开发构建不参与自动下载；可手动选择正式版。')).toBeInTheDocument();
+  expect(screen.getByText(en ? 'No Release information yet. Check for updates when online.' : '暂无正式版信息，联网后检查更新。')).toBeInTheDocument();
+  if (!en) expect(container.textContent).not.toContain('Release');
+});
+
 it('shows Release notes without executable markup, and filters experimental entries', () => {
   bridge();
   const callbacks = actions();

@@ -2,7 +2,7 @@
  * ChatProvider 领域状态缓存与 Context 重渲染拦截测试。
  */
 
-import { act, render, renderHook, screen } from '@testing-library/react';
+import { act, render, renderHook, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { Profiler, type ProfilerOnRenderCallback, type ReactNode } from 'react';
 import { MemoryRouter } from 'react-router';
@@ -14,7 +14,9 @@ import { setVoiceLevel } from '../voice/voiceLevelStore';
 import { ChatComposer } from './components/ChatComposer';
 import { ChatToolbar } from './components/ChatToolbar';
 import { SavedMessageList } from './SavedMessageList';
-import type { JobResource, Message } from '../../shared/api/types';
+import type { JobResource, Message, Session } from '../../shared/api/types';
+import { sessionsApi } from '../../shared/api/resources/sessions';
+import { studioConfirm } from '../../studio';
 import { TooltipProvider } from '../../shared/ui/Tooltip';
 import { useJobStore } from '../../stores/jobStore';
 
@@ -73,6 +75,62 @@ vi.mock('../../shared/api/resources/sessions', async (importOriginal) => {
       listResponses: vi.fn().mockResolvedValue([]),
     },
   };
+});
+
+describe('ChatProvider conversation deletion confirmation', () => {
+  const first = { id: 'a', title: 'First chat', model: 'model-a', mode: 'text', revision: 0 } as Session;
+  const second = { ...first, id: 'b', title: 'Second chat' };
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <MemoryRouter initialEntries={['/chat']}><ChatProvider>{children}</ChatProvider></MemoryRouter>
+  );
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockRuntime.connectionRevision = 1;
+    useConversationStore.getState().reset();
+    useDraftStore.setState({ drafts: {} });
+    vi.mocked(sessionsApi.listSessions).mockResolvedValue([first, second]);
+    vi.mocked(studioConfirm).mockResolvedValue(true);
+    vi.spyOn(sessionsApi, 'deleteSession').mockResolvedValue(undefined);
+  });
+
+  it('cancelling confirmation preserves all conversations and drafts', async () => {
+    vi.mocked(studioConfirm).mockResolvedValue(false);
+    const { result } = renderHook(() => useChat(), { wrapper });
+    await waitFor(() => expect(useConversationStore.getState().sessions).toHaveLength(2));
+    useDraftStore.getState().setDraft(first.id, 'unsent');
+    await act(async () => { await result.current.deleteAllConversations(); });
+    expect(studioConfirm).toHaveBeenCalledWith(expect.stringContaining('cannot be undone'));
+    expect(sessionsApi.deleteSession).not.toHaveBeenCalled();
+    expect(useConversationStore.getState().sessions).toHaveLength(2);
+    expect(useDraftStore.getState().drafts[first.id]).toBe('unsent');
+  });
+
+  it('confirmed deletion clears conversations without creating a replacement', async () => {
+    const { result } = renderHook(() => useChat(), { wrapper });
+    await waitFor(() => expect(useConversationStore.getState().sessions).toHaveLength(2));
+    useDraftStore.getState().setDraft(first.id, 'unsent');
+    await act(async () => { await result.current.deleteAllConversations(); });
+    expect(sessionsApi.deleteSession).toHaveBeenCalledTimes(2);
+    expect(useConversationStore.getState().sessions).toEqual([]);
+    expect(useConversationStore.getState().activeId).toBeNull();
+    expect(useDraftStore.getState().drafts).toEqual({});
+  });
+
+  it('confirmation opened on the old connection cannot delete the new connection', async () => {
+    let confirm!: (accepted: boolean) => void;
+    vi.mocked(studioConfirm).mockImplementationOnce(() => new Promise(resolve => { confirm = resolve; }));
+    const { result, rerender } = renderHook(() => useChat(), { wrapper });
+    await waitFor(() => expect(useConversationStore.getState().sessions).toHaveLength(2));
+    let deletion!: Promise<void>;
+    act(() => { deletion = result.current.deleteAllConversations(); });
+    mockRuntime.connectionRevision = 2;
+    vi.mocked(sessionsApi.listSessions).mockResolvedValue([second]);
+    rerender();
+    await waitFor(() => expect(useConversationStore.getState().sessions).toEqual([second]));
+    await act(async () => { confirm(true); await deletion; });
+    expect(sessionsApi.deleteSession).not.toHaveBeenCalled();
+    expect(useConversationStore.getState().sessions).toEqual([second]);
+  });
 });
 vi.mock('../../studio', () => ({
   studioConfirm: vi.fn().mockResolvedValue(true),

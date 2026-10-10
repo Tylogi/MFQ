@@ -41,6 +41,19 @@ it('keeps one precision range even for large expert banks', () => {
   expect(precisionColor(1.8, 1.8, 6.2)).not.toBe(precisionColor(6.2, 1.8, 6.2));
 });
 
+it('uses a clamped gold-to-copper precision scale that darkens with bpw', () => {
+  const colors = [1, 3, 5, 7, 9].map(value => precisionColor(value, 1, 9).match(/\d+/g)!.map(Number));
+  expect(colors[0]).toEqual([245, 234, 216]);
+  expect(colors.at(-1)).toEqual([126, 70, 29]);
+  colors.forEach((color, index) => {
+    expect(color[0]).toBeGreaterThan(color[1]);
+    expect(color[1]).toBeGreaterThan(color[2]);
+    if (index) color.forEach((channel, i) => expect(channel).toBeLessThan(colors[index - 1][i]));
+  });
+  expect(precisionColor(-1, 1, 9)).toBe(precisionColor(1, 1, 9));
+  expect(precisionColor(12, 1, 9)).toBe(precisionColor(9, 1, 9));
+});
+
 it('separates MoE and Attention budgets and excludes PLE from every layer total', () => {
   const analysis = analysisFixture();
   const tensor = (category: string, parameters: number, stored_bytes: number, layer: number | null = 0): AnalysisTensor =>

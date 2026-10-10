@@ -12,8 +12,8 @@ import { request, apiUrl, errorFromResponse, authorizedHeaders } from '../client
 
 export const sessionsApi = {
   /** 获取最近的会话列表，供侧栏与会话选择使用。 */
-  async listSessions(): Promise<Session[]> {
-    return (await request<{ data: Session[] }>('/api/v1/sessions?limit=200')).data;
+  async listSessions(offset = 0): Promise<Session[]> {
+    return (await request<{ data: Session[] }>('/api/v1/sessions?limit=200' + (offset ? `&offset=${offset}` : ''))).data;
   },
 
   /** 按模型和交互模式创建会话，返回服务端分配的标识与版本。 */

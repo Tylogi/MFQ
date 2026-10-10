@@ -4,6 +4,7 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import { sessionsApi } from '../../../shared/api/resources/sessions';
 import type { Session, Message, RuntimeInstance } from '../../../shared/api/types';
 import { useConversationStore } from '../state/conversationStore';
+import { useDraftStore } from '../state/draftStore';
 import { useConversationSessions } from './useConversationSessions';
 
 const runtime = vi.hoisted(() => ({
@@ -20,6 +21,7 @@ const second = { ...first, id: 'b', title: 'B' };
 
 beforeEach(() => {
   useConversationStore.getState().reset();
+  useDraftStore.setState({ drafts: {} });
   runtime.ready = true;
   runtime.connectionRevision = 1;
   runtime.selectedModel = 'model-a';
@@ -31,6 +33,7 @@ beforeEach(() => {
   vi.spyOn(sessionsApi, 'listResponses').mockResolvedValue([]);
   vi.spyOn(sessionsApi, 'forkSession').mockResolvedValue({ ...first, id: 'fork', model: 'model-b' });
   vi.spyOn(sessionsApi, 'deleteSession').mockResolvedValue(undefined);
+  vi.spyOn(sessionsApi, 'updateSession').mockImplementation(async (id, update) => ({ ...first, id, ...update } as Session));
 });
 
 it('连接版本变化后丢弃旧列表请求并加载新连接的会话', async () => {
@@ -168,5 +171,132 @@ it('删除期间连接切换不回写旧连接的结果', async () => {
   rerender();
   await waitFor(() => expect(result.current.activeId).toBe('b'));
   await act(async () => { resolveDelete(); expect(await deletion).toBe(false); });
+  expect(result.current.sessions).toEqual([second]);
+});
+
+it('删除全部会话后清除历史和对应草稿，不新建空会话', async () => {
+  useDraftStore.setState({ drafts: { a: 'draft A', b: 'draft B', unrelated: 'keep' } });
+  const create = vi.spyOn(sessionsApi, 'createSession');
+  const { result } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.conversationReady).toBe(true));
+  await act(async () => expect(await result.current.deleteAllSessions()).toEqual(['a', 'b']));
+  expect(sessionsApi.deleteSession).toHaveBeenCalledTimes(2);
+  expect(result.current.sessions).toEqual([]);
+  expect(result.current.activeId).toBeNull();
+  expect(result.current.messages).toEqual([]);
+  expect(result.current.responses).toEqual({});
+  expect(useDraftStore.getState().drafts).toEqual({ unrelated: 'keep' });
+  expect(create).not.toHaveBeenCalled();
+});
+
+it('批量删除覆盖第200条之后的会话，先取完分页再删除', async () => {
+  const page = Array.from({ length: 200 }, (_, index) => ({ ...first, id: `chat-${index}` }));
+  const last = { ...second, id: 'older-chat' };
+  vi.mocked(sessionsApi.listSessions).mockResolvedValueOnce(page).mockResolvedValueOnce(page).mockResolvedValueOnce([last]);
+  const { result } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.activeId).toBe('chat-0'));
+  await act(async () => expect(await result.current.deleteAllSessions()).toHaveLength(201));
+  expect(sessionsApi.listSessions).toHaveBeenNthCalledWith(2, 0);
+  expect(sessionsApi.listSessions).toHaveBeenNthCalledWith(3, 200);
+  expect(sessionsApi.deleteSession).toHaveBeenCalledTimes(201);
+  expect(sessionsApi.deleteSession).toHaveBeenLastCalledWith('older-chat');
+  expect(vi.mocked(sessionsApi.listSessions).mock.invocationCallOrder[2]).toBeLessThan(vi.mocked(sessionsApi.deleteSession).mock.invocationCallOrder[0]);
+  expect(result.current.sessions).toEqual([]);
+});
+
+it('批量删除部分失败只移除成功项，并保留剩余会话和草稿', async () => {
+  useDraftStore.setState({ drafts: { a: 'A', b: 'B' } });
+  vi.mocked(sessionsApi.deleteSession).mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('response in progress'));
+  const { result } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.conversationReady).toBe(true));
+  await act(async () => expect(await result.current.deleteAllSessions()).toEqual(['a']));
+  expect(result.current.sessions).toEqual([second]);
+  expect(result.current.activeId).toBe('b');
+  expect(result.current.error).toContain('response in progress');
+  expect(useDraftStore.getState().drafts).toEqual({ b: 'B' });
+});
+
+it('批量读取失败时不开始删除', async () => {
+  vi.mocked(sessionsApi.listSessions).mockResolvedValueOnce([first, second]).mockRejectedValueOnce(new Error('offline'));
+  const { result } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.conversationReady).toBe(true));
+  await act(async () => expect(await result.current.deleteAllSessions()).toEqual([]));
+  expect(sessionsApi.deleteSession).not.toHaveBeenCalled();
+  expect(result.current.sessions).toEqual([first, second]);
+  expect(result.current.error).toContain('offline');
+});
+
+it('批量删除期间禁用发送，切换连接后停止后续删除且不污染新列表', async () => {
+  let resolveDelete!: () => void;
+  vi.mocked(sessionsApi.deleteSession).mockImplementationOnce(() => new Promise((resolve) => { resolveDelete = resolve; }));
+  const { result, rerender } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.conversationReady).toBe(true));
+  let deletion!: Promise<string[]>;
+  act(() => { deletion = result.current.deleteAllSessions(); });
+  await waitFor(() => expect(sessionsApi.deleteSession).toHaveBeenCalledOnce());
+  expect(result.current.conversationReady).toBe(false);
+  runtime.connectionRevision = 2;
+  vi.mocked(sessionsApi.listSessions).mockResolvedValueOnce([second]);
+  rerender();
+  await waitFor(() => expect(result.current.activeId).toBe('b'));
+  await act(async () => { resolveDelete(); expect(await deletion).toEqual([]); });
+  expect(sessionsApi.deleteSession).toHaveBeenCalledOnce();
+  expect(result.current.sessions).toEqual([second]);
+  expect(result.current.transitioning).toBe(false);
+});
+
+it('重命名沿用同一会话和历史并保存服务器返回的版本', async () => {
+  const message = { id: 'message-a', role: 'user', parts: [], parent_id: null, created_at: '' } as Message;
+  vi.mocked(sessionsApi.listMessages).mockResolvedValue([message]);
+  vi.mocked(sessionsApi.updateSession).mockResolvedValueOnce({ ...first, title: 'Renamed', revision: 1 });
+  const { result } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.conversationReady).toBe(true));
+  await act(async () => expect(await result.current.renameSession('a', '  Renamed  ')).toBe(true));
+  expect(sessionsApi.updateSession).toHaveBeenCalledWith('a', { title: 'Renamed' });
+  expect(result.current.active?.title).toBe('Renamed');
+  expect(result.current.active?.revision).toBe(1);
+  expect(result.current.activeId).toBe('a');
+  expect(result.current.messages).toEqual([message]);
+  expect(sessionsApi.forkSession).not.toHaveBeenCalled();
+});
+
+it('无效名称不请求，重命名失败保留原名称', async () => {
+  vi.mocked(sessionsApi.updateSession).mockRejectedValueOnce(new Error('rename failed'));
+  const { result } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.conversationReady).toBe(true));
+  await act(async () => {
+    expect(await result.current.renameSession('a', '  ')).toBe(false);
+    expect(await result.current.renameSession('a', 'x'.repeat(513))).toBe(false);
+    expect(await result.current.renameSession('a', 'A')).toBe(true);
+  });
+  expect(sessionsApi.updateSession).not.toHaveBeenCalled();
+  await act(async () => expect(await result.current.renameSession('a', 'Renamed')).toBe(false));
+  expect(result.current.active?.title).toBe('A');
+  expect(result.current.error).toContain('rename failed');
+});
+
+it('生成期间不删除全部或重命名', async () => {
+  const { result } = renderHook(() => useConversationSessions(true, true));
+  await waitFor(() => expect(result.current.activeId).toBe('a'));
+  await act(async () => {
+    expect(await result.current.deleteAllSessions()).toEqual([]);
+    expect(await result.current.renameSession('a', 'New')).toBe(false);
+  });
+  expect(sessionsApi.deleteSession).not.toHaveBeenCalled();
+  expect(sessionsApi.updateSession).not.toHaveBeenCalled();
+});
+
+it('连接变化后不回写旧重命名结果', async () => {
+  let resolveRename!: (session: Session) => void;
+  vi.mocked(sessionsApi.updateSession).mockImplementationOnce(() => new Promise((resolve) => { resolveRename = resolve; }));
+  const { result, rerender } = renderHook(() => useConversationSessions(true, false));
+  await waitFor(() => expect(result.current.conversationReady).toBe(true));
+  let rename!: Promise<boolean>;
+  act(() => { rename = result.current.renameSession('a', 'Old server'); });
+  runtime.connectionRevision = 2;
+  vi.mocked(sessionsApi.listSessions).mockResolvedValueOnce([second]);
+  rerender();
+  await waitFor(() => expect(result.current.activeId).toBe('b'));
+  await act(async () => { resolveRename({ ...first, title: 'Old server' }); expect(await rename).toBe(false); });
   expect(result.current.sessions).toEqual([second]);
 });

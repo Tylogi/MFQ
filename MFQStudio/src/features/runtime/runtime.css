@@ -9,6 +9,7 @@
   padding: 24px;
 }
 .runtime-hero-copy { display: grid; min-width: 0; gap: 5px; }
+.runtime-hero .model-monogram.ready, .overview-model-card .model-monogram.ready { color: var(--ink-soft); }
 .runtime-hero-copy > div { display: flex; min-width: 0; align-items: center; gap: 9px; }
 .runtime-hero h2 { overflow: hidden; margin: 0; color: var(--ink-strong); font-size: 20px; font-weight: 650; letter-spacing: -0.025em; text-overflow: ellipsis; white-space: nowrap; }
 .runtime-hero-copy > p.runtime-endpoint {
@@ -36,6 +37,7 @@
 .runtime-hero-actions button:hover { border-color: var(--line-strong); background: var(--surface-hover); }
 .runtime-hero-actions button.primary { border-color: var(--accent); color: var(--on-accent); background: var(--accent); font-weight: 700; }
 .runtime-hero-actions button.primary:hover { border-color: var(--accent-hover); background: var(--accent-hover); }
+.runtime-hero-actions button.runtime-hero-chat { --accent: var(--ink-soft); --accent-hover: var(--ink); --on-accent: var(--surface); }
 
 .overview-models-panel { padding: 11px; }
 .overview-model-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 8px; }
