@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { runtimeApi, type PrefixCacheInventory, type PrefixCacheText, type PrefixCacheFilters } from '../../shared/api/resources/runtime';
 import { ListToolbar } from '../../shared/ui/ListToolbar';
 import { useRuntime } from '../../app/RuntimeProvider';
+import { hasSeparateVram } from './memoryArchitecture';
 import { useConnectionScope } from '../../app/useConnectionScope';
 import { useSettings } from '../settings/SettingsProvider';
 import { Icon, SectionLabel, TMPanel } from '../../app/display';
@@ -18,7 +19,7 @@ export function PrefixCacheInventoryPanel() {
 
 function CacheInventory() {
   const { tr } = useSettings();
-  const { refreshRuntime } = useRuntime();
+  const { refreshRuntime, runtime } = useRuntime();
   const connectionScope = useConnectionScope();
   const [inventory, setInventory] = useState<PrefixCacheInventory | null>(null);
   const [detail, setDetail] = useState<PrefixCacheInventory | null>(null);
@@ -109,7 +110,8 @@ function CacheInventory() {
     const message = namespace
       ? tr(`清理此缓存组（${formatBytes(group?.bytes ?? 0)}）？模型文件和聊天记录不会删除。`,
           `Clear this cache group (${formatBytes(group?.bytes ?? 0)})? Model files and chat history will be kept.`)
-      : tr(`清理全部前缀缓存（${formatBytes(inventory.total_bytes)}），包括未载入模型的 SSD 缓存与 RAM 热缓存？模型文件和聊天记录不会删除。`,
+      : hasSeparateVram(runtime) ? tr(`清理全部前缀缓存（${formatBytes(inventory.total_bytes)}），包括未载入模型的 SSD 缓存与显存热缓存？模型文件和聊天记录不会删除。`,
+          `Clear all prefix caches (${formatBytes(inventory.total_bytes)}), including unloaded models’ SSD caches and VRAM hot caches? Model files and chat history will be kept.`) : tr(`清理全部前缀缓存（${formatBytes(inventory.total_bytes)}），包括未载入模型的 SSD 缓存与 RAM 热缓存？模型文件和聊天记录不会删除。`,
           `Clear all prefix caches (${formatBytes(inventory.total_bytes)}), including unloaded models’ SSD caches and RAM hot caches? Model files and chat history will be kept.`);
     clearing.current = true;
     setBusy(true);

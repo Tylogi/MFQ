@@ -1262,6 +1262,13 @@ bool moe_expert_cache_has_sources(
     return cache && cache->has_sources();
 }
 
+std::vector<std::pair<std::string, double>> moe_expert_memory_metrics(
+        const std::shared_ptr<MoeExpertCache>& cache) {
+    return cache ? cache->memory_metrics() : std::vector<std::pair<std::string, double>>{
+        {"ram_expert_enabled", 0.0}, {"ram_expert_payload_bytes", 0.0},
+        {"ram_expert_pcie_read_bytes", 0.0}};
+}
+
 bool moe_expert_cache_finalized(
         const std::shared_ptr<MoeExpertCache>& cache) {
     return cache && cache->finalized();

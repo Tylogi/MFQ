@@ -6,6 +6,12 @@
 #include <string>
 
 namespace mfq::cuda::runtime_options {
+struct QsaKvOffloadOptions {
+    std::size_t gpu_budget_bytes = 0;
+    std::size_t ram_budget_bytes = 4ULL << 30;
+    std::string directory;
+};
+QsaKvOffloadOptions qsa_kv_offload();
 // Keep dynamic diagnostic/ablation options at the execution boundary. Values
 // are read on access so changing an option before graph capture remains valid.
 bool resident_plan_overlap();

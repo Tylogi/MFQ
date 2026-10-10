@@ -8,6 +8,7 @@ import { useJobStore } from '../../stores/jobStore';
 import { SettingRow } from '../../app/display';
 import { errorMessage } from '../../app/formatters';
 import { toast } from '../../stores/toastStore';
+import { hasSeparateVram, residentMemoryCapacity } from '../runtime/memoryArchitecture';
 
 export function MemoryBudgetControls({ residency }: { residency: string }) {
   const { tr } = useSettings();
@@ -24,7 +25,11 @@ export function MemoryBudgetControls({ residency }: { residency: string }) {
   const [saving, setSaving] = useState(false);
   const jobs = useJobStore((state) => state.jobs);
   const pending = jobs.some((job) => job.kind === 'runtime.memory.configure' && ['queued', 'running', 'cancelling'].includes(job.status));
-  const effectiveTotal = runtime?.runtime_memory_effective_budget_bytes ?? totalDetected;
+  const separate = hasSeparateVram(runtime);
+  const totalLabel = separate ? tr('总显存常驻预算', 'Total resident VRAM budget') : tr('总常驻内存预算', 'Total resident memory budget');
+  const modelLabel = separate ? tr('模型显存驻留', 'Model VRAM residency') : tr('模型总驻留', 'Total model residency');
+  const prefixLabel = separate ? tr('前缀显存配额', 'Prefix VRAM allowance') : tr('前缀 RAM 配额', 'Prefix RAM allowance');
+  const effectiveTotal = residentMemoryCapacity(runtime) ?? totalDetected;
   useEffect(() => {
     let disposed = false;
     void runtimeApi.memoryPolicy().then((policy) => {
@@ -73,16 +78,16 @@ export function MemoryBudgetControls({ residency }: { residency: string }) {
     </div>;
   }
   return <>
-    <SettingRow title={tr('总常驻内存预算', 'Total resident memory budget')}
-      detail={tr('权重、活跃 KV 和前缀 RAM 共用此预算；接近上限时，先将前缀缓存移至 SSD，再减少常驻专家。', 'Weights, live KV and prefix RAM share this budget; near the limit, move prefix caches to SSD before reducing resident experts.')}
-      trailing={<>{control(tr('总常驻内存预算', 'Total resident memory budget'), totalManual, setTotalManual, totalDraft, setTotalDraft, 0.1)}
+    <SettingRow title={totalLabel}
+      detail={separate ? tr('显存权重、活跃 KV 与显存热前缀共用此预算；前缀冷层在 SSD，流式专家与 KV 的 RAM 占用单独统计。', 'VRAM weights, live KV and hot prefixes share this budget. Cold prefixes reside on SSD; RAM-streamed experts and KV are accounted separately.') : tr('权重、活跃 KV 和前缀 RAM 共用此预算；接近上限时，先将前缀缓存移至 SSD，再减少常驻专家。', 'Weights, live KV and prefix RAM share this budget; near the limit, move prefix caches to SSD before reducing resident experts.')}
+      trailing={<>{control(totalLabel, totalManual, setTotalManual, totalDraft, setTotalDraft, 0.1)}
         {!totalManual && effectiveTotal != null && <small className="memory-budget-available">{(effectiveTotal / 2 ** 30).toFixed(1)} GiB</small>}</>} />
-    <SettingRow title={tr('模型总驻留', 'Total model residency')}
-      detail={tr('所有模型权重的总上限；放不下的 MoE 专家自动转为 SSD 缓存。', 'Total weight ceiling across models; overflowing MoE experts use SSD-backed caching.')}
-      trailing={control(tr('模型总驻留', 'Total model residency'), modelManual, setModelManual, modelDraft, setModelDraft, 0.1)} />
-    <SettingRow title={tr('前缀 RAM 配额', 'Prefix RAM allowance')}
-      detail={tr('所有模型可复用前缀的 RAM 上限，不含活跃 KV。', 'RAM limit for reusable prefixes across models; excludes active KV.')}
-      trailing={control(tr('前缀 RAM 配额', 'Prefix RAM allowance'), prefixManual, setPrefixManual, prefixDraft, setPrefixDraft, 0)} />
+    <SettingRow title={modelLabel}
+      detail={separate ? tr('所有模型权重的显存上限；放不下的 MoE 专家在 RAM 中按需传入显存，SSD 专家流式加载尚未支持。', 'VRAM ceiling across model weights; overflowing MoE experts stream from RAM to VRAM. SSD expert streaming is not yet supported.') : tr('所有模型权重的总上限；放不下的 MoE 专家自动转为 SSD 缓存。', 'Total weight ceiling across models; overflowing MoE experts use SSD-backed caching.')}
+      trailing={control(modelLabel, modelManual, setModelManual, modelDraft, setModelDraft, 0.1)} />
+    <SettingRow title={prefixLabel}
+      detail={separate ? tr('所有模型可复用前缀的显存上限，不含活跃 KV；冷前缀直接存入 SSD，不保留 RAM 缓存层。', 'VRAM limit for reusable prefixes, excluding live KV. Cold prefixes go directly to SSD without a RAM cache tier.') : tr('所有模型可复用前缀的 RAM 上限，不含活跃 KV。', 'RAM limit for reusable prefixes across models; excludes active KV.')}
+      trailing={control(prefixLabel, prefixManual, setPrefixManual, prefixDraft, setPrefixDraft, 0)} />
     <div className="memory-budget-actions"><small>{tr('当前模型驻留', 'Current weight residency')}: {residency}</small>
       <button disabled={!available || saving || pending || !valid} onClick={() => void apply()} type="button">
         {saving || pending ? tr('应用中…', 'Applying…') : tr('应用预算', 'Apply budgets')}

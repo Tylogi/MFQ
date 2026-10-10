@@ -90,10 +90,40 @@ def test_non_qsa_config_cannot_bypass_capability_with_its_name(tmp_path):
         asyncio.run(pool._validate_qsa_kv_policy(model, QsaKvOffloadPolicy(enabled=True)))
 
 
-def test_cuda_cannot_enable_metal_only_feature(tmp_path):
+def test_cuda_qsa_offload_supports_ram_budget_and_unified_devices(tmp_path, monkeypatch):
+    model = artifact(tmp_path)
     pool = RuntimePool(ModelCatalog([]), tmp_path / "native", backend="cuda")
-    with pytest.raises(JobExecutionError, match="Metal QSA"):
-        asyncio.run(pool._validate_qsa_kv_policy(artifact(tmp_path), QsaKvOffloadPolicy(enabled=True)))
+    policy = QsaKvOffloadPolicy(enabled=True, ram_budget_bytes=3 << 30)
+    assert asyncio.run(pool._validate_qsa_kv_policy(model, policy)) > 0
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.native_tokenizer_arguments", lambda *_: [])
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.memory_topology", lambda: {"memory_architecture": "discrete"})
+    _, environment = pool._launch_configuration(model, ModelLoadRequest(model=model.resource.name, qsa_kv_offload=policy), port=0)
+    assert environment["MFQ_QSA_KV_RAM_BUDGET_BYTES"] == str(3 << 30)
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.memory_topology", lambda: {"memory_architecture": "unified"})
+    _, environment = pool._launch_configuration(model, ModelLoadRequest(model=model.resource.name, qsa_kv_offload=policy), port=0)
+    assert environment["MFQ_QSA_KV_RAM_BUDGET_BYTES"] == "0"
+
+
+def test_cuda_ram_budget_automatic_sizing_and_stale_environment(tmp_path, monkeypatch):
+    model = artifact(tmp_path)
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.native_tokenizer_arguments", lambda *_: [])
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.memory_topology", lambda: {"memory_architecture": "discrete"})
+    monkeypatch.setattr("mfq.server.runtime.runtime_pool.host_memory_capacity", lambda: (32 << 30, 8 << 30))
+    pool = RuntimePool(ModelCatalog([]), tmp_path / "native", backend="cuda",
+        runtime_environment={"MFQ_QSA_KV_RAM_BUDGET_BYTES": "999"})
+    _, environment = pool._launch_configuration(model, ModelLoadRequest(model=model.resource.name,
+        qsa_kv_offload={"enabled": True}), port=0)
+    assert environment["MFQ_QSA_KV_RAM_BUDGET_BYTES"] == str(2 << 30)
+    _, environment = pool._launch_configuration(model, ModelLoadRequest(model=model.resource.name), port=0)
+    assert "MFQ_QSA_KV_RAM_BUDGET_BYTES" not in environment
+
+
+def test_cuda_selected_context_buffer_is_validated_before_reload(tmp_path):
+    model = artifact(tmp_path)
+    pool = RuntimePool(ModelCatalog([]), tmp_path / "native", backend="cuda")
+    with pytest.raises(JobExecutionError, match="one selected context"):
+        asyncio.run(pool._validate_qsa_kv_policy(model, QsaKvOffloadPolicy(enabled=True, budget_bytes=128 << 10)))
+    assert qsa_index_requirement(model, 262144, cuda=True) == 13 * 128 * (262144 + 65536) * 2
 
 
 def test_launch_off_is_not_overridden_by_inherited_environment(tmp_path, monkeypatch):
@@ -199,7 +229,7 @@ def test_preflight_does_not_create_jobs_for_non_qsa_but_accepts_fractional_budge
             manager.qsa_kv_offload_info.return_value = {"supported": True}
             response = await client.put("/api/v1/runtime/qsa-kv", json=payload)
             assert response.status_code == 202
-            assert service.create_job.await_args.args[0].payload == payload
+            assert service.create_job.await_args.args[0].payload == {**payload, "ram_budget_bytes": None}
     asyncio.run(run())
 
 

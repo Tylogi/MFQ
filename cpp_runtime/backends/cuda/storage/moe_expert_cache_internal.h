@@ -646,6 +646,14 @@ public:
         }
     }
 
+    std::vector<std::pair<std::string, double>> memory_metrics() const {
+        const auto host = host_experts_->stats();
+        const auto resident = std::size_t(std::max<int64_t>(0, host_bytes_)) + host.resident_bytes;
+        return {{"ram_expert_enabled", resident > 0 ? 1.0 : 0.0},
+            {"ram_expert_payload_bytes", double(resident)},
+            {"ram_expert_pcie_read_bytes", double(stats_.ram_pcie_bytes)}};
+    }
+
 private:
     struct DmaCallSample {
         int layer=0,tokens=0,entries=0;

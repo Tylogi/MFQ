@@ -78,6 +78,21 @@ public:
     }
     std::size_t max_bytes() const noexcept { return config_.max_bytes; }
 
+    std::uint64_t trim(std::size_t target_bytes) {
+        const auto previous = bytes_;
+        const auto limit = config_.max_bytes;
+        config_.max_bytes = std::min(limit, target_bytes);
+        evict_to_budget({}, 0);
+        config_.max_bytes = limit;
+        sync_metrics();
+        return previous - bytes_;
+    }
+
+    std::uint64_t set_limit(std::size_t max_bytes) {
+        config_.max_bytes = max_bytes;
+        return trim(max_bytes);
+    }
+
     template <typename Eligible>
     std::optional<Match> find_best(
             const std::string& requested_session,

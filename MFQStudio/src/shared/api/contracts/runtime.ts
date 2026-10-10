@@ -53,6 +53,11 @@ export interface RuntimeRequestMetrics {
 }
 
 export interface RuntimeStatus {
+  memory_architecture?: 'unified' | 'discrete' | 'unknown';
+  unified_memory?: boolean | null;
+  host_memory_total_bytes?: number | null;
+  device_memory_total_bytes?: number | null;
+  prefix_cache_hot_tier?: 'vram' | 'ram' | null;
   instance_id?: string;
   runtime_state?: string;
   model?: string;
@@ -155,7 +160,8 @@ export interface RuntimeResources {
   cpu_name?: string | null;
   cpu_cores?: number | null;
   cpu_utilization_percent: number | null;
-  gpus: { name: string; core_count?: number | null; utilization_percent: number | null }[];
+  gpus: { name: string; core_count?: number | null; utilization_percent: number | null;
+    memory_total_bytes?: number | null; memory_used_bytes?: number | null; memory_available_bytes?: number | null }[];
   memory_total_bytes?: number | null;
   memory_used_bytes?: number | null;
   memory_available_bytes?: number | null;
@@ -177,6 +183,11 @@ export interface RuntimeModel {
 }
 
 export interface RuntimeMemoryResources {
+  ram_experts?: boolean | null;
+  ram_expert_bytes?: number | null;
+  ram_kv?: boolean | null;
+  ram_kv_bytes?: number | null;
+  ram_kv_limit_bytes?: number | null;
   resident_weight_bytes: number | null;
   wired_bytes?: number | null;
   wired_limit_bytes?: number | null;
@@ -222,7 +233,7 @@ export interface RuntimeInstance {
   qsa_kv_offload_supported?: boolean;
   kv_quantization_supported?: boolean;
   kv_quantization?: { enabled: boolean; bits: 2 | 2.5 | 3 | 3.5 | 4 | 6 | 8; algorithm: 'turboquant' };
-  qsa_kv_offload?: { enabled: boolean; budget_bytes: number; target_context: number };
+  qsa_kv_offload?: { enabled: boolean; budget_bytes: number; ram_budget_bytes?: number | null; target_context: number };
   error?: ApiErrorBody['error'] | null;
 }
 

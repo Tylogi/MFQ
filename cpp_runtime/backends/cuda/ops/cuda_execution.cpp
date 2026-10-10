@@ -329,6 +329,12 @@ std::optional<bool> qsa_prefill_fused() {
     const auto* value=std::getenv("MFQ_QSA_PREFILL_FUSED");
     return value ? std::optional<bool>(std::atoi(value) != 0) : std::nullopt;
 }
+
+QsaKvOffloadOptions qsa_kv_offload() {
+    return {environment_size("MFQ_QSA_KV_BUDGET_BYTES", 0),
+        environment_size("MFQ_QSA_KV_RAM_BUDGET_BYTES", 4ULL << 30),
+        environment("MFQ_RUNTIME_PREFIX_CACHE_DIR").value_or("")};
+}
 std::optional<bool> qsa_select_fused() {
     const auto* value=std::getenv("MFQ_QSA_SELECT_FUSED");
     return value ? std::optional<bool>(value[0] != '0') : std::nullopt;

@@ -12,7 +12,7 @@ QSA_KV_BUFFER_BYTES = 64 << 20
 
 
 def qsa_index_requirement(artifact: DiscoveredModel, context: int, budget_bytes: int | None = None,
-    *, maximum_context: int | None = None) -> int:
+    *, maximum_context: int | None = None, cuda: bool = False) -> int:
     with open_mmap(artifact.path) as store:
         record = store.records.get(MODEL_CONFIG_ASSET)
         if record is None or record.nbytes > 4 << 20:
@@ -55,4 +55,11 @@ def qsa_index_requirement(artifact: DiscoveredModel, context: int, budget_bytes:
             buffer = max(4096, heads * dimension * 4 * ratio * 4, width * 16 * 4 * 2)
             if min(heads, dimension) <= 0 or min(QSA_KV_BUFFER_BYTES, budget_bytes // 4) < buffer:
                 raise ValueError(f"QSA KV budget needs at least {buffer * 4} bytes for microblock I/O; this is not an indexer residency requirement")
+            if cuda:
+                selected = min(context, integer("indexer_budget", 2048) + ratio - 1)
+                staging = selected * heads * dimension * 4 * 4
+                if min(QSA_KV_BUFFER_BYTES, budget_bytes // 4) < staging:
+                    raise ValueError(f"CUDA QSA KV budget needs at least {staging * 4} bytes for one selected context")
+        if cuda:
+            return layers * width * (context + context // ratio) * 2
         return layers * (width * ((ratio + 5) * 2 + (context // ratio) * 4) + 2)

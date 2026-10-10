@@ -139,6 +139,16 @@ def test_gpu_statistics_missing_is_not_idle(monkeypatch):
                                    {"name": "GPU 2", "core_count": None, "utilization_percent": None}]
 
 
+def test_discrete_gpu_memory_is_measured_separately_from_host_ram(monkeypatch):
+    monkeypatch.setattr(module.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(module, "_command", lambda _: "NVIDIA RTX 3090 Ti, 50, 24576, 2048, 22528\nNVIDIA GB10, N/A, N/A, N/A, N/A")
+    values = module._gpu_usage()
+    assert values[0]["memory_total_bytes"] == 24 << 30
+    assert values[0]["memory_used_bytes"] == 2 << 30
+    assert values[0]["memory_available_bytes"] == 22 << 30
+    assert values[1]["memory_total_bytes"] is None and values[1]["utilization_percent"] is None
+
+
 def test_streamed_kv_rates_track_completed_file_io_per_instance(monkeypatch):
     clock = iter([10, 12, 14, 16, 18, 30, 32])
     monkeypatch.setattr(module.time, "monotonic", lambda: next(clock))

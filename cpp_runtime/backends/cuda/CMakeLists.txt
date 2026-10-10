@@ -320,6 +320,7 @@ set(MFQ_CUDA_MODEL_SOURCES
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/ops.cpp
     ${MFQ_CUDA_ROOT}/models/deepseek_v41/dspark.cpp
     ${MFQ_CUDA_ROOT}/models/qwen4_exp/ops.cpp
+    ${MFQ_CUDA_ROOT}/runtime/kv_offload.cpp
     ${MFQ_CUDA_ROOT}/models/glm5_next/ops.cpp
     ${MFQ_CUDA_ROOT}/models/gemma4/ops.cpp
     ${MFQ_CUDA_ROOT}/models/glm_dsa/ops.cpp
@@ -581,6 +582,7 @@ if(BUILD_TESTING)
     target_compile_definitions(mfq-window-attention-test PRIVATE MFQ_NATIVE_CUDA_RUNTIME=1 NOMINMAX)
     target_link_libraries(mfq-window-attention-test PRIVATE mfq-cuda-runtime)
     add_test(NAME mfq-window-attention-test COMMAND mfq-window-attention-test)
+    add_test(NAME mfq-cuda-qsa-kv-offload-test COMMAND mfq-window-attention-test --qsa-kv-offload-check)
     mfq_configure_cuda_runtime_target(mfq-nint-row-pipeline-test)
     target_link_libraries(mfq-nint-row-pipeline-test PRIVATE mfq-cuda-runtime)
 

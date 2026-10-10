@@ -530,6 +530,7 @@ class RuntimeInferencePolicy(ProtocolModel):
 class QsaKvStorageSettings(ProtocolModel):
     enabled: bool = False
     budget_bytes: int = Field(default=2 << 30, ge=1, le=1 << 50)
+    ram_budget_bytes: int | None = Field(default=None, ge=0, le=1 << 50)
 
 
 class KvQuantizationSettings(ProtocolModel):
@@ -562,6 +563,7 @@ class RuntimeModelAliases(ProtocolModel):
 class QsaKvOffloadPolicy(ProtocolModel):
     enabled: bool = False
     budget_bytes: int = Field(default=2 << 30, ge=1, le=1 << 50)
+    ram_budget_bytes: int | None = Field(default=None, ge=0, le=1 << 50)
     target_context: int = Field(default=262144, ge=512, le=2147483647)
 
 
@@ -569,6 +571,7 @@ class ConfigureQsaKvOffloadRequest(ProtocolModel):
     instance_id: UUID
     enabled: bool = False
     budget_bytes: int = Field(default=2 << 30, ge=1, le=1 << 50)
+    ram_budget_bytes: int | None = Field(default=None, ge=0, le=1 << 50)
 
 
 class ModelLoadRequest(ProtocolModel):
@@ -711,6 +714,9 @@ class RuntimeGpuUtilization(ProtocolModel):
     name: str
     core_count: int | None = Field(default=None, ge=1)
     utilization_percent: float | None = Field(default=None, ge=0, le=100)
+    memory_total_bytes: int | None = Field(default=None, ge=0)
+    memory_used_bytes: int | None = Field(default=None, ge=0)
+    memory_available_bytes: int | None = Field(default=None, ge=0)
 
 
 class RuntimeDiskTraffic(ProtocolModel):
@@ -765,6 +771,11 @@ class RuntimeMemoryResources(ProtocolModel):
     prefix_cache_blocks: int | None = Field(default=None, ge=0)
     prefix_cache_bytes: int | None = Field(default=None, ge=0)
     prefix_cache_limit_bytes: int | None = Field(default=None, ge=0)
+    ram_experts: bool | None = None
+    ram_expert_bytes: int | None = Field(default=None, ge=0)
+    ram_kv: bool | None = None
+    ram_kv_bytes: int | None = Field(default=None, ge=0)
+    ram_kv_limit_bytes: int | None = Field(default=None, ge=0)
     ssd_experts: bool | None = None
     ssd_expert_bytes: int | None = Field(default=None, ge=0)
     ssd_ple: bool | None = None

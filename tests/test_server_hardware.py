@@ -39,6 +39,8 @@ def test_apple_identity_is_cached_without_inference_imports(monkeypatch):
 
 
 def test_windows_cpu_gpu_and_ram_names(monkeypatch):
+    monkeypatch.setattr(hardware, "_nvidia_memory", lambda: ())
+    monkeypatch.setattr(hardware, "_amd_memory", lambda: ())
     monkeypatch.setattr(hardware.platform, "system", lambda: "Windows")
     monkeypatch.setattr(hardware, "_command", lambda argv: json.dumps({
         "cpu_name": "AMD Ryzen 5 9600X", "cpu_cores": 6,
@@ -121,6 +123,32 @@ def test_nvml_unsupported_optional_queries_do_not_discard_capacity(monkeypatch):
     del library.nvmlDeviceGetMaxClockInfo, library.nvmlDeviceGetMemoryBusWidth
     monkeypatch.setattr(ctypes, "CDLL", lambda path: library)
     assert hardware._nvidia_memory() == (hardware.GpuMemory("NVIDIA GPU", 32 << 30), hardware.GpuMemory("NVIDIA GPU", 24 << 30))
+
+
+@pytest.mark.parametrize("gpus,architecture,capacity,hot", [
+    ((hardware.GpuMemory("NVIDIA GB10", 128 << 30, unified=True),), "unified", None, "ram"),
+    ((hardware.GpuMemory("RTX 3090 Ti", 24 << 30),), "discrete", 24 << 30, "vram"),
+    ((hardware.GpuMemory("integrated CUDA GPU", 64 << 30, unified=True),), "unified", None, "ram"),
+    ((hardware.GpuMemory("unknown discrete GPU"),), "discrete", None, "vram"),
+    ((), "unknown", None, None),
+])
+def test_runtime_topology_uses_physical_memory_instead_of_backend(monkeypatch, gpus, architecture, capacity, hot):
+    monkeypatch.setattr(hardware, "hardware_identity", lambda: hardware.HardwareIdentity(
+        "CPU", 16, tuple(gpu.name for gpu in gpus), physical_memory_bytes=128 << 30, gpu_memory=gpus))
+    value = hardware.memory_topology()
+    assert value["memory_architecture"] == architecture
+    assert value["device_memory_total_bytes"] == capacity
+    assert value["prefix_cache_hot_tier"] == hot
+    assert value["prefix_cache_cold_tier"] == "ssd"
+    assert value["host_memory_total_bytes"] == 128 << 30
+
+
+def test_gb10_keeps_unified_topology_when_capacity_queries_are_unavailable(monkeypatch):
+    monkeypatch.setattr(hardware, "hardware_identity", lambda: hardware.HardwareIdentity(
+        "CPU", 20, ("NVIDIA GB10",), physical_memory_bytes=128 << 30))
+    value = hardware.memory_topology()
+    assert value["memory_architecture"] == "unified" and value["device_memory_total_bytes"] is None
+    assert value["prefix_cache_hot_tier"] == "ram"
 
 
 def _nvml_fixture(name, calls):

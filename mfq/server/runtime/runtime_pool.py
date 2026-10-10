@@ -73,6 +73,7 @@ from mfq.server.runtime.native import (
     native_runtime_environment,
     native_tokenizer_arguments,
 )
+from mfq.server.services.hardware import host_memory_capacity, memory_topology
 
 logger = logging.getLogger(__name__)
 
@@ -1025,11 +1026,11 @@ class RuntimePool:
         return self.inference_policy.model_dump()
 
     async def _validate_qsa_kv_policy(self, artifact: DiscoveredModel, policy: Any, *, yarn_enabled: bool | None = None) -> int:
-        if self.backend != "metal":
-            raise _job_error("qsa_kv_offload_unsupported", "KV offload currently supports Metal QSA models only")
+        if self.backend not in {"metal", "cuda"}:
+            raise _job_error("qsa_kv_offload_unsupported", "KV offload requires a Metal or CUDA QSA backend")
         try:
             return await asyncio.to_thread(qsa_index_requirement, artifact, policy.target_context,
-                policy.budget_bytes if policy.enabled else None, maximum_context=self._context_limit(artifact, yarn_enabled))
+                policy.budget_bytes if policy.enabled else None, maximum_context=self._context_limit(artifact, yarn_enabled), cuda=self.backend == "cuda")
         except (ValueError, OSError, KeyError) as error:
             raise _job_error("qsa_kv_configuration_invalid", str(error)) from error
 
@@ -1101,7 +1102,7 @@ class RuntimePool:
         return sampling.model_copy(update={"enable_mtp": False})
 
     def memory_policy_status(self) -> dict[str, Any]:
-        return {**self.memory_policy.model_dump(), "actual_prefix_directory": str(self._prefix_cache_directory()),
+        return {**memory_topology(), **self.memory_policy.model_dump(), "actual_prefix_directory": str(self._prefix_cache_directory()),
             "effective_total_limit_bytes": self._effective_runtime_memory_budget_locked(),
             "total_capacity_limit_bytes": self._resident_total_limit(),
             "effective_prefix_limit_bytes": self._prefix_total_limit(), **self._prefix_disk_status}
@@ -1922,6 +1923,7 @@ class RuntimePool:
                 committed_memory,
             ) = self._runtime_memory_pressure_locked()
             memory_status = {
+                **memory_topology(),
                 "mtp_service_enabled": self.inference_policy.mtp_enabled,
                 "runtime_memory_budget_bytes": self._resident_total_limit(),
                 "runtime_memory_effective_budget_bytes": effective_memory_budget,
@@ -2232,7 +2234,7 @@ class RuntimePool:
         warning = None if settings.context_size is None or target == settings.context_size else (
             "yarn_context_size_exceeded" if enabled else "context_size_exceeded")
         storage = settings.qsa_kv_offload or QsaKvStorageSettings(enabled=previous.qsa_kv_offload.enabled,
-            budget_bytes=previous.qsa_kv_offload.budget_bytes)
+            budget_bytes=previous.qsa_kv_offload.budget_bytes, ram_budget_bytes=previous.qsa_kv_offload.ram_budget_bytes)
         quantization = settings.kv_quantization or previous.kv_quantization
         if quantization.enabled and not getattr(instance, "kv_quantization_supported", False):
             raise _job_error("kv_quantization_unsupported", "the model or backend does not support TurboQuant KV")
@@ -3362,10 +3364,11 @@ class RuntimePool:
     def _observed_runtime_bytes(
         process_resident_bytes: int | None,
         status: dict[str, Any] | None,
+        *, separate_memory: bool = False,
     ) -> int | None:
         candidates = [
             process_resident_bytes
-            if process_resident_bytes is not None and process_resident_bytes >= 0
+            if not separate_memory and process_resident_bytes is not None and process_resident_bytes >= 0
             else 0
         ]
         if status is not None:
@@ -3793,7 +3796,8 @@ class RuntimePool:
                     resident_task.cancel()
                 await asyncio.gather(resident_task, return_exceptions=True)
             raise
-        observed_resident = self._observed_runtime_bytes(resident, status)
+        observed_resident = self._observed_runtime_bytes(resident, status,
+            separate_memory=self.backend == "cuda" and memory_topology()["memory_architecture"] == "discrete")
         kv_bytes: int | None = None
         if status is not None:
             value = status.get("prefix_cache_hot_bytes", status.get("prefix_cache_bytes"))
@@ -3816,7 +3820,7 @@ class RuntimePool:
                 instance.prefix_concurrent_maintenance = status.get("prefix_cache_concurrent_maintenance") == 1
                 instance.resident_dynamic_budget = status.get("resident_memory_dynamic_budget") == 1
                 if "qsa_kv_offload_supported" in status:
-                    instance.qsa_kv_offload_supported = self.backend == "metal" and status["qsa_kv_offload_supported"] == 1
+                    instance.qsa_kv_offload_supported = self.backend in {"metal", "cuda"} and status["qsa_kv_offload_supported"] == 1
                 if "kv_quantization_supported" in status:
                     instance.kv_quantization_supported = self.backend == "metal" and status["kv_quantization_supported"] == 1
                 for field, metric in (("resident_budget_limit", "resident_memory_budget_bytes"),
@@ -3849,6 +3853,9 @@ class RuntimePool:
         values = previous.model_dump() if previous is not None else {}
         for target, source in (
             ("resident_weight_bytes", "resident_weight_bytes"),
+            ("ram_expert_bytes", "ram_expert_payload_bytes"),
+            ("ram_kv_bytes", "qsa_kv_ram_bytes"),
+            ("ram_kv_limit_bytes", "qsa_kv_ram_limit_bytes"),
             ("wired_bytes", "metal_wired_bytes"),
             ("wired_limit_bytes", "metal_wired_limit_bytes"),
             ("ssd_expert_bytes", "ssd_expert_payload_bytes"),
@@ -3865,7 +3872,7 @@ class RuntimePool:
             value = status.get(source)
             if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
                 values[target] = int(value)
-        for target, source in (("ssd_experts", "ssd_expert_enabled"), ("ssd_ple", "ssd_ple_enabled"), ("ssd_kv", "qsa_kv_offload_enabled"), ("wired_available", "metal_wired_available")):
+        for target, source in (("ram_experts", "ram_expert_enabled"), ("ram_kv", "qsa_kv_ram_enabled"), ("ssd_experts", "ssd_expert_enabled"), ("ssd_ple", "ssd_ple_enabled"), ("ssd_kv", "qsa_kv_offload_enabled"), ("wired_available", "metal_wired_available")):
             value = status.get(source)
             if isinstance(value, (bool, int, float)) and value in (0, 1):
                 values[target] = bool(value)
@@ -4084,12 +4091,21 @@ class RuntimePool:
         process_environment["MFQ_KV_TURBOQUANT_BITS"] = str(request.kv_quantization.bits if request.kv_quantization.enabled else 0)
         process_environment.pop("MFQ_QSA_KV_BUDGET_BYTES", None)
         process_environment.pop("MFQ_QSA_KV_TARGET_CONTEXT", None)
+        process_environment.pop("MFQ_QSA_KV_RAM_BUDGET_BYTES", None)
         if request.qsa_kv_offload.enabled:
-            if self.backend != "metal":
-                raise _job_error("qsa_kv_offload_unsupported", "KV offload currently supports Metal QSA models only")
+            if self.backend not in {"metal", "cuda"}:
+                raise _job_error("qsa_kv_offload_unsupported", "KV offload requires a Metal or CUDA QSA backend")
             qsa_index_requirement(artifact, self.resolve_context_size(artifact, request.context_size, yarn_enabled=request.yarn_enabled),
-                maximum_context=self._context_limit(artifact, request.yarn_enabled))
+                request.qsa_kv_offload.budget_bytes, maximum_context=self._context_limit(artifact, request.yarn_enabled), cuda=self.backend == "cuda")
             process_environment["MFQ_QSA_KV_BUDGET_BYTES"] = str(request.qsa_kv_offload.budget_bytes)
+            if self.backend == "cuda":
+                ram_budget = request.qsa_kv_offload.ram_budget_bytes
+                if memory_topology()["memory_architecture"] == "unified":
+                    ram_budget = 0
+                elif ram_budget is None:
+                    _, available = host_memory_capacity()
+                    ram_budget = min(4 << 30, max(0, available // 4)) if available is not None else 0
+                process_environment["MFQ_QSA_KV_RAM_BUDGET_BYTES"] = str(ram_budget)
         if self.backend == "metal" and artifact.resource.name in self._resident_load_limits:
             process_environment["MFQ_SERVER_RESIDENT_BUDGET_BYTES"] = str(self._resident_load_limits[artifact.resource.name])
         cache_directory = str(self._prefix_cache_directory())

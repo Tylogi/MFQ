@@ -2,10 +2,11 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { ModelContextSettings } from './ModelContextSettings';
 import { useJobStore } from '../../stores/jobStore';
-import type { ModelCacheProfile, RuntimeInstance } from '../../shared/api/types';
+import type { ModelCacheProfile, RuntimeInstance, RuntimeStatus } from '../../shared/api/types';
 
 const mocks = vi.hoisted(() => ({ policy: vi.fn(), info: vi.fn(), reload: vi.fn(), warning: vi.fn(), artifacts: vi.fn(), profile: vi.fn() }));
 const state = vi.hoisted(() => ({ language: 'en', ready: true, connectionRevision: 0, reloadingInstances: {},
+  runtime: null as RuntimeStatus | null,
   instances: [{ id: 'a', model: 'Model A', state: 'ready', context_size: 262144, context_capacity: 262144 }] as RuntimeInstance[] }));
 vi.mock('../../app/RuntimeProvider', () => ({ useRuntime: () => ({ ...state, reloadModelContext: mocks.reload }) }));
 vi.mock('../settings/SettingsProvider', () => ({ useSettings: () => ({ tr: (zh: string, en: string) => state.language === 'en' ? en : zh }) }));
@@ -16,6 +17,7 @@ vi.mock('../../stores/toastStore', () => ({ toast: { success: vi.fn(), error: vi
 beforeEach(() => {
   vi.clearAllMocks();
   state.language = 'en';
+  state.runtime = null;
   state.instances = [{ id: 'a', model: 'Model A', state: 'ready', context_size: 262144, context_capacity: 262144 } as RuntimeInstance];
   useJobStore.getState().setJobs([]);
   mocks.policy.mockResolvedValue({ max_context_size: null, model_overrides: {}, model_yarn_enabled: {} });
@@ -237,6 +239,19 @@ it('saves context, YaRN and streaming in one request and shows SSD estimates onl
   await waitFor(() => expect(mocks.reload).toHaveBeenCalledOnce());
   expect(mocks.reload).toHaveBeenCalledWith('a', 524288, true, { enabled: true, budget_bytes: 2 ** 29 }, undefined);
   expect(screen.queryByRole('button', { name: 'Apply settings' })).not.toBeInTheDocument();
+});
+
+it('saves discrete-device VRAM and RAM KV budgets together and shows the three tiers', async () => {
+  state.runtime = { state: 'ready', backend: 'cuda', memory_architecture: 'discrete' } as RuntimeStatus;
+  state.instances[0].qsa_kv_offload_supported = true;
+  const { save } = await controls();
+  fireEvent.click(screen.getByRole('checkbox', { name: 'Enable streaming sparse attention' }));
+  fireEvent.change(screen.getByRole('spinbutton', { name: 'Resident VRAM KV budget' }), { target: { value: '0.5' } });
+  fireEvent.change(screen.getByRole('spinbutton', { name: 'RAM streaming KV budget' }), { target: { value: '3' } });
+  expect(screen.getByLabelText('Model A final state')).toHaveTextContent('VRAM 512 MiB · RAM 3 GiB → SSD');
+  fireEvent.click(save);
+  await waitFor(() => expect(mocks.reload).toHaveBeenCalledWith('a', null, false,
+    { enabled: true, budget_bytes: 2 ** 29, ram_budget_bytes: 3 * 2 ** 30 }, undefined));
 });
 
 it('retains model settings and progress while its instance is being replaced', async () => {
