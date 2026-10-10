@@ -49,5 +49,13 @@ int main() {
     budget.store("b", {{2}, "", 20}, same_snapshot);
     require(budget.metrics().sessions == 1, "byte budget must evict LRU state");
     require(budget.metrics().bytes == 20, "byte accounting must stay exact");
+    require(budget.trim(10) == 20, "trim must release oversized LRU snapshots");
+    require(budget.max_bytes() == 25, "trim must preserve the configured limit");
+    budget.store("c", {{3}, "", 10}, same_snapshot);
+    budget.store("d", {{4}, "", 10}, same_snapshot);
+    require(budget.set_limit(10) == 10, "budget shrink must evict the oldest snapshot");
+    require(!budget.find_best("c", {3, 9}, 2, [](const State&) { return true; }), "LRU victim must be removed");
+    require(budget.find_best("d", {4, 9}, 2, [](const State&) { return true; }).has_value(), "newest snapshot must remain");
+    require(budget.set_limit(0) == 10 && !budget.enabled(), "zero allowance must empty and disable the hot tier");
     return 0;
 }

@@ -259,7 +259,6 @@ add_library(mfq-metal-runtime STATIC
     runtime/mlx_tensor.cpp
     runtime/mlx_transformer.cpp
     runtime/mlx_kv_quantization.cpp
-    runtime/qsa_kv_store.cpp
     runtime/mlx_qsa_kv_offload.cpp
     ops/mlx_grouped_linear.cpp
     ops/mlx_linear_attention.cpp

@@ -6,7 +6,8 @@ import type { useModelCatalog } from './useModelCatalog';
 import { ModelVendorMark } from '../../app/ModelVendorMark';
 import { ModelLoadProgress } from './ModelLoadProgress';
 import { formatNumber } from '../../app/formatters';
-import { ModelMemoryPressure } from './ModelMemoryPressure';
+import { ModelPressureBars } from './ModelMemoryPressure';
+import { hasSeparateVram } from '../runtime/memoryArchitecture';
 
 export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useModelCatalog> }) {
   const { tr } = useSettings();
@@ -25,6 +26,11 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
       ? b.total_bytes - a.total_bytes : (Date.parse(b.modified_at) || 0) - (Date.parse(a.modified_at) || 0));
   const filterCount = [status, architecture, format].filter(value => value !== 'all').length;
   const available = runtime?.runtime_memory_headroom_bytes;
+  const separate = hasSeparateVram(runtime);
+  const system = separate ? { physical_memory_bytes: runtime?.host_memory_total_bytes, memory_pools: [
+    { kind: 'vram' as const, capacity_bytes: runtime?.device_memory_total_bytes },
+    { kind: 'ram' as const, capacity_bytes: runtime?.host_memory_total_bytes },
+  ] } : undefined;
   const gib = (bytes?: number | null) => bytes == null ? '—' : `${formatNumber(bytes / 2 ** 30, 1)} GiB`;
   return (
     <>
@@ -71,10 +77,11 @@ export function LocalCheckpoints({ catalog }: { catalog: ReturnType<typeof useMo
                     <ModelLoadProgress model={item.name} />
                   </div>
                   <div className="local-checkpoint-memory">
-                    <small>{tr('剩余可用内存', 'Remaining available memory')} {gib(available)}</small>
-                    <ModelMemoryPressure required={item.estimated_resident_weight_bytes} available={available}
+                    {!separate && <small>{tr('剩余可用内存', 'Remaining available memory')} {gib(available)}</small>}
+                    <ModelPressureBars weights={item.estimated_resident_weight_bytes} roles={item.estimated_weight_bytes_by_role}
+                      system={system} available={available}
                       label={tr('预计占剩余可用内存', 'Estimated share of remaining available memory')}
-                      emptyLabel={tr('无可用内存', 'No available memory')} />
+                      tr={tr} />
                   </div>
                   <div className="model-row-actions"><ModelVendorMark name={item.name} architecture={item.architecture} /><button className="model-files-action" disabled={busy} onClick={() => void openModelFiles(item.id)} type="button"><Icon name="folder" size={13} />{tr('模型文件', 'Model files')}</button>{instance ? (
                     <button disabled={busy || instance.state !== 'ready'}

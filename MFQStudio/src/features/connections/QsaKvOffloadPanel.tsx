@@ -10,14 +10,17 @@ interface Props {
   context: number;
   enabled: boolean;
   budget: string;
+  separateVram?: boolean;
+  ramBudget?: string;
   profile?: ModelCacheProfile | null;
   metadataError?: string;
   disabled: boolean;
   onEnabledChange: (value: boolean) => void;
   onBudgetChange: (value: string) => void;
+  onRamBudgetChange?: (value: string) => void;
 }
 
-export function QsaKvOffloadPanel({ model, context, enabled, budget, profile, metadataError, disabled, onEnabledChange, onBudgetChange }: Props) {
+export function QsaKvOffloadPanel({ model, context, enabled, budget, separateVram = false, ramBudget = '', profile, metadataError, disabled, onEnabledChange, onBudgetChange, onRamBudgetChange }: Props) {
   const { tr } = useSettings();
   const contentId = useId();
   const [expanded, setExpanded] = useState(false);
@@ -47,15 +50,23 @@ export function QsaKvOffloadPanel({ model, context, enabled, budget, profile, me
     </div>
     <div id={contentId} className="qsa-kv-body" hidden={!expanded}>
       <p className="qsa-kv-description">{supported
-        ? tr('允许稀疏注意力模型设置 KV Cache 内存驻留上限，大幅降低给定上下文下的驻留量，对推理速度影响较小。', 'Set a maximum resident-memory budget for sparse-attention KV cache, substantially reducing memory residency at a given context length with a small impact on inference speed.')
+        ? separateVram
+          ? tr('KV Cache 保存在显存热层，淘汰后进入内存流式层；内存层按 LRU 淘汰到 SSD。前缀缓存单独使用显存热层与 SSD 冷层。', 'Active KV uses a VRAM hot tier, a RAM LRU tier and SSD overflow. Prefix cache separately uses VRAM and SSD.')
+          : tr('KV Cache 使用内存热层与 SSD 流式层，常驻预算限制内存占用。', 'KV cache uses a RAM hot tier and SSD streaming tier, with residency bounded by the memory budget.')
         : tr('仅支持具备此后端能力的 QSA 模型，其它模型不能启用。', 'Requires a QSA model and a backend with streaming sparse attention support.')}</p>
       <div className="qsa-kv-fields qsa-kv-model-settings-fields">
         <label className="qsa-kv-field" title={tr('按实际数据与 I/O 缓冲共享上限，不预留未来空间；块元数据与执行临时张量另计。', 'Shared payload and I/O budget, without future reservations; block metadata and execution scratch are separate.')}>
-          <span>{tr('KV 常驻预算', 'Resident KV budget')}</span>
+          <span>{separateVram ? tr('KV 显存常驻预算', 'Resident VRAM KV budget') : tr('KV 常驻预算', 'Resident KV budget')}</span>
           <div className="qsa-kv-input"><input type="number" step="any" min="0" max={2 ** 20}
-            aria-label={tr('KV 常驻预算', 'Resident KV budget')} value={budget} disabled={!supported || disabled}
+            aria-label={separateVram ? tr('KV 显存常驻预算', 'Resident VRAM KV budget') : tr('KV 常驻预算', 'Resident KV budget')} value={budget} disabled={!supported || disabled}
             onChange={event => onBudgetChange(event.target.value)} /><span>GiB</span></div>
         </label>
+        {separateVram && <label className="qsa-kv-field" title={tr('留空根据可用内存自动设置；0 表示直接溢出到 SSD。', 'Leave empty to size from available RAM; zero spills directly to SSD.')}>
+          <span>{tr('内存流式 KV 预算', 'RAM streaming KV budget')}</span>
+          <div className="qsa-kv-input"><input type="number" step="any" min="0" max={2 ** 20}
+            aria-label={tr('内存流式 KV 预算', 'RAM streaming KV budget')} value={ramBudget} disabled={!supported || disabled}
+            placeholder={tr('自动', 'Automatic')} onChange={event => onRamBudgetChange?.(event.target.value)} /><span>GiB</span></div>
+        </label>}
         <div className="qsa-kv-field" title={tr('跟随该模型上方的上下文设置，保存时一并应用。', 'Follows the model context setting above and applies with the same save.')}>
           <span>{tr('最大上下文', 'Maximum context')}</span>
           <div className="qsa-kv-context" role="status" aria-label={tr('最大上下文', 'Maximum context')}>

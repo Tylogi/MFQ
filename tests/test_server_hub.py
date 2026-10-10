@@ -244,8 +244,10 @@ def test_huggingface_metadata_uses_one_bounded_request(monkeypatch) -> None:
 
 def test_modelscope_metadata_and_listing_run_in_parallel(monkeypatch) -> None:
     from mfq.server.services import hub
-    from modelscope_hub import config
+    import sys
     from types import SimpleNamespace
+    config = SimpleNamespace(get_default_config=lambda: SimpleNamespace(endpoint='https://modelscope.cn', token=None))
+    monkeypatch.setitem(sys.modules, 'modelscope_hub.config', config)
 
     async def run() -> None:
         requests = []
@@ -282,7 +284,7 @@ def test_modelscope_metadata_and_listing_run_in_parallel(monkeypatch) -> None:
     ("https://huggingface.co", "http://proxy.test:8080", "http://proxy.test:8080"),
     ("http://localhost", "http://proxy.test:8080", None),
 ))
-def test_metadata_client_defaults_to_direct_when_proxy_discovery_fails(
+def test_metadata_client_uses_configured_proxy_when_proxy_discovery_fails(
     monkeypatch, endpoint, explicit, expected
 ) -> None:
     from mfq.server.api import network
@@ -302,8 +304,7 @@ def test_metadata_client_defaults_to_direct_when_proxy_discovery_fails(
         monkeypatch.setattr(network.urllib.request, name, unavailable, raising=False)
     monkeypatch.setattr(hub.httpx, "AsyncClient", lambda **kwargs: kwargs)
     options = hub._metadata_client(endpoint)
-    transport = options["transport"]
-    assert isinstance(transport, hub._DirectFirstTransport) if expected else transport is None
+    assert options["proxy"] == expected
     assert options["trust_env"] is False
     assert options["timeout"].connect == 4 and options["timeout"].read == 8
 

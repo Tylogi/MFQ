@@ -671,6 +671,7 @@ void qsa_sparse_gate_benchmark(bool compare_query=false) {
 }
 }
 #include "qsa_prefill_test.h"
+#include "qsa_kv_offload_test.h"
 #include "gdn_prefill_columns_test.h"
 #include "gdn_prefill_pipeline_test.h"
 int main(int argc,char** argv)try {
@@ -690,6 +691,7 @@ int main(int argc,char** argv)try {
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-pipeline-check")gdn_prefill_pipeline_case();
     else if(argc==2 && std::string(argv[1])=="--gdn-prefill-columns-bench")gdn_prefill_columns_benchmark();
     else if(argc==2 && std::string(argv[1])=="--qsa-prefill-check")qsa_prefill_fusion_case();
+    else if(argc==2 && std::string(argv[1])=="--qsa-kv-offload-check")qsa_kv_offload_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-sparse-gate-check")qsa_sparse_gate_case();
     else if(argc==2 && std::string(argv[1])=="--qsa-sparse-gate-bench")qsa_sparse_gate_benchmark();
     else if(argc==2 && std::string(argv[1])=="--qsa-sparse-query-bench")qsa_sparse_gate_benchmark(true);

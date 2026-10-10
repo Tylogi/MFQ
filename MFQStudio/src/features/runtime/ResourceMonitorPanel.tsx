@@ -5,6 +5,7 @@ import { errorMessage, formatNumber } from '../../app/formatters';
 import { useSettings } from '../settings/SettingsProvider';
 import { runtimeApi } from '../../shared/api/resources/runtime';
 import type { RuntimeResources } from '../../shared/api/types';
+import { hasSeparateVram } from './memoryArchitecture';
 
 function rate(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return '--';
@@ -13,7 +14,7 @@ function rate(value: number | null | undefined): string {
 }
 
 export function ResourceMonitorPanel() {
-  const { ready, connectionRevision } = useRuntime();
+  const { ready, connectionRevision, runtime } = useRuntime();
   const { tr } = useSettings();
   const [resources, setResources] = useState<RuntimeResources | null>(null);
   const [error, setError] = useState('');
@@ -75,6 +76,12 @@ export function ResourceMonitorPanel() {
             {item.utilization_percent != null && <i style={{ width: `${item.utilization_percent}%` }} />}
           </div>
           <small>{tr('整机占用', 'System utilization')}</small>
+        </div>)}
+        {hasSeparateVram(runtime) && resources?.gpus.map((gpu, index) => <div className="resource-monitor-metric" key={`vram-${index}`}>
+          <span>{tr('显存占用', 'VRAM used')} · {gpu.name}</span>
+          <strong>{gpu.memory_used_bytes == null ? '--' : `${formatNumber(gpu.memory_used_bytes / 2 ** 30, 1)} GiB`}</strong>
+          <small>{tr('总显存', 'Total VRAM')} {gpu.memory_total_bytes == null ? '--' : `${formatNumber(gpu.memory_total_bytes / 2 ** 30, 1)} GiB`}
+            {' · '}{tr('可用', 'Available')} {gpu.memory_available_bytes == null ? '--' : `${formatNumber(gpu.memory_available_bytes / 2 ** 30, 1)} GiB`}</small>
         </div>)}
         {[{ label: tr('内存占用', 'Memory used'), bytes: resources?.memory_used_bytes,
           description: resources?.memory_total_bytes != null

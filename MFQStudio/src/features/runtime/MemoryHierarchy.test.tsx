@@ -1,6 +1,26 @@
 import { render, screen } from '@testing-library/react';
 import { expect, it, vi } from 'vitest';
 import { MemoryHierarchy } from './MemoryHierarchy';
+
+it('shows seven separate VRAM, RAM and SSD tiers without treating unknown RAM telemetry as zero', () => {
+  const item = model('1', 1024);
+  Object.assign(item.memory!, { ram_experts: true, ram_expert_bytes: 4096,
+    ram_kv: true, ram_kv_bytes: 2048, ram_kv_limit_bytes: 8192, prefix_cache_bytes: 256, ssd_experts: false });
+  const { container, rerender } = render(<MemoryHierarchy instances={[item]} runtime={{ memory_architecture: 'discrete' }} memoryCapacityBytes={32768} detailed />);
+  expect(container.querySelectorAll('[data-tier]')).toHaveLength(7);
+  expect(screen.getByText('VRAM-resident experts and dense weights')).toBeInTheDocument();
+  expect(screen.getByText('RAM-streamed experts')).toBeInTheDocument();
+  expect(screen.getByText('RAM-streamed KV')).toBeInTheDocument();
+  expect(screen.getByText('Not yet supported on this device')).toBeInTheDocument();
+  expect(container.querySelector('[data-tier="ram-experts"] .resource-tier-model strong')).toHaveTextContent('4 KiB');
+  expect(container.querySelector('[data-tier="ram-kv"] .resource-tier-model strong')).toHaveTextContent('2 KiB');
+  expect(container.querySelector('[data-tier="kv"]')).toHaveTextContent('Prefix VRAM');
+  rerender(<MemoryHierarchy instances={[{ ...item, memory: { ...item.memory!, ram_expert_bytes: null } }]} runtime={{ memory_architecture: 'discrete' }} />);
+  expect(container.querySelector('[data-tier="ram-experts"]')).toHaveTextContent('Breakdown not reported');
+  rerender(<MemoryHierarchy instances={[item]} runtime={{ memory_architecture: 'unified', backend: 'cuda' }} />);
+  expect(container.querySelectorAll('[data-tier]')).toHaveLength(5);
+  expect(screen.queryByText('RAM-streamed experts')).not.toBeInTheDocument();
+});
 import type { RuntimeInstance } from '../../shared/api/types';
 
 vi.mock('../settings/SettingsProvider', () => ({

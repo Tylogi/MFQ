@@ -14,6 +14,8 @@ from mfq.formats.compat import canonical_dtype
 from mfq.server.state.catalog import _is_always_streamed_tensor
 from mfq.server.state.model_weights import (
     estimated_resident_weight_bytes as estimated_resident_weight_bytes,
+    estimated_weight_roles,
+    weight_role,
 )
 
 
@@ -31,6 +33,7 @@ class MfqMetadata:
     has_mtp_weights: bool = False
     config_span: tuple[int, int] | None = None
     last_legacy_block: int = -1
+    estimated_weight_bytes_by_role: dict[str, int] = field(default_factory=dict)
 
 
 def inspect_mfq_header(data: bytes, file_size: int) -> MfqMetadata:
@@ -73,6 +76,7 @@ def inspect_mfq_header(data: bytes, file_size: int) -> MfqMetadata:
         raise ValueError('Too many MFQ tensor records')
     payload_bytes = weight_bytes = ple_bytes = 0
     by_dtype: dict[str, int] = {}
+    by_role: dict[str, dict[str, int]] = {role: {} for role in ('dense', 'experts', 'embedding')}
     names = set()
     mtp = False
     config_record = None
@@ -98,6 +102,8 @@ def inspect_mfq_header(data: bytes, file_size: int) -> MfqMetadata:
             weight_bytes += size
             dtype = canonical_dtype(dtype)
             by_dtype[dtype] = by_dtype.get(dtype, 0) + size
+            role_dtypes = by_role[weight_role(name)]
+            role_dtypes[dtype] = role_dtypes.get(dtype, 0) + size
     if offset + payload_bytes != file_size:
         raise ValueError('MFQ file size does not match its tensor index')
     config = extra.get('hf_config')
@@ -106,7 +112,7 @@ def inspect_mfq_header(data: bytes, file_size: int) -> MfqMetadata:
         with suppress(ValueError, UnicodeError):
             config = json.loads(data[span[0]:span[0] + span[1]])
         span = None
-    return MfqMetadata(architecture, config if isinstance(config, dict) else {}, weight_bytes, ple_bytes, by_dtype, mtp, span, last_legacy_block)
+    return MfqMetadata(architecture, config if isinstance(config, dict) else {}, weight_bytes, ple_bytes, by_dtype, mtp, span, last_legacy_block, estimated_weight_roles(by_role))
 
 
 async def _read_range(client: httpx.AsyncClient, url: str, params: dict[str, str] | None,

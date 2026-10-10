@@ -81,6 +81,23 @@ def test_disk_only_prefix_contexts_are_not_counted_as_resident():
     assert partial.context_count is None
 
 
+def test_ram_streaming_tiers_are_reported_separately_from_vram_and_ssd():
+    memory = RuntimePool._memory_resources({"resident_weight_bytes": 1024,
+        "kv_cache_bytes": 200, "prefix_cache_hot_bytes": 50, "ram_expert_enabled": 1,
+        "ram_expert_payload_bytes": 3000, "qsa_kv_ram_enabled": 1,
+        "qsa_kv_ram_bytes": 4000, "qsa_kv_ram_limit_bytes": 8192, "qsa_kv_ssd_bytes": 5000})
+    assert memory.ram_experts is True and memory.ram_expert_bytes == 3000
+    assert memory.ram_kv is True and memory.ram_kv_bytes == 4000 and memory.ram_kv_limit_bytes == 8192
+    assert memory.resident_weight_bytes == 1024 and memory.kv_bytes == 250 and memory.ssd_kv_bytes == 5000
+
+
+def test_discrete_gpu_budget_does_not_count_host_ram_as_vram():
+    assert RuntimePool._observed_runtime_bytes(32 << 30, {"cuda_allocated_bytes": 2 << 30,
+        "cuda_reserved_bytes": 3 << 30}, separate_memory=True) == 3 << 30
+    assert RuntimePool._observed_runtime_bytes(32 << 30, {"cuda_allocated_bytes": 2 << 30}) == 32 << 30
+    assert RuntimePool._observed_runtime_bytes(32 << 30, {}, separate_memory=True) is None
+
+
 def test_invalid_measurements_are_unknown_but_explicit_zero_is_valid():
     memory = RuntimePool._memory_resources({"resident_weight_bytes": math.inf,
         "kv_cache_bytes": -1, "ssd_ple_payload_bytes": math.nan, "ssd_expert_enabled": 2})

@@ -1,4 +1,5 @@
 #pragma once
+namespace mfq::cuda { class KvOffloadStore; }
 
 #include "mfq_tensor_backend.h"
 #include "tensor_parallel.h"
@@ -341,6 +342,7 @@ struct CudaExecutionContext {
     LayerPlacementConfig layer_placement;
     // Engine-owned load resource; cached model/MTP weights share its lifetime.
     std::shared_ptr<MoeExpertCache> moe_expert_cache;
+    std::shared_ptr<mfq::cuda::KvOffloadStore> qsa_kv_store;
     std::unordered_map<int, MoeRouteLayerStats> moe_route_stats;
 
     void reset() noexcept;

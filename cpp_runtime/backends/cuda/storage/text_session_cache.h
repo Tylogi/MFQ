@@ -26,6 +26,8 @@ struct SessionCacheConfig;
 
 namespace mfq::cuda::internal {
 
+bool cuda_has_separate_memory();
+
 struct TextSessionRestore {
     std::size_t tokens = 0;
     mfq_tensor_backend::Tensor mtp_last_target_hidden;
@@ -45,7 +47,8 @@ public:
         const mfq::engine::PrefixCacheConfig& prefix_config,
         std::shared_ptr<mfq::cache::PagedPrefixCache> paged_cache = {},
         bool supported = true,
-        int disabled_reason = 0);
+        int disabled_reason = 0,
+        bool native_hot_snapshots = false);
     ~TextSessionCache();
 
     TextSessionCache(const TextSessionCache&) = delete;
@@ -71,6 +74,9 @@ public:
     std::size_t clear_live_sessions() noexcept;
     std::size_t clear();
     std::uint64_t trim_hot(std::uint64_t target_bytes);
+    std::uint64_t set_hot_limit(std::uint64_t max_bytes);
+    std::uint64_t set_disk_limit(std::uint64_t max_bytes);
+    std::uint64_t refresh_disk_index();
 
 private:
     struct Impl;

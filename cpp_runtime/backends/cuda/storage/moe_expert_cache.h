@@ -6,6 +6,8 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <vector>
+#include <utility>
 
 class MoeExpertCache;
 class MoeQuantRangeSource;
@@ -20,6 +22,8 @@ std::shared_ptr<MoeExpertCache> make_moe_expert_cache(
 bool moe_expert_cache_has_sources(
     const std::shared_ptr<MoeExpertCache>& cache);
 bool moe_expert_cache_finalized(
+    const std::shared_ptr<MoeExpertCache>& cache);
+std::vector<std::pair<std::string, double>> moe_expert_memory_metrics(
     const std::shared_ptr<MoeExpertCache>& cache);
 void finalize_moe_expert_cache(
     const std::shared_ptr<MoeExpertCache>& cache);

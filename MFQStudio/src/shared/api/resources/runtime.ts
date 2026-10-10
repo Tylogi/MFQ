@@ -44,6 +44,7 @@ export interface KvQuantizationSettings {
 export interface QsaKvStorageSettings {
   enabled: boolean;
   budget_bytes: number;
+  ram_budget_bytes?: number | null;
 }
 
 export interface YarnContextInfo {
@@ -58,7 +59,7 @@ export interface YarnContextInfo {
 export interface QsaKvOffloadInfo {
   supported: boolean;
   architecture: string;
-  policy: { enabled: boolean; budget_bytes: number; target_context: number };
+  policy: QsaKvStorageSettings & { target_context: number };
   required_index_bytes: number | null;
   buffer_bytes: number;
   target_context: number;

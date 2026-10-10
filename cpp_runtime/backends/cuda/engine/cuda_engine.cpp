@@ -3,6 +3,9 @@
 #include "generation.h"
 #include "storage/model_loader.h"
 #include "storage/weight_loader.h"
+#include "storage/moe_expert_cache.h"
+#include "runtime/kv_offload.h"
+#include "runtime/execution_options.h"
 #include "cuda_batching.h"
 #include "storage/text_session_cache.h"
 #include "mtp_metrics.h"
@@ -38,7 +41,8 @@ struct CudaEngineState {
           cache(config.session_cache, config.prefix_cache,
               make_cuda_paged_prefix_cache(*language.source, language.max_position_embeddings(),
                   language.supports_paged_text_session_state(), config.prefix_cache),
-                language.supports_text_session_state(), language.supports_text_session_state() ? 0 : 1) {
+                language.supports_text_session_state(), language.supports_text_session_state() ? 0 : 1,
+                cuda_has_separate_memory()) {
         if (config.continuous_batch.max_sequences) {
             if constexpr (std::is_same_v<Model, Qwen35CausalLm>)
                 batching = std::make_unique<ContinuousBatch<QwenBatchOperations>>(
@@ -88,6 +92,18 @@ struct CudaEngineState {
                 {"vision_declared", double(capabilities.vision_declared)}, {"vision_supported", double(capabilities.vision_supported)},
                 {"vision_available", double(capabilities.vision_available)}, {"mtp_declared", double(capabilities.mtp_declared)},
                 {"mtp_supported", double(capabilities.mtp_supported)}, {"mtp_available", double(capabilities.mtp_available)}};
+            auto experts = moe_expert_memory_metrics(execution->moe_expert_cache);
+            metrics.insert(metrics.end(), experts.begin(), experts.end());
+            metrics.insert(metrics.end(), {{"ssd_expert_enabled", 0.0}, {"ssd_expert_payload_bytes", 0.0},
+                {"qsa_kv_offload_supported", std::is_same_v<Model, Qwen4CausalLm> ? 1.0 : 0.0}});
+            if (execution->qsa_kv_store) {
+                auto kv = execution->qsa_kv_store->metrics();
+                metrics.insert(metrics.end(), kv.begin(), kv.end());
+                for (const auto& value : kv)
+                    if (value.first == "qsa_kv_resident_bytes") metrics.emplace_back("kv_cache_bytes", value.second);
+                metrics.emplace_back("kv_cache_contexts", language.cache_pos > 0 ? 1.0 : 0.0);
+            } else metrics.insert(metrics.end(), {{"qsa_kv_offload_enabled", 0.0},
+                {"qsa_kv_ram_enabled", 0.0}, {"qsa_kv_ram_bytes", 0.0}, {"qsa_kv_ssd_bytes", 0.0}});
             if (components.mtp) mtp::append_generation_metrics(metrics, components.mtp->last_stats);
             if (batching) {
                 auto batch = batching->metrics(); metrics.insert(metrics.end(), batch.begin(), batch.end());
@@ -135,9 +151,20 @@ struct CudaBackend {
         execution->profiler.enabled = false;
         mfq_tensor_backend::NoGradGuard no_grad;
         auto config = resolve_cuda_runtime_config(options);
+        const auto kv_options = runtime_options::qsa_kv_offload();
+        if (kv_options.gpu_budget_bytes) {
+            KvOffloadConfig kv;
+            kv.gpu_budget_bytes = kv_options.gpu_budget_bytes;
+            kv.ram_budget_bytes = cuda_has_separate_memory() ? kv_options.ram_budget_bytes : 0;
+            kv.buffer_bytes = std::min<std::size_t>(kv.buffer_bytes, kv.gpu_budget_bytes / 4);
+            kv.directory = kv_options.directory;
+            execution->qsa_kv_store = std::make_shared<KvOffloadStore>(std::move(kv));
+        }
         state = with_loaded_cuda_model(*execution, options, true,
             [&](auto& model, auto& components, auto, auto) -> State {
                 using Model = std::decay_t<decltype(model)>;
+                if constexpr (!std::is_same_v<Model, Qwen4CausalLm>)
+                    if (execution->qsa_kv_store) throw std::invalid_argument("CUDA streamed KV requires a QSA model");
                 return std::make_unique<CudaEngineState<Model>>(execution, std::move(model), std::move(components), config);
             });
         return visit([&](auto& state) {

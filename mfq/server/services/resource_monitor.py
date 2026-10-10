@@ -54,16 +54,27 @@ def _gpu_usage() -> list[dict[str, Any]]:
             devices.append({"name": card.name, "utilization_percent": _percent(value)})
         if devices:
             return devices
-    rows = _command(["nvidia-smi", "--query-gpu=name,utilization.gpu", "--format=csv,noheader,nounits"])
+    rows = _command(["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.total,memory.used,memory.free", "--format=csv,noheader,nounits"])
     devices = []
     for row in rows.splitlines():
-        name, _, value = row.rpartition(",")
+        columns = [value.strip() for value in row.split(",")]
+        if len(columns) not in {2, 5}:
+            continue
+        name, value = columns[:2]
         try:
             utilization = _percent(float(value.strip()))
         except ValueError:
             utilization = None
         if name.strip():
-            devices.append({"name": name.strip(), "utilization_percent": utilization})
+            device = {"name": name.strip(), "utilization_percent": utilization}
+            if len(columns) == 5:
+                for key, counter in zip(("memory_total_bytes", "memory_used_bytes", "memory_available_bytes"), columns[2:]):
+                    try:
+                        number = _number(float(counter))
+                    except ValueError:
+                        number = None
+                    device[key] = int(number * (1 << 20)) if number is not None else None
+            devices.append(device)
     if not devices:
         devices = [{"name": name, "utilization_percent": None} for name in hardware_identity().gpu_names]
     return devices
@@ -202,9 +213,8 @@ class ResourceMonitor:
                 if instance.state not in {"ready", "busy"}:
                     return None
                 try:
-                    async with asyncio.timeout(1.0):
-                        return await service.runtime_status(instance.id)
-                except (TimeoutError, RuntimeError):
+                    return await asyncio.wait_for(service.runtime_status(instance.id), timeout=1.0)
+                except (TimeoutError, asyncio.TimeoutError, RuntimeError):
                     return {"instance_id": str(instance.id), "model": instance.model}
             host, statuses = await asyncio.gather(
                 asyncio.to_thread(self._host_sample),

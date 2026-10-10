@@ -536,6 +536,36 @@ static void check_snapshots(CudaExecutionContext& execution, bool hybrid) {
         check(mixed.restore_best(model, nullptr, "source", {1, 2, 3}, 2).tokens == 0,
               "clear retained paged snapshot");
     }
+    {
+        mfq::cache::PagedPrefixCacheConfig config;
+        config.cache_dir = directory / "vram-ssd";
+        config.compatibility_key = "vram-ssd-prefix-test";
+        config.block_size_tokens = 2;
+        config.max_hot_bytes = 0;
+        auto paged = std::make_shared<mfq::cache::PagedPrefixCache>(config);
+        mfq::engine::PrefixCacheConfig prefix;
+        prefix.hot_bytes = text.bytes * 2;
+        TextSessionCache cache({}, prefix, paged, true, 0, true);
+        const auto metric = [&](const char* name) {
+            for (const auto& entry : cache.metrics()) if (entry.first == name) return entry.second;
+            throw std::runtime_error(std::string("missing prefix metric ") + name);
+        };
+        cache.store("", text);paged->flush();
+        check(metric("prefix_cache_hot_bytes") == text.bytes && metric("prefix_cache_ram_bytes") == 0,
+              "discrete prefix cache must retain native GPU snapshots without a RAM hot layer");
+        check(cache.restore_best(model, nullptr, "", {1,2,3}, 2).tokens == 2 && metric("prefix_cache_hot_hits") == 1,
+              "anonymous requests must reuse GPU-hot prefixes");
+        check(cache.trim_hot(0) == text.bytes && metric("prefix_cache_hot_bytes") == 0,
+              "GPU-hot prefix trim did not release its snapshot");
+        check(cache.restore_best(model, nullptr, "", {1,2,3}, 2).tokens == 2,
+              "SSD-cold prefix restore failed after GPU eviction");
+        check(metric("prefix_cache_hot_bytes") == text.bytes && metric("prefix_cache_ram_bytes") == 0,
+              "SSD prefix restore must promote directly into the GPU hot tier");
+        check(cache.set_hot_limit(0) == text.bytes,
+              "GPU prefix budget change did not release native snapshots");
+        check(cache.restore_best(model, nullptr, "", {1,2,3}, 2).tokens == 2 && !metric("prefix_cache_hot_bytes") && !metric("prefix_cache_ram_bytes"),
+              "zero GPU-hot budget must retain SSD reuse without RAM residency");
+    }
     std::filesystem::remove_all(directory);
 }
 

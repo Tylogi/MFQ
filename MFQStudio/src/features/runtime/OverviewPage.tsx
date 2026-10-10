@@ -15,6 +15,7 @@ import { runtimeModelNames } from './modelSelection';
 import { displayPrefillMetric, preferPositiveMetric } from './metrics';
 import { RuntimeHero } from './RuntimeHero';
 import { MemoryHierarchy } from './MemoryHierarchy';
+import { residentMemoryCapacity } from './memoryArchitecture';
 import { anthropicEndpoint, openAIEndpoint } from './endpoint';
 import { getApiBaseUrl, getApiToken } from '../../shared/api/client';
 import { runtimeApi } from '../../shared/api/resources/runtime';
@@ -240,8 +241,8 @@ export function OverviewPage() {
       </div>
       <SectionLabel title={tr('资源概览', 'Resource overview')} />
       {runtime ? (
-        <MemoryHierarchy instances={instances} connectionRevision={connectionRevision}
-          memoryCapacityBytes={runtime.runtime_memory_effective_budget_bytes ?? runtime.runtime_memory_budget_bytes} />
+        <MemoryHierarchy instances={instances} runtime={runtime} connectionRevision={connectionRevision}
+          memoryCapacityBytes={residentMemoryCapacity(runtime)} />
       ) : (
         <EmptyPanel
           icon="memory"

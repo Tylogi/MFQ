@@ -132,6 +132,8 @@
 .model-variant strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .model-variant small { color: var(--muted); font-size: 10.5px; }
 .variant-memory-pressure { display: grid; grid-template-columns: minmax(70px, 1fr) auto; align-items: center; gap: 7px; min-width: 110px; }
+.variant-memory-tiers { display: grid; min-width: 0; gap: 8px; }
+.variant-memory-caption { display: block; overflow: hidden; margin-bottom: 4px; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .variant-memory-pressure > strong { min-width: 39px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; text-align: right; }
 .variant-memory-track { overflow: hidden; height: 6px; border-radius: 99px; background: var(--panel-line); }
 .variant-memory-track span { display: block; height: 100%; border-radius: inherit; background: var(--muted); transition: width 180ms ease; }
@@ -204,7 +206,9 @@ body:has(.model-download-page) .studio-toast-container { bottom: calc(96px + env
   .model-browser-header { align-items: stretch; flex-direction: column; }
   .model-browser-tabs button { flex: 1; }
   .community-model-search { grid-template-columns: 1fr; }
-  .model-variant { grid-template-columns: minmax(0, 1fr) minmax(90px, 0.35fr) auto; }
+  .model-variant { grid-template-columns: minmax(0, 1fr) auto; gap: 0 10px; }
+  .model-variant > .variant-memory-tiers { grid-column: 1; grid-row: 2; padding: 0 0 12px 12px; }
+  .model-variant > button { grid-column: 2; grid-row: 1 / span 2; }
   .download-circle { right: 20px; bottom: max(20px, env(safe-area-inset-bottom)); }
   .download-queue-item { flex-wrap: wrap; gap: 10px; padding: 14px; }
   .download-item-icon { flex-basis: 32px; height: 32px; }

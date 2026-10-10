@@ -4,10 +4,12 @@ import { formatNumber } from '../../app/formatters';
 import { useSettings } from '../settings/SettingsProvider';
 import { PrefixCacheDirectory } from './PrefixCacheDirectory';
 import { PrefixDiskBudgetControls } from './PrefixDiskBudgetControls';
+import { hasSeparateVram } from '../runtime/memoryArchitecture';
 
 export function PrefixCacheSettingsPanel() {
   const { runtime } = useRuntime();
   const { tr } = useSettings();
+  const separate = hasSeparateVram(runtime);
   const diskBudget = Number(runtime?.prefix_cache_total_disk_max_bytes ?? runtime?.prefix_cache_disk_max_bytes ?? 0);
   const persistent = typeof runtime?.prefix_cache_total_disk_max_bytes === 'number'
     || typeof runtime?.prefix_cache_max_bytes === 'number';
@@ -16,6 +18,9 @@ export function PrefixCacheSettingsPanel() {
     <SectionLabel title={tr('持久化前缀缓存', 'Persistent prefix cache')} />
     <TMPanel className="server-settings-panel server-prefix-panel">
       <div className="setting-list">
+        <SettingRow title={tr('前缀缓存层级', 'Prefix cache hierarchy')}
+          detail={separate ? tr('显存热层 + SSD 冷层，不保留 RAM 中间缓存层。', 'VRAM hot tier + SSD cold tier, without an intermediate RAM cache.') : tr('RAM 热层 + SSD 冷层。', 'RAM hot tier + SSD cold tier.')}
+          trailing={<span className="server-managed-value">{separate ? 'VRAM → SSD' : 'RAM → SSD'}</span>} />
         <SettingRow
           title={tr('前缀块大小', 'Prefix block size')}
           detail={tr(

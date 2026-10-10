@@ -10,6 +10,7 @@ import { ResourceMonitorPanel } from './ResourceMonitorPanel';
 import { ResourceAllocationPanel } from './ResourceAllocationPanel';
 import { PrefixCacheInventoryPanel } from './PrefixCacheInventoryPanel';
 import { toast } from '../../stores/toastStore';
+import { hasSeparateVram } from './memoryArchitecture';
 
 export function CachePage() {
   const { connectionRevision } = useRuntime();
@@ -20,6 +21,7 @@ function ResourcePageContent() {
   const { runtime, refreshRuntime } = useRuntime();
   const connectionScope = useConnectionScope();
   const { tr } = useSettings();
+  const separate = hasSeparateVram(runtime);
   const [busy, setBusy] = useState(false);
   const clearing = useRef(false);
   const prefixCacheRamBudget = Number(runtime?.prefix_cache_total_hot_max_bytes ?? runtime?.prefix_cache_max_bytes ?? 0);
@@ -102,7 +104,7 @@ function ResourcePageContent() {
                       '当前进程内的单条设备热前缀；切换会话或编辑 prompt 会重新 prefill',
                       'One device-hot prefix in this process; switching sessions or editing the prompt triggers a fresh prefill',
                     )
-                  : tr(
+                  : separate ? tr('显存热缓存与可跨重启复用的 SSD 前缀块，不保留 RAM 中间层', 'VRAM hot cache with persistent SSD prefix blocks; no intermediate RAM tier') : tr(
                       'RAM 热缓存与可跨重启复用的 SSD 前缀块',
                       'RAM hot cache with persistent SSD prefix blocks',
                     )}
@@ -117,7 +119,7 @@ function ResourcePageContent() {
           {prefixCacheHotOnly ? (
             <>
               <UsageBar
-                label={tr('RAM 热前缀', 'RAM hot prefix')}
+                label={separate ? tr('显存热前缀', 'VRAM hot prefix') : tr('RAM 热前缀', 'RAM hot prefix')}
                 used={prefixCacheHotBytes}
                 total={Math.max(prefixCacheHotBytes, prefixCacheRamBudget)}
               />
@@ -161,7 +163,7 @@ function ResourcePageContent() {
                   total={Math.max(prefixCacheDiskBudget, prefixCacheDiskBytes)}
                 />
                 <UsageBar
-                  label={tr('RAM 热缓存总占用', 'Total RAM hot cache')}
+                  label={separate ? tr('显存热缓存总占用', 'Total VRAM hot cache') : tr('RAM 热缓存总占用', 'Total RAM hot cache')}
                   used={prefixCacheHotBytes}
                   total={Math.max(prefixCacheHotBytes, prefixCacheRamBudget)}
                 />
@@ -191,7 +193,7 @@ function ResourcePageContent() {
                   </small>
                 </div>
                 <div>
-                  <span>{tr('RAM 热层', 'RAM hot tier')}</span>
+                  <span>{separate ? tr('显存热层', 'VRAM hot tier') : tr('RAM 热层', 'RAM hot tier')}</span>
                   <strong>{formatNumber(prefixCacheHotBytes / 2 ** 20, 1)} MiB</strong>
                   <small>{formatNumber(runtime?.prefix_cache_hot_blocks)} blocks</small>
                 </div>
@@ -210,7 +212,7 @@ function ResourcePageContent() {
                 <div>
                   <span>{tr('SSD 命中', 'SSD hits')}</span>
                   <strong>{formatNumber(runtime?.prefix_cache_disk_hits)}</strong>
-                  <small>{formatNumber(runtime?.prefix_cache_hot_hits)} RAM hits</small>
+                  <small>{formatNumber(runtime?.prefix_cache_hot_hits)} {separate ? 'VRAM' : 'RAM'} hits</small>
                 </div>
                 <div>
                   <span>{tr('回收', 'Evictions')}</span>

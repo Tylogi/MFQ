@@ -27,6 +27,12 @@
 
 namespace mfq::cuda::internal {
 
+bool cuda_has_separate_memory() {
+    cudaDeviceProp properties{};
+    MFQ_CUDA_CHECK(cudaGetDeviceProperties(&properties, mfq_current_cuda_device()));
+    return !properties.integrated && std::strstr(properties.name, "GB10") == nullptr;
+}
+
 static std::string cuda_prefix_cache_compatibility_key(
     const mfq::ModelSource &source, int64_t max_position_embeddings) {
     std::ostringstream key;
@@ -74,7 +80,9 @@ std::shared_ptr<mfq::cache::PagedPrefixCache> make_cuda_paged_prefix_cache(
     cache.compatibility_key = cuda_prefix_cache_compatibility_key(source, max_position_embeddings);
     cache.block_size_tokens = static_cast<size_t>(config.block_tokens);
     cache.max_disk_bytes = config.disk_bytes;
-    cache.max_hot_bytes = config.hot_bytes;
+    // Discrete devices keep native GPU snapshots as the hot tier. Serialized
+    // blocks are staging buffers for SSD I/O, never a retained RAM cache.
+    cache.max_hot_bytes = cuda_has_separate_memory() ? 0 : config.hot_bytes;
     cache.max_pending_writes = config.pending_writes;
     cache.max_pending_bytes = config.pending_bytes;
     return std::make_shared<mfq::cache::PagedPrefixCache>(std::move(cache));
@@ -102,9 +110,11 @@ struct TextSessionCache::Impl : mfq::engine::SessionCache<CudaSessionOps> {
 
 TextSessionCache::TextSessionCache(const mfq::engine::SessionCacheConfig &session_config,
     const mfq::engine::PrefixCacheConfig &prefix_config,
-    std::shared_ptr<mfq::cache::PagedPrefixCache> paged_cache, bool supported, int disabled_reason)
+    std::shared_ptr<mfq::cache::PagedPrefixCache> paged_cache, bool supported, int disabled_reason,
+    bool native_hot_snapshots)
     : impl_(std::make_unique<Impl>(
-          session_config, prefix_config, std::move(paged_cache), supported, disabled_reason)) {}
+          session_config, prefix_config, std::move(paged_cache), supported, disabled_reason,
+          native_hot_snapshots)) {}
 
 TextSessionCache::~TextSessionCache() = default;
 
@@ -142,6 +152,9 @@ size_t TextSessionCache::clear_live_sessions() noexcept { return impl_->clear_li
 size_t TextSessionCache::clear() { return impl_->clear(); }
 
 uint64_t TextSessionCache::trim_hot(uint64_t target_bytes) { return impl_->trim_hot(target_bytes); }
+uint64_t TextSessionCache::set_hot_limit(uint64_t max_bytes) { return impl_->set_hot_limit(max_bytes); }
+uint64_t TextSessionCache::set_disk_limit(uint64_t max_bytes) { return impl_->set_disk_limit(max_bytes); }
+uint64_t TextSessionCache::refresh_disk_index() { return impl_->refresh_disk_index(); }
 
 #define MFQ_INSTANTIATE_SESSION_CACHE(MODEL)                                                       \
     template TextSessionRestore TextSessionCache::restore_best(MODEL &,                            \

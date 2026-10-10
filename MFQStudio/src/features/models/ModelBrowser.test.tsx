@@ -12,6 +12,29 @@ const configuration = {
   status: 'unknown' as const, recommendation: 'unknown' as const, reasons: [],
 };
 
+it('uses separate MoE pressure bars and applies the KV calculator only to VRAM', async () => {
+  const data = catalog(false, true);
+  const GiB = 2 ** 30;
+  data.system = { ...data.system, backend: 'cuda', physical_memory_bytes: 64 * GiB,
+    memory_pools: [{ kind: 'vram', capacity_bytes: 24 * GiB }, { kind: 'ram', capacity_bytes: 64 * GiB }] };
+  const first = data.data[0];
+  first.capabilities = ['MoE'];
+  first.cache_profile = { max_context: 32768, fixed_bytes: 0,
+    components: [{ bytes_per_row: 2 ** 20, tokens_per_row: 1, minimum_rows: 0, allocation: 'exact' }] };
+  first.variants[0] = { ...first.variants[0], estimated_resident_weight_bytes: 83 * GiB,
+    estimated_weight_bytes_by_role: { dense: 2 * GiB, experts: 80 * GiB, embedding: GiB } };
+  vi.mocked(modelsApi.officialHubModels).mockResolvedValue(data);
+  render(<ModelBrowser tab="official" onTabChange={vi.fn()} jobKinds={[]} onError={vi.fn()} onJobCreated={vi.fn()} tr={(_, en) => en} />);
+  expect(await screen.findByRole('progressbar', { name: 'VRAM pressure: 8.3%' })).toBeInTheDocument();
+  expect(screen.getByRole('progressbar', { name: 'RAM pressure: 126.6%' })).toBeInTheDocument();
+  fireEvent.click(screen.getByText('KV Cache curve & calculator'));
+  fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+  expect(screen.getByRole('progressbar', { name: 'VRAM pressure: 25.0%' })).toBeInTheDocument();
+  expect(screen.getByRole('progressbar', { name: 'RAM pressure: 126.6%' })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'Clear' }));
+  expect(screen.getByRole('progressbar', { name: 'VRAM pressure: 8.3%' })).toBeInTheDocument();
+});
+
 function catalog(refreshing: boolean, available: boolean): OfficialModelList {
   return {
     refreshing,

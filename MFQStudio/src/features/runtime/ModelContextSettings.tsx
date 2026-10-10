@@ -12,6 +12,7 @@ import { CompactSelect } from '../../shared/ui/CompactSelect';
 import { QsaKvOffloadPanel } from '../connections/QsaKvOffloadPanel';
 import { KvQuantizationPanel } from '../connections/KvQuantizationPanel';
 import { ModelContextSummary } from './ModelContextSummary';
+import { hasSeparateVram } from './memoryArchitecture';
 import { contextCacheEstimate, quantizedCacheProfile } from '../models/cacheData';
 import { useModelCacheProfiles } from '../models/useModelCacheProfiles';
 
@@ -25,6 +26,7 @@ export function ModelContextSettings() {
   const [yarnDrafts, setYarnDrafts] = useState<Record<string, boolean>>({});
   const [streamDrafts, setStreamDrafts] = useState<Record<string, boolean>>({});
   const [budgetDrafts, setBudgetDrafts] = useState<Record<string, string>>({});
+  const [ramBudgetDrafts, setRamBudgetDrafts] = useState<Record<string, string>>({});
   const [quantizationDrafts, setQuantizationDrafts] = useState<Record<string, KvQuantizationSettings>>({});
   const [yarnInfo, setYarnInfo] = useState<Record<string, YarnContextInfo>>({});
   const [warnings, setWarnings] = useState<Record<string, string>>({});
@@ -69,6 +71,7 @@ export function ModelContextSettings() {
   }, [ready, connectionRevision, terminalVersion]);
   useEffect(() => {
     setSelected(''); setDrafts({}); setYarnDrafts({}); setStreamDrafts({}); setBudgetDrafts({});
+    setRamBudgetDrafts({});
     setQuantizationDrafts({});
     setYarnInfo({}); setWarnings({}); setModelErrors({}); setPolicy(null); setError('');
     setSubmitting(''); setSaving(false); setCapDraft(null); setSaved(false);
@@ -105,11 +108,16 @@ export function ModelContextSettings() {
   const savedBudget = String((storage?.budget_bytes ?? 2 ** 31) / 2 ** 30);
   const budget = budgetDrafts[name] ?? savedBudget;
   const budgetBytes = budget.trim() === '' ? 0 : Math.round(Number(budget) * 2 ** 30);
+  const separateVram = hasSeparateVram(runtime);
+  const savedRamBudget = storage?.ram_budget_bytes == null ? '' : String(storage.ram_budget_bytes / 2 ** 30);
+  const ramBudget = ramBudgetDrafts[name] ?? savedRamBudget;
+  const ramBudgetBytes = ramBudget.trim() === '' ? null : Math.round(Number(ramBudget) * 2 ** 30);
+  const validRamBudget = !separateVram || ramBudgetBytes === null || Number.isSafeInteger(ramBudgetBytes) && ramBudgetBytes >= 0 && ramBudgetBytes <= 2 ** 50;
   const validNumber = (text: string, limit = 2147483647) => Number.isSafeInteger(Number(text)) && Number(text) >= 512 && Number(text) <= limit;
   const valid = value === '' || validNumber(value, maximum != null ? Number.MAX_SAFE_INTEGER : 2147483647);
-  const validBudget = !item?.qsa_kv_offload_supported || Number.isSafeInteger(budgetBytes) && budgetBytes > 0 && budgetBytes <= 2 ** 50;
+  const validBudget = !item?.qsa_kv_offload_supported || validRamBudget && Number.isSafeInteger(budgetBytes) && budgetBytes > 0 && budgetBytes <= 2 ** 50;
   const changed = value !== savedValue || yarnEnabled !== savedYarn || streamEnabled !== (storage?.enabled ?? false) || budget !== savedBudget
-    || quantization.enabled !== savedQuantization.enabled || quantization.bits !== savedQuantization.bits;
+    || separateVram && ramBudget !== savedRamBudget || quantization.enabled !== savedQuantization.enabled || quantization.bits !== savedQuantization.bits;
   const gib = (bytes: number) => `${(bytes / 2 ** 30).toFixed(2)} GiB`;
   const phases: Record<string, string> = { reloading: tr('准备重载', 'Preparing reload'), weights: tr('加载权重', 'Loading weights'),
     finalizing: tr('准备运行时', 'Preparing runtime'), compiling: tr('编译内核', 'Compiling kernels'), warming: tr('预热', 'Warming up') };
@@ -129,7 +137,7 @@ export function ModelContextSettings() {
     setSubmitting(targetName);
     try {
       await reloadModelContext(item.id, size, yarnEnabled, item.qsa_kv_offload_supported
-        ? { enabled: streamEnabled, budget_bytes: budgetBytes } : undefined,
+        ? { enabled: streamEnabled, budget_bytes: budgetBytes, ...(separateVram ? { ram_budget_bytes: ramBudgetBytes } : {}) } : undefined,
         item.kv_quantization_supported ? quantization : undefined);
       if (current()) toast.success(tr('整套模型设置已提交，重载后生效。', 'Model settings submitted together; they apply after reload.'));
     } catch (cause) {
@@ -208,13 +216,16 @@ export function ModelContextSettings() {
         <KvQuantizationPanel key={`quantization:${name}`} supported={item.kv_quantization_supported === true} disabled={busy || !policy}
           settings={quantization} onChange={value => setQuantizationDrafts(draft => ({ ...draft, [name]: value }))} />
         <QsaKvOffloadPanel key={name} model={item} context={finalContext} enabled={streamEnabled} budget={budget} profile={profile}
+          separateVram={separateVram} ramBudget={ramBudget}
+          onRamBudgetChange={(value) => setRamBudgetDrafts((draft) => ({ ...draft, [name]: value }))}
           metadataError={cacheErrors[name]} disabled={busy || !policy}
           onEnabledChange={(enabled) => setStreamDrafts((draft) => ({ ...draft, [name]: enabled }))}
           onBudgetChange={(value) => setBudgetDrafts((draft) => ({ ...draft, [name]: value }))} />
         {warnings[name] && <p role="alert">{warnings[name]} · {formatNumber(maximum)} tokens</p>}
         {modelErrors[name] && <p role="alert">{modelErrors[name]}</p>}
         {!valid && <p role="alert">{tr('请输入有效整数，或留空使用自动设置。', 'Enter a valid integer, or leave empty for automatic context.')}</p>}
-        {!validBudget && <p role="alert">{tr('请输入大于 0 的有效 KV 常驻预算。', 'Enter a valid resident KV budget greater than zero.')}</p>}
+        {!validBudget && <p role="alert">{validRamBudget ? tr('请输入大于 0 的有效 KV 常驻预算。', 'Enter a valid resident KV budget greater than zero.')
+          : tr('内存流式 KV 预算应为非负数，或留空使用自动设置。', 'RAM streaming KV budget must be nonnegative, or empty for automatic sizing.')}</p>}
         {active && <div className="model-context-progress" role="status">
           <span>{phases[String(job.progress_data?.phase)] ?? tr('等待执行', 'Queued')} · {job.progress_data?.context_size ?? finalContext} · {Math.round(job.progress * 100)}%</span>
           <progress aria-label={tr(`${name} 上下文设置进度`, `${name} context update progress`)} max={1} value={job.progress} />
@@ -223,7 +234,8 @@ export function ModelContextSettings() {
         {job && ['failed', 'cancelled', 'interrupted'].includes(job.status) && <p role="alert">{job.error?.message ?? tr('模型设置未完成，请重试。', 'Model settings did not complete. Please retry.')}</p>}
         <div className="model-context-footer">
           <ModelContextSummary model={name} context={valid ? finalContext : NaN} nativeContext={nativeCapacity} yarnEnabled={yarnEnabled}
-            profile={profile} streaming={streamEnabled} budget={budgetBytes} changed={changed} quantization={quantization} />
+            profile={profile} streaming={streamEnabled} budget={budgetBytes} separateVram={separateVram} ramBudget={ramBudgetBytes}
+            changed={changed} quantization={quantization} />
           <button className="model-context-save" aria-label={tr('保存到该模型', 'Save to this model')} type="button"
             disabled={busy || !valid || !validBudget || !policy || !info} onClick={() => void apply()}>
             {busy ? tr('保存中…', 'Saving…') : tr('保存到该模型', 'Save to this model')}
