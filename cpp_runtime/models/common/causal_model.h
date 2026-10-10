@@ -56,6 +56,10 @@ template <class Backend, class Derived> struct CausalModelBase : Backend, Causal
         }
     }
 
+    template <class Loader> bool has_independent_output_weights(Loader &loader) const {
+        return !tie_word_embeddings() && loader.has_weight("model.output.weight");
+    }
+
     template <class Loader> void load_weights(Loader &loader, bool with_blocks = true) {
         constexpr auto embedding = "model.token_embedding.weight";
         constexpr auto output = "model.output.weight";

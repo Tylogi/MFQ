@@ -1,3 +1,5 @@
+#pragma once
+
 void verify_compact_prefill_mma(const std::filesystem::path& root) {
     CudaExecutionContext execution;
     int cases=0;float maximum_relative=0;

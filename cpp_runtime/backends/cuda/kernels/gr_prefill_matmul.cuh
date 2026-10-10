@@ -1,3 +1,5 @@
+#pragma once
+
 // FP32 batched GR projection from compressed NINT weights. The only decoded
 // weights are a small shared-memory tile reused by sixty-four token rows.
 namespace {

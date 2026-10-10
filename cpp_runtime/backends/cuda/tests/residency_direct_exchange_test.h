@@ -1,3 +1,5 @@
+#pragma once
+
 #include "storage/moe_cached_source_internal.h"
 
 // Seed real compressed transfer-cache fields without launching the unrelated

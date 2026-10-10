@@ -1,3 +1,4 @@
+#include "../runtime/execution_options.h"
 #include "mfq_cuda_norm_ops.h"
 #include "mfq_cuda_quant_ops.h"
 #include "vq.h"
@@ -45,8 +46,8 @@ using mfq_tensor_backend::indexing::Slice;
 using namespace mfq::cuda::quant_format;
 
 void prepare_nvq_integer_codebook(NvqWeight& w) {
-    const char* enabled=std::getenv("MFQ_NVQ1_INTEGER_DELTA");
-    if(!enabled || enabled[0]=='0' || w.integer_codebook.defined() ||
+    const auto enabled=mfq::cuda::runtime_options::nvq1_integer_delta();
+    if(!enabled || !*enabled || w.integer_codebook.defined() ||
        (w.kernel_format!=1 && w.kernel_format!=8) || !w.codebook.is_cuda())return;
     const auto canonical=w.codebook.to(mfq_tensor_backend::kCPU).contiguous();
     const bool small=w.kernel_format==8;
@@ -63,8 +64,8 @@ void prepare_nvq_integer_codebook(NvqWeight& w) {
     w.integer_codebook=mfq_tensor_backend::tensor(digits).to(w.codebook.device()).contiguous();
 }
 void prepare_nvq_decode_records(NvqWeight& w,bool /*immutable*/) {
-    const char* enabled=std::getenv("MFQ_NVQ1_GROUP_RECORDS");
-    if(!enabled || enabled[0]!='1' || w.decode_records.defined() ||
+    const auto enabled=mfq::cuda::runtime_options::nvq1_group_records();
+    if(!enabled || !*enabled || w.decode_records.defined() ||
        (w.kernel_format!=1 && w.kernel_format!=8) || !w.indices_packed.is_cuda() || w.gs!=24 ||
        w.sub_bits!=(w.kernel_format==8?4:3))return;
     if(w.aux_packed.numel()==0){w.decode_records=w.indices_packed;return;}
@@ -106,7 +107,7 @@ static NvqMatmulPath select_nvq_matmul_path(const NvqWeight & w, int M) {
     // Small expert matrices underfill the multi-column GEMV on SM86.
     // The vector decoder plus FP32-accumulating GEMM is faster from M=9.
     if (M >= 9 && M <= 16 && w.out <= 4096 && w.neuron_len <= 4096 &&
-            std::getenv("MFQ_NVQ_DENSE_REFERENCE") == nullptr) {
+            !mfq::cuda::runtime_options::nvq_dense_reference()) {
         thread_local int cached_device = -1, major = 0, minor = 0;
         const int device = w.indices_packed.get_device();
         if (device != cached_device) {

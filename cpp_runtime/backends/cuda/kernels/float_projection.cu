@@ -8,10 +8,10 @@
 #include <mutex>
 #include <type_traits>
 #include <cstdlib>
-#include "gr_prefill_tf32.inc"
-#include "gr_prefill_half2.inc"
-#include "gr_prefill_matmul.inc"
-#include "gr_prefill_mix.inc"
+#include "gr_prefill_tf32.cuh"
+#include "gr_prefill_half2.cuh"
+#include "gr_prefill_matmul.cuh"
+#include "gr_prefill_mix.cuh"
 
 namespace {
 template<bool AlignedQ8=false,int FixedGroup=0,class Input>

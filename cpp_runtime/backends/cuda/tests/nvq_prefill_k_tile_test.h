@@ -1,3 +1,5 @@
+#pragma once
+
 void verify_nvq_prefill_k_tiles(const std::filesystem::path& root,bool cohorts=false,bool defaults=false) {
     struct Environment {
         const char* name;

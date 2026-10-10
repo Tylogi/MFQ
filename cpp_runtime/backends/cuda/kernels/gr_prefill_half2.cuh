@@ -1,3 +1,5 @@
+#pragma once
+
 // Transient half high/residual tiles. Residuals are scaled by 4096 before
 // half conversion; two/three Tensor Core products retain FP32 accuracy.
 #include <mma.h>

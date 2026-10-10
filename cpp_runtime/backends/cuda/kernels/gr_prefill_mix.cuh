@@ -1,3 +1,5 @@
+#pragma once
+
 // Four stream projections share the activation tile. Products overwrite the
 // decoded tile after the last FMA, then reduce in canonical stream order.
 namespace {

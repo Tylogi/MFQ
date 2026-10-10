@@ -365,8 +365,8 @@ void MoeExpertCache::preload_complete_residency() {
         layer_sources[source->layer_id_].push_back(source.get());
     }
     int64_t ram_allocated=0;
-    const auto* layer_option=std::getenv("MFQ_MOE_PREFILL_LAYER");
-    pipeline_prefill_layer_layout_=layer_option && std::atoi(layer_option)!=0;
+    const auto layer_option=mfq::cuda::runtime_options::moe_prefill_layer();
+    pipeline_prefill_layer_layout_=layer_option && *layer_option!=0;
     std::vector<std::vector<std::vector<int64_t>>> ram_field_offsets;
     if(pipeline_prefill_layer_layout_) {
         ram_field_offsets.resize(sources_.size());

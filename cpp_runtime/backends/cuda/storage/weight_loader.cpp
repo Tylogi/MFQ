@@ -1,3 +1,4 @@
+#include "../runtime/execution_options.h"
 #include "weight_loader.h"
 #include "float_projection.h"
 #include "gated_residual_fused.h"
@@ -9,7 +10,6 @@
 #include "moe_expert_cache.h"
 #include "mfe_expert_store.h"
 #include "moe_quant_range_source.h"
-#include "mfq/mfq_model_source.h"
 #include <cstdlib>
 #include <cstdio>
 
@@ -23,11 +23,13 @@ std::shared_ptr<mfq::NintRows> load_nint_row_table(
     bool parallel=source.supports_parallel_tensor_reads();
     auto batch=source.tensor_batch_reader(name);
     bool mapped_file=false;
-    const auto* mapped=std::getenv("MFQ_PLE_FILE_MAP");
-    if(mapped && mapped[0]=='1')if(const auto* file=dynamic_cast<const mfq::MfqModelSource*>(&source)) {
-        read=file->mapped_tensor_reader(name);parallel=true;batch={};mapped_file=true;
+    const auto mapped=mfq::cuda::runtime_options::ple_file_map();
+    if(mapped.value_or(false)) {
+        if(auto mapping=source.mapped_tensor_reader(name)) {
+            read=std::move(mapping);parallel=true;batch={};mapped_file=true;
+        }
     }
-    if(const auto* trace=std::getenv("MFQ_TRACE_PLE_TIMINGS");trace && trace[0]=='1')
+    if(const auto trace=mfq::cuda::runtime_options::trace_ple_timings();trace && *trace)
         std::fprintf(stderr,"nint_row_source mapped_file=%d nbytes=%llu name=%s\n",int(mapped_file),
             static_cast<unsigned long long>(metadata.nbytes),name.c_str());
     return std::make_shared<mfq::NintRows>(static_cast<std::size_t>(metadata.nbytes),
@@ -238,8 +240,8 @@ ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::Model
             weight->dense.scalar_type()==tb::kBFloat16 && weight->dense.is_contiguous() &&
             weight->dense.dim()==2 && weight->dense.size(0)>0 && weight->dense.size(0)<=4;
         auto prepared_right=prepare_injection?(promoted.defined()?promoted:right.to(tb::kFloat32)):Tensor{};
-        const auto* vector_setting=std::getenv("MFQ_GR_DENSE_VECTOR");
-        if(prepare_injection && (!vector_setting || vector_setting[0]!='0') &&
+        const auto vector_setting=mfq::cuda::runtime_options::gr_dense_vector();
+        if(prepare_injection && (!vector_setting || *vector_setting) &&
                 !promoted.defined() && right.size(0)%4==0)
             prepared_right=prepare_gr_dense_vector_right(prepared_right);
         Linear forward=[right=std::move(right),promoted=std::move(promoted)](

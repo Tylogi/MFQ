@@ -1,3 +1,5 @@
+#pragma once
+
 class GdnColumnsScope {
     std::string previous_;
     bool present_;

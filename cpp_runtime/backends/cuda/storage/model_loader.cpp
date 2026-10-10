@@ -1,3 +1,4 @@
+#include "../runtime/execution_options.h"
 #include "storage/weight_loader.h"
 #include "storage/model_loader.h"
 #include "storage/mapped_embedding.h"
@@ -21,13 +22,13 @@ template <class Model> struct CudaWeightLoader {
     Model &model;
     const mfq::ModelSource &source;
     auto embedding(const std::string &name) {
-        const auto* mapped=std::getenv("MFQ_EMBEDDING_MAPPED");
-        const bool mapped_control=mapped && mapped[0]=='2';
-        const bool use_mapped=mapped ? mapped[0]=='1' || mapped_control :
+        const auto mapped=mfq::cuda::runtime_options::embedding_mapped();
+        const bool mapped_control=mapped && *mapped==2;
+        const bool use_mapped=mapped ? *mapped==1 || mapped_control :
             model.execution->config.moe_pipeline && model.execution->config.moe_preload_all &&
             model.execution->config.moe_ram_pcie;
         const auto& dtype=require_tensor(source,name).dtype;
-        if(use_mapped && !model.tie_word_embeddings() && has_weight("model.output.weight") &&
+        if(use_mapped && model.has_independent_output_weights(*this) &&
                 !model.execution->tensor_parallel.enabled() && !model.execution->loading_cpu_layer &&
                 (dtype=="BF16" || dtype=="F16" || dtype=="F32")) {
             auto cpu=load_dense_cpu(*model.execution,source,name);

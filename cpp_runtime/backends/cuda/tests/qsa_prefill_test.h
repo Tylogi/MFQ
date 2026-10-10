@@ -1,3 +1,5 @@
+#pragma once
+
 void qsa_prefill_fusion_case() {
     struct Setting {
         std::string old;

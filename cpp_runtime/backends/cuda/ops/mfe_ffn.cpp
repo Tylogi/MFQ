@@ -33,8 +33,8 @@ View pool_view(const MixedMoePool& pool,int rows,std::vector<tb::Tensor>& owners
     if(pool.family==MixedMoeFamily::Nint)result=nint_view(pool.nint,rows,pool.local_experts,owners);
     else if(pool.family==MixedMoeFamily::Nvq) {
         const auto& w=pool.nvq;result.family=2;result.output_rows=rows;result.local_experts=pool.local_experts;
-        const char* word_signs=std::getenv("MFQ_MFE_NVQ_WORD_SIGNS");
-        result.nvq_word_signs=!word_signs || word_signs[0]!='0';
+        const auto word_signs=mfq::cuda::runtime_options::mfe_nvq_word_signs();
+        result.nvq_word_signs=!word_signs || *word_signs;
         result.input_width=int(w.neuron_len);result.groups=int(w.ng);result.group_size=int(w.gs);
         result.format=int(w.kernel_format);result.sub_bits=int(w.sub_bits);result.sign_mode=int(w.sign_mode);
         const bool d4=result.format==3 || result.format==10 || result.format==11 ||
@@ -95,13 +95,13 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         }
         d.fields[7]=it->second.first.data_ptr();d.fields[8]=it->second.second.data_ptr();
     };
-    const auto* late_option=std::getenv("MFQ_MFE_NINT_LATE_SCALE");
-    const auto* grouped_option=std::getenv("MFQ_NINT_GROUP_DOT");
-    const auto* hint_option=std::getenv("MFQ_NINT_ROUTE_HINT");
-    const auto* warp_option=std::getenv("MFQ_NINT_ROUTE_WARPS");
-    const bool align_late=late_option && std::strcmp(late_option,"1")==0 && batch_.tokens<=8 &&
-        (!grouped_option || grouped_option[0]!='0') && (!hint_option || hint_option[0]!='0') &&
-        (!warp_option || std::atoi(warp_option)!=4);
+    const auto late_option=mfq::cuda::runtime_options::mfe_nint_late_scale();
+    const auto grouped_option=mfq::cuda::runtime_options::nint_group_dot();
+    const auto hint_option=mfq::cuda::runtime_options::nint_route_hint();
+    const auto warp_option=mfq::cuda::runtime_options::nint_route_warps();
+    const bool align_late=late_option && *late_option && batch_.tokens<=8 &&
+        (!grouped_option || *grouped_option) && (!hint_option || *hint_option) &&
+        (!warp_option || *warp_option!=4);
     for(int projection=0;projection<3;++projection) {
         auto& runtime=*projections[projection];
         if(runtime.n_experts!=batch_.experts || (projection<2 && runtime.neuron_len!=batch_.input_width) ||
@@ -121,8 +121,8 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
                 d.nint_late_bits=-1; // The ordinary routed kernel uses four-value chunks here.
             else if(align_late && d.family==1 && nint_pools==1 && (d.group_size==24 || d.group_size==28)) {
                 const auto& w=runtime.pools[p].nint;
-                const auto* direct_option=std::getenv("MFQ_NINT_DIRECT_POOL");
-                const int width=direct_option && direct_option[0]=='0'?d.input_width:d.groups*d.group_size;
+                const auto direct_option=mfq::cuda::runtime_options::nint_direct_pool();
+                const int width=direct_option && !*direct_option?d.input_width:d.groups*d.group_size;
                 if(w.bits>=4 && w.bits<=6 && nint_late_scale_enabled(width,int(w.bits),input.get_device()))
                     d.nint_late_bits=int(w.bits);
             }
@@ -149,8 +149,8 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         mapping.insert(mapping.end(),indices.begin(),indices.end());
     }
     if(shared[0] || shared[1] || shared[2]) {
-        const auto* dense_math_option=std::getenv("MFQ_MFE_SHARED_DENSE_MATH");
-        batch_.shared_dense_math=dense_math_option && std::strcmp(dense_math_option,"1")==0;
+        const auto dense_math_option=mfq::cuda::runtime_options::mfe_shared_dense_math();
+        batch_.shared_dense_math=dense_math_option && *dense_math_option;
         if(!shared[0] || !shared[1] || !shared[2] || !shared_gate.defined() || shared_gate.numel()!=batch_.tokens)
             throw std::invalid_argument("two-stage MFE shared projection incomplete");
         batch_.shared_intermediate=int(shared[0]->out);
@@ -160,11 +160,11 @@ MfeFfnRuntime::MfeFfnRuntime(const std::array<MixedMoeRuntime*,3>& projections,
         for(int p=0;p<3;++p) {
             auto d=nint_view(*shared[p],int(shared[p]->out),1,owners_);d.expert_local=nullptr;
             d.nint_whole=nint_whole && (d.group_size==28 || (p<2 && d.group_size==24));
-            const auto* grouped=std::getenv("MFQ_NINT_GROUP_DOT");
+            const auto grouped=mfq::cuda::runtime_options::nint_group_dot();
             if(batch_.shared_dense_math && shared[p]->aligned_q8)
                 d.dense_reduction_warps=-1; // Dense q8 uses four-value chunk accumulation.
-            else if(batch_.shared_dense_math && (!grouped || grouped[0]!='0') &&
-                !std::getenv("MFQ_NINT_DENSE_REFERENCE") && !shared[p]->aligned_q8 &&
+            else if(batch_.shared_dense_math && (!grouped || *grouped) &&
+                !mfq::cuda::runtime_options::nint_dense_reference() && !shared[p]->aligned_q8 &&
                 (d.group_size==24 || d.group_size==28) &&
                 (reinterpret_cast<std::uintptr_t>(d.fields[0])&3u)==0)
                 d.dense_reduction_warps=d.groups<=32?1:4;
@@ -303,10 +303,10 @@ mfq::cuda::MfePackedProjection MfeFfnRuntime::expert_view(int p,int expert,
 void MfeFfnRuntime::trace_dispatch() {
     if(dispatch_trace_reported_)return;
     dispatch_trace_reported_=true;
-    const auto* trace=std::getenv("MFQ_TRACE_MFE_DISPATCH");
-    if(!trace || trace[0]=='0')return;
-    const auto* grouped=std::getenv("MFQ_MFE_GROUP_DOT");
-    const bool group_dot=!grouped || grouped[0]!='0';
+    const auto trace=mfq::cuda::runtime_options::trace_mfe_dispatch_requested();
+    if(!trace || !*trace)return;
+    const auto grouped=mfq::cuda::runtime_options::mfe_group_dot();
+    const bool group_dot=!grouped || *grouped;
     const bool gu_requested=mfq::cuda::mfe_ffn_e8_narrow_requested(batch_,false);
     const bool down_requested=mfq::cuda::mfe_ffn_e8_narrow_requested(batch_,true);
     const bool eligible=batch_.e8_narrow && batch_.default_math && group_dot;

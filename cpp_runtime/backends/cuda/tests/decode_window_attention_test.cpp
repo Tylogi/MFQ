@@ -249,7 +249,9 @@ void gdn_case(bool model_shape = false) {
     GdnWeights weights{linear(hidden,channels,1),linear(hidden,nv*d,2),linear(hidden,nv,3),linear(hidden,nv,4),
         linear(nv*d,hidden,5),data({channels,4},6),tb::zeros({nv},gpu),tb::zeros({nv},gpu),tb::ones({d},gpu)};
     Gdn actual(weights,nk,nv,d,4,1e-6,false),oracle(weights,nk,nv,d,4,1e-6,false,false);
-    Gdn row_reference(weights,nk,nv,d,4,1e-6,false,true,false,false,true,false);
+    // Isolate recurrence layout: both sides use the same fused preparation.
+    // The independent unfused oracle above still checks the complete result.
+    Gdn row_reference(weights,nk,nv,d,4,1e-6,false,true,false,false,true,true);
     const int prefix=model_shape?2:5;
     auto input=data({1,model_shape?5:32,hidden},12,.5f);
     actual.forward_chunk(execution,input.narrow(1,0,prefix),true);oracle.forward_chunk(execution,input.narrow(1,0,prefix),true);
@@ -668,9 +670,9 @@ void qsa_sparse_gate_benchmark(bool compare_query=false) {
     }
 }
 }
-#include "qsa_prefill_test.inc"
-#include "gdn_prefill_columns_test.inc"
-#include "gdn_prefill_pipeline_test.inc"
+#include "qsa_prefill_test.h"
+#include "gdn_prefill_columns_test.h"
+#include "gdn_prefill_pipeline_test.h"
 int main(int argc,char** argv)try {
     const auto stream=mfq_current_cuda_stream();auto context=default_context(mfq_current_cuda_device());context->begin_graph_pool(stream);
     if(argc==2 && std::string(argv[1])=="--gdn-core-check") {

@@ -1,3 +1,4 @@
+#include "../runtime/execution_options.h"
 #include "mfq_cuda_moe_ops.h"
 #include "mfq_cuda_quant_ops.h"
 #include "mfq_cuda_nint_route_hint.h"
@@ -1601,12 +1602,12 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
             found=nint_input_plans.emplace(input_rows,std::move(plan)).first;
         }
         auto& plan=found->second;
-        const char* row_setting=std::getenv("MFQ_NINT_ROUTE_ROW_WORKSPACE");
-        const char* direct_setting=std::getenv("MFQ_NINT_DIRECT_POOL");
-        const char* group_setting=std::getenv("MFQ_NINT_GROUP_DOT");
-        const char* hint_setting=std::getenv("MFQ_NINT_ROUTE_HINT");
-        const char* warp_setting=std::getenv("MFQ_NINT_ROUTE_WARPS");
-        bool request_rows=row_setting && row_setting[0]!='0';
+        const auto row_setting=mfq::cuda::runtime_options::nint_route_row_workspace();
+        const auto direct_setting=mfq::cuda::runtime_options::nint_direct_pool();
+        const auto group_setting=mfq::cuda::runtime_options::nint_group_dot();
+        const auto hint_setting=mfq::cuda::runtime_options::nint_route_hint();
+        const auto warp_setting=mfq::cuda::runtime_options::nint_route_warps();
+        bool request_rows=row_setting && *row_setting;
         if(!row_setting && tokens==1 && nint_dispatch->pools.size()==1) {
             const auto& w=pools[nint_dispatch->pools.front()].nint;
             if(neuron_len==2560 && out_per_expert==640 && w.gs==28 && w.bits==5 &&
@@ -1621,8 +1622,8 @@ mfq_tensor_backend::Tensor MixedMoeRuntime::forward(
             }
         }
         bool prepare_rows=request_rows && nint_dispatch->pools.size()==1 &&
-            (!direct_setting || direct_setting[0]!='0') && (!group_setting || group_setting[0]!='0') &&
-            (!hint_setting || hint_setting[0]!='0') && (!warp_setting || std::atoi(warp_setting)!=4);
+            (!direct_setting || *direct_setting) && (!group_setting || *group_setting) &&
+            (!hint_setting || *hint_setting) && (!warp_setting || *warp_setting!=4);
         if(prepare_rows) {
             const auto& pool=pools[nint_dispatch->pools.front()];const auto& w=pool.nint;
             prepare_rows=(w.gs==24 || w.gs==28) && w.bits>=4 && w.bits<=6;

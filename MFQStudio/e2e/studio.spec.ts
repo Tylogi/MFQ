@@ -381,7 +381,7 @@ test('下载来源与九宫格保留统一字体，仅降低文字对比度', as
   }
 });
 
-test('运行资源按模型分段，四个槽共享颜色，端点包含 v1', async ({ page }, testInfo) => {
+test('运行资源按模型分段，各槽使用统一中性色，端点包含 v1', async ({ page }, testInfo) => {
   await mockStudioServer(page);
   const instances = [1, 2, 3, 4].map((index) => ({
     id: `resource-${index}`, model: `Resource Model ${index}`, state: 'ready', devices: ['metal'],
@@ -403,7 +403,17 @@ test('运行资源按模型分段，四个槽共享颜色，端点包含 v1', as
   await expect(page.getByTitle('Resource Model 1 · Metal wired 1 GiB / 20 GiB')).toBeVisible();
   await expect(page.getByText('10 contexts · 20 cache blocks')).toBeVisible();
   const colors = await page.locator('.memory-model-legend i').evaluateAll((dots) => dots.map((dot) => getComputedStyle(dot).backgroundColor));
-  expect(new Set(colors).size).toBe(4);
+  expect(new Set(colors).size).toBe(1);
+  expect(colors[0]).not.toBe('rgba(0, 0, 0, 0)');
+  const expectedColor = await page.locator('.memory-model-legend i').first().evaluate((dot) => {
+    const probe = document.createElement('span');
+    probe.style.backgroundColor = 'var(--bar-fill)';
+    dot.appendChild(probe);
+    const color = getComputedStyle(probe).backgroundColor;
+    probe.remove();
+    return color;
+  });
+  expect(colors[0]).toBe(expectedColor);
   for (const tier of ['weights', 'kv', 'experts', 'ple']) {
     const bars = page.locator(`[data-tier="${tier}"] .memory-tier-track > span`);
     await expect(bars).toHaveCount(4);

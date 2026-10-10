@@ -1,3 +1,5 @@
+#pragma once
+
 void verify_prefill_graph_execution(const std::filesystem::path& root,bool grouped=false,int group_size=1,bool sparse=false,bool oracle=false,bool layer_prefill=false,bool layout_only=false,bool batch_check=false) {
     struct Setting {
         std::string old;

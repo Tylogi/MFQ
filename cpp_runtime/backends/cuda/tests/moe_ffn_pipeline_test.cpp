@@ -1718,10 +1718,10 @@ void verify_router_lookahead_inputs() {
     if(guards!=4)throw std::runtime_error("lookahead audit shape/sample guards incomplete");
     std::cout<<"router_lookahead_input_samples=3 layer_rows=9 warmup_samples=0 guards=4 original_bytes_exact=1 PASS\n";
 }
-#include "residency_direct_exchange_test.inc"
-#include "prefill_pipeline_test.inc"
-#include "compact_prefill_mma_test.inc"
-#include "nvq_prefill_k_tile_test.inc"
+#include "residency_direct_exchange_test.h"
+#include "prefill_pipeline_test.h"
+#include "compact_prefill_mma_test.h"
+#include "nvq_prefill_k_tile_test.h"
 int main(int argc,char** argv)try {
     std::cout.setf(std::ios::unitbuf);
     if(argc!=2 && argc!=3)throw std::runtime_error("expected real-shape range fixture directory");

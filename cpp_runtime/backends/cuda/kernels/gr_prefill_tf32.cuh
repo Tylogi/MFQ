@@ -1,3 +1,5 @@
+#pragma once
+
 // Compressed GR tiles with three TF32 products: Ah*Bh + Al*Bh + Ah*Bl.
 // The residual products retain near-FP32 precision without dense weights.
 #include <mma.h>

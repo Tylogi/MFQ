@@ -1,3 +1,4 @@
+#include "../../runtime/execution_options.h"
 #pragma once
 #include "cuda_execution.h"
 #include "mfq_cuda_linear_attention_ops.h"
@@ -98,9 +99,9 @@ class Gdn {
             cache && conv_.defined() ? conv_ : tb::zeros({b, kernel_ - 1, channels}, options);
         std::vector<Tensor> projections;
         std::array<Tensor,2> prepared_gates;
-        const auto* prefill_option=std::getenv("MFQ_GDN_PREFILL_FUSED");
+        const auto prefill_option=mfq::cuda::runtime_options::gdn_prefill_fused();
         const bool prefill_fused=t>1 && fused_preparation_ && d_<=256 && kernel_<=8 &&
-            (!prefill_option || std::atoi(prefill_option)!=0);
+            (!prefill_option || *prefill_option!=0);
         if(cache && conv_.defined() && state_.defined() && fused_core_ && fused_decode_ &&
             fused_preparation_ && fused_output_ && transposed_state_ && t==1 &&
             (d_==32 || d_==64 || d_==128) &&
@@ -121,7 +122,7 @@ class Gdn {
                     weight,w_.dt_bias.to(tb::kFloat32).contiguous(),w_.a_log.to(tb::kFloat32).contiguous(),
                     w_.norm.to(tb::kFloat32).contiguous(),nk_,nv_,d_,1e-6,eps_,silu_gate_,
                     x.scalar_type()==tb::kFloat16,true,core_workspace_,
-                    [] {const char* value=std::getenv("MFQ_GDN_INPLACE_STATE");return !value || value[0]!='0';}());
+                    [] {const auto value=mfq::cuda::runtime_options::gdn_inplace_state();return !value || *value;}());
                 auto output=w_.output(execution,decoded[0]);
                 conv_.copy_(decoded[1]);
                 if(state_.data_ptr()!=decoded[2].data_ptr())state_.copy_(decoded[2]);
@@ -595,8 +596,8 @@ class Qsa {
         const auto count=std::min(c_.budget/c_.pool,pools),columns=c_.budget+c_.pool-1;
         auto indices=std::get<1>(tb::topk(ranked,count,-1,true,false));
         Tensor selected;
-        const char* fused_selection=std::getenv("MFQ_QSA_SELECT_FUSED");
-        if(!fused_selection || fused_selection[0]!='0') {
+        const auto fused_selection=mfq::cuda::runtime_options::qsa_select_fused();
+        if(!fused_selection || *fused_selection) {
             selected=mfq_qwen4_exp::qsa_selected_tokens(indices,cache_positions,c_.pool,c_.budget);
         } else {
         auto valid=visible.expand({1,t,pools}).gather(-1,indices).unsqueeze(-1).expand({1,t,count,c_.pool});
@@ -619,8 +620,8 @@ class Qsa {
         Tensor gated;
         if(fused_projection_ && rotary_->fused() &&
             (hidden.scalar_type()==tb::kFloat16 || hidden.scalar_type()==tb::kFloat32)) {
-            const char* sparse_gate=std::getenv("MFQ_QSA_SPARSE_GATE_FUSED");
-            if(!sparse_gate || sparse_gate[0]!='0')
+            const auto sparse_gate=mfq::cuda::runtime_options::qsa_sparse_gate_fused();
+            if(!sparse_gate || *sparse_gate)
                 gated=mfq_qwen4_exp::sparse_gqa_attention_gate(p.query,graph_keys_,graph_values_,selected,
                     p.gate,hidden.scalar_type()==tb::kFloat16);
             else gated=mfq_qwen4_exp::attention_gate(
@@ -648,8 +649,8 @@ class Qsa {
                               hidden.size(1) > 0,
                           "Qwen4 QSA requires nonempty [B,T,H] input");
         const auto b = hidden.size(0), t = hidden.size(1), offset = use_cache ? position() : 0;
-        const auto* prefill_option=std::getenv("MFQ_QSA_PREFILL_FUSED");
-        const bool fused_prefill=t>8 && (!prefill_option || std::atoi(prefill_option)!=0);
+        const auto prefill_option=mfq::cuda::runtime_options::qsa_prefill_fused();
+        const bool fused_prefill=t>8 && (!prefill_option || *prefill_option!=0);
         MFQ_RUNTIME_CHECK(
             t <= c_.maximum - offset && full_positions.size(-1) == offset + t &&
                 (!use_cache || (offset == values_.position() && offset == index_.position())),

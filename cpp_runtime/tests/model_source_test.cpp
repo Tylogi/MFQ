@@ -174,6 +174,9 @@ int main() {
         mfq::MfqModelSource legacy_mfq_source(legacy_mfq_path);
         mfq::MfqModelSource legacy_gguf_source(legacy_gguf_path);
         mfq::HfModelSource hf_source(hf_path);
+        const mfq::ModelSource& generic_hf = hf_source;
+        require(!generic_hf.mapped_tensor_reader("model.token_embedding.weight"),
+                "unmapped source must advertise an empty mapped reader");
         const auto opened_mfq = mfq::open_model_source(mfq_path);
         const auto opened_hf = mfq::open_model_source(hf_path);
 
@@ -217,7 +220,8 @@ int main() {
         {
             mfq::MfqModelSource large(root/"mapped-large.mfq");
             auto ordinary=large.tensor_reader("model.token_embedding.weight");
-            auto mapped=large.mapped_tensor_reader("model.token_embedding.weight");
+            const mfq::ModelSource& generic=large;
+            auto mapped=generic.mapped_tensor_reader("model.token_embedding.weight");
             for(std::size_t offset:{0u,4093u,65521u,65536u,131071u,262143u}) {
                 const auto count=std::min<std::size_t>(67,262156-offset);
                 std::vector<std::byte> expected(count),actual(count);

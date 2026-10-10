@@ -1,3 +1,5 @@
+#pragma once
+
 class GdnPipelineScope {
     std::string old_;
     bool present_;
