@@ -70,11 +70,11 @@
 .analysis-attention-distribution .analysis-section-heading > div { display: flex; flex-wrap: wrap; gap: 14px; }
 .analysis-attention-distribution .analysis-section-heading span { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 10.5px; }
 .analysis-attention-distribution b { font-weight: 550; font-variant-numeric: tabular-nums; }
-.attention-kind { background: #b4c0ce; }
-.attention-qsa { background: #4177b5; }
-.attention-mla { background: #667b9a; }
-.attention-attention { background: #7c93aa; }
-.attention-gqa, .attention-mha, .attention-mqa { background: #7c93aa; }
+.attention-kind { background: #cec2b4; }
+.attention-qsa { background: var(--accent); }
+.attention-mla { background: #99795e; }
+.attention-attention { background: #aa9178; }
+.attention-gqa, .attention-mha, .attention-mqa { background: #aa9178; }
 .analysis-attention-distribution i { width: 7px; height: 7px; border-radius: 2px; }
 .attention-layer-strip { display: flex; height: 13px; gap: 2px; margin-top: 14px; }
 .attention-layer-strip > span { flex: 1; min-width: 0; border-radius: 2px; }

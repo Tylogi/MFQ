@@ -20,6 +20,8 @@ for (const language of ['zh-CN', 'en'] as const) {
     await card.click();
     await expect(page).toHaveURL(/\/versions$/);
     await expect(page.getByRole('heading', { name: en ? 'Version manager' : '版本管理', exact: true })).toBeVisible();
+    await expect(page.getByRole('heading', { name: en ? 'Release' : '正式版', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: en ? 'View all Releases' : '查看全部正式版', exact: true })).toBeVisible();
     await expect(page.locator('.release-version')).toHaveCount(2);
     await expect(page.getByRole('heading', { name: 'Faster inference' })).toBeVisible();
     const previous = page.locator('.release-version').nth(1);

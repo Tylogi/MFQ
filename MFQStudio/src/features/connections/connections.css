@@ -77,9 +77,9 @@
 .model-context-entry > p { margin: 0 0 16px; color: var(--muted); font-size: 11px; line-height: 1.6; }
 .model-context-settings [role="alert"] { color: var(--danger); font-size: 11px; }
 .model-context-progress { display: grid; gap: 10px; padding: 0 0 18px; color: var(--ink-soft); font-size: 11px; }
-.model-context-progress progress { width: 100%; height: 5px; border: 0; border-radius: 3px; overflow: hidden; accent-color: var(--accent); }
+.model-context-progress progress { width: 100%; height: 5px; border: 0; border-radius: 3px; overflow: hidden; accent-color: var(--bar-fill); }
 .model-context-progress progress::-webkit-progress-bar { background: var(--line-soft); }
-.model-context-progress progress::-webkit-progress-value { background: var(--accent); }
+.model-context-progress progress::-webkit-progress-value { background: var(--bar-fill); }
 @container (max-width: 560px) {
   .model-context-settings .setting-row { grid-template-columns: minmax(0, 1fr); gap: 12px; }
   .model-context-settings .setting-row-trailing { justify-self: start; }
@@ -93,7 +93,7 @@
 .server-input-unit span { color: var(--muted); font-size: 11px; }
 .server-prompt-input { width: min(36vw, 410px); resize: vertical; line-height: 1.45; }
 .server-temperature-control { display: flex; align-items: center; gap: 12px; }
-.server-temperature-control input { width: min(20vw, 190px); accent-color: var(--accent); }
+.server-temperature-control input { width: min(20vw, 190px); accent-color: var(--bar-fill); }
 .server-temperature-control strong { width: 42px; color: var(--ink-soft); font: 610 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; }
 .server-page-footer { display: flex; align-items: center; justify-content: flex-end; gap: 14px; margin-top: 18px; }
 .server-page-footer > span { color: var(--muted-light); font-size: 11px; }

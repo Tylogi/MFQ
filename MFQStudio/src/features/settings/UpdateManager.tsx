@@ -277,16 +277,16 @@ export function UpdateManager({
   return <section className="update-manager">
     <div className="update-current-row">
       <div><span>{tr('当前版本', 'Current version')}</span><strong title={currentVersion}>v{currentVersion}</strong>
-        <small>{currentRelease ? 'Release' : tr('开发构建 · 实验版本', 'Development build · Experimental')}</small></div>
+        <small>{currentRelease ? tr('正式版', 'Release') : tr('开发构建 · 实验版本', 'Development build · Experimental')}</small></div>
       <button disabled={busy !== null} onClick={() => void refresh()} type="button"><Icon name="refresh" size={15} />{busy === 'check' ? tr('检查中', 'Checking') : tr('检查更新', 'Check now')}</button>
     </div>
     <div className="version-preferences">
-      <div><div><strong>{tr('自动检查更新', 'Automatically check for updates')}</strong><small>{tr('联网后检查 Release，断网时保留已有版本信息。', 'Check Releases when online and retain cached information while offline.')}</small></div>
+      <div><div><strong>{tr('自动检查更新', 'Automatically check for updates')}</strong><small>{tr('联网后检查正式版，断网时保留已有版本信息。', 'Check Releases when online and retain cached information while offline.')}</small></div>
         <Switch label={tr('自动检查更新', 'Automatically check for updates')} checked={status?.automatic_check ?? true} disabled={!status || busy !== null} onCheckedChange={checked => void setAutomatic(checked)} /></div>
-      {isStudio() && <div><div><strong>{tr('自动下载 Release 更新', 'Automatically download Release updates')}</strong><small>{currentRelease
+      {isStudio() && <div><div><strong>{tr('自动下载正式版更新', 'Automatically download Release updates')}</strong><small>{currentRelease
         ? tr('后台下载并校验；安装前确认，随后重启应用与本地服务。', 'Download and verify in the background; confirm before restarting the app and local service.')
-        : tr('开发构建不参与自动下载；可手动选择 Release。', 'Development builds do not auto-download updates; choose a Release manually.')}</small></div>
-        <Switch label={tr('自动下载 Release 更新', 'Automatically download Release updates')} checked={status?.automatic_download ?? false} disabled={!status || busy !== null || !currentRelease || !status.platform_supported || !status.automatic_check} onCheckedChange={checked => void setAutomaticDownload(checked)} /></div>}
+        : tr('开发构建不参与自动下载；可手动选择正式版。', 'Development builds do not auto-download updates; choose a Release manually.')}</small></div>
+        <Switch label={tr('自动下载正式版更新', 'Automatically download Release updates')} checked={status?.automatic_download ?? false} disabled={!status || busy !== null || !currentRelease || !status.platform_supported || !status.automatic_check} onCheckedChange={checked => void setAutomaticDownload(checked)} /></div>}
       <p>{status?.checked_at_epoch_seconds
         ? tr('上次检查 ', 'Last checked ') + new Date(status.checked_at_epoch_seconds * 1000).toLocaleString()
         : tr('尚未检查', 'Not checked yet')}</p>
@@ -295,7 +295,7 @@ export function UpdateManager({
     {!isStudio() && <p className="version-note">{tr('浏览器可查看版本与说明；安装、切换和回退请在桌面应用中操作。', 'Browse releases and notes here; install, switch, or roll back in the desktop app.')}</p>}
     <div className="update-manager-grid">
       <section className="versions-release-panel">
-        <div className="version-section-heading"><h2>Release</h2><span>{releases.length} {tr('个版本', 'versions')}</span></div>
+        <div className="version-section-heading"><h2>{tr('正式版', 'Release')}</h2><span>{releases.length} {tr('个版本', 'versions')}</span></div>
         <div className="release-version-list">
           {releases.map((release, index) => {
             const ready = installed.has(release.version);
@@ -310,30 +310,30 @@ export function UpdateManager({
                 {isStudio() && !current && (ready
                   ? <button disabled={busy !== null || !status?.platform_supported} onClick={() => void install(release.version, tr)} type="button">{active ? tr('准备中', 'Preparing') : olderThan(release.version, currentVersion) ? tr('回退', 'Roll back') : tr('安装并重启', 'Install & restart')}</button>
                   : release.asset ? <button disabled={busy !== null || !status?.platform_supported} onClick={() => void download(release.tag)} type="button"><Icon name="download" size={14} />{active ? progressButtonLabel(releaseProgress, tr) : tr('下载', 'Download')}</button> : <span className="version-note">{tr('暂无本平台安装包', 'No installer for this platform')}</span>)}
-                <button aria-label={tr('查看 v' + release.version + ' Release', 'View v' + release.version + ' Release')} className="version-link" onClick={() => open(release.page_url)} type="button"><Icon name="link" size={15} /></button>
+                <button aria-label={tr('查看 v' + release.version + ' 正式版', 'View v' + release.version + ' Release')} className="version-link" onClick={() => open(release.page_url)} type="button"><Icon name="link" size={15} /></button>
               </div>
               <p className="release-version-name">{release.name}{release.asset ? ' · ' + formatBytes(release.asset.byte_size) : ''}</p>
               {releaseProgress && <div className="version-download-progress"><span>{progressLabel(releaseProgress, tr)}</span><progress aria-label={tr('更新下载进度', 'Update download progress')} max={Math.max(1, releaseProgress.total_bytes)} value={releaseProgress.received_bytes} /></div>}
               <details className="release-notes-disclosure" open={index === 0}><summary>{tr('版本说明', 'Version notes')}</summary><ReleaseNotes notes={release.notes} tr={tr} /></details>
             </article>;
           })}
-          {!releases.length && <div className="update-empty">{status ? tr('暂无 Release 信息，联网后检查更新。', 'No Release information yet. Check for updates when online.') : tr('正在读取版本信息…', 'Loading release information…')}</div>}
+          {!releases.length && <div className="update-empty">{status ? tr('暂无正式版信息，联网后检查更新。', 'No Release information yet. Check for updates when online.') : tr('正在读取版本信息…', 'Loading release information…')}</div>}
         </div>
       </section>
       <section className="versions-local-panel">
         <div className="version-section-heading"><h2>{tr('本地版本', 'Local versions')}</h2></div>
         <div className="installed-version-list">
-          <div className="local-version current"><div><strong title={currentVersion}>v{currentVersion}</strong><small>{tr('正在运行', 'Running')} · {currentRelease ? 'Release' : tr('实验版本', 'Experimental')}</small></div><Icon name="check" size={16} /></div>
+          <div className="local-version current"><div><strong title={currentVersion}>v{currentVersion}</strong><small>{tr('正在运行', 'Running')} · {currentRelease ? tr('正式版', 'Release') : tr('实验版本', 'Experimental')}</small></div><Icon name="check" size={16} /></div>
           {local.map(localRow)}
           {isStudio() && !local.length && <p className="version-note">{tr('下载后可切换；安装时保留当前版本供回退。', 'Downloaded versions can be switched to; the current version is retained on installation for rollback.')}</p>}
         </div>
         <details className="experimental-versions"><summary>{tr('实验版本', 'Experimental versions')}</summary>
-          <p className="version-note">{tr('非 Release 版本需额外编译，不参与自动更新。', 'Non-Release versions require a separate build and do not participate in automatic updates.')}</p>
+          <p className="version-note">{tr('非正式版需额外编译，不参与自动更新。', 'Non-Release versions require a separate build and do not participate in automatic updates.')}</p>
           {experimental.map(localRow)}
           <button className="release-page-link" onClick={() => open('https://github.com/Tylogi/TyloQuant')} type="button">{tr('查看源码', 'View source')}<Icon name="link" size={14} /></button>
         </details>
       </section>
     </div>
-    <button className="release-page-link" onClick={() => open(status?.releases_page || 'https://github.com/Tylogi/TyloQuant/releases')} type="button">{tr('查看全部 Release', 'View all Releases')}<Icon name="link" size={14} /></button>
+    <button className="release-page-link" onClick={() => open(status?.releases_page || 'https://github.com/Tylogi/TyloQuant/releases')} type="button">{tr('查看全部正式版', 'View all Releases')}<Icon name="link" size={14} /></button>
   </section>;
 }

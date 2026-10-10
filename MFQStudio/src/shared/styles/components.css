@@ -176,7 +176,7 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
 .usage-bar strong { color: var(--ink-soft); font-size: 12px; font-weight: 550; line-height: 1.5; }
 .usage-bar span { color: var(--muted); font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .usage-bar-track { height: 6px; overflow: hidden; border-radius: 999px; background: var(--surface-subtle); }
-.usage-bar-track i { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+.usage-bar-track i { display: block; height: 100%; border-radius: inherit; background: var(--bar-fill); }
 
 .empty-panel {
   display: grid;
@@ -305,10 +305,10 @@ button.primary:hover { border-color: var(--accent-hover); color: var(--on-accent
 .model-row > button:hover { border-color: var(--accent-border); background: var(--accent-soft); }
 .model-row .model-row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
 .model-load-progress, .model-row .model-load-progress, .runtime-hero-copy > .model-load-progress { display: flex; align-items: center; gap: 8px; margin-top: 5px; }
-.model-load-progress progress { width: min(100%, 260px); min-width: 0; height: 5px; border: 0; border-radius: 4px; overflow: hidden; accent-color: var(--accent); background: var(--line-soft); }
+.model-load-progress progress { width: min(100%, 260px); min-width: 0; height: 5px; border: 0; border-radius: 4px; overflow: hidden; accent-color: var(--bar-fill); background: var(--line-soft); }
 .model-load-progress progress::-webkit-progress-bar { border-radius: 4px; background: var(--line-soft); }
-.model-load-progress progress::-webkit-progress-value { border-radius: 4px; background: var(--accent); }
-.model-load-progress progress::-moz-progress-bar { border-radius: 4px; background: var(--accent); }
+.model-load-progress progress::-webkit-progress-value { border-radius: 4px; background: var(--bar-fill); }
+.model-load-progress progress::-moz-progress-bar { border-radius: 4px; background: var(--bar-fill); }
 .model-load-progress span { flex: none; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .model-row-actions button {
   border: 1px solid var(--panel-line);

@@ -34,7 +34,7 @@
 .resource-monitor-metric > span, .resource-monitor-metric small { color: var(--muted); font-size: 11px; }
 .resource-monitor-metric strong { color: var(--ink-soft); font-size: 21px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .resource-utilization-track { height: 4px; border-radius: 4px; overflow: hidden; background: var(--line); }
-.resource-utilization-track i { display: block; height: 100%; background: var(--accent); transition: width .3s; }
+.resource-utilization-track i { display: block; height: 100%; background: var(--bar-fill); transition: width .3s; }
 .resource-monitor-section { margin-top: 23px; border-top: 1px solid var(--panel-line); padding-top: 17px; }
 .resource-monitor-section h2 { margin: 0 0 10px; color: var(--ink-soft); font-size: 12px; font-weight: 600; }
 .resource-monitor-section p { color: var(--muted); font-size: 11px; line-height: 1.6; }

@@ -153,7 +153,7 @@ body:has(.model-download-page) .studio-toast-container { bottom: calc(96px + env
 .download-circle { position: fixed; right: 26px; bottom: max(26px, env(safe-area-inset-bottom)); z-index: 30; display: grid; width: 56px; height: 56px; place-items: center; padding: 0; border: 1px solid var(--panel-line); border-radius: 50%; color: var(--accent); background: var(--surface-raised); box-shadow: 0 5px 20px rgb(0 0 0 / 12%); }
 .download-circle:hover { background: var(--accent-soft); }
 .download-circle-ring { position: absolute; inset: 0; width: 100%; height: 100%; fill: none; stroke: var(--line-soft); stroke-width: 2; transform: rotate(-90deg); }
-.download-circle-ring .download-ring-progress { stroke: var(--accent); stroke-linecap: round; transition: stroke-dasharray 180ms ease; }
+.download-circle-ring .download-ring-progress { stroke: var(--bar-fill); stroke-linecap: round; transition: stroke-dasharray 180ms ease; }
 .download-circle-count { position: absolute; top: -2px; right: -2px; min-width: 18px; height: 18px; padding: 0 4px; border: 2px solid var(--surface-raised); border-radius: 99px; color: var(--on-accent); background: var(--accent); font-size: 10px; line-height: 14px; font-weight: 700; }
 .download-flight { position: fixed; z-index: 40; display: grid; width: 28px; height: 28px; place-items: center; border-radius: 50%; color: var(--on-accent); background: var(--accent); box-shadow: 0 4px 12px rgb(0 0 0 / 12%); pointer-events: none; animation: download-fly 650ms cubic-bezier(.4, 0, .7, 1) both; }
 .download-circle.receiving { animation: download-receive 200ms ease 500ms; }
@@ -178,10 +178,10 @@ body:has(.model-download-page) .studio-toast-container { bottom: calc(96px + env
 .download-item-heading > span { flex-shrink: 0; color: var(--muted); font-size: 11px; }
 .download-item-body > small { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 .download-item-progress { display: flex; align-items: center; gap: 10px; }
-.download-item-progress progress { flex: 1; width: 0; height: 5px; overflow: hidden; border: 0; border-radius: 99px; background: var(--line-soft); accent-color: var(--accent); }
+.download-item-progress progress { flex: 1; width: 0; height: 5px; overflow: hidden; border: 0; border-radius: 99px; background: var(--line-soft); accent-color: var(--bar-fill); }
 .download-item-progress progress::-webkit-progress-bar { background: var(--line-soft); }
-.download-item-progress progress::-webkit-progress-value { border-radius: 99px; background: var(--accent); }
-.download-item-progress progress::-moz-progress-bar { border-radius: 99px; background: var(--accent); }
+.download-item-progress progress::-webkit-progress-value { border-radius: 99px; background: var(--bar-fill); }
+.download-item-progress progress::-moz-progress-bar { border-radius: 99px; background: var(--bar-fill); }
 .download-item-progress > span { min-width: 40px; color: var(--muted); font-size: 11px; text-align: right; font-variant-numeric: tabular-nums; }
 .download-queue-item > button { flex-shrink: 0; border: 1px solid var(--panel-line); border-radius: 7px; padding: 7px 11px; color: var(--ink-soft); background: var(--panel-control); font-size: 12px; }
 .download-queue-item > button:disabled { opacity: .5; }

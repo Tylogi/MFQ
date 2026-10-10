@@ -40,7 +40,7 @@ for (const theme of ['light', 'dark'] as const) {
       await page.screenshot({ path: testInfo.outputPath(`${path.slice(1)}-${theme}.png`), animations: 'disabled', fullPage: true });
     }
     expect(await page.locator('.model-download-page').evaluate(element => getComputedStyle(element).getPropertyValue('--accent').trim()))
-      .toBe(theme === 'light' ? '#246fe5' : '#0a84ff');
+      .toBe(theme === 'light' ? '#9f6232' : '#d6aa73');
     expect(errors).toEqual([]);
     expect(state.unexpected).toEqual([]);
   });

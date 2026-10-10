@@ -205,7 +205,7 @@
 .voice-component-banner > div { display: grid; min-width: 0; gap: 2px; }
 .voice-component-banner strong { font-size: 11px; }
 .voice-component-banner span { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.voice-component-banner progress { width: 100%; height: 4px; grid-column: 1 / -1; accent-color: var(--accent); }
+.voice-component-banner progress { width: 100%; height: 4px; grid-column: 1 / -1; accent-color: var(--bar-fill); }
 .voice-component-banner button { grid-column: 2; grid-row: 1; border: 1px solid var(--accent-border); border-radius: 7px; padding: 6px 9px; color: var(--on-accent); background: var(--accent); font-size: 10.5px; font-weight: 700; }
 .voice-component-banner button:disabled { cursor: progress; opacity: 0.65; }
 .composer { overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: none; }

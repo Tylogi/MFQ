@@ -45,7 +45,7 @@ it('reports Metal wiring separately from weight size and warns on unavailable wi
 it('shows a dotted model legend even with one loaded model and five resource tiers', () => {
   const { container } = render(<MemoryHierarchy instances={[model('1', 1024)]} memoryCapacityBytes={4096} />);
   expect(screen.getByText('Runtime resources')).toBeInTheDocument();
-  expect(screen.getByLabelText('Model color legend').querySelector('i')).toHaveStyle({ backgroundColor: 'var(--accent)' });
+  expect(screen.getByLabelText('Model color legend').querySelector('i')).toHaveStyle({ backgroundColor: 'var(--bar-fill)' });
   expect(container.querySelectorAll('[data-tier]')).toHaveLength(5);
   expect(screen.getByText('1 contexts · 2 cache blocks')).toBeInTheDocument();
   expect(screen.queryByText(/allocator/i)).not.toBeInTheDocument();
@@ -59,13 +59,14 @@ it('shows a dotted model legend even with one loaded model and five resource tie
   expect(screen.queryByText(/Colors show each model/)).not.toBeInTheDocument();
 });
 
-it('shares load-order colors, uses memory capacity for resident tiers and byte shares for SSD', () => {
+it('uses one neutral fill with stable load order and preserves per-model resource shares', () => {
   const models = [model('1', 1024), model('2', 3072), model('3', 4096), model('4', 8192)];
   const { container } = render(<MemoryHierarchy instances={[...models].reverse()} memoryCapacityBytes={32768} />);
   const legend = container.querySelector('.memory-model-legend')!;
   const colors = models.map((item) => (legend.querySelector(`[data-model-id="${item.id}"] i`) as HTMLElement).style.backgroundColor);
-  expect(new Set(colors).size).toBe(4);
-  expect(colors[0]).toBe('var(--accent)');
+  expect(new Set(colors).size).toBe(1);
+  expect(colors[0]).toBe('var(--bar-fill)');
+  expect([...legend.children].map(item => (item as HTMLElement).dataset.modelId)).toEqual(['1', '2', '3', '4']);
   for (const tier of container.querySelectorAll('.memory-tier-track')) {
     expect([...tier.children].map((item) => (item as HTMLElement).style.backgroundColor)).toEqual(colors);
   }
@@ -77,15 +78,15 @@ it('shares load-order colors, uses memory capacity for resident tiers and byte s
   expect(screen.getByText('16 KiB / 16 KiB')).toBeInTheDocument();
 });
 
-it('keeps remaining model colors after unload/reordering and reuses a reloaded model color', () => {
+it('keeps the same neutral fill and stable order after unload/reordering/reload', () => {
   const first = model('1', 1024), second = model('2', 1024);
   const { container, rerender } = render(<MemoryHierarchy instances={[first, second]} memoryCapacityBytes={4096} />);
-  const red = (container.querySelector('[data-tier="weights"] [data-model-id="2"]') as HTMLElement).style.backgroundColor;
   rerender(<MemoryHierarchy instances={[second]} memoryCapacityBytes={4096} />);
-  expect(container.querySelector('[data-tier="kv"] [data-model-id="2"]')).toHaveStyle({ backgroundColor: red });
+  expect(container.querySelector('[data-tier="kv"] [data-model-id="2"]')).toHaveStyle({ backgroundColor: 'var(--bar-fill)' });
   expect(screen.getByText('1 KiB / 3 KiB')).toBeInTheDocument();
   rerender(<MemoryHierarchy instances={[second, { ...first, id: 'reload' }]} memoryCapacityBytes={4096} />);
-  expect(container.querySelector('[data-tier="ple"] [data-model-id="reload"]')).toHaveStyle({ backgroundColor: 'var(--accent)' });
+  expect(container.querySelector('[data-tier="ple"] [data-model-id="reload"]')).toHaveStyle({ backgroundColor: 'var(--bar-fill)' });
+  expect([...container.querySelector('.memory-model-legend')!.children].map(item => (item as HTMLElement).dataset.modelId)).toEqual(['reload', '2']);
   expect(screen.getByText('2 KiB / 2 KiB')).toBeInTheDocument();
 });
 
@@ -165,7 +166,7 @@ it('expands the same five tiers into per-model sizes, active KV, hot prefixes an
   expect(container.querySelector('[data-tier="experts"] .resource-tier-model')).toHaveTextContent('All experts resident');
   expect(container.querySelector('[data-tier="ple"] .resource-tier-model')).toHaveTextContent('No SSD PLE table');
   for (const tier of container.querySelectorAll('.resource-tier-details')) {
-    expect(tier.querySelector('.resource-tier-model-name i')).toHaveStyle({ backgroundColor: 'var(--accent)' });
+    expect(tier.querySelector('.resource-tier-model-name i')).toHaveStyle({ backgroundColor: 'var(--bar-fill)' });
   }
 });
 
@@ -188,7 +189,7 @@ it('tracks actual streamed KV storage without adding SSD bytes or traffic to res
   expect(tier).toHaveTextContent('Total read 12 KiB');
   expect(tier).toHaveTextContent('Total written 24 KiB');
   expect(tier).toHaveTextContent('RAM hit rate 50%');
-  expect(tier.querySelector('[data-model-id="1"]')).toHaveStyle({ width: '25%', backgroundColor: 'var(--accent)' });
+  expect(tier.querySelector('[data-model-id="1"]')).toHaveStyle({ width: '25%', backgroundColor: 'var(--bar-fill)' });
   expect(view.container.querySelector('[data-tier="kv"]')).toHaveTextContent('4 KiB / 28 KiB');
   view.rerender(<MemoryHierarchy instances={[first, second]} detailed memoryCapacityBytes={32768} />);
   const detail = view.container.querySelector('[data-tier="ssd-kv"] .resource-tier-model')!;
