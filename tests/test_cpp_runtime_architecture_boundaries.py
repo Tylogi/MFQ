@@ -783,7 +783,9 @@ def test_metal_residency_is_configured_before_model_allocation() -> None:
     configure = DECODE_APP[DECODE_APP.index("void configure_mlx_metal()") :]
     configure = configure[: configure.index("void self_test_metal()")]
     assert 'info.at("max_recommended_working_set_size")' in configure
-    assert "mlx::core::set_wired_limit(limit)" in configure
+    assert "mfq::metal::MlxMemoryResidency::configure(limit)" in configure
+    residency = (METAL / "runtime/mlx_memory_residency.h").read_text()
+    assert "mlx::core::set_wired_limit(limit)" in residency
     assert "Metal memory residency unavailable" in configure
     server = DECODE_APP[DECODE_APP.index("if (arguments.server)") :]
     assert server.index("configure_mlx_metal();") < server.index(
@@ -797,8 +799,9 @@ def test_qwen4_nint_ple_uses_shared_row_decode_without_resident_weights() -> Non
     assert "std::optional<MlxMappedNintRows> nint" in embedding
     assert "MlxMappedNintRows table(bytes)" in embedding
     assert "MlxNintRowBatch selected" in embedding
-    assert "append_row(row % rows_, selected)" in embedding
-    assert "selected.decode()" in embedding
+    assert "append_row(row % rows_, lookup.selected)" in embedding
+    assert "lookup.selected.append_batch(row.batch)" in embedding
+    assert "lookup.selected.decode()" in embedding
     assert "MlxNintWeight::from_blob" not in embedding
     assert "dequantize(" not in embedding
     assert "Qwen4 PLE cannot mix FP8 and NINT shards" in embedding
@@ -819,9 +822,11 @@ def test_mapped_nint_rows_keep_quantized_arithmetic_outside_model_owners() -> No
 
 def test_qwen4_qsa_caches_completed_index_blocks_incrementally() -> None:
     assert "MlxSequenceCache pooled_index_cache_;" in QWEN4
-    assert "const int cached = pooled_index_cache_.position();" in QWEN4
-    assert "pooled_index_cache_.append(pool_index_keys(" in QWEN4
-    assert "return pooled_index_cache_.view();" in QWEN4
+    assert "const int cached = offloaded_pool_ ? offloaded_pool_->position() : pooled_index_cache_.position();" in QWEN4
+    assert "auto pooled = pool_index_keys(raw, positions_full, begin, complete, index_tail_start_);" in QWEN4
+    assert "if (offloaded_pool_) offloaded_pool_->append(pooled);" in QWEN4
+    assert "else pooled_index_cache_.append(pooled);" in QWEN4
+    assert "return use_cache ? pooled_index_cache_.view() : pool_index_keys(" in QWEN4
     assert "trim_pooled_index_cache();" in QWEN4
 
 
@@ -1046,12 +1051,15 @@ def test_mixed_mfe_offload_uses_the_shared_pager() -> None:
 def test_mtp_policy_and_lifecycle_are_runtime_owned() -> None:
     for symbol in (
         "struct MlxMtpGenerationStats",
-        "class MlxMtpDepthController",
         "struct MlxMtpEngineCallbacks",
         "run_mlx_mtp_generation",
         "verify_stochastic_mtp_top_k_chain_device",
     ):
         assert symbol in MTP_HEADER or symbol in MTP_SOURCE
+    shared_controller = (ROOT / "cpp_runtime/engine/include/mtp_depth_controller.h").read_text()
+    assert "class DepthController" in shared_controller
+    assert '#include "mtp_depth_controller.h"' in MTP_HEADER
+    assert "mfq::engine::mtp::GenerationPolicy<MlxDsparkDepthController> depth_controller(" in MTP_SOURCE
 
     sources = model_sources()
     assert "struct MlxMtpGenerationStats" not in sources
@@ -1402,7 +1410,7 @@ def test_cuda_mtp_generation_loop_is_architecture_independent_and_reversible() -
     assert "should_exit" not in generation
     assert "should_exit" not in CUDA_MTP_HEADER
     assert "exit_streak" not in CUDA_MTP_HEADER
-    assert "DepthController depth_controller" in generation
+    assert "policy::GenerationPolicy<policy::DsparkDepthController> depth_controller(" in generation
     assert "bounded_depth(depth_controller.depth())" in generation
     assert "retains_partial_target_prefix()" in generation
     assert "CompactDistribution" in generation
