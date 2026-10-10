@@ -9,6 +9,7 @@ export interface ModelArtifact {
   missing_shards?: number;
   total_bytes: number;
   estimated_resident_weight_bytes?: number | null;
+  estimated_weight_bytes_by_role?: Partial<Record<'dense' | 'experts' | 'embedding', number>>;
   ssd_ple_bytes?: number | null;
   context_capacity?: number | null;
   tensor_count: number;
@@ -192,6 +193,7 @@ export interface HubModelVariant {
   byte_size: number;
   resident_weight_bytes?: number | null;
   estimated_resident_weight_bytes?: number | null;
+  estimated_weight_bytes_by_role?: Partial<Record<'dense' | 'experts' | 'embedding', number>>;
   ssd_ple_bytes?: number | null;
   configuration: ModelConfigurationStatus;
 }

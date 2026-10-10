@@ -220,6 +220,16 @@ def test_hub_memory_pools_do_not_double_count_shared_memory_or_pool_multiple_gpu
     assert value.memory_pools[-1].bandwidth_bytes_per_second == (1_792_000_000_000 if unified else None)
 
 
+def test_hub_uses_the_same_host_capacity_as_runtime_when_platform_probe_is_unavailable(monkeypatch):
+    monkeypatch.setattr(hub, 'hardware_identity', lambda: hardware.HardwareIdentity('CPU', 12, ('GPU',),
+        gpu_memory=(hardware.GpuMemory('GPU', 24 << 30),)))
+    monkeypatch.setattr(hub, 'host_memory_snapshot', lambda: None)
+    monkeypatch.setattr(hub, 'total_physical_memory', lambda: None)
+    monkeypatch.setattr(hub, 'memory_topology', lambda: {'host_memory_total_bytes': 64 << 30})
+    profile = hub.system_profile(backend='cuda')
+    assert profile.physical_memory_bytes == profile.memory_pools[-1].capacity_bytes == 64 << 30
+
+
 @pytest.mark.parametrize("backend", ["metal", "cuda", "rocm"])
 def test_hub_contract_preserves_hardware_and_backend_vendor(monkeypatch, backend):
     monkeypatch.setattr(hub, "hardware_identity", lambda: hardware.HardwareIdentity("Test CPU", 18, ("Test GPU",), 40, 128 << 30))

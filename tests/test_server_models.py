@@ -1298,7 +1298,12 @@ def test_common_server_rejects_directories_without_mfq_models(tmp_path: Path) ->
     asyncio.run(run())
 
 
-def test_empty_runtime_pool_reports_idle_state(tmp_path: Path) -> None:
+def test_empty_runtime_pool_reports_idle_state(tmp_path: Path, monkeypatch) -> None:
+    from mfq.server.runtime import runtime_pool
+    topology = {'memory_architecture': 'discrete', 'unified_memory': False,
+                'host_memory_total_bytes': 64 << 30, 'device_memory_total_bytes': 24 << 30,
+                'prefix_cache_hot_tier': 'vram', 'prefix_cache_cold_tier': 'ssd'}
+    monkeypatch.setattr(runtime_pool, 'memory_topology', lambda: topology)
     async def run() -> None:
         model_dir = tmp_path / "models"
         model_dir.mkdir()
@@ -1312,6 +1317,7 @@ def test_empty_runtime_pool_reports_idle_state(tmp_path: Path) -> None:
         status = await pool.runtime_status()
         assert status.pop("prefix_cache_total_disk_max_bytes") > 0
         assert status == {
+            **topology,
             "mtp_service_enabled": True,
             "prefix_cache_total_hot_bytes": 0,
             "prefix_cache_total_hot_max_bytes": 2 << 30,

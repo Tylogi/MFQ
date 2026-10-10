@@ -31,7 +31,7 @@ from mfq.server.protocol.models import (
     ModelDirectoryFile,
     ModelDirectoryList,
 )
-from mfq.server.state.model_weights import estimated_resident_weight_bytes
+from mfq.server.state.model_weights import estimated_resident_weight_bytes, estimated_weight_roles, weight_role
 from mfq.server.services.model_context import declared_context_size, yarn_context_limits
 
 MODEL_FILE_INDEX = ".mfq-files.json"
@@ -693,11 +693,14 @@ class ModelCatalog:
                     and _is_always_streamed_tensor(record.name)
                 )
                 weight_bytes_by_dtype: dict[str, int] = {}
+                by_role: dict[str, dict[str, int]] = {role: {} for role in ('dense', 'experts', 'embedding')}
                 for record in store.records.values():
                     if is_asset_record(record.name) or _is_always_streamed_tensor(record.name):
                         continue
                     dtype = canonical_dtype(record.dtype)
                     weight_bytes_by_dtype[dtype] = weight_bytes_by_dtype.get(dtype, 0) + int(record.nbytes)
+                    role_dtypes = by_role[weight_role(record.name)]
+                    role_dtypes[dtype] = role_dtypes.get(dtype, 0) + int(record.nbytes)
                 weight_bytes = sum(weight_bytes_by_dtype.values())
                 def json_asset(asset: str) -> dict:
                     record = store.records.get(asset)
@@ -727,6 +730,7 @@ class ModelCatalog:
                     shard_count=len(paths),
                     total_bytes=sum(stat.st_size for stat in stats),
                     estimated_resident_weight_bytes=estimated_resident_weight_bytes(weight_bytes, weight_bytes_by_dtype),
+                    estimated_weight_bytes_by_role=estimated_weight_roles(by_role),
                     ssd_ple_bytes=always_streamed_bytes,
                     context_capacity=capacity,
                     yarn_context_capacity=yarn_capacity,
@@ -880,6 +884,7 @@ class ModelCatalog:
             routed_expert_bytes = 0
             always_streamed_bytes = 0
             weight_bytes_by_dtype: dict[str, int] = {}
+            by_role: dict[str, dict[str, int]] = {role: {} for role in ('dense', 'experts', 'embedding')}
             for tensor_name, tensor_bytes in tensor_sizes.items():
                 mapped = map_source_tensor_name(tensor_name, config)
                 canonical_name = (
@@ -892,6 +897,8 @@ class ModelCatalog:
                 else:
                     dtype = canonical_dtype(tensor_dtypes[tensor_name])
                     weight_bytes_by_dtype[dtype] = weight_bytes_by_dtype.get(dtype, 0) + tensor_bytes
+                    role_dtypes = by_role[weight_role(canonical_name)]
+                    role_dtypes[dtype] = role_dtypes.get(dtype, 0) + tensor_bytes
             native, yarn_capacity, yarn_factor = yarn_context_limits(config, model_type)
             resource = ModelArtifactResource(
                 id=identifier,
@@ -901,6 +908,7 @@ class ModelCatalog:
                 shard_count=len(shard_paths),
                 total_bytes=sum(stat.st_size for stat in stats),
                 estimated_resident_weight_bytes=estimated_resident_weight_bytes(sum(weight_bytes_by_dtype.values()), weight_bytes_by_dtype),
+                estimated_weight_bytes_by_role=estimated_weight_roles(by_role),
                 ssd_ple_bytes=always_streamed_bytes,
                 context_capacity=native or declared_context_size(config, ModelCatalog._tokenizer_config(path)),
                 yarn_context_capacity=yarn_capacity,

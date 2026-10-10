@@ -132,6 +132,8 @@
 .model-variant strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .model-variant small { color: var(--muted); font-size: 10.5px; }
 .variant-memory-pressure { display: grid; grid-template-columns: minmax(70px, 1fr) auto; align-items: center; gap: 7px; min-width: 110px; }
+.variant-memory-tiers { display: grid; min-width: 0; gap: 8px; }
+.variant-memory-caption { display: block; overflow: hidden; margin-bottom: 4px; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .variant-memory-pressure > strong { min-width: 39px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; text-align: right; }
 .variant-memory-track { overflow: hidden; height: 6px; border-radius: 99px; background: var(--panel-line); }
 .variant-memory-track span { display: block; height: 100%; border-radius: inherit; background: var(--muted); transition: width 180ms ease; }

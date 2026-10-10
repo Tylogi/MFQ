@@ -876,6 +876,7 @@ class ModelArtifactResource(ProtocolModel):
     missing_shards: int = Field(default=0, ge=0)
     total_bytes: int = Field(ge=0)
     estimated_resident_weight_bytes: int | None = Field(default=None, ge=0)
+    estimated_weight_bytes_by_role: dict[Literal['dense', 'experts', 'embedding'], Annotated[int, Field(ge=0)]] = Field(default_factory=dict)
     ssd_ple_bytes: int | None = Field(default=None, ge=0)
     context_capacity: int | None = Field(default=None, ge=1)
     yarn_context_capacity: int | None = Field(default=None, ge=1)
@@ -956,6 +957,7 @@ class HubModelFile(ProtocolModel):
     sha256: str | None = Field(default=None, pattern=SHA256_PATTERN)
     weight_bytes: int | None = Field(default=None, ge=0)
     weight_bytes_by_dtype: dict[str, Annotated[int, Field(ge=0)]] = Field(default_factory=dict)
+    estimated_weight_bytes_by_role: dict[Literal['dense', 'experts', 'embedding'], Annotated[int, Field(ge=0)]] = Field(default_factory=dict)
     ssd_ple_bytes: int | None = Field(default=None, ge=0)
 
 
@@ -983,6 +985,7 @@ class HubModelVariant(ProtocolModel):
     byte_size: int = Field(default=0, ge=0)
     resident_weight_bytes: int | None = Field(default=None, ge=0)
     estimated_resident_weight_bytes: int | None = Field(default=None, ge=0)
+    estimated_weight_bytes_by_role: dict[Literal['dense', 'experts', 'embedding'], Annotated[int, Field(ge=0)]] = Field(default_factory=dict)
     ssd_ple_bytes: int | None = Field(default=None, ge=0)
     configuration: ModelConfigurationStatus
 

@@ -2582,6 +2582,21 @@
             "title": "Byte Size",
             "type": "integer"
           },
+          "estimated_weight_bytes_by_role": {
+            "additionalProperties": {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "propertyNames": {
+              "enum": [
+                "dense",
+                "experts",
+                "embedding"
+              ]
+            },
+            "title": "Estimated Weight Bytes By Role",
+            "type": "object"
+          },
           "name": {
             "maxLength": 1024,
             "minLength": 1,
@@ -3021,6 +3036,21 @@
               }
             ],
             "title": "Estimated Resident Weight Bytes"
+          },
+          "estimated_weight_bytes_by_role": {
+            "additionalProperties": {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "propertyNames": {
+              "enum": [
+                "dense",
+                "experts",
+                "embedding"
+              ]
+            },
+            "title": "Estimated Weight Bytes By Role",
+            "type": "object"
           },
           "files": {
             "items": {
@@ -3972,6 +4002,21 @@
               }
             ],
             "title": "Estimated Resident Weight Bytes"
+          },
+          "estimated_weight_bytes_by_role": {
+            "additionalProperties": {
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "propertyNames": {
+              "enum": [
+                "dense",
+                "experts",
+                "embedding"
+              ]
+            },
+            "title": "Estimated Weight Bytes By Role",
+            "type": "object"
           },
           "format": {
             "default": "mfq",
