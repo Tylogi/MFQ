@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstring>
 #include <iostream>
+#include <cstdlib>
 namespace tb=mfq_tensor_backend;
 void large_window() {
     auto fixture=std::make_shared<mfq::test::Fixture>(mfq::test::fixture(529,160,28,7,false));
@@ -28,7 +29,8 @@ void large_window() {
             window.enroll({h,[&,h]{std::memset(h,0,128);pipeline.issue(ids,shape);},[&,h] {
                 mfq::cuda::wait_route_publication(h,compute);
                 MfqCudaStreamGuard guard(dma);pipeline.upload(*stage,ids,shape);
-                MFQ_CUDA_CHECK(cudaLaunchHostFunc(dma.stream(),[](void* p){
+                if(stage->mapped_rows())mfq::cuda::publish_mapped_flag(h+16);
+                else MFQ_CUDA_CHECK(cudaLaunchHostFunc(dma.stream(),[](void* p){
                     mfq::cuda::publish_mapped_flag(static_cast<uint32_t*>(p));
                 },h+16));
             },{},[h]{mfq::cuda::publish_mapped_flag(h+16);}});
@@ -45,6 +47,14 @@ void large_window() {
     std::cout<<"MFQ large row window PASS layers="<<layers<<std::endl;
 }
 int main(int argc,char** argv)try {
+    const bool mapped_rows=argc==2 && std::string(argv[1])=="--mapped-rows";
+    if(mapped_rows) {
+#ifdef _WIN32
+        _putenv_s("MFQ_PLE_MAPPED_ROWS","1");
+#else
+        setenv("MFQ_PLE_MAPPED_ROWS","1",1);
+#endif
+    }
     const auto stream=mfq_current_cuda_stream();
     auto context=mfq::cuda::default_context(mfq_current_cuda_device());context->begin_graph_pool(stream);
     if(argc==2 && std::string(argv[1])=="--large-window") {
@@ -63,7 +73,7 @@ int main(int argc,char** argv)try {
         if(cache.find(1) || leased!=a || cache.find(4)!=d)
             throw std::runtime_error("row cache eviction invalidated a consumer lease");
     }
-    int cases=0,graph_cases=0;
+    int cases=0,graph_cases=0,changed_rows=0,cancel_guards=0,recoveries=0;
     for(const auto sub_bits:{4,5,6,7,8})for(const bool adaptive:{false,true}) {
         // The synthetic adaptive fixture uses every k selector. Canonical
         // streams cannot select k=9 or 10; static GR8/k7 remains covered.
@@ -85,20 +95,22 @@ int main(int argc,char** argv)try {
         mfq::cuda::publish_mapped_flag(host+16);
         const auto compute=mfq_current_cuda_stream();auto dma=mfq_get_stream_from_pool();
         mfq::cuda::DecodeWindow window(compute);
-        window.capture([&] {
+        const auto capture_rows=[&] {
             window.enroll({stage.get(),[&] {
                 std::memset(host,0,128);pipeline.issue(ids,shape);
             },[&] {
                 mfq::cuda::wait_route_publication(host,compute);
                 MfqCudaStreamGuard guard(dma);pipeline.upload(*stage,ids,shape);
-                MFQ_CUDA_CHECK(cudaLaunchHostFunc(dma.stream(),[](void* p){
+                if(stage->mapped_rows())mfq::cuda::publish_mapped_flag(host+16);
+                else MFQ_CUDA_CHECK(cudaLaunchHostFunc(dma.stream(),[](void* p){
                     mfq::cuda::publish_mapped_flag(static_cast<uint32_t*>(p));
                 },host+16));
             },{},[&]{mfq::cuda::publish_mapped_flag(host+16);}});
             mfq::cuda::signal_mapped_flag(mapped,compute);
             mfq::cuda::wait_mapped_flag(mapped+16,compute);
             stage->decode();
-        },[]{});
+        };
+        window.capture(capture_rows,[]{});
         for(int order=0;order<3;++order) {
             if(order)std::reverse(ids.begin(),ids.end());
             pipeline.issue(ids,shape);
@@ -117,9 +129,48 @@ int main(int argc,char** argv)try {
                 throw std::runtime_error("MFQ PLE asynchronous graph decode differs or changed output storage");
             ++graph_cases;
         }
+        // Change payloads and descriptor cohorts, not just the inverse order.
+        // This also checks visibility when a captured kernel reads host pages
+        // rewritten between graph replays.
+        for(int step=0;step<16;++step) {
+            for(std::size_t i=0;i<ids.size();++i)ids[i]=((step+int(i))%4)*529+(step*31+int(i)*17)%529;
+            auto expected=nint_sharded_embedding_lookup(tables,ids,shape,device).cpu().contiguous();
+            window.run();auto actual=stage->output().cpu().contiguous();
+            if(actual.sizes()!=expected.sizes() || std::memcmp(actual.data_ptr(),expected.data_ptr(),actual.numel()*actual.element_size()))
+                throw std::runtime_error("PLE changed-row replay saw stale payload or descriptors");
+            ++changed_rows;
+        }
+        const auto valid_ids=ids;ids[0]=-1;
+        bool rejected=false;
+        try{window.run();}catch(const std::out_of_range&){rejected=true;++cancel_guards;}
+        if(!rejected)throw std::runtime_error("PLE invalid gather was not rejected");
+        rejected=false;
+        try{window.run();}catch(const std::runtime_error&){rejected=true;++cancel_guards;}
+        if(!rejected)throw std::runtime_error("PLE reused a failed decode window");
+        ids=valid_ids;
+        mfq::cuda::DecodeWindow fresh(compute);
+        // Re-enroll using the new window while retaining the same row stage.
+        fresh.capture([&] {
+            fresh.enroll({stage.get(),[&]{std::memset(host,0,128);pipeline.issue(ids,shape);},[&] {
+                mfq::cuda::wait_route_publication(host,compute);
+                MfqCudaStreamGuard guard(dma);pipeline.upload(*stage,ids,shape);
+                if(stage->mapped_rows())mfq::cuda::publish_mapped_flag(host+16);
+                else MFQ_CUDA_CHECK(cudaLaunchHostFunc(dma.stream(),[](void* p){
+                    mfq::cuda::publish_mapped_flag(static_cast<uint32_t*>(p));
+                },host+16));
+            },{},[&]{mfq::cuda::publish_mapped_flag(host+16);}});
+            mfq::cuda::signal_mapped_flag(mapped,compute);
+            mfq::cuda::wait_mapped_flag(mapped+16,compute);stage->decode();
+        },[]{});
+        fresh.run();auto recovered=stage->output().cpu().contiguous();
+        auto expected=nint_sharded_embedding_lookup(tables,ids,shape,device).cpu().contiguous();
+        if(std::memcmp(recovered.data_ptr(),expected.data_ptr(),recovered.numel()*recovered.element_size()))
+            throw std::runtime_error("PLE recovery retained incomplete row data");
+        ++recoveries;
     }
     large_window();
     MFQ_CUDA_CHECK(cudaStreamSynchronize(stream));context->end_graph_pool(stream);
     std::cout<<"MFQ PLE native row gather/cache/issue/collect PASS cases="<<cases
-        <<" asynchronous graph cases="<<graph_cases<<'\n';
+        <<" asynchronous graph cases="<<graph_cases<<" changed_rows="<<changed_rows
+        <<" cancel_guards="<<cancel_guards<<" recoveries="<<recoveries<<" mapped_rows="<<mapped_rows<<'\n';
 }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}

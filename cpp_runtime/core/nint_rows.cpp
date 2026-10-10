@@ -331,8 +331,7 @@ void NintRowBatch::append_batch(const NintRowBatch& other) {
         throw std::overflow_error("NINT merged row batch exceeds bounds");
     }
     const auto offset = static_cast<std::uint32_t>(packed_.size());
-    packed_.reserve(packed_.size() + other.packed_.size());
-    descriptors_.reserve(descriptors_.size() + other.descriptors_.size());
+    // Preserve geometric vector growth when merging thousands of cached rows.
     packed_.insert(packed_.end(), other.packed_.begin(), other.packed_.end());
     for (std::size_t row = 0; row < other.rows(); ++row) {
         const auto* descriptor = other.descriptors_.data() + row * 6;

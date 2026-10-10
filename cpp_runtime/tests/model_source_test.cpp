@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -58,7 +59,7 @@ std::string graph_json() {
 
 void write_mfq(
     const std::filesystem::path& path,
-    std::string_view tensor_name = "model.token_embedding.weight") {
+    std::string_view tensor_name = "model.token_embedding.weight",std::int64_t elements=1) {
     const std::string config = R"({"model_type":"qwen3_5"})";
     std::ofstream stream(path, std::ios::binary);
     stream.write("MFQ1", 4);
@@ -68,14 +69,16 @@ void write_mfq(
     write_scalar<std::uint32_t>(stream, 2);
     write_string(stream, tensor_name);
     write_string(stream, "BF16");
-    write_scalar<std::uint64_t>(stream, 14);
+    write_scalar<std::uint64_t>(stream, 12+2*elements);
     write_string(stream, "__mfq_asset__/model_config.json");
     write_string(stream, "BLOB");
     write_scalar<std::uint64_t>(stream, config.size());
     write_scalar<std::uint32_t>(stream, 1);
-    write_scalar<std::int64_t>(stream, 1);
-    const char tensor[] = {0x12, 0x34};
-    stream.write(tensor, sizeof(tensor));
+    write_scalar<std::int64_t>(stream, elements);
+    std::vector<char> tensor(static_cast<std::size_t>(2*elements));
+    for(std::size_t i=0;i<tensor.size();++i)tensor[i]=static_cast<char>(i*17+3);
+    tensor[0]=0x12;tensor[1]=0x34;
+    stream.write(tensor.data(),static_cast<std::streamsize>(tensor.size()));
     stream.write(config.data(), static_cast<std::streamsize>(config.size()));
 }
 
@@ -156,6 +159,7 @@ int main() {
         const auto legacy_gguf_path = root / "legacy-gguf-model.mfq";
         const auto hf_path = root / "hf";
         write_mfq(mfq_path);
+        write_mfq(root/"mapped-large.mfq","model.token_embedding.weight",131072);
         write_mfq(
             legacy_mfq_path,
             "model.language_model.embed_tokens.weight");
@@ -187,6 +191,40 @@ int main() {
         catch (const std::out_of_range&) { range_rejected = true; }
         require(range_rejected, "retained reader accepted out-of-range bytes");
         retained = {}; // Close the independently owned file before cleanup.
+
+        {
+            auto mapped=[&] {
+                mfq::MfqModelSource temporary(legacy_gguf_path);
+                return temporary.mapped_tensor_reader("model.token_embedding.weight");
+            }();
+            std::vector<std::byte> all(14);mapped(0,all.data(),all.size());require_bytes(all);
+            for(std::size_t offset=0;offset<=all.size();++offset)for(std::size_t count=0;count<=all.size()-offset;++count) {
+                std::vector<std::byte> part(count);mapped(offset,part.data(),count);
+                require(std::equal(part.begin(),part.end(),all.begin()+offset),"mapped reader slice differs");
+            }
+            mapped(14,nullptr,0);
+            int rejected=0;
+            try {mapped(13,all.data(),2);}catch(const std::out_of_range&){++rejected;}
+            try {mapped(UINT64_MAX,all.data(),1);}catch(const std::out_of_range&){++rejected;}
+            try {mapped(0,nullptr,1);}catch(const std::invalid_argument&){++rejected;}
+            require(rejected==3,"mapped reader boundary guards failed");
+            std::vector<std::future<void>> readers;
+            for(int worker=0;worker<8;++worker)readers.push_back(std::async(std::launch::async,[mapped] {
+                for(int i=0;i<64;++i){std::vector<std::byte> bytes(14);mapped(0,bytes.data(),bytes.size());require_bytes(bytes);}
+            }));
+            for(auto& worker:readers)worker.get();
+        }
+        {
+            mfq::MfqModelSource large(root/"mapped-large.mfq");
+            auto ordinary=large.tensor_reader("model.token_embedding.weight");
+            auto mapped=large.mapped_tensor_reader("model.token_embedding.weight");
+            for(std::size_t offset:{0u,4093u,65521u,65536u,131071u,262143u}) {
+                const auto count=std::min<std::size_t>(67,262156-offset);
+                std::vector<std::byte> expected(count),actual(count);
+                ordinary(offset,expected.data(),count);mapped(offset,actual.data(),count);
+                require(actual==expected,"mapped tensor crossing page/granularity boundary differs");
+            }
+        }
 
         {
             mfq::MfqModelSource direct(legacy_gguf_path,mfq::FileReadMode::Direct);

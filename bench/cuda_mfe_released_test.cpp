@@ -9,11 +9,29 @@
 #include <cstring>
 #include <memory>
 #include <set>
+#include <fstream>
+#include <filesystem>
 
 namespace {
 namespace tb=mfq_tensor_backend;
 constexpr int hidden=2560,intermediate=640,routes=10,experts=512;
 const std::array<const char*,3> roles={"gate","up","down"};
+
+void export_shared_fixtures(const char* filename,const std::filesystem::path& root) {
+    const auto model=mfq::open_model_source(filename);
+    std::filesystem::create_directories(root);
+    for(const auto* role:roles) {
+        const auto name=std::string("model.block.0.mlp.shared_expert.")+role+".weight";
+        const auto* metadata=model->find_tensor(name);
+        if(!metadata || metadata->dtype!="NINT")throw std::runtime_error("shared fixture is not canonical NINT: "+name);
+        const auto blob=model->read(name);
+        const auto target=root/(std::string("shared-s2-")+role+".nint");
+        std::ofstream output(target,std::ios::binary);
+        if(!output || !output.write(reinterpret_cast<const char*>(blob.data()),std::streamsize(blob.size())))
+            throw std::runtime_error("cannot write shared fixture: "+target.string());
+        std::cout<<"shared_fixture tensor="<<name<<" bytes="<<blob.size()<<" path="<<target.string()<<'\n';
+    }
+}
 
 void cache_topology(const char* filename) {
     const auto model=mfq::open_model_source(filename);
@@ -69,8 +87,10 @@ void exact(const tb::Tensor& actual,const tb::Tensor& expected,const std::string
     const auto* y=static_cast<const uint8_t*>(b.data_ptr());
     std::size_t i=0;while(i<bytes && x[i]==y[i])++i;
     const auto index=i/a.element_size();auto af=a.to(tb::kFloat32),bf=b.to(tb::kFloat32);
-    throw std::runtime_error(label+" differs at "+std::to_string(index)+": "+
-        std::to_string(af.data_ptr<float>()[index])+" versus "+std::to_string(bf.data_ptr<float>()[index]));
+    std::ostringstream detail;detail.precision(9);
+    detail<<label<<" differs at "<<index<<": "<<af.data_ptr<float>()[index]
+        <<" versus "<<bf.data_ptr<float>()[index];
+    throw std::runtime_error(detail.str());
 }
 void finite(const tb::Tensor& value,const std::string& label) {
     const auto host=value.cpu().to(tb::kFloat32).contiguous();
@@ -211,7 +231,10 @@ public:
 };
 }
 int main(int argc,char** argv)try {
-    if(argc<2 || argc>3)throw std::runtime_error("usage: mfq-cuda-mfe-released-test model-shard [layer|--cache-topology]");
+    if(argc==4 && std::string(argv[2])=="--export-shared-fixtures") {
+        export_shared_fixtures(argv[1],argv[3]);return 0;
+    }
+    if(argc<2 || argc>3)throw std::runtime_error("usage: mfq-cuda-mfe-released-test model-shard [layer|--cache-topology|--export-shared-fixtures DIR]");
     if(argc==3 && std::string(argv[2])=="--cache-topology"){cache_topology(argv[1]);return 0;}
     auto context=mfq::cuda::default_context(mfq_current_cuda_device());
     const int layer=argc==3?std::stoi(argv[2]):0;Bank bank(argv[1],layer);

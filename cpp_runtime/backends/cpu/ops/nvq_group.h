@@ -34,4 +34,7 @@ NvqGroupDot nvq_group_dot_kernel(int format) noexcept;
 using NvqRowsDot=void(*)(const NvqDecodeView&,const float*,std::int64_t,std::int64_t,
     float*,std::int64_t,std::int64_t,std::int64_t);
 NvqRowsDot nvq_rows_dot_kernel(int format) noexcept;
+// Compact state/index/sign records for JSC E8/D4. Uses indices/index_bytes
+// and the same anchors/state tables; aux and states are not accessed.
+NvqRowsDot nvq_dense_rows_dot_kernel(int format) noexcept;
 } // namespace mfq::cpu

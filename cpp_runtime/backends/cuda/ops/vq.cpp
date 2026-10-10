@@ -7,9 +7,93 @@
 #include "quant_dot.h"
 #include "nvq_group.h"
 #include "cpu_projection_rows.h"
+#include "nvq_dense_pack.h"
+
+bool prepare_nvq_dense_groups(NvqWeight& w) {
+    if(w.dense_groups)return true;
+    if(!w.indices_packed.is_cpu() || w.gs!=24 || w.sub_bits!=4 ||
+            w.out<=0 || w.out>std::numeric_limits<int>::max() ||
+            w.neuron_len<=0 || w.neuron_len>std::numeric_limits<int>::max() ||
+            !mfq::cpu::nvq_dense_rows_dot_kernel(int(w.kernel_format)))return false;
+    const int rows=int(w.out),pairs=int((w.neuron_len+7)/8),groups=int(w.ng);
+    const bool d4=w.kernel_format==10 || w.kernel_format==11 || w.kernel_format==12 || w.kernel_format==15;
+    if(d4 && (w.neuron_len+3)/4!=2*pairs)return false;
+    // Every expert in an arena starts at a byte boundary. No per-expert
+    // padding is inserted; unsupported odd shapes keep canonical storage.
+    const int bits=w.kernel_format==12?9:(w.kernel_format==13 || w.kernel_format==15)?10:w.kernel_format==14?12:8;
+    if((int64_t(rows)*(int64_t(pairs)*((d4?2:1)*bits+7)+int64_t(groups)*4))&7)return false;
+    std::vector<uint8_t> compact;
+#define PACK(B,P) mfq::cpu::dense::pack<B,P>(w.indices_packed.data_ptr<uint8_t>(),w.indices_packed.numel(), \
+        w.aux_packed.data_ptr<uint8_t>(),w.aux_packed.numel(),w.sub_scale_packed.data_ptr<uint8_t>(), \
+        w.sub_scale_packed.numel(),rows,pairs,groups)
+    switch(w.kernel_format) {
+        case 5:compact=PACK(8,1);break;case 13:compact=PACK(10,1);break;case 14:compact=PACK(12,1);break;
+        case 10:case 11:compact=PACK(8,2);break;case 12:compact=PACK(9,2);break;case 15:compact=PACK(10,2);break;
+        default:return false;
+    }
+#undef PACK
+    if(compact.size()>size_t(w.indices_packed.numel()+w.aux_packed.numel()+w.sub_scale_packed.numel()))
+        throw std::runtime_error("compact NVQ unexpectedly expanded weights");
+    w.indices_packed=mfq_tensor_backend::tensor(compact);
+    w.aux_packed=mfq_tensor_backend::empty({0},w.indices_packed.options());
+    w.sub_scale_packed=mfq_tensor_backend::empty({0},w.indices_packed.options());
+    w.dense_groups=true;
+    return true;
+}
 
 using mfq_tensor_backend::indexing::Slice;
 using namespace mfq::cuda::quant_format;
+
+void prepare_nvq_integer_codebook(NvqWeight& w) {
+    const char* enabled=std::getenv("MFQ_NVQ1_INTEGER_DELTA");
+    if(!enabled || enabled[0]=='0' || w.integer_codebook.defined() ||
+       (w.kernel_format!=1 && w.kernel_format!=8) || !w.codebook.is_cuda())return;
+    const auto canonical=w.codebook.to(mfq_tensor_backend::kCPU).contiguous();
+    const bool small=w.kernel_format==8;
+    const int bank_bytes=small?512*8:2048*8;
+    if(canonical.numel()!=int64_t(small?2:1)*bank_bytes)
+        throw std::invalid_argument("NVQ1 integer decode book has invalid canonical size");
+    std::vector<int8_t> digits(2*bank_bytes);
+    const auto* source=canonical.data_ptr<int8_t>();
+    for(int negative=0;negative<2;++negative)for(int i=0;i<bank_bytes;++i) {
+        const int v=source[(small?negative*bank_bytes:0)+i];
+        if(v<-1 || v>1)throw std::invalid_argument("NVQ1 integer decode digits require -1/0/1");
+        digits[negative*bank_bytes+i]=int8_t((small?32:8)*v+(negative?-1:1)*(small?5:1));
+    }
+    w.integer_codebook=mfq_tensor_backend::tensor(digits).to(w.codebook.device()).contiguous();
+}
+void prepare_nvq_decode_records(NvqWeight& w,bool /*immutable*/) {
+    const char* enabled=std::getenv("MFQ_NVQ1_GROUP_RECORDS");
+    if(!enabled || enabled[0]!='1' || w.decode_records.defined() ||
+       (w.kernel_format!=1 && w.kernel_format!=8) || !w.indices_packed.is_cuda() || w.gs!=24 ||
+       w.sub_bits!=(w.kernel_format==8?4:3))return;
+    if(w.aux_packed.numel()==0){w.decode_records=w.indices_packed;return;}
+    const auto indices=w.indices_packed.to(mfq_tensor_backend::kCPU).contiguous();
+    const auto auxiliary=w.aux_packed.to(mfq_tensor_backend::kCPU).contiguous();
+    const auto states=w.sub_scale_packed.to(mfq_tensor_backend::kCPU).contiguous();
+    const auto bits=[](const mfq_tensor_backend::Tensor& data,int64_t bit,int width) {
+        uint32_t value=0;
+        for(int i=0;i<width;++i)if((bit+i)/8<data.numel())
+            value|=uint32_t((data.data_ptr<uint8_t>()[(bit+i)/8]>>((bit+i)&7))&1u)<<i;
+        return value;
+    };
+    const bool small=w.kernel_format==8;
+    const int index_bits=small?9:11,record_bytes=small?4:5,nvec=int((w.neuron_len+7)/8);
+    std::vector<uint8_t> records(size_t(w.out)*w.ng*record_bytes);
+    for(int64_t row=0;row<w.out;++row)for(int group=0;group<w.ng;++group) {
+        const int64_t linear=row*w.ng+group;
+        uint64_t record=0;
+        for(int segment=0;segment<3;++segment)if(group*3+segment<nvec)
+            record|=uint64_t(bits(indices,(row*nvec+group*3+segment)*index_bits,index_bits))<<(segment*index_bits);
+        record|=uint64_t(bits(states,linear*w.sub_bits,int(w.sub_bits)))<<(3*index_bits);
+        record|=uint64_t(bits(auxiliary,linear,1))<<(3*index_bits+w.sub_bits);
+        std::memcpy(records.data()+linear*record_bytes,&record,record_bytes);
+    }
+    w.decode_records=mfq_tensor_backend::tensor(records).to(w.indices_packed.device()).contiguous();
+    w.indices_packed=w.decode_records;
+    w.aux_packed=mfq_tensor_backend::empty({0},w.indices_packed.options());
+    w.sub_scale_packed=mfq_tensor_backend::empty({0},w.indices_packed.options());
+}
 
 enum class NvqMatmulPath {
     Gemv,
@@ -19,6 +103,19 @@ enum class NvqMatmulPath {
 };
 
 static NvqMatmulPath select_nvq_matmul_path(const NvqWeight & w, int M) {
+    // Small expert matrices underfill the multi-column GEMV on SM86.
+    // The vector decoder plus FP32-accumulating GEMM is faster from M=9.
+    if (M >= 9 && M <= 16 && w.out <= 4096 && w.neuron_len <= 4096 &&
+            std::getenv("MFQ_NVQ_DENSE_REFERENCE") == nullptr) {
+        thread_local int cached_device = -1, major = 0, minor = 0;
+        const int device = w.indices_packed.get_device();
+        if (device != cached_device) {
+            MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+            MFQ_CUDA_CHECK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
+            cached_device = device;
+        }
+        if (major == 8 && minor == 6) return NvqMatmulPath::DequantGemm;
+    }
     const bool e8_family =
         w.format == 2 || w.format == 5 || w.format == 7 ||
         w.format == 8 || w.format == 9 ||
@@ -164,6 +261,16 @@ static inline uint32_t cpu_nvq_bits(const uint8_t* data, int64_t bytes,
     return (word>>(bit&7))&((1u<<bits)-1u);
 }
 
+static inline uint32_t cpu_nvq_state(const uint8_t* indices,const uint8_t* states,
+        int64_t state_bytes,int64_t linear,int bits,int format) {
+    if(state_bytes==0 && (format==1 || format==8)) {
+        uint64_t record=0;const int bytes=format==8?4:5;
+        std::memcpy(&record,indices+linear*bytes,bytes);
+        return uint32_t(record>>(format==8?27:33))&((1u<<bits)-1u);
+    }
+    return cpu_nvq_bits(states,state_bytes,linear*bits,bits);
+}
+
 // Geometry, storage pointers and state tables are prepared once per GEMV.
 // E8 indices/signs are consumed once per eight values, D4 once per four.
 template<int Format>
@@ -175,9 +282,12 @@ static void cpu_decode_nvq_group(const CpuNvqDecodeView& w,
         (Format==8 || Format==12) ? 9 : Format==9 ? 6 :
         (Format==13 || Format==15) ? 10 : Format==14 ? 12 : 8;
     const int8_t* bank=w.banks[state];
-    int delta=1;
+    int delta=1;uint64_t record=0;
+    if constexpr(delta_format)if(w.aux_bytes==0)
+        std::memcpy(&record,w.indices+(row*w.groups+group)*(Format==8?4:5),Format==8?4:5);
     if constexpr (delta_format) {
-        const bool negative=cpu_nvq_bits(w.aux,w.aux_bytes,row*w.groups+group,1)!=0;
+        const bool negative=w.aux_bytes==0?((record>>(Format==8?31:36))&1u)!=0:
+            cpu_nvq_bits(w.aux,w.aux_bytes,row*w.groups+group,1)!=0;
         delta=negative ? -1 : 1;
         if constexpr (Format==8) bank+=int(negative)*512*8;
     }
@@ -189,7 +299,8 @@ static void cpu_decode_nvq_group(const CpuNvqDecodeView& w,
             continue;
         }
         const int64_t linear=row*w.nvec+vector;
-        const uint32_t code=bits==8 ? w.indices[linear] :
+        const uint32_t code=delta_format && w.aux_bytes==0?
+            uint32_t(record>>(chunk*bits))&((1u<<bits)-1u):bits==8 ? w.indices[linear] :
             cpu_nvq_bits(w.indices,w.index_bytes,linear*bits,bits);
         int8_t decoded[8];
         if constexpr (Format==7) {
@@ -254,15 +365,18 @@ CpuProjectionRows make_cpu_projection_rows(const NvqWeight& w) {
         v.multipliers[state]=cpu_nvq_scale(metadata,format,1.0f,state);
         v.banks[state]=format==7 ? metadata+64+state*32 : format==9 ? metadata+64+state*64*8 : cpu_nvq_codebook(metadata,format,state);
     }
-    p.nvq_rows=mfq::cpu::nvq_rows_dot_kernel(format);
+    p.nvq_rows=w.dense_groups ? mfq::cpu::nvq_dense_rows_dot_kernel(format) :
+        (format==1 || format==8) && v.aux_bytes==0?nullptr:mfq::cpu::nvq_rows_dot_kernel(format);
+    MFQ_RUNTIME_CHECK(!w.dense_groups || p.nvq_rows,"compact NVQ CPU decoder unavailable");
     if(!p.nvq_rows) {
         const auto decoder=cpu_nvq_decoder(format);
         const auto dot=mfq::cpu::scaled_i8_dot_kernel();
-        p.scalar_rows=[v,decoder,dot](const float* x,int batch,int stride,float* y,int out,int begin,int end) {
+        p.scalar_rows=[v,decoder,dot,format](const float* x,int batch,int stride,float* y,int out,int begin,int end) {
             for(int row=begin;row<end;++row) {
                 for(int t=0;t<batch;++t) y[t*out+row]=0;
                 for(int group=0;group<v.groups;++group) {
-                    const auto state=cpu_nvq_bits(v.states,v.state_bytes,(int64_t(row)*v.groups+group)*v.state_bits,v.state_bits);
+                    const auto state=cpu_nvq_state(v.indices,v.states,v.state_bytes,
+                        int64_t(row)*v.groups+group,v.state_bits,format);
                     const float scale=v.anchors[row]*v.multipliers[state];
                     alignas(32) int8_t codes[24];decoder(v,row,group,state,codes);
                     const int valid=static_cast<int>(std::min<int64_t>(24,v.width-int64_t(group)*24));
@@ -294,7 +408,9 @@ static mfq_tensor_backend::Tensor nvq_matmul_cpu(
     const int64_t scale_bytes = w.sub_scale_packed.numel();
     const int format=static_cast<int>(w.kernel_format);
     const auto decoder=cpu_nvq_decoder(format);
-    const auto fused_rows=mfq::cpu::nvq_rows_dot_kernel(format);
+    const auto fused_rows=w.dense_groups ? mfq::cpu::nvq_dense_rows_dot_kernel(format) :
+        (format==1 || format==8) && w.aux_packed.numel()==0?nullptr:mfq::cpu::nvq_rows_dot_kernel(format);
+    MFQ_RUNTIME_CHECK(!w.dense_groups || fused_rows,"compact NVQ CPU decoder unavailable");
     const int vector_size=cpu_nvq_d4(format) ? 4 : 8;
     MFQ_RUNTIME_CHECK(w.sub_bits>0 && w.sub_bits<=4,"CPU NVQ state width must be 1..4");
     CpuNvqDecodeView view{w.indices_packed.data_ptr<uint8_t>(),
@@ -327,10 +443,8 @@ static mfq_tensor_backend::Tensor nvq_matmul_cpu(
             std::fill(accumulators.begin(), accumulators.end(), 0.0f);
             for (int group = 0; group < w.ng; ++group) {
                 const int64_t scale_linear = neuron * w.ng + group;
-                const uint32_t state = cpu_nvq_bits(
-                    scales, scale_bytes,
-                    scale_linear * w.sub_bits,
-                    static_cast<int>(w.sub_bits));
+                const uint32_t state = cpu_nvq_state(view.indices,scales,scale_bytes,
+                    scale_linear,static_cast<int>(w.sub_bits),format);
                 const float scale = anchors[neuron]*view.multipliers[state];
                 const int valid = static_cast<int>(std::min<int64_t>(
                     w.gs, w.neuron_len - static_cast<int64_t>(group) * w.gs));
@@ -1613,8 +1727,11 @@ NvqWeight to_device_nvq(
         w.aux_packed = w.aux_packed.to(target).contiguous();
         w.sub_scale_packed =
             w.sub_scale_packed.to(target).contiguous();
+        if(w.kernel_format==16 || w.kernel_format==17)
+            w.sub_scale_packed=mfq_tensor_backend::empty({0},w.indices_packed.options());
         w.neuron_scale = w.neuron_scale.to(target).contiguous();
         w.codebook = w.codebook.to(target).contiguous();
+        prepare_nvq_decode_records(w,true);
         (void)w.workspace(1);
     }
     return w;

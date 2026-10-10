@@ -1,5 +1,6 @@
 #include "weight_loader.h"
 #include "float_projection.h"
+#include "gated_residual_fused.h"
 #include "selected_attention.h"
 #include <limits>
 #include <fstream>
@@ -8,6 +9,9 @@
 #include "moe_expert_cache.h"
 #include "mfe_expert_store.h"
 #include "moe_quant_range_source.h"
+#include "mfq/mfq_model_source.h"
+#include <cstdlib>
+#include <cstdio>
 
 std::shared_ptr<mfq::NintRows> load_nint_row_table(
         const mfq::ModelSource& source, const std::string& name) {
@@ -16,10 +20,20 @@ std::shared_ptr<mfq::NintRows> load_nint_row_table(
     MFQ_RUNTIME_CHECK(metadata.nbytes <= std::numeric_limits<std::size_t>::max(),
         "NINT row table size overflow");
     auto read = source.tensor_reader(name);
+    bool parallel=source.supports_parallel_tensor_reads();
+    auto batch=source.tensor_batch_reader(name);
+    bool mapped_file=false;
+    const auto* mapped=std::getenv("MFQ_PLE_FILE_MAP");
+    if(mapped && mapped[0]=='1')if(const auto* file=dynamic_cast<const mfq::MfqModelSource*>(&source)) {
+        read=file->mapped_tensor_reader(name);parallel=true;batch={};mapped_file=true;
+    }
+    if(const auto* trace=std::getenv("MFQ_TRACE_PLE_TIMINGS");trace && trace[0]=='1')
+        std::fprintf(stderr,"nint_row_source mapped_file=%d nbytes=%llu name=%s\n",int(mapped_file),
+            static_cast<unsigned long long>(metadata.nbytes),name.c_str());
     return std::make_shared<mfq::NintRows>(static_cast<std::size_t>(metadata.nbytes),
         [read = std::move(read)](std::size_t offset, std::uint8_t* out, std::size_t count) {
             read(offset, reinterpret_cast<std::byte*>(out), count);
-        }, source.supports_parallel_tensor_reads(),source.tensor_batch_reader(name));
+        }, parallel,std::move(batch));
 }
 
 MfeWeight load_mfe_gpu(
@@ -224,6 +238,10 @@ ResidualLinear residual_linear(CudaExecutionContext& execution, const mfq::Model
             weight->dense.scalar_type()==tb::kBFloat16 && weight->dense.is_contiguous() &&
             weight->dense.dim()==2 && weight->dense.size(0)>0 && weight->dense.size(0)<=4;
         auto prepared_right=prepare_injection?(promoted.defined()?promoted:right.to(tb::kFloat32)):Tensor{};
+        const auto* vector_setting=std::getenv("MFQ_GR_DENSE_VECTOR");
+        if(prepare_injection && (!vector_setting || vector_setting[0]!='0') &&
+                !promoted.defined() && right.size(0)%4==0)
+            prepared_right=prepare_gr_dense_vector_right(prepared_right);
         Linear forward=[right=std::move(right),promoted=std::move(promoted)](
                 CudaExecutionContext& execution,const Tensor& input) {
             const auto dtype=input.scalar_type()==right.scalar_type()?input.scalar_type():tb::kFloat32;
@@ -302,8 +320,8 @@ Routed routed_gate_up(CudaExecutionContext& execution, const mfq::ModelSource& f
     const bool has_gate=has_tensor(file, gate_name),has_up=has_tensor(file, up_name);
     MFQ_RUNTIME_CHECK(has_gate==has_up,"incomplete routed Gate/Up pair under ",base);
     if (!has_gate) return routed(execution,file,base+".gate_up.weight",layer,experts,2*width,input,role);
-    auto gate=routed(execution,file,gate_name,layer,experts,width,input,role);
-    auto up=routed(execution,file,up_name,layer,experts,width,input,role);
+    auto gate=routed(execution,file,gate_name,layer,experts,width,input,"gate");
+    auto up=routed(execution,file,up_name,layer,experts,width,input,"up");
     auto projections=gate.projections;
     projections.insert(projections.end(),up.projections.begin(),up.projections.end());
     Routed result=[gate=std::move(gate),up=std::move(up)](CudaExecutionContext& execution, const Tensor& x,const Tensor& ids) {

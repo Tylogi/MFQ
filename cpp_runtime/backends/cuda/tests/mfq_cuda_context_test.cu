@@ -55,6 +55,39 @@ int memory_limit_cases() {
     return 0;
 }
 
+int memory_pool_reuse_case() {
+    auto context=std::make_shared<mfq::cuda::Context>(0);
+    mfq::cuda::StreamGuard active(mfq::cuda::StreamHandle(0,context->stream().get()));
+    if(!context->supports_async_allocations())throw std::runtime_error("async allocator required");
+    const auto limit=context->memory_stats().limit,baseline=context->local_memory_usage();
+    if(limit<=baseline+128*1024*1024)throw std::runtime_error("insufficient test memory budget");
+    const auto retained=(limit-baseline)*3/4;
+    cudaMemPool_t pool=nullptr;MFQ_NATIVE_CUDA_CHECK(cudaDeviceGetDefaultMemPool(&pool,0));
+    std::uint64_t old_threshold=0,keep=~std::uint64_t(0);
+    MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool,cudaMemPoolAttrReleaseThreshold,&old_threshold));
+    struct Restore {
+        cudaMemPool_t pool;std::uint64_t threshold;
+        ~Restore(){cudaMemPoolSetAttribute(pool,cudaMemPoolAttrReleaseThreshold,&threshold);cudaMemPoolTrimTo(pool,0);}
+    } restore{pool,old_threshold};
+    MFQ_NATIVE_CUDA_CHECK(cudaMemPoolSetAttribute(pool,cudaMemPoolAttrReleaseThreshold,&keep));
+    {mfq::cuda::Buffer released(context,retained);}
+    context->stream().synchronize();
+    std::uint64_t reserved=0,used=0;
+    MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool,cudaMemPoolAttrReservedMemCurrent,&reserved));
+    MFQ_NATIVE_CUDA_CHECK(cudaMemPoolGetAttribute(pool,cudaMemPoolAttrUsedMemCurrent,&used));
+    if(reserved<retained || used!=0 || context->memory_stats().allocated!=0)
+        throw std::runtime_error("test did not retain an idle allocator pool");
+#ifdef _WIN32
+    if(context->local_memory_usage()+retained<=limit)
+        throw std::runtime_error("test did not exercise the WDDM pool accounting boundary");
+#endif
+    {mfq::cuda::Buffer reused(context,retained);context->stream().synchronize();}
+    context->stream().synchronize();
+    if(context->memory_stats().allocated!=0)throw std::runtime_error("pool reuse leaked an allocation");
+    std::cout<<"cuda_memory_pool_reuse retained_bytes="<<reserved<<" allocation_bytes="<<retained<<" PASS\n";
+    return 0;
+}
+
 int main(int argc,char** argv) {
     int devices = 0;
     MFQ_NATIVE_CUDA_CHECK(cudaGetDeviceCount(&devices));
@@ -62,6 +95,7 @@ int main(int argc,char** argv) {
         return 77;
     }
     if(argc==2 && std::string(argv[1])=="--memory-limit")return memory_limit_cases();
+    if(argc==2 && std::string(argv[1])=="--memory-pool-reuse")return memory_pool_reuse_case();
 
     auto context = std::make_shared<mfq::cuda::Context>(0);
     mfq::cuda::Buffer device(context, sizeof(std::uint32_t) * 4);

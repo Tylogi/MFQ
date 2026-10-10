@@ -13,6 +13,9 @@ struct MoeCachedCohort {
     std::vector<int64_t> bytes_per_expert;
     std::vector<int32_t> expert_to_local;
     std::vector<int32_t> host_map;
+    // Field-major cold experts inside one immutable, contiguous layer image.
+    std::vector<int32_t> prefill_ram_experts;
+    std::vector<int64_t> prefill_ram_fields;
     std::shared_ptr<mfq::cuda::MfeMxfp4ExpertStore> range_store;
     bool map_dirty = false;
     MixedMoePool active;
@@ -579,6 +582,7 @@ private:
     friend class MoeExpertCache;
     friend class MoeFfnPipeline;
     friend class MoeResidencyManager;
+    friend struct MoeResidencyTestAccess;
 
     std::shared_ptr<MixedMoeRuntime> fallback_runtime() {
         if (quant_source_) throw std::runtime_error("quantized range cache cannot stage a full projection");

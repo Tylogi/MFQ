@@ -14,6 +14,7 @@
 #include "mfq_tensor_backend.h"
 #include <vector>
 #include <cstdlib>
+#include <cstring>
 
 #include "reduce.cuh"
 
@@ -314,6 +315,8 @@ __global__ void gdn_warp_column_kernel(
         }                                                                              \
     } while (0)
 
+#include "gdn_prefill_columns.inc"
+
 static std::vector<mfq_tensor_backend::Tensor> gdn_cuda_impl(
     mfq_tensor_backend::Tensor q, mfq_tensor_backend::Tensor k, mfq_tensor_backend::Tensor v,
     mfq_tensor_backend::Tensor g, mfq_tensor_backend::Tensor beta, MfqOptional<mfq_tensor_backend::Tensor> state,
@@ -370,7 +373,17 @@ static std::vector<mfq_tensor_backend::Tensor> gdn_cuda_impl(
     const char* col_env = std::getenv("MFQ_GDN_COLUMN");
     const char* warp_env = std::getenv("MFQ_GDN_WARP");
     bool use_warp = transposed_state || !(warp_env && warp_env[0] == '0');
-    if (use_warp) {
+    const char* columns_env = std::getenv("MFQ_GDN_PREFILL_COLUMNS");
+    const int columns = columns_env ? std::atoi(columns_env) : (B * Hv >= 16 ? 4 : 0);
+    if (use_warp && !kda && D == 128 && T > 8 && (columns == 2 || columns == 4)) {
+        if (transposed_state) {
+            if (tiled_heads) launch_gdn_prefill_columns<true,true>(columns,B,Hq,Hv,T,qd,kd,vd,gd,bd,sd,od,sod,stream);
+            else launch_gdn_prefill_columns<true,false>(columns,B,Hq,Hv,T,qd,kd,vd,gd,bd,sd,od,sod,stream);
+        } else {
+            if (tiled_heads) launch_gdn_prefill_columns<false,true>(columns,B,Hq,Hv,T,qd,kd,vd,gd,bd,sd,od,sod,stream);
+            else launch_gdn_prefill_columns<false,false>(columns,B,Hq,Hv,T,qd,kd,vd,gd,bd,sd,od,sod,stream);
+        }
+    } else if (use_warp) {
         if (tiled_heads) { DISPATCH_GDN_WARP(true); }
         else { DISPATCH_GDN_WARP(false); }
     } else if (T <= 4 && col_env && col_env[0] == '1') {
@@ -432,7 +445,7 @@ std::vector<mfq_tensor_backend::Tensor> gdn_inplace_transposed_tiled_cuda(
     return gdn_cuda_impl(q, k, v, g, beta, state, true, true, true);
 }
 
-template<class Gate,class Output>
+template<int tiles,class Gate,class Output,int FixedWidth=0,int FixedTaps=0>
 __global__ void gdn_decode_core_kernel(const __half* qkv,const Gate* output_gate,
     const Gate* alpha,const Gate* beta,const float* convolution_state,const float* recurrent_state,
     const float* convolution_weight,const float* dt_bias,const float* a_log,const float* norm_weight,
@@ -440,7 +453,8 @@ __global__ void gdn_decode_core_kernel(const __half* qkv,const Gate* output_gate
     int width,int taps,int layout,float convolution_eps,double norm_eps,bool silu_gate,
     bool transposed_state,int64_t as0,int64_t as2,int64_t bs0,int64_t bs2,
     float* workspace) {
-    constexpr int tiles=4;
+    if constexpr(FixedWidth>0)width=FixedWidth;
+    if constexpr(FixedTaps>0)taps=FixedTaps;
     const int bh=blockIdx.x/tiles,tile=blockIdx.x%tiles;
     const int batch=bh/value_heads,head=bh%value_heads;
     const int key_head=head/(value_heads/key_heads),tid=threadIdx.x;
@@ -612,12 +626,19 @@ std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
     mfq_tensor_backend::Tensor a_log,mfq_tensor_backend::Tensor norm_weight,
     int64_t key_heads,int64_t value_heads,int64_t width,
     double convolution_eps,double norm_eps,bool silu_gate,bool output_half,
-    bool transposed_state,mfq_tensor_backend::Tensor workspace) {
-    constexpr int threads=256,tiles=4;
+    bool transposed_state,mfq_tensor_backend::Tensor workspace,bool inplace_state) {
+    constexpr int threads=256;
+    const int tiles=[] {
+        const char* value=std::getenv("MFQ_GDN_DECODE_TILES");
+        if(!value || !*value || std::strcmp(value,"4")==0)return 4;
+        if(std::strcmp(value,"2")==0)return 2;
+        if(std::strcmp(value,"1")==0)return 1;
+        MFQ_RUNTIME_CHECK(false,"MFQ_GDN_DECODE_TILES must be 1, 2 or 4");
+        return 4;
+    }();
     namespace tb=mfq_tensor_backend;
     MFQ_RUNTIME_CHECK(width==32 || width==64 || width==128,"GDN decode core width unsupported");
     MFQ_RUNTIME_CHECK(threads==256 || threads==512 || threads==1024,"GDN decode core block width unsupported");
-    MFQ_RUNTIME_CHECK(tiles==4,"GDN decode core tile count unsupported");
     MFQ_RUNTIME_CHECK(qkv.dim()==3 && qkv.size(0)>0 && key_heads>0 && value_heads>0 &&
         value_heads%key_heads==0 && key_heads<=std::numeric_limits<int>::max()/width &&
         value_heads<=std::numeric_limits<int>::max()/width,
@@ -647,12 +668,14 @@ std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
         "GDN decode core vector width disagrees");
     MfqCudaGuard guard(device);
     auto output=tb::empty({batch,1,value_heads*width},qkv.options().dtype(output_half?tb::kFloat16:tb::kFloat32));
-    auto conv=tb::empty_like(convolution_state),state=tb::empty_like(recurrent_state);
+    auto conv=tb::empty_like(convolution_state);
+    auto state=inplace_state?recurrent_state:tb::empty_like(recurrent_state);
     if(tiles>1 && !workspace.defined())workspace=tb::zeros({batch,value_heads,width+1},convolution_state.options());
-    MFQ_RUNTIME_CHECK(real(workspace) && workspace.sizes().vec()==std::vector<int64_t>({batch,value_heads,width+1}),
+    MFQ_RUNTIME_CHECK(!workspace.defined() || (real(workspace) &&
+        workspace.sizes().vec()==std::vector<int64_t>({batch,value_heads,width+1})),
         "GDN decode core workspace shape/device/dtype disagrees");
-    const auto launch=[&]<class Gate,class Output>() {
-        gdn_decode_core_kernel<Gate,Output><<<unsigned(batch*value_heads*tiles),threads,0,mfq_current_cuda_stream()>>>(
+    const auto launch=[&]<int Tiles,class Gate,class Output,int FixedWidth=0,int FixedTaps=0>() {
+        gdn_decode_core_kernel<Tiles,Gate,Output,FixedWidth,FixedTaps><<<unsigned(batch*value_heads*Tiles),threads,0,mfq_current_cuda_stream()>>>(
             reinterpret_cast<const __half*>(qkv.data_ptr<mfq_half>()),output_gate.data_ptr<Gate>(),alpha.data_ptr<Gate>(),beta.data_ptr<Gate>(),
             convolution_state.data_ptr<float>(),recurrent_state.data_ptr<float>(),convolution_weight.data_ptr<float>(),
             dt_bias.data_ptr<float>(),a_log.data_ptr<float>(),norm_weight.data_ptr<float>(),output.data_ptr<Output>(),
@@ -660,11 +683,26 @@ std::vector<mfq_tensor_backend::Tensor> gdn_decode_core_cuda(
             float(convolution_eps),norm_eps,silu_gate,transposed_state,alpha.stride(0),alpha.stride(2),beta.stride(0),beta.stride(2),
             workspace.defined()?workspace.data_ptr<float>():nullptr);
     };
-    if(alpha.scalar_type()==tb::kFloat16) {
-        if(output_half)launch.template operator()<mfq_half,mfq_half>();else launch.template operator()<mfq_half,float>();
-    } else {
-        if(output_half)launch.template operator()<float,mfq_half>();else launch.template operator()<float,float>();
-    }
+    const auto select_geometry=[&]<int Tiles,class Gate,class Output>() {
+        const char* fixed=std::getenv("MFQ_GDN_FIXED_GEOMETRY");
+        if((!fixed || fixed[0]!='0') && taps==4) {
+            if(width==32)launch.template operator()<Tiles,Gate,Output,32,4>();
+            else if(width==64)launch.template operator()<Tiles,Gate,Output,64,4>();
+            else launch.template operator()<Tiles,Gate,Output,128,4>();
+        } else launch.template operator()<Tiles,Gate,Output>();
+    };
+    const auto select_types=[&]<int Tiles>() {
+        if(alpha.scalar_type()==tb::kFloat16) {
+            if(output_half)select_geometry.template operator()<Tiles,mfq_half,mfq_half>();
+            else select_geometry.template operator()<Tiles,mfq_half,float>();
+        } else {
+            if(output_half)select_geometry.template operator()<Tiles,float,mfq_half>();
+            else select_geometry.template operator()<Tiles,float,float>();
+        }
+    };
+    if(tiles==1)select_types.template operator()<1>();
+    else if(tiles==2)select_types.template operator()<2>();
+    else select_types.template operator()<4>();
     MFQ_CUDA_CHECK(cudaGetLastError());
     return {output,conv,state};
 }

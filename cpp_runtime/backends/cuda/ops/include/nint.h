@@ -34,6 +34,8 @@ struct NintWeight {
     mfq_tensor_backend::Tensor sub_min;
     mfq_tensor_backend::Tensor neuron_scale;
     mfq_tensor_backend::Tensor neuron_min;
+    // Experimental routed row records; populated only by the comparison bench.
+    mfq_tensor_backend::Tensor route_metadata;
     int64_t out = 0;
     int64_t ng = 0;
     int64_t gs = 0;

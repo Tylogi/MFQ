@@ -44,13 +44,17 @@ template <typename Model> struct CudaGenerationOps {
     std::int32_t generation_limit = 0;
     bool graph_active = false;
     bool graph_prepared = false;
+    int64_t prefill_compute_chunk=1024;
+    mfq::engine::InferenceOutput* output=nullptr;
 
     CudaGenerationOps(Model &model, DecodeGraphCache &graph,
         const mfq::engine::InferenceRequest &request, const CudaPreparedPrompt *prepared,
-        const CudaDecodeGraphConfig &graph_config)
+        const CudaDecodeGraphConfig &graph_config,int64_t compute_chunk=1024,
+        mfq::engine::InferenceOutput* inference_output=nullptr)
         : model(model), graph(graph), constraint(request.token_constraint),
           sampler(request.sampling),
-          has_penalties(sampler.has_penalties()), prepared(prepared), graph_config(graph_config) {
+          has_penalties(sampler.has_penalties()), prepared(prepared), graph_config(graph_config),
+          prefill_compute_chunk(compute_chunk),output(inference_output) {
         full_ids = mfq_tensor_backend::tensor(request.prompt,
             mfq_tensor_backend::TensorOptions()
                 .dtype(mfq_tensor_backend::kInt64)
@@ -70,7 +74,19 @@ template <typename Model> struct CudaGenerationOps {
         PrefillCudaTimer timer;
         auto ids = full_ids.narrow(1, chunk.offset, chunk.count).contiguous();
         Tensor hidden;
-        if (prepared && prepared->transformed()) {
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            if((!prepared || !prepared->transformed()) &&
+                qwen4_layer_major_prefill_eligible(model,chunk.count))
+                hidden=qwen4_layer_major_prefill_hidden(model,ids,prefill_compute_chunk,true,
+                    [&] {return output && output->stopped();});
+        }
+        if(output && output->stopped()) {
+            MFQ_CUDA_CHECK(cudaEventRecord(timer.finished_event(),mfq_get_current_cuda_stream()));
+            return timer.elapsed_ms();
+        }
+        if (hidden.defined()) {
+            // The layer-major path has already advanced every physical cache.
+        } else if (prepared && prepared->transformed()) {
             hidden = model.hidden_forward_inputs(ids,
                 prepared->embeddings.narrow(1, chunk.offset, chunk.count).contiguous(),
                 prepared->positions.narrow(-1, chunk.offset, chunk.count).contiguous(),
@@ -268,9 +284,17 @@ template <class Model> struct CudaGenerationContext {
     Generation plain(mfq::engine::InferenceRequest& input, mfq::engine::InferenceOutput& output,
                      size_t reused, size_t stable) {
         if (batching) return batching->generate(request_id, input, output);
+        auto logical_chunk=config.generation.prefill_chunk_size;
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            if(reused==0 && (stable==0 || stable==input.prompt.size()) &&
+                (!prepared || !prepared->transformed()) &&
+                qwen4_layer_major_prefill_eligible(model,input.prompt.size()))
+                logical_chunk=input.prompt.size();
+        }
         return mfq::engine::generate_sequence(
-            CudaGenerationOps<Model>(model, graph, input, prepared ? &*prepared : nullptr, config.decode_graph),
-            output, input.prompt.size(), reused, stable, config.generation.prefill_chunk_size);
+            CudaGenerationOps<Model>(model, graph, input, prepared ? &*prepared : nullptr,
+                config.decode_graph,config.generation.prefill_chunk_size,&output),
+            output, input.prompt.size(), reused, stable,logical_chunk);
     }
     Generation speculate(mfq::engine::InferenceRequest &input, mfq::engine::InferenceOutput &output,
         size_t reused, Hidden restored, Hidden *committed) {

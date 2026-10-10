@@ -328,6 +328,17 @@ Tensor attention_gate(const Tensor& attended, const Tensor& gate, bool half_outp
     return mfq_selected_attention::gated(attended, gate, half_output);
 }
 
+Tensor sparse_gqa_attention_gate(const Tensor& q, const Tensor& k, const Tensor& v,
+    const Tensor& indices, const Tensor& gate, bool half_output) {
+    return mfq_selected_attention::sparse_gated(q, k, v, indices, gate,
+        1.0 / std::sqrt(double(q.size(3))), half_output);
+}
+
+Tensor qsa_selected_tokens(const Tensor& blocks, const Tensor& positions,
+    int64_t pool, int64_t budget) {
+    return mfq_selected_attention::block_indices_to_tokens(blocks, positions, pool, budget);
+}
+
 Tensor causal_gqa_attention_gate(const Tensor& q, const Tensor& k, const Tensor& v,
     const Tensor& positions, const Tensor& gate, int64_t columns, bool half_output) {
     return mfq_selected_attention::causal_gated(q, k, v, positions, gate, columns,

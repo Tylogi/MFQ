@@ -3,10 +3,13 @@
 #include "engine/generation.h"
 #include "generation_result.h"
 #include "models/deepseek_v4/ops.h"
+#include "models/qwen4_exp/ops.h"
 #include "diagnostics/flash_next_mtp.h"
 #include "qwen35/mtp.h"
 #include "quant_linear.h"
 #include "storage/weight_loader.h"
+#include "storage/moe_expert_cache.h"
+#include "storage/text_session_cache.h"
 #include "cuda_execution.h"
 #include "qwen35/linear_attention.h"
 #include "mfq/kernels/cuda/deepseek_v41.h"
@@ -21,8 +24,10 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <sstream>
 #include <string>
 #include <utility>
+#include <type_traits>
 #include <vector>
 
 namespace mfq::cuda {
@@ -47,7 +52,7 @@ template <typename Model>
 static int run_prefill_sweep(
     Model& model,
     const std::vector<int64_t> & sizes,
-    int repeats) {
+    int repeats,CudaExecutionContext& execution) {
     if (repeats < 1) throw std::runtime_error("--prefill-sweep-reps must be positive");
     const int64_t max_m = *std::max_element(sizes.begin(), sizes.end());
     if (max_m > model.max_position_embeddings()) {
@@ -60,6 +65,386 @@ static int run_prefill_sweep(
     for (int64_t i = 0; i < max_m; ++i) token_ids[(size_t)i] = 1 + i % token_span;
     auto all_ids = mfq_tensor_backend::tensor(
         token_ids, mfq_tensor_backend::TensorOptions().dtype(mfq_tensor_backend::kInt64).device(mfq_tensor_backend::kCUDA)).unsqueeze(0);
+
+    if(const auto* chunk_option=std::getenv("MFQ_PREFILL_SWEEP_CHUNKS");chunk_option && chunk_option[0]) {
+        const bool profile=execution.profiler.enabled;
+        const auto* flush_sweep_option=std::getenv("MFQ_PREFILL_LAYER_FLUSH_SWEEP");
+        const bool flush_sweep=flush_sweep_option && std::atoi(flush_sweep_option)!=0;
+        const auto* async_sweep_option=std::getenv("MFQ_PREFILL_LAYER_ASYNC_SWEEP");
+        const bool async_sweep=async_sweep_option && std::atoi(async_sweep_option)!=0;
+        const auto* phase_sweep_option=std::getenv("MFQ_PREFILL_LAYER_PHASE_SWEEP");
+        const bool phase_sweep=phase_sweep_option && std::atoi(phase_sweep_option)!=0;
+        const auto* layer_major_sweep_option=std::getenv("MFQ_PREFILL_LAYER_MAJOR_SWEEP");
+        const bool layer_major_sweep=layer_major_sweep_option && std::atoi(layer_major_sweep_option)!=0;
+        const auto* layer_major_option=std::getenv("MFQ_MOE_PREFILL_LAYER_MAJOR");
+        const bool layer_major_requested=layer_major_option && std::atoi(layer_major_option)!=0;
+        const auto* kernel_sweep_option=std::getenv("MFQ_PREFILL_KERNEL_SWEEP");
+        const bool kernel_sweep=kernel_sweep_option && std::atoi(kernel_sweep_option)!=0;
+        const bool gr_gdn_sweep=kernel_sweep && std::atoi(kernel_sweep_option)==2;
+        const bool exact_sweep=kernel_sweep && std::atoi(kernel_sweep_option)>=3;
+        const bool exact_pair_sweep=kernel_sweep && std::atoi(kernel_sweep_option)>=4;
+        const bool default_pair_sweep=kernel_sweep && std::atoi(kernel_sweep_option)==5;
+        const bool quant_pair_sweep=kernel_sweep && std::atoi(kernel_sweep_option)==6;
+        const bool gr_tile_pair_sweep=kernel_sweep && std::atoi(kernel_sweep_option)==7;
+        const bool gr_mix_pair_sweep=kernel_sweep && std::atoi(kernel_sweep_option)==8;
+        const bool nvq_cohort_pair_sweep=kernel_sweep && std::atoi(kernel_sweep_option)==10;
+        const bool nvq_k_pair_sweep=kernel_sweep && (std::atoi(kernel_sweep_option)==9 || nvq_cohort_pair_sweep);
+        const char* nvq_trial_option=nvq_cohort_pair_sweep?"MFQ_NVQ_PREFILL_COHORTS":"MFQ_NVQ_PREFILL_NARROW_G2";
+        const auto* chunk_oracle_option=std::getenv("MFQ_PREFILL_CHUNK_SWEEP_ORACLE");
+        const bool chunk_sweep_oracle=chunk_oracle_option && std::atoi(chunk_oracle_option)!=0;
+        std::vector<int64_t> chunks;
+        std::stringstream options(chunk_option);std::string term;
+        while(std::getline(options,term,',')) {
+            std::size_t parsed=0;const auto value=std::stoll(term,&parsed);
+            if(parsed!=term.size())throw std::invalid_argument("invalid prefill chunk size");
+            chunks.push_back(value);
+        }
+        if(chunks.empty() || std::any_of(chunks.begin(),chunks.end(),[](auto n){return n<=0;}))
+            throw std::invalid_argument("MFQ_PREFILL_SWEEP_CHUNKS must contain positive chunk sizes");
+        int64_t first_prompt_reference_top=-1;
+        mfq_tensor_backend::Tensor first_prompt_reference_logits;
+        mfq_tensor_backend::Tensor chunk_reference_logits;
+        bool numerical_failure=false;
+        for(int64_t m:sizes)for(int64_t chunk:chunks) {
+            std::vector<double> elapsed_ms;
+            mfq_tensor_backend::Tensor reference_logits;
+            for(int repeat=0;repeat<repeats;++repeat) {
+                const bool layer_major=(kernel_sweep?(exact_sweep || repeat%4>0):
+                    layer_major_sweep?bool(repeat&1):layer_major_requested) && m>1024;
+                if(kernel_sweep) {
+                    const auto* exact_gr=std::getenv("MFQ_PREFILL_EXACT_GR_KERNEL");
+                    const auto* gr=gr_mix_pair_sweep || nvq_k_pair_sweep?"17":gr_tile_pair_sweep?(repeat%2?(exact_gr?exact_gr:"12"):"6"):quant_pair_sweep?"6":exact_sweep?(repeat%2?(exact_gr?exact_gr:"8"):"1"):(repeat%4==3?"3":"1");
+                    const auto* batch=quant_pair_sweep || gr_tile_pair_sweep || gr_mix_pair_sweep || nvq_k_pair_sweep?"1":exact_pair_sweep?(repeat%2?"1":"0"):(!gr_gdn_sweep && repeat%4>=2?"1":"0");
+                    const auto* columns=exact_sweep || gr_gdn_sweep && repeat%4>=2?"4":"0";
+                    const bool use_defaults=default_pair_sweep && repeat%2;
+#ifdef _WIN32
+                    _putenv_s("MFQ_GR_PREFILL_MATMUL",use_defaults?"":gr);
+                    _putenv_s("MFQ_MOE_PREFILL_EXPERT_BATCH",use_defaults?"":batch);
+                    _putenv_s("MFQ_GDN_PREFILL_COLUMNS",columns);
+#else
+                    if(use_defaults) {
+                        unsetenv("MFQ_GR_PREFILL_MATMUL");unsetenv("MFQ_MOE_PREFILL_EXPERT_BATCH");
+                    } else {
+                        setenv("MFQ_GR_PREFILL_MATMUL",gr,1);setenv("MFQ_MOE_PREFILL_EXPERT_BATCH",batch,1);
+                    }
+                    setenv("MFQ_GDN_PREFILL_COLUMNS",columns,1);
+#endif
+                    if(quant_pair_sweep) {
+                        const auto* wide_rows=repeat%2?"1":"0";
+#ifdef _WIN32
+                        _putenv_s("MFQ_NVQ_PREFILL_M256",wide_rows);
+#else
+                        setenv("MFQ_NVQ_PREFILL_M256",wide_rows,1);
+#endif
+                        std::cout<<"prefill_quant_mode_m="<<m<<" chunk="<<chunk<<" repeat="<<repeat
+                            <<" m256="<<wide_rows<<std::endl;
+                    }
+                    if(nvq_k_pair_sweep) {
+                        const auto* narrow_g2=repeat%2?"1":"0";
+#ifdef _WIN32
+                        _putenv_s(nvq_trial_option,narrow_g2);
+                        if(nvq_cohort_pair_sweep)_putenv_s("MFQ_GDN_PREFILL_PIPELINED",narrow_g2);
+#else
+                        setenv(nvq_trial_option,narrow_g2,1);
+                        if(nvq_cohort_pair_sweep)setenv("MFQ_GDN_PREFILL_PIPELINED",narrow_g2,1);
+#endif
+                        std::cout<<(nvq_cohort_pair_sweep?"prefill_nvq_cohort_mode_m=":"prefill_nvq_k_mode_m=")
+                            <<m<<" chunk="<<chunk<<" repeat="<<repeat
+                            <<(nvq_cohort_pair_sweep?" cohorts=":" narrow_g2=")<<narrow_g2<<std::endl;
+                        if(nvq_cohort_pair_sweep)std::cout<<"prefill_gdn_pipeline_mode_m="<<m<<" chunk="<<chunk
+                            <<" repeat="<<repeat<<" pipelined="<<narrow_g2<<std::endl;
+                    }
+                    if(gr_mix_pair_sweep) {
+                        const auto* mix_option=std::getenv("MFQ_PREFILL_MIX_KERNEL");
+                        const auto* mix_baseline=std::getenv("MFQ_PREFILL_MIX_BASELINE");
+                        const auto* mixed=repeat%2?(mix_option?mix_option:"1"):(mix_baseline?mix_baseline:"0");
+#ifdef _WIN32
+                        _putenv_s("MFQ_GR_PREFILL_FUSED_MIX",mixed);
+#else
+                        setenv("MFQ_GR_PREFILL_FUSED_MIX",mixed,1);
+#endif
+                        std::cout<<"prefill_mix_mode_m="<<m<<" chunk="<<chunk<<" repeat="<<repeat
+                            <<" mode="<<mixed<<std::endl;
+                    }
+                    std::cout<<"prefill_kernel_mode_m="<<m<<" chunk="<<chunk<<" repeat="<<repeat
+                        <<" gr_kernel="<<gr<<" expert_batch="<<batch<<std::endl;
+                    std::cout<<"prefill_gdn_mode_m="<<m<<" chunk="<<chunk<<" repeat="<<repeat
+                        <<" columns="<<columns<<std::endl;
+                }
+                if(layer_major_sweep || layer_major_requested)
+                    std::cout<<"prefill_layer_major_m="<<m<<" chunk="<<chunk<<" repeat="<<repeat
+                        <<" layer_major="<<int(layer_major)<<std::endl;
+                if(phase_sweep) {
+                    const auto* enabled=(repeat&1)?"1":"0";
+#ifdef _WIN32
+                    _putenv_s("MFQ_MOE_PREFILL_LAYER_PHASED",enabled);
+#else
+                    setenv("MFQ_MOE_PREFILL_LAYER_PHASED",enabled,1);
+#endif
+                    std::cout<<"prefill_transfer_phase_m="<<m<<" chunk="<<chunk<<" repeat="<<repeat
+                        <<" phased="<<enabled<<std::endl;
+                }
+                if(async_sweep) {
+                    const auto* enabled=(repeat&1)?"1":"0";
+#ifdef _WIN32
+                    _putenv_s("MFQ_MOE_PREFILL_LAYER_ASYNC",enabled);
+#else
+                    setenv("MFQ_MOE_PREFILL_LAYER_ASYNC",enabled,1);
+#endif
+                    std::cout<<"prefill_transfer_async_m="<<m<<" chunk="<<chunk<<" repeat="<<repeat
+                        <<" async="<<enabled<<std::endl;
+                }
+                if(flush_sweep) {
+                    const auto* enabled=(repeat&1)?"1":"0";
+#ifdef _WIN32
+                    _putenv_s("MFQ_MOE_PREFILL_LAYER_FLUSH",enabled);
+#else
+                    setenv("MFQ_MOE_PREFILL_LAYER_FLUSH",enabled,1);
+#endif
+                    std::cout<<"prefill_transfer_flush_m="<<m<<" chunk="<<chunk<<" repeat="<<repeat
+                        <<" flush="<<enabled<<std::endl;
+                }
+                model.reset(1);mfq_cuda_synchronize();
+                execution.profiler.reset();
+                const auto started=std::chrono::steady_clock::now();
+                mfq_tensor_backend::Tensor logits;
+                if(layer_major) {
+                    if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+                        execution.profiler.enabled=profile;
+                        auto hidden=qwen4_layer_major_prefill_hidden(model,all_ids.narrow(1,0,m),chunk,true);
+                        logits=model.apply_final_logit_softcap(model.adapter_last_logits(
+                            model.lm_head,model.last_hidden(std::move(hidden))));
+                        mfq_cuda_synchronize();
+                        if(profile) {
+                            execution.profiler.report("prefill_layer_major_m="+std::to_string(m)+
+                                " chunk="+std::to_string(chunk)+" repeat="+std::to_string(repeat));
+                            execution.profiler.reset();
+                        }
+                    } else throw std::runtime_error("layer-major sweep requires Qwen4");
+                } else for(int64_t offset=0;offset<m;offset+=chunk) {
+                    execution.profiler.enabled=profile && offset==0;
+                    const auto count=std::min(chunk,m-offset);
+                    auto part=all_ids.narrow(1,offset,count);
+                    if(offset+count==m)logits=model.last_logits(part);
+                    else (void)model.hidden_forward(part);
+                    mfq_cuda_synchronize();
+                    if(execution.profiler.enabled) {
+                        execution.profiler.report("prefill_m="+std::to_string(m)+" chunk="+std::to_string(chunk)+
+                            " repeat="+std::to_string(repeat));
+                        execution.profiler.reset();
+                    }
+                    std::cout<<"prefill_progress_m="<<m<<" chunk="<<chunk<<" repeat="<<repeat
+                             <<" completed="<<offset+count<<" elapsed_ms="
+                             <<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count()<<std::endl;
+                }
+                execution.profiler.enabled=false;
+                const auto ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+                // Validate outside the measured region. An argmax alone can
+                // silently accept a projection which has produced NaNs.
+                const auto checked=logits.to(mfq_tensor_backend::kCPU,mfq_tensor_backend::kFloat32).contiguous();
+                for(int64_t i=0;i<checked.numel();++i)
+                    if(!std::isfinite(checked.template data_ptr<float>()[i]))
+                        throw std::runtime_error("nonfinite prefill logits at index "+std::to_string(i));
+                if(layer_major_sweep || chunk_sweep_oracle) {
+                    const bool reference=chunk_sweep_oracle ? chunk==chunks.front() && repeat==0 : exact_sweep?repeat%4==0:!layer_major;
+                    if(reference) {
+                        reference_logits=checked.clone();
+                        if(chunk_sweep_oracle)chunk_reference_logits=checked.clone();
+                    }
+                    else {
+                        if(chunk_sweep_oracle)reference_logits=chunk_reference_logits;
+                        if(!reference_logits.defined() || reference_logits.sizes()!=checked.sizes())
+                            throw std::runtime_error("layer-major logit reference missing");
+                        double error=0,scale=0,maximum=0;
+                        const auto* actual=checked.template data_ptr<float>();
+                        const auto* expected=reference_logits.template data_ptr<float>();
+                        for(int64_t i=0;i<checked.numel();++i) {
+                            const double delta=double(actual[i])-expected[i];
+                            error+=delta*delta;scale+=double(expected[i])*expected[i];
+                            maximum=std::max(maximum,std::abs(delta));
+                        }
+                        const auto rms=std::sqrt(error/std::max(1e-30,scale));
+                        std::cout<<"prefill_layer_major_oracle_m="<<m<<" chunk="<<chunk
+                            <<" repeat="<<repeat<<" relative_rms="<<rms
+                            <<" maximum_absolute="<<maximum<<std::endl;
+                        const bool accepted=rms<=1e-4;
+                        if(kernel_sweep || chunk_sweep_oracle) {
+                            numerical_failure=numerical_failure || !accepted;
+                            std::cout<<"prefill_numerical_validation_m="<<m<<" chunk="<<chunk
+                                <<" repeat="<<repeat<<" accepted="<<int(accepted)<<std::endl;
+                        } else MFQ_RUNTIME_CHECK(accepted,"layer-major full-prompt logits differ from chunk-major oracle");
+                        MFQ_RUNTIME_CHECK(model.cache_pos==m,"layer-major logical cache did not advance");
+                    }
+                }
+                if(phase_sweep && (repeat&1) && execution.moe_expert_cache) {
+                    std::ostringstream stats;
+                    print_moe_expert_cache_stats(execution.moe_expert_cache,stats);
+                    const auto data=stats.str();
+                    const std::string key="pipeline_phased_transfer_serves=";
+                    const auto begin=data.find(key);
+                    if(begin==std::string::npos || std::stoull(data.substr(begin+key.size()))==0)
+                        throw std::runtime_error("phased prefill was requested but no split copy executed");
+                }
+                elapsed_ms.push_back(ms);
+                const auto top=logits.argmax(-1).template item<int64_t>();
+                if((layer_major_sweep && (!layer_major || exact_sweep && repeat%4==0) || chunk_sweep_oracle && repeat==0) && m==sizes.front() && chunk==chunks.front()) {
+                    first_prompt_reference_top=top;
+                    first_prompt_reference_logits=checked.clone();
+                }
+                std::cout<<"prefill_chunk_sample_m="<<m<<" chunk="<<chunk<<" repeat="<<repeat
+                         <<" elapsed_ms="<<ms<<" tok_per_s="<<1000.0*m/ms<<" top="<<top<<std::endl;
+            }
+            std::sort(elapsed_ms.begin(),elapsed_ms.end());
+            std::cout<<((flush_sweep || async_sweep || phase_sweep || layer_major_sweep)?"prefill_mode_comparison_m=":"prefill_chunk_summary_m=")<<m<<" chunk="<<chunk<<" repeats="<<repeats
+                     <<" median_ms="<<elapsed_ms[elapsed_ms.size()/2]
+                     <<" min_ms="<<elapsed_ms.front()<<" max_ms="<<elapsed_ms.back()
+                     <<" tok_per_s="<<1000.0*m/elapsed_ms[elapsed_ms.size()/2]<<std::endl;
+        }
+        if constexpr(std::is_same_v<Model,Qwen4CausalLm>) {
+            if(layer_major_sweep || chunk_sweep_oracle) {
+                // Validate the exact GDN improvement through the public path
+                // even if a separate approximate GR experiment was rejected.
+                // Chunk comparisons must time the requested kernels even when
+                // a larger chunk fails the numerical oracle.
+                if(numerical_failure && !chunk_sweep_oracle) {
+#ifdef _WIN32
+                    _putenv_s("MFQ_GR_PREFILL_MATMUL","1");
+                    _putenv_s("MFQ_MOE_PREFILL_EXPERT_BATCH","0");
+#else
+                    setenv("MFQ_GR_PREFILL_MATMUL","1",1);
+                    setenv("MFQ_MOE_PREFILL_EXPERT_BATCH","0",1);
+#endif
+                }
+                const auto engine_chunks=chunk_sweep_oracle?chunks:std::vector<int64_t>{chunks.front()};
+                const std::string engine_gr=std::getenv("MFQ_GR_PREFILL_MATMUL")?std::getenv("MFQ_GR_PREFILL_MATMUL"):"17";
+                const std::string engine_batch=std::getenv("MFQ_MOE_PREFILL_EXPERT_BATCH")?std::getenv("MFQ_MOE_PREFILL_EXPERT_BATCH"):"1";
+                const std::string engine_mix=std::getenv("MFQ_PREFILL_MIX_KERNEL")?std::getenv("MFQ_PREFILL_MIX_KERNEL"):"1";
+                const std::string engine_mix_baseline=std::getenv("MFQ_PREFILL_MIX_BASELINE")?std::getenv("MFQ_PREFILL_MIX_BASELINE"):"0";
+                for(const auto engine_chunk:engine_chunks) {
+                std::vector<int64_t> engine_reference_tokens;
+                const auto* public_repeat_option=std::getenv("MFQ_PREFILL_PUBLIC_PAIR_REPEATS");
+                const int public_repeats=(exact_sweep || chunk_sweep_oracle) && public_repeat_option?std::clamp(std::atoi(public_repeat_option),1,8):1;
+                for(int public_repeat=0;public_repeat<public_repeats;++public_repeat) {
+                for(int engine_order=0;engine_order<(exact_sweep?2:1);++engine_order) {
+                const int engine_mode=exact_sweep?(engine_order^(public_repeat&1)):0;
+                std::cout<<"prefill_public_pair_repeat prompt="<<sizes.front()<<" chunk="<<engine_chunk
+                    <<" repeat="<<public_repeat<<" mode="<<engine_mode<<std::endl;
+                // End the previous long-prompt case before the public-path
+                // check; unused asynchronous pool blocks are outside timing.
+                model.reset(1);mfq_cuda_synchronize();
+#ifdef MFQ_NATIVE_CUDA_RUNTIME
+                cudaMemPool_t verification_pool=nullptr;
+                MFQ_CUDA_CHECK(cudaDeviceGetDefaultMemPool(&verification_pool,mfq_current_cuda_device()));
+                MFQ_CUDA_CHECK(cudaMemPoolTrimTo(verification_pool,0));
+#endif
+                if(exact_sweep) {
+#ifdef _WIN32
+                    _putenv_s("MFQ_GR_PREFILL_MATMUL",gr_mix_pair_sweep || nvq_k_pair_sweep?"17":gr_tile_pair_sweep?(engine_mode?engine_gr.c_str():"6"):quant_pair_sweep?"6":engine_mode?engine_gr.c_str():"1");
+                    _putenv_s("MFQ_MOE_PREFILL_EXPERT_BATCH",quant_pair_sweep || gr_tile_pair_sweep || gr_mix_pair_sweep || nvq_k_pair_sweep?"1":engine_mode?engine_batch.c_str():"0");
+                    if(nvq_k_pair_sweep)_putenv_s(nvq_trial_option,engine_mode?"1":"0");
+                    if(nvq_cohort_pair_sweep)_putenv_s("MFQ_GDN_PREFILL_PIPELINED",engine_mode?"1":"0");
+                    if(quant_pair_sweep)_putenv_s("MFQ_NVQ_PREFILL_M256",engine_mode?"1":"0");
+                    if(gr_mix_pair_sweep)_putenv_s("MFQ_GR_PREFILL_FUSED_MIX",engine_mode?engine_mix.c_str():engine_mix_baseline.c_str());
+#else
+                    setenv("MFQ_GR_PREFILL_MATMUL",gr_mix_pair_sweep || nvq_k_pair_sweep?"17":gr_tile_pair_sweep?(engine_mode?engine_gr.c_str():"6"):quant_pair_sweep?"6":engine_mode?engine_gr.c_str():"1",1);
+                    setenv("MFQ_MOE_PREFILL_EXPERT_BATCH",quant_pair_sweep || gr_tile_pair_sweep || gr_mix_pair_sweep || nvq_k_pair_sweep?"1":engine_mode?engine_batch.c_str():"0",1);
+                    if(nvq_k_pair_sweep)setenv(nvq_trial_option,engine_mode?"1":"0",1);
+                    if(nvq_cohort_pair_sweep)setenv("MFQ_GDN_PREFILL_PIPELINED",engine_mode?"1":"0",1);
+                    if(quant_pair_sweep)setenv("MFQ_NVQ_PREFILL_M256",engine_mode?"1":"0",1);
+                    if(gr_mix_pair_sweep)setenv("MFQ_GR_PREFILL_FUSED_MIX",engine_mode?engine_mix.c_str():engine_mix_baseline.c_str(),1);
+#endif
+                }
+                auto config=resolve_cuda_runtime_config({});
+                config.generation.prefill_chunk_size=engine_chunk;
+                DecodeGraphCache graph(model.max_position_embeddings());
+                TextSessionCache cache(config.session_cache,config.prefix_cache);
+                mfq::engine::InferenceRequest request;
+                request.prompt.assign(token_ids.begin(),token_ids.begin()+sizes.front());
+                request.sampling.max_tokens=exact_sweep?3:1;request.sampling.temperature=0.;
+                request.sampling.top_k=1;request.sampling.top_p=1.;request.sampling.enable_mtp=false;
+                mfq::engine::InferenceOutput output(request,nullptr,"layer-major-check");
+                const auto engine_started=std::chrono::steady_clock::now();
+                auto result=collect_generation(generate(model,graph,cache,config,request,output));
+                mfq_cuda_synchronize();
+                const auto engine_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-engine_started).count();
+                std::cout<<"prefill_ordinary_generation_timing prompt="<<sizes.front()<<" chunk="<<engine_chunk
+                    <<" mode="<<engine_mode<<" generated_tokens="<<result.tokens.size()
+                    <<" elapsed_ms="<<engine_ms<<" tok_per_s="<<1000.0*sizes.front()/engine_ms<<std::endl;
+                std::cout<<"prefill_ordinary_prefill_timing prompt="<<sizes.front()<<" chunk="<<engine_chunk
+                    <<" mode="<<engine_mode<<" elapsed_ms="<<result.prefill.model_ms
+                    <<" tok_per_s="<<1000.0*sizes.front()/result.prefill.model_ms<<std::endl;
+                MFQ_RUNTIME_CHECK(!result.tokens.empty() && result.tokens.front()==first_prompt_reference_top,
+                    "layer-major ordinary generation disagrees with chunk-major oracle");
+                if(exact_sweep) {
+                    if(engine_mode==0)engine_reference_tokens=result.tokens;
+                    else MFQ_RUNTIME_CHECK(result.tokens==engine_reference_tokens,
+                        "optimized prefill/decode continuation differs from original generation");
+                    std::cout<<"prefill_decode_continuation_check prompt="<<sizes.front()
+                        <<" mode="<<engine_mode<<" generated_tokens="<<result.tokens.size()<<" PASS"<<std::endl;
+                } else MFQ_RUNTIME_CHECK(result.tokens.size()==1,"generation first-token check returned extra tokens");
+                std::cout<<"prefill_layer_major_generation_check prompt="<<sizes.front()
+                    <<" chunk="<<engine_chunk<<" top="<<first_prompt_reference_top<<" PASS"<<std::endl;
+                }
+                }
+                }
+                if(exact_sweep) {
+#ifdef _WIN32
+                    _putenv_s("MFQ_GR_PREFILL_MATMUL",engine_gr.c_str());
+                    _putenv_s("MFQ_MOE_PREFILL_EXPERT_BATCH",engine_batch.c_str());
+                    if(gr_mix_pair_sweep)_putenv_s("MFQ_GR_PREFILL_FUSED_MIX",engine_mix.c_str());
+                    if(quant_pair_sweep)_putenv_s("MFQ_NVQ_PREFILL_M256","1");
+                    if(nvq_k_pair_sweep)_putenv_s(nvq_trial_option,"1");
+                    if(nvq_cohort_pair_sweep)_putenv_s("MFQ_GDN_PREFILL_PIPELINED","1");
+#else
+                    setenv("MFQ_GR_PREFILL_MATMUL",engine_gr.c_str(),1);
+                    setenv("MFQ_MOE_PREFILL_EXPERT_BATCH",engine_batch.c_str(),1);
+                    if(gr_mix_pair_sweep)setenv("MFQ_GR_PREFILL_FUSED_MIX",engine_mix.c_str(),1);
+                    if(quant_pair_sweep)setenv("MFQ_NVQ_PREFILL_M256","1",1);
+                    if(nvq_k_pair_sweep)setenv(nvq_trial_option,"1",1);
+                    if(nvq_cohort_pair_sweep)setenv("MFQ_GDN_PREFILL_PIPELINED","1",1);
+#endif
+                }
+                const auto* tail_profile=std::getenv("MFQ_PREFILL_POST_TIMING_PROFILE");
+                if(tail_profile && std::atoi(tail_profile)!=0) {
+                    model.reset(1);execution.profiler.reset();execution.profiler.enabled=true;
+                    auto hidden=qwen4_layer_major_prefill_hidden(model,all_ids.narrow(1,0,sizes.front()),chunks.front(),true);
+                    (void)model.apply_final_logit_softcap(model.adapter_last_logits(model.lm_head,model.last_hidden(std::move(hidden))));
+                    mfq_cuda_synchronize();
+                    execution.profiler.report("prefill_optimized_tail_profile_m="+std::to_string(sizes.front()));
+                    execution.profiler.enabled=false;
+                    execution.profiler.reset();
+                }
+                const auto* audit=std::getenv("MFQ_PREFILL_EXPERT_BATCH_AUDIT_RUN");
+                if(audit && std::atoi(audit)!=0) {
+#ifdef _WIN32
+                    _putenv_s("MFQ_GR_PREFILL_MATMUL","1");
+                    _putenv_s("MFQ_GDN_PREFILL_COLUMNS","0");
+                    _putenv_s("MFQ_MOE_PREFILL_EXPERT_BATCH","1");
+                    _putenv_s("MFQ_PREFILL_EXPERT_BATCH_AUDIT","1");
+#else
+                    setenv("MFQ_GR_PREFILL_MATMUL","1",1);
+                    setenv("MFQ_GDN_PREFILL_COLUMNS","0",1);
+                    setenv("MFQ_MOE_PREFILL_EXPERT_BATCH","1",1);
+                    setenv("MFQ_PREFILL_EXPERT_BATCH_AUDIT","1",1);
+#endif
+                    model.reset(1);
+                    auto hidden=qwen4_layer_major_prefill_hidden(model,all_ids.narrow(1,0,sizes.front()),chunks.front(),true);
+                    auto result=model.apply_final_logit_softcap(model.adapter_last_logits(model.lm_head,model.last_hidden(std::move(hidden))))
+                        .to(mfq_tensor_backend::kCPU,mfq_tensor_backend::kFloat32).contiguous();
+                    double error=0,scale=0;
+                    for(int64_t i=0;i<result.numel();++i) {
+                        const double expected=first_prompt_reference_logits.template data_ptr<float>()[i];
+                        const double delta=double(result.template data_ptr<float>()[i])-expected;
+                        error+=delta*delta;scale+=expected*expected;
+                    }
+                    const auto rms=std::sqrt(error/std::max(1e-30,scale));
+                    std::cout<<"prefill_expert_batch_audit_reference_logits relative_rms="<<rms<<std::endl;
+                    MFQ_RUNTIME_CHECK(std::isfinite(rms) && rms<=1e-4,"FFN batching audit changed non-FFN math");
+                }
+            }
+        }
+        return numerical_failure?2:0;
+    }
 
     for (int64_t m : sizes) {
         auto ids = all_ids.narrow(1, 0, m);

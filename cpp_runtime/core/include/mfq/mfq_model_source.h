@@ -55,6 +55,9 @@ public:
     FileReadStats file_read_stats() const noexcept override;
     bool supports_parallel_tensor_reads() const noexcept override;
     TensorReader tensor_reader(std::string_view name) const override;
+    // Read-only virtual mapping; only requested bytes are touched. The reader
+    // owns its mapping independently of the source and preserves tensor bounds.
+    TensorReader mapped_tensor_reader(std::string_view name) const;
     TensorBatchReader tensor_batch_reader(std::string_view name) const override;
     const std::vector<std::string>& assets() const noexcept override;
     bool has_asset(std::string_view name) const noexcept override;

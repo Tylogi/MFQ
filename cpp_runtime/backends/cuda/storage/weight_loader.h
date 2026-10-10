@@ -104,7 +104,7 @@ struct ResidualLinear {
     GatedResidualMixProjection mixed;
     GatedResidualActivationProjection activated;
     std::shared_ptr<const QuantLinear> weight;
-    // Exact original promoted layout for small BF16 residual injection.
+    // F32 [column, stream], or same-size vector layout [column/4, stream, 4].
     Tensor prepared_right;
     Tensor operator()(CudaExecutionContext& execution,const Tensor& input)const {
         return forward(execution,input);
